@@ -91,6 +91,7 @@ class rdma_model_test extends uvm_test;
     rdma_function_handle requested_h;
     rdma_function_handle wrong_h;
     rdma_dma_mapping mapping;
+    rdma_status subset_status;
     rdma_hw_image image;
     rdma_hw_image backing_image;
     rdma_hw_image bar_image;
@@ -278,7 +279,7 @@ class rdma_model_test extends uvm_test;
     write_permission = '{device_read:1'b0, device_write:1'b1, atomic:1'b0};
     read_write_permission = '{device_read:1'b1, device_write:1'b1,
                               atomic:1'b0};
-    atomic_permission = '{device_read:1'b0, device_write:1'b0, atomic:1'b1};
+    atomic_permission = '{device_read:1'b1, device_write:1'b0, atomic:1'b1};
 
     expect_status("DMA_FULL_RANGE",
                   mapping.check_access(requested_h, requester_bdf,
@@ -391,12 +392,17 @@ class rdma_model_test extends uvm_test;
                                        RDMA_DMA_BIDIRECTIONAL,
                                        read_permission),
                   RDMA_SC_DMA_PERMISSION);
-    expect_status("DMA_PERMISSION_DENIED",
-                  mapping.check_access(requested_h, requester_bdf,
-                                       request_iova, 64'd1,
-                                       RDMA_DMA_DEVICE_READ,
-                                       atomic_permission),
+    mapping.permissions = read_permission;
+    subset_status = mapping.check_access(requested_h, requester_bdf,
+                                         request_iova, 64'd1,
+                                         RDMA_DMA_DEVICE_READ,
+                                         atomic_permission);
+    expect_status("DMA_PERMISSION_SUBSET", subset_status,
                   RDMA_SC_DMA_PERMISSION);
+    if (subset_status == null ||
+        subset_status.message != "DMA permissions are not a mapping subset")
+      `uvm_error("DMA_PERMISSION_SUBSET",
+                 "DMA access did not reach the permission subset check")
     mapping.iova.value = 64'hffff_ffff_ffff_fff0;
     mapping.size = 64'h20;
     request_iova = mapping.iova;
