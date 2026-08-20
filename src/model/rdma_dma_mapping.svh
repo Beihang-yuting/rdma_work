@@ -1,0 +1,131 @@
+class rdma_dma_mapping extends uvm_object;
+  `uvm_object_utils(rdma_dma_mapping)
+
+  rdma_function_handle function_h;
+  rdma_bdf_t requester_bdf;
+  bit pasid_valid;
+  bit [19:0] pasid;
+  rdma_backing_addr_t backing_addr;
+  rdma_iova_t iova;
+  longint unsigned size;
+  rdma_dma_direction_e direction;
+  rdma_dma_permission_t permissions;
+  rdma_mapping_state_e state;
+  rdma_handle owner_h;
+
+  function new(string name = "rdma_dma_mapping");
+    super.new(name);
+    function_h = null;
+    requester_bdf = '0;
+    pasid_valid = 1'b0;
+    pasid = '0;
+    backing_addr = '0;
+    iova = '0;
+    size = '0;
+    direction = RDMA_DMA_DEVICE_READ;
+    permissions = '0;
+    state = RDMA_MAPPING_INVALID;
+    owner_h = null;
+  endfunction
+
+  function rdma_status check_access(
+    rdma_function_handle requested_function,
+    rdma_bdf_t requested_requester_bdf,
+    rdma_iova_t first_iova,
+    longint unsigned length,
+    rdma_dma_direction_e requested_direction,
+    rdma_dma_permission_t requested_permissions
+  );
+    longint unsigned mapping_last;
+    longint unsigned request_last;
+
+    if (state != RDMA_MAPPING_ACTIVE)
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "DMA mapping is not ACTIVE");
+    if (requested_function == null)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "requested function handle is null");
+    if (function_h == null)
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "mapping function handle is null");
+    if (function_h.kind != RDMA_RESOURCE_FUNCTION)
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "mapping handle kind is not FUNCTION");
+    if (requested_function.generation != function_h.generation)
+      return rdma_status::make(RDMA_SC_STALE_GENERATION,
+                               "requested function generation is stale");
+    if (requested_function.kind != RDMA_RESOURCE_FUNCTION ||
+        requested_function.function_uid != function_h.function_uid ||
+        requested_function.object_id != function_h.object_id ||
+        !function_h.same_instance(requested_function))
+      return rdma_status::make(RDMA_SC_DMA_TRANSLATION,
+                               "requested function does not own mapping");
+    if (requested_requester_bdf != requester_bdf)
+      return rdma_status::make(RDMA_SC_DMA_TRANSLATION,
+                               "requester BDF does not match mapping");
+    if (length == 0)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "DMA access length is zero");
+    if (size == 0)
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "ACTIVE DMA mapping has zero size");
+
+    if (iova.value > (64'hffff_ffff_ffff_ffff - (size - 1'b1)))
+      return rdma_status::make(RDMA_SC_DMA_TRANSLATION,
+                               "DMA mapping range end overflows 64 bits");
+    if (first_iova.value >
+        (64'hffff_ffff_ffff_ffff - (length - 1'b1)))
+      return rdma_status::make(RDMA_SC_DMA_TRANSLATION,
+                               "DMA request range end overflows 64 bits");
+
+    mapping_last = iova.value + size - 1'b1;
+    request_last = first_iova.value + length - 1'b1;
+    if (first_iova.value < iova.value || request_last > mapping_last)
+      return rdma_status::make(RDMA_SC_DMA_TRANSLATION,
+                               "DMA request is outside mapping range");
+
+    if (!(requested_direction inside {RDMA_DMA_DEVICE_READ,
+                                      RDMA_DMA_DEVICE_WRITE,
+                                      RDMA_DMA_BIDIRECTIONAL}))
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "requested DMA direction is invalid");
+    if (!(direction inside {RDMA_DMA_DEVICE_READ,
+                            RDMA_DMA_DEVICE_WRITE,
+                            RDMA_DMA_BIDIRECTIONAL}))
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "mapping DMA direction is invalid");
+    case (requested_direction)
+      RDMA_DMA_DEVICE_READ: begin
+        if (!requested_permissions.device_read)
+          return rdma_status::make(
+            RDMA_SC_DMA_PERMISSION,
+            "device-read DMA request omitted read permission"
+          );
+      end
+      RDMA_DMA_DEVICE_WRITE: begin
+        if (!requested_permissions.device_write)
+          return rdma_status::make(
+            RDMA_SC_DMA_PERMISSION,
+            "device-write DMA request omitted write permission"
+          );
+      end
+      RDMA_DMA_BIDIRECTIONAL: begin
+        if (!requested_permissions.device_read ||
+            !requested_permissions.device_write)
+          return rdma_status::make(
+            RDMA_SC_DMA_PERMISSION,
+            "bidirectional DMA request omitted read or write permission"
+          );
+      end
+    endcase
+    if (direction != RDMA_DMA_BIDIRECTIONAL &&
+        requested_direction != direction)
+      return rdma_status::make(RDMA_SC_DMA_PERMISSION,
+                               "DMA direction is not permitted");
+    if ((requested_permissions & ~permissions) != '0)
+      return rdma_status::make(RDMA_SC_DMA_PERMISSION,
+                               "DMA permissions are not a mapping subset");
+
+    return rdma_status::success();
+  endfunction
+endclass
