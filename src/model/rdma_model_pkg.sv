@@ -7,4 +7,8 @@ package rdma_model_pkg;
   `include "rdma_function_binding.svh"
   `include "rdma_dma_mapping.svh"
   `include "rdma_hw_image.svh"
+  `include "rdma_semantic_requests.svh"
+  `include "rdma_resources.svh"
+  `include "rdma_context_models.svh"
+  `include "rdma_queue_models.svh"
 endpackage
