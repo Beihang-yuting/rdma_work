@@ -137,10 +137,6 @@ class rdma_cmq_sqe_model extends rdma_hw_model;
       if (!context_status.ok())
         return context_status;
     end
-    if (opcode inside {RDMA_CMQ_DESTROY, RDMA_CMQ_MODIFY_QP,
-                       RDMA_CMQ_QUERY} && target_h == null)
-      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                               "CMQ command lacks target handle");
     return rdma_status::success();
   endfunction
 
@@ -180,6 +176,13 @@ class rdma_cmq_completion_model extends rdma_hw_model;
   endfunction
 
   virtual function rdma_status validate();
+    if (!(opcode inside {RDMA_CMQ_CREATE_PD, RDMA_CMQ_REGISTER_MR,
+                         RDMA_CMQ_CREATE_CQ, RDMA_CMQ_CREATE_QP,
+                         RDMA_CMQ_CREATE_SRQ, RDMA_CMQ_CREATE_CEQ,
+                         RDMA_CMQ_CREATE_AEQ, RDMA_CMQ_DESTROY,
+                         RDMA_CMQ_MODIFY_QP, RDMA_CMQ_QUERY}))
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "CMQ completion opcode is invalid");
     if (command_id == 0 || status == null)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "CMQ completion lacks command ID or status");
@@ -210,6 +213,8 @@ class rdma_sqe_rc_ext extends rdma_sqe_transport_ext;
 
   rdma_iova_t remote_addr;
   bit [31:0] rkey;
+  bit remote_access_valid;
+  bit rkey_valid;
   longint unsigned compare_value;
   longint unsigned swap_add_value;
 
@@ -217,6 +222,8 @@ class rdma_sqe_rc_ext extends rdma_sqe_transport_ext;
     super.new(name);
     remote_addr = '0;
     rkey = '0;
+    remote_access_valid = 1'b0;
+    rkey_valid = 1'b0;
     compare_value = '0;
     swap_add_value = '0;
   endfunction
@@ -229,6 +236,8 @@ class rdma_sqe_rc_ext extends rdma_sqe_transport_ext;
       `uvm_fatal("RDMA_COPY_TYPE", "RC SQE extension copy mismatch")
     remote_addr = rhs_ext.remote_addr;
     rkey = rhs_ext.rkey;
+    remote_access_valid = rhs_ext.remote_access_valid;
+    rkey_valid = rhs_ext.rkey_valid;
     compare_value = rhs_ext.compare_value;
     swap_add_value = rhs_ext.swap_add_value;
   endfunction
@@ -238,13 +247,13 @@ class rdma_sqe_rc_ext extends rdma_sqe_transport_ext;
   endfunction
 
   virtual function rdma_status validate(rdma_work_opcode_e opcode);
-    if (opcode == RDMA_WR_LOCAL_INVALIDATE && rkey == 0)
+    if (opcode == RDMA_WR_LOCAL_INVALIDATE && !rkey_valid)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                               "RC local invalidate rkey is zero");
+                               "RC local invalidate rkey is absent");
     if (opcode inside {RDMA_WR_RDMA_WRITE, RDMA_WR_WRITE_WITH_IMM,
                        RDMA_WR_RDMA_READ, RDMA_WR_ATOMIC_CMP_SWAP,
                        RDMA_WR_ATOMIC_FETCH_ADD}) begin
-      if (remote_addr.value == 0 || rkey == 0)
+      if (!remote_access_valid || !rkey_valid)
         return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                  "RC remote operation lacks address or rkey");
     end
@@ -319,12 +328,16 @@ class rdma_sqe_urc_ext extends rdma_sqe_transport_ext;
   bit [23:0] destination_qpn;
   rdma_iova_t remote_addr;
   bit [31:0] rkey;
+  bit remote_access_valid;
+  bit rkey_valid;
 
   function new(string name = "rdma_sqe_urc_ext");
     super.new(name);
     destination_qpn = '0;
     remote_addr = '0;
     rkey = '0;
+    remote_access_valid = 1'b0;
+    rkey_valid = 1'b0;
   endfunction
 
   virtual function void do_copy(uvm_object rhs);
@@ -336,6 +349,8 @@ class rdma_sqe_urc_ext extends rdma_sqe_transport_ext;
     destination_qpn = rhs_ext.destination_qpn;
     remote_addr = rhs_ext.remote_addr;
     rkey = rhs_ext.rkey;
+    remote_access_valid = rhs_ext.remote_access_valid;
+    rkey_valid = rhs_ext.rkey_valid;
   endfunction
 
   virtual function rdma_transport_e transport_kind();
@@ -344,9 +359,9 @@ class rdma_sqe_urc_ext extends rdma_sqe_transport_ext;
 
   virtual function rdma_status validate(rdma_work_opcode_e opcode);
     if (opcode == RDMA_WR_LOCAL_INVALIDATE) begin
-      if (rkey == 0)
+      if (!rkey_valid)
         return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                                 "URC local invalidate rkey is zero");
+                                 "URC local invalidate rkey is absent");
       return rdma_status::success();
     end
     if (destination_qpn == 0)
@@ -354,7 +369,7 @@ class rdma_sqe_urc_ext extends rdma_sqe_transport_ext;
                                "URC SQE destination QPN is zero");
     if (opcode inside {RDMA_WR_RDMA_WRITE, RDMA_WR_WRITE_WITH_IMM,
                        RDMA_WR_RDMA_READ}) begin
-      if (remote_addr.value == 0 || rkey == 0)
+      if (!remote_access_valid || !rkey_valid)
         return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                  "URC remote operation lacks address or rkey");
     end
@@ -619,6 +634,13 @@ class rdma_cqe_model extends rdma_hw_model;
     if (qp_h == null || qp_h.kind != RDMA_RESOURCE_QP || status == null)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "CQE requires QP handle and status");
+    if (!(opcode inside {RDMA_WR_SEND, RDMA_WR_SEND_WITH_IMM,
+                         RDMA_WR_RDMA_WRITE, RDMA_WR_WRITE_WITH_IMM,
+                         RDMA_WR_RDMA_READ, RDMA_WR_ATOMIC_CMP_SWAP,
+                         RDMA_WR_ATOMIC_FETCH_ADD,
+                         RDMA_WR_LOCAL_INVALIDATE, RDMA_WR_RECV}))
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "CQE work opcode is invalid");
     return rdma_status::success();
   endfunction
 
@@ -701,6 +723,10 @@ class rdma_aeqe_model extends rdma_hw_model;
     if (target_h == null)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "AEQE target handle is null");
+    if (!(severity inside {RDMA_SEVERITY_INFO, RDMA_SEVERITY_WARNING,
+                           RDMA_SEVERITY_ERROR, RDMA_SEVERITY_FATAL}))
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "AEQE severity is invalid");
     return rdma_status::success();
   endfunction
 
@@ -759,6 +785,39 @@ class rdma_doorbell_model extends rdma_hw_model;
     if (target_h == null)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "doorbell target handle is null");
+    case (kind)
+      RDMA_DOORBELL_CMQ_SQ:
+        if (target_h.kind != RDMA_RESOURCE_CMQ)
+          return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                                   "CMQ doorbell requires a CMQ target");
+      RDMA_DOORBELL_SQ,
+      RDMA_DOORBELL_RQ,
+      RDMA_DOORBELL_QP_FLUSH:
+        if (target_h.kind != RDMA_RESOURCE_QP)
+          return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                                   "QP doorbell requires a QP target");
+      RDMA_DOORBELL_SRQ:
+        if (target_h.kind != RDMA_RESOURCE_SRQ)
+          return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                                   "SRQ doorbell requires an SRQ target");
+      RDMA_DOORBELL_CQ:
+        if (target_h.kind != RDMA_RESOURCE_CQ)
+          return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                                   "CQ doorbell requires a CQ target");
+      RDMA_DOORBELL_CEQ:
+        if (target_h.kind != RDMA_RESOURCE_CEQ)
+          return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                                   "CEQ doorbell requires a CEQ target");
+      RDMA_DOORBELL_AEQ:
+        if (target_h.kind != RDMA_RESOURCE_AEQ)
+          return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                                   "AEQ doorbell requires an AEQ target");
+      RDMA_DOORBELL_TQ_FLUSH:
+        return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                                 "TQ doorbell target is not representable");
+      default: begin
+      end
+    endcase
     return rdma_status::success();
   endfunction
 

@@ -246,6 +246,15 @@ class rdma_qpc_model extends rdma_hw_model;
         !rdma_is_power_of_two(rq_depth))
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "QPC depth is not a nonzero power of two");
+    if (!(state inside {RDMA_QPS_RESET, RDMA_QPS_INIT, RDMA_QPS_RTR,
+                        RDMA_QPS_RTS, RDMA_QPS_SQD, RDMA_QPS_SQE,
+                        RDMA_QPS_ERROR}))
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "QPC state is invalid");
+    if (sq_producer_index >= sq_depth || sq_consumer_index >= sq_depth ||
+        rq_producer_index >= rq_depth || rq_consumer_index >= rq_depth)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "QPC queue index is outside the queue depth");
     if ((sq_base.value & 64'h3f) != 0 || (rq_base.value & 64'h3f) != 0)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "QPC queue base is not 64-byte aligned");
@@ -326,6 +335,9 @@ class rdma_cqc_model extends rdma_hw_model;
     if (!rdma_is_power_of_two(depth) || (base_addr.value & 64'h3f) != 0)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "CQC depth or alignment is invalid");
+    if (producer_index >= depth || consumer_index >= depth)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "CQC index is outside the queue depth");
     return rdma_status::success();
   endfunction
 
@@ -436,6 +448,9 @@ class rdma_srqc_model extends rdma_hw_model;
         (base_addr.value & 64'h3f) != 0)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "SRQC depth, SGE count, or alignment is invalid");
+    if (producer_index >= depth || consumer_index >= depth)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "SRQC index is outside the queue depth");
     return rdma_status::success();
   endfunction
 
@@ -488,6 +503,9 @@ class rdma_ceqc_model extends rdma_hw_model;
     if (!rdma_is_power_of_two(depth) || (base_addr.value & 64'h3f) != 0)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "CEQC depth or alignment is invalid");
+    if (producer_index >= depth || consumer_index >= depth)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "CEQC index is outside the queue depth");
     return rdma_status::success();
   endfunction
 
@@ -540,6 +558,9 @@ class rdma_aeqc_model extends rdma_hw_model;
     if (!rdma_is_power_of_two(depth) || (base_addr.value & 64'h3f) != 0)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "AEQC depth or alignment is invalid");
+    if (producer_index >= depth || consumer_index >= depth)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "AEQC index is outside the queue depth");
     return rdma_status::success();
   endfunction
 

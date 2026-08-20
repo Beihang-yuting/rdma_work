@@ -38,6 +38,17 @@ function automatic rdma_function_handle rdma_clone_function_handle_value(
   return cloned_handle;
 endfunction
 
+function automatic bit rdma_ring_state_valid(
+  int unsigned producer_index,
+  bit producer_wrap,
+  int unsigned consumer_index,
+  bit consumer_wrap
+);
+  if (producer_wrap == consumer_wrap)
+    return producer_index >= consumer_index;
+  return producer_index <= consumer_index;
+endfunction
+
 class rdma_resource extends uvm_object;
   `uvm_object_utils(rdma_resource)
 
@@ -57,6 +68,10 @@ class rdma_resource extends uvm_object;
     state = RDMA_RESOURCE_NEW;
     hmc_fvm_addr = '0;
     hmc_fvm_addr_valid = 1'b0;
+  endfunction
+
+  virtual function rdma_resource_kind_e resource_kind();
+    return RDMA_RESOURCE_FUNCTION;
   endfunction
 
   virtual function void do_copy(uvm_object rhs);
@@ -101,6 +116,14 @@ class rdma_resource extends uvm_object;
                         RDMA_RESOURCE_ERROR}))
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "resource state is invalid");
+    if (state != RDMA_RESOURCE_NEW) begin
+      if (handle == null || handle.kind != resource_kind())
+        return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                                 "resource handle kind is invalid");
+      if (owner == null || owner.kind != RDMA_RESOURCE_FUNCTION)
+        return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                                 "resource owner is not a function handle");
+    end
     return rdma_status::success();
   endfunction
 endclass
@@ -151,6 +174,10 @@ class rdma_queue_resource extends rdma_resource;
     if (producer_index >= depth || consumer_index >= depth)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "queue index is outside the queue depth");
+    if (!rdma_ring_state_valid(producer_index, producer_wrap,
+                               consumer_index, consumer_wrap))
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "queue producer and consumer state is invalid");
     return rdma_status::success();
   endfunction
 endclass
@@ -173,6 +200,10 @@ class rdma_function extends rdma_resource;
     vsi_id = '0;
     pfvf_id = '0;
     binding = rdma_function_binding::type_id::create("binding");
+  endfunction
+
+  virtual function rdma_resource_kind_e resource_kind();
+    return RDMA_RESOURCE_FUNCTION;
   endfunction
 
   virtual function void do_copy(uvm_object rhs);
@@ -210,6 +241,10 @@ class rdma_pd extends rdma_resource;
     global_pd_id = '0;
   endfunction
 
+  virtual function rdma_resource_kind_e resource_kind();
+    return RDMA_RESOURCE_PD;
+  endfunction
+
   virtual function void do_copy(uvm_object rhs);
     rdma_pd rhs_pd;
 
@@ -245,6 +280,10 @@ class rdma_mr extends rdma_resource;
     permissions = '0;
   endfunction
 
+  virtual function rdma_resource_kind_e resource_kind();
+    return RDMA_RESOURCE_MR;
+  endfunction
+
   virtual function void do_copy(uvm_object rhs);
     rdma_mr rhs_mr;
 
@@ -276,6 +315,10 @@ class rdma_cq extends rdma_queue_resource;
     ceq_h = null;
   endfunction
 
+  virtual function rdma_resource_kind_e resource_kind();
+    return RDMA_RESOURCE_CQ;
+  endfunction
+
   virtual function void do_copy(uvm_object rhs);
     rdma_cq rhs_cq;
 
@@ -300,9 +343,11 @@ class rdma_qp extends rdma_resource;
   int unsigned sq_producer_index;
   int unsigned sq_consumer_index;
   bit sq_wrap;
+  bit sq_consumer_wrap;
   int unsigned rq_producer_index;
   int unsigned rq_consumer_index;
   bit rq_wrap;
+  bit rq_consumer_wrap;
   rdma_iova_t sq_iova;
   rdma_iova_t rq_iova;
   rdma_handle pd_h;
@@ -321,15 +366,21 @@ class rdma_qp extends rdma_resource;
     sq_producer_index = '0;
     sq_consumer_index = '0;
     sq_wrap = 1'b0;
+    sq_consumer_wrap = 1'b0;
     rq_producer_index = '0;
     rq_consumer_index = '0;
     rq_wrap = 1'b0;
+    rq_consumer_wrap = 1'b0;
     sq_iova = '0;
     rq_iova = '0;
     pd_h = null;
     send_cq_h = null;
     recv_cq_h = null;
     srq_h = null;
+  endfunction
+
+  virtual function rdma_resource_kind_e resource_kind();
+    return RDMA_RESOURCE_QP;
   endfunction
 
   virtual function void do_copy(uvm_object rhs);
@@ -347,9 +398,11 @@ class rdma_qp extends rdma_resource;
     sq_producer_index = rhs_qp.sq_producer_index;
     sq_consumer_index = rhs_qp.sq_consumer_index;
     sq_wrap = rhs_qp.sq_wrap;
+    sq_consumer_wrap = rhs_qp.sq_consumer_wrap;
     rq_producer_index = rhs_qp.rq_producer_index;
     rq_consumer_index = rhs_qp.rq_consumer_index;
     rq_wrap = rhs_qp.rq_wrap;
+    rq_consumer_wrap = rhs_qp.rq_consumer_wrap;
     sq_iova = rhs_qp.sq_iova;
     rq_iova = rhs_qp.rq_iova;
     pd_h = rdma_clone_handle_value(rhs_qp.pd_h, "QP PD");
@@ -372,6 +425,12 @@ class rdma_qp extends rdma_resource;
         rq_producer_index >= rq_depth || rq_consumer_index >= rq_depth)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "QP queue index is outside the queue depth");
+    if (!rdma_ring_state_valid(sq_producer_index, sq_wrap,
+                               sq_consumer_index, sq_consumer_wrap) ||
+        !rdma_ring_state_valid(rq_producer_index, rq_wrap,
+                               rq_consumer_index, rq_consumer_wrap))
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "QP producer and consumer state is invalid");
     if (!(transport inside {RDMA_TRANSPORT_RC, RDMA_TRANSPORT_UD,
                             RDMA_TRANSPORT_URC}))
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
@@ -381,6 +440,15 @@ class rdma_qp extends rdma_resource;
                            RDMA_QPS_ERROR}))
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "QP state is invalid");
+    if (state inside {RDMA_RESOURCE_PROGRAMMED, RDMA_RESOURCE_ACTIVE}) begin
+      if (pd_h == null || pd_h.kind != RDMA_RESOURCE_PD)
+        return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                                 "QP PD handle is invalid");
+      if (send_cq_h == null || send_cq_h.kind != RDMA_RESOURCE_CQ ||
+          recv_cq_h == null || recv_cq_h.kind != RDMA_RESOURCE_CQ)
+        return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                                 "QP completion queue handle is invalid");
+    end
     return rdma_status::success();
   endfunction
 endclass
@@ -399,6 +467,10 @@ class rdma_srq extends rdma_queue_resource;
     global_srq_id = '0;
     max_sge = '0;
     pd_h = null;
+  endfunction
+
+  virtual function rdma_resource_kind_e resource_kind();
+    return RDMA_RESOURCE_SRQ;
   endfunction
 
   virtual function void do_copy(uvm_object rhs);
@@ -426,6 +498,10 @@ class rdma_ceq extends rdma_queue_resource;
     global_ceq_id = '0;
   endfunction
 
+  virtual function rdma_resource_kind_e resource_kind();
+    return RDMA_RESOURCE_CEQ;
+  endfunction
+
   virtual function void do_copy(uvm_object rhs);
     rdma_ceq rhs_ceq;
 
@@ -449,6 +525,10 @@ class rdma_aeq extends rdma_queue_resource;
     global_aeq_id = '0;
   endfunction
 
+  virtual function rdma_resource_kind_e resource_kind();
+    return RDMA_RESOURCE_AEQ;
+  endfunction
+
   virtual function void do_copy(uvm_object rhs);
     rdma_aeq rhs_aeq;
 
@@ -468,6 +548,7 @@ class rdma_cmq extends rdma_queue_resource;
   int unsigned completion_producer_index;
   int unsigned completion_consumer_index;
   bit completion_wrap;
+  bit completion_consumer_wrap;
   rdma_iova_t completion_iova;
 
   function new(string name = "rdma_cmq");
@@ -477,7 +558,12 @@ class rdma_cmq extends rdma_queue_resource;
     completion_producer_index = '0;
     completion_consumer_index = '0;
     completion_wrap = 1'b0;
+    completion_consumer_wrap = 1'b0;
     completion_iova = '0;
+  endfunction
+
+  virtual function rdma_resource_kind_e resource_kind();
+    return RDMA_RESOURCE_CMQ;
   endfunction
 
   virtual function void do_copy(uvm_object rhs);
@@ -491,6 +577,7 @@ class rdma_cmq extends rdma_queue_resource;
     completion_producer_index = rhs_cmq.completion_producer_index;
     completion_consumer_index = rhs_cmq.completion_consumer_index;
     completion_wrap = rhs_cmq.completion_wrap;
+    completion_consumer_wrap = rhs_cmq.completion_consumer_wrap;
     completion_iova = rhs_cmq.completion_iova;
   endfunction
 
@@ -505,6 +592,13 @@ class rdma_cmq extends rdma_queue_resource;
       return rdma_status::make(
         RDMA_SC_INVALID_ARGUMENT,
         "CMQ completion index is outside the queue depth"
+      );
+    if (!rdma_ring_state_valid(completion_producer_index, completion_wrap,
+                               completion_consumer_index,
+                               completion_consumer_wrap))
+      return rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT,
+        "CMQ completion producer and consumer state is invalid"
       );
     return rdma_status::success();
   endfunction

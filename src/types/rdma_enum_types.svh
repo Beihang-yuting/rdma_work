@@ -120,11 +120,11 @@ typedef enum bit [3:0] {
   RDMA_ENGINE_RESET    = 4'd11
 } rdma_engine_kind_e;
 
-typedef enum bit [1:0] {
-  RDMA_SEVERITY_INFO    = 2'd0,
-  RDMA_SEVERITY_WARNING = 2'd1,
-  RDMA_SEVERITY_ERROR   = 2'd2,
-  RDMA_SEVERITY_FATAL   = 2'd3
+typedef enum bit [2:0] {
+  RDMA_SEVERITY_INFO    = 3'd0,
+  RDMA_SEVERITY_WARNING = 3'd1,
+  RDMA_SEVERITY_ERROR   = 3'd2,
+  RDMA_SEVERITY_FATAL   = 3'd3
 } rdma_severity_e;
 
 typedef enum bit [1:0] {

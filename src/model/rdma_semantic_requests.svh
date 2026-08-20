@@ -348,6 +348,16 @@ class rdma_create_qp_req extends rdma_semantic_request;
     if (max_send_sge == 0 || max_recv_sge == 0)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "QP maximum SGE count is zero");
+    if (owner == null || owner.kind != RDMA_RESOURCE_FUNCTION)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "QP requires a function owner");
+    if (pd_h == null || pd_h.kind != RDMA_RESOURCE_PD)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "QP requires a PD handle");
+    if (send_cq_h == null || send_cq_h.kind != RDMA_RESOURCE_CQ ||
+        recv_cq_h == null || recv_cq_h.kind != RDMA_RESOURCE_CQ)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "QP requires send and receive CQ handles");
     return rdma_status::success();
   endfunction
 endclass
@@ -397,6 +407,12 @@ class rdma_create_srq_req extends rdma_semantic_request;
     if (max_sge == 0)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "SRQ maximum SGE count is zero");
+    if (owner == null || owner.kind != RDMA_RESOURCE_FUNCTION)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "SRQ requires a function owner");
+    if (pd_h == null || pd_h.kind != RDMA_RESOURCE_PD)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "SRQ requires a PD handle");
     return rdma_status::success();
   endfunction
 endclass
@@ -577,6 +593,8 @@ class rdma_post_send_req extends rdma_semantic_request;
   bit [31:0] immediate_data;
   rdma_iova_t remote_addr;
   bit [31:0] rkey;
+  bit remote_access_valid;
+  bit rkey_valid;
   bit [23:0] destination_qpn;
   bit [31:0] qkey;
   int unsigned address_vector_id;
@@ -596,6 +614,8 @@ class rdma_post_send_req extends rdma_semantic_request;
     immediate_data = '0;
     remote_addr = '0;
     rkey = '0;
+    remote_access_valid = 1'b0;
+    rkey_valid = 1'b0;
     destination_qpn = '0;
     qkey = '0;
     address_vector_id = '0;
@@ -630,6 +650,8 @@ class rdma_post_send_req extends rdma_semantic_request;
     immediate_data = rhs_req.immediate_data;
     remote_addr = rhs_req.remote_addr;
     rkey = rhs_req.rkey;
+    remote_access_valid = rhs_req.remote_access_valid;
+    rkey_valid = rhs_req.rkey_valid;
     destination_qpn = rhs_req.destination_qpn;
     qkey = rhs_req.qkey;
     address_vector_id = rhs_req.address_vector_id;
@@ -663,7 +685,7 @@ class rdma_post_send_req extends rdma_semantic_request;
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "work opcode is invalid for transport");
     if (opcode == RDMA_WR_LOCAL_INVALIDATE) begin
-      if (inline_data || sges.size() != 0 || payload.size() != 0 || rkey == 0)
+      if (inline_data || sges.size() != 0 || payload.size() != 0 || !rkey_valid)
         return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                  "local invalidate shape or rkey is invalid");
     end
@@ -706,7 +728,7 @@ class rdma_post_send_req extends rdma_semantic_request;
     if (opcode inside {RDMA_WR_RDMA_WRITE, RDMA_WR_WRITE_WITH_IMM,
                        RDMA_WR_RDMA_READ, RDMA_WR_ATOMIC_CMP_SWAP,
                        RDMA_WR_ATOMIC_FETCH_ADD}) begin
-      if (remote_addr.value == 0 || rkey == 0)
+      if (!remote_access_valid || !rkey_valid)
         return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                  "remote operation lacks address or rkey");
     end
