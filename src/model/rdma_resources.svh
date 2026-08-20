@@ -110,6 +110,8 @@ class rdma_resource extends uvm_object;
   endfunction
 
   virtual function rdma_status validate();
+    rdma_status status;
+
     if (!(state inside {RDMA_RESOURCE_NEW, RDMA_RESOURCE_ALLOCATED,
                         RDMA_RESOURCE_PROGRAMMED, RDMA_RESOURCE_ACTIVE,
                         RDMA_RESOURCE_QUIESCING, RDMA_RESOURCE_RELEASED,
@@ -120,16 +122,13 @@ class rdma_resource extends uvm_object;
       if (handle == null || handle.kind != resource_kind())
         return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                  "resource handle kind is invalid");
-      if (owner == null || owner.kind != RDMA_RESOURCE_FUNCTION)
-        return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                                 "resource owner is not a function handle");
-      if (!rdma_handle_matches_owner(handle, owner))
-        return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                                 "resource handle does not match its owner");
+      status = rdma_handle_owner_status(handle, owner);
+      if (!status.ok())
+        return status;
       foreach (dependencies[i]) begin
-        if (!rdma_handle_matches_owner(dependencies[i], owner))
-          return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                                   "resource dependency does not match owner");
+        status = rdma_handle_owner_status(dependencies[i], owner);
+        if (!status.ok())
+          return status;
       end
     end
     return rdma_status::success();
@@ -235,6 +234,18 @@ class rdma_function extends rdma_resource;
         `uvm_fatal("RDMA_COPY_TYPE", "function binding clone mismatch")
     end
   endfunction
+
+  virtual function rdma_status validate();
+    rdma_status status;
+
+    status = super.validate();
+    if (!status.ok())
+      return status;
+    if (state != RDMA_RESOURCE_NEW && !handle.same_instance(owner))
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "function handle does not match its owner");
+    return rdma_status::success();
+  endfunction
 endclass
 
 class rdma_pd extends rdma_resource;
@@ -315,10 +326,12 @@ class rdma_mr extends rdma_resource;
     if (!status.ok())
       return status;
     if (state inside {RDMA_RESOURCE_PROGRAMMED, RDMA_RESOURCE_ACTIVE}) begin
-      if (pd_h == null || pd_h.kind != RDMA_RESOURCE_PD ||
-          !rdma_handle_matches_owner(pd_h, owner))
+      if (pd_h != null && pd_h.kind != RDMA_RESOURCE_PD)
         return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                  "MR PD handle is invalid");
+      status = rdma_handle_owner_status(pd_h, owner);
+      if (!status.ok())
+        return status;
       if (length == 0)
         return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                  "MR length is zero");
@@ -363,10 +376,12 @@ class rdma_cq extends rdma_queue_resource;
     if (!status.ok())
       return status;
     if (state inside {RDMA_RESOURCE_PROGRAMMED, RDMA_RESOURCE_ACTIVE}) begin
-      if (ceq_h == null || ceq_h.kind != RDMA_RESOURCE_CEQ ||
-          !rdma_handle_matches_owner(ceq_h, owner))
+      if (ceq_h != null && ceq_h.kind != RDMA_RESOURCE_CEQ)
         return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                  "CQ CEQ handle is invalid");
+      status = rdma_handle_owner_status(ceq_h, owner);
+      if (!status.ok())
+        return status;
     end
     return rdma_status::success();
   endfunction
@@ -482,21 +497,32 @@ class rdma_qp extends rdma_resource;
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "QP state is invalid");
     if (state inside {RDMA_RESOURCE_PROGRAMMED, RDMA_RESOURCE_ACTIVE}) begin
-      if (pd_h == null || pd_h.kind != RDMA_RESOURCE_PD ||
-          !rdma_handle_matches_owner(pd_h, owner))
+      if (pd_h != null && pd_h.kind != RDMA_RESOURCE_PD)
         return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                  "QP PD handle is invalid");
-      if (send_cq_h == null || send_cq_h.kind != RDMA_RESOURCE_CQ ||
-          !rdma_handle_matches_owner(send_cq_h, owner) ||
-          recv_cq_h == null || recv_cq_h.kind != RDMA_RESOURCE_CQ ||
-          !rdma_handle_matches_owner(recv_cq_h, owner))
+      status = rdma_handle_owner_status(pd_h, owner);
+      if (!status.ok())
+        return status;
+      if (send_cq_h != null && send_cq_h.kind != RDMA_RESOURCE_CQ)
         return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                  "QP completion queue handle is invalid");
-      if (srq_h != null &&
-          (srq_h.kind != RDMA_RESOURCE_SRQ ||
-           !rdma_handle_matches_owner(srq_h, owner)))
+      status = rdma_handle_owner_status(send_cq_h, owner);
+      if (!status.ok())
+        return status;
+      if (recv_cq_h != null && recv_cq_h.kind != RDMA_RESOURCE_CQ)
         return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                                 "QP SRQ handle is invalid");
+                                 "QP completion queue handle is invalid");
+      status = rdma_handle_owner_status(recv_cq_h, owner);
+      if (!status.ok())
+        return status;
+      if (srq_h != null) begin
+        if (srq_h.kind != RDMA_RESOURCE_SRQ)
+          return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                                   "QP SRQ handle is invalid");
+        status = rdma_handle_owner_status(srq_h, owner);
+        if (!status.ok())
+          return status;
+      end
     end
     return rdma_status::success();
   endfunction
@@ -541,10 +567,12 @@ class rdma_srq extends rdma_queue_resource;
     if (!status.ok())
       return status;
     if (state inside {RDMA_RESOURCE_PROGRAMMED, RDMA_RESOURCE_ACTIVE}) begin
-      if (pd_h == null || pd_h.kind != RDMA_RESOURCE_PD ||
-          !rdma_handle_matches_owner(pd_h, owner))
+      if (pd_h != null && pd_h.kind != RDMA_RESOURCE_PD)
         return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                  "SRQ PD handle is invalid");
+      status = rdma_handle_owner_status(pd_h, owner);
+      if (!status.ok())
+        return status;
       if (max_sge == 0)
         return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                  "SRQ maximum SGE count is zero");

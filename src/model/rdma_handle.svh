@@ -38,12 +38,21 @@ class rdma_function_handle extends rdma_handle;
   endfunction
 endclass
 
-function automatic bit rdma_handle_matches_owner(
+function automatic rdma_status rdma_handle_owner_status(
   rdma_handle handle,
   rdma_function_handle owner
 );
-  return handle != null && owner != null &&
-         owner.kind == RDMA_RESOURCE_FUNCTION &&
-         handle.function_uid == owner.function_uid &&
-         handle.generation == owner.generation;
+  if (handle == null)
+    return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                             "handle is null");
+  if (owner == null || owner.kind != RDMA_RESOURCE_FUNCTION)
+    return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                             "owner is not a function handle");
+  if (handle.function_uid != owner.function_uid)
+    return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                             "handle function does not match owner");
+  if (handle.generation != owner.generation)
+    return rdma_status::make(RDMA_SC_STALE_GENERATION,
+                             "handle generation does not match owner");
+  return rdma_status::success();
 endfunction

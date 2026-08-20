@@ -176,7 +176,7 @@ class rdma_request_model_test extends uvm_test;
     mismatched_h.generation++;
     req.send_cq_h = mismatched_h;
     expect_status("CREATE_QP_CQ_GENERATION", req.validate(),
-                  RDMA_SC_INVALID_ARGUMENT);
+                  RDMA_SC_STALE_GENERATION);
     req.send_cq_h = cq_h;
     req.srq_h = srq_h;
     expect_status("CREATE_QP_SRQ", req.validate(), RDMA_SC_OK);
@@ -225,7 +225,7 @@ class rdma_request_model_test extends uvm_test;
     mismatched_h.generation++;
     register_mr.pd_h = mismatched_h;
     expect_status("REGISTER_MR_PD_GENERATION", register_mr.validate(),
-                  RDMA_SC_INVALID_ARGUMENT);
+                  RDMA_SC_STALE_GENERATION);
     register_mr.pd_h = pd_h;
 
     create_cq = rdma_create_cq_req::type_id::create("create_cq");
@@ -266,7 +266,7 @@ class rdma_request_model_test extends uvm_test;
     mismatched_h.generation++;
     create_srq.pd_h = mismatched_h;
     expect_status("CREATE_SRQ_PD_GENERATION", create_srq.validate(),
-                  RDMA_SC_INVALID_ARGUMENT);
+                  RDMA_SC_STALE_GENERATION);
     create_srq.pd_h = pd_h;
     create_srq.max_sge = 0;
     expect_status("CREATE_SRQ_SGE", create_srq.validate(),
@@ -486,6 +486,21 @@ class rdma_request_model_test extends uvm_test;
         ceq_resource == null || aeq_resource == null || cmq_resource == null)
       `uvm_error("RESOURCES", "one or more concrete resources are absent")
 
+    function_resource.handle = make_function_handle("function_resource_h");
+    function_resource.owner =
+      make_function_handle("function_resource_owner_h");
+    function_resource.state = RDMA_RESOURCE_ALLOCATED;
+    expect_status("FUNCTION_RESOURCE", function_resource.validate(),
+                  RDMA_SC_OK);
+    function_resource.handle.object_id++;
+    expect_status("FUNCTION_RESOURCE_OBJECT_ID", function_resource.validate(),
+                  RDMA_SC_INVALID_ARGUMENT);
+    function_resource.handle.object_id--;
+    function_resource.handle.generation++;
+    expect_status("FUNCTION_RESOURCE_GENERATION", function_resource.validate(),
+                  RDMA_SC_STALE_GENERATION);
+    function_resource.handle.generation--;
+
     expect_status("RESOURCE_NEW_IDENTITY_OPTIONAL", pd_resource.validate(),
                   RDMA_SC_OK);
     pd_resource.state = RDMA_RESOURCE_ALLOCATED;
@@ -503,7 +518,7 @@ class rdma_request_model_test extends uvm_test;
     pd_resource.handle.function_uid--;
     pd_resource.handle.generation++;
     expect_status("RESOURCE_HANDLE_GENERATION", pd_resource.validate(),
-                  RDMA_SC_INVALID_ARGUMENT);
+                  RDMA_SC_STALE_GENERATION);
     pd_resource.handle.generation--;
     pd_resource.dependencies.push_back(null);
     expect_status("RESOURCE_NULL_DEPENDENCY", pd_resource.validate(),
@@ -521,7 +536,7 @@ class rdma_request_model_test extends uvm_test;
     mismatched_h.generation++;
     pd_resource.dependencies.push_back(mismatched_h);
     expect_status("RESOURCE_STALE_DEPENDENCY", pd_resource.validate(),
-                  RDMA_SC_INVALID_ARGUMENT);
+                  RDMA_SC_STALE_GENERATION);
     pd_resource.dependencies.delete();
     function_h.kind = RDMA_RESOURCE_PD;
     expect_status("RESOURCE_OWNER_KIND", pd_resource.validate(),
@@ -572,7 +587,7 @@ class rdma_request_model_test extends uvm_test;
     mismatched_h.generation++;
     cq_resource.ceq_h = mismatched_h;
     expect_status("CQ_RESOURCE_CEQ_GENERATION", cq_resource.validate(),
-                  RDMA_SC_INVALID_ARGUMENT);
+                  RDMA_SC_STALE_GENERATION);
     cq_resource.ceq_h = cq_h;
     expect_status("CQ_RESOURCE_CEQ_KIND", cq_resource.validate(),
                   RDMA_SC_INVALID_ARGUMENT);
@@ -676,7 +691,7 @@ class rdma_request_model_test extends uvm_test;
     mismatched_h.generation++;
     qp_resource.recv_cq_h = mismatched_h;
     expect_status("QP_RESOURCE_CQ_GENERATION", qp_resource.validate(),
-                  RDMA_SC_INVALID_ARGUMENT);
+                  RDMA_SC_STALE_GENERATION);
     qp_resource.recv_cq_h = cq_h;
     cloned_object = qp_resource.clone();
     if (!$cast(qp_resource_clone, cloned_object))

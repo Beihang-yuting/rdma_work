@@ -214,13 +214,12 @@ class rdma_register_mr_req extends rdma_semantic_request;
     status = super.validate();
     if (!status.ok())
       return status;
-    if (owner == null || owner.kind != RDMA_RESOURCE_FUNCTION)
-      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                               "MR requires a function owner");
-    if (pd_h == null || pd_h.kind != RDMA_RESOURCE_PD ||
-        !rdma_handle_matches_owner(pd_h, owner))
+    if (pd_h != null && pd_h.kind != RDMA_RESOURCE_PD)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "MR requires a PD handle");
+    status = rdma_handle_owner_status(pd_h, owner);
+    if (!status.ok())
+      return status;
     if (length == 0)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "MR length is zero");
@@ -267,11 +266,14 @@ class rdma_create_cq_req extends rdma_semantic_request;
     if (owner == null || owner.kind != RDMA_RESOURCE_FUNCTION)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "CQ requires a function owner");
-    if (ceq_h != null &&
-        (ceq_h.kind != RDMA_RESOURCE_CEQ ||
-         !rdma_handle_matches_owner(ceq_h, owner)))
-      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                               "CQ CEQ handle is invalid");
+    if (ceq_h != null) begin
+      if (ceq_h.kind != RDMA_RESOURCE_CEQ)
+        return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                                 "CQ CEQ handle is invalid");
+      status = rdma_handle_owner_status(ceq_h, owner);
+      if (!status.ok())
+        return status;
+    end
     if (!rdma_is_power_of_two(depth))
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "CQ depth is not a nonzero power of two");
@@ -360,24 +362,32 @@ class rdma_create_qp_req extends rdma_semantic_request;
     if (max_send_sge == 0 || max_recv_sge == 0)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "QP maximum SGE count is zero");
-    if (owner == null || owner.kind != RDMA_RESOURCE_FUNCTION)
-      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                               "QP requires a function owner");
-    if (pd_h == null || pd_h.kind != RDMA_RESOURCE_PD ||
-        !rdma_handle_matches_owner(pd_h, owner))
+    if (pd_h != null && pd_h.kind != RDMA_RESOURCE_PD)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "QP requires a PD handle");
-    if (send_cq_h == null || send_cq_h.kind != RDMA_RESOURCE_CQ ||
-        !rdma_handle_matches_owner(send_cq_h, owner) ||
-        recv_cq_h == null || recv_cq_h.kind != RDMA_RESOURCE_CQ ||
-        !rdma_handle_matches_owner(recv_cq_h, owner))
+    status = rdma_handle_owner_status(pd_h, owner);
+    if (!status.ok())
+      return status;
+    if (send_cq_h != null && send_cq_h.kind != RDMA_RESOURCE_CQ)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "QP requires send and receive CQ handles");
-    if (srq_h != null &&
-        (srq_h.kind != RDMA_RESOURCE_SRQ ||
-         !rdma_handle_matches_owner(srq_h, owner)))
+    status = rdma_handle_owner_status(send_cq_h, owner);
+    if (!status.ok())
+      return status;
+    if (recv_cq_h != null && recv_cq_h.kind != RDMA_RESOURCE_CQ)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                               "QP SRQ handle is invalid");
+                               "QP requires send and receive CQ handles");
+    status = rdma_handle_owner_status(recv_cq_h, owner);
+    if (!status.ok())
+      return status;
+    if (srq_h != null) begin
+      if (srq_h.kind != RDMA_RESOURCE_SRQ)
+        return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                                 "QP SRQ handle is invalid");
+      status = rdma_handle_owner_status(srq_h, owner);
+      if (!status.ok())
+        return status;
+    end
     return rdma_status::success();
   endfunction
 endclass
@@ -427,13 +437,12 @@ class rdma_create_srq_req extends rdma_semantic_request;
     if (max_sge == 0)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "SRQ maximum SGE count is zero");
-    if (owner == null || owner.kind != RDMA_RESOURCE_FUNCTION)
-      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                               "SRQ requires a function owner");
-    if (pd_h == null || pd_h.kind != RDMA_RESOURCE_PD ||
-        !rdma_handle_matches_owner(pd_h, owner))
+    if (pd_h != null && pd_h.kind != RDMA_RESOURCE_PD)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "SRQ requires a PD handle");
+    status = rdma_handle_owner_status(pd_h, owner);
+    if (!status.ok())
+      return status;
     return rdma_status::success();
   endfunction
 endclass
