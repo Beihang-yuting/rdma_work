@@ -17,6 +17,9 @@ class rdma_status extends uvm_object;
 
   function new(string name = "rdma_status");
     super.new(name);
+    category = RDMA_STATUS_STATE;
+    code = RDMA_SC_OK;
+    severity = RDMA_SEVERITY_INFO;
   endfunction
 
   static function automatic rdma_status make(
@@ -56,7 +59,7 @@ class rdma_status extends uvm_object;
   );
     case (code)
       RDMA_SC_OK:
-        return RDMA_STATUS_NONE;
+        return RDMA_STATUS_STATE;
       RDMA_SC_INVALID_ARGUMENT,
       RDMA_SC_UNSUPPORTED_OPCODE:
         return RDMA_STATUS_CONFIGURATION;

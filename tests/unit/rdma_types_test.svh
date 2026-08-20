@@ -13,6 +13,7 @@ class rdma_types_test extends uvm_test;
     rdma_function_key_t function_key;
     rdma_status status;
     rdma_status ok_status;
+    rdma_status default_status;
     string status_text;
     rdma_status_code_e codes[$] = '{
       RDMA_SC_OK,
@@ -32,7 +33,7 @@ class rdma_types_test extends uvm_test;
       RDMA_SC_RESET_CANCELLED
     };
     rdma_status_category_e categories[$] = '{
-      RDMA_STATUS_NONE,
+      RDMA_STATUS_STATE,
       RDMA_STATUS_CONFIGURATION,
       RDMA_STATUS_STATE,
       RDMA_STATUS_STATE,
@@ -63,10 +64,16 @@ class rdma_types_test extends uvm_test;
     if (!ok_status.ok())
       `uvm_error("STATUS", "success() did not return an OK status")
     if (ok_status.code != RDMA_SC_OK ||
-        ok_status.category != RDMA_STATUS_NONE ||
+        ok_status.category != RDMA_STATUS_STATE ||
         ok_status.severity != RDMA_SEVERITY_INFO ||
         ok_status.message != "ready")
       `uvm_error("STATUS", "success() initialized fields incorrectly")
+
+    default_status = rdma_status::type_id::create("default_status");
+    if (!default_status.ok() ||
+        default_status.category != RDMA_STATUS_STATE ||
+        default_status.severity != RDMA_SEVERITY_INFO)
+      `uvm_error("STATUS", "constructor defaults are not successful")
 
     foreach (codes[i]) begin
       if (rdma_status::category_for(codes[i]) != categories[i])

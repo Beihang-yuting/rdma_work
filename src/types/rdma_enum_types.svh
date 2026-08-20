@@ -17,7 +17,6 @@ typedef enum bit [4:0] {
 } rdma_status_code_e;
 
 typedef enum bit [3:0] {
-  RDMA_STATUS_NONE,
   RDMA_STATUS_CONFIGURATION,
   RDMA_STATUS_RESOURCE,
   RDMA_STATUS_STATE,
