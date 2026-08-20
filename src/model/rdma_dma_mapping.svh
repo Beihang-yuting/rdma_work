@@ -28,6 +28,40 @@ class rdma_dma_mapping extends uvm_object;
     owner_h = null;
   endfunction
 
+  virtual function void do_copy(uvm_object rhs);
+    rdma_dma_mapping rhs_mapping;
+    uvm_object cloned_object;
+
+    super.do_copy(rhs);
+    if (!$cast(rhs_mapping, rhs))
+      `uvm_fatal("RDMA_COPY_TYPE", "rdma_dma_mapping copy type mismatch")
+    if (rhs_mapping.function_h == null) begin
+      function_h = null;
+    end
+    else begin
+      cloned_object = rhs_mapping.function_h.clone();
+      if (cloned_object == null || !$cast(function_h, cloned_object))
+        `uvm_fatal("RDMA_COPY_TYPE", "rdma_function_handle clone type mismatch")
+    end
+    requester_bdf = rhs_mapping.requester_bdf;
+    pasid_valid = rhs_mapping.pasid_valid;
+    pasid = rhs_mapping.pasid;
+    backing_addr = rhs_mapping.backing_addr;
+    iova = rhs_mapping.iova;
+    size = rhs_mapping.size;
+    direction = rhs_mapping.direction;
+    permissions = rhs_mapping.permissions;
+    state = rhs_mapping.state;
+    if (rhs_mapping.owner_h == null) begin
+      owner_h = null;
+    end
+    else begin
+      cloned_object = rhs_mapping.owner_h.clone();
+      if (cloned_object == null || !$cast(owner_h, cloned_object))
+        `uvm_fatal("RDMA_COPY_TYPE", "rdma_handle clone type mismatch")
+    end
+  endfunction
+
   function rdma_status check_access(
     rdma_function_handle requested_function,
     rdma_bdf_t requested_requester_bdf,
@@ -51,15 +85,14 @@ class rdma_dma_mapping extends uvm_object;
     if (function_h.kind != RDMA_RESOURCE_FUNCTION)
       return rdma_status::make(RDMA_SC_INVALID_STATE,
                                "mapping handle kind is not FUNCTION");
+    if (requested_function.kind != RDMA_RESOURCE_FUNCTION ||
+        requested_function.function_uid != function_h.function_uid ||
+        requested_function.object_id != function_h.object_id)
+      return rdma_status::make(RDMA_SC_DMA_TRANSLATION,
+                               "requested function does not own mapping");
     if (requested_function.generation != function_h.generation)
       return rdma_status::make(RDMA_SC_STALE_GENERATION,
                                "requested function generation is stale");
-    if (requested_function.kind != RDMA_RESOURCE_FUNCTION ||
-        requested_function.function_uid != function_h.function_uid ||
-        requested_function.object_id != function_h.object_id ||
-        !function_h.same_instance(requested_function))
-      return rdma_status::make(RDMA_SC_DMA_TRANSLATION,
-                               "requested function does not own mapping");
     if (requested_requester_bdf != requester_bdf)
       return rdma_status::make(RDMA_SC_DMA_TRANSLATION,
                                "requester BDF does not match mapping");

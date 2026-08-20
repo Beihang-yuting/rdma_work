@@ -36,4 +36,24 @@ class rdma_hw_image extends uvm_object;
     bar_target = '0;
     field_summary.delete();
   endfunction
+
+  virtual function void do_copy(uvm_object rhs);
+    rdma_hw_image rhs_image;
+
+    super.do_copy(rhs);
+    if (!$cast(rhs_image, rhs))
+      `uvm_fatal("RDMA_COPY_TYPE", "rdma_hw_image copy type mismatch")
+    bytes = rhs_image.bytes;
+    length = rhs_image.length;
+    alignment = rhs_image.alignment;
+    endian = rhs_image.endian;
+    image_kind = rhs_image.image_kind;
+    hardware_version = rhs_image.hardware_version;
+    function_generation = rhs_image.function_generation;
+    write_target_kind = rhs_image.write_target_kind;
+    backing_target = rhs_image.backing_target;
+    hmc_target = rhs_image.hmc_target;
+    bar_target = rhs_image.bar_target;
+    field_summary = rhs_image.field_summary;
+  endfunction
 endclass

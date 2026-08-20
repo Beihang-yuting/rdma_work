@@ -13,6 +13,18 @@ class rdma_bar_info extends uvm_object;
     size = '0;
     enabled = 1'b0;
   endfunction
+
+  virtual function void do_copy(uvm_object rhs);
+    rdma_bar_info rhs_bar;
+
+    super.do_copy(rhs);
+    if (!$cast(rhs_bar, rhs))
+      `uvm_fatal("RDMA_COPY_TYPE", "rdma_bar_info copy type mismatch")
+    bar_id = rhs_bar.bar_id;
+    base = rhs_bar.base;
+    size = rhs_bar.size;
+    enabled = rhs_bar.enabled;
+  endfunction
 endclass
 
 class rdma_pcie_identity extends uvm_object;
@@ -37,6 +49,30 @@ class rdma_pcie_identity extends uvm_object;
       bar[i].bar_id = i;
     end
   endfunction
+
+  virtual function void do_copy(uvm_object rhs);
+    rdma_pcie_identity rhs_pcie;
+    uvm_object cloned_object;
+
+    super.do_copy(rhs);
+    if (!$cast(rhs_pcie, rhs))
+      `uvm_fatal("RDMA_COPY_TYPE", "rdma_pcie_identity copy type mismatch")
+    bdf = rhs_pcie.bdf;
+    parent_pf_bdf = rhs_pcie.parent_pf_bdf;
+    vf_index = rhs_pcie.vf_index;
+    mse = rhs_pcie.mse;
+    bme = rhs_pcie.bme;
+    foreach (bar[i]) begin
+      if (rhs_pcie.bar[i] == null) begin
+        bar[i] = null;
+      end
+      else begin
+        cloned_object = rhs_pcie.bar[i].clone();
+        if (cloned_object == null || !$cast(bar[i], cloned_object))
+          `uvm_fatal("RDMA_COPY_TYPE", "rdma_bar_info clone type mismatch")
+      end
+    end
+  endfunction
 endclass
 
 class rdma_pcie_function_info extends rdma_pcie_identity;
@@ -59,6 +95,17 @@ class rdma_bar_decode extends uvm_object;
     target_bdf = '0;
     bar_id = '0;
     bar_offset = '0;
+  endfunction
+
+  virtual function void do_copy(uvm_object rhs);
+    rdma_bar_decode rhs_decode;
+
+    super.do_copy(rhs);
+    if (!$cast(rhs_decode, rhs))
+      `uvm_fatal("RDMA_COPY_TYPE", "rdma_bar_decode copy type mismatch")
+    target_bdf = rhs_decode.target_bdf;
+    bar_id = rhs_decode.bar_id;
+    bar_offset = rhs_decode.bar_offset;
   endfunction
 endclass
 
@@ -118,6 +165,52 @@ class rdma_function_binding extends uvm_object;
     dmi_ready = 1'b0;
     vft_valid = 1'b0;
     vft_ready = 1'b0;
+  endfunction
+
+  virtual function void do_copy(uvm_object rhs);
+    rdma_function_binding rhs_binding;
+    uvm_object cloned_object;
+
+    super.do_copy(rhs);
+    if (!$cast(rhs_binding, rhs))
+      `uvm_fatal("RDMA_COPY_TYPE", "rdma_function_binding copy type mismatch")
+    function_uid = rhs_binding.function_uid;
+    if (rhs_binding.pcie == null) begin
+      pcie = null;
+    end
+    else begin
+      cloned_object = rhs_binding.pcie.clone();
+      if (cloned_object == null || !$cast(pcie, cloned_object))
+        `uvm_fatal("RDMA_COPY_TYPE", "rdma_pcie_identity clone type mismatch")
+    end
+    notify_bar_id = rhs_binding.notify_bar_id;
+    notify_base = rhs_binding.notify_base;
+    notify_size = rhs_binding.notify_size;
+    notify_table_sel = rhs_binding.notify_table_sel;
+    notify_table_index = rhs_binding.notify_table_index;
+    host_id = rhs_binding.host_id;
+    pfvf_id = rhs_binding.pfvf_id;
+    rdma_vf_id = rhs_binding.rdma_vf_id;
+    global_function_id = rhs_binding.global_function_id;
+    vsi_id = rhs_binding.vsi_id;
+    dma_domain_id = rhs_binding.dma_domain_id;
+    dma_domain_valid = rhs_binding.dma_domain_valid;
+    state = rhs_binding.state;
+    generation = rhs_binding.generation;
+    if (rhs_binding.owner_h == null) begin
+      owner_h = null;
+    end
+    else begin
+      cloned_object = rhs_binding.owner_h.clone();
+      if (cloned_object == null || !$cast(owner_h, cloned_object))
+        `uvm_fatal("RDMA_COPY_TYPE", "rdma_handle clone type mismatch")
+    end
+    notify_valid = rhs_binding.notify_valid;
+    notify_ready = rhs_binding.notify_ready;
+    dmi_valid = rhs_binding.dmi_valid;
+    dmi_ready = rhs_binding.dmi_ready;
+    vft_valid = rhs_binding.vft_valid;
+    vft_ready = rhs_binding.vft_ready;
   endfunction
 
   function rdma_function_handle make_handle();
@@ -197,9 +290,11 @@ class rdma_function_binding extends uvm_object;
       if (owner_h == null)
         return rdma_status::make(RDMA_SC_INVALID_STATE,
                                  "ACTIVE binding has no owner handle");
-      if (owner_h.function_uid != function_uid)
+      if (owner_h.kind != RDMA_RESOURCE_FUNCTION ||
+          owner_h.function_uid != function_uid ||
+          owner_h.object_id != global_function_id)
         return rdma_status::make(RDMA_SC_INVALID_STATE,
-                                 "ACTIVE binding owner is from another function");
+                                 "ACTIVE binding owner identity does not match");
       if (owner_h.generation != generation)
         return rdma_status::make(RDMA_SC_STALE_GENERATION,
                                  "ACTIVE binding owner generation is stale");
