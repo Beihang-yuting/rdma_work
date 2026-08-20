@@ -1,0 +1,371 @@
+class rdma_adapter_test_observer extends rdma_net_observer;
+  `uvm_object_utils(rdma_adapter_test_observer)
+
+  int unsigned notification_count;
+  rdma_packet last_packet;
+
+  function new(string name = "rdma_adapter_test_observer");
+    super.new(name);
+    notification_count = 0;
+    last_packet = null;
+  endfunction
+
+  virtual function void write(rdma_packet packet);
+    uvm_object cloned_object;
+
+    notification_count++;
+    if (packet == null) begin
+      last_packet = null;
+      return;
+    end
+    cloned_object = packet.clone();
+    if (cloned_object == null || !$cast(last_packet, cloned_object))
+      `uvm_fatal("OBSERVER_COPY", "packet clone type mismatch")
+  endfunction
+endclass
+
+class rdma_adapter_contract_test extends uvm_test;
+  `uvm_component_utils(rdma_adapter_contract_test)
+
+  function new(string name = "rdma_adapter_contract_test",
+               uvm_component parent = null);
+    super.new(name, parent);
+  endfunction
+
+  function automatic rdma_function_handle make_function_handle(string name);
+    rdma_function_handle function_h;
+
+    function_h = rdma_function_handle::type_id::create(name);
+    function_h.function_uid = 64'h1234_5678_9abc_def0;
+    function_h.object_id = 32'h1020_3040;
+    function_h.generation = 32'd17;
+    return function_h;
+  endfunction
+
+  function automatic rdma_function_binding make_binding(string name);
+    rdma_function_binding binding;
+
+    binding = rdma_function_binding::type_id::create(name);
+    binding.function_uid = 64'h1234_5678_9abc_def0;
+    binding.global_function_id = 32'h1020_3040;
+    binding.generation = 32'd17;
+    binding.notify_base.value = 64'h8000_1000;
+    binding.dma_domain_id = 32'h55aa;
+    return binding;
+  endfunction
+
+  function automatic rdma_packet make_packet(string name, byte value);
+    rdma_packet packet;
+
+    packet = rdma_packet::type_id::create(name);
+    packet.transport = RDMA_TRANSPORT_RC;
+    packet.opcode = RDMA_NET_SEND;
+    packet.destination_qpn = 24'h102030;
+    packet.source_qpn = 24'h405060;
+    packet.psn = 24'h708090;
+    packet.payload.push_back(value);
+    packet.payload.push_back(value + 1'b1);
+    return packet;
+  endfunction
+
+  function automatic void expect_status(
+    string check_name,
+    rdma_status status,
+    rdma_status_code_e expected_code
+  );
+    if (status == null) begin
+      `uvm_error(check_name, "adapter returned a null status")
+      return;
+    end
+    if (status.code != expected_code)
+      `uvm_error(check_name,
+                 $sformatf("expected %s, got %s", expected_code.name(),
+                           status.code.name()))
+  endfunction
+
+  task run_phase(uvm_phase phase);
+    rdma_mock_host_mem mem;
+    rdma_host_mem_api mem_api;
+    rdma_mock_pcie pcie;
+    rdma_pcie_api pcie_api;
+    rdma_mock_function_table table;
+    rdma_function_table_api table_api;
+    rdma_mock_net net;
+    rdma_net_api net_api;
+    rdma_adapter_test_observer observer;
+    rdma_function_handle function_h;
+    rdma_dma_mapping mapping;
+    rdma_dma_mapping failed_mapping;
+    rdma_dma_mapping second_mapping;
+    rdma_function_binding binding;
+    rdma_packet tx_packet;
+    rdma_packet rx_source;
+    rdma_packet rx_packet;
+    rdma_net_response_policy policy;
+    rdma_net_fault fault;
+    rdma_pcie_function_info info;
+    rdma_pcie_function_info info_result;
+    rdma_bar_decode decode;
+    rdma_bar_decode decode_result;
+    rdma_status status;
+    rdma_status injected;
+    rdma_bdf_t bdf;
+    rdma_cfg_offset_t cfg_offset;
+    rdma_bar_addr_t bar_address;
+    bit [31:0] cfg_data;
+    byte write_data[] = '{8'h11, 8'h22, 8'h33, 8'h44};
+    byte read_data[];
+    byte overflow_data[] = '{8'haa, 8'hbb};
+
+    phase.raise_objection(this);
+
+    function_h = make_function_handle("function_h");
+    bdf = '{segment:16'h1, bus:8'h22, device:5'h3, function_num:3'h4};
+    cfg_offset.value = 12'habc;
+    bar_address.value = 64'h9000_0040;
+
+    mem = rdma_mock_host_mem::type_id::create("mem");
+    mem_api = mem;
+    status = mem_api.allocate(function_h, 4096, 4096,
+                              RDMA_DMA_BIDIRECTIONAL, mapping);
+    expect_status("HOST_ALLOCATE", status, RDMA_SC_OK);
+    if (mapping == null || mapping.size != 4096 ||
+        mapping.function_h == null ||
+        mapping.function_h.generation != function_h.generation)
+      `uvm_error("HOST_ALLOCATE", "host adapter contract failed")
+    if (mem.calls.size() != 1 || mem.calls[0].call_sequence != 1 ||
+        mem.calls[0].method_name != "allocate" ||
+        mem.calls[0].function_h == function_h ||
+        mem.calls[0].function_h.generation != 17 ||
+        mem.calls[0].size != 4096 || mem.calls[0].alignment != 4096)
+      `uvm_error("HOST_RECORD", "allocate call was not recorded by value")
+
+    status = mem_api.write(mapping, 8, write_data);
+    expect_status("HOST_WRITE", status, RDMA_SC_OK);
+    write_data[0] = 8'hff;
+    if (mem.calls.size() != 2 || mem.calls[1].call_sequence != 2 ||
+        mem.calls[1].method_name != "write" ||
+        mem.calls[1].mapping == mapping || mem.calls[1].offset != 8 ||
+        mem.calls[1].data.size() != 4 || mem.calls[1].data[0] != 8'h11)
+      `uvm_error("HOST_WRITE_RECORD", "write history aliases caller data")
+
+    status = mem_api.read(mapping, 8, 4, read_data);
+    expect_status("HOST_READ", status, RDMA_SC_OK);
+    if (read_data.size() != 4 || read_data[0] != 8'h11 ||
+        read_data[3] != 8'h44 || mem.calls[2].call_sequence != 3 ||
+        mem.calls[2].method_name != "read")
+      `uvm_error("HOST_READ", "host read did not preserve payload/order")
+
+    status = mem_api.write(mapping, 4095, overflow_data);
+    expect_status("HOST_BOUNDS", status, RDMA_SC_DMA_TRANSLATION);
+    status = mem_api.\release (mapping);
+    expect_status("HOST_RELEASE", status, RDMA_SC_OK);
+    status = mem_api.read(mapping, 0, 1, read_data);
+    expect_status("HOST_RELEASED_READ", status, RDMA_SC_INVALID_STATE);
+
+    injected = rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED, "one shot");
+    mem.fail_next("allocate", injected);
+    injected.message = "caller mutation";
+    status = mem_api.allocate(function_h, 64, 64, RDMA_DMA_DEVICE_READ,
+                              failed_mapping);
+    expect_status("HOST_INJECTED", status, RDMA_SC_RESOURCE_EXHAUSTED);
+    if (status.message != "one shot" || failed_mapping != null)
+      `uvm_error("HOST_INJECTED", "injected failure was not copied")
+    status = mem_api.allocate(function_h, 64, 64, RDMA_DMA_DEVICE_READ,
+                              second_mapping);
+    expect_status("HOST_ONE_SHOT", status, RDMA_SC_OK);
+
+    pcie = rdma_mock_pcie::type_id::create("pcie");
+    pcie_api = pcie;
+    pcie.cfg_read_value = 32'hdead_beef;
+    pcie_api.cfg_read32(bdf, cfg_offset, cfg_data, status);
+    expect_status("PCIE_CFG_READ", status, RDMA_SC_OK);
+    if (cfg_data != 32'hdead_beef)
+      `uvm_error("PCIE_CFG_READ", "configured read value was not returned")
+    pcie_api.cfg_write32(bdf, cfg_offset, 32'h1234_5678, 4'b1010,
+                         status);
+    expect_status("PCIE_CFG_WRITE", status, RDMA_SC_OK);
+    pcie_api.mmio_write(function_h, bar_address, overflow_data, status);
+    expect_status("PCIE_MMIO", status, RDMA_SC_OK);
+    overflow_data[0] = 8'h00;
+    pcie_api.dma_visibility_barrier(function_h, status);
+    expect_status("PCIE_DMA_BARRIER", status, RDMA_SC_OK);
+    pcie_api.mmio_ordering_barrier(function_h, status);
+    expect_status("PCIE_MMIO_BARRIER", status, RDMA_SC_OK);
+
+    info = rdma_pcie_function_info::type_id::create("info");
+    info.bdf = bdf;
+    info.vf_index = 32'd9;
+    pcie.function_info_response = info;
+    status = pcie_api.get_function_info(bdf, info_result);
+    expect_status("PCIE_INFO", status, RDMA_SC_OK);
+    if (info_result == null || info_result == info ||
+        info_result.vf_index != 9)
+      `uvm_error("PCIE_INFO", "function info response was not copied")
+
+    decode = rdma_bar_decode::type_id::create("decode");
+    decode.target_bdf = bdf;
+    decode.bar_id = 3'd2;
+    decode.bar_offset = 64'h40;
+    pcie.decode_response = decode;
+    status = pcie_api.decode_bar(bar_address, decode_result);
+    expect_status("PCIE_DECODE", status, RDMA_SC_OK);
+    if (decode_result == null || decode_result == decode ||
+        decode_result.bar_offset != 64'h40)
+      `uvm_error("PCIE_DECODE", "BAR decode response was not copied")
+
+    function_h.generation = 32'd99;
+    if (pcie.calls.size() != 7 || pcie.calls[0].call_sequence != 1 ||
+        pcie.calls[1].call_sequence != 2 ||
+        pcie.calls[2].call_sequence != 3 ||
+        pcie.calls[2].method_name != "mmio_write" ||
+        pcie.calls[2].function_h == function_h ||
+        pcie.calls[2].function_h.generation != 17 ||
+        pcie.calls[2].address != bar_address ||
+        pcie.calls[2].data.size() != 2 || pcie.calls[2].data[0] != 8'haa ||
+        pcie.calls[6].method_name != "decode_bar")
+      `uvm_error("PCIE_RECORD", "PCIe call order/data were not preserved")
+    function_h.generation = 32'd17;
+    pcie.fail_next("cfg_read32",
+                   rdma_status::make(RDMA_SC_PCIE_COMPLETION, "one shot"));
+    pcie_api.cfg_read32(bdf, cfg_offset, cfg_data, status);
+    expect_status("PCIE_INJECTED", status, RDMA_SC_PCIE_COMPLETION);
+    pcie_api.cfg_read32(bdf, cfg_offset, cfg_data, status);
+    expect_status("PCIE_ONE_SHOT", status, RDMA_SC_OK);
+
+    table = rdma_mock_function_table::type_id::create("table");
+    table_api = table;
+    binding = make_binding("binding");
+    table_api.program_notify(binding, status);
+    expect_status("TABLE_PROGRAM_NOTIFY", status, RDMA_SC_OK);
+    table_api.clear_notify(binding, status);
+    expect_status("TABLE_CLEAR_NOTIFY", status, RDMA_SC_OK);
+    table_api.program_dmi(binding, status);
+    expect_status("TABLE_PROGRAM_DMI", status, RDMA_SC_OK);
+    table_api.clear_dmi(binding, status);
+    expect_status("TABLE_CLEAR_DMI", status, RDMA_SC_OK);
+    table_api.program_vft(binding, status);
+    expect_status("TABLE_PROGRAM_VFT", status, RDMA_SC_OK);
+    table_api.clear_vft(binding, status);
+    expect_status("TABLE_CLEAR_VFT", status, RDMA_SC_OK);
+    binding.generation = 32'd33;
+    if (table.calls.size() != 6 || table.calls[0].call_sequence != 1 ||
+        table.calls[5].call_sequence != 6 ||
+        table.calls[0].method_name != "program_notify" ||
+        table.calls[5].method_name != "clear_vft" ||
+        table.calls[0].binding == binding ||
+        table.calls[0].binding.generation != 17)
+      `uvm_error("TABLE_RECORD", "table call order/value was not preserved")
+    binding.generation = 32'd17;
+    table.fail_next("program_notify",
+                    rdma_status::make(RDMA_SC_INVALID_STATE, "one shot"));
+    table_api.program_notify(binding, status);
+    expect_status("TABLE_INJECTED", status, RDMA_SC_INVALID_STATE);
+    table_api.program_notify(binding, status);
+    expect_status("TABLE_ONE_SHOT", status, RDMA_SC_OK);
+
+    net = rdma_mock_net::type_id::create("net");
+    net_api = net;
+    observer = rdma_adapter_test_observer::type_id::create("observer");
+    net_api.register_observer(observer);
+    tx_packet = make_packet("tx_packet", 8'h31);
+    net_api.send_packet(tx_packet, status);
+    expect_status("NET_SEND", status, RDMA_SC_OK);
+    tx_packet.payload[0] = 8'hff;
+    if (observer.notification_count != 1 || observer.last_packet == null ||
+        observer.last_packet.payload[0] != 8'h31)
+      `uvm_error("NET_OBSERVER", "observer was not notified by value")
+
+    rx_source = make_packet("rx_source", 8'h51);
+    net.enqueue_receive(rx_source);
+    rx_source.payload[0] = 8'h00;
+    net_api.receive_packet(rx_packet, status);
+    expect_status("NET_RECEIVE", status, RDMA_SC_OK);
+    if (rx_packet == null || rx_packet.payload[0] != 8'h51)
+      `uvm_error("NET_RECEIVE", "receive queue aliases its source")
+
+    policy = rdma_net_response_policy::type_id::create("policy");
+    policy.responder_mode = RDMA_RESPONDER_VIP;
+    policy.drop_every_n = 7;
+    status = net_api.configure_response_policy(policy);
+    expect_status("NET_POLICY", status, RDMA_SC_OK);
+    fault = rdma_net_fault::type_id::create("fault");
+    fault.kind = RDMA_FAULT_PACKET_DROP;
+    fault.drop_packet = 1'b1;
+    status = net_api.inject_fault(fault);
+    expect_status("NET_FAULT", status, RDMA_SC_OK);
+    policy.drop_every_n = 99;
+    fault.drop_packet = 1'b0;
+    if (net.calls.size() != 5 || net.calls[0].call_sequence != 1 ||
+        net.calls[4].call_sequence != 5 ||
+        net.calls[0].method_name != "register_observer" ||
+        net.calls[1].method_name != "send_packet" ||
+        net.calls[1].packet == tx_packet ||
+        net.calls[1].packet.payload[0] != 8'h31 ||
+        net.calls[3].policy == policy || net.calls[3].policy.drop_every_n != 7 ||
+        net.calls[4].fault == fault || !net.calls[4].fault.drop_packet)
+      `uvm_error("NET_RECORD", "network call order/value was not preserved")
+
+    net.fail_next("send_packet",
+                  rdma_status::make(RDMA_SC_TIMEOUT, "one shot"));
+    net_api.send_packet(tx_packet, status);
+    expect_status("NET_INJECTED", status, RDMA_SC_TIMEOUT);
+    net_api.send_packet(tx_packet, status);
+    expect_status("NET_ONE_SHOT", status, RDMA_SC_OK);
+    if (observer.notification_count != 2)
+      `uvm_error("NET_OBSERVER", "failed send notified observer")
+
+    if (mem.calls.size() != 8 ||
+        mem.calls[3].method_name != "write" ||
+        mem.calls[4].method_name != "release" ||
+        mem.calls[5].method_name != "read" ||
+        mem.calls[6].method_name != "allocate" ||
+        mem.calls[7].method_name != "allocate")
+      `uvm_error("HOST_ORDER", "host call history is incomplete")
+    foreach (mem.calls[i]) begin
+      if (mem.calls[i].call_sequence != i + 1)
+        `uvm_error("HOST_ORDER", "host call sequence is not monotonic")
+    end
+
+    if (pcie.calls.size() != 9 ||
+        pcie.calls[0].target != bdf ||
+        pcie.calls[0].offset != cfg_offset ||
+        pcie.calls[1].cfg_data != 32'h1234_5678 ||
+        pcie.calls[1].byte_enable != 4'b1010 ||
+        pcie.calls[3].method_name != "dma_visibility_barrier" ||
+        pcie.calls[4].method_name != "mmio_ordering_barrier" ||
+        pcie.calls[5].method_name != "get_function_info" ||
+        pcie.calls[7].method_name != "cfg_read32" ||
+        pcie.calls[8].method_name != "cfg_read32")
+      `uvm_error("PCIE_ORDER", "PCIe call history is incomplete")
+    foreach (pcie.calls[i]) begin
+      if (pcie.calls[i].call_sequence != i + 1)
+        `uvm_error("PCIE_ORDER", "PCIe call sequence is not monotonic")
+    end
+
+    if (table.calls.size() != 8 ||
+        table.calls[1].method_name != "clear_notify" ||
+        table.calls[2].method_name != "program_dmi" ||
+        table.calls[3].method_name != "clear_dmi" ||
+        table.calls[4].method_name != "program_vft" ||
+        table.calls[6].method_name != "program_notify" ||
+        table.calls[7].method_name != "program_notify")
+      `uvm_error("TABLE_ORDER", "table call history is incomplete")
+    foreach (table.calls[i]) begin
+      if (table.calls[i].call_sequence != i + 1)
+        `uvm_error("TABLE_ORDER", "table call sequence is not monotonic")
+    end
+
+    if (net.calls.size() != 7 || net.calls[2].packet == null ||
+        net.calls[2].packet.payload[0] != 8'h51 ||
+        net.calls[5].method_name != "send_packet" ||
+        net.calls[6].method_name != "send_packet")
+      `uvm_error("NET_ORDER", "network call history is incomplete")
+    foreach (net.calls[i]) begin
+      if (net.calls[i].call_sequence != i + 1)
+        `uvm_error("NET_ORDER", "network call sequence is not monotonic")
+    end
+
+    phase.drop_objection(this);
+  endtask
+endclass
