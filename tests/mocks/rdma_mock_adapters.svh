@@ -74,6 +74,20 @@ function automatic rdma_packet rdma_mock_clone_packet(rdma_packet source);
   return result;
 endfunction
 
+function automatic rdma_net_observer rdma_mock_clone_observer(
+  rdma_net_observer source
+);
+  uvm_object cloned_object;
+  rdma_net_observer result;
+
+  if (source == null)
+    return null;
+  cloned_object = source.clone();
+  if (cloned_object == null || !$cast(result, cloned_object))
+    `uvm_fatal("MOCK_COPY", "network observer clone type mismatch")
+  return result;
+endfunction
+
 function automatic rdma_net_response_policy rdma_mock_clone_policy(
   rdma_net_response_policy source
 );
@@ -301,6 +315,7 @@ class rdma_mock_host_mem extends rdma_host_mem_api;
   );
     rdma_status failure;
     int region_index;
+    longint unsigned allocated_size;
 
     record_call("write", null, mapping, data.size(), 0,
                 RDMA_DMA_DEVICE_READ, offset, data);
@@ -317,7 +332,14 @@ class rdma_mock_host_mem extends rdma_host_mem_api;
     if (region_index < 0)
       return rdma_status::make(RDMA_SC_DMA_TRANSLATION,
                                "DMA mapping is unknown");
-    if (offset > mapping.size || data.size() > (mapping.size - offset))
+    if (regions[region_index].mapping.state != RDMA_MAPPING_ACTIVE)
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "DMA allocation is not active");
+    allocated_size = regions[region_index].mapping.size;
+    if (offset > allocated_size)
+      return rdma_status::make(RDMA_SC_DMA_TRANSLATION,
+                               "write is outside the DMA mapping");
+    if (data.size() > (allocated_size - offset))
       return rdma_status::make(RDMA_SC_DMA_TRANSLATION,
                                "write is outside the DMA mapping");
     foreach (data[i])
@@ -333,6 +355,7 @@ class rdma_mock_host_mem extends rdma_host_mem_api;
   );
     rdma_status failure;
     int region_index;
+    longint unsigned allocated_size;
 
     record_call("read", null, mapping, size, 0, RDMA_DMA_DEVICE_READ,
                 offset);
@@ -350,7 +373,14 @@ class rdma_mock_host_mem extends rdma_host_mem_api;
     if (region_index < 0)
       return rdma_status::make(RDMA_SC_DMA_TRANSLATION,
                                "DMA mapping is unknown");
-    if (offset > mapping.size || size > (mapping.size - offset))
+    if (regions[region_index].mapping.state != RDMA_MAPPING_ACTIVE)
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "DMA allocation is not active");
+    allocated_size = regions[region_index].mapping.size;
+    if (offset > allocated_size)
+      return rdma_status::make(RDMA_SC_DMA_TRANSLATION,
+                               "read is outside the DMA mapping");
+    if (size > (allocated_size - offset))
       return rdma_status::make(RDMA_SC_DMA_TRANSLATION,
                                "read is outside the DMA mapping");
     data = new[size];
@@ -377,6 +407,9 @@ class rdma_mock_host_mem extends rdma_host_mem_api;
     if (region_index < 0)
       return rdma_status::make(RDMA_SC_DMA_TRANSLATION,
                                "DMA mapping is unknown");
+    if (regions[region_index].mapping.state != RDMA_MAPPING_ACTIVE)
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "DMA allocation is not active");
     mapping.state = RDMA_MAPPING_RELEASED;
     regions[region_index].mapping.state = RDMA_MAPPING_RELEASED;
     return rdma_status::success();
@@ -727,7 +760,7 @@ class rdma_mock_net extends rdma_net_api;
     call_record.call_sequence = next_sequence;
     call_record.method_name = method_name;
     call_record.packet = rdma_mock_clone_packet(packet);
-    call_record.observer = observer;
+    call_record.observer = rdma_mock_clone_observer(observer);
     call_record.policy = rdma_mock_clone_policy(policy);
     call_record.fault = rdma_mock_clone_fault(fault);
     calls.push_back(call_record);

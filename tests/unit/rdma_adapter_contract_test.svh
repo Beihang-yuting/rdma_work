@@ -10,6 +10,24 @@ class rdma_adapter_test_observer extends rdma_net_observer;
     last_packet = null;
   endfunction
 
+  virtual function void do_copy(uvm_object rhs);
+    rdma_adapter_test_observer rhs_observer;
+    uvm_object cloned_object;
+
+    super.do_copy(rhs);
+    if (!$cast(rhs_observer, rhs))
+      `uvm_fatal("OBSERVER_COPY", "observer copy type mismatch")
+    notification_count = rhs_observer.notification_count;
+    if (rhs_observer.last_packet == null) begin
+      last_packet = null;
+    end
+    else begin
+      cloned_object = rhs_observer.last_packet.clone();
+      if (cloned_object == null || !$cast(last_packet, cloned_object))
+        `uvm_fatal("OBSERVER_COPY", "observer packet clone type mismatch")
+    end
+  endfunction
+
   virtual function void write(rdma_packet packet);
     uvm_object cloned_object;
 
@@ -86,6 +104,8 @@ class rdma_adapter_contract_test extends uvm_test;
   task run_phase(uvm_phase phase);
     rdma_mock_host_mem mem;
     rdma_host_mem_api mem_api;
+    rdma_mock_host_mem authoritative_mem;
+    rdma_host_mem_api authoritative_mem_api;
     rdma_mock_pcie pcie;
     rdma_pcie_api pcie_api;
     rdma_mock_function_table table;
@@ -93,12 +113,16 @@ class rdma_adapter_contract_test extends uvm_test;
     rdma_mock_net net;
     rdma_net_api net_api;
     rdma_adapter_test_observer observer;
+    rdma_adapter_test_observer observer_snapshot;
     rdma_function_handle function_h;
     rdma_dma_mapping mapping;
     rdma_dma_mapping failed_mapping;
     rdma_dma_mapping second_mapping;
+    rdma_dma_mapping authoritative_mapping;
+    rdma_dma_mapping stale_active_mapping;
     rdma_function_binding binding;
     rdma_packet tx_packet;
+    rdma_packet observer_seed;
     rdma_packet rx_source;
     rdma_packet rx_packet;
     rdma_net_response_policy policy;
@@ -109,6 +133,7 @@ class rdma_adapter_contract_test extends uvm_test;
     rdma_bar_decode decode_result;
     rdma_status status;
     rdma_status injected;
+    uvm_object cloned_object;
     rdma_bdf_t bdf;
     rdma_cfg_offset_t cfg_offset;
     rdma_bar_addr_t bar_address;
@@ -116,6 +141,7 @@ class rdma_adapter_contract_test extends uvm_test;
     byte write_data[] = '{8'h11, 8'h22, 8'h33, 8'h44};
     byte read_data[];
     byte overflow_data[] = '{8'haa, 8'hbb};
+    byte crossing_data[] = '{8'hde, 8'had};
 
     phase.raise_objection(this);
 
@@ -174,6 +200,52 @@ class rdma_adapter_contract_test extends uvm_test;
     status = mem_api.allocate(function_h, 64, 64, RDMA_DMA_DEVICE_READ,
                               second_mapping);
     expect_status("HOST_ONE_SHOT", status, RDMA_SC_OK);
+
+    authoritative_mem = rdma_mock_host_mem::type_id::create(
+      "authoritative_mem"
+    );
+    authoritative_mem_api = authoritative_mem;
+    status = authoritative_mem_api.allocate(
+      function_h, 64, 64, RDMA_DMA_BIDIRECTIONAL, authoritative_mapping
+    );
+    expect_status("HOST_AUTH_ALLOCATE", status, RDMA_SC_OK);
+    cloned_object = authoritative_mapping.clone();
+    if (cloned_object == null ||
+        !$cast(stale_active_mapping, cloned_object))
+      `uvm_fatal("HOST_AUTH_CLONE", "mapping clone type mismatch")
+
+    authoritative_mapping.size = 128;
+    status = authoritative_mem_api.write(authoritative_mapping, 63,
+                                         crossing_data);
+    expect_status("HOST_AUTH_WRITE_BOUNDS", status, RDMA_SC_DMA_TRANSLATION);
+    status = authoritative_mem_api.read(authoritative_mapping, 63, 2,
+                                        read_data);
+    expect_status("HOST_AUTH_READ_BOUNDS", status, RDMA_SC_DMA_TRANSLATION);
+    if (authoritative_mem.regions.size() != 1 ||
+        authoritative_mem.regions[0].data.size() != 64 ||
+        authoritative_mem.regions[0].data[63] != 0 || read_data.size() != 0)
+      `uvm_error("HOST_AUTH_BOUNDS",
+                 "caller size mutation reached authoritative storage")
+
+    status = authoritative_mem_api.\release (authoritative_mapping);
+    expect_status("HOST_AUTH_RELEASE", status, RDMA_SC_OK);
+    status = authoritative_mem_api.read(stale_active_mapping, 0, 1,
+                                        read_data);
+    expect_status("HOST_AUTH_STALE_READ", status, RDMA_SC_INVALID_STATE);
+    status = authoritative_mem_api.write(stale_active_mapping, 0,
+                                         crossing_data);
+    expect_status("HOST_AUTH_STALE_WRITE", status, RDMA_SC_INVALID_STATE);
+    status = authoritative_mem_api.\release (stale_active_mapping);
+    expect_status("HOST_AUTH_STALE_RELEASE", status, RDMA_SC_INVALID_STATE);
+    status = authoritative_mem_api.\release (authoritative_mapping);
+    expect_status("HOST_AUTH_REPEAT_RELEASE", status, RDMA_SC_INVALID_STATE);
+    if (authoritative_mem.calls.size() != 8)
+      `uvm_error("HOST_AUTH_ORDER", "authoritative call history is incomplete")
+    foreach (authoritative_mem.calls[i]) begin
+      if (authoritative_mem.calls[i].call_sequence != i + 1)
+        `uvm_error("HOST_AUTH_ORDER",
+                   "authoritative call sequence is not monotonic")
+    end
 
     pcie = rdma_mock_pcie::type_id::create("pcie");
     pcie_api = pcie;
@@ -267,14 +339,29 @@ class rdma_adapter_contract_test extends uvm_test;
     net = rdma_mock_net::type_id::create("net");
     net_api = net;
     observer = rdma_adapter_test_observer::type_id::create("observer");
+    observer_seed = make_packet("observer_seed", 8'h21);
+    observer.write(observer_seed);
     net_api.register_observer(observer);
+    if (!$cast(observer_snapshot, net.calls[0].observer) ||
+        observer_snapshot == observer ||
+        observer_snapshot.notification_count != 1 ||
+        observer_snapshot.last_packet == null ||
+        observer_snapshot.last_packet == observer.last_packet ||
+        observer_snapshot.last_packet.payload[0] != 8'h21)
+      `uvm_error("NET_OBSERVER_SNAPSHOT",
+                 "observer registration history aliases caller state")
     tx_packet = make_packet("tx_packet", 8'h31);
     net_api.send_packet(tx_packet, status);
     expect_status("NET_SEND", status, RDMA_SC_OK);
     tx_packet.payload[0] = 8'hff;
-    if (observer.notification_count != 1 || observer.last_packet == null ||
+    if (observer.notification_count != 2 || observer.last_packet == null ||
         observer.last_packet.payload[0] != 8'h31)
       `uvm_error("NET_OBSERVER", "observer was not notified by value")
+    if (observer_snapshot.notification_count != 1 ||
+        observer_snapshot.last_packet == null ||
+        observer_snapshot.last_packet.payload[0] != 8'h21)
+      `uvm_error("NET_OBSERVER_SNAPSHOT",
+                 "recorded observer changed after registration")
 
     rx_source = make_packet("rx_source", 8'h51);
     net.enqueue_receive(rx_source);
@@ -312,7 +399,7 @@ class rdma_adapter_contract_test extends uvm_test;
     expect_status("NET_INJECTED", status, RDMA_SC_TIMEOUT);
     net_api.send_packet(tx_packet, status);
     expect_status("NET_ONE_SHOT", status, RDMA_SC_OK);
-    if (observer.notification_count != 2)
+    if (observer.notification_count != 3)
       `uvm_error("NET_OBSERVER", "failed send notified observer")
 
     if (mem.calls.size() != 8 ||
