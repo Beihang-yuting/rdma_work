@@ -69,11 +69,14 @@ class rdma_request_model_test extends uvm_test;
     rdma_post_send_req post_send_clone;
     rdma_post_recv_req post_recv;
     rdma_sge sge;
+    rdma_sge atomic_sge;
+    rdma_sge extra_sge;
     rdma_sge recv_sge;
     rdma_function function_resource;
     rdma_pd pd_resource;
     rdma_mr mr_resource;
     rdma_cq cq_resource;
+    rdma_cq cq_resource_clone;
     rdma_qp qp_resource;
     rdma_qp qp_resource_clone;
     rdma_srq srq_resource;
@@ -84,8 +87,10 @@ class rdma_request_model_test extends uvm_test;
     rdma_qpc_model qpc;
     rdma_qpc_model qpc_clone;
     rdma_qpc_rc_ext rc_ext;
+    rdma_qpc_rc_ext rc_ext_clone;
     rdma_qpc_ud_ext ud_ext;
     rdma_qpc_urc_ext urc_ext;
+    rdma_qpc_urc_ext urc_ext_clone;
     rdma_cqc_model cqc;
     rdma_mrt_model mrt;
     rdma_srqc_model srqc;
@@ -99,8 +104,11 @@ class rdma_request_model_test extends uvm_test;
     rdma_sqe_model ud_sqe;
     rdma_sqe_model urc_sqe;
     rdma_sqe_model sqe_clone;
+    rdma_sqe_model ud_sqe_clone;
     rdma_sqe_rc_ext sqe_rc_ext;
+    rdma_sqe_rc_ext sqe_rc_ext_clone;
     rdma_sqe_ud_ext sqe_ud_ext;
+    rdma_sqe_ud_ext sqe_ud_ext_clone;
     rdma_sqe_urc_ext sqe_urc_ext;
     rdma_rqe_model rqe;
     rdma_cqe_model cqe;
@@ -229,28 +237,58 @@ class rdma_request_model_test extends uvm_test;
     post_send.destination_qpn = 24'h102030;
     post_send.qkey = 32'h8001_0000;
     post_send.address_vector_id = 32'h5566_7788;
+    expect_status("POST_SEND_UD_AV_MISSING", post_send.validate(),
+                  RDMA_SC_INVALID_ARGUMENT);
+    post_send.address_vector_valid = 1'b1;
+    post_send.address_vector_id = '0;
+    expect_status("POST_SEND_UD_ZERO_AV_ID", post_send.validate(), RDMA_SC_OK);
+    post_send.address_vector_id = 32'h5566_7788;
     expect_status("POST_SEND_UD", post_send.validate(), RDMA_SC_OK);
     post_send.transport = RDMA_TRANSPORT_RC;
-    post_send.opcode = RDMA_WR_SEND;
+    post_send.opcode = RDMA_WR_RDMA_WRITE;
+    post_send.compare_value = 64'h0123_4567_89ab_cdef;
+    post_send.swap_add_value = 64'hfedc_ba98_7654_3210;
     post_send.payload.push_back(8'ha5);
     post_send.payload.push_back(8'h5a);
     expect_status("POST_SEND", post_send.validate(), RDMA_SC_OK);
     cloned_object = post_send.clone();
     if (!$cast(post_send_clone, cloned_object))
       `uvm_error("REQ_CLONE", "post-send clone lost dynamic type")
+    else if (post_send_clone.owner == null ||
+             post_send_clone.qp_h == null ||
+             post_send_clone.sges.size() != 1)
+      `uvm_error("REQ_CLONE", "post-send clone lost nested objects")
+    else if (post_send_clone.sges[0] == null)
+      `uvm_error("REQ_CLONE", "post-send clone contains a null SGE")
     else if (post_send_clone.owner == post_send.owner ||
              post_send_clone.qp_h == post_send.qp_h ||
-             post_send_clone.sges.size() != 1 ||
              post_send_clone.sges[0] == post_send.sges[0] ||
              post_send_clone.sges[0].iova != post_send.sges[0].iova ||
              post_send_clone.payload != post_send.payload ||
+             post_send_clone.request_id != 64'h8877_6655_4433_2211 ||
+             post_send_clone.correlation_id != 64'h0102_0304_0506_0708 ||
              post_send_clone.timeout_value != post_send.timeout_value ||
-             post_send_clone.expected_status_code != RDMA_SC_QUEUE_FULL)
+             post_send_clone.timeout_policy != RDMA_TIMEOUT_CYCLES ||
+             post_send_clone.expected_status_code != RDMA_SC_QUEUE_FULL ||
+             post_send_clone.transport != RDMA_TRANSPORT_RC ||
+             post_send_clone.opcode != RDMA_WR_RDMA_WRITE ||
+             post_send_clone.remote_addr.value != 64'h1234_0000 ||
+             post_send_clone.rkey != 32'h1357_2468 ||
+             post_send_clone.destination_qpn != 24'h102030 ||
+             post_send_clone.qkey != 32'h8001_0000 ||
+             post_send_clone.address_vector_id != 32'h5566_7788 ||
+             !post_send_clone.address_vector_valid ||
+             post_send_clone.compare_value != 64'h0123_4567_89ab_cdef ||
+             post_send_clone.swap_add_value != 64'hfedc_ba98_7654_3210)
       `uvm_error("REQ_CLONE", "post-send clone lost or aliased fields")
     else begin
+      post_send_clone.owner.function_uid++;
+      post_send_clone.qp_h.object_id++;
       post_send_clone.sges[0].length++;
       post_send_clone.payload[0] = 8'hff;
-      if (post_send.sges[0].length != 32'h345 ||
+      if (post_send.owner.function_uid != 64'h1234_5678_9abc_def0 ||
+          post_send.qp_h.object_id != 32'h404 ||
+          post_send.sges[0].length != 32'h345 ||
           post_send.payload[0] != 8'ha5)
         `uvm_error("REQ_CLONE", "post-send clone mutation reached source")
     end
@@ -264,6 +302,57 @@ class rdma_request_model_test extends uvm_test;
     expect_status("POST_SEND_ZERO_SGE", post_send.validate(),
                   RDMA_SC_INVALID_ARGUMENT);
     sge.length = 32'h345;
+
+    atomic_sge = rdma_sge::type_id::create("atomic_sge");
+    atomic_sge.iova.value = 64'h2222_0000;
+    atomic_sge.length = 8;
+    atomic_sge.lkey = 32'h2222_3333;
+    extra_sge = rdma_sge::type_id::create("extra_sge");
+    extra_sge.iova.value = 64'h3333_0000;
+    extra_sge.length = 8;
+    extra_sge.lkey = 32'h3333_4444;
+    post_send.opcode = RDMA_WR_ATOMIC_CMP_SWAP;
+    post_send.inline_data = 1'b1;
+    expect_status("POST_SEND_ATOMIC_INLINE", post_send.validate(),
+                  RDMA_SC_INVALID_ARGUMENT);
+    post_send.inline_data = 1'b0;
+    post_send.payload.delete();
+    post_send.sges.delete();
+    post_send.sges.push_back(atomic_sge);
+    post_send.remote_addr.value = 64'h4444_0000;
+    post_send.rkey = 32'h4444_5555;
+    expect_status("POST_SEND_ATOMIC", post_send.validate(), RDMA_SC_OK);
+    post_send.sges.push_back(extra_sge);
+    expect_status("POST_SEND_ATOMIC_COUNT", post_send.validate(),
+                  RDMA_SC_INVALID_ARGUMENT);
+    void'(post_send.sges.pop_back());
+    atomic_sge.length = 4;
+    expect_status("POST_SEND_ATOMIC_LENGTH", post_send.validate(),
+                  RDMA_SC_INVALID_ARGUMENT);
+    atomic_sge.length = 8;
+    atomic_sge.iova.value = 64'h2222_0004;
+    expect_status("POST_SEND_ATOMIC_LOCAL_ALIGN", post_send.validate(),
+                  RDMA_SC_INVALID_ARGUMENT);
+    atomic_sge.iova.value = 64'h2222_0000;
+    post_send.remote_addr.value = 64'h4444_0004;
+    expect_status("POST_SEND_ATOMIC_REMOTE_ALIGN", post_send.validate(),
+                  RDMA_SC_INVALID_ARGUMENT);
+    post_send.remote_addr.value = 64'h4444_0000;
+    post_send.opcode = RDMA_WR_ATOMIC_FETCH_ADD;
+    expect_status("POST_SEND_FETCH_ADD", post_send.validate(), RDMA_SC_OK);
+
+    post_send.opcode = RDMA_WR_RDMA_READ;
+    atomic_sge.length = 64;
+    expect_status("POST_SEND_READ", post_send.validate(), RDMA_SC_OK);
+    post_send.inline_data = 1'b1;
+    post_send.payload.push_back(8'h5c);
+    expect_status("POST_SEND_READ_INLINE", post_send.validate(),
+                  RDMA_SC_INVALID_ARGUMENT);
+    post_send.inline_data = 1'b0;
+    expect_status("POST_SEND_READ_PAYLOAD", post_send.validate(),
+                  RDMA_SC_INVALID_ARGUMENT);
+    post_send.payload.delete();
+
     post_send.opcode = RDMA_WR_LOCAL_INVALIDATE;
     expect_status("POST_SEND_INVALIDATE_SGE", post_send.validate(),
                   RDMA_SC_INVALID_ARGUMENT);
@@ -302,12 +391,62 @@ class rdma_request_model_test extends uvm_test;
         ceq_resource == null || aeq_resource == null || cmq_resource == null)
       `uvm_error("RESOURCES", "one or more concrete resources are absent")
 
+    cq_resource.handle = cq_h;
+    cq_resource.owner = function_h;
+    cq_resource.state = RDMA_RESOURCE_ACTIVE;
+    cq_resource.local_cq_id = 32'h3131;
+    cq_resource.global_cq_id = 32'h9191_3131;
+    cq_resource.ceq_h = ceq_h;
+    cq_resource.depth = 256;
+    cq_resource.producer_index = 32'h81;
+    cq_resource.consumer_index = 32'h42;
+    cq_resource.producer_wrap = 1'b1;
+    cq_resource.consumer_wrap = 1'b1;
+    cq_resource.queue_iova.value = 64'h4100_0000;
+    expect_status("CQ_RESOURCE", cq_resource.validate(), RDMA_SC_OK);
+    cloned_object = cq_resource.clone();
+    if (!$cast(cq_resource_clone, cloned_object))
+      `uvm_error("CQ_RESOURCE_CLONE", "CQ clone lost dynamic type")
+    else if (cq_resource_clone.handle == null ||
+             cq_resource_clone.owner == null ||
+             cq_resource_clone.ceq_h == null)
+      `uvm_error("CQ_RESOURCE_CLONE", "CQ clone lost nested handles")
+    else if (cq_resource_clone.handle == cq_resource.handle ||
+             cq_resource_clone.owner == cq_resource.owner ||
+             cq_resource_clone.ceq_h == cq_resource.ceq_h ||
+             cq_resource_clone.state != RDMA_RESOURCE_ACTIVE ||
+             cq_resource_clone.local_cq_id != 32'h3131 ||
+             cq_resource_clone.global_cq_id != 32'h9191_3131 ||
+             cq_resource_clone.depth != 256 ||
+             cq_resource_clone.producer_index != 32'h81 ||
+             cq_resource_clone.consumer_index != 32'h42 ||
+             !cq_resource_clone.producer_wrap ||
+             !cq_resource_clone.consumer_wrap ||
+             cq_resource_clone.queue_iova.value != 64'h4100_0000)
+      `uvm_error("CQ_RESOURCE_CLONE", "CQ clone lost or aliased fields")
+    cq_resource.depth = 0;
+    expect_status("CQ_RESOURCE_ZERO_DEPTH", cq_resource.validate(),
+                  RDMA_SC_INVALID_ARGUMENT);
+    cq_resource.depth = 100;
+    expect_status("CQ_RESOURCE_POWER_TWO", cq_resource.validate(),
+                  RDMA_SC_INVALID_ARGUMENT);
+    cq_resource.depth = 256;
+    cq_resource.producer_index = 256;
+    expect_status("CQ_RESOURCE_PI", cq_resource.validate(),
+                  RDMA_SC_INVALID_ARGUMENT);
+    cq_resource.producer_index = 32'h81;
+    cq_resource.consumer_index = 256;
+    expect_status("CQ_RESOURCE_CI", cq_resource.validate(),
+                  RDMA_SC_INVALID_ARGUMENT);
+    cq_resource.consumer_index = 32'h42;
+
     qp_resource.handle = qp_h;
     qp_resource.owner = function_h;
     qp_resource.state = RDMA_RESOURCE_ACTIVE;
     qp_resource.local_qp_id = 32'h1111;
     qp_resource.global_qp_id = 32'h9999_1111;
     qp_resource.transport = RDMA_TRANSPORT_URC;
+    qp_resource.qp_state = RDMA_QPS_RTS;
     qp_resource.sq_depth = 1024;
     qp_resource.rq_depth = 512;
     qp_resource.sq_producer_index = 32'h81;
@@ -316,6 +455,8 @@ class rdma_request_model_test extends uvm_test;
     qp_resource.rq_producer_index = 32'h24;
     qp_resource.rq_consumer_index = 32'h12;
     qp_resource.rq_wrap = 1'b0;
+    qp_resource.sq_iova.value = 64'h4200_0000;
+    qp_resource.rq_iova.value = 64'h4300_0000;
     qp_resource.pd_h = pd_h;
     qp_resource.send_cq_h = cq_h;
     qp_resource.recv_cq_h = cq_h;
@@ -330,29 +471,106 @@ class rdma_request_model_test extends uvm_test;
     mapping.size = 64'h2000;
     mapping.state = RDMA_MAPPING_ACTIVE;
     qp_resource.backing_mappings.push_back(mapping);
+    expect_status("QP_RESOURCE", qp_resource.validate(), RDMA_SC_OK);
     cloned_object = qp_resource.clone();
     if (!$cast(qp_resource_clone, cloned_object))
       `uvm_error("RESOURCE_CLONE", "QP clone lost dynamic type")
+    else if (qp_resource_clone.handle == null ||
+             qp_resource_clone.owner == null ||
+             qp_resource_clone.pd_h == null ||
+             qp_resource_clone.send_cq_h == null ||
+             qp_resource_clone.recv_cq_h == null ||
+             qp_resource_clone.backing_mappings.size() != 1 ||
+             qp_resource_clone.dependencies.size() != 1 ||
+             qp_resource_clone.outstanding_ids.size() != 1)
+      `uvm_error("RESOURCE_CLONE", "QP clone lost nested objects")
+    else if (qp_resource_clone.backing_mappings[0] == null ||
+             qp_resource_clone.dependencies[0] == null)
+      `uvm_error("RESOURCE_CLONE", "QP clone contains a null nested object")
     else if (qp_resource_clone.handle == qp_resource.handle ||
              qp_resource_clone.owner == qp_resource.owner ||
-             qp_resource_clone.backing_mappings.size() != 1 ||
              qp_resource_clone.backing_mappings[0] ==
                qp_resource.backing_mappings[0] ||
-             qp_resource_clone.dependencies.size() != 1 ||
              qp_resource_clone.dependencies[0] ==
                qp_resource.dependencies[0] ||
              qp_resource_clone.pd_h == qp_resource.pd_h ||
+             qp_resource_clone.send_cq_h == qp_resource.send_cq_h ||
+             qp_resource_clone.recv_cq_h == qp_resource.recv_cq_h ||
+             qp_resource_clone.state != RDMA_RESOURCE_ACTIVE ||
+             qp_resource_clone.local_qp_id != 32'h1111 ||
+             qp_resource_clone.global_qp_id != 32'h9999_1111 ||
              qp_resource_clone.transport != RDMA_TRANSPORT_URC ||
+             qp_resource_clone.qp_state != RDMA_QPS_RTS ||
+             qp_resource_clone.sq_depth != 1024 ||
+             qp_resource_clone.rq_depth != 512 ||
              qp_resource_clone.sq_producer_index != 32'h81 ||
+             qp_resource_clone.sq_consumer_index != 32'h42 ||
+             !qp_resource_clone.sq_wrap ||
+             qp_resource_clone.rq_producer_index != 32'h24 ||
+             qp_resource_clone.rq_consumer_index != 32'h12 ||
+             qp_resource_clone.rq_wrap ||
+             qp_resource_clone.sq_iova.value != 64'h4200_0000 ||
+             qp_resource_clone.rq_iova.value != 64'h4300_0000 ||
              qp_resource_clone.outstanding_ids[0] != 64'hface_0001)
       `uvm_error("RESOURCE_CLONE", "QP clone lost or aliased state")
     else begin
+      qp_resource_clone.handle.object_id++;
+      qp_resource_clone.owner.function_uid++;
       qp_resource_clone.backing_mappings[0].iova.value++;
       qp_resource_clone.dependencies[0].object_id++;
-      if (qp_resource.backing_mappings[0].iova.value != 64'h5000_0000 ||
+      if (qp_resource.handle.object_id != 32'h404 ||
+          qp_resource.owner.function_uid != 64'h1234_5678_9abc_def0 ||
+          qp_resource.backing_mappings[0].iova.value != 64'h5000_0000 ||
           qp_resource.dependencies[0].object_id != 32'h101)
         `uvm_error("RESOURCE_CLONE", "QP clone mutation reached source")
     end
+
+    qp_resource.sq_depth = 0;
+    expect_status("QP_RESOURCE_ZERO_DEPTH", qp_resource.validate(),
+                  RDMA_SC_INVALID_ARGUMENT);
+    qp_resource.sq_depth = 1000;
+    expect_status("QP_RESOURCE_POWER_TWO", qp_resource.validate(),
+                  RDMA_SC_INVALID_ARGUMENT);
+    qp_resource.sq_depth = 1024;
+    qp_resource.sq_producer_index = 1024;
+    expect_status("QP_RESOURCE_SQ_PI", qp_resource.validate(),
+                  RDMA_SC_INVALID_ARGUMENT);
+    qp_resource.sq_producer_index = 32'h81;
+    qp_resource.rq_consumer_index = 512;
+    expect_status("QP_RESOURCE_RQ_CI", qp_resource.validate(),
+                  RDMA_SC_INVALID_ARGUMENT);
+    qp_resource.rq_consumer_index = 32'h12;
+    qp_resource.transport = rdma_transport_e'(3'b111);
+    expect_status("QP_RESOURCE_TRANSPORT", qp_resource.validate(),
+                  RDMA_SC_INVALID_ARGUMENT);
+    qp_resource.transport = RDMA_TRANSPORT_URC;
+    qp_resource.qp_state = rdma_qp_state_e'(4'hf);
+    expect_status("QP_RESOURCE_QP_STATE", qp_resource.validate(),
+                  RDMA_SC_INVALID_ARGUMENT);
+    qp_resource.qp_state = RDMA_QPS_RTS;
+    qp_resource.state = rdma_resource_state_e'(3'b111);
+    expect_status("QP_RESOURCE_STATE", qp_resource.validate(),
+                  RDMA_SC_INVALID_ARGUMENT);
+    qp_resource.state = RDMA_RESOURCE_ACTIVE;
+
+    cmq_resource.state = RDMA_RESOURCE_PROGRAMMED;
+    cmq_resource.depth = 64;
+    cmq_resource.producer_index = 11;
+    cmq_resource.consumer_index = 7;
+    cmq_resource.producer_wrap = 1'b1;
+    cmq_resource.consumer_wrap = 1'b0;
+    cmq_resource.completion_producer_index = 23;
+    cmq_resource.completion_consumer_index = 19;
+    cmq_resource.completion_wrap = 1'b1;
+    expect_status("CMQ_RESOURCE", cmq_resource.validate(), RDMA_SC_OK);
+    cmq_resource.completion_producer_index = 64;
+    expect_status("CMQ_RESOURCE_COMPLETION_PI", cmq_resource.validate(),
+                  RDMA_SC_INVALID_ARGUMENT);
+    cmq_resource.completion_producer_index = 23;
+    cmq_resource.completion_consumer_index = 64;
+    expect_status("CMQ_RESOURCE_COMPLETION_CI", cmq_resource.validate(),
+                  RDMA_SC_INVALID_ARGUMENT);
+    cmq_resource.completion_consumer_index = 19;
 
     iova_type_name = $typename(mr_resource.iova);
     hmc_type_name = $typename(qp_resource.hmc_fvm_addr);
@@ -367,33 +585,83 @@ class rdma_request_model_test extends uvm_test;
     qpc.pd_h = pd_h;
     qpc.send_cq_h = cq_h;
     qpc.recv_cq_h = cq_h;
+    qpc.state = RDMA_QPS_RTS;
     qpc.sq_depth = 1024;
     qpc.rq_depth = 512;
     qpc.sq_base.value = 64'h6000_0000;
     qpc.rq_base.value = 64'h6001_0000;
+    qpc.sq_producer_index = 32'h71;
+    qpc.sq_consumer_index = 32'h31;
+    qpc.rq_producer_index = 32'h52;
+    qpc.rq_consumer_index = 32'h22;
     rc_ext = rdma_qpc_rc_ext::type_id::create("rc_ext");
     rc_ext.remote_qpn = 24'habc123;
     rc_ext.send_psn = 24'h102030;
     rc_ext.recv_psn = 24'h405060;
     rc_ext.retry_count = 3;
+    rc_ext.rnr_retry_count = 5;
+    rc_ext.path_mtu = 8'h4;
     qpc.transport_ext = rc_ext;
     expect_status("QPC_RC", qpc.validate(), RDMA_SC_OK);
     cloned_object = qpc.clone();
-    if (!$cast(qpc_clone, cloned_object) ||
-        qpc_clone.transport_ext == qpc.transport_ext ||
+    if (!$cast(qpc_clone, cloned_object))
+      `uvm_error("QPC_CLONE", "QPC clone lost dynamic type")
+    else if (qpc_clone.qp_h == null ||
+        qpc_clone.pd_h == null ||
+        qpc_clone.send_cq_h == null ||
+        qpc_clone.recv_cq_h == null ||
+        qpc_clone.transport_ext == null)
+      `uvm_error("QPC_CLONE", "QPC clone lost nested objects")
+    else if (qpc_clone.transport_ext == qpc.transport_ext ||
         qpc_clone.qp_h == qpc.qp_h ||
-        !$cast(rc_ext, qpc_clone.transport_ext) ||
-        rc_ext.remote_qpn != 24'habc123)
+        qpc_clone.pd_h == qpc.pd_h ||
+        qpc_clone.send_cq_h == qpc.send_cq_h ||
+        qpc_clone.recv_cq_h == qpc.recv_cq_h ||
+        qpc_clone.transport != RDMA_TRANSPORT_RC ||
+        qpc_clone.state != RDMA_QPS_RTS ||
+        qpc_clone.sq_depth != 1024 || qpc_clone.rq_depth != 512 ||
+        qpc_clone.sq_base.value != 64'h6000_0000 ||
+        qpc_clone.rq_base.value != 64'h6001_0000 ||
+        qpc_clone.sq_producer_index != 32'h71 ||
+        qpc_clone.sq_consumer_index != 32'h31 ||
+        qpc_clone.rq_producer_index != 32'h52 ||
+        qpc_clone.rq_consumer_index != 32'h22)
+      `uvm_error("QPC_CLONE", "QPC clone lost or aliased common fields")
+    else if (!$cast(rc_ext_clone, qpc_clone.transport_ext))
+      `uvm_error("QPC_CLONE", "QPC clone lost RC extension type")
+    else if (rc_ext_clone.remote_qpn != 24'habc123 ||
+        rc_ext_clone.send_psn != 24'h102030 ||
+        rc_ext_clone.recv_psn != 24'h405060 ||
+        rc_ext_clone.retry_count != 3 ||
+        rc_ext_clone.rnr_retry_count != 5 ||
+        rc_ext_clone.path_mtu != 8'h4)
       `uvm_error("QPC_CLONE", "QPC clone lost nested RC extension")
+    else begin
+      qpc_clone.qp_h.object_id++;
+      qpc_clone.sq_depth = 2048;
+      rc_ext_clone.remote_qpn++;
+      if (qpc.qp_h.object_id != 32'h404 || qpc.sq_depth != 1024 ||
+          rc_ext.remote_qpn != 24'habc123)
+        `uvm_error("QPC_CLONE", "QPC clone mutation reached source")
+    end
 
     ud_ext = rdma_qpc_ud_ext::type_id::create("ud_ext");
     ud_ext.qkey = 32'h8001_0000;
+    ud_ext.address_vector_id = 32'h7654_3210;
     qpc.transport_ext = ud_ext;
     expect_status("QPC_MISMATCH", qpc.validate(), RDMA_SC_INVALID_ARGUMENT);
     qpc.transport = RDMA_TRANSPORT_UD;
+    expect_status("QPC_UD_AV_MISSING", qpc.validate(),
+                  RDMA_SC_INVALID_ARGUMENT);
+    ud_ext.address_vector_valid = 1'b1;
+    ud_ext.address_vector_id = '0;
+    expect_status("QPC_UD_ZERO_AV_ID", qpc.validate(), RDMA_SC_OK);
+    ud_ext.address_vector_id = 32'h7654_3210;
     expect_status("QPC_UD", qpc.validate(), RDMA_SC_OK);
     urc_ext = rdma_qpc_urc_ext::type_id::create("urc_ext");
     urc_ext.remote_qpn = 24'h765432;
+    urc_ext.send_psn = 24'h112244;
+    urc_ext.path_mtu = 8'h5;
     qpc.transport = RDMA_TRANSPORT_URC;
     qpc.transport_ext = urc_ext;
     expect_status("QPC_URC", qpc.validate(), RDMA_SC_OK);
@@ -456,12 +724,43 @@ class rdma_request_model_test extends uvm_test;
         cmq_create_qp.command_id == cmq_modify_qp.command_id)
       `uvm_error("CMQ_OPCODES", "CMQ operations are not independent")
     cloned_object = cmq_create_qp.clone();
-    if (!$cast(cmq_clone, cloned_object) ||
-        cmq_clone.context_model == cmq_create_qp.context_model ||
+    if (!$cast(cmq_clone, cloned_object))
+      `uvm_error("CMQ_CLONE", "CMQ SQE clone lost dynamic type")
+    else if (cmq_clone.function_h == null ||
+        cmq_clone.target_h == null ||
+        cmq_clone.context_model == null)
+      `uvm_error("CMQ_CLONE", "CMQ SQE clone lost nested objects")
+    else if (cmq_clone.context_model == cmq_create_qp.context_model ||
+        cmq_clone.function_h == cmq_create_qp.function_h ||
         cmq_clone.target_h == cmq_create_qp.target_h ||
-        !$cast(qpc_clone, cmq_clone.context_model) ||
-        qpc_clone.transport_ext == qpc.transport_ext)
+        cmq_clone.opcode != RDMA_CMQ_CREATE_QP ||
+        cmq_clone.command_id != 64'h1111_2222)
+      `uvm_error("CMQ_CLONE", "CMQ SQE clone lost or aliased fields")
+    else if (!$cast(qpc_clone, cmq_clone.context_model))
+      `uvm_error("CMQ_CLONE", "CMQ SQE clone lost QPC context type")
+    else if (qpc_clone.transport_ext == null)
+      `uvm_error("CMQ_CLONE", "CMQ QPC clone lost its extension")
+    else if (qpc_clone.transport_ext == qpc.transport_ext ||
+        qpc_clone.transport != RDMA_TRANSPORT_URC ||
+        qpc_clone.sq_depth != 1024)
+      `uvm_error("CMQ_CLONE", "CMQ QPC clone lost or aliased fields")
+    else if (!$cast(urc_ext_clone, qpc_clone.transport_ext))
+      `uvm_error("CMQ_CLONE", "CMQ QPC clone lost URC extension type")
+    else if (urc_ext_clone.remote_qpn != 24'h765432 ||
+        urc_ext_clone.send_psn != 24'h112244 ||
+        urc_ext_clone.path_mtu != 8'h5)
       `uvm_error("CMQ_CLONE", "CMQ SQE clone lost nested context")
+    else begin
+      cmq_clone.function_h.function_uid++;
+      cmq_clone.target_h.object_id++;
+      qpc_clone.sq_depth = 2048;
+      urc_ext_clone.remote_qpn++;
+      if (cmq_create_qp.function_h.function_uid !=
+            64'h1234_5678_9abc_def0 ||
+          cmq_create_qp.target_h.object_id != 32'h404 ||
+          qpc.sq_depth != 1024 || urc_ext.remote_qpn != 24'h765432)
+        `uvm_error("CMQ_CLONE", "CMQ clone mutation reached source")
+    end
 
     cmq_completion =
       rdma_cmq_completion_model::type_id::create("cmq_completion");
@@ -473,16 +772,91 @@ class rdma_request_model_test extends uvm_test;
 
     rc_sqe = rdma_sqe_model::type_id::create("rc_sqe");
     rc_sqe.transport = RDMA_TRANSPORT_RC;
-    rc_sqe.opcode = RDMA_WR_RDMA_WRITE;
+    rc_sqe.opcode = RDMA_WR_ATOMIC_CMP_SWAP;
     rc_sqe.qp_h = qp_h;
     rc_sqe.wr_id = 64'ha1;
-    rc_sqe.inline_data = 1'b1;
-    rc_sqe.payload.push_back(8'hc3);
+    rc_sqe.inline_data = 1'b0;
+    atomic_sge.iova.value = 64'h2222_0000;
+    atomic_sge.length = 8;
+    rc_sqe.sges.push_back(atomic_sge);
     sqe_rc_ext = rdma_sqe_rc_ext::type_id::create("sqe_rc_ext");
     sqe_rc_ext.remote_addr.value = 64'hc000_0000;
     sqe_rc_ext.rkey = 32'h1234_5678;
+    sqe_rc_ext.compare_value = 64'h1111_2222_3333_4444;
+    sqe_rc_ext.swap_add_value = 64'haaaa_bbbb_cccc_dddd;
     rc_sqe.transport_ext = sqe_rc_ext;
     expect_status("RC_SQE", rc_sqe.validate(), RDMA_SC_OK);
+
+    cloned_object = rc_sqe.clone();
+    if (!$cast(sqe_clone, cloned_object))
+      `uvm_error("SQE_CLONE", "SQE clone lost dynamic type")
+    else if (sqe_clone.qp_h == null || sqe_clone.transport_ext == null ||
+             sqe_clone.sges.size() != 1)
+      `uvm_error("SQE_CLONE", "SQE clone lost nested objects")
+    else if (sqe_clone.sges[0] == null)
+      `uvm_error("SQE_CLONE", "SQE clone contains a null SGE")
+    else if (sqe_clone.qp_h == rc_sqe.qp_h ||
+             sqe_clone.transport_ext == rc_sqe.transport_ext ||
+             sqe_clone.sges[0] == rc_sqe.sges[0] ||
+             sqe_clone.transport != RDMA_TRANSPORT_RC ||
+             sqe_clone.opcode != RDMA_WR_ATOMIC_CMP_SWAP ||
+             sqe_clone.wr_id != 64'ha1 ||
+             sqe_clone.sges[0].iova.value != 64'h2222_0000 ||
+             sqe_clone.sges[0].length != 8)
+      `uvm_error("SQE_CLONE", "SQE clone lost or aliased common fields")
+    else if (!$cast(sqe_rc_ext_clone, sqe_clone.transport_ext))
+      `uvm_error("SQE_CLONE", "SQE clone lost RC extension type")
+    else if (sqe_rc_ext_clone.remote_addr.value != 64'hc000_0000 ||
+             sqe_rc_ext_clone.rkey != 32'h1234_5678 ||
+             sqe_rc_ext_clone.compare_value != 64'h1111_2222_3333_4444 ||
+             sqe_rc_ext_clone.swap_add_value != 64'haaaa_bbbb_cccc_dddd)
+      `uvm_error("SQE_CLONE", "SQE clone lost nested atomic fields")
+    else begin
+      sqe_clone.qp_h.object_id++;
+      sqe_clone.sges[0].length++;
+      sqe_rc_ext_clone.compare_value++;
+      if (rc_sqe.qp_h.object_id != 32'h404 ||
+          rc_sqe.sges[0].length != 8 ||
+          sqe_rc_ext.compare_value != 64'h1111_2222_3333_4444)
+        `uvm_error("SQE_CLONE", "SQE clone mutation reached source")
+    end
+
+    rc_sqe.inline_data = 1'b1;
+    rc_sqe.payload.push_back(8'hc3);
+    expect_status("RC_SQE_ATOMIC_INLINE", rc_sqe.validate(),
+                  RDMA_SC_INVALID_ARGUMENT);
+    rc_sqe.inline_data = 1'b0;
+    rc_sqe.payload.delete();
+    rc_sqe.sges.push_back(extra_sge);
+    expect_status("RC_SQE_ATOMIC_COUNT", rc_sqe.validate(),
+                  RDMA_SC_INVALID_ARGUMENT);
+    void'(rc_sqe.sges.pop_back());
+    atomic_sge.length = 4;
+    expect_status("RC_SQE_ATOMIC_LENGTH", rc_sqe.validate(),
+                  RDMA_SC_INVALID_ARGUMENT);
+    atomic_sge.length = 8;
+    atomic_sge.iova.value = 64'h2222_0004;
+    expect_status("RC_SQE_ATOMIC_LOCAL_ALIGN", rc_sqe.validate(),
+                  RDMA_SC_INVALID_ARGUMENT);
+    atomic_sge.iova.value = 64'h2222_0000;
+    sqe_rc_ext.remote_addr.value = 64'hc000_0004;
+    expect_status("RC_SQE_ATOMIC_REMOTE_ALIGN", rc_sqe.validate(),
+                  RDMA_SC_INVALID_ARGUMENT);
+    sqe_rc_ext.remote_addr.value = 64'hc000_0000;
+    rc_sqe.opcode = RDMA_WR_ATOMIC_FETCH_ADD;
+    expect_status("RC_SQE_FETCH_ADD", rc_sqe.validate(), RDMA_SC_OK);
+
+    rc_sqe.opcode = RDMA_WR_RDMA_READ;
+    atomic_sge.length = 64;
+    expect_status("RC_SQE_READ", rc_sqe.validate(), RDMA_SC_OK);
+    rc_sqe.inline_data = 1'b1;
+    rc_sqe.payload.push_back(8'hc4);
+    expect_status("RC_SQE_READ_INLINE", rc_sqe.validate(),
+                  RDMA_SC_INVALID_ARGUMENT);
+    rc_sqe.inline_data = 1'b0;
+    expect_status("RC_SQE_READ_PAYLOAD", rc_sqe.validate(),
+                  RDMA_SC_INVALID_ARGUMENT);
+    rc_sqe.payload.delete();
 
     ud_sqe = rdma_sqe_model::type_id::create("ud_sqe");
     ud_sqe.transport = RDMA_TRANSPORT_UD;
@@ -494,22 +868,53 @@ class rdma_request_model_test extends uvm_test;
     sqe_ud_ext = rdma_sqe_ud_ext::type_id::create("sqe_ud_ext");
     sqe_ud_ext.destination_qpn = 24'h010203;
     sqe_ud_ext.qkey = 32'h1111_2222;
+    sqe_ud_ext.address_vector_id = 32'h89ab_cdef;
     ud_sqe.transport_ext = sqe_ud_ext;
+    expect_status("UD_SQE_AV_MISSING", ud_sqe.validate(),
+                  RDMA_SC_INVALID_ARGUMENT);
+    sqe_ud_ext.address_vector_valid = 1'b1;
+    sqe_ud_ext.address_vector_id = '0;
+    expect_status("UD_SQE_ZERO_AV_ID", ud_sqe.validate(), RDMA_SC_OK);
+    sqe_ud_ext.address_vector_id = 32'h89ab_cdef;
     expect_status("UD_SQE", ud_sqe.validate(), RDMA_SC_OK);
     if (rc_sqe.transport == ud_sqe.transport ||
         rc_sqe.opcode == ud_sqe.opcode)
       `uvm_error("SQE_VARIANTS", "SQE variants are not independent")
-    cloned_object = rc_sqe.clone();
-    if (!$cast(sqe_clone, cloned_object) ||
-        sqe_clone.transport_ext == rc_sqe.transport_ext ||
-        sqe_clone.payload != rc_sqe.payload)
-      `uvm_error("SQE_CLONE", "SQE clone lost nested transport fields")
+    cloned_object = ud_sqe.clone();
+    if (!$cast(ud_sqe_clone, cloned_object))
+      `uvm_error("UD_SQE_CLONE", "UD SQE clone lost dynamic type")
+    else if (ud_sqe_clone.qp_h == null ||
+             ud_sqe_clone.transport_ext == null ||
+             ud_sqe_clone.payload.size() != 1)
+      `uvm_error("UD_SQE_CLONE", "UD SQE clone lost nested objects")
+    else if (ud_sqe_clone.qp_h == ud_sqe.qp_h ||
+             ud_sqe_clone.transport_ext == ud_sqe.transport_ext ||
+             ud_sqe_clone.payload != ud_sqe.payload)
+      `uvm_error("UD_SQE_CLONE", "UD SQE clone lost or aliased fields")
+    else if (!$cast(sqe_ud_ext_clone, ud_sqe_clone.transport_ext))
+      `uvm_error("UD_SQE_CLONE", "UD SQE clone lost UD extension type")
+    else if (sqe_ud_ext_clone.destination_qpn != 24'h010203 ||
+             sqe_ud_ext_clone.qkey != 32'h1111_2222 ||
+             sqe_ud_ext_clone.address_vector_id != 32'h89ab_cdef ||
+             !sqe_ud_ext_clone.address_vector_valid)
+      `uvm_error("UD_SQE_CLONE", "UD SQE clone lost fields")
+    else begin
+      ud_sqe_clone.qp_h.object_id++;
+      ud_sqe_clone.payload[0] = 8'h00;
+      sqe_ud_ext_clone.address_vector_id++;
+      if (ud_sqe.qp_h.object_id != 32'h404 ||
+          ud_sqe.payload[0] != 8'hd4 ||
+          sqe_ud_ext.address_vector_id != 32'h89ab_cdef)
+        `uvm_error("UD_SQE_CLONE", "UD SQE clone mutation reached source")
+    end
+
     rc_sqe.opcode = RDMA_WR_RECV;
     expect_status("RC_SQE_RECV_OPCODE", rc_sqe.validate(),
                   RDMA_SC_UNSUPPORTED_OPCODE);
     rc_sqe.opcode = RDMA_WR_LOCAL_INVALIDATE;
     rc_sqe.inline_data = 1'b0;
     rc_sqe.payload.delete();
+    rc_sqe.sges.delete();
     sqe_rc_ext.rkey = 0;
     expect_status("RC_SQE_INVALIDATE_RKEY", rc_sqe.validate(),
                   RDMA_SC_INVALID_ARGUMENT);

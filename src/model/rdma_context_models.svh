@@ -73,6 +73,7 @@ class rdma_qpc_ud_ext extends rdma_qpc_transport_ext;
 
   bit [31:0] qkey;
   int unsigned address_vector_id;
+  bit address_vector_valid;
   bit [7:0] traffic_class;
   bit [19:0] flow_label;
 
@@ -80,6 +81,7 @@ class rdma_qpc_ud_ext extends rdma_qpc_transport_ext;
     super.new(name);
     qkey = '0;
     address_vector_id = '0;
+    address_vector_valid = 1'b0;
     traffic_class = '0;
     flow_label = '0;
   endfunction
@@ -92,6 +94,7 @@ class rdma_qpc_ud_ext extends rdma_qpc_transport_ext;
       `uvm_fatal("RDMA_COPY_TYPE", "UD QPC extension copy mismatch")
     qkey = rhs_ext.qkey;
     address_vector_id = rhs_ext.address_vector_id;
+    address_vector_valid = rhs_ext.address_vector_valid;
     traffic_class = rhs_ext.traffic_class;
     flow_label = rhs_ext.flow_label;
   endfunction
@@ -101,9 +104,9 @@ class rdma_qpc_ud_ext extends rdma_qpc_transport_ext;
   endfunction
 
   virtual function rdma_status validate();
-    if (qkey == 0)
+    if (qkey == 0 || !address_vector_valid)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                               "UD QPC qkey is zero");
+                               "UD QPC lacks qkey or address vector");
     return rdma_status::success();
   endfunction
 

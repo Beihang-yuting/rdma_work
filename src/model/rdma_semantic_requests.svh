@@ -580,6 +580,7 @@ class rdma_post_send_req extends rdma_semantic_request;
   bit [23:0] destination_qpn;
   bit [31:0] qkey;
   int unsigned address_vector_id;
+  bit address_vector_valid;
   longint unsigned compare_value;
   longint unsigned swap_add_value;
 
@@ -598,6 +599,7 @@ class rdma_post_send_req extends rdma_semantic_request;
     destination_qpn = '0;
     qkey = '0;
     address_vector_id = '0;
+    address_vector_valid = 1'b0;
     compare_value = '0;
     swap_add_value = '0;
   endfunction
@@ -631,6 +633,7 @@ class rdma_post_send_req extends rdma_semantic_request;
     destination_qpn = rhs_req.destination_qpn;
     qkey = rhs_req.qkey;
     address_vector_id = rhs_req.address_vector_id;
+    address_vector_valid = rhs_req.address_vector_valid;
     compare_value = rhs_req.compare_value;
     swap_add_value = rhs_req.swap_add_value;
     sges.delete();
@@ -664,6 +667,29 @@ class rdma_post_send_req extends rdma_semantic_request;
         return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                  "local invalidate shape or rkey is invalid");
     end
+    else if (opcode inside {RDMA_WR_ATOMIC_CMP_SWAP,
+                            RDMA_WR_ATOMIC_FETCH_ADD}) begin
+      if (inline_data || payload.size() != 0 || sges.size() != 1)
+        return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                                 "atomic send shape is invalid");
+      if (sges[0] == null || sges[0].length != 8)
+        return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                                 "atomic send requires one 8-byte SGE");
+      if ((sges[0].iova.value & 64'h7) != 0 ||
+          (remote_addr.value & 64'h7) != 0)
+        return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                                 "atomic send address is not 8-byte aligned");
+    end
+    else if (opcode == RDMA_WR_RDMA_READ) begin
+      if (inline_data || payload.size() != 0 || sges.size() == 0)
+        return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                                 "RDMA read shape is invalid");
+      foreach (sges[i]) begin
+        if (sges[i] == null || sges[i].length == 0)
+          return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                                   "read SGE is null or has zero length");
+      end
+    end
     else begin
       if (!inline_data && sges.size() == 0)
         return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
@@ -685,9 +711,9 @@ class rdma_post_send_req extends rdma_semantic_request;
                                  "remote operation lacks address or rkey");
     end
     if (transport == RDMA_TRANSPORT_UD &&
-        (destination_qpn == 0 || qkey == 0))
+        (destination_qpn == 0 || qkey == 0 || !address_vector_valid))
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                               "UD send lacks destination QPN or qkey");
+                               "UD send lacks destination QPN, qkey, or AV");
     return rdma_status::success();
   endfunction
 endclass

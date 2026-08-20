@@ -248,6 +248,14 @@ class rdma_sqe_rc_ext extends rdma_sqe_transport_ext;
         return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                  "RC remote operation lacks address or rkey");
     end
+    if (opcode inside {RDMA_WR_ATOMIC_CMP_SWAP,
+                       RDMA_WR_ATOMIC_FETCH_ADD}) begin
+      if ((remote_addr.value & 64'h7) != 0)
+        return rdma_status::make(
+          RDMA_SC_INVALID_ARGUMENT,
+          "RC atomic remote address is not 8-byte aligned"
+        );
+    end
     return rdma_status::success();
   endfunction
 
@@ -263,12 +271,14 @@ class rdma_sqe_ud_ext extends rdma_sqe_transport_ext;
   bit [23:0] destination_qpn;
   bit [31:0] qkey;
   int unsigned address_vector_id;
+  bit address_vector_valid;
 
   function new(string name = "rdma_sqe_ud_ext");
     super.new(name);
     destination_qpn = '0;
     qkey = '0;
     address_vector_id = '0;
+    address_vector_valid = 1'b0;
   endfunction
 
   virtual function void do_copy(uvm_object rhs);
@@ -280,6 +290,7 @@ class rdma_sqe_ud_ext extends rdma_sqe_transport_ext;
     destination_qpn = rhs_ext.destination_qpn;
     qkey = rhs_ext.qkey;
     address_vector_id = rhs_ext.address_vector_id;
+    address_vector_valid = rhs_ext.address_vector_valid;
   endfunction
 
   virtual function rdma_transport_e transport_kind();
@@ -290,9 +301,9 @@ class rdma_sqe_ud_ext extends rdma_sqe_transport_ext;
     if (!(opcode inside {RDMA_WR_SEND, RDMA_WR_SEND_WITH_IMM}))
       return rdma_status::make(RDMA_SC_UNSUPPORTED_OPCODE,
                                "UD SQE opcode is unsupported");
-    if (destination_qpn == 0 || qkey == 0)
+    if (destination_qpn == 0 || qkey == 0 || !address_vector_valid)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                               "UD SQE lacks destination QPN or qkey");
+                               "UD SQE lacks destination QPN, qkey, or AV");
     return rdma_status::success();
   endfunction
 
@@ -441,6 +452,30 @@ class rdma_sqe_model extends rdma_hw_model;
       if (inline_data || sges.size() != 0 || payload.size() != 0)
         return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                  "local invalidate SQE carries data");
+    end
+    else if (opcode inside {RDMA_WR_ATOMIC_CMP_SWAP,
+                            RDMA_WR_ATOMIC_FETCH_ADD}) begin
+      if (inline_data || payload.size() != 0 || sges.size() != 1)
+        return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                                 "atomic SQE shape is invalid");
+      if (sges[0] == null || sges[0].length != 8)
+        return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                                 "atomic SQE requires one 8-byte SGE");
+      if ((sges[0].iova.value & 64'h7) != 0)
+        return rdma_status::make(
+          RDMA_SC_INVALID_ARGUMENT,
+          "atomic SQE local address is not 8-byte aligned"
+        );
+    end
+    else if (opcode == RDMA_WR_RDMA_READ) begin
+      if (inline_data || payload.size() != 0 || sges.size() == 0)
+        return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                                 "RDMA read SQE shape is invalid");
+      foreach (sges[i]) begin
+        if (sges[i] == null || sges[i].length == 0)
+          return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                                   "read SQE SGE is null or has zero length");
+      end
     end
     else begin
       if (!inline_data && sges.size() == 0)

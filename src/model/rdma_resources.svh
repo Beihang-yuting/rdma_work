@@ -93,6 +93,16 @@ class rdma_resource extends uvm_object;
     end
     outstanding_ids = rhs_resource.outstanding_ids;
   endfunction
+
+  virtual function rdma_status validate();
+    if (!(state inside {RDMA_RESOURCE_NEW, RDMA_RESOURCE_ALLOCATED,
+                        RDMA_RESOURCE_PROGRAMMED, RDMA_RESOURCE_ACTIVE,
+                        RDMA_RESOURCE_QUIESCING, RDMA_RESOURCE_RELEASED,
+                        RDMA_RESOURCE_ERROR}))
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "resource state is invalid");
+    return rdma_status::success();
+  endfunction
 endclass
 
 class rdma_queue_resource extends rdma_resource;
@@ -127,6 +137,21 @@ class rdma_queue_resource extends rdma_resource;
     producer_wrap = rhs_queue.producer_wrap;
     consumer_wrap = rhs_queue.consumer_wrap;
     queue_iova = rhs_queue.queue_iova;
+  endfunction
+
+  virtual function rdma_status validate();
+    rdma_status status;
+
+    status = super.validate();
+    if (!status.ok())
+      return status;
+    if (!rdma_is_power_of_two(depth))
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "queue depth is not a nonzero power of two");
+    if (producer_index >= depth || consumer_index >= depth)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "queue index is outside the queue depth");
+    return rdma_status::success();
   endfunction
 endclass
 
@@ -332,6 +357,32 @@ class rdma_qp extends rdma_resource;
     recv_cq_h = rdma_clone_handle_value(rhs_qp.recv_cq_h, "QP receive CQ");
     srq_h = rdma_clone_handle_value(rhs_qp.srq_h, "QP SRQ");
   endfunction
+
+  virtual function rdma_status validate();
+    rdma_status status;
+
+    status = super.validate();
+    if (!status.ok())
+      return status;
+    if (!rdma_is_power_of_two(sq_depth) ||
+        !rdma_is_power_of_two(rq_depth))
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "QP depth is not a nonzero power of two");
+    if (sq_producer_index >= sq_depth || sq_consumer_index >= sq_depth ||
+        rq_producer_index >= rq_depth || rq_consumer_index >= rq_depth)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "QP queue index is outside the queue depth");
+    if (!(transport inside {RDMA_TRANSPORT_RC, RDMA_TRANSPORT_UD,
+                            RDMA_TRANSPORT_URC}))
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "QP transport is invalid");
+    if (!(qp_state inside {RDMA_QPS_RESET, RDMA_QPS_INIT, RDMA_QPS_RTR,
+                           RDMA_QPS_RTS, RDMA_QPS_SQD, RDMA_QPS_SQE,
+                           RDMA_QPS_ERROR}))
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "QP state is invalid");
+    return rdma_status::success();
+  endfunction
 endclass
 
 class rdma_srq extends rdma_queue_resource;
@@ -441,5 +492,20 @@ class rdma_cmq extends rdma_queue_resource;
     completion_consumer_index = rhs_cmq.completion_consumer_index;
     completion_wrap = rhs_cmq.completion_wrap;
     completion_iova = rhs_cmq.completion_iova;
+  endfunction
+
+  virtual function rdma_status validate();
+    rdma_status status;
+
+    status = super.validate();
+    if (!status.ok())
+      return status;
+    if (completion_producer_index >= depth ||
+        completion_consumer_index >= depth)
+      return rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT,
+        "CMQ completion index is outside the queue depth"
+      );
+    return rdma_status::success();
   endfunction
 endclass
