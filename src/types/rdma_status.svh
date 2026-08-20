@@ -19,7 +19,17 @@ class rdma_status extends uvm_object;
     super.new(name);
     category = RDMA_STATUS_STATE;
     code = RDMA_SC_OK;
+    hardware_code = '0;
+    hardware_code_valid = 1'b0;
+    source_engine = RDMA_ENGINE_NONE;
+    function_uid = '0;
+    generation = '0;
+    resource_id = '0;
+    command_id = '0;
+    wr_id = '0;
     severity = RDMA_SEVERITY_INFO;
+    retryable = 1'b0;
+    message = "";
   endfunction
 
   static function automatic rdma_status make(
@@ -90,7 +100,27 @@ class rdma_status extends uvm_object;
   endfunction
 
   virtual function string convert2string();
+    string category_text;
+    string code_text;
     string hardware_text;
+    string source_engine_text;
+    string severity_text;
+
+    category_text = category.name();
+    if (category_text == "")
+      category_text = $sformatf("UNKNOWN(%0d)", category);
+
+    code_text = code.name();
+    if (code_text == "")
+      code_text = $sformatf("UNKNOWN(%0d)", code);
+
+    source_engine_text = source_engine.name();
+    if (source_engine_text == "")
+      source_engine_text = $sformatf("UNKNOWN(%0d)", source_engine);
+
+    severity_text = severity.name();
+    if (severity_text == "")
+      severity_text = $sformatf("UNKNOWN(%0d)", severity);
 
     if (hardware_code_valid)
       hardware_text = $sformatf(" hardware_code=0x%08x", hardware_code);
@@ -102,17 +132,17 @@ class rdma_status extends uvm_object;
        "source_engine=%s function_uid=0x%016x generation=%0d ",
        "resource_id=0x%016x command_id=0x%016x wr_id=0x%016x ",
        "severity=%s retryable=%0b message=\"%s\")"},
-      category.name(),
-      code.name(),
+      category_text,
+      code_text,
       hardware_code_valid,
       hardware_text,
-      source_engine.name(),
+      source_engine_text,
       function_uid,
       generation,
       resource_id,
       command_id,
       wr_id,
-      severity.name(),
+      severity_text,
       retryable,
       message
     );
