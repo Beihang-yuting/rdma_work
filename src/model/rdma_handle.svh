@@ -37,3 +37,13 @@ class rdma_function_handle extends rdma_handle;
     kind = RDMA_RESOURCE_FUNCTION;
   endfunction
 endclass
+
+function automatic bit rdma_handle_matches_owner(
+  rdma_handle handle,
+  rdma_function_handle owner
+);
+  return handle != null && owner != null &&
+         owner.kind == RDMA_RESOURCE_FUNCTION &&
+         handle.function_uid == owner.function_uid &&
+         handle.generation == owner.generation;
+endfunction

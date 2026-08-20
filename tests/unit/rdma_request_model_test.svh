@@ -58,6 +58,7 @@ class rdma_request_model_test extends uvm_test;
     rdma_handle ceq_h;
     rdma_handle aeq_h;
     rdma_handle cmq_h;
+    rdma_handle mismatched_h;
     rdma_create_pd_req create_pd;
     rdma_register_mr_req register_mr;
     rdma_create_cq_req create_cq;
@@ -118,6 +119,7 @@ class rdma_request_model_test extends uvm_test;
     rdma_ceqe_model ceqe;
     rdma_aeqe_model aeqe;
     rdma_doorbell_model doorbell;
+    rdma_doorbell_model doorbell_clone;
     rdma_packet packet;
     rdma_packet packet_clone;
     rdma_net_response_policy policy;
@@ -164,6 +166,27 @@ class rdma_request_model_test extends uvm_test;
     expect_status("CREATE_QP_RECV_CQ", req.validate(),
                   RDMA_SC_INVALID_ARGUMENT);
     req.recv_cq_h = cq_h;
+    mismatched_h = make_handle("qp_cross_pd_h", RDMA_RESOURCE_PD, 32'h901);
+    mismatched_h.function_uid++;
+    req.pd_h = mismatched_h;
+    expect_status("CREATE_QP_PD_OWNER", req.validate(),
+                  RDMA_SC_INVALID_ARGUMENT);
+    req.pd_h = pd_h;
+    mismatched_h = make_handle("qp_stale_cq_h", RDMA_RESOURCE_CQ, 32'h902);
+    mismatched_h.generation++;
+    req.send_cq_h = mismatched_h;
+    expect_status("CREATE_QP_CQ_GENERATION", req.validate(),
+                  RDMA_SC_INVALID_ARGUMENT);
+    req.send_cq_h = cq_h;
+    req.srq_h = srq_h;
+    expect_status("CREATE_QP_SRQ", req.validate(), RDMA_SC_OK);
+    mismatched_h = make_handle("qp_cross_srq_h", RDMA_RESOURCE_SRQ,
+                               32'h903);
+    mismatched_h.function_uid++;
+    req.srq_h = mismatched_h;
+    expect_status("CREATE_QP_SRQ_OWNER", req.validate(),
+                  RDMA_SC_INVALID_ARGUMENT);
+    req.srq_h = null;
     req.sq_depth = 1000;
     if (req.validate().ok()) `uvm_error("REQ", "non-power-of-two depth accepted")
     expect_status("QP_DEPTH", req.validate(), RDMA_SC_INVALID_ARGUMENT);
@@ -182,6 +205,10 @@ class rdma_request_model_test extends uvm_test;
     register_mr.permissions = '{device_read:1'b1, device_write:1'b1,
                                 atomic:1'b0};
     expect_status("REGISTER_MR", register_mr.validate(), RDMA_SC_OK);
+    register_mr.owner = null;
+    expect_status("REGISTER_MR_OWNER", register_mr.validate(),
+                  RDMA_SC_INVALID_ARGUMENT);
+    register_mr.owner = function_h;
     register_mr.length = 0;
     expect_status("REGISTER_MR_LENGTH", register_mr.validate(),
                   RDMA_SC_INVALID_ARGUMENT);
@@ -189,12 +216,35 @@ class rdma_request_model_test extends uvm_test;
     register_mr.pd_h = null;
     expect_status("REGISTER_MR_PD", register_mr.validate(),
                   RDMA_SC_INVALID_ARGUMENT);
+    mismatched_h = make_handle("mr_cross_pd_h", RDMA_RESOURCE_PD, 32'h904);
+    mismatched_h.function_uid++;
+    register_mr.pd_h = mismatched_h;
+    expect_status("REGISTER_MR_PD_OWNER", register_mr.validate(),
+                  RDMA_SC_INVALID_ARGUMENT);
+    mismatched_h = make_handle("mr_stale_pd_h", RDMA_RESOURCE_PD, 32'h905);
+    mismatched_h.generation++;
+    register_mr.pd_h = mismatched_h;
+    expect_status("REGISTER_MR_PD_GENERATION", register_mr.validate(),
+                  RDMA_SC_INVALID_ARGUMENT);
     register_mr.pd_h = pd_h;
 
     create_cq = rdma_create_cq_req::type_id::create("create_cq");
+    create_cq.owner = function_h;
     create_cq.depth = 256;
     create_cq.ceq_h = ceq_h;
     expect_status("CREATE_CQ", create_cq.validate(), RDMA_SC_OK);
+    create_cq.owner = null;
+    expect_status("CREATE_CQ_OWNER", create_cq.validate(),
+                  RDMA_SC_INVALID_ARGUMENT);
+    create_cq.owner = function_h;
+    create_cq.ceq_h = null;
+    expect_status("CREATE_CQ_OPTIONAL_CEQ", create_cq.validate(), RDMA_SC_OK);
+    mismatched_h = make_handle("cq_cross_ceq_h", RDMA_RESOURCE_CEQ, 32'h906);
+    mismatched_h.function_uid++;
+    create_cq.ceq_h = mismatched_h;
+    expect_status("CREATE_CQ_CEQ_OWNER", create_cq.validate(),
+                  RDMA_SC_INVALID_ARGUMENT);
+    create_cq.ceq_h = ceq_h;
     create_cq.depth = 0;
     expect_status("CREATE_CQ_DEPTH", create_cq.validate(),
                   RDMA_SC_INVALID_ARGUMENT);
@@ -211,6 +261,11 @@ class rdma_request_model_test extends uvm_test;
     create_srq.owner = function_h;
     create_srq.pd_h = cq_h;
     expect_status("CREATE_SRQ_PD", create_srq.validate(),
+                  RDMA_SC_INVALID_ARGUMENT);
+    mismatched_h = make_handle("srq_stale_pd_h", RDMA_RESOURCE_PD, 32'h907);
+    mismatched_h.generation++;
+    create_srq.pd_h = mismatched_h;
+    expect_status("CREATE_SRQ_PD_GENERATION", create_srq.validate(),
                   RDMA_SC_INVALID_ARGUMENT);
     create_srq.pd_h = pd_h;
     create_srq.max_sge = 0;
@@ -442,10 +497,59 @@ class rdma_request_model_test extends uvm_test;
                   RDMA_SC_INVALID_ARGUMENT);
     pd_resource.handle = pd_h;
     expect_status("RESOURCE_ALLOCATED", pd_resource.validate(), RDMA_SC_OK);
+    pd_resource.handle.function_uid++;
+    expect_status("RESOURCE_HANDLE_OWNER", pd_resource.validate(),
+                  RDMA_SC_INVALID_ARGUMENT);
+    pd_resource.handle.function_uid--;
+    pd_resource.handle.generation++;
+    expect_status("RESOURCE_HANDLE_GENERATION", pd_resource.validate(),
+                  RDMA_SC_INVALID_ARGUMENT);
+    pd_resource.handle.generation--;
+    pd_resource.dependencies.push_back(null);
+    expect_status("RESOURCE_NULL_DEPENDENCY", pd_resource.validate(),
+                  RDMA_SC_INVALID_ARGUMENT);
+    pd_resource.dependencies.delete();
+    mismatched_h = make_handle("cross_dependency_h", RDMA_RESOURCE_CQ,
+                               32'h908);
+    mismatched_h.function_uid++;
+    pd_resource.dependencies.push_back(mismatched_h);
+    expect_status("RESOURCE_CROSS_DEPENDENCY", pd_resource.validate(),
+                  RDMA_SC_INVALID_ARGUMENT);
+    pd_resource.dependencies.delete();
+    mismatched_h = make_handle("stale_dependency_h", RDMA_RESOURCE_CQ,
+                               32'h90e);
+    mismatched_h.generation++;
+    pd_resource.dependencies.push_back(mismatched_h);
+    expect_status("RESOURCE_STALE_DEPENDENCY", pd_resource.validate(),
+                  RDMA_SC_INVALID_ARGUMENT);
+    pd_resource.dependencies.delete();
     function_h.kind = RDMA_RESOURCE_PD;
     expect_status("RESOURCE_OWNER_KIND", pd_resource.validate(),
                   RDMA_SC_INVALID_ARGUMENT);
     function_h.kind = RDMA_RESOURCE_FUNCTION;
+
+    mr_resource.handle = mr_h;
+    mr_resource.owner = function_h;
+    mr_resource.state = RDMA_RESOURCE_PROGRAMMED;
+    mr_resource.pd_h = pd_h;
+    mr_resource.length = 64'h1000;
+    expect_status("MR_RESOURCE", mr_resource.validate(), RDMA_SC_OK);
+    mismatched_h = make_handle("mr_resource_cross_pd_h", RDMA_RESOURCE_PD,
+                               32'h909);
+    mismatched_h.function_uid++;
+    mr_resource.pd_h = mismatched_h;
+    expect_status("MR_RESOURCE_PD_OWNER", mr_resource.validate(),
+                  RDMA_SC_INVALID_ARGUMENT);
+    mr_resource.pd_h = cq_h;
+    expect_status("MR_RESOURCE_PD_KIND", mr_resource.validate(),
+                  RDMA_SC_INVALID_ARGUMENT);
+    mr_resource.pd_h = pd_h;
+    mr_resource.length = 0;
+    expect_status("MR_RESOURCE_LENGTH", mr_resource.validate(),
+                  RDMA_SC_INVALID_ARGUMENT);
+    mr_resource.state = RDMA_RESOURCE_RELEASED;
+    mr_resource.pd_h = null;
+    expect_status("MR_RESOURCE_RELEASED", mr_resource.validate(), RDMA_SC_OK);
 
     cq_resource.handle = cq_h;
     cq_resource.owner = function_h;
@@ -460,6 +564,23 @@ class rdma_request_model_test extends uvm_test;
     cq_resource.consumer_wrap = 1'b1;
     cq_resource.queue_iova.value = 64'h4100_0000;
     expect_status("CQ_RESOURCE", cq_resource.validate(), RDMA_SC_OK);
+    cq_resource.ceq_h = null;
+    expect_status("CQ_RESOURCE_CEQ", cq_resource.validate(),
+                  RDMA_SC_INVALID_ARGUMENT);
+    mismatched_h = make_handle("cq_resource_stale_ceq_h", RDMA_RESOURCE_CEQ,
+                               32'h90a);
+    mismatched_h.generation++;
+    cq_resource.ceq_h = mismatched_h;
+    expect_status("CQ_RESOURCE_CEQ_GENERATION", cq_resource.validate(),
+                  RDMA_SC_INVALID_ARGUMENT);
+    cq_resource.ceq_h = cq_h;
+    expect_status("CQ_RESOURCE_CEQ_KIND", cq_resource.validate(),
+                  RDMA_SC_INVALID_ARGUMENT);
+    cq_resource.state = RDMA_RESOURCE_RELEASED;
+    cq_resource.ceq_h = null;
+    expect_status("CQ_RESOURCE_RELEASED", cq_resource.validate(), RDMA_SC_OK);
+    cq_resource.state = RDMA_RESOURCE_ACTIVE;
+    cq_resource.ceq_h = ceq_h;
     cloned_object = cq_resource.clone();
     if (!$cast(cq_resource_clone, cloned_object))
       `uvm_error("CQ_RESOURCE_CLONE", "CQ clone lost dynamic type")
@@ -541,6 +662,22 @@ class rdma_request_model_test extends uvm_test;
     mapping.state = RDMA_MAPPING_ACTIVE;
     qp_resource.backing_mappings.push_back(mapping);
     expect_status("QP_RESOURCE", qp_resource.validate(), RDMA_SC_OK);
+    qp_resource.srq_h = srq_h;
+    expect_status("QP_RESOURCE_SRQ", qp_resource.validate(), RDMA_SC_OK);
+    mismatched_h = make_handle("qp_resource_cross_srq_h", RDMA_RESOURCE_SRQ,
+                               32'h90b);
+    mismatched_h.function_uid++;
+    qp_resource.srq_h = mismatched_h;
+    expect_status("QP_RESOURCE_SRQ_OWNER", qp_resource.validate(),
+                  RDMA_SC_INVALID_ARGUMENT);
+    qp_resource.srq_h = null;
+    mismatched_h = make_handle("qp_resource_stale_cq_h", RDMA_RESOURCE_CQ,
+                               32'h90c);
+    mismatched_h.generation++;
+    qp_resource.recv_cq_h = mismatched_h;
+    expect_status("QP_RESOURCE_CQ_GENERATION", qp_resource.validate(),
+                  RDMA_SC_INVALID_ARGUMENT);
+    qp_resource.recv_cq_h = cq_h;
     cloned_object = qp_resource.clone();
     if (!$cast(qp_resource_clone, cloned_object))
       `uvm_error("RESOURCE_CLONE", "QP clone lost dynamic type")
@@ -653,6 +790,31 @@ class rdma_request_model_test extends uvm_test;
     expect_status("QP_RESOURCE_STATE", qp_resource.validate(),
                   RDMA_SC_INVALID_ARGUMENT);
     qp_resource.state = RDMA_RESOURCE_ACTIVE;
+
+    srq_resource.handle = srq_h;
+    srq_resource.owner = function_h;
+    srq_resource.state = RDMA_RESOURCE_PROGRAMMED;
+    srq_resource.depth = 128;
+    srq_resource.max_sge = 2;
+    srq_resource.pd_h = pd_h;
+    expect_status("SRQ_RESOURCE", srq_resource.validate(), RDMA_SC_OK);
+    mismatched_h = make_handle("srq_resource_cross_pd_h", RDMA_RESOURCE_PD,
+                               32'h90d);
+    mismatched_h.function_uid++;
+    srq_resource.pd_h = mismatched_h;
+    expect_status("SRQ_RESOURCE_PD_OWNER", srq_resource.validate(),
+                  RDMA_SC_INVALID_ARGUMENT);
+    srq_resource.pd_h = cq_h;
+    expect_status("SRQ_RESOURCE_PD_KIND", srq_resource.validate(),
+                  RDMA_SC_INVALID_ARGUMENT);
+    srq_resource.pd_h = pd_h;
+    srq_resource.max_sge = 0;
+    expect_status("SRQ_RESOURCE_MAX_SGE", srq_resource.validate(),
+                  RDMA_SC_INVALID_ARGUMENT);
+    srq_resource.state = RDMA_RESOURCE_RELEASED;
+    srq_resource.pd_h = null;
+    expect_status("SRQ_RESOURCE_RELEASED", srq_resource.validate(),
+                  RDMA_SC_OK);
 
     cmq_resource.handle = cmq_h;
     cmq_resource.owner = function_h;
@@ -1152,8 +1314,12 @@ class rdma_request_model_test extends uvm_test;
     aeqe.target_h = qp_h;
     aeqe.event_code = 32'h66;
     expect_status("AEQE", aeqe.validate(), RDMA_SC_OK);
-    aeqe.severity = rdma_severity_e'(3'b111);
-    expect_status("AEQE_SEVERITY", aeqe.validate(), RDMA_SC_INVALID_ARGUMENT);
+    aeqe.severity = RDMA_SEVERITY_WARNING;
+    expect_status("AEQE_SEVERITY_WARNING", aeqe.validate(), RDMA_SC_OK);
+    aeqe.severity = RDMA_SEVERITY_ERROR;
+    expect_status("AEQE_SEVERITY_ERROR", aeqe.validate(), RDMA_SC_OK);
+    aeqe.severity = RDMA_SEVERITY_FATAL;
+    expect_status("AEQE_SEVERITY_FATAL", aeqe.validate(), RDMA_SC_OK);
     aeqe.severity = RDMA_SEVERITY_INFO;
     doorbell = rdma_doorbell_model::type_id::create("doorbell");
     doorbell.kind = RDMA_DOORBELL_SQ;
@@ -1207,7 +1373,22 @@ class rdma_request_model_test extends uvm_test;
     expect_status("DOORBELL_CMQ_TARGET", doorbell.validate(),
                   RDMA_SC_INVALID_ARGUMENT);
     doorbell.kind = RDMA_DOORBELL_TQ_FLUSH;
-    expect_status("DOORBELL_TQ_UNREPRESENTABLE", doorbell.validate(),
+    doorbell.target_h = function_h;
+    doorbell.queue_id = 0;
+    expect_status("DOORBELL_TQ_ID_MISSING", doorbell.validate(),
+                  RDMA_SC_INVALID_ARGUMENT);
+    doorbell.queue_id_valid = 1'b1;
+    expect_status("DOORBELL_TQ_ZERO_ID", doorbell.validate(), RDMA_SC_OK);
+    cloned_object = doorbell.clone();
+    if (!$cast(doorbell_clone, cloned_object))
+      `uvm_error("DOORBELL_TQ_CLONE", "doorbell clone lost dynamic type")
+    else if (doorbell_clone.target_h == null ||
+             doorbell_clone.target_h == doorbell.target_h ||
+             doorbell_clone.target_h.kind != RDMA_RESOURCE_FUNCTION ||
+             doorbell_clone.queue_id != 0 || !doorbell_clone.queue_id_valid)
+      `uvm_error("DOORBELL_TQ_CLONE", "doorbell clone lost TQ identity")
+    doorbell.target_h = qp_h;
+    expect_status("DOORBELL_TQ_TARGET", doorbell.validate(),
                   RDMA_SC_INVALID_ARGUMENT);
 
     packet = rdma_packet::type_id::create("packet");

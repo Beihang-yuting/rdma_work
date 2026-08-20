@@ -742,6 +742,7 @@ class rdma_doorbell_model extends rdma_hw_model;
   rdma_doorbell_kind_e kind;
   rdma_handle target_h;
   int unsigned queue_id;
+  bit queue_id_valid;
   int unsigned producer_index;
   bit wrap;
   bit arm;
@@ -752,6 +753,7 @@ class rdma_doorbell_model extends rdma_hw_model;
     kind = RDMA_DOORBELL_CMQ_SQ;
     target_h = null;
     queue_id = '0;
+    queue_id_valid = 1'b0;
     producer_index = '0;
     wrap = 1'b0;
     arm = 1'b0;
@@ -768,6 +770,7 @@ class rdma_doorbell_model extends rdma_hw_model;
     target_h = rdma_clone_handle_value(rhs_doorbell.target_h,
                                        "doorbell target");
     queue_id = rhs_doorbell.queue_id;
+    queue_id_valid = rhs_doorbell.queue_id_valid;
     producer_index = rhs_doorbell.producer_index;
     wrap = rhs_doorbell.wrap;
     arm = rhs_doorbell.arm;
@@ -813,8 +816,11 @@ class rdma_doorbell_model extends rdma_hw_model;
           return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                    "AEQ doorbell requires an AEQ target");
       RDMA_DOORBELL_TQ_FLUSH:
-        return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                                 "TQ doorbell target is not representable");
+        if (target_h.kind != RDMA_RESOURCE_FUNCTION || !queue_id_valid)
+          return rdma_status::make(
+            RDMA_SC_INVALID_ARGUMENT,
+            "TQ doorbell requires a function target and queue ID"
+          );
       default: begin
       end
     endcase

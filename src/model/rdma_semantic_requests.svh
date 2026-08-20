@@ -214,7 +214,11 @@ class rdma_register_mr_req extends rdma_semantic_request;
     status = super.validate();
     if (!status.ok())
       return status;
-    if (pd_h == null || pd_h.kind != RDMA_RESOURCE_PD)
+    if (owner == null || owner.kind != RDMA_RESOURCE_FUNCTION)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "MR requires a function owner");
+    if (pd_h == null || pd_h.kind != RDMA_RESOURCE_PD ||
+        !rdma_handle_matches_owner(pd_h, owner))
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "MR requires a PD handle");
     if (length == 0)
@@ -260,6 +264,14 @@ class rdma_create_cq_req extends rdma_semantic_request;
     status = super.validate();
     if (!status.ok())
       return status;
+    if (owner == null || owner.kind != RDMA_RESOURCE_FUNCTION)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "CQ requires a function owner");
+    if (ceq_h != null &&
+        (ceq_h.kind != RDMA_RESOURCE_CEQ ||
+         !rdma_handle_matches_owner(ceq_h, owner)))
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "CQ CEQ handle is invalid");
     if (!rdma_is_power_of_two(depth))
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "CQ depth is not a nonzero power of two");
@@ -351,13 +363,21 @@ class rdma_create_qp_req extends rdma_semantic_request;
     if (owner == null || owner.kind != RDMA_RESOURCE_FUNCTION)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "QP requires a function owner");
-    if (pd_h == null || pd_h.kind != RDMA_RESOURCE_PD)
+    if (pd_h == null || pd_h.kind != RDMA_RESOURCE_PD ||
+        !rdma_handle_matches_owner(pd_h, owner))
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "QP requires a PD handle");
     if (send_cq_h == null || send_cq_h.kind != RDMA_RESOURCE_CQ ||
-        recv_cq_h == null || recv_cq_h.kind != RDMA_RESOURCE_CQ)
+        !rdma_handle_matches_owner(send_cq_h, owner) ||
+        recv_cq_h == null || recv_cq_h.kind != RDMA_RESOURCE_CQ ||
+        !rdma_handle_matches_owner(recv_cq_h, owner))
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "QP requires send and receive CQ handles");
+    if (srq_h != null &&
+        (srq_h.kind != RDMA_RESOURCE_SRQ ||
+         !rdma_handle_matches_owner(srq_h, owner)))
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "QP SRQ handle is invalid");
     return rdma_status::success();
   endfunction
 endclass
@@ -410,7 +430,8 @@ class rdma_create_srq_req extends rdma_semantic_request;
     if (owner == null || owner.kind != RDMA_RESOURCE_FUNCTION)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "SRQ requires a function owner");
-    if (pd_h == null || pd_h.kind != RDMA_RESOURCE_PD)
+    if (pd_h == null || pd_h.kind != RDMA_RESOURCE_PD ||
+        !rdma_handle_matches_owner(pd_h, owner))
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "SRQ requires a PD handle");
     return rdma_status::success();

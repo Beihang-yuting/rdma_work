@@ -220,6 +220,8 @@ class rdma_types_test extends uvm_test;
     check_enum_code("RDMA_SEVERITY_WARNING", RDMA_SEVERITY_WARNING, 2'd1);
     check_enum_code("RDMA_SEVERITY_ERROR", RDMA_SEVERITY_ERROR, 2'd2);
     check_enum_code("RDMA_SEVERITY_FATAL", RDMA_SEVERITY_FATAL, 2'd3);
+    if ($bits(rdma_severity_e) != 2)
+      `uvm_error("RDMA_SEVERITY_WIDTH", "rdma_severity_e is not two bits")
 
     check_enum_code("RDMA_RESPONDER_DUT", RDMA_RESPONDER_DUT, 2'd0);
     check_enum_code("RDMA_RESPONDER_VIP", RDMA_RESPONDER_VIP, 2'd1);
