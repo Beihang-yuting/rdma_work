@@ -6,6 +6,8 @@ class rdma_xtr_v1_golden_case;
 endclass
 
 class rdma_xtr_v1_golden_reader;
+  localparam int unsigned MAX_PAYLOAD_BYTES = 512;
+
   static function bit strip_canonical_newline(
       string line,
       output string content,
@@ -171,42 +173,55 @@ class rdma_xtr_v1_golden_reader;
     return 0;
   endfunction
 
-  static function bit parse_payload_line(
+  static function rdma_status_code_e parse_payload_line(
       string line,
       int unsigned expected_bytes,
       output byte unsigned payload[],
       output string error);
     string content;
+    longint unsigned encoded_length;
 
-    payload = new[0];
+    payload.delete();
     error = "";
+    if (expected_bytes == 0) begin
+      error = "payload byte count must be positive";
+      return RDMA_SC_CODEC_ERROR;
+    end
+    if (expected_bytes > MAX_PAYLOAD_BYTES) begin
+      error = $sformatf("payload byte count %0d exceeds reader maximum %0d",
+                        expected_bytes, MAX_PAYLOAD_BYTES);
+      return RDMA_SC_CODEC_ERROR;
+    end
     if (!strip_canonical_newline(line, content, error))
-      return 0;
-    if (expected_bytes == 0 || content.len() != expected_bytes * 3 - 1) begin
+      return RDMA_SC_CODEC_ERROR;
+    encoded_length = expected_bytes;
+    encoded_length = encoded_length * 3 - 1;
+    if (content.len() != encoded_length) begin
       error = $sformatf("payload text length does not encode %0d bytes",
                         expected_bytes);
-      return 0;
+      return RDMA_SC_CODEC_ERROR;
     end
     payload = new[expected_bytes];
     foreach (payload[index]) begin
       int high;
       int low;
-      int position = index * 3;
+      longint unsigned position = index;
+      position = position * 3;
       if (!lower_hex_nibble(content.getc(position), high) ||
           !lower_hex_nibble(content.getc(position + 1), low)) begin
         error = "payload bytes must use exactly two lowercase hex digits";
-        payload = new[0];
-        return 0;
+        payload.delete();
+        return RDMA_SC_CODEC_ERROR;
       end
       if (index + 1 < expected_bytes &&
           content.getc(position + 2) != 8'h20) begin
         error = "payload bytes must use one ASCII space separator";
-        payload = new[0];
-        return 0;
+        payload.delete();
+        return RDMA_SC_CODEC_ERROR;
       end
       payload[index] = byte'((high << 4) | low);
     end
-    return 1;
+    return RDMA_SC_OK;
   endfunction
 
   static function bit read_all(
@@ -271,8 +286,8 @@ class rdma_xtr_v1_golden_reader;
           state = 4;
         end
         4: begin
-          if (!parse_payload_line(line, current.byte_count,
-                                  current.payload, error)) begin
+          if (parse_payload_line(line, current.byte_count,
+                                 current.payload, error) != RDMA_SC_OK) begin
             $fclose(fd);
             return 0;
           end

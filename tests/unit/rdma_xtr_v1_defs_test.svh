@@ -85,18 +85,37 @@ class rdma_xtr_v1_defs_test extends uvm_test;
 
   task check_golden_reader_rejections();
     byte unsigned payload[];
+    rdma_status_code_e payload_status;
+    int status;
     string parsed_name;
     string error;
+    string reject_dir;
     string valid_case;
 
-    if (rdma_xtr_v1_golden_reader::parse_payload_line(
-          "AA\n", 1, payload, error))
+    if (rdma_xtr_v1_golden_reader::MAX_PAYLOAD_BYTES != 512)
+      `uvm_error("GOLDEN_GRAMMAR", "golden reader payload limit")
+
+    payload = new[1];
+    payload[0] = 8'h5a;
+    payload_status = rdma_xtr_v1_golden_reader::parse_payload_line(
+        "0\n", 32'd1431655766, payload, error);
+    if (payload_status != RDMA_SC_CODEC_ERROR)
+      `uvm_error("GOLDEN_GRAMMAR", "wraparound byte count was accepted")
+    if (payload.size() != 0)
+      `uvm_error("GOLDEN_GRAMMAR",
+                 "wraparound byte count left a partially parsed payload")
+
+    payload_status = rdma_xtr_v1_golden_reader::parse_payload_line(
+        "AA\n", 1, payload, error);
+    if (payload_status == RDMA_SC_OK)
       `uvm_error("GOLDEN_GRAMMAR", "uppercase hex was accepted")
-    if (rdma_xtr_v1_golden_reader::parse_payload_line(
-          "0g\n", 1, payload, error))
+    payload_status = rdma_xtr_v1_golden_reader::parse_payload_line(
+        "0g\n", 1, payload, error);
+    if (payload_status == RDMA_SC_OK)
       `uvm_error("GOLDEN_GRAMMAR", "partial hex token was accepted")
-    if (rdma_xtr_v1_golden_reader::parse_payload_line(
-          "00  01\n", 2, payload, error))
+    payload_status = rdma_xtr_v1_golden_reader::parse_payload_line(
+        "00  01\n", 2, payload, error);
+    if (payload_status == RDMA_SC_OK)
       `uvm_error("GOLDEN_GRAMMAR", "noncanonical byte spacing was accepted")
     if (rdma_xtr_v1_golden_reader::parse_case_line(
           "# case: Qpc_rc_boundary\n", parsed_name, error))
@@ -110,8 +129,21 @@ class rdma_xtr_v1_defs_test extends uvm_test;
                   "# inputs: value=1\n",
                   "# bytes: 1\n",
                   "00\n"};
+    status = 1;
+    for (int unsigned attempt = 0; attempt < 64 && status != 0; attempt++) begin
+      reject_dir = $sformatf("/tmp/rdma_xtr_v1_defs_test.%08x",
+                             $urandom());
+      status = $system($sformatf("mkdir -m 700 -- %s 2>/dev/null",
+                                 reject_dir));
+    end
+    if (status != 0) begin
+      `uvm_error("GOLDEN_GRAMMAR",
+                 $sformatf("cannot create reject fixture directory %s",
+                           reject_dir))
+      return;
+    end
     check_read_all_rejection(
-        "/tmp/rdma_xtr_v1_defs_test_duplicate.hex",
+        {reject_dir, "/duplicate.hex"},
         {valid_case, "\n# xtr_v1-golden-v1\n",
          "# case: first\n",
          "# inputs: value=2\n",
@@ -119,7 +151,7 @@ class rdma_xtr_v1_defs_test extends uvm_test;
          "01\n"},
         "duplicate case name");
     check_read_all_rejection(
-        "/tmp/rdma_xtr_v1_defs_test_truncated.hex",
+        {reject_dir, "/truncated.hex"},
         {"# xtr_v1-golden-v1\n",
          "# case: truncated\n",
          "# inputs: value=1\n",
@@ -127,7 +159,7 @@ class rdma_xtr_v1_defs_test extends uvm_test;
          "00\n"},
         "truncated payload");
     check_read_all_rejection(
-        "/tmp/rdma_xtr_v1_defs_test_extra.hex",
+        {reject_dir, "/extra.hex"},
         {"# xtr_v1-golden-v1\n",
          "# case: extra\n",
          "# inputs: value=1\n",
@@ -135,40 +167,108 @@ class rdma_xtr_v1_defs_test extends uvm_test;
          "00 01\n"},
         "extra payload byte");
     check_read_all_rejection(
-        "/tmp/rdma_xtr_v1_defs_test_incomplete.hex",
+        {reject_dir, "/incomplete.hex"},
         {valid_case, "\n# xtr_v1-golden-v1\n",
          "# case: incomplete\n",
          "# inputs: value=2\n",
          "# bytes: 1\n"},
         "incomplete trailing case");
+    status = $system($sformatf("rmdir -- %s", reject_dir));
+    if (status != 0)
+      `uvm_error("GOLDEN_GRAMMAR",
+                 $sformatf("cannot remove reject fixture directory %s",
+                           reject_dir))
   endtask
 
   function void check_mask_lookup_api();
     bit [63:0] mask_value;
+    rdma_image_kind_e image_kinds[8] = '{
+      RDMA_IMAGE_CQC,
+      RDMA_IMAGE_MRT, RDMA_IMAGE_MRT, RDMA_IMAGE_MRT, RDMA_IMAGE_MRT,
+      RDMA_IMAGE_SRQC, RDMA_IMAGE_CEQC, RDMA_IMAGE_AEQC
+    };
+    bit [7:0] opcodes[8] = '{
+      XTR_V1_OP_CQC_CREATE,
+      XTR_V1_OP_KEY_ALLOC, XTR_V1_OP_MR_REGISTER,
+      XTR_V1_OP_MR_REGISTER, XTR_V1_OP_MR_REGISTER,
+      XTR_V1_OP_SRFQC_CREATE, XTR_V1_OP_CEQC_CREATE,
+      XTR_V1_OP_AEQC_CREATE
+    };
+    int unsigned pbl_modes[8] = '{0, 0, 0, 1, 2, 0, 0, 0};
+    string labels[8] = '{
+      "CQC create", "MRT key allocate PBL0", "MRT register PBL0",
+      "MRT register PBL1", "MRT register PBL2", "SRQC create",
+      "CEQC create", "AEQC create"
+    };
+    bit [63:0] expected_masks[8][8] = '{
+      '{64'h00000000001fffff, 64'hff0fffffffffffff,
+        64'hfffffffffffff8ff, 64'hfffffffffff8c701,
+        64'hf000000000ffffff, 64'h0000000000000fff,
+        64'hffffffffffffffc0, 64'h0000000f00ffffff},
+      '{64'h6000000000ffffff, 64'h00000000ff000000,
+        64'hffffffffffffffff, 64'hff00bfffffffffff,
+        64'hffffffffffffffff, 64'hfffffffffffff000,
+        64'h0000000000000fff, 64'h0000000000000000},
+      '{64'h6000000000ffffff, 64'h00000000ff000000,
+        64'hffffffffff000000, 64'hff00bfffffffffff,
+        64'hffffffffffffffff, 64'hfffffffffffff000,
+        64'h0000000000000fff, 64'h0000000000000000},
+      '{64'h6000000000ffffff, 64'h00000000ff000000,
+        64'hffffffffff000000, 64'hff00bfffffffffff,
+        64'hffffffffffffffff, 64'hfffffffffffff000,
+        64'hffffffffffffffff, 64'h0000000000000000},
+      '{64'h6000000000ffffff, 64'h00000000ff000000,
+        64'hffffffffff000000, 64'hff00bfffffffffff,
+        64'hffffffffffffffff, 64'hfffffff000000000,
+        64'h0000000000000fff, 64'h0000000000000000},
+      '{64'h000000000000ffff, 64'h0000000000000000,
+        64'hcfffffffffffffff, 64'hffff000000000000,
+        64'hfffffffffffff0fc, 64'h00000000ffffffff,
+        64'h0000000000000000, 64'h0000000000000000},
+      '{64'h0000000000000fff, 64'h0000000000000000,
+        64'hc1ffffffffffffff, 64'hfffffffffffff800,
+        64'h0000007ffff0c000, 64'hffff00000007ffff,
+        64'h0000000000000000, 64'h0000000000000000},
+      '{64'h0000000000000fff, 64'h0000000000000000,
+        64'hc1ffffffffffffff, 64'hfffffffffffff800,
+        64'h0000007ffff0c000, 64'hffff00000007ffff,
+        64'h0000000000000000, 64'h0000000000000000}
+    };
 
     if (request_envelope_mask(0) != 64'h8fff3fff00000000 ||
         request_envelope_mask(1) != 0 || request_envelope_mask(8) != 0)
       `uvm_error("MASK_API", "request envelope qword lookup")
-    if (!body_mask(RDMA_IMAGE_CQC, XTR_V1_OP_CQC_CREATE, 0, 0,
-                   mask_value) || mask_value != 64'h00000000001fffff)
-      `uvm_error("MASK_API", "CQC lookup")
-    if (!body_mask(RDMA_IMAGE_MRT, XTR_V1_OP_KEY_ALLOC, 0, 2,
-                   mask_value) || mask_value != 64'hffffffffffffffff)
-      `uvm_error("MASK_API", "MRT key lookup")
-    if (!body_mask(RDMA_IMAGE_SRQC, XTR_V1_OP_SRFQC_CREATE, 0, 2,
-                   mask_value) || mask_value != 64'hcfffffffffffffff)
-      `uvm_error("MASK_API", "SRQC lookup")
-    if (!body_mask(RDMA_IMAGE_CEQC, XTR_V1_OP_CEQC_CREATE, 0, 3,
-                   mask_value) || mask_value != 64'hfffffffffffff800)
-      `uvm_error("MASK_API", "CEQC lookup")
-    if (!body_mask(RDMA_IMAGE_AEQC, XTR_V1_OP_AEQC_CREATE, 0, 5,
-                   mask_value) || mask_value != 64'hffff00000007ffff)
-      `uvm_error("MASK_API", "AEQC lookup")
+
+    foreach (image_kinds[case_index]) begin
+      for (int unsigned qword_index = 0; qword_index < 8;
+           qword_index++) begin
+        mask_value = '1;
+        if (!body_mask(image_kinds[case_index], opcodes[case_index],
+                       pbl_modes[case_index], qword_index, mask_value)) begin
+          `uvm_error("MASK_API",
+                     $sformatf("%s qword %0d was rejected",
+                               labels[case_index], qword_index))
+        end else if (mask_value != expected_masks[case_index][qword_index]) begin
+          `uvm_error("MASK_API",
+                     $sformatf("%s qword %0d mask 0x%016x, expected 0x%016x",
+                               labels[case_index], qword_index, mask_value,
+                               expected_masks[case_index][qword_index]))
+        end
+      end
+    end
 
     mask_value = '1;
     if (body_mask(RDMA_IMAGE_CQC, XTR_V1_OP_AEQC_CREATE, 0, 0,
                   mask_value) || mask_value != 0)
-      `uvm_error("MASK_API", "kind/opcode mismatch was accepted")
+      `uvm_error("MASK_API", "unsupported opcode was accepted")
+    mask_value = '1;
+    if (body_mask(RDMA_IMAGE_MRT, XTR_V1_OP_MR_REGISTER, 3, 0,
+                  mask_value) || mask_value != 0)
+      `uvm_error("MASK_API", "unsupported PBL mode was accepted")
+    mask_value = '1;
+    if (body_mask(RDMA_IMAGE_QPC, XTR_V1_OP_QPC_CREATE, 0, 0,
+                  mask_value) || mask_value != 0)
+      `uvm_error("MASK_API", "unsupported image kind was accepted")
     mask_value = '1;
     if (body_mask(RDMA_IMAGE_MRT, XTR_V1_OP_MR_REGISTER, 0, 8,
                   mask_value) || mask_value != 0)
