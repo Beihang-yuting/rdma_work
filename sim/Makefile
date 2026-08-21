@@ -30,35 +30,47 @@ host_mem_preflight:
 			exit 2; \
 		fi; \
 	done
-	@if git -C "$(HOST_MEM_ROOT)" rev-parse --is-inside-work-tree \
+	@preflight_failed=0; \
+	git_metadata_available=0; \
+	if git -C "$(HOST_MEM_ROOT)" rev-parse --is-inside-work-tree \
 		>/dev/null 2>&1; then \
+		git_metadata_available=1; \
 		actual_head=$$(git -C "$(HOST_MEM_ROOT)" rev-parse HEAD); \
 		if [[ "$$actual_head" != "$(HOST_MEM_PINNED_COMMIT)" ]]; then \
 			echo "host_mem preflight failed: HEAD $$actual_head does not match pinned commit $(HOST_MEM_PINNED_COMMIT)" >&2; \
-			exit 1; \
+			preflight_failed=1; \
+		else \
+			if ! git -C "$(HOST_MEM_ROOT)" diff --cached \
+				--no-ext-diff --quiet "$(HOST_MEM_PINNED_COMMIT)" -- \
+				src/host_mem_pkg.sv src/host_mem_manager.sv; then \
+				echo "host_mem preflight failed: pinned source index differs from commit $(HOST_MEM_PINNED_COMMIT) (staged change)" >&2; \
+				preflight_failed=1; \
+			fi; \
+			if ! git -C "$(HOST_MEM_ROOT)" diff --no-ext-diff --quiet -- \
+				src/host_mem_pkg.sv src/host_mem_manager.sv; then \
+				echo "host_mem preflight failed: pinned source worktree differs from the index (unstaged change)" >&2; \
+				preflight_failed=1; \
+			fi; \
 		fi; \
-		if ! git -C "$(HOST_MEM_ROOT)" diff --no-ext-diff --quiet \
-			"$(HOST_MEM_PINNED_COMMIT)" -- \
-			src/host_mem_pkg.sv src/host_mem_manager.sv; then \
-			echo "host_mem preflight failed: pinned source files differ from commit $(HOST_MEM_PINNED_COMMIT)" >&2; \
-			exit 1; \
-		fi; \
-		echo "host_mem preflight passed: pinned git checkout is clean"; \
+	fi; \
+	pkg_hash=$$(sha256sum "$(HOST_MEM_ROOT)/src/host_mem_pkg.sv"); \
+	pkg_hash=$${pkg_hash%% *}; \
+	manager_hash=$$(sha256sum "$(HOST_MEM_ROOT)/src/host_mem_manager.sv"); \
+	manager_hash=$${manager_hash%% *}; \
+	if [[ "$$pkg_hash" != "$(HOST_MEM_PKG_SHA256)" ]]; then \
+		echo "host_mem preflight failed: host_mem_pkg.sv SHA-256 $$pkg_hash does not match pinned $(HOST_MEM_PKG_SHA256)" >&2; \
+		preflight_failed=1; \
+	fi; \
+	if [[ "$$manager_hash" != "$(HOST_MEM_MANAGER_SHA256)" ]]; then \
+		echo "host_mem preflight failed: host_mem_manager.sv SHA-256 $$manager_hash does not match pinned $(HOST_MEM_MANAGER_SHA256)" >&2; \
+		preflight_failed=1; \
+	fi; \
+	if [[ "$$preflight_failed" != 0 ]]; then \
+		exit 1; \
+	fi; \
+	if [[ "$$git_metadata_available" == 1 ]]; then \
+		echo "host_mem preflight passed: pinned git checkout and source hashes match"; \
 	else \
-		pkg_hash=$$(sha256sum \
-			"$(HOST_MEM_ROOT)/src/host_mem_pkg.sv"); \
-		pkg_hash=$${pkg_hash%% *}; \
-		manager_hash=$$(sha256sum \
-			"$(HOST_MEM_ROOT)/src/host_mem_manager.sv"); \
-		manager_hash=$${manager_hash%% *}; \
-		if [[ "$$pkg_hash" != "$(HOST_MEM_PKG_SHA256)" ]]; then \
-			echo "host_mem preflight failed: host_mem_pkg.sv SHA-256 $$pkg_hash does not match pinned $(HOST_MEM_PKG_SHA256)" >&2; \
-			exit 1; \
-		fi; \
-		if [[ "$$manager_hash" != "$(HOST_MEM_MANAGER_SHA256)" ]]; then \
-			echo "host_mem preflight failed: host_mem_manager.sv SHA-256 $$manager_hash does not match pinned $(HOST_MEM_MANAGER_SHA256)" >&2; \
-			exit 1; \
-		fi; \
 		echo "host_mem preflight passed: git metadata unavailable; pinned source hashes match"; \
 	fi
 
