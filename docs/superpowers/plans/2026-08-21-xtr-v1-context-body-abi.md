@@ -404,6 +404,7 @@ class rdma_qpc_model extends rdma_hw_model;
   rdma_backing_addr_t sq_backing, rq_backing, context_backing;
   rdma_object_mode_e sq_mode, rq_mode;
   rdma_address_vector address_vector;
+  rdma_qpc_behavior behavior;
   bit signature_enable, tx_flow_control, rx_flow_control;
   rdma_qpc_transport_ext transport_ext;
 endclass
@@ -596,6 +597,11 @@ git commit -m "feat: add xtr_v1 logical qword codec"
 
 ### Task 10C: Implement standalone RC/UD/URC QPC codecs
 
+> **Task 10A.1 prerequisite:** Follow
+> `docs/superpowers/specs/2026-08-21-qpc-behavior-ownership-design.md`.
+> QPC behavior is explicit model state; `context_backing` maps to `SHADOW_PBA`;
+> xtr_v1 has one shared `FC_EN`; and QPC uses a private 512B allowed mask.
+
 **Files:**
 - Modify: `src/codec/rdma_codec_base.svh`
 - Create: `src/codec/xtr_v1/rdma_xtr_v1_qpc_codecs.svh`
@@ -615,7 +621,13 @@ if (!equal) `uvm_error("QPC_ROUNDTRIP", {case_name, ": ", mismatch})
 
 Add a projected-handle test where source handles have nonzero `function_uid/generation` and decoded handles have zero lifecycle metadata; equality must still pass when kind/object ID match and fail when either differs. Verify the encoded image keeps source generation in `function_generation`, but payload bytes do not change when only lifecycle metadata changes.
 
-Negative rows must cover wrong model subclass, transport-extension mismatch, QPN/CQN/PD/SRQ width overflow, invalid PMTU, bad retry width, queue/context misalignment, TC ECN mismatch, wrong image metadata, a nonzero reserved bit, and each group of RC PSN mirrors corrupted one at a time. Encode/decode failures must return null output objects.
+Every golden builder explicitly sets `behavior`; transport selection must not supply
+behavior defaults. Set `context_backing.value = frozen_shadow_pba << 9`, verify
+`signature_enable -> SQ_CE_EN`, and use equal TX/RX flow-control values for positive
+vectors. Negative rows also cover behavior width violations, TX/RX flow-control
+mismatch, and a QPC-private reserved bit.
+
+Negative rows must cover wrong model subclass, transport-extension mismatch, QPN/CQN/PD/SRQ width overflow, invalid PMTU, bad retry width, queue/context misalignment, TC ECN mismatch, wrong image metadata, and each group of RC PSN mirrors corrupted one at a time. Encode/decode failures must return null output objects.
 
 - [ ] **Step 2: Run RED on 53**
 
@@ -642,7 +654,11 @@ virtual function rdma_status serialized_equal(
 endfunction
 ```
 
-Every xtr_v1 QPC/body codec overrides it. The override compares only serialized semantics, compares handles by `kind/object_id`, canonicalizes SQE to SQD on state decode, and ignores function UID/generation plus QPC `context_backing` because those have no QPC payload bits.
+Every xtr_v1 QPC/body codec overrides it. The QPC override compares every serialized
+behavior field, `context_backing`, `signature_enable`, and both flow-control semantics;
+it compares handles by `kind/object_id`, canonicalizes SQE to SQD on state decode, and
+ignores only function UID/generation plus fields that the approved design explicitly
+classifies as runtime metadata.
 
 - [ ] **Step 4: Implement common QPC projection plus three transport codecs**
 
@@ -659,6 +675,18 @@ image.write_target_kind = RDMA_HW_TARGET_NONE;
 ```
 
 Derived classes are `rdma_xtr_v1_qpc_rc_codec`, `rdma_xtr_v1_qpc_ud_codec`, and `rdma_xtr_v1_qpc_urc_codec`. Each begins with a fresh 512-byte qword builder, calls common-field projection, calls only its own extension projection, validates the complete QPC allowed mask, serializes once, and assigns the output image only after all operations succeed.
+
+The common projection writes `behavior.transport_version`, migration, both endian
+swap bits, both fence bits, and priority into their frozen QPC fields. It writes
+`SHADOW_PBA = context_backing.value >> 9` and `SQ_CE_EN = signature_enable`.
+Reject unequal TX/RX flow control with `RDMA_SC_INVALID_ARGUMENT`, otherwise write the
+shared value to `FC_EN`; decode restores both model fields from that bit and restores
+the byte IOVA with `SHADOW_PBA << 9`.
+
+Build a QPC-specific 512B allowed mask from the frozen QPC field table. Do not call
+the 64B sparse-command `body_mask()` for `RDMA_IMAGE_QPC`. Leave `CC_TYPE`,
+`RTO_CODE`, and `LOAD_RQ_PI_TH` zero/reserved until a separate approved design assigns
+their ownership.
 
 Use explicit mapping helpers:
 
