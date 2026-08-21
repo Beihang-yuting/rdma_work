@@ -2,6 +2,7 @@ package rdma_unit_test_pkg;
   import uvm_pkg::*;
   import rdma_types_pkg::*;
   import rdma_model_pkg::*;
+  import rdma_core_pkg::*;
   import rdma_adapter_pkg::*;
   `include "uvm_macros.svh"
 
@@ -11,4 +12,5 @@ package rdma_unit_test_pkg;
   `include "unit/rdma_model_test.svh"
   `include "unit/rdma_request_model_test.svh"
   `include "unit/rdma_adapter_contract_test.svh"
+  `include "unit/rdma_resource_manager_test.svh"
 endpackage
