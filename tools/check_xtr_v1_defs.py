@@ -17,6 +17,7 @@ FIXED_COMMIT = "491faf2ba42627fffd4dd027607299c8bb591ec2"
 REPO_ROOT = Path(__file__).resolve().parents[1]
 MANIFEST_PATH = REPO_ROOT / "hw" / "xtr_v1" / "source_manifest.txt"
 SV_DEFS_PATH = REPO_ROOT / "src" / "codec" / "xtr_v1" / "rdma_xtr_v1_defs.svh"
+SV_MASKS_PATH = REPO_ROOT / "src" / "codec" / "xtr_v1" / "rdma_xtr_v1_image_masks.svh"
 GOLDEN_DIR = REPO_ROOT / "hw" / "xtr_v1" / "golden_vectors"
 
 SOURCE_HASHES = {
@@ -32,6 +33,13 @@ SOURCE_HASHES = {
     "cq.c": "a9db3e9ea40741dbb12735d55820d18c5ade3eea7cd4125d670557972f336cee",
     "wr.c": "df855a9c560fced5dae7e188a540fb1b333fb8746395f88522a185eb265e8230",
     "cmq.c": "0976654707f3ee68a96589121aae22db7a6cefb1eec3454e756ba16e411ab383",
+    "alloc.h": "6723ae4bdfdc283e6c4821d2ce59f5ca300629665527cf316e4c49c6dad53922",
+    "mr.h": "de683e3e941e31ba07162ea2b4712a5ed2224d26362fd567916c0abfbfef58c8",
+    "mr.c": "ac507832fb7f595ad168735946499c4612baf1eaebac7ede301f1f29621d8aed",
+    "rdma_main.h": "19f16fc6f4e0b2a8e3f9e14ec4ac9d2bde1e34472313866abe430be1f9258c7e",
+    "srq.h": "c0f7edd9bc65a4a574c082167221bdb7644c28e6f4387c1bd2a5db157b2341ae",
+    "srq.c": "c511b0d669e9501ece1c3f02ac7079b6d900b34cf87a33b1dc800857b47fd766",
+    "event.h": "9c1185a2279854c95ed00a949c2a8aa3f4a1588386de65bf7fa7662d08dfb99a",
     "event.c": "efdba325776236f3715c4e847d5bae90369263bd29b14192dd6234b498df189b",
 }
 
@@ -42,6 +50,63 @@ REQUIRED_MANIFEST_ROWS = {
     ("wr.h", "XTRDMA_SQ_WQE_*|XTRDMA_RQE_*|XTRDMA_CQE_*"),
     ("defs.h", "XTRDMA_CEQE_*|XTRDMA_AEQE_*|EC_*"),
     ("eth_header/rdma_register.h", "RDMA_HID_MAP_TABLE|RDMA_RPE_VFT_TABLE"),
+    ("alloc.h", "xtrdma_alloc_type"),
+    ("mr.h", "MR/PBL/page/address-enums|xtrdma_reg_mr_info"),
+    ("mr.c", "xtrdma_hwreg_mr"),
+    ("rdma_main.h", "xtrdma_get_access"),
+    ("srq.h", "XTRDMA_SRFQ_CTX_*"),
+    ("srq.c", "xtrdma_hw_create_srfqc"),
+    ("event.h", "XTRDMA_EQ_CTX_*"),
+    ("event.c", "xtrdma_hw_create_eq"),
+}
+
+ENVELOPE_MASK = (0x8FFF3FFF00000000,) + (0,) * 7
+BODY_MASKS = {
+    "cqc_create": (
+        0x00000000001FFFFF, 0xFF0FFFFFFFFFFFFF,
+        0xFFFFFFFFFFFFF8FF, 0xFFFFFFFFFFF8C701,
+        0xF000000000FFFFFF, 0x0000000000000FFF,
+        0xFFFFFFFFFFFFFFC0, 0x0000000F00FFFFFF,
+    ),
+    "mrt_register_pbl0": (
+        0x6000000000FFFFFF, 0x00000000FF000000,
+        0xFFFFFFFFFF000000, 0xFF00BFFFFFFFFFFF,
+        0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFF000,
+        0x0000000000000FFF, 0,
+    ),
+    "mrt_key_alloc_pbl0": (
+        0x6000000000FFFFFF, 0x00000000FF000000,
+        0xFFFFFFFFFFFFFFFF, 0xFF00BFFFFFFFFFFF,
+        0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFF000,
+        0x0000000000000FFF, 0,
+    ),
+    "mrt_register_pbl1": (
+        0x6000000000FFFFFF, 0x00000000FF000000,
+        0xFFFFFFFFFF000000, 0xFF00BFFFFFFFFFFF,
+        0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFF000,
+        0xFFFFFFFFFFFFFFFF, 0,
+    ),
+    "mrt_register_pbl2": (
+        0x6000000000FFFFFF, 0x00000000FF000000,
+        0xFFFFFFFFFF000000, 0xFF00BFFFFFFFFFFF,
+        0xFFFFFFFFFFFFFFFF, 0xFFFFFFF000000000,
+        0x0000000000000FFF, 0,
+    ),
+    "srqc_create": (
+        0x000000000000FFFF, 0, 0xCFFFFFFFFFFFFFFF,
+        0xFFFF000000000000, 0xFFFFFFFFFFFFF0FC,
+        0x00000000FFFFFFFF, 0, 0,
+    ),
+    "ceqc_create": (
+        0x0000000000000FFF, 0, 0xC1FFFFFFFFFFFFFF,
+        0xFFFFFFFFFFFFF800, 0x0000007FFFF0C000,
+        0xFFFF00000007FFFF, 0, 0,
+    ),
+    "aeqc_create": (
+        0x0000000000000FFF, 0, 0xC1FFFFFFFFFFFFFF,
+        0xFFFFFFFFFFFFF800, 0x0000007FFFF0C000,
+        0xFFFF00000007FFFF, 0, 0,
+    ),
 }
 
 
@@ -54,6 +119,7 @@ class FieldMapping(NamedTuple):
     c_symbol: str
     sv_stem: str
     word_byte_offset: int
+    lsb_adjust: int = 0
 
 
 class ReferenceField(NamedTuple):
@@ -72,10 +138,27 @@ class ValueMapping(NamedTuple):
     subtract_symbol: str = ""
 
 
+class BodyTranslation(NamedTuple):
+    path: str
+    c_symbol: str
+    sv_stem: str
+    local_word_byte_offset: int
+    final_base_offset: int
+
+
+class GoldenInput(NamedTuple):
+    name: str
+    value: str
+
+
 class GoldenCase(NamedTuple):
     name: str
-    summary: str
+    inputs: tuple[GoldenInput, ...]
     payload: bytes
+
+    @property
+    def summary(self) -> str:
+        return ",".join(f"{item.name}={item.value}" for item in self.inputs)
 
 
 # word_byte_offset comes from the fixed driver's set_64bit_val/get_64bit_val
@@ -93,11 +176,15 @@ FIELD_MAPPINGS = (
     FieldMapping("qp.h", "XTRDMA_QPC_STAT_IDX", "XTR_V1_QPC_STAT_IDX", 0),
     FieldMapping("qp.h", "XTRDMA_QPC_UD_QKEY_H", "XTR_V1_QPC_UD_QKEY_H", 0),
     FieldMapping("qp.h", "XTRDMA_QPC_UD_QKEY_L", "XTR_V1_QPC_UD_QKEY_L", 8),
+    FieldMapping("qp.h", "XTRDMA_QPC_URC_RSQ_PBA_H", "XTR_V1_QPC_URC_RSQ_PBA_H", 0),
+    FieldMapping("qp.h", "XTRDMA_QPC_URC_RSQ_PBA_L", "XTR_V1_QPC_URC_RSQ_PBA_L", 8),
     FieldMapping("qp.h", "XTRDMA_QPC_PKEY", "XTR_V1_QPC_PKEY", 8),
     FieldMapping("qp.h", "XTRDMA_QPC_SHADOW_PBA", "XTR_V1_QPC_SHADOW_PBA", 16),
     FieldMapping("qp.h", "XTRDMA_QPC_TX_ENDIAN_SWAP", "XTR_V1_QPC_TX_ENDIAN_SWAP", 16),
     FieldMapping("qp.h", "XTRDMA_QPC_RX_ENDIAN_SWAP", "XTR_V1_QPC_RX_ENDIAN_SWAP", 16),
     FieldMapping("qp.h", "XTRDMA_QPC_SQ_CE_EN", "XTR_V1_QPC_SQ_CE_EN", 16),
+    FieldMapping("qp.h", "XTRDMA_QPC_RA_RENCE", "XTR_V1_QPC_RA_FENCE", 16),
+    FieldMapping("qp.h", "XTRDMA_QPC_AA_FENCE", "XTR_V1_QPC_AA_FENCE", 16),
     FieldMapping("qp.h", "XTRDMA_QPC_FC_EN", "XTR_V1_QPC_FC_EN", 16),
     FieldMapping("qp.h", "XTRDMA_QPC_CC_TYPE", "XTR_V1_QPC_CC_TYPE", 24),
     FieldMapping("qp.h", "XTRDMA_QPC_QP_ST", "XTR_V1_QPC_QP_ST", 24),
@@ -108,49 +195,90 @@ FIELD_MAPPINGS = (
     FieldMapping("qp.h", "XTRDMA_QPC_RC_SRFQN", "XTR_V1_QPC_RC_SRFQN", 24),
     FieldMapping("qp.h", "XTRDMA_QPC_PD_IDX", "XTR_V1_QPC_PD_IDX", 24),
     FieldMapping("qp.h", "XTRDMA_QPC_QP_ACCESS_FLAG", "XTR_V1_QPC_QP_ACCESS_FLAG", 32),
+    FieldMapping("qp.h", "XTRDMA_QPC_URC_RDSQ_PBA", "XTR_V1_QPC_URC_RDSQ_PBA", 32),
+    FieldMapping("qp.h", "XTRDMA_QPC_URC_RDSQ_SIZE", "XTR_V1_QPC_URC_RDSQ_SIZE", 32),
+    FieldMapping("qp.h", "XTRDMA_QPC_PSN_RETRY_TH", "XTR_V1_QPC_PSN_RETRY_TH", 40),
     FieldMapping("qp.h", "XTRDMA_QPC_RTO_CODE", "XTR_V1_QPC_RTO_CODE", 40),
     FieldMapping("qp.h", "XTRDMA_QPC_VLAN", "XTR_V1_QPC_VLAN", 56),
     FieldMapping("qp.h", "XTRDMA_QPC_IPV6", "XTR_V1_QPC_IPV6", 56),
+    FieldMapping("qp.h", "XTRDMA_QPC_TUNNEL", "XTR_V1_QPC_TUNNEL", 56),
+    FieldMapping("qp.h", "XTRDMA_QPC_LAG", "XTR_V1_QPC_LAG", 56),
+    FieldMapping("qp.h", "XTRDMA_QPC_FWD", "XTR_V1_QPC_FWD", 56),
     FieldMapping("qp.h", "XTRDMA_QPC_DST_VPORT_ID", "XTR_V1_QPC_DST_VPORT_ID", 56),
     FieldMapping("qp.h", "XTRDMA_QPC_SRC_ADDR_IDX", "XTR_V1_QPC_SRC_ADDR_IDX", 56),
+    FieldMapping("qp.h", "XTRDMA_QPC_DST_PORT", "XTR_V1_QPC_DST_PORT", 56),
     FieldMapping("qp.h", "XTRDMA_QPC_DST_QPN", "XTR_V1_QPC_DST_QPN", 56),
     FieldMapping("qp.h", "XTRDMA_QPC_DMAC", "XTR_V1_QPC_DMAC", 64),
+    FieldMapping("qp.h", "XTRDMA_QPC_PRI", "XTR_V1_QPC_PRI", 64),
+    FieldMapping("qp.h", "XTRDMA_QPC_CFI", "XTR_V1_QPC_CFI", 64),
     FieldMapping("qp.h", "XTRDMA_QPC_VLAN_ID", "XTR_V1_QPC_VLAN_ID", 64),
     FieldMapping("qp.h", "XTRDMA_QPC_FLOW_LABEL", "XTR_V1_QPC_FLOW_LABEL", 72),
+    FieldMapping("qp.h", "XTRDMA_QPC_SRC_VPORT_ID", "XTR_V1_QPC_SRC_VPORT_ID", 72),
     FieldMapping("qp.h", "XTRDMA_QPC_DSCP", "XTR_V1_QPC_DSCP", 72),
     FieldMapping("qp.h", "XTRDMA_QPC_ECN", "XTR_V1_QPC_ECN", 72),
     FieldMapping("qp.h", "XTRDMA_QPC_HOPLIMIT", "XTR_V1_QPC_HOPLIMIT", 72),
     FieldMapping("qp.h", "XTRDMA_QPC_CUR_UDP_SPORT", "XTR_V1_QPC_CUR_UDP_SPORT", 72),
+    FieldMapping("qp.h", "XTRDMA_QPC_URC_TX_RBSN", "XTR_V1_QPC_URC_TX_RBSN", 96),
+    FieldMapping("qp.h", "XTRDMA_QPC_URC_TX_DBSN", "XTR_V1_QPC_URC_TX_DBSN", 96),
+    FieldMapping("qp.h", "XTRDMA_QPC_URC_RX_RBSN", "XTR_V1_QPC_URC_RX_RBSN", 128),
+    FieldMapping("qp.h", "XTRDMA_QPC_URC_RX_DBSN", "XTR_V1_QPC_URC_RX_DBSN", 128),
+    FieldMapping("qp.h", "XTRDMA_QPC_RC_TPE_CUR_SQ_PSN", "XTR_V1_QPC_RC_TPE_CUR_SQ_PSN", 160),
+    FieldMapping("qp.h", "XTRDMA_QPC_RC_LAST_READ_PSN", "XTR_V1_QPC_RC_LAST_READ_PSN", 208),
     FieldMapping("qp.h", "XTRDMA_QPC_SQ_PD_PBA_OR_PBA", "XTR_V1_QPC_SQ_PBA", 216),
     FieldMapping("qp.h", "XTRDMA_QPC_SQ_SIZE", "XTR_V1_QPC_SQ_SIZE", 216),
     FieldMapping("qp.h", "XTRDMA_QPC_SQ_OM", "XTR_V1_QPC_SQ_OM", 216),
+    FieldMapping("qp.h", "XTRDMA_QPC_RC_EIRQ_PSN_MAX", "XTR_V1_QPC_RC_EIRQ_PSN_MAX", 224),
+    FieldMapping("qp.h", "XTRDMA_QPC_URC_RX_SRBSN", "XTR_V1_QPC_URC_RX_SRBSN", 224),
+    FieldMapping("qp.h", "XTRDMA_QPC_EIRQ_CUR_SEND_PSN", "XTR_V1_QPC_EIRQ_CUR_SEND_PSN", 232),
+    FieldMapping("qp.h", "XTRDMA_QPC_URC_CUR_TX_DPSN", "XTR_V1_QPC_URC_CUR_TX_DPSN", 232),
+    FieldMapping("qp.h", "XTRDMA_QPC_URC_CUR_TX_RPSN", "XTR_V1_QPC_URC_CUR_TX_RPSN", 232),
+    FieldMapping("qp.h", "XTRDMA_QPC_EPSN_REQ", "XTR_V1_QPC_EPSN_REQ", 288),
+    FieldMapping("qp.h", "XTRDMA_QPC_URC_RXED_DBSN", "XTR_V1_QPC_URC_RXED_DBSN", 296),
+    FieldMapping("qp.h", "XTRDMA_QPC_URC_RQ_SE_TH", "XTR_V1_QPC_URC_RQ_SE_TH", 320),
+    FieldMapping("qp.h", "XTRDMA_QPC_URC_SQ_CE_TH", "XTR_V1_QPC_URC_SQ_CE_TH", 320),
+    FieldMapping("qp.h", "XTRDMA_QPC_URC_TX_SRBSN", "XTR_V1_QPC_URC_TX_SRBSN", 328),
+    FieldMapping("qp.h", "XTRDMA_QPC_URC_MAX_TX_SRBSN", "XTR_V1_QPC_URC_MAX_TX_SRBSN", 328),
+    FieldMapping("qp.h", "XTRDMA_QPC_RC_PSN_MAX_RPE", "XTR_V1_QPC_RC_PSN_MAX_RPE", 344),
+    FieldMapping("qp.h", "XTRDMA_QPC_RC_EPSN_RSP", "XTR_V1_QPC_RC_EPSN_RSP", 352),
+    FieldMapping("qp.h", "XTRDMA_QPC2_RC_EPSN_RSP", "XTR_V1_QPC2_RC_EPSN_RSP", 376),
+    FieldMapping("qp.h", "XTRDMA_QPC_URC_CUR_DSQ_PBA_H", "XTR_V1_QPC_URC_CUR_DSQ_PBA_H", 384),
+    FieldMapping("qp.h", "XTRDMA_QPC_URC_CUR_DSQ_PBA_L", "XTR_V1_QPC_URC_CUR_DSQ_PBA_L", 392),
+    FieldMapping("qp.h", "XTRDMA_QPC_URC_NXT_DSQ_PBA", "XTR_V1_QPC_URC_NXT_DSQ_PBA", 392),
+    FieldMapping("qp.h", "XTRDMA_QPC_URC_TPE_RPSN_MAX", "XTR_V1_QPC_URC_TPE_RPSN_MAX", 400),
+    FieldMapping("qp.h", "XTRDMA_QPC_RC_PSN_MAX_TPE", "XTR_V1_QPC_RC_PSN_MAX_TPE", 416),
+    FieldMapping("qp.h", "XTRDMA_QPC_URC_TPE_DPSN_MAX", "XTR_V1_QPC_URC_TPE_DPSN_MAX", 416),
+    FieldMapping("qp.h", "XTRDMA_QPC_URC_NXT_DSQ_FETCH_NUM", "XTR_V1_QPC_URC_NXT_DSQ_FETCH_NUM", 416),
+    FieldMapping("qp.h", "XTRDMA_QPC_RC_RETRY_FPSN", "XTR_V1_QPC_RC_RETRY_FPSN", 424),
+    FieldMapping("qp.h", "XTRDMA_QPC_RC_RETRY_PSN", "XTR_V1_QPC_RC_RETRY_PSN", 432),
     FieldMapping("qp.h", "XTRDMA_QPC_SQ_CQN", "XTR_V1_QPC_SQ_CQN", 448),
     FieldMapping("qp.h", "XTRDMA_QPC_RQ_CQN", "XTR_V1_QPC_RQ_CQN", 448),
     FieldMapping("qp.h", "XTRDMA_QPC_LOAD_RQ_PI_TH", "XTR_V1_QPC_LOAD_RQ_PI_TH", 480),
     FieldMapping("qp.h", "XTRDMA_QPC_RQ_OR_SRQ_PD_PBA_OR_PBA", "XTR_V1_QPC_RQ_PBA", 496),
     FieldMapping("qp.h", "XTRDMA_QPC_RQ_OR_SRQ_SIZE", "XTR_V1_QPC_RQ_SIZE", 496),
     FieldMapping("qp.h", "XTRDMA_QPC_RQ_OR_SRQ_OM", "XTR_V1_QPC_RQ_OM", 496),
-    # CQC context (cq.c stores qwords at bytes 0..48).
-    FieldMapping("cq.h", "XTRDMA_CMQ_CQC_CQ_SD_PBA", "XTR_V1_CQC_CQ_SD_PBA", 0),
-    FieldMapping("cq.h", "XTRDMA_CMQ_CQC_CQ_SIZE", "XTR_V1_CQC_CQ_SIZE", 0),
-    FieldMapping("cq.h", "XTRDMA_CMQ_CQC_URC_FLAG", "XTR_V1_CQC_URC_FLAG", 0),
-    FieldMapping("cq.h", "XTRDMA_CMQ_CQC_CQ_ST", "XTR_V1_CQC_CQ_ST", 0),
-    FieldMapping("cq.h", "XTRDMA_CMQ_CQC_CUR_PBA_VLD", "XTR_V1_CQC_CUR_PBA_VLD", 8),
-    FieldMapping("cq.h", "XTRDMA_CMQ_CQC_CUR_CQ_PD_PBA", "XTR_V1_CQC_CUR_CQ_PD_PBA", 8),
-    FieldMapping("cq.h", "XTRDMA_CMQ_CQC_LOAD_CQ_CI_TH", "XTR_V1_CQC_LOAD_CQ_CI_TH", 16),
-    FieldMapping("cq.h", "XTRDMA_CMQ_CQC_CQ_OM", "XTR_V1_CQC_CQ_OM", 16),
-    FieldMapping("cq.h", "XTRDMA_CMQ_CQC_NXT_PBA_VLD", "XTR_V1_CQC_NXT_PBA_VLD", 16),
-    FieldMapping("cq.h", "XTRDMA_CMQ_CQC_NXT_CQ_PD_PBA_L", "XTR_V1_CQC_NXT_CQ_PD_PBA_L", 16),
-    FieldMapping("cq.h", "XTRDMA_CMQ_CQC_CQ_PI", "XTR_V1_CQC_CQ_PI", 24),
-    FieldMapping("cq.h", "XTRDMA_CMQ_CQC_CQ_PI_WRAP", "XTR_V1_CQC_CQ_PI_WRAP", 24),
-    FieldMapping("cq.h", "XTRDMA_CMQ_CQC_LAST_ARM_SN", "XTR_V1_CQC_LAST_ARM_SN", 24),
-    FieldMapping("cq.h", "XTRDMA_CMQ_CQC_CQE_SIZE", "XTR_V1_CQC_CQE_SIZE", 24),
-    FieldMapping("cq.h", "XTRDMA_CMQ_CQC_CEQN", "XTR_V1_CQC_CEQN", 32),
-    FieldMapping("cq.h", "XTRDMA_CMQ_CQC_SHADOW_PA", "XTR_V1_CQC_SHADOW_PA", 40),
-    FieldMapping("cq.h", "XTRDMA_CMQ_CQC_CQ_CI", "XTR_V1_CQC_CQ_CI", 48),
-    FieldMapping("cq.h", "XTRDMA_CMQ_CQC_CQ_CI_WRAP", "XTR_V1_CQC_CQ_CI_WRAP", 48),
-    FieldMapping("cq.h", "XTRDMA_CMQ_CQC_ARM_SN", "XTR_V1_CQC_ARM_SN", 48),
-    FieldMapping("cq.h", "XTRDMA_CMQ_CQC_ARM_ST", "XTR_V1_CQC_ARM_ST", 48),
+    # CQC local bytes 0..55 are copied to final body bytes 8..63.
+    FieldMapping("cq.h", "XTRDMA_CMQ_CQC_CQ_SD_PBA", "XTR_V1_CQC_BODY_CQ_SD_PBA", 8),
+    FieldMapping("cq.h", "XTRDMA_CMQ_CQC_CQ_SIZE", "XTR_V1_CQC_BODY_CQ_SIZE", 8),
+    FieldMapping("cq.h", "XTRDMA_CMQ_CQC_URC_FLAG", "XTR_V1_CQC_BODY_URC_FLAG", 8),
+    FieldMapping("cq.h", "XTRDMA_CMQ_CQC_CQ_ST", "XTR_V1_CQC_BODY_CQ_ST", 8),
+    FieldMapping("cq.h", "XTRDMA_CMQ_CQC_NXT_CQ_PD_PBA_H", "XTR_V1_CQC_BODY_NXT_CQ_PD_PBA_H", 16),
+    FieldMapping("cq.h", "XTRDMA_CMQ_CQC_CUR_PBA_VLD", "XTR_V1_CQC_BODY_CUR_PBA_VLD", 16),
+    FieldMapping("cq.h", "XTRDMA_CMQ_CQC_CUR_CQ_PD_PBA", "XTR_V1_CQC_BODY_CUR_CQ_PD_PBA", 16),
+    FieldMapping("cq.h", "XTRDMA_CMQ_CQC_LOAD_CQ_CI_DONE", "XTR_V1_CQC_BODY_LOAD_CQ_CI_DONE", 24),
+    FieldMapping("cq.h", "XTRDMA_CMQ_CQC_LOAD_CQ_CI_TH", "XTR_V1_CQC_BODY_LOAD_CQ_CI_TH", 24),
+    FieldMapping("cq.h", "XTRDMA_CMQ_CQC_CQ_OM", "XTR_V1_CQC_BODY_CQ_OM", 24),
+    FieldMapping("cq.h", "XTRDMA_CMQ_CQC_NXT_PBA_VLD", "XTR_V1_CQC_BODY_NXT_PBA_VLD", 24),
+    FieldMapping("cq.h", "XTRDMA_CMQ_CQC_NXT_CQ_PD_PBA_L", "XTR_V1_CQC_BODY_NXT_CQ_PD_PBA_L", 24),
+    FieldMapping("cq.h", "XTRDMA_CMQ_CQC_CQ_PI", "XTR_V1_CQC_BODY_CQ_PI", 32),
+    FieldMapping("cq.h", "XTRDMA_CMQ_CQC_CQ_PI_WRAP", "XTR_V1_CQC_BODY_CQ_PI_WRAP", 32),
+    FieldMapping("cq.h", "XTRDMA_CMQ_CQC_LAST_ARM_SN", "XTR_V1_CQC_BODY_LAST_ARM_SN", 32),
+    FieldMapping("cq.h", "XTRDMA_CMQ_CQC_CQE_SIZE", "XTR_V1_CQC_BODY_CQE_SIZE", 32),
+    FieldMapping("cq.h", "XTRDMA_CMQ_CQC_CEQN", "XTR_V1_CQC_BODY_CEQN", 40),
+    FieldMapping("cq.h", "XTRDMA_CMQ_CQC_SHADOW_PA", "XTR_V1_CQC_BODY_SHADOW_PA", 48),
+    FieldMapping("cq.h", "XTRDMA_CMQ_CQC_CQ_CI", "XTR_V1_CQC_BODY_CQ_CI", 56),
+    FieldMapping("cq.h", "XTRDMA_CMQ_CQC_CQ_CI_WRAP", "XTR_V1_CQC_BODY_CQ_CI_WRAP", 56),
+    FieldMapping("cq.h", "XTRDMA_CMQ_CQC_ARM_SN", "XTR_V1_CQC_BODY_ARM_SN", 56),
+    FieldMapping("cq.h", "XTRDMA_CMQ_CQC_ARM_ST", "XTR_V1_CQC_BODY_ARM_ST", 56),
     # CMQ request/completion words.
     FieldMapping("cmq.h", "XTRDMA_CMQSQ_WQE_VALID", "XTR_V1_CMQ_VALID", 0),
     FieldMapping("cmq.h", "XTRDMA_CMQSQ_VFID_OVERRIDE", "XTR_V1_CMQ_VFID_OVERRIDE", 0),
@@ -165,8 +293,57 @@ FIELD_MAPPINGS = (
     FieldMapping("cmq.h", "XTRDMA_CMQSQ_WQE_SIGNATURE", "XTR_V1_CMQ_SIGNATURE", 8),
     FieldMapping("cmq.h", "XTRDMA_CMQSQ_WQE_RQ_CQN", "XTR_V1_CMQ_RQ_CQN", 8),
     FieldMapping("cmq.h", "XTRDMA_CMQSQ_WQE_QPC_BUFFER_ADDR", "XTR_V1_CMQ_QPC_BUFFER_ADDR", 24),
-    FieldMapping("cmq.h", "XTRDMA_CMQSQ_WQE_CQC_WQE_CQN", "XTR_V1_CMQ_CQC_CQN", 0),
-    FieldMapping("cmq.h", "XTRDMA_CMQCQ_WQE_SRFQN", "XTR_V1_CMQ_SRFQN", 0),
+    FieldMapping("cmq.h", "XTRDMA_CMQSQ_WQE_CQC_WQE_CQN", "XTR_V1_CQC_BODY_CQN", 0),
+    FieldMapping("cmq.h", "XTRDMA_CMQCQ_WQE_SRFQN", "XTR_V1_SRQC_BODY_SRFQN", 0),
+    FieldMapping("cmq.h", "XTRDMA_CMQCQ_WQE_EQN", "XTR_V1_EQC_BODY_EQN", 0),
+    FieldMapping("cmq.h", "XTRDMA_CMQCQ_WQE_RETURN_OCC_IDX", "XTR_V1_CMQ_COMPLETION_RETURN_OCC_IDX", 0),
+    FieldMapping("cmq.h", "XTRDMA_CMQCQ_WQE_IFA_INFO", "XTR_V1_CMQ_COMPLETION_IFA_INFO", 8),
+    # MRT register/key-allocate sparse body is already in final WQE coordinates.
+    FieldMapping("cmq.h", "XTRDMA_CQPSQ_STAG_IDX", "XTR_V1_MRT_BODY_STAG_IDX", 0),
+    FieldMapping("cmq.h", "XTRDMA_CQPSQ_NXT_ST", "XTR_V1_MRT_BODY_NXT_ST", 0),
+    FieldMapping("cmq.h", "XTRDMA_CQPSQ_STAG_KEY", "XTR_V1_MRT_BODY_STAG_KEY", 8),
+    FieldMapping("cmq.h", "XTRDMA_CQPSQ_MRT_INFO0_PARENT_MR_STAG_IDX", "XTR_V1_MRT_BODY_PARENT_STAG_IDX", 16),
+    FieldMapping("cmq.h", "XTRDMA_CQPSQ_MRT_INFO0_PD_IDX", "XTR_V1_MRT_BODY_PD_IDX", 16),
+    FieldMapping("cmq.h", "XTRDMA_CQPSQ_MRT_INFO0_PLD_VF_ID", "XTR_V1_MRT_BODY_PLD_VF_ID", 16),
+    FieldMapping("cmq.h", "XTRDMA_CQPSQ_MRT_INFO0_PLD_VF_EN", "XTR_V1_MRT_BODY_PLD_VF_EN", 16),
+    FieldMapping("cmq.h", "XTRDMA_CQPSQ_MRT_INFO0_RIGHT", "XTR_V1_MRT_BODY_RIGHT", 16),
+    FieldMapping("cmq.h", "XTRDMA_CQPSQ_MRT_INFO0_TYPE", "XTR_V1_MRT_BODY_TYPE", 16),
+    FieldMapping("cmq.h", "XTRDMA_CQPSQ_MRT_INFO0_HOST_PG_SIZE", "XTR_V1_MRT_BODY_HOST_PG_SIZE", 16),
+    FieldMapping("cmq.h", "XTRDMA_CQPSQ_MRT_INFO0_PBL_MODE", "XTR_V1_MRT_BODY_PBL_MODE", 16),
+    FieldMapping("cmq.h", "XTRDMA_CQPSQ_MRT_INFO0_ADDR_MODE", "XTR_V1_MRT_BODY_ADDR_MODE", 16),
+    FieldMapping("cmq.h", "XTRDMA_CQPSQ_MRT_INFO0_INVALIDATE_EN", "XTR_V1_MRT_BODY_INVALIDATE_EN", 16),
+    FieldMapping("cmq.h", "XTRDMA_CQPSQ_MRT_INFO0_ST", "XTR_V1_MRT_BODY_ST", 16),
+    FieldMapping("cmq.h", "XTRDMA_CQPSQ_MRT_INFO0_LEN", "XTR_V1_MRT_BODY_LEN", 24),
+    FieldMapping("cmq.h", "XTRDMA_CQPSQ_MRT_INFO0_ODP", "XTR_V1_MRT_BODY_ODP", 24),
+    FieldMapping("cmq.h", "XTRDMA_CQPSQ_MRT_INFO0_STAG_KEY", "XTR_V1_MRT_BODY_INFO_STAG_KEY", 24),
+    FieldMapping("cmq.h", "XTRDMA_CQPSQ_MRT_INFO0_START_VA", "XTR_V1_MRT_BODY_START_VA", 32),
+    FieldMapping("cmq.h", "XTRDMA_CQPSQ_MRT_INFO0_FIRST_PBL_IDX", "XTR_V1_MRT_BODY_FIRST_PBL_IDX", 40),
+    FieldMapping("cmq.h", "XTRDMA_CQPSQ_MRT_INFO0_Payload_PBA_0", "XTR_V1_MRT_BODY_PAYLOAD_PBA0", 40),
+    FieldMapping("cmq.h", "XTRDMA_CQPSQ_MRT_INFO1_MR_SN", "XTR_V1_MRT_BODY_MR_SN", 48),
+    FieldMapping("cmq.h", "XTRDMA_CQPSQ_MRT_INFO1_Payload_PBA_1", "XTR_V1_MRT_BODY_PAYLOAD_PBA1", 48),
+    # SRQC and EQC local bytes 0..31 are copied to final body bytes 16..47.
+    FieldMapping("srq.h", "XTRDMA_SRFQ_CTX_SRFQ_ST", "XTR_V1_SRQC_BODY_SRFQ_ST", 16),
+    FieldMapping("srq.h", "XTRDMA_SRFQ_CTX_LOAD_SRFQ_PI_TH", "XTR_V1_SRQC_BODY_LOAD_SRFQ_PI_TH", 16),
+    FieldMapping("srq.h", "XTRDMA_SRFQ_CTX_SRFQC_SHADOW_PA", "XTR_V1_SRQC_BODY_SHADOW_PA", 16),
+    FieldMapping("srq.h", "XTRDMA_SRFQ_CTX_PD_IDX", "XTR_V1_SRQC_BODY_PD_IDX", 24),
+    FieldMapping("srq.h", "XTRDMA_SRFQ_CTX_SRFQ_PD_PBA_OR_PBA", "XTR_V1_SRQC_BODY_SRFQ_PBA", 32),
+    FieldMapping("srq.h", "XTRDMA_SRFQ_CTX_SRFQ_SIZE", "XTR_V1_SRQC_BODY_SRFQ_SIZE", 32),
+    FieldMapping("srq.h", "XTRDMA_SRFQ_CTX_SRFQ_OM", "XTR_V1_SRQC_BODY_SRFQ_OM", 32),
+    FieldMapping("srq.h", "XTRDMA_SRFQ_CTX_SRFQ_PI_WRAP", "XTR_V1_SRQC_BODY_SRFQ_PI_WRAP", 40, 16),
+    FieldMapping("srq.h", "XTRDMA_SRFQ_CTX_SRFQ_PI", "XTR_V1_SRQC_BODY_SRFQ_PI", 40, 16),
+    FieldMapping("srq.h", "XTRDMA_SRFQ_CTX_SRQ_LIMIT_TH", "XTR_V1_SRQC_BODY_LIMIT_TH", 40),
+    FieldMapping("srq.h", "XTRDMA_SRFQ_CTX_ARM_SN", "XTR_V1_SRQC_BODY_ARM_SN", 40),
+    FieldMapping("event.h", "XTRDMA_EQ_CTX_EQ_ST", "XTR_V1_EQC_BODY_EQ_ST", 16),
+    FieldMapping("event.h", "XTRDMA_EQ_CTX_EQ_SIZE", "XTR_V1_EQC_BODY_EQ_SIZE", 16),
+    FieldMapping("event.h", "XTRDMA_EQ_CTX_NXT_EQ_PBA", "XTR_V1_EQC_BODY_NXT_EQ_PBA", 16),
+    FieldMapping("event.h", "XTRDMA_EQ_CTX_CUR_EQ_PBA", "XTR_V1_EQC_BODY_CUR_EQ_PBA", 24),
+    FieldMapping("event.h", "XTRDMA_EQ_CTX_CUR_PBA_VLD", "XTR_V1_EQC_BODY_CUR_PBA_VLD", 24),
+    FieldMapping("event.h", "XTRDMA_EQ_CTX_EQ_PI_WRAP", "XTR_V1_EQC_BODY_EQ_PI_WRAP", 32),
+    FieldMapping("event.h", "XTRDMA_EQ_CTX_EQ_PI", "XTR_V1_EQC_BODY_EQ_PI", 32),
+    FieldMapping("event.h", "XTRDMA_EQ_CTX_EQ_OM", "XTR_V1_EQC_BODY_EQ_OM", 32),
+    FieldMapping("event.h", "XTRDMA_EQ_CTX_MSI_X_IDX", "XTR_V1_EQC_BODY_MSI_X_IDX", 40),
+    FieldMapping("event.h", "XTRDMA_EQ_CTX_EQ_CI_WRAP", "XTR_V1_EQC_BODY_EQ_CI_WRAP", 40),
+    FieldMapping("event.h", "XTRDMA_EQ_CTX_EQ_CI", "XTR_V1_EQC_BODY_EQ_CI", 40),
     # SQE/RQE/CQE fields.
     FieldMapping("wr.h", "XTRDMA_SQ_WQE_QPN", "XTR_V1_SQ_WQE_QPN", 0),
     FieldMapping("wr.h", "XTRDMA_SQ_WQE_ICOS", "XTR_V1_SQ_WQE_ICOS", 0),
@@ -244,6 +421,56 @@ FIELD_MAPPINGS = (
 )
 
 
+# Local context qword placements independently transcribed from the driver
+# copy sites. CQC is copied at final byte +8; SRQC/EQC at final byte +16.
+BODY_TRANSLATIONS = (
+    BodyTranslation("cq.h", "XTRDMA_CMQ_CQC_CQ_SD_PBA", "XTR_V1_CQC_BODY_CQ_SD_PBA", 0, 8),
+    BodyTranslation("cq.h", "XTRDMA_CMQ_CQC_CQ_SIZE", "XTR_V1_CQC_BODY_CQ_SIZE", 0, 8),
+    BodyTranslation("cq.h", "XTRDMA_CMQ_CQC_URC_FLAG", "XTR_V1_CQC_BODY_URC_FLAG", 0, 8),
+    BodyTranslation("cq.h", "XTRDMA_CMQ_CQC_CQ_ST", "XTR_V1_CQC_BODY_CQ_ST", 0, 8),
+    BodyTranslation("cq.h", "XTRDMA_CMQ_CQC_NXT_CQ_PD_PBA_H", "XTR_V1_CQC_BODY_NXT_CQ_PD_PBA_H", 8, 8),
+    BodyTranslation("cq.h", "XTRDMA_CMQ_CQC_CUR_PBA_VLD", "XTR_V1_CQC_BODY_CUR_PBA_VLD", 8, 8),
+    BodyTranslation("cq.h", "XTRDMA_CMQ_CQC_CUR_CQ_PD_PBA", "XTR_V1_CQC_BODY_CUR_CQ_PD_PBA", 8, 8),
+    BodyTranslation("cq.h", "XTRDMA_CMQ_CQC_LOAD_CQ_CI_DONE", "XTR_V1_CQC_BODY_LOAD_CQ_CI_DONE", 16, 8),
+    BodyTranslation("cq.h", "XTRDMA_CMQ_CQC_LOAD_CQ_CI_TH", "XTR_V1_CQC_BODY_LOAD_CQ_CI_TH", 16, 8),
+    BodyTranslation("cq.h", "XTRDMA_CMQ_CQC_CQ_OM", "XTR_V1_CQC_BODY_CQ_OM", 16, 8),
+    BodyTranslation("cq.h", "XTRDMA_CMQ_CQC_NXT_PBA_VLD", "XTR_V1_CQC_BODY_NXT_PBA_VLD", 16, 8),
+    BodyTranslation("cq.h", "XTRDMA_CMQ_CQC_NXT_CQ_PD_PBA_L", "XTR_V1_CQC_BODY_NXT_CQ_PD_PBA_L", 16, 8),
+    BodyTranslation("cq.h", "XTRDMA_CMQ_CQC_CQ_PI", "XTR_V1_CQC_BODY_CQ_PI", 24, 8),
+    BodyTranslation("cq.h", "XTRDMA_CMQ_CQC_CQ_PI_WRAP", "XTR_V1_CQC_BODY_CQ_PI_WRAP", 24, 8),
+    BodyTranslation("cq.h", "XTRDMA_CMQ_CQC_LAST_ARM_SN", "XTR_V1_CQC_BODY_LAST_ARM_SN", 24, 8),
+    BodyTranslation("cq.h", "XTRDMA_CMQ_CQC_CQE_SIZE", "XTR_V1_CQC_BODY_CQE_SIZE", 24, 8),
+    BodyTranslation("cq.h", "XTRDMA_CMQ_CQC_CEQN", "XTR_V1_CQC_BODY_CEQN", 32, 8),
+    BodyTranslation("cq.h", "XTRDMA_CMQ_CQC_SHADOW_PA", "XTR_V1_CQC_BODY_SHADOW_PA", 40, 8),
+    BodyTranslation("cq.h", "XTRDMA_CMQ_CQC_CQ_CI", "XTR_V1_CQC_BODY_CQ_CI", 48, 8),
+    BodyTranslation("cq.h", "XTRDMA_CMQ_CQC_CQ_CI_WRAP", "XTR_V1_CQC_BODY_CQ_CI_WRAP", 48, 8),
+    BodyTranslation("cq.h", "XTRDMA_CMQ_CQC_ARM_SN", "XTR_V1_CQC_BODY_ARM_SN", 48, 8),
+    BodyTranslation("cq.h", "XTRDMA_CMQ_CQC_ARM_ST", "XTR_V1_CQC_BODY_ARM_ST", 48, 8),
+    BodyTranslation("srq.h", "XTRDMA_SRFQ_CTX_SRFQ_ST", "XTR_V1_SRQC_BODY_SRFQ_ST", 0, 16),
+    BodyTranslation("srq.h", "XTRDMA_SRFQ_CTX_LOAD_SRFQ_PI_TH", "XTR_V1_SRQC_BODY_LOAD_SRFQ_PI_TH", 0, 16),
+    BodyTranslation("srq.h", "XTRDMA_SRFQ_CTX_SRFQC_SHADOW_PA", "XTR_V1_SRQC_BODY_SHADOW_PA", 0, 16),
+    BodyTranslation("srq.h", "XTRDMA_SRFQ_CTX_PD_IDX", "XTR_V1_SRQC_BODY_PD_IDX", 8, 16),
+    BodyTranslation("srq.h", "XTRDMA_SRFQ_CTX_SRFQ_PD_PBA_OR_PBA", "XTR_V1_SRQC_BODY_SRFQ_PBA", 16, 16),
+    BodyTranslation("srq.h", "XTRDMA_SRFQ_CTX_SRFQ_SIZE", "XTR_V1_SRQC_BODY_SRFQ_SIZE", 16, 16),
+    BodyTranslation("srq.h", "XTRDMA_SRFQ_CTX_SRFQ_OM", "XTR_V1_SRQC_BODY_SRFQ_OM", 16, 16),
+    BodyTranslation("srq.h", "XTRDMA_SRFQ_CTX_SRFQ_PI_WRAP", "XTR_V1_SRQC_BODY_SRFQ_PI_WRAP", 24, 16),
+    BodyTranslation("srq.h", "XTRDMA_SRFQ_CTX_SRFQ_PI", "XTR_V1_SRQC_BODY_SRFQ_PI", 24, 16),
+    BodyTranslation("srq.h", "XTRDMA_SRFQ_CTX_SRQ_LIMIT_TH", "XTR_V1_SRQC_BODY_LIMIT_TH", 24, 16),
+    BodyTranslation("srq.h", "XTRDMA_SRFQ_CTX_ARM_SN", "XTR_V1_SRQC_BODY_ARM_SN", 24, 16),
+    BodyTranslation("event.h", "XTRDMA_EQ_CTX_EQ_ST", "XTR_V1_EQC_BODY_EQ_ST", 0, 16),
+    BodyTranslation("event.h", "XTRDMA_EQ_CTX_EQ_SIZE", "XTR_V1_EQC_BODY_EQ_SIZE", 0, 16),
+    BodyTranslation("event.h", "XTRDMA_EQ_CTX_NXT_EQ_PBA", "XTR_V1_EQC_BODY_NXT_EQ_PBA", 0, 16),
+    BodyTranslation("event.h", "XTRDMA_EQ_CTX_CUR_EQ_PBA", "XTR_V1_EQC_BODY_CUR_EQ_PBA", 8, 16),
+    BodyTranslation("event.h", "XTRDMA_EQ_CTX_CUR_PBA_VLD", "XTR_V1_EQC_BODY_CUR_PBA_VLD", 8, 16),
+    BodyTranslation("event.h", "XTRDMA_EQ_CTX_EQ_PI_WRAP", "XTR_V1_EQC_BODY_EQ_PI_WRAP", 16, 16),
+    BodyTranslation("event.h", "XTRDMA_EQ_CTX_EQ_PI", "XTR_V1_EQC_BODY_EQ_PI", 16, 16),
+    BodyTranslation("event.h", "XTRDMA_EQ_CTX_EQ_OM", "XTR_V1_EQC_BODY_EQ_OM", 16, 16),
+    BodyTranslation("event.h", "XTRDMA_EQ_CTX_MSI_X_IDX", "XTR_V1_EQC_BODY_MSI_X_IDX", 24, 16),
+    BodyTranslation("event.h", "XTRDMA_EQ_CTX_EQ_CI_WRAP", "XTR_V1_EQC_BODY_EQ_CI_WRAP", 24, 16),
+    BodyTranslation("event.h", "XTRDMA_EQ_CTX_EQ_CI", "XTR_V1_EQC_BODY_EQ_CI", 24, 16),
+)
+
+
 VALUE_MAPPINGS = (
     ValueMapping("qp.h", "XTRDMA_QP_CONTEXT_SIZE", "XTR_V1_QPC_BYTES"),
     ValueMapping("cq.h", "XTRDMA_CQ_CONTEXT_SIZE", "XTR_V1_CQC_BYTES"),
@@ -269,20 +496,65 @@ VALUE_MAPPINGS = (
     ValueMapping("cmq.h", "XTRDMA_OP_QPC_MODIFY", "XTR_V1_OP_QPC_MODIFY"),
     ValueMapping("cmq.h", "XTRDMA_OP_QPC_DELETE", "XTR_V1_OP_QPC_DELETE"),
     ValueMapping("cmq.h", "XTRDMA_OP_QPC_QUERY", "XTR_V1_OP_QPC_QUERY"),
+    ValueMapping("cmq.h", "XTRDMA_OP_KEY_ALLOC", "XTR_V1_OP_KEY_ALLOC"),
     ValueMapping("cmq.h", "XTRDMA_OP_MR_REGISTER", "XTR_V1_OP_MR_REGISTER"),
     ValueMapping("cmq.h", "XTRDMA_OP_MR_DEREGISTER", "XTR_V1_OP_MR_DEREGISTER"),
+    ValueMapping("cmq.h", "XTRDMA_OP_OCC_FLUSH", "XTR_V1_OP_OCC_FLUSH"),
     ValueMapping("cmq.h", "XTRDMA_OP_CQC_RESIZE", "XTR_V1_OP_CQC_RESIZE"),
     ValueMapping("cmq.h", "XTRDMA_OP_CQC_CREATE", "XTR_V1_OP_CQC_CREATE"),
     ValueMapping("cmq.h", "XTRDMA_OP_CQC_MODIFY", "XTR_V1_OP_CQC_MODIFY"),
     ValueMapping("cmq.h", "XTRDMA_OP_CQC_DELETE", "XTR_V1_OP_CQC_DELETE"),
     ValueMapping("cmq.h", "XTRDMA_OP_CQC_QUERY", "XTR_V1_OP_CQC_QUERY"),
     ValueMapping("cmq.h", "XTRDMA_OP_CEQC_CREATE", "XTR_V1_OP_CEQC_CREATE"),
+    ValueMapping("cmq.h", "XTRDMA_OP_CEQC_DELETE", "XTR_V1_OP_CEQC_DELETE"),
+    ValueMapping("cmq.h", "XTRDMA_OP_CEQC_QUERY", "XTR_V1_OP_CEQC_QUERY"),
     ValueMapping("cmq.h", "XTRDMA_OP_AEQC_CREATE", "XTR_V1_OP_AEQC_CREATE"),
+    ValueMapping("cmq.h", "XTRDMA_OP_AEQC_DELETE", "XTR_V1_OP_AEQC_DELETE"),
+    ValueMapping("cmq.h", "XTRDMA_OP_AEQC_QUERY", "XTR_V1_OP_AEQC_QUERY"),
     ValueMapping("cmq.h", "XTRDMA_OP_QP_FLUSH", "XTR_V1_OP_QP_FLUSH"),
+    ValueMapping("cmq.h", "XTRDMA_OP_TQ_FLUSH", "XTR_V1_OP_TQ_FLUSH"),
     ValueMapping("cmq.h", "XTRDMA_OP_SRFQC_CREATE", "XTR_V1_OP_SRFQC_CREATE"),
     ValueMapping("cmq.h", "XTRDMA_OP_SRFQC_DELETE", "XTR_V1_OP_SRFQC_DELETE"),
     ValueMapping("cmq.h", "XTRDMA_OP_SRFQC_QUERY", "XTR_V1_OP_SRFQC_QUERY"),
     ValueMapping("cmq.h", "XTRDMA_OP_NOP", "XTR_V1_OP_NOP"),
+    # Context object/state/mode codes consumed by Task 10 codecs.
+    ValueMapping("alloc.h", "XTRDMA_ALLOC_TYPE_DIRECT", "XTR_V1_ALLOC_TYPE_DIRECT"),
+    ValueMapping("alloc.h", "XTRDMA_ALLOC_TYPE_INDIRECT", "XTR_V1_ALLOC_TYPE_INDIRECT"),
+    ValueMapping("alloc.h", "XTRDMA_ALLOC_TYPE_HUGE", "XTR_V1_ALLOC_TYPE_HUGE"),
+    ValueMapping("alloc.h", "XTRDMA_ALLOC_TYPE_L3_INDIRECT", "XTR_V1_ALLOC_TYPE_L3_INDIRECT"),
+    ValueMapping("mr.h", "XTRDMA_ADDR_TYPE_VA_BASED", "XTR_V1_ADDR_TYPE_VA_BASED"),
+    ValueMapping("mr.h", "XTRDMA_ADDR_TYPE_ZERO_BASED", "XTR_V1_ADDR_TYPE_ZERO_BASED"),
+    ValueMapping("mr.h", "XTRDMA_MR_ST_INVLD", "XTR_V1_MR_ST_INVALID"),
+    ValueMapping("mr.h", "XTRDMA_MR_ST_FREE", "XTR_V1_MR_ST_FREE"),
+    ValueMapping("mr.h", "XTRDMA_MR_ST_VLD", "XTR_V1_MR_ST_VALID"),
+    ValueMapping("mr.h", "XTRDMA_HOST_PAGE_4K", "XTR_V1_HOST_PAGE_4K"),
+    ValueMapping("mr.h", "XTRDMA_HOST_PAGE_2M", "XTR_V1_HOST_PAGE_2M"),
+    ValueMapping("mr.h", "XTRDMA_HOST_PAGE_1G", "XTR_V1_HOST_PAGE_1G"),
+    ValueMapping("mr.h", "PBL_MODE_0", "XTR_V1_PBL_MODE_0"),
+    ValueMapping("mr.h", "PBL_MODE_1", "XTR_V1_PBL_MODE_1"),
+    ValueMapping("mr.h", "PBL_MODE_2", "XTR_V1_PBL_MODE_2"),
+    ValueMapping("mr.h", "XTRDMA_MR", "XTR_V1_MEM_TYPE_MR"),
+    ValueMapping("mr.h", "XTRDMA_MW_TYPE1", "XTR_V1_MEM_TYPE_MW_TYPE1"),
+    ValueMapping("mr.h", "XTRDMA_MW_TYPE2B", "XTR_V1_MEM_TYPE_MW_TYPE2B"),
+    ValueMapping("mr.h", "XTRDMA_MW_INVLD_DISABLE", "XTR_V1_INVALIDATE_DISABLE"),
+    ValueMapping("mr.h", "XTRDMA_MW_INVLD_EN", "XTR_V1_INVALIDATE_ENABLE"),
+    ValueMapping("cq.h", "XTRDMA_CQC_ARM_ST_NO_EVENT", "XTR_V1_CQC_ARM_ST_NO_EVENT"),
+    ValueMapping("cq.h", "XTRDMA_CQC_ARM_ST_NEXT_SE_ONLY_EVENT", "XTR_V1_CQC_ARM_ST_NEXT_SE"),
+    ValueMapping("cq.h", "XTRDMA_CQC_ARM_ST_NEXT_COMP_EVENT", "XTR_V1_CQC_ARM_ST_NEXT_COMP"),
+    ValueMapping("cq.h", "XTRDMA_CQC_CQ_ST_INVLD", "XTR_V1_CQC_ST_INVALID"),
+    ValueMapping("cq.h", "XTRDMA_CQC_CQ_ST_VLD", "XTR_V1_CQC_ST_VALID"),
+    ValueMapping("cq.h", "XTRDMA_CQC_CQ_ST_ERR", "XTR_V1_CQC_ST_ERROR"),
+    ValueMapping("srq.h", "XTRDMA_SRQ_STATE_INVLD", "XTR_V1_SRQC_ST_INVALID"),
+    ValueMapping("srq.h", "XTRDMA_SRQ_STATE_VALID", "XTR_V1_SRQC_ST_VALID"),
+    ValueMapping("srq.h", "XTRDMA_SRQ_STATE_ERROR", "XTR_V1_SRQC_ST_ERROR"),
+    ValueMapping("event.h", "XTRDMA_EVENT_STATE_INVLD", "XTR_V1_EQC_ST_INVALID"),
+    ValueMapping("event.h", "XTRDMA_EVENT_STATE_VALID", "XTR_V1_EQC_ST_VALID"),
+    ValueMapping("event.h", "XTRDMA_EVENT_STATE_ERROR", "XTR_V1_EQC_ST_ERROR"),
+    ValueMapping("defs.h", "XTRDMA_ACCESS_FLAGS_LOCAL_WRITE", "XTR_V1_RIGHT_LOCAL_WRITE"),
+    ValueMapping("defs.h", "XTRDMA_ACCESS_FLAGS_REMOTE_READ", "XTR_V1_RIGHT_REMOTE_READ"),
+    ValueMapping("defs.h", "XTRDMA_ACCESS_FLAGS_REMOTE_WRITE", "XTR_V1_RIGHT_REMOTE_WRITE"),
+    ValueMapping("defs.h", "XTRDMA_ACCESS_FLAGS_BIND_WINDOW", "XTR_V1_RIGHT_BIND_WINDOW"),
+    ValueMapping("defs.h", "XTRDMA_ACCESS_FLAGS_REMOTE_ATOMIC", "XTR_V1_RIGHT_REMOTE_ATOMIC"),
     ValueMapping("defs.h", "EC_TPE_DB_TYPE_INVLD", "XTR_V1_EC_TPE_DB_TYPE_INVLD"),
     ValueMapping("defs.h", "EC_TPE_SQ_KEY_ERR", "XTR_V1_EC_TPE_SQ_KEY_ERR"),
     ValueMapping("defs.h", "EC_TPE_SQ_WQE_OPCODE_INVLD", "XTR_V1_EC_TPE_SQ_WQE_OPCODE_INVLD"),
@@ -296,7 +568,19 @@ VALUE_MAPPINGS = (
     ValueMapping("defs.h", "EC_GLB_MBUS_ERR", "XTR_V1_EC_GLB_MBUS"),
 )
 
+# Normalized input-right sets and their hardware result bits, independently
+# checked against the pinned xtrdma_get_access implementation.
+ACCESS_PROJECTIONS = (
+    ("IB_ACCESS_LOCAL_WRITE|IB_ACCESS_REMOTE_WRITE|IB_ACCESS_REMOTE_ATOMIC",
+     "XTRDMA_ACCESS_FLAGS_LOCAL_WRITE"),
+    ("IB_ACCESS_REMOTE_WRITE", "XTRDMA_ACCESS_FLAGS_REMOTE_WRITE"),
+    ("IB_ACCESS_REMOTE_READ", "XTRDMA_ACCESS_FLAGS_REMOTE_READ"),
+    ("IB_ACCESS_MW_BIND", "XTRDMA_ACCESS_FLAGS_BIND_WINDOW"),
+    ("IB_ACCESS_REMOTE_ATOMIC", "XTRDMA_ACCESS_FLAGS_REMOTE_ATOMIC"),
+)
+
 PROFILE_VALUES = {
+    "XTR_V1_HW_VERSION": 1,
     "XTR_V1_RQE_BYTES": 64,
     "XTR_V1_CQE_BYTES": 64,
     "XTR_V1_DB_BYTES": 8,
@@ -307,7 +591,10 @@ def parse_field_expression(expression: str) -> tuple[int, int]:
     expr = expression.strip()
     bit_match = re.fullmatch(r"BIT(?:_ULL)?\(\s*(\d+)\s*\)", expr)
     if bit_match:
-        return int(bit_match.group(1)), 1
+        bit = int(bit_match.group(1))
+        if bit > 63:
+            raise ValidationError(f"invalid BIT position {bit}: {expression}")
+        return bit, 1
     mask_match = re.fullmatch(
         r"GENMASK(?:_ULL)?\(\s*(\d+)\s*,\s*(\d+)\s*\)", expr
     )
@@ -366,6 +653,140 @@ def parse_sv_constants(text: str) -> dict[str, int]:
     return constants
 
 
+def validate_mapping_uniqueness(
+    field_mappings: tuple[FieldMapping, ...],
+    value_mappings: tuple[ValueMapping, ...],
+    reference_fields: tuple[ReferenceField, ...],
+) -> None:
+    def unique(items, label: str) -> None:
+        seen = set()
+        for item in items:
+            if item in seen:
+                raise ValidationError(f"duplicate {label}: {item}")
+            seen.add(item)
+
+    unique((mapping.sv_stem for mapping in field_mappings), "field mapping SV stem")
+    unique(((mapping.path, mapping.c_symbol) for mapping in field_mappings),
+           "field mapping source")
+    unique((mapping.sv_name for mapping in value_mappings), "SV value mapping")
+    unique(((mapping.path, mapping.c_symbol) for mapping in value_mappings),
+           "value mapping source")
+    unique((reference.sv_stem for reference in reference_fields),
+           "reference SV stem")
+    unique(((reference.path, reference.c_symbol) for reference in reference_fields),
+           "reference source")
+
+
+def validate_body_translations(
+    translations: tuple[BodyTranslation, ...],
+    field_mappings: tuple[FieldMapping, ...],
+) -> None:
+    expected = {
+        mapping.sv_stem: mapping
+        for mapping in field_mappings
+        if ((mapping.path == "cq.h" and mapping.sv_stem.startswith("XTR_V1_CQC_BODY_"))
+            or (mapping.path == "srq.h" and mapping.sv_stem.startswith("XTR_V1_SRQC_BODY_"))
+            or (mapping.path == "event.h" and mapping.sv_stem.startswith("XTR_V1_EQC_BODY_")))
+    }
+    seen: set[str] = set()
+    for translation in translations:
+        if translation.sv_stem in seen:
+            raise ValidationError(f"duplicate body translation: {translation.sv_stem}")
+        seen.add(translation.sv_stem)
+        mapping = expected.get(translation.sv_stem)
+        if mapping is None:
+            raise ValidationError(f"unexpected body translation: {translation.sv_stem}")
+        if (mapping.path, mapping.c_symbol) != (
+            translation.path, translation.c_symbol
+        ):
+            raise ValidationError(
+                f"body translation source mismatch for {translation.sv_stem}"
+            )
+        final_offset = (
+            translation.local_word_byte_offset + translation.final_base_offset
+        )
+        if mapping.word_byte_offset != final_offset:
+            raise ValidationError(
+                f"body translation offset mismatch for {translation.sv_stem}"
+            )
+    if seen != set(expected):
+        missing = sorted(set(expected) - seen)
+        raise ValidationError(f"missing body translations: {missing}")
+
+
+def validate_sv_mask_api(text: str) -> None:
+    envelope_signature = re.compile(
+        r"function\s+automatic\s+bit\s*\[63:0\]\s+"
+        r"request_envelope_mask\s*\(\s*int\s+unsigned\s+qword_index\s*\)\s*;",
+        re.S,
+    )
+    body_signature = re.compile(
+        r"function\s+automatic\s+bit\s+body_mask\s*\(\s*"
+        r"rdma_image_kind_e\s+image_kind\s*,\s*bit\s*\[7:0\]\s+opcode\s*,\s*"
+        r"int\s+unsigned\s+pbl_mode\s*,\s*int\s+unsigned\s+qword_index\s*,\s*"
+        r"output\s+bit\s*\[63:0\]\s+mask\s*\)\s*;",
+        re.S,
+    )
+    if envelope_signature.search(text) is None:
+        raise ValidationError("request_envelope_mask qword API missing")
+    if body_signature.search(text) is None:
+        raise ValidationError("body_mask image-kind/qword API missing")
+    for image_kind in (
+        "RDMA_IMAGE_CQC", "RDMA_IMAGE_MRT", "RDMA_IMAGE_SRQC",
+        "RDMA_IMAGE_CEQC", "RDMA_IMAGE_AEQC",
+    ):
+        if image_kind not in text:
+            raise ValidationError(f"body_mask image-kind selector missing: {image_kind}")
+    if text.count("qword_index > 7") < 2:
+        raise ValidationError("mask qword bounds are not fail closed")
+
+
+def validate_access_projections(text: str) -> None:
+    function = re.search(
+        r"\bstatic\s+inline\s+u8\s+xtrdma_get_access\s*\([^)]*\)\s*\{"
+        r"(.*?)\breturn\s+hw_access\s*;\s*\}",
+        text,
+        re.S,
+    )
+    if function is None:
+        raise ValidationError("xtrdma_get_access implementation missing")
+    observed: dict[str, set[str]] = {}
+    for statement in re.finditer(
+        r"hw_access\s*\|=\s*(.*?)\?\s*"
+        r"(XTRDMA_ACCESS_FLAGS_[A-Z_]+)\s*:\s*0\s*;",
+        function.group(1),
+        re.S,
+    ):
+        inputs = set(re.findall(r"access\s*&\s*(IB_ACCESS_[A-Z_]+)", statement.group(1)))
+        observed[statement.group(2)] = inputs
+    expected = {
+        output: set(inputs.split("|"))
+        for inputs, output in ACCESS_PROJECTIONS
+    }
+    if observed != expected:
+        raise ValidationError("xtrdma_get_access projection mapping drift")
+
+
+def parse_sv_masks(text: str) -> dict[str, tuple[int, ...]]:
+    masks: dict[str, tuple[int, ...]] = {}
+    pattern = re.compile(
+        r"localparam\s+bit\s*\[63:0\]\s+"
+        r"(XTR_V1_[A-Z0-9_]+_MASK)\s*\[0:7\]\s*=\s*'\{(.*?)\};",
+        re.S,
+    )
+    for match in pattern.finditer(text):
+        name = match.group(1)
+        if name in masks:
+            raise ValidationError(f"duplicate SV mask: {name}")
+        values = tuple(
+            parse_sv_value(item.strip()) for item in match.group(2).split(",")
+        )
+        if len(values) != 8:
+            raise ValidationError(f"{name} must contain eight qword masks")
+        masks[name] = values
+    return masks
+
+
 def strip_c_comments(line: str) -> str:
     return re.sub(r"/\*.*?\*/", "", line).strip()
 
@@ -382,13 +803,30 @@ def parse_c_symbols(text: str) -> tuple[dict[str, list[str]], dict[str, list[str
 
     enums: dict[str, list[str]] = {}
     for block in re.finditer(r"\benum\s+([A-Za-z_]\w*)\s*\{(.*?)\};", text, re.S):
-        for item in block.group(2).split(","):
-            clean = strip_c_comments(item).strip()
+        body = re.sub(r"/\*.*?\*/", "", block.group(2), flags=re.S)
+        next_value: int | None = 0
+        for item in body.split(","):
+            clean = item.strip()
             if not clean:
                 continue
-            match = re.fullmatch(r"([A-Za-z_]\w*)\s*=\s*([^\n]+)", clean)
-            if match:
-                enums.setdefault(match.group(1), []).append(match.group(2).strip())
+            explicit = re.fullmatch(r"([A-Za-z_]\w*)\s*=\s*(.+)", clean, re.S)
+            if explicit:
+                name, expression = explicit.group(1), explicit.group(2).strip()
+                enums.setdefault(name, []).append(expression)
+                try:
+                    next_value = parse_value_expression(expression) + 1
+                except ValidationError:
+                    next_value = None
+                continue
+            implicit = re.fullmatch(r"([A-Za-z_]\w*)", clean)
+            if not implicit:
+                continue
+            if next_value is None:
+                expression = "<implicit-after-unsupported-expression>"
+            else:
+                expression = str(next_value)
+                next_value += 1
+            enums.setdefault(implicit.group(1), []).append(expression)
     return macros, enums
 
 
@@ -466,10 +904,6 @@ REFERENCE_FIELDS = (
     ReferenceField("qp.h", "XTRDMA_QPC_SQ_PD_PBA_OR_PBA", "XTR_V1_QPC_SQ_PBA", 216, 12, 52),
     ReferenceField("qp.h", "XTRDMA_QPC_SQ_SIZE", "XTR_V1_QPC_SQ_SIZE", 216, 8, 4),
     ReferenceField("qp.h", "XTRDMA_QPC_SQ_OM", "XTR_V1_QPC_SQ_OM", 216, 6, 2),
-    ReferenceField("cq.h", "XTRDMA_CMQ_CQC_CQ_SD_PBA", "XTR_V1_CQC_CQ_SD_PBA", 0, 0, 52),
-    ReferenceField("cq.h", "XTRDMA_CMQ_CQC_CQ_SIZE", "XTR_V1_CQC_CQ_SIZE", 0, 56, 5),
-    ReferenceField("cq.h", "XTRDMA_CMQ_CQC_URC_FLAG", "XTR_V1_CQC_URC_FLAG", 0, 61, 1),
-    ReferenceField("cq.h", "XTRDMA_CMQ_CQC_CQ_ST", "XTR_V1_CQC_CQ_ST", 0, 62, 2),
     ReferenceField("cmq.h", "XTRDMA_CMQCQ_OPCODE", "XTR_V1_CMQ_OPCODE", 0, 32, 8),
     ReferenceField("cmq.h", "XTRDMA_CMQSQ_WQE_QPN", "XTR_V1_CMQ_QPN", 0, 0, 24),
     ReferenceField("cmq.h", "XTRDMA_CMQSQ_WQE_INDEX", "XTR_V1_CMQ_WQE_INDEX", 0, 40, 5),
@@ -542,6 +976,145 @@ REFERENCE_FIELDS = (
     ReferenceField("cq.h", "XTRDMA_NOTIFY_CQ_DB_ARM_DB_FLAG", "XTR_V1_NOTIFY_CQ_ARM", 0, 61, 1),
     ReferenceField("cq.h", "XTRDMA_NOTIFY_CQ_DB_ARM_ST", "XTR_V1_NOTIFY_CQ_ARM_ST", 0, 58, 2),
     ReferenceField("cq.h", "XTRDMA_NOTIFY_CQ_DB_ARM_SN", "XTR_V1_NOTIFY_CQ_ARM_SN", 0, 56, 2),
+    # Extended QPC placements used by the three transport boundary cases.
+    ReferenceField("qp.h", "XTRDMA_QPC_UD_QKEY_L", "XTR_V1_QPC_UD_QKEY_L", 8, 40, 24),
+    ReferenceField("qp.h", "XTRDMA_QPC_URC_RSQ_PBA_H", "XTR_V1_QPC_URC_RSQ_PBA_H", 0, 0, 4),
+    ReferenceField("qp.h", "XTRDMA_QPC_URC_RSQ_PBA_L", "XTR_V1_QPC_URC_RSQ_PBA_L", 8, 16, 48),
+    ReferenceField("qp.h", "XTRDMA_QPC_SHADOW_PBA", "XTR_V1_QPC_SHADOW_PBA", 16, 9, 55),
+    ReferenceField("qp.h", "XTRDMA_QPC_SQ_CE_EN", "XTR_V1_QPC_SQ_CE_EN", 16, 4, 1),
+    ReferenceField("qp.h", "XTRDMA_QPC_RA_RENCE", "XTR_V1_QPC_RA_FENCE", 16, 3, 1),
+    ReferenceField("qp.h", "XTRDMA_QPC_AA_FENCE", "XTR_V1_QPC_AA_FENCE", 16, 2, 1),
+    ReferenceField("qp.h", "XTRDMA_QPC_FC_EN", "XTR_V1_QPC_FC_EN", 16, 1, 1),
+    ReferenceField("qp.h", "XTRDMA_QPC_RNR_RETRY_TH", "XTR_V1_QPC_RNR_RETRY_TH", 24, 45, 3),
+    ReferenceField("qp.h", "XTRDMA_QPC_RC_SRFQ", "XTR_V1_QPC_RC_SRFQ", 24, 31, 1),
+    ReferenceField("qp.h", "XTRDMA_QPC_RC_SRFQN", "XTR_V1_QPC_RC_SRFQN", 24, 16, 15),
+    ReferenceField("qp.h", "XTRDMA_QPC_QP_ACCESS_FLAG", "XTR_V1_QPC_QP_ACCESS_FLAG", 32, 0, 5),
+    ReferenceField("qp.h", "XTRDMA_QPC_URC_RDSQ_PBA", "XTR_V1_QPC_URC_RDSQ_PBA", 32, 12, 52),
+    ReferenceField("qp.h", "XTRDMA_QPC_URC_RDSQ_SIZE", "XTR_V1_QPC_URC_RDSQ_SIZE", 32, 8, 3),
+    ReferenceField("qp.h", "XTRDMA_QPC_PSN_RETRY_TH", "XTR_V1_QPC_PSN_RETRY_TH", 40, 5, 3),
+    ReferenceField("qp.h", "XTRDMA_QPC_VLAN", "XTR_V1_QPC_VLAN", 56, 63, 1),
+    ReferenceField("qp.h", "XTRDMA_QPC_IPV6", "XTR_V1_QPC_IPV6", 56, 62, 1),
+    ReferenceField("qp.h", "XTRDMA_QPC_TUNNEL", "XTR_V1_QPC_TUNNEL", 56, 61, 1),
+    ReferenceField("qp.h", "XTRDMA_QPC_LAG", "XTR_V1_QPC_LAG", 56, 60, 1),
+    ReferenceField("qp.h", "XTRDMA_QPC_FWD", "XTR_V1_QPC_FWD", 56, 58, 2),
+    ReferenceField("qp.h", "XTRDMA_QPC_DST_VPORT_ID", "XTR_V1_QPC_DST_VPORT_ID", 56, 44, 11),
+    ReferenceField("qp.h", "XTRDMA_QPC_SRC_ADDR_IDX", "XTR_V1_QPC_SRC_ADDR_IDX", 56, 32, 12),
+    ReferenceField("qp.h", "XTRDMA_QPC_DST_PORT", "XTR_V1_QPC_DST_PORT", 56, 24, 4),
+    ReferenceField("qp.h", "XTRDMA_QPC_DST_QPN", "XTR_V1_QPC_DST_QPN", 56, 0, 24),
+    ReferenceField("qp.h", "XTRDMA_QPC_DMAC", "XTR_V1_QPC_DMAC", 64, 16, 48),
+    ReferenceField("qp.h", "XTRDMA_QPC_PRI", "XTR_V1_QPC_PRI", 64, 13, 3),
+    ReferenceField("qp.h", "XTRDMA_QPC_CFI", "XTR_V1_QPC_CFI", 64, 12, 1),
+    ReferenceField("qp.h", "XTRDMA_QPC_VLAN_ID", "XTR_V1_QPC_VLAN_ID", 64, 0, 12),
+    ReferenceField("qp.h", "XTRDMA_QPC_SRC_VPORT_ID", "XTR_V1_QPC_SRC_VPORT_ID", 72, 52, 11),
+    ReferenceField("qp.h", "XTRDMA_QPC_FLOW_LABEL", "XTR_V1_QPC_FLOW_LABEL", 72, 32, 20),
+    ReferenceField("qp.h", "XTRDMA_QPC_DSCP", "XTR_V1_QPC_DSCP", 72, 26, 6),
+    ReferenceField("qp.h", "XTRDMA_QPC_ECN", "XTR_V1_QPC_ECN", 72, 24, 2),
+    ReferenceField("qp.h", "XTRDMA_QPC_HOPLIMIT", "XTR_V1_QPC_HOPLIMIT", 72, 16, 8),
+    ReferenceField("qp.h", "XTRDMA_QPC_CUR_UDP_SPORT", "XTR_V1_QPC_CUR_UDP_SPORT", 72, 0, 16),
+    ReferenceField("qp.h", "XTRDMA_QPC_URC_TX_RBSN", "XTR_V1_QPC_URC_TX_RBSN", 96, 24, 24),
+    ReferenceField("qp.h", "XTRDMA_QPC_URC_TX_DBSN", "XTR_V1_QPC_URC_TX_DBSN", 96, 0, 24),
+    ReferenceField("qp.h", "XTRDMA_QPC_URC_RX_RBSN", "XTR_V1_QPC_URC_RX_RBSN", 128, 24, 24),
+    ReferenceField("qp.h", "XTRDMA_QPC_URC_RX_DBSN", "XTR_V1_QPC_URC_RX_DBSN", 128, 0, 24),
+    ReferenceField("qp.h", "XTRDMA_QPC_RC_TPE_CUR_SQ_PSN", "XTR_V1_QPC_RC_TPE_CUR_SQ_PSN", 160, 0, 24),
+    ReferenceField("qp.h", "XTRDMA_QPC_RC_LAST_READ_PSN", "XTR_V1_QPC_RC_LAST_READ_PSN", 208, 0, 24),
+    ReferenceField("qp.h", "XTRDMA_QPC_RC_EIRQ_PSN_MAX", "XTR_V1_QPC_RC_EIRQ_PSN_MAX", 224, 24, 24),
+    ReferenceField("qp.h", "XTRDMA_QPC_URC_RX_SRBSN", "XTR_V1_QPC_URC_RX_SRBSN", 224, 24, 24),
+    ReferenceField("qp.h", "XTRDMA_QPC_EIRQ_CUR_SEND_PSN", "XTR_V1_QPC_EIRQ_CUR_SEND_PSN", 232, 0, 24),
+    ReferenceField("qp.h", "XTRDMA_QPC_URC_CUR_TX_DPSN", "XTR_V1_QPC_URC_CUR_TX_DPSN", 232, 24, 24),
+    ReferenceField("qp.h", "XTRDMA_QPC_URC_CUR_TX_RPSN", "XTR_V1_QPC_URC_CUR_TX_RPSN", 232, 0, 24),
+    ReferenceField("qp.h", "XTRDMA_QPC_EPSN_REQ", "XTR_V1_QPC_EPSN_REQ", 288, 16, 24),
+    ReferenceField("qp.h", "XTRDMA_QPC_URC_RXED_DBSN", "XTR_V1_QPC_URC_RXED_DBSN", 296, 0, 24),
+    ReferenceField("qp.h", "XTRDMA_QPC_URC_RQ_SE_TH", "XTR_V1_QPC_URC_RQ_SE_TH", 320, 20, 4),
+    ReferenceField("qp.h", "XTRDMA_QPC_URC_SQ_CE_TH", "XTR_V1_QPC_URC_SQ_CE_TH", 320, 16, 4),
+    ReferenceField("qp.h", "XTRDMA_QPC_URC_TX_SRBSN", "XTR_V1_QPC_URC_TX_SRBSN", 328, 24, 24),
+    ReferenceField("qp.h", "XTRDMA_QPC_URC_MAX_TX_SRBSN", "XTR_V1_QPC_URC_MAX_TX_SRBSN", 328, 0, 24),
+    ReferenceField("qp.h", "XTRDMA_QPC_RC_PSN_MAX_RPE", "XTR_V1_QPC_RC_PSN_MAX_RPE", 344, 32, 24),
+    ReferenceField("qp.h", "XTRDMA_QPC_RC_EPSN_RSP", "XTR_V1_QPC_RC_EPSN_RSP", 352, 16, 24),
+    ReferenceField("qp.h", "XTRDMA_QPC2_RC_EPSN_RSP", "XTR_V1_QPC2_RC_EPSN_RSP", 376, 32, 24),
+    ReferenceField("qp.h", "XTRDMA_QPC_URC_CUR_DSQ_PBA_H", "XTR_V1_QPC_URC_CUR_DSQ_PBA_H", 384, 0, 40),
+    ReferenceField("qp.h", "XTRDMA_QPC_URC_CUR_DSQ_PBA_L", "XTR_V1_QPC_URC_CUR_DSQ_PBA_L", 392, 52, 12),
+    ReferenceField("qp.h", "XTRDMA_QPC_URC_NXT_DSQ_PBA", "XTR_V1_QPC_URC_NXT_DSQ_PBA", 392, 0, 52),
+    ReferenceField("qp.h", "XTRDMA_QPC_URC_TPE_RPSN_MAX", "XTR_V1_QPC_URC_TPE_RPSN_MAX", 400, 40, 24),
+    ReferenceField("qp.h", "XTRDMA_QPC_RC_PSN_MAX_TPE", "XTR_V1_QPC_RC_PSN_MAX_TPE", 416, 40, 24),
+    ReferenceField("qp.h", "XTRDMA_QPC_URC_TPE_DPSN_MAX", "XTR_V1_QPC_URC_TPE_DPSN_MAX", 416, 40, 24),
+    ReferenceField("qp.h", "XTRDMA_QPC_URC_NXT_DSQ_FETCH_NUM", "XTR_V1_QPC_URC_NXT_DSQ_FETCH_NUM", 416, 32, 6),
+    ReferenceField("qp.h", "XTRDMA_QPC_RC_RETRY_FPSN", "XTR_V1_QPC_RC_RETRY_FPSN", 424, 0, 24),
+    ReferenceField("qp.h", "XTRDMA_QPC_RC_RETRY_PSN", "XTR_V1_QPC_RC_RETRY_PSN", 432, 0, 24),
+    ReferenceField("qp.h", "XTRDMA_QPC_SQ_CQN", "XTR_V1_QPC_SQ_CQN", 448, 20, 20),
+    ReferenceField("qp.h", "XTRDMA_QPC_RQ_CQN", "XTR_V1_QPC_RQ_CQN", 448, 0, 20),
+    ReferenceField("qp.h", "XTRDMA_QPC_RQ_OR_SRQ_PD_PBA_OR_PBA", "XTR_V1_QPC_RQ_PBA", 496, 12, 52),
+    ReferenceField("qp.h", "XTRDMA_QPC_RQ_OR_SRQ_SIZE", "XTR_V1_QPC_RQ_SIZE", 496, 8, 4),
+    ReferenceField("qp.h", "XTRDMA_QPC_RQ_OR_SRQ_OM", "XTR_V1_QPC_RQ_OM", 496, 6, 2),
+    # Sparse body placements, independently transcribed in final WQE coordinates.
+    ReferenceField("cmq.h", "XTRDMA_CMQSQ_WQE_CQC_WQE_CQN", "XTR_V1_CQC_BODY_CQN", 0, 0, 21),
+    ReferenceField("cq.h", "XTRDMA_CMQ_CQC_CQ_SD_PBA", "XTR_V1_CQC_BODY_CQ_SD_PBA", 8, 0, 52),
+    ReferenceField("cq.h", "XTRDMA_CMQ_CQC_CQ_SIZE", "XTR_V1_CQC_BODY_CQ_SIZE", 8, 56, 5),
+    ReferenceField("cq.h", "XTRDMA_CMQ_CQC_URC_FLAG", "XTR_V1_CQC_BODY_URC_FLAG", 8, 61, 1),
+    ReferenceField("cq.h", "XTRDMA_CMQ_CQC_CQ_ST", "XTR_V1_CQC_BODY_CQ_ST", 8, 62, 2),
+    ReferenceField("cq.h", "XTRDMA_CMQ_CQC_NXT_CQ_PD_PBA_H", "XTR_V1_CQC_BODY_NXT_CQ_PD_PBA_H", 16, 0, 8),
+    ReferenceField("cq.h", "XTRDMA_CMQ_CQC_CUR_PBA_VLD", "XTR_V1_CQC_BODY_CUR_PBA_VLD", 16, 11, 1),
+    ReferenceField("cq.h", "XTRDMA_CMQ_CQC_CUR_CQ_PD_PBA", "XTR_V1_CQC_BODY_CUR_CQ_PD_PBA", 16, 12, 52),
+    ReferenceField("cq.h", "XTRDMA_CMQ_CQC_LOAD_CQ_CI_DONE", "XTR_V1_CQC_BODY_LOAD_CQ_CI_DONE", 24, 0, 1),
+    ReferenceField("cq.h", "XTRDMA_CMQ_CQC_LOAD_CQ_CI_TH", "XTR_V1_CQC_BODY_LOAD_CQ_CI_TH", 24, 8, 3),
+    ReferenceField("cq.h", "XTRDMA_CMQ_CQC_CQ_OM", "XTR_V1_CQC_BODY_CQ_OM", 24, 14, 2),
+    ReferenceField("cq.h", "XTRDMA_CMQ_CQC_NXT_PBA_VLD", "XTR_V1_CQC_BODY_NXT_PBA_VLD", 24, 19, 1),
+    ReferenceField("cq.h", "XTRDMA_CMQ_CQC_NXT_CQ_PD_PBA_L", "XTR_V1_CQC_BODY_NXT_CQ_PD_PBA_L", 24, 20, 44),
+    ReferenceField("cq.h", "XTRDMA_CMQ_CQC_CQ_PI", "XTR_V1_CQC_BODY_CQ_PI", 32, 0, 23),
+    ReferenceField("cq.h", "XTRDMA_CMQ_CQC_CQ_PI_WRAP", "XTR_V1_CQC_BODY_CQ_PI_WRAP", 32, 23, 1),
+    ReferenceField("cq.h", "XTRDMA_CMQ_CQC_LAST_ARM_SN", "XTR_V1_CQC_BODY_LAST_ARM_SN", 32, 60, 2),
+    ReferenceField("cq.h", "XTRDMA_CMQ_CQC_CQE_SIZE", "XTR_V1_CQC_BODY_CQE_SIZE", 32, 62, 2),
+    ReferenceField("cq.h", "XTRDMA_CMQ_CQC_CEQN", "XTR_V1_CQC_BODY_CEQN", 40, 0, 12),
+    ReferenceField("cq.h", "XTRDMA_CMQ_CQC_SHADOW_PA", "XTR_V1_CQC_BODY_SHADOW_PA", 48, 6, 58),
+    ReferenceField("cq.h", "XTRDMA_CMQ_CQC_CQ_CI", "XTR_V1_CQC_BODY_CQ_CI", 56, 0, 23),
+    ReferenceField("cq.h", "XTRDMA_CMQ_CQC_CQ_CI_WRAP", "XTR_V1_CQC_BODY_CQ_CI_WRAP", 56, 23, 1),
+    ReferenceField("cq.h", "XTRDMA_CMQ_CQC_ARM_SN", "XTR_V1_CQC_BODY_ARM_SN", 56, 32, 2),
+    ReferenceField("cq.h", "XTRDMA_CMQ_CQC_ARM_ST", "XTR_V1_CQC_BODY_ARM_ST", 56, 34, 2),
+    ReferenceField("cmq.h", "XTRDMA_CQPSQ_STAG_IDX", "XTR_V1_MRT_BODY_STAG_IDX", 0, 0, 24),
+    ReferenceField("cmq.h", "XTRDMA_CQPSQ_NXT_ST", "XTR_V1_MRT_BODY_NXT_ST", 0, 61, 2),
+    ReferenceField("cmq.h", "XTRDMA_CQPSQ_STAG_KEY", "XTR_V1_MRT_BODY_STAG_KEY", 8, 24, 8),
+    ReferenceField("cmq.h", "XTRDMA_CQPSQ_MRT_INFO0_PARENT_MR_STAG_IDX", "XTR_V1_MRT_BODY_PARENT_STAG_IDX", 16, 0, 24),
+    ReferenceField("cmq.h", "XTRDMA_CQPSQ_MRT_INFO0_PD_IDX", "XTR_V1_MRT_BODY_PD_IDX", 16, 24, 16),
+    ReferenceField("cmq.h", "XTRDMA_CQPSQ_MRT_INFO0_PLD_VF_ID", "XTR_V1_MRT_BODY_PLD_VF_ID", 16, 40, 8),
+    ReferenceField("cmq.h", "XTRDMA_CQPSQ_MRT_INFO0_PLD_VF_EN", "XTR_V1_MRT_BODY_PLD_VF_EN", 16, 48, 1),
+    ReferenceField("cmq.h", "XTRDMA_CQPSQ_MRT_INFO0_RIGHT", "XTR_V1_MRT_BODY_RIGHT", 16, 49, 5),
+    ReferenceField("cmq.h", "XTRDMA_CQPSQ_MRT_INFO0_TYPE", "XTR_V1_MRT_BODY_TYPE", 16, 54, 2),
+    ReferenceField("cmq.h", "XTRDMA_CQPSQ_MRT_INFO0_HOST_PG_SIZE", "XTR_V1_MRT_BODY_HOST_PG_SIZE", 16, 56, 2),
+    ReferenceField("cmq.h", "XTRDMA_CQPSQ_MRT_INFO0_PBL_MODE", "XTR_V1_MRT_BODY_PBL_MODE", 16, 58, 2),
+    ReferenceField("cmq.h", "XTRDMA_CQPSQ_MRT_INFO0_ADDR_MODE", "XTR_V1_MRT_BODY_ADDR_MODE", 16, 60, 1),
+    ReferenceField("cmq.h", "XTRDMA_CQPSQ_MRT_INFO0_INVALIDATE_EN", "XTR_V1_MRT_BODY_INVALIDATE_EN", 16, 61, 1),
+    ReferenceField("cmq.h", "XTRDMA_CQPSQ_MRT_INFO0_ST", "XTR_V1_MRT_BODY_ST", 16, 62, 2),
+    ReferenceField("cmq.h", "XTRDMA_CQPSQ_MRT_INFO0_LEN", "XTR_V1_MRT_BODY_LEN", 24, 0, 46),
+    ReferenceField("cmq.h", "XTRDMA_CQPSQ_MRT_INFO0_ODP", "XTR_V1_MRT_BODY_ODP", 24, 47, 1),
+    ReferenceField("cmq.h", "XTRDMA_CQPSQ_MRT_INFO0_STAG_KEY", "XTR_V1_MRT_BODY_INFO_STAG_KEY", 24, 56, 8),
+    ReferenceField("cmq.h", "XTRDMA_CQPSQ_MRT_INFO0_START_VA", "XTR_V1_MRT_BODY_START_VA", 32, 0, 64),
+    ReferenceField("cmq.h", "XTRDMA_CQPSQ_MRT_INFO0_FIRST_PBL_IDX", "XTR_V1_MRT_BODY_FIRST_PBL_IDX", 40, 36, 28),
+    ReferenceField("cmq.h", "XTRDMA_CQPSQ_MRT_INFO0_Payload_PBA_0", "XTR_V1_MRT_BODY_PAYLOAD_PBA0", 40, 12, 52),
+    ReferenceField("cmq.h", "XTRDMA_CQPSQ_MRT_INFO1_MR_SN", "XTR_V1_MRT_BODY_MR_SN", 48, 0, 12),
+    ReferenceField("cmq.h", "XTRDMA_CQPSQ_MRT_INFO1_Payload_PBA_1", "XTR_V1_MRT_BODY_PAYLOAD_PBA1", 48, 12, 52),
+    ReferenceField("cmq.h", "XTRDMA_CMQCQ_WQE_SRFQN", "XTR_V1_SRQC_BODY_SRFQN", 0, 0, 16),
+    ReferenceField("srq.h", "XTRDMA_SRFQ_CTX_SRFQ_ST", "XTR_V1_SRQC_BODY_SRFQ_ST", 16, 62, 2),
+    ReferenceField("srq.h", "XTRDMA_SRFQ_CTX_LOAD_SRFQ_PI_TH", "XTR_V1_SRQC_BODY_LOAD_SRFQ_PI_TH", 16, 52, 8),
+    ReferenceField("srq.h", "XTRDMA_SRFQ_CTX_SRFQC_SHADOW_PA", "XTR_V1_SRQC_BODY_SHADOW_PA", 16, 0, 52),
+    ReferenceField("srq.h", "XTRDMA_SRFQ_CTX_PD_IDX", "XTR_V1_SRQC_BODY_PD_IDX", 24, 48, 16),
+    ReferenceField("srq.h", "XTRDMA_SRFQ_CTX_SRFQ_PD_PBA_OR_PBA", "XTR_V1_SRQC_BODY_SRFQ_PBA", 32, 12, 52),
+    ReferenceField("srq.h", "XTRDMA_SRFQ_CTX_SRFQ_SIZE", "XTR_V1_SRQC_BODY_SRFQ_SIZE", 32, 4, 4),
+    ReferenceField("srq.h", "XTRDMA_SRFQ_CTX_SRFQ_OM", "XTR_V1_SRQC_BODY_SRFQ_OM", 32, 2, 2),
+    ReferenceField("srq.h", "XTRDMA_SRFQ_CTX_SRFQ_PI_WRAP", "XTR_V1_SRQC_BODY_SRFQ_PI_WRAP", 40, 31, 1),
+    ReferenceField("srq.h", "XTRDMA_SRFQ_CTX_SRFQ_PI", "XTR_V1_SRQC_BODY_SRFQ_PI", 40, 16, 15),
+    ReferenceField("srq.h", "XTRDMA_SRFQ_CTX_SRQ_LIMIT_TH", "XTR_V1_SRQC_BODY_LIMIT_TH", 40, 2, 14),
+    ReferenceField("srq.h", "XTRDMA_SRFQ_CTX_ARM_SN", "XTR_V1_SRQC_BODY_ARM_SN", 40, 0, 2),
+    ReferenceField("cmq.h", "XTRDMA_CMQCQ_WQE_EQN", "XTR_V1_EQC_BODY_EQN", 0, 0, 12),
+    ReferenceField("event.h", "XTRDMA_EQ_CTX_EQ_ST", "XTR_V1_EQC_BODY_EQ_ST", 16, 62, 2),
+    ReferenceField("event.h", "XTRDMA_EQ_CTX_EQ_SIZE", "XTR_V1_EQC_BODY_EQ_SIZE", 16, 52, 5),
+    ReferenceField("event.h", "XTRDMA_EQ_CTX_NXT_EQ_PBA", "XTR_V1_EQC_BODY_NXT_EQ_PBA", 16, 0, 52),
+    ReferenceField("event.h", "XTRDMA_EQ_CTX_CUR_EQ_PBA", "XTR_V1_EQC_BODY_CUR_EQ_PBA", 24, 12, 52),
+    ReferenceField("event.h", "XTRDMA_EQ_CTX_CUR_PBA_VLD", "XTR_V1_EQC_BODY_CUR_PBA_VLD", 24, 11, 1),
+    ReferenceField("event.h", "XTRDMA_EQ_CTX_EQ_PI_WRAP", "XTR_V1_EQC_BODY_EQ_PI_WRAP", 32, 38, 1),
+    ReferenceField("event.h", "XTRDMA_EQ_CTX_EQ_PI", "XTR_V1_EQC_BODY_EQ_PI", 32, 20, 18),
+    ReferenceField("event.h", "XTRDMA_EQ_CTX_EQ_OM", "XTR_V1_EQC_BODY_EQ_OM", 32, 14, 2),
+    ReferenceField("event.h", "XTRDMA_EQ_CTX_MSI_X_IDX", "XTR_V1_EQC_BODY_MSI_X_IDX", 40, 48, 16),
+    ReferenceField("event.h", "XTRDMA_EQ_CTX_EQ_CI_WRAP", "XTR_V1_EQC_BODY_EQ_CI_WRAP", 40, 18, 1),
+    ReferenceField("event.h", "XTRDMA_EQ_CTX_EQ_CI", "XTR_V1_EQC_BODY_EQ_CI", 40, 0, 18),
 )
 
 REFERENCE_BY_STEM = {reference.sv_stem: reference for reference in REFERENCE_FIELDS}
@@ -596,43 +1169,316 @@ def validate_reference_fields(
                 raise ValidationError(f"reference mask mismatch for {reference.sv_stem}")
 
 
+def parse_input_summary(summary: str) -> tuple[GoldenInput, ...]:
+    if not summary:
+        raise ValidationError("golden input summary must not be empty")
+    inputs: list[GoldenInput] = []
+    names: set[str] = set()
+    for token in summary.split(","):
+        match = re.fullmatch(r"([a-z][a-z0-9_]*)=([a-z0-9_]+)", token)
+        if match is None:
+            raise ValidationError(f"malformed golden input token: {token}")
+        name, value = match.groups()
+        if name in names:
+            raise ValidationError(f"duplicate golden input name: {name}")
+        names.add(name)
+        inputs.append(GoldenInput(name, value))
+    return tuple(inputs)
+
+
 def build_golden_cases() -> dict[str, list[GoldenCase]]:
     def make_case(name: str, byte_count: int, inputs) -> GoldenCase:
+        summary = ",".join(
+            summary_part for _, _, summary_part in inputs if summary_part
+        )
+        frozen_inputs = parse_input_summary(summary)
         image = ReferenceImage(byte_count)
-        for stem, value, _ in inputs:
+        for stem, value, summary_part in inputs:
+            if stem and summary_part:
+                source = parse_input_summary(summary_part)[0]
+                if re.fullmatch(r"(?:0x[0-9a-f]+|[0-9]+)", source.value):
+                    # Split/derived values are checked after assembly by
+                    # validate_context_contract; all other field values must
+                    # be the exact frozen source input.
+                    if (source.name not in {"qkey", "rsq_pba", "dsq_pba"}
+                            and value != int(source.value, 0)):
+                        raise ValidationError(
+                            f"{name} field {stem} drifts from input {source.name}"
+                        )
             if stem:
                 put_named(image, stem, value)
-        summary = ",".join(summary_part for _, _, summary_part in inputs)
-        return GoldenCase(name, summary, bytes(image))
+        return GoldenCase(name, frozen_inputs, bytes(image))
 
-    qpc = make_case("qpc_common_boundary", 512, (
-        ("XTR_V1_QPC_TVER", 2, "tver=2"),
+    rc_send_psn = 0xABCDEF
+    rc_recv_psn = 0x123456
+    qpc_rc = make_case("qpc_rc_boundary", 512, (
+        ("", 0, "transport=rc"),
+        ("XTR_V1_QPC_TVER", 1, "tver=1"),
         ("XTR_V1_QPC_MIG", 1, "mig=1"),
-        ("XTR_V1_QPC_SERVICE_TYPE", 3, "service=ud"),
+        ("XTR_V1_QPC_SERVICE_TYPE", 0, ""),
         ("XTR_V1_QPC_HOST_ID", 5, "host=5"),
         ("XTR_V1_QPC_VF_ID", 0xABC, "vf=0xabc"),
-        ("XTR_V1_QPC_ICOS", 5, "icos=5"),
+        ("XTR_V1_QPC_ICOS", 3, "icos=3"),
         ("XTR_V1_QPC_QPN", 0x15555, "qpn=0x15555"),
         ("XTR_V1_QPC_STAT_IDX", 0xA5, "stat_idx=0xa5"),
-        ("XTR_V1_QPC_UD_QKEY_H", 0x5A, "ud_qkey_h=0x5a"),
         ("XTR_V1_QPC_PKEY", 0xBEEF, "pkey=0xbeef"),
-        ("XTR_V1_QPC_TX_ENDIAN_SWAP", 1, "tx_endian_swap=1"),
-        ("XTR_V1_QPC_RX_ENDIAN_SWAP", 1, "rx_endian_swap=1"),
-        ("XTR_V1_QPC_QP_ST", 5, "qp_state=5"),
-        ("XTR_V1_QPC_PMTU", 6, "pmtu=6"),
+        ("XTR_V1_QPC_SHADOW_PBA", 0x123456789AB, "shadow_pba=0x123456789ab"),
+        ("XTR_V1_QPC_TX_ENDIAN_SWAP", 1, "tx_swap=1"),
+        ("XTR_V1_QPC_RX_ENDIAN_SWAP", 1, "rx_swap=1"),
+        ("XTR_V1_QPC_SQ_CE_EN", 1, "sq_ce=1"),
+        ("XTR_V1_QPC_RA_FENCE", 1, "ra_fence=1"),
+        ("XTR_V1_QPC_AA_FENCE", 1, "aa_fence=1"),
+        ("XTR_V1_QPC_FC_EN", 1, "fc=1"),
+        ("XTR_V1_QPC_QP_ST", 3, "state=3"),
+        ("XTR_V1_QPC_PMTU", 5, "pmtu=5"),
+        ("XTR_V1_QPC_PSN_RETRY_TH", 7, "retry_count=7"),
+        ("XTR_V1_QPC_RNR_RETRY_TH", 7, "rnr_retry=7"),
         ("XTR_V1_QPC_QP_SN", 0xC3, "qp_sn=0xc3"),
-        ("XTR_V1_QPC_PD_IDX", 0xA55A, "pd_idx=0xa55a"),
+        ("XTR_V1_QPC_RC_SRFQ", 1, "srfq=1"),
+        ("XTR_V1_QPC_RC_SRFQN", 0x4567, "srfqn=0x4567"),
+        ("XTR_V1_QPC_PD_IDX", 0xA55A, "pd=0xa55a"),
+        ("XTR_V1_QPC_QP_ACCESS_FLAG", 0x1F, "access=0x1f"),
+        ("XTR_V1_QPC_DST_QPN", 0x654321, "dst_qpn=0x654321"),
+        ("XTR_V1_QPC_DMAC", 0x112233445566, "dmac=0x112233445566"),
+        ("XTR_V1_QPC_VLAN_ID", 0xABC, "vlan_id=0xabc"),
+        ("XTR_V1_QPC_FLOW_LABEL", 0xABCDE, "flow=0xabcde"),
+        ("XTR_V1_QPC_DSCP", 0x2A, "dscp=0x2a"),
+        ("XTR_V1_QPC_ECN", 2, "ecn=2"),
+        ("XTR_V1_QPC_HOPLIMIT", 0x40, "hop=0x40"),
+        ("XTR_V1_QPC_CUR_UDP_SPORT", 0xC123, "udp_sport=0xc123"),
+        ("XTR_V1_QPC_RC_TPE_CUR_SQ_PSN", rc_send_psn, f"send_psn={rc_send_psn:#x}"),
+        ("XTR_V1_QPC_RC_LAST_READ_PSN", rc_send_psn, ""),
+        ("XTR_V1_QPC_RC_PSN_MAX_RPE", rc_send_psn, ""),
+        ("XTR_V1_QPC_RC_EPSN_RSP", rc_send_psn, ""),
+        ("XTR_V1_QPC2_RC_EPSN_RSP", rc_send_psn, ""),
+        ("XTR_V1_QPC_RC_PSN_MAX_TPE", rc_send_psn, ""),
+        ("XTR_V1_QPC_RC_RETRY_FPSN", rc_send_psn, ""),
+        ("XTR_V1_QPC_RC_RETRY_PSN", rc_send_psn, ""),
+        ("XTR_V1_QPC_RC_EIRQ_PSN_MAX", rc_recv_psn, f"recv_psn={rc_recv_psn:#x}"),
+        ("XTR_V1_QPC_EIRQ_CUR_SEND_PSN", rc_recv_psn, ""),
+        ("XTR_V1_QPC_EPSN_REQ", rc_recv_psn, ""),
         ("XTR_V1_QPC_SQ_PBA", 0x123456789ABCD, "sq_pba=0x123456789abcd"),
         ("XTR_V1_QPC_SQ_SIZE", 0xB, "sq_size=11"),
         ("XTR_V1_QPC_SQ_OM", 2, "sq_om=2"),
+        ("XTR_V1_QPC_SQ_CQN", 0xABCDE, "sq_cqn=0xabcde"),
+        ("XTR_V1_QPC_RQ_CQN", 0x54321, "rq_cqn=0x54321"),
+        ("XTR_V1_QPC_RQ_PBA", 0x0FEDCBA987654, "rq_pba=0x0fedcba987654"),
+        ("XTR_V1_QPC_RQ_SIZE", 0xA, "rq_size=10"),
+        ("XTR_V1_QPC_RQ_OM", 1, "rq_om=1"),
     ))
 
-    cqc = make_case("cqc_boundary", 64, (
-        ("XTR_V1_CQC_CQ_SD_PBA", 0x123456789ABCD, "sd_pba=0x123456789abcd"),
-        ("XTR_V1_CQC_CQ_SIZE", 0x1B, "size=27"),
-        ("XTR_V1_CQC_URC_FLAG", 1, "urc=1"),
-        ("XTR_V1_CQC_CQ_ST", 2, "state=2"),
+    ud_qkey = 0x89ABCDEF
+    ud_dest_ip = bytes.fromhex("20010db8000000000000000000000001")
+    qpc_ud = make_case("qpc_ud_boundary", 512, (
+        ("", 0, "transport=ud"),
+        ("XTR_V1_QPC_TVER", 1, "tver=1"),
+        ("XTR_V1_QPC_MIG", 0, "mig=0"),
+        ("XTR_V1_QPC_SERVICE_TYPE", 3, ""),
+        ("XTR_V1_QPC_HOST_ID", 6, "host=6"),
+        ("XTR_V1_QPC_VF_ID", 0x345, "vf=0x345"),
+        ("XTR_V1_QPC_ICOS", 5, "icos=5"),
+        ("XTR_V1_QPC_QPN", 0x2AAAA, "qpn=0x2aaaa"),
+        ("XTR_V1_QPC_STAT_IDX", 0x5A, "stat_idx=0x5a"),
+        ("XTR_V1_QPC_UD_QKEY_H", ud_qkey >> 24, f"qkey={ud_qkey:#x}"),
+        ("XTR_V1_QPC_UD_QKEY_L", ud_qkey & 0xFFFFFF, ""),
+        ("XTR_V1_QPC_PKEY", 0x1234, "pkey=0x1234"),
+        ("XTR_V1_QPC_SHADOW_PBA", 0x0FEDCBA9876, "shadow_pba=0x0fedcba9876"),
+        ("XTR_V1_QPC_TX_ENDIAN_SWAP", 1, "tx_swap=1"),
+        ("XTR_V1_QPC_RX_ENDIAN_SWAP", 1, "rx_swap=1"),
+        ("XTR_V1_QPC_QP_ST", 3, "state=3"),
+        ("XTR_V1_QPC_PMTU", 4, "pmtu=4"),
+        ("XTR_V1_QPC_QP_SN", 0x7E, "qp_sn=0x7e"),
+        ("XTR_V1_QPC_PD_IDX", 0x5AA5, "pd=0x5aa5"),
+        ("XTR_V1_QPC_VLAN", 1, "vlan=1"),
+        ("XTR_V1_QPC_IPV6", 1, "ipv6=1"),
+        ("XTR_V1_QPC_TUNNEL", 1, "tunnel=1"),
+        ("XTR_V1_QPC_LAG", 1, "lag=1"),
+        ("XTR_V1_QPC_FWD", 2, "fwd=2"),
+        ("XTR_V1_QPC_DST_VPORT_ID", 0x456, "dst_vport=0x456"),
+        ("XTR_V1_QPC_SRC_ADDR_IDX", 0xABC, "src_addr=0xabc"),
+        ("XTR_V1_QPC_DST_PORT", 0xB, "dst_port=0xb"),
+        ("XTR_V1_QPC_DST_QPN", 0xABCDEF, "dst_qpn=0xabcdef"),
+        ("XTR_V1_QPC_DMAC", 0xA1B2C3D4E5F6, "dmac=0xa1b2c3d4e5f6"),
+        ("XTR_V1_QPC_PRI", 5, "pri=5"),
+        ("XTR_V1_QPC_CFI", 1, "cfi=1"),
+        ("XTR_V1_QPC_VLAN_ID", 0x789, "vlan_id=0x789"),
+        ("XTR_V1_QPC_SRC_VPORT_ID", 0x345, "src_vport=0x345"),
+        ("XTR_V1_QPC_FLOW_LABEL", 0x54321, "flow=0x54321"),
+        ("XTR_V1_QPC_DSCP", 0x2B, "dscp=0x2b"),
+        ("XTR_V1_QPC_ECN", 0, "ecn=0"),
+        ("XTR_V1_QPC_HOPLIMIT", 0x7F, "hop=0x7f"),
+        ("XTR_V1_QPC_CUR_UDP_SPORT", 0xBEEF, "udp_sport=0xbeef"),
+        ("", 0, f"dest_ip={ud_dest_ip.hex()}"),
+        ("XTR_V1_QPC_SQ_PBA", 0x1111122222333, "sq_pba=0x1111122222333"),
+        ("XTR_V1_QPC_SQ_SIZE", 9, "sq_size=9"),
+        ("XTR_V1_QPC_SQ_OM", 3, "sq_om=3"),
+        ("XTR_V1_QPC_SQ_CQN", 0x13579, "sq_cqn=0x13579"),
+        ("XTR_V1_QPC_RQ_CQN", 0x2468A, "rq_cqn=0x2468a"),
+        ("XTR_V1_QPC_RQ_PBA", 0x4444455555666, "rq_pba=0x4444455555666"),
+        ("XTR_V1_QPC_RQ_SIZE", 8, "rq_size=8"),
+        ("XTR_V1_QPC_RQ_OM", 2, "rq_om=2"),
     ))
+    qpc_ud_image = bytearray(qpc_ud.payload)
+    qpc_ud_image[80:96] = ud_dest_ip
+    qpc_ud = qpc_ud._replace(payload=bytes(qpc_ud_image))
+
+    urc_rsq_pba = 0x123456789ABCD
+    urc_dsq_pba = 0x3456789ABCDEF
+    qpc_urc = make_case("qpc_urc_boundary", 512, (
+        ("", 0, "transport=urc"),
+        ("XTR_V1_QPC_TVER", 1, "tver=1"), ("XTR_V1_QPC_MIG", 1, "mig=1"),
+        ("XTR_V1_QPC_SERVICE_TYPE", 6, ""), ("XTR_V1_QPC_HOST_ID", 7, "host=7"),
+        ("XTR_V1_QPC_VF_ID", 0x789, "vf=0x789"), ("XTR_V1_QPC_ICOS", 7, "icos=7"),
+        ("XTR_V1_QPC_QPN", 0x3FFFF, "qpn=0x3ffff"), ("XTR_V1_QPC_STAT_IDX", 0xFF, "stat_idx=0xff"),
+        ("XTR_V1_QPC_URC_RSQ_PBA_H", urc_rsq_pba >> 48, f"rsq_pba={urc_rsq_pba:#x}"),
+        ("XTR_V1_QPC_URC_RSQ_PBA_L", urc_rsq_pba & ((1 << 48) - 1), ""),
+        ("XTR_V1_QPC_PKEY", 0xABCD, "pkey=0xabcd"),
+        ("XTR_V1_QPC_SHADOW_PBA", 0x123456789AB, "shadow_pba=0x123456789ab"),
+        ("XTR_V1_QPC_QP_ST", 3, "state=3"), ("XTR_V1_QPC_PMTU", 5, "pmtu=5"),
+        ("XTR_V1_QPC_QP_SN", 0xFE, "qp_sn=0xfe"), ("XTR_V1_QPC_PD_IDX", 0xFFFF, "pd=0xffff"),
+        ("XTR_V1_QPC_URC_RDSQ_PBA", 0x23456789ABCDE, "rdsq_pba=0x23456789abcde"),
+        ("XTR_V1_QPC_URC_RDSQ_SIZE", 7, "rdsq_size=7"),
+        ("XTR_V1_QPC_URC_TX_RBSN", 0xABCDEF, "tx_rbsn=0xabcdef"),
+        ("XTR_V1_QPC_URC_TX_DBSN", 0x654321, "tx_dbsn=0x654321"),
+        ("XTR_V1_QPC_URC_RX_RBSN", 0x123456, "rx_rbsn=0x123456"),
+        ("XTR_V1_QPC_URC_RX_DBSN", 0xFEDCBA, "rx_dbsn=0xfedcba"),
+        ("XTR_V1_QPC_URC_RX_SRBSN", 0x345678, "rx_srbsn=0x345678"),
+        ("XTR_V1_QPC_URC_CUR_TX_DPSN", 0x456789, "cur_dpsn=0x456789"),
+        ("XTR_V1_QPC_URC_CUR_TX_RPSN", 0x56789A, "cur_rpsn=0x56789a"),
+        ("XTR_V1_QPC_URC_RXED_DBSN", 0x6789AB, "rxed_dbsn=0x6789ab"),
+        ("XTR_V1_QPC_URC_RQ_SE_TH", 0xF, "rq_se_th=0xf"),
+        ("XTR_V1_QPC_URC_SQ_CE_TH", 0xE, "sq_ce_th=0xe"),
+        ("XTR_V1_QPC_URC_TX_SRBSN", 0x789ABC, "tx_srbsn=0x789abc"),
+        ("XTR_V1_QPC_URC_MAX_TX_SRBSN", 0x89ABCD, "max_tx_srbsn=0x89abcd"),
+        ("XTR_V1_QPC_URC_CUR_DSQ_PBA_H", urc_dsq_pba >> 12, f"dsq_pba={urc_dsq_pba:#x}"),
+        ("XTR_V1_QPC_URC_CUR_DSQ_PBA_L", urc_dsq_pba & 0xFFF, ""),
+        ("XTR_V1_QPC_URC_NXT_DSQ_PBA", urc_dsq_pba + 1, ""),
+        ("XTR_V1_QPC_URC_TPE_RPSN_MAX", 0x9ABCDE, "tpe_rpsn_max=0x9abcde"),
+        ("XTR_V1_QPC_URC_TPE_DPSN_MAX", 0xABCDEF, "tpe_dpsn_max=0xabcdef"),
+        ("XTR_V1_QPC_URC_NXT_DSQ_FETCH_NUM", 0x3F, "dsq_fetch=0x3f"),
+        ("XTR_V1_QPC_SQ_PBA", 0x456789ABCDEF0, "sq_pba=0x456789abcdef0"),
+        ("XTR_V1_QPC_SQ_SIZE", 0xF, "sq_size=0xf"), ("XTR_V1_QPC_SQ_OM", 3, "sq_om=3"),
+        ("XTR_V1_QPC_SQ_CQN", 0xFFFFF, "sq_cqn=0xfffff"),
+        ("XTR_V1_QPC_RQ_CQN", 0xABCDE, "rq_cqn=0xabcde"),
+        ("XTR_V1_QPC_RQ_PBA", 0x56789ABCDEF01, "rq_pba=0x56789abcdef01"),
+        ("XTR_V1_QPC_RQ_SIZE", 0xE, "rq_size=0xe"), ("XTR_V1_QPC_RQ_OM", 2, "rq_om=2"),
+    ))
+
+    cqc = make_case("cqc_create_body_boundary", 64, (
+        ("XTR_V1_CQC_BODY_CQN", 0x1FFFFF, "cqn=0x1fffff"),
+        ("XTR_V1_CQC_BODY_CQ_SD_PBA", 0xFFFFFFFFFFFFF, "sd_pba=0xfffffffffffff"),
+        ("XTR_V1_CQC_BODY_CQ_SIZE", 0x1F, "size=0x1f"),
+        ("XTR_V1_CQC_BODY_URC_FLAG", 1, "urc=1"), ("XTR_V1_CQC_BODY_CQ_ST", 3, "state=3"),
+        ("XTR_V1_CQC_BODY_NXT_CQ_PD_PBA_H", 0xFF, "next_hi=0xff"),
+        ("XTR_V1_CQC_BODY_CUR_PBA_VLD", 1, "cur_valid=1"),
+        ("XTR_V1_CQC_BODY_CUR_CQ_PD_PBA", 0xFFFFFFFFFFFFF, "cur_pba=0xfffffffffffff"),
+        ("XTR_V1_CQC_BODY_LOAD_CQ_CI_DONE", 1, "load_ci=1"),
+        ("XTR_V1_CQC_BODY_LOAD_CQ_CI_TH", 7, "threshold=7"),
+        ("XTR_V1_CQC_BODY_CQ_OM", 3, "mode=3"), ("XTR_V1_CQC_BODY_NXT_PBA_VLD", 1, "next_valid=1"),
+        ("XTR_V1_CQC_BODY_NXT_CQ_PD_PBA_L", 0xFFFFFFFFFFF, "next_lo=0xfffffffffff"),
+        ("XTR_V1_CQC_BODY_CQ_PI", 0x7FFFFF, "pi=0x7fffff"),
+        ("XTR_V1_CQC_BODY_CQ_PI_WRAP", 1, "pi_wrap=1"),
+        ("XTR_V1_CQC_BODY_LAST_ARM_SN", 3, "last_arm=3"),
+        ("XTR_V1_CQC_BODY_CQE_SIZE", 3, "cqe_size=3"),
+        ("XTR_V1_CQC_BODY_CEQN", 0xFFF, "ceqn=0xfff"),
+        ("XTR_V1_CQC_BODY_SHADOW_PA", 0x3FFFFFFFFFFFFFF, "shadow=0x3ffffffffffffff"),
+        ("XTR_V1_CQC_BODY_CQ_CI", 0x7FFFFF, "ci=0x7fffff"),
+        ("XTR_V1_CQC_BODY_CQ_CI_WRAP", 1, "ci_wrap=1"),
+        ("XTR_V1_CQC_BODY_ARM_SN", 3, "arm_sn=3"), ("XTR_V1_CQC_BODY_ARM_ST", 3, "arm_state=3"),
+    ))
+
+    def make_mrt(name: str, pbl: int, key_alloc: bool) -> GoldenCase:
+        variant = "key_alloc" if key_alloc else "mr_register"
+        stag = 0xFFFFFF
+        state = 3
+        key = 0xFF
+        pd = 0xFFFF
+        payload_vf = 0xFF
+        rights = 0x1F
+        mem_type = 3
+        host_page = 3
+        address_mode = 1
+        invalidate = 1
+        length = 0x3FFFFFFFFFFF
+        start_va = 0xFFFFFFFFFFFFFFFF
+        payload_pba = 0xFFFFFFFFFFFFF
+        first_pbl = 0xFFFFFFF
+        mr_sn = 0xFFF
+        pbl_tail = {
+            0: f"pba0={payload_pba:#x}",
+            1: f"pba0={payload_pba:#x},pba1={payload_pba:#x}",
+            2: f"first_pbl={first_pbl:#x}",
+        }[pbl]
+        summary = (f"opcode={variant},stag={stag:#x},state={state},key={key:#x},"
+                   f"parent={'self' if key_alloc else '0'},pd={pd:#x},"
+                   f"payload_vf={payload_vf:#x},"
+                   f"payload_vf_en=1,rights={rights:#x},type={mem_type},"
+                   f"host_page={host_page},pbl={pbl},address_mode={address_mode},"
+                   f"invalidate={invalidate},length={length:#x},odp=1,"
+                   f"start_va={start_va:#x},{pbl_tail},mr_sn={mr_sn:#x}")
+        fields = [
+            ("XTR_V1_MRT_BODY_STAG_IDX", stag), ("XTR_V1_MRT_BODY_NXT_ST", state),
+            ("XTR_V1_MRT_BODY_STAG_KEY", key), ("XTR_V1_MRT_BODY_PD_IDX", pd),
+            ("XTR_V1_MRT_BODY_PLD_VF_ID", payload_vf), ("XTR_V1_MRT_BODY_PLD_VF_EN", 1),
+            ("XTR_V1_MRT_BODY_RIGHT", rights), ("XTR_V1_MRT_BODY_TYPE", mem_type),
+            ("XTR_V1_MRT_BODY_HOST_PG_SIZE", host_page), ("XTR_V1_MRT_BODY_PBL_MODE", pbl),
+            ("XTR_V1_MRT_BODY_ADDR_MODE", address_mode),
+            ("XTR_V1_MRT_BODY_INVALIDATE_EN", invalidate),
+            ("XTR_V1_MRT_BODY_ST", state), ("XTR_V1_MRT_BODY_LEN", length),
+            ("XTR_V1_MRT_BODY_ODP", 1), ("XTR_V1_MRT_BODY_INFO_STAG_KEY", key),
+            ("XTR_V1_MRT_BODY_START_VA", start_va),
+            ("XTR_V1_MRT_BODY_MR_SN", mr_sn),
+        ]
+        if key_alloc:
+            fields.append(("XTR_V1_MRT_BODY_PARENT_STAG_IDX", stag))
+        if pbl == 2:
+            fields.append(("XTR_V1_MRT_BODY_FIRST_PBL_IDX", first_pbl))
+        else:
+            fields.append(("XTR_V1_MRT_BODY_PAYLOAD_PBA0", payload_pba))
+        if pbl == 1:
+            fields.append(("XTR_V1_MRT_BODY_PAYLOAD_PBA1", payload_pba))
+        image = ReferenceImage(64)
+        for stem, value in fields:
+            put_named(image, stem, value)
+        return GoldenCase(name, parse_input_summary(summary), bytes(image))
+
+    mrt_pbl0 = make_mrt("mrt_register_pbl0_boundary", 0, False)
+    mrt_pbl1 = make_mrt("mrt_register_pbl1_boundary", 1, False)
+    mrt_pbl2 = make_mrt("mrt_register_pbl2_boundary", 2, False)
+    mrt_key = make_mrt("mrt_key_alloc_pbl0_boundary", 0, True)
+
+    srqc = make_case("srqc_create_body_boundary", 64, (
+        ("XTR_V1_SRQC_BODY_SRFQN", 0xFFFF, "srfqn=0xffff"),
+        ("XTR_V1_SRQC_BODY_SRFQ_ST", 3, "state=3"),
+        ("XTR_V1_SRQC_BODY_LOAD_SRFQ_PI_TH", 0xFF, "load_pi=0xff"),
+        ("XTR_V1_SRQC_BODY_SHADOW_PA", 0xFFFFFFFFFFFFF, "shadow=0xfffffffffffff"),
+        ("XTR_V1_SRQC_BODY_PD_IDX", 0xFFFF, "pd=0xffff"),
+        ("XTR_V1_SRQC_BODY_SRFQ_PBA", 0xFFFFFFFFFFFFF, "pba=0xfffffffffffff"),
+        ("XTR_V1_SRQC_BODY_SRFQ_SIZE", 0xF, "size=0xf"),
+        ("XTR_V1_SRQC_BODY_SRFQ_OM", 3, "mode=3"),
+        ("XTR_V1_SRQC_BODY_SRFQ_PI_WRAP", 1, "pi_wrap=1"),
+        ("XTR_V1_SRQC_BODY_SRFQ_PI", 0x7FFF, "pi=0x7fff"),
+        ("XTR_V1_SRQC_BODY_LIMIT_TH", 0x3FFF, "limit=0x3fff"),
+        ("XTR_V1_SRQC_BODY_ARM_SN", 3, "arm_sn=3"),
+    ))
+
+    def make_eq(name: str) -> GoldenCase:
+        return make_case(name, 64, (
+            ("XTR_V1_EQC_BODY_EQN", 0xFFF, "eqn=0xfff"),
+            ("XTR_V1_EQC_BODY_EQ_ST", 3, "state=3"),
+            ("XTR_V1_EQC_BODY_EQ_SIZE", 0x1F, "size=0x1f"),
+            ("XTR_V1_EQC_BODY_NXT_EQ_PBA", 0xFFFFFFFFFFFFF, "next=0xfffffffffffff"),
+            ("XTR_V1_EQC_BODY_CUR_EQ_PBA", 0xFFFFFFFFFFFFF, "current=0xfffffffffffff"),
+            ("XTR_V1_EQC_BODY_CUR_PBA_VLD", 1, "current_valid=1"),
+            ("XTR_V1_EQC_BODY_EQ_PI_WRAP", 1, "pi_wrap=1"),
+            ("XTR_V1_EQC_BODY_EQ_PI", 0x3FFFF, "pi=0x3ffff"),
+            ("XTR_V1_EQC_BODY_EQ_OM", 3, "mode=3"),
+            ("XTR_V1_EQC_BODY_MSI_X_IDX", 0xFFFF, "msix=0xffff"),
+            ("XTR_V1_EQC_BODY_EQ_CI_WRAP", 1, "ci_wrap=1"),
+            ("XTR_V1_EQC_BODY_EQ_CI", 0x3FFFF, "ci=0x3ffff"),
+        ))
+    ceqc = make_eq("ceqc_create_body_boundary")
+    aeqc = make_eq("aeqc_create_body_boundary")
 
     cmq = make_case("qpc_create", 64, (
         ("XTR_V1_CMQ_OPCODE", 0, "opcode=0"),
@@ -737,8 +1583,17 @@ def build_golden_cases() -> dict[str, list[GoldenCase]]:
 
     return {
         "context": [
-            qpc,
+            qpc_rc,
+            qpc_ud,
+            qpc_urc,
             cqc,
+            mrt_pbl0,
+            mrt_pbl1,
+            mrt_pbl2,
+            mrt_key,
+            srqc,
+            ceqc,
+            aeqc,
         ],
         "cmq": [cmq],
         "queue": [
@@ -759,6 +1614,8 @@ def build_golden_cases() -> dict[str, list[GoldenCase]]:
 def render_golden(cases: list[GoldenCase]) -> str:
     lines: list[str] = []
     for index, case in enumerate(cases):
+        if parse_input_summary(case.summary) != case.inputs:
+            raise ValidationError(f"golden input round-trip mismatch for {case.name}")
         if index:
             lines.append("")
         lines.extend(
@@ -771,6 +1628,173 @@ def render_golden(cases: list[GoldenCase]) -> str:
             ]
         )
     return "\n".join(lines) + "\n"
+
+
+def parse_golden_text(text: str) -> list[GoldenCase]:
+    if not text.endswith("\n"):
+        raise ValidationError("golden file must end with one newline")
+    lines = text.splitlines()
+    cases: list[GoldenCase] = []
+    names = set()
+    index = 0
+    while index < len(lines):
+        if index:
+            if lines[index] != "":
+                raise ValidationError("golden cases must have one blank separator")
+            index += 1
+        if index + 5 > len(lines):
+            raise ValidationError("incomplete trailing golden case")
+        marker, case_line, inputs_line, bytes_line, payload_line = lines[index:index + 5]
+        if marker != "# xtr_v1-golden-v1":
+            raise ValidationError("malformed golden format marker")
+        case_match = re.fullmatch(r"# case: ([a-z0-9_]+)", case_line)
+        inputs_match = re.fullmatch(r"# inputs: (\S+)", inputs_line)
+        bytes_match = re.fullmatch(r"# bytes: ([1-9][0-9]*)", bytes_line)
+        if not case_match or not inputs_match or not bytes_match:
+            raise ValidationError("malformed golden case header")
+        name = case_match.group(1)
+        if name in names:
+            raise ValidationError(f"duplicate golden case name: {name}")
+        names.add(name)
+        if not re.fullmatch(r"[0-9a-f]{2}(?: [0-9a-f]{2})*", payload_line):
+            raise ValidationError(f"malformed hex payload for {name}")
+        payload = bytes(int(token, 16) for token in payload_line.split(" "))
+        byte_count = int(bytes_match.group(1))
+        if len(payload) != byte_count:
+            raise ValidationError(
+                f"golden case {name} has {len(payload)} payload bytes, expected {byte_count}"
+            )
+        inputs = parse_input_summary(inputs_match.group(1))
+        cases.append(GoldenCase(name, inputs, payload))
+        index += 5
+    if not cases:
+        raise ValidationError("golden file has no cases")
+    if render_golden(cases) != text:
+        raise ValidationError("golden file is not in canonical form")
+    return cases
+
+
+def validate_context_contract(cases: list[GoldenCase]) -> None:
+    def inputs_by_name(case: GoldenCase) -> dict[str, str]:
+        return {item.name: item.value for item in case.inputs}
+
+    def numeric_input(case: GoldenCase, name: str) -> int:
+        value = inputs_by_name(case).get(name)
+        if value is None or re.fullmatch(r"(?:0x[0-9a-f]+|[0-9]+)", value) is None:
+            raise ValidationError(f"{case.name} missing numeric input {name}")
+        return int(value, 0)
+
+    def field_value(case: GoldenCase, stem: str) -> int:
+        reference = REFERENCE_BY_STEM[stem]
+        word = int.from_bytes(
+            case.payload[
+                reference.word_byte_offset:reference.word_byte_offset + 8
+            ],
+            "big",
+        )
+        return (word >> reference.lsb) & ((1 << reference.width) - 1)
+
+    expected_names = [
+        "qpc_rc_boundary", "qpc_ud_boundary", "qpc_urc_boundary",
+        "cqc_create_body_boundary", "mrt_register_pbl0_boundary",
+        "mrt_register_pbl1_boundary", "mrt_register_pbl2_boundary",
+        "mrt_key_alloc_pbl0_boundary", "srqc_create_body_boundary",
+        "ceqc_create_body_boundary", "aeqc_create_body_boundary",
+    ]
+    if [case.name for case in cases] != expected_names:
+        raise ValidationError("context golden case order/name contract drift")
+    if [len(case.payload) for case in cases] != [512, 512, 512] + [64] * 8:
+        raise ValidationError("context golden byte-count contract drift")
+
+    transport_codes = {"rc": 0, "ud": 3, "urc": 6}
+    for case in cases[:3]:
+        transport = inputs_by_name(case).get("transport")
+        if transport not in transport_codes:
+            raise ValidationError(f"{case.name} transport input is unsupported")
+        if field_value(case, "XTR_V1_QPC_SERVICE_TYPE") != transport_codes[transport]:
+            raise ValidationError(f"{case.name} transport/service-type mismatch")
+
+    mask_keys = [
+        "cqc_create", "mrt_register_pbl0", "mrt_register_pbl1",
+        "mrt_register_pbl2", "mrt_key_alloc_pbl0", "srqc_create",
+        "ceqc_create", "aeqc_create",
+    ]
+    for case, mask_key in zip(cases[3:], mask_keys):
+        mask = BODY_MASKS[mask_key]
+        for word_index, allowed in enumerate(mask):
+            word = int.from_bytes(case.payload[word_index * 8:(word_index + 1) * 8], "big")
+            if word & ~allowed:
+                raise ValidationError(
+                    f"{case.name} has nonzero data outside {mask_key} body mask"
+                )
+            if allowed & ENVELOPE_MASK[word_index]:
+                raise ValidationError(f"{mask_key} body overlaps request envelope")
+
+    rc = cases[0]
+    for stem in (
+        "XTR_V1_QPC_RC_TPE_CUR_SQ_PSN", "XTR_V1_QPC_RC_LAST_READ_PSN",
+        "XTR_V1_QPC_RC_PSN_MAX_RPE", "XTR_V1_QPC_RC_EPSN_RSP",
+        "XTR_V1_QPC2_RC_EPSN_RSP", "XTR_V1_QPC_RC_PSN_MAX_TPE",
+        "XTR_V1_QPC_RC_RETRY_FPSN", "XTR_V1_QPC_RC_RETRY_PSN",
+    ):
+        if field_value(rc, stem) != numeric_input(rc, "send_psn"):
+            raise ValidationError(f"{rc.name} send PSN/input mismatch at {stem}")
+    for stem in (
+        "XTR_V1_QPC_RC_EIRQ_PSN_MAX", "XTR_V1_QPC_EIRQ_CUR_SEND_PSN",
+        "XTR_V1_QPC_EPSN_REQ",
+    ):
+        if field_value(rc, stem) != numeric_input(rc, "recv_psn"):
+            raise ValidationError(f"{rc.name} recv PSN/input mismatch at {stem}")
+
+    ud = cases[1]
+    qkey = ((field_value(ud, "XTR_V1_QPC_UD_QKEY_H") << 24)
+            | field_value(ud, "XTR_V1_QPC_UD_QKEY_L"))
+    if qkey != numeric_input(ud, "qkey"):
+        raise ValidationError(f"{ud.name} split QKey/input mismatch")
+    if ud.payload[80:96].hex() != inputs_by_name(ud).get("dest_ip"):
+        raise ValidationError(f"{ud.name} destination IP/input mismatch")
+
+    urc = cases[2]
+    rsq_pba = ((field_value(urc, "XTR_V1_QPC_URC_RSQ_PBA_H") << 48)
+               | field_value(urc, "XTR_V1_QPC_URC_RSQ_PBA_L"))
+    dsq_pba = ((field_value(urc, "XTR_V1_QPC_URC_CUR_DSQ_PBA_H") << 12)
+               | field_value(urc, "XTR_V1_QPC_URC_CUR_DSQ_PBA_L"))
+    if rsq_pba != numeric_input(urc, "rsq_pba"):
+        raise ValidationError(f"{urc.name} split RSQ address/input mismatch")
+    if dsq_pba != numeric_input(urc, "dsq_pba"):
+        raise ValidationError(f"{urc.name} split DSQ address/input mismatch")
+    if field_value(urc, "XTR_V1_QPC_URC_NXT_DSQ_PBA") != dsq_pba + 1:
+        raise ValidationError(f"{urc.name} derived next DSQ address mismatch")
+
+    for case in cases[4:8]:
+        q0 = int.from_bytes(case.payload[0:8], "big")
+        q1 = int.from_bytes(case.payload[8:16], "big")
+        q2 = int.from_bytes(case.payload[16:24], "big")
+        q3 = int.from_bytes(case.payload[24:32], "big")
+        if ((q0 >> 61) & 3) != ((q2 >> 62) & 3):
+            raise ValidationError(f"{case.name} repeated MRT state mismatch")
+        if ((q0 >> 61) & 3) != numeric_input(case, "state"):
+            raise ValidationError(f"{case.name} MRT state/input mismatch")
+        if ((q1 >> 24) & 0xFF) != ((q3 >> 56) & 0xFF):
+            raise ValidationError(f"{case.name} repeated MRT STAG key mismatch")
+        if ((q1 >> 24) & 0xFF) != numeric_input(case, "key"):
+            raise ValidationError(f"{case.name} MRT STAG key/input mismatch")
+        parent = q2 & 0xFFFFFF
+        stag = q0 & 0xFFFFFF
+        if stag != numeric_input(case, "stag"):
+            raise ValidationError(f"{case.name} MRT STAG/input mismatch")
+        if ((q2 >> 58) & 3) != numeric_input(case, "pbl"):
+            raise ValidationError(f"{case.name} MRT PBL/input mismatch")
+        if case.name == "mrt_key_alloc_pbl0_boundary":
+            if (inputs_by_name(case).get("opcode") != "key_alloc"
+                    or inputs_by_name(case).get("parent") != "self"
+                    or parent != stag):
+                raise ValidationError("KEY_ALLOC self-parent STAG mismatch")
+        elif (inputs_by_name(case).get("opcode") != "mr_register"
+              or inputs_by_name(case).get("parent") != "0" or parent != 0):
+            raise ValidationError("MR_REGISTER parent STAG field must be zero")
+
+    validate_body_translations(BODY_TRANSLATIONS, FIELD_MAPPINGS)
 
 
 def load_manifest() -> list[tuple[str, str, str, str]]:
@@ -821,6 +1845,8 @@ def validate_git_head(kernel_root: Path) -> None:
 
 def validate(kernel_root: Path) -> None:
     validate_git_head(kernel_root)
+    validate_mapping_uniqueness(FIELD_MAPPINGS, VALUE_MAPPINGS, REFERENCE_FIELDS)
+    validate_body_translations(BODY_TRANSLATIONS, FIELD_MAPPINGS)
     rows = load_manifest()
     seen_rows = set()
     source_text: dict[str, str] = {}
@@ -851,13 +1877,20 @@ def validate(kernel_root: Path) -> None:
             raise ValidationError(f"pinned source {path} has no manifest row")
 
     parsed_sources = {path: parse_c_symbols(text) for path, text in source_text.items()}
+    validate_access_projections(source_text["rdma_main.h"])
     sv_constants = parse_sv_constants(SV_DEFS_PATH.read_text())
+    sv_mask_text = SV_MASKS_PATH.read_text()
+    validate_sv_mask_api(sv_mask_text)
+    sv_masks = parse_sv_masks(sv_mask_text)
     expected_constants: dict[str, int] = dict(PROFILE_VALUES)
     parsed_fields: dict[str, tuple[str, str, int, int]] = {}
     for mapping in FIELD_MAPPINGS:
         macros, _ = parsed_sources[mapping.path]
         expression = require_unique_expression(macros, mapping.c_symbol, mapping.path)
         lsb, width = parse_field_expression(expression)
+        lsb += mapping.lsb_adjust
+        if lsb + width > 64:
+            raise ValidationError(f"translated field exceeds qword: {mapping.sv_stem}")
         parsed_fields[mapping.sv_stem] = (
             mapping.path,
             mapping.c_symbol,
@@ -889,13 +1922,33 @@ def validate(kernel_root: Path) -> None:
                 f"SV constant mismatch for {name}: {sv_constants[name]:#x} != {expected:#x}"
             )
 
+    expected_masks = {
+        "XTR_V1_CMQ_ENVELOPE_MASK": ENVELOPE_MASK,
+        "XTR_V1_CQC_CREATE_BODY_MASK": BODY_MASKS["cqc_create"],
+        "XTR_V1_MRT_REGISTER_PBL0_BODY_MASK": BODY_MASKS["mrt_register_pbl0"],
+        "XTR_V1_MRT_REGISTER_PBL1_BODY_MASK": BODY_MASKS["mrt_register_pbl1"],
+        "XTR_V1_MRT_REGISTER_PBL2_BODY_MASK": BODY_MASKS["mrt_register_pbl2"],
+        "XTR_V1_MRT_KEY_ALLOC_PBL0_BODY_MASK": BODY_MASKS["mrt_key_alloc_pbl0"],
+        "XTR_V1_SRQC_CREATE_BODY_MASK": BODY_MASKS["srqc_create"],
+        "XTR_V1_CEQC_CREATE_BODY_MASK": BODY_MASKS["ceqc_create"],
+        "XTR_V1_AEQC_CREATE_BODY_MASK": BODY_MASKS["aeqc_create"],
+    }
+    if sv_masks != expected_masks:
+        raise ValidationError("SV image mask lookup differs from independent reference")
+
     for kind, cases in build_golden_cases().items():
         expected = render_golden(cases).encode()
         golden_path = GOLDEN_DIR / f"{kind}.hex"
         if not golden_path.is_file():
             raise ValidationError(f"golden file missing: {golden_path.relative_to(REPO_ROOT)}")
-        if golden_path.read_bytes() != expected:
+        actual_bytes = golden_path.read_bytes()
+        if actual_bytes != expected:
             raise ValidationError(f"golden byte mismatch: {golden_path.relative_to(REPO_ROOT)}")
+        parsed_cases = parse_golden_text(actual_bytes.decode("ascii"))
+        if parsed_cases != cases:
+            raise ValidationError(f"golden parsed contract mismatch: {golden_path.relative_to(REPO_ROOT)}")
+        if kind == "context":
+            validate_context_contract(parsed_cases)
 
 
 def main(argv: list[str] | None = None) -> int:

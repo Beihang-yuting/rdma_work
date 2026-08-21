@@ -27,14 +27,21 @@ xtr_defs:
 	fi; \
 	cleanup() { \
 		command_status=$$?; \
+		cleanup_status=0; \
 		trap - EXIT; \
 		if [[ "$$ref_dir" =~ ^/tmp/rdma_xtr_v1_ref\.[A-Za-z0-9]{6}$$ && -d "$$ref_dir" ]]; then \
-			rm -rf -- "$$ref_dir"; \
+			if ! rm -rf -- "$$ref_dir"; then \
+				echo "Failed to remove xtr_v1 reference directory: $$ref_dir" >&2; \
+				cleanup_status=1; \
+			fi; \
 		else \
 			echo "Refusing to remove unexpected xtr_v1 reference directory: $$ref_dir" >&2; \
-			command_status=1; \
+			cleanup_status=1; \
 		fi; \
-		exit $$command_status; \
+		if [[ "$$command_status" != 0 ]]; then \
+			exit $$command_status; \
+		fi; \
+		exit $$cleanup_status; \
 	}; \
 	trap cleanup EXIT; \
 	unzip -q "$(XTR_V1_ARCHIVE)" "$(XTR_V1_ARCHIVE_PREFIX)/*" -d "$$ref_dir"; \
