@@ -32,9 +32,9 @@ is fatal and is never evaluated as Python or C.
 
 | Image/case | Bytes | Memory endian | Authoritative source and field group | Golden contract lines and fixed input summary |
 |---|---:|---|---|---|
-| QPC `qpc_rc_boundary`, `qpc_ud_boundary`, `qpc_urc_boundary` | 512 each | big-endian per 64-bit qword; destination IP remains driver `memcpy` byte order | `qp.h` `XTRDMA_QPC_*`; byte placement from `qp.c:xtrdma_fill_rc_ud_qpc_info` and `xtrdma_fill_urc_qpc_info` | First three `context.hex` cases. Inputs freeze transport-specific backing, address-vector, PSN/sequence mirrors, thresholds and queue IDs. |
+| QPC `qpc_rc_boundary`, `qpc_ud_boundary`, `qpc_urc_boundary` | 512 each | big-endian per 64-bit qword; destination IP remains driver `memcpy` byte order | `qp.h` `XTRDMA_QPC_*`; byte placement from `qp.c:xtrdma_fill_rc_ud_qpc_info` and `xtrdma_fill_urc_qpc_info` | First three `context.hex` cases. Inputs freeze transport-specific backing, traffic class, address-vector, PSN/sequence mirrors, thresholds and queue IDs. `ICOS=traffic_class[7:5]`, `DSCP=traffic_class[7:2]`; UD ECN is 0 and RC/URC ECN is 2. |
 | CQC `cqc_create_body_boundary` | 64 | big-endian per 64-bit qword | `cq.h` `XTRDMA_CMQ_CQC_*`, `cmq.h` CQN; `cq.c` local stores copied by `cmq.c:xtrdma_sc_cq_create` | Final sparse WQE coordinates: local byte 0..55 becomes byte 8..63. |
-| MRT register/key allocate, PBL0/1/2 | 64 each | big-endian per 64-bit qword | `cmq.h` `XTRDMA_CQPSQ_MRT_*`; `mr.c:xtrdma_hwreg_mr`, `cmq.c:xtrdma_sc_mr_register` | Four ordered cases freeze MR_REGISTER PBL0/1/2 plus KEY_ALLOC PBL0. KEY_ALLOC byte 16 bits 23:0 repeats its STAG; MR_REGISTER keeps them zero. |
+| MRT register/key allocate, PBL0/1/2 | 64 each | big-endian per 64-bit qword | `cmq.h` `XTRDMA_CQPSQ_MRT_*`; `mr.c:xtrdma_hwreg_mr`, `cmq.c:xtrdma_sc_mr_register` | Four ordered cases freeze MR_REGISTER (`0x05`) PBL0/1/2 plus KEY_ALLOC (`0x04`) PBL0. KEY_ALLOC byte 16 bits 23:0 repeats its STAG; MR_REGISTER keeps them zero. |
 | SRQC `srqc_create_body_boundary` | 64 | big-endian per 64-bit qword | `srq.h` `XTRDMA_SRFQ_CTX_*`; `srq.c:xtrdma_hw_create_srfqc` | Final sparse WQE coordinates: local byte 0..31 becomes byte 16..47. |
 | CEQC/AEQC create body boundaries | 64 each | big-endian per 64-bit qword | `event.h` `XTRDMA_EQ_CTX_*`; `event.c:xtrdma_hw_create_eq` | Shared EQC layout at final byte 16..47, with distinct case/opcode/image ownership. |
 | CMQ `qpc_create` | 64 | big-endian per 64-bit qword | `cmq.h` common/QPC fields and `xtrdma_cmq_opcode`; byte placement from `cmq.c` | `cmq.hex`: case 2, inputs 3, length 4, payload 5; `opcode=0,qpn=0x654321,index=27,valid=1,vfid_override=1,use_vfid=0x345,wrap=1,sq_cqn=0x15555,sign=1,rq_cqn=0xaaaa,buffer=0x123456789ab` |
@@ -53,7 +53,9 @@ blank line.  The checker independently regenerates the complete file and
 requires byte-for-byte equality. `context.hex` contains exactly 11 cases in the
 order listed above: three 512-byte QPC images followed by eight 64-byte sparse
 bodies. Both the Python and SystemVerilog readers reject duplicate names,
-malformed/truncated/extra bytes, and incomplete trailing cases.
+malformed/truncated/extra bytes, and incomplete trailing cases. The SV reader
+parses into a private queue and publishes no cases unless the complete file is
+valid.
 
 ## Request envelope and sparse-body ownership
 
@@ -75,7 +77,10 @@ The context value baseline also freezes allocation modes direct/indirect/huge/
 L3-indirect as `0/1/2/3`; MR VA/zero-based addressing as `0/1`; MR
 invalid/free/valid as `0/1/2`; 4KiB/2MiB/1GiB pages and PBL0/PBL1/PBL2 as
 `0/1/2`; and MR/MW-type1/MW-type2B as `0/1/2`. CQC, SRQC, and EQC
-invalid/valid/error states are `0/1/2`. Hardware RDMA rights are independent
+invalid/valid/error states are `0/1/2`, and CQC arm states are `0/1/2`.
+Context body goldens use only these supported values (including CQE-size index
+`2`) so Task 10 can round-trip them through the frozen semantic mappings.
+Hardware RDMA rights are independent
 bits local-write `0x01`, remote-read `0x02`, remote-write `0x04`, MW-bind
 `0x08`, and remote-atomic `0x10`; the pinned `xtrdma_get_access` projection
 also freezes the rule that remote-write or remote-atomic implies local-write.
@@ -84,6 +89,9 @@ also freezes the rule that remote-write or remote-atomic implies local-write.
 
 - QPC is 512 bytes (`XTRDMA_QP_CONTEXT_SIZE`), CQC is 64 bytes
   (`XTRDMA_CQ_CONTEXT_SIZE`), and CMQE/WQE are 64 bytes.
+- The QPC destination-IP byte range is independently frozen and checked as
+  `XTR_V1_QPC_DEST_IP_BYTE_OFFSET=80` and `XTR_V1_QPC_DEST_IP_BYTES=16`;
+  golden construction and validation both consume that profile metadata.
 - CEQE and AEQE are 16 bytes.  The frozen queue profile selects a 64-byte CQE.
 - `defs.h` supplies CEQE/AEQE fields and representative error codes used by
   the later error codec.

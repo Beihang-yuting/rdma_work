@@ -4,7 +4,10 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 from pathlib import Path
+import subprocess
+import tempfile
 import unittest
 
 
@@ -102,6 +105,33 @@ localparam bit [63:0] XTR_V1_WINDOW = 64'h2000;
                 CHECKER.REFERENCE_FIELDS,
             )
 
+        colliding_value = first_value._replace(
+            c_symbol="OTHER_CROSS_TABLE_VALUE",
+            sv_name=f"{first_field.sv_stem}_OFFSET",
+        )
+        with self.assertRaisesRegex(CHECKER.ValidationError, "global SV constant"):
+            validate(
+                CHECKER.FIELD_MAPPINGS,
+                CHECKER.VALUE_MAPPINGS + (colliding_value,),
+                CHECKER.REFERENCE_FIELDS,
+            )
+
+        reference_stem = "XTR_V1_TEST_REFERENCE_COLLISION"
+        colliding_reference = CHECKER.REFERENCE_FIELDS[0]._replace(
+            c_symbol="OTHER_CROSS_TABLE_REFERENCE",
+            sv_stem=reference_stem,
+        )
+        colliding_value = first_value._replace(
+            c_symbol="OTHER_REFERENCE_VALUE",
+            sv_name=f"{reference_stem}_OFFSET",
+        )
+        with self.assertRaisesRegex(CHECKER.ValidationError, "global SV constant"):
+            validate(
+                CHECKER.FIELD_MAPPINGS,
+                CHECKER.VALUE_MAPPINGS + (colliding_value,),
+                CHECKER.REFERENCE_FIELDS + (colliding_reference,),
+            )
+
     def test_field_declaration_expands_to_auditable_coordinates(self) -> None:
         constants = CHECKER.parse_sv_constants(
             "`XTR_V1_FIELD(XTR_V1_QPC_QPN, 0, 16, 21)\n"
@@ -160,20 +190,47 @@ localparam bit [63:0] XTR_V1_WINDOW = 64'h2000;
 
 class MakefileCleanupTest(unittest.TestCase):
     def test_xtr_defs_cleanup_preserves_command_failure_and_reports_delete_failure(self) -> None:
-        text = (REPO_ROOT / "sim" / "Makefile").read_text()
-        recipe = text[text.index("xtr_defs:"):text.index("\nhost_mem_preflight:")]
-        self.assertIn("command_status=$$?", recipe)
-        self.assertIn("cleanup_status=0", recipe)
-        self.assertIn("if ! rm -rf -- \"$$ref_dir\"; then", recipe)
-        self.assertIn("cleanup_status=1", recipe)
-        self.assertRegex(
-            recipe,
-            r'(?s)if \[\[ "\$\$command_status" != 0 \]\]; then.*?'
-            r'exit \$\$command_status;.*?exit \$\$cleanup_status;',
-        )
-        self.assertIn(
-            '^/tmp/rdma_xtr_v1_ref\\.[A-Za-z0-9]{6}$$', recipe
-        )
+        sim_dir = REPO_ROOT / "sim"
+        rendered = subprocess.run(
+            ["make", "--no-print-directory", "-n", "xtr_defs"],
+            cwd=sim_dir,
+            check=True,
+            text=True,
+            stdout=subprocess.PIPE,
+        ).stdout
+
+        with tempfile.TemporaryDirectory(prefix="rdma_xtr_v1_cleanup_test.") as temp:
+            bin_dir = Path(temp)
+            (bin_dir / "unzip").write_text("#!/bin/bash\nexit 0\n")
+            (bin_dir / "python3").write_text(
+                "#!/bin/bash\nexit \"${XTR_TEST_COMMAND_STATUS:?}\"\n"
+            )
+            # Remove the exact empty mktemp directory, but deliberately report
+            # failure so the real recipe's EXIT trap must choose the status.
+            (bin_dir / "rm").write_text(
+                "#!/bin/bash\n/bin/rmdir \"$3\" || exit 99\nexit 1\n"
+            )
+            for command in ("unzip", "python3", "rm"):
+                (bin_dir / command).chmod(0o755)
+
+            for command_status, expected in ((0, 1), (7, 7)):
+                with self.subTest(command_status=command_status):
+                    env = os.environ.copy()
+                    env["PATH"] = f"{bin_dir}:/usr/bin:/bin"
+                    env["XTR_TEST_COMMAND_STATUS"] = str(command_status)
+                    completed = subprocess.run(
+                        ["/bin/bash", "-o", "pipefail", "-c", rendered],
+                        cwd=sim_dir,
+                        env=env,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                    )
+                    self.assertEqual(completed.returncode, expected, completed.stderr)
+                    self.assertIn(
+                        "Failed to remove xtr_v1 reference directory",
+                        completed.stderr,
+                    )
 
 
 class ReferenceEncodingTest(unittest.TestCase):
@@ -184,6 +241,48 @@ class ReferenceEncodingTest(unittest.TestCase):
     def require_checker_attribute(self, name: str):
         self.assertTrue(hasattr(CHECKER, name), f"checker has no {name}")
         return getattr(CHECKER, name)
+
+    def field_value(self, case, stem: str) -> int:
+        reference = CHECKER.REFERENCE_BY_STEM[stem]
+        word = int.from_bytes(
+            case.payload[
+                reference.word_byte_offset:reference.word_byte_offset + 8
+            ],
+            "big",
+        )
+        return (word >> reference.lsb) & ((1 << reference.width) - 1)
+
+    def mutate_field(self, case, stem: str):
+        reference = CHECKER.REFERENCE_BY_STEM[stem]
+        current = self.field_value(case, stem)
+        return self.set_field(case, stem, current ^ 1)
+
+    def set_field(self, case, stem: str, value: int):
+        reference = CHECKER.REFERENCE_BY_STEM[stem]
+        start = reference.word_byte_offset
+        image = bytearray(case.payload)
+        word = int.from_bytes(image[start:start + 8], "big")
+        mask = ((1 << reference.width) - 1) << reference.lsb
+        word = (word & ~mask) | (value << reference.lsb)
+        image[start:start + 8] = word.to_bytes(8, "big")
+        return case._replace(payload=bytes(image))
+
+    def mutate_input(self, case, name: str):
+        inputs = []
+        for item in case.inputs:
+            if item.name != name:
+                inputs.append(item)
+                continue
+            replacements = {
+                "mr_register": "key_alloc",
+                "key_alloc": "mr_register",
+                "self": "0",
+            }
+            value = replacements.get(item.value)
+            if value is None:
+                value = hex(int(item.value, 0) ^ 1)
+            inputs.append(CHECKER.GoldenInput(item.name, value))
+        return case._replace(inputs=tuple(inputs))
 
     def test_absolute_offsets_use_big_endian_driver_qwords(self) -> None:
         image = self.make_reference_image(16)
@@ -273,6 +372,33 @@ class ReferenceEncodingTest(unittest.TestCase):
                     (drifted,) + references[1:], CHECKER.FIELD_MAPPINGS
                 )
 
+    def test_destination_ip_profile_constants_are_checked_and_drive_placement(self) -> None:
+        validate_profile = self.require_checker_attribute(
+            "validate_profile_constants"
+        )
+        sv_constants = CHECKER.parse_sv_constants(
+            (REPO_ROOT / "src/codec/xtr_v1/rdma_xtr_v1_defs.svh").read_text()
+        )
+        validate_profile(sv_constants, CHECKER.PROFILE_VALUES)
+        self.assertEqual(CHECKER.PROFILE_VALUES["XTR_V1_QPC_DEST_IP_BYTE_OFFSET"], 80)
+        self.assertEqual(CHECKER.PROFILE_VALUES["XTR_V1_QPC_DEST_IP_BYTES"], 16)
+
+        drifted = dict(CHECKER.PROFILE_VALUES)
+        drifted["XTR_V1_QPC_DEST_IP_BYTE_OFFSET"] += 1
+        with self.assertRaisesRegex(CHECKER.ValidationError, "profile constant"):
+            validate_profile(sv_constants, drifted)
+
+        saved_offset = CHECKER.PROFILE_VALUES["XTR_V1_QPC_DEST_IP_BYTE_OFFSET"]
+        try:
+            CHECKER.PROFILE_VALUES["XTR_V1_QPC_DEST_IP_BYTE_OFFSET"] = 81
+            ud = CHECKER.build_golden_cases()["context"][1]
+        finally:
+            CHECKER.PROFILE_VALUES["XTR_V1_QPC_DEST_IP_BYTE_OFFSET"] = saved_offset
+        self.assertEqual(
+            ud.payload[81:97],
+            bytes.fromhex("20010db8000000000000000000000001"),
+        )
+
     def test_every_golden_field_has_explicit_reference_placement(self) -> None:
         references = self.require_checker_attribute("REFERENCE_FIELDS")
         reference_stems = [reference.sv_stem for reference in references]
@@ -328,7 +454,7 @@ class ReferenceEncodingTest(unittest.TestCase):
         self.assertEqual(len(cases["doorbell"][0].payload), 8)
         self.assertEqual(
             context_cases[0].payload[:8],
-            bytes.fromhex("605abc615555a500"),
+            bytes.fromhex("605abca15555a500"),
         )
 
     def test_context_case_summaries_are_an_immutable_input_contract(self) -> None:
@@ -345,17 +471,17 @@ class ReferenceEncodingTest(unittest.TestCase):
                     case.summary = "drift"
         summaries = [case.summary for case in context_cases]
         self.assertEqual(summaries, [
-            "transport=rc,tver=1,mig=1,host=5,vf=0xabc,icos=3,qpn=0x15555,stat_idx=0xa5,pkey=0xbeef,shadow_pba=0x123456789ab,tx_swap=1,rx_swap=1,sq_ce=1,ra_fence=1,aa_fence=1,fc=1,state=3,pmtu=5,retry_count=7,rnr_retry=7,qp_sn=0xc3,srfq=1,srfqn=0x4567,pd=0xa55a,access=0x1f,dst_qpn=0x654321,dmac=0x112233445566,vlan_id=0xabc,flow=0xabcde,dscp=0x2a,ecn=2,hop=0x40,udp_sport=0xc123,send_psn=0xabcdef,recv_psn=0x123456,sq_pba=0x123456789abcd,sq_size=11,sq_om=2,sq_cqn=0xabcde,rq_cqn=0x54321,rq_pba=0x0fedcba987654,rq_size=10,rq_om=1",
-            "transport=ud,tver=1,mig=0,host=6,vf=0x345,icos=5,qpn=0x2aaaa,stat_idx=0x5a,qkey=0x89abcdef,pkey=0x1234,shadow_pba=0x0fedcba9876,tx_swap=1,rx_swap=1,state=3,pmtu=4,qp_sn=0x7e,pd=0x5aa5,vlan=1,ipv6=1,tunnel=1,lag=1,fwd=2,dst_vport=0x456,src_addr=0xabc,dst_port=0xb,dst_qpn=0xabcdef,dmac=0xa1b2c3d4e5f6,pri=5,cfi=1,vlan_id=0x789,src_vport=0x345,flow=0x54321,dscp=0x2b,ecn=0,hop=0x7f,udp_sport=0xbeef,dest_ip=20010db8000000000000000000000001,sq_pba=0x1111122222333,sq_size=9,sq_om=3,sq_cqn=0x13579,rq_cqn=0x2468a,rq_pba=0x4444455555666,rq_size=8,rq_om=2",
-            "transport=urc,tver=1,mig=1,host=7,vf=0x789,icos=7,qpn=0x3ffff,stat_idx=0xff,rsq_pba=0x123456789abcd,pkey=0xabcd,shadow_pba=0x123456789ab,state=3,pmtu=5,qp_sn=0xfe,pd=0xffff,rdsq_pba=0x23456789abcde,rdsq_size=7,tx_rbsn=0xabcdef,tx_dbsn=0x654321,rx_rbsn=0x123456,rx_dbsn=0xfedcba,rx_srbsn=0x345678,cur_dpsn=0x456789,cur_rpsn=0x56789a,rxed_dbsn=0x6789ab,rq_se_th=0xf,sq_ce_th=0xe,tx_srbsn=0x789abc,max_tx_srbsn=0x89abcd,dsq_pba=0x3456789abcdef,tpe_rpsn_max=0x9abcde,tpe_dpsn_max=0xabcdef,dsq_fetch=0x3f,sq_pba=0x456789abcdef0,sq_size=0xf,sq_om=3,sq_cqn=0xfffff,rq_cqn=0xabcde,rq_pba=0x56789abcdef01,rq_size=0xe,rq_om=2",
-            "cqn=0x1fffff,sd_pba=0xfffffffffffff,size=0x1f,urc=1,state=3,next_hi=0xff,cur_valid=1,cur_pba=0xfffffffffffff,load_ci=1,threshold=7,mode=3,next_valid=1,next_lo=0xfffffffffff,pi=0x7fffff,pi_wrap=1,last_arm=3,cqe_size=3,ceqn=0xfff,shadow=0x3ffffffffffffff,ci=0x7fffff,ci_wrap=1,arm_sn=3,arm_state=3",
-            "opcode=mr_register,stag=0xffffff,state=3,key=0xff,parent=0,pd=0xffff,payload_vf=0xff,payload_vf_en=1,rights=0x1f,type=3,host_page=3,pbl=0,address_mode=1,invalidate=1,length=0x3fffffffffff,odp=1,start_va=0xffffffffffffffff,pba0=0xfffffffffffff,mr_sn=0xfff",
-            "opcode=mr_register,stag=0xffffff,state=3,key=0xff,parent=0,pd=0xffff,payload_vf=0xff,payload_vf_en=1,rights=0x1f,type=3,host_page=3,pbl=1,address_mode=1,invalidate=1,length=0x3fffffffffff,odp=1,start_va=0xffffffffffffffff,pba0=0xfffffffffffff,pba1=0xfffffffffffff,mr_sn=0xfff",
-            "opcode=mr_register,stag=0xffffff,state=3,key=0xff,parent=0,pd=0xffff,payload_vf=0xff,payload_vf_en=1,rights=0x1f,type=3,host_page=3,pbl=2,address_mode=1,invalidate=1,length=0x3fffffffffff,odp=1,start_va=0xffffffffffffffff,first_pbl=0xfffffff,mr_sn=0xfff",
-            "opcode=key_alloc,stag=0xffffff,state=3,key=0xff,parent=self,pd=0xffff,payload_vf=0xff,payload_vf_en=1,rights=0x1f,type=3,host_page=3,pbl=0,address_mode=1,invalidate=1,length=0x3fffffffffff,odp=1,start_va=0xffffffffffffffff,pba0=0xfffffffffffff,mr_sn=0xfff",
-            "srfqn=0xffff,state=3,load_pi=0xff,shadow=0xfffffffffffff,pd=0xffff,pba=0xfffffffffffff,size=0xf,mode=3,pi_wrap=1,pi=0x7fff,limit=0x3fff,arm_sn=3",
-            "eqn=0xfff,state=3,size=0x1f,next=0xfffffffffffff,current=0xfffffffffffff,current_valid=1,pi_wrap=1,pi=0x3ffff,mode=3,msix=0xffff,ci_wrap=1,ci=0x3ffff",
-            "eqn=0xfff,state=3,size=0x1f,next=0xfffffffffffff,current=0xfffffffffffff,current_valid=1,pi_wrap=1,pi=0x3ffff,mode=3,msix=0xffff,ci_wrap=1,ci=0x3ffff",
+            "transport=rc,traffic_class=0xa8,tver=1,mig=1,host=5,vf=0xabc,icos=5,qpn=0x15555,stat_idx=0xa5,pkey=0xbeef,shadow_pba=0x123456789ab,tx_swap=1,rx_swap=1,sq_ce=1,ra_fence=1,aa_fence=1,fc=1,state=3,pmtu=5,retry_count=7,rnr_retry=7,qp_sn=0xc3,srfq=1,srfqn=0x4567,pd=0xa55a,access=0x1f,dst_qpn=0x654321,dmac=0x112233445566,vlan_id=0xabc,flow=0xabcde,dscp=0x2a,ecn=2,hop=0x40,udp_sport=0xc123,send_psn=0xabcdef,recv_psn=0x123456,sq_pba=0x123456789abcd,sq_size=11,sq_om=2,sq_cqn=0xabcde,rq_cqn=0x54321,rq_pba=0x0fedcba987654,rq_size=10,rq_om=1",
+            "transport=ud,traffic_class=0xac,tver=1,mig=0,host=6,vf=0x345,icos=5,qpn=0x2aaaa,stat_idx=0x5a,qkey=0x89abcdef,pkey=0x1234,shadow_pba=0x0fedcba9876,tx_swap=1,rx_swap=1,state=3,pmtu=4,qp_sn=0x7e,pd=0x5aa5,vlan=1,ipv6=1,tunnel=1,lag=1,fwd=2,dst_vport=0x456,src_addr=0xabc,dst_port=0xb,dst_qpn=0xabcdef,dmac=0xa1b2c3d4e5f6,pri=5,cfi=1,vlan_id=0x789,src_vport=0x345,flow=0x54321,dscp=0x2b,ecn=0,hop=0x7f,udp_sport=0xbeef,dest_ip=20010db8000000000000000000000001,sq_pba=0x1111122222333,sq_size=9,sq_om=3,sq_cqn=0x13579,rq_cqn=0x2468a,rq_pba=0x4444455555666,rq_size=8,rq_om=2",
+            "transport=urc,traffic_class=0xfc,tver=1,mig=1,host=7,vf=0x789,icos=7,qpn=0x3ffff,stat_idx=0xff,rsq_pba=0x123456789abcd,pkey=0xabcd,shadow_pba=0x123456789ab,state=3,pmtu=5,qp_sn=0xfe,pd=0xffff,dscp=0x3f,ecn=2,rdsq_pba=0x23456789abcde,rdsq_size=7,tx_rbsn=0xabcdef,tx_dbsn=0x654321,rx_rbsn=0x123456,rx_dbsn=0xfedcba,rx_srbsn=0x345678,cur_dpsn=0x456789,cur_rpsn=0x56789a,rxed_dbsn=0x6789ab,rq_se_th=0xf,sq_ce_th=0xe,tx_srbsn=0x789abc,max_tx_srbsn=0x89abcd,dsq_pba=0x3456789abcdef,tpe_rpsn_max=0x9abcde,tpe_dpsn_max=0xabcdef,dsq_fetch=0x3f,sq_pba=0x456789abcdef0,sq_size=0xf,sq_om=3,sq_cqn=0xfffff,rq_cqn=0xabcde,rq_pba=0x56789abcdef01,rq_size=0xe,rq_om=2",
+            "cqn=0x1fffff,sd_pba=0xfffffffffffff,size=0x1f,urc=1,state=2,next_hi=0xff,cur_valid=1,cur_pba=0xfffffffffffff,load_ci=1,threshold=7,mode=3,next_valid=1,next_lo=0xfffffffffff,pi=0x7fffff,pi_wrap=1,last_arm=3,cqe_size=2,ceqn=0xfff,shadow=0x3ffffffffffffff,ci=0x7fffff,ci_wrap=1,arm_sn=3,arm_state=2",
+            "opcode=0x05,stag=0xffffff,state=2,key=0xff,parent=0,pd=0xffff,payload_vf=0xff,payload_vf_en=1,rights=0x1f,type=2,host_page=2,pbl=0,address_mode=1,invalidate=1,length=0x3fffffffffff,odp=1,start_va=0xffffffffffffffff,pba0=0xfffffffffffff,mr_sn=0xfff",
+            "opcode=0x05,stag=0xffffff,state=2,key=0xff,parent=0,pd=0xffff,payload_vf=0xff,payload_vf_en=1,rights=0x1f,type=2,host_page=2,pbl=1,address_mode=1,invalidate=1,length=0x3fffffffffff,odp=1,start_va=0xffffffffffffffff,pba0=0xfffffffffffff,pba1=0xfffffffffffff,mr_sn=0xfff",
+            "opcode=0x05,stag=0xffffff,state=2,key=0xff,parent=0,pd=0xffff,payload_vf=0xff,payload_vf_en=1,rights=0x1f,type=2,host_page=2,pbl=2,address_mode=1,invalidate=1,length=0x3fffffffffff,odp=1,start_va=0xffffffffffffffff,first_pbl=0xfffffff,mr_sn=0xfff",
+            "opcode=0x04,stag=0xffffff,state=2,key=0xff,parent=self,pd=0xffff,payload_vf=0xff,payload_vf_en=1,rights=0x1f,type=2,host_page=2,pbl=0,address_mode=1,invalidate=1,length=0x3fffffffffff,odp=1,start_va=0xffffffffffffffff,pba0=0xfffffffffffff,mr_sn=0xfff",
+            "srfqn=0xffff,state=2,load_pi=0xff,shadow=0xfffffffffffff,pd=0xffff,pba=0xfffffffffffff,size=0xf,mode=3,pi_wrap=1,pi=0x7fff,limit=0x3fff,arm_sn=3",
+            "eqn=0xfff,state=2,size=0x1f,next=0xfffffffffffff,current=0xfffffffffffff,current_valid=1,pi_wrap=1,pi=0x3ffff,mode=3,msix=0xffff,ci_wrap=1,ci=0x3ffff",
+            "eqn=0xfff,state=2,size=0x1f,next=0xfffffffffffff,current=0xfffffffffffff,current_valid=1,pi_wrap=1,pi=0x3ffff,mode=3,msix=0xffff,ci_wrap=1,ci=0x3ffff",
         ])
 
     def test_body_masks_are_independent_exact_and_envelope_disjoint(self) -> None:
@@ -423,6 +549,150 @@ class ReferenceEncodingTest(unittest.TestCase):
             validate_translations(
                 (drifted,) + translations[1:], CHECKER.FIELD_MAPPINGS
             )
+
+    def test_qpc_traffic_class_projection_and_ecn_policy_are_enforced(self) -> None:
+        validate = self.require_checker_attribute("validate_context_contract")
+        cases = CHECKER.build_golden_cases()["context"]
+        for case, required_ecn in zip(cases[:3], (2, 0, 2)):
+            inputs = {item.name: item.value for item in case.inputs}
+            traffic_class = int(inputs["traffic_class"], 0)
+            self.assertEqual(self.field_value(case, "XTR_V1_QPC_ICOS"),
+                             traffic_class >> 5)
+            self.assertEqual(self.field_value(case, "XTR_V1_QPC_DSCP"),
+                             traffic_class >> 2)
+            self.assertEqual(self.field_value(case, "XTR_V1_QPC_ECN"),
+                             required_ecn)
+
+            for stem in ("XTR_V1_QPC_ICOS", "XTR_V1_QPC_DSCP",
+                         "XTR_V1_QPC_ECN"):
+                with self.subTest(case=case.name, stem=stem):
+                    corrupted = list(cases)
+                    corrupted[cases.index(case)] = self.mutate_field(case, stem)
+                    with self.assertRaisesRegex(
+                        CHECKER.ValidationError, "traffic class|ECN"
+                    ):
+                        validate(corrupted)
+
+    def test_body_goldens_use_only_driver_supported_semantic_values(self) -> None:
+        validate = self.require_checker_attribute("validate_context_contract")
+        cases = CHECKER.build_golden_cases()["context"]
+        supported = {
+            "cqc_create_body_boundary": {
+                "XTR_V1_CQC_BODY_CQ_ST": {0, 1, 2},
+                "XTR_V1_CQC_BODY_CQE_SIZE": {0, 1, 2},
+                "XTR_V1_CQC_BODY_ARM_ST": {0, 1, 2},
+            },
+            "mrt_register_pbl0_boundary": {
+                "XTR_V1_MRT_BODY_NXT_ST": {0, 1, 2},
+                "XTR_V1_MRT_BODY_ST": {0, 1, 2},
+                "XTR_V1_MRT_BODY_TYPE": {0, 1, 2},
+                "XTR_V1_MRT_BODY_HOST_PG_SIZE": {0, 1, 2},
+            },
+            "mrt_register_pbl1_boundary": {
+                "XTR_V1_MRT_BODY_NXT_ST": {0, 1, 2},
+                "XTR_V1_MRT_BODY_ST": {0, 1, 2},
+                "XTR_V1_MRT_BODY_TYPE": {0, 1, 2},
+                "XTR_V1_MRT_BODY_HOST_PG_SIZE": {0, 1, 2},
+            },
+            "mrt_register_pbl2_boundary": {
+                "XTR_V1_MRT_BODY_NXT_ST": {0, 1, 2},
+                "XTR_V1_MRT_BODY_ST": {0, 1, 2},
+                "XTR_V1_MRT_BODY_TYPE": {0, 1, 2},
+                "XTR_V1_MRT_BODY_HOST_PG_SIZE": {0, 1, 2},
+            },
+            "mrt_key_alloc_pbl0_boundary": {
+                "XTR_V1_MRT_BODY_NXT_ST": {0, 1, 2},
+                "XTR_V1_MRT_BODY_ST": {0, 1, 2},
+                "XTR_V1_MRT_BODY_TYPE": {0, 1, 2},
+                "XTR_V1_MRT_BODY_HOST_PG_SIZE": {0, 1, 2},
+            },
+            "srqc_create_body_boundary": {
+                "XTR_V1_SRQC_BODY_SRFQ_ST": {0, 1, 2},
+            },
+            "ceqc_create_body_boundary": {
+                "XTR_V1_EQC_BODY_EQ_ST": {0, 1, 2},
+            },
+            "aeqc_create_body_boundary": {
+                "XTR_V1_EQC_BODY_EQ_ST": {0, 1, 2},
+            },
+        }
+        semantic_input = {
+            "XTR_V1_CQC_BODY_CQ_ST": "state",
+            "XTR_V1_CQC_BODY_CQE_SIZE": "cqe_size",
+            "XTR_V1_CQC_BODY_ARM_ST": "arm_state",
+            "XTR_V1_MRT_BODY_NXT_ST": "state",
+            "XTR_V1_MRT_BODY_ST": "state",
+            "XTR_V1_MRT_BODY_TYPE": "type",
+            "XTR_V1_MRT_BODY_HOST_PG_SIZE": "host_page",
+            "XTR_V1_SRQC_BODY_SRFQ_ST": "state",
+            "XTR_V1_EQC_BODY_EQ_ST": "state",
+        }
+        by_name = {case.name: case for case in cases}
+        for name, fields in supported.items():
+            for stem, values in fields.items():
+                case = by_name[name]
+                with self.subTest(case=name, stem=stem):
+                    self.assertIn(self.field_value(case, stem), values)
+                    corrupted = list(cases)
+                    index = cases.index(case)
+                    # All listed semantic fields are two bits wide and value
+                    # three is the only representable unsupported code.
+                    corrupted[index] = self.set_field(case, stem, 3)
+                    with self.assertRaisesRegex(
+                        CHECKER.ValidationError, "unsupported semantic"
+                    ):
+                        validate(corrupted)
+                    corrupted[index] = self.mutate_input(
+                        case, semantic_input[stem]
+                    )
+                    with self.assertRaisesRegex(
+                        CHECKER.ValidationError, "unsupported semantic"
+                    ):
+                        validate(corrupted)
+
+    def test_mrt_inputs_and_payload_fields_are_fully_coupled(self) -> None:
+        validate = self.require_checker_attribute("validate_context_contract")
+        cases = CHECKER.build_golden_cases()["context"]
+        by_name = {case.name: case for case in cases}
+        fields_by_case = {
+            "mrt_register_pbl0_boundary": (
+                "XTR_V1_MRT_BODY_STAG_IDX", "XTR_V1_MRT_BODY_NXT_ST",
+                "XTR_V1_MRT_BODY_STAG_KEY", "XTR_V1_MRT_BODY_PARENT_STAG_IDX",
+                "XTR_V1_MRT_BODY_PD_IDX", "XTR_V1_MRT_BODY_PLD_VF_ID",
+                "XTR_V1_MRT_BODY_PLD_VF_EN", "XTR_V1_MRT_BODY_RIGHT",
+                "XTR_V1_MRT_BODY_TYPE", "XTR_V1_MRT_BODY_HOST_PG_SIZE",
+                "XTR_V1_MRT_BODY_PBL_MODE", "XTR_V1_MRT_BODY_ADDR_MODE",
+                "XTR_V1_MRT_BODY_INVALIDATE_EN", "XTR_V1_MRT_BODY_ST",
+                "XTR_V1_MRT_BODY_LEN", "XTR_V1_MRT_BODY_ODP",
+                "XTR_V1_MRT_BODY_INFO_STAG_KEY", "XTR_V1_MRT_BODY_START_VA",
+                "XTR_V1_MRT_BODY_PAYLOAD_PBA0", "XTR_V1_MRT_BODY_MR_SN",
+            ),
+            "mrt_register_pbl1_boundary": ("XTR_V1_MRT_BODY_PAYLOAD_PBA1",),
+            "mrt_register_pbl2_boundary": ("XTR_V1_MRT_BODY_FIRST_PBL_IDX",),
+            "mrt_key_alloc_pbl0_boundary": (
+                "XTR_V1_MRT_BODY_PARENT_STAG_IDX",
+            ),
+        }
+        for name, stems in fields_by_case.items():
+            case = by_name[name]
+            for stem in stems:
+                with self.subTest(case=name, payload_field=stem):
+                    corrupted = list(cases)
+                    corrupted[cases.index(case)] = self.mutate_field(case, stem)
+                    with self.assertRaises(CHECKER.ValidationError):
+                        validate(corrupted)
+
+        for name in (
+            "mrt_register_pbl0_boundary", "mrt_register_pbl1_boundary",
+            "mrt_register_pbl2_boundary", "mrt_key_alloc_pbl0_boundary",
+        ):
+            case = by_name[name]
+            for item in case.inputs:
+                with self.subTest(case=name, input=item.name):
+                    corrupted = list(cases)
+                    corrupted[cases.index(case)] = self.mutate_input(case, item.name)
+                    with self.assertRaises(CHECKER.ValidationError):
+                        validate(corrupted)
 
     def test_strict_golden_parser_rejects_all_structural_drift(self) -> None:
         parser = self.require_checker_attribute("parse_golden_text")

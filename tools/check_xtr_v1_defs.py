@@ -584,6 +584,10 @@ PROFILE_VALUES = {
     "XTR_V1_RQE_BYTES": 64,
     "XTR_V1_CQE_BYTES": 64,
     "XTR_V1_DB_BYTES": 8,
+    # Raw destination-IP bytes are not a mask-backed qword field, so their
+    # placement is frozen as independently checked profile metadata.
+    "XTR_V1_QPC_DEST_IP_BYTE_OFFSET": 80,
+    "XTR_V1_QPC_DEST_IP_BYTES": 16,
 }
 
 
@@ -675,6 +679,48 @@ def validate_mapping_uniqueness(
            "reference SV stem")
     unique(((reference.path, reference.c_symbol) for reference in reference_fields),
            "reference source")
+
+    # expected_constants is keyed by the final emitted SV names.  Validate
+    # that namespace before building the dictionary so no later table can
+    # silently overwrite a field coordinate.
+    final_names: dict[str, str] = {}
+
+    def add_final(name: str, producer: str) -> None:
+        previous = final_names.get(name)
+        if previous is not None and previous != producer:
+            raise ValidationError(
+                f"duplicate global SV constant {name}: {previous} and {producer}"
+            )
+        final_names[name] = producer
+
+    field_stems = {mapping.sv_stem for mapping in field_mappings}
+    for mapping in field_mappings:
+        producer = f"field/reference {mapping.sv_stem}"
+        for suffix in ("WORD_BYTE_OFFSET", "LSB", "WIDTH", "OFFSET"):
+            add_final(f"{mapping.sv_stem}_{suffix}", producer)
+    for reference in reference_fields:
+        producer = f"field/reference {reference.sv_stem}"
+        if reference.sv_stem not in field_stems:
+            for suffix in ("WORD_BYTE_OFFSET", "LSB", "WIDTH", "OFFSET"):
+                add_final(f"{reference.sv_stem}_{suffix}", producer)
+    for mapping in value_mappings:
+        add_final(mapping.sv_name, f"value {mapping.sv_name}")
+    for name in PROFILE_VALUES:
+        add_final(name, f"profile {name}")
+
+
+def validate_profile_constants(
+    sv_constants: dict[str, int],
+    profile_values: dict[str, int],
+) -> None:
+    for name, expected in profile_values.items():
+        actual = sv_constants.get(name)
+        if actual is None:
+            raise ValidationError(f"required profile constant missing: {name}")
+        if actual != expected:
+            raise ValidationError(
+                f"profile constant mismatch for {name}: {actual:#x} != {expected:#x}"
+            )
 
 
 def validate_body_translations(
@@ -1211,14 +1257,17 @@ def build_golden_cases() -> dict[str, list[GoldenCase]]:
 
     rc_send_psn = 0xABCDEF
     rc_recv_psn = 0x123456
+    rc_traffic_class = 0xA8
     qpc_rc = make_case("qpc_rc_boundary", 512, (
         ("", 0, "transport=rc"),
+        ("", 0, f"traffic_class={rc_traffic_class:#x}"),
         ("XTR_V1_QPC_TVER", 1, "tver=1"),
         ("XTR_V1_QPC_MIG", 1, "mig=1"),
         ("XTR_V1_QPC_SERVICE_TYPE", 0, ""),
         ("XTR_V1_QPC_HOST_ID", 5, "host=5"),
         ("XTR_V1_QPC_VF_ID", 0xABC, "vf=0xabc"),
-        ("XTR_V1_QPC_ICOS", 3, "icos=3"),
+        ("XTR_V1_QPC_ICOS", rc_traffic_class >> 5,
+         f"icos={rc_traffic_class >> 5}"),
         ("XTR_V1_QPC_QPN", 0x15555, "qpn=0x15555"),
         ("XTR_V1_QPC_STAT_IDX", 0xA5, "stat_idx=0xa5"),
         ("XTR_V1_QPC_PKEY", 0xBEEF, "pkey=0xbeef"),
@@ -1242,7 +1291,8 @@ def build_golden_cases() -> dict[str, list[GoldenCase]]:
         ("XTR_V1_QPC_DMAC", 0x112233445566, "dmac=0x112233445566"),
         ("XTR_V1_QPC_VLAN_ID", 0xABC, "vlan_id=0xabc"),
         ("XTR_V1_QPC_FLOW_LABEL", 0xABCDE, "flow=0xabcde"),
-        ("XTR_V1_QPC_DSCP", 0x2A, "dscp=0x2a"),
+        ("XTR_V1_QPC_DSCP", rc_traffic_class >> 2,
+         f"dscp={rc_traffic_class >> 2:#x}"),
         ("XTR_V1_QPC_ECN", 2, "ecn=2"),
         ("XTR_V1_QPC_HOPLIMIT", 0x40, "hop=0x40"),
         ("XTR_V1_QPC_CUR_UDP_SPORT", 0xC123, "udp_sport=0xc123"),
@@ -1269,14 +1319,17 @@ def build_golden_cases() -> dict[str, list[GoldenCase]]:
 
     ud_qkey = 0x89ABCDEF
     ud_dest_ip = bytes.fromhex("20010db8000000000000000000000001")
+    ud_traffic_class = 0xAC
     qpc_ud = make_case("qpc_ud_boundary", 512, (
         ("", 0, "transport=ud"),
+        ("", 0, f"traffic_class={ud_traffic_class:#x}"),
         ("XTR_V1_QPC_TVER", 1, "tver=1"),
         ("XTR_V1_QPC_MIG", 0, "mig=0"),
         ("XTR_V1_QPC_SERVICE_TYPE", 3, ""),
         ("XTR_V1_QPC_HOST_ID", 6, "host=6"),
         ("XTR_V1_QPC_VF_ID", 0x345, "vf=0x345"),
-        ("XTR_V1_QPC_ICOS", 5, "icos=5"),
+        ("XTR_V1_QPC_ICOS", ud_traffic_class >> 5,
+         f"icos={ud_traffic_class >> 5}"),
         ("XTR_V1_QPC_QPN", 0x2AAAA, "qpn=0x2aaaa"),
         ("XTR_V1_QPC_STAT_IDX", 0x5A, "stat_idx=0x5a"),
         ("XTR_V1_QPC_UD_QKEY_H", ud_qkey >> 24, f"qkey={ud_qkey:#x}"),
@@ -1304,7 +1357,8 @@ def build_golden_cases() -> dict[str, list[GoldenCase]]:
         ("XTR_V1_QPC_VLAN_ID", 0x789, "vlan_id=0x789"),
         ("XTR_V1_QPC_SRC_VPORT_ID", 0x345, "src_vport=0x345"),
         ("XTR_V1_QPC_FLOW_LABEL", 0x54321, "flow=0x54321"),
-        ("XTR_V1_QPC_DSCP", 0x2B, "dscp=0x2b"),
+        ("XTR_V1_QPC_DSCP", ud_traffic_class >> 2,
+         f"dscp={ud_traffic_class >> 2:#x}"),
         ("XTR_V1_QPC_ECN", 0, "ecn=0"),
         ("XTR_V1_QPC_HOPLIMIT", 0x7F, "hop=0x7f"),
         ("XTR_V1_QPC_CUR_UDP_SPORT", 0xBEEF, "udp_sport=0xbeef"),
@@ -1319,16 +1373,24 @@ def build_golden_cases() -> dict[str, list[GoldenCase]]:
         ("XTR_V1_QPC_RQ_OM", 2, "rq_om=2"),
     ))
     qpc_ud_image = bytearray(qpc_ud.payload)
-    qpc_ud_image[80:96] = ud_dest_ip
+    dest_ip_offset = PROFILE_VALUES["XTR_V1_QPC_DEST_IP_BYTE_OFFSET"]
+    dest_ip_bytes = PROFILE_VALUES["XTR_V1_QPC_DEST_IP_BYTES"]
+    if len(ud_dest_ip) != dest_ip_bytes:
+        raise ValidationError("QPC destination IP does not match profile byte count")
+    qpc_ud_image[dest_ip_offset:dest_ip_offset + dest_ip_bytes] = ud_dest_ip
     qpc_ud = qpc_ud._replace(payload=bytes(qpc_ud_image))
 
     urc_rsq_pba = 0x123456789ABCD
     urc_dsq_pba = 0x3456789ABCDEF
+    urc_traffic_class = 0xFC
     qpc_urc = make_case("qpc_urc_boundary", 512, (
         ("", 0, "transport=urc"),
+        ("", 0, f"traffic_class={urc_traffic_class:#x}"),
         ("XTR_V1_QPC_TVER", 1, "tver=1"), ("XTR_V1_QPC_MIG", 1, "mig=1"),
         ("XTR_V1_QPC_SERVICE_TYPE", 6, ""), ("XTR_V1_QPC_HOST_ID", 7, "host=7"),
-        ("XTR_V1_QPC_VF_ID", 0x789, "vf=0x789"), ("XTR_V1_QPC_ICOS", 7, "icos=7"),
+        ("XTR_V1_QPC_VF_ID", 0x789, "vf=0x789"),
+        ("XTR_V1_QPC_ICOS", urc_traffic_class >> 5,
+         f"icos={urc_traffic_class >> 5}"),
         ("XTR_V1_QPC_QPN", 0x3FFFF, "qpn=0x3ffff"), ("XTR_V1_QPC_STAT_IDX", 0xFF, "stat_idx=0xff"),
         ("XTR_V1_QPC_URC_RSQ_PBA_H", urc_rsq_pba >> 48, f"rsq_pba={urc_rsq_pba:#x}"),
         ("XTR_V1_QPC_URC_RSQ_PBA_L", urc_rsq_pba & ((1 << 48) - 1), ""),
@@ -1336,6 +1398,9 @@ def build_golden_cases() -> dict[str, list[GoldenCase]]:
         ("XTR_V1_QPC_SHADOW_PBA", 0x123456789AB, "shadow_pba=0x123456789ab"),
         ("XTR_V1_QPC_QP_ST", 3, "state=3"), ("XTR_V1_QPC_PMTU", 5, "pmtu=5"),
         ("XTR_V1_QPC_QP_SN", 0xFE, "qp_sn=0xfe"), ("XTR_V1_QPC_PD_IDX", 0xFFFF, "pd=0xffff"),
+        ("XTR_V1_QPC_DSCP", urc_traffic_class >> 2,
+         f"dscp={urc_traffic_class >> 2:#x}"),
+        ("XTR_V1_QPC_ECN", 2, "ecn=2"),
         ("XTR_V1_QPC_URC_RDSQ_PBA", 0x23456789ABCDE, "rdsq_pba=0x23456789abcde"),
         ("XTR_V1_QPC_URC_RDSQ_SIZE", 7, "rdsq_size=7"),
         ("XTR_V1_QPC_URC_TX_RBSN", 0xABCDEF, "tx_rbsn=0xabcdef"),
@@ -1368,7 +1433,7 @@ def build_golden_cases() -> dict[str, list[GoldenCase]]:
         ("XTR_V1_CQC_BODY_CQN", 0x1FFFFF, "cqn=0x1fffff"),
         ("XTR_V1_CQC_BODY_CQ_SD_PBA", 0xFFFFFFFFFFFFF, "sd_pba=0xfffffffffffff"),
         ("XTR_V1_CQC_BODY_CQ_SIZE", 0x1F, "size=0x1f"),
-        ("XTR_V1_CQC_BODY_URC_FLAG", 1, "urc=1"), ("XTR_V1_CQC_BODY_CQ_ST", 3, "state=3"),
+        ("XTR_V1_CQC_BODY_URC_FLAG", 1, "urc=1"), ("XTR_V1_CQC_BODY_CQ_ST", 2, "state=2"),
         ("XTR_V1_CQC_BODY_NXT_CQ_PD_PBA_H", 0xFF, "next_hi=0xff"),
         ("XTR_V1_CQC_BODY_CUR_PBA_VLD", 1, "cur_valid=1"),
         ("XTR_V1_CQC_BODY_CUR_CQ_PD_PBA", 0xFFFFFFFFFFFFF, "cur_pba=0xfffffffffffff"),
@@ -1379,24 +1444,24 @@ def build_golden_cases() -> dict[str, list[GoldenCase]]:
         ("XTR_V1_CQC_BODY_CQ_PI", 0x7FFFFF, "pi=0x7fffff"),
         ("XTR_V1_CQC_BODY_CQ_PI_WRAP", 1, "pi_wrap=1"),
         ("XTR_V1_CQC_BODY_LAST_ARM_SN", 3, "last_arm=3"),
-        ("XTR_V1_CQC_BODY_CQE_SIZE", 3, "cqe_size=3"),
+        ("XTR_V1_CQC_BODY_CQE_SIZE", 2, "cqe_size=2"),
         ("XTR_V1_CQC_BODY_CEQN", 0xFFF, "ceqn=0xfff"),
         ("XTR_V1_CQC_BODY_SHADOW_PA", 0x3FFFFFFFFFFFFFF, "shadow=0x3ffffffffffffff"),
         ("XTR_V1_CQC_BODY_CQ_CI", 0x7FFFFF, "ci=0x7fffff"),
         ("XTR_V1_CQC_BODY_CQ_CI_WRAP", 1, "ci_wrap=1"),
-        ("XTR_V1_CQC_BODY_ARM_SN", 3, "arm_sn=3"), ("XTR_V1_CQC_BODY_ARM_ST", 3, "arm_state=3"),
+        ("XTR_V1_CQC_BODY_ARM_SN", 3, "arm_sn=3"), ("XTR_V1_CQC_BODY_ARM_ST", 2, "arm_state=2"),
     ))
 
     def make_mrt(name: str, pbl: int, key_alloc: bool) -> GoldenCase:
-        variant = "key_alloc" if key_alloc else "mr_register"
+        opcode = 0x04 if key_alloc else 0x05
         stag = 0xFFFFFF
-        state = 3
+        state = 2
         key = 0xFF
         pd = 0xFFFF
         payload_vf = 0xFF
         rights = 0x1F
-        mem_type = 3
-        host_page = 3
+        mem_type = 2
+        host_page = 2
         address_mode = 1
         invalidate = 1
         length = 0x3FFFFFFFFFFF
@@ -1404,43 +1469,48 @@ def build_golden_cases() -> dict[str, list[GoldenCase]]:
         payload_pba = 0xFFFFFFFFFFFFF
         first_pbl = 0xFFFFFFF
         mr_sn = 0xFFF
-        pbl_tail = {
-            0: f"pba0={payload_pba:#x}",
-            1: f"pba0={payload_pba:#x},pba1={payload_pba:#x}",
-            2: f"first_pbl={first_pbl:#x}",
-        }[pbl]
-        summary = (f"opcode={variant},stag={stag:#x},state={state},key={key:#x},"
-                   f"parent={'self' if key_alloc else '0'},pd={pd:#x},"
-                   f"payload_vf={payload_vf:#x},"
-                   f"payload_vf_en=1,rights={rights:#x},type={mem_type},"
-                   f"host_page={host_page},pbl={pbl},address_mode={address_mode},"
-                   f"invalidate={invalidate},length={length:#x},odp=1,"
-                   f"start_va={start_va:#x},{pbl_tail},mr_sn={mr_sn:#x}")
         fields = [
-            ("XTR_V1_MRT_BODY_STAG_IDX", stag), ("XTR_V1_MRT_BODY_NXT_ST", state),
-            ("XTR_V1_MRT_BODY_STAG_KEY", key), ("XTR_V1_MRT_BODY_PD_IDX", pd),
-            ("XTR_V1_MRT_BODY_PLD_VF_ID", payload_vf), ("XTR_V1_MRT_BODY_PLD_VF_EN", 1),
-            ("XTR_V1_MRT_BODY_RIGHT", rights), ("XTR_V1_MRT_BODY_TYPE", mem_type),
-            ("XTR_V1_MRT_BODY_HOST_PG_SIZE", host_page), ("XTR_V1_MRT_BODY_PBL_MODE", pbl),
-            ("XTR_V1_MRT_BODY_ADDR_MODE", address_mode),
-            ("XTR_V1_MRT_BODY_INVALIDATE_EN", invalidate),
-            ("XTR_V1_MRT_BODY_ST", state), ("XTR_V1_MRT_BODY_LEN", length),
-            ("XTR_V1_MRT_BODY_ODP", 1), ("XTR_V1_MRT_BODY_INFO_STAG_KEY", key),
-            ("XTR_V1_MRT_BODY_START_VA", start_va),
-            ("XTR_V1_MRT_BODY_MR_SN", mr_sn),
+            ("", 0, f"opcode={opcode:#04x}"),
+            ("XTR_V1_MRT_BODY_STAG_IDX", stag, f"stag={stag:#x}"),
+            ("XTR_V1_MRT_BODY_NXT_ST", state, f"state={state}"),
+            ("XTR_V1_MRT_BODY_STAG_KEY", key, f"key={key:#x}"),
+            ("XTR_V1_MRT_BODY_PD_IDX", pd, f"pd={pd:#x}"),
+            ("XTR_V1_MRT_BODY_PLD_VF_ID", payload_vf,
+             f"payload_vf={payload_vf:#x}"),
+            ("XTR_V1_MRT_BODY_PLD_VF_EN", 1, "payload_vf_en=1"),
+            ("XTR_V1_MRT_BODY_RIGHT", rights, f"rights={rights:#x}"),
+            ("XTR_V1_MRT_BODY_TYPE", mem_type, f"type={mem_type}"),
+            ("XTR_V1_MRT_BODY_HOST_PG_SIZE", host_page,
+             f"host_page={host_page}"),
+            ("XTR_V1_MRT_BODY_PBL_MODE", pbl, f"pbl={pbl}"),
+            ("XTR_V1_MRT_BODY_ADDR_MODE", address_mode,
+             f"address_mode={address_mode}"),
+            ("XTR_V1_MRT_BODY_INVALIDATE_EN", invalidate,
+             f"invalidate={invalidate}"),
+            ("XTR_V1_MRT_BODY_ST", state, ""),
+            ("XTR_V1_MRT_BODY_LEN", length, f"length={length:#x}"),
+            ("XTR_V1_MRT_BODY_ODP", 1, "odp=1"),
+            ("XTR_V1_MRT_BODY_INFO_STAG_KEY", key, ""),
+            ("XTR_V1_MRT_BODY_START_VA", start_va,
+             f"start_va={start_va:#x}"),
         ]
         if key_alloc:
-            fields.append(("XTR_V1_MRT_BODY_PARENT_STAG_IDX", stag))
-        if pbl == 2:
-            fields.append(("XTR_V1_MRT_BODY_FIRST_PBL_IDX", first_pbl))
+            fields.insert(4, ("XTR_V1_MRT_BODY_PARENT_STAG_IDX", stag,
+                              "parent=self"))
         else:
-            fields.append(("XTR_V1_MRT_BODY_PAYLOAD_PBA0", payload_pba))
+            fields.insert(4, ("XTR_V1_MRT_BODY_PARENT_STAG_IDX", 0,
+                              "parent=0"))
+        if pbl == 2:
+            fields.append(("XTR_V1_MRT_BODY_FIRST_PBL_IDX", first_pbl,
+                           f"first_pbl={first_pbl:#x}"))
+        else:
+            fields.append(("XTR_V1_MRT_BODY_PAYLOAD_PBA0", payload_pba,
+                           f"pba0={payload_pba:#x}"))
         if pbl == 1:
-            fields.append(("XTR_V1_MRT_BODY_PAYLOAD_PBA1", payload_pba))
-        image = ReferenceImage(64)
-        for stem, value in fields:
-            put_named(image, stem, value)
-        return GoldenCase(name, parse_input_summary(summary), bytes(image))
+            fields.append(("XTR_V1_MRT_BODY_PAYLOAD_PBA1", payload_pba,
+                           f"pba1={payload_pba:#x}"))
+        fields.append(("XTR_V1_MRT_BODY_MR_SN", mr_sn, f"mr_sn={mr_sn:#x}"))
+        return make_case(name, 64, fields)
 
     mrt_pbl0 = make_mrt("mrt_register_pbl0_boundary", 0, False)
     mrt_pbl1 = make_mrt("mrt_register_pbl1_boundary", 1, False)
@@ -1449,7 +1519,7 @@ def build_golden_cases() -> dict[str, list[GoldenCase]]:
 
     srqc = make_case("srqc_create_body_boundary", 64, (
         ("XTR_V1_SRQC_BODY_SRFQN", 0xFFFF, "srfqn=0xffff"),
-        ("XTR_V1_SRQC_BODY_SRFQ_ST", 3, "state=3"),
+        ("XTR_V1_SRQC_BODY_SRFQ_ST", 2, "state=2"),
         ("XTR_V1_SRQC_BODY_LOAD_SRFQ_PI_TH", 0xFF, "load_pi=0xff"),
         ("XTR_V1_SRQC_BODY_SHADOW_PA", 0xFFFFFFFFFFFFF, "shadow=0xfffffffffffff"),
         ("XTR_V1_SRQC_BODY_PD_IDX", 0xFFFF, "pd=0xffff"),
@@ -1465,7 +1535,7 @@ def build_golden_cases() -> dict[str, list[GoldenCase]]:
     def make_eq(name: str) -> GoldenCase:
         return make_case(name, 64, (
             ("XTR_V1_EQC_BODY_EQN", 0xFFF, "eqn=0xfff"),
-            ("XTR_V1_EQC_BODY_EQ_ST", 3, "state=3"),
+            ("XTR_V1_EQC_BODY_EQ_ST", 2, "state=2"),
             ("XTR_V1_EQC_BODY_EQ_SIZE", 0x1F, "size=0x1f"),
             ("XTR_V1_EQC_BODY_NXT_EQ_PBA", 0xFFFFFFFFFFFFF, "next=0xfffffffffffff"),
             ("XTR_V1_EQC_BODY_CUR_EQ_PBA", 0xFFFFFFFFFFFFF, "current=0xfffffffffffff"),
@@ -1707,12 +1777,28 @@ def validate_context_contract(cases: list[GoldenCase]) -> None:
         raise ValidationError("context golden byte-count contract drift")
 
     transport_codes = {"rc": 0, "ud": 3, "urc": 6}
+    required_ecn = {"rc": 2, "ud": 0, "urc": 2}
     for case in cases[:3]:
         transport = inputs_by_name(case).get("transport")
         if transport not in transport_codes:
             raise ValidationError(f"{case.name} transport input is unsupported")
         if field_value(case, "XTR_V1_QPC_SERVICE_TYPE") != transport_codes[transport]:
             raise ValidationError(f"{case.name} transport/service-type mismatch")
+        traffic_class = numeric_input(case, "traffic_class")
+        if traffic_class > 0xFF:
+            raise ValidationError(f"{case.name} traffic class exceeds eight bits")
+        icos = field_value(case, "XTR_V1_QPC_ICOS")
+        dscp = field_value(case, "XTR_V1_QPC_DSCP")
+        ecn = field_value(case, "XTR_V1_QPC_ECN")
+        if (icos != traffic_class >> 5
+                or icos != numeric_input(case, "icos")):
+            raise ValidationError(f"{case.name} traffic class/ICOS mismatch")
+        if (dscp != traffic_class >> 2
+                or dscp != numeric_input(case, "dscp")):
+            raise ValidationError(f"{case.name} traffic class/DSCP mismatch")
+        if (ecn != required_ecn[transport]
+                or ecn != numeric_input(case, "ecn")):
+            raise ValidationError(f"{case.name} ECN policy/input mismatch")
 
     mask_keys = [
         "cqc_create", "mrt_register_pbl0", "mrt_register_pbl1",
@@ -1729,6 +1815,53 @@ def validate_context_contract(cases: list[GoldenCase]) -> None:
                 )
             if allowed & ENVELOPE_MASK[word_index]:
                 raise ValidationError(f"{mask_key} body overlaps request envelope")
+
+    semantic_domains = {
+        "cqc_create_body_boundary": (
+            ("XTR_V1_CQC_BODY_CQ_ST", "state"),
+            ("XTR_V1_CQC_BODY_CQE_SIZE", "cqe_size"),
+            ("XTR_V1_CQC_BODY_ARM_ST", "arm_state"),
+        ),
+        "mrt_register_pbl0_boundary": (
+            ("XTR_V1_MRT_BODY_NXT_ST", "state"),
+            ("XTR_V1_MRT_BODY_ST", "state"),
+            ("XTR_V1_MRT_BODY_TYPE", "type"),
+            ("XTR_V1_MRT_BODY_HOST_PG_SIZE", "host_page"),
+        ),
+        "mrt_register_pbl1_boundary": (
+            ("XTR_V1_MRT_BODY_NXT_ST", "state"),
+            ("XTR_V1_MRT_BODY_ST", "state"),
+            ("XTR_V1_MRT_BODY_TYPE", "type"),
+            ("XTR_V1_MRT_BODY_HOST_PG_SIZE", "host_page"),
+        ),
+        "mrt_register_pbl2_boundary": (
+            ("XTR_V1_MRT_BODY_NXT_ST", "state"),
+            ("XTR_V1_MRT_BODY_ST", "state"),
+            ("XTR_V1_MRT_BODY_TYPE", "type"),
+            ("XTR_V1_MRT_BODY_HOST_PG_SIZE", "host_page"),
+        ),
+        "mrt_key_alloc_pbl0_boundary": (
+            ("XTR_V1_MRT_BODY_NXT_ST", "state"),
+            ("XTR_V1_MRT_BODY_ST", "state"),
+            ("XTR_V1_MRT_BODY_TYPE", "type"),
+            ("XTR_V1_MRT_BODY_HOST_PG_SIZE", "host_page"),
+        ),
+        "srqc_create_body_boundary": (("XTR_V1_SRQC_BODY_SRFQ_ST", "state"),),
+        "ceqc_create_body_boundary": (("XTR_V1_EQC_BODY_EQ_ST", "state"),),
+        "aeqc_create_body_boundary": (("XTR_V1_EQC_BODY_EQ_ST", "state"),),
+    }
+    for case in cases[3:]:
+        for stem, input_name in semantic_domains[case.name]:
+            actual = field_value(case, stem)
+            expected = numeric_input(case, input_name)
+            if actual not in {0, 1, 2} or expected not in {0, 1, 2}:
+                raise ValidationError(
+                    f"{case.name} unsupported semantic value at {stem}"
+                )
+            if actual != expected:
+                raise ValidationError(
+                    f"{case.name} semantic {stem}/input {input_name} mismatch"
+                )
 
     rc = cases[0]
     for stem in (
@@ -1751,7 +1884,10 @@ def validate_context_contract(cases: list[GoldenCase]) -> None:
             | field_value(ud, "XTR_V1_QPC_UD_QKEY_L"))
     if qkey != numeric_input(ud, "qkey"):
         raise ValidationError(f"{ud.name} split QKey/input mismatch")
-    if ud.payload[80:96].hex() != inputs_by_name(ud).get("dest_ip"):
+    dest_ip_offset = PROFILE_VALUES["XTR_V1_QPC_DEST_IP_BYTE_OFFSET"]
+    dest_ip_bytes = PROFILE_VALUES["XTR_V1_QPC_DEST_IP_BYTES"]
+    if ud.payload[dest_ip_offset:dest_ip_offset + dest_ip_bytes].hex() != \
+            inputs_by_name(ud).get("dest_ip"):
         raise ValidationError(f"{ud.name} destination IP/input mismatch")
 
     urc = cases[2]
@@ -1767,32 +1903,70 @@ def validate_context_contract(cases: list[GoldenCase]) -> None:
         raise ValidationError(f"{urc.name} derived next DSQ address mismatch")
 
     for case in cases[4:8]:
-        q0 = int.from_bytes(case.payload[0:8], "big")
-        q1 = int.from_bytes(case.payload[8:16], "big")
-        q2 = int.from_bytes(case.payload[16:24], "big")
-        q3 = int.from_bytes(case.payload[24:32], "big")
-        if ((q0 >> 61) & 3) != ((q2 >> 62) & 3):
-            raise ValidationError(f"{case.name} repeated MRT state mismatch")
-        if ((q0 >> 61) & 3) != numeric_input(case, "state"):
-            raise ValidationError(f"{case.name} MRT state/input mismatch")
-        if ((q1 >> 24) & 0xFF) != ((q3 >> 56) & 0xFF):
-            raise ValidationError(f"{case.name} repeated MRT STAG key mismatch")
-        if ((q1 >> 24) & 0xFF) != numeric_input(case, "key"):
-            raise ValidationError(f"{case.name} MRT STAG key/input mismatch")
-        parent = q2 & 0xFFFFFF
-        stag = q0 & 0xFFFFFF
-        if stag != numeric_input(case, "stag"):
-            raise ValidationError(f"{case.name} MRT STAG/input mismatch")
-        if ((q2 >> 58) & 3) != numeric_input(case, "pbl"):
-            raise ValidationError(f"{case.name} MRT PBL/input mismatch")
+        direct_fields = (
+            ("XTR_V1_MRT_BODY_STAG_IDX", "stag"),
+            ("XTR_V1_MRT_BODY_NXT_ST", "state"),
+            ("XTR_V1_MRT_BODY_STAG_KEY", "key"),
+            ("XTR_V1_MRT_BODY_PD_IDX", "pd"),
+            ("XTR_V1_MRT_BODY_PLD_VF_ID", "payload_vf"),
+            ("XTR_V1_MRT_BODY_PLD_VF_EN", "payload_vf_en"),
+            ("XTR_V1_MRT_BODY_RIGHT", "rights"),
+            ("XTR_V1_MRT_BODY_TYPE", "type"),
+            ("XTR_V1_MRT_BODY_HOST_PG_SIZE", "host_page"),
+            ("XTR_V1_MRT_BODY_PBL_MODE", "pbl"),
+            ("XTR_V1_MRT_BODY_ADDR_MODE", "address_mode"),
+            ("XTR_V1_MRT_BODY_INVALIDATE_EN", "invalidate"),
+            ("XTR_V1_MRT_BODY_ST", "state"),
+            ("XTR_V1_MRT_BODY_LEN", "length"),
+            ("XTR_V1_MRT_BODY_ODP", "odp"),
+            ("XTR_V1_MRT_BODY_INFO_STAG_KEY", "key"),
+            ("XTR_V1_MRT_BODY_START_VA", "start_va"),
+            ("XTR_V1_MRT_BODY_MR_SN", "mr_sn"),
+        )
+        for stem, input_name in direct_fields:
+            if field_value(case, stem) != numeric_input(case, input_name):
+                raise ValidationError(
+                    f"{case.name} MRT {stem}/input {input_name} mismatch"
+                )
+
+        inputs = inputs_by_name(case)
+        stag = numeric_input(case, "stag")
+        parent = field_value(case, "XTR_V1_MRT_BODY_PARENT_STAG_IDX")
+        pbl = numeric_input(case, "pbl")
         if case.name == "mrt_key_alloc_pbl0_boundary":
-            if (inputs_by_name(case).get("opcode") != "key_alloc"
-                    or inputs_by_name(case).get("parent") != "self"
+            if (inputs.get("opcode") != "0x04"
+                    or inputs.get("parent") != "self"
                     or parent != stag):
                 raise ValidationError("KEY_ALLOC self-parent STAG mismatch")
-        elif (inputs_by_name(case).get("opcode") != "mr_register"
-              or inputs_by_name(case).get("parent") != "0" or parent != 0):
+        elif (inputs.get("opcode") != "0x05"
+              or inputs.get("parent") != "0" or parent != 0):
             raise ValidationError("MR_REGISTER parent STAG field must be zero")
+
+        pbl_fields = {
+            0: (("XTR_V1_MRT_BODY_PAYLOAD_PBA0", "pba0"),),
+            1: (
+                ("XTR_V1_MRT_BODY_PAYLOAD_PBA0", "pba0"),
+                ("XTR_V1_MRT_BODY_PAYLOAD_PBA1", "pba1"),
+            ),
+            2: (("XTR_V1_MRT_BODY_FIRST_PBL_IDX", "first_pbl"),),
+        }
+        if pbl not in pbl_fields:
+            raise ValidationError(f"{case.name} unsupported MRT PBL mode")
+        for stem, input_name in pbl_fields[pbl]:
+            if field_value(case, stem) != numeric_input(case, input_name):
+                raise ValidationError(
+                    f"{case.name} MRT {stem}/input {input_name} mismatch"
+                )
+
+        expected_inputs = {
+            "opcode", "stag", "state", "key", "parent", "pd",
+            "payload_vf", "payload_vf_en", "rights", "type", "host_page",
+            "pbl", "address_mode", "invalidate", "length", "odp",
+            "start_va", "mr_sn",
+            *(input_name for _, input_name in pbl_fields[pbl]),
+        }
+        if set(inputs) != expected_inputs:
+            raise ValidationError(f"{case.name} MRT input contract mismatch")
 
     validate_body_translations(BODY_TRANSLATIONS, FIELD_MAPPINGS)
 
@@ -1879,6 +2053,7 @@ def validate(kernel_root: Path) -> None:
     parsed_sources = {path: parse_c_symbols(text) for path, text in source_text.items()}
     validate_access_projections(source_text["rdma_main.h"])
     sv_constants = parse_sv_constants(SV_DEFS_PATH.read_text())
+    validate_profile_constants(sv_constants, PROFILE_VALUES)
     sv_mask_text = SV_MASKS_PATH.read_text()
     validate_sv_mask_api(sv_mask_text)
     sv_masks = parse_sv_masks(sv_mask_text)

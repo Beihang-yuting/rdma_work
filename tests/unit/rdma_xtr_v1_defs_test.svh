@@ -51,10 +51,43 @@ class rdma_xtr_v1_defs_test extends uvm_test;
     end
   endfunction
 
-  function void check_golden_reader_rejections();
+  task automatic check_read_all_rejection(
+      string path,
+      string contents,
+      string label);
+    int fd;
+    int status;
+    rdma_xtr_v1_golden_case cases[$];
+    rdma_xtr_v1_golden_case seed;
+    string error;
+
+    fd = $fopen(path, "w");
+    if (fd == 0) begin
+      `uvm_error("GOLDEN_GRAMMAR", $sformatf("cannot create %s", path))
+      return;
+    end
+    $fwrite(fd, "%s", contents);
+    $fclose(fd);
+
+    seed = new();
+    seed.name = "seed_must_not_survive_failure";
+    cases.push_back(seed);
+    if (rdma_xtr_v1_golden_reader::read_all(path, cases, error))
+      `uvm_error("GOLDEN_GRAMMAR", {label, " was accepted"})
+    if (cases.size() != 0)
+      `uvm_error("GOLDEN_GRAMMAR",
+                 $sformatf("%s left %0d partially parsed cases", label,
+                           cases.size()))
+    status = $system($sformatf("rm -f -- %s", path));
+    if (status != 0)
+      `uvm_error("GOLDEN_GRAMMAR", $sformatf("cannot remove %s", path))
+  endtask
+
+  task check_golden_reader_rejections();
     byte unsigned payload[];
     string parsed_name;
     string error;
+    string valid_case;
 
     if (rdma_xtr_v1_golden_reader::parse_payload_line(
           "AA\n", 1, payload, error))
@@ -71,7 +104,44 @@ class rdma_xtr_v1_defs_test extends uvm_test;
     if (rdma_xtr_v1_golden_reader::parse_case_line(
           "# case: qpc-rc-boundary\n", parsed_name, error))
       `uvm_error("GOLDEN_GRAMMAR", "punctuated case name was accepted")
-  endfunction
+
+    valid_case = {"# xtr_v1-golden-v1\n",
+                  "# case: first\n",
+                  "# inputs: value=1\n",
+                  "# bytes: 1\n",
+                  "00\n"};
+    check_read_all_rejection(
+        "/tmp/rdma_xtr_v1_defs_test_duplicate.hex",
+        {valid_case, "\n# xtr_v1-golden-v1\n",
+         "# case: first\n",
+         "# inputs: value=2\n",
+         "# bytes: 1\n",
+         "01\n"},
+        "duplicate case name");
+    check_read_all_rejection(
+        "/tmp/rdma_xtr_v1_defs_test_truncated.hex",
+        {"# xtr_v1-golden-v1\n",
+         "# case: truncated\n",
+         "# inputs: value=1\n",
+         "# bytes: 2\n",
+         "00\n"},
+        "truncated payload");
+    check_read_all_rejection(
+        "/tmp/rdma_xtr_v1_defs_test_extra.hex",
+        {"# xtr_v1-golden-v1\n",
+         "# case: extra\n",
+         "# inputs: value=1\n",
+         "# bytes: 1\n",
+         "00 01\n"},
+        "extra payload byte");
+    check_read_all_rejection(
+        "/tmp/rdma_xtr_v1_defs_test_incomplete.hex",
+        {valid_case, "\n# xtr_v1-golden-v1\n",
+         "# case: incomplete\n",
+         "# inputs: value=2\n",
+         "# bytes: 1\n"},
+        "incomplete trailing case");
+  endtask
 
   function void check_mask_lookup_api();
     bit [63:0] mask_value;

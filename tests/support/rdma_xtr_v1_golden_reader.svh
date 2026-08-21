@@ -218,6 +218,7 @@ class rdma_xtr_v1_golden_reader;
     string line;
     string content;
     rdma_xtr_v1_golden_case current;
+    rdma_xtr_v1_golden_case parsed_cases[$];
 
     cases.delete();
     error = "";
@@ -246,8 +247,8 @@ class rdma_xtr_v1_golden_reader;
             $fclose(fd);
             return 0;
           end
-          foreach (cases[index]) begin
-            if (cases[index].name == current.name) begin
+          foreach (parsed_cases[index]) begin
+            if (parsed_cases[index].name == current.name) begin
               error = $sformatf("duplicate case name %s", current.name);
               $fclose(fd);
               return 0;
@@ -275,7 +276,7 @@ class rdma_xtr_v1_golden_reader;
             $fclose(fd);
             return 0;
           end
-          cases.push_back(current);
+          parsed_cases.push_back(current);
           state = 5;
         end
         5: begin
@@ -291,15 +292,16 @@ class rdma_xtr_v1_golden_reader;
     end
     $fclose(fd);
     if (state != 5) begin
-      error = (state == 0 && cases.size() != 0)
+      error = (state == 0 && parsed_cases.size() != 0)
               ? "trailing blank separator"
               : "incomplete trailing case";
       return 0;
     end
-    if (cases.size() == 0) begin
+    if (parsed_cases.size() == 0) begin
       error = "golden file has no cases";
       return 0;
     end
+    cases = parsed_cases;
     return 1;
   endfunction
 endclass
