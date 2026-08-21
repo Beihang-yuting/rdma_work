@@ -167,6 +167,11 @@ class rdma_resource_manager extends uvm_object;
       if (!generation_high_water.exists(key))
         return rdma_status::make(RDMA_SC_INVALID_STATE,
                                  "Function generation ledger is missing");
+      if (generation_exhausted.exists(key))
+        return rdma_status::make(
+          RDMA_SC_RESOURCE_EXHAUSTED,
+          "Function generation counter is permanently exhausted"
+        );
       if (observed_generation < generation_high_water[key]) begin
         if (generation_high_water[key] == 32'hffff_ffff &&
             observed_generation == 0) begin
@@ -208,7 +213,6 @@ class rdma_resource_manager extends uvm_object;
     binding_snapshots[key] = clone_binding_value(trusted_binding,
                                                  "binding registry");
     generation_high_water[key] = owner.generation;
-    generation_exhausted.delete(key);
   endfunction
 
   protected function rdma_status active_binding_status(

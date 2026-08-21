@@ -9,6 +9,18 @@ class rdma_resource_manager_probe extends rdma_resource_manager;
   );
     next_object_serial[kind] = next_serial;
   endfunction
+
+  function int unsigned observed_next_local_id(
+    rdma_resource_kind_e kind
+  );
+    return next_local_id[kind];
+  endfunction
+
+  function int unsigned observed_next_object_serial(
+    rdma_resource_kind_e kind
+  );
+    return next_object_serial[kind];
+  endfunction
 endclass
 
 class rdma_resource_manager_test extends uvm_test;
@@ -115,6 +127,7 @@ class rdma_resource_manager_test extends uvm_test;
     rdma_resource_manager rollback_rm;
     rdma_resource_manager function_cycle_rm;
     rdma_resource_manager function_wrap_rm;
+    rdma_resource_manager_probe permanent_exhaustion_rm;
     rdma_resource_manager_probe exhaustion_rm;
     rdma_hmc_allocator hmc;
     rdma_hmc_allocator hmc_exhaustion;
@@ -127,6 +140,7 @@ class rdma_resource_manager_test extends uvm_test;
     rdma_function_binding rollback_binding;
     rdma_function_binding function_cycle_binding;
     rdma_function_binding function_wrap_binding;
+    rdma_function_binding permanent_exhaustion_binding;
     rdma_function_handle owner_h;
     rdma_function_handle owner_b_h;
     rdma_pd pd;
@@ -157,6 +171,10 @@ class rdma_resource_manager_test extends uvm_test;
     rdma_function rejected_function;
     rdma_function function_max;
     rdma_function function_wrapped;
+    rdma_function permanent_exhaustion_function;
+    rdma_pd permanent_exhaustion_pd;
+    rdma_cmq permanent_exhaustion_cmq;
+    rdma_aeq permanent_exhaustion_aeq;
     rdma_mr dep_mr;
     rdma_mr teardown_mr;
     rdma_cq cq_pool;
@@ -182,6 +200,10 @@ class rdma_resource_manager_test extends uvm_test;
     rdma_resource second_resource;
     rdma_status s;
     int unsigned leak_count;
+    int unsigned pd_local_before_exhaustion;
+    int unsigned pd_serial_before_exhaustion;
+    int unsigned cmq_local_before_exhaustion;
+    int unsigned cmq_serial_before_exhaustion;
     rdma_hmc_fvm_addr_t hmc_base;
     rdma_hmc_fvm_addr_t hmc_addr;
     rdma_hmc_fvm_addr_t hmc_addr_two;
@@ -648,6 +670,142 @@ class rdma_resource_manager_test extends uvm_test;
     expect_status("FUNCTION_WRAP_OLD_STALE",
                   function_wrap_rm.lookup(owner_h, resource),
                   RDMA_SC_STALE_GENERATION);
+
+    // Once max -> zero is observed, exhaustion is permanent even if the same
+    // live source is written back to max.  Rejected retries are atomic and the
+    // privileged teardown path remains available for the old max topology.
+    permanent_exhaustion_rm = new("permanent_exhaustion_rm");
+    permanent_exhaustion_binding = make_active_binding(
+      "permanent_exhaustion_binding", 64'hf00c_0000_0000_0003,
+      32'hf00c_0303, 32'hffff_ffff
+    );
+    expect_status(
+      "PERMANENT_EXHAUSTION_CREATE_MAX",
+      permanent_exhaustion_rm.create_function(
+        permanent_exhaustion_binding, permanent_exhaustion_function
+      ),
+      RDMA_SC_OK
+    );
+    owner_h = clone_function_handle(
+      "PERMANENT_EXHAUSTION_OWNER_MAX", permanent_exhaustion_function.owner
+    );
+    old_h = clone_handle("PERMANENT_EXHAUSTION_OLD_HANDLE",
+                         permanent_exhaustion_function.handle);
+    expect_status(
+      "PERMANENT_EXHAUSTION_INITIAL_LIVE",
+      permanent_exhaustion_rm.check_leaks(leak_count, owner_h),
+      RDMA_SC_INVALID_STATE
+    );
+    if (leak_count != 1)
+      `uvm_error("PERMANENT_EXHAUSTION_INITIAL_LIVE",
+                 $sformatf("expected 1 live resource, got %0d", leak_count))
+
+    pd_local_before_exhaustion =
+      permanent_exhaustion_rm.observed_next_local_id(RDMA_RESOURCE_PD);
+    pd_serial_before_exhaustion =
+      permanent_exhaustion_rm.observed_next_object_serial(RDMA_RESOURCE_PD);
+    cmq_local_before_exhaustion =
+      permanent_exhaustion_rm.observed_next_local_id(RDMA_RESOURCE_CMQ);
+    cmq_serial_before_exhaustion =
+      permanent_exhaustion_rm.observed_next_object_serial(RDMA_RESOURCE_CMQ);
+
+    permanent_exhaustion_binding.generation = 32'd0;
+    permanent_exhaustion_binding.owner_h =
+      permanent_exhaustion_binding.make_handle();
+    expect_status(
+      "PERMANENT_EXHAUSTION_REJECT_ZERO",
+      permanent_exhaustion_rm.create_pd(permanent_exhaustion_binding,
+                                        permanent_exhaustion_pd),
+      RDMA_SC_RESOURCE_EXHAUSTED
+    );
+    if (permanent_exhaustion_pd != null)
+      `uvm_error("PERMANENT_EXHAUSTION_REJECT_ZERO",
+                 "zero generation returned a PD")
+
+    permanent_exhaustion_binding.generation = 32'hffff_ffff;
+    permanent_exhaustion_binding.owner_h =
+      permanent_exhaustion_binding.make_handle();
+    expect_status(
+      "PERMANENT_EXHAUSTION_REJECT_MAX_PD",
+      permanent_exhaustion_rm.create_pd(permanent_exhaustion_binding,
+                                        permanent_exhaustion_pd),
+      RDMA_SC_RESOURCE_EXHAUSTED
+    );
+    if (permanent_exhaustion_pd != null)
+      `uvm_error("PERMANENT_EXHAUSTION_REJECT_MAX_PD",
+                 "max-generation retry returned a PD")
+    expect_status(
+      "PERMANENT_EXHAUSTION_REJECT_MAX_CMQ",
+      permanent_exhaustion_rm.create_cmq(permanent_exhaustion_binding,
+                                         permanent_exhaustion_cmq),
+      RDMA_SC_RESOURCE_EXHAUSTED
+    );
+    if (permanent_exhaustion_cmq != null)
+      `uvm_error("PERMANENT_EXHAUSTION_REJECT_MAX_CMQ",
+                 "max-generation retry returned a CMQ")
+    expect_status(
+      "PERMANENT_EXHAUSTION_NO_GHOSTS",
+      permanent_exhaustion_rm.check_leaks(leak_count, owner_h),
+      RDMA_SC_INVALID_STATE
+    );
+    if (leak_count != 1)
+      `uvm_error("PERMANENT_EXHAUSTION_NO_GHOSTS",
+                 $sformatf("failed creates changed leak count to %0d",
+                           leak_count))
+    if (permanent_exhaustion_rm.observed_next_local_id(RDMA_RESOURCE_PD) !=
+          pd_local_before_exhaustion ||
+        permanent_exhaustion_rm.observed_next_object_serial(
+          RDMA_RESOURCE_PD
+        ) != pd_serial_before_exhaustion)
+      `uvm_error("PERMANENT_EXHAUSTION_PD_ATOMIC",
+                 "failed PD creates consumed an ID or incarnation serial")
+    if (permanent_exhaustion_rm.observed_next_local_id(RDMA_RESOURCE_CMQ) !=
+          cmq_local_before_exhaustion ||
+        permanent_exhaustion_rm.observed_next_object_serial(
+          RDMA_RESOURCE_CMQ
+        ) != cmq_serial_before_exhaustion)
+      `uvm_error("PERMANENT_EXHAUSTION_CMQ_ATOMIC",
+                 "failed CMQ create consumed an ID or incarnation serial")
+    expect_status(
+      "PERMANENT_EXHAUSTION_OLD_LOOKUP",
+      permanent_exhaustion_rm.lookup(old_h, resource),
+      RDMA_SC_STALE_GENERATION
+    );
+    expect_status(
+      "PERMANENT_EXHAUSTION_OLD_RELEASE",
+      permanent_exhaustion_rm.\release (old_h),
+      RDMA_SC_STALE_GENERATION
+    );
+    expect_status(
+      "PERMANENT_EXHAUSTION_PRIVILEGED_TEARDOWN",
+      permanent_exhaustion_rm.release_function(owner_h), RDMA_SC_OK
+    );
+    expect_status(
+      "PERMANENT_EXHAUSTION_NO_LEAKS",
+      permanent_exhaustion_rm.check_leaks(leak_count, owner_h), RDMA_SC_OK
+    );
+    if (leak_count != 0)
+      `uvm_error("PERMANENT_EXHAUSTION_NO_LEAKS",
+                 "privileged teardown leaked the max-generation topology")
+    expect_status(
+      "PERMANENT_EXHAUSTION_AFTER_TEARDOWN",
+      permanent_exhaustion_rm.create_aeq(permanent_exhaustion_binding,
+                                         permanent_exhaustion_aeq),
+      RDMA_SC_RESOURCE_EXHAUSTED
+    );
+    if (permanent_exhaustion_aeq != null)
+      `uvm_error("PERMANENT_EXHAUSTION_AFTER_TEARDOWN",
+                 "post-teardown retry returned an AEQ")
+    expect_status(
+      "PERMANENT_EXHAUSTION_RETIRED_LOOKUP",
+      permanent_exhaustion_rm.lookup(old_h, resource),
+      RDMA_SC_STALE_GENERATION
+    );
+    expect_status(
+      "PERMANENT_EXHAUSTION_RETIRED_RELEASE",
+      permanent_exhaustion_rm.\release (old_h),
+      RDMA_SC_STALE_GENERATION
+    );
 
     // Incarnation exhaustion is a clean failure; it never wraps to revive an
     // earlier handle, and another kind's serial pool remains independent.
