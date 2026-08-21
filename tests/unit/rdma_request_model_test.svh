@@ -877,19 +877,17 @@ class rdma_request_model_test extends uvm_test;
     qpc.state = RDMA_QPS_RTS;
     qpc.sq_depth = 1024;
     qpc.rq_depth = 512;
-    qpc.sq_base.value = 64'h6000_0000;
-    qpc.rq_base.value = 64'h6001_0000;
-    qpc.sq_producer_index = 32'h71;
-    qpc.sq_consumer_index = 32'h31;
-    qpc.rq_producer_index = 32'h52;
-    qpc.rq_consumer_index = 32'h22;
+    qpc.sq_backing.value = 64'h6000_0000;
+    qpc.rq_backing.value = 64'h6001_0000;
+    qpc.context_backing.value = 64'h6002_0000;
+    qpc.address_vector.destination_mac = 48'h02_11_22_33_44_55;
     rc_ext = rdma_qpc_rc_ext::type_id::create("rc_ext");
     rc_ext.remote_qpn = 24'habc123;
     rc_ext.send_psn = 24'h102030;
     rc_ext.recv_psn = 24'h405060;
     rc_ext.retry_count = 3;
     rc_ext.rnr_retry_count = 5;
-    rc_ext.path_mtu = 8'h4;
+    rc_ext.path_mtu_bytes = 4096;
     qpc.transport_ext = rc_ext;
     expect_status("QPC_RC", qpc.validate(), RDMA_SC_OK);
     cloned_object = qpc.clone();
@@ -909,12 +907,10 @@ class rdma_request_model_test extends uvm_test;
         qpc_clone.transport != RDMA_TRANSPORT_RC ||
         qpc_clone.state != RDMA_QPS_RTS ||
         qpc_clone.sq_depth != 1024 || qpc_clone.rq_depth != 512 ||
-        qpc_clone.sq_base.value != 64'h6000_0000 ||
-        qpc_clone.rq_base.value != 64'h6001_0000 ||
-        qpc_clone.sq_producer_index != 32'h71 ||
-        qpc_clone.sq_consumer_index != 32'h31 ||
-        qpc_clone.rq_producer_index != 32'h52 ||
-        qpc_clone.rq_consumer_index != 32'h22)
+        qpc_clone.sq_backing.value != 64'h6000_0000 ||
+        qpc_clone.rq_backing.value != 64'h6001_0000 ||
+        qpc_clone.context_backing.value != 64'h6002_0000 ||
+        qpc_clone.address_vector == qpc.address_vector)
       `uvm_error("QPC_CLONE", "QPC clone lost or aliased common fields")
     else if (!$cast(rc_ext_clone, qpc_clone.transport_ext))
       `uvm_error("QPC_CLONE", "QPC clone lost RC extension type")
@@ -923,7 +919,7 @@ class rdma_request_model_test extends uvm_test;
         rc_ext_clone.recv_psn != 24'h405060 ||
         rc_ext_clone.retry_count != 3 ||
         rc_ext_clone.rnr_retry_count != 5 ||
-        rc_ext_clone.path_mtu != 8'h4)
+        rc_ext_clone.path_mtu_bytes != 4096)
       `uvm_error("QPC_CLONE", "QPC clone lost nested RC extension")
     else begin
       qpc_clone.qp_h.object_id++;
@@ -936,91 +932,91 @@ class rdma_request_model_test extends uvm_test;
 
     ud_ext = rdma_qpc_ud_ext::type_id::create("ud_ext");
     ud_ext.qkey = 32'h8001_0000;
-    ud_ext.address_vector_id = 32'h7654_3210;
     qpc.transport_ext = ud_ext;
     expect_status("QPC_MISMATCH", qpc.validate(), RDMA_SC_INVALID_ARGUMENT);
     qpc.transport = RDMA_TRANSPORT_UD;
+    qpc.address_vector = null;
     expect_status("QPC_UD_AV_MISSING", qpc.validate(),
                   RDMA_SC_INVALID_ARGUMENT);
-    ud_ext.address_vector_valid = 1'b1;
-    ud_ext.address_vector_id = '0;
-    expect_status("QPC_UD_ZERO_AV_ID", qpc.validate(), RDMA_SC_OK);
-    ud_ext.address_vector_id = 32'h7654_3210;
+    qpc.address_vector = rdma_address_vector::type_id::create("qpc_ud_av");
     expect_status("QPC_UD", qpc.validate(), RDMA_SC_OK);
     urc_ext = rdma_qpc_urc_ext::type_id::create("urc_ext");
     urc_ext.remote_qpn = 24'h765432;
-    urc_ext.send_psn = 24'h112244;
-    urc_ext.path_mtu = 8'h5;
+    urc_ext.rbsn = 24'h112244;
+    urc_ext.dbsn = 24'h223355;
+    urc_ext.rpsn = 24'h334466;
+    urc_ext.dpsn = 24'h445577;
+    urc_ext.path_mtu_bytes = 8192;
+    urc_ext.rsq_backing.value = 64'h6100_0000;
+    urc_ext.rdsq_backing.value = 64'h6200_0000;
+    urc_ext.dsq_backing.value = 64'h6300_0000;
     qpc.transport = RDMA_TRANSPORT_URC;
     qpc.transport_ext = urc_ext;
     expect_status("QPC_URC", qpc.validate(), RDMA_SC_OK);
     qpc.state = rdma_qp_state_e'(4'hf);
     expect_status("QPC_STATE", qpc.validate(), RDMA_SC_INVALID_ARGUMENT);
     qpc.state = RDMA_QPS_RTS;
-    qpc.sq_producer_index = qpc.sq_depth;
-    expect_status("QPC_SQ_PI", qpc.validate(), RDMA_SC_INVALID_ARGUMENT);
-    qpc.sq_producer_index = 32'h71;
-    qpc.sq_consumer_index = qpc.sq_depth;
-    expect_status("QPC_SQ_CI", qpc.validate(), RDMA_SC_INVALID_ARGUMENT);
-    qpc.sq_consumer_index = 32'h31;
-    qpc.rq_producer_index = qpc.rq_depth;
-    expect_status("QPC_RQ_PI", qpc.validate(), RDMA_SC_INVALID_ARGUMENT);
-    qpc.rq_producer_index = 32'h52;
-    qpc.rq_consumer_index = qpc.rq_depth;
-    expect_status("QPC_RQ_CI", qpc.validate(), RDMA_SC_INVALID_ARGUMENT);
-    qpc.rq_consumer_index = 32'h22;
 
     cqc = rdma_cqc_model::type_id::create("cqc");
     cqc.cq_h = cq_h;
+    cqc.state = RDMA_CONTEXT_VALID;
     cqc.depth = 256;
-    cqc.base_addr.value = 64'h7000_0000;
+    cqc.cqe_size_bytes = 64;
+    cqc.page_layout.current_valid = 1'b1;
+    cqc.page_layout.current_base.value = 64'h7000_0000;
     expect_status("CQC", cqc.validate(), RDMA_SC_OK);
-    cqc.producer_index = cqc.depth;
+    cqc.producer.index = cqc.depth;
     expect_status("CQC_PI", cqc.validate(), RDMA_SC_INVALID_ARGUMENT);
-    cqc.producer_index = 0;
-    cqc.consumer_index = cqc.depth;
+    cqc.producer.index = 0;
+    cqc.consumer.index = cqc.depth;
     expect_status("CQC_CI", cqc.validate(), RDMA_SC_INVALID_ARGUMENT);
-    cqc.consumer_index = 0;
+    cqc.consumer.index = 0;
     mrt = rdma_mrt_model::type_id::create("mrt");
     mrt.mr_h = mr_h;
     mrt.pd_h = pd_h;
+    mrt.state = RDMA_CONTEXT_VALID;
     mrt.iova.value = 64'h8000_0000;
     mrt.length = 64'h1000;
+    mrt.lkey = 32'h0002_025a;
+    mrt.rkey = 0;
+    mrt.access.local_write = 1'b1;
     expect_status("MRT", mrt.validate(), RDMA_SC_OK);
     srqc = rdma_srqc_model::type_id::create("srqc");
     srqc.srq_h = srq_h;
     srqc.pd_h = pd_h;
+    srqc.state = RDMA_CONTEXT_VALID;
     srqc.depth = 128;
-    srqc.base_addr.value = 64'h9000_0000;
+    srqc.srfq_backing.value = 64'h9000_0000;
     expect_status("SRQC", srqc.validate(), RDMA_SC_OK);
-    srqc.producer_index = srqc.depth;
+    srqc.producer.index = srqc.depth;
     expect_status("SRQC_PI", srqc.validate(), RDMA_SC_INVALID_ARGUMENT);
-    srqc.producer_index = 0;
-    srqc.consumer_index = srqc.depth;
-    expect_status("SRQC_CI", srqc.validate(), RDMA_SC_INVALID_ARGUMENT);
-    srqc.consumer_index = 0;
+    srqc.producer.index = 0;
     ceqc = rdma_ceqc_model::type_id::create("ceqc");
     ceqc.ceq_h = ceq_h;
+    ceqc.state = RDMA_CONTEXT_VALID;
     ceqc.depth = 64;
-    ceqc.base_addr.value = 64'ha000_0000;
+    ceqc.page_layout.current_valid = 1'b1;
+    ceqc.page_layout.current_base.value = 64'ha000_0000;
     expect_status("CEQC", ceqc.validate(), RDMA_SC_OK);
-    ceqc.producer_index = ceqc.depth;
+    ceqc.producer.index = ceqc.depth;
     expect_status("CEQC_PI", ceqc.validate(), RDMA_SC_INVALID_ARGUMENT);
-    ceqc.producer_index = 0;
-    ceqc.consumer_index = ceqc.depth;
+    ceqc.producer.index = 0;
+    ceqc.consumer.index = ceqc.depth;
     expect_status("CEQC_CI", ceqc.validate(), RDMA_SC_INVALID_ARGUMENT);
-    ceqc.consumer_index = 0;
+    ceqc.consumer.index = 0;
     aeqc = rdma_aeqc_model::type_id::create("aeqc");
     aeqc.aeq_h = aeq_h;
+    aeqc.state = RDMA_CONTEXT_VALID;
     aeqc.depth = 64;
-    aeqc.base_addr.value = 64'hb000_0000;
+    aeqc.page_layout.current_valid = 1'b1;
+    aeqc.page_layout.current_base.value = 64'hb000_0000;
     expect_status("AEQC", aeqc.validate(), RDMA_SC_OK);
-    aeqc.producer_index = aeqc.depth;
+    aeqc.producer.index = aeqc.depth;
     expect_status("AEQC_PI", aeqc.validate(), RDMA_SC_INVALID_ARGUMENT);
-    aeqc.producer_index = 0;
-    aeqc.consumer_index = aeqc.depth;
+    aeqc.producer.index = 0;
+    aeqc.consumer.index = aeqc.depth;
     expect_status("AEQC_CI", aeqc.validate(), RDMA_SC_INVALID_ARGUMENT);
-    aeqc.consumer_index = 0;
+    aeqc.consumer.index = 0;
     if (qpc.describe() == "" || cqc.describe() == "")
       `uvm_error("HW_MODEL", "hardware models lack semantic descriptions")
 
@@ -1075,8 +1071,8 @@ class rdma_request_model_test extends uvm_test;
     else if (!$cast(urc_ext_clone, qpc_clone.transport_ext))
       `uvm_error("CMQ_CLONE", "CMQ QPC clone lost URC extension type")
     else if (urc_ext_clone.remote_qpn != 24'h765432 ||
-        urc_ext_clone.send_psn != 24'h112244 ||
-        urc_ext_clone.path_mtu != 8'h5)
+        urc_ext_clone.rbsn != 24'h112244 ||
+        urc_ext_clone.path_mtu_bytes != 8192)
       `uvm_error("CMQ_CLONE", "CMQ SQE clone lost nested context")
     else begin
       cmq_clone.function_h.function_uid++;

@@ -7,6 +7,131 @@ virtual class rdma_hw_model extends uvm_object;
   pure virtual function string describe();
 endclass
 
+// Context handles carry hardware-projection/local IDs.  Resource-manager
+// incarnation IDs remain opaque registry identities and are not used here.
+function automatic rdma_status rdma_context_handle_status(
+  rdma_handle handle,
+  rdma_resource_kind_e expected_kind,
+  int unsigned object_id_width,
+  string label
+);
+  longint unsigned object_id_limit;
+
+  if (handle == null)
+    return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                             {label, " handle is null"});
+  if (handle.kind != expected_kind)
+    return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                             {label, " handle kind is invalid"});
+  object_id_limit = 64'h1 << object_id_width;
+  if ({32'b0, handle.object_id} >= object_id_limit)
+    return rdma_status::make(
+      RDMA_SC_INVALID_ARGUMENT,
+      $sformatf("%s object ID exceeds %0d bits", label, object_id_width)
+    );
+  return rdma_status::success();
+endfunction
+
+function automatic rdma_status rdma_context_lifecycle_status(
+  rdma_handle reference,
+  rdma_handle candidate,
+  string label
+);
+  if (reference == null || candidate == null)
+    return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                             {label, " lifecycle handle is null"});
+  if (candidate.function_uid != reference.function_uid)
+    return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                             {label, " function UID does not match"});
+  if (candidate.generation != reference.generation)
+    return rdma_status::make(RDMA_SC_STALE_GENERATION,
+                             {label, " generation does not match"});
+  return rdma_status::success();
+endfunction
+
+function automatic rdma_status rdma_context_state_status(
+  rdma_context_state_e state,
+  string label
+);
+  if (!(state inside {RDMA_CONTEXT_INVALID, RDMA_CONTEXT_VALID,
+                      RDMA_CONTEXT_ERROR}))
+    return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                             {label, " context state is invalid"});
+  return rdma_status::success();
+endfunction
+
+function automatic rdma_status rdma_object_mode_status(
+  rdma_object_mode_e mode,
+  string label
+);
+  if (!(mode inside {RDMA_OBJECT_DIRECT_4K, RDMA_OBJECT_INDIRECT_4K,
+                     RDMA_OBJECT_HUGE_2M,
+                     RDMA_OBJECT_L3_INDIRECT_4K}))
+    return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                             {label, " object mode is invalid"});
+  return rdma_status::success();
+endfunction
+
+function automatic rdma_page_table_layout rdma_clone_page_layout_value(
+  rdma_page_table_layout source,
+  string label
+);
+  uvm_object cloned_object;
+  rdma_page_table_layout cloned_layout;
+
+  if (source == null)
+    return null;
+  cloned_object = source.clone();
+  if (cloned_object == null || !$cast(cloned_layout, cloned_object))
+    `uvm_fatal("RDMA_COPY_TYPE", {label, " page layout clone mismatch"})
+  return cloned_layout;
+endfunction
+
+function automatic rdma_ring_position rdma_clone_ring_position_value(
+  rdma_ring_position source,
+  string label
+);
+  uvm_object cloned_object;
+  rdma_ring_position cloned_position;
+
+  if (source == null)
+    return null;
+  cloned_object = source.clone();
+  if (cloned_object == null || !$cast(cloned_position, cloned_object))
+    `uvm_fatal("RDMA_COPY_TYPE", {label, " ring position clone mismatch"})
+  return cloned_position;
+endfunction
+
+function automatic rdma_address_vector rdma_clone_address_vector_value(
+  rdma_address_vector source,
+  string label
+);
+  uvm_object cloned_object;
+  rdma_address_vector cloned_vector;
+
+  if (source == null)
+    return null;
+  cloned_object = source.clone();
+  if (cloned_object == null || !$cast(cloned_vector, cloned_object))
+    `uvm_fatal("RDMA_COPY_TYPE", {label, " address vector clone mismatch"})
+  return cloned_vector;
+endfunction
+
+function automatic rdma_mr_page_layout rdma_clone_mr_page_layout_value(
+  rdma_mr_page_layout source,
+  string label
+);
+  uvm_object cloned_object;
+  rdma_mr_page_layout cloned_layout;
+
+  if (source == null)
+    return null;
+  cloned_object = source.clone();
+  if (cloned_object == null || !$cast(cloned_layout, cloned_object))
+    `uvm_fatal("RDMA_COPY_TYPE", {label, " MR page layout clone mismatch"})
+  return cloned_layout;
+endfunction
+
 virtual class rdma_qpc_transport_ext extends uvm_object;
   function new(string name = "rdma_qpc_transport_ext");
     super.new(name);
@@ -23,9 +148,9 @@ class rdma_qpc_rc_ext extends rdma_qpc_transport_ext;
   bit [23:0] remote_qpn;
   bit [23:0] send_psn;
   bit [23:0] recv_psn;
-  bit [7:0] retry_count;
-  bit [7:0] rnr_retry_count;
-  bit [7:0] path_mtu;
+  int unsigned retry_count;
+  int unsigned rnr_retry_count;
+  int unsigned path_mtu_bytes;
 
   function new(string name = "rdma_qpc_rc_ext");
     super.new(name);
@@ -34,7 +159,7 @@ class rdma_qpc_rc_ext extends rdma_qpc_transport_ext;
     recv_psn = '0;
     retry_count = '0;
     rnr_retry_count = '0;
-    path_mtu = '0;
+    path_mtu_bytes = '0;
   endfunction
 
   virtual function void do_copy(uvm_object rhs);
@@ -48,7 +173,7 @@ class rdma_qpc_rc_ext extends rdma_qpc_transport_ext;
     recv_psn = rhs_ext.recv_psn;
     retry_count = rhs_ext.retry_count;
     rnr_retry_count = rhs_ext.rnr_retry_count;
-    path_mtu = rhs_ext.path_mtu;
+    path_mtu_bytes = rhs_ext.path_mtu_bytes;
   endfunction
 
   virtual function rdma_transport_e transport_kind();
@@ -63,8 +188,8 @@ class rdma_qpc_rc_ext extends rdma_qpc_transport_ext;
   endfunction
 
   virtual function string describe();
-    return $sformatf("RC(remote_qpn=%0d send_psn=%0d recv_psn=%0d)",
-                     remote_qpn, send_psn, recv_psn);
+    return $sformatf("RC(remote_qpn=%0d send_psn=%0d recv_psn=%0d mtu=%0d)",
+                     remote_qpn, send_psn, recv_psn, path_mtu_bytes);
   endfunction
 endclass
 
@@ -72,18 +197,10 @@ class rdma_qpc_ud_ext extends rdma_qpc_transport_ext;
   `uvm_object_utils(rdma_qpc_ud_ext)
 
   bit [31:0] qkey;
-  int unsigned address_vector_id;
-  bit address_vector_valid;
-  bit [7:0] traffic_class;
-  bit [19:0] flow_label;
 
   function new(string name = "rdma_qpc_ud_ext");
     super.new(name);
     qkey = '0;
-    address_vector_id = '0;
-    address_vector_valid = 1'b0;
-    traffic_class = '0;
-    flow_label = '0;
   endfunction
 
   virtual function void do_copy(uvm_object rhs);
@@ -93,10 +210,6 @@ class rdma_qpc_ud_ext extends rdma_qpc_transport_ext;
     if (!$cast(rhs_ext, rhs))
       `uvm_fatal("RDMA_COPY_TYPE", "UD QPC extension copy mismatch")
     qkey = rhs_ext.qkey;
-    address_vector_id = rhs_ext.address_vector_id;
-    address_vector_valid = rhs_ext.address_vector_valid;
-    traffic_class = rhs_ext.traffic_class;
-    flow_label = rhs_ext.flow_label;
   endfunction
 
   virtual function rdma_transport_e transport_kind();
@@ -104,15 +217,14 @@ class rdma_qpc_ud_ext extends rdma_qpc_transport_ext;
   endfunction
 
   virtual function rdma_status validate();
-    if (qkey == 0 || !address_vector_valid)
+    if (qkey == 0)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                               "UD QPC lacks qkey or address vector");
+                               "UD QPC qkey is zero");
     return rdma_status::success();
   endfunction
 
   virtual function string describe();
-    return $sformatf("UD(qkey=0x%08x address_vector_id=%0d)",
-                     qkey, address_vector_id);
+    return $sformatf("UD(qkey=0x%08x)", qkey);
   endfunction
 endclass
 
@@ -120,14 +232,30 @@ class rdma_qpc_urc_ext extends rdma_qpc_transport_ext;
   `uvm_object_utils(rdma_qpc_urc_ext)
 
   bit [23:0] remote_qpn;
-  bit [23:0] send_psn;
-  bit [7:0] path_mtu;
+  bit [23:0] rbsn;
+  bit [23:0] dbsn;
+  bit [23:0] rpsn;
+  bit [23:0] dpsn;
+  int unsigned path_mtu_bytes;
+  rdma_backing_addr_t rsq_backing;
+  rdma_backing_addr_t rdsq_backing;
+  rdma_backing_addr_t dsq_backing;
+  int unsigned fetch_threshold;
+  int unsigned queue_threshold;
 
   function new(string name = "rdma_qpc_urc_ext");
     super.new(name);
     remote_qpn = '0;
-    send_psn = '0;
-    path_mtu = '0;
+    rbsn = '0;
+    dbsn = '0;
+    rpsn = '0;
+    dpsn = '0;
+    path_mtu_bytes = '0;
+    rsq_backing = '0;
+    rdsq_backing = '0;
+    dsq_backing = '0;
+    fetch_threshold = '0;
+    queue_threshold = '0;
   endfunction
 
   virtual function void do_copy(uvm_object rhs);
@@ -137,8 +265,16 @@ class rdma_qpc_urc_ext extends rdma_qpc_transport_ext;
     if (!$cast(rhs_ext, rhs))
       `uvm_fatal("RDMA_COPY_TYPE", "URC QPC extension copy mismatch")
     remote_qpn = rhs_ext.remote_qpn;
-    send_psn = rhs_ext.send_psn;
-    path_mtu = rhs_ext.path_mtu;
+    rbsn = rhs_ext.rbsn;
+    dbsn = rhs_ext.dbsn;
+    rpsn = rhs_ext.rpsn;
+    dpsn = rhs_ext.dpsn;
+    path_mtu_bytes = rhs_ext.path_mtu_bytes;
+    rsq_backing = rhs_ext.rsq_backing;
+    rdsq_backing = rhs_ext.rdsq_backing;
+    dsq_backing = rhs_ext.dsq_backing;
+    fetch_threshold = rhs_ext.fetch_threshold;
+    queue_threshold = rhs_ext.queue_threshold;
   endfunction
 
   virtual function rdma_transport_e transport_kind();
@@ -149,12 +285,17 @@ class rdma_qpc_urc_ext extends rdma_qpc_transport_ext;
     if (remote_qpn == 0)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "URC QPC remote QPN is zero");
+    if ((rsq_backing.value & 64'hfff) != 0 ||
+        (rdsq_backing.value & 64'hfff) != 0 ||
+        (dsq_backing.value & 64'hfff) != 0)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "URC queue backing is not 4 KiB aligned");
     return rdma_status::success();
   endfunction
 
   virtual function string describe();
-    return $sformatf("URC(remote_qpn=%0d send_psn=%0d)",
-                     remote_qpn, send_psn);
+    return $sformatf("URC(remote_qpn=%0d rbsn=%0d dbsn=%0d mtu=%0d)",
+                     remote_qpn, rbsn, dbsn, path_mtu_bytes);
   endfunction
 endclass
 
@@ -168,14 +309,23 @@ class rdma_qpc_model extends rdma_hw_model;
   rdma_handle srq_h;
   rdma_transport_e transport;
   rdma_qp_state_e state;
+  int unsigned host_id;
+  int unsigned vf_id;
+  int unsigned stat_index;
+  bit [15:0] pkey;
+  bit [7:0] qp_sequence;
+  rdma_rdma_access_t access;
   int unsigned sq_depth;
   int unsigned rq_depth;
-  rdma_hmc_fvm_addr_t sq_base;
-  rdma_hmc_fvm_addr_t rq_base;
-  int unsigned sq_producer_index;
-  int unsigned sq_consumer_index;
-  int unsigned rq_producer_index;
-  int unsigned rq_consumer_index;
+  rdma_backing_addr_t sq_backing;
+  rdma_backing_addr_t rq_backing;
+  rdma_backing_addr_t context_backing;
+  rdma_object_mode_e sq_mode;
+  rdma_object_mode_e rq_mode;
+  rdma_address_vector address_vector;
+  bit signature_enable;
+  bit tx_flow_control;
+  bit rx_flow_control;
   rdma_qpc_transport_ext transport_ext;
 
   function new(string name = "rdma_qpc_model");
@@ -187,14 +337,23 @@ class rdma_qpc_model extends rdma_hw_model;
     srq_h = null;
     transport = RDMA_TRANSPORT_RC;
     state = RDMA_QPS_RESET;
+    host_id = '0;
+    vf_id = '0;
+    stat_index = '0;
+    pkey = '0;
+    qp_sequence = '0;
+    access = '0;
     sq_depth = '0;
     rq_depth = '0;
-    sq_base = '0;
-    rq_base = '0;
-    sq_producer_index = '0;
-    sq_consumer_index = '0;
-    rq_producer_index = '0;
-    rq_consumer_index = '0;
+    sq_backing = '0;
+    rq_backing = '0;
+    context_backing = '0;
+    sq_mode = RDMA_OBJECT_DIRECT_4K;
+    rq_mode = RDMA_OBJECT_DIRECT_4K;
+    address_vector = rdma_address_vector::type_id::create("address_vector");
+    signature_enable = 1'b0;
+    tx_flow_control = 1'b0;
+    rx_flow_control = 1'b0;
     transport_ext = null;
   endfunction
 
@@ -213,14 +372,24 @@ class rdma_qpc_model extends rdma_hw_model;
     srq_h = rdma_clone_handle_value(rhs_qpc.srq_h, "QPC SRQ");
     transport = rhs_qpc.transport;
     state = rhs_qpc.state;
+    host_id = rhs_qpc.host_id;
+    vf_id = rhs_qpc.vf_id;
+    stat_index = rhs_qpc.stat_index;
+    pkey = rhs_qpc.pkey;
+    qp_sequence = rhs_qpc.qp_sequence;
+    access = rhs_qpc.access;
     sq_depth = rhs_qpc.sq_depth;
     rq_depth = rhs_qpc.rq_depth;
-    sq_base = rhs_qpc.sq_base;
-    rq_base = rhs_qpc.rq_base;
-    sq_producer_index = rhs_qpc.sq_producer_index;
-    sq_consumer_index = rhs_qpc.sq_consumer_index;
-    rq_producer_index = rhs_qpc.rq_producer_index;
-    rq_consumer_index = rhs_qpc.rq_consumer_index;
+    sq_backing = rhs_qpc.sq_backing;
+    rq_backing = rhs_qpc.rq_backing;
+    context_backing = rhs_qpc.context_backing;
+    sq_mode = rhs_qpc.sq_mode;
+    rq_mode = rhs_qpc.rq_mode;
+    address_vector = rdma_clone_address_vector_value(rhs_qpc.address_vector,
+                                                     "QPC");
+    signature_enable = rhs_qpc.signature_enable;
+    tx_flow_control = rhs_qpc.tx_flow_control;
+    rx_flow_control = rhs_qpc.rx_flow_control;
     if (rhs_qpc.transport_ext == null) begin
       transport_ext = null;
     end
@@ -232,16 +401,39 @@ class rdma_qpc_model extends rdma_hw_model;
   endfunction
 
   virtual function rdma_status validate();
+    rdma_status status;
     rdma_qpc_rc_ext rc_ext;
     rdma_qpc_ud_ext ud_ext;
     rdma_qpc_urc_ext urc_ext;
 
-    if (qp_h == null || qp_h.kind != RDMA_RESOURCE_QP ||
-        pd_h == null || pd_h.kind != RDMA_RESOURCE_PD ||
-        send_cq_h == null || send_cq_h.kind != RDMA_RESOURCE_CQ ||
-        recv_cq_h == null || recv_cq_h.kind != RDMA_RESOURCE_CQ)
-      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                               "QPC requires QP, PD, and CQ references");
+    status = rdma_context_handle_status(qp_h, RDMA_RESOURCE_QP, 21,
+                                        "QPC QP");
+    if (!status.ok()) return status;
+    status = rdma_context_handle_status(pd_h, RDMA_RESOURCE_PD, 16,
+                                        "QPC PD");
+    if (!status.ok()) return status;
+    status = rdma_context_handle_status(send_cq_h, RDMA_RESOURCE_CQ, 20,
+                                        "QPC send CQ");
+    if (!status.ok()) return status;
+    status = rdma_context_handle_status(recv_cq_h, RDMA_RESOURCE_CQ, 20,
+                                        "QPC receive CQ");
+    if (!status.ok()) return status;
+    if (srq_h != null) begin
+      status = rdma_context_handle_status(srq_h, RDMA_RESOURCE_SRQ, 15,
+                                          "QPC SRQ");
+      if (!status.ok()) return status;
+    end
+    status = rdma_context_lifecycle_status(qp_h, pd_h, "QPC PD");
+    if (!status.ok()) return status;
+    status = rdma_context_lifecycle_status(qp_h, send_cq_h, "QPC send CQ");
+    if (!status.ok()) return status;
+    status = rdma_context_lifecycle_status(qp_h, recv_cq_h,
+                                           "QPC receive CQ");
+    if (!status.ok()) return status;
+    if (srq_h != null) begin
+      status = rdma_context_lifecycle_status(qp_h, srq_h, "QPC SRQ");
+      if (!status.ok()) return status;
+    end
     if (!rdma_is_power_of_two(sq_depth) ||
         !rdma_is_power_of_two(rq_depth))
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
@@ -251,13 +443,22 @@ class rdma_qpc_model extends rdma_hw_model;
                         RDMA_QPS_ERROR}))
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "QPC state is invalid");
-    if (sq_producer_index >= sq_depth || sq_consumer_index >= sq_depth ||
-        rq_producer_index >= rq_depth || rq_consumer_index >= rq_depth)
+    if ((sq_backing.value & 64'hfff) != 0 ||
+        (rq_backing.value & 64'hfff) != 0)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                               "QPC queue index is outside the queue depth");
-    if ((sq_base.value & 64'h3f) != 0 || (rq_base.value & 64'h3f) != 0)
+                               "QPC queue backing is not 4 KiB aligned");
+    if ((context_backing.value & 64'h1ff) != 0)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                               "QPC queue base is not 64-byte aligned");
+                               "QPC context backing is not 512-byte aligned");
+    status = rdma_object_mode_status(sq_mode, "QPC SQ");
+    if (!status.ok()) return status;
+    status = rdma_object_mode_status(rq_mode, "QPC RQ");
+    if (!status.ok()) return status;
+    if (address_vector == null)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "QPC address vector is null");
+    status = address_vector.validate();
+    if (!status.ok()) return status;
     if (transport_ext == null || transport_ext.transport_kind() != transport)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "QPC transport extension does not match");
@@ -296,21 +497,37 @@ class rdma_cqc_model extends rdma_hw_model;
 
   rdma_handle cq_h;
   rdma_handle ceq_h;
+  rdma_context_state_e state;
   int unsigned depth;
-  rdma_hmc_fvm_addr_t base_addr;
-  int unsigned producer_index;
-  int unsigned consumer_index;
-  bit armed;
+  int unsigned cqe_size_bytes;
+  int unsigned threshold;
+  rdma_page_table_layout page_layout;
+  rdma_ring_position producer;
+  rdma_ring_position consumer;
+  bit urc_enable;
+  bit load_ci_done;
+  bit [1:0] last_arm_sequence;
+  bit [1:0] arm_sequence;
+  bit [1:0] arm_state;
+  rdma_backing_addr_t shadow_backing;
 
   function new(string name = "rdma_cqc_model");
     super.new(name);
     cq_h = null;
     ceq_h = null;
+    state = RDMA_CONTEXT_INVALID;
     depth = '0;
-    base_addr = '0;
-    producer_index = '0;
-    consumer_index = '0;
-    armed = 1'b0;
+    cqe_size_bytes = '0;
+    threshold = '0;
+    page_layout = rdma_page_table_layout::type_id::create("page_layout");
+    producer = rdma_ring_position::type_id::create("producer");
+    consumer = rdma_ring_position::type_id::create("consumer");
+    urc_enable = 1'b0;
+    load_ci_done = 1'b0;
+    last_arm_sequence = '0;
+    arm_sequence = '0;
+    arm_state = '0;
+    shadow_backing = '0;
   endfunction
 
   virtual function void do_copy(uvm_object rhs);
@@ -321,28 +538,62 @@ class rdma_cqc_model extends rdma_hw_model;
       `uvm_fatal("RDMA_COPY_TYPE", "CQC model copy mismatch")
     cq_h = rdma_clone_handle_value(rhs_cqc.cq_h, "CQC CQ");
     ceq_h = rdma_clone_handle_value(rhs_cqc.ceq_h, "CQC CEQ");
+    state = rhs_cqc.state;
     depth = rhs_cqc.depth;
-    base_addr = rhs_cqc.base_addr;
-    producer_index = rhs_cqc.producer_index;
-    consumer_index = rhs_cqc.consumer_index;
-    armed = rhs_cqc.armed;
+    cqe_size_bytes = rhs_cqc.cqe_size_bytes;
+    threshold = rhs_cqc.threshold;
+    page_layout = rdma_clone_page_layout_value(rhs_cqc.page_layout, "CQC");
+    producer = rdma_clone_ring_position_value(rhs_cqc.producer,
+                                              "CQC producer");
+    consumer = rdma_clone_ring_position_value(rhs_cqc.consumer,
+                                              "CQC consumer");
+    urc_enable = rhs_cqc.urc_enable;
+    load_ci_done = rhs_cqc.load_ci_done;
+    last_arm_sequence = rhs_cqc.last_arm_sequence;
+    arm_sequence = rhs_cqc.arm_sequence;
+    arm_state = rhs_cqc.arm_state;
+    shadow_backing = rhs_cqc.shadow_backing;
   endfunction
 
   virtual function rdma_status validate();
-    if (cq_h == null || cq_h.kind != RDMA_RESOURCE_CQ)
+    rdma_status status;
+
+    status = rdma_context_handle_status(cq_h, RDMA_RESOURCE_CQ, 21,
+                                        "CQC CQ");
+    if (!status.ok()) return status;
+    if (ceq_h != null) begin
+      status = rdma_context_handle_status(ceq_h, RDMA_RESOURCE_CEQ, 12,
+                                          "CQC CEQ");
+      if (!status.ok()) return status;
+      status = rdma_context_lifecycle_status(cq_h, ceq_h, "CQC CEQ");
+      if (!status.ok()) return status;
+    end
+    status = rdma_context_state_status(state, "CQC");
+    if (!status.ok()) return status;
+    if (!rdma_is_power_of_two(depth))
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                               "CQC requires a CQ handle");
-    if (!rdma_is_power_of_two(depth) || (base_addr.value & 64'h3f) != 0)
+                               "CQC depth is not a nonzero power of two");
+    if (page_layout == null || producer == null || consumer == null)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                               "CQC depth or alignment is invalid");
-    if (producer_index >= depth || consumer_index >= depth)
+                               "CQC nested layout or ring is null");
+    status = page_layout.validate();
+    if (!status.ok()) return status;
+    status = producer.validate();
+    if (!status.ok()) return status;
+    status = consumer.validate();
+    if (!status.ok()) return status;
+    if (producer.index >= depth || consumer.index >= depth)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                               "CQC index is outside the queue depth");
+                               "CQC ring position is outside the depth");
+    if ((shadow_backing.value & 64'h3f) != 0)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "CQC shadow backing is not 64-byte aligned");
     return rdma_status::success();
   endfunction
 
   virtual function string describe();
-    return $sformatf("CQC(depth=%0d base=0x%016x)", depth, base_addr.value);
+    return $sformatf("CQC(depth=%0d cqe_size=%0d shadow=0x%016x)",
+                     depth, cqe_size_bytes, shadow_backing.value);
   endfunction
 endclass
 
@@ -351,23 +602,27 @@ class rdma_mrt_model extends rdma_hw_model;
 
   rdma_handle mr_h;
   rdma_handle pd_h;
+  rdma_context_state_e state;
   rdma_iova_t iova;
   longint unsigned length;
-  rdma_backing_addr_t backing_addr;
   bit [31:0] lkey;
   bit [31:0] rkey;
-  rdma_dma_permission_t permissions;
+  rdma_rdma_access_t access;
+  bit [1:0] object_type;
+  rdma_mr_page_layout page_layout;
 
   function new(string name = "rdma_mrt_model");
     super.new(name);
     mr_h = null;
     pd_h = null;
+    state = RDMA_CONTEXT_INVALID;
     iova = '0;
     length = '0;
-    backing_addr = '0;
     lkey = '0;
     rkey = '0;
-    permissions = '0;
+    access = '0;
+    object_type = '0;
+    page_layout = rdma_mr_page_layout::type_id::create("page_layout");
   endfunction
 
   virtual function void do_copy(uvm_object rhs);
@@ -378,27 +633,57 @@ class rdma_mrt_model extends rdma_hw_model;
       `uvm_fatal("RDMA_COPY_TYPE", "MRT model copy mismatch")
     mr_h = rdma_clone_handle_value(rhs_mrt.mr_h, "MRT MR");
     pd_h = rdma_clone_handle_value(rhs_mrt.pd_h, "MRT PD");
+    state = rhs_mrt.state;
     iova = rhs_mrt.iova;
     length = rhs_mrt.length;
-    backing_addr = rhs_mrt.backing_addr;
     lkey = rhs_mrt.lkey;
     rkey = rhs_mrt.rkey;
-    permissions = rhs_mrt.permissions;
+    access = rhs_mrt.access;
+    object_type = rhs_mrt.object_type;
+    page_layout = rdma_clone_mr_page_layout_value(rhs_mrt.page_layout,
+                                                  "MRT");
   endfunction
 
   virtual function rdma_status validate();
-    if (mr_h == null || mr_h.kind != RDMA_RESOURCE_MR ||
-        pd_h == null || pd_h.kind != RDMA_RESOURCE_PD)
-      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                               "MRT requires MR and PD handles");
+    rdma_status status;
+    bit has_remote_right;
+
+    status = rdma_context_handle_status(mr_h, RDMA_RESOURCE_MR, 24,
+                                        "MRT MR");
+    if (!status.ok()) return status;
+    status = rdma_context_handle_status(pd_h, RDMA_RESOURCE_PD, 16,
+                                        "MRT PD");
+    if (!status.ok()) return status;
+    status = rdma_context_lifecycle_status(mr_h, pd_h, "MRT PD");
+    if (!status.ok()) return status;
+    status = rdma_context_state_status(state, "MRT");
+    if (!status.ok()) return status;
     if (length == 0)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "MRT length is zero");
+    if (length[63:46] != 0)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "MRT length exceeds 46 bits");
+    if (mr_h.object_id != {8'b0, lkey[31:8]})
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "MRT object ID does not match lkey index");
+    has_remote_right = access.remote_read || access.remote_write ||
+                       access.remote_atomic;
+    if ((has_remote_right && rkey != lkey) ||
+        (!has_remote_right && !(rkey == 0 || rkey == lkey)))
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "MRT lkey and rkey are inconsistent");
+    if (page_layout == null)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "MRT page layout is null");
+    status = page_layout.validate();
+    if (!status.ok()) return status;
     return rdma_status::success();
   endfunction
 
   virtual function string describe();
-    return $sformatf("MRT(iova=0x%016x length=%0d)", iova.value, length);
+    return $sformatf("MRT(iova=0x%016x length=%0d lkey=0x%08x)",
+                     iova.value, length, lkey);
   endfunction
 endclass
 
@@ -407,21 +692,29 @@ class rdma_srqc_model extends rdma_hw_model;
 
   rdma_handle srq_h;
   rdma_handle pd_h;
+  rdma_context_state_e state;
   int unsigned depth;
-  int unsigned max_sge;
-  rdma_hmc_fvm_addr_t base_addr;
-  int unsigned producer_index;
-  int unsigned consumer_index;
+  int unsigned load_pi_threshold;
+  int unsigned limit_threshold;
+  rdma_object_mode_e object_mode;
+  rdma_backing_addr_t srfq_backing;
+  rdma_backing_addr_t shadow_backing;
+  rdma_ring_position producer;
+  bit [1:0] arm_sequence;
 
   function new(string name = "rdma_srqc_model");
     super.new(name);
     srq_h = null;
     pd_h = null;
+    state = RDMA_CONTEXT_INVALID;
     depth = '0;
-    max_sge = 1;
-    base_addr = '0;
-    producer_index = '0;
-    consumer_index = '0;
+    load_pi_threshold = '0;
+    limit_threshold = '0;
+    object_mode = RDMA_OBJECT_DIRECT_4K;
+    srfq_backing = '0;
+    shadow_backing = '0;
+    producer = rdma_ring_position::type_id::create("producer");
+    arm_sequence = '0;
   endfunction
 
   virtual function void do_copy(uvm_object rhs);
@@ -432,30 +725,50 @@ class rdma_srqc_model extends rdma_hw_model;
       `uvm_fatal("RDMA_COPY_TYPE", "SRQC model copy mismatch")
     srq_h = rdma_clone_handle_value(rhs_srqc.srq_h, "SRQC SRQ");
     pd_h = rdma_clone_handle_value(rhs_srqc.pd_h, "SRQC PD");
+    state = rhs_srqc.state;
     depth = rhs_srqc.depth;
-    max_sge = rhs_srqc.max_sge;
-    base_addr = rhs_srqc.base_addr;
-    producer_index = rhs_srqc.producer_index;
-    consumer_index = rhs_srqc.consumer_index;
+    load_pi_threshold = rhs_srqc.load_pi_threshold;
+    limit_threshold = rhs_srqc.limit_threshold;
+    object_mode = rhs_srqc.object_mode;
+    srfq_backing = rhs_srqc.srfq_backing;
+    shadow_backing = rhs_srqc.shadow_backing;
+    producer = rdma_clone_ring_position_value(rhs_srqc.producer,
+                                              "SRQC producer");
+    arm_sequence = rhs_srqc.arm_sequence;
   endfunction
 
   virtual function rdma_status validate();
-    if (srq_h == null || srq_h.kind != RDMA_RESOURCE_SRQ ||
-        pd_h == null || pd_h.kind != RDMA_RESOURCE_PD)
+    rdma_status status;
+
+    status = rdma_context_handle_status(srq_h, RDMA_RESOURCE_SRQ, 16,
+                                        "SRQC SRQ");
+    if (!status.ok()) return status;
+    status = rdma_context_handle_status(pd_h, RDMA_RESOURCE_PD, 16,
+                                        "SRQC PD");
+    if (!status.ok()) return status;
+    status = rdma_context_lifecycle_status(srq_h, pd_h, "SRQC PD");
+    if (!status.ok()) return status;
+    status = rdma_context_state_status(state, "SRQC");
+    if (!status.ok()) return status;
+    if (!rdma_is_power_of_two(depth))
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                               "SRQC requires SRQ and PD handles");
-    if (!rdma_is_power_of_two(depth) || max_sge == 0 ||
-        (base_addr.value & 64'h3f) != 0)
+                               "SRQC depth is not a nonzero power of two");
+    status = rdma_object_mode_status(object_mode, "SRQC");
+    if (!status.ok()) return status;
+    if (producer == null)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                               "SRQC depth, SGE count, or alignment is invalid");
-    if (producer_index >= depth || consumer_index >= depth)
+                               "SRQC producer position is null");
+    status = producer.validate();
+    if (!status.ok()) return status;
+    if (producer.index >= depth)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                               "SRQC index is outside the queue depth");
+                               "SRQC producer position exceeds depth");
     return rdma_status::success();
   endfunction
 
   virtual function string describe();
-    return $sformatf("SRQC(depth=%0d max_sge=%0d)", depth, max_sge);
+    return $sformatf("SRQC(depth=%0d producer=%0d)", depth,
+                     (producer == null) ? 0 : producer.index);
   endfunction
 endclass
 
@@ -463,22 +776,22 @@ class rdma_ceqc_model extends rdma_hw_model;
   `uvm_object_utils(rdma_ceqc_model)
 
   rdma_handle ceq_h;
+  rdma_context_state_e state;
   int unsigned depth;
-  rdma_hmc_fvm_addr_t base_addr;
-  int unsigned producer_index;
-  int unsigned consumer_index;
-  bit interrupt_enable;
   int unsigned vector_id;
+  rdma_page_table_layout page_layout;
+  rdma_ring_position producer;
+  rdma_ring_position consumer;
 
   function new(string name = "rdma_ceqc_model");
     super.new(name);
     ceq_h = null;
+    state = RDMA_CONTEXT_INVALID;
     depth = '0;
-    base_addr = '0;
-    producer_index = '0;
-    consumer_index = '0;
-    interrupt_enable = 1'b0;
     vector_id = '0;
+    page_layout = rdma_page_table_layout::type_id::create("page_layout");
+    producer = rdma_ring_position::type_id::create("producer");
+    consumer = rdma_ring_position::type_id::create("consumer");
   endfunction
 
   virtual function void do_copy(uvm_object rhs);
@@ -488,24 +801,40 @@ class rdma_ceqc_model extends rdma_hw_model;
     if (!$cast(rhs_ceqc, rhs))
       `uvm_fatal("RDMA_COPY_TYPE", "CEQC model copy mismatch")
     ceq_h = rdma_clone_handle_value(rhs_ceqc.ceq_h, "CEQC CEQ");
+    state = rhs_ceqc.state;
     depth = rhs_ceqc.depth;
-    base_addr = rhs_ceqc.base_addr;
-    producer_index = rhs_ceqc.producer_index;
-    consumer_index = rhs_ceqc.consumer_index;
-    interrupt_enable = rhs_ceqc.interrupt_enable;
     vector_id = rhs_ceqc.vector_id;
+    page_layout = rdma_clone_page_layout_value(rhs_ceqc.page_layout,
+                                               "CEQC");
+    producer = rdma_clone_ring_position_value(rhs_ceqc.producer,
+                                              "CEQC producer");
+    consumer = rdma_clone_ring_position_value(rhs_ceqc.consumer,
+                                              "CEQC consumer");
   endfunction
 
   virtual function rdma_status validate();
-    if (ceq_h == null || ceq_h.kind != RDMA_RESOURCE_CEQ)
+    rdma_status status;
+
+    status = rdma_context_handle_status(ceq_h, RDMA_RESOURCE_CEQ, 12,
+                                        "CEQC CEQ");
+    if (!status.ok()) return status;
+    status = rdma_context_state_status(state, "CEQC");
+    if (!status.ok()) return status;
+    if (!rdma_is_power_of_two(depth))
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                               "CEQC requires a CEQ handle");
-    if (!rdma_is_power_of_two(depth) || (base_addr.value & 64'h3f) != 0)
+                               "CEQC depth is not a nonzero power of two");
+    if (page_layout == null || producer == null || consumer == null)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                               "CEQC depth or alignment is invalid");
-    if (producer_index >= depth || consumer_index >= depth)
+                               "CEQC nested layout or ring is null");
+    status = page_layout.validate();
+    if (!status.ok()) return status;
+    status = producer.validate();
+    if (!status.ok()) return status;
+    status = consumer.validate();
+    if (!status.ok()) return status;
+    if (producer.index >= depth || consumer.index >= depth)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                               "CEQC index is outside the queue depth");
+                               "CEQC ring position is outside the depth");
     return rdma_status::success();
   endfunction
 
@@ -518,22 +847,22 @@ class rdma_aeqc_model extends rdma_hw_model;
   `uvm_object_utils(rdma_aeqc_model)
 
   rdma_handle aeq_h;
+  rdma_context_state_e state;
   int unsigned depth;
-  rdma_hmc_fvm_addr_t base_addr;
-  int unsigned producer_index;
-  int unsigned consumer_index;
-  bit interrupt_enable;
   int unsigned vector_id;
+  rdma_page_table_layout page_layout;
+  rdma_ring_position producer;
+  rdma_ring_position consumer;
 
   function new(string name = "rdma_aeqc_model");
     super.new(name);
     aeq_h = null;
+    state = RDMA_CONTEXT_INVALID;
     depth = '0;
-    base_addr = '0;
-    producer_index = '0;
-    consumer_index = '0;
-    interrupt_enable = 1'b0;
     vector_id = '0;
+    page_layout = rdma_page_table_layout::type_id::create("page_layout");
+    producer = rdma_ring_position::type_id::create("producer");
+    consumer = rdma_ring_position::type_id::create("consumer");
   endfunction
 
   virtual function void do_copy(uvm_object rhs);
@@ -543,24 +872,40 @@ class rdma_aeqc_model extends rdma_hw_model;
     if (!$cast(rhs_aeqc, rhs))
       `uvm_fatal("RDMA_COPY_TYPE", "AEQC model copy mismatch")
     aeq_h = rdma_clone_handle_value(rhs_aeqc.aeq_h, "AEQC AEQ");
+    state = rhs_aeqc.state;
     depth = rhs_aeqc.depth;
-    base_addr = rhs_aeqc.base_addr;
-    producer_index = rhs_aeqc.producer_index;
-    consumer_index = rhs_aeqc.consumer_index;
-    interrupt_enable = rhs_aeqc.interrupt_enable;
     vector_id = rhs_aeqc.vector_id;
+    page_layout = rdma_clone_page_layout_value(rhs_aeqc.page_layout,
+                                               "AEQC");
+    producer = rdma_clone_ring_position_value(rhs_aeqc.producer,
+                                              "AEQC producer");
+    consumer = rdma_clone_ring_position_value(rhs_aeqc.consumer,
+                                              "AEQC consumer");
   endfunction
 
   virtual function rdma_status validate();
-    if (aeq_h == null || aeq_h.kind != RDMA_RESOURCE_AEQ)
+    rdma_status status;
+
+    status = rdma_context_handle_status(aeq_h, RDMA_RESOURCE_AEQ, 12,
+                                        "AEQC AEQ");
+    if (!status.ok()) return status;
+    status = rdma_context_state_status(state, "AEQC");
+    if (!status.ok()) return status;
+    if (!rdma_is_power_of_two(depth))
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                               "AEQC requires an AEQ handle");
-    if (!rdma_is_power_of_two(depth) || (base_addr.value & 64'h3f) != 0)
+                               "AEQC depth is not a nonzero power of two");
+    if (page_layout == null || producer == null || consumer == null)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                               "AEQC depth or alignment is invalid");
-    if (producer_index >= depth || consumer_index >= depth)
+                               "AEQC nested layout or ring is null");
+    status = page_layout.validate();
+    if (!status.ok()) return status;
+    status = producer.validate();
+    if (!status.ok()) return status;
+    status = consumer.validate();
+    if (!status.ok()) return status;
+    if (producer.index >= depth || consumer.index >= depth)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                               "AEQC index is outside the queue depth");
+                               "AEQC ring position is outside the depth");
     return rdma_status::success();
   endfunction
 
