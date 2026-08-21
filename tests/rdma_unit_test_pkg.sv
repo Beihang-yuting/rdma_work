@@ -1,3 +1,10 @@
+`ifdef RDMA_HOST_MEM_TEST
+  // host_mem_manager is intentionally a $unit-scope class upstream.  Include
+  // the pinned implementation at compilation-unit scope to preserve its
+  // original type identity without changing or copying the dependency.
+  `include "host_mem_manager.sv"
+`endif
+
 package rdma_unit_test_pkg;
   import uvm_pkg::*;
   import rdma_types_pkg::*;
@@ -7,10 +14,6 @@ package rdma_unit_test_pkg;
 `ifdef RDMA_HOST_MEM_TEST
   import host_mem_pkg::*;
   import rdma_host_mem_adapter_pkg::*;
-  // host_mem_manager is intentionally a $unit-scope class upstream.  Include
-  // the pinned implementation here so the dedicated test package can use the
-  // real manager without changing or copying the external dependency.
-  `include "host_mem_manager.sv"
 `endif
   `include "uvm_macros.svh"
 
@@ -22,7 +25,16 @@ package rdma_unit_test_pkg;
   `include "unit/rdma_adapter_contract_test.svh"
   `include "unit/rdma_resource_manager_test.svh"
   `include "unit/rdma_harness_expected_failure_probe.svh"
+endpackage
+
 `ifdef RDMA_HOST_MEM_TEST
+  import uvm_pkg::*;
+  import host_mem_pkg::*;
+  import rdma_types_pkg::*;
+  import rdma_model_pkg::*;
+  import rdma_core_pkg::*;
+  import rdma_adapter_pkg::*;
+  import rdma_host_mem_adapter_pkg::*;
+  `include "uvm_macros.svh"
   `include "integration/rdma_host_mem_adapter_test.svh"
 `endif
-endpackage

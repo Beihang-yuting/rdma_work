@@ -100,6 +100,8 @@ package rdma_host_mem_adapter_pkg;
     bit [63:0] iova_base;
 
     protected rdma_host_mem_allocation_record allocations[$];
+    protected bit iova_config_locked;
+    protected bit [63:0] locked_iova_base;
     protected bit iova_cursor_valid;
     protected bit [64:0] next_iova;
 
@@ -107,6 +109,8 @@ package rdma_host_mem_adapter_pkg;
       super.new(name);
       mem = null;
       iova_base = '0;
+      iova_config_locked = 1'b0;
+      locked_iova_base = '0;
       iova_cursor_valid = 1'b0;
       next_iova = '0;
     endfunction
@@ -318,6 +322,11 @@ package rdma_host_mem_adapter_pkg;
       if (mem == null)
         return rdma_status::make(RDMA_SC_INVALID_STATE,
                                  "host_mem API is not configured");
+      if (iova_config_locked && iova_base != locked_iova_base)
+        return rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "IOVA configuration cannot change after a successful allocation"
+        );
       if (function_h == null ||
           function_h.kind != RDMA_RESOURCE_FUNCTION)
         return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
@@ -406,6 +415,10 @@ package rdma_host_mem_adapter_pkg;
       allocation.backing_mem = mem;
       allocation.active = 1'b1;
       allocations.push_back(allocation);
+      if (!iova_config_locked) begin
+        locked_iova_base = iova_base;
+        iova_config_locked = 1'b1;
+      end
       if (iova_base != 0) begin
         next_iova = committed_cursor;
         iova_cursor_valid = 1'b1;

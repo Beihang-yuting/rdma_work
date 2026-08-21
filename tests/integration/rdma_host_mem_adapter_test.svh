@@ -62,11 +62,11 @@ class rdma_host_mem_adapter_test extends uvm_test;
   endfunction
 
   task run_phase(uvm_phase phase);
-    host_mem_manager hm;
-    host_mem_manager offset_hm;
-    host_mem_manager overflow_hm;
-    host_mem_manager equal_hm_a;
-    host_mem_manager equal_hm_b;
+    $unit::host_mem_manager hm;
+    $unit::host_mem_manager offset_hm;
+    $unit::host_mem_manager overflow_hm;
+    $unit::host_mem_manager equal_hm_a;
+    $unit::host_mem_manager equal_hm_b;
     rdma_host_mem_adapter adapter;
     rdma_host_mem_adapter offset_adapter;
     rdma_host_mem_adapter overflow_adapter;
@@ -78,6 +78,9 @@ class rdma_host_mem_adapter_test extends uvm_test;
     rdma_dma_mapping mapping_b;
     rdma_dma_mapping offset_mapping_a;
     rdma_dma_mapping offset_mapping_b;
+    rdma_dma_mapping offset_mapping_c;
+    rdma_dma_mapping offset_rejected_nonzero;
+    rdma_dma_mapping offset_rejected_identity;
     rdma_dma_mapping overflow_mapping;
     rdma_dma_mapping equal_mapping_a;
     rdma_dma_mapping equal_mapping_b;
@@ -104,7 +107,7 @@ class rdma_host_mem_adapter_test extends uvm_test;
     invalid_function_h = make_function_handle("invalid_function_h");
     invalid_function_h.kind = RDMA_RESOURCE_PD;
 
-    hm = host_mem_manager::type_id::create("hm");
+    hm = $unit::host_mem_manager::type_id::create("hm");
     hm.init_region(64'h0000_0001_0000_0000,
                    64'h0000_0001_00ff_ffff);
     adapter = rdma_host_mem_adapter::type_id::create("adapter");
@@ -316,7 +319,7 @@ class rdma_host_mem_adapter_test extends uvm_test;
 
     // A non-zero iova_base is the first end-exclusive IOVA cursor.  Each
     // successful mapping aligns that cursor and advances it by mapping size.
-    offset_hm = host_mem_manager::type_id::create("offset_hm");
+    offset_hm = $unit::host_mem_manager::type_id::create("offset_hm");
     offset_hm.init_region(64'h0000_0002_0000_0000,
                           64'h0000_0002_00ff_ffff);
     offset_adapter = rdma_host_mem_adapter::type_id::create("offset_adapter");
@@ -326,18 +329,54 @@ class rdma_host_mem_adapter_test extends uvm_test;
                                      RDMA_DMA_DEVICE_WRITE,
                                      offset_mapping_a);
     expect_status("OFFSET_ALLOC_A", status, RDMA_SC_OK);
-    status = offset_adapter.allocate(function_h, 128, 256,
+
+    offset_adapter.iova_base = 64'h0000_0000_5000_0000;
+    offset_rejected_nonzero = rdma_dma_mapping::type_id::create(
+      "offset_rejected_nonzero_seed"
+    );
+    status = offset_adapter.allocate(function_h, 64, 64,
+                                     RDMA_DMA_BIDIRECTIONAL,
+                                     offset_rejected_nonzero);
+    expect_status("OFFSET_REBASE_NONZERO", status, RDMA_SC_INVALID_STATE);
+    if (offset_rejected_nonzero != null)
+      `uvm_error("OFFSET_REBASE_NONZERO",
+                 "IOVA reconfiguration returned a mapping")
+
+    offset_adapter.iova_base = 64'h0000_0000_0000_0000;
+    offset_rejected_identity = rdma_dma_mapping::type_id::create(
+      "offset_rejected_identity_seed"
+    );
+    status = offset_adapter.allocate(function_h, 64, 64,
+                                     RDMA_DMA_BIDIRECTIONAL,
+                                     offset_rejected_identity);
+    expect_status("OFFSET_REBASE_IDENTITY", status, RDMA_SC_INVALID_STATE);
+    if (offset_rejected_identity != null)
+      `uvm_error("OFFSET_REBASE_IDENTITY",
+                 "IOVA identity switch returned a mapping")
+
+    offset_adapter.iova_base = 64'h0000_0000_4000_0000;
+    status = offset_adapter.allocate(function_h, 64, 64,
                                      RDMA_DMA_BIDIRECTIONAL,
                                      offset_mapping_b);
     expect_status("OFFSET_ALLOC_B", status, RDMA_SC_OK);
-    if (offset_mapping_a == null || offset_mapping_b == null)
+    status = offset_adapter.allocate(function_h, 128, 256,
+                                     RDMA_DMA_BIDIRECTIONAL,
+                                     offset_mapping_c);
+    expect_status("OFFSET_ALLOC_C", status, RDMA_SC_OK);
+    if (offset_mapping_a == null || offset_mapping_b == null ||
+        offset_mapping_c == null)
       `uvm_fatal("OFFSET_ALLOC", "offset allocation returned null")
     if (offset_mapping_a.iova.value != 64'h0000_0000_4000_0000 ||
         offset_mapping_a.iova.value == offset_mapping_a.backing_addr.value)
       `uvm_error("OFFSET_BASE", "first offset IOVA is incorrect")
-    if (offset_mapping_b.iova.value != 64'h0000_0000_4000_0100 ||
-        offset_mapping_b.iova.value <
-          offset_mapping_a.iova.value + offset_mapping_a.size)
+    if (offset_mapping_b.backing_addr.value !=
+          64'h0000_0002_0000_0040 ||
+        offset_mapping_b.iova.value != 64'h0000_0000_4000_0040)
+      `uvm_error("OFFSET_REBASE_NO_ADVANCE",
+                 "rejected reconfiguration advanced backing or IOVA state")
+    if (offset_mapping_c.iova.value != 64'h0000_0000_4000_0100 ||
+        offset_mapping_c.iova.value <
+          offset_mapping_b.iova.value + offset_mapping_b.size)
       `uvm_error("OFFSET_NON_OVERLAP", "offset IOVA ranges overlap")
     if (offset_mapping_a.permissions.device_read ||
         !offset_mapping_a.permissions.device_write ||
@@ -347,6 +386,16 @@ class rdma_host_mem_adapter_test extends uvm_test;
     expect_status("OFFSET_RELEASE_A", status, RDMA_SC_OK);
     status = offset_adapter.\release (offset_mapping_b);
     expect_status("OFFSET_RELEASE_B", status, RDMA_SC_OK);
+    status = offset_adapter.\release (offset_mapping_c);
+    expect_status("OFFSET_RELEASE_C", status, RDMA_SC_OK);
+    if (offset_rejected_nonzero != null) begin
+      status = offset_adapter.\release (offset_rejected_nonzero);
+      expect_status("OFFSET_REBASE_NONZERO_CLEANUP", status, RDMA_SC_OK);
+    end
+    if (offset_rejected_identity != null) begin
+      status = offset_adapter.\release (offset_rejected_identity);
+      expect_status("OFFSET_REBASE_IDENTITY_CLEANUP", status, RDMA_SC_OK);
+    end
     status = offset_adapter.check_leaks(leak_count);
     expect_status("OFFSET_LEAKS", status, RDMA_SC_OK);
     if (leak_count != 0)
@@ -354,7 +403,7 @@ class rdma_host_mem_adapter_test extends uvm_test;
 
     // IOVA arithmetic failure rolls back the real backing allocation and
     // does not advance the cursor.  The same base is reusable immediately.
-    overflow_hm = host_mem_manager::type_id::create("overflow_hm");
+    overflow_hm = $unit::host_mem_manager::type_id::create("overflow_hm");
     overflow_hm.init_region(64'h0000_0003_0000_0000,
                             64'h0000_0003_00ff_ffff);
     overflow_adapter = rdma_host_mem_adapter::type_id::create(
@@ -386,8 +435,8 @@ class rdma_host_mem_adapter_test extends uvm_test;
 
     // Equal numeric addresses from independent managers/adapters remain
     // distinct because allocation identity and adapter ownership are opaque.
-    equal_hm_a = host_mem_manager::type_id::create("equal_hm_a");
-    equal_hm_b = host_mem_manager::type_id::create("equal_hm_b");
+    equal_hm_a = $unit::host_mem_manager::type_id::create("equal_hm_a");
+    equal_hm_b = $unit::host_mem_manager::type_id::create("equal_hm_b");
     equal_hm_a.init_region(64'h0000_0005_0000_0000,
                            64'h0000_0005_000f_ffff);
     equal_hm_b.init_region(64'h0000_0005_0000_0000,
