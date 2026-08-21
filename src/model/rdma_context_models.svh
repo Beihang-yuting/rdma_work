@@ -755,6 +755,9 @@ class rdma_srqc_model extends rdma_hw_model;
                                "SRQC depth is not a nonzero power of two");
     status = rdma_object_mode_status(object_mode, "SRQC");
     if (!status.ok()) return status;
+    if ((srfq_backing.value & 64'hfff) != 0)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "SRQC queue backing is not 4 KiB aligned");
     if (producer == null)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "SRQC producer position is null");

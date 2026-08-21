@@ -434,6 +434,9 @@ class rdma_context_model_test extends uvm_test;
     qpc.context_backing.value += 64'h100;
     expect_invalid("CONTEXT_ALIGNMENT", qpc.validate());
     qpc.context_backing.value -= 64'h100;
+    srqc.srfq_backing.value += 64;
+    expect_invalid("SRQC_QUEUE_ALIGNMENT", srqc.validate());
+    srqc.srfq_backing.value -= 64;
 
     urc_ext = rdma_qpc_urc_ext::type_id::create("urc_ext");
     urc_ext.remote_qpn = 24'h112233;
