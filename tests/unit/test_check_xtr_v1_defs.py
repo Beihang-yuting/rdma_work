@@ -69,14 +69,129 @@ localparam bit [63:0] XTR_V1_WINDOW = 64'h2000;
 
 
 class ReferenceEncodingTest(unittest.TestCase):
+    def make_reference_image(self, byte_count: int):
+        image_type = getattr(CHECKER, "ReferenceImage", bytearray)
+        return image_type(byte_count)
+
+    def require_checker_attribute(self, name: str):
+        self.assertTrue(hasattr(CHECKER, name), f"checker has no {name}")
+        return getattr(CHECKER, name)
+
     def test_absolute_offsets_use_big_endian_driver_qwords(self) -> None:
-        image = bytearray(16)
+        image = self.make_reference_image(16)
         CHECKER.put_field(image, 16, 21, 0x15555)
         self.assertEqual(bytes(image[:8]), bytes.fromhex("0000000155550000"))
 
     def test_overflow_is_fatal(self) -> None:
         with self.assertRaisesRegex(CHECKER.ValidationError, "does not fit"):
-            CHECKER.put_field(bytearray(8), 0, 4, 0x10)
+            CHECKER.put_field(self.make_reference_image(8), 0, 4, 0x10)
+
+    def test_zero_write_reserves_the_full_field_range(self) -> None:
+        image = self.make_reference_image(8)
+        CHECKER.put_field(image, 0, 8, 0)
+        with self.assertRaisesRegex(CHECKER.ValidationError, "overlap"):
+            CHECKER.put_field(image, 0, 8, 1)
+
+    def test_partial_zero_overlap_is_fatal_and_atomic(self) -> None:
+        image = self.make_reference_image(8)
+        CHECKER.put_field(image, 0, 8, 0)
+        payload_before = bytes(image)
+        occupancy_before = tuple(getattr(image, "occupancy", ()))
+
+        with self.assertRaisesRegex(CHECKER.ValidationError, "overlap"):
+            CHECKER.put_field(image, 4, 8, 0xAB)
+
+        self.assertEqual(bytes(image), payload_before)
+        self.assertEqual(tuple(image.occupancy), occupancy_before)
+
+    def test_nonoverlap_width64_and_endian_behavior_is_preserved(self) -> None:
+        image = self.make_reference_image(16)
+        CHECKER.put_field(image, 0, 4, 0xA)
+        CHECKER.put_field(image, 4, 4, 0xB)
+        CHECKER.put_field(image, 64, 64, 0x0123456789ABCDEF)
+        self.assertEqual(bytes(image[:8]), bytes.fromhex("00000000000000ba"))
+        self.assertEqual(bytes(image[8:]), bytes.fromhex("0123456789abcdef"))
+
+    def test_plain_bytearray_cannot_bypass_occupancy_tracking(self) -> None:
+        with self.assertRaisesRegex(CHECKER.ValidationError, "occupancy"):
+            CHECKER.put_field(bytearray(8), 0, 8, 0)
+
+    def test_reference_encoder_is_independent_of_sv_mapping_placement(self) -> None:
+        expected = CHECKER.build_golden_cases()
+        saved_mappings = CHECKER.FIELD_MAPPINGS
+        had_legacy_lookup = hasattr(CHECKER, "FIELD_BY_STEM")
+        saved_lookup = getattr(CHECKER, "FIELD_BY_STEM", None)
+        try:
+            CHECKER.FIELD_MAPPINGS = ()
+            if had_legacy_lookup:
+                CHECKER.FIELD_BY_STEM = {}
+            try:
+                actual = CHECKER.build_golden_cases()
+            except (KeyError, CHECKER.ValidationError) as error:
+                self.fail(f"golden encoder consulted SV mapping placement: {error}")
+        finally:
+            CHECKER.FIELD_MAPPINGS = saved_mappings
+            if had_legacy_lookup:
+                CHECKER.FIELD_BY_STEM = saved_lookup
+        self.assertEqual(actual, expected)
+
+    def test_reference_validation_rejects_missing_duplicate_and_drift(self) -> None:
+        references = self.require_checker_attribute("REFERENCE_FIELDS")
+        validate_references = self.require_checker_attribute(
+            "validate_reference_fields"
+        )
+        first = references[0]
+
+        with self.subTest("duplicate"):
+            with self.assertRaisesRegex(CHECKER.ValidationError, "duplicate"):
+                validate_references(references + (first,), CHECKER.FIELD_MAPPINGS)
+
+        with self.subTest("missing mapping"):
+            mappings_without_first = tuple(
+                mapping for mapping in CHECKER.FIELD_MAPPINGS
+                if mapping.sv_stem != first.sv_stem
+            )
+            with self.assertRaisesRegex(CHECKER.ValidationError, "missing"):
+                validate_references(references, mappings_without_first)
+
+        with self.subTest("byte offset mismatch"):
+            drifted = first._replace(
+                word_byte_offset=first.word_byte_offset + 8
+            )
+            with self.assertRaisesRegex(
+                CHECKER.ValidationError, "byte offset mismatch"
+            ):
+                validate_references(
+                    (drifted,) + references[1:], CHECKER.FIELD_MAPPINGS
+                )
+
+    def test_every_golden_field_has_explicit_reference_placement(self) -> None:
+        references = self.require_checker_attribute("REFERENCE_FIELDS")
+        self.assertEqual(len(references), 95)
+        reference_stems = [reference.sv_stem for reference in references]
+        self.assertEqual(len(set(reference_stems)), 95)
+        for reference in references:
+            with self.subTest(stem=reference.sv_stem):
+                self.assertGreaterEqual(reference.word_byte_offset, 0)
+                self.assertGreaterEqual(reference.lsb, 0)
+                self.assertGreaterEqual(reference.width, 1)
+                self.assertLessEqual(reference.lsb + reference.width, 64)
+                self.assertNotEqual((reference.lsb, reference.width), (0, 0))
+
+        used_stems = []
+        original_put_named = CHECKER.put_named
+
+        def record_put_named(image, stem, value):
+            used_stems.append(stem)
+            original_put_named(image, stem, value)
+
+        try:
+            CHECKER.put_named = record_put_named
+            CHECKER.build_golden_cases()
+        finally:
+            CHECKER.put_named = original_put_named
+        self.assertEqual(len(used_stems), 95)
+        self.assertEqual(set(used_stems), set(reference_stems))
 
     def test_reference_cases_have_stable_contract(self) -> None:
         cases = CHECKER.build_golden_cases()

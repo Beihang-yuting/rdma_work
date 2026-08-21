@@ -56,6 +56,15 @@ class FieldMapping(NamedTuple):
     word_byte_offset: int
 
 
+class ReferenceField(NamedTuple):
+    path: str
+    c_symbol: str
+    sv_stem: str
+    word_byte_offset: int
+    lsb: int
+    width: int
+
+
 class ValueMapping(NamedTuple):
     path: str
     c_symbol: str
@@ -394,108 +403,202 @@ def require_unique_expression(
     return expressions[0]
 
 
-def put_field(image: bytearray, logical_offset: int, width: int, value: int) -> None:
+class ReferenceImage(bytearray):
+    """Golden payload plus occupancy masks for its logical qwords."""
+
+    def __init__(self, byte_count: int):
+        super().__init__(byte_count)
+        self.occupancy = [0] * ((byte_count + 7) // 8)
+
+
+def put_field(
+    image: ReferenceImage, logical_offset: int, width: int, value: int
+) -> None:
+    if not isinstance(image, ReferenceImage):
+        raise ValidationError("reference image occupancy tracking is required")
     if width < 1 or width > 64 or value < 0 or value >= (1 << width):
         raise ValidationError(f"value {value:#x} does not fit width {width}")
     word_byte_offset = (logical_offset // 64) * 8
     lsb = logical_offset % 64
     if lsb + width > 64 or word_byte_offset + 8 > len(image):
         raise ValidationError("field crosses a logical qword or image boundary")
-    word = int.from_bytes(image[word_byte_offset : word_byte_offset + 8], "big")
     mask = ((1 << width) - 1) << lsb
-    if word & mask:
+    word_index = word_byte_offset // 8
+    if image.occupancy[word_index] & mask:
         raise ValidationError("reference fields overlap")
+    word = int.from_bytes(image[word_byte_offset : word_byte_offset + 8], "big")
     word |= value << lsb
     image[word_byte_offset : word_byte_offset + 8] = word.to_bytes(8, "big")
+    image.occupancy[word_index] |= mask
 
 
-FIELD_BY_STEM = {mapping.sv_stem: mapping for mapping in FIELD_MAPPINGS}
+def put_named(image: ReferenceImage, stem: str, value: int) -> None:
+    reference = REFERENCE_BY_STEM.get(stem)
+    if reference is None:
+        raise ValidationError(f"reference placement missing for {stem}")
+    put_field(
+        image,
+        reference.word_byte_offset * 8 + reference.lsb,
+        reference.width,
+        value,
+    )
 
 
-def put_named(image: bytearray, stem: str, value: int) -> None:
-    mapping = FIELD_BY_STEM[stem]
-    # The pinned mask values below are checked against C before golden files pass.
-    _, expressions = _REFERENCE_FIELDS[mapping.c_symbol]
-    lsb, width = expressions
-    put_field(image, mapping.word_byte_offset * 8 + lsb, width, value)
+# Golden placement is independently transcribed from the pinned driver call
+# sites and masks. It is intentionally not derived from FIELD_MAPPINGS.
+REFERENCE_FIELDS = (
+    ReferenceField("qp.h", "XTRDMA_QPC_TVER", "XTR_V1_QPC_TVER", 0, 62, 2),
+    ReferenceField("qp.h", "XTRDMA_QPC_MIG", "XTR_V1_QPC_MIG", 0, 61, 1),
+    ReferenceField("qp.h", "XTRDMA_QPC_SERVICE_TYPE", "XTR_V1_QPC_SERVICE_TYPE", 0, 58, 3),
+    ReferenceField("qp.h", "XTRDMA_QPC_HOST_ID", "XTR_V1_QPC_HOST_ID", 0, 52, 3),
+    ReferenceField("qp.h", "XTRDMA_QPC_VF_ID", "XTR_V1_QPC_VF_ID", 0, 40, 12),
+    ReferenceField("qp.h", "XTRDMA_QPC_ICOS", "XTR_V1_QPC_ICOS", 0, 37, 3),
+    ReferenceField("qp.h", "XTRDMA_QPC_QPN", "XTR_V1_QPC_QPN", 0, 16, 21),
+    ReferenceField("qp.h", "XTRDMA_QPC_STAT_IDX", "XTR_V1_QPC_STAT_IDX", 0, 8, 8),
+    ReferenceField("qp.h", "XTRDMA_QPC_UD_QKEY_H", "XTR_V1_QPC_UD_QKEY_H", 0, 0, 8),
+    ReferenceField("qp.h", "XTRDMA_QPC_PKEY", "XTR_V1_QPC_PKEY", 8, 0, 16),
+    ReferenceField("qp.h", "XTRDMA_QPC_TX_ENDIAN_SWAP", "XTR_V1_QPC_TX_ENDIAN_SWAP", 16, 6, 1),
+    ReferenceField("qp.h", "XTRDMA_QPC_RX_ENDIAN_SWAP", "XTR_V1_QPC_RX_ENDIAN_SWAP", 16, 5, 1),
+    ReferenceField("qp.h", "XTRDMA_QPC_QP_ST", "XTR_V1_QPC_QP_ST", 24, 56, 3),
+    ReferenceField("qp.h", "XTRDMA_QPC_PMTU", "XTR_V1_QPC_PMTU", 24, 48, 3),
+    ReferenceField("qp.h", "XTRDMA_QPC_QP_SN", "XTR_V1_QPC_QP_SN", 24, 32, 8),
+    ReferenceField("qp.h", "XTRDMA_QPC_PD_IDX", "XTR_V1_QPC_PD_IDX", 24, 0, 16),
+    ReferenceField("qp.h", "XTRDMA_QPC_SQ_PD_PBA_OR_PBA", "XTR_V1_QPC_SQ_PBA", 216, 12, 52),
+    ReferenceField("qp.h", "XTRDMA_QPC_SQ_SIZE", "XTR_V1_QPC_SQ_SIZE", 216, 8, 4),
+    ReferenceField("qp.h", "XTRDMA_QPC_SQ_OM", "XTR_V1_QPC_SQ_OM", 216, 6, 2),
+    ReferenceField("cq.h", "XTRDMA_CMQ_CQC_CQ_SD_PBA", "XTR_V1_CQC_CQ_SD_PBA", 0, 0, 52),
+    ReferenceField("cq.h", "XTRDMA_CMQ_CQC_CQ_SIZE", "XTR_V1_CQC_CQ_SIZE", 0, 56, 5),
+    ReferenceField("cq.h", "XTRDMA_CMQ_CQC_URC_FLAG", "XTR_V1_CQC_URC_FLAG", 0, 61, 1),
+    ReferenceField("cq.h", "XTRDMA_CMQ_CQC_CQ_ST", "XTR_V1_CQC_CQ_ST", 0, 62, 2),
+    ReferenceField("cmq.h", "XTRDMA_CMQCQ_OPCODE", "XTR_V1_CMQ_OPCODE", 0, 32, 8),
+    ReferenceField("cmq.h", "XTRDMA_CMQSQ_WQE_QPN", "XTR_V1_CMQ_QPN", 0, 0, 24),
+    ReferenceField("cmq.h", "XTRDMA_CMQSQ_WQE_INDEX", "XTR_V1_CMQ_WQE_INDEX", 0, 40, 5),
+    ReferenceField("cmq.h", "XTRDMA_CMQSQ_WQE_VALID", "XTR_V1_CMQ_VALID", 0, 63, 1),
+    ReferenceField("cmq.h", "XTRDMA_CMQSQ_VFID_OVERRIDE", "XTR_V1_CMQ_VFID_OVERRIDE", 0, 59, 1),
+    ReferenceField("cmq.h", "XTRDMA_CMQSQ_USE_VFID", "XTR_V1_CMQ_USE_VFID", 0, 48, 11),
+    ReferenceField("cmq.h", "XTRDMA_CMQSQ_WQE_WRAP", "XTR_V1_CMQ_WRAP", 0, 45, 1),
+    ReferenceField("cmq.h", "XTRDMA_CMQSQ_WQE_SQ_CQN", "XTR_V1_CMQ_SQ_CQN", 8, 43, 21),
+    ReferenceField("cmq.h", "XTRDMA_CMQSQ_WQE_SIGN_EN", "XTR_V1_CMQ_SIGN_EN", 8, 32, 1),
+    ReferenceField("cmq.h", "XTRDMA_CMQSQ_WQE_RQ_CQN", "XTR_V1_CMQ_RQ_CQN", 8, 0, 21),
+    ReferenceField("cmq.h", "XTRDMA_CMQSQ_WQE_QPC_BUFFER_ADDR", "XTR_V1_CMQ_QPC_BUFFER_ADDR", 24, 9, 55),
+    ReferenceField("wr.h", "XTRDMA_SQ_WQE_QPN", "XTR_V1_SQ_WQE_QPN", 0, 0, 21),
+    ReferenceField("wr.h", "XTRDMA_SQ_WQE_OPCODE", "XTR_V1_SQ_WQE_OPCODE", 0, 32, 4),
+    ReferenceField("wr.h", "XTRDMA_SQ_WQE_INDEX", "XTR_V1_SQ_WQE_INDEX", 0, 40, 15),
+    ReferenceField("wr.h", "XTRDMA_SQ_WQE_RC_REMOTE_KEY", "XTR_V1_SQ_WQE_RC_REMOTE_KEY", 16, 0, 32),
+    ReferenceField("wr.h", "XTRDMA_SQ_WQE_ICOS", "XTR_V1_SQ_WQE_ICOS", 0, 21, 3),
+    ReferenceField("wr.h", "XTRDMA_SQ_WQE_QP_SN", "XTR_V1_SQ_WQE_QP_SN", 0, 24, 8),
+    ReferenceField("wr.h", "XTRDMA_SQ_WQE_DST_PORT", "XTR_V1_SQ_WQE_DST_PORT", 0, 36, 4),
+    ReferenceField("wr.h", "XTRDMA_SQ_WQE_WRAP", "XTR_V1_SQ_WQE_WRAP", 0, 55, 1),
+    ReferenceField("wr.h", "XTRDMA_SQ_WQE_SIGN_EN", "XTR_V1_SQ_WQE_SIGN_EN", 0, 56, 1),
+    ReferenceField("wr.h", "XTRDMA_SQ_WQE_SE", "XTR_V1_SQ_WQE_SE", 0, 57, 1),
+    ReferenceField("wr.h", "XTRDMA_SQ_WQE_FENCE", "XTR_V1_SQ_WQE_FENCE", 0, 58, 2),
+    ReferenceField("wr.h", "XTRDMA_SQ_WQE_CE", "XTR_V1_SQ_WQE_CE", 0, 61, 2),
+    ReferenceField("wr.h", "XTRDMA_SQ_WQE_VALID", "XTR_V1_SQ_WQE_VALID", 0, 63, 1),
+    ReferenceField("wr.h", "XTRDMA_SQ_WQE_SIGNATURE", "XTR_V1_SQ_WQE_SIGNATURE", 16, 56, 8),
+    ReferenceField("wr.h", "XTRDMA_SQ_WQE_RC_SGE_NUM", "XTR_V1_SQ_WQE_RC_SGE_NUM", 16, 48, 8),
+    ReferenceField("wr.h", "XTRDMA_SQ_WQE_RC_REMOTE_VA", "XTR_V1_SQ_WQE_RC_REMOTE_VA", 24, 0, 64),
+    ReferenceField("wr.h", "XTRDMA_QP_RQ_QPN", "XTR_V1_RQE_QPN", 0, 0, 24),
+    ReferenceField("wr.h", "XTRDMA_QP_RQ_WQE_IDX", "XTR_V1_RQE_INDEX", 0, 40, 15),
+    ReferenceField("wr.h", "XTRDMA_QP_RQ_TPL", "XTR_V1_RQE_PAYLOAD_LEN", 8, 0, 32),
+    ReferenceField("wr.h", "XTRDMA_QP_RQ_QP_SN", "XTR_V1_RQE_QP_SN", 0, 24, 8),
+    ReferenceField("wr.h", "XTRDMA_QP_RQ_WQE_OP", "XTR_V1_RQE_OPCODE", 0, 32, 4),
+    ReferenceField("wr.h", "XTRDMA_QP_RQ_WQE_IDX_WRAP", "XTR_V1_RQE_WRAP", 0, 55, 1),
+    ReferenceField("wr.h", "XTRDMA_QP_RQ_VALID", "XTR_V1_RQE_VALID", 0, 63, 1),
+    ReferenceField("wr.h", "XTRDMA_QP_RQ_SIGNATURE", "XTR_V1_RQE_SIGNATURE", 16, 56, 8),
+    ReferenceField("wr.h", "XTRDMA_QP_RQ_SGE_NUM", "XTR_V1_RQE_SGE_NUM", 16, 48, 8),
+    ReferenceField("wr.h", "XTRDMA_CQE_QPN", "XTR_V1_CQE_QPN", 0, 0, 18),
+    ReferenceField("wr.h", "XTRDMA_CQE_QP_WQE_INDEX", "XTR_V1_CQE_WQE_INDEX", 0, 40, 15),
+    ReferenceField("wr.h", "XTRDMA_CQE_ECODE", "XTR_V1_CQE_ECODE", 0, 24, 8),
+    ReferenceField("wr.h", "XTRDMA_CQE_PAYLOAD_LEN", "XTR_V1_CQE_PAYLOAD_LEN", 8, 0, 32),
+    ReferenceField("wr.h", "XTRDMA_CQE_POLARITY", "XTR_V1_CQE_POLARITY", 0, 63, 1),
+    ReferenceField("wr.h", "XTRDMA_CQE_RQ_CQE", "XTR_V1_CQE_RQ_CQE", 0, 59, 1),
+    ReferenceField("wr.h", "XTRDMA_CQE_QP_WQE_WRAP", "XTR_V1_CQE_WQE_WRAP", 0, 55, 1),
+    ReferenceField("wr.h", "XTRDMA_CQE_PKT_OPCODE", "XTR_V1_CQE_PKT_OPCODE", 0, 32, 8),
+    ReferenceField("wr.h", "XTRDMA_CQE_IMMDT_DATA_INVLD_KEY", "XTR_V1_CQE_IMMDT_DATA", 8, 32, 32),
+    ReferenceField("defs.h", "XTRDMA_CEQE_QPN", "XTR_V1_CEQE_QPN", 0, 40, 21),
+    ReferenceField("defs.h", "XTRDMA_CEQE_CQN", "XTR_V1_CEQE_CQN", 0, 16, 21),
+    ReferenceField("defs.h", "XTRDMA_CEQE_ECODE", "XTR_V1_CEQE_ECODE", 0, 8, 8),
+    ReferenceField("defs.h", "XTRDMA_CEQE_RC_CQ_PI", "XTR_V1_CEQE_CQ_PI", 8, 0, 16),
+    ReferenceField("defs.h", "XTRDMA_CEQE_WQE_VLD", "XTR_V1_CEQE_VALID", 0, 63, 1),
+    ReferenceField("defs.h", "XTRDMA_CEQE_PKT_OPCODE", "XTR_V1_CEQE_PKT_OPCODE", 0, 0, 8),
+    ReferenceField("defs.h", "XTRDMA_CEQE_RC_CQ_PI_WRAP", "XTR_V1_CEQE_CQ_PI_WRAP", 8, 23, 1),
+    ReferenceField("defs.h", "XTRDMA_AEQE_QPN", "XTR_V1_AEQE_QPN", 0, 0, 18),
+    ReferenceField("defs.h", "XTRDMA_AEQE_QP_ST", "XTR_V1_AEQE_QP_ST", 0, 60, 3),
+    ReferenceField("defs.h", "XTRDMA_AEQE_ECODE", "XTR_V1_AEQE_ECODE", 0, 24, 8),
+    ReferenceField("defs.h", "XTRDMA_AEQE_QUEUE_WQE_IDX", "XTR_V1_AEQE_WQE_INDEX", 8, 32, 23),
+    ReferenceField("defs.h", "XTRDMA_AEQE_WQE_VLD", "XTR_V1_AEQE_VALID", 0, 63, 1),
+    ReferenceField("defs.h", "XTRDMA_AEQE_PKT_OPCODE", "XTR_V1_AEQE_PKT_OPCODE", 0, 32, 8),
+    ReferenceField("defs.h", "XTRDMA_AEQE_QUEUE_WQE_IDX_WARP", "XTR_V1_AEQE_WQE_WRAP", 8, 55, 1),
+    ReferenceField("cmq.h", "XTRDMA_CMQSQ_DB_PI", "XTR_V1_CMQ_DB_PI", 0, 32, 5),
+    ReferenceField("cmq.h", "XTRDMA_CMQSQ_DB_POL", "XTR_V1_CMQ_DB_POLARITY", 0, 37, 1),
+    ReferenceField("wr.h", "XTRDMA_NOTIFY_QPN", "XTR_V1_NOTIFY_RQ_QPN", 0, 0, 21),
+    ReferenceField("wr.h", "XTRDMA_NOTIFY_ICOS", "XTR_V1_NOTIFY_RQ_ICOS", 0, 21, 3),
+    ReferenceField("wr.h", "XTRDMA_NOTIFY_PI", "XTR_V1_NOTIFY_RQ_PI", 0, 32, 15),
+    ReferenceField("wr.h", "XTRDMA_NOTIFY_PI_WRAP", "XTR_V1_NOTIFY_RQ_PI_WRAP", 0, 47, 1),
+    ReferenceField("cq.h", "XTRDMA_NOTIFY_CQ_DB_CQN", "XTR_V1_NOTIFY_CQ_CQN", 0, 0, 21),
+    ReferenceField("cq.h", "XTRDMA_NOTIFY_CQ_HOST_ID", "XTR_V1_NOTIFY_CQ_HOST_ID", 0, 21, 3),
+    ReferenceField("cq.h", "XTRDMA_NOTIFY_CQ_DB_RC_CI", "XTR_V1_NOTIFY_CQ_CI", 0, 24, 23),
+    ReferenceField("cq.h", "XTRDMA_NOTIFY_CQ_DB_RC_CI_WRAP", "XTR_V1_NOTIFY_CQ_CI_WRAP", 0, 47, 1),
+    ReferenceField("cq.h", "XTRDMA_NOTIFY_CQ_DB_ARM_DB_FLAG", "XTR_V1_NOTIFY_CQ_ARM", 0, 61, 1),
+    ReferenceField("cq.h", "XTRDMA_NOTIFY_CQ_DB_ARM_ST", "XTR_V1_NOTIFY_CQ_ARM_ST", 0, 58, 2),
+    ReferenceField("cq.h", "XTRDMA_NOTIFY_CQ_DB_ARM_SN", "XTR_V1_NOTIFY_CQ_ARM_SN", 0, 56, 2),
+)
+
+REFERENCE_BY_STEM = {reference.sv_stem: reference for reference in REFERENCE_FIELDS}
 
 
-# Independent pinned mask/shift inputs used by build_golden_cases. The checker
-# separately proves each tuple against its real C BIT/GENMASK expression.
-_REFERENCE_FIELDS = {
-    mapping.c_symbol: (mapping.path, (0, 0)) for mapping in FIELD_MAPPINGS
-}
+def validate_reference_fields(
+    reference_fields: tuple[ReferenceField, ...],
+    field_mappings: tuple[FieldMapping, ...],
+    parsed_fields: dict[str, tuple[str, str, int, int]] | None = None,
+) -> None:
+    mappings_by_stem = {}
+    for mapping in field_mappings:
+        if mapping.sv_stem in mappings_by_stem:
+            raise ValidationError(f"duplicate field mapping for {mapping.sv_stem}")
+        mappings_by_stem[mapping.sv_stem] = mapping
 
+    seen_stems = set()
+    seen_sources = set()
+    for reference in reference_fields:
+        source_key = (reference.path, reference.c_symbol)
+        if reference.sv_stem in seen_stems or source_key in seen_sources:
+            raise ValidationError(f"duplicate reference field for {reference.sv_stem}")
+        seen_stems.add(reference.sv_stem)
+        seen_sources.add(source_key)
+        if (
+            reference.word_byte_offset < 0
+            or reference.lsb < 0
+            or reference.width < 1
+            or reference.lsb + reference.width > 64
+        ):
+            raise ValidationError(f"invalid reference coordinates for {reference.sv_stem}")
 
-def _install_reference_widths() -> None:
-    # Keep this explicit and eval-free; it is the reference encoder's audited rule set.
-    expressions = {
-        "XTRDMA_QPC_TVER": (62, 2), "XTRDMA_QPC_MIG": (61, 1),
-        "XTRDMA_QPC_SERVICE_TYPE": (58, 3), "XTRDMA_QPC_HOST_ID": (52, 3),
-        "XTRDMA_QPC_VF_ID": (40, 12), "XTRDMA_QPC_ICOS": (37, 3),
-        "XTRDMA_QPC_QPN": (16, 21), "XTRDMA_QPC_STAT_IDX": (8, 8),
-        "XTRDMA_QPC_UD_QKEY_H": (0, 8), "XTRDMA_QPC_PKEY": (0, 16),
-        "XTRDMA_QPC_TX_ENDIAN_SWAP": (6, 1), "XTRDMA_QPC_RX_ENDIAN_SWAP": (5, 1),
-        "XTRDMA_QPC_QP_ST": (56, 3), "XTRDMA_QPC_PMTU": (48, 3),
-        "XTRDMA_QPC_QP_SN": (32, 8), "XTRDMA_QPC_PD_IDX": (0, 16),
-        "XTRDMA_QPC_SQ_PD_PBA_OR_PBA": (12, 52),
-        "XTRDMA_QPC_SQ_SIZE": (8, 4), "XTRDMA_QPC_SQ_OM": (6, 2),
-        "XTRDMA_CMQ_CQC_CQ_SD_PBA": (0, 52), "XTRDMA_CMQ_CQC_CQ_SIZE": (56, 5),
-        "XTRDMA_CMQ_CQC_URC_FLAG": (61, 1), "XTRDMA_CMQ_CQC_CQ_ST": (62, 2),
-        "XTRDMA_CMQSQ_WQE_VALID": (63, 1), "XTRDMA_CMQSQ_VFID_OVERRIDE": (59, 1),
-        "XTRDMA_CMQSQ_USE_VFID": (48, 11), "XTRDMA_CMQSQ_WQE_WRAP": (45, 1),
-        "XTRDMA_CMQSQ_WQE_INDEX": (40, 5), "XTRDMA_CMQCQ_OPCODE": (32, 8),
-        "XTRDMA_CMQSQ_WQE_QPN": (0, 24), "XTRDMA_CMQSQ_WQE_SQ_CQN": (43, 21),
-        "XTRDMA_CMQSQ_WQE_SIGN_EN": (32, 1), "XTRDMA_CMQSQ_WQE_RQ_CQN": (0, 21),
-        "XTRDMA_CMQSQ_WQE_QPC_BUFFER_ADDR": (9, 55),
-        "XTRDMA_SQ_WQE_QPN": (0, 21), "XTRDMA_SQ_WQE_ICOS": (21, 3),
-        "XTRDMA_SQ_WQE_QP_SN": (24, 8), "XTRDMA_SQ_WQE_OPCODE": (32, 4),
-        "XTRDMA_SQ_WQE_DST_PORT": (36, 4), "XTRDMA_SQ_WQE_INDEX": (40, 15),
-        "XTRDMA_SQ_WQE_WRAP": (55, 1), "XTRDMA_SQ_WQE_SIGN_EN": (56, 1),
-        "XTRDMA_SQ_WQE_SE": (57, 1), "XTRDMA_SQ_WQE_FENCE": (58, 2),
-        "XTRDMA_SQ_WQE_CE": (61, 2), "XTRDMA_SQ_WQE_VALID": (63, 1),
-        "XTRDMA_SQ_WQE_SIGNATURE": (56, 8), "XTRDMA_SQ_WQE_RC_SGE_NUM": (48, 8),
-        "XTRDMA_SQ_WQE_RC_REMOTE_KEY": (0, 32), "XTRDMA_SQ_WQE_RC_REMOTE_VA": (0, 64),
-        "XTRDMA_QP_RQ_QPN": (0, 24), "XTRDMA_QP_RQ_QP_SN": (24, 8),
-        "XTRDMA_QP_RQ_WQE_OP": (32, 4), "XTRDMA_QP_RQ_WQE_IDX": (40, 15),
-        "XTRDMA_QP_RQ_WQE_IDX_WRAP": (55, 1), "XTRDMA_QP_RQ_VALID": (63, 1),
-        "XTRDMA_QP_RQ_TPL": (0, 32), "XTRDMA_QP_RQ_SIGNATURE": (56, 8),
-        "XTRDMA_QP_RQ_SGE_NUM": (48, 8), "XTRDMA_CQE_POLARITY": (63, 1),
-        "XTRDMA_CQE_RQ_CQE": (59, 1), "XTRDMA_CQE_QP_WQE_WRAP": (55, 1),
-        "XTRDMA_CQE_QP_WQE_INDEX": (40, 15), "XTRDMA_CQE_PKT_OPCODE": (32, 8),
-        "XTRDMA_CQE_ECODE": (24, 8), "XTRDMA_CQE_QPN": (0, 18),
-        "XTRDMA_CQE_IMMDT_DATA_INVLD_KEY": (32, 32), "XTRDMA_CQE_PAYLOAD_LEN": (0, 32),
-        "XTRDMA_CEQE_WQE_VLD": (63, 1), "XTRDMA_CEQE_QPN": (40, 21),
-        "XTRDMA_CEQE_CQN": (16, 21), "XTRDMA_CEQE_ECODE": (8, 8),
-        "XTRDMA_CEQE_PKT_OPCODE": (0, 8), "XTRDMA_CEQE_RC_CQ_PI_WRAP": (23, 1),
-        "XTRDMA_CEQE_RC_CQ_PI": (0, 16), "XTRDMA_AEQE_WQE_VLD": (63, 1),
-        "XTRDMA_AEQE_QP_ST": (60, 3), "XTRDMA_AEQE_PKT_OPCODE": (32, 8),
-        "XTRDMA_AEQE_ECODE": (24, 8), "XTRDMA_AEQE_QPN": (0, 18),
-        "XTRDMA_AEQE_QUEUE_WQE_IDX_WARP": (55, 1),
-        "XTRDMA_AEQE_QUEUE_WQE_IDX": (32, 23),
-        "XTRDMA_CMQSQ_DB_PI": (32, 5), "XTRDMA_CMQSQ_DB_POL": (37, 1),
-        "XTRDMA_NOTIFY_PI_WRAP": (47, 1), "XTRDMA_NOTIFY_PI": (32, 15),
-        "XTRDMA_NOTIFY_ICOS": (21, 3), "XTRDMA_NOTIFY_QPN": (0, 21),
-        "XTRDMA_NOTIFY_SRFQ_WRAP": (47, 1), "XTRDMA_NOTIFY_SRFQ_PI": (32, 15),
-        "XTRDMA_NOTIFY_SRFQN": (0, 16), "XTRDMA_NOTIFY_CQ_DB_ARM_DB_FLAG": (61, 1),
-        "XTRDMA_NOTIFY_CQ_DB_ARM_ST": (58, 2), "XTRDMA_NOTIFY_CQ_DB_ARM_SN": (56, 2),
-        "XTRDMA_NOTIFY_CQ_DB_RC_CI_WRAP": (47, 1), "XTRDMA_NOTIFY_CQ_DB_RC_CI": (24, 23),
-        "XTRDMA_NOTIFY_CQ_HOST_ID": (21, 3), "XTRDMA_NOTIFY_CQ_DB_CQN": (0, 21),
-        "XTRDMA_NOTIFY_CEQ_CI_WRAP": (50, 1), "XTRDMA_NOTIFY_CEQ_CI": (32, 18),
-        "XTRDMA_NOTIFY_CEQ_CEQN": (0, 22), "XTRDMA_NOTIFY_AEQ_CI_WRAP": (50, 1),
-        "XTRDMA_NOTIFY_AEQ_CI": (32, 18), "XTRDMA_NOTIFY_AEQ_AEQN": (0, 12),
-    }
-    for symbol, expression in expressions.items():
-        path, _ = _REFERENCE_FIELDS[symbol]
-        _REFERENCE_FIELDS[symbol] = (path, expression)
+        mapping = mappings_by_stem.get(reference.sv_stem)
+        if mapping is None:
+            raise ValidationError(f"reference mapping missing for {reference.sv_stem}")
+        if mapping.path != reference.path or mapping.c_symbol != reference.c_symbol:
+            raise ValidationError(f"reference source mismatch for {reference.sv_stem}")
+        if mapping.word_byte_offset != reference.word_byte_offset:
+            raise ValidationError(f"reference byte offset mismatch for {reference.sv_stem}")
 
-
-_install_reference_widths()
+        if parsed_fields is not None:
+            parsed = parsed_fields.get(reference.sv_stem)
+            if parsed is None:
+                raise ValidationError(f"parsed reference field missing for {reference.sv_stem}")
+            expected = (
+                reference.path,
+                reference.c_symbol,
+                reference.lsb,
+                reference.width,
+            )
+            if parsed != expected:
+                raise ValidationError(f"reference mask mismatch for {reference.sv_stem}")
 
 
 def build_golden_cases() -> dict[str, list[GoldenCase]]:
     def make_case(name: str, byte_count: int, inputs) -> GoldenCase:
-        image = bytearray(byte_count)
+        image = ReferenceImage(byte_count)
         for stem, value, _ in inputs:
             if stem:
                 put_named(image, stem, value)
@@ -750,17 +853,23 @@ def validate(kernel_root: Path) -> None:
     parsed_sources = {path: parse_c_symbols(text) for path, text in source_text.items()}
     sv_constants = parse_sv_constants(SV_DEFS_PATH.read_text())
     expected_constants: dict[str, int] = dict(PROFILE_VALUES)
+    parsed_fields: dict[str, tuple[str, str, int, int]] = {}
     for mapping in FIELD_MAPPINGS:
         macros, _ = parsed_sources[mapping.path]
         expression = require_unique_expression(macros, mapping.c_symbol, mapping.path)
         lsb, width = parse_field_expression(expression)
-        ref_path, ref_field = _REFERENCE_FIELDS[mapping.c_symbol]
-        if ref_field != (0, 0) and (ref_path != mapping.path or ref_field != (lsb, width)):
-            raise ValidationError(f"reference encoder drift for {mapping.c_symbol}")
+        parsed_fields[mapping.sv_stem] = (
+            mapping.path,
+            mapping.c_symbol,
+            lsb,
+            width,
+        )
         expected_constants[f"{mapping.sv_stem}_WORD_BYTE_OFFSET"] = mapping.word_byte_offset
         expected_constants[f"{mapping.sv_stem}_LSB"] = lsb
         expected_constants[f"{mapping.sv_stem}_WIDTH"] = width
         expected_constants[f"{mapping.sv_stem}_OFFSET"] = mapping.word_byte_offset * 8 + lsb
+
+    validate_reference_fields(REFERENCE_FIELDS, FIELD_MAPPINGS, parsed_fields)
 
     for mapping in VALUE_MAPPINGS:
         macros, enums = parsed_sources[mapping.path]
