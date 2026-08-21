@@ -111,6 +111,9 @@ class rdma_adapter_contract_test extends uvm_test;
     rdma_dma_mapping identity_mapping_b;
     rdma_dma_mapping forged_mapping;
     rdma_mock_dma_mapping identity_mock_mapping;
+    rdma_mock_dma_mapping identity_mock_mapping_b;
+    rdma_mock_dma_mapping identity_mock_mapping_snapshot;
+    rdma_mock_dma_mapping third_mock_mapping;
     rdma_function_binding binding;
     rdma_packet tx_packet;
     rdma_packet observer_seed;
@@ -292,22 +295,45 @@ class rdma_adapter_contract_test extends uvm_test;
     if (!$cast(identity_mock_mapping, identity_mapping_a))
       `uvm_fatal("HOST_IDENTITY_TYPE",
                  "allocated mapping does not carry mock identity")
-    status = identity_mock_mapping.initialize_allocation_token(64'hfeed);
+    status = identity_mock_mapping.initialize_allocation_token();
     expect_status("HOST_IDENTITY_REINITIALIZE", status,
                   RDMA_SC_INVALID_STATE);
     status = identity_mem_api.allocate(
       function_h, 64, 64, RDMA_DMA_BIDIRECTIONAL, identity_mapping_b
     );
     expect_status("HOST_IDENTITY_ALLOC_B", status, RDMA_SC_OK);
+    if (!$cast(identity_mock_mapping_b, identity_mapping_b))
+      `uvm_fatal("HOST_IDENTITY_TYPE",
+                 "second allocated mapping does not carry mock identity")
+    third_mock_mapping = rdma_mock_dma_mapping::type_id::create(
+      "third_mock_mapping"
+    );
+    status = third_mock_mapping.initialize_allocation_token();
+    expect_status("HOST_IDENTITY_THIRD_INIT", status, RDMA_SC_OK);
+    if (identity_mock_mapping.same_allocation(identity_mock_mapping_b) ||
+        third_mock_mapping.same_allocation(identity_mock_mapping) ||
+        third_mock_mapping.same_allocation(identity_mock_mapping_b))
+      `uvm_error("HOST_IDENTITY_UNIQUE",
+                 "independent mappings share allocation identity")
     cloned_object = identity_mapping_a.clone();
     if (cloned_object == null ||
         !$cast(identity_mapping_a_snapshot, cloned_object))
       `uvm_fatal("HOST_IDENTITY_CLONE", "mapping clone type mismatch")
+    if (!$cast(identity_mock_mapping_snapshot, identity_mapping_a_snapshot) ||
+        !identity_mock_mapping.same_allocation(
+          identity_mock_mapping_snapshot
+        ))
+      `uvm_error("HOST_IDENTITY_CLONE",
+                 "mapping clone did not preserve allocation identity")
     status = identity_mem_api.write(identity_mapping_b, 0, identity_b_data);
     expect_status("HOST_IDENTITY_SEED_B", status, RDMA_SC_OK);
 
-    identity_mapping_a.backing_addr = identity_mapping_b.backing_addr;
-    identity_mapping_a.iova = identity_mapping_b.iova;
+    identity_mapping_a.copy(identity_mapping_b);
+    if (!identity_mock_mapping.same_allocation(
+          identity_mock_mapping_snapshot
+        ) || identity_mock_mapping.same_allocation(identity_mock_mapping_b))
+      `uvm_error("HOST_IDENTITY_COPY",
+                 "copy operation replaced allocation identity")
     status = identity_mem_api.write(identity_mapping_a, 0, identity_a_data);
     expect_status("HOST_IDENTITY_WRITE_A", status, RDMA_SC_OK);
     status = identity_mem_api.read(identity_mapping_b, 0, 2,

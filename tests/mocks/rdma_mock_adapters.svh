@@ -159,6 +159,7 @@ class rdma_mock_dma_mapping extends rdma_dma_mapping;
 
   local longint unsigned allocation_token;
   local bit allocation_token_initialized;
+  local static longint unsigned next_token = 1;
 
   function new(string name = "rdma_mock_dma_mapping");
     super.new(name);
@@ -166,34 +167,45 @@ class rdma_mock_dma_mapping extends rdma_dma_mapping;
     allocation_token_initialized = 1'b0;
   endfunction
 
-  function rdma_status initialize_allocation_token(longint unsigned token);
+  function rdma_status initialize_allocation_token();
     if (allocation_token_initialized)
       return rdma_status::make(RDMA_SC_INVALID_STATE,
                                "allocation token is already initialized");
-    if (token == 0)
-      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                               "allocation token must be nonzero");
-    allocation_token = token;
+    if (next_token == 0)
+      return rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED,
+                               "allocation tokens are exhausted");
+    allocation_token = next_token;
     allocation_token_initialized = 1'b1;
+    next_token++;
     return rdma_status::success();
   endfunction
 
-  function bit has_allocation_token();
-    return allocation_token_initialized;
-  endfunction
-
-  function longint unsigned get_allocation_token();
-    return allocation_token;
+  function bit same_allocation(rdma_mock_dma_mapping rhs);
+    if (rhs == null)
+      return 1'b0;
+    return allocation_token_initialized && rhs.allocation_token_initialized &&
+           allocation_token == rhs.allocation_token;
   endfunction
 
   virtual function void do_copy(uvm_object rhs);
     rdma_mock_dma_mapping rhs_mapping;
+    bit destination_was_initialized;
+    longint unsigned destination_token;
 
+    destination_was_initialized = allocation_token_initialized;
+    destination_token = allocation_token;
     super.do_copy(rhs);
     if (!$cast(rhs_mapping, rhs))
       `uvm_fatal("MOCK_COPY", "mock DMA mapping copy type mismatch")
-    allocation_token = rhs_mapping.allocation_token;
-    allocation_token_initialized = rhs_mapping.allocation_token_initialized;
+    if (destination_was_initialized) begin
+      // Public mapping fields may be copied, but established identity is fixed.
+      allocation_token = destination_token;
+      allocation_token_initialized = 1'b1;
+    end
+    else begin
+      allocation_token = rhs_mapping.allocation_token;
+      allocation_token_initialized = rhs_mapping.allocation_token_initialized;
+    end
   endfunction
 endclass
 
@@ -217,13 +229,11 @@ class rdma_mock_host_mem extends rdma_host_mem_api;
   rdma_status failures[string];
   longint unsigned next_sequence;
   longint unsigned next_address;
-  local longint unsigned next_allocation_token;
 
   function new(string name = "rdma_mock_host_mem");
     super.new(name);
     next_sequence = 0;
     next_address = 64'h0000_0001_0000_0000;
-    next_allocation_token = 1;
   endfunction
 
   function rdma_status fail_next(string method_name, rdma_status status);
@@ -284,14 +294,10 @@ class rdma_mock_host_mem extends rdma_host_mem_api;
       return -1;
     if (!$cast(requested_mapping, mapping))
       return -1;
-    if (!requested_mapping.has_allocation_token())
-      return -1;
     foreach (regions[i]) begin
       if (!$cast(region_mapping, regions[i].mapping))
         continue;
-      if (region_mapping.has_allocation_token() &&
-          region_mapping.get_allocation_token() ==
-            requested_mapping.get_allocation_token() &&
+      if (region_mapping.same_allocation(requested_mapping) &&
           region_mapping.function_h != null && mapping.function_h != null &&
           region_mapping.function_h.same_instance(mapping.function_h))
         return i;
@@ -338,15 +344,10 @@ class rdma_mock_host_mem extends rdma_host_mem_api;
     if (size > (64'hffff_ffff_ffff_ffff - aligned_address))
       return rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED,
                                "DMA allocation end overflows");
-    if (next_allocation_token == 0)
-      return rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED,
-                               "DMA allocation tokens are exhausted");
     allocated_mapping = rdma_mock_dma_mapping::type_id::create(
       $sformatf("mapping_%0d", regions.size())
     );
-    token_status = allocated_mapping.initialize_allocation_token(
-      next_allocation_token
-    );
+    token_status = allocated_mapping.initialize_allocation_token();
     if (!token_status.ok())
       return token_status;
     allocated_mapping.function_h = rdma_mock_clone_function_handle(function_h);
@@ -369,7 +370,6 @@ class rdma_mock_host_mem extends rdma_host_mem_api;
     region.data = new[size];
     regions.push_back(region);
     next_address = aligned_address + size;
-    next_allocation_token++;
     return rdma_status::success();
   endfunction
 
