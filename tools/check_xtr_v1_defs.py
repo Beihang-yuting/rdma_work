@@ -1257,7 +1257,7 @@ def build_golden_cases() -> dict[str, list[GoldenCase]]:
 
     rc_send_psn = 0xABCDEF
     rc_recv_psn = 0x123456
-    rc_traffic_class = 0xA8
+    rc_traffic_class = 0xAA
     qpc_rc = make_case("qpc_rc_boundary", 512, (
         ("", 0, "transport=rc"),
         ("", 0, f"traffic_class={rc_traffic_class:#x}"),
@@ -1382,7 +1382,7 @@ def build_golden_cases() -> dict[str, list[GoldenCase]]:
 
     urc_rsq_pba = 0x123456789ABCD
     urc_dsq_pba = 0x3456789ABCDEF
-    urc_traffic_class = 0xFC
+    urc_traffic_class = 0xFE
     qpc_urc = make_case("qpc_urc_boundary", 512, (
         ("", 0, "transport=urc"),
         ("", 0, f"traffic_class={urc_traffic_class:#x}"),
@@ -1796,7 +1796,8 @@ def validate_context_contract(cases: list[GoldenCase]) -> None:
         if (dscp != traffic_class >> 2
                 or dscp != numeric_input(case, "dscp")):
             raise ValidationError(f"{case.name} traffic class/DSCP mismatch")
-        if (ecn != required_ecn[transport]
+        if (ecn != (traffic_class & 0x3)
+                or ecn != required_ecn[transport]
                 or ecn != numeric_input(case, "ecn")):
             raise ValidationError(f"{case.name} ECN policy/input mismatch")
 

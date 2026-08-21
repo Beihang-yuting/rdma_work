@@ -471,9 +471,9 @@ class ReferenceEncodingTest(unittest.TestCase):
                     case.summary = "drift"
         summaries = [case.summary for case in context_cases]
         self.assertEqual(summaries, [
-            "transport=rc,traffic_class=0xa8,tver=1,mig=1,host=5,vf=0xabc,icos=5,qpn=0x15555,stat_idx=0xa5,pkey=0xbeef,shadow_pba=0x123456789ab,tx_swap=1,rx_swap=1,sq_ce=1,ra_fence=1,aa_fence=1,fc=1,state=3,pmtu=5,retry_count=7,rnr_retry=7,qp_sn=0xc3,srfq=1,srfqn=0x4567,pd=0xa55a,access=0x1f,dst_qpn=0x654321,dmac=0x112233445566,vlan_id=0xabc,flow=0xabcde,dscp=0x2a,ecn=2,hop=0x40,udp_sport=0xc123,send_psn=0xabcdef,recv_psn=0x123456,sq_pba=0x123456789abcd,sq_size=11,sq_om=2,sq_cqn=0xabcde,rq_cqn=0x54321,rq_pba=0x0fedcba987654,rq_size=10,rq_om=1",
+            "transport=rc,traffic_class=0xaa,tver=1,mig=1,host=5,vf=0xabc,icos=5,qpn=0x15555,stat_idx=0xa5,pkey=0xbeef,shadow_pba=0x123456789ab,tx_swap=1,rx_swap=1,sq_ce=1,ra_fence=1,aa_fence=1,fc=1,state=3,pmtu=5,retry_count=7,rnr_retry=7,qp_sn=0xc3,srfq=1,srfqn=0x4567,pd=0xa55a,access=0x1f,dst_qpn=0x654321,dmac=0x112233445566,vlan_id=0xabc,flow=0xabcde,dscp=0x2a,ecn=2,hop=0x40,udp_sport=0xc123,send_psn=0xabcdef,recv_psn=0x123456,sq_pba=0x123456789abcd,sq_size=11,sq_om=2,sq_cqn=0xabcde,rq_cqn=0x54321,rq_pba=0x0fedcba987654,rq_size=10,rq_om=1",
             "transport=ud,traffic_class=0xac,tver=1,mig=0,host=6,vf=0x345,icos=5,qpn=0x2aaaa,stat_idx=0x5a,qkey=0x89abcdef,pkey=0x1234,shadow_pba=0x0fedcba9876,tx_swap=1,rx_swap=1,state=3,pmtu=4,qp_sn=0x7e,pd=0x5aa5,vlan=1,ipv6=1,tunnel=1,lag=1,fwd=2,dst_vport=0x456,src_addr=0xabc,dst_port=0xb,dst_qpn=0xabcdef,dmac=0xa1b2c3d4e5f6,pri=5,cfi=1,vlan_id=0x789,src_vport=0x345,flow=0x54321,dscp=0x2b,ecn=0,hop=0x7f,udp_sport=0xbeef,dest_ip=20010db8000000000000000000000001,sq_pba=0x1111122222333,sq_size=9,sq_om=3,sq_cqn=0x13579,rq_cqn=0x2468a,rq_pba=0x4444455555666,rq_size=8,rq_om=2",
-            "transport=urc,traffic_class=0xfc,tver=1,mig=1,host=7,vf=0x789,icos=7,qpn=0x3ffff,stat_idx=0xff,rsq_pba=0x123456789abcd,pkey=0xabcd,shadow_pba=0x123456789ab,state=3,pmtu=5,qp_sn=0xfe,pd=0xffff,dscp=0x3f,ecn=2,rdsq_pba=0x23456789abcde,rdsq_size=7,tx_rbsn=0xabcdef,tx_dbsn=0x654321,rx_rbsn=0x123456,rx_dbsn=0xfedcba,rx_srbsn=0x345678,cur_dpsn=0x456789,cur_rpsn=0x56789a,rxed_dbsn=0x6789ab,rq_se_th=0xf,sq_ce_th=0xe,tx_srbsn=0x789abc,max_tx_srbsn=0x89abcd,dsq_pba=0x3456789abcdef,tpe_rpsn_max=0x9abcde,tpe_dpsn_max=0xabcdef,dsq_fetch=0x3f,sq_pba=0x456789abcdef0,sq_size=0xf,sq_om=3,sq_cqn=0xfffff,rq_cqn=0xabcde,rq_pba=0x56789abcdef01,rq_size=0xe,rq_om=2",
+            "transport=urc,traffic_class=0xfe,tver=1,mig=1,host=7,vf=0x789,icos=7,qpn=0x3ffff,stat_idx=0xff,rsq_pba=0x123456789abcd,pkey=0xabcd,shadow_pba=0x123456789ab,state=3,pmtu=5,qp_sn=0xfe,pd=0xffff,dscp=0x3f,ecn=2,rdsq_pba=0x23456789abcde,rdsq_size=7,tx_rbsn=0xabcdef,tx_dbsn=0x654321,rx_rbsn=0x123456,rx_dbsn=0xfedcba,rx_srbsn=0x345678,cur_dpsn=0x456789,cur_rpsn=0x56789a,rxed_dbsn=0x6789ab,rq_se_th=0xf,sq_ce_th=0xe,tx_srbsn=0x789abc,max_tx_srbsn=0x89abcd,dsq_pba=0x3456789abcdef,tpe_rpsn_max=0x9abcde,tpe_dpsn_max=0xabcdef,dsq_fetch=0x3f,sq_pba=0x456789abcdef0,sq_size=0xf,sq_om=3,sq_cqn=0xfffff,rq_cqn=0xabcde,rq_pba=0x56789abcdef01,rq_size=0xe,rq_om=2",
             "cqn=0x1fffff,sd_pba=0xfffffffffffff,size=0x1f,urc=1,state=2,next_hi=0xff,cur_valid=1,cur_pba=0xfffffffffffff,load_ci=1,threshold=7,mode=3,next_valid=1,next_lo=0xfffffffffff,pi=0x7fffff,pi_wrap=1,last_arm=3,cqe_size=2,ceqn=0xfff,shadow=0x3ffffffffffffff,ci=0x7fffff,ci_wrap=1,arm_sn=3,arm_state=2",
             "opcode=0x05,stag=0xffffff,state=2,key=0xff,parent=0,pd=0xffff,payload_vf=0xff,payload_vf_en=1,rights=0x1f,type=2,host_page=2,pbl=0,address_mode=1,invalidate=1,length=0x3fffffffffff,odp=1,start_va=0xffffffffffffffff,pba0=0xfffffffffffff,mr_sn=0xfff",
             "opcode=0x05,stag=0xffffff,state=2,key=0xff,parent=0,pd=0xffff,payload_vf=0xff,payload_vf_en=1,rights=0x1f,type=2,host_page=2,pbl=1,address_mode=1,invalidate=1,length=0x3fffffffffff,odp=1,start_va=0xffffffffffffffff,pba0=0xfffffffffffff,pba1=0xfffffffffffff,mr_sn=0xfff",
@@ -562,6 +562,8 @@ class ReferenceEncodingTest(unittest.TestCase):
                              traffic_class >> 2)
             self.assertEqual(self.field_value(case, "XTR_V1_QPC_ECN"),
                              required_ecn)
+            self.assertEqual(self.field_value(case, "XTR_V1_QPC_ECN"),
+                             traffic_class & 0x3)
 
             for stem in ("XTR_V1_QPC_ICOS", "XTR_V1_QPC_DSCP",
                          "XTR_V1_QPC_ECN"):
@@ -572,6 +574,14 @@ class ReferenceEncodingTest(unittest.TestCase):
                         CHECKER.ValidationError, "traffic class|ECN"
                     ):
                         validate(corrupted)
+
+            with self.subTest(case=case.name, input="traffic_class_low_bits"):
+                corrupted = list(cases)
+                corrupted[cases.index(case)] = self.mutate_input(
+                    case, "traffic_class"
+                )
+                with self.assertRaisesRegex(CHECKER.ValidationError, "ECN"):
+                    validate(corrupted)
 
     def test_body_goldens_use_only_driver_supported_semantic_values(self) -> None:
         validate = self.require_checker_attribute("validate_context_contract")
