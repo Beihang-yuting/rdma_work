@@ -3,12 +3,19 @@ class rdma_resource_manager extends uvm_object;
 
   // Registry keys are exactly function_uid:generation:kind:object_id.
   protected rdma_resource registry[string];
-  // Bindings remain live references so a Function generation transition is
-  // immediately visible to stale-handle checks.
-  protected rdma_function_binding live_bindings[string];
-  // Incarnation ownership is retained after release to distinguish a stale or
-  // released value handle from an unknown/forged handle.
+  // The caller-owned reference is only a monotonic generation observer.  All
+  // identity and configuration are read from the immutable deep-copy snapshot.
+  protected rdma_function_binding generation_sources[string];
+  protected rdma_function_binding binding_snapshots[string];
+  protected int unsigned generation_high_water[string];
+  protected bit generation_exhausted[string];
+  protected bit known_generations[string];
+  protected bit retired_generations[string];
+  // Exact incarnation ownership is retained after release.  Including the
+  // generation prevents a later Function generation from replacing an older
+  // tombstone.
   protected rdma_function_handle incarnation_owners[string];
+  protected rdma_handle incarnation_handles[string];
 
   // Local IDs are reusable and independent for every resource kind.  The
   // 28-bit serial component of object_id is monotonic and never reused; the
@@ -31,17 +38,23 @@ class rdma_resource_manager extends uvm_object;
   endfunction
 
   protected function string resource_key(rdma_handle handle);
-    return $sformatf("%016h:%08h:%0d:%08h", handle.function_uid,
+    return $sformatf("%016h:%08h:%01h:%08h", handle.function_uid,
                      handle.generation, handle.kind, handle.object_id);
   endfunction
 
   protected function string incarnation_key(rdma_handle handle);
-    return $sformatf("%016h:%0d:%08h", handle.function_uid,
-                     handle.kind, handle.object_id);
+    return resource_key(handle);
   endfunction
 
   protected function string function_key(rdma_function_handle owner);
     return $sformatf("%016h:%08h", owner.function_uid, owner.object_id);
+  endfunction
+
+  protected function string function_generation_key(
+    rdma_function_handle owner
+  );
+    return $sformatf("%016h:%08h:%08h", owner.function_uid,
+                     owner.object_id, owner.generation);
   endfunction
 
   protected function rdma_resource clone_resource_value(
@@ -60,48 +73,181 @@ class rdma_resource_manager extends uvm_object;
     return cloned_resource;
   endfunction
 
-  protected function rdma_status active_binding_status(
-    rdma_function_binding binding
+  protected function rdma_function_binding clone_binding_value(
+    rdma_function_binding source,
+    string copy_label
+  );
+    uvm_object cloned_object;
+    rdma_function_binding cloned_binding;
+
+    if (source == null)
+      return null;
+    cloned_object = source.clone();
+    if (cloned_object == null || !$cast(cloned_binding, cloned_object))
+      `uvm_fatal("RM_COPY_TYPE",
+                 {copy_label, " Function binding clone mismatch"})
+    return cloned_binding;
+  endfunction
+
+  protected function bit source_key(
+    rdma_function_binding binding,
+    output string key
+  );
+    key = "";
+    foreach (generation_sources[candidate_key]) begin
+      if (generation_sources[candidate_key] == binding) begin
+        key = candidate_key;
+        return 1'b1;
+      end
+    end
+    return 1'b0;
+  endfunction
+
+  protected function void refresh_generation(string key);
+    int unsigned observed_generation;
+
+    if (!generation_sources.exists(key) ||
+        generation_sources[key] == null)
+      return;
+    observed_generation = generation_sources[key].generation;
+    if (generation_high_water.exists(key) &&
+        generation_high_water[key] == 32'hffff_ffff &&
+        observed_generation == 0)
+      generation_exhausted[key] = 1'b1;
+    if (!generation_high_water.exists(key) ||
+        observed_generation > generation_high_water[key])
+      generation_high_water[key] = observed_generation;
+  endfunction
+
+  protected function rdma_status binding_context_status(
+    rdma_function_binding binding,
+    output rdma_function_binding trusted_binding,
+    output rdma_function_handle owner,
+    output string key,
+    output bit registration_needed
   );
     rdma_status status;
+    int unsigned observed_generation;
+    bit source_is_known;
 
+    trusted_binding = null;
+    owner = null;
+    key = "";
+    registration_needed = 1'b0;
     if (binding == null)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "function binding is null");
-    status = binding.validate();
+
+    source_is_known = source_key(binding, key);
+    if (!source_is_known) begin
+      key = $sformatf("%016h:%08h", binding.function_uid,
+                      binding.global_function_id);
+      if (binding_snapshots.exists(key))
+        return rdma_status::make(
+          RDMA_SC_INVALID_ARGUMENT,
+          "Function generation source is not the registered binding"
+        );
+    end
+
+    if (!binding_snapshots.exists(key)) begin
+      status = binding.validate();
+      if (!status.ok())
+        return status;
+      if (binding.state != RDMA_BIND_ACTIVE)
+        return rdma_status::make(RDMA_SC_INVALID_STATE,
+                                 "function binding is not ACTIVE");
+      trusted_binding = clone_binding_value(binding, "new binding");
+      observed_generation = binding.generation;
+      registration_needed = 1'b1;
+    end
+    else begin
+      trusted_binding = clone_binding_value(binding_snapshots[key],
+                                            "trusted binding");
+      observed_generation = binding.generation;
+      if (!generation_high_water.exists(key))
+        return rdma_status::make(RDMA_SC_INVALID_STATE,
+                                 "Function generation ledger is missing");
+      if (observed_generation < generation_high_water[key]) begin
+        if (generation_high_water[key] == 32'hffff_ffff &&
+            observed_generation == 0) begin
+          generation_exhausted[key] = 1'b1;
+          return rdma_status::make(
+            RDMA_SC_RESOURCE_EXHAUSTED,
+            "Function generation wrapped after 32-bit exhaustion"
+          );
+        end
+        return rdma_status::make(RDMA_SC_STALE_GENERATION,
+                                 "Function generation moved backwards");
+      end
+      if (observed_generation > generation_high_water[key])
+        generation_high_water[key] = observed_generation;
+    end
+
+    trusted_binding.generation = observed_generation;
+    trusted_binding.owner_h = trusted_binding.make_handle();
+    owner = trusted_binding.make_handle();
+    if (retired_generations.exists(function_generation_key(owner)))
+      return rdma_status::make(RDMA_SC_STALE_GENERATION,
+                               "Function generation is retired");
+    status = trusted_binding.validate();
     if (!status.ok())
       return status;
-    if (binding.state != RDMA_BIND_ACTIVE)
+    if (trusted_binding.state != RDMA_BIND_ACTIVE)
       return rdma_status::make(RDMA_SC_INVALID_STATE,
                                "function binding is not ACTIVE");
     return rdma_status::success();
+  endfunction
+
+  protected function void register_binding_context(
+    rdma_function_binding source,
+    rdma_function_binding trusted_binding,
+    rdma_function_handle owner,
+    string key
+  );
+    generation_sources[key] = source;
+    binding_snapshots[key] = clone_binding_value(trusted_binding,
+                                                 "binding registry");
+    generation_high_water[key] = owner.generation;
+    generation_exhausted.delete(key);
+  endfunction
+
+  protected function rdma_status active_binding_status(
+    rdma_function_binding binding,
+    output rdma_function_handle owner
+  );
+    rdma_function_binding trusted_binding;
+    string key;
+    bit registration_needed;
+
+    return binding_context_status(binding, trusted_binding, owner, key,
+                                  registration_needed);
   endfunction
 
   protected function rdma_status owner_binding_status(
     rdma_function_handle owner
   );
     string key;
-    rdma_function_binding binding;
-    rdma_function_handle current_owner;
+    string generation_key;
 
     if (owner == null || owner.kind != RDMA_RESOURCE_FUNCTION)
       return rdma_status::make(RDMA_SC_INVALID_STATE,
                                "registry owner is not a Function handle");
     key = function_key(owner);
-    if (!live_bindings.exists(key))
+    if (!binding_snapshots.exists(key))
       return rdma_status::make(RDMA_SC_INVALID_STATE,
                                "Function binding is not registered");
-    binding = live_bindings[key];
-    if (binding == null)
-      return rdma_status::make(RDMA_SC_INVALID_STATE,
-                               "registered Function binding is null");
-    current_owner = binding.make_handle();
-    if (current_owner.generation != owner.generation)
+    refresh_generation(key);
+    generation_key = function_generation_key(owner);
+    if (retired_generations.exists(generation_key))
       return rdma_status::make(RDMA_SC_STALE_GENERATION,
-                               "Function generation is stale");
-    if (!current_owner.same_instance(owner))
-      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                               "complete Function identity does not match");
+                               "Function generation is retired");
+    if (generation_exhausted.exists(key))
+      return rdma_status::make(RDMA_SC_STALE_GENERATION,
+                               "Function generation counter is exhausted");
+    if (!generation_high_water.exists(key) ||
+        generation_high_water[key] != owner.generation)
+      return rdma_status::make(RDMA_SC_STALE_GENERATION,
+                               "Function generation is not current");
     return rdma_status::success();
   endfunction
 
@@ -127,13 +273,16 @@ class rdma_resource_manager extends uvm_object;
     output int unsigned local_id
   );
     rdma_status status;
+    rdma_function_binding trusted_binding;
     int unsigned serial;
     string owner_key;
+    bit registration_needed;
 
     owner = null;
     handle = null;
     local_id = '0;
-    status = active_binding_status(binding);
+    status = binding_context_status(binding, trusted_binding, owner,
+                                    owner_key, registration_needed);
     if (!status.ok())
       return status;
     if (!valid_kind(kind) || kind == RDMA_RESOURCE_FUNCTION)
@@ -152,18 +301,13 @@ class rdma_resource_manager extends uvm_object;
       return rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED,
                                "resource local ID pool is exhausted");
 
-    owner = binding.make_handle();
     if (has_conflicting_generation(owner))
       return rdma_status::make(
         RDMA_SC_INVALID_STATE,
         "older Function generation still owns live resources"
       );
-    owner_key = function_key(owner);
-    if (live_bindings.exists(owner_key)) begin
-      status = owner_binding_status(owner);
-      if (!status.ok())
-        return status;
-    end
+    if (registration_needed)
+      register_binding_context(binding, trusted_binding, owner, owner_key);
 
     if (free_local_ids.exists(kind) &&
         free_local_ids[kind].size() != 0)
@@ -179,7 +323,6 @@ class rdma_resource_manager extends uvm_object;
     handle.function_uid = owner.function_uid;
     handle.object_id = {kind, serial[27:0]};
     handle.generation = owner.generation;
-    live_bindings[owner_key] = binding;
     return rdma_status::success();
   endfunction
 
@@ -187,10 +330,33 @@ class rdma_resource_manager extends uvm_object;
     string key;
 
     key = resource_key(resource.handle);
-    registry[key] = resource;
+    registry[key] = clone_resource_value(resource, "registry");
     incarnation_owners[incarnation_key(resource.handle)] =
       rdma_clone_function_handle_value(resource.owner,
                                         "resource incarnation owner");
+    incarnation_handles[incarnation_key(resource.handle)] =
+      rdma_clone_handle_value(resource.handle, "resource incarnation");
+    known_generations[function_generation_key(resource.owner)] = 1'b1;
+  endfunction
+
+  protected function bit related_incarnation_owner(
+    rdma_handle handle,
+    output rdma_function_handle owner
+  );
+    owner = null;
+    foreach (incarnation_handles[key]) begin
+      if (incarnation_handles[key] == null ||
+          !incarnation_owners.exists(key) ||
+          incarnation_owners[key] == null)
+        continue;
+      if (incarnation_handles[key].function_uid == handle.function_uid &&
+          incarnation_handles[key].kind == handle.kind &&
+          incarnation_handles[key].object_id == handle.object_id) begin
+        owner = incarnation_owners[key];
+        return 1'b1;
+      end
+    end
+    return 1'b0;
   endfunction
 
   protected function rdma_status dependency_status(
@@ -330,16 +496,19 @@ class rdma_resource_manager extends uvm_object;
   );
     rdma_status status;
     rdma_function authoritative;
+    rdma_function_binding trusted_binding;
     rdma_resource published;
     rdma_function_handle owner;
     string key;
+    string owner_key;
     int unsigned local_id;
+    bit registration_needed;
 
     function_resource = null;
-    status = active_binding_status(binding);
+    status = binding_context_status(binding, trusted_binding, owner,
+                                    owner_key, registration_needed);
     if (!status.ok())
       return status;
-    owner = binding.make_handle();
     key = resource_key(owner);
     if (registry.exists(key))
       return rdma_status::make(RDMA_SC_INVALID_STATE,
@@ -349,9 +518,7 @@ class rdma_resource_manager extends uvm_object;
         RDMA_SC_INVALID_STATE,
         "older Function generation still owns live resources"
       );
-    if (incarnation_owners.exists(incarnation_key(owner)) &&
-        incarnation_owners[incarnation_key(owner)].generation ==
-          owner.generation)
+    if (incarnation_owners.exists(incarnation_key(owner)))
       return rdma_status::make(RDMA_SC_INVALID_STATE,
                                "Function incarnation was already released");
     if ((!free_local_ids.exists(RDMA_RESOURCE_FUNCTION) ||
@@ -359,6 +526,8 @@ class rdma_resource_manager extends uvm_object;
         next_local_id[RDMA_RESOURCE_FUNCTION] == 32'hffff_ffff)
       return rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED,
                                "Function local ID pool is exhausted");
+    if (registration_needed)
+      register_binding_context(binding, trusted_binding, owner, owner_key);
     if (free_local_ids.exists(RDMA_RESOURCE_FUNCTION) &&
         free_local_ids[RDMA_RESOURCE_FUNCTION].size() != 0)
       local_id = free_local_ids[RDMA_RESOURCE_FUNCTION].pop_front();
@@ -366,7 +535,6 @@ class rdma_resource_manager extends uvm_object;
       local_id = next_local_id[RDMA_RESOURCE_FUNCTION];
       next_local_id[RDMA_RESOURCE_FUNCTION]++;
     end
-    live_bindings[function_key(owner)] = binding;
     authoritative = rdma_function::type_id::create("function_resource");
     authoritative.handle = owner;
     authoritative.owner = rdma_clone_function_handle_value(owner,
@@ -374,7 +542,8 @@ class rdma_resource_manager extends uvm_object;
     authoritative.state = RDMA_RESOURCE_ALLOCATED;
     authoritative.local_function_id = local_id;
     authoritative.global_function_id = owner.object_id;
-    authoritative.binding = binding;
+    authoritative.binding = clone_binding_value(trusted_binding,
+                                                  "Function resource");
     register_resource(authoritative);
     published = clone_resource_value(authoritative, "create Function");
     if (!$cast(function_resource, published))
@@ -424,10 +593,9 @@ class rdma_resource_manager extends uvm_object;
     int unsigned local_id;
 
     mr = null;
-    status = active_binding_status(binding);
+    status = active_binding_status(binding, owner);
     if (!status.ok())
       return status;
-    owner = binding.make_handle();
     status = dependency_status(owner, pd_h, RDMA_RESOURCE_PD, 1'b0);
     if (!status.ok())
       return status;
@@ -465,10 +633,9 @@ class rdma_resource_manager extends uvm_object;
     int unsigned local_id;
 
     cq = null;
-    status = active_binding_status(binding);
+    status = active_binding_status(binding, owner);
     if (!status.ok())
       return status;
-    owner = binding.make_handle();
     status = dependency_status(owner, ceq_h, RDMA_RESOURCE_CEQ, 1'b1);
     if (!status.ok())
       return status;
@@ -511,10 +678,9 @@ class rdma_resource_manager extends uvm_object;
     int unsigned local_id;
 
     qp = null;
-    status = active_binding_status(binding);
+    status = active_binding_status(binding, owner);
     if (!status.ok())
       return status;
-    owner = binding.make_handle();
     status = dependency_status(owner, pd_h, RDMA_RESOURCE_PD, 1'b0);
     if (!status.ok())
       return status;
@@ -577,10 +743,9 @@ class rdma_resource_manager extends uvm_object;
     int unsigned local_id;
 
     srq = null;
-    status = active_binding_status(binding);
+    status = active_binding_status(binding, owner);
     if (!status.ok())
       return status;
-    owner = binding.make_handle();
     status = dependency_status(owner, pd_h, RDMA_RESOURCE_PD, 1'b0);
     if (!status.ok())
       return status;
@@ -729,18 +894,19 @@ class rdma_resource_manager extends uvm_object;
     end
 
     incarnation = incarnation_key(handle);
-    if (!incarnation_owners.exists(incarnation))
+    if (!incarnation_owners.exists(incarnation)) begin
+      if (related_incarnation_owner(handle, owner))
+        return rdma_status::make(RDMA_SC_STALE_GENERATION,
+                                 "resource handle generation is stale");
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "resource handle is unknown or forged");
+    end
     owner = incarnation_owners[incarnation];
     status = owner_binding_status(owner);
     if (status.code == RDMA_SC_STALE_GENERATION)
       return status;
     if (!status.ok())
       return status;
-    if (handle.generation != owner.generation)
-      return rdma_status::make(RDMA_SC_STALE_GENERATION,
-                               "resource handle generation is stale");
     return rdma_status::make(RDMA_SC_INVALID_STATE,
                              "resource handle has been released");
   endfunction
@@ -781,9 +947,10 @@ class rdma_resource_manager extends uvm_object;
   endfunction
 
   function rdma_status release_function(rdma_function_handle owner);
-    rdma_status status;
     bit selected[string];
     string release_order[$];
+    string owner_key;
+    string generation_key;
     int unsigned target_count;
     bit progress;
     bit blocked;
@@ -791,9 +958,18 @@ class rdma_resource_manager extends uvm_object;
     if (owner == null || owner.kind != RDMA_RESOURCE_FUNCTION)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "Function teardown handle is invalid");
-    status = owner_binding_status(owner);
-    if (!status.ok())
-      return status;
+    owner_key = function_key(owner);
+    generation_key = function_generation_key(owner);
+    if (!binding_snapshots.exists(owner_key))
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "Function teardown identity is unknown");
+    refresh_generation(owner_key);
+    if (retired_generations.exists(generation_key))
+      return rdma_status::make(RDMA_SC_STALE_GENERATION,
+                               "Function generation is already retired");
+    if (!known_generations.exists(generation_key))
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "Function generation was never registered");
 
     target_count = 0;
     foreach (registry[key]) begin
@@ -835,6 +1011,7 @@ class rdma_resource_manager extends uvm_object;
 
     foreach (release_order[i])
       force_release_key(release_order[i]);
+    retired_generations[generation_key] = 1'b1;
     return rdma_status::success();
   endfunction
 

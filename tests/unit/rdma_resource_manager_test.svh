@@ -111,6 +111,10 @@ class rdma_resource_manager_test extends uvm_test;
     rdma_resource_manager identity_rm;
     rdma_resource_manager all_kind_rm;
     rdma_resource_manager generation_rm;
+    rdma_resource_manager snapshot_rm;
+    rdma_resource_manager rollback_rm;
+    rdma_resource_manager function_cycle_rm;
+    rdma_resource_manager function_wrap_rm;
     rdma_resource_manager_probe exhaustion_rm;
     rdma_hmc_allocator hmc;
     rdma_hmc_allocator hmc_exhaustion;
@@ -119,6 +123,10 @@ class rdma_resource_manager_test extends uvm_test;
     rdma_function_binding binding_a;
     rdma_function_binding binding_b;
     rdma_function_binding exhaustion_binding;
+    rdma_function_binding snapshot_binding;
+    rdma_function_binding rollback_binding;
+    rdma_function_binding function_cycle_binding;
+    rdma_function_binding function_wrap_binding;
     rdma_function_handle owner_h;
     rdma_function_handle owner_b_h;
     rdma_pd pd;
@@ -133,6 +141,8 @@ class rdma_resource_manager_test extends uvm_test;
     rdma_pd generation_pd;
     rdma_pd rejected_generation_pd;
     rdma_pd next_generation_pd;
+    rdma_pd snapshot_pd;
+    rdma_pd rollback_pd;
     rdma_mr all_kind_mr;
     rdma_cq all_kind_cq;
     rdma_qp all_kind_qp;
@@ -140,6 +150,13 @@ class rdma_resource_manager_test extends uvm_test;
     rdma_cmq all_kind_cmq;
     rdma_ceq all_kind_ceq;
     rdma_aeq all_kind_aeq;
+    rdma_function snapshot_function;
+    rdma_function snapshot_function_lookup;
+    rdma_function function_a;
+    rdma_function function_b;
+    rdma_function rejected_function;
+    rdma_function function_max;
+    rdma_function function_wrapped;
     rdma_mr dep_mr;
     rdma_mr teardown_mr;
     rdma_cq cq_pool;
@@ -147,6 +164,8 @@ class rdma_resource_manager_test extends uvm_test;
     rdma_cq teardown_cq;
     rdma_qp dep_qp;
     rdma_qp teardown_qp;
+    rdma_qp snapshot_qp;
+    rdma_qp snapshot_qp_lookup;
     rdma_srq dep_srq;
     rdma_ceq dep_ceq;
     rdma_ceq teardown_ceq;
@@ -156,6 +175,9 @@ class rdma_resource_manager_test extends uvm_test;
     rdma_handle frozen_qp_h;
     rdma_handle forged_h;
     rdma_handle generation_old_h;
+    rdma_handle snapshot_pd_h;
+    rdma_handle snapshot_qp_h;
+    rdma_handle rollback_h;
     rdma_resource resource;
     rdma_resource second_resource;
     rdma_status s;
@@ -169,6 +191,7 @@ class rdma_resource_manager_test extends uvm_test;
     longint unsigned lease_size;
     string hmc_type_name;
     string iova_type_name;
+    rdma_bdf_t snapshot_bdf;
 
     phase.raise_objection(this);
 
@@ -246,11 +269,124 @@ class rdma_resource_manager_test extends uvm_test;
     forged_h.generation++;
     expect_status("FORGED_GENERATION_LOOKUP", rm.lookup(forged_h, resource),
                   RDMA_SC_STALE_GENERATION);
+    forged_h = clone_handle("FORGED_OBJECT_ID", pd_reused.handle);
+    forged_h.object_id++;
+    expect_status("FORGED_OBJECT_ID_LOOKUP", rm.lookup(forged_h, resource),
+                  RDMA_SC_INVALID_ARGUMENT);
     expect_status("ID_RELEASE_CQ", rm.\release (cq_pool.handle), RDMA_SC_OK);
     expect_status("ID_RELEASE_PD_REUSED", rm.\release (pd_reused.handle),
                   RDMA_SC_OK);
     expect_status("ID_REPEAT_RELEASE", rm.\release (pd_reused.handle),
                   RDMA_SC_INVALID_STATE);
+
+    // Caller-owned bindings and published resources are never authoritative.
+    // Only monotonic generation changes from the original binding reference
+    // may affect lifecycle checks; identity and configuration are snapshots.
+    snapshot_rm = rdma_resource_manager::type_id::create("snapshot_rm");
+    snapshot_binding = make_active_binding(
+      "snapshot_binding", 64'h5a5a_0000_0000_0001,
+      32'h5a5a_0101, 32'd11
+    );
+    snapshot_bdf = snapshot_binding.pcie.bdf;
+    expect_status("SNAPSHOT_CREATE_FUNCTION",
+                  snapshot_rm.create_function(snapshot_binding,
+                                              snapshot_function),
+                  RDMA_SC_OK);
+    owner_h = clone_function_handle("SNAPSHOT_OWNER",
+                                    snapshot_function.owner);
+    expect_status("SNAPSHOT_CREATE_PD",
+                  snapshot_rm.create_pd(snapshot_binding, snapshot_pd),
+                  RDMA_SC_OK);
+    snapshot_pd_h = clone_handle("SNAPSHOT_PD_H", snapshot_pd.handle);
+    expect_status("SNAPSHOT_CREATE_CQ",
+                  snapshot_rm.create_cq(snapshot_binding, null, cq_pool),
+                  RDMA_SC_OK);
+    expect_status("SNAPSHOT_CREATE_QP",
+                  snapshot_rm.create_qp(snapshot_binding,
+                                        snapshot_pd.handle,
+                                        cq_pool.handle, cq_pool.handle,
+                                        null, snapshot_qp),
+                  RDMA_SC_OK);
+    snapshot_qp_h = clone_handle("SNAPSHOT_QP_H", snapshot_qp.handle);
+
+    snapshot_function.handle.object_id++;
+    snapshot_function.owner.object_id++;
+    snapshot_function.binding.global_function_id++;
+    snapshot_function.binding.pcie.bdf.bus++;
+    snapshot_qp.handle.object_id++;
+    snapshot_qp.owner.object_id++;
+    snapshot_qp.pd_h.object_id++;
+    snapshot_qp.dependencies[0].object_id++;
+    snapshot_pd.handle.object_id++;
+    snapshot_binding.function_uid ^= 64'hffff;
+    snapshot_binding.global_function_id++;
+    snapshot_binding.host_id = 32'hffff_0001;
+    snapshot_binding.pcie.bdf.bus++;
+
+    expect_status("SNAPSHOT_FUNCTION_LOOKUP",
+                  snapshot_rm.lookup(owner_h, resource), RDMA_SC_OK);
+    if (resource == null || !$cast(snapshot_function_lookup, resource)) begin
+      `uvm_error("SNAPSHOT_FUNCTION_LOOKUP",
+                 "Function lookup returned the wrong resource type")
+    end
+    else if (snapshot_function_lookup.binding == null ||
+             snapshot_function_lookup.binding.function_uid !=
+               64'h5a5a_0000_0000_0001 ||
+             snapshot_function_lookup.binding.global_function_id !=
+               32'h5a5a_0101 ||
+             snapshot_function_lookup.binding.host_id != 0 ||
+             snapshot_function_lookup.binding.pcie == null ||
+             snapshot_function_lookup.binding.pcie.bdf != snapshot_bdf) begin
+      `uvm_error("SNAPSHOT_FUNCTION_VALUE",
+                 "caller mutation changed authoritative Function binding")
+    end
+    expect_status("SNAPSHOT_QP_LOOKUP",
+                  snapshot_rm.lookup(snapshot_qp_h, resource), RDMA_SC_OK);
+    if (resource == null || !$cast(snapshot_qp_lookup, resource)) begin
+      `uvm_error("SNAPSHOT_QP_LOOKUP",
+                 "QP lookup returned the wrong resource type")
+    end
+    else if (snapshot_qp_lookup.owner == null ||
+             !snapshot_qp_lookup.owner.same_instance(owner_h) ||
+             snapshot_qp_lookup.pd_h == null ||
+             !snapshot_qp_lookup.pd_h.same_instance(snapshot_pd_h) ||
+             snapshot_qp_lookup.dependencies.size() == 0 ||
+             !snapshot_qp_lookup.dependencies[0].same_instance(snapshot_pd_h))
+      `uvm_error("SNAPSHOT_QP_VALUE",
+                 "caller mutation changed authoritative QP ownership")
+    expect_status("SNAPSHOT_TEARDOWN",
+                  snapshot_rm.release_function(owner_h), RDMA_SC_OK);
+    expect_status("SNAPSHOT_RETIRED_LOOKUP",
+                  snapshot_rm.lookup(snapshot_qp_h, resource),
+                  RDMA_SC_STALE_GENERATION);
+
+    // Generation observation is monotonic.  Seeing B makes A stale forever,
+    // even if the caller later writes A back into the source binding.
+    rollback_rm = rdma_resource_manager::type_id::create("rollback_rm");
+    rollback_binding = make_active_binding(
+      "rollback_binding", 64'hb011_bacc_0000_0001,
+      32'hb011_0101, 32'd41
+    );
+    owner_h = rollback_binding.make_handle();
+    expect_status("ROLLBACK_CREATE_A",
+                  rollback_rm.create_pd(rollback_binding, rollback_pd),
+                  RDMA_SC_OK);
+    rollback_h = clone_handle("ROLLBACK_H", rollback_pd.handle);
+    rollback_binding.generation = 32'd42;
+    rollback_binding.owner_h = rollback_binding.make_handle();
+    expect_status("ROLLBACK_A_STALE_AT_B",
+                  rollback_rm.lookup(rollback_h, resource),
+                  RDMA_SC_STALE_GENERATION);
+    rollback_binding.generation = 32'd41;
+    rollback_binding.owner_h = rollback_binding.make_handle();
+    expect_status("ROLLBACK_A_STAYS_STALE",
+                  rollback_rm.lookup(rollback_h, resource),
+                  RDMA_SC_STALE_GENERATION);
+    expect_status("ROLLBACK_PRIVILEGED_TEARDOWN",
+                  rollback_rm.release_function(owner_h), RDMA_SC_OK);
+    expect_status("ROLLBACK_REPEATED_TEARDOWN",
+                  rollback_rm.release_function(owner_h),
+                  RDMA_SC_STALE_GENERATION);
 
     // A new Function generation cannot be admitted while an older generation
     // still owns live resources.  Once the old generation is drained, the
@@ -274,17 +410,27 @@ class rdma_resource_manager_test extends uvm_test;
     if (rejected_generation_pd != null)
       `uvm_error("GENERATION_REJECT_OVERLAP",
                  "overlapping Function generation returned a resource")
-    binding_a.generation--;
-    binding_a.owner_h = binding_a.make_handle();
     expect_status("GENERATION_RELEASE_OLD",
                   generation_rm.release_function(owner_h), RDMA_SC_OK);
-    binding_a.generation++;
-    binding_a.owner_h = binding_a.make_handle();
+    expect_status("GENERATION_OLD_LOOKUP_RETIRED",
+                  generation_rm.lookup(generation_old_h, resource),
+                  RDMA_SC_STALE_GENERATION);
+    expect_status("GENERATION_OLD_RELEASE_RETIRED",
+                  generation_rm.\release (generation_old_h),
+                  RDMA_SC_STALE_GENERATION);
+    expect_status("GENERATION_OLD_TEARDOWN_RETIRED",
+                  generation_rm.release_function(owner_h),
+                  RDMA_SC_STALE_GENERATION);
     expect_status("GENERATION_CREATE_NEXT",
                   generation_rm.create_pd(binding_a, next_generation_pd),
                   RDMA_SC_OK);
-    if (next_generation_pd.local_pd_id != generation_pd.local_pd_id ||
-        next_generation_pd.handle.object_id == generation_old_h.object_id)
+    if (next_generation_pd == null) begin
+      `uvm_error("GENERATION_REUSE",
+                 "next Function generation returned no resource")
+    end
+    else if (next_generation_pd.local_pd_id != generation_pd.local_pd_id ||
+             next_generation_pd.handle.object_id ==
+               generation_old_h.object_id)
       `uvm_error("GENERATION_REUSE",
                  "generation transition violated ID/incarnation rules")
     expect_status("GENERATION_OLD_STAYS_STALE",
@@ -293,6 +439,10 @@ class rdma_resource_manager_test extends uvm_test;
     expect_status("GENERATION_RELEASE_NEXT",
                   generation_rm.release_function(binding_a.make_handle()),
                   RDMA_SC_OK);
+    if (next_generation_pd != null)
+      expect_status("GENERATION_NEXT_RETIRED",
+                    generation_rm.lookup(next_generation_pd.handle, resource),
+                    RDMA_SC_STALE_GENERATION);
 
     // A display-key collision on uid/generation must not alias distinct
     // complete Function instances.
@@ -307,21 +457,22 @@ class rdma_resource_manager_test extends uvm_test;
                   identity_rm.create_pd(binding_a, pd), RDMA_SC_OK);
     expect_status("IDENTITY_CREATE_B",
                   identity_rm.create_pd(binding_b, pd_b), RDMA_SC_OK);
+    owner_b_h = clone_function_handle("IDENTITY_OWNER_B", pd_b.owner);
     binding_b.generation++;
     expect_status("IDENTITY_A_REMAINS_LIVE",
                   identity_rm.lookup(pd.handle, resource), RDMA_SC_OK);
     expect_status("IDENTITY_B_IS_STALE",
                   identity_rm.lookup(pd_b.handle, resource),
                   RDMA_SC_STALE_GENERATION);
-    binding_b.generation--;
     expect_status("IDENTITY_RELEASE_A",
                   identity_rm.release_function(binding_a.make_handle()),
                   RDMA_SC_OK);
-    expect_status("IDENTITY_B_REMAINS_LIVE",
-                  identity_rm.lookup(pd_b.handle, resource), RDMA_SC_OK);
     expect_status("IDENTITY_RELEASE_B",
-                  identity_rm.release_function(binding_b.make_handle()),
+                  identity_rm.release_function(owner_b_h),
                   RDMA_SC_OK);
+    expect_status("IDENTITY_B_RETIRED",
+                  identity_rm.lookup(pd_b.handle, resource),
+                  RDMA_SC_STALE_GENERATION);
 
     // Dependency checks reject unsafe release; explicit leaf-first release is
     // accepted once all dependents are gone.
@@ -417,14 +568,85 @@ class rdma_resource_manager_test extends uvm_test;
                   teardown_rm.release_function(owner_h), RDMA_SC_OK);
     expect_status("TEARDOWN_USE_AFTER_FREE",
                   teardown_rm.lookup(frozen_qp_h, resource),
-                  RDMA_SC_INVALID_STATE);
+                  RDMA_SC_STALE_GENERATION);
+    expect_status("TEARDOWN_RELEASE_AFTER_FREE",
+                  teardown_rm.\release (frozen_qp_h),
+                  RDMA_SC_STALE_GENERATION);
     expect_status("TEARDOWN_NO_LEAKS",
                   teardown_rm.check_leaks(leak_count, owner_h), RDMA_SC_OK);
     if (leak_count != 0)
       `uvm_error("TEARDOWN_NO_LEAKS", "release_function leaked resources")
-    binding_a.generation++;
-    expect_status("TEARDOWN_STALE_FUNCTION",
+    expect_status("TEARDOWN_REPEATED_FUNCTION",
                   teardown_rm.release_function(owner_h),
+                  RDMA_SC_STALE_GENERATION);
+
+    // Function generations are exact non-reusable incarnations.  A -> B -> A
+    // rollback is rejected, and max -> zero is exhaustion rather than wrap.
+    function_cycle_rm = rdma_resource_manager::type_id::create(
+      "function_cycle_rm"
+    );
+    function_cycle_binding = make_active_binding(
+      "function_cycle_binding", 64'hf00c_0000_0000_0001,
+      32'hf00c_0101, 32'd5
+    );
+    expect_status("FUNCTION_CYCLE_CREATE_A",
+                  function_cycle_rm.create_function(function_cycle_binding,
+                                                    function_a),
+                  RDMA_SC_OK);
+    owner_h = clone_function_handle("FUNCTION_CYCLE_OWNER_A",
+                                    function_a.owner);
+    expect_status("FUNCTION_CYCLE_RELEASE_A",
+                  function_cycle_rm.release_function(owner_h), RDMA_SC_OK);
+    function_cycle_binding.generation = 32'd6;
+    function_cycle_binding.owner_h = function_cycle_binding.make_handle();
+    expect_status("FUNCTION_CYCLE_CREATE_B",
+                  function_cycle_rm.create_function(function_cycle_binding,
+                                                    function_b),
+                  RDMA_SC_OK);
+    if (function_b.local_function_id != function_a.local_function_id ||
+        function_b.handle.same_instance(function_a.handle))
+      `uvm_error("FUNCTION_CYCLE_B",
+                 "Function local ID/incarnation transition is invalid")
+    owner_b_h = clone_function_handle("FUNCTION_CYCLE_OWNER_B",
+                                      function_b.owner);
+    expect_status("FUNCTION_CYCLE_RELEASE_B",
+                  function_cycle_rm.release_function(owner_b_h), RDMA_SC_OK);
+    function_cycle_binding.generation = 32'd5;
+    function_cycle_binding.owner_h = function_cycle_binding.make_handle();
+    expect_status("FUNCTION_CYCLE_REJECT_A",
+                  function_cycle_rm.create_function(function_cycle_binding,
+                                                    rejected_function),
+                  RDMA_SC_STALE_GENERATION);
+    if (rejected_function != null)
+      `uvm_error("FUNCTION_CYCLE_REJECT_A",
+                 "retired Function generation was recreated")
+
+    function_wrap_rm = rdma_resource_manager::type_id::create(
+      "function_wrap_rm"
+    );
+    function_wrap_binding = make_active_binding(
+      "function_wrap_binding", 64'hf00c_0000_0000_0002,
+      32'hf00c_0202, 32'hffff_ffff
+    );
+    expect_status("FUNCTION_WRAP_CREATE_MAX",
+                  function_wrap_rm.create_function(function_wrap_binding,
+                                                   function_max),
+                  RDMA_SC_OK);
+    owner_h = clone_function_handle("FUNCTION_WRAP_OWNER_MAX",
+                                    function_max.owner);
+    expect_status("FUNCTION_WRAP_RELEASE_MAX",
+                  function_wrap_rm.release_function(owner_h), RDMA_SC_OK);
+    function_wrap_binding.generation = 32'd0;
+    function_wrap_binding.owner_h = function_wrap_binding.make_handle();
+    expect_status("FUNCTION_WRAP_REJECT_ZERO",
+                  function_wrap_rm.create_function(function_wrap_binding,
+                                                   function_wrapped),
+                  RDMA_SC_RESOURCE_EXHAUSTED);
+    if (function_wrapped != null)
+      `uvm_error("FUNCTION_WRAP_REJECT_ZERO",
+                 "wrapped Function generation returned a resource")
+    expect_status("FUNCTION_WRAP_OLD_STALE",
+                  function_wrap_rm.lookup(owner_h, resource),
                   RDMA_SC_STALE_GENERATION);
 
     // Incarnation exhaustion is a clean failure; it never wraps to revive an
@@ -532,14 +754,32 @@ class rdma_resource_manager_test extends uvm_test;
 
     owner_b_h = clone_function_handle("HMC_OTHER_OWNER", owner_h);
     owner_b_h.object_id++;
+    expect_status("HMC_RELEASE_WRONG_OWNER",
+                  hmc.\release (owner_b_h, RDMA_RESOURCE_QP, hmc_addr),
+                  RDMA_SC_INVALID_ARGUMENT);
+    expect_status("HMC_ACTIVE_AFTER_WRONG_OWNER",
+                  hmc.lookup(owner_h, RDMA_RESOURCE_QP, hmc_addr,
+                             lease_size), RDMA_SC_OK);
     expect_status("HMC_WRONG_OWNER",
                   hmc.lookup(owner_b_h, RDMA_RESOURCE_QP, hmc_addr,
                              lease_size), RDMA_SC_INVALID_ARGUMENT);
     owner_b_h = clone_function_handle("HMC_STALE_OWNER", owner_h);
     owner_b_h.generation++;
+    expect_status("HMC_RELEASE_STALE_OWNER",
+                  hmc.\release (owner_b_h, RDMA_RESOURCE_QP, hmc_addr),
+                  RDMA_SC_STALE_GENERATION);
+    expect_status("HMC_ACTIVE_AFTER_STALE_OWNER",
+                  hmc.lookup(owner_h, RDMA_RESOURCE_QP, hmc_addr,
+                             lease_size), RDMA_SC_OK);
     expect_status("HMC_STALE_OWNER",
                   hmc.lookup(owner_b_h, RDMA_RESOURCE_QP, hmc_addr,
                              lease_size), RDMA_SC_STALE_GENERATION);
+    expect_status("HMC_RELEASE_WRONG_KIND",
+                  hmc.\release (owner_h, RDMA_RESOURCE_CQ, hmc_addr),
+                  RDMA_SC_INVALID_ARGUMENT);
+    expect_status("HMC_ACTIVE_AFTER_WRONG_KIND",
+                  hmc.lookup(owner_h, RDMA_RESOURCE_QP, hmc_addr,
+                             lease_size), RDMA_SC_OK);
     expect_status("HMC_WRONG_KIND",
                   hmc.lookup(owner_h, RDMA_RESOURCE_CQ, hmc_addr,
                              lease_size), RDMA_SC_INVALID_ARGUMENT);
