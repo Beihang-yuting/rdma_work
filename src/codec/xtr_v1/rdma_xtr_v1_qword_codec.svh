@@ -1,6 +1,8 @@
 class rdma_xtr_v1_qword_builder extends uvm_object;
   `uvm_object_utils(rdma_xtr_v1_qword_builder)
 
+  localparam int unsigned MAX_IMAGE_BYTES = XTR_V1_QPC_BYTES;
+
   protected bit [63:0] words[];
   protected bit [63:0] occupancy[];
   protected int unsigned byte_count;
@@ -12,6 +14,18 @@ class rdma_xtr_v1_qword_builder extends uvm_object;
     occupancy = new[0];
     byte_count = 0;
     initialized = 1'b0;
+  endfunction
+
+  virtual function void do_copy(uvm_object rhs);
+    rdma_xtr_v1_qword_builder rhs_builder;
+
+    super.do_copy(rhs);
+    if (!$cast(rhs_builder, rhs))
+      `uvm_fatal("RDMA_COPY_TYPE", "qword builder copy type mismatch")
+    words = rhs_builder.words;
+    occupancy = rhs_builder.occupancy;
+    byte_count = rhs_builder.byte_count;
+    initialized = rhs_builder.initialized;
   endfunction
 
   protected function rdma_status invalid_state_status();
@@ -54,6 +68,9 @@ class rdma_xtr_v1_qword_builder extends uvm_object;
 
     if (byte_count == 0)
       return codec_error("qword image length must be nonzero");
+    if (byte_count > MAX_IMAGE_BYTES)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "qword image exceeds xtr_v1 maximum length");
     if ((byte_count & 7) != 0)
       return codec_error("qword image length must be divisible by eight");
 
@@ -95,7 +112,8 @@ class rdma_xtr_v1_qword_builder extends uvm_object;
     if ((occupancy[qword_index] & field_mask) != 0)
       return codec_error("field overlaps an earlier qword write");
 
-    words[qword_index] |= value << lsb;
+    words[qword_index] = (words[qword_index] & ~field_mask) |
+                         ((value << lsb) & field_mask);
     occupancy[qword_index] |= field_mask;
     return rdma_status::success();
   endfunction
@@ -161,7 +179,8 @@ class rdma_xtr_v1_qword_builder extends uvm_object;
       shift = 56 - (byte_in_qword << 3);
       byte_mask = 64'hff << shift;
       byte_value = value[i];
-      words[qword_index] |= byte_value << shift;
+      words[qword_index] = (words[qword_index] & ~byte_mask) |
+                           ((byte_value << shift) & byte_mask);
       occupancy[qword_index] |= byte_mask;
     end
     return rdma_status::success();
@@ -191,6 +210,10 @@ class rdma_xtr_v1_qword_builder extends uvm_object;
 
     if (value.size() == 0)
       return codec_error("serialized qword image must be nonempty");
+    if (value.size() > MAX_IMAGE_BYTES)
+      return rdma_status::make(
+          RDMA_SC_INVALID_ARGUMENT,
+          "serialized qword image exceeds xtr_v1 maximum length");
     if ((value.size() & 7) != 0)
       return codec_error(
           "serialized qword image length must be divisible by eight");

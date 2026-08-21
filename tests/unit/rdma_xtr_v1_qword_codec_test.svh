@@ -138,6 +138,14 @@ class rdma_xtr_v1_qword_codec_test extends uvm_test;
     rdma_xtr_v1_qword_builder builder;
     rdma_xtr_v1_qword_builder decoded;
     rdma_xtr_v1_qword_builder empty_builder;
+    rdma_xtr_v1_qword_builder overwrite_builder;
+    rdma_xtr_v1_qword_builder crossing_builder;
+    rdma_xtr_v1_qword_builder late_overlap_builder;
+    rdma_xtr_v1_qword_builder zero_field_builder;
+    rdma_xtr_v1_qword_builder size_builder;
+    rdma_xtr_v1_qword_builder clone_source;
+    rdma_xtr_v1_qword_builder clone_copy;
+    uvm_object cloned_object;
     rdma_status status;
     byte unsigned memcpy_bytes[];
     byte unsigned zero_byte[];
@@ -146,6 +154,16 @@ class rdma_xtr_v1_qword_codec_test extends uvm_test;
     byte unsigned expected_bytes[];
     byte unsigned byte_snapshot[];
     byte unsigned invalid_bytes[];
+    byte unsigned all_ff_bytes[];
+    byte unsigned overwritten_bytes[];
+    byte unsigned crossing_bytes[];
+    byte unsigned crossing_serialized[];
+    byte unsigned crossing_expected[];
+    byte unsigned late_overlap_bytes[];
+    byte unsigned late_serialized_before[];
+    byte unsigned late_serialized_after[];
+    byte unsigned oversized_bytes[];
+    byte unsigned oversized_snapshot[];
     bit [63:0] words[];
     bit [63:0] occupancy[];
     bit [63:0] words_before[];
@@ -289,6 +307,18 @@ class rdma_xtr_v1_qword_codec_test extends uvm_test;
     if (words.size() != 1 || words[0] != 64'hfedc_ba98_7654_3210)
       `uvm_error("FIELD_WIDTH_64", "full-width value was not retained")
 
+    // A zero-valued field still owns its complete mask and blocks a later
+    // author from overlapping it.
+    zero_field_builder = new("zero_field_builder");
+    expect_ok("ZERO_FIELD_RESET", zero_field_builder.reset(8));
+    expect_ok("ZERO_FIELD_AUTHOR",
+              zero_field_builder.put_field(0, 8, 8, 0));
+    snapshot_builder(zero_field_builder, words_before, occupancy_before);
+    status = zero_field_builder.put_field(0, 8, 8, 8'hff);
+    expect_status("ZERO_FIELD_OVERLAP", status, RDMA_SC_CODEC_ERROR);
+    expect_builder_unchanged("ZERO_FIELD_OVERLAP", zero_field_builder,
+                             words_before, occupancy_before);
+
     // A zero memcpy byte reserves all eight target bits.  The overlapping
     // failure cannot reserve any additional bits or change prior words.
     expect_ok("MEMCPY_RESET", builder.reset(16));
@@ -316,6 +346,131 @@ class rdma_xtr_v1_qword_codec_test extends uvm_test;
     expect_status("MEMCPY_EMPTY", status, RDMA_SC_CODEC_ERROR);
     expect_builder_unchanged("MEMCPY_EMPTY", builder, words_before,
                              occupancy_before);
+
+    // A successful memcpy can cross the qword 7/8 byte boundary.  Exact
+    // logical words, occupancy, and final byte order are all observable.
+    crossing_builder = new("crossing_builder");
+    expect_ok("MEMCPY_CROSS_RESET", crossing_builder.reset(16));
+    crossing_bytes = '{8'ha1, 8'hb2, 8'hc3};
+    expect_ok("MEMCPY_CROSS",
+              crossing_builder.put_memcpy(7, crossing_bytes));
+    snapshot_builder(crossing_builder, words, occupancy);
+    if (words.size() != 2 || words[0] != 64'h0000_0000_0000_00a1 ||
+        words[1] != 64'hb2c3_0000_0000_0000)
+      `uvm_error("MEMCPY_CROSS_WORDS", "cross-qword logical words mismatch")
+    if (occupancy.size() != 2 ||
+        occupancy[0] != 64'h0000_0000_0000_00ff ||
+        occupancy[1] != 64'hffff_0000_0000_0000)
+      `uvm_error("MEMCPY_CROSS_OCCUPANCY",
+                 "cross-qword occupancy mismatch")
+    expect_ok("MEMCPY_CROSS_SERIALIZE",
+              crossing_builder.serialize(crossing_serialized));
+    crossing_expected = '{
+      8'h00,8'h00,8'h00,8'h00,8'h00,8'h00,8'h00,8'ha1,
+      8'hb2,8'hc3,8'h00,8'h00,8'h00,8'h00,8'h00,8'h00
+    };
+    if (!bytes_equal(crossing_serialized, crossing_expected))
+      `uvm_error("MEMCPY_CROSS_SERIALIZE", "cross-qword bytes mismatch")
+
+    // The occupied target appears only after two free bytes.  Complete
+    // preflight must reject without changing either qword, occupancy, or the
+    // serialized before-image.
+    late_overlap_builder = new("late_overlap_builder");
+    expect_ok("MEMCPY_LATE_RESET", late_overlap_builder.reset(16));
+    zero_byte = '{8'h00};
+    expect_ok("MEMCPY_LATE_RESERVE",
+              late_overlap_builder.put_memcpy(9, zero_byte));
+    expect_ok("MEMCPY_LATE_BEFORE",
+              late_overlap_builder.serialize(late_serialized_before));
+    snapshot_builder(late_overlap_builder, words_before, occupancy_before);
+    late_overlap_bytes = '{8'h11, 8'h22, 8'h33, 8'h44};
+    status = late_overlap_builder.put_memcpy(7, late_overlap_bytes);
+    expect_status("MEMCPY_LATE_OVERLAP", status, RDMA_SC_CODEC_ERROR);
+    expect_builder_unchanged("MEMCPY_LATE_OVERLAP", late_overlap_builder,
+                             words_before, occupancy_before);
+    late_serialized_after = '{8'ha5};
+    expect_ok("MEMCPY_LATE_AFTER",
+              late_overlap_builder.serialize(late_serialized_after));
+    if (!bytes_equal(late_serialized_after, late_serialized_before))
+      `uvm_error("MEMCPY_LATE_SERIALIZE",
+                 "late overlap changed serialized before-image")
+
+    // Deserialization deliberately leaves occupancy clear, so a subsequent
+    // author must replace decoded bits rather than OR into them.
+    overwrite_builder = new("overwrite_builder");
+    all_ff_bytes = new[16];
+    foreach (all_ff_bytes[i])
+      all_ff_bytes[i] = 8'hff;
+    expect_ok("OVERWRITE_DESERIALIZE",
+              overwrite_builder.deserialize(all_ff_bytes));
+    expect_ok("OVERWRITE_ZERO_FIELD",
+              overwrite_builder.put_field(0, 0, 8, 0));
+    zero_byte = '{8'h00};
+    expect_ok("OVERWRITE_ZERO_MEMCPY",
+              overwrite_builder.put_memcpy(8, zero_byte));
+    field_value = '1;
+    expect_ok("OVERWRITE_GET_FIELD",
+              overwrite_builder.get_field(0, 0, 8, field_value));
+    if (field_value != 0)
+      `uvm_error("OVERWRITE_GET_FIELD", "zero field did not clear decoded bits")
+    field_value = '1;
+    expect_ok("OVERWRITE_GET_MEMCPY",
+              overwrite_builder.get_field(8, 56, 8, field_value));
+    if (field_value != 0)
+      `uvm_error("OVERWRITE_GET_MEMCPY", "zero memcpy did not clear decoded bits")
+    snapshot_builder(overwrite_builder, words, occupancy);
+    if (words.size() != 2 || words[0] != 64'hffff_ffff_ffff_ff00 ||
+        words[1] != 64'h00ff_ffff_ffff_ffff)
+      `uvm_error("OVERWRITE_WORDS", "decoded replacement words mismatch")
+    if (occupancy.size() != 2 ||
+        occupancy[0] != 64'h0000_0000_0000_00ff ||
+        occupancy[1] != 64'hff00_0000_0000_0000)
+      `uvm_error("OVERWRITE_OCCUPANCY",
+                 "decoded replacement occupancy mismatch")
+    expect_ok("OVERWRITE_SERIALIZE",
+              overwrite_builder.serialize(overwritten_bytes));
+    if (overwritten_bytes.size() != 16 || overwritten_bytes[7] != 0 ||
+        overwritten_bytes[8] != 0)
+      `uvm_error("OVERWRITE_SERIALIZE",
+                 "decoded zero replacement did not reach serialized bytes")
+
+    // Reject oversized xtr_v1 images before allocation.  The huge call is
+    // deliberately gated on the small over-limit rejection so the RED build
+    // can never attempt a multi-gigabyte allocation.
+    size_builder = new("size_builder");
+    expect_ok("SIZE_BASE_RESET", size_builder.reset(16));
+    expect_ok("SIZE_BASE_FIELD", size_builder.put_field(0, 0, 8, 8'h5a));
+    snapshot_builder(size_builder, words_before, occupancy_before);
+    status = size_builder.reset(520);
+    expect_status("RESET_OVER_MAX", status, RDMA_SC_INVALID_ARGUMENT);
+    expect_builder_unchanged("RESET_OVER_MAX", size_builder, words_before,
+                             occupancy_before);
+    if (status != null && status.code == RDMA_SC_INVALID_ARGUMENT) begin
+      snapshot_builder(size_builder, words_before, occupancy_before);
+      status = size_builder.reset(32'hffff_fff8);
+      expect_status("RESET_HUGE", status, RDMA_SC_INVALID_ARGUMENT);
+      expect_builder_unchanged("RESET_HUGE", size_builder, words_before,
+                               occupancy_before);
+    end else begin
+      `uvm_error("RESET_HUGE_GUARD",
+                 "unsafe huge reset skipped because 520-byte bound failed")
+    end
+
+    expect_ok("SIZE_DESERIALIZE_BASE_RESET", size_builder.reset(16));
+    expect_ok("SIZE_DESERIALIZE_BASE_FIELD",
+              size_builder.put_field(0, 0, 8, 8'ha5));
+    oversized_bytes = new[520];
+    foreach (oversized_bytes[i])
+      oversized_bytes[i] = byte'(i);
+    oversized_snapshot = oversized_bytes;
+    snapshot_builder(size_builder, words_before, occupancy_before);
+    status = size_builder.deserialize(oversized_bytes);
+    expect_status("DESERIALIZE_OVER_MAX", status,
+                  RDMA_SC_INVALID_ARGUMENT);
+    if (!bytes_equal(oversized_bytes, oversized_snapshot))
+      `uvm_error("DESERIALIZE_OVER_MAX", "failure changed input bytes")
+    expect_builder_unchanged("DESERIALIZE_OVER_MAX", size_builder,
+                             words_before, occupancy_before);
 
     // Invalid deserialize calls preserve an already-populated builder.
     snapshot_builder(decoded, words_before, occupancy_before);
@@ -394,6 +549,28 @@ class rdma_xtr_v1_qword_codec_test extends uvm_test;
       `uvm_error("GET_INVALID_STATE", "failure changed output argument")
     expect_builder_unchanged("GET_INVALID_STATE", empty_builder,
                              words_before, occupancy_before);
+
+    // UVM clone retains complete populated state, and later mutation of the
+    // clone cannot reach the source's dynamic arrays or scalar metadata.
+    clone_source = new("clone_source");
+    expect_ok("CLONE_RESET", clone_source.reset(16));
+    expect_ok("CLONE_FIELD", clone_source.put_field(0, 0, 8, 8'haa));
+    zero_byte = '{8'h55};
+    expect_ok("CLONE_MEMCPY", clone_source.put_memcpy(8, zero_byte));
+    snapshot_builder(clone_source, words_before, occupancy_before);
+    cloned_object = clone_source.clone();
+    if (cloned_object == null || !$cast(clone_copy, cloned_object)) begin
+      `uvm_error("BUILDER_CLONE", "clone lost qword builder dynamic type")
+    end else begin
+      snapshot_builder(clone_copy, words, occupancy);
+      if (!qwords_equal(words, words_before) ||
+          !qwords_equal(occupancy, occupancy_before))
+        `uvm_error("BUILDER_CLONE", "clone did not retain populated state")
+      expect_ok("BUILDER_CLONE_MUTATE",
+                clone_copy.put_field(0, 8, 8, 8'hbb));
+      expect_builder_unchanged("BUILDER_CLONE_INDEPENDENT", clone_source,
+                               words_before, occupancy_before);
+    end
 
     check_supported_masks();
 
