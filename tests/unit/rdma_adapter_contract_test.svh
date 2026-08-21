@@ -10,24 +10,6 @@ class rdma_adapter_test_observer extends rdma_net_observer;
     last_packet = null;
   endfunction
 
-  virtual function void do_copy(uvm_object rhs);
-    rdma_adapter_test_observer rhs_observer;
-    uvm_object cloned_object;
-
-    super.do_copy(rhs);
-    if (!$cast(rhs_observer, rhs))
-      `uvm_fatal("OBSERVER_COPY", "observer copy type mismatch")
-    notification_count = rhs_observer.notification_count;
-    if (rhs_observer.last_packet == null) begin
-      last_packet = null;
-    end
-    else begin
-      cloned_object = rhs_observer.last_packet.clone();
-      if (cloned_object == null || !$cast(last_packet, cloned_object))
-        `uvm_fatal("OBSERVER_COPY", "observer packet clone type mismatch")
-    end
-  endfunction
-
   virtual function void write(rdma_packet packet);
     uvm_object cloned_object;
 
@@ -106,6 +88,10 @@ class rdma_adapter_contract_test extends uvm_test;
     rdma_host_mem_api mem_api;
     rdma_mock_host_mem authoritative_mem;
     rdma_host_mem_api authoritative_mem_api;
+    rdma_mock_host_mem overflow_mem;
+    rdma_host_mem_api overflow_mem_api;
+    rdma_mock_host_mem identity_mem;
+    rdma_host_mem_api identity_mem_api;
     rdma_mock_pcie pcie;
     rdma_pcie_api pcie_api;
     rdma_mock_function_table table;
@@ -113,13 +99,18 @@ class rdma_adapter_contract_test extends uvm_test;
     rdma_mock_net net;
     rdma_net_api net_api;
     rdma_adapter_test_observer observer;
-    rdma_adapter_test_observer observer_snapshot;
     rdma_function_handle function_h;
     rdma_dma_mapping mapping;
     rdma_dma_mapping failed_mapping;
     rdma_dma_mapping second_mapping;
     rdma_dma_mapping authoritative_mapping;
     rdma_dma_mapping stale_active_mapping;
+    rdma_dma_mapping overflow_mapping;
+    rdma_dma_mapping identity_mapping_a;
+    rdma_dma_mapping identity_mapping_a_snapshot;
+    rdma_dma_mapping identity_mapping_b;
+    rdma_dma_mapping forged_mapping;
+    rdma_mock_dma_mapping identity_mock_mapping;
     rdma_function_binding binding;
     rdma_packet tx_packet;
     rdma_packet observer_seed;
@@ -137,11 +128,16 @@ class rdma_adapter_contract_test extends uvm_test;
     rdma_bdf_t bdf;
     rdma_cfg_offset_t cfg_offset;
     rdma_bar_addr_t bar_address;
+    longint unsigned next_address_before;
+    int unsigned region_count_before;
     bit [31:0] cfg_data;
     byte write_data[] = '{8'h11, 8'h22, 8'h33, 8'h44};
     byte read_data[];
     byte overflow_data[] = '{8'haa, 8'hbb};
     byte crossing_data[] = '{8'hde, 8'had};
+    byte identity_a_data[] = '{8'ha1, 8'ha2};
+    byte identity_b_data[] = '{8'hb1, 8'hb2};
+    byte identity_read_data[];
 
     phase.raise_objection(this);
 
@@ -152,6 +148,15 @@ class rdma_adapter_contract_test extends uvm_test;
 
     mem = rdma_mock_host_mem::type_id::create("mem");
     mem_api = mem;
+    status = mem.fail_next(
+      "allocatte", rdma_status::make(RDMA_SC_TIMEOUT, "typo")
+    );
+    expect_status("HOST_FAIL_KEY", status, RDMA_SC_INVALID_ARGUMENT);
+    status = mem.fail_next("read", null);
+    expect_status("HOST_FAIL_NULL", status, RDMA_SC_INVALID_ARGUMENT);
+    if (mem.failures.exists("allocatte") || mem.failures.exists("read"))
+      `uvm_error("HOST_FAIL_CONFIG",
+                 "invalid host failure configuration was retained")
     status = mem_api.allocate(function_h, 4096, 4096,
                               RDMA_DMA_BIDIRECTIONAL, mapping);
     expect_status("HOST_ALLOCATE", status, RDMA_SC_OK);
@@ -190,7 +195,8 @@ class rdma_adapter_contract_test extends uvm_test;
     expect_status("HOST_RELEASED_READ", status, RDMA_SC_INVALID_STATE);
 
     injected = rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED, "one shot");
-    mem.fail_next("allocate", injected);
+    status = mem.fail_next("allocate", injected);
+    expect_status("HOST_FAIL_VALID", status, RDMA_SC_OK);
     injected.message = "caller mutation";
     status = mem_api.allocate(function_h, 64, 64, RDMA_DMA_DEVICE_READ,
                               failed_mapping);
@@ -247,8 +253,121 @@ class rdma_adapter_contract_test extends uvm_test;
                    "authoritative call sequence is not monotonic")
     end
 
+    overflow_mem = rdma_mock_host_mem::type_id::create("overflow_mem");
+    overflow_mem_api = overflow_mem;
+    overflow_mem.next_address = 64'hffff_ffff_ffff_fff8;
+    next_address_before = overflow_mem.next_address;
+    region_count_before = overflow_mem.regions.size();
+    status = overflow_mem_api.allocate(
+      function_h, 16, 16, RDMA_DMA_BIDIRECTIONAL, overflow_mapping
+    );
+    expect_status("HOST_ALIGN_OVERFLOW", status,
+                  RDMA_SC_RESOURCE_EXHAUSTED);
+    if (overflow_mapping != null ||
+        overflow_mem.regions.size() != region_count_before ||
+        overflow_mem.next_address != next_address_before)
+      `uvm_error("HOST_ALIGN_OVERFLOW",
+                 "alignment overflow mutated allocator state")
+
+    overflow_mem.next_address = 64'hffff_ffff_ffff_ffc0;
+    next_address_before = overflow_mem.next_address;
+    region_count_before = overflow_mem.regions.size();
+    status = overflow_mem_api.allocate(
+      function_h, 128, 64, RDMA_DMA_BIDIRECTIONAL, overflow_mapping
+    );
+    expect_status("HOST_END_OVERFLOW", status,
+                  RDMA_SC_RESOURCE_EXHAUSTED);
+    if (overflow_mapping != null ||
+        overflow_mem.regions.size() != region_count_before ||
+        overflow_mem.next_address != next_address_before)
+      `uvm_error("HOST_END_OVERFLOW",
+                 "allocation end overflow mutated allocator state")
+
+    identity_mem = rdma_mock_host_mem::type_id::create("identity_mem");
+    identity_mem_api = identity_mem;
+    status = identity_mem_api.allocate(
+      function_h, 64, 64, RDMA_DMA_BIDIRECTIONAL, identity_mapping_a
+    );
+    expect_status("HOST_IDENTITY_ALLOC_A", status, RDMA_SC_OK);
+    if (!$cast(identity_mock_mapping, identity_mapping_a))
+      `uvm_fatal("HOST_IDENTITY_TYPE",
+                 "allocated mapping does not carry mock identity")
+    status = identity_mock_mapping.initialize_allocation_token(64'hfeed);
+    expect_status("HOST_IDENTITY_REINITIALIZE", status,
+                  RDMA_SC_INVALID_STATE);
+    status = identity_mem_api.allocate(
+      function_h, 64, 64, RDMA_DMA_BIDIRECTIONAL, identity_mapping_b
+    );
+    expect_status("HOST_IDENTITY_ALLOC_B", status, RDMA_SC_OK);
+    cloned_object = identity_mapping_a.clone();
+    if (cloned_object == null ||
+        !$cast(identity_mapping_a_snapshot, cloned_object))
+      `uvm_fatal("HOST_IDENTITY_CLONE", "mapping clone type mismatch")
+    status = identity_mem_api.write(identity_mapping_b, 0, identity_b_data);
+    expect_status("HOST_IDENTITY_SEED_B", status, RDMA_SC_OK);
+
+    identity_mapping_a.backing_addr = identity_mapping_b.backing_addr;
+    identity_mapping_a.iova = identity_mapping_b.iova;
+    status = identity_mem_api.write(identity_mapping_a, 0, identity_a_data);
+    expect_status("HOST_IDENTITY_WRITE_A", status, RDMA_SC_OK);
+    status = identity_mem_api.read(identity_mapping_b, 0, 2,
+                                   identity_read_data);
+    expect_status("HOST_IDENTITY_READ_B", status, RDMA_SC_OK);
+    if (identity_read_data.size() != 2 ||
+        identity_read_data[0] != identity_b_data[0] ||
+        identity_read_data[1] != identity_b_data[1])
+      `uvm_error("HOST_IDENTITY_REDIRECT",
+                 "mutated mapping A redirected write into allocation B")
+    status = identity_mem_api.read(identity_mapping_a_snapshot, 0, 2,
+                                   identity_read_data);
+    expect_status("HOST_IDENTITY_READ_A", status, RDMA_SC_OK);
+    if (identity_read_data.size() != 2 ||
+        identity_read_data[0] != identity_a_data[0] ||
+        identity_read_data[1] != identity_a_data[1])
+      `uvm_error("HOST_IDENTITY_TARGET",
+                 "mutated mapping A did not retain allocation identity")
+
+    status = identity_mem_api.\release (identity_mapping_a);
+    expect_status("HOST_IDENTITY_RELEASE_A", status, RDMA_SC_OK);
+    status = identity_mem_api.read(identity_mapping_b, 0, 2,
+                                   identity_read_data);
+    expect_status("HOST_IDENTITY_B_ACTIVE", status, RDMA_SC_OK);
+    if (identity_read_data.size() != 2 ||
+        identity_read_data[0] != identity_b_data[0] ||
+        identity_read_data[1] != identity_b_data[1])
+      `uvm_error("HOST_IDENTITY_RELEASE_REDIRECT",
+                 "releasing mapping A changed allocation B")
+    status = identity_mem_api.read(identity_mapping_a_snapshot, 0, 1,
+                                   identity_read_data);
+    expect_status("HOST_IDENTITY_A_RELEASED", status,
+                  RDMA_SC_INVALID_STATE);
+
+    forged_mapping = rdma_dma_mapping::type_id::create("forged_mapping");
+    forged_mapping.function_h = rdma_mock_clone_function_handle(function_h);
+    forged_mapping.backing_addr = identity_mapping_b.backing_addr;
+    forged_mapping.iova = identity_mapping_b.iova;
+    forged_mapping.size = identity_mapping_b.size;
+    forged_mapping.state = RDMA_MAPPING_ACTIVE;
+    status = identity_mem_api.read(forged_mapping, 0, 1,
+                                   identity_read_data);
+    expect_status("HOST_FORGED_READ", status, RDMA_SC_DMA_TRANSLATION);
+    status = identity_mem_api.write(forged_mapping, 0, identity_a_data);
+    expect_status("HOST_FORGED_WRITE", status, RDMA_SC_DMA_TRANSLATION);
+    status = identity_mem_api.\release (forged_mapping);
+    expect_status("HOST_FORGED_RELEASE", status, RDMA_SC_DMA_TRANSLATION);
+
     pcie = rdma_mock_pcie::type_id::create("pcie");
     pcie_api = pcie;
+    status = pcie.fail_next(
+      "cfg_read", rdma_status::make(RDMA_SC_TIMEOUT, "typo")
+    );
+    expect_status("PCIE_FAIL_KEY", status, RDMA_SC_INVALID_ARGUMENT);
+    status = pcie.fail_next("cfg_read32", null);
+    expect_status("PCIE_FAIL_NULL", status, RDMA_SC_INVALID_ARGUMENT);
+    if (pcie.failures.exists("cfg_read") ||
+        pcie.failures.exists("cfg_read32"))
+      `uvm_error("PCIE_FAIL_CONFIG",
+                 "invalid PCIe failure configuration was retained")
     pcie.cfg_read_value = 32'hdead_beef;
     pcie_api.cfg_read32(bdf, cfg_offset, cfg_data, status);
     expect_status("PCIE_CFG_READ", status, RDMA_SC_OK);
@@ -298,8 +417,10 @@ class rdma_adapter_contract_test extends uvm_test;
         pcie.calls[6].method_name != "decode_bar")
       `uvm_error("PCIE_RECORD", "PCIe call order/data were not preserved")
     function_h.generation = 32'd17;
-    pcie.fail_next("cfg_read32",
-                   rdma_status::make(RDMA_SC_PCIE_COMPLETION, "one shot"));
+    status = pcie.fail_next(
+      "cfg_read32", rdma_status::make(RDMA_SC_PCIE_COMPLETION, "one shot")
+    );
+    expect_status("PCIE_FAIL_VALID", status, RDMA_SC_OK);
     pcie_api.cfg_read32(bdf, cfg_offset, cfg_data, status);
     expect_status("PCIE_INJECTED", status, RDMA_SC_PCIE_COMPLETION);
     pcie_api.cfg_read32(bdf, cfg_offset, cfg_data, status);
@@ -307,6 +428,16 @@ class rdma_adapter_contract_test extends uvm_test;
 
     table = rdma_mock_function_table::type_id::create("table");
     table_api = table;
+    status = table.fail_next(
+      "program", rdma_status::make(RDMA_SC_TIMEOUT, "typo")
+    );
+    expect_status("TABLE_FAIL_KEY", status, RDMA_SC_INVALID_ARGUMENT);
+    status = table.fail_next("program_notify", null);
+    expect_status("TABLE_FAIL_NULL", status, RDMA_SC_INVALID_ARGUMENT);
+    if (table.failures.exists("program") ||
+        table.failures.exists("program_notify"))
+      `uvm_error("TABLE_FAIL_CONFIG",
+                 "invalid table failure configuration was retained")
     binding = make_binding("binding");
     table_api.program_notify(binding, status);
     expect_status("TABLE_PROGRAM_NOTIFY", status, RDMA_SC_OK);
@@ -329,8 +460,10 @@ class rdma_adapter_contract_test extends uvm_test;
         table.calls[0].binding.generation != 17)
       `uvm_error("TABLE_RECORD", "table call order/value was not preserved")
     binding.generation = 32'd17;
-    table.fail_next("program_notify",
-                    rdma_status::make(RDMA_SC_INVALID_STATE, "one shot"));
+    status = table.fail_next(
+      "program_notify", rdma_status::make(RDMA_SC_INVALID_STATE, "one shot")
+    );
+    expect_status("TABLE_FAIL_VALID", status, RDMA_SC_OK);
     table_api.program_notify(binding, status);
     expect_status("TABLE_INJECTED", status, RDMA_SC_INVALID_STATE);
     table_api.program_notify(binding, status);
@@ -338,18 +471,25 @@ class rdma_adapter_contract_test extends uvm_test;
 
     net = rdma_mock_net::type_id::create("net");
     net_api = net;
+    status = net.fail_next(
+      "register_observer", rdma_status::make(RDMA_SC_TIMEOUT, "void method")
+    );
+    expect_status("NET_FAIL_KEY", status, RDMA_SC_INVALID_ARGUMENT);
+    status = net.fail_next("send_packet", null);
+    expect_status("NET_FAIL_NULL", status, RDMA_SC_INVALID_ARGUMENT);
+    if (net.failures.exists("register_observer") ||
+        net.failures.exists("send_packet"))
+      `uvm_error("NET_FAIL_CONFIG",
+                 "invalid network failure configuration was retained")
     observer = rdma_adapter_test_observer::type_id::create("observer");
     observer_seed = make_packet("observer_seed", 8'h21);
     observer.write(observer_seed);
     net_api.register_observer(observer);
-    if (!$cast(observer_snapshot, net.calls[0].observer) ||
-        observer_snapshot == observer ||
-        observer_snapshot.notification_count != 1 ||
-        observer_snapshot.last_packet == null ||
-        observer_snapshot.last_packet == observer.last_packet ||
-        observer_snapshot.last_packet.payload[0] != 8'h21)
-      `uvm_error("NET_OBSERVER_SNAPSHOT",
-                 "observer registration history aliases caller state")
+    if (!net.calls[0].observer_present ||
+        net.calls[0].observer_type_name != observer.get_type_name() ||
+        net.calls[0].observer_instance_name != observer.get_name())
+      `uvm_error("NET_OBSERVER_METADATA",
+                 "observer registration metadata was not recorded")
     tx_packet = make_packet("tx_packet", 8'h31);
     net_api.send_packet(tx_packet, status);
     expect_status("NET_SEND", status, RDMA_SC_OK);
@@ -357,11 +497,11 @@ class rdma_adapter_contract_test extends uvm_test;
     if (observer.notification_count != 2 || observer.last_packet == null ||
         observer.last_packet.payload[0] != 8'h31)
       `uvm_error("NET_OBSERVER", "observer was not notified by value")
-    if (observer_snapshot.notification_count != 1 ||
-        observer_snapshot.last_packet == null ||
-        observer_snapshot.last_packet.payload[0] != 8'h21)
-      `uvm_error("NET_OBSERVER_SNAPSHOT",
-                 "recorded observer changed after registration")
+    if (!net.calls[0].observer_present ||
+        net.calls[0].observer_type_name != "rdma_adapter_test_observer" ||
+        net.calls[0].observer_instance_name != "observer")
+      `uvm_error("NET_OBSERVER_METADATA",
+                 "observer changes altered registration metadata")
 
     rx_source = make_packet("rx_source", 8'h51);
     net.enqueue_receive(rx_source);
@@ -393,8 +533,10 @@ class rdma_adapter_contract_test extends uvm_test;
         net.calls[4].fault == fault || !net.calls[4].fault.drop_packet)
       `uvm_error("NET_RECORD", "network call order/value was not preserved")
 
-    net.fail_next("send_packet",
-                  rdma_status::make(RDMA_SC_TIMEOUT, "one shot"));
+    status = net.fail_next(
+      "send_packet", rdma_status::make(RDMA_SC_TIMEOUT, "one shot")
+    );
+    expect_status("NET_FAIL_VALID", status, RDMA_SC_OK);
     net_api.send_packet(tx_packet, status);
     expect_status("NET_INJECTED", status, RDMA_SC_TIMEOUT);
     net_api.send_packet(tx_packet, status);

@@ -74,20 +74,6 @@ function automatic rdma_packet rdma_mock_clone_packet(rdma_packet source);
   return result;
 endfunction
 
-function automatic rdma_net_observer rdma_mock_clone_observer(
-  rdma_net_observer source
-);
-  uvm_object cloned_object;
-  rdma_net_observer result;
-
-  if (source == null)
-    return null;
-  cloned_object = source.clone();
-  if (cloned_object == null || !$cast(result, cloned_object))
-    `uvm_fatal("MOCK_COPY", "network observer clone type mismatch")
-  return result;
-endfunction
-
 function automatic rdma_net_response_policy rdma_mock_clone_policy(
   rdma_net_response_policy source
 );
@@ -168,6 +154,49 @@ class rdma_mock_host_mem_call extends uvm_object;
   endfunction
 endclass
 
+class rdma_mock_dma_mapping extends rdma_dma_mapping;
+  `uvm_object_utils(rdma_mock_dma_mapping)
+
+  local longint unsigned allocation_token;
+  local bit allocation_token_initialized;
+
+  function new(string name = "rdma_mock_dma_mapping");
+    super.new(name);
+    allocation_token = 0;
+    allocation_token_initialized = 1'b0;
+  endfunction
+
+  function rdma_status initialize_allocation_token(longint unsigned token);
+    if (allocation_token_initialized)
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "allocation token is already initialized");
+    if (token == 0)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "allocation token must be nonzero");
+    allocation_token = token;
+    allocation_token_initialized = 1'b1;
+    return rdma_status::success();
+  endfunction
+
+  function bit has_allocation_token();
+    return allocation_token_initialized;
+  endfunction
+
+  function longint unsigned get_allocation_token();
+    return allocation_token;
+  endfunction
+
+  virtual function void do_copy(uvm_object rhs);
+    rdma_mock_dma_mapping rhs_mapping;
+
+    super.do_copy(rhs);
+    if (!$cast(rhs_mapping, rhs))
+      `uvm_fatal("MOCK_COPY", "mock DMA mapping copy type mismatch")
+    allocation_token = rhs_mapping.allocation_token;
+    allocation_token_initialized = rhs_mapping.allocation_token_initialized;
+  endfunction
+endclass
+
 class rdma_mock_memory_region extends uvm_object;
   `uvm_object_utils(rdma_mock_memory_region)
 
@@ -188,15 +217,24 @@ class rdma_mock_host_mem extends rdma_host_mem_api;
   rdma_status failures[string];
   longint unsigned next_sequence;
   longint unsigned next_address;
+  local longint unsigned next_allocation_token;
 
   function new(string name = "rdma_mock_host_mem");
     super.new(name);
     next_sequence = 0;
     next_address = 64'h0000_0001_0000_0000;
+    next_allocation_token = 1;
   endfunction
 
-  function void fail_next(string method_name, rdma_status status);
+  function rdma_status fail_next(string method_name, rdma_status status);
+    if (!(method_name inside {"allocate", "write", "read", "release"}))
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "unknown host memory method");
+    if (status == null)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "failure status is null");
     failures[method_name] = rdma_mock_clone_status(status);
+    return rdma_status::success();
   endfunction
 
   function automatic rdma_status take_failure(string method_name);
@@ -239,15 +277,23 @@ class rdma_mock_host_mem extends rdma_host_mem_api;
   endfunction
 
   function automatic int find_region(rdma_dma_mapping mapping);
+    rdma_mock_dma_mapping requested_mapping;
+    rdma_mock_dma_mapping region_mapping;
+
     if (mapping == null)
       return -1;
+    if (!$cast(requested_mapping, mapping))
+      return -1;
+    if (!requested_mapping.has_allocation_token())
+      return -1;
     foreach (regions[i]) begin
-      if (regions[i].mapping != null &&
-          regions[i].mapping.backing_addr == mapping.backing_addr &&
-          regions[i].mapping.iova == mapping.iova &&
-          regions[i].mapping.function_h != null &&
-          mapping.function_h != null &&
-          regions[i].mapping.function_h.same_instance(mapping.function_h))
+      if (!$cast(region_mapping, regions[i].mapping))
+        continue;
+      if (region_mapping.has_allocation_token() &&
+          region_mapping.get_allocation_token() ==
+            requested_mapping.get_allocation_token() &&
+          region_mapping.function_h != null && mapping.function_h != null &&
+          region_mapping.function_h.same_instance(mapping.function_h))
         return i;
     end
     return -1;
@@ -261,8 +307,11 @@ class rdma_mock_host_mem extends rdma_host_mem_api;
     output rdma_dma_mapping mapping
   );
     rdma_status failure;
+    rdma_status token_status;
     rdma_mock_memory_region region;
+    rdma_mock_dma_mapping allocated_mapping;
     longint unsigned aligned_address;
+    longint unsigned alignment_mask;
 
     record_call("allocate", function_h, null, size, alignment, direction);
     mapping = null;
@@ -281,22 +330,37 @@ class rdma_mock_host_mem extends rdma_host_mem_api;
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "DMA direction is invalid");
 
-    aligned_address = (next_address + alignment - 1'b1) &
-                      ~(longint'(alignment) - 1'b1);
-    mapping = rdma_dma_mapping::type_id::create(
+    alignment_mask = alignment - 1'b1;
+    if (next_address > (64'hffff_ffff_ffff_ffff - alignment_mask))
+      return rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED,
+                               "aligned DMA address overflows");
+    aligned_address = (next_address + alignment_mask) & ~alignment_mask;
+    if (size > (64'hffff_ffff_ffff_ffff - aligned_address))
+      return rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED,
+                               "DMA allocation end overflows");
+    if (next_allocation_token == 0)
+      return rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED,
+                               "DMA allocation tokens are exhausted");
+    allocated_mapping = rdma_mock_dma_mapping::type_id::create(
       $sformatf("mapping_%0d", regions.size())
     );
-    mapping.function_h = rdma_mock_clone_function_handle(function_h);
-    mapping.backing_addr.value = aligned_address;
-    mapping.iova.value = aligned_address;
-    mapping.size = size;
-    mapping.direction = direction;
-    mapping.permissions.device_read =
+    token_status = allocated_mapping.initialize_allocation_token(
+      next_allocation_token
+    );
+    if (!token_status.ok())
+      return token_status;
+    allocated_mapping.function_h = rdma_mock_clone_function_handle(function_h);
+    allocated_mapping.backing_addr.value = aligned_address;
+    allocated_mapping.iova.value = aligned_address;
+    allocated_mapping.size = size;
+    allocated_mapping.direction = direction;
+    allocated_mapping.permissions.device_read =
       direction inside {RDMA_DMA_DEVICE_READ, RDMA_DMA_BIDIRECTIONAL};
-    mapping.permissions.device_write =
+    allocated_mapping.permissions.device_write =
       direction inside {RDMA_DMA_DEVICE_WRITE, RDMA_DMA_BIDIRECTIONAL};
-    mapping.permissions.atomic = 1'b0;
-    mapping.state = RDMA_MAPPING_ACTIVE;
+    allocated_mapping.permissions.atomic = 1'b0;
+    allocated_mapping.state = RDMA_MAPPING_ACTIVE;
+    mapping = allocated_mapping;
 
     region = rdma_mock_memory_region::type_id::create(
       $sformatf("region_%0d", regions.size())
@@ -305,6 +369,7 @@ class rdma_mock_host_mem extends rdma_host_mem_api;
     region.data = new[size];
     regions.push_back(region);
     next_address = aligned_address + size;
+    next_allocation_token++;
     return rdma_status::success();
   endfunction
 
@@ -460,8 +525,19 @@ class rdma_mock_pcie extends rdma_pcie_api;
     decode_response = null;
   endfunction
 
-  function void fail_next(string method_name, rdma_status status);
+  function rdma_status fail_next(string method_name, rdma_status status);
+    if (!(method_name inside {
+          "cfg_read32", "cfg_write32", "mmio_write",
+          "dma_visibility_barrier", "mmio_ordering_barrier",
+          "get_function_info", "decode_bar"
+        }))
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "unknown PCIe method");
+    if (status == null)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "failure status is null");
     failures[method_name] = rdma_mock_clone_status(status);
+    return rdma_status::success();
   endfunction
 
   function automatic rdma_status take_failure(string method_name);
@@ -627,8 +703,18 @@ class rdma_mock_function_table extends rdma_function_table_api;
     next_sequence = 0;
   endfunction
 
-  function void fail_next(string method_name, rdma_status status);
+  function rdma_status fail_next(string method_name, rdma_status status);
+    if (!(method_name inside {
+          "program_notify", "clear_notify", "program_dmi", "clear_dmi",
+          "program_vft", "clear_vft"
+        }))
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "unknown function table method");
+    if (status == null)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "failure status is null");
     failures[method_name] = rdma_mock_clone_status(status);
+    return rdma_status::success();
   endfunction
 
   function automatic rdma_status take_failure(string method_name);
@@ -701,7 +787,9 @@ class rdma_mock_net_call extends uvm_object;
   longint unsigned call_sequence;
   string method_name;
   rdma_packet packet;
-  rdma_net_observer observer;
+  bit observer_present;
+  string observer_type_name;
+  string observer_instance_name;
   rdma_net_response_policy policy;
   rdma_net_fault fault;
 
@@ -710,7 +798,9 @@ class rdma_mock_net_call extends uvm_object;
     call_sequence = 0;
     method_name = "";
     packet = null;
-    observer = null;
+    observer_present = 1'b0;
+    observer_type_name = "";
+    observer_instance_name = "";
     policy = null;
     fault = null;
   endfunction
@@ -730,8 +820,18 @@ class rdma_mock_net extends rdma_net_api;
     next_sequence = 0;
   endfunction
 
-  function void fail_next(string method_name, rdma_status status);
+  function rdma_status fail_next(string method_name, rdma_status status);
+    if (!(method_name inside {
+          "send_packet", "receive_packet", "configure_response_policy",
+          "inject_fault"
+        }))
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "unknown network method");
+    if (status == null)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "failure status is null");
     failures[method_name] = rdma_mock_clone_status(status);
+    return rdma_status::success();
   endfunction
 
   function automatic rdma_status take_failure(string method_name);
@@ -760,7 +860,11 @@ class rdma_mock_net extends rdma_net_api;
     call_record.call_sequence = next_sequence;
     call_record.method_name = method_name;
     call_record.packet = rdma_mock_clone_packet(packet);
-    call_record.observer = rdma_mock_clone_observer(observer);
+    call_record.observer_present = observer != null;
+    if (observer != null) begin
+      call_record.observer_type_name = observer.get_type_name();
+      call_record.observer_instance_name = observer.get_name();
+    end
     call_record.policy = rdma_mock_clone_policy(policy);
     call_record.fault = rdma_mock_clone_fault(fault);
     calls.push_back(call_record);
