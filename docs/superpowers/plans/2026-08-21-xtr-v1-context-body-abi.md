@@ -389,6 +389,10 @@ endclass
 
 - [ ] **Step 4: Replace the six field models with serializable semantics only**
 
+The `rdma_qpc_behavior` type and `rdma_qpc_model.behavior` member below are supplied
+by Task 10A.1. A from-scratch execution must run Task 10A.1 before compiling Task 10A
+Step 4 or Step 5.
+
 Keep `rdma_hw_model` and the transport-extension base. Use the following exact public ownership:
 
 ```systemverilog
@@ -621,13 +625,29 @@ if (!equal) `uvm_error("QPC_ROUNDTRIP", {case_name, ": ", mismatch})
 
 Add a projected-handle test where source handles have nonzero `function_uid/generation` and decoded handles have zero lifecycle metadata; equality must still pass when kind/object ID match and fail when either differs. Verify the encoded image keeps source generation in `function_generation`, but payload bytes do not change when only lifecycle metadata changes.
 
+Add a table-driven `serialized_equal()` falsification test. Clone a valid
+decoded/canonical model and mutate, one at a time, `behavior.transport_version`,
+`behavior.migration_enable`, `behavior.tx_endian_swap`, `behavior.rx_endian_swap`,
+`behavior.read_after_write_fence`, `behavior.atomic_after_atomic_fence`,
+`behavior.priority`, `context_backing` by one 512B unit, `signature_enable`, TX flow
+control, and RX flow control. Each call must return `RDMA_SC_OK` with `equal == 0` and a
+nonempty, useful `mismatch`. The individual TX and RX mutations are legal generic-model
+states even though encode later rejects their asymmetry.
+
 Every golden builder explicitly sets `behavior`; transport selection must not supply
 behavior defaults. Set `context_backing.value = frozen_shadow_pba << 9`, verify
 `signature_enable -> SQ_CE_EN`, and use equal TX/RX flow-control values for positive
-vectors. Negative rows also cover behavior width violations, TX/RX flow-control
-mismatch, and a QPC-private reserved bit.
+vectors. Add a separate positive encode/decode round trip at the accepted maxima
+`behavior.transport_version = 3` (`tver=3`) and `behavior.priority = 7`, with equal
+TX/RX flow control; do not compare this maxima case to a fixed golden.
 
-Negative rows must cover wrong model subclass, transport-extension mismatch, QPN/CQN/PD/SRQ width overflow, invalid PMTU, bad retry width, queue/context misalignment, TC ECN mismatch, wrong image metadata, and each group of RC PSN mirrors corrupted one at a time. Encode/decode failures must return null output objects.
+Require exact negative status codes. Wrong model subclass or transport extension, all
+field-width violations (including QPN/CQN/PD/SRQ and behavior), queue/context alignment
+violations, invalid PMTU, retry, or TC values, and TX/RX flow-control mismatch return
+`RDMA_SC_INVALID_ARGUMENT`. Wrong image metadata or length, QPC-private reserved-bit
+corruption, and RC PSN mirror corruption return `RDMA_SC_CODEC_ERROR`. An absent
+registry variant returns `RDMA_SC_UNSUPPORTED_OPCODE`. Encode/decode output objects
+remain null on every failure.
 
 - [ ] **Step 2: Run RED on 53**
 
@@ -654,11 +674,10 @@ virtual function rdma_status serialized_equal(
 endfunction
 ```
 
-Every xtr_v1 QPC/body codec overrides it. The QPC override compares every serialized
-behavior field, `context_backing`, `signature_enable`, and both flow-control semantics;
-it compares handles by `kind/object_id`, canonicalizes SQE to SQD on state decode, and
-ignores only function UID/generation plus fields that the approved design explicitly
-classifies as runtime metadata.
+Every xtr_v1 QPC/body codec overrides it. The QPC override compares handles by
+`kind/object_id`; it ignores ONLY every handle's `function_uid` and `generation`.
+Aside from SQE-to-SQD canonicalization on state decode, it compares every other QPC
+model and transport-extension semantic represented by the xtr_v1 image.
 
 - [ ] **Step 4: Implement common QPC projection plus three transport codecs**
 
@@ -683,10 +702,35 @@ Reject unequal TX/RX flow control with `RDMA_SC_INVALID_ARGUMENT`, otherwise wri
 shared value to `FC_EN`; decode restores both model fields from that bit and restores
 the byte IOVA with `SHADOW_PBA << 9`.
 
-Build a QPC-specific 512B allowed mask from the frozen QPC field table. Do not call
-the 64B sparse-command `body_mask()` for `RDMA_IMAGE_QPC`. Leave `CC_TYPE`,
-`RTO_CODE`, and `LOAD_RQ_PI_TH` zero/reserved until a separate approved design assigns
-their ownership.
+Define this QPC-private mask interface in `rdma_xtr_v1_qpc_codecs.svh`:
+
+```systemverilog
+protected function bit qpc_allowed_mask(
+  rdma_transport_e transport,
+  int unsigned qword_index,
+  output bit [63:0] mask
+);
+protected function rdma_status validate_qpc_encode_mask(
+  rdma_xtr_v1_qword_builder builder,
+  rdma_transport_e transport
+);
+protected function rdma_status validate_qpc_decode_mask(
+  rdma_xtr_v1_qword_builder builder,
+  rdma_transport_e transport
+);
+```
+
+`qpc_allowed_mask()` covers exactly qwords 0..63 and supplies distinct RC, UD, and URC
+masks derived from the frozen QPC field table. An unsupported transport or qword index
+fails the lookup. `validate_qpc_encode_mask()` uses `get_occupancy()`, requires exactly
+64 qwords, and requires `occupancy[qword] == allowed_mask[qword]`, so an authored field
+counts even when its value is zero. `validate_qpc_decode_mask()` uses `get_words()`,
+requires exactly 64 qwords, and rejects
+`(words[qword] & ~allowed_mask[qword]) != 0` with `RDMA_SC_CODEC_ERROR`.
+
+None of these helpers calls, extends, or modifies the 64B sparse-command `body_mask()`
+or its frozen body masks. Leave `CC_TYPE`, `RTO_CODE`, and `LOAD_RQ_PI_TH`
+zero/reserved until a separate approved design assigns their ownership.
 
 Use explicit mapping helpers:
 
