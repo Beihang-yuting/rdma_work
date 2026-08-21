@@ -389,9 +389,13 @@ endclass
 
 - [ ] **Step 4: Replace the six field models with serializable semantics only**
 
-The `rdma_qpc_behavior` type and `rdma_qpc_model.behavior` member below are supplied
-by Task 10A.1. A from-scratch execution must run Task 10A.1 before compiling Task 10A
-Step 4 or Step 5.
+The public ownership block below shows the final model after Task 10A.1, so it includes
+`rdma_qpc_behavior behavior;` as architectural truth. For a clean replay, execute and
+commit Task 10A first without that single behavior member (retain every other shown
+field), because Task 10A.1 tests depend on the model and test artifacts created by
+Task 10A. Then execute Task 10A.1 immediately after Task 10A and before Task 10B or
+Task 10C; Task 10A.1 adds the behavior type, member, and tests in its own isolated
+commit.
 
 Keep `rdma_hw_model` and the transport-extension base. Use the following exact public ownership:
 
