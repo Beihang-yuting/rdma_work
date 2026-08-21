@@ -45,6 +45,10 @@
 In `rdma_context_model_test.run_phase()`, add these declarations next to the existing
 QPC declarations:
 
+`priority` is a SystemVerilog keyword, so SV examples use the escaped identifier
+`\priority `; its required trailing whitespace terminates the identifier and must be
+preserved.
+
 ```systemverilog
     rdma_qpc_behavior behavior;
     rdma_qpc_behavior behavior_clone;
@@ -60,7 +64,7 @@ checks:
         behavior.rx_endian_swap != 1'b1 ||
         behavior.read_after_write_fence != 1'b1 ||
         behavior.atomic_after_atomic_fence != 1'b1 ||
-        behavior.priority != 0)
+        behavior.\priority != 0)
       `uvm_error("QPC_BEHAVIOR_DEFAULT", "driver-compatible defaults were lost")
     expect_ok("QPC_BEHAVIOR_VALID", behavior.validate());
     if (behavior.describe() == "")
@@ -71,8 +75,8 @@ checks:
       `uvm_error("QPC_BEHAVIOR_CLONE", "behavior clone lost dynamic type")
     else begin
       behavior_clone.transport_version = 3;
-      behavior_clone.priority = 7;
-      if (behavior.transport_version != 0 || behavior.priority != 0)
+      behavior_clone.\priority = 7;
+      if (behavior.transport_version != 0 || behavior.\priority != 0)
         `uvm_error("QPC_BEHAVIOR_CLONE", "behavior clone aliases source")
       expect_ok("QPC_BEHAVIOR_BOUNDARY", behavior_clone.validate());
     end
@@ -80,9 +84,9 @@ checks:
     behavior.transport_version = 4;
     expect_invalid("QPC_BEHAVIOR_TVER_WIDTH", behavior.validate());
     behavior.transport_version = 0;
-    behavior.priority = 8;
+    behavior.\priority = 8;
     expect_invalid("QPC_BEHAVIOR_PRIORITY_WIDTH", behavior.validate());
-    behavior.priority = 0;
+    behavior.\priority = 0;
 ```
 
 In `make_qpc()`, set explicit non-default behavior values after assigning the address
@@ -96,7 +100,7 @@ behavior:
     qpc.behavior.rx_endian_swap = 1'b1;
     qpc.behavior.read_after_write_fence = 1'b1;
     qpc.behavior.atomic_after_atomic_fence = 1'b1;
-    qpc.behavior.priority = 5;
+    qpc.behavior.\priority = 5;
 ```
 
 Extend the existing QPC clone checks so the condition rejects a null or aliased
@@ -111,10 +115,10 @@ behavior, then mutate the clone and prove isolation:
              qpc_clone.qp_h == qpc.qp_h)
       `uvm_error("QPC_CLONE", "QPC clone did not deep-copy nested values")
     else begin
-      qpc_clone.behavior.priority = 6;
+      qpc_clone.behavior.\priority = 6;
       qpc_clone.address_vector.destination_mac++;
       qpc_clone.qp_h.object_id++;
-      if (qpc.behavior.priority != 5 ||
+      if (qpc.behavior.\priority != 5 ||
           qpc.address_vector.destination_mac != 48'h02_11_22_33_44_55 ||
           qpc.qp_h.object_id != 32'h101)
         `uvm_error("QPC_CLONE", "QPC clone mutation reached source")
@@ -132,9 +136,9 @@ checks. Restore every mutation so later tests continue from a valid QPC:
     qpc.behavior.transport_version = 4;
     expect_invalid("QPC_BEHAVIOR_INVALID", qpc.validate());
     qpc.behavior.transport_version = 1;
-    qpc.behavior.priority = 8;
+    qpc.behavior.\priority = 8;
     expect_invalid("QPC_BEHAVIOR_PRIORITY", qpc.validate());
-    qpc.behavior.priority = 5;
+    qpc.behavior.\priority = 5;
 
     // Generic QPC semantics permit asymmetric flow control.  xtr_v1 rejects it.
     qpc.tx_flow_control = 1'b1;
@@ -147,7 +151,7 @@ In `rdma_request_model_test.svh`, set explicit behavior values on the existing Q
 ```systemverilog
     qpc.behavior.transport_version = 1;
     qpc.behavior.migration_enable = 1'b1;
-    qpc.behavior.priority = 5;
+    qpc.behavior.\priority = 5;
 ```
 
 Extend its clone null check with `qpc_clone.behavior == null`, extend its alias/value
@@ -157,15 +161,15 @@ check with the following expressions, and extend its mutation check as shown:
         qpc_clone.behavior == qpc.behavior ||
         qpc_clone.behavior.transport_version != 1 ||
         qpc_clone.behavior.migration_enable != 1'b1 ||
-        qpc_clone.behavior.priority != 5 ||
+        qpc_clone.behavior.\priority != 5 ||
 ```
 
 ```systemverilog
-      qpc_clone.behavior.priority = 6;
+      qpc_clone.behavior.\priority = 6;
       qpc_clone.qp_h.object_id++;
       qpc_clone.sq_depth = 2048;
       rc_ext_clone.remote_qpn++;
-      if (qpc.behavior.priority != 5 ||
+      if (qpc.behavior.\priority != 5 ||
           qpc.qp_h.object_id != 32'h404 || qpc.sq_depth != 1024 ||
           rc_ext.remote_qpn != 24'habc123)
         `uvm_error("QPC_CLONE", "QPC clone mutation reached source")
@@ -198,7 +202,7 @@ class rdma_qpc_behavior extends uvm_object;
   bit rx_endian_swap;
   bit read_after_write_fence;
   bit atomic_after_atomic_fence;
-  int unsigned priority;
+  int unsigned \priority ;
 
   function new(string name = "rdma_qpc_behavior");
     super.new(name);
@@ -208,7 +212,7 @@ class rdma_qpc_behavior extends uvm_object;
     rx_endian_swap = 1'b1;
     read_after_write_fence = 1'b1;
     atomic_after_atomic_fence = 1'b1;
-    priority = 0;
+    \priority = 0;
   endfunction
 
   virtual function void do_copy(uvm_object rhs);
@@ -223,14 +227,14 @@ class rdma_qpc_behavior extends uvm_object;
     rx_endian_swap = rhs_behavior.rx_endian_swap;
     read_after_write_fence = rhs_behavior.read_after_write_fence;
     atomic_after_atomic_fence = rhs_behavior.atomic_after_atomic_fence;
-    priority = rhs_behavior.priority;
+    \priority = rhs_behavior.\priority ;
   endfunction
 
   virtual function rdma_status validate();
     if (transport_version > 3)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "QPC transport version exceeds 2 bits");
-    if (priority > 7)
+    if (\priority > 7)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "QPC priority exceeds 3 bits");
     return rdma_status::success();
@@ -240,8 +244,7 @@ class rdma_qpc_behavior extends uvm_object;
     return $sformatf(
       "behavior(tver=%0d mig=%0b tx_swap=%0b rx_swap=%0b ra_fence=%0b aa_fence=%0b priority=%0d)",
       transport_version, migration_enable, tx_endian_swap, rx_endian_swap,
-      read_after_write_fence, atomic_after_atomic_fence, priority
-    );
+      read_after_write_fence, atomic_after_atomic_fence, \priority );
   endfunction
 endclass
 ```

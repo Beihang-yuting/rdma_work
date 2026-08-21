@@ -633,7 +633,7 @@ Add a table-driven `serialized_equal()` falsification test. Clone a valid
 decoded/canonical model and mutate, one at a time, `behavior.transport_version`,
 `behavior.migration_enable`, `behavior.tx_endian_swap`, `behavior.rx_endian_swap`,
 `behavior.read_after_write_fence`, `behavior.atomic_after_atomic_fence`,
-`behavior.priority`, `context_backing` by one 512B unit, `signature_enable`, TX flow
+`behavior.\priority `, `context_backing` by one 512B unit, `signature_enable`, TX flow
 control, and RX flow control. Each call must return `RDMA_SC_OK` with `equal == 0` and a
 nonempty, useful `mismatch`. The individual TX and RX mutations are legal generic-model
 states even though encode later rejects their asymmetry.
@@ -642,7 +642,7 @@ Every golden builder explicitly sets `behavior`; transport selection must not su
 behavior defaults. Set `context_backing.value = frozen_shadow_pba << 9`, verify
 `signature_enable -> SQ_CE_EN`, and use equal TX/RX flow-control values for positive
 vectors. Add a separate positive encode/decode round trip at the accepted maxima
-`behavior.transport_version = 3` (`tver=3`) and `behavior.priority = 7`, with equal
+`behavior.transport_version = 3` (`tver=3`) and `behavior.\priority = 7`, with equal
 TX/RX flow control; do not compare this maxima case to a fixed golden.
 
 Require exact negative status codes. Wrong model subclass or transport extension, all
