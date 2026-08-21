@@ -13,4 +13,5 @@ package rdma_unit_test_pkg;
   `include "unit/rdma_request_model_test.svh"
   `include "unit/rdma_adapter_contract_test.svh"
   `include "unit/rdma_resource_manager_test.svh"
+  `include "unit/rdma_harness_expected_failure_probe.svh"
 endpackage

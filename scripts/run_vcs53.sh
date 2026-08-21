@@ -41,7 +41,16 @@ if [[ ! "$remote_dir" =~ ^/home/ubuntu/workspace/rdma_uvm\.[A-Za-z0-9]{6}$ ]]; t
 fi
 
 cleanup() {
-  ssh "$REMOTE_HOST" "rm -rf -- '$remote_dir'"
+  local command_status=$?
+
+  trap - EXIT
+  if ! ssh "$REMOTE_HOST" "rm -rf -- '$remote_dir'"; then
+    echo "Failed to remove remote simulation directory: $remote_dir" >&2
+    if (( command_status == 0 )); then
+      command_status=1
+    fi
+  fi
+  exit "$command_status"
 }
 trap cleanup EXIT
 

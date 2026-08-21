@@ -127,6 +127,7 @@ class rdma_resource_manager_test extends uvm_test;
     rdma_resource_manager rollback_rm;
     rdma_resource_manager function_cycle_rm;
     rdma_resource_manager function_wrap_rm;
+    rdma_resource_manager function_release_rm;
     rdma_resource_manager_probe permanent_exhaustion_rm;
     rdma_resource_manager_probe exhaustion_rm;
     rdma_hmc_allocator hmc;
@@ -140,6 +141,7 @@ class rdma_resource_manager_test extends uvm_test;
     rdma_function_binding rollback_binding;
     rdma_function_binding function_cycle_binding;
     rdma_function_binding function_wrap_binding;
+    rdma_function_binding function_release_binding;
     rdma_function_binding permanent_exhaustion_binding;
     rdma_function_handle owner_h;
     rdma_function_handle owner_b_h;
@@ -171,6 +173,9 @@ class rdma_resource_manager_test extends uvm_test;
     rdma_function rejected_function;
     rdma_function function_max;
     rdma_function function_wrapped;
+    rdma_function function_release_function;
+    rdma_function function_release_lookup;
+    rdma_pd function_release_pd;
     rdma_function permanent_exhaustion_function;
     rdma_pd permanent_exhaustion_pd;
     rdma_cmq permanent_exhaustion_cmq;
@@ -196,6 +201,7 @@ class rdma_resource_manager_test extends uvm_test;
     rdma_handle snapshot_pd_h;
     rdma_handle snapshot_qp_h;
     rdma_handle rollback_h;
+    rdma_handle function_release_h;
     rdma_resource resource;
     rdma_resource second_resource;
     rdma_status s;
@@ -309,11 +315,26 @@ class rdma_resource_manager_test extends uvm_test;
       "snapshot_binding", 64'h5a5a_0000_0000_0001,
       32'h5a5a_0101, 32'd11
     );
+    snapshot_binding.rdma_vf_id = 32'h5a5a_0202;
+    snapshot_binding.vsi_id = 32'h5a5a_0303;
+    snapshot_binding.pfvf_id = 32'h5a5a_0404;
     snapshot_bdf = snapshot_binding.pcie.bdf;
     expect_status("SNAPSHOT_CREATE_FUNCTION",
                   snapshot_rm.create_function(snapshot_binding,
                                               snapshot_function),
                   RDMA_SC_OK);
+    if (snapshot_function == null ||
+        snapshot_function.rdma_vf_id != 32'h5a5a_0202 ||
+        snapshot_function.vsi_id != 32'h5a5a_0303 ||
+        snapshot_function.pfvf_id != 32'h5a5a_0404)
+      `uvm_error("SNAPSHOT_FUNCTION_LOGICAL_IDS",
+                 "created Function omitted trusted logical identity fields")
+    if (snapshot_function == null || snapshot_function.binding == null ||
+        snapshot_function.binding.rdma_vf_id != 32'h5a5a_0202 ||
+        snapshot_function.binding.vsi_id != 32'h5a5a_0303 ||
+        snapshot_function.binding.pfvf_id != 32'h5a5a_0404)
+      `uvm_error("SNAPSHOT_FUNCTION_NESTED_IDS",
+                 "created Function binding omitted logical identity fields")
     owner_h = clone_function_handle("SNAPSHOT_OWNER",
                                     snapshot_function.owner);
     expect_status("SNAPSHOT_CREATE_PD",
@@ -335,6 +356,12 @@ class rdma_resource_manager_test extends uvm_test;
     snapshot_function.owner.object_id++;
     snapshot_function.binding.global_function_id++;
     snapshot_function.binding.pcie.bdf.bus++;
+    snapshot_function.rdma_vf_id++;
+    snapshot_function.vsi_id++;
+    snapshot_function.pfvf_id++;
+    snapshot_function.binding.rdma_vf_id++;
+    snapshot_function.binding.vsi_id++;
+    snapshot_function.binding.pfvf_id++;
     snapshot_qp.handle.object_id++;
     snapshot_qp.owner.object_id++;
     snapshot_qp.pd_h.object_id++;
@@ -344,6 +371,9 @@ class rdma_resource_manager_test extends uvm_test;
     snapshot_binding.global_function_id++;
     snapshot_binding.host_id = 32'hffff_0001;
     snapshot_binding.pcie.bdf.bus++;
+    snapshot_binding.rdma_vf_id++;
+    snapshot_binding.vsi_id++;
+    snapshot_binding.pfvf_id++;
 
     expect_status("SNAPSHOT_FUNCTION_LOOKUP",
                   snapshot_rm.lookup(owner_h, resource), RDMA_SC_OK);
@@ -351,16 +381,25 @@ class rdma_resource_manager_test extends uvm_test;
       `uvm_error("SNAPSHOT_FUNCTION_LOOKUP",
                  "Function lookup returned the wrong resource type")
     end
-    else if (snapshot_function_lookup.binding == null ||
-             snapshot_function_lookup.binding.function_uid !=
-               64'h5a5a_0000_0000_0001 ||
-             snapshot_function_lookup.binding.global_function_id !=
-               32'h5a5a_0101 ||
-             snapshot_function_lookup.binding.host_id != 0 ||
-             snapshot_function_lookup.binding.pcie == null ||
-             snapshot_function_lookup.binding.pcie.bdf != snapshot_bdf) begin
-      `uvm_error("SNAPSHOT_FUNCTION_VALUE",
-                 "caller mutation changed authoritative Function binding")
+    else begin
+      if (snapshot_function_lookup.rdma_vf_id != 32'h5a5a_0202 ||
+          snapshot_function_lookup.vsi_id != 32'h5a5a_0303 ||
+          snapshot_function_lookup.pfvf_id != 32'h5a5a_0404)
+        `uvm_error("SNAPSHOT_FUNCTION_LOGICAL_IDS_LOOKUP",
+                   "caller mutation changed Function logical identity")
+      if (snapshot_function_lookup.binding == null ||
+          snapshot_function_lookup.binding.function_uid !=
+            64'h5a5a_0000_0000_0001 ||
+          snapshot_function_lookup.binding.global_function_id !=
+            32'h5a5a_0101 ||
+          snapshot_function_lookup.binding.rdma_vf_id != 32'h5a5a_0202 ||
+          snapshot_function_lookup.binding.vsi_id != 32'h5a5a_0303 ||
+          snapshot_function_lookup.binding.pfvf_id != 32'h5a5a_0404 ||
+          snapshot_function_lookup.binding.host_id != 0 ||
+          snapshot_function_lookup.binding.pcie == null ||
+          snapshot_function_lookup.binding.pcie.bdf != snapshot_bdf)
+        `uvm_error("SNAPSHOT_FUNCTION_VALUE",
+                   "caller mutation changed authoritative Function binding")
     end
     expect_status("SNAPSHOT_QP_LOOKUP",
                   snapshot_rm.lookup(snapshot_qp_h, resource), RDMA_SC_OK);
@@ -601,6 +640,86 @@ class rdma_resource_manager_test extends uvm_test;
     expect_status("TEARDOWN_REPEATED_FUNCTION",
                   teardown_rm.release_function(owner_h),
                   RDMA_SC_STALE_GENERATION);
+
+    // A Function is the retirement boundary.  Ordinary release must preserve
+    // it so only privileged Function teardown can atomically retire topology.
+    function_release_rm = rdma_resource_manager::type_id::create(
+      "function_release_rm"
+    );
+    function_release_binding = make_active_binding(
+      "function_release_binding", 64'hf00d_0000_0000_0001,
+      32'hf00d_0101, 32'd77
+    );
+    function_release_binding.vsi_id = 32'hf00d_0202;
+    expect_status(
+      "FUNCTION_ORDINARY_RELEASE_CREATE",
+      function_release_rm.create_function(function_release_binding,
+                                           function_release_function),
+      RDMA_SC_OK
+    );
+    owner_h = clone_function_handle("FUNCTION_ORDINARY_RELEASE_OWNER",
+                                    function_release_function.owner);
+    function_release_h = clone_handle("FUNCTION_ORDINARY_RELEASE_HANDLE",
+                                      function_release_function.handle);
+    expect_status(
+      "FUNCTION_ORDINARY_RELEASE_REJECT",
+      function_release_rm.\release (function_release_h),
+      RDMA_SC_INVALID_STATE
+    );
+    expect_status(
+      "FUNCTION_ORDINARY_RELEASE_STILL_LIVE",
+      function_release_rm.lookup(function_release_h, resource), RDMA_SC_OK
+    );
+    if (resource == null || !$cast(function_release_lookup, resource)) begin
+      `uvm_error("FUNCTION_ORDINARY_RELEASE_STILL_LIVE",
+                 "ordinary release removed or changed Function type")
+    end
+    else if (!function_release_lookup.handle.same_instance(
+               function_release_h
+             ) ||
+             !function_release_lookup.owner.same_instance(owner_h) ||
+             function_release_lookup.local_function_id !=
+               function_release_function.local_function_id ||
+             function_release_lookup.rdma_vf_id !=
+               function_release_binding.rdma_vf_id ||
+             function_release_lookup.vsi_id !=
+               function_release_binding.vsi_id ||
+             function_release_lookup.pfvf_id !=
+               function_release_binding.pfvf_id)
+      `uvm_error("FUNCTION_ORDINARY_RELEASE_UNCHANGED",
+                 "rejected ordinary release changed the live Function")
+    expect_status(
+      "FUNCTION_ORDINARY_RELEASE_CREATE_PD",
+      function_release_rm.create_pd(function_release_binding,
+                                    function_release_pd),
+      RDMA_SC_OK
+    );
+    expect_status(
+      "FUNCTION_ORDINARY_RELEASE_TEARDOWN",
+      function_release_rm.release_function(owner_h), RDMA_SC_OK
+    );
+    expect_status(
+      "FUNCTION_ORDINARY_RELEASE_RETIRED",
+      function_release_rm.lookup(function_release_h, resource),
+      RDMA_SC_STALE_GENERATION
+    );
+    expect_status(
+      "FUNCTION_ORDINARY_RELEASE_RETIRED_RELEASE",
+      function_release_rm.\release (function_release_h),
+      RDMA_SC_STALE_GENERATION
+    );
+    expect_status(
+      "FUNCTION_ORDINARY_RELEASE_PD_RETIRED",
+      function_release_rm.lookup(function_release_pd.handle, resource),
+      RDMA_SC_STALE_GENERATION
+    );
+    expect_status(
+      "FUNCTION_ORDINARY_RELEASE_NO_LEAKS",
+      function_release_rm.check_leaks(leak_count, owner_h), RDMA_SC_OK
+    );
+    if (leak_count != 0)
+      `uvm_error("FUNCTION_ORDINARY_RELEASE_NO_LEAKS",
+                 "privileged Function teardown leaked topology")
 
     // Function generations are exact non-reusable incarnations.  A -> B -> A
     // rollback is rejected, and max -> zero is exhaustion rather than wrap.

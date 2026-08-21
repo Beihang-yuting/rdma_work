@@ -34,6 +34,11 @@ class rdma_hmc_lease extends uvm_object;
   endfunction
 endclass
 
+// One allocator instance represents one monotonic HMC aperture epoch.
+// Individual release and release_function() only make leases inactive; they
+// intentionally do not reclaim capacity or reuse addresses, so an old
+// owner/generation/kind address can never become live again.  Start a new
+// aperture epoch by constructing and configuring a new allocator object.
 class rdma_hmc_allocator extends uvm_object;
   `uvm_object_utils(rdma_hmc_allocator)
 

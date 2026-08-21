@@ -546,6 +546,9 @@ class rdma_resource_manager extends uvm_object;
     authoritative.state = RDMA_RESOURCE_ALLOCATED;
     authoritative.local_function_id = local_id;
     authoritative.global_function_id = owner.object_id;
+    authoritative.rdma_vf_id = trusted_binding.rdma_vf_id;
+    authoritative.vsi_id = trusted_binding.vsi_id;
+    authoritative.pfvf_id = trusted_binding.pfvf_id;
     authoritative.binding = clone_binding_value(trusted_binding,
                                                   "Function resource");
     register_resource(authoritative);
@@ -939,6 +942,11 @@ class rdma_resource_manager extends uvm_object;
     status = lookup(handle, ignored);
     if (!status.ok())
       return status;
+    if (handle.kind == RDMA_RESOURCE_FUNCTION)
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "Function resources require privileged Function teardown"
+      );
     key = resource_key(handle);
     if (registry[key].state != RDMA_RESOURCE_ALLOCATED)
       return rdma_status::make(RDMA_SC_INVALID_STATE,
