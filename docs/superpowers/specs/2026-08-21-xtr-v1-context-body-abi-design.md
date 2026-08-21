@@ -49,7 +49,7 @@ byte 0 为最低地址。
 |---|---|---:|---:|---|---|
 | `RDMA_IMAGE_QPC` | 独立 QPC buffer | 512B | 512B | 每 qword big-endian | host backing；地址由 QPC CMQ 命令引用 |
 | `RDMA_IMAGE_CQC` | CQC create sparse body | 64B | 64B | 每 qword big-endian | 只可与 CMQ envelope 合并 |
-| `RDMA_IMAGE_MRT` | MR register sparse body | 64B | 64B | 每 qword big-endian | 只可与 CMQ envelope 合并 |
+| `RDMA_IMAGE_MRT` | KEY_ALLOC/MR_REGISTER sparse body | 64B | 64B | 每 qword big-endian | 只可与 CMQ envelope 合并 |
 | `RDMA_IMAGE_SRQC` | SRFQC create sparse body | 64B | 64B | 每 qword big-endian | 只可与 CMQ envelope 合并 |
 | `RDMA_IMAGE_CEQC` | CEQC create sparse body | 64B | 64B | 每 qword big-endian | 只可与 CMQ envelope 合并 |
 | `RDMA_IMAGE_AEQC` | AEQC create sparse body | 64B | 64B | 每 qword big-endian | 只可与 CMQ envelope 合并 |
@@ -116,13 +116,13 @@ envelope。任何 codec 都不得因 request WQE 中该字段为零而把它声�
 `cqc_boundary` 不能作为 Task 10 的最终 golden；Task 9.5 将其替换为
 `cqc_create_body_boundary`。
 
-### 5.2 MRT register body
+### 5.2 MRT KEY_ALLOC/MR_REGISTER body
 
 | final WQE byte | body 字段 |
 |---:|---|
 | 0 | STAG index 23:0、next state 62:61 |
 | 8 | STAG key 31:24 |
-| 16 | parent index 23:0、PD 39:24、payload VF 47:40/enable 48、rights 53:49、type 55:54、host page 57:56、PBL mode 59:58、address mode 60、invalidate 61、state 63:62 |
+| 16 | KEY_ALLOC self-parent index 23:0；PD 39:24、payload VF 47:40/enable 48、rights 53:49、type 55:54、host page 57:56、PBL mode 59:58、address mode 60、invalidate 61、state 63:62 |
 | 24 | length 45:0、ODP 47、重复 STAG key 63:56 |
 | 32 | start VA 63:0 |
 | 40 | PBL2 first index 63:36，或 PBL0/PBL1 payload PBA0 63:12 |
@@ -131,6 +131,11 @@ envelope。任何 codec 都不得因 request WQE 中该字段为零而把它声�
 同一 variant 中 byte 40 的 PBL index 和 PBA 不可同时有效。byte 0 state 与 byte 16
 state 都由同一个 model state 投影，decode 时两者不一致是 `RDMA_SC_CODEC_ERROR`。
 byte 8 与 byte 24 的 STAG key 同样必须一致。
+
+普通 `mr.c:xtrdma_hwreg_mr()` 实际使用 `KEY_ALLOC(0x04)`；该 variant 按当前驱动的
+DFX 行为把 byte 16 parent index 写成自身 STAG index。`MR_REGISTER(0x05)` 使用相同
+model，但 byte 16 bit 23:0 必须为零。两个 opcode 使用不同 body mask/key，不能互相
+decode；本轮不把 KEY_ALLOC 的 self-parent 行为推广为硬件中立 model 字段。
 
 ### 5.3 SRQC create body
 
@@ -263,7 +268,8 @@ completion/monitor 负责 CI。
 - MRT：`iova -> start VA`、`length -> 46-bit length`；rights bit 0..4 分别来自
   local-write、remote-read、remote-write、MW-bind、remote-atomic，其中 remote-write 或
   remote-atomic 会规范化地同时置 local-write；
-  PBL0/PBL1 使用 PBA，PBL2 使用 first PBL index。`backing_addr` 不再兼任三种模式，
+  PBL0/PBL1 使用 PBA，PBL2 使用 first PBL index。KEY_ALLOC 的 self-parent index 从
+  STAG index 派生，MR_REGISTER 对应位置固定为零。`backing_addr` 不再兼任三种模式，
   由 `rdma_mr_page_layout` 明确选择。
 - SRQC：depth 映射 size factor，producer index/wrap 映射 SRFQ PI；page layout 提供
   SRFQ backing；shadow backing、limit threshold、arm sequence 和 load threshold
@@ -359,7 +365,8 @@ field width、field uniqueness 和 ownership mask 都必须从 checker 的独立
 ### 9.2 Definitions 和 golden cases
 
 Task 9.5 新增明确的 `*_BODY_*` 常量，避免把 local context 坐标与 final WQE 坐标混用；
-现有 QPC standalone 常量保持原名。固定 golden 至少包含：
+现有 QPC standalone 常量保持原名，并新增
+`XTR_V1_OP_KEY_ALLOC=8'h04`。新增/替换的 context/body golden 精确包含：
 
 - `qpc_rc_boundary`：RC address vector、SQ/RQ backing、SQ/RQ CQN、SRQ 选择、
   send/recv PSN 镜像、retry/RNR、state 和 handle ID；
@@ -369,6 +376,7 @@ Task 9.5 新增明确的 `*_BODY_*` 常量，避免把 local context 坐标与 f
 - `cqc_create_body_boundary`；
 - `mrt_register_pbl0_boundary`、`mrt_register_pbl1_boundary`、
   `mrt_register_pbl2_boundary`；
+- `mrt_key_alloc_pbl0_boundary`，用于锁定普通 MR 路径的 opcode 和 self-parent 差异；
 - `srqc_create_body_boundary`；
 - `ceqc_create_body_boundary`、`aeqc_create_body_boundary`。
 
