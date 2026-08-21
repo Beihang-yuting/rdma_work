@@ -9,6 +9,7 @@ package rdma_unit_test_pkg;
   import uvm_pkg::*;
   import rdma_types_pkg::*;
   import rdma_model_pkg::*;
+  import rdma_codec_pkg::*;
   import rdma_core_pkg::*;
   import rdma_adapter_pkg::*;
 `ifdef RDMA_HOST_MEM_TEST
@@ -24,6 +25,7 @@ package rdma_unit_test_pkg;
   `include "unit/rdma_request_model_test.svh"
   `include "unit/rdma_adapter_contract_test.svh"
   `include "unit/rdma_resource_manager_test.svh"
+  `include "unit/rdma_codec_registry_test.svh"
   `include "unit/rdma_harness_expected_failure_probe.svh"
 endpackage
 
