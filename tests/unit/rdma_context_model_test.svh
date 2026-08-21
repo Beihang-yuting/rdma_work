@@ -138,6 +138,13 @@ class rdma_context_model_test extends uvm_test;
     qpc.signature_enable = 1'b1;
     qpc.tx_flow_control = 1'b1;
     qpc.rx_flow_control = 1'b0;
+    qpc.behavior.transport_version = 1;
+    qpc.behavior.migration_enable = 1'b1;
+    qpc.behavior.tx_endian_swap = 1'b1;
+    qpc.behavior.rx_endian_swap = 1'b1;
+    qpc.behavior.read_after_write_fence = 1'b1;
+    qpc.behavior.atomic_after_atomic_fence = 1'b1;
+    qpc.behavior.\priority = 5;
     rc_ext = rdma_qpc_rc_ext::type_id::create({name, "_rc_ext"});
     rc_ext.remote_qpn = 24'h654321;
     rc_ext.send_psn = 24'habcdef;
@@ -248,6 +255,8 @@ class rdma_context_model_test extends uvm_test;
     rdma_address_vector address_vector_clone;
     rdma_mr_page_layout mr_page_layout;
     rdma_mr_page_layout mr_page_layout_clone;
+    rdma_qpc_behavior behavior;
+    rdma_qpc_behavior behavior_clone;
     rdma_qpc_model qpc;
     rdma_qpc_model qpc_clone;
     rdma_cqc_model cqc;
@@ -272,6 +281,37 @@ class rdma_context_model_test extends uvm_test;
     if (!access.remote_write || dma_permission.device_write)
       `uvm_error("ACCESS_TYPES",
                  "RDMA rights leaked into PCIe DMA permission")
+
+    behavior = rdma_qpc_behavior::type_id::create("behavior");
+    if (behavior.transport_version != 0 || behavior.migration_enable != 1'b0 ||
+        behavior.tx_endian_swap != 1'b1 ||
+        behavior.rx_endian_swap != 1'b1 ||
+        behavior.read_after_write_fence != 1'b1 ||
+        behavior.atomic_after_atomic_fence != 1'b1 ||
+        behavior.\priority != 0)
+      `uvm_error("QPC_BEHAVIOR_DEFAULTS",
+                 "QPC behavior construction defaults are incorrect")
+    expect_ok("QPC_BEHAVIOR_VALID", behavior.validate());
+    if (behavior.describe() == "")
+      `uvm_error("QPC_BEHAVIOR_DESCRIBE", "QPC behavior description is empty")
+    cloned_object = behavior.clone();
+    if (!$cast(behavior_clone, cloned_object))
+      `uvm_error("QPC_BEHAVIOR_CLONE",
+                 "QPC behavior clone lost dynamic type")
+    else begin
+      behavior_clone.transport_version = 3;
+      behavior_clone.\priority = 7;
+      if (behavior.transport_version != 0 || behavior.\priority != 0)
+        `uvm_error("QPC_BEHAVIOR_CLONE",
+                   "QPC behavior clone mutation reached source")
+      expect_ok("QPC_BEHAVIOR_CLONE_VALID", behavior_clone.validate());
+      behavior_clone.transport_version = 4;
+      expect_invalid("QPC_BEHAVIOR_TVER_RANGE", behavior_clone.validate());
+      behavior_clone.transport_version = 3;
+      behavior_clone.\priority = 8;
+      expect_invalid("QPC_BEHAVIOR_PRIORITY_RANGE", behavior_clone.validate());
+      behavior_clone.\priority = 7;
+    end
 
     ring = make_ring("ring", 7, 1'b1);
     expect_ok("RING_VALID", ring.validate());
@@ -327,15 +367,19 @@ class rdma_context_model_test extends uvm_test;
     cloned_object = qpc.clone();
     if (!$cast(qpc_clone, cloned_object))
       `uvm_error("QPC_CLONE", "QPC clone lost dynamic type")
-    else if (qpc_clone.address_vector == null ||
+    else if (qpc_clone.behavior == null ||
+             qpc_clone.address_vector == null ||
+             qpc_clone.behavior == qpc.behavior ||
              qpc_clone.address_vector == qpc.address_vector ||
              qpc_clone.transport_ext == qpc.transport_ext ||
              qpc_clone.qp_h == qpc.qp_h)
       `uvm_error("QPC_CLONE", "QPC clone did not deep-copy nested values")
     else begin
+      qpc_clone.behavior.\priority = 6;
       qpc_clone.address_vector.destination_mac++;
       qpc_clone.qp_h.object_id++;
-      if (qpc.address_vector.destination_mac != 48'h02_11_22_33_44_55 ||
+      if (qpc.behavior.\priority != 5 ||
+          qpc.address_vector.destination_mac != 48'h02_11_22_33_44_55 ||
           qpc.qp_h.object_id != 32'h101)
         `uvm_error("QPC_CLONE", "QPC clone mutation reached source")
     end
@@ -434,6 +478,19 @@ class rdma_context_model_test extends uvm_test;
     qpc.context_backing.value += 64'h100;
     expect_invalid("CONTEXT_ALIGNMENT", qpc.validate());
     qpc.context_backing.value -= 64'h100;
+    behavior = qpc.behavior;
+    qpc.behavior = null;
+    expect_invalid("QPC_BEHAVIOR_NULL", qpc.validate());
+    qpc.behavior = behavior;
+    qpc.behavior.transport_version = 4;
+    expect_invalid("QPC_BEHAVIOR_TVER", qpc.validate());
+    qpc.behavior.transport_version = 1;
+    qpc.behavior.\priority = 8;
+    expect_invalid("QPC_BEHAVIOR_PRIORITY", qpc.validate());
+    qpc.behavior.\priority = 5;
+    qpc.tx_flow_control = 1'b1;
+    qpc.rx_flow_control = 1'b0;
+    expect_ok("QPC_ASYMMETRIC_FLOW_CONTROL", qpc.validate());
     srqc.srfq_backing.value += 64;
     expect_invalid("SRQC_QUEUE_ALIGNMENT", srqc.validate());
     srqc.srfq_backing.value -= 64;

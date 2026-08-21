@@ -869,6 +869,9 @@ class rdma_request_model_test extends uvm_test;
                  "identity/address wrapper separation was lost")
 
     qpc = rdma_qpc_model::type_id::create("qpc");
+    qpc.behavior.transport_version = 1;
+    qpc.behavior.migration_enable = 1'b1;
+    qpc.behavior.\priority = 5;
     qpc.transport = RDMA_TRANSPORT_RC;
     qpc.qp_h = qp_h;
     qpc.pd_h = pd_h;
@@ -897,9 +900,11 @@ class rdma_request_model_test extends uvm_test;
         qpc_clone.pd_h == null ||
         qpc_clone.send_cq_h == null ||
         qpc_clone.recv_cq_h == null ||
+        qpc_clone.behavior == null ||
         qpc_clone.transport_ext == null)
       `uvm_error("QPC_CLONE", "QPC clone lost nested objects")
-    else if (qpc_clone.transport_ext == qpc.transport_ext ||
+    else if (qpc_clone.behavior == qpc.behavior ||
+        qpc_clone.transport_ext == qpc.transport_ext ||
         qpc_clone.qp_h == qpc.qp_h ||
         qpc_clone.pd_h == qpc.pd_h ||
         qpc_clone.send_cq_h == qpc.send_cq_h ||
@@ -910,6 +915,9 @@ class rdma_request_model_test extends uvm_test;
         qpc_clone.sq_backing.value != 64'h6000_0000 ||
         qpc_clone.rq_backing.value != 64'h6001_0000 ||
         qpc_clone.context_backing.value != 64'h6002_0000 ||
+        qpc_clone.behavior.transport_version != 1 ||
+        qpc_clone.behavior.migration_enable != 1'b1 ||
+        qpc_clone.behavior.\priority != 5 ||
         qpc_clone.address_vector == qpc.address_vector)
       `uvm_error("QPC_CLONE", "QPC clone lost or aliased common fields")
     else if (!$cast(rc_ext_clone, qpc_clone.transport_ext))
@@ -922,10 +930,12 @@ class rdma_request_model_test extends uvm_test;
         rc_ext_clone.path_mtu_bytes != 4096)
       `uvm_error("QPC_CLONE", "QPC clone lost nested RC extension")
     else begin
+      qpc_clone.behavior.\priority = 6;
       qpc_clone.qp_h.object_id++;
       qpc_clone.sq_depth = 2048;
       rc_ext_clone.remote_qpn++;
-      if (qpc.qp_h.object_id != 32'h404 || qpc.sq_depth != 1024 ||
+      if (qpc.behavior.\priority != 5 ||
+          qpc.qp_h.object_id != 32'h404 || qpc.sq_depth != 1024 ||
           rc_ext.remote_qpn != 24'habc123)
         `uvm_error("QPC_CLONE", "QPC clone mutation reached source")
     end

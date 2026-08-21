@@ -132,6 +132,62 @@ function automatic rdma_mr_page_layout rdma_clone_mr_page_layout_value(
   return cloned_layout;
 endfunction
 
+class rdma_qpc_behavior extends uvm_object;
+  `uvm_object_utils(rdma_qpc_behavior)
+
+  int unsigned transport_version;
+  bit migration_enable;
+  bit tx_endian_swap;
+  bit rx_endian_swap;
+  bit read_after_write_fence;
+  bit atomic_after_atomic_fence;
+  int unsigned \priority ;
+
+  function new(string name = "rdma_qpc_behavior");
+    super.new(name);
+    transport_version = 0;
+    migration_enable = 1'b0;
+    tx_endian_swap = 1'b1;
+    rx_endian_swap = 1'b1;
+    read_after_write_fence = 1'b1;
+    atomic_after_atomic_fence = 1'b1;
+    \priority = 0;
+  endfunction
+
+  virtual function void do_copy(uvm_object rhs);
+    rdma_qpc_behavior rhs_behavior;
+
+    super.do_copy(rhs);
+    if (!$cast(rhs_behavior, rhs))
+      `uvm_fatal("RDMA_COPY_TYPE", "QPC behavior copy mismatch")
+    transport_version = rhs_behavior.transport_version;
+    migration_enable = rhs_behavior.migration_enable;
+    tx_endian_swap = rhs_behavior.tx_endian_swap;
+    rx_endian_swap = rhs_behavior.rx_endian_swap;
+    read_after_write_fence = rhs_behavior.read_after_write_fence;
+    atomic_after_atomic_fence = rhs_behavior.atomic_after_atomic_fence;
+    \priority = rhs_behavior.\priority ;
+  endfunction
+
+  virtual function rdma_status validate();
+    if (transport_version > 3)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "QPC transport version exceeds 3");
+    if (\priority > 7)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "QPC priority exceeds 7");
+    return rdma_status::success();
+  endfunction
+
+  virtual function string describe();
+    return $sformatf(
+      "Behavior(tver=%0d migration=%0b tx_swap=%0b rx_swap=%0b ra_fence=%0b atomic_fence=%0b priority=%0d)",
+      transport_version, migration_enable, tx_endian_swap, rx_endian_swap,
+      read_after_write_fence, atomic_after_atomic_fence, \priority
+    );
+  endfunction
+endclass
+
 virtual class rdma_qpc_transport_ext extends uvm_object;
   function new(string name = "rdma_qpc_transport_ext");
     super.new(name);
@@ -326,6 +382,7 @@ class rdma_qpc_model extends rdma_hw_model;
   bit signature_enable;
   bit tx_flow_control;
   bit rx_flow_control;
+  rdma_qpc_behavior behavior;
   rdma_qpc_transport_ext transport_ext;
 
   function new(string name = "rdma_qpc_model");
@@ -354,6 +411,7 @@ class rdma_qpc_model extends rdma_hw_model;
     signature_enable = 1'b0;
     tx_flow_control = 1'b0;
     rx_flow_control = 1'b0;
+    behavior = rdma_qpc_behavior::type_id::create("behavior");
     transport_ext = null;
   endfunction
 
@@ -390,6 +448,14 @@ class rdma_qpc_model extends rdma_hw_model;
     signature_enable = rhs_qpc.signature_enable;
     tx_flow_control = rhs_qpc.tx_flow_control;
     rx_flow_control = rhs_qpc.rx_flow_control;
+    if (rhs_qpc.behavior == null) begin
+      behavior = null;
+    end
+    else begin
+      cloned_object = rhs_qpc.behavior.clone();
+      if (cloned_object == null || !$cast(behavior, cloned_object))
+        `uvm_fatal("RDMA_COPY_TYPE", "QPC behavior clone mismatch")
+    end
     if (rhs_qpc.transport_ext == null) begin
       transport_ext = null;
     end
@@ -406,6 +472,11 @@ class rdma_qpc_model extends rdma_hw_model;
     rdma_qpc_ud_ext ud_ext;
     rdma_qpc_urc_ext urc_ext;
 
+    if (behavior == null)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "QPC behavior is null");
+    status = behavior.validate();
+    if (!status.ok()) return status;
     status = rdma_context_handle_status(qp_h, RDMA_RESOURCE_QP, 21,
                                         "QPC QP");
     if (!status.ok()) return status;
@@ -483,12 +554,16 @@ class rdma_qpc_model extends rdma_hw_model;
   endfunction
 
   virtual function string describe();
+    string behavior_text;
     string extension_text;
 
+    behavior_text = (behavior == null) ? "null" : behavior.describe();
     extension_text = (transport_ext == null) ? "null"
                                              : transport_ext.describe();
-    return $sformatf("QPC(transport=%s sq_depth=%0d rq_depth=%0d %s)",
-                     transport.name(), sq_depth, rq_depth, extension_text);
+    return $sformatf(
+      "QPC(transport=%s sq_depth=%0d rq_depth=%0d behavior=%s ext=%s)",
+      transport.name(), sq_depth, rq_depth, behavior_text, extension_text
+    );
   endfunction
 endclass
 
