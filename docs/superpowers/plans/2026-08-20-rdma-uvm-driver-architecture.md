@@ -54,6 +54,7 @@ rdma_work/
 │   │   ├── rdma_function_binding.svh
 │   │   ├── rdma_semantic_requests.svh
 │   │   ├── rdma_resources.svh
+│   │   ├── rdma_context_layouts.svh
 │   │   ├── rdma_context_models.svh
 │   │   └── rdma_queue_models.svh
 │   ├── adapter/
@@ -69,7 +70,10 @@ rdma_work/
 │   │   ├── rdma_bit_packer.svh
 │   │   └── xtr_v1/
 │   │       ├── rdma_xtr_v1_defs.svh
-│   │       ├── rdma_xtr_v1_context_codecs.svh
+│   │       ├── rdma_xtr_v1_image_masks.svh
+│   │       ├── rdma_xtr_v1_qword_codec.svh
+│   │       ├── rdma_xtr_v1_qpc_codecs.svh
+│   │       ├── rdma_xtr_v1_context_body_codecs.svh
 │   │       ├── rdma_xtr_v1_cmq_codecs.svh
 │   │       ├── rdma_xtr_v1_queue_codecs.svh
 │   │       ├── rdma_xtr_v1_doorbell_codecs.svh
@@ -935,120 +939,27 @@ git add src/codec/xtr_v1/rdma_xtr_v1_defs.svh hw tools docs/hw sim/Makefile test
 git commit -m "feat: freeze xtr_v1 RDMA hardware definitions"
 ```
 
-### Task 10: 实现 QPC/CQC/MRT/SRQC/EQC codec
+### Tasks 9.5-11: 实现 xtr_v1 context/body ABI 与 CMQ 合成
 
-**Files:**
-- Create: `src/codec/xtr_v1/rdma_xtr_v1_context_codecs.svh`
-- Modify: `src/codec/rdma_codec_pkg.sv`
-- Create: `tests/unit/rdma_xtr_v1_context_codec_test.svh`
-- Modify: `tests/rdma_unit_test_pkg.sv`
+Task 9 的扩展冻结、原 Task 10 和原 Task 11 已拆分到独立的可执行计划：
 
-- [ ] **Step 1: 为每种 context 写 golden encode/decode 和非法字段测试**
+`docs/superpowers/plans/2026-08-21-xtr-v1-context-body-abi.md`
 
-```systemverilog
-foreach (golden_cases[i]) begin
-  s = registry.lookup(golden_cases[i].key, codec);
-  s = codec.encode(golden_cases[i].model, image);
-  if (!s.ok() || image.bytes != golden_cases[i].bytes)
-    `uvm_error("CTX_ENC", golden_cases[i].name)
-  s = codec.decode(image, decoded);
-  if (!s.ok() || !golden_cases[i].model.semantic_equal(decoded))
-    `uvm_error("CTX_DEC", golden_cases[i].name)
-end
-```
+该计划是这部分实现的唯一权威入口，并按以下顺序执行：
 
-case 必须包含 RC/UD/URC QPC、CQC、MRT、SRQC、CEQC、AEQC；每类至少一个全边界值
-case 和一个 reserved-bit/对齐错误 case。
+1. Task 9.5：扩展 checker、固定驱动 manifest、定义、ownership mask 和 11 个 golden；
+2. Task 10A：重构硬件中立 context/layout model；
+3. Task 10B：实现 logical-qword 与 big-endian 两阶段 helper；
+4. Task 10C：实现 RC/UD/URC 独立 512B QPC codec；
+5. Task 10D：实现 CQC/MRT/SRQC/CEQC/AEQC 的 64B sparse body codec；
+6. Task 11A：实现 CMQ envelope、opcode/body registry 和受检查合成；
+7. Task 11B：实现 completion 与硬件 error-code decode；
+8. Task 11C：完成端到端回归和交付审计。
 
-- [ ] **Step 2: 在 53 上确认 codec lookup 失败**
-
-Run: `scripts/run_vcs53.sh core rdma_xtr_v1_context_codec_test`
-
-Expected: FAIL，首个 registry lookup 返回 `RDMA_SC_UNSUPPORTED_OPCODE`。
-
-- [ ] **Step 3: 实现公共 QPC 头加 transport extension 的 codec**
-
-每个 codec 先 `validate_model()`，用 `rdma_bit_packer` 写固定长度 image，再
-`validate_image()` 检查 reserved bit。QPC common codec 只处理 host/vf/qpn/pd/state/
-queue base 等公共字段，RC/UD/URC extension 各自处理专有字段；禁止用一个 512-byte
-case statement 混合三种 transport。所有 context codec 注册到 `xtr_v1` key。
-
-- [ ] **Step 4: 在 53 上运行 context codec 测试**
-
-Run: `scripts/run_vcs53.sh core rdma_xtr_v1_context_codec_test`
-
-Expected: PASS；所有 golden vector byte-for-byte 相等且 round-trip 通过。
-
-- [ ] **Step 5: 提交 context codec**
-
-```bash
-git add src/codec tests
-git commit -m "feat: encode xtr_v1 RDMA contexts"
-```
-
-### Task 11: 实现多 opcode CMQ codec 和硬件错误码解释
-
-**Files:**
-- Create: `src/codec/xtr_v1/rdma_xtr_v1_cmq_codecs.svh`
-- Create: `src/codec/xtr_v1/rdma_xtr_v1_error_codec.svh`
-- Modify: `src/codec/rdma_codec_pkg.sv`
-- Create: `tests/unit/rdma_xtr_v1_cmq_codec_test.svh`
-- Create: `tests/unit/rdma_xtr_v1_error_codec_test.svh`
-- Modify: `tests/rdma_unit_test_pkg.sv`
-
-- [ ] **Step 1: 写 CMQE 公共头、多 opcode、completion 和未知 error 测试**
-
-```systemverilog
-foreach (supported_ops[i]) begin
-  req.opcode = supported_ops[i];
-  s = cmq_registry.encode_request(req, image);
-  if (!s.ok() || image.bytes.size() != 64)
-    `uvm_error("CMQ", $sformatf("opcode %0h", req.opcode))
-end
-req.opcode = 8'hff;
-if (cmq_registry.encode_request(req, image).code != RDMA_SC_UNSUPPORTED_OPCODE)
-  `uvm_error("CMQ", "unknown opcode encoded")
-s = error_codec.decode_status(8'he7, RDMA_ENGINE_CQ, status);
-if (status.code != RDMA_SC_UNKNOWN_HW_ERROR || status.hardware_code != 8'he7)
-  `uvm_error("ECODE", "unknown code lost")
-```
-
-- [ ] **Step 2: 在 53 上确认 CMQ codec 未注册**
-
-Run:
-
-```bash
-scripts/run_vcs53.sh core rdma_xtr_v1_cmq_codec_test
-scripts/run_vcs53.sh core rdma_xtr_v1_error_codec_test
-```
-
-Expected: 两个 test FAIL，分别为 codec miss 和 error codec 未定义。
-
-- [ ] **Step 3: 实现 CMQE 公共头与 opcode 专用 body**
-
-CMQE 固定 64 bytes。公共头编码 valid、VF override/use_vfid、wrap、WQE index、opcode；
-body codec 覆盖本阶段确定范围的 QPC/CQC/CEQC/AEQC/SRFQC、MR 和 flush 命令。
-completion decode 提取 opcode、command error code、WQE index/wrap 和命令专用返回字段。
-error codec 根据 `defs.h` 和 `wr.h` 归类 QP/CQ/SRQ/DMA/flush/remote error；原始 8-bit
-ecode 总是保留。
-
-- [ ] **Step 4: 在 53 上运行 CMQ 和 error codec 测试**
-
-Run:
-
-```bash
-scripts/run_vcs53.sh core rdma_xtr_v1_cmq_codec_test
-scripts/run_vcs53.sh core rdma_xtr_v1_error_codec_test
-```
-
-Expected: PASS；支持 opcode 生成 64 bytes，未知 opcode/code 均返回确定状态。
-
-- [ ] **Step 5: 提交 CMQ codec**
-
-```bash
-git add src/codec tests
-git commit -m "feat: encode xtr_v1 CMQ commands and errors"
-```
+边界固定为：只有 QPC 是独立 context；CQC/MRT/SRQC/CEQC/AEQC 是最终 CMQ WQE 坐标
+下的 sparse body，不能单独下发。Task 10 不拥有 `opcode/index/wrap/valid/use-vfid`；
+Task 11 不能重新解释 Task 10 字段。普通 MR 路径使用 `KEY_ALLOC(0x04)`，并与
+`MR_REGISTER(0x05)` 使用不同 body mask 和 registry key。
 
 ### Task 12: 实现所有 doorbell codec 和顺序调度器
 
