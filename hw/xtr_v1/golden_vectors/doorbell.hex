@@ -1,0 +1,17 @@
+# xtr_v1-golden-v1
+# case: cmq_sq
+# inputs: pi=27,polarity=1,offset=0x0
+# bytes: 8
+00 00 00 3b 00 00 00 00
+
+# xtr_v1-golden-v1
+# case: rq
+# inputs: qpn=0x15555,icos=5,pi=0x4567,wrap=1,offset=0x10
+# bytes: 8
+00 00 c5 67 00 a1 55 55
+
+# xtr_v1-golden-v1
+# case: cq
+# inputs: cqn=0x15555,host=5,ci=0x654321,wrap=1,arm=1,offset=0x18
+# bytes: 8
+2b 00 e5 43 21 a1 55 55

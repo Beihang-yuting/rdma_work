@@ -1,0 +1,29 @@
+# xtr_v1-golden-v1
+# case: sqe_rc_boundary
+# inputs: qpn=0x15555,opcode=13,index=0x4567,rkey=0xdeadbeef
+# bytes: 64
+cb c5 67 bd a6 a1 55 55 00 00 00 00 00 00 00 00 c7 04 00 00 de ad be ef 01 23 45 67 89 ab cd ef 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+
+# xtr_v1-golden-v1
+# case: rqe_boundary
+# inputs: qpn=0xabcde,index=0x3456,payload=0x10203040
+# bytes: 64
+80 b4 56 09 5a 0a bc de 00 00 00 00 10 20 30 40 96 02 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+
+# xtr_v1-golden-v1
+# case: cqe_error
+# inputs: qpn=0x2aaaa,index=0x4567,ecode=0xf4,payload=0x10203040
+# bytes: 64
+88 c5 67 9a f4 02 aa aa 89 ab cd ef 10 20 30 40 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+
+# xtr_v1-golden-v1
+# case: ceqe_error
+# inputs: qpn=0x15555,cqn=0x1aaaaa,ecode=0xf4,pi=0xbeef
+# bytes: 16
+81 55 55 1a aa aa f4 9a 00 00 00 00 00 80 be ef
+
+# xtr_v1-golden-v1
+# case: aeqe_error
+# inputs: qpn=0x2aaaa,state=5,ecode=0xff,index=0x654321
+# bytes: 16
+d0 00 00 81 ff 02 aa aa 00 e5 43 21 00 00 00 00

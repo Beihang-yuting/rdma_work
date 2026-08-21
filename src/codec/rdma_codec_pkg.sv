@@ -3,6 +3,7 @@ package rdma_codec_pkg;
   import rdma_types_pkg::*;
   import rdma_model_pkg::*;
   `include "uvm_macros.svh"
+  `include "xtr_v1/rdma_xtr_v1_defs.svh"
 
   typedef struct {
     string hw_version;
