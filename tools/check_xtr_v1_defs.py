@@ -112,9 +112,9 @@ FIELD_MAPPINGS = (
     FieldMapping("qp.h", "XTRDMA_QPC_ECN", "XTR_V1_QPC_ECN", 72),
     FieldMapping("qp.h", "XTRDMA_QPC_HOPLIMIT", "XTR_V1_QPC_HOPLIMIT", 72),
     FieldMapping("qp.h", "XTRDMA_QPC_CUR_UDP_SPORT", "XTR_V1_QPC_CUR_UDP_SPORT", 72),
-    FieldMapping("qp.h", "XTRDMA_QPC_SQ_PD_PBA_OR_PBA", "XTR_V1_QPC_SQ_PBA", 416),
-    FieldMapping("qp.h", "XTRDMA_QPC_SQ_SIZE", "XTR_V1_QPC_SQ_SIZE", 416),
-    FieldMapping("qp.h", "XTRDMA_QPC_SQ_OM", "XTR_V1_QPC_SQ_OM", 416),
+    FieldMapping("qp.h", "XTRDMA_QPC_SQ_PD_PBA_OR_PBA", "XTR_V1_QPC_SQ_PBA", 216),
+    FieldMapping("qp.h", "XTRDMA_QPC_SQ_SIZE", "XTR_V1_QPC_SQ_SIZE", 216),
+    FieldMapping("qp.h", "XTRDMA_QPC_SQ_OM", "XTR_V1_QPC_SQ_OM", 216),
     FieldMapping("qp.h", "XTRDMA_QPC_SQ_CQN", "XTR_V1_QPC_SQ_CQN", 448),
     FieldMapping("qp.h", "XTRDMA_QPC_RQ_CQN", "XTR_V1_QPC_RQ_CQN", 448),
     FieldMapping("qp.h", "XTRDMA_QPC_LOAD_RQ_PI_TH", "XTR_V1_QPC_LOAD_RQ_PI_TH", 480),
@@ -438,6 +438,8 @@ def _install_reference_widths() -> None:
         "XTRDMA_QPC_TX_ENDIAN_SWAP": (6, 1), "XTRDMA_QPC_RX_ENDIAN_SWAP": (5, 1),
         "XTRDMA_QPC_QP_ST": (56, 3), "XTRDMA_QPC_PMTU": (48, 3),
         "XTRDMA_QPC_QP_SN": (32, 8), "XTRDMA_QPC_PD_IDX": (0, 16),
+        "XTRDMA_QPC_SQ_PD_PBA_OR_PBA": (12, 52),
+        "XTRDMA_QPC_SQ_SIZE": (8, 4), "XTRDMA_QPC_SQ_OM": (6, 2),
         "XTRDMA_CMQ_CQC_CQ_SD_PBA": (0, 52), "XTRDMA_CMQ_CQC_CQ_SIZE": (56, 5),
         "XTRDMA_CMQ_CQC_URC_FLAG": (61, 1), "XTRDMA_CMQ_CQC_CQ_ST": (62, 2),
         "XTRDMA_CMQSQ_WQE_VALID": (63, 1), "XTRDMA_CMQSQ_VFID_OVERRIDE": (59, 1),
@@ -492,125 +494,161 @@ _install_reference_widths()
 
 
 def build_golden_cases() -> dict[str, list[GoldenCase]]:
-    qpc = bytearray(512)
-    for stem, value in (
-        ("XTR_V1_QPC_TVER", 2), ("XTR_V1_QPC_MIG", 1),
-        ("XTR_V1_QPC_SERVICE_TYPE", 3), ("XTR_V1_QPC_HOST_ID", 5),
-        ("XTR_V1_QPC_VF_ID", 0xABC), ("XTR_V1_QPC_ICOS", 5),
-        ("XTR_V1_QPC_QPN", 0x15555), ("XTR_V1_QPC_STAT_IDX", 0xA5),
-        ("XTR_V1_QPC_UD_QKEY_H", 0x5A), ("XTR_V1_QPC_PKEY", 0xBEEF),
-        ("XTR_V1_QPC_TX_ENDIAN_SWAP", 1), ("XTR_V1_QPC_RX_ENDIAN_SWAP", 1),
-        ("XTR_V1_QPC_QP_ST", 5), ("XTR_V1_QPC_PMTU", 6),
-        ("XTR_V1_QPC_QP_SN", 0xC3), ("XTR_V1_QPC_PD_IDX", 0xA55A),
-    ):
-        put_named(qpc, stem, value)
+    def make_case(name: str, byte_count: int, inputs) -> GoldenCase:
+        image = bytearray(byte_count)
+        for stem, value, _ in inputs:
+            if stem:
+                put_named(image, stem, value)
+        summary = ",".join(summary_part for _, _, summary_part in inputs)
+        return GoldenCase(name, summary, bytes(image))
 
-    cqc = bytearray(64)
-    for stem, value in (
-        ("XTR_V1_CQC_CQ_SD_PBA", 0x123456789ABCD),
-        ("XTR_V1_CQC_CQ_SIZE", 0x1B), ("XTR_V1_CQC_URC_FLAG", 1),
-        ("XTR_V1_CQC_CQ_ST", 2),
-    ):
-        put_named(cqc, stem, value)
+    qpc = make_case("qpc_common_boundary", 512, (
+        ("XTR_V1_QPC_TVER", 2, "tver=2"),
+        ("XTR_V1_QPC_MIG", 1, "mig=1"),
+        ("XTR_V1_QPC_SERVICE_TYPE", 3, "service=ud"),
+        ("XTR_V1_QPC_HOST_ID", 5, "host=5"),
+        ("XTR_V1_QPC_VF_ID", 0xABC, "vf=0xabc"),
+        ("XTR_V1_QPC_ICOS", 5, "icos=5"),
+        ("XTR_V1_QPC_QPN", 0x15555, "qpn=0x15555"),
+        ("XTR_V1_QPC_STAT_IDX", 0xA5, "stat_idx=0xa5"),
+        ("XTR_V1_QPC_UD_QKEY_H", 0x5A, "ud_qkey_h=0x5a"),
+        ("XTR_V1_QPC_PKEY", 0xBEEF, "pkey=0xbeef"),
+        ("XTR_V1_QPC_TX_ENDIAN_SWAP", 1, "tx_endian_swap=1"),
+        ("XTR_V1_QPC_RX_ENDIAN_SWAP", 1, "rx_endian_swap=1"),
+        ("XTR_V1_QPC_QP_ST", 5, "qp_state=5"),
+        ("XTR_V1_QPC_PMTU", 6, "pmtu=6"),
+        ("XTR_V1_QPC_QP_SN", 0xC3, "qp_sn=0xc3"),
+        ("XTR_V1_QPC_PD_IDX", 0xA55A, "pd_idx=0xa55a"),
+        ("XTR_V1_QPC_SQ_PBA", 0x123456789ABCD, "sq_pba=0x123456789abcd"),
+        ("XTR_V1_QPC_SQ_SIZE", 0xB, "sq_size=11"),
+        ("XTR_V1_QPC_SQ_OM", 2, "sq_om=2"),
+    ))
 
-    cmq = bytearray(64)
-    for stem, value in (
-        ("XTR_V1_CMQ_VALID", 1), ("XTR_V1_CMQ_VFID_OVERRIDE", 1),
-        ("XTR_V1_CMQ_USE_VFID", 0x345), ("XTR_V1_CMQ_WRAP", 1),
-        ("XTR_V1_CMQ_WQE_INDEX", 0x1B), ("XTR_V1_CMQ_OPCODE", 0),
-        ("XTR_V1_CMQ_QPN", 0x654321), ("XTR_V1_CMQ_SQ_CQN", 0x15555),
-        ("XTR_V1_CMQ_SIGN_EN", 1), ("XTR_V1_CMQ_RQ_CQN", 0x0AAAA),
-        ("XTR_V1_CMQ_QPC_BUFFER_ADDR", 0x123456789AB),
-    ):
-        put_named(cmq, stem, value)
+    cqc = make_case("cqc_boundary", 64, (
+        ("XTR_V1_CQC_CQ_SD_PBA", 0x123456789ABCD, "sd_pba=0x123456789abcd"),
+        ("XTR_V1_CQC_CQ_SIZE", 0x1B, "size=27"),
+        ("XTR_V1_CQC_URC_FLAG", 1, "urc=1"),
+        ("XTR_V1_CQC_CQ_ST", 2, "state=2"),
+    ))
 
-    sqe = bytearray(64)
-    for stem, value in (
-        ("XTR_V1_SQ_WQE_QPN", 0x15555), ("XTR_V1_SQ_WQE_ICOS", 5),
-        ("XTR_V1_SQ_WQE_QP_SN", 0xA6), ("XTR_V1_SQ_WQE_OPCODE", 0xD),
-        ("XTR_V1_SQ_WQE_DST_PORT", 0xB), ("XTR_V1_SQ_WQE_INDEX", 0x4567),
-        ("XTR_V1_SQ_WQE_WRAP", 1), ("XTR_V1_SQ_WQE_SIGN_EN", 1),
-        ("XTR_V1_SQ_WQE_SE", 1), ("XTR_V1_SQ_WQE_FENCE", 2),
-        ("XTR_V1_SQ_WQE_CE", 2), ("XTR_V1_SQ_WQE_VALID", 1),
-        ("XTR_V1_SQ_WQE_SIGNATURE", 0xC7), ("XTR_V1_SQ_WQE_RC_SGE_NUM", 4),
-        ("XTR_V1_SQ_WQE_RC_REMOTE_KEY", 0xDEADBEEF),
-        ("XTR_V1_SQ_WQE_RC_REMOTE_VA", 0x0123456789ABCDEF),
-    ):
-        put_named(sqe, stem, value)
+    cmq = make_case("qpc_create", 64, (
+        ("XTR_V1_CMQ_OPCODE", 0, "opcode=0"),
+        ("XTR_V1_CMQ_QPN", 0x654321, "qpn=0x654321"),
+        ("XTR_V1_CMQ_WQE_INDEX", 0x1B, "index=27"),
+        ("XTR_V1_CMQ_VALID", 1, "valid=1"),
+        ("XTR_V1_CMQ_VFID_OVERRIDE", 1, "vfid_override=1"),
+        ("XTR_V1_CMQ_USE_VFID", 0x345, "use_vfid=0x345"),
+        ("XTR_V1_CMQ_WRAP", 1, "wrap=1"),
+        ("XTR_V1_CMQ_SQ_CQN", 0x15555, "sq_cqn=0x15555"),
+        ("XTR_V1_CMQ_SIGN_EN", 1, "sign=1"),
+        ("XTR_V1_CMQ_RQ_CQN", 0x0AAAA, "rq_cqn=0xaaaa"),
+        ("XTR_V1_CMQ_QPC_BUFFER_ADDR", 0x123456789AB, "buffer=0x123456789ab"),
+    ))
 
-    rqe = bytearray(64)
-    for stem, value in (
-        ("XTR_V1_RQE_QPN", 0xABCDE), ("XTR_V1_RQE_QP_SN", 0x5A),
-        ("XTR_V1_RQE_OPCODE", 9), ("XTR_V1_RQE_INDEX", 0x3456),
-        ("XTR_V1_RQE_WRAP", 1), ("XTR_V1_RQE_VALID", 1),
-        ("XTR_V1_RQE_PAYLOAD_LEN", 0x10203040),
-        ("XTR_V1_RQE_SIGNATURE", 0x96), ("XTR_V1_RQE_SGE_NUM", 2),
-    ):
-        put_named(rqe, stem, value)
+    sqe = make_case("sqe_rc_boundary", 64, (
+        ("XTR_V1_SQ_WQE_QPN", 0x15555, "qpn=0x15555"),
+        ("XTR_V1_SQ_WQE_OPCODE", 0xD, "opcode=13"),
+        ("XTR_V1_SQ_WQE_INDEX", 0x4567, "index=0x4567"),
+        ("XTR_V1_SQ_WQE_RC_REMOTE_KEY", 0xDEADBEEF, "rkey=0xdeadbeef"),
+        ("XTR_V1_SQ_WQE_ICOS", 5, "icos=5"),
+        ("XTR_V1_SQ_WQE_QP_SN", 0xA6, "qp_sn=0xa6"),
+        ("XTR_V1_SQ_WQE_DST_PORT", 0xB, "dst_port=11"),
+        ("XTR_V1_SQ_WQE_WRAP", 1, "wrap=1"),
+        ("XTR_V1_SQ_WQE_SIGN_EN", 1, "sign=1"),
+        ("XTR_V1_SQ_WQE_SE", 1, "se=1"),
+        ("XTR_V1_SQ_WQE_FENCE", 2, "fence=2"),
+        ("XTR_V1_SQ_WQE_CE", 2, "ce=2"),
+        ("XTR_V1_SQ_WQE_VALID", 1, "valid=1"),
+        ("XTR_V1_SQ_WQE_SIGNATURE", 0xC7, "signature=0xc7"),
+        ("XTR_V1_SQ_WQE_RC_SGE_NUM", 4, "sge_num=4"),
+        ("XTR_V1_SQ_WQE_RC_REMOTE_VA", 0x0123456789ABCDEF,
+         "remote_va=0x0123456789abcdef"),
+    ))
 
-    cqe = bytearray(64)
-    for stem, value in (
-        ("XTR_V1_CQE_POLARITY", 1), ("XTR_V1_CQE_RQ_CQE", 1),
-        ("XTR_V1_CQE_WQE_WRAP", 1), ("XTR_V1_CQE_WQE_INDEX", 0x4567),
-        ("XTR_V1_CQE_PKT_OPCODE", 0x9A), ("XTR_V1_CQE_ECODE", 0xF4),
-        ("XTR_V1_CQE_QPN", 0x2AAAA), ("XTR_V1_CQE_IMMDT_DATA", 0x89ABCDEF),
-        ("XTR_V1_CQE_PAYLOAD_LEN", 0x10203040),
-    ):
-        put_named(cqe, stem, value)
+    rqe = make_case("rqe_boundary", 64, (
+        ("XTR_V1_RQE_QPN", 0xABCDE, "qpn=0xabcde"),
+        ("XTR_V1_RQE_INDEX", 0x3456, "index=0x3456"),
+        ("XTR_V1_RQE_PAYLOAD_LEN", 0x10203040, "payload=0x10203040"),
+        ("XTR_V1_RQE_QP_SN", 0x5A, "qp_sn=0x5a"),
+        ("XTR_V1_RQE_OPCODE", 9, "opcode=9"),
+        ("XTR_V1_RQE_WRAP", 1, "wrap=1"),
+        ("XTR_V1_RQE_VALID", 1, "valid=1"),
+        ("XTR_V1_RQE_SIGNATURE", 0x96, "signature=0x96"),
+        ("XTR_V1_RQE_SGE_NUM", 2, "sge_num=2"),
+    ))
 
-    ceqe = bytearray(16)
-    for stem, value in (
-        ("XTR_V1_CEQE_VALID", 1), ("XTR_V1_CEQE_QPN", 0x15555),
-        ("XTR_V1_CEQE_CQN", 0x1AAAAA), ("XTR_V1_CEQE_ECODE", 0xF4),
-        ("XTR_V1_CEQE_PKT_OPCODE", 0x9A), ("XTR_V1_CEQE_CQ_PI_WRAP", 1),
-        ("XTR_V1_CEQE_CQ_PI", 0xBEEF),
-    ):
-        put_named(ceqe, stem, value)
+    cqe = make_case("cqe_error", 64, (
+        ("XTR_V1_CQE_QPN", 0x2AAAA, "qpn=0x2aaaa"),
+        ("XTR_V1_CQE_WQE_INDEX", 0x4567, "index=0x4567"),
+        ("XTR_V1_CQE_ECODE", 0xF4, "ecode=0xf4"),
+        ("XTR_V1_CQE_PAYLOAD_LEN", 0x10203040, "payload=0x10203040"),
+        ("XTR_V1_CQE_POLARITY", 1, "polarity=1"),
+        ("XTR_V1_CQE_RQ_CQE", 1, "rq_cqe=1"),
+        ("XTR_V1_CQE_WQE_WRAP", 1, "wrap=1"),
+        ("XTR_V1_CQE_PKT_OPCODE", 0x9A, "packet_opcode=0x9a"),
+        ("XTR_V1_CQE_IMMDT_DATA", 0x89ABCDEF, "immediate=0x89abcdef"),
+    ))
 
-    aeqe = bytearray(16)
-    for stem, value in (
-        ("XTR_V1_AEQE_VALID", 1), ("XTR_V1_AEQE_QP_ST", 5),
-        ("XTR_V1_AEQE_PKT_OPCODE", 0x81), ("XTR_V1_AEQE_ECODE", 0xFF),
-        ("XTR_V1_AEQE_QPN", 0x2AAAA), ("XTR_V1_AEQE_WQE_WRAP", 1),
-        ("XTR_V1_AEQE_WQE_INDEX", 0x654321),
-    ):
-        put_named(aeqe, stem, value)
+    ceqe = make_case("ceqe_error", 16, (
+        ("XTR_V1_CEQE_QPN", 0x15555, "qpn=0x15555"),
+        ("XTR_V1_CEQE_CQN", 0x1AAAAA, "cqn=0x1aaaaa"),
+        ("XTR_V1_CEQE_ECODE", 0xF4, "ecode=0xf4"),
+        ("XTR_V1_CEQE_CQ_PI", 0xBEEF, "pi=0xbeef"),
+        ("XTR_V1_CEQE_VALID", 1, "valid=1"),
+        ("XTR_V1_CEQE_PKT_OPCODE", 0x9A, "packet_opcode=0x9a"),
+        ("XTR_V1_CEQE_CQ_PI_WRAP", 1, "wrap=1"),
+    ))
 
-    cmq_db = bytearray(8)
-    put_named(cmq_db, "XTR_V1_CMQ_DB_PI", 0x1B)
-    put_named(cmq_db, "XTR_V1_CMQ_DB_POLARITY", 1)
-    rq_db = bytearray(8)
-    for stem, value in (
-        ("XTR_V1_NOTIFY_RQ_PI_WRAP", 1), ("XTR_V1_NOTIFY_RQ_PI", 0x4567),
-        ("XTR_V1_NOTIFY_RQ_ICOS", 5), ("XTR_V1_NOTIFY_RQ_QPN", 0x15555),
-    ):
-        put_named(rq_db, stem, value)
-    cq_db = bytearray(8)
-    for stem, value in (
-        ("XTR_V1_NOTIFY_CQ_ARM", 1), ("XTR_V1_NOTIFY_CQ_ARM_ST", 2),
-        ("XTR_V1_NOTIFY_CQ_ARM_SN", 3), ("XTR_V1_NOTIFY_CQ_CI_WRAP", 1),
-        ("XTR_V1_NOTIFY_CQ_CI", 0x654321), ("XTR_V1_NOTIFY_CQ_HOST_ID", 5),
-        ("XTR_V1_NOTIFY_CQ_CQN", 0x15555),
-    ):
-        put_named(cq_db, stem, value)
+    aeqe = make_case("aeqe_error", 16, (
+        ("XTR_V1_AEQE_QPN", 0x2AAAA, "qpn=0x2aaaa"),
+        ("XTR_V1_AEQE_QP_ST", 5, "state=5"),
+        ("XTR_V1_AEQE_ECODE", 0xFF, "ecode=0xff"),
+        ("XTR_V1_AEQE_WQE_INDEX", 0x654321, "index=0x654321"),
+        ("XTR_V1_AEQE_VALID", 1, "valid=1"),
+        ("XTR_V1_AEQE_PKT_OPCODE", 0x81, "packet_opcode=0x81"),
+        ("XTR_V1_AEQE_WQE_WRAP", 1, "wrap=1"),
+    ))
+
+    cmq_db = make_case("cmq_sq", 8, (
+        ("XTR_V1_CMQ_DB_PI", 0x1B, "pi=27"),
+        ("XTR_V1_CMQ_DB_POLARITY", 1, "polarity=1"),
+        ("", 0, "offset=0x0"),
+    ))
+    rq_db = make_case("rq", 8, (
+        ("XTR_V1_NOTIFY_RQ_QPN", 0x15555, "qpn=0x15555"),
+        ("XTR_V1_NOTIFY_RQ_ICOS", 5, "icos=5"),
+        ("XTR_V1_NOTIFY_RQ_PI", 0x4567, "pi=0x4567"),
+        ("XTR_V1_NOTIFY_RQ_PI_WRAP", 1, "wrap=1"),
+        ("", 0, "offset=0x10"),
+    ))
+    cq_db = make_case("cq", 8, (
+        ("XTR_V1_NOTIFY_CQ_CQN", 0x15555, "cqn=0x15555"),
+        ("XTR_V1_NOTIFY_CQ_HOST_ID", 5, "host=5"),
+        ("XTR_V1_NOTIFY_CQ_CI", 0x654321, "ci=0x654321"),
+        ("XTR_V1_NOTIFY_CQ_CI_WRAP", 1, "wrap=1"),
+        ("XTR_V1_NOTIFY_CQ_ARM", 1, "arm=1"),
+        ("XTR_V1_NOTIFY_CQ_ARM_ST", 2, "arm_state=2"),
+        ("XTR_V1_NOTIFY_CQ_ARM_SN", 3, "arm_sn=3"),
+        ("", 0, "offset=0x18"),
+    ))
 
     return {
         "context": [
-            GoldenCase("qpc_common_boundary", "tver=2,mig=1,service=ud,host=5,vf=0xabc,icos=5,qpn=0x15555", bytes(qpc)),
-            GoldenCase("cqc_boundary", "sd_pba=0x123456789abcd,size=27,urc=1,state=2", bytes(cqc)),
+            qpc,
+            cqc,
         ],
-        "cmq": [GoldenCase("qpc_create", "opcode=0,qpn=0x654321,index=27,valid=1,buffer=0x123456789ab", bytes(cmq))],
+        "cmq": [cmq],
         "queue": [
-            GoldenCase("sqe_rc_boundary", "qpn=0x15555,opcode=13,index=0x4567,rkey=0xdeadbeef", bytes(sqe)),
-            GoldenCase("rqe_boundary", "qpn=0xabcde,index=0x3456,payload=0x10203040", bytes(rqe)),
-            GoldenCase("cqe_error", "qpn=0x2aaaa,index=0x4567,ecode=0xf4,payload=0x10203040", bytes(cqe)),
-            GoldenCase("ceqe_error", "qpn=0x15555,cqn=0x1aaaaa,ecode=0xf4,pi=0xbeef", bytes(ceqe)),
-            GoldenCase("aeqe_error", "qpn=0x2aaaa,state=5,ecode=0xff,index=0x654321", bytes(aeqe)),
+            sqe,
+            rqe,
+            cqe,
+            ceqe,
+            aeqe,
         ],
         "doorbell": [
-            GoldenCase("cmq_sq", "pi=27,polarity=1,offset=0x0", bytes(cmq_db)),
-            GoldenCase("rq", "qpn=0x15555,icos=5,pi=0x4567,wrap=1,offset=0x10", bytes(rq_db)),
-            GoldenCase("cq", "cqn=0x15555,host=5,ci=0x654321,wrap=1,arm=1,offset=0x18", bytes(cq_db)),
+            cmq_db,
+            rq_db,
+            cq_db,
         ],
     }
 

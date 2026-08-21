@@ -12,6 +12,6 @@
 
 # xtr_v1-golden-v1
 # case: cq
-# inputs: cqn=0x15555,host=5,ci=0x654321,wrap=1,arm=1,offset=0x18
+# inputs: cqn=0x15555,host=5,ci=0x654321,wrap=1,arm=1,arm_state=2,arm_sn=3,offset=0x18
 # bytes: 8
 2b 00 e5 43 21 a1 55 55

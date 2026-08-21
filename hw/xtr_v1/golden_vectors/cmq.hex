@@ -1,5 +1,5 @@
 # xtr_v1-golden-v1
 # case: qpc_create
-# inputs: opcode=0,qpn=0x654321,index=27,valid=1,buffer=0x123456789ab
+# inputs: opcode=0,qpn=0x654321,index=27,valid=1,vfid_override=1,use_vfid=0x345,wrap=1,sq_cqn=0x15555,sign=1,rq_cqn=0xaaaa,buffer=0x123456789ab
 # bytes: 64
 8b 45 3b 00 00 65 43 21 0a aa a8 01 00 00 aa aa 00 00 00 00 00 00 00 00 00 02 46 8a cf 13 56 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00

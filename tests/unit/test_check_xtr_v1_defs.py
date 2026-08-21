@@ -90,6 +90,71 @@ class ReferenceEncodingTest(unittest.TestCase):
             bytes.fromhex("ac5abca15555a55a"),
         )
 
+    def test_qpc_sq_fields_use_driver_qword_at_byte_216(self) -> None:
+        offsets = {
+            mapping.sv_stem: mapping.word_byte_offset
+            for mapping in CHECKER.FIELD_MAPPINGS
+        }
+        for stem in (
+            "XTR_V1_QPC_SQ_PBA",
+            "XTR_V1_QPC_SQ_SIZE",
+            "XTR_V1_QPC_SQ_OM",
+        ):
+            with self.subTest(stem=stem):
+                self.assertEqual(offsets[stem], 216)
+
+        qpc = CHECKER.build_golden_cases()["context"][0].payload
+        self.assertEqual(qpc[216:224], bytes.fromhex("123456789abcdb80"))
+
+    def test_golden_summaries_list_every_participating_input(self) -> None:
+        cases = CHECKER.build_golden_cases()
+        summaries = {
+            case.name: case.summary
+            for case_group in cases.values()
+            for case in case_group
+        }
+        self.assertEqual(
+            summaries,
+            {
+                "qpc_common_boundary":
+                    "tver=2,mig=1,service=ud,host=5,vf=0xabc,icos=5,"
+                    "qpn=0x15555,stat_idx=0xa5,ud_qkey_h=0x5a,pkey=0xbeef,"
+                    "tx_endian_swap=1,rx_endian_swap=1,qp_state=5,pmtu=6,"
+                    "qp_sn=0xc3,pd_idx=0xa55a,sq_pba=0x123456789abcd,"
+                    "sq_size=11,sq_om=2",
+                "cqc_boundary":
+                    "sd_pba=0x123456789abcd,size=27,urc=1,state=2",
+                "qpc_create":
+                    "opcode=0,qpn=0x654321,index=27,valid=1,"
+                    "vfid_override=1,use_vfid=0x345,wrap=1,sq_cqn=0x15555,"
+                    "sign=1,rq_cqn=0xaaaa,buffer=0x123456789ab",
+                "sqe_rc_boundary":
+                    "qpn=0x15555,opcode=13,index=0x4567,rkey=0xdeadbeef,"
+                    "icos=5,qp_sn=0xa6,dst_port=11,wrap=1,sign=1,se=1,"
+                    "fence=2,ce=2,valid=1,signature=0xc7,sge_num=4,"
+                    "remote_va=0x0123456789abcdef",
+                "rqe_boundary":
+                    "qpn=0xabcde,index=0x3456,payload=0x10203040,"
+                    "qp_sn=0x5a,opcode=9,wrap=1,valid=1,signature=0x96,"
+                    "sge_num=2",
+                "cqe_error":
+                    "qpn=0x2aaaa,index=0x4567,ecode=0xf4,"
+                    "payload=0x10203040,polarity=1,rq_cqe=1,wrap=1,"
+                    "packet_opcode=0x9a,immediate=0x89abcdef",
+                "ceqe_error":
+                    "qpn=0x15555,cqn=0x1aaaaa,ecode=0xf4,pi=0xbeef,"
+                    "valid=1,packet_opcode=0x9a,wrap=1",
+                "aeqe_error":
+                    "qpn=0x2aaaa,state=5,ecode=0xff,index=0x654321,"
+                    "valid=1,packet_opcode=0x81,wrap=1",
+                "cmq_sq": "pi=27,polarity=1,offset=0x0",
+                "rq": "qpn=0x15555,icos=5,pi=0x4567,wrap=1,offset=0x10",
+                "cq":
+                    "cqn=0x15555,host=5,ci=0x654321,wrap=1,arm=1,"
+                    "arm_state=2,arm_sn=3,offset=0x18",
+            },
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
