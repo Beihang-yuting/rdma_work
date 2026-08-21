@@ -16,4 +16,5 @@ package rdma_codec_pkg;
   `include "rdma_codec_base.svh"
   `include "rdma_codec_registry.svh"
   `include "rdma_bit_packer.svh"
+  `include "xtr_v1/rdma_xtr_v1_qword_codec.svh"
 endpackage
