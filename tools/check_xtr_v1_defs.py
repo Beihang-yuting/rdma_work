@@ -951,6 +951,27 @@ def mask_sv_strings(text: str) -> str:
     return "".join(result)
 
 
+def validate_error_codec_preprocessor(codec_code: str) -> None:
+    """Allow only the one required macro invocation in the error codec."""
+    approved = list(
+        re.finditer(
+            r"^[ \t]*`uvm_object_utils\(rdma_xtr_v1_error_codec\)"
+            r"[ \t]*(?=\r?$)",
+            codec_code,
+            re.M,
+        )
+    )
+    backticks = [match.start() for match in re.finditer(r"`", codec_code)]
+    if (
+        len(approved) != 1
+        or len(backticks) != 1
+        or not approved[0].start() <= backticks[0] < approved[0].end()
+    ):
+        raise ValidationError(
+            "error codec preprocessor use differs from approved macro"
+        )
+
+
 def tokenize_sv_syntax(text: str) -> list[str]:
     """Tokenize enough SV syntax to audit hardware-code use sites."""
     token_pattern = re.compile(
@@ -1619,6 +1640,7 @@ def validate_error_codec(
     """Bind codec literals and symbolic lookup to validated source identities."""
     codec_text = strip_sv_comments(codec_text)
     codec_code = mask_sv_strings(codec_text)
+    validate_error_codec_preprocessor(codec_code)
     known_values = set(canonical)
     for literal in re.finditer(
         r"\b(\d+)\s*'\s*[sS]?\s*([hHdDbBoO])\s*([0-9a-fA-F_]+)",

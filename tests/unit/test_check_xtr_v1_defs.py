@@ -144,6 +144,7 @@ enum xtrdma_cqe_ecode {
 
     def codec_text(self) -> str:
         return """
+`uvm_object_utils(rdma_xtr_v1_error_codec)
 local function rdma_status_code_e classify(bit [7:0] hardware_code);
   case (hardware_code)
     XTR_V1_CMQ_SUCCESS_ECODE: return RDMA_SC_OK;
@@ -593,6 +594,41 @@ endfunction
                     CHECKER.ValidationError, "hardware_code"
                 ):
                     validate_codec(bypass, canonical)
+
+    def test_codec_rejects_token_pasting_macro_bypass(self) -> None:
+        validate_codec = self.require_checker_attribute(
+            "validate_error_codec"
+        )
+        pinned_compare = (
+            "  if (hardware_code == XTR_V1_CMQ_SUCCESS_ECODE) begin\n"
+        )
+        macro_bypass = (
+            "`define REVIEW_HC(a,b) a``b\n"
+            + self.codec_text().replace(
+                pinned_compare,
+                "  if (`REVIEW_HC(hardware_,code) == 240) "
+                "return RDMA_SC_OK;\n"
+                + pinned_compare,
+            )
+        )
+        with self.assertRaisesRegex(
+            CHECKER.ValidationError, "preprocessor|macro"
+        ):
+            validate_codec(macro_bypass, self.canonical_fixture())
+
+    def test_codec_preprocessor_audit_ignores_comments_and_strings(self) -> None:
+        validate_codec = self.require_checker_attribute(
+            "validate_error_codec"
+        )
+        diagnostic = """
+// `define REVIEW_HC(a,b) a``b
+/* `REVIEW_HC(hardware_,code) */
+string macro_text = "`REVIEW_HC(hardware_,code)";
+""" + self.codec_text()
+        try:
+            validate_codec(diagnostic, self.canonical_fixture())
+        except CHECKER.ValidationError as error:
+            self.fail(f"comment/string backtick was parsed as code: {error}")
 
     def test_codec_raw_scan_ignores_quoted_diagnostic_text(self) -> None:
         validate_codec = self.require_checker_attribute(
