@@ -177,6 +177,10 @@ model 只表达资源语义和 backing 拓扑，不出现 `XTRDMA_*` 常量。Ta
 - `rdma_address_vector`：source address index、source/destination vport、destination
   port、destination MAC、16B destination IP、IPv6/VLAN/CFI/LAG/tunnel/fwd、VLAN ID、
   traffic class、flow label、hop limit 和 UDP source port；
+- `rdma_urc_queue_config`：拥有未移位的 RSQ/RDSQ/DSQ byte-address backing、
+  entry-count RSQ/RDSQ depth、count-valued RDSQ/DSQ fetch count 和 entry-count
+  RQ sequence/SQ completion threshold，并负责这些硬件中立 queue topology 值的
+  deep copy、validation 和 description；
 - `rdma_rdma_access_t`：local write、remote read、remote write、memory-window bind、
   remote atomic；它与只描述 PCIe DMA 方向的 `rdma_dma_permission_t` 分离；
 - `rdma_mr_page_layout`：PBL mode、host page size、PBA0/PBA1、first PBL index、
@@ -268,10 +272,26 @@ traffic class 投影为 `ICOS=tc[7:5]`、`DSCP=tc[7:2]`。固定驱动 create pr
 使用 ECN 0、对 RC/URC 使用 ECN 2；model 的 `tc[1:0]` 必须与该 profile 一致，否则
 encode 返回 invalid argument。codec 同时编码 flow label、MAC、IP、VLAN 和端口字段。
 
-URC extension 使用独立的 RBSN/DBSN/RPSN/DPSN 语义字段和 URC queue backing，禁止把
-RC `send_psn/recv_psn` 直接写入 URC-only bit。URC golden 固定驱动 create 路径中的
-RSQ/RDSQ/DSQ backing、sequence 初值、fetch threshold 和 queue threshold 投影；
-未进入映像的运行时值不参加 equality。
+URC create/modify 使用一个 `rdma_qpc_urc_ext`；它拥有 `remote_qpn`、canonical
+`rbsn/dbsn/rpsn/dpsn` 和 non-null `rdma_urc_queue_config`。queue object 拥有未移位的
+byte-address `rsq_backing/rdsq_backing/dsq_backing`、entry-count
+`rsq_depth/rdsq_depth`、count-valued `rdsq_fetch_count/dsq_fetch_count`，以及
+entry-count `rq_sequence_threshold_entries/sq_completion_threshold_entries`。禁止把
+RC `send_psn/recv_psn` 直接写入 URC-only bit。
+
+xtr_v1 的 sequence mirror 固定为：`rbsn -> TX_RBSN/RX_RBSN`、
+`dbsn -> TX_DBSN/RX_DBSN/RXED_DBSN`、
+`rpsn -> CUR_TX_RPSN/TPE_RPSN_MAX`、
+`dpsn -> CUR_TX_DPSN/TPE_DPSN_MAX`。decode 必须先证明每组所有 mirror 相等，才能
+publish 对应 canonical scalar。`RX_SRBSN/TX_SRBSN/MAX_TX_SRBSN` 是 runtime-only，
+没有 create owner，必须排除在 create allowed mask 外；create-image decode 看到其中
+任意非零值都返回 `RDMA_SC_CODEC_ERROR`。
+
+RSQ/RDSQ depth 以 exact `log2(entries)` 编入 3-bit 字段；RDSQ/DSQ fetch count 以
+count 直接编入 6-bit 字段；threshold 的零值编码为 code 0，非零值以 exact
+`log2(entries)` 编入 4-bit 字段。DSQ current page 等于 `dsq_backing.value >> 12`，
+next page 必须等于 current page 加一，且该加法不得发生 52-bit overflow。decode 对
+这些 depth、count、threshold、backing page 和 next-page relation 执行精确逆变换。
 
 现有 QPC model 中的 SQ/RQ producer/consumer index 属于 ring/shadow 运行时状态，不是
 512B CMQ QPC buffer 的 create 参数。Task 10 把它们从 QPC field model 移除；
@@ -324,16 +344,24 @@ QPC `serialized_equal()` 对 RC、UD 和 URC 都比较公共
 `rdma_qpc_model.path_mtu_bytes`。它绝不从 transport extension 读取 MTU，也绝不
 省略 UD MTU。
 
+URC `serialized_equal()` 还比较 `remote_qpn`、四个 canonical sequence scalar，以及
+`rdma_urc_queue_config` 的每个字段；它不比较三个 runtime SRBSN 字段，因为成功的
+create-image decode 已要求 `RX_SRBSN/TX_SRBSN/MAX_TX_SRBSN` 全部为零。
+
 编码分两阶段进行：先用 `LSB/WIDTH` 对 logical qword 执行等价 `FIELD_PREP`，再逐
 qword big-endian serialization。禁止把 `WORD_BYTE_OFFSET*8+LSB` 当成 raw byte-stream
 bit offset。16B IP 和其他 byte array 按驱动 `memcpy` 顺序复制。
 
 所有操作都必须原子化：
 
-- model class/variant 不匹配、宽度超限、非 2 的幂、非法对齐或矛盾字段返回
-  `RDMA_SC_INVALID_ARGUMENT`；
+- caller-supplied model / encode input 的 class/variant 不匹配、宽度超限、非 2 的幂、
+  非法对齐或矛盾字段返回 `RDMA_SC_INVALID_ARGUMENT`；这包括 URC
+  `remote_qpn == 0` 和 threshold topology 不合法；
 - image kind、length、alignment、endian、reserved bit 或重复镜像不合法返回
   `RDMA_SC_CODEC_ERROR`；
+- 从 image decode 和 inverse transform 后发现的 semantic invalidity 返回
+  `RDMA_SC_CODEC_ERROR` 并保持 decode output null/unpublished；这包括 threshold inverse
+  超过 common QPC RQ/SQ depth，以及 URC `DST_QPN == 0`；
 - 未注册 transport/opcode 返回 `RDMA_SC_UNSUPPORTED_OPCODE`；
 - encode 失败不返回半写 image；decode 失败不返回半填 model；
 - 每次 encode 从全零固定长度数组开始，body mask 外的 byte/bit 必须保持零。
@@ -394,7 +422,9 @@ Task 9.5 新增明确的 `*_BODY_*` 常量，避免把 local context 坐标与 f
   send/recv PSN 镜像、retry/RNR、state 和 handle ID；
 - `qpc_ud_boundary`：QKey、traffic class 拆分、flow label、MAC、IPv4-mapped/IPv6 byte
   顺序、VLAN 和端口；
-- `qpc_urc_boundary`：URC RSQ/RDSQ/DSQ backing、RBSN/DBSN/RPSN/DPSN 和 threshold；
+- `qpc_urc_boundary`：非零 remote QPN；四个 canonical sequence owner 派生出的全部
+  mirror；使用 byte address、entry count 和 count 单位的 RSQ/RDSQ/DSQ queue config；
+  RSQ/RDSQ depth、RDSQ/DSQ fetch、RQ/SQ threshold；三个 runtime SRBSN 全部为零；
 - `cqc_create_body_boundary`；
 - `mrt_register_pbl0_boundary`、`mrt_register_pbl1_boundary`、
   `mrt_register_pbl2_boundary`；

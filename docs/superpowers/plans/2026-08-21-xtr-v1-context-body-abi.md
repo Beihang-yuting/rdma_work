@@ -17,14 +17,15 @@
 - Never derive a golden vector or expected mask from the SystemVerilog codec under test.
 - Run Python unit tests locally. Run every SystemVerilog compile/simulation through `scripts/run_vcs53.sh`; no local simulator result is an acceptance result.
 - Execute tasks strictly in order. For every task use a fresh implementer with `superpowers:test-driven-development`, a fresh spec reviewer, then a fresh quality reviewer. The original implementer fixes review findings; each reviewer rechecks its own findings. The controller runs a fresh 53/VCS staging verification before starting the next task.
-- For a clean replay, execute Task 10A -> Task 10A.1 -> Task 10A.2 before Task 10B or Task 10C. Task 10A.2 follows `docs/superpowers/specs/2026-08-22-qpc-path-mtu-ownership-design.md` and moves PMTU into common QPC state before any codec consumes it.
+- For a clean replay, execute Task 9.5 -> URC frozen-ABI prerequisite -> Task 10A -> Task 10A.1 -> Task 10A.2 -> URC queue-model prerequisite -> Task 10B -> Task 10C. Both URC prerequisites come from `docs/superpowers/plans/2026-08-22-urc-qpc-create-semantics.md`; Task 10A.2 follows `docs/superpowers/specs/2026-08-22-qpc-path-mtu-ownership-design.md` and moves PMTU into common QPC state before any codec consumes it.
+- On the current branch Task 10B is already complete. Before resuming Task 10C, apply and review both URC prerequisites; do not replay or rewrite the accepted qword-builder commit.
 - A task is not complete until the RED command failed for the intended reason, the GREEN commands passed, reviewers accepted it, the 53 staging directory was cleaned, and the task commit contains only that task.
 
 ## File responsibility map
 
 | File | Responsibility |
 |---|---|
-| `src/model/rdma_context_layouts.svh` | Hardware-neutral object mode, state, ring, page-table, address-vector, RDMA-access, and MR-page-layout value objects. No `XTR_V1_*` names. |
+| `src/model/rdma_context_layouts.svh` | Hardware-neutral object mode, state, ring, page-table, address-vector, `rdma_urc_queue_config`, RDMA-access, and MR-page-layout value objects. No `XTR_V1_*` names. |
 | `src/model/rdma_context_models.svh` | QPC/CQC/MRT/SRQC/CEQC/AEQC semantic field models, validation, deep copy, and descriptions. |
 | `src/codec/xtr_v1/rdma_xtr_v1_defs.svh` | Audited xtr_v1 sizes, opcodes, values, and field coordinates. |
 | `src/codec/xtr_v1/rdma_xtr_v1_image_masks.svh` | Immutable per-image/per-opcode qword ownership masks shared by body validation and CMQ composition. |
@@ -267,7 +268,7 @@ if (!access.remote_write || dma_permission.device_write)
   `uvm_error("ACCESS_TYPES", "RDMA rights leaked into PCIe DMA permission")
 ```
 
-Construct one valid model of each type, clone it, mutate nested layout/address-vector objects on the clone, and verify the original is unchanged. Add negative rows for a mismatched handle kind, mixed function UID/generation, zero/non-power-of-two depth, 4KiB queue misalignment, 64B shadow misalignment, 512B QPC-context misalignment, out-of-range ring index, illegal mode, zero MRT length, length above 46 bits, inconsistent lkey/rkey, and contradictory PBL fields.
+Construct one valid model of each type, clone it, mutate nested layout/address-vector objects on the clone, and verify the original is unchanged. Add negative rows for a mismatched handle kind, mixed function UID/generation, zero/non-power-of-two depth, 4KiB queue misalignment, 64B shadow misalignment, 512B QPC-context misalignment, out-of-range ring index, illegal mode, zero MRT length, length above 46 bits, inconsistent lkey/rkey, and contradictory PBL fields. The URC model rows must also require exact `RDMA_SC_INVALID_ARGUMENT` for `remote_qpn == 0`.
 
 Keep runtime ownership assertions on resources:
 
@@ -390,8 +391,9 @@ endclass
 
 - [ ] **Step 4: Replace the six field models with serializable semantics only**
 
-The public ownership block below shows the final model after Task 10A.2, so it includes
-both `rdma_qpc_behavior behavior;` and common `path_mtu_bytes` as architectural truth.
+The public ownership block below shows the final model after Task 10A.2 and the URC
+queue-model prerequisite, so it includes `rdma_qpc_behavior behavior;`, common
+`path_mtu_bytes`, and the canonical URC queue object as architectural truth.
 For a clean replay, Task 10A omits both the behavior member and common QPC MTU, but
 retains the historical pre-10A.2 extension ownership: RC declares
 `int unsigned retry_count, rnr_retry_count, path_mtu_bytes;`, and URC separately declares
@@ -399,9 +401,11 @@ retains the historical pre-10A.2 extension ownership: RC declares
 preserving both legacy extension MTU fields. Task 10A.2 then follows
 `docs/superpowers/specs/2026-08-22-qpc-path-mtu-ownership-design.md` and executable
 `docs/superpowers/plans/2026-08-22-qpc-path-mtu-ownership.md`: it adds the common MTU and
-removes both extension duplicates to reach the final block shown below. Complete Task
-10A -> Task 10A.1 -> Task 10A.2 before Task 10B or Task 10C; each prerequisite remains
-an isolated commit.
+removes both extension duplicates. The URC queue-model prerequisite then follows
+`docs/superpowers/plans/2026-08-22-urc-qpc-create-semantics.md` to reach the final block
+shown below. Complete Task 10A -> Task 10A.1 -> Task 10A.2 -> URC queue-model
+prerequisite -> Task 10B -> Task 10C in that portion of the clean replay; each
+prerequisite remains an isolated commit.
 
 Keep `rdma_hw_model` and the transport-extension base. Use the following exact public ownership:
 
@@ -433,10 +437,17 @@ class rdma_qpc_ud_ext extends rdma_qpc_transport_ext;
   bit [31:0] qkey;
 endclass
 
+class rdma_urc_queue_config extends uvm_object;
+  rdma_backing_addr_t rsq_backing, rdsq_backing, dsq_backing;
+  int unsigned rsq_depth, rdsq_depth;
+  int unsigned rdsq_fetch_count, dsq_fetch_count;
+  int unsigned rq_sequence_threshold_entries;
+  int unsigned sq_completion_threshold_entries;
+endclass
+
 class rdma_qpc_urc_ext extends rdma_qpc_transport_ext;
   bit [23:0] remote_qpn, rbsn, dbsn, rpsn, dpsn;
-  rdma_backing_addr_t rsq_backing, rdsq_backing, dsq_backing;
-  int unsigned fetch_threshold, queue_threshold;
+  rdma_urc_queue_config queues;
 endclass
 
 class rdma_cqc_model extends rdma_hw_model;
@@ -490,7 +501,14 @@ endclass
 
 Remove QPC PI/CI fields, SRQC `max_sge` and consumer index, and EQC `interrupt_enable` from context models. Do not remove the corresponding QP/SRQ runtime state from `rdma_resources.svh`. Event interrupt enable remains policy outside the serialized model.
 
-Validation shared by all models must check handle kind, one consistent function UID/generation pair across all handles, object-ID profile width, nested object non-null, and nested validation before returning success. An all-zero lifecycle pair is valid for a decode-created projection handle. QPC queues and URC queues are 4KiB aligned; QPC context backing is 512B aligned; CQC shadow is 64B aligned. MRT requires `mr_h.object_id == lkey[31:8]`; any remote right requires `rkey == lkey`, otherwise `rkey` is zero or `lkey`. Validation must not mutate access rights; the MRT codec derives a normalized hardware rights value that sets local-write whenever remote-write or remote-atomic is set.
+Validation shared by all models must check handle kind, one consistent function UID/generation pair across all handles, object-ID profile width, nested object non-null, and nested validation before returning success. An all-zero lifecycle pair is valid for a decode-created projection handle. QPC queues are 4KiB aligned; QPC context backing is 512B aligned; CQC shadow is 64B aligned. MRT requires `mr_h.object_id == lkey[31:8]`; any remote right requires `rkey == lkey`, otherwise `rkey` is zero or `lkey`. Validation must not mutate access rights; the MRT codec derives a normalized hardware rights value that sets local-write whenever remote-write or remote-atomic is set.
+
+Generic URC validation requires `remote_qpn != 0`, a non-null `queues` object,
+4KiB-aligned backing addresses, and nonzero power-of-two RSQ/RDSQ depths; a zero
+remote QPN returns `RDMA_SC_INVALID_ARGUMENT`. Each threshold is either zero or a
+power of two of at least two entries; RQ/SQ thresholds must not exceed the common QPC
+RQ/SQ depths. Generic model validation does not limit fetch counts or impose device
+field widths.
 
 - [ ] **Step 5: Run GREEN model regression on 53**
 
@@ -618,6 +636,10 @@ git commit -m "feat: add xtr_v1 logical qword codec"
 > xtr_v1 has one shared `FC_EN`; and QPC uses a private 512B allowed mask. Common
 > `rdma_qpc_model.path_mtu_bytes` is the only PMTU source; codecs must not read MTU
 > from a transport extension or synthesize a transport/golden default.
+> The URC frozen-ABI and URC queue-model prerequisites both follow
+> `docs/superpowers/plans/2026-08-22-urc-qpc-create-semantics.md`. On the current
+> branch, apply and review both before resuming Task 10C; Task 10B and its accepted
+> qword-builder commit remain in place and must not be replayed or rewritten.
 
 **Files:**
 - Modify: `src/codec/rdma_codec_base.svh`
@@ -663,13 +685,73 @@ Encode 256, 512, and another unsupported nonzero value such as 1500 and require 
 `RDMA_SC_INVALID_ARGUMENT`. Decode otherwise valid images with PMTU code 0/1/6/7 and
 require exact `RDMA_SC_CODEC_ERROR`.
 
-Require exact negative status codes. Wrong model subclass or transport extension, all
-field-width violations (including QPN/CQN/PD/SRQ and behavior), queue/context alignment
-violations, invalid PMTU, retry, or TC values, and TX/RX flow-control mismatch return
-`RDMA_SC_INVALID_ARGUMENT`. Wrong image metadata or length, QPC-private reserved-bit
-corruption, and RC PSN mirror corruption return `RDMA_SC_CODEC_ERROR`. An absent
-registry variant returns `RDMA_SC_UNSUPPORTED_OPCODE`. Encode/decode output objects
-remain null/unpublished on every failure, including every PMTU failure above.
+Build the URC source model only from the `qpc_urc_boundary` semantic input summary:
+all backing values are byte addresses, and every depth or threshold is an entry count.
+Encode must match all 512 frozen bytes; decode must restore the same canonical values;
+`serialized_equal()` must compare every member of `queues` as well as the other URC
+semantics.
+
+Keep all canonical `qpc_urc_boundary` values and the frozen golden unchanged. Add a
+separate positive, non-golden owner-discriminator routing test by cloning or building
+a valid URC model with mutually distinct owners: `remote_qpn = 24'h123456`,
+`dbsn = 24'h234567`, `rsq_depth = 32`, `rdsq_depth = 128`,
+`rdsq_fetch_count = 7`, and `dsq_fetch_count = 13`. Keep every other field valid and
+keep both thresholds within the common QPC RQ/SQ topology.
+
+After encode, do not rely only on decode/round-trip. Deserialize the image and read
+the exact frozen target-field coordinates, requiring
+`XTR_V1_QPC_DST_QPN == 24'h123456`,
+`XTR_V1_QPC_URC_TX_DBSN == 24'h234567`,
+`XTR_V1_QPC_URC_RX_DBSN == 24'h234567`,
+`XTR_V1_QPC_URC_RXED_DBSN == 24'h234567`,
+`XTR_V1_QPC_URC_RSQ_SIZE == 5`,
+`XTR_V1_QPC_URC_RDSQ_SIZE == 7`,
+`XTR_V1_QPC_URC_NXT_RDSQ_FETCH_NUM == 7`, and
+`XTR_V1_QPC_URC_NXT_DSQ_FETCH_NUM == 13`. Then decode must return
+`RDMA_SC_OK`, and `serialized_equal(source, decoded)` must return `RDMA_SC_OK` with
+`equal == 1`. These direct coordinate assertions prevent a mutually swapped encoder
+and decoder from passing through self-consistency. This is a non-golden routing test;
+it must not modify or replace the fixed vector.
+
+Add table-driven URC field-mutation cases for every sequence mirror group (two RBSN,
+three DBSN, two RPSN, and two DPSN fields), each runtime field
+`RX_SRBSN/TX_SRBSN/MAX_TX_SRBSN`, each RSQ/RDSQ depth code, both fetch values, both
+threshold codes, the DSQ next-page relation, and reserved bits. A changed depth code,
+fetch value, or threshold code whose exact inverse leaves the model topology valid
+must decode with `RDMA_SC_OK`, publish the inverse-transformed canonical model, and
+make `serialized_equal(source, decoded)` return `equal == 0`. Every representable
+depth code and fetch value is valid by itself; tests must not classify those mutations
+as unconditional corruption. The semantic-invalid decode matrix must include both a
+threshold code whose inverse exceeds the common QPC RQ or SQ depth and an otherwise
+valid URC image whose `DST_QPN` is cleared to zero; each must return exact
+`RDMA_SC_CODEC_ERROR` and leave the decode output null. Mirror mismatch, runtime
+nonzero, DSQ next-page relation, reserved-bit, metadata, or length corruption must
+also return exact `RDMA_SC_CODEC_ERROR` and leave the decode output null.
+
+Add URC encode-invalid cases for an RSQ or RDSQ depth whose `log2` exceeds 3 bits,
+either fetch count greater than 63, either nonzero threshold whose `log2` exceeds
+4 bits, and a DSQ current page equal to the maximum 52-bit value. Each returns exact
+`RDMA_SC_INVALID_ARGUMENT` and leaves the image output null. The highest aligned byte
+address `64'hffff_ffff_ffff_f000`, whose page is `(1 << 52) - 1`, must encode and decode
+successfully for RSQ and RDSQ; the same DSQ current page is invalid because its next
+page would overflow. A crafted decode image with DSQ current page at that maximum and
+the narrow next-page field wrapped to zero must return `RDMA_SC_CODEC_ERROR` and leave
+the decode output null. Retain tests proving the generic model can express queue
+depths, fetch counts, and thresholds beyond xtr_v1 field widths. A non-golden
+threshold-zero round trip must return zero; every nonzero threshold must decode by the
+exact inverse `1 << code`.
+
+Require exact negative status codes by error source. Caller-supplied encode models with
+the wrong subclass or transport extension, field-width violations (including
+QPN/CQN/PD/SRQ and behavior), queue/context alignment violations, invalid PMTU, retry,
+or TC values, TX/RX flow-control mismatch, or other semantic invalidity return
+`RDMA_SC_INVALID_ARGUMENT`. Image decode failures caused by wrong metadata or length,
+QPC-private reserved-bit corruption, RC PSN mirror corruption, or image-derived
+semantic invalidity return `RDMA_SC_CODEC_ERROR`; the latter includes URC
+`DST_QPN == 0` and threshold inverse values that exceed common QPC depth. An absent
+registry variant returns `RDMA_SC_UNSUPPORTED_OPCODE`. The image output remains
+null/unpublished on every encode failure, and the model output remains null/unpublished
+on every decode failure, including every PMTU failure above.
 
 - [ ] **Step 2: Run RED on 53**
 
@@ -801,7 +883,35 @@ For RC, write `send_psn` to byte offsets `160, 208, 344, 352, 376, 416, 424, 432
 
 For all address-vector transports, write `ICOS=traffic_class[7:5]` and `DSCP=traffic_class[7:2]`. Require `traffic_class[1:0]==0` for UD and `==2` for RC/URC. Use `put_memcpy()` for the 16 destination-IP bytes in driver `memcpy` order; encode MAC, VLAN/CFI, flow label, vports, destination port, source-address index, hop limit, UDP source port, LAG/tunnel/forward flags from the named model fields.
 
-For URC, encode only `rbsn/dbsn/rpsn/dpsn`, RSQ/RDSQ/DSQ backing, fetch threshold, and queue threshold into URC-only fields. Never feed RC `send_psn/recv_psn` mappings from an URC model.
+For URC encode, require non-null `queues` and `remote_qpn != 0`; a zero remote QPN
+returns `RDMA_SC_INVALID_ARGUMENT`. Map the nonzero `remote_qpn` to `DST_QPN`. On
+decode, `DST_QPN == 0` returns `RDMA_SC_CODEC_ERROR`, and the canonical `remote_qpn`
+may be published only after this check passes. Map each canonical sequence scalar to
+all of its mirrors:
+`rbsn -> TX_RBSN/RX_RBSN`, `dbsn -> TX_DBSN/RX_DBSN/RXED_DBSN`,
+`rpsn -> CUR_TX_RPSN/TPE_RPSN_MAX`, and
+`dpsn -> CUR_TX_DPSN/TPE_DPSN_MAX`. Decode returns `RDMA_SC_CODEC_ERROR` on any
+mirror mismatch and assigns a canonical scalar only after its entire group agrees.
+Never feed RC `send_psn/recv_psn` mappings from a URC model.
+
+Validate every URC backing as 4KiB aligned, compute its page value, and prove that
+page fits 52 bits before authoring any field. Split the RSQ and DSQ current pages
+across their frozen high/low fields and encode RDSQ in its single 52-bit field. Encode
+RSQ/RDSQ depth as exact
+`log2(entries)` fitting 3 bits, RDSQ/DSQ fetch counts directly fitting 6 bits, and
+each threshold as code zero for zero or exact power-of-two `log2(entries)` fitting
+4 bits for nonzero. For DSQ, compute `current + 1` in widened 53-bit arithmetic and
+reject overflow before narrowing or authoring the next-page field. Decode performs
+the exact inverse transforms, zero-extends the current and next page values, and checks
+the relation in widened arithmetic; a maximum current page followed by a narrow
+wrapped-zero next page is overflow, not a valid relation.
+
+The URC create allowed mask includes the new `RSQ_SIZE` and `NXT_RDSQ_FETCH_NUM`
+fields plus every common and URC create-owned field. It excludes
+`RX_SRBSN/TX_SRBSN/MAX_TX_SRBSN`, `CC_TYPE`, `RTO_CODE`, and `LOAD_RQ_PI_TH`; any
+nonzero excluded field returns `RDMA_SC_CODEC_ERROR`. Encode authors every allowed
+field, including semantic zeros, and its 64-qword occupancy must exactly equal the
+selected URC mask.
 
 - [ ] **Step 5: Register exact keys without wildcard fallback**
 
@@ -821,9 +931,19 @@ It registers exactly `(qpc,rc,00)`, `(qpc,ud,00)`, and `(qpc,urc,00)`. If any re
 scripts/run_vcs53.sh core rdma_xtr_v1_qpc_codec_test
 scripts/run_vcs53.sh core rdma_xtr_v1_qword_codec_test
 scripts/run_vcs53.sh core rdma_context_model_test
+scripts/run_vcs53.sh core rdma_request_model_test
+scripts/run_vcs53.sh core rdma_xtr_v1_defs_test
 ```
 
-Expected: PASS; all three images match golden byte-for-byte; mirror corruption is detected; registry isolation and atomic output behavior hold.
+Expected: every command exits 0 with UVM warning/error/fatal counts 0/0/0; RC and UD
+remain frozen byte-identical; URC matches the canonical create vector; valid
+owner-discriminator exact-coordinate routing checks pass; valid
+depth/fetch/threshold mutations decode to inverse canonical values with
+`RDMA_SC_OK` and serialized inequality; zero-`DST_QPN`, topology-invalid threshold,
+mirror, runtime, relation, reserved, metadata, and length cases return exact
+`RDMA_SC_CODEC_ERROR` with null decode outputs; encode-invalid cases return exact
+`RDMA_SC_INVALID_ARGUMENT`, upper-bound RSQ/RDSQ backings round-trip, and registry
+isolation remains intact.
 
 - [ ] **Step 7: Commit Task 10C**
 
@@ -1231,7 +1351,7 @@ git commit -m "feat: decode xtr_v1 CMQ completions and errors"
 
 - [ ] **Step 1: Write an end-to-end create/register regression test**
 
-For RC/UD/URC QPC and every Task 10 body, perform model validation, body/context encode, checked composition, completion decode, and serialized equality where a body is returned. Use two envelopes with distinct VF override/use-vfid values and prove body bytes remain unchanged while only envelope-owned bits change. Also verify all failed operations leave the input model, input body, and previously successful output unchanged.
+For RC/UD/URC QPC and every Task 10 body, perform model validation, body/context encode, checked composition, completion decode, and serialized equality where a body is returned. Use two envelopes with distinct VF override/use-vfid values and prove body bytes remain unchanged while only envelope-owned bits change. Also verify all failed operations leave the immutable input model and input body unchanged, and separately retained artifacts from prior successful calls remain unchanged. The output formal passed to any failing encode/decode call must be null/unpublished.
 
 - [ ] **Step 2: Run RED on 53**
 
