@@ -57,6 +57,54 @@ malformed/truncated/extra bytes, and incomplete trailing cases. The SV reader
 parses into a private queue and publishes no cases unless the complete file is
 valid.
 
+### Delivered context-to-CMQ layers
+
+Standalone QPC images are context artifacts, not sparse CMQ bodies.  Their
+registry keys and transport masks select the codec that authors the full
+512-byte context used as the QPC create signature source.
+
+| Standalone QPC golden case | Bytes / alignment / endian | Source functions | Codec registry key | Mask owner |
+|---|---|---|---|---|
+| `qpc_rc_boundary` | 512 / 512 / big-endian per qword | `rdma_xtr_v1_qpc_rc_codec::encode_extension`, `rdma_xtr_v1_qpc_codec_base::{encode,decode,serialized_equal}` | `xtr_v1\|1\|qpc\|rc\|00` | RC coordinates admitted by `qpc_allowed_mask(RDMA_TRANSPORT_RC, ...)`; no CMQ envelope ownership |
+| `qpc_ud_boundary` | 512 / 512 / big-endian per qword | `rdma_xtr_v1_qpc_ud_codec::encode_extension`, `rdma_xtr_v1_qpc_codec_base::{encode,decode,serialized_equal}` | `xtr_v1\|1\|qpc\|ud\|00` | UD coordinates admitted by `qpc_allowed_mask(RDMA_TRANSPORT_UD, ...)`; no CMQ envelope ownership |
+| `qpc_urc_boundary` | 512 / 512 / big-endian per qword | `rdma_xtr_v1_qpc_urc_codec::encode_extension`, `rdma_xtr_v1_qpc_codec_base::{encode,decode,serialized_equal}` | `xtr_v1\|1\|qpc\|urc\|00` | URC coordinates admitted by `qpc_allowed_mask(RDMA_TRANSPORT_URC, ...)`; no CMQ envelope ownership |
+
+The eight sparse bodies retain final CMQ SQE byte coordinates.  Each body is
+64-byte aligned and its mask is disjoint from the request envelope.
+
+| Sparse-body golden case | Bytes / alignment / endian | Source functions | Codec registry key | Mask owner |
+|---|---|---|---|---|
+| `cqc_create_body_boundary` | 64 / 64 / big-endian per qword | `rdma_xtr_v1_cqc_create_body_codec::{encode_body,decode_body}` through `rdma_xtr_v1_context_body_codec_base::{encode,decode,serialized_equal}` | `xtr_v1\|2\|cqc\|create\|0c` | `XTR_V1_CQC_CREATE_BODY_MASK` |
+| `mrt_key_alloc_pbl0_boundary` | 64 / 64 / big-endian per qword | `rdma_xtr_v1_mrt_key_alloc_body_codec::{encode_body,decode_body}` through `rdma_xtr_v1_mrt_body_codec_base::{encode_body,decode_body}` | `xtr_v1\|3\|mrt\|key_alloc\|04` | `XTR_V1_MRT_KEY_ALLOC_PBL0_BODY_MASK` |
+| `mrt_register_pbl0_boundary` | 64 / 64 / big-endian per qword | `rdma_xtr_v1_mrt_register_body_codec::{encode_body,decode_body}` through `rdma_xtr_v1_mrt_body_codec_base::{encode_body,decode_body}` | `xtr_v1\|3\|mrt\|register\|05` | `XTR_V1_MRT_REGISTER_PBL0_BODY_MASK` |
+| `mrt_register_pbl1_boundary` | 64 / 64 / big-endian per qword | `rdma_xtr_v1_mrt_register_body_codec::{encode_body,decode_body}` through `rdma_xtr_v1_mrt_body_codec_base::{encode_body,decode_body}` | `xtr_v1\|3\|mrt\|register\|05` | `XTR_V1_MRT_REGISTER_PBL1_BODY_MASK` |
+| `mrt_register_pbl2_boundary` | 64 / 64 / big-endian per qword | `rdma_xtr_v1_mrt_register_body_codec::{encode_body,decode_body}` through `rdma_xtr_v1_mrt_body_codec_base::{encode_body,decode_body}` | `xtr_v1\|3\|mrt\|register\|05` | `XTR_V1_MRT_REGISTER_PBL2_BODY_MASK` |
+| `srqc_create_body_boundary` | 64 / 64 / big-endian per qword | `rdma_xtr_v1_srqc_create_body_codec::{encode_body,decode_body}` through `rdma_xtr_v1_context_body_codec_base` | `xtr_v1\|4\|srqc\|create\|35` | `XTR_V1_SRQC_CREATE_BODY_MASK` |
+| `ceqc_create_body_boundary` | 64 / 64 / big-endian per qword | `rdma_xtr_v1_ceqc_create_body_codec::{encode_body,decode_body}` through `rdma_xtr_v1_context_body_codec_base` | `xtr_v1\|5\|ceqc\|create\|10` | `XTR_V1_CEQC_CREATE_BODY_MASK` |
+| `aeqc_create_body_boundary` | 64 / 64 / big-endian per qword | `rdma_xtr_v1_aeqc_create_body_codec::{encode_body,decode_body}` through `rdma_xtr_v1_context_body_codec_base` | `xtr_v1\|6\|aeqc\|create\|14` | `XTR_V1_AEQC_CREATE_BODY_MASK` |
+
+Final create/register SQEs are checked compositions.  In every row the request
+envelope owns qword-0 mask `8fff3fff00000000` and no bits in qwords 1..7;
+the listed body mask owns the remaining admitted fields.  The composer mints
+the registered body with `rdma_xtr_v1_cmq_request_composer::build_body`, merges
+it with `compose_request`, and the response is admitted by
+`rdma_xtr_v1_cmq_completion_codec::decode_completion`.
+
+| Final CMQ SQE context source | Bytes / alignment / endian | Source functions | CMQ registry key | Body mask owner |
+|---|---|---|---|---|
+| `qpc_rc_boundary`, `qpc_ud_boundary`, `qpc_urc_boundary` | 64 / 64 / big-endian per qword | `rdma_xtr_v1_cmq_request_composer::{build_body,compose_request}`, `rdma_xtr_v1_cmq_completion_codec::decode_completion` | body registry opcode `00`, input `RDMA_IMAGE_CMQ_SQE` | `XTR_V1_QPC_CREATE_BODY_OWNERSHIP`; the composer owns the checksum signature while the 512-byte QPC remains standalone |
+| `cqc_create_body_boundary` | 64 / 64 / big-endian per qword | `rdma_xtr_v1_cmq_request_composer::{build_body,compose_request}`, `rdma_xtr_v1_cmq_completion_codec::decode_completion` | body registry opcode `0c`, input `RDMA_IMAGE_CQC` | `XTR_V1_CQC_CREATE_BODY_MASK` |
+| `mrt_key_alloc_pbl0_boundary` | 64 / 64 / big-endian per qword | `rdma_xtr_v1_cmq_request_composer::{build_body,compose_request}`, `rdma_xtr_v1_cmq_completion_codec::decode_completion` | body registry opcode `04`, input `RDMA_IMAGE_MRT` | `XTR_V1_MRT_KEY_ALLOC_PBL0_BODY_MASK` |
+| `mrt_register_pbl0_boundary`, `mrt_register_pbl1_boundary`, `mrt_register_pbl2_boundary` | 64 / 64 / big-endian per qword | `rdma_xtr_v1_cmq_request_composer::{build_body,compose_request}`, `rdma_xtr_v1_cmq_completion_codec::decode_completion` | body registry opcode `05`, input `RDMA_IMAGE_MRT` | exact PBL0/PBL1/PBL2 register mask selected by the authenticated body |
+| `srqc_create_body_boundary` | 64 / 64 / big-endian per qword | `rdma_xtr_v1_cmq_request_composer::{build_body,compose_request}`, `rdma_xtr_v1_cmq_completion_codec::decode_completion` | body registry opcode `35`, input `RDMA_IMAGE_SRQC` | `XTR_V1_SRQC_CREATE_BODY_MASK` |
+| `ceqc_create_body_boundary` | 64 / 64 / big-endian per qword | `rdma_xtr_v1_cmq_request_composer::{build_body,compose_request}`, `rdma_xtr_v1_cmq_completion_codec::decode_completion` | body registry opcode `10`, input `RDMA_IMAGE_CEQC` | `XTR_V1_CEQC_CREATE_BODY_MASK` |
+| `aeqc_create_body_boundary` | 64 / 64 / big-endian per qword | `rdma_xtr_v1_cmq_request_composer::{build_body,compose_request}`, `rdma_xtr_v1_cmq_completion_codec::decode_completion` | body registry opcode `14`, input `RDMA_IMAGE_AEQC` | `XTR_V1_AEQC_CREATE_BODY_MASK` |
+
+KEY_ALLOC opcode `04` is the ordinary MR allocation path: it uses PBL0 and
+writes a self-parent STAG (`parent_stag_idx == stag_idx`).  MR_REGISTER opcode
+`05` is the register path for PBL0/PBL1/PBL2 and writes
+`parent_stag_idx == 0`.
+
 ### Canonical URC create/modify image
 
 `qpc_urc_boundary` is the canonical URC create/modify semantic image. Its
