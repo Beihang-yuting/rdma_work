@@ -595,6 +595,32 @@ class rdma_xtr_v1_qpc_codec_test extends uvm_test;
     end
   endfunction
 
+  function automatic void check_access_equality_falsification(
+    rdma_codec_base codec,
+    rdma_qpc_model source
+  );
+    rdma_qpc_model no_access;
+    rdma_qpc_model remote_read;
+    rdma_status status;
+    bit equal;
+    string mismatch;
+
+    no_access = clone_qpc(source, "ACCESS_EQUALITY_NONE_CLONE");
+    remote_read = clone_qpc(source, "ACCESS_EQUALITY_REMOTE_READ_CLONE");
+    no_access.access = '0;
+    remote_read.access = '0;
+    remote_read.access.remote_read = 1'b1;
+
+    status = codec.serialized_equal(no_access, remote_read, equal, mismatch);
+    expect_ok("ACCESS_EQUALITY_NEGATIVE_STATUS", status);
+    if (equal)
+      `uvm_error("ACCESS_EQUALITY_NEGATIVE",
+                 "serialized_equal ignored distinct hardware access rights")
+    if (mismatch != "access")
+      `uvm_error("ACCESS_EQUALITY_MISMATCH",
+                 $sformatf("expected access mismatch, got '%s'", mismatch))
+  endfunction
+
   function automatic void check_pmtu_table(rdma_codec_base codec,
                                             rdma_qpc_model source);
     int unsigned mtus[4] = '{1024, 2048, 4096, 8192};
@@ -1132,6 +1158,7 @@ class rdma_xtr_v1_qpc_codec_test extends uvm_test;
     check_access_normalization("RC", rc_codec, rc_source);
     check_access_normalization("UD", ud_codec, ud_source);
     check_access_normalization("URC", urc_codec, urc_source);
+    check_access_equality_falsification(rc_codec, rc_source);
     canonical_state = clone_qpc(rc_source, "sqe_canonical_source");
     canonical_state.state = RDMA_QPS_SQE;
     status = rc_codec.encode(canonical_state, canonical_state_image);
