@@ -222,8 +222,26 @@ QPC common model 增加 `host_id`、`vf_id`、`stat_index`、`pkey`、`qp_sequen
 512B context backing address。队列 depth 编码为 `log2(depth)`；队列 backing 先验证
 4KiB 对齐，再右移 12。context backing 先验证 512B 对齐，再右移 9。
 
-path MTU 在 model 中用 byte size 表示，xtr_v1 固定映射 1024/2048/4096/8192B 到
-PMTU code 2/3/4/5；256B、512B 和其他值在本 profile 中返回 invalid argument。
+`rdma_qpc_model.path_mtu_bytes` 是 RC、UD 和 URC 共同的 path MTU 语义状态。
+`rdma_qpc_rc_ext` 和 `rdma_qpc_urc_ext` 不得保存重复 MTU；
+`rdma_qpc_ud_ext` 仍只拥有 QKey。通用
+model 的校验只要求 `path_mtu_bytes != 0`，因此 256B、512B 和未来设备
+支持的其他非零值都是可表示的硬件中立语义。
+
+xtr_v1 encode 单独执行以下精确 profile 映射：
+
+| `path_mtu_bytes` | PMTU code |
+|---:|---:|
+| 1024 | 2 |
+| 2048 | 3 |
+| 4096 | 4 |
+| 8192 | 5 |
+
+任何其他非零 byte size，包括 256B 和 512B，返回
+`RDMA_SC_INVALID_ARGUMENT`。decode 执行精确逆映射，code 2/3/4/5 分别恢复
+1024/2048/4096/8192B；code 0/1/6/7 返回 `RDMA_SC_CODEC_ERROR`。codec 不得
+根据 transport 生成默认 MTU。所有这些失败都保持原子输出契约：encode 的
+image 与 decode 的 model 保持 null/未发布。
 
 transport 投影固定为 RC=`0`、UD=`3`、URC=`6`。QP state 投影固定为：
 
@@ -302,6 +320,10 @@ queue object mode 复用。
    损坏；
 6. reserved bit 必须为零。
 
+QPC `serialized_equal()` 对 RC、UD 和 URC 都比较公共
+`rdma_qpc_model.path_mtu_bytes`。它绝不从 transport extension 读取 MTU，也绝不
+省略 UD MTU。
+
 编码分两阶段进行：先用 `LSB/WIDTH` 对 logical qword 执行等价 `FIELD_PREP`，再逐
 qword big-endian serialization。禁止把 `WORD_BYTE_OFFSET*8+LSB` 当成 raw byte-stream
 bit offset。16B IP 和其他 byte array 按驱动 `memcpy` 顺序复制。
@@ -379,6 +401,11 @@ Task 9.5 新增明确的 `*_BODY_*` 常量，避免把 local context 坐标与 f
 - `mrt_key_alloc_pbl0_boundary`，用于锁定普通 MR 路径的 opcode 和 self-parent 差异；
 - `srqc_create_body_boundary`；
 - `ceqc_create_body_boundary`、`aeqc_create_body_boundary`。
+
+三个 QPC case 的 frozen common golden inputs 精确为：RC=8192B/code 5、
+UD=4096B/code 4、URC=8192B/code 5，均设置
+`rdma_qpc_model.path_mtu_bytes`。这些是每个 golden case 显式提供的输入，不是
+transport 或 codec 默认值。
 
 每个 case 都保存固定输入摘要、byte count 和完整 payload。reference encoder 继续使用
 独立 occupancy；零值字段也占用声明的 mask，重叠或越界必须在不改变输出的情况下失败。

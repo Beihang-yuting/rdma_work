@@ -17,6 +17,7 @@
 - Never derive a golden vector or expected mask from the SystemVerilog codec under test.
 - Run Python unit tests locally. Run every SystemVerilog compile/simulation through `scripts/run_vcs53.sh`; no local simulator result is an acceptance result.
 - Execute tasks strictly in order. For every task use a fresh implementer with `superpowers:test-driven-development`, a fresh spec reviewer, then a fresh quality reviewer. The original implementer fixes review findings; each reviewer rechecks its own findings. The controller runs a fresh 53/VCS staging verification before starting the next task.
+- For a clean replay, execute Task 10A -> Task 10A.1 -> Task 10A.2 before Task 10B or Task 10C. Task 10A.2 follows `docs/superpowers/specs/2026-08-22-qpc-path-mtu-ownership-design.md` and moves PMTU into common QPC state before any codec consumes it.
 - A task is not complete until the RED command failed for the intended reason, the GREEN commands passed, reviewers accepted it, the 53 staging directory was cleaned, and the task commit contains only that task.
 
 ## File responsibility map
@@ -389,13 +390,18 @@ endclass
 
 - [ ] **Step 4: Replace the six field models with serializable semantics only**
 
-The public ownership block below shows the final model after Task 10A.1, so it includes
-`rdma_qpc_behavior behavior;` as architectural truth. For a clean replay, execute and
-commit Task 10A first without that single behavior member (retain every other shown
-field), because Task 10A.1 tests depend on the model and test artifacts created by
-Task 10A. Then execute Task 10A.1 immediately after Task 10A and before Task 10B or
-Task 10C; Task 10A.1 adds the behavior type, member, and tests in its own isolated
-commit.
+The public ownership block below shows the final model after Task 10A.2, so it includes
+both `rdma_qpc_behavior behavior;` and common `path_mtu_bytes` as architectural truth.
+For a clean replay, Task 10A omits both the behavior member and common QPC MTU, but
+retains the historical pre-10A.2 extension ownership: RC declares
+`int unsigned retry_count, rnr_retry_count, path_mtu_bytes;`, and URC separately declares
+`int unsigned path_mtu_bytes;`. Task 10A.1 adds the behavior type, member, and tests while
+preserving both legacy extension MTU fields. Task 10A.2 then follows
+`docs/superpowers/specs/2026-08-22-qpc-path-mtu-ownership-design.md` and executable
+`docs/superpowers/plans/2026-08-22-qpc-path-mtu-ownership.md`: it adds the common MTU and
+removes both extension duplicates to reach the final block shown below. Complete Task
+10A -> Task 10A.1 -> Task 10A.2 before Task 10B or Task 10C; each prerequisite remains
+an isolated commit.
 
 Keep `rdma_hw_model` and the transport-extension base. Use the following exact public ownership:
 
@@ -408,6 +414,7 @@ class rdma_qpc_model extends rdma_hw_model;
   bit [15:0] pkey;
   bit [7:0] qp_sequence;
   rdma_rdma_access_t access;
+  int unsigned path_mtu_bytes;
   int unsigned sq_depth, rq_depth;
   rdma_backing_addr_t sq_backing, rq_backing, context_backing;
   rdma_object_mode_e sq_mode, rq_mode;
@@ -419,7 +426,7 @@ endclass
 
 class rdma_qpc_rc_ext extends rdma_qpc_transport_ext;
   bit [23:0] remote_qpn, send_psn, recv_psn;
-  int unsigned retry_count, rnr_retry_count, path_mtu_bytes;
+  int unsigned retry_count, rnr_retry_count;
 endclass
 
 class rdma_qpc_ud_ext extends rdma_qpc_transport_ext;
@@ -428,7 +435,6 @@ endclass
 
 class rdma_qpc_urc_ext extends rdma_qpc_transport_ext;
   bit [23:0] remote_qpn, rbsn, dbsn, rpsn, dpsn;
-  int unsigned path_mtu_bytes;
   rdma_backing_addr_t rsq_backing, rdsq_backing, dsq_backing;
   int unsigned fetch_threshold, queue_threshold;
 endclass
@@ -605,10 +611,13 @@ git commit -m "feat: add xtr_v1 logical qword codec"
 
 ### Task 10C: Implement standalone RC/UD/URC QPC codecs
 
-> **Task 10A.1 prerequisite:** Follow
-> `docs/superpowers/specs/2026-08-21-qpc-behavior-ownership-design.md`.
+> **Task 10A.1 and Task 10A.2 prerequisites:** Follow
+> `docs/superpowers/specs/2026-08-21-qpc-behavior-ownership-design.md` and
+> `docs/superpowers/specs/2026-08-22-qpc-path-mtu-ownership-design.md`.
 > QPC behavior is explicit model state; `context_backing` maps to `SHADOW_PBA`;
-> xtr_v1 has one shared `FC_EN`; and QPC uses a private 512B allowed mask.
+> xtr_v1 has one shared `FC_EN`; and QPC uses a private 512B allowed mask. Common
+> `rdma_qpc_model.path_mtu_bytes` is the only PMTU source; codecs must not read MTU
+> from a transport extension or synthesize a transport/golden default.
 
 **Files:**
 - Modify: `src/codec/rdma_codec_base.svh`
@@ -633,10 +642,11 @@ Add a table-driven `serialized_equal()` falsification test. Clone a valid
 decoded/canonical model and mutate, one at a time, `behavior.transport_version`,
 `behavior.migration_enable`, `behavior.tx_endian_swap`, `behavior.rx_endian_swap`,
 `behavior.read_after_write_fence`, `behavior.atomic_after_atomic_fence`,
-`behavior.\priority `, `context_backing` by one 512B unit, `signature_enable`, TX flow
-control, and RX flow control. Each call must return `RDMA_SC_OK` with `equal == 0` and a
-nonempty, useful `mismatch`. The individual TX and RX mutations are legal generic-model
-states even though encode later rejects their asymmetry.
+`behavior.\priority `, common `path_mtu_bytes`, `context_backing` by one 512B unit,
+`signature_enable`, TX flow control, and RX flow control. Each call must return
+`RDMA_SC_OK` with `equal == 0` and a nonempty, useful `mismatch`. The individual TX and
+RX mutations are legal generic-model states even though encode later rejects their
+asymmetry.
 
 Every golden builder explicitly sets `behavior`; transport selection must not supply
 behavior defaults. Set `context_backing.value = frozen_shadow_pba << 9`, verify
@@ -645,13 +655,21 @@ vectors. Add a separate positive encode/decode round trip at the accepted maxima
 `behavior.transport_version = 3` (`tver=3`) and `behavior.\priority = 7`, with equal
 TX/RX flow control; do not compare this maxima case to a fixed golden.
 
+Every golden builder also explicitly sets common `path_mtu_bytes`: RC=8192B/code 5,
+UD=4096B/code 4, and URC=8192B/code 5. These are case inputs, not defaults. Require all
+three transport cases to complete encode/decode/serialized-equal round trips. Exercise
+the complete supported table 1024/2048/4096/8192 -> 2/3/4/5.
+Encode 256, 512, and another unsupported nonzero value such as 1500 and require exact
+`RDMA_SC_INVALID_ARGUMENT`. Decode otherwise valid images with PMTU code 0/1/6/7 and
+require exact `RDMA_SC_CODEC_ERROR`.
+
 Require exact negative status codes. Wrong model subclass or transport extension, all
 field-width violations (including QPN/CQN/PD/SRQ and behavior), queue/context alignment
 violations, invalid PMTU, retry, or TC values, and TX/RX flow-control mismatch return
 `RDMA_SC_INVALID_ARGUMENT`. Wrong image metadata or length, QPC-private reserved-bit
 corruption, and RC PSN mirror corruption return `RDMA_SC_CODEC_ERROR`. An absent
 registry variant returns `RDMA_SC_UNSUPPORTED_OPCODE`. Encode/decode output objects
-remain null on every failure.
+remain null/unpublished on every failure, including every PMTU failure above.
 
 - [ ] **Step 2: Run RED on 53**
 
@@ -756,16 +774,28 @@ case (qpc.state)
   default: return invalid_state();
 endcase
 
-case (path_mtu_bytes)
+case (qpc.path_mtu_bytes)
   1024: pmtu_code = 3'd2;
   2048: pmtu_code = 3'd3;
   4096: pmtu_code = 3'd4;
   8192: pmtu_code = 3'd5;
-  default: return invalid_pmtu();
+  default:
+    return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                             "xtr_v1 path MTU is unsupported");
+endcase
+
+case (pmtu_code)
+  3'd2: qpc.path_mtu_bytes = 1024;
+  3'd3: qpc.path_mtu_bytes = 2048;
+  3'd4: qpc.path_mtu_bytes = 4096;
+  3'd5: qpc.path_mtu_bytes = 8192;
+  default:
+    return rdma_status::make(RDMA_SC_CODEC_ERROR,
+                             "xtr_v1 PMTU code is invalid");
 endcase
 ```
 
-All queue backing fields require 4KiB alignment before `>>12`; depths require exact power-of-two encoding. Decode reverses those transformations and returns SQD for hardware state 5.
+All queue backing fields require 4KiB alignment before `>>12`; depths require exact power-of-two encoding. Decode reverses those transformations and returns SQD for hardware state 5. Decode assigns the inverse PMTU mapping only into temporary QPC state, validates that state and the entire image, and publishes the output model only after the whole image passes.
 
 For RC, write `send_psn` to byte offsets `160, 208, 344, 352, 376, 416, 424, 432` and `recv_psn` to `224, 232, 288`, using each offset's frozen LSB/width. Decode uses byte 352 and byte 288 as canonical values only after all mirrors match. Retry and RNR retry are exactly 3 bits.
 
