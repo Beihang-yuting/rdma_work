@@ -17,6 +17,9 @@ FIXED_COMMIT = "491faf2ba42627fffd4dd027607299c8bb591ec2"
 REPO_ROOT = Path(__file__).resolve().parents[1]
 MANIFEST_PATH = REPO_ROOT / "hw" / "xtr_v1" / "source_manifest.txt"
 SV_DEFS_PATH = REPO_ROOT / "src" / "codec" / "xtr_v1" / "rdma_xtr_v1_defs.svh"
+ERROR_CODEC_PATH = (
+    REPO_ROOT / "src" / "codec" / "xtr_v1" / "rdma_xtr_v1_error_codec.svh"
+)
 SV_MASKS_PATH = REPO_ROOT / "src" / "codec" / "xtr_v1" / "rdma_xtr_v1_image_masks.svh"
 GOLDEN_DIR = REPO_ROOT / "hw" / "xtr_v1" / "golden_vectors"
 
@@ -183,12 +186,184 @@ class ValueMapping(NamedTuple):
     subtract_symbol: str = ""
 
 
+class ErrorCodeMapping(NamedTuple):
+    path: str
+    c_symbol: str
+    sv_name: str
+
+
 class BodyTranslation(NamedTuple):
     path: str
     c_symbol: str
     sv_stem: str
     local_word_byte_offset: int
     final_base_offset: int
+
+
+# Every genuine error-code value identity discovered from the pinned headers.
+# Values intentionally do not appear here: validate_error_code_mappings parses
+# them independently from the fixed driver on every checker run.
+ERROR_CODE_MAPPINGS = (
+    ErrorCodeMapping("defs.h", "EC_TPE_DB_TYPE_INVLD", "XTR_V1_ECODE_EC_TPE_DB_TYPE_INVLD"),
+    ErrorCodeMapping("defs.h", "EC_TPE_OCC_QPC_ERR", "XTR_V1_ECODE_EC_TPE_OCC_QPC_ERR"),
+    ErrorCodeMapping("defs.h", "EC_TPE_TX_FLUSH", "XTR_V1_ECODE_EC_TPE_TX_FLUSH"),
+    ErrorCodeMapping("defs.h", "EC_TPE_QP_FLUSH", "XTR_V1_ECODE_EC_TPE_QP_FLUSH"),
+    ErrorCodeMapping("defs.h", "EC_TPE_SQ_VF_QPN_UNMATCH", "XTR_V1_ECODE_EC_TPE_SQ_VF_QPN_UNMATCH"),
+    ErrorCodeMapping("defs.h", "EC_TPE_SQ_RTO_OVERTIME", "XTR_V1_ECODE_EC_TPE_SQ_RTO_OVERTIME"),
+    ErrorCodeMapping("defs.h", "EC_TPE_SQ_SIGN_ERR_OVERTIME", "XTR_V1_ECODE_EC_TPE_SQ_SIGN_ERR_OVERTIME"),
+    ErrorCodeMapping("defs.h", "EC_TPE_SQ_PSN_ERR_OVERTIME", "XTR_V1_ECODE_EC_TPE_SQ_PSN_ERR_OVERTIME"),
+    ErrorCodeMapping("defs.h", "EC_TPE_SQ_KEY_ERR", "XTR_V1_ECODE_EC_TPE_SQ_KEY_ERR"),
+    ErrorCodeMapping("defs.h", "EC_TPE_SQ_WQE_OPCODE_INVLD", "XTR_V1_ECODE_EC_TPE_SQ_WQE_OPCODE_INVLD"),
+    ErrorCodeMapping("defs.h", "EC_TPE_SQ_QP_ACCESS_ERR", "XTR_V1_ECODE_EC_TPE_SQ_QP_ACCESS_ERR"),
+    ErrorCodeMapping("defs.h", "EC_TPE_SQ_WQE_SIGN_ERR", "XTR_V1_ECODE_EC_TPE_SQ_WQE_SIGN_ERR"),
+    ErrorCodeMapping("defs.h", "EC_TPE_SQ_RETRY_FENCE_WQE", "XTR_V1_ECODE_EC_TPE_SQ_RETRY_FENCE_WQE"),
+    ErrorCodeMapping("defs.h", "EC_TPE_SQ_PAYLOAD_LEN_ABOVE", "XTR_V1_ECODE_EC_TPE_SQ_PAYLOAD_LEN_ABOVE"),
+    ErrorCodeMapping("defs.h", "EC_TPE_SQ_WRITE_LEN_UNMATCH", "XTR_V1_ECODE_EC_TPE_SQ_WRITE_LEN_UNMATCH"),
+    ErrorCodeMapping("defs.h", "EC_TPE_SGB_KEY_ERR", "XTR_V1_ECODE_EC_TPE_SGB_KEY_ERR"),
+    ErrorCodeMapping("defs.h", "EC_RTS2SQD_DB_QP_ST_UNMATCH", "XTR_V1_ECODE_EC_RTS2SQD_DB_QP_ST_UNMATCH"),
+    ErrorCodeMapping("defs.h", "EC_RTS2SQD_DONE", "XTR_V1_ECODE_EC_RTS2SQD_DONE"),
+    ErrorCodeMapping("defs.h", "EC_SQD2RTS_DB_QP_ST_UNMATCH", "XTR_V1_ECODE_EC_SQD2RTS_DB_QP_ST_UNMATCH"),
+    ErrorCodeMapping("defs.h", "EC_TPE_EIRQ_RDSQ_VF_QPN_UNMATCH", "XTR_V1_ECODE_EC_TPE_EIRQ_RDSQ_VF_QPN_UNMATCH"),
+    ErrorCodeMapping("defs.h", "EC_TPE_EIRQ_RDSQ_KEY_ERR", "XTR_V1_ECODE_EC_TPE_EIRQ_RDSQ_KEY_ERR"),
+    ErrorCodeMapping("defs.h", "EC_TPE_EIRQ_RDSQ_WQE_OPCODE_INVLD", "XTR_V1_ECODE_EC_TPE_EIRQ_RDSQ_WQE_OPCODE_INVLD"),
+    ErrorCodeMapping("defs.h", "EC_TPE_URC_RSQ_RTO_OVERTIME", "XTR_V1_ECODE_EC_TPE_URC_RSQ_RTO_OVERTIME"),
+    ErrorCodeMapping("defs.h", "EC_TPE_TX_LOCAL_WQE_RTO_OVERTIME", "XTR_V1_ECODE_EC_TPE_TX_LOCAL_WQE_RTO_OVERTIME"),
+    ErrorCodeMapping("defs.h", "EC_TPE_SQ_SGE_PLD_LEN_UNMATCH", "XTR_V1_ECODE_EC_TPE_SQ_SGE_PLD_LEN_UNMATCH"),
+    ErrorCodeMapping("defs.h", "EC_TME_OCC_MR_ABNORMAL_RSLT", "XTR_V1_ECODE_EC_TME_OCC_MR_ABNORMAL_RSLT"),
+    ErrorCodeMapping("defs.h", "EC_TME_PBL_INVLD", "XTR_V1_ECODE_EC_TME_PBL_INVLD"),
+    ErrorCodeMapping("defs.h", "EC_TME_PKT_LEN_ZERO", "XTR_V1_ECODE_EC_TME_PKT_LEN_ZERO"),
+    ErrorCodeMapping("defs.h", "EC_TME_PKT_ST_ERR", "XTR_V1_ECODE_EC_TME_PKT_ST_ERR"),
+    ErrorCodeMapping("defs.h", "EC_TME_PKT_TYPE_ERR", "XTR_V1_ECODE_EC_TME_PKT_TYPE_ERR"),
+    ErrorCodeMapping("defs.h", "EC_TME_PKT_PD_ERR", "XTR_V1_ECODE_EC_TME_PKT_PD_ERR"),
+    ErrorCodeMapping("defs.h", "EC_TME_PKT_KEY_ERR", "XTR_V1_ECODE_EC_TME_PKT_KEY_ERR"),
+    ErrorCodeMapping("defs.h", "EC_TME_PKT_TYPE1_NOT_VA", "XTR_V1_ECODE_EC_TME_PKT_TYPE1_NOT_VA"),
+    ErrorCodeMapping("defs.h", "EC_TME_PKT_MR_LEN_ZERO", "XTR_V1_ECODE_EC_TME_PKT_MR_LEN_ZERO"),
+    ErrorCodeMapping("defs.h", "EC_TME_PKT_LEN_ERR", "XTR_V1_ECODE_EC_TME_PKT_LEN_ERR"),
+    ErrorCodeMapping("defs.h", "EC_TME_PKT_TYPE2B_QPN_ERR", "XTR_V1_ECODE_EC_TME_PKT_TYPE2B_QPN_ERR"),
+    ErrorCodeMapping("defs.h", "EC_TME_PLD_LEN_CHK_ERR", "XTR_V1_ECODE_EC_TME_PLD_LEN_CHK_ERR"),
+    ErrorCodeMapping("defs.h", "EC_TME_LOINVLD_NOT_PERMIT", "XTR_V1_ECODE_EC_TME_LOINVLD_NOT_PERMIT"),
+    ErrorCodeMapping("defs.h", "EC_TME_LOINVLD_ST_INVLD", "XTR_V1_ECODE_EC_TME_LOINVLD_ST_INVLD"),
+    ErrorCodeMapping("defs.h", "EC_TME_LOINVLD_TYPE1_MW", "XTR_V1_ECODE_EC_TME_LOINVLD_TYPE1_MW"),
+    ErrorCodeMapping("defs.h", "EC_TME_LOINVLD_PD_ERR", "XTR_V1_ECODE_EC_TME_LOINVLD_PD_ERR"),
+    ErrorCodeMapping("defs.h", "EC_TME_LOINVLD_KEY_ERR", "XTR_V1_ECODE_EC_TME_LOINVLD_KEY_ERR"),
+    ErrorCodeMapping("defs.h", "EC_TME_LOINVLD_MR_WITH_MW", "XTR_V1_ECODE_EC_TME_LOINVLD_MR_WITH_MW"),
+    ErrorCodeMapping("defs.h", "EC_TME_LOINVLD_TYPE2B_QPN_ERR", "XTR_V1_ECODE_EC_TME_LOINVLD_TYPE2B_QPN_ERR"),
+    ErrorCodeMapping("defs.h", "EC_TME_BIND_PARENT_MR_ST_NOT_VLD", "XTR_V1_ECODE_EC_TME_BIND_PARENT_MR_ST_NOT_VLD"),
+    ErrorCodeMapping("defs.h", "EC_TME_BIND_MW_ST_INVLD", "XTR_V1_ECODE_EC_TME_BIND_MW_ST_INVLD"),
+    ErrorCodeMapping("defs.h", "EC_TME_BIND_MW_ST_NOT_FREE", "XTR_V1_ECODE_EC_TME_BIND_MW_ST_NOT_FREE"),
+    ErrorCodeMapping("defs.h", "EC_TME_BIND_PARENT_MR_TYPE_ERR", "XTR_V1_ECODE_EC_TME_BIND_PARENT_MR_TYPE_ERR"),
+    ErrorCodeMapping("defs.h", "EC_TME_BIND_MW_TYPE_ERR", "XTR_V1_ECODE_EC_TME_BIND_MW_TYPE_ERR"),
+    ErrorCodeMapping("defs.h", "EC_TME_BIND_WQE_TYPE_ERR", "XTR_V1_ECODE_EC_TME_BIND_WQE_TYPE_ERR"),
+    ErrorCodeMapping("defs.h", "EC_TME_BIND_PD_ERR", "XTR_V1_ECODE_EC_TME_BIND_PD_ERR"),
+    ErrorCodeMapping("defs.h", "EC_TME_BIND_PARENT_MR_KEY_ERR", "XTR_V1_ECODE_EC_TME_BIND_PARENT_MR_KEY_ERR"),
+    ErrorCodeMapping("defs.h", "EC_TME_BIND_PARENT_MR_RIGHT_B_ERR", "XTR_V1_ECODE_EC_TME_BIND_PARENT_MR_RIGHT_B_ERR"),
+    ErrorCodeMapping("defs.h", "EC_TME_BIND_PARENT_MR_RIGHT_LW_ERR", "XTR_V1_ECODE_EC_TME_BIND_PARENT_MR_RIGHT_LW_ERR"),
+    ErrorCodeMapping("defs.h", "EC_TME_BIND_PARENT_MR_NOT_VA", "XTR_V1_ECODE_EC_TME_BIND_PARENT_MR_NOT_VA"),
+    ErrorCodeMapping("defs.h", "EC_TME_BIND_MW_LEN_ERR", "XTR_V1_ECODE_EC_TME_BIND_MW_LEN_ERR"),
+    ErrorCodeMapping("defs.h", "EC_TME_BIND_MW_TYPE1_OP_ERR", "XTR_V1_ECODE_EC_TME_BIND_MW_TYPE1_OP_ERR"),
+    ErrorCodeMapping("defs.h", "EC_TME_BIND_MW_TYPE2B_ZERO_BIND", "XTR_V1_ECODE_EC_TME_BIND_MW_TYPE2B_ZERO_BIND"),
+    ErrorCodeMapping("defs.h", "EC_TME_BIND_PARENT_MR_BIND_NUM_ERR", "XTR_V1_ECODE_EC_TME_BIND_PARENT_MR_BIND_NUM_ERR"),
+    ErrorCodeMapping("defs.h", "EC_TME_FMR_ST_ERR", "XTR_V1_ECODE_EC_TME_FMR_ST_ERR"),
+    ErrorCodeMapping("defs.h", "EC_TME_FMR_TYPE_ERR", "XTR_V1_ECODE_EC_TME_FMR_TYPE_ERR"),
+    ErrorCodeMapping("defs.h", "EC_TME_FMR_PD_ERR", "XTR_V1_ECODE_EC_TME_FMR_PD_ERR"),
+    ErrorCodeMapping("defs.h", "EC_TDE_DMA_ERR", "XTR_V1_ECODE_EC_TDE_DMA_ERR"),
+    ErrorCodeMapping("defs.h", "EC_TDE_SRC_ADDR_TBL_INVLD", "XTR_V1_ECODE_EC_TDE_SRC_ADDR_TBL_INVLD"),
+    ErrorCodeMapping("defs.h", "EC_CCE_RC_CCREQ", "XTR_V1_ECODE_EC_CCE_RC_CCREQ"),
+    ErrorCodeMapping("defs.h", "EC_CCE_RC_ACK", "XTR_V1_ECODE_EC_CCE_RC_ACK"),
+    ErrorCodeMapping("defs.h", "EC_CCE_URC_ACK", "XTR_V1_ECODE_EC_CCE_URC_ACK"),
+    ErrorCodeMapping("defs.h", "EC_RPE_REQ_SRFQ_OVER_LIMIT_TH", "XTR_V1_ECODE_EC_RPE_REQ_SRFQ_OVER_LIMIT_TH"),
+    ErrorCodeMapping("defs.h", "EC_RPE_REQ_SRFQ_PKT_LEN_UNMATCH_SGE", "XTR_V1_ECODE_EC_RPE_REQ_SRFQ_PKT_LEN_UNMATCH_SGE"),
+    ErrorCodeMapping("defs.h", "EC_RPE_REQ_SRFQ_WQE_ERR", "XTR_V1_ECODE_EC_RPE_REQ_SRFQ_WQE_ERR"),
+    ErrorCodeMapping("defs.h", "EC_RPE_REQ_SRFQ_ST_INVLD", "XTR_V1_ECODE_EC_RPE_REQ_SRFQ_ST_INVLD"),
+    ErrorCodeMapping("defs.h", "EC_RPE_REQ_DUP_DR_NML_URC", "XTR_V1_ECODE_EC_RPE_REQ_DUP_DR_NML_URC"),
+    ErrorCodeMapping("defs.h", "EC_RPE_REQ_DR_OWN_URC", "XTR_V1_ECODE_EC_RPE_REQ_DR_OWN_URC"),
+    ErrorCodeMapping("defs.h", "EC_RPE_RC_URC_ACCESS_INVLD", "XTR_V1_ECODE_EC_RPE_RC_URC_ACCESS_INVLD"),
+    ErrorCodeMapping("defs.h", "EC_RPE_ICRC_ERR_TRIM_PKT", "XTR_V1_ECODE_EC_RPE_ICRC_ERR_TRIM_PKT"),
+    ErrorCodeMapping("defs.h", "EC_RPE_OCC_QPC_ERR", "XTR_V1_ECODE_EC_RPE_OCC_QPC_ERR"),
+    ErrorCodeMapping("defs.h", "EC_RPE_RC_URC_OPCODE_INVLD", "XTR_V1_ECODE_EC_RPE_RC_URC_OPCODE_INVLD"),
+    ErrorCodeMapping("defs.h", "EC_RPE_RX_FLUSH", "XTR_V1_ECODE_EC_RPE_RX_FLUSH"),
+    ErrorCodeMapping("defs.h", "EC_RPE_REQ_RQ_WQE_ERR_UD", "XTR_V1_ECODE_EC_RPE_REQ_RQ_WQE_ERR_UD"),
+    ErrorCodeMapping("defs.h", "EC_RPE_REQ_ATOMIC_OCTBYTE_ALIGN_ERR", "XTR_V1_ECODE_EC_RPE_REQ_ATOMIC_OCTBYTE_ALIGN_ERR"),
+    ErrorCodeMapping("defs.h", "EC_RPE_REQ_OPCODE_MIS_LAST", "XTR_V1_ECODE_EC_RPE_REQ_OPCODE_MIS_LAST"),
+    ErrorCodeMapping("defs.h", "EC_RPE_REQ_OPCODE_MIS_FST", "XTR_V1_ECODE_EC_RPE_REQ_OPCODE_MIS_FST"),
+    ErrorCodeMapping("defs.h", "EC_RPE_REQ_PKT_LEN_UNMATCH_PMTU_PAD", "XTR_V1_ECODE_EC_RPE_REQ_PKT_LEN_UNMATCH_PMTU_PAD"),
+    ErrorCodeMapping("defs.h", "EC_RPE_REQ_PKT_LEN_UNMATCH_RETH", "XTR_V1_ECODE_EC_RPE_REQ_PKT_LEN_UNMATCH_RETH"),
+    ErrorCodeMapping("defs.h", "EC_RPE_REQ_PKT_LEN_UNMATCH_SGE_RC_URC", "XTR_V1_ECODE_EC_RPE_REQ_PKT_LEN_UNMATCH_SGE_RC_URC"),
+    ErrorCodeMapping("defs.h", "EC_RPE_REQ_RQ_WQE_ERR_RC_URC", "XTR_V1_ECODE_EC_RPE_REQ_RQ_WQE_ERR_RC_URC"),
+    ErrorCodeMapping("defs.h", "EC_RPE_RSP_ORQ_WQE_ERR", "XTR_V1_ECODE_EC_RPE_RSP_ORQ_WQE_ERR"),
+    ErrorCodeMapping("defs.h", "EC_RPE_RSP_OPCODE_MIS_LAST", "XTR_V1_ECODE_EC_RPE_RSP_OPCODE_MIS_LAST"),
+    ErrorCodeMapping("defs.h", "EC_RPE_RSP_OPCODE_MIS_FST", "XTR_V1_ECODE_EC_RPE_RSP_OPCODE_MIS_FST"),
+    ErrorCodeMapping("defs.h", "EC_RPE_RSP_PKT_LEN_UNMATCH_SGE_RC", "XTR_V1_ECODE_EC_RPE_RSP_PKT_LEN_UNMATCH_SGE_RC"),
+    ErrorCodeMapping("defs.h", "EC_RPE_RSP_PKT_LEN_UNMATCH_PMTU_PAD", "XTR_V1_ECODE_EC_RPE_RSP_PKT_LEN_UNMATCH_PMTU_PAD"),
+    ErrorCodeMapping("defs.h", "EC_RPE_RSP_PSN_UNMATCH_ORQ_LAST_PSN", "XTR_V1_ECODE_EC_RPE_RSP_PSN_UNMATCH_ORQ_LAST_PSN"),
+    ErrorCodeMapping("defs.h", "EC_RPE_RSP_ORQE_PSN_ERR", "XTR_V1_ECODE_EC_RPE_RSP_ORQE_PSN_ERR"),
+    ErrorCodeMapping("defs.h", "EC_RPE_RSP_NAK_RNR_ERR_OVERTIME", "XTR_V1_ECODE_EC_RPE_RSP_NAK_RNR_ERR_OVERTIME"),
+    ErrorCodeMapping("defs.h", "EC_RPE_NAK_FATAL_ERR", "XTR_V1_ECODE_EC_RPE_NAK_FATAL_ERR"),
+    ErrorCodeMapping("defs.h", "EC_RPE_RX_FLUSH_QP_INVLD", "XTR_V1_ECODE_EC_RPE_RX_FLUSH_QP_INVLD"),
+    ErrorCodeMapping("defs.h", "EC_RPE_URC_DR_TCIE", "XTR_V1_ECODE_EC_RPE_URC_DR_TCIE"),
+    ErrorCodeMapping("defs.h", "EC_RPE_NACK_CIE", "XTR_V1_ECODE_EC_RPE_NACK_CIE"),
+    ErrorCodeMapping("defs.h", "EC_RME_OCC_MR_ABNORMAL_RSLT", "XTR_V1_ECODE_EC_RME_OCC_MR_ABNORMAL_RSLT"),
+    ErrorCodeMapping("defs.h", "EC_RME_PBL_INVLD", "XTR_V1_ECODE_EC_RME_PBL_INVLD"),
+    ErrorCodeMapping("defs.h", "EC_RME_PKT_SRFQ_PD_ERR", "XTR_V1_ECODE_EC_RME_PKT_SRFQ_PD_ERR"),
+    ErrorCodeMapping("defs.h", "EC_RME_PKT_LEN_ZERO", "XTR_V1_ECODE_EC_RME_PKT_LEN_ZERO"),
+    ErrorCodeMapping("defs.h", "EC_RME_PKT_ST_ERR", "XTR_V1_ECODE_EC_RME_PKT_ST_ERR"),
+    ErrorCodeMapping("defs.h", "EC_RME_PKT_TYPE_ERR", "XTR_V1_ECODE_EC_RME_PKT_TYPE_ERR"),
+    ErrorCodeMapping("defs.h", "EC_RME_PKT_PD_ERR", "XTR_V1_ECODE_EC_RME_PKT_PD_ERR"),
+    ErrorCodeMapping("defs.h", "EC_RME_PKT_KEY_ERR", "XTR_V1_ECODE_EC_RME_PKT_KEY_ERR"),
+    ErrorCodeMapping("defs.h", "EC_RME_PKT_RIGHT_ERR", "XTR_V1_ECODE_EC_RME_PKT_RIGHT_ERR"),
+    ErrorCodeMapping("defs.h", "EC_RME_PKT_TYPE1_NOT_VA", "XTR_V1_ECODE_EC_RME_PKT_TYPE1_NOT_VA"),
+    ErrorCodeMapping("defs.h", "EC_RME_PKT_MR_LEN_ZERO", "XTR_V1_ECODE_EC_RME_PKT_MR_LEN_ZERO"),
+    ErrorCodeMapping("defs.h", "EC_RME_PKT_LEN_ERR", "XTR_V1_ECODE_EC_RME_PKT_LEN_ERR"),
+    ErrorCodeMapping("defs.h", "EC_RME_PKT_SRFQ_MR_ERR", "XTR_V1_ECODE_EC_RME_PKT_SRFQ_MR_ERR"),
+    ErrorCodeMapping("defs.h", "EC_RME_ROINVLD_NOT_PERMIT", "XTR_V1_ECODE_EC_RME_ROINVLD_NOT_PERMIT"),
+    ErrorCodeMapping("defs.h", "EC_RME_ROINVLD_ST_INVLD", "XTR_V1_ECODE_EC_RME_ROINVLD_ST_INVLD"),
+    ErrorCodeMapping("defs.h", "EC_RME_ROINVLD_TYPE1_MW", "XTR_V1_ECODE_EC_RME_ROINVLD_TYPE1_MW"),
+    ErrorCodeMapping("defs.h", "EC_RME_ROINVLD_PD_ERR", "XTR_V1_ECODE_EC_RME_ROINVLD_PD_ERR"),
+    ErrorCodeMapping("defs.h", "EC_RME_ROINVLD_KEY_ERR", "XTR_V1_ECODE_EC_RME_ROINVLD_KEY_ERR"),
+    ErrorCodeMapping("defs.h", "EC_RME_ROINVLD_MR_WITH_MW", "XTR_V1_ECODE_EC_RME_ROINVLD_MR_WITH_MW"),
+    ErrorCodeMapping("defs.h", "EC_RME_ROINVLD_TYPE2B_QPN_ERR", "XTR_V1_ECODE_EC_RME_ROINVLD_TYPE2B_QPN_ERR"),
+    ErrorCodeMapping("defs.h", "EC_RME_PKT_TYPE2B_QPN_ERR", "XTR_V1_ECODE_EC_RME_PKT_TYPE2B_QPN_ERR"),
+    ErrorCodeMapping("defs.h", "EC_RME_PLD_LEN_CHK_ERR", "XTR_V1_ECODE_EC_RME_PLD_LEN_CHK_ERR"),
+    ErrorCodeMapping("defs.h", "EC_RCE_OCC_EIRQ_RDSQ_ERR", "XTR_V1_ECODE_EC_RCE_OCC_EIRQ_RDSQ_ERR"),
+    ErrorCodeMapping("defs.h", "EC_RCE_OCC_UAQ_ERR", "XTR_V1_ECODE_EC_RCE_OCC_UAQ_ERR"),
+    ErrorCodeMapping("defs.h", "EC_RCE_URC_TACK_RBM_DUP_PKT", "XTR_V1_ECODE_EC_RCE_URC_TACK_RBM_DUP_PKT"),
+    ErrorCodeMapping("defs.h", "EC_RCE_OCC_CQC_ERR", "XTR_V1_ECODE_EC_RCE_OCC_CQC_ERR"),
+    ErrorCodeMapping("defs.h", "EC_RCE_CQC_INVLD", "XTR_V1_ECODE_EC_RCE_CQC_INVLD"),
+    ErrorCodeMapping("defs.h", "EC_RCE_CQ_FULL", "XTR_V1_ECODE_EC_RCE_CQ_FULL"),
+    ErrorCodeMapping("defs.h", "EC_RCE_CQ_LOAD_PBA_ERR", "XTR_V1_ECODE_EC_RCE_CQ_LOAD_PBA_ERR"),
+    ErrorCodeMapping("defs.h", "EC_RCE_COM_EST", "XTR_V1_ECODE_EC_RCE_COM_EST"),
+    ErrorCodeMapping("defs.h", "EC_RCE_CEQC_INVLD", "XTR_V1_ECODE_EC_RCE_CEQC_INVLD"),
+    ErrorCodeMapping("defs.h", "EC_RCE_CEQ_FULL", "XTR_V1_ECODE_EC_RCE_CEQ_FULL"),
+    ErrorCodeMapping("defs.h", "EC_RCE_AEQC_INVLD", "XTR_V1_ECODE_EC_RCE_AEQC_INVLD"),
+    ErrorCodeMapping("defs.h", "EC_RCE_AEQ_FULL", "XTR_V1_ECODE_EC_RCE_AEQ_FULL"),
+    ErrorCodeMapping("defs.h", "EC_GLB_MBUS_ERR", "XTR_V1_ECODE_EC_GLB_MBUS_ERR"),
+    ErrorCodeMapping("wr.h", "XTRDMA_CQE_ECODE_TX_REQ_NML", "XTR_V1_ECODE_XTRDMA_CQE_ECODE_TX_REQ_NML"),
+    ErrorCodeMapping("wr.h", "XTRDMA_CQE_ECODE_TX_RSP_NML", "XTR_V1_ECODE_XTRDMA_CQE_ECODE_TX_RSP_NML"),
+    ErrorCodeMapping("wr.h", "XTRDMA_CQE_ECODE_SQ_FLUSH_ERR", "XTR_V1_ECODE_XTRDMA_CQE_ECODE_SQ_FLUSH_ERR"),
+    ErrorCodeMapping("wr.h", "XTRDMA_CQE_ECODE_TX_EC_CCE_URC_ACK", "XTR_V1_ECODE_XTRDMA_CQE_ECODE_TX_EC_CCE_URC_ACK"),
+    ErrorCodeMapping("wr.h", "XTRDMA_CQE_ECODE_SRFQ_OVER_LIMIT_TH", "XTR_V1_ECODE_XTRDMA_CQE_ECODE_SRFQ_OVER_LIMIT_TH"),
+    ErrorCodeMapping("wr.h", "XTRDMA_CQE_ECODE_RX_REQ_NML", "XTR_V1_ECODE_XTRDMA_CQE_ECODE_RX_REQ_NML"),
+    ErrorCodeMapping("wr.h", "XTRDMA_CQE_ECODE_RX_RSP_NML", "XTR_V1_ECODE_XTRDMA_CQE_ECODE_RX_RSP_NML"),
+    ErrorCodeMapping("wr.h", "XTRDMA_CQE_ECODE_RQ_FLUSH_ERR", "XTR_V1_ECODE_XTRDMA_CQE_ECODE_RQ_FLUSH_ERR"),
+    ErrorCodeMapping("wr.h", "XTRDMA_CQE_ECODE_NAK_FATAL_ERR", "XTR_V1_ECODE_XTRDMA_CQE_ECODE_NAK_FATAL_ERR"),
+    ErrorCodeMapping("wr.h", "XTRDMA_CQE_ECODE_TX_EC_RCE_URC_SQ_CPL_SRBM_DUP_PKT", "XTR_V1_ECODE_XTRDMA_CQE_ECODE_TX_EC_RCE_URC_SQ_CPL_SRBM_DUP_PKT"),
+)
+
+# The pinned sources intentionally give these five values two identities.
+# Canonical symbolic lookup preserves the defs.h identity; every alias still
+# receives its own independently checked SV constant.
+EXPECTED_ERROR_CODE_ALIASES = (
+    (("defs.h", "EC_TPE_QP_FLUSH"),
+     ("wr.h", "XTRDMA_CQE_ECODE_SQ_FLUSH_ERR")),
+    (("defs.h", "EC_CCE_URC_ACK"),
+     ("wr.h", "XTRDMA_CQE_ECODE_TX_EC_CCE_URC_ACK")),
+    (("defs.h", "EC_RPE_REQ_SRFQ_OVER_LIMIT_TH"),
+     ("wr.h", "XTRDMA_CQE_ECODE_SRFQ_OVER_LIMIT_TH")),
+    (("defs.h", "EC_RPE_RX_FLUSH"),
+     ("wr.h", "XTRDMA_CQE_ECODE_RQ_FLUSH_ERR")),
+    (("defs.h", "EC_RPE_NAK_FATAL_ERR"),
+     ("wr.h", "XTRDMA_CQE_ECODE_NAK_FATAL_ERR")),
+)
 
 
 class GoldenInput(NamedTuple):
@@ -636,17 +811,6 @@ VALUE_MAPPINGS = (
     ValueMapping("defs.h", "XTRDMA_ACCESS_FLAGS_REMOTE_WRITE", "XTR_V1_RIGHT_REMOTE_WRITE"),
     ValueMapping("defs.h", "XTRDMA_ACCESS_FLAGS_BIND_WINDOW", "XTR_V1_RIGHT_BIND_WINDOW"),
     ValueMapping("defs.h", "XTRDMA_ACCESS_FLAGS_REMOTE_ATOMIC", "XTR_V1_RIGHT_REMOTE_ATOMIC"),
-    ValueMapping("defs.h", "EC_TPE_DB_TYPE_INVLD", "XTR_V1_EC_TPE_DB_TYPE_INVLD"),
-    ValueMapping("defs.h", "EC_TPE_SQ_KEY_ERR", "XTR_V1_EC_TPE_SQ_KEY_ERR"),
-    ValueMapping("defs.h", "EC_TPE_SQ_WQE_OPCODE_INVLD", "XTR_V1_EC_TPE_SQ_WQE_OPCODE_INVLD"),
-    ValueMapping("defs.h", "EC_TME_PKT_KEY_ERR", "XTR_V1_EC_TME_PKT_KEY_ERR"),
-    ValueMapping("defs.h", "EC_TDE_DMA_ERR", "XTR_V1_EC_TDE_DMA_ERR"),
-    ValueMapping("defs.h", "EC_RPE_REQ_SRFQ_OVER_LIMIT_TH", "XTR_V1_EC_RPE_SRFQ_LIMIT"),
-    ValueMapping("defs.h", "EC_RPE_ICRC_ERR_TRIM_PKT", "XTR_V1_EC_RPE_ICRC"),
-    ValueMapping("defs.h", "EC_RPE_RX_FLUSH", "XTR_V1_EC_RPE_RX_FLUSH"),
-    ValueMapping("defs.h", "EC_RCE_OCC_CQC_ERR", "XTR_V1_EC_RCE_OCC_CQC"),
-    ValueMapping("defs.h", "EC_RCE_CQ_FULL", "XTR_V1_EC_RCE_CQ_FULL"),
-    ValueMapping("defs.h", "EC_GLB_MBUS_ERR", "XTR_V1_EC_GLB_MBUS"),
 )
 
 # Normalized input-right sets and their hardware result bits, independently
@@ -665,6 +829,9 @@ PROFILE_VALUES = {
     "XTR_V1_RQE_BYTES": 64,
     "XTR_V1_CQE_BYTES": 64,
     "XTR_V1_DB_BYTES": 8,
+    # CMQ completion zero is a profile success code, not a claim that the
+    # wr.h TX_REQ_NML identity describes a CMQ completion.
+    "XTR_V1_CMQ_SUCCESS_ECODE": 0,
     # Raw destination-IP bytes are not a mask-backed qword field, so their
     # placement is frozen as independently checked profile metadata.
     "XTR_V1_QPC_DEST_IP_BYTE_OFFSET": 80,
@@ -709,7 +876,56 @@ def parse_sv_value(expression: str) -> int:
     raise ValidationError(f"unsupported SV constant expression: {expression}")
 
 
+def strip_sv_comments(text: str) -> str:
+    """Remove SV comments while preserving strings and source layout."""
+    result: list[str] = []
+    index = 0
+    state = "code"
+    while index < len(text):
+        char = text[index]
+        following = text[index + 1] if index + 1 < len(text) else ""
+        if state == "code":
+            if char == '"':
+                result.append(char)
+                state = "string"
+                index += 1
+            elif char == "/" and following == "/":
+                result.extend((" ", " "))
+                state = "line_comment"
+                index += 2
+            elif char == "/" and following == "*":
+                result.extend((" ", " "))
+                state = "block_comment"
+                index += 2
+            else:
+                result.append(char)
+                index += 1
+        elif state == "string":
+            result.append(char)
+            index += 1
+            if char == "\\" and index < len(text):
+                result.append(text[index])
+                index += 1
+            elif char == '"':
+                state = "code"
+        elif state == "line_comment":
+            result.append(char if char in "\r\n" else " ")
+            index += 1
+            if char == "\n":
+                state = "code"
+        else:
+            if char == "*" and following == "/":
+                result.extend((" ", " "))
+                state = "code"
+                index += 2
+            else:
+                result.append(char if char in "\r\n" else " ")
+                index += 1
+    return "".join(result)
+
+
 def parse_sv_constants(text: str) -> dict[str, int]:
+    text = strip_sv_comments(text)
     constants: dict[str, int] = {}
 
     def add(name: str, value: int) -> None:
@@ -804,6 +1020,8 @@ def validate_mapping_uniqueness(
                 add_final(f"{reference.sv_stem}_{suffix}", producer)
     for mapping in value_mappings:
         add_final(mapping.sv_name, f"value {mapping.sv_name}")
+    for mapping in ERROR_CODE_MAPPINGS:
+        add_final(mapping.sv_name, f"error code {mapping.path}:{mapping.c_symbol}")
     for name in PROFILE_VALUES:
         add_final(name, f"profile {name}")
 
@@ -1018,6 +1236,306 @@ def require_unique_expression(
     if len(expressions) != 1:
         raise ValidationError(f"mapped symbol {symbol} is duplicated in {source_path}")
     return expressions[0]
+
+
+def discover_error_code_values(
+    source_text: dict[str, str],
+) -> dict[tuple[str, str], int]:
+    """Discover genuine code values by pinned path and source-name pattern."""
+    values: dict[tuple[str, str], int] = {}
+    patterns = {
+        "defs.h": re.compile(r"^EC_[A-Za-z0-9_]+$"),
+        # The trailing underscore excludes the XTRDMA_CQE_ECODE field mask.
+        "wr.h": re.compile(r"^XTRDMA_CQE_ECODE_[A-Za-z0-9_]+$"),
+    }
+    for path, pattern in patterns.items():
+        text = source_text.get(path)
+        if text is None:
+            raise ValidationError(f"error code source missing: {path}")
+        macros, enums = parse_c_symbols(text)
+        names = {name for name in macros if pattern.fullmatch(name)}
+        names.update(name for name in enums if pattern.fullmatch(name))
+        for name in names:
+            macro_expressions = macros.get(name, [])
+            enum_expressions = enums.get(name, [])
+            expressions = macro_expressions + enum_expressions
+            if len(expressions) != 1:
+                raise ValidationError(
+                    f"error code {name} is duplicated in {path}"
+                )
+            expression = expressions[0]
+            value = parse_value_expression(expression)
+            if not 0 <= value <= 0xFF:
+                raise ValidationError(
+                    f"error code {path}:{name} is outside 8-bit range: {value:#x}"
+                )
+            values[(path, name)] = value
+    return values
+
+
+def validate_error_code_mappings(
+    mappings: tuple[ErrorCodeMapping, ...],
+    source_text: dict[str, str],
+    sv_text: str,
+) -> dict[tuple[str, str], int]:
+    """Check identity completeness and independently derived SV code values."""
+    sv_text = strip_sv_comments(sv_text)
+    identities = [(mapping.path, mapping.c_symbol) for mapping in mappings]
+    if len(identities) != len(set(identities)):
+        raise ValidationError("duplicate error code source identity")
+    sv_names = [mapping.sv_name for mapping in mappings]
+    if len(sv_names) != len(set(sv_names)):
+        raise ValidationError("duplicate error code SV name")
+    for mapping in mappings:
+        expected_name = f"XTR_V1_ECODE_{mapping.c_symbol}"
+        if mapping.sv_name != expected_name:
+            raise ValidationError(
+                f"error code SV name loses source identity: {mapping.sv_name}"
+            )
+
+    source_values = discover_error_code_values(source_text)
+    discovered = set(source_values)
+    declared = set(identities)
+    missing = sorted(discovered - declared)
+    extra = sorted(declared - discovered)
+    if missing:
+        raise ValidationError(f"missing error code mapping: {missing}")
+    if extra:
+        raise ValidationError(f"extra error code mapping: {extra}")
+
+    sv_constants = parse_sv_constants(sv_text)
+    expected_sv_names = set(sv_names)
+    identifier_counts: dict[str, int] = {}
+    for name in re.findall(r"\bXTR_V1_ECODE_[A-Za-z0-9_]+\b", sv_text):
+        identifier_counts[name] = identifier_counts.get(name, 0) + 1
+    actual_sv_names = set(identifier_counts)
+    missing_sv = sorted(expected_sv_names - actual_sv_names)
+    extra_sv = sorted(actual_sv_names - expected_sv_names)
+    if missing_sv:
+        raise ValidationError(f"missing SV error code constant: {missing_sv}")
+    if extra_sv:
+        raise ValidationError(f"extra SV error code constant: {extra_sv}")
+
+    assignments: dict[str, int] = {}
+    for name in re.findall(
+        r"\b(XTR_V1_ECODE_[A-Za-z0-9_]+)\b\s*=", sv_text
+    ):
+        assignments[name] = assignments.get(name, 0) + 1
+    declarations: dict[str, list[tuple[int, int]]] = {}
+    for match in re.finditer(
+            r"\blocalparam\s+bit\s*\[\s*(\d+)\s*:\s*(\d+)\s*\]\s+"
+            r"(XTR_V1_ECODE_[A-Za-z0-9_]+)\s*=",
+            sv_text,
+    ):
+        declarations.setdefault(match.group(3), []).append(
+            (int(match.group(1)), int(match.group(2)))
+        )
+    for mapping in mappings:
+        if identifier_counts.get(mapping.sv_name) != 1:
+            raise ValidationError(
+                f"SV error code {mapping.sv_name} must have one canonical definition"
+            )
+        if (
+            assignments.get(mapping.sv_name) != 1
+            or declarations.get(mapping.sv_name) != [(7, 0)]
+        ):
+            raise ValidationError(
+                f"SV error code {mapping.sv_name} must be declared bit [7:0]"
+            )
+        expected = source_values[(mapping.path, mapping.c_symbol)]
+        actual = sv_constants[mapping.sv_name]
+        if actual != expected:
+            raise ValidationError(
+                f"SV error code mismatch for {mapping.c_symbol}: "
+                f"{actual:#x} != {expected:#x}"
+            )
+    return source_values
+
+
+def canonical_error_code_mappings(
+    mappings: tuple[ErrorCodeMapping, ...],
+    source_values: dict[tuple[str, str], int],
+    expected_aliases=EXPECTED_ERROR_CODE_ALIASES,
+) -> dict[int, ErrorCodeMapping]:
+    """Select one lookup identity per value after exact alias validation."""
+    by_value: dict[int, list[ErrorCodeMapping]] = {}
+    for mapping in mappings:
+        identity = (mapping.path, mapping.c_symbol)
+        if identity not in source_values:
+            raise ValidationError(f"error code value missing for {identity}")
+        by_value.setdefault(source_values[identity], []).append(mapping)
+
+    observed_aliases = {
+        frozenset((mapping.path, mapping.c_symbol) for mapping in group)
+        for group in by_value.values()
+        if len(group) > 1
+    }
+    required_aliases = {
+        frozenset(group) for group in expected_aliases
+    }
+    if observed_aliases != required_aliases:
+        raise ValidationError(
+            "error code alias set drift: "
+            f"observed={sorted(map(sorted, observed_aliases))}, "
+            f"expected={sorted(map(sorted, required_aliases))}"
+        )
+
+    canonical: dict[int, ErrorCodeMapping] = {}
+    for value, group in by_value.items():
+        defs_mappings = [mapping for mapping in group if mapping.path == "defs.h"]
+        if len(defs_mappings) > 1:
+            raise ValidationError(
+                f"multiple defs.h identities alias error code {value:#x}"
+            )
+        canonical[value] = defs_mappings[0] if defs_mappings else group[0]
+    return canonical
+
+
+def validate_error_codec(
+    codec_text: str,
+    canonical: dict[int, ErrorCodeMapping],
+) -> None:
+    """Bind codec literals and symbolic lookup to validated source identities."""
+    codec_text = strip_sv_comments(codec_text)
+    known_values = set(canonical)
+    for literal in re.finditer(
+        r"\b8\s*'\s*[sS]?\s*([hHdDbBoO])\s*([0-9a-fA-F_]+)",
+        codec_text,
+    ):
+        base = {"h": 16, "d": 10, "b": 2, "o": 8}[
+            literal.group(1).lower()
+        ]
+        try:
+            value = int(literal.group(2).replace("_", ""), base)
+        except ValueError:
+            continue
+        if value in known_values:
+            raise ValidationError(
+                f"raw literal {literal.group(0)} used for known error code"
+            )
+
+    allowed_names = {
+        mapping.sv_name
+        for value, mapping in canonical.items()
+        if value != 0
+    }
+    allowed_names.add("XTR_V1_CMQ_SUCCESS_ECODE")
+    for function_name in ("classify", "inferred_engine"):
+        function = re.search(
+            rf"\blocal\s+function\b[^;]*\b{function_name}\s*\([^;]*\)\s*;"
+            r"(.*?)\bendfunction\b",
+            codec_text,
+            re.S,
+        )
+        if function is None:
+            raise ValidationError(
+                f"hardware error function missing: {function_name}"
+            )
+        explicit_case = re.search(
+            r"\bcase\s*\(\s*hardware_code\s*\)(.*?)"
+            r"^[ \t]*default[ \t]*:",
+            function.group(1),
+            re.S | re.M,
+        )
+        if explicit_case is None:
+            raise ValidationError(
+                f"hardware error case missing default: {function_name}"
+            )
+        item_pattern = re.compile(
+            r"^[ \t]*(?P<labels>[^:;]+?)[ \t]*:[ \t]*"
+            r"\s*return\b[^;]*;",
+            re.M | re.S,
+        )
+        position = 0
+        for item in item_pattern.finditer(explicit_case.group(1)):
+            if explicit_case.group(1)[position:item.start()].strip():
+                raise ValidationError(
+                    f"invalid hardware error case item in {function_name}"
+                )
+            labels = [label.strip() for label in item.group("labels").split(",")]
+            if not labels or any(label not in allowed_names for label in labels):
+                raise ValidationError(
+                    f"invalid hardware error case item in {function_name}: "
+                    f"{item.group('labels').strip()}"
+                )
+            position = item.end()
+        if explicit_case.group(1)[position:].strip():
+            raise ValidationError(
+                f"invalid hardware error case item in {function_name}"
+            )
+
+    symbolic_function = re.search(
+        r"\blocal\s+function\s+string\s+symbolic_name\s*\([^)]*\)\s*;"
+        r"(.*?)\bendfunction\b",
+        codec_text,
+        re.S,
+    )
+    if symbolic_function is None:
+        raise ValidationError("symbolic error code lookup function missing")
+    case_block = re.search(
+        r"\bcase\s*\(\s*hardware_code\s*\)(.*?)\bendcase\b",
+        symbolic_function.group(1),
+        re.S,
+    )
+    if case_block is None:
+        raise ValidationError("symbolic error code lookup case missing")
+    case_body = case_block.group(1)
+    defaults = list(
+        re.finditer(r"^[ \t]*default[ \t]*:", case_body, re.M)
+    )
+    if len(defaults) != 1:
+        raise ValidationError("symbolic error code unknown default differs")
+    explicit_text = case_body[:defaults[0].start()]
+    default_text = case_body[defaults[0].start():]
+    if re.fullmatch(
+        r"\s*default\s*:\s*return\s*\$sformatf\(\s*"
+        r'"XTR_V1_UNKNOWN_ECODE_0x%02x"\s*,\s*hardware_code\s*'
+        r"\)\s*;\s*",
+        default_text,
+        re.S,
+    ) is None:
+        raise ValidationError("symbolic error code unknown default differs")
+
+    observed: list[tuple[str, str]] = []
+    item_pattern = re.compile(
+        r"^[ \t]*(?P<labels>[^:;]+?)[ \t]*:\s*return\s*"
+        r'"(?P<value>(?:\\.|[^"\\])*)"\s*;',
+        re.M | re.S,
+    )
+    position = 0
+    for item in item_pattern.finditer(explicit_text):
+        if explicit_text[position:item.start()].strip():
+            raise ValidationError(
+                "symbolic error code lookup differs from canonical source mapping"
+            )
+        observed.extend(
+            (label.strip(), item.group("value"))
+            for label in item.group("labels").split(",")
+        )
+        position = item.end()
+    if explicit_text[position:].strip():
+        raise ValidationError(
+            "symbolic error code lookup differs from canonical source mapping"
+        )
+    expected = [
+        ("XTR_V1_CMQ_SUCCESS_ECODE", "XTR_V1_CMQ_SUCCESS")
+    ]
+    expected.extend(
+        (mapping.sv_name, mapping.c_symbol)
+        for value, mapping in sorted(canonical.items())
+        if value != 0
+    )
+    if len(observed) != len(set(observed)) or set(observed) != set(expected):
+        raise ValidationError(
+            "symbolic error code lookup differs from canonical source mapping"
+        )
+
+    used_names = set(re.findall(r"\bXTR_V1_ECODE_[A-Za-z0-9_]+\b", codec_text))
+    unknown_names = sorted(used_names - allowed_names)
+    if unknown_names:
+        raise ValidationError(
+            f"codec consumes noncanonical error code constant: {unknown_names}"
+        )
 
 
 class ReferenceImage(bytearray):
@@ -2518,7 +3036,15 @@ def validate(kernel_root: Path) -> None:
 
     parsed_sources = {path: parse_c_symbols(text) for path, text in source_text.items()}
     validate_access_projections(source_text["rdma_main.h"])
-    sv_constants = parse_sv_constants(SV_DEFS_PATH.read_text())
+    sv_defs_text = SV_DEFS_PATH.read_text()
+    error_values = validate_error_code_mappings(
+        ERROR_CODE_MAPPINGS, source_text, sv_defs_text
+    )
+    canonical_error_codes = canonical_error_code_mappings(
+        ERROR_CODE_MAPPINGS, error_values
+    )
+    validate_error_codec(ERROR_CODEC_PATH.read_text(), canonical_error_codes)
+    sv_constants = parse_sv_constants(sv_defs_text)
     validate_profile_constants(sv_constants, PROFILE_VALUES)
     sv_mask_text = SV_MASKS_PATH.read_text()
     validate_sv_mask_api(sv_mask_text)

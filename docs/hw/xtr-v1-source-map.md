@@ -169,8 +169,21 @@ also freezes the rule that remote-write or remote-atomic implies local-write.
   `XTR_V1_QPC_DEST_IP_BYTE_OFFSET=80` and `XTR_V1_QPC_DEST_IP_BYTES=16`;
   golden construction and validation both consume that profile metadata.
 - CEQE and AEQE are 16 bytes.  The frozen queue profile selects a 64-byte CQE.
-- `defs.h` supplies CEQE/AEQE fields and representative error codes used by
-  the later error codec.
+- `defs.h` supplies CEQE/AEQE fields and the complete 133-symbol `EC_*`
+  hardware error-code set.  `wr.h` supplies all 10 genuine
+  `XTRDMA_CQE_ECODE_*` value symbols; the mask-only `XTRDMA_CQE_ECODE` field
+  is excluded.  The checker discovers these identities from the pinned
+  sources and requires an exact 143-row source-to-SV mapping, with an 8-bit
+  SV constant independently checked against every C value.
+- Those 143 identities encode 138 values.  The only permitted aliases are
+  `0x08`, `0x76`, `0x78`, `0x8f`, and `0xb9`, each shared by one `defs.h` and
+  one `wr.h` identity.  Symbolic lookup uses the `defs.h` identity for those
+  aliases and the `wr.h` identity for wr-only values such as `0xf0`.
+  CMQ completion `0x00` remains an explicit profile success symbol rather
+  than being mislabeled as the wr.h TX-request-normal identity.  The checker
+  rejects missing, extra, duplicate, value-drifted, or non-8-bit mappings,
+  symbolic string/constant drift, unexpected aliases, and raw literals for
+  every source-known code consumed by the error codec.
 - `xtrdma_hw.h` supplies every notify-register address.  SV doorbell offsets
   are relative to `XTRDMA_PF_NTFE_BAR_OFFSET`, so they can be added to a
   Function binding's `notify_base` without adding `0x2000` twice.

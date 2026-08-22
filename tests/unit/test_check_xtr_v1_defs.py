@@ -6,6 +6,7 @@ from __future__ import annotations
 import importlib.util
 import os
 from pathlib import Path
+import re
 import subprocess
 import tempfile
 import unittest
@@ -62,6 +63,386 @@ enum sample {
         self.assertEqual(enums["SAMPLE_SIX"], ["6"])
 
 
+class ErrorCodeMappingTest(unittest.TestCase):
+    SOURCES = {
+        "defs.h": """
+#define EC_FIRST 0x02
+#define EC_SHARED 0x08
+""",
+        "wr.h": """
+#define XTRDMA_CQE_ECODE GENMASK(31, 24)
+enum xtrdma_cqe_ecode {
+    XTRDMA_CQE_ECODE_TX_REQ_NML = 0,
+    XTRDMA_CQE_ECODE_SQ_FLUSH_ERR = 0x08,
+    XTRDMA_CQE_ECODE_TX_EC_RCE_URC_SQ_CPL_SRBM_DUP_PKT = 0xf0,
+};
+""",
+    }
+    SOURCE_VALUES = {
+        ("defs.h", "EC_FIRST"): 0x02,
+        ("defs.h", "EC_SHARED"): 0x08,
+        ("wr.h", "XTRDMA_CQE_ECODE_TX_REQ_NML"): 0x00,
+        ("wr.h", "XTRDMA_CQE_ECODE_SQ_FLUSH_ERR"): 0x08,
+        (
+            "wr.h",
+            "XTRDMA_CQE_ECODE_TX_EC_RCE_URC_SQ_CPL_SRBM_DUP_PKT",
+        ): 0xF0,
+    }
+    EXPECTED_ALIASES = (
+        (
+            ("defs.h", "EC_SHARED"),
+            ("wr.h", "XTRDMA_CQE_ECODE_SQ_FLUSH_ERR"),
+        ),
+    )
+
+    def require_checker_attribute(self, name: str):
+        self.assertTrue(
+            hasattr(CHECKER, name), f"checker API missing: {name}"
+        )
+        return getattr(CHECKER, name)
+
+    def mappings(self):
+        mapping_type = self.require_checker_attribute("ErrorCodeMapping")
+        return tuple(
+            mapping_type(path, symbol, f"XTR_V1_ECODE_{symbol}")
+            for path, symbol in self.SOURCE_VALUES
+        )
+
+    def sv_text(self, overrides=None, extra: str = "") -> str:
+        values = dict(self.SOURCE_VALUES)
+        if overrides is not None:
+            values.update(overrides)
+        declarations = []
+        for (_, symbol), value in values.items():
+            declarations.append(
+                f"localparam bit [7:0] XTR_V1_ECODE_{symbol} = 8'h{value:02x};"
+            )
+        declarations.append(
+            "localparam bit [7:0] XTR_V1_CMQ_SUCCESS_ECODE = 8'h00;"
+        )
+        if extra:
+            declarations.append(extra)
+        return "\n".join(declarations)
+
+    def validate_fixture(self, sources=None, sv_text=None, mappings=None):
+        validate = self.require_checker_attribute(
+            "validate_error_code_mappings"
+        )
+        return validate(
+            self.mappings() if mappings is None else mappings,
+            self.SOURCES if sources is None else sources,
+            self.sv_text() if sv_text is None else sv_text,
+        )
+
+    def canonical_fixture(self):
+        canonicalize = self.require_checker_attribute(
+            "canonical_error_code_mappings"
+        )
+        mappings = self.mappings()
+        values = self.validate_fixture(mappings=mappings)
+        return canonicalize(mappings, values, self.EXPECTED_ALIASES)
+
+    def codec_text(self) -> str:
+        return """
+local function rdma_status_code_e classify(bit [7:0] hardware_code);
+  case (hardware_code)
+    XTR_V1_CMQ_SUCCESS_ECODE: return RDMA_SC_OK;
+    XTR_V1_ECODE_EC_FIRST: return RDMA_SC_UNKNOWN_HW_ERROR;
+    default: return RDMA_SC_UNKNOWN_HW_ERROR;
+  endcase
+endfunction
+local function rdma_engine_kind_e inferred_engine(bit [7:0] hardware_code);
+  case (hardware_code)
+    XTR_V1_ECODE_EC_SHARED: return RDMA_ENGINE_CQ;
+    default: return RDMA_ENGINE_CMQ;
+  endcase
+endfunction
+local function string symbolic_name(bit [7:0] hardware_code);
+  case (hardware_code)
+    XTR_V1_CMQ_SUCCESS_ECODE: return "XTR_V1_CMQ_SUCCESS";
+    XTR_V1_ECODE_EC_FIRST: return "EC_FIRST";
+    XTR_V1_ECODE_EC_SHARED: return "EC_SHARED";
+    XTR_V1_ECODE_XTRDMA_CQE_ECODE_TX_EC_RCE_URC_SQ_CPL_SRBM_DUP_PKT:
+      return "XTRDMA_CQE_ECODE_TX_EC_RCE_URC_SQ_CPL_SRBM_DUP_PKT";
+    default: return $sformatf("XTR_V1_UNKNOWN_ECODE_0x%02x", hardware_code);
+  endcase
+endfunction
+"""
+
+    def test_source_discovery_rejects_missing_and_extra_mapping(self) -> None:
+        mappings = self.mappings()
+        self.validate_fixture(mappings=mappings)
+
+        with self.assertRaisesRegex(
+            CHECKER.ValidationError, "missing error code mapping"
+        ):
+            self.validate_fixture(mappings=mappings[:-1])
+
+        mapping_type = self.require_checker_attribute("ErrorCodeMapping")
+        extra = mapping_type(
+            "defs.h", "EC_GHOST", "XTR_V1_ECODE_EC_GHOST"
+        )
+        with self.assertRaisesRegex(
+            CHECKER.ValidationError, "extra error code mapping"
+        ):
+            self.validate_fixture(mappings=mappings + (extra,))
+
+    def test_mapping_identity_and_sv_names_must_be_unique(self) -> None:
+        mappings = self.mappings()
+        duplicate_identity = mappings[0]._replace(
+            sv_name="XTR_V1_ECODE_DUPLICATE_IDENTITY"
+        )
+        with self.assertRaisesRegex(
+            CHECKER.ValidationError, "duplicate error code source identity"
+        ):
+            self.validate_fixture(mappings=mappings + (duplicate_identity,))
+
+        duplicate_sv_name = mappings[0]._replace(
+            path=mappings[1].path,
+            c_symbol=mappings[1].c_symbol,
+        )
+        with self.assertRaisesRegex(
+            CHECKER.ValidationError, "duplicate error code SV name"
+        ):
+            self.validate_fixture(
+                mappings=mappings[:1] + (duplicate_sv_name,) + mappings[2:]
+            )
+
+    def test_source_and_sv_constant_value_drift_are_rejected(self) -> None:
+        drifted_sources = dict(self.SOURCES)
+        drifted_sources["defs.h"] = drifted_sources["defs.h"].replace(
+            "EC_FIRST 0x02", "EC_FIRST 0x03"
+        )
+        with self.assertRaisesRegex(
+            CHECKER.ValidationError, "SV error code mismatch.*EC_FIRST"
+        ):
+            self.validate_fixture(sources=drifted_sources)
+
+        with self.assertRaisesRegex(
+            CHECKER.ValidationError, "SV error code mismatch.*EC_FIRST"
+        ):
+            self.validate_fixture(
+                sv_text=self.sv_text(
+                    {("defs.h", "EC_FIRST"): 0x03}
+                )
+            )
+
+    def test_sv_error_constants_are_exact_and_eight_bits(self) -> None:
+        missing = self.sv_text().replace(
+            "localparam bit [7:0] XTR_V1_ECODE_EC_FIRST = 8'h02;", ""
+        )
+        with self.assertRaisesRegex(
+            CHECKER.ValidationError, "missing SV error code constant"
+        ):
+            self.validate_fixture(sv_text=missing)
+
+        extra = (
+            "localparam bit [7:0] XTR_V1_ECODE_EC_GHOST = 8'h03;"
+        )
+        with self.assertRaisesRegex(
+            CHECKER.ValidationError, "extra SV error code constant"
+        ):
+            self.validate_fixture(sv_text=self.sv_text(extra=extra))
+
+        for alternate_extra in (
+            "localparam logic [7:0] XTR_V1_ECODE_EC_GHOST = 8'h03;",
+            "parameter bit [7:0] XTR_V1_ECODE_EC_GHOST = 8'h03;",
+            "localparam byte unsigned XTR_V1_ECODE_EC_GHOST = 8'h03;",
+        ):
+            with self.subTest(alternate_extra=alternate_extra):
+                with self.assertRaisesRegex(
+                    CHECKER.ValidationError, "extra SV error code constant"
+                ):
+                    self.validate_fixture(
+                        sv_text=self.sv_text(extra=alternate_extra)
+                    )
+
+        wrong_width = self.sv_text().replace(
+            "bit [7:0] XTR_V1_ECODE_EC_FIRST",
+            "bit [15:0] XTR_V1_ECODE_EC_FIRST",
+        )
+        with self.assertRaisesRegex(
+            CHECKER.ValidationError, "must be declared bit \\[7:0\\]"
+        ):
+            self.validate_fixture(sv_text=wrong_width)
+
+        commented = self.sv_text().replace(
+            "localparam bit [7:0] XTR_V1_ECODE_EC_FIRST = 8'h02;",
+            "// localparam bit [7:0] XTR_V1_ECODE_EC_FIRST = 8'h02;",
+        )
+        with self.assertRaisesRegex(
+            CHECKER.ValidationError, "missing SV error code constant"
+        ):
+            self.validate_fixture(sv_text=commented)
+
+    def test_sv_error_constant_alternate_duplicate_is_rejected(self) -> None:
+        duplicate = (
+            "typedef enum bit [7:0] { XTR_V1_ECODE_EC_FIRST } "
+            "xtr_v1_ghost_e;"
+        )
+        with self.assertRaisesRegex(
+            CHECKER.ValidationError, "must have one canonical definition"
+        ):
+            self.validate_fixture(sv_text=self.sv_text(extra=duplicate))
+
+    def test_alias_set_and_defs_first_policy_are_explicit(self) -> None:
+        canonical = self.canonical_fixture()
+        self.assertEqual(canonical[0x08].path, "defs.h")
+        self.assertEqual(canonical[0x08].c_symbol, "EC_SHARED")
+
+        canonicalize = self.require_checker_attribute(
+            "canonical_error_code_mappings"
+        )
+        mappings = self.mappings()
+        values = self.validate_fixture(mappings=mappings)
+        with self.assertRaisesRegex(
+            CHECKER.ValidationError, "error code alias set drift"
+        ):
+            canonicalize(mappings, values, ())
+
+    def test_fixed_mapping_is_complete_and_contains_wr_f0(self) -> None:
+        mappings = self.require_checker_attribute("ERROR_CODE_MAPPINGS")
+        identities = {(row.path, row.c_symbol) for row in mappings}
+        self.assertEqual(len(mappings), 143)
+        self.assertEqual(
+            sum(row.path == "defs.h" for row in mappings), 133
+        )
+        self.assertEqual(sum(row.path == "wr.h" for row in mappings), 10)
+        self.assertIn(
+            (
+                "wr.h",
+                "XTRDMA_CQE_ECODE_TX_EC_RCE_URC_SQ_CPL_SRBM_DUP_PKT",
+            ),
+            identities,
+        )
+
+    def test_codec_symbolic_constant_and_string_drift_are_rejected(self) -> None:
+        validate_codec = self.require_checker_attribute(
+            "validate_error_codec"
+        )
+        canonical = self.canonical_fixture()
+        validate_codec(self.codec_text(), canonical)
+
+        string_drift = self.codec_text().replace(
+            'return "EC_FIRST";', 'return "EC_BROKEN";'
+        )
+        with self.assertRaisesRegex(
+            CHECKER.ValidationError, "symbolic error code lookup"
+        ):
+            validate_codec(string_drift, canonical)
+
+        constant_drift = self.codec_text().replace(
+            'XTR_V1_ECODE_EC_FIRST: return "EC_FIRST";',
+            'XTR_V1_ECODE_EC_SHARED: return "EC_FIRST";',
+        )
+        with self.assertRaisesRegex(
+            CHECKER.ValidationError, "symbolic error code lookup"
+        ):
+            validate_codec(constant_drift, canonical)
+
+        commented_function = self.codec_text()
+        start = commented_function.index(
+            "local function string symbolic_name"
+        )
+        end = commented_function.index("endfunction", start) + len(
+            "endfunction"
+        )
+        commented_function = (
+            commented_function[:start]
+            + "/* "
+            + commented_function[start:end]
+            + " */"
+            + commented_function[end:]
+        )
+        with self.assertRaisesRegex(
+            CHECKER.ValidationError, "symbolic error code lookup function missing"
+        ):
+            validate_codec(commented_function, canonical)
+
+    def test_codec_symbolic_unknown_default_is_exact(self) -> None:
+        validate_codec = self.require_checker_attribute(
+            "validate_error_codec"
+        )
+        canonical = self.canonical_fixture()
+        drifted_default = self.codec_text().replace(
+            'default: return $sformatf("XTR_V1_UNKNOWN_ECODE_0x%02x", '
+            'hardware_code);',
+            'default: return "BOGUS";',
+        )
+        with self.assertRaisesRegex(
+            CHECKER.ValidationError, "symbolic error code unknown default"
+        ):
+            validate_codec(drifted_default, canonical)
+
+    def test_codec_symbolic_lookup_rejects_unknown_specific_case(self) -> None:
+        validate_codec = self.require_checker_attribute(
+            "validate_error_codec"
+        )
+        canonical = self.canonical_fixture()
+        unknown_specific = self.codec_text().replace(
+            'default: return $sformatf("XTR_V1_UNKNOWN_ECODE_0x%02x", '
+            'hardware_code);',
+            '8\'h42: return "NOT_THE_DEFAULT";\n'
+            '    default: return $sformatf('
+            '"XTR_V1_UNKNOWN_ECODE_0x%02x", hardware_code);',
+        )
+        with self.assertRaisesRegex(
+            CHECKER.ValidationError, "symbolic error code lookup"
+        ):
+            validate_codec(unknown_specific, canonical)
+
+    def test_codec_cannot_use_raw_literal_for_known_source_code(self) -> None:
+        validate_codec = self.require_checker_attribute(
+            "validate_error_codec"
+        )
+        canonical = self.canonical_fixture()
+        for literal in (
+            "8'hf0", "8'd240", "8'b11110000", "8'o360",
+            "8'shf0", "8'sb11110000", "8'so360",
+        ):
+            with self.subTest(literal=literal):
+                raw_f0 = self.codec_text().replace(
+                    "XTR_V1_ECODE_XTRDMA_CQE_ECODE_TX_EC_RCE_URC_"
+                    "SQ_CPL_SRBM_DUP_PKT:",
+                    f"{literal}:",
+                )
+                with self.assertRaisesRegex(
+                    CHECKER.ValidationError, "raw literal.*known error code"
+                ):
+                    validate_codec(raw_f0, canonical)
+
+    def test_codec_requires_cmq_profile_symbol_for_zero_cases(self) -> None:
+        validate_codec = self.require_checker_attribute(
+            "validate_error_codec"
+        )
+        canonical = self.canonical_fixture()
+        source_zero = self.codec_text().replace(
+            "XTR_V1_CMQ_SUCCESS_ECODE: return RDMA_SC_OK;",
+            "XTR_V1_ECODE_XTRDMA_CQE_ECODE_TX_REQ_NML: "
+            "return RDMA_SC_OK;",
+        )
+        with self.assertRaisesRegex(
+            CHECKER.ValidationError, "hardware error case item"
+        ):
+            validate_codec(source_zero, canonical)
+
+    def test_repo_f0_uses_source_pinned_constant_and_symbol(self) -> None:
+        constants = CHECKER.parse_sv_constants(
+            (REPO_ROOT / "src/codec/xtr_v1/rdma_xtr_v1_defs.svh").read_text()
+        )
+        name = (
+            "XTR_V1_ECODE_XTRDMA_CQE_ECODE_TX_EC_RCE_URC_"
+            "SQ_CPL_SRBM_DUP_PKT"
+        )
+        self.assertEqual(constants.get(name), 0xF0)
+        codec = (
+            REPO_ROOT
+            / "src/codec/xtr_v1/rdma_xtr_v1_error_codec.svh"
+        ).read_text()
+        self.assertRegex(codec, rf"\b{re.escape(name)}\s*:")
+        self.assertNotRegex(codec, r"\b8'h[fF]0\s*:")
+
+
 class SvDefinitionTest(unittest.TestCase):
     NEW_URC_FIELDS = {
         "XTR_V1_QPC_URC_RSQ_SIZE": (
@@ -79,6 +460,18 @@ localparam int unsigned XTR_V1_FIELD_OFFSET = 40;
 """
         with self.assertRaisesRegex(CHECKER.ValidationError, "duplicate"):
             CHECKER.parse_sv_constants(text)
+
+    def test_sv_comment_stripping_preserves_quoted_markers(self) -> None:
+        strip_comments = getattr(CHECKER, "strip_sv_comments", None)
+        self.assertIsNotNone(strip_comments, "checker has no strip_sv_comments")
+        stripped = strip_comments(
+            'string url = "https://example.invalid/a/*literal*/";\n'
+            '// localparam bit [7:0] XTR_V1_ECODE_LINE = 8\'h42;\n'
+            '/* localparam bit [7:0] XTR_V1_ECODE_BLOCK = 8\'h43; */\n'
+        )
+        self.assertIn('"https://example.invalid/a/*literal*/"', stripped)
+        self.assertNotIn("XTR_V1_ECODE_LINE", stripped)
+        self.assertNotIn("XTR_V1_ECODE_BLOCK", stripped)
 
     def test_width_and_value_literals_are_parsed(self) -> None:
         constants = CHECKER.parse_sv_constants(
