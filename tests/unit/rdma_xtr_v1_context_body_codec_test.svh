@@ -1180,6 +1180,114 @@ class rdma_xtr_v1_context_body_codec_test extends uvm_test;
       `uvm_error("AEQC_AS_CEQC", "cross decode published model")
   endfunction
 
+  function automatic void check_ceqc_next_invalid(
+    rdma_codec_base codec
+  );
+    rdma_ceqc_model model;
+    rdma_ceqc_model snapshot;
+    rdma_hw_image image;
+    rdma_status status;
+
+    model = make_ceqc("ceqc_next_invalid");
+    model.page_layout.next_valid = 1'b0;
+    status = model.validate();
+    expect_ok("CEQC_NEXT_INVALID_MODEL_VALID", status);
+    if (!$cast(snapshot,
+               clone_model(model, "CEQC_NEXT_INVALID_SNAPSHOT")))
+      return;
+    if (snapshot == model || snapshot.ceq_h == model.ceq_h ||
+        snapshot.page_layout == model.page_layout ||
+        snapshot.producer == model.producer ||
+        snapshot.consumer == model.consumer) begin
+      `uvm_error("CEQC_NEXT_INVALID_SNAPSHOT",
+                 "model snapshot is not a deep copy")
+      return;
+    end
+
+    image = rdma_hw_image::type_id::create("ceqc_next_invalid_stale");
+    status = codec.encode(model, image);
+    expect_status("CEQC_NEXT_INVALID", status, RDMA_SC_INVALID_ARGUMENT);
+    if (image != null)
+      `uvm_error("CEQC_NEXT_INVALID", "failed encode published an image")
+    if (model.ceq_h == null || snapshot.ceq_h == null ||
+        !model.ceq_h.same_instance(snapshot.ceq_h) ||
+        model.state != snapshot.state || model.depth != snapshot.depth ||
+        model.vector_id != snapshot.vector_id ||
+        model.page_layout == null || snapshot.page_layout == null ||
+        model.page_layout.mode != snapshot.page_layout.mode ||
+        model.page_layout.sd_base.value !=
+          snapshot.page_layout.sd_base.value ||
+        model.page_layout.current_base.value !=
+          snapshot.page_layout.current_base.value ||
+        model.page_layout.current_valid !=
+          snapshot.page_layout.current_valid ||
+        model.page_layout.next_base.value !=
+          snapshot.page_layout.next_base.value ||
+        model.page_layout.next_valid != snapshot.page_layout.next_valid ||
+        model.producer == null || snapshot.producer == null ||
+        model.producer.index != snapshot.producer.index ||
+        model.producer.wrap != snapshot.producer.wrap ||
+        model.consumer == null || snapshot.consumer == null ||
+        model.consumer.index != snapshot.consumer.index ||
+        model.consumer.wrap != snapshot.consumer.wrap)
+      `uvm_error("CEQC_NEXT_INVALID_IMMUTABLE",
+                 "failed encode mutated the input model")
+  endfunction
+
+  function automatic void check_aeqc_next_invalid(
+    rdma_codec_base codec
+  );
+    rdma_aeqc_model model;
+    rdma_aeqc_model snapshot;
+    rdma_hw_image image;
+    rdma_status status;
+
+    model = make_aeqc("aeqc_next_invalid");
+    model.page_layout.next_valid = 1'b0;
+    status = model.validate();
+    expect_ok("AEQC_NEXT_INVALID_MODEL_VALID", status);
+    if (!$cast(snapshot,
+               clone_model(model, "AEQC_NEXT_INVALID_SNAPSHOT")))
+      return;
+    if (snapshot == model || snapshot.aeq_h == model.aeq_h ||
+        snapshot.page_layout == model.page_layout ||
+        snapshot.producer == model.producer ||
+        snapshot.consumer == model.consumer) begin
+      `uvm_error("AEQC_NEXT_INVALID_SNAPSHOT",
+                 "model snapshot is not a deep copy")
+      return;
+    end
+
+    image = rdma_hw_image::type_id::create("aeqc_next_invalid_stale");
+    status = codec.encode(model, image);
+    expect_status("AEQC_NEXT_INVALID", status, RDMA_SC_INVALID_ARGUMENT);
+    if (image != null)
+      `uvm_error("AEQC_NEXT_INVALID", "failed encode published an image")
+    if (model.aeq_h == null || snapshot.aeq_h == null ||
+        !model.aeq_h.same_instance(snapshot.aeq_h) ||
+        model.state != snapshot.state || model.depth != snapshot.depth ||
+        model.vector_id != snapshot.vector_id ||
+        model.page_layout == null || snapshot.page_layout == null ||
+        model.page_layout.mode != snapshot.page_layout.mode ||
+        model.page_layout.sd_base.value !=
+          snapshot.page_layout.sd_base.value ||
+        model.page_layout.current_base.value !=
+          snapshot.page_layout.current_base.value ||
+        model.page_layout.current_valid !=
+          snapshot.page_layout.current_valid ||
+        model.page_layout.next_base.value !=
+          snapshot.page_layout.next_base.value ||
+        model.page_layout.next_valid != snapshot.page_layout.next_valid ||
+        model.producer == null || snapshot.producer == null ||
+        model.producer.index != snapshot.producer.index ||
+        model.producer.wrap != snapshot.producer.wrap ||
+        model.consumer == null || snapshot.consumer == null ||
+        model.consumer.index != snapshot.consumer.index ||
+        model.consumer.wrap != snapshot.consumer.wrap)
+      `uvm_error("AEQC_NEXT_INVALID_IMMUTABLE",
+                 "failed encode mutated the input model")
+  endfunction
+
   task run_phase(uvm_phase phase);
     rdma_codec_registry registry;
     rdma_codec_base cqc_codec;
@@ -1305,6 +1413,8 @@ class rdma_xtr_v1_context_body_codec_test extends uvm_test;
     check_srqc_negatives(srqc_codec, srqc, srqc_image);
     check_eq_negatives(ceqc_codec, aeqc_codec, ceqc, aeqc,
                        ceqc_image, aeqc_image);
+    check_ceqc_next_invalid(ceqc_codec);
+    check_aeqc_next_invalid(aeqc_codec);
 
     check_reserved_qwords("CQC", cqc_codec, cqc_image, RDMA_IMAGE_CQC,
                           XTR_V1_OP_CQC_CREATE, RDMA_MR_PBL0);

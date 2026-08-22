@@ -1086,6 +1086,8 @@ virtual class rdma_xtr_v1_eq_create_body_codec_base
     if (!(layout.mode inside {RDMA_OBJECT_INDIRECT_4K,
                               RDMA_OBJECT_L3_INDIRECT_4K}))
       return invalid_argument("xtr_v1 EQC object mode is unsupported");
+    if (!layout.next_valid)
+      return invalid_argument("xtr_v1 EQC next backing is not valid");
     status = encode_log2(depth, 5, "EQC depth", depth_code);
     if (!status.ok()) return status;
     status = encode_page(layout.current_base, "EQC current backing", page);
