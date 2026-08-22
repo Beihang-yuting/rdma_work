@@ -390,6 +390,24 @@ endfunction
         ):
             validate_codec(drifted_default, canonical)
 
+    def test_codec_symbolic_rejects_case_item_after_default(self) -> None:
+        validate_codec = self.require_checker_attribute(
+            "validate_error_codec"
+        )
+        default = (
+            '    default: return $sformatf("XTR_V1_UNKNOWN_ECODE_0x%02x", '
+            "hardware_code);\n"
+        )
+        drifted = self.codec_text().replace(
+            default,
+            default + "    (8'hf1 - 1): return \"FORGED_F0\";\n",
+        )
+        self.assertNotEqual(drifted, self.codec_text())
+        with self.assertRaisesRegex(
+            CHECKER.ValidationError, "symbolic error code unknown default"
+        ):
+            validate_codec(drifted, self.canonical_fixture())
+
     def test_codec_symbolic_lookup_rejects_unknown_specific_case(self) -> None:
         validate_codec = self.require_checker_attribute(
             "validate_error_codec"
@@ -464,6 +482,24 @@ endfunction
                 ):
                     validate_codec(early_return, canonical)
 
+    def test_codec_classify_rejects_case_item_after_default(self) -> None:
+        validate_codec = self.require_checker_attribute(
+            "validate_error_codec"
+        )
+        drifted = self.codec_text().replace(
+            "    default: return RDMA_SC_UNKNOWN_HW_ERROR;\n"
+            "  endcase\n",
+            "    default: return RDMA_SC_UNKNOWN_HW_ERROR;\n"
+            "    (8'hf1 - 1): return RDMA_SC_OK;\n"
+            "  endcase\n",
+            1,
+        )
+        self.assertNotEqual(drifted, self.codec_text())
+        with self.assertRaisesRegex(
+            CHECKER.ValidationError, "classify|case item|default"
+        ):
+            validate_codec(drifted, self.canonical_fixture())
+
     def test_codec_inferred_engine_rejects_external_known_code_returns(self) -> None:
         validate_codec = self.require_checker_attribute(
             "validate_error_codec"
@@ -489,6 +525,22 @@ endfunction
                     "inferred_engine|hardware_code comparison",
                 ):
                     validate_codec(early_return, canonical)
+
+    def test_codec_inferred_engine_rejects_case_item_after_default(self) -> None:
+        validate_codec = self.require_checker_attribute(
+            "validate_error_codec"
+        )
+        drifted = self.codec_text().replace(
+            "    default: return RDMA_ENGINE_CMQ;\n",
+            "    default: return RDMA_ENGINE_CMQ;\n"
+            "    (8'hf1 - 1): return RDMA_ENGINE_CQ;\n",
+            1,
+        )
+        self.assertNotEqual(drifted, self.codec_text())
+        with self.assertRaisesRegex(
+            CHECKER.ValidationError, "inferred_engine|case item|default"
+        ):
+            validate_codec(drifted, self.canonical_fixture())
 
     def test_codec_other_function_rejects_known_code_expression(self) -> None:
         validate_codec = self.require_checker_attribute(
@@ -668,6 +720,45 @@ string macro_text = "`REVIEW_HC(hardware_,code)";
             validate_codec(extension, canonical)
         except CHECKER.ValidationError as error:
             self.fail(f"wide zero-extension literal was rejected: {error}")
+
+    def test_codec_accepts_whitespace_in_based_literal(self) -> None:
+        validate_codec = self.require_checker_attribute(
+            "validate_error_codec"
+        )
+        for literal in ("24 'h0", "24'h 0"):
+            with self.subTest(literal=literal):
+                spaced = self.codec_text().replace("24'h0", literal)
+                self.assertNotEqual(spaced, self.codec_text())
+                try:
+                    validate_codec(spaced, self.canonical_fixture())
+                except CHECKER.ValidationError as error:
+                    self.fail(f"legal based-literal whitespace was rejected: {error}")
+
+    def test_error_codec_uvm_test_checks_success_symbols(self) -> None:
+        test_text = (
+            REPO_ROOT / "tests" / "unit" /
+            "rdma_xtr_v1_error_codec_test.svh"
+        ).read_text()
+        start = test_text.index("function automatic void check_error")
+        end = test_text.index("endfunction", start)
+        check_error_body = test_text[start:end]
+        self.assertRegex(
+            check_error_body,
+            re.compile(
+                r"\n    end\n    if \(expected_symbol != \"\" && "
+                r"decoded\.message != expected_symbol\)",
+            ),
+        )
+        for label in ("ZERO_RETAINS_ENGINE", "ZERO_NONE_CANONICAL"):
+            with self.subTest(label=label):
+                self.assertRegex(
+                    test_text,
+                    re.compile(
+                        rf'check_error\("{label}"[^;]*1\'b0,\s*'
+                        r'"XTR_V1_CMQ_SUCCESS"\s*\);',
+                        re.S,
+                    ),
+                )
 
     def test_sv_error_constant_cannot_be_forged_inside_string(self) -> None:
         declaration = (

@@ -62,11 +62,11 @@ class rdma_xtr_v1_error_codec_test extends uvm_test;
         `uvm_error(label, "nonzero ecode has inconsistent severity")
       if (decoded.message.len() == 0)
         `uvm_error(label, "nonzero ecode has an empty symbolic message")
-      if (expected_symbol != "" && decoded.message != expected_symbol)
-        `uvm_error(label,
-                   $sformatf("expected message %s, got %s",
-                             expected_symbol, decoded.message))
     end
+    if (expected_symbol != "" && decoded.message != expected_symbol)
+      `uvm_error(label,
+                 $sformatf("expected message %s, got %s",
+                           expected_symbol, decoded.message))
   endfunction
 
   function automatic void check_fixed_classifications();
@@ -141,9 +141,11 @@ class rdma_xtr_v1_error_codec_test extends uvm_test;
 
   function automatic void check_engine_policy_and_success();
     check_error("ZERO_RETAINS_ENGINE", 8'h00, RDMA_ENGINE_CMQ,
-                RDMA_SC_OK, RDMA_STATUS_STATE, RDMA_ENGINE_CMQ, 1'b0);
+                RDMA_SC_OK, RDMA_STATUS_STATE, RDMA_ENGINE_CMQ, 1'b0,
+                "XTR_V1_CMQ_SUCCESS");
     check_error("ZERO_NONE_CANONICAL", 8'h00, RDMA_ENGINE_NONE,
-                RDMA_SC_OK, RDMA_STATUS_STATE, RDMA_ENGINE_CMQ, 1'b0);
+                RDMA_SC_OK, RDMA_STATUS_STATE, RDMA_ENGINE_CMQ, 1'b0,
+                "XTR_V1_CMQ_SUCCESS");
     check_error("NONE_TRANSLATION_INFER", 8'h45, RDMA_ENGINE_NONE,
                 RDMA_SC_DMA_TRANSLATION, RDMA_STATUS_DMA,
                 RDMA_ENGINE_DMA, 1'b1, "EC_TME_PBL_INVLD");

@@ -974,11 +974,20 @@ def validate_error_codec_preprocessor(codec_code: str) -> None:
 
 def tokenize_sv_syntax(text: str) -> list[str]:
     """Tokenize enough SV syntax to audit hardware-code use sites."""
-    token_pattern = re.compile(
+    based_literal = re.compile(
         r"\d+\s*'\s*[sS]?\s*[hHdDbBoO]\s*[0-9a-fA-F_xXzZ?]+"
+    )
+    token_pattern = re.compile(
+        rf"{based_literal.pattern}"
         r"|[A-Za-z_]\w*|===|!==|==|!=|&&|\|\||<<|>>|[^\s]"
     )
-    return [match.group(0) for match in token_pattern.finditer(text)]
+    tokens = [match.group(0) for match in token_pattern.finditer(text)]
+    return [
+        re.sub(r"\s+", "", token)
+        if based_literal.fullmatch(token)
+        else token
+        for token in tokens
+    ]
 
 
 class SvFunctionRegion(NamedTuple):
@@ -1034,6 +1043,57 @@ def matching_statement_patterns(
         for index in matching_token_patterns(tokens, pattern, start, end)
         if index == start or tokens[index - 1] in {";", "begin", "else"}
     ]
+
+
+def validate_outer_case_default_is_last(
+    case_body: str, function_name: str
+) -> None:
+    """Require one depth-zero default whose statement consumes the case tail."""
+    tokens = tokenize_sv_syntax(case_body)
+    case_depth = 0
+    defaults: list[int] = []
+    for index, token in enumerate(tokens):
+        if token == "case":
+            case_depth += 1
+        elif token == "endcase":
+            if case_depth == 0:
+                raise ValidationError(
+                    f"invalid nested case in {function_name} default"
+                )
+            case_depth -= 1
+        elif (
+            token == "default"
+            and case_depth == 0
+            and index + 1 < len(tokens)
+            and tokens[index + 1] == ":"
+        ):
+            defaults.append(index)
+    if case_depth != 0 or len(defaults) != 1:
+        raise ValidationError(
+            f"hardware error case must have one outer default: {function_name}"
+        )
+
+    statement_start = defaults[0] + 2
+    statement_end: int | None = None
+    if statement_start < len(tokens) and tokens[statement_start] == "begin":
+        block_depth = 0
+        for index in range(statement_start, len(tokens)):
+            if tokens[index] == "begin":
+                block_depth += 1
+            elif tokens[index] == "end":
+                block_depth -= 1
+                if block_depth == 0:
+                    statement_end = index + 1
+                    break
+    else:
+        try:
+            statement_end = tokens.index(";", statement_start) + 1
+        except ValueError:
+            pass
+    if statement_end is None or statement_end != len(tokens):
+        raise ValidationError(
+            f"hardware error default must be final case item: {function_name}"
+        )
 
 
 def validate_hardware_code_uses(codec_code: str) -> None:
@@ -1687,6 +1747,7 @@ def validate_error_codec(
         if whole_case is None:
             raise ValidationError(f"invalid {function_name} function body")
         case_body = whole_case.group(1)
+        validate_outer_case_default_is_last(case_body, function_name)
         explicit_case = re.search(
             r"(.*?)^[ \t]*default[ \t]*:",
             case_body,
