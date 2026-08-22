@@ -201,6 +201,90 @@ class rdma_address_vector extends uvm_object;
   endfunction
 endclass
 
+class rdma_urc_queue_config extends uvm_object;
+  `uvm_object_utils(rdma_urc_queue_config)
+
+  rdma_backing_addr_t rsq_backing;
+  rdma_backing_addr_t rdsq_backing;
+  rdma_backing_addr_t dsq_backing;
+  int unsigned rsq_depth;
+  int unsigned rdsq_depth;
+  int unsigned rdsq_fetch_count;
+  int unsigned dsq_fetch_count;
+  int unsigned rq_sequence_threshold_entries;
+  int unsigned sq_completion_threshold_entries;
+
+  function new(string name = "rdma_urc_queue_config");
+    super.new(name);
+    rsq_backing = '0;
+    rdsq_backing = '0;
+    dsq_backing = '0;
+    rsq_depth = '0;
+    rdsq_depth = '0;
+    rdsq_fetch_count = '0;
+    dsq_fetch_count = '0;
+    rq_sequence_threshold_entries = '0;
+    sq_completion_threshold_entries = '0;
+  endfunction
+
+  virtual function void do_copy(uvm_object rhs);
+    rdma_urc_queue_config rhs_queues;
+
+    super.do_copy(rhs);
+    if (!$cast(rhs_queues, rhs))
+      `uvm_fatal("RDMA_COPY_TYPE", "URC queue configuration copy mismatch")
+    rsq_backing = rhs_queues.rsq_backing;
+    rdsq_backing = rhs_queues.rdsq_backing;
+    dsq_backing = rhs_queues.dsq_backing;
+    rsq_depth = rhs_queues.rsq_depth;
+    rdsq_depth = rhs_queues.rdsq_depth;
+    rdsq_fetch_count = rhs_queues.rdsq_fetch_count;
+    dsq_fetch_count = rhs_queues.dsq_fetch_count;
+    rq_sequence_threshold_entries =
+      rhs_queues.rq_sequence_threshold_entries;
+    sq_completion_threshold_entries =
+      rhs_queues.sq_completion_threshold_entries;
+  endfunction
+
+  virtual function rdma_status validate();
+    if ((rsq_backing.value & 64'hfff) != 0 ||
+        (rdsq_backing.value & 64'hfff) != 0 ||
+        (dsq_backing.value & 64'hfff) != 0)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "URC backing is not 4 KiB aligned");
+    if (!rdma_is_power_of_two(rsq_depth) ||
+        !rdma_is_power_of_two(rdsq_depth))
+      return rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT,
+        "URC queue depth is not a nonzero power of two"
+      );
+    if (rq_sequence_threshold_entries != 0 &&
+        (rq_sequence_threshold_entries < 2 ||
+         !rdma_is_power_of_two(rq_sequence_threshold_entries)))
+      return rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT,
+        "URC RQ sequence threshold is not zero or a power of two >= 2"
+      );
+    if (sq_completion_threshold_entries != 0 &&
+        (sq_completion_threshold_entries < 2 ||
+         !rdma_is_power_of_two(sq_completion_threshold_entries)))
+      return rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT,
+        "URC SQ completion threshold is not zero or a power of two >= 2"
+      );
+    return rdma_status::success();
+  endfunction
+
+  virtual function string describe();
+    return $sformatf(
+      "urc_queues(rsq_backing=0x%016x rdsq_backing=0x%016x dsq_backing=0x%016x rsq_depth=%0d rdsq_depth=%0d rdsq_fetch_count=%0d dsq_fetch_count=%0d rq_sequence_threshold_entries=%0d sq_completion_threshold_entries=%0d)",
+      rsq_backing.value, rdsq_backing.value, dsq_backing.value, rsq_depth,
+      rdsq_depth, rdsq_fetch_count, dsq_fetch_count,
+      rq_sequence_threshold_entries, sq_completion_threshold_entries
+    );
+  endfunction
+endclass
+
 class rdma_mr_page_layout extends uvm_object;
   `uvm_object_utils(rdma_mr_page_layout)
 

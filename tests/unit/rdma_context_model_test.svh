@@ -36,6 +36,15 @@ class rdma_context_model_test extends uvm_test;
       `uvm_error(label, "invalid context topology was accepted")
   endfunction
 
+  function void expect_invalid_argument(string label, rdma_status status);
+    if (status == null)
+      `uvm_error(label, "invalid context topology returned null status")
+    else if (status.code != RDMA_SC_INVALID_ARGUMENT)
+      `uvm_error(label,
+                 $sformatf("expected INVALID_ARGUMENT, got %s (%s)",
+                           status.code.name(), status.convert2string()))
+  endfunction
+
   function rdma_page_table_layout make_page_layout(string name);
     rdma_page_table_layout layout;
 
@@ -255,6 +264,8 @@ class rdma_context_model_test extends uvm_test;
     rdma_address_vector address_vector_clone;
     rdma_mr_page_layout mr_page_layout;
     rdma_mr_page_layout mr_page_layout_clone;
+    rdma_urc_queue_config urc_queues;
+    rdma_urc_queue_config urc_queues_clone;
     rdma_qpc_behavior behavior;
     rdma_qpc_behavior behavior_clone;
     rdma_qpc_model qpc;
@@ -270,6 +281,7 @@ class rdma_context_model_test extends uvm_test;
     rdma_aeqc_model aeqc;
     rdma_aeqc_model aeqc_clone;
     rdma_qpc_urc_ext urc_ext;
+    rdma_qpc_urc_ext urc_ext_clone;
     rdma_qp qp;
     rdma_srq srq;
     rdma_status status;
@@ -514,20 +526,146 @@ class rdma_context_model_test extends uvm_test;
     expect_invalid("SRQC_QUEUE_ALIGNMENT", srqc.validate());
     srqc.srfq_backing.value -= 64;
 
+    urc_queues = rdma_urc_queue_config::type_id::create("urc_queues");
+    if (urc_queues.rsq_backing.value != 0 ||
+        urc_queues.rdsq_backing.value != 0 ||
+        urc_queues.dsq_backing.value != 0 ||
+        urc_queues.rsq_depth != 0 || urc_queues.rdsq_depth != 0 ||
+        urc_queues.rdsq_fetch_count != 0 ||
+        urc_queues.dsq_fetch_count != 0 ||
+        urc_queues.rq_sequence_threshold_entries != 0 ||
+        urc_queues.sq_completion_threshold_entries != 0)
+      `uvm_error("URC_QUEUE_DEFAULTS",
+                 "URC queue construction defaults are incorrect")
+    expect_invalid_argument("URC_QUEUE_ZERO_DEPTHS", urc_queues.validate());
+
+    urc_queues.rsq_backing.value = 64'h0000_0001_6000_0000;
+    urc_queues.rdsq_backing.value = 64'h0000_0001_7000_0000;
+    urc_queues.dsq_backing.value = 64'h0000_0001_8000_0000;
+    urc_queues.rsq_depth = 64;
+    urc_queues.rdsq_depth = 128;
+    urc_queues.rdsq_fetch_count = 8;
+    urc_queues.dsq_fetch_count = 16;
+    urc_queues.rq_sequence_threshold_entries = 16;
+    urc_queues.sq_completion_threshold_entries = 32;
+    expect_ok("URC_QUEUE_VALID", urc_queues.validate());
+    if (!uvm_is_match("*rsq_depth=64*", urc_queues.describe()) ||
+        !uvm_is_match("*rdsq_depth=128*", urc_queues.describe()))
+      `uvm_error("URC_QUEUE_DESCRIBE",
+                 "URC queue description lost queue depths")
+    cloned_object = urc_queues.clone();
+    if (!$cast(urc_queues_clone, cloned_object))
+      `uvm_error("URC_QUEUE_CLONE", "URC queue clone lost dynamic type")
+    else begin
+      urc_queues_clone.rsq_backing.value += 64'h1000;
+      urc_queues_clone.rsq_depth = 256;
+      urc_queues_clone.rdsq_fetch_count = 24;
+      if (urc_queues.rsq_backing.value != 64'h0000_0001_6000_0000 ||
+          urc_queues.rsq_depth != 64 ||
+          urc_queues.rdsq_fetch_count != 8)
+        `uvm_error("URC_QUEUE_CLONE",
+                   "URC queue clone mutation reached source")
+    end
+
     urc_ext = rdma_qpc_urc_ext::type_id::create("urc_ext");
     urc_ext.remote_qpn = 24'h112233;
     urc_ext.rbsn = 24'h010203;
     urc_ext.dbsn = 24'h040506;
     urc_ext.rpsn = 24'h070809;
     urc_ext.dpsn = 24'h0a0b0c;
-    urc_ext.rsq_backing.value = 64'h1600_0000;
-    urc_ext.rdsq_backing.value = 64'h1700_0000;
-    urc_ext.dsq_backing.value = 64'h1800_0000;
-    urc_ext.fetch_threshold = 4;
-    urc_ext.queue_threshold = 8;
+    urc_ext.queues.copy(urc_queues);
     expect_ok("URC_EXT_VALID", urc_ext.validate());
-    urc_ext.rsq_backing.value++;
-    expect_invalid("URC_QUEUE_ALIGNMENT", urc_ext.validate());
+    urc_ext.remote_qpn = '0;
+    expect_invalid_argument("URC_REMOTE_QPN_ZERO", urc_ext.validate());
+    urc_ext.remote_qpn = 24'h112233;
+    expect_ok("URC_REMOTE_QPN_RESTORED", urc_ext.validate());
+    if (!uvm_is_match("*rpsn=460809*", urc_ext.describe()) ||
+        !uvm_is_match("*dpsn=658188*", urc_ext.describe()) ||
+        !uvm_is_match("*queues=*", urc_ext.describe()))
+      `uvm_error("URC_EXT_DESCRIBE",
+                 "URC extension description lost canonical fields")
+    cloned_object = urc_ext.clone();
+    if (!$cast(urc_ext_clone, cloned_object))
+      `uvm_error("URC_EXT_CLONE", "URC extension clone lost dynamic type")
+    else if (urc_ext_clone.queues == null ||
+             urc_ext_clone.queues == urc_ext.queues)
+      `uvm_error("URC_EXT_CLONE", "URC extension clone aliased queues")
+    else begin
+      urc_ext_clone.queues.dsq_backing.value += 64'h1000;
+      urc_ext_clone.queues.sq_completion_threshold_entries = 64;
+      if (urc_ext.queues.dsq_backing.value !=
+            64'h0000_0001_8000_0000 ||
+          urc_ext.queues.sq_completion_threshold_entries != 32)
+        `uvm_error("URC_EXT_CLONE",
+                   "URC extension clone mutation reached source")
+    end
+
+    urc_ext.queues = null;
+    expect_invalid_argument("URC_QUEUES_NULL", urc_ext.validate());
+    cloned_object = urc_ext.clone();
+    if (!$cast(urc_ext_clone, cloned_object))
+      `uvm_error("URC_EXT_NULL_QUEUES_CLONE",
+                 "URC extension clone lost dynamic type")
+    else begin
+      if (urc_ext_clone.queues != null)
+        `uvm_error("URC_EXT_NULL_QUEUES_CLONE",
+                   "URC extension clone fabricated a queue configuration")
+      expect_invalid_argument("URC_EXT_NULL_QUEUES_CLONE_VALIDATE",
+                              urc_ext_clone.validate());
+    end
+    urc_ext.queues =
+      rdma_urc_queue_config::type_id::create("urc_ext_queues_restored");
+    urc_ext.queues.copy(urc_queues);
+    expect_ok("URC_QUEUES_RESTORED", urc_ext.validate());
+    urc_ext.queues.rsq_backing.value++;
+    expect_invalid_argument("URC_RSQ_ALIGNMENT", urc_ext.validate());
+    urc_ext.queues.rsq_backing.value--;
+    urc_ext.queues.rdsq_backing.value++;
+    expect_invalid_argument("URC_RDSQ_ALIGNMENT", urc_ext.validate());
+    urc_ext.queues.rdsq_backing.value--;
+    urc_ext.queues.dsq_backing.value++;
+    expect_invalid_argument("URC_DSQ_ALIGNMENT", urc_ext.validate());
+    urc_ext.queues.dsq_backing.value--;
+    urc_ext.queues.rsq_depth = 48;
+    expect_invalid_argument("URC_RSQ_DEPTH", urc_ext.validate());
+    urc_ext.queues.rsq_depth = 64;
+    urc_ext.queues.rdsq_depth = 0;
+    expect_invalid_argument("URC_RDSQ_DEPTH", urc_ext.validate());
+    urc_ext.queues.rdsq_depth = 128;
+    urc_ext.queues.rq_sequence_threshold_entries = 1;
+    expect_invalid_argument("URC_RQ_THRESHOLD_MIN", urc_ext.validate());
+    urc_ext.queues.rq_sequence_threshold_entries = 3;
+    expect_invalid_argument("URC_RQ_THRESHOLD_POWER_TWO",
+                            urc_ext.validate());
+    urc_ext.queues.rq_sequence_threshold_entries = 16;
+    urc_ext.queues.sq_completion_threshold_entries = 6;
+    expect_invalid_argument("URC_SQ_THRESHOLD_POWER_TWO",
+                            urc_ext.validate());
+
+    urc_ext.queues.rsq_depth = 1024;
+    urc_ext.queues.rdsq_depth = 2048;
+    urc_ext.queues.rdsq_fetch_count = 1000;
+    urc_ext.queues.dsq_fetch_count = 2000;
+    urc_ext.queues.rq_sequence_threshold_entries = 65536;
+    urc_ext.queues.sq_completion_threshold_entries = 131072;
+    expect_ok("URC_DEVICE_NEUTRAL_WIDTH", urc_ext.validate());
+
+    urc_ext.queues.rsq_depth = 64;
+    urc_ext.queues.rdsq_depth = 128;
+    urc_ext.queues.rdsq_fetch_count = 8;
+    urc_ext.queues.dsq_fetch_count = 16;
+    urc_ext.queues.rq_sequence_threshold_entries = qpc.rq_depth;
+    urc_ext.queues.sq_completion_threshold_entries = qpc.sq_depth;
+    qpc.transport = RDMA_TRANSPORT_URC;
+    qpc.transport_ext = urc_ext;
+    expect_ok("QPC_URC_THRESHOLDS_AT_DEPTH", qpc.validate());
+    urc_ext.queues.rq_sequence_threshold_entries = qpc.rq_depth * 2;
+    expect_invalid_argument("QPC_URC_RQ_THRESHOLD_DEPTH", qpc.validate());
+    urc_ext.queues.rq_sequence_threshold_entries = qpc.rq_depth;
+    urc_ext.queues.sq_completion_threshold_entries = qpc.sq_depth * 2;
+    expect_invalid_argument("QPC_URC_SQ_THRESHOLD_DEPTH", qpc.validate());
+    urc_ext.queues.sq_completion_threshold_entries = qpc.sq_depth;
+    expect_ok("QPC_URC_THRESHOLDS_RESTORED", qpc.validate());
 
     cqc.shadow_backing.value++;
     expect_invalid("SHADOW_ALIGNMENT", cqc.validate());

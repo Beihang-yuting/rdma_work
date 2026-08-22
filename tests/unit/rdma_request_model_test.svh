@@ -961,9 +961,15 @@ class rdma_request_model_test extends uvm_test;
     urc_ext.dbsn = 24'h223355;
     urc_ext.rpsn = 24'h334466;
     urc_ext.dpsn = 24'h445577;
-    urc_ext.rsq_backing.value = 64'h6100_0000;
-    urc_ext.rdsq_backing.value = 64'h6200_0000;
-    urc_ext.dsq_backing.value = 64'h6300_0000;
+    urc_ext.queues.rsq_backing.value = 64'h6100_0000;
+    urc_ext.queues.rdsq_backing.value = 64'h6200_0000;
+    urc_ext.queues.dsq_backing.value = 64'h6300_0000;
+    urc_ext.queues.rsq_depth = 64;
+    urc_ext.queues.rdsq_depth = 128;
+    urc_ext.queues.rdsq_fetch_count = 8;
+    urc_ext.queues.dsq_fetch_count = 16;
+    urc_ext.queues.rq_sequence_threshold_entries = 128;
+    urc_ext.queues.sq_completion_threshold_entries = 256;
     qpc.path_mtu_bytes = 8192;
     qpc.transport = RDMA_TRANSPORT_URC;
     qpc.transport_ext = urc_ext;
@@ -1086,18 +1092,36 @@ class rdma_request_model_test extends uvm_test;
       `uvm_error("CMQ_CLONE", "CMQ QPC clone lost or aliased fields")
     else if (!$cast(urc_ext_clone, qpc_clone.transport_ext))
       `uvm_error("CMQ_CLONE", "CMQ QPC clone lost URC extension type")
-    else if (urc_ext_clone.remote_qpn != 24'h765432 ||
-        urc_ext_clone.rbsn != 24'h112244)
+    else if (urc_ext_clone.queues == null ||
+        urc_ext_clone.queues == urc_ext.queues ||
+        urc_ext_clone.remote_qpn != 24'h765432 ||
+        urc_ext_clone.rbsn != 24'h112244 ||
+        urc_ext_clone.dbsn != 24'h223355 ||
+        urc_ext_clone.rpsn != 24'h334466 ||
+        urc_ext_clone.dpsn != 24'h445577 ||
+        urc_ext_clone.queues.rsq_backing.value != 64'h6100_0000 ||
+        urc_ext_clone.queues.rdsq_backing.value != 64'h6200_0000 ||
+        urc_ext_clone.queues.dsq_backing.value != 64'h6300_0000 ||
+        urc_ext_clone.queues.rsq_depth != 64 ||
+        urc_ext_clone.queues.rdsq_depth != 128 ||
+        urc_ext_clone.queues.rdsq_fetch_count != 8 ||
+        urc_ext_clone.queues.dsq_fetch_count != 16 ||
+        urc_ext_clone.queues.rq_sequence_threshold_entries != 128 ||
+        urc_ext_clone.queues.sq_completion_threshold_entries != 256)
       `uvm_error("CMQ_CLONE", "CMQ SQE clone lost nested context")
     else begin
       cmq_clone.function_h.function_uid++;
       cmq_clone.target_h.object_id++;
       qpc_clone.sq_depth = 2048;
       urc_ext_clone.remote_qpn++;
+      urc_ext_clone.queues.rsq_backing.value += 64'h1000;
+      urc_ext_clone.queues.rdsq_fetch_count = 24;
       if (cmq_create_qp.function_h.function_uid !=
             64'h1234_5678_9abc_def0 ||
           cmq_create_qp.target_h.object_id != 32'h404 ||
-          qpc.sq_depth != 1024 || urc_ext.remote_qpn != 24'h765432)
+          qpc.sq_depth != 1024 || urc_ext.remote_qpn != 24'h765432 ||
+          urc_ext.queues.rsq_backing.value != 64'h6100_0000 ||
+          urc_ext.queues.rdsq_fetch_count != 8)
         `uvm_error("CMQ_CLONE", "CMQ clone mutation reached source")
     end
 

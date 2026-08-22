@@ -289,11 +289,7 @@ class rdma_qpc_urc_ext extends rdma_qpc_transport_ext;
   bit [23:0] dbsn;
   bit [23:0] rpsn;
   bit [23:0] dpsn;
-  rdma_backing_addr_t rsq_backing;
-  rdma_backing_addr_t rdsq_backing;
-  rdma_backing_addr_t dsq_backing;
-  int unsigned fetch_threshold;
-  int unsigned queue_threshold;
+  rdma_urc_queue_config queues;
 
   function new(string name = "rdma_qpc_urc_ext");
     super.new(name);
@@ -302,15 +298,12 @@ class rdma_qpc_urc_ext extends rdma_qpc_transport_ext;
     dbsn = '0;
     rpsn = '0;
     dpsn = '0;
-    rsq_backing = '0;
-    rdsq_backing = '0;
-    dsq_backing = '0;
-    fetch_threshold = '0;
-    queue_threshold = '0;
+    queues = rdma_urc_queue_config::type_id::create("queues");
   endfunction
 
   virtual function void do_copy(uvm_object rhs);
     rdma_qpc_urc_ext rhs_ext;
+    uvm_object cloned_object;
 
     super.do_copy(rhs);
     if (!$cast(rhs_ext, rhs))
@@ -320,11 +313,14 @@ class rdma_qpc_urc_ext extends rdma_qpc_transport_ext;
     dbsn = rhs_ext.dbsn;
     rpsn = rhs_ext.rpsn;
     dpsn = rhs_ext.dpsn;
-    rsq_backing = rhs_ext.rsq_backing;
-    rdsq_backing = rhs_ext.rdsq_backing;
-    dsq_backing = rhs_ext.dsq_backing;
-    fetch_threshold = rhs_ext.fetch_threshold;
-    queue_threshold = rhs_ext.queue_threshold;
+    if (rhs_ext.queues == null) begin
+      queues = null;
+    end
+    else begin
+      cloned_object = rhs_ext.queues.clone();
+      if (cloned_object == null || !$cast(queues, cloned_object))
+        `uvm_fatal("RDMA_COPY_TYPE", "URC queue configuration clone mismatch")
+    end
   endfunction
 
   virtual function rdma_transport_e transport_kind();
@@ -335,17 +331,20 @@ class rdma_qpc_urc_ext extends rdma_qpc_transport_ext;
     if (remote_qpn == 0)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "URC QPC remote QPN is zero");
-    if ((rsq_backing.value & 64'hfff) != 0 ||
-        (rdsq_backing.value & 64'hfff) != 0 ||
-        (dsq_backing.value & 64'hfff) != 0)
+    if (queues == null)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                               "URC queue backing is not 4 KiB aligned");
-    return rdma_status::success();
+                               "URC QPC queue configuration is null");
+    return queues.validate();
   endfunction
 
   virtual function string describe();
-    return $sformatf("URC(remote_qpn=%0d rbsn=%0d dbsn=%0d)",
-                     remote_qpn, rbsn, dbsn);
+    string queues_text;
+
+    queues_text = (queues == null) ? "null" : queues.describe();
+    return $sformatf(
+      "URC(remote_qpn=%0d rbsn=%0d dbsn=%0d rpsn=%0d dpsn=%0d queues=%s)",
+      remote_qpn, rbsn, dbsn, rpsn, dpsn, queues_text
+    );
   endfunction
 endclass
 
@@ -550,7 +549,21 @@ class rdma_qpc_model extends rdma_hw_model;
         return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                  "QPC transport is unsupported");
     endcase
-    return transport_ext.validate();
+    status = transport_ext.validate();
+    if (!status.ok()) return status;
+    if (transport == RDMA_TRANSPORT_URC) begin
+      if (urc_ext.queues.rq_sequence_threshold_entries > rq_depth)
+        return rdma_status::make(
+          RDMA_SC_INVALID_ARGUMENT,
+          "URC RQ sequence threshold exceeds QPC RQ depth"
+        );
+      if (urc_ext.queues.sq_completion_threshold_entries > sq_depth)
+        return rdma_status::make(
+          RDMA_SC_INVALID_ARGUMENT,
+          "URC SQ completion threshold exceeds QPC SQ depth"
+        );
+    end
+    return rdma_status::success();
   endfunction
 
   virtual function string describe();
