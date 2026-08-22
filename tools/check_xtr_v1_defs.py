@@ -109,6 +109,51 @@ BODY_MASKS = {
     ),
 }
 
+# Task 11 CMQ composition ownership is intentionally frozen separately from
+# the Task 10 context-body masks above.  These masks describe which final CMQ
+# qword bits each exact opcode body may author.
+CMQ_BODY_OWNERSHIP = {
+    "XTR_V1_QPC_CREATE_BODY_OWNERSHIP": (
+        0x0000000000FFFFFF, 0xFFFFF801FF1FFFFF,
+        0x0000000000000000, 0xFFFFFFFFFFFFFE00, 0, 0, 0, 0,
+    ),
+    "XTR_V1_QPC_MODIFY_BODY_OWNERSHIP": (
+        0x7000000000FFFFFF, 0xFFFFF801FF1FFFFF,
+        0xFFFFFFFF3FFF3FFF, 0xFFFFFFFFFFFFFE00,
+        0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF,
+        0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF,
+    ),
+    "XTR_V1_QPC_DELETE_BODY_OWNERSHIP": (
+        0x0000000000FFFFFF, 0xFFFFF800001FFFFF, 0, 0, 0, 0, 0, 0,
+    ),
+    "XTR_V1_QPC_QUERY_BODY_OWNERSHIP": (
+        0x0000000000FFFFFF, 0, 0, 0xFFFFFFFFFFFFFE00, 0, 0, 0, 0,
+    ),
+    "XTR_V1_MRT_REGISTER_BODY_OWNERSHIP": (
+        0x6000000000FFFFFF, 0x00000000FF000000,
+        0xFFFFFFFFFF000000, 0xFF00BFFFFFFFFFFF,
+        0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFF000,
+        0xFFFFFFFFFFFFFFFF, 0,
+    ),
+    "XTR_V1_MR_DEREGISTER_BODY_OWNERSHIP": (
+        0x6000000000FFFFFF, 0x00000000FF000000, 0, 0, 0, 0, 0, 0,
+    ),
+    "XTR_V1_OCC_FLUSH_BODY_OWNERSHIP": (
+        0x30000000001FFFFF, 0xFFC00FFF00000000,
+        0xFFFFFFFFFFFFF000, 0, 0, 0, 0, 0,
+    ),
+    "XTR_V1_CQ_OBJECT_ID_BODY_OWNERSHIP": (
+        0x00000000001FFFFF, 0, 0, 0, 0, 0, 0, 0,
+    ),
+    "XTR_V1_EQ_OBJECT_ID_BODY_OWNERSHIP": (
+        0x0000000000000FFF, 0, 0, 0, 0, 0, 0, 0,
+    ),
+    "XTR_V1_SRQ_OBJECT_ID_BODY_OWNERSHIP": (
+        0x000000000000FFFF, 0, 0, 0, 0, 0, 0, 0,
+    ),
+    "XTR_V1_EMPTY_BODY_OWNERSHIP": (0, 0, 0, 0, 0, 0, 0, 0),
+}
+
 
 class ValidationError(RuntimeError):
     """The checked definition baseline is inconsistent or unsupported."""
@@ -295,6 +340,37 @@ FIELD_MAPPINGS = (
     FieldMapping("cmq.h", "XTRDMA_CMQSQ_WQE_SIGNATURE", "XTR_V1_CMQ_SIGNATURE", 8),
     FieldMapping("cmq.h", "XTRDMA_CMQSQ_WQE_RQ_CQN", "XTR_V1_CMQ_RQ_CQN", 8),
     FieldMapping("cmq.h", "XTRDMA_CMQSQ_WQE_QPC_BUFFER_ADDR", "XTR_V1_CMQ_QPC_BUFFER_ADDR", 24),
+    # Task 11 exact QPC command and OCC-flush body fields.
+    FieldMapping("cmq.h", "XTRDMA_CMQSQ_WQE_NXT_QP_ST", "XTR_V1_CMQ_NEXT_QP_STATE", 0),
+    FieldMapping("cmq.h", "XTRDMA_CMQSQ_WQE_MODIFY_MODE", "XTR_V1_CMQ_MODIFY_MODE", 16),
+    FieldMapping("cmq.h", "XTRDMA_CMQSQ_WQE_MODIFY_START_QWORD0", "XTR_V1_CMQ_MODIFY_START_QWORD0", 16),
+    FieldMapping("cmq.h", "XTRDMA_CMQSQ_WQE_MODIFY_WBE0", "XTR_V1_CMQ_MODIFY_WBE0", 16),
+    FieldMapping("cmq.h", "XTRDMA_CMQSQ_WQE_WBE_TPL_NUM", "XTR_V1_CMQ_WBE_TEMPLATE_COUNT", 16),
+    FieldMapping("cmq.h", "XTRDMA_CMQSQ_WQE_MODIFY_START_QWORD1", "XTR_V1_CMQ_MODIFY_START_QWORD1", 16),
+    FieldMapping("cmq.h", "XTRDMA_CMQSQ_WQE_MODIFY_WBE1", "XTR_V1_CMQ_MODIFY_WBE1", 16),
+    FieldMapping("cmq.h", "XTRDMA_CMQSQ_WQE_MODIFY_START_QWORD2", "XTR_V1_CMQ_MODIFY_START_QWORD2", 16),
+    FieldMapping("cmq.h", "XTRDMA_CMQSQ_WQE_MODIFY_WBE2", "XTR_V1_CMQ_MODIFY_WBE2", 16),
+    FieldMapping("cmq.h", "XTRDMA_CMQSQ_WQE_MODIFY_START_QWORD3", "XTR_V1_CMQ_MODIFY_START_QWORD3", 16),
+    FieldMapping("cmq.h", "XTRDMA_CMQSQ_WQE_MODIFY_WBE3", "XTR_V1_CMQ_MODIFY_WBE3", 16),
+    FieldMapping("cmq.h", "XTRDMA_CMQSQ_WQE_MODIFY_DATA", "XTR_V1_CMQ_MODIFY_DATA0", 32),
+    FieldMapping("cmq.h", "XTRDMA_CMQSQ_WQE_MODIFY_DATA", "XTR_V1_CMQ_MODIFY_DATA1", 40),
+    FieldMapping("cmq.h", "XTRDMA_CMQSQ_WQE_MODIFY_DATA", "XTR_V1_CMQ_MODIFY_DATA2", 48),
+    FieldMapping("cmq.h", "XTRDMA_CMQSQ_WQE_MODIFY_DATA", "XTR_V1_CMQ_MODIFY_DATA3", 56),
+    FieldMapping("cmq.h", "XTRDMA_CMQSQ_OCC_FLUSH_VF_FLUSH", "XTR_V1_CMQ_OCC_VF_FLUSH", 0),
+    FieldMapping("cmq.h", "XTRDMA_CMQSQ_OCC_FLUSH_MR_SN_FLUSH", "XTR_V1_CMQ_OCC_MR_SERIAL_FLUSH", 0),
+    FieldMapping("cmq.h", "XTRDMA_CMQSQ_OCC_FLUSH_QPN", "XTR_V1_CMQ_OCC_QPN", 0),
+    FieldMapping("cmq.h", "XTRDMA_CMQSQ_OCC_FLUSH_QPC_FLAG", "XTR_V1_CMQ_OCC_QPC", 8),
+    FieldMapping("cmq.h", "XTRDMA_CMQSQ_OCC_FLUSH_CQC_FLAG", "XTR_V1_CMQ_OCC_CQC", 8),
+    FieldMapping("cmq.h", "XTRDMA_CMQSQ_OCC_FLUSH_MRT_FLAG", "XTR_V1_CMQ_OCC_MRT", 8),
+    FieldMapping("cmq.h", "XTRDMA_CMQSQ_OCC_FLUSH_PBLE_FLAG", "XTR_V1_CMQ_OCC_PBLE", 8),
+    FieldMapping("cmq.h", "XTRDMA_CMQSQ_OCC_FLUSH_SQRQE_FLAG", "XTR_V1_CMQ_OCC_SQRQE", 8),
+    FieldMapping("cmq.h", "XTRDMA_CMQSQ_OCC_FLUSH_SGB_IRQE_FLAG", "XTR_V1_CMQ_OCC_SGB_IRQE", 8),
+    FieldMapping("cmq.h", "XTRDMA_CMQSQ_OCC_FLUSH_EIRQE_FLAG", "XTR_V1_CMQ_OCC_EIRQE", 8),
+    FieldMapping("cmq.h", "XTRDMA_CMQSQ_OCC_FLUSH_ORQE_FLAG", "XTR_V1_CMQ_OCC_ORQE", 8),
+    FieldMapping("cmq.h", "XTRDMA_CMQSQ_OCC_FLUSH_UAQE_FLAG", "XTR_V1_CMQ_OCC_UAQE", 8),
+    FieldMapping("cmq.h", "XTRDMA_CMQSQ_OCC_FLUSH_PD_FLAG", "XTR_V1_CMQ_OCC_PD", 8),
+    FieldMapping("cmq.h", "XTRDMA_CMQSQ_OCC_FLUSH_MR_SN", "XTR_V1_CMQ_OCC_MR_SERIAL", 8),
+    FieldMapping("cmq.h", "XTRDMA_CMQSQ_OCC_FLUSH_PD_PBA", "XTR_V1_CMQ_OCC_PD_BACKING", 16),
     FieldMapping("cmq.h", "XTRDMA_CMQSQ_WQE_CQC_WQE_CQN", "XTR_V1_CQC_BODY_CQN", 0),
     FieldMapping("cmq.h", "XTRDMA_CMQCQ_WQE_SRFQN", "XTR_V1_SRQC_BODY_SRFQN", 0),
     FieldMapping("cmq.h", "XTRDMA_CMQCQ_WQE_EQN", "XTR_V1_EQC_BODY_EQN", 0),
@@ -519,6 +595,9 @@ VALUE_MAPPINGS = (
     ValueMapping("cmq.h", "XTRDMA_OP_SRFQC_DELETE", "XTR_V1_OP_SRFQC_DELETE"),
     ValueMapping("cmq.h", "XTRDMA_OP_SRFQC_QUERY", "XTR_V1_OP_SRFQC_QUERY"),
     ValueMapping("cmq.h", "XTRDMA_OP_NOP", "XTR_V1_OP_NOP"),
+    ValueMapping("qp.h", "XTRDMA_MODIFY_MODE_ONLY_ST", "XTR_V1_QPC_MODIFY_STATE_ONLY"),
+    ValueMapping("qp.h", "XTRDMA_MODIFY_MODE_FULL_QPC", "XTR_V1_QPC_MODIFY_FULL"),
+    ValueMapping("qp.h", "XTRDMA_MODIFY_MODE_PARTIAL_QPC", "XTR_V1_QPC_MODIFY_PARTIAL"),
     # Context object/state/mode codes consumed by Task 10 codecs.
     ValueMapping("alloc.h", "XTRDMA_ALLOC_TYPE_DIRECT", "XTR_V1_ALLOC_TYPE_DIRECT"),
     ValueMapping("alloc.h", "XTRDMA_ALLOC_TYPE_INDIRECT", "XTR_V1_ALLOC_TYPE_INDIRECT"),
@@ -671,16 +750,34 @@ def validate_mapping_uniqueness(
                 raise ValidationError(f"duplicate {label}: {item}")
             seen.add(item)
 
+    def unique_sources(items, label: str) -> None:
+        modify_data_source = ("cmq.h", "XTRDMA_CMQSQ_WQE_MODIFY_DATA")
+        modify_data_offsets = {32, 40, 48, 56}
+        offsets_by_source: dict[tuple[str, str], list[int]] = {}
+        for item in items:
+            source = (item.path, item.c_symbol)
+            offsets_by_source.setdefault(source, []).append(
+                item.word_byte_offset
+            )
+        for source, offsets in offsets_by_source.items():
+            if source == modify_data_source:
+                if (len(offsets) != 4 or
+                        set(offsets) != modify_data_offsets):
+                    raise ValidationError(
+                        f"duplicate {label} exception must contain exactly "
+                        f"offsets 32, 40, 48, and 56: {source}"
+                    )
+            elif len(offsets) != 1:
+                raise ValidationError(f"duplicate {label}: {source}")
+
     unique((mapping.sv_stem for mapping in field_mappings), "field mapping SV stem")
-    unique(((mapping.path, mapping.c_symbol) for mapping in field_mappings),
-           "field mapping source")
+    unique_sources(field_mappings, "field mapping source")
     unique((mapping.sv_name for mapping in value_mappings), "SV value mapping")
     unique(((mapping.path, mapping.c_symbol) for mapping in value_mappings),
            "value mapping source")
     unique((reference.sv_stem for reference in reference_fields),
            "reference SV stem")
-    unique(((reference.path, reference.c_symbol) for reference in reference_fields),
-           "reference source")
+    unique_sources(reference_fields, "reference source")
 
     # expected_constants is keyed by the final emitted SV names.  Validate
     # that namespace before building the dictionary so no later table can
@@ -835,6 +932,40 @@ def parse_sv_masks(text: str) -> dict[str, tuple[int, ...]]:
     return masks
 
 
+def parse_sv_ownership(text: str) -> dict[str, tuple[int, ...]]:
+    ownership: dict[str, tuple[int, ...]] = {}
+    pattern = re.compile(
+        r"localparam\s+bit\s*\[63:0\]\s+"
+        r"(XTR_V1_[A-Z0-9_]+_OWNERSHIP)\s*\[0:7\]\s*=\s*'\{(.*?)\};",
+        re.S,
+    )
+    for match in pattern.finditer(text):
+        name = match.group(1)
+        if name in ownership:
+            raise ValidationError(f"duplicate SV ownership: {name}")
+        values = tuple(
+            parse_sv_value(item.strip()) for item in match.group(2).split(",")
+        )
+        if len(values) != 8:
+            raise ValidationError(f"{name} must contain eight qword masks")
+        ownership[name] = values
+    return ownership
+
+
+def validate_cmq_body_ownership(
+    ownership: dict[str, tuple[int, ...]],
+) -> None:
+    if ownership != CMQ_BODY_OWNERSHIP:
+        raise ValidationError(
+            "SV CMQ body ownership differs from independent reference"
+        )
+    for name, masks in ownership.items():
+        if any(mask & envelope for mask, envelope in zip(masks, ENVELOPE_MASK)):
+            raise ValidationError(
+                f"CMQ body ownership overlaps request envelope: {name}"
+            )
+
+
 def strip_c_comments(line: str) -> str:
     return re.sub(r"/\*.*?\*/", "", line).strip()
 
@@ -963,6 +1094,36 @@ REFERENCE_FIELDS = (
     ReferenceField("cmq.h", "XTRDMA_CMQSQ_WQE_SIGN_EN", "XTR_V1_CMQ_SIGN_EN", 8, 32, 1),
     ReferenceField("cmq.h", "XTRDMA_CMQSQ_WQE_RQ_CQN", "XTR_V1_CMQ_RQ_CQN", 8, 0, 21),
     ReferenceField("cmq.h", "XTRDMA_CMQSQ_WQE_QPC_BUFFER_ADDR", "XTR_V1_CMQ_QPC_BUFFER_ADDR", 24, 9, 55),
+    ReferenceField("cmq.h", "XTRDMA_CMQSQ_WQE_NXT_QP_ST", "XTR_V1_CMQ_NEXT_QP_STATE", 0, 60, 3),
+    ReferenceField("cmq.h", "XTRDMA_CMQSQ_WQE_MODIFY_MODE", "XTR_V1_CMQ_MODIFY_MODE", 16, 62, 2),
+    ReferenceField("cmq.h", "XTRDMA_CMQSQ_WQE_MODIFY_START_QWORD0", "XTR_V1_CMQ_MODIFY_START_QWORD0", 16, 56, 6),
+    ReferenceField("cmq.h", "XTRDMA_CMQSQ_WQE_MODIFY_WBE0", "XTR_V1_CMQ_MODIFY_WBE0", 16, 48, 8),
+    ReferenceField("cmq.h", "XTRDMA_CMQSQ_WQE_WBE_TPL_NUM", "XTR_V1_CMQ_WBE_TEMPLATE_COUNT", 16, 46, 2),
+    ReferenceField("cmq.h", "XTRDMA_CMQSQ_WQE_MODIFY_START_QWORD1", "XTR_V1_CMQ_MODIFY_START_QWORD1", 16, 40, 6),
+    ReferenceField("cmq.h", "XTRDMA_CMQSQ_WQE_MODIFY_WBE1", "XTR_V1_CMQ_MODIFY_WBE1", 16, 32, 8),
+    ReferenceField("cmq.h", "XTRDMA_CMQSQ_WQE_MODIFY_START_QWORD2", "XTR_V1_CMQ_MODIFY_START_QWORD2", 16, 24, 6),
+    ReferenceField("cmq.h", "XTRDMA_CMQSQ_WQE_MODIFY_WBE2", "XTR_V1_CMQ_MODIFY_WBE2", 16, 16, 8),
+    ReferenceField("cmq.h", "XTRDMA_CMQSQ_WQE_MODIFY_START_QWORD3", "XTR_V1_CMQ_MODIFY_START_QWORD3", 16, 8, 6),
+    ReferenceField("cmq.h", "XTRDMA_CMQSQ_WQE_MODIFY_WBE3", "XTR_V1_CMQ_MODIFY_WBE3", 16, 0, 8),
+    ReferenceField("cmq.h", "XTRDMA_CMQSQ_WQE_MODIFY_DATA", "XTR_V1_CMQ_MODIFY_DATA0", 32, 0, 64),
+    ReferenceField("cmq.h", "XTRDMA_CMQSQ_WQE_MODIFY_DATA", "XTR_V1_CMQ_MODIFY_DATA1", 40, 0, 64),
+    ReferenceField("cmq.h", "XTRDMA_CMQSQ_WQE_MODIFY_DATA", "XTR_V1_CMQ_MODIFY_DATA2", 48, 0, 64),
+    ReferenceField("cmq.h", "XTRDMA_CMQSQ_WQE_MODIFY_DATA", "XTR_V1_CMQ_MODIFY_DATA3", 56, 0, 64),
+    ReferenceField("cmq.h", "XTRDMA_CMQSQ_OCC_FLUSH_VF_FLUSH", "XTR_V1_CMQ_OCC_VF_FLUSH", 0, 61, 1),
+    ReferenceField("cmq.h", "XTRDMA_CMQSQ_OCC_FLUSH_MR_SN_FLUSH", "XTR_V1_CMQ_OCC_MR_SERIAL_FLUSH", 0, 60, 1),
+    ReferenceField("cmq.h", "XTRDMA_CMQSQ_OCC_FLUSH_QPN", "XTR_V1_CMQ_OCC_QPN", 0, 0, 21),
+    ReferenceField("cmq.h", "XTRDMA_CMQSQ_OCC_FLUSH_QPC_FLAG", "XTR_V1_CMQ_OCC_QPC", 8, 63, 1),
+    ReferenceField("cmq.h", "XTRDMA_CMQSQ_OCC_FLUSH_CQC_FLAG", "XTR_V1_CMQ_OCC_CQC", 8, 62, 1),
+    ReferenceField("cmq.h", "XTRDMA_CMQSQ_OCC_FLUSH_MRT_FLAG", "XTR_V1_CMQ_OCC_MRT", 8, 61, 1),
+    ReferenceField("cmq.h", "XTRDMA_CMQSQ_OCC_FLUSH_PBLE_FLAG", "XTR_V1_CMQ_OCC_PBLE", 8, 60, 1),
+    ReferenceField("cmq.h", "XTRDMA_CMQSQ_OCC_FLUSH_SQRQE_FLAG", "XTR_V1_CMQ_OCC_SQRQE", 8, 59, 1),
+    ReferenceField("cmq.h", "XTRDMA_CMQSQ_OCC_FLUSH_SGB_IRQE_FLAG", "XTR_V1_CMQ_OCC_SGB_IRQE", 8, 58, 1),
+    ReferenceField("cmq.h", "XTRDMA_CMQSQ_OCC_FLUSH_EIRQE_FLAG", "XTR_V1_CMQ_OCC_EIRQE", 8, 57, 1),
+    ReferenceField("cmq.h", "XTRDMA_CMQSQ_OCC_FLUSH_ORQE_FLAG", "XTR_V1_CMQ_OCC_ORQE", 8, 56, 1),
+    ReferenceField("cmq.h", "XTRDMA_CMQSQ_OCC_FLUSH_UAQE_FLAG", "XTR_V1_CMQ_OCC_UAQE", 8, 55, 1),
+    ReferenceField("cmq.h", "XTRDMA_CMQSQ_OCC_FLUSH_PD_FLAG", "XTR_V1_CMQ_OCC_PD", 8, 54, 1),
+    ReferenceField("cmq.h", "XTRDMA_CMQSQ_OCC_FLUSH_MR_SN", "XTR_V1_CMQ_OCC_MR_SERIAL", 8, 32, 12),
+    ReferenceField("cmq.h", "XTRDMA_CMQSQ_OCC_FLUSH_PD_PBA", "XTR_V1_CMQ_OCC_PD_BACKING", 16, 12, 52),
     ReferenceField("wr.h", "XTRDMA_SQ_WQE_QPN", "XTR_V1_SQ_WQE_QPN", 0, 0, 21),
     ReferenceField("wr.h", "XTRDMA_SQ_WQE_OPCODE", "XTR_V1_SQ_WQE_OPCODE", 0, 32, 4),
     ReferenceField("wr.h", "XTRDMA_SQ_WQE_INDEX", "XTR_V1_SQ_WQE_INDEX", 0, 40, 15),
@@ -1184,7 +1345,11 @@ def validate_reference_fields(
     seen_stems = set()
     seen_sources = set()
     for reference in reference_fields:
-        source_key = (reference.path, reference.c_symbol)
+        source_key = (
+            reference.path,
+            reference.c_symbol,
+            reference.word_byte_offset,
+        )
         if reference.sv_stem in seen_stems or source_key in seen_sources:
             raise ValidationError(f"duplicate reference field for {reference.sv_stem}")
         seen_stems.add(reference.sv_stem)
@@ -2358,6 +2523,8 @@ def validate(kernel_root: Path) -> None:
     sv_mask_text = SV_MASKS_PATH.read_text()
     validate_sv_mask_api(sv_mask_text)
     sv_masks = parse_sv_masks(sv_mask_text)
+    sv_ownership = parse_sv_ownership(sv_mask_text)
+    validate_cmq_body_ownership(sv_ownership)
     expected_constants: dict[str, int] = dict(PROFILE_VALUES)
     parsed_fields: dict[str, tuple[str, str, int, int]] = {}
     for mapping in FIELD_MAPPINGS:

@@ -141,6 +141,66 @@ localparam bit [63:0] XTR_V1_WINDOW = 64'h2000;
                 CHECKER.REFERENCE_FIELDS + (colliding_reference,),
             )
 
+    def test_cmq_composer_does_not_retain_built_artifacts(self) -> None:
+        source = (
+            REPO_ROOT
+            / "src/codec/xtr_v1/rdma_xtr_v1_cmq_codecs.svh"
+        ).read_text()
+        self.assertNotRegex(
+            source,
+            r"\bminted_(?:bodies|opcodes|snapshots)\s*\[\$\]",
+        )
+
+    def test_duplicate_source_symbol_at_another_offset_is_fatal(self) -> None:
+        validate = CHECKER.validate_mapping_uniqueness
+        first = next(
+            mapping
+            for mapping in CHECKER.FIELD_MAPPINGS
+            if mapping.c_symbol != "XTRDMA_CMQSQ_WQE_MODIFY_DATA"
+        )
+        duplicate = first._replace(
+            sv_stem="XTR_V1_TEST_DUPLICATE_SOURCE",
+            word_byte_offset=first.word_byte_offset + 8,
+        )
+        with self.assertRaisesRegex(CHECKER.ValidationError, "source"):
+            validate(
+                CHECKER.FIELD_MAPPINGS + (duplicate,),
+                CHECKER.VALUE_MAPPINGS,
+                CHECKER.REFERENCE_FIELDS,
+            )
+
+    def test_modify_data_source_exception_requires_exact_quartet(self) -> None:
+        validate = CHECKER.validate_mapping_uniqueness
+        symbol = "XTRDMA_CMQSQ_WQE_MODIFY_DATA"
+        fields = tuple(
+            mapping
+            for mapping in CHECKER.FIELD_MAPPINGS
+            if mapping.path == "cmq.h" and mapping.c_symbol == symbol
+        )
+        references = tuple(
+            reference
+            for reference in CHECKER.REFERENCE_FIELDS
+            if reference.path == "cmq.h" and reference.c_symbol == symbol
+        )
+
+        validate(fields, (), references)
+        for label, selected_fields, selected_references in (
+            ("field missing", fields[:-1], references),
+            ("reference missing", fields, references[:-1]),
+        ):
+            with self.subTest(label=label):
+                with self.assertRaisesRegex(
+                    CHECKER.ValidationError, "source"
+                ):
+                    validate(selected_fields, (), selected_references)
+
+        extra_field = fields[0]._replace(
+            sv_stem="XTR_V1_TEST_MODIFY_DATA4",
+            word_byte_offset=64,
+        )
+        with self.assertRaisesRegex(CHECKER.ValidationError, "source"):
+            validate(fields + (extra_field,), (), references)
+
     def test_field_declaration_expands_to_auditable_coordinates(self) -> None:
         constants = CHECKER.parse_sv_constants(
             "`XTR_V1_FIELD(XTR_V1_QPC_QPN, 0, 16, 21)\n"
@@ -308,6 +368,269 @@ localparam bit [63:0] XTR_V1_WINDOW = 64'h2000;
     def test_mask_file_exposes_qword_lookup_api_with_image_kind(self) -> None:
         validate = getattr(CHECKER, "validate_sv_mask_api")
         validate((REPO_ROOT / "src/codec/xtr_v1/rdma_xtr_v1_image_masks.svh").read_text())
+
+
+class Task11DefinitionTest(unittest.TestCase):
+    TASK11_FIELDS = {
+        "XTR_V1_CMQ_NEXT_QP_STATE":
+            ("XTRDMA_CMQSQ_WQE_NXT_QP_ST", 0, 60, 3),
+        "XTR_V1_CMQ_MODIFY_MODE":
+            ("XTRDMA_CMQSQ_WQE_MODIFY_MODE", 16, 62, 2),
+        "XTR_V1_CMQ_MODIFY_START_QWORD0":
+            ("XTRDMA_CMQSQ_WQE_MODIFY_START_QWORD0", 16, 56, 6),
+        "XTR_V1_CMQ_MODIFY_WBE0":
+            ("XTRDMA_CMQSQ_WQE_MODIFY_WBE0", 16, 48, 8),
+        "XTR_V1_CMQ_WBE_TEMPLATE_COUNT":
+            ("XTRDMA_CMQSQ_WQE_WBE_TPL_NUM", 16, 46, 2),
+        "XTR_V1_CMQ_MODIFY_START_QWORD1":
+            ("XTRDMA_CMQSQ_WQE_MODIFY_START_QWORD1", 16, 40, 6),
+        "XTR_V1_CMQ_MODIFY_WBE1":
+            ("XTRDMA_CMQSQ_WQE_MODIFY_WBE1", 16, 32, 8),
+        "XTR_V1_CMQ_MODIFY_START_QWORD2":
+            ("XTRDMA_CMQSQ_WQE_MODIFY_START_QWORD2", 16, 24, 6),
+        "XTR_V1_CMQ_MODIFY_WBE2":
+            ("XTRDMA_CMQSQ_WQE_MODIFY_WBE2", 16, 16, 8),
+        "XTR_V1_CMQ_MODIFY_START_QWORD3":
+            ("XTRDMA_CMQSQ_WQE_MODIFY_START_QWORD3", 16, 8, 6),
+        "XTR_V1_CMQ_MODIFY_WBE3":
+            ("XTRDMA_CMQSQ_WQE_MODIFY_WBE3", 16, 0, 8),
+        "XTR_V1_CMQ_MODIFY_DATA0":
+            ("XTRDMA_CMQSQ_WQE_MODIFY_DATA", 32, 0, 64),
+        "XTR_V1_CMQ_MODIFY_DATA1":
+            ("XTRDMA_CMQSQ_WQE_MODIFY_DATA", 40, 0, 64),
+        "XTR_V1_CMQ_MODIFY_DATA2":
+            ("XTRDMA_CMQSQ_WQE_MODIFY_DATA", 48, 0, 64),
+        "XTR_V1_CMQ_MODIFY_DATA3":
+            ("XTRDMA_CMQSQ_WQE_MODIFY_DATA", 56, 0, 64),
+        "XTR_V1_CMQ_OCC_VF_FLUSH":
+            ("XTRDMA_CMQSQ_OCC_FLUSH_VF_FLUSH", 0, 61, 1),
+        "XTR_V1_CMQ_OCC_MR_SERIAL_FLUSH":
+            ("XTRDMA_CMQSQ_OCC_FLUSH_MR_SN_FLUSH", 0, 60, 1),
+        "XTR_V1_CMQ_OCC_QPN":
+            ("XTRDMA_CMQSQ_OCC_FLUSH_QPN", 0, 0, 21),
+        "XTR_V1_CMQ_OCC_QPC":
+            ("XTRDMA_CMQSQ_OCC_FLUSH_QPC_FLAG", 8, 63, 1),
+        "XTR_V1_CMQ_OCC_CQC":
+            ("XTRDMA_CMQSQ_OCC_FLUSH_CQC_FLAG", 8, 62, 1),
+        "XTR_V1_CMQ_OCC_MRT":
+            ("XTRDMA_CMQSQ_OCC_FLUSH_MRT_FLAG", 8, 61, 1),
+        "XTR_V1_CMQ_OCC_PBLE":
+            ("XTRDMA_CMQSQ_OCC_FLUSH_PBLE_FLAG", 8, 60, 1),
+        "XTR_V1_CMQ_OCC_SQRQE":
+            ("XTRDMA_CMQSQ_OCC_FLUSH_SQRQE_FLAG", 8, 59, 1),
+        "XTR_V1_CMQ_OCC_SGB_IRQE":
+            ("XTRDMA_CMQSQ_OCC_FLUSH_SGB_IRQE_FLAG", 8, 58, 1),
+        "XTR_V1_CMQ_OCC_EIRQE":
+            ("XTRDMA_CMQSQ_OCC_FLUSH_EIRQE_FLAG", 8, 57, 1),
+        "XTR_V1_CMQ_OCC_ORQE":
+            ("XTRDMA_CMQSQ_OCC_FLUSH_ORQE_FLAG", 8, 56, 1),
+        "XTR_V1_CMQ_OCC_UAQE":
+            ("XTRDMA_CMQSQ_OCC_FLUSH_UAQE_FLAG", 8, 55, 1),
+        "XTR_V1_CMQ_OCC_PD":
+            ("XTRDMA_CMQSQ_OCC_FLUSH_PD_FLAG", 8, 54, 1),
+        "XTR_V1_CMQ_OCC_MR_SERIAL":
+            ("XTRDMA_CMQSQ_OCC_FLUSH_MR_SN", 8, 32, 12),
+        "XTR_V1_CMQ_OCC_PD_BACKING":
+            ("XTRDMA_CMQSQ_OCC_FLUSH_PD_PBA", 16, 12, 52),
+    }
+
+    EXPECTED_OWNERSHIP = {
+        "XTR_V1_QPC_CREATE_BODY_OWNERSHIP": (
+            0x0000000000FFFFFF, 0xFFFFF801FF1FFFFF,
+            0x0000000000000000, 0xFFFFFFFFFFFFFE00, 0, 0, 0, 0,
+        ),
+        "XTR_V1_QPC_MODIFY_BODY_OWNERSHIP": (
+            0x7000000000FFFFFF, 0xFFFFF801FF1FFFFF,
+            0xFFFFFFFF3FFF3FFF, 0xFFFFFFFFFFFFFE00,
+            0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF,
+            0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF,
+        ),
+        "XTR_V1_QPC_DELETE_BODY_OWNERSHIP": (
+            0x0000000000FFFFFF, 0xFFFFF800001FFFFF, 0, 0, 0, 0, 0, 0,
+        ),
+        "XTR_V1_QPC_QUERY_BODY_OWNERSHIP": (
+            0x0000000000FFFFFF, 0, 0, 0xFFFFFFFFFFFFFE00, 0, 0, 0, 0,
+        ),
+        "XTR_V1_MRT_REGISTER_BODY_OWNERSHIP": (
+            0x6000000000FFFFFF, 0x00000000FF000000,
+            0xFFFFFFFFFF000000, 0xFF00BFFFFFFFFFFF,
+            0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFF000,
+            0xFFFFFFFFFFFFFFFF, 0,
+        ),
+        "XTR_V1_MR_DEREGISTER_BODY_OWNERSHIP": (
+            0x6000000000FFFFFF, 0x00000000FF000000, 0, 0, 0, 0, 0, 0,
+        ),
+        "XTR_V1_OCC_FLUSH_BODY_OWNERSHIP": (
+            0x30000000001FFFFF, 0xFFC00FFF00000000,
+            0xFFFFFFFFFFFFF000, 0, 0, 0, 0, 0,
+        ),
+        "XTR_V1_CQ_OBJECT_ID_BODY_OWNERSHIP": (
+            0x00000000001FFFFF, 0, 0, 0, 0, 0, 0, 0,
+        ),
+        "XTR_V1_EQ_OBJECT_ID_BODY_OWNERSHIP": (
+            0x0000000000000FFF, 0, 0, 0, 0, 0, 0, 0,
+        ),
+        "XTR_V1_SRQ_OBJECT_ID_BODY_OWNERSHIP": (
+            0x000000000000FFFF, 0, 0, 0, 0, 0, 0, 0,
+        ),
+        "XTR_V1_EMPTY_BODY_OWNERSHIP": (0, 0, 0, 0, 0, 0, 0, 0),
+    }
+
+    @staticmethod
+    def parsed_reference_fields():
+        return {
+            reference.sv_stem: (
+                reference.path,
+                reference.c_symbol,
+                reference.lsb,
+                reference.width,
+            )
+            for reference in CHECKER.REFERENCE_FIELDS
+        }
+
+    def test_task11_rows_match_source_reference_and_sv_coordinates(self) -> None:
+        mappings = {mapping.sv_stem: mapping for mapping in CHECKER.FIELD_MAPPINGS}
+        references = {
+            reference.sv_stem: reference
+            for reference in CHECKER.REFERENCE_FIELDS
+        }
+        sv_constants = CHECKER.parse_sv_constants(
+            (REPO_ROOT / "src/codec/xtr_v1/rdma_xtr_v1_defs.svh").read_text()
+        )
+        for stem, (c_symbol, byte_offset, lsb, width) in self.TASK11_FIELDS.items():
+            with self.subTest(stem=stem):
+                self.assertEqual(
+                    mappings[stem],
+                    CHECKER.FieldMapping("cmq.h", c_symbol, stem, byte_offset),
+                )
+                self.assertEqual(
+                    references[stem],
+                    CHECKER.ReferenceField(
+                        "cmq.h", c_symbol, stem, byte_offset, lsb, width
+                    ),
+                )
+                self.assertEqual(
+                    (
+                        sv_constants[f"{stem}_WORD_BYTE_OFFSET"],
+                        sv_constants[f"{stem}_LSB"],
+                        sv_constants[f"{stem}_WIDTH"],
+                        sv_constants[f"{stem}_OFFSET"],
+                    ),
+                    (byte_offset, lsb, width, byte_offset * 8 + lsb),
+                )
+
+    def test_task11_source_coordinate_drift_is_rejected(self) -> None:
+        parsed_fields = self.parsed_reference_fields()
+        for stem in self.TASK11_FIELDS:
+            with self.subTest(stem=stem):
+                drifted = dict(parsed_fields)
+                path, c_symbol, lsb, width = drifted[stem]
+                drifted[stem] = (path, c_symbol, lsb ^ 1, width)
+                with self.assertRaisesRegex(
+                    CHECKER.ValidationError, "reference mask mismatch"
+                ):
+                    CHECKER.validate_reference_fields(
+                        CHECKER.REFERENCE_FIELDS,
+                        CHECKER.FIELD_MAPPINGS,
+                        drifted,
+                    )
+
+    def test_task11_reference_coordinate_drift_is_rejected(self) -> None:
+        parsed_fields = self.parsed_reference_fields()
+        for stem in self.TASK11_FIELDS:
+            with self.subTest(stem=stem):
+                references = list(CHECKER.REFERENCE_FIELDS)
+                index = next(
+                    index for index, reference in enumerate(references)
+                    if reference.sv_stem == stem
+                )
+                references[index] = references[index]._replace(
+                    word_byte_offset=references[index].word_byte_offset + 8
+                )
+                with self.assertRaisesRegex(
+                    CHECKER.ValidationError, "reference byte offset mismatch"
+                ):
+                    CHECKER.validate_reference_fields(
+                        tuple(references), CHECKER.FIELD_MAPPINGS, parsed_fields
+                    )
+
+    def test_task11_sv_constant_drift_is_rejected(self) -> None:
+        sv_constants = CHECKER.parse_sv_constants(
+            (REPO_ROOT / "src/codec/xtr_v1/rdma_xtr_v1_defs.svh").read_text()
+        )
+        for stem, (_, byte_offset, lsb, width) in self.TASK11_FIELDS.items():
+            expected = {
+                f"{stem}_WORD_BYTE_OFFSET": byte_offset,
+                f"{stem}_LSB": lsb,
+                f"{stem}_WIDTH": width,
+                f"{stem}_OFFSET": byte_offset * 8 + lsb,
+            }
+            with self.subTest(stem=stem):
+                CHECKER.validate_required_sv_constants(sv_constants, expected)
+                drifted = dict(sv_constants)
+                drifted[f"{stem}_OFFSET"] ^= 1
+                with self.assertRaisesRegex(
+                    CHECKER.ValidationError, "SV constant mismatch"
+                ):
+                    CHECKER.validate_required_sv_constants(drifted, expected)
+
+    def test_modify_mode_values_are_pinned_to_driver_enums(self) -> None:
+        expected = {
+            ("qp.h", "XTRDMA_MODIFY_MODE_ONLY_ST",
+             "XTR_V1_QPC_MODIFY_STATE_ONLY"),
+            ("qp.h", "XTRDMA_MODIFY_MODE_FULL_QPC",
+             "XTR_V1_QPC_MODIFY_FULL"),
+            ("qp.h", "XTRDMA_MODIFY_MODE_PARTIAL_QPC",
+             "XTR_V1_QPC_MODIFY_PARTIAL"),
+        }
+        actual = {
+            (mapping.path, mapping.c_symbol, mapping.sv_name)
+            for mapping in CHECKER.VALUE_MAPPINGS
+        }
+        self.assertTrue(expected <= actual)
+        constants = CHECKER.parse_sv_constants(
+            (REPO_ROOT / "src/codec/xtr_v1/rdma_xtr_v1_defs.svh").read_text()
+        )
+        expected_values = {
+            "XTR_V1_QPC_MODIFY_STATE_ONLY": 0,
+            "XTR_V1_QPC_MODIFY_FULL": 1,
+            "XTR_V1_QPC_MODIFY_PARTIAL": 2,
+        }
+        CHECKER.validate_required_sv_constants(constants, expected_values)
+        for name in expected_values:
+            with self.subTest(name=name):
+                drifted = dict(constants)
+                drifted[name] += 1
+                with self.assertRaisesRegex(
+                    CHECKER.ValidationError, "SV constant mismatch"
+                ):
+                    CHECKER.validate_required_sv_constants(
+                        drifted, expected_values
+                    )
+
+    def test_cmq_ownership_is_parsed_separately_and_exact(self) -> None:
+        text = (REPO_ROOT /
+                "src/codec/xtr_v1/rdma_xtr_v1_image_masks.svh").read_text()
+        self.assertEqual(CHECKER.CMQ_BODY_OWNERSHIP, self.EXPECTED_OWNERSHIP)
+        self.assertEqual(
+            CHECKER.parse_sv_ownership(text), self.EXPECTED_OWNERSHIP
+        )
+        self.assertTrue(
+            set(CHECKER.parse_sv_masks(text)).isdisjoint(self.EXPECTED_OWNERSHIP)
+        )
+        CHECKER.validate_cmq_body_ownership(self.EXPECTED_OWNERSHIP)
+
+    def test_each_cmq_ownership_mask_drift_is_rejected(self) -> None:
+        for name in self.EXPECTED_OWNERSHIP:
+            with self.subTest(name=name):
+                drifted = dict(self.EXPECTED_OWNERSHIP)
+                words = list(drifted[name])
+                words[0] ^= 1
+                drifted[name] = tuple(words)
+                with self.assertRaisesRegex(
+                    CHECKER.ValidationError, "CMQ body ownership"
+                ):
+                    CHECKER.validate_cmq_body_ownership(drifted)
 
 
 class MakefileCleanupTest(unittest.TestCase):
@@ -546,7 +869,11 @@ class ReferenceEncodingTest(unittest.TestCase):
         finally:
             CHECKER.put_named = original_put_named
         self.assertGreater(len(used_stems), 95)
-        self.assertEqual(set(used_stems), set(reference_stems))
+        task11_audit_only = set(Task11DefinitionTest.TASK11_FIELDS)
+        self.assertTrue(task11_audit_only <= set(reference_stems))
+        self.assertEqual(
+            set(used_stems), set(reference_stems) - task11_audit_only
+        )
 
     def test_reference_cases_have_stable_contract(self) -> None:
         cases = CHECKER.build_golden_cases()

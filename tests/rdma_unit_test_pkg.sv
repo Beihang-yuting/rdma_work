@@ -32,6 +32,7 @@ package rdma_unit_test_pkg;
   `include "unit/rdma_xtr_v1_qword_codec_test.svh"
   `include "unit/rdma_xtr_v1_qpc_codec_test.svh"
   `include "unit/rdma_xtr_v1_context_body_codec_test.svh"
+  `include "unit/rdma_xtr_v1_cmq_codec_test.svh"
   `include "unit/rdma_harness_expected_failure_probe.svh"
 endpackage
 
