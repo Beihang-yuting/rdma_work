@@ -206,7 +206,6 @@ class rdma_qpc_rc_ext extends rdma_qpc_transport_ext;
   bit [23:0] recv_psn;
   int unsigned retry_count;
   int unsigned rnr_retry_count;
-  int unsigned path_mtu_bytes;
 
   function new(string name = "rdma_qpc_rc_ext");
     super.new(name);
@@ -215,7 +214,6 @@ class rdma_qpc_rc_ext extends rdma_qpc_transport_ext;
     recv_psn = '0;
     retry_count = '0;
     rnr_retry_count = '0;
-    path_mtu_bytes = '0;
   endfunction
 
   virtual function void do_copy(uvm_object rhs);
@@ -229,7 +227,6 @@ class rdma_qpc_rc_ext extends rdma_qpc_transport_ext;
     recv_psn = rhs_ext.recv_psn;
     retry_count = rhs_ext.retry_count;
     rnr_retry_count = rhs_ext.rnr_retry_count;
-    path_mtu_bytes = rhs_ext.path_mtu_bytes;
   endfunction
 
   virtual function rdma_transport_e transport_kind();
@@ -244,8 +241,8 @@ class rdma_qpc_rc_ext extends rdma_qpc_transport_ext;
   endfunction
 
   virtual function string describe();
-    return $sformatf("RC(remote_qpn=%0d send_psn=%0d recv_psn=%0d mtu=%0d)",
-                     remote_qpn, send_psn, recv_psn, path_mtu_bytes);
+    return $sformatf("RC(remote_qpn=%0d send_psn=%0d recv_psn=%0d)",
+                     remote_qpn, send_psn, recv_psn);
   endfunction
 endclass
 
@@ -292,7 +289,6 @@ class rdma_qpc_urc_ext extends rdma_qpc_transport_ext;
   bit [23:0] dbsn;
   bit [23:0] rpsn;
   bit [23:0] dpsn;
-  int unsigned path_mtu_bytes;
   rdma_backing_addr_t rsq_backing;
   rdma_backing_addr_t rdsq_backing;
   rdma_backing_addr_t dsq_backing;
@@ -306,7 +302,6 @@ class rdma_qpc_urc_ext extends rdma_qpc_transport_ext;
     dbsn = '0;
     rpsn = '0;
     dpsn = '0;
-    path_mtu_bytes = '0;
     rsq_backing = '0;
     rdsq_backing = '0;
     dsq_backing = '0;
@@ -325,7 +320,6 @@ class rdma_qpc_urc_ext extends rdma_qpc_transport_ext;
     dbsn = rhs_ext.dbsn;
     rpsn = rhs_ext.rpsn;
     dpsn = rhs_ext.dpsn;
-    path_mtu_bytes = rhs_ext.path_mtu_bytes;
     rsq_backing = rhs_ext.rsq_backing;
     rdsq_backing = rhs_ext.rdsq_backing;
     dsq_backing = rhs_ext.dsq_backing;
@@ -350,8 +344,8 @@ class rdma_qpc_urc_ext extends rdma_qpc_transport_ext;
   endfunction
 
   virtual function string describe();
-    return $sformatf("URC(remote_qpn=%0d rbsn=%0d dbsn=%0d mtu=%0d)",
-                     remote_qpn, rbsn, dbsn, path_mtu_bytes);
+    return $sformatf("URC(remote_qpn=%0d rbsn=%0d dbsn=%0d)",
+                     remote_qpn, rbsn, dbsn);
   endfunction
 endclass
 
@@ -371,6 +365,7 @@ class rdma_qpc_model extends rdma_hw_model;
   bit [15:0] pkey;
   bit [7:0] qp_sequence;
   rdma_rdma_access_t access;
+  int unsigned path_mtu_bytes;
   int unsigned sq_depth;
   int unsigned rq_depth;
   rdma_backing_addr_t sq_backing;
@@ -400,6 +395,7 @@ class rdma_qpc_model extends rdma_hw_model;
     pkey = '0;
     qp_sequence = '0;
     access = '0;
+    path_mtu_bytes = '0;
     sq_depth = '0;
     rq_depth = '0;
     sq_backing = '0;
@@ -436,6 +432,7 @@ class rdma_qpc_model extends rdma_hw_model;
     pkey = rhs_qpc.pkey;
     qp_sequence = rhs_qpc.qp_sequence;
     access = rhs_qpc.access;
+    path_mtu_bytes = rhs_qpc.path_mtu_bytes;
     sq_depth = rhs_qpc.sq_depth;
     rq_depth = rhs_qpc.rq_depth;
     sq_backing = rhs_qpc.sq_backing;
@@ -477,6 +474,9 @@ class rdma_qpc_model extends rdma_hw_model;
                                "QPC behavior is null");
     status = behavior.validate();
     if (!status.ok()) return status;
+    if (path_mtu_bytes == 0)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "QPC path MTU is zero");
     status = rdma_context_handle_status(qp_h, RDMA_RESOURCE_QP, 21,
                                         "QPC QP");
     if (!status.ok()) return status;
@@ -561,8 +561,9 @@ class rdma_qpc_model extends rdma_hw_model;
     extension_text = (transport_ext == null) ? "null"
                                              : transport_ext.describe();
     return $sformatf(
-      "QPC(transport=%s sq_depth=%0d rq_depth=%0d behavior=%s ext=%s)",
-      transport.name(), sq_depth, rq_depth, behavior_text, extension_text
+      "QPC(transport=%s mtu=%0d sq_depth=%0d rq_depth=%0d behavior=%s ext=%s)",
+      transport.name(), path_mtu_bytes, sq_depth, rq_depth, behavior_text,
+      extension_text
     );
   endfunction
 endclass

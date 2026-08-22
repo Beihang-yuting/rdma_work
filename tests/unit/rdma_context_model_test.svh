@@ -127,6 +127,7 @@ class rdma_context_model_test extends uvm_test;
     qpc.access = '{local_write:1'b1, remote_read:1'b1,
                    remote_write:1'b1, memory_window_bind:1'b0,
                    remote_atomic:1'b1};
+    qpc.path_mtu_bytes = 1024;
     qpc.sq_depth = 64;
     qpc.rq_depth = 32;
     qpc.sq_backing.value = 64'h0000_0000_1000_0000;
@@ -151,7 +152,6 @@ class rdma_context_model_test extends uvm_test;
     rc_ext.recv_psn = 24'h123456;
     rc_ext.retry_count = 3;
     rc_ext.rnr_retry_count = 4;
-    rc_ext.path_mtu_bytes = 1024;
     qpc.transport_ext = rc_ext;
     return qpc;
   endfunction
@@ -272,6 +272,7 @@ class rdma_context_model_test extends uvm_test;
     rdma_qpc_urc_ext urc_ext;
     rdma_qp qp;
     rdma_srq srq;
+    rdma_status status;
 
     phase.raise_objection(this);
 
@@ -364,6 +365,10 @@ class rdma_context_model_test extends uvm_test;
 
     qpc = make_qpc("qpc");
     expect_ok("QPC_VALID", qpc.validate());
+    if (qpc.path_mtu_bytes != 1024 ||
+        !uvm_is_match("*mtu=1024*", qpc.describe()))
+      `uvm_error("QPC_PATH_MTU",
+                 "QPC common path MTU is missing from model or description")
     cloned_object = qpc.clone();
     if (!$cast(qpc_clone, cloned_object))
       `uvm_error("QPC_CLONE", "QPC clone lost dynamic type")
@@ -372,15 +377,18 @@ class rdma_context_model_test extends uvm_test;
              qpc_clone.behavior == qpc.behavior ||
              qpc_clone.address_vector == qpc.address_vector ||
              qpc_clone.transport_ext == qpc.transport_ext ||
-             qpc_clone.qp_h == qpc.qp_h)
+             qpc_clone.qp_h == qpc.qp_h ||
+             qpc_clone.path_mtu_bytes != 1024)
       `uvm_error("QPC_CLONE", "QPC clone did not deep-copy nested values")
     else begin
       qpc_clone.behavior.\priority = 6;
       qpc_clone.address_vector.destination_mac++;
       qpc_clone.qp_h.object_id++;
+      qpc_clone.path_mtu_bytes = 2048;
       if (qpc.behavior.\priority != 5 ||
           qpc.address_vector.destination_mac != 48'h02_11_22_33_44_55 ||
-          qpc.qp_h.object_id != 32'h101)
+          qpc.qp_h.object_id != 32'h101 ||
+          qpc.path_mtu_bytes != 1024)
         `uvm_error("QPC_CLONE", "QPC clone mutation reached source")
     end
 
@@ -478,6 +486,17 @@ class rdma_context_model_test extends uvm_test;
     qpc.context_backing.value += 64'h100;
     expect_invalid("CONTEXT_ALIGNMENT", qpc.validate());
     qpc.context_backing.value -= 64'h100;
+    qpc.path_mtu_bytes = 0;
+    status = qpc.validate();
+    if (status == null)
+      `uvm_error("QPC_ZERO_PATH_MTU", "QPC validation returned null status")
+    else if (status.code != RDMA_SC_INVALID_ARGUMENT)
+      `uvm_error("QPC_ZERO_PATH_MTU",
+                 $sformatf("expected INVALID_ARGUMENT, got %s",
+                           status.code.name()))
+    qpc.path_mtu_bytes = 256;
+    expect_ok("QPC_PATH_MTU_256", qpc.validate());
+    qpc.path_mtu_bytes = 1024;
     behavior = qpc.behavior;
     qpc.behavior = null;
     expect_invalid("QPC_BEHAVIOR_NULL", qpc.validate());
@@ -501,7 +520,6 @@ class rdma_context_model_test extends uvm_test;
     urc_ext.dbsn = 24'h040506;
     urc_ext.rpsn = 24'h070809;
     urc_ext.dpsn = 24'h0a0b0c;
-    urc_ext.path_mtu_bytes = 1024;
     urc_ext.rsq_backing.value = 64'h1600_0000;
     urc_ext.rdsq_backing.value = 64'h1700_0000;
     urc_ext.dsq_backing.value = 64'h1800_0000;
