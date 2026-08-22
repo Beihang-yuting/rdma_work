@@ -178,6 +178,7 @@ FIELD_MAPPINGS = (
     FieldMapping("qp.h", "XTRDMA_QPC_UD_QKEY_L", "XTR_V1_QPC_UD_QKEY_L", 8),
     FieldMapping("qp.h", "XTRDMA_QPC_URC_RSQ_PBA_H", "XTR_V1_QPC_URC_RSQ_PBA_H", 0),
     FieldMapping("qp.h", "XTRDMA_QPC_URC_RSQ_PBA_L", "XTR_V1_QPC_URC_RSQ_PBA_L", 8),
+    FieldMapping("qp.h", "XTRDMA_QPC_URC_RSQ_SIZE", "XTR_V1_QPC_URC_RSQ_SIZE", 24),
     FieldMapping("qp.h", "XTRDMA_QPC_PKEY", "XTR_V1_QPC_PKEY", 8),
     FieldMapping("qp.h", "XTRDMA_QPC_SHADOW_PBA", "XTR_V1_QPC_SHADOW_PBA", 16),
     FieldMapping("qp.h", "XTRDMA_QPC_TX_ENDIAN_SWAP", "XTR_V1_QPC_TX_ENDIAN_SWAP", 16),
@@ -228,6 +229,7 @@ FIELD_MAPPINGS = (
     FieldMapping("qp.h", "XTRDMA_QPC_SQ_SIZE", "XTR_V1_QPC_SQ_SIZE", 216),
     FieldMapping("qp.h", "XTRDMA_QPC_SQ_OM", "XTR_V1_QPC_SQ_OM", 216),
     FieldMapping("qp.h", "XTRDMA_QPC_RC_EIRQ_PSN_MAX", "XTR_V1_QPC_RC_EIRQ_PSN_MAX", 224),
+    FieldMapping("qp.h", "XTRDMA_QPC_URC_NXT_RDSQ_FETCH_NUM", "XTR_V1_QPC_URC_NXT_RDSQ_FETCH_NUM", 224),
     FieldMapping("qp.h", "XTRDMA_QPC_URC_RX_SRBSN", "XTR_V1_QPC_URC_RX_SRBSN", 224),
     FieldMapping("qp.h", "XTRDMA_QPC_EIRQ_CUR_SEND_PSN", "XTR_V1_QPC_EIRQ_CUR_SEND_PSN", 232),
     FieldMapping("qp.h", "XTRDMA_QPC_URC_CUR_TX_DPSN", "XTR_V1_QPC_URC_CUR_TX_DPSN", 232),
@@ -1026,6 +1028,7 @@ REFERENCE_FIELDS = (
     ReferenceField("qp.h", "XTRDMA_QPC_UD_QKEY_L", "XTR_V1_QPC_UD_QKEY_L", 8, 40, 24),
     ReferenceField("qp.h", "XTRDMA_QPC_URC_RSQ_PBA_H", "XTR_V1_QPC_URC_RSQ_PBA_H", 0, 0, 4),
     ReferenceField("qp.h", "XTRDMA_QPC_URC_RSQ_PBA_L", "XTR_V1_QPC_URC_RSQ_PBA_L", 8, 16, 48),
+    ReferenceField("qp.h", "XTRDMA_QPC_URC_RSQ_SIZE", "XTR_V1_QPC_URC_RSQ_SIZE", 24, 59, 3),
     ReferenceField("qp.h", "XTRDMA_QPC_SHADOW_PBA", "XTR_V1_QPC_SHADOW_PBA", 16, 9, 55),
     ReferenceField("qp.h", "XTRDMA_QPC_SQ_CE_EN", "XTR_V1_QPC_SQ_CE_EN", 16, 4, 1),
     ReferenceField("qp.h", "XTRDMA_QPC_RA_RENCE", "XTR_V1_QPC_RA_FENCE", 16, 3, 1),
@@ -1064,6 +1067,7 @@ REFERENCE_FIELDS = (
     ReferenceField("qp.h", "XTRDMA_QPC_RC_TPE_CUR_SQ_PSN", "XTR_V1_QPC_RC_TPE_CUR_SQ_PSN", 160, 0, 24),
     ReferenceField("qp.h", "XTRDMA_QPC_RC_LAST_READ_PSN", "XTR_V1_QPC_RC_LAST_READ_PSN", 208, 0, 24),
     ReferenceField("qp.h", "XTRDMA_QPC_RC_EIRQ_PSN_MAX", "XTR_V1_QPC_RC_EIRQ_PSN_MAX", 224, 24, 24),
+    ReferenceField("qp.h", "XTRDMA_QPC_URC_NXT_RDSQ_FETCH_NUM", "XTR_V1_QPC_URC_NXT_RDSQ_FETCH_NUM", 224, 16, 6),
     ReferenceField("qp.h", "XTRDMA_QPC_URC_RX_SRBSN", "XTR_V1_QPC_URC_RX_SRBSN", 224, 24, 24),
     ReferenceField("qp.h", "XTRDMA_QPC_EIRQ_CUR_SEND_PSN", "XTR_V1_QPC_EIRQ_CUR_SEND_PSN", 232, 0, 24),
     ReferenceField("qp.h", "XTRDMA_QPC_URC_CUR_TX_DPSN", "XTR_V1_QPC_URC_CUR_TX_DPSN", 232, 24, 24),
@@ -1233,6 +1237,9 @@ def parse_input_summary(summary: str) -> tuple[GoldenInput, ...]:
 
 
 def build_golden_cases() -> dict[str, list[GoldenCase]]:
+    def semantic_input(name: str, value: str | int):
+        return ("", 0, f"{name}={value}")
+
     def make_case(name: str, byte_count: int, inputs) -> GoldenCase:
         summary = ",".join(
             summary_part for _, _, summary_part in inputs if summary_part
@@ -1380,54 +1387,167 @@ def build_golden_cases() -> dict[str, list[GoldenCase]]:
     qpc_ud_image[dest_ip_offset:dest_ip_offset + dest_ip_bytes] = ud_dest_ip
     qpc_ud = qpc_ud._replace(payload=bytes(qpc_ud_image))
 
-    urc_rsq_pba = 0x123456789ABCD
-    urc_dsq_pba = 0x3456789ABCDEF
     urc_traffic_class = 0xFE
+    urc_context_backing = 0x123456789AB << 9
+    urc_rsq_backing = 0x123456789ABCD << 12
+    urc_rdsq_backing = 0x23456789ABCDE << 12
+    urc_dsq_backing = 0x3456789ABCDEF << 12
+    urc_sq_backing = 0x456789ABCDEF0 << 12
+    urc_rq_backing = 0x56789ABCDEF01 << 12
+    urc_rsq_depth = 64
+    urc_rdsq_depth = 64
+    urc_sq_depth = 32768
+    urc_rq_depth = 16384
+    urc_rq_sequence_threshold = 2048
+    urc_sq_completion_threshold = 4096
+    urc_remote_qpn = 0x654321
+    urc_rbsn = 0xABCDEF
+    urc_dbsn = 0x654321
+    urc_rpsn = 0x56789A
+    urc_dpsn = 0x456789
+    urc_dest_ip = bytes(16)
     qpc_urc = make_case("qpc_urc_boundary", 512, (
-        ("", 0, "transport=urc"),
-        ("", 0, f"traffic_class={urc_traffic_class:#x}"),
-        ("XTR_V1_QPC_TVER", 1, "tver=1"), ("XTR_V1_QPC_MIG", 1, "mig=1"),
-        ("XTR_V1_QPC_SERVICE_TYPE", 6, ""), ("XTR_V1_QPC_HOST_ID", 7, "host=7"),
-        ("XTR_V1_QPC_VF_ID", 0x789, "vf=0x789"),
-        ("XTR_V1_QPC_ICOS", urc_traffic_class >> 5,
-         f"icos={urc_traffic_class >> 5}"),
-        ("XTR_V1_QPC_QPN", 0x3FFFF, "qpn=0x3ffff"), ("XTR_V1_QPC_STAT_IDX", 0xFF, "stat_idx=0xff"),
-        ("XTR_V1_QPC_URC_RSQ_PBA_H", urc_rsq_pba >> 48, f"rsq_pba={urc_rsq_pba:#x}"),
-        ("XTR_V1_QPC_URC_RSQ_PBA_L", urc_rsq_pba & ((1 << 48) - 1), ""),
-        ("XTR_V1_QPC_PKEY", 0xABCD, "pkey=0xabcd"),
-        ("XTR_V1_QPC_SHADOW_PBA", 0x123456789AB, "shadow_pba=0x123456789ab"),
-        ("XTR_V1_QPC_QP_ST", 3, "state=3"), ("XTR_V1_QPC_PMTU", 5, "pmtu=5"),
-        ("XTR_V1_QPC_QP_SN", 0xFE, "qp_sn=0xfe"), ("XTR_V1_QPC_PD_IDX", 0xFFFF, "pd=0xffff"),
-        ("XTR_V1_QPC_DSCP", urc_traffic_class >> 2,
-         f"dscp={urc_traffic_class >> 2:#x}"),
-        ("XTR_V1_QPC_ECN", 2, "ecn=2"),
-        ("XTR_V1_QPC_URC_RDSQ_PBA", 0x23456789ABCDE, "rdsq_pba=0x23456789abcde"),
-        ("XTR_V1_QPC_URC_RDSQ_SIZE", 7, "rdsq_size=7"),
-        ("XTR_V1_QPC_URC_TX_RBSN", 0xABCDEF, "tx_rbsn=0xabcdef"),
-        ("XTR_V1_QPC_URC_TX_DBSN", 0x654321, "tx_dbsn=0x654321"),
-        ("XTR_V1_QPC_URC_RX_RBSN", 0x123456, "rx_rbsn=0x123456"),
-        ("XTR_V1_QPC_URC_RX_DBSN", 0xFEDCBA, "rx_dbsn=0xfedcba"),
-        ("XTR_V1_QPC_URC_RX_SRBSN", 0x345678, "rx_srbsn=0x345678"),
-        ("XTR_V1_QPC_URC_CUR_TX_DPSN", 0x456789, "cur_dpsn=0x456789"),
-        ("XTR_V1_QPC_URC_CUR_TX_RPSN", 0x56789A, "cur_rpsn=0x56789a"),
-        ("XTR_V1_QPC_URC_RXED_DBSN", 0x6789AB, "rxed_dbsn=0x6789ab"),
-        ("XTR_V1_QPC_URC_RQ_SE_TH", 0xF, "rq_se_th=0xf"),
-        ("XTR_V1_QPC_URC_SQ_CE_TH", 0xE, "sq_ce_th=0xe"),
-        ("XTR_V1_QPC_URC_TX_SRBSN", 0x789ABC, "tx_srbsn=0x789abc"),
-        ("XTR_V1_QPC_URC_MAX_TX_SRBSN", 0x89ABCD, "max_tx_srbsn=0x89abcd"),
-        ("XTR_V1_QPC_URC_CUR_DSQ_PBA_H", urc_dsq_pba >> 12, f"dsq_pba={urc_dsq_pba:#x}"),
-        ("XTR_V1_QPC_URC_CUR_DSQ_PBA_L", urc_dsq_pba & 0xFFF, ""),
-        ("XTR_V1_QPC_URC_NXT_DSQ_PBA", urc_dsq_pba + 1, ""),
-        ("XTR_V1_QPC_URC_TPE_RPSN_MAX", 0x9ABCDE, "tpe_rpsn_max=0x9abcde"),
-        ("XTR_V1_QPC_URC_TPE_DPSN_MAX", 0xABCDEF, "tpe_dpsn_max=0xabcdef"),
-        ("XTR_V1_QPC_URC_NXT_DSQ_FETCH_NUM", 0x3F, "dsq_fetch=0x3f"),
-        ("XTR_V1_QPC_SQ_PBA", 0x456789ABCDEF0, "sq_pba=0x456789abcdef0"),
-        ("XTR_V1_QPC_SQ_SIZE", 0xF, "sq_size=0xf"), ("XTR_V1_QPC_SQ_OM", 3, "sq_om=3"),
-        ("XTR_V1_QPC_SQ_CQN", 0xFFFFF, "sq_cqn=0xfffff"),
-        ("XTR_V1_QPC_RQ_CQN", 0xABCDE, "rq_cqn=0xabcde"),
-        ("XTR_V1_QPC_RQ_PBA", 0x56789ABCDEF01, "rq_pba=0x56789abcdef01"),
-        ("XTR_V1_QPC_RQ_SIZE", 0xE, "rq_size=0xe"), ("XTR_V1_QPC_RQ_OM", 2, "rq_om=2"),
+        semantic_input("transport", "urc"),
+        semantic_input("traffic_class", f"{urc_traffic_class:#x}"),
+        semantic_input("transport_version", 1),
+        semantic_input("migration_enable", 1),
+        semantic_input("host_id", 7),
+        semantic_input("vf_id", "0x789"),
+        semantic_input("qpn", "0x3ffff"),
+        semantic_input("stat_index", "0xff"),
+        semantic_input("pkey", "0xabcd"),
+        semantic_input("context_backing", f"{urc_context_backing:#x}"),
+        semantic_input("tx_endian_swap", 0),
+        semantic_input("rx_endian_swap", 0),
+        semantic_input("signature_enable", 0),
+        semantic_input("read_after_write_fence", 0),
+        semantic_input("atomic_after_atomic_fence", 0),
+        semantic_input("tx_flow_control", 0),
+        semantic_input("rx_flow_control", 0),
+        semantic_input("state", 3),
+        semantic_input("path_mtu_bytes", 8192),
+        semantic_input("qp_sequence", "0xfe"),
+        semantic_input("pd_id", "0xffff"),
+        semantic_input("access", 0),
+        semantic_input("vlan_enable", 0),
+        semantic_input("ipv6", 0),
+        semantic_input("tunnel_enable", 0),
+        semantic_input("lag_enable", 0),
+        semantic_input("forwarding_enable", 0),
+        semantic_input("destination_vport", 0),
+        semantic_input("source_address_index", 0),
+        semantic_input("destination_port", 0),
+        semantic_input("remote_qpn", f"{urc_remote_qpn:#x}"),
+        semantic_input("destination_mac", 0),
+        semantic_input("priority", 0),
+        semantic_input("cfi", 0),
+        semantic_input("vlan_id", 0),
+        semantic_input("source_vport", 0),
+        semantic_input("flow_label", 0),
+        semantic_input("hop_limit", 0),
+        semantic_input("udp_source_port", 0),
+        semantic_input("destination_ip", urc_dest_ip.hex()),
+        semantic_input("rbsn", f"{urc_rbsn:#x}"),
+        semantic_input("dbsn", f"{urc_dbsn:#x}"),
+        semantic_input("rpsn", f"{urc_rpsn:#x}"),
+        semantic_input("dpsn", f"{urc_dpsn:#x}"),
+        semantic_input("rsq_backing", f"{urc_rsq_backing:#x}"),
+        semantic_input("rdsq_backing", f"{urc_rdsq_backing:#x}"),
+        semantic_input("dsq_backing", f"{urc_dsq_backing:#x}"),
+        semantic_input("rsq_depth", urc_rsq_depth),
+        semantic_input("rdsq_depth", urc_rdsq_depth),
+        semantic_input("rdsq_fetch_count", 8),
+        semantic_input("dsq_fetch_count", 8),
+        semantic_input("rq_sequence_threshold_entries", urc_rq_sequence_threshold),
+        semantic_input("sq_completion_threshold_entries", urc_sq_completion_threshold),
+        semantic_input("sq_backing", f"{urc_sq_backing:#x}"),
+        semantic_input("sq_depth", urc_sq_depth),
+        semantic_input("sq_mode", 3),
+        semantic_input("send_cq_id", "0xfffff"),
+        semantic_input("recv_cq_id", "0xabcde"),
+        semantic_input("rq_backing", f"{urc_rq_backing:#x}"),
+        semantic_input("rq_depth", urc_rq_depth),
+        semantic_input("rq_mode", 2),
+        ("XTR_V1_QPC_TVER", 1, ""),
+        ("XTR_V1_QPC_MIG", 1, ""),
+        ("XTR_V1_QPC_SERVICE_TYPE", 6, ""),
+        ("XTR_V1_QPC_HOST_ID", 7, ""),
+        ("XTR_V1_QPC_VF_ID", 0x789, ""),
+        ("XTR_V1_QPC_ICOS", urc_traffic_class >> 5, ""),
+        ("XTR_V1_QPC_QPN", 0x3FFFF, ""),
+        ("XTR_V1_QPC_STAT_IDX", 0xFF, ""),
+        ("XTR_V1_QPC_URC_RSQ_PBA_H", (urc_rsq_backing >> 12) >> 48, ""),
+        ("XTR_V1_QPC_URC_RSQ_PBA_L", (urc_rsq_backing >> 12) & ((1 << 48) - 1), ""),
+        ("XTR_V1_QPC_URC_RSQ_SIZE", urc_rsq_depth.bit_length() - 1, ""),
+        ("XTR_V1_QPC_PKEY", 0xABCD, ""),
+        ("XTR_V1_QPC_SHADOW_PBA", urc_context_backing >> 9, ""),
+        ("XTR_V1_QPC_TX_ENDIAN_SWAP", 0, ""),
+        ("XTR_V1_QPC_RX_ENDIAN_SWAP", 0, ""),
+        ("XTR_V1_QPC_SQ_CE_EN", 0, ""),
+        ("XTR_V1_QPC_RA_FENCE", 0, ""),
+        ("XTR_V1_QPC_AA_FENCE", 0, ""),
+        ("XTR_V1_QPC_FC_EN", 0, ""),
+        ("XTR_V1_QPC_QP_ST", 3, ""),
+        ("XTR_V1_QPC_PMTU", 5, ""),
+        ("XTR_V1_QPC_QP_SN", 0xFE, ""),
+        ("XTR_V1_QPC_PD_IDX", 0xFFFF, ""),
+        ("XTR_V1_QPC_QP_ACCESS_FLAG", 0, ""),
+        ("XTR_V1_QPC_URC_RDSQ_PBA", urc_rdsq_backing >> 12, ""),
+        ("XTR_V1_QPC_URC_RDSQ_SIZE", urc_rdsq_depth.bit_length() - 1, ""),
+        ("XTR_V1_QPC_VLAN", 0, ""),
+        ("XTR_V1_QPC_IPV6", 0, ""),
+        ("XTR_V1_QPC_TUNNEL", 0, ""),
+        ("XTR_V1_QPC_LAG", 0, ""),
+        ("XTR_V1_QPC_FWD", 0, ""),
+        ("XTR_V1_QPC_DST_VPORT_ID", 0, ""),
+        ("XTR_V1_QPC_SRC_ADDR_IDX", 0, ""),
+        ("XTR_V1_QPC_DST_PORT", 0, ""),
+        ("XTR_V1_QPC_DST_QPN", urc_remote_qpn, ""),
+        ("XTR_V1_QPC_DMAC", 0, ""),
+        ("XTR_V1_QPC_PRI", 0, ""),
+        ("XTR_V1_QPC_CFI", 0, ""),
+        ("XTR_V1_QPC_VLAN_ID", 0, ""),
+        ("XTR_V1_QPC_SRC_VPORT_ID", 0, ""),
+        ("XTR_V1_QPC_FLOW_LABEL", 0, ""),
+        ("XTR_V1_QPC_DSCP", urc_traffic_class >> 2, ""),
+        ("XTR_V1_QPC_ECN", urc_traffic_class & 0x3, ""),
+        ("XTR_V1_QPC_HOPLIMIT", 0, ""),
+        ("XTR_V1_QPC_CUR_UDP_SPORT", 0, ""),
+        ("XTR_V1_QPC_URC_TX_RBSN", urc_rbsn, ""),
+        ("XTR_V1_QPC_URC_TX_DBSN", urc_dbsn, ""),
+        ("XTR_V1_QPC_URC_RX_RBSN", urc_rbsn, ""),
+        ("XTR_V1_QPC_URC_RX_DBSN", urc_dbsn, ""),
+        ("XTR_V1_QPC_URC_NXT_RDSQ_FETCH_NUM", 8, ""),
+        ("XTR_V1_QPC_URC_RX_SRBSN", 0, ""),
+        ("XTR_V1_QPC_URC_CUR_TX_DPSN", urc_dpsn, ""),
+        ("XTR_V1_QPC_URC_CUR_TX_RPSN", urc_rpsn, ""),
+        ("XTR_V1_QPC_URC_RXED_DBSN", urc_dbsn, ""),
+        ("XTR_V1_QPC_URC_RQ_SE_TH", urc_rq_sequence_threshold.bit_length() - 1, ""),
+        ("XTR_V1_QPC_URC_SQ_CE_TH", urc_sq_completion_threshold.bit_length() - 1, ""),
+        # Exercise the runtime coordinates at zero. ReferenceImage occupancy is
+        # checker coverage, not ownership in a future codec create mask.
+        ("XTR_V1_QPC_URC_TX_SRBSN", 0, ""),
+        ("XTR_V1_QPC_URC_MAX_TX_SRBSN", 0, ""),
+        ("XTR_V1_QPC_URC_CUR_DSQ_PBA_H", (urc_dsq_backing >> 12) >> 12, ""),
+        ("XTR_V1_QPC_URC_CUR_DSQ_PBA_L", (urc_dsq_backing >> 12) & 0xFFF, ""),
+        ("XTR_V1_QPC_URC_NXT_DSQ_PBA", (urc_dsq_backing >> 12) + 1, ""),
+        ("XTR_V1_QPC_URC_TPE_RPSN_MAX", urc_rpsn, ""),
+        ("XTR_V1_QPC_URC_TPE_DPSN_MAX", urc_dpsn, ""),
+        ("XTR_V1_QPC_URC_NXT_DSQ_FETCH_NUM", 8, ""),
+        ("XTR_V1_QPC_SQ_PBA", urc_sq_backing >> 12, ""),
+        ("XTR_V1_QPC_SQ_SIZE", urc_sq_depth.bit_length() - 1, ""),
+        ("XTR_V1_QPC_SQ_OM", 3, ""),
+        ("XTR_V1_QPC_SQ_CQN", 0xFFFFF, ""),
+        ("XTR_V1_QPC_RQ_CQN", 0xABCDE, ""),
+        ("XTR_V1_QPC_RQ_PBA", urc_rq_backing >> 12, ""),
+        ("XTR_V1_QPC_RQ_SIZE", urc_rq_depth.bit_length() - 1, ""),
+        ("XTR_V1_QPC_RQ_OM", 2, ""),
     ))
+    qpc_urc_image = bytearray(qpc_urc.payload)
+    if len(urc_dest_ip) != dest_ip_bytes:
+        raise ValidationError("URC QPC destination IP does not match profile byte count")
+    qpc_urc_image[dest_ip_offset:dest_ip_offset + dest_ip_bytes] = urc_dest_ip
+    qpc_urc = qpc_urc._replace(payload=bytes(qpc_urc_image))
 
     cqc = make_case("cqc_create_body_boundary", 64, (
         ("XTR_V1_CQC_BODY_CQN", 0x1FFFFF, "cqn=0x1fffff"),
@@ -1790,15 +1910,19 @@ def validate_context_contract(cases: list[GoldenCase]) -> None:
         icos = field_value(case, "XTR_V1_QPC_ICOS")
         dscp = field_value(case, "XTR_V1_QPC_DSCP")
         ecn = field_value(case, "XTR_V1_QPC_ECN")
+        inputs = inputs_by_name(case)
         if (icos != traffic_class >> 5
-                or icos != numeric_input(case, "icos")):
+                or ("icos" in inputs
+                    and icos != numeric_input(case, "icos"))):
             raise ValidationError(f"{case.name} traffic class/ICOS mismatch")
         if (dscp != traffic_class >> 2
-                or dscp != numeric_input(case, "dscp")):
+                or ("dscp" in inputs
+                    and dscp != numeric_input(case, "dscp"))):
             raise ValidationError(f"{case.name} traffic class/DSCP mismatch")
         if (ecn != (traffic_class & 0x3)
                 or ecn != required_ecn[transport]
-                or ecn != numeric_input(case, "ecn")):
+                or ("ecn" in inputs
+                    and ecn != numeric_input(case, "ecn"))):
             raise ValidationError(f"{case.name} ECN policy/input mismatch")
 
     mask_keys = [
@@ -1892,16 +2016,179 @@ def validate_context_contract(cases: list[GoldenCase]) -> None:
         raise ValidationError(f"{ud.name} destination IP/input mismatch")
 
     urc = cases[2]
-    rsq_pba = ((field_value(urc, "XTR_V1_QPC_URC_RSQ_PBA_H") << 48)
-               | field_value(urc, "XTR_V1_QPC_URC_RSQ_PBA_L"))
-    dsq_pba = ((field_value(urc, "XTR_V1_QPC_URC_CUR_DSQ_PBA_H") << 12)
-               | field_value(urc, "XTR_V1_QPC_URC_CUR_DSQ_PBA_L"))
-    if rsq_pba != numeric_input(urc, "rsq_pba"):
-        raise ValidationError(f"{urc.name} split RSQ address/input mismatch")
-    if dsq_pba != numeric_input(urc, "dsq_pba"):
-        raise ValidationError(f"{urc.name} split DSQ address/input mismatch")
-    if field_value(urc, "XTR_V1_QPC_URC_NXT_DSQ_PBA") != dsq_pba + 1:
+    urc_inputs = inputs_by_name(urc)
+    expected_urc_inputs = {
+        "transport", "traffic_class", "transport_version",
+        "migration_enable", "host_id", "vf_id", "qpn", "stat_index",
+        "pkey", "context_backing", "tx_endian_swap", "rx_endian_swap",
+        "signature_enable", "read_after_write_fence",
+        "atomic_after_atomic_fence", "tx_flow_control", "rx_flow_control",
+        "state", "path_mtu_bytes", "qp_sequence", "pd_id", "access",
+        "vlan_enable", "ipv6", "tunnel_enable", "lag_enable",
+        "forwarding_enable", "destination_vport", "source_address_index",
+        "destination_port", "remote_qpn", "destination_mac", "priority",
+        "cfi", "vlan_id", "source_vport", "flow_label", "hop_limit",
+        "udp_source_port", "destination_ip", "rbsn", "dbsn", "rpsn",
+        "dpsn", "rsq_backing", "rdsq_backing", "dsq_backing",
+        "rsq_depth", "rdsq_depth", "rdsq_fetch_count", "dsq_fetch_count",
+        "rq_sequence_threshold_entries", "sq_completion_threshold_entries",
+        "sq_backing", "sq_depth", "sq_mode", "send_cq_id", "recv_cq_id",
+        "rq_backing", "rq_depth", "rq_mode",
+    }
+    optional_derived_inputs = {"icos", "dscp", "ecn"}
+    if set(urc_inputs) - optional_derived_inputs != expected_urc_inputs:
+        raise ValidationError(f"{urc.name} semantic input contract mismatch")
+
+    direct_urc_fields = (
+        ("XTR_V1_QPC_TVER", "transport_version"),
+        ("XTR_V1_QPC_MIG", "migration_enable"),
+        ("XTR_V1_QPC_HOST_ID", "host_id"),
+        ("XTR_V1_QPC_VF_ID", "vf_id"),
+        ("XTR_V1_QPC_QPN", "qpn"),
+        ("XTR_V1_QPC_STAT_IDX", "stat_index"),
+        ("XTR_V1_QPC_PKEY", "pkey"),
+        ("XTR_V1_QPC_TX_ENDIAN_SWAP", "tx_endian_swap"),
+        ("XTR_V1_QPC_RX_ENDIAN_SWAP", "rx_endian_swap"),
+        ("XTR_V1_QPC_SQ_CE_EN", "signature_enable"),
+        ("XTR_V1_QPC_RA_FENCE", "read_after_write_fence"),
+        ("XTR_V1_QPC_AA_FENCE", "atomic_after_atomic_fence"),
+        ("XTR_V1_QPC_QP_ST", "state"),
+        ("XTR_V1_QPC_QP_SN", "qp_sequence"),
+        ("XTR_V1_QPC_PD_IDX", "pd_id"),
+        ("XTR_V1_QPC_QP_ACCESS_FLAG", "access"),
+        ("XTR_V1_QPC_VLAN", "vlan_enable"),
+        ("XTR_V1_QPC_IPV6", "ipv6"),
+        ("XTR_V1_QPC_TUNNEL", "tunnel_enable"),
+        ("XTR_V1_QPC_LAG", "lag_enable"),
+        ("XTR_V1_QPC_FWD", "forwarding_enable"),
+        ("XTR_V1_QPC_DST_VPORT_ID", "destination_vport"),
+        ("XTR_V1_QPC_SRC_ADDR_IDX", "source_address_index"),
+        ("XTR_V1_QPC_DST_PORT", "destination_port"),
+        ("XTR_V1_QPC_DST_QPN", "remote_qpn"),
+        ("XTR_V1_QPC_DMAC", "destination_mac"),
+        ("XTR_V1_QPC_PRI", "priority"),
+        ("XTR_V1_QPC_CFI", "cfi"),
+        ("XTR_V1_QPC_VLAN_ID", "vlan_id"),
+        ("XTR_V1_QPC_SRC_VPORT_ID", "source_vport"),
+        ("XTR_V1_QPC_FLOW_LABEL", "flow_label"),
+        ("XTR_V1_QPC_HOPLIMIT", "hop_limit"),
+        ("XTR_V1_QPC_CUR_UDP_SPORT", "udp_source_port"),
+        ("XTR_V1_QPC_SQ_OM", "sq_mode"),
+        ("XTR_V1_QPC_SQ_CQN", "send_cq_id"),
+        ("XTR_V1_QPC_RQ_CQN", "recv_cq_id"),
+        ("XTR_V1_QPC_RQ_OM", "rq_mode"),
+    )
+    for stem, input_name in direct_urc_fields:
+        if field_value(urc, stem) != numeric_input(urc, input_name):
+            raise ValidationError(
+                f"{urc.name} {stem}/input {input_name} mismatch"
+            )
+
+    flow_control = field_value(urc, "XTR_V1_QPC_FC_EN")
+    if (flow_control != numeric_input(urc, "tx_flow_control")
+            or flow_control != numeric_input(urc, "rx_flow_control")):
+        raise ValidationError(f"{urc.name} flow-control input mismatch")
+
+    backing_fields = (
+        ("XTR_V1_QPC_SHADOW_PBA", 9, "context_backing"),
+        ("XTR_V1_QPC_URC_RDSQ_PBA", 12, "rdsq_backing"),
+        ("XTR_V1_QPC_SQ_PBA", 12, "sq_backing"),
+        ("XTR_V1_QPC_RQ_PBA", 12, "rq_backing"),
+    )
+    for stem, shift, input_name in backing_fields:
+        if (field_value(urc, stem) << shift) != numeric_input(urc, input_name):
+            raise ValidationError(
+                f"{urc.name} {stem}/backing input {input_name} mismatch"
+            )
+
+    path_mtu_codes = {1024: 2, 2048: 3, 4096: 4, 8192: 5}
+    path_mtu = numeric_input(urc, "path_mtu_bytes")
+    if (path_mtu not in path_mtu_codes
+            or field_value(urc, "XTR_V1_QPC_PMTU") != path_mtu_codes[path_mtu]):
+        raise ValidationError(f"{urc.name} path MTU/input mismatch")
+
+    dest_ip_offset = PROFILE_VALUES["XTR_V1_QPC_DEST_IP_BYTE_OFFSET"]
+    dest_ip_bytes = PROFILE_VALUES["XTR_V1_QPC_DEST_IP_BYTES"]
+    destination_ip = urc_inputs["destination_ip"]
+    if (re.fullmatch(r"[0-9a-f]{32}", destination_ip) is None
+            or urc.payload[
+                dest_ip_offset:dest_ip_offset + dest_ip_bytes
+            ].hex() != destination_ip):
+        raise ValidationError(f"{urc.name} destination IP/input mismatch")
+
+    rsq_page = ((field_value(urc, "XTR_V1_QPC_URC_RSQ_PBA_H") << 48)
+                | field_value(urc, "XTR_V1_QPC_URC_RSQ_PBA_L"))
+    dsq_page = ((field_value(urc, "XTR_V1_QPC_URC_CUR_DSQ_PBA_H") << 12)
+                | field_value(urc, "XTR_V1_QPC_URC_CUR_DSQ_PBA_L"))
+    if rsq_page << 12 != numeric_input(urc, "rsq_backing"):
+        raise ValidationError(f"{urc.name} split RSQ backing/input mismatch")
+    if dsq_page << 12 != numeric_input(urc, "dsq_backing"):
+        raise ValidationError(f"{urc.name} split DSQ backing/input mismatch")
+    if field_value(urc, "XTR_V1_QPC_URC_NXT_DSQ_PBA") != dsq_page + 1:
         raise ValidationError(f"{urc.name} derived next DSQ address mismatch")
+
+    def exact_log2(input_name: str) -> int:
+        entries = numeric_input(urc, input_name)
+        if entries == 0 or entries & (entries - 1):
+            raise ValidationError(
+                f"{urc.name} input {input_name} is not a power of two"
+            )
+        return entries.bit_length() - 1
+
+    log2_fields = (
+        ("XTR_V1_QPC_URC_RSQ_SIZE", "rsq_depth"),
+        ("XTR_V1_QPC_URC_RDSQ_SIZE", "rdsq_depth"),
+        ("XTR_V1_QPC_URC_RQ_SE_TH", "rq_sequence_threshold_entries"),
+        ("XTR_V1_QPC_URC_SQ_CE_TH", "sq_completion_threshold_entries"),
+        ("XTR_V1_QPC_SQ_SIZE", "sq_depth"),
+        ("XTR_V1_QPC_RQ_SIZE", "rq_depth"),
+    )
+    for stem, input_name in log2_fields:
+        if field_value(urc, stem) != exact_log2(input_name):
+            raise ValidationError(
+                f"{urc.name} {stem}/log2 input {input_name} mismatch"
+            )
+
+    fetch_fields = (
+        ("XTR_V1_QPC_URC_NXT_RDSQ_FETCH_NUM", "rdsq_fetch_count"),
+        ("XTR_V1_QPC_URC_NXT_DSQ_FETCH_NUM", "dsq_fetch_count"),
+    )
+    for stem, input_name in fetch_fields:
+        if field_value(urc, stem) != numeric_input(urc, input_name):
+            raise ValidationError(
+                f"{urc.name} {stem}/fetch input {input_name} mismatch"
+            )
+
+    mirror_groups = {
+        "rbsn": (
+            "XTR_V1_QPC_URC_TX_RBSN", "XTR_V1_QPC_URC_RX_RBSN",
+        ),
+        "dbsn": (
+            "XTR_V1_QPC_URC_TX_DBSN", "XTR_V1_QPC_URC_RX_DBSN",
+            "XTR_V1_QPC_URC_RXED_DBSN",
+        ),
+        "rpsn": (
+            "XTR_V1_QPC_URC_CUR_TX_RPSN",
+            "XTR_V1_QPC_URC_TPE_RPSN_MAX",
+        ),
+        "dpsn": (
+            "XTR_V1_QPC_URC_CUR_TX_DPSN",
+            "XTR_V1_QPC_URC_TPE_DPSN_MAX",
+        ),
+    }
+    for input_name, stems in mirror_groups.items():
+        owner = numeric_input(urc, input_name)
+        if any(field_value(urc, stem) != owner for stem in stems):
+            raise ValidationError(
+                f"{urc.name} {input_name} sequence mirror mismatch"
+            )
+
+    for stem in (
+        "XTR_V1_QPC_URC_RX_SRBSN", "XTR_V1_QPC_URC_TX_SRBSN",
+        "XTR_V1_QPC_URC_MAX_TX_SRBSN",
+    ):
+        if field_value(urc, stem) != 0:
+            raise ValidationError(f"{urc.name} runtime SRBSN field is nonzero")
 
     for case in cases[4:8]:
         direct_fields = (
@@ -2018,6 +2305,19 @@ def validate_git_head(kernel_root: Path) -> None:
         raise ValidationError(f"kernel HEAD {actual} does not match fixed {FIXED_COMMIT}")
 
 
+def validate_required_sv_constants(
+    sv_constants: dict[str, int], expected_constants: dict[str, int]
+) -> None:
+    for name, expected in expected_constants.items():
+        actual = sv_constants.get(name)
+        if actual is None:
+            raise ValidationError(f"required SV constant missing: {name}")
+        if actual != expected:
+            raise ValidationError(
+                f"SV constant mismatch for {name}: {actual:#x} != {expected:#x}"
+            )
+
+
 def validate(kernel_root: Path) -> None:
     validate_git_head(kernel_root)
     validate_mapping_uniqueness(FIELD_MAPPINGS, VALUE_MAPPINGS, REFERENCE_FIELDS)
@@ -2090,13 +2390,7 @@ def validate(kernel_root: Path) -> None:
             value -= parse_value_expression(subtract_expression)
         expected_constants[mapping.sv_name] = value
 
-    for name, expected in expected_constants.items():
-        if name not in sv_constants:
-            raise ValidationError(f"required SV constant missing: {name}")
-        if sv_constants[name] != expected:
-            raise ValidationError(
-                f"SV constant mismatch for {name}: {sv_constants[name]:#x} != {expected:#x}"
-            )
+    validate_required_sv_constants(sv_constants, expected_constants)
 
     expected_masks = {
         "XTR_V1_CMQ_ENVELOPE_MASK": ENVELOPE_MASK,

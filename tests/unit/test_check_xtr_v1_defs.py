@@ -63,6 +63,15 @@ enum sample {
 
 
 class SvDefinitionTest(unittest.TestCase):
+    NEW_URC_FIELDS = {
+        "XTR_V1_QPC_URC_RSQ_SIZE": (
+            "XTRDMA_QPC_URC_RSQ_SIZE", 24, 59, 3, 251
+        ),
+        "XTR_V1_QPC_URC_NXT_RDSQ_FETCH_NUM": (
+            "XTRDMA_QPC_URC_NXT_RDSQ_FETCH_NUM", 224, 16, 6, 1808
+        ),
+    }
+
     def test_duplicate_constant_is_fatal(self) -> None:
         text = """
 localparam int unsigned XTR_V1_FIELD_OFFSET = 32;
@@ -140,6 +149,119 @@ localparam bit [63:0] XTR_V1_WINDOW = 64'h2000;
         self.assertEqual(constants["XTR_V1_QPC_QPN_LSB"], 16)
         self.assertEqual(constants["XTR_V1_QPC_QPN_WIDTH"], 21)
         self.assertEqual(constants["XTR_V1_QPC_QPN_OFFSET"], 16)
+
+    def test_new_urc_rows_match_source_reference_and_sv_coordinates(self) -> None:
+        mappings = {mapping.sv_stem: mapping for mapping in CHECKER.FIELD_MAPPINGS}
+        references = {
+            reference.sv_stem: reference
+            for reference in CHECKER.REFERENCE_FIELDS
+        }
+        sv_constants = CHECKER.parse_sv_constants(
+            (REPO_ROOT / "src/codec/xtr_v1/rdma_xtr_v1_defs.svh").read_text()
+        )
+
+        for stem, (c_symbol, byte_offset, lsb, width, offset) in \
+                self.NEW_URC_FIELDS.items():
+            with self.subTest(stem=stem):
+                self.assertEqual(
+                    mappings[stem],
+                    CHECKER.FieldMapping("qp.h", c_symbol, stem, byte_offset),
+                )
+                self.assertEqual(
+                    references[stem],
+                    CHECKER.ReferenceField(
+                        "qp.h", c_symbol, stem, byte_offset, lsb, width
+                    ),
+                )
+                self.assertEqual(
+                    {
+                        "word_byte_offset": sv_constants[
+                            f"{stem}_WORD_BYTE_OFFSET"
+                        ],
+                        "lsb": sv_constants[f"{stem}_LSB"],
+                        "width": sv_constants[f"{stem}_WIDTH"],
+                        "offset": sv_constants[f"{stem}_OFFSET"],
+                    },
+                    {
+                        "word_byte_offset": byte_offset,
+                        "lsb": lsb,
+                        "width": width,
+                        "offset": offset,
+                    },
+                )
+
+    def test_new_urc_source_coordinate_drift_is_rejected(self) -> None:
+        parsed_fields = {
+            reference.sv_stem: (
+                reference.path,
+                reference.c_symbol,
+                reference.lsb,
+                reference.width,
+            )
+            for reference in CHECKER.REFERENCE_FIELDS
+        }
+        for stem in self.NEW_URC_FIELDS:
+            with self.subTest(stem=stem):
+                drifted = dict(parsed_fields)
+                path, c_symbol, lsb, width = drifted[stem]
+                drifted[stem] = (path, c_symbol, lsb ^ 1, width)
+                with self.assertRaisesRegex(
+                    CHECKER.ValidationError, "reference mask mismatch"
+                ):
+                    CHECKER.validate_reference_fields(
+                        CHECKER.REFERENCE_FIELDS,
+                        CHECKER.FIELD_MAPPINGS,
+                        drifted,
+                    )
+
+    def test_new_urc_reference_coordinate_drift_is_rejected(self) -> None:
+        parsed_fields = {
+            reference.sv_stem: (
+                reference.path,
+                reference.c_symbol,
+                reference.lsb,
+                reference.width,
+            )
+            for reference in CHECKER.REFERENCE_FIELDS
+        }
+        for stem in self.NEW_URC_FIELDS:
+            with self.subTest(stem=stem):
+                references = list(CHECKER.REFERENCE_FIELDS)
+                index = next(
+                    index for index, reference in enumerate(references)
+                    if reference.sv_stem == stem
+                )
+                references[index] = references[index]._replace(
+                    lsb=references[index].lsb ^ 1
+                )
+                with self.assertRaisesRegex(
+                    CHECKER.ValidationError, "reference mask mismatch"
+                ):
+                    CHECKER.validate_reference_fields(
+                        tuple(references), CHECKER.FIELD_MAPPINGS, parsed_fields
+                    )
+
+    def test_new_urc_sv_constant_drift_is_rejected(self) -> None:
+        validate_required = getattr(CHECKER, "validate_required_sv_constants")
+        sv_constants = CHECKER.parse_sv_constants(
+            (REPO_ROOT / "src/codec/xtr_v1/rdma_xtr_v1_defs.svh").read_text()
+        )
+        for stem, (_, byte_offset, lsb, width, offset) in \
+                self.NEW_URC_FIELDS.items():
+            expected = {
+                f"{stem}_WORD_BYTE_OFFSET": byte_offset,
+                f"{stem}_LSB": lsb,
+                f"{stem}_WIDTH": width,
+                f"{stem}_OFFSET": offset,
+            }
+            with self.subTest(stem=stem):
+                validate_required(sv_constants, expected)
+                drifted = dict(sv_constants)
+                drifted[f"{stem}_OFFSET"] ^= 1
+                with self.assertRaisesRegex(
+                    CHECKER.ValidationError, "SV constant mismatch"
+                ):
+                    validate_required(drifted, expected)
 
     def test_context_object_state_mode_and_right_values_are_mapped(self) -> None:
         mappings = {
@@ -456,6 +578,10 @@ class ReferenceEncodingTest(unittest.TestCase):
             context_cases[0].payload[:8],
             bytes.fromhex("605abca15555a500"),
         )
+        self.assertEqual(
+            context_cases[1].payload[:8],
+            bytes.fromhex("4c6345a2aaaa5a89"),
+        )
 
     def test_context_case_summaries_are_an_immutable_input_contract(self) -> None:
         context_cases = CHECKER.build_golden_cases()["context"]
@@ -473,7 +599,7 @@ class ReferenceEncodingTest(unittest.TestCase):
         self.assertEqual(summaries, [
             "transport=rc,traffic_class=0xaa,tver=1,mig=1,host=5,vf=0xabc,icos=5,qpn=0x15555,stat_idx=0xa5,pkey=0xbeef,shadow_pba=0x123456789ab,tx_swap=1,rx_swap=1,sq_ce=1,ra_fence=1,aa_fence=1,fc=1,state=3,pmtu=5,retry_count=7,rnr_retry=7,qp_sn=0xc3,srfq=1,srfqn=0x4567,pd=0xa55a,access=0x1f,dst_qpn=0x654321,dmac=0x112233445566,vlan_id=0xabc,flow=0xabcde,dscp=0x2a,ecn=2,hop=0x40,udp_sport=0xc123,send_psn=0xabcdef,recv_psn=0x123456,sq_pba=0x123456789abcd,sq_size=11,sq_om=2,sq_cqn=0xabcde,rq_cqn=0x54321,rq_pba=0x0fedcba987654,rq_size=10,rq_om=1",
             "transport=ud,traffic_class=0xac,tver=1,mig=0,host=6,vf=0x345,icos=5,qpn=0x2aaaa,stat_idx=0x5a,qkey=0x89abcdef,pkey=0x1234,shadow_pba=0x0fedcba9876,tx_swap=1,rx_swap=1,state=3,pmtu=4,qp_sn=0x7e,pd=0x5aa5,vlan=1,ipv6=1,tunnel=1,lag=1,fwd=2,dst_vport=0x456,src_addr=0xabc,dst_port=0xb,dst_qpn=0xabcdef,dmac=0xa1b2c3d4e5f6,pri=5,cfi=1,vlan_id=0x789,src_vport=0x345,flow=0x54321,dscp=0x2b,ecn=0,hop=0x7f,udp_sport=0xbeef,dest_ip=20010db8000000000000000000000001,sq_pba=0x1111122222333,sq_size=9,sq_om=3,sq_cqn=0x13579,rq_cqn=0x2468a,rq_pba=0x4444455555666,rq_size=8,rq_om=2",
-            "transport=urc,traffic_class=0xfe,tver=1,mig=1,host=7,vf=0x789,icos=7,qpn=0x3ffff,stat_idx=0xff,rsq_pba=0x123456789abcd,pkey=0xabcd,shadow_pba=0x123456789ab,state=3,pmtu=5,qp_sn=0xfe,pd=0xffff,dscp=0x3f,ecn=2,rdsq_pba=0x23456789abcde,rdsq_size=7,tx_rbsn=0xabcdef,tx_dbsn=0x654321,rx_rbsn=0x123456,rx_dbsn=0xfedcba,rx_srbsn=0x345678,cur_dpsn=0x456789,cur_rpsn=0x56789a,rxed_dbsn=0x6789ab,rq_se_th=0xf,sq_ce_th=0xe,tx_srbsn=0x789abc,max_tx_srbsn=0x89abcd,dsq_pba=0x3456789abcdef,tpe_rpsn_max=0x9abcde,tpe_dpsn_max=0xabcdef,dsq_fetch=0x3f,sq_pba=0x456789abcdef0,sq_size=0xf,sq_om=3,sq_cqn=0xfffff,rq_cqn=0xabcde,rq_pba=0x56789abcdef01,rq_size=0xe,rq_om=2",
+            "transport=urc,traffic_class=0xfe,transport_version=1,migration_enable=1,host_id=7,vf_id=0x789,qpn=0x3ffff,stat_index=0xff,pkey=0xabcd,context_backing=0x2468acf135600,tx_endian_swap=0,rx_endian_swap=0,signature_enable=0,read_after_write_fence=0,atomic_after_atomic_fence=0,tx_flow_control=0,rx_flow_control=0,state=3,path_mtu_bytes=8192,qp_sequence=0xfe,pd_id=0xffff,access=0,vlan_enable=0,ipv6=0,tunnel_enable=0,lag_enable=0,forwarding_enable=0,destination_vport=0,source_address_index=0,destination_port=0,remote_qpn=0x654321,destination_mac=0,priority=0,cfi=0,vlan_id=0,source_vport=0,flow_label=0,hop_limit=0,udp_source_port=0,destination_ip=00000000000000000000000000000000,rbsn=0xabcdef,dbsn=0x654321,rpsn=0x56789a,dpsn=0x456789,rsq_backing=0x123456789abcd000,rdsq_backing=0x23456789abcde000,dsq_backing=0x3456789abcdef000,rsq_depth=64,rdsq_depth=64,rdsq_fetch_count=8,dsq_fetch_count=8,rq_sequence_threshold_entries=2048,sq_completion_threshold_entries=4096,sq_backing=0x456789abcdef0000,sq_depth=32768,sq_mode=3,send_cq_id=0xfffff,recv_cq_id=0xabcde,rq_backing=0x56789abcdef01000,rq_depth=16384,rq_mode=2",
             "cqn=0x1fffff,sd_pba=0xfffffffffffff,size=0x1f,urc=1,state=2,next_hi=0xff,cur_valid=1,cur_pba=0xfffffffffffff,load_ci=1,threshold=7,mode=3,next_valid=1,next_lo=0xfffffffffff,pi=0x7fffff,pi_wrap=1,last_arm=3,cqe_size=2,ceqn=0xfff,shadow=0x3ffffffffffffff,ci=0x7fffff,ci_wrap=1,arm_sn=3,arm_state=2",
             "opcode=0x05,stag=0xffffff,state=2,key=0xff,parent=0,pd=0xffff,payload_vf=0xff,payload_vf_en=1,rights=0x1f,type=2,host_page=2,pbl=0,address_mode=1,invalidate=1,length=0x3fffffffffff,odp=1,start_va=0xffffffffffffffff,pba0=0xfffffffffffff,mr_sn=0xfff",
             "opcode=0x05,stag=0xffffff,state=2,key=0xff,parent=0,pd=0xffff,payload_vf=0xff,payload_vf_en=1,rights=0x1f,type=2,host_page=2,pbl=1,address_mode=1,invalidate=1,length=0x3fffffffffff,odp=1,start_va=0xffffffffffffffff,pba0=0xfffffffffffff,pba1=0xfffffffffffff,mr_sn=0xfff",
@@ -582,6 +708,129 @@ class ReferenceEncodingTest(unittest.TestCase):
                 )
                 with self.assertRaisesRegex(CHECKER.ValidationError, "ECN"):
                     validate(corrupted)
+
+    def test_canonical_urc_semantics_drive_all_derived_fields(self) -> None:
+        urc = CHECKER.build_golden_cases()["context"][2]
+        inputs = {item.name: item.value for item in urc.inputs}
+        expected_core = {
+            "remote_qpn": "0x654321",
+            "rbsn": "0xabcdef",
+            "dbsn": "0x654321",
+            "rpsn": "0x56789a",
+            "dpsn": "0x456789",
+            "rsq_backing": "0x123456789abcd000",
+            "rdsq_backing": "0x23456789abcde000",
+            "dsq_backing": "0x3456789abcdef000",
+            "rsq_depth": "64",
+            "rdsq_depth": "64",
+            "rdsq_fetch_count": "8",
+            "dsq_fetch_count": "8",
+            "rq_sequence_threshold_entries": "2048",
+            "sq_completion_threshold_entries": "4096",
+            "sq_depth": "32768",
+            "rq_depth": "16384",
+            "path_mtu_bytes": "8192",
+        }
+        for name, value in expected_core.items():
+            with self.subTest(input=name):
+                self.assertEqual(inputs[name], value)
+
+        absent_legacy_names = {
+            "tx_rbsn", "rx_rbsn", "tx_dbsn", "rx_dbsn", "rxed_dbsn",
+            "rx_srbsn", "tx_srbsn", "max_tx_srbsn", "rdsq_size",
+            "rq_se_th", "sq_ce_th", "dsq_fetch",
+        }
+        self.assertTrue(absent_legacy_names.isdisjoint(inputs))
+
+        expected_fields = {
+            "XTR_V1_QPC_DST_QPN": 0x654321,
+            "XTR_V1_QPC_URC_RSQ_SIZE": 6,
+            "XTR_V1_QPC_URC_RDSQ_SIZE": 6,
+            "XTR_V1_QPC_URC_NXT_RDSQ_FETCH_NUM": 8,
+            "XTR_V1_QPC_URC_NXT_DSQ_FETCH_NUM": 8,
+            "XTR_V1_QPC_URC_RQ_SE_TH": 11,
+            "XTR_V1_QPC_URC_SQ_CE_TH": 12,
+            "XTR_V1_QPC_SQ_SIZE": 15,
+            "XTR_V1_QPC_RQ_SIZE": 14,
+            "XTR_V1_QPC_PMTU": 5,
+            "XTR_V1_QPC_URC_TX_RBSN": 0xABCDEF,
+            "XTR_V1_QPC_URC_RX_RBSN": 0xABCDEF,
+            "XTR_V1_QPC_URC_TX_DBSN": 0x654321,
+            "XTR_V1_QPC_URC_RX_DBSN": 0x654321,
+            "XTR_V1_QPC_URC_RXED_DBSN": 0x654321,
+            "XTR_V1_QPC_URC_CUR_TX_RPSN": 0x56789A,
+            "XTR_V1_QPC_URC_TPE_RPSN_MAX": 0x56789A,
+            "XTR_V1_QPC_URC_CUR_TX_DPSN": 0x456789,
+            "XTR_V1_QPC_URC_TPE_DPSN_MAX": 0x456789,
+            "XTR_V1_QPC_URC_RX_SRBSN": 0,
+            "XTR_V1_QPC_URC_TX_SRBSN": 0,
+            "XTR_V1_QPC_URC_MAX_TX_SRBSN": 0,
+        }
+        for stem, expected in expected_fields.items():
+            with self.subTest(field=stem):
+                self.assertEqual(self.field_value(urc, stem), expected)
+
+        rsq_page = (
+            self.field_value(urc, "XTR_V1_QPC_URC_RSQ_PBA_H") << 48
+        ) | self.field_value(urc, "XTR_V1_QPC_URC_RSQ_PBA_L")
+        dsq_page = (
+            self.field_value(urc, "XTR_V1_QPC_URC_CUR_DSQ_PBA_H") << 12
+        ) | self.field_value(urc, "XTR_V1_QPC_URC_CUR_DSQ_PBA_L")
+        self.assertEqual(rsq_page, 0x123456789ABCD)
+        self.assertEqual(
+            self.field_value(urc, "XTR_V1_QPC_URC_RDSQ_PBA"),
+            0x23456789ABCDE,
+        )
+        self.assertEqual(dsq_page, 0x3456789ABCDEF)
+        self.assertEqual(
+            self.field_value(urc, "XTR_V1_QPC_URC_NXT_DSQ_PBA"),
+            dsq_page + 1,
+        )
+
+    def test_canonical_urc_common_handle_is_named_qpn(self) -> None:
+        urc = CHECKER.build_golden_cases()["context"][2]
+        inputs = {item.name: item.value for item in urc.inputs}
+
+        self.assertIn("qpn", inputs)
+        self.assertEqual(inputs["qpn"], "0x3ffff")
+        self.assertNotIn("qp_id", inputs)
+
+    def test_every_urc_semantic_input_is_coupled_to_payload(self) -> None:
+        validate = self.require_checker_attribute("validate_context_contract")
+        cases = CHECKER.build_golden_cases()["context"]
+        urc = cases[2]
+
+        for item in urc.inputs:
+            with self.subTest(input=item.name):
+                if item.name == "transport":
+                    mutated_inputs = tuple(
+                        CHECKER.GoldenInput(entry.name, "rc")
+                        if entry.name == "transport" else entry
+                        for entry in urc.inputs
+                    )
+                    mutated = urc._replace(inputs=mutated_inputs)
+                else:
+                    mutated = self.mutate_input(urc, item.name)
+                corrupted = list(cases)
+                corrupted[2] = mutated
+                with self.assertRaises(CHECKER.ValidationError):
+                    validate(corrupted)
+
+    def test_urc_accepts_optional_traffic_class_derived_summaries(self) -> None:
+        validate = self.require_checker_attribute("validate_context_contract")
+        cases = CHECKER.build_golden_cases()["context"]
+        urc = cases[2]
+        derived_inputs = (
+            CHECKER.GoldenInput("icos", "7"),
+            CHECKER.GoldenInput("dscp", "0x3f"),
+            CHECKER.GoldenInput("ecn", "2"),
+        )
+        cases[2] = urc._replace(inputs=urc.inputs + derived_inputs)
+
+        try:
+            validate(cases)
+        except CHECKER.ValidationError as error:
+            self.fail(f"valid derived summaries were rejected: {error}")
 
     def test_body_goldens_use_only_driver_supported_semantic_values(self) -> None:
         validate = self.require_checker_attribute("validate_context_contract")

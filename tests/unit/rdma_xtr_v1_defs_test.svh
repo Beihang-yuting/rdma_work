@@ -319,6 +319,16 @@ class rdma_xtr_v1_defs_test extends uvm_test;
 
     if (XTR_V1_QPC_QPN_OFFSET != 16 || XTR_V1_QPC_QPN_WIDTH != 21)
       `uvm_error("DEFS", "QPC QPN field")
+    if (XTR_V1_QPC_URC_RSQ_SIZE_WORD_BYTE_OFFSET != 24 ||
+        XTR_V1_QPC_URC_RSQ_SIZE_LSB != 59 ||
+        XTR_V1_QPC_URC_RSQ_SIZE_WIDTH != 3 ||
+        XTR_V1_QPC_URC_RSQ_SIZE_OFFSET != 251)
+      `uvm_error("DEFS", "URC RSQ size field")
+    if (XTR_V1_QPC_URC_NXT_RDSQ_FETCH_NUM_WORD_BYTE_OFFSET != 224 ||
+        XTR_V1_QPC_URC_NXT_RDSQ_FETCH_NUM_LSB != 16 ||
+        XTR_V1_QPC_URC_NXT_RDSQ_FETCH_NUM_WIDTH != 6 ||
+        XTR_V1_QPC_URC_NXT_RDSQ_FETCH_NUM_OFFSET != 1808)
+      `uvm_error("DEFS", "URC RDSQ fetch field")
     if (XTR_V1_CMQ_OPCODE_OFFSET != 32 ||
         XTR_V1_CMQ_OPCODE_WIDTH != 8)
       `uvm_error("DEFS", "CMQ opcode field")
