@@ -411,6 +411,18 @@ virtual class rdma_xtr_v1_qpc_codec_base extends rdma_codec_base;
     return $sformatf("xtr_v1 512-byte %s QPC image", expected_transport().name());
   endfunction
 
+  protected function bit [4:0] normalized_rights(rdma_rdma_access_t access);
+    bit [4:0] rights;
+    rights = '0;
+    if (access.local_write || access.remote_write || access.remote_atomic)
+      rights |= XTR_V1_RIGHT_LOCAL_WRITE;
+    if (access.remote_read) rights |= XTR_V1_RIGHT_REMOTE_READ;
+    if (access.remote_write) rights |= XTR_V1_RIGHT_REMOTE_WRITE;
+    if (access.memory_window_bind) rights |= XTR_V1_RIGHT_BIND_WINDOW;
+    if (access.remote_atomic) rights |= XTR_V1_RIGHT_REMOTE_ATOMIC;
+    return rights;
+  endfunction
+
   protected function rdma_status encode_common(
     rdma_qpc_model qpc,
     rdma_xtr_v1_qword_builder builder
@@ -438,12 +450,7 @@ virtual class rdma_xtr_v1_qpc_codec_base extends rdma_codec_base;
     status = encode_page(qpc.rq_backing, "QPC RQ backing", rq_page); if (!status.ok()) return status;
     status = encode_log2(qpc.sq_depth, 4, "QPC SQ depth", sq_size); if (!status.ok()) return status;
     status = encode_log2(qpc.rq_depth, 4, "QPC RQ depth", rq_size); if (!status.ok()) return status;
-    access_code = '0;
-    if (qpc.access.local_write) access_code |= XTR_V1_RIGHT_LOCAL_WRITE;
-    if (qpc.access.remote_read) access_code |= XTR_V1_RIGHT_REMOTE_READ;
-    if (qpc.access.remote_write) access_code |= XTR_V1_RIGHT_REMOTE_WRITE;
-    if (qpc.access.memory_window_bind) access_code |= XTR_V1_RIGHT_BIND_WINDOW;
-    if (qpc.access.remote_atomic) access_code |= XTR_V1_RIGHT_REMOTE_ATOMIC;
+    access_code = normalized_rights(qpc.access);
 
 `define QPC_PUT(STEM, VALUE) \
     status = put(builder, STEM``_WORD_BYTE_OFFSET, STEM``_LSB, \
@@ -743,7 +750,10 @@ virtual class rdma_xtr_v1_qpc_codec_base extends rdma_codec_base;
     `QPC_NE(stat_index, "stat_index")
     `QPC_NE(pkey, "pkey")
     `QPC_NE(qp_sequence, "qp_sequence")
-    `QPC_NE(access, "access")
+    if (normalized_rights(left.access) != normalized_rights(right.access)) begin
+      mismatch = "access";
+      return rdma_status::success();
+    end
     `QPC_NE(path_mtu_bytes, "path_mtu_bytes")
     `QPC_NE(sq_depth, "sq_depth")
     `QPC_NE(rq_depth, "rq_depth")

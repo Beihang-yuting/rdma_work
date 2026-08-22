@@ -512,6 +512,87 @@ class rdma_xtr_v1_qpc_codec_test extends uvm_test;
     expect_serialized_inequality("PROJECTED_KIND", codec, source, changed);
   endfunction
 
+  function automatic void check_access_normalization(
+    rdma_codec_base codec,
+    rdma_qpc_model source
+  );
+    rdma_qpc_model qpc;
+    rdma_qpc_model decoded;
+    rdma_hw_model decoded_model;
+    rdma_hw_image image;
+    rdma_status status;
+    rdma_rdma_access_t original_access;
+    rdma_rdma_access_t canonical_access;
+    bit [4:0] expected_rights;
+    bit [4:0] actual_rights;
+    bit equal;
+    string mismatch;
+    string label;
+
+    for (int unsigned which = 0; which < 3; which++) begin
+      qpc = clone_qpc(source, "ACCESS_NORMALIZATION_CLONE");
+      qpc.access = '0;
+      case (which)
+        0: begin
+          label = "REMOTE_WRITE_ONLY";
+          qpc.access.remote_write = 1'b1;
+          expected_rights = 5'h05;
+        end
+        1: begin
+          label = "REMOTE_ATOMIC_ONLY";
+          qpc.access.remote_atomic = 1'b1;
+          expected_rights = 5'h11;
+        end
+        2: begin
+          label = "REMOTE_READ_ONLY";
+          qpc.access.remote_read = 1'b1;
+          expected_rights = 5'h02;
+        end
+      endcase
+      original_access = qpc.access;
+      canonical_access = original_access;
+      if (canonical_access.remote_write || canonical_access.remote_atomic)
+        canonical_access.local_write = 1'b1;
+
+      image = null;
+      status = codec.encode(qpc, image);
+      expect_ok({label, "_ENCODE"}, status);
+      if (qpc.access != original_access)
+        `uvm_error({label, "_INPUT"}, "encode modified the input access model")
+      if (image == null) begin
+        `uvm_error({label, "_IMAGE"}, "successful encode published null")
+        continue;
+      end
+      actual_rights = image_field(
+        image,
+        XTR_V1_QPC_QP_ACCESS_FLAG_WORD_BYTE_OFFSET,
+        XTR_V1_QPC_QP_ACCESS_FLAG_LSB,
+        XTR_V1_QPC_QP_ACCESS_FLAG_WIDTH
+      );
+      if (actual_rights != expected_rights)
+        `uvm_error({label, "_RIGHTS"},
+                   $sformatf("QP_ACCESS_FLAG expected 0x%02h, got 0x%02h",
+                             expected_rights, actual_rights))
+
+      decoded_model = null;
+      status = codec.decode(image, decoded_model);
+      expect_ok({label, "_DECODE"}, status);
+      if (!$cast(decoded, decoded_model)) begin
+        `uvm_error({label, "_DECODE_TYPE"},
+                   "decode did not publish a QPC model")
+        continue;
+      end
+      if (decoded.access != canonical_access)
+        `uvm_error({label, "_CANONICAL"},
+                   "decode did not publish canonical access rights")
+      status = codec.serialized_equal(qpc, decoded, equal, mismatch);
+      expect_ok({label, "_EQUAL_STATUS"}, status);
+      if (!equal)
+        `uvm_error({label, "_EQUAL"},
+                   {"normalized round trip mismatch: ", mismatch})
+    end
+  endfunction
+
   function automatic void check_pmtu_table(rdma_codec_base codec,
                                             rdma_qpc_model source);
     int unsigned mtus[4] = '{1024, 2048, 4096, 8192};
@@ -1046,6 +1127,7 @@ class rdma_xtr_v1_qpc_codec_test extends uvm_test;
     rc_source = make_rc();
     ud_source = make_ud();
     urc_source = make_urc();
+    check_access_normalization(rc_codec, rc_source);
     canonical_state = clone_qpc(rc_source, "sqe_canonical_source");
     canonical_state.state = RDMA_QPS_SQE;
     status = rc_codec.encode(canonical_state, canonical_state_image);
