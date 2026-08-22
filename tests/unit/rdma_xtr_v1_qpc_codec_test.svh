@@ -513,6 +513,7 @@ class rdma_xtr_v1_qpc_codec_test extends uvm_test;
   endfunction
 
   function automatic void check_access_normalization(
+    string transport_label,
     rdma_codec_base codec,
     rdma_qpc_model source
   );
@@ -530,21 +531,22 @@ class rdma_xtr_v1_qpc_codec_test extends uvm_test;
     string label;
 
     for (int unsigned which = 0; which < 3; which++) begin
-      qpc = clone_qpc(source, "ACCESS_NORMALIZATION_CLONE");
+      qpc = clone_qpc(source,
+                      {transport_label, "_ACCESS_NORMALIZATION_CLONE"});
       qpc.access = '0;
       case (which)
         0: begin
-          label = "REMOTE_WRITE_ONLY";
+          label = {transport_label, "_REMOTE_WRITE_ONLY"};
           qpc.access.remote_write = 1'b1;
           expected_rights = 5'h05;
         end
         1: begin
-          label = "REMOTE_ATOMIC_ONLY";
+          label = {transport_label, "_REMOTE_ATOMIC_ONLY"};
           qpc.access.remote_atomic = 1'b1;
           expected_rights = 5'h11;
         end
         2: begin
-          label = "REMOTE_READ_ONLY";
+          label = {transport_label, "_REMOTE_READ_ONLY"};
           qpc.access.remote_read = 1'b1;
           expected_rights = 5'h02;
         end
@@ -1127,7 +1129,9 @@ class rdma_xtr_v1_qpc_codec_test extends uvm_test;
     rc_source = make_rc();
     ud_source = make_ud();
     urc_source = make_urc();
-    check_access_normalization(rc_codec, rc_source);
+    check_access_normalization("RC", rc_codec, rc_source);
+    check_access_normalization("UD", ud_codec, ud_source);
+    check_access_normalization("URC", urc_codec, urc_source);
     canonical_state = clone_qpc(rc_source, "sqe_canonical_source");
     canonical_state.state = RDMA_QPS_SQE;
     status = rc_codec.encode(canonical_state, canonical_state_image);
