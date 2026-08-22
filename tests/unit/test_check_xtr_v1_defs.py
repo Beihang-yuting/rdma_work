@@ -167,6 +167,21 @@ local function string symbolic_name(bit [7:0] hardware_code);
     default: return $sformatf("XTR_V1_UNKNOWN_ECODE_0x%02x", hardware_code);
   endcase
 endfunction
+function rdma_status_code_e decode_status(bit [7:0] hardware_code);
+  rdma_status_code_e code;
+  rdma_engine_kind_e source_engine;
+  code = classify(hardware_code);
+  source_engine = inferred_engine(hardware_code, code);
+  candidate.message = symbolic_name(hardware_code);
+  if (hardware_code == XTR_V1_CMQ_SUCCESS_ECODE) begin
+    candidate.hardware_code = '0;
+    return RDMA_SC_OK;
+  end
+  else begin
+    candidate.hardware_code = {24'h0, hardware_code};
+    return code;
+  end
+endfunction
 """
 
     def test_source_discovery_rejects_missing_and_extra_mapping(self) -> None:
@@ -486,9 +501,98 @@ local function bit raw_comparison_probe(bit [7:0] hardware_code);
 endfunction
 """
         with self.assertRaisesRegex(
-            CHECKER.ValidationError, "hardware_code comparison"
+            CHECKER.ValidationError, "hardware_code use"
         ):
             validate_codec(helper + self.codec_text(), canonical)
+
+    def test_codec_decode_status_rejects_unapproved_hardware_code_uses(
+        self,
+    ) -> None:
+        validate_codec = self.require_checker_attribute(
+            "validate_error_codec"
+        )
+        canonical = self.canonical_fixture()
+        pinned_compare = (
+            "  if (hardware_code == XTR_V1_CMQ_SUCCESS_ECODE) begin\n"
+        )
+        mutations = {
+            "case equality": (
+                "  if (hardware_code === 240) return RDMA_SC_OK;\n"
+            ),
+            "inequality else": """  if (hardware_code != 240)
+    code = RDMA_SC_UNKNOWN_HW_ERROR;
+  else
+    return RDMA_SC_OK;
+""",
+            "part select": (
+                "  if (hardware_code[7:0] == 240) return RDMA_SC_OK;\n"
+            ),
+            "arithmetic": (
+                "  if ((hardware_code + 0) == 240) return RDMA_SC_OK;\n"
+            ),
+            "inside": (
+                "  if (hardware_code inside {240}) return RDMA_SC_OK;\n"
+            ),
+        }
+        for name, mutation in mutations.items():
+            with self.subTest(name=name):
+                bypass = self.codec_text().replace(
+                    pinned_compare, mutation + pinned_compare
+                )
+                self.assertNotEqual(bypass, self.codec_text())
+                with self.assertRaisesRegex(
+                    CHECKER.ValidationError, "hardware_code use"
+                ):
+                    validate_codec(bypass, canonical)
+
+    def test_codec_accepts_reverse_pinned_success_comparison(self) -> None:
+        validate_codec = self.require_checker_attribute(
+            "validate_error_codec"
+        )
+        reverse = self.codec_text().replace(
+            "hardware_code == XTR_V1_CMQ_SUCCESS_ECODE",
+            "XTR_V1_CMQ_SUCCESS_ECODE == hardware_code",
+        )
+        try:
+            validate_codec(reverse, self.canonical_fixture())
+        except CHECKER.ValidationError as error:
+            self.fail(f"reverse pinned success comparison was rejected: {error}")
+
+    def test_codec_rejects_qualified_hardware_code_roles(self) -> None:
+        validate_codec = self.require_checker_attribute(
+            "validate_error_codec"
+        )
+        canonical = self.canonical_fixture()
+        mutations = {
+            "classify callee": (
+                "code = classify(hardware_code);",
+                "code = other.classify(hardware_code);",
+            ),
+            "inferred callee": (
+                "source_engine = inferred_engine(hardware_code, code);",
+                "source_engine = other.inferred_engine(hardware_code, code);",
+            ),
+            "symbolic callee": (
+                "candidate.message = symbolic_name(hardware_code);",
+                "candidate.message = other.symbolic_name(hardware_code);",
+            ),
+            "zero assignment": (
+                "candidate.hardware_code = '0;",
+                "other.candidate.hardware_code = '0;",
+            ),
+            "extension assignment": (
+                "candidate.hardware_code = {24'h0, hardware_code};",
+                "other.candidate.hardware_code = {24'h0, hardware_code};",
+            ),
+        }
+        for name, (valid, qualified) in mutations.items():
+            with self.subTest(name=name):
+                bypass = self.codec_text().replace(valid, qualified)
+                self.assertNotEqual(bypass, self.codec_text())
+                with self.assertRaisesRegex(
+                    CHECKER.ValidationError, "hardware_code"
+                ):
+                    validate_codec(bypass, canonical)
 
     def test_codec_raw_scan_ignores_quoted_diagnostic_text(self) -> None:
         validate_codec = self.require_checker_attribute(

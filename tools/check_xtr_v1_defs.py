@@ -952,7 +952,7 @@ def mask_sv_strings(text: str) -> str:
 
 
 def tokenize_sv_syntax(text: str) -> list[str]:
-    """Tokenize enough SV syntax to audit hardware-code comparisons."""
+    """Tokenize enough SV syntax to audit hardware-code use sites."""
     token_pattern = re.compile(
         r"\d+\s*'\s*[sS]?\s*[hHdDbBoO]\s*[0-9a-fA-F_xXzZ?]+"
         r"|[A-Za-z_]\w*|===|!==|==|!=|&&|\|\||<<|>>|[^\s]"
@@ -960,86 +960,189 @@ def tokenize_sv_syntax(text: str) -> list[str]:
     return [match.group(0) for match in token_pattern.finditer(text)]
 
 
-def strip_outer_parentheses(tokens: list[str]) -> list[str]:
-    """Remove only parentheses that enclose an entire token expression."""
-    stripped = tokens
-    while len(stripped) >= 2 and stripped[0] == "(" and stripped[-1] == ")":
-        depth = 0
-        closes_at_end = False
-        for index, token in enumerate(stripped):
-            if token == "(":
-                depth += 1
-            elif token == ")":
-                depth -= 1
-                if depth == 0:
-                    closes_at_end = index == len(stripped) - 1
-                    break
-        if not closes_at_end:
+class SvFunctionRegion(NamedTuple):
+    name: str
+    header_start: int
+    body_start: int
+    body_end: int
+
+
+def parse_sv_function_regions(tokens: list[str]) -> list[SvFunctionRegion]:
+    """Return non-nested function token ranges from a codec source."""
+    regions: list[SvFunctionRegion] = []
+    position = 0
+    while position < len(tokens):
+        try:
+            header_start = tokens.index("function", position)
+        except ValueError:
             break
-        stripped = stripped[1:-1]
-    return stripped
-
-
-def comparison_left_operand(tokens: list[str], operator: int) -> list[str]:
-    boundary = {"(", ";", ",", "&&", "||", "?", ":", "=", "return"}
-    depth = 0
-    start = operator
-    for index in range(operator - 1, -1, -1):
-        token = tokens[index]
-        if token == ")":
-            depth += 1
-        elif token == "(":
-            if depth == 0:
-                break
-            depth -= 1
-        elif depth == 0 and token in boundary:
-            break
-        start = index
-    return tokens[start:operator]
-
-
-def comparison_right_operand(tokens: list[str], operator: int) -> list[str]:
-    boundary = {")", ";", ",", "&&", "||", "?", ":", "=", "return", "==", "!="}
-    depth = 0
-    end = operator + 1
-    for index in range(operator + 1, len(tokens)):
-        token = tokens[index]
-        if token == "(":
-            depth += 1
-        elif token == ")":
-            if depth == 0:
-                break
-            depth -= 1
-        elif depth == 0 and token in boundary:
-            break
-        end = index + 1
-    return tokens[operator + 1:end]
-
-
-def validate_hardware_code_comparisons(
-    codec_code: str, allowed_names: set[str]
-) -> None:
-    """Require every hardware_code equality operand to be source-constrained."""
-    tokens = tokenize_sv_syntax(codec_code)
-    for operator, token in enumerate(tokens):
-        if token != "==":
-            continue
-        left = strip_outer_parentheses(
-            comparison_left_operand(tokens, operator)
-        )
-        right = strip_outer_parentheses(
-            comparison_right_operand(tokens, operator)
-        )
-        if left == ["hardware_code"]:
-            other = right
-        elif right == ["hardware_code"]:
-            other = left
-        else:
-            continue
-        if len(other) != 1 or other[0] not in allowed_names:
-            raise ValidationError(
-                "hardware_code comparison must use a canonical error constant"
+        try:
+            body_start = tokens.index(";", header_start + 1) + 1
+            body_end = tokens.index("endfunction", body_start)
+            arguments = tokens.index("(", header_start + 1, body_start)
+        except ValueError as error:
+            raise ValidationError("invalid SV function syntax in error codec") from error
+        if arguments == header_start + 1:
+            raise ValidationError("invalid SV function syntax in error codec")
+        regions.append(
+            SvFunctionRegion(
+                tokens[arguments - 1], header_start, body_start, body_end
             )
+        )
+        position = body_end + 1
+    return regions
+
+
+def matching_token_patterns(
+    tokens: list[str], pattern: list[str], start: int, end: int
+) -> list[int]:
+    """Return starts of an exact token pattern inside one function range."""
+    return [
+        index
+        for index in range(start, end - len(pattern) + 1)
+        if tokens[index:index + len(pattern)] == pattern
+    ]
+
+
+def matching_statement_patterns(
+    tokens: list[str], pattern: list[str], start: int, end: int
+) -> list[int]:
+    """Return exact token patterns that also start at a statement boundary."""
+    return [
+        index
+        for index in matching_token_patterns(tokens, pattern, start, end)
+        if index == start or tokens[index - 1] in {";", "begin", "else"}
+    ]
+
+
+def validate_hardware_code_uses(codec_code: str) -> None:
+    """Fail closed unless every hardware_code token has a pinned role."""
+    tokens = tokenize_sv_syntax(codec_code)
+    regions = parse_sv_function_regions(tokens)
+    regions_by_name: dict[str, list[SvFunctionRegion]] = {}
+    for region in regions:
+        regions_by_name.setdefault(region.name, []).append(region)
+
+    required_names = {
+        "classify", "inferred_engine", "symbolic_name", "decode_status"
+    }
+    for name in required_names:
+        if len(regions_by_name.get(name, [])) != 1:
+            raise ValidationError(f"hardware error function differs: {name}")
+
+    approved: set[int] = set()
+    formal_prefix = ["bit", "[", "7", ":", "0", "]"]
+    for region in regions:
+        formals = []
+        for index in range(region.header_start, region.body_start):
+            if tokens[index] != "hardware_code":
+                continue
+            if (
+                tokens[max(region.header_start, index - len(formal_prefix)):index]
+                == formal_prefix
+                and index + 1 < region.body_start
+                and tokens[index + 1] in {",", ")"}
+            ):
+                approved.add(index)
+                formals.append(index)
+        if region.name in required_names and len(formals) != 1:
+            raise ValidationError(
+                f"hardware_code formal differs in {region.name}"
+            )
+
+    case_pattern = ["case", "(", "hardware_code", ")"]
+    for name in ("classify", "inferred_engine", "symbolic_name"):
+        region = regions_by_name[name][0]
+        selectors = matching_token_patterns(
+            tokens, case_pattern, region.body_start, region.body_end
+        )
+        if len(selectors) != 1:
+            raise ValidationError(f"hardware_code case selector differs in {name}")
+        approved.add(selectors[0] + 2)
+
+    symbolic = regions_by_name["symbolic_name"][0]
+    format_pattern = ["$", "sformatf", "(", ",", "hardware_code", ")"]
+    format_uses = matching_token_patterns(
+        tokens, format_pattern, symbolic.body_start, symbolic.body_end
+    )
+    if len(format_uses) != 1:
+        raise ValidationError("symbolic hardware_code format output differs")
+    approved.add(format_uses[0] + 4)
+
+    decode = regions_by_name["decode_status"][0]
+    call_patterns = (
+        (
+            "classify",
+            ["code", "=", "classify", "(", "hardware_code", ")", ";"],
+            4,
+        ),
+        (
+            "inferred_engine",
+            [
+                "source_engine", "=", "inferred_engine", "(",
+                "hardware_code", ",", "code", ")", ";",
+            ],
+            4,
+        ),
+        (
+            "symbolic_name",
+            [
+                "candidate", ".", "message", "=", "symbolic_name", "(",
+                "hardware_code", ")", ";",
+            ],
+            6,
+        ),
+    )
+    for callee, pattern, offset in call_patterns:
+        starts = matching_statement_patterns(
+            tokens, pattern, decode.body_start, decode.body_end
+        )
+        if len(starts) != 1:
+            raise ValidationError(
+                f"decode_status {callee} hardware_code call differs"
+            )
+        approved.add(starts[0] + offset)
+
+    success = "XTR_V1_CMQ_SUCCESS_ECODE"
+    success_patterns = (
+        (["if", "(", "hardware_code", "==", success, ")"], 2),
+        (["if", "(", success, "==", "hardware_code", ")"], 4),
+    )
+    success_uses: list[int] = []
+    for pattern, offset in success_patterns:
+        success_uses.extend(
+            start + offset
+            for start in matching_statement_patterns(
+                tokens, pattern, decode.body_start, decode.body_end
+            )
+        )
+    if len(success_uses) != 1:
+        raise ValidationError(
+            "hardware_code use in decode_status pinned success comparison differs"
+        )
+    approved.update(success_uses)
+
+    assignment_patterns = (
+        (["candidate", ".", "hardware_code", "=", "'", "0", ";"], (2,)),
+        (
+            [
+                "candidate", ".", "hardware_code", "=", "{", "24'h0",
+                ",", "hardware_code", "}", ";",
+            ],
+            (2, 7),
+        ),
+    )
+    for pattern, offsets in assignment_patterns:
+        starts = matching_statement_patterns(
+            tokens, pattern, decode.body_start, decode.body_end
+        )
+        if len(starts) != 1:
+            raise ValidationError("decode_status hardware_code assignment differs")
+        approved.update(starts[0] + offset for offset in offsets)
+
+    for index, token in enumerate(tokens):
+        if token == "hardware_code" and index not in approved:
+            raise ValidationError("hardware_code use is not approved")
 
 
 def parse_sv_constants(text: str) -> dict[str, int]:
@@ -1672,7 +1775,7 @@ def validate_error_codec(
         raise ValidationError(
             f"codec consumes noncanonical error code constant: {unknown_names}"
         )
-    validate_hardware_code_comparisons(codec_code, allowed_names)
+    validate_hardware_code_uses(codec_code)
 
 
 class ReferenceImage(bytearray):
