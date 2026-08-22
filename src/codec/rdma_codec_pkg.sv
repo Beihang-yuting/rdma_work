@@ -20,4 +20,5 @@ package rdma_codec_pkg;
   `include "xtr_v1/rdma_xtr_v1_qpc_codecs.svh"
   `include "xtr_v1/rdma_xtr_v1_context_body_codecs.svh"
   `include "xtr_v1/rdma_xtr_v1_cmq_codecs.svh"
+  `include "xtr_v1/rdma_xtr_v1_error_codec.svh"
 endpackage

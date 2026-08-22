@@ -48,6 +48,206 @@ class rdma_xtr_v1_cmq_envelope extends uvm_object;
   endfunction
 endclass
 
+class rdma_xtr_v1_cmq_completion extends uvm_object;
+  `uvm_object_utils(rdma_xtr_v1_cmq_completion)
+
+  bit [7:0] opcode;
+  bit [7:0] command_ecode;
+  bit [4:0] wqe_index;
+  bit wrap;
+  byte unsigned object_payload[];
+
+  function new(string name = "rdma_xtr_v1_cmq_completion");
+    super.new(name);
+    opcode = '0;
+    command_ecode = '0;
+    wqe_index = '0;
+    wrap = 1'b0;
+    object_payload = new[0];
+  endfunction
+
+  virtual function void do_copy(uvm_object rhs);
+    rdma_xtr_v1_cmq_completion rhs_completion;
+    super.do_copy(rhs);
+    if (!$cast(rhs_completion, rhs))
+      `uvm_fatal("RDMA_COPY_TYPE", "CMQ completion copy type mismatch")
+    opcode = rhs_completion.opcode;
+    command_ecode = rhs_completion.command_ecode;
+    wqe_index = rhs_completion.wqe_index;
+    wrap = rhs_completion.wrap;
+    object_payload = rhs_completion.object_payload;
+  endfunction
+endclass
+
+class rdma_xtr_v1_cmq_completion_codec extends uvm_object;
+  `uvm_object_utils(rdma_xtr_v1_cmq_completion_codec)
+
+  localparam bit [7:0] COMPLETION_KEY_QUERY_OPCODE = 8'h09;
+
+  function new(string name = "rdma_xtr_v1_cmq_completion_codec");
+    super.new(name);
+  endfunction
+
+  local function rdma_status codec_error(string message);
+    return rdma_status::make(RDMA_SC_CODEC_ERROR, message);
+  endfunction
+
+  local function bit [63:0] image_qword(
+    rdma_hw_image image,
+    int unsigned qword_index
+  );
+    bit [63:0] value;
+    int unsigned base;
+    value = '0;
+    base = qword_index * 8;
+    for (int unsigned i = 0; i < 8; i++)
+      value = {value[55:0], image.bytes[base + i]};
+    return value;
+  endfunction
+
+  // Registered request opcodes plus the driver's response-only KEY_QUERY.
+  // Keep completion admission independent of a mutable/injectable registry.
+  local function bit supported_opcode(bit [7:0] opcode);
+    return opcode inside {
+      XTR_V1_OP_QPC_CREATE, XTR_V1_OP_QPC_MODIFY,
+      XTR_V1_OP_QPC_DELETE, XTR_V1_OP_QPC_QUERY,
+      XTR_V1_OP_KEY_ALLOC, XTR_V1_OP_MR_REGISTER,
+      XTR_V1_OP_MR_DEREGISTER, COMPLETION_KEY_QUERY_OPCODE,
+      XTR_V1_OP_OCC_FLUSH,
+      XTR_V1_OP_CQC_CREATE, XTR_V1_OP_CQC_DELETE,
+      XTR_V1_OP_CQC_QUERY, XTR_V1_OP_CEQC_CREATE,
+      XTR_V1_OP_CEQC_DELETE, XTR_V1_OP_CEQC_QUERY,
+      XTR_V1_OP_AEQC_CREATE, XTR_V1_OP_AEQC_DELETE,
+      XTR_V1_OP_AEQC_QUERY, XTR_V1_OP_TQ_FLUSH,
+      XTR_V1_OP_SRFQC_CREATE, XTR_V1_OP_SRFQC_DELETE,
+      XTR_V1_OP_SRFQC_QUERY
+    };
+  endfunction
+
+  local function bit [63:0] allowed_qword_mask(
+    bit [7:0] opcode,
+    int unsigned qword_index
+  );
+    if (qword_index == 0)
+      return 64'h0000_3fff_ff00_0000;
+    case (opcode)
+      COMPLETION_KEY_QUERY_OPCODE:
+        if (qword_index inside {[2:7]})
+          return 64'hffff_ffff_ffff_ffff;
+      XTR_V1_OP_CQC_QUERY:
+        return 64'hffff_ffff_ffff_ffff;
+      XTR_V1_OP_CEQC_QUERY,
+      XTR_V1_OP_AEQC_QUERY,
+      XTR_V1_OP_SRFQC_QUERY:
+        if (qword_index inside {[2:5]})
+          return 64'hffff_ffff_ffff_ffff;
+      default: return 64'h0000_0000_0000_0000;
+    endcase
+    return 64'h0000_0000_0000_0000;
+  endfunction
+
+  local function void returned_payload_bounds(
+    bit [7:0] opcode,
+    output int unsigned first_byte,
+    output int unsigned byte_count
+  );
+    first_byte = 0;
+    byte_count = 0;
+    case (opcode)
+      COMPLETION_KEY_QUERY_OPCODE: begin
+        first_byte = 16;
+        byte_count = 48;
+      end
+      XTR_V1_OP_CQC_QUERY: begin
+        first_byte = 8;
+        byte_count = 56;
+      end
+      XTR_V1_OP_CEQC_QUERY,
+      XTR_V1_OP_AEQC_QUERY,
+      XTR_V1_OP_SRFQC_QUERY: begin
+        first_byte = 16;
+        byte_count = 32;
+      end
+      default: begin
+        first_byte = 0;
+        byte_count = 0;
+      end
+    endcase
+  endfunction
+
+  function rdma_status decode_completion(
+    rdma_hw_image image,
+    bit [7:0] expected_opcode,
+    bit expected_wrap,
+    output rdma_xtr_v1_cmq_completion completion
+  );
+    bit [63:0] qword0;
+    bit [63:0] word;
+    bit [7:0] opcode;
+    bit wrap;
+    int unsigned first_byte;
+    int unsigned byte_count;
+    rdma_xtr_v1_cmq_completion candidate;
+
+    completion = null;
+    if (image == null)
+      return codec_error("xtr_v1 CMQ completion image is null");
+    if (image.length != XTR_V1_CMQE_BYTES ||
+        image.bytes.size() != XTR_V1_CMQE_BYTES)
+      return codec_error("xtr_v1 CMQ completion length is not 64 bytes");
+    if (image.alignment != XTR_V1_CMQE_BYTES ||
+        image.endian != RDMA_ENDIAN_BIG ||
+        image.image_kind != RDMA_IMAGE_CMQ_CQE ||
+        image.hardware_version != XTR_V1_HW_VERSION ||
+        image.write_target_kind != RDMA_HW_TARGET_NONE ||
+        image.backing_target.value != 0 || image.hmc_target.value != 0 ||
+        image.bar_target.value != 0)
+      return codec_error("xtr_v1 CMQ completion metadata is invalid");
+    if (!supported_opcode(expected_opcode))
+      return rdma_status::make(
+        RDMA_SC_UNSUPPORTED_OPCODE,
+        $sformatf("unsupported expected xtr_v1 CMQ completion opcode 0x%02x",
+                  expected_opcode)
+      );
+
+    qword0 = image_qword(image, 0);
+    opcode = (qword0 >> XTR_V1_CMQ_OPCODE_LSB) & 8'hff;
+    wrap = (qword0 >> XTR_V1_CMQ_WRAP_LSB) & 1'b1;
+    if (!supported_opcode(opcode))
+      return rdma_status::make(
+        RDMA_SC_UNSUPPORTED_OPCODE,
+        $sformatf("unsupported xtr_v1 CMQ completion opcode 0x%02x", opcode)
+      );
+
+    for (int unsigned q = 0; q < 8; q++) begin
+      word = image_qword(image, q);
+      if ((word & ~allowed_qword_mask(opcode, q)) != 0)
+        return codec_error($sformatf(
+          "xtr_v1 CMQ completion qword %0d contains a reserved bit", q));
+    end
+    if (opcode != expected_opcode)
+      return codec_error($sformatf(
+        "xtr_v1 CMQ completion opcode mismatch: expected 0x%02x got 0x%02x",
+        expected_opcode, opcode));
+    if (wrap != expected_wrap)
+      return codec_error("xtr_v1 CMQ completion wrap mismatch");
+
+    candidate = new("xtr_v1_cmq_completion");
+    candidate.opcode = opcode;
+    candidate.command_ecode =
+      (qword0 >> XTR_V1_CMQ_CMD_ECODE_LSB) & 8'hff;
+    candidate.wqe_index =
+      (qword0 >> XTR_V1_CMQ_WQE_INDEX_LSB) & 5'h1f;
+    candidate.wrap = wrap;
+    returned_payload_bounds(opcode, first_byte, byte_count);
+    candidate.object_payload = new[byte_count];
+    foreach (candidate.object_payload[i])
+      candidate.object_payload[i] = image.bytes[first_byte + i];
+    completion = candidate;
+    return rdma_status::success();
+  endfunction
+endclass
+
 class rdma_xtr_v1_qpc_command_body extends rdma_hw_model;
   `uvm_object_utils(rdma_xtr_v1_qpc_command_body)
 
