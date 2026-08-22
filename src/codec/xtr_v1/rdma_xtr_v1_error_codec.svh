@@ -228,7 +228,7 @@ class rdma_xtr_v1_error_codec extends uvm_object;
     candidate.retryable = code inside {
       RDMA_SC_DMA_TRANSLATION, RDMA_SC_PCIE_COMPLETION, RDMA_SC_QUEUE_FULL
     };
-    if (hardware_code == 0) begin
+    if (hardware_code == XTR_V1_CMQ_SUCCESS_ECODE) begin
       candidate.hardware_code = '0;
       candidate.hardware_code_valid = 1'b0;
       candidate.severity = RDMA_SEVERITY_INFO;

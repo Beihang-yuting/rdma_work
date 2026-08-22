@@ -448,6 +448,48 @@ endfunction
                 ):
                     validate_codec(early_return, canonical)
 
+    def test_codec_inferred_engine_rejects_external_known_code_returns(self) -> None:
+        validate_codec = self.require_checker_attribute(
+            "validate_error_codec"
+        )
+        canonical = self.canonical_fixture()
+        declaration = (
+            "local function rdma_engine_kind_e inferred_engine("
+            "bit [7:0] hardware_code);\n"
+        )
+        for condition in (
+            "hardware_code == 240",
+            "hardware_code == (8'hf1 - 1)",
+            "hardware_code == (16'h00f0)",
+        ):
+            with self.subTest(condition=condition):
+                early_return = self.codec_text().replace(
+                    declaration,
+                    declaration
+                    + f"  if ({condition}) return RDMA_ENGINE_CQ;\n",
+                )
+                with self.assertRaisesRegex(
+                    CHECKER.ValidationError,
+                    "inferred_engine|hardware_code comparison",
+                ):
+                    validate_codec(early_return, canonical)
+
+    def test_codec_other_function_rejects_known_code_expression(self) -> None:
+        validate_codec = self.require_checker_attribute(
+            "validate_error_codec"
+        )
+        canonical = self.canonical_fixture()
+        helper = """
+local function bit raw_comparison_probe(bit [7:0] hardware_code);
+  if (hardware_code == (8'hf1 - 1)) return 1'b1;
+  return 1'b0;
+endfunction
+"""
+        with self.assertRaisesRegex(
+            CHECKER.ValidationError, "hardware_code comparison"
+        ):
+            validate_codec(helper + self.codec_text(), canonical)
+
     def test_codec_raw_scan_ignores_quoted_diagnostic_text(self) -> None:
         validate_codec = self.require_checker_attribute(
             "validate_error_codec"

@@ -951,6 +951,97 @@ def mask_sv_strings(text: str) -> str:
     return "".join(result)
 
 
+def tokenize_sv_syntax(text: str) -> list[str]:
+    """Tokenize enough SV syntax to audit hardware-code comparisons."""
+    token_pattern = re.compile(
+        r"\d+\s*'\s*[sS]?\s*[hHdDbBoO]\s*[0-9a-fA-F_xXzZ?]+"
+        r"|[A-Za-z_]\w*|===|!==|==|!=|&&|\|\||<<|>>|[^\s]"
+    )
+    return [match.group(0) for match in token_pattern.finditer(text)]
+
+
+def strip_outer_parentheses(tokens: list[str]) -> list[str]:
+    """Remove only parentheses that enclose an entire token expression."""
+    stripped = tokens
+    while len(stripped) >= 2 and stripped[0] == "(" and stripped[-1] == ")":
+        depth = 0
+        closes_at_end = False
+        for index, token in enumerate(stripped):
+            if token == "(":
+                depth += 1
+            elif token == ")":
+                depth -= 1
+                if depth == 0:
+                    closes_at_end = index == len(stripped) - 1
+                    break
+        if not closes_at_end:
+            break
+        stripped = stripped[1:-1]
+    return stripped
+
+
+def comparison_left_operand(tokens: list[str], operator: int) -> list[str]:
+    boundary = {"(", ";", ",", "&&", "||", "?", ":", "=", "return"}
+    depth = 0
+    start = operator
+    for index in range(operator - 1, -1, -1):
+        token = tokens[index]
+        if token == ")":
+            depth += 1
+        elif token == "(":
+            if depth == 0:
+                break
+            depth -= 1
+        elif depth == 0 and token in boundary:
+            break
+        start = index
+    return tokens[start:operator]
+
+
+def comparison_right_operand(tokens: list[str], operator: int) -> list[str]:
+    boundary = {")", ";", ",", "&&", "||", "?", ":", "=", "return", "==", "!="}
+    depth = 0
+    end = operator + 1
+    for index in range(operator + 1, len(tokens)):
+        token = tokens[index]
+        if token == "(":
+            depth += 1
+        elif token == ")":
+            if depth == 0:
+                break
+            depth -= 1
+        elif depth == 0 and token in boundary:
+            break
+        end = index + 1
+    return tokens[operator + 1:end]
+
+
+def validate_hardware_code_comparisons(
+    codec_code: str, allowed_names: set[str]
+) -> None:
+    """Require every hardware_code equality operand to be source-constrained."""
+    tokens = tokenize_sv_syntax(codec_code)
+    for operator, token in enumerate(tokens):
+        if token != "==":
+            continue
+        left = strip_outer_parentheses(
+            comparison_left_operand(tokens, operator)
+        )
+        right = strip_outer_parentheses(
+            comparison_right_operand(tokens, operator)
+        )
+        if left == ["hardware_code"]:
+            other = right
+        elif right == ["hardware_code"]:
+            other = left
+        else:
+            continue
+        if len(other) != 1 or other[0] not in allowed_names:
+            raise ValidationError(
+                "hardware_code comparison must use a canonical error constant"
+            )
+
+
 def parse_sv_constants(text: str) -> dict[str, int]:
     text = mask_sv_strings(strip_sv_comments(text))
     constants: dict[str, int] = {}
@@ -1445,34 +1536,6 @@ def validate_error_codec(
             raise ValidationError(
                 f"raw literal {literal.group(0)} used for known error code"
             )
-    wide_literal = (
-        r"(?P<literal>(?P<width>\d+)\s*'\s*[sS]?\s*"
-        r"(?P<base>[hHdDbBoO])\s*(?P<digits>[0-9a-fA-F_]+))"
-    )
-    for comparison_pattern in (
-        rf"\bhardware_code\s*==\s*{wide_literal}",
-        rf"{wide_literal}\s*==\s*\bhardware_code",
-    ):
-        for comparison in re.finditer(comparison_pattern, codec_code):
-            width = int(comparison.group("width"))
-            if width <= 8:
-                continue
-            base = {"h": 16, "d": 10, "b": 2, "o": 8}[
-                comparison.group("base").lower()
-            ]
-            try:
-                value = int(
-                    comparison.group("digits").replace("_", ""), base
-                )
-            except ValueError:
-                continue
-            value &= (1 << width) - 1
-            if value in known_values:
-                raise ValidationError(
-                    f"raw literal {comparison.group('literal')} used for "
-                    "known error code"
-                )
-
     allowed_names = {
         mapping.sv_name
         for value, mapping in canonical.items()
@@ -1490,27 +1553,15 @@ def validate_error_codec(
             raise ValidationError(
                 f"hardware error function missing: {function_name}"
             )
-        if function_name == "classify":
-            whole_case = re.fullmatch(
-                r"\s*case\s*\(\s*hardware_code\s*\)(.*?)"
-                r"\bendcase\b\s*",
-                function.group(1),
-                re.S,
-            )
-            if whole_case is None:
-                raise ValidationError("invalid classify function body")
-            case_body = whole_case.group(1)
-        else:
-            case_body_match = re.search(
-                r"\bcase\s*\(\s*hardware_code\s*\)(.*?)\bendcase\b",
-                function.group(1),
-                re.S,
-            )
-            if case_body_match is None:
-                raise ValidationError(
-                    f"hardware error case missing default: {function_name}"
-                )
-            case_body = case_body_match.group(1)
+        whole_case = re.fullmatch(
+            r"\s*case\s*\(\s*hardware_code\s*\)(.*?)"
+            r"\bendcase\b\s*",
+            function.group(1),
+            re.S,
+        )
+        if whole_case is None:
+            raise ValidationError(f"invalid {function_name} function body")
+        case_body = whole_case.group(1)
         explicit_case = re.search(
             r"(.*?)^[ \t]*default[ \t]*:",
             case_body,
@@ -1621,6 +1672,7 @@ def validate_error_codec(
         raise ValidationError(
             f"codec consumes noncanonical error code constant: {unknown_names}"
         )
+    validate_hardware_code_comparisons(codec_code, allowed_names)
 
 
 class ReferenceImage(bytearray):
