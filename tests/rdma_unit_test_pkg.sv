@@ -30,6 +30,7 @@ package rdma_unit_test_pkg;
   `include "unit/rdma_codec_registry_test.svh"
   `include "unit/rdma_xtr_v1_defs_test.svh"
   `include "unit/rdma_xtr_v1_qword_codec_test.svh"
+  `include "unit/rdma_xtr_v1_qpc_codec_test.svh"
   `include "unit/rdma_harness_expected_failure_probe.svh"
 endpackage
 
