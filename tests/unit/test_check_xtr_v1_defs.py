@@ -391,6 +391,21 @@ endfunction
         ):
             validate_codec(unknown_specific, canonical)
 
+    def test_codec_symbolic_rejects_case_external_unknown_return(self) -> None:
+        validate_codec = self.require_checker_attribute(
+            "validate_error_codec"
+        )
+        canonical = self.canonical_fixture()
+        early_return = self.codec_text().replace(
+            "local function string symbolic_name(bit [7:0] hardware_code);\n",
+            "local function string symbolic_name(bit [7:0] hardware_code);\n"
+            "  if (hardware_code == 8'h42) return \"SPECIAL_UNKNOWN\";\n",
+        )
+        with self.assertRaisesRegex(
+            CHECKER.ValidationError, "symbolic error code lookup"
+        ):
+            validate_codec(early_return, canonical)
+
     def test_codec_cannot_use_raw_literal_for_known_source_code(self) -> None:
         validate_codec = self.require_checker_attribute(
             "validate_error_codec"
@@ -410,6 +425,80 @@ endfunction
                     CHECKER.ValidationError, "raw literal.*known error code"
                 ):
                     validate_codec(raw_f0, canonical)
+
+    def test_codec_classify_rejects_case_external_known_code_returns(self) -> None:
+        validate_codec = self.require_checker_attribute(
+            "validate_error_codec"
+        )
+        canonical = self.canonical_fixture()
+        for condition in (
+            "hardware_code == 16'h00f0",
+            "hardware_code == 240",
+            "hardware_code == (8'hf1 - 1)",
+        ):
+            with self.subTest(condition=condition):
+                early_return = self.codec_text().replace(
+                    "  case (hardware_code)\n",
+                    f"  if ({condition}) return RDMA_SC_OK;\n"
+                    "  case (hardware_code)\n",
+                    1,
+                )
+                with self.assertRaisesRegex(
+                    CHECKER.ValidationError, "classify|raw literal"
+                ):
+                    validate_codec(early_return, canonical)
+
+    def test_codec_raw_scan_ignores_quoted_diagnostic_text(self) -> None:
+        validate_codec = self.require_checker_attribute(
+            "validate_error_codec"
+        )
+        canonical = self.canonical_fixture()
+        diagnostic = (
+            'string diagnostic = "diagnostic 8\'hf0 only";\n'
+            + self.codec_text()
+        )
+        try:
+            validate_codec(diagnostic, canonical)
+        except CHECKER.ValidationError as error:
+            self.fail(f"quoted raw literal was parsed as code: {error}")
+
+    def test_codec_raw_scan_ignores_narrow_non_error_literals(self) -> None:
+        validate_codec = self.require_checker_attribute(
+            "validate_error_codec"
+        )
+        canonical = self.canonical_fixture()
+        narrow_literal = "bit diagnostic_flag = 1'b0;\n" + self.codec_text()
+        try:
+            validate_codec(narrow_literal, canonical)
+        except CHECKER.ValidationError as error:
+            self.fail(f"narrow non-error literal was rejected: {error}")
+
+    def test_codec_raw_scan_ignores_wide_zero_extension_literals(self) -> None:
+        validate_codec = self.require_checker_attribute(
+            "validate_error_codec"
+        )
+        canonical = self.canonical_fixture()
+        extension = (
+            "logic [31:0] diagnostic = {24'h0, 8'h42};\n"
+            + self.codec_text()
+        )
+        try:
+            validate_codec(extension, canonical)
+        except CHECKER.ValidationError as error:
+            self.fail(f"wide zero-extension literal was rejected: {error}")
+
+    def test_sv_error_constant_cannot_be_forged_inside_string(self) -> None:
+        declaration = (
+            "localparam bit [7:0] XTR_V1_ECODE_EC_FIRST = 8'h02;"
+        )
+        forged = self.sv_text().replace(
+            declaration,
+            f'string forged = "{declaration}";',
+        )
+        with self.assertRaisesRegex(
+            CHECKER.ValidationError, "missing SV error code constant"
+        ):
+            self.validate_fixture(sv_text=forged)
 
     def test_codec_requires_cmq_profile_symbol_for_zero_cases(self) -> None:
         validate_codec = self.require_checker_attribute(

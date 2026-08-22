@@ -924,8 +924,35 @@ def strip_sv_comments(text: str) -> str:
     return "".join(result)
 
 
+def mask_sv_strings(text: str) -> str:
+    """Blank quoted SV strings while preserving source positions and lines."""
+    result: list[str] = []
+    index = 0
+    in_string = False
+    while index < len(text):
+        char = text[index]
+        if not in_string:
+            if char == '"':
+                result.append(" ")
+                in_string = True
+            else:
+                result.append(char)
+            index += 1
+            continue
+
+        result.append(char if char in "\r\n" else " ")
+        index += 1
+        if char == "\\" and index < len(text):
+            escaped = text[index]
+            result.append(escaped if escaped in "\r\n" else " ")
+            index += 1
+        elif char == '"':
+            in_string = False
+    return "".join(result)
+
+
 def parse_sv_constants(text: str) -> dict[str, int]:
-    text = strip_sv_comments(text)
+    text = mask_sv_strings(strip_sv_comments(text))
     constants: dict[str, int] = {}
 
     def add(name: str, value: int) -> None:
@@ -1279,7 +1306,7 @@ def validate_error_code_mappings(
     sv_text: str,
 ) -> dict[tuple[str, str], int]:
     """Check identity completeness and independently derived SV code values."""
-    sv_text = strip_sv_comments(sv_text)
+    sv_text = mask_sv_strings(strip_sv_comments(sv_text))
     identities = [(mapping.path, mapping.c_symbol) for mapping in mappings]
     if len(identities) != len(set(identities)):
         raise ValidationError("duplicate error code source identity")
@@ -1397,22 +1424,54 @@ def validate_error_codec(
 ) -> None:
     """Bind codec literals and symbolic lookup to validated source identities."""
     codec_text = strip_sv_comments(codec_text)
+    codec_code = mask_sv_strings(codec_text)
     known_values = set(canonical)
     for literal in re.finditer(
-        r"\b8\s*'\s*[sS]?\s*([hHdDbBoO])\s*([0-9a-fA-F_]+)",
-        codec_text,
+        r"\b(\d+)\s*'\s*[sS]?\s*([hHdDbBoO])\s*([0-9a-fA-F_]+)",
+        codec_code,
     ):
+        width = int(literal.group(1))
+        if width != 8:
+            continue
         base = {"h": 16, "d": 10, "b": 2, "o": 8}[
-            literal.group(1).lower()
+            literal.group(2).lower()
         ]
         try:
-            value = int(literal.group(2).replace("_", ""), base)
+            value = int(literal.group(3).replace("_", ""), base)
         except ValueError:
             continue
+        value &= (1 << width) - 1
         if value in known_values:
             raise ValidationError(
                 f"raw literal {literal.group(0)} used for known error code"
             )
+    wide_literal = (
+        r"(?P<literal>(?P<width>\d+)\s*'\s*[sS]?\s*"
+        r"(?P<base>[hHdDbBoO])\s*(?P<digits>[0-9a-fA-F_]+))"
+    )
+    for comparison_pattern in (
+        rf"\bhardware_code\s*==\s*{wide_literal}",
+        rf"{wide_literal}\s*==\s*\bhardware_code",
+    ):
+        for comparison in re.finditer(comparison_pattern, codec_code):
+            width = int(comparison.group("width"))
+            if width <= 8:
+                continue
+            base = {"h": 16, "d": 10, "b": 2, "o": 8}[
+                comparison.group("base").lower()
+            ]
+            try:
+                value = int(
+                    comparison.group("digits").replace("_", ""), base
+                )
+            except ValueError:
+                continue
+            value &= (1 << width) - 1
+            if value in known_values:
+                raise ValidationError(
+                    f"raw literal {comparison.group('literal')} used for "
+                    "known error code"
+                )
 
     allowed_names = {
         mapping.sv_name
@@ -1424,17 +1483,37 @@ def validate_error_codec(
         function = re.search(
             rf"\blocal\s+function\b[^;]*\b{function_name}\s*\([^;]*\)\s*;"
             r"(.*?)\bendfunction\b",
-            codec_text,
+            codec_code,
             re.S,
         )
         if function is None:
             raise ValidationError(
                 f"hardware error function missing: {function_name}"
             )
+        if function_name == "classify":
+            whole_case = re.fullmatch(
+                r"\s*case\s*\(\s*hardware_code\s*\)(.*?)"
+                r"\bendcase\b\s*",
+                function.group(1),
+                re.S,
+            )
+            if whole_case is None:
+                raise ValidationError("invalid classify function body")
+            case_body = whole_case.group(1)
+        else:
+            case_body_match = re.search(
+                r"\bcase\s*\(\s*hardware_code\s*\)(.*?)\bendcase\b",
+                function.group(1),
+                re.S,
+            )
+            if case_body_match is None:
+                raise ValidationError(
+                    f"hardware error case missing default: {function_name}"
+                )
+            case_body = case_body_match.group(1)
         explicit_case = re.search(
-            r"\bcase\s*\(\s*hardware_code\s*\)(.*?)"
-            r"^[ \t]*default[ \t]*:",
-            function.group(1),
+            r"(.*?)^[ \t]*default[ \t]*:",
+            case_body,
             re.S | re.M,
         )
         if explicit_case is None:
@@ -1467,19 +1546,25 @@ def validate_error_codec(
     symbolic_function = re.search(
         r"\blocal\s+function\s+string\s+symbolic_name\s*\([^)]*\)\s*;"
         r"(.*?)\bendfunction\b",
-        codec_text,
+        codec_code,
         re.S,
     )
     if symbolic_function is None:
         raise ValidationError("symbolic error code lookup function missing")
-    case_block = re.search(
-        r"\bcase\s*\(\s*hardware_code\s*\)(.*?)\bendcase\b",
-        symbolic_function.group(1),
+    symbolic_body = codec_text[
+        symbolic_function.start(1):symbolic_function.end(1)
+    ]
+    symbolic_code_body = codec_code[
+        symbolic_function.start(1):symbolic_function.end(1)
+    ]
+    case_block = re.fullmatch(
+        r"\s*case\s*\(\s*hardware_code\s*\)(.*?)\bendcase\b\s*",
+        symbolic_code_body,
         re.S,
     )
     if case_block is None:
-        raise ValidationError("symbolic error code lookup case missing")
-    case_body = case_block.group(1)
+        raise ValidationError("symbolic error code lookup function body differs")
+    case_body = symbolic_body[case_block.start(1):case_block.end(1)]
     defaults = list(
         re.finditer(r"^[ \t]*default[ \t]*:", case_body, re.M)
     )
@@ -1530,7 +1615,7 @@ def validate_error_codec(
             "symbolic error code lookup differs from canonical source mapping"
         )
 
-    used_names = set(re.findall(r"\bXTR_V1_ECODE_[A-Za-z0-9_]+\b", codec_text))
+    used_names = set(re.findall(r"\bXTR_V1_ECODE_[A-Za-z0-9_]+\b", codec_code))
     unknown_names = sorted(used_names - allowed_names)
     if unknown_names:
         raise ValidationError(
