@@ -1742,6 +1742,7 @@ class rdma_cmq_engine extends uvm_object;
     bit saved_vfid_override;
     bit [10:0] saved_use_vfid;
     time saved_timeout;
+    bit root_source_changed_during_clone;
 
     snapshot = null;
     staging_invariant_failed = 1'b0;
@@ -1783,41 +1784,43 @@ class rdma_cmq_engine extends uvm_object;
         return status;
     end
 
+    source.function_h = null;
+    source.opcode_key = null;
+    source.body = null;
+    source.qpc_signature_source = null;
     cloned_object = source.clone();
+    root_source_changed_during_clone =
+      source.function_h != null || source.opcode_key != null ||
+      source.body != null || source.qpc_signature_source != null ||
+      source.vfid_override != saved_vfid_override ||
+      source.use_vfid != saved_use_vfid || source.timeout != saved_timeout;
+    source.function_h = saved_function_source;
+    source.opcode_key = saved_opcode_source;
+    source.body = saved_body_source;
+    source.qpc_signature_source = saved_signature_source;
+    source.vfid_override = saved_vfid_override;
+    source.use_vfid = saved_use_vfid;
+    source.timeout = saved_timeout;
     if (cloned_object == null || !$cast(cloned_command, cloned_object) ||
         cloned_command == source ||
         cloned_command.get_type_name() != source_type_name) begin
       return invalid_argument("CMQ command snapshot clone contract failed");
     end
-    if (source.function_h != saved_function_source ||
-        source.opcode_key != saved_opcode_source ||
-        source.body != saved_body_source ||
-        source.qpc_signature_source != saved_signature_source ||
-        source.vfid_override != saved_vfid_override ||
-        source.use_vfid != saved_use_vfid ||
-        source.timeout != saved_timeout ||
+    if (root_source_changed_during_clone ||
+        cloned_command.function_h != null ||
+        cloned_command.opcode_key != null ||
+        cloned_command.body != null ||
+        cloned_command.qpc_signature_source != null ||
         cloned_command.vfid_override != saved_vfid_override ||
         cloned_command.use_vfid != saved_use_vfid ||
         cloned_command.timeout != saved_timeout ||
         !same_handle(source.function_h, function_snapshot) ||
-        !same_handle(cloned_command.function_h, function_snapshot) ||
-        cloned_command.function_h == source.function_h ||
         !same_opcode_value(source.opcode_key, opcode_snapshot) ||
-        !same_opcode_value(cloned_command.opcode_key, opcode_snapshot) ||
-        cloned_command.opcode_key == source.opcode_key ||
-        !same_body_value(cloned_command.body, body_snapshot) ||
-        !body_graph_detached(source.body, cloned_command.body) ||
         ((source.qpc_signature_source == null) !=
-         (signature_snapshot == null)) ||
-        ((cloned_command.qpc_signature_source == null) !=
          (signature_snapshot == null)) ||
         (signature_snapshot != null &&
          (!same_image_value(source.qpc_signature_source,
-                            signature_snapshot) ||
-          !same_image_value(cloned_command.qpc_signature_source,
-                            signature_snapshot) ||
-          cloned_command.qpc_signature_source ==
-            source.qpc_signature_source))) begin
+                            signature_snapshot)))) begin
       return invalid_argument("CMQ command snapshot changed its source value");
     end
 
