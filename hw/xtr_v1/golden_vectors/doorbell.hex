@@ -5,13 +5,73 @@
 00 00 00 3b 00 00 00 00
 
 # xtr_v1-golden-v1
+# case: sq
+# inputs: offset=0x100
+# bytes: 8
+cb c5 67 bd a6 a1 55 55
+
+# xtr_v1-golden-v1
 # case: rq
 # inputs: qpn=0x15555,icos=5,pi=0x4567,wrap=1,offset=0x10
 # bytes: 8
 00 00 c5 67 00 a1 55 55
 
 # xtr_v1-golden-v1
-# case: cq
-# inputs: cqn=0x15555,host=5,ci=0x654321,wrap=1,arm=1,arm_state=2,arm_sn=3,offset=0x18
+# case: srq_pi
+# inputs: srqn=0xa55a,pi=0x4567,wrap=1,limit_invalid=1,offset=0x40
+# bytes: 8
+40 00 c5 67 00 00 a5 5a
+
+# xtr_v1-golden-v1
+# case: srq_limit
+# inputs: srqn=0xa55a,limit=0x2aaa,arm_sn=3,pi_invalid=1,offset=0x40
+# bytes: 8
+80 00 00 00 aa ab a5 5a
+
+# xtr_v1-golden-v1
+# case: cq_rc_ud
+# inputs: cqn=0x15555,host=5,ci=0x654321,wrap=1,arm=1,arm_state=2,arm_sn=3,urc=0,offset=0x18
 # bytes: 8
 2b 00 e5 43 21 a1 55 55
+
+# xtr_v1-golden-v1
+# case: cq_urc
+# inputs: cqn=0x12345,host=3,sq_ci=0x4567,sq_wrap=1,rq_ci=0x2345,rq_wrap=0,arm=1,arm_state=1,arm_sn=2,urc=1,offset=0x18
+# bytes: 8
+36 c5 67 23 45 61 23 45
+
+# xtr_v1-golden-v1
+# case: ceq
+# inputs: ceqn=0x2aaaaa,ci=0x2aaaa,wrap=1,offset=0x20
+# bytes: 8
+00 06 aa aa 00 2a aa aa
+
+# xtr_v1-golden-v1
+# case: aeq
+# inputs: aeqn=0xaaa,ci=0x15555,wrap=1,offset=0x28
+# bytes: 8
+00 05 55 55 00 00 0a aa
+
+# xtr_v1-golden-v1
+# case: rts2sqd
+# inputs: qpn=0x15555,dst_port=11,qp_sn=0xa6,icos=5,db_type=0xd,offset=0x48
+# bytes: 8
+00 0b a6 d0 00 a1 55 55
+
+# xtr_v1-golden-v1
+# case: sqd2rts
+# inputs: qpn=0x15555,dst_port=11,qp_sn=0xa6,icos=5,db_type=0xe,offset=0x50
+# bytes: 8
+00 0b a6 e0 00 a1 55 55
+
+# xtr_v1-golden-v1
+# case: qp_flush
+# inputs: qpn=0x15555,dst_port=11,qp_sn=0xa6,icos=0,db_type=0xa,offset=0x58
+# bytes: 8
+00 0b a6 a0 00 01 55 55
+
+# xtr_v1-golden-v1
+# case: tx_flush
+# inputs: qpn=0x2aaaa,dst_port=15,qp_sn=0x0,icos=0,db_type=0xb,offset=0x8
+# bytes: 8
+00 0f 00 b0 00 02 aa aa

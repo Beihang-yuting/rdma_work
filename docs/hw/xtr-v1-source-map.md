@@ -44,8 +44,18 @@ is fatal and is never evaluated as Python or C.
 | CEQE `ceqe_error` | 16 | big-endian per 64-bit qword | `defs.h` `XTRDMA_CEQE_*`; event placement from `event.c` | `queue.hex`: case 20, inputs 21, length 22, payload 23; `qpn=0x15555,cqn=0x1aaaaa,ecode=0xf4,pi=0xbeef,valid=1,packet_opcode=0x9a,wrap=1` |
 | AEQE `aeqe_error` | 16 | big-endian per 64-bit qword | `defs.h` `XTRDMA_AEQE_*`; event placement from `event.c` | `queue.hex`: case 26, inputs 27, length 28, payload 29; `qpn=0x2aaaa,state=5,ecode=0xff,index=0x654321,valid=1,packet_opcode=0x81,wrap=1` |
 | CMQ SQ doorbell `cmq_sq` | 8 | big-endian 64-bit payload | `cmq.h` `XTRDMA_CMQSQ_DB_*`; register offset from `xtrdma_hw.h` | `doorbell.hex`: case 2, inputs 3, length 4, payload 5; `pi=27,polarity=1,offset=0x0` |
-| RQ doorbell `rq` | 8 | big-endian 64-bit payload | `wr.h` `XTRDMA_NOTIFY_*`; register offset from `xtrdma_hw.h` | `doorbell.hex`: case 8, inputs 9, length 10, payload 11; `qpn=0x15555,icos=5,pi=0x4567,wrap=1,offset=0x10` |
-| CQ doorbell `cq` | 8 | big-endian 64-bit payload | `cq.h` `XTRDMA_NOTIFY_CQ_*`; register offset from `xtrdma_hw.h` | `doorbell.hex`: case 14, inputs 15, length 16, payload 17; `cqn=0x15555,host=5,ci=0x654321,wrap=1,arm=1,arm_state=2,arm_sn=3,offset=0x18` |
+| SQ doorbell `sq` | 8 | exact big-endian qword from encoded SQE | `wr.h` `XTRDMA_SQ_WQE_*`; register offset from `xtrdma_hw.h` | `doorbell.hex`: case 8; byte-for-byte equal to `sqe_rc_boundary[0:8]`; `offset=0x100` |
+| RQ doorbell `rq` | 8 | big-endian 64-bit payload | `wr.h` `XTRDMA_NOTIFY_*`; register offset from `xtrdma_hw.h` | `doorbell.hex`: case 14; `qpn=0x15555,icos=5,pi=0x4567,wrap=1,offset=0x10` |
+| SRQ PI doorbell `srq_pi` | 8 | big-endian 64-bit payload | `wr.h` `XTRDMA_NOTIFY_SRFQ_*`, `XTRDMA_SRFQ_LIMIT_INVLD` | `doorbell.hex`: case 20; `srqn=0xa55a,pi=0x4567,wrap=1,limit_invalid=1,offset=0x40` |
+| SRQ limit doorbell `srq_limit` | 8 | big-endian 64-bit payload | `defs.h` `XTRDMA_SRFQ_PI_INVLD`, `XTRDMA_SRFQ_LIMIT_TH`, `XTRDMA_SRFQ_ARM_SN` | `doorbell.hex`: case 26; `srqn=0xa55a,limit=0x2aaa,arm_sn=3,pi_invalid=1,offset=0x40` |
+| RC/UD CQ doorbell `cq_rc_ud` | 8 | big-endian 64-bit payload | `cq.h` `XTRDMA_NOTIFY_CQ_*` RC fields | `doorbell.hex`: case 32; `cqn=0x15555,host=5,ci=0x654321,wrap=1,arm=1,arm_state=2,arm_sn=3,urc=0,offset=0x18` |
+| URC CQ doorbell `cq_urc` | 8 | big-endian 64-bit payload | `cq.h` `XTRDMA_NOTIFY_CQ_*` URC fields | `doorbell.hex`: case 38; `cqn=0x12345,host=3,sq_ci=0x4567,sq_wrap=1,rq_ci=0x2345,rq_wrap=0,arm=1,arm_state=1,arm_sn=2,urc=1,offset=0x18` |
+| CEQ doorbell `ceq` | 8 | big-endian 64-bit payload | `defs.h` `XTRDMA_NOTIFY_CEQ_*` | `doorbell.hex`: case 44; `ceqn=0x2aaaaa,ci=0x2aaaa,wrap=1,offset=0x20` |
+| AEQ doorbell `aeq` | 8 | big-endian 64-bit payload | `defs.h` `XTRDMA_NOTIFY_AEQ_*` | `doorbell.hex`: case 50; `aeqn=0xaaa,ci=0x15555,wrap=1,offset=0x28` |
+| QP transition doorbell `rts2sqd` | 8 | big-endian 64-bit payload | `qp.h` shared QP-control layout and `XTRDMA_DB_RTS2SQD` | `doorbell.hex`: case 56; `qpn=0x15555,dst_port=11,qp_sn=0xa6,icos=5,db_type=0xd,offset=0x48` |
+| QP transition doorbell `sqd2rts` | 8 | big-endian 64-bit payload | `qp.h` shared QP-control layout and `XTRDMA_DB_SQD2RTS` | `doorbell.hex`: case 62; `qpn=0x15555,dst_port=11,qp_sn=0xa6,icos=5,db_type=0xe,offset=0x50` |
+| QP flush doorbell `qp_flush` | 8 | big-endian 64-bit payload | `qp.h` shared QP-control layout and `XTRDMA_DB_QP_FLUSH` | `doorbell.hex`: case 68; `qpn=0x15555,dst_port=11,qp_sn=0xa6,icos=0,db_type=0xa,offset=0x58` |
+| TX flush doorbell `tx_flush` | 8 | big-endian 64-bit payload | `qp.h` shared QP-control layout, `XTRDMA_DB_TX_FLUSH`; `eth_header/register.h` `QSCH_G2P_DPORT_NODE_MODE` | `doorbell.hex`: case 74; `qpn=0x2aaaa,dst_port=15,qp_sn=0,icos=0,db_type=0xb,offset=0x8` |
 
 The `.hex` grammar is stable: marker, case, inputs, byte count, then one
 space-separated lowercase hex byte line.  Multiple cases are separated by one
@@ -149,6 +159,10 @@ KEY_ALLOC `0x04`, OCC_FLUSH `0x0a`, CEQC delete/query `0x12/0x13`, AEQC
 delete/query `0x16/0x17`, and TQ_FLUSH `0x20`. CMQ completion coordinates are
 kept separate from request-body coordinates.
 
+`XTRDMA_OP_TQ_FLUSH (0x20)` is exclusively a CMQ command. It is not the
+notify-window write at relative offset `0x008`; that MMIO register carries the
+distinct TX-flush doorbell with codec-owned type `XTRDMA_DB_TX_FLUSH (0xB)`.
+
 The context value baseline also freezes allocation modes direct/indirect/huge/
 L3-indirect as `0/1/2/3`; MR VA/zero-based addressing as `0/1`; MR
 invalid/free/valid as `0/1/2`; 4KiB/2MiB/1GiB pages and PBL0/PBL1/PBL2 as
@@ -192,6 +206,8 @@ also freezes the rule that remote-write or remote-atomic implies local-write.
 - `eth_header/rdma_register.h` pins `RDMA_HID_MAP_TABLE` and
   `RDMA_RPE_VFT_TABLE` provenance for later Function-table work; Task 9 does
   not infer their C bitfield layout from compiler-dependent struct packing.
+- `eth_header/register.h` independently pins the TX-flush fixed destination
+  port `QSCH_G2P_DPORT_NODE_MODE=15`.
 - `alloc.h`, `mr.h`, `mr.c`, and `rdma_main.h` pin object mode, MR/PBL layout,
   the ordinary MR KEY_ALLOC projection, and access-right normalization.
 - `srq.h`/`srq.c` and `event.h`/`event.c` pin the SRQC and EQC local layouts and

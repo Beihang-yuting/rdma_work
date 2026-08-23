@@ -30,6 +30,7 @@ SOURCE_HASHES = {
     "wr.h": "c75fb5770ef0ea1af404efbaf95cf79356d1096d331d7cdfcc46ea9ad9b3225b",
     "defs.h": "79e26543d2b9c0942be2819cd505f50118b6cd005a2c8d237dbf8a690963b9ae",
     "eth_header/rdma_register.h": "af957673ba0b561cd27d4bd22394cc0bc56a0173bff66c59176a5a829e0acc13",
+    "eth_header/register.h": "061071cab4008cee1fa837b9aa71c068215c98cb5665ef5f4b038a24da09c734",
     "xtrdma_hw.h": "a917b3080d601bcf62d595383ab6c663c19c2a05c7a1854f481800c97dddc9cb",
     "map.h": "9b532a140458c3f9592b8a1d7531500e820f8f7b1650bf6fd7f41aa1d214c75d",
     "qp.c": "90e91142fbfbd009feda08b1137ef2c584e8da1054f83d6250c1f67cce1a165a",
@@ -53,6 +54,7 @@ REQUIRED_MANIFEST_ROWS = {
     ("wr.h", "XTRDMA_SQ_WQE_*|XTRDMA_RQE_*|XTRDMA_CQE_*"),
     ("defs.h", "XTRDMA_CEQE_*|XTRDMA_AEQE_*|EC_*"),
     ("eth_header/rdma_register.h", "RDMA_HID_MAP_TABLE|RDMA_RPE_VFT_TABLE"),
+    ("eth_header/register.h", "QSCH_G2P_DPORT_NODE_MODE"),
     ("alloc.h", "xtrdma_alloc_type"),
     ("mr.h", "MR/PBL/page/address-enums|xtrdma_reg_mr_info"),
     ("mr.c", "xtrdma_hwreg_mr"),
@@ -658,11 +660,22 @@ FIELD_MAPPINGS = (
     FieldMapping("wr.h", "XTRDMA_NOTIFY_SRFQ_WRAP", "XTR_V1_NOTIFY_SRFQ_WRAP", 0),
     FieldMapping("wr.h", "XTRDMA_NOTIFY_SRFQ_PI", "XTR_V1_NOTIFY_SRFQ_PI", 0),
     FieldMapping("wr.h", "XTRDMA_NOTIFY_SRFQN", "XTR_V1_NOTIFY_SRFQN", 0),
+    FieldMapping("wr.h", "XTRDMA_SRFQ_LIMIT_INVLD", "XTR_V1_NOTIFY_SRQ_LIMIT_INVALID", 0),
+    FieldMapping("defs.h", "XTRDMA_SRFQ_PI_INVLD", "XTR_V1_NOTIFY_SRQ_PI_INVALID", 0),
+    FieldMapping("defs.h", "XTRDMA_SRFQ_LIMIT_TH", "XTR_V1_NOTIFY_SRQ_LIMIT", 0),
+    FieldMapping("defs.h", "XTRDMA_SRFQ_ARM_SN", "XTR_V1_NOTIFY_SRQ_ARM_SN", 0),
+    FieldMapping("cq.h", "XTRDMA_NOTIFY_CQ_DB_CI_INVLD", "XTR_V1_NOTIFY_CQ_CI_INVALID", 0),
+    FieldMapping("cq.h", "XTRDMA_NOTIFY_CQ_DB_ARM_INVLD", "XTR_V1_NOTIFY_CQ_ARM_INVALID", 0),
     FieldMapping("cq.h", "XTRDMA_NOTIFY_CQ_DB_ARM_DB_FLAG", "XTR_V1_NOTIFY_CQ_ARM", 0),
+    FieldMapping("cq.h", "XTRDMA_NOTIFY_CQ_DB_URC_FLAG", "XTR_V1_NOTIFY_CQ_URC", 0),
     FieldMapping("cq.h", "XTRDMA_NOTIFY_CQ_DB_ARM_ST", "XTR_V1_NOTIFY_CQ_ARM_ST", 0),
     FieldMapping("cq.h", "XTRDMA_NOTIFY_CQ_DB_ARM_SN", "XTR_V1_NOTIFY_CQ_ARM_SN", 0),
     FieldMapping("cq.h", "XTRDMA_NOTIFY_CQ_DB_RC_CI_WRAP", "XTR_V1_NOTIFY_CQ_CI_WRAP", 0),
     FieldMapping("cq.h", "XTRDMA_NOTIFY_CQ_DB_RC_CI", "XTR_V1_NOTIFY_CQ_CI", 0),
+    FieldMapping("cq.h", "XTRDMA_NOTIFY_CQ_DB_URC_SW_CPL_SQ_WQE_WRAP", "XTR_V1_NOTIFY_CQ_URC_SQ_WRAP", 0),
+    FieldMapping("cq.h", "XTRDMA_NOTIFY_CQ_DB_URC_SW_CPL_SQ_WQE_IDX", "XTR_V1_NOTIFY_CQ_URC_SQ_CI", 0),
+    FieldMapping("cq.h", "XTRDMA_NOTIFY_CQ_DB_URC_SW_CPL_RQ_WQE_WRAP", "XTR_V1_NOTIFY_CQ_URC_RQ_WRAP", 0),
+    FieldMapping("cq.h", "XTRDMA_NOTIFY_CQ_DB_URC_SW_CPL_RQ_WQE_IDX", "XTR_V1_NOTIFY_CQ_URC_RQ_CI", 0),
     FieldMapping("cq.h", "XTRDMA_NOTIFY_CQ_HOST_ID", "XTR_V1_NOTIFY_CQ_HOST_ID", 0),
     FieldMapping("cq.h", "XTRDMA_NOTIFY_CQ_DB_CQN", "XTR_V1_NOTIFY_CQ_CQN", 0),
     FieldMapping("defs.h", "XTRDMA_NOTIFY_CEQ_CI_WRAP", "XTR_V1_NOTIFY_CEQ_CI_WRAP", 0),
@@ -671,6 +684,11 @@ FIELD_MAPPINGS = (
     FieldMapping("defs.h", "XTRDMA_NOTIFY_AEQ_CI_WRAP", "XTR_V1_NOTIFY_AEQ_CI_WRAP", 0),
     FieldMapping("defs.h", "XTRDMA_NOTIFY_AEQ_CI", "XTR_V1_NOTIFY_AEQ_CI", 0),
     FieldMapping("defs.h", "XTRDMA_NOTIFY_AEQ_AEQN", "XTR_V1_NOTIFY_AEQ_AEQN", 0),
+    FieldMapping("qp.h", "XTRDMA_DST_PORT", "XTR_V1_NOTIFY_QP_DST_PORT", 0),
+    FieldMapping("qp.h", "XTRDMA_QP_SN", "XTR_V1_NOTIFY_QP_SN", 0),
+    FieldMapping("qp.h", "XTRDMA_DB_TYPE", "XTR_V1_NOTIFY_QP_DB_TYPE", 0),
+    FieldMapping("qp.h", "XTRDMA_ICOS", "XTR_V1_NOTIFY_QP_ICOS", 0),
+    FieldMapping("qp.h", "XTRDMA_QPN", "XTR_V1_NOTIFY_QP_QPN", 0),
 )
 
 
@@ -744,6 +762,13 @@ VALUE_MAPPINGS = (
     ValueMapping("xtrdma_hw.h", "XTRDMA_PF_NTFE_SQD2RTS_DB", "XTR_V1_DB_SQD2RTS_OFFSET", "XTRDMA_PF_NTFE_BAR_OFFSET"),
     ValueMapping("xtrdma_hw.h", "XTRDMA_PF_NTFE_FLUSH_QP_DB", "XTR_V1_DB_QP_FLUSH_OFFSET", "XTRDMA_PF_NTFE_BAR_OFFSET"),
     ValueMapping("xtrdma_hw.h", "XTRDMA_PF_NTFE_FLUSH_TX_DB", "XTR_V1_DB_TX_FLUSH_OFFSET", "XTRDMA_PF_NTFE_BAR_OFFSET"),
+    ValueMapping("wr.h", "XTRDMA_SRFQ_LIMIT_INVLD_VAL", "XTR_V1_NOTIFY_SRQ_LIMIT_INVALID_VALUE"),
+    ValueMapping("srq.h", "XTRDMA_SRFQ_DB_INVLD", "XTR_V1_NOTIFY_SRQ_PI_INVALID_VALUE"),
+    ValueMapping("qp.h", "XTRDMA_DB_QP_FLUSH", "XTR_V1_DB_TYPE_QP_FLUSH"),
+    ValueMapping("qp.h", "XTRDMA_DB_TX_FLUSH", "XTR_V1_DB_TYPE_TX_FLUSH"),
+    ValueMapping("qp.h", "XTRDMA_DB_RTS2SQD", "XTR_V1_DB_TYPE_RTS2SQD"),
+    ValueMapping("qp.h", "XTRDMA_DB_SQD2RTS", "XTR_V1_DB_TYPE_SQD2RTS"),
+    ValueMapping("eth_header/register.h", "QSCH_G2P_DPORT_NODE_MODE", "XTR_V1_TX_FLUSH_DST_PORT"),
     # Explicit enum values needed by the next CMQ/error-code codecs.
     ValueMapping("cmq.h", "XTRDMA_OP_QPC_CREATE", "XTR_V1_OP_QPC_CREATE"),
     ValueMapping("cmq.h", "XTRDMA_OP_QPC_MODIFY", "XTR_V1_OP_QPC_MODIFY"),
@@ -2019,6 +2044,13 @@ REFERENCE_FIELDS = (
     ReferenceField("wr.h", "XTRDMA_NOTIFY_ICOS", "XTR_V1_NOTIFY_RQ_ICOS", 0, 21, 3),
     ReferenceField("wr.h", "XTRDMA_NOTIFY_PI", "XTR_V1_NOTIFY_RQ_PI", 0, 32, 15),
     ReferenceField("wr.h", "XTRDMA_NOTIFY_PI_WRAP", "XTR_V1_NOTIFY_RQ_PI_WRAP", 0, 47, 1),
+    ReferenceField("wr.h", "XTRDMA_NOTIFY_SRFQ_WRAP", "XTR_V1_NOTIFY_SRFQ_WRAP", 0, 47, 1),
+    ReferenceField("wr.h", "XTRDMA_NOTIFY_SRFQ_PI", "XTR_V1_NOTIFY_SRFQ_PI", 0, 32, 15),
+    ReferenceField("wr.h", "XTRDMA_NOTIFY_SRFQN", "XTR_V1_NOTIFY_SRFQN", 0, 0, 16),
+    ReferenceField("wr.h", "XTRDMA_SRFQ_LIMIT_INVLD", "XTR_V1_NOTIFY_SRQ_LIMIT_INVALID", 0, 62, 1),
+    ReferenceField("defs.h", "XTRDMA_SRFQ_PI_INVLD", "XTR_V1_NOTIFY_SRQ_PI_INVALID", 0, 63, 1),
+    ReferenceField("defs.h", "XTRDMA_SRFQ_LIMIT_TH", "XTR_V1_NOTIFY_SRQ_LIMIT", 0, 18, 14),
+    ReferenceField("defs.h", "XTRDMA_SRFQ_ARM_SN", "XTR_V1_NOTIFY_SRQ_ARM_SN", 0, 16, 2),
     ReferenceField("cq.h", "XTRDMA_NOTIFY_CQ_DB_CQN", "XTR_V1_NOTIFY_CQ_CQN", 0, 0, 21),
     ReferenceField("cq.h", "XTRDMA_NOTIFY_CQ_HOST_ID", "XTR_V1_NOTIFY_CQ_HOST_ID", 0, 21, 3),
     ReferenceField("cq.h", "XTRDMA_NOTIFY_CQ_DB_RC_CI", "XTR_V1_NOTIFY_CQ_CI", 0, 24, 23),
@@ -2026,6 +2058,24 @@ REFERENCE_FIELDS = (
     ReferenceField("cq.h", "XTRDMA_NOTIFY_CQ_DB_ARM_DB_FLAG", "XTR_V1_NOTIFY_CQ_ARM", 0, 61, 1),
     ReferenceField("cq.h", "XTRDMA_NOTIFY_CQ_DB_ARM_ST", "XTR_V1_NOTIFY_CQ_ARM_ST", 0, 58, 2),
     ReferenceField("cq.h", "XTRDMA_NOTIFY_CQ_DB_ARM_SN", "XTR_V1_NOTIFY_CQ_ARM_SN", 0, 56, 2),
+    ReferenceField("cq.h", "XTRDMA_NOTIFY_CQ_DB_CI_INVLD", "XTR_V1_NOTIFY_CQ_CI_INVALID", 0, 63, 1),
+    ReferenceField("cq.h", "XTRDMA_NOTIFY_CQ_DB_ARM_INVLD", "XTR_V1_NOTIFY_CQ_ARM_INVALID", 0, 62, 1),
+    ReferenceField("cq.h", "XTRDMA_NOTIFY_CQ_DB_URC_FLAG", "XTR_V1_NOTIFY_CQ_URC", 0, 60, 1),
+    ReferenceField("cq.h", "XTRDMA_NOTIFY_CQ_DB_URC_SW_CPL_SQ_WQE_WRAP", "XTR_V1_NOTIFY_CQ_URC_SQ_WRAP", 0, 55, 1),
+    ReferenceField("cq.h", "XTRDMA_NOTIFY_CQ_DB_URC_SW_CPL_SQ_WQE_IDX", "XTR_V1_NOTIFY_CQ_URC_SQ_CI", 0, 40, 15),
+    ReferenceField("cq.h", "XTRDMA_NOTIFY_CQ_DB_URC_SW_CPL_RQ_WQE_WRAP", "XTR_V1_NOTIFY_CQ_URC_RQ_WRAP", 0, 39, 1),
+    ReferenceField("cq.h", "XTRDMA_NOTIFY_CQ_DB_URC_SW_CPL_RQ_WQE_IDX", "XTR_V1_NOTIFY_CQ_URC_RQ_CI", 0, 24, 15),
+    ReferenceField("defs.h", "XTRDMA_NOTIFY_CEQ_CI_WRAP", "XTR_V1_NOTIFY_CEQ_CI_WRAP", 0, 50, 1),
+    ReferenceField("defs.h", "XTRDMA_NOTIFY_CEQ_CI", "XTR_V1_NOTIFY_CEQ_CI", 0, 32, 18),
+    ReferenceField("defs.h", "XTRDMA_NOTIFY_CEQ_CEQN", "XTR_V1_NOTIFY_CEQ_CEQN", 0, 0, 22),
+    ReferenceField("defs.h", "XTRDMA_NOTIFY_AEQ_CI_WRAP", "XTR_V1_NOTIFY_AEQ_CI_WRAP", 0, 50, 1),
+    ReferenceField("defs.h", "XTRDMA_NOTIFY_AEQ_CI", "XTR_V1_NOTIFY_AEQ_CI", 0, 32, 18),
+    ReferenceField("defs.h", "XTRDMA_NOTIFY_AEQ_AEQN", "XTR_V1_NOTIFY_AEQ_AEQN", 0, 0, 12),
+    ReferenceField("qp.h", "XTRDMA_DST_PORT", "XTR_V1_NOTIFY_QP_DST_PORT", 0, 48, 4),
+    ReferenceField("qp.h", "XTRDMA_QP_SN", "XTR_V1_NOTIFY_QP_SN", 0, 40, 8),
+    ReferenceField("qp.h", "XTRDMA_DB_TYPE", "XTR_V1_NOTIFY_QP_DB_TYPE", 0, 36, 4),
+    ReferenceField("qp.h", "XTRDMA_ICOS", "XTR_V1_NOTIFY_QP_ICOS", 0, 21, 3),
+    ReferenceField("qp.h", "XTRDMA_QPN", "XTR_V1_NOTIFY_QP_QPN", 0, 0, 21),
     # Extended QPC placements used by the three transport boundary cases.
     ReferenceField("qp.h", "XTRDMA_QPC_UD_QKEY_L", "XTR_V1_QPC_UD_QKEY_L", 8, 40, 24),
     ReferenceField("qp.h", "XTRDMA_QPC_URC_RSQ_PBA_H", "XTR_V1_QPC_URC_RSQ_PBA_H", 0, 0, 4),
@@ -2759,6 +2809,9 @@ def build_golden_cases() -> dict[str, list[GoldenCase]]:
         ("XTR_V1_CMQ_DB_POLARITY", 1, "polarity=1"),
         ("", 0, "offset=0x0"),
     ))
+    sq_db = GoldenCase(
+        "sq", parse_input_summary("offset=0x100"), sqe.payload[:8]
+    )
     rq_db = make_case("rq", 8, (
         ("XTR_V1_NOTIFY_RQ_QPN", 0x15555, "qpn=0x15555"),
         ("XTR_V1_NOTIFY_RQ_ICOS", 5, "icos=5"),
@@ -2766,7 +2819,21 @@ def build_golden_cases() -> dict[str, list[GoldenCase]]:
         ("XTR_V1_NOTIFY_RQ_PI_WRAP", 1, "wrap=1"),
         ("", 0, "offset=0x10"),
     ))
-    cq_db = make_case("cq", 8, (
+    srq_pi_db = make_case("srq_pi", 8, (
+        ("XTR_V1_NOTIFY_SRFQN", 0xA55A, "srqn=0xa55a"),
+        ("XTR_V1_NOTIFY_SRFQ_PI", 0x4567, "pi=0x4567"),
+        ("XTR_V1_NOTIFY_SRFQ_WRAP", 1, "wrap=1"),
+        ("XTR_V1_NOTIFY_SRQ_LIMIT_INVALID", 1, "limit_invalid=1"),
+        ("", 0, "offset=0x40"),
+    ))
+    srq_limit_db = make_case("srq_limit", 8, (
+        ("XTR_V1_NOTIFY_SRFQN", 0xA55A, "srqn=0xa55a"),
+        ("XTR_V1_NOTIFY_SRQ_LIMIT", 0x2AAA, "limit=0x2aaa"),
+        ("XTR_V1_NOTIFY_SRQ_ARM_SN", 3, "arm_sn=3"),
+        ("XTR_V1_NOTIFY_SRQ_PI_INVALID", 1, "pi_invalid=1"),
+        ("", 0, "offset=0x40"),
+    ))
+    cq_rc_ud_db = make_case("cq_rc_ud", 8, (
         ("XTR_V1_NOTIFY_CQ_CQN", 0x15555, "cqn=0x15555"),
         ("XTR_V1_NOTIFY_CQ_HOST_ID", 5, "host=5"),
         ("XTR_V1_NOTIFY_CQ_CI", 0x654321, "ci=0x654321"),
@@ -2774,8 +2841,63 @@ def build_golden_cases() -> dict[str, list[GoldenCase]]:
         ("XTR_V1_NOTIFY_CQ_ARM", 1, "arm=1"),
         ("XTR_V1_NOTIFY_CQ_ARM_ST", 2, "arm_state=2"),
         ("XTR_V1_NOTIFY_CQ_ARM_SN", 3, "arm_sn=3"),
+        ("XTR_V1_NOTIFY_CQ_URC", 0, "urc=0"),
+        ("XTR_V1_NOTIFY_CQ_CI_INVALID", 0, ""),
+        ("XTR_V1_NOTIFY_CQ_ARM_INVALID", 0, ""),
         ("", 0, "offset=0x18"),
     ))
+    cq_urc_db = make_case("cq_urc", 8, (
+        ("XTR_V1_NOTIFY_CQ_CQN", 0x12345, "cqn=0x12345"),
+        ("XTR_V1_NOTIFY_CQ_HOST_ID", 3, "host=3"),
+        ("XTR_V1_NOTIFY_CQ_URC_SQ_CI", 0x4567, "sq_ci=0x4567"),
+        ("XTR_V1_NOTIFY_CQ_URC_SQ_WRAP", 1, "sq_wrap=1"),
+        ("XTR_V1_NOTIFY_CQ_URC_RQ_CI", 0x2345, "rq_ci=0x2345"),
+        ("XTR_V1_NOTIFY_CQ_URC_RQ_WRAP", 0, "rq_wrap=0"),
+        ("XTR_V1_NOTIFY_CQ_ARM", 1, "arm=1"),
+        ("XTR_V1_NOTIFY_CQ_ARM_ST", 1, "arm_state=1"),
+        ("XTR_V1_NOTIFY_CQ_ARM_SN", 2, "arm_sn=2"),
+        ("XTR_V1_NOTIFY_CQ_URC", 1, "urc=1"),
+        ("XTR_V1_NOTIFY_CQ_CI_INVALID", 0, ""),
+        ("XTR_V1_NOTIFY_CQ_ARM_INVALID", 0, ""),
+        ("", 0, "offset=0x18"),
+    ))
+    ceq_db = make_case("ceq", 8, (
+        ("XTR_V1_NOTIFY_CEQ_CEQN", 0x2AAAAA, "ceqn=0x2aaaaa"),
+        ("XTR_V1_NOTIFY_CEQ_CI", 0x2AAAA, "ci=0x2aaaa"),
+        ("XTR_V1_NOTIFY_CEQ_CI_WRAP", 1, "wrap=1"),
+        ("", 0, "offset=0x20"),
+    ))
+    aeq_db = make_case("aeq", 8, (
+        ("XTR_V1_NOTIFY_AEQ_AEQN", 0xAAA, "aeqn=0xaaa"),
+        ("XTR_V1_NOTIFY_AEQ_CI", 0x15555, "ci=0x15555"),
+        ("XTR_V1_NOTIFY_AEQ_CI_WRAP", 1, "wrap=1"),
+        ("", 0, "offset=0x28"),
+    ))
+
+    def make_qp_control(name, qpn, dst_port, qp_sn, icos, db_type, offset):
+        return make_case(name, 8, (
+            ("XTR_V1_NOTIFY_QP_QPN", qpn, f"qpn={qpn:#x}"),
+            ("XTR_V1_NOTIFY_QP_DST_PORT", dst_port,
+             f"dst_port={dst_port}"),
+            ("XTR_V1_NOTIFY_QP_SN", qp_sn, f"qp_sn={qp_sn:#x}"),
+            ("XTR_V1_NOTIFY_QP_ICOS", icos, f"icos={icos}"),
+            ("XTR_V1_NOTIFY_QP_DB_TYPE", db_type,
+             f"db_type={db_type:#x}"),
+            ("", 0, f"offset={offset:#x}"),
+        ))
+
+    rts2sqd_db = make_qp_control(
+        "rts2sqd", 0x15555, 11, 0xA6, 5, 0xD, 0x48
+    )
+    sqd2rts_db = make_qp_control(
+        "sqd2rts", 0x15555, 11, 0xA6, 5, 0xE, 0x50
+    )
+    qp_flush_db = make_qp_control(
+        "qp_flush", 0x15555, 11, 0xA6, 0, 0xA, 0x58
+    )
+    tx_flush_db = make_qp_control(
+        "tx_flush", 0x2AAAA, 15, 0, 0, 0xB, 0x08
+    )
 
     return {
         "context": [
@@ -2801,8 +2923,18 @@ def build_golden_cases() -> dict[str, list[GoldenCase]]:
         ],
         "doorbell": [
             cmq_db,
+            sq_db,
             rq_db,
-            cq_db,
+            srq_pi_db,
+            srq_limit_db,
+            cq_rc_ud_db,
+            cq_urc_db,
+            ceq_db,
+            aeq_db,
+            rts2sqd_db,
+            sqd2rts_db,
+            qp_flush_db,
+            tx_flush_db,
         ],
     }
 
@@ -3265,6 +3397,67 @@ def validate_context_contract(cases: list[GoldenCase]) -> None:
     validate_body_translations(BODY_TRANSLATIONS, FIELD_MAPPINGS)
 
 
+DOORBELL_CASE_NAMES = (
+    "cmq_sq", "sq", "rq", "srq_pi", "srq_limit", "cq_rc_ud",
+    "cq_urc", "ceq", "aeq", "rts2sqd", "sqd2rts", "qp_flush",
+    "tx_flush",
+)
+DOORBELL_CASE_OFFSETS = (
+    0x000, 0x100, 0x010, 0x040, 0x040, 0x018, 0x018, 0x020,
+    0x028, 0x048, 0x050, 0x058, 0x008,
+)
+
+
+def validate_doorbell_contract(
+    cases: list[GoldenCase], queue_cases: list[GoldenCase]
+) -> None:
+    if tuple(case.name for case in cases) != DOORBELL_CASE_NAMES:
+        raise ValidationError("doorbell golden order/name contract drift")
+    if any(len(case.payload) != 8 for case in cases):
+        raise ValidationError("doorbell golden payload length contract drift")
+    offsets = []
+    for case in cases:
+        inputs = {item.name: item.value for item in case.inputs}
+        offset = inputs.get("offset")
+        if offset is None or re.fullmatch(r"(?:0x[0-9a-f]+|[0-9]+)", offset) is None:
+            raise ValidationError(f"doorbell {case.name} offset input is invalid")
+        offsets.append(int(offset, 0))
+    if tuple(offsets) != DOORBELL_CASE_OFFSETS:
+        raise ValidationError("doorbell golden offset contract drift")
+
+    sqe = next(
+        (case for case in queue_cases if case.name == "sqe_rc_boundary"),
+        None,
+    )
+    if sqe is None or len(sqe.payload) < 8 or cases[1].payload != sqe.payload[:8]:
+        raise ValidationError("doorbell SQ payload is not the encoded SQE header")
+
+    canonical = build_golden_cases()["doorbell"]
+    for actual, expected in zip(cases, canonical):
+        if actual.inputs != expected.inputs:
+            raise ValidationError(
+                f"doorbell {actual.name} input contract drift"
+            )
+        if actual.payload != expected.payload:
+            raise ValidationError(
+                f"doorbell {actual.name} payload contract drift"
+            )
+
+
+def validate_source_hash_contract(source_hashes: dict[str, str]) -> None:
+    expected = {
+        "eth_header/register.h":
+            "061071cab4008cee1fa837b9aa71c068215c98cb5665ef5f4b038a24da09c734",
+    }
+    for path, pinned_hash in expected.items():
+        actual = source_hashes.get(path)
+        if actual != pinned_hash:
+            raise ValidationError(f"source hash contract drift for {path}")
+    for path, digest in source_hashes.items():
+        if re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+            raise ValidationError(f"source hash is malformed for {path}")
+
+
 def load_manifest() -> list[tuple[str, str, str, str]]:
     rows = []
     for line_number, raw_line in enumerate(MANIFEST_PATH.read_text().splitlines(), 1):
@@ -3326,6 +3519,7 @@ def validate_required_sv_constants(
 
 def validate(kernel_root: Path) -> None:
     validate_git_head(kernel_root)
+    validate_source_hash_contract(SOURCE_HASHES)
     validate_mapping_uniqueness(FIELD_MAPPINGS, VALUE_MAPPINGS, REFERENCE_FIELDS)
     validate_body_translations(BODY_TRANSLATIONS, FIELD_MAPPINGS)
     rows = load_manifest()
@@ -3422,7 +3616,8 @@ def validate(kernel_root: Path) -> None:
     if sv_masks != expected_masks:
         raise ValidationError("SV image mask lookup differs from independent reference")
 
-    for kind, cases in build_golden_cases().items():
+    golden_cases = build_golden_cases()
+    for kind, cases in golden_cases.items():
         expected = render_golden(cases).encode()
         golden_path = GOLDEN_DIR / f"{kind}.hex"
         if not golden_path.is_file():
@@ -3435,6 +3630,8 @@ def validate(kernel_root: Path) -> None:
             raise ValidationError(f"golden parsed contract mismatch: {golden_path.relative_to(REPO_ROOT)}")
         if kind == "context":
             validate_context_contract(parsed_cases)
+        elif kind == "doorbell":
+            validate_doorbell_contract(parsed_cases, golden_cases["queue"])
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -1388,6 +1388,182 @@ class Task11DefinitionTest(unittest.TestCase):
                     CHECKER.validate_cmq_body_ownership(drifted)
 
 
+class Task12DoorbellDefinitionTest(unittest.TestCase):
+    DOORBELL_NAMES = [
+        "cmq_sq", "sq", "rq", "srq_pi", "srq_limit", "cq_rc_ud",
+        "cq_urc", "ceq", "aeq", "rts2sqd", "sqd2rts", "qp_flush",
+        "tx_flush",
+    ]
+    DOORBELL_OFFSETS = [
+        0x000, 0x100, 0x010, 0x040, 0x040, 0x018, 0x018, 0x020,
+        0x028, 0x048, 0x050, 0x058, 0x008,
+    ]
+    DOORBELL_FIELDS = {
+        "XTR_V1_NOTIFY_SRQ_LIMIT_INVALID":
+            ("wr.h", "XTRDMA_SRFQ_LIMIT_INVLD", 0, 62, 1),
+        "XTR_V1_NOTIFY_SRQ_PI_INVALID":
+            ("defs.h", "XTRDMA_SRFQ_PI_INVLD", 0, 63, 1),
+        "XTR_V1_NOTIFY_SRQ_LIMIT":
+            ("defs.h", "XTRDMA_SRFQ_LIMIT_TH", 0, 18, 14),
+        "XTR_V1_NOTIFY_SRQ_ARM_SN":
+            ("defs.h", "XTRDMA_SRFQ_ARM_SN", 0, 16, 2),
+        "XTR_V1_NOTIFY_CQ_CI_INVALID":
+            ("cq.h", "XTRDMA_NOTIFY_CQ_DB_CI_INVLD", 0, 63, 1),
+        "XTR_V1_NOTIFY_CQ_ARM_INVALID":
+            ("cq.h", "XTRDMA_NOTIFY_CQ_DB_ARM_INVLD", 0, 62, 1),
+        "XTR_V1_NOTIFY_CQ_URC":
+            ("cq.h", "XTRDMA_NOTIFY_CQ_DB_URC_FLAG", 0, 60, 1),
+        "XTR_V1_NOTIFY_CQ_URC_SQ_WRAP":
+            ("cq.h", "XTRDMA_NOTIFY_CQ_DB_URC_SW_CPL_SQ_WQE_WRAP", 0, 55, 1),
+        "XTR_V1_NOTIFY_CQ_URC_SQ_CI":
+            ("cq.h", "XTRDMA_NOTIFY_CQ_DB_URC_SW_CPL_SQ_WQE_IDX", 0, 40, 15),
+        "XTR_V1_NOTIFY_CQ_URC_RQ_WRAP":
+            ("cq.h", "XTRDMA_NOTIFY_CQ_DB_URC_SW_CPL_RQ_WQE_WRAP", 0, 39, 1),
+        "XTR_V1_NOTIFY_CQ_URC_RQ_CI":
+            ("cq.h", "XTRDMA_NOTIFY_CQ_DB_URC_SW_CPL_RQ_WQE_IDX", 0, 24, 15),
+        "XTR_V1_NOTIFY_QP_DST_PORT":
+            ("qp.h", "XTRDMA_DST_PORT", 0, 48, 4),
+        "XTR_V1_NOTIFY_QP_SN":
+            ("qp.h", "XTRDMA_QP_SN", 0, 40, 8),
+        "XTR_V1_NOTIFY_QP_DB_TYPE":
+            ("qp.h", "XTRDMA_DB_TYPE", 0, 36, 4),
+        "XTR_V1_NOTIFY_QP_ICOS":
+            ("qp.h", "XTRDMA_ICOS", 0, 21, 3),
+        "XTR_V1_NOTIFY_QP_QPN":
+            ("qp.h", "XTRDMA_QPN", 0, 0, 21),
+    }
+    DOORBELL_VALUES = {
+        ("wr.h", "XTRDMA_SRFQ_LIMIT_INVLD_VAL",
+         "XTR_V1_NOTIFY_SRQ_LIMIT_INVALID_VALUE", 1),
+        ("srq.h", "XTRDMA_SRFQ_DB_INVLD",
+         "XTR_V1_NOTIFY_SRQ_PI_INVALID_VALUE", 1),
+        ("qp.h", "XTRDMA_DB_QP_FLUSH", "XTR_V1_DB_TYPE_QP_FLUSH", 0xA),
+        ("qp.h", "XTRDMA_DB_TX_FLUSH", "XTR_V1_DB_TYPE_TX_FLUSH", 0xB),
+        ("qp.h", "XTRDMA_DB_RTS2SQD", "XTR_V1_DB_TYPE_RTS2SQD", 0xD),
+        ("qp.h", "XTRDMA_DB_SQD2RTS", "XTR_V1_DB_TYPE_SQD2RTS", 0xE),
+        ("eth_header/register.h", "QSCH_G2P_DPORT_NODE_MODE",
+         "XTR_V1_TX_FLUSH_DST_PORT", 15),
+    }
+
+    @staticmethod
+    def parsed_reference_fields():
+        return {
+            reference.sv_stem: (
+                reference.path,
+                reference.c_symbol,
+                reference.lsb,
+                reference.width,
+            )
+            for reference in CHECKER.REFERENCE_FIELDS
+        }
+
+    def test_all_doorbell_fields_are_source_pinned_and_exact(self) -> None:
+        mappings = {mapping.sv_stem: mapping for mapping in CHECKER.FIELD_MAPPINGS}
+        references = {
+            reference.sv_stem: reference
+            for reference in CHECKER.REFERENCE_FIELDS
+        }
+        for stem, (path, symbol, byte_offset, lsb, width) in \
+                self.DOORBELL_FIELDS.items():
+            with self.subTest(stem=stem):
+                self.assertEqual(
+                    mappings[stem],
+                    CHECKER.FieldMapping(path, symbol, stem, byte_offset),
+                )
+                self.assertEqual(
+                    references[stem],
+                    CHECKER.ReferenceField(
+                        path, symbol, stem, byte_offset, lsb, width
+                    ),
+                )
+
+    def test_doorbell_field_coordinate_mutation_is_rejected(self) -> None:
+        parsed_fields = self.parsed_reference_fields()
+        stem = "XTR_V1_NOTIFY_CQ_URC_SQ_CI"
+        references = list(CHECKER.REFERENCE_FIELDS)
+        index = next(
+            index for index, reference in enumerate(references)
+            if reference.sv_stem == stem
+        )
+        references[index] = references[index]._replace(lsb=39)
+        with self.assertRaisesRegex(
+            CHECKER.ValidationError, "reference mask mismatch"
+        ):
+            CHECKER.validate_reference_fields(
+                tuple(references), CHECKER.FIELD_MAPPINGS, parsed_fields
+            )
+
+    def test_all_doorbell_constants_are_source_pinned_and_exact(self) -> None:
+        mappings = {
+            (mapping.path, mapping.c_symbol, mapping.sv_name)
+            for mapping in CHECKER.VALUE_MAPPINGS
+        }
+        constants = CHECKER.parse_sv_constants(
+            (REPO_ROOT / "src/codec/xtr_v1/rdma_xtr_v1_defs.svh").read_text()
+        )
+        for path, symbol, sv_name, value in self.DOORBELL_VALUES:
+            with self.subTest(sv_name=sv_name):
+                self.assertIn((path, symbol, sv_name), mappings)
+                CHECKER.validate_required_sv_constants(
+                    constants, {sv_name: value}
+                )
+
+    def test_doorbell_constant_mutation_is_rejected(self) -> None:
+        constants = CHECKER.parse_sv_constants(
+            (REPO_ROOT / "src/codec/xtr_v1/rdma_xtr_v1_defs.svh").read_text()
+        )
+        expected = {
+            sv_name: value
+            for _, _, sv_name, value in self.DOORBELL_VALUES
+        }
+        drifted = dict(constants)
+        drifted["XTR_V1_DB_TYPE_TX_FLUSH"] = 0xA
+        with self.assertRaisesRegex(CHECKER.ValidationError, "SV constant mismatch"):
+            CHECKER.validate_required_sv_constants(drifted, expected)
+
+    def test_doorbell_goldens_have_exact_order_size_offsets_and_sq_header(self) -> None:
+        cases_by_kind = CHECKER.build_golden_cases()
+        cases = cases_by_kind["doorbell"]
+        self.assertEqual([case.name for case in cases], self.DOORBELL_NAMES)
+        self.assertEqual([len(case.payload) for case in cases], [8] * 13)
+        offsets = [
+            int({item.name: item.value for item in case.inputs}["offset"], 0)
+            for case in cases
+        ]
+        self.assertEqual(offsets, self.DOORBELL_OFFSETS)
+        sqe = next(
+            case for case in cases_by_kind["queue"]
+            if case.name == "sqe_rc_boundary"
+        )
+        self.assertEqual(cases[1].payload, sqe.payload[:8])
+
+    def test_doorbell_case_name_and_payload_mutations_are_rejected(self) -> None:
+        validate = getattr(CHECKER, "validate_doorbell_contract")
+        cases_by_kind = CHECKER.build_golden_cases()
+        cases = cases_by_kind["doorbell"]
+        validate(cases, cases_by_kind["queue"])
+
+        renamed = list(cases)
+        renamed[1] = renamed[1]._replace(name="sq_header")
+        with self.assertRaisesRegex(CHECKER.ValidationError, "order/name"):
+            validate(renamed, cases_by_kind["queue"])
+
+        changed = list(cases)
+        payload = bytearray(changed[6].payload)
+        payload[3] ^= 1
+        changed[6] = changed[6]._replace(payload=bytes(payload))
+        with self.assertRaisesRegex(CHECKER.ValidationError, "payload"):
+            validate(changed, cases_by_kind["queue"])
+
+    def test_new_pinned_source_hash_mutation_is_rejected(self) -> None:
+        validate = getattr(CHECKER, "validate_source_hash_contract")
+        validate(CHECKER.SOURCE_HASHES)
+        drifted = dict(CHECKER.SOURCE_HASHES)
+        drifted["eth_header/register.h"] = "0" * 64
+        with self.assertRaisesRegex(CHECKER.ValidationError, "source hash"):
+            validate(drifted)
+
+
 class MakefileCleanupTest(unittest.TestCase):
     def test_xtr_defs_cleanup_preserves_command_failure_and_reports_delete_failure(self) -> None:
         sim_dir = REPO_ROOT / "sim"
@@ -2109,10 +2285,35 @@ class ReferenceEncodingTest(unittest.TestCase):
                     "qpn=0x2aaaa,state=5,ecode=0xff,index=0x654321,"
                     "valid=1,packet_opcode=0x81,wrap=1",
                 "cmq_sq": "pi=27,polarity=1,offset=0x0",
+                "sq": "offset=0x100",
                 "rq": "qpn=0x15555,icos=5,pi=0x4567,wrap=1,offset=0x10",
-                "cq":
+                "srq_pi":
+                    "srqn=0xa55a,pi=0x4567,wrap=1,limit_invalid=1,"
+                    "offset=0x40",
+                "srq_limit":
+                    "srqn=0xa55a,limit=0x2aaa,arm_sn=3,pi_invalid=1,"
+                    "offset=0x40",
+                "cq_rc_ud":
                     "cqn=0x15555,host=5,ci=0x654321,wrap=1,arm=1,"
-                    "arm_state=2,arm_sn=3,offset=0x18",
+                    "arm_state=2,arm_sn=3,urc=0,offset=0x18",
+                "cq_urc":
+                    "cqn=0x12345,host=3,sq_ci=0x4567,sq_wrap=1,"
+                    "rq_ci=0x2345,rq_wrap=0,arm=1,arm_state=1,arm_sn=2,"
+                    "urc=1,offset=0x18",
+                "ceq": "ceqn=0x2aaaaa,ci=0x2aaaa,wrap=1,offset=0x20",
+                "aeq": "aeqn=0xaaa,ci=0x15555,wrap=1,offset=0x28",
+                "rts2sqd":
+                    "qpn=0x15555,dst_port=11,qp_sn=0xa6,icos=5,"
+                    "db_type=0xd,offset=0x48",
+                "sqd2rts":
+                    "qpn=0x15555,dst_port=11,qp_sn=0xa6,icos=5,"
+                    "db_type=0xe,offset=0x50",
+                "qp_flush":
+                    "qpn=0x15555,dst_port=11,qp_sn=0xa6,icos=0,"
+                    "db_type=0xa,offset=0x58",
+                "tx_flush":
+                    "qpn=0x2aaaa,dst_port=15,qp_sn=0x0,icos=0,"
+                    "db_type=0xb,offset=0x8",
             },
         )
 
