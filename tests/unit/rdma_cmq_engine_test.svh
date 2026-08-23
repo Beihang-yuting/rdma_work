@@ -1,17 +1,67 @@
+typedef enum int unsigned {
+  RDMA_CMQ_TEST_SQE_GOOD,
+  RDMA_CMQ_TEST_SQE_NULL,
+  RDMA_CMQ_TEST_SQE_SHORT,
+  RDMA_CMQ_TEST_SQE_BAD_ALIGNMENT,
+  RDMA_CMQ_TEST_SQE_BAD_KIND,
+  RDMA_CMQ_TEST_SQE_STALE_GENERATION,
+  RDMA_CMQ_TEST_SQE_BAD_TARGET_KIND,
+  RDMA_CMQ_TEST_SQE_BAD_TARGET_ADDRESS,
+  RDMA_CMQ_TEST_EXPECTED_NULL,
+  RDMA_CMQ_TEST_EXPECTED_INVALID
+} rdma_cmq_test_sqe_fault_e;
+
+typedef enum int unsigned {
+  RDMA_CMQ_TEST_DB_GOOD,
+  RDMA_CMQ_TEST_DB_NULL,
+  RDMA_CMQ_TEST_DB_BAD_LENGTH,
+  RDMA_CMQ_TEST_DB_BAD_KIND,
+  RDMA_CMQ_TEST_DB_STALE_GENERATION,
+  RDMA_CMQ_TEST_DB_BAD_TARGET_KIND
+} rdma_cmq_test_doorbell_fault_e;
+
 class rdma_cmq_test_profile extends rdma_cmq_hw_profile;
   `uvm_object_utils(rdma_cmq_test_profile)
 
-  localparam bit [31:0] TEST_OPCODE = 32'hcafe_0001;
+  localparam bit [31:0] TEST_OPCODE = 32'h0000_0010;
+  localparam bit [31:0] TEST_OPCODE_A = 32'h0000_0010;
+  localparam bit [31:0] TEST_OPCODE_B = 32'h0000_0020;
+  localparam bit [31:0] TEST_OPCODE_UNSUPPORTED = 32'h0000_00ee;
+  localparam longint unsigned TEST_DOORBELL_OFFSET = 64'h80;
 
   bit fail_validation;
   bit return_null_status;
   int unsigned validation_calls;
+  rdma_cmq_test_sqe_fault_e sqe_fault;
+  rdma_cmq_test_doorbell_fault_e doorbell_fault;
+  bit [31:0] fail_compose_opcode;
+  rdma_status_code_e compose_failure_code;
+  bit fail_doorbell_encode;
+  rdma_status_code_e doorbell_failure_code;
+  int unsigned compose_calls;
+  int unsigned doorbell_calls;
+  int unsigned last_final_pi;
+  bit last_polarity;
+  rdma_handle last_doorbell_target;
+  rdma_cmq_expected_response last_expected_alias;
 
   function new(string name = "rdma_cmq_test_profile");
     super.new(name);
     fail_validation = 1'b0;
     return_null_status = 1'b0;
     validation_calls = 0;
+    sqe_fault = RDMA_CMQ_TEST_SQE_GOOD;
+    doorbell_fault = RDMA_CMQ_TEST_DB_GOOD;
+    fail_compose_opcode = '0;
+    compose_failure_code = RDMA_SC_CODEC_ERROR;
+    fail_doorbell_encode = 1'b0;
+    doorbell_failure_code = RDMA_SC_CODEC_ERROR;
+    compose_calls = 0;
+    doorbell_calls = 0;
+    last_final_pi = 0;
+    last_polarity = 1'b0;
+    last_doorbell_target = null;
+    last_expected_alias = null;
   endfunction
 
   virtual function string profile_name();
@@ -34,30 +84,79 @@ class rdma_cmq_test_profile extends rdma_cmq_hw_profile;
     output rdma_hw_image sqe,
     output rdma_cmq_expected_response expected
   );
+    rdma_cmq_sqe_model body;
+
     sqe = null;
     expected = null;
+    compose_calls++;
     if (command == null || command.opcode_key == null ||
-        command.opcode_key.profile_name != profile_name() ||
-        command.opcode_key.opcode != TEST_OPCODE)
+        command.opcode_key.profile_name != profile_name())
       return rdma_status::make(RDMA_SC_UNSUPPORTED_OPCODE,
-                               "test profile accepts only its test opcode");
+                               "test profile name is unsupported");
+    if (!(command.opcode_key.opcode inside {TEST_OPCODE_A,
+                                            TEST_OPCODE_B}))
+      return rdma_status::make(RDMA_SC_UNSUPPORTED_OPCODE,
+                               "test profile opcode is unsupported");
     if (slot == null)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "test profile slot is null");
+    if (fail_compose_opcode != 0 &&
+        command.opcode_key.opcode == fail_compose_opcode)
+      return rdma_status::make(compose_failure_code,
+                               "injected test profile compose failure");
+    if (!$cast(body, command.body))
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "test profile body type is invalid");
+    if (sqe_fault == RDMA_CMQ_TEST_SQE_NULL)
+      return rdma_status::success();
     sqe = rdma_hw_image::type_id::create("test_sqe");
     for (int unsigned i = 0; i < 64; i++)
-      sqe.bytes.push_back(8'h00);
+      sqe.bytes.push_back(byte'(command.opcode_key.opcode[7:0] + i));
+    sqe.bytes[0] = command.opcode_key.opcode[7:0];
+    sqe.bytes[1] = body.flags[7:0];
+    sqe.bytes[2] = (command.qpc_signature_source == null ||
+                    command.qpc_signature_source.bytes.size() == 0) ?
+                   8'h00 : command.qpc_signature_source.bytes[0];
+    sqe.bytes[3] = command.function_h.object_id[7:0];
+    sqe.bytes[4] = slot.sq_index[7:0];
+    sqe.bytes[5] = {7'b0, slot.sq_wrap};
+    sqe.bytes[6] = slot.slot_sequence[7:0];
+    sqe.bytes[7] = body.command_id[7:0];
     sqe.length = 64;
     sqe.alignment = 64;
-    sqe.endian = RDMA_ENDIAN_LITTLE;
+    sqe.endian = RDMA_ENDIAN_BIG;
     sqe.image_kind = RDMA_IMAGE_CMQ_SQE;
-    sqe.hardware_version = 1;
+    sqe.hardware_version = 7;
     sqe.function_generation = command.function_h.generation;
+    sqe.write_target_kind = RDMA_HW_TARGET_BACKING;
+    sqe.backing_target.value = slot.backing_addr.value +
+                               slot.relative_offset;
     expected = rdma_cmq_expected_response::type_id::create(
       "test_expected"
     );
-    expected.hardware_opcode = TEST_OPCODE;
-    expected.variant = "test";
+    expected.hardware_opcode = command.opcode_key.opcode;
+    expected.variant = $sformatf("expected_%02h_%02h",
+                                 command.opcode_key.opcode[7:0],
+                                 body.flags[7:0]);
+    last_expected_alias = expected;
+    case (sqe_fault)
+      RDMA_CMQ_TEST_SQE_SHORT: begin
+        void'(sqe.bytes.pop_back());
+        sqe.length = 63;
+      end
+      RDMA_CMQ_TEST_SQE_BAD_ALIGNMENT: sqe.alignment = 32;
+      RDMA_CMQ_TEST_SQE_BAD_KIND: sqe.image_kind = RDMA_IMAGE_CMQ_CQE;
+      RDMA_CMQ_TEST_SQE_STALE_GENERATION:
+        sqe.function_generation++;
+      RDMA_CMQ_TEST_SQE_BAD_TARGET_KIND:
+        sqe.write_target_kind = RDMA_HW_TARGET_BAR;
+      RDMA_CMQ_TEST_SQE_BAD_TARGET_ADDRESS:
+        sqe.backing_target.value++;
+      RDMA_CMQ_TEST_EXPECTED_NULL: expected = null;
+      RDMA_CMQ_TEST_EXPECTED_INVALID: expected.variant = "";
+      default: begin
+      end
+    endcase
     return rdma_status::success();
   endfunction
 
@@ -79,9 +178,144 @@ class rdma_cmq_test_profile extends rdma_cmq_hw_profile;
     bit polarity,
     output rdma_hw_image image
   );
+    byte unsigned payload[8];
+
     image = null;
-    return rdma_status::make(RDMA_SC_UNSUPPORTED_OPCODE,
-                             "test profile has no doorbell opcode");
+    doorbell_calls++;
+    last_final_pi = final_pi;
+    last_polarity = polarity;
+    last_doorbell_target = rdma_clone_handle_value(
+      cmq_h, "test profile doorbell target"
+    );
+    if (fail_doorbell_encode)
+      return rdma_status::make(doorbell_failure_code,
+                               "injected doorbell encode failure");
+    if (doorbell_fault == RDMA_CMQ_TEST_DB_NULL)
+      return rdma_status::success();
+    payload = '{byte'(final_pi), byte'(polarity),
+                byte'(cmq_h.object_id[7:0]),
+                byte'(cmq_h.object_id[15:8]),
+                8'ha5, 8'h5a, 8'hc3, 8'h3c};
+    image = rdma_hw_image::type_id::create("test_doorbell");
+    foreach (payload[i]) image.bytes.push_back(payload[i]);
+    image.length = $size(payload);
+    image.alignment = 8;
+    image.endian = RDMA_ENDIAN_LITTLE;
+    image.image_kind = RDMA_IMAGE_DOORBELL;
+    image.hardware_version = 9;
+    image.function_generation = cmq_h.generation;
+    image.write_target_kind = RDMA_HW_TARGET_BAR;
+    image.bar_target.value = TEST_DOORBELL_OFFSET;
+    case (doorbell_fault)
+      RDMA_CMQ_TEST_DB_BAD_LENGTH: image.length = 7;
+      RDMA_CMQ_TEST_DB_BAD_KIND: image.image_kind = RDMA_IMAGE_CMQ_SQE;
+      RDMA_CMQ_TEST_DB_STALE_GENERATION:
+        image.function_generation++;
+      RDMA_CMQ_TEST_DB_BAD_TARGET_KIND:
+        image.write_target_kind = RDMA_HW_TARGET_BACKING;
+      default: begin
+      end
+    endcase
+    return rdma_status::success();
+  endfunction
+endclass
+
+class rdma_cmq_test_pcie extends rdma_mock_pcie;
+  `uvm_object_utils(rdma_cmq_test_pcie)
+
+  function new(string name = "rdma_cmq_test_pcie");
+    super.new(name);
+  endfunction
+
+  virtual task dma_visibility_barrier(
+    rdma_function_handle function_h,
+    output rdma_status status
+  );
+    rdma_mock_call_trace saved_trace;
+
+    saved_trace = call_trace;
+    call_trace = null;
+    void'(record_call("dma_visibility_barrier", '0, '0, '0, '0,
+                      function_h));
+    call_trace = saved_trace;
+    if (call_trace != null)
+      call_trace.record("pcie_dma_barrier");
+    status = take_failure("dma_visibility_barrier");
+    if (status == null)
+      status = rdma_status::success();
+  endtask
+
+  virtual task mmio_ordering_barrier(
+    rdma_function_handle function_h,
+    output rdma_status status
+  );
+    rdma_mock_call_trace saved_trace;
+
+    saved_trace = call_trace;
+    call_trace = null;
+    void'(record_call("mmio_ordering_barrier", '0, '0, '0, '0,
+                      function_h));
+    call_trace = saved_trace;
+    if (call_trace != null)
+      call_trace.record("pcie_mmio_barrier");
+    status = take_failure("mmio_ordering_barrier");
+    if (status == null)
+      status = rdma_status::success();
+  endtask
+endclass
+
+class rdma_cmq_test_blocking_pcie extends rdma_cmq_test_pcie;
+  `uvm_object_utils(rdma_cmq_test_blocking_pcie)
+
+  bit block_dma_barrier;
+  bit dma_barrier_entered;
+  bit release_dma_barrier;
+
+  function new(string name = "rdma_cmq_test_blocking_pcie");
+    super.new(name);
+    block_dma_barrier = 1'b0;
+    dma_barrier_entered = 1'b0;
+    release_dma_barrier = 1'b0;
+  endfunction
+
+  virtual task dma_visibility_barrier(
+    rdma_function_handle function_h,
+    output rdma_status status
+  );
+    rdma_mock_call_trace saved_trace;
+
+    saved_trace = call_trace;
+    call_trace = null;
+    void'(record_call("dma_visibility_barrier", '0, '0, '0, '0,
+                      function_h));
+    call_trace = saved_trace;
+    if (call_trace != null)
+      call_trace.record("pcie_dma_barrier");
+    status = take_failure("dma_visibility_barrier");
+    if (status != null)
+      return;
+    if (block_dma_barrier) begin
+      dma_barrier_entered = 1'b1;
+      wait (release_dma_barrier);
+    end
+    status = rdma_status::success();
+  endtask
+endclass
+
+class rdma_cmq_bad_clone_command extends rdma_cmq_command_desc;
+  `uvm_object_utils(rdma_cmq_bad_clone_command)
+
+  bit return_wrong_type;
+
+  function new(string name = "rdma_cmq_bad_clone_command");
+    super.new(name);
+    return_wrong_type = 1'b0;
+  endfunction
+
+  virtual function uvm_object clone();
+    if (return_wrong_type)
+      return rdma_status::success("wrong command clone type");
+    return null;
   endfunction
 endclass
 
@@ -168,6 +402,40 @@ class rdma_cmq_engine_probe extends rdma_cmq_engine;
     publish_seq = 11;
     retire_seq = 7;
     cq_consume_seq = 5;
+  endfunction
+
+  function int unsigned tokens_in_use_count();
+    int unsigned count;
+
+    count = 0;
+    foreach (token_in_use[i])
+      if (token_in_use[i])
+        count++;
+    return count;
+  endfunction
+
+  function int unsigned slot_record_count();
+    int unsigned count;
+
+    count = 0;
+    foreach (slots[i])
+      if (slots[i] != null)
+        count++;
+    return count;
+  endfunction
+
+  function string slot_expected_variant(int unsigned sq_index);
+    if (sq_index >= 32 || slots[sq_index] == null ||
+        slots[sq_index].expected == null)
+      return "";
+    return slots[sq_index].expected.variant;
+  endfunction
+
+  function longint unsigned slot_ticket_command_id(int unsigned sq_index);
+    if (sq_index >= 32 || slots[sq_index] == null ||
+        slots[sq_index].ticket == null)
+      return 0;
+    return slots[sq_index].ticket.command_id;
   endfunction
 
   function bit retry_only_poisoned();
@@ -527,6 +795,114 @@ class rdma_cmq_engine_test extends uvm_test;
     cmq.depth = depth;
     return cmq;
   endfunction
+
+  function automatic rdma_cmq_command_desc make_command(
+    string name,
+    rdma_function_binding binding,
+    bit [31:0] opcode,
+    byte unsigned marker,
+    time timeout_value = 1us
+  );
+    rdma_cmq_command_desc command;
+    rdma_cmq_sqe_model body;
+    rdma_handle target_h;
+
+    command = rdma_cmq_command_desc::type_id::create(name);
+    command.function_h = binding.make_handle();
+    command.opcode_key = rdma_cmq_opcode_key::type_id::create(
+      {name, "_key"}
+    );
+    command.opcode_key.profile_name = "cmq_engine_test";
+    command.opcode_key.opcode = opcode;
+    command.opcode_key.variant = $sformatf("variant_%02h", opcode[7:0]);
+    target_h = rdma_handle::type_id::create({name, "_target"});
+    target_h.kind = RDMA_RESOURCE_CMQ;
+    target_h.function_uid = binding.function_uid;
+    target_h.object_id = TEST_CMQ_ID;
+    target_h.generation = binding.generation;
+    body = rdma_cmq_sqe_model::type_id::create({name, "_body"});
+    body.opcode = RDMA_CMQ_QUERY;
+    body.command_id = longint'(marker) + 1'b1;
+    body.function_h = binding.make_handle();
+    body.target_h = target_h;
+    body.flags = marker;
+    command.body = body;
+    command.qpc_signature_source = rdma_hw_image::type_id::create(
+      {name, "_signature"}
+    );
+    command.qpc_signature_source.bytes.push_back(marker ^ 8'hff);
+    command.qpc_signature_source.length = 1;
+    command.qpc_signature_source.alignment = 1;
+    command.qpc_signature_source.endian = RDMA_ENDIAN_LITTLE;
+    command.qpc_signature_source.image_kind = RDMA_IMAGE_QPC;
+    command.qpc_signature_source.hardware_version = 1;
+    command.qpc_signature_source.function_generation = binding.generation;
+    command.timeout = timeout_value;
+    return command;
+  endfunction
+
+  function automatic void clear_submit_observation(
+    rdma_mock_host_mem mem,
+    rdma_mock_pcie pcie,
+    rdma_mock_call_trace trace
+  );
+    mem.calls.delete();
+    pcie.calls.delete();
+    trace.clear();
+  endfunction
+
+  function automatic void expect_submit_trace(
+    string label,
+    rdma_mock_call_trace trace,
+    string expected[]
+  );
+    if (trace.calls.size() != expected.size()) begin
+      `uvm_error(label,
+                 $sformatf("trace has %0d calls, expected %0d",
+                           trace.calls.size(), expected.size()))
+      return;
+    end
+    foreach (expected[i]) begin
+      if (trace.calls[i] != expected[i])
+        `uvm_error(label,
+                   $sformatf("trace[%0d] is %s, expected %s", i,
+                             trace.calls[i], expected[i]))
+    end
+  endfunction
+
+  function automatic void expect_no_submit_side_effects(
+    string label,
+    rdma_mock_host_mem mem,
+    rdma_mock_pcie pcie,
+    rdma_mock_call_trace trace
+  );
+    if (mem.calls.size() != 0 || pcie.calls.size() != 0 ||
+        trace.calls.size() != 0)
+      `uvm_error(label, "submission rejection caused adapter side effects")
+  endfunction
+
+  task automatic prepare_active(
+    string label,
+    rdma_cmq_engine engine,
+    rdma_mock_host_mem mem,
+    rdma_mock_pcie pcie,
+    rdma_doorbell_scheduler scheduler,
+    rdma_cmq_test_profile profile,
+    rdma_function_binding prepared_binding,
+    rdma_function_binding active_binding,
+    rdma_cmq cmq,
+    output rdma_cmq_runtime_desc runtime_desc
+  );
+    rdma_status status;
+
+    status = scheduler.configure(mem, pcie);
+    expect_status({label, "_SCHEDULER"}, status, RDMA_SC_OK);
+    engine.prepare(prepared_binding, cmq, 1'b1, 20'h34567, mem,
+                   scheduler, profile, runtime_desc, status);
+    expect_status({label, "_PREPARE"}, status, RDMA_SC_OK);
+    engine.activate(active_binding, status);
+    expect_status({label, "_ACTIVATE"}, status, RDMA_SC_OK);
+  endtask
 
   function automatic int unsigned count_host_calls(
     rdma_mock_host_mem mem,
@@ -1792,6 +2168,814 @@ class rdma_cmq_engine_test extends uvm_test;
                  "restored adapter did not release retained mapping")
   endtask
 
+  task automatic check_batch_compaction_and_doorbell();
+    rdma_cmq_engine_probe engine;
+    rdma_mock_host_mem mem;
+    rdma_mock_pcie pcie;
+    rdma_mock_call_trace trace;
+    rdma_doorbell_scheduler scheduler;
+    rdma_cmq_test_profile profile;
+    rdma_function_binding prepared_binding;
+    rdma_function_binding active_binding;
+    rdma_cmq cmq;
+    rdma_cmq_runtime_desc runtime_desc;
+    rdma_cmq_command_desc requests[];
+    rdma_cmq_ticket tickets[];
+    rdma_status item_statuses[];
+    rdma_status batch_status;
+    rdma_status status;
+    string expected_trace[5] = '{
+      "host_write", "host_write", "pcie_dma_barrier",
+      "pcie_mmio_barrier", "pcie_mmio_write"
+    };
+
+    engine = rdma_cmq_engine_probe::type_id::create("batch_engine");
+    mem = rdma_mock_host_mem::type_id::create("batch_mem");
+    pcie = rdma_cmq_test_pcie::type_id::create("batch_pcie");
+    trace = rdma_mock_call_trace::type_id::create("batch_trace");
+    mem.set_call_trace(trace);
+    pcie.set_call_trace(trace);
+    scheduler = rdma_doorbell_scheduler::type_id::create("batch_scheduler");
+    profile = rdma_cmq_test_profile::type_id::create("batch_profile");
+    prepared_binding = make_binding("batch_prepared", RDMA_BIND_PREPARED);
+    active_binding = make_binding("batch_active", RDMA_BIND_ACTIVE);
+    cmq = make_cmq("batch_cmq", prepared_binding);
+    prepare_active("BATCH", engine, mem, pcie, scheduler, profile,
+                   prepared_binding, active_binding, cmq, runtime_desc);
+    clear_submit_observation(mem, pcie, trace);
+
+    requests = new[3];
+    requests[0] = make_command("batch_a", active_binding,
+                               rdma_cmq_test_profile::TEST_OPCODE_A, 8'ha1);
+    requests[1] = make_command(
+      "batch_unsupported", active_binding,
+      rdma_cmq_test_profile::TEST_OPCODE_UNSUPPORTED, 8'hb2
+    );
+    requests[2] = make_command("batch_b", active_binding,
+                               rdma_cmq_test_profile::TEST_OPCODE_B, 8'hc3);
+    engine.submit_batch(requests, tickets, item_statuses, batch_status);
+
+    expect_status("BATCH_STATUS", batch_status, RDMA_SC_OK);
+    if (tickets.size() != 3 || item_statuses.size() != 3)
+      `uvm_error("BATCH_ALIGNMENT", "batch outputs are not input-aligned")
+    else begin
+      expect_status("BATCH_ITEM_A", item_statuses[0], RDMA_SC_OK);
+      expect_status("BATCH_ITEM_UNSUPPORTED", item_statuses[1],
+                    RDMA_SC_UNSUPPORTED_OPCODE);
+      expect_status("BATCH_ITEM_B", item_statuses[2], RDMA_SC_OK);
+      if (tickets[0] == null || tickets[1] != null || tickets[2] == null)
+        `uvm_error("BATCH_TICKETS", "batch ticket publication is misaligned")
+      else begin
+        if (tickets[0].slot_sequence != 0 || tickets[0].sq_index != 0 ||
+            tickets[0].sq_wrap || tickets[2].slot_sequence != 1 ||
+            tickets[2].sq_index != 1 || tickets[2].sq_wrap)
+          `uvm_error("BATCH_COMPACTION",
+                     "successful commands did not compact into SQ slots 0/1")
+        if (tickets[0].command_id == 0 || tickets[2].command_id == 0 ||
+            tickets[0].command_id[4:0] != 0 ||
+            tickets[2].command_id[4:0] != 1)
+          `uvm_error("BATCH_COMMAND_IDS",
+                     "tickets did not use distinct reserved command tokens")
+        if (tickets[0].function_h == requests[0].function_h ||
+            tickets[0].opcode_key == requests[0].opcode_key ||
+            tickets[0].cmq_h == cmq.handle)
+          `uvm_error("BATCH_TICKET_DETACH",
+                     "published ticket aliases caller-owned input")
+      end
+    end
+
+    expect_submit_trace("BATCH_TRACE", trace, expected_trace);
+    if (mem.calls.size() != 2 ||
+        mem.calls[0].method_name != "write" ||
+        mem.calls[0].offset != 0 || mem.calls[0].data.size() != 64 ||
+        mem.calls[0].data[0] != 8'h10 ||
+        mem.calls[0].data[1] != 8'ha1 ||
+        mem.calls[0].data[2] != 8'h5e ||
+        mem.calls[0].data[4] != 8'h00 ||
+        mem.calls[0].data[6] != 8'h00 ||
+        mem.calls[1].method_name != "write" ||
+        mem.calls[1].offset != 64 || mem.calls[1].data.size() != 64 ||
+        mem.calls[1].data[0] != 8'h20 ||
+        mem.calls[1].data[1] != 8'hc3 ||
+        mem.calls[1].data[2] != 8'h3c ||
+        mem.calls[1].data[4] != 8'h01 ||
+        mem.calls[1].data[6] != 8'h01)
+      `uvm_error("BATCH_SQE_WRITES",
+                 "compacted SQE writes or detached bytes are incorrect")
+    if (pcie.calls.size() != 3 ||
+        pcie.calls[2].method_name != "mmio_write" ||
+        pcie.calls[2].function_h == null ||
+        !pcie.calls[2].function_h.same_instance(active_binding.make_handle()) ||
+        pcie.calls[2].address.value != active_binding.notify_base.value +
+                                         64'h80 ||
+        pcie.calls[2].data.size() != 8 ||
+        pcie.calls[2].data[0] != 8'h02 ||
+        pcie.calls[2].data[1] != 8'h00 ||
+        pcie.calls[2].data[2] != TEST_CMQ_ID[7:0] ||
+        pcie.calls[2].data[3] != TEST_CMQ_ID[15:8])
+      `uvm_error("BATCH_DOORBELL",
+                 "final CMQ doorbell target or payload is incorrect")
+    if (profile.doorbell_calls != 1 || profile.last_final_pi != 2 ||
+        profile.last_polarity || profile.last_doorbell_target == null ||
+        !profile.last_doorbell_target.same_instance(cmq.handle))
+      `uvm_error("BATCH_PROFILE_DOORBELL",
+                 "profile did not receive the final compacted PI/identity")
+    if (engine.published_count() != 2 ||
+        engine.tokens_in_use_count() != 2 ||
+        engine.slot_record_count() != 2 ||
+        engine.slot_expected_variant(0) != "expected_10_a1" ||
+        engine.slot_expected_variant(1) != "expected_20_c3")
+      `uvm_error("BATCH_LEDGER", "batch slot ledger was not committed")
+
+    engine.shutdown(status);
+    expect_status("BATCH_SHUTDOWN", status, RDMA_SC_OK);
+  endtask
+
+  task automatic check_empty_invalid_and_state_rejections();
+    rdma_cmq_engine_probe engine;
+    rdma_cmq_engine unconfigured_engine;
+    rdma_mock_host_mem mem;
+    rdma_mock_pcie pcie;
+    rdma_mock_call_trace trace;
+    rdma_doorbell_scheduler scheduler;
+    rdma_cmq_test_profile profile;
+    rdma_function_binding prepared_binding;
+    rdma_function_binding active_binding;
+    rdma_cmq cmq;
+    rdma_cmq_runtime_desc runtime_desc;
+    rdma_cmq_command_desc request;
+    rdma_cmq_command_desc requests[];
+    rdma_cmq_ticket ticket;
+    rdma_cmq_ticket tickets[];
+    rdma_status status;
+    rdma_status item_statuses[];
+    rdma_status batch_status;
+
+    prepared_binding = make_binding("state_prepared", RDMA_BIND_PREPARED);
+    active_binding = make_binding("state_active", RDMA_BIND_ACTIVE);
+    request = make_command("state_request", active_binding,
+                           rdma_cmq_test_profile::TEST_OPCODE_A, 8'h11);
+    unconfigured_engine = rdma_cmq_engine::type_id::create(
+      "unconfigured_submit_engine"
+    );
+    unconfigured_engine.submit(request, ticket, status);
+    expect_status("SUBMIT_UNCONFIGURED", status, RDMA_SC_INVALID_STATE);
+    if (ticket != null)
+      `uvm_error("SUBMIT_UNCONFIGURED", "inactive engine returned a ticket")
+    requests = new[1];
+    requests[0] = request;
+    unconfigured_engine.submit_batch(requests, tickets, item_statuses,
+                                     batch_status);
+    expect_status("BATCH_UNCONFIGURED", batch_status,
+                  RDMA_SC_INVALID_STATE);
+    if (tickets.size() != 1 || item_statuses.size() != 1 ||
+        tickets[0] != null)
+      `uvm_error("BATCH_UNCONFIGURED", "inactive batch outputs misaligned")
+
+    engine = rdma_cmq_engine_probe::type_id::create("invalid_engine");
+    mem = rdma_mock_host_mem::type_id::create("invalid_mem");
+    pcie = rdma_cmq_test_pcie::type_id::create("invalid_pcie");
+    trace = rdma_mock_call_trace::type_id::create("invalid_trace");
+    mem.set_call_trace(trace);
+    pcie.set_call_trace(trace);
+    scheduler = rdma_doorbell_scheduler::type_id::create("invalid_scheduler");
+    profile = rdma_cmq_test_profile::type_id::create("invalid_profile");
+    cmq = make_cmq("invalid_cmq", prepared_binding);
+    expect_status("INVALID_SCHEDULER_CONFIGURE",
+                  scheduler.configure(mem, pcie), RDMA_SC_OK);
+    engine.prepare(prepared_binding, cmq, 1'b1, 20'h34567, mem,
+                   scheduler, profile, runtime_desc, status);
+    expect_status("INVALID_PREPARE", status, RDMA_SC_OK);
+    clear_submit_observation(mem, pcie, trace);
+    engine.submit(request, ticket, status);
+    expect_status("SUBMIT_PREPARED", status, RDMA_SC_INVALID_STATE);
+    if (ticket != null)
+      `uvm_error("SUBMIT_PREPARED", "PREPARED engine returned a ticket")
+    expect_no_submit_side_effects("SUBMIT_PREPARED", mem, pcie, trace);
+
+    requests = new[0];
+    engine.submit_batch(requests, tickets, item_statuses, batch_status);
+    expect_status("EMPTY_PREPARED", batch_status, RDMA_SC_INVALID_STATE);
+    if (tickets.size() != 0 || item_statuses.size() != 0)
+      `uvm_error("EMPTY_PREPARED", "empty inactive outputs are not empty")
+    expect_no_submit_side_effects("EMPTY_PREPARED", mem, pcie, trace);
+
+    engine.activate(active_binding, status);
+    expect_status("INVALID_ACTIVATE", status, RDMA_SC_OK);
+    requests = new[0];
+    engine.submit_batch(requests, tickets, item_statuses, batch_status);
+    expect_status("EMPTY_ACTIVE", batch_status, RDMA_SC_OK);
+    if (tickets.size() != 0 || item_statuses.size() != 0)
+      `uvm_error("EMPTY_ACTIVE", "empty batch outputs are not empty")
+    expect_no_submit_side_effects("EMPTY_ACTIVE", mem, pcie, trace);
+
+    requests = new[3];
+    requests[0] = null;
+    requests[1] = make_command("invalid_body", active_binding,
+                               rdma_cmq_test_profile::TEST_OPCODE_A, 8'h22);
+    requests[1].body = null;
+    requests[2] = make_command(
+      "invalid_unsupported", active_binding,
+      rdma_cmq_test_profile::TEST_OPCODE_UNSUPPORTED, 8'h33
+    );
+    engine.submit_batch(requests, tickets, item_statuses, batch_status);
+    expect_status("ALL_INVALID_BATCH", batch_status, RDMA_SC_OK);
+    if (tickets.size() != 3 || item_statuses.size() != 3)
+      `uvm_error("ALL_INVALID_ALIGNMENT", "invalid outputs misaligned")
+    else begin
+      expect_status("ALL_INVALID_NULL", item_statuses[0],
+                    RDMA_SC_INVALID_ARGUMENT);
+      expect_status("ALL_INVALID_BODY", item_statuses[1],
+                    RDMA_SC_INVALID_ARGUMENT);
+      expect_status("ALL_INVALID_OPCODE", item_statuses[2],
+                    RDMA_SC_UNSUPPORTED_OPCODE);
+      foreach (tickets[i])
+        if (tickets[i] != null)
+          `uvm_error("ALL_INVALID_TICKET", "invalid item returned a ticket")
+    end
+    if (engine.published_count() != 0 ||
+        engine.tokens_in_use_count() != 0 ||
+        engine.slot_record_count() != 0)
+      `uvm_error("ALL_INVALID_LEDGER", "invalid batch changed the ledger")
+    expect_no_submit_side_effects("ALL_INVALID_EFFECTS", mem, pcie, trace);
+
+    engine.shutdown(status);
+    expect_status("INVALID_SHUTDOWN", status, RDMA_SC_OK);
+  endtask
+
+  task automatic check_submit_wrapper_and_snapshot_detachment();
+    rdma_cmq_engine_probe engine;
+    rdma_mock_host_mem mem;
+    rdma_cmq_test_blocking_pcie blocking_pcie;
+    rdma_mock_call_trace trace;
+    rdma_doorbell_scheduler scheduler;
+    rdma_cmq_test_profile profile;
+    rdma_function_binding prepared_binding;
+    rdma_function_binding active_binding;
+    rdma_cmq cmq;
+    rdma_cmq_runtime_desc runtime_desc;
+    rdma_cmq_command_desc request;
+    rdma_cmq_sqe_model body;
+    rdma_cmq_ticket ticket;
+    rdma_status status;
+    bit submit_done;
+    string expected_trace[4] = '{
+      "host_write", "pcie_dma_barrier", "pcie_mmio_barrier",
+      "pcie_mmio_write"
+    };
+
+    engine = rdma_cmq_engine_probe::type_id::create("wrapper_engine");
+    mem = rdma_mock_host_mem::type_id::create("wrapper_mem");
+    blocking_pcie = rdma_cmq_test_blocking_pcie::type_id::create(
+      "wrapper_pcie"
+    );
+    trace = rdma_mock_call_trace::type_id::create("wrapper_trace");
+    mem.set_call_trace(trace);
+    blocking_pcie.set_call_trace(trace);
+    scheduler = rdma_doorbell_scheduler::type_id::create(
+      "wrapper_scheduler"
+    );
+    profile = rdma_cmq_test_profile::type_id::create("wrapper_profile");
+    prepared_binding = make_binding("wrapper_prepared", RDMA_BIND_PREPARED);
+    active_binding = make_binding("wrapper_active", RDMA_BIND_ACTIVE);
+    cmq = make_cmq("wrapper_cmq", prepared_binding);
+    prepare_active("WRAPPER", engine, mem, blocking_pcie, scheduler, profile,
+                   prepared_binding, active_binding, cmq, runtime_desc);
+    clear_submit_observation(mem, blocking_pcie, trace);
+
+    request = make_command(
+      "wrapper_unsupported", active_binding,
+      rdma_cmq_test_profile::TEST_OPCODE_UNSUPPORTED, 8'h33
+    );
+    engine.submit(request, ticket, status);
+    expect_status("WRAPPER_UNSUPPORTED", status,
+                  RDMA_SC_UNSUPPORTED_OPCODE);
+    if (ticket != null)
+      `uvm_error("WRAPPER_UNSUPPORTED", "failed wrapper returned a ticket")
+    expect_no_submit_side_effects("WRAPPER_UNSUPPORTED", mem,
+                                  blocking_pcie, trace);
+
+    request = make_command("wrapper_snapshot", active_binding,
+                           rdma_cmq_test_profile::TEST_OPCODE_A, 8'h44,
+                           10us);
+    if (!$cast(body, request.body))
+      `uvm_fatal("WRAPPER_SETUP", "snapshot body type is invalid")
+    blocking_pcie.block_dma_barrier = 1'b1;
+    blocking_pcie.release_dma_barrier = 1'b0;
+    submit_done = 1'b0;
+    ticket = null;
+    status = null;
+    fork
+      begin
+        engine.submit(request, ticket, status);
+        submit_done = 1'b1;
+      end
+    join_none
+    wait (blocking_pcie.dma_barrier_entered);
+    if (submit_done || ticket != null || engine.published_count() != 0)
+      `uvm_error("WRAPPER_PUBLICATION_GATE",
+                 "wrapper published before the scheduler transaction")
+
+    request.opcode_key.opcode = rdma_cmq_test_profile::TEST_OPCODE_B;
+    request.opcode_key.variant = "caller_mutated";
+    request.function_h.function_uid++;
+    request.function_h.object_id++;
+    request.function_h.generation++;
+    body.flags = 8'h99;
+    body.command_id = 64'h99;
+    request.qpc_signature_source.bytes[0] = 8'h88;
+    profile.last_expected_alias.variant = "profile_alias_mutated";
+    blocking_pcie.release_dma_barrier = 1'b1;
+    wait (submit_done);
+
+    expect_status("WRAPPER_SNAPSHOT", status, RDMA_SC_OK);
+    if (ticket == null)
+      `uvm_error("WRAPPER_SNAPSHOT", "successful wrapper returned no ticket")
+    else begin
+      if (ticket.opcode_key.opcode !=
+            rdma_cmq_test_profile::TEST_OPCODE_A ||
+          ticket.opcode_key.variant != "variant_10" ||
+          ticket.function_h.function_uid != TEST_FUNCTION_UID ||
+          ticket.function_h.object_id != TEST_FUNCTION_ID ||
+          ticket.function_h.generation != TEST_GENERATION)
+        `uvm_error("WRAPPER_SNAPSHOT_TICKET",
+                   "ticket was derived from caller-mutated input")
+      if (engine.slot_ticket_command_id(0) != ticket.command_id)
+        `uvm_error("WRAPPER_SNAPSHOT_TICKET",
+                   "slot record does not own a detached ticket value")
+    end
+    if (mem.calls.size() != 1 || mem.calls[0].offset != 0 ||
+        mem.calls[0].data.size() != 64 ||
+        mem.calls[0].data[0] != 8'h10 ||
+        mem.calls[0].data[1] != 8'h44 ||
+        mem.calls[0].data[2] != 8'hbb ||
+        mem.calls[0].data[3] != TEST_FUNCTION_ID[7:0])
+      `uvm_error("WRAPPER_SNAPSHOT_SQE",
+                 "written SQE was derived from caller-mutated input")
+    if (engine.slot_expected_variant(0) != "expected_10_44")
+      `uvm_error("WRAPPER_SNAPSHOT_EXPECTED",
+                 "slot expected response aliases profile-owned output")
+    expect_submit_trace("WRAPPER_SNAPSHOT_TRACE", trace, expected_trace);
+    if (blocking_pcie.calls.size() != 3)
+      `uvm_error("WRAPPER_ONE_DOORBELL",
+                 "one-item wrapper did not schedule exactly one doorbell")
+
+    engine.shutdown(status);
+    expect_status("WRAPPER_SHUTDOWN", status, RDMA_SC_OK);
+  endtask
+
+  task automatic check_transaction_failure_atomicity();
+    rdma_cmq_engine_probe engine;
+    rdma_mock_host_mem mem;
+    rdma_mock_pcie pcie;
+    rdma_mock_call_trace trace;
+    rdma_doorbell_scheduler scheduler;
+    rdma_cmq_test_profile profile;
+    rdma_function_binding prepared_binding;
+    rdma_function_binding active_binding;
+    rdma_cmq cmq;
+    rdma_cmq_runtime_desc runtime_desc;
+    rdma_cmq_command_desc requests[];
+    rdma_cmq_ticket tickets[];
+    rdma_status item_statuses[];
+    rdma_status batch_status;
+    rdma_status status;
+
+    engine = rdma_cmq_engine_probe::type_id::create("atomic_engine");
+    mem = rdma_mock_host_mem::type_id::create("atomic_mem");
+    pcie = rdma_cmq_test_pcie::type_id::create("atomic_pcie");
+    trace = rdma_mock_call_trace::type_id::create("atomic_trace");
+    mem.set_call_trace(trace);
+    pcie.set_call_trace(trace);
+    scheduler = rdma_doorbell_scheduler::type_id::create("atomic_scheduler");
+    profile = rdma_cmq_test_profile::type_id::create("atomic_profile");
+    prepared_binding = make_binding("atomic_prepared", RDMA_BIND_PREPARED);
+    active_binding = make_binding("atomic_active", RDMA_BIND_ACTIVE);
+    cmq = make_cmq("atomic_cmq", prepared_binding);
+    prepare_active("ATOMIC", engine, mem, pcie, scheduler, profile,
+                   prepared_binding, active_binding, cmq, runtime_desc);
+    clear_submit_observation(mem, pcie, trace);
+
+    requests = new[3];
+    requests[0] = make_command("atomic_a", active_binding,
+                               rdma_cmq_test_profile::TEST_OPCODE_A, 8'h51);
+    requests[1] = make_command(
+      "atomic_unsupported", active_binding,
+      rdma_cmq_test_profile::TEST_OPCODE_UNSUPPORTED, 8'h52
+    );
+    requests[2] = make_command("atomic_b", active_binding,
+                               rdma_cmq_test_profile::TEST_OPCODE_B, 8'h53);
+
+    profile.fail_doorbell_encode = 1'b1;
+    profile.doorbell_failure_code = RDMA_SC_CODEC_ERROR;
+    engine.submit_batch(requests, tickets, item_statuses, batch_status);
+    expect_status("ATOMIC_ENCODE_BATCH", batch_status, RDMA_SC_CODEC_ERROR);
+    if (tickets.size() != 3 || item_statuses.size() != 3)
+      `uvm_error("ATOMIC_ENCODE_ALIGNMENT", "encode outputs misaligned")
+    else begin
+      expect_status("ATOMIC_ENCODE_A", item_statuses[0],
+                    RDMA_SC_CODEC_ERROR);
+      expect_status("ATOMIC_ENCODE_UNSUPPORTED", item_statuses[1],
+                    RDMA_SC_UNSUPPORTED_OPCODE);
+      expect_status("ATOMIC_ENCODE_B", item_statuses[2],
+                    RDMA_SC_CODEC_ERROR);
+      foreach (tickets[i])
+        if (tickets[i] != null)
+          `uvm_error("ATOMIC_ENCODE_TICKET",
+                     "encode failure published a tentative ticket")
+    end
+    expect_no_submit_side_effects("ATOMIC_ENCODE_EFFECTS", mem, pcie,
+                                  trace);
+    if (engine.published_count() != 0 ||
+        engine.tokens_in_use_count() != 0 ||
+        engine.slot_record_count() != 0)
+      `uvm_error("ATOMIC_ENCODE_LEDGER",
+                 "encode failure committed tentative state")
+
+    profile.fail_doorbell_encode = 1'b0;
+    clear_submit_observation(mem, pcie, trace);
+    expect_status("ATOMIC_FAIL_INJECT",
+                  pcie.fail_next(
+                    "mmio_write",
+                    rdma_status::make(RDMA_SC_TIMEOUT,
+                                      "injected transport failure")
+                  ), RDMA_SC_OK);
+    engine.submit_batch(requests, tickets, item_statuses, batch_status);
+    expect_status("ATOMIC_TRANSPORT_BATCH", batch_status, RDMA_SC_TIMEOUT);
+    if (tickets.size() != 3 || item_statuses.size() != 3)
+      `uvm_error("ATOMIC_TRANSPORT_ALIGNMENT", "transport outputs misaligned")
+    else begin
+      expect_status("ATOMIC_TRANSPORT_A", item_statuses[0], RDMA_SC_TIMEOUT);
+      expect_status("ATOMIC_TRANSPORT_UNSUPPORTED", item_statuses[1],
+                    RDMA_SC_UNSUPPORTED_OPCODE);
+      expect_status("ATOMIC_TRANSPORT_B", item_statuses[2], RDMA_SC_TIMEOUT);
+      foreach (tickets[i])
+        if (tickets[i] != null)
+          `uvm_error("ATOMIC_TRANSPORT_TICKET",
+                     "transport failure published a tentative ticket")
+    end
+    if (mem.calls.size() != 2 || pcie.calls.size() != 3 ||
+        pcie.calls[2].method_name != "mmio_write")
+      `uvm_error("ATOMIC_TRANSPORT_PATH",
+                 "transport failure did not reach the final doorbell")
+    if (engine.published_count() != 0 ||
+        engine.tokens_in_use_count() != 0 ||
+        engine.slot_record_count() != 0)
+      `uvm_error("ATOMIC_TRANSPORT_LEDGER",
+                 "scheduler failure committed tentative state")
+
+    clear_submit_observation(mem, pcie, trace);
+    requests = new[1];
+    requests[0] = make_command("atomic_recovery", active_binding,
+                               rdma_cmq_test_profile::TEST_OPCODE_A, 8'h61);
+    engine.submit_batch(requests, tickets, item_statuses, batch_status);
+    expect_status("ATOMIC_RECOVERY_BATCH", batch_status, RDMA_SC_OK);
+    if (tickets.size() != 1 || tickets[0] == null ||
+        item_statuses.size() != 1)
+      `uvm_error("ATOMIC_RECOVERY", "recovery submission did not publish")
+    else begin
+      expect_status("ATOMIC_RECOVERY_ITEM", item_statuses[0], RDMA_SC_OK);
+      if (tickets[0].slot_sequence != 0 || tickets[0].sq_index != 0 ||
+          tickets[0].command_id[4:0] != 0 ||
+          tickets[0].command_id[63:5] != 3)
+        `uvm_error("ATOMIC_RECOVERY_ID",
+                   "rollback reused slot/token without advancing incarnation")
+    end
+
+    profile.fail_compose_opcode = rdma_cmq_test_profile::TEST_OPCODE_B;
+    clear_submit_observation(mem, pcie, trace);
+    requests[0] = make_command("atomic_compose", active_binding,
+                               rdma_cmq_test_profile::TEST_OPCODE_B, 8'h62);
+    engine.submit_batch(requests, tickets, item_statuses, batch_status);
+    expect_status("ATOMIC_COMPOSE_BATCH", batch_status, RDMA_SC_OK);
+    if (tickets.size() != 1 || tickets[0] != null ||
+        item_statuses.size() != 1)
+      `uvm_error("ATOMIC_COMPOSE", "compose failure output is not atomic")
+    else
+      expect_status("ATOMIC_COMPOSE_ITEM", item_statuses[0],
+                    RDMA_SC_CODEC_ERROR);
+    expect_no_submit_side_effects("ATOMIC_COMPOSE_EFFECTS", mem, pcie,
+                                  trace);
+    if (engine.published_count() != 1 ||
+        engine.tokens_in_use_count() != 1 ||
+        engine.slot_record_count() != 1)
+      `uvm_error("ATOMIC_COMPOSE_LEDGER",
+                 "per-item compose failure changed committed state")
+
+    engine.shutdown(status);
+    expect_status("ATOMIC_SHUTDOWN", status, RDMA_SC_OK);
+  endtask
+
+  task automatic check_submission_validation_and_profile_metadata();
+    rdma_cmq_engine_probe engine;
+    rdma_mock_host_mem mem;
+    rdma_mock_pcie pcie;
+    rdma_mock_call_trace trace;
+    rdma_doorbell_scheduler scheduler;
+    rdma_cmq_test_profile profile;
+    rdma_function_binding prepared_binding;
+    rdma_function_binding active_binding;
+    rdma_cmq cmq;
+    rdma_cmq_runtime_desc runtime_desc;
+    rdma_cmq_command_desc requests[];
+    rdma_cmq_bad_clone_command bad_clone;
+    rdma_cmq_ticket tickets[];
+    rdma_status item_statuses[];
+    rdma_status batch_status;
+    rdma_status status;
+    rdma_status_code_e expected_validation_codes[10] = '{
+      RDMA_SC_INVALID_ARGUMENT,
+      RDMA_SC_INVALID_ARGUMENT,
+      RDMA_SC_INVALID_ARGUMENT,
+      RDMA_SC_INVALID_ARGUMENT,
+      RDMA_SC_INVALID_ARGUMENT,
+      RDMA_SC_STALE_GENERATION,
+      RDMA_SC_UNSUPPORTED_OPCODE,
+      RDMA_SC_INVALID_ARGUMENT,
+      RDMA_SC_INVALID_STATE,
+      RDMA_SC_INVALID_STATE
+    };
+    rdma_status_code_e expected_sqe_codes[9] = '{
+      RDMA_SC_INVALID_STATE,
+      RDMA_SC_INVALID_ARGUMENT,
+      RDMA_SC_INVALID_ARGUMENT,
+      RDMA_SC_INVALID_ARGUMENT,
+      RDMA_SC_STALE_GENERATION,
+      RDMA_SC_INVALID_ARGUMENT,
+      RDMA_SC_INVALID_ARGUMENT,
+      RDMA_SC_INVALID_STATE,
+      RDMA_SC_INVALID_ARGUMENT
+    };
+    rdma_status_code_e expected_db_codes[5] = '{
+      RDMA_SC_INVALID_STATE,
+      RDMA_SC_INVALID_ARGUMENT,
+      RDMA_SC_INVALID_ARGUMENT,
+      RDMA_SC_STALE_GENERATION,
+      RDMA_SC_INVALID_ARGUMENT
+    };
+
+    engine = rdma_cmq_engine_probe::type_id::create("validation_engine");
+    mem = rdma_mock_host_mem::type_id::create("validation_mem");
+    pcie = rdma_cmq_test_pcie::type_id::create("validation_pcie");
+    trace = rdma_mock_call_trace::type_id::create("validation_trace");
+    mem.set_call_trace(trace);
+    pcie.set_call_trace(trace);
+    scheduler = rdma_doorbell_scheduler::type_id::create(
+      "validation_scheduler"
+    );
+    profile = rdma_cmq_test_profile::type_id::create("validation_profile");
+    prepared_binding = make_binding("validation_prepared",
+                                    RDMA_BIND_PREPARED);
+    active_binding = make_binding("validation_active", RDMA_BIND_ACTIVE);
+    cmq = make_cmq("validation_cmq", prepared_binding);
+    prepare_active("VALIDATION", engine, mem, pcie, scheduler, profile,
+                   prepared_binding, active_binding, cmq, runtime_desc);
+    clear_submit_observation(mem, pcie, trace);
+
+    requests = new[10];
+    requests[0] = null;
+    requests[1] = make_command("validation_body", active_binding,
+                               rdma_cmq_test_profile::TEST_OPCODE_A, 8'h01);
+    requests[1].body = null;
+    requests[2] = make_command("validation_kind", active_binding,
+                               rdma_cmq_test_profile::TEST_OPCODE_A, 8'h02);
+    requests[2].function_h.kind = RDMA_RESOURCE_QP;
+    requests[3] = make_command("validation_uid", active_binding,
+                               rdma_cmq_test_profile::TEST_OPCODE_A, 8'h03);
+    requests[3].function_h.function_uid++;
+    requests[4] = make_command("validation_object", active_binding,
+                               rdma_cmq_test_profile::TEST_OPCODE_A, 8'h04);
+    requests[4].function_h.object_id++;
+    requests[5] = make_command("validation_generation", active_binding,
+                               rdma_cmq_test_profile::TEST_OPCODE_A, 8'h05);
+    requests[5].function_h.generation++;
+    requests[6] = make_command("validation_profile", active_binding,
+                               rdma_cmq_test_profile::TEST_OPCODE_A, 8'h06);
+    requests[6].opcode_key.profile_name = "wrong_profile";
+    requests[7] = make_command("validation_timeout", active_binding,
+                               rdma_cmq_test_profile::TEST_OPCODE_A, 8'h07);
+    requests[7].timeout = 0;
+    bad_clone = rdma_cmq_bad_clone_command::type_id::create(
+      "validation_null_clone"
+    );
+    requests[8] = bad_clone;
+    bad_clone = rdma_cmq_bad_clone_command::type_id::create(
+      "validation_wrong_clone"
+    );
+    bad_clone.return_wrong_type = 1'b1;
+    requests[9] = bad_clone;
+    engine.submit_batch(requests, tickets, item_statuses, batch_status);
+    expect_status("VALIDATION_BATCH", batch_status, RDMA_SC_OK);
+    if (tickets.size() != requests.size() ||
+        item_statuses.size() != requests.size())
+      `uvm_error("VALIDATION_ALIGNMENT", "validation outputs misaligned")
+    else begin
+      foreach (requests[i]) begin
+        expect_status($sformatf("VALIDATION_ITEM_%0d", i), item_statuses[i],
+                      expected_validation_codes[i]);
+        if (tickets[i] != null)
+          `uvm_error("VALIDATION_TICKET",
+                     $sformatf("validation item %0d returned a ticket", i))
+      end
+    end
+    expect_no_submit_side_effects("VALIDATION_EFFECTS", mem, pcie, trace);
+
+    #1ns;
+    clear_submit_observation(mem, pcie, trace);
+    requests = new[1];
+    requests[0] = make_command("validation_overflow", active_binding,
+                               rdma_cmq_test_profile::TEST_OPCODE_A, 8'h08);
+    requests[0].timeout = time'(-1);
+    engine.submit_batch(requests, tickets, item_statuses, batch_status);
+    expect_status("VALIDATION_OVERFLOW_BATCH", batch_status, RDMA_SC_OK);
+    if (tickets.size() != 1 || tickets[0] != null ||
+        item_statuses.size() != 1)
+      `uvm_error("VALIDATION_OVERFLOW", "deadline overflow output invalid")
+    else
+      expect_status("VALIDATION_OVERFLOW_ITEM", item_statuses[0],
+                    RDMA_SC_INVALID_ARGUMENT);
+    expect_no_submit_side_effects("VALIDATION_OVERFLOW_EFFECTS", mem, pcie,
+                                  trace);
+
+    for (int unsigned fault = 1; fault <= 9; fault++) begin
+      clear_submit_observation(mem, pcie, trace);
+      if (!$cast(profile.sqe_fault, fault))
+        `uvm_fatal("VALIDATION_SETUP", "SQE fault enum cast failed")
+      requests[0] = make_command($sformatf("sqe_fault_%0d", fault),
+                                 active_binding,
+                                 rdma_cmq_test_profile::TEST_OPCODE_A,
+                                 byte'(8'h20 + fault));
+      engine.submit_batch(requests, tickets, item_statuses, batch_status);
+      expect_status($sformatf("SQE_FAULT_BATCH_%0d", fault), batch_status,
+                    RDMA_SC_OK);
+      if (tickets.size() != 1 || tickets[0] != null ||
+          item_statuses.size() != 1)
+        `uvm_error("SQE_FAULT_OUTPUT",
+                   $sformatf("SQE fault %0d output invalid", fault))
+      else
+        expect_status($sformatf("SQE_FAULT_ITEM_%0d", fault),
+                      item_statuses[0], expected_sqe_codes[fault - 1]);
+      expect_no_submit_side_effects(
+        $sformatf("SQE_FAULT_EFFECTS_%0d", fault), mem, pcie, trace
+      );
+    end
+    profile.sqe_fault = RDMA_CMQ_TEST_SQE_GOOD;
+
+    for (int unsigned fault = 1; fault <= 5; fault++) begin
+      clear_submit_observation(mem, pcie, trace);
+      if (!$cast(profile.doorbell_fault, fault))
+        `uvm_fatal("VALIDATION_SETUP", "doorbell fault enum cast failed")
+      requests[0] = make_command($sformatf("db_fault_%0d", fault),
+                                 active_binding,
+                                 rdma_cmq_test_profile::TEST_OPCODE_A,
+                                 byte'(8'h40 + fault));
+      engine.submit_batch(requests, tickets, item_statuses, batch_status);
+      expect_status($sformatf("DB_FAULT_BATCH_%0d", fault), batch_status,
+                    expected_db_codes[fault - 1]);
+      if (tickets.size() != 1 || tickets[0] != null ||
+          item_statuses.size() != 1)
+        `uvm_error("DB_FAULT_OUTPUT",
+                   $sformatf("doorbell fault %0d output invalid", fault))
+      else
+        expect_status($sformatf("DB_FAULT_ITEM_%0d", fault),
+                      item_statuses[0], expected_db_codes[fault - 1]);
+      expect_no_submit_side_effects(
+        $sformatf("DB_FAULT_EFFECTS_%0d", fault), mem, pcie, trace
+      );
+    end
+    if (engine.published_count() != 0 ||
+        engine.tokens_in_use_count() != 0 ||
+        engine.slot_record_count() != 0)
+      `uvm_error("VALIDATION_LEDGER",
+                 "rejected metadata changed engine ledger state")
+
+    engine.shutdown(status);
+    expect_status("VALIDATION_SHUTDOWN", status, RDMA_SC_OK);
+  endtask
+
+  task automatic check_full_initial_capacity_and_shutdown_reset();
+    rdma_cmq_engine_probe engine;
+    rdma_mock_host_mem mem;
+    rdma_mock_pcie pcie;
+    rdma_mock_call_trace trace;
+    rdma_doorbell_scheduler scheduler;
+    rdma_cmq_test_profile profile;
+    rdma_function_binding prepared_binding;
+    rdma_function_binding active_binding;
+    rdma_cmq cmq;
+    rdma_cmq_runtime_desc runtime_desc;
+    rdma_cmq_command_desc requests[];
+    rdma_cmq_ticket tickets[];
+    rdma_status item_statuses[];
+    rdma_status batch_status;
+    rdma_status status;
+
+    engine = rdma_cmq_engine_probe::type_id::create("capacity_engine");
+    mem = rdma_mock_host_mem::type_id::create("capacity_mem");
+    pcie = rdma_cmq_test_pcie::type_id::create("capacity_pcie");
+    trace = rdma_mock_call_trace::type_id::create("capacity_trace");
+    mem.set_call_trace(trace);
+    pcie.set_call_trace(trace);
+    scheduler = rdma_doorbell_scheduler::type_id::create(
+      "capacity_scheduler"
+    );
+    profile = rdma_cmq_test_profile::type_id::create("capacity_profile");
+    prepared_binding = make_binding("capacity_prepared", RDMA_BIND_PREPARED);
+    active_binding = make_binding("capacity_active", RDMA_BIND_ACTIVE);
+    cmq = make_cmq("capacity_cmq", prepared_binding);
+    prepare_active("CAPACITY", engine, mem, pcie, scheduler, profile,
+                   prepared_binding, active_binding, cmq, runtime_desc);
+    clear_submit_observation(mem, pcie, trace);
+
+    requests = new[33];
+    foreach (requests[i])
+      requests[i] = make_command(
+        $sformatf("capacity_%0d", i), active_binding,
+        (i[0] == 1'b0) ? rdma_cmq_test_profile::TEST_OPCODE_A :
+                         rdma_cmq_test_profile::TEST_OPCODE_B,
+        byte'(i + 1'b1), 10us
+      );
+    engine.submit_batch(requests, tickets, item_statuses, batch_status);
+    expect_status("CAPACITY_BATCH", batch_status, RDMA_SC_OK);
+    if (tickets.size() != 33 || item_statuses.size() != 33)
+      `uvm_error("CAPACITY_ALIGNMENT", "capacity outputs misaligned")
+    else begin
+      for (int unsigned i = 0; i < 32; i++) begin
+        expect_status($sformatf("CAPACITY_ITEM_%0d", i), item_statuses[i],
+                      RDMA_SC_OK);
+        if (tickets[i] == null || tickets[i].slot_sequence != i ||
+            tickets[i].sq_index != i || tickets[i].sq_wrap)
+          `uvm_error("CAPACITY_TICKET",
+                     $sformatf("capacity ticket %0d is invalid", i))
+      end
+      expect_status("CAPACITY_ITEM_FULL", item_statuses[32],
+                    RDMA_SC_QUEUE_FULL);
+      if (tickets[32] != null)
+        `uvm_error("CAPACITY_ITEM_FULL",
+                   "33rd initial command incorrectly consumed a slot")
+    end
+    if (mem.calls.size() != 32 || pcie.calls.size() != 3 ||
+        pcie.calls[2].method_name != "mmio_write" ||
+        pcie.calls[2].data.size() != 8 ||
+        pcie.calls[2].data[0] != 8'h00 ||
+        pcie.calls[2].data[1] != 8'h01 ||
+        profile.doorbell_calls != 1 || profile.last_final_pi != 0 ||
+        !profile.last_polarity)
+      `uvm_error("CAPACITY_DOORBELL",
+                 "full 32-entry publication did not use PI 0/polarity 1")
+    if (engine.published_count() != 32 ||
+        engine.tokens_in_use_count() != 32 ||
+        engine.slot_record_count() != 32)
+      `uvm_error("CAPACITY_LEDGER", "full initial capacity was not committed")
+
+    clear_submit_observation(mem, pcie, trace);
+    requests = new[1];
+    requests[0] = make_command("capacity_overflow", active_binding,
+                               rdma_cmq_test_profile::TEST_OPCODE_A, 8'hfe);
+    engine.submit_batch(requests, tickets, item_statuses, batch_status);
+    expect_status("CAPACITY_OVERFLOW_BATCH", batch_status, RDMA_SC_OK);
+    if (tickets.size() != 1 || tickets[0] != null ||
+        item_statuses.size() != 1)
+      `uvm_error("CAPACITY_OVERFLOW", "full-ring output invalid")
+    else
+      expect_status("CAPACITY_OVERFLOW_ITEM", item_statuses[0],
+                    RDMA_SC_QUEUE_FULL);
+    expect_no_submit_side_effects("CAPACITY_OVERFLOW_EFFECTS", mem, pcie,
+                                  trace);
+
+    engine.shutdown(status);
+    expect_status("CAPACITY_SHUTDOWN", status, RDMA_SC_OK);
+    if (engine.published_count() != 0 || engine.retired_count() != 0 ||
+        engine.cq_consumed_count() != 0 ||
+        engine.tokens_in_use_count() != 0 ||
+        engine.slot_record_count() != 0)
+      `uvm_error("CAPACITY_SHUTDOWN_RESET",
+                 "shutdown did not clear slots, tokens, and counters")
+
+    prepared_binding = make_binding("capacity_reprepared",
+                                    RDMA_BIND_PREPARED);
+    active_binding = make_binding("capacity_reactive", RDMA_BIND_ACTIVE);
+    cmq = make_cmq("capacity_recmq", prepared_binding);
+    engine.prepare(prepared_binding, cmq, 1'b1, 20'h34567, mem,
+                   scheduler, profile, runtime_desc, status);
+    expect_status("CAPACITY_REPREPARE", status, RDMA_SC_OK);
+    engine.activate(active_binding, status);
+    expect_status("CAPACITY_REACTIVATE", status, RDMA_SC_OK);
+    clear_submit_observation(mem, pcie, trace);
+    requests[0] = make_command("capacity_reuse", active_binding,
+                               rdma_cmq_test_profile::TEST_OPCODE_A, 8'h77);
+    engine.submit_batch(requests, tickets, item_statuses, batch_status);
+    expect_status("CAPACITY_REUSE_BATCH", batch_status, RDMA_SC_OK);
+    if (tickets.size() != 1 || tickets[0] == null ||
+        tickets[0].slot_sequence != 0 || tickets[0].sq_index != 0 ||
+        tickets[0].command_id != 64'd32)
+      `uvm_error("CAPACITY_REUSE",
+                 "new prepare did not restart slot/token authority cleanly")
+
+    engine.shutdown(status);
+    expect_status("CAPACITY_FINAL_SHUTDOWN", status, RDMA_SC_OK);
+  endtask
+
   virtual task run_phase(uvm_phase phase);
     phase.raise_objection(this);
     check_success_and_detachment();
@@ -1805,6 +2989,12 @@ class rdma_cmq_engine_test extends uvm_test;
     check_null_shutdown_release_retry();
     check_missing_host_mem_shutdown();
     check_activation_guards();
+    check_batch_compaction_and_doorbell();
+    check_empty_invalid_and_state_rejections();
+    check_submit_wrapper_and_snapshot_detachment();
+    check_transaction_failure_atomicity();
+    check_submission_validation_and_profile_metadata();
+    check_full_initial_capacity_and_shutdown_reset();
     phase.drop_objection(this);
   endtask
 endclass
