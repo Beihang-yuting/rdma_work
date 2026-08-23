@@ -12,5 +12,6 @@ package rdma_model_pkg;
   `include "rdma_resources.svh"
   `include "rdma_context_layouts.svh"
   `include "rdma_context_models.svh"
+  `include "rdma_cmq_engine_models.svh"
   `include "rdma_queue_models.svh"
 endpackage

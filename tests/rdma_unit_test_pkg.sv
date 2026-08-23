@@ -23,6 +23,7 @@ package rdma_unit_test_pkg;
   `include "unit/rdma_smoke_test.svh"
   `include "unit/rdma_types_test.svh"
   `include "unit/rdma_model_test.svh"
+  `include "unit/rdma_cmq_engine_models_test.svh"
   `include "unit/rdma_context_model_test.svh"
   `include "unit/rdma_request_model_test.svh"
   `include "unit/rdma_adapter_contract_test.svh"
