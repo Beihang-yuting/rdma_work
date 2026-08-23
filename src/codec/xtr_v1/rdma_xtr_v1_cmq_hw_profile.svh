@@ -7,10 +7,7 @@ class rdma_xtr_v1_cmq_hw_profile extends rdma_cmq_hw_profile;
   protected rdma_xtr_v1_doorbell_codec_registry doorbell_codecs;
   protected rdma_status doorbell_registration_status;
 
-  function new(
-    string name = "rdma_xtr_v1_cmq_hw_profile",
-    rdma_xtr_v1_doorbell_codec_registry injected_doorbell_codecs = null
-  );
+  function new(string name = "rdma_xtr_v1_cmq_hw_profile");
     rdma_status status;
     super.new(name);
     request_composer = rdma_xtr_v1_cmq_request_composer::type_id::create(
@@ -18,12 +15,9 @@ class rdma_xtr_v1_cmq_hw_profile extends rdma_cmq_hw_profile;
     completion_codec = rdma_xtr_v1_cmq_completion_codec::type_id::create(
       "completion_codec");
     error_codec = rdma_xtr_v1_error_codec::type_id::create("error_codec");
-    if (injected_doorbell_codecs == null)
-      doorbell_codecs =
-        rdma_xtr_v1_doorbell_codec_registry::type_id::create(
-          "doorbell_codecs");
-    else
-      doorbell_codecs = injected_doorbell_codecs;
+    doorbell_codecs =
+      rdma_xtr_v1_doorbell_codec_registry::type_id::create(
+        "doorbell_codecs");
     doorbell_registration_status = null;
     if (doorbell_codecs != null) begin
       status = doorbell_codecs.register_defaults();

@@ -28,6 +28,48 @@ class rdma_xtr_v1_cmq_profile_probe
 
 endclass
 
+class rdma_xtr_v1_cmq_conflicted_doorbell_registry
+    extends rdma_xtr_v1_doorbell_codec_registry;
+  `uvm_object_utils(rdma_xtr_v1_cmq_conflicted_doorbell_registry)
+
+  local static bit arm_conflict;
+  local static bit conflict_seeded;
+
+  function new(
+    string name = "rdma_xtr_v1_cmq_conflicted_doorbell_registry"
+  );
+    rdma_codec_key conflict_key;
+    rdma_xtr_v1_doorbell_codec conflict_codec;
+    rdma_status status;
+
+    super.new(name);
+    if (arm_conflict) begin
+      arm_conflict = 1'b0;
+      conflict_seeded = 1'b0;
+      conflict_key = '{hw_version:"xtr_v1",
+                       image_kind:RDMA_IMAGE_DOORBELL,
+                       object_type:"doorbell", variant:"cmq_sq",
+                       opcode:8'h00};
+      conflict_codec = new("pre_registered_cmq_sq", "cmq_sq");
+      status = register_codec(conflict_key, conflict_codec);
+      if (status == null || !status.ok())
+        `uvm_fatal("PROFILE_REGISTRY_FIXTURE",
+                   "failed to seed CMQ doorbell registration collision")
+      else
+        conflict_seeded = 1'b1;
+    end
+  endfunction
+
+  static function void arm_next_instance();
+    arm_conflict = 1'b1;
+    conflict_seeded = 1'b0;
+  endfunction
+
+  static function bit seeded_collision();
+    return conflict_seeded;
+  endfunction
+endclass
+
 class rdma_xtr_v1_cmq_profile_test extends uvm_test;
   `uvm_component_utils(rdma_xtr_v1_cmq_profile_test)
 
@@ -215,9 +257,7 @@ class rdma_xtr_v1_cmq_profile_test extends uvm_test;
     rdma_xtr_v1_cmq_hw_profile profile;
     rdma_xtr_v1_cmq_hw_profile failed_registration_profile;
     rdma_xtr_v1_cmq_profile_probe probe;
-    rdma_xtr_v1_doorbell_codec_registry conflicted_registry;
-    rdma_xtr_v1_doorbell_codec conflict_codec;
-    rdma_codec_key conflict_key;
+    uvm_factory factory;
     rdma_status status;
     string expected_message;
 
@@ -251,20 +291,18 @@ class rdma_xtr_v1_cmq_profile_test extends uvm_test;
     probe.clear_doorbell_defaults();
     expect_status("PROFILE_MISSING_DOORBELLS", probe.validate_profile(),
                   RDMA_SC_INVALID_STATE);
-    conflicted_registry =
-      rdma_xtr_v1_doorbell_codec_registry::type_id::create(
-        "conflicted_profile_registry");
-    conflict_codec = new("pre_registered_cmq_sq", "cmq_sq");
-    conflict_key = '{hw_version:"xtr_v1",
-                     image_kind:RDMA_IMAGE_DOORBELL,
-                     object_type:"doorbell", variant:"cmq_sq",
-                     opcode:8'h00};
-    expect_status("PROFILE_ARM_REGISTRATION_FAILURE",
-                  conflicted_registry.register_codec(conflict_key,
-                                                     conflict_codec),
-                  RDMA_SC_OK);
-    failed_registration_profile = new(
-      "failed_doorbell_registration", conflicted_registry);
+    factory = uvm_factory::get();
+    factory.set_type_override_by_type(
+      rdma_xtr_v1_doorbell_codec_registry::get_type(),
+      rdma_xtr_v1_cmq_conflicted_doorbell_registry::get_type()
+    );
+    rdma_xtr_v1_cmq_conflicted_doorbell_registry::arm_next_instance();
+    failed_registration_profile =
+      rdma_xtr_v1_cmq_hw_profile::type_id::create(
+        "failed_doorbell_registration");
+    if (!rdma_xtr_v1_cmq_conflicted_doorbell_registry::seeded_collision())
+      `uvm_error("PROFILE_ARM_REGISTRATION_FAILURE",
+                 "factory override did not seed the intended collision")
     status = failed_registration_profile.validate_profile();
     expect_status("PROFILE_FAILED_DOORBELL_REGISTRATION", status,
                   RDMA_SC_INVALID_STATE);
@@ -276,6 +314,11 @@ class rdma_xtr_v1_cmq_profile_test extends uvm_test;
       `uvm_error("PROFILE_FAILED_DOORBELL_REGISTRATION",
                  {"profile did not preserve register_defaults failure: ",
                   status.message})
+
+    profile = rdma_xtr_v1_cmq_hw_profile::type_id::create(
+      "profile_after_registration_failure");
+    expect_status("PROFILE_AFTER_REGISTRATION_FAILURE",
+                  profile.validate_profile(), RDMA_SC_OK);
   endfunction
 
   function automatic void check_compose_sqe();
