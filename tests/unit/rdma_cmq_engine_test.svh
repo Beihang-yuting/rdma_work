@@ -70,6 +70,14 @@ typedef enum int unsigned {
 } rdma_cmq_test_extension_fault_e;
 
 typedef enum int unsigned {
+  RDMA_CMQ_TEST_DIRECT_HANDLE_GOOD,
+  RDMA_CMQ_TEST_DIRECT_HANDLE_DROP_SCALAR,
+  RDMA_CMQ_TEST_DIRECT_HANDLE_ALIAS_EDGE,
+  RDMA_CMQ_TEST_DIRECT_HANDLE_SAME_DRIFT,
+  RDMA_CMQ_TEST_DIRECT_HANDLE_DETACH_DRIFT
+} rdma_cmq_test_direct_handle_fault_e;
+
+typedef enum int unsigned {
   RDMA_CMQ_TEST_ABORT_SLOT_CONTEXT,
   RDMA_CMQ_TEST_ABORT_TICKET,
   RDMA_CMQ_TEST_ABORT_SLOT_RECORD,
@@ -229,6 +237,31 @@ class rdma_cmq_edge_extension_qpc extends rdma_qpc_model;
     result.copy(this);
     result.extension_h = extension_h;
     return result;
+  endfunction
+endclass
+
+class rdma_cmq_scalar_extension_function_handle
+    extends rdma_function_handle;
+  `uvm_object_utils(rdma_cmq_scalar_extension_function_handle)
+
+  int unsigned extension_value;
+
+  function new(
+    string name = "rdma_cmq_scalar_extension_function_handle"
+  );
+    super.new(name);
+    extension_value = 0;
+  endfunction
+endclass
+
+class rdma_cmq_edge_extension_handle extends rdma_handle;
+  `uvm_object_utils(rdma_cmq_edge_extension_handle)
+
+  rdma_handle extension_h;
+
+  function new(string name = "rdma_cmq_edge_extension_handle");
+    super.new(name);
+    extension_h = null;
   endfunction
 endclass
 
@@ -958,6 +991,7 @@ class rdma_cmq_profile_hook_fault_profile extends rdma_cmq_test_profile;
 
   rdma_cmq_test_hook_fault_e snapshot_fault;
   rdma_cmq_test_extension_fault_e extension_fault;
+  rdma_cmq_test_direct_handle_fault_e direct_handle_fault;
   int unsigned snapshot_calls;
   int unsigned same_calls;
   int unsigned detach_calls;
@@ -966,6 +1000,7 @@ class rdma_cmq_profile_hook_fault_profile extends rdma_cmq_test_profile;
     super.new(name);
     snapshot_fault = RDMA_CMQ_TEST_HOOK_GOOD;
     extension_fault = RDMA_CMQ_TEST_EXTENSION_GOOD;
+    direct_handle_fault = RDMA_CMQ_TEST_DIRECT_HANDLE_GOOD;
     snapshot_calls = 0;
     same_calls = 0;
     detach_calls = 0;
@@ -984,6 +1019,23 @@ class rdma_cmq_profile_hook_fault_profile extends rdma_cmq_test_profile;
     return result;
   endfunction
 
+  protected function rdma_function_handle copy_function_handle(
+    rdma_function_handle source
+  );
+    rdma_function_handle result;
+
+    if (source == null)
+      return null;
+    result = rdma_function_handle::type_id::create(
+      "hook_snapshot_function_handle"
+    );
+    result.kind = source.kind;
+    result.function_uid = source.function_uid;
+    result.object_id = source.object_id;
+    result.generation = source.generation;
+    return result;
+  endfunction
+
   protected function bit same_nested_handle_value(
     rdma_handle lhs,
     rdma_handle rhs
@@ -994,6 +1046,53 @@ class rdma_cmq_profile_hook_fault_profile extends rdma_cmq_test_profile;
            lhs.function_uid == rhs.function_uid &&
            lhs.object_id == rhs.object_id &&
            lhs.generation == rhs.generation;
+  endfunction
+
+  protected function bit same_sqe_base_value(
+    rdma_cmq_sqe_model lhs,
+    rdma_cmq_sqe_model rhs
+  );
+    if (lhs == null || rhs == null)
+      return 1'b0;
+    return lhs.opcode == rhs.opcode &&
+           lhs.command_id == rhs.command_id &&
+           lhs.flags == rhs.flags &&
+           same_nested_handle_value(lhs.function_h, rhs.function_h) &&
+           same_nested_handle_value(lhs.target_h, rhs.target_h) &&
+           lhs.context_model == null && rhs.context_model == null;
+  endfunction
+
+  protected function void append_sqe_graph_nodes(
+    rdma_cmq_sqe_model sqe,
+    uvm_object extension_edge,
+    ref uvm_object nodes[$]
+  );
+    if (sqe == null)
+      return;
+    nodes.push_back(sqe);
+    if (sqe.function_h != null) nodes.push_back(sqe.function_h);
+    if (sqe.target_h != null) nodes.push_back(sqe.target_h);
+    if (sqe.context_model != null) nodes.push_back(sqe.context_model);
+    if (extension_edge != null) nodes.push_back(extension_edge);
+  endfunction
+
+  protected function bit sqe_graphs_are_detached(
+    rdma_cmq_sqe_model source,
+    uvm_object source_extension_edge,
+    rdma_cmq_sqe_model snapshot,
+    uvm_object snapshot_extension_edge
+  );
+    uvm_object source_nodes[$];
+    uvm_object snapshot_nodes[$];
+
+    append_sqe_graph_nodes(source, source_extension_edge, source_nodes);
+    append_sqe_graph_nodes(snapshot, snapshot_extension_edge,
+                           snapshot_nodes);
+    foreach (source_nodes[i])
+      foreach (snapshot_nodes[j])
+        if (source_nodes[i] == snapshot_nodes[j])
+          return 1'b0;
+    return source_nodes.size() != 0 && snapshot_nodes.size() != 0;
   endfunction
 
   protected function bit same_qpc_base_value(
@@ -1082,9 +1181,69 @@ class rdma_cmq_profile_hook_fault_profile extends rdma_cmq_test_profile;
     rdma_cmq_scalar_extension_qpc snapshot_scalar;
     rdma_cmq_edge_extension_qpc source_edge;
     rdma_cmq_edge_extension_qpc snapshot_edge;
+    rdma_cmq_sqe_model source_sqe;
+    rdma_cmq_sqe_model snapshot_sqe;
+    rdma_cmq_scalar_extension_function_handle source_scalar_handle;
+    rdma_cmq_scalar_extension_function_handle snapshot_scalar_handle;
+    rdma_cmq_edge_extension_handle source_edge_handle;
+    rdma_cmq_edge_extension_handle snapshot_edge_handle;
     uvm_object cloned_object;
 
     snapshot = null;
+    if ($cast(source_sqe, source) &&
+        ($cast(source_scalar_handle, source_sqe.function_h) ||
+         $cast(source_edge_handle, source_sqe.target_h))) begin
+      snapshot_calls++;
+      snapshot_sqe = rdma_cmq_sqe_model::type_id::create(
+        "profile_direct_handle_sqe_snapshot"
+      );
+      snapshot_sqe.opcode = source_sqe.opcode;
+      snapshot_sqe.command_id = source_sqe.command_id;
+      snapshot_sqe.flags = source_sqe.flags;
+      if (source_scalar_handle != null) begin
+        snapshot_scalar_handle =
+          rdma_cmq_scalar_extension_function_handle::type_id::create(
+            "profile_scalar_function_snapshot"
+          );
+        snapshot_scalar_handle.kind = source_scalar_handle.kind;
+        snapshot_scalar_handle.function_uid =
+          source_scalar_handle.function_uid;
+        snapshot_scalar_handle.object_id = source_scalar_handle.object_id;
+        snapshot_scalar_handle.generation = source_scalar_handle.generation;
+        snapshot_scalar_handle.extension_value =
+          source_scalar_handle.extension_value;
+        if (direct_handle_fault == RDMA_CMQ_TEST_DIRECT_HANDLE_DROP_SCALAR)
+          snapshot_scalar_handle.extension_value = 0;
+        snapshot_sqe.function_h = snapshot_scalar_handle;
+      end
+      else begin
+        snapshot_sqe.function_h = copy_function_handle(
+          source_sqe.function_h
+        );
+      end
+      if (source_edge_handle != null) begin
+        snapshot_edge_handle =
+          rdma_cmq_edge_extension_handle::type_id::create(
+            "profile_edge_target_snapshot"
+          );
+        snapshot_edge_handle.kind = source_edge_handle.kind;
+        snapshot_edge_handle.function_uid = source_edge_handle.function_uid;
+        snapshot_edge_handle.object_id = source_edge_handle.object_id;
+        snapshot_edge_handle.generation = source_edge_handle.generation;
+        snapshot_edge_handle.extension_h = copy_nested_handle(
+          source_edge_handle.extension_h
+        );
+        if (direct_handle_fault == RDMA_CMQ_TEST_DIRECT_HANDLE_ALIAS_EDGE)
+          snapshot_edge_handle.extension_h = source_edge_handle.extension_h;
+        snapshot_sqe.target_h = snapshot_edge_handle;
+      end
+      else begin
+        snapshot_sqe.target_h = copy_nested_handle(source_sqe.target_h);
+      end
+      snapshot_sqe.context_model = null;
+      snapshot = snapshot_sqe;
+      return rdma_status::success();
+    end
     if ($cast(source_scalar, source)) begin
       snapshot_calls++;
       if (extension_fault == RDMA_CMQ_TEST_EXTENSION_NULL_OUTPUT)
@@ -1192,8 +1351,42 @@ class rdma_cmq_profile_hook_fault_profile extends rdma_cmq_test_profile;
     rdma_cmq_scalar_extension_qpc rhs_scalar;
     rdma_cmq_edge_extension_qpc lhs_edge;
     rdma_cmq_edge_extension_qpc rhs_edge;
+    rdma_cmq_sqe_model lhs_sqe;
+    rdma_cmq_sqe_model rhs_sqe;
+    rdma_cmq_scalar_extension_function_handle lhs_scalar_handle;
+    rdma_cmq_scalar_extension_function_handle rhs_scalar_handle;
+    rdma_cmq_edge_extension_handle lhs_edge_handle;
+    rdma_cmq_edge_extension_handle rhs_edge_handle;
     bit same_value;
 
+    if ($cast(lhs_sqe, lhs) && $cast(rhs_sqe, rhs)) begin
+      if ($cast(lhs_scalar_handle, lhs_sqe.function_h) &&
+          $cast(rhs_scalar_handle, rhs_sqe.function_h)) begin
+        same_calls++;
+        same_value = same_sqe_base_value(lhs_sqe, rhs_sqe) &&
+                     lhs_scalar_handle.extension_value ==
+                       rhs_scalar_handle.extension_value;
+        if (direct_handle_fault ==
+              RDMA_CMQ_TEST_DIRECT_HANDLE_DROP_SCALAR &&
+            same_calls == 1)
+          return same_sqe_base_value(lhs_sqe, rhs_sqe);
+        if (direct_handle_fault ==
+              RDMA_CMQ_TEST_DIRECT_HANDLE_SAME_DRIFT &&
+            same_calls > 1)
+          return 1'b0;
+        return same_value;
+      end
+      if ($cast(lhs_edge_handle, lhs_sqe.target_h) &&
+          $cast(rhs_edge_handle, rhs_sqe.target_h)) begin
+        same_calls++;
+        same_value = same_sqe_base_value(lhs_sqe, rhs_sqe) &&
+                     same_nested_handle_value(
+                       lhs_edge_handle.extension_h,
+                       rhs_edge_handle.extension_h
+                     );
+        return same_value;
+      end
+    end
     if ($cast(lhs_scalar, lhs) && $cast(rhs_scalar, rhs)) begin
       same_calls++;
       return same_qpc_base_value(lhs_scalar, rhs_scalar) &&
@@ -1231,7 +1424,44 @@ class rdma_cmq_profile_hook_fault_profile extends rdma_cmq_test_profile;
     rdma_cmq_scalar_extension_qpc snapshot_scalar;
     rdma_cmq_edge_extension_qpc source_edge;
     rdma_cmq_edge_extension_qpc snapshot_edge;
+    rdma_cmq_sqe_model source_sqe;
+    rdma_cmq_sqe_model snapshot_sqe;
+    rdma_cmq_scalar_extension_function_handle source_scalar_handle;
+    rdma_cmq_scalar_extension_function_handle snapshot_scalar_handle;
+    rdma_cmq_edge_extension_handle source_edge_handle;
+    rdma_cmq_edge_extension_handle snapshot_edge_handle;
+    bit detached;
 
+    if ($cast(source_sqe, source) && $cast(snapshot_sqe, snapshot)) begin
+      if ($cast(source_scalar_handle, source_sqe.function_h) &&
+          $cast(snapshot_scalar_handle, snapshot_sqe.function_h)) begin
+        detach_calls++;
+        detached = sqe_graphs_are_detached(source_sqe, null,
+                                           snapshot_sqe, null);
+        if (direct_handle_fault ==
+              RDMA_CMQ_TEST_DIRECT_HANDLE_DETACH_DRIFT &&
+            detach_calls > 1)
+          return 1'b0;
+        return detached;
+      end
+      if ($cast(source_edge_handle, source_sqe.target_h) &&
+          $cast(snapshot_edge_handle, snapshot_sqe.target_h)) begin
+        detach_calls++;
+        detached = sqe_graphs_are_detached(
+          source_sqe, source_edge_handle.extension_h,
+          snapshot_sqe, snapshot_edge_handle.extension_h
+        );
+        if (direct_handle_fault ==
+              RDMA_CMQ_TEST_DIRECT_HANDLE_ALIAS_EDGE &&
+            detach_calls == 1)
+          return 1'b1;
+        if (direct_handle_fault ==
+              RDMA_CMQ_TEST_DIRECT_HANDLE_DETACH_DRIFT &&
+            detach_calls > 1)
+          return 1'b0;
+        return detached;
+      end
+    end
     if ($cast(source_scalar, source) &&
         $cast(snapshot_scalar, snapshot)) begin
       detach_calls++;
@@ -4391,6 +4621,28 @@ class rdma_cmq_engine_test extends uvm_test;
       `uvm_error("MUTATING_SOURCE_LEDGER",
                  "mutating clone failure changed the authority ledger")
 
+    clear_submit_observation(mem, pcie, trace);
+    requests = new[1];
+    requests[0] = make_command(
+      "mutating_source_recovery", active_binding,
+      rdma_cmq_test_profile::TEST_OPCODE_A, 8'hd0
+    );
+    engine.submit_batch(requests, tickets, item_statuses, batch_status);
+    expect_status("MUTATING_SOURCE_RECOVERY_BATCH", batch_status,
+                  RDMA_SC_OK);
+    if (tickets.size() != 1 || tickets[0] == null ||
+        item_statuses.size() != 1)
+      `uvm_error("MUTATING_SOURCE_RECOVERY",
+                 "source restoration failure contaminated recovery")
+    else
+      expect_status("MUTATING_SOURCE_RECOVERY_ITEM", item_statuses[0],
+                    RDMA_SC_OK);
+    if (engine.published_count() != 1 ||
+        engine.tokens_in_use_count() != 1 ||
+        engine.slot_record_count() != 1)
+      `uvm_error("MUTATING_SOURCE_RECOVERY_LEDGER",
+                 "source restoration failure polluted recovery state")
+
     engine.shutdown(status);
     expect_status("MUTATING_SOURCE_SHUTDOWN", status, RDMA_SC_OK);
   endtask
@@ -5631,6 +5883,10 @@ class rdma_cmq_engine_test extends uvm_test;
     rdma_cmq_runtime_desc runtime_desc;
     rdma_cmq_command_desc requests[];
     rdma_cmq_sqe_model command_body;
+    rdma_cmq_scalar_extension_function_handle scalar_function_h;
+    rdma_cmq_edge_extension_handle edge_target_h;
+    rdma_handle saved_extension_h;
+    int unsigned saved_extension_value;
     rdma_cmq_ticket tickets[];
     rdma_status item_statuses[];
     rdma_status batch_status;
@@ -5837,6 +6093,150 @@ class rdma_cmq_engine_test extends uvm_test;
       engine.shutdown(status);
       expect_status($sformatf("EXTENSION_CONTRACT_SHUTDOWN_%0d", fault),
                     status, RDMA_SC_OK);
+    end
+
+    for (int unsigned fault = RDMA_CMQ_TEST_DIRECT_HANDLE_DROP_SCALAR;
+         fault <= RDMA_CMQ_TEST_DIRECT_HANDLE_DETACH_DRIFT; fault++) begin
+      engine = rdma_cmq_engine_probe::type_id::create(
+        $sformatf("direct_handle_engine_%0d", fault)
+      );
+      mem = rdma_mock_host_mem::type_id::create(
+        $sformatf("direct_handle_mem_%0d", fault)
+      );
+      pcie = rdma_cmq_test_pcie::type_id::create(
+        $sformatf("direct_handle_pcie_%0d", fault)
+      );
+      trace = rdma_mock_call_trace::type_id::create(
+        $sformatf("direct_handle_trace_%0d", fault)
+      );
+      mem.set_call_trace(trace);
+      pcie.set_call_trace(trace);
+      scheduler = rdma_doorbell_scheduler::type_id::create(
+        $sformatf("direct_handle_scheduler_%0d", fault)
+      );
+      profile = rdma_cmq_profile_hook_fault_profile::type_id::create(
+        $sformatf("direct_handle_profile_%0d", fault)
+      );
+      if (!$cast(profile.direct_handle_fault, fault))
+        `uvm_fatal("DIRECT_HANDLE_SETUP",
+                   "direct handle fault enum cast failed")
+      prepared_binding = make_binding(
+        $sformatf("direct_handle_prepared_%0d", fault),
+        RDMA_BIND_PREPARED
+      );
+      active_binding = make_binding(
+        $sformatf("direct_handle_active_%0d", fault), RDMA_BIND_ACTIVE
+      );
+      cmq = make_cmq($sformatf("direct_handle_cmq_%0d", fault),
+                     prepared_binding);
+      prepare_active($sformatf("DIRECT_HANDLE_%0d", fault), engine, mem,
+                     pcie, scheduler, profile, prepared_binding,
+                     active_binding, cmq, runtime_desc);
+      clear_submit_observation(mem, pcie, trace);
+
+      requests = new[1];
+      requests[0] = make_command(
+        $sformatf("direct_handle_request_%0d", fault), active_binding,
+        rdma_cmq_test_profile::TEST_OPCODE_A, byte'(8'he0 + fault)
+      );
+      if (!$cast(command_body, requests[0].body))
+        `uvm_fatal("DIRECT_HANDLE_SETUP", "command body cast failed")
+      scalar_function_h = null;
+      edge_target_h = null;
+      saved_extension_h = null;
+      saved_extension_value = 0;
+      if (fault inside {
+            RDMA_CMQ_TEST_DIRECT_HANDLE_DROP_SCALAR,
+            RDMA_CMQ_TEST_DIRECT_HANDLE_SAME_DRIFT
+          }) begin
+        scalar_function_h =
+          rdma_cmq_scalar_extension_function_handle::type_id::create(
+            $sformatf("direct_handle_scalar_%0d", fault)
+          );
+        scalar_function_h.copy(command_body.function_h);
+        scalar_function_h.extension_value = 32'hcafe_0000 + fault;
+        saved_extension_value = scalar_function_h.extension_value;
+        command_body.function_h = scalar_function_h;
+      end
+      else begin
+        edge_target_h = rdma_cmq_edge_extension_handle::type_id::create(
+          $sformatf("direct_handle_edge_%0d", fault)
+        );
+        edge_target_h.copy(command_body.target_h);
+        edge_target_h.extension_h = make_context_handle(
+          $sformatf("direct_handle_edge_object_%0d", fault),
+          active_binding, RDMA_RESOURCE_CMQ, TEST_CMQ_ID
+        );
+        saved_extension_h = edge_target_h.extension_h;
+        command_body.target_h = edge_target_h;
+      end
+
+      engine.submit_batch(requests, tickets, item_statuses, batch_status);
+
+      expect_status($sformatf("DIRECT_HANDLE_BATCH_%0d", fault),
+                    batch_status, RDMA_SC_INVALID_STATE);
+      if (tickets.size() != 1 || tickets[0] != null ||
+          item_statuses.size() != 1)
+        `uvm_error("DIRECT_HANDLE_OUTPUT",
+                   $sformatf("fault %0d published output", fault))
+      else
+        expect_status($sformatf("DIRECT_HANDLE_ITEM_%0d", fault),
+                      item_statuses[0], RDMA_SC_INVALID_STATE);
+      if (profile.snapshot_calls != 1 || profile.same_calls != 2 ||
+          profile.detach_calls !=
+            ((fault inside {
+                RDMA_CMQ_TEST_DIRECT_HANDLE_ALIAS_EDGE,
+                RDMA_CMQ_TEST_DIRECT_HANDLE_DETACH_DRIFT
+              }) ? 2 : 1))
+        `uvm_error("DIRECT_HANDLE_HOOKS",
+                   $sformatf("fault %0d hook counts are %0d/%0d/%0d",
+                             fault, profile.snapshot_calls,
+                             profile.same_calls, profile.detach_calls))
+      if ((scalar_function_h != null &&
+           (command_body.function_h != scalar_function_h ||
+            scalar_function_h.extension_value != saved_extension_value)) ||
+          (edge_target_h != null &&
+           (command_body.target_h != edge_target_h ||
+            edge_target_h.extension_h != saved_extension_h)))
+        `uvm_error("DIRECT_HANDLE_SOURCE",
+                   $sformatf("fault %0d changed the caller body", fault))
+      expect_no_submit_side_effects(
+        $sformatf("DIRECT_HANDLE_EFFECTS_%0d", fault), mem, pcie, trace
+      );
+      if (profile.doorbell_calls != 0)
+        `uvm_error("DIRECT_HANDLE_DOORBELL",
+                   $sformatf("fault %0d encoded a doorbell", fault))
+      if (engine.published_count() != 0 ||
+          engine.tokens_in_use_count() != 0 ||
+          engine.slot_record_count() != 0)
+        `uvm_error("DIRECT_HANDLE_LEDGER",
+                   $sformatf("fault %0d committed tentative state", fault))
+
+      profile.direct_handle_fault = RDMA_CMQ_TEST_DIRECT_HANDLE_GOOD;
+      clear_submit_observation(mem, pcie, trace);
+      requests[0] = make_command(
+        $sformatf("direct_handle_recovery_%0d", fault), active_binding,
+        rdma_cmq_test_profile::TEST_OPCODE_A, byte'(8'hf0 + fault)
+      );
+      engine.submit_batch(requests, tickets, item_statuses, batch_status);
+      expect_status($sformatf("DIRECT_HANDLE_RECOVERY_BATCH_%0d", fault),
+                    batch_status, RDMA_SC_OK);
+      if (tickets.size() != 1 || tickets[0] == null ||
+          item_statuses.size() != 1)
+        `uvm_error("DIRECT_HANDLE_RECOVERY",
+                   $sformatf("fault %0d blocked recovery", fault))
+      else
+        expect_status($sformatf("DIRECT_HANDLE_RECOVERY_ITEM_%0d", fault),
+                      item_statuses[0], RDMA_SC_OK);
+      if (engine.published_count() != 1 ||
+          engine.tokens_in_use_count() != 1 ||
+          engine.slot_record_count() != 1)
+        `uvm_error("DIRECT_HANDLE_RECOVERY_LEDGER",
+                   $sformatf("fault %0d did not recover cleanly", fault))
+
+      engine.shutdown(status);
+      expect_status($sformatf("DIRECT_HANDLE_SHUTDOWN_%0d", fault), status,
+                    RDMA_SC_OK);
     end
   endtask
 

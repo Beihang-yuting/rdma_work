@@ -847,6 +847,12 @@ class rdma_cmq_engine extends uvm_object;
     rhs_type = rhs.get_object_type();
     if (lhs_type == null || rhs_type == null || lhs_type != rhs_type)
       return 1'b0;
+    if (!core_body_shell_is_exact(lhs) ||
+        !core_body_shell_is_exact(rhs)) begin
+      if (profile == null)
+        return 1'b0;
+      return profile.same_command_body_value(lhs, rhs);
+    end
     if (lhs_type == rdma_cmq_sqe_model::get_type()) begin
       if (!$cast(lhs_sqe, lhs) || !$cast(rhs_sqe, rhs))
         return 1'b0;
@@ -863,12 +869,6 @@ class rdma_cmq_engine extends uvm_object;
       return lhs_sqe.context_model == null ||
              same_body_value(lhs_sqe.context_model,
                              rhs_sqe.context_model);
-    end
-    if (!core_body_shell_is_exact(lhs) ||
-        !core_body_shell_is_exact(rhs)) begin
-      if (profile == null)
-        return 1'b0;
-      return profile.same_command_body_value(lhs, rhs);
     end
     lhs_value = body_value_key(lhs);
     rhs_value = body_value_key(rhs);
@@ -965,6 +965,12 @@ class rdma_cmq_engine extends uvm_object;
     if (source_type == null || snapshot_type == null ||
         source_type != snapshot_type)
       return 1'b0;
+    if (!core_body_shell_is_exact(source) ||
+        !core_body_shell_is_exact(snapshot)) begin
+      if (profile == null)
+        return 1'b0;
+      return profile.command_body_graph_detached(source, snapshot);
+    end
     if (source_type == rdma_cmq_sqe_model::get_type()) begin
       if (!$cast(source_sqe, source) || !$cast(snapshot_sqe, snapshot))
         return 1'b0;
@@ -980,12 +986,6 @@ class rdma_cmq_engine extends uvm_object;
       return source_sqe.context_model == null ||
              body_graph_detached(source_sqe.context_model,
                                  snapshot_sqe.context_model);
-    end
-    if (!core_body_shell_is_exact(source) ||
-        !core_body_shell_is_exact(snapshot)) begin
-      if (profile == null)
-        return 1'b0;
-      return profile.command_body_graph_detached(source, snapshot);
     end
     append_body_graph_nodes(source, source_nodes);
     append_body_graph_nodes(snapshot, snapshot_nodes);
