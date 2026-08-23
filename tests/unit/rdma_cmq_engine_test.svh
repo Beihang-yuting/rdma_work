@@ -8,7 +8,13 @@ typedef enum int unsigned {
   RDMA_CMQ_TEST_SQE_BAD_TARGET_KIND,
   RDMA_CMQ_TEST_SQE_BAD_TARGET_ADDRESS,
   RDMA_CMQ_TEST_EXPECTED_NULL,
-  RDMA_CMQ_TEST_EXPECTED_INVALID
+  RDMA_CMQ_TEST_EXPECTED_INVALID,
+  RDMA_CMQ_TEST_SQE_INACTIVE_HMC,
+  RDMA_CMQ_TEST_SQE_INACTIVE_BAR,
+  RDMA_CMQ_TEST_SQE_CLONE_SELF,
+  RDMA_CMQ_TEST_SQE_CLONE_MUTATE,
+  RDMA_CMQ_TEST_EXPECTED_CLONE_SELF,
+  RDMA_CMQ_TEST_EXPECTED_CLONE_MUTATE
 } rdma_cmq_test_sqe_fault_e;
 
 typedef enum int unsigned {
@@ -17,8 +23,284 @@ typedef enum int unsigned {
   RDMA_CMQ_TEST_DB_BAD_LENGTH,
   RDMA_CMQ_TEST_DB_BAD_KIND,
   RDMA_CMQ_TEST_DB_STALE_GENERATION,
-  RDMA_CMQ_TEST_DB_BAD_TARGET_KIND
+  RDMA_CMQ_TEST_DB_BAD_TARGET_KIND,
+  RDMA_CMQ_TEST_DB_INACTIVE_BACKING,
+  RDMA_CMQ_TEST_DB_INACTIVE_HMC,
+  RDMA_CMQ_TEST_DB_CLONE_SELF,
+  RDMA_CMQ_TEST_DB_CLONE_MUTATE
 } rdma_cmq_test_doorbell_fault_e;
+
+typedef enum bit [1:0] {
+  RDMA_CMQ_TEST_CLONE_GOOD,
+  RDMA_CMQ_TEST_CLONE_NULL,
+  RDMA_CMQ_TEST_CLONE_SELF,
+  RDMA_CMQ_TEST_CLONE_MUTATE
+} rdma_cmq_test_clone_fault_e;
+
+typedef enum int unsigned {
+  RDMA_CMQ_TEST_ABORT_SLOT_CONTEXT,
+  RDMA_CMQ_TEST_ABORT_TICKET,
+  RDMA_CMQ_TEST_ABORT_SLOT_RECORD,
+  RDMA_CMQ_TEST_ABORT_DEPENDENCY,
+  RDMA_CMQ_TEST_ABORT_DOORBELL_DESC,
+  RDMA_CMQ_TEST_ABORT_PROFILE_OUTPUT
+} rdma_cmq_test_abort_fault_e;
+
+class rdma_cmq_clone_fault_function_handle extends rdma_function_handle;
+  `uvm_object_utils(rdma_cmq_clone_fault_function_handle)
+
+  rdma_cmq_test_clone_fault_e clone_fault;
+
+  function new(string name = "rdma_cmq_clone_fault_function_handle");
+    super.new(name);
+    clone_fault = RDMA_CMQ_TEST_CLONE_GOOD;
+  endfunction
+
+  virtual function uvm_object clone();
+    case (clone_fault)
+      RDMA_CMQ_TEST_CLONE_NULL: return null;
+      RDMA_CMQ_TEST_CLONE_SELF: return this;
+      default: return super.clone();
+    endcase
+  endfunction
+endclass
+
+class rdma_cmq_clone_fault_opcode_key extends rdma_cmq_opcode_key;
+  `uvm_object_utils(rdma_cmq_clone_fault_opcode_key)
+
+  rdma_cmq_test_clone_fault_e clone_fault;
+
+  function new(string name = "rdma_cmq_clone_fault_opcode_key");
+    super.new(name);
+    clone_fault = RDMA_CMQ_TEST_CLONE_GOOD;
+  endfunction
+
+  virtual function uvm_object clone();
+    case (clone_fault)
+      RDMA_CMQ_TEST_CLONE_NULL: return null;
+      RDMA_CMQ_TEST_CLONE_SELF: return this;
+      default: return super.clone();
+    endcase
+  endfunction
+endclass
+
+class rdma_cmq_clone_fault_body extends rdma_cmq_sqe_model;
+  `uvm_object_utils(rdma_cmq_clone_fault_body)
+
+  rdma_cmq_test_clone_fault_e clone_fault;
+
+  function new(string name = "rdma_cmq_clone_fault_body");
+    super.new(name);
+    clone_fault = RDMA_CMQ_TEST_CLONE_GOOD;
+  endfunction
+
+  virtual function uvm_object clone();
+    case (clone_fault)
+      RDMA_CMQ_TEST_CLONE_NULL: return null;
+      RDMA_CMQ_TEST_CLONE_SELF: return this;
+      default: return super.clone();
+    endcase
+  endfunction
+endclass
+
+class rdma_cmq_clone_fault_image extends rdma_hw_image;
+  `uvm_object_utils(rdma_cmq_clone_fault_image)
+
+  rdma_cmq_test_clone_fault_e clone_fault;
+
+  function new(string name = "rdma_cmq_clone_fault_image");
+    super.new(name);
+    clone_fault = RDMA_CMQ_TEST_CLONE_GOOD;
+  endfunction
+
+  virtual function uvm_object clone();
+    case (clone_fault)
+      RDMA_CMQ_TEST_CLONE_NULL: return null;
+      RDMA_CMQ_TEST_CLONE_SELF: return this;
+      RDMA_CMQ_TEST_CLONE_MUTATE: begin
+        if (bytes.size() == 0)
+          length++;
+        else
+          bytes[0] ^= 8'hff;
+        return super.clone();
+      end
+      default: return super.clone();
+    endcase
+  endfunction
+endclass
+
+class rdma_cmq_clone_fault_expected extends rdma_cmq_expected_response;
+  `uvm_object_utils(rdma_cmq_clone_fault_expected)
+
+  rdma_cmq_test_clone_fault_e clone_fault;
+
+  function new(string name = "rdma_cmq_clone_fault_expected");
+    super.new(name);
+    clone_fault = RDMA_CMQ_TEST_CLONE_GOOD;
+  endfunction
+
+  virtual function uvm_object clone();
+    case (clone_fault)
+      RDMA_CMQ_TEST_CLONE_NULL: return null;
+      RDMA_CMQ_TEST_CLONE_SELF: return this;
+      RDMA_CMQ_TEST_CLONE_MUTATE: begin
+        variant = {variant, "_mutated"};
+        return super.clone();
+      end
+      default: return super.clone();
+    endcase
+  endfunction
+endclass
+
+class rdma_cmq_failing_slot_context extends rdma_cmq_slot_context;
+  `uvm_object_utils(rdma_cmq_failing_slot_context)
+
+  local static bit arm_failure;
+
+  function new(string name = "rdma_cmq_failing_slot_context");
+    super.new(name);
+  endfunction
+
+  static function void arm();
+    arm_failure = 1'b1;
+  endfunction
+
+  static function void disarm();
+    arm_failure = 1'b0;
+  endfunction
+
+  static function bit armed();
+    return arm_failure;
+  endfunction
+
+  virtual function uvm_object clone();
+    if (arm_failure && sq_index == 1) begin
+      arm_failure = 1'b0;
+      return this;
+    end
+    return super.clone();
+  endfunction
+endclass
+
+class rdma_cmq_failing_ticket extends rdma_cmq_ticket;
+  `uvm_object_utils(rdma_cmq_failing_ticket)
+
+  local static bit arm_failure;
+
+  function new(string name = "rdma_cmq_failing_ticket");
+    super.new(name);
+  endfunction
+
+  static function void arm();
+    arm_failure = 1'b1;
+  endfunction
+
+  static function void disarm();
+    arm_failure = 1'b0;
+  endfunction
+
+  static function bit armed();
+    return arm_failure;
+  endfunction
+
+  virtual function uvm_object clone();
+    if (arm_failure && sq_index == 1) begin
+      arm_failure = 1'b0;
+      return this;
+    end
+    return super.clone();
+  endfunction
+endclass
+
+class rdma_cmq_failing_slot_record extends rdma_cmq_slot_record;
+  `uvm_object_utils(rdma_cmq_failing_slot_record)
+
+  local static bit arm_failure;
+
+  function new(string name = "rdma_cmq_failing_slot_record");
+    super.new(name);
+  endfunction
+
+  static function void arm();
+    arm_failure = 1'b1;
+  endfunction
+
+  static function void disarm();
+    arm_failure = 1'b0;
+  endfunction
+
+  static function bit armed();
+    return arm_failure;
+  endfunction
+
+  virtual function uvm_object clone();
+    if (arm_failure && sq_index == 1) begin
+      arm_failure = 1'b0;
+      return this;
+    end
+    return super.clone();
+  endfunction
+endclass
+
+class rdma_cmq_failing_dependency extends rdma_doorbell_dependency;
+  `uvm_object_utils(rdma_cmq_failing_dependency)
+
+  local static bit arm_failure;
+
+  function new(string name = "rdma_cmq_failing_dependency");
+    super.new(name);
+  endfunction
+
+  static function void arm();
+    arm_failure = 1'b1;
+  endfunction
+
+  static function void disarm();
+    arm_failure = 1'b0;
+  endfunction
+
+  static function bit armed();
+    return arm_failure;
+  endfunction
+
+  virtual function uvm_object clone();
+    if (arm_failure && relative_offset == 64) begin
+      arm_failure = 1'b0;
+      return this;
+    end
+    return super.clone();
+  endfunction
+endclass
+
+class rdma_cmq_failing_doorbell_desc extends rdma_doorbell_desc;
+  `uvm_object_utils(rdma_cmq_failing_doorbell_desc)
+
+  local static bit arm_failure;
+
+  function new(string name = "rdma_cmq_failing_doorbell_desc");
+    super.new(name);
+  endfunction
+
+  static function void arm();
+    arm_failure = 1'b1;
+  endfunction
+
+  static function void disarm();
+    arm_failure = 1'b0;
+  endfunction
+
+  static function bit armed();
+    return arm_failure;
+  endfunction
+
+  virtual function uvm_object clone();
+    if (arm_failure) begin
+      arm_failure = 1'b0;
+      return this;
+    end
+    return super.clone();
+  endfunction
+endclass
 
 class rdma_cmq_test_profile extends rdma_cmq_hw_profile;
   `uvm_object_utils(rdma_cmq_test_profile)
@@ -33,6 +315,7 @@ class rdma_cmq_test_profile extends rdma_cmq_hw_profile;
   bit return_null_status;
   int unsigned validation_calls;
   rdma_cmq_test_sqe_fault_e sqe_fault;
+  int unsigned sqe_fault_compose_call;
   rdma_cmq_test_doorbell_fault_e doorbell_fault;
   bit [31:0] fail_compose_opcode;
   rdma_status_code_e compose_failure_code;
@@ -51,6 +334,7 @@ class rdma_cmq_test_profile extends rdma_cmq_hw_profile;
     return_null_status = 1'b0;
     validation_calls = 0;
     sqe_fault = RDMA_CMQ_TEST_SQE_GOOD;
+    sqe_fault_compose_call = 0;
     doorbell_fault = RDMA_CMQ_TEST_DB_GOOD;
     fail_compose_opcode = '0;
     compose_failure_code = RDMA_SC_CODEC_ERROR;
@@ -85,6 +369,8 @@ class rdma_cmq_test_profile extends rdma_cmq_hw_profile;
     output rdma_cmq_expected_response expected
   );
     rdma_cmq_sqe_model body;
+    rdma_cmq_clone_fault_image clone_fault_image;
+    rdma_cmq_clone_fault_expected clone_fault_expected;
 
     sqe = null;
     expected = null;
@@ -139,24 +425,55 @@ class rdma_cmq_test_profile extends rdma_cmq_hw_profile;
                                  command.opcode_key.opcode[7:0],
                                  body.flags[7:0]);
     last_expected_alias = expected;
-    case (sqe_fault)
-      RDMA_CMQ_TEST_SQE_SHORT: begin
-        void'(sqe.bytes.pop_back());
-        sqe.length = 63;
-      end
-      RDMA_CMQ_TEST_SQE_BAD_ALIGNMENT: sqe.alignment = 32;
-      RDMA_CMQ_TEST_SQE_BAD_KIND: sqe.image_kind = RDMA_IMAGE_CMQ_CQE;
-      RDMA_CMQ_TEST_SQE_STALE_GENERATION:
-        sqe.function_generation++;
-      RDMA_CMQ_TEST_SQE_BAD_TARGET_KIND:
-        sqe.write_target_kind = RDMA_HW_TARGET_BAR;
-      RDMA_CMQ_TEST_SQE_BAD_TARGET_ADDRESS:
-        sqe.backing_target.value++;
-      RDMA_CMQ_TEST_EXPECTED_NULL: expected = null;
-      RDMA_CMQ_TEST_EXPECTED_INVALID: expected.variant = "";
-      default: begin
-      end
-    endcase
+    if (sqe_fault_compose_call == 0 ||
+        compose_calls == sqe_fault_compose_call) begin
+      case (sqe_fault)
+        RDMA_CMQ_TEST_SQE_SHORT: begin
+          void'(sqe.bytes.pop_back());
+          sqe.length = 63;
+        end
+        RDMA_CMQ_TEST_SQE_BAD_ALIGNMENT: sqe.alignment = 32;
+        RDMA_CMQ_TEST_SQE_BAD_KIND: sqe.image_kind = RDMA_IMAGE_CMQ_CQE;
+        RDMA_CMQ_TEST_SQE_STALE_GENERATION:
+          sqe.function_generation++;
+        RDMA_CMQ_TEST_SQE_BAD_TARGET_KIND:
+          sqe.write_target_kind = RDMA_HW_TARGET_BAR;
+        RDMA_CMQ_TEST_SQE_BAD_TARGET_ADDRESS:
+          sqe.backing_target.value++;
+        RDMA_CMQ_TEST_EXPECTED_NULL: expected = null;
+        RDMA_CMQ_TEST_EXPECTED_INVALID: expected.variant = "";
+        RDMA_CMQ_TEST_SQE_INACTIVE_HMC:
+          sqe.hmc_target.value = 64'h40;
+        RDMA_CMQ_TEST_SQE_INACTIVE_BAR:
+          sqe.bar_target.value = 64'h80;
+        RDMA_CMQ_TEST_SQE_CLONE_SELF,
+        RDMA_CMQ_TEST_SQE_CLONE_MUTATE: begin
+          clone_fault_image = rdma_cmq_clone_fault_image::type_id::create(
+            "test_sqe_clone_fault"
+          );
+          clone_fault_image.copy(sqe);
+          clone_fault_image.clone_fault =
+            (sqe_fault == RDMA_CMQ_TEST_SQE_CLONE_SELF) ?
+              RDMA_CMQ_TEST_CLONE_SELF : RDMA_CMQ_TEST_CLONE_MUTATE;
+          sqe = clone_fault_image;
+        end
+        RDMA_CMQ_TEST_EXPECTED_CLONE_SELF,
+        RDMA_CMQ_TEST_EXPECTED_CLONE_MUTATE: begin
+          clone_fault_expected =
+            rdma_cmq_clone_fault_expected::type_id::create(
+              "test_expected_clone_fault"
+            );
+          clone_fault_expected.copy(expected);
+          clone_fault_expected.clone_fault =
+            (sqe_fault == RDMA_CMQ_TEST_EXPECTED_CLONE_SELF) ?
+              RDMA_CMQ_TEST_CLONE_SELF : RDMA_CMQ_TEST_CLONE_MUTATE;
+          expected = clone_fault_expected;
+          last_expected_alias = expected;
+        end
+        default: begin
+        end
+      endcase
+    end
     return rdma_status::success();
   endfunction
 
@@ -179,6 +496,7 @@ class rdma_cmq_test_profile extends rdma_cmq_hw_profile;
     output rdma_hw_image image
   );
     byte unsigned payload[8];
+    rdma_cmq_clone_fault_image clone_fault_image;
 
     image = null;
     doorbell_calls++;
@@ -213,6 +531,21 @@ class rdma_cmq_test_profile extends rdma_cmq_hw_profile;
         image.function_generation++;
       RDMA_CMQ_TEST_DB_BAD_TARGET_KIND:
         image.write_target_kind = RDMA_HW_TARGET_BACKING;
+      RDMA_CMQ_TEST_DB_INACTIVE_BACKING:
+        image.backing_target.value = 64'h40;
+      RDMA_CMQ_TEST_DB_INACTIVE_HMC:
+        image.hmc_target.value = 64'h80;
+      RDMA_CMQ_TEST_DB_CLONE_SELF,
+      RDMA_CMQ_TEST_DB_CLONE_MUTATE: begin
+        clone_fault_image = rdma_cmq_clone_fault_image::type_id::create(
+          "test_doorbell_clone_fault"
+        );
+        clone_fault_image.copy(image);
+        clone_fault_image.clone_fault =
+          (doorbell_fault == RDMA_CMQ_TEST_DB_CLONE_SELF) ?
+            RDMA_CMQ_TEST_CLONE_SELF : RDMA_CMQ_TEST_CLONE_MUTATE;
+        image = clone_fault_image;
+      end
       default: begin
       end
     endcase
@@ -728,6 +1061,47 @@ class rdma_cmq_engine_test extends uvm_test;
   function new(string name = "rdma_cmq_engine_test",
                uvm_component parent = null);
     super.new(name, parent);
+  endfunction
+
+  function automatic void configure_submission_factory_faults();
+    uvm_factory factory;
+
+    factory = uvm_factory::get();
+    factory.set_type_override_by_type(
+      rdma_cmq_slot_context::get_type(),
+      rdma_cmq_failing_slot_context::get_type()
+    );
+    factory.set_type_override_by_type(
+      rdma_cmq_ticket::get_type(), rdma_cmq_failing_ticket::get_type()
+    );
+    factory.set_type_override_by_type(
+      rdma_cmq_slot_record::get_type(),
+      rdma_cmq_failing_slot_record::get_type()
+    );
+    factory.set_type_override_by_type(
+      rdma_doorbell_dependency::get_type(),
+      rdma_cmq_failing_dependency::get_type()
+    );
+    factory.set_type_override_by_type(
+      rdma_doorbell_desc::get_type(),
+      rdma_cmq_failing_doorbell_desc::get_type()
+    );
+  endfunction
+
+  function automatic void disarm_submission_factory_faults();
+    rdma_cmq_failing_slot_context::disarm();
+    rdma_cmq_failing_ticket::disarm();
+    rdma_cmq_failing_slot_record::disarm();
+    rdma_cmq_failing_dependency::disarm();
+    rdma_cmq_failing_doorbell_desc::disarm();
+  endfunction
+
+  function automatic bit submission_factory_fault_armed();
+    return rdma_cmq_failing_slot_context::armed() ||
+           rdma_cmq_failing_ticket::armed() ||
+           rdma_cmq_failing_slot_record::armed() ||
+           rdma_cmq_failing_dependency::armed() ||
+           rdma_cmq_failing_doorbell_desc::armed();
   endfunction
 
   function automatic void expect_status(
@@ -2419,6 +2793,7 @@ class rdma_cmq_engine_test extends uvm_test;
     rdma_cmq_ticket ticket;
     rdma_status status;
     bit submit_done;
+    longint unsigned internal_command_id;
     string expected_trace[4] = '{
       "host_write", "pcie_dma_barrier", "pcie_mmio_barrier",
       "pcie_mmio_write"
@@ -2503,6 +2878,13 @@ class rdma_cmq_engine_test extends uvm_test;
       if (engine.slot_ticket_command_id(0) != ticket.command_id)
         `uvm_error("WRAPPER_SNAPSHOT_TICKET",
                    "slot record does not own a detached ticket value")
+      internal_command_id = engine.slot_ticket_command_id(0);
+      ticket.command_id = 0;
+      ticket.opcode_key.variant = "caller_mutated_ticket";
+      if (engine.slot_ticket_command_id(0) != internal_command_id ||
+          engine.slot_expected_variant(0) != "expected_10_44")
+        `uvm_error("WRAPPER_OUTPUT_TICKET_DETACH",
+                   "caller ticket mutation changed slot authority")
     end
     if (mem.calls.size() != 1 || mem.calls[0].offset != 0 ||
         mem.calls[0].data.size() != 64 ||
@@ -2522,6 +2904,140 @@ class rdma_cmq_engine_test extends uvm_test;
 
     engine.shutdown(status);
     expect_status("WRAPPER_SHUTDOWN", status, RDMA_SC_OK);
+  endtask
+
+  task automatic check_nested_command_snapshot_failures();
+    rdma_cmq_engine_probe engine;
+    rdma_mock_host_mem mem;
+    rdma_mock_pcie pcie;
+    rdma_mock_call_trace trace;
+    rdma_doorbell_scheduler scheduler;
+    rdma_cmq_test_profile profile;
+    rdma_function_binding prepared_binding;
+    rdma_function_binding active_binding;
+    rdma_cmq cmq;
+    rdma_cmq_runtime_desc runtime_desc;
+    rdma_cmq_command_desc requests[];
+    rdma_cmq_clone_fault_function_handle fault_function;
+    rdma_cmq_clone_fault_opcode_key fault_opcode;
+    rdma_cmq_clone_fault_body fault_body;
+    rdma_cmq_clone_fault_image fault_image;
+    rdma_cmq_sqe_model source_body;
+    rdma_cmq_ticket tickets[];
+    rdma_status item_statuses[];
+    rdma_status batch_status;
+    rdma_status status;
+
+    engine = rdma_cmq_engine_probe::type_id::create("nested_clone_engine");
+    mem = rdma_mock_host_mem::type_id::create("nested_clone_mem");
+    pcie = rdma_cmq_test_pcie::type_id::create("nested_clone_pcie");
+    trace = rdma_mock_call_trace::type_id::create("nested_clone_trace");
+    mem.set_call_trace(trace);
+    pcie.set_call_trace(trace);
+    scheduler = rdma_doorbell_scheduler::type_id::create(
+      "nested_clone_scheduler"
+    );
+    profile = rdma_cmq_test_profile::type_id::create(
+      "nested_clone_profile"
+    );
+    prepared_binding = make_binding("nested_clone_prepared",
+                                    RDMA_BIND_PREPARED);
+    active_binding = make_binding("nested_clone_active", RDMA_BIND_ACTIVE);
+    cmq = make_cmq("nested_clone_cmq", prepared_binding);
+    prepare_active("NESTED_CLONE", engine, mem, pcie, scheduler, profile,
+                   prepared_binding, active_binding, cmq, runtime_desc);
+    clear_submit_observation(mem, pcie, trace);
+
+    requests = new[8];
+    foreach (requests[i])
+      requests[i] = make_command(
+        $sformatf("nested_clone_%0d", i), active_binding,
+        rdma_cmq_test_profile::TEST_OPCODE_A, byte'(8'h70 + i)
+      );
+
+    fault_function =
+      rdma_cmq_clone_fault_function_handle::type_id::create(
+        "nested_function_null"
+      );
+    fault_function.copy(requests[0].function_h);
+    fault_function.clone_fault = RDMA_CMQ_TEST_CLONE_NULL;
+    requests[0].function_h = fault_function;
+    fault_function =
+      rdma_cmq_clone_fault_function_handle::type_id::create(
+        "nested_function_self"
+      );
+    fault_function.copy(requests[1].function_h);
+    fault_function.clone_fault = RDMA_CMQ_TEST_CLONE_SELF;
+    requests[1].function_h = fault_function;
+
+    fault_opcode = rdma_cmq_clone_fault_opcode_key::type_id::create(
+      "nested_opcode_null"
+    );
+    fault_opcode.copy(requests[2].opcode_key);
+    fault_opcode.clone_fault = RDMA_CMQ_TEST_CLONE_NULL;
+    requests[2].opcode_key = fault_opcode;
+    fault_opcode = rdma_cmq_clone_fault_opcode_key::type_id::create(
+      "nested_opcode_self"
+    );
+    fault_opcode.copy(requests[3].opcode_key);
+    fault_opcode.clone_fault = RDMA_CMQ_TEST_CLONE_SELF;
+    requests[3].opcode_key = fault_opcode;
+
+    if (!$cast(source_body, requests[4].body))
+      `uvm_fatal("NESTED_CLONE_SETUP", "source body type is invalid")
+    fault_body = rdma_cmq_clone_fault_body::type_id::create(
+      "nested_body_null"
+    );
+    fault_body.copy(source_body);
+    fault_body.clone_fault = RDMA_CMQ_TEST_CLONE_NULL;
+    requests[4].body = fault_body;
+    if (!$cast(source_body, requests[5].body))
+      `uvm_fatal("NESTED_CLONE_SETUP", "source body type is invalid")
+    fault_body = rdma_cmq_clone_fault_body::type_id::create(
+      "nested_body_self"
+    );
+    fault_body.copy(source_body);
+    fault_body.clone_fault = RDMA_CMQ_TEST_CLONE_SELF;
+    requests[5].body = fault_body;
+
+    fault_image = rdma_cmq_clone_fault_image::type_id::create(
+      "nested_signature_null"
+    );
+    fault_image.copy(requests[6].qpc_signature_source);
+    fault_image.clone_fault = RDMA_CMQ_TEST_CLONE_NULL;
+    requests[6].qpc_signature_source = fault_image;
+    fault_image = rdma_cmq_clone_fault_image::type_id::create(
+      "nested_signature_self"
+    );
+    fault_image.copy(requests[7].qpc_signature_source);
+    fault_image.clone_fault = RDMA_CMQ_TEST_CLONE_SELF;
+    requests[7].qpc_signature_source = fault_image;
+
+    engine.submit_batch(requests, tickets, item_statuses, batch_status);
+    expect_status("NESTED_CLONE_BATCH", batch_status, RDMA_SC_OK);
+    if (tickets.size() != requests.size() ||
+        item_statuses.size() != requests.size())
+      `uvm_error("NESTED_CLONE_ALIGNMENT",
+                 "nested-clone outputs are misaligned")
+    else begin
+      foreach (requests[i]) begin
+        expect_status($sformatf("NESTED_CLONE_ITEM_%0d", i),
+                      item_statuses[i], RDMA_SC_INVALID_ARGUMENT);
+        if (tickets[i] != null)
+          `uvm_error("NESTED_CLONE_TICKET",
+                     $sformatf("nested-clone item %0d returned ticket", i))
+      end
+    end
+    expect_no_submit_side_effects("NESTED_CLONE_EFFECTS", mem, pcie,
+                                  trace);
+    if (engine.published_count() != 0 ||
+        engine.tokens_in_use_count() != 0 ||
+        engine.slot_record_count() != 0)
+      `uvm_error("NESTED_CLONE_LEDGER",
+                 "nested clone failure changed the authority ledger")
+
+    engine.shutdown(status);
+    expect_status("NESTED_CLONE_SHUTDOWN", status, RDMA_SC_OK);
   endtask
 
   task automatic check_transaction_failure_atomicity();
@@ -2692,26 +3208,36 @@ class rdma_cmq_engine_test extends uvm_test;
       RDMA_SC_STALE_GENERATION,
       RDMA_SC_UNSUPPORTED_OPCODE,
       RDMA_SC_INVALID_ARGUMENT,
+      RDMA_SC_INVALID_ARGUMENT,
+      RDMA_SC_INVALID_ARGUMENT
+    };
+    rdma_status_code_e expected_sqe_codes[15] = '{
+      RDMA_SC_INVALID_STATE,
+      RDMA_SC_INVALID_ARGUMENT,
+      RDMA_SC_INVALID_ARGUMENT,
+      RDMA_SC_INVALID_ARGUMENT,
+      RDMA_SC_STALE_GENERATION,
+      RDMA_SC_INVALID_ARGUMENT,
+      RDMA_SC_INVALID_ARGUMENT,
+      RDMA_SC_INVALID_STATE,
+      RDMA_SC_INVALID_ARGUMENT,
+      RDMA_SC_INVALID_ARGUMENT,
+      RDMA_SC_INVALID_ARGUMENT,
+      RDMA_SC_INVALID_STATE,
+      RDMA_SC_INVALID_STATE,
       RDMA_SC_INVALID_STATE,
       RDMA_SC_INVALID_STATE
     };
-    rdma_status_code_e expected_sqe_codes[9] = '{
-      RDMA_SC_INVALID_STATE,
-      RDMA_SC_INVALID_ARGUMENT,
-      RDMA_SC_INVALID_ARGUMENT,
-      RDMA_SC_INVALID_ARGUMENT,
-      RDMA_SC_STALE_GENERATION,
-      RDMA_SC_INVALID_ARGUMENT,
-      RDMA_SC_INVALID_ARGUMENT,
-      RDMA_SC_INVALID_STATE,
-      RDMA_SC_INVALID_ARGUMENT
-    };
-    rdma_status_code_e expected_db_codes[5] = '{
+    rdma_status_code_e expected_db_codes[9] = '{
       RDMA_SC_INVALID_STATE,
       RDMA_SC_INVALID_ARGUMENT,
       RDMA_SC_INVALID_ARGUMENT,
       RDMA_SC_STALE_GENERATION,
-      RDMA_SC_INVALID_ARGUMENT
+      RDMA_SC_INVALID_ARGUMENT,
+      RDMA_SC_INVALID_ARGUMENT,
+      RDMA_SC_INVALID_ARGUMENT,
+      RDMA_SC_INVALID_STATE,
+      RDMA_SC_INVALID_STATE
     };
 
     engine = rdma_cmq_engine_probe::type_id::create("validation_engine");
@@ -2797,7 +3323,34 @@ class rdma_cmq_engine_test extends uvm_test;
     expect_no_submit_side_effects("VALIDATION_OVERFLOW_EFFECTS", mem, pcie,
                                   trace);
 
-    for (int unsigned fault = 1; fault <= 9; fault++) begin
+    clear_submit_observation(mem, pcie, trace);
+    requests = new[2];
+    requests[0] = make_command("validation_timeout_x", active_binding,
+                               rdma_cmq_test_profile::TEST_OPCODE_A, 8'h09);
+    requests[0].timeout[7] = 1'bx;
+    requests[1] = make_command("validation_timeout_z", active_binding,
+                               rdma_cmq_test_profile::TEST_OPCODE_A, 8'h0a);
+    requests[1].timeout[11] = 1'bz;
+    engine.submit_batch(requests, tickets, item_statuses, batch_status);
+    expect_status("VALIDATION_UNKNOWN_TIMEOUT_BATCH", batch_status,
+                  RDMA_SC_OK);
+    if (tickets.size() != 2 || item_statuses.size() != 2)
+      `uvm_error("VALIDATION_UNKNOWN_TIMEOUT",
+                 "unknown timeout outputs are misaligned")
+    else begin
+      foreach (tickets[i]) begin
+        if (tickets[i] != null)
+          `uvm_error("VALIDATION_UNKNOWN_TIMEOUT",
+                     $sformatf("unknown timeout item %0d returned ticket", i))
+        expect_status($sformatf("VALIDATION_UNKNOWN_TIMEOUT_%0d", i),
+                      item_statuses[i], RDMA_SC_INVALID_ARGUMENT);
+      end
+    end
+    expect_no_submit_side_effects("VALIDATION_UNKNOWN_TIMEOUT_EFFECTS",
+                                  mem, pcie, trace);
+
+    requests = new[1];
+    for (int unsigned fault = 1; fault <= 15; fault++) begin
       clear_submit_observation(mem, pcie, trace);
       if (!$cast(profile.sqe_fault, fault))
         `uvm_fatal("VALIDATION_SETUP", "SQE fault enum cast failed")
@@ -2807,7 +3360,7 @@ class rdma_cmq_engine_test extends uvm_test;
                                  byte'(8'h20 + fault));
       engine.submit_batch(requests, tickets, item_statuses, batch_status);
       expect_status($sformatf("SQE_FAULT_BATCH_%0d", fault), batch_status,
-                    RDMA_SC_OK);
+                    expected_sqe_codes[fault - 1]);
       if (tickets.size() != 1 || tickets[0] != null ||
           item_statuses.size() != 1)
         `uvm_error("SQE_FAULT_OUTPUT",
@@ -2821,7 +3374,7 @@ class rdma_cmq_engine_test extends uvm_test;
     end
     profile.sqe_fault = RDMA_CMQ_TEST_SQE_GOOD;
 
-    for (int unsigned fault = 1; fault <= 5; fault++) begin
+    for (int unsigned fault = 1; fault <= 9; fault++) begin
       clear_submit_observation(mem, pcie, trace);
       if (!$cast(profile.doorbell_fault, fault))
         `uvm_fatal("VALIDATION_SETUP", "doorbell fault enum cast failed")
@@ -2851,6 +3404,231 @@ class rdma_cmq_engine_test extends uvm_test;
 
     engine.shutdown(status);
     expect_status("VALIDATION_SHUTDOWN", status, RDMA_SC_OK);
+  endtask
+
+  task automatic check_internal_invariant_batch_abort();
+    rdma_cmq_engine_probe engine;
+    rdma_mock_host_mem mem;
+    rdma_mock_pcie pcie;
+    rdma_mock_call_trace trace;
+    rdma_doorbell_scheduler scheduler;
+    rdma_cmq_test_profile profile;
+    rdma_function_binding prepared_binding;
+    rdma_function_binding active_binding;
+    rdma_cmq cmq;
+    rdma_cmq_runtime_desc runtime_desc;
+    rdma_cmq_command_desc requests[];
+    rdma_cmq_ticket tickets[];
+    rdma_status item_statuses[];
+    rdma_status batch_status;
+    rdma_status status;
+    rdma_status_code_e expected_failure;
+
+    configure_submission_factory_faults();
+    disarm_submission_factory_faults();
+    for (int unsigned fault = RDMA_CMQ_TEST_ABORT_SLOT_CONTEXT;
+         fault <= RDMA_CMQ_TEST_ABORT_PROFILE_OUTPUT; fault++) begin
+      engine = rdma_cmq_engine_probe::type_id::create(
+        $sformatf("invariant_engine_%0d", fault)
+      );
+      mem = rdma_mock_host_mem::type_id::create(
+        $sformatf("invariant_mem_%0d", fault)
+      );
+      pcie = rdma_cmq_test_pcie::type_id::create(
+        $sformatf("invariant_pcie_%0d", fault)
+      );
+      trace = rdma_mock_call_trace::type_id::create(
+        $sformatf("invariant_trace_%0d", fault)
+      );
+      mem.set_call_trace(trace);
+      pcie.set_call_trace(trace);
+      scheduler = rdma_doorbell_scheduler::type_id::create(
+        $sformatf("invariant_scheduler_%0d", fault)
+      );
+      profile = rdma_cmq_test_profile::type_id::create(
+        $sformatf("invariant_profile_%0d", fault)
+      );
+      prepared_binding = make_binding(
+        $sformatf("invariant_prepared_%0d", fault), RDMA_BIND_PREPARED
+      );
+      active_binding = make_binding(
+        $sformatf("invariant_active_%0d", fault), RDMA_BIND_ACTIVE
+      );
+      cmq = make_cmq($sformatf("invariant_cmq_%0d", fault),
+                     prepared_binding);
+      prepare_active($sformatf("INVARIANT_%0d", fault), engine, mem, pcie,
+                     scheduler, profile, prepared_binding, active_binding,
+                     cmq, runtime_desc);
+      clear_submit_observation(mem, pcie, trace);
+
+      case (fault)
+        RDMA_CMQ_TEST_ABORT_SLOT_CONTEXT:
+          rdma_cmq_failing_slot_context::arm();
+        RDMA_CMQ_TEST_ABORT_TICKET:
+          rdma_cmq_failing_ticket::arm();
+        RDMA_CMQ_TEST_ABORT_SLOT_RECORD:
+          rdma_cmq_failing_slot_record::arm();
+        RDMA_CMQ_TEST_ABORT_DEPENDENCY:
+          rdma_cmq_failing_dependency::arm();
+        RDMA_CMQ_TEST_ABORT_DOORBELL_DESC:
+          rdma_cmq_failing_doorbell_desc::arm();
+        RDMA_CMQ_TEST_ABORT_PROFILE_OUTPUT: begin
+          profile.sqe_fault = RDMA_CMQ_TEST_SQE_BAD_ALIGNMENT;
+          profile.sqe_fault_compose_call = 3;
+        end
+        default:
+          `uvm_fatal("INVARIANT_SETUP", "unknown invariant fault")
+      endcase
+      expected_failure =
+        (fault == RDMA_CMQ_TEST_ABORT_PROFILE_OUTPUT) ?
+          RDMA_SC_INVALID_ARGUMENT : RDMA_SC_INVALID_STATE;
+
+      requests = new[3];
+      requests[0] = make_command(
+        $sformatf("invariant_unsupported_%0d", fault), active_binding,
+        rdma_cmq_test_profile::TEST_OPCODE_UNSUPPORTED, 8'he0
+      );
+      requests[1] = make_command(
+        $sformatf("invariant_success_%0d", fault), active_binding,
+        rdma_cmq_test_profile::TEST_OPCODE_A, 8'he1
+      );
+      requests[2] = make_command(
+        $sformatf("invariant_trigger_%0d", fault), active_binding,
+        rdma_cmq_test_profile::TEST_OPCODE_B, 8'he2
+      );
+      engine.submit_batch(requests, tickets, item_statuses, batch_status);
+
+      expect_status($sformatf("INVARIANT_BATCH_%0d", fault), batch_status,
+                    expected_failure);
+      if (tickets.size() != 3 || item_statuses.size() != 3)
+        `uvm_error("INVARIANT_ALIGNMENT",
+                   $sformatf("fault %0d outputs are misaligned", fault))
+      else begin
+        expect_status($sformatf("INVARIANT_UNSUPPORTED_%0d", fault),
+                      item_statuses[0], RDMA_SC_UNSUPPORTED_OPCODE);
+        expect_status($sformatf("INVARIANT_EARLY_SUCCESS_%0d", fault),
+                      item_statuses[1], expected_failure);
+        expect_status($sformatf("INVARIANT_TRIGGER_%0d", fault),
+                      item_statuses[2], expected_failure);
+        foreach (tickets[i])
+          if (tickets[i] != null)
+            `uvm_error("INVARIANT_TICKET",
+                       $sformatf("fault %0d item %0d returned ticket",
+                                 fault, i))
+      end
+      expect_no_submit_side_effects(
+        $sformatf("INVARIANT_EFFECTS_%0d", fault), mem, pcie, trace
+      );
+      if (engine.published_count() != 0 ||
+          engine.tokens_in_use_count() != 0 ||
+          engine.slot_record_count() != 0)
+        `uvm_error("INVARIANT_LEDGER",
+                   $sformatf("fault %0d committed tentative state", fault))
+      if (fault != RDMA_CMQ_TEST_ABORT_PROFILE_OUTPUT &&
+          submission_factory_fault_armed())
+        `uvm_error("INVARIANT_ARM",
+                   $sformatf("fault %0d fixture was not exercised", fault))
+
+      disarm_submission_factory_faults();
+      profile.sqe_fault = RDMA_CMQ_TEST_SQE_GOOD;
+      profile.sqe_fault_compose_call = 0;
+      clear_submit_observation(mem, pcie, trace);
+      requests = new[1];
+      requests[0] = make_command(
+        $sformatf("invariant_recovery_%0d", fault), active_binding,
+        rdma_cmq_test_profile::TEST_OPCODE_A, byte'(8'hf0 + fault)
+      );
+      engine.submit_batch(requests, tickets, item_statuses, batch_status);
+      expect_status($sformatf("INVARIANT_RECOVERY_BATCH_%0d", fault),
+                    batch_status, RDMA_SC_OK);
+      if (tickets.size() != 1 || tickets[0] == null ||
+          item_statuses.size() != 1)
+        `uvm_error("INVARIANT_RECOVERY",
+                   $sformatf("fault %0d contaminated recovery", fault))
+      else
+        expect_status($sformatf("INVARIANT_RECOVERY_ITEM_%0d", fault),
+                      item_statuses[0], RDMA_SC_OK);
+
+      engine.shutdown(status);
+      expect_status($sformatf("INVARIANT_SHUTDOWN_%0d", fault), status,
+                    RDMA_SC_OK);
+    end
+    disarm_submission_factory_faults();
+  endtask
+
+  task automatic check_incarnation_survives_reprepare();
+    rdma_cmq_engine_probe engine;
+    rdma_mock_host_mem mem;
+    rdma_mock_pcie pcie;
+    rdma_mock_call_trace trace;
+    rdma_doorbell_scheduler scheduler;
+    rdma_cmq_test_profile profile;
+    rdma_function_binding prepared_binding;
+    rdma_function_binding active_binding;
+    rdma_cmq cmq;
+    rdma_cmq_runtime_desc runtime_desc;
+    rdma_cmq_command_desc request;
+    rdma_cmq_ticket first_ticket;
+    rdma_cmq_ticket second_ticket;
+    rdma_status status;
+
+    engine = rdma_cmq_engine_probe::type_id::create("incarnation_engine");
+    mem = rdma_mock_host_mem::type_id::create("incarnation_mem");
+    pcie = rdma_cmq_test_pcie::type_id::create("incarnation_pcie");
+    trace = rdma_mock_call_trace::type_id::create("incarnation_trace");
+    mem.set_call_trace(trace);
+    pcie.set_call_trace(trace);
+    scheduler = rdma_doorbell_scheduler::type_id::create(
+      "incarnation_scheduler"
+    );
+    profile = rdma_cmq_test_profile::type_id::create(
+      "incarnation_profile"
+    );
+    prepared_binding = make_binding("incarnation_prepared",
+                                    RDMA_BIND_PREPARED);
+    active_binding = make_binding("incarnation_active", RDMA_BIND_ACTIVE);
+    cmq = make_cmq("incarnation_cmq", prepared_binding);
+    prepare_active("INCARNATION", engine, mem, pcie, scheduler, profile,
+                   prepared_binding, active_binding, cmq, runtime_desc);
+    clear_submit_observation(mem, pcie, trace);
+
+    request = make_command("incarnation_first", active_binding,
+                           rdma_cmq_test_profile::TEST_OPCODE_A, 8'hc0);
+    engine.submit(request, first_ticket, status);
+    expect_status("INCARNATION_FIRST", status, RDMA_SC_OK);
+    if (first_ticket == null)
+      `uvm_error("INCARNATION_FIRST", "first submit returned no ticket")
+
+    engine.shutdown(status);
+    expect_status("INCARNATION_SHUTDOWN", status, RDMA_SC_OK);
+    prepared_binding = make_binding("incarnation_reprepared",
+                                    RDMA_BIND_PREPARED);
+    active_binding = make_binding("incarnation_reactive", RDMA_BIND_ACTIVE);
+    cmq = make_cmq("incarnation_recmq", prepared_binding);
+    engine.prepare(prepared_binding, cmq, 1'b1, 20'h34567, mem,
+                   scheduler, profile, runtime_desc, status);
+    expect_status("INCARNATION_REPREPARE", status, RDMA_SC_OK);
+    engine.activate(active_binding, status);
+    expect_status("INCARNATION_REACTIVATE", status, RDMA_SC_OK);
+    clear_submit_observation(mem, pcie, trace);
+
+    request = make_command("incarnation_second", active_binding,
+                           rdma_cmq_test_profile::TEST_OPCODE_A, 8'hc1);
+    engine.submit(request, second_ticket, status);
+    expect_status("INCARNATION_SECOND", status, RDMA_SC_OK);
+    if (first_ticket == null || second_ticket == null)
+      `uvm_error("INCARNATION_MONOTONIC",
+                 "same-generation lifecycle submit returned null ticket")
+    else if (second_ticket.command_id == first_ticket.command_id ||
+             second_ticket.command_id[4:0] !=
+               first_ticket.command_id[4:0] ||
+             second_ticket.command_id[63:5] <=
+               first_ticket.command_id[63:5])
+      `uvm_error("INCARNATION_MONOTONIC",
+                 "shutdown/reprepare reused a prior full command ID")
+
+    engine.shutdown(status);
+    expect_status("INCARNATION_FINAL_SHUTDOWN", status, RDMA_SC_OK);
   endtask
 
   task automatic check_full_initial_capacity_and_shutdown_reset();
@@ -2968,9 +3746,9 @@ class rdma_cmq_engine_test extends uvm_test;
     expect_status("CAPACITY_REUSE_BATCH", batch_status, RDMA_SC_OK);
     if (tickets.size() != 1 || tickets[0] == null ||
         tickets[0].slot_sequence != 0 || tickets[0].sq_index != 0 ||
-        tickets[0].command_id != 64'd32)
+        tickets[0].command_id != 64'd64)
       `uvm_error("CAPACITY_REUSE",
-                 "new prepare did not restart slot/token authority cleanly")
+                 "new prepare reset a monotonic command incarnation")
 
     engine.shutdown(status);
     expect_status("CAPACITY_FINAL_SHUTDOWN", status, RDMA_SC_OK);
@@ -2992,8 +3770,11 @@ class rdma_cmq_engine_test extends uvm_test;
     check_batch_compaction_and_doorbell();
     check_empty_invalid_and_state_rejections();
     check_submit_wrapper_and_snapshot_detachment();
+    check_nested_command_snapshot_failures();
     check_transaction_failure_atomicity();
     check_submission_validation_and_profile_metadata();
+    check_internal_invariant_batch_abort();
+    check_incarnation_survives_reprepare();
     check_full_initial_capacity_and_shutdown_reset();
     phase.drop_objection(this);
   endtask
