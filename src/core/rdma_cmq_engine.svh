@@ -2896,6 +2896,7 @@ class rdma_cmq_engine extends uvm_object;
     bit preserve_item_status[];
     int unsigned success_count;
     rdma_function_handle active_function;
+    rdma_handle doorbell_encode_target;
     rdma_hw_image doorbell_image;
     rdma_hw_image doorbell_snapshot;
     rdma_doorbell_desc doorbell_candidate;
@@ -3334,14 +3335,35 @@ class rdma_cmq_engine extends uvm_object;
         final_sequence = publish_seq + success_count;
         final_pi = final_sequence % CMQ_DEPTH;
         final_polarity = (final_sequence / CMQ_DEPTH) & 1'b1;
-        doorbell_image = null;
-        status = profile.encode_doorbell(cmq_snapshot.handle, final_pi,
-                                         final_polarity, doorbell_image);
-        if (status == null)
-          status = invalid_state("CMQ doorbell encoding returned null status");
+        status = checked_handle_snapshot(
+          cmq_snapshot.handle, "CMQ doorbell encoder",
+          RDMA_SC_INVALID_STATE, doorbell_encode_target
+        );
         if (!status.ok()) begin
           transaction_status = status;
           transaction_failed = 1'b1;
+        end
+        else begin
+          doorbell_image = null;
+          status = profile.encode_doorbell(
+            doorbell_encode_target, final_pi, final_polarity, doorbell_image
+          );
+          if (!same_handle(doorbell_encode_target, cmq_snapshot.handle)) begin
+            transaction_status = invalid_state(
+              "CMQ doorbell encoder changed its detached handle input"
+            );
+            transaction_failed = 1'b1;
+          end
+          else begin
+            if (status == null)
+              status = invalid_state(
+                "CMQ doorbell encoding returned null status"
+              );
+            if (!status.ok()) begin
+              transaction_status = status;
+              transaction_failed = 1'b1;
+            end
+          end
         end
       end
     end
@@ -3349,7 +3371,9 @@ class rdma_cmq_engine extends uvm_object;
     if (!transaction_failed) begin
       status = doorbell_metadata_status(doorbell_image);
       if (!status.ok()) begin
-        transaction_status = status;
+        transaction_status = invalid_state(
+          {"CMQ doorbell profile output is invalid: ", status.message}
+        );
         transaction_failed = 1'b1;
       end
     end
@@ -3366,7 +3390,9 @@ class rdma_cmq_engine extends uvm_object;
     if (!transaction_failed) begin
       status = doorbell_metadata_status(doorbell_snapshot);
       if (!status.ok()) begin
-        transaction_status = status;
+        transaction_status = invalid_state(
+          {"CMQ doorbell snapshot metadata is invalid: ", status.message}
+        );
         transaction_failed = 1'b1;
       end
     end

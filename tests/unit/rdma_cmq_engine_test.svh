@@ -30,6 +30,13 @@ typedef enum int unsigned {
   RDMA_CMQ_TEST_DB_CLONE_MUTATE
 } rdma_cmq_test_doorbell_fault_e;
 
+typedef enum int unsigned {
+  RDMA_CMQ_TEST_DB_INPUT_GOOD,
+  RDMA_CMQ_TEST_DB_INPUT_MUTATE_SUCCESS,
+  RDMA_CMQ_TEST_DB_INPUT_MUTATE_FAILURE,
+  RDMA_CMQ_TEST_DB_INPUT_MUTATE_NULL
+} rdma_cmq_test_doorbell_input_fault_e;
+
 typedef enum bit [2:0] {
   RDMA_CMQ_TEST_CLONE_GOOD,
   RDMA_CMQ_TEST_CLONE_NULL,
@@ -613,6 +620,7 @@ class rdma_cmq_test_profile extends rdma_cmq_hw_profile;
   rdma_cmq_test_sqe_fault_e sqe_fault;
   int unsigned sqe_fault_compose_call;
   rdma_cmq_test_doorbell_fault_e doorbell_fault;
+  rdma_cmq_test_doorbell_input_fault_e doorbell_input_fault;
   bit [31:0] fail_compose_opcode;
   int unsigned null_compose_call;
   rdma_status_code_e compose_failure_code;
@@ -623,6 +631,7 @@ class rdma_cmq_test_profile extends rdma_cmq_hw_profile;
   int unsigned last_final_pi;
   bit last_polarity;
   rdma_handle last_doorbell_target;
+  rdma_handle last_doorbell_input;
   rdma_cmq_expected_response last_expected_alias;
 
   function new(string name = "rdma_cmq_test_profile");
@@ -633,6 +642,7 @@ class rdma_cmq_test_profile extends rdma_cmq_hw_profile;
     sqe_fault = RDMA_CMQ_TEST_SQE_GOOD;
     sqe_fault_compose_call = 0;
     doorbell_fault = RDMA_CMQ_TEST_DB_GOOD;
+    doorbell_input_fault = RDMA_CMQ_TEST_DB_INPUT_GOOD;
     fail_compose_opcode = '0;
     null_compose_call = 0;
     compose_failure_code = RDMA_SC_CODEC_ERROR;
@@ -643,6 +653,7 @@ class rdma_cmq_test_profile extends rdma_cmq_hw_profile;
     last_final_pi = 0;
     last_polarity = 1'b0;
     last_doorbell_target = null;
+    last_doorbell_input = null;
     last_expected_alias = null;
   endfunction
 
@@ -804,9 +815,23 @@ class rdma_cmq_test_profile extends rdma_cmq_hw_profile;
     doorbell_calls++;
     last_final_pi = final_pi;
     last_polarity = polarity;
+    last_doorbell_input = cmq_h;
     last_doorbell_target = rdma_clone_handle_value(
       cmq_h, "test profile doorbell target"
     );
+    if (doorbell_input_fault != RDMA_CMQ_TEST_DB_INPUT_GOOD) begin
+      cmq_h.object_id++;
+      case (doorbell_input_fault)
+        RDMA_CMQ_TEST_DB_INPUT_MUTATE_FAILURE:
+          return rdma_status::make(
+            RDMA_SC_CODEC_ERROR,
+            "injected mutating doorbell encode failure"
+          );
+        RDMA_CMQ_TEST_DB_INPUT_MUTATE_NULL: return null;
+        default: begin
+        end
+      endcase
+    end
     if (fail_doorbell_encode)
       return rdma_status::make(doorbell_failure_code,
                                "injected doorbell encode failure");
@@ -1231,6 +1256,16 @@ class rdma_cmq_engine_probe extends rdma_cmq_engine;
 
   function string probe_body_value_key(rdma_hw_model body);
     return body_value_key(body);
+  endfunction
+
+  function bit probe_authority_handle_matches(rdma_handle expected);
+    return cmq_snapshot != null && cmq_snapshot.handle != null &&
+           same_handle(cmq_snapshot.handle, expected);
+  endfunction
+
+  function bit probe_is_authority_handle(rdma_handle candidate);
+    return candidate != null && cmq_snapshot != null &&
+           candidate == cmq_snapshot.handle;
   endfunction
 
   function longint unsigned slot_ticket_command_id(int unsigned sq_index);
@@ -4611,6 +4646,120 @@ class rdma_cmq_engine_test extends uvm_test;
     expect_status("ATOMIC_SHUTDOWN", status, RDMA_SC_OK);
   endtask
 
+  task automatic check_doorbell_authority_isolation();
+    rdma_cmq_engine_probe engine;
+    rdma_mock_host_mem mem;
+    rdma_mock_pcie pcie;
+    rdma_mock_call_trace trace;
+    rdma_doorbell_scheduler scheduler;
+    rdma_cmq_test_profile profile;
+    rdma_function_binding prepared_binding;
+    rdma_function_binding active_binding;
+    rdma_cmq cmq;
+    rdma_cmq_runtime_desc runtime_desc;
+    rdma_cmq_command_desc requests[];
+    rdma_cmq_ticket tickets[];
+    rdma_status item_statuses[];
+    rdma_status batch_status;
+    rdma_status status;
+
+    for (int unsigned fault = RDMA_CMQ_TEST_DB_INPUT_MUTATE_SUCCESS;
+         fault <= RDMA_CMQ_TEST_DB_INPUT_MUTATE_NULL; fault++) begin
+      engine = rdma_cmq_engine_probe::type_id::create(
+        $sformatf("doorbell_authority_engine_%0d", fault)
+      );
+      mem = rdma_mock_host_mem::type_id::create(
+        $sformatf("doorbell_authority_mem_%0d", fault)
+      );
+      pcie = rdma_cmq_test_pcie::type_id::create(
+        $sformatf("doorbell_authority_pcie_%0d", fault)
+      );
+      trace = rdma_mock_call_trace::type_id::create(
+        $sformatf("doorbell_authority_trace_%0d", fault)
+      );
+      mem.set_call_trace(trace);
+      pcie.set_call_trace(trace);
+      scheduler = rdma_doorbell_scheduler::type_id::create(
+        $sformatf("doorbell_authority_scheduler_%0d", fault)
+      );
+      profile = rdma_cmq_test_profile::type_id::create(
+        $sformatf("doorbell_authority_profile_%0d", fault)
+      );
+      if (!$cast(profile.doorbell_input_fault, fault))
+        `uvm_fatal("DOORBELL_AUTHORITY_SETUP",
+                   "doorbell input fault enum cast failed")
+      prepared_binding = make_binding(
+        $sformatf("doorbell_authority_prepared_%0d", fault),
+        RDMA_BIND_PREPARED
+      );
+      active_binding = make_binding(
+        $sformatf("doorbell_authority_active_%0d", fault),
+        RDMA_BIND_ACTIVE
+      );
+      cmq = make_cmq($sformatf("doorbell_authority_cmq_%0d", fault),
+                     prepared_binding);
+      prepare_active($sformatf("DOORBELL_AUTHORITY_%0d", fault), engine,
+                     mem, pcie, scheduler, profile, prepared_binding,
+                     active_binding, cmq, runtime_desc);
+      clear_submit_observation(mem, pcie, trace);
+
+      requests = new[1];
+      requests[0] = make_command(
+        $sformatf("doorbell_authority_hostile_%0d", fault), active_binding,
+        rdma_cmq_test_profile::TEST_OPCODE_A, byte'(8'hd0 + fault)
+      );
+      engine.submit_batch(requests, tickets, item_statuses, batch_status);
+      expect_status($sformatf("DOORBELL_AUTHORITY_BATCH_%0d", fault),
+                    batch_status, RDMA_SC_INVALID_STATE);
+      if (tickets.size() != 1 || tickets[0] != null ||
+          item_statuses.size() != 1)
+        `uvm_error("DOORBELL_AUTHORITY_OUTPUT",
+                   $sformatf("fault %0d published hostile output", fault))
+      else
+        expect_status($sformatf("DOORBELL_AUTHORITY_ITEM_%0d", fault),
+                      item_statuses[0], RDMA_SC_INVALID_STATE);
+      if (!engine.probe_authority_handle_matches(cmq.handle) ||
+          engine.probe_is_authority_handle(profile.last_doorbell_input))
+        `uvm_error("DOORBELL_AUTHORITY_HANDLE",
+                   $sformatf("fault %0d exposed or changed authority", fault))
+      expect_no_submit_side_effects(
+        $sformatf("DOORBELL_AUTHORITY_EFFECTS_%0d", fault), mem, pcie,
+        trace
+      );
+      if (engine.published_count() != 0 ||
+          engine.tokens_in_use_count() != 0 ||
+          engine.slot_record_count() != 0)
+        `uvm_error("DOORBELL_AUTHORITY_LEDGER",
+                   $sformatf("fault %0d committed tentative state", fault))
+
+      profile.doorbell_input_fault = RDMA_CMQ_TEST_DB_INPUT_GOOD;
+      clear_submit_observation(mem, pcie, trace);
+      requests[0] = make_command(
+        $sformatf("doorbell_authority_recovery_%0d", fault), active_binding,
+        rdma_cmq_test_profile::TEST_OPCODE_A, byte'(8'he0 + fault)
+      );
+      engine.submit_batch(requests, tickets, item_statuses, batch_status);
+      expect_status($sformatf("DOORBELL_AUTHORITY_RECOVERY_BATCH_%0d",
+                              fault), batch_status, RDMA_SC_OK);
+      if (tickets.size() != 1 || tickets[0] == null ||
+          item_statuses.size() != 1)
+        `uvm_error("DOORBELL_AUTHORITY_RECOVERY",
+                   $sformatf("fault %0d blocked recovery", fault))
+      else
+        expect_status($sformatf("DOORBELL_AUTHORITY_RECOVERY_ITEM_%0d",
+                                fault), item_statuses[0], RDMA_SC_OK);
+      if (engine.published_count() != 1 ||
+          engine.tokens_in_use_count() != 1 ||
+          engine.slot_record_count() != 1)
+        `uvm_error("DOORBELL_AUTHORITY_RECOVERY_LEDGER",
+                   $sformatf("fault %0d did not recover cleanly", fault))
+
+      engine.shutdown(status);
+      expect_status($sformatf("DOORBELL_AUTHORITY_SHUTDOWN_%0d", fault),
+                    status, RDMA_SC_OK);
+    end
+  endtask
+
   task automatic check_submission_validation_and_profile_metadata();
     rdma_cmq_engine_probe engine;
     rdma_mock_host_mem mem;
@@ -4661,12 +4810,12 @@ class rdma_cmq_engine_test extends uvm_test;
     };
     rdma_status_code_e expected_db_codes[9] = '{
       RDMA_SC_INVALID_STATE,
-      RDMA_SC_INVALID_ARGUMENT,
-      RDMA_SC_INVALID_ARGUMENT,
-      RDMA_SC_STALE_GENERATION,
-      RDMA_SC_INVALID_ARGUMENT,
-      RDMA_SC_INVALID_ARGUMENT,
-      RDMA_SC_INVALID_ARGUMENT,
+      RDMA_SC_INVALID_STATE,
+      RDMA_SC_INVALID_STATE,
+      RDMA_SC_INVALID_STATE,
+      RDMA_SC_INVALID_STATE,
+      RDMA_SC_INVALID_STATE,
+      RDMA_SC_INVALID_STATE,
       RDMA_SC_INVALID_STATE,
       RDMA_SC_INVALID_STATE
     };
@@ -5572,6 +5721,7 @@ class rdma_cmq_engine_test extends uvm_test;
     check_mutating_clone_source_restoration();
     check_qpc_context_snapshot_failures();
     check_transaction_failure_atomicity();
+    check_doorbell_authority_isolation();
     check_submission_validation_and_profile_metadata();
     check_profile_hook_snapshot_contract();
     check_stateful_profile_snapshot_rechecks();
