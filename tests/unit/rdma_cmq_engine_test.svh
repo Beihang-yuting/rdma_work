@@ -655,6 +655,8 @@ class rdma_cmq_failing_dependency extends rdma_doorbell_dependency;
   `uvm_object_utils(rdma_cmq_failing_dependency)
 
   local static bit arm_failure;
+  local static bit capture_armed;
+  local static longint unsigned captured_dependency_id;
 
   function new(string name = "rdma_cmq_failing_dependency");
     super.new(name);
@@ -672,7 +674,28 @@ class rdma_cmq_failing_dependency extends rdma_doorbell_dependency;
     return arm_failure;
   endfunction
 
+  static function void arm_capture();
+    capture_armed = 1'b1;
+    captured_dependency_id = '0;
+  endfunction
+
+  static function void disarm_capture();
+    capture_armed = 1'b0;
+    captured_dependency_id = '0;
+  endfunction
+
+  static function bit take_captured_dependency_id(
+    output longint unsigned dependency_id
+  );
+    dependency_id = captured_dependency_id;
+    return !capture_armed;
+  endfunction
+
   virtual function uvm_object clone();
+    if (capture_armed) begin
+      capture_armed = 1'b0;
+      captured_dependency_id = dependency_id;
+    end
     if (arm_failure && relative_offset == 64) begin
       arm_failure = 1'b0;
       return this;
@@ -824,7 +847,7 @@ class rdma_cmq_test_profile extends rdma_cmq_hw_profile;
                    8'h00 : command.qpc_signature_source.bytes[0];
     sqe.bytes[3] = command.function_h.object_id[7:0];
     sqe.bytes[4] = slot.sq_index[7:0];
-    sqe.bytes[5] = {7'b0, slot.sq_wrap};
+    sqe.bytes[5] = {6'b0, !slot.sq_wrap, slot.sq_wrap};
     sqe.bytes[6] = slot.slot_sequence[7:0];
     sqe.bytes[7] = body.command_id[7:0];
     sqe.length = 64;
@@ -1676,6 +1699,29 @@ class rdma_cmq_engine_probe extends rdma_cmq_engine;
     cq_consume_seq = 5;
   endfunction
 
+  function void seed_ring_counters(
+    longint unsigned seeded_publish_seq,
+    longint unsigned seeded_retire_seq
+  );
+    publish_seq = seeded_publish_seq;
+    retire_seq = seeded_retire_seq;
+  endfunction
+
+  function rdma_status complete_and_retire_slot_zero();
+    int unsigned token;
+
+    if (slots[0] == null)
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "test retirement slot is null");
+    token = slots[0].command_token;
+    if (token >= 32 || !token_in_use[token])
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "test retirement token is invalid");
+    token_in_use[token] = 1'b0;
+    slots[0].state = CMQ_SLOT_COMPLETED;
+    return retire_completed_prefix();
+  endfunction
+
   function int unsigned tokens_in_use_count();
     int unsigned count;
 
@@ -2061,6 +2107,7 @@ class rdma_cmq_engine_test extends uvm_test;
     rdma_cmq_failing_ticket::disarm();
     rdma_cmq_failing_slot_record::disarm();
     rdma_cmq_failing_dependency::disarm();
+    rdma_cmq_failing_dependency::disarm_capture();
     rdma_cmq_failing_doorbell_desc::disarm();
   endfunction
 
@@ -5164,6 +5211,208 @@ class rdma_cmq_engine_test extends uvm_test;
     expect_status("ATOMIC_SHUTDOWN", status, RDMA_SC_OK);
   endtask
 
+  task automatic check_all_transport_failure_rollbacks();
+    rdma_cmq_engine_probe engine;
+    rdma_mock_host_mem mem;
+    rdma_cmq_test_pcie pcie;
+    rdma_mock_call_trace trace;
+    rdma_doorbell_scheduler scheduler;
+    rdma_cmq_test_profile profile;
+    rdma_function_binding prepared_binding;
+    rdma_function_binding active_binding;
+    rdma_cmq cmq;
+    rdma_cmq_runtime_desc runtime_desc;
+    rdma_cmq_command_desc requests[];
+    rdma_cmq_ticket tickets[];
+    rdma_cmq_ticket baseline_ticket;
+    rdma_status item_statuses[];
+    rdma_status batch_status;
+    rdma_status injected;
+    rdma_status status;
+    longint unsigned baseline_command_id;
+    string baseline_expected_variant;
+    string label;
+
+    for (int unsigned fault = 0; fault < 4; fault++) begin
+      label = $sformatf("TRANSPORT_ROLLBACK_%0d", fault);
+      engine = rdma_cmq_engine_probe::type_id::create(
+        $sformatf("transport_rollback_engine_%0d", fault)
+      );
+      mem = rdma_mock_host_mem::type_id::create(
+        $sformatf("transport_rollback_mem_%0d", fault)
+      );
+      pcie = rdma_cmq_test_pcie::type_id::create(
+        $sformatf("transport_rollback_pcie_%0d", fault)
+      );
+      trace = rdma_mock_call_trace::type_id::create(
+        $sformatf("transport_rollback_trace_%0d", fault)
+      );
+      mem.set_call_trace(trace);
+      pcie.set_call_trace(trace);
+      scheduler = rdma_doorbell_scheduler::type_id::create(
+        $sformatf("transport_rollback_scheduler_%0d", fault)
+      );
+      profile = rdma_cmq_test_profile::type_id::create(
+        $sformatf("transport_rollback_profile_%0d", fault)
+      );
+      prepared_binding = make_binding(
+        $sformatf("transport_rollback_prepared_%0d", fault),
+        RDMA_BIND_PREPARED
+      );
+      active_binding = make_binding(
+        $sformatf("transport_rollback_active_%0d", fault),
+        RDMA_BIND_ACTIVE
+      );
+      cmq = make_cmq($sformatf("transport_rollback_cmq_%0d", fault),
+                     prepared_binding);
+      prepare_active(label, engine, mem, pcie, scheduler, profile,
+                     prepared_binding, active_binding, cmq, runtime_desc);
+      clear_submit_observation(mem, pcie, trace);
+      baseline_ticket = null;
+      baseline_command_id = '0;
+      baseline_expected_variant = "";
+
+      requests = new[1];
+      requests[0] = make_command(
+        $sformatf("transport_baseline_%0d", fault), active_binding,
+        rdma_cmq_test_profile::TEST_OPCODE_A, byte'(8'h60 + fault)
+      );
+      engine.submit_batch(requests, tickets, item_statuses, batch_status);
+      expect_status({label, "_BASELINE_BATCH"}, batch_status, RDMA_SC_OK);
+      if (tickets.size() != 1 || tickets[0] == null ||
+          item_statuses.size() != 1)
+        `uvm_error("TRANSPORT_ROLLBACK_BASELINE",
+                   $sformatf("%s baseline output is invalid", label))
+      else begin
+        expect_status({label, "_BASELINE_ITEM"}, item_statuses[0],
+                      RDMA_SC_OK);
+        baseline_ticket = tickets[0];
+        baseline_command_id = tickets[0].command_id;
+        baseline_expected_variant = engine.slot_expected_variant(0);
+        if (tickets[0].slot_sequence != 0 || tickets[0].sq_index != 0 ||
+            tickets[0].sq_wrap || baseline_command_id == 0 ||
+            baseline_expected_variant == "")
+          `uvm_error("TRANSPORT_ROLLBACK_BASELINE_AUTHORITY",
+                     $sformatf("%s baseline authority is invalid", label))
+      end
+      clear_submit_observation(mem, pcie, trace);
+
+      requests = new[4];
+      requests[0] = make_command(
+        $sformatf("transport_rollback_a_%0d", fault), active_binding,
+        rdma_cmq_test_profile::TEST_OPCODE_A, byte'(8'h70 + fault)
+      );
+      requests[1] = make_command(
+        $sformatf("transport_rollback_invalid_%0d", fault), active_binding,
+        rdma_cmq_test_profile::TEST_OPCODE_UNSUPPORTED,
+        byte'(8'h80 + fault)
+      );
+      requests[2] = make_command(
+        $sformatf("transport_rollback_codec_%0d", fault), active_binding,
+        rdma_cmq_test_profile::TEST_OPCODE_B, byte'(8'h90 + fault)
+      );
+      requests[3] = make_command(
+        $sformatf("transport_rollback_b_%0d", fault), active_binding,
+        rdma_cmq_test_profile::TEST_OPCODE_A, byte'(8'ha0 + fault)
+      );
+      profile.fail_compose_opcode = rdma_cmq_test_profile::TEST_OPCODE_B;
+      profile.compose_failure_code = RDMA_SC_CODEC_ERROR;
+      injected = rdma_status::make(
+        RDMA_SC_TIMEOUT, $sformatf("injected transport failure %0d", fault)
+      );
+      case (fault)
+        0: expect_status({label, "_ARM_DEPENDENCY"},
+                         mem.fail_write_at(2, injected), RDMA_SC_OK);
+        1: expect_status(
+             {label, "_ARM_DMA"},
+             pcie.fail_next("dma_visibility_barrier", injected), RDMA_SC_OK
+           );
+        2: expect_status(
+             {label, "_ARM_MMIO_BARRIER"},
+             pcie.fail_next("mmio_ordering_barrier", injected), RDMA_SC_OK
+           );
+        3: expect_status(
+             {label, "_ARM_MMIO_WRITE"},
+             pcie.fail_next("mmio_write", injected), RDMA_SC_OK
+           );
+      endcase
+
+      engine.submit_batch(requests, tickets, item_statuses, batch_status);
+      expect_status({label, "_BATCH"}, batch_status, RDMA_SC_TIMEOUT);
+      if (tickets.size() != 4 || item_statuses.size() != 4)
+        `uvm_error("TRANSPORT_ROLLBACK_ALIGNMENT",
+                   $sformatf("%s outputs are misaligned", label))
+      else begin
+        expect_status({label, "_VALID_A"}, item_statuses[0],
+                      RDMA_SC_TIMEOUT);
+        expect_status({label, "_VALIDATION"}, item_statuses[1],
+                      RDMA_SC_UNSUPPORTED_OPCODE);
+        expect_status({label, "_CODEC"}, item_statuses[2],
+                      RDMA_SC_CODEC_ERROR);
+        expect_status({label, "_VALID_B"}, item_statuses[3],
+                      RDMA_SC_TIMEOUT);
+        foreach (tickets[i])
+          if (tickets[i] != null)
+            `uvm_error("TRANSPORT_ROLLBACK_TICKET",
+                       $sformatf("%s published tentative ticket %0d",
+                                 label, i))
+      end
+      if (mem.calls.size() != 2 || pcie.calls.size() != fault)
+        `uvm_error("TRANSPORT_ROLLBACK_PATH",
+                   $sformatf("%s observed host/PCIe calls %0d/%0d",
+                             label, mem.calls.size(), pcie.calls.size()))
+      if (engine.published_count() != 1 || engine.retired_count() != 0 ||
+          engine.tokens_in_use_count() != 1 ||
+          engine.slot_record_count() != 1 || baseline_ticket == null ||
+          baseline_ticket.command_id != baseline_command_id ||
+          baseline_ticket.slot_sequence != 0 ||
+          engine.slot_ticket_command_id(0) != baseline_command_id ||
+          engine.slot_expected_variant(0) != baseline_expected_variant)
+        `uvm_error("TRANSPORT_ROLLBACK_LEDGER",
+                   $sformatf("%s changed committed authority", label))
+
+      clear_submit_observation(mem, pcie, trace);
+      profile.fail_compose_opcode = '0;
+      requests = new[2];
+      requests[0] = make_command(
+        $sformatf("transport_recovery_a_%0d", fault), active_binding,
+        rdma_cmq_test_profile::TEST_OPCODE_A, byte'(8'ha0 + fault)
+      );
+      requests[1] = make_command(
+        $sformatf("transport_recovery_b_%0d", fault), active_binding,
+        rdma_cmq_test_profile::TEST_OPCODE_B, byte'(8'hb0 + fault)
+      );
+      engine.submit_batch(requests, tickets, item_statuses, batch_status);
+      expect_status({label, "_RECOVERY_BATCH"}, batch_status, RDMA_SC_OK);
+      if (tickets.size() != 2 || tickets[0] == null || tickets[1] == null ||
+          item_statuses.size() != 2)
+        `uvm_error("TRANSPORT_ROLLBACK_RECOVERY",
+                   $sformatf("%s recovery outputs are invalid", label))
+      else begin
+        expect_status({label, "_RECOVERY_A"}, item_statuses[0], RDMA_SC_OK);
+        expect_status({label, "_RECOVERY_B"}, item_statuses[1], RDMA_SC_OK);
+        if (tickets[0].slot_sequence != 1 || tickets[0].sq_index != 1 ||
+            tickets[0].sq_wrap || tickets[1].slot_sequence != 2 ||
+            tickets[1].sq_index != 2 || tickets[1].sq_wrap)
+          `uvm_error("TRANSPORT_ROLLBACK_REUSE",
+                     $sformatf("%s did not overwrite unpublished slots",
+                               label))
+      end
+      if (mem.calls.size() != 2 || mem.calls[0].offset != 64 ||
+          mem.calls[1].offset != 128 || engine.published_count() != 3 ||
+          engine.tokens_in_use_count() != 3 ||
+          engine.slot_record_count() != 3 ||
+          engine.slot_ticket_command_id(0) != baseline_command_id ||
+          engine.slot_expected_variant(0) != baseline_expected_variant)
+        `uvm_error("TRANSPORT_ROLLBACK_RECOVERY_LEDGER",
+                   $sformatf("%s leaked or skipped recovered authority",
+                             label))
+
+      engine.shutdown(status);
+      expect_status({label, "_SHUTDOWN"}, status, RDMA_SC_OK);
+    end
+  endtask
+
   task automatic check_doorbell_authority_isolation();
     rdma_cmq_engine_probe engine;
     rdma_mock_host_mem mem;
@@ -6465,6 +6714,317 @@ class rdma_cmq_engine_test extends uvm_test;
     expect_status("INCARNATION_FINAL_SHUTDOWN", status, RDMA_SC_OK);
   endtask
 
+  task automatic check_max_dependency_id_boundary();
+    rdma_cmq_engine_probe engine;
+    rdma_mock_host_mem mem;
+    rdma_cmq_test_pcie pcie;
+    rdma_mock_call_trace trace;
+    rdma_doorbell_scheduler scheduler;
+    rdma_cmq_test_profile profile;
+    rdma_function_binding prepared_binding;
+    rdma_function_binding active_binding;
+    rdma_cmq cmq;
+    rdma_cmq_runtime_desc runtime_desc;
+    rdma_cmq_command_desc requests[];
+    rdma_cmq_ticket tickets[];
+    rdma_status item_statuses[];
+    rdma_status batch_status;
+    rdma_status status;
+    longint unsigned captured_dependency_id;
+
+    disarm_submission_factory_faults();
+    engine = rdma_cmq_engine_probe::type_id::create(
+      "max_dependency_engine"
+    );
+    mem = rdma_mock_host_mem::type_id::create("max_dependency_mem");
+    pcie = rdma_cmq_test_pcie::type_id::create("max_dependency_pcie");
+    trace = rdma_mock_call_trace::type_id::create("max_dependency_trace");
+    mem.set_call_trace(trace);
+    pcie.set_call_trace(trace);
+    scheduler = rdma_doorbell_scheduler::type_id::create(
+      "max_dependency_scheduler"
+    );
+    profile = rdma_cmq_test_profile::type_id::create(
+      "max_dependency_profile"
+    );
+    prepared_binding = make_binding("max_dependency_prepared",
+                                    RDMA_BIND_PREPARED);
+    active_binding = make_binding("max_dependency_active",
+                                  RDMA_BIND_ACTIVE);
+    cmq = make_cmq("max_dependency_cmq", prepared_binding);
+    prepare_active("MAX_DEPENDENCY", engine, mem, pcie, scheduler, profile,
+                   prepared_binding, active_binding, cmq, runtime_desc);
+    clear_submit_observation(mem, pcie, trace);
+    engine.seed_ring_counters(64'hffff_ffff_ffff_fffe,
+                              64'hffff_ffff_ffff_fffe);
+    rdma_cmq_failing_dependency::arm_capture();
+
+    requests = new[1];
+    requests[0] = make_command(
+      "max_dependency_request", active_binding,
+      rdma_cmq_test_profile::TEST_OPCODE_A, 8'hbe, 10us
+    );
+    engine.submit_batch(requests, tickets, item_statuses, batch_status);
+    expect_status("MAX_DEPENDENCY_BATCH", batch_status, RDMA_SC_OK);
+    if (tickets.size() != 1 || tickets[0] == null ||
+        item_statuses.size() != 1)
+      `uvm_error("MAX_DEPENDENCY_OUTPUT", "boundary output is invalid")
+    else begin
+      expect_status("MAX_DEPENDENCY_ITEM", item_statuses[0], RDMA_SC_OK);
+      if (tickets[0].slot_sequence != 64'hffff_ffff_ffff_fffe ||
+          tickets[0].sq_index != 30 || !tickets[0].sq_wrap)
+        `uvm_error("MAX_DEPENDENCY_TICKET",
+                   "maximum valid dependency boundary used the wrong slot")
+    end
+    if (!rdma_cmq_failing_dependency::take_captured_dependency_id(
+          captured_dependency_id
+        ) || captured_dependency_id != 64'hffff_ffff_ffff_ffff)
+      `uvm_error("MAX_DEPENDENCY_ID",
+                 "slot max-1 did not produce dependency ID max")
+    if (mem.calls.size() != 1 || mem.calls[0].offset != (30 * 64) ||
+        pcie.calls.size() != 3 || profile.last_final_pi != 31 ||
+        !profile.last_polarity)
+      `uvm_error("MAX_DEPENDENCY_TRANSPORT",
+                 "maximum valid dependency boundary was not published")
+    if (engine.published_count() != 64'hffff_ffff_ffff_ffff ||
+        engine.retired_count() != 64'hffff_ffff_ffff_fffe ||
+        engine.tokens_in_use_count() != 1 ||
+        engine.slot_record_count() != 1)
+      `uvm_error("MAX_DEPENDENCY_LEDGER",
+                 "maximum valid dependency boundary corrupted authority")
+
+    disarm_submission_factory_faults();
+    engine.shutdown(status);
+    expect_status("MAX_DEPENDENCY_SHUTDOWN", status, RDMA_SC_OK);
+  endtask
+
+  task automatic check_counter_invariants_poison_before_transport();
+    rdma_cmq_engine_probe engine;
+    rdma_mock_host_mem mem;
+    rdma_cmq_test_pcie pcie;
+    rdma_mock_call_trace trace;
+    rdma_doorbell_scheduler scheduler;
+    rdma_cmq_test_profile profile;
+    rdma_function_binding prepared_binding;
+    rdma_function_binding active_binding;
+    rdma_cmq cmq;
+    rdma_cmq_runtime_desc runtime_desc;
+    rdma_cmq_command_desc requests[];
+    rdma_cmq_ticket tickets[];
+    rdma_status item_statuses[];
+    rdma_status batch_status;
+    rdma_status status;
+    longint unsigned seeded_publish_seq;
+    longint unsigned seeded_retire_seq;
+    int unsigned request_count;
+    string label;
+
+    for (int unsigned invariant = 0; invariant < 3; invariant++) begin
+      case (invariant)
+        0: begin
+          label = "COUNTER_NEXT_PUBLICATION_OVERFLOW";
+          seeded_publish_seq = 64'hffff_ffff_ffff_fff0;
+          seeded_retire_seq = 64'hffff_ffff_ffff_fff0;
+          request_count = 32;
+        end
+        1: begin
+          label = "COUNTER_PUBLISH_BEFORE_RETIRE";
+          seeded_publish_seq = 4;
+          seeded_retire_seq = 5;
+          request_count = 1;
+        end
+        default: begin
+          label = "COUNTER_OCCUPANCY_EXCEEDS_DEPTH";
+          seeded_publish_seq = 33;
+          seeded_retire_seq = 0;
+          request_count = 1;
+        end
+      endcase
+
+      engine = rdma_cmq_engine_probe::type_id::create(
+        $sformatf("counter_poison_engine_%0d", invariant)
+      );
+      mem = rdma_mock_host_mem::type_id::create(
+        $sformatf("counter_poison_mem_%0d", invariant)
+      );
+      pcie = rdma_cmq_test_pcie::type_id::create(
+        $sformatf("counter_poison_pcie_%0d", invariant)
+      );
+      trace = rdma_mock_call_trace::type_id::create(
+        $sformatf("counter_poison_trace_%0d", invariant)
+      );
+      mem.set_call_trace(trace);
+      pcie.set_call_trace(trace);
+      scheduler = rdma_doorbell_scheduler::type_id::create(
+        $sformatf("counter_poison_scheduler_%0d", invariant)
+      );
+      profile = rdma_cmq_test_profile::type_id::create(
+        $sformatf("counter_poison_profile_%0d", invariant)
+      );
+      prepared_binding = make_binding(
+        $sformatf("counter_poison_prepared_%0d", invariant),
+        RDMA_BIND_PREPARED
+      );
+      active_binding = make_binding(
+        $sformatf("counter_poison_active_%0d", invariant),
+        RDMA_BIND_ACTIVE
+      );
+      cmq = make_cmq($sformatf("counter_poison_cmq_%0d", invariant),
+                     prepared_binding);
+      prepare_active(label, engine, mem, pcie, scheduler, profile,
+                     prepared_binding, active_binding, cmq, runtime_desc);
+      clear_submit_observation(mem, pcie, trace);
+      engine.seed_ring_counters(seeded_publish_seq, seeded_retire_seq);
+
+      requests = new[request_count];
+      foreach (requests[i])
+        requests[i] = make_command(
+          $sformatf("counter_poison_request_%0d_%0d", invariant, i),
+          active_binding, rdma_cmq_test_profile::TEST_OPCODE_A,
+          byte'(8'hc0 + i), 10us
+        );
+      engine.submit_batch(requests, tickets, item_statuses, batch_status);
+      if (batch_status == null || batch_status.ok())
+        `uvm_error("COUNTER_POISON_STATUS",
+                   $sformatf("%s did not fail the batch", label))
+      if (invariant == 0 &&
+          (batch_status == null ||
+           batch_status.message !=
+             "CMQ producer sequence addition overflows"))
+        `uvm_error("COUNTER_POISON_OVERFLOW_BRANCH",
+                   "counter overflow did not fail at producer addition")
+      if (tickets.size() != request_count ||
+          item_statuses.size() != request_count)
+        `uvm_error("COUNTER_POISON_ALIGNMENT",
+                   $sformatf("%s outputs are misaligned", label))
+      else begin
+        foreach (tickets[i]) begin
+          if (tickets[i] != null)
+            `uvm_error("COUNTER_POISON_TICKET",
+                       $sformatf("%s published ticket %0d", label, i))
+          if (item_statuses[i] == null || item_statuses[i].ok())
+            `uvm_error("COUNTER_POISON_ITEM_STATUS",
+                       $sformatf("%s item %0d did not fail", label, i))
+        end
+      end
+      expect_no_submit_side_effects({label, "_EFFECTS"}, mem, pcie, trace);
+      if (engine.state() != RDMA_CMQ_ENGINE_POISONED ||
+          engine.mapping_snapshot() == null)
+        `uvm_error("COUNTER_POISON_STATE",
+                   $sformatf("%s did not retain poisoned release authority",
+                             label))
+      if (engine.published_count() != seeded_publish_seq ||
+          engine.retired_count() != seeded_retire_seq ||
+          engine.tokens_in_use_count() != 0 ||
+          engine.slot_record_count() != 0)
+        `uvm_error("COUNTER_POISON_LEDGER",
+                   $sformatf("%s changed the authority ledger", label))
+
+      engine.shutdown(status);
+      expect_status({label, "_SHUTDOWN"}, status, RDMA_SC_OK);
+    end
+  endtask
+
+  task automatic check_retire_then_wrap_publication();
+    rdma_cmq_engine_probe engine;
+    rdma_mock_host_mem mem;
+    rdma_cmq_test_pcie pcie;
+    rdma_mock_call_trace trace;
+    rdma_doorbell_scheduler scheduler;
+    rdma_cmq_test_profile profile;
+    rdma_function_binding prepared_binding;
+    rdma_function_binding active_binding;
+    rdma_cmq cmq;
+    rdma_cmq_runtime_desc runtime_desc;
+    rdma_cmq_command_desc requests[];
+    rdma_cmq_ticket tickets[];
+    rdma_status item_statuses[];
+    rdma_status batch_status;
+    rdma_status status;
+
+    engine = rdma_cmq_engine_probe::type_id::create("wrap_engine");
+    mem = rdma_mock_host_mem::type_id::create("wrap_mem");
+    pcie = rdma_cmq_test_pcie::type_id::create("wrap_pcie");
+    trace = rdma_mock_call_trace::type_id::create("wrap_trace");
+    mem.set_call_trace(trace);
+    pcie.set_call_trace(trace);
+    scheduler = rdma_doorbell_scheduler::type_id::create("wrap_scheduler");
+    profile = rdma_cmq_test_profile::type_id::create("wrap_profile");
+    prepared_binding = make_binding("wrap_prepared", RDMA_BIND_PREPARED);
+    active_binding = make_binding("wrap_active", RDMA_BIND_ACTIVE);
+    cmq = make_cmq("wrap_cmq", prepared_binding);
+    prepare_active("WRAP", engine, mem, pcie, scheduler, profile,
+                   prepared_binding, active_binding, cmq, runtime_desc);
+    clear_submit_observation(mem, pcie, trace);
+
+    requests = new[32];
+    foreach (requests[i])
+      requests[i] = make_command(
+        $sformatf("wrap_fill_%0d", i), active_binding,
+        rdma_cmq_test_profile::TEST_OPCODE_A, byte'(i + 1'b1), 10us
+      );
+    engine.submit_batch(requests, tickets, item_statuses, batch_status);
+    expect_status("WRAP_FILL_BATCH", batch_status, RDMA_SC_OK);
+    if (tickets.size() != 32 || item_statuses.size() != 32)
+      `uvm_error("WRAP_FILL_ALIGNMENT", "fill outputs are misaligned")
+    else begin
+      foreach (tickets[i]) begin
+        expect_status($sformatf("WRAP_FILL_ITEM_%0d", i), item_statuses[i],
+                      RDMA_SC_OK);
+        if (tickets[i] == null)
+          `uvm_error("WRAP_FILL_TICKET",
+                     $sformatf("fill ticket %0d is null", i))
+      end
+    end
+
+    status = engine.complete_and_retire_slot_zero();
+    expect_status("WRAP_RETIRE_ZERO", status, RDMA_SC_OK);
+    if (engine.published_count() != 32 || engine.retired_count() != 1 ||
+        engine.tokens_in_use_count() != 31 ||
+        engine.slot_record_count() != 31)
+      `uvm_error("WRAP_RETIRE_LEDGER",
+                 "retiring slot zero changed the wrong authority")
+
+    clear_submit_observation(mem, pcie, trace);
+    requests = new[1];
+    requests[0] = make_command("wrap_sequence_32", active_binding,
+                               rdma_cmq_test_profile::TEST_OPCODE_B,
+                               8'hf0, 10us);
+    engine.submit_batch(requests, tickets, item_statuses, batch_status);
+    expect_status("WRAP_SEQUENCE_32_BATCH", batch_status, RDMA_SC_OK);
+    if (tickets.size() != 1 || tickets[0] == null ||
+        item_statuses.size() != 1)
+      `uvm_error("WRAP_SEQUENCE_32_OUTPUT", "wrapped output is invalid")
+    else begin
+      expect_status("WRAP_SEQUENCE_32_ITEM", item_statuses[0], RDMA_SC_OK);
+      if (tickets[0].slot_sequence != 32 || tickets[0].sq_index != 0 ||
+          !tickets[0].sq_wrap)
+        `uvm_error("WRAP_SEQUENCE_32_TICKET",
+                   "wrapped ticket did not reuse slot zero at sequence 32")
+    end
+    if (mem.calls.size() != 1 || mem.calls[0].offset != 0 ||
+        mem.calls[0].data.size() != 64 ||
+        mem.calls[0].data[5][1:0] != 2'b01)
+      `uvm_error("WRAP_SEQUENCE_32_SQE",
+                 "sequence 32 SQE did not encode valid=0/wrap=1")
+    if (pcie.calls.size() != 3 ||
+        pcie.calls[2].method_name != "mmio_write" ||
+        pcie.calls[2].data.size() != 8 ||
+        pcie.calls[2].data[0] != 8'h01 ||
+        pcie.calls[2].data[1] != 8'h01 ||
+        profile.last_final_pi != 1 || !profile.last_polarity)
+      `uvm_error("WRAP_SEQUENCE_32_DOORBELL",
+                 "sequence 32 doorbell did not encode PI=1/polarity=1")
+    if (engine.published_count() != 33 || engine.retired_count() != 1 ||
+        engine.tokens_in_use_count() != 32 ||
+        engine.slot_record_count() != 32)
+      `uvm_error("WRAP_SEQUENCE_32_LEDGER",
+                 "wrapped publication did not restore full occupancy")
+
+    engine.shutdown(status);
+    expect_status("WRAP_SHUTDOWN", status, RDMA_SC_OK);
+  endtask
+
   task automatic check_full_initial_capacity_and_shutdown_reset();
     rdma_cmq_engine_probe engine;
     rdma_mock_host_mem mem;
@@ -6609,6 +7169,7 @@ class rdma_cmq_engine_test extends uvm_test;
     check_mutating_clone_source_restoration();
     check_qpc_context_snapshot_failures();
     check_transaction_failure_atomicity();
+    check_all_transport_failure_rollbacks();
     check_doorbell_authority_isolation();
     check_submission_validation_and_profile_metadata();
     check_profile_hook_snapshot_contract();
@@ -6616,6 +7177,9 @@ class rdma_cmq_engine_test extends uvm_test;
     check_exact_type_profile_delegation();
     check_internal_invariant_batch_abort();
     check_incarnation_survives_reprepare();
+    check_max_dependency_id_boundary();
+    check_counter_invariants_poison_before_transport();
+    check_retire_then_wrap_publication();
     check_full_initial_capacity_and_shutdown_reset();
     phase.drop_objection(this);
   endtask

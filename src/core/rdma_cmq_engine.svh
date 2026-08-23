@@ -108,6 +108,50 @@ class rdma_cmq_engine extends uvm_object;
     return rdma_status::make(RDMA_SC_INVALID_STATE, message);
   endfunction
 
+  protected function rdma_status poison_status(string message);
+    engine_state = RDMA_CMQ_ENGINE_POISONED;
+    return invalid_state(message);
+  endfunction
+
+  protected function rdma_status ring_used(output longint unsigned used);
+    used = 0;
+    if (publish_seq < retire_seq)
+      return poison_status("CMQ publish counter precedes retire counter");
+    used = publish_seq - retire_seq;
+    if (used > CMQ_DEPTH)
+      return poison_status("CMQ ring occupancy exceeds depth");
+    return rdma_status::success();
+  endfunction
+
+  protected function rdma_status retire_completed_prefix();
+    rdma_status status;
+    longint unsigned used;
+
+    status = ring_used(used);
+    if (!status.ok())
+      return status;
+    while (retire_seq < publish_seq) begin
+      int unsigned index;
+
+      index = retire_seq % CMQ_DEPTH;
+      if (slots[index] == null ||
+          slots[index].slot_sequence != retire_seq ||
+          slots[index].sq_index != index ||
+          slots[index].sq_wrap !=
+            ((retire_seq / CMQ_DEPTH) & 1'b1))
+        return poison_status("CMQ retirement slot ledger is inconsistent");
+      if (!(slots[index].state inside {
+            CMQ_SLOT_COMPLETED,
+            CMQ_SLOT_LATE_COMPLETED,
+            CMQ_SLOT_RESET_CANCELLED
+          }))
+        break;
+      slots[index] = null;
+      retire_seq++;
+    end
+    return rdma_status::success();
+  endfunction
+
   protected function bit same_handle(rdma_handle lhs, rdma_handle rhs);
     if (lhs == null || rhs == null)
       return 1'b0;
@@ -3148,6 +3192,7 @@ class rdma_cmq_engine extends uvm_object;
     bit final_polarity;
     time minimum_remaining;
     time remaining;
+    longint unsigned used;
     bit transaction_failed;
 
     tickets = new[requests.size()];
@@ -3193,6 +3238,14 @@ class rdma_cmq_engine extends uvm_object;
     active_function = prepared_binding.make_handle();
     if (active_function == null) begin
       batch_status = invalid_state("CMQ ACTIVE Function handle is missing");
+      foreach (item_statuses[i])
+        item_statuses[i] = rdma_cmq_clone_status_value(batch_status);
+      engine_lock.put(1);
+      return;
+    end
+    status = ring_used(used);
+    if (!status.ok()) begin
+      batch_status = rdma_cmq_clone_status_value(status);
       foreach (item_statuses[i])
         item_statuses[i] = rdma_cmq_clone_status_value(batch_status);
       engine_lock.put(1);
@@ -3303,12 +3356,24 @@ class rdma_cmq_engine extends uvm_object;
         preserve_item_status[i] = 1'b1;
         continue;
       end
-      if ((publish_seq - retire_seq) + success_count >= CMQ_DEPTH) begin
+      if ((used + success_count) == CMQ_DEPTH) begin
         item_statuses[i] = rdma_status::make(
           RDMA_SC_QUEUE_FULL, "CMQ submission ring is full"
         );
         preserve_item_status[i] = 1'b1;
         continue;
+      end
+
+      // Include the current candidate in the producer precheck.  A sequence
+      // at UINT64_MAX cannot be published because its dependency ID is the
+      // checked sequence + 1, so fail before constructing either value.
+      if (publish_seq >=
+          (64'hffff_ffff_ffff_ffff - success_count)) begin
+        transaction_status = poison_status(
+          "CMQ producer sequence addition overflows"
+        );
+        transaction_failed = 1'b1;
+        break;
       end
 
       for (int unsigned token_index = 0;
@@ -3340,24 +3405,13 @@ class rdma_cmq_engine extends uvm_object;
         continue;
       end
 
-      if (publish_seq >
-          (64'hffff_ffff_ffff_ffff - success_count)) begin
-        tentative_token_reserved[selected_token] = 1'b0;
-        item_statuses[i] = rdma_status::make(
-          RDMA_SC_RESOURCE_EXHAUSTED, "CMQ slot sequence overflows"
-        );
-        preserve_item_status[i] = 1'b1;
-        continue;
-      end
       slot_sequence = publish_seq + success_count;
       if (slot_sequence == 64'hffff_ffff_ffff_ffff) begin
-        tentative_token_reserved[selected_token] = 1'b0;
-        item_statuses[i] = rdma_status::make(
-          RDMA_SC_RESOURCE_EXHAUSTED,
-          "CMQ dependency identifier would overflow"
+        transaction_status = poison_status(
+          "CMQ dependency identifier addition overflows"
         );
-        preserve_item_status[i] = 1'b1;
-        continue;
+        transaction_failed = 1'b1;
+        break;
       end
       sq_index = slot_sequence % CMQ_DEPTH;
       sq_wrap = (slot_sequence / CMQ_DEPTH) & 1'b1;
@@ -3563,8 +3617,7 @@ class rdma_cmq_engine extends uvm_object;
     if (!transaction_failed) begin
       if (publish_seq >
           (64'hffff_ffff_ffff_ffff - success_count)) begin
-        transaction_status = rdma_status::make(
-          RDMA_SC_RESOURCE_EXHAUSTED,
+        transaction_status = poison_status(
           "CMQ final producer sequence overflows"
         );
         transaction_failed = 1'b1;
@@ -3758,7 +3811,7 @@ class rdma_cmq_engine extends uvm_object;
         tentative_success_statuses[success_index];
       tentative_token_reserved[token_index] = 1'b0;
     end
-    publish_seq += success_count;
+    publish_seq = final_sequence;
     batch_status = successful_batch_status;
     engine_lock.put(1);
   endtask
