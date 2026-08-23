@@ -49,7 +49,8 @@ class rdma_xtr_v1_cmq_completion_test extends uvm_test;
     bit [7:0] opcode,
     bit [7:0] command_ecode = 8'h00,
     bit [4:0] wqe_index = 5'h1b,
-    bit wrap = 1'b1
+    bit wrap = 1'b1,
+    bit owner = 1'b1
   );
     rdma_hw_image image;
     bit [63:0] qword0;
@@ -66,6 +67,7 @@ class rdma_xtr_v1_cmq_completion_test extends uvm_test;
     image.hmc_target = '0;
     image.bar_target = '0;
     qword0 = '0;
+    qword0[63] = owner;
     qword0[45] = wrap;
     qword0[44:40] = wqe_index;
     qword0[39:32] = opcode;
@@ -121,14 +123,14 @@ class rdma_xtr_v1_cmq_completion_test extends uvm_test;
   endfunction
 
   // Independent driver-derived oracle.  It intentionally does not call any
-  // codec mask/helper: qword 0 owns only bits 45:24; returned-object bytes are
-  // opened only for admitted query opcodes.
+  // codec mask/helper: qword 0 owns owner bit 63 and bits 45:24;
+  // returned-object bytes are opened only for admitted query opcodes.
   function automatic bit [63:0] literal_allowed_mask(
     bit [7:0] opcode,
     int unsigned qword_index
   );
     if (qword_index == 0)
-      return 64'h0000_3fff_ff00_0000;
+      return 64'h8000_3fff_ff00_0000;
     case (opcode)
       8'h0f: return 64'hffff_ffff_ffff_ffff; // CQC bytes 8..63
       8'h09:
@@ -163,8 +165,7 @@ class rdma_xtr_v1_cmq_completion_test extends uvm_test;
   function automatic void expect_decode_success(
     string label,
     rdma_hw_image image,
-    bit [7:0] expected_opcode,
-    bit expected_wrap,
+    bit expected_owner,
     int unsigned expected_first_byte,
     int unsigned expected_payload_length
   );
@@ -172,19 +173,24 @@ class rdma_xtr_v1_cmq_completion_test extends uvm_test;
     rdma_hw_image snapshot;
     rdma_status status;
     bit [63:0] qword0;
+    bit ready;
     snapshot = clone_image(image, {label, "_snapshot"});
     completion = null;
-    status = codec.decode_completion(image, expected_opcode, expected_wrap,
-                                     completion);
+    ready = 1'b0;
+    status = codec.inspect_completion(image, expected_owner, ready,
+                                      completion);
     expect_status({label, "_STATUS"}, status, RDMA_SC_OK);
-    if (completion == null)
+    if (!ready)
+      `uvm_error(label, "matching owner was not reported ready")
+    else if (completion == null)
       `uvm_error(label, "successful decode published null")
     else begin
       qword0 = get_qword(image, 0);
-      if (completion.opcode != expected_opcode ||
+      if (completion.owner != expected_owner ||
+          completion.opcode != qword0[39:32] ||
           completion.command_ecode != qword0[31:24] ||
           completion.wqe_index != qword0[44:40] ||
-          completion.wrap != expected_wrap)
+          completion.wrap != qword0[45])
         `uvm_error(label, "successful decode changed a common field")
       if (completion.object_payload.size() != expected_payload_length)
         `uvm_error(label, $sformatf(
@@ -204,19 +210,25 @@ class rdma_xtr_v1_cmq_completion_test extends uvm_test;
   function automatic void expect_decode_failure(
     string label,
     rdma_hw_image image,
-    bit [7:0] expected_opcode,
-    bit expected_wrap,
-    rdma_status_code_e expected_status = RDMA_SC_CODEC_ERROR
+    bit expected_owner,
+    rdma_status_code_e expected_status = RDMA_SC_CODEC_ERROR,
+    bit expected_ready = 1'b1
   );
     rdma_xtr_v1_cmq_completion completion;
     rdma_hw_image snapshot;
     rdma_status status;
+    bit ready;
     completion = rdma_xtr_v1_cmq_completion::type_id::create(
       {label, "_stale_completion"});
     snapshot = (image == null) ? null : clone_image(image, {label, "_snapshot"});
-    status = codec.decode_completion(image, expected_opcode, expected_wrap,
-                                     completion);
+    ready = 1'b1;
+    status = codec.inspect_completion(image, expected_owner, ready,
+                                      completion);
     expect_status(label, status, expected_status);
+    if (ready != expected_ready)
+      `uvm_error(label, $sformatf(
+        "failure ready mismatch: expected %0b got %0b",
+        expected_ready, ready))
     if (completion != null)
       `uvm_error(label, "structural decode failure published completion")
     if (image != null)
@@ -227,21 +239,29 @@ class rdma_xtr_v1_cmq_completion_test extends uvm_test;
     rdma_hw_image image;
     rdma_hw_image snapshot;
     rdma_xtr_v1_cmq_completion completion;
+    rdma_xtr_v1_cmq_completion copied;
     rdma_status status;
+    bit ready;
     image = make_image(8'h00, 8'h45, 5'h1b, 1'b1);
     snapshot = clone_image(image, "common_snapshot");
     completion = null;
-    status = codec.decode_completion(image, 8'h00, 1'b1, completion);
+    ready = 1'b0;
+    status = codec.inspect_completion(image, 1'b1, ready, completion);
     expect_status("CQE_COMMON_STATUS", status, RDMA_SC_OK);
-    if (completion == null)
+    if (!ready || completion == null)
       `uvm_error("CQE_COMMON", "successful decode published null")
     else begin
-      if (completion.opcode != 8'h00 ||
+      if (completion.owner != 1'b1 || completion.opcode != 8'h00 ||
           completion.command_ecode != 8'h45 ||
           completion.wqe_index != 5'h1b || completion.wrap != 1'b1)
         `uvm_error("CQE_COMMON", "common completion fields changed")
       if (completion.object_payload.size() != 0)
         `uvm_error("CQE_COMMON", "non-return command published payload")
+      copied = rdma_xtr_v1_cmq_completion::type_id::create(
+        "copied_completion");
+      copied.copy(completion);
+      if (copied.owner != completion.owner)
+        `uvm_error("CQE_COMMON_COPY", "completion copy lost owner")
     end
     expect_image_unchanged("CQE_COMMON_IMMUTABLE", image, snapshot);
   endfunction
@@ -256,15 +276,17 @@ class rdma_xtr_v1_cmq_completion_test extends uvm_test;
     rdma_hw_image snapshot;
     rdma_xtr_v1_cmq_completion completion;
     rdma_status status;
+    bit ready;
     int unsigned expected_length;
     image = make_image(opcode, 8'h00, 5'h03, 1'b0);
     for (int unsigned i = first_byte; i <= last_byte; i++)
       image.bytes[i] = i;
     snapshot = clone_image(image, {label, "_snapshot"});
     completion = null;
-    status = codec.decode_completion(image, opcode, 1'b0, completion);
+    ready = 1'b0;
+    status = codec.inspect_completion(image, 1'b1, ready, completion);
     expect_status({label, "_STATUS"}, status, RDMA_SC_OK);
-    if (completion == null) begin
+    if (!ready || completion == null) begin
       `uvm_error(label, "successful payload decode published null")
       return;
     end
@@ -289,51 +311,75 @@ class rdma_xtr_v1_cmq_completion_test extends uvm_test;
 
   function automatic void check_metadata_failures();
     rdma_hw_image image;
-    expect_decode_failure("CQE_NULL", null, 8'h00, 1'b0);
+    expect_decode_failure("CQE_NULL", null, 1'b1, RDMA_SC_CODEC_ERROR,
+                          1'b0);
 
     image = make_image(8'h00, 0, 0, 0);
     image.length = 63;
-    expect_decode_failure("CQE_LENGTH", image, 8'h00, 1'b0);
+    expect_decode_failure("CQE_LENGTH", image, 1'b1, RDMA_SC_CODEC_ERROR,
+                          1'b0);
     image = make_image(8'h00, 0, 0, 0);
     void'(image.bytes.pop_back());
-    expect_decode_failure("CQE_BYTE_SIZE", image, 8'h00, 1'b0);
+    expect_decode_failure("CQE_BYTE_SIZE", image, 1'b1,
+                          RDMA_SC_CODEC_ERROR, 1'b0);
     image = make_image(8'h00, 0, 0, 0);
     image.image_kind = RDMA_IMAGE_CMQ_SQE;
-    expect_decode_failure("CQE_KIND", image, 8'h00, 1'b0);
+    expect_decode_failure("CQE_KIND", image, 1'b1, RDMA_SC_CODEC_ERROR,
+                          1'b0);
     image = make_image(8'h00, 0, 0, 0);
     image.hardware_version = 2;
-    expect_decode_failure("CQE_VERSION", image, 8'h00, 1'b0);
+    expect_decode_failure("CQE_VERSION", image, 1'b1, RDMA_SC_CODEC_ERROR,
+                          1'b0);
     image = make_image(8'h00, 0, 0, 0);
     image.endian = RDMA_ENDIAN_LITTLE;
-    expect_decode_failure("CQE_ENDIAN", image, 8'h00, 1'b0);
+    expect_decode_failure("CQE_ENDIAN", image, 1'b1, RDMA_SC_CODEC_ERROR,
+                          1'b0);
     image = make_image(8'h00, 0, 0, 0);
     image.alignment = 8;
-    expect_decode_failure("CQE_ALIGNMENT", image, 8'h00, 1'b0);
+    expect_decode_failure("CQE_ALIGNMENT", image, 1'b1,
+                          RDMA_SC_CODEC_ERROR, 1'b0);
     image = make_image(8'h00, 0, 0, 0);
     image.write_target_kind = RDMA_HW_TARGET_BAR;
-    expect_decode_failure("CQE_TARGET_KIND", image, 8'h00, 1'b0);
+    expect_decode_failure("CQE_TARGET_KIND", image, 1'b1,
+                          RDMA_SC_CODEC_ERROR, 1'b0);
     image = make_image(8'h00, 0, 0, 0);
     image.backing_target.value = 64'h1000;
-    expect_decode_failure("CQE_BACKING_TARGET", image, 8'h00, 1'b0);
+    expect_decode_failure("CQE_BACKING_TARGET", image, 1'b1,
+                          RDMA_SC_CODEC_ERROR, 1'b0);
     image = make_image(8'h00, 0, 0, 0);
     image.hmc_target.value = 64'h2000;
-    expect_decode_failure("CQE_HMC_TARGET", image, 8'h00, 1'b0);
+    expect_decode_failure("CQE_HMC_TARGET", image, 1'b1,
+                          RDMA_SC_CODEC_ERROR, 1'b0);
     image = make_image(8'h00, 0, 0, 0);
     image.bar_target.value = 64'h3000;
-    expect_decode_failure("CQE_BAR_TARGET", image, 8'h00, 1'b0);
+    expect_decode_failure("CQE_BAR_TARGET", image, 1'b1,
+                          RDMA_SC_CODEC_ERROR, 1'b0);
   endfunction
 
-  function automatic void check_expected_identity_failures();
+  function automatic void check_owner_ready_ordering();
     rdma_hw_image image;
-    image = make_image(8'h00, 0, 0, 0);
-    expect_decode_failure("CQE_OPCODE_MISMATCH", image, 8'h01, 1'b0);
-    image = make_image(8'h00, 0, 0, 0);
-    expect_decode_failure("CQE_EXPECTED_OPCODE_UNSUPPORTED", image, 8'hfe,
-                          1'b0, RDMA_SC_UNSUPPORTED_OPCODE);
-    image = make_image(8'h00, 0, 0, 0);
-    expect_decode_failure("CQE_WRAP_MISMATCH", image, 8'h00, 1'b1);
-    image = make_image(8'hfe, 0, 0, 0);
-    expect_decode_failure("CQE_UNKNOWN_OPCODE", image, 8'hfe, 1'b0,
+    rdma_xtr_v1_cmq_completion completion;
+    rdma_status status;
+    bit [63:0] word;
+    bit ready;
+
+    // A stale entry may contain arbitrary payload.  Once metadata/qword 0 are
+    // readable, owner mismatch must return empty without interpreting it.
+    image = make_image(8'hfe, 8'hff, 5'h1f, 1'b1, 1'b0);
+    word = get_qword(image, 7);
+    word[3] = 1'b1;
+    set_qword(image, 7, word);
+    completion = rdma_xtr_v1_cmq_completion::type_id::create(
+      "stale_owner_completion");
+    ready = 1'b1;
+    status = codec.inspect_completion(image, 1'b1, ready, completion);
+    expect_status("CQE_OWNER_MISMATCH_STATUS", status, RDMA_SC_OK);
+    if (ready || completion != null)
+      `uvm_error("CQE_OWNER_MISMATCH",
+                 "stale owner published readiness or a completion")
+
+    image = make_image(8'hfe, 0, 0, 0, 1'b1);
+    expect_decode_failure("CQE_UNKNOWN_OPCODE", image, 1'b1,
                           RDMA_SC_UNSUPPORTED_OPCODE);
   endfunction
 
@@ -352,14 +398,14 @@ class rdma_xtr_v1_cmq_completion_test extends uvm_test;
       image = make_image(supported[i], 0, 0, 0);
       literal_payload_bounds(supported[i], first_byte, byte_count);
       expect_decode_success(
-        $sformatf("CQE_ADMISSION_%02x", supported[i]), image, supported[i],
-        1'b0, first_byte, byte_count);
+        $sformatf("CQE_ADMISSION_%02x", supported[i]), image, 1'b1,
+        first_byte, byte_count);
     end
     foreach (unsupported[i]) begin
       image = make_image(unsupported[i], 0, 0, 0);
       expect_decode_failure(
         $sformatf("CQE_UNSUPPORTED_%02x", unsupported[i]), image,
-        unsupported[i], 1'b0, RDMA_SC_UNSUPPORTED_OPCODE);
+        1'b1, RDMA_SC_UNSUPPORTED_OPCODE);
     end
   endfunction
 
@@ -380,7 +426,7 @@ class rdma_xtr_v1_cmq_completion_test extends uvm_test;
           set_qword(image, q, word);
           expect_decode_failure(
             $sformatf("CQE_RESERVED_%02x_Q%0d_B%0d", opcodes[o], q, b),
-            image, opcodes[o], 1'b0
+            image, 1'b1
           );
         end
       end
@@ -402,7 +448,7 @@ class rdma_xtr_v1_cmq_completion_test extends uvm_test;
       word[b] = 1'b1;
       set_qword(image, 0, word);
       expect_decode_success($sformatf("CQE_ALLOWED_ECODE_B%0d", b), image,
-                            8'h00, 1'b0, 0, 0);
+                            1'b1, 0, 0);
     end
     for (int unsigned b = 40; b <= 44; b++) begin
       image = make_image(8'h00, 0, 0, 0);
@@ -410,8 +456,10 @@ class rdma_xtr_v1_cmq_completion_test extends uvm_test;
       word[b] = 1'b1;
       set_qword(image, 0, word);
       expect_decode_success($sformatf("CQE_ALLOWED_INDEX_B%0d", b), image,
-                            8'h00, 1'b0, 0, 0);
+                            1'b1, 0, 0);
     end
+    image = make_image(8'h00, 0, 0, 0, 1'b1);
+    expect_decode_success("CQE_ALLOWED_OWNER", image, 1'b1, 0, 0);
 
     foreach (payload_opcodes[o]) begin
       literal_payload_bounds(payload_opcodes[o], first_byte, byte_count);
@@ -426,7 +474,7 @@ class rdma_xtr_v1_cmq_completion_test extends uvm_test;
           expect_decode_success(
             $sformatf("CQE_ALLOWED_PAYLOAD_%02x_Q%0d_B%0d",
                       payload_opcodes[o], q, b),
-            image, payload_opcodes[o], 1'b0, first_byte, byte_count);
+            image, 1'b1, first_byte, byte_count);
         end
       end
     end
@@ -443,7 +491,7 @@ class rdma_xtr_v1_cmq_completion_test extends uvm_test;
     check_payload_slice("CQE_AEQC_QUERY_SLICE", 8'h17, 16, 47);
     check_payload_slice("CQE_SRFQC_QUERY_SLICE", 8'h38, 16, 47);
     check_metadata_failures();
-    check_expected_identity_failures();
+    check_owner_ready_ordering();
     check_literal_admission_table();
     check_every_reserved_bit();
     check_every_allowed_data_bit();

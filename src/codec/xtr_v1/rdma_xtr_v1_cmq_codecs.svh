@@ -51,6 +51,7 @@ endclass
 class rdma_xtr_v1_cmq_completion extends uvm_object;
   `uvm_object_utils(rdma_xtr_v1_cmq_completion)
 
+  bit owner;
   bit [7:0] opcode;
   bit [7:0] command_ecode;
   bit [4:0] wqe_index;
@@ -59,6 +60,7 @@ class rdma_xtr_v1_cmq_completion extends uvm_object;
 
   function new(string name = "rdma_xtr_v1_cmq_completion");
     super.new(name);
+    owner = 1'b0;
     opcode = '0;
     command_ecode = '0;
     wqe_index = '0;
@@ -71,6 +73,7 @@ class rdma_xtr_v1_cmq_completion extends uvm_object;
     super.do_copy(rhs);
     if (!$cast(rhs_completion, rhs))
       `uvm_fatal("RDMA_COPY_TYPE", "CMQ completion copy type mismatch")
+    owner = rhs_completion.owner;
     opcode = rhs_completion.opcode;
     command_ecode = rhs_completion.command_ecode;
     wqe_index = rhs_completion.wqe_index;
@@ -129,7 +132,7 @@ class rdma_xtr_v1_cmq_completion_codec extends uvm_object;
     int unsigned qword_index
   );
     if (qword_index == 0)
-      return 64'h0000_3fff_ff00_0000;
+      return 64'h8000_3fff_ff00_0000;
     case (opcode)
       COMPLETION_KEY_QUERY_OPCODE:
         if (qword_index inside {[2:7]})
@@ -175,20 +178,22 @@ class rdma_xtr_v1_cmq_completion_codec extends uvm_object;
     endcase
   endfunction
 
-  function rdma_status decode_completion(
+  function rdma_status inspect_completion(
     rdma_hw_image image,
-    bit [7:0] expected_opcode,
-    bit expected_wrap,
+    bit expected_owner,
+    output bit ready,
     output rdma_xtr_v1_cmq_completion completion
   );
     bit [63:0] qword0;
     bit [63:0] word;
     bit [7:0] opcode;
+    bit owner;
     bit wrap;
     int unsigned first_byte;
     int unsigned byte_count;
     rdma_xtr_v1_cmq_completion candidate;
 
+    ready = 1'b0;
     completion = null;
     if (image == null)
       return codec_error("xtr_v1 CMQ completion image is null");
@@ -203,14 +208,11 @@ class rdma_xtr_v1_cmq_completion_codec extends uvm_object;
         image.backing_target.value != 0 || image.hmc_target.value != 0 ||
         image.bar_target.value != 0)
       return codec_error("xtr_v1 CMQ completion metadata is invalid");
-    if (!supported_opcode(expected_opcode))
-      return rdma_status::make(
-        RDMA_SC_UNSUPPORTED_OPCODE,
-        $sformatf("unsupported expected xtr_v1 CMQ completion opcode 0x%02x",
-                  expected_opcode)
-      );
-
     qword0 = image_qword(image, 0);
+    owner = qword0[63];
+    if (owner != expected_owner)
+      return rdma_status::success();
+    ready = 1'b1;
     opcode = (qword0 >> XTR_V1_CMQ_OPCODE_LSB) & 8'hff;
     wrap = (qword0 >> XTR_V1_CMQ_WRAP_LSB) & 1'b1;
     if (!supported_opcode(opcode))
@@ -225,14 +227,8 @@ class rdma_xtr_v1_cmq_completion_codec extends uvm_object;
         return codec_error($sformatf(
           "xtr_v1 CMQ completion qword %0d contains a reserved bit", q));
     end
-    if (opcode != expected_opcode)
-      return codec_error($sformatf(
-        "xtr_v1 CMQ completion opcode mismatch: expected 0x%02x got 0x%02x",
-        expected_opcode, opcode));
-    if (wrap != expected_wrap)
-      return codec_error("xtr_v1 CMQ completion wrap mismatch");
-
     candidate = new("xtr_v1_cmq_completion");
+    candidate.owner = owner;
     candidate.opcode = opcode;
     candidate.command_ecode =
       (qword0 >> XTR_V1_CMQ_CMD_ECODE_LSB) & 8'hff;

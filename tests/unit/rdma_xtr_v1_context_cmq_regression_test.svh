@@ -1175,6 +1175,7 @@ class rdma_xtr_v1_context_cmq_regression_test extends uvm_test;
     image.hardware_version = XTR_V1_HW_VERSION;
     image.write_target_kind = RDMA_HW_TARGET_NONE;
     word = '0;
+    word[63] = 1'b1;
     word[45] = wrap;
     word[44:40] = 5'h1b;
     word[39:32] = opcode;
@@ -1192,6 +1193,7 @@ class rdma_xtr_v1_context_cmq_regression_test extends uvm_test;
     rdma_hw_image snapshot;
     rdma_xtr_v1_cmq_completion completion;
     rdma_status status;
+    bit ready;
     image = make_completion(opcode, 1'b1);
     if (image == null || completion_codec == null) begin
       `uvm_error(label, "completion check has a null prerequisite")
@@ -1200,18 +1202,20 @@ class rdma_xtr_v1_context_cmq_regression_test extends uvm_test;
     snapshot = clone_image(image, {label, "_CQE_SNAPSHOT"});
     if (snapshot == null) return 1'b0;
     completion = null;
-    status = completion_codec.decode_completion(image, opcode, 1'b1,
-                                                 completion);
+    ready = 1'b0;
+    status = completion_codec.inspect_completion(image, 1'b1, ready,
+                                                  completion);
     if (status != null && status.ok() &&
         !expect_image_unchanged({label, "_COMPLETION_INPUT"}, image,
                                 snapshot))
       return 1'b0;
     if (!require_ok({label, "_COMPLETION_DECODE"}, status)) return 1'b0;
-    if (completion == null) begin
+    if (!ready || completion == null) begin
       `uvm_error(label, "successful completion decode published null")
       return 1'b0;
     end
-    if (completion.opcode != opcode || completion.command_ecode != 0 ||
+    if (!completion.owner || completion.opcode != opcode ||
+        completion.command_ecode != 0 ||
         completion.wqe_index != 5'h1b || !completion.wrap ||
         completion.object_payload.size() != 0) begin
       `uvm_error(label, "create/register completion fields are incorrect")
@@ -1642,6 +1646,7 @@ class rdma_xtr_v1_context_cmq_regression_test extends uvm_test;
     rdma_xtr_v1_cmq_envelope bad_envelope;
     rdma_xtr_v1_cmq_completion completion;
     rdma_status status;
+    bit ready;
 
     if (qpc_codec == null || qpc == null || qpc_image == null ||
         cqc_codec == null || cqc == null || cqc_body == null ||
@@ -1804,6 +1809,7 @@ class rdma_xtr_v1_context_cmq_regression_test extends uvm_test;
       `uvm_error("FAIL_COMPLETION_DECODE", "completion image creation failed")
       return 1'b0;
     end
+    corrupt.bytes[7] |= 8'h01;
     input_snapshot = clone_image(corrupt, "FAIL_COMPLETION_SNAPSHOT");
     if (input_snapshot == null) return 1'b0;
     completion = rdma_xtr_v1_cmq_completion::type_id::create(
@@ -1812,8 +1818,9 @@ class rdma_xtr_v1_context_cmq_regression_test extends uvm_test;
       `uvm_error("FAIL_COMPLETION_DECODE", "stale completion creation failed")
       return 1'b0;
     end
-    status = completion_codec.decode_completion(
-      corrupt, XTR_V1_OP_CQC_CREATE, 1'b0, completion);
+    ready = 1'b1;
+    status = completion_codec.inspect_completion(
+      corrupt, 1'b1, ready, completion);
     if (!verify_artifact_ledger("AFTER_FAIL_COMPLETION_DECODE"))
       return 1'b0;
     if (!require_status("FAIL_COMPLETION_DECODE", status,
@@ -1822,6 +1829,11 @@ class rdma_xtr_v1_context_cmq_regression_test extends uvm_test;
     if (completion != null) begin
       `uvm_error("FAIL_COMPLETION_DECODE",
                  "failed completion decode published an object")
+      return 1'b0;
+    end
+    if (!ready) begin
+      `uvm_error("FAIL_COMPLETION_DECODE",
+                 "matching-owner malformed completion was not ready")
       return 1'b0;
     end
     if (!expect_image_unchanged("FAIL_COMPLETION_INPUT", corrupt,
