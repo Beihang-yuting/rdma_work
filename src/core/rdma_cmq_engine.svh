@@ -136,6 +136,66 @@ class rdma_cmq_engine extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  protected function rdma_status decoded_status_contract(
+    rdma_cmq_decoded_cqe decoded
+  );
+    rdma_status command_status;
+
+    if (decoded == null || decoded.command_status == null)
+      return invalid_state("CMQ decoded completion status is missing");
+    command_status = decoded.command_status;
+    if (command_status.category !=
+        rdma_status::category_for(command_status.code))
+      return invalid_state(
+        "CMQ decoded completion status category is inconsistent"
+      );
+    if (decoded.hardware_ecode == 0) begin
+      if (!command_status.ok() || command_status.hardware_code_valid ||
+          command_status.hardware_code != 0 ||
+          command_status.severity != RDMA_SEVERITY_INFO)
+        return invalid_state(
+          "CMQ successful hardware ecode status is inconsistent"
+        );
+    end
+    else begin
+      if (command_status.ok() || !command_status.hardware_code_valid ||
+          command_status.hardware_code != decoded.hardware_ecode ||
+          command_status.severity != RDMA_SEVERITY_ERROR)
+        return invalid_state(
+          "CMQ failed hardware ecode status is inconsistent"
+        );
+    end
+    return rdma_status::success();
+  endfunction
+
+  protected function rdma_status poll_ledger_status(
+    output longint unsigned used
+  );
+    rdma_status status;
+    int unsigned slot_count;
+    int unsigned token_count;
+
+    used = 0;
+    status = ring_used(used);
+    if (!status.ok())
+      return status;
+    if (cq_consume_seq < retire_seq || cq_consume_seq > publish_seq)
+      return invalid_state("CMQ completion counters are inconsistent");
+    slot_count = 0;
+    token_count = 0;
+    foreach (slots[i]) begin
+      if (slots[i] != null)
+        slot_count++;
+      if (token_in_use[i])
+        token_count++;
+    end
+    if (slot_count != used || entry_registry.num() != used ||
+        token_count != command_registry.num() ||
+        command_registry.num() > used)
+      return invalid_state("CMQ polling ledger is inconsistent");
+    return rdma_status::success();
+  endfunction
+
   protected function string command_key(rdma_cmq_ticket ticket);
     return $sformatf(
       "%016h:%08h:%08h:%016h",
@@ -197,6 +257,9 @@ class rdma_cmq_engine extends uvm_object;
     output rdma_cmq_completion completion
   );
     rdma_status validation_status;
+    rdma_status snapshot_status;
+    rdma_cmq_ticket ticket_snapshot;
+    uvm_object payload_snapshot;
 
     completion = null;
     if (record == null || record.ticket == null ||
@@ -210,18 +273,32 @@ class rdma_cmq_engine extends uvm_object;
     );
     if (completion == null)
       return invalid_state("CMQ completion construction failed");
-    completion.ticket = rdma_cmq_clone_ticket_value(
-      record.ticket, "CMQ polled completion"
+    snapshot_status = checked_completion_ticket_snapshot(
+      record.ticket, ticket_snapshot
     );
+    if (snapshot_status == null || !snapshot_status.ok()) begin
+      completion = null;
+      return (snapshot_status == null) ?
+        invalid_state("CMQ completion ticket snapshot returned null") :
+        snapshot_status;
+    end
+    completion.ticket = ticket_snapshot;
     completion.status = rdma_cmq_clone_status_value(
       decoded.command_status
     );
     completion.raw_cqe = rdma_cmq_clone_image_value(
       raw_cqe, "CMQ polled completion raw CQE"
     );
-    completion.decoded_response = rdma_cmq_clone_object_value(
-      decoded.response_payload, "CMQ polled completion response"
+    snapshot_status = checked_completion_payload_snapshot(
+      decoded.response_payload, payload_snapshot
     );
+    if (snapshot_status == null || !snapshot_status.ok()) begin
+      completion = null;
+      return (snapshot_status == null) ?
+        invalid_state("CMQ completion payload snapshot returned null") :
+        snapshot_status;
+    end
+    completion.decoded_response = payload_snapshot;
     if (completion.ticket == null || completion.status == null ||
         completion.raw_cqe == null) begin
       completion = null;
@@ -2353,6 +2430,124 @@ class rdma_cmq_engine extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  protected function rdma_status checked_completion_payload_snapshot(
+    uvm_object source,
+    output uvm_object snapshot
+  );
+    uvm_object_wrapper source_type;
+    uvm_object_wrapper snapshot_type;
+    rdma_status status;
+
+    snapshot = null;
+    if (profile == null)
+      return invalid_state("CMQ completion payload profile is unavailable");
+    if (source == null)
+      return invalid_state("CMQ completion payload is null");
+    source_type = source.get_object_type();
+    if (source_type == null)
+      return invalid_state(
+        "CMQ completion payload dynamic type is unregistered"
+      );
+    status = profile.snapshot_completion_payload(source, snapshot);
+    if (status == null) begin
+      snapshot = null;
+      return invalid_state(
+        "CMQ completion payload snapshot returned null status"
+      );
+    end
+    if (!status.ok()) begin
+      snapshot = null;
+      return status;
+    end
+    snapshot_type = (snapshot == null) ? null : snapshot.get_object_type();
+    if (snapshot == null || snapshot == source || snapshot_type == null ||
+        snapshot_type != source_type ||
+        !profile.same_completion_payload_value(source, snapshot) ||
+        !profile.completion_payload_graph_detached(source, snapshot)) begin
+      snapshot = null;
+      return invalid_state("CMQ completion payload snapshot contract failed");
+    end
+    if (!profile.same_completion_payload_value(source, snapshot) ||
+        !profile.completion_payload_graph_detached(source, snapshot)) begin
+      snapshot = null;
+      return invalid_state(
+        "CMQ completion payload final snapshot contract failed"
+      );
+    end
+    return rdma_status::success();
+  endfunction
+
+  protected function rdma_status checked_completion_ticket_snapshot(
+    rdma_cmq_ticket source,
+    output rdma_cmq_ticket snapshot
+  );
+    rdma_status status;
+    longint unsigned saved_command_id;
+    longint unsigned saved_slot_sequence;
+    int unsigned saved_sq_index;
+    bit saved_sq_wrap;
+    time saved_absolute_deadline;
+
+    snapshot = null;
+    if (source == null || source.function_h == null ||
+        source.cmq_h == null || source.opcode_key == null)
+      return invalid_state("CMQ completion ticket authority is incomplete");
+    saved_command_id = source.command_id;
+    saved_slot_sequence = source.slot_sequence;
+    saved_sq_index = source.sq_index;
+    saved_sq_wrap = source.sq_wrap;
+    saved_absolute_deadline = source.absolute_deadline;
+    snapshot = rdma_cmq_ticket::type_id::create(
+      "cmq_polled_completion_ticket"
+    );
+    if (snapshot == null)
+      return invalid_state("CMQ completion ticket construction failed");
+    snapshot.command_id = saved_command_id;
+    status = checked_function_snapshot(
+      source.function_h, "CMQ completion ticket", RDMA_SC_INVALID_STATE,
+      snapshot.function_h
+    );
+    if (!status.ok()) begin
+      snapshot = null;
+      return status;
+    end
+    status = checked_handle_snapshot(
+      source.cmq_h, "CMQ completion ticket", RDMA_SC_INVALID_STATE,
+      snapshot.cmq_h
+    );
+    if (!status.ok()) begin
+      snapshot = null;
+      return status;
+    end
+    snapshot.slot_sequence = saved_slot_sequence;
+    snapshot.sq_index = saved_sq_index;
+    snapshot.sq_wrap = saved_sq_wrap;
+    status = checked_opcode_snapshot(
+      source.opcode_key, "CMQ completion ticket", RDMA_SC_INVALID_STATE,
+      snapshot.opcode_key
+    );
+    if (!status.ok()) begin
+      snapshot = null;
+      return status;
+    end
+    snapshot.absolute_deadline = saved_absolute_deadline;
+    if (source.command_id != saved_command_id ||
+        source.slot_sequence != saved_slot_sequence ||
+        source.sq_index != saved_sq_index || source.sq_wrap != saved_sq_wrap ||
+        source.absolute_deadline != saved_absolute_deadline) begin
+      snapshot = null;
+      return invalid_state(
+        "CMQ completion ticket snapshot changed its source value"
+      );
+    end
+    status = snapshot.validate();
+    if (status == null || !status.ok()) begin
+      snapshot = null;
+      return invalid_state("CMQ completion ticket snapshot validation failed");
+    end
+    return rdma_status::success();
+  endfunction
+
   protected function rdma_status checked_expected_snapshot(
     rdma_cmq_expected_response source,
     string label,
@@ -4005,6 +4200,7 @@ class rdma_cmq_engine extends uvm_object;
     bit ready;
     string hardware_key;
     string software_key;
+    longint unsigned ledger_used;
 
     completions.delete();
     diagnostics.delete();
@@ -4023,6 +4219,18 @@ class rdma_cmq_engine extends uvm_object;
     end
     status = mapping_authority_status(backing_mapping, dma_context);
     if (!status.ok()) begin
+      engine_lock.put(1);
+      return;
+    end
+    while (terminal_fifo.size() != 0)
+      completions.push_back(terminal_fifo.pop_front());
+    status = poll_ledger_status(ledger_used);
+    if (!status.ok()) begin
+      engine_lock.put(1);
+      return;
+    end
+    if (ledger_used == 0) begin
+      status = rdma_status::success();
       engine_lock.put(1);
       return;
     end
@@ -4046,9 +4254,12 @@ class rdma_cmq_engine extends uvm_object;
       status = make_raw_cqe_image(data, raw_cqe);
       if (!status.ok())
         break;
-      raw_snapshot = rdma_cmq_clone_image_value(
-        raw_cqe, "CMQ CQE inspection snapshot"
+      status = checked_image_snapshot(
+        raw_cqe, "CMQ CQE inspection", RDMA_SC_INVALID_STATE,
+        raw_snapshot
       );
+      if (!status.ok())
+        break;
       expected_owner = !((cq_consume_seq / CMQ_DEPTH) & 1'b1);
       ready = 1'b0;
       decoded = null;
@@ -4081,6 +4292,9 @@ class rdma_cmq_engine extends uvm_object;
         status = invalid_state("CMQ decoded CQE validation failed");
         break;
       end
+      status = decoded_status_contract(decoded);
+      if (!status.ok())
+        break;
 
       hardware_key = entry_key(decoded.wqe_index, decoded.wqe_wrap);
       if (!entry_registry.exists(hardware_key)) begin
@@ -4140,6 +4354,8 @@ class rdma_cmq_engine extends uvm_object;
           retirement_status;
         break;
       end
+      if (publish_seq == retire_seq)
+        break;
     end
 
     while (terminal_fifo.size() != 0)

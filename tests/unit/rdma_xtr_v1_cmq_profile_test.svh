@@ -951,6 +951,71 @@ class rdma_xtr_v1_cmq_profile_test extends uvm_test;
                  "TQ compose mutated the slot")
   endfunction
 
+  function automatic void check_completion_payload_snapshot_contract();
+    rdma_xtr_v1_cmq_hw_profile profile;
+    rdma_xtr_v1_cmq_completion source;
+    rdma_xtr_v1_cmq_completion snapshot;
+    uvm_object snapshot_object;
+    rdma_status status;
+
+    profile = rdma_xtr_v1_cmq_hw_profile::type_id::create(
+      "completion_payload_snapshot_profile"
+    );
+    source = rdma_xtr_v1_cmq_completion::type_id::create(
+      "completion_payload_snapshot_source"
+    );
+    source.owner = 1'b1;
+    source.opcode = XTR_V1_OP_CQC_QUERY;
+    source.command_ecode = XTR_V1_ECODE_EC_RCE_CQ_FULL;
+    source.wqe_index = 5'h1b;
+    source.wrap = 1'b1;
+    source.object_payload = new[3];
+    source.object_payload[0] = 8'h12;
+    source.object_payload[1] = 8'h34;
+    source.object_payload[2] = 8'h56;
+
+    snapshot_object = null;
+    status = profile.snapshot_completion_payload(source, snapshot_object);
+    expect_status("PAYLOAD_SNAPSHOT_STATUS", status, RDMA_SC_OK);
+    if (!$cast(snapshot, snapshot_object)) begin
+      `uvm_error("PAYLOAD_SNAPSHOT_TYPE",
+                 "completion payload snapshot lost its XTR type")
+      return;
+    end
+    if (snapshot == source ||
+        !profile.same_completion_payload_value(source, snapshot) ||
+        !profile.completion_payload_graph_detached(source, snapshot) ||
+        snapshot.owner != source.owner ||
+        snapshot.opcode != source.opcode ||
+        snapshot.command_ecode != source.command_ecode ||
+        snapshot.wqe_index != source.wqe_index ||
+        snapshot.wrap != source.wrap ||
+        snapshot.object_payload.size() != source.object_payload.size())
+      `uvm_error("PAYLOAD_SNAPSHOT_CONTRACT",
+                 "completion payload snapshot is not detached and equal")
+    else
+      foreach (source.object_payload[i])
+        if (snapshot.object_payload[i] != source.object_payload[i])
+          `uvm_error("PAYLOAD_SNAPSHOT_BYTES",
+                     "completion payload snapshot bytes changed")
+
+    source.owner = 1'b0;
+    source.opcode = XTR_V1_OP_CQC_DELETE;
+    source.command_ecode = 8'h00;
+    source.wqe_index = 5'h02;
+    source.wrap = 1'b0;
+    source.object_payload[0] = 8'hff;
+    if (!snapshot.owner || snapshot.opcode != XTR_V1_OP_CQC_QUERY ||
+        snapshot.command_ecode != XTR_V1_ECODE_EC_RCE_CQ_FULL ||
+        snapshot.wqe_index != 5'h1b || !snapshot.wrap ||
+        snapshot.object_payload.size() != 3 ||
+        snapshot.object_payload[0] != 8'h12 ||
+        snapshot.object_payload[1] != 8'h34 ||
+        snapshot.object_payload[2] != 8'h56)
+      `uvm_error("PAYLOAD_SNAPSHOT_DRIFT",
+                 "completion payload snapshot followed source mutation")
+  endfunction
+
   function automatic void check_inspect_cqe();
     rdma_xtr_v1_cmq_hw_profile profile;
     rdma_xtr_v1_error_codec oracle;
@@ -1098,6 +1163,7 @@ class rdma_xtr_v1_cmq_profile_test extends uvm_test;
     check_body_snapshot_contract();
     check_compose_sqe();
     check_compose_generation_policy();
+    check_completion_payload_snapshot_contract();
     check_inspect_cqe();
     check_encode_doorbell();
     phase.drop_objection(this);

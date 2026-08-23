@@ -27,6 +27,28 @@ virtual class rdma_cmq_hw_profile extends uvm_object;
   );
     return 1'b0;
   endfunction
+  virtual function rdma_status snapshot_completion_payload(
+    uvm_object source,
+    output uvm_object snapshot
+  );
+    snapshot = null;
+    return rdma_status::make(
+      RDMA_SC_INVALID_ARGUMENT,
+      "CMQ profile does not recognize the completion payload type"
+    );
+  endfunction
+  virtual function bit same_completion_payload_value(
+    uvm_object lhs,
+    uvm_object rhs
+  );
+    return 1'b0;
+  endfunction
+  virtual function bit completion_payload_graph_detached(
+    uvm_object source,
+    uvm_object snapshot
+  );
+    return 1'b0;
+  endfunction
   pure virtual function rdma_status compose_sqe(
     rdma_cmq_command_desc command,
     rdma_cmq_slot_context slot,

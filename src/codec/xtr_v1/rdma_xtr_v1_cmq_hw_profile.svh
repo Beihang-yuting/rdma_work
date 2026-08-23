@@ -428,6 +428,66 @@ class rdma_xtr_v1_cmq_hw_profile extends rdma_cmq_hw_profile;
     return status;
   endfunction
 
+  virtual function rdma_status snapshot_completion_payload(
+    uvm_object source,
+    output uvm_object snapshot
+  );
+    rdma_xtr_v1_cmq_completion source_payload;
+    rdma_xtr_v1_cmq_completion snapshot_payload;
+
+    snapshot = null;
+    if (!$cast(source_payload, source))
+      return invalid_argument(
+        "xtr_v1 CMQ completion payload type is unsupported"
+      );
+    snapshot_payload = rdma_xtr_v1_cmq_completion::type_id::create(
+      "xtr_v1_completion_payload_snapshot"
+    );
+    if (snapshot_payload == null)
+      return invalid_state("xtr_v1 completion payload allocation failed");
+    snapshot_payload.owner = source_payload.owner;
+    snapshot_payload.opcode = source_payload.opcode;
+    snapshot_payload.command_ecode = source_payload.command_ecode;
+    snapshot_payload.wqe_index = source_payload.wqe_index;
+    snapshot_payload.wrap = source_payload.wrap;
+    snapshot_payload.object_payload = source_payload.object_payload;
+    snapshot = snapshot_payload;
+    return rdma_status::success();
+  endfunction
+
+  virtual function bit same_completion_payload_value(
+    uvm_object lhs,
+    uvm_object rhs
+  );
+    rdma_xtr_v1_cmq_completion lhs_payload;
+    rdma_xtr_v1_cmq_completion rhs_payload;
+
+    if (!$cast(lhs_payload, lhs) || !$cast(rhs_payload, rhs) ||
+        lhs_payload.object_payload.size() !=
+          rhs_payload.object_payload.size())
+      return 1'b0;
+    foreach (lhs_payload.object_payload[i])
+      if (lhs_payload.object_payload[i] != rhs_payload.object_payload[i])
+        return 1'b0;
+    return lhs_payload.owner == rhs_payload.owner &&
+           lhs_payload.opcode == rhs_payload.opcode &&
+           lhs_payload.command_ecode == rhs_payload.command_ecode &&
+           lhs_payload.wqe_index == rhs_payload.wqe_index &&
+           lhs_payload.wrap == rhs_payload.wrap;
+  endfunction
+
+  virtual function bit completion_payload_graph_detached(
+    uvm_object source,
+    uvm_object snapshot
+  );
+    rdma_xtr_v1_cmq_completion source_payload;
+    rdma_xtr_v1_cmq_completion snapshot_payload;
+
+    return $cast(source_payload, source) &&
+           $cast(snapshot_payload, snapshot) &&
+           source_payload != snapshot_payload;
+  endfunction
+
   protected function rdma_codec_key doorbell_key(string variant);
     rdma_codec_key key;
     key.hw_version = "xtr_v1";
