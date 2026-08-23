@@ -2249,6 +2249,37 @@ class rdma_cmq_engine_probe extends rdma_cmq_engine;
     return terminal_fifo.size();
   endfunction
 
+  function rdma_cmq_slot_state_e slot_state_at(int unsigned sq_index);
+    if (sq_index >= 32 || slots[sq_index] == null)
+      return CMQ_SLOT_FREE;
+    return slots[sq_index].state;
+  endfunction
+
+  function bit token_in_use_at(int unsigned token_index);
+    if (token_index >= 32)
+      return 1'b0;
+    return token_in_use[token_index];
+  endfunction
+
+  function bit [58:0] token_incarnation_at(int unsigned token_index);
+    if (token_index >= 32)
+      return '0;
+    return token_incarnation[token_index];
+  endfunction
+
+  function void seed_token_incarnation(
+    int unsigned token_index,
+    bit [58:0] incarnation
+  );
+    if (token_index < 32)
+      token_incarnation[token_index] = incarnation;
+  endfunction
+
+  function void seed_all_token_incarnations(bit [58:0] incarnation);
+    foreach (token_incarnation[i])
+      token_incarnation[i] = incarnation;
+  endfunction
+
   function void seed_terminal_completion(rdma_cmq_completion completion);
     terminal_fifo.push_back(completion);
   endfunction
@@ -3293,6 +3324,91 @@ class rdma_cmq_engine_test extends uvm_test;
              payload.wqe_index != expected_ticket.sq_index ||
              payload.wrap != expected_ticket.sq_wrap)
       `uvm_error(label, "decoded CQE payload fields are mismatched")
+  endfunction
+
+  function automatic void expect_timeout_completion(
+    string label,
+    rdma_cmq_completion completion,
+    rdma_cmq_ticket expected_ticket
+  );
+    rdma_status validation_status;
+
+    if (completion == null || expected_ticket == null ||
+        expected_ticket.function_h == null ||
+        expected_ticket.cmq_h == null ||
+        expected_ticket.opcode_key == null) begin
+      `uvm_error(label, "timeout completion prerequisites are null")
+      return;
+    end
+    validation_status = completion.validate();
+    expect_status({label, "_VALIDATE"}, validation_status, RDMA_SC_OK);
+    if (completion.ticket == null || completion.ticket == expected_ticket ||
+        completion.ticket.function_h == expected_ticket.function_h ||
+        completion.ticket.cmq_h == expected_ticket.cmq_h ||
+        completion.ticket.opcode_key == expected_ticket.opcode_key ||
+        completion.ticket.command_id != expected_ticket.command_id ||
+        completion.ticket.slot_sequence != expected_ticket.slot_sequence ||
+        completion.ticket.sq_index != expected_ticket.sq_index ||
+        completion.ticket.sq_wrap != expected_ticket.sq_wrap ||
+        completion.ticket.absolute_deadline !=
+          expected_ticket.absolute_deadline)
+      `uvm_error(label, "timeout completion ticket is aliased or mismatched")
+    expect_status({label, "_STATUS"}, completion.status, RDMA_SC_TIMEOUT);
+    if (completion.status == null)
+      return;
+    if (completion.status.source_engine != RDMA_ENGINE_CMQ ||
+        completion.status.function_uid !=
+          expected_ticket.function_h.function_uid ||
+        completion.status.generation !=
+          expected_ticket.function_h.generation ||
+        completion.status.resource_id != expected_ticket.cmq_h.object_id ||
+        completion.status.command_id != expected_ticket.command_id ||
+        completion.raw_cqe != null || completion.decoded_response != null)
+      `uvm_error(label, "timeout completion identity or payload is invalid")
+  endfunction
+
+  function automatic void expect_late_diagnostic(
+    string label,
+    rdma_cmq_engine_probe engine,
+    rdma_cmq_diagnostic diagnostic,
+    rdma_cmq_ticket expected_ticket,
+    rdma_hw_image expected_raw
+  );
+    rdma_status validation_status;
+
+    if (diagnostic == null || expected_ticket == null ||
+        expected_ticket.function_h == null ||
+        expected_ticket.cmq_h == null ||
+        expected_ticket.opcode_key == null || expected_raw == null) begin
+      `uvm_error(label, "late diagnostic prerequisites are null")
+      return;
+    end
+    validation_status = diagnostic.validate();
+    expect_status({label, "_VALIDATE"}, validation_status, RDMA_SC_OK);
+    if (diagnostic.kind != RDMA_CMQ_DIAG_LATE_COMPLETION ||
+        diagnostic.ticket == null || diagnostic.ticket == expected_ticket ||
+        diagnostic.ticket.function_h == expected_ticket.function_h ||
+        diagnostic.ticket.cmq_h == expected_ticket.cmq_h ||
+        diagnostic.ticket.opcode_key == expected_ticket.opcode_key ||
+        diagnostic.ticket.command_id != expected_ticket.command_id ||
+        diagnostic.ticket.slot_sequence != expected_ticket.slot_sequence ||
+        diagnostic.ticket.sq_index != expected_ticket.sq_index ||
+        diagnostic.ticket.sq_wrap != expected_ticket.sq_wrap ||
+        diagnostic.ticket.absolute_deadline != expected_ticket.absolute_deadline)
+      `uvm_error(label, "late diagnostic ticket is aliased or mismatched")
+    expect_status({label, "_STATUS"}, diagnostic.status, RDMA_SC_TIMEOUT);
+    if (diagnostic.status == null)
+      return;
+    if (diagnostic.status.source_engine != RDMA_ENGINE_CMQ ||
+        diagnostic.status.function_uid !=
+          expected_ticket.function_h.function_uid ||
+        diagnostic.status.generation !=
+          expected_ticket.function_h.generation ||
+        diagnostic.status.resource_id != expected_ticket.cmq_h.object_id ||
+        diagnostic.status.command_id != expected_ticket.command_id ||
+        diagnostic.raw_cqe == null || diagnostic.raw_cqe == expected_raw ||
+        !engine.probe_same_image(diagnostic.raw_cqe, expected_raw))
+      `uvm_error(label, "late diagnostic identity or raw CQE is invalid")
   endfunction
 
   function automatic void expect_release_retry_identity(
@@ -7757,6 +7873,296 @@ class rdma_cmq_engine_test extends uvm_test;
     disarm_submission_factory_faults();
   endtask
 
+  task automatic check_timeout_quarantine_and_late_diagnostic();
+    rdma_cmq_engine_probe engine;
+    rdma_mock_host_mem mem;
+    rdma_cmq_test_pcie pcie;
+    rdma_mock_call_trace trace;
+    rdma_doorbell_scheduler scheduler;
+    rdma_cmq_test_profile profile;
+    rdma_function_binding prepared_binding;
+    rdma_function_binding active_binding;
+    rdma_cmq cmq;
+    rdma_cmq_runtime_desc runtime_desc;
+    rdma_cmq_command_desc requests[];
+    rdma_cmq_command_desc reuse_request;
+    rdma_cmq_ticket tickets[];
+    rdma_cmq_ticket reuse_ticket;
+    rdma_status item_statuses[];
+    rdma_status batch_status;
+    rdma_dma_mapping mapping;
+    rdma_cmq_completion completions[$];
+    rdma_cmq_diagnostic diagnostics[$];
+    rdma_hw_image first_raw;
+    rdma_hw_image reuse_raw;
+    rdma_hw_image survivor_raw;
+    rdma_status status;
+
+    engine = rdma_cmq_engine_probe::type_id::create("timeout_engine");
+    mem = rdma_mock_host_mem::type_id::create("timeout_mem");
+    pcie = rdma_cmq_test_pcie::type_id::create("timeout_pcie");
+    trace = rdma_mock_call_trace::type_id::create("timeout_trace");
+    mem.set_call_trace(trace);
+    pcie.set_call_trace(trace);
+    scheduler = rdma_doorbell_scheduler::type_id::create(
+      "timeout_scheduler"
+    );
+    profile = rdma_cmq_test_profile::type_id::create("timeout_profile");
+    prepared_binding = make_binding("timeout_prepared", RDMA_BIND_PREPARED);
+    active_binding = make_binding("timeout_active", RDMA_BIND_ACTIVE);
+    cmq = make_cmq("timeout_cmq", prepared_binding);
+    prepare_active("TIMEOUT", engine, mem, pcie, scheduler, profile,
+                   prepared_binding, active_binding, cmq, runtime_desc);
+    clear_submit_observation(mem, pcie, trace);
+
+    requests = new[2];
+    requests[0] = make_command(
+      "timeout_first", active_binding,
+      rdma_cmq_test_profile::TEST_OPCODE_A, 8'hd0, 10ns
+    );
+    requests[1] = make_command(
+      "timeout_survivor", active_binding,
+      rdma_cmq_test_profile::TEST_OPCODE_B, 8'hd1, 1us
+    );
+    engine.submit_batch(requests, tickets, item_statuses, batch_status);
+    expect_status("TIMEOUT_BATCH", batch_status, RDMA_SC_OK);
+    if (tickets.size() != 2 || item_statuses.size() != 2 ||
+        tickets[0] == null || tickets[1] == null) begin
+      `uvm_error("TIMEOUT_BATCH", "timeout batch outputs are incomplete")
+      engine.shutdown(status);
+      return;
+    end
+    expect_status("TIMEOUT_ITEM_0", item_statuses[0], RDMA_SC_OK);
+    expect_status("TIMEOUT_ITEM_1", item_statuses[1], RDMA_SC_OK);
+    if (tickets[0].command_id[4:0] != 0 ||
+        tickets[1].command_id[4:0] != 1)
+      `uvm_error("TIMEOUT_TOKEN_ORDER", "initial token order is unexpected")
+    mapping = engine.mapping_snapshot();
+
+    #20ns;
+    engine.expire(completions, status);
+    expect_status("TIMEOUT_EXPIRE", status, RDMA_SC_OK);
+    if (completions.size() != 1)
+      `uvm_error("TIMEOUT_EXPIRE", "expire did not return exactly one result")
+    else
+      expect_timeout_completion("TIMEOUT_RESULT", completions[0], tickets[0]);
+    if (engine.slot_state_at(0) != CMQ_SLOT_TIMED_OUT_QUARANTINED ||
+        engine.slot_state_at(1) != CMQ_SLOT_PUBLISHED ||
+        engine.published_count() != 2 || engine.retired_count() != 0 ||
+        engine.cq_consumed_count() != 0 ||
+        engine.tokens_in_use_count() != 1 ||
+        engine.command_registry_count() != 1 ||
+        engine.entry_registry_count() != 2 ||
+        engine.slot_record_count() != 2)
+      `uvm_error("TIMEOUT_QUARANTINE",
+                 "partial expiry changed the quarantine ledger incorrectly")
+
+    engine.expire(completions, status);
+    expect_status("TIMEOUT_EXPIRE_AGAIN", status, RDMA_SC_OK);
+    if (completions.size() != 0)
+      `uvm_error("TIMEOUT_EXPIRE_AGAIN",
+                 "timeout completion was delivered more than once")
+
+    clear_submit_observation(mem, pcie, trace);
+    reuse_request = make_command(
+      "timeout_reuse", active_binding,
+      rdma_cmq_test_profile::TEST_OPCODE_A, 8'hd2, 10ns
+    );
+    engine.submit(reuse_request, reuse_ticket, status);
+    expect_status("TIMEOUT_REUSE", status, RDMA_SC_OK);
+    if (reuse_ticket == null)
+      `uvm_error("TIMEOUT_REUSE", "reused token returned no ticket")
+    else if (reuse_ticket.command_id[4:0] != tickets[0].command_id[4:0] ||
+             reuse_ticket.command_id == tickets[0].command_id ||
+             reuse_ticket.command_id[63:5] <= tickets[0].command_id[63:5])
+      `uvm_error("TIMEOUT_REUSE",
+                 "token reuse did not advance the full command incarnation")
+
+    mem.calls.delete();
+    write_profile_cqe(
+      "TIMEOUT_LATE_FIRST", mem, mapping, profile, 0, 1'b1, tickets[0],
+      0, first_raw
+    );
+    engine.poll(completions, diagnostics, status);
+    expect_status("TIMEOUT_LATE_FIRST_POLL", status, RDMA_SC_OK);
+    if (completions.size() != 0 || diagnostics.size() != 1)
+      `uvm_error("TIMEOUT_LATE_FIRST_POLL",
+                 "late CQE was not converted to one diagnostic")
+    else
+      expect_late_diagnostic("TIMEOUT_LATE_FIRST_DIAG", engine,
+                             diagnostics[0], tickets[0], first_raw);
+    if (reuse_ticket != null &&
+        (!engine.token_in_use_at(reuse_ticket.command_id[4:0]) ||
+         engine.command_registry_count() != 2 ||
+         engine.tokens_in_use_count() != 2 ||
+         engine.retired_count() != 1 ||
+         engine.cq_consumed_count() != 1))
+      `uvm_error("TIMEOUT_LATE_TOKEN",
+                 "late CQE reclaimed the token's newer incarnation")
+
+    engine.poll(completions, diagnostics, status);
+    expect_status("TIMEOUT_LATE_REPEAT_POLL", status, RDMA_SC_OK);
+    if (completions.size() != 0 || diagnostics.size() != 0 ||
+        engine.cq_consumed_count() != 1)
+      `uvm_error("TIMEOUT_LATE_REPEAT_POLL",
+                 "consumed late CQE was delivered more than once")
+
+    if (reuse_ticket != null) begin
+      mem.calls.delete();
+      write_profile_cqe(
+        "TIMEOUT_READY_AT_DEADLINE", mem, mapping, profile, 1, 1'b1,
+        reuse_ticket, 0, reuse_raw
+      );
+      #20ns;
+      engine.poll(completions, diagnostics, status);
+      expect_status("TIMEOUT_READY_AT_DEADLINE_POLL", status, RDMA_SC_OK);
+      if (completions.size() != 1 || diagnostics.size() != 1)
+        `uvm_error("TIMEOUT_READY_AT_DEADLINE_POLL",
+                   "deadline-ready CQE was not expired before inspection")
+      else begin
+        expect_timeout_completion("TIMEOUT_READY_AT_DEADLINE_RESULT",
+                                  completions[0], reuse_ticket);
+        expect_late_diagnostic("TIMEOUT_READY_AT_DEADLINE_DIAG", engine,
+                               diagnostics[0], reuse_ticket, reuse_raw);
+      end
+      if (engine.slot_state_at(reuse_ticket.sq_index) !=
+            CMQ_SLOT_LATE_COMPLETED ||
+          engine.retired_count() != 1 ||
+          engine.cq_consumed_count() != 2 ||
+          engine.command_registry_count() != 1 ||
+          engine.tokens_in_use_count() != 1 ||
+          engine.entry_registry_count() != 2)
+        `uvm_error("TIMEOUT_READY_AT_DEADLINE_LEDGER",
+                   "deadline-ready late completion ledger is inconsistent")
+    end
+
+    mem.calls.delete();
+    write_profile_cqe(
+      "TIMEOUT_SURVIVOR_CQE", mem, mapping, profile, 2, 1'b1, tickets[1],
+      0, survivor_raw
+    );
+    engine.poll(completions, diagnostics, status);
+    expect_status("TIMEOUT_SURVIVOR_POLL", status, RDMA_SC_OK);
+    if (completions.size() != 1 || diagnostics.size() != 0)
+      `uvm_error("TIMEOUT_SURVIVOR_POLL",
+                 "unexpired survivor did not complete normally")
+    else
+      expect_polled_completion(
+        "TIMEOUT_SURVIVOR_RESULT", engine, completions[0], tickets[1],
+        survivor_raw, 1'b1, 0, RDMA_SC_OK
+      );
+    if (engine.published_count() != 3 || engine.retired_count() != 3 ||
+        engine.cq_consumed_count() != 3 ||
+        engine.tokens_in_use_count() != 0 ||
+        engine.slot_record_count() != 0 ||
+        engine.command_registry_count() != 0 ||
+        engine.entry_registry_count() != 0)
+      `uvm_error("TIMEOUT_FINAL_LEDGER",
+                 "normal survivor did not retire the late-completed prefix")
+
+    engine.shutdown(status);
+    expect_status("TIMEOUT_SHUTDOWN", status, RDMA_SC_OK);
+  endtask
+
+  task automatic check_command_incarnation_exhaustion();
+    rdma_cmq_engine_probe engine;
+    rdma_mock_host_mem mem;
+    rdma_cmq_test_pcie pcie;
+    rdma_mock_call_trace trace;
+    rdma_doorbell_scheduler scheduler;
+    rdma_cmq_test_profile profile;
+    rdma_function_binding prepared_binding;
+    rdma_function_binding active_binding;
+    rdma_cmq cmq;
+    rdma_cmq_runtime_desc runtime_desc;
+    rdma_cmq_command_desc request;
+    rdma_cmq_ticket first_ticket;
+    rdma_cmq_ticket second_ticket;
+    rdma_cmq_ticket exhausted_ticket;
+    rdma_dma_mapping mapping;
+    rdma_cmq_completion completions[$];
+    rdma_cmq_diagnostic diagnostics[$];
+    rdma_hw_image raw_cqe;
+    rdma_status status;
+
+    engine = rdma_cmq_engine_probe::type_id::create("exhaustion_engine");
+    mem = rdma_mock_host_mem::type_id::create("exhaustion_mem");
+    pcie = rdma_cmq_test_pcie::type_id::create("exhaustion_pcie");
+    trace = rdma_mock_call_trace::type_id::create("exhaustion_trace");
+    mem.set_call_trace(trace);
+    pcie.set_call_trace(trace);
+    scheduler = rdma_doorbell_scheduler::type_id::create(
+      "exhaustion_scheduler"
+    );
+    profile = rdma_cmq_test_profile::type_id::create("exhaustion_profile");
+    prepared_binding = make_binding("exhaustion_prepared",
+                                    RDMA_BIND_PREPARED);
+    active_binding = make_binding("exhaustion_active", RDMA_BIND_ACTIVE);
+    cmq = make_cmq("exhaustion_cmq", prepared_binding);
+    prepare_active("EXHAUSTION", engine, mem, pcie, scheduler, profile,
+                   prepared_binding, active_binding, cmq, runtime_desc);
+    mapping = engine.mapping_snapshot();
+    engine.seed_token_incarnation(0, {59{1'b1}});
+    clear_submit_observation(mem, pcie, trace);
+
+    request = make_command("exhaustion_skip_first", active_binding,
+                           rdma_cmq_test_profile::TEST_OPCODE_A, 8'he0, 1us);
+    engine.submit(request, first_ticket, status);
+    expect_status("EXHAUSTION_SKIP_FIRST", status, RDMA_SC_OK);
+    if (first_ticket == null || first_ticket.command_id[4:0] != 1 ||
+        engine.token_incarnation_at(0) != {59{1'b1}})
+      `uvm_error("EXHAUSTION_SKIP_FIRST",
+                 "max-incarnation token was not permanently skipped")
+
+    if (first_ticket != null) begin
+      mem.calls.delete();
+      write_profile_cqe(
+        "EXHAUSTION_FIRST_CQE", mem, mapping, profile, 0, 1'b1,
+        first_ticket, 0, raw_cqe
+      );
+      engine.poll(completions, diagnostics, status);
+      expect_status("EXHAUSTION_FIRST_POLL", status, RDMA_SC_OK);
+      if (completions.size() != 1 || diagnostics.size() != 0)
+        `uvm_error("EXHAUSTION_FIRST_POLL",
+                   "skip fixture did not complete normally")
+    end
+
+    clear_submit_observation(mem, pcie, trace);
+    request = make_command("exhaustion_skip_again", active_binding,
+                           rdma_cmq_test_profile::TEST_OPCODE_B, 8'he1, 1us);
+    engine.submit(request, second_ticket, status);
+    expect_status("EXHAUSTION_SKIP_AGAIN", status, RDMA_SC_OK);
+    if (first_ticket == null || second_ticket == null ||
+        second_ticket.command_id[4:0] != 1 ||
+        second_ticket.command_id[63:5] <= first_ticket.command_id[63:5] ||
+        engine.token_incarnation_at(0) != {59{1'b1}})
+      `uvm_error("EXHAUSTION_SKIP_AGAIN",
+                 "max-incarnation token became allocatable after retirement")
+
+    engine.seed_all_token_incarnations({59{1'b1}});
+    clear_submit_observation(mem, pcie, trace);
+    request = make_command("exhaustion_all", active_binding,
+                           rdma_cmq_test_profile::TEST_OPCODE_A, 8'he2, 1us);
+    engine.submit(request, exhausted_ticket, status);
+    expect_status("EXHAUSTION_ALL", status, RDMA_SC_RESOURCE_EXHAUSTED);
+    if (exhausted_ticket != null)
+      `uvm_error("EXHAUSTION_ALL", "exhausted submit returned a ticket")
+    expect_no_submit_side_effects("EXHAUSTION_ALL_EFFECTS", mem, pcie,
+                                  trace);
+    if (engine.published_count() != 2 || engine.retired_count() != 1 ||
+        engine.cq_consumed_count() != 1 ||
+        engine.tokens_in_use_count() != 1 ||
+        engine.slot_record_count() != 1 ||
+        engine.command_registry_count() != 1 ||
+        engine.entry_registry_count() != 1 ||
+        engine.token_incarnation_at(0) != {59{1'b1}})
+      `uvm_error("EXHAUSTION_ALL_LEDGER",
+                 "resource exhaustion polluted committed authority")
+
+    engine.shutdown(status);
+    expect_status("EXHAUSTION_SHUTDOWN", status, RDMA_SC_OK);
+  endtask
+
   task automatic check_incarnation_survives_reprepare();
     rdma_cmq_engine_probe engine;
     rdma_mock_host_mem mem;
@@ -9202,6 +9608,8 @@ class rdma_cmq_engine_test extends uvm_test;
     check_stateful_profile_snapshot_rechecks();
     check_exact_type_profile_delegation();
     check_internal_invariant_batch_abort();
+    check_timeout_quarantine_and_late_diagnostic();
+    check_command_incarnation_exhaustion();
     check_incarnation_survives_reprepare();
     check_max_dependency_id_boundary();
     check_counter_invariants_poison_before_transport();

@@ -81,6 +81,7 @@ class rdma_cmq_engine extends uvm_object;
   protected rdma_cmq_slot_record command_registry[string];
   protected rdma_cmq_slot_record entry_registry[string];
   protected rdma_cmq_completion terminal_fifo[$];
+  protected rdma_cmq_diagnostic diagnostic_fifo[$];
   // The fixed CMQ profile API has no separate raw-CQE metadata hook.  A
   // profile therefore owns one endian/hardware-version format across its
   // SQE and CQE images.  Only a scheduler-successful batch may establish
@@ -317,6 +318,178 @@ class rdma_cmq_engine extends uvm_object;
     if (validation_status == null || !validation_status.ok()) begin
       completion = null;
       return invalid_state("CMQ completion snapshot validation failed");
+    end
+    return rdma_status::success();
+  endfunction
+
+  protected function rdma_status make_timeout_status(
+    rdma_cmq_ticket ticket,
+    string message,
+    output rdma_status timeout_status
+  );
+    timeout_status = null;
+    if (ticket == null || ticket.function_h == null || ticket.cmq_h == null)
+      return invalid_state("CMQ timeout status ticket authority is missing");
+    timeout_status = rdma_status::make(RDMA_SC_TIMEOUT, message);
+    if (timeout_status == null)
+      return invalid_state("CMQ timeout status construction failed");
+    timeout_status.source_engine = RDMA_ENGINE_CMQ;
+    timeout_status.function_uid = ticket.function_h.function_uid;
+    timeout_status.generation = ticket.function_h.generation;
+    timeout_status.resource_id = ticket.cmq_h.object_id;
+    timeout_status.command_id = ticket.command_id;
+    return rdma_status::success();
+  endfunction
+
+  protected function rdma_status make_timeout_completion(
+    rdma_cmq_slot_record record,
+    output rdma_cmq_completion completion
+  );
+    rdma_status status;
+    rdma_cmq_ticket ticket_snapshot;
+
+    completion = null;
+    if (record == null || record.ticket == null)
+      return invalid_state("CMQ timeout completion authority is missing");
+    completion = rdma_cmq_completion::type_id::create(
+      "cmq_timeout_completion"
+    );
+    if (completion == null)
+      return invalid_state("CMQ timeout completion construction failed");
+    status = checked_completion_ticket_snapshot(record.ticket,
+                                                ticket_snapshot);
+    if (status == null || !status.ok()) begin
+      completion = null;
+      return (status == null) ?
+        invalid_state("CMQ timeout ticket snapshot returned null status") :
+        status;
+    end
+    completion.ticket = ticket_snapshot;
+    status = make_timeout_status(
+      completion.ticket, "CMQ command deadline expired", completion.status
+    );
+    if (status == null || !status.ok()) begin
+      completion = null;
+      return (status == null) ?
+        invalid_state("CMQ timeout status helper returned null") : status;
+    end
+    completion.raw_cqe = null;
+    completion.decoded_response = null;
+    status = completion.validate();
+    if (status == null || !status.ok()) begin
+      completion = null;
+      return invalid_state("CMQ timeout completion validation failed");
+    end
+    return rdma_status::success();
+  endfunction
+
+  protected function rdma_status make_late_diagnostic(
+    rdma_cmq_slot_record record,
+    rdma_hw_image raw_cqe,
+    output rdma_cmq_diagnostic diagnostic
+  );
+    rdma_status status;
+    rdma_cmq_ticket ticket_snapshot;
+
+    diagnostic = null;
+    if (record == null || record.ticket == null || raw_cqe == null)
+      return invalid_state("CMQ late diagnostic authority is missing");
+    diagnostic = rdma_cmq_diagnostic::type_id::create(
+      "cmq_late_completion_diagnostic"
+    );
+    if (diagnostic == null)
+      return invalid_state("CMQ late diagnostic construction failed");
+    status = checked_completion_ticket_snapshot(record.ticket,
+                                                ticket_snapshot);
+    if (status == null || !status.ok()) begin
+      diagnostic = null;
+      return (status == null) ?
+        invalid_state("CMQ late diagnostic ticket snapshot returned null") :
+        status;
+    end
+    diagnostic.kind = RDMA_CMQ_DIAG_LATE_COMPLETION;
+    diagnostic.ticket = ticket_snapshot;
+    status = make_timeout_status(
+      diagnostic.ticket, "CMQ completion arrived after timeout",
+      diagnostic.status
+    );
+    if (status == null || !status.ok()) begin
+      diagnostic = null;
+      return (status == null) ?
+        invalid_state("CMQ late diagnostic status helper returned null") :
+        status;
+    end
+    diagnostic.raw_cqe = raw_cqe;
+    status = diagnostic.validate();
+    if (status == null || !status.ok()) begin
+      diagnostic = null;
+      return invalid_state("CMQ late diagnostic validation failed");
+    end
+    return rdma_status::success();
+  endfunction
+
+  protected function rdma_status expire_locked();
+    rdma_status status;
+    longint unsigned ledger_used;
+    rdma_cmq_slot_record staged_records[CMQ_DEPTH];
+    rdma_cmq_completion staged_completions[CMQ_DEPTH];
+    string staged_command_keys[CMQ_DEPTH];
+    int unsigned staged_tokens[CMQ_DEPTH];
+    int unsigned staged_count;
+
+    status = poll_ledger_status(ledger_used);
+    if (status == null || !status.ok())
+      return (status == null) ?
+        invalid_state("CMQ expiry ledger audit returned null status") : status;
+    staged_count = 0;
+    foreach (slots[i]) begin
+      rdma_cmq_slot_record record;
+      string software_key;
+      string hardware_key;
+      int unsigned token_index;
+
+      record = slots[i];
+      if (record == null || record.state != CMQ_SLOT_PUBLISHED)
+        continue;
+      if (record.ticket == null || record.ticket.function_h == null ||
+          record.ticket.cmq_h == null || record.ticket.opcode_key == null ||
+          record.expected == null ||
+          $isunknown(record.ticket.absolute_deadline))
+        return invalid_state("CMQ expiry slot authority is incomplete");
+      if (record.ticket.absolute_deadline > $time)
+        continue;
+      hardware_key = entry_key(record.sq_index, record.sq_wrap);
+      software_key = command_key(record.ticket);
+      token_index = record.command_token;
+      if (record.sq_index != i || record.ticket.sq_index != i ||
+          record.ticket.slot_sequence != record.slot_sequence ||
+          record.ticket.sq_wrap != record.sq_wrap ||
+          record.ticket.command_id[4:0] != record.command_token ||
+          !entry_registry.exists(hardware_key) ||
+          entry_registry[hardware_key] != record ||
+          !command_registry.exists(software_key) ||
+          command_registry[software_key] != record ||
+          token_index >= CMQ_DEPTH || !token_in_use[token_index])
+        return invalid_state("CMQ expiry slot ledger is inconsistent");
+      status = make_timeout_completion(
+        record, staged_completions[staged_count]
+      );
+      if (status == null || !status.ok() ||
+          staged_completions[staged_count] == null)
+        return (status == null) ?
+          invalid_state("CMQ timeout completion helper returned null status") :
+          status;
+      staged_records[staged_count] = record;
+      staged_command_keys[staged_count] = software_key;
+      staged_tokens[staged_count] = token_index;
+      staged_count++;
+    end
+
+    for (int unsigned i = 0; i < staged_count; i++) begin
+      terminal_fifo.push_back(staged_completions[i]);
+      command_registry.delete(staged_command_keys[i]);
+      token_in_use[staged_tokens[i]] = 1'b0;
+      staged_records[i].state = CMQ_SLOT_TIMED_OUT_QUARANTINED;
     end
     return rdma_status::success();
   endfunction
@@ -3172,6 +3345,7 @@ class rdma_cmq_engine extends uvm_object;
     command_registry.delete();
     entry_registry.delete();
     terminal_fifo.delete();
+    diagnostic_fifo.delete();
     foreach (slots[i]) begin
       slots[i] = null;
       token_in_use[i] = 1'b0;
@@ -3372,6 +3546,7 @@ class rdma_cmq_engine extends uvm_object;
     command_registry.delete();
     entry_registry.delete();
     terminal_fifo.delete();
+    diagnostic_fifo.delete();
     foreach (slots[i]) begin
       slots[i] = null;
       token_in_use[i] = 1'b0;
@@ -4179,6 +4354,24 @@ class rdma_cmq_engine extends uvm_object;
     engine_lock.put(1);
   endtask
 
+  task expire(
+    output rdma_cmq_completion completions[$],
+    output rdma_status status
+  );
+    completions.delete();
+    status = invalid_state("CMQ expire did not complete");
+    engine_lock.get(1);
+    if (engine_state != RDMA_CMQ_ENGINE_ACTIVE) begin
+      status = invalid_state("CMQ expire requires an ACTIVE engine");
+      engine_lock.put(1);
+      return;
+    end
+    status = expire_locked();
+    while (terminal_fifo.size() != 0)
+      completions.push_back(terminal_fifo.pop_front());
+    engine_lock.put(1);
+  endtask
+
   task poll(
     output rdma_cmq_completion completions[$],
     output rdma_cmq_diagnostic diagnostics[$],
@@ -4189,12 +4382,14 @@ class rdma_cmq_engine extends uvm_object;
     rdma_status inspect_status;
     rdma_status validation_status;
     rdma_status completion_status;
+    rdma_status diagnostic_status;
     rdma_status retirement_status;
     rdma_hw_image raw_cqe;
     rdma_hw_image raw_snapshot;
     rdma_cmq_decoded_cqe decoded;
     rdma_cmq_slot_record record;
     rdma_cmq_completion completion;
+    rdma_cmq_diagnostic diagnostic;
     longint unsigned read_offset;
     int unsigned cq_index;
     int unsigned token_index;
@@ -4224,14 +4419,23 @@ class rdma_cmq_engine extends uvm_object;
       engine_lock.put(1);
       return;
     end
+    status = expire_locked();
+    if (status == null)
+      status = invalid_state("CMQ expiry helper returned null status");
     while (terminal_fifo.size() != 0)
       completions.push_back(terminal_fifo.pop_front());
+    if (!status.ok()) begin
+      engine_lock.put(1);
+      return;
+    end
     status = poll_ledger_status(ledger_used);
     if (!status.ok()) begin
       engine_lock.put(1);
       return;
     end
     if (ledger_used == 0) begin
+      while (diagnostic_fifo.size() != 0)
+        diagnostics.push_back(diagnostic_fifo.pop_front());
       status = rdma_status::success();
       engine_lock.put(1);
       return;
@@ -4309,7 +4513,14 @@ class rdma_cmq_engine extends uvm_object;
           record.sq_index != decoded.wqe_index ||
           record.sq_wrap != decoded.wqe_wrap ||
           record.ticket == null || record.expected == null ||
-          record.state != CMQ_SLOT_PUBLISHED) begin
+          record.ticket.sq_index != record.sq_index ||
+          record.ticket.sq_wrap != record.sq_wrap ||
+          record.ticket.slot_sequence != record.slot_sequence ||
+          record.ticket.command_id[4:0] != record.command_token ||
+          !(record.state inside {
+            CMQ_SLOT_PUBLISHED,
+            CMQ_SLOT_TIMED_OUT_QUARANTINED
+          })) begin
         status = invalid_state("CMQ decoded CQE entry ledger is inconsistent");
         break;
       end
@@ -4318,36 +4529,61 @@ class rdma_cmq_engine extends uvm_object;
         break;
       end
       software_key = command_key(record.ticket);
-      if (!command_registry.exists(software_key) ||
-          command_registry[software_key] != record) begin
-        status = invalid_state("CMQ decoded CQE command registry is inconsistent");
-        break;
-      end
-      token_index = record.command_token;
-      if (token_index >= CMQ_DEPTH || !token_in_use[token_index]) begin
-        status = invalid_state("CMQ decoded CQE command token is inconsistent");
-        break;
-      end
       if (cq_consume_seq == 64'hffff_ffff_ffff_ffff) begin
         status = poison_status("CMQ completion consumer counter overflows");
         break;
       end
 
-      completion_status = make_polled_completion(
-        record, raw_snapshot, decoded, completion
-      );
-      if (completion_status == null || !completion_status.ok() ||
-          completion == null) begin
-        status = (completion_status == null) ?
-          invalid_state("CMQ completion construction returned null status") :
-          completion_status;
-        break;
+      if (record.state == CMQ_SLOT_PUBLISHED) begin
+        if (!command_registry.exists(software_key) ||
+            command_registry[software_key] != record) begin
+          status = invalid_state(
+            "CMQ decoded CQE command registry is inconsistent"
+          );
+          break;
+        end
+        token_index = record.command_token;
+        if (token_index >= CMQ_DEPTH || !token_in_use[token_index]) begin
+          status = invalid_state(
+            "CMQ decoded CQE command token is inconsistent"
+          );
+          break;
+        end
+        completion_status = make_polled_completion(
+          record, raw_snapshot, decoded, completion
+        );
+        if (completion_status == null || !completion_status.ok() ||
+            completion == null) begin
+          status = (completion_status == null) ?
+            invalid_state("CMQ completion construction returned null status") :
+            completion_status;
+          break;
+        end
+        terminal_fifo.push_back(completion);
+        command_registry.delete(software_key);
+        token_in_use[token_index] = 1'b0;
+        record.state = CMQ_SLOT_COMPLETED;
       end
-
-      terminal_fifo.push_back(completion);
-      command_registry.delete(software_key);
-      token_in_use[token_index] = 1'b0;
-      record.state = CMQ_SLOT_COMPLETED;
+      else begin
+        if (command_registry.exists(software_key)) begin
+          status = invalid_state(
+            "CMQ quarantined command remains in the command registry"
+          );
+          break;
+        end
+        diagnostic_status = make_late_diagnostic(
+          record, raw_snapshot, diagnostic
+        );
+        if (diagnostic_status == null || !diagnostic_status.ok() ||
+            diagnostic == null) begin
+          status = (diagnostic_status == null) ?
+            invalid_state("CMQ late diagnostic returned null status") :
+            diagnostic_status;
+          break;
+        end
+        diagnostic_fifo.push_back(diagnostic);
+        record.state = CMQ_SLOT_LATE_COMPLETED;
+      end
       cq_consume_seq++;
       retirement_status = retire_completed_prefix();
       if (retirement_status == null || !retirement_status.ok()) begin
@@ -4362,6 +4598,8 @@ class rdma_cmq_engine extends uvm_object;
 
     while (terminal_fifo.size() != 0)
       completions.push_back(terminal_fifo.pop_front());
+    while (diagnostic_fifo.size() != 0)
+      diagnostics.push_back(diagnostic_fifo.pop_front());
     engine_lock.put(1);
   endtask
 
