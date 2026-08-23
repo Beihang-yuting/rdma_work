@@ -1,3 +1,19 @@
+class rdma_cmq_null_status_body extends rdma_hw_model;
+  `uvm_object_utils(rdma_cmq_null_status_body)
+
+  function new(string name = "rdma_cmq_null_status_body");
+    super.new(name);
+  endfunction
+
+  virtual function rdma_status validate();
+    return null;
+  endfunction
+
+  virtual function string describe();
+    return "CMQ test body returning null validation status";
+  endfunction
+endclass
+
 class rdma_cmq_engine_models_test extends uvm_test;
   `uvm_component_utils(rdma_cmq_engine_models_test)
 
@@ -144,6 +160,7 @@ class rdma_cmq_engine_models_test extends uvm_test;
 
     rdma_cmq_sqe_model body;
     rdma_cmq_sqe_model body_snapshot;
+    rdma_cmq_null_status_body null_status_body;
     rdma_qpc_behavior response_payload;
     rdma_qpc_behavior response_payload_snapshot;
     rdma_qpc_behavior decoded_response;
@@ -261,6 +278,17 @@ class rdma_cmq_engine_models_test extends uvm_test;
     command.body = null;
     expect_status("COMMAND_NULL_BODY", command.validate(),
                   RDMA_SC_INVALID_ARGUMENT);
+    command.body = body;
+    body.command_id = 0;
+    expect_status("COMMAND_INVALID_BODY", command.validate(),
+                  RDMA_SC_INVALID_ARGUMENT);
+    body.command_id = 64'h111;
+    null_status_body = rdma_cmq_null_status_body::type_id::create(
+      "null_status_body"
+    );
+    command.body = null_status_body;
+    expect_status("COMMAND_NULL_BODY_STATUS", command.validate(),
+                  RDMA_SC_INVALID_STATE);
     command.body = body;
     command.timeout = 0;
     expect_status("COMMAND_ZERO_TIMEOUT", command.validate(),

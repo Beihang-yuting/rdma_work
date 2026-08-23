@@ -231,6 +231,12 @@ class rdma_cmq_command_desc extends uvm_object;
     if (body == null)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "CMQ command body is null");
+    status = body.validate();
+    if (status == null)
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "CMQ command body returned null status");
+    if (!status.ok())
+      return status;
     if (timeout == 0)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "CMQ command timeout is zero");
