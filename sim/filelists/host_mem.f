@@ -10,8 +10,8 @@
 ../src/types/rdma_types_pkg.sv
 ../src/model/rdma_model_pkg.sv
 ../src/codec/rdma_codec_pkg.sv
-../src/core/rdma_core_pkg.sv
 ../src/adapter/rdma_adapter_pkg.sv
+../src/core/rdma_core_pkg.sv
 ../src/adapters/host_mem/rdma_host_mem_adapter_pkg.sv
 ../tests/rdma_unit_test_pkg.sv
 ../tests/tb_top.sv

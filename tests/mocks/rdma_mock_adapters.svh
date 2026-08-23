@@ -20,6 +20,25 @@ function automatic rdma_status rdma_mock_clone_status(rdma_status source);
   return result;
 endfunction
 
+class rdma_mock_call_trace extends uvm_object;
+  `uvm_object_utils(rdma_mock_call_trace)
+
+  string calls[$];
+
+  function new(string name = "rdma_mock_call_trace");
+    super.new(name);
+    calls.delete();
+  endfunction
+
+  function void record(string method_name);
+    calls.push_back(method_name);
+  endfunction
+
+  function void clear();
+    calls.delete();
+  endfunction
+endclass
+
 function automatic rdma_function_handle rdma_mock_clone_function_handle(
   rdma_function_handle source
 );
@@ -229,11 +248,33 @@ class rdma_mock_host_mem extends rdma_host_mem_api;
   rdma_status failures[string];
   longint unsigned next_sequence;
   longint unsigned next_address;
+  rdma_mock_call_trace call_trace;
+  int writes_until_failure;
+  rdma_status delayed_write_failure;
 
   function new(string name = "rdma_mock_host_mem");
     super.new(name);
     next_sequence = 0;
     next_address = 64'h0000_0001_0000_0000;
+    call_trace = null;
+    writes_until_failure = -1;
+    delayed_write_failure = null;
+  endfunction
+
+  function void set_call_trace(rdma_mock_call_trace trace);
+    call_trace = trace;
+  endfunction
+
+  function rdma_status fail_write_at(
+    int unsigned ordinal,
+    rdma_status status
+  );
+    if (ordinal == 0 || status == null)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "write failure ordinal/status is invalid");
+    writes_until_failure = ordinal - 1;
+    delayed_write_failure = rdma_mock_clone_status(status);
+    return rdma_status::success();
   endfunction
 
   function rdma_status fail_next(string method_name, rdma_status status);
@@ -283,6 +324,8 @@ class rdma_mock_host_mem extends rdma_host_mem_api;
     call_record.offset = offset;
     call_record.data = data;
     calls.push_back(call_record);
+    if (call_trace != null)
+      call_trace.record({"host_", method_name});
     return call_record;
   endfunction
 
@@ -384,6 +427,14 @@ class rdma_mock_host_mem extends rdma_host_mem_api;
 
     record_call("write", null, mapping, data.size(), 0,
                 RDMA_DMA_DEVICE_READ, offset, data);
+    if (writes_until_failure == 0) begin
+      failure = rdma_mock_clone_status(delayed_write_failure);
+      writes_until_failure = -1;
+      delayed_write_failure = null;
+      return failure;
+    end
+    if (writes_until_failure > 0)
+      writes_until_failure--;
     failure = take_failure("write");
     if (failure != null)
       return failure;
@@ -516,6 +567,7 @@ class rdma_mock_pcie extends rdma_pcie_api;
   bit [31:0] cfg_read_value;
   rdma_pcie_function_info function_info_response;
   rdma_bar_decode decode_response;
+  rdma_mock_call_trace call_trace;
 
   function new(string name = "rdma_mock_pcie");
     super.new(name);
@@ -523,6 +575,11 @@ class rdma_mock_pcie extends rdma_pcie_api;
     cfg_read_value = '0;
     function_info_response = null;
     decode_response = null;
+    call_trace = null;
+  endfunction
+
+  function void set_call_trace(rdma_mock_call_trace trace);
+    call_trace = trace;
   endfunction
 
   function rdma_status fail_next(string method_name, rdma_status status);
@@ -576,6 +633,8 @@ class rdma_mock_pcie extends rdma_pcie_api;
     call_record.address = address;
     call_record.data = data;
     calls.push_back(call_record);
+    if (call_trace != null)
+      call_trace.record({"pcie_", method_name});
     return call_record;
   endfunction
 

@@ -27,6 +27,7 @@ package rdma_unit_test_pkg;
   `include "unit/rdma_request_model_test.svh"
   `include "unit/rdma_adapter_contract_test.svh"
   `include "unit/rdma_resource_manager_test.svh"
+  `include "unit/rdma_doorbell_scheduler_test.svh"
   `include "unit/rdma_codec_registry_test.svh"
   `include "unit/rdma_xtr_v1_defs_test.svh"
   `include "unit/rdma_xtr_v1_qword_codec_test.svh"
