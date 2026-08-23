@@ -40,6 +40,19 @@ typedef enum bit [2:0] {
 } rdma_cmq_test_clone_fault_e;
 
 typedef enum int unsigned {
+  RDMA_CMQ_TEST_HOOK_GOOD,
+  RDMA_CMQ_TEST_HOOK_NULL_STATUS,
+  RDMA_CMQ_TEST_HOOK_NONOK_STATUS,
+  RDMA_CMQ_TEST_HOOK_NULL_OUTPUT,
+  RDMA_CMQ_TEST_HOOK_WRONG_TYPE,
+  RDMA_CMQ_TEST_HOOK_SELF_OUTPUT,
+  RDMA_CMQ_TEST_HOOK_MUTATED_OUTPUT,
+  RDMA_CMQ_TEST_HOOK_ALIASED_OUTPUT,
+  RDMA_CMQ_TEST_HOOK_NULL_VALIDATION,
+  RDMA_CMQ_TEST_HOOK_FAILED_VALIDATION
+} rdma_cmq_test_hook_fault_e;
+
+typedef enum int unsigned {
   RDMA_CMQ_TEST_ABORT_SLOT_CONTEXT,
   RDMA_CMQ_TEST_ABORT_TICKET,
   RDMA_CMQ_TEST_ABORT_SLOT_RECORD,
@@ -235,6 +248,58 @@ class rdma_cmq_unknown_body extends rdma_hw_model;
 
   virtual function string describe();
     return "unknown CMQ body";
+  endfunction
+endclass
+
+class rdma_cmq_profile_hook_body extends rdma_hw_model;
+  `uvm_object_utils(rdma_cmq_profile_hook_body)
+
+  local static int unsigned hostile_clone_calls;
+
+  int unsigned value;
+  rdma_handle nested_h;
+  bit validation_returns_null;
+  bit validation_fails;
+
+  function new(string name = "rdma_cmq_profile_hook_body");
+    super.new(name);
+    value = 0;
+    nested_h = null;
+    validation_returns_null = 1'b0;
+    validation_fails = 1'b0;
+  endfunction
+
+  static function void clear_hostile_clone_calls();
+    hostile_clone_calls = 0;
+  endfunction
+
+  static function int unsigned clone_call_count();
+    return hostile_clone_calls;
+  endfunction
+
+  virtual function uvm_object clone();
+    hostile_clone_calls++;
+    `uvm_fatal("RDMA_COPY_TYPE",
+               "hostile custom CMQ body clone must not be called")
+    return null;
+  endfunction
+
+  virtual function rdma_status validate();
+    if (validation_returns_null)
+      return null;
+    if (validation_fails)
+      return rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT,
+        "injected custom CMQ body snapshot validation failure"
+      );
+    if (nested_h == null)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "custom CMQ body handle is null");
+    return rdma_status::success();
+  endfunction
+
+  virtual function string describe();
+    return $sformatf("custom hook body value=%0d", value);
   endfunction
 endclass
 
@@ -750,6 +815,118 @@ class rdma_cmq_test_profile extends rdma_cmq_hw_profile;
       end
     endcase
     return rdma_status::success();
+  endfunction
+endclass
+
+class rdma_cmq_profile_hook_fault_profile extends rdma_cmq_test_profile;
+  `uvm_object_utils(rdma_cmq_profile_hook_fault_profile)
+
+  rdma_cmq_test_hook_fault_e snapshot_fault;
+  int unsigned snapshot_calls;
+
+  function new(string name = "rdma_cmq_profile_hook_fault_profile");
+    super.new(name);
+    snapshot_fault = RDMA_CMQ_TEST_HOOK_GOOD;
+    snapshot_calls = 0;
+  endfunction
+
+  protected function rdma_handle copy_nested_handle(rdma_handle source);
+    rdma_handle result;
+
+    if (source == null)
+      return null;
+    result = rdma_handle::type_id::create("hook_snapshot_handle");
+    result.kind = source.kind;
+    result.function_uid = source.function_uid;
+    result.object_id = source.object_id;
+    result.generation = source.generation;
+    return result;
+  endfunction
+
+  virtual function rdma_status snapshot_command_body(
+    rdma_hw_model source,
+    output rdma_hw_model snapshot
+  );
+    rdma_cmq_profile_hook_body source_body;
+    rdma_cmq_profile_hook_body snapshot_body;
+
+    snapshot = null;
+    if (!$cast(source_body, source))
+      return super.snapshot_command_body(source, snapshot);
+    snapshot_calls++;
+    case (snapshot_fault)
+      RDMA_CMQ_TEST_HOOK_NULL_STATUS:
+        return null;
+      RDMA_CMQ_TEST_HOOK_NONOK_STATUS:
+        return rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "injected ordinary custom body snapshot rejection"
+        );
+      RDMA_CMQ_TEST_HOOK_NULL_OUTPUT:
+        return rdma_status::success();
+      RDMA_CMQ_TEST_HOOK_WRONG_TYPE: begin
+        snapshot = rdma_cmq_unknown_body::type_id::create(
+          "hook_wrong_type_output"
+        );
+        return rdma_status::success();
+      end
+      RDMA_CMQ_TEST_HOOK_SELF_OUTPUT: begin
+        snapshot = source;
+        return rdma_status::success();
+      end
+      default: begin
+        snapshot_body = rdma_cmq_profile_hook_body::type_id::create(
+          "hook_snapshot_output"
+        );
+        snapshot_body.value = source_body.value;
+        snapshot_body.nested_h = copy_nested_handle(source_body.nested_h);
+        case (snapshot_fault)
+          RDMA_CMQ_TEST_HOOK_MUTATED_OUTPUT:
+            snapshot_body.value++;
+          RDMA_CMQ_TEST_HOOK_ALIASED_OUTPUT:
+            snapshot_body.nested_h = source_body.nested_h;
+          RDMA_CMQ_TEST_HOOK_NULL_VALIDATION:
+            snapshot_body.validation_returns_null = 1'b1;
+          RDMA_CMQ_TEST_HOOK_FAILED_VALIDATION:
+            snapshot_body.validation_fails = 1'b1;
+          default: begin
+          end
+        endcase
+        snapshot = snapshot_body;
+        return rdma_status::success();
+      end
+    endcase
+  endfunction
+
+  virtual function bit same_command_body_value(
+    rdma_hw_model lhs,
+    rdma_hw_model rhs
+  );
+    rdma_cmq_profile_hook_body lhs_body;
+    rdma_cmq_profile_hook_body rhs_body;
+
+    if (!$cast(lhs_body, lhs) || !$cast(rhs_body, rhs) ||
+        lhs_body.nested_h == null || rhs_body.nested_h == null)
+      return 1'b0;
+    return lhs_body.value == rhs_body.value &&
+           lhs_body.nested_h.kind == rhs_body.nested_h.kind &&
+           lhs_body.nested_h.function_uid == rhs_body.nested_h.function_uid &&
+           lhs_body.nested_h.object_id == rhs_body.nested_h.object_id &&
+           lhs_body.nested_h.generation == rhs_body.nested_h.generation;
+  endfunction
+
+  virtual function bit command_body_graph_detached(
+    rdma_hw_model source,
+    rdma_hw_model snapshot
+  );
+    rdma_cmq_profile_hook_body source_body;
+    rdma_cmq_profile_hook_body snapshot_body;
+
+    if (!$cast(source_body, source) || !$cast(snapshot_body, snapshot) ||
+        source_body == snapshot_body || source_body.nested_h == null ||
+        snapshot_body.nested_h == null)
+      return 1'b0;
+    return source_body.nested_h != snapshot_body.nested_h;
   endfunction
 endclass
 
@@ -1417,6 +1594,23 @@ class rdma_cmq_engine_test extends uvm_test;
     command.qpc_signature_source.function_generation = binding.generation;
     command.timeout = timeout_value;
     return command;
+  endfunction
+
+  function automatic rdma_cmq_profile_hook_body make_profile_hook_body(
+    string name,
+    rdma_function_binding binding,
+    int unsigned value
+  );
+    rdma_cmq_profile_hook_body body;
+
+    body = rdma_cmq_profile_hook_body::type_id::create(name);
+    body.value = value;
+    body.nested_h = rdma_handle::type_id::create({name, "_nested"});
+    body.nested_h.kind = RDMA_RESOURCE_CMQ;
+    body.nested_h.function_uid = binding.function_uid;
+    body.nested_h.object_id = TEST_CMQ_ID;
+    body.nested_h.generation = binding.generation;
+    return body;
   endfunction
 
   function automatic rdma_handle make_context_handle(
@@ -4281,6 +4475,191 @@ class rdma_cmq_engine_test extends uvm_test;
     expect_status("VALIDATION_SHUTDOWN", status, RDMA_SC_OK);
   endtask
 
+  task automatic check_profile_hook_snapshot_contract();
+    rdma_cmq_engine_probe engine;
+    rdma_mock_host_mem mem;
+    rdma_mock_pcie pcie;
+    rdma_mock_call_trace trace;
+    rdma_doorbell_scheduler scheduler;
+    rdma_cmq_profile_hook_fault_profile profile;
+    rdma_function_binding prepared_binding;
+    rdma_function_binding active_binding;
+    rdma_cmq cmq;
+    rdma_cmq_runtime_desc runtime_desc;
+    rdma_cmq_command_desc requests[];
+    rdma_cmq_ticket tickets[];
+    rdma_status item_statuses[];
+    rdma_status batch_status;
+    rdma_status status;
+    rdma_cmq_copy_fatal_catcher catcher;
+
+    for (int unsigned fault = RDMA_CMQ_TEST_HOOK_NULL_STATUS;
+         fault <= RDMA_CMQ_TEST_HOOK_FAILED_VALIDATION; fault++) begin
+      if (fault == RDMA_CMQ_TEST_HOOK_NONOK_STATUS)
+        continue;
+      engine = rdma_cmq_engine_probe::type_id::create(
+        $sformatf("hook_contract_engine_%0d", fault)
+      );
+      mem = rdma_mock_host_mem::type_id::create(
+        $sformatf("hook_contract_mem_%0d", fault)
+      );
+      pcie = rdma_cmq_test_pcie::type_id::create(
+        $sformatf("hook_contract_pcie_%0d", fault)
+      );
+      trace = rdma_mock_call_trace::type_id::create(
+        $sformatf("hook_contract_trace_%0d", fault)
+      );
+      mem.set_call_trace(trace);
+      pcie.set_call_trace(trace);
+      scheduler = rdma_doorbell_scheduler::type_id::create(
+        $sformatf("hook_contract_scheduler_%0d", fault)
+      );
+      profile = rdma_cmq_profile_hook_fault_profile::type_id::create(
+        $sformatf("hook_contract_profile_%0d", fault)
+      );
+      if (!$cast(profile.snapshot_fault, fault))
+        `uvm_fatal("HOOK_CONTRACT_SETUP", "hook fault enum cast failed")
+      prepared_binding = make_binding(
+        $sformatf("hook_contract_prepared_%0d", fault), RDMA_BIND_PREPARED
+      );
+      active_binding = make_binding(
+        $sformatf("hook_contract_active_%0d", fault), RDMA_BIND_ACTIVE
+      );
+      cmq = make_cmq($sformatf("hook_contract_cmq_%0d", fault),
+                     prepared_binding);
+      prepare_active($sformatf("HOOK_CONTRACT_%0d", fault), engine, mem,
+                     pcie, scheduler, profile, prepared_binding,
+                     active_binding, cmq, runtime_desc);
+      clear_submit_observation(mem, pcie, trace);
+
+      requests = new[4];
+      requests[0] = null;
+      requests[1] = make_command(
+        $sformatf("hook_contract_unsupported_%0d", fault), active_binding,
+        rdma_cmq_test_profile::TEST_OPCODE_UNSUPPORTED, 8'hd0
+      );
+      requests[2] = make_command(
+        $sformatf("hook_contract_tentative_%0d", fault), active_binding,
+        rdma_cmq_test_profile::TEST_OPCODE_A, 8'hd1
+      );
+      requests[3] = make_command(
+        $sformatf("hook_contract_trigger_%0d", fault), active_binding,
+        rdma_cmq_test_profile::TEST_OPCODE_B, 8'hd2
+      );
+      requests[3].body = make_profile_hook_body(
+        $sformatf("hook_contract_body_%0d", fault), active_binding,
+        32'h1234_0000 + fault
+      );
+      rdma_cmq_profile_hook_body::clear_hostile_clone_calls();
+      catcher = new($sformatf("hook_contract_catcher_%0d", fault));
+      uvm_report_cb::add(null, catcher);
+      engine.submit_batch(requests, tickets, item_statuses, batch_status);
+      uvm_report_cb::delete(null, catcher);
+
+      expect_status($sformatf("HOOK_CONTRACT_BATCH_%0d", fault),
+                    batch_status, RDMA_SC_INVALID_STATE);
+      if (tickets.size() != 4 || item_statuses.size() != 4)
+        `uvm_error("HOOK_CONTRACT_ALIGNMENT",
+                   $sformatf("fault %0d outputs are misaligned", fault))
+      else begin
+        expect_status($sformatf("HOOK_CONTRACT_INVALID_%0d", fault),
+                      item_statuses[0], RDMA_SC_INVALID_ARGUMENT);
+        expect_status($sformatf("HOOK_CONTRACT_UNSUPPORTED_%0d", fault),
+                      item_statuses[1], RDMA_SC_UNSUPPORTED_OPCODE);
+        expect_status($sformatf("HOOK_CONTRACT_TENTATIVE_%0d", fault),
+                      item_statuses[2], RDMA_SC_INVALID_STATE);
+        expect_status($sformatf("HOOK_CONTRACT_TRIGGER_%0d", fault),
+                      item_statuses[3], RDMA_SC_INVALID_STATE);
+        foreach (tickets[i])
+          if (tickets[i] != null)
+            `uvm_error("HOOK_CONTRACT_TICKET",
+                       $sformatf("fault %0d item %0d returned ticket",
+                                 fault, i))
+      end
+      if (profile.snapshot_calls != 1)
+        `uvm_error("HOOK_CONTRACT_CALLS",
+                   $sformatf("fault %0d made %0d hook calls", fault,
+                             profile.snapshot_calls))
+      if (catcher.caught_count != 0 ||
+          rdma_cmq_profile_hook_body::clone_call_count() != 0)
+        `uvm_error("HOOK_CONTRACT_HOSTILE_CLONE",
+                   $sformatf("fault %0d reached hostile clone (%0d/%0d)",
+                             fault, catcher.caught_count,
+                             rdma_cmq_profile_hook_body::clone_call_count()))
+      expect_no_submit_side_effects(
+        $sformatf("HOOK_CONTRACT_EFFECTS_%0d", fault), mem, pcie, trace
+      );
+      if (profile.doorbell_calls != 0)
+        `uvm_error("HOOK_CONTRACT_DOORBELL",
+                   $sformatf("fault %0d encoded a doorbell", fault))
+      if (engine.published_count() != 0 ||
+          engine.tokens_in_use_count() != 0 ||
+          engine.slot_record_count() != 0)
+        `uvm_error("HOOK_CONTRACT_LEDGER",
+                   $sformatf("fault %0d committed tentative state", fault))
+
+      engine.shutdown(status);
+      expect_status($sformatf("HOOK_CONTRACT_SHUTDOWN_%0d", fault), status,
+                    RDMA_SC_OK);
+    end
+
+    engine = rdma_cmq_engine_probe::type_id::create("hook_nonok_engine");
+    mem = rdma_mock_host_mem::type_id::create("hook_nonok_mem");
+    pcie = rdma_cmq_test_pcie::type_id::create("hook_nonok_pcie");
+    trace = rdma_mock_call_trace::type_id::create("hook_nonok_trace");
+    mem.set_call_trace(trace);
+    pcie.set_call_trace(trace);
+    scheduler = rdma_doorbell_scheduler::type_id::create(
+      "hook_nonok_scheduler"
+    );
+    profile = rdma_cmq_profile_hook_fault_profile::type_id::create(
+      "hook_nonok_profile"
+    );
+    profile.snapshot_fault = RDMA_CMQ_TEST_HOOK_NONOK_STATUS;
+    prepared_binding = make_binding("hook_nonok_prepared", RDMA_BIND_PREPARED);
+    active_binding = make_binding("hook_nonok_active", RDMA_BIND_ACTIVE);
+    cmq = make_cmq("hook_nonok_cmq", prepared_binding);
+    prepare_active("HOOK_NONOK", engine, mem, pcie, scheduler, profile,
+                   prepared_binding, active_binding, cmq, runtime_desc);
+    clear_submit_observation(mem, pcie, trace);
+    requests = new[2];
+    requests[0] = make_command(
+      "hook_nonok_unsupported", active_binding,
+      rdma_cmq_test_profile::TEST_OPCODE_UNSUPPORTED, 8'he0
+    );
+    requests[1] = make_command(
+      "hook_nonok_rejected", active_binding,
+      rdma_cmq_test_profile::TEST_OPCODE_A, 8'he1
+    );
+    requests[1].body = make_profile_hook_body(
+      "hook_nonok_body", active_binding, 32'h5678_0000
+    );
+    rdma_cmq_profile_hook_body::clear_hostile_clone_calls();
+    engine.submit_batch(requests, tickets, item_statuses, batch_status);
+    expect_status("HOOK_NONOK_BATCH", batch_status, RDMA_SC_OK);
+    if (tickets.size() != 2 || item_statuses.size() != 2)
+      `uvm_error("HOOK_NONOK_ALIGNMENT", "hook outputs are misaligned")
+    else begin
+      expect_status("HOOK_NONOK_UNSUPPORTED", item_statuses[0],
+                    RDMA_SC_UNSUPPORTED_OPCODE);
+      expect_status("HOOK_NONOK_REJECTED", item_statuses[1],
+                    RDMA_SC_INVALID_STATE);
+      foreach (tickets[i])
+        if (tickets[i] != null)
+          `uvm_error("HOOK_NONOK_TICKET", "rejected hook returned a ticket")
+    end
+    if (rdma_cmq_profile_hook_body::clone_call_count() != 0)
+      `uvm_error("HOOK_NONOK_HOSTILE_CLONE",
+                 "ordinary hook rejection reached hostile clone")
+    expect_no_submit_side_effects("HOOK_NONOK_EFFECTS", mem, pcie, trace);
+    if (engine.published_count() != 0 ||
+        engine.tokens_in_use_count() != 0 ||
+        engine.slot_record_count() != 0)
+      `uvm_error("HOOK_NONOK_LEDGER", "hook rejection changed the ledger")
+    engine.shutdown(status);
+    expect_status("HOOK_NONOK_SHUTDOWN", status, RDMA_SC_OK);
+  endtask
+
   task automatic check_internal_invariant_batch_abort();
     rdma_cmq_engine_probe engine;
     rdma_mock_host_mem mem;
@@ -4650,6 +5029,7 @@ class rdma_cmq_engine_test extends uvm_test;
     check_qpc_context_snapshot_failures();
     check_transaction_failure_atomicity();
     check_submission_validation_and_profile_metadata();
+    check_profile_hook_snapshot_contract();
     check_internal_invariant_batch_abort();
     check_incarnation_survives_reprepare();
     check_full_initial_capacity_and_shutdown_reset();

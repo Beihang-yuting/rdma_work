@@ -1447,7 +1447,8 @@ class rdma_cmq_engine extends uvm_object;
     rdma_hw_model source,
     string label,
     rdma_status_code_e failure_code,
-    output rdma_hw_model snapshot
+    output rdma_hw_model snapshot,
+    output bit staging_invariant_failed
   );
     uvm_object cloned_object;
     rdma_status status;
@@ -1468,6 +1469,7 @@ class rdma_cmq_engine extends uvm_object;
     int unsigned saved_flags;
 
     snapshot = null;
+    staging_invariant_failed = 1'b0;
     if (source == null)
       return snapshot_failure(failure_code, {label, " body is null"});
     status = source.validate();
@@ -1496,13 +1498,37 @@ class rdma_cmq_engine extends uvm_object;
       status = profile.snapshot_command_body(source, snapshot);
       if (status == null) begin
         snapshot = null;
+        staging_invariant_failed = 1'b1;
         return snapshot_failure(
-          failure_code, {label, " body profile snapshot returned null"}
+          RDMA_SC_INVALID_STATE,
+          {label, " body profile snapshot returned null status"}
         );
       end
-      if (!status.ok())
+      if (!status.ok()) begin
         snapshot = null;
-      return status;
+        return status;
+      end
+      if (snapshot == null || snapshot == source ||
+          snapshot.get_type_name() != source_type_name ||
+          !profile.same_command_body_value(source, snapshot) ||
+          !profile.command_body_graph_detached(source, snapshot)) begin
+        snapshot = null;
+        staging_invariant_failed = 1'b1;
+        return snapshot_failure(
+          RDMA_SC_INVALID_STATE,
+          {label, " body profile snapshot contract failed"}
+        );
+      end
+      status = snapshot.validate();
+      if (status == null || !status.ok()) begin
+        snapshot = null;
+        staging_invariant_failed = 1'b1;
+        return snapshot_failure(
+          RDMA_SC_INVALID_STATE,
+          {label, " body profile snapshot validation failed"}
+        );
+      end
+      return rdma_status::success();
     end
     begin
       saved_opcode = source_sqe.opcode;
@@ -1527,7 +1553,7 @@ class rdma_cmq_engine extends uvm_object;
       if (source_sqe.context_model != null) begin
         status = checked_body_snapshot(
           source_sqe.context_model, {label, " body context"}, failure_code,
-          context_snapshot
+          context_snapshot, staging_invariant_failed
         );
         if (!status.ok())
           return status;
@@ -1698,7 +1724,8 @@ class rdma_cmq_engine extends uvm_object;
 
   protected function rdma_status snapshot_command_value(
     rdma_cmq_command_desc source,
-    output rdma_cmq_command_desc snapshot
+    output rdma_cmq_command_desc snapshot,
+    output bit staging_invariant_failed
   );
     rdma_status status;
     uvm_object cloned_object;
@@ -1717,6 +1744,7 @@ class rdma_cmq_engine extends uvm_object;
     time saved_timeout;
 
     snapshot = null;
+    staging_invariant_failed = 1'b0;
     if (source == null)
       return invalid_argument("CMQ command is null");
     saved_function_source = source.function_h;
@@ -1740,7 +1768,8 @@ class rdma_cmq_engine extends uvm_object;
     if (!status.ok())
       return status;
     status = checked_body_snapshot(
-      source.body, "CMQ command", RDMA_SC_INVALID_ARGUMENT, body_snapshot
+      source.body, "CMQ command", RDMA_SC_INVALID_ARGUMENT, body_snapshot,
+      staging_invariant_failed
     );
     if (!status.ok())
       return status;
@@ -1776,7 +1805,6 @@ class rdma_cmq_engine extends uvm_object;
         !same_opcode_value(source.opcode_key, opcode_snapshot) ||
         !same_opcode_value(cloned_command.opcode_key, opcode_snapshot) ||
         cloned_command.opcode_key == source.opcode_key ||
-        !same_body_value(source.body, body_snapshot) ||
         !same_body_value(cloned_command.body, body_snapshot) ||
         !body_graph_detached(source.body, cloned_command.body) ||
         ((source.qpc_signature_source == null) !=
@@ -1791,6 +1819,14 @@ class rdma_cmq_engine extends uvm_object;
           cloned_command.qpc_signature_source ==
             source.qpc_signature_source))) begin
       return invalid_argument("CMQ command snapshot changed its source value");
+    end
+
+    if (!same_body_value(source.body, body_snapshot) ||
+        !body_graph_detached(source.body, body_snapshot)) begin
+      staging_invariant_failed = 1'b1;
+      return invalid_state(
+        "CMQ command body snapshot violated its final staging contract"
+      );
     end
 
     snapshot = cloned_command;
@@ -2667,6 +2703,7 @@ class rdma_cmq_engine extends uvm_object;
       int unsigned selected_token;
       bit sq_wrap;
       bit token_found;
+      bit snapshot_invariant_failed;
 
       command_snapshot = null;
       slot_context_snapshot = null;
@@ -2683,9 +2720,16 @@ class rdma_cmq_engine extends uvm_object;
       dependency_mapping = null;
       token_found = 1'b0;
       selected_token = 0;
+      snapshot_invariant_failed = 1'b0;
 
-      status = snapshot_command_value(requests[i], command_snapshot);
+      status = snapshot_command_value(requests[i], command_snapshot,
+                                      snapshot_invariant_failed);
       if (!status.ok()) begin
+        if (snapshot_invariant_failed) begin
+          transaction_status = status;
+          transaction_failed = 1'b1;
+          break;
+        end
         item_statuses[i] = rdma_cmq_clone_status_value(status);
         preserve_item_status[i] = 1'b1;
         continue;
