@@ -1831,9 +1831,9 @@ class rdma_xtr_v1_context_cmq_regression_test extends uvm_test;
                  "failed completion decode published an object")
       return 1'b0;
     end
-    if (!ready) begin
+    if (ready) begin
       `uvm_error("FAIL_COMPLETION_DECODE",
-                 "matching-owner malformed completion was not ready")
+                 "malformed completion published partial ready")
       return 1'b0;
     end
     if (!expect_image_unchanged("FAIL_COMPLETION_INPUT", corrupt,

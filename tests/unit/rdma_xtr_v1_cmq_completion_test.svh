@@ -212,7 +212,7 @@ class rdma_xtr_v1_cmq_completion_test extends uvm_test;
     rdma_hw_image image,
     bit expected_owner,
     rdma_status_code_e expected_status = RDMA_SC_CODEC_ERROR,
-    bit expected_ready = 1'b1
+    bit expected_ready = 1'b0
   );
     rdma_xtr_v1_cmq_completion completion;
     rdma_hw_image snapshot;

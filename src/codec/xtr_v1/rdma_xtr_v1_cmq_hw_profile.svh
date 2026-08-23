@@ -7,7 +7,10 @@ class rdma_xtr_v1_cmq_hw_profile extends rdma_cmq_hw_profile;
   protected rdma_xtr_v1_doorbell_codec_registry doorbell_codecs;
   protected rdma_status doorbell_registration_status;
 
-  function new(string name = "rdma_xtr_v1_cmq_hw_profile");
+  function new(
+    string name = "rdma_xtr_v1_cmq_hw_profile",
+    rdma_xtr_v1_doorbell_codec_registry injected_doorbell_codecs = null
+  );
     rdma_status status;
     super.new(name);
     request_composer = rdma_xtr_v1_cmq_request_composer::type_id::create(
@@ -15,9 +18,12 @@ class rdma_xtr_v1_cmq_hw_profile extends rdma_cmq_hw_profile;
     completion_codec = rdma_xtr_v1_cmq_completion_codec::type_id::create(
       "completion_codec");
     error_codec = rdma_xtr_v1_error_codec::type_id::create("error_codec");
-    doorbell_codecs =
-      rdma_xtr_v1_doorbell_codec_registry::type_id::create(
-        "doorbell_codecs");
+    if (injected_doorbell_codecs == null)
+      doorbell_codecs =
+        rdma_xtr_v1_doorbell_codec_registry::type_id::create(
+          "doorbell_codecs");
+    else
+      doorbell_codecs = injected_doorbell_codecs;
     doorbell_registration_status = null;
     if (doorbell_codecs != null) begin
       status = doorbell_codecs.register_defaults();
@@ -64,9 +70,10 @@ class rdma_xtr_v1_cmq_hw_profile extends rdma_cmq_hw_profile;
       return invalid_state("xtr_v1 error codec is not initialized");
     if (doorbell_codecs == null)
       return invalid_state("xtr_v1 doorbell registry is not initialized");
-    if (doorbell_registration_status == null ||
-        !doorbell_registration_status.ok())
+    if (doorbell_registration_status == null)
       return invalid_state("xtr_v1 doorbell default registration failed");
+    if (!doorbell_registration_status.ok())
+      return doorbell_registration_status;
     foreach (variants[i]) begin
       codec = null;
       status = doorbell_codecs.lookup(doorbell_key(variants[i]), codec);
@@ -200,6 +207,7 @@ class rdma_xtr_v1_cmq_hw_profile extends rdma_cmq_hw_profile;
     rdma_xtr_v1_cmq_completion payload;
     rdma_cmq_decoded_cqe candidate;
     uvm_object cloned_object;
+    bit completion_ready;
 
     ready = 1'b0;
     decoded = null;
@@ -208,11 +216,12 @@ class rdma_xtr_v1_cmq_hw_profile extends rdma_cmq_hw_profile;
     status = validate_raw_cqe(raw_cqe);
     if (!status.ok()) return status;
     completion = null;
+    completion_ready = 1'b0;
     status = completion_codec.inspect_completion(
-      raw_cqe, expected_owner, ready, completion
+      raw_cqe, expected_owner, completion_ready, completion
     );
     if (!status.ok()) return status;
-    if (!ready) return rdma_status::success();
+    if (!completion_ready) return rdma_status::success();
     if (completion == null)
       return invalid_state("xtr_v1 completion codec published null");
 
@@ -227,6 +236,8 @@ class rdma_xtr_v1_cmq_hw_profile extends rdma_cmq_hw_profile;
       return invalid_state("xtr_v1 completion payload clone failed");
 
     candidate = rdma_cmq_decoded_cqe::type_id::create("decoded_cqe");
+    if (candidate == null)
+      return invalid_state("xtr_v1 decoded CQE allocation failed");
     candidate.hardware_opcode = {24'h0, completion.opcode};
     candidate.wqe_index = completion.wqe_index;
     candidate.wqe_wrap = completion.wrap;
@@ -236,6 +247,7 @@ class rdma_xtr_v1_cmq_hw_profile extends rdma_cmq_hw_profile;
     status = candidate.validate();
     if (!status.ok()) return status;
     decoded = candidate;
+    ready = 1'b1;
     return rdma_status::success();
   endfunction
 

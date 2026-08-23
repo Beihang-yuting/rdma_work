@@ -212,7 +212,6 @@ class rdma_xtr_v1_cmq_completion_codec extends uvm_object;
     owner = qword0[63];
     if (owner != expected_owner)
       return rdma_status::success();
-    ready = 1'b1;
     opcode = (qword0 >> XTR_V1_CMQ_OPCODE_LSB) & 8'hff;
     wrap = (qword0 >> XTR_V1_CMQ_WRAP_LSB) & 1'b1;
     if (!supported_opcode(opcode))
@@ -240,6 +239,7 @@ class rdma_xtr_v1_cmq_completion_codec extends uvm_object;
     foreach (candidate.object_payload[i])
       candidate.object_payload[i] = image.bytes[first_byte + i];
     completion = candidate;
+    ready = 1'b1;
     return rdma_status::success();
   endfunction
 endclass

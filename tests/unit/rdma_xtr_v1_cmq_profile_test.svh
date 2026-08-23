@@ -26,11 +26,6 @@ class rdma_xtr_v1_cmq_profile_probe
     doorbell_codecs.clear();
   endfunction
 
-  function void force_doorbell_registration_failure();
-    doorbell_registration_status = rdma_status::make(
-      RDMA_SC_INVALID_STATE, "injected doorbell registration failure"
-    );
-  endfunction
 endclass
 
 class rdma_xtr_v1_cmq_profile_test extends uvm_test;
@@ -218,7 +213,13 @@ class rdma_xtr_v1_cmq_profile_test extends uvm_test;
 
   function automatic void check_profile_validation();
     rdma_xtr_v1_cmq_hw_profile profile;
+    rdma_xtr_v1_cmq_hw_profile failed_registration_profile;
     rdma_xtr_v1_cmq_profile_probe probe;
+    rdma_xtr_v1_doorbell_codec_registry conflicted_registry;
+    rdma_xtr_v1_doorbell_codec conflict_codec;
+    rdma_codec_key conflict_key;
+    rdma_status status;
+    string expected_message;
 
     profile = rdma_xtr_v1_cmq_hw_profile::type_id::create("profile");
     if (profile.profile_name() != "xtr_v1")
@@ -250,11 +251,31 @@ class rdma_xtr_v1_cmq_profile_test extends uvm_test;
     probe.clear_doorbell_defaults();
     expect_status("PROFILE_MISSING_DOORBELLS", probe.validate_profile(),
                   RDMA_SC_INVALID_STATE);
-    probe = rdma_xtr_v1_cmq_profile_probe::type_id::create(
-      "failed_doorbell_registration");
-    probe.force_doorbell_registration_failure();
-    expect_status("PROFILE_FAILED_DOORBELL_REGISTRATION",
-                  probe.validate_profile(), RDMA_SC_INVALID_STATE);
+    conflicted_registry =
+      rdma_xtr_v1_doorbell_codec_registry::type_id::create(
+        "conflicted_profile_registry");
+    conflict_codec = new("pre_registered_cmq_sq", "cmq_sq");
+    conflict_key = '{hw_version:"xtr_v1",
+                     image_kind:RDMA_IMAGE_DOORBELL,
+                     object_type:"doorbell", variant:"cmq_sq",
+                     opcode:8'h00};
+    expect_status("PROFILE_ARM_REGISTRATION_FAILURE",
+                  conflicted_registry.register_codec(conflict_key,
+                                                     conflict_codec),
+                  RDMA_SC_OK);
+    failed_registration_profile = new(
+      "failed_doorbell_registration", conflicted_registry);
+    status = failed_registration_profile.validate_profile();
+    expect_status("PROFILE_FAILED_DOORBELL_REGISTRATION", status,
+                  RDMA_SC_INVALID_STATE);
+    expected_message = {
+      "xtr_v1 doorbell codec key already registered: ",
+      $sformatf("xtr_v1|%0d|doorbell|cmq_sq|00", RDMA_IMAGE_DOORBELL)
+    };
+    if (status != null && status.message != expected_message)
+      `uvm_error("PROFILE_FAILED_DOORBELL_REGISTRATION",
+                 {"profile did not preserve register_defaults failure: ",
+                  status.message})
   endfunction
 
   function automatic void check_compose_sqe();
@@ -462,6 +483,17 @@ class rdma_xtr_v1_cmq_profile_test extends uvm_test;
     expect_status("INSPECT_OWNER_MISMATCH_STATUS", status, RDMA_SC_OK);
     if (ready || decoded != null)
       `uvm_error("INSPECT_OWNER_MISMATCH", "stale CQE was inspected")
+
+    raw_cqe = make_cqe(1'b1, 8'hfe, 8'hff, 5'h1f, 1'b1);
+    decoded = rdma_cmq_decoded_cqe::type_id::create(
+      "stale_malformed_decoded");
+    ready = 1'b1;
+    status = profile.inspect_cqe(raw_cqe, 1'b1, ready, decoded);
+    expect_status("INSPECT_MALFORMED_STATUS", status,
+                  RDMA_SC_UNSUPPORTED_OPCODE);
+    if (ready || decoded != null)
+      `uvm_error("INSPECT_MALFORMED",
+                 "malformed CQE published partial outputs")
   endfunction
 
   function automatic void check_encode_doorbell();
