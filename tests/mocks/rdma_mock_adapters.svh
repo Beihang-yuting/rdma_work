@@ -53,6 +53,20 @@ function automatic rdma_function_handle rdma_mock_clone_function_handle(
   return result;
 endfunction
 
+function automatic rdma_dma_request_context rdma_mock_clone_dma_context(
+  rdma_dma_request_context source
+);
+  uvm_object cloned_object;
+  rdma_dma_request_context result;
+
+  if (source == null)
+    return null;
+  cloned_object = source.clone();
+  if (cloned_object == null || !$cast(result, cloned_object))
+    `uvm_fatal("MOCK_COPY", "DMA request context clone type mismatch")
+  return result;
+endfunction
+
 function automatic rdma_dma_mapping rdma_mock_clone_mapping(
   rdma_dma_mapping source
 );
@@ -152,7 +166,7 @@ class rdma_mock_host_mem_call extends uvm_object;
 
   longint unsigned call_sequence;
   string method_name;
-  rdma_function_handle function_h;
+  rdma_dma_request_context request_context;
   rdma_dma_mapping mapping;
   int unsigned size;
   int unsigned alignment;
@@ -164,7 +178,7 @@ class rdma_mock_host_mem_call extends uvm_object;
     super.new(name);
     call_sequence = 0;
     method_name = "";
-    function_h = null;
+    request_context = null;
     mapping = null;
     size = 0;
     alignment = 0;
@@ -300,7 +314,7 @@ class rdma_mock_host_mem extends rdma_host_mem_api;
 
   function automatic rdma_mock_host_mem_call record_call(
     string method_name,
-    rdma_function_handle function_h = null,
+    rdma_dma_request_context request_context = null,
     rdma_dma_mapping mapping = null,
     int unsigned size = 0,
     int unsigned alignment = 0,
@@ -316,7 +330,8 @@ class rdma_mock_host_mem extends rdma_host_mem_api;
     next_sequence++;
     call_record.call_sequence = next_sequence;
     call_record.method_name = method_name;
-    call_record.function_h = rdma_mock_clone_function_handle(function_h);
+    call_record.request_context =
+      rdma_mock_clone_dma_context(request_context);
     call_record.mapping = rdma_mock_clone_mapping(mapping);
     call_record.size = size;
     call_record.alignment = alignment;
@@ -327,6 +342,25 @@ class rdma_mock_host_mem extends rdma_host_mem_api;
     if (call_trace != null)
       call_trace.record({"host_", method_name});
     return call_record;
+  endfunction
+
+  function automatic bit same_handle(rdma_handle lhs, rdma_handle rhs);
+    if (lhs == null || rhs == null)
+      return lhs == null && rhs == null;
+    return lhs.same_instance(rhs);
+  endfunction
+
+  function automatic bit mapping_authority_matches(
+    rdma_dma_mapping candidate,
+    rdma_dma_mapping authority
+  );
+    if (candidate == null || authority == null)
+      return 1'b0;
+    return same_handle(candidate.function_h, authority.function_h) &&
+           candidate.requester_bdf == authority.requester_bdf &&
+           candidate.pasid_valid == authority.pasid_valid &&
+           candidate.pasid == authority.pasid &&
+           same_handle(candidate.owner_h, authority.owner_h);
   endfunction
 
   function automatic int find_region(rdma_dma_mapping mapping);
@@ -341,35 +375,39 @@ class rdma_mock_host_mem extends rdma_host_mem_api;
       if (!$cast(region_mapping, regions[i].mapping))
         continue;
       if (region_mapping.same_allocation(requested_mapping) &&
-          region_mapping.function_h != null && mapping.function_h != null &&
-          region_mapping.function_h.same_instance(mapping.function_h))
+          mapping_authority_matches(mapping, region_mapping))
         return i;
     end
     return -1;
   endfunction
 
   virtual function rdma_status allocate(
-    rdma_function_handle function_h,
+    rdma_dma_request_context request_context,
     int unsigned size,
     int unsigned alignment,
     rdma_dma_direction_e direction,
     output rdma_dma_mapping mapping
   );
     rdma_status failure;
+    rdma_status status;
     rdma_status token_status;
     rdma_mock_memory_region region;
     rdma_mock_dma_mapping allocated_mapping;
     longint unsigned aligned_address;
     longint unsigned alignment_mask;
 
-    record_call("allocate", function_h, null, size, alignment, direction);
     mapping = null;
+    record_call("allocate", request_context, null, size, alignment,
+                direction);
+    if (request_context == null)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "DMA request context is null");
+    status = request_context.validate();
+    if (!status.ok())
+      return status;
     failure = take_failure("allocate");
     if (failure != null)
       return failure;
-    if (function_h == null || function_h.kind != RDMA_RESOURCE_FUNCTION)
-      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                               "function handle is invalid");
     if (size == 0 || alignment == 0 ||
         (alignment & (alignment - 1'b1)) != 0)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
@@ -393,7 +431,11 @@ class rdma_mock_host_mem extends rdma_host_mem_api;
     token_status = allocated_mapping.initialize_allocation_token();
     if (!token_status.ok())
       return token_status;
-    allocated_mapping.function_h = rdma_mock_clone_function_handle(function_h);
+    allocated_mapping.function_h =
+      rdma_mock_clone_function_handle(request_context.function_h);
+    allocated_mapping.requester_bdf = request_context.requester_bdf;
+    allocated_mapping.pasid_valid = request_context.pasid_valid;
+    allocated_mapping.pasid = request_context.pasid;
     allocated_mapping.backing_addr.value = aligned_address;
     allocated_mapping.iova.value = aligned_address;
     allocated_mapping.size = size;
@@ -404,6 +446,9 @@ class rdma_mock_host_mem extends rdma_host_mem_api;
       direction inside {RDMA_DMA_DEVICE_WRITE, RDMA_DMA_BIDIRECTIONAL};
     allocated_mapping.permissions.atomic = 1'b0;
     allocated_mapping.state = RDMA_MAPPING_ACTIVE;
+    allocated_mapping.owner_h = (request_context.owner_h == null) ? null :
+      rdma_clone_handle_value(request_context.owner_h,
+                              "mock host memory mapping owner");
     mapping = allocated_mapping;
 
     region = rdma_mock_memory_region::type_id::create(

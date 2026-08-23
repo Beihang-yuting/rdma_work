@@ -17,6 +17,27 @@ class rdma_host_mem_adapter_test extends uvm_test;
     return function_h;
   endfunction
 
+  function automatic rdma_dma_request_context make_dma_context(
+    string name,
+    rdma_function_handle function_h,
+    rdma_bdf_t requester_bdf,
+    bit pasid_valid = 1'b0,
+    bit [19:0] pasid = '0,
+    rdma_handle owner_h = null
+  );
+    rdma_dma_request_context result;
+    result = rdma_dma_request_context::type_id::create(name);
+    result.function_h = rdma_clone_function_handle_value(
+      function_h, "DMA context Function"
+    );
+    result.requester_bdf = requester_bdf;
+    result.pasid_valid = pasid_valid;
+    result.pasid = pasid;
+    result.owner_h = (owner_h == null) ? null :
+                     rdma_clone_handle_value(owner_h, "DMA context owner");
+    return result;
+  endfunction
+
   function automatic rdma_dma_mapping clone_mapping(
     string check_name,
     rdma_dma_mapping source
@@ -74,6 +95,9 @@ class rdma_host_mem_adapter_test extends uvm_test;
     rdma_host_mem_adapter equal_adapter_b;
     rdma_function_handle function_h;
     rdma_function_handle invalid_function_h;
+    rdma_dma_request_context request_context;
+    rdma_dma_request_context request_context_snapshot;
+    rdma_dma_request_context invalid_context;
     rdma_dma_mapping mapping;
     rdma_dma_mapping mapping_b;
     rdma_dma_mapping offset_mapping_a;
@@ -86,7 +110,6 @@ class rdma_host_mem_adapter_test extends uvm_test;
     rdma_dma_mapping equal_mapping_b;
     rdma_dma_mapping valid_clone;
     rdma_dma_mapping stale_clone;
-    rdma_dma_mapping release_view;
     rdma_dma_mapping tampered;
     rdma_dma_mapping copy_attack;
     rdma_dma_mapping forged_mapping;
@@ -106,6 +129,24 @@ class rdma_host_mem_adapter_test extends uvm_test;
     function_h = make_function_handle("function_h");
     invalid_function_h = make_function_handle("invalid_function_h");
     invalid_function_h.kind = RDMA_RESOURCE_PD;
+    request_context = rdma_dma_request_context::type_id::create(
+      "vf_dma_context"
+    );
+    request_context.function_h = make_function_handle("vf_function_h");
+    request_context.requester_bdf =
+      '{segment:16'h0000, bus:8'h53, device:5'h02, function_num:3'h5};
+    request_context.pasid_valid = 1'b1;
+    request_context.pasid = 20'habcde;
+    request_context.owner_h = rdma_handle::type_id::create("cmq_owner");
+    request_context.owner_h.kind = RDMA_RESOURCE_CMQ;
+    request_context.owner_h.function_uid =
+      request_context.function_h.function_uid;
+    request_context.owner_h.object_id = 32'h44;
+    request_context.owner_h.generation = request_context.function_h.generation;
+    request_context_snapshot = rdma_dma_request_context::type_id::create(
+      "vf_dma_context_snapshot"
+    );
+    request_context_snapshot.copy(request_context);
 
     hm = $unit::host_mem_manager::type_id::create("hm");
     hm.init_region(64'h0000_0001_0000_0000,
@@ -116,24 +157,44 @@ class rdma_host_mem_adapter_test extends uvm_test;
     mapping = rdma_dma_mapping::type_id::create("non_null_seed");
     status = adapter.allocate(null, 64, 64, RDMA_DMA_BIDIRECTIONAL,
                               mapping);
-    expect_status("ALLOC_NULL_FUNCTION", status, RDMA_SC_INVALID_ARGUMENT);
+    expect_status("ALLOC_NULL_CONTEXT", status, RDMA_SC_INVALID_ARGUMENT);
     if (mapping != null)
-      `uvm_error("ALLOC_NULL_FUNCTION", "failure did not null the output")
-    status = adapter.allocate(invalid_function_h, 64, 64,
+      `uvm_error("ALLOC_NULL_CONTEXT", "failure did not null the output")
+    invalid_context = make_dma_context(
+      "invalid_function_context", invalid_function_h, '0
+    );
+    status = adapter.allocate(invalid_context, 64, 64,
                               RDMA_DMA_BIDIRECTIONAL, mapping);
     expect_status("ALLOC_FUNCTION_KIND", status, RDMA_SC_INVALID_ARGUMENT);
-    status = adapter.allocate(function_h, 0, 64, RDMA_DMA_BIDIRECTIONAL,
+    invalid_context = make_dma_context(
+      "zero_generation_context", function_h, '0
+    );
+    invalid_context.function_h.generation = 0;
+    status = adapter.allocate(invalid_context, 64, 64,
+                              RDMA_DMA_BIDIRECTIONAL, mapping);
+    expect_status("ALLOC_FUNCTION_GENERATION", status,
+                  RDMA_SC_STALE_GENERATION);
+    invalid_context = make_dma_context(
+      "invalid_pasid_context", function_h, '0, 1'b0, 20'h1
+    );
+    status = adapter.allocate(invalid_context, 64, 64,
+                              RDMA_DMA_BIDIRECTIONAL, mapping);
+    expect_status("ALLOC_CONTEXT_PASID", status, RDMA_SC_INVALID_ARGUMENT);
+    status = adapter.allocate(request_context, 0, 64,
+                              RDMA_DMA_BIDIRECTIONAL,
                               mapping);
     expect_status("ALLOC_ZERO_SIZE", status, RDMA_SC_INVALID_ARGUMENT);
-    status = adapter.allocate(function_h, 64, 0, RDMA_DMA_BIDIRECTIONAL,
+    status = adapter.allocate(request_context, 64, 0,
+                              RDMA_DMA_BIDIRECTIONAL,
                               mapping);
     expect_status("ALLOC_ZERO_ALIGNMENT", status,
                   RDMA_SC_INVALID_ARGUMENT);
-    status = adapter.allocate(function_h, 64, 3, RDMA_DMA_BIDIRECTIONAL,
+    status = adapter.allocate(request_context, 64, 3,
+                              RDMA_DMA_BIDIRECTIONAL,
                               mapping);
     expect_status("ALLOC_NON_POWER_OF_TWO", status,
                   RDMA_SC_INVALID_ARGUMENT);
-    status = adapter.allocate(function_h, 64, 64,
+    status = adapter.allocate(request_context, 64, 64,
                               rdma_dma_direction_e'(3), mapping);
     expect_status("ALLOC_DIRECTION", status, RDMA_SC_INVALID_ARGUMENT);
     if (mapping != null)
@@ -148,7 +209,7 @@ class rdma_host_mem_adapter_test extends uvm_test;
                            external_addr))
     hm.write_mem(external_addr, external_wr, `__FILE__, `__LINE__);
 
-    status = adapter.allocate(function_h, 4096, 4096,
+    status = adapter.allocate(request_context, 4096, 4096,
                               RDMA_DMA_BIDIRECTIONAL, mapping);
     expect_status("ALLOC_64BIT", status, RDMA_SC_OK);
     if (mapping == null)
@@ -166,13 +227,42 @@ class rdma_host_mem_adapter_test extends uvm_test;
         mapping.state != RDMA_MAPPING_ACTIVE)
       `uvm_error("MAPPING_FIELDS", "mapping metadata is inconsistent")
     if (mapping.function_h == null ||
-        mapping.function_h == function_h ||
-        !mapping.function_h.same_instance(function_h))
-      `uvm_error("FUNCTION_CLONE", "Function incarnation was not cloned")
+        mapping.function_h == request_context.function_h ||
+        !mapping.function_h.same_instance(request_context.function_h) ||
+        mapping.requester_bdf != request_context.requester_bdf ||
+        mapping.pasid_valid != request_context.pasid_valid ||
+        mapping.pasid != request_context.pasid || mapping.owner_h == null ||
+        mapping.owner_h == request_context.owner_h ||
+        !mapping.owner_h.same_instance(request_context.owner_h))
+      `uvm_error("REQUEST_AUTHORITY_CLONE",
+                 "DMA requester authority was not copied by value")
 
     valid_clone = clone_mapping("VALID_CLONE", mapping);
     stale_clone = clone_mapping("STALE_CLONE", mapping);
-    release_view = clone_mapping("RELEASE_CLONE", mapping);
+
+    request_context.function_h.generation++;
+    request_context.requester_bdf.bus = 8'hff;
+    request_context.pasid_valid = 1'b0;
+    request_context.pasid = 20'h12345;
+    request_context.owner_h.object_id = 32'hffff_ffff;
+    if (mapping.function_h.generation !=
+          request_context_snapshot.function_h.generation ||
+        mapping.requester_bdf != request_context_snapshot.requester_bdf ||
+        mapping.pasid_valid != request_context_snapshot.pasid_valid ||
+        mapping.pasid != request_context_snapshot.pasid ||
+        mapping.owner_h == null ||
+        mapping.owner_h.object_id != request_context_snapshot.owner_h.object_id ||
+        valid_clone.function_h.generation !=
+          request_context_snapshot.function_h.generation ||
+        valid_clone.requester_bdf != request_context_snapshot.requester_bdf ||
+        valid_clone.pasid_valid != request_context_snapshot.pasid_valid ||
+        valid_clone.pasid != request_context_snapshot.pasid ||
+        valid_clone.owner_h == null ||
+        valid_clone.owner_h.object_id !=
+          request_context_snapshot.owner_h.object_id)
+      `uvm_error("REQUEST_CONTEXT_VALUE_COPY",
+                 "caller context mutation changed mapping authority")
+    request_context.copy(request_context_snapshot);
 
     status = adapter.write(valid_clone, 0, wr);
     expect_status("ROUNDTRIP_WRITE", status, RDMA_SC_OK);
@@ -225,7 +315,8 @@ class rdma_host_mem_adapter_test extends uvm_test;
                   RDMA_SC_DMA_TRANSLATION);
     expect_empty("READ_65BIT_OVERFLOW", rd);
 
-    status = adapter.allocate(function_h, 64, 64, RDMA_DMA_DEVICE_READ,
+    status = adapter.allocate(request_context, 64, 64,
+                              RDMA_DMA_DEVICE_READ,
                               mapping_b);
     expect_status("ALLOC_SECOND", status, RDMA_SC_OK);
     if (mapping_b == null || !mapping_b.permissions.device_read ||
@@ -238,6 +329,50 @@ class rdma_host_mem_adapter_test extends uvm_test;
     tampered.function_h.generation++;
     status = adapter.write(tampered, 0, one_byte);
     expect_status("TAMPER_FUNCTION", status, RDMA_SC_DMA_TRANSLATION);
+    tampered = clone_mapping("TAMPER_REQUESTER_BDF", mapping);
+    tampered.requester_bdf.function_num++;
+    status = adapter.read(tampered, 0, 1, rd);
+    expect_status("TAMPER_REQUESTER_BDF_READ", status,
+                  RDMA_SC_DMA_TRANSLATION);
+    expect_empty("TAMPER_REQUESTER_BDF_READ", rd);
+    status = adapter.write(tampered, 0, one_byte);
+    expect_status("TAMPER_REQUESTER_BDF_WRITE", status,
+                  RDMA_SC_DMA_TRANSLATION);
+    status = adapter.\release (tampered);
+    expect_status("TAMPER_REQUESTER_BDF_RELEASE", status,
+                  RDMA_SC_DMA_TRANSLATION);
+    tampered = clone_mapping("TAMPER_PASID_VALID", mapping);
+    tampered.pasid_valid = !tampered.pasid_valid;
+    status = adapter.read(tampered, 0, 1, rd);
+    expect_status("TAMPER_PASID_VALID_READ", status,
+                  RDMA_SC_DMA_TRANSLATION);
+    expect_empty("TAMPER_PASID_VALID_READ", rd);
+    status = adapter.write(tampered, 0, one_byte);
+    expect_status("TAMPER_PASID_VALID_WRITE", status,
+                  RDMA_SC_DMA_TRANSLATION);
+    status = adapter.\release (tampered);
+    expect_status("TAMPER_PASID_VALID_RELEASE", status,
+                  RDMA_SC_DMA_TRANSLATION);
+    tampered = clone_mapping("TAMPER_PASID", mapping);
+    tampered.pasid++;
+    status = adapter.read(tampered, 0, 1, rd);
+    expect_status("TAMPER_PASID_READ", status, RDMA_SC_DMA_TRANSLATION);
+    expect_empty("TAMPER_PASID_READ", rd);
+    status = adapter.write(tampered, 0, one_byte);
+    expect_status("TAMPER_PASID_WRITE", status, RDMA_SC_DMA_TRANSLATION);
+    status = adapter.\release (tampered);
+    expect_status("TAMPER_PASID_RELEASE", status,
+                  RDMA_SC_DMA_TRANSLATION);
+    tampered = clone_mapping("TAMPER_OWNER", mapping);
+    tampered.owner_h.object_id++;
+    status = adapter.read(tampered, 0, 1, rd);
+    expect_status("TAMPER_OWNER_READ", status, RDMA_SC_DMA_TRANSLATION);
+    expect_empty("TAMPER_OWNER_READ", rd);
+    status = adapter.write(tampered, 0, one_byte);
+    expect_status("TAMPER_OWNER_WRITE", status, RDMA_SC_DMA_TRANSLATION);
+    status = adapter.\release (tampered);
+    expect_status("TAMPER_OWNER_RELEASE", status,
+                  RDMA_SC_DMA_TRANSLATION);
     tampered = clone_mapping("TAMPER_BACKING", mapping);
     tampered.backing_addr.value++;
     status = adapter.read(tampered, 0, 1, rd);
@@ -278,18 +413,18 @@ class rdma_host_mem_adapter_test extends uvm_test;
       `uvm_error("COPY_TARGET_UNCHANGED",
                  "copy attack redirected to another allocation")
 
-    function_h.generation = 32'd99;
+    request_context.function_h.generation = 32'd99;
     if (mapping.function_h == null || mapping.function_h.generation != 17)
       `uvm_error("FUNCTION_VALUE_COPY", "caller mutation aliased mapping")
-    function_h.generation = 32'd17;
+    request_context.copy(request_context_snapshot);
 
     status = adapter.\release (mapping_b);
     expect_status("RELEASE_SECOND", status, RDMA_SC_OK);
     if (mapping_b.state != RDMA_MAPPING_RELEASED)
       `uvm_error("RELEASE_SECOND", "release did not mark caller mapping")
-    status = adapter.\release (release_view);
+    status = adapter.\release (valid_clone);
     expect_status("RELEASE_PRIMARY", status, RDMA_SC_OK);
-    if (release_view.state != RDMA_MAPPING_RELEASED)
+    if (valid_clone.state != RDMA_MAPPING_RELEASED)
       `uvm_error("RELEASE_PRIMARY", "release did not mark caller mapping")
     rd = new[1];
     rd[0] = 8'hff;
@@ -300,7 +435,7 @@ class rdma_host_mem_adapter_test extends uvm_test;
     status = adapter.write(mapping, 0, one_byte);
     expect_status("USE_AFTER_RELEASE_WRITE", status,
                   RDMA_SC_INVALID_STATE);
-    status = adapter.\release (release_view);
+    status = adapter.\release (valid_clone);
     expect_status("DOUBLE_RELEASE", status, RDMA_SC_INVALID_STATE);
 
     // A caller-owned allocation in the same global manager is not part of
@@ -325,7 +460,7 @@ class rdma_host_mem_adapter_test extends uvm_test;
     offset_adapter = rdma_host_mem_adapter::type_id::create("offset_adapter");
     offset_adapter.mem = offset_hm;
     offset_adapter.iova_base = 64'h0000_0000_4000_0000;
-    status = offset_adapter.allocate(function_h, 64, 64,
+    status = offset_adapter.allocate(request_context, 64, 64,
                                      RDMA_DMA_DEVICE_WRITE,
                                      offset_mapping_a);
     expect_status("OFFSET_ALLOC_A", status, RDMA_SC_OK);
@@ -334,7 +469,7 @@ class rdma_host_mem_adapter_test extends uvm_test;
     offset_rejected_nonzero = rdma_dma_mapping::type_id::create(
       "offset_rejected_nonzero_seed"
     );
-    status = offset_adapter.allocate(function_h, 64, 64,
+    status = offset_adapter.allocate(request_context, 64, 64,
                                      RDMA_DMA_BIDIRECTIONAL,
                                      offset_rejected_nonzero);
     expect_status("OFFSET_REBASE_NONZERO", status, RDMA_SC_INVALID_STATE);
@@ -346,7 +481,7 @@ class rdma_host_mem_adapter_test extends uvm_test;
     offset_rejected_identity = rdma_dma_mapping::type_id::create(
       "offset_rejected_identity_seed"
     );
-    status = offset_adapter.allocate(function_h, 64, 64,
+    status = offset_adapter.allocate(request_context, 64, 64,
                                      RDMA_DMA_BIDIRECTIONAL,
                                      offset_rejected_identity);
     expect_status("OFFSET_REBASE_IDENTITY", status, RDMA_SC_INVALID_STATE);
@@ -355,11 +490,11 @@ class rdma_host_mem_adapter_test extends uvm_test;
                  "IOVA identity switch returned a mapping")
 
     offset_adapter.iova_base = 64'h0000_0000_4000_0000;
-    status = offset_adapter.allocate(function_h, 64, 64,
+    status = offset_adapter.allocate(request_context, 64, 64,
                                      RDMA_DMA_BIDIRECTIONAL,
                                      offset_mapping_b);
     expect_status("OFFSET_ALLOC_B", status, RDMA_SC_OK);
-    status = offset_adapter.allocate(function_h, 128, 256,
+    status = offset_adapter.allocate(request_context, 128, 256,
                                      RDMA_DMA_BIDIRECTIONAL,
                                      offset_mapping_c);
     expect_status("OFFSET_ALLOC_C", status, RDMA_SC_OK);
@@ -411,14 +546,14 @@ class rdma_host_mem_adapter_test extends uvm_test;
     );
     overflow_adapter.mem = overflow_hm;
     overflow_adapter.iova_base = 64'hffff_ffff_ffff_fff0;
-    status = overflow_adapter.allocate(function_h, 32, 16,
+    status = overflow_adapter.allocate(request_context, 32, 16,
                                        RDMA_DMA_BIDIRECTIONAL,
                                        overflow_mapping);
     expect_status("IOVA_END_OVERFLOW", status,
                   RDMA_SC_RESOURCE_EXHAUSTED);
     if (overflow_mapping != null)
       `uvm_error("IOVA_END_OVERFLOW", "failed allocation returned mapping")
-    status = overflow_adapter.allocate(function_h, 16, 16,
+    status = overflow_adapter.allocate(request_context, 16, 16,
                                        RDMA_DMA_BIDIRECTIONAL,
                                        overflow_mapping);
     expect_status("IOVA_CURSOR_ROLLBACK", status, RDMA_SC_OK);
@@ -449,11 +584,11 @@ class rdma_host_mem_adapter_test extends uvm_test;
     );
     equal_adapter_a.mem = equal_hm_a;
     equal_adapter_b.mem = equal_hm_b;
-    status = equal_adapter_a.allocate(function_h, 64, 64,
+    status = equal_adapter_a.allocate(request_context, 64, 64,
                                       RDMA_DMA_BIDIRECTIONAL,
                                       equal_mapping_a);
     expect_status("EQUAL_ALLOC_A", status, RDMA_SC_OK);
-    status = equal_adapter_b.allocate(function_h, 64, 64,
+    status = equal_adapter_b.allocate(request_context, 64, 64,
                                       RDMA_DMA_BIDIRECTIONAL,
                                       equal_mapping_b);
     expect_status("EQUAL_ALLOC_B", status, RDMA_SC_OK);

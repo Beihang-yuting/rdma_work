@@ -42,6 +42,25 @@ class rdma_adapter_contract_test extends uvm_test;
     return function_h;
   endfunction
 
+  function automatic rdma_dma_request_context make_dma_context(
+    string name,
+    rdma_function_handle function_h,
+    rdma_bdf_t requester_bdf,
+    bit pasid_valid = 1'b0,
+    bit [19:0] pasid = '0,
+    rdma_handle owner_h = null
+  );
+    rdma_dma_request_context result;
+    result = rdma_dma_request_context::type_id::create(name);
+    result.function_h = rdma_mock_clone_function_handle(function_h);
+    result.requester_bdf = requester_bdf;
+    result.pasid_valid = pasid_valid;
+    result.pasid = pasid;
+    result.owner_h = (owner_h == null) ? null :
+                     rdma_clone_handle_value(owner_h, "DMA context owner");
+    return result;
+  endfunction
+
   function automatic rdma_function_binding make_binding(string name);
     rdma_function_binding binding;
 
@@ -100,6 +119,13 @@ class rdma_adapter_contract_test extends uvm_test;
     rdma_net_api net_api;
     rdma_adapter_test_observer observer;
     rdma_function_handle function_h;
+    rdma_dma_request_context request_context;
+    rdma_dma_request_context context_snapshot;
+    rdma_dma_request_context invalid_context;
+    rdma_mock_host_mem validation_mem;
+    rdma_host_mem_api validation_mem_api;
+    rdma_handle owner_h;
+    rdma_handle cross_owner_h;
     rdma_dma_mapping mapping;
     rdma_dma_mapping failed_mapping;
     rdma_dma_mapping second_mapping;
@@ -146,8 +172,93 @@ class rdma_adapter_contract_test extends uvm_test;
 
     function_h = make_function_handle("function_h");
     bdf = '{segment:16'h1, bus:8'h22, device:5'h3, function_num:3'h4};
+    owner_h = rdma_handle::type_id::create("dma_owner");
+    owner_h.kind = RDMA_RESOURCE_CMQ;
+    owner_h.function_uid = function_h.function_uid;
+    owner_h.object_id = 32'h4455_6677;
+    owner_h.generation = function_h.generation;
+    request_context = make_dma_context(
+      "request_context", function_h, bdf, 1'b1, 20'habcde, owner_h
+    );
     cfg_offset.value = 12'habc;
     bar_address.value = 64'h9000_0040;
+
+    cloned_object = request_context.clone();
+    if (cloned_object == null || !$cast(context_snapshot, cloned_object))
+      `uvm_fatal("DMA_CONTEXT_CLONE", "DMA context clone type mismatch")
+    if (context_snapshot == request_context ||
+        context_snapshot.function_h == request_context.function_h ||
+        context_snapshot.owner_h == request_context.owner_h ||
+        !context_snapshot.function_h.same_instance(
+          request_context.function_h
+        ) || !context_snapshot.owner_h.same_instance(request_context.owner_h))
+      `uvm_error("DMA_CONTEXT_CLONE",
+                 "DMA context clone did not detach authority handles")
+
+    validation_mem = rdma_mock_host_mem::type_id::create("validation_mem");
+    validation_mem_api = validation_mem;
+    status = validation_mem_api.allocate(
+      null, 64, 64, RDMA_DMA_BIDIRECTIONAL, failed_mapping
+    );
+    expect_status("HOST_CONTEXT_NULL", status, RDMA_SC_INVALID_ARGUMENT);
+    invalid_context = make_dma_context(
+      "null_function_context", null, bdf
+    );
+    status = validation_mem_api.allocate(
+      invalid_context, 64, 64, RDMA_DMA_BIDIRECTIONAL, failed_mapping
+    );
+    expect_status("HOST_CONTEXT_FUNCTION_NULL", status,
+                  RDMA_SC_INVALID_ARGUMENT);
+    invalid_context = make_dma_context(
+      "wrong_kind_context", function_h, bdf
+    );
+    invalid_context.function_h.kind = RDMA_RESOURCE_PD;
+    status = validation_mem_api.allocate(
+      invalid_context, 64, 64, RDMA_DMA_BIDIRECTIONAL, failed_mapping
+    );
+    expect_status("HOST_CONTEXT_FUNCTION_KIND", status,
+                  RDMA_SC_INVALID_ARGUMENT);
+    invalid_context = make_dma_context(
+      "zero_generation_context", function_h, bdf
+    );
+    invalid_context.function_h.generation = 0;
+    status = validation_mem_api.allocate(
+      invalid_context, 64, 64, RDMA_DMA_BIDIRECTIONAL, failed_mapping
+    );
+    expect_status("HOST_CONTEXT_FUNCTION_GENERATION", status,
+                  RDMA_SC_STALE_GENERATION);
+    invalid_context = make_dma_context(
+      "invalid_pasid_context", function_h, bdf, 1'b0, 20'h1
+    );
+    status = validation_mem_api.allocate(
+      invalid_context, 64, 64, RDMA_DMA_BIDIRECTIONAL, failed_mapping
+    );
+    expect_status("HOST_CONTEXT_PASID", status, RDMA_SC_INVALID_ARGUMENT);
+    cross_owner_h = rdma_clone_handle_value(owner_h, "cross Function owner");
+    cross_owner_h.function_uid++;
+    invalid_context = make_dma_context(
+      "cross_function_owner_context", function_h, bdf, 1'b0, '0,
+      cross_owner_h
+    );
+    status = validation_mem_api.allocate(
+      invalid_context, 64, 64, RDMA_DMA_BIDIRECTIONAL, failed_mapping
+    );
+    expect_status("HOST_CONTEXT_OWNER_FUNCTION", status,
+                  RDMA_SC_INVALID_ARGUMENT);
+    cross_owner_h = rdma_clone_handle_value(owner_h, "stale owner");
+    cross_owner_h.generation++;
+    invalid_context = make_dma_context(
+      "stale_owner_context", function_h, bdf, 1'b0, '0, cross_owner_h
+    );
+    status = validation_mem_api.allocate(
+      invalid_context, 64, 64, RDMA_DMA_BIDIRECTIONAL, failed_mapping
+    );
+    expect_status("HOST_CONTEXT_OWNER_GENERATION", status,
+                  RDMA_SC_STALE_GENERATION);
+    if (validation_mem.regions.size() != 0 ||
+        validation_mem.next_address != 64'h0000_0001_0000_0000)
+      `uvm_error("HOST_CONTEXT_VALIDATION",
+                 "invalid DMA context changed allocator state")
 
     mem = rdma_mock_host_mem::type_id::create("mem");
     mem_api = mem;
@@ -160,19 +271,56 @@ class rdma_adapter_contract_test extends uvm_test;
     if (mem.failures.exists("allocatte") || mem.failures.exists("read"))
       `uvm_error("HOST_FAIL_CONFIG",
                  "invalid host failure configuration was retained")
-    status = mem_api.allocate(function_h, 4096, 4096,
+    status = mem_api.allocate(request_context, 4096, 4096,
                               RDMA_DMA_BIDIRECTIONAL, mapping);
     expect_status("HOST_ALLOCATE", status, RDMA_SC_OK);
     if (mapping == null || mapping.size != 4096 ||
         mapping.function_h == null ||
-        mapping.function_h.generation != function_h.generation)
+        mapping.function_h.generation != function_h.generation ||
+        mapping.requester_bdf != bdf || !mapping.pasid_valid ||
+        mapping.pasid != 20'habcde || mapping.owner_h == null ||
+        mapping.owner_h == request_context.owner_h ||
+        !mapping.owner_h.same_instance(request_context.owner_h))
       `uvm_error("HOST_ALLOCATE", "host adapter contract failed")
     if (mem.calls.size() != 1 || mem.calls[0].call_sequence != 1 ||
         mem.calls[0].method_name != "allocate" ||
-        mem.calls[0].function_h == function_h ||
-        mem.calls[0].function_h.generation != 17 ||
+        mem.calls[0].request_context == request_context ||
+        mem.calls[0].request_context == null ||
+        mem.calls[0].request_context.function_h ==
+          request_context.function_h ||
+        mem.calls[0].request_context.owner_h == request_context.owner_h ||
+        mem.calls[0].request_context.function_h.generation != 17 ||
+        mem.calls[0].request_context.requester_bdf != bdf ||
+        !mem.calls[0].request_context.pasid_valid ||
+        mem.calls[0].request_context.pasid != 20'habcde ||
+        mem.calls[0].request_context.owner_h == null ||
+        mem.calls[0].request_context.owner_h.object_id != 32'h4455_6677 ||
         mem.calls[0].size != 4096 || mem.calls[0].alignment != 4096)
       `uvm_error("HOST_RECORD", "allocate call was not recorded by value")
+    request_context.function_h.generation = 32'd99;
+    request_context.requester_bdf.bus = 8'hff;
+    request_context.pasid_valid = 1'b0;
+    request_context.pasid = 20'h12345;
+    request_context.owner_h.object_id = 32'hffff_ffff;
+    if (mapping.function_h.generation != 17 ||
+        mapping.requester_bdf != bdf || !mapping.pasid_valid ||
+        mapping.pasid != 20'habcde || mapping.owner_h == null ||
+        mapping.owner_h.object_id != 32'h4455_6677 ||
+        mem.calls[0].request_context.function_h.generation != 17 ||
+        mem.calls[0].request_context.requester_bdf != bdf ||
+        !mem.calls[0].request_context.pasid_valid ||
+        mem.calls[0].request_context.pasid != 20'habcde ||
+        mem.calls[0].request_context.owner_h.object_id != 32'h4455_6677 ||
+        mem.regions.size() != 1 || mem.regions[0].mapping == null ||
+        mem.regions[0].mapping.function_h.generation != 17 ||
+        mem.regions[0].mapping.requester_bdf != bdf ||
+        !mem.regions[0].mapping.pasid_valid ||
+        mem.regions[0].mapping.pasid != 20'habcde ||
+        mem.regions[0].mapping.owner_h == null ||
+        mem.regions[0].mapping.owner_h.object_id != 32'h4455_6677)
+      `uvm_error("HOST_CONTEXT_SNAPSHOT",
+                 "caller DMA context mutation changed saved authority")
+    request_context.copy(context_snapshot);
 
     status = mem_api.write(mapping, 8, write_data);
     expect_status("HOST_WRITE", status, RDMA_SC_OK);
@@ -201,12 +349,14 @@ class rdma_adapter_contract_test extends uvm_test;
     status = mem.fail_next("allocate", injected);
     expect_status("HOST_FAIL_VALID", status, RDMA_SC_OK);
     injected.message = "caller mutation";
-    status = mem_api.allocate(function_h, 64, 64, RDMA_DMA_DEVICE_READ,
+    status = mem_api.allocate(request_context, 64, 64,
+                              RDMA_DMA_DEVICE_READ,
                               failed_mapping);
     expect_status("HOST_INJECTED", status, RDMA_SC_RESOURCE_EXHAUSTED);
     if (status.message != "one shot" || failed_mapping != null)
       `uvm_error("HOST_INJECTED", "injected failure was not copied")
-    status = mem_api.allocate(function_h, 64, 64, RDMA_DMA_DEVICE_READ,
+    status = mem_api.allocate(request_context, 64, 64,
+                              RDMA_DMA_DEVICE_READ,
                               second_mapping);
     expect_status("HOST_ONE_SHOT", status, RDMA_SC_OK);
 
@@ -215,7 +365,8 @@ class rdma_adapter_contract_test extends uvm_test;
     );
     authoritative_mem_api = authoritative_mem;
     status = authoritative_mem_api.allocate(
-      function_h, 64, 64, RDMA_DMA_BIDIRECTIONAL, authoritative_mapping
+      request_context, 64, 64, RDMA_DMA_BIDIRECTIONAL,
+      authoritative_mapping
     );
     expect_status("HOST_AUTH_ALLOCATE", status, RDMA_SC_OK);
     cloned_object = authoritative_mapping.clone();
@@ -262,7 +413,7 @@ class rdma_adapter_contract_test extends uvm_test;
     next_address_before = overflow_mem.next_address;
     region_count_before = overflow_mem.regions.size();
     status = overflow_mem_api.allocate(
-      function_h, 16, 16, RDMA_DMA_BIDIRECTIONAL, overflow_mapping
+      request_context, 16, 16, RDMA_DMA_BIDIRECTIONAL, overflow_mapping
     );
     expect_status("HOST_ALIGN_OVERFLOW", status,
                   RDMA_SC_RESOURCE_EXHAUSTED);
@@ -276,7 +427,7 @@ class rdma_adapter_contract_test extends uvm_test;
     next_address_before = overflow_mem.next_address;
     region_count_before = overflow_mem.regions.size();
     status = overflow_mem_api.allocate(
-      function_h, 128, 64, RDMA_DMA_BIDIRECTIONAL, overflow_mapping
+      request_context, 128, 64, RDMA_DMA_BIDIRECTIONAL, overflow_mapping
     );
     expect_status("HOST_END_OVERFLOW", status,
                   RDMA_SC_RESOURCE_EXHAUSTED);
@@ -289,7 +440,7 @@ class rdma_adapter_contract_test extends uvm_test;
     identity_mem = rdma_mock_host_mem::type_id::create("identity_mem");
     identity_mem_api = identity_mem;
     status = identity_mem_api.allocate(
-      function_h, 64, 64, RDMA_DMA_BIDIRECTIONAL, identity_mapping_a
+      request_context, 64, 64, RDMA_DMA_BIDIRECTIONAL, identity_mapping_a
     );
     expect_status("HOST_IDENTITY_ALLOC_A", status, RDMA_SC_OK);
     if (!$cast(identity_mock_mapping, identity_mapping_a))
@@ -299,7 +450,7 @@ class rdma_adapter_contract_test extends uvm_test;
     expect_status("HOST_IDENTITY_REINITIALIZE", status,
                   RDMA_SC_INVALID_STATE);
     status = identity_mem_api.allocate(
-      function_h, 64, 64, RDMA_DMA_BIDIRECTIONAL, identity_mapping_b
+      request_context, 64, 64, RDMA_DMA_BIDIRECTIONAL, identity_mapping_b
     );
     expect_status("HOST_IDENTITY_ALLOC_B", status, RDMA_SC_OK);
     if (!$cast(identity_mock_mapping_b, identity_mapping_b))

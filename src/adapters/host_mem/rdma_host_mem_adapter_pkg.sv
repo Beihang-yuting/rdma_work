@@ -301,7 +301,7 @@ package rdma_host_mem_adapter_pkg;
     endfunction
 
     virtual function rdma_status allocate(
-      rdma_function_handle function_h,
+      rdma_dma_request_context request_context,
       int unsigned size,
       int unsigned alignment,
       rdma_dma_direction_e direction,
@@ -319,6 +319,12 @@ package rdma_host_mem_adapter_pkg;
       uvm_object cloned_object;
 
       mapping = null;
+      if (request_context == null)
+        return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                                 "DMA request context is null");
+      status = request_context.validate();
+      if (!status.ok())
+        return status;
       if (mem == null)
         return rdma_status::make(RDMA_SC_INVALID_STATE,
                                  "host_mem API is not configured");
@@ -327,10 +333,6 @@ package rdma_host_mem_adapter_pkg;
           RDMA_SC_INVALID_STATE,
           "IOVA configuration cannot change after a successful allocation"
         );
-      if (function_h == null ||
-          function_h.kind != RDMA_RESOURCE_FUNCTION)
-        return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                                 "Function handle is invalid");
       if (size == 0 || alignment == 0 ||
           (alignment & (alignment - 1'b1)) != 0)
         return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
@@ -362,7 +364,7 @@ package rdma_host_mem_adapter_pkg;
         return status;
       end
 
-      function_copy = clone_function_handle(function_h);
+      function_copy = clone_function_handle(request_context.function_h);
       if (function_copy == null) begin
         mem.free(backing_address, `__FILE__, `__LINE__);
         return rdma_status::make(RDMA_SC_INVALID_STATE,
@@ -382,9 +384,9 @@ package rdma_host_mem_adapter_pkg;
         return status;
       end
       allocated_mapping.function_h = function_copy;
-      allocated_mapping.requester_bdf = '0;
-      allocated_mapping.pasid_valid = 1'b0;
-      allocated_mapping.pasid = '0;
+      allocated_mapping.requester_bdf = request_context.requester_bdf;
+      allocated_mapping.pasid_valid = request_context.pasid_valid;
+      allocated_mapping.pasid = request_context.pasid;
       allocated_mapping.backing_addr.value = backing_address;
       allocated_mapping.iova.value = selected_iova;
       allocated_mapping.size = size;
@@ -395,7 +397,15 @@ package rdma_host_mem_adapter_pkg;
         direction inside {RDMA_DMA_DEVICE_WRITE, RDMA_DMA_BIDIRECTIONAL};
       allocated_mapping.permissions.atomic = 1'b0;
       allocated_mapping.state = RDMA_MAPPING_ACTIVE;
-      allocated_mapping.owner_h = null;
+      allocated_mapping.owner_h = rdma_clone_handle_value(
+        request_context.owner_h, "host memory mapping owner"
+      );
+      if (request_context.owner_h != null &&
+          allocated_mapping.owner_h == null) begin
+        mem.free(backing_address, `__FILE__, `__LINE__);
+        return rdma_status::make(RDMA_SC_INVALID_STATE,
+                                 "DMA mapping owner clone failed");
+      end
 
       cloned_object = allocated_mapping.clone();
       if (cloned_object == null || !$cast(authority, cloned_object)) begin

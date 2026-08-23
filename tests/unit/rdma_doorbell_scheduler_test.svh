@@ -515,6 +515,7 @@ class rdma_doorbell_scheduler_test extends uvm_test;
     rdma_function_binding rebound_binding_new;
     rdma_function_handle function_a;
     rdma_function_handle function_b;
+    rdma_dma_request_context request_context;
     rdma_dma_mapping mapping;
     rdma_doorbell_desc desc;
     rdma_doorbell_dependency dependency;
@@ -588,13 +589,21 @@ class rdma_doorbell_scheduler_test extends uvm_test;
                              64'h0000_0000_9000_0000);
     function_a = binding_a.make_handle();
     function_b = binding_b.make_handle();
-    status = mem.allocate(function_a, 64, 8, RDMA_DMA_DEVICE_READ, mapping);
+    request_context = rdma_dma_request_context::type_id::create(
+      "dependency_dma_context"
+    );
+    request_context.function_h =
+      rdma_mock_clone_function_handle(function_a);
+    request_context.requester_bdf = binding_a.pcie.bdf;
+    request_context.pasid_valid = 1'b0;
+    request_context.pasid = '0;
+    request_context.owner_h = null;
+    status = mem.allocate(request_context, 64, 8,
+                          RDMA_DMA_DEVICE_READ, mapping);
     expect_status("ALLOCATE_DEPENDENCY", status, RDMA_SC_OK);
     if (mapping == null) begin
       `uvm_fatal("TEST_SETUP", "dependency mapping allocation failed")
     end
-    mapping.requester_bdf = binding_a.pcie.bdf;
-
     // Scheduler request/result objects are values: cloning must recursively
     // detach every mutable handle/image/dependency while preserving the
     // concrete mapping subclass's opaque allocation identity.

@@ -4,7 +4,7 @@ virtual class rdma_host_mem_api extends uvm_object;
   endfunction
 
   pure virtual function rdma_status allocate(
-    rdma_function_handle function_h,
+    rdma_dma_request_context request_context,
     int unsigned size,
     int unsigned alignment,
     rdma_dma_direction_e direction,
