@@ -1,3 +1,35 @@
+class rdma_owner_clone_failure_handle extends rdma_handle;
+  `uvm_object_utils(rdma_owner_clone_failure_handle)
+
+  function new(string name = "rdma_owner_clone_failure_handle");
+    super.new(name);
+  endfunction
+
+  virtual function uvm_object clone();
+    return null;
+  endfunction
+endclass
+
+class rdma_owner_clone_counting_host_mem extends $unit::host_mem_manager;
+  `uvm_object_utils(rdma_owner_clone_counting_host_mem)
+
+  int unsigned free_call_count;
+
+  function new(string name = "rdma_owner_clone_counting_host_mem");
+    super.new(name);
+    free_call_count = 0;
+  endfunction
+
+  virtual function void free(
+    bit [63:0] addr,
+    string file = "",
+    int line = 0
+  );
+    free_call_count++;
+    super.free(addr, file, line);
+  endfunction
+endclass
+
 class rdma_host_mem_adapter_test extends uvm_test;
   `uvm_component_utils(rdma_host_mem_adapter_test)
 
@@ -88,16 +120,20 @@ class rdma_host_mem_adapter_test extends uvm_test;
     $unit::host_mem_manager overflow_hm;
     $unit::host_mem_manager equal_hm_a;
     $unit::host_mem_manager equal_hm_b;
+    rdma_owner_clone_counting_host_mem owner_clone_hm;
     rdma_host_mem_adapter adapter;
     rdma_host_mem_adapter offset_adapter;
     rdma_host_mem_adapter overflow_adapter;
     rdma_host_mem_adapter equal_adapter_a;
     rdma_host_mem_adapter equal_adapter_b;
+    rdma_host_mem_adapter owner_clone_adapter;
     rdma_function_handle function_h;
     rdma_function_handle invalid_function_h;
     rdma_dma_request_context request_context;
     rdma_dma_request_context request_context_snapshot;
     rdma_dma_request_context invalid_context;
+    rdma_dma_request_context owner_clone_context;
+    rdma_owner_clone_failure_handle owner_clone_failure_h;
     rdma_dma_mapping mapping;
     rdma_dma_mapping mapping_b;
     rdma_dma_mapping offset_mapping_a;
@@ -108,6 +144,8 @@ class rdma_host_mem_adapter_test extends uvm_test;
     rdma_dma_mapping overflow_mapping;
     rdma_dma_mapping equal_mapping_a;
     rdma_dma_mapping equal_mapping_b;
+    rdma_dma_mapping owner_clone_mapping;
+    rdma_dma_mapping owner_clone_followup_mapping;
     rdma_dma_mapping valid_clone;
     rdma_dma_mapping stale_clone;
     rdma_dma_mapping tampered;
@@ -199,6 +237,82 @@ class rdma_host_mem_adapter_test extends uvm_test;
     expect_status("ALLOC_DIRECTION", status, RDMA_SC_INVALID_ARGUMENT);
     if (mapping != null)
       `uvm_error("ALLOC_FAILURE_OUTPUT", "invalid allocation returned mapping")
+
+    // Owner cloning happens only after host backing has been obtained.  A
+    // clone failure must therefore roll that backing back without committing
+    // the IOVA configuration or cursor.
+    owner_clone_hm = rdma_owner_clone_counting_host_mem::type_id::create(
+      "owner_clone_hm"
+    );
+    owner_clone_hm.init_region(64'h0000_0005_0000_0000,
+                               64'h0000_0005_00ff_ffff);
+    owner_clone_adapter = rdma_host_mem_adapter::type_id::create(
+      "owner_clone_adapter"
+    );
+    owner_clone_adapter.mem = owner_clone_hm;
+    owner_clone_adapter.iova_base = 64'h0000_0000_6000_0000;
+    owner_clone_context = make_dma_context(
+      "owner_clone_context", request_context.function_h,
+      request_context.requester_bdf, request_context.pasid_valid,
+      request_context.pasid
+    );
+    owner_clone_failure_h =
+      rdma_owner_clone_failure_handle::type_id::create(
+        "owner_clone_failure_h"
+      );
+    owner_clone_failure_h.kind = RDMA_RESOURCE_CMQ;
+    owner_clone_failure_h.function_uid =
+      owner_clone_context.function_h.function_uid;
+    owner_clone_failure_h.object_id = 32'h55;
+    owner_clone_failure_h.generation =
+      owner_clone_context.function_h.generation;
+    owner_clone_context.owner_h = owner_clone_failure_h;
+    status = owner_clone_context.validate();
+    expect_status("OWNER_CLONE_CONTEXT_VALID", status, RDMA_SC_OK);
+    owner_clone_mapping = rdma_dma_mapping::type_id::create(
+      "owner_clone_non_null_seed"
+    );
+    status = owner_clone_adapter.allocate(
+      owner_clone_context, 64, 64, RDMA_DMA_BIDIRECTIONAL,
+      owner_clone_mapping
+    );
+    expect_status("OWNER_CLONE_FAILURE", status, RDMA_SC_INVALID_STATE);
+    if (owner_clone_mapping != null)
+      `uvm_error("OWNER_CLONE_FAILURE",
+                 "failed owner clone returned a mapping")
+    if (owner_clone_hm.free_call_count != 1)
+      `uvm_error("OWNER_CLONE_FREE_COUNT",
+                 $sformatf("owner clone rollback freed %0d times",
+                           owner_clone_hm.free_call_count))
+    status = owner_clone_adapter.check_leaks(leak_count);
+    expect_status("OWNER_CLONE_ROLLBACK", status, RDMA_SC_OK);
+    if (leak_count != 0)
+      `uvm_error("OWNER_CLONE_ROLLBACK",
+                 "owner clone failure leaked host backing")
+
+    owner_clone_context.owner_h = null;
+    owner_clone_adapter.iova_base = 64'h0000_0000_7000_0000;
+    status = owner_clone_adapter.allocate(
+      owner_clone_context, 64, 64, RDMA_DMA_BIDIRECTIONAL,
+      owner_clone_followup_mapping
+    );
+    expect_status("OWNER_CLONE_CURSOR_ROLLBACK", status, RDMA_SC_OK);
+    if (owner_clone_followup_mapping == null ||
+        owner_clone_followup_mapping.iova.value !=
+          64'h0000_0000_7000_0000)
+      `uvm_error("OWNER_CLONE_CURSOR_ROLLBACK",
+                 "failed owner clone committed IOVA state")
+    status = owner_clone_adapter.\release (owner_clone_followup_mapping);
+    expect_status("OWNER_CLONE_FOLLOWUP_RELEASE", status, RDMA_SC_OK);
+    if (owner_clone_hm.free_call_count != 2)
+      `uvm_error("OWNER_CLONE_FINAL_FREE_COUNT",
+                 $sformatf("expected 2 total frees, got %0d",
+                           owner_clone_hm.free_call_count))
+    status = owner_clone_adapter.check_leaks(leak_count);
+    expect_status("OWNER_CLONE_FINAL_LEAKS", status, RDMA_SC_OK);
+    if (leak_count != 0)
+      `uvm_error("OWNER_CLONE_FINAL_LEAKS",
+                 "owner clone rollback test leaked host backing")
 
     // The first real host allocation proves rejected requests did not reach
     // or advance the underlying allocator.

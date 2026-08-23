@@ -129,6 +129,18 @@ package rdma_host_mem_adapter_pkg;
       return result;
     endfunction
 
+    protected function rdma_handle clone_owner_handle(rdma_handle source);
+      uvm_object cloned_object;
+      rdma_handle result;
+
+      if (source == null)
+        return null;
+      cloned_object = source.clone();
+      if (cloned_object == null || !$cast(result, cloned_object))
+        return null;
+      return result;
+    endfunction
+
     protected function bit same_handle(rdma_handle lhs, rdma_handle rhs);
       if (lhs == null || rhs == null)
         return lhs == null && rhs == null;
@@ -397,8 +409,8 @@ package rdma_host_mem_adapter_pkg;
         direction inside {RDMA_DMA_DEVICE_WRITE, RDMA_DMA_BIDIRECTIONAL};
       allocated_mapping.permissions.atomic = 1'b0;
       allocated_mapping.state = RDMA_MAPPING_ACTIVE;
-      allocated_mapping.owner_h = rdma_clone_handle_value(
-        request_context.owner_h, "host memory mapping owner"
+      allocated_mapping.owner_h = clone_owner_handle(
+        request_context.owner_h
       );
       if (request_context.owner_h != null &&
           allocated_mapping.owner_h == null) begin
