@@ -62,6 +62,14 @@ typedef enum int unsigned {
 } rdma_cmq_test_hook_fault_e;
 
 typedef enum int unsigned {
+  RDMA_CMQ_TEST_EXTENSION_GOOD,
+  RDMA_CMQ_TEST_EXTENSION_DROP_SCALAR,
+  RDMA_CMQ_TEST_EXTENSION_ALIAS_EDGE,
+  RDMA_CMQ_TEST_EXTENSION_NULL_OUTPUT,
+  RDMA_CMQ_TEST_EXTENSION_MUTATE_SOURCE
+} rdma_cmq_test_extension_fault_e;
+
+typedef enum int unsigned {
   RDMA_CMQ_TEST_ABORT_SLOT_CONTEXT,
   RDMA_CMQ_TEST_ABORT_TICKET,
   RDMA_CMQ_TEST_ABORT_SLOT_RECORD,
@@ -156,6 +164,71 @@ class rdma_cmq_clone_fault_qpc extends rdma_qpc_model;
         return rdma_status::success("wrong QPC clone type");
       default: return super.clone();
     endcase
+  endfunction
+endclass
+
+class rdma_cmq_scalar_extension_qpc extends rdma_qpc_model;
+  `uvm_object_utils(rdma_cmq_scalar_extension_qpc)
+
+  local static int unsigned hostile_clone_calls;
+
+  int unsigned extension_value;
+
+  function new(string name = "rdma_cmq_scalar_extension_qpc");
+    super.new(name);
+    extension_value = 0;
+  endfunction
+
+  static function void clear_hostile_clone_calls();
+    hostile_clone_calls = 0;
+  endfunction
+
+  static function int unsigned clone_call_count();
+    return hostile_clone_calls;
+  endfunction
+
+  virtual function uvm_object clone();
+    rdma_cmq_scalar_extension_qpc result;
+
+    hostile_clone_calls++;
+    result = rdma_cmq_scalar_extension_qpc::type_id::create(
+      "lossy_scalar_extension_clone"
+    );
+    result.copy(this);
+    return result;
+  endfunction
+endclass
+
+class rdma_cmq_edge_extension_qpc extends rdma_qpc_model;
+  `uvm_object_utils(rdma_cmq_edge_extension_qpc)
+
+  local static int unsigned hostile_clone_calls;
+
+  rdma_handle extension_h;
+
+  function new(string name = "rdma_cmq_edge_extension_qpc");
+    super.new(name);
+    extension_h = null;
+  endfunction
+
+  static function void clear_hostile_clone_calls();
+    hostile_clone_calls = 0;
+  endfunction
+
+  static function int unsigned clone_call_count();
+    return hostile_clone_calls;
+  endfunction
+
+  virtual function uvm_object clone();
+    rdma_cmq_edge_extension_qpc result;
+
+    hostile_clone_calls++;
+    result = rdma_cmq_edge_extension_qpc::type_id::create(
+      "aliasing_edge_extension_clone"
+    );
+    result.copy(this);
+    result.extension_h = extension_h;
+    return result;
   endfunction
 endclass
 
@@ -884,6 +957,7 @@ class rdma_cmq_profile_hook_fault_profile extends rdma_cmq_test_profile;
   `uvm_object_utils(rdma_cmq_profile_hook_fault_profile)
 
   rdma_cmq_test_hook_fault_e snapshot_fault;
+  rdma_cmq_test_extension_fault_e extension_fault;
   int unsigned snapshot_calls;
   int unsigned same_calls;
   int unsigned detach_calls;
@@ -891,6 +965,7 @@ class rdma_cmq_profile_hook_fault_profile extends rdma_cmq_test_profile;
   function new(string name = "rdma_cmq_profile_hook_fault_profile");
     super.new(name);
     snapshot_fault = RDMA_CMQ_TEST_HOOK_GOOD;
+    extension_fault = RDMA_CMQ_TEST_EXTENSION_GOOD;
     snapshot_calls = 0;
     same_calls = 0;
     detach_calls = 0;
@@ -909,15 +984,141 @@ class rdma_cmq_profile_hook_fault_profile extends rdma_cmq_test_profile;
     return result;
   endfunction
 
+  protected function bit same_nested_handle_value(
+    rdma_handle lhs,
+    rdma_handle rhs
+  );
+    if (lhs == null || rhs == null)
+      return lhs == null && rhs == null;
+    return lhs.kind == rhs.kind &&
+           lhs.function_uid == rhs.function_uid &&
+           lhs.object_id == rhs.object_id &&
+           lhs.generation == rhs.generation;
+  endfunction
+
+  protected function bit same_qpc_base_value(
+    rdma_qpc_model lhs,
+    rdma_qpc_model rhs
+  );
+    if (lhs == null || rhs == null ||
+        lhs.address_vector == null || rhs.address_vector == null ||
+        lhs.behavior == null || rhs.behavior == null ||
+        lhs.transport_ext == null || rhs.transport_ext == null)
+      return 1'b0;
+    return same_nested_handle_value(lhs.qp_h, rhs.qp_h) &&
+           same_nested_handle_value(lhs.pd_h, rhs.pd_h) &&
+           same_nested_handle_value(lhs.send_cq_h, rhs.send_cq_h) &&
+           same_nested_handle_value(lhs.recv_cq_h, rhs.recv_cq_h) &&
+           same_nested_handle_value(lhs.srq_h, rhs.srq_h) &&
+           lhs.transport == rhs.transport && lhs.state == rhs.state &&
+           lhs.host_id == rhs.host_id && lhs.vf_id == rhs.vf_id &&
+           lhs.stat_index == rhs.stat_index && lhs.pkey == rhs.pkey &&
+           lhs.qp_sequence == rhs.qp_sequence &&
+           lhs.access == rhs.access &&
+           lhs.path_mtu_bytes == rhs.path_mtu_bytes &&
+           lhs.sq_depth == rhs.sq_depth && lhs.rq_depth == rhs.rq_depth &&
+           lhs.sq_backing.value == rhs.sq_backing.value &&
+           lhs.rq_backing.value == rhs.rq_backing.value &&
+           lhs.context_backing.value == rhs.context_backing.value &&
+           lhs.sq_mode == rhs.sq_mode && lhs.rq_mode == rhs.rq_mode &&
+           lhs.signature_enable == rhs.signature_enable &&
+           lhs.tx_flow_control == rhs.tx_flow_control &&
+           lhs.rx_flow_control == rhs.rx_flow_control &&
+           lhs.address_vector.describe() == rhs.address_vector.describe() &&
+           lhs.behavior.describe() == rhs.behavior.describe() &&
+           lhs.transport_ext.get_type_name() ==
+             rhs.transport_ext.get_type_name() &&
+           lhs.transport_ext.describe() == rhs.transport_ext.describe();
+  endfunction
+
+  protected function void append_qpc_graph_nodes(
+    rdma_qpc_model qpc,
+    uvm_object extension_edge,
+    ref uvm_object nodes[$]
+  );
+    rdma_qpc_urc_ext urc_ext;
+
+    if (qpc == null)
+      return;
+    nodes.push_back(qpc);
+    if (qpc.qp_h != null) nodes.push_back(qpc.qp_h);
+    if (qpc.pd_h != null) nodes.push_back(qpc.pd_h);
+    if (qpc.send_cq_h != null) nodes.push_back(qpc.send_cq_h);
+    if (qpc.recv_cq_h != null) nodes.push_back(qpc.recv_cq_h);
+    if (qpc.srq_h != null) nodes.push_back(qpc.srq_h);
+    if (qpc.address_vector != null) nodes.push_back(qpc.address_vector);
+    if (qpc.behavior != null) nodes.push_back(qpc.behavior);
+    if (qpc.transport_ext != null) nodes.push_back(qpc.transport_ext);
+    if ($cast(urc_ext, qpc.transport_ext) && urc_ext.queues != null)
+      nodes.push_back(urc_ext.queues);
+    if (extension_edge != null) nodes.push_back(extension_edge);
+  endfunction
+
+  protected function bit qpc_graphs_are_detached(
+    rdma_qpc_model source,
+    uvm_object source_extension_edge,
+    rdma_qpc_model snapshot,
+    uvm_object snapshot_extension_edge
+  );
+    uvm_object source_nodes[$];
+    uvm_object snapshot_nodes[$];
+
+    append_qpc_graph_nodes(source, source_extension_edge, source_nodes);
+    append_qpc_graph_nodes(snapshot, snapshot_extension_edge, snapshot_nodes);
+    foreach (source_nodes[i])
+      foreach (snapshot_nodes[j])
+        if (source_nodes[i] == snapshot_nodes[j])
+          return 1'b0;
+    return source_nodes.size() != 0 && snapshot_nodes.size() != 0;
+  endfunction
+
   virtual function rdma_status snapshot_command_body(
     rdma_hw_model source,
     output rdma_hw_model snapshot
   );
     rdma_cmq_profile_hook_body source_body;
     rdma_cmq_profile_hook_body snapshot_body;
+    rdma_cmq_scalar_extension_qpc source_scalar;
+    rdma_cmq_scalar_extension_qpc snapshot_scalar;
+    rdma_cmq_edge_extension_qpc source_edge;
+    rdma_cmq_edge_extension_qpc snapshot_edge;
     uvm_object cloned_object;
 
     snapshot = null;
+    if ($cast(source_scalar, source)) begin
+      snapshot_calls++;
+      if (extension_fault == RDMA_CMQ_TEST_EXTENSION_NULL_OUTPUT)
+        return rdma_status::success();
+      snapshot_scalar = rdma_cmq_scalar_extension_qpc::type_id::create(
+        "profile_scalar_extension_snapshot"
+      );
+      snapshot_scalar.copy(source_scalar);
+      snapshot_scalar.extension_value = source_scalar.extension_value;
+      case (extension_fault)
+        RDMA_CMQ_TEST_EXTENSION_DROP_SCALAR:
+          snapshot_scalar.extension_value = 0;
+        RDMA_CMQ_TEST_EXTENSION_MUTATE_SOURCE:
+          source_scalar.extension_value++;
+        default: begin
+        end
+      endcase
+      snapshot = snapshot_scalar;
+      return rdma_status::success();
+    end
+    if ($cast(source_edge, source)) begin
+      snapshot_calls++;
+      if (extension_fault == RDMA_CMQ_TEST_EXTENSION_NULL_OUTPUT)
+        return rdma_status::success();
+      snapshot_edge = rdma_cmq_edge_extension_qpc::type_id::create(
+        "profile_edge_extension_snapshot"
+      );
+      snapshot_edge.copy(source_edge);
+      snapshot_edge.extension_h = copy_nested_handle(source_edge.extension_h);
+      if (extension_fault == RDMA_CMQ_TEST_EXTENSION_ALIAS_EDGE)
+        snapshot_edge.extension_h = source_edge.extension_h;
+      snapshot = snapshot_edge;
+      return rdma_status::success();
+    end
     if (!$cast(source_body, source))
       return super.snapshot_command_body(source, snapshot);
     snapshot_calls++;
@@ -987,8 +1188,23 @@ class rdma_cmq_profile_hook_fault_profile extends rdma_cmq_test_profile;
   );
     rdma_cmq_profile_hook_body lhs_body;
     rdma_cmq_profile_hook_body rhs_body;
+    rdma_cmq_scalar_extension_qpc lhs_scalar;
+    rdma_cmq_scalar_extension_qpc rhs_scalar;
+    rdma_cmq_edge_extension_qpc lhs_edge;
+    rdma_cmq_edge_extension_qpc rhs_edge;
     bit same_value;
 
+    if ($cast(lhs_scalar, lhs) && $cast(rhs_scalar, rhs)) begin
+      same_calls++;
+      return same_qpc_base_value(lhs_scalar, rhs_scalar) &&
+             lhs_scalar.extension_value == rhs_scalar.extension_value;
+    end
+    if ($cast(lhs_edge, lhs) && $cast(rhs_edge, rhs)) begin
+      same_calls++;
+      return same_qpc_base_value(lhs_edge, rhs_edge) &&
+             same_nested_handle_value(lhs_edge.extension_h,
+                                      rhs_edge.extension_h);
+    end
     if (!$cast(lhs_body, lhs) || !$cast(rhs_body, rhs) ||
         lhs_body.nested_h == null || rhs_body.nested_h == null)
       return 1'b0;
@@ -1011,6 +1227,24 @@ class rdma_cmq_profile_hook_fault_profile extends rdma_cmq_test_profile;
   );
     rdma_cmq_profile_hook_body source_body;
     rdma_cmq_profile_hook_body snapshot_body;
+    rdma_cmq_scalar_extension_qpc source_scalar;
+    rdma_cmq_scalar_extension_qpc snapshot_scalar;
+    rdma_cmq_edge_extension_qpc source_edge;
+    rdma_cmq_edge_extension_qpc snapshot_edge;
+
+    if ($cast(source_scalar, source) &&
+        $cast(snapshot_scalar, snapshot)) begin
+      detach_calls++;
+      return qpc_graphs_are_detached(source_scalar, null,
+                                     snapshot_scalar, null);
+    end
+    if ($cast(source_edge, source) && $cast(snapshot_edge, snapshot)) begin
+      detach_calls++;
+      return qpc_graphs_are_detached(
+        source_edge, source_edge.extension_h,
+        snapshot_edge, snapshot_edge.extension_h
+      );
+    end
 
     if (!$cast(source_body, source) || !$cast(snapshot_body, snapshot) ||
         source_body == snapshot_body || source_body.nested_h == null ||
@@ -1779,6 +2013,38 @@ class rdma_cmq_engine_test extends uvm_test;
     rc_ext = rdma_qpc_rc_ext::type_id::create({name, "_rc_ext"});
     rc_ext.remote_qpn = 24'h654321;
     qpc.transport_ext = rc_ext;
+    return qpc;
+  endfunction
+
+  function automatic rdma_cmq_scalar_extension_qpc
+      make_scalar_extension_qpc(
+        string name,
+        rdma_function_binding binding,
+        int unsigned extension_value
+      );
+    rdma_qpc_model base_qpc;
+    rdma_cmq_scalar_extension_qpc qpc;
+
+    base_qpc = make_qpc_context({name, "_base"}, binding);
+    qpc = rdma_cmq_scalar_extension_qpc::type_id::create(name);
+    qpc.copy(base_qpc);
+    qpc.extension_value = extension_value;
+    return qpc;
+  endfunction
+
+  function automatic rdma_cmq_edge_extension_qpc make_edge_extension_qpc(
+    string name,
+    rdma_function_binding binding
+  );
+    rdma_qpc_model base_qpc;
+    rdma_cmq_edge_extension_qpc qpc;
+
+    base_qpc = make_qpc_context({name, "_base"}, binding);
+    qpc = rdma_cmq_edge_extension_qpc::type_id::create(name);
+    qpc.copy(base_qpc);
+    qpc.extension_h = make_context_handle(
+      {name, "_extension"}, binding, RDMA_RESOURCE_CMQ, TEST_CMQ_ID
+    );
     return qpc;
   endfunction
 
@@ -5352,6 +5618,228 @@ class rdma_cmq_engine_test extends uvm_test;
     end
   endtask
 
+  task automatic check_exact_type_profile_delegation();
+    rdma_cmq_engine_probe engine;
+    rdma_mock_host_mem mem;
+    rdma_mock_pcie pcie;
+    rdma_mock_call_trace trace;
+    rdma_doorbell_scheduler scheduler;
+    rdma_cmq_profile_hook_fault_profile profile;
+    rdma_function_binding prepared_binding;
+    rdma_function_binding active_binding;
+    rdma_cmq cmq;
+    rdma_cmq_runtime_desc runtime_desc;
+    rdma_cmq_command_desc requests[];
+    rdma_cmq_sqe_model command_body;
+    rdma_cmq_ticket tickets[];
+    rdma_status item_statuses[];
+    rdma_status batch_status;
+    rdma_status status;
+
+    for (int unsigned mode = 0; mode < 3; mode++) begin
+      engine = rdma_cmq_engine_probe::type_id::create(
+        $sformatf("exact_type_engine_%0d", mode)
+      );
+      mem = rdma_mock_host_mem::type_id::create(
+        $sformatf("exact_type_mem_%0d", mode)
+      );
+      pcie = rdma_cmq_test_pcie::type_id::create(
+        $sformatf("exact_type_pcie_%0d", mode)
+      );
+      trace = rdma_mock_call_trace::type_id::create(
+        $sformatf("exact_type_trace_%0d", mode)
+      );
+      mem.set_call_trace(trace);
+      pcie.set_call_trace(trace);
+      scheduler = rdma_doorbell_scheduler::type_id::create(
+        $sformatf("exact_type_scheduler_%0d", mode)
+      );
+      profile = rdma_cmq_profile_hook_fault_profile::type_id::create(
+        $sformatf("exact_type_profile_%0d", mode)
+      );
+      prepared_binding = make_binding(
+        $sformatf("exact_type_prepared_%0d", mode), RDMA_BIND_PREPARED
+      );
+      active_binding = make_binding(
+        $sformatf("exact_type_active_%0d", mode), RDMA_BIND_ACTIVE
+      );
+      cmq = make_cmq($sformatf("exact_type_cmq_%0d", mode),
+                     prepared_binding);
+      prepare_active($sformatf("EXACT_TYPE_%0d", mode), engine, mem,
+                     pcie, scheduler, profile, prepared_binding,
+                     active_binding, cmq, runtime_desc);
+      clear_submit_observation(mem, pcie, trace);
+
+      requests = new[1];
+      requests[0] = make_command(
+        $sformatf("exact_type_request_%0d", mode), active_binding,
+        rdma_cmq_test_profile::TEST_OPCODE_A, byte'(8'hb0 + mode)
+      );
+      if (!$cast(command_body, requests[0].body))
+        `uvm_fatal("EXACT_TYPE_SETUP", "command body cast failed")
+      command_body.opcode = RDMA_CMQ_CREATE_QP;
+      case (mode)
+        0: command_body.context_model = make_qpc_context(
+             "exact_type_builtin_qpc", active_binding
+           );
+        1: command_body.context_model = make_scalar_extension_qpc(
+             "exact_type_scalar_qpc", active_binding, 32'h1357_9bdf
+           );
+        2: command_body.context_model = make_edge_extension_qpc(
+             "exact_type_edge_qpc", active_binding
+           );
+        default:
+          `uvm_fatal("EXACT_TYPE_SETUP", "unknown exact-type mode")
+      endcase
+      rdma_cmq_scalar_extension_qpc::clear_hostile_clone_calls();
+      rdma_cmq_edge_extension_qpc::clear_hostile_clone_calls();
+      engine.submit_batch(requests, tickets, item_statuses, batch_status);
+
+      expect_status($sformatf("EXACT_TYPE_BATCH_%0d", mode), batch_status,
+                    RDMA_SC_OK);
+      if (tickets.size() != 1 || tickets[0] == null ||
+          item_statuses.size() != 1)
+        `uvm_error("EXACT_TYPE_OUTPUT",
+                   $sformatf("mode %0d did not publish", mode))
+      else
+        expect_status($sformatf("EXACT_TYPE_ITEM_%0d", mode),
+                      item_statuses[0], RDMA_SC_OK);
+      if (mode == 0) begin
+        if (profile.snapshot_calls != 0 || profile.same_calls != 0 ||
+            profile.detach_calls != 0)
+          `uvm_error("EXACT_TYPE_BUILTIN",
+                     "exact built-in QPC unexpectedly used profile hooks")
+      end
+      else begin
+        if (profile.snapshot_calls != 1 || profile.same_calls == 0 ||
+            profile.detach_calls == 0)
+          `uvm_error("EXACT_TYPE_EXTENSION",
+                     $sformatf("mode %0d bypassed profile hooks (%0d/%0d/%0d)",
+                               mode, profile.snapshot_calls,
+                               profile.same_calls, profile.detach_calls))
+        if (rdma_cmq_scalar_extension_qpc::clone_call_count() != 0 ||
+            rdma_cmq_edge_extension_qpc::clone_call_count() != 0)
+          `uvm_error("EXACT_TYPE_HOSTILE_CLONE",
+                     $sformatf("mode %0d invoked an extension clone (%0d/%0d)",
+                               mode,
+                               rdma_cmq_scalar_extension_qpc::clone_call_count(),
+                               rdma_cmq_edge_extension_qpc::clone_call_count()))
+      end
+
+      engine.shutdown(status);
+      expect_status($sformatf("EXACT_TYPE_SHUTDOWN_%0d", mode), status,
+                    RDMA_SC_OK);
+    end
+
+    for (int unsigned fault = RDMA_CMQ_TEST_EXTENSION_DROP_SCALAR;
+         fault <= RDMA_CMQ_TEST_EXTENSION_MUTATE_SOURCE; fault++) begin
+      engine = rdma_cmq_engine_probe::type_id::create(
+        $sformatf("extension_contract_engine_%0d", fault)
+      );
+      mem = rdma_mock_host_mem::type_id::create(
+        $sformatf("extension_contract_mem_%0d", fault)
+      );
+      pcie = rdma_cmq_test_pcie::type_id::create(
+        $sformatf("extension_contract_pcie_%0d", fault)
+      );
+      trace = rdma_mock_call_trace::type_id::create(
+        $sformatf("extension_contract_trace_%0d", fault)
+      );
+      mem.set_call_trace(trace);
+      pcie.set_call_trace(trace);
+      scheduler = rdma_doorbell_scheduler::type_id::create(
+        $sformatf("extension_contract_scheduler_%0d", fault)
+      );
+      profile = rdma_cmq_profile_hook_fault_profile::type_id::create(
+        $sformatf("extension_contract_profile_%0d", fault)
+      );
+      if (!$cast(profile.extension_fault, fault))
+        `uvm_fatal("EXTENSION_CONTRACT_SETUP",
+                   "extension fault enum cast failed")
+      prepared_binding = make_binding(
+        $sformatf("extension_contract_prepared_%0d", fault),
+        RDMA_BIND_PREPARED
+      );
+      active_binding = make_binding(
+        $sformatf("extension_contract_active_%0d", fault),
+        RDMA_BIND_ACTIVE
+      );
+      cmq = make_cmq($sformatf("extension_contract_cmq_%0d", fault),
+                     prepared_binding);
+      prepare_active($sformatf("EXTENSION_CONTRACT_%0d", fault), engine,
+                     mem, pcie, scheduler, profile, prepared_binding,
+                     active_binding, cmq, runtime_desc);
+      clear_submit_observation(mem, pcie, trace);
+
+      requests = new[1];
+      requests[0] = make_command(
+        $sformatf("extension_contract_request_%0d", fault), active_binding,
+        rdma_cmq_test_profile::TEST_OPCODE_A, byte'(8'hc0 + fault)
+      );
+      if (!$cast(command_body, requests[0].body))
+        `uvm_fatal("EXTENSION_CONTRACT_SETUP", "command body cast failed")
+      command_body.opcode = RDMA_CMQ_CREATE_QP;
+      if (fault == RDMA_CMQ_TEST_EXTENSION_ALIAS_EDGE)
+        command_body.context_model = make_edge_extension_qpc(
+          $sformatf("extension_contract_edge_%0d", fault), active_binding
+        );
+      else
+        command_body.context_model = make_scalar_extension_qpc(
+          $sformatf("extension_contract_scalar_%0d", fault),
+          active_binding, 32'h2468_ace0 + fault
+        );
+      rdma_cmq_scalar_extension_qpc::clear_hostile_clone_calls();
+      rdma_cmq_edge_extension_qpc::clear_hostile_clone_calls();
+      engine.submit_batch(requests, tickets, item_statuses, batch_status);
+
+      expect_status($sformatf("EXTENSION_CONTRACT_BATCH_%0d", fault),
+                    batch_status, RDMA_SC_INVALID_STATE);
+      if (tickets.size() != 1 || tickets[0] != null ||
+          item_statuses.size() != 1)
+        `uvm_error("EXTENSION_CONTRACT_OUTPUT",
+                   $sformatf("fault %0d published output", fault))
+      else
+        expect_status($sformatf("EXTENSION_CONTRACT_ITEM_%0d", fault),
+                      item_statuses[0], RDMA_SC_INVALID_STATE);
+      expect_no_submit_side_effects(
+        $sformatf("EXTENSION_CONTRACT_EFFECTS_%0d", fault), mem, pcie,
+        trace
+      );
+      if (engine.published_count() != 0 ||
+          engine.tokens_in_use_count() != 0 ||
+          engine.slot_record_count() != 0)
+        `uvm_error("EXTENSION_CONTRACT_LEDGER",
+                   $sformatf("fault %0d committed tentative state", fault))
+
+      profile.extension_fault = RDMA_CMQ_TEST_EXTENSION_GOOD;
+      clear_submit_observation(mem, pcie, trace);
+      requests[0] = make_command(
+        $sformatf("extension_contract_recovery_%0d", fault),
+        active_binding, rdma_cmq_test_profile::TEST_OPCODE_A,
+        byte'(8'hd0 + fault)
+      );
+      engine.submit_batch(requests, tickets, item_statuses, batch_status);
+      expect_status($sformatf("EXTENSION_CONTRACT_RECOVERY_BATCH_%0d",
+                              fault), batch_status, RDMA_SC_OK);
+      if (tickets.size() != 1 || tickets[0] == null ||
+          item_statuses.size() != 1)
+        `uvm_error("EXTENSION_CONTRACT_RECOVERY",
+                   $sformatf("fault %0d blocked recovery", fault))
+      else
+        expect_status($sformatf("EXTENSION_CONTRACT_RECOVERY_ITEM_%0d",
+                                fault), item_statuses[0], RDMA_SC_OK);
+      if (engine.published_count() != 1 ||
+          engine.tokens_in_use_count() != 1 ||
+          engine.slot_record_count() != 1)
+        `uvm_error("EXTENSION_CONTRACT_RECOVERY_LEDGER",
+                   $sformatf("fault %0d did not recover cleanly", fault))
+
+      engine.shutdown(status);
+      expect_status($sformatf("EXTENSION_CONTRACT_SHUTDOWN_%0d", fault),
+                    status, RDMA_SC_OK);
+    end
+  endtask
+
   task automatic check_internal_invariant_batch_abort();
     rdma_cmq_engine_probe engine;
     rdma_mock_host_mem mem;
@@ -5725,6 +6213,7 @@ class rdma_cmq_engine_test extends uvm_test;
     check_submission_validation_and_profile_metadata();
     check_profile_hook_snapshot_contract();
     check_stateful_profile_snapshot_rechecks();
+    check_exact_type_profile_delegation();
     check_internal_invariant_batch_abort();
     check_incarnation_survives_reprepare();
     check_full_initial_capacity_and_shutdown_reset();

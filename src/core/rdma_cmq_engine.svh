@@ -518,6 +518,138 @@ class rdma_cmq_engine extends uvm_object;
                      handle.generation);
   endfunction
 
+  protected function automatic bit has_exact_object_type(
+    uvm_object value,
+    uvm_object_wrapper expected_type
+  );
+    uvm_object_wrapper actual_type;
+
+    if (value == null || expected_type == null)
+      return 1'b0;
+    actual_type = value.get_object_type();
+    return actual_type != null && actual_type == expected_type;
+  endfunction
+
+  protected function automatic bit has_optional_exact_object_type(
+    uvm_object value,
+    uvm_object_wrapper expected_type
+  );
+    return value == null || has_exact_object_type(value, expected_type);
+  endfunction
+
+  protected function automatic bit core_body_shell_is_exact(
+    rdma_hw_model body
+  );
+    rdma_cmq_sqe_model sqe;
+    rdma_qpc_model qpc;
+    rdma_qpc_urc_ext urc_ext;
+    rdma_cqc_model cqc;
+    rdma_mrt_model mrt;
+    rdma_srqc_model srqc;
+    rdma_ceqc_model ceqc;
+    rdma_aeqc_model aeqc;
+
+    if (body == null)
+      return 1'b0;
+    if (has_exact_object_type(body, rdma_cmq_sqe_model::get_type())) begin
+      if (!$cast(sqe, body)) return 1'b0;
+      return has_exact_object_type(
+               sqe.function_h, rdma_function_handle::get_type()
+             ) &&
+             has_optional_exact_object_type(
+               sqe.target_h, rdma_handle::get_type()
+             );
+    end
+    if (has_exact_object_type(body, rdma_qpc_model::get_type())) begin
+      if (!$cast(qpc, body)) return 1'b0;
+      if (!has_exact_object_type(qpc.qp_h, rdma_handle::get_type()) ||
+          !has_exact_object_type(qpc.pd_h, rdma_handle::get_type()) ||
+          !has_exact_object_type(qpc.send_cq_h, rdma_handle::get_type()) ||
+          !has_exact_object_type(qpc.recv_cq_h, rdma_handle::get_type()) ||
+          !has_optional_exact_object_type(
+            qpc.srq_h, rdma_handle::get_type()
+          ) ||
+          !has_exact_object_type(
+            qpc.address_vector, rdma_address_vector::get_type()
+          ) ||
+          !has_exact_object_type(
+            qpc.behavior, rdma_qpc_behavior::get_type()
+          ))
+        return 1'b0;
+      if (has_exact_object_type(qpc.transport_ext,
+                                rdma_qpc_rc_ext::get_type()) ||
+          has_exact_object_type(qpc.transport_ext,
+                                rdma_qpc_ud_ext::get_type()))
+        return 1'b1;
+      if (!has_exact_object_type(qpc.transport_ext,
+                                 rdma_qpc_urc_ext::get_type()) ||
+          !$cast(urc_ext, qpc.transport_ext))
+        return 1'b0;
+      return has_exact_object_type(
+        urc_ext.queues, rdma_urc_queue_config::get_type()
+      );
+    end
+    if (has_exact_object_type(body, rdma_cqc_model::get_type())) begin
+      if (!$cast(cqc, body)) return 1'b0;
+      return has_exact_object_type(cqc.cq_h, rdma_handle::get_type()) &&
+             has_optional_exact_object_type(
+               cqc.ceq_h, rdma_handle::get_type()
+             ) &&
+             has_exact_object_type(
+               cqc.page_layout, rdma_page_table_layout::get_type()
+             ) &&
+             has_exact_object_type(
+               cqc.producer, rdma_ring_position::get_type()
+             ) &&
+             has_exact_object_type(
+               cqc.consumer, rdma_ring_position::get_type()
+             );
+    end
+    if (has_exact_object_type(body, rdma_mrt_model::get_type())) begin
+      if (!$cast(mrt, body)) return 1'b0;
+      return has_exact_object_type(mrt.mr_h, rdma_handle::get_type()) &&
+             has_exact_object_type(mrt.pd_h, rdma_handle::get_type()) &&
+             has_exact_object_type(
+               mrt.page_layout, rdma_mr_page_layout::get_type()
+             );
+    end
+    if (has_exact_object_type(body, rdma_srqc_model::get_type())) begin
+      if (!$cast(srqc, body)) return 1'b0;
+      return has_exact_object_type(srqc.srq_h, rdma_handle::get_type()) &&
+             has_exact_object_type(srqc.pd_h, rdma_handle::get_type()) &&
+             has_exact_object_type(
+               srqc.producer, rdma_ring_position::get_type()
+             );
+    end
+    if (has_exact_object_type(body, rdma_ceqc_model::get_type())) begin
+      if (!$cast(ceqc, body)) return 1'b0;
+      return has_exact_object_type(ceqc.ceq_h, rdma_handle::get_type()) &&
+             has_exact_object_type(
+               ceqc.page_layout, rdma_page_table_layout::get_type()
+             ) &&
+             has_exact_object_type(
+               ceqc.producer, rdma_ring_position::get_type()
+             ) &&
+             has_exact_object_type(
+               ceqc.consumer, rdma_ring_position::get_type()
+             );
+    end
+    if (has_exact_object_type(body, rdma_aeqc_model::get_type())) begin
+      if (!$cast(aeqc, body)) return 1'b0;
+      return has_exact_object_type(aeqc.aeq_h, rdma_handle::get_type()) &&
+             has_exact_object_type(
+               aeqc.page_layout, rdma_page_table_layout::get_type()
+             ) &&
+             has_exact_object_type(
+               aeqc.producer, rdma_ring_position::get_type()
+             ) &&
+             has_exact_object_type(
+               aeqc.consumer, rdma_ring_position::get_type()
+             );
+    end
+    return 1'b0;
+  endfunction
+
   protected function automatic string nested_value_key(uvm_object value);
     rdma_handle handle;
     rdma_ring_position ring;
@@ -533,18 +665,22 @@ class rdma_cmq_engine extends uvm_object;
 
     if (value == null)
       return "<null-object>";
-    if ($cast(handle, value))
+    if (has_exact_object_type(value, rdma_handle::get_type()) &&
+        $cast(handle, value))
       return {"handle:", handle_value_key(handle)};
-    if ($cast(ring, value))
+    if (has_exact_object_type(value, rdma_ring_position::get_type()) &&
+        $cast(ring, value))
       return $sformatf("ring:%0d:%0b", ring.index, ring.wrap);
-    if ($cast(page_layout, value))
+    if (has_exact_object_type(value, rdma_page_table_layout::get_type()) &&
+        $cast(page_layout, value))
       return $sformatf("page:%0d:%016h:%016h:%0b:%016h:%0b",
                        page_layout.mode, page_layout.sd_base.value,
                        page_layout.current_base.value,
                        page_layout.current_valid,
                        page_layout.next_base.value,
                        page_layout.next_valid);
-    if ($cast(address_vector, value)) begin
+    if (has_exact_object_type(value, rdma_address_vector::get_type()) &&
+        $cast(address_vector, value)) begin
       result = $sformatf(
         "av:%0d:%0d:%0d:%0d:%012h:%0b:%0b:%0b:%0b:%0b:%0b:%03h:%02h:%05h:%02h:%04h",
         address_vector.source_address_index, address_vector.source_vport,
@@ -562,7 +698,8 @@ class rdma_cmq_engine extends uvm_object;
                   $sformatf(":%02h", address_vector.destination_ip[i])};
       return result;
     end
-    if ($cast(queues, value))
+    if (has_exact_object_type(value, rdma_urc_queue_config::get_type()) &&
+        $cast(queues, value))
       return $sformatf(
         "urcq:%016h:%016h:%016h:%0d:%0d:%0d:%0d:%0d:%0d",
         queues.rsq_backing.value, queues.rdsq_backing.value,
@@ -571,7 +708,8 @@ class rdma_cmq_engine extends uvm_object;
         queues.rq_sequence_threshold_entries,
         queues.sq_completion_threshold_entries
       );
-    if ($cast(mr_page_layout, value))
+    if (has_exact_object_type(value, rdma_mr_page_layout::get_type()) &&
+        $cast(mr_page_layout, value))
       return $sformatf(
         "mrpage:%0d:%0d:%016h:%016h:%0d:%0d:%0b:%0b:%0b:%0d:%0d",
         mr_page_layout.pbl_mode, mr_page_layout.host_page_size,
@@ -581,7 +719,8 @@ class rdma_cmq_engine extends uvm_object;
         mr_page_layout.payload_vf_enable,
         mr_page_layout.payload_vf_id, mr_page_layout.mr_serial
       );
-    if ($cast(behavior, value))
+    if (has_exact_object_type(value, rdma_qpc_behavior::get_type()) &&
+        $cast(behavior, value))
       return $sformatf("behavior:%0d:%0b:%0b:%0b:%0b:%0b:%0d",
                        behavior.transport_version,
                        behavior.migration_enable,
@@ -589,14 +728,17 @@ class rdma_cmq_engine extends uvm_object;
                        behavior.read_after_write_fence,
                        behavior.atomic_after_atomic_fence,
                        behavior.\priority );
-    if ($cast(rc_ext, value))
+    if (has_exact_object_type(value, rdma_qpc_rc_ext::get_type()) &&
+        $cast(rc_ext, value))
       return $sformatf("rc:%06h:%06h:%06h:%0d:%0d",
                        rc_ext.remote_qpn, rc_ext.send_psn,
                        rc_ext.recv_psn, rc_ext.retry_count,
                        rc_ext.rnr_retry_count);
-    if ($cast(ud_ext, value))
+    if (has_exact_object_type(value, rdma_qpc_ud_ext::get_type()) &&
+        $cast(ud_ext, value))
       return $sformatf("ud:%08h", ud_ext.qkey);
-    if ($cast(urc_ext, value))
+    if (has_exact_object_type(value, rdma_qpc_urc_ext::get_type()) &&
+        $cast(urc_ext, value))
       return $sformatf("urc:%06h:%06h:%06h:%06h:%06h:%s",
                        urc_ext.remote_qpn, urc_ext.rbsn, urc_ext.dbsn,
                        urc_ext.rpsn, urc_ext.dpsn,
@@ -615,14 +757,16 @@ class rdma_cmq_engine extends uvm_object;
 
     if (body == null)
       return "<null-body>";
-    if ($cast(sqe, body))
+    if (has_exact_object_type(body, rdma_cmq_sqe_model::get_type()) &&
+        $cast(sqe, body))
       return $sformatf("sqe:%0d:%016h:%08h:%s:%s:%s", sqe.opcode,
                        sqe.command_id, sqe.flags,
                        handle_value_key(sqe.function_h),
                        handle_value_key(sqe.target_h),
                        (sqe.context_model == null) ? "<null-context>" :
                          body_value_key(sqe.context_model));
-    if ($cast(qpc, body))
+    if (has_exact_object_type(body, rdma_qpc_model::get_type()) &&
+        $cast(qpc, body))
       return $sformatf(
         "qpc:%s:%s:%s:%s:%s:%0d:%0d:%0d:%0d:%0d:%04h:%02h:%0h:%0d:%0d:%0d:%016h:%016h:%016h:%0d:%0d:%s:%0b:%0b:%0b:%s:%s",
         handle_value_key(qpc.qp_h), handle_value_key(qpc.pd_h),
@@ -638,7 +782,8 @@ class rdma_cmq_engine extends uvm_object;
         nested_value_key(qpc.behavior),
         nested_value_key(qpc.transport_ext)
       );
-    if ($cast(cqc, body))
+    if (has_exact_object_type(body, rdma_cqc_model::get_type()) &&
+        $cast(cqc, body))
       return $sformatf(
         "cqc:%s:%s:%0d:%0d:%0d:%0d:%s:%s:%s:%0b:%0b:%0h:%0h:%0h:%016h",
         handle_value_key(cqc.cq_h), handle_value_key(cqc.ceq_h),
@@ -648,14 +793,16 @@ class rdma_cmq_engine extends uvm_object;
         cqc.urc_enable, cqc.load_ci_done, cqc.last_arm_sequence,
         cqc.arm_sequence, cqc.arm_state, cqc.shadow_backing.value
       );
-    if ($cast(mrt, body))
+    if (has_exact_object_type(body, rdma_mrt_model::get_type()) &&
+        $cast(mrt, body))
       return $sformatf(
         "mrt:%s:%s:%0d:%016h:%016h:%08h:%08h:%0h:%0h:%s",
         handle_value_key(mrt.mr_h), handle_value_key(mrt.pd_h),
         mrt.state, mrt.iova.value, mrt.length, mrt.lkey, mrt.rkey,
         mrt.access, mrt.object_type, nested_value_key(mrt.page_layout)
       );
-    if ($cast(srqc, body))
+    if (has_exact_object_type(body, rdma_srqc_model::get_type()) &&
+        $cast(srqc, body))
       return $sformatf(
         "srqc:%s:%s:%0d:%0d:%0d:%0d:%0d:%016h:%016h:%s:%0h",
         handle_value_key(srqc.srq_h), handle_value_key(srqc.pd_h),
@@ -664,14 +811,16 @@ class rdma_cmq_engine extends uvm_object;
         srqc.srfq_backing.value, srqc.shadow_backing.value,
         nested_value_key(srqc.producer), srqc.arm_sequence
       );
-    if ($cast(ceqc, body))
+    if (has_exact_object_type(body, rdma_ceqc_model::get_type()) &&
+        $cast(ceqc, body))
       return $sformatf("ceqc:%s:%0d:%0d:%0d:%s:%s:%s",
                        handle_value_key(ceqc.ceq_h), ceqc.state,
                        ceqc.depth, ceqc.vector_id,
                        nested_value_key(ceqc.page_layout),
                        nested_value_key(ceqc.producer),
                        nested_value_key(ceqc.consumer));
-    if ($cast(aeqc, body))
+    if (has_exact_object_type(body, rdma_aeqc_model::get_type()) &&
+        $cast(aeqc, body))
       return $sformatf("aeqc:%s:%0d:%0d:%0d:%s:%s:%s",
                        handle_value_key(aeqc.aeq_h), aeqc.state,
                        aeqc.depth, aeqc.vector_id,
@@ -685,19 +834,47 @@ class rdma_cmq_engine extends uvm_object;
     rdma_hw_model lhs,
     rdma_hw_model rhs
   );
+    uvm_object_wrapper lhs_type;
+    uvm_object_wrapper rhs_type;
+    rdma_cmq_sqe_model lhs_sqe;
+    rdma_cmq_sqe_model rhs_sqe;
     string lhs_value;
     string rhs_value;
 
-    if (lhs == null || rhs == null ||
-        lhs.get_type_name() != rhs.get_type_name())
+    if (lhs == null || rhs == null)
       return 1'b0;
+    lhs_type = lhs.get_object_type();
+    rhs_type = rhs.get_object_type();
+    if (lhs_type == null || rhs_type == null || lhs_type != rhs_type)
+      return 1'b0;
+    if (lhs_type == rdma_cmq_sqe_model::get_type()) begin
+      if (!$cast(lhs_sqe, lhs) || !$cast(rhs_sqe, rhs))
+        return 1'b0;
+      if (lhs_sqe.opcode != rhs_sqe.opcode ||
+          lhs_sqe.command_id != rhs_sqe.command_id ||
+          lhs_sqe.flags != rhs_sqe.flags ||
+          handle_value_key(lhs_sqe.function_h) !=
+            handle_value_key(rhs_sqe.function_h) ||
+          handle_value_key(lhs_sqe.target_h) !=
+            handle_value_key(rhs_sqe.target_h) ||
+          ((lhs_sqe.context_model == null) !=
+           (rhs_sqe.context_model == null)))
+        return 1'b0;
+      return lhs_sqe.context_model == null ||
+             same_body_value(lhs_sqe.context_model,
+                             rhs_sqe.context_model);
+    end
+    if (!core_body_shell_is_exact(lhs) ||
+        !core_body_shell_is_exact(rhs)) begin
+      if (profile == null)
+        return 1'b0;
+      return profile.same_command_body_value(lhs, rhs);
+    end
     lhs_value = body_value_key(lhs);
     rhs_value = body_value_key(rhs);
     if (lhs_value != "" || rhs_value != "")
       return lhs_value != "" && lhs_value == rhs_value;
-    if (profile == null)
-      return 1'b0;
-    return profile.same_command_body_value(lhs, rhs);
+    return 1'b0;
   endfunction
 
   protected function automatic void append_body_graph_nodes(
@@ -716,12 +893,13 @@ class rdma_cmq_engine extends uvm_object;
     if (body == null)
       return;
     nodes.push_back(body);
-    if ($cast(sqe, body)) begin
+    if (has_exact_object_type(body, rdma_cmq_sqe_model::get_type()) &&
+        $cast(sqe, body)) begin
       if (sqe.function_h != null) nodes.push_back(sqe.function_h);
       if (sqe.target_h != null) nodes.push_back(sqe.target_h);
-      append_body_graph_nodes(sqe.context_model, nodes);
     end
-    else if ($cast(qpc, body)) begin
+    else if (has_exact_object_type(body, rdma_qpc_model::get_type()) &&
+             $cast(qpc, body)) begin
       if (qpc.qp_h != null) nodes.push_back(qpc.qp_h);
       if (qpc.pd_h != null) nodes.push_back(qpc.pd_h);
       if (qpc.send_cq_h != null) nodes.push_back(qpc.send_cq_h);
@@ -733,30 +911,35 @@ class rdma_cmq_engine extends uvm_object;
       if ($cast(urc_ext, qpc.transport_ext) && urc_ext.queues != null)
         nodes.push_back(urc_ext.queues);
     end
-    else if ($cast(cqc, body)) begin
+    else if (has_exact_object_type(body, rdma_cqc_model::get_type()) &&
+             $cast(cqc, body)) begin
       if (cqc.cq_h != null) nodes.push_back(cqc.cq_h);
       if (cqc.ceq_h != null) nodes.push_back(cqc.ceq_h);
       if (cqc.page_layout != null) nodes.push_back(cqc.page_layout);
       if (cqc.producer != null) nodes.push_back(cqc.producer);
       if (cqc.consumer != null) nodes.push_back(cqc.consumer);
     end
-    else if ($cast(mrt, body)) begin
+    else if (has_exact_object_type(body, rdma_mrt_model::get_type()) &&
+             $cast(mrt, body)) begin
       if (mrt.mr_h != null) nodes.push_back(mrt.mr_h);
       if (mrt.pd_h != null) nodes.push_back(mrt.pd_h);
       if (mrt.page_layout != null) nodes.push_back(mrt.page_layout);
     end
-    else if ($cast(srqc, body)) begin
+    else if (has_exact_object_type(body, rdma_srqc_model::get_type()) &&
+             $cast(srqc, body)) begin
       if (srqc.srq_h != null) nodes.push_back(srqc.srq_h);
       if (srqc.pd_h != null) nodes.push_back(srqc.pd_h);
       if (srqc.producer != null) nodes.push_back(srqc.producer);
     end
-    else if ($cast(ceqc, body)) begin
+    else if (has_exact_object_type(body, rdma_ceqc_model::get_type()) &&
+             $cast(ceqc, body)) begin
       if (ceqc.ceq_h != null) nodes.push_back(ceqc.ceq_h);
       if (ceqc.page_layout != null) nodes.push_back(ceqc.page_layout);
       if (ceqc.producer != null) nodes.push_back(ceqc.producer);
       if (ceqc.consumer != null) nodes.push_back(ceqc.consumer);
     end
-    else if ($cast(aeqc, body)) begin
+    else if (has_exact_object_type(body, rdma_aeqc_model::get_type()) &&
+             $cast(aeqc, body)) begin
       if (aeqc.aeq_h != null) nodes.push_back(aeqc.aeq_h);
       if (aeqc.page_layout != null) nodes.push_back(aeqc.page_layout);
       if (aeqc.producer != null) nodes.push_back(aeqc.producer);
@@ -768,12 +951,38 @@ class rdma_cmq_engine extends uvm_object;
     rdma_hw_model source,
     rdma_hw_model snapshot
   );
+    uvm_object_wrapper source_type;
+    uvm_object_wrapper snapshot_type;
+    rdma_cmq_sqe_model source_sqe;
+    rdma_cmq_sqe_model snapshot_sqe;
     uvm_object source_nodes[$];
     uvm_object snapshot_nodes[$];
 
     if (source == null || snapshot == null)
       return 1'b0;
-    if (body_value_key(source) == "" || body_value_key(snapshot) == "") begin
+    source_type = source.get_object_type();
+    snapshot_type = snapshot.get_object_type();
+    if (source_type == null || snapshot_type == null ||
+        source_type != snapshot_type)
+      return 1'b0;
+    if (source_type == rdma_cmq_sqe_model::get_type()) begin
+      if (!$cast(source_sqe, source) || !$cast(snapshot_sqe, snapshot))
+        return 1'b0;
+      append_body_graph_nodes(source, source_nodes);
+      append_body_graph_nodes(snapshot, snapshot_nodes);
+      foreach (source_nodes[i])
+        foreach (snapshot_nodes[j])
+          if (source_nodes[i] == snapshot_nodes[j])
+            return 1'b0;
+      if ((source_sqe.context_model == null) !=
+          (snapshot_sqe.context_model == null))
+        return 1'b0;
+      return source_sqe.context_model == null ||
+             body_graph_detached(source_sqe.context_model,
+                                 snapshot_sqe.context_model);
+    end
+    if (!core_body_shell_is_exact(source) ||
+        !core_body_shell_is_exact(snapshot)) begin
       if (profile == null)
         return 1'b0;
       return profile.command_body_graph_detached(source, snapshot);
@@ -1736,6 +1945,59 @@ class rdma_cmq_engine extends uvm_object;
     return status;
   endfunction
 
+  protected function rdma_status checked_profile_body_snapshot(
+    rdma_hw_model source,
+    string label,
+    output rdma_hw_model snapshot,
+    output bit staging_invariant_failed
+  );
+    uvm_object_wrapper source_type;
+    uvm_object_wrapper snapshot_type;
+    rdma_status status;
+
+    snapshot = null;
+    if (profile == null)
+      return invalid_argument({label, " body profile is unavailable"});
+    source_type = source.get_object_type();
+    if (source_type == null)
+      return invalid_argument({label, " body dynamic type is unregistered"});
+    status = profile.snapshot_command_body(source, snapshot);
+    if (status == null) begin
+      snapshot = null;
+      staging_invariant_failed = 1'b1;
+      return snapshot_failure(
+        RDMA_SC_INVALID_STATE,
+        {label, " body profile snapshot returned null status"}
+      );
+    end
+    if (!status.ok()) begin
+      snapshot = null;
+      return status;
+    end
+    snapshot_type = (snapshot == null) ? null : snapshot.get_object_type();
+    if (snapshot == null || snapshot == source || snapshot_type == null ||
+        snapshot_type != source_type ||
+        !profile.same_command_body_value(source, snapshot) ||
+        !profile.command_body_graph_detached(source, snapshot)) begin
+      snapshot = null;
+      staging_invariant_failed = 1'b1;
+      return snapshot_failure(
+        RDMA_SC_INVALID_STATE,
+        {label, " body profile snapshot contract failed"}
+      );
+    end
+    status = snapshot.validate();
+    if (status == null || !status.ok()) begin
+      snapshot = null;
+      staging_invariant_failed = 1'b1;
+      return snapshot_failure(
+        RDMA_SC_INVALID_STATE,
+        {label, " body profile snapshot validation failed"}
+      );
+    end
+    return rdma_status::success();
+  endfunction
+
   protected function rdma_status checked_body_snapshot(
     rdma_hw_model source,
     string label,
@@ -1745,7 +2007,6 @@ class rdma_cmq_engine extends uvm_object;
   );
     rdma_status status;
     rdma_hw_model cloned_body;
-    string source_type_name;
     rdma_cmq_sqe_model source_sqe;
     rdma_cmq_sqe_model cloned_sqe;
     rdma_qpc_model source_qpc;
@@ -1773,57 +2034,34 @@ class rdma_cmq_engine extends uvm_object;
       );
     if (!status.ok())
       return status;
-    source_type_name = source.get_type_name();
-    if (!$cast(source_sqe, source)) begin
-      if ($cast(source_qpc, source))
+    if (!core_body_shell_is_exact(source))
+      return checked_profile_body_snapshot(
+        source, label, snapshot, staging_invariant_failed
+      );
+    if (!has_exact_object_type(source,
+                               rdma_cmq_sqe_model::get_type())) begin
+      if (has_exact_object_type(source, rdma_qpc_model::get_type()) &&
+          $cast(source_qpc, source))
         return checked_qpc_snapshot(
           source_qpc, label, failure_code, snapshot
         );
-      if ($cast(source_cqc, source) || $cast(source_mrt, source) ||
-          $cast(source_srqc, source) || $cast(source_ceqc, source) ||
-          $cast(source_aeqc, source))
+      if ((has_exact_object_type(source, rdma_cqc_model::get_type()) &&
+           $cast(source_cqc, source)) ||
+          (has_exact_object_type(source, rdma_mrt_model::get_type()) &&
+           $cast(source_mrt, source)) ||
+          (has_exact_object_type(source, rdma_srqc_model::get_type()) &&
+           $cast(source_srqc, source)) ||
+          (has_exact_object_type(source, rdma_ceqc_model::get_type()) &&
+           $cast(source_ceqc, source)) ||
+          (has_exact_object_type(source, rdma_aeqc_model::get_type()) &&
+           $cast(source_aeqc, source)))
         return checked_context_snapshot(
           source, label, failure_code, snapshot
         );
-      if (profile == null)
-        return snapshot_failure(
-          failure_code, {label, " body profile is unavailable"}
-        );
-      status = profile.snapshot_command_body(source, snapshot);
-      if (status == null) begin
-        snapshot = null;
-        staging_invariant_failed = 1'b1;
-        return snapshot_failure(
-          RDMA_SC_INVALID_STATE,
-          {label, " body profile snapshot returned null status"}
-        );
-      end
-      if (!status.ok()) begin
-        snapshot = null;
-        return status;
-      end
-      if (snapshot == null || snapshot == source ||
-          snapshot.get_type_name() != source_type_name ||
-          !profile.same_command_body_value(source, snapshot) ||
-          !profile.command_body_graph_detached(source, snapshot)) begin
-        snapshot = null;
-        staging_invariant_failed = 1'b1;
-        return snapshot_failure(
-          RDMA_SC_INVALID_STATE,
-          {label, " body profile snapshot contract failed"}
-        );
-      end
-      status = snapshot.validate();
-      if (status == null || !status.ok()) begin
-        snapshot = null;
-        staging_invariant_failed = 1'b1;
-        return snapshot_failure(
-          RDMA_SC_INVALID_STATE,
-          {label, " body profile snapshot validation failed"}
-        );
-      end
-      return rdma_status::success();
+      return invalid_argument({label, " body exact type is unsupported"});
     end
+    if (!$cast(source_sqe, source))
+      return invalid_argument({label, " SQE body dynamic type is invalid"});
     begin
       saved_body_value = body_value_key(source);
       saved_opcode = source_sqe.opcode;
