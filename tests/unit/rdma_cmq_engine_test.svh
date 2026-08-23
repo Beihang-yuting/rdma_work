@@ -10098,7 +10098,12 @@ class rdma_cmq_engine_test extends uvm_test;
     if (engine.published_count() != 0 || engine.retired_count() != 0 ||
         engine.cq_consumed_count() != 0 ||
         engine.tokens_in_use_count() != 0 ||
-        engine.slot_record_count() != 0)
+        engine.slot_record_count() != 0 ||
+        engine.command_registry_count() != 0 ||
+        engine.entry_registry_count() != 0 ||
+        engine.outstanding_count() != 0 ||
+        engine.quarantine_count() != 0 ||
+        engine.mapping_snapshot() != null)
       `uvm_error("CAPACITY_SHUTDOWN_RESET",
                  "shutdown did not clear slots, tokens, and counters")
 
@@ -10440,6 +10445,8 @@ class rdma_cmq_engine_test extends uvm_test;
       engine.submit(request, rejected_ticket, status);
       if (status == null || status.ok() || rejected_ticket != null)
         `uvm_error(label, "poisoned engine accepted a later submit")
+      if (i == 0 && $time < ticket.absolute_deadline)
+        #(ticket.absolute_deadline - $time);
       engine.poll(completions, diagnostics, status);
       if (status == null || status.ok() || completions.size() != 0 ||
           diagnostics.size() != 0)
@@ -10697,6 +10704,591 @@ class rdma_cmq_engine_test extends uvm_test;
     end
   endtask
 
+  task automatic check_wait_for_fifo_and_deadline();
+    rdma_cmq_engine_probe engine;
+    rdma_mock_host_mem mem;
+    rdma_cmq_test_pcie pcie;
+    rdma_doorbell_scheduler scheduler;
+    rdma_cmq_test_profile profile;
+    rdma_function_binding prepared_binding;
+    rdma_function_binding active_binding;
+    rdma_cmq cmq;
+    rdma_cmq_runtime_desc runtime_desc;
+    rdma_dma_mapping mapping;
+    rdma_cmq_command_desc requests[];
+    rdma_cmq_ticket tickets[];
+    rdma_cmq_ticket unknown_ticket;
+    rdma_status item_statuses[];
+    rdma_status batch_status;
+    rdma_cmq_completion completion;
+    rdma_cmq_completion completions[$];
+    rdma_cmq_diagnostic diagnostics[$];
+    rdma_hw_image raw_b;
+    rdma_hw_image raw_a;
+    rdma_status status;
+
+    engine = rdma_cmq_engine_probe::type_id::create("wait_fifo_engine");
+    mem = rdma_mock_host_mem::type_id::create("wait_fifo_mem");
+    pcie = rdma_cmq_test_pcie::type_id::create("wait_fifo_pcie");
+    scheduler = rdma_doorbell_scheduler::type_id::create(
+      "wait_fifo_scheduler"
+    );
+    profile = rdma_cmq_test_profile::type_id::create("wait_fifo_profile");
+    prepared_binding = make_binding("wait_fifo_prepared", RDMA_BIND_PREPARED);
+    active_binding = make_binding("wait_fifo_active", RDMA_BIND_ACTIVE);
+    cmq = make_cmq("wait_fifo_cmq", prepared_binding);
+    prepare_active("WAIT_FIFO", engine, mem, pcie, scheduler, profile,
+                   prepared_binding, active_binding, cmq, runtime_desc);
+    requests = new[2];
+    requests[0] = make_command(
+      "wait_fifo_a", active_binding,
+      rdma_cmq_test_profile::TEST_OPCODE_A, 8'h41, 20ns
+    );
+    requests[1] = make_command(
+      "wait_fifo_b", active_binding,
+      rdma_cmq_test_profile::TEST_OPCODE_B, 8'h42, 20ns
+    );
+    engine.submit_batch(requests, tickets, item_statuses, batch_status);
+    expect_status("WAIT_FIFO_SUBMIT", batch_status, RDMA_SC_OK);
+    mapping = engine.mapping_snapshot();
+    write_profile_cqe("WAIT_FIFO_B", mem, mapping, profile, 0, 1'b1,
+                      tickets[1], 0, raw_b);
+    fork
+      begin
+        #2ns;
+        write_profile_cqe("WAIT_FIFO_A", mem, mapping, profile, 1, 1'b1,
+                          tickets[0], 0, raw_a);
+      end
+    join_none
+    engine.wait_for(tickets[0], completion, status);
+    wait fork;
+    expect_status("WAIT_FIFO_WAIT_A", status, RDMA_SC_OK);
+    if (completion == null || completion.ticket == null ||
+        completion.ticket.command_id != tickets[0].command_id)
+      `uvm_error("WAIT_FIFO_WAIT_A", "wait_for did not return ticket A")
+    engine.poll(completions, diagnostics, status);
+    expect_status("WAIT_FIFO_POLL_B", status, RDMA_SC_OK);
+    if (completions.size() != 1 || completions[0].ticket == null ||
+        completions[0].ticket.command_id != tickets[1].command_id ||
+        diagnostics.size() != 0)
+      `uvm_error("WAIT_FIFO_POLL_B", "wait_for consumed queued ticket B")
+    engine.poll(completions, diagnostics, status);
+    expect_status("WAIT_FIFO_POLL_ONCE", status, RDMA_SC_OK);
+    if (completions.size() != 0 || diagnostics.size() != 0)
+      `uvm_error("WAIT_FIFO_POLL_ONCE", "completion was delivered twice")
+    engine.wait_for(tickets[1], completion, status);
+    expect_status("WAIT_FIFO_ALREADY_DELIVERED", status,
+                  RDMA_SC_INVALID_ARGUMENT);
+    if (completion != null)
+      `uvm_error("WAIT_FIFO_ALREADY_DELIVERED",
+                 "already delivered wait returned a completion")
+    unknown_ticket = rdma_cmq_ticket::type_id::create("wait_unknown_ticket");
+    unknown_ticket.copy(tickets[1]);
+    unknown_ticket.command_id += 32;
+    engine.wait_for(unknown_ticket, completion, status);
+    expect_status("WAIT_FIFO_UNKNOWN", status, RDMA_SC_INVALID_ARGUMENT);
+    if (completion != null)
+      `uvm_error("WAIT_FIFO_UNKNOWN", "unknown wait returned completion")
+    requests = new[2];
+    requests[0] = make_command(
+      "wait_fifo_c", active_binding,
+      rdma_cmq_test_profile::TEST_OPCODE_A, 8'h44, 20ns
+    );
+    requests[1] = make_command(
+      "wait_fifo_d", active_binding,
+      rdma_cmq_test_profile::TEST_OPCODE_B, 8'h45, 20ns
+    );
+    engine.submit_batch(requests, tickets, item_statuses, batch_status);
+    expect_status("WAIT_FIFO_SUBMIT_CD", batch_status, RDMA_SC_OK);
+    write_profile_cqe("WAIT_FIFO_D", mem, mapping, profile, 2, 1'b1,
+                      tickets[1], 0, raw_b);
+    fork
+      begin
+        #2ns;
+        write_profile_cqe("WAIT_FIFO_C", mem, mapping, profile, 3, 1'b1,
+                          tickets[0], 0, raw_a);
+      end
+    join_none
+    engine.wait_for(tickets[0], completion, status);
+    wait fork;
+    expect_status("WAIT_FIFO_WAIT_C", status, RDMA_SC_OK);
+    mem.calls.delete();
+    engine.wait_for(tickets[1], completion, status);
+    expect_status("WAIT_FIFO_DIRECT_D", status, RDMA_SC_OK);
+    if (completion == null || completion.ticket == null ||
+        completion.ticket.command_id != tickets[1].command_id ||
+        count_host_calls(mem, "read") != 0)
+      `uvm_error("WAIT_FIFO_DIRECT_D",
+                 "queued wait target caused a new host read")
+    engine.shutdown(status);
+    expect_status("WAIT_FIFO_SHUTDOWN", status, RDMA_SC_OK);
+
+    engine = rdma_cmq_engine_probe::type_id::create("wait_timeout_engine");
+    mem = rdma_mock_host_mem::type_id::create("wait_timeout_mem");
+    pcie = rdma_cmq_test_pcie::type_id::create("wait_timeout_pcie");
+    scheduler = rdma_doorbell_scheduler::type_id::create(
+      "wait_timeout_scheduler"
+    );
+    profile = rdma_cmq_test_profile::type_id::create("wait_timeout_profile");
+    prepared_binding = make_binding("wait_timeout_prepared",
+                                    RDMA_BIND_PREPARED);
+    active_binding = make_binding("wait_timeout_active", RDMA_BIND_ACTIVE);
+    cmq = make_cmq("wait_timeout_cmq", prepared_binding);
+    prepare_active("WAIT_TIMEOUT", engine, mem, pcie, scheduler, profile,
+                   prepared_binding, active_binding, cmq, runtime_desc);
+    requests = new[1];
+    requests[0] = make_command(
+      "wait_timeout_request", active_binding,
+      rdma_cmq_test_profile::TEST_OPCODE_A, 8'h43, 3ns
+    );
+    engine.submit_batch(requests, tickets, item_statuses, batch_status);
+    expect_status("WAIT_TIMEOUT_SUBMIT", batch_status, RDMA_SC_OK);
+    engine.wait_for(tickets[0], completion, status);
+    expect_status("WAIT_TIMEOUT_WAIT", status, RDMA_SC_OK);
+    if (completion == null || completion.status == null ||
+        completion.status.code != RDMA_SC_TIMEOUT ||
+        $time != tickets[0].absolute_deadline)
+      `uvm_error("WAIT_TIMEOUT_WAIT",
+                 "wait_for did not expire at the exact absolute deadline")
+    if (engine.outstanding_count() != 0 ||
+        engine.quarantine_count() != 1)
+      `uvm_error("WAIT_TIMEOUT_COUNTS",
+                 "detached outstanding/quarantine counts are wrong")
+    engine.wait_for(tickets[0], completion, status);
+    expect_status("WAIT_TIMEOUT_ALREADY_DELIVERED", status,
+                  RDMA_SC_INVALID_ARGUMENT);
+    engine.shutdown(status);
+    expect_status("WAIT_TIMEOUT_SHUTDOWN", status, RDMA_SC_OK);
+  endtask
+
+  task automatic check_cancel_reset_and_shutdown_lifecycle();
+    rdma_cmq_engine_probe engine;
+    rdma_mock_host_mem mem;
+    rdma_cmq_test_pcie pcie;
+    rdma_doorbell_scheduler scheduler;
+    rdma_cmq_test_profile profile;
+    rdma_function_binding prepared_binding;
+    rdma_function_binding active_binding;
+    rdma_cmq cmq;
+    rdma_cmq_runtime_desc runtime_desc;
+    rdma_dma_mapping old_mapping;
+    rdma_cmq_command_desc requests[];
+    rdma_cmq_ticket tickets[];
+    rdma_cmq_ticket published_ticket;
+    rdma_cmq_ticket reuse_ticket;
+    rdma_status item_statuses[];
+    rdma_status batch_status;
+    rdma_cmq_completion completions[$];
+    rdma_status status;
+    byte data[];
+    byte one[];
+    int unsigned release_calls;
+
+    engine = rdma_cmq_engine_probe::type_id::create("cancel_engine");
+    mem = rdma_mock_host_mem::type_id::create("cancel_mem");
+    pcie = rdma_cmq_test_pcie::type_id::create("cancel_pcie");
+    scheduler = rdma_doorbell_scheduler::type_id::create("cancel_scheduler");
+    profile = rdma_cmq_test_profile::type_id::create("cancel_profile");
+    prepared_binding = make_binding("cancel_prepared", RDMA_BIND_PREPARED);
+    active_binding = make_binding("cancel_active", RDMA_BIND_ACTIVE);
+    cmq = make_cmq("cancel_cmq", prepared_binding);
+    prepare_active("CANCEL", engine, mem, pcie, scheduler, profile,
+                   prepared_binding, active_binding, cmq, runtime_desc);
+    requests = new[2];
+    requests[0] = make_command(
+      "cancel_timeout", active_binding,
+      rdma_cmq_test_profile::TEST_OPCODE_A, 8'h51, 2ns
+    );
+    requests[1] = make_command(
+      "cancel_published", active_binding,
+      rdma_cmq_test_profile::TEST_OPCODE_B, 8'h52, 20ns
+    );
+    engine.submit_batch(requests, tickets, item_statuses, batch_status);
+    expect_status("CANCEL_SUBMIT", batch_status, RDMA_SC_OK);
+    published_ticket = tickets[1];
+    #2ns;
+    engine.expire(completions, status);
+    expect_status("CANCEL_EXPIRE", status, RDMA_SC_OK);
+    if (completions.size() != 1 || completions[0].status == null ||
+        completions[0].status.code != RDMA_SC_TIMEOUT)
+      `uvm_error("CANCEL_EXPIRE", "timeout setup did not deliver once")
+    requests = new[1];
+    requests[0] = make_command(
+      "cancel_reuse", active_binding,
+      rdma_cmq_test_profile::TEST_OPCODE_A, 8'h53, 20ns
+    );
+    engine.submit_batch(requests, tickets, item_statuses, batch_status);
+    expect_status("CANCEL_REUSE_SUBMIT", batch_status, RDMA_SC_OK);
+    reuse_ticket = tickets[0];
+    if (reuse_ticket == null || reuse_ticket.command_id[4:0] != 0 ||
+        reuse_ticket.command_id[63:5] == 0 ||
+        !engine.token_in_use_at(reuse_ticket.command_id[4:0]))
+      `uvm_error("CANCEL_REUSE_SUBMIT",
+                 "timeout token was not reused by a newer incarnation")
+    engine.cancel_generation(active_binding.generation + 1,
+                             completions, status);
+    expect_status("CANCEL_STALE", status, RDMA_SC_STALE_GENERATION);
+    if (completions.size() != 0 || engine.outstanding_count() != 2 ||
+        engine.quarantine_count() != 1 ||
+        engine.state() != RDMA_CMQ_ENGINE_ACTIVE)
+      `uvm_error("CANCEL_STALE", "stale cancel changed engine authority")
+    engine.cancel_generation(active_binding.generation,
+                             completions, status);
+    expect_status("CANCEL_CURRENT", status, RDMA_SC_OK);
+    if (completions.size() != 2)
+      `uvm_error("CANCEL_CURRENT", "cancel did not return two completions")
+    else if (completions[0] == null || completions[1] == null ||
+        completions[0].ticket == null ||
+        completions[0].status == null || completions[1].ticket == null ||
+        completions[1].status == null ||
+        completions[0].status.code != RDMA_SC_RESET_CANCELLED ||
+        completions[1].status.code != RDMA_SC_RESET_CANCELLED ||
+        completions[0].status.source_engine != RDMA_ENGINE_RESET ||
+        completions[1].status.source_engine != RDMA_ENGINE_RESET ||
+        completions[0].status.function_uid != active_binding.function_uid ||
+        completions[0].status.generation != active_binding.generation ||
+        completions[0].status.resource_id != cmq.handle.object_id ||
+        completions[0].status.command_id != completions[0].ticket.command_id ||
+        completions[1].status.command_id != completions[1].ticket.command_id ||
+        !((completions[0].ticket.command_id == reuse_ticket.command_id &&
+           completions[1].ticket.command_id == published_ticket.command_id) ||
+          (completions[1].ticket.command_id == reuse_ticket.command_id &&
+           completions[0].ticket.command_id == published_ticket.command_id)))
+      `uvm_error("CANCEL_CURRENT", "cancel completion identity is wrong")
+    if (engine.state() != RDMA_CMQ_ENGINE_QUIESCED ||
+        engine.outstanding_count() != 0 || engine.quarantine_count() != 0 ||
+        engine.published_count() != 0 || engine.retired_count() != 0 ||
+        engine.cq_consumed_count() != 0 ||
+        engine.tokens_in_use_count() != 0 ||
+        engine.slot_record_count() != 0 ||
+        engine.command_registry_count() != 0 ||
+        engine.entry_registry_count() != 0)
+      `uvm_error("CANCEL_CURRENT", "cancel did not quiesce every ledger")
+    old_mapping = engine.mapping_snapshot();
+    release_calls = count_host_calls(mem, "release");
+    engine.shutdown(status);
+    expect_status("CANCEL_QUIESCED_SHUTDOWN", status, RDMA_SC_OK);
+    expect_unconfigured("CANCEL_QUIESCED_SHUTDOWN_STATE", engine);
+    if (count_host_calls(mem, "release") != release_calls + 1)
+      `uvm_error("CANCEL_QUIESCED_SHUTDOWN",
+                 "QUIESCED shutdown did not release exactly once")
+    data = new[0];
+    status = mem.read(old_mapping, 0, 1, data);
+    if (status == null || status.ok())
+      `uvm_error("CANCEL_RESET_OLD_READ",
+                 "released mapping still accepted a read")
+    one = new[1];
+    one[0] = 8'ha5;
+    status = mem.write(old_mapping, 0, one);
+    if (status == null || status.ok())
+      `uvm_error("CANCEL_RESET_OLD_WRITE",
+                 "released mapping still accepted a write")
+    engine.shutdown(status);
+    expect_status("CANCEL_SHUTDOWN_IDEMPOTENT", status, RDMA_SC_OK);
+    if (count_host_calls(mem, "release") != release_calls + 1)
+      `uvm_error("CANCEL_SHUTDOWN_IDEMPOTENT",
+                 "idempotent shutdown released twice")
+  endtask
+
+  task automatic check_reset_fifo_retry_and_reprepare();
+    rdma_cmq_engine_probe engine;
+    rdma_mock_host_mem mem;
+    rdma_cmq_null_release_once_mem null_mem;
+    rdma_cmq_test_pcie pcie;
+    rdma_doorbell_scheduler scheduler;
+    rdma_cmq_test_profile profile;
+    rdma_function_binding prepared_binding;
+    rdma_function_binding active_binding;
+    rdma_function_binding next_prepared;
+    rdma_function_binding next_active;
+    rdma_cmq cmq;
+    rdma_cmq next_cmq;
+    rdma_cmq_runtime_desc runtime_desc;
+    rdma_dma_mapping mapping;
+    rdma_dma_mapping retained_mapping;
+    rdma_cmq_command_desc requests[];
+    rdma_cmq_ticket tickets[];
+    rdma_cmq_ticket first_ticket;
+    rdma_cmq_ticket second_ticket;
+    rdma_cmq_ticket cancel_ticket;
+    rdma_cmq_ticket next_ticket;
+    rdma_status item_statuses[];
+    rdma_status batch_status;
+    rdma_cmq_completion completion;
+    rdma_cmq_completion completions[$];
+    rdma_cmq_diagnostic diagnostics[$];
+    rdma_hw_image raw_b;
+    rdma_hw_image raw_a;
+    rdma_hw_image poison_raw;
+    rdma_status status;
+    byte data[];
+
+    engine = rdma_cmq_engine_probe::type_id::create("reset_fifo_engine");
+    mem = rdma_mock_host_mem::type_id::create("reset_fifo_mem");
+    pcie = rdma_cmq_test_pcie::type_id::create("reset_fifo_pcie");
+    scheduler = rdma_doorbell_scheduler::type_id::create(
+      "reset_fifo_scheduler"
+    );
+    profile = rdma_cmq_test_profile::type_id::create("reset_fifo_profile");
+    prepared_binding = make_binding("reset_fifo_prepared",
+                                    RDMA_BIND_PREPARED);
+    active_binding = make_binding("reset_fifo_active", RDMA_BIND_ACTIVE);
+    cmq = make_cmq("reset_fifo_cmq", prepared_binding);
+    prepare_active("RESET_FIFO", engine, mem, pcie, scheduler, profile,
+                   prepared_binding, active_binding, cmq, runtime_desc);
+    requests = new[2];
+    requests[0] = make_command(
+      "reset_fifo_a", active_binding,
+      rdma_cmq_test_profile::TEST_OPCODE_A, 8'h61, 20ns
+    );
+    requests[1] = make_command(
+      "reset_fifo_b", active_binding,
+      rdma_cmq_test_profile::TEST_OPCODE_B, 8'h62, 20ns
+    );
+    engine.submit_batch(requests, tickets, item_statuses, batch_status);
+    expect_status("RESET_FIFO_SUBMIT_AB", batch_status, RDMA_SC_OK);
+    first_ticket = tickets[0];
+    second_ticket = tickets[1];
+    mapping = engine.mapping_snapshot();
+    write_profile_cqe("RESET_FIFO_B", mem, mapping, profile, 0, 1'b1,
+                      second_ticket, 0, raw_b);
+    fork
+      begin
+        #2ns;
+        write_profile_cqe("RESET_FIFO_A", mem, mapping, profile, 1, 1'b1,
+                          first_ticket, 0, raw_a);
+      end
+    join_none
+    engine.wait_for(first_ticket, completion, status);
+    wait fork;
+    expect_status("RESET_FIFO_WAIT_A", status, RDMA_SC_OK);
+    requests = new[1];
+    requests[0] = make_command(
+      "reset_fifo_cancel", active_binding,
+      rdma_cmq_test_profile::TEST_OPCODE_A, 8'h63, 20ns
+    );
+    engine.submit_batch(requests, tickets, item_statuses, batch_status);
+    expect_status("RESET_FIFO_SUBMIT_CANCEL", batch_status, RDMA_SC_OK);
+    cancel_ticket = tickets[0];
+    engine.reset(completions, status);
+    expect_status("RESET_FIFO_RESET", status, RDMA_SC_OK);
+    expect_unconfigured("RESET_FIFO_STATE", engine);
+    if (completions.size() != 2 || completions[0].ticket == null ||
+        completions[1].ticket == null || completions[1].status == null ||
+        completions[0].ticket.command_id != second_ticket.command_id ||
+        completions[1].ticket.command_id != cancel_ticket.command_id ||
+        completions[1].status.code != RDMA_SC_RESET_CANCELLED)
+      `uvm_error("RESET_FIFO_RESET",
+                 "reset did not preserve terminal-before-cancel FIFO order")
+    data = new[0];
+    status = mem.read(mapping, 0, 1, data);
+    if (status == null || status.ok())
+      `uvm_error("RESET_FIFO_OLD_MAPPING",
+                 "successful reset left its old mapping active")
+
+    next_prepared = make_binding("reset_fifo_next_prepared",
+                                 RDMA_BIND_PREPARED);
+    next_active = make_binding("reset_fifo_next_active", RDMA_BIND_ACTIVE);
+    next_prepared.generation++;
+    next_prepared.owner_h = next_prepared.make_handle();
+    next_active.generation++;
+    next_active.owner_h = next_active.make_handle();
+    next_cmq = make_cmq("reset_fifo_next_cmq", next_prepared);
+    scheduler = rdma_doorbell_scheduler::type_id::create(
+      "reset_fifo_next_scheduler"
+    );
+    prepare_active("RESET_FIFO_NEXT", engine, mem, pcie, scheduler, profile,
+                   next_prepared, next_active, next_cmq, runtime_desc);
+    requests = new[1];
+    requests[0] = make_command(
+      "reset_fifo_next_request", next_active,
+      rdma_cmq_test_profile::TEST_OPCODE_A, 8'h64, 20ns
+    );
+    engine.submit_batch(requests, tickets, item_statuses, batch_status);
+    expect_status("RESET_FIFO_NEXT_SUBMIT", batch_status, RDMA_SC_OK);
+    next_ticket = tickets[0];
+    if (next_ticket == null ||
+        next_ticket.command_id == first_ticket.command_id ||
+        next_ticket.command_id[63:5] <= first_ticket.command_id[63:5])
+      `uvm_error("RESET_FIFO_NEXT_INCARNATION",
+                 "reset/reprepare rewound command incarnation")
+    engine.shutdown(status);
+    expect_status("RESET_FIFO_NEXT_SHUTDOWN", status, RDMA_SC_OK);
+
+    engine = rdma_cmq_engine_probe::type_id::create("reset_retry_engine");
+    mem = rdma_mock_host_mem::type_id::create("reset_retry_mem");
+    pcie = rdma_cmq_test_pcie::type_id::create("reset_retry_pcie");
+    scheduler = rdma_doorbell_scheduler::type_id::create(
+      "reset_retry_scheduler"
+    );
+    profile = rdma_cmq_test_profile::type_id::create("reset_retry_profile");
+    prepared_binding = make_binding("reset_retry_prepared",
+                                    RDMA_BIND_PREPARED);
+    active_binding = make_binding("reset_retry_active", RDMA_BIND_ACTIVE);
+    cmq = make_cmq("reset_retry_cmq", prepared_binding);
+    prepare_active("RESET_RETRY", engine, mem, pcie, scheduler, profile,
+                   prepared_binding, active_binding, cmq, runtime_desc);
+    requests = new[1];
+    requests[0] = make_command(
+      "reset_retry_request", active_binding,
+      rdma_cmq_test_profile::TEST_OPCODE_A, 8'h65, 20ns
+    );
+    engine.submit_batch(requests, tickets, item_statuses, batch_status);
+    expect_status("RESET_RETRY_SUBMIT", batch_status, RDMA_SC_OK);
+    cancel_ticket = tickets[0];
+    retained_mapping = engine.mapping_snapshot();
+    expect_status(
+      "RESET_RETRY_ARM",
+      mem.fail_next(
+        "release",
+        rdma_status::make(RDMA_SC_UNKNOWN_HW_ERROR,
+                          "injected reset release failure")
+      ),
+      RDMA_SC_OK
+    );
+    engine.reset(completions, status);
+    expect_status("RESET_RETRY_FAIL", status, RDMA_SC_UNKNOWN_HW_ERROR);
+    if (completions.size() != 0 ||
+        engine.state() != RDMA_CMQ_ENGINE_POISONED ||
+        engine.mapping_snapshot() == null ||
+        engine.terminal_fifo_count() != 1 ||
+        engine.outstanding_count() != 0 ||
+        count_host_calls(mem, "release") != 1 ||
+        mem.regions[0].mapping.state != RDMA_MAPPING_ACTIVE)
+      `uvm_error("RESET_RETRY_FAIL",
+                 "failed reset published results or lost retry authority")
+    engine.reset(completions, status);
+    expect_status("RESET_RETRY_SUCCESS", status, RDMA_SC_OK);
+    expect_unconfigured("RESET_RETRY_STATE", engine);
+    if (completions.size() != 1 || completions[0].ticket == null ||
+        completions[0].status == null ||
+        completions[0].ticket.command_id != cancel_ticket.command_id ||
+        completions[0].status.code != RDMA_SC_RESET_CANCELLED ||
+        count_host_calls(mem, "release") != 2 ||
+        mem.regions[0].mapping.state != RDMA_MAPPING_RELEASED)
+      `uvm_error("RESET_RETRY_SUCCESS",
+                 "reset retry did not deliver/release exactly once")
+
+    engine = rdma_cmq_engine_probe::type_id::create(
+      "reset_null_retry_engine"
+    );
+    null_mem = rdma_cmq_null_release_once_mem::type_id::create(
+      "reset_null_retry_mem"
+    );
+    mem = null_mem;
+    pcie = rdma_cmq_test_pcie::type_id::create("reset_null_retry_pcie");
+    scheduler = rdma_doorbell_scheduler::type_id::create(
+      "reset_null_retry_scheduler"
+    );
+    profile = rdma_cmq_test_profile::type_id::create(
+      "reset_null_retry_profile"
+    );
+    prepared_binding = make_binding("reset_null_retry_prepared",
+                                    RDMA_BIND_PREPARED);
+    active_binding = make_binding("reset_null_retry_active",
+                                  RDMA_BIND_ACTIVE);
+    cmq = make_cmq("reset_null_retry_cmq", prepared_binding);
+    prepare_active("RESET_NULL_RETRY", engine, mem, pcie, scheduler, profile,
+                   prepared_binding, active_binding, cmq, runtime_desc);
+    requests = new[1];
+    requests[0] = make_command(
+      "reset_null_retry_request", active_binding,
+      rdma_cmq_test_profile::TEST_OPCODE_A, 8'h67, 20ns
+    );
+    engine.submit_batch(requests, tickets, item_statuses, batch_status);
+    expect_status("RESET_NULL_RETRY_SUBMIT", batch_status, RDMA_SC_OK);
+    cancel_ticket = tickets[0];
+    engine.reset(completions, status);
+    expect_status("RESET_NULL_RETRY_FAIL", status, RDMA_SC_INVALID_STATE);
+    if (completions.size() != 0 ||
+        engine.state() != RDMA_CMQ_ENGINE_POISONED ||
+        engine.mapping_snapshot() == null ||
+        engine.terminal_fifo_count() != 1 ||
+        count_host_calls(mem, "release") != 1 ||
+        mem.regions[0].mapping.state != RDMA_MAPPING_ACTIVE)
+      `uvm_error("RESET_NULL_RETRY_FAIL",
+                 "null reset release lost FIFO or mapping authority")
+    engine.reset(completions, status);
+    expect_status("RESET_NULL_RETRY_SUCCESS", status, RDMA_SC_OK);
+    expect_unconfigured("RESET_NULL_RETRY_STATE", engine);
+    if (completions.size() != 1 || completions[0].ticket == null ||
+        completions[0].status == null ||
+        completions[0].ticket.command_id != cancel_ticket.command_id ||
+        completions[0].status.code != RDMA_SC_RESET_CANCELLED ||
+        count_host_calls(mem, "release") != 2 ||
+        mem.regions[0].mapping.state != RDMA_MAPPING_RELEASED)
+      `uvm_error("RESET_NULL_RETRY_SUCCESS",
+                 "null reset retry did not deliver/release exactly once")
+
+    engine = rdma_cmq_engine_probe::type_id::create("poison_reset_engine");
+    mem = rdma_mock_host_mem::type_id::create("poison_reset_mem");
+    pcie = rdma_cmq_test_pcie::type_id::create("poison_reset_pcie");
+    scheduler = rdma_doorbell_scheduler::type_id::create(
+      "poison_reset_scheduler"
+    );
+    profile = rdma_cmq_test_profile::type_id::create("poison_reset_profile");
+    prepared_binding = make_binding("poison_reset_prepared",
+                                    RDMA_BIND_PREPARED);
+    active_binding = make_binding("poison_reset_active", RDMA_BIND_ACTIVE);
+    cmq = make_cmq("poison_reset_cmq", prepared_binding);
+    prepare_active("POISON_RESET", engine, mem, pcie, scheduler, profile,
+                   prepared_binding, active_binding, cmq, runtime_desc);
+    requests = new[1];
+    requests[0] = make_command(
+      "poison_reset_request", active_binding,
+      rdma_cmq_test_profile::TEST_OPCODE_A, 8'h66, 20ns
+    );
+    engine.submit_batch(requests, tickets, item_statuses, batch_status);
+    expect_status("POISON_RESET_SUBMIT", batch_status, RDMA_SC_OK);
+    first_ticket = tickets[0];
+    mapping = engine.mapping_snapshot();
+    write_profile_cqe("POISON_RESET_CQE", mem, mapping, profile, 0, 1'b1,
+                      first_ticket, 0, poison_raw);
+    poison_raw.bytes[3] = rdma_cmq_test_profile::TEST_OPCODE_B[7:0];
+    overwrite_profile_cqe("POISON_RESET_CQE", mem, mapping, 0, poison_raw);
+    engine.poll(completions, diagnostics, status);
+    expect_status("POISON_RESET_POLL", status, RDMA_SC_CODEC_ERROR);
+    if (engine.state() != RDMA_CMQ_ENGINE_POISONED ||
+        diagnostics.size() != 1 || engine.last_poison_snapshot() == null)
+      `uvm_error("POISON_RESET_POLL", "poison setup lost raw evidence")
+    engine.reset(completions, status);
+    expect_status("POISON_RESET_RESET", status, RDMA_SC_OK);
+    expect_unconfigured("POISON_RESET_STATE", engine);
+    if (completions.size() != 1 || completions[0].ticket == null ||
+        completions[0].status == null ||
+        completions[0].ticket.command_id != first_ticket.command_id ||
+        completions[0].status.code != RDMA_SC_RESET_CANCELLED ||
+        engine.last_poison_snapshot() != null)
+      `uvm_error("POISON_RESET_RESET",
+                 "poison reset did not cancel once and clear evidence")
+    data = new[0];
+    status = mem.read(mapping, 0, 1, data);
+    if (status == null || status.ok())
+      `uvm_error("POISON_RESET_OLD_MAPPING",
+                 "poison reset left old mapping active")
+    next_prepared = make_binding("poison_reset_next_prepared",
+                                 RDMA_BIND_PREPARED);
+    next_active = make_binding("poison_reset_next_active", RDMA_BIND_ACTIVE);
+    next_prepared.generation++;
+    next_prepared.owner_h = next_prepared.make_handle();
+    next_active.generation++;
+    next_active.owner_h = next_active.make_handle();
+    next_cmq = make_cmq("poison_reset_next_cmq", next_prepared);
+    scheduler = rdma_doorbell_scheduler::type_id::create(
+      "poison_reset_next_scheduler"
+    );
+    prepare_active("POISON_RESET_NEXT", engine, mem, pcie, scheduler, profile,
+                   next_prepared, next_active, next_cmq, runtime_desc);
+    engine.poll(completions, diagnostics, status);
+    expect_status("POISON_RESET_NEXT_POLL", status, RDMA_SC_OK);
+    if (completions.size() != 0 || diagnostics.size() != 0 ||
+        engine.state() != RDMA_CMQ_ENGINE_ACTIVE)
+      `uvm_error("POISON_RESET_NEXT_POLL",
+                 "old generation CQE influenced new generation")
+    engine.shutdown(status);
+    expect_status("POISON_RESET_NEXT_SHUTDOWN", status, RDMA_SC_OK);
+  endtask
+
   virtual task run_phase(uvm_phase phase);
     phase.raise_objection(this);
     check_success_and_detachment();
@@ -10746,6 +11338,9 @@ class rdma_cmq_engine_test extends uvm_test;
     check_retirement_preflight_poison_atomicity();
     check_cqe_poison_isolation_and_snapshot_detachment();
     check_poison_shutdown_release_retry_preserves_snapshot();
+    check_wait_for_fifo_and_deadline();
+    check_cancel_reset_and_shutdown_lifecycle();
+    check_reset_fifo_retry_and_reprepare();
     check_poll_backing_out_of_order_and_owner_wrap();
     check_retire_then_wrap_publication();
     phase.drop_objection(this);

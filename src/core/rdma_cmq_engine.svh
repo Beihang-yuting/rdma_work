@@ -385,6 +385,76 @@ class rdma_cmq_engine extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  protected function rdma_status make_cancel_completion(
+    rdma_cmq_slot_record record,
+    output rdma_cmq_completion completion
+  );
+    rdma_status status;
+    rdma_cmq_ticket ticket_snapshot;
+
+    completion = null;
+    if (record == null || record.ticket == null ||
+        record.ticket.function_h == null || record.ticket.cmq_h == null)
+      return invalid_state("CMQ cancel completion authority is missing");
+    completion = rdma_cmq_completion::type_id::create(
+      "cmq_cancel_completion"
+    );
+    if (completion == null)
+      return invalid_state("CMQ cancel completion construction failed");
+    status = checked_completion_ticket_snapshot(record.ticket,
+                                                ticket_snapshot);
+    if (status == null || !status.ok()) begin
+      completion = null;
+      return (status == null) ?
+        invalid_state("CMQ cancel ticket snapshot returned null") : status;
+    end
+    completion.ticket = ticket_snapshot;
+    completion.status = rdma_status::make(
+      RDMA_SC_RESET_CANCELLED,
+      "CMQ command cancelled by generation reset"
+    );
+    if (completion.status == null) begin
+      completion = null;
+      return invalid_state("CMQ cancel status construction failed");
+    end
+    completion.status.source_engine = RDMA_ENGINE_RESET;
+    completion.status.function_uid = ticket_snapshot.function_h.function_uid;
+    completion.status.generation = ticket_snapshot.function_h.generation;
+    completion.status.resource_id = ticket_snapshot.cmq_h.object_id;
+    completion.status.command_id = ticket_snapshot.command_id;
+    completion.raw_cqe = null;
+    completion.decoded_response = null;
+    status = completion.validate();
+    if (status == null || !status.ok()) begin
+      completion = null;
+      return invalid_state("CMQ cancel completion validation failed");
+    end
+    return rdma_status::success();
+  endfunction
+
+  protected function int terminal_index(rdma_cmq_ticket ticket);
+    if (ticket == null)
+      return -1;
+    foreach (terminal_fifo[i]) begin
+      if (terminal_fifo[i] != null && terminal_fifo[i].ticket != null &&
+          same_ticket_value(terminal_fifo[i].ticket, ticket))
+        return i;
+    end
+    return -1;
+  endfunction
+
+  protected function bit ticket_is_outstanding(rdma_cmq_ticket ticket);
+    string software_key;
+
+    if (ticket == null)
+      return 1'b0;
+    software_key = command_key(ticket);
+    return command_registry.exists(software_key) &&
+           command_registry[software_key] != null &&
+           command_registry[software_key].ticket != null &&
+           same_ticket_value(command_registry[software_key].ticket, ticket);
+  endfunction
+
   protected function rdma_status make_late_diagnostic(
     rdma_cmq_slot_record record,
     rdma_hw_image raw_cqe,
@@ -657,6 +727,78 @@ class rdma_cmq_engine extends uvm_object;
       token_in_use[staged_tokens[i]] = 1'b0;
       staged_records[i].state = CMQ_SLOT_TIMED_OUT_QUARANTINED;
     end
+    return rdma_status::success();
+  endfunction
+
+  protected function rdma_status cancel_generation_locked(
+    int unsigned generation
+  );
+    rdma_status status;
+    rdma_cmq_completion staged_completions[CMQ_DEPTH];
+    int unsigned staged_count;
+
+    if (prepared_binding == null)
+      return invalid_state("CMQ generation authority is missing");
+    if (generation != prepared_binding.generation)
+      return rdma_status::make(
+        RDMA_SC_STALE_GENERATION,
+        "CMQ cancel generation does not match current generation"
+      );
+
+    staged_count = 0;
+    foreach (slots[i]) begin
+      rdma_cmq_slot_record record;
+
+      record = slots[i];
+      if (record == null)
+        continue;
+      if (record.state == CMQ_SLOT_PUBLISHED) begin
+        if (record.ticket == null || record.ticket.function_h == null ||
+            record.ticket.cmq_h == null ||
+            record.ticket.function_h.generation != generation)
+          return invalid_state("CMQ cancel slot authority is inconsistent");
+        if (record.command_token >= CMQ_DEPTH ||
+            !token_in_use[record.command_token])
+          return invalid_state("CMQ cancel token authority is inconsistent");
+        status = make_cancel_completion(
+          record, staged_completions[staged_count]
+        );
+        if (status == null || !status.ok() ||
+            staged_completions[staged_count] == null)
+          return (status == null) ?
+            invalid_state("CMQ cancel completion helper returned null") :
+            status;
+        staged_count++;
+      end
+    end
+
+    for (int unsigned i = 0; i < staged_count; i++)
+      terminal_fifo.push_back(staged_completions[i]);
+    foreach (slots[i]) begin
+      rdma_cmq_slot_record record;
+      int unsigned token_index;
+
+      record = slots[i];
+      if (record == null)
+        continue;
+      if (record.state == CMQ_SLOT_PUBLISHED) begin
+        token_index = record.command_token;
+        token_in_use[token_index] = 1'b0;
+        record.state = CMQ_SLOT_RESET_CANCELLED;
+      end
+      // A timeout tombstone already released its token.  Do not write the
+      // token bitmap for quarantine: that token may name a newer command.
+      slots[i] = null;
+    end
+    command_registry.delete();
+    entry_registry.delete();
+    publish_seq = 0;
+    retire_seq = 0;
+    cq_consume_seq = 0;
+    profile_image_format_valid = 1'b0;
+    profile_image_endian = RDMA_ENDIAN_LITTLE;
+    profile_hardware_version = 0;
+    engine_state = RDMA_CMQ_ENGINE_QUIESCED;
     return rdma_status::success();
   endfunction
 
@@ -4566,11 +4708,7 @@ class rdma_cmq_engine extends uvm_object;
     engine_lock.put(1);
   endtask
 
-  task poll(
-    output rdma_cmq_completion completions[$],
-    output rdma_cmq_diagnostic diagnostics[$],
-    output rdma_status status
-  );
+  protected task poll_locked(output rdma_status status);
     byte data[];
     rdma_status read_status;
     rdma_status inspect_status;
@@ -4594,45 +4732,24 @@ class rdma_cmq_engine extends uvm_object;
     longint unsigned ledger_used;
     longint unsigned prospective_retire_seq;
 
-    completions.delete();
-    diagnostics.delete();
     status = invalid_state("CMQ poll did not complete");
-    engine_lock.get(1);
     if (engine_state != RDMA_CMQ_ENGINE_ACTIVE) begin
       status = invalid_state("CMQ poll requires an ACTIVE engine");
-      engine_lock.put(1);
       return;
     end
     if (prepared_binding == null || backing_mapping == null ||
         host_mem == null || profile == null) begin
       status = invalid_state("CMQ ACTIVE polling authority is missing");
-      engine_lock.put(1);
       return;
     end
     status = mapping_authority_status(backing_mapping, dma_context);
-    if (!status.ok()) begin
-      engine_lock.put(1);
+    if (!status.ok())
       return;
-    end
-    status = expire_locked();
-    if (status == null)
-      status = invalid_state("CMQ expiry helper returned null status");
-    while (terminal_fifo.size() != 0)
-      completions.push_back(terminal_fifo.pop_front());
-    if (!status.ok()) begin
-      engine_lock.put(1);
-      return;
-    end
     status = poll_ledger_status(ledger_used);
-    if (!status.ok()) begin
-      engine_lock.put(1);
+    if (!status.ok())
       return;
-    end
     if (ledger_used == 0) begin
-      while (diagnostic_fifo.size() != 0)
-        diagnostics.push_back(diagnostic_fifo.pop_front());
       status = rdma_status::success();
-      engine_lock.put(1);
       return;
     end
 
@@ -4853,10 +4970,216 @@ class rdma_cmq_engine extends uvm_object;
         break;
     end
 
+  endtask
+
+  task poll(
+    output rdma_cmq_completion completions[$],
+    output rdma_cmq_diagnostic diagnostics[$],
+    output rdma_status status
+  );
+    rdma_status expiry_status;
+
+    completions.delete();
+    diagnostics.delete();
+    status = invalid_state("CMQ poll did not complete");
+    engine_lock.get(1);
+    if (engine_state != RDMA_CMQ_ENGINE_ACTIVE) begin
+      status = invalid_state("CMQ poll requires an ACTIVE engine");
+      engine_lock.put(1);
+      return;
+    end
+    expiry_status = expire_locked();
+    if (expiry_status == null)
+      status = invalid_state("CMQ expiry helper returned null status");
+    else if (!expiry_status.ok())
+      status = expiry_status;
+    else begin
+      poll_locked(status);
+    end
     while (terminal_fifo.size() != 0)
       completions.push_back(terminal_fifo.pop_front());
     while (diagnostic_fifo.size() != 0)
       diagnostics.push_back(diagnostic_fifo.pop_front());
+    engine_lock.put(1);
+  endtask
+
+  task wait_for(
+    rdma_cmq_ticket ticket,
+    output rdma_cmq_completion completion,
+    output rdma_status status
+  );
+    rdma_status validation_status;
+    rdma_status expiry_status;
+    int fifo_index;
+    time remaining;
+    time wait_time;
+
+    completion = null;
+    status = invalid_state("CMQ wait did not complete");
+    engine_lock.get(1);
+    if (engine_state != RDMA_CMQ_ENGINE_ACTIVE) begin
+      status = invalid_state("CMQ wait requires an ACTIVE engine");
+      engine_lock.put(1);
+      return;
+    end
+    if (ticket == null) begin
+      status = invalid_argument("CMQ wait ticket is null");
+      engine_lock.put(1);
+      return;
+    end
+    validation_status = ticket.validate();
+    if (validation_status == null || !validation_status.ok()) begin
+      status = invalid_argument("CMQ wait ticket is invalid");
+      engine_lock.put(1);
+      return;
+    end
+    fifo_index = terminal_index(ticket);
+    if (fifo_index < 0 && !ticket_is_outstanding(ticket)) begin
+      status = invalid_argument("CMQ wait ticket is unknown or delivered");
+      engine_lock.put(1);
+      return;
+    end
+
+    forever begin
+      fifo_index = terminal_index(ticket);
+      if (fifo_index >= 0) begin
+        completion = terminal_fifo[fifo_index];
+        terminal_fifo.delete(fifo_index);
+        status = rdma_status::success();
+        engine_lock.put(1);
+        return;
+      end
+      expiry_status = expire_locked();
+      if (expiry_status == null)
+        status = invalid_state("CMQ expiry helper returned null status");
+      else if (!expiry_status.ok())
+        status = expiry_status;
+      else begin
+        poll_locked(status);
+      end
+      fifo_index = terminal_index(ticket);
+      if (fifo_index >= 0) begin
+        completion = terminal_fifo[fifo_index];
+        terminal_fifo.delete(fifo_index);
+        status = rdma_status::success();
+        engine_lock.put(1);
+        return;
+      end
+      if (status == null || !status.ok()) begin
+        if (status == null)
+          status = invalid_state("CMQ wait helper returned null status");
+        engine_lock.put(1);
+        return;
+      end
+      if (!ticket_is_outstanding(ticket)) begin
+        status = invalid_argument("CMQ wait ticket is unknown or delivered");
+        engine_lock.put(1);
+        return;
+      end
+      if ($time >= ticket.absolute_deadline) begin
+        status = invalid_state("CMQ wait deadline produced no completion");
+        engine_lock.put(1);
+        return;
+      end
+      remaining = ticket.absolute_deadline - $time;
+      wait_time = (remaining < 1ns) ? remaining : 1ns;
+      engine_lock.put(1);
+      #(wait_time);
+      engine_lock.get(1);
+      if (engine_state != RDMA_CMQ_ENGINE_ACTIVE) begin
+        status = invalid_state("CMQ engine changed state during wait");
+        engine_lock.put(1);
+        return;
+      end
+    end
+  endtask
+
+  task cancel_generation(
+    int unsigned generation,
+    output rdma_cmq_completion completions[$],
+    output rdma_status status
+  );
+    completions.delete();
+    status = invalid_state("CMQ generation cancel did not complete");
+    engine_lock.get(1);
+    if (!(engine_state inside {
+          RDMA_CMQ_ENGINE_PREPARED,
+          RDMA_CMQ_ENGINE_ACTIVE,
+          RDMA_CMQ_ENGINE_QUIESCED,
+          RDMA_CMQ_ENGINE_POISONED
+        })) begin
+      status = invalid_state("CMQ engine state cannot be cancelled");
+      engine_lock.put(1);
+      return;
+    end
+    status = cancel_generation_locked(generation);
+    if (status != null && status.ok()) begin
+      while (terminal_fifo.size() != 0)
+        completions.push_back(terminal_fifo.pop_front());
+    end
+    if (status == null)
+      status = invalid_state("CMQ generation cancel returned null status");
+    engine_lock.put(1);
+  endtask
+
+  task reset(
+    output rdma_cmq_completion completions[$],
+    output rdma_status status
+  );
+    rdma_status release_status;
+
+    completions.delete();
+    status = invalid_state("CMQ reset did not complete");
+    engine_lock.get(1);
+    if (engine_state == RDMA_CMQ_ENGINE_UNCONFIGURED) begin
+      clear_configuration();
+      status = rdma_status::success();
+      engine_lock.put(1);
+      return;
+    end
+    if (!(engine_state inside {
+          RDMA_CMQ_ENGINE_PREPARED,
+          RDMA_CMQ_ENGINE_ACTIVE,
+          RDMA_CMQ_ENGINE_QUIESCED,
+          RDMA_CMQ_ENGINE_POISONED
+        })) begin
+      status = invalid_state("CMQ engine state cannot be reset");
+      engine_lock.put(1);
+      return;
+    end
+    if (prepared_binding != null) begin
+      status = cancel_generation_locked(prepared_binding.generation);
+      if (status == null || !status.ok()) begin
+        if (status == null)
+          status = invalid_state("CMQ reset cancellation returned null");
+        engine_lock.put(1);
+        return;
+      end
+    end
+    if (backing_mapping == null || host_mem == null) begin
+      engine_state = RDMA_CMQ_ENGINE_POISONED;
+      status = invalid_state("CMQ reset release authority is missing");
+      engine_lock.put(1);
+      return;
+    end
+    release_status = host_mem.\release (backing_mapping);
+    if (release_status == null) begin
+      engine_state = RDMA_CMQ_ENGINE_POISONED;
+      status = invalid_state("CMQ reset release returned null status");
+      engine_lock.put(1);
+      return;
+    end
+    if (!release_status.ok()) begin
+      engine_state = RDMA_CMQ_ENGINE_POISONED;
+      status = release_status;
+      engine_lock.put(1);
+      return;
+    end
+    while (terminal_fifo.size() != 0)
+      completions.push_back(terminal_fifo.pop_front());
+    clear_configuration();
+    engine_state = RDMA_CMQ_ENGINE_UNCONFIGURED;
+    status = rdma_status::success();
     engine_lock.put(1);
   endtask
 
@@ -4888,6 +5211,22 @@ class rdma_cmq_engine extends uvm_object;
     return cq_consume_seq;
   endfunction
 
+  function int unsigned outstanding_count();
+    return command_registry.num();
+  endfunction
+
+  function int unsigned quarantine_count();
+    int unsigned count;
+
+    count = 0;
+    foreach (slots[i]) begin
+      if (slots[i] != null &&
+          slots[i].state == CMQ_SLOT_TIMED_OUT_QUARANTINED)
+        count++;
+    end
+    return count;
+  endfunction
+
   function rdma_cmq_diagnostic last_poison_snapshot();
     rdma_status status;
     rdma_cmq_diagnostic snapshot;
@@ -4901,6 +5240,7 @@ class rdma_cmq_engine extends uvm_object;
   endfunction
 
   task shutdown(output rdma_status status);
+    rdma_status cancel_status;
     rdma_status release_status;
 
     status = invalid_state("CMQ shutdown did not complete");
@@ -4913,11 +5253,27 @@ class rdma_cmq_engine extends uvm_object;
     end
     if (!(engine_state inside {RDMA_CMQ_ENGINE_PREPARED,
                                RDMA_CMQ_ENGINE_ACTIVE,
+                               RDMA_CMQ_ENGINE_QUIESCED,
                                RDMA_CMQ_ENGINE_POISONED})) begin
       status = invalid_state("CMQ engine state cannot be shut down");
       engine_lock.put(1);
       return;
     end
+    if (engine_state != RDMA_CMQ_ENGINE_POISONED &&
+        prepared_binding != null) begin
+      cancel_status = cancel_generation_locked(prepared_binding.generation);
+      if (cancel_status == null || !cancel_status.ok()) begin
+        status = (cancel_status == null) ?
+          invalid_state("CMQ shutdown cancellation returned null") :
+          cancel_status;
+        engine_lock.put(1);
+        return;
+      end
+    end
+    // shutdown has no completion output; cancellation and any older
+    // undelivered results are deliberately discarded after ledger cleanup.
+    terminal_fifo.delete();
+    diagnostic_fifo.delete();
     if (backing_mapping == null || host_mem == null) begin
       retain_release_authority(backing_mapping, host_mem);
       status = invalid_state("CMQ shutdown release authority is missing");
