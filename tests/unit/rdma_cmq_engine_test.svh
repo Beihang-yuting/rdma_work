@@ -35,7 +35,8 @@ typedef enum bit [2:0] {
   RDMA_CMQ_TEST_CLONE_NULL,
   RDMA_CMQ_TEST_CLONE_SELF,
   RDMA_CMQ_TEST_CLONE_MUTATE,
-  RDMA_CMQ_TEST_CLONE_WRONG_TYPE
+  RDMA_CMQ_TEST_CLONE_WRONG_TYPE,
+  RDMA_CMQ_TEST_CLONE_ALIAS
 } rdma_cmq_test_clone_fault_e;
 
 typedef enum int unsigned {
@@ -51,10 +52,14 @@ class rdma_cmq_clone_fault_function_handle extends rdma_function_handle;
   `uvm_object_utils(rdma_cmq_clone_fault_function_handle)
 
   rdma_cmq_test_clone_fault_e clone_fault;
+  rdma_function_handle alias_target;
+  bit alias_once;
 
   function new(string name = "rdma_cmq_clone_fault_function_handle");
     super.new(name);
     clone_fault = RDMA_CMQ_TEST_CLONE_GOOD;
+    alias_target = null;
+    alias_once = 1'b0;
   endfunction
 
   virtual function uvm_object clone();
@@ -63,6 +68,13 @@ class rdma_cmq_clone_fault_function_handle extends rdma_function_handle;
       RDMA_CMQ_TEST_CLONE_SELF: return this;
       RDMA_CMQ_TEST_CLONE_WRONG_TYPE:
         return rdma_status::success("wrong Function clone type");
+      RDMA_CMQ_TEST_CLONE_ALIAS: begin
+        if (alias_once) begin
+          alias_once = 1'b0;
+          return alias_target;
+        end
+        return super.clone();
+      end
       default: return super.clone();
     endcase
   endfunction
@@ -72,8 +84,61 @@ class rdma_cmq_clone_fault_handle extends rdma_handle;
   `uvm_object_utils(rdma_cmq_clone_fault_handle)
 
   rdma_cmq_test_clone_fault_e clone_fault;
+  rdma_handle alias_target;
 
   function new(string name = "rdma_cmq_clone_fault_handle");
+    super.new(name);
+    clone_fault = RDMA_CMQ_TEST_CLONE_GOOD;
+    alias_target = null;
+  endfunction
+
+  virtual function uvm_object clone();
+    case (clone_fault)
+      RDMA_CMQ_TEST_CLONE_NULL: return null;
+      RDMA_CMQ_TEST_CLONE_SELF: return this;
+      RDMA_CMQ_TEST_CLONE_MUTATE: begin
+        object_id++;
+        return super.clone();
+      end
+      RDMA_CMQ_TEST_CLONE_WRONG_TYPE:
+        return rdma_status::success("wrong handle clone type");
+      RDMA_CMQ_TEST_CLONE_ALIAS: return alias_target;
+      default: return super.clone();
+    endcase
+  endfunction
+endclass
+
+class rdma_cmq_clone_fault_qpc extends rdma_qpc_model;
+  `uvm_object_utils(rdma_cmq_clone_fault_qpc)
+
+  rdma_cmq_test_clone_fault_e clone_fault;
+
+  function new(string name = "rdma_cmq_clone_fault_qpc");
+    super.new(name);
+    clone_fault = RDMA_CMQ_TEST_CLONE_GOOD;
+  endfunction
+
+  virtual function uvm_object clone();
+    case (clone_fault)
+      RDMA_CMQ_TEST_CLONE_NULL: return null;
+      RDMA_CMQ_TEST_CLONE_SELF: return this;
+      RDMA_CMQ_TEST_CLONE_MUTATE: begin
+        host_id++;
+        return super.clone();
+      end
+      RDMA_CMQ_TEST_CLONE_WRONG_TYPE:
+        return rdma_status::success("wrong QPC clone type");
+      default: return super.clone();
+    endcase
+  endfunction
+endclass
+
+class rdma_cmq_clone_fault_page_layout extends rdma_page_table_layout;
+  `uvm_object_utils(rdma_cmq_clone_fault_page_layout)
+
+  rdma_cmq_test_clone_fault_e clone_fault;
+
+  function new(string name = "rdma_cmq_clone_fault_page_layout");
     super.new(name);
     clone_fault = RDMA_CMQ_TEST_CLONE_GOOD;
   endfunction
@@ -83,9 +148,110 @@ class rdma_cmq_clone_fault_handle extends rdma_handle;
       RDMA_CMQ_TEST_CLONE_NULL: return null;
       RDMA_CMQ_TEST_CLONE_SELF: return this;
       RDMA_CMQ_TEST_CLONE_WRONG_TYPE:
-        return rdma_status::success("wrong handle clone type");
+        return rdma_status::success("wrong page-layout clone type");
       default: return super.clone();
     endcase
+  endfunction
+endclass
+
+class rdma_cmq_clone_fault_mr_page_layout extends rdma_mr_page_layout;
+  `uvm_object_utils(rdma_cmq_clone_fault_mr_page_layout)
+
+  rdma_cmq_test_clone_fault_e clone_fault;
+
+  function new(string name = "rdma_cmq_clone_fault_mr_page_layout");
+    super.new(name);
+    clone_fault = RDMA_CMQ_TEST_CLONE_GOOD;
+  endfunction
+
+  virtual function uvm_object clone();
+    case (clone_fault)
+      RDMA_CMQ_TEST_CLONE_NULL: return null;
+      RDMA_CMQ_TEST_CLONE_SELF: return this;
+      RDMA_CMQ_TEST_CLONE_WRONG_TYPE:
+        return rdma_status::success("wrong MR-layout clone type");
+      default: return super.clone();
+    endcase
+  endfunction
+endclass
+
+class rdma_cmq_clone_fault_ring extends rdma_ring_position;
+  `uvm_object_utils(rdma_cmq_clone_fault_ring)
+
+  rdma_cmq_test_clone_fault_e clone_fault;
+  rdma_ring_position alias_target;
+
+  function new(string name = "rdma_cmq_clone_fault_ring");
+    super.new(name);
+    clone_fault = RDMA_CMQ_TEST_CLONE_GOOD;
+    alias_target = null;
+  endfunction
+
+  virtual function uvm_object clone();
+    case (clone_fault)
+      RDMA_CMQ_TEST_CLONE_NULL: return null;
+      RDMA_CMQ_TEST_CLONE_SELF: return this;
+      RDMA_CMQ_TEST_CLONE_MUTATE: begin
+        index++;
+        return super.clone();
+      end
+      RDMA_CMQ_TEST_CLONE_WRONG_TYPE:
+        return rdma_status::success("wrong ring clone type");
+      RDMA_CMQ_TEST_CLONE_ALIAS: return alias_target;
+      default: return super.clone();
+    endcase
+  endfunction
+endclass
+
+class rdma_cmq_clone_fault_aeqc extends rdma_aeqc_model;
+  `uvm_object_utils(rdma_cmq_clone_fault_aeqc)
+
+  rdma_cmq_test_clone_fault_e clone_fault;
+
+  function new(string name = "rdma_cmq_clone_fault_aeqc");
+    super.new(name);
+    clone_fault = RDMA_CMQ_TEST_CLONE_GOOD;
+  endfunction
+
+  virtual function uvm_object clone();
+    if (clone_fault == RDMA_CMQ_TEST_CLONE_MUTATE) begin
+      vector_id++;
+      return super.clone();
+    end
+    return super.clone();
+  endfunction
+endclass
+
+class rdma_cmq_unknown_body extends rdma_hw_model;
+  `uvm_object_utils(rdma_cmq_unknown_body)
+
+  function new(string name = "rdma_cmq_unknown_body");
+    super.new(name);
+  endfunction
+
+  virtual function rdma_status validate();
+    return rdma_status::success();
+  endfunction
+
+  virtual function string describe();
+    return "unknown CMQ body";
+  endfunction
+endclass
+
+class rdma_cmq_copy_fatal_catcher extends uvm_report_catcher;
+  int unsigned caught_count;
+
+  function new(string name = "rdma_cmq_copy_fatal_catcher");
+    super.new(name);
+    caught_count = 0;
+  endfunction
+
+  virtual function action_e catch();
+    if (get_severity() == UVM_FATAL && get_id() == "RDMA_COPY_TYPE") begin
+      caught_count++;
+      return CAUGHT;
+    end
+    return THROW;
   endfunction
 endclass
 
@@ -1251,6 +1417,181 @@ class rdma_cmq_engine_test extends uvm_test;
     command.qpc_signature_source.function_generation = binding.generation;
     command.timeout = timeout_value;
     return command;
+  endfunction
+
+  function automatic rdma_handle make_context_handle(
+    string name,
+    rdma_function_binding binding,
+    rdma_resource_kind_e kind,
+    int unsigned object_id
+  );
+    rdma_handle handle;
+
+    handle = rdma_handle::type_id::create(name);
+    handle.kind = kind;
+    handle.function_uid = binding.function_uid;
+    handle.object_id = object_id;
+    handle.generation = binding.generation;
+    return handle;
+  endfunction
+
+  function automatic rdma_qpc_model make_qpc_context(
+    string name,
+    rdma_function_binding binding
+  );
+    rdma_qpc_model qpc;
+    rdma_qpc_rc_ext rc_ext;
+
+    qpc = rdma_qpc_model::type_id::create(name);
+    qpc.qp_h = make_context_handle({name, "_qp"}, binding,
+                                   RDMA_RESOURCE_QP, 32'h101);
+    qpc.pd_h = make_context_handle({name, "_pd"}, binding,
+                                   RDMA_RESOURCE_PD, 32'h202);
+    qpc.send_cq_h = make_context_handle({name, "_scq"}, binding,
+                                        RDMA_RESOURCE_CQ, 32'h303);
+    qpc.recv_cq_h = make_context_handle({name, "_rcq"}, binding,
+                                        RDMA_RESOURCE_CQ, 32'h304);
+    qpc.transport = RDMA_TRANSPORT_RC;
+    qpc.state = RDMA_QPS_RTS;
+    qpc.path_mtu_bytes = 1024;
+    qpc.sq_depth = 64;
+    qpc.rq_depth = 32;
+    qpc.sq_backing.value = 64'h0000_0000_1000_0000;
+    qpc.rq_backing.value = 64'h0000_0000_1100_0000;
+    qpc.context_backing.value = 64'h0000_0000_1200_0000;
+    rc_ext = rdma_qpc_rc_ext::type_id::create({name, "_rc_ext"});
+    rc_ext.remote_qpn = 24'h654321;
+    qpc.transport_ext = rc_ext;
+    return qpc;
+  endfunction
+
+  function automatic rdma_page_table_layout make_context_page_layout(
+    string name
+  );
+    rdma_page_table_layout layout;
+
+    layout = rdma_page_table_layout::type_id::create(name);
+    layout.mode = RDMA_OBJECT_INDIRECT_4K;
+    layout.sd_base.value = 64'h0000_0000_0100_0000;
+    layout.current_base.value = 64'h0000_0000_0200_0000;
+    layout.current_valid = 1'b1;
+    layout.next_base.value = 64'h0000_0000_0300_0000;
+    layout.next_valid = 1'b1;
+    return layout;
+  endfunction
+
+  function automatic rdma_ring_position make_context_ring(
+    string name,
+    int unsigned index
+  );
+    rdma_ring_position ring;
+
+    ring = rdma_ring_position::type_id::create(name);
+    ring.index = index;
+    return ring;
+  endfunction
+
+  function automatic rdma_cqc_model make_cqc_context(
+    string name,
+    rdma_function_binding binding
+  );
+    rdma_cqc_model cqc;
+
+    cqc = rdma_cqc_model::type_id::create(name);
+    cqc.cq_h = make_context_handle({name, "_cq"}, binding,
+                                   RDMA_RESOURCE_CQ, 32'h301);
+    cqc.ceq_h = make_context_handle({name, "_ceq"}, binding,
+                                    RDMA_RESOURCE_CEQ, 32'h701);
+    cqc.state = RDMA_CONTEXT_VALID;
+    cqc.depth = 64;
+    cqc.cqe_size_bytes = 64;
+    cqc.threshold = 8;
+    cqc.page_layout = make_context_page_layout({name, "_layout"});
+    cqc.producer = make_context_ring({name, "_producer"}, 9);
+    cqc.consumer = make_context_ring({name, "_consumer"}, 3);
+    cqc.shadow_backing.value = 64'h0000_0000_1300_0000;
+    return cqc;
+  endfunction
+
+  function automatic rdma_mrt_model make_mrt_context(
+    string name,
+    rdma_function_binding binding
+  );
+    rdma_mrt_model mrt;
+
+    mrt = rdma_mrt_model::type_id::create(name);
+    mrt.mr_h = make_context_handle({name, "_mr"}, binding,
+                                   RDMA_RESOURCE_MR, 32'h000123);
+    mrt.pd_h = make_context_handle({name, "_pd"}, binding,
+                                   RDMA_RESOURCE_PD, 32'h000202);
+    mrt.state = RDMA_CONTEXT_VALID;
+    mrt.iova.value = 64'h0000_0000_8000_0000;
+    mrt.length = 64'h2000;
+    mrt.lkey = 32'h0001_235a;
+    mrt.rkey = mrt.lkey;
+    mrt.access = '{local_write:1'b1, remote_read:1'b1,
+                   remote_write:1'b1, memory_window_bind:1'b0,
+                   remote_atomic:1'b0};
+    mrt.object_type = 2'd1;
+    mrt.page_layout.pba0.value = 64'h0000_0000_0400_0000;
+    return mrt;
+  endfunction
+
+  function automatic rdma_srqc_model make_srqc_context(
+    string name,
+    rdma_function_binding binding
+  );
+    rdma_srqc_model srqc;
+
+    srqc = rdma_srqc_model::type_id::create(name);
+    srqc.srq_h = make_context_handle({name, "_srq"}, binding,
+                                     RDMA_RESOURCE_SRQ, 32'h501);
+    srqc.pd_h = make_context_handle({name, "_pd"}, binding,
+                                    RDMA_RESOURCE_PD, 32'h202);
+    srqc.state = RDMA_CONTEXT_VALID;
+    srqc.depth = 32;
+    srqc.load_pi_threshold = 4;
+    srqc.limit_threshold = 8;
+    srqc.srfq_backing.value = 64'h0000_0000_1400_0000;
+    srqc.shadow_backing.value = 64'h0000_0000_1500_0000;
+    srqc.producer = make_context_ring({name, "_producer"}, 5);
+    return srqc;
+  endfunction
+
+  function automatic rdma_ceqc_model make_ceqc_context(
+    string name,
+    rdma_function_binding binding
+  );
+    rdma_ceqc_model ceqc;
+
+    ceqc = rdma_ceqc_model::type_id::create(name);
+    ceqc.ceq_h = make_context_handle({name, "_ceq"}, binding,
+                                     RDMA_RESOURCE_CEQ, 32'h701);
+    ceqc.state = RDMA_CONTEXT_VALID;
+    ceqc.depth = 32;
+    ceqc.vector_id = 11;
+    ceqc.page_layout = make_context_page_layout({name, "_layout"});
+    ceqc.producer = make_context_ring({name, "_producer"}, 7);
+    ceqc.consumer = make_context_ring({name, "_consumer"}, 2);
+    return ceqc;
+  endfunction
+
+  function automatic rdma_aeqc_model make_aeqc_context(
+    string name,
+    rdma_function_binding binding
+  );
+    rdma_aeqc_model aeqc;
+
+    aeqc = rdma_aeqc_model::type_id::create(name);
+    aeqc.aeq_h = make_context_handle({name, "_aeq"}, binding,
+                                     RDMA_RESOURCE_AEQ, 32'h801);
+    aeqc.state = RDMA_CONTEXT_VALID;
+    aeqc.depth = 32;
+    aeqc.vector_id = 12;
+    aeqc.page_layout = make_context_page_layout({name, "_layout"});
+    aeqc.producer = make_context_ring({name, "_producer"}, 8);
+    aeqc.consumer = make_context_ring({name, "_consumer"}, 1);
+    return aeqc;
   endfunction
 
   function automatic void clear_submit_observation(
@@ -2987,7 +3328,7 @@ class rdma_cmq_engine_test extends uvm_test;
                    prepared_binding, active_binding, cmq, runtime_desc);
     clear_submit_observation(mem, pcie, trace);
 
-    requests = new[17];
+    requests = new[18];
     foreach (requests[i])
       requests[i] = make_command(
         $sformatf("nested_clone_%0d", i), active_binding,
@@ -3130,6 +3471,26 @@ class rdma_cmq_engine_test extends uvm_test;
     fault_body.clone_fault = RDMA_CMQ_TEST_CLONE_SELF;
     source_body.context_model = fault_body;
 
+    if (!$cast(source_body, requests[17].body))
+      `uvm_fatal("NESTED_CLONE_SETUP", "source body type is invalid")
+    fault_function =
+      rdma_cmq_clone_fault_function_handle::type_id::create(
+        "nested_body_function_sibling_alias"
+      );
+    fault_function.copy(source_body.function_h);
+    fault_function.clone_fault = RDMA_CMQ_TEST_CLONE_GOOD;
+    source_body.target_h = fault_function;
+    fault_function =
+      rdma_cmq_clone_fault_function_handle::type_id::create(
+        "nested_body_function_alias_source"
+      );
+    fault_function.copy(source_body.function_h);
+    fault_function.clone_fault = RDMA_CMQ_TEST_CLONE_ALIAS;
+    fault_function.alias_once = 1'b1;
+    if (!$cast(fault_function.alias_target, source_body.target_h))
+      `uvm_fatal("NESTED_CLONE_SETUP", "alias target type is invalid")
+    source_body.function_h = fault_function;
+
     engine.submit_batch(requests, tickets, item_statuses, batch_status);
     expect_status("NESTED_CLONE_BATCH", batch_status, RDMA_SC_OK);
     if (tickets.size() != requests.size() ||
@@ -3155,6 +3516,262 @@ class rdma_cmq_engine_test extends uvm_test;
 
     engine.shutdown(status);
     expect_status("NESTED_CLONE_SHUTDOWN", status, RDMA_SC_OK);
+  endtask
+
+  task automatic check_qpc_context_snapshot_failures();
+    rdma_cmq_engine_probe engine;
+    rdma_mock_host_mem mem;
+    rdma_mock_pcie pcie;
+    rdma_mock_call_trace trace;
+    rdma_doorbell_scheduler scheduler;
+    rdma_cmq_test_profile profile;
+    rdma_function_binding prepared_binding;
+    rdma_function_binding active_binding;
+    rdma_cmq cmq;
+    rdma_cmq_runtime_desc runtime_desc;
+    rdma_cmq_command_desc requests[];
+    rdma_cmq_sqe_model outer_body;
+    rdma_qpc_model qpc;
+    rdma_cqc_model cqc;
+    rdma_mrt_model mrt;
+    rdma_srqc_model srqc;
+    rdma_ceqc_model ceqc;
+    rdma_aeqc_model aeqc;
+    rdma_cmq_clone_fault_qpc fault_qpc;
+    rdma_cmq_clone_fault_aeqc fault_aeqc;
+    rdma_cmq_clone_fault_handle fault_handle;
+    rdma_cmq_clone_fault_page_layout fault_page_layout;
+    rdma_cmq_clone_fault_mr_page_layout fault_mr_page_layout;
+    rdma_cmq_clone_fault_ring fault_ring;
+    rdma_cmq_unknown_body unknown_body;
+    rdma_cmq_copy_fatal_catcher catcher;
+    rdma_cmq_ticket tickets[];
+    rdma_status item_statuses[];
+    rdma_status batch_status;
+    rdma_status status;
+
+    engine = rdma_cmq_engine_probe::type_id::create("qpc_graph_engine");
+    mem = rdma_mock_host_mem::type_id::create("qpc_graph_mem");
+    pcie = rdma_cmq_test_pcie::type_id::create("qpc_graph_pcie");
+    trace = rdma_mock_call_trace::type_id::create("qpc_graph_trace");
+    mem.set_call_trace(trace);
+    pcie.set_call_trace(trace);
+    scheduler = rdma_doorbell_scheduler::type_id::create(
+      "qpc_graph_scheduler"
+    );
+    profile = rdma_cmq_test_profile::type_id::create("qpc_graph_profile");
+    prepared_binding = make_binding("qpc_graph_prepared",
+                                    RDMA_BIND_PREPARED);
+    active_binding = make_binding("qpc_graph_active", RDMA_BIND_ACTIVE);
+    cmq = make_cmq("qpc_graph_cmq", prepared_binding);
+    prepare_active("QPC_GRAPH", engine, mem, pcie, scheduler, profile,
+                   prepared_binding, active_binding, cmq, runtime_desc);
+    clear_submit_observation(mem, pcie, trace);
+
+    requests = new[12];
+    foreach (requests[i]) begin
+      requests[i] = make_command(
+        $sformatf("qpc_graph_%0d", i), active_binding,
+        rdma_cmq_test_profile::TEST_OPCODE_A, byte'(8'h90 + i)
+      );
+      if (!$cast(outer_body, requests[i].body))
+        `uvm_fatal("QPC_GRAPH_SETUP", "outer body type is invalid")
+      outer_body.context_model = make_qpc_context(
+        $sformatf("qpc_graph_context_%0d", i), active_binding
+      );
+    end
+
+    if (!$cast(outer_body, requests[0].body) ||
+        !$cast(qpc, outer_body.context_model))
+      `uvm_fatal("QPC_GRAPH_SETUP", "null-clone QPC is invalid")
+    fault_handle = rdma_cmq_clone_fault_handle::type_id::create(
+      "qpc_nested_null"
+    );
+    fault_handle.copy(qpc.qp_h);
+    fault_handle.clone_fault = RDMA_CMQ_TEST_CLONE_NULL;
+    qpc.qp_h = fault_handle;
+
+    if (!$cast(outer_body, requests[1].body) ||
+        !$cast(qpc, outer_body.context_model))
+      `uvm_fatal("QPC_GRAPH_SETUP", "wrong-clone QPC is invalid")
+    fault_handle = rdma_cmq_clone_fault_handle::type_id::create(
+      "qpc_nested_wrong"
+    );
+    fault_handle.copy(qpc.qp_h);
+    fault_handle.clone_fault = RDMA_CMQ_TEST_CLONE_WRONG_TYPE;
+    qpc.qp_h = fault_handle;
+
+    if (!$cast(outer_body, requests[2].body) ||
+        !$cast(qpc, outer_body.context_model))
+      `uvm_fatal("QPC_GRAPH_SETUP", "self-clone QPC is invalid")
+    fault_handle = rdma_cmq_clone_fault_handle::type_id::create(
+      "qpc_nested_self"
+    );
+    fault_handle.copy(qpc.qp_h);
+    fault_handle.clone_fault = RDMA_CMQ_TEST_CLONE_SELF;
+    qpc.qp_h = fault_handle;
+
+    if (!$cast(outer_body, requests[3].body) ||
+        !$cast(qpc, outer_body.context_model))
+      `uvm_fatal("QPC_GRAPH_SETUP", "alias-clone QPC is invalid")
+    fault_handle = rdma_cmq_clone_fault_handle::type_id::create(
+      "qpc_nested_alias"
+    );
+    fault_handle.copy(qpc.send_cq_h);
+    fault_handle.clone_fault = RDMA_CMQ_TEST_CLONE_ALIAS;
+    fault_handle.alias_target = qpc.recv_cq_h;
+    qpc.send_cq_h = fault_handle;
+
+    if (!$cast(outer_body, requests[4].body) ||
+        !$cast(qpc, outer_body.context_model))
+      `uvm_fatal("QPC_GRAPH_SETUP", "mutating QPC is invalid")
+    fault_qpc = rdma_cmq_clone_fault_qpc::type_id::create(
+      "qpc_scalar_mutate"
+    );
+    fault_qpc.copy(qpc);
+    fault_qpc.clone_fault = RDMA_CMQ_TEST_CLONE_MUTATE;
+    outer_body.context_model = fault_qpc;
+
+    if (!$cast(outer_body, requests[5].body))
+      `uvm_fatal("QPC_GRAPH_SETUP", "unknown outer body is invalid")
+    unknown_body = rdma_cmq_unknown_body::type_id::create(
+      "qpc_unknown_context"
+    );
+    outer_body.context_model = unknown_body;
+
+    if (!$cast(outer_body, requests[6].body) ||
+        !$cast(qpc, outer_body.context_model))
+      `uvm_fatal("QPC_GRAPH_SETUP", "nested-mutation QPC is invalid")
+    fault_handle = rdma_cmq_clone_fault_handle::type_id::create(
+      "qpc_nested_mutate"
+    );
+    fault_handle.copy(qpc.qp_h);
+    fault_handle.clone_fault = RDMA_CMQ_TEST_CLONE_MUTATE;
+    qpc.qp_h = fault_handle;
+
+    if (!$cast(outer_body, requests[7].body))
+      `uvm_fatal("QPC_GRAPH_SETUP", "CQC outer body is invalid")
+    cqc = make_cqc_context("cqc_nested_null", active_binding);
+    fault_page_layout =
+      rdma_cmq_clone_fault_page_layout::type_id::create(
+        "cqc_page_null"
+      );
+    fault_page_layout.copy(cqc.page_layout);
+    fault_page_layout.clone_fault = RDMA_CMQ_TEST_CLONE_NULL;
+    cqc.page_layout = fault_page_layout;
+    outer_body.context_model = cqc;
+
+    if (!$cast(outer_body, requests[8].body))
+      `uvm_fatal("QPC_GRAPH_SETUP", "MRT outer body is invalid")
+    mrt = make_mrt_context("mrt_nested_wrong", active_binding);
+    fault_mr_page_layout =
+      rdma_cmq_clone_fault_mr_page_layout::type_id::create(
+        "mrt_page_wrong"
+      );
+    fault_mr_page_layout.copy(mrt.page_layout);
+    fault_mr_page_layout.clone_fault = RDMA_CMQ_TEST_CLONE_WRONG_TYPE;
+    mrt.page_layout = fault_mr_page_layout;
+    outer_body.context_model = mrt;
+
+    if (!$cast(outer_body, requests[9].body))
+      `uvm_fatal("QPC_GRAPH_SETUP", "SRQC outer body is invalid")
+    srqc = make_srqc_context("srqc_nested_self", active_binding);
+    fault_ring = rdma_cmq_clone_fault_ring::type_id::create(
+      "srqc_producer_self"
+    );
+    fault_ring.copy(srqc.producer);
+    fault_ring.clone_fault = RDMA_CMQ_TEST_CLONE_SELF;
+    srqc.producer = fault_ring;
+    outer_body.context_model = srqc;
+
+    if (!$cast(outer_body, requests[10].body))
+      `uvm_fatal("QPC_GRAPH_SETUP", "CEQC outer body is invalid")
+    ceqc = make_ceqc_context("ceqc_nested_alias", active_binding);
+    fault_ring = rdma_cmq_clone_fault_ring::type_id::create(
+      "ceqc_producer_alias"
+    );
+    fault_ring.copy(ceqc.producer);
+    fault_ring.clone_fault = RDMA_CMQ_TEST_CLONE_ALIAS;
+    fault_ring.alias_target = ceqc.consumer;
+    ceqc.producer = fault_ring;
+    outer_body.context_model = ceqc;
+
+    if (!$cast(outer_body, requests[11].body))
+      `uvm_fatal("QPC_GRAPH_SETUP", "AEQC outer body is invalid")
+    aeqc = make_aeqc_context("aeqc_scalar_mutate", active_binding);
+    fault_aeqc = rdma_cmq_clone_fault_aeqc::type_id::create(
+      "aeqc_context_mutate"
+    );
+    fault_aeqc.copy(aeqc);
+    fault_aeqc.clone_fault = RDMA_CMQ_TEST_CLONE_MUTATE;
+    outer_body.context_model = fault_aeqc;
+
+    catcher = new("qpc_copy_fatal_catcher");
+    uvm_report_cb::add(null, catcher);
+    engine.submit_batch(requests, tickets, item_statuses, batch_status);
+    uvm_report_cb::delete(null, catcher);
+    expect_status("QPC_GRAPH_BATCH", batch_status, RDMA_SC_OK);
+    if (catcher.caught_count != 0)
+      `uvm_error("QPC_GRAPH_FATAL",
+                 $sformatf("snapshot validation reached %0d copy fatals",
+                           catcher.caught_count))
+    if (tickets.size() != requests.size() ||
+        item_statuses.size() != requests.size())
+      `uvm_error("QPC_GRAPH_ALIGNMENT", "QPC graph outputs misaligned")
+    else begin
+      foreach (requests[i]) begin
+        expect_status($sformatf("QPC_GRAPH_ITEM_%0d", i),
+                      item_statuses[i], RDMA_SC_INVALID_ARGUMENT);
+        if (tickets[i] != null)
+          `uvm_error("QPC_GRAPH_TICKET",
+                     $sformatf("QPC graph item %0d returned a ticket", i))
+      end
+    end
+    expect_no_submit_side_effects("QPC_GRAPH_EFFECTS", mem, pcie, trace);
+
+    requests = new[6];
+    foreach (requests[i]) begin
+      requests[i] = make_command(
+        $sformatf("context_valid_%0d", i), active_binding,
+        rdma_cmq_test_profile::TEST_OPCODE_A, byte'(8'hb0 + i)
+      );
+      if (!$cast(outer_body, requests[i].body))
+        `uvm_fatal("QPC_GRAPH_SETUP", "valid outer body is invalid")
+      case (i)
+        0: outer_body.context_model =
+             make_qpc_context("context_valid_qpc", active_binding);
+        1: outer_body.context_model =
+             make_cqc_context("context_valid_cqc", active_binding);
+        2: outer_body.context_model =
+             make_mrt_context("context_valid_mrt", active_binding);
+        3: outer_body.context_model =
+             make_srqc_context("context_valid_srqc", active_binding);
+        4: outer_body.context_model =
+             make_ceqc_context("context_valid_ceqc", active_binding);
+        5: outer_body.context_model =
+             make_aeqc_context("context_valid_aeqc", active_binding);
+        default: begin
+        end
+      endcase
+    end
+    engine.submit_batch(requests, tickets, item_statuses, batch_status);
+    expect_status("CONTEXT_VALID_BATCH", batch_status, RDMA_SC_OK);
+    if (tickets.size() != requests.size() ||
+        item_statuses.size() != requests.size())
+      `uvm_error("CONTEXT_VALID_ALIGNMENT",
+                 "valid context outputs misaligned")
+    else begin
+      foreach (requests[i]) begin
+        expect_status($sformatf("CONTEXT_VALID_ITEM_%0d", i),
+                      item_statuses[i], RDMA_SC_OK);
+        if (tickets[i] == null)
+          `uvm_error("CONTEXT_VALID_TICKET",
+                     $sformatf("valid context item %0d lacks a ticket", i))
+      end
+    end
+
+    engine.shutdown(status);
+    expect_status("QPC_GRAPH_SHUTDOWN", status, RDMA_SC_OK);
   endtask
 
   task automatic check_null_compose_transaction_abort();
@@ -4030,6 +4647,7 @@ class rdma_cmq_engine_test extends uvm_test;
     check_submit_wrapper_and_snapshot_detachment();
     check_null_compose_transaction_abort();
     check_nested_command_snapshot_failures();
+    check_qpc_context_snapshot_failures();
     check_transaction_failure_atomicity();
     check_submission_validation_and_profile_metadata();
     check_internal_invariant_batch_abort();

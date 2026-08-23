@@ -1,3 +1,86 @@
+typedef enum bit [2:0] {
+  RDMA_XTR_SNAPSHOT_CLONE_GOOD,
+  RDMA_XTR_SNAPSHOT_CLONE_NULL,
+  RDMA_XTR_SNAPSHOT_CLONE_SELF,
+  RDMA_XTR_SNAPSHOT_CLONE_MUTATE,
+  RDMA_XTR_SNAPSHOT_CLONE_WRONG,
+  RDMA_XTR_SNAPSHOT_CLONE_ALIAS
+} rdma_xtr_snapshot_clone_fault_e;
+
+class rdma_xtr_v1_snapshot_fault_handle extends rdma_handle;
+  `uvm_object_utils(rdma_xtr_v1_snapshot_fault_handle)
+
+  rdma_xtr_snapshot_clone_fault_e clone_fault;
+  rdma_handle alias_target;
+
+  function new(string name = "rdma_xtr_v1_snapshot_fault_handle");
+    super.new(name);
+    clone_fault = RDMA_XTR_SNAPSHOT_CLONE_GOOD;
+    alias_target = null;
+  endfunction
+
+  virtual function uvm_object clone();
+    case (clone_fault)
+      RDMA_XTR_SNAPSHOT_CLONE_NULL: return null;
+      RDMA_XTR_SNAPSHOT_CLONE_SELF: return this;
+      RDMA_XTR_SNAPSHOT_CLONE_MUTATE: begin
+        object_id++;
+        return super.clone();
+      end
+      RDMA_XTR_SNAPSHOT_CLONE_WRONG:
+        return rdma_status::success("wrong XTR handle clone type");
+      RDMA_XTR_SNAPSHOT_CLONE_ALIAS: return alias_target;
+      default: return super.clone();
+    endcase
+  endfunction
+endclass
+
+class rdma_xtr_v1_snapshot_mutating_occ extends rdma_xtr_v1_occ_flush_body;
+  `uvm_object_utils(rdma_xtr_v1_snapshot_mutating_occ)
+
+  function new(string name = "rdma_xtr_v1_snapshot_mutating_occ");
+    super.new(name);
+  endfunction
+
+  virtual function uvm_object clone();
+    qpn++;
+    return super.clone();
+  endfunction
+endclass
+
+class rdma_xtr_v1_snapshot_unknown_body extends rdma_hw_model;
+  `uvm_object_utils(rdma_xtr_v1_snapshot_unknown_body)
+
+  function new(string name = "rdma_xtr_v1_snapshot_unknown_body");
+    super.new(name);
+  endfunction
+
+  virtual function rdma_status validate();
+    return rdma_status::success();
+  endfunction
+
+  virtual function string describe();
+    return "unknown XTR body";
+  endfunction
+endclass
+
+class rdma_xtr_v1_snapshot_copy_catcher extends uvm_report_catcher;
+  int unsigned caught_count;
+
+  function new(string name = "rdma_xtr_v1_snapshot_copy_catcher");
+    super.new(name);
+    caught_count = 0;
+  endfunction
+
+  virtual function action_e catch();
+    if (get_severity() == UVM_FATAL && get_id() == "RDMA_COPY_TYPE") begin
+      caught_count++;
+      return CAUGHT;
+    end
+    return THROW;
+  endfunction
+endclass
+
 class rdma_xtr_v1_cmq_profile_probe
     extends rdma_xtr_v1_cmq_hw_profile;
   `uvm_object_utils(rdma_xtr_v1_cmq_profile_probe)
@@ -470,6 +553,143 @@ class rdma_xtr_v1_cmq_profile_test extends uvm_test;
       `uvm_error("COMPOSE_TARGET_OVERFLOW", "failure published outputs")
   endfunction
 
+  function automatic void check_body_snapshot_contract();
+    rdma_xtr_v1_cmq_hw_profile profile;
+    rdma_hw_model bodies[5];
+    rdma_hw_model snapshot;
+    rdma_xtr_v1_qpc_command_body qpc_body;
+    rdma_xtr_v1_object_id_command_body object_body;
+    rdma_xtr_v1_mr_deregister_body mr_body;
+    rdma_xtr_v1_occ_flush_body occ_body;
+    rdma_xtr_v1_cmq_empty_body empty_body;
+    rdma_xtr_v1_snapshot_fault_handle fault_handle;
+    rdma_xtr_v1_snapshot_mutating_occ mutating_occ;
+    rdma_xtr_v1_snapshot_unknown_body unknown_body;
+    rdma_xtr_v1_snapshot_copy_catcher catcher;
+    rdma_status status;
+
+    profile = rdma_xtr_v1_cmq_hw_profile::type_id::create(
+      "snapshot_profile"
+    );
+    qpc_body = rdma_xtr_v1_qpc_command_body::type_id::create(
+      "snapshot_qpc"
+    );
+    qpc_body.qp_h = make_handle("snapshot_qp", RDMA_RESOURCE_QP,
+                                24'h123456);
+    qpc_body.send_cq_h = make_handle("snapshot_scq", RDMA_RESOURCE_CQ,
+                                     20'h34567);
+    qpc_body.recv_cq_h = make_handle("snapshot_rcq", RDMA_RESOURCE_CQ,
+                                     20'h34568);
+    qpc_body.qpc_buffer.value = 64'h0000_0000_1000_0000;
+    qpc_body.next_state = RDMA_QPS_RTS;
+    qpc_body.partial_modify = 1'b1;
+    qpc_body.wbe_template_count = 2;
+    foreach (qpc_body.modify_start_qword[i]) begin
+      qpc_body.modify_start_qword[i] = i;
+      qpc_body.modify_wbe[i] = byte'(8'h11 << i);
+      qpc_body.modify_data[i] = 64'h1000 + i;
+    end
+    object_body = rdma_xtr_v1_object_id_command_body::type_id::create(
+      "snapshot_object"
+    );
+    object_body.object_h = make_handle("snapshot_object_h",
+                                       RDMA_RESOURCE_CQ, 20'h45678);
+    mr_body = rdma_xtr_v1_mr_deregister_body::type_id::create(
+      "snapshot_mr"
+    );
+    mr_body.mr_h = make_handle("snapshot_mr_h", RDMA_RESOURCE_MR,
+                               24'h56789a);
+    mr_body.stag_key = 8'ha5;
+    mr_body.next_state = RDMA_CONTEXT_INVALID;
+    occ_body = rdma_xtr_v1_occ_flush_body::type_id::create("snapshot_occ");
+    occ_body.vf_flush = 1'b1;
+    occ_body.qpc = 1'b1;
+    occ_body.cqc = 1'b1;
+    occ_body.mrt = 1'b1;
+    occ_body.pble = 1'b1;
+    occ_body.sqrqe = 1'b1;
+    occ_body.sgb_irqe = 1'b1;
+    occ_body.eirqe = 1'b1;
+    occ_body.orqe = 1'b1;
+    occ_body.uaqe = 1'b1;
+    empty_body = rdma_xtr_v1_cmq_empty_body::type_id::create(
+      "snapshot_empty"
+    );
+    bodies = '{qpc_body, object_body, mr_body, occ_body, empty_body};
+    foreach (bodies[i]) begin
+      snapshot = null;
+      status = profile.snapshot_command_body(bodies[i], snapshot);
+      expect_status($sformatf("BODY_SNAPSHOT_VALID_%0d", i), status,
+                    RDMA_SC_OK);
+      if (snapshot == null || snapshot == bodies[i] ||
+          !profile.same_command_body_value(bodies[i], snapshot) ||
+          !profile.command_body_graph_detached(bodies[i], snapshot))
+        `uvm_error("BODY_SNAPSHOT_VALID",
+                   $sformatf("valid body %0d snapshot is not detached", i))
+    end
+
+    catcher = new("snapshot_copy_catcher");
+    uvm_report_cb::add(null, catcher);
+    for (int unsigned fault = RDMA_XTR_SNAPSHOT_CLONE_NULL;
+         fault <= RDMA_XTR_SNAPSHOT_CLONE_WRONG; fault++) begin
+      qpc_body = rdma_xtr_v1_qpc_command_body::type_id::create(
+        $sformatf("fault_qpc_%0d", fault)
+      );
+      fault_handle = rdma_xtr_v1_snapshot_fault_handle::type_id::create(
+        $sformatf("fault_qp_%0d", fault)
+      );
+      fault_handle.copy(make_handle("fault_qp_source", RDMA_RESOURCE_QP,
+                                    24'h123456));
+      fault_handle.clone_fault = rdma_xtr_snapshot_clone_fault_e'(fault);
+      qpc_body.qp_h = fault_handle;
+      snapshot = null;
+      status = profile.snapshot_command_body(qpc_body, snapshot);
+      expect_status($sformatf("BODY_SNAPSHOT_FAULT_%0d", fault), status,
+                    RDMA_SC_INVALID_ARGUMENT);
+      if (snapshot != null)
+        `uvm_error("BODY_SNAPSHOT_FAULT", "failure published a snapshot")
+    end
+    qpc_body = rdma_xtr_v1_qpc_command_body::type_id::create(
+      "fault_qpc_alias"
+    );
+    qpc_body.recv_cq_h = make_handle("fault_alias_target",
+                                     RDMA_RESOURCE_CQ, 20'h12345);
+    fault_handle = rdma_xtr_v1_snapshot_fault_handle::type_id::create(
+      "fault_alias_source"
+    );
+    fault_handle.copy(qpc_body.recv_cq_h);
+    fault_handle.clone_fault = RDMA_XTR_SNAPSHOT_CLONE_ALIAS;
+    fault_handle.alias_target = qpc_body.recv_cq_h;
+    qpc_body.qp_h = make_handle("fault_alias_qp", RDMA_RESOURCE_QP,
+                                24'h123456);
+    qpc_body.send_cq_h = fault_handle;
+    snapshot = null;
+    status = profile.snapshot_command_body(qpc_body, snapshot);
+    expect_status("BODY_SNAPSHOT_ALIAS", status, RDMA_SC_INVALID_ARGUMENT);
+
+    mutating_occ = rdma_xtr_v1_snapshot_mutating_occ::type_id::create(
+      "snapshot_mutating_occ"
+    );
+    mutating_occ.mr_serial_flush = 1'b1;
+    mutating_occ.pble = 1'b1;
+    snapshot = null;
+    status = profile.snapshot_command_body(mutating_occ, snapshot);
+    expect_status("BODY_SNAPSHOT_MUTATING_BODY", status,
+                  RDMA_SC_INVALID_ARGUMENT);
+    unknown_body = rdma_xtr_v1_snapshot_unknown_body::type_id::create(
+      "snapshot_unknown"
+    );
+    snapshot = null;
+    status = profile.snapshot_command_body(unknown_body, snapshot);
+    expect_status("BODY_SNAPSHOT_UNKNOWN", status,
+                  RDMA_SC_INVALID_ARGUMENT);
+    uvm_report_cb::delete(null, catcher);
+    if (catcher.caught_count != 0)
+      `uvm_error("BODY_SNAPSHOT_FATAL",
+                 $sformatf("body preflight reached %0d copy fatals",
+                           catcher.caught_count))
+  endfunction
+
   function automatic void check_compose_generation_policy();
     rdma_xtr_v1_cmq_hw_profile profile;
     rdma_function_handle function_h;
@@ -861,6 +1081,7 @@ class rdma_xtr_v1_cmq_profile_test extends uvm_test;
   virtual task run_phase(uvm_phase phase);
     phase.raise_objection(this);
     check_profile_validation();
+    check_body_snapshot_contract();
     check_compose_sqe();
     check_compose_generation_policy();
     check_inspect_cqe();

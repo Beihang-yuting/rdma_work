@@ -37,6 +37,284 @@ class rdma_xtr_v1_cmq_hw_profile extends rdma_cmq_hw_profile;
     return rdma_status::make(RDMA_SC_INVALID_STATE, message);
   endfunction
 
+  protected function string command_handle_value_key(rdma_handle handle);
+    if (handle == null)
+      return "<null-handle>";
+    return $sformatf("%0d:%016h:%08h:%08h", handle.kind,
+                     handle.function_uid, handle.object_id,
+                     handle.generation);
+  endfunction
+
+  protected function string command_body_value_key(rdma_hw_model body);
+    rdma_xtr_v1_qpc_command_body qpc_body;
+    rdma_xtr_v1_object_id_command_body object_body;
+    rdma_xtr_v1_mr_deregister_body mr_body;
+    rdma_xtr_v1_occ_flush_body occ_body;
+    rdma_xtr_v1_cmq_empty_body empty_body;
+    string result;
+
+    if (body == null)
+      return "<null-body>";
+    if ($cast(qpc_body, body)) begin
+      result = $sformatf(
+        "qpc:%s:%s:%s:%016h:%0d:%0b:%0b:%0h",
+        command_handle_value_key(qpc_body.qp_h),
+        command_handle_value_key(qpc_body.send_cq_h),
+        command_handle_value_key(qpc_body.recv_cq_h),
+        qpc_body.qpc_buffer.value, qpc_body.next_state,
+        qpc_body.full_modify, qpc_body.partial_modify,
+        qpc_body.wbe_template_count
+      );
+      foreach (qpc_body.modify_start_qword[i])
+        result = {result,
+                  $sformatf(":%02h:%02h:%016h",
+                            qpc_body.modify_start_qword[i],
+                            qpc_body.modify_wbe[i],
+                            qpc_body.modify_data[i])};
+      return result;
+    end
+    if ($cast(object_body, body))
+      return {"object:", command_handle_value_key(object_body.object_h)};
+    if ($cast(mr_body, body))
+      return $sformatf("mr:%s:%02h:%0d",
+                       command_handle_value_key(mr_body.mr_h),
+                       mr_body.stag_key, mr_body.next_state);
+    if ($cast(occ_body, body))
+      return $sformatf(
+        "occ:%0b:%0b:%0b:%0b:%0b:%0b:%0b:%0b:%0b:%0b:%0b:%0b:%06h:%03h:%016h",
+        occ_body.vf_flush, occ_body.mr_serial_flush, occ_body.qpc,
+        occ_body.cqc, occ_body.mrt, occ_body.pble, occ_body.sqrqe,
+        occ_body.sgb_irqe, occ_body.eirqe, occ_body.orqe, occ_body.uaqe,
+        occ_body.pd, occ_body.qpn, occ_body.mr_serial,
+        occ_body.pd_backing.value
+      );
+    if ($cast(empty_body, body))
+      return "empty";
+    return "";
+  endfunction
+
+  protected function void append_command_body_nodes(
+    rdma_hw_model body,
+    ref uvm_object nodes[$]
+  );
+    rdma_xtr_v1_qpc_command_body qpc_body;
+    rdma_xtr_v1_object_id_command_body object_body;
+    rdma_xtr_v1_mr_deregister_body mr_body;
+
+    if (body == null)
+      return;
+    nodes.push_back(body);
+    if ($cast(qpc_body, body)) begin
+      if (qpc_body.qp_h != null) nodes.push_back(qpc_body.qp_h);
+      if (qpc_body.send_cq_h != null) nodes.push_back(qpc_body.send_cq_h);
+      if (qpc_body.recv_cq_h != null) nodes.push_back(qpc_body.recv_cq_h);
+    end
+    else if ($cast(object_body, body)) begin
+      if (object_body.object_h != null) nodes.push_back(object_body.object_h);
+    end
+    else if ($cast(mr_body, body)) begin
+      if (mr_body.mr_h != null) nodes.push_back(mr_body.mr_h);
+    end
+  endfunction
+
+  virtual function bit same_command_body_value(
+    rdma_hw_model lhs,
+    rdma_hw_model rhs
+  );
+    string lhs_value;
+    string rhs_value;
+
+    if (lhs == null || rhs == null ||
+        lhs.get_type_name() != rhs.get_type_name())
+      return 1'b0;
+    lhs_value = command_body_value_key(lhs);
+    rhs_value = command_body_value_key(rhs);
+    return lhs_value != "" && lhs_value == rhs_value;
+  endfunction
+
+  virtual function bit command_body_graph_detached(
+    rdma_hw_model source,
+    rdma_hw_model snapshot
+  );
+    uvm_object source_nodes[$];
+    uvm_object snapshot_nodes[$];
+
+    if (source == null || snapshot == null ||
+        command_body_value_key(source) == "" ||
+        command_body_value_key(snapshot) == "")
+      return 1'b0;
+    append_command_body_nodes(source, source_nodes);
+    append_command_body_nodes(snapshot, snapshot_nodes);
+    foreach (source_nodes[i])
+      foreach (snapshot_nodes[j])
+        if (source_nodes[i] == snapshot_nodes[j])
+          return 1'b0;
+    return 1'b1;
+  endfunction
+
+  protected function rdma_status checked_command_handle_snapshot(
+    rdma_handle source,
+    string label,
+    output rdma_handle snapshot
+  );
+    uvm_object cloned_object;
+    string source_type_name;
+    rdma_resource_kind_e saved_kind;
+    longint unsigned saved_function_uid;
+    int unsigned saved_object_id;
+    int unsigned saved_generation;
+
+    snapshot = null;
+    if (source == null)
+      return invalid_argument({label, " handle is null"});
+    source_type_name = source.get_type_name();
+    saved_kind = source.kind;
+    saved_function_uid = source.function_uid;
+    saved_object_id = source.object_id;
+    saved_generation = source.generation;
+    cloned_object = source.clone();
+    if (cloned_object == null || !$cast(snapshot, cloned_object) ||
+        snapshot == source || snapshot.get_type_name() != source_type_name) begin
+      snapshot = null;
+      return invalid_argument({label, " handle clone contract failed"});
+    end
+    if (source.kind != saved_kind ||
+        source.function_uid != saved_function_uid ||
+        source.object_id != saved_object_id ||
+        source.generation != saved_generation ||
+        snapshot.kind != saved_kind ||
+        snapshot.function_uid != saved_function_uid ||
+        snapshot.object_id != saved_object_id ||
+        snapshot.generation != saved_generation) begin
+      snapshot = null;
+      return invalid_argument({label, " handle clone changed its value"});
+    end
+    return rdma_status::success();
+  endfunction
+
+  virtual function rdma_status snapshot_command_body(
+    rdma_hw_model source,
+    output rdma_hw_model snapshot
+  );
+    uvm_object cloned_object;
+    rdma_status status;
+    rdma_xtr_v1_qpc_command_body source_qpc;
+    rdma_xtr_v1_qpc_command_body snapshot_qpc;
+    rdma_xtr_v1_object_id_command_body source_object;
+    rdma_xtr_v1_object_id_command_body snapshot_object;
+    rdma_xtr_v1_mr_deregister_body source_mr;
+    rdma_xtr_v1_mr_deregister_body snapshot_mr;
+    rdma_xtr_v1_occ_flush_body source_occ;
+    rdma_xtr_v1_cmq_empty_body source_empty;
+    rdma_handle handle0_snapshot;
+    rdma_handle handle1_snapshot;
+    rdma_handle handle2_snapshot;
+    string source_type_name;
+    string saved_value;
+
+    snapshot = null;
+    if (source == null)
+      return invalid_argument("xtr_v1 CMQ command body is null");
+    source_type_name = source.get_type_name();
+    saved_value = command_body_value_key(source);
+    if (saved_value == "" ||
+        !($cast(source_qpc, source) || $cast(source_object, source) ||
+          $cast(source_mr, source) || $cast(source_occ, source) ||
+          $cast(source_empty, source)))
+      return invalid_argument({"xtr_v1 CMQ command body type is unsupported: ",
+                               source_type_name});
+    status = source.validate();
+    if (status == null)
+      return invalid_argument("xtr_v1 CMQ body validation returned null");
+    if (!status.ok())
+      return status;
+    handle0_snapshot = null;
+    handle1_snapshot = null;
+    handle2_snapshot = null;
+    if (source_qpc != null) begin
+      status = checked_command_handle_snapshot(
+        source_qpc.qp_h, "xtr_v1 QPC command QP", handle0_snapshot
+      );
+      if (!status.ok()) return status;
+      if (source_qpc.send_cq_h != null) begin
+        status = checked_command_handle_snapshot(
+          source_qpc.send_cq_h, "xtr_v1 QPC command send CQ",
+          handle1_snapshot
+        );
+        if (!status.ok()) return status;
+      end
+      if (source_qpc.recv_cq_h != null) begin
+        status = checked_command_handle_snapshot(
+          source_qpc.recv_cq_h, "xtr_v1 QPC command receive CQ",
+          handle2_snapshot
+        );
+        if (!status.ok()) return status;
+      end
+    end
+    else if (source_object != null) begin
+      status = checked_command_handle_snapshot(
+        source_object.object_h, "xtr_v1 object-ID command",
+        handle0_snapshot
+      );
+      if (!status.ok()) return status;
+    end
+    else if (source_mr != null) begin
+      status = checked_command_handle_snapshot(
+        source_mr.mr_h, "xtr_v1 MR deregister", handle0_snapshot
+      );
+      if (!status.ok()) return status;
+    end
+    cloned_object = source.clone();
+    if (cloned_object == null || !$cast(snapshot, cloned_object) ||
+        snapshot == source || snapshot.get_type_name() != source_type_name) begin
+      snapshot = null;
+      return invalid_argument("xtr_v1 CMQ body clone contract failed");
+    end
+    if (command_body_value_key(source) != saved_value ||
+        command_body_value_key(snapshot) != saved_value ||
+        !command_body_graph_detached(source, snapshot)) begin
+      snapshot = null;
+      return invalid_argument("xtr_v1 CMQ body clone changed its value");
+    end
+    if (source_qpc != null) begin
+      if (!$cast(snapshot_qpc, snapshot)) begin
+        snapshot = null;
+        return invalid_argument("xtr_v1 QPC body snapshot type is invalid");
+      end
+      snapshot_qpc.qp_h = handle0_snapshot;
+      snapshot_qpc.send_cq_h = handle1_snapshot;
+      snapshot_qpc.recv_cq_h = handle2_snapshot;
+    end
+    else if (source_object != null) begin
+      if (!$cast(snapshot_object, snapshot)) begin
+        snapshot = null;
+        return invalid_argument(
+          "xtr_v1 object-ID body snapshot type is invalid"
+        );
+      end
+      snapshot_object.object_h = handle0_snapshot;
+    end
+    else if (source_mr != null) begin
+      if (!$cast(snapshot_mr, snapshot)) begin
+        snapshot = null;
+        return invalid_argument("xtr_v1 MR body snapshot type is invalid");
+      end
+      snapshot_mr.mr_h = handle0_snapshot;
+    end
+    if (!command_body_graph_detached(source, snapshot)) begin
+      snapshot = null;
+      return invalid_argument("xtr_v1 CMQ body snapshot aliases its source");
+    end
+    status = snapshot.validate();
+    if (status == null) begin
+      snapshot = null;
+      return invalid_argument("xtr_v1 CMQ snapshot validation returned null");
+    end
+    if (!status.ok())
+      snapshot = null;
+    return status;
+  endfunction
+
   protected function rdma_codec_key doorbell_key(string variant);
     rdma_codec_key key;
     key.hw_version = "xtr_v1";
