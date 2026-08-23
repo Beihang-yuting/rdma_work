@@ -258,6 +258,10 @@ class rdma_xtr_v1_doorbell_codec_test extends uvm_test;
     rdma_xtr_v1_golden_case golden;
     rdma_xtr_v1_golden_case sqe;
     rdma_xtr_v1_doorbell_codec_registry registry;
+    rdma_xtr_v1_doorbell_codec_registry collision_registry;
+    rdma_codec_registry_test_codec collision_codec;
+    rdma_codec_duplicate_catcher collision_catcher;
+    rdma_codec_key collision_key;
     rdma_xtr_v1_doorbell_model_base model;
     rdma_xtr_v1_doorbell_model_base decoded_doorbell;
     rdma_xtr_v1_wrong_doorbell_model wrong;
@@ -275,6 +279,8 @@ class rdma_xtr_v1_doorbell_codec_test extends uvm_test;
     rdma_status status;
     string error;
     string keys[$];
+    string keys_before[$];
+    string keys_after[$];
     bit equal;
     string mismatch;
 
@@ -459,6 +465,45 @@ class rdma_xtr_v1_doorbell_codec_test extends uvm_test;
     registry.list_keys(keys);
     if (keys.size() != 13)
       `uvm_error("KEYS", "duplicate registration changed the registry")
+
+    // clear() is polymorphic registry state reset: the specialized
+    // registration guard must reset with the base key table.
+    registry.clear();
+    registry.list_keys(keys);
+    if (keys.size() != 0)
+      `uvm_error("CLEAR_DEFAULTS", "specialized clear retained codec keys")
+    expect_ok("REREGISTER_AFTER_CLEAR", registry.register_defaults());
+    registry.list_keys(keys);
+    if (keys.size() != 13)
+      `uvm_error("REREGISTER_AFTER_CLEAR",
+                 "clear followed by defaults did not restore all keys")
+
+    // Defaults are transactional. A collision at the final key must be
+    // detected before inserting any preceding default, preserving the exact
+    // original key set.
+    collision_registry =
+      rdma_xtr_v1_doorbell_codec_registry::type_id::create(
+        "collision_registry"
+      );
+    collision_codec = new("collision_codec", RDMA_ENDIAN_BIG);
+    collision_key = '{hw_version:"xtr_v1",
+                      image_kind:RDMA_IMAGE_DOORBELL,
+                      object_type:"doorbell", variant:"tx_flush",
+                      opcode:8'h00};
+    expect_ok("ARM_LATE_COLLISION",
+              collision_registry.register_codec(collision_key,
+                                                collision_codec));
+    collision_registry.list_keys(keys_before);
+    collision_catcher = new("collision_catcher");
+    uvm_report_cb::add(null, collision_catcher);
+    expect_status("ATOMIC_DEFAULT_COLLISION",
+                  collision_registry.register_defaults(),
+                  RDMA_SC_INVALID_STATE);
+    uvm_report_cb::delete(null, collision_catcher);
+    collision_registry.list_keys(keys_after);
+    if (keys_after != keys_before)
+      `uvm_error("ATOMIC_DEFAULT_COLLISION",
+                 "failed default registration partially changed key set")
 
     phase.drop_objection(this);
   endtask

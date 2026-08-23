@@ -1185,22 +1185,40 @@ class rdma_xtr_v1_doorbell_codec_registry extends rdma_codec_registry;
     return key;
   endfunction
 
+  virtual function void clear();
+    super.clear();
+    defaults_registered = 1'b0;
+  endfunction
+
   function rdma_status register_defaults();
     string variants[13] = '{
       "cmq_sq", "sq", "rq", "srq_pi", "srq_limit", "cq_rc_ud",
       "cq_urc", "ceq", "aeq", "rts2sqd", "sqd2rts", "qp_flush",
       "tx_flush"
     };
+    string canonical_keys[13];
     rdma_xtr_v1_doorbell_codec codec;
     rdma_status status;
 
     if (defaults_registered)
       return rdma_status::make(RDMA_SC_INVALID_STATE,
                                "xtr_v1 doorbell codecs are already registered");
+    // Preflight every canonical key before mutating the registry. A collision
+    // at any position must preserve the exact prior key set.
+    foreach (variants[i]) begin
+      status = canonicalize(make_key(variants[i]), canonical_keys[i]);
+      if (!status.ok())
+        return status;
+      if (codecs.exists(canonical_keys[i]))
+        return rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          {"xtr_v1 doorbell codec key already registered: ",
+           canonical_keys[i]}
+        );
+    end
     foreach (variants[i]) begin
       codec = new({"doorbell_codec_", variants[i]}, variants[i]);
-      status = register_codec(make_key(variants[i]), codec);
-      if (!status.ok()) return status;
+      codecs[canonical_keys[i]] = codec;
     end
     defaults_registered = 1'b1;
     return rdma_status::success();

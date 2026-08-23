@@ -97,7 +97,7 @@ class rdma_codec_registry extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  function void clear();
+  virtual function void clear();
     codecs.delete();
   endfunction
 

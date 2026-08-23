@@ -2,17 +2,34 @@ class rdma_doorbell_blocking_pcie extends rdma_mock_pcie;
   `uvm_object_utils(rdma_doorbell_blocking_pcie)
 
   longint unsigned blocked_function_uid;
+  string blocked_method;
   bit block_enabled;
   bit barrier_entered;
   bit release_barrier;
+  int unsigned blocked_call_count;
 
   function new(string name = "rdma_doorbell_blocking_pcie");
     super.new(name);
     blocked_function_uid = 0;
+    blocked_method = "dma_visibility_barrier";
     block_enabled = 1'b0;
     barrier_entered = 1'b0;
     release_barrier = 1'b0;
+    blocked_call_count = 0;
   endfunction
+
+  protected task block_selected_call(
+    string method_name,
+    rdma_function_handle function_h
+  );
+    if (block_enabled && method_name == blocked_method &&
+        function_h != null &&
+        function_h.function_uid == blocked_function_uid) begin
+      barrier_entered = 1'b1;
+      blocked_call_count++;
+      wait (release_barrier);
+    end
+  endtask
 
   virtual task dma_visibility_barrier(
     rdma_function_handle function_h,
@@ -23,11 +40,35 @@ class rdma_doorbell_blocking_pcie extends rdma_mock_pcie;
     status = take_failure("dma_visibility_barrier");
     if (status != null)
       return;
-    if (block_enabled && function_h != null &&
-        function_h.function_uid == blocked_function_uid) begin
-      barrier_entered = 1'b1;
-      wait (release_barrier);
-    end
+    block_selected_call("dma_visibility_barrier", function_h);
+    status = rdma_status::success();
+  endtask
+
+  virtual task mmio_ordering_barrier(
+    rdma_function_handle function_h,
+    output rdma_status status
+  );
+    void'(record_call("mmio_ordering_barrier", '0, '0, '0, '0,
+                      function_h));
+    status = take_failure("mmio_ordering_barrier");
+    if (status != null)
+      return;
+    block_selected_call("mmio_ordering_barrier", function_h);
+    status = rdma_status::success();
+  endtask
+
+  virtual task mmio_write(
+    rdma_function_handle function_h,
+    rdma_bar_addr_t address,
+    byte data[],
+    output rdma_status status
+  );
+    void'(record_call("mmio_write", '0, '0, '0, '0, function_h,
+                      address, data));
+    status = take_failure("mmio_write");
+    if (status != null)
+      return;
+    block_selected_call("mmio_write", function_h);
     status = rdma_status::success();
   endtask
 endclass
@@ -151,7 +192,7 @@ class rdma_doorbell_scheduler_test extends uvm_test;
     desc.write_combining_policy = RDMA_DB_WRITE_NON_COMBINING;
     desc.allow_merge = 1'b0;
     desc.merge_requested = 1'b0;
-    desc.timeout = 100;
+    desc.timeout = 100ns;
     desc.readback_policy = RDMA_DB_READBACK_NONE;
     return desc;
   endfunction
@@ -262,6 +303,204 @@ class rdma_doorbell_scheduler_test extends uvm_test;
     end
   endfunction
 
+  task automatic expect_recovery_submit(
+    string label,
+    rdma_doorbell_scheduler scheduler,
+    rdma_function_binding binding
+  );
+    rdma_doorbell_desc recovery_desc;
+    rdma_doorbell_result recovery_result;
+    rdma_status recovery_status;
+
+    recovery_desc = make_desc({label, "_desc"}, binding);
+    scheduler.submit(binding, recovery_desc, recovery_result, recovery_status);
+    expect_status(label, recovery_status, RDMA_SC_OK);
+    if (recovery_result == null)
+      `uvm_error(label, "same-Function recovery did not publish a result")
+  endtask
+
+  task automatic check_value_clone_contracts(
+    rdma_function_binding binding,
+    rdma_dma_mapping allocated_mapping
+  );
+    uvm_object cloned_object;
+    rdma_dma_mapping source_mapping;
+    rdma_mock_dma_mapping source_mock_mapping;
+    rdma_mock_dma_mapping cloned_mock_mapping;
+    rdma_doorbell_dependency source_dependency;
+    rdma_doorbell_dependency cloned_dependency;
+    rdma_doorbell_desc source_desc;
+    rdma_doorbell_desc cloned_desc;
+    rdma_doorbell_result source_result;
+    rdma_doorbell_result cloned_result;
+    rdma_function_handle function_h;
+    longint unsigned expected_mapping_iova;
+    byte unsigned expected_dependency_byte;
+    byte unsigned expected_payload_byte;
+
+    function_h = binding.make_handle();
+    cloned_object = allocated_mapping.clone();
+    if (cloned_object == null || !$cast(source_mapping, cloned_object)) begin
+      `uvm_error("DB_COPY_SETUP", "could not clone source DMA mapping")
+      return;
+    end
+    source_dependency = make_dependency(
+      "copy_dependency", 64'h1234, RDMA_DB_DEP_QUEUE_CONTEXT,
+      source_mapping, 8, function_h, 8'h40
+    );
+    expected_mapping_iova = source_dependency.mapping.iova.value;
+    expected_dependency_byte = source_dependency.image.bytes[0];
+
+    cloned_object = source_dependency.clone();
+    if (cloned_object == null || !$cast(cloned_dependency, cloned_object)) begin
+      `uvm_error("DEPENDENCY_COPY", "dependency clone type was not preserved")
+    end
+    else begin
+      if (cloned_dependency.dependency_id != source_dependency.dependency_id ||
+          cloned_dependency.stage != source_dependency.stage ||
+          cloned_dependency.relative_offset !=
+            source_dependency.relative_offset ||
+          cloned_dependency.ready != source_dependency.ready)
+        `uvm_error("DEPENDENCY_COPY", "dependency scalar fields were not copied")
+      if (cloned_dependency.mapping == null ||
+          cloned_dependency.mapping == source_dependency.mapping ||
+          cloned_dependency.image == null ||
+          cloned_dependency.image == source_dependency.image)
+        `uvm_error("DEPENDENCY_COPY", "dependency value handles alias source")
+      if (cloned_dependency.mapping == null) begin
+        `uvm_error("DEPENDENCY_COPY", "mapping clone was null")
+      end
+      else if (!$cast(source_mock_mapping, source_dependency.mapping)) begin
+        `uvm_error("DEPENDENCY_COPY",
+                   "source mapping lost its concrete mock type")
+      end
+      else if (!$cast(cloned_mock_mapping, cloned_dependency.mapping)) begin
+        `uvm_error("DEPENDENCY_COPY",
+                   "mapping clone lost its concrete mock type")
+      end
+      else if (!cloned_mock_mapping.same_allocation(source_mock_mapping)) begin
+        `uvm_error("DEPENDENCY_COPY",
+                   "mapping clone lost opaque allocation identity")
+      end
+      if (cloned_dependency.mapping != null &&
+          cloned_dependency.mapping.state !=
+            source_dependency.mapping.state)
+        `uvm_error("DEPENDENCY_COPY", "mapping clone lost mapping state")
+
+      source_dependency.mapping.iova.value++;
+      source_dependency.image.bytes[0] ^= 8'hff;
+      if (cloned_dependency.mapping == null ||
+          cloned_dependency.image == null) begin
+        `uvm_error("DEPENDENCY_COPY",
+                   "dependency clone omitted nested values")
+      end
+      else if (cloned_dependency.mapping.iova.value != expected_mapping_iova ||
+               cloned_dependency.image.bytes[0] !=
+                 expected_dependency_byte) begin
+        `uvm_error("DEPENDENCY_COPY",
+                   "dependency clone changed after source mutation")
+      end
+    end
+
+    source_desc = make_desc("copy_desc", binding);
+    source_desc.dependencies.push_back(source_dependency);
+    expected_payload_byte = source_desc.payload_image.bytes[0];
+    cloned_object = source_desc.clone();
+    if (cloned_object == null || !$cast(cloned_desc, cloned_object)) begin
+      `uvm_error("DESC_COPY", "descriptor clone type was not preserved")
+    end
+    else begin
+      if (cloned_desc.kind != source_desc.kind ||
+          cloned_desc.notify_bar_id != source_desc.notify_bar_id ||
+          cloned_desc.relative_offset != source_desc.relative_offset ||
+          cloned_desc.width != source_desc.width ||
+          cloned_desc.endian != source_desc.endian ||
+          cloned_desc.barrier_policy != source_desc.barrier_policy ||
+          cloned_desc.write_combining_policy !=
+            source_desc.write_combining_policy ||
+          cloned_desc.allow_merge != source_desc.allow_merge ||
+          cloned_desc.merge_requested != source_desc.merge_requested ||
+          cloned_desc.timeout != source_desc.timeout ||
+          cloned_desc.readback_policy != source_desc.readback_policy)
+        `uvm_error("DESC_COPY", "descriptor scalar fields were not copied")
+      if (cloned_desc.function_h == null ||
+          cloned_desc.target_h == null ||
+          cloned_desc.payload_image == null ||
+          cloned_desc.dependencies.size() != 1) begin
+        `uvm_error("DESC_COPY", "descriptor clone omitted value fields")
+      end
+      else if (cloned_desc.function_h == source_desc.function_h ||
+               cloned_desc.target_h == source_desc.target_h ||
+               cloned_desc.payload_image == source_desc.payload_image ||
+               cloned_desc.dependencies[0] == source_desc.dependencies[0] ||
+               cloned_desc.dependencies[0].mapping ==
+                 source_desc.dependencies[0].mapping ||
+               cloned_desc.dependencies[0].image ==
+                 source_desc.dependencies[0].image) begin
+        `uvm_error("DESC_COPY", "descriptor value graph aliases source")
+      end
+      if (cloned_desc.dependencies.size() == 1 &&
+          cloned_desc.dependencies[0].mapping != null &&
+          cloned_desc.dependencies[0].mapping.state !=
+            source_desc.dependencies[0].mapping.state)
+        `uvm_error("DESC_COPY", "nested mapping clone lost mapping state")
+
+      source_desc.function_h.generation++;
+      source_desc.target_h.object_id++;
+      source_desc.payload_image.bytes[0] ^= 8'hff;
+      source_desc.dependencies[0].relative_offset++;
+      if (cloned_desc.function_h == null ||
+          cloned_desc.target_h == null ||
+          cloned_desc.payload_image == null ||
+          cloned_desc.dependencies.size() != 1) begin
+        `uvm_error("DESC_COPY", "descriptor clone omitted mutation targets")
+      end
+      else if (cloned_desc.function_h.generation != binding.generation ||
+               cloned_desc.target_h.object_id != 21'h15555 ||
+               cloned_desc.payload_image.bytes[0] != expected_payload_byte ||
+               cloned_desc.dependencies[0].relative_offset != 8) begin
+        `uvm_error("DESC_COPY", "descriptor clone changed after source mutation")
+      end
+    end
+
+    source_result = rdma_doorbell_result::type_id::create("copy_result");
+    source_result.kind = RDMA_DOORBELL_RQ;
+    source_result.function_h = function_h;
+    source_result.target_h = make_target("copy_result_target", function_h,
+                                         RDMA_RESOURCE_QP, 21'h15555);
+    source_result.absolute_address.value = 64'h1234_5000;
+    source_result.width = 8;
+    source_result.dependency_count = 3;
+    cloned_object = source_result.clone();
+    if (cloned_object == null || !$cast(cloned_result, cloned_object)) begin
+      `uvm_error("RESULT_COPY", "result clone type was not preserved")
+    end
+    else begin
+      if (cloned_result.kind != source_result.kind ||
+          cloned_result.absolute_address != source_result.absolute_address ||
+          cloned_result.width != source_result.width ||
+          cloned_result.dependency_count != source_result.dependency_count ||
+          cloned_result.function_h == null ||
+          cloned_result.target_h == null) begin
+        `uvm_error("RESULT_COPY", "result fields were not copied")
+      end
+      else if (cloned_result.function_h == source_result.function_h ||
+               cloned_result.target_h == source_result.target_h) begin
+        `uvm_error("RESULT_COPY", "result fields were not deep copied")
+      end
+      source_result.function_h.generation++;
+      source_result.target_h.object_id++;
+      if (cloned_result.function_h == null ||
+          cloned_result.target_h == null) begin
+        `uvm_error("RESULT_COPY", "result clone omitted mutation targets")
+      end
+      else if (cloned_result.function_h.generation != binding.generation ||
+               cloned_result.target_h.object_id != 21'h15555) begin
+        `uvm_error("RESULT_COPY", "result clone changed after source mutation")
+      end
+    end
+  endtask
+
   task run_phase(uvm_phase phase);
     rdma_mock_call_trace trace;
     rdma_mock_host_mem mem;
@@ -271,6 +510,9 @@ class rdma_doorbell_scheduler_test extends uvm_test;
     rdma_doorbell_scheduler scheduler;
     rdma_function_binding binding_a;
     rdma_function_binding binding_b;
+    rdma_function_binding snapshot_binding;
+    rdma_function_binding rebound_binding_old;
+    rdma_function_binding rebound_binding_new;
     rdma_function_handle function_a;
     rdma_function_handle function_b;
     rdma_dma_mapping mapping;
@@ -299,16 +541,29 @@ class rdma_doorbell_scheduler_test extends uvm_test;
     rdma_doorbell_desc first_desc;
     rdma_doorbell_desc second_desc;
     rdma_doorbell_desc other_desc;
+    rdma_doorbell_desc snapshot_desc;
     rdma_doorbell_result first_result;
     rdma_doorbell_result second_result;
     rdma_doorbell_result other_result;
+    rdma_doorbell_result snapshot_result;
     rdma_status first_status;
     rdma_status second_status;
     rdma_status other_status;
+    rdma_status snapshot_status;
     bit first_done;
     bit second_started;
     bit second_done;
     bit other_done;
+    bit snapshot_done;
+    bit watchdog_fired;
+    time submit_started_at;
+    time submit_finished_at;
+    string blocking_methods[3] = '{
+      "dma_visibility_barrier", "mmio_ordering_barrier", "mmio_write"
+    };
+    longint unsigned snapshot_address;
+    int unsigned expected_generation;
+    int unsigned expected_target_id;
 
     phase.raise_objection(this);
 
@@ -339,6 +594,13 @@ class rdma_doorbell_scheduler_test extends uvm_test;
       `uvm_fatal("TEST_SETUP", "dependency mapping allocation failed")
     end
     mapping.requester_bdf = binding_a.pcie.bdf;
+
+    // Scheduler request/result objects are values: cloning must recursively
+    // detach every mutable handle/image/dependency while preserving the
+    // concrete mapping subclass's opaque allocation identity.
+    check_value_clone_contracts(binding_a, mapping);
+    if (mapping.state != RDMA_MAPPING_ACTIVE)
+      `uvm_error("DB_COPY_SETUP", "clone contract mutated source mapping state")
 
     // Successful execution proves stage ordering, barriers, final address,
     // exact payload bytes, and success-only result publication.
@@ -515,6 +777,7 @@ class rdma_doorbell_scheduler_test extends uvm_test;
     expect_status("FAIL_HOST_FIRST", status, RDMA_SC_TIMEOUT);
     expect_trace("FAIL_HOST_FIRST", trace, host_first_failure);
     if (result != null) `uvm_error("FAIL_HOST_FIRST", "failure published result")
+    expect_recovery_submit("RECOVER_HOST_FIRST", scheduler, binding_a);
 
     desc = make_desc("fail_host_second", binding_a);
     add_two_dependencies(desc, mapping, function_a);
@@ -525,6 +788,7 @@ class rdma_doorbell_scheduler_test extends uvm_test;
     expect_status("FAIL_HOST_SECOND", status, RDMA_SC_TIMEOUT);
     expect_trace("FAIL_HOST_SECOND", trace, host_second_failure);
     if (result != null) `uvm_error("FAIL_HOST_SECOND", "failure published result")
+    expect_recovery_submit("RECOVER_HOST_SECOND", scheduler, binding_a);
 
     desc = make_desc("fail_dma_barrier", binding_a);
     add_two_dependencies(desc, mapping, function_a);
@@ -536,6 +800,7 @@ class rdma_doorbell_scheduler_test extends uvm_test;
     expect_status("FAIL_DMA_BARRIER", status, RDMA_SC_TIMEOUT);
     expect_trace("FAIL_DMA_BARRIER", trace, dma_failure);
     if (result != null) `uvm_error("FAIL_DMA_BARRIER", "failure published result")
+    expect_recovery_submit("RECOVER_DMA_FAILURE", scheduler, binding_a);
 
     desc = make_desc("fail_mmio_barrier", binding_a);
     add_two_dependencies(desc, mapping, function_a);
@@ -547,6 +812,8 @@ class rdma_doorbell_scheduler_test extends uvm_test;
     expect_status("FAIL_MMIO_BARRIER", status, RDMA_SC_TIMEOUT);
     expect_trace("FAIL_MMIO_BARRIER", trace, mmio_barrier_failure);
     if (result != null) `uvm_error("FAIL_MMIO_BARRIER", "failure published result")
+    expect_recovery_submit("RECOVER_MMIO_BARRIER_FAILURE", scheduler,
+                           binding_a);
 
     desc = make_desc("fail_mmio_write", binding_a);
     add_two_dependencies(desc, mapping, function_a);
@@ -557,9 +824,11 @@ class rdma_doorbell_scheduler_test extends uvm_test;
     expect_status("FAIL_MMIO_WRITE", status, RDMA_SC_TIMEOUT);
     expect_trace("FAIL_MMIO_WRITE", trace, full_order);
     if (result != null) `uvm_error("FAIL_MMIO_WRITE", "failure published result")
+    expect_recovery_submit("RECOVER_MMIO_WRITE_FAILURE", scheduler, binding_a);
 
-    // Per-Function lock: a second A submission cannot reach any adapter while
-    // the first A is blocked. A different Function B is not globally blocked.
+    // All execution inputs become immutable values after the Function lock is
+    // acquired. Mutating the caller graph while a barrier is blocked cannot
+    // alter later adapter calls or the published result.
     blocking_pcie = rdma_doorbell_blocking_pcie::type_id::create(
         "blocking_pcie");
     blocking_pcie_api = blocking_pcie;
@@ -569,68 +838,313 @@ class rdma_doorbell_scheduler_test extends uvm_test;
                   concurrent_scheduler.configure(mem_api, blocking_pcie_api),
                   RDMA_SC_OK);
 
-    first_desc = make_desc("same_function_first", binding_a);
-    second_desc = make_desc("same_function_second", binding_a);
+    snapshot_binding = make_binding("snapshot_binding", 64'haaaa, 1, 9,
+                                    64'h0000_0000_8000_0000);
+    snapshot_desc = make_desc("snapshot_desc", snapshot_binding);
+    add_two_dependencies(snapshot_desc, mapping,
+                         snapshot_desc.function_h);
+    snapshot_address = snapshot_binding.notify_base.value +
+                       snapshot_desc.relative_offset;
+    expected_generation = snapshot_desc.function_h.generation;
+    expected_target_id = snapshot_desc.target_h.object_id;
     blocking_pcie.blocked_function_uid = function_a.function_uid;
+    blocking_pcie.blocked_method = "dma_visibility_barrier";
     blocking_pcie.block_enabled = 1'b1;
     blocking_pcie.barrier_entered = 1'b0;
     blocking_pcie.release_barrier = 1'b0;
+    blocking_pcie.blocked_call_count = 0;
+    blocking_pcie.calls.delete();
+    clear_observation(mem, blocking_pcie, trace);
+    snapshot_done = 1'b0;
+    watchdog_fired = 1'b0;
+    fork : snapshot_watchdog
+      begin : snapshot_scenario
+        fork : snapshot_submit_worker
+          begin
+            concurrent_scheduler.submit(snapshot_binding, snapshot_desc,
+                                        snapshot_result, snapshot_status);
+            snapshot_done = 1'b1;
+          end
+        join_none
+        wait (blocking_pcie.barrier_entered);
+        snapshot_binding.state = RDMA_BIND_BOUND;
+        snapshot_binding.generation++;
+        snapshot_binding.notify_base.value += 64'h2000;
+        snapshot_desc.function_h.generation += 32;
+        snapshot_desc.target_h.object_id++;
+        snapshot_desc.relative_offset = 64'h18;
+        snapshot_desc.payload_image.bytes[0] = 8'hff;
+        snapshot_desc.dependencies[0].relative_offset = 40;
+        snapshot_desc.dependencies[0].image.bytes[0] = 8'hee;
+        snapshot_desc.dependencies[0].mapping.state = RDMA_MAPPING_FROZEN;
+        snapshot_desc.dependencies.delete();
+        blocking_pcie.release_barrier = 1'b1;
+        wait (snapshot_done);
+      end
+      begin : snapshot_deadline
+        #200ns;
+        watchdog_fired = 1'b1;
+        blocking_pcie.release_barrier = 1'b1;
+        #20ns;
+      end
+    join_any
+    disable snapshot_watchdog;
+    if (watchdog_fired)
+      `uvm_error("IMMUTABLE_SNAPSHOT", "snapshot submission hung")
+    expect_status("IMMUTABLE_SNAPSHOT", snapshot_status, RDMA_SC_OK);
+    if (snapshot_result == null ||
+        snapshot_result.function_h == null ||
+        snapshot_result.function_h.generation != expected_generation ||
+        snapshot_result.target_h == null ||
+        snapshot_result.target_h.object_id != expected_target_id ||
+        snapshot_result.absolute_address.value != snapshot_address ||
+        snapshot_result.dependency_count != 2)
+      `uvm_error("IMMUTABLE_SNAPSHOT", "result observed caller mutation")
+    if (blocking_pcie.calls.size() != 3 ||
+        blocking_pcie.calls[1].function_h == null ||
+        blocking_pcie.calls[1].function_h.generation != expected_generation ||
+        blocking_pcie.calls[2].function_h == null ||
+        blocking_pcie.calls[2].function_h.generation != expected_generation ||
+        blocking_pcie.calls[2].address.value != snapshot_address ||
+        blocking_pcie.calls[2].data != expected_mmio)
+      `uvm_error("IMMUTABLE_SNAPSHOT", "adapter observed caller mutation")
+
+    // The timeout is one total simulation-time deadline. Each potentially
+    // blocking PCIe task must consume only the remaining request budget, be
+    // killed locally on expiry, and leave the Function lock reusable.
+    foreach (blocking_methods[method_index]) begin
+      first_desc = make_desc({"timeout_", blocking_methods[method_index]},
+                             binding_a);
+      first_desc.timeout = 5ns;
+      blocking_pcie.blocked_function_uid = function_a.function_uid;
+      blocking_pcie.blocked_method = blocking_methods[method_index];
+      blocking_pcie.block_enabled = 1'b1;
+      blocking_pcie.barrier_entered = 1'b0;
+      blocking_pcie.release_barrier = 1'b0;
+      blocking_pcie.blocked_call_count = 0;
+      blocking_pcie.calls.delete();
+      first_done = 1'b0;
+      watchdog_fired = 1'b0;
+      submit_started_at = $time;
+      fork : pcie_timeout_watchdog
+        begin : timed_submit
+          concurrent_scheduler.submit(binding_a, first_desc, first_result,
+                                      first_status);
+          submit_finished_at = $time;
+          first_done = 1'b1;
+        end
+        begin : timed_submit_deadline
+          #(first_desc.timeout + 5ns);
+          if (!first_done) begin
+            watchdog_fired = 1'b1;
+            blocking_pcie.release_barrier = 1'b1;
+          end
+          #20ns;
+        end
+      join_any
+      disable pcie_timeout_watchdog;
+      if (watchdog_fired || !first_done)
+        `uvm_error("PCIE_TIMEOUT", {blocking_methods[method_index],
+                    " did not honor the descriptor deadline"})
+      expect_status({"TIMEOUT_", blocking_methods[method_index]},
+                    first_status, RDMA_SC_TIMEOUT);
+      if (first_result != null)
+        `uvm_error("PCIE_TIMEOUT", "timed-out submission published a result")
+      if (!blocking_pcie.barrier_entered ||
+          blocking_pcie.blocked_call_count != 1)
+        `uvm_error("PCIE_TIMEOUT", "selected adapter task did not block")
+      if (submit_finished_at - submit_started_at != first_desc.timeout)
+        `uvm_error("PCIE_TIMEOUT", "submit did not use one total deadline")
+      blocking_pcie.block_enabled = 1'b0;
+      blocking_pcie.release_barrier = 1'b1;
+      expect_recovery_submit({"RECOVER_", blocking_methods[method_index]},
+                             concurrent_scheduler, binding_a);
+    end
+
+    // Waiting for an already-held Function lock consumes the same deadline.
+    // A timed-out waiter must not put a token it never acquired: a third
+    // waiter remains blocked until the original owner releases the lock.
+    first_desc = make_desc("lock_owner", binding_a);
+    first_desc.timeout = 100ns;
+    second_desc = make_desc("lock_timeout", binding_a);
+    second_desc.timeout = 5ns;
+    other_desc = make_desc("post_timeout_waiter", binding_a);
+    other_desc.timeout = 50ns;
+    blocking_pcie.blocked_function_uid = function_a.function_uid;
+    blocking_pcie.blocked_method = "dma_visibility_barrier";
+    blocking_pcie.block_enabled = 1'b1;
+    blocking_pcie.barrier_entered = 1'b0;
+    blocking_pcie.release_barrier = 1'b0;
+    blocking_pcie.blocked_call_count = 0;
     blocking_pcie.calls.delete();
     first_done = 1'b0;
     second_started = 1'b0;
     second_done = 1'b0;
-    fork
-      begin
-        concurrent_scheduler.submit(binding_a, first_desc, first_result,
-                                    first_status);
-        first_done = 1'b1;
+    other_done = 1'b0;
+    watchdog_fired = 1'b0;
+    fork : lock_timeout_watchdog
+      begin : lock_timeout_scenario
+        fork : lock_timeout_workers
+          begin
+            concurrent_scheduler.submit(binding_a, first_desc, first_result,
+                                        first_status);
+            first_done = 1'b1;
+          end
+          begin
+            wait (blocking_pcie.barrier_entered);
+            second_started = 1'b1;
+            submit_started_at = $time;
+            concurrent_scheduler.submit(binding_a, second_desc, second_result,
+                                        second_status);
+            submit_finished_at = $time;
+            second_done = 1'b1;
+          end
+        join_none
+        wait (blocking_pcie.barrier_entered && second_done);
+        fork : post_timeout_waiter_worker
+          begin
+            concurrent_scheduler.submit(binding_a, other_desc, other_result,
+                                        other_status);
+            other_done = 1'b1;
+          end
+        join_none
+        #1ns;
+        if (first_done || other_done || blocking_pcie.calls.size() != 1)
+          `uvm_error("LOCK_TIMEOUT_TOKEN",
+                     "timed-out lock waiter leaked a semaphore token")
+        blocking_pcie.release_barrier = 1'b1;
+        wait (first_done && other_done);
       end
-      begin
-        wait (blocking_pcie.barrier_entered);
-        second_started = 1'b1;
-        concurrent_scheduler.submit(binding_a, second_desc, second_result,
-                                    second_status);
-        second_done = 1'b1;
+      begin : lock_timeout_deadline
+        #40ns;
+        watchdog_fired = 1'b1;
+        blocking_pcie.release_barrier = 1'b1;
+        #20ns;
       end
-    join_none
-    wait (blocking_pcie.barrier_entered && second_started);
-    #1ns;
-    if (first_done || second_done || blocking_pcie.calls.size() != 1)
-      `uvm_error("SAME_FUNCTION_LOCK", "same-Function submissions overlapped")
-    blocking_pcie.release_barrier = 1'b1;
-    wait (first_done && second_done);
-    expect_status("SAME_FUNCTION_FIRST", first_status, RDMA_SC_OK);
-    expect_status("SAME_FUNCTION_SECOND", second_status, RDMA_SC_OK);
-    if (first_result == null || second_result == null)
-      `uvm_error("SAME_FUNCTION_LOCK", "serialized submissions lost result")
+    join_any
+    disable lock_timeout_watchdog;
+    if (watchdog_fired)
+      `uvm_error("LOCK_TIMEOUT", "lock wait did not honor its deadline")
+    expect_status("LOCK_OWNER", first_status, RDMA_SC_OK);
+    expect_status("LOCK_TIMEOUT", second_status, RDMA_SC_TIMEOUT);
+    expect_status("POST_TIMEOUT_WAITER", other_status, RDMA_SC_OK);
+    if (second_result != null)
+      `uvm_error("LOCK_TIMEOUT", "timed-out lock waiter published a result")
+    if (submit_finished_at - submit_started_at != second_desc.timeout)
+      `uvm_error("LOCK_TIMEOUT", "lock wait used the wrong deadline")
+    if (first_result == null || other_result == null)
+      `uvm_error("LOCK_TIMEOUT", "lock timeout recovery lost a result")
+    blocking_pcie.block_enabled = 1'b0;
+    expect_recovery_submit("RECOVER_LOCK_TIMEOUT", concurrent_scheduler,
+                           binding_a);
 
-    first_desc = make_desc("different_function_a", binding_a);
-    other_desc = make_desc("different_function_b", binding_b);
+    // Lock identity deliberately excludes generation. Two distinct binding
+    // objects for old/new incarnations of one immutable Function serialize.
+    rebound_binding_old = make_binding("rebound_old", 64'hcccc, 3, 1,
+                                       64'h0000_0000_a000_0000);
+    rebound_binding_new = make_binding("rebound_new", 64'hcccc, 3, 2,
+                                       64'h0000_0000_a000_0000);
+    first_desc = make_desc("old_incarnation", rebound_binding_old);
+    second_desc = make_desc("new_incarnation", rebound_binding_new);
+    first_desc.timeout = 100ns;
+    second_desc.timeout = 100ns;
+    blocking_pcie.blocked_function_uid = rebound_binding_old.function_uid;
+    blocking_pcie.blocked_method = "dma_visibility_barrier";
+    blocking_pcie.block_enabled = 1'b1;
     blocking_pcie.barrier_entered = 1'b0;
     blocking_pcie.release_barrier = 1'b0;
+    blocking_pcie.blocked_call_count = 0;
+    blocking_pcie.calls.delete();
+    first_done = 1'b0;
+    second_started = 1'b0;
+    second_done = 1'b0;
+    watchdog_fired = 1'b0;
+    fork : incarnation_lock_watchdog
+      begin : incarnation_lock_scenario
+        fork : incarnation_workers
+          begin
+            concurrent_scheduler.submit(rebound_binding_old, first_desc,
+                                        first_result, first_status);
+            first_done = 1'b1;
+          end
+          begin
+            wait (blocking_pcie.barrier_entered);
+            second_started = 1'b1;
+            concurrent_scheduler.submit(rebound_binding_new, second_desc,
+                                        second_result, second_status);
+            second_done = 1'b1;
+          end
+        join_none
+        wait (blocking_pcie.barrier_entered && second_started);
+        #1ns;
+        if (first_done || second_done || blocking_pcie.calls.size() != 1)
+          `uvm_error("INCARNATION_LOCK",
+                     "new Function incarnation overlapped the old one")
+        blocking_pcie.release_barrier = 1'b1;
+        wait (first_done && second_done);
+      end
+      begin : incarnation_lock_deadline
+        #50ns;
+        watchdog_fired = 1'b1;
+        blocking_pcie.release_barrier = 1'b1;
+        #20ns;
+      end
+    join_any
+    disable incarnation_lock_watchdog;
+    if (watchdog_fired)
+      `uvm_error("INCARNATION_LOCK", "incarnation serialization hung")
+    expect_status("OLD_INCARNATION", first_status, RDMA_SC_OK);
+    expect_status("NEW_INCARNATION", second_status, RDMA_SC_OK);
+    if (first_result == null || second_result == null)
+      `uvm_error("INCARNATION_LOCK", "serialized incarnation lost result")
+
+    // A different Function remains independent of the blocked Function.
+    first_desc = make_desc("different_function_a", binding_a);
+    other_desc = make_desc("different_function_b", binding_b);
+    blocking_pcie.blocked_function_uid = function_a.function_uid;
+    blocking_pcie.blocked_method = "dma_visibility_barrier";
+    blocking_pcie.block_enabled = 1'b1;
+    blocking_pcie.barrier_entered = 1'b0;
+    blocking_pcie.release_barrier = 1'b0;
+    blocking_pcie.blocked_call_count = 0;
     blocking_pcie.calls.delete();
     first_done = 1'b0;
     other_done = 1'b0;
-    fork
-      begin
-        concurrent_scheduler.submit(binding_a, first_desc, first_result,
-                                    first_status);
-        first_done = 1'b1;
+    watchdog_fired = 1'b0;
+    fork : independent_function_watchdog
+      begin : independent_function_scenario
+        fork : independent_function_workers
+          begin
+            concurrent_scheduler.submit(binding_a, first_desc, first_result,
+                                        first_status);
+            first_done = 1'b1;
+          end
+          begin
+            wait (blocking_pcie.barrier_entered);
+            concurrent_scheduler.submit(binding_b, other_desc, other_result,
+                                        other_status);
+            other_done = 1'b1;
+          end
+        join_none
+        wait (blocking_pcie.barrier_entered && other_done);
+        blocking_pcie.release_barrier = 1'b1;
+        wait (first_done);
       end
-      begin
-        wait (blocking_pcie.barrier_entered);
-        concurrent_scheduler.submit(binding_b, other_desc, other_result,
-                                    other_status);
-        other_done = 1'b1;
+      begin : independent_function_deadline
+        #50ns;
+        watchdog_fired = 1'b1;
+        blocking_pcie.release_barrier = 1'b1;
+        #20ns;
       end
-    join_none
-    wait (blocking_pcie.barrier_entered && other_done);
-    if (first_done || other_result == null)
+    join_any
+    disable independent_function_watchdog;
+    if (watchdog_fired)
       `uvm_error("DIFFERENT_FUNCTION_LOCK",
-                 "blocked Function A prevented independent Function B")
+                 "independent Function progress hung")
+    if (!first_done || first_result == null || other_result == null)
+      `uvm_error("DIFFERENT_FUNCTION_LOCK",
+                 "independent Function submissions lost a result")
     expect_status("DIFFERENT_FUNCTION_B", other_status, RDMA_SC_OK);
-    blocking_pcie.release_barrier = 1'b1;
-    wait (first_done);
     expect_status("DIFFERENT_FUNCTION_A", first_status, RDMA_SC_OK);
 
     phase.drop_objection(this);

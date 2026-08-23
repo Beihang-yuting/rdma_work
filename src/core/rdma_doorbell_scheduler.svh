@@ -39,6 +39,38 @@ class rdma_doorbell_dependency extends uvm_object;
     image = null;
     ready = 1'b0;
   endfunction
+
+  virtual function void do_copy(uvm_object rhs);
+    rdma_doorbell_dependency rhs_dependency;
+    uvm_object cloned_object;
+
+    super.do_copy(rhs);
+    if (!$cast(rhs_dependency, rhs))
+      `uvm_fatal("RDMA_COPY_TYPE",
+                 "rdma_doorbell_dependency copy type mismatch")
+    dependency_id = rhs_dependency.dependency_id;
+    stage = rhs_dependency.stage;
+    if (rhs_dependency.mapping == null) begin
+      mapping = null;
+    end
+    else begin
+      cloned_object = rhs_dependency.mapping.clone();
+      if (cloned_object == null || !$cast(mapping, cloned_object))
+        `uvm_fatal("RDMA_COPY_TYPE",
+                   "doorbell dependency mapping clone type mismatch")
+    end
+    relative_offset = rhs_dependency.relative_offset;
+    if (rhs_dependency.image == null) begin
+      image = null;
+    end
+    else begin
+      cloned_object = rhs_dependency.image.clone();
+      if (cloned_object == null || !$cast(image, cloned_object))
+        `uvm_fatal("RDMA_COPY_TYPE",
+                   "doorbell dependency image clone type mismatch")
+    end
+    ready = rhs_dependency.ready;
+  endfunction
 endclass
 
 class rdma_doorbell_desc extends uvm_object;
@@ -57,7 +89,12 @@ class rdma_doorbell_desc extends uvm_object;
   bit allow_merge;
   bit merge_requested;
   rdma_doorbell_dependency dependencies[$];
-  longint unsigned timeout;
+  // Maximum total elapsed SystemVerilog simulation time for submit(), from
+  // entry through Function-lock acquisition and the final PCIe task. The value
+  // is a simulation-time value, not a per-operation timeout. Callers should
+  // assign an explicit time literal (for example, 100ns) so the intended unit
+  // is independent of compilation-unit time settings.
+  time timeout;
   rdma_doorbell_readback_policy_e readback_policy;
 
   function new(string name = "rdma_doorbell_desc");
@@ -77,6 +114,96 @@ class rdma_doorbell_desc extends uvm_object;
     dependencies.delete();
     timeout = '0;
     readback_policy = RDMA_DB_READBACK_NONE;
+  endfunction
+
+  virtual function void do_copy(uvm_object rhs);
+    rdma_doorbell_desc rhs_desc;
+    rdma_doorbell_dependency cloned_dependency;
+    rdma_doorbell_dependency dependency_clones[rdma_doorbell_dependency];
+    rdma_dma_mapping mapping_clones[rdma_dma_mapping];
+    rdma_hw_image image_clones[rdma_hw_image];
+    uvm_object cloned_object;
+
+    super.do_copy(rhs);
+    if (!$cast(rhs_desc, rhs))
+      `uvm_fatal("RDMA_COPY_TYPE", "rdma_doorbell_desc copy type mismatch")
+    kind = rhs_desc.kind;
+    if (rhs_desc.function_h == null) begin
+      function_h = null;
+    end
+    else begin
+      cloned_object = rhs_desc.function_h.clone();
+      if (cloned_object == null || !$cast(function_h, cloned_object))
+        `uvm_fatal("RDMA_COPY_TYPE",
+                   "doorbell descriptor Function clone type mismatch")
+    end
+    if (rhs_desc.target_h == null) begin
+      target_h = null;
+    end
+    else begin
+      cloned_object = rhs_desc.target_h.clone();
+      if (cloned_object == null || !$cast(target_h, cloned_object))
+        `uvm_fatal("RDMA_COPY_TYPE",
+                   "doorbell descriptor target clone type mismatch")
+    end
+    notify_bar_id = rhs_desc.notify_bar_id;
+    relative_offset = rhs_desc.relative_offset;
+    width = rhs_desc.width;
+    endian = rhs_desc.endian;
+    if (rhs_desc.payload_image == null) begin
+      payload_image = null;
+    end
+    else begin
+      cloned_object = rhs_desc.payload_image.clone();
+      if (cloned_object == null || !$cast(payload_image, cloned_object))
+        `uvm_fatal("RDMA_COPY_TYPE",
+                   "doorbell payload image clone type mismatch")
+      image_clones[rhs_desc.payload_image] = payload_image;
+    end
+    barrier_policy = rhs_desc.barrier_policy;
+    write_combining_policy = rhs_desc.write_combining_policy;
+    allow_merge = rhs_desc.allow_merge;
+    merge_requested = rhs_desc.merge_requested;
+    dependencies.delete();
+    foreach (rhs_desc.dependencies[i]) begin
+      if (rhs_desc.dependencies[i] == null) begin
+        dependencies.push_back(null);
+      end
+      else if (dependency_clones.exists(rhs_desc.dependencies[i])) begin
+        dependencies.push_back(dependency_clones[rhs_desc.dependencies[i]]);
+      end
+      else begin
+        cloned_object = rhs_desc.dependencies[i].clone();
+        if (cloned_object == null ||
+            !$cast(cloned_dependency, cloned_object))
+          `uvm_fatal("RDMA_COPY_TYPE",
+                     "doorbell dependency clone type mismatch")
+        // UVM 1.2 suppresses a repeated nested copy while an outer copy is
+        // active. Preserve source alias topology explicitly so two
+        // dependencies sharing one mapping/image receive the same detached
+        // value rather than a default-constructed second clone.
+        if (rhs_desc.dependencies[i].mapping != null) begin
+          if (mapping_clones.exists(rhs_desc.dependencies[i].mapping))
+            cloned_dependency.mapping =
+              mapping_clones[rhs_desc.dependencies[i].mapping];
+          else
+            mapping_clones[rhs_desc.dependencies[i].mapping] =
+              cloned_dependency.mapping;
+        end
+        if (rhs_desc.dependencies[i].image != null) begin
+          if (image_clones.exists(rhs_desc.dependencies[i].image))
+            cloned_dependency.image =
+              image_clones[rhs_desc.dependencies[i].image];
+          else
+            image_clones[rhs_desc.dependencies[i].image] =
+              cloned_dependency.image;
+        end
+        dependency_clones[rhs_desc.dependencies[i]] = cloned_dependency;
+        dependencies.push_back(cloned_dependency);
+      end
+    end
+    timeout = rhs_desc.timeout;
+    readback_policy = rhs_desc.readback_policy;
   endfunction
 endclass
 
@@ -98,6 +225,37 @@ class rdma_doorbell_result extends uvm_object;
     absolute_address = '0;
     width = '0;
     dependency_count = '0;
+  endfunction
+
+  virtual function void do_copy(uvm_object rhs);
+    rdma_doorbell_result rhs_result;
+    uvm_object cloned_object;
+
+    super.do_copy(rhs);
+    if (!$cast(rhs_result, rhs))
+      `uvm_fatal("RDMA_COPY_TYPE", "rdma_doorbell_result copy type mismatch")
+    kind = rhs_result.kind;
+    if (rhs_result.function_h == null) begin
+      function_h = null;
+    end
+    else begin
+      cloned_object = rhs_result.function_h.clone();
+      if (cloned_object == null || !$cast(function_h, cloned_object))
+        `uvm_fatal("RDMA_COPY_TYPE",
+                   "doorbell result Function clone type mismatch")
+    end
+    if (rhs_result.target_h == null) begin
+      target_h = null;
+    end
+    else begin
+      cloned_object = rhs_result.target_h.clone();
+      if (cloned_object == null || !$cast(target_h, cloned_object))
+        `uvm_fatal("RDMA_COPY_TYPE",
+                   "doorbell result target clone type mismatch")
+    end
+    absolute_address = rhs_result.absolute_address;
+    width = rhs_result.width;
+    dependency_count = rhs_result.dependency_count;
   endfunction
 endclass
 
@@ -154,6 +312,239 @@ class rdma_doorbell_scheduler extends uvm_object;
       function_locks[key] = new(1);
     return function_locks[key];
   endfunction
+
+  protected function rdma_status timeout_status(string operation);
+    return rdma_status::make(
+      RDMA_SC_TIMEOUT,
+      {"doorbell submit deadline expired during ", operation}
+    );
+  endfunction
+
+  protected function bit deadline_remaining(
+    time deadline,
+    output time remaining
+  );
+    if ($time >= deadline) begin
+      remaining = 0;
+      return 1'b0;
+    end
+    remaining = deadline - $time;
+    return 1'b1;
+  endfunction
+
+  protected function rdma_status clone_binding_snapshot(
+    rdma_function_binding source,
+    output rdma_function_binding snapshot
+  );
+    uvm_object cloned_object;
+
+    snapshot = null;
+    if (source == null)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "function binding is null");
+    cloned_object = source.clone();
+    if (cloned_object == null || !$cast(snapshot, cloned_object)) begin
+      snapshot = null;
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "function binding snapshot clone failed"
+      );
+    end
+    return rdma_status::success();
+  endfunction
+
+  protected function rdma_status clone_desc_snapshot(
+    rdma_doorbell_desc source,
+    output rdma_doorbell_desc snapshot
+  );
+    uvm_object cloned_object;
+
+    snapshot = null;
+    if (source == null)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "doorbell descriptor is null");
+    cloned_object = source.clone();
+    if (cloned_object == null || !$cast(snapshot, cloned_object)) begin
+      snapshot = null;
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "doorbell descriptor snapshot clone failed"
+      );
+    end
+    return rdma_status::success();
+  endfunction
+
+  protected task acquire_function_lock_before_deadline(
+    semaphore function_lock,
+    time deadline,
+    output bit acquired,
+    output rdma_status status
+  );
+    bit worker_acquired;
+    time remaining;
+
+    acquired = 1'b0;
+    worker_acquired = 1'b0;
+    if (!deadline_remaining(deadline, remaining)) begin
+      status = timeout_status("Function lock acquisition");
+      return;
+    end
+    if (function_lock.try_get(1)) begin
+      acquired = 1'b1;
+      status = rdma_status::success();
+      return;
+    end
+
+    // Enclose the race in a per-invocation child process. A named-block
+    // disable can reach concurrent activations of this task in some
+    // simulators; this descendant-only disable cannot.
+    fork
+      begin : function_lock_deadline_scope
+        fork
+          begin : function_lock_worker
+            function_lock.get(1);
+            worker_acquired = 1'b1;
+          end
+          begin : function_lock_timer
+            #(remaining);
+          end
+        join_any
+        disable fork;
+      end
+    join
+
+    if (!worker_acquired) begin
+      status = timeout_status("Function lock acquisition");
+      return;
+    end
+    acquired = 1'b1;
+    status = rdma_status::success();
+  endtask
+
+  protected task dma_barrier_before_deadline(
+    rdma_function_handle function_h,
+    time deadline,
+    output rdma_status status
+  );
+    rdma_status worker_status;
+    bit worker_done;
+    time remaining;
+
+    worker_status = null;
+    worker_done = 1'b0;
+    if (!deadline_remaining(deadline, remaining)) begin
+      status = timeout_status("DMA visibility barrier");
+      return;
+    end
+    fork
+      begin : dma_barrier_deadline_scope
+        fork
+          begin : dma_barrier_worker
+            pcie.dma_visibility_barrier(function_h, worker_status);
+            worker_done = 1'b1;
+          end
+          begin : dma_barrier_timer
+            #(remaining);
+          end
+        join_any
+        disable fork;
+      end
+    join
+    if (!worker_done) begin
+      status = timeout_status("DMA visibility barrier");
+      return;
+    end
+    if (worker_status == null) begin
+      status = rdma_status::make(RDMA_SC_INVALID_STATE,
+                                 "PCIe DMA barrier returned null status");
+      return;
+    end
+    status = worker_status;
+  endtask
+
+  protected task mmio_barrier_before_deadline(
+    rdma_function_handle function_h,
+    time deadline,
+    output rdma_status status
+  );
+    rdma_status worker_status;
+    bit worker_done;
+    time remaining;
+
+    worker_status = null;
+    worker_done = 1'b0;
+    if (!deadline_remaining(deadline, remaining)) begin
+      status = timeout_status("MMIO ordering barrier");
+      return;
+    end
+    fork
+      begin : mmio_barrier_deadline_scope
+        fork
+          begin : mmio_barrier_worker
+            pcie.mmio_ordering_barrier(function_h, worker_status);
+            worker_done = 1'b1;
+          end
+          begin : mmio_barrier_timer
+            #(remaining);
+          end
+        join_any
+        disable fork;
+      end
+    join
+    if (!worker_done) begin
+      status = timeout_status("MMIO ordering barrier");
+      return;
+    end
+    if (worker_status == null) begin
+      status = rdma_status::make(RDMA_SC_INVALID_STATE,
+                                 "PCIe MMIO barrier returned null status");
+      return;
+    end
+    status = worker_status;
+  endtask
+
+  protected task mmio_write_before_deadline(
+    rdma_function_handle function_h,
+    rdma_bar_addr_t address,
+    byte data[],
+    time deadline,
+    output rdma_status status
+  );
+    rdma_status worker_status;
+    bit worker_done;
+    time remaining;
+
+    worker_status = null;
+    worker_done = 1'b0;
+    if (!deadline_remaining(deadline, remaining)) begin
+      status = timeout_status("MMIO write");
+      return;
+    end
+    fork
+      begin : mmio_write_deadline_scope
+        fork
+          begin : mmio_write_worker
+            pcie.mmio_write(function_h, address, data, worker_status);
+            worker_done = 1'b1;
+          end
+          begin : mmio_write_timer
+            #(remaining);
+          end
+        join_any
+        disable fork;
+      end
+    join
+    if (!worker_done) begin
+      status = timeout_status("MMIO write");
+      return;
+    end
+    if (worker_status == null) begin
+      status = rdma_status::make(RDMA_SC_INVALID_STATE,
+                                 "PCIe MMIO write returned null status");
+      return;
+    end
+    status = worker_status;
+  endtask
 
   protected function rdma_status target_kind_status(
     rdma_doorbell_kind_e kind,
@@ -431,6 +822,7 @@ class rdma_doorbell_scheduler extends uvm_object;
     rdma_doorbell_desc desc,
     longint unsigned locked_function_uid,
     int unsigned locked_object_id,
+    time deadline,
     output rdma_doorbell_result result,
     output rdma_status status
   );
@@ -452,34 +844,20 @@ class rdma_doorbell_scheduler extends uvm_object;
 
     if (desc.barrier_policy inside {RDMA_DB_BARRIER_DMA,
                                     RDMA_DB_BARRIER_DMA_MMIO}) begin
-      pcie.dma_visibility_barrier(desc.function_h, status);
-      if (status == null) begin
-        status = rdma_status::make(RDMA_SC_INVALID_STATE,
-                                   "PCIe DMA barrier returned null status");
-        return;
-      end
+      dma_barrier_before_deadline(desc.function_h, deadline, status);
       if (!status.ok())
         return;
     end
     if (desc.barrier_policy inside {RDMA_DB_BARRIER_MMIO,
                                     RDMA_DB_BARRIER_DMA_MMIO}) begin
-      pcie.mmio_ordering_barrier(desc.function_h, status);
-      if (status == null) begin
-        status = rdma_status::make(RDMA_SC_INVALID_STATE,
-                                   "PCIe MMIO barrier returned null status");
-        return;
-      end
+      mmio_barrier_before_deadline(desc.function_h, deadline, status);
       if (!status.ok())
         return;
     end
 
     copy_image_bytes(desc.payload_image, payload);
-    pcie.mmio_write(desc.function_h, absolute_address, payload, status);
-    if (status == null) begin
-      status = rdma_status::make(RDMA_SC_INVALID_STATE,
-                                 "PCIe MMIO write returned null status");
-      return;
-    end
+    mmio_write_before_deadline(desc.function_h, absolute_address, payload,
+                               deadline, status);
     if (!status.ok())
       return;
 
@@ -505,6 +883,11 @@ class rdma_doorbell_scheduler extends uvm_object;
     longint unsigned locked_function_uid;
     int unsigned locked_object_id;
     semaphore function_lock;
+    rdma_function_binding binding_snapshot;
+    rdma_doorbell_desc desc_snapshot;
+    time request_timeout;
+    time deadline;
+    bit lock_acquired;
 
     result = null;
     if (binding == null) begin
@@ -518,14 +901,46 @@ class rdma_doorbell_scheduler extends uvm_object;
       return;
     end
 
+    // The timeout is the only descriptor scalar required before the lock.
+    // Capture it once so caller mutation cannot extend a queued request.
+    request_timeout = desc.timeout;
+    if (request_timeout == 0) begin
+      status = rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                                 "doorbell timeout is zero");
+      return;
+    end
+    deadline = $time + request_timeout;
+    if (deadline < $time) begin
+      status = rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                                 "doorbell deadline overflows simulation time");
+      return;
+    end
+
     // Generation is deliberately excluded: teardown/rebind of the same
     // immutable Function identity must serialize with its prior incarnation.
     locked_function_uid = binding.function_uid;
     locked_object_id = binding.global_function_id;
     function_lock = lock_for(locked_function_uid, locked_object_id);
-    function_lock.get(1);
-    submit_locked(binding, desc, locked_function_uid, locked_object_id,
-                  result, status);
+    acquire_function_lock_before_deadline(function_lock, deadline,
+                                          lock_acquired, status);
+    if (!lock_acquired)
+      return;
+
+    // Snapshot only after acquiring the immutable-identity lock, so binding
+    // teardown/rebind that completed while waiting remains visible to
+    // preflight. From this point onward, preflight and execution read only the
+    // detached value graph and never caller-owned objects.
+    status = clone_binding_snapshot(binding, binding_snapshot);
+    if (status.ok())
+      status = clone_desc_snapshot(desc, desc_snapshot);
+    if (status.ok()) begin
+      desc_snapshot.timeout = request_timeout;
+      submit_locked(binding_snapshot, desc_snapshot, locked_function_uid,
+                    locked_object_id, deadline, result, status);
+    end
+
+    // This is the single post-acquisition exit: every preflight, adapter,
+    // timeout, and snapshot failure releases exactly the token acquired above.
     function_lock.put(1);
   endtask
 endclass
