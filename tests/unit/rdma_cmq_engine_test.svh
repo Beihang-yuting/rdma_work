@@ -30,11 +30,12 @@ typedef enum int unsigned {
   RDMA_CMQ_TEST_DB_CLONE_MUTATE
 } rdma_cmq_test_doorbell_fault_e;
 
-typedef enum bit [1:0] {
+typedef enum bit [2:0] {
   RDMA_CMQ_TEST_CLONE_GOOD,
   RDMA_CMQ_TEST_CLONE_NULL,
   RDMA_CMQ_TEST_CLONE_SELF,
-  RDMA_CMQ_TEST_CLONE_MUTATE
+  RDMA_CMQ_TEST_CLONE_MUTATE,
+  RDMA_CMQ_TEST_CLONE_WRONG_TYPE
 } rdma_cmq_test_clone_fault_e;
 
 typedef enum int unsigned {
@@ -60,6 +61,29 @@ class rdma_cmq_clone_fault_function_handle extends rdma_function_handle;
     case (clone_fault)
       RDMA_CMQ_TEST_CLONE_NULL: return null;
       RDMA_CMQ_TEST_CLONE_SELF: return this;
+      RDMA_CMQ_TEST_CLONE_WRONG_TYPE:
+        return rdma_status::success("wrong Function clone type");
+      default: return super.clone();
+    endcase
+  endfunction
+endclass
+
+class rdma_cmq_clone_fault_handle extends rdma_handle;
+  `uvm_object_utils(rdma_cmq_clone_fault_handle)
+
+  rdma_cmq_test_clone_fault_e clone_fault;
+
+  function new(string name = "rdma_cmq_clone_fault_handle");
+    super.new(name);
+    clone_fault = RDMA_CMQ_TEST_CLONE_GOOD;
+  endfunction
+
+  virtual function uvm_object clone();
+    case (clone_fault)
+      RDMA_CMQ_TEST_CLONE_NULL: return null;
+      RDMA_CMQ_TEST_CLONE_SELF: return this;
+      RDMA_CMQ_TEST_CLONE_WRONG_TYPE:
+        return rdma_status::success("wrong handle clone type");
       default: return super.clone();
     endcase
   endfunction
@@ -79,6 +103,8 @@ class rdma_cmq_clone_fault_opcode_key extends rdma_cmq_opcode_key;
     case (clone_fault)
       RDMA_CMQ_TEST_CLONE_NULL: return null;
       RDMA_CMQ_TEST_CLONE_SELF: return this;
+      RDMA_CMQ_TEST_CLONE_WRONG_TYPE:
+        return rdma_status::success("wrong opcode clone type");
       default: return super.clone();
     endcase
   endfunction
@@ -98,6 +124,8 @@ class rdma_cmq_clone_fault_body extends rdma_cmq_sqe_model;
     case (clone_fault)
       RDMA_CMQ_TEST_CLONE_NULL: return null;
       RDMA_CMQ_TEST_CLONE_SELF: return this;
+      RDMA_CMQ_TEST_CLONE_WRONG_TYPE:
+        return rdma_status::success("wrong body clone type");
       default: return super.clone();
     endcase
   endfunction
@@ -318,6 +346,7 @@ class rdma_cmq_test_profile extends rdma_cmq_hw_profile;
   int unsigned sqe_fault_compose_call;
   rdma_cmq_test_doorbell_fault_e doorbell_fault;
   bit [31:0] fail_compose_opcode;
+  int unsigned null_compose_call;
   rdma_status_code_e compose_failure_code;
   bit fail_doorbell_encode;
   rdma_status_code_e doorbell_failure_code;
@@ -337,6 +366,7 @@ class rdma_cmq_test_profile extends rdma_cmq_hw_profile;
     sqe_fault_compose_call = 0;
     doorbell_fault = RDMA_CMQ_TEST_DB_GOOD;
     fail_compose_opcode = '0;
+    null_compose_call = 0;
     compose_failure_code = RDMA_SC_CODEC_ERROR;
     fail_doorbell_encode = 1'b0;
     doorbell_failure_code = RDMA_SC_CODEC_ERROR;
@@ -386,6 +416,10 @@ class rdma_cmq_test_profile extends rdma_cmq_hw_profile;
     if (slot == null)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "test profile slot is null");
+    if (null_compose_call != 0 && compose_calls == null_compose_call) begin
+      null_compose_call = 0;
+      return null;
+    end
     if (fail_compose_opcode != 0 &&
         command.opcode_key.opcode == fail_compose_opcode)
       return rdma_status::make(compose_failure_code,
@@ -639,15 +673,19 @@ class rdma_cmq_bad_clone_command extends rdma_cmq_command_desc;
   `uvm_object_utils(rdma_cmq_bad_clone_command)
 
   bit return_wrong_type;
+  bit return_self;
 
   function new(string name = "rdma_cmq_bad_clone_command");
     super.new(name);
     return_wrong_type = 1'b0;
+    return_self = 1'b0;
   endfunction
 
   virtual function uvm_object clone();
     if (return_wrong_type)
       return rdma_status::success("wrong command clone type");
+    if (return_self)
+      return this;
     return null;
   endfunction
 endclass
@@ -2919,6 +2957,7 @@ class rdma_cmq_engine_test extends uvm_test;
     rdma_cmq_runtime_desc runtime_desc;
     rdma_cmq_command_desc requests[];
     rdma_cmq_clone_fault_function_handle fault_function;
+    rdma_cmq_clone_fault_handle fault_handle;
     rdma_cmq_clone_fault_opcode_key fault_opcode;
     rdma_cmq_clone_fault_body fault_body;
     rdma_cmq_clone_fault_image fault_image;
@@ -2948,7 +2987,7 @@ class rdma_cmq_engine_test extends uvm_test;
                    prepared_binding, active_binding, cmq, runtime_desc);
     clear_submit_observation(mem, pcie, trace);
 
-    requests = new[8];
+    requests = new[17];
     foreach (requests[i])
       requests[i] = make_command(
         $sformatf("nested_clone_%0d", i), active_binding,
@@ -3013,6 +3052,84 @@ class rdma_cmq_engine_test extends uvm_test;
     fault_image.clone_fault = RDMA_CMQ_TEST_CLONE_SELF;
     requests[7].qpc_signature_source = fault_image;
 
+    if (!$cast(source_body, requests[8].body))
+      `uvm_fatal("NESTED_CLONE_SETUP", "source body type is invalid")
+    fault_function =
+      rdma_cmq_clone_fault_function_handle::type_id::create(
+        "nested_body_function_null"
+      );
+    fault_function.copy(source_body.function_h);
+    fault_function.clone_fault = RDMA_CMQ_TEST_CLONE_NULL;
+    source_body.function_h = fault_function;
+    if (!$cast(source_body, requests[9].body))
+      `uvm_fatal("NESTED_CLONE_SETUP", "source body type is invalid")
+    fault_function =
+      rdma_cmq_clone_fault_function_handle::type_id::create(
+        "nested_body_function_wrong"
+      );
+    fault_function.copy(source_body.function_h);
+    fault_function.clone_fault = RDMA_CMQ_TEST_CLONE_WRONG_TYPE;
+    source_body.function_h = fault_function;
+    if (!$cast(source_body, requests[10].body))
+      `uvm_fatal("NESTED_CLONE_SETUP", "source body type is invalid")
+    fault_function =
+      rdma_cmq_clone_fault_function_handle::type_id::create(
+        "nested_body_function_self"
+      );
+    fault_function.copy(source_body.function_h);
+    fault_function.clone_fault = RDMA_CMQ_TEST_CLONE_SELF;
+    source_body.function_h = fault_function;
+
+    if (!$cast(source_body, requests[11].body))
+      `uvm_fatal("NESTED_CLONE_SETUP", "source body type is invalid")
+    fault_handle = rdma_cmq_clone_fault_handle::type_id::create(
+      "nested_body_target_null"
+    );
+    fault_handle.copy(source_body.target_h);
+    fault_handle.clone_fault = RDMA_CMQ_TEST_CLONE_NULL;
+    source_body.target_h = fault_handle;
+    if (!$cast(source_body, requests[12].body))
+      `uvm_fatal("NESTED_CLONE_SETUP", "source body type is invalid")
+    fault_handle = rdma_cmq_clone_fault_handle::type_id::create(
+      "nested_body_target_wrong"
+    );
+    fault_handle.copy(source_body.target_h);
+    fault_handle.clone_fault = RDMA_CMQ_TEST_CLONE_WRONG_TYPE;
+    source_body.target_h = fault_handle;
+    if (!$cast(source_body, requests[13].body))
+      `uvm_fatal("NESTED_CLONE_SETUP", "source body type is invalid")
+    fault_handle = rdma_cmq_clone_fault_handle::type_id::create(
+      "nested_body_target_self"
+    );
+    fault_handle.copy(source_body.target_h);
+    fault_handle.clone_fault = RDMA_CMQ_TEST_CLONE_SELF;
+    source_body.target_h = fault_handle;
+
+    if (!$cast(source_body, requests[14].body))
+      `uvm_fatal("NESTED_CLONE_SETUP", "source body type is invalid")
+    fault_body = rdma_cmq_clone_fault_body::type_id::create(
+      "nested_body_context_null"
+    );
+    fault_body.copy(source_body);
+    fault_body.clone_fault = RDMA_CMQ_TEST_CLONE_NULL;
+    source_body.context_model = fault_body;
+    if (!$cast(source_body, requests[15].body))
+      `uvm_fatal("NESTED_CLONE_SETUP", "source body type is invalid")
+    fault_body = rdma_cmq_clone_fault_body::type_id::create(
+      "nested_body_context_wrong"
+    );
+    fault_body.copy(source_body);
+    fault_body.clone_fault = RDMA_CMQ_TEST_CLONE_WRONG_TYPE;
+    source_body.context_model = fault_body;
+    if (!$cast(source_body, requests[16].body))
+      `uvm_fatal("NESTED_CLONE_SETUP", "source body type is invalid")
+    fault_body = rdma_cmq_clone_fault_body::type_id::create(
+      "nested_body_context_self"
+    );
+    fault_body.copy(source_body);
+    fault_body.clone_fault = RDMA_CMQ_TEST_CLONE_SELF;
+    source_body.context_model = fault_body;
+
     engine.submit_batch(requests, tickets, item_statuses, batch_status);
     expect_status("NESTED_CLONE_BATCH", batch_status, RDMA_SC_OK);
     if (tickets.size() != requests.size() ||
@@ -3038,6 +3155,125 @@ class rdma_cmq_engine_test extends uvm_test;
 
     engine.shutdown(status);
     expect_status("NESTED_CLONE_SHUTDOWN", status, RDMA_SC_OK);
+  endtask
+
+  task automatic check_null_compose_transaction_abort();
+    rdma_cmq_engine_probe engine;
+    rdma_mock_host_mem mem;
+    rdma_mock_pcie pcie;
+    rdma_mock_call_trace trace;
+    rdma_doorbell_scheduler scheduler;
+    rdma_cmq_test_profile profile;
+    rdma_function_binding prepared_binding;
+    rdma_function_binding active_binding;
+    rdma_cmq cmq;
+    rdma_cmq_runtime_desc runtime_desc;
+    rdma_cmq_command_desc requests[];
+    rdma_cmq_ticket tickets[];
+    rdma_status item_statuses[];
+    rdma_status batch_status;
+    rdma_status status;
+
+    engine = rdma_cmq_engine_probe::type_id::create(
+      "null_compose_engine"
+    );
+    mem = rdma_mock_host_mem::type_id::create("null_compose_mem");
+    pcie = rdma_cmq_test_pcie::type_id::create("null_compose_pcie");
+    trace = rdma_mock_call_trace::type_id::create("null_compose_trace");
+    mem.set_call_trace(trace);
+    pcie.set_call_trace(trace);
+    scheduler = rdma_doorbell_scheduler::type_id::create(
+      "null_compose_scheduler"
+    );
+    profile = rdma_cmq_test_profile::type_id::create(
+      "null_compose_profile"
+    );
+    prepared_binding = make_binding("null_compose_prepared",
+                                    RDMA_BIND_PREPARED);
+    active_binding = make_binding("null_compose_active", RDMA_BIND_ACTIVE);
+    cmq = make_cmq("null_compose_cmq", prepared_binding);
+    prepare_active("NULL_COMPOSE", engine, mem, pcie, scheduler, profile,
+                   prepared_binding, active_binding, cmq, runtime_desc);
+    clear_submit_observation(mem, pcie, trace);
+
+    requests = new[6];
+    requests[0] = make_command(
+      "null_compose_invalid", active_binding,
+      rdma_cmq_test_profile::TEST_OPCODE_A, 8'h40
+    );
+    requests[0].body = null;
+    requests[1] = make_command(
+      "null_compose_unsupported", active_binding,
+      rdma_cmq_test_profile::TEST_OPCODE_UNSUPPORTED, 8'h41
+    );
+    requests[2] = make_command(
+      "null_compose_codec", active_binding,
+      rdma_cmq_test_profile::TEST_OPCODE_B, 8'h42
+    );
+    requests[3] = make_command(
+      "null_compose_tentative", active_binding,
+      rdma_cmq_test_profile::TEST_OPCODE_A, 8'h43
+    );
+    requests[4] = make_command(
+      "null_compose_trigger", active_binding,
+      rdma_cmq_test_profile::TEST_OPCODE_A, 8'h44
+    );
+    requests[5] = make_command(
+      "null_compose_unprocessed", active_binding,
+      rdma_cmq_test_profile::TEST_OPCODE_A, 8'h45
+    );
+    profile.fail_compose_opcode = rdma_cmq_test_profile::TEST_OPCODE_B;
+    profile.null_compose_call = 4;
+
+    engine.submit_batch(requests, tickets, item_statuses, batch_status);
+    expect_status("NULL_COMPOSE_BATCH", batch_status,
+                  RDMA_SC_INVALID_STATE);
+    if (tickets.size() != requests.size() ||
+        item_statuses.size() != requests.size())
+      `uvm_error("NULL_COMPOSE_ALIGNMENT",
+                 "null-compose outputs are misaligned")
+    else begin
+      expect_status("NULL_COMPOSE_INVALID", item_statuses[0],
+                    RDMA_SC_INVALID_ARGUMENT);
+      expect_status("NULL_COMPOSE_UNSUPPORTED", item_statuses[1],
+                    RDMA_SC_UNSUPPORTED_OPCODE);
+      expect_status("NULL_COMPOSE_CODEC", item_statuses[2],
+                    RDMA_SC_CODEC_ERROR);
+      for (int unsigned i = 3; i < requests.size(); i++)
+        expect_status($sformatf("NULL_COMPOSE_ABORTED_%0d", i),
+                      item_statuses[i], RDMA_SC_INVALID_STATE);
+      foreach (tickets[i])
+        if (tickets[i] != null)
+          `uvm_error("NULL_COMPOSE_TICKET",
+                     $sformatf("null-compose item %0d returned a ticket", i))
+    end
+    expect_no_submit_side_effects("NULL_COMPOSE_EFFECTS", mem, pcie,
+                                  trace);
+    if (engine.published_count() != 0 ||
+        engine.tokens_in_use_count() != 0 ||
+        engine.slot_record_count() != 0)
+      `uvm_error("NULL_COMPOSE_LEDGER",
+                 "null compose status committed tentative state")
+
+    profile.fail_compose_opcode = '0;
+    clear_submit_observation(mem, pcie, trace);
+    requests = new[1];
+    requests[0] = make_command(
+      "null_compose_recovery", active_binding,
+      rdma_cmq_test_profile::TEST_OPCODE_A, 8'h46
+    );
+    engine.submit_batch(requests, tickets, item_statuses, batch_status);
+    expect_status("NULL_COMPOSE_RECOVERY_BATCH", batch_status, RDMA_SC_OK);
+    if (tickets.size() != 1 || tickets[0] == null ||
+        item_statuses.size() != 1)
+      `uvm_error("NULL_COMPOSE_RECOVERY",
+                 "submission did not recover after null compose status")
+    else
+      expect_status("NULL_COMPOSE_RECOVERY_ITEM", item_statuses[0],
+                    RDMA_SC_OK);
+
+    engine.shutdown(status);
+    expect_status("NULL_COMPOSE_SHUTDOWN", status, RDMA_SC_OK);
   endtask
 
   task automatic check_transaction_failure_atomicity();
@@ -3194,12 +3430,13 @@ class rdma_cmq_engine_test extends uvm_test;
     rdma_cmq cmq;
     rdma_cmq_runtime_desc runtime_desc;
     rdma_cmq_command_desc requests[];
+    rdma_cmq_command_desc valid_clone_source;
     rdma_cmq_bad_clone_command bad_clone;
     rdma_cmq_ticket tickets[];
     rdma_status item_statuses[];
     rdma_status batch_status;
     rdma_status status;
-    rdma_status_code_e expected_validation_codes[10] = '{
+    rdma_status_code_e expected_validation_codes[11] = '{
       RDMA_SC_INVALID_ARGUMENT,
       RDMA_SC_INVALID_ARGUMENT,
       RDMA_SC_INVALID_ARGUMENT,
@@ -3207,6 +3444,7 @@ class rdma_cmq_engine_test extends uvm_test;
       RDMA_SC_INVALID_ARGUMENT,
       RDMA_SC_STALE_GENERATION,
       RDMA_SC_UNSUPPORTED_OPCODE,
+      RDMA_SC_INVALID_ARGUMENT,
       RDMA_SC_INVALID_ARGUMENT,
       RDMA_SC_INVALID_ARGUMENT,
       RDMA_SC_INVALID_ARGUMENT
@@ -3258,7 +3496,7 @@ class rdma_cmq_engine_test extends uvm_test;
                    prepared_binding, active_binding, cmq, runtime_desc);
     clear_submit_observation(mem, pcie, trace);
 
-    requests = new[10];
+    requests = new[11];
     requests[0] = null;
     requests[1] = make_command("validation_body", active_binding,
                                rdma_cmq_test_profile::TEST_OPCODE_A, 8'h01);
@@ -3284,12 +3522,32 @@ class rdma_cmq_engine_test extends uvm_test;
     bad_clone = rdma_cmq_bad_clone_command::type_id::create(
       "validation_null_clone"
     );
+    valid_clone_source = make_command(
+      "validation_null_clone_source", active_binding,
+      rdma_cmq_test_profile::TEST_OPCODE_A, 8'h08
+    );
+    bad_clone.copy(valid_clone_source);
     requests[8] = bad_clone;
     bad_clone = rdma_cmq_bad_clone_command::type_id::create(
       "validation_wrong_clone"
     );
+    valid_clone_source = make_command(
+      "validation_wrong_clone_source", active_binding,
+      rdma_cmq_test_profile::TEST_OPCODE_A, 8'h09
+    );
+    bad_clone.copy(valid_clone_source);
     bad_clone.return_wrong_type = 1'b1;
     requests[9] = bad_clone;
+    bad_clone = rdma_cmq_bad_clone_command::type_id::create(
+      "validation_self_clone"
+    );
+    valid_clone_source = make_command(
+      "validation_self_clone_source", active_binding,
+      rdma_cmq_test_profile::TEST_OPCODE_A, 8'h0a
+    );
+    bad_clone.copy(valid_clone_source);
+    bad_clone.return_self = 1'b1;
+    requests[10] = bad_clone;
     engine.submit_batch(requests, tickets, item_statuses, batch_status);
     expect_status("VALIDATION_BATCH", batch_status, RDMA_SC_OK);
     if (tickets.size() != requests.size() ||
@@ -3770,6 +4028,7 @@ class rdma_cmq_engine_test extends uvm_test;
     check_batch_compaction_and_doorbell();
     check_empty_invalid_and_state_rejections();
     check_submit_wrapper_and_snapshot_detachment();
+    check_null_compose_transaction_abort();
     check_nested_command_snapshot_failures();
     check_transaction_failure_atomicity();
     check_submission_validation_and_profile_metadata();

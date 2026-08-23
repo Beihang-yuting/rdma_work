@@ -510,6 +510,63 @@ class rdma_cmq_engine extends uvm_object;
            lhs.ready == rhs.ready;
   endfunction
 
+  protected function automatic bit same_body_value(
+    rdma_hw_model lhs,
+    rdma_hw_model rhs
+  );
+    rdma_cmq_sqe_model lhs_sqe;
+    rdma_cmq_sqe_model rhs_sqe;
+
+    if (lhs == null || rhs == null ||
+        lhs.get_type_name() != rhs.get_type_name())
+      return 1'b0;
+    if (!$cast(lhs_sqe, lhs))
+      return 1'b1;
+    if (!$cast(rhs_sqe, rhs))
+      return 1'b0;
+    if (lhs_sqe.opcode != rhs_sqe.opcode ||
+        lhs_sqe.command_id != rhs_sqe.command_id ||
+        lhs_sqe.flags != rhs_sqe.flags ||
+        !same_handle(lhs_sqe.function_h, rhs_sqe.function_h))
+      return 1'b0;
+    if ((lhs_sqe.target_h == null) != (rhs_sqe.target_h == null))
+      return 1'b0;
+    if (lhs_sqe.target_h != null &&
+        !same_handle(lhs_sqe.target_h, rhs_sqe.target_h))
+      return 1'b0;
+    if ((lhs_sqe.context_model == null) !=
+        (rhs_sqe.context_model == null))
+      return 1'b0;
+    if (lhs_sqe.context_model != null &&
+        !same_body_value(lhs_sqe.context_model, rhs_sqe.context_model))
+      return 1'b0;
+    return 1'b1;
+  endfunction
+
+  protected function automatic bit body_graph_detached(
+    rdma_hw_model source,
+    rdma_hw_model snapshot
+  );
+    rdma_cmq_sqe_model source_sqe;
+    rdma_cmq_sqe_model snapshot_sqe;
+
+    if (source == null || snapshot == null || snapshot == source)
+      return 1'b0;
+    if (!$cast(source_sqe, source))
+      return 1'b1;
+    if (!$cast(snapshot_sqe, snapshot) ||
+        source_sqe.function_h == snapshot_sqe.function_h)
+      return 1'b0;
+    if (source_sqe.target_h != null &&
+        source_sqe.target_h == snapshot_sqe.target_h)
+      return 1'b0;
+    if (source_sqe.context_model != null &&
+        !body_graph_detached(source_sqe.context_model,
+                             snapshot_sqe.context_model))
+      return 1'b0;
+    return 1'b1;
+  endfunction
+
   protected function rdma_status checked_function_snapshot(
     rdma_function_handle source,
     string label,
@@ -660,6 +717,14 @@ class rdma_cmq_engine extends uvm_object;
     uvm_object cloned_object;
     rdma_status status;
     string source_type_name;
+    rdma_cmq_sqe_model source_sqe;
+    rdma_cmq_sqe_model cloned_sqe;
+    rdma_function_handle function_snapshot;
+    rdma_handle target_snapshot;
+    rdma_hw_model context_snapshot;
+    rdma_cmq_opcode_e saved_opcode;
+    longint unsigned saved_command_id;
+    int unsigned saved_flags;
 
     snapshot = null;
     if (source == null)
@@ -672,6 +737,35 @@ class rdma_cmq_engine extends uvm_object;
     if (!status.ok())
       return status;
     source_type_name = source.get_type_name();
+    if ($cast(source_sqe, source)) begin
+      saved_opcode = source_sqe.opcode;
+      saved_command_id = source_sqe.command_id;
+      saved_flags = source_sqe.flags;
+      status = checked_function_snapshot(
+        source_sqe.function_h, {label, " body"}, failure_code,
+        function_snapshot
+      );
+      if (!status.ok())
+        return status;
+      target_snapshot = null;
+      if (source_sqe.target_h != null) begin
+        status = checked_handle_snapshot(
+          source_sqe.target_h, {label, " body target"}, failure_code,
+          target_snapshot
+        );
+        if (!status.ok())
+          return status;
+      end
+      context_snapshot = null;
+      if (source_sqe.context_model != null) begin
+        status = checked_body_snapshot(
+          source_sqe.context_model, {label, " body context"}, failure_code,
+          context_snapshot
+        );
+        if (!status.ok())
+          return status;
+      end
+    end
     cloned_object = source.clone();
     if (cloned_object == null || !$cast(snapshot, cloned_object) ||
         snapshot == source || snapshot.get_type_name() != source_type_name) begin
@@ -679,6 +773,42 @@ class rdma_cmq_engine extends uvm_object;
       return snapshot_failure(
         failure_code, {label, " body snapshot clone contract failed"}
       );
+    end
+    if (source_sqe != null) begin
+      if (!$cast(cloned_sqe, snapshot) ||
+          source_sqe.opcode != saved_opcode ||
+          source_sqe.command_id != saved_command_id ||
+          source_sqe.flags != saved_flags ||
+          cloned_sqe.opcode != saved_opcode ||
+          cloned_sqe.command_id != saved_command_id ||
+          cloned_sqe.flags != saved_flags ||
+          !same_handle(source_sqe.function_h, function_snapshot) ||
+          !same_handle(cloned_sqe.function_h, function_snapshot) ||
+          cloned_sqe.function_h == source_sqe.function_h ||
+          ((source_sqe.target_h == null) != (target_snapshot == null)) ||
+          ((cloned_sqe.target_h == null) != (target_snapshot == null)) ||
+          (target_snapshot != null &&
+           (!same_handle(source_sqe.target_h, target_snapshot) ||
+            !same_handle(cloned_sqe.target_h, target_snapshot) ||
+            cloned_sqe.target_h == source_sqe.target_h)) ||
+          ((source_sqe.context_model == null) !=
+           (context_snapshot == null)) ||
+          ((cloned_sqe.context_model == null) !=
+           (context_snapshot == null)) ||
+          (context_snapshot != null &&
+           (!same_body_value(source_sqe.context_model, context_snapshot) ||
+            !same_body_value(cloned_sqe.context_model, context_snapshot) ||
+            !body_graph_detached(source_sqe.context_model,
+                                 cloned_sqe.context_model)))) begin
+        snapshot = null;
+        return snapshot_failure(
+          failure_code, {label, " body snapshot changed its source value"}
+        );
+      end
+      cloned_sqe.function_h = function_snapshot;
+      cloned_sqe.target_h = target_snapshot;
+      cloned_sqe.context_model = context_snapshot;
+      snapshot = cloned_sqe;
     end
     status = snapshot.validate();
     if (status == null) begin
@@ -798,51 +928,103 @@ class rdma_cmq_engine extends uvm_object;
     output rdma_cmq_command_desc snapshot
   );
     rdma_status status;
+    uvm_object cloned_object;
+    rdma_cmq_command_desc cloned_command;
+    rdma_function_handle function_snapshot;
+    rdma_cmq_opcode_key opcode_snapshot;
+    rdma_hw_model body_snapshot;
+    rdma_hw_image signature_snapshot;
+    rdma_function_handle saved_function_source;
+    rdma_cmq_opcode_key saved_opcode_source;
+    rdma_hw_model saved_body_source;
+    rdma_hw_image saved_signature_source;
+    string source_type_name;
+    bit saved_vfid_override;
+    bit [10:0] saved_use_vfid;
+    time saved_timeout;
 
     snapshot = null;
     if (source == null)
       return invalid_argument("CMQ command is null");
-    snapshot = rdma_cmq_command_desc::type_id::create(
-      "cmq_command_snapshot"
-    );
-    if (snapshot == null)
-      return invalid_state("CMQ command snapshot construction failed");
+    saved_function_source = source.function_h;
+    saved_opcode_source = source.opcode_key;
+    saved_body_source = source.body;
+    saved_signature_source = source.qpc_signature_source;
+    source_type_name = source.get_type_name();
+    saved_vfid_override = source.vfid_override;
+    saved_use_vfid = source.use_vfid;
+    saved_timeout = source.timeout;
     status = checked_function_snapshot(
       source.function_h, "CMQ command", RDMA_SC_INVALID_ARGUMENT,
-      snapshot.function_h
+      function_snapshot
     );
-    if (!status.ok()) begin
-      snapshot = null;
+    if (!status.ok())
       return status;
-    end
     status = checked_opcode_snapshot(
       source.opcode_key, "CMQ command", RDMA_SC_INVALID_ARGUMENT,
-      snapshot.opcode_key
+      opcode_snapshot
     );
-    if (!status.ok()) begin
-      snapshot = null;
+    if (!status.ok())
       return status;
-    end
     status = checked_body_snapshot(
-      source.body, "CMQ command", RDMA_SC_INVALID_ARGUMENT, snapshot.body
+      source.body, "CMQ command", RDMA_SC_INVALID_ARGUMENT, body_snapshot
     );
-    if (!status.ok()) begin
-      snapshot = null;
+    if (!status.ok())
       return status;
-    end
+    signature_snapshot = null;
     if (source.qpc_signature_source != null) begin
       status = checked_image_snapshot(
         source.qpc_signature_source, "CMQ command signature",
-        RDMA_SC_INVALID_ARGUMENT, snapshot.qpc_signature_source
+        RDMA_SC_INVALID_ARGUMENT, signature_snapshot
       );
-      if (!status.ok()) begin
-        snapshot = null;
+      if (!status.ok())
         return status;
-      end
     end
-    snapshot.vfid_override = source.vfid_override;
-    snapshot.use_vfid = source.use_vfid;
-    snapshot.timeout = source.timeout;
+
+    cloned_object = source.clone();
+    if (cloned_object == null || !$cast(cloned_command, cloned_object) ||
+        cloned_command == source ||
+        cloned_command.get_type_name() != source_type_name) begin
+      return invalid_argument("CMQ command snapshot clone contract failed");
+    end
+    if (source.function_h != saved_function_source ||
+        source.opcode_key != saved_opcode_source ||
+        source.body != saved_body_source ||
+        source.qpc_signature_source != saved_signature_source ||
+        source.vfid_override != saved_vfid_override ||
+        source.use_vfid != saved_use_vfid ||
+        source.timeout != saved_timeout ||
+        cloned_command.vfid_override != saved_vfid_override ||
+        cloned_command.use_vfid != saved_use_vfid ||
+        cloned_command.timeout != saved_timeout ||
+        !same_handle(source.function_h, function_snapshot) ||
+        !same_handle(cloned_command.function_h, function_snapshot) ||
+        cloned_command.function_h == source.function_h ||
+        !same_opcode_value(source.opcode_key, opcode_snapshot) ||
+        !same_opcode_value(cloned_command.opcode_key, opcode_snapshot) ||
+        cloned_command.opcode_key == source.opcode_key ||
+        !same_body_value(source.body, body_snapshot) ||
+        !same_body_value(cloned_command.body, body_snapshot) ||
+        !body_graph_detached(source.body, cloned_command.body) ||
+        ((source.qpc_signature_source == null) !=
+         (signature_snapshot == null)) ||
+        ((cloned_command.qpc_signature_source == null) !=
+         (signature_snapshot == null)) ||
+        (signature_snapshot != null &&
+         (!same_image_value(source.qpc_signature_source,
+                            signature_snapshot) ||
+          !same_image_value(cloned_command.qpc_signature_source,
+                            signature_snapshot) ||
+          cloned_command.qpc_signature_source ==
+            source.qpc_signature_source))) begin
+      return invalid_argument("CMQ command snapshot changed its source value");
+    end
+
+    snapshot = cloned_command;
+    snapshot.function_h = function_snapshot;
+    snapshot.opcode_key = opcode_snapshot;
+    snapshot.body = body_snapshot;
+    snapshot.qpc_signature_source = signature_snapshot;
     status = snapshot.validate();
     if (status == null) begin
       snapshot = null;
@@ -1901,8 +2083,13 @@ class rdma_cmq_engine extends uvm_object;
 
       status = profile.compose_sqe(command_snapshot, slot_context_snapshot,
                                    profile_sqe, profile_expected);
-      if (status == null)
-        status = invalid_state("CMQ SQE composition returned null status");
+      if (status == null) begin
+        transaction_status = invalid_state(
+          "CMQ SQE composition returned null status"
+        );
+        transaction_failed = 1'b1;
+        break;
+      end
       if (!status.ok()) begin
         tentative_token_reserved[selected_token] = 1'b0;
         item_statuses[i] = rdma_cmq_clone_status_value(status);
