@@ -70,7 +70,9 @@ typedef enum int unsigned {
   RDMA_CMQ_TEST_DECODED_NONZERO_HARDWARE_INVALID,
   RDMA_CMQ_TEST_DECODED_HARDWARE_MISMATCH,
   RDMA_CMQ_TEST_DECODED_CATEGORY_MISMATCH,
-  RDMA_CMQ_TEST_DECODED_SEVERITY_MISMATCH
+  RDMA_CMQ_TEST_DECODED_SEVERITY_MISMATCH,
+  RDMA_CMQ_TEST_DECODED_NONZERO_WARNING,
+  RDMA_CMQ_TEST_DECODED_NONZERO_FATAL
 } rdma_cmq_test_decoded_contract_fault_e;
 
 typedef enum int unsigned {
@@ -561,14 +563,24 @@ class rdma_cmq_poll_raw_self_image extends rdma_hw_image;
   `uvm_object_utils(rdma_cmq_poll_raw_self_image)
 
   local static bit arm_next_raw_self_clone;
+  local static bit arm_next_raw_stateful_clone;
+  local static int unsigned total_clone_calls;
   bit self_clone;
+  bit stateful_clone;
+  int unsigned stateful_clone_calls;
 
   function new(string name = "rdma_cmq_poll_raw_self_image");
     super.new(name);
     self_clone = 1'b0;
+    stateful_clone = 1'b0;
+    stateful_clone_calls = 0;
     if (name == "cmq_raw_cqe" && arm_next_raw_self_clone) begin
       self_clone = 1'b1;
       arm_next_raw_self_clone = 1'b0;
+    end
+    else if (name == "cmq_raw_cqe" && arm_next_raw_stateful_clone) begin
+      stateful_clone = 1'b1;
+      arm_next_raw_stateful_clone = 1'b0;
     end
   endfunction
 
@@ -576,13 +588,50 @@ class rdma_cmq_poll_raw_self_image extends rdma_hw_image;
     arm_next_raw_self_clone = 1'b1;
   endfunction
 
+  static function void arm_next_raw_stateful();
+    arm_next_raw_stateful_clone = 1'b1;
+  endfunction
+
+  static function void clear_clone_calls();
+    total_clone_calls = 0;
+  endfunction
+
+  static function int unsigned clone_call_count();
+    return total_clone_calls;
+  endfunction
+
   static function void disarm();
     arm_next_raw_self_clone = 1'b0;
+    arm_next_raw_stateful_clone = 1'b0;
+  endfunction
+
+  virtual function void do_copy(uvm_object rhs);
+    rdma_cmq_poll_raw_self_image rhs_image;
+
+    super.do_copy(rhs);
+    if (!$cast(rhs_image, rhs))
+      `uvm_fatal("RDMA_COPY_TYPE",
+                 "poll raw image copy type mismatch")
+    self_clone = rhs_image.self_clone;
+    stateful_clone = rhs_image.stateful_clone;
+    stateful_clone_calls = rhs_image.stateful_clone_calls;
   endfunction
 
   virtual function uvm_object clone();
+    uvm_object cloned_object;
+
     if (self_clone)
       return this;
+    if (stateful_clone) begin
+      total_clone_calls++;
+      stateful_clone_calls++;
+      if (stateful_clone_calls == 2 && bytes.size() != 0)
+        bytes[0] ^= 8'hff;
+      cloned_object = super.clone();
+      if (stateful_clone_calls == 1)
+        stateful_clone = 1'b0;
+      return cloned_object;
+    end
     return super.clone();
   endfunction
 endclass
@@ -1209,6 +1258,12 @@ class rdma_cmq_test_profile extends rdma_cmq_hw_profile;
       RDMA_CMQ_TEST_DECODED_SEVERITY_MISMATCH: begin
         decoded.hardware_ecode = 32'h1;
         decoded.command_status.severity = RDMA_SEVERITY_INFO;
+      end
+      RDMA_CMQ_TEST_DECODED_NONZERO_WARNING: begin
+        decoded.command_status.severity = RDMA_SEVERITY_WARNING;
+      end
+      RDMA_CMQ_TEST_DECODED_NONZERO_FATAL: begin
+        decoded.command_status.severity = RDMA_SEVERITY_FATAL;
       end
       default: begin
       end
@@ -8064,6 +8119,33 @@ class rdma_cmq_engine_test extends uvm_test;
       )
     rdma_cmq_poll_raw_self_image::disarm();
 
+    profile.mutate_raw_cqe_input = 1'b0;
+    rdma_cmq_poll_raw_self_image::clear_clone_calls();
+    rdma_cmq_poll_raw_self_image::arm_next_raw_stateful();
+    engine.poll(completions, diagnostics, status);
+    expect_status("POLL_RAW_SNAPSHOT_RETRY_STATUS", status, RDMA_SC_OK);
+    if (rdma_cmq_poll_raw_self_image::clone_call_count() != 1)
+      `uvm_error(
+        "POLL_RAW_SNAPSHOT_RETRY_CLONES",
+        $sformatf(
+          "raw snapshot was cloned %0d times instead of once",
+          rdma_cmq_poll_raw_self_image::clone_call_count()
+        )
+      )
+    if (completions.size() != 1 || diagnostics.size() != 0 ||
+        completions[0] == null || completions[0].raw_cqe == null ||
+        !engine.probe_same_image(completions[0].raw_cqe, raw_cqe) ||
+        engine.cq_consumed_count() != 1 || engine.retired_count() != 1 ||
+        engine.tokens_in_use_count() != 0 ||
+        engine.slot_record_count() != 0 ||
+        engine.command_registry_count() != 0 ||
+        engine.entry_registry_count() != 0)
+      `uvm_error(
+        "POLL_RAW_SNAPSHOT_RETRY",
+        "raw snapshot retry did not deliver the original CQE atomically"
+      )
+    rdma_cmq_poll_raw_self_image::disarm();
+
     engine.shutdown(status);
     expect_status("POLL_RAW_SNAPSHOT_SHUTDOWN", status, RDMA_SC_OK);
   endtask
@@ -8270,7 +8352,10 @@ class rdma_cmq_engine_test extends uvm_test;
 
   task automatic check_poll_decoded_status_contract_failures();
     rdma_cmq_test_decoded_contract_fault_e faults[7];
+    rdma_cmq_test_decoded_contract_fault_e legal_faults[2];
+    rdma_severity_e legal_severities[2];
     string labels[7];
+    string legal_labels[2];
     rdma_cmq_engine_probe engine;
     rdma_mock_host_mem mem;
     rdma_cmq_test_pcie pcie;
@@ -8302,6 +8387,12 @@ class rdma_cmq_engine_test extends uvm_test;
     labels[4] = "HARDWARE_MISMATCH";
     labels[5] = "CATEGORY_MISMATCH";
     labels[6] = "SEVERITY_MISMATCH";
+    legal_faults[0] = RDMA_CMQ_TEST_DECODED_NONZERO_WARNING;
+    legal_faults[1] = RDMA_CMQ_TEST_DECODED_NONZERO_FATAL;
+    legal_severities[0] = RDMA_SEVERITY_WARNING;
+    legal_severities[1] = RDMA_SEVERITY_FATAL;
+    legal_labels[0] = "NONZERO_WARNING";
+    legal_labels[1] = "NONZERO_FATAL";
 
     engine = rdma_cmq_engine_probe::type_id::create(
       "poll_decoded_contract_engine"
@@ -8393,9 +8484,78 @@ class rdma_cmq_engine_test extends uvm_test;
       end
     end
 
-    if (engine.published_count() != $size(faults) ||
-        engine.cq_consumed_count() != $size(faults) ||
-        engine.retired_count() != $size(faults))
+    foreach (legal_faults[i]) begin
+      bit legal_poll_ok;
+      string label;
+
+      label = {"POLL_DECODED_CONTRACT_", legal_labels[i]};
+      request = make_command(
+        $sformatf("poll_decoded_contract_legal_request_%0d", i),
+        active_binding, rdma_cmq_test_profile::TEST_OPCODE_A,
+        byte'(8'h70 + i), 10us
+      );
+      engine.submit(request, ticket, status);
+      expect_status({label, "_SUBMIT"}, status, RDMA_SC_OK);
+      write_profile_cqe(
+        {label, "_CQE"}, mem, mapping, profile, $size(faults) + i,
+        1'b1, ticket, 32'h1, raw_cqe
+      );
+
+      profile.decoded_contract_fault = legal_faults[i];
+      engine.poll(completions, diagnostics, status);
+      legal_poll_ok = status != null && status.ok();
+      expect_status({label, "_STATUS"}, status, RDMA_SC_OK);
+      if (!legal_poll_ok || completions.size() != 1 ||
+          diagnostics.size() != 0 || completions[0] == null ||
+          completions[0].ticket == null ||
+          completions[0].ticket.command_id != ticket.command_id ||
+          completions[0].status == null || completions[0].status.ok() ||
+          completions[0].status.category !=
+            rdma_status::category_for(completions[0].status.code) ||
+          !completions[0].status.hardware_code_valid ||
+          completions[0].status.hardware_code != 32'h1 ||
+          completions[0].status.severity != legal_severities[i] ||
+          completions[0].raw_cqe == null ||
+          !engine.probe_same_image(completions[0].raw_cqe, raw_cqe) ||
+          engine.published_count() != ($size(faults) + i + 1) ||
+          engine.cq_consumed_count() != ($size(faults) + i + 1) ||
+          engine.retired_count() != ($size(faults) + i + 1) ||
+          engine.tokens_in_use_count() != 0 ||
+          engine.slot_record_count() != 0 ||
+          engine.command_registry_count() != 0 ||
+          engine.entry_registry_count() != 0 ||
+          engine.terminal_fifo_count() != 0)
+        `uvm_error(
+          label,
+          "legal nonzero severity did not preserve completion authority"
+        )
+
+      if (!legal_poll_ok) begin
+        profile.decoded_contract_fault =
+          RDMA_CMQ_TEST_DECODED_CONTRACT_GOOD;
+        engine.poll(completions, diagnostics, status);
+        expect_status({label, "_CLEANUP_STATUS"}, status, RDMA_SC_OK);
+        if (completions.size() != 1 || diagnostics.size() != 0 ||
+            engine.cq_consumed_count() != ($size(faults) + i + 1) ||
+            engine.retired_count() != ($size(faults) + i + 1) ||
+            engine.tokens_in_use_count() != 0 ||
+            engine.slot_record_count() != 0 ||
+            engine.command_registry_count() != 0 ||
+            engine.entry_registry_count() != 0)
+          `uvm_error(
+            {label, "_CLEANUP"},
+            "legal severity RED cleanup did not consume the retained CQE"
+          )
+      end
+      profile.decoded_contract_fault = RDMA_CMQ_TEST_DECODED_CONTRACT_GOOD;
+    end
+
+    if (engine.published_count() !=
+          ($size(faults) + $size(legal_faults)) ||
+        engine.cq_consumed_count() !=
+          ($size(faults) + $size(legal_faults)) ||
+        engine.retired_count() !=
+          ($size(faults) + $size(legal_faults)))
       `uvm_error(
         "POLL_DECODED_CONTRACT_FINAL",
         "decoded status matrix did not preserve command sequencing"

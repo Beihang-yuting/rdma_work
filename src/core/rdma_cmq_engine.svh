@@ -160,7 +160,11 @@ class rdma_cmq_engine extends uvm_object;
     else begin
       if (command_status.ok() || !command_status.hardware_code_valid ||
           command_status.hardware_code != decoded.hardware_ecode ||
-          command_status.severity != RDMA_SEVERITY_ERROR)
+          !(command_status.severity inside {
+            RDMA_SEVERITY_WARNING,
+            RDMA_SEVERITY_ERROR,
+            RDMA_SEVERITY_FATAL
+          }))
         return invalid_state(
           "CMQ failed hardware ecode status is inconsistent"
         );
@@ -286,9 +290,7 @@ class rdma_cmq_engine extends uvm_object;
     completion.status = rdma_cmq_clone_status_value(
       decoded.command_status
     );
-    completion.raw_cqe = rdma_cmq_clone_image_value(
-      raw_cqe, "CMQ polled completion raw CQE"
-    );
+    completion.raw_cqe = raw_cqe;
     snapshot_status = checked_completion_payload_snapshot(
       decoded.response_payload, payload_snapshot
     );
