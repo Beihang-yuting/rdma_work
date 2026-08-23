@@ -102,7 +102,9 @@ typedef enum bit [3:0] {
   RDMA_DOORBELL_CEQ      = 4'd5,
   RDMA_DOORBELL_AEQ      = 4'd6,
   RDMA_DOORBELL_QP_FLUSH = 4'd7,
-  RDMA_DOORBELL_TQ_FLUSH = 4'd8
+  RDMA_DOORBELL_TX_FLUSH = 4'd8,
+  RDMA_DOORBELL_RTS2SQD  = 4'd9,
+  RDMA_DOORBELL_SQD2RTS  = 4'd10
 } rdma_doorbell_kind_e;
 
 typedef enum bit [3:0] {

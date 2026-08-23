@@ -782,7 +782,9 @@ class rdma_doorbell_model extends rdma_hw_model;
                        RDMA_DOORBELL_RQ, RDMA_DOORBELL_SRQ,
                        RDMA_DOORBELL_CQ, RDMA_DOORBELL_CEQ,
                        RDMA_DOORBELL_AEQ, RDMA_DOORBELL_QP_FLUSH,
-                       RDMA_DOORBELL_TQ_FLUSH}))
+                       RDMA_DOORBELL_TX_FLUSH,
+                       RDMA_DOORBELL_RTS2SQD,
+                       RDMA_DOORBELL_SQD2RTS}))
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "doorbell kind is invalid");
     if (target_h == null)
@@ -795,7 +797,10 @@ class rdma_doorbell_model extends rdma_hw_model;
                                    "CMQ doorbell requires a CMQ target");
       RDMA_DOORBELL_SQ,
       RDMA_DOORBELL_RQ,
-      RDMA_DOORBELL_QP_FLUSH:
+      RDMA_DOORBELL_QP_FLUSH,
+      RDMA_DOORBELL_TX_FLUSH,
+      RDMA_DOORBELL_RTS2SQD,
+      RDMA_DOORBELL_SQD2RTS:
         if (target_h.kind != RDMA_RESOURCE_QP)
           return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                    "QP doorbell requires a QP target");
@@ -815,12 +820,6 @@ class rdma_doorbell_model extends rdma_hw_model;
         if (target_h.kind != RDMA_RESOURCE_AEQ)
           return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                    "AEQ doorbell requires an AEQ target");
-      RDMA_DOORBELL_TQ_FLUSH:
-        if (target_h.kind != RDMA_RESOURCE_FUNCTION || !queue_id_valid)
-          return rdma_status::make(
-            RDMA_SC_INVALID_ARGUMENT,
-            "TQ doorbell requires a function target and queue ID"
-          );
       default: begin
       end
     endcase

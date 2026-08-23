@@ -1422,23 +1422,30 @@ class rdma_request_model_test extends uvm_test;
     doorbell.target_h = qp_h;
     expect_status("DOORBELL_CMQ_TARGET", doorbell.validate(),
                   RDMA_SC_INVALID_ARGUMENT);
-    doorbell.kind = RDMA_DOORBELL_TQ_FLUSH;
+    doorbell.kind = RDMA_DOORBELL_RTS2SQD;
+    doorbell.target_h = qp_h;
+    expect_status("DOORBELL_RTS2SQD", doorbell.validate(), RDMA_SC_OK);
     doorbell.target_h = function_h;
-    doorbell.queue_id = 0;
-    expect_status("DOORBELL_TQ_ID_MISSING", doorbell.validate(),
+    expect_status("DOORBELL_RTS2SQD_TARGET", doorbell.validate(),
                   RDMA_SC_INVALID_ARGUMENT);
-    doorbell.queue_id_valid = 1'b1;
-    expect_status("DOORBELL_TQ_ZERO_ID", doorbell.validate(), RDMA_SC_OK);
+    doorbell.kind = RDMA_DOORBELL_SQD2RTS;
+    doorbell.target_h = qp_h;
+    expect_status("DOORBELL_SQD2RTS", doorbell.validate(), RDMA_SC_OK);
+    doorbell.target_h = function_h;
+    expect_status("DOORBELL_SQD2RTS_TARGET", doorbell.validate(),
+                  RDMA_SC_INVALID_ARGUMENT);
+    doorbell.kind = RDMA_DOORBELL_TX_FLUSH;
+    doorbell.target_h = qp_h;
+    expect_status("DOORBELL_TX_FLUSH", doorbell.validate(), RDMA_SC_OK);
     cloned_object = doorbell.clone();
     if (!$cast(doorbell_clone, cloned_object))
-      `uvm_error("DOORBELL_TQ_CLONE", "doorbell clone lost dynamic type")
+      `uvm_error("DOORBELL_TX_CLONE", "doorbell clone lost dynamic type")
     else if (doorbell_clone.target_h == null ||
              doorbell_clone.target_h == doorbell.target_h ||
-             doorbell_clone.target_h.kind != RDMA_RESOURCE_FUNCTION ||
-             doorbell_clone.queue_id != 0 || !doorbell_clone.queue_id_valid)
-      `uvm_error("DOORBELL_TQ_CLONE", "doorbell clone lost TQ identity")
-    doorbell.target_h = qp_h;
-    expect_status("DOORBELL_TQ_TARGET", doorbell.validate(),
+             doorbell_clone.target_h.kind != RDMA_RESOURCE_QP)
+      `uvm_error("DOORBELL_TX_CLONE", "doorbell clone lost TX identity")
+    doorbell.target_h = function_h;
+    expect_status("DOORBELL_TX_TARGET", doorbell.validate(),
                   RDMA_SC_INVALID_ARGUMENT);
 
     packet = rdma_packet::type_id::create("packet");

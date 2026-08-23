@@ -17,6 +17,7 @@ package rdma_codec_pkg;
   `include "rdma_codec_registry.svh"
   `include "rdma_bit_packer.svh"
   `include "xtr_v1/rdma_xtr_v1_qword_codec.svh"
+  `include "xtr_v1/rdma_xtr_v1_doorbell_codecs.svh"
   `include "xtr_v1/rdma_xtr_v1_qpc_codecs.svh"
   `include "xtr_v1/rdma_xtr_v1_context_body_codecs.svh"
   `include "xtr_v1/rdma_xtr_v1_cmq_codecs.svh"

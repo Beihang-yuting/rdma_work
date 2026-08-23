@@ -201,7 +201,9 @@ class rdma_types_test extends uvm_test;
     check_enum_code("RDMA_DOORBELL_CEQ", RDMA_DOORBELL_CEQ, 4'd5);
     check_enum_code("RDMA_DOORBELL_AEQ", RDMA_DOORBELL_AEQ, 4'd6);
     check_enum_code("RDMA_DOORBELL_QP_FLUSH", RDMA_DOORBELL_QP_FLUSH, 4'd7);
-    check_enum_code("RDMA_DOORBELL_TQ_FLUSH", RDMA_DOORBELL_TQ_FLUSH, 4'd8);
+    check_enum_code("RDMA_DOORBELL_TX_FLUSH", RDMA_DOORBELL_TX_FLUSH, 4'd8);
+    check_enum_code("RDMA_DOORBELL_RTS2SQD", RDMA_DOORBELL_RTS2SQD, 4'd9);
+    check_enum_code("RDMA_DOORBELL_SQD2RTS", RDMA_DOORBELL_SQD2RTS, 4'd10);
 
     check_enum_code("RDMA_ENGINE_NONE", RDMA_ENGINE_NONE, 4'd0);
     check_enum_code("RDMA_ENGINE_RESOURCE", RDMA_ENGINE_RESOURCE, 4'd1);
