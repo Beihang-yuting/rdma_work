@@ -98,6 +98,56 @@ class rdma_cmq_runtime_clone_failure_engine extends rdma_cmq_engine;
   endfunction
 endclass
 
+class rdma_cmq_runtime_build_failure_engine extends rdma_cmq_engine;
+  `uvm_object_utils(rdma_cmq_runtime_build_failure_engine)
+
+  bit return_null_status;
+
+  function new(string name = "rdma_cmq_runtime_build_failure_engine");
+    super.new(name);
+    return_null_status = 1'b0;
+  endfunction
+
+  virtual function rdma_status build_runtime_desc(
+    rdma_dma_request_context request_context,
+    rdma_cmq cmq,
+    rdma_dma_mapping mapping,
+    output rdma_cmq_runtime_desc runtime
+  );
+    runtime = null;
+    if (return_null_status)
+      return null;
+    return rdma_status::make(RDMA_SC_CODEC_ERROR,
+                             "injected runtime construction failure");
+  endfunction
+endclass
+
+typedef enum int unsigned {
+  RDMA_CMQ_TAMPER_FUNCTION_KIND,
+  RDMA_CMQ_TAMPER_FUNCTION_UID,
+  RDMA_CMQ_TAMPER_FUNCTION_OBJECT,
+  RDMA_CMQ_TAMPER_FUNCTION_GENERATION,
+  RDMA_CMQ_TAMPER_BDF,
+  RDMA_CMQ_TAMPER_PASID_VALID,
+  RDMA_CMQ_TAMPER_PASID,
+  RDMA_CMQ_TAMPER_OWNER_NULL,
+  RDMA_CMQ_TAMPER_OWNER_KIND,
+  RDMA_CMQ_TAMPER_OWNER_UID,
+  RDMA_CMQ_TAMPER_OWNER_OBJECT,
+  RDMA_CMQ_TAMPER_OWNER_GENERATION,
+  RDMA_CMQ_TAMPER_DIRECTION,
+  RDMA_CMQ_TAMPER_STATE,
+  RDMA_CMQ_TAMPER_SIZE,
+  RDMA_CMQ_TAMPER_PERMISSION_READ,
+  RDMA_CMQ_TAMPER_PERMISSION_WRITE,
+  RDMA_CMQ_TAMPER_IOVA_ALIGNMENT,
+  RDMA_CMQ_TAMPER_BACKING_ALIGNMENT,
+  RDMA_CMQ_TAMPER_IOVA_RANGE,
+  RDMA_CMQ_TAMPER_BACKING_RANGE,
+  RDMA_CMQ_TAMPER_PERMISSION_ATOMIC,
+  RDMA_CMQ_TAMPER_COUNT
+} rdma_cmq_mapping_tamper_e;
+
 class rdma_cmq_engine_probe extends rdma_cmq_engine;
   `uvm_object_utils(rdma_cmq_engine_probe)
 
@@ -110,22 +160,146 @@ class rdma_cmq_engine_probe extends rdma_cmq_engine;
       backing_mapping.copy(source);
   endfunction
 
-  function void tamper_mapping(int unsigned kind);
+  function void tamper_mapping(rdma_cmq_mapping_tamper_e kind);
     if (backing_mapping == null)
       return;
     case (kind)
-      0: backing_mapping.function_h.function_uid++;
-      1: backing_mapping.function_h.object_id++;
-      2: backing_mapping.function_h.generation++;
-      3: backing_mapping.requester_bdf.bus++;
-      4: backing_mapping.pasid_valid = !backing_mapping.pasid_valid;
-      5: backing_mapping.pasid++;
-      6: backing_mapping.owner_h.object_id++;
-      7: backing_mapping.state = RDMA_MAPPING_FROZEN;
-      8: backing_mapping.size--;
-      9: backing_mapping.direction = RDMA_DMA_DEVICE_READ;
-      default: backing_mapping.owner_h = null;
+      RDMA_CMQ_TAMPER_FUNCTION_KIND:
+        backing_mapping.function_h.kind = RDMA_RESOURCE_QP;
+      RDMA_CMQ_TAMPER_FUNCTION_UID:
+        backing_mapping.function_h.function_uid++;
+      RDMA_CMQ_TAMPER_FUNCTION_OBJECT:
+        backing_mapping.function_h.object_id++;
+      RDMA_CMQ_TAMPER_FUNCTION_GENERATION:
+        backing_mapping.function_h.generation++;
+      RDMA_CMQ_TAMPER_BDF:
+        backing_mapping.requester_bdf.bus++;
+      RDMA_CMQ_TAMPER_PASID_VALID:
+        backing_mapping.pasid_valid = !backing_mapping.pasid_valid;
+      RDMA_CMQ_TAMPER_PASID:
+        backing_mapping.pasid++;
+      RDMA_CMQ_TAMPER_OWNER_NULL:
+        backing_mapping.owner_h = null;
+      RDMA_CMQ_TAMPER_OWNER_KIND:
+        backing_mapping.owner_h.kind = RDMA_RESOURCE_CQ;
+      RDMA_CMQ_TAMPER_OWNER_UID:
+        backing_mapping.owner_h.function_uid++;
+      RDMA_CMQ_TAMPER_OWNER_OBJECT:
+        backing_mapping.owner_h.object_id++;
+      RDMA_CMQ_TAMPER_OWNER_GENERATION:
+        backing_mapping.owner_h.generation++;
+      RDMA_CMQ_TAMPER_DIRECTION:
+        backing_mapping.direction = RDMA_DMA_DEVICE_READ;
+      RDMA_CMQ_TAMPER_STATE:
+        backing_mapping.state = RDMA_MAPPING_FROZEN;
+      RDMA_CMQ_TAMPER_SIZE:
+        backing_mapping.size--;
+      RDMA_CMQ_TAMPER_PERMISSION_READ:
+        backing_mapping.permissions.device_read = 1'b0;
+      RDMA_CMQ_TAMPER_PERMISSION_WRITE:
+        backing_mapping.permissions.device_write = 1'b0;
+      RDMA_CMQ_TAMPER_IOVA_ALIGNMENT:
+        backing_mapping.iova.value++;
+      RDMA_CMQ_TAMPER_BACKING_ALIGNMENT:
+        backing_mapping.backing_addr.value++;
+      RDMA_CMQ_TAMPER_IOVA_RANGE:
+        backing_mapping.iova.value = 64'hffff_ffff_ffff_f800;
+      RDMA_CMQ_TAMPER_BACKING_RANGE:
+        backing_mapping.backing_addr.value = 64'hffff_ffff_ffff_f800;
+      RDMA_CMQ_TAMPER_PERMISSION_ATOMIC:
+        backing_mapping.permissions.atomic = 1'b1;
+      default: return;
     endcase
+  endfunction
+endclass
+
+typedef enum int unsigned {
+  RDMA_CMQ_BAD_MAPPING_ATOMIC,
+  RDMA_CMQ_BAD_MAPPING_IOVA_ALIGNMENT,
+  RDMA_CMQ_BAD_MAPPING_BACKING_ALIGNMENT,
+  RDMA_CMQ_BAD_MAPPING_IOVA_RANGE,
+  RDMA_CMQ_BAD_MAPPING_BACKING_RANGE
+} rdma_cmq_bad_mapping_kind_e;
+
+class rdma_cmq_bad_mapping_mem extends rdma_mock_host_mem;
+  `uvm_object_utils(rdma_cmq_bad_mapping_mem)
+
+  rdma_cmq_bad_mapping_kind_e bad_kind;
+
+  function new(string name = "rdma_cmq_bad_mapping_mem");
+    super.new(name);
+    bad_kind = RDMA_CMQ_BAD_MAPPING_ATOMIC;
+  endfunction
+
+  virtual function rdma_status allocate(
+    rdma_dma_request_context request_context,
+    int unsigned size,
+    int unsigned alignment,
+    rdma_dma_direction_e direction,
+    output rdma_dma_mapping mapping
+  );
+    rdma_status status;
+    int region_index;
+
+    status = super.allocate(request_context, size, alignment, direction,
+                            mapping);
+    if (!status.ok() || mapping == null)
+      return status;
+    region_index = regions.size() - 1;
+    case (bad_kind)
+      RDMA_CMQ_BAD_MAPPING_ATOMIC: begin
+        mapping.permissions.atomic = 1'b1;
+        regions[region_index].mapping.permissions.atomic = 1'b1;
+      end
+      RDMA_CMQ_BAD_MAPPING_IOVA_ALIGNMENT: begin
+        mapping.iova.value++;
+        regions[region_index].mapping.iova.value++;
+      end
+      RDMA_CMQ_BAD_MAPPING_BACKING_ALIGNMENT: begin
+        mapping.backing_addr.value++;
+        regions[region_index].mapping.backing_addr.value++;
+      end
+      RDMA_CMQ_BAD_MAPPING_IOVA_RANGE: begin
+        mapping.iova.value = 64'hffff_ffff_ffff_f800;
+        regions[region_index].mapping.iova.value = mapping.iova.value;
+      end
+      RDMA_CMQ_BAD_MAPPING_BACKING_RANGE: begin
+        mapping.backing_addr.value = 64'hffff_ffff_ffff_f800;
+        regions[region_index].mapping.backing_addr.value =
+          mapping.backing_addr.value;
+      end
+    endcase
+    return status;
+  endfunction
+endclass
+
+class rdma_cmq_upper_boundary_mem extends rdma_mock_host_mem;
+  `uvm_object_utils(rdma_cmq_upper_boundary_mem)
+
+  function new(string name = "rdma_cmq_upper_boundary_mem");
+    super.new(name);
+  endfunction
+
+  virtual function rdma_status allocate(
+    rdma_dma_request_context request_context,
+    int unsigned size,
+    int unsigned alignment,
+    rdma_dma_direction_e direction,
+    output rdma_dma_mapping mapping
+  );
+    rdma_status status;
+    int region_index;
+
+    status = super.allocate(request_context, size, alignment, direction,
+                            mapping);
+    if (!status.ok() || mapping == null)
+      return status;
+    region_index = regions.size() - 1;
+    mapping.iova.value = 64'hffff_ffff_ffff_f000;
+    mapping.backing_addr.value = 64'hffff_ffff_ffff_f000;
+    regions[region_index].mapping.iova = mapping.iova;
+    regions[region_index].mapping.backing_addr = mapping.backing_addr;
+    return status;
   endfunction
 endclass
 
@@ -247,6 +421,50 @@ class rdma_cmq_engine_test extends uvm_test;
         result++;
     end
     return result;
+  endfunction
+
+  function automatic bit same_nullable_handle(
+    rdma_handle lhs,
+    rdma_handle rhs
+  );
+    if (lhs == null || rhs == null)
+      return lhs == null && rhs == null;
+    return lhs.same_instance(rhs);
+  endfunction
+
+  function automatic bit same_mapping_fields(
+    rdma_dma_mapping lhs,
+    rdma_dma_mapping rhs
+  );
+    if (lhs == null || rhs == null)
+      return lhs == null && rhs == null;
+    return same_nullable_handle(lhs.function_h, rhs.function_h) &&
+           lhs.requester_bdf == rhs.requester_bdf &&
+           lhs.pasid_valid == rhs.pasid_valid && lhs.pasid == rhs.pasid &&
+           lhs.backing_addr == rhs.backing_addr && lhs.iova == rhs.iova &&
+           lhs.size == rhs.size && lhs.direction == rhs.direction &&
+           lhs.permissions == rhs.permissions && lhs.state == rhs.state &&
+           same_nullable_handle(lhs.owner_h, rhs.owner_h);
+  endfunction
+
+  function automatic void expect_post_allocate_rollback(
+    string label,
+    rdma_cmq_engine engine,
+    rdma_mock_host_mem mem,
+    rdma_cmq_runtime_desc runtime_desc,
+    int unsigned expected_write_count
+  );
+    if (runtime_desc != null)
+      `uvm_error(label, "failed prepare published a runtime descriptor")
+    if (count_host_calls(mem, "allocate") != 1 ||
+        count_host_calls(mem, "write") != expected_write_count ||
+        count_host_calls(mem, "release") != 1)
+      `uvm_error(label,
+                 "post-allocation failure did not release exactly once")
+    if (mem.regions.size() != 1 || mem.regions[0].mapping == null ||
+        mem.regions[0].mapping.state != RDMA_MAPPING_RELEASED)
+      `uvm_error(label, "post-allocation failure leaked its mock region")
+    expect_unconfigured({label, "_STATE"}, engine);
   endfunction
 
   function automatic void expect_unconfigured(
@@ -586,8 +804,11 @@ class rdma_cmq_engine_test extends uvm_test;
   task automatic check_allocation_and_rollback_failures();
     rdma_cmq_engine engine;
     rdma_cmq_runtime_clone_failure_engine clone_failure_engine;
+    rdma_cmq_runtime_build_failure_engine build_failure_engine;
     rdma_mock_host_mem mem;
     rdma_cmq_short_mapping_mem short_mem;
+    rdma_cmq_bad_mapping_mem bad_mem;
+    rdma_cmq_upper_boundary_mem upper_boundary_mem;
     rdma_doorbell_scheduler scheduler;
     rdma_cmq_test_profile profile;
     rdma_function_binding binding;
@@ -630,6 +851,71 @@ class rdma_cmq_engine_test extends uvm_test;
                  "invalid mapping was not released exactly once")
     expect_unconfigured("SHORT_MAPPING_STATE", engine);
 
+    for (int unsigned bad_kind = RDMA_CMQ_BAD_MAPPING_ATOMIC;
+         bad_kind <= RDMA_CMQ_BAD_MAPPING_BACKING_RANGE; bad_kind++) begin
+      bad_mem = rdma_cmq_bad_mapping_mem::type_id::create(
+        $sformatf("bad_mapping_mem_%0d", bad_kind)
+      );
+      bad_mem.bad_kind = rdma_cmq_bad_mapping_kind_e'(bad_kind);
+      engine = rdma_cmq_engine::type_id::create(
+        $sformatf("bad_mapping_engine_%0d", bad_kind)
+      );
+      engine.prepare(binding, cmq, 1'b1, 20'h34567, bad_mem, scheduler,
+                     profile, runtime_desc, status);
+      if (bad_kind == RDMA_CMQ_BAD_MAPPING_ATOMIC)
+        expect_status("ATOMIC_MAPPING_PREPARE", status,
+                      RDMA_SC_DMA_PERMISSION);
+      else
+        expect_status($sformatf("BAD_MAPPING_PREPARE_%0d", bad_kind),
+                      status, RDMA_SC_DMA_TRANSLATION);
+      if (bad_kind inside {RDMA_CMQ_BAD_MAPPING_IOVA_RANGE,
+                           RDMA_CMQ_BAD_MAPPING_BACKING_RANGE}) begin
+        // A 4096-aligned 64-bit base cannot overflow a 4096-byte range.
+        // The first address above the maximum legal aligned base is
+        // necessarily unaligned, so fail closed at the alignment check.
+        if (status == null ||
+            status.message !=
+              "CMQ backing mapping is not 4096-byte aligned")
+          `uvm_error("BAD_MAPPING_UPPER_BOUND_STATUS",
+                     "upper-bound fixture did not fail on alignment")
+      end
+      expect_post_allocate_rollback(
+        $sformatf("BAD_MAPPING_ROLLBACK_%0d", bad_kind), engine,
+        bad_mem, runtime_desc, 0
+      );
+    end
+
+    upper_boundary_mem = rdma_cmq_upper_boundary_mem::type_id::create(
+      "upper_boundary_mem"
+    );
+    engine = rdma_cmq_engine::type_id::create("upper_boundary_engine");
+    engine.prepare(binding, cmq, 1'b1, 20'h34567,
+                   upper_boundary_mem, scheduler, profile,
+                   runtime_desc, status);
+    expect_status("UPPER_BOUNDARY_PREPARE", status, RDMA_SC_OK);
+    if (runtime_desc == null)
+      `uvm_error("UPPER_BOUNDARY_RUNTIME",
+                 "maximum legal aligned base published no runtime")
+    else begin
+      expect_status("UPPER_BOUNDARY_RUNTIME_VALIDATE",
+                    runtime_desc.validate(), RDMA_SC_OK);
+      if (runtime_desc.sq_iova.value != 64'hffff_ffff_ffff_f000 ||
+          runtime_desc.cq_iova.value != 64'hffff_ffff_ffff_f800)
+        `uvm_error("UPPER_BOUNDARY_LAYOUT",
+                   "maximum legal aligned base produced wrong layout")
+    end
+    if (count_host_calls(upper_boundary_mem, "allocate") != 1 ||
+        count_host_calls(upper_boundary_mem, "write") != 1 ||
+        count_host_calls(upper_boundary_mem, "release") != 0)
+      `uvm_error("UPPER_BOUNDARY_CALLS",
+                 "maximum legal aligned base used wrong host operations")
+    engine.shutdown(status);
+    expect_status("UPPER_BOUNDARY_SHUTDOWN", status, RDMA_SC_OK);
+    expect_unconfigured("UPPER_BOUNDARY_SHUTDOWN_STATE", engine);
+    if (count_host_calls(upper_boundary_mem, "release") != 1)
+      `uvm_error("UPPER_BOUNDARY_RELEASE",
+                 "maximum legal aligned base was not released once")
+
     mem = rdma_mock_host_mem::type_id::create("write_failure_mem");
     expect_status("ARM_WRITE_FAILURE",
                   mem.fail_next("write", rdma_status::make(
@@ -646,6 +932,34 @@ class rdma_cmq_engine_test extends uvm_test;
                  "zero-write failure did not release exactly once")
     expect_unconfigured("ZERO_WRITE_FAILURE_STATE", engine);
 
+    mem = rdma_mock_host_mem::type_id::create("build_failure_mem");
+    build_failure_engine =
+      rdma_cmq_runtime_build_failure_engine::type_id::create(
+        "build_failure_engine"
+      );
+    build_failure_engine.prepare(binding, cmq, 1'b1, 20'h34567,
+                                 mem, scheduler, profile,
+                                 runtime_desc, status);
+    expect_status("RUNTIME_BUILD_FAILURE", status, RDMA_SC_CODEC_ERROR);
+    expect_post_allocate_rollback("RUNTIME_BUILD_ROLLBACK",
+                                  build_failure_engine, mem,
+                                  runtime_desc, 1);
+
+    mem = rdma_mock_host_mem::type_id::create("build_null_status_mem");
+    build_failure_engine =
+      rdma_cmq_runtime_build_failure_engine::type_id::create(
+        "build_null_status_engine"
+      );
+    build_failure_engine.return_null_status = 1'b1;
+    build_failure_engine.prepare(binding, cmq, 1'b1, 20'h34567,
+                                 mem, scheduler, profile,
+                                 runtime_desc, status);
+    expect_status("RUNTIME_BUILD_NULL_STATUS", status,
+                  RDMA_SC_INVALID_STATE);
+    expect_post_allocate_rollback("RUNTIME_BUILD_NULL_ROLLBACK",
+                                  build_failure_engine, mem,
+                                  runtime_desc, 1);
+
     mem = rdma_mock_host_mem::type_id::create("clone_failure_mem");
     clone_failure_engine =
       rdma_cmq_runtime_clone_failure_engine::type_id::create(
@@ -655,13 +969,9 @@ class rdma_cmq_engine_test extends uvm_test;
                                  mem, scheduler, profile,
                                  runtime_desc, status);
     expect_status("RUNTIME_CLONE_FAILURE", status, RDMA_SC_INVALID_STATE);
-    if (count_host_calls(mem, "allocate") != 1 ||
-        count_host_calls(mem, "write") != 1 ||
-        count_host_calls(mem, "release") != 1)
-      `uvm_error("RUNTIME_CLONE_ROLLBACK",
-                 "runtime clone failure did not release exactly once")
-    expect_unconfigured("RUNTIME_CLONE_FAILURE_STATE",
-                        clone_failure_engine);
+    expect_post_allocate_rollback("RUNTIME_CLONE_ROLLBACK",
+                                  clone_failure_engine, mem,
+                                  runtime_desc, 1);
 
     mem = rdma_mock_host_mem::type_id::create("release_failure_mem");
     expect_status("ARM_RELEASE_WRITE_FAILURE",
@@ -702,14 +1012,10 @@ class rdma_cmq_engine_test extends uvm_test;
     rdma_cmq cmq;
     rdma_cmq_runtime_desc runtime_desc;
     rdma_dma_mapping good_mapping;
+    rdma_dma_mapping before_mapping;
+    rdma_dma_mapping after_mapping;
     rdma_status status;
-    rdma_status_code_e expected_codes[10] = '{
-      RDMA_SC_DMA_TRANSLATION, RDMA_SC_DMA_TRANSLATION,
-      RDMA_SC_STALE_GENERATION, RDMA_SC_DMA_TRANSLATION,
-      RDMA_SC_DMA_PERMISSION, RDMA_SC_DMA_PERMISSION,
-      RDMA_SC_DMA_TRANSLATION, RDMA_SC_INVALID_STATE,
-      RDMA_SC_INVALID_STATE, RDMA_SC_INVALID_STATE
-    };
+    rdma_status_code_e expected_codes[RDMA_CMQ_TAMPER_COUNT];
 
     engine = rdma_cmq_engine_probe::type_id::create("activate_engine");
     mem = rdma_mock_host_mem::type_id::create("activate_mem");
@@ -723,6 +1029,41 @@ class rdma_cmq_engine_test extends uvm_test;
     cmq = make_cmq("activate_cmq", prepared_binding);
     prepare_defaults("ACTIVATE_PREPARE", engine, mem, prepared_binding,
                      cmq, scheduler, profile, runtime_desc);
+
+    expected_codes[RDMA_CMQ_TAMPER_FUNCTION_KIND] =
+      RDMA_SC_DMA_TRANSLATION;
+    expected_codes[RDMA_CMQ_TAMPER_FUNCTION_UID] =
+      RDMA_SC_DMA_TRANSLATION;
+    expected_codes[RDMA_CMQ_TAMPER_FUNCTION_OBJECT] =
+      RDMA_SC_DMA_TRANSLATION;
+    expected_codes[RDMA_CMQ_TAMPER_FUNCTION_GENERATION] =
+      RDMA_SC_STALE_GENERATION;
+    expected_codes[RDMA_CMQ_TAMPER_BDF] = RDMA_SC_DMA_TRANSLATION;
+    expected_codes[RDMA_CMQ_TAMPER_PASID_VALID] = RDMA_SC_DMA_PERMISSION;
+    expected_codes[RDMA_CMQ_TAMPER_PASID] = RDMA_SC_DMA_PERMISSION;
+    expected_codes[RDMA_CMQ_TAMPER_OWNER_NULL] = RDMA_SC_DMA_TRANSLATION;
+    expected_codes[RDMA_CMQ_TAMPER_OWNER_KIND] = RDMA_SC_DMA_TRANSLATION;
+    expected_codes[RDMA_CMQ_TAMPER_OWNER_UID] = RDMA_SC_DMA_TRANSLATION;
+    expected_codes[RDMA_CMQ_TAMPER_OWNER_OBJECT] =
+      RDMA_SC_DMA_TRANSLATION;
+    expected_codes[RDMA_CMQ_TAMPER_OWNER_GENERATION] =
+      RDMA_SC_DMA_TRANSLATION;
+    expected_codes[RDMA_CMQ_TAMPER_DIRECTION] = RDMA_SC_INVALID_STATE;
+    expected_codes[RDMA_CMQ_TAMPER_STATE] = RDMA_SC_INVALID_STATE;
+    expected_codes[RDMA_CMQ_TAMPER_SIZE] = RDMA_SC_INVALID_STATE;
+    expected_codes[RDMA_CMQ_TAMPER_PERMISSION_READ] =
+      RDMA_SC_DMA_PERMISSION;
+    expected_codes[RDMA_CMQ_TAMPER_PERMISSION_WRITE] =
+      RDMA_SC_DMA_PERMISSION;
+    expected_codes[RDMA_CMQ_TAMPER_IOVA_ALIGNMENT] =
+      RDMA_SC_DMA_TRANSLATION;
+    expected_codes[RDMA_CMQ_TAMPER_BACKING_ALIGNMENT] =
+      RDMA_SC_DMA_TRANSLATION;
+    expected_codes[RDMA_CMQ_TAMPER_IOVA_RANGE] = RDMA_SC_DMA_TRANSLATION;
+    expected_codes[RDMA_CMQ_TAMPER_BACKING_RANGE] =
+      RDMA_SC_DMA_TRANSLATION;
+    expected_codes[RDMA_CMQ_TAMPER_PERMISSION_ATOMIC] =
+      RDMA_SC_DMA_PERMISSION;
 
     candidate = make_binding("not_active_candidate", RDMA_BIND_PREPARED);
     engine.activate(candidate, status);
@@ -753,16 +1094,21 @@ class rdma_cmq_engine_test extends uvm_test;
     expect_status("ACTIVATE_BDF", status, RDMA_SC_DMA_TRANSLATION);
 
     good_mapping = engine.mapping_snapshot();
-    for (int unsigned kind = 0; kind < 10; kind++) begin
-      engine.tamper_mapping(kind);
+    for (int unsigned kind = 0; kind < RDMA_CMQ_TAMPER_COUNT; kind++) begin
+      engine.tamper_mapping(rdma_cmq_mapping_tamper_e'(kind));
+      before_mapping = engine.mapping_snapshot();
       engine.activate(active_binding, status);
       expect_status($sformatf("ACTIVATE_MAPPING_%0d", kind), status,
                     expected_codes[kind]);
+      after_mapping = engine.mapping_snapshot();
       if (engine.state() != RDMA_CMQ_ENGINE_PREPARED ||
           engine.published_count() != 0 || engine.retired_count() != 0 ||
           engine.cq_consumed_count() != 0)
         `uvm_error("ACTIVATE_MAPPING_ATOMIC",
                    "failed activate changed state or counters")
+      if (!same_mapping_fields(before_mapping, after_mapping))
+        `uvm_error("ACTIVATE_MAPPING_AUTHORITY",
+                   "failed activate changed retained mapping authority")
       engine.restore_mapping(good_mapping);
     end
 
@@ -773,6 +1119,185 @@ class rdma_cmq_engine_test extends uvm_test;
                  "matching ACTIVE binding was not committed")
     engine.shutdown(status);
     expect_status("ACTIVATE_SHUTDOWN", status, RDMA_SC_OK);
+    expect_unconfigured("ACTIVATE_SHUTDOWN_STATE", engine);
+    if (count_host_calls(mem, "release") != 1 ||
+        mem.regions.size() != 1 || mem.regions[0].mapping == null ||
+        mem.regions[0].mapping.state != RDMA_MAPPING_RELEASED)
+      `uvm_error("ACTIVATE_SHUTDOWN_RELEASE",
+                 "ACTIVE shutdown did not release backing exactly once")
+    engine.shutdown(status);
+    expect_status("ACTIVATE_SHUTDOWN_IDEMPOTENT", status, RDMA_SC_OK);
+    if (count_host_calls(mem, "release") != 1)
+      `uvm_error("ACTIVATE_SHUTDOWN_IDEMPOTENT",
+                 "idempotent ACTIVE shutdown released backing again")
+  endtask
+
+  task automatic check_prepared_shutdown_lifecycle();
+    rdma_cmq_engine engine;
+    rdma_mock_host_mem first_mem;
+    rdma_mock_host_mem second_mem;
+    rdma_doorbell_scheduler first_scheduler;
+    rdma_doorbell_scheduler second_scheduler;
+    rdma_cmq_test_profile first_profile;
+    rdma_cmq_test_profile second_profile;
+    rdma_function_binding first_binding;
+    rdma_function_binding second_binding;
+    rdma_function_binding active_binding;
+    rdma_cmq first_cmq;
+    rdma_cmq second_cmq;
+    rdma_cmq_runtime_desc runtime_desc;
+    rdma_status status;
+    int unsigned first_call_count;
+
+    engine = rdma_cmq_engine::type_id::create("prepared_shutdown_engine");
+    first_mem = rdma_mock_host_mem::type_id::create(
+      "prepared_shutdown_first_mem"
+    );
+    first_scheduler = rdma_doorbell_scheduler::type_id::create(
+      "prepared_shutdown_first_scheduler"
+    );
+    first_profile = rdma_cmq_test_profile::type_id::create(
+      "prepared_shutdown_first_profile"
+    );
+    first_binding = make_binding("prepared_shutdown_first_binding",
+                                 RDMA_BIND_PREPARED);
+    first_cmq = make_cmq("prepared_shutdown_first_cmq", first_binding);
+    prepare_defaults("PREPARED_SHUTDOWN_PREPARE", engine, first_mem,
+                     first_binding, first_cmq, first_scheduler,
+                     first_profile, runtime_desc);
+
+    engine.shutdown(status);
+    expect_status("PREPARED_SHUTDOWN", status, RDMA_SC_OK);
+    expect_unconfigured("PREPARED_SHUTDOWN_STATE", engine);
+    if (count_host_calls(first_mem, "release") != 1 ||
+        first_mem.regions.size() != 1 ||
+        first_mem.regions[0].mapping == null ||
+        first_mem.regions[0].mapping.state != RDMA_MAPPING_RELEASED ||
+        engine.published_count() != 0 || engine.retired_count() != 0 ||
+        engine.cq_consumed_count() != 0)
+      `uvm_error("PREPARED_SHUTDOWN_RELEASE",
+                 "PREPARED shutdown did not clear backing and counters")
+    first_call_count = first_mem.calls.size();
+    engine.shutdown(status);
+    expect_status("PREPARED_SHUTDOWN_IDEMPOTENT", status, RDMA_SC_OK);
+    if (first_mem.calls.size() != first_call_count ||
+        count_host_calls(first_mem, "release") != 1)
+      `uvm_error("PREPARED_SHUTDOWN_IDEMPOTENT",
+                 "idempotent PREPARED shutdown reused old authority")
+    active_binding = make_binding("prepared_shutdown_active_probe",
+                                  RDMA_BIND_ACTIVE);
+    engine.activate(active_binding, status);
+    expect_status("PREPARED_SHUTDOWN_CLEARED_ACTIVATE", status,
+                  RDMA_SC_INVALID_STATE);
+    if (first_mem.calls.size() != first_call_count)
+      `uvm_error("PREPARED_SHUTDOWN_CLEARED_ACTIVATE",
+                 "post-shutdown activate reused old host authority")
+
+    second_mem = rdma_mock_host_mem::type_id::create(
+      "prepared_shutdown_second_mem"
+    );
+    second_scheduler = rdma_doorbell_scheduler::type_id::create(
+      "prepared_shutdown_second_scheduler"
+    );
+    second_profile = rdma_cmq_test_profile::type_id::create(
+      "prepared_shutdown_second_profile"
+    );
+    second_binding = make_binding("prepared_shutdown_second_binding",
+                                  RDMA_BIND_PREPARED);
+    second_binding.function_uid++;
+    second_binding.global_function_id++;
+    second_binding.generation++;
+    second_binding.owner_h = second_binding.make_handle();
+    second_cmq = make_cmq("prepared_shutdown_second_cmq", second_binding);
+    prepare_defaults("PREPARED_SHUTDOWN_REPREPARE", engine, second_mem,
+                     second_binding, second_cmq, second_scheduler,
+                     second_profile, runtime_desc);
+    if (first_mem.calls.size() != first_call_count ||
+        first_profile.validation_calls != 1 ||
+        second_profile.validation_calls != 1 ||
+        engine.published_count() != 0 || engine.retired_count() != 0 ||
+        engine.cq_consumed_count() != 0)
+      `uvm_error("PREPARED_SHUTDOWN_REPREPARE",
+                 "reprepare reused stale collaborators or counters")
+    engine.shutdown(status);
+    expect_status("PREPARED_SHUTDOWN_REPREPARE_RELEASE", status,
+                  RDMA_SC_OK);
+    if (count_host_calls(first_mem, "release") != 1 ||
+        count_host_calls(second_mem, "release") != 1)
+      `uvm_error("PREPARED_SHUTDOWN_REPREPARE_RELEASE",
+                 "reprepare released through the wrong collaborator")
+  endtask
+
+  task automatic check_shutdown_release_retry();
+    rdma_cmq_engine engine;
+    rdma_mock_host_mem mem;
+    rdma_doorbell_scheduler scheduler;
+    rdma_cmq_test_profile profile;
+    rdma_function_binding binding;
+    rdma_cmq cmq;
+    rdma_cmq_runtime_desc runtime_desc;
+    rdma_dma_mapping retained_snapshot;
+    rdma_mock_dma_mapping retained_mock;
+    rdma_mock_dma_mapping first_release_mapping;
+    rdma_mock_dma_mapping second_release_mapping;
+    rdma_status status;
+
+    engine = rdma_cmq_engine::type_id::create("shutdown_retry_engine");
+    mem = rdma_mock_host_mem::type_id::create("shutdown_retry_mem");
+    scheduler = rdma_doorbell_scheduler::type_id::create(
+      "shutdown_retry_scheduler"
+    );
+    profile = rdma_cmq_test_profile::type_id::create(
+      "shutdown_retry_profile"
+    );
+    binding = make_binding("shutdown_retry_binding", RDMA_BIND_PREPARED);
+    cmq = make_cmq("shutdown_retry_cmq", binding);
+    prepare_defaults("SHUTDOWN_RETRY_PREPARE", engine, mem, binding, cmq,
+                     scheduler, profile, runtime_desc);
+    expect_status("ARM_SHUTDOWN_RELEASE_FAILURE",
+                  mem.fail_next("release", rdma_status::make(
+                    RDMA_SC_UNKNOWN_HW_ERROR,
+                    "injected shutdown release failure"
+                  )), RDMA_SC_OK);
+
+    engine.shutdown(status);
+    expect_status("SHUTDOWN_RELEASE_FAILURE", status,
+                  RDMA_SC_UNKNOWN_HW_ERROR);
+    retained_snapshot = engine.mapping_snapshot();
+    if (status == null ||
+        status.message != "injected shutdown release failure" ||
+        engine.state() != RDMA_CMQ_ENGINE_POISONED ||
+        retained_snapshot == null ||
+        count_host_calls(mem, "release") != 1 ||
+        mem.regions.size() != 1 || mem.regions[0].mapping == null ||
+        mem.regions[0].mapping.state != RDMA_MAPPING_ACTIVE)
+      `uvm_error("SHUTDOWN_RELEASE_FAILURE",
+                 "shutdown release failure lost retained authority")
+    if (!$cast(retained_mock, retained_snapshot))
+      `uvm_error("SHUTDOWN_RELEASE_FAILURE",
+                 "retained shutdown mapping lost allocation identity")
+
+    engine.shutdown(status);
+    expect_status("SHUTDOWN_RELEASE_RETRY", status, RDMA_SC_OK);
+    expect_unconfigured("SHUTDOWN_RELEASE_RETRY_STATE", engine);
+    if (count_host_calls(mem, "release") != 2 ||
+        mem.regions[0].mapping.state != RDMA_MAPPING_RELEASED)
+      `uvm_error("SHUTDOWN_RELEASE_RETRY",
+                 "shutdown did not retry and retire the same allocation")
+    if (!$cast(first_release_mapping, mem.calls[2].mapping) ||
+        !$cast(second_release_mapping, mem.calls[3].mapping) ||
+        !first_release_mapping.same_allocation(second_release_mapping) ||
+        (retained_mock != null &&
+         !retained_mock.same_allocation(second_release_mapping)))
+      `uvm_error("SHUTDOWN_RELEASE_RETRY_IDENTITY",
+                 "shutdown retry changed mapping allocation identity")
+
+    engine.shutdown(status);
+    expect_status("SHUTDOWN_RELEASE_RETRY_IDEMPOTENT", status,
+                  RDMA_SC_OK);
+    if (count_host_calls(mem, "release") != 2)
+      `uvm_error("SHUTDOWN_RELEASE_RETRY_IDEMPOTENT",
+                 "third shutdown released retired backing again")
   endtask
 
   virtual task run_phase(uvm_phase phase);
@@ -781,6 +1306,8 @@ class rdma_cmq_engine_test extends uvm_test;
     check_preallocation_rejections();
     check_pasid_normalization_and_busy_prepare();
     check_allocation_and_rollback_failures();
+    check_prepared_shutdown_lifecycle();
+    check_shutdown_release_retry();
     check_activation_guards();
     phase.drop_objection(this);
   endtask

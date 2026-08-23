@@ -203,6 +203,13 @@ class rdma_cmq_engine extends uvm_object;
     rdma_dma_mapping mapping,
     rdma_dma_request_context request_context
   );
+    rdma_dma_permission_t expected_permissions;
+
+    expected_permissions = '{
+      device_read: 1'b1,
+      device_write: 1'b1,
+      atomic: 1'b0
+    };
     if (mapping == null)
       return invalid_state("CMQ host memory returned a null mapping");
     if (request_context == null)
@@ -257,11 +264,10 @@ class rdma_cmq_engine extends uvm_object;
       return invalid_state("CMQ backing mapping size is not 4096 bytes");
     if (mapping.direction != RDMA_DMA_BIDIRECTIONAL)
       return invalid_state("CMQ backing mapping is not bidirectional");
-    if (!mapping.permissions.device_read ||
-        !mapping.permissions.device_write)
+    if (mapping.permissions != expected_permissions)
       return rdma_status::make(
         RDMA_SC_DMA_PERMISSION,
-        "CMQ backing mapping lacks bidirectional permissions"
+        "CMQ backing mapping permissions are not exactly bidirectional"
       );
     if ((mapping.iova.value & (BACKING_BYTES - 1'b1)) != 0 ||
         (mapping.backing_addr.value & (BACKING_BYTES - 1'b1)) != 0)
