@@ -78,6 +78,16 @@ class rdma_cmq_engine extends uvm_object;
   protected rdma_cmq_slot_record slots[CMQ_DEPTH];
   protected bit token_in_use[CMQ_DEPTH];
   protected bit [58:0] token_incarnation[CMQ_DEPTH];
+  protected rdma_cmq_slot_record command_registry[string];
+  protected rdma_cmq_slot_record entry_registry[string];
+  protected rdma_cmq_completion terminal_fifo[$];
+  // The fixed CMQ profile API has no separate raw-CQE metadata hook.  A
+  // profile therefore owns one endian/hardware-version format across its
+  // SQE and CQE images.  Only a scheduler-successful batch may establish
+  // this authority; staging and transport failures must leave it unchanged.
+  protected bit profile_image_format_valid;
+  protected rdma_byte_endian_e profile_image_endian;
+  protected int unsigned profile_hardware_version;
 
   function new(string name = "rdma_cmq_engine");
     super.new(name);
@@ -93,6 +103,9 @@ class rdma_cmq_engine extends uvm_object;
     publish_seq = 0;
     retire_seq = 0;
     cq_consume_seq = 0;
+    profile_image_format_valid = 1'b0;
+    profile_image_endian = RDMA_ENDIAN_LITTLE;
+    profile_hardware_version = 0;
     foreach (slots[i]) begin
       slots[i] = null;
       token_in_use[i] = 1'b0;
@@ -123,6 +136,112 @@ class rdma_cmq_engine extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  protected function string command_key(rdma_cmq_ticket ticket);
+    return $sformatf(
+      "%016h:%08h:%08h:%016h",
+      ticket.function_h.function_uid,
+      ticket.function_h.object_id,
+      ticket.function_h.generation,
+      ticket.command_id
+    );
+  endfunction
+
+  protected function string entry_key(int unsigned index, bit wrap);
+    return $sformatf(
+      "%016h:%08h:%0d:%0b",
+      prepared_binding.function_uid,
+      prepared_binding.generation,
+      index,
+      wrap
+    );
+  endfunction
+
+  protected function rdma_status make_raw_cqe_image(
+    byte data[],
+    output rdma_hw_image raw_cqe
+  );
+    raw_cqe = null;
+    if (data.size() != CMQE_BYTES)
+      return invalid_state("CMQ host read did not return one full CQE");
+    if (prepared_binding == null)
+      return invalid_state("CMQ CQE Function authority is missing");
+    if (!profile_image_format_valid ||
+        !(profile_image_endian inside {
+          RDMA_ENDIAN_LITTLE, RDMA_ENDIAN_BIG
+        }) || profile_hardware_version == 0)
+      return invalid_state(
+        "CMQ profile-wide CQE format authority is missing"
+      );
+    raw_cqe = rdma_hw_image::type_id::create("cmq_raw_cqe");
+    if (raw_cqe == null)
+      return invalid_state("CMQ raw CQE construction failed");
+    foreach (data[i])
+      raw_cqe.bytes.push_back(data[i]);
+    raw_cqe.length = CMQE_BYTES;
+    raw_cqe.alignment = CMQE_BYTES;
+    raw_cqe.endian = profile_image_endian;
+    raw_cqe.image_kind = RDMA_IMAGE_CMQ_CQE;
+    raw_cqe.hardware_version = profile_hardware_version;
+    raw_cqe.function_generation = prepared_binding.generation;
+    raw_cqe.write_target_kind = RDMA_HW_TARGET_NONE;
+    raw_cqe.backing_target = '0;
+    raw_cqe.hmc_target = '0;
+    raw_cqe.bar_target = '0;
+    return rdma_status::success();
+  endfunction
+
+  protected function rdma_status make_polled_completion(
+    rdma_cmq_slot_record record,
+    rdma_hw_image raw_cqe,
+    rdma_cmq_decoded_cqe decoded,
+    output rdma_cmq_completion completion
+  );
+    rdma_status validation_status;
+
+    completion = null;
+    if (record == null || record.ticket == null ||
+        record.ticket.function_h == null || record.ticket.cmq_h == null)
+      return invalid_state("CMQ completion ticket authority is missing");
+    if (raw_cqe == null || decoded == null ||
+        decoded.command_status == null)
+      return invalid_state("CMQ completion decode authority is missing");
+    completion = rdma_cmq_completion::type_id::create(
+      "cmq_polled_completion"
+    );
+    if (completion == null)
+      return invalid_state("CMQ completion construction failed");
+    completion.ticket = rdma_cmq_clone_ticket_value(
+      record.ticket, "CMQ polled completion"
+    );
+    completion.status = rdma_cmq_clone_status_value(
+      decoded.command_status
+    );
+    completion.raw_cqe = rdma_cmq_clone_image_value(
+      raw_cqe, "CMQ polled completion raw CQE"
+    );
+    completion.decoded_response = rdma_cmq_clone_object_value(
+      decoded.response_payload, "CMQ polled completion response"
+    );
+    if (completion.ticket == null || completion.status == null ||
+        completion.raw_cqe == null) begin
+      completion = null;
+      return invalid_state("CMQ completion snapshot construction failed");
+    end
+    completion.status.source_engine = RDMA_ENGINE_CMQ;
+    completion.status.function_uid =
+      completion.ticket.function_h.function_uid;
+    completion.status.generation =
+      completion.ticket.function_h.generation;
+    completion.status.resource_id = completion.ticket.cmq_h.object_id;
+    completion.status.command_id = completion.ticket.command_id;
+    validation_status = completion.validate();
+    if (validation_status == null || !validation_status.ok()) begin
+      completion = null;
+      return invalid_state("CMQ completion snapshot validation failed");
+    end
+    return rdma_status::success();
+  endfunction
+
   protected function rdma_status retire_completed_prefix();
     rdma_status status;
     longint unsigned used;
@@ -146,6 +265,7 @@ class rdma_cmq_engine extends uvm_object;
             CMQ_SLOT_RESET_CANCELLED
           }))
         break;
+      entry_registry.delete(entry_key(index, slots[index].sq_wrap));
       slots[index] = null;
       retire_seq++;
     end
@@ -2849,6 +2969,12 @@ class rdma_cmq_engine extends uvm_object;
     publish_seq = 0;
     retire_seq = 0;
     cq_consume_seq = 0;
+    profile_image_format_valid = 1'b0;
+    profile_image_endian = RDMA_ENDIAN_LITTLE;
+    profile_hardware_version = 0;
+    command_registry.delete();
+    entry_registry.delete();
+    terminal_fifo.delete();
     foreach (slots[i]) begin
       slots[i] = null;
       token_in_use[i] = 1'b0;
@@ -3043,6 +3169,12 @@ class rdma_cmq_engine extends uvm_object;
     publish_seq = 0;
     retire_seq = 0;
     cq_consume_seq = 0;
+    profile_image_format_valid = 1'b0;
+    profile_image_endian = RDMA_ENDIAN_LITTLE;
+    profile_hardware_version = 0;
+    command_registry.delete();
+    entry_registry.delete();
+    terminal_fifo.delete();
     foreach (slots[i]) begin
       slots[i] = null;
       token_in_use[i] = 1'b0;
@@ -3194,6 +3326,9 @@ class rdma_cmq_engine extends uvm_object;
     time remaining;
     longint unsigned used;
     bit transaction_failed;
+    bit staged_profile_format_valid;
+    rdma_byte_endian_e staged_profile_endian;
+    int unsigned staged_profile_hardware_version;
 
     tickets = new[requests.size()];
     item_statuses = new[requests.size()];
@@ -3208,6 +3343,9 @@ class rdma_cmq_engine extends uvm_object;
     transaction_failed = 1'b0;
     transaction_status = null;
     successful_batch_status = null;
+    staged_profile_format_valid = 1'b0;
+    staged_profile_endian = RDMA_ENDIAN_LITTLE;
+    staged_profile_hardware_version = 0;
     dependencies.delete();
     foreach (tentative_token_reserved[i]) begin
       tentative_token_reserved[i] = 1'b0;
@@ -3256,6 +3394,9 @@ class rdma_cmq_engine extends uvm_object;
       engine_lock.put(1);
       return;
     end
+    staged_profile_format_valid = profile_image_format_valid;
+    staged_profile_endian = profile_image_endian;
+    staged_profile_hardware_version = profile_hardware_version;
 
     foreach (requests[i]) begin : stage_each_request
       rdma_cmq_command_desc command_snapshot;
@@ -3509,6 +3650,20 @@ class rdma_cmq_engine extends uvm_object;
       status = sqe_metadata_status(sqe_snapshot, expected_backing_target);
       if (!status.ok()) begin
         transaction_status = status;
+        transaction_failed = 1'b1;
+        break;
+      end
+      if (!staged_profile_format_valid) begin
+        staged_profile_format_valid = 1'b1;
+        staged_profile_endian = sqe_snapshot.endian;
+        staged_profile_hardware_version = sqe_snapshot.hardware_version;
+      end
+      else if (sqe_snapshot.endian != staged_profile_endian ||
+               sqe_snapshot.hardware_version !=
+                 staged_profile_hardware_version) begin
+        transaction_status = invalid_state(
+          "CMQ profile changed its profile-wide SQE/CQE image format"
+        );
         transaction_failed = 1'b1;
         break;
       end
@@ -3800,19 +3955,195 @@ class rdma_cmq_engine extends uvm_object;
       int unsigned original_index;
       int unsigned token_index;
       int unsigned slot_index;
+      string published_command_key;
+      string published_entry_key;
 
       original_index = original_indices[success_index];
       token_index = tentative_tokens[success_index];
       slot_index = tentative_records[success_index].sq_index;
       token_in_use[token_index] = 1'b1;
       slots[slot_index] = tentative_records[success_index];
+      published_command_key = command_key(slots[slot_index].ticket);
+      published_entry_key = entry_key(
+        slot_index, slots[slot_index].sq_wrap
+      );
+      command_registry[published_command_key] = slots[slot_index];
+      entry_registry[published_entry_key] = slots[slot_index];
       tickets[original_index] = caller_tickets[success_index];
       item_statuses[original_index] =
         tentative_success_statuses[success_index];
       tentative_token_reserved[token_index] = 1'b0;
     end
     publish_seq = final_sequence;
+    profile_image_format_valid = staged_profile_format_valid;
+    profile_image_endian = staged_profile_endian;
+    profile_hardware_version = staged_profile_hardware_version;
     batch_status = successful_batch_status;
+    engine_lock.put(1);
+  endtask
+
+  task poll(
+    output rdma_cmq_completion completions[$],
+    output rdma_cmq_diagnostic diagnostics[$],
+    output rdma_status status
+  );
+    byte data[];
+    rdma_status read_status;
+    rdma_status inspect_status;
+    rdma_status validation_status;
+    rdma_status completion_status;
+    rdma_status retirement_status;
+    rdma_hw_image raw_cqe;
+    rdma_hw_image raw_snapshot;
+    rdma_cmq_decoded_cqe decoded;
+    rdma_cmq_slot_record record;
+    rdma_cmq_completion completion;
+    longint unsigned read_offset;
+    int unsigned cq_index;
+    int unsigned token_index;
+    bit expected_owner;
+    bit ready;
+    string hardware_key;
+    string software_key;
+
+    completions.delete();
+    diagnostics.delete();
+    status = invalid_state("CMQ poll did not complete");
+    engine_lock.get(1);
+    if (engine_state != RDMA_CMQ_ENGINE_ACTIVE) begin
+      status = invalid_state("CMQ poll requires an ACTIVE engine");
+      engine_lock.put(1);
+      return;
+    end
+    if (prepared_binding == null || backing_mapping == null ||
+        host_mem == null || profile == null) begin
+      status = invalid_state("CMQ ACTIVE polling authority is missing");
+      engine_lock.put(1);
+      return;
+    end
+    status = mapping_authority_status(backing_mapping, dma_context);
+    if (!status.ok()) begin
+      engine_lock.put(1);
+      return;
+    end
+
+    status = rdma_status::success();
+    while (status.ok()) begin
+      cq_index = cq_consume_seq % CMQ_DEPTH;
+      read_offset = CQ_OFFSET + (longint'(cq_index) * CMQE_BYTES);
+      data = new[0];
+      read_status = host_mem.read(
+        backing_mapping, read_offset, CMQE_BYTES, data
+      );
+      if (read_status == null) begin
+        status = invalid_state("CMQ CQ backing read returned null status");
+        break;
+      end
+      if (!read_status.ok()) begin
+        status = rdma_cmq_clone_status_value(read_status);
+        break;
+      end
+      status = make_raw_cqe_image(data, raw_cqe);
+      if (!status.ok())
+        break;
+      raw_snapshot = rdma_cmq_clone_image_value(
+        raw_cqe, "CMQ CQE inspection snapshot"
+      );
+      expected_owner = !((cq_consume_seq / CMQ_DEPTH) & 1'b1);
+      ready = 1'b0;
+      decoded = null;
+      inspect_status = profile.inspect_cqe(
+        raw_cqe, expected_owner, ready, decoded
+      );
+      if (!same_image_value(raw_cqe, raw_snapshot)) begin
+        status = invalid_state("CMQ profile changed its raw CQE input");
+        break;
+      end
+      if (inspect_status == null) begin
+        status = invalid_state("CMQ profile inspection returned null status");
+        break;
+      end
+      if (!inspect_status.ok()) begin
+        status = rdma_cmq_clone_status_value(inspect_status);
+        break;
+      end
+      if (!ready) begin
+        status = rdma_status::success();
+        break;
+      end
+      if (decoded == null || decoded.command_status == null ||
+          decoded.wqe_index >= CMQ_DEPTH) begin
+        status = invalid_state("CMQ profile returned an invalid decoded CQE");
+        break;
+      end
+      validation_status = decoded.validate();
+      if (validation_status == null || !validation_status.ok()) begin
+        status = invalid_state("CMQ decoded CQE validation failed");
+        break;
+      end
+
+      hardware_key = entry_key(decoded.wqe_index, decoded.wqe_wrap);
+      if (!entry_registry.exists(hardware_key)) begin
+        status = invalid_state("CMQ decoded CQE has no registered entry");
+        break;
+      end
+      record = entry_registry[hardware_key];
+      if (record == null || slots[decoded.wqe_index] == null ||
+          slots[decoded.wqe_index] != record ||
+          record.sq_index != decoded.wqe_index ||
+          record.sq_wrap != decoded.wqe_wrap ||
+          record.ticket == null || record.expected == null ||
+          record.state != CMQ_SLOT_PUBLISHED) begin
+        status = invalid_state("CMQ decoded CQE entry ledger is inconsistent");
+        break;
+      end
+      if (record.expected.hardware_opcode != decoded.hardware_opcode) begin
+        status = invalid_state("CMQ decoded CQE opcode does not match command");
+        break;
+      end
+      software_key = command_key(record.ticket);
+      if (!command_registry.exists(software_key) ||
+          command_registry[software_key] != record) begin
+        status = invalid_state("CMQ decoded CQE command registry is inconsistent");
+        break;
+      end
+      token_index = record.command_token;
+      if (token_index >= CMQ_DEPTH || !token_in_use[token_index]) begin
+        status = invalid_state("CMQ decoded CQE command token is inconsistent");
+        break;
+      end
+      if (cq_consume_seq == 64'hffff_ffff_ffff_ffff) begin
+        status = poison_status("CMQ completion consumer counter overflows");
+        break;
+      end
+
+      completion_status = make_polled_completion(
+        record, raw_snapshot, decoded, completion
+      );
+      if (completion_status == null || !completion_status.ok() ||
+          completion == null) begin
+        status = (completion_status == null) ?
+          invalid_state("CMQ completion construction returned null status") :
+          completion_status;
+        break;
+      end
+
+      terminal_fifo.push_back(completion);
+      command_registry.delete(software_key);
+      token_in_use[token_index] = 1'b0;
+      record.state = CMQ_SLOT_COMPLETED;
+      cq_consume_seq++;
+      retirement_status = retire_completed_prefix();
+      if (retirement_status == null || !retirement_status.ok()) begin
+        status = (retirement_status == null) ?
+          invalid_state("CMQ retirement returned null status") :
+          retirement_status;
+        break;
+      end
+    end
+
+    while (terminal_fifo.size() != 0)
+      completions.push_back(terminal_fifo.pop_front());
     engine_lock.put(1);
   endtask
 

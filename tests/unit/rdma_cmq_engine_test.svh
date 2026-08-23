@@ -755,6 +755,11 @@ class rdma_cmq_test_profile extends rdma_cmq_hw_profile;
   rdma_status_code_e compose_failure_code;
   bit fail_doorbell_encode;
   rdma_status_code_e doorbell_failure_code;
+  rdma_byte_endian_e sqe_endian;
+  int unsigned sqe_hardware_version;
+  bit alternate_sqe_format_for_opcode_b;
+  rdma_byte_endian_e alternate_sqe_endian;
+  int unsigned alternate_sqe_hardware_version;
   int unsigned compose_calls;
   int unsigned doorbell_calls;
   int unsigned last_final_pi;
@@ -762,6 +767,8 @@ class rdma_cmq_test_profile extends rdma_cmq_hw_profile;
   rdma_handle last_doorbell_target;
   rdma_handle last_doorbell_input;
   rdma_cmq_expected_response last_expected_alias;
+  rdma_xtr_v1_cmq_completion_codec completion_codec;
+  rdma_xtr_v1_error_codec error_codec;
 
   function new(string name = "rdma_cmq_test_profile");
     super.new(name);
@@ -777,6 +784,11 @@ class rdma_cmq_test_profile extends rdma_cmq_hw_profile;
     compose_failure_code = RDMA_SC_CODEC_ERROR;
     fail_doorbell_encode = 1'b0;
     doorbell_failure_code = RDMA_SC_CODEC_ERROR;
+    sqe_endian = RDMA_ENDIAN_BIG;
+    sqe_hardware_version = 7;
+    alternate_sqe_format_for_opcode_b = 1'b0;
+    alternate_sqe_endian = RDMA_ENDIAN_LITTLE;
+    alternate_sqe_hardware_version = 8;
     compose_calls = 0;
     doorbell_calls = 0;
     last_final_pi = 0;
@@ -784,6 +796,12 @@ class rdma_cmq_test_profile extends rdma_cmq_hw_profile;
     last_doorbell_target = null;
     last_doorbell_input = null;
     last_expected_alias = null;
+    completion_codec = rdma_xtr_v1_cmq_completion_codec::type_id::create(
+      "engine_test_completion_codec"
+    );
+    error_codec = rdma_xtr_v1_error_codec::type_id::create(
+      "engine_test_error_codec"
+    );
   endfunction
 
   virtual function string profile_name();
@@ -798,6 +816,53 @@ class rdma_cmq_test_profile extends rdma_cmq_hw_profile;
       return rdma_status::make(RDMA_SC_INVALID_STATE,
                                "test CMQ profile validation failed");
     return rdma_status::success();
+  endfunction
+
+  protected function void set_cqe_qword(
+    rdma_hw_image image,
+    int unsigned qword_index,
+    bit [63:0] value
+  );
+    int unsigned base;
+
+    base = qword_index * 8;
+    for (int unsigned i = 0; i < 8; i++)
+      image.bytes[base + i] = value[63 - (i * 8) -: 8];
+  endfunction
+
+  function rdma_hw_image make_cqe(
+    string name,
+    bit owner,
+    bit [31:0] hardware_opcode,
+    bit [31:0] hardware_ecode,
+    int unsigned wqe_index,
+    bit wqe_wrap,
+    int unsigned function_generation
+  );
+    rdma_hw_image image;
+    bit [63:0] qword0;
+
+    image = rdma_hw_image::type_id::create(name);
+    repeat (64)
+      image.bytes.push_back(8'h00);
+    image.length = 64;
+    image.alignment = 64;
+    image.endian = sqe_endian;
+    image.image_kind = RDMA_IMAGE_CMQ_CQE;
+    image.hardware_version = sqe_hardware_version;
+    image.function_generation = function_generation;
+    image.write_target_kind = RDMA_HW_TARGET_NONE;
+    image.backing_target = '0;
+    image.hmc_target = '0;
+    image.bar_target = '0;
+    qword0 = '0;
+    qword0[63] = owner;
+    qword0[45] = wqe_wrap;
+    qword0[44:40] = wqe_index[4:0];
+    qword0[39:32] = hardware_opcode[7:0];
+    qword0[31:24] = hardware_ecode[7:0];
+    set_cqe_qword(image, 0, qword0);
+    return image;
   endfunction
 
   virtual function rdma_status compose_sqe(
@@ -852,9 +917,14 @@ class rdma_cmq_test_profile extends rdma_cmq_hw_profile;
     sqe.bytes[7] = body.command_id[7:0];
     sqe.length = 64;
     sqe.alignment = 64;
-    sqe.endian = RDMA_ENDIAN_BIG;
+    sqe.endian = (alternate_sqe_format_for_opcode_b &&
+                  command.opcode_key.opcode == TEST_OPCODE_B) ?
+                 alternate_sqe_endian : sqe_endian;
     sqe.image_kind = RDMA_IMAGE_CMQ_SQE;
-    sqe.hardware_version = 7;
+    sqe.hardware_version =
+      (alternate_sqe_format_for_opcode_b &&
+       command.opcode_key.opcode == TEST_OPCODE_B) ?
+      alternate_sqe_hardware_version : sqe_hardware_version;
     sqe.function_generation = command.function_h.generation;
     sqe.write_target_kind = RDMA_HW_TARGET_BACKING;
     sqe.backing_target.value = slot.backing_addr.value +
@@ -925,10 +995,87 @@ class rdma_cmq_test_profile extends rdma_cmq_hw_profile;
     output bit ready,
     output rdma_cmq_decoded_cqe decoded
   );
+    rdma_status status;
+    rdma_status command_status;
+    rdma_hw_image codec_raw_cqe;
+    rdma_xtr_v1_cmq_completion completion;
+    rdma_xtr_v1_cmq_completion payload;
+    uvm_object cloned_object;
+
     ready = 1'b0;
     decoded = null;
-    return rdma_status::make(RDMA_SC_UNSUPPORTED_OPCODE,
-                             "test profile has no completion opcode");
+    if (completion_codec == null || error_codec == null)
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "test profile completion codecs are unavailable"
+      );
+    codec_raw_cqe = rdma_cmq_clone_image_value(
+      raw_cqe, "test profile XTR codec input"
+    );
+    if (codec_raw_cqe == null)
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "test profile could not snapshot its raw CQE input"
+      );
+    // The synthetic profile deliberately advertises a non-XTR format to
+    // exercise engine neutrality.  Only its private test codec adapter owns
+    // the XTR v1 metadata required to decode the borrowed wire layout.
+    codec_raw_cqe.endian = RDMA_ENDIAN_BIG;
+    codec_raw_cqe.hardware_version = XTR_V1_HW_VERSION;
+    status = completion_codec.inspect_completion(
+      codec_raw_cqe, expected_owner, ready, completion
+    );
+    if (status == null || !status.ok() || !ready)
+      return status;
+    if (completion == null) begin
+      ready = 1'b0;
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "test completion codec returned null decoded data"
+      );
+    end
+    status = error_codec.decode_status(
+      completion.command_ecode, RDMA_ENGINE_CMQ, command_status
+    );
+    if (status == null || !status.ok() || command_status == null) begin
+      ready = 1'b0;
+      return (status == null) ?
+        rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "test error codec returned null status"
+        ) : status;
+    end
+    cloned_object = completion.clone();
+    if (cloned_object == null || !$cast(payload, cloned_object)) begin
+      ready = 1'b0;
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "test completion payload clone failed"
+      );
+    end
+    decoded = rdma_cmq_decoded_cqe::type_id::create(
+      "engine_test_decoded_cqe"
+    );
+    if (decoded == null) begin
+      ready = 1'b0;
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "test decoded CQE allocation failed"
+      );
+    end
+    decoded.hardware_opcode = {24'h0, completion.opcode};
+    decoded.wqe_index = completion.wqe_index;
+    decoded.wqe_wrap = completion.wrap;
+    decoded.hardware_ecode = {24'h0, completion.command_ecode};
+    decoded.command_status = command_status;
+    decoded.response_payload = payload;
+    status = decoded.validate();
+    if (!status.ok()) begin
+      decoded = null;
+      ready = 1'b0;
+      return status;
+    end
+    return rdma_status::success();
   endfunction
 
   virtual function rdma_status encode_doorbell(
@@ -1707,21 +1854,6 @@ class rdma_cmq_engine_probe extends rdma_cmq_engine;
     retire_seq = seeded_retire_seq;
   endfunction
 
-  function rdma_status complete_and_retire_slot_zero();
-    int unsigned token;
-
-    if (slots[0] == null)
-      return rdma_status::make(RDMA_SC_INVALID_STATE,
-                               "test retirement slot is null");
-    token = slots[0].command_token;
-    if (token >= 32 || !token_in_use[token])
-      return rdma_status::make(RDMA_SC_INVALID_STATE,
-                               "test retirement token is invalid");
-    token_in_use[token] = 1'b0;
-    slots[0].state = CMQ_SLOT_COMPLETED;
-    return retire_completed_prefix();
-  endfunction
-
   function int unsigned tokens_in_use_count();
     int unsigned count;
 
@@ -1740,6 +1872,14 @@ class rdma_cmq_engine_probe extends rdma_cmq_engine;
       if (slots[i] != null)
         count++;
     return count;
+  endfunction
+
+  function int unsigned command_registry_count();
+    return command_registry.num();
+  endfunction
+
+  function int unsigned entry_registry_count();
+    return entry_registry.num();
   endfunction
 
   function string slot_expected_variant(int unsigned sq_index);
@@ -2071,6 +2211,7 @@ class rdma_cmq_engine_test extends uvm_test;
   localparam int unsigned TEST_FUNCTION_ID = 32'h1020_3040;
   localparam int unsigned TEST_GENERATION = 32'd9;
   localparam int unsigned TEST_CMQ_ID = 32'h5566_7788;
+  localparam longint unsigned TEST_CQ_OFFSET = 64'd2048;
 
   function new(string name = "rdma_cmq_engine_test",
                uvm_component parent = null);
@@ -2547,6 +2688,148 @@ class rdma_cmq_engine_test extends uvm_test;
       match_count++;
     end
     return -1;
+  endfunction
+
+  task automatic write_profile_cqe(
+    string label,
+    rdma_mock_host_mem mem,
+    rdma_dma_mapping mapping,
+    rdma_cmq_test_profile profile,
+    longint unsigned cq_sequence,
+    bit owner,
+    rdma_cmq_ticket ticket,
+    bit [31:0] hardware_ecode,
+    output rdma_hw_image raw_cqe
+  );
+    byte data[];
+    rdma_status status;
+
+    raw_cqe = null;
+    if (mem == null || mapping == null || profile == null ||
+        ticket == null || ticket.function_h == null ||
+        ticket.opcode_key == null) begin
+      `uvm_error(label, "CQE write prerequisites are incomplete")
+      return;
+    end
+    raw_cqe = profile.make_cqe(
+      {label, "_raw_cqe"}, owner, ticket.opcode_key.opcode,
+      hardware_ecode, ticket.sq_index, ticket.sq_wrap,
+      ticket.function_h.generation
+    );
+    if (raw_cqe == null || raw_cqe.bytes.size() != 64) begin
+      `uvm_error(label, "profile did not produce a 64-byte CQE")
+      raw_cqe = null;
+      return;
+    end
+    data = new[64];
+    foreach (data[i])
+      data[i] = raw_cqe.bytes[i];
+    status = mem.write(
+      mapping,
+      TEST_CQ_OFFSET + ((cq_sequence % 32) * 64),
+      data
+    );
+    expect_status({label, "_WRITE"}, status, RDMA_SC_OK);
+  endtask
+
+  function automatic void expect_poll_read_geometry(
+    string label,
+    rdma_mock_host_mem mem,
+    longint unsigned first_cq_sequence,
+    int unsigned expected_count
+  );
+    int call_index;
+    longint unsigned expected_offset;
+
+    if (count_host_calls(mem, "read") != expected_count) begin
+      `uvm_error(label,
+                 $sformatf("poll issued %0d reads, expected %0d",
+                           count_host_calls(mem, "read"),
+                           expected_count))
+      return;
+    end
+    for (int unsigned i = 0; i < expected_count; i++) begin
+      call_index = host_call_index(mem, "read", i);
+      expected_offset = TEST_CQ_OFFSET +
+                        (((first_cq_sequence + i) % 32) * 64);
+      if (call_index < 0 || mem.calls[call_index].size != 64 ||
+          mem.calls[call_index].offset != expected_offset)
+        `uvm_error(label,
+                   $sformatf("read %0d was not an exact 64B CQ slot read",
+                             i))
+    end
+  endfunction
+
+  function automatic void expect_polled_completion(
+    string label,
+    rdma_cmq_engine_probe engine,
+    rdma_cmq_completion completion,
+    rdma_cmq_ticket expected_ticket,
+    rdma_hw_image expected_raw,
+    bit expected_owner,
+    bit [31:0] expected_hardware_ecode,
+    rdma_status_code_e expected_code
+  );
+    rdma_xtr_v1_cmq_completion payload;
+    rdma_status validation_status;
+
+    if (completion == null || expected_ticket == null ||
+        expected_ticket.function_h == null ||
+        expected_ticket.cmq_h == null ||
+        expected_ticket.opcode_key == null || expected_raw == null) begin
+      `uvm_error(label, "completion comparison prerequisites are null")
+      return;
+    end
+    validation_status = completion.validate();
+    expect_status({label, "_VALIDATE"}, validation_status, RDMA_SC_OK);
+    if (completion.ticket == null || completion.ticket == expected_ticket ||
+        completion.ticket.function_h == expected_ticket.function_h ||
+        completion.ticket.cmq_h == expected_ticket.cmq_h ||
+        completion.ticket.opcode_key == expected_ticket.opcode_key ||
+        completion.ticket.command_id != expected_ticket.command_id ||
+        completion.ticket.slot_sequence != expected_ticket.slot_sequence ||
+        completion.ticket.sq_index != expected_ticket.sq_index ||
+        completion.ticket.sq_wrap != expected_ticket.sq_wrap ||
+        completion.ticket.opcode_key.opcode !=
+          expected_ticket.opcode_key.opcode)
+      `uvm_error(label, "completion ticket is aliased or mismatched")
+    expect_status({label, "_COMMAND_STATUS"}, completion.status,
+                  expected_code);
+    if (completion.status == null)
+      return;
+    if (completion.status.source_engine != RDMA_ENGINE_CMQ ||
+        completion.status.function_uid !=
+          expected_ticket.function_h.function_uid ||
+        completion.status.generation !=
+          expected_ticket.function_h.generation ||
+        completion.status.resource_id != expected_ticket.cmq_h.object_id ||
+        completion.status.command_id != expected_ticket.command_id)
+      `uvm_error(label, "completion status identity is incomplete")
+    if (expected_hardware_ecode == 0) begin
+      if (completion.status.hardware_code_valid ||
+          completion.status.hardware_code != 0)
+        `uvm_error(label, "successful completion retained hardware error")
+    end
+    else if (!completion.status.hardware_code_valid ||
+             completion.status.hardware_code != expected_hardware_ecode)
+      `uvm_error(label, "completion lost the raw hardware ecode")
+    if (completion.raw_cqe == null || completion.raw_cqe == expected_raw ||
+        !engine.probe_same_image(completion.raw_cqe, expected_raw))
+      `uvm_error(label, "completion raw CQE is aliased or mismatched")
+    if (completion.raw_cqe != null &&
+        (completion.raw_cqe.endian != expected_raw.endian ||
+         completion.raw_cqe.hardware_version !=
+           expected_raw.hardware_version))
+      `uvm_error(label,
+                 "completion raw CQE lost profile-wide format metadata")
+    if (!$cast(payload, completion.decoded_response))
+      `uvm_error(label, "completion lost the typed decoded payload")
+    else if (payload.owner != expected_owner ||
+             payload.opcode != expected_ticket.opcode_key.opcode[7:0] ||
+             payload.command_ecode != expected_hardware_ecode[7:0] ||
+             payload.wqe_index != expected_ticket.sq_index ||
+             payload.wrap != expected_ticket.sq_wrap)
+      `uvm_error(label, "decoded CQE payload fields are mismatched")
   endfunction
 
   function automatic void expect_release_retry_identity(
@@ -5044,7 +5327,9 @@ class rdma_cmq_engine_test extends uvm_test;
                                   trace);
     if (engine.published_count() != 0 ||
         engine.tokens_in_use_count() != 0 ||
-        engine.slot_record_count() != 0)
+        engine.slot_record_count() != 0 ||
+        engine.command_registry_count() != 0 ||
+        engine.entry_registry_count() != 0)
       `uvm_error("NULL_COMPOSE_LEDGER",
                  "null compose status committed tentative state")
 
@@ -5133,7 +5418,9 @@ class rdma_cmq_engine_test extends uvm_test;
                                   trace);
     if (engine.published_count() != 0 ||
         engine.tokens_in_use_count() != 0 ||
-        engine.slot_record_count() != 0)
+        engine.slot_record_count() != 0 ||
+        engine.command_registry_count() != 0 ||
+        engine.entry_registry_count() != 0)
       `uvm_error("ATOMIC_ENCODE_LEDGER",
                  "encode failure committed tentative state")
 
@@ -5165,10 +5452,16 @@ class rdma_cmq_engine_test extends uvm_test;
                  "transport failure did not reach the final doorbell")
     if (engine.published_count() != 0 ||
         engine.tokens_in_use_count() != 0 ||
-        engine.slot_record_count() != 0)
+        engine.slot_record_count() != 0 ||
+        engine.command_registry_count() != 0 ||
+        engine.entry_registry_count() != 0)
       `uvm_error("ATOMIC_TRANSPORT_LEDGER",
                  "scheduler failure committed tentative state")
 
+    // A failed scheduler transaction must not commit the tentative CMQ
+    // profile format.  Recovery is allowed to establish a different one.
+    profile.sqe_endian = RDMA_ENDIAN_LITTLE;
+    profile.sqe_hardware_version = 11;
     clear_submit_observation(mem, pcie, trace);
     requests = new[1];
     requests[0] = make_command("atomic_recovery", active_binding,
@@ -5203,12 +5496,127 @@ class rdma_cmq_engine_test extends uvm_test;
                                   trace);
     if (engine.published_count() != 1 ||
         engine.tokens_in_use_count() != 1 ||
-        engine.slot_record_count() != 1)
+        engine.slot_record_count() != 1 ||
+        engine.command_registry_count() != 1 ||
+        engine.entry_registry_count() != 1)
       `uvm_error("ATOMIC_COMPOSE_LEDGER",
                  "per-item compose failure changed committed state")
 
     engine.shutdown(status);
     expect_status("ATOMIC_SHUTDOWN", status, RDMA_SC_OK);
+  endtask
+
+  task automatic check_profile_wide_cqe_format_authority();
+    rdma_cmq_engine_probe engine;
+    rdma_mock_host_mem mem;
+    rdma_cmq_test_pcie pcie;
+    rdma_mock_call_trace trace;
+    rdma_doorbell_scheduler scheduler;
+    rdma_cmq_test_profile profile;
+    rdma_function_binding prepared_binding;
+    rdma_function_binding active_binding;
+    rdma_cmq cmq;
+    rdma_cmq_runtime_desc runtime_desc;
+    rdma_cmq_command_desc requests[];
+    rdma_cmq_ticket tickets[];
+    rdma_status item_statuses[];
+    rdma_status batch_status;
+    rdma_status status;
+
+    engine = rdma_cmq_engine_probe::type_id::create("format_engine");
+    mem = rdma_mock_host_mem::type_id::create("format_mem");
+    pcie = rdma_cmq_test_pcie::type_id::create("format_pcie");
+    trace = rdma_mock_call_trace::type_id::create("format_trace");
+    mem.set_call_trace(trace);
+    pcie.set_call_trace(trace);
+    scheduler = rdma_doorbell_scheduler::type_id::create(
+      "format_scheduler"
+    );
+    profile = rdma_cmq_test_profile::type_id::create("format_profile");
+    prepared_binding = make_binding("format_prepared", RDMA_BIND_PREPARED);
+    active_binding = make_binding("format_active", RDMA_BIND_ACTIVE);
+    cmq = make_cmq("format_cmq", prepared_binding);
+    prepare_active("FORMAT", engine, mem, pcie, scheduler, profile,
+                   prepared_binding, active_binding, cmq, runtime_desc);
+    clear_submit_observation(mem, pcie, trace);
+
+    profile.alternate_sqe_format_for_opcode_b = 1'b1;
+    requests = new[2];
+    requests[0] = make_command(
+      "format_batch_a", active_binding,
+      rdma_cmq_test_profile::TEST_OPCODE_A, 8'h71
+    );
+    requests[1] = make_command(
+      "format_batch_b", active_binding,
+      rdma_cmq_test_profile::TEST_OPCODE_B, 8'h72
+    );
+    engine.submit_batch(requests, tickets, item_statuses, batch_status);
+    expect_status("FORMAT_BATCH_STATUS", batch_status,
+                  RDMA_SC_INVALID_STATE);
+    if (tickets.size() != 2 || item_statuses.size() != 2)
+      `uvm_error("FORMAT_BATCH_OUTPUT", "format failure outputs misaligned")
+    else foreach (tickets[i]) begin
+      if (tickets[i] != null)
+        `uvm_error("FORMAT_BATCH_TICKET",
+                   "inconsistent batch published a ticket")
+      expect_status($sformatf("FORMAT_BATCH_ITEM_%0d", i),
+                    item_statuses[i], RDMA_SC_INVALID_STATE);
+    end
+    expect_no_submit_side_effects("FORMAT_BATCH_EFFECTS", mem, pcie,
+                                  trace);
+    if (engine.published_count() != 0 ||
+        engine.tokens_in_use_count() != 0 ||
+        engine.slot_record_count() != 0 ||
+        engine.command_registry_count() != 0 ||
+        engine.entry_registry_count() != 0)
+      `uvm_error("FORMAT_BATCH_LEDGER",
+                 "inconsistent batch polluted the committed ledger")
+
+    profile.alternate_sqe_format_for_opcode_b = 1'b0;
+    clear_submit_observation(mem, pcie, trace);
+    requests = new[1];
+    requests[0] = make_command(
+      "format_authority", active_binding,
+      rdma_cmq_test_profile::TEST_OPCODE_A, 8'h73
+    );
+    engine.submit_batch(requests, tickets, item_statuses, batch_status);
+    expect_status("FORMAT_AUTHORITY_BATCH", batch_status, RDMA_SC_OK);
+    if (tickets.size() != 1 || tickets[0] == null ||
+        item_statuses.size() != 1)
+      `uvm_error("FORMAT_AUTHORITY_OUTPUT",
+                 "format authority submission did not publish")
+    else
+      expect_status("FORMAT_AUTHORITY_ITEM", item_statuses[0], RDMA_SC_OK);
+
+    profile.sqe_endian = RDMA_ENDIAN_LITTLE;
+    profile.sqe_hardware_version = 12;
+    clear_submit_observation(mem, pcie, trace);
+    requests[0] = make_command(
+      "format_change", active_binding,
+      rdma_cmq_test_profile::TEST_OPCODE_A, 8'h74
+    );
+    engine.submit_batch(requests, tickets, item_statuses, batch_status);
+    expect_status("FORMAT_CHANGE_BATCH", batch_status,
+                  RDMA_SC_INVALID_STATE);
+    if (tickets.size() != 1 || tickets[0] != null ||
+        item_statuses.size() != 1)
+      `uvm_error("FORMAT_CHANGE_OUTPUT",
+                 "cross-batch format failure output is invalid")
+    else
+      expect_status("FORMAT_CHANGE_ITEM", item_statuses[0],
+                    RDMA_SC_INVALID_STATE);
+    expect_no_submit_side_effects("FORMAT_CHANGE_EFFECTS", mem, pcie,
+                                  trace);
+    if (engine.published_count() != 1 ||
+        engine.tokens_in_use_count() != 1 ||
+        engine.slot_record_count() != 1 ||
+        engine.command_registry_count() != 1 ||
+        engine.entry_registry_count() != 1)
+      `uvm_error("FORMAT_CHANGE_LEDGER",
+                 "cross-batch format change polluted committed authority")
+
+    engine.shutdown(status);
+    expect_status("FORMAT_SHUTDOWN", status, RDMA_SC_OK);
   endtask
 
   task automatic check_all_transport_failure_rollbacks();
@@ -5363,7 +5771,9 @@ class rdma_cmq_engine_test extends uvm_test;
                              label, mem.calls.size(), pcie.calls.size()))
       if (engine.published_count() != 1 || engine.retired_count() != 0 ||
           engine.tokens_in_use_count() != 1 ||
-          engine.slot_record_count() != 1 || baseline_ticket == null ||
+          engine.slot_record_count() != 1 ||
+          engine.command_registry_count() != 1 ||
+          engine.entry_registry_count() != 1 || baseline_ticket == null ||
           baseline_ticket.command_id != baseline_command_id ||
           baseline_ticket.slot_sequence != 0 ||
           engine.slot_ticket_command_id(0) != baseline_command_id ||
@@ -5402,6 +5812,8 @@ class rdma_cmq_engine_test extends uvm_test;
           mem.calls[1].offset != 128 || engine.published_count() != 3 ||
           engine.tokens_in_use_count() != 3 ||
           engine.slot_record_count() != 3 ||
+          engine.command_registry_count() != 3 ||
+          engine.entry_registry_count() != 3 ||
           engine.slot_ticket_command_id(0) != baseline_command_id ||
           engine.slot_expected_variant(0) != baseline_expected_variant)
         `uvm_error("TRANSPORT_ROLLBACK_RECOVERY_LEDGER",
@@ -6925,6 +7337,294 @@ class rdma_cmq_engine_test extends uvm_test;
     end
   endtask
 
+  task automatic check_poll_backing_out_of_order_and_owner_wrap();
+    rdma_cmq_engine_probe engine;
+    rdma_mock_host_mem mem;
+    rdma_cmq_test_pcie pcie;
+    rdma_doorbell_scheduler scheduler;
+    rdma_cmq_test_profile profile;
+    rdma_function_binding prepared_binding;
+    rdma_function_binding active_binding;
+    rdma_cmq cmq;
+    rdma_cmq_runtime_desc runtime_desc;
+    rdma_dma_mapping mapping;
+    rdma_cmq_command_desc requests[];
+    rdma_cmq_ticket tickets[];
+    rdma_status item_statuses[];
+    rdma_status batch_status;
+    rdma_cmq_completion completions[$];
+    rdma_cmq_diagnostic diagnostics[$];
+    rdma_hw_image arrival_raw[3];
+    longint unsigned arrival_ids[$];
+    rdma_cmq_command_desc wrap_requests[];
+    rdma_cmq_ticket wrap_tickets[];
+    rdma_status wrap_item_statuses[];
+    rdma_hw_image wrap_raw[];
+    rdma_cmq_command_desc wrapped_request;
+    rdma_cmq_ticket wrapped_ticket;
+    rdma_hw_image wrapped_raw;
+    rdma_status status;
+    byte unsigned detached_byte;
+
+    engine = rdma_cmq_engine_probe::type_id::create("poll_engine");
+    mem = rdma_mock_host_mem::type_id::create("poll_mem");
+    pcie = rdma_cmq_test_pcie::type_id::create("poll_pcie");
+    scheduler = rdma_doorbell_scheduler::type_id::create(
+      "poll_scheduler"
+    );
+    profile = rdma_cmq_test_profile::type_id::create("poll_profile");
+    prepared_binding = make_binding("poll_prepared", RDMA_BIND_PREPARED);
+    active_binding = make_binding("poll_active", RDMA_BIND_ACTIVE);
+    cmq = make_cmq("poll_cmq", prepared_binding);
+    prepare_active("POLL", engine, mem, pcie, scheduler, profile,
+                   prepared_binding, active_binding, cmq, runtime_desc);
+    mapping = engine.mapping_snapshot();
+    if (mapping == null)
+      `uvm_error("POLL_MAPPING", "active engine returned no mapping")
+
+    requests = new[3];
+    requests[0] = make_command(
+      "poll_request_0", active_binding,
+      rdma_cmq_test_profile::TEST_OPCODE_A, 8'h90, 10us
+    );
+    requests[1] = make_command(
+      "poll_request_1", active_binding,
+      rdma_cmq_test_profile::TEST_OPCODE_B, 8'h91, 10us
+    );
+    requests[2] = make_command(
+      "poll_request_2", active_binding,
+      rdma_cmq_test_profile::TEST_OPCODE_A, 8'h92, 10us
+    );
+    engine.submit_batch(requests, tickets, item_statuses, batch_status);
+    expect_status("POLL_SUBMIT_BATCH", batch_status, RDMA_SC_OK);
+    if (tickets.size() != 3 || item_statuses.size() != 3) begin
+      `uvm_error("POLL_SUBMIT_ALIGNMENT", "three ticket outputs are missing")
+      engine.shutdown(status);
+      return;
+    end
+    foreach (tickets[i]) begin
+      expect_status($sformatf("POLL_SUBMIT_ITEM_%0d", i),
+                    item_statuses[i], RDMA_SC_OK);
+      if (tickets[i] == null || tickets[i].slot_sequence != i ||
+          tickets[i].sq_index != i || tickets[i].sq_wrap)
+        `uvm_error("POLL_SUBMIT_TICKET",
+                   $sformatf("ticket %0d has a wrong initial slot", i))
+    end
+    if (engine.published_count() != 3 || engine.retired_count() != 0 ||
+        engine.tokens_in_use_count() != 3 ||
+        engine.slot_record_count() != 3 ||
+        engine.command_registry_count() != 3 ||
+        engine.entry_registry_count() != 3)
+      `uvm_error("POLL_SUBMIT_LEDGER", "three commands were not published")
+
+    mem.calls.delete();
+    engine.poll(completions, diagnostics, status);
+    expect_status("POLL_OWNER_MISMATCH_STATUS", status, RDMA_SC_OK);
+    if (completions.size() != 0 || diagnostics.size() != 0 ||
+        engine.cq_consumed_count() != 0 || engine.retired_count() != 0)
+      `uvm_error("POLL_OWNER_MISMATCH",
+                 "owner mismatch published output or advanced a counter")
+    expect_poll_read_geometry("POLL_OWNER_MISMATCH_READ", mem, 0, 1);
+
+    mem.calls.delete();
+    write_profile_cqe(
+      "POLL_ARRIVAL_2", mem, mapping, profile, 0, 1'b1, tickets[2],
+      0, arrival_raw[0]
+    );
+    engine.poll(completions, diagnostics, status);
+    expect_status("POLL_ARRIVAL_2_STATUS", status, RDMA_SC_OK);
+    if (completions.size() != 1 || diagnostics.size() != 0)
+      `uvm_error("POLL_ARRIVAL_2_OUTPUT", "arrival 2 output is misaligned")
+    else begin
+      expect_polled_completion(
+        "POLL_ARRIVAL_2_COMPLETION", engine, completions[0], tickets[2],
+        arrival_raw[0], 1'b1, 0, RDMA_SC_OK
+      );
+      arrival_ids.push_back(completions[0].ticket.command_id);
+      detached_byte = completions[0].raw_cqe.bytes[0];
+      arrival_raw[0].bytes[0] ^= 8'hff;
+      if (completions[0].raw_cqe.bytes[0] != detached_byte)
+        `uvm_error("POLL_ARRIVAL_2_DETACHED",
+                   "caller raw image mutation reached completion")
+    end
+    if (engine.cq_consumed_count() != 1 ||
+        engine.retired_count() != 0 ||
+        engine.tokens_in_use_count() != 2 ||
+        engine.slot_record_count() != 3 ||
+        engine.command_registry_count() != 2 ||
+        engine.entry_registry_count() != 3)
+      `uvm_error("POLL_ARRIVAL_2_PREFIX",
+                 "out-of-order completion advanced retirement")
+    expect_poll_read_geometry("POLL_ARRIVAL_2_READ", mem, 0, 2);
+
+    mem.calls.delete();
+    write_profile_cqe(
+      "POLL_ARRIVAL_0", mem, mapping, profile, 1, 1'b1, tickets[0],
+      XTR_V1_ECODE_EC_RCE_CQ_FULL, arrival_raw[1]
+    );
+    engine.poll(completions, diagnostics, status);
+    expect_status("POLL_ARRIVAL_0_STATUS", status, RDMA_SC_OK);
+    if (completions.size() != 1 || diagnostics.size() != 0)
+      `uvm_error("POLL_ARRIVAL_0_OUTPUT", "arrival 0 output is misaligned")
+    else begin
+      expect_polled_completion(
+        "POLL_ARRIVAL_0_COMPLETION", engine, completions[0], tickets[0],
+        arrival_raw[1], 1'b1, XTR_V1_ECODE_EC_RCE_CQ_FULL,
+        RDMA_SC_QUEUE_FULL
+      );
+      arrival_ids.push_back(completions[0].ticket.command_id);
+    end
+    if (engine.cq_consumed_count() != 2 ||
+        engine.retired_count() != 1 ||
+        engine.tokens_in_use_count() != 1 ||
+        engine.slot_record_count() != 2 ||
+        engine.command_registry_count() != 1 ||
+        engine.entry_registry_count() != 2)
+      `uvm_error("POLL_ARRIVAL_0_PREFIX",
+                 "slot zero completion retired the wrong prefix")
+    expect_poll_read_geometry("POLL_ARRIVAL_0_READ", mem, 1, 2);
+
+    mem.calls.delete();
+    write_profile_cqe(
+      "POLL_ARRIVAL_1", mem, mapping, profile, 2, 1'b1, tickets[1],
+      0, arrival_raw[2]
+    );
+    engine.poll(completions, diagnostics, status);
+    expect_status("POLL_ARRIVAL_1_STATUS", status, RDMA_SC_OK);
+    if (completions.size() != 1 || diagnostics.size() != 0)
+      `uvm_error("POLL_ARRIVAL_1_OUTPUT", "arrival 1 output is misaligned")
+    else begin
+      expect_polled_completion(
+        "POLL_ARRIVAL_1_COMPLETION", engine, completions[0], tickets[1],
+        arrival_raw[2], 1'b1, 0, RDMA_SC_OK
+      );
+      arrival_ids.push_back(completions[0].ticket.command_id);
+    end
+    if (arrival_ids.size() != 3 ||
+        arrival_ids[0] != tickets[2].command_id ||
+        arrival_ids[1] != tickets[0].command_id ||
+        arrival_ids[2] != tickets[1].command_id)
+      `uvm_error("POLL_ARRIVAL_ORDER",
+                 "completion delivery did not preserve 2,0,1 arrival")
+    if (engine.cq_consumed_count() != 3 ||
+        engine.retired_count() != 3 ||
+        engine.tokens_in_use_count() != 0 ||
+        engine.slot_record_count() != 0 ||
+        engine.command_registry_count() != 0 ||
+        engine.entry_registry_count() != 0)
+      `uvm_error("POLL_ARRIVAL_1_PREFIX",
+                 "completion 1 did not retire the full prefix")
+    expect_poll_read_geometry("POLL_ARRIVAL_1_READ", mem, 2, 2);
+
+    wrap_requests = new[29];
+    foreach (wrap_requests[i])
+      wrap_requests[i] = make_command(
+        $sformatf("poll_wrap_request_%0d", i), active_binding,
+        (i[0] == 1'b0) ? rdma_cmq_test_profile::TEST_OPCODE_A :
+                         rdma_cmq_test_profile::TEST_OPCODE_B,
+        byte'(8'ha0 + i), 10us
+      );
+    engine.submit_batch(wrap_requests, wrap_tickets, wrap_item_statuses,
+                        batch_status);
+    expect_status("POLL_WRAP_SUBMIT", batch_status, RDMA_SC_OK);
+    if (wrap_tickets.size() != 29 || wrap_item_statuses.size() != 29) begin
+      `uvm_error("POLL_WRAP_ALIGNMENT", "owner-wrap outputs are misaligned")
+      engine.shutdown(status);
+      return;
+    end
+    if (engine.command_registry_count() != 29 ||
+        engine.entry_registry_count() != 29)
+      `uvm_error("POLL_WRAP_REGISTRY",
+                 "owner-wrap submission did not install both registries")
+    wrap_raw = new[29];
+    mem.calls.delete();
+    foreach (wrap_tickets[i]) begin
+      expect_status($sformatf("POLL_WRAP_ITEM_%0d", i),
+                    wrap_item_statuses[i], RDMA_SC_OK);
+      if (wrap_tickets[i] == null ||
+          wrap_tickets[i].slot_sequence != (i + 3) ||
+          wrap_tickets[i].sq_index != (i + 3) ||
+          wrap_tickets[i].sq_wrap)
+        `uvm_error("POLL_WRAP_TICKET",
+                   $sformatf("owner-wrap ticket %0d is wrong", i))
+      write_profile_cqe(
+        $sformatf("POLL_WRAP_CQE_%0d", i), mem, mapping, profile,
+        longint'(i + 3), 1'b1, wrap_tickets[i], 0, wrap_raw[i]
+      );
+    end
+    engine.poll(completions, diagnostics, status);
+    expect_status("POLL_WRAP_STATUS", status, RDMA_SC_OK);
+    if (completions.size() != 29 || diagnostics.size() != 0)
+      `uvm_error("POLL_WRAP_OUTPUT",
+                 "poll did not drain all 29 terminal completions")
+    else foreach (completions[i])
+      expect_polled_completion(
+        $sformatf("POLL_WRAP_COMPLETION_%0d", i), engine,
+        completions[i], wrap_tickets[i], wrap_raw[i], 1'b1, 0,
+        RDMA_SC_OK
+      );
+    expect_poll_read_geometry("POLL_WRAP_READ", mem, 3, 30);
+    if (engine.cq_consumed_count() != 32 ||
+        engine.retired_count() != 32 ||
+        engine.tokens_in_use_count() != 0 ||
+        engine.slot_record_count() != 0 ||
+        engine.command_registry_count() != 0 ||
+        engine.entry_registry_count() != 0)
+      `uvm_error("POLL_WRAP_LEDGER",
+                 "32 CQEs did not complete and retire exactly once")
+
+    mem.calls.delete();
+    engine.poll(completions, diagnostics, status);
+    expect_status("POLL_OWNER_FLIP_EMPTY_STATUS", status, RDMA_SC_OK);
+    if (completions.size() != 0 || diagnostics.size() != 0 ||
+        engine.cq_consumed_count() != 32)
+      `uvm_error("POLL_OWNER_FLIP_EMPTY",
+                 "old owner-1 CQE was reused after owner flip")
+    expect_poll_read_geometry("POLL_OWNER_FLIP_EMPTY_READ", mem, 32, 1);
+
+    wrapped_request = make_command(
+      "poll_sequence_32", active_binding,
+      rdma_cmq_test_profile::TEST_OPCODE_B, 8'he0, 10us
+    );
+    engine.submit(wrapped_request, wrapped_ticket, status);
+    expect_status("POLL_SEQUENCE_32_SUBMIT", status, RDMA_SC_OK);
+    if (wrapped_ticket == null || wrapped_ticket.slot_sequence != 32 ||
+        wrapped_ticket.sq_index != 0 || !wrapped_ticket.sq_wrap)
+      `uvm_error("POLL_SEQUENCE_32_TICKET",
+                 "sequence 32 did not reuse wrapped slot zero")
+    if (engine.command_registry_count() != 1 ||
+        engine.entry_registry_count() != 1)
+      `uvm_error("POLL_SEQUENCE_32_REGISTRY",
+                 "wrapped command did not install both registries")
+    mem.calls.delete();
+    write_profile_cqe(
+      "POLL_SEQUENCE_32_CQE", mem, mapping, profile, 32, 1'b0,
+      wrapped_ticket, 0, wrapped_raw
+    );
+    engine.poll(completions, diagnostics, status);
+    expect_status("POLL_SEQUENCE_32_STATUS", status, RDMA_SC_OK);
+    if (completions.size() != 1 || diagnostics.size() != 0)
+      `uvm_error("POLL_SEQUENCE_32_OUTPUT",
+                 "owner-zero CQE did not produce one completion")
+    else
+      expect_polled_completion(
+        "POLL_SEQUENCE_32_COMPLETION", engine, completions[0],
+        wrapped_ticket, wrapped_raw, 1'b0, 0, RDMA_SC_OK
+      );
+    expect_poll_read_geometry("POLL_SEQUENCE_32_READ", mem, 32, 2);
+    if (engine.cq_consumed_count() != 33 ||
+        engine.retired_count() != 33 ||
+        engine.tokens_in_use_count() != 0 ||
+        engine.slot_record_count() != 0 ||
+        engine.command_registry_count() != 0 ||
+        engine.entry_registry_count() != 0)
+      `uvm_error("POLL_SEQUENCE_32_LEDGER",
+                 "owner-zero completion did not close wrapped command")
+
+    engine.shutdown(status);
+    expect_status("POLL_SHUTDOWN", status, RDMA_SC_OK);
+  endtask
+
   task automatic check_retire_then_wrap_publication();
     rdma_cmq_engine_probe engine;
     rdma_mock_host_mem mem;
@@ -6940,6 +7640,10 @@ class rdma_cmq_engine_test extends uvm_test;
     rdma_cmq_ticket tickets[];
     rdma_status item_statuses[];
     rdma_status batch_status;
+    rdma_dma_mapping mapping;
+    rdma_cmq_completion completions[$];
+    rdma_cmq_diagnostic diagnostics[$];
+    rdma_hw_image raw_cqe;
     rdma_status status;
 
     engine = rdma_cmq_engine_probe::type_id::create("wrap_engine");
@@ -6977,8 +7681,22 @@ class rdma_cmq_engine_test extends uvm_test;
       end
     end
 
-    status = engine.complete_and_retire_slot_zero();
+    mapping = engine.mapping_snapshot();
+    clear_submit_observation(mem, pcie, trace);
+    write_profile_cqe(
+      "WRAP_RETIRE_ZERO", mem, mapping, profile, 0, 1'b1, tickets[0],
+      0, raw_cqe
+    );
+    engine.poll(completions, diagnostics, status);
     expect_status("WRAP_RETIRE_ZERO", status, RDMA_SC_OK);
+    if (completions.size() != 1 || diagnostics.size() != 0)
+      `uvm_error("WRAP_RETIRE_OUTPUT",
+                 "real CQE did not produce one slot-zero completion")
+    else
+      expect_polled_completion(
+        "WRAP_RETIRE_COMPLETION", engine, completions[0], tickets[0],
+        raw_cqe, 1'b1, 0, RDMA_SC_OK
+      );
     if (engine.published_count() != 32 || engine.retired_count() != 1 ||
         engine.tokens_in_use_count() != 31 ||
         engine.slot_record_count() != 31)
@@ -7128,6 +7846,8 @@ class rdma_cmq_engine_test extends uvm_test;
                                     RDMA_BIND_PREPARED);
     active_binding = make_binding("capacity_reactive", RDMA_BIND_ACTIVE);
     cmq = make_cmq("capacity_recmq", prepared_binding);
+    profile.sqe_endian = RDMA_ENDIAN_LITTLE;
+    profile.sqe_hardware_version = 13;
     engine.prepare(prepared_binding, cmq, 1'b1, 20'h34567, mem,
                    scheduler, profile, runtime_desc, status);
     expect_status("CAPACITY_REPREPARE", status, RDMA_SC_OK);
@@ -7169,6 +7889,7 @@ class rdma_cmq_engine_test extends uvm_test;
     check_mutating_clone_source_restoration();
     check_qpc_context_snapshot_failures();
     check_transaction_failure_atomicity();
+    check_profile_wide_cqe_format_authority();
     check_all_transport_failure_rollbacks();
     check_doorbell_authority_isolation();
     check_submission_validation_and_profile_metadata();
@@ -7179,6 +7900,7 @@ class rdma_cmq_engine_test extends uvm_test;
     check_incarnation_survives_reprepare();
     check_max_dependency_id_boundary();
     check_counter_invariants_poison_before_transport();
+    check_poll_backing_out_of_order_and_owner_wrap();
     check_retire_then_wrap_publication();
     check_full_initial_capacity_and_shutdown_reset();
     phase.drop_objection(this);
