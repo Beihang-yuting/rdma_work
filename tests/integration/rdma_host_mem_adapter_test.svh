@@ -10,6 +10,76 @@ class rdma_owner_clone_failure_handle extends rdma_handle;
   endfunction
 endclass
 
+class rdma_owner_snapshot_clone_failure_handle extends rdma_handle;
+  `uvm_object_utils(rdma_owner_snapshot_clone_failure_handle)
+
+  function new(string name = "rdma_owner_snapshot_clone_failure_handle");
+    super.new(name);
+  endfunction
+
+  virtual function uvm_object clone();
+    return null;
+  endfunction
+endclass
+
+class rdma_owner_two_stage_clone_handle extends rdma_handle;
+  `uvm_object_utils(rdma_owner_two_stage_clone_handle)
+
+  function new(string name = "rdma_owner_two_stage_clone_handle");
+    super.new(name);
+  endfunction
+
+  virtual function uvm_object clone();
+    rdma_owner_snapshot_clone_failure_handle result;
+
+    result = rdma_owner_snapshot_clone_failure_handle::type_id::create(
+      {get_name(), "_snapshot_failure"}
+    );
+    if (result == null)
+      return null;
+    result.kind = kind;
+    result.function_uid = function_uid;
+    result.object_id = object_id;
+    result.generation = generation;
+    return result;
+  endfunction
+endclass
+
+class rdma_owner_snapshot_alias_handle extends rdma_handle;
+  `uvm_object_utils(rdma_owner_snapshot_alias_handle)
+
+  function new(string name = "rdma_owner_snapshot_alias_handle");
+    super.new(name);
+  endfunction
+
+  virtual function uvm_object clone();
+    return this;
+  endfunction
+endclass
+
+class rdma_owner_two_stage_alias_handle extends rdma_handle;
+  `uvm_object_utils(rdma_owner_two_stage_alias_handle)
+
+  function new(string name = "rdma_owner_two_stage_alias_handle");
+    super.new(name);
+  endfunction
+
+  virtual function uvm_object clone();
+    rdma_owner_snapshot_alias_handle result;
+
+    result = rdma_owner_snapshot_alias_handle::type_id::create(
+      {get_name(), "_snapshot_alias"}
+    );
+    if (result == null)
+      return null;
+    result.kind = kind;
+    result.function_uid = function_uid;
+    result.object_id = object_id;
+    result.generation = generation;
+    return result;
+  endfunction
+endclass
+
 class rdma_owner_clone_counting_host_mem extends $unit::host_mem_manager;
   `uvm_object_utils(rdma_owner_clone_counting_host_mem)
 
@@ -121,19 +191,24 @@ class rdma_host_mem_adapter_test extends uvm_test;
     $unit::host_mem_manager equal_hm_a;
     $unit::host_mem_manager equal_hm_b;
     rdma_owner_clone_counting_host_mem owner_clone_hm;
+    rdma_owner_clone_counting_host_mem authority_clone_hm;
     rdma_host_mem_adapter adapter;
     rdma_host_mem_adapter offset_adapter;
     rdma_host_mem_adapter overflow_adapter;
     rdma_host_mem_adapter equal_adapter_a;
     rdma_host_mem_adapter equal_adapter_b;
     rdma_host_mem_adapter owner_clone_adapter;
+    rdma_host_mem_adapter authority_clone_adapter;
     rdma_function_handle function_h;
     rdma_function_handle invalid_function_h;
     rdma_dma_request_context request_context;
     rdma_dma_request_context request_context_snapshot;
     rdma_dma_request_context invalid_context;
     rdma_dma_request_context owner_clone_context;
+    rdma_dma_request_context authority_clone_context;
     rdma_owner_clone_failure_handle owner_clone_failure_h;
+    rdma_owner_two_stage_clone_handle authority_clone_owner_h;
+    rdma_owner_two_stage_alias_handle authority_alias_owner_h;
     rdma_dma_mapping mapping;
     rdma_dma_mapping mapping_b;
     rdma_dma_mapping offset_mapping_a;
@@ -146,6 +221,8 @@ class rdma_host_mem_adapter_test extends uvm_test;
     rdma_dma_mapping equal_mapping_b;
     rdma_dma_mapping owner_clone_mapping;
     rdma_dma_mapping owner_clone_followup_mapping;
+    rdma_dma_mapping authority_clone_mapping;
+    rdma_dma_mapping authority_clone_followup_mapping;
     rdma_dma_mapping valid_clone;
     rdma_dma_mapping stale_clone;
     rdma_dma_mapping tampered;
@@ -313,6 +390,121 @@ class rdma_host_mem_adapter_test extends uvm_test;
     if (leak_count != 0)
       `uvm_error("OWNER_CLONE_FINAL_LEAKS",
                  "owner clone rollback test leaked host backing")
+
+    // A request owner can clone successfully into a value whose next clone
+    // fails.  Authority snapshot construction must report that failure
+    // nonfatally and roll back both backing and pending IOVA state.
+    authority_clone_hm =
+      rdma_owner_clone_counting_host_mem::type_id::create(
+        "authority_clone_hm"
+      );
+    authority_clone_hm.init_region(64'h0000_0006_0000_0000,
+                                   64'h0000_0006_00ff_ffff);
+    authority_clone_adapter = rdma_host_mem_adapter::type_id::create(
+      "authority_clone_adapter"
+    );
+    authority_clone_adapter.mem = authority_clone_hm;
+    authority_clone_adapter.iova_base = 64'h0000_0000_8000_0000;
+    authority_clone_context = make_dma_context(
+      "authority_clone_context", request_context.function_h,
+      request_context.requester_bdf, request_context.pasid_valid,
+      request_context.pasid
+    );
+    authority_clone_owner_h =
+      rdma_owner_two_stage_clone_handle::type_id::create(
+        "authority_clone_owner_h"
+      );
+    authority_clone_owner_h.kind = RDMA_RESOURCE_CMQ;
+    authority_clone_owner_h.function_uid =
+      authority_clone_context.function_h.function_uid;
+    authority_clone_owner_h.object_id = 32'h66;
+    authority_clone_owner_h.generation =
+      authority_clone_context.function_h.generation;
+    authority_clone_context.owner_h = authority_clone_owner_h;
+    status = authority_clone_context.validate();
+    expect_status("AUTHORITY_CLONE_CONTEXT_VALID", status, RDMA_SC_OK);
+    authority_clone_mapping = rdma_dma_mapping::type_id::create(
+      "authority_clone_non_null_seed"
+    );
+    status = authority_clone_adapter.allocate(
+      authority_clone_context, 64, 64, RDMA_DMA_BIDIRECTIONAL,
+      authority_clone_mapping
+    );
+    expect_status("AUTHORITY_CLONE_FAILURE", status,
+                  RDMA_SC_INVALID_STATE);
+    if (authority_clone_mapping != null)
+      `uvm_error("AUTHORITY_CLONE_FAILURE",
+                 "failed authority clone returned a mapping")
+    if (authority_clone_hm.free_call_count != 1)
+      `uvm_error("AUTHORITY_CLONE_FREE_COUNT",
+                 $sformatf("authority clone rollback freed %0d times",
+                           authority_clone_hm.free_call_count))
+    status = authority_clone_adapter.check_leaks(leak_count);
+    expect_status("AUTHORITY_CLONE_ROLLBACK", status, RDMA_SC_OK);
+    if (leak_count != 0)
+      `uvm_error("AUTHORITY_CLONE_ROLLBACK",
+                 "authority clone failure leaked host backing")
+
+    authority_alias_owner_h =
+      rdma_owner_two_stage_alias_handle::type_id::create(
+        "authority_alias_owner_h"
+      );
+    authority_alias_owner_h.kind = RDMA_RESOURCE_CMQ;
+    authority_alias_owner_h.function_uid =
+      authority_clone_context.function_h.function_uid;
+    authority_alias_owner_h.object_id = 32'h67;
+    authority_alias_owner_h.generation =
+      authority_clone_context.function_h.generation;
+    authority_clone_context.owner_h = authority_alias_owner_h;
+    status = authority_clone_context.validate();
+    expect_status("AUTHORITY_ALIAS_CONTEXT_VALID", status, RDMA_SC_OK);
+    authority_clone_mapping = rdma_dma_mapping::type_id::create(
+      "authority_alias_non_null_seed"
+    );
+    status = authority_clone_adapter.allocate(
+      authority_clone_context, 64, 64, RDMA_DMA_BIDIRECTIONAL,
+      authority_clone_mapping
+    );
+    expect_status("AUTHORITY_ALIAS_FAILURE", status,
+                  RDMA_SC_INVALID_STATE);
+    if (authority_clone_mapping != null)
+      `uvm_error("AUTHORITY_ALIAS_FAILURE",
+                 "aliased authority clone returned a mapping")
+    if (authority_clone_hm.free_call_count != 2)
+      `uvm_error("AUTHORITY_ALIAS_FREE_COUNT",
+                 $sformatf("authority alias rollback freed %0d times",
+                           authority_clone_hm.free_call_count))
+    status = authority_clone_adapter.check_leaks(leak_count);
+    expect_status("AUTHORITY_ALIAS_ROLLBACK", status, RDMA_SC_OK);
+    if (leak_count != 0)
+      `uvm_error("AUTHORITY_ALIAS_ROLLBACK",
+                 "authority alias failure leaked host backing")
+
+    authority_clone_context.owner_h = null;
+    authority_clone_adapter.iova_base = 64'h0000_0000_9000_0000;
+    status = authority_clone_adapter.allocate(
+      authority_clone_context, 64, 64, RDMA_DMA_BIDIRECTIONAL,
+      authority_clone_followup_mapping
+    );
+    expect_status("AUTHORITY_CLONE_CURSOR_ROLLBACK", status, RDMA_SC_OK);
+    if (authority_clone_followup_mapping == null ||
+        authority_clone_followup_mapping.iova.value !=
+          64'h0000_0000_9000_0000)
+      `uvm_error("AUTHORITY_CLONE_CURSOR_ROLLBACK",
+                 "failed authority clone committed IOVA state")
+    status = authority_clone_adapter.\release (
+      authority_clone_followup_mapping
+    );
+    expect_status("AUTHORITY_CLONE_FOLLOWUP_RELEASE", status, RDMA_SC_OK);
+    if (authority_clone_hm.free_call_count != 3)
+      `uvm_error("AUTHORITY_CLONE_FINAL_FREE_COUNT",
+                 $sformatf("expected 3 total frees, got %0d",
+                           authority_clone_hm.free_call_count))
+    status = authority_clone_adapter.check_leaks(leak_count);
+    expect_status("AUTHORITY_CLONE_FINAL_LEAKS", status, RDMA_SC_OK);
+    if (leak_count != 0)
+      `uvm_error("AUTHORITY_CLONE_FINAL_LEAKS",
+                 "authority clone rollback test leaked host backing")
 
     // The first real host allocation proves rejected requests did not reach
     // or advance the underlying allocator.

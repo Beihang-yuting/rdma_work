@@ -52,6 +52,73 @@ package rdma_host_mem_adapter_pkg;
              allocation_identity == rhs.allocation_identity;
     endfunction
 
+    function rdma_status make_authority_snapshot(
+      output rdma_host_mem_mapping snapshot
+    );
+      rdma_host_mem_mapping candidate;
+      rdma_function_handle function_copy;
+      rdma_handle owner_copy;
+      uvm_object cloned_object;
+
+      snapshot = null;
+      if (allocation_identity == null)
+        return rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "host memory allocation identity is not initialized"
+        );
+      if (function_h == null)
+        return rdma_status::make(RDMA_SC_INVALID_STATE,
+                                 "DMA mapping Function is null");
+      candidate = rdma_host_mem_mapping::type_id::create(
+        {get_name(), "_authority"}
+      );
+      if (candidate == null)
+        return rdma_status::make(
+          RDMA_SC_RESOURCE_EXHAUSTED,
+          "DMA mapping authority creation failed"
+        );
+
+      cloned_object = function_h.clone();
+      if (cloned_object == null || !$cast(function_copy, cloned_object) ||
+          function_copy == function_h)
+        return rdma_status::make(RDMA_SC_INVALID_STATE,
+                                 "DMA mapping Function clone failed");
+      if (!function_copy.same_instance(function_h))
+        return rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "DMA mapping Function clone changed identity"
+        );
+
+      owner_copy = null;
+      if (owner_h != null) begin
+        cloned_object = owner_h.clone();
+        if (cloned_object == null || !$cast(owner_copy, cloned_object) ||
+            owner_copy == owner_h)
+          return rdma_status::make(RDMA_SC_INVALID_STATE,
+                                   "DMA mapping owner clone failed");
+        if (!owner_copy.same_instance(owner_h))
+          return rdma_status::make(
+            RDMA_SC_INVALID_STATE,
+            "DMA mapping owner clone changed identity"
+          );
+      end
+
+      candidate.function_h = function_copy;
+      candidate.requester_bdf = requester_bdf;
+      candidate.pasid_valid = pasid_valid;
+      candidate.pasid = pasid;
+      candidate.backing_addr = backing_addr;
+      candidate.iova = iova;
+      candidate.size = size;
+      candidate.direction = direction;
+      candidate.permissions = permissions;
+      candidate.state = state;
+      candidate.owner_h = owner_copy;
+      candidate.allocation_identity = allocation_identity;
+      snapshot = candidate;
+      return rdma_status::success();
+    endfunction
+
     virtual function void do_copy(uvm_object rhs);
       rdma_host_mem_mapping rhs_mapping;
       rdma_host_mem_allocation_identity destination_identity;
@@ -328,7 +395,6 @@ package rdma_host_mem_adapter_pkg;
       rdma_host_mem_mapping authority;
       rdma_host_mem_allocation_record allocation;
       rdma_status status;
-      uvm_object cloned_object;
 
       mapping = null;
       if (request_context == null)
@@ -419,11 +485,19 @@ package rdma_host_mem_adapter_pkg;
                                  "DMA mapping owner clone failed");
       end
 
-      cloned_object = allocated_mapping.clone();
-      if (cloned_object == null || !$cast(authority, cloned_object)) begin
+      status = allocated_mapping.make_authority_snapshot(authority);
+      if (!status.ok()) begin
         mem.free(backing_address, `__FILE__, `__LINE__);
-        return rdma_status::make(RDMA_SC_INVALID_STATE,
-                                 "DMA mapping snapshot clone failed");
+        return status;
+      end
+      if (authority == null ||
+          !authority.same_allocation(allocated_mapping) ||
+          !mapping_values_match(allocated_mapping, authority)) begin
+        mem.free(backing_address, `__FILE__, `__LINE__);
+        return rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "DMA mapping authority snapshot is inconsistent"
+        );
       end
       allocation = rdma_host_mem_allocation_record::type_id::create(
         $sformatf("host_allocation_%0d", allocations.size())
