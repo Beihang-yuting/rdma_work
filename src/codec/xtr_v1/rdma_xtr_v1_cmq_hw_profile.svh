@@ -89,6 +89,45 @@ class rdma_xtr_v1_cmq_hw_profile extends rdma_cmq_hw_profile;
            lhs.generation == rhs.generation;
   endfunction
 
+  protected function bit generationless_opcode(bit [7:0] opcode);
+    return opcode inside {XTR_V1_OP_OCC_FLUSH, XTR_V1_OP_TQ_FLUSH};
+  endfunction
+
+  protected function rdma_status validate_composed_sqe(
+    rdma_hw_image image,
+    bit [7:0] opcode,
+    int unsigned function_generation
+  );
+    if (image == null)
+      return invalid_state("xtr_v1 CMQ request composer published null");
+    if (image.length != XTR_V1_CMQE_BYTES ||
+        image.bytes.size() != XTR_V1_CMQE_BYTES ||
+        image.alignment != XTR_V1_CMQE_BYTES ||
+        image.endian != RDMA_ENDIAN_BIG ||
+        image.image_kind != RDMA_IMAGE_CMQ_SQE ||
+        image.hardware_version != XTR_V1_HW_VERSION ||
+        image.write_target_kind != RDMA_HW_TARGET_NONE ||
+        image.backing_target.value != 0 || image.hmc_target.value != 0 ||
+        image.bar_target.value != 0)
+      return rdma_status::make(
+        RDMA_SC_CODEC_ERROR,
+        "xtr_v1 CMQ request composer published invalid metadata"
+      );
+    if (generationless_opcode(opcode)) begin
+      if (image.function_generation != 0)
+        return rdma_status::make(
+          RDMA_SC_CODEC_ERROR,
+          "xtr_v1 generationless CMQ body published a generation"
+        );
+    end
+    else if (image.function_generation != function_generation)
+      return rdma_status::make(
+        RDMA_SC_STALE_GENERATION,
+        "xtr_v1 CMQ body generation does not match Function"
+      );
+    return rdma_status::success();
+  endfunction
+
   virtual function rdma_status compose_sqe(
     rdma_cmq_command_desc command,
     rdma_cmq_slot_context slot,
@@ -152,11 +191,15 @@ class rdma_xtr_v1_cmq_hw_profile extends rdma_cmq_hw_profile;
       envelope, body, command.qpc_signature_source, composed
     );
     if (!status.ok()) return status;
-    if (composed == null)
-      return invalid_state("xtr_v1 CMQ request composer published null");
+    status = validate_composed_sqe(
+      composed, opcode, command.function_h.generation
+    );
+    if (!status.ok()) return status;
 
     detached = rdma_hw_image::type_id::create("detached_sqe");
     detached.copy(composed);
+    if (generationless_opcode(opcode))
+      detached.function_generation = command.function_h.generation;
     target_address = slot.backing_addr.value + slot.relative_offset;
     detached.write_target_kind = RDMA_HW_TARGET_BACKING;
     detached.backing_target.value = target_address;

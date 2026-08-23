@@ -502,6 +502,29 @@ class rdma_xtr_v1_occ_flush_body extends rdma_hw_model;
   endfunction
 endclass
 
+class rdma_xtr_v1_cmq_empty_body extends rdma_hw_model;
+  `uvm_object_utils(rdma_xtr_v1_cmq_empty_body)
+
+  function new(string name = "rdma_xtr_v1_cmq_empty_body");
+    super.new(name);
+  endfunction
+
+  virtual function void do_copy(uvm_object rhs);
+    rdma_xtr_v1_cmq_empty_body rhs_body;
+    super.do_copy(rhs);
+    if (!$cast(rhs_body, rhs))
+      `uvm_fatal("RDMA_COPY_TYPE", "empty CMQ body copy type mismatch")
+  endfunction
+
+  virtual function rdma_status validate();
+    return rdma_status::success();
+  endfunction
+
+  virtual function string describe();
+    return "xtr_v1 empty CMQ command body";
+  endfunction
+endclass
+
 class rdma_xtr_v1_cmq_body_token extends uvm_object;
   function new(string name = "rdma_xtr_v1_cmq_body_token");
     super.new(name);
@@ -1120,12 +1143,17 @@ class rdma_xtr_v1_cmq_empty_layout_codec
     bit [7:0] opcode,
     rdma_hw_model model
   );
+    rdma_xtr_v1_cmq_empty_body body;
     if (opcode != XTR_V1_OP_TQ_FLUSH)
       return rdma_status::make(RDMA_SC_UNSUPPORTED_OPCODE,
                                "empty CMQ body opcode does not match");
-    if (model != null)
-      return invalid_argument("TQ flush body must be null");
-    return rdma_status::success();
+    if (model == null)
+      return rdma_status::success();
+    if (!$cast(body, model))
+      return invalid_argument(
+        "TQ flush codec requires rdma_xtr_v1_cmq_empty_body"
+      );
+    return body.validate();
   endfunction
 
   protected virtual function int unsigned owner_generation(

@@ -430,20 +430,35 @@ class rdma_xtr_v1_cmq_profile_test extends uvm_test;
     command.opcode_key.profile_name = "xtr_v1";
 
     command.opcode_key.opcode = 32'h0100_000e;
+    sqe = rdma_hw_image::type_id::create("stale_high_opcode_sqe");
+    expected = rdma_cmq_expected_response::type_id::create(
+      "stale_high_opcode_expected");
     status = profile.compose_sqe(command, slot, sqe, expected);
     expect_status("COMPOSE_HIGH_OPCODE", status, RDMA_SC_INVALID_ARGUMENT);
+    if (sqe != null || expected != null)
+      `uvm_error("COMPOSE_HIGH_OPCODE", "failure published outputs")
     command.opcode_key.opcode = XTR_V1_OP_CQC_DELETE;
 
     command.vfid_override = 1'b0;
+    sqe = rdma_hw_image::type_id::create("stale_invalid_vfid_sqe");
+    expected = rdma_cmq_expected_response::type_id::create(
+      "stale_invalid_vfid_expected");
     status = profile.compose_sqe(command, slot, sqe, expected);
     expect_status("COMPOSE_INVALID_VFID", status, RDMA_SC_INVALID_ARGUMENT);
+    if (sqe != null || expected != null)
+      `uvm_error("COMPOSE_INVALID_VFID", "failure published outputs")
     command.vfid_override = 1'b1;
 
     command.opcode_key.opcode = XTR_V1_OP_TQ_FLUSH;
     command.opcode_key.variant = "flush";
+    sqe = rdma_hw_image::type_id::create("stale_incompatible_body_sqe");
+    expected = rdma_cmq_expected_response::type_id::create(
+      "stale_incompatible_body_expected");
     status = profile.compose_sqe(command, slot, sqe, expected);
     expect_status("COMPOSE_INCOMPATIBLE_BODY", status,
                   RDMA_SC_INVALID_ARGUMENT);
+    if (sqe != null || expected != null)
+      `uvm_error("COMPOSE_INCOMPATIBLE_BODY", "failure published outputs")
     command.opcode_key.opcode = XTR_V1_OP_CQC_DELETE;
     command.opcode_key.variant = "delete";
 
@@ -453,6 +468,253 @@ class rdma_xtr_v1_cmq_profile_test extends uvm_test;
                   RDMA_SC_DMA_TRANSLATION);
     if (sqe != null || expected != null)
       `uvm_error("COMPOSE_TARGET_OVERFLOW", "failure published outputs")
+  endfunction
+
+  function automatic void check_compose_generation_policy();
+    rdma_xtr_v1_cmq_hw_profile profile;
+    rdma_function_handle function_h;
+    rdma_handle cmq_h;
+    rdma_cmq_command_desc command;
+    rdma_cmq_command_desc command_snapshot;
+    rdma_cmq_opcode_key key;
+    rdma_cmq_slot_context slot;
+    rdma_cmq_slot_context slot_snapshot;
+    rdma_xtr_v1_object_id_command_body object_body;
+    rdma_xtr_v1_occ_flush_body occ_body;
+    rdma_xtr_v1_occ_flush_body occ_snapshot;
+    rdma_xtr_v1_cmq_empty_body empty_body;
+    rdma_xtr_v1_cmq_empty_body empty_snapshot;
+    rdma_hw_image sqe;
+    rdma_cmq_expected_response expected;
+    rdma_status status;
+    bit [63:0] qword0;
+
+    profile = rdma_xtr_v1_cmq_hw_profile::type_id::create(
+      "generation_profile");
+    function_h = make_function("generation_function");
+    cmq_h = make_handle("generation_cmq", RDMA_RESOURCE_CMQ, 32'h56);
+    slot = make_slot("generation_slot", function_h, cmq_h);
+
+    command = make_command("mismatched_generation_command", function_h);
+    if (!$cast(object_body, command.body)) begin
+      `uvm_error("COMPOSE_BODY_GENERATION_SETUP",
+                 "object-ID command body cast failed")
+      return;
+    end
+    object_body.object_h.generation = TEST_GENERATION + 1;
+    sqe = rdma_hw_image::type_id::create("stale_generation_sqe");
+    expected = rdma_cmq_expected_response::type_id::create(
+      "stale_generation_expected");
+    status = profile.compose_sqe(command, slot, sqe, expected);
+    expect_status("COMPOSE_BODY_GENERATION", status,
+                  RDMA_SC_STALE_GENERATION);
+    if (sqe != null || expected != null)
+      `uvm_error("COMPOSE_BODY_GENERATION",
+                 "generation mismatch published outputs")
+    if (object_body.object_h.generation != TEST_GENERATION + 1)
+      `uvm_error("COMPOSE_BODY_GENERATION",
+                 "generation mismatch mutated the command body")
+
+    occ_body = rdma_xtr_v1_occ_flush_body::type_id::create(
+      "generationless_occ_body");
+    occ_body.vf_flush = 1'b1;
+    occ_body.qpc = 1'b1;
+    occ_body.cqc = 1'b1;
+    occ_body.mrt = 1'b1;
+    occ_body.pble = 1'b1;
+    occ_body.sqrqe = 1'b1;
+    occ_body.sgb_irqe = 1'b1;
+    occ_body.eirqe = 1'b1;
+    occ_body.orqe = 1'b1;
+    occ_body.uaqe = 1'b1;
+    key = rdma_cmq_opcode_key::type_id::create("occ_flush_key");
+    key.profile_name = "xtr_v1";
+    key.opcode = XTR_V1_OP_OCC_FLUSH;
+    key.variant = "vf_flush";
+    command = rdma_cmq_command_desc::type_id::create("occ_flush_command");
+    command.function_h = function_h;
+    command.opcode_key = key;
+    command.body = occ_body;
+    command.qpc_signature_source = null;
+    command.vfid_override = 1'b1;
+    command.use_vfid = 11'h345;
+    command.timeout = 100;
+    command_snapshot = rdma_cmq_command_desc::type_id::create(
+      "occ_flush_command_snapshot");
+    command_snapshot.copy(command);
+    if (!$cast(occ_snapshot, command_snapshot.body)) begin
+      `uvm_error("COMPOSE_OCC_SETUP", "OCC snapshot body cast failed")
+      return;
+    end
+    slot_snapshot = rdma_cmq_slot_context::type_id::create(
+      "occ_flush_slot_snapshot");
+    slot_snapshot.copy(slot);
+
+    sqe = null;
+    expected = null;
+    status = profile.compose_sqe(command, slot, sqe, expected);
+    expect_status("COMPOSE_OCC_STATUS", status, RDMA_SC_OK);
+    if (sqe == null || expected == null) begin
+      `uvm_error("COMPOSE_OCC_OUTPUT", "OCC flush published null outputs")
+      return;
+    end
+    qword0 = get_qword(sqe, 0);
+    if (sqe.length != 64 || sqe.bytes.size() != 64 ||
+        sqe.alignment != 64 || sqe.endian != RDMA_ENDIAN_BIG ||
+        sqe.image_kind != RDMA_IMAGE_CMQ_SQE ||
+        sqe.hardware_version != XTR_V1_HW_VERSION ||
+        sqe.function_generation != TEST_GENERATION ||
+        sqe.write_target_kind != RDMA_HW_TARGET_BACKING ||
+        sqe.backing_target.value != 64'h0000_0000_4000_0140 ||
+        sqe.hmc_target.value != 0 || sqe.bar_target.value != 0)
+      `uvm_error("COMPOSE_OCC_METADATA",
+                 "generationless OCC SQE metadata is wrong")
+    if (qword0[63] != !slot.sq_wrap || qword0[61] != 1'b1 ||
+        qword0[59] != 1'b1 || qword0[58:48] != 11'h345 ||
+        qword0[45] != slot.sq_wrap ||
+        qword0[44:40] != slot.sq_index[4:0] ||
+        qword0[39:32] != XTR_V1_OP_OCC_FLUSH ||
+        get_qword(sqe, 1) != 64'hff80_0000_0000_0000)
+      `uvm_error("COMPOSE_OCC_FIELDS",
+                 "generationless OCC SQE fields are wrong")
+    for (int unsigned q = 2; q < 8; q++)
+      if (get_qword(sqe, q) != 0)
+        `uvm_error("COMPOSE_OCC_FIELDS",
+                   "generationless OCC SQE has unexpected payload")
+    if (expected.hardware_opcode != XTR_V1_OP_OCC_FLUSH ||
+        expected.variant != "vf_flush")
+      `uvm_error("COMPOSE_OCC_EXPECTED", "OCC expected response is wrong")
+    if (command.function_h != function_h || command.opcode_key != key ||
+        command.body != occ_body ||
+        command.function_h.function_uid !=
+          command_snapshot.function_h.function_uid ||
+        command.function_h.object_id !=
+          command_snapshot.function_h.object_id ||
+        command.function_h.generation !=
+          command_snapshot.function_h.generation ||
+        command.opcode_key.profile_name !=
+          command_snapshot.opcode_key.profile_name ||
+        command.opcode_key.opcode != command_snapshot.opcode_key.opcode ||
+        command.opcode_key.variant != command_snapshot.opcode_key.variant ||
+        command.qpc_signature_source !=
+          command_snapshot.qpc_signature_source ||
+        command.vfid_override != command_snapshot.vfid_override ||
+        command.use_vfid != command_snapshot.use_vfid ||
+        command.timeout != command_snapshot.timeout ||
+        occ_body.vf_flush != occ_snapshot.vf_flush ||
+        occ_body.mr_serial_flush != occ_snapshot.mr_serial_flush ||
+        occ_body.qpc != occ_snapshot.qpc ||
+        occ_body.cqc != occ_snapshot.cqc ||
+        occ_body.mrt != occ_snapshot.mrt ||
+        occ_body.pble != occ_snapshot.pble ||
+        occ_body.sqrqe != occ_snapshot.sqrqe ||
+        occ_body.sgb_irqe != occ_snapshot.sgb_irqe ||
+        occ_body.eirqe != occ_snapshot.eirqe ||
+        occ_body.orqe != occ_snapshot.orqe ||
+        occ_body.uaqe != occ_snapshot.uaqe ||
+        occ_body.pd != occ_snapshot.pd ||
+        occ_body.qpn != occ_snapshot.qpn ||
+        occ_body.mr_serial != occ_snapshot.mr_serial ||
+        occ_body.pd_backing.value != occ_snapshot.pd_backing.value)
+      `uvm_error("COMPOSE_OCC_COMMAND_IMMUTABLE",
+                 "OCC compose mutated the command")
+    if (slot.function_h != function_h || slot.cmq_h != cmq_h ||
+        slot.backing_addr.value != slot_snapshot.backing_addr.value ||
+        slot.relative_offset != slot_snapshot.relative_offset ||
+        slot.slot_sequence != slot_snapshot.slot_sequence ||
+        slot.sq_index != slot_snapshot.sq_index ||
+        slot.sq_wrap != slot_snapshot.sq_wrap)
+      `uvm_error("COMPOSE_OCC_SLOT_IMMUTABLE",
+                 "OCC compose mutated the slot")
+
+    empty_body = rdma_xtr_v1_cmq_empty_body::type_id::create(
+      "tq_flush_body");
+    status = empty_body.validate();
+    expect_status("COMPOSE_TQ_BODY_VALID", status, RDMA_SC_OK);
+    if (empty_body.describe() != "xtr_v1 empty CMQ command body")
+      `uvm_error("COMPOSE_TQ_BODY_DESCRIBE",
+                 "typed empty body description is not meaningful")
+    key = rdma_cmq_opcode_key::type_id::create("tq_flush_key");
+    key.profile_name = "xtr_v1";
+    key.opcode = XTR_V1_OP_TQ_FLUSH;
+    key.variant = "flush";
+    command = rdma_cmq_command_desc::type_id::create("tq_flush_command");
+    command.function_h = function_h;
+    command.opcode_key = key;
+    command.body = empty_body;
+    command.qpc_signature_source = null;
+    command.vfid_override = 1'b1;
+    command.use_vfid = 11'h345;
+    command.timeout = 100;
+    command_snapshot = rdma_cmq_command_desc::type_id::create(
+      "tq_flush_command_snapshot");
+    command_snapshot.copy(command);
+    if (!$cast(empty_snapshot, command_snapshot.body)) begin
+      `uvm_error("COMPOSE_TQ_SETUP", "empty snapshot body cast failed")
+      return;
+    end
+    slot_snapshot = rdma_cmq_slot_context::type_id::create(
+      "tq_flush_slot_snapshot");
+    slot_snapshot.copy(slot);
+
+    sqe = null;
+    expected = null;
+    status = profile.compose_sqe(command, slot, sqe, expected);
+    expect_status("COMPOSE_TQ_STATUS", status, RDMA_SC_OK);
+    if (sqe == null || expected == null) begin
+      `uvm_error("COMPOSE_TQ_OUTPUT", "TQ flush published null outputs")
+      return;
+    end
+    qword0 = get_qword(sqe, 0);
+    if (sqe.length != 64 || sqe.bytes.size() != 64 ||
+        sqe.alignment != 64 || sqe.endian != RDMA_ENDIAN_BIG ||
+        sqe.image_kind != RDMA_IMAGE_CMQ_SQE ||
+        sqe.hardware_version != XTR_V1_HW_VERSION ||
+        sqe.function_generation != TEST_GENERATION ||
+        sqe.write_target_kind != RDMA_HW_TARGET_BACKING ||
+        sqe.backing_target.value != 64'h0000_0000_4000_0140 ||
+        sqe.hmc_target.value != 0 || sqe.bar_target.value != 0)
+      `uvm_error("COMPOSE_TQ_METADATA", "TQ flush SQE metadata is wrong")
+    if (qword0[63] != !slot.sq_wrap || qword0[59] != 1'b1 ||
+        qword0[58:48] != 11'h345 || qword0[45] != slot.sq_wrap ||
+        qword0[44:40] != slot.sq_index[4:0] ||
+        qword0[39:32] != XTR_V1_OP_TQ_FLUSH)
+      `uvm_error("COMPOSE_TQ_FIELDS", "TQ flush envelope is wrong")
+    for (int unsigned q = 1; q < 8; q++)
+      if (get_qword(sqe, q) != 0)
+        `uvm_error("COMPOSE_TQ_FIELDS",
+                   "TQ flush has nonempty body payload")
+    if (expected.hardware_opcode != XTR_V1_OP_TQ_FLUSH ||
+        expected.variant != "flush")
+      `uvm_error("COMPOSE_TQ_EXPECTED", "TQ expected response is wrong")
+    if (command.function_h != function_h || command.opcode_key != key ||
+        command.body != empty_body ||
+        empty_snapshot == empty_body ||
+        command.function_h.function_uid !=
+          command_snapshot.function_h.function_uid ||
+        command.function_h.object_id !=
+          command_snapshot.function_h.object_id ||
+        command.function_h.generation !=
+          command_snapshot.function_h.generation ||
+        command.opcode_key.profile_name !=
+          command_snapshot.opcode_key.profile_name ||
+        command.opcode_key.opcode != command_snapshot.opcode_key.opcode ||
+        command.opcode_key.variant != command_snapshot.opcode_key.variant ||
+        command.qpc_signature_source !=
+          command_snapshot.qpc_signature_source ||
+        command.vfid_override != command_snapshot.vfid_override ||
+        command.use_vfid != command_snapshot.use_vfid ||
+        command.timeout != command_snapshot.timeout)
+      `uvm_error("COMPOSE_TQ_COMMAND_IMMUTABLE",
+                 "TQ compose mutated the command")
+    if (slot.function_h != function_h || slot.cmq_h != cmq_h ||
+        slot.backing_addr.value != slot_snapshot.backing_addr.value ||
+        slot.relative_offset != slot_snapshot.relative_offset ||
+        slot.slot_sequence != slot_snapshot.slot_sequence ||
+        slot.sq_index != slot_snapshot.sq_index ||
+        slot.sq_wrap != slot_snapshot.sq_wrap)
+      `uvm_error("COMPOSE_TQ_SLOT_IMMUTABLE",
+                 "TQ compose mutated the slot")
   endfunction
 
   function automatic void check_inspect_cqe();
@@ -583,17 +845,24 @@ class rdma_xtr_v1_cmq_profile_test extends uvm_test;
     if (image != null)
       `uvm_error("DOORBELL_NULL_HANDLE", "failure published image")
     cmq_h.kind = RDMA_RESOURCE_CQ;
+    image = rdma_hw_image::type_id::create("stale_wrong_handle_doorbell");
     status = profile.encode_doorbell(cmq_h, 17, 1'b1, image);
     expect_status("DOORBELL_WRONG_HANDLE", status, RDMA_SC_INVALID_ARGUMENT);
+    if (image != null)
+      `uvm_error("DOORBELL_WRONG_HANDLE", "failure published image")
     cmq_h.kind = RDMA_RESOURCE_CMQ;
+    image = rdma_hw_image::type_id::create("stale_pi_range_doorbell");
     status = profile.encode_doorbell(cmq_h, 32, 1'b1, image);
     expect_status("DOORBELL_PI_RANGE", status, RDMA_SC_INVALID_ARGUMENT);
+    if (image != null)
+      `uvm_error("DOORBELL_PI_RANGE", "failure published image")
   endfunction
 
   virtual task run_phase(uvm_phase phase);
     phase.raise_objection(this);
     check_profile_validation();
     check_compose_sqe();
+    check_compose_generation_policy();
     check_inspect_cqe();
     check_encode_doorbell();
     phase.drop_objection(this);
