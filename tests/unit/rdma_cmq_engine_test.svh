@@ -110,6 +110,7 @@ typedef enum int unsigned {
 class rdma_cmq_clone_fault_function_handle extends rdma_function_handle;
   `uvm_object_utils(rdma_cmq_clone_fault_function_handle)
 
+  local static int unsigned fault_clone_calls;
   rdma_cmq_test_clone_fault_e clone_fault;
   rdma_function_handle alias_target;
   bit alias_once;
@@ -121,7 +122,17 @@ class rdma_cmq_clone_fault_function_handle extends rdma_function_handle;
     alias_once = 1'b0;
   endfunction
 
+  static function void clear_fault_clone_calls();
+    fault_clone_calls = 0;
+  endfunction
+
+  static function int unsigned fault_clone_call_count();
+    return fault_clone_calls;
+  endfunction
+
   virtual function uvm_object clone();
+    if (clone_fault != RDMA_CMQ_TEST_CLONE_GOOD)
+      fault_clone_calls++;
     case (clone_fault)
       RDMA_CMQ_TEST_CLONE_NULL: return null;
       RDMA_CMQ_TEST_CLONE_SELF: return this;
@@ -2249,10 +2260,54 @@ class rdma_cmq_engine_probe extends rdma_cmq_engine;
     return terminal_fifo.size();
   endfunction
 
+  function int unsigned diagnostic_fifo_count();
+    return diagnostic_fifo.size();
+  endfunction
+
   function rdma_cmq_slot_state_e slot_state_at(int unsigned sq_index);
     if (sq_index >= 32 || slots[sq_index] == null)
       return CMQ_SLOT_FREE;
     return slots[sq_index].state;
+  endfunction
+
+  function bit install_slot_ticket_function_clone_fault(
+    int unsigned sq_index,
+    rdma_cmq_test_clone_fault_e clone_fault
+  );
+    rdma_function_handle source;
+    rdma_cmq_clone_fault_function_handle fault_function;
+
+    if (sq_index >= 32 || slots[sq_index] == null ||
+        slots[sq_index].ticket == null ||
+        slots[sq_index].ticket.function_h == null)
+      return 1'b0;
+    source = slots[sq_index].ticket.function_h;
+    fault_function = rdma_cmq_clone_fault_function_handle::type_id::create(
+      $sformatf("timeout_fault_function_%0d", sq_index)
+    );
+    if (fault_function == null)
+      return 1'b0;
+    fault_function.kind = source.kind;
+    fault_function.function_uid = source.function_uid;
+    fault_function.object_id = source.object_id;
+    fault_function.generation = source.generation;
+    fault_function.clone_fault = clone_fault;
+    slots[sq_index].ticket.function_h = fault_function;
+    return 1'b1;
+  endfunction
+
+  function bit set_slot_ticket_function_clone_fault(
+    int unsigned sq_index,
+    rdma_cmq_test_clone_fault_e clone_fault
+  );
+    rdma_cmq_clone_fault_function_handle fault_function;
+
+    if (sq_index >= 32 || slots[sq_index] == null ||
+        slots[sq_index].ticket == null ||
+        !$cast(fault_function, slots[sq_index].ticket.function_h))
+      return 1'b0;
+    fault_function.clone_fault = clone_fault;
+    return 1'b1;
   endfunction
 
   function bit token_in_use_at(int unsigned token_index);
@@ -8064,6 +8119,293 @@ class rdma_cmq_engine_test extends uvm_test;
     expect_status("TIMEOUT_SHUTDOWN", status, RDMA_SC_OK);
   endtask
 
+  task automatic check_expire_snapshot_failure_is_atomic_and_retryable();
+    rdma_cmq_engine_probe engine;
+    rdma_mock_host_mem mem;
+    rdma_cmq_test_pcie pcie;
+    rdma_mock_call_trace trace;
+    rdma_doorbell_scheduler scheduler;
+    rdma_cmq_test_profile profile;
+    rdma_function_binding prepared_binding;
+    rdma_function_binding active_binding;
+    rdma_cmq cmq;
+    rdma_cmq_runtime_desc runtime_desc;
+    rdma_cmq_command_desc requests[];
+    rdma_cmq_ticket tickets[];
+    rdma_status item_statuses[];
+    rdma_status batch_status;
+    rdma_cmq_completion completions[$];
+    rdma_status status;
+
+    engine = rdma_cmq_engine_probe::type_id::create(
+      "expire_snapshot_failure_engine"
+    );
+    mem = rdma_mock_host_mem::type_id::create(
+      "expire_snapshot_failure_mem"
+    );
+    pcie = rdma_cmq_test_pcie::type_id::create(
+      "expire_snapshot_failure_pcie"
+    );
+    trace = rdma_mock_call_trace::type_id::create(
+      "expire_snapshot_failure_trace"
+    );
+    mem.set_call_trace(trace);
+    pcie.set_call_trace(trace);
+    scheduler = rdma_doorbell_scheduler::type_id::create(
+      "expire_snapshot_failure_scheduler"
+    );
+    profile = rdma_cmq_test_profile::type_id::create(
+      "expire_snapshot_failure_profile"
+    );
+    prepared_binding = make_binding(
+      "expire_snapshot_failure_prepared", RDMA_BIND_PREPARED
+    );
+    active_binding = make_binding(
+      "expire_snapshot_failure_active", RDMA_BIND_ACTIVE
+    );
+    cmq = make_cmq("expire_snapshot_failure_cmq", prepared_binding);
+    prepare_active(
+      "EXPIRE_SNAPSHOT_FAILURE", engine, mem, pcie, scheduler, profile,
+      prepared_binding, active_binding, cmq, runtime_desc
+    );
+    clear_submit_observation(mem, pcie, trace);
+
+    requests = new[2];
+    requests[0] = make_command(
+      "expire_snapshot_failure_request_0", active_binding,
+      rdma_cmq_test_profile::TEST_OPCODE_A, 8'hd8, 10ns
+    );
+    requests[1] = make_command(
+      "expire_snapshot_failure_request_1", active_binding,
+      rdma_cmq_test_profile::TEST_OPCODE_B, 8'hd9, 10ns
+    );
+    engine.submit_batch(requests, tickets, item_statuses, batch_status);
+    expect_status("EXPIRE_SNAPSHOT_FAILURE_SUBMIT", batch_status, RDMA_SC_OK);
+    if (tickets.size() != 2 || item_statuses.size() != 2 ||
+        tickets[0] == null || tickets[1] == null) begin
+      `uvm_error("EXPIRE_SNAPSHOT_FAILURE_SUBMIT",
+                 "two-command timeout fixture is incomplete")
+      engine.shutdown(status);
+      return;
+    end
+    expect_status("EXPIRE_SNAPSHOT_FAILURE_ITEM_0", item_statuses[0],
+                  RDMA_SC_OK);
+    expect_status("EXPIRE_SNAPSHOT_FAILURE_ITEM_1", item_statuses[1],
+                  RDMA_SC_OK);
+
+    if (!engine.install_slot_ticket_function_clone_fault(
+          tickets[1].sq_index, RDMA_CMQ_TEST_CLONE_NULL
+        ))
+      `uvm_error("EXPIRE_SNAPSHOT_FAILURE_INJECT",
+                 "could not inject the second ticket snapshot fault")
+    rdma_cmq_clone_fault_function_handle::clear_fault_clone_calls();
+    #20ns;
+    engine.expire(completions, status);
+    expect_status("EXPIRE_SNAPSHOT_FAILURE_STATUS", status,
+                  RDMA_SC_INVALID_STATE);
+    if (rdma_cmq_clone_fault_function_handle::fault_clone_call_count() != 1)
+      `uvm_error("EXPIRE_SNAPSHOT_FAILURE_HIT",
+                 "the second timeout ticket fault was not exercised once")
+    if (completions.size() != 0 || engine.terminal_fifo_count() != 0 ||
+        engine.diagnostic_fifo_count() != 0 ||
+        engine.published_count() != 2 || engine.retired_count() != 0 ||
+        engine.cq_consumed_count() != 0 ||
+        engine.tokens_in_use_count() != 2 ||
+        engine.slot_record_count() != 2 ||
+        engine.command_registry_count() != 2 ||
+        engine.entry_registry_count() != 2 ||
+        engine.slot_state_at(tickets[0].sq_index) != CMQ_SLOT_PUBLISHED ||
+        engine.slot_state_at(tickets[1].sq_index) != CMQ_SLOT_PUBLISHED)
+      `uvm_error("EXPIRE_SNAPSHOT_FAILURE_ATOMIC",
+                 "later timeout snapshot failure partially mutated authority")
+
+    if (!engine.set_slot_ticket_function_clone_fault(
+          tickets[1].sq_index, RDMA_CMQ_TEST_CLONE_GOOD
+        ))
+      `uvm_error("EXPIRE_SNAPSHOT_FAILURE_CLEAR",
+                 "could not clear the second ticket snapshot fault")
+    engine.expire(completions, status);
+    expect_status("EXPIRE_SNAPSHOT_FAILURE_RETRY_STATUS", status, RDMA_SC_OK);
+    if (completions.size() != 2)
+      `uvm_error("EXPIRE_SNAPSHOT_FAILURE_RETRY_OUTPUT",
+                 "retry did not deliver exactly two timeout completions")
+    else begin
+      expect_timeout_completion("EXPIRE_SNAPSHOT_FAILURE_RETRY_0",
+                                completions[0], tickets[0]);
+      expect_timeout_completion("EXPIRE_SNAPSHOT_FAILURE_RETRY_1",
+                                completions[1], tickets[1]);
+    end
+    if (engine.terminal_fifo_count() != 0 ||
+        engine.diagnostic_fifo_count() != 0 ||
+        engine.published_count() != 2 || engine.retired_count() != 0 ||
+        engine.cq_consumed_count() != 0 ||
+        engine.tokens_in_use_count() != 0 ||
+        engine.slot_record_count() != 2 ||
+        engine.command_registry_count() != 0 ||
+        engine.entry_registry_count() != 2 ||
+        engine.slot_state_at(tickets[0].sq_index) !=
+          CMQ_SLOT_TIMED_OUT_QUARANTINED ||
+        engine.slot_state_at(tickets[1].sq_index) !=
+          CMQ_SLOT_TIMED_OUT_QUARANTINED)
+      `uvm_error("EXPIRE_SNAPSHOT_FAILURE_RETRY_LEDGER",
+                 "successful retry did not quarantine both commands")
+
+    engine.expire(completions, status);
+    expect_status("EXPIRE_SNAPSHOT_FAILURE_ONCE_STATUS", status, RDMA_SC_OK);
+    if (completions.size() != 0)
+      `uvm_error("EXPIRE_SNAPSHOT_FAILURE_ONCE",
+                 "retry timeout completions were delivered more than once")
+    engine.shutdown(status);
+    expect_status("EXPIRE_SNAPSHOT_FAILURE_SHUTDOWN", status, RDMA_SC_OK);
+  endtask
+
+  task automatic check_late_diagnostic_snapshot_failure_is_retryable();
+    rdma_cmq_engine_probe engine;
+    rdma_mock_host_mem mem;
+    rdma_cmq_test_pcie pcie;
+    rdma_mock_call_trace trace;
+    rdma_doorbell_scheduler scheduler;
+    rdma_cmq_test_profile profile;
+    rdma_function_binding prepared_binding;
+    rdma_function_binding active_binding;
+    rdma_cmq cmq;
+    rdma_cmq_runtime_desc runtime_desc;
+    rdma_cmq_command_desc request;
+    rdma_cmq_ticket ticket;
+    rdma_dma_mapping mapping;
+    rdma_cmq_completion completions[$];
+    rdma_cmq_diagnostic diagnostics[$];
+    rdma_hw_image raw_cqe;
+    rdma_status status;
+
+    engine = rdma_cmq_engine_probe::type_id::create(
+      "late_snapshot_failure_engine"
+    );
+    mem = rdma_mock_host_mem::type_id::create("late_snapshot_failure_mem");
+    pcie = rdma_cmq_test_pcie::type_id::create(
+      "late_snapshot_failure_pcie"
+    );
+    trace = rdma_mock_call_trace::type_id::create(
+      "late_snapshot_failure_trace"
+    );
+    mem.set_call_trace(trace);
+    pcie.set_call_trace(trace);
+    scheduler = rdma_doorbell_scheduler::type_id::create(
+      "late_snapshot_failure_scheduler"
+    );
+    profile = rdma_cmq_test_profile::type_id::create(
+      "late_snapshot_failure_profile"
+    );
+    prepared_binding = make_binding("late_snapshot_failure_prepared",
+                                    RDMA_BIND_PREPARED);
+    active_binding = make_binding("late_snapshot_failure_active",
+                                  RDMA_BIND_ACTIVE);
+    cmq = make_cmq("late_snapshot_failure_cmq", prepared_binding);
+    prepare_active(
+      "LATE_SNAPSHOT_FAILURE", engine, mem, pcie, scheduler, profile,
+      prepared_binding, active_binding, cmq, runtime_desc
+    );
+    clear_submit_observation(mem, pcie, trace);
+
+    request = make_command(
+      "late_snapshot_failure_request", active_binding,
+      rdma_cmq_test_profile::TEST_OPCODE_A, 8'hda, 10ns
+    );
+    engine.submit(request, ticket, status);
+    expect_status("LATE_SNAPSHOT_FAILURE_SUBMIT", status, RDMA_SC_OK);
+    if (ticket == null) begin
+      `uvm_error("LATE_SNAPSHOT_FAILURE_SUBMIT",
+                 "late diagnostic fixture returned no ticket")
+      engine.shutdown(status);
+      return;
+    end
+    mapping = engine.mapping_snapshot();
+    #20ns;
+    engine.expire(completions, status);
+    expect_status("LATE_SNAPSHOT_FAILURE_EXPIRE", status, RDMA_SC_OK);
+    if (completions.size() != 1)
+      `uvm_error("LATE_SNAPSHOT_FAILURE_EXPIRE",
+                 "fixture did not produce one timeout completion")
+    else
+      expect_timeout_completion("LATE_SNAPSHOT_FAILURE_TIMEOUT",
+                                completions[0], ticket);
+    if (engine.slot_state_at(ticket.sq_index) !=
+          CMQ_SLOT_TIMED_OUT_QUARANTINED ||
+        engine.command_registry_count() != 0 ||
+        engine.tokens_in_use_count() != 0 ||
+        engine.entry_registry_count() != 1)
+      `uvm_error("LATE_SNAPSHOT_FAILURE_QUARANTINE",
+                 "fixture did not retain quarantined late-CQE authority")
+
+    write_profile_cqe(
+      "LATE_SNAPSHOT_FAILURE_CQE", mem, mapping, profile, 0, 1'b1,
+      ticket, 0, raw_cqe
+    );
+    if (!engine.install_slot_ticket_function_clone_fault(
+          ticket.sq_index, RDMA_CMQ_TEST_CLONE_NULL
+        ))
+      `uvm_error("LATE_SNAPSHOT_FAILURE_INJECT",
+                 "could not inject the late diagnostic ticket fault")
+    rdma_cmq_clone_fault_function_handle::clear_fault_clone_calls();
+    mem.calls.delete();
+    engine.poll(completions, diagnostics, status);
+    expect_status("LATE_SNAPSHOT_FAILURE_STATUS", status,
+                  RDMA_SC_INVALID_STATE);
+    if (rdma_cmq_clone_fault_function_handle::fault_clone_call_count() != 1)
+      `uvm_error("LATE_SNAPSHOT_FAILURE_HIT",
+                 "the late diagnostic ticket fault was not exercised once")
+    if (completions.size() != 0 || diagnostics.size() != 0 ||
+        engine.terminal_fifo_count() != 0 ||
+        engine.diagnostic_fifo_count() != 0 ||
+        engine.published_count() != 1 || engine.retired_count() != 0 ||
+        engine.cq_consumed_count() != 0 ||
+        engine.tokens_in_use_count() != 0 ||
+        engine.slot_record_count() != 1 ||
+        engine.command_registry_count() != 0 ||
+        engine.entry_registry_count() != 1 ||
+        engine.slot_state_at(ticket.sq_index) !=
+          CMQ_SLOT_TIMED_OUT_QUARANTINED ||
+        count_host_calls(mem, "read") != 1)
+      `uvm_error("LATE_SNAPSHOT_FAILURE_ATOMIC",
+                 "diagnostic snapshot failure consumed the late CQE")
+
+    if (!engine.set_slot_ticket_function_clone_fault(
+          ticket.sq_index, RDMA_CMQ_TEST_CLONE_GOOD
+        ))
+      `uvm_error("LATE_SNAPSHOT_FAILURE_CLEAR",
+                 "could not clear the late diagnostic ticket fault")
+    mem.calls.delete();
+    engine.poll(completions, diagnostics, status);
+    expect_status("LATE_SNAPSHOT_FAILURE_RETRY_STATUS", status, RDMA_SC_OK);
+    if (completions.size() != 0 || diagnostics.size() != 1)
+      `uvm_error("LATE_SNAPSHOT_FAILURE_RETRY_OUTPUT",
+                 "retry did not deliver one late diagnostic")
+    else
+      expect_late_diagnostic("LATE_SNAPSHOT_FAILURE_RETRY_DIAG", engine,
+                             diagnostics[0], ticket, raw_cqe);
+    if (engine.terminal_fifo_count() != 0 ||
+        engine.diagnostic_fifo_count() != 0 ||
+        engine.published_count() != 1 || engine.retired_count() != 1 ||
+        engine.cq_consumed_count() != 1 ||
+        engine.tokens_in_use_count() != 0 ||
+        engine.slot_record_count() != 0 ||
+        engine.command_registry_count() != 0 ||
+        engine.entry_registry_count() != 0 ||
+        count_host_calls(mem, "read") != 1)
+      `uvm_error("LATE_SNAPSHOT_FAILURE_RETRY_LEDGER",
+                 "late diagnostic retry did not consume and retire once")
+
+    mem.calls.delete();
+    engine.poll(completions, diagnostics, status);
+    expect_status("LATE_SNAPSHOT_FAILURE_ONCE_STATUS", status, RDMA_SC_OK);
+    if (completions.size() != 0 || diagnostics.size() != 0 ||
+        count_host_calls(mem, "read") != 0)
+      `uvm_error("LATE_SNAPSHOT_FAILURE_ONCE",
+                 "late diagnostic was delivered more than once")
+    engine.shutdown(status);
+    expect_status("LATE_SNAPSHOT_FAILURE_SHUTDOWN", status, RDMA_SC_OK);
+  endtask
+
   task automatic check_command_incarnation_exhaustion();
     rdma_cmq_engine_probe engine;
     rdma_mock_host_mem mem;
@@ -9609,6 +9951,8 @@ class rdma_cmq_engine_test extends uvm_test;
     check_exact_type_profile_delegation();
     check_internal_invariant_batch_abort();
     check_timeout_quarantine_and_late_diagnostic();
+    check_expire_snapshot_failure_is_atomic_and_retryable();
+    check_late_diagnostic_snapshot_failure_is_retryable();
     check_command_incarnation_exhaustion();
     check_incarnation_survives_reprepare();
     check_max_dependency_id_boundary();
