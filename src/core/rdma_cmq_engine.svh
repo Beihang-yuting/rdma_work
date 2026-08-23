@@ -187,7 +187,7 @@ class rdma_cmq_engine extends uvm_object;
     if (!status.ok())
       return status;
     if (cq_consume_seq < retire_seq || cq_consume_seq > publish_seq)
-      return invalid_state("CMQ completion counters are inconsistent");
+      return poison_status("CMQ completion counters are inconsistent");
     slot_count = 0;
     token_count = 0;
     foreach (slots[i]) begin
@@ -199,7 +199,7 @@ class rdma_cmq_engine extends uvm_object;
     if (slot_count != used || entry_registry.num() != used ||
         token_count != command_registry.num() ||
         command_registry.num() > used)
-      return invalid_state("CMQ polling ledger is inconsistent");
+      return poison_status("CMQ polling ledger is inconsistent");
     return rdma_status::success();
   endfunction
 
@@ -660,34 +660,57 @@ class rdma_cmq_engine extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  protected function rdma_status retire_completed_prefix();
-    rdma_status status;
-    longint unsigned used;
-
-    status = ring_used(used);
-    if (!status.ok())
-      return status;
-    while (retire_seq < publish_seq) begin
+  protected function rdma_status prospective_retirement_status(
+    rdma_cmq_slot_record prospective_record,
+    output longint unsigned prospective_retire_seq
+  );
+    prospective_retire_seq = retire_seq;
+    if (prospective_record == null)
+      return invalid_state("CMQ prospective retirement record is null");
+    if (prospective_record.slot_sequence < retire_seq ||
+        prospective_record.slot_sequence >= publish_seq ||
+        prospective_record.sq_index !=
+          (prospective_record.slot_sequence % CMQ_DEPTH) ||
+        prospective_record.sq_wrap !=
+          ((prospective_record.slot_sequence / CMQ_DEPTH) & 1'b1))
+      return invalid_state(
+        "CMQ prospective retirement record incarnation is inconsistent"
+      );
+    while (prospective_retire_seq < publish_seq) begin
       int unsigned index;
+      rdma_cmq_slot_record record;
 
-      index = retire_seq % CMQ_DEPTH;
-      if (slots[index] == null ||
-          slots[index].slot_sequence != retire_seq ||
-          slots[index].sq_index != index ||
-          slots[index].sq_wrap !=
-            ((retire_seq / CMQ_DEPTH) & 1'b1))
-        return poison_status("CMQ retirement slot ledger is inconsistent");
-      if (!(slots[index].state inside {
+      index = prospective_retire_seq % CMQ_DEPTH;
+      record = slots[index];
+      if (record == null ||
+          record.slot_sequence != prospective_retire_seq ||
+          record.sq_index != index ||
+          record.sq_wrap !=
+            ((prospective_retire_seq / CMQ_DEPTH) & 1'b1))
+        return invalid_state("CMQ retirement slot ledger is inconsistent");
+      if (record != prospective_record &&
+          !(record.state inside {
             CMQ_SLOT_COMPLETED,
             CMQ_SLOT_LATE_COMPLETED,
             CMQ_SLOT_RESET_CANCELLED
           }))
         break;
+      prospective_retire_seq++;
+    end
+    return rdma_status::success();
+  endfunction
+
+  protected function void commit_retired_prefix(
+    longint unsigned prospective_retire_seq
+  );
+    while (retire_seq < prospective_retire_seq) begin
+      int unsigned index;
+
+      index = retire_seq % CMQ_DEPTH;
       entry_registry.delete(entry_key(index, slots[index].sq_wrap));
       slots[index] = null;
       retire_seq++;
     end
-    return rdma_status::success();
   endfunction
 
   protected function bit same_handle(rdma_handle lhs, rdma_handle rhs);
@@ -3523,7 +3546,11 @@ class rdma_cmq_engine extends uvm_object;
     rdma_dma_mapping retained_mapping,
     rdma_host_mem_api retained_host_mem
   );
+    rdma_cmq_diagnostic retained_last_poison;
+
+    retained_last_poison = last_poison;
     clear_configuration();
+    last_poison = retained_last_poison;
     if (retained_mapping != null) begin
       backing_mapping = retained_mapping;
       host_mem = retained_host_mem;
@@ -4565,6 +4592,7 @@ class rdma_cmq_engine extends uvm_object;
     string hardware_key;
     string software_key;
     longint unsigned ledger_used;
+    longint unsigned prospective_retire_seq;
 
     completions.delete();
     diagnostics.delete();
@@ -4764,6 +4792,32 @@ class rdma_cmq_engine extends uvm_object;
           );
           break;
         end
+      end
+      else begin
+        if (command_registry.exists(software_key)) begin
+          status = poison(
+            RDMA_CMQ_DIAG_POISON,
+            "CMQ quarantined command remains in the command registry",
+            raw_snapshot, record.ticket
+          );
+          break;
+        end
+      end
+      retirement_status = prospective_retirement_status(
+        record, prospective_retire_seq
+      );
+      if (retirement_status == null || !retirement_status.ok()) begin
+        status = poison(
+          RDMA_CMQ_DIAG_POISON,
+          (retirement_status == null) ?
+            "CMQ prospective retirement returned null status" :
+            retirement_status.message,
+          raw_snapshot
+        );
+        break;
+      end
+
+      if (record.state == CMQ_SLOT_PUBLISHED) begin
         completion_status = make_polled_completion(
           record, raw_snapshot, decoded, completion
         );
@@ -4780,14 +4834,6 @@ class rdma_cmq_engine extends uvm_object;
         record.state = CMQ_SLOT_COMPLETED;
       end
       else begin
-        if (command_registry.exists(software_key)) begin
-          status = poison(
-            RDMA_CMQ_DIAG_POISON,
-            "CMQ quarantined command remains in the command registry",
-            raw_snapshot, record.ticket
-          );
-          break;
-        end
         diagnostic_status = make_late_diagnostic(
           record, raw_snapshot, diagnostic
         );
@@ -4802,13 +4848,7 @@ class rdma_cmq_engine extends uvm_object;
         record.state = CMQ_SLOT_LATE_COMPLETED;
       end
       cq_consume_seq++;
-      retirement_status = retire_completed_prefix();
-      if (retirement_status == null || !retirement_status.ok()) begin
-        status = (retirement_status == null) ?
-          invalid_state("CMQ retirement returned null status") :
-          retirement_status;
-        break;
-      end
+      commit_retired_prefix(prospective_retire_seq);
       if (publish_seq == retire_seq)
         break;
     end
