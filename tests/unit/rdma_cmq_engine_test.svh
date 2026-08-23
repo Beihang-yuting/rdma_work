@@ -81,6 +81,10 @@ class rdma_cmq_clone_fault_function_handle extends rdma_function_handle;
     case (clone_fault)
       RDMA_CMQ_TEST_CLONE_NULL: return null;
       RDMA_CMQ_TEST_CLONE_SELF: return this;
+      RDMA_CMQ_TEST_CLONE_MUTATE: begin
+        object_id++;
+        return super.clone();
+      end
       RDMA_CMQ_TEST_CLONE_WRONG_TYPE:
         return rdma_status::success("wrong Function clone type");
       RDMA_CMQ_TEST_CLONE_ALIAS: begin
@@ -359,6 +363,10 @@ class rdma_cmq_clone_fault_opcode_key extends rdma_cmq_opcode_key;
     case (clone_fault)
       RDMA_CMQ_TEST_CLONE_NULL: return null;
       RDMA_CMQ_TEST_CLONE_SELF: return this;
+      RDMA_CMQ_TEST_CLONE_MUTATE: begin
+        variant = {variant, "_mutated"};
+        return super.clone();
+      end
       RDMA_CMQ_TEST_CLONE_WRONG_TYPE:
         return rdma_status::success("wrong opcode clone type");
       default: return super.clone();
@@ -380,6 +388,10 @@ class rdma_cmq_clone_fault_body extends rdma_cmq_sqe_model;
     case (clone_fault)
       RDMA_CMQ_TEST_CLONE_NULL: return null;
       RDMA_CMQ_TEST_CLONE_SELF: return this;
+      RDMA_CMQ_TEST_CLONE_MUTATE: begin
+        flags++;
+        return super.clone();
+      end
       RDMA_CMQ_TEST_CLONE_WRONG_TYPE:
         return rdma_status::success("wrong body clone type");
       default: return super.clone();
@@ -1200,6 +1212,25 @@ class rdma_cmq_engine_probe extends rdma_cmq_engine;
         slots[sq_index].expected == null)
       return "";
     return slots[sq_index].expected.variant;
+  endfunction
+
+  function bit probe_same_handle(rdma_handle lhs, rdma_handle rhs);
+    return same_handle(lhs, rhs);
+  endfunction
+
+  function bit probe_same_opcode(
+    rdma_cmq_opcode_key lhs,
+    rdma_cmq_opcode_key rhs
+  );
+    return same_opcode_value(lhs, rhs);
+  endfunction
+
+  function bit probe_same_image(rdma_hw_image lhs, rdma_hw_image rhs);
+    return same_image_value(lhs, rhs);
+  endfunction
+
+  function string probe_body_value_key(rdma_hw_model body);
+    return body_value_key(body);
   endfunction
 
   function longint unsigned slot_ticket_command_id(int unsigned sq_index);
@@ -3769,6 +3800,300 @@ class rdma_cmq_engine_test extends uvm_test;
     expect_status("NESTED_CLONE_SHUTDOWN", status, RDMA_SC_OK);
   endtask
 
+  task automatic check_mutating_clone_source_restoration();
+    rdma_cmq_engine_probe engine;
+    rdma_mock_host_mem mem;
+    rdma_mock_pcie pcie;
+    rdma_mock_call_trace trace;
+    rdma_doorbell_scheduler scheduler;
+    rdma_cmq_test_profile profile;
+    rdma_function_binding prepared_binding;
+    rdma_function_binding active_binding;
+    rdma_cmq cmq;
+    rdma_cmq_runtime_desc runtime_desc;
+    rdma_cmq_command_desc requests[];
+    rdma_function_handle saved_function_refs[];
+    rdma_cmq_opcode_key saved_opcode_refs[];
+    rdma_hw_model saved_body_refs[];
+    rdma_hw_image saved_signature_refs[];
+    rdma_function_handle saved_function_values[];
+    rdma_cmq_opcode_key saved_opcode_values[];
+    rdma_hw_image saved_signature_values[];
+    rdma_function_handle saved_body_function_refs[];
+    rdma_handle saved_body_target_refs[];
+    rdma_hw_model saved_body_context_refs[];
+    string saved_body_values[];
+    bit saved_vfid_override[];
+    bit [10:0] saved_use_vfid[];
+    time saved_timeout[];
+    rdma_cmq_sqe_model source_body;
+    rdma_cmq_clone_fault_function_handle fault_function;
+    rdma_cmq_clone_fault_opcode_key fault_opcode;
+    rdma_cmq_clone_fault_image fault_image;
+    rdma_cmq_clone_fault_body fault_body;
+    rdma_cmq_clone_fault_qpc fault_qpc;
+    rdma_cmq_clone_fault_handle fault_handle;
+    rdma_cmq_clone_fault_ring fault_ring;
+    rdma_qpc_model qpc;
+    rdma_qpc_model outer_qpc;
+    rdma_qpc_model nested_qpc;
+    rdma_cqc_model nested_cqc;
+    rdma_handle saved_outer_qp_h;
+    rdma_handle saved_outer_pd_h;
+    rdma_handle saved_outer_send_cq_h;
+    rdma_handle saved_outer_recv_cq_h;
+    rdma_handle saved_outer_srq_h;
+    rdma_handle saved_nested_qp_h;
+    rdma_handle saved_nested_pd_h;
+    rdma_handle saved_nested_send_cq_h;
+    rdma_handle saved_nested_recv_cq_h;
+    rdma_handle saved_nested_srq_h;
+    rdma_handle saved_cqc_cq_h;
+    rdma_handle saved_cqc_ceq_h;
+    rdma_page_table_layout saved_cqc_page_layout;
+    rdma_ring_position saved_cqc_producer;
+    rdma_ring_position saved_cqc_consumer;
+    int unsigned saved_outer_host_id;
+    int unsigned saved_nested_object_id;
+    int unsigned saved_cqc_producer_index;
+    int unsigned saved_outer_flags;
+    rdma_cmq_ticket tickets[];
+    rdma_status item_statuses[];
+    rdma_status batch_status;
+    rdma_status status;
+
+    engine = rdma_cmq_engine_probe::type_id::create(
+      "mutating_source_engine"
+    );
+    mem = rdma_mock_host_mem::type_id::create("mutating_source_mem");
+    pcie = rdma_cmq_test_pcie::type_id::create("mutating_source_pcie");
+    trace = rdma_mock_call_trace::type_id::create("mutating_source_trace");
+    mem.set_call_trace(trace);
+    pcie.set_call_trace(trace);
+    scheduler = rdma_doorbell_scheduler::type_id::create(
+      "mutating_source_scheduler"
+    );
+    profile = rdma_cmq_test_profile::type_id::create(
+      "mutating_source_profile"
+    );
+    prepared_binding = make_binding("mutating_source_prepared",
+                                    RDMA_BIND_PREPARED);
+    active_binding = make_binding("mutating_source_active",
+                                  RDMA_BIND_ACTIVE);
+    cmq = make_cmq("mutating_source_cmq", prepared_binding);
+    prepare_active("MUTATING_SOURCE", engine, mem, pcie, scheduler, profile,
+                   prepared_binding, active_binding, cmq, runtime_desc);
+    clear_submit_observation(mem, pcie, trace);
+
+    requests = new[7];
+    foreach (requests[i])
+      requests[i] = make_command(
+        $sformatf("mutating_source_%0d", i), active_binding,
+        rdma_cmq_test_profile::TEST_OPCODE_A, byte'(8'hc0 + i)
+      );
+
+    fault_function =
+      rdma_cmq_clone_fault_function_handle::type_id::create(
+        "mutating_source_function"
+      );
+    fault_function.copy(requests[0].function_h);
+    fault_function.clone_fault = RDMA_CMQ_TEST_CLONE_MUTATE;
+    requests[0].function_h = fault_function;
+
+    fault_opcode = rdma_cmq_clone_fault_opcode_key::type_id::create(
+      "mutating_source_opcode"
+    );
+    fault_opcode.copy(requests[1].opcode_key);
+    fault_opcode.clone_fault = RDMA_CMQ_TEST_CLONE_MUTATE;
+    requests[1].opcode_key = fault_opcode;
+
+    fault_image = rdma_cmq_clone_fault_image::type_id::create(
+      "mutating_source_image"
+    );
+    fault_image.copy(requests[2].qpc_signature_source);
+    fault_image.clone_fault = RDMA_CMQ_TEST_CLONE_MUTATE;
+    requests[2].qpc_signature_source = fault_image;
+
+    if (!$cast(source_body, requests[3].body))
+      `uvm_fatal("MUTATING_SOURCE_SETUP", "SQE source body is invalid")
+    fault_body = rdma_cmq_clone_fault_body::type_id::create(
+      "mutating_source_sqe"
+    );
+    fault_body.copy(source_body);
+    fault_body.clone_fault = RDMA_CMQ_TEST_CLONE_MUTATE;
+    requests[3].body = fault_body;
+    saved_outer_flags = fault_body.flags;
+
+    if (!$cast(source_body, requests[4].body))
+      `uvm_fatal("MUTATING_SOURCE_SETUP", "QPC outer body is invalid")
+    qpc = make_qpc_context("mutating_source_outer_qpc", active_binding);
+    fault_qpc = rdma_cmq_clone_fault_qpc::type_id::create(
+      "mutating_source_qpc"
+    );
+    fault_qpc.copy(qpc);
+    fault_qpc.clone_fault = RDMA_CMQ_TEST_CLONE_MUTATE;
+    source_body.context_model = fault_qpc;
+    outer_qpc = fault_qpc;
+    saved_outer_host_id = outer_qpc.host_id;
+    saved_outer_qp_h = outer_qpc.qp_h;
+    saved_outer_pd_h = outer_qpc.pd_h;
+    saved_outer_send_cq_h = outer_qpc.send_cq_h;
+    saved_outer_recv_cq_h = outer_qpc.recv_cq_h;
+    saved_outer_srq_h = outer_qpc.srq_h;
+
+    if (!$cast(source_body, requests[5].body))
+      `uvm_fatal("MUTATING_SOURCE_SETUP", "QPC nested body is invalid")
+    nested_qpc = make_qpc_context("mutating_source_nested_qpc",
+                                  active_binding);
+    fault_handle = rdma_cmq_clone_fault_handle::type_id::create(
+      "mutating_source_qpc_handle"
+    );
+    fault_handle.copy(nested_qpc.qp_h);
+    fault_handle.clone_fault = RDMA_CMQ_TEST_CLONE_MUTATE;
+    nested_qpc.qp_h = fault_handle;
+    source_body.context_model = nested_qpc;
+    saved_nested_object_id = fault_handle.object_id;
+    saved_nested_qp_h = nested_qpc.qp_h;
+    saved_nested_pd_h = nested_qpc.pd_h;
+    saved_nested_send_cq_h = nested_qpc.send_cq_h;
+    saved_nested_recv_cq_h = nested_qpc.recv_cq_h;
+    saved_nested_srq_h = nested_qpc.srq_h;
+
+    if (!$cast(source_body, requests[6].body))
+      `uvm_fatal("MUTATING_SOURCE_SETUP", "CQC nested body is invalid")
+    nested_cqc = make_cqc_context("mutating_source_nested_cqc",
+                                  active_binding);
+    fault_ring = rdma_cmq_clone_fault_ring::type_id::create(
+      "mutating_source_cqc_ring"
+    );
+    fault_ring.copy(nested_cqc.producer);
+    fault_ring.clone_fault = RDMA_CMQ_TEST_CLONE_MUTATE;
+    nested_cqc.producer = fault_ring;
+    source_body.context_model = nested_cqc;
+    saved_cqc_producer_index = fault_ring.index;
+    saved_cqc_cq_h = nested_cqc.cq_h;
+    saved_cqc_ceq_h = nested_cqc.ceq_h;
+    saved_cqc_page_layout = nested_cqc.page_layout;
+    saved_cqc_producer = nested_cqc.producer;
+    saved_cqc_consumer = nested_cqc.consumer;
+
+    saved_function_refs = new[requests.size()];
+    saved_opcode_refs = new[requests.size()];
+    saved_body_refs = new[requests.size()];
+    saved_signature_refs = new[requests.size()];
+    saved_function_values = new[requests.size()];
+    saved_opcode_values = new[requests.size()];
+    saved_signature_values = new[requests.size()];
+    saved_body_function_refs = new[requests.size()];
+    saved_body_target_refs = new[requests.size()];
+    saved_body_context_refs = new[requests.size()];
+    saved_body_values = new[requests.size()];
+    saved_vfid_override = new[requests.size()];
+    saved_use_vfid = new[requests.size()];
+    saved_timeout = new[requests.size()];
+    foreach (requests[i]) begin
+      saved_function_refs[i] = requests[i].function_h;
+      saved_opcode_refs[i] = requests[i].opcode_key;
+      saved_body_refs[i] = requests[i].body;
+      saved_signature_refs[i] = requests[i].qpc_signature_source;
+      saved_vfid_override[i] = requests[i].vfid_override;
+      saved_use_vfid[i] = requests[i].use_vfid;
+      saved_timeout[i] = requests[i].timeout;
+      saved_function_values[i] = rdma_function_handle::type_id::create(
+        $sformatf("mutating_source_saved_function_%0d", i)
+      );
+      saved_function_values[i].copy(requests[i].function_h);
+      saved_opcode_values[i] = rdma_cmq_opcode_key::type_id::create(
+        $sformatf("mutating_source_saved_opcode_%0d", i)
+      );
+      saved_opcode_values[i].copy(requests[i].opcode_key);
+      saved_signature_values[i] = rdma_hw_image::type_id::create(
+        $sformatf("mutating_source_saved_signature_%0d", i)
+      );
+      saved_signature_values[i].copy(requests[i].qpc_signature_source);
+      if (!$cast(source_body, requests[i].body))
+        `uvm_fatal("MUTATING_SOURCE_SETUP", "saved SQE body is invalid")
+      saved_body_function_refs[i] = source_body.function_h;
+      saved_body_target_refs[i] = source_body.target_h;
+      saved_body_context_refs[i] = source_body.context_model;
+      saved_body_values[i] = engine.probe_body_value_key(source_body);
+    end
+
+    engine.submit_batch(requests, tickets, item_statuses, batch_status);
+    expect_status("MUTATING_SOURCE_BATCH", batch_status, RDMA_SC_OK);
+    if (tickets.size() != requests.size() ||
+        item_statuses.size() != requests.size())
+      `uvm_error("MUTATING_SOURCE_ALIGNMENT", "outputs are misaligned")
+    else begin
+      foreach (requests[i]) begin
+        expect_status($sformatf("MUTATING_SOURCE_ITEM_%0d", i),
+                      item_statuses[i], RDMA_SC_INVALID_ARGUMENT);
+        if (tickets[i] != null)
+          `uvm_error("MUTATING_SOURCE_TICKET",
+                     $sformatf("item %0d returned a ticket", i))
+      end
+    end
+    foreach (requests[i]) begin
+      if (requests[i].function_h != saved_function_refs[i] ||
+          requests[i].opcode_key != saved_opcode_refs[i] ||
+          requests[i].body != saved_body_refs[i] ||
+          requests[i].qpc_signature_source != saved_signature_refs[i] ||
+          requests[i].vfid_override != saved_vfid_override[i] ||
+          requests[i].use_vfid != saved_use_vfid[i] ||
+          requests[i].timeout != saved_timeout[i] ||
+          !engine.probe_same_handle(requests[i].function_h,
+                                    saved_function_values[i]) ||
+          !engine.probe_same_opcode(requests[i].opcode_key,
+                                    saved_opcode_values[i]) ||
+          !engine.probe_same_image(requests[i].qpc_signature_source,
+                                   saved_signature_values[i]))
+        `uvm_error("MUTATING_SOURCE_ROOT",
+                   $sformatf("item %0d changed its command root", i))
+      if (!$cast(source_body, requests[i].body)) begin
+        `uvm_error("MUTATING_SOURCE_BODY",
+                   $sformatf("item %0d lost its SQE body", i))
+      end
+      else if (source_body.function_h != saved_body_function_refs[i] ||
+               source_body.target_h != saved_body_target_refs[i] ||
+               source_body.context_model != saved_body_context_refs[i] ||
+               engine.probe_body_value_key(source_body) !=
+                 saved_body_values[i])
+        `uvm_error("MUTATING_SOURCE_BODY",
+                   $sformatf("item %0d changed its SQE graph", i))
+    end
+    if (fault_body.flags != saved_outer_flags ||
+        outer_qpc.host_id != saved_outer_host_id ||
+        outer_qpc.qp_h != saved_outer_qp_h ||
+        outer_qpc.pd_h != saved_outer_pd_h ||
+        outer_qpc.send_cq_h != saved_outer_send_cq_h ||
+        outer_qpc.recv_cq_h != saved_outer_recv_cq_h ||
+        outer_qpc.srq_h != saved_outer_srq_h ||
+        fault_handle.object_id != saved_nested_object_id ||
+        nested_qpc.qp_h != saved_nested_qp_h ||
+        nested_qpc.pd_h != saved_nested_pd_h ||
+        nested_qpc.send_cq_h != saved_nested_send_cq_h ||
+        nested_qpc.recv_cq_h != saved_nested_recv_cq_h ||
+        nested_qpc.srq_h != saved_nested_srq_h ||
+        fault_ring.index != saved_cqc_producer_index ||
+        nested_cqc.cq_h != saved_cqc_cq_h ||
+        nested_cqc.ceq_h != saved_cqc_ceq_h ||
+        nested_cqc.page_layout != saved_cqc_page_layout ||
+        nested_cqc.producer != saved_cqc_producer ||
+        nested_cqc.consumer != saved_cqc_consumer)
+      `uvm_error("MUTATING_SOURCE_NESTED",
+                 "mutating clone changed a caller-owned nested graph")
+    expect_no_submit_side_effects("MUTATING_SOURCE_EFFECTS", mem, pcie,
+                                  trace);
+    if (engine.published_count() != 0 ||
+        engine.tokens_in_use_count() != 0 ||
+        engine.slot_record_count() != 0)
+      `uvm_error("MUTATING_SOURCE_LEDGER",
+                 "mutating clone failure changed the authority ledger")
+
+    engine.shutdown(status);
+    expect_status("MUTATING_SOURCE_SHUTDOWN", status, RDMA_SC_OK);
+  endtask
+
   task automatic check_qpc_context_snapshot_failures();
     rdma_cmq_engine_probe engine;
     rdma_mock_host_mem mem;
@@ -5244,6 +5569,7 @@ class rdma_cmq_engine_test extends uvm_test;
     check_submit_wrapper_and_snapshot_detachment();
     check_null_compose_transaction_abort();
     check_nested_command_snapshot_failures();
+    check_mutating_clone_source_restoration();
     check_qpc_context_snapshot_failures();
     check_transaction_failure_atomicity();
     check_submission_validation_and_profile_metadata();

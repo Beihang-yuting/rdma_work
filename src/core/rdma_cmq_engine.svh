@@ -809,6 +809,10 @@ class rdma_cmq_engine extends uvm_object;
     saved_object_id = source.object_id;
     saved_generation = source.generation;
     cloned_object = source.clone();
+    source.kind = saved_kind;
+    source.function_uid = saved_function_uid;
+    source.object_id = saved_object_id;
+    source.generation = saved_generation;
     if (cloned_object == null || !$cast(snapshot, cloned_object) ||
         snapshot == source || snapshot.get_type_name() != source_type_name) begin
       snapshot = null;
@@ -854,6 +858,10 @@ class rdma_cmq_engine extends uvm_object;
     saved_object_id = source.object_id;
     saved_generation = source.generation;
     cloned_object = source.clone();
+    source.kind = saved_kind;
+    source.function_uid = saved_function_uid;
+    source.object_id = saved_object_id;
+    source.generation = saved_generation;
     if (cloned_object == null || !$cast(snapshot, cloned_object) ||
         snapshot == source || snapshot.get_type_name() != source_type_name) begin
       snapshot = null;
@@ -928,6 +936,8 @@ class rdma_cmq_engine extends uvm_object;
     output uvm_object snapshot
   );
     uvm_object cloned_object;
+    uvm_object saved_source;
+    uvm_object_wrapper source_wrapper;
     rdma_status status;
     string source_type_name;
     string saved_value;
@@ -942,7 +952,16 @@ class rdma_cmq_engine extends uvm_object;
       return snapshot_failure(
         failure_code, {label, " has no checked value representation"}
       );
+    source_wrapper = source.get_object_type();
+    saved_source = (source_wrapper == null) ? null :
+      source_wrapper.create_object({label, "_saved"});
+    if (saved_source == null)
+      return snapshot_failure(
+        failure_code, {label, " source value capture failed"}
+      );
+    saved_source.copy(source);
     cloned_object = source.clone();
+    source.copy(saved_source);
     if (cloned_object == null || cloned_object == source ||
         cloned_object.get_type_name() != source_type_name) begin
       return snapshot_failure(
@@ -970,6 +989,8 @@ class rdma_cmq_engine extends uvm_object;
   );
     uvm_object cloned_object;
     uvm_object queues_object;
+    uvm_object saved_object;
+    uvm_object_wrapper source_wrapper;
     rdma_status status;
     rdma_qpc_rc_ext source_rc;
     rdma_qpc_ud_ext source_ud;
@@ -978,6 +999,8 @@ class rdma_cmq_engine extends uvm_object;
     rdma_urc_queue_config queues_snapshot;
     string source_type_name;
     string saved_value;
+    string saved_shell_value;
+    rdma_urc_queue_config saved_queues;
 
     snapshot = null;
     if (source == null)
@@ -1014,7 +1037,22 @@ class rdma_cmq_engine extends uvm_object;
                               {label, " URC queue snapshot is invalid"});
     source_type_name = source.get_type_name();
     saved_value = nested_value_key(source);
+    saved_queues = source_urc.queues;
+    source_urc.queues = null;
+    source_wrapper = source.get_object_type();
+    saved_object = (source_wrapper == null) ? null :
+      source_wrapper.create_object({label, "_saved_transport"});
+    if (saved_object == null) begin
+      source_urc.queues = saved_queues;
+      return snapshot_failure(
+        failure_code, {label, " transport value capture failed"}
+      );
+    end
+    saved_object.copy(source);
+    saved_shell_value = nested_value_key(saved_object);
     cloned_object = source.clone();
+    source.copy(saved_object);
+    source_urc.queues = saved_queues;
     if (cloned_object == null || !$cast(snapshot, cloned_object) ||
         snapshot == source || snapshot.get_type_name() != source_type_name ||
         !$cast(snapshot_urc, snapshot)) begin
@@ -1024,8 +1062,8 @@ class rdma_cmq_engine extends uvm_object;
       );
     end
     if (nested_value_key(source) != saved_value ||
-        nested_value_key(snapshot) != saved_value ||
-        snapshot_urc.queues == source_urc.queues) begin
+        nested_value_key(snapshot) != saved_shell_value ||
+        snapshot_urc.queues != null) begin
       snapshot = null;
       return snapshot_failure(
         failure_code, {label, " transport snapshot changed its source value"}
@@ -1050,6 +1088,240 @@ class rdma_cmq_engine extends uvm_object;
     return status;
   endfunction
 
+  protected function automatic bit clear_body_references(
+    rdma_hw_model body,
+    ref uvm_object references[$]
+  );
+    rdma_cmq_sqe_model sqe;
+    rdma_qpc_model qpc;
+    rdma_cqc_model cqc;
+    rdma_mrt_model mrt;
+    rdma_srqc_model srqc;
+    rdma_ceqc_model ceqc;
+    rdma_aeqc_model aeqc;
+
+    references.delete();
+    if ($cast(sqe, body)) begin
+      references.push_back(sqe.function_h);
+      references.push_back(sqe.target_h);
+      references.push_back(sqe.context_model);
+      sqe.function_h = null;
+      sqe.target_h = null;
+      sqe.context_model = null;
+      return 1'b1;
+    end
+    if ($cast(qpc, body)) begin
+      references.push_back(qpc.qp_h);
+      references.push_back(qpc.pd_h);
+      references.push_back(qpc.send_cq_h);
+      references.push_back(qpc.recv_cq_h);
+      references.push_back(qpc.srq_h);
+      references.push_back(qpc.address_vector);
+      references.push_back(qpc.behavior);
+      references.push_back(qpc.transport_ext);
+      qpc.qp_h = null;
+      qpc.pd_h = null;
+      qpc.send_cq_h = null;
+      qpc.recv_cq_h = null;
+      qpc.srq_h = null;
+      qpc.address_vector = null;
+      qpc.behavior = null;
+      qpc.transport_ext = null;
+      return 1'b1;
+    end
+    if ($cast(cqc, body)) begin
+      references.push_back(cqc.cq_h);
+      references.push_back(cqc.ceq_h);
+      references.push_back(cqc.page_layout);
+      references.push_back(cqc.producer);
+      references.push_back(cqc.consumer);
+      cqc.cq_h = null;
+      cqc.ceq_h = null;
+      cqc.page_layout = null;
+      cqc.producer = null;
+      cqc.consumer = null;
+      return 1'b1;
+    end
+    if ($cast(mrt, body)) begin
+      references.push_back(mrt.mr_h);
+      references.push_back(mrt.pd_h);
+      references.push_back(mrt.page_layout);
+      mrt.mr_h = null;
+      mrt.pd_h = null;
+      mrt.page_layout = null;
+      return 1'b1;
+    end
+    if ($cast(srqc, body)) begin
+      references.push_back(srqc.srq_h);
+      references.push_back(srqc.pd_h);
+      references.push_back(srqc.producer);
+      srqc.srq_h = null;
+      srqc.pd_h = null;
+      srqc.producer = null;
+      return 1'b1;
+    end
+    if ($cast(ceqc, body)) begin
+      references.push_back(ceqc.ceq_h);
+      references.push_back(ceqc.page_layout);
+      references.push_back(ceqc.producer);
+      references.push_back(ceqc.consumer);
+      ceqc.ceq_h = null;
+      ceqc.page_layout = null;
+      ceqc.producer = null;
+      ceqc.consumer = null;
+      return 1'b1;
+    end
+    if ($cast(aeqc, body)) begin
+      references.push_back(aeqc.aeq_h);
+      references.push_back(aeqc.page_layout);
+      references.push_back(aeqc.producer);
+      references.push_back(aeqc.consumer);
+      aeqc.aeq_h = null;
+      aeqc.page_layout = null;
+      aeqc.producer = null;
+      aeqc.consumer = null;
+      return 1'b1;
+    end
+    return 1'b0;
+  endfunction
+
+  protected function automatic bit restore_body_references(
+    rdma_hw_model body,
+    ref uvm_object references[$]
+  );
+    rdma_cmq_sqe_model sqe;
+    rdma_qpc_model qpc;
+    rdma_cqc_model cqc;
+    rdma_mrt_model mrt;
+    rdma_srqc_model srqc;
+    rdma_ceqc_model ceqc;
+    rdma_aeqc_model aeqc;
+
+    if ($cast(sqe, body) && references.size() == 3) begin
+      if (!$cast(sqe.function_h, references[0]) && references[0] != null)
+        return 1'b0;
+      if (!$cast(sqe.target_h, references[1]) && references[1] != null)
+        return 1'b0;
+      if (!$cast(sqe.context_model, references[2]) &&
+          references[2] != null)
+        return 1'b0;
+      return 1'b1;
+    end
+    if ($cast(qpc, body) && references.size() == 8) begin
+      if (!$cast(qpc.qp_h, references[0]) && references[0] != null)
+        return 1'b0;
+      if (!$cast(qpc.pd_h, references[1]) && references[1] != null)
+        return 1'b0;
+      if (!$cast(qpc.send_cq_h, references[2]) && references[2] != null)
+        return 1'b0;
+      if (!$cast(qpc.recv_cq_h, references[3]) && references[3] != null)
+        return 1'b0;
+      if (!$cast(qpc.srq_h, references[4]) && references[4] != null)
+        return 1'b0;
+      if (!$cast(qpc.address_vector, references[5]) &&
+          references[5] != null)
+        return 1'b0;
+      if (!$cast(qpc.behavior, references[6]) && references[6] != null)
+        return 1'b0;
+      if (!$cast(qpc.transport_ext, references[7]) &&
+          references[7] != null)
+        return 1'b0;
+      return 1'b1;
+    end
+    if ($cast(cqc, body) && references.size() == 5) begin
+      if (!$cast(cqc.cq_h, references[0]) && references[0] != null)
+        return 1'b0;
+      if (!$cast(cqc.ceq_h, references[1]) && references[1] != null)
+        return 1'b0;
+      if (!$cast(cqc.page_layout, references[2]) && references[2] != null)
+        return 1'b0;
+      if (!$cast(cqc.producer, references[3]) && references[3] != null)
+        return 1'b0;
+      if (!$cast(cqc.consumer, references[4]) && references[4] != null)
+        return 1'b0;
+      return 1'b1;
+    end
+    if ($cast(mrt, body) && references.size() == 3) begin
+      if (!$cast(mrt.mr_h, references[0]) && references[0] != null)
+        return 1'b0;
+      if (!$cast(mrt.pd_h, references[1]) && references[1] != null)
+        return 1'b0;
+      if (!$cast(mrt.page_layout, references[2]) && references[2] != null)
+        return 1'b0;
+      return 1'b1;
+    end
+    if ($cast(srqc, body) && references.size() == 3) begin
+      if (!$cast(srqc.srq_h, references[0]) && references[0] != null)
+        return 1'b0;
+      if (!$cast(srqc.pd_h, references[1]) && references[1] != null)
+        return 1'b0;
+      if (!$cast(srqc.producer, references[2]) && references[2] != null)
+        return 1'b0;
+      return 1'b1;
+    end
+    if ($cast(ceqc, body) && references.size() == 4) begin
+      if (!$cast(ceqc.ceq_h, references[0]) && references[0] != null)
+        return 1'b0;
+      if (!$cast(ceqc.page_layout, references[1]) && references[1] != null)
+        return 1'b0;
+      if (!$cast(ceqc.producer, references[2]) && references[2] != null)
+        return 1'b0;
+      if (!$cast(ceqc.consumer, references[3]) && references[3] != null)
+        return 1'b0;
+      return 1'b1;
+    end
+    if ($cast(aeqc, body) && references.size() == 4) begin
+      if (!$cast(aeqc.aeq_h, references[0]) && references[0] != null)
+        return 1'b0;
+      if (!$cast(aeqc.page_layout, references[1]) && references[1] != null)
+        return 1'b0;
+      if (!$cast(aeqc.producer, references[2]) && references[2] != null)
+        return 1'b0;
+      if (!$cast(aeqc.consumer, references[3]) && references[3] != null)
+        return 1'b0;
+      return 1'b1;
+    end
+    return 1'b0;
+  endfunction
+
+  protected function automatic bit body_references_are_null(
+    rdma_hw_model body
+  );
+    rdma_cmq_sqe_model sqe;
+    rdma_qpc_model qpc;
+    rdma_cqc_model cqc;
+    rdma_mrt_model mrt;
+    rdma_srqc_model srqc;
+    rdma_ceqc_model ceqc;
+    rdma_aeqc_model aeqc;
+
+    if ($cast(sqe, body))
+      return sqe.function_h == null && sqe.target_h == null &&
+             sqe.context_model == null;
+    if ($cast(qpc, body))
+      return qpc.qp_h == null && qpc.pd_h == null &&
+             qpc.send_cq_h == null && qpc.recv_cq_h == null &&
+             qpc.srq_h == null && qpc.address_vector == null &&
+             qpc.behavior == null && qpc.transport_ext == null;
+    if ($cast(cqc, body))
+      return cqc.cq_h == null && cqc.ceq_h == null &&
+             cqc.page_layout == null && cqc.producer == null &&
+             cqc.consumer == null;
+    if ($cast(mrt, body))
+      return mrt.mr_h == null && mrt.pd_h == null &&
+             mrt.page_layout == null;
+    if ($cast(srqc, body))
+      return srqc.srq_h == null && srqc.pd_h == null &&
+             srqc.producer == null;
+    if ($cast(ceqc, body))
+      return ceqc.ceq_h == null && ceqc.page_layout == null &&
+             ceqc.producer == null && ceqc.consumer == null;
+    if ($cast(aeqc, body))
+      return aeqc.aeq_h == null && aeqc.page_layout == null &&
+             aeqc.producer == null && aeqc.consumer == null;
+    return 1'b0;
+  endfunction
+
   protected function rdma_status checked_outer_body_clone(
     rdma_hw_model source,
     string saved_value,
@@ -1058,12 +1330,39 @@ class rdma_cmq_engine extends uvm_object;
     output rdma_hw_model snapshot
   );
     uvm_object cloned_object;
+    uvm_object saved_object;
+    uvm_object_wrapper source_wrapper;
     rdma_status status;
+    rdma_hw_model saved_body;
     string source_type_name;
+    string saved_shell_value;
+    uvm_object saved_references[$];
 
     snapshot = null;
     source_type_name = source.get_type_name();
+    if (!clear_body_references(source, saved_references))
+      return snapshot_failure(
+        failure_code, {label, " body reference capture failed"}
+      );
+    source_wrapper = source.get_object_type();
+    saved_object = (source_wrapper == null) ? null :
+      source_wrapper.create_object({label, "_saved_shell"});
+    if (saved_object == null || !$cast(saved_body, saved_object)) begin
+      void'(restore_body_references(source, saved_references));
+      return snapshot_failure(
+        failure_code, {label, " body value capture failed"}
+      );
+    end
+    saved_body.copy(source);
+    saved_shell_value = body_value_key(saved_body);
     cloned_object = source.clone();
+    source.copy(saved_body);
+    if (!restore_body_references(source, saved_references)) begin
+      snapshot = null;
+      return snapshot_failure(
+        failure_code, {label, " body source restoration failed"}
+      );
+    end
     if (cloned_object == null || !$cast(snapshot, cloned_object) ||
         snapshot == source || snapshot.get_type_name() != source_type_name) begin
       snapshot = null;
@@ -1072,23 +1371,14 @@ class rdma_cmq_engine extends uvm_object;
       );
     end
     if (body_value_key(source) != saved_value ||
-        body_value_key(snapshot) != saved_value ||
-        !body_graph_detached(source, snapshot)) begin
+        body_value_key(snapshot) != saved_shell_value ||
+        !body_references_are_null(snapshot)) begin
       snapshot = null;
       return snapshot_failure(
         failure_code, {label, " body snapshot changed its source value"}
       );
     end
-    status = snapshot.validate();
-    if (status == null) begin
-      snapshot = null;
-      return snapshot_failure(
-        failure_code, {label, " body snapshot validation returned null"}
-      );
-    end
-    if (!status.ok())
-      snapshot = null;
-    return status;
+    return rdma_status::success();
   endfunction
 
   protected function rdma_status checked_qpc_snapshot(
@@ -1394,8 +1684,8 @@ class rdma_cmq_engine extends uvm_object;
     rdma_status_code_e failure_code,
     output rdma_cmq_opcode_key snapshot
   );
-    uvm_object cloned_object;
     rdma_status status;
+    uvm_object cloned_object;
     string saved_profile_name;
     bit [31:0] saved_opcode;
     string saved_variant;
@@ -1414,6 +1704,9 @@ class rdma_cmq_engine extends uvm_object;
     saved_opcode = source.opcode;
     saved_variant = source.variant;
     cloned_object = source.clone();
+    source.profile_name = saved_profile_name;
+    source.opcode = saved_opcode;
+    source.variant = saved_variant;
     if (cloned_object == null || !$cast(snapshot, cloned_object) ||
         snapshot == source) begin
       snapshot = null;
@@ -1450,8 +1743,8 @@ class rdma_cmq_engine extends uvm_object;
     output rdma_hw_model snapshot,
     output bit staging_invariant_failed
   );
-    uvm_object cloned_object;
     rdma_status status;
+    rdma_hw_model cloned_body;
     string source_type_name;
     rdma_cmq_sqe_model source_sqe;
     rdma_cmq_sqe_model cloned_sqe;
@@ -1467,6 +1760,7 @@ class rdma_cmq_engine extends uvm_object;
     rdma_cmq_opcode_e saved_opcode;
     longint unsigned saved_command_id;
     int unsigned saved_flags;
+    string saved_body_value;
 
     snapshot = null;
     staging_invariant_failed = 1'b0;
@@ -1531,6 +1825,7 @@ class rdma_cmq_engine extends uvm_object;
       return rdma_status::success();
     end
     begin
+      saved_body_value = body_value_key(source);
       saved_opcode = source_sqe.opcode;
       saved_command_id = source_sqe.command_id;
       saved_flags = source_sqe.flags;
@@ -1559,55 +1854,31 @@ class rdma_cmq_engine extends uvm_object;
           return status;
       end
     end
-    cloned_object = source.clone();
-    if (cloned_object == null || !$cast(snapshot, cloned_object) ||
-        snapshot == source || snapshot.get_type_name() != source_type_name) begin
-      snapshot = null;
+    status = checked_outer_body_clone(
+      source, saved_body_value, label, failure_code, cloned_body
+    );
+    if (!status.ok())
+      return status;
+    if (!$cast(cloned_sqe, cloned_body))
       return snapshot_failure(
-        failure_code, {label, " body snapshot clone contract failed"}
+        failure_code, {label, " body snapshot type is invalid"}
+      );
+    if (source_sqe.opcode != saved_opcode ||
+        source_sqe.command_id != saved_command_id ||
+        source_sqe.flags != saved_flags) begin
+      return snapshot_failure(
+        failure_code, {label, " body snapshot changed its source value"}
       );
     end
-    if (source_sqe != null) begin
-      if (!$cast(cloned_sqe, snapshot) ||
-          source_sqe.opcode != saved_opcode ||
-          source_sqe.command_id != saved_command_id ||
-          source_sqe.flags != saved_flags ||
-          cloned_sqe.opcode != saved_opcode ||
-          cloned_sqe.command_id != saved_command_id ||
-          cloned_sqe.flags != saved_flags ||
-          !same_handle(source_sqe.function_h, function_snapshot) ||
-          !same_handle(cloned_sqe.function_h, function_snapshot) ||
-          cloned_sqe.function_h == source_sqe.function_h ||
-          ((source_sqe.target_h == null) != (target_snapshot == null)) ||
-          ((cloned_sqe.target_h == null) != (target_snapshot == null)) ||
-          (target_snapshot != null &&
-           (!same_handle(source_sqe.target_h, target_snapshot) ||
-            !same_handle(cloned_sqe.target_h, target_snapshot) ||
-            cloned_sqe.target_h == source_sqe.target_h)) ||
-          ((source_sqe.context_model == null) !=
-           (context_snapshot == null)) ||
-          ((cloned_sqe.context_model == null) !=
-           (context_snapshot == null)) ||
-          (context_snapshot != null &&
-           (!same_body_value(source_sqe.context_model, context_snapshot) ||
-            !same_body_value(cloned_sqe.context_model, context_snapshot) ||
-            !body_graph_detached(source_sqe.context_model,
-                                 cloned_sqe.context_model)))) begin
-        snapshot = null;
-        return snapshot_failure(
-          failure_code, {label, " body snapshot changed its source value"}
-        );
-      end
-      cloned_sqe.function_h = function_snapshot;
-      cloned_sqe.target_h = target_snapshot;
-      cloned_sqe.context_model = context_snapshot;
-      snapshot = cloned_sqe;
-      if (!body_graph_detached(source, snapshot)) begin
-        snapshot = null;
-        return snapshot_failure(
-          failure_code, {label, " body snapshot aliases its source"}
-        );
-      end
+    cloned_sqe.function_h = function_snapshot;
+    cloned_sqe.target_h = target_snapshot;
+    cloned_sqe.context_model = context_snapshot;
+    snapshot = cloned_sqe;
+    if (!body_graph_detached(source, snapshot)) begin
+      snapshot = null;
+      return snapshot_failure(
+        failure_code, {label, " body snapshot aliases its source"}
+      );
     end
     status = snapshot.validate();
     if (status == null) begin
@@ -1651,6 +1922,18 @@ class rdma_cmq_engine extends uvm_object;
     saved_value.bar_target = source.bar_target;
     saved_value.field_summary = source.field_summary;
     cloned_object = source.clone();
+    source.bytes = saved_value.bytes;
+    source.length = saved_value.length;
+    source.alignment = saved_value.alignment;
+    source.endian = saved_value.endian;
+    source.image_kind = saved_value.image_kind;
+    source.hardware_version = saved_value.hardware_version;
+    source.function_generation = saved_value.function_generation;
+    source.write_target_kind = saved_value.write_target_kind;
+    source.backing_target = saved_value.backing_target;
+    source.hmc_target = saved_value.hmc_target;
+    source.bar_target = saved_value.bar_target;
+    source.field_summary = saved_value.field_summary;
     if (cloned_object == null || !$cast(snapshot, cloned_object) ||
         snapshot == source) begin
       snapshot = null;

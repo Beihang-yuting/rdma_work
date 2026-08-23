@@ -567,6 +567,9 @@ class rdma_xtr_v1_cmq_profile_test extends uvm_test;
     rdma_xtr_v1_snapshot_unknown_body unknown_body;
     rdma_xtr_v1_snapshot_copy_catcher catcher;
     rdma_status status;
+    rdma_handle saved_fault_qp_ref;
+    int unsigned saved_fault_object_id;
+    bit [23:0] saved_mutating_qpn;
 
     profile = rdma_xtr_v1_cmq_hw_profile::type_id::create(
       "snapshot_profile"
@@ -642,12 +645,18 @@ class rdma_xtr_v1_cmq_profile_test extends uvm_test;
                                     24'h123456));
       fault_handle.clone_fault = rdma_xtr_snapshot_clone_fault_e'(fault);
       qpc_body.qp_h = fault_handle;
+      saved_fault_qp_ref = qpc_body.qp_h;
+      saved_fault_object_id = fault_handle.object_id;
       snapshot = null;
       status = profile.snapshot_command_body(qpc_body, snapshot);
       expect_status($sformatf("BODY_SNAPSHOT_FAULT_%0d", fault), status,
                     RDMA_SC_INVALID_ARGUMENT);
       if (snapshot != null)
         `uvm_error("BODY_SNAPSHOT_FAULT", "failure published a snapshot")
+      if (qpc_body.qp_h != saved_fault_qp_ref ||
+          fault_handle.object_id != saved_fault_object_id)
+        `uvm_error("BODY_SNAPSHOT_SOURCE",
+                   $sformatf("handle fault %0d changed its source", fault))
     end
     qpc_body = rdma_xtr_v1_qpc_command_body::type_id::create(
       "fault_qpc_alias"
@@ -672,10 +681,15 @@ class rdma_xtr_v1_cmq_profile_test extends uvm_test;
     );
     mutating_occ.mr_serial_flush = 1'b1;
     mutating_occ.pble = 1'b1;
+    saved_mutating_qpn = mutating_occ.qpn;
     snapshot = null;
     status = profile.snapshot_command_body(mutating_occ, snapshot);
     expect_status("BODY_SNAPSHOT_MUTATING_BODY", status,
                   RDMA_SC_INVALID_ARGUMENT);
+    if (mutating_occ.qpn != saved_mutating_qpn ||
+        !mutating_occ.mr_serial_flush || !mutating_occ.pble)
+      `uvm_error("BODY_SNAPSHOT_SOURCE",
+                 "mutating XTR body clone changed its source")
     unknown_body = rdma_xtr_v1_snapshot_unknown_body::type_id::create(
       "snapshot_unknown"
     );
