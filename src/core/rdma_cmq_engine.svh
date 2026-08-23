@@ -4,8 +4,8 @@ class rdma_cmq_engine extends uvm_object;
   localparam int unsigned CMQ_DEPTH = 32;
   localparam int unsigned CMQE_BYTES = 64;
   localparam int unsigned SQ_BYTES = 2048;
-  localparam int unsigned CQ_OFFSET = 2048;
-  localparam int unsigned BACKING_BYTES = 4096;
+  localparam int unsigned CQ_OFFSET = SQ_BYTES;
+  localparam int unsigned BACKING_BYTES = 2 * SQ_BYTES;
 
   protected semaphore engine_lock;
   protected rdma_cmq_engine_state_e engine_state;
@@ -440,6 +440,18 @@ class rdma_cmq_engine extends uvm_object;
     cq_consume_seq = 0;
   endfunction
 
+  protected function void retain_release_authority(
+    rdma_dma_mapping retained_mapping,
+    rdma_host_mem_api retained_host_mem
+  );
+    clear_configuration();
+    if (retained_mapping != null) begin
+      backing_mapping = retained_mapping;
+      host_mem = retained_host_mem;
+    end
+    engine_state = RDMA_CMQ_ENGINE_POISONED;
+  endfunction
+
   protected function rdma_status rollback_candidate(
     rdma_host_mem_api candidate_host_mem,
     rdma_dma_mapping candidate_mapping,
@@ -460,10 +472,7 @@ class rdma_cmq_engine extends uvm_object;
       return original_failure;
     end
     original_message = original_failure.message;
-    clear_configuration();
-    backing_mapping = candidate_mapping;
-    host_mem = candidate_host_mem;
-    engine_state = RDMA_CMQ_ENGINE_POISONED;
+    retain_release_authority(candidate_mapping, candidate_host_mem);
     if (release_status == null)
       cleanup_failure = invalid_state(
         {"CMQ prepare rollback release returned null; original failure: ",
@@ -737,20 +746,20 @@ class rdma_cmq_engine extends uvm_object;
       return;
     end
     if (backing_mapping == null || host_mem == null) begin
-      engine_state = RDMA_CMQ_ENGINE_POISONED;
+      retain_release_authority(backing_mapping, host_mem);
       status = invalid_state("CMQ shutdown release authority is missing");
       engine_lock.put(1);
       return;
     end
     release_status = host_mem.\release (backing_mapping);
     if (release_status == null) begin
-      engine_state = RDMA_CMQ_ENGINE_POISONED;
+      retain_release_authority(backing_mapping, host_mem);
       status = invalid_state("CMQ shutdown release returned null status");
       engine_lock.put(1);
       return;
     end
     if (!release_status.ok()) begin
-      engine_state = RDMA_CMQ_ENGINE_POISONED;
+      retain_release_authority(backing_mapping, host_mem);
       status = release_status;
       engine_lock.put(1);
       return;

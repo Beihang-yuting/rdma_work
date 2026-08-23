@@ -4,11 +4,13 @@ class rdma_cmq_test_profile extends rdma_cmq_hw_profile;
   localparam bit [31:0] TEST_OPCODE = 32'hcafe_0001;
 
   bit fail_validation;
+  bit return_null_status;
   int unsigned validation_calls;
 
   function new(string name = "rdma_cmq_test_profile");
     super.new(name);
     fail_validation = 1'b0;
+    return_null_status = 1'b0;
     validation_calls = 0;
   endfunction
 
@@ -18,6 +20,8 @@ class rdma_cmq_test_profile extends rdma_cmq_hw_profile;
 
   virtual function rdma_status validate_profile();
     validation_calls++;
+    if (return_null_status)
+      return null;
     if (fail_validation)
       return rdma_status::make(RDMA_SC_INVALID_STATE,
                                "test CMQ profile validation failed");
@@ -158,6 +162,36 @@ class rdma_cmq_engine_probe extends rdma_cmq_engine;
   function void restore_mapping(rdma_dma_mapping source);
     if (backing_mapping != null && source != null)
       backing_mapping.copy(source);
+  endfunction
+
+  function void seed_runtime_counters();
+    publish_seq = 11;
+    retire_seq = 7;
+    cq_consume_seq = 5;
+  endfunction
+
+  function bit retry_only_poisoned();
+    return engine_state == RDMA_CMQ_ENGINE_POISONED &&
+           host_mem != null && backing_mapping != null &&
+           prepared_binding == null && dma_context == null &&
+           cmq_snapshot == null && scheduler == null && profile == null &&
+           publish_seq == 0 && retire_seq == 0 && cq_consume_seq == 0;
+  endfunction
+
+  function void drop_host_mem_authority();
+    host_mem = null;
+  endfunction
+
+  function void restore_host_mem_authority(rdma_host_mem_api source);
+    host_mem = source;
+  endfunction
+
+  function bit missing_host_mem_poisoned();
+    return engine_state == RDMA_CMQ_ENGINE_POISONED &&
+           host_mem == null && backing_mapping != null &&
+           prepared_binding == null && dma_context == null &&
+           cmq_snapshot == null && scheduler == null && profile == null &&
+           publish_seq == 0 && retire_seq == 0 && cq_consume_seq == 0;
   endfunction
 
   function void tamper_mapping(rdma_cmq_mapping_tamper_e kind);
@@ -303,6 +337,91 @@ class rdma_cmq_upper_boundary_mem extends rdma_mock_host_mem;
   endfunction
 endclass
 
+typedef enum int unsigned {
+  RDMA_CMQ_ALLOCATE_NULL_NO_CANDIDATE,
+  RDMA_CMQ_ALLOCATE_NULL_WITH_CANDIDATE,
+  RDMA_CMQ_ALLOCATE_FAILURE_WITH_CANDIDATE
+} rdma_cmq_allocate_result_e;
+
+class rdma_cmq_allocate_result_mem extends rdma_mock_host_mem;
+  `uvm_object_utils(rdma_cmq_allocate_result_mem)
+
+  rdma_cmq_allocate_result_e result_kind;
+
+  function new(string name = "rdma_cmq_allocate_result_mem");
+    super.new(name);
+    result_kind = RDMA_CMQ_ALLOCATE_NULL_NO_CANDIDATE;
+  endfunction
+
+  virtual function rdma_status allocate(
+    rdma_dma_request_context request_context,
+    int unsigned size,
+    int unsigned alignment,
+    rdma_dma_direction_e direction,
+    output rdma_dma_mapping mapping
+  );
+    rdma_status status;
+
+    if (result_kind == RDMA_CMQ_ALLOCATE_NULL_NO_CANDIDATE) begin
+      mapping = null;
+      record_call("allocate", request_context, null, size, alignment,
+                  direction);
+      return null;
+    end
+    status = super.allocate(request_context, size, alignment, direction,
+                            mapping);
+    if (!status.ok() || mapping == null)
+      return status;
+    if (result_kind == RDMA_CMQ_ALLOCATE_NULL_WITH_CANDIDATE)
+      return null;
+    return rdma_status::make(
+      RDMA_SC_RESOURCE_EXHAUSTED,
+      "injected allocation failure with candidate"
+    );
+  endfunction
+endclass
+
+class rdma_cmq_null_write_mem extends rdma_mock_host_mem;
+  `uvm_object_utils(rdma_cmq_null_write_mem)
+
+  function new(string name = "rdma_cmq_null_write_mem");
+    super.new(name);
+  endfunction
+
+  virtual function rdma_status write(
+    rdma_dma_mapping mapping,
+    longint unsigned offset,
+    byte data[]
+  );
+    rdma_status status;
+
+    status = super.write(mapping, offset, data);
+    if (!status.ok())
+      return status;
+    return null;
+  endfunction
+endclass
+
+class rdma_cmq_null_release_once_mem extends rdma_mock_host_mem;
+  `uvm_object_utils(rdma_cmq_null_release_once_mem)
+
+  bit return_null_once;
+
+  function new(string name = "rdma_cmq_null_release_once_mem");
+    super.new(name);
+    return_null_once = 1'b1;
+  endfunction
+
+  virtual function rdma_status \release (rdma_dma_mapping mapping);
+    if (return_null_once) begin
+      return_null_once = 1'b0;
+      record_call("release", null, mapping);
+      return null;
+    end
+    return super.\release (mapping);
+  endfunction
+endclass
+
 class rdma_cmq_short_mapping_mem extends rdma_mock_host_mem;
   `uvm_object_utils(rdma_cmq_short_mapping_mem)
 
@@ -421,6 +540,51 @@ class rdma_cmq_engine_test extends uvm_test;
         result++;
     end
     return result;
+  endfunction
+
+  function automatic int host_call_index(
+    rdma_mock_host_mem mem,
+    string method_name,
+    int unsigned ordinal
+  );
+    int unsigned match_count;
+
+    match_count = 0;
+    foreach (mem.calls[i]) begin
+      if (mem.calls[i].method_name != method_name)
+        continue;
+      if (match_count == ordinal)
+        return i;
+      match_count++;
+    end
+    return -1;
+  endfunction
+
+  function automatic void expect_release_retry_identity(
+    string label,
+    rdma_mock_host_mem mem,
+    rdma_mock_dma_mapping retained_mapping
+  );
+    int first_index;
+    int second_index;
+    rdma_mock_dma_mapping first_release_mapping;
+    rdma_mock_dma_mapping second_release_mapping;
+
+    first_index = host_call_index(mem, "release", 0);
+    second_index = host_call_index(mem, "release", 1);
+    if (first_index < 0 || second_index < 0) begin
+      `uvm_error(label, "two release records were not available")
+      return;
+    end
+    if (!$cast(first_release_mapping, mem.calls[first_index].mapping) ||
+        !$cast(second_release_mapping, mem.calls[second_index].mapping)) begin
+      `uvm_error(label, "release record lost allocation identity")
+      return;
+    end
+    if (retained_mapping == null ||
+        !first_release_mapping.same_allocation(second_release_mapping) ||
+        !retained_mapping.same_allocation(second_release_mapping))
+      `uvm_error(label, "release retry changed mapping allocation identity")
   endfunction
 
   function automatic bit same_nullable_handle(
@@ -803,6 +967,7 @@ class rdma_cmq_engine_test extends uvm_test;
 
   task automatic check_allocation_and_rollback_failures();
     rdma_cmq_engine engine;
+    rdma_cmq_engine_probe release_failure_engine;
     rdma_cmq_runtime_clone_failure_engine clone_failure_engine;
     rdma_cmq_runtime_build_failure_engine build_failure_engine;
     rdma_mock_host_mem mem;
@@ -814,6 +979,8 @@ class rdma_cmq_engine_test extends uvm_test;
     rdma_function_binding binding;
     rdma_cmq cmq;
     rdma_cmq_runtime_desc runtime_desc;
+    rdma_dma_mapping retained_snapshot;
+    rdma_mock_dma_mapping retained_mock;
     rdma_status status;
 
     scheduler = rdma_doorbell_scheduler::type_id::create(
@@ -983,22 +1150,147 @@ class rdma_cmq_engine_test extends uvm_test;
                     RDMA_SC_UNKNOWN_HW_ERROR,
                     "injected rollback release failure"
                   )), RDMA_SC_OK);
-    engine = rdma_cmq_engine::type_id::create("release_failure_engine");
-    engine.prepare(binding, cmq, 1'b1, 20'h34567, mem, scheduler,
-                   profile, runtime_desc, status);
+    release_failure_engine = rdma_cmq_engine_probe::type_id::create(
+      "release_failure_engine"
+    );
+    release_failure_engine.prepare(binding, cmq, 1'b1, 20'h34567, mem,
+                                   scheduler, profile, runtime_desc,
+                                   status);
     expect_status("ROLLBACK_RELEASE_FAILURE", status,
                   RDMA_SC_UNKNOWN_HW_ERROR);
-    if (engine.state() != RDMA_CMQ_ENGINE_POISONED ||
-        engine.mapping_snapshot() == null ||
+    retained_snapshot = release_failure_engine.mapping_snapshot();
+    if (status == null ||
+        status.message !=
+          {"CMQ prepare rollback release failed: ",
+           "injected rollback release failure; original failure: ",
+           "rollback trigger"} ||
+        !release_failure_engine.retry_only_poisoned() ||
+        retained_snapshot == null ||
         count_host_calls(mem, "release") != 1)
       `uvm_error("ROLLBACK_RELEASE_AUTHORITY",
                  "failed rollback did not retain POISONED authority")
-    engine.shutdown(status);
+    if (!$cast(retained_mock, retained_snapshot))
+      `uvm_error("ROLLBACK_RELEASE_AUTHORITY",
+                 "failed rollback lost allocation identity")
+    release_failure_engine.shutdown(status);
     expect_status("ROLLBACK_RELEASE_RETRY", status, RDMA_SC_OK);
-    expect_unconfigured("ROLLBACK_RELEASE_RETRY_STATE", engine);
+    expect_unconfigured("ROLLBACK_RELEASE_RETRY_STATE",
+                        release_failure_engine);
     if (count_host_calls(mem, "release") != 2)
       `uvm_error("ROLLBACK_RELEASE_RETRY",
                  "shutdown did not retry the retained release once")
+    expect_release_retry_identity("ROLLBACK_RELEASE_RETRY_IDENTITY", mem,
+                                  retained_mock);
+  endtask
+
+  task automatic check_null_status_guards();
+    rdma_cmq_engine engine;
+    rdma_mock_host_mem mem;
+    rdma_cmq_allocate_result_mem allocate_mem;
+    rdma_cmq_null_write_mem null_write_mem;
+    rdma_doorbell_scheduler scheduler;
+    rdma_cmq_test_profile profile;
+    rdma_function_binding binding;
+    rdma_cmq cmq;
+    rdma_cmq_runtime_desc runtime_desc;
+    rdma_status status;
+
+    scheduler = rdma_doorbell_scheduler::type_id::create(
+      "null_status_scheduler"
+    );
+    binding = make_binding("null_status_binding", RDMA_BIND_PREPARED);
+    cmq = make_cmq("null_status_cmq", binding);
+
+    mem = rdma_mock_host_mem::type_id::create("null_profile_mem");
+    profile = rdma_cmq_test_profile::type_id::create(
+      "null_status_profile"
+    );
+    profile.return_null_status = 1'b1;
+    engine = rdma_cmq_engine::type_id::create("null_profile_engine");
+    engine.prepare(binding, cmq, 1'b1, 20'h34567, mem, scheduler,
+                   profile, runtime_desc, status);
+    expect_status("NULL_PROFILE_STATUS", status, RDMA_SC_INVALID_STATE);
+    if (status == null ||
+        status.message != "CMQ hardware profile returned null status" ||
+        profile.validation_calls != 1 || runtime_desc != null ||
+        mem.calls.size() != 0)
+      `uvm_error("NULL_PROFILE_STATUS",
+                 "null profile status did not fail before allocation")
+    expect_unconfigured("NULL_PROFILE_STATUS_STATE", engine);
+
+    profile = rdma_cmq_test_profile::type_id::create(
+      "null_status_good_profile"
+    );
+    allocate_mem = rdma_cmq_allocate_result_mem::type_id::create(
+      "null_allocate_no_candidate_mem"
+    );
+    allocate_mem.result_kind = RDMA_CMQ_ALLOCATE_NULL_NO_CANDIDATE;
+    engine = rdma_cmq_engine::type_id::create(
+      "null_allocate_no_candidate_engine"
+    );
+    engine.prepare(binding, cmq, 1'b1, 20'h34567, allocate_mem,
+                   scheduler, profile, runtime_desc, status);
+    expect_status("NULL_ALLOCATE_NO_CANDIDATE", status,
+                  RDMA_SC_INVALID_STATE);
+    if (status == null ||
+        status.message != "CMQ host allocation returned null status" ||
+        runtime_desc != null || allocate_mem.regions.size() != 0 ||
+        count_host_calls(allocate_mem, "allocate") != 1 ||
+        count_host_calls(allocate_mem, "write") != 0 ||
+        count_host_calls(allocate_mem, "release") != 0)
+      `uvm_error("NULL_ALLOCATE_NO_CANDIDATE",
+                 "null allocation without candidate did not fail closed")
+    expect_unconfigured("NULL_ALLOCATE_NO_CANDIDATE_STATE", engine);
+
+    allocate_mem = rdma_cmq_allocate_result_mem::type_id::create(
+      "null_allocate_candidate_mem"
+    );
+    allocate_mem.result_kind = RDMA_CMQ_ALLOCATE_NULL_WITH_CANDIDATE;
+    engine = rdma_cmq_engine::type_id::create(
+      "null_allocate_candidate_engine"
+    );
+    engine.prepare(binding, cmq, 1'b1, 20'h34567, allocate_mem,
+                   scheduler, profile, runtime_desc, status);
+    expect_status("NULL_ALLOCATE_WITH_CANDIDATE", status,
+                  RDMA_SC_INVALID_STATE);
+    if (status == null ||
+        status.message != "CMQ host allocation returned null status")
+      `uvm_error("NULL_ALLOCATE_WITH_CANDIDATE",
+                 "null allocation candidate lost normalized status")
+    expect_post_allocate_rollback("NULL_ALLOCATE_CANDIDATE_ROLLBACK",
+                                  engine, allocate_mem, runtime_desc, 0);
+
+    allocate_mem = rdma_cmq_allocate_result_mem::type_id::create(
+      "failed_allocate_candidate_mem"
+    );
+    allocate_mem.result_kind = RDMA_CMQ_ALLOCATE_FAILURE_WITH_CANDIDATE;
+    engine = rdma_cmq_engine::type_id::create(
+      "failed_allocate_candidate_engine"
+    );
+    engine.prepare(binding, cmq, 1'b1, 20'h34567, allocate_mem,
+                   scheduler, profile, runtime_desc, status);
+    expect_status("FAILED_ALLOCATE_WITH_CANDIDATE", status,
+                  RDMA_SC_RESOURCE_EXHAUSTED);
+    if (status == null ||
+        status.message != "injected allocation failure with candidate")
+      `uvm_error("FAILED_ALLOCATE_WITH_CANDIDATE",
+                 "allocation candidate failure lost adapter status")
+    expect_post_allocate_rollback("FAILED_ALLOCATE_CANDIDATE_ROLLBACK",
+                                  engine, allocate_mem, runtime_desc, 0);
+
+    null_write_mem = rdma_cmq_null_write_mem::type_id::create(
+      "null_write_mem"
+    );
+    engine = rdma_cmq_engine::type_id::create("null_write_engine");
+    engine.prepare(binding, cmq, 1'b1, 20'h34567, null_write_mem,
+                   scheduler, profile, runtime_desc, status);
+    expect_status("NULL_WRITE_STATUS", status, RDMA_SC_INVALID_STATE);
+    if (status == null ||
+        status.message != "CMQ backing zero-write returned null status")
+      `uvm_error("NULL_WRITE_STATUS",
+                 "null write did not return normalized status")
+    expect_post_allocate_rollback("NULL_WRITE_ROLLBACK", engine,
+                                  null_write_mem, runtime_desc, 1);
   endtask
 
   task automatic check_activation_guards();
@@ -1229,7 +1521,7 @@ class rdma_cmq_engine_test extends uvm_test;
   endtask
 
   task automatic check_shutdown_release_retry();
-    rdma_cmq_engine engine;
+    rdma_cmq_engine_probe engine;
     rdma_mock_host_mem mem;
     rdma_doorbell_scheduler scheduler;
     rdma_cmq_test_profile profile;
@@ -1238,11 +1530,11 @@ class rdma_cmq_engine_test extends uvm_test;
     rdma_cmq_runtime_desc runtime_desc;
     rdma_dma_mapping retained_snapshot;
     rdma_mock_dma_mapping retained_mock;
-    rdma_mock_dma_mapping first_release_mapping;
-    rdma_mock_dma_mapping second_release_mapping;
     rdma_status status;
 
-    engine = rdma_cmq_engine::type_id::create("shutdown_retry_engine");
+    engine = rdma_cmq_engine_probe::type_id::create(
+      "shutdown_retry_engine"
+    );
     mem = rdma_mock_host_mem::type_id::create("shutdown_retry_mem");
     scheduler = rdma_doorbell_scheduler::type_id::create(
       "shutdown_retry_scheduler"
@@ -1259,6 +1551,7 @@ class rdma_cmq_engine_test extends uvm_test;
                     RDMA_SC_UNKNOWN_HW_ERROR,
                     "injected shutdown release failure"
                   )), RDMA_SC_OK);
+    engine.seed_runtime_counters();
 
     engine.shutdown(status);
     expect_status("SHUTDOWN_RELEASE_FAILURE", status,
@@ -1268,6 +1561,7 @@ class rdma_cmq_engine_test extends uvm_test;
         status.message != "injected shutdown release failure" ||
         engine.state() != RDMA_CMQ_ENGINE_POISONED ||
         retained_snapshot == null ||
+        !engine.retry_only_poisoned() ||
         count_host_calls(mem, "release") != 1 ||
         mem.regions.size() != 1 || mem.regions[0].mapping == null ||
         mem.regions[0].mapping.state != RDMA_MAPPING_ACTIVE)
@@ -1284,13 +1578,8 @@ class rdma_cmq_engine_test extends uvm_test;
         mem.regions[0].mapping.state != RDMA_MAPPING_RELEASED)
       `uvm_error("SHUTDOWN_RELEASE_RETRY",
                  "shutdown did not retry and retire the same allocation")
-    if (!$cast(first_release_mapping, mem.calls[2].mapping) ||
-        !$cast(second_release_mapping, mem.calls[3].mapping) ||
-        !first_release_mapping.same_allocation(second_release_mapping) ||
-        (retained_mock != null &&
-         !retained_mock.same_allocation(second_release_mapping)))
-      `uvm_error("SHUTDOWN_RELEASE_RETRY_IDENTITY",
-                 "shutdown retry changed mapping allocation identity")
+    expect_release_retry_identity("SHUTDOWN_RELEASE_RETRY_IDENTITY", mem,
+                                  retained_mock);
 
     engine.shutdown(status);
     expect_status("SHUTDOWN_RELEASE_RETRY_IDEMPOTENT", status,
@@ -1300,14 +1589,221 @@ class rdma_cmq_engine_test extends uvm_test;
                  "third shutdown released retired backing again")
   endtask
 
+  task automatic check_active_shutdown_release_retry();
+    rdma_cmq_engine_probe engine;
+    rdma_mock_host_mem mem;
+    rdma_doorbell_scheduler scheduler;
+    rdma_cmq_test_profile profile;
+    rdma_function_binding prepared_binding;
+    rdma_function_binding active_binding;
+    rdma_cmq cmq;
+    rdma_cmq_runtime_desc runtime_desc;
+    rdma_dma_mapping retained_snapshot;
+    rdma_mock_dma_mapping retained_mock;
+    rdma_status status;
+
+    engine = rdma_cmq_engine_probe::type_id::create(
+      "active_shutdown_retry_engine"
+    );
+    mem = rdma_mock_host_mem::type_id::create(
+      "active_shutdown_retry_mem"
+    );
+    scheduler = rdma_doorbell_scheduler::type_id::create(
+      "active_shutdown_retry_scheduler"
+    );
+    profile = rdma_cmq_test_profile::type_id::create(
+      "active_shutdown_retry_profile"
+    );
+    prepared_binding = make_binding("active_shutdown_retry_prepared",
+                                    RDMA_BIND_PREPARED);
+    active_binding = make_binding("active_shutdown_retry_active",
+                                  RDMA_BIND_ACTIVE);
+    cmq = make_cmq("active_shutdown_retry_cmq", prepared_binding);
+    prepare_defaults("ACTIVE_SHUTDOWN_RETRY_PREPARE", engine, mem,
+                     prepared_binding, cmq, scheduler, profile,
+                     runtime_desc);
+    engine.activate(active_binding, status);
+    expect_status("ACTIVE_SHUTDOWN_RETRY_ACTIVATE", status, RDMA_SC_OK);
+    expect_status("ARM_ACTIVE_SHUTDOWN_RELEASE_FAILURE",
+                  mem.fail_next("release", rdma_status::make(
+                    RDMA_SC_UNKNOWN_HW_ERROR,
+                    "injected ACTIVE shutdown release failure"
+                  )), RDMA_SC_OK);
+    engine.seed_runtime_counters();
+
+    engine.shutdown(status);
+    expect_status("ACTIVE_SHUTDOWN_RELEASE_FAILURE", status,
+                  RDMA_SC_UNKNOWN_HW_ERROR);
+    retained_snapshot = engine.mapping_snapshot();
+    if (status == null ||
+        status.message != "injected ACTIVE shutdown release failure" ||
+        !engine.retry_only_poisoned() || retained_snapshot == null ||
+        count_host_calls(mem, "release") != 1 ||
+        mem.regions.size() != 1 || mem.regions[0].mapping == null ||
+        mem.regions[0].mapping.state != RDMA_MAPPING_ACTIVE)
+      `uvm_error("ACTIVE_SHUTDOWN_RELEASE_FAILURE",
+                 "ACTIVE release failure did not retain retry-only state")
+    if (!$cast(retained_mock, retained_snapshot))
+      `uvm_error("ACTIVE_SHUTDOWN_RELEASE_FAILURE",
+                 "ACTIVE release failure lost allocation identity")
+
+    engine.shutdown(status);
+    expect_status("ACTIVE_SHUTDOWN_RELEASE_RETRY", status, RDMA_SC_OK);
+    expect_unconfigured("ACTIVE_SHUTDOWN_RELEASE_RETRY_STATE", engine);
+    if (count_host_calls(mem, "release") != 2 ||
+        mem.regions[0].mapping.state != RDMA_MAPPING_RELEASED)
+      `uvm_error("ACTIVE_SHUTDOWN_RELEASE_RETRY",
+                 "ACTIVE shutdown retry did not release backing")
+    expect_release_retry_identity(
+      "ACTIVE_SHUTDOWN_RELEASE_RETRY_IDENTITY", mem, retained_mock
+    );
+  endtask
+
+  task automatic check_null_shutdown_release_retry();
+    rdma_cmq_engine_probe engine;
+    rdma_cmq_null_release_once_mem mem;
+    rdma_doorbell_scheduler scheduler;
+    rdma_cmq_test_profile profile;
+    rdma_function_binding binding;
+    rdma_cmq cmq;
+    rdma_cmq_runtime_desc runtime_desc;
+    rdma_dma_mapping retained_snapshot;
+    rdma_mock_dma_mapping retained_mock;
+    rdma_status status;
+
+    engine = rdma_cmq_engine_probe::type_id::create(
+      "null_release_retry_engine"
+    );
+    mem = rdma_cmq_null_release_once_mem::type_id::create(
+      "null_release_retry_mem"
+    );
+    scheduler = rdma_doorbell_scheduler::type_id::create(
+      "null_release_retry_scheduler"
+    );
+    profile = rdma_cmq_test_profile::type_id::create(
+      "null_release_retry_profile"
+    );
+    binding = make_binding("null_release_retry_binding",
+                           RDMA_BIND_PREPARED);
+    cmq = make_cmq("null_release_retry_cmq", binding);
+    prepare_defaults("NULL_RELEASE_RETRY_PREPARE", engine, mem, binding,
+                     cmq, scheduler, profile, runtime_desc);
+    engine.seed_runtime_counters();
+
+    engine.shutdown(status);
+    expect_status("NULL_SHUTDOWN_RELEASE", status, RDMA_SC_INVALID_STATE);
+    retained_snapshot = engine.mapping_snapshot();
+    if (status == null ||
+        status.message != "CMQ shutdown release returned null status" ||
+        !engine.retry_only_poisoned() || retained_snapshot == null ||
+        count_host_calls(mem, "release") != 1 ||
+        mem.regions.size() != 1 || mem.regions[0].mapping == null ||
+        mem.regions[0].mapping.state != RDMA_MAPPING_ACTIVE)
+      `uvm_error("NULL_SHUTDOWN_RELEASE",
+                 "null release did not retain retry-only authority")
+    if (!$cast(retained_mock, retained_snapshot))
+      `uvm_error("NULL_SHUTDOWN_RELEASE",
+                 "null release lost mapping allocation identity")
+
+    engine.shutdown(status);
+    expect_status("NULL_SHUTDOWN_RELEASE_RETRY", status, RDMA_SC_OK);
+    expect_unconfigured("NULL_SHUTDOWN_RELEASE_RETRY_STATE", engine);
+    if (count_host_calls(mem, "release") != 2 ||
+        mem.regions[0].mapping.state != RDMA_MAPPING_RELEASED)
+      `uvm_error("NULL_SHUTDOWN_RELEASE_RETRY",
+                 "null release retry did not release backing")
+    expect_release_retry_identity("NULL_SHUTDOWN_RELEASE_RETRY_IDENTITY",
+                                  mem, retained_mock);
+    engine.shutdown(status);
+    expect_status("NULL_SHUTDOWN_RELEASE_IDEMPOTENT", status,
+                  RDMA_SC_OK);
+    if (count_host_calls(mem, "release") != 2)
+      `uvm_error("NULL_SHUTDOWN_RELEASE_IDEMPOTENT",
+                 "idempotent shutdown retried a released mapping")
+  endtask
+
+  task automatic check_missing_host_mem_shutdown();
+    rdma_cmq_engine_probe engine;
+    rdma_mock_host_mem mem;
+    rdma_doorbell_scheduler scheduler;
+    rdma_cmq_test_profile profile;
+    rdma_function_binding binding;
+    rdma_cmq cmq;
+    rdma_cmq_runtime_desc runtime_desc;
+    rdma_dma_mapping retained_snapshot;
+    rdma_mock_dma_mapping original_mapping;
+    rdma_mock_dma_mapping retained_mapping;
+    rdma_status status;
+
+    engine = rdma_cmq_engine_probe::type_id::create(
+      "missing_host_mem_engine"
+    );
+    mem = rdma_mock_host_mem::type_id::create("missing_host_mem");
+    scheduler = rdma_doorbell_scheduler::type_id::create(
+      "missing_host_mem_scheduler"
+    );
+    profile = rdma_cmq_test_profile::type_id::create(
+      "missing_host_mem_profile"
+    );
+    binding = make_binding("missing_host_mem_binding", RDMA_BIND_PREPARED);
+    cmq = make_cmq("missing_host_mem_cmq", binding);
+    prepare_defaults("MISSING_HOST_MEM_PREPARE", engine, mem, binding, cmq,
+                     scheduler, profile, runtime_desc);
+    retained_snapshot = engine.mapping_snapshot();
+    if (!$cast(original_mapping, retained_snapshot))
+      `uvm_error("MISSING_HOST_MEM_PREPARE",
+                 "prepared mapping lost allocation identity")
+    engine.seed_runtime_counters();
+    engine.drop_host_mem_authority();
+
+    engine.shutdown(status);
+    expect_status("MISSING_HOST_MEM_SHUTDOWN", status,
+                  RDMA_SC_INVALID_STATE);
+    retained_snapshot = engine.mapping_snapshot();
+    if (!$cast(retained_mapping, retained_snapshot))
+      `uvm_error("MISSING_HOST_MEM_SHUTDOWN",
+                 "missing adapter path lost retained mapping")
+    if (status == null ||
+        status.message != "CMQ shutdown release authority is missing" ||
+        !engine.missing_host_mem_poisoned() ||
+        count_host_calls(mem, "release") != 0 ||
+        mem.regions.size() != 1 || mem.regions[0].mapping == null ||
+        mem.regions[0].mapping.state != RDMA_MAPPING_ACTIVE ||
+        original_mapping == null || retained_mapping == null ||
+        !original_mapping.same_allocation(retained_mapping))
+      `uvm_error("MISSING_HOST_MEM_SHUTDOWN",
+                 "missing adapter path did not fail closed visibly")
+
+    engine.shutdown(status);
+    expect_status("MISSING_HOST_MEM_SHUTDOWN_REPEAT", status,
+                  RDMA_SC_INVALID_STATE);
+    if (!engine.missing_host_mem_poisoned() ||
+        count_host_calls(mem, "release") != 0)
+      `uvm_error("MISSING_HOST_MEM_SHUTDOWN_REPEAT",
+                 "missing adapter failure was not deterministic")
+
+    engine.restore_host_mem_authority(mem);
+    engine.shutdown(status);
+    expect_status("MISSING_HOST_MEM_RECOVERY", status, RDMA_SC_OK);
+    expect_unconfigured("MISSING_HOST_MEM_RECOVERY_STATE", engine);
+    if (count_host_calls(mem, "release") != 1 ||
+        mem.regions[0].mapping.state != RDMA_MAPPING_RELEASED)
+      `uvm_error("MISSING_HOST_MEM_RECOVERY",
+                 "restored adapter did not release retained mapping")
+  endtask
+
   virtual task run_phase(uvm_phase phase);
     phase.raise_objection(this);
     check_success_and_detachment();
     check_preallocation_rejections();
     check_pasid_normalization_and_busy_prepare();
     check_allocation_and_rollback_failures();
+    check_null_status_guards();
     check_prepared_shutdown_lifecycle();
     check_shutdown_release_retry();
+    check_active_shutdown_release_retry();
+    check_null_shutdown_release_retry();
+    check_missing_host_mem_shutdown();
     check_activation_guards();
     phase.drop_objection(this);
   endtask
