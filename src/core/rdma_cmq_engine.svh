@@ -82,6 +82,7 @@ class rdma_cmq_engine extends uvm_object;
   protected rdma_cmq_slot_record entry_registry[string];
   protected rdma_cmq_completion terminal_fifo[$];
   protected rdma_cmq_diagnostic diagnostic_fifo[$];
+  protected rdma_cmq_diagnostic last_poison;
   // The fixed CMQ profile API has no separate raw-CQE metadata hook.  A
   // profile therefore owns one endian/hardware-version format across its
   // SQE and CQE images.  Only a scheduler-successful batch may establish
@@ -107,6 +108,7 @@ class rdma_cmq_engine extends uvm_object;
     profile_image_format_valid = 1'b0;
     profile_image_endian = RDMA_ENDIAN_LITTLE;
     profile_hardware_version = 0;
+    last_poison = null;
     foreach (slots[i]) begin
       slots[i] = null;
       token_in_use[i] = 1'b0;
@@ -426,6 +428,170 @@ class rdma_cmq_engine extends uvm_object;
       return invalid_state("CMQ late diagnostic validation failed");
     end
     return rdma_status::success();
+  endfunction
+
+  protected function rdma_status make_diagnostic(
+    rdma_cmq_diagnostic_kind_e kind,
+    rdma_cmq_ticket trusted_ticket,
+    rdma_status failure,
+    rdma_hw_image raw_cqe,
+    output rdma_cmq_diagnostic diagnostic
+  );
+    rdma_status status;
+    rdma_cmq_ticket ticket_snapshot;
+    rdma_function_handle function_snapshot;
+    rdma_handle cmq_snapshot_value;
+    rdma_cmq_opcode_key opcode_snapshot;
+    rdma_status failure_snapshot;
+    rdma_hw_image raw_snapshot;
+
+    diagnostic = null;
+    if (failure == null || raw_cqe == null)
+      return invalid_state("CMQ poison diagnostic authority is missing");
+    ticket_snapshot = null;
+    if (trusted_ticket != null) begin
+      if (trusted_ticket.function_h == null ||
+          trusted_ticket.cmq_h == null ||
+          trusted_ticket.opcode_key == null)
+        return invalid_state("CMQ trusted poison ticket is incomplete");
+      function_snapshot = new("cmq_poison_ticket_function");
+      function_snapshot.kind = trusted_ticket.function_h.kind;
+      function_snapshot.function_uid =
+        trusted_ticket.function_h.function_uid;
+      function_snapshot.object_id = trusted_ticket.function_h.object_id;
+      function_snapshot.generation = trusted_ticket.function_h.generation;
+      cmq_snapshot_value = new("cmq_poison_ticket_cmq");
+      cmq_snapshot_value.kind = trusted_ticket.cmq_h.kind;
+      cmq_snapshot_value.function_uid = trusted_ticket.cmq_h.function_uid;
+      cmq_snapshot_value.object_id = trusted_ticket.cmq_h.object_id;
+      cmq_snapshot_value.generation = trusted_ticket.cmq_h.generation;
+      opcode_snapshot = new("cmq_poison_ticket_opcode");
+      opcode_snapshot.profile_name = trusted_ticket.opcode_key.profile_name;
+      opcode_snapshot.opcode = trusted_ticket.opcode_key.opcode;
+      opcode_snapshot.variant = trusted_ticket.opcode_key.variant;
+      ticket_snapshot = new("cmq_poison_ticket");
+      ticket_snapshot.command_id = trusted_ticket.command_id;
+      ticket_snapshot.function_h = function_snapshot;
+      ticket_snapshot.cmq_h = cmq_snapshot_value;
+      ticket_snapshot.slot_sequence = trusted_ticket.slot_sequence;
+      ticket_snapshot.sq_index = trusted_ticket.sq_index;
+      ticket_snapshot.sq_wrap = trusted_ticket.sq_wrap;
+      ticket_snapshot.opcode_key = opcode_snapshot;
+      ticket_snapshot.absolute_deadline =
+        trusted_ticket.absolute_deadline;
+      status = ticket_snapshot.validate();
+      if (status == null || !status.ok()) begin
+        ticket_snapshot = null;
+        return (status == null) ?
+          invalid_state("CMQ poison ticket validation returned null") :
+          status;
+      end
+    end
+    failure_snapshot = new("cmq_poison_status");
+    failure_snapshot.category = failure.category;
+    failure_snapshot.code = failure.code;
+    failure_snapshot.hardware_code = failure.hardware_code;
+    failure_snapshot.hardware_code_valid = failure.hardware_code_valid;
+    failure_snapshot.source_engine = failure.source_engine;
+    failure_snapshot.function_uid = failure.function_uid;
+    failure_snapshot.generation = failure.generation;
+    failure_snapshot.resource_id = failure.resource_id;
+    failure_snapshot.command_id = failure.command_id;
+    failure_snapshot.wr_id = failure.wr_id;
+    failure_snapshot.severity = failure.severity;
+    failure_snapshot.retryable = failure.retryable;
+    failure_snapshot.message = failure.message;
+    raw_snapshot = new("cmq_poison_raw_cqe");
+    raw_snapshot.bytes = raw_cqe.bytes;
+    raw_snapshot.length = raw_cqe.length;
+    raw_snapshot.alignment = raw_cqe.alignment;
+    raw_snapshot.endian = raw_cqe.endian;
+    raw_snapshot.image_kind = raw_cqe.image_kind;
+    raw_snapshot.hardware_version = raw_cqe.hardware_version;
+    raw_snapshot.function_generation = raw_cqe.function_generation;
+    raw_snapshot.write_target_kind = raw_cqe.write_target_kind;
+    raw_snapshot.backing_target = raw_cqe.backing_target;
+    raw_snapshot.hmc_target = raw_cqe.hmc_target;
+    raw_snapshot.bar_target = raw_cqe.bar_target;
+    raw_snapshot.field_summary = raw_cqe.field_summary;
+    diagnostic = new("cmq_poison_diagnostic");
+    diagnostic.kind = kind;
+    diagnostic.ticket = ticket_snapshot;
+    diagnostic.status = failure_snapshot;
+    diagnostic.raw_cqe = raw_snapshot;
+    status = diagnostic.validate();
+    if (status == null || !status.ok()) begin
+      diagnostic = null;
+      return invalid_state("CMQ poison diagnostic validation failed");
+    end
+    return rdma_status::success();
+  endfunction
+
+  protected function rdma_status clone_diagnostic(
+    rdma_cmq_diagnostic source,
+    output rdma_cmq_diagnostic snapshot
+  );
+    snapshot = null;
+    if (source == null)
+      return invalid_state("CMQ poison diagnostic source is null");
+    return make_diagnostic(
+      source.kind, source.ticket, source.status, source.raw_cqe, snapshot
+    );
+  endfunction
+
+  protected function rdma_status poison(
+    rdma_cmq_diagnostic_kind_e kind,
+    string message,
+    rdma_hw_image raw_cqe,
+    rdma_cmq_ticket trusted_ticket = null
+  );
+    rdma_status status;
+    rdma_status failure;
+    rdma_cmq_diagnostic diagnostic;
+    rdma_cmq_diagnostic poison_snapshot;
+
+    failure = rdma_status::make(RDMA_SC_CODEC_ERROR, message);
+    failure.source_engine = RDMA_ENGINE_CMQ;
+    if (prepared_binding != null) begin
+      failure.function_uid = prepared_binding.function_uid;
+      failure.generation = prepared_binding.generation;
+    end
+    if (cmq_snapshot != null && cmq_snapshot.handle != null)
+      failure.resource_id = cmq_snapshot.handle.object_id;
+    if (trusted_ticket != null)
+      failure.command_id = trusted_ticket.command_id;
+
+    // Stage both owned objects before publishing any poison state.  The FIFO
+    // item is caller-owned after poll(), while last_poison remains engine
+    // authority, so they must never share a root or nested object.
+    status = make_diagnostic(
+      kind, trusted_ticket, failure, raw_cqe, diagnostic
+    );
+    if (status == null || !status.ok() || diagnostic == null) begin
+      // If a trusted ticket was itself inconsistent, preserve raw evidence
+      // without claiming that association.  The fallback remains a complete,
+      // detached diagnostic rather than publishing a partial poison state.
+      failure.command_id = 0;
+      status = make_diagnostic(
+        RDMA_CMQ_DIAG_POISON, null, failure, raw_cqe, diagnostic
+      );
+      if (status == null || !status.ok() || diagnostic == null) begin
+        engine_state = RDMA_CMQ_ENGINE_POISONED;
+        return (status == null) ?
+          invalid_state("CMQ poison diagnostic staging returned null") :
+          status;
+      end
+    end
+    status = clone_diagnostic(diagnostic, poison_snapshot);
+    if (status == null || !status.ok() || poison_snapshot == null) begin
+      engine_state = RDMA_CMQ_ENGINE_POISONED;
+      return (status == null) ?
+        invalid_state("CMQ last-poison staging returned null") : status;
+    end
+    last_poison = poison_snapshot;
+    diagnostic_fifo.push_back(diagnostic);
+    engine_state = RDMA_CMQ_ENGINE_POISONED;
+    return failure;
   endfunction
 
   protected function rdma_status expire_locked();
@@ -3346,6 +3512,7 @@ class rdma_cmq_engine extends uvm_object;
     entry_registry.delete();
     terminal_fifo.delete();
     diagnostic_fifo.delete();
+    last_poison = null;
     foreach (slots[i]) begin
       slots[i] = null;
       token_in_use[i] = 1'b0;
@@ -4477,34 +4644,42 @@ class rdma_cmq_engine extends uvm_object;
         break;
       end
       if (inspect_status == null) begin
-        status = invalid_state("CMQ profile inspection returned null status");
+        status = poison(
+          RDMA_CMQ_DIAG_MALFORMED_CQE,
+          "CMQ profile inspection returned null status", raw_snapshot
+        );
         break;
       end
       if (!inspect_status.ok()) begin
-        status = rdma_cmq_clone_status_value(inspect_status);
+        if (inspect_status.code inside {
+              RDMA_SC_CODEC_ERROR, RDMA_SC_UNSUPPORTED_OPCODE
+            })
+          status = poison(
+            RDMA_CMQ_DIAG_MALFORMED_CQE,
+            inspect_status.message, raw_snapshot
+          );
+        else
+          status = rdma_cmq_clone_status_value(inspect_status);
         break;
       end
       if (!ready) begin
         status = rdma_status::success();
         break;
       end
-      if (decoded == null || decoded.command_status == null ||
-          decoded.wqe_index >= CMQ_DEPTH) begin
-        status = invalid_state("CMQ profile returned an invalid decoded CQE");
+      if (decoded == null || decoded.wqe_index >= CMQ_DEPTH) begin
+        status = poison(
+          RDMA_CMQ_DIAG_MALFORMED_CQE,
+          "CMQ profile returned an invalid decoded CQE", raw_snapshot
+        );
         break;
       end
-      validation_status = decoded.validate();
-      if (validation_status == null || !validation_status.ok()) begin
-        status = invalid_state("CMQ decoded CQE validation failed");
-        break;
-      end
-      status = decoded_status_contract(decoded);
-      if (!status.ok())
-        break;
 
       hardware_key = entry_key(decoded.wqe_index, decoded.wqe_wrap);
       if (!entry_registry.exists(hardware_key)) begin
-        status = invalid_state("CMQ decoded CQE has no registered entry");
+        status = poison(
+          RDMA_CMQ_DIAG_UNKNOWN_CQE,
+          "CMQ decoded CQE has no registered entry", raw_snapshot
+        );
         break;
       end
       record = entry_registry[hardware_key];
@@ -4521,31 +4696,71 @@ class rdma_cmq_engine extends uvm_object;
             CMQ_SLOT_PUBLISHED,
             CMQ_SLOT_TIMED_OUT_QUARANTINED
           })) begin
-        status = invalid_state("CMQ decoded CQE entry ledger is inconsistent");
+        status = poison(
+          RDMA_CMQ_DIAG_POISON,
+          "CMQ decoded CQE entry ledger is inconsistent", raw_snapshot
+        );
+        break;
+      end
+      if (decoded.command_status == null) begin
+        status = poison(
+          RDMA_CMQ_DIAG_MALFORMED_CQE,
+          "CMQ profile returned a null decoded command status",
+          raw_snapshot, record.ticket
+        );
+        break;
+      end
+      validation_status = decoded.validate();
+      if (validation_status == null || !validation_status.ok()) begin
+        status = poison(
+          RDMA_CMQ_DIAG_MALFORMED_CQE,
+          "CMQ decoded CQE validation failed", raw_snapshot,
+          record.ticket
+        );
+        break;
+      end
+      status = decoded_status_contract(decoded);
+      if (!status.ok()) begin
+        status = poison(
+          RDMA_CMQ_DIAG_MALFORMED_CQE, status.message, raw_snapshot,
+          record.ticket
+        );
         break;
       end
       if (record.expected.hardware_opcode != decoded.hardware_opcode) begin
-        status = invalid_state("CMQ decoded CQE opcode does not match command");
+        status = poison(
+          RDMA_CMQ_DIAG_MALFORMED_CQE,
+          "CMQ decoded CQE opcode does not match command", raw_snapshot,
+          record.ticket
+        );
         break;
       end
       software_key = command_key(record.ticket);
       if (cq_consume_seq == 64'hffff_ffff_ffff_ffff) begin
-        status = poison_status("CMQ completion consumer counter overflows");
+        status = poison(
+          RDMA_CMQ_DIAG_POISON,
+          "CMQ completion consumer counter overflows", raw_snapshot,
+          record.ticket
+        );
         break;
       end
 
       if (record.state == CMQ_SLOT_PUBLISHED) begin
         if (!command_registry.exists(software_key) ||
             command_registry[software_key] != record) begin
-          status = invalid_state(
-            "CMQ decoded CQE command registry is inconsistent"
+          status = poison(
+            RDMA_CMQ_DIAG_POISON,
+            "CMQ decoded CQE command registry is inconsistent",
+            raw_snapshot, record.ticket
           );
           break;
         end
         token_index = record.command_token;
         if (token_index >= CMQ_DEPTH || !token_in_use[token_index]) begin
-          status = invalid_state(
-            "CMQ decoded CQE command token is inconsistent"
+          status = poison(
+            RDMA_CMQ_DIAG_POISON,
+            "CMQ decoded CQE command token is inconsistent", raw_snapshot,
+            record.ticket
           );
           break;
         end
@@ -4566,8 +4781,10 @@ class rdma_cmq_engine extends uvm_object;
       end
       else begin
         if (command_registry.exists(software_key)) begin
-          status = invalid_state(
-            "CMQ quarantined command remains in the command registry"
+          status = poison(
+            RDMA_CMQ_DIAG_POISON,
+            "CMQ quarantined command remains in the command registry",
+            raw_snapshot, record.ticket
           );
           break;
         end
@@ -4629,6 +4846,18 @@ class rdma_cmq_engine extends uvm_object;
 
   function longint unsigned cq_consumed_count();
     return cq_consume_seq;
+  endfunction
+
+  function rdma_cmq_diagnostic last_poison_snapshot();
+    rdma_status status;
+    rdma_cmq_diagnostic snapshot;
+
+    if (last_poison == null)
+      return null;
+    status = clone_diagnostic(last_poison, snapshot);
+    if (status == null || !status.ok() || snapshot == null)
+      return null;
+    return snapshot;
   endfunction
 
   task shutdown(output rdma_status status);
