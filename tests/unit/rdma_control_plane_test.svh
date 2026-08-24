@@ -188,6 +188,7 @@ class rdma_fault_resource_manager extends rdma_recovery_probe_manager;
   protected rdma_status next_mark_error_failure;
   protected rdma_status next_activate_failure;
   protected rdma_status next_finalize_failure;
+  protected rdma_status next_restore_active_failure;
 
   function new(string name = "rdma_fault_resource_manager");
     super.new(name);
@@ -200,6 +201,7 @@ class rdma_fault_resource_manager extends rdma_recovery_probe_manager;
     next_mark_error_failure = null;
     next_activate_failure = null;
     next_finalize_failure = null;
+    next_restore_active_failure = null;
   endfunction
 
   function void fail_next_release_reserved(rdma_status failure);
@@ -216,6 +218,10 @@ class rdma_fault_resource_manager extends rdma_recovery_probe_manager;
 
   function void fail_next_finalize_release(rdma_status failure);
     next_finalize_failure = rdma_cmq_clone_status_value(failure);
+  endfunction
+
+  function void fail_next_restore_active(rdma_status failure);
+    next_restore_active_failure = rdma_cmq_clone_status_value(failure);
   endfunction
 
   virtual function rdma_status activate(rdma_handle handle);
@@ -274,7 +280,14 @@ class rdma_fault_resource_manager extends rdma_recovery_probe_manager;
   endfunction
 
   virtual function rdma_status restore_active(rdma_handle handle);
+    rdma_status failure;
+
     restore_active_calls++;
+    if (next_restore_active_failure != null) begin
+      failure = rdma_cmq_clone_status_value(next_restore_active_failure);
+      next_restore_active_failure = null;
+      return failure;
+    end
     return super.restore_active(handle);
   endfunction
 
@@ -769,8 +782,10 @@ class rdma_control_plane_test extends uvm_test;
     rdma_dma_request_context dma_context;
     rdma_mr_backing_desc backing;
     rdma_backing_ref backing_ref;
+    rdma_backing_ref backing_ref2;
     rdma_hmc_ref hmc_ref;
     rdma_hmc_fvm_addr_t hmc_base;
+    rdma_dma_mapping mapping2;
     rdma_control_result result;
     rdma_status status;
     longint unsigned lease_size;
@@ -826,6 +841,23 @@ class rdma_control_plane_test extends uvm_test;
     backing.page_layout.pbl_mode = pbl_mode;
     if (pbl_mode == RDMA_MR_PBL0)
       backing.page_layout.pba0 = mapping.backing_addr;
+    else if (pbl_mode == RDMA_MR_PBL1) begin
+      status = host_mem.allocate(
+        dma_context, int'(request.length), 4096, RDMA_DMA_DEVICE_READ,
+        mapping2
+      );
+      expect_status({prefix, "_MAP2_ALLOCATE"}, status, RDMA_SC_OK);
+      mapping2.iova = request.iova;
+      backing_ref2 = rdma_backing_ref::type_id::create(
+        {prefix, "_backing_ref2"}
+      );
+      backing_ref2.mapping = mapping2;
+      backing_ref2.ownership = ownership;
+      backing_ref2.release_complete = 1'b0;
+      backing.backing_refs.push_back(backing_ref2);
+      backing.page_layout.pba0 = mapping.backing_addr;
+      backing.page_layout.pba1 = mapping2.backing_addr;
+    end
     else if (pbl_mode == RDMA_MR_PBL2) begin
       status = hmc.allocate(binding.make_handle(), RDMA_RESOURCE_MR,
                             64'h2000, 64'h1000, hmc_address);
@@ -4177,6 +4209,7 @@ class rdma_control_plane_test extends uvm_test;
     rdma_mr live_mr;
     rdma_resource resource;
     rdma_dma_mapping mapping;
+    rdma_dma_mapping mapping2;
     rdma_hmc_fvm_addr_t hmc_address;
     rdma_xtr_v1_occ_flush_body occ_body;
     rdma_xtr_v1_mr_deregister_body dereg_body;
@@ -4255,6 +4288,44 @@ class rdma_control_plane_test extends uvm_test;
     status = host_mem.\release (mapping);
     expect_status("MR_DEREG_BORROWED_PBL0_CALLER_RELEASE", status,
                   RDMA_SC_OK);
+
+    setup_deregister_mr_case(
+      "dereg_borrowed_pbl1", RDMA_MR_PBL1, RDMA_OWNERSHIP_BORROWED,
+      control, manager, mock_cmq, host_mem, hmc, binding, pd, mr,
+      mapping, hmc_address, baseline_allocations
+    );
+    if (mr == null || mr.backing_refs.size() != 2 ||
+        mr.backing_refs[1] == null || host_mem.regions.size() != 2 ||
+        host_mem.regions[1] == null ||
+        host_mem.regions[1].mapping == null)
+      `uvm_fatal("MR_DEREG_BORROWED_PBL1_SETUP",
+                 "PBL1 fixture lost its second borrowed mapping")
+    mapping2 = host_mem.regions[1].mapping;
+    control.deregister_mr(binding, mr.handle, result);
+    expect_result("MR_DEREG_BORROWED_PBL1", result, RDMA_SC_OK);
+    expected_opcodes.delete();
+    expected_opcodes.push_back(XTR_V1_OP_MR_DEREGISTER);
+    expected_opcodes.push_back(XTR_V1_OP_TQ_FLUSH);
+    expect_cmq_opcodes("MR_DEREG_BORROWED_PBL1_ORDER", mock_cmq,
+                       expected_opcodes);
+    if (mapping == null || mapping.state != RDMA_MAPPING_ACTIVE ||
+        mapping2 == null || mapping2.state != RDMA_MAPPING_ACTIVE ||
+        host_mem.live_allocations() != baseline_allocations + 2 ||
+        host_mem.calls.size() != 2 ||
+        host_mem.calls[0].method_name != "allocate" ||
+        host_mem.calls[1].method_name != "allocate" ||
+        manager.finalize_release_calls != 1)
+      `uvm_error("MR_DEREG_BORROWED_PBL1_CLEANUP",
+                 "PBL1 deregister released borrowed mapping authority")
+    status = host_mem.\release (mapping);
+    expect_status("MR_DEREG_BORROWED_PBL1_CALLER_MAP0", status,
+                  RDMA_SC_OK);
+    status = host_mem.\release (mapping2);
+    expect_status("MR_DEREG_BORROWED_PBL1_CALLER_MAP1", status,
+                  RDMA_SC_OK);
+    if (host_mem.live_allocations() != baseline_allocations)
+      `uvm_error("MR_DEREG_BORROWED_PBL1_CALLER_CLEANUP",
+                 "caller did not release both PBL1 mappings")
 
     setup_deregister_mr_case(
       "dereg_borrowed_pbl2", RDMA_MR_PBL2, RDMA_OWNERSHIP_BORROWED,
@@ -4353,6 +4424,7 @@ class rdma_control_plane_test extends uvm_test;
     rdma_hmc_fvm_addr_t hmc_address;
     rdma_hmc_fvm_addr_t fault_hmc_base;
     rdma_control_result result;
+    rdma_control_result recovery_result;
     rdma_recovery_record recovery;
     rdma_status injected_status;
     rdma_status status;
@@ -4398,6 +4470,60 @@ class rdma_control_plane_test extends uvm_test;
                             hmc_address);
     expect_status("MR_DEREG_OCC_FAILURE_CALLER_HMC_RELEASE", status,
                   RDMA_SC_OK);
+
+    setup_deregister_mr_case(
+      "dereg_occ_restore_failure", RDMA_MR_PBL2,
+      RDMA_OWNERSHIP_BORROWED, control, manager, mock_cmq, host_mem, hmc,
+      binding, pd, mr, mapping, hmc_address, baseline_allocations
+    );
+    injected_status = rdma_status::make(
+      RDMA_SC_UNKNOWN_HW_ERROR, "injected OCC explicit failure"
+    );
+    mock_cmq.fail_opcode(XTR_V1_OP_OCC_FLUSH, injected_status);
+    injected_status = rdma_status::make(
+      RDMA_SC_RESOURCE_BUSY, "injected OCC restore ACTIVE failure"
+    );
+    manager.fail_next_restore_active(injected_status);
+    control.deregister_mr(binding, mr.handle, result);
+    expect_recovery_result("MR_DEREG_OCC_RESTORE_FAILURE", result,
+                           RDMA_SC_UNKNOWN_HW_ERROR);
+    status = manager.lookup(mr.handle, resource);
+    expect_status("MR_DEREG_OCC_RESTORE_LOOKUP", status, RDMA_SC_OK);
+    live_mr = null;
+    void'($cast(live_mr, resource));
+    status = manager.lookup_recovery(mr.handle, recovery);
+    expect_status("MR_DEREG_OCC_RESTORE_RECOVERY", status, RDMA_SC_OK);
+    expected_opcodes.delete();
+    expected_opcodes.push_back(XTR_V1_OP_OCC_FLUSH);
+    expect_cmq_opcodes("MR_DEREG_OCC_RESTORE_ORDER", mock_cmq,
+                       expected_opcodes);
+    if (live_mr == null || live_mr.state != RDMA_RESOURCE_ERROR ||
+        result.rollback_statuses.size() != 1 ||
+        result.rollback_statuses[0] == null ||
+        result.rollback_statuses[0].code != RDMA_SC_RESOURCE_BUSY ||
+        recovery == null ||
+        recovery.hardware_presence != RDMA_HW_PRESENCE_PRESENT ||
+        recovery.completed_steps.size() != 0 ||
+        recovery.pending_steps.size() != 1 ||
+        recovery.pending_steps[0] != RDMA_CTRL_STEP_HW_OCC_FLUSHED ||
+        recovery.ambiguous_ticket != null ||
+        recovery.rollback_statuses.size() != 1 ||
+        recovery.rollback_statuses[0] == null ||
+        recovery.rollback_statuses[0].code != RDMA_SC_RESOURCE_BUSY ||
+        manager.restore_active_calls != 1 ||
+        manager.mark_error_calls != 1 ||
+        manager.finalize_release_calls != 0 ||
+        host_mem.live_allocations() != baseline_allocations + 1)
+      `uvm_error("MR_DEREG_OCC_RESTORE_STATE",
+                 "failed OCC restore lost actionable PRESENT recovery")
+    status = hmc.lookup(binding.make_handle(), RDMA_RESOURCE_MR,
+                        hmc_address, lease_size);
+    expect_status("MR_DEREG_OCC_RESTORE_HMC", status, RDMA_SC_OK);
+    status = host_mem.\release (mapping);
+    expect_status("MR_DEREG_OCC_RESTORE_MAP_RELEASE", status, RDMA_SC_OK);
+    status = hmc.\release (binding.make_handle(), RDMA_RESOURCE_MR,
+                            hmc_address);
+    expect_status("MR_DEREG_OCC_RESTORE_HMC_RELEASE", status, RDMA_SC_OK);
 
     setup_deregister_mr_case(
       "dereg_occ_timeout", RDMA_MR_PBL2, RDMA_OWNERSHIP_BORROWED,
@@ -4457,6 +4583,65 @@ class rdma_control_plane_test extends uvm_test;
                  "explicit MR_DEREGISTER failure did not restore ACTIVE")
     status = host_mem.\release (mapping);
     expect_status("MR_DEREG_COMMAND_FAILURE_CALLER_RELEASE", status,
+                  RDMA_SC_OK);
+
+    setup_deregister_mr_case(
+      "dereg_command_restore_failure", RDMA_MR_PBL2,
+      RDMA_OWNERSHIP_BORROWED, control, manager, mock_cmq, host_mem, hmc,
+      binding, pd, mr, mapping, hmc_address, baseline_allocations
+    );
+    injected_status = rdma_status::make(
+      RDMA_SC_UNKNOWN_HW_ERROR, "injected MR deregister explicit failure"
+    );
+    mock_cmq.fail_opcode(XTR_V1_OP_MR_DEREGISTER, injected_status);
+    injected_status = rdma_status::make(
+      RDMA_SC_RESOURCE_BUSY, "injected MR restore ACTIVE failure"
+    );
+    manager.fail_next_restore_active(injected_status);
+    control.deregister_mr(binding, mr.handle, result);
+    expect_recovery_result("MR_DEREG_COMMAND_RESTORE_FAILURE", result,
+                           RDMA_SC_UNKNOWN_HW_ERROR);
+    status = manager.lookup(mr.handle, resource);
+    expect_status("MR_DEREG_COMMAND_RESTORE_LOOKUP", status, RDMA_SC_OK);
+    live_mr = null;
+    void'($cast(live_mr, resource));
+    status = manager.lookup_recovery(mr.handle, recovery);
+    expect_status("MR_DEREG_COMMAND_RESTORE_RECOVERY", status, RDMA_SC_OK);
+    expected_opcodes.delete();
+    expected_opcodes.push_back(XTR_V1_OP_OCC_FLUSH);
+    expected_opcodes.push_back(XTR_V1_OP_MR_DEREGISTER);
+    expect_cmq_opcodes("MR_DEREG_COMMAND_RESTORE_ORDER", mock_cmq,
+                       expected_opcodes);
+    if (live_mr == null || live_mr.state != RDMA_RESOURCE_ERROR ||
+        result.rollback_statuses.size() != 1 ||
+        result.rollback_statuses[0] == null ||
+        result.rollback_statuses[0].code != RDMA_SC_RESOURCE_BUSY ||
+        recovery == null ||
+        recovery.hardware_presence != RDMA_HW_PRESENCE_PRESENT ||
+        recovery.completed_steps.size() != 1 ||
+        recovery.completed_steps[0] != RDMA_CTRL_STEP_HW_OCC_FLUSHED ||
+        recovery.pending_steps.size() != 1 ||
+        recovery.pending_steps[0] !=
+          RDMA_CTRL_STEP_HW_MR_DEREGISTERED ||
+        recovery.ambiguous_ticket != null ||
+        recovery.rollback_statuses.size() != 1 ||
+        recovery.rollback_statuses[0] == null ||
+        recovery.rollback_statuses[0].code != RDMA_SC_RESOURCE_BUSY ||
+        manager.restore_active_calls != 1 ||
+        manager.mark_error_calls != 1 ||
+        manager.finalize_release_calls != 0 ||
+        host_mem.live_allocations() != baseline_allocations + 1)
+      `uvm_error("MR_DEREG_COMMAND_RESTORE_STATE",
+                 "failed MR restore lost actionable PRESENT recovery")
+    status = hmc.lookup(binding.make_handle(), RDMA_RESOURCE_MR,
+                        hmc_address, lease_size);
+    expect_status("MR_DEREG_COMMAND_RESTORE_HMC", status, RDMA_SC_OK);
+    status = host_mem.\release (mapping);
+    expect_status("MR_DEREG_COMMAND_RESTORE_MAP_RELEASE", status,
+                  RDMA_SC_OK);
+    status = hmc.\release (binding.make_handle(), RDMA_RESOURCE_MR,
+                            hmc_address);
+    expect_status("MR_DEREG_COMMAND_RESTORE_HMC_RELEASE", status,
                   RDMA_SC_OK);
 
     setup_deregister_mr_case(
@@ -4587,6 +4772,43 @@ class rdma_control_plane_test extends uvm_test;
         manager.finalize_release_calls != 0)
       `uvm_error("MR_DEREG_OWNED_RELEASE_GATE",
                  "failed owned release reached finalize or lost recovery")
+    expected_opcodes.delete();
+    expected_opcodes.push_back(XTR_V1_OP_MR_DEREGISTER);
+    expected_opcodes.push_back(XTR_V1_OP_TQ_FLUSH);
+    expect_cmq_opcodes("MR_DEREG_OWNED_RECOVERY_BOUNDARY_ORDER", mock_cmq,
+                       expected_opcodes);
+    control.recover_resource(binding, mr.handle, recovery_result);
+    expect_result("MR_DEREG_OWNED_RECOVERY_BOUNDARY", recovery_result,
+                  RDMA_SC_UNSUPPORTED_OPCODE);
+    status = manager.lookup(mr.handle, resource);
+    expect_status("MR_DEREG_OWNED_RECOVERY_BOUNDARY_LOOKUP", status,
+                  RDMA_SC_OK);
+    live_mr = null;
+    void'($cast(live_mr, resource));
+    status = manager.lookup_recovery(mr.handle, recovery);
+    expect_status("MR_DEREG_OWNED_RECOVERY_BOUNDARY_RECORD", status,
+                  RDMA_SC_OK);
+    if (live_mr == null || live_mr.state != RDMA_RESOURCE_ERROR ||
+        recovery == null ||
+        recovery.hardware_presence != RDMA_HW_PRESENCE_ABSENT ||
+        recovery.completed_steps.size() != 2 ||
+        recovery.completed_steps[0] !=
+          RDMA_CTRL_STEP_HW_MR_DEREGISTERED ||
+        recovery.completed_steps[1] != RDMA_CTRL_STEP_HW_DRAINED ||
+        recovery.pending_steps.size() != 1 ||
+        recovery.pending_steps[0] != RDMA_CTRL_STEP_BACKING_RELEASED ||
+        recovery.backing_refs.size() != 1 ||
+        recovery.backing_refs[0] == null ||
+        recovery.backing_refs[0].release_complete ||
+        host_mem.live_allocations() != baseline_allocations + 1 ||
+        host_mem.calls.size() != 2 ||
+        host_mem.calls[0].method_name != "allocate" ||
+        host_mem.calls[1].method_name != "release" ||
+        mock_cmq.calls.size() != 2 ||
+        manager.restore_active_calls != 0 ||
+        manager.finalize_release_calls != 0)
+      `uvm_error("MR_DEREG_OWNED_RECOVERY_BOUNDARY_STATE",
+                 "Task 8 recovery consumed an active-origin MR record")
 
     setup_deregister_mr_case(
       "dereg_owned_hmc_release_failure", RDMA_MR_PBL2,
@@ -4684,6 +4906,40 @@ class rdma_control_plane_test extends uvm_test;
         manager.finalize_release_calls != 1)
       `uvm_error("MR_DEREG_FINALIZE_FAILURE_STATE",
                  "finalize failure did not retain ABSENT ERROR recovery")
+    expected_opcodes.delete();
+    expected_opcodes.push_back(XTR_V1_OP_MR_DEREGISTER);
+    expected_opcodes.push_back(XTR_V1_OP_TQ_FLUSH);
+    expect_cmq_opcodes("MR_DEREG_FINALIZE_BOUNDARY_ORDER", mock_cmq,
+                       expected_opcodes);
+    status = manager.complete_reserved_error(mr.handle);
+    expect_status("MR_DEREG_FINALIZE_MANAGER_BOUNDARY", status,
+                  RDMA_SC_INVALID_STATE);
+    status = manager.lookup(mr.handle, resource);
+    expect_status("MR_DEREG_FINALIZE_BOUNDARY_LOOKUP", status, RDMA_SC_OK);
+    live_mr = null;
+    void'($cast(live_mr, resource));
+    status = manager.lookup_recovery(mr.handle, recovery);
+    expect_status("MR_DEREG_FINALIZE_BOUNDARY_RECOVERY", status,
+                  RDMA_SC_OK);
+    if (live_mr == null || live_mr.state != RDMA_RESOURCE_ERROR ||
+        recovery == null ||
+        recovery.hardware_presence != RDMA_HW_PRESENCE_ABSENT ||
+        recovery.completed_steps.size() != 3 ||
+        recovery.completed_steps[0] !=
+          RDMA_CTRL_STEP_HW_MR_DEREGISTERED ||
+        recovery.completed_steps[1] != RDMA_CTRL_STEP_HW_DRAINED ||
+        recovery.completed_steps[2] != RDMA_CTRL_STEP_BACKING_RELEASED ||
+        recovery.pending_steps.size() != 1 ||
+        recovery.pending_steps[0] != RDMA_CTRL_STEP_RESOURCE_RELEASED ||
+        recovery.backing_refs.size() != 1 ||
+        recovery.backing_refs[0] == null ||
+        !recovery.backing_refs[0].release_complete ||
+        host_mem.live_allocations() != baseline_allocations ||
+        host_mem.calls.size() != 2 || mock_cmq.calls.size() != 2 ||
+        manager.restore_active_calls != 0 ||
+        manager.finalize_release_calls != 1)
+      `uvm_error("MR_DEREG_FINALIZE_BOUNDARY_STATE",
+                 "manager completed an active-origin MR recovery record")
   endtask
 
   task automatic check_transaction_id_exhaustion();

@@ -2893,6 +2893,15 @@ class rdma_resource_manager extends uvm_object;
         "resource is not a reserved ERROR MR"
       );
     recovery = recovery_records[key];
+    if (recovery != null) begin
+      foreach (recovery.completed_steps[i]) begin
+        if (rdma_control_step_is_hardware(recovery.completed_steps[i]))
+          return rdma_status::make(
+            RDMA_SC_INVALID_STATE,
+            "reserved ERROR completion rejects hardware history"
+          );
+      end
+    end
     if (recovery == null ||
         recovery.hardware_presence != RDMA_HW_PRESENCE_ABSENT ||
         recovery.ambiguous_ticket != null ||

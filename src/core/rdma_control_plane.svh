@@ -1256,7 +1256,7 @@ class rdma_control_plane extends uvm_object;
               );
               retain_mr_destroy_error(
                 mr_snapshot, primary_status, result,
-                RDMA_HW_PRESENCE_PRESENT, 1'b0,
+                RDMA_HW_PRESENCE_PRESENT, 1'b1,
                 RDMA_CTRL_STEP_HW_OCC_FLUSHED, null, result_finalized
               );
             end
@@ -1320,7 +1320,7 @@ class rdma_control_plane extends uvm_object;
             );
             retain_mr_destroy_error(
               mr_snapshot, primary_status, result,
-              RDMA_HW_PRESENCE_PRESENT, 1'b0,
+              RDMA_HW_PRESENCE_PRESENT, 1'b1,
               RDMA_CTRL_STEP_HW_MR_DEREGISTERED, null,
               result_finalized
             );
@@ -2335,6 +2335,20 @@ class rdma_control_plane extends uvm_object;
       status = checked_status(
         status, "reserved recovery record lookup returned null"
       );
+      if (!status.ok())
+        break;
+      if (recovery != null) begin
+        foreach (recovery.completed_steps[i]) begin
+          if (rdma_control_step_is_hardware(
+                recovery.completed_steps[i])) begin
+            status = rdma_status::make(
+              RDMA_SC_UNSUPPORTED_OPCODE,
+              "recovery with hardware history is not reserved-MR cleanup"
+            );
+            break;
+          end
+        end
+      end
       if (!status.ok())
         break;
       if (recovery == null ||
