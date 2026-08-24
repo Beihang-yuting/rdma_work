@@ -61,6 +61,7 @@ class rdma_request_model_test extends uvm_test;
     rdma_handle mismatched_h;
     rdma_create_pd_req create_pd;
     rdma_register_mr_req register_mr;
+    rdma_register_mr_req register_mr_clone;
     rdma_create_cq_req create_cq;
     rdma_create_srq_req create_srq;
     rdma_create_ceq_req create_ceq;
@@ -198,6 +199,9 @@ class rdma_request_model_test extends uvm_test;
     expect_status("CREATE_PD", create_pd.validate(), RDMA_SC_OK);
 
     register_mr = rdma_register_mr_req::type_id::create("register_mr");
+    if (register_mr.access != '0)
+      `uvm_error("REGISTER_MR_ACCESS_DEFAULT",
+                 "new register MR request access is not zero")
     register_mr.owner = function_h;
     register_mr.pd_h = pd_h;
     register_mr.iova.value = 64'h1111_0000;
@@ -207,8 +211,17 @@ class rdma_request_model_test extends uvm_test;
                            remote_atomic:1'b0};
     expect_status("REGISTER_MR", register_mr.validate(), RDMA_SC_OK);
     register_mr.access.remote_atomic = 1'b1;
-    if (!register_mr.access.remote_atomic)
-      `uvm_error("REGISTER_MR_ACCESS", "remote atomic access was lost")
+    cloned_object = register_mr.clone();
+    if (!$cast(register_mr_clone, cloned_object))
+      `uvm_error("REGISTER_MR_ACCESS_COPY",
+                 "register MR clone lost dynamic type")
+    else if (!register_mr_clone.access.remote_atomic)
+      `uvm_error("REGISTER_MR_ACCESS_COPY",
+                 "register MR clone lost remote atomic access")
+    else if (register_mr_clone.access != register_mr.access)
+      `uvm_error("REGISTER_MR_ACCESS_COPY",
+                 $sformatf("register MR clone changed access from 0x%0h to 0x%0h",
+                           register_mr.access, register_mr_clone.access))
     register_mr.owner = null;
     expect_status("REGISTER_MR_OWNER", register_mr.validate(),
                   RDMA_SC_INVALID_ARGUMENT);
