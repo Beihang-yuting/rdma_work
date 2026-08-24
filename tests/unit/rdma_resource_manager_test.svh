@@ -1050,6 +1050,15 @@ class rdma_rm_unregistered_mapping extends rdma_dma_mapping;
   endfunction
 endclass
 
+// Inherits the built-in wrapper and clone implementation without changing any
+// source or public mapping value.  Its clone therefore collapses to the base
+// rdma_dma_mapping type unless the owned-capability boundary rejects it.
+class rdma_rm_stable_unregistered_mapping extends rdma_dma_mapping;
+  function new(string name = "rdma_rm_stable_unregistered_mapping");
+    super.new(name);
+  endfunction
+endclass
+
 class rdma_rm_lying_mapping extends rdma_dma_mapping;
   typedef uvm_object_registry#(rdma_rm_lying_mapping,
                                "rdma_rm_lying_mapping") type_id;
@@ -1332,6 +1341,9 @@ class rdma_resource_manager_test extends uvm_test;
     rdma_rm_owned_alias_mapping alias_mapping;
     rdma_rm_owned_drift_mapping drift_mapping;
     rdma_rm_unregistered_mapping unregistered_mapping;
+    rdma_rm_stable_unregistered_mapping stable_unregistered_mapping;
+    rdma_dma_mapping base_mapping;
+    string mapping_labels[$];
     rdma_backing_ref backing_ref;
 
     contract_rm = rdma_resource_manager::type_id::create(
@@ -1354,12 +1366,22 @@ class rdma_resource_manager_test extends uvm_test;
       "owned_alias_mapping"
     );
     mappings.push_back(alias_mapping);
+    mapping_labels.push_back("ALIAS");
     drift_mapping = rdma_rm_owned_drift_mapping::type_id::create(
       "owned_drift_mapping"
     );
     mappings.push_back(drift_mapping);
+    mapping_labels.push_back("DRIFT");
     unregistered_mapping = new("owned_unregistered_mapping");
     mappings.push_back(unregistered_mapping);
+    mapping_labels.push_back("MUTATING_UNREGISTERED");
+    stable_unregistered_mapping =
+      new("owned_stable_unregistered_mapping");
+    mappings.push_back(stable_unregistered_mapping);
+    mapping_labels.push_back("STABLE_UNREGISTERED");
+    base_mapping = rdma_dma_mapping::type_id::create("owned_base_mapping");
+    mappings.push_back(base_mapping);
+    mapping_labels.push_back("EXACT_BASE");
 
     foreach (mappings[i]) begin
       mappings[i].function_h = contract_binding.make_handle();
@@ -1376,23 +1398,23 @@ class rdma_resource_manager_test extends uvm_test;
       mappings[i].owner_h = null;
 
       expect_status(
-        $sformatf("OWNED_CLONE_CONTRACT_CREATE_%0d", i),
+        {"OWNED_CLONE_CONTRACT_CREATE_", mapping_labels[i]},
         contract_rm.create_mr(contract_binding, contract_pd.handle, candidate),
         RDMA_SC_OK
       );
       prepare_mr(candidate, mappings[i].iova.value);
       backing_ref = rdma_backing_ref::type_id::create(
-        $sformatf("owned_clone_contract_ref_%0d", i)
+        {"owned_clone_contract_ref_", mapping_labels[i]}
       );
       backing_ref.mapping = mappings[i];
       backing_ref.ownership = RDMA_OWNERSHIP_CONTROL_PLANE;
       candidate.backing_refs.push_back(backing_ref);
       expect_status(
-        $sformatf("OWNED_CLONE_CONTRACT_REJECT_%0d", i),
+        {"OWNED_CLONE_CONTRACT_REJECT_", mapping_labels[i]},
         contract_rm.stage_allocated(candidate), RDMA_SC_INVALID_ARGUMENT
       );
       expect_status(
-        $sformatf("OWNED_CLONE_CONTRACT_LOOKUP_%0d", i),
+        {"OWNED_CLONE_CONTRACT_LOOKUP_", mapping_labels[i]},
         contract_rm.lookup(candidate.handle, resource), RDMA_SC_OK
       );
       if (resource == null || resource.state != RDMA_RESOURCE_ALLOCATED ||

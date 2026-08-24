@@ -258,10 +258,11 @@ class rdma_resource_manager extends uvm_object;
     if (!status.ok())
       return status;
     source_type = source.get_object_type();
-    if (source_type == null)
+    if (source_type == null ||
+        source_type == rdma_dma_mapping::get_type())
       return rdma_status::make(
         RDMA_SC_INVALID_ARGUMENT,
-        {copy_label, " owned mapping type is not registered"}
+        {copy_label, " owned mapping type is not a registered subtype"}
       );
     cloned_object = source.clone();
     if (cloned_object == null || !$cast(result, cloned_object) ||
