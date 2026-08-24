@@ -78,6 +78,7 @@ class rdma_request_model_test extends uvm_test;
     rdma_function function_resource;
     rdma_pd pd_resource;
     rdma_mr mr_resource;
+    rdma_mr mr_resource_clone;
     rdma_cq cq_resource;
     rdma_cq cq_resource_clone;
     rdma_qp qp_resource;
@@ -87,6 +88,8 @@ class rdma_request_model_test extends uvm_test;
     rdma_aeq aeq_resource;
     rdma_cmq cmq_resource;
     rdma_dma_mapping mapping;
+    rdma_backing_ref backing_ref;
+    rdma_hmc_ref hmc_ref;
     rdma_qpc_model qpc;
     rdma_qpc_model qpc_clone;
     rdma_qpc_rc_ext rc_ext;
@@ -560,12 +563,105 @@ class rdma_request_model_test extends uvm_test;
                   RDMA_SC_INVALID_ARGUMENT);
     function_h.kind = RDMA_RESOURCE_FUNCTION;
 
+    if (mr_resource.access != '0 || mr_resource.mr_serial != '0)
+      `uvm_error("MR_RESOURCE_DEFAULT", "MR access or serial default is nonzero")
     mr_resource.handle = mr_h;
     mr_resource.owner = function_h;
     mr_resource.state = RDMA_RESOURCE_PROGRAMMED;
     mr_resource.pd_h = pd_h;
     mr_resource.length = 64'h1000;
+    mr_resource.local_mr_id = 24'h12_3456;
+    mr_resource.lkey = 32'h1234_56a5;
+    mr_resource.rkey = 0;
+    mr_resource.access.local_write = 1'b1;
+    mr_resource.mr_serial = 12'habc;
     expect_status("MR_RESOURCE", mr_resource.validate(), RDMA_SC_OK);
+    mr_resource.state = RDMA_RESOURCE_ACTIVE;
+    expect_status("MR_RESOURCE_ACTIVE_KEY", mr_resource.validate(),
+                  RDMA_SC_OK);
+    mr_resource.state = RDMA_RESOURCE_QUIESCING;
+    expect_status("MR_RESOURCE_QUIESCING_KEY", mr_resource.validate(),
+                  RDMA_SC_OK);
+    mr_resource.state = RDMA_RESOURCE_ERROR;
+    expect_status("MR_RESOURCE_ERROR_KEY", mr_resource.validate(),
+                  RDMA_SC_OK);
+    mr_resource.local_mr_id++;
+    mr_resource.state = RDMA_RESOURCE_PROGRAMMED;
+    expect_status("MR_RESOURCE_PROGRAMMED_INDEX", mr_resource.validate(),
+                  RDMA_SC_INVALID_ARGUMENT);
+    mr_resource.state = RDMA_RESOURCE_ACTIVE;
+    expect_status("MR_RESOURCE_ACTIVE_INDEX", mr_resource.validate(),
+                  RDMA_SC_INVALID_ARGUMENT);
+    mr_resource.state = RDMA_RESOURCE_QUIESCING;
+    expect_status("MR_RESOURCE_QUIESCING_INDEX", mr_resource.validate(),
+                  RDMA_SC_INVALID_ARGUMENT);
+    mr_resource.state = RDMA_RESOURCE_ERROR;
+    expect_status("MR_RESOURCE_ERROR_INDEX", mr_resource.validate(),
+                  RDMA_SC_INVALID_ARGUMENT);
+    mr_resource.local_mr_id = 32'h0112_3456;
+    expect_status("MR_RESOURCE_INDEX_WIDTH", mr_resource.validate(),
+                  RDMA_SC_INVALID_ARGUMENT);
+    mr_resource.local_mr_id = 24'h12_3456;
+    mr_resource.state = RDMA_RESOURCE_PROGRAMMED;
+    mr_resource.access.remote_read = 1'b1;
+    expect_status("MR_RESOURCE_REMOTE_RKEY", mr_resource.validate(),
+                  RDMA_SC_INVALID_ARGUMENT);
+    mr_resource.state = RDMA_RESOURCE_ACTIVE;
+    expect_status("MR_RESOURCE_ACTIVE_REMOTE_RKEY", mr_resource.validate(),
+                  RDMA_SC_INVALID_ARGUMENT);
+    mr_resource.state = RDMA_RESOURCE_QUIESCING;
+    expect_status("MR_RESOURCE_QUIESCING_REMOTE_RKEY",
+                  mr_resource.validate(), RDMA_SC_INVALID_ARGUMENT);
+    mr_resource.state = RDMA_RESOURCE_ERROR;
+    expect_status("MR_RESOURCE_ERROR_REMOTE_RKEY", mr_resource.validate(),
+                  RDMA_SC_INVALID_ARGUMENT);
+    mr_resource.state = RDMA_RESOURCE_PROGRAMMED;
+    mr_resource.rkey = mr_resource.lkey;
+    expect_status("MR_RESOURCE_REMOTE_RKEY_MATCH", mr_resource.validate(),
+                  RDMA_SC_OK);
+    mr_resource.access.remote_read = 1'b0;
+    mr_resource.access.remote_write = 1'b1;
+    mr_resource.rkey = 0;
+    expect_status("MR_RESOURCE_REMOTE_WRITE_RKEY", mr_resource.validate(),
+                  RDMA_SC_INVALID_ARGUMENT);
+    mr_resource.access.remote_write = 1'b0;
+    mr_resource.access.remote_atomic = 1'b1;
+    expect_status("MR_RESOURCE_REMOTE_ATOMIC_RKEY", mr_resource.validate(),
+                  RDMA_SC_INVALID_ARGUMENT);
+    mr_resource.access.remote_atomic = 1'b0;
+    mr_resource.access.memory_window_bind = 1'b1;
+    mr_resource.rkey = 32'hffff_ffff;
+    expect_status("MR_RESOURCE_LOCAL_RKEY", mr_resource.validate(),
+                  RDMA_SC_INVALID_ARGUMENT);
+    mr_resource.state = RDMA_RESOURCE_ACTIVE;
+    expect_status("MR_RESOURCE_ACTIVE_LOCAL_RKEY", mr_resource.validate(),
+                  RDMA_SC_INVALID_ARGUMENT);
+    mr_resource.state = RDMA_RESOURCE_QUIESCING;
+    expect_status("MR_RESOURCE_QUIESCING_LOCAL_RKEY",
+                  mr_resource.validate(), RDMA_SC_INVALID_ARGUMENT);
+    mr_resource.state = RDMA_RESOURCE_ERROR;
+    expect_status("MR_RESOURCE_ERROR_LOCAL_RKEY", mr_resource.validate(),
+                  RDMA_SC_INVALID_ARGUMENT);
+    mr_resource.state = RDMA_RESOURCE_PROGRAMMED;
+    mr_resource.rkey = mr_resource.lkey;
+    expect_status("MR_RESOURCE_LOCAL_MATCHING_RKEY", mr_resource.validate(),
+                  RDMA_SC_OK);
+    mr_resource.rkey = 0;
+    expect_status("MR_RESOURCE_LOCAL_ZERO_RKEY", mr_resource.validate(),
+                  RDMA_SC_OK);
+    cloned_object = mr_resource.clone();
+    if (!$cast(mr_resource_clone, cloned_object))
+      `uvm_error("MR_RESOURCE_COPY", "MR clone lost dynamic type")
+    else if (mr_resource_clone.handle == null ||
+             mr_resource_clone.pd_h == null ||
+             mr_resource_clone.handle == mr_resource.handle ||
+             mr_resource_clone.pd_h == mr_resource.pd_h ||
+             mr_resource_clone.access != mr_resource.access ||
+             mr_resource_clone.mr_serial != 12'habc ||
+             mr_resource_clone.local_mr_id != 24'h12_3456 ||
+             mr_resource_clone.lkey != 32'h1234_56a5 ||
+             mr_resource_clone.rkey != 0)
+      `uvm_error("MR_RESOURCE_COPY", "MR clone lost or aliased state")
     mismatched_h = make_handle("mr_resource_cross_pd_h", RDMA_RESOURCE_PD,
                                32'h909);
     mismatched_h.function_uid++;
@@ -692,7 +788,18 @@ class rdma_request_model_test extends uvm_test;
     mapping.iova.value = 64'h5000_0000;
     mapping.size = 64'h2000;
     mapping.state = RDMA_MAPPING_ACTIVE;
-    qp_resource.backing_mappings.push_back(mapping);
+    backing_ref = rdma_backing_ref::type_id::create("backing_ref");
+    backing_ref.mapping = mapping;
+    backing_ref.ownership = RDMA_OWNERSHIP_CONTROL_PLANE;
+    qp_resource.backing_refs.push_back(backing_ref);
+    hmc_ref = rdma_hmc_ref::type_id::create("hmc_ref");
+    hmc_ref.owner = function_h;
+    hmc_ref.object_kind = RDMA_RESOURCE_MR;
+    hmc_ref.address.value = 64'h6000_0000;
+    hmc_ref.size = 64'h1000;
+    hmc_ref.first_pbl_index = 32'h80;
+    hmc_ref.ownership = RDMA_OWNERSHIP_CONTROL_PLANE;
+    qp_resource.hmc_refs.push_back(hmc_ref);
     expect_status("QP_RESOURCE", qp_resource.validate(), RDMA_SC_OK);
     qp_resource.srq_h = srq_h;
     expect_status("QP_RESOURCE_SRQ", qp_resource.validate(), RDMA_SC_OK);
@@ -718,17 +825,30 @@ class rdma_request_model_test extends uvm_test;
              qp_resource_clone.pd_h == null ||
              qp_resource_clone.send_cq_h == null ||
              qp_resource_clone.recv_cq_h == null ||
-             qp_resource_clone.backing_mappings.size() != 1 ||
+             qp_resource_clone.backing_refs.size() != 1 ||
+             qp_resource_clone.hmc_refs.size() != 1 ||
              qp_resource_clone.dependencies.size() != 1 ||
              qp_resource_clone.outstanding_ids.size() != 1)
       `uvm_error("RESOURCE_CLONE", "QP clone lost nested objects")
-    else if (qp_resource_clone.backing_mappings[0] == null ||
+    else if (qp_resource_clone.backing_refs[0] == null ||
+             qp_resource_clone.backing_refs[0].mapping == null ||
+             qp_resource_clone.hmc_refs[0] == null ||
+             qp_resource_clone.hmc_refs[0].owner == null ||
              qp_resource_clone.dependencies[0] == null)
       `uvm_error("RESOURCE_CLONE", "QP clone contains a null nested object")
     else if (qp_resource_clone.handle == qp_resource.handle ||
              qp_resource_clone.owner == qp_resource.owner ||
-             qp_resource_clone.backing_mappings[0] ==
-               qp_resource.backing_mappings[0] ||
+             qp_resource_clone.backing_refs[0] ==
+               qp_resource.backing_refs[0] ||
+             qp_resource_clone.backing_refs[0].mapping ==
+               qp_resource.backing_refs[0].mapping ||
+             qp_resource_clone.backing_refs[0].mapping.function_h ==
+               qp_resource.backing_refs[0].mapping.function_h ||
+             qp_resource_clone.backing_refs[0].mapping.owner_h ==
+               qp_resource.backing_refs[0].mapping.owner_h ||
+             qp_resource_clone.hmc_refs[0] == qp_resource.hmc_refs[0] ||
+             qp_resource_clone.hmc_refs[0].owner ==
+               qp_resource.hmc_refs[0].owner ||
              qp_resource_clone.dependencies[0] ==
                qp_resource.dependencies[0] ||
              qp_resource_clone.pd_h == qp_resource.pd_h ||
@@ -756,13 +876,29 @@ class rdma_request_model_test extends uvm_test;
     else begin
       qp_resource_clone.handle.object_id++;
       qp_resource_clone.owner.function_uid++;
-      qp_resource_clone.backing_mappings[0].iova.value++;
+      qp_resource_clone.backing_refs[0].mapping.iova.value++;
+      qp_resource_clone.backing_refs[0].mapping.owner_h.object_id++;
+      qp_resource_clone.hmc_refs[0].owner.function_uid++;
       qp_resource_clone.dependencies[0].object_id++;
       if (qp_resource.handle.object_id != 32'h404 ||
           qp_resource.owner.function_uid != 64'h1234_5678_9abc_def0 ||
-          qp_resource.backing_mappings[0].iova.value != 64'h5000_0000 ||
+          qp_resource.backing_refs[0].mapping.iova.value !=
+            64'h5000_0000 ||
+          qp_resource.backing_refs[0].mapping.owner_h.object_id !=
+            32'h404 ||
+          qp_resource.hmc_refs[0].owner.function_uid !=
+            64'h1234_5678_9abc_def0 ||
           qp_resource.dependencies[0].object_id != 32'h101)
         `uvm_error("RESOURCE_CLONE", "QP clone mutation reached source")
+      qp_resource_clone.backing_refs.push_back(backing_ref);
+      qp_resource_clone.hmc_refs.push_back(hmc_ref);
+      qp_resource_clone.copy(qp_resource);
+      if (qp_resource_clone.backing_refs.size() != 1 ||
+          qp_resource_clone.hmc_refs.size() != 1 ||
+          qp_resource_clone.backing_refs[0] == backing_ref ||
+          qp_resource_clone.hmc_refs[0] == hmc_ref)
+        `uvm_error("RESOURCE_REF_REPLACE",
+                   "resource copy retained or aliased prior backing graph")
     end
 
     qp_resource.sq_producer_index = 32'h20;

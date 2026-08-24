@@ -19,6 +19,7 @@ package rdma_unit_test_pkg;
   `include "uvm_macros.svh"
 
   `include "rdma_mock_adapters.svh"
+  `include "mocks/rdma_mock_control_plane.svh"
   `include "support/rdma_xtr_v1_golden_reader.svh"
   `include "unit/rdma_smoke_test.svh"
   `include "unit/rdma_types_test.svh"

@@ -138,6 +138,9 @@ class rdma_control_plane_models_test extends uvm_test;
     rdma_backing_ref backing_ref_clone;
     rdma_hmc_ref hmc_ref;
     rdma_hmc_ref hmc_ref_clone;
+    rdma_mr mr_resource;
+    rdma_incarnation_stag_key_policy policy;
+    rdma_mock_stag_key_policy mock_policy;
     rdma_mr_backing_desc descriptor;
     rdma_mr_backing_desc descriptor_clone;
     rdma_control_result result;
@@ -152,6 +155,9 @@ class rdma_control_plane_models_test extends uvm_test;
     rdma_backing_ref saved_backing_ref;
     rdma_hmc_ref saved_hmc_ref;
     rdma_handle saved_resource_h;
+    rdma_status status;
+    bit [7:0] stag_key;
+    bit [7:0] first_stag_key;
     uvm_object cloned_object;
 
     phase.raise_objection(this);
@@ -164,6 +170,50 @@ class rdma_control_plane_models_test extends uvm_test;
     backing_ref = make_backing_ref("backing_ref", mapping);
     backing_ref2 = make_backing_ref("backing_ref2", mapping2);
     hmc_ref = make_hmc_ref("hmc_ref", function_h, 32'h80);
+
+    policy = rdma_incarnation_stag_key_policy::type_id::create("policy");
+    stag_key = 8'hff;
+    status = policy.derive(null, stag_key);
+    expect_status("STAG_KEY_NULL", status, RDMA_SC_INVALID_ARGUMENT);
+    if (stag_key != 0)
+      `uvm_error("STAG_KEY_NULL", "invalid policy input retained a key")
+    mr_resource = rdma_mr::type_id::create("mr_resource");
+    stag_key = 8'hff;
+    status = policy.derive(mr_resource, stag_key);
+    expect_status("STAG_KEY_NULL_HANDLE", status, RDMA_SC_INVALID_ARGUMENT);
+    if (stag_key != 0)
+      `uvm_error("STAG_KEY_NULL_HANDLE",
+                 "null-handle policy input retained a key")
+    mr_resource.handle = make_resource("wrong_kind_h", RDMA_RESOURCE_PD);
+    stag_key = 8'hff;
+    status = policy.derive(mr_resource, stag_key);
+    expect_status("STAG_KEY_KIND", status, RDMA_SC_INVALID_ARGUMENT);
+    if (stag_key != 0)
+      `uvm_error("STAG_KEY_KIND", "wrong-kind policy input retained a key")
+    mr_resource.handle.kind = RDMA_RESOURCE_MR;
+    mr_resource.handle.object_id = 32'hca11_345a;
+    status = policy.derive(mr_resource, stag_key);
+    expect_status("STAG_KEY", status, RDMA_SC_OK);
+    if (stag_key != mr_resource.handle.object_id[7:0])
+      `uvm_error("STAG_KEY", "default key is not incarnation-derived")
+    first_stag_key = stag_key;
+    mr_resource.handle.object_id++;
+    status = policy.derive(mr_resource, stag_key);
+    expect_status("STAG_KEY_NEXT", status, RDMA_SC_OK);
+    if (stag_key != mr_resource.handle.object_id[7:0] ||
+        stag_key == first_stag_key)
+      `uvm_error("STAG_KEY_NEXT",
+                 "adjacent incarnation did not derive a distinct key")
+
+    mock_policy = rdma_mock_stag_key_policy::type_id::create("mock_policy");
+    mock_policy.fixed_key = 8'hc3;
+    status = mock_policy.derive(mr_resource, stag_key);
+    expect_status("STAG_KEY_MOCK", status, RDMA_SC_OK);
+    status = mock_policy.derive(null, stag_key);
+    expect_status("STAG_KEY_MOCK_REPEAT", status, RDMA_SC_OK);
+    if (stag_key != 8'hc3 || mock_policy.call_count != 2)
+      `uvm_error("STAG_KEY_MOCK",
+                 "mock did not return its fixed key or record calls")
 
     expect_status("BACKING_REF", backing_ref.validate(), RDMA_SC_OK);
     cloned_object = backing_ref.clone();

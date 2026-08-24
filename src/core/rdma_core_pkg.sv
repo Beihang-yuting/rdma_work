@@ -6,6 +6,7 @@ package rdma_core_pkg;
   import rdma_codec_pkg::*;
   `include "uvm_macros.svh"
 
+  `include "rdma_stag_key_policy.svh"
   `include "rdma_hmc_allocator.svh"
   `include "rdma_resource_manager.svh"
   `include "rdma_doorbell_scheduler.svh"

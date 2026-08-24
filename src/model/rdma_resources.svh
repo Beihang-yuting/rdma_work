@@ -45,7 +45,8 @@ class rdma_resource extends uvm_object;
   rdma_handle handle;
   rdma_function_handle owner;
   rdma_resource_state_e state;
-  rdma_dma_mapping backing_mappings[$];
+  rdma_backing_ref backing_refs[$];
+  rdma_hmc_ref hmc_refs[$];
   rdma_handle dependencies[$];
   longint unsigned outstanding_ids[$];
   rdma_hmc_fvm_addr_t hmc_fvm_addr;
@@ -67,7 +68,8 @@ class rdma_resource extends uvm_object;
   virtual function void do_copy(uvm_object rhs);
     rdma_resource rhs_resource;
     uvm_object cloned_object;
-    rdma_dma_mapping cloned_mapping;
+    rdma_backing_ref cloned_backing_ref;
+    rdma_hmc_ref cloned_hmc_ref;
     rdma_handle cloned_handle;
 
     super.do_copy(rhs);
@@ -78,16 +80,29 @@ class rdma_resource extends uvm_object;
     state = rhs_resource.state;
     hmc_fvm_addr = rhs_resource.hmc_fvm_addr;
     hmc_fvm_addr_valid = rhs_resource.hmc_fvm_addr_valid;
-    backing_mappings.delete();
-    foreach (rhs_resource.backing_mappings[i]) begin
-      if (rhs_resource.backing_mappings[i] == null) begin
-        backing_mappings.push_back(null);
+    backing_refs.delete();
+    foreach (rhs_resource.backing_refs[i]) begin
+      if (rhs_resource.backing_refs[i] == null) begin
+        backing_refs.push_back(null);
       end
       else begin
-        cloned_object = rhs_resource.backing_mappings[i].clone();
-        if (cloned_object == null || !$cast(cloned_mapping, cloned_object))
-          `uvm_fatal("RDMA_COPY_TYPE", "DMA mapping clone type mismatch")
-        backing_mappings.push_back(cloned_mapping);
+        cloned_object = rhs_resource.backing_refs[i].clone();
+        if (cloned_object == null ||
+            !$cast(cloned_backing_ref, cloned_object))
+          `uvm_fatal("RDMA_COPY_TYPE", "backing reference clone mismatch")
+        backing_refs.push_back(cloned_backing_ref);
+      end
+    end
+    hmc_refs.delete();
+    foreach (rhs_resource.hmc_refs[i]) begin
+      if (rhs_resource.hmc_refs[i] == null) begin
+        hmc_refs.push_back(null);
+      end
+      else begin
+        cloned_object = rhs_resource.hmc_refs[i].clone();
+        if (cloned_object == null || !$cast(cloned_hmc_ref, cloned_object))
+          `uvm_fatal("RDMA_COPY_TYPE", "HMC reference clone mismatch")
+        hmc_refs.push_back(cloned_hmc_ref);
       end
     end
     dependencies.delete();
@@ -275,7 +290,8 @@ class rdma_mr extends rdma_resource;
   longint unsigned length;
   bit [31:0] lkey;
   bit [31:0] rkey;
-  rdma_dma_permission_t permissions;
+  rdma_rdma_access_t access;
+  bit [11:0] mr_serial;
 
   function new(string name = "rdma_mr");
     super.new(name);
@@ -286,7 +302,8 @@ class rdma_mr extends rdma_resource;
     length = '0;
     lkey = '0;
     rkey = '0;
-    permissions = '0;
+    access = '0;
+    mr_serial = '0;
   endfunction
 
   virtual function rdma_resource_kind_e resource_kind();
@@ -306,11 +323,13 @@ class rdma_mr extends rdma_resource;
     length = rhs_mr.length;
     lkey = rhs_mr.lkey;
     rkey = rhs_mr.rkey;
-    permissions = rhs_mr.permissions;
+    access = rhs_mr.access;
+    mr_serial = rhs_mr.mr_serial;
   endfunction
 
   virtual function rdma_status validate();
     rdma_status status;
+    bit has_remote_access;
 
     status = super.validate();
     if (!status.ok())
@@ -325,6 +344,18 @@ class rdma_mr extends rdma_resource;
       if (length == 0)
         return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                  "MR length is zero");
+    end
+    if (state inside {RDMA_RESOURCE_PROGRAMMED, RDMA_RESOURCE_ACTIVE,
+                      RDMA_RESOURCE_QUIESCING, RDMA_RESOURCE_ERROR}) begin
+      if (local_mr_id != {8'b0, lkey[31:8]})
+        return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                                 "MR local ID does not match lkey index");
+      has_remote_access = access.remote_read || access.remote_write ||
+                          access.remote_atomic;
+      if ((has_remote_access && rkey != lkey) ||
+          (!has_remote_access && !(rkey == 0 || rkey == lkey)))
+        return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                                 "MR lkey and rkey are inconsistent");
     end
     return rdma_status::success();
   endfunction
