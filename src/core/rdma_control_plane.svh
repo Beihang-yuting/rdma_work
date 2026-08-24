@@ -72,6 +72,39 @@ class rdma_control_plane extends uvm_object;
     return result;
   endfunction
 
+  protected function void cleanup_activated_pd(
+    rdma_handle pd_h,
+    rdma_control_result result
+  );
+    rdma_status cleanup_status;
+
+    cleanup_status = manager.begin_quiesce(pd_h);
+    cleanup_status = checked_status(
+      cleanup_status, "active PD cleanup quiesce returned null"
+    );
+    if (!cleanup_status.ok()) begin
+      result.rollback_statuses.push_back(
+        rdma_cmq_clone_status_value(cleanup_status)
+      );
+      return;
+    end
+    result.final_resource_state = RDMA_RESOURCE_QUIESCING;
+    result.final_resource_state_known = 1'b1;
+
+    cleanup_status = manager.finalize_release(pd_h);
+    cleanup_status = checked_status(
+      cleanup_status, "active PD cleanup release returned null"
+    );
+    if (!cleanup_status.ok()) begin
+      result.rollback_statuses.push_back(
+        rdma_cmq_clone_status_value(cleanup_status)
+      );
+      return;
+    end
+    result.final_resource_state = RDMA_RESOURCE_RELEASED;
+    result.completed_steps.push_back(RDMA_CTRL_STEP_RESOURCE_RELEASED);
+  endfunction
+
   protected function void finish_result(
     rdma_control_result result,
     rdma_status operation_status
@@ -252,6 +285,7 @@ class rdma_control_plane extends uvm_object;
     output rdma_control_result result
   );
     rdma_function_handle owner;
+    rdma_function_handle locked_owner;
     rdma_pd reserved_pd;
     rdma_resource active_resource;
     rdma_status status;
@@ -293,6 +327,29 @@ class rdma_control_plane extends uvm_object;
       end
 
       acquire_function_lock(owner, function_lock);
+      status = binding_owner_status(binding, locked_owner);
+      if (status == null || !status.ok()) begin
+        status = checked_status(
+          status, "post-lock Function binding check returned null"
+        );
+        break;
+      end
+      status = same_owner_status(
+        locked_owner, owner, "post-lock create PD binding"
+      );
+      if (status == null || !status.ok()) begin
+        status = checked_status(
+          status, "post-lock Function identity check returned null"
+        );
+        break;
+      end
+      status = request_status(request, locked_owner);
+      if (status == null || !status.ok()) begin
+        status = checked_status(
+          status, "post-lock create PD request check returned null"
+        );
+        break;
+      end
       status = manager.create_pd(binding, reserved_pd);
       if (status == null || !status.ok()) begin
         status = checked_status(status,
@@ -307,12 +364,14 @@ class rdma_control_plane extends uvm_object;
         if (reserved_pd != null && reserved_pd.handle != null) begin
           result.resource_h = snapshot_handle(reserved_pd.handle);
           result.final_resource_state = RDMA_RESOURCE_ALLOCATED;
+          result.final_resource_state_known = 1'b1;
           rollback_status = manager.release_reserved(reserved_pd.handle);
           rollback_status = checked_status(
             rollback_status, "PD reservation rollback returned null"
           );
-          if (rollback_status.ok())
+          if (rollback_status.ok()) begin
             result.final_resource_state = RDMA_RESOURCE_RELEASED;
+          end
           else
             result.rollback_statuses.push_back(
               rdma_cmq_clone_status_value(rollback_status)
@@ -322,6 +381,7 @@ class rdma_control_plane extends uvm_object;
       end
       result.resource_h = snapshot_handle(reserved_pd.handle);
       result.final_resource_state = RDMA_RESOURCE_ALLOCATED;
+      result.final_resource_state_known = 1'b1;
       result.completed_steps.push_back(RDMA_CTRL_STEP_RESOURCE_RESERVED);
 
       status = manager.activate(reserved_pd.handle);
@@ -343,6 +403,7 @@ class rdma_control_plane extends uvm_object;
         break;
       end
       result.final_resource_state = RDMA_RESOURCE_ACTIVE;
+      result.final_resource_state_known = 1'b1;
       result.completed_steps.push_back(RDMA_CTRL_STEP_REGISTRY_ACTIVE);
 
       status = manager.lookup(reserved_pd.handle, active_resource);
@@ -350,6 +411,7 @@ class rdma_control_plane extends uvm_object;
         status = checked_status(
           status, "resource manager active PD lookup returned null"
         );
+        cleanup_activated_pd(reserved_pd.handle, result);
         break;
       end
       if (!$cast(pd, active_resource) || pd == null || pd.handle == null ||
@@ -358,6 +420,7 @@ class rdma_control_plane extends uvm_object;
         status = invalid_state(
           "resource manager active PD snapshot is invalid"
         );
+        cleanup_activated_pd(reserved_pd.handle, result);
         break;
       end
       result.resource_h = snapshot_handle(pd.handle);
@@ -428,6 +491,7 @@ class rdma_control_plane extends uvm_object;
       end
       result.resource_h = snapshot_handle(pd_snapshot.handle);
       result.final_resource_state = pd_snapshot.state;
+      result.final_resource_state_known = 1'b1;
       status = same_owner_status(pd_snapshot.owner, owner, "destroy PD");
       if (status == null || !status.ok()) begin
         status = checked_status(status,

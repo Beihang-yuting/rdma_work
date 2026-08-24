@@ -384,6 +384,14 @@ class rdma_control_plane_models_test extends uvm_test;
     result.transaction_id = 64'h100;
     result.status = rdma_status::success("registered");
     result.primary_status = rdma_status::success("registered");
+    expect_status("RESULT_UNKNOWN_DEFAULT", result.validate(), RDMA_SC_OK);
+    if (result.final_resource_state_known)
+      `uvm_error("RESULT_UNKNOWN_DEFAULT",
+                 "new control result claims a known final state")
+    result.final_resource_state = RDMA_RESOURCE_ACTIVE;
+    expect_status("RESULT_UNKNOWN_NONCANONICAL", result.validate(),
+                  RDMA_SC_INVALID_STATE);
+    result.final_resource_state = RDMA_RESOURCE_NEW;
     result.rollback_statuses.push_back(
       rdma_status::make(RDMA_SC_TIMEOUT, "recorded rollback probe")
     );
@@ -391,6 +399,7 @@ class rdma_control_plane_models_test extends uvm_test;
     result.completed_steps.push_back(RDMA_CTRL_STEP_RESOURCE_RESERVED);
     result.completed_steps.push_back(RDMA_CTRL_STEP_REGISTRY_ACTIVE);
     result.final_resource_state = RDMA_RESOURCE_ACTIVE;
+    result.final_resource_state_known = 1'b1;
     result.recovery_required = 1'b0;
     expect_status("RESULT", result.validate(), RDMA_SC_OK);
     if (!result.ok())
@@ -419,6 +428,8 @@ class rdma_control_plane_models_test extends uvm_test;
              result_clone.transaction_id != result.transaction_id ||
              result_clone.final_resource_state !=
                result.final_resource_state ||
+             result_clone.final_resource_state_known !=
+               result.final_resource_state_known ||
              result_clone.recovery_required != result.recovery_required)
       `uvm_error("RESULT_COPY", "result clone is not a detached snapshot")
 
@@ -436,6 +447,10 @@ class rdma_control_plane_models_test extends uvm_test;
     expect_status("RESULT_RECOVERY_CODE", result.validate(),
                   RDMA_SC_INVALID_STATE);
     result.status = saved_status;
+    result.final_resource_state_known = 1'b0;
+    expect_status("RESULT_RECOVERY_UNKNOWN", result.validate(),
+                  RDMA_SC_INVALID_STATE);
+    result.final_resource_state_known = 1'b1;
     result.final_resource_state = RDMA_RESOURCE_ACTIVE;
     expect_status("RESULT_RECOVERY_STATE", result.validate(),
                   RDMA_SC_INVALID_STATE);

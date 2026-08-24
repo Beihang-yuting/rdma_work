@@ -13,6 +13,62 @@ class rdma_control_plane_probe extends rdma_control_plane;
     transaction_ids_exhausted = exhausted;
   endfunction
 
+  task acquire_test_function_lock(
+    rdma_function_handle owner,
+    output semaphore function_lock
+  );
+    acquire_function_lock(owner, function_lock);
+  endtask
+
+  task release_test_function_lock(semaphore function_lock);
+    if (function_lock != null)
+      function_lock.put(1);
+  endtask
+
+endclass
+
+class rdma_post_activate_snapshot_failure_manager extends
+  rdma_resource_manager;
+  `uvm_object_utils(rdma_post_activate_snapshot_failure_manager)
+
+  int unsigned begin_quiesce_calls;
+  int unsigned finalize_release_calls;
+  protected bit hostile_snapshot_pending;
+  protected string hostile_key;
+
+  function new(string name = "rdma_post_activate_snapshot_failure_manager");
+    super.new(name);
+    begin_quiesce_calls = 0;
+    finalize_release_calls = 0;
+    hostile_snapshot_pending = 1'b0;
+  endfunction
+
+  virtual function rdma_status activate(rdma_handle handle);
+    rdma_status status;
+
+    status = super.activate(handle);
+    if (status != null && status.ok()) begin
+      hostile_key = resource_key(handle);
+      registry[hostile_key].state = RDMA_RESOURCE_ERROR;
+      hostile_snapshot_pending = 1'b1;
+    end
+    return status;
+  endfunction
+
+  virtual function rdma_status begin_quiesce(rdma_handle handle);
+    begin_quiesce_calls++;
+    if (hostile_snapshot_pending && registry.exists(hostile_key)) begin
+      registry[hostile_key].state = RDMA_RESOURCE_ACTIVE;
+      hostile_snapshot_pending = 1'b0;
+    end
+    return super.begin_quiesce(handle);
+  endfunction
+
+  virtual function rdma_status finalize_release(rdma_handle handle);
+    finalize_release_calls++;
+    return super.finalize_release(handle);
+  endfunction
+
 endclass
 
 class rdma_control_plane_test extends uvm_test;
@@ -240,6 +296,7 @@ class rdma_control_plane_test extends uvm_test;
         result == null || result.resource_h == null ||
         result.resource_h == pd.handle ||
         !same_handle_fields(result.resource_h, pd.handle) ||
+        !result.final_resource_state_known ||
         result.final_resource_state != RDMA_RESOURCE_ACTIVE ||
         result.completed_steps.size() != 2 ||
         result.completed_steps[0] != RDMA_CTRL_STEP_RESOURCE_RESERVED ||
@@ -269,9 +326,15 @@ class rdma_control_plane_test extends uvm_test;
 
     status = manager.create_mr(binding, saved_pd_h, reserved_mr);
     expect_status("MR_DEP_CREATE", status, RDMA_SC_OK);
+    if (reserved_mr == null || reserved_mr.handle == null) begin
+      `uvm_error("MR_DEP_CREATE_RESULT",
+                 "resource manager returned a null MR reservation")
+      return;
+    end
     control.destroy_pd(binding, saved_pd_h, result);
     expect_result("PD_BUSY", result, RDMA_SC_RESOURCE_BUSY);
     if (result == null || result.resource_h == null ||
+        !result.final_resource_state_known ||
         result.final_resource_state != RDMA_RESOURCE_ACTIVE ||
         !same_handle_fields(result.resource_h, saved_pd_h) ||
         result.transaction_id <= first_transaction_id)
@@ -288,6 +351,7 @@ class rdma_control_plane_test extends uvm_test;
     control.destroy_pd(binding, saved_pd_h, result);
     expect_result("PD_DESTROY", result, RDMA_SC_OK);
     if (result == null || result.resource_h == null ||
+        !result.final_resource_state_known ||
         result.final_resource_state != RDMA_RESOURCE_RELEASED ||
         result.completed_steps.size() != 1 ||
         result.completed_steps[0] != RDMA_CTRL_STEP_RESOURCE_RELEASED ||
@@ -309,12 +373,18 @@ class rdma_control_plane_test extends uvm_test;
     );
     control.destroy_pd(wrong_binding, saved_pd_h, result);
     expect_result("PD_WRONG_BINDING", result, RDMA_SC_INVALID_ARGUMENT);
+    if (result == null || result.final_resource_state_known)
+      `uvm_error("PD_WRONG_BINDING_STATE",
+                 "wrong binding reported an authoritative final PD state")
     stale_binding = make_active_binding(
       "stale_binding", binding.function_uid, binding.global_function_id,
       binding.generation + 1'b1
     );
     control.destroy_pd(stale_binding, saved_pd_h, result);
     expect_result("PD_STALE_BINDING", result, RDMA_SC_STALE_GENERATION);
+    if (result == null || result.final_resource_state_known)
+      `uvm_error("PD_STALE_BINDING_STATE",
+                 "stale binding reported an authoritative final PD state")
     status = manager.lookup(saved_pd_h, resource);
     expect_status("PD_REJECTED_DESTROY_LOOKUP", status, RDMA_SC_OK);
     if (!$cast(registry_pd, resource) || registry_pd == null ||
@@ -325,6 +395,9 @@ class rdma_control_plane_test extends uvm_test;
     expect_result("PD_SECOND_DESTROY", result, RDMA_SC_OK);
     control.destroy_pd(binding, saved_pd_h, result);
     expect_result("PD_ALREADY_DESTROYED", result, RDMA_SC_INVALID_STATE);
+    if (result == null || result.final_resource_state_known)
+      `uvm_error("PD_ALREADY_DESTROYED_STATE",
+                 "released-PD lookup reported a known final state")
 
     hostile_request = make_create_pd_request("hostile_request", binding);
     hostile_request.owner = wrong_binding.make_handle();
@@ -352,6 +425,157 @@ class rdma_control_plane_test extends uvm_test;
     status = hmc.\release (binding.make_handle(), RDMA_RESOURCE_PD,
                            first_hmc_address);
     expect_status("PD_HMC_TEST_CLEANUP", status, RDMA_SC_OK);
+  endtask
+
+  task automatic check_post_activate_snapshot_cleanup();
+    rdma_control_plane control;
+    rdma_post_activate_snapshot_failure_manager manager;
+    rdma_mock_cmq_port mock_cmq;
+    rdma_mock_stag_key_policy key_policy;
+    rdma_function_binding binding;
+    rdma_create_pd_req request;
+    rdma_pd pd;
+    rdma_resource resource;
+    rdma_control_result result;
+    rdma_status status;
+
+    control = rdma_control_plane::type_id::create("cleanup_control");
+    manager = rdma_post_activate_snapshot_failure_manager::type_id::create(
+      "cleanup_manager"
+    );
+    mock_cmq = rdma_mock_cmq_port::type_id::create("cleanup_cmq");
+    key_policy = rdma_mock_stag_key_policy::type_id::create(
+      "cleanup_policy"
+    );
+    binding = make_active_binding(
+      "cleanup_binding", 64'hc100_0000_0000_0001, 32'hc100_0101, 23
+    );
+    request = make_create_pd_request("cleanup_request", binding);
+    status = control.configure(manager, mock_cmq, key_policy);
+    expect_status("POST_ACTIVATE_CONFIGURE", status, RDMA_SC_OK);
+
+    control.create_pd(binding, request, pd, result);
+    expect_result("POST_ACTIVATE_SNAPSHOT", result, RDMA_SC_INVALID_STATE);
+    if (pd != null)
+      `uvm_error("POST_ACTIVATE_PD",
+                 "failed active snapshot returned a public PD")
+    if (result == null || result.resource_h == null ||
+        !result.final_resource_state_known ||
+        result.final_resource_state != RDMA_RESOURCE_RELEASED ||
+        result.completed_steps.size() != 3 ||
+        result.completed_steps[0] != RDMA_CTRL_STEP_RESOURCE_RESERVED ||
+        result.completed_steps[1] != RDMA_CTRL_STEP_REGISTRY_ACTIVE ||
+        result.completed_steps[2] != RDMA_CTRL_STEP_RESOURCE_RELEASED ||
+        result.rollback_statuses.size() != 0)
+      `uvm_error("POST_ACTIVATE_RESULT",
+                 "post-activation cleanup result is incomplete")
+    if (manager.begin_quiesce_calls != 1 ||
+        manager.finalize_release_calls != 1)
+      `uvm_error("POST_ACTIVATE_CLEANUP_CALLS",
+                 "post-activation cleanup did not quiesce and release once")
+    if (result != null && result.resource_h != null) begin
+      status = manager.lookup(result.resource_h, resource);
+      expect_status("POST_ACTIVATE_LOOKUP", status, RDMA_SC_INVALID_STATE);
+    end
+  endtask
+
+  task automatic check_post_lock_revalidation();
+    rdma_control_plane_probe binding_control;
+    rdma_control_plane_probe request_control;
+    rdma_resource_manager binding_manager;
+    rdma_resource_manager request_manager;
+    rdma_mock_cmq_port mock_cmq;
+    rdma_mock_stag_key_policy key_policy;
+    rdma_function_binding binding;
+    rdma_function_binding request_binding;
+    rdma_function_binding wrong_binding;
+    rdma_create_pd_req request;
+    rdma_create_pd_req mutable_request;
+    rdma_function_handle prelock_owner;
+    rdma_pd pd;
+    rdma_control_result result;
+    rdma_status status;
+    semaphore held_lock;
+
+    binding_control = rdma_control_plane_probe::type_id::create(
+      "binding_fence_control"
+    );
+    binding_manager = rdma_resource_manager::type_id::create(
+      "binding_fence_manager"
+    );
+    mock_cmq = rdma_mock_cmq_port::type_id::create("fence_cmq");
+    key_policy = rdma_mock_stag_key_policy::type_id::create("fence_policy");
+    binding = make_active_binding(
+      "mutable_binding", 64'hf100_0000_0000_0001, 32'hf100_0101, 31
+    );
+    request = make_create_pd_request("binding_fence_request", binding);
+    status = binding_control.configure(binding_manager, mock_cmq, key_policy);
+    expect_status("BINDING_FENCE_CONFIGURE", status, RDMA_SC_OK);
+    prelock_owner = binding.make_handle();
+    binding_control.acquire_test_function_lock(prelock_owner, held_lock);
+    fork
+      begin
+        binding_control.create_pd(binding, request, pd, result);
+      end
+      begin
+        #1ns;
+        binding.generation++;
+        binding.owner_h = binding.make_handle();
+        binding_control.release_test_function_lock(held_lock);
+      end
+    join
+    expect_result("BINDING_FENCE", result, RDMA_SC_STALE_GENERATION);
+    if (pd != null)
+      `uvm_error("BINDING_FENCE_PD",
+                 "post-lock binding mutation created a PD")
+    if (pd != null && pd.handle != null) begin
+      status = binding_manager.begin_quiesce(pd.handle);
+      expect_status("BINDING_FENCE_RED_CLEANUP_QUIESCE", status, RDMA_SC_OK);
+      status = binding_manager.finalize_release(pd.handle);
+      expect_status("BINDING_FENCE_RED_CLEANUP_RELEASE", status, RDMA_SC_OK);
+    end
+
+    request_control = rdma_control_plane_probe::type_id::create(
+      "request_fence_control"
+    );
+    request_manager = rdma_resource_manager::type_id::create(
+      "request_fence_manager"
+    );
+    request_binding = make_active_binding(
+      "request_binding", 64'hf200_0000_0000_0001, 32'hf200_0101, 37
+    );
+    wrong_binding = make_active_binding(
+      "request_wrong_binding", 64'hf200_0000_0000_0002, 32'hf200_0202, 37
+    );
+    mutable_request = make_create_pd_request(
+      "mutable_request", request_binding
+    );
+    status = request_control.configure(request_manager, mock_cmq, key_policy);
+    expect_status("REQUEST_FENCE_CONFIGURE", status, RDMA_SC_OK);
+    prelock_owner = request_binding.make_handle();
+    request_control.acquire_test_function_lock(prelock_owner, held_lock);
+    fork
+      begin
+        request_control.create_pd(
+          request_binding, mutable_request, pd, result
+        );
+      end
+      begin
+        #1ns;
+        mutable_request.owner = wrong_binding.make_handle();
+        request_control.release_test_function_lock(held_lock);
+      end
+    join
+    expect_result("REQUEST_FENCE", result, RDMA_SC_INVALID_ARGUMENT);
+    if (pd != null)
+      `uvm_error("REQUEST_FENCE_PD",
+                 "post-lock request mutation created a PD")
+    if (pd != null && pd.handle != null) begin
+      status = request_manager.begin_quiesce(pd.handle);
+      expect_status("REQUEST_FENCE_RED_CLEANUP_QUIESCE", status, RDMA_SC_OK);
+      status = request_manager.finalize_release(pd.handle);
+      expect_status("REQUEST_FENCE_RED_CLEANUP_RELEASE", status, RDMA_SC_OK);
+    end
   endtask
 
   task automatic check_transaction_id_exhaustion();
@@ -383,13 +607,17 @@ class rdma_control_plane_test extends uvm_test;
     control.create_pd(binding, request, pd, result);
     expect_result("TXN_MAX", result, RDMA_SC_OK);
     if (result == null ||
-        result.transaction_id != 64'hffff_ffff_ffff_ffff || pd == null)
+        result.transaction_id != 64'hffff_ffff_ffff_ffff ||
+        pd == null || pd.handle == null) begin
       `uvm_error("TXN_MAX", "maximum transaction ID was not issued once")
+      return;
+    end
     control.destroy_pd(binding, pd.handle, result);
     expect_result("TXN_EXHAUSTED", result, RDMA_SC_RESOURCE_EXHAUSTED,
                   1'b0);
     if (result == null || result.transaction_id != 0 ||
         result.resource_h == null ||
+        result.final_resource_state_known ||
         !same_handle_fields(result.resource_h, pd.handle))
       `uvm_error("TXN_EXHAUSTED",
                  "exhaustion reused an ID or lost the supplied PD handle")
@@ -408,6 +636,8 @@ class rdma_control_plane_test extends uvm_test;
     phase.raise_objection(this);
     check_configure_contract();
     check_pd_lifecycle();
+    check_post_activate_snapshot_cleanup();
+    check_post_lock_revalidation();
     check_transaction_id_exhaustion();
     phase.drop_objection(this);
   endtask

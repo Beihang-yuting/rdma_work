@@ -179,6 +179,7 @@ class rdma_control_result extends uvm_object;
   rdma_handle resource_h;
   rdma_control_step_e completed_steps[$];
   rdma_resource_state_e final_resource_state;
+  bit final_resource_state_known;
   bit recovery_required;
 
   function new(string name = "rdma_control_result");
@@ -188,6 +189,7 @@ class rdma_control_result extends uvm_object;
     primary_status = null;
     resource_h = null;
     final_resource_state = RDMA_RESOURCE_NEW;
+    final_resource_state_known = 1'b0;
     recovery_required = 1'b0;
   endfunction
 
@@ -216,8 +218,15 @@ class rdma_control_result extends uvm_object;
           RDMA_RESOURCE_ERROR}))
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "control result final state is invalid");
+    if (!final_resource_state_known &&
+        final_resource_state != RDMA_RESOURCE_NEW)
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "unknown control result final state is not canonical"
+      );
     if (recovery_required &&
-        (status.code != RDMA_SC_RECOVERY_REQUIRED ||
+        (!final_resource_state_known ||
+         status.code != RDMA_SC_RECOVERY_REQUIRED ||
          final_resource_state != RDMA_RESOURCE_ERROR))
       return rdma_status::make(
         RDMA_SC_INVALID_STATE,
@@ -244,6 +253,7 @@ class rdma_control_result extends uvm_object;
                                          "control result");
     completed_steps = rhs_result.completed_steps;
     final_resource_state = rhs_result.final_resource_state;
+    final_resource_state_known = rhs_result.final_resource_state_known;
     recovery_required = rhs_result.recovery_required;
   endfunction
 endclass
