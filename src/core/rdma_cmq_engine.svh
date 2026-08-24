@@ -203,6 +203,35 @@ class rdma_cmq_engine extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  protected function rdma_status ticket_trust_status(
+    rdma_cmq_ticket ticket
+  );
+    rdma_status status;
+
+    if (ticket == null || ticket.function_h == null ||
+        ticket.cmq_h == null || ticket.opcode_key == null)
+      return invalid_argument("CMQ ticket trust authority is incomplete");
+    if ($isunknown(ticket.command_id) ||
+        $isunknown(ticket.slot_sequence) ||
+        $isunknown(ticket.sq_index) ||
+        $isunknown(ticket.sq_wrap) ||
+        $isunknown(ticket.absolute_deadline) ||
+        $isunknown(ticket.function_h.kind) ||
+        $isunknown(ticket.function_h.function_uid) ||
+        $isunknown(ticket.function_h.object_id) ||
+        $isunknown(ticket.function_h.generation) ||
+        $isunknown(ticket.cmq_h.kind) ||
+        $isunknown(ticket.cmq_h.function_uid) ||
+        $isunknown(ticket.cmq_h.object_id) ||
+        $isunknown(ticket.cmq_h.generation) ||
+        $isunknown(ticket.opcode_key.opcode))
+      return invalid_argument("CMQ ticket identity contains unknown bits");
+    status = ticket.validate();
+    if (status == null)
+      return invalid_argument("CMQ ticket validation returned null");
+    return status;
+  endfunction
+
   protected function string command_key(rdma_cmq_ticket ticket);
     return $sformatf(
       "%016h:%08h:%08h:%016h",
@@ -730,6 +759,113 @@ class rdma_cmq_engine extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  protected function rdma_status strict_cancel_ledger_status(
+    int unsigned generation
+  );
+    rdma_status status;
+    longint unsigned ledger_used;
+
+    status = poll_ledger_status(ledger_used);
+    if (status == null || !status.ok())
+      return (status == null) ?
+        poison_status("CMQ cancel ledger audit returned null status") :
+        status;
+    foreach (slots[i]) begin
+      rdma_cmq_slot_record record;
+      string hardware_key;
+      string software_key;
+
+      record = slots[i];
+      if (record == null)
+        continue;
+      if ($isunknown(record.slot_sequence) ||
+          $isunknown(record.sq_index) ||
+          $isunknown(record.sq_wrap) ||
+          $isunknown(record.state) ||
+          $isunknown(record.command_token))
+        return poison_status(
+          "CMQ cancel slot identity contains unknown bits"
+        );
+      status = ticket_trust_status(record.ticket);
+      if (status == null || !status.ok())
+        return poison_status("CMQ cancel ticket authority is untrusted");
+      if (record.expected == null ||
+          !(record.state inside {
+            CMQ_SLOT_PUBLISHED,
+            CMQ_SLOT_COMPLETED,
+            CMQ_SLOT_TIMED_OUT_QUARANTINED,
+            CMQ_SLOT_LATE_COMPLETED
+          }) ||
+          record.sq_index >= CMQ_DEPTH || record.sq_index != i ||
+          record.sq_index != (record.slot_sequence % CMQ_DEPTH) ||
+          record.sq_wrap !=
+            ((record.slot_sequence / CMQ_DEPTH) % 2) ||
+          record.ticket.sq_index != record.sq_index ||
+          record.ticket.slot_sequence != record.slot_sequence ||
+          record.ticket.sq_wrap != record.sq_wrap ||
+          record.ticket.command_id[4:0] != record.command_token ||
+          record.ticket.function_h.generation != generation ||
+          prepared_binding == null ||
+          !prepared_binding.accepts(record.ticket.function_h) ||
+          cmq_snapshot == null || cmq_snapshot.handle == null ||
+          !same_handle(record.ticket.cmq_h, cmq_snapshot.handle))
+        return poison_status("CMQ cancel slot authority is inconsistent");
+      hardware_key = entry_key(record.sq_index, record.sq_wrap);
+      if (!entry_registry.exists(hardware_key) ||
+          entry_registry[hardware_key] != record)
+        return poison_status("CMQ cancel entry registry is inconsistent");
+      software_key = command_key(record.ticket);
+      if (record.state == CMQ_SLOT_PUBLISHED) begin
+        if (!command_registry.exists(software_key) ||
+            command_registry[software_key] != record ||
+            record.command_token >= CMQ_DEPTH ||
+            !token_in_use[record.command_token])
+          return poison_status(
+            "CMQ cancel published command ledger is inconsistent"
+          );
+      end
+      else if (command_registry.exists(software_key))
+        return poison_status(
+          "CMQ cancel terminal command remains in the registry"
+        );
+    end
+    return rdma_status::success();
+  endfunction
+
+  protected function bit recovery_record_is_trusted(
+    rdma_cmq_slot_record record,
+    int unsigned slot_index,
+    int unsigned generation
+  );
+    rdma_status status;
+
+    if (record == null || record.ticket == null ||
+        $isunknown(record.slot_sequence) ||
+        $isunknown(record.sq_index) ||
+        $isunknown(record.sq_wrap) ||
+        $isunknown(record.state) ||
+        $isunknown(record.command_token))
+      return 1'b0;
+    status = ticket_trust_status(record.ticket);
+    if (status == null || !status.ok())
+      return 1'b0;
+    if (record.state != CMQ_SLOT_PUBLISHED ||
+        prepared_binding == null ||
+        !prepared_binding.accepts(record.ticket.function_h) ||
+        cmq_snapshot == null || cmq_snapshot.handle == null ||
+        !same_handle(record.ticket.cmq_h, cmq_snapshot.handle) ||
+        record.ticket.function_h.generation != generation ||
+        record.sq_index >= CMQ_DEPTH || record.sq_index != slot_index ||
+        record.sq_index != (record.slot_sequence % CMQ_DEPTH) ||
+        record.sq_wrap != ((record.slot_sequence / CMQ_DEPTH) % 2) ||
+        record.ticket.sq_index != record.sq_index ||
+        record.ticket.slot_sequence != record.slot_sequence ||
+        record.ticket.sq_wrap != record.sq_wrap ||
+        record.ticket.command_id[4:0] != record.command_token)
+      return 1'b0;
+    return 1'b1;
+  endfunction
+
   protected function rdma_status cancel_generation_locked(
     int unsigned generation,
     bit recover_poisoned_ledger
@@ -747,6 +883,14 @@ class rdma_cmq_engine extends uvm_object;
         "CMQ cancel generation does not match current generation"
       );
 
+    if (!recover_poisoned_ledger) begin
+      status = strict_cancel_ledger_status(generation);
+      if (status == null || !status.ok())
+        return (status == null) ?
+          poison_status("CMQ cancel ledger audit returned null status") :
+          status;
+    end
+
     staged_count = 0;
     if (recover_poisoned_ledger) begin
       foreach (slots[i]) begin
@@ -754,17 +898,7 @@ class rdma_cmq_engine extends uvm_object;
         string software_key;
 
         record = slots[i];
-        if (record == null || record.state != CMQ_SLOT_PUBLISHED ||
-            record.ticket == null || record.ticket.function_h == null ||
-            record.ticket.cmq_h == null ||
-            !prepared_binding.accepts(record.ticket.function_h) ||
-            cmq_snapshot == null || cmq_snapshot.handle == null ||
-            !same_handle(record.ticket.cmq_h, cmq_snapshot.handle) ||
-            record.ticket.function_h.generation != generation ||
-            record.sq_index != i || record.ticket.sq_index != i ||
-            record.ticket.slot_sequence != record.slot_sequence ||
-            record.ticket.sq_wrap != record.sq_wrap ||
-            record.ticket.command_id[4:0] != record.command_token)
+        if (!recovery_record_is_trusted(record, i, generation))
           continue;
         software_key = command_key(record.ticket);
         if (staged_command_keys.exists(software_key))
@@ -5026,6 +5160,8 @@ class rdma_cmq_engine extends uvm_object;
     engine_lock.get(1);
     if (engine_state != RDMA_CMQ_ENGINE_ACTIVE) begin
       status = invalid_state("CMQ poll requires an ACTIVE engine");
+      while (diagnostic_fifo.size() != 0)
+        diagnostics.push_back(diagnostic_fifo.pop_front());
       engine_lock.put(1);
       return;
     end
@@ -5068,7 +5204,7 @@ class rdma_cmq_engine extends uvm_object;
       engine_lock.put(1);
       return;
     end
-    validation_status = ticket.validate();
+    validation_status = ticket_trust_status(ticket);
     if (validation_status == null || !validation_status.ok()) begin
       status = invalid_argument("CMQ wait ticket is invalid");
       engine_lock.put(1);
@@ -5146,8 +5282,7 @@ class rdma_cmq_engine extends uvm_object;
     if (!(engine_state inside {
           RDMA_CMQ_ENGINE_PREPARED,
           RDMA_CMQ_ENGINE_ACTIVE,
-          RDMA_CMQ_ENGINE_QUIESCED,
-          RDMA_CMQ_ENGINE_POISONED
+          RDMA_CMQ_ENGINE_QUIESCED
         })) begin
       status = invalid_state("CMQ engine state cannot be cancelled");
       engine_lock.put(1);
@@ -5306,8 +5441,11 @@ class rdma_cmq_engine extends uvm_object;
     end
     if (engine_state != RDMA_CMQ_ENGINE_POISONED &&
         prepared_binding != null) begin
+      // shutdown has no completion output and must retain only release
+      // authority on failure, so use the same best-effort quarantine cleanup
+      // as poison recovery rather than the public cancellation audit.
       cancel_status = cancel_generation_locked(
-        prepared_binding.generation, 1'b0
+        prepared_binding.generation, 1'b1
       );
       if (cancel_status == null || !cancel_status.ok()) begin
         status = (cancel_status == null) ?
