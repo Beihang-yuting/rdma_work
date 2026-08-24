@@ -52,6 +52,12 @@ class rdma_control_plane_probe extends rdma_control_plane;
     );
   endtask
 
+  function void use_hmc_allocator_for_test(
+    rdma_hmc_allocator replacement
+  );
+    hmc_allocator = replacement;
+  endfunction
+
 endclass
 
 class rdma_cp_mutating_completion_mapping extends rdma_mock_dma_mapping;
@@ -4337,6 +4343,7 @@ class rdma_control_plane_test extends uvm_test;
     rdma_mock_cmq_port mock_cmq;
     rdma_mock_host_mem host_mem;
     rdma_hmc_allocator hmc;
+    rdma_hmc_allocator fault_hmc;
     rdma_function_binding binding;
     rdma_pd pd;
     rdma_mr mr;
@@ -4344,6 +4351,7 @@ class rdma_control_plane_test extends uvm_test;
     rdma_resource resource;
     rdma_dma_mapping mapping;
     rdma_hmc_fvm_addr_t hmc_address;
+    rdma_hmc_fvm_addr_t fault_hmc_base;
     rdma_control_result result;
     rdma_recovery_record recovery;
     rdma_status injected_status;
@@ -4509,6 +4517,47 @@ class rdma_control_plane_test extends uvm_test;
                  "post-deregister drain failure recovery is wrong")
 
     setup_deregister_mr_case(
+      "dereg_drain_timeout", RDMA_MR_PBL0, RDMA_OWNERSHIP_BORROWED,
+      control, manager, mock_cmq, host_mem, hmc, binding, pd, mr,
+      mapping, hmc_address, baseline_allocations
+    );
+    mock_cmq.timeout_opcode(XTR_V1_OP_TQ_FLUSH);
+    control.deregister_mr(binding, mr.handle, result);
+    expect_recovery_result("MR_DEREG_DRAIN_TIMEOUT", result,
+                           RDMA_SC_TIMEOUT);
+    status = manager.lookup(mr.handle, resource);
+    expect_status("MR_DEREG_DRAIN_TIMEOUT_LOOKUP", status, RDMA_SC_OK);
+    live_mr = null;
+    void'($cast(live_mr, resource));
+    status = manager.lookup_recovery(mr.handle, recovery);
+    expect_status("MR_DEREG_DRAIN_TIMEOUT_RECOVERY", status, RDMA_SC_OK);
+    expected_opcodes.delete();
+    expected_opcodes.push_back(XTR_V1_OP_MR_DEREGISTER);
+    expected_opcodes.push_back(XTR_V1_OP_TQ_FLUSH);
+    expect_cmq_opcodes("MR_DEREG_DRAIN_TIMEOUT_ORDER", mock_cmq,
+                       expected_opcodes);
+    if (live_mr == null || live_mr.state != RDMA_RESOURCE_ERROR ||
+        recovery == null ||
+        recovery.hardware_presence != RDMA_HW_PRESENCE_ABSENT ||
+        recovery.completed_steps.size() != 1 ||
+        recovery.completed_steps[0] !=
+          RDMA_CTRL_STEP_HW_MR_DEREGISTERED ||
+        recovery.pending_steps.size() != 1 ||
+        recovery.pending_steps[0] != RDMA_CTRL_STEP_HW_DRAINED ||
+        recovery.ambiguous_ticket == null || mock_cmq.calls.size() != 2 ||
+        mock_cmq.calls[1] == null || mock_cmq.calls[1].ticket == null ||
+        recovery.ambiguous_ticket == mock_cmq.calls[1].ticket ||
+        recovery.ambiguous_ticket.command_id !=
+          mock_cmq.calls[1].ticket.command_id ||
+        host_mem.live_allocations() != baseline_allocations + 1 ||
+        host_mem.calls.size() != 1 ||
+        host_mem.calls[0].method_name != "allocate" ||
+        manager.restore_active_calls != 0 ||
+        manager.finalize_release_calls != 0)
+      `uvm_error("MR_DEREG_DRAIN_TIMEOUT_STATE",
+                 "TQ timeout did not retain detached ABSENT recovery")
+
+    setup_deregister_mr_case(
       "dereg_owned_release_failure", RDMA_MR_PBL0,
       RDMA_OWNERSHIP_CONTROL_PLANE, control, manager, mock_cmq, host_mem,
       hmc, binding, pd, mr, mapping, hmc_address, baseline_allocations
@@ -4538,6 +4587,72 @@ class rdma_control_plane_test extends uvm_test;
         manager.finalize_release_calls != 0)
       `uvm_error("MR_DEREG_OWNED_RELEASE_GATE",
                  "failed owned release reached finalize or lost recovery")
+
+    setup_deregister_mr_case(
+      "dereg_owned_hmc_release_failure", RDMA_MR_PBL2,
+      RDMA_OWNERSHIP_CONTROL_PLANE, control, manager, mock_cmq, host_mem,
+      hmc, binding, pd, mr, mapping, hmc_address, baseline_allocations
+    );
+    fault_hmc = rdma_hmc_allocator::type_id::create(
+      "dereg_owned_hmc_release_fault"
+    );
+    fault_hmc_base.value = 64'h0000_0009_0000_0000;
+    status = fault_hmc.configure(fault_hmc_base, 64'h0001_0000);
+    expect_status("MR_DEREG_OWNED_HMC_FAULT_CONFIGURE", status,
+                  RDMA_SC_OK);
+    control.use_hmc_allocator_for_test(fault_hmc);
+    control.deregister_mr(binding, mr.handle, result);
+    expect_recovery_result("MR_DEREG_OWNED_HMC_RELEASE_FAILURE", result,
+                           RDMA_SC_INVALID_ARGUMENT);
+    status = manager.lookup(mr.handle, resource);
+    expect_status("MR_DEREG_OWNED_HMC_RELEASE_LOOKUP", status, RDMA_SC_OK);
+    live_mr = null;
+    void'($cast(live_mr, resource));
+    status = manager.lookup_recovery(mr.handle, recovery);
+    expect_status("MR_DEREG_OWNED_HMC_RELEASE_RECOVERY", status,
+                  RDMA_SC_OK);
+    expected_opcodes.delete();
+    expected_opcodes.push_back(XTR_V1_OP_OCC_FLUSH);
+    expected_opcodes.push_back(XTR_V1_OP_MR_DEREGISTER);
+    expected_opcodes.push_back(XTR_V1_OP_TQ_FLUSH);
+    expect_cmq_opcodes("MR_DEREG_OWNED_HMC_RELEASE_ORDER", mock_cmq,
+                       expected_opcodes);
+    status = hmc.lookup(binding.make_handle(), RDMA_RESOURCE_MR,
+                        hmc_address, lease_size);
+    expect_status("MR_DEREG_OWNED_HMC_RELEASE_LEASE", status, RDMA_SC_OK);
+    if (result.primary_status == null ||
+        result.primary_status.message != "HMC address is unknown or forged" ||
+        live_mr == null || live_mr.state != RDMA_RESOURCE_ERROR ||
+        recovery == null ||
+        recovery.hardware_presence != RDMA_HW_PRESENCE_ABSENT ||
+        recovery.completed_steps.size() != 3 ||
+        recovery.completed_steps[0] != RDMA_CTRL_STEP_HW_OCC_FLUSHED ||
+        recovery.completed_steps[1] !=
+          RDMA_CTRL_STEP_HW_MR_DEREGISTERED ||
+        recovery.completed_steps[2] != RDMA_CTRL_STEP_HW_DRAINED ||
+        recovery.pending_steps.size() != 1 ||
+        recovery.pending_steps[0] != RDMA_CTRL_STEP_BACKING_RELEASED ||
+        recovery.hmc_refs.size() != 1 || recovery.hmc_refs[0] == null ||
+        recovery.hmc_refs[0].ownership !=
+          RDMA_OWNERSHIP_CONTROL_PLANE ||
+        recovery.hmc_refs[0].release_complete ||
+        recovery.hmc_refs[0].object_kind != RDMA_RESOURCE_MR ||
+        recovery.hmc_refs[0].address != hmc_address ||
+        recovery.hmc_refs[0].owner == null ||
+        !recovery.hmc_refs[0].owner.same_instance(binding.make_handle()) ||
+        recovery.backing_refs.size() != 1 ||
+        recovery.backing_refs[0] == null ||
+        recovery.backing_refs[0].mapping == null ||
+        recovery.backing_refs[0].ownership !=
+          RDMA_OWNERSHIP_CONTROL_PLANE ||
+        recovery.backing_refs[0].release_complete ||
+        host_mem.live_allocations() != baseline_allocations + 1 ||
+        host_mem.calls.size() != 1 ||
+        host_mem.calls[0].method_name != "allocate" ||
+        manager.restore_active_calls != 0 ||
+        manager.finalize_release_calls != 0)
+      `uvm_error("MR_DEREG_OWNED_HMC_RELEASE_STATE",
+                 "HMC release failure lost retryable owned authority")
 
     setup_deregister_mr_case(
       "dereg_finalize_failure", RDMA_MR_PBL0,
