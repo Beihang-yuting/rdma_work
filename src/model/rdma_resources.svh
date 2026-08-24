@@ -1,13 +1,3 @@
-typedef enum bit [2:0] {
-  RDMA_RESOURCE_NEW        = 3'd0,
-  RDMA_RESOURCE_ALLOCATED  = 3'd1,
-  RDMA_RESOURCE_PROGRAMMED = 3'd2,
-  RDMA_RESOURCE_ACTIVE     = 3'd3,
-  RDMA_RESOURCE_QUIESCING  = 3'd4,
-  RDMA_RESOURCE_RELEASED   = 3'd5,
-  RDMA_RESOURCE_ERROR      = 3'd6
-} rdma_resource_state_e;
-
 function automatic rdma_handle rdma_clone_handle_value(
   rdma_handle source,
   string copy_label
