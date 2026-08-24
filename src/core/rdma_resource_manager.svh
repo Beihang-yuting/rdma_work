@@ -170,6 +170,14 @@ class rdma_resource_manager extends uvm_object;
     return lhs.same_instance(rhs);
   endfunction
 
+  protected function bit same_handle_value(rdma_handle lhs,
+                                            rdma_handle rhs);
+    if (lhs == null || rhs == null)
+      return lhs == rhs;
+    return lhs.get_object_type() == rhs.get_object_type() &&
+           lhs.same_instance(rhs);
+  endfunction
+
   protected function bit same_dependency_topology(rdma_resource lhs,
                                                   rdma_resource rhs);
     if (lhs == null || rhs == null ||
@@ -186,7 +194,8 @@ class rdma_resource_manager extends uvm_object;
                                                rdma_function_binding rhs);
     if (lhs == null || rhs == null)
       return lhs == rhs;
-    if (lhs.function_uid != rhs.function_uid ||
+    if (lhs.get_object_type() != rhs.get_object_type() ||
+        lhs.function_uid != rhs.function_uid ||
         lhs.notify_bar_id != rhs.notify_bar_id ||
         lhs.notify_base != rhs.notify_base ||
         lhs.notify_size != rhs.notify_size ||
@@ -203,11 +212,12 @@ class rdma_resource_manager extends uvm_object;
         lhs.notify_ready != rhs.notify_ready ||
         lhs.dmi_valid != rhs.dmi_valid || lhs.dmi_ready != rhs.dmi_ready ||
         lhs.vft_valid != rhs.vft_valid || lhs.vft_ready != rhs.vft_ready ||
-        !same_handle_instance(lhs.owner_h, rhs.owner_h))
+        !same_handle_value(lhs.owner_h, rhs.owner_h))
       return 1'b0;
     if (lhs.pcie == null || rhs.pcie == null)
       return lhs.pcie == rhs.pcie;
-    if (lhs.pcie.bdf != rhs.pcie.bdf ||
+    if (lhs.pcie.get_object_type() != rhs.pcie.get_object_type() ||
+        lhs.pcie.bdf != rhs.pcie.bdf ||
         lhs.pcie.parent_pf_bdf != rhs.pcie.parent_pf_bdf ||
         lhs.pcie.vf_index != rhs.pcie.vf_index ||
         lhs.pcie.mse != rhs.pcie.mse || lhs.pcie.bme != rhs.pcie.bme)
@@ -217,7 +227,9 @@ class rdma_resource_manager extends uvm_object;
         if (lhs.pcie.bar[i] != rhs.pcie.bar[i])
           return 1'b0;
       end
-      else if (lhs.pcie.bar[i].bar_id != rhs.pcie.bar[i].bar_id ||
+      else if (lhs.pcie.bar[i].get_object_type() !=
+                 rhs.pcie.bar[i].get_object_type() ||
+               lhs.pcie.bar[i].bar_id != rhs.pcie.bar[i].bar_id ||
                lhs.pcie.bar[i].base != rhs.pcie.bar[i].base ||
                lhs.pcie.bar[i].size != rhs.pcie.bar[i].size ||
                lhs.pcie.bar[i].enabled != rhs.pcie.bar[i].enabled)
@@ -385,6 +397,20 @@ class rdma_resource_manager extends uvm_object;
       result = null;
       return status;
     end
+    if (!same_resource_value(result, source)) begin
+      result = null;
+      return rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT,
+        {copy_label, " resource clone changed validated fields"}
+      );
+    end
+    if (!resource_graph_detached(result, source)) begin
+      result = null;
+      return rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT,
+        {copy_label, " resource clone retained caller-owned aliases"}
+      );
+    end
     return rdma_status::success();
   endfunction
 
@@ -393,7 +419,16 @@ class rdma_resource_manager extends uvm_object;
     if (lhs == null || rhs == null)
       return lhs == rhs;
     return lhs.get_object_type() == rhs.get_object_type() &&
-           lhs.convert2string() == rhs.convert2string();
+           lhs.category == rhs.category && lhs.code == rhs.code &&
+           lhs.hardware_code == rhs.hardware_code &&
+           lhs.hardware_code_valid == rhs.hardware_code_valid &&
+           lhs.source_engine == rhs.source_engine &&
+           lhs.function_uid == rhs.function_uid &&
+           lhs.generation == rhs.generation &&
+           lhs.resource_id == rhs.resource_id &&
+           lhs.command_id == rhs.command_id && lhs.wr_id == rhs.wr_id &&
+           lhs.severity == rhs.severity && lhs.retryable == rhs.retryable &&
+           lhs.message == rhs.message;
   endfunction
 
   protected function bit same_ticket_value(rdma_cmq_ticket lhs,
@@ -402,8 +437,8 @@ class rdma_resource_manager extends uvm_object;
       return lhs == rhs;
     if (lhs.get_object_type() != rhs.get_object_type() ||
         lhs.command_id != rhs.command_id ||
-        !same_handle_instance(lhs.function_h, rhs.function_h) ||
-        !same_handle_instance(lhs.cmq_h, rhs.cmq_h) ||
+        !same_handle_value(lhs.function_h, rhs.function_h) ||
+        !same_handle_value(lhs.cmq_h, rhs.cmq_h) ||
         lhs.slot_sequence != rhs.slot_sequence ||
         lhs.sq_index != rhs.sq_index || lhs.sq_wrap != rhs.sq_wrap ||
         lhs.absolute_deadline != rhs.absolute_deadline)
@@ -465,12 +500,312 @@ class rdma_resource_manager extends uvm_object;
            lhs.release_complete == rhs.release_complete;
   endfunction
 
+  protected function bit same_resource_base_value(rdma_resource lhs,
+                                                   rdma_resource rhs);
+    if (lhs == null || rhs == null)
+      return lhs == rhs;
+    if (lhs.get_object_type() != rhs.get_object_type() ||
+        lhs.resource_kind() != rhs.resource_kind() ||
+        !same_handle_value(lhs.handle, rhs.handle) ||
+        !same_handle_value(lhs.owner, rhs.owner) ||
+        lhs.state != rhs.state ||
+        lhs.hmc_fvm_addr != rhs.hmc_fvm_addr ||
+        lhs.hmc_fvm_addr_valid != rhs.hmc_fvm_addr_valid ||
+        lhs.backing_refs.size() != rhs.backing_refs.size() ||
+        lhs.hmc_refs.size() != rhs.hmc_refs.size() ||
+        lhs.dependencies.size() != rhs.dependencies.size() ||
+        lhs.outstanding_ids.size() != rhs.outstanding_ids.size())
+      return 1'b0;
+    foreach (lhs.backing_refs[i]) begin
+      if (!same_backing_ref_value(lhs.backing_refs[i],
+                                  rhs.backing_refs[i]))
+        return 1'b0;
+    end
+    foreach (lhs.hmc_refs[i]) begin
+      if (!same_hmc_ref_value(lhs.hmc_refs[i], rhs.hmc_refs[i]))
+        return 1'b0;
+    end
+    foreach (lhs.dependencies[i]) begin
+      if (!same_handle_value(lhs.dependencies[i], rhs.dependencies[i]))
+        return 1'b0;
+    end
+    foreach (lhs.outstanding_ids[i]) begin
+      if (lhs.outstanding_ids[i] != rhs.outstanding_ids[i])
+        return 1'b0;
+    end
+    return 1'b1;
+  endfunction
+
+  protected function bit same_queue_resource_value(rdma_resource lhs,
+                                                    rdma_resource rhs);
+    rdma_queue_resource lhs_queue;
+    rdma_queue_resource rhs_queue;
+
+    if (!$cast(lhs_queue, lhs) || !$cast(rhs_queue, rhs))
+      return 1'b0;
+    return lhs_queue.depth == rhs_queue.depth &&
+           lhs_queue.producer_index == rhs_queue.producer_index &&
+           lhs_queue.consumer_index == rhs_queue.consumer_index &&
+           lhs_queue.producer_wrap == rhs_queue.producer_wrap &&
+           lhs_queue.consumer_wrap == rhs_queue.consumer_wrap &&
+           lhs_queue.queue_iova == rhs_queue.queue_iova;
+  endfunction
+
+  protected function bit same_resource_value(rdma_resource lhs,
+                                              rdma_resource rhs);
+    rdma_function lhs_function;
+    rdma_function rhs_function;
+    rdma_pd lhs_pd;
+    rdma_pd rhs_pd;
+    rdma_mr lhs_mr;
+    rdma_mr rhs_mr;
+    rdma_cq lhs_cq;
+    rdma_cq rhs_cq;
+    rdma_qp lhs_qp;
+    rdma_qp rhs_qp;
+    rdma_srq lhs_srq;
+    rdma_srq rhs_srq;
+    rdma_cmq lhs_cmq;
+    rdma_cmq rhs_cmq;
+    rdma_ceq lhs_ceq;
+    rdma_ceq rhs_ceq;
+    rdma_aeq lhs_aeq;
+    rdma_aeq rhs_aeq;
+
+    if (!same_resource_base_value(lhs, rhs))
+      return 1'b0;
+    case (rhs.resource_kind())
+      RDMA_RESOURCE_FUNCTION: begin
+        if (!$cast(lhs_function, lhs) || !$cast(rhs_function, rhs))
+          return 1'b0;
+        return lhs_function.local_function_id ==
+                 rhs_function.local_function_id &&
+               lhs_function.global_function_id ==
+                 rhs_function.global_function_id &&
+               lhs_function.rdma_vf_id == rhs_function.rdma_vf_id &&
+               lhs_function.vsi_id == rhs_function.vsi_id &&
+               lhs_function.pfvf_id == rhs_function.pfvf_id &&
+               same_binding_identity(lhs_function.binding,
+                                     rhs_function.binding);
+      end
+      RDMA_RESOURCE_PD: begin
+        if (!$cast(lhs_pd, lhs) || !$cast(rhs_pd, rhs))
+          return 1'b0;
+        return lhs_pd.local_pd_id == rhs_pd.local_pd_id &&
+               lhs_pd.global_pd_id == rhs_pd.global_pd_id;
+      end
+      RDMA_RESOURCE_MR: begin
+        if (!$cast(lhs_mr, lhs) || !$cast(rhs_mr, rhs))
+          return 1'b0;
+        return lhs_mr.local_mr_id == rhs_mr.local_mr_id &&
+               lhs_mr.global_mr_id == rhs_mr.global_mr_id &&
+               same_handle_value(lhs_mr.pd_h, rhs_mr.pd_h) &&
+               lhs_mr.iova == rhs_mr.iova &&
+               lhs_mr.length == rhs_mr.length &&
+               lhs_mr.lkey == rhs_mr.lkey &&
+               lhs_mr.rkey == rhs_mr.rkey &&
+               lhs_mr.access == rhs_mr.access &&
+               lhs_mr.mr_serial == rhs_mr.mr_serial;
+      end
+      RDMA_RESOURCE_CQ: begin
+        if (!$cast(lhs_cq, lhs) || !$cast(rhs_cq, rhs))
+          return 1'b0;
+        return same_queue_resource_value(lhs, rhs) &&
+               lhs_cq.local_cq_id == rhs_cq.local_cq_id &&
+               lhs_cq.global_cq_id == rhs_cq.global_cq_id &&
+               same_handle_value(lhs_cq.ceq_h, rhs_cq.ceq_h);
+      end
+      RDMA_RESOURCE_QP: begin
+        if (!$cast(lhs_qp, lhs) || !$cast(rhs_qp, rhs))
+          return 1'b0;
+        return lhs_qp.local_qp_id == rhs_qp.local_qp_id &&
+               lhs_qp.global_qp_id == rhs_qp.global_qp_id &&
+               lhs_qp.transport == rhs_qp.transport &&
+               lhs_qp.qp_state == rhs_qp.qp_state &&
+               lhs_qp.sq_depth == rhs_qp.sq_depth &&
+               lhs_qp.rq_depth == rhs_qp.rq_depth &&
+               lhs_qp.sq_producer_index == rhs_qp.sq_producer_index &&
+               lhs_qp.sq_consumer_index == rhs_qp.sq_consumer_index &&
+               lhs_qp.sq_wrap == rhs_qp.sq_wrap &&
+               lhs_qp.sq_consumer_wrap == rhs_qp.sq_consumer_wrap &&
+               lhs_qp.rq_producer_index == rhs_qp.rq_producer_index &&
+               lhs_qp.rq_consumer_index == rhs_qp.rq_consumer_index &&
+               lhs_qp.rq_wrap == rhs_qp.rq_wrap &&
+               lhs_qp.rq_consumer_wrap == rhs_qp.rq_consumer_wrap &&
+               lhs_qp.sq_iova == rhs_qp.sq_iova &&
+               lhs_qp.rq_iova == rhs_qp.rq_iova &&
+               same_handle_value(lhs_qp.pd_h, rhs_qp.pd_h) &&
+               same_handle_value(lhs_qp.send_cq_h, rhs_qp.send_cq_h) &&
+               same_handle_value(lhs_qp.recv_cq_h, rhs_qp.recv_cq_h) &&
+               same_handle_value(lhs_qp.srq_h, rhs_qp.srq_h);
+      end
+      RDMA_RESOURCE_SRQ: begin
+        if (!$cast(lhs_srq, lhs) || !$cast(rhs_srq, rhs))
+          return 1'b0;
+        return same_queue_resource_value(lhs, rhs) &&
+               lhs_srq.local_srq_id == rhs_srq.local_srq_id &&
+               lhs_srq.global_srq_id == rhs_srq.global_srq_id &&
+               lhs_srq.max_sge == rhs_srq.max_sge &&
+               same_handle_value(lhs_srq.pd_h, rhs_srq.pd_h);
+      end
+      RDMA_RESOURCE_CMQ: begin
+        if (!$cast(lhs_cmq, lhs) || !$cast(rhs_cmq, rhs))
+          return 1'b0;
+        return same_queue_resource_value(lhs, rhs) &&
+               lhs_cmq.local_cmq_id == rhs_cmq.local_cmq_id &&
+               lhs_cmq.global_cmq_id == rhs_cmq.global_cmq_id &&
+               lhs_cmq.completion_producer_index ==
+                 rhs_cmq.completion_producer_index &&
+               lhs_cmq.completion_consumer_index ==
+                 rhs_cmq.completion_consumer_index &&
+               lhs_cmq.completion_wrap == rhs_cmq.completion_wrap &&
+               lhs_cmq.completion_consumer_wrap ==
+                 rhs_cmq.completion_consumer_wrap &&
+               lhs_cmq.completion_iova == rhs_cmq.completion_iova;
+      end
+      RDMA_RESOURCE_CEQ: begin
+        if (!$cast(lhs_ceq, lhs) || !$cast(rhs_ceq, rhs))
+          return 1'b0;
+        return same_queue_resource_value(lhs, rhs) &&
+               lhs_ceq.local_ceq_id == rhs_ceq.local_ceq_id &&
+               lhs_ceq.global_ceq_id == rhs_ceq.global_ceq_id;
+      end
+      RDMA_RESOURCE_AEQ: begin
+        if (!$cast(lhs_aeq, lhs) || !$cast(rhs_aeq, rhs))
+          return 1'b0;
+        return same_queue_resource_value(lhs, rhs) &&
+               lhs_aeq.local_aeq_id == rhs_aeq.local_aeq_id &&
+               lhs_aeq.global_aeq_id == rhs_aeq.global_aeq_id;
+      end
+      default: return 1'b0;
+    endcase
+  endfunction
+
+  protected function void collect_mapping_graph(
+    rdma_dma_mapping value,
+    ref uvm_object nodes[$]
+  );
+    if (value == null)
+      return;
+    nodes.push_back(value);
+    if (value.function_h != null)
+      nodes.push_back(value.function_h);
+    if (value.owner_h != null)
+      nodes.push_back(value.owner_h);
+  endfunction
+
+  protected function void collect_backing_ref_graph(
+    rdma_backing_ref value,
+    ref uvm_object nodes[$]
+  );
+    if (value == null)
+      return;
+    nodes.push_back(value);
+    collect_mapping_graph(value.mapping, nodes);
+  endfunction
+
+  protected function void collect_hmc_ref_graph(
+    rdma_hmc_ref value,
+    ref uvm_object nodes[$]
+  );
+    if (value == null)
+      return;
+    nodes.push_back(value);
+    if (value.owner != null)
+      nodes.push_back(value.owner);
+  endfunction
+
+  protected function void collect_resource_graph(
+    rdma_resource value,
+    ref uvm_object nodes[$]
+  );
+    rdma_function function_value;
+    rdma_mr mr_value;
+    rdma_cq cq_value;
+    rdma_qp qp_value;
+    rdma_srq srq_value;
+
+    if (value == null)
+      return;
+    nodes.push_back(value);
+    if (value.handle != null)
+      nodes.push_back(value.handle);
+    if (value.owner != null)
+      nodes.push_back(value.owner);
+    foreach (value.backing_refs[i])
+      collect_backing_ref_graph(value.backing_refs[i], nodes);
+    foreach (value.hmc_refs[i])
+      collect_hmc_ref_graph(value.hmc_refs[i], nodes);
+    foreach (value.dependencies[i]) begin
+      if (value.dependencies[i] != null)
+        nodes.push_back(value.dependencies[i]);
+    end
+    case (value.resource_kind())
+      RDMA_RESOURCE_FUNCTION: begin
+        if ($cast(function_value, value) && function_value.binding != null) begin
+          nodes.push_back(function_value.binding);
+          if (function_value.binding.owner_h != null)
+            nodes.push_back(function_value.binding.owner_h);
+          if (function_value.binding.pcie != null) begin
+            nodes.push_back(function_value.binding.pcie);
+            foreach (function_value.binding.pcie.bar[i]) begin
+              if (function_value.binding.pcie.bar[i] != null)
+                nodes.push_back(function_value.binding.pcie.bar[i]);
+            end
+          end
+        end
+      end
+      RDMA_RESOURCE_MR: begin
+        if ($cast(mr_value, value) && mr_value.pd_h != null)
+          nodes.push_back(mr_value.pd_h);
+      end
+      RDMA_RESOURCE_CQ: begin
+        if ($cast(cq_value, value) && cq_value.ceq_h != null)
+          nodes.push_back(cq_value.ceq_h);
+      end
+      RDMA_RESOURCE_QP: begin
+        if ($cast(qp_value, value)) begin
+          if (qp_value.pd_h != null)
+            nodes.push_back(qp_value.pd_h);
+          if (qp_value.send_cq_h != null)
+            nodes.push_back(qp_value.send_cq_h);
+          if (qp_value.recv_cq_h != null)
+            nodes.push_back(qp_value.recv_cq_h);
+          if (qp_value.srq_h != null)
+            nodes.push_back(qp_value.srq_h);
+        end
+      end
+      RDMA_RESOURCE_SRQ: begin
+        if ($cast(srq_value, value) && srq_value.pd_h != null)
+          nodes.push_back(srq_value.pd_h);
+      end
+    endcase
+  endfunction
+
+  protected function bit resource_graph_detached(rdma_resource result,
+                                                 rdma_resource source);
+    uvm_object result_nodes[$];
+    uvm_object source_nodes[$];
+
+    if (result == null || source == null)
+      return result == source;
+    collect_resource_graph(result, result_nodes);
+    collect_resource_graph(source, source_nodes);
+    foreach (result_nodes[i]) begin
+      foreach (source_nodes[j]) begin
+        if (result_nodes[i] == source_nodes[j])
+          return 1'b0;
+      end
+    end
+    return 1'b1;
+  endfunction
+
   protected function bit same_recovery_value(rdma_recovery_record lhs,
                                               rdma_recovery_record rhs);
     if (lhs == null || rhs == null)
       return lhs == rhs;
     if (lhs.get_object_type() != rhs.get_object_type() ||
-        !same_handle_instance(lhs.resource_h, rhs.resource_h) ||
+        !same_handle_value(lhs.resource_h, rhs.resource_h) ||
         lhs.hardware_presence != rhs.hardware_presence ||
         lhs.completed_steps.size() != rhs.completed_steps.size() ||
         lhs.pending_steps.size() != rhs.pending_steps.size() ||
@@ -505,6 +840,63 @@ class rdma_resource_manager extends uvm_object;
     return 1'b1;
   endfunction
 
+  protected function void collect_ticket_graph(
+    rdma_cmq_ticket value,
+    ref uvm_object nodes[$]
+  );
+    if (value == null)
+      return;
+    nodes.push_back(value);
+    if (value.function_h != null)
+      nodes.push_back(value.function_h);
+    if (value.cmq_h != null)
+      nodes.push_back(value.cmq_h);
+    if (value.opcode_key != null)
+      nodes.push_back(value.opcode_key);
+  endfunction
+
+  protected function void collect_recovery_graph(
+    rdma_recovery_record value,
+    ref uvm_object nodes[$]
+  );
+    if (value == null)
+      return;
+    nodes.push_back(value);
+    if (value.resource_h != null)
+      nodes.push_back(value.resource_h);
+    foreach (value.backing_refs[i])
+      collect_backing_ref_graph(value.backing_refs[i], nodes);
+    foreach (value.hmc_refs[i])
+      collect_hmc_ref_graph(value.hmc_refs[i], nodes);
+    collect_ticket_graph(value.ambiguous_ticket, nodes);
+    if (value.primary_status != null)
+      nodes.push_back(value.primary_status);
+    foreach (value.rollback_statuses[i]) begin
+      if (value.rollback_statuses[i] != null)
+        nodes.push_back(value.rollback_statuses[i]);
+    end
+  endfunction
+
+  protected function bit recovery_graph_detached(
+    rdma_recovery_record result,
+    rdma_recovery_record source
+  );
+    uvm_object result_nodes[$];
+    uvm_object source_nodes[$];
+
+    if (result == null || source == null)
+      return result == source;
+    collect_recovery_graph(result, result_nodes);
+    collect_recovery_graph(source, source_nodes);
+    foreach (result_nodes[i]) begin
+      foreach (source_nodes[j]) begin
+        if (result_nodes[i] == source_nodes[j])
+          return 1'b0;
+      end
+    end
+    return 1'b1;
+  endfunction
+
   protected function rdma_status clone_public_recovery_value(
     rdma_recovery_record source,
     string copy_label,
@@ -532,6 +924,13 @@ class rdma_resource_manager extends uvm_object;
       return rdma_status::make(
         RDMA_SC_INVALID_ARGUMENT,
         {copy_label, " recovery clone changed validated fields"}
+      );
+    end
+    if (!recovery_graph_detached(result, source)) begin
+      result = null;
+      return rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT,
+        {copy_label, " recovery clone retained caller-owned aliases"}
       );
     end
     return rdma_status::success();

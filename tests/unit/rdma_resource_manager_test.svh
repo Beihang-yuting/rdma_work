@@ -59,14 +59,56 @@ class rdma_width_probe_manager extends rdma_resource_manager;
   endfunction
 endclass
 
-typedef enum bit [2:0] {
+typedef enum bit [5:0] {
   RDMA_RM_CLONE_GOOD,
   RDMA_RM_CLONE_SELF,
   RDMA_RM_CLONE_WRONG,
   RDMA_RM_CLONE_DRIFT,
   RDMA_RM_CLONE_BACKING_DRIFT,
-  RDMA_RM_CLONE_HMC_DRIFT
+  RDMA_RM_CLONE_HMC_DRIFT,
+  RDMA_RM_CLONE_PROGRAMMABLE_DRIFT,
+  RDMA_RM_CLONE_SHALLOW_RESOURCE_HANDLE,
+  RDMA_RM_CLONE_SHALLOW_RESOURCE_OWNER,
+  RDMA_RM_CLONE_SHALLOW_RESOURCE_DEPENDENCY,
+  RDMA_RM_CLONE_SHALLOW_RESOURCE_BACKING_REF,
+  RDMA_RM_CLONE_SHALLOW_RESOURCE_MAPPING,
+  RDMA_RM_CLONE_SHALLOW_RESOURCE_MAPPING_FUNCTION,
+  RDMA_RM_CLONE_SHALLOW_RESOURCE_MAPPING_OWNER,
+  RDMA_RM_CLONE_SHALLOW_RESOURCE_HMC_REF,
+  RDMA_RM_CLONE_SHALLOW_RESOURCE_HMC_OWNER,
+  RDMA_RM_CLONE_SHALLOW_RESOURCE_KIND_HANDLE,
+  RDMA_RM_CLONE_SHALLOW_RECOVERY_RESOURCE_HANDLE,
+  RDMA_RM_CLONE_SHALLOW_RECOVERY_BACKING_REF,
+  RDMA_RM_CLONE_SHALLOW_RECOVERY_MAPPING,
+  RDMA_RM_CLONE_SHALLOW_RECOVERY_MAPPING_FUNCTION,
+  RDMA_RM_CLONE_SHALLOW_RECOVERY_MAPPING_OWNER,
+  RDMA_RM_CLONE_SHALLOW_RECOVERY_HMC_REF,
+  RDMA_RM_CLONE_SHALLOW_RECOVERY_HMC_OWNER,
+  RDMA_RM_CLONE_SHALLOW_RECOVERY_TICKET,
+  RDMA_RM_CLONE_SHALLOW_RECOVERY_TICKET_FUNCTION,
+  RDMA_RM_CLONE_SHALLOW_RECOVERY_TICKET_CMQ,
+  RDMA_RM_CLONE_SHALLOW_RECOVERY_TICKET_OPCODE,
+  RDMA_RM_CLONE_SHALLOW_RECOVERY_PRIMARY_STATUS,
+  RDMA_RM_CLONE_SHALLOW_RECOVERY_ROLLBACK_STATUS,
+  RDMA_RM_CLONE_CROSS_RESOURCE_ALIAS,
+  RDMA_RM_CLONE_RECOVERY_TICKET_DRIFT,
+  RDMA_RM_CLONE_RECOVERY_STEPS_DRIFT,
+  RDMA_RM_CLONE_RECOVERY_PRIMARY_HIDDEN_HW_DRIFT,
+  RDMA_RM_CLONE_RECOVERY_ROLLBACK_STATUS_DRIFT
 } rdma_rm_clone_fault_e;
+
+typedef enum bit [1:0] {
+  RDMA_RM_KIND_CLONE_GOOD,
+  RDMA_RM_KIND_CLONE_VALUE_DRIFT,
+  RDMA_RM_KIND_CLONE_SHALLOW_HANDLES
+} rdma_rm_kind_clone_fault_e;
+
+typedef enum bit [1:0] {
+  RDMA_RM_FUNCTION_CLONE_GOOD,
+  RDMA_RM_FUNCTION_CLONE_SHALLOW_BINDING,
+  RDMA_RM_FUNCTION_CLONE_SHALLOW_PCIE,
+  RDMA_RM_FUNCTION_CLONE_SHALLOW_BAR
+} rdma_rm_function_clone_fault_e;
 
 class rdma_rm_fault_mr extends rdma_mr;
   `uvm_object_utils(rdma_rm_fault_mr)
@@ -101,8 +143,317 @@ class rdma_rm_fault_mr extends rdma_mr;
         cloned_mr.local_mr_id++;
         return cloned_mr;
       end
+      RDMA_RM_CLONE_BACKING_DRIFT: begin
+        cloned_object = super.clone();
+        if (!$cast(cloned_mr, cloned_object) ||
+            cloned_mr.backing_refs.size() == 0 ||
+            cloned_mr.backing_refs[0] == null ||
+            cloned_mr.backing_refs[0].mapping == null)
+          `uvm_fatal("RM_TEST_CLONE",
+                     "fault MR backing clone setup failed")
+        cloned_mr.backing_refs[0].mapping.iova.value++;
+        return cloned_mr;
+      end
+      RDMA_RM_CLONE_HMC_DRIFT: begin
+        cloned_object = super.clone();
+        if (!$cast(cloned_mr, cloned_object) ||
+            cloned_mr.hmc_refs.size() == 0 ||
+            cloned_mr.hmc_refs[0] == null)
+          `uvm_fatal("RM_TEST_CLONE", "fault MR HMC clone setup failed")
+        cloned_mr.hmc_refs[0].address.value++;
+        return cloned_mr;
+      end
+      RDMA_RM_CLONE_PROGRAMMABLE_DRIFT: begin
+        cloned_object = super.clone();
+        if (!$cast(cloned_mr, cloned_object))
+          `uvm_fatal("RM_TEST_CLONE", "fault MR clone cast failed")
+        cloned_mr.iova.value += 64'h1000;
+        cloned_mr.length += 64'h1000;
+        cloned_mr.lkey[7:0]++;
+        cloned_mr.rkey = cloned_mr.lkey;
+        cloned_mr.access.local_write = !cloned_mr.access.local_write;
+        cloned_mr.mr_serial++;
+        cloned_mr.hmc_fvm_addr.value++;
+        return cloned_mr;
+      end
+      RDMA_RM_CLONE_SHALLOW_RESOURCE_HANDLE: begin
+        cloned_object = super.clone();
+        if (!$cast(cloned_mr, cloned_object))
+          `uvm_fatal("RM_TEST_CLONE", "fault MR clone cast failed")
+        cloned_mr.handle = handle;
+        return cloned_mr;
+      end
+      RDMA_RM_CLONE_SHALLOW_RESOURCE_OWNER: begin
+        cloned_object = super.clone();
+        if (!$cast(cloned_mr, cloned_object))
+          `uvm_fatal("RM_TEST_CLONE", "fault MR clone cast failed")
+        cloned_mr.owner = owner;
+        return cloned_mr;
+      end
+      RDMA_RM_CLONE_SHALLOW_RESOURCE_DEPENDENCY: begin
+        cloned_object = super.clone();
+        if (!$cast(cloned_mr, cloned_object) || dependencies.size() == 0)
+          `uvm_fatal("RM_TEST_CLONE",
+                     "fault MR dependency clone setup failed")
+        cloned_mr.dependencies[0] = dependencies[0];
+        return cloned_mr;
+      end
+      RDMA_RM_CLONE_SHALLOW_RESOURCE_BACKING_REF: begin
+        cloned_object = super.clone();
+        if (!$cast(cloned_mr, cloned_object) || backing_refs.size() == 0)
+          `uvm_fatal("RM_TEST_CLONE",
+                     "fault MR backing reference clone setup failed")
+        cloned_mr.backing_refs[0] = backing_refs[0];
+        return cloned_mr;
+      end
+      RDMA_RM_CLONE_SHALLOW_RESOURCE_MAPPING: begin
+        cloned_object = super.clone();
+        if (!$cast(cloned_mr, cloned_object) || backing_refs.size() == 0 ||
+            backing_refs[0] == null)
+          `uvm_fatal("RM_TEST_CLONE",
+                     "fault MR mapping clone setup failed")
+        cloned_mr.backing_refs[0].mapping = backing_refs[0].mapping;
+        return cloned_mr;
+      end
+      RDMA_RM_CLONE_SHALLOW_RESOURCE_MAPPING_FUNCTION: begin
+        cloned_object = super.clone();
+        if (!$cast(cloned_mr, cloned_object) || backing_refs.size() == 0 ||
+            backing_refs[0] == null || backing_refs[0].mapping == null)
+          `uvm_fatal("RM_TEST_CLONE",
+                     "fault MR mapping Function clone setup failed")
+        cloned_mr.backing_refs[0].mapping.function_h =
+          backing_refs[0].mapping.function_h;
+        return cloned_mr;
+      end
+      RDMA_RM_CLONE_SHALLOW_RESOURCE_MAPPING_OWNER: begin
+        cloned_object = super.clone();
+        if (!$cast(cloned_mr, cloned_object) || backing_refs.size() == 0 ||
+            backing_refs[0] == null || backing_refs[0].mapping == null)
+          `uvm_fatal("RM_TEST_CLONE",
+                     "fault MR mapping owner clone setup failed")
+        cloned_mr.backing_refs[0].mapping.owner_h =
+          backing_refs[0].mapping.owner_h;
+        return cloned_mr;
+      end
+      RDMA_RM_CLONE_SHALLOW_RESOURCE_HMC_REF: begin
+        cloned_object = super.clone();
+        if (!$cast(cloned_mr, cloned_object) || hmc_refs.size() == 0)
+          `uvm_fatal("RM_TEST_CLONE",
+                     "fault MR HMC reference clone setup failed")
+        cloned_mr.hmc_refs[0] = hmc_refs[0];
+        return cloned_mr;
+      end
+      RDMA_RM_CLONE_SHALLOW_RESOURCE_HMC_OWNER: begin
+        cloned_object = super.clone();
+        if (!$cast(cloned_mr, cloned_object) || hmc_refs.size() == 0 ||
+            hmc_refs[0] == null)
+          `uvm_fatal("RM_TEST_CLONE",
+                     "fault MR HMC owner clone setup failed")
+        cloned_mr.hmc_refs[0].owner = hmc_refs[0].owner;
+        return cloned_mr;
+      end
+      RDMA_RM_CLONE_SHALLOW_RESOURCE_KIND_HANDLE: begin
+        cloned_object = super.clone();
+        if (!$cast(cloned_mr, cloned_object))
+          `uvm_fatal("RM_TEST_CLONE", "fault MR clone cast failed")
+        cloned_mr.pd_h = pd_h;
+        return cloned_mr;
+      end
+      RDMA_RM_CLONE_CROSS_RESOURCE_ALIAS: begin
+        cloned_object = super.clone();
+        if (!$cast(cloned_mr, cloned_object) || backing_refs.size() == 0 ||
+            backing_refs[0] == null || backing_refs[0].mapping == null ||
+            hmc_refs.size() == 0 || hmc_refs[0] == null)
+          `uvm_fatal("RM_TEST_CLONE",
+                     "fault MR cross-alias setup failed")
+        cloned_mr.backing_refs[0].mapping.function_h = hmc_refs[0].owner;
+        cloned_mr.backing_refs[0].mapping.owner_h = handle;
+        return cloned_mr;
+      end
       default: return super.clone();
     endcase
+  endfunction
+endclass
+
+class rdma_rm_fault_function extends rdma_function;
+  `uvm_object_utils(rdma_rm_fault_function)
+
+  rdma_rm_function_clone_fault_e clone_fault;
+
+  function new(string name = "rdma_rm_fault_function");
+    super.new(name);
+    clone_fault = RDMA_RM_FUNCTION_CLONE_GOOD;
+  endfunction
+
+  virtual function uvm_object clone();
+    uvm_object cloned_object;
+    rdma_rm_fault_function cloned_function;
+
+    cloned_object = super.clone();
+    if (!$cast(cloned_function, cloned_object))
+      `uvm_fatal("RM_TEST_CLONE", "fault Function clone cast failed")
+    case (clone_fault)
+      RDMA_RM_FUNCTION_CLONE_SHALLOW_BINDING:
+        cloned_function.binding = binding;
+      RDMA_RM_FUNCTION_CLONE_SHALLOW_PCIE:
+        cloned_function.binding.pcie = binding.pcie;
+      RDMA_RM_FUNCTION_CLONE_SHALLOW_BAR:
+        cloned_function.binding.pcie.bar[0] = binding.pcie.bar[0];
+    endcase
+    return cloned_function;
+  endfunction
+endclass
+
+class rdma_rm_fault_pd extends rdma_pd;
+  `uvm_object_utils(rdma_rm_fault_pd)
+  rdma_rm_kind_clone_fault_e clone_fault;
+  function new(string name = "rdma_rm_fault_pd");
+    super.new(name);
+    clone_fault = RDMA_RM_KIND_CLONE_GOOD;
+  endfunction
+  virtual function uvm_object clone();
+    uvm_object cloned_object;
+    rdma_rm_fault_pd cloned_pd;
+    cloned_object = super.clone();
+    if (!$cast(cloned_pd, cloned_object))
+      `uvm_fatal("RM_TEST_CLONE", "fault PD clone cast failed")
+    if (clone_fault == RDMA_RM_KIND_CLONE_VALUE_DRIFT)
+      cloned_pd.global_pd_id++;
+    return cloned_pd;
+  endfunction
+endclass
+
+class rdma_rm_fault_cq extends rdma_cq;
+  `uvm_object_utils(rdma_rm_fault_cq)
+  rdma_rm_kind_clone_fault_e clone_fault;
+  function new(string name = "rdma_rm_fault_cq");
+    super.new(name);
+    clone_fault = RDMA_RM_KIND_CLONE_GOOD;
+  endfunction
+  virtual function uvm_object clone();
+    uvm_object cloned_object;
+    rdma_rm_fault_cq cloned_cq;
+    cloned_object = super.clone();
+    if (!$cast(cloned_cq, cloned_object))
+      `uvm_fatal("RM_TEST_CLONE", "fault CQ clone cast failed")
+    case (clone_fault)
+      RDMA_RM_KIND_CLONE_VALUE_DRIFT: begin
+        cloned_cq.queue_iova.value++;
+      end
+      RDMA_RM_KIND_CLONE_SHALLOW_HANDLES: cloned_cq.ceq_h = ceq_h;
+    endcase
+    return cloned_cq;
+  endfunction
+endclass
+
+class rdma_rm_fault_qp extends rdma_qp;
+  `uvm_object_utils(rdma_rm_fault_qp)
+  rdma_rm_kind_clone_fault_e clone_fault;
+  function new(string name = "rdma_rm_fault_qp");
+    super.new(name);
+    clone_fault = RDMA_RM_KIND_CLONE_GOOD;
+  endfunction
+  virtual function uvm_object clone();
+    uvm_object cloned_object;
+    rdma_rm_fault_qp cloned_qp;
+    cloned_object = super.clone();
+    if (!$cast(cloned_qp, cloned_object))
+      `uvm_fatal("RM_TEST_CLONE", "fault QP clone cast failed")
+    case (clone_fault)
+      RDMA_RM_KIND_CLONE_VALUE_DRIFT: begin
+        cloned_qp.rq_iova.value++;
+      end
+      RDMA_RM_KIND_CLONE_SHALLOW_HANDLES: begin
+        cloned_qp.pd_h = pd_h;
+        cloned_qp.send_cq_h = send_cq_h;
+        cloned_qp.recv_cq_h = recv_cq_h;
+        cloned_qp.srq_h = srq_h;
+      end
+    endcase
+    return cloned_qp;
+  endfunction
+endclass
+
+class rdma_rm_fault_srq extends rdma_srq;
+  `uvm_object_utils(rdma_rm_fault_srq)
+  rdma_rm_kind_clone_fault_e clone_fault;
+  function new(string name = "rdma_rm_fault_srq");
+    super.new(name);
+    clone_fault = RDMA_RM_KIND_CLONE_GOOD;
+  endfunction
+  virtual function uvm_object clone();
+    uvm_object cloned_object;
+    rdma_rm_fault_srq cloned_srq;
+    cloned_object = super.clone();
+    if (!$cast(cloned_srq, cloned_object))
+      `uvm_fatal("RM_TEST_CLONE", "fault SRQ clone cast failed")
+    case (clone_fault)
+      RDMA_RM_KIND_CLONE_VALUE_DRIFT: begin
+        cloned_srq.max_sge++;
+      end
+      RDMA_RM_KIND_CLONE_SHALLOW_HANDLES: cloned_srq.pd_h = pd_h;
+    endcase
+    return cloned_srq;
+  endfunction
+endclass
+
+class rdma_rm_fault_cmq extends rdma_cmq;
+  `uvm_object_utils(rdma_rm_fault_cmq)
+  rdma_rm_kind_clone_fault_e clone_fault;
+  function new(string name = "rdma_rm_fault_cmq");
+    super.new(name);
+    clone_fault = RDMA_RM_KIND_CLONE_GOOD;
+  endfunction
+  virtual function uvm_object clone();
+    uvm_object cloned_object;
+    rdma_rm_fault_cmq cloned_cmq;
+    cloned_object = super.clone();
+    if (!$cast(cloned_cmq, cloned_object))
+      `uvm_fatal("RM_TEST_CLONE", "fault CMQ clone cast failed")
+    if (clone_fault == RDMA_RM_KIND_CLONE_VALUE_DRIFT) begin
+      cloned_cmq.completion_iova.value++;
+    end
+    return cloned_cmq;
+  endfunction
+endclass
+
+class rdma_rm_fault_ceq extends rdma_ceq;
+  `uvm_object_utils(rdma_rm_fault_ceq)
+  rdma_rm_kind_clone_fault_e clone_fault;
+  function new(string name = "rdma_rm_fault_ceq");
+    super.new(name);
+    clone_fault = RDMA_RM_KIND_CLONE_GOOD;
+  endfunction
+  virtual function uvm_object clone();
+    uvm_object cloned_object;
+    rdma_rm_fault_ceq cloned_ceq;
+    cloned_object = super.clone();
+    if (!$cast(cloned_ceq, cloned_object))
+      `uvm_fatal("RM_TEST_CLONE", "fault CEQ clone cast failed")
+    if (clone_fault == RDMA_RM_KIND_CLONE_VALUE_DRIFT) begin
+      cloned_ceq.queue_iova.value++;
+    end
+    return cloned_ceq;
+  endfunction
+endclass
+
+class rdma_rm_fault_aeq extends rdma_aeq;
+  `uvm_object_utils(rdma_rm_fault_aeq)
+  rdma_rm_kind_clone_fault_e clone_fault;
+  function new(string name = "rdma_rm_fault_aeq");
+    super.new(name);
+    clone_fault = RDMA_RM_KIND_CLONE_GOOD;
+  endfunction
+  virtual function uvm_object clone();
+    uvm_object cloned_object;
+    rdma_rm_fault_aeq cloned_aeq;
+    cloned_object = super.clone();
+    if (!$cast(cloned_aeq, cloned_object))
+      `uvm_fatal("RM_TEST_CLONE", "fault AEQ clone cast failed")
+    if (clone_fault == RDMA_RM_KIND_CLONE_VALUE_DRIFT) begin
+      cloned_aeq.queue_iova.value++;
+    end
+    return cloned_aeq;
   endfunction
 endclass
 
@@ -150,6 +501,161 @@ class rdma_rm_fault_recovery extends rdma_recovery_record;
         cloned_recovery.hmc_refs[0].address.value++;
         return cloned_recovery;
       end
+      RDMA_RM_CLONE_SHALLOW_RECOVERY_RESOURCE_HANDLE: begin
+        cloned_object = super.clone();
+        if (!$cast(cloned_recovery, cloned_object))
+          `uvm_fatal("RM_TEST_CLONE", "fault recovery clone cast failed")
+        cloned_recovery.resource_h = resource_h;
+        return cloned_recovery;
+      end
+      RDMA_RM_CLONE_SHALLOW_RECOVERY_BACKING_REF: begin
+        cloned_object = super.clone();
+        if (!$cast(cloned_recovery, cloned_object) ||
+            backing_refs.size() == 0)
+          `uvm_fatal("RM_TEST_CLONE",
+                     "fault recovery backing reference setup failed")
+        cloned_recovery.backing_refs[0] = backing_refs[0];
+        return cloned_recovery;
+      end
+      RDMA_RM_CLONE_SHALLOW_RECOVERY_MAPPING: begin
+        cloned_object = super.clone();
+        if (!$cast(cloned_recovery, cloned_object) ||
+            backing_refs.size() == 0 || backing_refs[0] == null)
+          `uvm_fatal("RM_TEST_CLONE",
+                     "fault recovery mapping setup failed")
+        cloned_recovery.backing_refs[0].mapping = backing_refs[0].mapping;
+        return cloned_recovery;
+      end
+      RDMA_RM_CLONE_SHALLOW_RECOVERY_MAPPING_FUNCTION: begin
+        cloned_object = super.clone();
+        if (!$cast(cloned_recovery, cloned_object) ||
+            backing_refs.size() == 0 || backing_refs[0] == null ||
+            backing_refs[0].mapping == null)
+          `uvm_fatal("RM_TEST_CLONE",
+                     "fault recovery mapping Function setup failed")
+        cloned_recovery.backing_refs[0].mapping.function_h =
+          backing_refs[0].mapping.function_h;
+        return cloned_recovery;
+      end
+      RDMA_RM_CLONE_SHALLOW_RECOVERY_MAPPING_OWNER: begin
+        cloned_object = super.clone();
+        if (!$cast(cloned_recovery, cloned_object) ||
+            backing_refs.size() == 0 || backing_refs[0] == null ||
+            backing_refs[0].mapping == null)
+          `uvm_fatal("RM_TEST_CLONE",
+                     "fault recovery mapping owner setup failed")
+        cloned_recovery.backing_refs[0].mapping.owner_h =
+          backing_refs[0].mapping.owner_h;
+        return cloned_recovery;
+      end
+      RDMA_RM_CLONE_SHALLOW_RECOVERY_HMC_REF: begin
+        cloned_object = super.clone();
+        if (!$cast(cloned_recovery, cloned_object) || hmc_refs.size() == 0)
+          `uvm_fatal("RM_TEST_CLONE",
+                     "fault recovery HMC reference setup failed")
+        cloned_recovery.hmc_refs[0] = hmc_refs[0];
+        return cloned_recovery;
+      end
+      RDMA_RM_CLONE_SHALLOW_RECOVERY_HMC_OWNER: begin
+        cloned_object = super.clone();
+        if (!$cast(cloned_recovery, cloned_object) || hmc_refs.size() == 0 ||
+            hmc_refs[0] == null)
+          `uvm_fatal("RM_TEST_CLONE",
+                     "fault recovery HMC owner setup failed")
+        cloned_recovery.hmc_refs[0].owner = hmc_refs[0].owner;
+        return cloned_recovery;
+      end
+      RDMA_RM_CLONE_SHALLOW_RECOVERY_TICKET: begin
+        cloned_object = super.clone();
+        if (!$cast(cloned_recovery, cloned_object))
+          `uvm_fatal("RM_TEST_CLONE", "fault recovery clone cast failed")
+        cloned_recovery.ambiguous_ticket = ambiguous_ticket;
+        return cloned_recovery;
+      end
+      RDMA_RM_CLONE_SHALLOW_RECOVERY_TICKET_FUNCTION: begin
+        cloned_object = super.clone();
+        if (!$cast(cloned_recovery, cloned_object) ||
+            ambiguous_ticket == null)
+          `uvm_fatal("RM_TEST_CLONE",
+                     "fault recovery ticket Function setup failed")
+        cloned_recovery.ambiguous_ticket.function_h =
+          ambiguous_ticket.function_h;
+        return cloned_recovery;
+      end
+      RDMA_RM_CLONE_SHALLOW_RECOVERY_TICKET_CMQ: begin
+        cloned_object = super.clone();
+        if (!$cast(cloned_recovery, cloned_object) ||
+            ambiguous_ticket == null)
+          `uvm_fatal("RM_TEST_CLONE",
+                     "fault recovery ticket CMQ setup failed")
+        cloned_recovery.ambiguous_ticket.cmq_h = ambiguous_ticket.cmq_h;
+        return cloned_recovery;
+      end
+      RDMA_RM_CLONE_SHALLOW_RECOVERY_TICKET_OPCODE: begin
+        cloned_object = super.clone();
+        if (!$cast(cloned_recovery, cloned_object) ||
+            ambiguous_ticket == null)
+          `uvm_fatal("RM_TEST_CLONE",
+                     "fault recovery ticket opcode setup failed")
+        cloned_recovery.ambiguous_ticket.opcode_key =
+          ambiguous_ticket.opcode_key;
+        return cloned_recovery;
+      end
+      RDMA_RM_CLONE_SHALLOW_RECOVERY_PRIMARY_STATUS: begin
+        cloned_object = super.clone();
+        if (!$cast(cloned_recovery, cloned_object))
+          `uvm_fatal("RM_TEST_CLONE", "fault recovery clone cast failed")
+        cloned_recovery.primary_status = primary_status;
+        return cloned_recovery;
+      end
+      RDMA_RM_CLONE_SHALLOW_RECOVERY_ROLLBACK_STATUS: begin
+        cloned_object = super.clone();
+        if (!$cast(cloned_recovery, cloned_object) ||
+            rollback_statuses.size() == 0)
+          `uvm_fatal("RM_TEST_CLONE",
+                     "fault recovery rollback status setup failed")
+        cloned_recovery.rollback_statuses[0] = rollback_statuses[0];
+        return cloned_recovery;
+      end
+      RDMA_RM_CLONE_RECOVERY_TICKET_DRIFT: begin
+        cloned_object = super.clone();
+        if (!$cast(cloned_recovery, cloned_object) ||
+            cloned_recovery.ambiguous_ticket == null)
+          `uvm_fatal("RM_TEST_CLONE",
+                     "fault recovery ticket drift setup failed")
+        cloned_recovery.ambiguous_ticket.command_id++;
+        return cloned_recovery;
+      end
+      RDMA_RM_CLONE_RECOVERY_STEPS_DRIFT: begin
+        cloned_object = super.clone();
+        if (!$cast(cloned_recovery, cloned_object) ||
+            cloned_recovery.completed_steps.size() == 0)
+          `uvm_fatal("RM_TEST_CLONE",
+                     "fault recovery step drift setup failed")
+        cloned_recovery.completed_steps[0] =
+          RDMA_CTRL_STEP_BACKING_ATTACHED;
+        return cloned_recovery;
+      end
+      RDMA_RM_CLONE_RECOVERY_PRIMARY_HIDDEN_HW_DRIFT: begin
+        cloned_object = super.clone();
+        if (!$cast(cloned_recovery, cloned_object) ||
+            cloned_recovery.primary_status == null)
+          `uvm_fatal("RM_TEST_CLONE",
+                     "fault recovery primary status setup failed")
+        cloned_recovery.primary_status.hardware_code++;
+        return cloned_recovery;
+      end
+      RDMA_RM_CLONE_RECOVERY_ROLLBACK_STATUS_DRIFT: begin
+        cloned_object = super.clone();
+        if (!$cast(cloned_recovery, cloned_object) ||
+            cloned_recovery.rollback_statuses.size() == 0 ||
+            cloned_recovery.rollback_statuses[0] == null)
+          `uvm_fatal("RM_TEST_CLONE",
+                     "fault recovery rollback status drift setup failed")
+        cloned_recovery.rollback_statuses[0].retryable =
+          !cloned_recovery.rollback_statuses[0].retryable;
+        return cloned_recovery;
+      end
       default: return super.clone();
     endcase
   endfunction
@@ -162,6 +668,21 @@ class rdma_clone_probe_manager extends rdma_resource_manager;
 
   function void replace_authoritative(rdma_resource replacement);
     registry[resource_key(replacement.handle)] = replacement;
+  endfunction
+
+  function rdma_status probe_public_resource_clone(
+    rdma_resource source,
+    output rdma_resource result
+  );
+    return clone_public_resource_value(source, "clone gate probe", result);
+  endfunction
+
+  function void reset_error_probe(rdma_resource replacement);
+    string key;
+
+    key = resource_key(replacement.handle);
+    registry[key] = clone_resource_value(replacement, "error probe reset");
+    recovery_records.delete(key);
   endfunction
 endclass
 
@@ -344,6 +865,10 @@ class rdma_resource_manager_test extends uvm_test;
     rdma_pd dependency_quiescing_pd;
     rdma_pd dependency_error_pd;
     rdma_pd clone_gate_pd;
+    rdma_pd clone_kind_pd_seed;
+    rdma_rm_fault_pd clone_kind_pd_authoritative;
+    rdma_rm_fault_pd clone_kind_pd_candidate;
+    rdma_rm_fault_pd clone_kind_pd_lookup;
     rdma_pd clone_recovery_pd;
     rdma_pd allocated_error_pd;
     rdma_pd wrong_stage_pd;
@@ -377,6 +902,8 @@ class rdma_resource_manager_test extends uvm_test;
     rdma_function width_function_a;
     rdma_function width_function_b_failed;
     rdma_function width_function_b_reused;
+    rdma_function clone_gate_function;
+    rdma_rm_fault_function clone_fault_function;
     rdma_pd function_release_pd;
     rdma_function permanent_exhaustion_function;
     rdma_pd permanent_exhaustion_pd;
@@ -408,16 +935,40 @@ class rdma_resource_manager_test extends uvm_test;
     rdma_cq publication_lookup_cq;
     rdma_cq dep_cq;
     rdma_cq teardown_cq;
+    rdma_cq clone_kind_cq_seed;
+    rdma_rm_fault_cq clone_kind_cq_authoritative;
+    rdma_rm_fault_cq clone_kind_cq_candidate;
+    rdma_rm_fault_cq clone_kind_cq_lookup;
     rdma_qp dep_qp;
     rdma_qp teardown_qp;
     rdma_qp snapshot_qp;
     rdma_qp snapshot_qp_lookup;
+    rdma_qp clone_kind_qp_seed;
+    rdma_rm_fault_qp clone_kind_qp_authoritative;
+    rdma_rm_fault_qp clone_kind_qp_candidate;
+    rdma_rm_fault_qp clone_kind_qp_lookup;
     rdma_srq dep_srq;
+    rdma_srq clone_kind_srq_seed;
+    rdma_rm_fault_srq clone_kind_srq_authoritative;
+    rdma_rm_fault_srq clone_kind_srq_candidate;
+    rdma_rm_fault_srq clone_kind_srq_lookup;
     rdma_ceq dep_ceq;
     rdma_ceq teardown_ceq;
+    rdma_ceq clone_kind_ceq_seed;
+    rdma_rm_fault_ceq clone_kind_ceq_authoritative;
+    rdma_rm_fault_ceq clone_kind_ceq_candidate;
+    rdma_rm_fault_ceq clone_kind_ceq_lookup;
     rdma_aeq frozen_aeq;
     rdma_aeq width_probe_aeq;
     rdma_aeq rollback_aeq;
+    rdma_aeq clone_kind_aeq_seed;
+    rdma_rm_fault_aeq clone_kind_aeq_authoritative;
+    rdma_rm_fault_aeq clone_kind_aeq_candidate;
+    rdma_rm_fault_aeq clone_kind_aeq_lookup;
+    rdma_cmq clone_kind_cmq_seed;
+    rdma_rm_fault_cmq clone_kind_cmq_authoritative;
+    rdma_rm_fault_cmq clone_kind_cmq_candidate;
+    rdma_rm_fault_cmq clone_kind_cmq_lookup;
     rdma_handle old_h;
     rdma_handle same_generation_old_h;
     rdma_handle frozen_qp_h;
@@ -436,6 +987,7 @@ class rdma_resource_manager_test extends uvm_test;
     rdma_function_handle privileged_recovery_owner;
     rdma_resource resource;
     rdma_resource second_resource;
+    rdma_resource clone_probe_result;
     rdma_recovery_record recovery_record;
     rdma_recovery_record recovery_lookup;
     rdma_recovery_record recovery_lookup_again;
@@ -445,6 +997,12 @@ class rdma_resource_manager_test extends uvm_test;
     rdma_backing_ref clone_backing_ref;
     rdma_dma_mapping clone_mapping;
     rdma_hmc_ref clone_hmc_ref;
+    rdma_mr clone_lookup_mr;
+    rdma_rm_clone_fault_e resource_clone_faults[$];
+    string resource_clone_fault_names[$];
+    rdma_rm_clone_fault_e recovery_clone_faults[$];
+    string recovery_clone_fault_names[$];
+    rdma_cmq_ticket clone_ticket;
     rdma_status s;
     int unsigned leak_count;
     int unsigned pd_local_before_exhaustion;
@@ -1152,6 +1710,42 @@ class rdma_resource_manager_test extends uvm_test;
       "clone_gate_binding", 64'h1c1f_4000_0000_0001,
       32'h1c1f_4401, 32'd21
     );
+    expect_status("CLONE_GATE_CREATE_FUNCTION",
+                  clone_gate_rm.create_function(clone_gate_binding,
+                                                clone_gate_function),
+                  RDMA_SC_OK);
+    clone_fault_function = rdma_rm_fault_function::type_id::create(
+      "clone_fault_function"
+    );
+    clone_fault_function.copy(clone_gate_function);
+    clone_fault_function.clone_fault = RDMA_RM_FUNCTION_CLONE_GOOD;
+    expect_status("CLONE_GATE_FUNCTION_GOOD",
+                  clone_gate_rm.probe_public_resource_clone(
+                    clone_fault_function, clone_probe_result
+                  ),
+                  RDMA_SC_OK);
+    clone_fault_function.clone_fault =
+      RDMA_RM_FUNCTION_CLONE_SHALLOW_BINDING;
+    expect_status("CLONE_GATE_FUNCTION_SHALLOW_BINDING",
+                  clone_gate_rm.probe_public_resource_clone(
+                    clone_fault_function, clone_probe_result
+                  ),
+                  RDMA_SC_INVALID_ARGUMENT);
+    clone_fault_function.clone_fault = RDMA_RM_FUNCTION_CLONE_SHALLOW_PCIE;
+    expect_status("CLONE_GATE_FUNCTION_SHALLOW_PCIE",
+                  clone_gate_rm.probe_public_resource_clone(
+                    clone_fault_function, clone_probe_result
+                  ),
+                  RDMA_SC_INVALID_ARGUMENT);
+    clone_fault_function.clone_fault = RDMA_RM_FUNCTION_CLONE_SHALLOW_BAR;
+    expect_status("CLONE_GATE_FUNCTION_SHALLOW_BAR",
+                  clone_gate_rm.probe_public_resource_clone(
+                    clone_fault_function, clone_probe_result
+                  ),
+                  RDMA_SC_INVALID_ARGUMENT);
+    // Function and PD do not have a legal PROGRAMMED transition.  Function
+    // clone detachment is therefore covered directly at the protected gate;
+    // PD clone faults below use its legal public stage path.
     expect_status("CLONE_GATE_CREATE_PD",
                   clone_gate_rm.create_pd(clone_gate_binding,
                                            clone_gate_pd),
@@ -1162,6 +1756,42 @@ class rdma_resource_manager_test extends uvm_test;
                                            clone_seed_mr),
                   RDMA_SC_OK);
     prepare_mr(clone_seed_mr, 64'h4100_0000);
+    clone_mapping = rdma_dma_mapping::type_id::create(
+      "clone_resource_mapping"
+    );
+    clone_mapping.function_h = clone_function_handle(
+      "CLONE_RESOURCE_MAPPING_OWNER", clone_gate_binding.make_handle()
+    );
+    clone_mapping.requester_bdf = clone_gate_binding.pcie.bdf;
+    clone_mapping.backing_addr.value = 64'h4200_0000;
+    clone_mapping.iova.value = 64'h4300_0000;
+    clone_mapping.size = 64'h2000;
+    clone_mapping.direction = RDMA_DMA_BIDIRECTIONAL;
+    clone_mapping.permissions =
+      '{device_read:1'b1, device_write:1'b1, atomic:1'b0};
+    clone_mapping.state = RDMA_MAPPING_ACTIVE;
+    clone_mapping.owner_h = clone_handle(
+      "CLONE_RESOURCE_MAPPING_HANDLE", clone_seed_mr.handle
+    );
+    clone_backing_ref = rdma_backing_ref::type_id::create(
+      "clone_resource_backing_ref"
+    );
+    clone_backing_ref.mapping = clone_mapping;
+    clone_backing_ref.ownership = RDMA_OWNERSHIP_CONTROL_PLANE;
+    clone_seed_mr.backing_refs.push_back(clone_backing_ref);
+    clone_hmc_ref = rdma_hmc_ref::type_id::create(
+      "clone_resource_hmc_ref"
+    );
+    clone_hmc_ref.owner = clone_function_handle(
+      "CLONE_RESOURCE_HMC_OWNER", clone_gate_binding.make_handle()
+    );
+    clone_hmc_ref.address.value = 64'h4400_0000;
+    clone_hmc_ref.size = 64'h2000;
+    clone_hmc_ref.first_pbl_index = 32'd5;
+    clone_hmc_ref.ownership = RDMA_OWNERSHIP_CONTROL_PLANE;
+    clone_seed_mr.hmc_refs.push_back(clone_hmc_ref);
+    clone_seed_mr.hmc_fvm_addr.value = 64'h4500_0000;
+    clone_seed_mr.hmc_fvm_addr_valid = 1'b1;
     clone_authoritative_mr = rdma_rm_fault_mr::type_id::create(
       "clone_authoritative_mr"
     );
@@ -1183,10 +1813,112 @@ class rdma_resource_manager_test extends uvm_test;
       `uvm_error("CLONE_GATE_STAGE_SELF_LOOKUP",
                  "self-clone stage changed or aliased the registry")
 
+    resource_clone_faults.push_back(RDMA_RM_CLONE_PROGRAMMABLE_DRIFT);
+    resource_clone_fault_names.push_back("PROGRAMMABLE_DRIFT");
+    resource_clone_faults.push_back(RDMA_RM_CLONE_BACKING_DRIFT);
+    resource_clone_fault_names.push_back("BACKING_DRIFT");
+    resource_clone_faults.push_back(RDMA_RM_CLONE_HMC_DRIFT);
+    resource_clone_fault_names.push_back("HMC_DRIFT");
+    resource_clone_faults.push_back(RDMA_RM_CLONE_SHALLOW_RESOURCE_HANDLE);
+    resource_clone_fault_names.push_back("SHALLOW_HANDLE");
+    resource_clone_faults.push_back(RDMA_RM_CLONE_SHALLOW_RESOURCE_OWNER);
+    resource_clone_fault_names.push_back("SHALLOW_OWNER");
+    resource_clone_faults.push_back(
+      RDMA_RM_CLONE_SHALLOW_RESOURCE_DEPENDENCY
+    );
+    resource_clone_fault_names.push_back("SHALLOW_DEPENDENCY");
+    resource_clone_faults.push_back(
+      RDMA_RM_CLONE_SHALLOW_RESOURCE_BACKING_REF
+    );
+    resource_clone_fault_names.push_back("SHALLOW_BACKING_REF");
+    resource_clone_faults.push_back(RDMA_RM_CLONE_SHALLOW_RESOURCE_MAPPING);
+    resource_clone_fault_names.push_back("SHALLOW_MAPPING");
+    resource_clone_faults.push_back(
+      RDMA_RM_CLONE_SHALLOW_RESOURCE_MAPPING_FUNCTION
+    );
+    resource_clone_fault_names.push_back("SHALLOW_MAPPING_FUNCTION");
+    resource_clone_faults.push_back(
+      RDMA_RM_CLONE_SHALLOW_RESOURCE_MAPPING_OWNER
+    );
+    resource_clone_fault_names.push_back("SHALLOW_MAPPING_OWNER");
+    resource_clone_faults.push_back(RDMA_RM_CLONE_SHALLOW_RESOURCE_HMC_REF);
+    resource_clone_fault_names.push_back("SHALLOW_HMC_REF");
+    resource_clone_faults.push_back(
+      RDMA_RM_CLONE_SHALLOW_RESOURCE_HMC_OWNER
+    );
+    resource_clone_fault_names.push_back("SHALLOW_HMC_OWNER");
+    resource_clone_faults.push_back(
+      RDMA_RM_CLONE_SHALLOW_RESOURCE_KIND_HANDLE
+    );
+    resource_clone_fault_names.push_back("SHALLOW_KIND_HANDLE");
+    resource_clone_faults.push_back(RDMA_RM_CLONE_CROSS_RESOURCE_ALIAS);
+    resource_clone_fault_names.push_back("CROSS_RESOURCE_ALIAS");
+    foreach (resource_clone_faults[i]) begin
+      clone_candidate_mr.clone_fault = resource_clone_faults[i];
+      expect_status({"CLONE_GATE_STAGE_", resource_clone_fault_names[i]},
+                    clone_gate_rm.stage_allocated(clone_candidate_mr),
+                    RDMA_SC_INVALID_ARGUMENT);
+      expect_status(
+        {"CLONE_GATE_STAGE_", resource_clone_fault_names[i], "_LOOKUP"},
+        clone_gate_rm.lookup(clone_seed_mr.handle, resource), RDMA_SC_OK
+      );
+      if (!$cast(clone_lookup_mr, resource) || clone_lookup_mr == null ||
+          clone_lookup_mr.state != RDMA_RESOURCE_ALLOCATED ||
+          clone_lookup_mr.length != clone_seed_mr.length ||
+          clone_lookup_mr.backing_refs.size() != 1 ||
+          clone_lookup_mr.backing_refs[0] == null ||
+          clone_lookup_mr.backing_refs[0].mapping == null ||
+          clone_lookup_mr.backing_refs[0].mapping.iova !=
+            clone_seed_mr.backing_refs[0].mapping.iova ||
+          clone_lookup_mr.hmc_refs.size() != 1 ||
+          clone_lookup_mr.hmc_refs[0] == null ||
+          clone_lookup_mr.hmc_refs[0].address !=
+            clone_seed_mr.hmc_refs[0].address)
+        `uvm_error(
+          {"CLONE_GATE_STAGE_", resource_clone_fault_names[i], "_ATOMIC"},
+          "faulting public resource clone changed registry authority"
+        )
+    end
+
     clone_candidate_mr.clone_fault = RDMA_RM_CLONE_GOOD;
     expect_status("CLONE_GATE_STAGE_GOOD",
                   clone_gate_rm.stage_allocated(clone_candidate_mr),
                   RDMA_SC_OK);
+    clone_candidate_mr.handle.object_id++;
+    clone_candidate_mr.owner.generation++;
+    clone_candidate_mr.dependencies[0].object_id++;
+    clone_candidate_mr.backing_refs[0].mapping.iova.value++;
+    clone_candidate_mr.backing_refs[0].mapping.function_h.generation++;
+    clone_candidate_mr.backing_refs[0].mapping.owner_h.object_id++;
+    clone_candidate_mr.hmc_refs[0].address.value++;
+    clone_candidate_mr.hmc_refs[0].owner.generation++;
+    clone_candidate_mr.pd_h.object_id++;
+    expect_status("CLONE_GATE_STAGE_DETACHED_LOOKUP",
+                  clone_gate_rm.lookup(clone_seed_mr.handle, resource),
+                  RDMA_SC_OK);
+    if (!$cast(clone_lookup_mr, resource) || clone_lookup_mr == null ||
+        !clone_lookup_mr.handle.same_instance(clone_seed_mr.handle) ||
+        !clone_lookup_mr.owner.same_instance(clone_seed_mr.owner) ||
+        !clone_lookup_mr.dependencies[0].same_instance(
+          clone_seed_mr.dependencies[0]
+        ) || clone_lookup_mr.backing_refs[0] == null ||
+        clone_lookup_mr.backing_refs[0].mapping == null ||
+        clone_lookup_mr.backing_refs[0].mapping.iova !=
+          clone_seed_mr.backing_refs[0].mapping.iova ||
+        !clone_lookup_mr.backing_refs[0].mapping.function_h.same_instance(
+          clone_seed_mr.backing_refs[0].mapping.function_h
+        ) ||
+        !clone_lookup_mr.backing_refs[0].mapping.owner_h.same_instance(
+          clone_seed_mr.backing_refs[0].mapping.owner_h
+        ) || clone_lookup_mr.hmc_refs[0] == null ||
+        clone_lookup_mr.hmc_refs[0].address !=
+          clone_seed_mr.hmc_refs[0].address ||
+        !clone_lookup_mr.hmc_refs[0].owner.same_instance(
+          clone_seed_mr.hmc_refs[0].owner
+        ) || !clone_lookup_mr.pd_h.same_instance(clone_seed_mr.pd_h))
+      `uvm_error("CLONE_GATE_STAGE_DETACHED_LOOKUP",
+                 "caller nested mutation reached staged registry authority")
+    clone_candidate_mr.copy(clone_seed_mr);
     clone_candidate_mr.clone_fault = RDMA_RM_CLONE_SELF;
     expect_status("CLONE_GATE_COMMIT_SELF",
                   clone_gate_rm.commit_programmed(clone_candidate_mr),
@@ -1198,6 +1930,33 @@ class rdma_resource_manager_test extends uvm_test;
         resource.state != RDMA_RESOURCE_ALLOCATED)
       `uvm_error("CLONE_GATE_COMMIT_SELF_LOOKUP",
                  "self-clone commit changed or aliased the registry")
+
+    foreach (resource_clone_faults[i]) begin
+      clone_candidate_mr.clone_fault = resource_clone_faults[i];
+      expect_status({"CLONE_GATE_COMMIT_", resource_clone_fault_names[i]},
+                    clone_gate_rm.commit_programmed(clone_candidate_mr),
+                    RDMA_SC_INVALID_ARGUMENT);
+      expect_status(
+        {"CLONE_GATE_COMMIT_", resource_clone_fault_names[i], "_LOOKUP"},
+        clone_gate_rm.lookup(clone_seed_mr.handle, resource), RDMA_SC_OK
+      );
+      if (!$cast(clone_lookup_mr, resource) || clone_lookup_mr == null ||
+          clone_lookup_mr.state != RDMA_RESOURCE_ALLOCATED ||
+          clone_lookup_mr.length != clone_seed_mr.length ||
+          clone_lookup_mr.backing_refs.size() != 1 ||
+          clone_lookup_mr.backing_refs[0] == null ||
+          clone_lookup_mr.backing_refs[0].mapping == null ||
+          clone_lookup_mr.backing_refs[0].mapping.iova !=
+            clone_seed_mr.backing_refs[0].mapping.iova ||
+          clone_lookup_mr.hmc_refs.size() != 1 ||
+          clone_lookup_mr.hmc_refs[0] == null ||
+          clone_lookup_mr.hmc_refs[0].address !=
+            clone_seed_mr.hmc_refs[0].address)
+        `uvm_error(
+          {"CLONE_GATE_COMMIT_", resource_clone_fault_names[i], "_ATOMIC"},
+          "faulting commit clone changed staged registry authority"
+        )
+    end
 
     clone_wrong_mr = rdma_rm_fault_mr::type_id::create("clone_wrong_mr");
     clone_wrong_mr.copy(clone_seed_mr);
@@ -1211,6 +1970,373 @@ class rdma_resource_manager_test extends uvm_test;
     expect_status("CLONE_GATE_STAGE_DRIFT",
                   clone_gate_rm.stage_allocated(clone_drift_mr),
                   RDMA_SC_INVALID_ARGUMENT);
+
+    // Each remaining resource kind is installed as an exact-type legal
+    // registry incarnation before its public publication paths are probed.
+    expect_status("CLONE_KIND_CREATE_PD",
+                  clone_gate_rm.create_pd(clone_gate_binding,
+                                          clone_kind_pd_seed),
+                  RDMA_SC_OK);
+    clone_kind_pd_authoritative = rdma_rm_fault_pd::type_id::create(
+      "clone_kind_pd_authoritative"
+    );
+    clone_kind_pd_authoritative.copy(clone_kind_pd_seed);
+    clone_kind_pd_candidate = rdma_rm_fault_pd::type_id::create(
+      "clone_kind_pd_candidate"
+    );
+    clone_kind_pd_candidate.copy(clone_kind_pd_seed);
+    clone_gate_rm.replace_authoritative(clone_kind_pd_authoritative);
+    clone_kind_pd_candidate.clone_fault = RDMA_RM_KIND_CLONE_VALUE_DRIFT;
+    expect_status("CLONE_KIND_PD_STAGE_VALUE",
+                  clone_gate_rm.stage_allocated(clone_kind_pd_candidate),
+                  RDMA_SC_INVALID_ARGUMENT);
+    expect_status("CLONE_KIND_PD_STAGE_ATOMIC",
+                  clone_gate_rm.lookup(clone_kind_pd_seed.handle, resource),
+                  RDMA_SC_OK);
+    if (!$cast(clone_kind_pd_lookup, resource) ||
+        clone_kind_pd_lookup == null ||
+        clone_kind_pd_lookup.state != RDMA_RESOURCE_ALLOCATED ||
+        clone_kind_pd_lookup.global_pd_id != clone_kind_pd_seed.global_pd_id)
+      `uvm_error("CLONE_KIND_PD_STAGE_ATOMIC",
+                 "PD clone fault changed registry authority")
+    clone_kind_pd_candidate.clone_fault = RDMA_RM_KIND_CLONE_GOOD;
+    expect_status("CLONE_KIND_PD_STAGE_GOOD",
+                  clone_gate_rm.stage_allocated(clone_kind_pd_candidate),
+                  RDMA_SC_OK);
+
+    expect_status("CLONE_KIND_CREATE_CEQ",
+                  clone_gate_rm.create_ceq(clone_gate_binding,
+                                           clone_kind_ceq_seed),
+                  RDMA_SC_OK);
+    clone_kind_ceq_seed.depth = 8;
+    clone_kind_ceq_seed.queue_iova.value = 64'h4600_0000;
+    clone_kind_ceq_authoritative = rdma_rm_fault_ceq::type_id::create(
+      "clone_kind_ceq_authoritative"
+    );
+    clone_kind_ceq_authoritative.copy(clone_kind_ceq_seed);
+    clone_kind_ceq_candidate = rdma_rm_fault_ceq::type_id::create(
+      "clone_kind_ceq_candidate"
+    );
+    clone_kind_ceq_candidate.copy(clone_kind_ceq_seed);
+    clone_gate_rm.replace_authoritative(clone_kind_ceq_authoritative);
+    clone_kind_ceq_candidate.clone_fault = RDMA_RM_KIND_CLONE_VALUE_DRIFT;
+    expect_status("CLONE_KIND_CEQ_STAGE_VALUE",
+                  clone_gate_rm.stage_allocated(clone_kind_ceq_candidate),
+                  RDMA_SC_INVALID_ARGUMENT);
+    expect_status("CLONE_KIND_CEQ_STAGE_ATOMIC",
+                  clone_gate_rm.lookup(clone_kind_ceq_seed.handle, resource),
+                  RDMA_SC_OK);
+    if (!$cast(clone_kind_ceq_lookup, resource) ||
+        clone_kind_ceq_lookup == null ||
+        clone_kind_ceq_lookup.state != RDMA_RESOURCE_ALLOCATED ||
+        clone_kind_ceq_lookup.queue_iova != clone_kind_ceq_seed.queue_iova)
+      `uvm_error("CLONE_KIND_CEQ_STAGE_ATOMIC",
+                 "CEQ stage clone fault changed registry authority")
+    clone_kind_ceq_candidate.clone_fault = RDMA_RM_KIND_CLONE_GOOD;
+    expect_status("CLONE_KIND_CEQ_STAGE_GOOD",
+                  clone_gate_rm.stage_allocated(clone_kind_ceq_candidate),
+                  RDMA_SC_OK);
+    clone_kind_ceq_candidate.clone_fault = RDMA_RM_KIND_CLONE_VALUE_DRIFT;
+    expect_status("CLONE_KIND_CEQ_COMMIT_VALUE",
+                  clone_gate_rm.commit_programmed(clone_kind_ceq_candidate),
+                  RDMA_SC_INVALID_ARGUMENT);
+    expect_status("CLONE_KIND_CEQ_COMMIT_ATOMIC",
+                  clone_gate_rm.lookup(clone_kind_ceq_seed.handle, resource),
+                  RDMA_SC_OK);
+    if (!$cast(clone_kind_ceq_lookup, resource) ||
+        clone_kind_ceq_lookup == null ||
+        clone_kind_ceq_lookup.state != RDMA_RESOURCE_ALLOCATED ||
+        clone_kind_ceq_lookup.queue_iova != clone_kind_ceq_seed.queue_iova)
+      `uvm_error("CLONE_KIND_CEQ_COMMIT_ATOMIC",
+                 "CEQ commit clone fault changed registry authority")
+
+    expect_status("CLONE_KIND_CREATE_CQ",
+                  clone_gate_rm.create_cq(clone_gate_binding,
+                                          clone_kind_ceq_seed.handle,
+                                          clone_kind_cq_seed),
+                  RDMA_SC_OK);
+    clone_kind_cq_seed.depth = 16;
+    clone_kind_cq_seed.queue_iova.value = 64'h4700_0000;
+    clone_kind_cq_authoritative = rdma_rm_fault_cq::type_id::create(
+      "clone_kind_cq_authoritative"
+    );
+    clone_kind_cq_authoritative.copy(clone_kind_cq_seed);
+    clone_kind_cq_candidate = rdma_rm_fault_cq::type_id::create(
+      "clone_kind_cq_candidate"
+    );
+    clone_kind_cq_candidate.copy(clone_kind_cq_seed);
+    clone_gate_rm.replace_authoritative(clone_kind_cq_authoritative);
+    clone_kind_cq_candidate.clone_fault = RDMA_RM_KIND_CLONE_VALUE_DRIFT;
+    expect_status("CLONE_KIND_CQ_STAGE_VALUE",
+                  clone_gate_rm.stage_allocated(clone_kind_cq_candidate),
+                  RDMA_SC_INVALID_ARGUMENT);
+    clone_kind_cq_candidate.clone_fault = RDMA_RM_KIND_CLONE_SHALLOW_HANDLES;
+    expect_status("CLONE_KIND_CQ_STAGE_HANDLE",
+                  clone_gate_rm.stage_allocated(clone_kind_cq_candidate),
+                  RDMA_SC_INVALID_ARGUMENT);
+    expect_status("CLONE_KIND_CQ_STAGE_ATOMIC",
+                  clone_gate_rm.lookup(clone_kind_cq_seed.handle, resource),
+                  RDMA_SC_OK);
+    if (!$cast(clone_kind_cq_lookup, resource) ||
+        clone_kind_cq_lookup == null ||
+        clone_kind_cq_lookup.state != RDMA_RESOURCE_ALLOCATED ||
+        clone_kind_cq_lookup.queue_iova != clone_kind_cq_seed.queue_iova ||
+        !clone_kind_cq_lookup.ceq_h.same_instance(clone_kind_cq_seed.ceq_h))
+      `uvm_error("CLONE_KIND_CQ_STAGE_ATOMIC",
+                 "CQ stage clone fault changed registry authority")
+    clone_kind_cq_candidate.clone_fault = RDMA_RM_KIND_CLONE_GOOD;
+    expect_status("CLONE_KIND_CQ_STAGE_GOOD",
+                  clone_gate_rm.stage_allocated(clone_kind_cq_candidate),
+                  RDMA_SC_OK);
+    clone_kind_cq_candidate.clone_fault = RDMA_RM_KIND_CLONE_VALUE_DRIFT;
+    expect_status("CLONE_KIND_CQ_COMMIT_VALUE",
+                  clone_gate_rm.commit_programmed(clone_kind_cq_candidate),
+                  RDMA_SC_INVALID_ARGUMENT);
+    clone_kind_cq_candidate.clone_fault = RDMA_RM_KIND_CLONE_SHALLOW_HANDLES;
+    expect_status("CLONE_KIND_CQ_COMMIT_HANDLE",
+                  clone_gate_rm.commit_programmed(clone_kind_cq_candidate),
+                  RDMA_SC_INVALID_ARGUMENT);
+    expect_status("CLONE_KIND_CQ_COMMIT_ATOMIC",
+                  clone_gate_rm.lookup(clone_kind_cq_seed.handle, resource),
+                  RDMA_SC_OK);
+    if (!$cast(clone_kind_cq_lookup, resource) ||
+        clone_kind_cq_lookup == null ||
+        clone_kind_cq_lookup.state != RDMA_RESOURCE_ALLOCATED ||
+        clone_kind_cq_lookup.queue_iova != clone_kind_cq_seed.queue_iova ||
+        !clone_kind_cq_lookup.ceq_h.same_instance(clone_kind_cq_seed.ceq_h))
+      `uvm_error("CLONE_KIND_CQ_COMMIT_ATOMIC",
+                 "CQ commit clone fault changed registry authority")
+
+    expect_status("CLONE_KIND_CREATE_SRQ",
+                  clone_gate_rm.create_srq(clone_gate_binding,
+                                           clone_kind_pd_seed.handle,
+                                           clone_kind_srq_seed),
+                  RDMA_SC_OK);
+    clone_kind_srq_seed.depth = 16;
+    clone_kind_srq_seed.queue_iova.value = 64'h4800_0000;
+    clone_kind_srq_seed.max_sge = 4;
+    clone_kind_srq_authoritative = rdma_rm_fault_srq::type_id::create(
+      "clone_kind_srq_authoritative"
+    );
+    clone_kind_srq_authoritative.copy(clone_kind_srq_seed);
+    clone_kind_srq_candidate = rdma_rm_fault_srq::type_id::create(
+      "clone_kind_srq_candidate"
+    );
+    clone_kind_srq_candidate.copy(clone_kind_srq_seed);
+    clone_gate_rm.replace_authoritative(clone_kind_srq_authoritative);
+    clone_kind_srq_candidate.clone_fault = RDMA_RM_KIND_CLONE_VALUE_DRIFT;
+    expect_status("CLONE_KIND_SRQ_STAGE_VALUE",
+                  clone_gate_rm.stage_allocated(clone_kind_srq_candidate),
+                  RDMA_SC_INVALID_ARGUMENT);
+    clone_kind_srq_candidate.clone_fault =
+      RDMA_RM_KIND_CLONE_SHALLOW_HANDLES;
+    expect_status("CLONE_KIND_SRQ_STAGE_HANDLE",
+                  clone_gate_rm.stage_allocated(clone_kind_srq_candidate),
+                  RDMA_SC_INVALID_ARGUMENT);
+    expect_status("CLONE_KIND_SRQ_STAGE_ATOMIC",
+                  clone_gate_rm.lookup(clone_kind_srq_seed.handle, resource),
+                  RDMA_SC_OK);
+    if (!$cast(clone_kind_srq_lookup, resource) ||
+        clone_kind_srq_lookup == null ||
+        clone_kind_srq_lookup.state != RDMA_RESOURCE_ALLOCATED ||
+        clone_kind_srq_lookup.max_sge != clone_kind_srq_seed.max_sge ||
+        !clone_kind_srq_lookup.pd_h.same_instance(clone_kind_srq_seed.pd_h))
+      `uvm_error("CLONE_KIND_SRQ_STAGE_ATOMIC",
+                 "SRQ stage clone fault changed registry authority")
+    clone_kind_srq_candidate.clone_fault = RDMA_RM_KIND_CLONE_GOOD;
+    expect_status("CLONE_KIND_SRQ_STAGE_GOOD",
+                  clone_gate_rm.stage_allocated(clone_kind_srq_candidate),
+                  RDMA_SC_OK);
+    clone_kind_srq_candidate.clone_fault = RDMA_RM_KIND_CLONE_VALUE_DRIFT;
+    expect_status("CLONE_KIND_SRQ_COMMIT_VALUE",
+                  clone_gate_rm.commit_programmed(clone_kind_srq_candidate),
+                  RDMA_SC_INVALID_ARGUMENT);
+    clone_kind_srq_candidate.clone_fault =
+      RDMA_RM_KIND_CLONE_SHALLOW_HANDLES;
+    expect_status("CLONE_KIND_SRQ_COMMIT_HANDLE",
+                  clone_gate_rm.commit_programmed(clone_kind_srq_candidate),
+                  RDMA_SC_INVALID_ARGUMENT);
+    expect_status("CLONE_KIND_SRQ_COMMIT_ATOMIC",
+                  clone_gate_rm.lookup(clone_kind_srq_seed.handle, resource),
+                  RDMA_SC_OK);
+    if (!$cast(clone_kind_srq_lookup, resource) ||
+        clone_kind_srq_lookup == null ||
+        clone_kind_srq_lookup.state != RDMA_RESOURCE_ALLOCATED ||
+        clone_kind_srq_lookup.max_sge != clone_kind_srq_seed.max_sge ||
+        !clone_kind_srq_lookup.pd_h.same_instance(clone_kind_srq_seed.pd_h))
+      `uvm_error("CLONE_KIND_SRQ_COMMIT_ATOMIC",
+                 "SRQ commit clone fault changed registry authority")
+
+    expect_status("CLONE_KIND_CREATE_QP",
+                  clone_gate_rm.create_qp(clone_gate_binding,
+                                          clone_kind_pd_seed.handle,
+                                          clone_kind_cq_seed.handle,
+                                          clone_kind_cq_seed.handle,
+                                          clone_kind_srq_seed.handle,
+                                          clone_kind_qp_seed),
+                  RDMA_SC_OK);
+    clone_kind_qp_seed.sq_depth = 16;
+    clone_kind_qp_seed.rq_depth = 16;
+    clone_kind_qp_seed.sq_iova.value = 64'h4900_0000;
+    clone_kind_qp_seed.rq_iova.value = 64'h4a00_0000;
+    clone_kind_qp_authoritative = rdma_rm_fault_qp::type_id::create(
+      "clone_kind_qp_authoritative"
+    );
+    clone_kind_qp_authoritative.copy(clone_kind_qp_seed);
+    clone_kind_qp_candidate = rdma_rm_fault_qp::type_id::create(
+      "clone_kind_qp_candidate"
+    );
+    clone_kind_qp_candidate.copy(clone_kind_qp_seed);
+    clone_gate_rm.replace_authoritative(clone_kind_qp_authoritative);
+    clone_kind_qp_candidate.clone_fault = RDMA_RM_KIND_CLONE_VALUE_DRIFT;
+    expect_status("CLONE_KIND_QP_STAGE_VALUE",
+                  clone_gate_rm.stage_allocated(clone_kind_qp_candidate),
+                  RDMA_SC_INVALID_ARGUMENT);
+    clone_kind_qp_candidate.clone_fault = RDMA_RM_KIND_CLONE_SHALLOW_HANDLES;
+    expect_status("CLONE_KIND_QP_STAGE_HANDLES",
+                  clone_gate_rm.stage_allocated(clone_kind_qp_candidate),
+                  RDMA_SC_INVALID_ARGUMENT);
+    expect_status("CLONE_KIND_QP_STAGE_ATOMIC",
+                  clone_gate_rm.lookup(clone_kind_qp_seed.handle, resource),
+                  RDMA_SC_OK);
+    if (!$cast(clone_kind_qp_lookup, resource) ||
+        clone_kind_qp_lookup == null ||
+        clone_kind_qp_lookup.state != RDMA_RESOURCE_ALLOCATED ||
+        clone_kind_qp_lookup.rq_iova != clone_kind_qp_seed.rq_iova ||
+        !clone_kind_qp_lookup.pd_h.same_instance(clone_kind_qp_seed.pd_h) ||
+        !clone_kind_qp_lookup.send_cq_h.same_instance(
+          clone_kind_qp_seed.send_cq_h
+        ) || !clone_kind_qp_lookup.recv_cq_h.same_instance(
+          clone_kind_qp_seed.recv_cq_h
+        ) || !clone_kind_qp_lookup.srq_h.same_instance(
+          clone_kind_qp_seed.srq_h
+        ))
+      `uvm_error("CLONE_KIND_QP_STAGE_ATOMIC",
+                 "QP stage clone fault changed registry authority")
+    clone_kind_qp_candidate.clone_fault = RDMA_RM_KIND_CLONE_GOOD;
+    expect_status("CLONE_KIND_QP_STAGE_GOOD",
+                  clone_gate_rm.stage_allocated(clone_kind_qp_candidate),
+                  RDMA_SC_OK);
+    clone_kind_qp_candidate.clone_fault = RDMA_RM_KIND_CLONE_VALUE_DRIFT;
+    expect_status("CLONE_KIND_QP_COMMIT_VALUE",
+                  clone_gate_rm.commit_programmed(clone_kind_qp_candidate),
+                  RDMA_SC_INVALID_ARGUMENT);
+    clone_kind_qp_candidate.clone_fault = RDMA_RM_KIND_CLONE_SHALLOW_HANDLES;
+    expect_status("CLONE_KIND_QP_COMMIT_HANDLES",
+                  clone_gate_rm.commit_programmed(clone_kind_qp_candidate),
+                  RDMA_SC_INVALID_ARGUMENT);
+    expect_status("CLONE_KIND_QP_COMMIT_ATOMIC",
+                  clone_gate_rm.lookup(clone_kind_qp_seed.handle, resource),
+                  RDMA_SC_OK);
+    if (!$cast(clone_kind_qp_lookup, resource) ||
+        clone_kind_qp_lookup == null ||
+        clone_kind_qp_lookup.state != RDMA_RESOURCE_ALLOCATED ||
+        clone_kind_qp_lookup.rq_iova != clone_kind_qp_seed.rq_iova ||
+        !clone_kind_qp_lookup.pd_h.same_instance(clone_kind_qp_seed.pd_h) ||
+        !clone_kind_qp_lookup.send_cq_h.same_instance(
+          clone_kind_qp_seed.send_cq_h
+        ) || !clone_kind_qp_lookup.recv_cq_h.same_instance(
+          clone_kind_qp_seed.recv_cq_h
+        ) || !clone_kind_qp_lookup.srq_h.same_instance(
+          clone_kind_qp_seed.srq_h
+        ))
+      `uvm_error("CLONE_KIND_QP_COMMIT_ATOMIC",
+                 "QP commit clone fault changed registry authority")
+
+    expect_status("CLONE_KIND_CREATE_CMQ",
+                  clone_gate_rm.create_cmq(clone_gate_binding,
+                                           clone_kind_cmq_seed),
+                  RDMA_SC_OK);
+    clone_kind_cmq_seed.depth = 8;
+    clone_kind_cmq_seed.queue_iova.value = 64'h4b00_0000;
+    clone_kind_cmq_seed.completion_iova.value = 64'h4c00_0000;
+    clone_kind_cmq_authoritative = rdma_rm_fault_cmq::type_id::create(
+      "clone_kind_cmq_authoritative"
+    );
+    clone_kind_cmq_authoritative.copy(clone_kind_cmq_seed);
+    clone_kind_cmq_candidate = rdma_rm_fault_cmq::type_id::create(
+      "clone_kind_cmq_candidate"
+    );
+    clone_kind_cmq_candidate.copy(clone_kind_cmq_seed);
+    clone_gate_rm.replace_authoritative(clone_kind_cmq_authoritative);
+    clone_kind_cmq_candidate.clone_fault = RDMA_RM_KIND_CLONE_VALUE_DRIFT;
+    expect_status("CLONE_KIND_CMQ_STAGE_VALUE",
+                  clone_gate_rm.stage_allocated(clone_kind_cmq_candidate),
+                  RDMA_SC_INVALID_ARGUMENT);
+    expect_status("CLONE_KIND_CMQ_STAGE_ATOMIC",
+                  clone_gate_rm.lookup(clone_kind_cmq_seed.handle, resource),
+                  RDMA_SC_OK);
+    if (!$cast(clone_kind_cmq_lookup, resource) ||
+        clone_kind_cmq_lookup == null ||
+        clone_kind_cmq_lookup.state != RDMA_RESOURCE_ALLOCATED ||
+        clone_kind_cmq_lookup.completion_iova !=
+          clone_kind_cmq_seed.completion_iova)
+      `uvm_error("CLONE_KIND_CMQ_STAGE_ATOMIC",
+                 "CMQ stage clone fault changed registry authority")
+    clone_kind_cmq_candidate.clone_fault = RDMA_RM_KIND_CLONE_GOOD;
+    expect_status("CLONE_KIND_CMQ_STAGE_GOOD",
+                  clone_gate_rm.stage_allocated(clone_kind_cmq_candidate),
+                  RDMA_SC_OK);
+    clone_kind_cmq_candidate.clone_fault = RDMA_RM_KIND_CLONE_VALUE_DRIFT;
+    expect_status("CLONE_KIND_CMQ_COMMIT_VALUE",
+                  clone_gate_rm.commit_programmed(clone_kind_cmq_candidate),
+                  RDMA_SC_INVALID_ARGUMENT);
+    expect_status("CLONE_KIND_CMQ_COMMIT_ATOMIC",
+                  clone_gate_rm.lookup(clone_kind_cmq_seed.handle, resource),
+                  RDMA_SC_OK);
+    if (!$cast(clone_kind_cmq_lookup, resource) ||
+        clone_kind_cmq_lookup == null ||
+        clone_kind_cmq_lookup.state != RDMA_RESOURCE_ALLOCATED ||
+        clone_kind_cmq_lookup.completion_iova !=
+          clone_kind_cmq_seed.completion_iova)
+      `uvm_error("CLONE_KIND_CMQ_COMMIT_ATOMIC",
+                 "CMQ commit clone fault changed registry authority")
+
+    expect_status("CLONE_KIND_CREATE_AEQ",
+                  clone_gate_rm.create_aeq(clone_gate_binding,
+                                           clone_kind_aeq_seed),
+                  RDMA_SC_OK);
+    clone_kind_aeq_seed.depth = 8;
+    clone_kind_aeq_seed.queue_iova.value = 64'h4d00_0000;
+    clone_kind_aeq_authoritative = rdma_rm_fault_aeq::type_id::create(
+      "clone_kind_aeq_authoritative"
+    );
+    clone_kind_aeq_authoritative.copy(clone_kind_aeq_seed);
+    clone_kind_aeq_candidate = rdma_rm_fault_aeq::type_id::create(
+      "clone_kind_aeq_candidate"
+    );
+    clone_kind_aeq_candidate.copy(clone_kind_aeq_seed);
+    clone_gate_rm.replace_authoritative(clone_kind_aeq_authoritative);
+    clone_kind_aeq_candidate.clone_fault = RDMA_RM_KIND_CLONE_VALUE_DRIFT;
+    expect_status("CLONE_KIND_AEQ_STAGE_VALUE",
+                  clone_gate_rm.stage_allocated(clone_kind_aeq_candidate),
+                  RDMA_SC_INVALID_ARGUMENT);
+    expect_status("CLONE_KIND_AEQ_STAGE_ATOMIC",
+                  clone_gate_rm.lookup(clone_kind_aeq_seed.handle, resource),
+                  RDMA_SC_OK);
+    if (!$cast(clone_kind_aeq_lookup, resource) ||
+        clone_kind_aeq_lookup == null ||
+        clone_kind_aeq_lookup.state != RDMA_RESOURCE_ALLOCATED ||
+        clone_kind_aeq_lookup.queue_iova != clone_kind_aeq_seed.queue_iova)
+      `uvm_error("CLONE_KIND_AEQ_STAGE_ATOMIC",
+                 "AEQ stage clone fault changed registry authority")
+    clone_kind_aeq_candidate.clone_fault = RDMA_RM_KIND_CLONE_GOOD;
+    expect_status("CLONE_KIND_AEQ_STAGE_GOOD",
+                  clone_gate_rm.stage_allocated(clone_kind_aeq_candidate),
+                  RDMA_SC_OK);
+    clone_kind_aeq_candidate.clone_fault = RDMA_RM_KIND_CLONE_VALUE_DRIFT;
+    expect_status("CLONE_KIND_AEQ_COMMIT_VALUE",
+                  clone_gate_rm.commit_programmed(clone_kind_aeq_candidate),
+                  RDMA_SC_INVALID_ARGUMENT);
+    expect_status("CLONE_KIND_AEQ_COMMIT_ATOMIC",
+                  clone_gate_rm.lookup(clone_kind_aeq_seed.handle, resource),
+                  RDMA_SC_OK);
+    if (!$cast(clone_kind_aeq_lookup, resource) ||
+        clone_kind_aeq_lookup == null ||
+        clone_kind_aeq_lookup.state != RDMA_RESOURCE_ALLOCATED ||
+        clone_kind_aeq_lookup.queue_iova != clone_kind_aeq_seed.queue_iova)
+      `uvm_error("CLONE_KIND_AEQ_COMMIT_ATOMIC",
+                 "AEQ commit clone fault changed registry authority")
 
     expect_status("CLONE_GATE_CREATE_RECOVERY_PD",
                   clone_gate_rm.create_pd(clone_gate_binding,
@@ -1260,6 +2386,139 @@ class rdma_resource_manager_test extends uvm_test;
     clone_hmc_ref.first_pbl_index = 32'd7;
     clone_hmc_ref.ownership = RDMA_OWNERSHIP_CONTROL_PLANE;
     clone_fault_recovery.hmc_refs.push_back(clone_hmc_ref);
+    clone_fault_recovery.completed_steps.push_back(
+      RDMA_CTRL_STEP_RESOURCE_RESERVED
+    );
+    clone_fault_recovery.pending_steps.push_back(RDMA_CTRL_STEP_HW_DRAINED);
+    clone_ticket = rdma_cmq_ticket::type_id::create(
+      "clone_recovery_ticket"
+    );
+    clone_ticket.command_id = 64'h5400_0000_0000_0001;
+    clone_ticket.function_h = clone_function_handle(
+      "CLONE_GATE_TICKET_FUNCTION", clone_gate_binding.make_handle()
+    );
+    clone_ticket.cmq_h = rdma_handle::type_id::create(
+      "clone_recovery_ticket_cmq"
+    );
+    clone_ticket.cmq_h.kind = RDMA_RESOURCE_CMQ;
+    clone_ticket.cmq_h.function_uid = clone_gate_binding.function_uid;
+    clone_ticket.cmq_h.object_id = {RDMA_RESOURCE_CMQ, 28'h000_0001};
+    clone_ticket.cmq_h.generation = clone_gate_binding.generation;
+    clone_ticket.slot_sequence = 64'd3;
+    clone_ticket.sq_index = 32'd3;
+    clone_ticket.sq_wrap = 1'b0;
+    clone_ticket.opcode_key = rdma_cmq_opcode_key::type_id::create(
+      "clone_recovery_ticket_opcode"
+    );
+    clone_ticket.opcode_key.profile_name = "clone_probe";
+    clone_ticket.opcode_key.opcode = 32'h0000_0055;
+    clone_ticket.opcode_key.variant = "default";
+    clone_ticket.absolute_deadline = 100ns;
+    clone_fault_recovery.ambiguous_ticket = clone_ticket;
+    clone_fault_recovery.primary_status.hardware_code = 32'h5500_0001;
+    clone_fault_recovery.primary_status.hardware_code_valid = 1'b0;
+    clone_fault_recovery.primary_status.function_uid =
+      clone_gate_binding.function_uid;
+    clone_fault_recovery.primary_status.generation =
+      clone_gate_binding.generation;
+    clone_fault_recovery.primary_status.resource_id =
+      clone_recovery_pd.handle.object_id;
+    clone_fault_recovery.primary_status.command_id = clone_ticket.command_id;
+    clone_fault_recovery.primary_status.wr_id = 64'h5500_0000_0000_0002;
+    clone_fault_recovery.primary_status.retryable = 1'b1;
+    clone_fault_recovery.rollback_statuses.push_back(
+      rdma_status::make(RDMA_SC_DMA_TRANSLATION,
+                        "clone rollback authority probe")
+    );
+    clone_fault_recovery.rollback_statuses[0].function_uid =
+      clone_gate_binding.function_uid;
+    clone_fault_recovery.rollback_statuses[0].generation =
+      clone_gate_binding.generation;
+
+    recovery_clone_faults.push_back(
+      RDMA_RM_CLONE_SHALLOW_RECOVERY_RESOURCE_HANDLE
+    );
+    recovery_clone_fault_names.push_back("SHALLOW_RESOURCE_HANDLE");
+    recovery_clone_faults.push_back(
+      RDMA_RM_CLONE_SHALLOW_RECOVERY_BACKING_REF
+    );
+    recovery_clone_fault_names.push_back("SHALLOW_BACKING_REF");
+    recovery_clone_faults.push_back(RDMA_RM_CLONE_SHALLOW_RECOVERY_MAPPING);
+    recovery_clone_fault_names.push_back("SHALLOW_MAPPING");
+    recovery_clone_faults.push_back(
+      RDMA_RM_CLONE_SHALLOW_RECOVERY_MAPPING_FUNCTION
+    );
+    recovery_clone_fault_names.push_back("SHALLOW_MAPPING_FUNCTION");
+    recovery_clone_faults.push_back(
+      RDMA_RM_CLONE_SHALLOW_RECOVERY_MAPPING_OWNER
+    );
+    recovery_clone_fault_names.push_back("SHALLOW_MAPPING_OWNER");
+    recovery_clone_faults.push_back(RDMA_RM_CLONE_SHALLOW_RECOVERY_HMC_REF);
+    recovery_clone_fault_names.push_back("SHALLOW_HMC_REF");
+    recovery_clone_faults.push_back(
+      RDMA_RM_CLONE_SHALLOW_RECOVERY_HMC_OWNER
+    );
+    recovery_clone_fault_names.push_back("SHALLOW_HMC_OWNER");
+    recovery_clone_faults.push_back(RDMA_RM_CLONE_SHALLOW_RECOVERY_TICKET);
+    recovery_clone_fault_names.push_back("SHALLOW_TICKET");
+    recovery_clone_faults.push_back(
+      RDMA_RM_CLONE_SHALLOW_RECOVERY_TICKET_FUNCTION
+    );
+    recovery_clone_fault_names.push_back("SHALLOW_TICKET_FUNCTION");
+    recovery_clone_faults.push_back(
+      RDMA_RM_CLONE_SHALLOW_RECOVERY_TICKET_CMQ
+    );
+    recovery_clone_fault_names.push_back("SHALLOW_TICKET_CMQ");
+    recovery_clone_faults.push_back(
+      RDMA_RM_CLONE_SHALLOW_RECOVERY_TICKET_OPCODE
+    );
+    recovery_clone_fault_names.push_back("SHALLOW_TICKET_OPCODE");
+    recovery_clone_faults.push_back(
+      RDMA_RM_CLONE_SHALLOW_RECOVERY_PRIMARY_STATUS
+    );
+    recovery_clone_fault_names.push_back("SHALLOW_PRIMARY_STATUS");
+    recovery_clone_faults.push_back(
+      RDMA_RM_CLONE_SHALLOW_RECOVERY_ROLLBACK_STATUS
+    );
+    recovery_clone_fault_names.push_back("SHALLOW_ROLLBACK_STATUS");
+    recovery_clone_faults.push_back(RDMA_RM_CLONE_RECOVERY_TICKET_DRIFT);
+    recovery_clone_fault_names.push_back("TICKET_DRIFT");
+    recovery_clone_faults.push_back(RDMA_RM_CLONE_RECOVERY_STEPS_DRIFT);
+    recovery_clone_fault_names.push_back("ORDERED_STEPS_DRIFT");
+    recovery_clone_faults.push_back(
+      RDMA_RM_CLONE_RECOVERY_PRIMARY_HIDDEN_HW_DRIFT
+    );
+    recovery_clone_fault_names.push_back("PRIMARY_HIDDEN_HW_DRIFT");
+    recovery_clone_faults.push_back(
+      RDMA_RM_CLONE_RECOVERY_ROLLBACK_STATUS_DRIFT
+    );
+    recovery_clone_fault_names.push_back("ROLLBACK_STATUS_DRIFT");
+    foreach (recovery_clone_faults[i]) begin
+      clone_fault_recovery.clone_fault = recovery_clone_faults[i];
+      expect_status(
+        {"CLONE_GATE_RECOVERY_", recovery_clone_fault_names[i]},
+        clone_gate_rm.mark_error(clone_recovery_pd.handle,
+                                 clone_fault_recovery),
+        RDMA_SC_INVALID_ARGUMENT
+      );
+      expect_status(
+        {"CLONE_GATE_RECOVERY_", recovery_clone_fault_names[i], "_STATE"},
+        clone_gate_rm.lookup(clone_recovery_pd.handle, resource), RDMA_SC_OK
+      );
+      if (resource == null || resource.state != RDMA_RESOURCE_ALLOCATED)
+        `uvm_error(
+          {"CLONE_GATE_RECOVERY_", recovery_clone_fault_names[i],
+           "_ATOMIC"},
+          "shallow recovery clone changed resource state"
+        )
+      expect_status(
+        {"CLONE_GATE_RECOVERY_", recovery_clone_fault_names[i], "_ABSENT"},
+        clone_gate_rm.lookup_recovery(clone_recovery_pd.handle,
+                                      recovery_lookup),
+        RDMA_SC_INVALID_STATE
+      );
+      clone_gate_rm.reset_error_probe(clone_recovery_pd);
+    end
     clone_fault_recovery.clone_fault = RDMA_RM_CLONE_SELF;
     expect_status("CLONE_GATE_RECOVERY_SELF",
                   clone_gate_rm.mark_error(clone_recovery_pd.handle,
@@ -1320,6 +2579,70 @@ class rdma_resource_manager_test extends uvm_test;
                   clone_gate_rm.lookup_recovery(clone_recovery_pd.handle,
                                                 recovery_lookup),
                   RDMA_SC_INVALID_STATE);
+    clone_fault_recovery.clone_fault = RDMA_RM_CLONE_GOOD;
+    expect_status("CLONE_GATE_RECOVERY_GOOD",
+                  clone_gate_rm.mark_error(clone_recovery_pd.handle,
+                                           clone_fault_recovery),
+                  RDMA_SC_OK);
+    clone_fault_recovery.resource_h.object_id++;
+    clone_fault_recovery.completed_steps.delete();
+    clone_fault_recovery.pending_steps.delete();
+    clone_fault_recovery.backing_refs[0].mapping.iova.value++;
+    clone_fault_recovery.backing_refs[0].mapping.function_h.generation++;
+    clone_fault_recovery.backing_refs[0].mapping.owner_h.object_id++;
+    clone_fault_recovery.hmc_refs[0].address.value++;
+    clone_fault_recovery.hmc_refs[0].owner.generation++;
+    clone_fault_recovery.ambiguous_ticket.command_id++;
+    clone_fault_recovery.ambiguous_ticket.function_h.generation++;
+    clone_fault_recovery.ambiguous_ticket.cmq_h.object_id++;
+    clone_fault_recovery.ambiguous_ticket.opcode_key.profile_name =
+      "caller_mutated";
+    clone_fault_recovery.primary_status.hardware_code++;
+    clone_fault_recovery.primary_status.message = "caller mutated";
+    clone_fault_recovery.rollback_statuses[0].code = RDMA_SC_TIMEOUT;
+    expect_status("CLONE_GATE_RECOVERY_GOOD_LOOKUP",
+                  clone_gate_rm.lookup_recovery(clone_recovery_pd.handle,
+                                                recovery_lookup),
+                  RDMA_SC_OK);
+    if (recovery_lookup == null ||
+        !recovery_lookup.resource_h.same_instance(clone_recovery_pd.handle) ||
+        recovery_lookup.completed_steps.size() != 1 ||
+        recovery_lookup.completed_steps[0] !=
+          RDMA_CTRL_STEP_RESOURCE_RESERVED ||
+        recovery_lookup.pending_steps.size() != 1 ||
+        recovery_lookup.pending_steps[0] != RDMA_CTRL_STEP_HW_DRAINED ||
+        recovery_lookup.backing_refs.size() != 1 ||
+        recovery_lookup.backing_refs[0] == null ||
+        recovery_lookup.backing_refs[0].mapping == null ||
+        recovery_lookup.backing_refs[0].mapping.iova.value !=
+          64'h5200_0000 ||
+        recovery_lookup.backing_refs[0].mapping.function_h.generation !=
+          clone_gate_binding.generation ||
+        recovery_lookup.backing_refs[0].mapping.owner_h.object_id !=
+          clone_recovery_pd.handle.object_id ||
+        recovery_lookup.hmc_refs.size() != 1 ||
+        recovery_lookup.hmc_refs[0] == null ||
+        recovery_lookup.hmc_refs[0].address.value != 64'h5300_0000 ||
+        recovery_lookup.hmc_refs[0].owner.generation !=
+          clone_gate_binding.generation ||
+        recovery_lookup.ambiguous_ticket == null ||
+        recovery_lookup.ambiguous_ticket.command_id !=
+          64'h5400_0000_0000_0001 ||
+        recovery_lookup.ambiguous_ticket.function_h.generation !=
+          clone_gate_binding.generation ||
+        recovery_lookup.ambiguous_ticket.cmq_h.object_id !=
+          {RDMA_RESOURCE_CMQ, 28'h000_0001} ||
+        recovery_lookup.ambiguous_ticket.opcode_key == null ||
+        recovery_lookup.ambiguous_ticket.opcode_key.profile_name !=
+          "clone_probe" || recovery_lookup.primary_status == null ||
+        recovery_lookup.primary_status.hardware_code != 32'h5500_0001 ||
+        recovery_lookup.primary_status.message != "clone authority probe" ||
+        recovery_lookup.rollback_statuses.size() != 1 ||
+        recovery_lookup.rollback_statuses[0] == null ||
+        recovery_lookup.rollback_statuses[0].code !=
+          RDMA_SC_DMA_TRANSLATION)
+      `uvm_error("CLONE_GATE_RECOVERY_GOOD_LOOKUP",
+                 "caller nested mutation reached recovery side-table state")
     expect_status("CLONE_GATE_RELEASE_FUNCTION",
                   clone_gate_rm.release_function(
                     clone_gate_binding.make_handle()
