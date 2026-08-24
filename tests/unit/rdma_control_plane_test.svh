@@ -33,11 +33,9 @@ class rdma_control_plane_probe extends rdma_control_plane;
     output rdma_mr mr,
     output rdma_control_result result
   );
-    bit caller_mapping_recovery;
-
     register_mr_internal(
       binding, request, backing, RDMA_OWNERSHIP_BORROWED, 0,
-      function_lock, mr, result, caller_mapping_recovery
+      function_lock, mr, result
     );
   endtask
 
@@ -1253,6 +1251,7 @@ class rdma_control_plane_test extends uvm_test;
     rdma_mr registry_mr;
     rdma_recovery_record recovery;
     rdma_control_result result;
+    rdma_control_result recovery_result;
     rdma_status injected_status;
     rdma_status status;
     int unsigned baseline_allocations;
@@ -1282,19 +1281,17 @@ class rdma_control_plane_test extends uvm_test;
 
     control.alloc_and_register_mr(binding, request, dma_context, 4096,
                                   mapping, mr, result);
-    expect_recovery_fallback("OWNED_PRESTAGE_RELEASE", result,
-                             RDMA_SC_INVALID_STATE);
+    expect_recovery_result("OWNED_PRESTAGE_RELEASE", result,
+                           RDMA_SC_INVALID_STATE);
     expect_cmq_opcodes("OWNED_PRESTAGE_RELEASE_OPCODES", mock_cmq,
                        expected_opcodes);
     registry_resource = null;
     recovery = null;
     if (result != null && result.resource_h != null) begin
       status = manager.lookup(result.resource_h, registry_resource);
-      expect_status("OWNED_PRESTAGE_RESOURCE_RELEASED", status,
-                    RDMA_SC_INVALID_STATE);
+      expect_status("OWNED_PRESTAGE_RESOURCE_ERROR", status, RDMA_SC_OK);
       status = manager.lookup_recovery(result.resource_h, recovery);
-      expect_status("OWNED_PRESTAGE_RECOVERY_ABSENT", status,
-                    RDMA_SC_INVALID_STATE);
+      expect_status("OWNED_PRESTAGE_RECOVERY", status, RDMA_SC_OK);
     end
     else begin
       `uvm_error("OWNED_PRESTAGE_RESOURCE_HANDLE",
@@ -1311,23 +1308,41 @@ class rdma_control_plane_test extends uvm_test;
 
     if (result == null ||
         !result.final_resource_state_known ||
-        result.final_resource_state != RDMA_RESOURCE_RELEASED ||
-        result.recovery_required || result.rollback_statuses.size() != 1 ||
+        result.final_resource_state != RDMA_RESOURCE_ERROR ||
+        !result.recovery_required || result.rollback_statuses.size() != 1 ||
         result.rollback_statuses[0] == null ||
         result.rollback_statuses[0].code != RDMA_SC_UNKNOWN_HW_ERROR ||
-        mapping == null || mapping.state != RDMA_MAPPING_ACTIVE || mr != null ||
-        registry_mr != null ||
-        recovery != null ||
+        mapping != null || mr == null || mr.state != RDMA_RESOURCE_ERROR ||
+        registry_mr == null || registry_mr.state != RDMA_RESOURCE_ERROR ||
+        recovery == null ||
+        recovery.hardware_presence != RDMA_HW_PRESENCE_ABSENT ||
+        recovery.pending_steps.size() != 1 ||
+        recovery.pending_steps[0] != RDMA_CTRL_STEP_BACKING_RELEASED ||
+        recovery.backing_refs.size() != 1 ||
+        recovery.backing_refs[0] == null ||
+        recovery.backing_refs[0].release_complete ||
+        recovery.backing_refs[0].mapping == null ||
+        recovery.backing_refs[0].mapping.state != RDMA_MAPPING_ACTIVE ||
         host_mem.live_allocations() != baseline_allocations + 1 ||
-        final_leaks != baseline_leaks || release_calls != 1)
+        final_leaks != baseline_leaks + 1 || release_calls != 1 ||
+        manager.release_reserved_calls != 0)
       `uvm_error(
         "OWNED_PRESTAGE_RELEASE_STATE",
-        "pre-stage rollback fallback lost mapping or reservation authority"
+        "pre-stage backing failure was not durably retained"
       )
 
-    if (mapping != null) begin
-      status = host_mem.\release (mapping);
-      expect_status("OWNED_PRESTAGE_CALLER_RELEASE", status, RDMA_SC_OK);
+    if (result != null && result.resource_h != null)
+      control.recover_resource(binding, result.resource_h, recovery_result);
+    else
+      recovery_result = null;
+    expect_result("OWNED_PRESTAGE_RECOVER", recovery_result, RDMA_SC_OK);
+    if (result != null && result.resource_h != null) begin
+      status = manager.lookup(result.resource_h, registry_resource);
+      expect_status("OWNED_PRESTAGE_RELEASED", status,
+                    RDMA_SC_INVALID_STATE);
+      status = manager.lookup_recovery(result.resource_h, recovery);
+      expect_status("OWNED_PRESTAGE_RECOVERY_CLEARED", status,
+                    RDMA_SC_INVALID_STATE);
     end
     release_calls = 0;
     foreach (host_mem.calls[i])
@@ -1335,11 +1350,11 @@ class rdma_control_plane_test extends uvm_test;
           host_mem.calls[i].method_name == "release")
         release_calls++;
     void'(manager.check_leaks(final_leaks, binding.make_handle()));
-    if (mapping == null || mapping.state != RDMA_MAPPING_RELEASED ||
-        host_mem.live_allocations() != baseline_allocations ||
-        final_leaks != baseline_leaks || release_calls != 2)
-      `uvm_error("OWNED_PRESTAGE_CALLER_STATE",
-                 "caller release did not preserve reservation cleanup")
+    if (host_mem.live_allocations() != baseline_allocations ||
+        final_leaks != baseline_leaks || release_calls != 2 ||
+        manager.release_reserved_calls != 0)
+      `uvm_error("OWNED_PRESTAGE_RECOVER_STATE",
+                 "durable pre-stage recovery did not finish exactly once")
   endtask
 
   task automatic check_owned_mr_prestage_double_cleanup_failure();
@@ -1420,11 +1435,9 @@ class rdma_control_plane_test extends uvm_test;
         !result.recovery_required ||
         result.final_resource_state != RDMA_RESOURCE_ERROR ||
         !result.final_resource_state_known ||
-        result.rollback_statuses.size() != 2 ||
+        result.rollback_statuses.size() != 1 ||
         result.rollback_statuses[0] == null ||
         result.rollback_statuses[0].code != RDMA_SC_UNKNOWN_HW_ERROR ||
-        result.rollback_statuses[1] == null ||
-        result.rollback_statuses[1].code != RDMA_SC_RESOURCE_BUSY ||
         recovery == null ||
         recovery.hardware_presence != RDMA_HW_PRESENCE_ABSENT ||
         recovery.pending_steps.size() != 1 ||
@@ -1435,7 +1448,8 @@ class rdma_control_plane_test extends uvm_test;
         recovery.backing_refs[0].release_complete ||
         recovery.backing_refs[0].mapping.state != RDMA_MAPPING_ACTIVE ||
         host_mem.live_allocations() != baseline_allocations + 1 ||
-        final_leaks != baseline_leaks + 1 || release_calls != 1)
+        final_leaks != baseline_leaks + 1 || release_calls != 1 ||
+        manager.release_reserved_calls != 0)
       `uvm_error("OWNED_PRESTAGE_DOUBLE_STATE",
                  "double cleanup failure lost durable manager authority")
 
@@ -1467,7 +1481,8 @@ class rdma_control_plane_test extends uvm_test;
         recovery.pending_steps.size() != 1 ||
         recovery.pending_steps[0] != RDMA_CTRL_STEP_BACKING_RELEASED ||
         host_mem.live_allocations() != baseline_allocations + 1 ||
-        final_leaks != baseline_leaks + 1)
+        final_leaks != baseline_leaks + 1 ||
+        manager.release_reserved_calls != 0)
       `uvm_error("OWNED_PRESTAGE_DOUBLE_RETRY_STATE",
                  "failed retry did not retain durable recovery authority")
 
@@ -1516,7 +1531,8 @@ class rdma_control_plane_test extends uvm_test;
         recovery.backing_refs[0].mapping == null ||
         recovery.backing_refs[0].mapping.state != RDMA_MAPPING_ACTIVE ||
         host_mem.live_allocations() != baseline_allocations ||
-        final_leaks != baseline_leaks + 1 || release_calls != 3)
+        final_leaks != baseline_leaks + 1 || release_calls != 3 ||
+        manager.release_reserved_calls != 0)
       `uvm_error("OWNED_PRESTAGE_DOUBLE_COMPLETE_STATE",
                  "post-release completion failure was not retryable")
 
@@ -1538,7 +1554,8 @@ class rdma_control_plane_test extends uvm_test;
           host_mem.calls[i].method_name == "release")
         release_calls++;
     if (host_mem.live_allocations() != baseline_allocations ||
-        final_leaks != baseline_leaks || release_calls != 3)
+        final_leaks != baseline_leaks || release_calls != 3 ||
+        manager.release_reserved_calls != 0)
       `uvm_error("OWNED_PRESTAGE_DOUBLE_RECOVER_STATE",
                  "reserved ERROR recovery did not finish exactly once")
   endtask
@@ -1766,12 +1783,14 @@ class rdma_control_plane_test extends uvm_test;
     rdma_mr registry_mr;
     rdma_recovery_record recovery;
     rdma_control_result result;
+    rdma_control_result recovery_result;
     rdma_status injected_status;
     rdma_status status;
     int unsigned baseline_allocations;
     int unsigned baseline_leaks;
     int unsigned final_leaks;
     int unsigned release_calls;
+    bit release_complete;
     bit [7:0] expected_opcodes[$];
 
     setup_owned_mr_case(
@@ -1798,8 +1817,8 @@ class rdma_control_plane_test extends uvm_test;
 
     control.alloc_and_register_mr(binding, request, dma_context, 4096,
                                   mapping, mr, result);
-    expect_recovery_fallback("OWNED_RELEASED_MAPPING", result,
-                             RDMA_SC_INVALID_STATE);
+    expect_recovery_result("OWNED_RELEASED_MAPPING", result,
+                           RDMA_SC_INVALID_STATE);
     expect_cmq_opcodes("OWNED_RELEASED_MAPPING_OPCODES", mock_cmq,
                        expected_opcodes);
     registry_resource = null;
@@ -1808,8 +1827,16 @@ class rdma_control_plane_test extends uvm_test;
       status = manager.lookup(result.resource_h, registry_resource);
       expect_status("OWNED_RELEASED_MAPPING_LOOKUP", status, RDMA_SC_OK);
       status = manager.lookup_recovery(result.resource_h, recovery);
-      expect_status("OWNED_RELEASED_MAPPING_RECOVERY_ABSENT", status,
-                    RDMA_SC_INVALID_STATE);
+      expect_status("OWNED_RELEASED_MAPPING_RECOVERY", status, RDMA_SC_OK);
+    end
+    release_complete = 1'b0;
+    if (recovery != null && recovery.backing_refs.size() == 1 &&
+        recovery.backing_refs[0] != null &&
+        recovery.backing_refs[0].mapping != null) begin
+      status = manager.query_owned_release_completion(
+        recovery.backing_refs[0].mapping, release_complete
+      );
+      expect_status("OWNED_RELEASED_MAPPING_OPAQUE", status, RDMA_SC_OK);
     end
     registry_mr = null;
     void'($cast(registry_mr, registry_resource));
@@ -1822,20 +1849,93 @@ class rdma_control_plane_test extends uvm_test;
 
     if (result == null || result.resource_h == null ||
         !result.final_resource_state_known ||
-        result.final_resource_state != RDMA_RESOURCE_ALLOCATED ||
-        result.recovery_required || result.rollback_statuses.size() != 2 ||
+        result.final_resource_state != RDMA_RESOURCE_ERROR ||
+        !result.recovery_required || result.rollback_statuses.size() != 1 ||
         result.rollback_statuses[0] == null ||
         result.rollback_statuses[0].code != RDMA_SC_RESOURCE_BUSY ||
-        result.rollback_statuses[1] == null ||
-        result.rollback_statuses[1].code != RDMA_SC_INVALID_STATE ||
-        mapping != null || mr != null || registry_mr == null ||
-        registry_mr.state != RDMA_RESOURCE_ALLOCATED || recovery != null ||
+        mapping != null || mr == null || mr.state != RDMA_RESOURCE_ERROR ||
+        registry_mr == null || registry_mr.state != RDMA_RESOURCE_ERROR ||
+        recovery == null ||
+        recovery.hardware_presence != RDMA_HW_PRESENCE_ABSENT ||
+        recovery.ambiguous_ticket != null || recovery.hmc_refs.size() != 0 ||
+        recovery.pending_steps.size() != 1 ||
+        recovery.pending_steps[0] != RDMA_CTRL_STEP_RESOURCE_RELEASED ||
+        recovery.completed_steps.size() == 0 ||
+        recovery.completed_steps[$] != RDMA_CTRL_STEP_BACKING_RELEASED ||
+        recovery.backing_refs.size() != 1 ||
+        recovery.backing_refs[0] == null ||
+        !recovery.backing_refs[0].release_complete ||
+        recovery.backing_refs[0].mapping == null ||
+        recovery.backing_refs[0].mapping.state != RDMA_MAPPING_RELEASED ||
+        !release_complete ||
         host_mem.live_allocations() != baseline_allocations ||
-        final_leaks != baseline_leaks + 1 || release_calls != 1)
+        final_leaks != baseline_leaks + 1 || release_calls != 1 ||
+        manager.release_reserved_calls != 1)
       `uvm_error(
         "OWNED_RELEASED_MAPPING_STATE",
-        "post-release fallback returned a stale active mapping snapshot"
+        "released backing was not retained as durable resource recovery"
       )
+
+    injected_status = rdma_status::make(
+      RDMA_SC_RESOURCE_BUSY,
+      "injected released-backing completion failure"
+    );
+    status = manager.fail_next_transition("complete_reserved_error",
+                                          injected_status);
+    expect_status("OWNED_RELEASED_MAPPING_COMPLETE_INJECT", status,
+                  RDMA_SC_OK);
+    if (result != null && result.resource_h != null)
+      control.recover_resource(binding, result.resource_h, recovery_result);
+    else
+      recovery_result = null;
+    expect_recovery_result("OWNED_RELEASED_MAPPING_RETRY", recovery_result,
+                           RDMA_SC_RESOURCE_BUSY);
+    recovery = null;
+    registry_resource = null;
+    if (result != null && result.resource_h != null) begin
+      status = manager.lookup(result.resource_h, registry_resource);
+      expect_status("OWNED_RELEASED_MAPPING_RETRY_LOOKUP", status,
+                    RDMA_SC_OK);
+      status = manager.lookup_recovery(result.resource_h, recovery);
+      expect_status("OWNED_RELEASED_MAPPING_RETRY_RECORD", status,
+                    RDMA_SC_OK);
+    end
+    void'(manager.check_leaks(final_leaks, binding.make_handle()));
+    release_calls = 0;
+    foreach (host_mem.calls[i])
+      if (host_mem.calls[i] != null &&
+          host_mem.calls[i].method_name == "release")
+        release_calls++;
+    if (registry_resource == null ||
+        registry_resource.state != RDMA_RESOURCE_ERROR || recovery == null ||
+        recovery.pending_steps.size() != 1 ||
+        recovery.pending_steps[0] != RDMA_CTRL_STEP_RESOURCE_RELEASED ||
+        host_mem.live_allocations() != baseline_allocations ||
+        final_leaks != baseline_leaks + 1 || release_calls != 1)
+      `uvm_error("OWNED_RELEASED_MAPPING_RETRY_STATE",
+                 "resource-only recovery failure was not retryable")
+
+    if (result != null && result.resource_h != null)
+      control.recover_resource(binding, result.resource_h, recovery_result);
+    else
+      recovery_result = null;
+    expect_result("OWNED_RELEASED_MAPPING_RECOVER", recovery_result,
+                  RDMA_SC_OK);
+    if (result != null && result.resource_h != null) begin
+      status = manager.lookup(result.resource_h, registry_resource);
+      expect_status("OWNED_RELEASED_MAPPING_RELEASED", status,
+                    RDMA_SC_INVALID_STATE);
+    end
+    void'(manager.check_leaks(final_leaks, binding.make_handle()));
+    release_calls = 0;
+    foreach (host_mem.calls[i])
+      if (host_mem.calls[i] != null &&
+          host_mem.calls[i].method_name == "release")
+        release_calls++;
+    if (host_mem.live_allocations() != baseline_allocations ||
+        final_leaks != baseline_leaks || release_calls != 1)
+      `uvm_error("OWNED_RELEASED_MAPPING_RECOVER_STATE",
+                 "resource-only recovery released backing more than once")
   endtask
 
   task automatic check_owned_mr_success();

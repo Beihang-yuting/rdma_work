@@ -40,10 +40,12 @@ endclass
 class rdma_fault_inject_resource_manager extends rdma_resource_manager;
   `uvm_object_utils(rdma_fault_inject_resource_manager)
 
+  int unsigned release_reserved_calls;
   protected rdma_status transition_failures[string];
 
   function new(string name = "rdma_fault_inject_resource_manager");
     super.new(name);
+    release_reserved_calls = 0;
     transition_failures.delete();
   endfunction
 
@@ -99,6 +101,7 @@ class rdma_fault_inject_resource_manager extends rdma_resource_manager;
   virtual function rdma_status release_reserved(rdma_handle handle);
     rdma_status failure;
 
+    release_reserved_calls++;
     failure = take_transition_failure("release_reserved");
     if (failure != null)
       return failure;

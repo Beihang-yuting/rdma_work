@@ -2718,6 +2718,8 @@ class rdma_resource_manager extends uvm_object;
     rdma_function_handle related_owner;
     rdma_handle trusted_handle;
     rdma_status status;
+    bit opaque_release_complete;
+    bit backing_release_pending;
     string key;
 
     status = project_handle_value(handle, "mark error", trusted_handle);
@@ -2778,24 +2780,49 @@ class rdma_resource_manager extends uvm_object;
           recovery_copy.ambiguous_ticket != null ||
           recovery_copy.hmc_refs.size() != 0 ||
           recovery_copy.pending_steps.size() != 1 ||
-          recovery_copy.pending_steps[0] !=
-            RDMA_CTRL_STEP_BACKING_RELEASED ||
+          !(recovery_copy.pending_steps[0] inside {
+            RDMA_CTRL_STEP_BACKING_RELEASED,
+            RDMA_CTRL_STEP_RESOURCE_RELEASED
+          }) ||
           recovery_copy.backing_refs.size() != 1)
         return rdma_status::make(
           RDMA_SC_INVALID_ARGUMENT,
-          "reserved ERROR recovery is not local backing cleanup"
+          "reserved ERROR recovery is not canonical local cleanup"
         );
+      backing_release_pending = recovery_copy.pending_steps[0] ==
+        RDMA_CTRL_STEP_BACKING_RELEASED;
       foreach (recovery_copy.backing_refs[i]) begin
         if (recovery_copy.backing_refs[i] == null ||
             recovery_copy.backing_refs[i].ownership !=
               RDMA_OWNERSHIP_CONTROL_PLANE ||
-            recovery_copy.backing_refs[i].release_complete ||
-            recovery_copy.backing_refs[i].mapping == null ||
-            recovery_copy.backing_refs[i].mapping.state !=
-              RDMA_MAPPING_ACTIVE)
+            recovery_copy.backing_refs[i].mapping == null)
           return rdma_status::make(
             RDMA_SC_INVALID_ARGUMENT,
-            "reserved ERROR backing authority is not owned and live"
+            "reserved ERROR backing authority is incomplete"
+          );
+        status = query_owned_release_completion(
+          recovery_copy.backing_refs[i].mapping, opaque_release_complete
+        );
+        if (status == null || !status.ok())
+          return rdma_status::make(
+            RDMA_SC_INVALID_ARGUMENT,
+            "reserved ERROR backing completion proof is invalid"
+          );
+        if (backing_release_pending &&
+            (recovery_copy.backing_refs[i].release_complete ||
+             recovery_copy.backing_refs[i].mapping.state !=
+               RDMA_MAPPING_ACTIVE || opaque_release_complete))
+          return rdma_status::make(
+            RDMA_SC_INVALID_ARGUMENT,
+            "reserved ERROR backing cleanup is not owned and live"
+          );
+        if (!backing_release_pending &&
+            (!recovery_copy.backing_refs[i].release_complete ||
+             recovery_copy.backing_refs[i].mapping.state !=
+               RDMA_MAPPING_RELEASED || !opaque_release_complete))
+          return rdma_status::make(
+            RDMA_SC_INVALID_ARGUMENT,
+            "reserved ERROR resource cleanup lacks released backing"
           );
       end
     end
@@ -2844,6 +2871,7 @@ class rdma_resource_manager extends uvm_object;
     rdma_recovery_record recovery;
     rdma_dma_mapping canonical_mapping;
     rdma_status status;
+    bit backing_release_pending;
     bit release_complete;
     string key;
 
@@ -2870,13 +2898,34 @@ class rdma_resource_manager extends uvm_object;
         recovery.ambiguous_ticket != null ||
         recovery.hmc_refs.size() != 0 ||
         recovery.pending_steps.size() != 1 ||
-        recovery.pending_steps[0] != RDMA_CTRL_STEP_BACKING_RELEASED ||
+        !(recovery.pending_steps[0] inside {
+          RDMA_CTRL_STEP_BACKING_RELEASED,
+          RDMA_CTRL_STEP_RESOURCE_RELEASED
+        }) ||
         recovery.backing_refs.size() != 1 ||
         recovery.backing_refs[0] == null ||
+        recovery.backing_refs[0].ownership !=
+          RDMA_OWNERSHIP_CONTROL_PLANE ||
         recovery.backing_refs[0].mapping == null)
       return rdma_status::make(
         RDMA_SC_RECOVERY_REQUIRED,
         "reserved ERROR MR still requires non-local recovery"
+      );
+    backing_release_pending = recovery.pending_steps[0] ==
+      RDMA_CTRL_STEP_BACKING_RELEASED;
+    if (backing_release_pending &&
+        (recovery.backing_refs[0].release_complete ||
+         recovery.backing_refs[0].mapping.state != RDMA_MAPPING_ACTIVE))
+      return rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT,
+        "reserved ERROR backing cleanup schema is invalid"
+      );
+    if (!backing_release_pending &&
+        (!recovery.backing_refs[0].release_complete ||
+         recovery.backing_refs[0].mapping.state != RDMA_MAPPING_RELEASED))
+      return rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT,
+        "reserved ERROR resource cleanup schema is invalid"
       );
     // Public RELEASED state is forgeable; completion is proven solely by the
     // adapter-sealed fact shared with the canonical recovery mapping.
