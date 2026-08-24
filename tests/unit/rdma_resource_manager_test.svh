@@ -94,7 +94,9 @@ typedef enum bit [5:0] {
   RDMA_RM_CLONE_RECOVERY_TICKET_DRIFT,
   RDMA_RM_CLONE_RECOVERY_STEPS_DRIFT,
   RDMA_RM_CLONE_RECOVERY_PRIMARY_HIDDEN_HW_DRIFT,
-  RDMA_RM_CLONE_RECOVERY_ROLLBACK_STATUS_DRIFT
+  RDMA_RM_CLONE_RECOVERY_ROLLBACK_STATUS_DRIFT,
+  RDMA_RM_CLONE_MUTATE_SOURCE_SCALAR,
+  RDMA_RM_CLONE_LAUNDER_SOURCE_CHILD
 } rdma_rm_clone_fault_e;
 
 typedef enum bit [1:0] {
@@ -124,6 +126,7 @@ class rdma_rm_fault_mr extends rdma_mr;
     uvm_object cloned_object;
     rdma_rm_fault_mr cloned_mr;
     rdma_pd wrong_pd;
+    rdma_handle saved_pd_h;
 
     case (clone_fault)
       RDMA_RM_CLONE_SELF: return this;
@@ -268,6 +271,22 @@ class rdma_rm_fault_mr extends rdma_mr;
                      "fault MR cross-alias setup failed")
         cloned_mr.backing_refs[0].mapping.function_h = hmc_refs[0].owner;
         cloned_mr.backing_refs[0].mapping.owner_h = handle;
+        return cloned_mr;
+      end
+      RDMA_RM_CLONE_MUTATE_SOURCE_SCALAR: begin
+        cloned_object = super.clone();
+        if (!$cast(cloned_mr, cloned_object))
+          `uvm_fatal("RM_TEST_CLONE", "fault MR clone cast failed")
+        length++;
+        return cloned_mr;
+      end
+      RDMA_RM_CLONE_LAUNDER_SOURCE_CHILD: begin
+        saved_pd_h = pd_h;
+        cloned_object = super.clone();
+        if (!$cast(cloned_mr, cloned_object))
+          `uvm_fatal("RM_TEST_CLONE", "fault MR clone cast failed")
+        pd_h = cloned_mr.pd_h;
+        cloned_mr.pd_h = saved_pd_h;
         return cloned_mr;
       end
       default: return super.clone();
@@ -470,6 +489,7 @@ class rdma_rm_fault_recovery extends rdma_recovery_record;
   virtual function uvm_object clone();
     uvm_object cloned_object;
     rdma_rm_fault_recovery cloned_recovery;
+    rdma_cmq_ticket saved_ticket;
 
     case (clone_fault)
       RDMA_RM_CLONE_SELF: return this;
@@ -656,6 +676,22 @@ class rdma_rm_fault_recovery extends rdma_recovery_record;
           !cloned_recovery.rollback_statuses[0].retryable;
         return cloned_recovery;
       end
+      RDMA_RM_CLONE_MUTATE_SOURCE_SCALAR: begin
+        cloned_object = super.clone();
+        if (!$cast(cloned_recovery, cloned_object))
+          `uvm_fatal("RM_TEST_CLONE", "fault recovery clone cast failed")
+        hardware_presence = RDMA_HW_PRESENCE_PRESENT;
+        return cloned_recovery;
+      end
+      RDMA_RM_CLONE_LAUNDER_SOURCE_CHILD: begin
+        saved_ticket = ambiguous_ticket;
+        cloned_object = super.clone();
+        if (!$cast(cloned_recovery, cloned_object))
+          `uvm_fatal("RM_TEST_CLONE", "fault recovery clone cast failed")
+        ambiguous_ticket = cloned_recovery.ambiguous_ticket;
+        cloned_recovery.ambiguous_ticket = saved_ticket;
+        return cloned_recovery;
+      end
       default: return super.clone();
     endcase
   endfunction
@@ -668,6 +704,18 @@ class rdma_clone_probe_manager extends rdma_resource_manager;
 
   function void replace_authoritative(rdma_resource replacement);
     registry[resource_key(replacement.handle)] = replacement;
+  endfunction
+
+  function void reset_publication_probe(rdma_resource replacement,
+                                        bit staged);
+    string key;
+
+    key = resource_key(replacement.handle);
+    registry[key] = replacement;
+    if (staged)
+      staged_allocations[key] = 1'b1;
+    else
+      staged_allocations.delete(key);
   endfunction
 
   function rdma_status probe_public_resource_clone(
@@ -1003,6 +1051,10 @@ class rdma_resource_manager_test extends uvm_test;
     rdma_rm_clone_fault_e recovery_clone_faults[$];
     string recovery_clone_fault_names[$];
     rdma_cmq_ticket clone_ticket;
+    rdma_handle mutating_clone_pd_ref;
+    rdma_cmq_ticket mutating_clone_ticket_ref;
+    longint unsigned mutating_clone_length;
+    rdma_hw_presence_e mutating_clone_presence;
     rdma_status s;
     int unsigned leak_count;
     int unsigned pd_local_before_exhaustion;
@@ -1971,6 +2023,57 @@ class rdma_resource_manager_test extends uvm_test;
                   clone_gate_rm.stage_allocated(clone_drift_mr),
                   RDMA_SC_INVALID_ARGUMENT);
 
+    // A hostile clone may mutate its source after producing a valid copy.
+    // Rejection must restore the complete caller value and keep publication
+    // atomic even when the result looks like the pre-mutation source.
+    clone_authoritative_mr.copy(clone_seed_mr);
+    clone_authoritative_mr.clone_fault = RDMA_RM_CLONE_GOOD;
+    clone_candidate_mr.copy(clone_seed_mr);
+    clone_gate_rm.reset_publication_probe(clone_authoritative_mr, 1'b0);
+    mutating_clone_length = clone_candidate_mr.length;
+    clone_candidate_mr.clone_fault = RDMA_RM_CLONE_MUTATE_SOURCE_SCALAR;
+    expect_status("CLONE_GATE_MUTATE_SOURCE_STAGE",
+                  clone_gate_rm.stage_allocated(clone_candidate_mr),
+                  RDMA_SC_INVALID_ARGUMENT);
+    if (clone_candidate_mr.length != mutating_clone_length)
+      `uvm_error("CLONE_GATE_MUTATE_SOURCE_STAGE_RESTORE",
+                 "rejected clone left its caller source scalar mutated")
+    expect_status("CLONE_GATE_MUTATE_SOURCE_STAGE_ATOMIC",
+                  clone_gate_rm.lookup(clone_seed_mr.handle, resource),
+                  RDMA_SC_OK);
+    if (!$cast(clone_lookup_mr, resource) || clone_lookup_mr == null ||
+        clone_lookup_mr.state != RDMA_RESOURCE_ALLOCATED ||
+        clone_lookup_mr.length != clone_seed_mr.length)
+      `uvm_error("CLONE_GATE_MUTATE_SOURCE_STAGE_ATOMIC",
+                 "source-mutating stage changed registry authority")
+
+    // The clone result launders a pre-clone caller child by swapping an equal
+    // detached child into its source.  Detachment must use the pre-clone graph.
+    clone_authoritative_mr.copy(clone_seed_mr);
+    clone_authoritative_mr.clone_fault = RDMA_RM_CLONE_GOOD;
+    clone_candidate_mr.copy(clone_seed_mr);
+    clone_candidate_mr.clone_fault = RDMA_RM_CLONE_GOOD;
+    clone_gate_rm.reset_publication_probe(clone_authoritative_mr, 1'b0);
+    expect_status("CLONE_GATE_LAUNDER_SOURCE_STAGE_GOOD",
+                  clone_gate_rm.stage_allocated(clone_candidate_mr),
+                  RDMA_SC_OK);
+    mutating_clone_pd_ref = clone_candidate_mr.pd_h;
+    clone_candidate_mr.clone_fault = RDMA_RM_CLONE_LAUNDER_SOURCE_CHILD;
+    expect_status("CLONE_GATE_LAUNDER_SOURCE_COMMIT",
+                  clone_gate_rm.commit_programmed(clone_candidate_mr),
+                  RDMA_SC_INVALID_ARGUMENT);
+    if (clone_candidate_mr.pd_h != mutating_clone_pd_ref)
+      `uvm_error("CLONE_GATE_LAUNDER_SOURCE_COMMIT_RESTORE",
+                 "rejected clone replaced its caller source child")
+    expect_status("CLONE_GATE_LAUNDER_SOURCE_COMMIT_ATOMIC",
+                  clone_gate_rm.lookup(clone_seed_mr.handle, resource),
+                  RDMA_SC_OK);
+    if (!$cast(clone_lookup_mr, resource) || clone_lookup_mr == null ||
+        clone_lookup_mr.state != RDMA_RESOURCE_ALLOCATED ||
+        !clone_lookup_mr.pd_h.same_instance(clone_seed_mr.pd_h))
+      `uvm_error("CLONE_GATE_LAUNDER_SOURCE_COMMIT_ATOMIC",
+                 "child-laundering commit changed registry authority")
+
     // Each remaining resource kind is installed as an exact-type legal
     // registry incarnation before its public publication paths are probed.
     expect_status("CLONE_KIND_CREATE_PD",
@@ -2434,6 +2537,48 @@ class rdma_resource_manager_test extends uvm_test;
       clone_gate_binding.function_uid;
     clone_fault_recovery.rollback_statuses[0].generation =
       clone_gate_binding.generation;
+
+    mutating_clone_presence = clone_fault_recovery.hardware_presence;
+    clone_fault_recovery.clone_fault = RDMA_RM_CLONE_MUTATE_SOURCE_SCALAR;
+    expect_status("CLONE_GATE_RECOVERY_MUTATE_SOURCE",
+                  clone_gate_rm.mark_error(clone_recovery_pd.handle,
+                                           clone_fault_recovery),
+                  RDMA_SC_INVALID_ARGUMENT);
+    if (clone_fault_recovery.hardware_presence != mutating_clone_presence)
+      `uvm_error("CLONE_GATE_RECOVERY_MUTATE_SOURCE_RESTORE",
+                 "rejected recovery clone left its source scalar mutated")
+    expect_status("CLONE_GATE_RECOVERY_MUTATE_SOURCE_STATE",
+                  clone_gate_rm.lookup(clone_recovery_pd.handle, resource),
+                  RDMA_SC_OK);
+    if (resource == null || resource.state != RDMA_RESOURCE_ALLOCATED)
+      `uvm_error("CLONE_GATE_RECOVERY_MUTATE_SOURCE_ATOMIC",
+                 "source-mutating recovery changed resource state")
+    expect_status("CLONE_GATE_RECOVERY_MUTATE_SOURCE_ABSENT",
+                  clone_gate_rm.lookup_recovery(clone_recovery_pd.handle,
+                                                recovery_lookup),
+                  RDMA_SC_INVALID_STATE);
+    clone_gate_rm.reset_error_probe(clone_recovery_pd);
+
+    mutating_clone_ticket_ref = clone_fault_recovery.ambiguous_ticket;
+    clone_fault_recovery.clone_fault = RDMA_RM_CLONE_LAUNDER_SOURCE_CHILD;
+    expect_status("CLONE_GATE_RECOVERY_LAUNDER_SOURCE",
+                  clone_gate_rm.mark_error(clone_recovery_pd.handle,
+                                           clone_fault_recovery),
+                  RDMA_SC_INVALID_ARGUMENT);
+    if (clone_fault_recovery.ambiguous_ticket != mutating_clone_ticket_ref)
+      `uvm_error("CLONE_GATE_RECOVERY_LAUNDER_SOURCE_RESTORE",
+                 "rejected recovery clone replaced its source ticket")
+    expect_status("CLONE_GATE_RECOVERY_LAUNDER_SOURCE_STATE",
+                  clone_gate_rm.lookup(clone_recovery_pd.handle, resource),
+                  RDMA_SC_OK);
+    if (resource == null || resource.state != RDMA_RESOURCE_ALLOCATED)
+      `uvm_error("CLONE_GATE_RECOVERY_LAUNDER_SOURCE_ATOMIC",
+                 "child-laundering recovery changed resource state")
+    expect_status("CLONE_GATE_RECOVERY_LAUNDER_SOURCE_ABSENT",
+                  clone_gate_rm.lookup_recovery(clone_recovery_pd.handle,
+                                                recovery_lookup),
+                  RDMA_SC_INVALID_STATE);
+    clone_gate_rm.reset_error_probe(clone_recovery_pd);
 
     recovery_clone_faults.push_back(
       RDMA_RM_CLONE_SHALLOW_RECOVERY_RESOURCE_HANDLE

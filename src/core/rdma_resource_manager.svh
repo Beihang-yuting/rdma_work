@@ -1,3 +1,240 @@
+// These are deliberately plain classes.  Capturing caller state must not
+// dispatch through UVM clone/copy hooks that an untrusted public value can
+// override, and the snapshots must never become publishable registry values.
+class rdma_rm_handle_snapshot;
+  rdma_handle object_ref;
+  uvm_object_wrapper object_type;
+  rdma_resource_kind_e kind;
+  longint unsigned function_uid;
+  int unsigned object_id;
+  int unsigned generation;
+endclass
+
+class rdma_rm_mapping_snapshot;
+  rdma_dma_mapping object_ref;
+  uvm_object_wrapper object_type;
+  rdma_rm_handle_snapshot function_h;
+  rdma_bdf_t requester_bdf;
+  bit pasid_valid;
+  bit [19:0] pasid;
+  rdma_backing_addr_t backing_addr;
+  rdma_iova_t iova;
+  longint unsigned size;
+  rdma_dma_direction_e direction;
+  rdma_dma_permission_t permissions;
+  rdma_mapping_state_e state;
+  rdma_rm_handle_snapshot owner_h;
+endclass
+
+class rdma_rm_backing_ref_snapshot;
+  rdma_backing_ref object_ref;
+  uvm_object_wrapper object_type;
+  rdma_rm_mapping_snapshot mapping;
+  rdma_resource_ownership_e ownership;
+  bit release_complete;
+endclass
+
+class rdma_rm_hmc_ref_snapshot;
+  rdma_hmc_ref object_ref;
+  uvm_object_wrapper object_type;
+  rdma_rm_handle_snapshot owner;
+  rdma_resource_kind_e object_kind;
+  rdma_hmc_fvm_addr_t address;
+  longint unsigned size;
+  int unsigned first_pbl_index;
+  rdma_resource_ownership_e ownership;
+  bit release_complete;
+endclass
+
+class rdma_rm_bar_snapshot;
+  rdma_bar_info object_ref;
+  uvm_object_wrapper object_type;
+  bit [2:0] bar_id;
+  rdma_bar_addr_t base;
+  longint unsigned size;
+  bit enabled;
+endclass
+
+class rdma_rm_pcie_snapshot;
+  rdma_pcie_identity object_ref;
+  uvm_object_wrapper object_type;
+  rdma_bdf_t bdf;
+  rdma_bdf_t parent_pf_bdf;
+  int unsigned vf_index;
+  bit mse;
+  bit bme;
+  rdma_rm_bar_snapshot bar[6];
+endclass
+
+class rdma_rm_binding_snapshot;
+  rdma_function_binding object_ref;
+  uvm_object_wrapper object_type;
+  longint unsigned function_uid;
+  rdma_rm_pcie_snapshot pcie;
+  bit [2:0] notify_bar_id;
+  rdma_bar_addr_t notify_base;
+  longint unsigned notify_size;
+  int unsigned notify_table_sel;
+  int unsigned notify_table_index;
+  int unsigned host_id;
+  int unsigned pfvf_id;
+  int unsigned rdma_vf_id;
+  int unsigned global_function_id;
+  int unsigned vsi_id;
+  int unsigned dma_domain_id;
+  bit dma_domain_valid;
+  rdma_binding_state_e state;
+  int unsigned generation;
+  rdma_rm_handle_snapshot owner_h;
+  bit notify_valid;
+  bit notify_ready;
+  bit dmi_valid;
+  bit dmi_ready;
+  bit vft_valid;
+  bit vft_ready;
+endclass
+
+class rdma_rm_resource_snapshot;
+  rdma_resource object_ref;
+  uvm_object_wrapper object_type;
+  rdma_resource_kind_e kind;
+  uvm_object graph_nodes[$];
+
+  rdma_rm_handle_snapshot handle;
+  rdma_rm_handle_snapshot owner;
+  rdma_resource_state_e state;
+  rdma_rm_backing_ref_snapshot backing_refs[$];
+  rdma_rm_hmc_ref_snapshot hmc_refs[$];
+  rdma_rm_handle_snapshot dependencies[$];
+  longint unsigned outstanding_ids[$];
+  rdma_hmc_fvm_addr_t hmc_fvm_addr;
+  bit hmc_fvm_addr_valid;
+
+  int unsigned depth;
+  int unsigned producer_index;
+  int unsigned consumer_index;
+  bit producer_wrap;
+  bit consumer_wrap;
+  rdma_iova_t queue_iova;
+
+  int unsigned local_function_id;
+  int unsigned global_function_id;
+  int unsigned rdma_vf_id;
+  int unsigned vsi_id;
+  int unsigned pfvf_id;
+  rdma_rm_binding_snapshot binding;
+
+  int unsigned local_pd_id;
+  int unsigned global_pd_id;
+
+  int unsigned local_mr_id;
+  int unsigned global_mr_id;
+  rdma_rm_handle_snapshot mr_pd_h;
+  rdma_iova_t mr_iova;
+  longint unsigned mr_length;
+  bit [31:0] lkey;
+  bit [31:0] rkey;
+  rdma_rdma_access_t access;
+  bit [11:0] mr_serial;
+
+  int unsigned local_cq_id;
+  int unsigned global_cq_id;
+  rdma_rm_handle_snapshot ceq_h;
+
+  int unsigned local_qp_id;
+  int unsigned global_qp_id;
+  rdma_transport_e transport;
+  rdma_qp_state_e qp_state;
+  int unsigned sq_depth;
+  int unsigned rq_depth;
+  int unsigned sq_producer_index;
+  int unsigned sq_consumer_index;
+  bit sq_wrap;
+  bit sq_consumer_wrap;
+  int unsigned rq_producer_index;
+  int unsigned rq_consumer_index;
+  bit rq_wrap;
+  bit rq_consumer_wrap;
+  rdma_iova_t sq_iova;
+  rdma_iova_t rq_iova;
+  rdma_rm_handle_snapshot qp_pd_h;
+  rdma_rm_handle_snapshot send_cq_h;
+  rdma_rm_handle_snapshot recv_cq_h;
+  rdma_rm_handle_snapshot srq_h;
+
+  int unsigned local_srq_id;
+  int unsigned global_srq_id;
+  int unsigned max_sge;
+  rdma_rm_handle_snapshot srq_pd_h;
+
+  int unsigned local_cmq_id;
+  int unsigned global_cmq_id;
+  int unsigned completion_producer_index;
+  int unsigned completion_consumer_index;
+  bit completion_wrap;
+  bit completion_consumer_wrap;
+  rdma_iova_t completion_iova;
+
+  int unsigned local_ceq_id;
+  int unsigned global_ceq_id;
+  int unsigned local_aeq_id;
+  int unsigned global_aeq_id;
+endclass
+
+class rdma_rm_opcode_snapshot;
+  rdma_cmq_opcode_key object_ref;
+  uvm_object_wrapper object_type;
+  string profile_name;
+  bit [31:0] opcode;
+  string variant;
+endclass
+
+class rdma_rm_ticket_snapshot;
+  rdma_cmq_ticket object_ref;
+  uvm_object_wrapper object_type;
+  longint unsigned command_id;
+  rdma_rm_handle_snapshot function_h;
+  rdma_rm_handle_snapshot cmq_h;
+  longint unsigned slot_sequence;
+  int unsigned sq_index;
+  bit sq_wrap;
+  rdma_rm_opcode_snapshot opcode_key;
+  time absolute_deadline;
+endclass
+
+class rdma_rm_status_snapshot;
+  rdma_status object_ref;
+  uvm_object_wrapper object_type;
+  rdma_status_category_e category;
+  rdma_status_code_e code;
+  bit [31:0] hardware_code;
+  bit hardware_code_valid;
+  rdma_engine_kind_e source_engine;
+  bit [63:0] function_uid;
+  bit [31:0] generation;
+  bit [63:0] resource_id;
+  bit [63:0] command_id;
+  bit [63:0] wr_id;
+  rdma_severity_e severity;
+  bit retryable;
+  string message;
+endclass
+
+class rdma_rm_recovery_snapshot;
+  rdma_recovery_record object_ref;
+  uvm_object_wrapper object_type;
+  uvm_object graph_nodes[$];
+  rdma_rm_handle_snapshot resource_h;
+  rdma_hw_presence_e hardware_presence;
+  rdma_control_step_e completed_steps[$];
+  rdma_control_step_e pending_steps[$];
+  rdma_rm_backing_ref_snapshot backing_refs[$];
+  rdma_rm_hmc_ref_snapshot hmc_refs[$];
+  rdma_rm_ticket_snapshot ambiguous_ticket;
+  rdma_rm_status_snapshot primary_status;
+  rdma_rm_status_snapshot rollback_statuses[$];
+endclass
+
 class rdma_resource_manager extends uvm_object;
   `uvm_object_utils(rdma_resource_manager)
 
@@ -30,6 +267,1010 @@ class rdma_resource_manager extends uvm_object;
 
   function new(string name = "rdma_resource_manager");
     super.new(name);
+  endfunction
+
+  protected function rdma_rm_handle_snapshot capture_handle_snapshot(
+    rdma_handle source
+  );
+    rdma_rm_handle_snapshot snapshot;
+
+    snapshot = new;
+    snapshot.object_ref = source;
+    if (source != null) begin
+      snapshot.object_type = source.get_object_type();
+      snapshot.kind = source.kind;
+      snapshot.function_uid = source.function_uid;
+      snapshot.object_id = source.object_id;
+      snapshot.generation = source.generation;
+    end
+    return snapshot;
+  endfunction
+
+  protected function bit restore_handle_snapshot(
+    rdma_rm_handle_snapshot snapshot
+  );
+    if (snapshot == null)
+      return 1'b0;
+    if (snapshot.object_ref == null)
+      return 1'b1;
+    snapshot.object_ref.kind = snapshot.kind;
+    snapshot.object_ref.function_uid = snapshot.function_uid;
+    snapshot.object_ref.object_id = snapshot.object_id;
+    snapshot.object_ref.generation = snapshot.generation;
+    return snapshot.object_ref.get_object_type() == snapshot.object_type;
+  endfunction
+
+  protected function bit handle_snapshot_matches(
+    rdma_handle value,
+    rdma_rm_handle_snapshot snapshot
+  );
+    if (snapshot == null || value != snapshot.object_ref)
+      return 1'b0;
+    if (value == null)
+      return 1'b1;
+    return value.get_object_type() == snapshot.object_type &&
+           value.kind == snapshot.kind &&
+           value.function_uid == snapshot.function_uid &&
+           value.object_id == snapshot.object_id &&
+           value.generation == snapshot.generation;
+  endfunction
+
+  protected function rdma_rm_mapping_snapshot capture_mapping_snapshot(
+    rdma_dma_mapping source
+  );
+    rdma_rm_mapping_snapshot snapshot;
+
+    snapshot = new;
+    snapshot.object_ref = source;
+    if (source != null) begin
+      snapshot.object_type = source.get_object_type();
+      snapshot.function_h = capture_handle_snapshot(source.function_h);
+      snapshot.requester_bdf = source.requester_bdf;
+      snapshot.pasid_valid = source.pasid_valid;
+      snapshot.pasid = source.pasid;
+      snapshot.backing_addr = source.backing_addr;
+      snapshot.iova = source.iova;
+      snapshot.size = source.size;
+      snapshot.direction = source.direction;
+      snapshot.permissions = source.permissions;
+      snapshot.state = source.state;
+      snapshot.owner_h = capture_handle_snapshot(source.owner_h);
+    end
+    return snapshot;
+  endfunction
+
+  protected function bit restore_mapping_snapshot(
+    rdma_rm_mapping_snapshot snapshot
+  );
+    rdma_function_handle function_h;
+    bit ok;
+
+    if (snapshot == null)
+      return 1'b0;
+    if (snapshot.object_ref == null)
+      return 1'b1;
+    ok = restore_handle_snapshot(snapshot.function_h);
+    ok = restore_handle_snapshot(snapshot.owner_h) && ok;
+    if (snapshot.function_h.object_ref == null)
+      snapshot.object_ref.function_h = null;
+    else if (!$cast(function_h, snapshot.function_h.object_ref))
+      ok = 1'b0;
+    else
+      snapshot.object_ref.function_h = function_h;
+    snapshot.object_ref.requester_bdf = snapshot.requester_bdf;
+    snapshot.object_ref.pasid_valid = snapshot.pasid_valid;
+    snapshot.object_ref.pasid = snapshot.pasid;
+    snapshot.object_ref.backing_addr = snapshot.backing_addr;
+    snapshot.object_ref.iova = snapshot.iova;
+    snapshot.object_ref.size = snapshot.size;
+    snapshot.object_ref.direction = snapshot.direction;
+    snapshot.object_ref.permissions = snapshot.permissions;
+    snapshot.object_ref.state = snapshot.state;
+    snapshot.object_ref.owner_h = snapshot.owner_h.object_ref;
+    return ok && snapshot.object_ref.get_object_type() == snapshot.object_type;
+  endfunction
+
+  protected function bit mapping_snapshot_matches(
+    rdma_dma_mapping value,
+    rdma_rm_mapping_snapshot snapshot
+  );
+    if (snapshot == null || value != snapshot.object_ref)
+      return 1'b0;
+    if (value == null)
+      return 1'b1;
+    return value.get_object_type() == snapshot.object_type &&
+           handle_snapshot_matches(value.function_h, snapshot.function_h) &&
+           value.requester_bdf == snapshot.requester_bdf &&
+           value.pasid_valid == snapshot.pasid_valid &&
+           value.pasid == snapshot.pasid &&
+           value.backing_addr == snapshot.backing_addr &&
+           value.iova == snapshot.iova && value.size == snapshot.size &&
+           value.direction == snapshot.direction &&
+           value.permissions == snapshot.permissions &&
+           value.state == snapshot.state &&
+           handle_snapshot_matches(value.owner_h, snapshot.owner_h);
+  endfunction
+
+  protected function rdma_rm_backing_ref_snapshot
+    capture_backing_ref_snapshot(rdma_backing_ref source);
+    rdma_rm_backing_ref_snapshot snapshot;
+
+    snapshot = new;
+    snapshot.object_ref = source;
+    if (source != null) begin
+      snapshot.object_type = source.get_object_type();
+      snapshot.mapping = capture_mapping_snapshot(source.mapping);
+      snapshot.ownership = source.ownership;
+      snapshot.release_complete = source.release_complete;
+    end
+    return snapshot;
+  endfunction
+
+  protected function bit restore_backing_ref_snapshot(
+    rdma_rm_backing_ref_snapshot snapshot
+  );
+    bit ok;
+
+    if (snapshot == null)
+      return 1'b0;
+    if (snapshot.object_ref == null)
+      return 1'b1;
+    ok = restore_mapping_snapshot(snapshot.mapping);
+    snapshot.object_ref.mapping = snapshot.mapping.object_ref;
+    snapshot.object_ref.ownership = snapshot.ownership;
+    snapshot.object_ref.release_complete = snapshot.release_complete;
+    return ok && snapshot.object_ref.get_object_type() == snapshot.object_type;
+  endfunction
+
+  protected function bit backing_ref_snapshot_matches(
+    rdma_backing_ref value,
+    rdma_rm_backing_ref_snapshot snapshot
+  );
+    if (snapshot == null || value != snapshot.object_ref)
+      return 1'b0;
+    if (value == null)
+      return 1'b1;
+    return value.get_object_type() == snapshot.object_type &&
+           mapping_snapshot_matches(value.mapping, snapshot.mapping) &&
+           value.ownership == snapshot.ownership &&
+           value.release_complete == snapshot.release_complete;
+  endfunction
+
+  protected function rdma_rm_hmc_ref_snapshot capture_hmc_ref_snapshot(
+    rdma_hmc_ref source
+  );
+    rdma_rm_hmc_ref_snapshot snapshot;
+
+    snapshot = new;
+    snapshot.object_ref = source;
+    if (source != null) begin
+      snapshot.object_type = source.get_object_type();
+      snapshot.owner = capture_handle_snapshot(source.owner);
+      snapshot.object_kind = source.object_kind;
+      snapshot.address = source.address;
+      snapshot.size = source.size;
+      snapshot.first_pbl_index = source.first_pbl_index;
+      snapshot.ownership = source.ownership;
+      snapshot.release_complete = source.release_complete;
+    end
+    return snapshot;
+  endfunction
+
+  protected function bit restore_hmc_ref_snapshot(
+    rdma_rm_hmc_ref_snapshot snapshot
+  );
+    rdma_function_handle owner;
+    bit ok;
+
+    if (snapshot == null)
+      return 1'b0;
+    if (snapshot.object_ref == null)
+      return 1'b1;
+    ok = restore_handle_snapshot(snapshot.owner);
+    if (snapshot.owner.object_ref == null)
+      snapshot.object_ref.owner = null;
+    else if (!$cast(owner, snapshot.owner.object_ref))
+      ok = 1'b0;
+    else
+      snapshot.object_ref.owner = owner;
+    snapshot.object_ref.object_kind = snapshot.object_kind;
+    snapshot.object_ref.address = snapshot.address;
+    snapshot.object_ref.size = snapshot.size;
+    snapshot.object_ref.first_pbl_index = snapshot.first_pbl_index;
+    snapshot.object_ref.ownership = snapshot.ownership;
+    snapshot.object_ref.release_complete = snapshot.release_complete;
+    return ok && snapshot.object_ref.get_object_type() == snapshot.object_type;
+  endfunction
+
+  protected function bit hmc_ref_snapshot_matches(
+    rdma_hmc_ref value,
+    rdma_rm_hmc_ref_snapshot snapshot
+  );
+    if (snapshot == null || value != snapshot.object_ref)
+      return 1'b0;
+    if (value == null)
+      return 1'b1;
+    return value.get_object_type() == snapshot.object_type &&
+           handle_snapshot_matches(value.owner, snapshot.owner) &&
+           value.object_kind == snapshot.object_kind &&
+           value.address == snapshot.address && value.size == snapshot.size &&
+           value.first_pbl_index == snapshot.first_pbl_index &&
+           value.ownership == snapshot.ownership &&
+           value.release_complete == snapshot.release_complete;
+  endfunction
+
+  protected function rdma_rm_bar_snapshot capture_bar_snapshot(
+    rdma_bar_info source
+  );
+    rdma_rm_bar_snapshot snapshot;
+
+    snapshot = new;
+    snapshot.object_ref = source;
+    if (source != null) begin
+      snapshot.object_type = source.get_object_type();
+      snapshot.bar_id = source.bar_id;
+      snapshot.base = source.base;
+      snapshot.size = source.size;
+      snapshot.enabled = source.enabled;
+    end
+    return snapshot;
+  endfunction
+
+  protected function bit restore_bar_snapshot(rdma_rm_bar_snapshot snapshot);
+    if (snapshot == null)
+      return 1'b0;
+    if (snapshot.object_ref == null)
+      return 1'b1;
+    snapshot.object_ref.bar_id = snapshot.bar_id;
+    snapshot.object_ref.base = snapshot.base;
+    snapshot.object_ref.size = snapshot.size;
+    snapshot.object_ref.enabled = snapshot.enabled;
+    return snapshot.object_ref.get_object_type() == snapshot.object_type;
+  endfunction
+
+  protected function bit bar_snapshot_matches(
+    rdma_bar_info value,
+    rdma_rm_bar_snapshot snapshot
+  );
+    if (snapshot == null || value != snapshot.object_ref)
+      return 1'b0;
+    if (value == null)
+      return 1'b1;
+    return value.get_object_type() == snapshot.object_type &&
+           value.bar_id == snapshot.bar_id && value.base == snapshot.base &&
+           value.size == snapshot.size && value.enabled == snapshot.enabled;
+  endfunction
+
+  protected function rdma_rm_pcie_snapshot capture_pcie_snapshot(
+    rdma_pcie_identity source
+  );
+    rdma_rm_pcie_snapshot snapshot;
+
+    snapshot = new;
+    snapshot.object_ref = source;
+    if (source != null) begin
+      snapshot.object_type = source.get_object_type();
+      snapshot.bdf = source.bdf;
+      snapshot.parent_pf_bdf = source.parent_pf_bdf;
+      snapshot.vf_index = source.vf_index;
+      snapshot.mse = source.mse;
+      snapshot.bme = source.bme;
+      foreach (source.bar[i])
+        snapshot.bar[i] = capture_bar_snapshot(source.bar[i]);
+    end
+    return snapshot;
+  endfunction
+
+  protected function bit restore_pcie_snapshot(
+    rdma_rm_pcie_snapshot snapshot
+  );
+    bit ok;
+
+    if (snapshot == null)
+      return 1'b0;
+    if (snapshot.object_ref == null)
+      return 1'b1;
+    ok = 1'b1;
+    snapshot.object_ref.bdf = snapshot.bdf;
+    snapshot.object_ref.parent_pf_bdf = snapshot.parent_pf_bdf;
+    snapshot.object_ref.vf_index = snapshot.vf_index;
+    snapshot.object_ref.mse = snapshot.mse;
+    snapshot.object_ref.bme = snapshot.bme;
+    foreach (snapshot.object_ref.bar[i]) begin
+      snapshot.object_ref.bar[i] = snapshot.bar[i].object_ref;
+      ok = restore_bar_snapshot(snapshot.bar[i]) && ok;
+    end
+    return ok && snapshot.object_ref.get_object_type() == snapshot.object_type;
+  endfunction
+
+  protected function bit pcie_snapshot_matches(
+    rdma_pcie_identity value,
+    rdma_rm_pcie_snapshot snapshot
+  );
+    if (snapshot == null || value != snapshot.object_ref)
+      return 1'b0;
+    if (value == null)
+      return 1'b1;
+    if (value.get_object_type() != snapshot.object_type ||
+        value.bdf != snapshot.bdf ||
+        value.parent_pf_bdf != snapshot.parent_pf_bdf ||
+        value.vf_index != snapshot.vf_index || value.mse != snapshot.mse ||
+        value.bme != snapshot.bme)
+      return 1'b0;
+    foreach (value.bar[i]) begin
+      if (!bar_snapshot_matches(value.bar[i], snapshot.bar[i]))
+        return 1'b0;
+    end
+    return 1'b1;
+  endfunction
+
+  protected function rdma_rm_binding_snapshot capture_binding_snapshot(
+    rdma_function_binding source
+  );
+    rdma_rm_binding_snapshot snapshot;
+
+    snapshot = new;
+    snapshot.object_ref = source;
+    if (source != null) begin
+      snapshot.object_type = source.get_object_type();
+      snapshot.function_uid = source.function_uid;
+      snapshot.pcie = capture_pcie_snapshot(source.pcie);
+      snapshot.notify_bar_id = source.notify_bar_id;
+      snapshot.notify_base = source.notify_base;
+      snapshot.notify_size = source.notify_size;
+      snapshot.notify_table_sel = source.notify_table_sel;
+      snapshot.notify_table_index = source.notify_table_index;
+      snapshot.host_id = source.host_id;
+      snapshot.pfvf_id = source.pfvf_id;
+      snapshot.rdma_vf_id = source.rdma_vf_id;
+      snapshot.global_function_id = source.global_function_id;
+      snapshot.vsi_id = source.vsi_id;
+      snapshot.dma_domain_id = source.dma_domain_id;
+      snapshot.dma_domain_valid = source.dma_domain_valid;
+      snapshot.state = source.state;
+      snapshot.generation = source.generation;
+      snapshot.owner_h = capture_handle_snapshot(source.owner_h);
+      snapshot.notify_valid = source.notify_valid;
+      snapshot.notify_ready = source.notify_ready;
+      snapshot.dmi_valid = source.dmi_valid;
+      snapshot.dmi_ready = source.dmi_ready;
+      snapshot.vft_valid = source.vft_valid;
+      snapshot.vft_ready = source.vft_ready;
+    end
+    return snapshot;
+  endfunction
+
+  protected function bit restore_binding_snapshot(
+    rdma_rm_binding_snapshot snapshot
+  );
+    bit ok;
+
+    if (snapshot == null)
+      return 1'b0;
+    if (snapshot.object_ref == null)
+      return 1'b1;
+    ok = restore_pcie_snapshot(snapshot.pcie);
+    ok = restore_handle_snapshot(snapshot.owner_h) && ok;
+    snapshot.object_ref.function_uid = snapshot.function_uid;
+    snapshot.object_ref.pcie = snapshot.pcie.object_ref;
+    snapshot.object_ref.notify_bar_id = snapshot.notify_bar_id;
+    snapshot.object_ref.notify_base = snapshot.notify_base;
+    snapshot.object_ref.notify_size = snapshot.notify_size;
+    snapshot.object_ref.notify_table_sel = snapshot.notify_table_sel;
+    snapshot.object_ref.notify_table_index = snapshot.notify_table_index;
+    snapshot.object_ref.host_id = snapshot.host_id;
+    snapshot.object_ref.pfvf_id = snapshot.pfvf_id;
+    snapshot.object_ref.rdma_vf_id = snapshot.rdma_vf_id;
+    snapshot.object_ref.global_function_id = snapshot.global_function_id;
+    snapshot.object_ref.vsi_id = snapshot.vsi_id;
+    snapshot.object_ref.dma_domain_id = snapshot.dma_domain_id;
+    snapshot.object_ref.dma_domain_valid = snapshot.dma_domain_valid;
+    snapshot.object_ref.state = snapshot.state;
+    snapshot.object_ref.generation = snapshot.generation;
+    snapshot.object_ref.owner_h = snapshot.owner_h.object_ref;
+    snapshot.object_ref.notify_valid = snapshot.notify_valid;
+    snapshot.object_ref.notify_ready = snapshot.notify_ready;
+    snapshot.object_ref.dmi_valid = snapshot.dmi_valid;
+    snapshot.object_ref.dmi_ready = snapshot.dmi_ready;
+    snapshot.object_ref.vft_valid = snapshot.vft_valid;
+    snapshot.object_ref.vft_ready = snapshot.vft_ready;
+    return ok && snapshot.object_ref.get_object_type() == snapshot.object_type;
+  endfunction
+
+  protected function bit binding_snapshot_matches(
+    rdma_function_binding value,
+    rdma_rm_binding_snapshot snapshot
+  );
+    if (snapshot == null || value != snapshot.object_ref)
+      return 1'b0;
+    if (value == null)
+      return 1'b1;
+    return value.get_object_type() == snapshot.object_type &&
+           value.function_uid == snapshot.function_uid &&
+           pcie_snapshot_matches(value.pcie, snapshot.pcie) &&
+           value.notify_bar_id == snapshot.notify_bar_id &&
+           value.notify_base == snapshot.notify_base &&
+           value.notify_size == snapshot.notify_size &&
+           value.notify_table_sel == snapshot.notify_table_sel &&
+           value.notify_table_index == snapshot.notify_table_index &&
+           value.host_id == snapshot.host_id &&
+           value.pfvf_id == snapshot.pfvf_id &&
+           value.rdma_vf_id == snapshot.rdma_vf_id &&
+           value.global_function_id == snapshot.global_function_id &&
+           value.vsi_id == snapshot.vsi_id &&
+           value.dma_domain_id == snapshot.dma_domain_id &&
+           value.dma_domain_valid == snapshot.dma_domain_valid &&
+           value.state == snapshot.state &&
+           value.generation == snapshot.generation &&
+           handle_snapshot_matches(value.owner_h, snapshot.owner_h) &&
+           value.notify_valid == snapshot.notify_valid &&
+           value.notify_ready == snapshot.notify_ready &&
+           value.dmi_valid == snapshot.dmi_valid &&
+           value.dmi_ready == snapshot.dmi_ready &&
+           value.vft_valid == snapshot.vft_valid &&
+           value.vft_ready == snapshot.vft_ready;
+  endfunction
+
+  protected function rdma_rm_resource_snapshot capture_resource_snapshot(
+    rdma_resource source
+  );
+    rdma_rm_resource_snapshot snapshot;
+    rdma_queue_resource queue_value;
+    rdma_function function_value;
+    rdma_pd pd_value;
+    rdma_mr mr_value;
+    rdma_cq cq_value;
+    rdma_qp qp_value;
+    rdma_srq srq_value;
+    rdma_cmq cmq_value;
+    rdma_ceq ceq_value;
+    rdma_aeq aeq_value;
+
+    if (source == null)
+      return null;
+    snapshot = new;
+    snapshot.object_ref = source;
+    snapshot.object_type = source.get_object_type();
+    snapshot.kind = source.resource_kind();
+    snapshot.handle = capture_handle_snapshot(source.handle);
+    snapshot.owner = capture_handle_snapshot(source.owner);
+    snapshot.state = source.state;
+    foreach (source.backing_refs[i])
+      snapshot.backing_refs.push_back(
+        capture_backing_ref_snapshot(source.backing_refs[i])
+      );
+    foreach (source.hmc_refs[i])
+      snapshot.hmc_refs.push_back(capture_hmc_ref_snapshot(source.hmc_refs[i]));
+    foreach (source.dependencies[i])
+      snapshot.dependencies.push_back(
+        capture_handle_snapshot(source.dependencies[i])
+      );
+    snapshot.outstanding_ids = source.outstanding_ids;
+    snapshot.hmc_fvm_addr = source.hmc_fvm_addr;
+    snapshot.hmc_fvm_addr_valid = source.hmc_fvm_addr_valid;
+
+    case (snapshot.kind)
+      RDMA_RESOURCE_FUNCTION: begin
+        if (!$cast(function_value, source))
+          return null;
+        snapshot.local_function_id = function_value.local_function_id;
+        snapshot.global_function_id = function_value.global_function_id;
+        snapshot.rdma_vf_id = function_value.rdma_vf_id;
+        snapshot.vsi_id = function_value.vsi_id;
+        snapshot.pfvf_id = function_value.pfvf_id;
+        snapshot.binding = capture_binding_snapshot(function_value.binding);
+      end
+      RDMA_RESOURCE_PD: begin
+        if (!$cast(pd_value, source))
+          return null;
+        snapshot.local_pd_id = pd_value.local_pd_id;
+        snapshot.global_pd_id = pd_value.global_pd_id;
+      end
+      RDMA_RESOURCE_MR: begin
+        if (!$cast(mr_value, source))
+          return null;
+        snapshot.local_mr_id = mr_value.local_mr_id;
+        snapshot.global_mr_id = mr_value.global_mr_id;
+        snapshot.mr_pd_h = capture_handle_snapshot(mr_value.pd_h);
+        snapshot.mr_iova = mr_value.iova;
+        snapshot.mr_length = mr_value.length;
+        snapshot.lkey = mr_value.lkey;
+        snapshot.rkey = mr_value.rkey;
+        snapshot.access = mr_value.access;
+        snapshot.mr_serial = mr_value.mr_serial;
+      end
+      RDMA_RESOURCE_CQ: begin
+        if (!$cast(cq_value, source) || !$cast(queue_value, source))
+          return null;
+        snapshot.depth = queue_value.depth;
+        snapshot.producer_index = queue_value.producer_index;
+        snapshot.consumer_index = queue_value.consumer_index;
+        snapshot.producer_wrap = queue_value.producer_wrap;
+        snapshot.consumer_wrap = queue_value.consumer_wrap;
+        snapshot.queue_iova = queue_value.queue_iova;
+        snapshot.local_cq_id = cq_value.local_cq_id;
+        snapshot.global_cq_id = cq_value.global_cq_id;
+        snapshot.ceq_h = capture_handle_snapshot(cq_value.ceq_h);
+      end
+      RDMA_RESOURCE_QP: begin
+        if (!$cast(qp_value, source))
+          return null;
+        snapshot.local_qp_id = qp_value.local_qp_id;
+        snapshot.global_qp_id = qp_value.global_qp_id;
+        snapshot.transport = qp_value.transport;
+        snapshot.qp_state = qp_value.qp_state;
+        snapshot.sq_depth = qp_value.sq_depth;
+        snapshot.rq_depth = qp_value.rq_depth;
+        snapshot.sq_producer_index = qp_value.sq_producer_index;
+        snapshot.sq_consumer_index = qp_value.sq_consumer_index;
+        snapshot.sq_wrap = qp_value.sq_wrap;
+        snapshot.sq_consumer_wrap = qp_value.sq_consumer_wrap;
+        snapshot.rq_producer_index = qp_value.rq_producer_index;
+        snapshot.rq_consumer_index = qp_value.rq_consumer_index;
+        snapshot.rq_wrap = qp_value.rq_wrap;
+        snapshot.rq_consumer_wrap = qp_value.rq_consumer_wrap;
+        snapshot.sq_iova = qp_value.sq_iova;
+        snapshot.rq_iova = qp_value.rq_iova;
+        snapshot.qp_pd_h = capture_handle_snapshot(qp_value.pd_h);
+        snapshot.send_cq_h = capture_handle_snapshot(qp_value.send_cq_h);
+        snapshot.recv_cq_h = capture_handle_snapshot(qp_value.recv_cq_h);
+        snapshot.srq_h = capture_handle_snapshot(qp_value.srq_h);
+      end
+      RDMA_RESOURCE_SRQ: begin
+        if (!$cast(srq_value, source) || !$cast(queue_value, source))
+          return null;
+        snapshot.depth = queue_value.depth;
+        snapshot.producer_index = queue_value.producer_index;
+        snapshot.consumer_index = queue_value.consumer_index;
+        snapshot.producer_wrap = queue_value.producer_wrap;
+        snapshot.consumer_wrap = queue_value.consumer_wrap;
+        snapshot.queue_iova = queue_value.queue_iova;
+        snapshot.local_srq_id = srq_value.local_srq_id;
+        snapshot.global_srq_id = srq_value.global_srq_id;
+        snapshot.max_sge = srq_value.max_sge;
+        snapshot.srq_pd_h = capture_handle_snapshot(srq_value.pd_h);
+      end
+      RDMA_RESOURCE_CMQ: begin
+        if (!$cast(cmq_value, source) || !$cast(queue_value, source))
+          return null;
+        snapshot.depth = queue_value.depth;
+        snapshot.producer_index = queue_value.producer_index;
+        snapshot.consumer_index = queue_value.consumer_index;
+        snapshot.producer_wrap = queue_value.producer_wrap;
+        snapshot.consumer_wrap = queue_value.consumer_wrap;
+        snapshot.queue_iova = queue_value.queue_iova;
+        snapshot.local_cmq_id = cmq_value.local_cmq_id;
+        snapshot.global_cmq_id = cmq_value.global_cmq_id;
+        snapshot.completion_producer_index =
+          cmq_value.completion_producer_index;
+        snapshot.completion_consumer_index =
+          cmq_value.completion_consumer_index;
+        snapshot.completion_wrap = cmq_value.completion_wrap;
+        snapshot.completion_consumer_wrap =
+          cmq_value.completion_consumer_wrap;
+        snapshot.completion_iova = cmq_value.completion_iova;
+      end
+      RDMA_RESOURCE_CEQ: begin
+        if (!$cast(ceq_value, source) || !$cast(queue_value, source))
+          return null;
+        snapshot.depth = queue_value.depth;
+        snapshot.producer_index = queue_value.producer_index;
+        snapshot.consumer_index = queue_value.consumer_index;
+        snapshot.producer_wrap = queue_value.producer_wrap;
+        snapshot.consumer_wrap = queue_value.consumer_wrap;
+        snapshot.queue_iova = queue_value.queue_iova;
+        snapshot.local_ceq_id = ceq_value.local_ceq_id;
+        snapshot.global_ceq_id = ceq_value.global_ceq_id;
+      end
+      RDMA_RESOURCE_AEQ: begin
+        if (!$cast(aeq_value, source) || !$cast(queue_value, source))
+          return null;
+        snapshot.depth = queue_value.depth;
+        snapshot.producer_index = queue_value.producer_index;
+        snapshot.consumer_index = queue_value.consumer_index;
+        snapshot.producer_wrap = queue_value.producer_wrap;
+        snapshot.consumer_wrap = queue_value.consumer_wrap;
+        snapshot.queue_iova = queue_value.queue_iova;
+        snapshot.local_aeq_id = aeq_value.local_aeq_id;
+        snapshot.global_aeq_id = aeq_value.global_aeq_id;
+      end
+      default: return null;
+    endcase
+    collect_resource_graph(source, snapshot.graph_nodes);
+    return snapshot;
+  endfunction
+
+  protected function bit restore_resource_snapshot(
+    rdma_rm_resource_snapshot snapshot
+  );
+    rdma_function_handle owner;
+    rdma_queue_resource queue_value;
+    rdma_function function_value;
+    rdma_pd pd_value;
+    rdma_mr mr_value;
+    rdma_cq cq_value;
+    rdma_qp qp_value;
+    rdma_srq srq_value;
+    rdma_cmq cmq_value;
+    rdma_ceq ceq_value;
+    rdma_aeq aeq_value;
+    bit ok;
+
+    if (snapshot == null || snapshot.object_ref == null)
+      return 1'b0;
+    ok = restore_handle_snapshot(snapshot.handle);
+    ok = restore_handle_snapshot(snapshot.owner) && ok;
+    snapshot.object_ref.handle = snapshot.handle.object_ref;
+    if (snapshot.owner.object_ref == null)
+      snapshot.object_ref.owner = null;
+    else if (!$cast(owner, snapshot.owner.object_ref))
+      ok = 1'b0;
+    else
+      snapshot.object_ref.owner = owner;
+    snapshot.object_ref.state = snapshot.state;
+    snapshot.object_ref.backing_refs.delete();
+    foreach (snapshot.backing_refs[i]) begin
+      ok = restore_backing_ref_snapshot(snapshot.backing_refs[i]) && ok;
+      snapshot.object_ref.backing_refs.push_back(
+        snapshot.backing_refs[i].object_ref
+      );
+    end
+    snapshot.object_ref.hmc_refs.delete();
+    foreach (snapshot.hmc_refs[i]) begin
+      ok = restore_hmc_ref_snapshot(snapshot.hmc_refs[i]) && ok;
+      snapshot.object_ref.hmc_refs.push_back(snapshot.hmc_refs[i].object_ref);
+    end
+    snapshot.object_ref.dependencies.delete();
+    foreach (snapshot.dependencies[i]) begin
+      ok = restore_handle_snapshot(snapshot.dependencies[i]) && ok;
+      snapshot.object_ref.dependencies.push_back(
+        snapshot.dependencies[i].object_ref
+      );
+    end
+    snapshot.object_ref.outstanding_ids = snapshot.outstanding_ids;
+    snapshot.object_ref.hmc_fvm_addr = snapshot.hmc_fvm_addr;
+    snapshot.object_ref.hmc_fvm_addr_valid = snapshot.hmc_fvm_addr_valid;
+
+    case (snapshot.kind)
+      RDMA_RESOURCE_FUNCTION: begin
+        if (!$cast(function_value, snapshot.object_ref))
+          ok = 1'b0;
+        else begin
+          ok = restore_binding_snapshot(snapshot.binding) && ok;
+          function_value.local_function_id = snapshot.local_function_id;
+          function_value.global_function_id = snapshot.global_function_id;
+          function_value.rdma_vf_id = snapshot.rdma_vf_id;
+          function_value.vsi_id = snapshot.vsi_id;
+          function_value.pfvf_id = snapshot.pfvf_id;
+          function_value.binding = snapshot.binding.object_ref;
+        end
+      end
+      RDMA_RESOURCE_PD: begin
+        if (!$cast(pd_value, snapshot.object_ref))
+          ok = 1'b0;
+        else begin
+          pd_value.local_pd_id = snapshot.local_pd_id;
+          pd_value.global_pd_id = snapshot.global_pd_id;
+        end
+      end
+      RDMA_RESOURCE_MR: begin
+        if (!$cast(mr_value, snapshot.object_ref))
+          ok = 1'b0;
+        else begin
+          ok = restore_handle_snapshot(snapshot.mr_pd_h) && ok;
+          mr_value.local_mr_id = snapshot.local_mr_id;
+          mr_value.global_mr_id = snapshot.global_mr_id;
+          mr_value.pd_h = snapshot.mr_pd_h.object_ref;
+          mr_value.iova = snapshot.mr_iova;
+          mr_value.length = snapshot.mr_length;
+          mr_value.lkey = snapshot.lkey;
+          mr_value.rkey = snapshot.rkey;
+          mr_value.access = snapshot.access;
+          mr_value.mr_serial = snapshot.mr_serial;
+        end
+      end
+      RDMA_RESOURCE_CQ: begin
+        if (!$cast(cq_value, snapshot.object_ref) ||
+            !$cast(queue_value, snapshot.object_ref))
+          ok = 1'b0;
+        else begin
+          ok = restore_handle_snapshot(snapshot.ceq_h) && ok;
+          queue_value.depth = snapshot.depth;
+          queue_value.producer_index = snapshot.producer_index;
+          queue_value.consumer_index = snapshot.consumer_index;
+          queue_value.producer_wrap = snapshot.producer_wrap;
+          queue_value.consumer_wrap = snapshot.consumer_wrap;
+          queue_value.queue_iova = snapshot.queue_iova;
+          cq_value.local_cq_id = snapshot.local_cq_id;
+          cq_value.global_cq_id = snapshot.global_cq_id;
+          cq_value.ceq_h = snapshot.ceq_h.object_ref;
+        end
+      end
+      RDMA_RESOURCE_QP: begin
+        if (!$cast(qp_value, snapshot.object_ref))
+          ok = 1'b0;
+        else begin
+          ok = restore_handle_snapshot(snapshot.qp_pd_h) && ok;
+          ok = restore_handle_snapshot(snapshot.send_cq_h) && ok;
+          ok = restore_handle_snapshot(snapshot.recv_cq_h) && ok;
+          ok = restore_handle_snapshot(snapshot.srq_h) && ok;
+          qp_value.local_qp_id = snapshot.local_qp_id;
+          qp_value.global_qp_id = snapshot.global_qp_id;
+          qp_value.transport = snapshot.transport;
+          qp_value.qp_state = snapshot.qp_state;
+          qp_value.sq_depth = snapshot.sq_depth;
+          qp_value.rq_depth = snapshot.rq_depth;
+          qp_value.sq_producer_index = snapshot.sq_producer_index;
+          qp_value.sq_consumer_index = snapshot.sq_consumer_index;
+          qp_value.sq_wrap = snapshot.sq_wrap;
+          qp_value.sq_consumer_wrap = snapshot.sq_consumer_wrap;
+          qp_value.rq_producer_index = snapshot.rq_producer_index;
+          qp_value.rq_consumer_index = snapshot.rq_consumer_index;
+          qp_value.rq_wrap = snapshot.rq_wrap;
+          qp_value.rq_consumer_wrap = snapshot.rq_consumer_wrap;
+          qp_value.sq_iova = snapshot.sq_iova;
+          qp_value.rq_iova = snapshot.rq_iova;
+          qp_value.pd_h = snapshot.qp_pd_h.object_ref;
+          qp_value.send_cq_h = snapshot.send_cq_h.object_ref;
+          qp_value.recv_cq_h = snapshot.recv_cq_h.object_ref;
+          qp_value.srq_h = snapshot.srq_h.object_ref;
+        end
+      end
+      RDMA_RESOURCE_SRQ: begin
+        if (!$cast(srq_value, snapshot.object_ref) ||
+            !$cast(queue_value, snapshot.object_ref))
+          ok = 1'b0;
+        else begin
+          ok = restore_handle_snapshot(snapshot.srq_pd_h) && ok;
+          queue_value.depth = snapshot.depth;
+          queue_value.producer_index = snapshot.producer_index;
+          queue_value.consumer_index = snapshot.consumer_index;
+          queue_value.producer_wrap = snapshot.producer_wrap;
+          queue_value.consumer_wrap = snapshot.consumer_wrap;
+          queue_value.queue_iova = snapshot.queue_iova;
+          srq_value.local_srq_id = snapshot.local_srq_id;
+          srq_value.global_srq_id = snapshot.global_srq_id;
+          srq_value.max_sge = snapshot.max_sge;
+          srq_value.pd_h = snapshot.srq_pd_h.object_ref;
+        end
+      end
+      RDMA_RESOURCE_CMQ: begin
+        if (!$cast(cmq_value, snapshot.object_ref) ||
+            !$cast(queue_value, snapshot.object_ref))
+          ok = 1'b0;
+        else begin
+          queue_value.depth = snapshot.depth;
+          queue_value.producer_index = snapshot.producer_index;
+          queue_value.consumer_index = snapshot.consumer_index;
+          queue_value.producer_wrap = snapshot.producer_wrap;
+          queue_value.consumer_wrap = snapshot.consumer_wrap;
+          queue_value.queue_iova = snapshot.queue_iova;
+          cmq_value.local_cmq_id = snapshot.local_cmq_id;
+          cmq_value.global_cmq_id = snapshot.global_cmq_id;
+          cmq_value.completion_producer_index =
+            snapshot.completion_producer_index;
+          cmq_value.completion_consumer_index =
+            snapshot.completion_consumer_index;
+          cmq_value.completion_wrap = snapshot.completion_wrap;
+          cmq_value.completion_consumer_wrap =
+            snapshot.completion_consumer_wrap;
+          cmq_value.completion_iova = snapshot.completion_iova;
+        end
+      end
+      RDMA_RESOURCE_CEQ: begin
+        if (!$cast(ceq_value, snapshot.object_ref) ||
+            !$cast(queue_value, snapshot.object_ref))
+          ok = 1'b0;
+        else begin
+          queue_value.depth = snapshot.depth;
+          queue_value.producer_index = snapshot.producer_index;
+          queue_value.consumer_index = snapshot.consumer_index;
+          queue_value.producer_wrap = snapshot.producer_wrap;
+          queue_value.consumer_wrap = snapshot.consumer_wrap;
+          queue_value.queue_iova = snapshot.queue_iova;
+          ceq_value.local_ceq_id = snapshot.local_ceq_id;
+          ceq_value.global_ceq_id = snapshot.global_ceq_id;
+        end
+      end
+      RDMA_RESOURCE_AEQ: begin
+        if (!$cast(aeq_value, snapshot.object_ref) ||
+            !$cast(queue_value, snapshot.object_ref))
+          ok = 1'b0;
+        else begin
+          queue_value.depth = snapshot.depth;
+          queue_value.producer_index = snapshot.producer_index;
+          queue_value.consumer_index = snapshot.consumer_index;
+          queue_value.producer_wrap = snapshot.producer_wrap;
+          queue_value.consumer_wrap = snapshot.consumer_wrap;
+          queue_value.queue_iova = snapshot.queue_iova;
+          aeq_value.local_aeq_id = snapshot.local_aeq_id;
+          aeq_value.global_aeq_id = snapshot.global_aeq_id;
+        end
+      end
+      default: ok = 1'b0;
+    endcase
+    return ok &&
+           snapshot.object_ref.get_object_type() == snapshot.object_type;
+  endfunction
+
+  protected function bit resource_snapshot_matches(
+    rdma_resource value,
+    rdma_rm_resource_snapshot snapshot
+  );
+    rdma_queue_resource queue_value;
+    rdma_function function_value;
+    rdma_pd pd_value;
+    rdma_mr mr_value;
+    rdma_cq cq_value;
+    rdma_qp qp_value;
+    rdma_srq srq_value;
+    rdma_cmq cmq_value;
+    rdma_ceq ceq_value;
+    rdma_aeq aeq_value;
+
+    if (snapshot == null || value != snapshot.object_ref || value == null)
+      return 1'b0;
+    if (value.get_object_type() != snapshot.object_type ||
+        value.resource_kind() != snapshot.kind ||
+        !handle_snapshot_matches(value.handle, snapshot.handle) ||
+        !handle_snapshot_matches(value.owner, snapshot.owner) ||
+        value.state != snapshot.state ||
+        value.backing_refs.size() != snapshot.backing_refs.size() ||
+        value.hmc_refs.size() != snapshot.hmc_refs.size() ||
+        value.dependencies.size() != snapshot.dependencies.size() ||
+        value.outstanding_ids.size() != snapshot.outstanding_ids.size() ||
+        value.hmc_fvm_addr != snapshot.hmc_fvm_addr ||
+        value.hmc_fvm_addr_valid != snapshot.hmc_fvm_addr_valid)
+      return 1'b0;
+    foreach (value.backing_refs[i]) begin
+      if (!backing_ref_snapshot_matches(value.backing_refs[i],
+                                        snapshot.backing_refs[i]))
+        return 1'b0;
+    end
+    foreach (value.hmc_refs[i]) begin
+      if (!hmc_ref_snapshot_matches(value.hmc_refs[i], snapshot.hmc_refs[i]))
+        return 1'b0;
+    end
+    foreach (value.dependencies[i]) begin
+      if (!handle_snapshot_matches(value.dependencies[i],
+                                   snapshot.dependencies[i]))
+        return 1'b0;
+    end
+    foreach (value.outstanding_ids[i]) begin
+      if (value.outstanding_ids[i] != snapshot.outstanding_ids[i])
+        return 1'b0;
+    end
+
+    case (snapshot.kind)
+      RDMA_RESOURCE_FUNCTION: begin
+        if (!$cast(function_value, value))
+          return 1'b0;
+        return function_value.local_function_id == snapshot.local_function_id &&
+               function_value.global_function_id ==
+                 snapshot.global_function_id &&
+               function_value.rdma_vf_id == snapshot.rdma_vf_id &&
+               function_value.vsi_id == snapshot.vsi_id &&
+               function_value.pfvf_id == snapshot.pfvf_id &&
+               binding_snapshot_matches(function_value.binding,
+                                        snapshot.binding);
+      end
+      RDMA_RESOURCE_PD: begin
+        if (!$cast(pd_value, value))
+          return 1'b0;
+        return pd_value.local_pd_id == snapshot.local_pd_id &&
+               pd_value.global_pd_id == snapshot.global_pd_id;
+      end
+      RDMA_RESOURCE_MR: begin
+        if (!$cast(mr_value, value))
+          return 1'b0;
+        return mr_value.local_mr_id == snapshot.local_mr_id &&
+               mr_value.global_mr_id == snapshot.global_mr_id &&
+               handle_snapshot_matches(mr_value.pd_h, snapshot.mr_pd_h) &&
+               mr_value.iova == snapshot.mr_iova &&
+               mr_value.length == snapshot.mr_length &&
+               mr_value.lkey == snapshot.lkey && mr_value.rkey == snapshot.rkey &&
+               mr_value.access == snapshot.access &&
+               mr_value.mr_serial == snapshot.mr_serial;
+      end
+      RDMA_RESOURCE_CQ: begin
+        if (!$cast(cq_value, value) || !$cast(queue_value, value))
+          return 1'b0;
+        return queue_value.depth == snapshot.depth &&
+               queue_value.producer_index == snapshot.producer_index &&
+               queue_value.consumer_index == snapshot.consumer_index &&
+               queue_value.producer_wrap == snapshot.producer_wrap &&
+               queue_value.consumer_wrap == snapshot.consumer_wrap &&
+               queue_value.queue_iova == snapshot.queue_iova &&
+               cq_value.local_cq_id == snapshot.local_cq_id &&
+               cq_value.global_cq_id == snapshot.global_cq_id &&
+               handle_snapshot_matches(cq_value.ceq_h, snapshot.ceq_h);
+      end
+      RDMA_RESOURCE_QP: begin
+        if (!$cast(qp_value, value))
+          return 1'b0;
+        return qp_value.local_qp_id == snapshot.local_qp_id &&
+               qp_value.global_qp_id == snapshot.global_qp_id &&
+               qp_value.transport == snapshot.transport &&
+               qp_value.qp_state == snapshot.qp_state &&
+               qp_value.sq_depth == snapshot.sq_depth &&
+               qp_value.rq_depth == snapshot.rq_depth &&
+               qp_value.sq_producer_index == snapshot.sq_producer_index &&
+               qp_value.sq_consumer_index == snapshot.sq_consumer_index &&
+               qp_value.sq_wrap == snapshot.sq_wrap &&
+               qp_value.sq_consumer_wrap == snapshot.sq_consumer_wrap &&
+               qp_value.rq_producer_index == snapshot.rq_producer_index &&
+               qp_value.rq_consumer_index == snapshot.rq_consumer_index &&
+               qp_value.rq_wrap == snapshot.rq_wrap &&
+               qp_value.rq_consumer_wrap == snapshot.rq_consumer_wrap &&
+               qp_value.sq_iova == snapshot.sq_iova &&
+               qp_value.rq_iova == snapshot.rq_iova &&
+               handle_snapshot_matches(qp_value.pd_h, snapshot.qp_pd_h) &&
+               handle_snapshot_matches(qp_value.send_cq_h,
+                                       snapshot.send_cq_h) &&
+               handle_snapshot_matches(qp_value.recv_cq_h,
+                                       snapshot.recv_cq_h) &&
+               handle_snapshot_matches(qp_value.srq_h, snapshot.srq_h);
+      end
+      RDMA_RESOURCE_SRQ: begin
+        if (!$cast(srq_value, value) || !$cast(queue_value, value))
+          return 1'b0;
+        return queue_value.depth == snapshot.depth &&
+               queue_value.producer_index == snapshot.producer_index &&
+               queue_value.consumer_index == snapshot.consumer_index &&
+               queue_value.producer_wrap == snapshot.producer_wrap &&
+               queue_value.consumer_wrap == snapshot.consumer_wrap &&
+               queue_value.queue_iova == snapshot.queue_iova &&
+               srq_value.local_srq_id == snapshot.local_srq_id &&
+               srq_value.global_srq_id == snapshot.global_srq_id &&
+               srq_value.max_sge == snapshot.max_sge &&
+               handle_snapshot_matches(srq_value.pd_h, snapshot.srq_pd_h);
+      end
+      RDMA_RESOURCE_CMQ: begin
+        if (!$cast(cmq_value, value) || !$cast(queue_value, value))
+          return 1'b0;
+        return queue_value.depth == snapshot.depth &&
+               queue_value.producer_index == snapshot.producer_index &&
+               queue_value.consumer_index == snapshot.consumer_index &&
+               queue_value.producer_wrap == snapshot.producer_wrap &&
+               queue_value.consumer_wrap == snapshot.consumer_wrap &&
+               queue_value.queue_iova == snapshot.queue_iova &&
+               cmq_value.local_cmq_id == snapshot.local_cmq_id &&
+               cmq_value.global_cmq_id == snapshot.global_cmq_id &&
+               cmq_value.completion_producer_index ==
+                 snapshot.completion_producer_index &&
+               cmq_value.completion_consumer_index ==
+                 snapshot.completion_consumer_index &&
+               cmq_value.completion_wrap == snapshot.completion_wrap &&
+               cmq_value.completion_consumer_wrap ==
+                 snapshot.completion_consumer_wrap &&
+               cmq_value.completion_iova == snapshot.completion_iova;
+      end
+      RDMA_RESOURCE_CEQ: begin
+        if (!$cast(ceq_value, value) || !$cast(queue_value, value))
+          return 1'b0;
+        return queue_value.depth == snapshot.depth &&
+               queue_value.producer_index == snapshot.producer_index &&
+               queue_value.consumer_index == snapshot.consumer_index &&
+               queue_value.producer_wrap == snapshot.producer_wrap &&
+               queue_value.consumer_wrap == snapshot.consumer_wrap &&
+               queue_value.queue_iova == snapshot.queue_iova &&
+               ceq_value.local_ceq_id == snapshot.local_ceq_id &&
+               ceq_value.global_ceq_id == snapshot.global_ceq_id;
+      end
+      RDMA_RESOURCE_AEQ: begin
+        if (!$cast(aeq_value, value) || !$cast(queue_value, value))
+          return 1'b0;
+        return queue_value.depth == snapshot.depth &&
+               queue_value.producer_index == snapshot.producer_index &&
+               queue_value.consumer_index == snapshot.consumer_index &&
+               queue_value.producer_wrap == snapshot.producer_wrap &&
+               queue_value.consumer_wrap == snapshot.consumer_wrap &&
+               queue_value.queue_iova == snapshot.queue_iova &&
+               aeq_value.local_aeq_id == snapshot.local_aeq_id &&
+               aeq_value.global_aeq_id == snapshot.global_aeq_id;
+      end
+      default: return 1'b0;
+    endcase
   endfunction
 
   protected function bit valid_kind(rdma_resource_kind_e kind);
@@ -376,16 +1617,45 @@ class rdma_resource_manager extends uvm_object;
     output rdma_resource result
   );
     uvm_object cloned_object;
+    rdma_rm_resource_snapshot snapshot;
     rdma_status status;
+    bit source_mutated;
+    bit source_restored;
 
     result = null;
     if (source == null)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                {copy_label, " resource is null"});
+    snapshot = capture_resource_snapshot(source);
+    if (snapshot == null)
+      return rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT,
+        {copy_label, " resource pre-clone snapshot failed"}
+      );
     cloned_object = source.clone();
+    // Detect against the pre-clone value before repair, then repair on every
+    // normal clone return path before inspecting or publishing the result.
+    source_mutated = !resource_snapshot_matches(source, snapshot);
+    source_restored = restore_resource_snapshot(snapshot);
+    source_restored = resource_snapshot_matches(source, snapshot) &&
+                      source_restored;
+    if (!source_restored) begin
+      result = null;
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        {copy_label, " resource source restoration failed"}
+      );
+    end
+    if (source_mutated) begin
+      result = null;
+      return rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT,
+        {copy_label, " resource clone mutated its source"}
+      );
+    end
     if (cloned_object == null || cloned_object == source ||
         !$cast(result, cloned_object) ||
-        result.get_object_type() != source.get_object_type()) begin
+        result.get_object_type() != snapshot.object_type) begin
       result = null;
       return rdma_status::make(
         RDMA_SC_INVALID_ARGUMENT,
@@ -404,7 +1674,7 @@ class rdma_resource_manager extends uvm_object;
         {copy_label, " resource clone changed validated fields"}
       );
     end
-    if (!resource_graph_detached(result, source)) begin
+    if (!resource_graph_detached_from_nodes(result, snapshot.graph_nodes)) begin
       result = null;
       return rdma_status::make(
         RDMA_SC_INVALID_ARGUMENT,
@@ -412,6 +1682,190 @@ class rdma_resource_manager extends uvm_object;
       );
     end
     return rdma_status::success();
+  endfunction
+
+  protected function rdma_rm_opcode_snapshot capture_opcode_snapshot(
+    rdma_cmq_opcode_key source
+  );
+    rdma_rm_opcode_snapshot snapshot;
+
+    snapshot = new;
+    snapshot.object_ref = source;
+    if (source != null) begin
+      snapshot.object_type = source.get_object_type();
+      snapshot.profile_name = source.profile_name;
+      snapshot.opcode = source.opcode;
+      snapshot.variant = source.variant;
+    end
+    return snapshot;
+  endfunction
+
+  protected function bit restore_opcode_snapshot(
+    rdma_rm_opcode_snapshot snapshot
+  );
+    if (snapshot == null)
+      return 1'b0;
+    if (snapshot.object_ref == null)
+      return 1'b1;
+    snapshot.object_ref.profile_name = snapshot.profile_name;
+    snapshot.object_ref.opcode = snapshot.opcode;
+    snapshot.object_ref.variant = snapshot.variant;
+    return snapshot.object_ref.get_object_type() == snapshot.object_type;
+  endfunction
+
+  protected function bit opcode_snapshot_matches(
+    rdma_cmq_opcode_key value,
+    rdma_rm_opcode_snapshot snapshot
+  );
+    if (snapshot == null || value != snapshot.object_ref)
+      return 1'b0;
+    if (value == null)
+      return 1'b1;
+    return value.get_object_type() == snapshot.object_type &&
+           value.profile_name == snapshot.profile_name &&
+           value.opcode == snapshot.opcode &&
+           value.variant == snapshot.variant;
+  endfunction
+
+  protected function rdma_rm_ticket_snapshot capture_ticket_snapshot(
+    rdma_cmq_ticket source
+  );
+    rdma_rm_ticket_snapshot snapshot;
+
+    snapshot = new;
+    snapshot.object_ref = source;
+    if (source != null) begin
+      snapshot.object_type = source.get_object_type();
+      snapshot.command_id = source.command_id;
+      snapshot.function_h = capture_handle_snapshot(source.function_h);
+      snapshot.cmq_h = capture_handle_snapshot(source.cmq_h);
+      snapshot.slot_sequence = source.slot_sequence;
+      snapshot.sq_index = source.sq_index;
+      snapshot.sq_wrap = source.sq_wrap;
+      snapshot.opcode_key = capture_opcode_snapshot(source.opcode_key);
+      snapshot.absolute_deadline = source.absolute_deadline;
+    end
+    return snapshot;
+  endfunction
+
+  protected function bit restore_ticket_snapshot(
+    rdma_rm_ticket_snapshot snapshot
+  );
+    rdma_function_handle function_h;
+    bit ok;
+
+    if (snapshot == null)
+      return 1'b0;
+    if (snapshot.object_ref == null)
+      return 1'b1;
+    ok = restore_handle_snapshot(snapshot.function_h);
+    ok = restore_handle_snapshot(snapshot.cmq_h) && ok;
+    ok = restore_opcode_snapshot(snapshot.opcode_key) && ok;
+    snapshot.object_ref.command_id = snapshot.command_id;
+    if (snapshot.function_h.object_ref == null)
+      snapshot.object_ref.function_h = null;
+    else if (!$cast(function_h, snapshot.function_h.object_ref))
+      ok = 1'b0;
+    else
+      snapshot.object_ref.function_h = function_h;
+    snapshot.object_ref.cmq_h = snapshot.cmq_h.object_ref;
+    snapshot.object_ref.slot_sequence = snapshot.slot_sequence;
+    snapshot.object_ref.sq_index = snapshot.sq_index;
+    snapshot.object_ref.sq_wrap = snapshot.sq_wrap;
+    snapshot.object_ref.opcode_key = snapshot.opcode_key.object_ref;
+    snapshot.object_ref.absolute_deadline = snapshot.absolute_deadline;
+    return snapshot.object_ref.get_object_type() == snapshot.object_type && ok;
+  endfunction
+
+  protected function bit ticket_snapshot_matches(
+    rdma_cmq_ticket value,
+    rdma_rm_ticket_snapshot snapshot
+  );
+    if (snapshot == null || value != snapshot.object_ref)
+      return 1'b0;
+    if (value == null)
+      return 1'b1;
+    return value.get_object_type() == snapshot.object_type &&
+           value.command_id == snapshot.command_id &&
+           handle_snapshot_matches(value.function_h, snapshot.function_h) &&
+           handle_snapshot_matches(value.cmq_h, snapshot.cmq_h) &&
+           value.slot_sequence == snapshot.slot_sequence &&
+           value.sq_index == snapshot.sq_index &&
+           value.sq_wrap == snapshot.sq_wrap &&
+           opcode_snapshot_matches(value.opcode_key, snapshot.opcode_key) &&
+           value.absolute_deadline == snapshot.absolute_deadline;
+  endfunction
+
+  protected function rdma_rm_status_snapshot capture_status_snapshot(
+    rdma_status source
+  );
+    rdma_rm_status_snapshot snapshot;
+
+    snapshot = new;
+    snapshot.object_ref = source;
+    if (source != null) begin
+      snapshot.object_type = source.get_object_type();
+      snapshot.category = source.category;
+      snapshot.code = source.code;
+      snapshot.hardware_code = source.hardware_code;
+      snapshot.hardware_code_valid = source.hardware_code_valid;
+      snapshot.source_engine = source.source_engine;
+      snapshot.function_uid = source.function_uid;
+      snapshot.generation = source.generation;
+      snapshot.resource_id = source.resource_id;
+      snapshot.command_id = source.command_id;
+      snapshot.wr_id = source.wr_id;
+      snapshot.severity = source.severity;
+      snapshot.retryable = source.retryable;
+      snapshot.message = source.message;
+    end
+    return snapshot;
+  endfunction
+
+  protected function bit restore_status_snapshot(
+    rdma_rm_status_snapshot snapshot
+  );
+    if (snapshot == null)
+      return 1'b0;
+    if (snapshot.object_ref == null)
+      return 1'b1;
+    snapshot.object_ref.category = snapshot.category;
+    snapshot.object_ref.code = snapshot.code;
+    snapshot.object_ref.hardware_code = snapshot.hardware_code;
+    snapshot.object_ref.hardware_code_valid = snapshot.hardware_code_valid;
+    snapshot.object_ref.source_engine = snapshot.source_engine;
+    snapshot.object_ref.function_uid = snapshot.function_uid;
+    snapshot.object_ref.generation = snapshot.generation;
+    snapshot.object_ref.resource_id = snapshot.resource_id;
+    snapshot.object_ref.command_id = snapshot.command_id;
+    snapshot.object_ref.wr_id = snapshot.wr_id;
+    snapshot.object_ref.severity = snapshot.severity;
+    snapshot.object_ref.retryable = snapshot.retryable;
+    snapshot.object_ref.message = snapshot.message;
+    return snapshot.object_ref.get_object_type() == snapshot.object_type;
+  endfunction
+
+  protected function bit status_snapshot_matches(
+    rdma_status value,
+    rdma_rm_status_snapshot snapshot
+  );
+    if (snapshot == null || value != snapshot.object_ref)
+      return 1'b0;
+    if (value == null)
+      return 1'b1;
+    return value.get_object_type() == snapshot.object_type &&
+           value.category == snapshot.category && value.code == snapshot.code &&
+           value.hardware_code == snapshot.hardware_code &&
+           value.hardware_code_valid == snapshot.hardware_code_valid &&
+           value.source_engine == snapshot.source_engine &&
+           value.function_uid == snapshot.function_uid &&
+           value.generation == snapshot.generation &&
+           value.resource_id == snapshot.resource_id &&
+           value.command_id == snapshot.command_id &&
+           value.wr_id == snapshot.wr_id &&
+           value.severity == snapshot.severity &&
+           value.retryable == snapshot.retryable &&
+           value.message == snapshot.message;
   endfunction
 
   protected function bit same_status_value(rdma_status lhs,
@@ -782,15 +2236,15 @@ class rdma_resource_manager extends uvm_object;
     endcase
   endfunction
 
-  protected function bit resource_graph_detached(rdma_resource result,
-                                                 rdma_resource source);
+  protected function bit resource_graph_detached_from_nodes(
+    rdma_resource result,
+    ref uvm_object source_nodes[$]
+  );
     uvm_object result_nodes[$];
-    uvm_object source_nodes[$];
 
-    if (result == null || source == null)
-      return result == source;
+    if (result == null)
+      return 1'b0;
     collect_resource_graph(result, result_nodes);
-    collect_resource_graph(source, source_nodes);
     foreach (result_nodes[i]) begin
       foreach (source_nodes[j]) begin
         if (result_nodes[i] == source_nodes[j])
@@ -877,17 +2331,129 @@ class rdma_resource_manager extends uvm_object;
     end
   endfunction
 
-  protected function bit recovery_graph_detached(
-    rdma_recovery_record result,
+  protected function rdma_rm_recovery_snapshot capture_recovery_snapshot(
     rdma_recovery_record source
   );
-    uvm_object result_nodes[$];
-    uvm_object source_nodes[$];
+    rdma_rm_recovery_snapshot snapshot;
 
-    if (result == null || source == null)
-      return result == source;
+    if (source == null)
+      return null;
+    snapshot = new;
+    snapshot.object_ref = source;
+    snapshot.object_type = source.get_object_type();
+    snapshot.resource_h = capture_handle_snapshot(source.resource_h);
+    snapshot.hardware_presence = source.hardware_presence;
+    snapshot.completed_steps = source.completed_steps;
+    snapshot.pending_steps = source.pending_steps;
+    foreach (source.backing_refs[i])
+      snapshot.backing_refs.push_back(
+        capture_backing_ref_snapshot(source.backing_refs[i])
+      );
+    foreach (source.hmc_refs[i])
+      snapshot.hmc_refs.push_back(capture_hmc_ref_snapshot(source.hmc_refs[i]));
+    snapshot.ambiguous_ticket = capture_ticket_snapshot(source.ambiguous_ticket);
+    snapshot.primary_status = capture_status_snapshot(source.primary_status);
+    foreach (source.rollback_statuses[i])
+      snapshot.rollback_statuses.push_back(
+        capture_status_snapshot(source.rollback_statuses[i])
+      );
+    collect_recovery_graph(source, snapshot.graph_nodes);
+    return snapshot;
+  endfunction
+
+  protected function bit restore_recovery_snapshot(
+    rdma_rm_recovery_snapshot snapshot
+  );
+    bit ok;
+
+    if (snapshot == null || snapshot.object_ref == null)
+      return 1'b0;
+    ok = restore_handle_snapshot(snapshot.resource_h);
+    ok = restore_ticket_snapshot(snapshot.ambiguous_ticket) && ok;
+    ok = restore_status_snapshot(snapshot.primary_status) && ok;
+    snapshot.object_ref.resource_h = snapshot.resource_h.object_ref;
+    snapshot.object_ref.hardware_presence = snapshot.hardware_presence;
+    snapshot.object_ref.completed_steps = snapshot.completed_steps;
+    snapshot.object_ref.pending_steps = snapshot.pending_steps;
+    snapshot.object_ref.backing_refs.delete();
+    foreach (snapshot.backing_refs[i]) begin
+      ok = restore_backing_ref_snapshot(snapshot.backing_refs[i]) && ok;
+      snapshot.object_ref.backing_refs.push_back(
+        snapshot.backing_refs[i].object_ref
+      );
+    end
+    snapshot.object_ref.hmc_refs.delete();
+    foreach (snapshot.hmc_refs[i]) begin
+      ok = restore_hmc_ref_snapshot(snapshot.hmc_refs[i]) && ok;
+      snapshot.object_ref.hmc_refs.push_back(snapshot.hmc_refs[i].object_ref);
+    end
+    snapshot.object_ref.ambiguous_ticket =
+      snapshot.ambiguous_ticket.object_ref;
+    snapshot.object_ref.primary_status = snapshot.primary_status.object_ref;
+    snapshot.object_ref.rollback_statuses.delete();
+    foreach (snapshot.rollback_statuses[i]) begin
+      ok = restore_status_snapshot(snapshot.rollback_statuses[i]) && ok;
+      snapshot.object_ref.rollback_statuses.push_back(
+        snapshot.rollback_statuses[i].object_ref
+      );
+    end
+    return ok &&
+           snapshot.object_ref.get_object_type() == snapshot.object_type;
+  endfunction
+
+  protected function bit recovery_snapshot_matches(
+    rdma_recovery_record value,
+    rdma_rm_recovery_snapshot snapshot
+  );
+    if (snapshot == null || value != snapshot.object_ref || value == null)
+      return 1'b0;
+    if (value.get_object_type() != snapshot.object_type ||
+        !handle_snapshot_matches(value.resource_h, snapshot.resource_h) ||
+        value.hardware_presence != snapshot.hardware_presence ||
+        value.completed_steps.size() != snapshot.completed_steps.size() ||
+        value.pending_steps.size() != snapshot.pending_steps.size() ||
+        value.backing_refs.size() != snapshot.backing_refs.size() ||
+        value.hmc_refs.size() != snapshot.hmc_refs.size() ||
+        value.rollback_statuses.size() != snapshot.rollback_statuses.size() ||
+        !ticket_snapshot_matches(value.ambiguous_ticket,
+                                 snapshot.ambiguous_ticket) ||
+        !status_snapshot_matches(value.primary_status,
+                                 snapshot.primary_status))
+      return 1'b0;
+    foreach (value.completed_steps[i]) begin
+      if (value.completed_steps[i] != snapshot.completed_steps[i])
+        return 1'b0;
+    end
+    foreach (value.pending_steps[i]) begin
+      if (value.pending_steps[i] != snapshot.pending_steps[i])
+        return 1'b0;
+    end
+    foreach (value.backing_refs[i]) begin
+      if (!backing_ref_snapshot_matches(value.backing_refs[i],
+                                        snapshot.backing_refs[i]))
+        return 1'b0;
+    end
+    foreach (value.hmc_refs[i]) begin
+      if (!hmc_ref_snapshot_matches(value.hmc_refs[i], snapshot.hmc_refs[i]))
+        return 1'b0;
+    end
+    foreach (value.rollback_statuses[i]) begin
+      if (!status_snapshot_matches(value.rollback_statuses[i],
+                                   snapshot.rollback_statuses[i]))
+        return 1'b0;
+    end
+    return 1'b1;
+  endfunction
+
+  protected function bit recovery_graph_detached_from_nodes(
+    rdma_recovery_record result,
+    ref uvm_object source_nodes[$]
+  );
+    uvm_object result_nodes[$];
+
+    if (result == null)
+      return 1'b0;
     collect_recovery_graph(result, result_nodes);
-    collect_recovery_graph(source, source_nodes);
     foreach (result_nodes[i]) begin
       foreach (source_nodes[j]) begin
         if (result_nodes[i] == source_nodes[j])
@@ -903,15 +2469,44 @@ class rdma_resource_manager extends uvm_object;
     output rdma_recovery_record result
   );
     uvm_object cloned_object;
+    rdma_rm_recovery_snapshot snapshot;
+    bit source_mutated;
+    bit source_restored;
 
     result = null;
     if (source == null)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                {copy_label, " recovery record is null"});
+    snapshot = capture_recovery_snapshot(source);
+    if (snapshot == null)
+      return rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT,
+        {copy_label, " recovery pre-clone snapshot failed"}
+      );
     cloned_object = source.clone();
+    // Recovery records receive the same caller-restoration guarantee as
+    // resource values, including every nested reference and scalar.
+    source_mutated = !recovery_snapshot_matches(source, snapshot);
+    source_restored = restore_recovery_snapshot(snapshot);
+    source_restored = recovery_snapshot_matches(source, snapshot) &&
+                      source_restored;
+    if (!source_restored) begin
+      result = null;
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        {copy_label, " recovery source restoration failed"}
+      );
+    end
+    if (source_mutated) begin
+      result = null;
+      return rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT,
+        {copy_label, " recovery clone mutated its source"}
+      );
+    end
     if (cloned_object == null || cloned_object == source ||
         !$cast(result, cloned_object) ||
-        result.get_object_type() != source.get_object_type()) begin
+        result.get_object_type() != snapshot.object_type) begin
       result = null;
       return rdma_status::make(
         RDMA_SC_INVALID_ARGUMENT,
@@ -926,7 +2521,7 @@ class rdma_resource_manager extends uvm_object;
         {copy_label, " recovery clone changed validated fields"}
       );
     end
-    if (!recovery_graph_detached(result, source)) begin
+    if (!recovery_graph_detached_from_nodes(result, snapshot.graph_nodes)) begin
       result = null;
       return rdma_status::make(
         RDMA_SC_INVALID_ARGUMENT,
