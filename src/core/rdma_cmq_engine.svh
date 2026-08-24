@@ -472,6 +472,43 @@ class rdma_cmq_engine extends uvm_object;
     return -1;
   endfunction
 
+  protected function int late_diagnostic_index(rdma_cmq_ticket ticket);
+    if (ticket == null)
+      return -1;
+    foreach (diagnostic_fifo[i]) begin
+      if (diagnostic_fifo[i] != null &&
+          diagnostic_fifo[i].kind == RDMA_CMQ_DIAG_LATE_COMPLETION &&
+          diagnostic_fifo[i].ticket != null &&
+          same_ticket_value(diagnostic_fifo[i].ticket, ticket))
+        return i;
+    end
+    return -1;
+  endfunction
+
+  protected function bit ticket_has_engine_authority(
+    rdma_cmq_ticket ticket
+  );
+    if (ticket == null || ticket.function_h == null || ticket.cmq_h == null ||
+        prepared_binding == null || cmq_snapshot == null ||
+        cmq_snapshot.handle == null)
+      return 1'b0;
+    if (ticket.function_h.kind != RDMA_RESOURCE_FUNCTION ||
+        ticket.function_h.function_uid != prepared_binding.function_uid ||
+        ticket.function_h.object_id != prepared_binding.global_function_id ||
+        ticket.function_h.generation != prepared_binding.generation ||
+        !ticket.cmq_h.same_instance(cmq_snapshot.handle))
+      return 1'b0;
+    if (terminal_index(ticket) >= 0 || late_diagnostic_index(ticket) >= 0 ||
+        ticket_is_outstanding(ticket))
+      return 1'b1;
+    foreach (slots[i]) begin
+      if (slots[i] != null && slots[i].ticket != null &&
+          same_ticket_value(slots[i].ticket, ticket))
+        return 1'b1;
+    end
+    return 1'b0;
+  endfunction
+
   protected function bit ticket_is_outstanding(rdma_cmq_ticket ticket);
     string software_key;
 
@@ -525,6 +562,35 @@ class rdma_cmq_engine extends uvm_object;
     if (status == null || !status.ok()) begin
       diagnostic = null;
       return invalid_state("CMQ late diagnostic validation failed");
+    end
+    return rdma_status::success();
+  endfunction
+
+  protected function rdma_status make_reconciled_late_completion(
+    rdma_cmq_diagnostic diagnostic,
+    output rdma_cmq_completion completion
+  );
+    rdma_status validation_status;
+
+    completion = null;
+    if (diagnostic == null ||
+        diagnostic.kind != RDMA_CMQ_DIAG_LATE_COMPLETION ||
+        diagnostic.ticket == null || diagnostic.status == null ||
+        diagnostic.raw_cqe == null)
+      return invalid_state("CMQ late reconcile diagnostic is incomplete");
+    completion = rdma_cmq_completion::type_id::create(
+      "cmq_reconciled_late_completion"
+    );
+    if (completion == null)
+      return invalid_state("CMQ late reconcile completion construction failed");
+    completion.ticket = diagnostic.ticket;
+    completion.status = diagnostic.status;
+    completion.raw_cqe = diagnostic.raw_cqe;
+    completion.decoded_response = null;
+    validation_status = completion.validate();
+    if (validation_status == null || !validation_status.ok()) begin
+      completion = null;
+      return invalid_state("CMQ late reconcile completion validation failed");
     end
     return rdma_status::success();
   endfunction
@@ -5292,6 +5358,117 @@ class rdma_cmq_engine extends uvm_object;
         return;
       end
     end
+  endtask
+
+  task reconcile_ticket(
+    rdma_cmq_ticket ticket,
+    output bit terminal_known,
+    output rdma_cmq_completion completion,
+    output rdma_status status
+  );
+    rdma_status validation_status;
+    rdma_status helper_status;
+    rdma_cmq_ticket ticket_snapshot;
+    rdma_cmq_completion staged_completion;
+    int fifo_index;
+
+    terminal_known = 1'b0;
+    completion = null;
+    status = invalid_state("CMQ ticket reconcile did not complete");
+    engine_lock.get(1);
+    if (engine_state != RDMA_CMQ_ENGINE_ACTIVE) begin
+      status = invalid_state("CMQ ticket reconcile requires an ACTIVE engine");
+      engine_lock.put(1);
+      return;
+    end
+    validation_status = ticket_trust_status(ticket);
+    if (validation_status == null || !validation_status.ok()) begin
+      status = invalid_argument("CMQ reconcile ticket is invalid");
+      engine_lock.put(1);
+      return;
+    end
+    validation_status = checked_completion_ticket_snapshot(
+      ticket, ticket_snapshot
+    );
+    if (validation_status == null || !validation_status.ok()) begin
+      status = (validation_status == null) ?
+        invalid_state("CMQ reconcile ticket snapshot returned null status") :
+        validation_status;
+      engine_lock.put(1);
+      return;
+    end
+    if (!ticket_has_engine_authority(ticket_snapshot)) begin
+      status = invalid_argument("CMQ reconcile ticket is unknown or stale");
+      engine_lock.put(1);
+      return;
+    end
+
+    helper_status = expire_locked();
+    if (helper_status == null || !helper_status.ok()) begin
+      status = (helper_status == null) ?
+        invalid_state("CMQ reconcile expiry returned null status") :
+        helper_status;
+      engine_lock.put(1);
+      return;
+    end
+    poll_locked(helper_status);
+    if (helper_status == null || !helper_status.ok()) begin
+      status = (helper_status == null) ?
+        invalid_state("CMQ reconcile poll returned null status") :
+        helper_status;
+      engine_lock.put(1);
+      return;
+    end
+
+    fifo_index = terminal_index(ticket_snapshot);
+    if (fifo_index >= 0) begin
+      staged_completion = terminal_fifo[fifo_index];
+      if (staged_completion == null || staged_completion.status == null) begin
+        status = invalid_state("CMQ reconcile terminal completion is incomplete");
+        engine_lock.put(1);
+        return;
+      end
+      status = rdma_cmq_clone_status_value(staged_completion.status);
+      if (status == null) begin
+        status = invalid_state("CMQ reconcile terminal status copy failed");
+        engine_lock.put(1);
+        return;
+      end
+      terminal_fifo.delete(fifo_index);
+      completion = staged_completion;
+      terminal_known = 1'b1;
+      engine_lock.put(1);
+      return;
+    end
+
+    fifo_index = late_diagnostic_index(ticket_snapshot);
+    if (fifo_index >= 0) begin
+      helper_status = make_reconciled_late_completion(
+        diagnostic_fifo[fifo_index], staged_completion
+      );
+      if (helper_status == null || !helper_status.ok() ||
+          staged_completion == null || staged_completion.status == null) begin
+        status = (helper_status == null) ?
+          invalid_state("CMQ late reconcile helper returned null status") :
+          helper_status;
+        engine_lock.put(1);
+        return;
+      end
+      status = rdma_cmq_clone_status_value(staged_completion.status);
+      if (status == null) begin
+        status = invalid_state("CMQ late reconcile status copy failed");
+        engine_lock.put(1);
+        return;
+      end
+      diagnostic_fifo.delete(fifo_index);
+      completion = staged_completion;
+      terminal_known = 1'b1;
+      engine_lock.put(1);
+      return;
+    end
+
+    status = rdma_status::success();
+    engine_lock.put(1);
   endtask
 
   task cancel_generation(

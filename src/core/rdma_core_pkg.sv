@@ -10,5 +10,7 @@ package rdma_core_pkg;
   `include "rdma_hmc_allocator.svh"
   `include "rdma_resource_manager.svh"
   `include "rdma_doorbell_scheduler.svh"
+  `include "rdma_cmq_port.svh"
   `include "rdma_cmq_engine.svh"
+  `include "rdma_cmq_engine_port_adapter.svh"
 endpackage
