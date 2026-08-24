@@ -801,6 +801,37 @@ class rdma_rm_schema_mapping extends rdma_dma_mapping;
   endfunction
 endclass
 
+class rdma_rm_owned_alias_mapping extends rdma_dma_mapping;
+  `uvm_object_utils(rdma_rm_owned_alias_mapping)
+
+  function new(string name = "rdma_rm_owned_alias_mapping");
+    super.new(name);
+  endfunction
+
+  virtual function uvm_object clone();
+    return this;
+  endfunction
+endclass
+
+class rdma_rm_owned_drift_mapping extends rdma_dma_mapping;
+  `uvm_object_utils(rdma_rm_owned_drift_mapping)
+
+  function new(string name = "rdma_rm_owned_drift_mapping");
+    super.new(name);
+  endfunction
+
+  virtual function uvm_object clone();
+    uvm_object cloned_object;
+    rdma_rm_owned_drift_mapping result;
+
+    cloned_object = super.clone();
+    if (!$cast(result, cloned_object))
+      `uvm_fatal("RM_OWNED_CLONE", "drift mapping clone cast failed")
+    result.size++;
+    return result;
+  endfunction
+endclass
+
 class rdma_rm_schema_hmc_ref extends rdma_hmc_ref;
   `uvm_object_utils(rdma_rm_schema_hmc_ref)
 
@@ -1291,6 +1322,239 @@ class rdma_resource_manager_test extends uvm_test;
                   remote_atomic:1'b0};
   endfunction
 
+  task automatic check_owned_mapping_clone_contract_rejections();
+    rdma_resource_manager contract_rm;
+    rdma_function_binding contract_binding;
+    rdma_pd contract_pd;
+    rdma_mr candidate;
+    rdma_resource resource;
+    rdma_dma_mapping mappings[$];
+    rdma_rm_owned_alias_mapping alias_mapping;
+    rdma_rm_owned_drift_mapping drift_mapping;
+    rdma_rm_unregistered_mapping unregistered_mapping;
+    rdma_backing_ref backing_ref;
+
+    contract_rm = rdma_resource_manager::type_id::create(
+      "owned_clone_contract_rm"
+    );
+    contract_binding = make_active_binding(
+      "owned_clone_contract_binding", 64'hca10_0000_0000_0001,
+      32'hca10_0101, 32'd90
+    );
+    expect_status(
+      "OWNED_CLONE_CONTRACT_PD_CREATE",
+      contract_rm.create_pd(contract_binding, contract_pd), RDMA_SC_OK
+    );
+    expect_status(
+      "OWNED_CLONE_CONTRACT_PD_ACTIVATE",
+      contract_rm.activate(contract_pd.handle), RDMA_SC_OK
+    );
+
+    alias_mapping = rdma_rm_owned_alias_mapping::type_id::create(
+      "owned_alias_mapping"
+    );
+    mappings.push_back(alias_mapping);
+    drift_mapping = rdma_rm_owned_drift_mapping::type_id::create(
+      "owned_drift_mapping"
+    );
+    mappings.push_back(drift_mapping);
+    unregistered_mapping = new("owned_unregistered_mapping");
+    mappings.push_back(unregistered_mapping);
+
+    foreach (mappings[i]) begin
+      mappings[i].function_h = contract_binding.make_handle();
+      mappings[i].requester_bdf = contract_binding.pcie.bdf;
+      mappings[i].backing_addr.value =
+        64'hca10_1000_0000_0000 + (i * 64'h10000);
+      mappings[i].iova.value =
+        64'hca10_2000_0000_0000 + (i * 64'h10000);
+      mappings[i].size = 64'h2000;
+      mappings[i].direction = RDMA_DMA_BIDIRECTIONAL;
+      mappings[i].permissions =
+        '{device_read:1'b1, device_write:1'b1, atomic:1'b0};
+      mappings[i].state = RDMA_MAPPING_ACTIVE;
+      mappings[i].owner_h = null;
+
+      expect_status(
+        $sformatf("OWNED_CLONE_CONTRACT_CREATE_%0d", i),
+        contract_rm.create_mr(contract_binding, contract_pd.handle, candidate),
+        RDMA_SC_OK
+      );
+      prepare_mr(candidate, mappings[i].iova.value);
+      backing_ref = rdma_backing_ref::type_id::create(
+        $sformatf("owned_clone_contract_ref_%0d", i)
+      );
+      backing_ref.mapping = mappings[i];
+      backing_ref.ownership = RDMA_OWNERSHIP_CONTROL_PLANE;
+      candidate.backing_refs.push_back(backing_ref);
+      expect_status(
+        $sformatf("OWNED_CLONE_CONTRACT_REJECT_%0d", i),
+        contract_rm.stage_allocated(candidate), RDMA_SC_INVALID_ARGUMENT
+      );
+      expect_status(
+        $sformatf("OWNED_CLONE_CONTRACT_LOOKUP_%0d", i),
+        contract_rm.lookup(candidate.handle, resource), RDMA_SC_OK
+      );
+      if (resource == null || resource.state != RDMA_RESOURCE_ALLOCATED ||
+          resource.backing_refs.size() != 0)
+        `uvm_error("OWNED_CLONE_CONTRACT_ATOMIC",
+                   "rejected owned clone changed the canonical MR")
+    end
+  endtask
+
+  task automatic check_owned_mapping_capability_snapshots();
+    rdma_resource_manager capability_rm;
+    rdma_mock_host_mem capability_mem;
+    rdma_function_binding capability_binding;
+    rdma_dma_request_context capability_context;
+    rdma_pd capability_pd;
+    rdma_mr active_mr;
+    rdma_mr recovery_mr;
+    rdma_mr active_snapshot;
+    rdma_resource resource;
+    rdma_dma_mapping active_mapping;
+    rdma_dma_mapping recovery_mapping;
+    rdma_backing_ref active_ref;
+    rdma_backing_ref recovery_ref;
+    rdma_recovery_record recovery;
+    rdma_recovery_record recovery_snapshot;
+    rdma_status status;
+
+    capability_rm = rdma_resource_manager::type_id::create(
+      "owned_capability_rm"
+    );
+    capability_mem = rdma_mock_host_mem::type_id::create(
+      "owned_capability_mem"
+    );
+    capability_binding = make_active_binding(
+      "owned_capability_binding", 64'hca11_0000_0000_0001,
+      32'hca11_0101, 32'd91
+    );
+    capability_context = rdma_dma_request_context::type_id::create(
+      "owned_capability_context"
+    );
+    capability_context.function_h = capability_binding.make_handle();
+    capability_context.requester_bdf = capability_binding.pcie.bdf;
+    capability_context.pasid_valid = 1'b1;
+    capability_context.pasid = 20'hca111;
+    capability_context.owner_h = null;
+
+    expect_status(
+      "OWNED_CAPABILITY_PD_CREATE",
+      capability_rm.create_pd(capability_binding, capability_pd), RDMA_SC_OK
+    );
+    expect_status(
+      "OWNED_CAPABILITY_PD_ACTIVATE",
+      capability_rm.activate(capability_pd.handle), RDMA_SC_OK
+    );
+
+    status = capability_mem.allocate(
+      capability_context, 8192, 4096, RDMA_DMA_BIDIRECTIONAL,
+      active_mapping
+    );
+    expect_status("OWNED_CAPABILITY_ACTIVE_ALLOCATE", status, RDMA_SC_OK);
+    expect_status(
+      "OWNED_CAPABILITY_ACTIVE_CREATE",
+      capability_rm.create_mr(capability_binding, capability_pd.handle,
+                              active_mr),
+      RDMA_SC_OK
+    );
+    prepare_mr(active_mr, active_mapping.iova.value);
+    active_ref = rdma_backing_ref::type_id::create(
+      "owned_capability_active_ref"
+    );
+    active_ref.mapping = active_mapping;
+    active_ref.ownership = RDMA_OWNERSHIP_CONTROL_PLANE;
+    active_mr.backing_refs.push_back(active_ref);
+    expect_status("OWNED_CAPABILITY_ACTIVE_STAGE",
+                  capability_rm.stage_allocated(active_mr), RDMA_SC_OK);
+    expect_status("OWNED_CAPABILITY_ACTIVE_COMMIT",
+                  capability_rm.commit_programmed(active_mr), RDMA_SC_OK);
+    expect_status("OWNED_CAPABILITY_ACTIVE_ACTIVATE",
+                  capability_rm.activate(active_mr.handle), RDMA_SC_OK);
+    expect_status("OWNED_CAPABILITY_ACTIVE_LOOKUP",
+                  capability_rm.lookup(active_mr.handle, resource),
+                  RDMA_SC_OK);
+    active_snapshot = null;
+    if (!$cast(active_snapshot, resource) || active_snapshot == null ||
+        active_snapshot.backing_refs.size() != 1 ||
+        active_snapshot.backing_refs[0] == null ||
+        active_snapshot.backing_refs[0].mapping == null)
+      `uvm_fatal("OWNED_CAPABILITY_ACTIVE_LOOKUP",
+                 "ACTIVE lookup lost its owned mapping")
+    status = capability_mem.\release (
+      active_snapshot.backing_refs[0].mapping
+    );
+    expect_status("OWNED_CAPABILITY_ACTIVE_RELEASE", status, RDMA_SC_OK);
+    status = capability_mem.\release (
+      active_snapshot.backing_refs[0].mapping
+    );
+    expect_status("OWNED_CAPABILITY_ACTIVE_RELEASE_AGAIN", status,
+                  RDMA_SC_INVALID_STATE);
+
+    status = capability_mem.allocate(
+      capability_context, 8192, 4096, RDMA_DMA_BIDIRECTIONAL,
+      recovery_mapping
+    );
+    expect_status("OWNED_CAPABILITY_RECOVERY_ALLOCATE", status, RDMA_SC_OK);
+    expect_status(
+      "OWNED_CAPABILITY_RECOVERY_CREATE",
+      capability_rm.create_mr(capability_binding, capability_pd.handle,
+                              recovery_mr),
+      RDMA_SC_OK
+    );
+    prepare_mr(recovery_mr, recovery_mapping.iova.value);
+    recovery_ref = rdma_backing_ref::type_id::create(
+      "owned_capability_recovery_ref"
+    );
+    recovery_ref.mapping = recovery_mapping;
+    recovery_ref.ownership = RDMA_OWNERSHIP_CONTROL_PLANE;
+    recovery_mr.backing_refs.push_back(recovery_ref);
+    expect_status("OWNED_CAPABILITY_RECOVERY_STAGE",
+                  capability_rm.stage_allocated(recovery_mr), RDMA_SC_OK);
+    expect_status("OWNED_CAPABILITY_RECOVERY_COMMIT",
+                  capability_rm.commit_programmed(recovery_mr), RDMA_SC_OK);
+    expect_status("OWNED_CAPABILITY_RECOVERY_ACTIVATE",
+                  capability_rm.activate(recovery_mr.handle), RDMA_SC_OK);
+    recovery = rdma_recovery_record::type_id::create(
+      "owned_capability_recovery"
+    );
+    recovery.resource_h = clone_handle(
+      "OWNED_CAPABILITY_RECOVERY_HANDLE", recovery_mr.handle
+    );
+    recovery.hardware_presence = RDMA_HW_PRESENCE_ABSENT;
+    recovery.backing_refs.push_back(recovery_ref);
+    recovery.primary_status = rdma_status::make(
+      RDMA_SC_UNKNOWN_HW_ERROR, "owned mapping recovery authority"
+    );
+    expect_status("OWNED_CAPABILITY_RECOVERY_MARK",
+                  capability_rm.mark_error(recovery_mr.handle, recovery),
+                  RDMA_SC_OK);
+    expect_status(
+      "OWNED_CAPABILITY_RECOVERY_LOOKUP",
+      capability_rm.lookup_recovery(recovery_mr.handle, recovery_snapshot),
+      RDMA_SC_OK
+    );
+    if (recovery_snapshot == null ||
+        recovery_snapshot.backing_refs.size() != 1 ||
+        recovery_snapshot.backing_refs[0] == null ||
+        recovery_snapshot.backing_refs[0].mapping == null)
+      `uvm_fatal("OWNED_CAPABILITY_RECOVERY_LOOKUP",
+                 "recovery lookup lost its owned mapping")
+    status = capability_mem.\release (
+      recovery_snapshot.backing_refs[0].mapping
+    );
+    expect_status("OWNED_CAPABILITY_RECOVERY_RELEASE", status, RDMA_SC_OK);
+    status = capability_mem.\release (
+      recovery_snapshot.backing_refs[0].mapping
+    );
+    expect_status("OWNED_CAPABILITY_RECOVERY_RELEASE_AGAIN", status,
+                  RDMA_SC_INVALID_STATE);
+    if (capability_mem.live_allocations() != 0)
+      `uvm_error("OWNED_CAPABILITY_RELEASE_COUNT",
+                 "canonical snapshots did not release each allocation once")
+  endtask
+
   function automatic bit same_handle_fields(rdma_handle lhs,
                                              rdma_handle rhs);
     if (lhs == null || rhs == null)
@@ -1668,6 +1932,8 @@ class rdma_resource_manager_test extends uvm_test;
     rdma_pcie_identity schema_saved_pcie;
 
     phase.raise_objection(this);
+    check_owned_mapping_clone_contract_rejections();
+    check_owned_mapping_capability_snapshots();
 
     // PD and MR local IDs are hardware-width projections.  The inclusive
     // boundary succeeds, while the next fresh ID fails atomically without
@@ -2513,7 +2779,7 @@ class rdma_resource_manager_test extends uvm_test;
     projection_unregistered_backing_ref.mapping =
       projection_unregistered_mapping;
     projection_unregistered_backing_ref.ownership =
-      RDMA_OWNERSHIP_CONTROL_PLANE;
+      RDMA_OWNERSHIP_BORROWED;
     projection_nested_mr.backing_refs.push_back(
       projection_unregistered_backing_ref
     );
@@ -2539,7 +2805,7 @@ class rdma_resource_manager_test extends uvm_test;
     projection_lying_mapping.clone_calls = 0;
     projection_lying_backing_ref = new("projection_lying_backing_ref");
     projection_lying_backing_ref.mapping = projection_lying_mapping;
-    projection_lying_backing_ref.ownership = RDMA_OWNERSHIP_CONTROL_PLANE;
+    projection_lying_backing_ref.ownership = RDMA_OWNERSHIP_BORROWED;
     projection_nested_mr.backing_refs.push_back(
       projection_lying_backing_ref
     );
@@ -3087,10 +3353,8 @@ class rdma_resource_manager_test extends uvm_test;
         $sformatf("composite_backing_ref_%0d", i)
       );
       composite_backing_refs[i].mapping = composite_mappings[i];
-      composite_backing_refs[i].ownership =
-        (i == 0) ? RDMA_OWNERSHIP_BORROWED :
-                   RDMA_OWNERSHIP_CONTROL_PLANE;
-      composite_backing_refs[i].release_complete = (i == 1);
+      composite_backing_refs[i].ownership = RDMA_OWNERSHIP_BORROWED;
+      composite_backing_refs[i].release_complete = 1'b0;
       composite_backing_refs[i].clone_calls = 0;
       composite_mr_candidate.backing_refs.push_back(
         composite_backing_refs[i]
@@ -3192,9 +3456,8 @@ class rdma_resource_manager_test extends uvm_test;
           composite_mr_candidate.hmc_refs[i] != composite_hmc_refs[i] ||
           composite_hmc_refs[i].owner != composite_hmc_owners[i] ||
           composite_backing_refs[i].ownership !=
-            ((i == 0) ? RDMA_OWNERSHIP_BORROWED :
-                        RDMA_OWNERSHIP_CONTROL_PLANE) ||
-          composite_backing_refs[i].release_complete != (i == 1) ||
+            RDMA_OWNERSHIP_BORROWED ||
+          composite_backing_refs[i].release_complete ||
           composite_mappings[i].requester_bdf !=
             composite_mr_binding.pcie.bdf ||
           composite_mappings[i].pasid_valid != (i == 1) ||

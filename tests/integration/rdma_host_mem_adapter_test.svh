@@ -119,6 +119,198 @@ class rdma_host_mem_adapter_test extends uvm_test;
     return function_h;
   endfunction
 
+  function automatic rdma_function_binding make_active_binding(string name);
+    rdma_function_binding binding;
+
+    binding = rdma_function_binding::type_id::create(name);
+    binding.function_uid = 64'hca12_0000_0000_0001;
+    binding.generation = 32'd92;
+    binding.global_function_id = 32'hca12_0101;
+    binding.rdma_vf_id = 32'hca12_0202;
+    binding.pfvf_id = 32'hca12_0303;
+    binding.pcie.vf_index = 32'hca12_0404;
+    binding.pcie.bdf = '{segment:16'h1001, bus:8'h20, device:5'h03,
+                         function_num:3'h5};
+    binding.pcie.parent_pf_bdf = '{segment:16'h2002, bus:8'h30,
+                                   device:5'h04, function_num:3'h2};
+    binding.pcie.bar[0].base.value = 64'h0000_0000_8000_0000;
+    binding.pcie.bar[0].size = 64'h4000;
+    binding.pcie.bar[0].enabled = 1'b1;
+    binding.notify_bar_id = 3'd0;
+    binding.notify_base.value = 64'h0000_0000_8000_2000;
+    binding.notify_size = 64'h2000;
+    binding.state = RDMA_BIND_ACTIVE;
+    binding.owner_h = binding.make_handle();
+    binding.dma_domain_valid = 1'b1;
+    binding.pcie.mse = 1'b1;
+    binding.pcie.bme = 1'b1;
+    binding.notify_valid = 1'b1;
+    binding.notify_ready = 1'b1;
+    binding.dmi_valid = 1'b1;
+    binding.dmi_ready = 1'b1;
+    binding.vft_valid = 1'b1;
+    binding.vft_ready = 1'b1;
+    return binding;
+  endfunction
+
+  function automatic void prepare_manager_mr(
+    rdma_mr mr,
+    rdma_dma_mapping mapping
+  );
+    mr.iova = mapping.iova;
+    mr.length = mapping.size;
+    mr.lkey = {mr.local_mr_id[23:0], 8'h6d};
+    mr.rkey = mr.lkey;
+    mr.access = '{local_write:1'b1, remote_read:1'b1,
+                  remote_write:1'b0, memory_window_bind:1'b0,
+                  remote_atomic:1'b0};
+  endfunction
+
+  task automatic check_manager_owned_mapping_identity();
+    $unit::host_mem_manager identity_hm;
+    rdma_host_mem_adapter identity_adapter;
+    rdma_resource_manager identity_rm;
+    rdma_function_binding identity_binding;
+    rdma_dma_request_context identity_context;
+    rdma_pd identity_pd;
+    rdma_mr active_mr;
+    rdma_mr recovery_mr;
+    rdma_mr active_snapshot;
+    rdma_resource resource;
+    rdma_dma_mapping active_mapping;
+    rdma_dma_mapping recovery_mapping;
+    rdma_backing_ref active_ref;
+    rdma_backing_ref recovery_ref;
+    rdma_recovery_record recovery;
+    rdma_recovery_record recovery_snapshot;
+    rdma_status status;
+    int unsigned leak_count;
+
+    identity_hm = $unit::host_mem_manager::type_id::create(
+      "manager_identity_hm"
+    );
+    identity_hm.init_region(64'h0000_0007_0000_0000,
+                            64'h0000_0007_00ff_ffff);
+    identity_adapter = rdma_host_mem_adapter::type_id::create(
+      "manager_identity_adapter"
+    );
+    identity_adapter.mem = identity_hm;
+    identity_rm = rdma_resource_manager::type_id::create(
+      "manager_identity_rm"
+    );
+    identity_binding = make_active_binding("manager_identity_binding");
+    identity_context = make_dma_context(
+      "manager_identity_context", identity_binding.make_handle(),
+      identity_binding.pcie.bdf
+    );
+
+    expect_status("MANAGER_IDENTITY_PD_CREATE",
+                  identity_rm.create_pd(identity_binding, identity_pd),
+                  RDMA_SC_OK);
+    expect_status("MANAGER_IDENTITY_PD_ACTIVATE",
+                  identity_rm.activate(identity_pd.handle), RDMA_SC_OK);
+
+    status = identity_adapter.allocate(
+      identity_context, 4096, 4096, RDMA_DMA_BIDIRECTIONAL, active_mapping
+    );
+    expect_status("MANAGER_IDENTITY_ACTIVE_ALLOCATE", status, RDMA_SC_OK);
+    expect_status("MANAGER_IDENTITY_ACTIVE_CREATE",
+                  identity_rm.create_mr(identity_binding, identity_pd.handle,
+                                        active_mr),
+                  RDMA_SC_OK);
+    prepare_manager_mr(active_mr, active_mapping);
+    active_ref = rdma_backing_ref::type_id::create(
+      "manager_identity_active_ref"
+    );
+    active_ref.mapping = active_mapping;
+    active_ref.ownership = RDMA_OWNERSHIP_CONTROL_PLANE;
+    active_mr.backing_refs.push_back(active_ref);
+    expect_status("MANAGER_IDENTITY_ACTIVE_STAGE",
+                  identity_rm.stage_allocated(active_mr), RDMA_SC_OK);
+    expect_status("MANAGER_IDENTITY_ACTIVE_COMMIT",
+                  identity_rm.commit_programmed(active_mr), RDMA_SC_OK);
+    expect_status("MANAGER_IDENTITY_ACTIVE_ACTIVATE",
+                  identity_rm.activate(active_mr.handle), RDMA_SC_OK);
+    expect_status("MANAGER_IDENTITY_ACTIVE_LOOKUP",
+                  identity_rm.lookup(active_mr.handle, resource), RDMA_SC_OK);
+    active_snapshot = null;
+    if (!$cast(active_snapshot, resource) || active_snapshot == null ||
+        active_snapshot.backing_refs.size() != 1 ||
+        active_snapshot.backing_refs[0] == null ||
+        active_snapshot.backing_refs[0].mapping == null)
+      `uvm_fatal("MANAGER_IDENTITY_ACTIVE_LOOKUP",
+                 "ACTIVE lookup lost its owned mapping")
+    status = identity_adapter.\release (
+      active_snapshot.backing_refs[0].mapping
+    );
+    expect_status("MANAGER_IDENTITY_ACTIVE_RELEASE", status, RDMA_SC_OK);
+    status = identity_adapter.\release (
+      active_snapshot.backing_refs[0].mapping
+    );
+    expect_status("MANAGER_IDENTITY_ACTIVE_RELEASE_AGAIN", status,
+                  RDMA_SC_INVALID_STATE);
+
+    status = identity_adapter.allocate(
+      identity_context, 4096, 4096, RDMA_DMA_BIDIRECTIONAL, recovery_mapping
+    );
+    expect_status("MANAGER_IDENTITY_RECOVERY_ALLOCATE", status, RDMA_SC_OK);
+    expect_status("MANAGER_IDENTITY_RECOVERY_CREATE",
+                  identity_rm.create_mr(identity_binding, identity_pd.handle,
+                                        recovery_mr),
+                  RDMA_SC_OK);
+    prepare_manager_mr(recovery_mr, recovery_mapping);
+    recovery_ref = rdma_backing_ref::type_id::create(
+      "manager_identity_recovery_ref"
+    );
+    recovery_ref.mapping = recovery_mapping;
+    recovery_ref.ownership = RDMA_OWNERSHIP_CONTROL_PLANE;
+    recovery_mr.backing_refs.push_back(recovery_ref);
+    expect_status("MANAGER_IDENTITY_RECOVERY_STAGE",
+                  identity_rm.stage_allocated(recovery_mr), RDMA_SC_OK);
+    expect_status("MANAGER_IDENTITY_RECOVERY_COMMIT",
+                  identity_rm.commit_programmed(recovery_mr), RDMA_SC_OK);
+    expect_status("MANAGER_IDENTITY_RECOVERY_ACTIVATE",
+                  identity_rm.activate(recovery_mr.handle), RDMA_SC_OK);
+    recovery = rdma_recovery_record::type_id::create(
+      "manager_identity_recovery"
+    );
+    recovery.resource_h = rdma_clone_handle_value(
+      recovery_mr.handle, "manager identity recovery"
+    );
+    recovery.hardware_presence = RDMA_HW_PRESENCE_ABSENT;
+    recovery.backing_refs.push_back(recovery_ref);
+    recovery.primary_status = rdma_status::make(
+      RDMA_SC_UNKNOWN_HW_ERROR, "production mapping recovery authority"
+    );
+    expect_status("MANAGER_IDENTITY_RECOVERY_MARK",
+                  identity_rm.mark_error(recovery_mr.handle, recovery),
+                  RDMA_SC_OK);
+    expect_status("MANAGER_IDENTITY_RECOVERY_LOOKUP",
+                  identity_rm.lookup_recovery(recovery_mr.handle,
+                                              recovery_snapshot),
+                  RDMA_SC_OK);
+    if (recovery_snapshot == null ||
+        recovery_snapshot.backing_refs.size() != 1 ||
+        recovery_snapshot.backing_refs[0] == null ||
+        recovery_snapshot.backing_refs[0].mapping == null)
+      `uvm_fatal("MANAGER_IDENTITY_RECOVERY_LOOKUP",
+                 "recovery lookup lost its owned mapping")
+    status = identity_adapter.\release (
+      recovery_snapshot.backing_refs[0].mapping
+    );
+    expect_status("MANAGER_IDENTITY_RECOVERY_RELEASE", status, RDMA_SC_OK);
+    status = identity_adapter.\release (
+      recovery_snapshot.backing_refs[0].mapping
+    );
+    expect_status("MANAGER_IDENTITY_RECOVERY_RELEASE_AGAIN", status,
+                  RDMA_SC_INVALID_STATE);
+    status = identity_adapter.check_leaks(leak_count);
+    expect_status("MANAGER_IDENTITY_LEAK_STATUS", status, RDMA_SC_OK);
+    if (leak_count != 0)
+      `uvm_error("MANAGER_IDENTITY_LEAK_COUNT",
+                 "manager snapshots leaked production host allocations")
+  endtask
+
   function automatic rdma_dma_request_context make_dma_context(
     string name,
     rdma_function_handle function_h,
@@ -240,6 +432,8 @@ class rdma_host_mem_adapter_test extends uvm_test;
     byte external_rd[];
 
     phase.raise_objection(this);
+
+    check_manager_owned_mapping_identity();
 
     function_h = make_function_handle("function_h");
     invalid_function_h = make_function_handle("invalid_function_h");

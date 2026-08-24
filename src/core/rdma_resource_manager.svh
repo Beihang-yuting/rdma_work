@@ -114,10 +114,12 @@ class rdma_resource_manager extends uvm_object;
   endfunction
 
   // Public carriers may be compatible subclasses, but only fields declared by
-  // the built-in model are authoritative.  The manager never invokes virtual
-  // type, clone, copy, resource-kind, or validation hooks on a carrier.  Every
-  // accepted graph is structurally projected into direct-new built-in storage.
-  // Future extension support requires an explicit trusted adapter here.
+  // the built-in model are authoritative.  Borrowed carrier graphs are
+  // structurally projected into direct-new built-in storage without invoking
+  // their virtual clone/copy hooks.  An owned DMA mapping is the explicit
+  // exception: its concrete clone carries opaque adapter release authority and
+  // is accepted only through the checked contract below.  Future extension
+  // support requires another explicit trusted adapter here.
   protected function rdma_status project_handle_value(
     rdma_handle source,
     string copy_label,
@@ -200,6 +202,92 @@ class rdma_resource_manager extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  protected function bit same_mapping_handle_value(
+    rdma_handle lhs,
+    rdma_handle rhs
+  );
+    if (lhs == null || rhs == null)
+      return lhs == null && rhs == null;
+    return lhs.kind == rhs.kind &&
+           lhs.function_uid == rhs.function_uid &&
+           lhs.object_id == rhs.object_id &&
+           lhs.generation == rhs.generation;
+  endfunction
+
+  protected function bit same_mapping_value(
+    rdma_dma_mapping lhs,
+    rdma_dma_mapping rhs
+  );
+    if (lhs == null || rhs == null)
+      return lhs == null && rhs == null;
+    return same_mapping_handle_value(lhs.function_h, rhs.function_h) &&
+           lhs.requester_bdf == rhs.requester_bdf &&
+           lhs.pasid_valid == rhs.pasid_valid &&
+           lhs.pasid == rhs.pasid &&
+           lhs.backing_addr.value == rhs.backing_addr.value &&
+           lhs.iova.value == rhs.iova.value &&
+           lhs.size == rhs.size &&
+           lhs.direction == rhs.direction &&
+           lhs.permissions == rhs.permissions &&
+           lhs.state == rhs.state &&
+           same_mapping_handle_value(lhs.owner_h, rhs.owner_h);
+  endfunction
+
+  // An owned mapping is also the adapter's release capability.  Preserve its
+  // concrete value type while treating clone() as an untrusted boundary: the
+  // clone must be registered, exact-type, detached, and value preserving.
+  protected function rdma_status clone_owned_mapping_value(
+    rdma_dma_mapping source,
+    string copy_label,
+    output rdma_dma_mapping result
+  );
+    rdma_dma_mapping saved_value;
+    rdma_status status;
+    uvm_object cloned_object;
+    uvm_object_wrapper source_type;
+    uvm_object_wrapper result_type;
+
+    result = null;
+    if (source == null)
+      return rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT,
+        {copy_label, " owned mapping is null"}
+      );
+    status = project_mapping_value(source, {copy_label, "_saved"},
+                                   saved_value);
+    if (!status.ok())
+      return status;
+    source_type = source.get_object_type();
+    if (source_type == null)
+      return rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT,
+        {copy_label, " owned mapping type is not registered"}
+      );
+    cloned_object = source.clone();
+    if (cloned_object == null || !$cast(result, cloned_object) ||
+        result == source) begin
+      result = null;
+      return rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT,
+        {copy_label, " owned mapping clone contract failed"}
+      );
+    end
+    result_type = result.get_object_type();
+    if (result_type == null || result_type != source_type ||
+        !same_mapping_value(source, saved_value) ||
+        !same_mapping_value(result, saved_value) ||
+        (source.function_h != null &&
+         result.function_h == source.function_h) ||
+        (source.owner_h != null && result.owner_h == source.owner_h)) begin
+      result = null;
+      return rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT,
+        {copy_label, " owned mapping clone changed type, value, or aliases"}
+      );
+    end
+    return rdma_status::success();
+  endfunction
+
   protected function rdma_status project_backing_ref_value(
     rdma_backing_ref source,
     string copy_label,
@@ -212,15 +300,31 @@ class rdma_resource_manager extends uvm_object;
       return rdma_status::success();
     result = new({copy_label, "_backing_ref"});
     result.mapping = null;
-    status = project_mapping_value(source.mapping, {copy_label, "_mapping"},
-                                   result.mapping);
+    if (source.ownership == RDMA_OWNERSHIP_CONTROL_PLANE)
+      status = clone_owned_mapping_value(
+        source.mapping, {copy_label, "_mapping"}, result.mapping
+      );
+    else
+      status = project_mapping_value(
+        source.mapping, {copy_label, "_mapping"}, result.mapping
+      );
     if (!status.ok()) begin
       result = null;
       return status;
     end
     result.ownership = source.ownership;
     result.release_complete = source.release_complete;
-    return rdma_status::success();
+    status = result.validate();
+    if (status == null) begin
+      result = null;
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        {copy_label, " backing validation returned null"}
+      );
+    end
+    if (!status.ok())
+      result = null;
+    return status;
   endfunction
 
   protected function rdma_status project_hmc_ref_value(

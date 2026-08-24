@@ -272,7 +272,8 @@ class rdma_control_plane extends uvm_object;
           RDMA_HW_PRESENCE_UNKNOWN : RDMA_HW_PRESENCE_PRESENT;
         retain_mr_rollback_error(
           reserved_mr, primary_status, result, failure_presence, 1'b1,
-          RDMA_CTRL_STEP_HW_MR_DEREGISTERED, ticket, mr,
+          RDMA_CTRL_STEP_HW_MR_DEREGISTERED,
+          (rollback_status.code == RDMA_SC_TIMEOUT) ? ticket : null, mr,
           result_finalized
         );
         return;
@@ -369,7 +370,7 @@ class rdma_control_plane extends uvm_object;
         );
         retain_mr_rollback_error(
           reserved_mr, primary_status, result, RDMA_HW_PRESENCE_ABSENT,
-          1'b0, RDMA_CTRL_STEP_RESOURCE_RELEASED, null, mr,
+          1'b1, RDMA_CTRL_STEP_RESOURCE_RELEASED, null, mr,
           result_finalized
         );
         return;
@@ -419,6 +420,7 @@ class rdma_control_plane extends uvm_object;
         return;
       end
     end
+    result.completed_steps.push_back(RDMA_CTRL_STEP_RESOURCE_RELEASED);
     result.final_resource_state = RDMA_RESOURCE_RELEASED;
     result.final_resource_state_known = 1'b1;
   endtask
@@ -1014,12 +1016,14 @@ class rdma_control_plane extends uvm_object;
     bit [7:0] stag_key;
     bit has_remote_access;
     bit result_finalized;
+    bit function_lock_acquired_here;
 
     mr = null;
     result = make_result();
     caller_mapping_recovery = 1'b0;
     function_lock = supplied_function_lock;
     result_finalized = 1'b0;
+    function_lock_acquired_here = 1'b0;
     transaction_id = supplied_transaction_id;
     if (transaction_id == 0)
       reserve_transaction_id(transaction_id, status);
@@ -1063,8 +1067,10 @@ class rdma_control_plane extends uvm_object;
         break;
       end
 
-      if (function_lock == null)
+      if (function_lock == null) begin
         acquire_function_lock(owner, function_lock);
+        function_lock_acquired_here = 1'b1;
+      end
       status = binding_owner_status(binding, locked_owner);
       if (status == null || !status.ok()) begin
         status = checked_status(
@@ -1409,7 +1415,7 @@ class rdma_control_plane extends uvm_object;
 
     if (!result_finalized)
       finish_result(result, status);
-    if (function_lock != null)
+    if (function_lock_acquired_here && function_lock != null)
       function_lock.put(1);
   endtask
 
@@ -1437,6 +1443,8 @@ class rdma_control_plane extends uvm_object;
     output rdma_control_result result
   );
     rdma_function_handle owner;
+    rdma_function_handle locked_owner;
+    rdma_register_mr_req frozen_request;
     rdma_dma_request_context frozen_context;
     rdma_dma_mapping allocated_mapping;
     rdma_mr_backing_desc backing;
@@ -1512,6 +1520,120 @@ class rdma_control_plane extends uvm_object;
         status = invalid_argument("owned MR DMA request context is null");
         break;
       end
+      status = dma_context.validate();
+      if (status == null || !status.ok()) begin
+        status = checked_status(
+          status, "owned MR DMA context validation returned null"
+        );
+        break;
+      end
+      status = same_owner_status(dma_context.function_h, owner,
+                                 "owned MR DMA context");
+      if (status == null || !status.ok()) begin
+        status = checked_status(
+          status, "owned MR DMA Function check returned null"
+        );
+        break;
+      end
+      if (dma_context.requester_bdf != binding.pcie.bdf) begin
+        status = rdma_status::make(
+          RDMA_SC_DMA_TRANSLATION,
+          "owned MR DMA requester BDF does not match Function"
+        );
+        break;
+      end
+      if (dma_context.owner_h != null) begin
+        status = invalid_argument(
+          "owned MR DMA request owner must be null"
+        );
+        break;
+      end
+      if (host_mem == null) begin
+        status = invalid_state(
+          "owned MR host memory adapter is unavailable"
+        );
+        break;
+      end
+
+      acquire_function_lock(owner, function_lock);
+      status = binding_owner_status(binding, locked_owner);
+      if (status == null || !status.ok()) begin
+        status = checked_status(
+          status, "post-lock owned MR Function binding check returned null"
+        );
+        break;
+      end
+      status = same_owner_status(
+        locked_owner, owner, "post-lock owned MR Function binding"
+      );
+      if (status == null || !status.ok()) begin
+        status = checked_status(
+          status, "post-lock owned MR Function identity check returned null"
+        );
+        break;
+      end
+      status = register_mr_request_status(request, locked_owner);
+      if (status == null || !status.ok()) begin
+        status = checked_status(
+          status, "post-lock owned register MR request check returned null"
+        );
+        break;
+      end
+      if (request.length > 64'h0000_0000_ffff_ffff) begin
+        status = invalid_argument(
+          "owned MR length exceeds host allocation size"
+        );
+        break;
+      end
+      if (request.access.remote_atomic) begin
+        status = rdma_status::make(
+          RDMA_SC_UNSUPPORTED_OPCODE,
+          "owned MR helper cannot allocate atomic DMA authority"
+        );
+        break;
+      end
+      status = dma_context.validate();
+      if (status == null || !status.ok()) begin
+        status = checked_status(
+          status, "post-lock owned MR DMA context validation returned null"
+        );
+        break;
+      end
+      status = same_owner_status(
+        dma_context.function_h, locked_owner,
+        "post-lock owned MR DMA context"
+      );
+      if (status == null || !status.ok()) begin
+        status = checked_status(
+          status, "post-lock owned MR DMA Function check returned null"
+        );
+        break;
+      end
+      if (dma_context.requester_bdf != binding.pcie.bdf) begin
+        status = rdma_status::make(
+          RDMA_SC_DMA_TRANSLATION,
+          "owned MR DMA requester BDF does not match Function"
+        );
+        break;
+      end
+      if (dma_context.owner_h != null) begin
+        status = invalid_argument(
+          "owned MR DMA request owner must be null"
+        );
+        break;
+      end
+
+      cloned_object = request.clone();
+      if (cloned_object == null ||
+          !$cast(frozen_request, cloned_object) ||
+          frozen_request == request ||
+          frozen_request.owner == request.owner ||
+          frozen_request.pd_h == request.pd_h) begin
+        status = invalid_state(
+          "owned MR request snapshot is not deeply detached"
+        );
+        break;
+      end
       cloned_object = dma_context.clone();
       if (cloned_object == null ||
           !$cast(frozen_context, cloned_object) ||
@@ -1526,48 +1648,56 @@ class rdma_control_plane extends uvm_object;
         );
         break;
       end
+      status = register_mr_request_status(frozen_request, locked_owner);
+      if (status == null || !status.ok()) begin
+        status = checked_status(
+          status, "owned MR request snapshot check returned null"
+        );
+        break;
+      end
+      if (frozen_request.length > 64'h0000_0000_ffff_ffff) begin
+        status = invalid_argument(
+          "owned MR snapshot length exceeds host allocation size"
+        );
+        break;
+      end
+      if (frozen_request.access.remote_atomic) begin
+        status = rdma_status::make(
+          RDMA_SC_UNSUPPORTED_OPCODE,
+          "owned MR snapshot cannot request atomic DMA authority"
+        );
+        break;
+      end
       status = frozen_context.validate();
       if (status == null || !status.ok()) begin
         status = checked_status(
-          status, "owned MR DMA context validation returned null"
+          status, "owned MR DMA context snapshot validation returned null"
         );
         break;
       end
-      status = same_owner_status(frozen_context.function_h, owner,
-                                 "owned MR DMA context");
+      status = same_owner_status(
+        frozen_context.function_h, locked_owner,
+        "owned MR DMA context snapshot"
+      );
       if (status == null || !status.ok()) begin
         status = checked_status(
-          status, "owned MR DMA Function check returned null"
+          status, "owned MR DMA context snapshot Function check returned null"
         );
         break;
       end
-      if (frozen_context.requester_bdf != binding.pcie.bdf) begin
-        status = rdma_status::make(
-          RDMA_SC_DMA_TRANSLATION,
-          "owned MR DMA requester BDF does not match Function"
-        );
-        break;
-      end
-      if (frozen_context.owner_h != null) begin
+      if (frozen_context.requester_bdf != binding.pcie.bdf ||
+          frozen_context.owner_h != null) begin
         status = invalid_argument(
-          "owned MR DMA request owner must be null"
+          "owned MR DMA context snapshot authority is invalid"
         );
         break;
       end
-      if (host_mem == null) begin
-        status = invalid_state(
-          "owned MR host memory adapter is unavailable"
-        );
-        break;
-      end
-
-      acquire_function_lock(owner, function_lock);
       // Preserve the caller-selected MR IOVA.  The allocation contract cannot
       // request one, so inner backing validation must prove that the returned
       // mapping covers request.iova rather than silently rewriting it.
       status = host_mem.allocate(
-        frozen_context, request.length, alignment,
-        required_dma_direction(request.access), allocated_mapping
+        frozen_context, frozen_request.length, alignment,
+        required_dma_direction(frozen_request.access), allocated_mapping
       );
       status = checked_status(
         status, "owned MR host memory allocation returned null"
@@ -1609,7 +1739,7 @@ class rdma_control_plane extends uvm_object;
 
       registration_started = 1'b1;
       register_mr_internal(
-        binding, request, backing, RDMA_OWNERSHIP_CONTROL_PLANE,
+        binding, frozen_request, backing, RDMA_OWNERSHIP_CONTROL_PLANE,
         transaction_id, function_lock, mr, result,
         caller_mapping_recovery
       );
@@ -1644,7 +1774,7 @@ class rdma_control_plane extends uvm_object;
         mapping = allocated_mapping;
       end
     end
-    if (function_lock != null && !registration_started)
+    if (function_lock != null)
       function_lock.put(1);
   endtask
 endclass

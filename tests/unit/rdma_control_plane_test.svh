@@ -25,6 +25,22 @@ class rdma_control_plane_probe extends rdma_control_plane;
       function_lock.put(1);
   endtask
 
+  task register_mr_with_test_lock(
+    rdma_function_binding binding,
+    rdma_register_mr_req request,
+    rdma_mr_backing_desc backing,
+    semaphore function_lock,
+    output rdma_mr mr,
+    output rdma_control_result result
+  );
+    bit caller_mapping_recovery;
+
+    register_mr_internal(
+      binding, request, backing, RDMA_OWNERSHIP_BORROWED, 0,
+      function_lock, mr, result, caller_mapping_recovery
+    );
+  endtask
+
 endclass
 
 class rdma_blocking_mock_cmq_port extends rdma_mock_cmq_port;
@@ -119,15 +135,21 @@ class rdma_fault_resource_manager extends rdma_recovery_probe_manager;
 
   int unsigned release_reserved_calls;
   int unsigned mark_error_calls;
+  int unsigned finalize_release_calls;
   protected rdma_status next_release_failure;
   protected rdma_status next_mark_error_failure;
+  protected rdma_status next_activate_failure;
+  protected rdma_status next_finalize_failure;
 
   function new(string name = "rdma_fault_resource_manager");
     super.new(name);
     release_reserved_calls = 0;
     mark_error_calls = 0;
+    finalize_release_calls = 0;
     next_release_failure = null;
     next_mark_error_failure = null;
+    next_activate_failure = null;
+    next_finalize_failure = null;
   endfunction
 
   function void fail_next_release_reserved(rdma_status failure);
@@ -136,6 +158,25 @@ class rdma_fault_resource_manager extends rdma_recovery_probe_manager;
 
   function void fail_next_mark_error(rdma_status failure);
     next_mark_error_failure = rdma_cmq_clone_status_value(failure);
+  endfunction
+
+  function void fail_next_activate(rdma_status failure);
+    next_activate_failure = rdma_cmq_clone_status_value(failure);
+  endfunction
+
+  function void fail_next_finalize_release(rdma_status failure);
+    next_finalize_failure = rdma_cmq_clone_status_value(failure);
+  endfunction
+
+  virtual function rdma_status activate(rdma_handle handle);
+    rdma_status failure;
+
+    if (next_activate_failure != null) begin
+      failure = rdma_cmq_clone_status_value(next_activate_failure);
+      next_activate_failure = null;
+      return failure;
+    end
+    return super.activate(handle);
   endfunction
 
   virtual function rdma_status release_reserved(rdma_handle handle);
@@ -163,6 +204,18 @@ class rdma_fault_resource_manager extends rdma_recovery_probe_manager;
       return failure;
     end
     return super.mark_error(handle, recovery);
+  endfunction
+
+  virtual function rdma_status finalize_release(rdma_handle handle);
+    rdma_status failure;
+
+    finalize_release_calls++;
+    if (next_finalize_failure != null) begin
+      failure = rdma_cmq_clone_status_value(next_finalize_failure);
+      next_finalize_failure = null;
+      return failure;
+    end
+    return super.finalize_release(handle);
   endfunction
 
 endclass
@@ -879,13 +932,16 @@ class rdma_control_plane_test extends uvm_test;
     rdma_status injected_status;
     rdma_status status;
     rdma_status_code_e expected_primary;
+    rdma_status_code_e expected_rollback;
     rdma_resource_state_e expected_state;
+    rdma_hw_presence_e expected_presence;
     int unsigned baseline_allocations;
     int unsigned baseline_leaks;
     int unsigned final_leaks;
     int unsigned release_calls;
     bit [7:0] expected_opcodes[$];
     bit rollback_failure;
+    bit expected_ambiguous_ticket;
 
     setup_owned_mr_case(
       {"owned_", failure_kind}, 1'b1, control, manager, mock_cmq,
@@ -895,7 +951,10 @@ class rdma_control_plane_test extends uvm_test;
     if (pd == null)
       return;
     rollback_failure = 1'b0;
+    expected_ambiguous_ticket = 1'b0;
     expected_primary = RDMA_SC_INVALID_STATE;
+    expected_rollback = RDMA_SC_OK;
+    expected_presence = RDMA_HW_PRESENCE_ABSENT;
     expected_state = RDMA_RESOURCE_RELEASED;
     case (failure_kind)
       "allocate": begin
@@ -951,6 +1010,27 @@ class rdma_control_plane_test extends uvm_test;
         expected_opcodes.push_back(XTR_V1_OP_KEY_ALLOC);
         expected_opcodes.push_back(XTR_V1_OP_MR_DEREGISTER);
         rollback_failure = 1'b1;
+        expected_rollback = RDMA_SC_UNKNOWN_HW_ERROR;
+        expected_presence = RDMA_HW_PRESENCE_PRESENT;
+        expected_state = RDMA_RESOURCE_ERROR;
+      end
+      "deregister_timeout": begin
+        injected_status = rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "injected commit before owned deregister timeout"
+        );
+        status = manager.fail_next_transition(
+          "commit_programmed", injected_status
+        );
+        expect_status("OWNED_DEREG_TIMEOUT_COMMIT_INJECT", status,
+                      RDMA_SC_OK);
+        mock_cmq.timeout_opcode(XTR_V1_OP_MR_DEREGISTER);
+        expected_opcodes.push_back(XTR_V1_OP_KEY_ALLOC);
+        expected_opcodes.push_back(XTR_V1_OP_MR_DEREGISTER);
+        rollback_failure = 1'b1;
+        expected_rollback = RDMA_SC_TIMEOUT;
+        expected_presence = RDMA_HW_PRESENCE_UNKNOWN;
+        expected_ambiguous_ticket = 1'b1;
         expected_state = RDMA_RESOURCE_ERROR;
       end
       default:
@@ -995,21 +1075,35 @@ class rdma_control_plane_test extends uvm_test;
           result.final_resource_state != RDMA_RESOURCE_ERROR ||
           result.rollback_statuses.size() != 1 ||
           result.rollback_statuses[0] == null ||
-          result.rollback_statuses[0].code != RDMA_SC_UNKNOWN_HW_ERROR ||
+          result.rollback_statuses[0].code != expected_rollback ||
           mr == null || mr.state != RDMA_RESOURCE_ERROR ||
           recovery == null ||
-          recovery.hardware_presence != RDMA_HW_PRESENCE_PRESENT ||
+          recovery.hardware_presence != expected_presence ||
           recovery.pending_steps.size() != 1 ||
-          recovery.pending_steps[0] != RDMA_CTRL_STEP_HW_MR_DEREGISTERED)
+          recovery.pending_steps[0] != RDMA_CTRL_STEP_HW_MR_DEREGISTERED ||
+          (expected_ambiguous_ticket &&
+           recovery.ambiguous_ticket == null) ||
+          (!expected_ambiguous_ticket &&
+           recovery.ambiguous_ticket != null))
         `uvm_error("OWNED_DEREG_RECOVERY",
                    "rollback failure did not retain one owned ERROR MR")
+      else if (expected_ambiguous_ticket &&
+               mock_cmq.calls[1] != null &&
+               mock_cmq.calls[1].ticket != null &&
+               (recovery.ambiguous_ticket == mock_cmq.calls[1].ticket ||
+                recovery.ambiguous_ticket.command_id !=
+                  mock_cmq.calls[1].ticket.command_id))
+        `uvm_error("OWNED_DEREG_RECOVERY_TICKET",
+                   "rollback timeout ticket is aliased or corrupted")
     end
     else if (host_mem.live_allocations() != baseline_allocations ||
              final_leaks != baseline_leaks || release_calls != 1 ||
              result == null || !result.final_resource_state_known ||
              result.final_resource_state != expected_state ||
              result.recovery_required ||
-             result.rollback_statuses.size() != 0 || mr != null)
+             result.rollback_statuses.size() != 0 || mr != null ||
+             result.completed_steps.size() == 0 ||
+             result.completed_steps[$] != RDMA_CTRL_STEP_RESOURCE_RELEASED)
       `uvm_error({"OWNED_", failure_kind, "_STATE"},
                  "complete rollback did not restore owned baselines")
 
@@ -1826,10 +1920,11 @@ class rdma_control_plane_test extends uvm_test;
         !result.final_resource_state_known ||
         result.final_resource_state != RDMA_RESOURCE_RELEASED ||
         result.recovery_required || result.rollback_statuses.size() != 0 ||
-        result.completed_steps.size() != 3 ||
+        result.completed_steps.size() != 4 ||
         result.completed_steps[0] != RDMA_CTRL_STEP_RESOURCE_RESERVED ||
         result.completed_steps[1] != RDMA_CTRL_STEP_BACKING_ATTACHED ||
-        result.completed_steps[2] != RDMA_CTRL_STEP_HMC_ATTACHED)
+        result.completed_steps[2] != RDMA_CTRL_STEP_HMC_ATTACHED ||
+        result.completed_steps[3] != RDMA_CTRL_STEP_RESOURCE_RELEASED)
       `uvm_error("KEY_ALLOC_FAILURE_RESULT",
                  "explicit KEY_ALLOC failure did not release local state")
     if (mock_cmq.calls.size() != 1 || mock_cmq.calls[0] == null ||
@@ -2539,7 +2634,8 @@ class rdma_control_plane_test extends uvm_test;
     if (recovery == null ||
         recovery.hardware_presence != RDMA_HW_PRESENCE_ABSENT ||
         recovery.completed_steps != result.completed_steps ||
-        recovery.pending_steps.size() != 0 ||
+        recovery.pending_steps.size() != 1 ||
+        recovery.pending_steps[0] != RDMA_CTRL_STEP_RESOURCE_RELEASED ||
         recovery.primary_status == null ||
         recovery.primary_status.code != RDMA_SC_UNKNOWN_HW_ERROR ||
         recovery.rollback_statuses.size() != 1 ||
@@ -2655,12 +2751,59 @@ class rdma_control_plane_test extends uvm_test;
         manager.mark_error_calls != 3 || mock_cmq.calls.size() != 3)
       `uvm_error("FREEZE_TIMEOUT_CALLS",
                  "timeout freeze failure published recovery or skipped calls")
-    foreach (mock_cmq.calls[i]) begin
-      if (mock_cmq.calls[i] == null ||
-          mock_cmq.calls[i].opcode != XTR_V1_OP_KEY_ALLOC)
-        `uvm_error("FREEZE_FAILURE_COMMANDS",
-                   "freeze failure test issued a non-KEY_ALLOC command")
+
+    request = make_register_mr_request("freeze_finalize_request", binding,
+                                       pd);
+    request.iova.value += 64'h0006_0000;
+    backing = make_borrowed_pbl0_backing(
+      "freeze_finalize_backing", binding, request, RDMA_MR_PBL2
+    );
+    status = hmc.allocate(binding.make_handle(), RDMA_RESOURCE_MR,
+                          64'h1000, 64'h1000, hmc_address);
+    expect_status("FREEZE_FINALIZE_HMC_ALLOCATE", status, RDMA_SC_OK);
+    status = hmc.lookup(binding.make_handle(), RDMA_RESOURCE_MR,
+                        hmc_address, lease_size);
+    expect_status("FREEZE_FINALIZE_HMC_LOOKUP", status, RDMA_SC_OK);
+    hmc_ref = make_borrowed_hmc_ref(
+      "freeze_finalize_hmc_ref", binding, hmc_address, lease_size,
+      28'h000_0b00
+    );
+    backing.hmc_refs.push_back(hmc_ref);
+    backing.page_layout.first_pbl_index = hmc_ref.first_pbl_index;
+    manager.fail_next_activate(mark_error_failure);
+    manager.fail_next_finalize_release(release_failure);
+    control.register_mr(binding, request, backing, mr, result);
+    expect_recovery_result("FREEZE_FINALIZE", result,
+                           RDMA_SC_INVALID_STATE);
+    recovery = null;
+    if (result != null && result.resource_h != null) begin
+      status = manager.lookup(result.resource_h, resource);
+      expect_status("FREEZE_FINALIZE_LOOKUP", status, RDMA_SC_OK);
+      status = manager.lookup_recovery(result.resource_h, recovery);
+      expect_status("FREEZE_FINALIZE_RECOVERY", status, RDMA_SC_OK);
     end
+    if (mr == null || mr.state != RDMA_RESOURCE_ERROR || result == null ||
+        result.final_resource_state != RDMA_RESOURCE_ERROR ||
+        !result.recovery_required || result.rollback_statuses.size() != 1 ||
+        result.rollback_statuses[0] == null ||
+        result.rollback_statuses[0].code != RDMA_SC_RESOURCE_BUSY ||
+        recovery == null ||
+        recovery.hardware_presence != RDMA_HW_PRESENCE_ABSENT ||
+        recovery.pending_steps.size() != 1 ||
+        recovery.pending_steps[0] != RDMA_CTRL_STEP_RESOURCE_RELEASED ||
+        recovery.ambiguous_ticket != null)
+      `uvm_error("FREEZE_FINALIZE_RECORD",
+                 "finalize failure did not retain pending release recovery")
+    if (manager.release_reserved_calls != 2 ||
+        manager.mark_error_calls != 5 ||
+        manager.finalize_release_calls != 1 ||
+        mock_cmq.calls.size() != 5 ||
+        mock_cmq.calls[3] == null ||
+        mock_cmq.calls[3].opcode != XTR_V1_OP_KEY_ALLOC ||
+        mock_cmq.calls[4] == null ||
+        mock_cmq.calls[4].opcode != XTR_V1_OP_MR_DEREGISTER)
+      `uvm_error("FREEZE_FINALIZE_CALLS",
+                 "finalize failure command or recovery calls are incomplete")
   endtask
 
   task automatic check_post_lock_revalidation();
@@ -2854,6 +2997,202 @@ class rdma_control_plane_test extends uvm_test;
         backing.backing_refs[0].mapping.state != RDMA_MAPPING_ACTIVE)
       `uvm_error("MR_BACKING_FENCE_RESULT",
                  "post-lock backing mutation reached MR side effects")
+  endtask
+
+  task automatic check_supplied_lock_ownership();
+    rdma_control_plane_probe control;
+    rdma_resource_manager manager;
+    rdma_mock_cmq_port mock_cmq;
+    rdma_mock_stag_key_policy key_policy;
+    rdma_function_binding binding;
+    rdma_create_pd_req pd_request;
+    rdma_register_mr_req request;
+    rdma_mr_backing_desc backing;
+    rdma_function_handle owner;
+    rdma_pd pd;
+    rdma_mr mr;
+    rdma_control_result result;
+    rdma_status status;
+    semaphore outer_lock;
+    semaphore contender_lock;
+    bit inner_done;
+    bit contender_acquired;
+
+    control = rdma_control_plane_probe::type_id::create(
+      "supplied_lock_control"
+    );
+    manager = rdma_resource_manager::type_id::create(
+      "supplied_lock_manager"
+    );
+    mock_cmq = rdma_mock_cmq_port::type_id::create("supplied_lock_cmq");
+    key_policy = rdma_mock_stag_key_policy::type_id::create(
+      "supplied_lock_policy"
+    );
+    binding = make_active_binding(
+      "supplied_lock_binding", 64'hf310_0000_0000_0001,
+      32'hf310_0101, 63
+    );
+    status = control.configure(manager, mock_cmq, key_policy);
+    expect_status("SUPPLIED_LOCK_CONFIGURE", status, RDMA_SC_OK);
+    pd_request = make_create_pd_request("supplied_lock_pd_request", binding);
+    control.create_pd(binding, pd_request, pd, result);
+    expect_result("SUPPLIED_LOCK_PD_CREATE", result, RDMA_SC_OK);
+    if (pd == null || pd.handle == null)
+      return;
+    request = make_register_mr_request("supplied_lock_request", binding, pd);
+    backing = make_borrowed_pbl0_backing(
+      "supplied_lock_backing", binding, request
+    );
+    status = key_policy.fail_next(
+      rdma_status::make(RDMA_SC_INVALID_STATE,
+                        "injected supplied-lock registration failure")
+    );
+    expect_status("SUPPLIED_LOCK_INJECT", status, RDMA_SC_OK);
+    owner = binding.make_handle();
+    control.acquire_test_function_lock(owner, outer_lock);
+    inner_done = 1'b0;
+    contender_acquired = 1'b0;
+    fork
+      begin
+        control.register_mr_with_test_lock(
+          binding, request, backing, outer_lock, mr, result
+        );
+        inner_done = 1'b1;
+      end
+      begin
+        control.acquire_test_function_lock(owner, contender_lock);
+        contender_acquired = 1'b1;
+        control.release_test_function_lock(contender_lock);
+      end
+      begin
+        wait (inner_done);
+        #1ns;
+        if (contender_acquired)
+          `uvm_error("SUPPLIED_LOCK_EARLY_RELEASE",
+                     "inner registration released its caller-owned lock")
+        control.release_test_function_lock(outer_lock);
+        #1ns;
+        if (!contender_acquired)
+          `uvm_error("SUPPLIED_LOCK_FINAL_RELEASE",
+                     "contender remained blocked after outer lock release")
+      end
+    join
+    expect_result("SUPPLIED_LOCK_RESULT", result, RDMA_SC_INVALID_STATE);
+    if (mr != null)
+      `uvm_error("SUPPLIED_LOCK_MR",
+                 "failing supplied-lock registration returned an MR")
+  endtask
+
+  task automatic check_owned_post_lock_snapshot();
+    rdma_control_plane_probe control;
+    rdma_resource_manager manager;
+    rdma_blocking_mock_cmq_port blocking_cmq;
+    rdma_mock_stag_key_policy key_policy;
+    rdma_mock_host_mem host_mem;
+    rdma_function_binding binding;
+    rdma_create_pd_req pd_request;
+    rdma_register_mr_req request;
+    rdma_dma_request_context dma_context;
+    rdma_function_handle owner;
+    rdma_pd pd;
+    rdma_mr mr;
+    rdma_mrt_model mrt;
+    rdma_dma_mapping mapping;
+    rdma_control_result result;
+    rdma_status status;
+    semaphore held_lock;
+    longint unsigned first_length;
+    bit [19:0] first_pasid;
+    rdma_rdma_access_t first_access;
+    bit cmq_entered;
+
+    control = rdma_control_plane_probe::type_id::create(
+      "owned_snapshot_control"
+    );
+    manager = rdma_resource_manager::type_id::create(
+      "owned_snapshot_manager"
+    );
+    blocking_cmq = rdma_blocking_mock_cmq_port::type_id::create(
+      "owned_snapshot_cmq"
+    );
+    key_policy = rdma_mock_stag_key_policy::type_id::create(
+      "owned_snapshot_policy"
+    );
+    host_mem = rdma_mock_host_mem::type_id::create("owned_snapshot_mem");
+    binding = make_active_binding(
+      "owned_snapshot_binding", 64'hf320_0000_0000_0001,
+      32'hf320_0101, 65
+    );
+    status = control.configure(
+      manager, blocking_cmq, key_policy, host_mem, null, 3us
+    );
+    expect_status("OWNED_SNAPSHOT_CONFIGURE", status, RDMA_SC_OK);
+    pd_request = make_create_pd_request("owned_snapshot_pd_request", binding);
+    control.create_pd(binding, pd_request, pd, result);
+    expect_result("OWNED_SNAPSHOT_PD_CREATE", result, RDMA_SC_OK);
+    if (pd == null || pd.handle == null)
+      return;
+    request = make_register_mr_request("owned_snapshot_request", binding, pd);
+    request.iova.value = host_mem.next_address;
+    dma_context = make_dma_context("owned_snapshot_context", binding);
+    owner = binding.make_handle();
+    control.acquire_test_function_lock(owner, held_lock);
+    first_length = 64'h3000;
+    first_pasid = 20'h1a111;
+    first_access = '{local_write:1'b1, remote_read:1'b1,
+                     remote_write:1'b0, memory_window_bind:1'b0,
+                     remote_atomic:1'b0};
+    fork
+      begin
+        control.alloc_and_register_mr(
+          binding, request, dma_context, 4096, mapping, mr, result
+        );
+      end
+      begin
+        #1ns;
+        request.length = first_length;
+        request.access = first_access;
+        dma_context.pasid = first_pasid;
+        control.release_test_function_lock(held_lock);
+        blocking_cmq.wait_until_entered(1us, cmq_entered);
+        if (!cmq_entered)
+          `uvm_error("OWNED_SNAPSHOT_HANDSHAKE",
+                     "owned registration did not reach blocking CMQ")
+        else begin
+          request.length = 64'h4000;
+          request.access = '{local_write:1'b0, remote_read:1'b0,
+                             remote_write:1'b1,
+                             memory_window_bind:1'b0,
+                             remote_atomic:1'b0};
+          dma_context.pasid = 20'h2b222;
+        end
+        blocking_cmq.resume_execute();
+      end
+    join
+    expect_result("OWNED_SNAPSHOT_RESULT", result, RDMA_SC_OK);
+    mrt = null;
+    if (blocking_cmq.calls.size() != 1 ||
+        blocking_cmq.calls[0] == null ||
+        blocking_cmq.calls[0].command == null ||
+        !$cast(mrt, blocking_cmq.calls[0].command.body))
+      `uvm_error("OWNED_SNAPSHOT_COMMAND",
+                 "owned snapshot lost its KEY_ALLOC MRT")
+    if (host_mem.calls.size() != 1 || host_mem.calls[0] == null ||
+        host_mem.calls[0].method_name != "allocate" ||
+        host_mem.calls[0].size != first_length ||
+        host_mem.calls[0].direction != RDMA_DMA_BIDIRECTIONAL ||
+        host_mem.calls[0].request_context == null ||
+        host_mem.calls[0].request_context == dma_context ||
+        host_mem.calls[0].request_context.pasid != first_pasid ||
+        mrt == null || mrt.length != first_length ||
+        mrt.access != first_access || mr == null ||
+        mr.length != first_length || mr.access != first_access ||
+        mr.backing_refs.size() != 1 || mr.backing_refs[0] == null ||
+        mr.backing_refs[0].mapping == null ||
+        mr.backing_refs[0].mapping.pasid != first_pasid ||
+        request.length != 64'h4000 || dma_context.pasid != 20'h2b222)
+      `uvm_error("OWNED_SNAPSHOT_VALUES",
+                 "owned registration mixed pre-lock or later caller values")
   endtask
 
   task automatic check_register_mr_pre_cmq_rejections();
@@ -3291,6 +3630,7 @@ class rdma_control_plane_test extends uvm_test;
     run_owned_mr_failure("commit_programmed");
     run_owned_mr_failure("activate");
     run_owned_mr_failure("deregister");
+    run_owned_mr_failure("deregister_timeout");
     check_owned_mr_prestage_release_failure();
     check_owned_mr_timeout_freeze_failure_no_mapping();
     check_owned_mr_released_mapping_not_returned();
@@ -3308,6 +3648,8 @@ class rdma_control_plane_test extends uvm_test;
     check_post_activate_snapshot_cleanup();
     check_post_lock_revalidation();
     check_register_mr_post_lock_revalidation();
+    check_supplied_lock_ownership();
+    check_owned_post_lock_snapshot();
     check_transaction_id_exhaustion();
     phase.drop_objection(this);
   endtask
