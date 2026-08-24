@@ -185,6 +185,130 @@ class rdma_control_plane extends uvm_object;
     return same_owner_status(request.owner, owner, "create PD request");
   endfunction
 
+  protected function rdma_status register_mr_request_status(
+    rdma_register_mr_req request,
+    rdma_function_handle owner
+  );
+    rdma_status status;
+
+    if (request == null)
+      return invalid_argument("register MR request is null");
+    status = request.validate();
+    if (status == null)
+      return invalid_state("register MR request validation returned null");
+    if (!status.ok())
+      return rdma_cmq_clone_status_value(status);
+    return same_owner_status(request.owner, owner, "register MR request");
+  endfunction
+
+  protected function rdma_status validate_backing(
+    rdma_function_binding binding,
+    rdma_register_mr_req request,
+    rdma_mr_backing_desc backing,
+    rdma_function_handle owner
+  );
+    rdma_dma_permission_t required_permissions;
+    rdma_dma_direction_e required_direction;
+    rdma_status status;
+    longint unsigned lease_size;
+
+    if (binding == null || request == null || owner == null)
+      return invalid_state("register MR backing authority is incomplete");
+    if (backing == null)
+      return invalid_argument("register MR backing descriptor is null");
+    status = backing.validate();
+    if (status == null)
+      return invalid_state("register MR backing validation returned null");
+    if (!status.ok())
+      return rdma_cmq_clone_status_value(status);
+    if (backing.page_layout.pbl_mode == RDMA_MR_PBL2 &&
+        backing.page_layout.first_pbl_index > 28'hfff_ffff)
+      return invalid_argument("register MR first PBL index exceeds 28 bits");
+    status = same_owner_status(backing.function_h, owner,
+                               "register MR backing");
+    if (status == null || !status.ok())
+      return checked_status(status,
+                            "register MR backing owner check returned null");
+    if (backing.requester_bdf != binding.pcie.bdf)
+      return rdma_status::make(
+        RDMA_SC_DMA_TRANSLATION,
+        "register MR backing requester BDF does not match Function"
+      );
+    required_permissions = '0;
+    required_permissions.device_read = 1'b1;
+    required_permissions.device_write = request.access.local_write ||
+                                        request.access.remote_write ||
+                                        request.access.remote_atomic;
+    required_permissions.atomic = request.access.remote_atomic;
+    required_direction = required_permissions.device_write ?
+                         RDMA_DMA_BIDIRECTIONAL : RDMA_DMA_DEVICE_READ;
+    foreach (backing.backing_refs[i]) begin
+      if (backing.backing_refs[i] == null ||
+          backing.backing_refs[i].mapping == null)
+        return invalid_argument("register MR backing reference is null");
+      if (backing.backing_refs[i].ownership != RDMA_OWNERSHIP_BORROWED)
+        return invalid_argument("register MR requires borrowed backing");
+      if (backing.backing_refs[i].mapping.pasid_valid !=
+            backing.pasid_valid ||
+          (backing.pasid_valid &&
+           backing.backing_refs[i].mapping.pasid != backing.pasid))
+        return rdma_status::make(
+          RDMA_SC_DMA_TRANSLATION,
+          "register MR backing PASID does not match mapping"
+        );
+      status = backing.backing_refs[i].mapping.check_access(
+        owner, backing.requester_bdf, request.iova, request.length,
+        required_direction, required_permissions
+      );
+      if (status == null)
+        return invalid_state("register MR mapping access returned null");
+      if (!status.ok())
+        return rdma_cmq_clone_status_value(status);
+    end
+    foreach (backing.hmc_refs[i]) begin
+      if (backing.hmc_refs[i] == null)
+        return invalid_argument("register MR HMC reference is null");
+      if (backing.hmc_refs[i].ownership != RDMA_OWNERSHIP_BORROWED)
+        return invalid_argument("register MR requires borrowed HMC backing");
+      status = same_owner_status(backing.hmc_refs[i].owner, owner,
+                                 "register MR HMC backing");
+      if (status == null || !status.ok())
+        return checked_status(
+          status, "register MR HMC owner check returned null"
+        );
+      if (hmc_allocator == null)
+        return invalid_state("register MR HMC allocator is unavailable");
+      status = hmc_allocator.lookup(
+        owner, backing.hmc_refs[i].object_kind,
+        backing.hmc_refs[i].address, lease_size
+      );
+      if (status == null)
+        return invalid_state("register MR HMC lookup returned null");
+      if (!status.ok())
+        return rdma_cmq_clone_status_value(status);
+      if (lease_size != backing.hmc_refs[i].size)
+        return invalid_argument("register MR HMC lease size does not match");
+    end
+    return rdma_status::success();
+  endfunction
+
+  protected function rdma_handle project_handle(
+    rdma_handle software_h,
+    int unsigned local_id,
+    rdma_resource_kind_e expected_kind
+  );
+    rdma_handle projected;
+
+    if (software_h == null || software_h.kind != expected_kind)
+      return null;
+    projected = new("control_plane_hw_projection");
+    projected.kind = expected_kind;
+    projected.function_uid = software_h.function_uid;
+    projected.object_id = local_id;
+    projected.generation = software_h.generation;
+    return projected;
+  endfunction
+
   protected function rdma_status pd_handle_owner_status(
     rdma_handle pd_h,
     rdma_function_handle owner
@@ -526,6 +650,338 @@ class rdma_control_plane extends uvm_object;
     end while (1'b0);
 
     finish_result(result, status);
+    if (function_lock != null)
+      function_lock.put(1);
+  endtask
+
+  task register_mr(
+    rdma_function_binding binding,
+    rdma_register_mr_req request,
+    rdma_mr_backing_desc backing,
+    output rdma_mr mr,
+    output rdma_control_result result
+  );
+    rdma_function_handle owner;
+    rdma_function_handle locked_owner;
+    rdma_resource pd_resource;
+    rdma_pd pd_snapshot;
+    rdma_mr reserved_mr;
+    rdma_resource active_resource;
+    rdma_mrt_model mrt;
+    rdma_cmq_command_desc command;
+    rdma_cmq_opcode_key opcode_key;
+    rdma_cmq_ticket ticket;
+    rdma_cmq_completion completion;
+    rdma_recovery_record recovery;
+    rdma_status status;
+    rdma_status rollback_status;
+    semaphore function_lock;
+    longint unsigned transaction_id;
+    bit [7:0] stag_key;
+    bit has_remote_access;
+
+    mr = null;
+    result = make_result();
+    function_lock = null;
+    reserve_transaction_id(transaction_id, status);
+    result.transaction_id = transaction_id;
+
+    do begin
+      if (status == null || !status.ok()) begin
+        status = checked_status(
+          status, "transaction ID allocation returned null status"
+        );
+        break;
+      end
+      status = configured_status();
+      if (status == null || !status.ok()) begin
+        status = checked_status(
+          status, "control-plane configuration check returned null"
+        );
+        break;
+      end
+      status = binding_owner_status(binding, owner);
+      if (status == null || !status.ok()) begin
+        status = checked_status(status,
+                                "Function binding check returned null");
+        break;
+      end
+      status = register_mr_request_status(request, owner);
+      if (status == null || !status.ok()) begin
+        status = checked_status(
+          status, "register MR request check returned null"
+        );
+        break;
+      end
+      status = validate_backing(binding, request, backing, owner);
+      if (status == null || !status.ok()) begin
+        status = checked_status(
+          status, "register MR backing check returned null"
+        );
+        break;
+      end
+
+      acquire_function_lock(owner, function_lock);
+      status = binding_owner_status(binding, locked_owner);
+      if (status == null || !status.ok()) begin
+        status = checked_status(
+          status, "post-lock Function binding check returned null"
+        );
+        break;
+      end
+      status = same_owner_status(
+        locked_owner, owner, "post-lock register MR binding"
+      );
+      if (status == null || !status.ok()) begin
+        status = checked_status(
+          status, "post-lock Function identity check returned null"
+        );
+        break;
+      end
+      status = register_mr_request_status(request, locked_owner);
+      if (status == null || !status.ok()) begin
+        status = checked_status(
+          status, "post-lock register MR request check returned null"
+        );
+        break;
+      end
+      status = validate_backing(binding, request, backing, locked_owner);
+      if (status == null || !status.ok()) begin
+        status = checked_status(
+          status, "post-lock register MR backing check returned null"
+        );
+        break;
+      end
+
+      status = manager.lookup(request.pd_h, pd_resource);
+      if (status == null || !status.ok()) begin
+        status = checked_status(status,
+                                "resource manager PD lookup returned null");
+        break;
+      end
+      if (!$cast(pd_snapshot, pd_resource) || pd_snapshot == null ||
+          pd_snapshot.handle == null || pd_snapshot.owner == null ||
+          pd_snapshot.state != RDMA_RESOURCE_ACTIVE) begin
+        status = invalid_state("register MR requires an ACTIVE PD");
+        break;
+      end
+      status = same_owner_status(pd_snapshot.owner, locked_owner,
+                                 "register MR PD");
+      if (status == null || !status.ok()) begin
+        status = checked_status(status,
+                                "register MR PD owner check returned null");
+        break;
+      end
+
+      status = manager.create_mr(binding, request.pd_h, reserved_mr);
+      if (status == null || !status.ok()) begin
+        status = checked_status(status,
+                                "resource manager create MR returned null");
+        break;
+      end
+      if (reserved_mr == null || reserved_mr.handle == null ||
+          reserved_mr.state != RDMA_RESOURCE_ALLOCATED) begin
+        status = invalid_state(
+          "resource manager returned an invalid MR reservation"
+        );
+        break;
+      end
+      result.resource_h = snapshot_handle(reserved_mr.handle);
+      result.final_resource_state = RDMA_RESOURCE_ALLOCATED;
+      result.final_resource_state_known = 1'b1;
+      result.completed_steps.push_back(RDMA_CTRL_STEP_RESOURCE_RESERVED);
+
+      reserved_mr.iova = request.iova;
+      reserved_mr.length = request.length;
+      reserved_mr.access = request.access;
+      reserved_mr.mr_serial = reserved_mr.handle.object_id[11:0];
+      reserved_mr.backing_refs = backing.backing_refs;
+      reserved_mr.hmc_refs = backing.hmc_refs;
+      status = key_policy.derive(reserved_mr, stag_key);
+      if (status == null || !status.ok()) begin
+        status = checked_status(status,
+                                "STAG key policy returned null status");
+        rollback_status = manager.release_reserved(reserved_mr.handle);
+        rollback_status = checked_status(
+          rollback_status, "MR reservation rollback returned null"
+        );
+        if (rollback_status.ok())
+          result.final_resource_state = RDMA_RESOURCE_RELEASED;
+        else
+          result.rollback_statuses.push_back(
+            rdma_cmq_clone_status_value(rollback_status)
+          );
+        break;
+      end
+      reserved_mr.lkey = {reserved_mr.local_mr_id[23:0], stag_key};
+      has_remote_access = request.access.remote_read ||
+                          request.access.remote_write ||
+                          request.access.remote_atomic;
+      reserved_mr.rkey = has_remote_access ? reserved_mr.lkey : 32'b0;
+      result.completed_steps.push_back(RDMA_CTRL_STEP_BACKING_ATTACHED);
+      if (reserved_mr.hmc_refs.size() != 0)
+        result.completed_steps.push_back(RDMA_CTRL_STEP_HMC_ATTACHED);
+
+      status = manager.stage_allocated(reserved_mr);
+      if (status == null || !status.ok()) begin
+        status = checked_status(status,
+                                "resource manager stage MR returned null");
+        rollback_status = manager.release_reserved(reserved_mr.handle);
+        rollback_status = checked_status(
+          rollback_status, "MR reservation rollback returned null"
+        );
+        if (rollback_status.ok())
+          result.final_resource_state = RDMA_RESOURCE_RELEASED;
+        else
+          result.rollback_statuses.push_back(
+            rdma_cmq_clone_status_value(rollback_status)
+          );
+        break;
+      end
+
+      mrt = rdma_mrt_model::type_id::create("register_mr_mrt");
+      mrt.mr_h = project_handle(reserved_mr.handle,
+                                reserved_mr.local_mr_id,
+                                RDMA_RESOURCE_MR);
+      mrt.pd_h = project_handle(pd_snapshot.handle,
+                                pd_snapshot.local_pd_id,
+                                RDMA_RESOURCE_PD);
+      mrt.state = RDMA_CONTEXT_VALID;
+      mrt.iova = reserved_mr.iova;
+      mrt.length = reserved_mr.length;
+      mrt.lkey = reserved_mr.lkey;
+      mrt.rkey = reserved_mr.rkey;
+      mrt.access = reserved_mr.access;
+      mrt.object_type = 2'b0;
+      mrt.page_layout = rdma_clone_mr_page_layout_value(
+        backing.page_layout, "register MR"
+      );
+      if (mrt.page_layout != null)
+        mrt.page_layout.mr_serial = reserved_mr.mr_serial;
+
+      command = rdma_cmq_command_desc::type_id::create(
+        "register_mr_key_alloc"
+      );
+      command.function_h = rdma_clone_function_handle_value(
+        locked_owner, "register MR command"
+      );
+      opcode_key = rdma_cmq_opcode_key::type_id::create(
+        "register_mr_key_alloc_opcode"
+      );
+      opcode_key.profile_name = "xtr_v1";
+      opcode_key.opcode = XTR_V1_OP_KEY_ALLOC;
+      opcode_key.variant = "key_alloc";
+      command.opcode_key = opcode_key;
+      command.body = mrt;
+      command.timeout = default_timeout;
+
+      cmq.execute(command, ticket, completion, status);
+      if (status == null || !status.ok()) begin
+        status = checked_status(status,
+                                "KEY_ALLOC execution returned null status");
+        if (status.code == RDMA_SC_TIMEOUT) begin
+          recovery = rdma_recovery_record::type_id::create(
+            "register_mr_timeout_recovery"
+          );
+          recovery.resource_h = snapshot_handle(reserved_mr.handle);
+          recovery.hardware_presence = RDMA_HW_PRESENCE_UNKNOWN;
+          recovery.completed_steps = result.completed_steps;
+          recovery.pending_steps.push_back(
+            RDMA_CTRL_STEP_HW_KEY_ALLOCATED
+          );
+          recovery.backing_refs = reserved_mr.backing_refs;
+          recovery.hmc_refs = reserved_mr.hmc_refs;
+          recovery.ambiguous_ticket = rdma_cmq_clone_ticket_value(
+            ticket, "register MR timeout recovery"
+          );
+          recovery.primary_status = rdma_cmq_clone_status_value(status);
+          rollback_status = manager.mark_error(
+            reserved_mr.handle, recovery
+          );
+          rollback_status = checked_status(
+            rollback_status, "MR timeout recovery freeze returned null"
+          );
+          if (!rollback_status.ok()) begin
+            result.rollback_statuses.push_back(
+              rdma_cmq_clone_status_value(rollback_status)
+            );
+            break;
+          end
+          result.final_resource_state = RDMA_RESOURCE_ERROR;
+          result.final_resource_state_known = 1'b1;
+          result.recovery_required = 1'b1;
+          result.primary_status = rdma_cmq_clone_status_value(status);
+          result.status = rdma_status::make(
+            RDMA_SC_RECOVERY_REQUIRED,
+            "KEY_ALLOC timeout requires recovery"
+          );
+          rollback_status = manager.lookup(
+            reserved_mr.handle, active_resource
+          );
+          rollback_status = checked_status(
+            rollback_status, "resource manager ERROR MR lookup returned null"
+          );
+          if (rollback_status.ok()) begin
+            if (!$cast(mr, active_resource) || mr == null ||
+                mr.handle == null || mr.state != RDMA_RESOURCE_ERROR)
+              mr = null;
+          end
+          break;
+        end
+        rollback_status = manager.release_reserved(reserved_mr.handle);
+        rollback_status = checked_status(
+          rollback_status, "MR reservation rollback returned null"
+        );
+        if (rollback_status.ok())
+          result.final_resource_state = RDMA_RESOURCE_RELEASED;
+        else
+          result.rollback_statuses.push_back(
+            rdma_cmq_clone_status_value(rollback_status)
+          );
+        break;
+      end
+      result.completed_steps.push_back(RDMA_CTRL_STEP_HW_KEY_ALLOCATED);
+
+      status = manager.commit_programmed(reserved_mr);
+      if (status == null || !status.ok()) begin
+        status = checked_status(
+          status, "resource manager MR commit returned null"
+        );
+        break;
+      end
+      result.final_resource_state = RDMA_RESOURCE_PROGRAMMED;
+      result.completed_steps.push_back(RDMA_CTRL_STEP_REGISTRY_PROGRAMMED);
+
+      status = manager.activate(reserved_mr.handle);
+      if (status == null || !status.ok()) begin
+        status = checked_status(status,
+                                "resource manager MR activate returned null");
+        break;
+      end
+      result.final_resource_state = RDMA_RESOURCE_ACTIVE;
+      result.completed_steps.push_back(RDMA_CTRL_STEP_REGISTRY_ACTIVE);
+
+      status = manager.lookup(reserved_mr.handle, active_resource);
+      if (status == null || !status.ok()) begin
+        status = checked_status(
+          status, "resource manager active MR lookup returned null"
+        );
+        break;
+      end
+      if (!$cast(mr, active_resource) || mr == null || mr.handle == null ||
+          mr.state != RDMA_RESOURCE_ACTIVE) begin
+        mr = null;
+        status = invalid_state(
+          "resource manager active MR snapshot is invalid"
+        );
+        break;
+      end
+      result.resource_h = snapshot_handle(mr.handle);
+      status = rdma_status::success();
+    end while (1'b0);
+
+    if (!result.recovery_required)
+      finish_result(result, status);
     if (function_lock != null)
       function_lock.put(1);
   endtask
