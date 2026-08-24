@@ -176,43 +176,252 @@ class rdma_control_plane extends uvm_object;
     );
   endfunction
 
-  protected function void cleanup_reserved_mr(
+  protected function void retain_mr_rollback_error(
     rdma_mr reserved_mr,
     rdma_status primary_status,
     rdma_control_result result,
+    rdma_hw_presence_e hardware_presence,
+    bit has_pending_step,
+    rdma_control_step_e pending_step,
+    rdma_cmq_ticket ambiguous_ticket,
     output rdma_mr mr,
     output bit result_finalized
   );
     rdma_recovery_record recovery;
-    rdma_status release_status;
 
-    mr = null;
-    result_finalized = 1'b0;
-    release_status = manager.release_reserved(reserved_mr.handle);
-    release_status = checked_status(
-      release_status, "MR reservation rollback returned null"
-    );
-    if (release_status.ok()) begin
-      result.final_resource_state = RDMA_RESOURCE_RELEASED;
-      return;
-    end
-
-    result.rollback_statuses.push_back(
-      rdma_cmq_clone_status_value(release_status)
-    );
     recovery = rdma_recovery_record::type_id::create(
-      "register_mr_absent_recovery"
+      "register_mr_rollback_recovery"
     );
     recovery.resource_h = snapshot_handle(reserved_mr.handle);
-    recovery.hardware_presence = RDMA_HW_PRESENCE_ABSENT;
+    recovery.hardware_presence = hardware_presence;
     recovery.completed_steps = result.completed_steps;
+    if (has_pending_step)
+      recovery.pending_steps.push_back(pending_step);
     recovery.backing_refs = reserved_mr.backing_refs;
     recovery.hmc_refs = reserved_mr.hmc_refs;
+    recovery.ambiguous_ticket = rdma_cmq_clone_ticket_value(
+      ambiguous_ticket, "register MR rollback recovery"
+    );
     recovery.primary_status = rdma_cmq_clone_status_value(primary_status);
     recovery.rollback_statuses = result.rollback_statuses;
     finalize_mr_recovery(reserved_mr, recovery, primary_status, result, mr,
                          result_finalized);
   endfunction
+
+  protected task rollback_mr_creation(
+    rdma_mr reserved_mr,
+    rdma_function_handle owner,
+    rdma_status primary_status,
+    rdma_control_result result,
+    bit hardware_key_allocated,
+    bit registry_programmed,
+    output rdma_mr mr,
+    output bit result_finalized,
+    output bit caller_mapping_recovery
+  );
+    rdma_xtr_v1_mr_deregister_body deregister_body;
+    rdma_cmq_command_desc command;
+    rdma_cmq_opcode_key opcode_key;
+    rdma_cmq_ticket ticket;
+    rdma_cmq_completion completion;
+    rdma_recovery_record recovery;
+    rdma_status rollback_status;
+    rdma_hw_presence_e failure_presence;
+    bit released_owned_backing;
+
+    mr = null;
+    result_finalized = 1'b0;
+    caller_mapping_recovery = 1'b0;
+    ticket = null;
+    released_owned_backing = 1'b0;
+
+    if (hardware_key_allocated) begin
+      deregister_body = rdma_xtr_v1_mr_deregister_body::type_id::create(
+        "register_mr_rollback_deregister_body"
+      );
+      deregister_body.mr_h = project_handle(
+        reserved_mr.handle, reserved_mr.local_mr_id,
+        RDMA_RESOURCE_MR
+      );
+      deregister_body.stag_key = reserved_mr.lkey[7:0];
+      deregister_body.next_state = RDMA_CONTEXT_INVALID;
+      opcode_key = rdma_cmq_opcode_key::type_id::create(
+        "register_mr_rollback_deregister_opcode"
+      );
+      opcode_key.profile_name = "xtr_v1";
+      opcode_key.opcode = XTR_V1_OP_MR_DEREGISTER;
+      opcode_key.variant = "deregister";
+      command = rdma_cmq_command_desc::type_id::create(
+        "register_mr_rollback_deregister"
+      );
+      command.function_h = rdma_clone_function_handle_value(
+        owner, "register MR rollback command"
+      );
+      command.opcode_key = opcode_key;
+      command.body = deregister_body;
+      command.timeout = default_timeout;
+      cmq.execute(command, ticket, completion, rollback_status);
+      rollback_status = checked_status(
+        rollback_status, "MR_DEREGISTER rollback returned null"
+      );
+      if (!rollback_status.ok()) begin
+        result.rollback_statuses.push_back(
+          rdma_cmq_clone_status_value(rollback_status)
+        );
+        failure_presence = (rollback_status.code == RDMA_SC_TIMEOUT) ?
+          RDMA_HW_PRESENCE_UNKNOWN : RDMA_HW_PRESENCE_PRESENT;
+        retain_mr_rollback_error(
+          reserved_mr, primary_status, result, failure_presence, 1'b1,
+          RDMA_CTRL_STEP_HW_MR_DEREGISTERED, ticket, mr,
+          result_finalized
+        );
+        return;
+      end
+      result.completed_steps.push_back(
+        RDMA_CTRL_STEP_HW_MR_DEREGISTERED
+      );
+    end
+
+    for (int i = int'(reserved_mr.hmc_refs.size()) - 1; i >= 0; i--) begin
+      if (reserved_mr.hmc_refs[i] == null ||
+          reserved_mr.hmc_refs[i].ownership !=
+            RDMA_OWNERSHIP_CONTROL_PLANE ||
+          reserved_mr.hmc_refs[i].release_complete)
+        continue;
+      if (hmc_allocator == null)
+        rollback_status = invalid_state(
+          "owned MR HMC rollback allocator is unavailable"
+        );
+      else
+        rollback_status = hmc_allocator.\release (
+          reserved_mr.hmc_refs[i].owner,
+          reserved_mr.hmc_refs[i].object_kind,
+          reserved_mr.hmc_refs[i].address
+        );
+      rollback_status = checked_status(
+        rollback_status, "owned MR HMC rollback returned null"
+      );
+      if (!rollback_status.ok()) begin
+        result.rollback_statuses.push_back(
+          rdma_cmq_clone_status_value(rollback_status)
+        );
+        retain_mr_rollback_error(
+          reserved_mr, primary_status, result, RDMA_HW_PRESENCE_ABSENT,
+          1'b1, RDMA_CTRL_STEP_BACKING_RELEASED, null, mr,
+          result_finalized
+        );
+        return;
+      end
+      reserved_mr.hmc_refs[i].release_complete = 1'b1;
+      released_owned_backing = 1'b1;
+    end
+
+    for (int i = int'(reserved_mr.backing_refs.size()) - 1; i >= 0; i--) begin
+      if (reserved_mr.backing_refs[i] == null ||
+          reserved_mr.backing_refs[i].ownership !=
+            RDMA_OWNERSHIP_CONTROL_PLANE ||
+          reserved_mr.backing_refs[i].release_complete)
+        continue;
+      if (host_mem == null)
+        rollback_status = invalid_state(
+          "owned MR backing rollback host memory is unavailable"
+        );
+      else
+        rollback_status = host_mem.\release (
+          reserved_mr.backing_refs[i].mapping
+        );
+      rollback_status = checked_status(
+        rollback_status, "owned MR backing rollback returned null"
+      );
+      if (!rollback_status.ok()) begin
+        result.rollback_statuses.push_back(
+          rdma_cmq_clone_status_value(rollback_status)
+        );
+        retain_mr_rollback_error(
+          reserved_mr, primary_status, result, RDMA_HW_PRESENCE_ABSENT,
+          1'b1, RDMA_CTRL_STEP_BACKING_RELEASED, null, mr,
+          result_finalized
+        );
+        caller_mapping_recovery =
+          !hardware_key_allocated && !registry_programmed &&
+          result_finalized && result.status != null &&
+          result.status.code == RDMA_SC_RECOVERY_REQUIRED &&
+          !result.recovery_required &&
+          reserved_mr.backing_refs[i].mapping != null &&
+          reserved_mr.backing_refs[i].mapping.state == RDMA_MAPPING_ACTIVE &&
+          !reserved_mr.backing_refs[i].release_complete;
+        return;
+      end
+      reserved_mr.backing_refs[i].release_complete = 1'b1;
+      released_owned_backing = 1'b1;
+    end
+    if (released_owned_backing)
+      result.completed_steps.push_back(RDMA_CTRL_STEP_BACKING_RELEASED);
+
+    if (!registry_programmed) begin
+      rollback_status = manager.release_reserved(reserved_mr.handle);
+      rollback_status = checked_status(
+        rollback_status, "MR reservation rollback returned null"
+      );
+      if (!rollback_status.ok()) begin
+        result.rollback_statuses.push_back(
+          rdma_cmq_clone_status_value(rollback_status)
+        );
+        retain_mr_rollback_error(
+          reserved_mr, primary_status, result, RDMA_HW_PRESENCE_ABSENT,
+          1'b0, RDMA_CTRL_STEP_RESOURCE_RELEASED, null, mr,
+          result_finalized
+        );
+        return;
+      end
+    end
+    else begin
+      recovery = rdma_recovery_record::type_id::create(
+        "register_mr_programmed_rollback"
+      );
+      recovery.resource_h = snapshot_handle(reserved_mr.handle);
+      recovery.hardware_presence = RDMA_HW_PRESENCE_ABSENT;
+      recovery.completed_steps = result.completed_steps;
+      recovery.backing_refs = reserved_mr.backing_refs;
+      recovery.hmc_refs = reserved_mr.hmc_refs;
+      recovery.primary_status = rdma_cmq_clone_status_value(primary_status);
+      recovery.rollback_statuses = result.rollback_statuses;
+      rollback_status = manager.mark_error(reserved_mr.handle, recovery);
+      rollback_status = checked_status(
+        rollback_status, "programmed MR rollback mark ERROR returned null"
+      );
+      if (!rollback_status.ok()) begin
+        result.rollback_statuses.push_back(
+          rdma_cmq_clone_status_value(rollback_status)
+        );
+        retain_mr_rollback_error(
+          reserved_mr, primary_status, result, RDMA_HW_PRESENCE_ABSENT,
+          1'b1, RDMA_CTRL_STEP_RESOURCE_RELEASED, null, mr,
+          result_finalized
+        );
+        return;
+      end
+      result.final_resource_state = RDMA_RESOURCE_ERROR;
+      result.final_resource_state_known = 1'b1;
+      rollback_status = manager.finalize_release(reserved_mr.handle);
+      rollback_status = checked_status(
+        rollback_status, "programmed MR rollback release returned null"
+      );
+      if (!rollback_status.ok()) begin
+        result.rollback_statuses.push_back(
+          rdma_cmq_clone_status_value(rollback_status)
+        );
+        retain_mr_rollback_error(
+          reserved_mr, primary_status, result, RDMA_HW_PRESENCE_ABSENT,
+          1'b1, RDMA_CTRL_STEP_RESOURCE_RELEASED, null, mr,
+          result_finalized
+        );
+        return;
+      end
+    end
+    result.final_resource_state = RDMA_RESOURCE_RELEASED;
+    result.final_resource_state_known = 1'b1;
+  endtask
 
   protected function void finish_result(
     rdma_control_result result,
@@ -310,11 +519,20 @@ class rdma_control_plane extends uvm_object;
     return same_owner_status(request.owner, owner, "register MR request");
   endfunction
 
+  protected function rdma_dma_direction_e required_dma_direction(
+    rdma_rdma_access_t access
+  );
+    return (access.local_write || access.remote_write ||
+            access.remote_atomic) ?
+           RDMA_DMA_BIDIRECTIONAL : RDMA_DMA_DEVICE_READ;
+  endfunction
+
   protected function rdma_status validate_backing(
     rdma_function_binding binding,
     rdma_register_mr_req request,
     rdma_mr_backing_desc backing,
-    rdma_function_handle owner
+    rdma_function_handle owner,
+    rdma_resource_ownership_e required_ownership
   );
     rdma_dma_permission_t required_permissions;
     rdma_dma_direction_e required_direction;
@@ -349,14 +567,13 @@ class rdma_control_plane extends uvm_object;
                                         request.access.remote_write ||
                                         request.access.remote_atomic;
     required_permissions.atomic = request.access.remote_atomic;
-    required_direction = required_permissions.device_write ?
-                         RDMA_DMA_BIDIRECTIONAL : RDMA_DMA_DEVICE_READ;
+    required_direction = required_dma_direction(request.access);
     foreach (backing.backing_refs[i]) begin
       if (backing.backing_refs[i] == null ||
           backing.backing_refs[i].mapping == null)
         return invalid_argument("register MR backing reference is null");
-      if (backing.backing_refs[i].ownership != RDMA_OWNERSHIP_BORROWED)
-        return invalid_argument("register MR requires borrowed backing");
+      if (backing.backing_refs[i].ownership != required_ownership)
+        return invalid_argument("register MR backing ownership is invalid");
       if (backing.backing_refs[i].mapping.pasid_valid !=
             backing.pasid_valid ||
           (backing.pasid_valid &&
@@ -377,8 +594,8 @@ class rdma_control_plane extends uvm_object;
     foreach (backing.hmc_refs[i]) begin
       if (backing.hmc_refs[i] == null)
         return invalid_argument("register MR HMC reference is null");
-      if (backing.hmc_refs[i].ownership != RDMA_OWNERSHIP_BORROWED)
-        return invalid_argument("register MR requires borrowed HMC backing");
+      if (backing.hmc_refs[i].ownership != required_ownership)
+        return invalid_argument("register MR HMC ownership is invalid");
       status = same_owner_status(backing.hmc_refs[i].owner, owner,
                                  "register MR HMC backing");
       if (status == null || !status.ok())
@@ -763,12 +980,16 @@ class rdma_control_plane extends uvm_object;
       function_lock.put(1);
   endtask
 
-  task register_mr(
+  protected task register_mr_internal(
     rdma_function_binding binding,
     rdma_register_mr_req request,
     rdma_mr_backing_desc backing,
+    rdma_resource_ownership_e required_ownership,
+    longint unsigned supplied_transaction_id,
+    semaphore supplied_function_lock,
     output rdma_mr mr,
-    output rdma_control_result result
+    output rdma_control_result result,
+    output bit caller_mapping_recovery
   );
     rdma_function_handle owner;
     rdma_function_handle locked_owner;
@@ -796,9 +1017,14 @@ class rdma_control_plane extends uvm_object;
 
     mr = null;
     result = make_result();
-    function_lock = null;
+    caller_mapping_recovery = 1'b0;
+    function_lock = supplied_function_lock;
     result_finalized = 1'b0;
-    reserve_transaction_id(transaction_id, status);
+    transaction_id = supplied_transaction_id;
+    if (transaction_id == 0)
+      reserve_transaction_id(transaction_id, status);
+    else
+      status = rdma_status::success();
     result.transaction_id = transaction_id;
 
     do begin
@@ -828,7 +1054,8 @@ class rdma_control_plane extends uvm_object;
         );
         break;
       end
-      status = validate_backing(binding, request, backing, owner);
+      status = validate_backing(binding, request, backing, owner,
+                                required_ownership);
       if (status == null || !status.ok()) begin
         status = checked_status(
           status, "register MR backing check returned null"
@@ -836,7 +1063,8 @@ class rdma_control_plane extends uvm_object;
         break;
       end
 
-      acquire_function_lock(owner, function_lock);
+      if (function_lock == null)
+        acquire_function_lock(owner, function_lock);
       status = binding_owner_status(binding, locked_owner);
       if (status == null || !status.ok()) begin
         status = checked_status(
@@ -860,7 +1088,8 @@ class rdma_control_plane extends uvm_object;
         );
         break;
       end
-      status = validate_backing(binding, request, backing, locked_owner);
+      status = validate_backing(binding, request, backing, locked_owner,
+                                required_ownership);
       if (status == null || !status.ok()) begin
         status = checked_status(
           status, "post-lock register MR backing check returned null"
@@ -937,7 +1166,7 @@ class rdma_control_plane extends uvm_object;
         break;
       end
       status = validate_backing(binding, frozen_request, frozen_backing,
-                                locked_owner);
+                                locked_owner, required_ownership);
       if (status == null || !status.ok()) begin
         status = checked_status(
           status, "register MR backing snapshot check returned null"
@@ -989,12 +1218,16 @@ class rdma_control_plane extends uvm_object;
       reserved_mr.mr_serial = reserved_mr.handle.object_id[11:0];
       reserved_mr.backing_refs = frozen_backing.backing_refs;
       reserved_mr.hmc_refs = frozen_backing.hmc_refs;
+      result.completed_steps.push_back(RDMA_CTRL_STEP_BACKING_ATTACHED);
+      if (reserved_mr.hmc_refs.size() != 0)
+        result.completed_steps.push_back(RDMA_CTRL_STEP_HMC_ATTACHED);
       status = key_policy.derive(reserved_mr, stag_key);
       if (status == null || !status.ok()) begin
         status = checked_status(status,
                                 "STAG key policy returned null status");
-        cleanup_reserved_mr(reserved_mr, status, result, mr,
-                            result_finalized);
+        rollback_mr_creation(reserved_mr, locked_owner, status, result,
+                             1'b0, 1'b0, mr, result_finalized,
+                             caller_mapping_recovery);
         break;
       end
       reserved_mr.lkey = {reserved_mr.local_mr_id[23:0], stag_key};
@@ -1002,16 +1235,13 @@ class rdma_control_plane extends uvm_object;
                           frozen_request.access.remote_write ||
                           frozen_request.access.remote_atomic;
       reserved_mr.rkey = has_remote_access ? reserved_mr.lkey : 32'b0;
-      result.completed_steps.push_back(RDMA_CTRL_STEP_BACKING_ATTACHED);
-      if (reserved_mr.hmc_refs.size() != 0)
-        result.completed_steps.push_back(RDMA_CTRL_STEP_HMC_ATTACHED);
-
       status = manager.stage_allocated(reserved_mr);
       if (status == null || !status.ok()) begin
         status = checked_status(status,
                                 "resource manager stage MR returned null");
-        cleanup_reserved_mr(reserved_mr, status, result, mr,
-                            result_finalized);
+        rollback_mr_creation(reserved_mr, locked_owner, status, result,
+                             1'b0, 1'b0, mr, result_finalized,
+                             caller_mapping_recovery);
         break;
       end
 
@@ -1075,8 +1305,9 @@ class rdma_control_plane extends uvm_object;
                                result_finalized);
           break;
         end
-        cleanup_reserved_mr(reserved_mr, status, result, mr,
-                            result_finalized);
+        rollback_mr_creation(reserved_mr, locked_owner, status, result,
+                             1'b0, 1'b0, mr, result_finalized,
+                             caller_mapping_recovery);
         break;
       end
       result.completed_steps.push_back(RDMA_CTRL_STEP_HW_KEY_ALLOCATED);
@@ -1137,6 +1368,9 @@ class rdma_control_plane extends uvm_object;
         status = checked_status(
           status, "resource manager MR commit returned null"
         );
+        rollback_mr_creation(reserved_mr, locked_owner, status, result,
+                             1'b1, 1'b0, mr, result_finalized,
+                             caller_mapping_recovery);
         break;
       end
       result.final_resource_state = RDMA_RESOURCE_PROGRAMMED;
@@ -1146,6 +1380,9 @@ class rdma_control_plane extends uvm_object;
       if (status == null || !status.ok()) begin
         status = checked_status(status,
                                 "resource manager MR activate returned null");
+        rollback_mr_creation(reserved_mr, locked_owner, status, result,
+                             1'b1, 1'b1, mr, result_finalized,
+                             caller_mapping_recovery);
         break;
       end
       result.final_resource_state = RDMA_RESOURCE_ACTIVE;
@@ -1173,6 +1410,241 @@ class rdma_control_plane extends uvm_object;
     if (!result_finalized)
       finish_result(result, status);
     if (function_lock != null)
+      function_lock.put(1);
+  endtask
+
+  task register_mr(
+    rdma_function_binding binding,
+    rdma_register_mr_req request,
+    rdma_mr_backing_desc backing,
+    output rdma_mr mr,
+    output rdma_control_result result
+  );
+    bit caller_mapping_recovery;
+
+    register_mr_internal(binding, request, backing,
+                         RDMA_OWNERSHIP_BORROWED, 0, null, mr, result,
+                         caller_mapping_recovery);
+  endtask
+
+  task alloc_and_register_mr(
+    rdma_function_binding binding,
+    rdma_register_mr_req request,
+    rdma_dma_request_context dma_context,
+    int unsigned alignment,
+    output rdma_dma_mapping mapping,
+    output rdma_mr mr,
+    output rdma_control_result result
+  );
+    rdma_function_handle owner;
+    rdma_dma_request_context frozen_context;
+    rdma_dma_mapping allocated_mapping;
+    rdma_mr_backing_desc backing;
+    rdma_backing_ref backing_ref;
+    rdma_status status;
+    rdma_status release_status;
+    uvm_object cloned_object;
+    semaphore function_lock;
+    longint unsigned transaction_id;
+    bit ownership_transferred;
+    bit registration_started;
+    bit caller_mapping_recovery;
+
+    mapping = null;
+    mr = null;
+    result = make_result();
+    allocated_mapping = null;
+    function_lock = null;
+    ownership_transferred = 1'b0;
+    registration_started = 1'b0;
+    caller_mapping_recovery = 1'b0;
+    reserve_transaction_id(transaction_id, status);
+    result.transaction_id = transaction_id;
+
+    do begin
+      if (status == null || !status.ok()) begin
+        status = checked_status(
+          status, "transaction ID allocation returned null status"
+        );
+        break;
+      end
+      status = configured_status();
+      if (status == null || !status.ok()) begin
+        status = checked_status(
+          status, "control-plane configuration check returned null"
+        );
+        break;
+      end
+      status = binding_owner_status(binding, owner);
+      if (status == null || !status.ok()) begin
+        status = checked_status(status,
+                                "Function binding check returned null");
+        break;
+      end
+      status = register_mr_request_status(request, owner);
+      if (status == null || !status.ok()) begin
+        status = checked_status(
+          status, "owned register MR request check returned null"
+        );
+        break;
+      end
+      if (alignment < 4096 ||
+          (alignment & (alignment - 1'b1)) != 0) begin
+        status = invalid_argument(
+          "owned MR alignment must be a power of two of at least 4096"
+        );
+        break;
+      end
+      if (request.length > 64'h0000_0000_ffff_ffff) begin
+        status = invalid_argument(
+          "owned MR length exceeds host allocation size"
+        );
+        break;
+      end
+      if (request.access.remote_atomic) begin
+        status = rdma_status::make(
+          RDMA_SC_UNSUPPORTED_OPCODE,
+          "owned MR helper cannot allocate atomic DMA authority"
+        );
+        break;
+      end
+      if (dma_context == null) begin
+        status = invalid_argument("owned MR DMA request context is null");
+        break;
+      end
+      cloned_object = dma_context.clone();
+      if (cloned_object == null ||
+          !$cast(frozen_context, cloned_object) ||
+          frozen_context == dma_context ||
+          frozen_context.function_h == dma_context.function_h ||
+          (dma_context.owner_h == null && frozen_context.owner_h != null) ||
+          (dma_context.owner_h != null &&
+           (frozen_context.owner_h == null ||
+            frozen_context.owner_h == dma_context.owner_h))) begin
+        status = invalid_state(
+          "owned MR DMA context snapshot is not deeply detached"
+        );
+        break;
+      end
+      status = frozen_context.validate();
+      if (status == null || !status.ok()) begin
+        status = checked_status(
+          status, "owned MR DMA context validation returned null"
+        );
+        break;
+      end
+      status = same_owner_status(frozen_context.function_h, owner,
+                                 "owned MR DMA context");
+      if (status == null || !status.ok()) begin
+        status = checked_status(
+          status, "owned MR DMA Function check returned null"
+        );
+        break;
+      end
+      if (frozen_context.requester_bdf != binding.pcie.bdf) begin
+        status = rdma_status::make(
+          RDMA_SC_DMA_TRANSLATION,
+          "owned MR DMA requester BDF does not match Function"
+        );
+        break;
+      end
+      if (frozen_context.owner_h != null) begin
+        status = invalid_argument(
+          "owned MR DMA request owner must be null"
+        );
+        break;
+      end
+      if (host_mem == null) begin
+        status = invalid_state(
+          "owned MR host memory adapter is unavailable"
+        );
+        break;
+      end
+
+      acquire_function_lock(owner, function_lock);
+      // Preserve the caller-selected MR IOVA.  The allocation contract cannot
+      // request one, so inner backing validation must prove that the returned
+      // mapping covers request.iova rather than silently rewriting it.
+      status = host_mem.allocate(
+        frozen_context, request.length, alignment,
+        required_dma_direction(request.access), allocated_mapping
+      );
+      status = checked_status(
+        status, "owned MR host memory allocation returned null"
+      );
+      if (!status.ok())
+        break;
+      if (allocated_mapping == null ||
+          allocated_mapping.state != RDMA_MAPPING_ACTIVE ||
+          allocated_mapping.owner_h != null) begin
+        status = invalid_state(
+          "owned MR host memory allocation is invalid"
+        );
+        break;
+      end
+
+      backing = rdma_mr_backing_desc::type_id::create(
+        "allocated_mr_backing"
+      );
+      backing.function_h = rdma_clone_function_handle_value(
+        frozen_context.function_h, "allocated MR backing"
+      );
+      backing.requester_bdf = frozen_context.requester_bdf;
+      backing.pasid_valid = frozen_context.pasid_valid;
+      backing.pasid = frozen_context.pasid;
+      backing_ref = rdma_backing_ref::type_id::create(
+        "allocated_mr_backing_ref"
+      );
+      backing_ref.mapping = allocated_mapping;
+      backing_ref.ownership = RDMA_OWNERSHIP_CONTROL_PLANE;
+      backing_ref.release_complete = 1'b0;
+      backing.backing_refs.push_back(backing_ref);
+      backing.page_layout.pbl_mode = RDMA_MR_PBL0;
+      backing.page_layout.host_page_size = RDMA_MR_PAGE_4K;
+      backing.page_layout.pba0 = allocated_mapping.backing_addr;
+      backing.page_layout.pba1 = '0;
+      backing.page_layout.first_pbl_index = 0;
+      backing.page_layout.address_mode = RDMA_MR_ADDRESS_VA_BASED;
+      backing.page_layout.odp = 1'b0;
+
+      registration_started = 1'b1;
+      register_mr_internal(
+        binding, request, backing, RDMA_OWNERSHIP_CONTROL_PLANE,
+        transaction_id, function_lock, mr, result,
+        caller_mapping_recovery
+      );
+      foreach (result.completed_steps[i])
+        if (result.completed_steps[i] == RDMA_CTRL_STEP_BACKING_ATTACHED)
+          ownership_transferred = 1'b1;
+      if (result.ok())
+        mapping = allocated_mapping;
+      else if (caller_mapping_recovery && allocated_mapping != null &&
+               allocated_mapping.state == RDMA_MAPPING_ACTIVE)
+        mapping = allocated_mapping;
+    end while (1'b0);
+
+    if (!registration_started)
+      finish_result(result, status);
+    if (allocated_mapping != null && !ownership_transferred) begin
+      release_status = host_mem.\release (allocated_mapping);
+      release_status = checked_status(
+        release_status, "unattached owned MR release returned null"
+      );
+      if (!release_status.ok()) begin
+        result.rollback_statuses.push_back(
+          rdma_cmq_clone_status_value(release_status)
+        );
+        result.status = rdma_status::make(
+          RDMA_SC_RECOVERY_REQUIRED,
+          "unattached owned MR mapping requires caller recovery"
+        );
+        result.recovery_required = 1'b0;
+        result.final_resource_state = RDMA_RESOURCE_NEW;
+        result.final_resource_state_known = 1'b0;
+        mapping = allocated_mapping;
+      end
+    end
+    if (function_lock != null && !registration_started)
       function_lock.put(1);
   endtask
 endclass

@@ -279,6 +279,17 @@ class rdma_mock_host_mem extends rdma_host_mem_api;
     call_trace = trace;
   endfunction
 
+  function int unsigned live_allocations();
+    int unsigned count;
+
+    count = 0;
+    foreach (regions[i])
+      if (regions[i].mapping != null &&
+          regions[i].mapping.state == RDMA_MAPPING_ACTIVE)
+        count++;
+    return count;
+  endfunction
+
   function rdma_status fail_write_at(
     int unsigned ordinal,
     rdma_status status

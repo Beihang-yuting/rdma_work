@@ -3,20 +3,117 @@ class rdma_mock_stag_key_policy extends rdma_stag_key_policy;
 
   bit [7:0] fixed_key;
   int unsigned call_count;
+  protected rdma_status next_failure;
 
   function new(string name = "rdma_mock_stag_key_policy");
     super.new(name);
     fixed_key = '0;
     call_count = 0;
+    next_failure = null;
+  endfunction
+
+  function rdma_status fail_next(rdma_status failure);
+    if (failure == null)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "STAG key failure status is null");
+    next_failure = rdma_cmq_clone_status_value(failure);
+    return rdma_status::success();
   endfunction
 
   virtual function rdma_status derive(
     rdma_mr mr,
     output bit [7:0] stag_key
   );
+    rdma_status failure;
+
     call_count++;
     stag_key = fixed_key;
+    if (next_failure != null) begin
+      failure = rdma_cmq_clone_status_value(next_failure);
+      next_failure = null;
+      return failure;
+    end
     return rdma_status::success();
+  endfunction
+endclass
+
+class rdma_fault_inject_resource_manager extends rdma_resource_manager;
+  `uvm_object_utils(rdma_fault_inject_resource_manager)
+
+  protected rdma_status transition_failures[string];
+
+  function new(string name = "rdma_fault_inject_resource_manager");
+    super.new(name);
+    transition_failures.delete();
+  endfunction
+
+  function rdma_status fail_next_transition(
+    string transition_name,
+    rdma_status failure
+  );
+    if (!(transition_name inside {"commit_programmed", "activate",
+                                  "release_reserved", "mark_error"}))
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "unknown resource transition");
+    if (failure == null)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "transition failure status is null");
+    transition_failures[transition_name] =
+      rdma_cmq_clone_status_value(failure);
+    return rdma_status::success();
+  endfunction
+
+  protected function rdma_status take_transition_failure(
+    string transition_name
+  );
+    rdma_status failure;
+
+    if (!transition_failures.exists(transition_name))
+      return null;
+    failure = rdma_cmq_clone_status_value(
+      transition_failures[transition_name]
+    );
+    transition_failures.delete(transition_name);
+    return failure;
+  endfunction
+
+  virtual function rdma_status commit_programmed(rdma_resource candidate);
+    rdma_status failure;
+
+    failure = take_transition_failure("commit_programmed");
+    if (failure != null)
+      return failure;
+    return super.commit_programmed(candidate);
+  endfunction
+
+  virtual function rdma_status activate(rdma_handle handle);
+    rdma_status failure;
+
+    failure = take_transition_failure("activate");
+    if (failure != null)
+      return failure;
+    return super.activate(handle);
+  endfunction
+
+  virtual function rdma_status release_reserved(rdma_handle handle);
+    rdma_status failure;
+
+    failure = take_transition_failure("release_reserved");
+    if (failure != null)
+      return failure;
+    return super.release_reserved(handle);
+  endfunction
+
+  virtual function rdma_status mark_error(
+    rdma_handle handle,
+    rdma_recovery_record recovery
+  );
+    rdma_status failure;
+
+    failure = take_transition_failure("mark_error");
+    if (failure != null)
+      return failure;
+    return super.mark_error(handle, recovery);
   endfunction
 endclass
 
@@ -65,6 +162,9 @@ class rdma_mock_cmq_snapshot_engine extends rdma_cmq_engine;
 
   function new(string name = "rdma_mock_cmq_snapshot_engine");
     super.new(name);
+    profile = rdma_xtr_v1_cmq_hw_profile::type_id::create(
+      {name, "_profile"}
+    );
   endfunction
 
   function rdma_status snapshot_command_for_mock(

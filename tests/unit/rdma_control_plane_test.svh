@@ -50,6 +50,24 @@ class rdma_blocking_mock_cmq_port extends rdma_mock_cmq_port;
     super.execute(command, ticket, completion, status);
   endtask
 
+  task wait_until_entered(time timeout, output bit observed);
+    observed = 1'b0;
+    fork : wait_for_blocked_execute
+      begin
+        entered.get(1);
+        observed = 1'b1;
+      end
+      begin
+        #(timeout);
+      end
+    join_any
+    disable wait_for_blocked_execute;
+  endtask
+
+  task resume_execute();
+    resume.put(1);
+  endtask
+
 endclass
 
 class rdma_recovery_probe_manager extends rdma_resource_manager;
@@ -359,6 +377,21 @@ class rdma_control_plane_test extends uvm_test;
     return request;
   endfunction
 
+  function automatic rdma_dma_request_context make_dma_context(
+    string name,
+    rdma_function_binding binding
+  );
+    rdma_dma_request_context dma_context;
+
+    dma_context = rdma_dma_request_context::type_id::create(name);
+    dma_context.function_h = binding.make_handle();
+    dma_context.requester_bdf = binding.pcie.bdf;
+    dma_context.pasid_valid = 1'b1;
+    dma_context.pasid = 20'h5a123;
+    dma_context.owner_h = null;
+    return dma_context;
+  endfunction
+
   function automatic rdma_mr_backing_desc make_borrowed_pbl0_backing(
     string name,
     rdma_function_binding binding,
@@ -497,6 +530,110 @@ class rdma_control_plane_test extends uvm_test;
     end
   endtask
 
+  function automatic void expect_cmq_opcodes(
+    string check_name,
+    rdma_mock_cmq_port mock_cmq,
+    input bit [7:0] expected[$]
+  );
+    bit [7:0] actual[$];
+
+    if (mock_cmq == null) begin
+      `uvm_error(check_name, "mock CMQ is null")
+      return;
+    end
+    mock_cmq.get_opcodes(actual);
+    if (actual != expected)
+      `uvm_error(check_name,
+                 $sformatf("unexpected CMQ opcode sequence: %p", actual))
+  endfunction
+
+  task automatic setup_owned_mr_case(
+    string prefix,
+    bit inject_host_mem,
+    output rdma_control_plane control,
+    output rdma_fault_inject_resource_manager manager,
+    output rdma_mock_cmq_port mock_cmq,
+    output rdma_mock_stag_key_policy key_policy,
+    output rdma_mock_host_mem host_mem,
+    output rdma_function_binding binding,
+    output rdma_register_mr_req request,
+    output rdma_dma_request_context dma_context,
+    output rdma_pd pd,
+    output int unsigned baseline_allocations,
+    output int unsigned baseline_leaks
+  );
+    rdma_create_pd_req pd_request;
+    rdma_control_result result;
+    rdma_status status;
+
+    control = rdma_control_plane::type_id::create({prefix, "_control"});
+    manager = rdma_fault_inject_resource_manager::type_id::create(
+      {prefix, "_manager"}
+    );
+    mock_cmq = rdma_mock_cmq_port::type_id::create({prefix, "_cmq"});
+    key_policy = rdma_mock_stag_key_policy::type_id::create(
+      {prefix, "_policy"}
+    );
+    key_policy.fixed_key = 8'h7c;
+    host_mem = rdma_mock_host_mem::type_id::create({prefix, "_host_mem"});
+    binding = make_active_binding(
+      {prefix, "_binding"}, 64'ha150_0000_0000_0001,
+      32'ha150_0101, 43
+    );
+    status = control.configure(
+      manager, mock_cmq, key_policy,
+      inject_host_mem ? host_mem : null, null, 2us
+    );
+    expect_status({prefix, "_CONFIGURE"}, status, RDMA_SC_OK);
+    pd_request = make_create_pd_request({prefix, "_pd_request"}, binding);
+    control.create_pd(binding, pd_request, pd, result);
+    expect_result({prefix, "_PD_CREATE"}, result, RDMA_SC_OK);
+    request = make_register_mr_request({prefix, "_request"}, binding, pd);
+    // The current allocation API cannot request a desired IOVA.  The caller's
+    // MR IOVA therefore remains authoritative and must be covered by the
+    // mapping selected by the allocator; this mock chooses that address next.
+    request.iova.value = host_mem.next_address;
+    dma_context = make_dma_context({prefix, "_dma_context"}, binding);
+    baseline_allocations = host_mem.live_allocations();
+    void'(manager.check_leaks(baseline_leaks, binding.make_handle()));
+  endtask
+
+  task automatic expect_owned_preallocate_reject(
+    string check_name,
+    rdma_control_plane control,
+    rdma_fault_inject_resource_manager manager,
+    rdma_mock_cmq_port mock_cmq,
+    rdma_mock_host_mem host_mem,
+    rdma_function_binding binding,
+    rdma_register_mr_req request,
+    rdma_dma_request_context dma_context,
+    int unsigned alignment,
+    rdma_status_code_e expected_code,
+    int unsigned baseline_allocations,
+    int unsigned baseline_leaks
+  );
+    rdma_dma_mapping mapping;
+    rdma_mr mr;
+    rdma_control_result result;
+    int unsigned final_leaks;
+    bit [7:0] expected_opcodes[$];
+
+    control.alloc_and_register_mr(binding, request, dma_context, alignment,
+                                  mapping, mr, result);
+    expect_result(check_name, result, expected_code);
+    expect_cmq_opcodes({check_name, "_OPCODES"}, mock_cmq,
+                       expected_opcodes);
+    void'(manager.check_leaks(final_leaks, binding.make_handle()));
+    if (mapping != null || mr != null ||
+        host_mem.calls.size() != 0 ||
+        host_mem.live_allocations() != baseline_allocations ||
+        final_leaks != baseline_leaks || result == null ||
+        result.resource_h != null || result.final_resource_state_known ||
+        result.final_resource_state != RDMA_RESOURCE_NEW)
+      `uvm_error(check_name,
+                 "pre-allocation rejection changed owned resource state")
+  endtask
+
   task automatic check_configure_contract();
     rdma_control_plane controls[8];
     rdma_resource_manager managers[8];
@@ -561,6 +698,777 @@ class rdma_control_plane_test extends uvm_test;
     if (mem.calls.size() != 0)
       `uvm_error("CONFIGURE_SIDE_EFFECT",
                  "configure invoked the optional host-memory adapter")
+  endtask
+
+  task automatic check_mock_typed_body_snapshot();
+    rdma_mock_cmq_port mock_cmq;
+    rdma_function_binding binding;
+    rdma_cmq_command_desc command;
+    rdma_cmq_opcode_key opcode_key;
+    rdma_xtr_v1_mr_deregister_body body;
+    rdma_xtr_v1_mr_deregister_body snapshot_body;
+    rdma_cmq_ticket ticket;
+    rdma_cmq_completion completion;
+    rdma_status status;
+
+    mock_cmq = rdma_mock_cmq_port::type_id::create("typed_snapshot_cmq");
+    binding = make_active_binding(
+      "typed_snapshot_binding", 64'ha050_0000_0000_0001,
+      32'ha050_0101, 37
+    );
+    body = rdma_xtr_v1_mr_deregister_body::type_id::create(
+      "typed_snapshot_body"
+    );
+    body.mr_h = new("typed_snapshot_mr");
+    body.mr_h.kind = RDMA_RESOURCE_MR;
+    body.mr_h.function_uid = binding.function_uid;
+    body.mr_h.object_id = 24'h65_4321;
+    body.mr_h.generation = binding.generation;
+    body.stag_key = 8'hd3;
+    body.next_state = RDMA_CONTEXT_INVALID;
+    opcode_key = rdma_cmq_opcode_key::type_id::create(
+      "typed_snapshot_opcode"
+    );
+    opcode_key.profile_name = "xtr_v1";
+    opcode_key.opcode = XTR_V1_OP_MR_DEREGISTER;
+    opcode_key.variant = "deregister";
+    command = rdma_cmq_command_desc::type_id::create(
+      "typed_snapshot_command"
+    );
+    command.function_h = binding.make_handle();
+    command.opcode_key = opcode_key;
+    command.body = body;
+    command.timeout = 1us;
+
+    mock_cmq.execute(command, ticket, completion, status);
+    expect_status("TYPED_SNAPSHOT_EXECUTE", status, RDMA_SC_OK);
+    snapshot_body = null;
+    if (mock_cmq.calls.size() != 1 || mock_cmq.calls[0] == null ||
+        mock_cmq.calls[0].command == null ||
+        !$cast(snapshot_body, mock_cmq.calls[0].command.body) ||
+        snapshot_body == null || snapshot_body == body ||
+        snapshot_body.mr_h == null || snapshot_body.mr_h == body.mr_h ||
+        !same_handle_fields(snapshot_body.mr_h, body.mr_h) ||
+        snapshot_body.stag_key != body.stag_key ||
+        snapshot_body.next_state != body.next_state)
+      `uvm_error("TYPED_SNAPSHOT_DETACHED",
+                 "mock CMQ did not retain a detached typed-body snapshot")
+  endtask
+
+  task automatic check_owned_mr_validation();
+    rdma_control_plane control;
+    rdma_fault_inject_resource_manager manager;
+    rdma_mock_cmq_port mock_cmq;
+    rdma_mock_stag_key_policy key_policy;
+    rdma_mock_host_mem host_mem;
+    rdma_function_binding binding;
+    rdma_function_binding wrong_binding;
+    rdma_register_mr_req request;
+    rdma_dma_request_context dma_context;
+    rdma_pd pd;
+    rdma_function_handle saved_function;
+    rdma_bdf_t saved_bdf;
+    longint unsigned saved_length;
+    int unsigned baseline_allocations;
+    int unsigned baseline_leaks;
+
+    setup_owned_mr_case(
+      "owned_validate", 1'b1, control, manager, mock_cmq, key_policy,
+      host_mem, binding, request, dma_context, pd, baseline_allocations,
+      baseline_leaks
+    );
+    if (pd == null)
+      return;
+
+    expect_owned_preallocate_reject(
+      "OWNED_NULL_CONTEXT", control, manager, mock_cmq, host_mem, binding,
+      request, null, 4096, RDMA_SC_INVALID_ARGUMENT,
+      baseline_allocations, baseline_leaks
+    );
+
+    wrong_binding = make_active_binding(
+      "owned_wrong_binding", 64'ha151_0000_0000_0001,
+      32'ha151_0101, binding.generation
+    );
+    saved_function = dma_context.function_h;
+    dma_context.function_h = wrong_binding.make_handle();
+    expect_owned_preallocate_reject(
+      "OWNED_FUNCTION_MISMATCH", control, manager, mock_cmq, host_mem,
+      binding, request, dma_context, 4096, RDMA_SC_INVALID_ARGUMENT,
+      baseline_allocations, baseline_leaks
+    );
+    dma_context.function_h = saved_function;
+
+    saved_bdf = dma_context.requester_bdf;
+    dma_context.requester_bdf.function_num ^= 3'h1;
+    expect_owned_preallocate_reject(
+      "OWNED_BDF_MISMATCH", control, manager, mock_cmq, host_mem, binding,
+      request, dma_context, 4096, RDMA_SC_DMA_TRANSLATION,
+      baseline_allocations, baseline_leaks
+    );
+    dma_context.requester_bdf = saved_bdf;
+
+    dma_context.owner_h = rdma_clone_handle_value(
+      request.pd_h, "owned validation DMA owner"
+    );
+    expect_owned_preallocate_reject(
+      "OWNED_NON_NULL_OWNER", control, manager, mock_cmq, host_mem, binding,
+      request, dma_context, 4096, RDMA_SC_INVALID_ARGUMENT,
+      baseline_allocations, baseline_leaks
+    );
+    dma_context.owner_h = null;
+
+    expect_owned_preallocate_reject(
+      "OWNED_SMALL_ALIGNMENT", control, manager, mock_cmq, host_mem,
+      binding, request, dma_context, 2048, RDMA_SC_INVALID_ARGUMENT,
+      baseline_allocations, baseline_leaks
+    );
+    expect_owned_preallocate_reject(
+      "OWNED_NON_POWER_ALIGNMENT", control, manager, mock_cmq, host_mem,
+      binding, request, dma_context, 6144, RDMA_SC_INVALID_ARGUMENT,
+      baseline_allocations, baseline_leaks
+    );
+
+    request.access.remote_atomic = 1'b1;
+    expect_owned_preallocate_reject(
+      "OWNED_REMOTE_ATOMIC", control, manager, mock_cmq, host_mem, binding,
+      request, dma_context, 4096, RDMA_SC_UNSUPPORTED_OPCODE,
+      baseline_allocations, baseline_leaks
+    );
+    request.access.remote_atomic = 1'b0;
+
+    saved_length = request.length;
+    request.length = 64'h0000_0001_0000_0000;
+    expect_owned_preallocate_reject(
+      "OWNED_LENGTH_TOO_LARGE", control, manager, mock_cmq, host_mem,
+      binding, request, dma_context, 4096, RDMA_SC_INVALID_ARGUMENT,
+      baseline_allocations, baseline_leaks
+    );
+    request.length = saved_length;
+
+    setup_owned_mr_case(
+      "owned_no_host", 1'b0, control, manager, mock_cmq, key_policy,
+      host_mem, binding, request, dma_context, pd, baseline_allocations,
+      baseline_leaks
+    );
+    if (pd == null)
+      return;
+    expect_owned_preallocate_reject(
+      "OWNED_NO_HOST_MEM", control, manager, mock_cmq, host_mem, binding,
+      request, dma_context, 4096, RDMA_SC_INVALID_STATE,
+      baseline_allocations, baseline_leaks
+    );
+  endtask
+
+  task automatic run_owned_mr_failure(string failure_kind);
+    rdma_control_plane control;
+    rdma_fault_inject_resource_manager manager;
+    rdma_mock_cmq_port mock_cmq;
+    rdma_mock_stag_key_policy key_policy;
+    rdma_mock_host_mem host_mem;
+    rdma_function_binding binding;
+    rdma_register_mr_req request;
+    rdma_dma_request_context dma_context;
+    rdma_pd pd;
+    rdma_dma_mapping mapping;
+    rdma_mr mr;
+    rdma_control_result result;
+    rdma_mrt_model key_alloc_body;
+    rdma_xtr_v1_mr_deregister_body dereg_body;
+    rdma_recovery_record recovery;
+    rdma_status injected_status;
+    rdma_status status;
+    rdma_status_code_e expected_primary;
+    rdma_resource_state_e expected_state;
+    int unsigned baseline_allocations;
+    int unsigned baseline_leaks;
+    int unsigned final_leaks;
+    int unsigned release_calls;
+    bit [7:0] expected_opcodes[$];
+    bit rollback_failure;
+
+    setup_owned_mr_case(
+      {"owned_", failure_kind}, 1'b1, control, manager, mock_cmq,
+      key_policy, host_mem, binding, request, dma_context, pd,
+      baseline_allocations, baseline_leaks
+    );
+    if (pd == null)
+      return;
+    rollback_failure = 1'b0;
+    expected_primary = RDMA_SC_INVALID_STATE;
+    expected_state = RDMA_RESOURCE_RELEASED;
+    case (failure_kind)
+      "allocate": begin
+        injected_status = rdma_status::make(
+          RDMA_SC_RESOURCE_EXHAUSTED, "injected owned allocation failure"
+        );
+        status = host_mem.fail_next("allocate", injected_status);
+        expect_status("OWNED_ALLOCATE_INJECT", status, RDMA_SC_OK);
+        expected_primary = RDMA_SC_RESOURCE_EXHAUSTED;
+        expected_state = RDMA_RESOURCE_NEW;
+      end
+      "key_alloc": begin
+        injected_status = rdma_status::make(
+          RDMA_SC_UNKNOWN_HW_ERROR, "injected owned KEY_ALLOC failure"
+        );
+        mock_cmq.fail_opcode(XTR_V1_OP_KEY_ALLOC, injected_status);
+        expected_primary = RDMA_SC_UNKNOWN_HW_ERROR;
+        expected_opcodes.push_back(XTR_V1_OP_KEY_ALLOC);
+      end
+      "commit_programmed": begin
+        injected_status = rdma_status::make(
+          RDMA_SC_INVALID_STATE, "injected owned commit failure"
+        );
+        status = manager.fail_next_transition(
+          "commit_programmed", injected_status
+        );
+        expect_status("OWNED_COMMIT_INJECT", status, RDMA_SC_OK);
+        expected_opcodes.push_back(XTR_V1_OP_KEY_ALLOC);
+        expected_opcodes.push_back(XTR_V1_OP_MR_DEREGISTER);
+      end
+      "activate": begin
+        injected_status = rdma_status::make(
+          RDMA_SC_INVALID_STATE, "injected owned activate failure"
+        );
+        status = manager.fail_next_transition("activate", injected_status);
+        expect_status("OWNED_ACTIVATE_INJECT", status, RDMA_SC_OK);
+        expected_opcodes.push_back(XTR_V1_OP_KEY_ALLOC);
+        expected_opcodes.push_back(XTR_V1_OP_MR_DEREGISTER);
+      end
+      "deregister": begin
+        injected_status = rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "injected commit before owned deregister failure"
+        );
+        status = manager.fail_next_transition(
+          "commit_programmed", injected_status
+        );
+        expect_status("OWNED_DEREG_COMMIT_INJECT", status, RDMA_SC_OK);
+        injected_status = rdma_status::make(
+          RDMA_SC_UNKNOWN_HW_ERROR, "injected owned deregister failure"
+        );
+        mock_cmq.fail_opcode(XTR_V1_OP_MR_DEREGISTER, injected_status);
+        expected_opcodes.push_back(XTR_V1_OP_KEY_ALLOC);
+        expected_opcodes.push_back(XTR_V1_OP_MR_DEREGISTER);
+        rollback_failure = 1'b1;
+        expected_state = RDMA_RESOURCE_ERROR;
+      end
+      default:
+        `uvm_fatal("OWNED_FAILURE_KIND", "unknown owned failure case")
+    endcase
+
+    control.alloc_and_register_mr(binding, request, dma_context, 4096,
+                                  mapping, mr, result);
+    if (rollback_failure)
+      expect_recovery_result({"OWNED_", failure_kind}, result,
+                             expected_primary);
+    else
+      expect_result({"OWNED_", failure_kind}, result, expected_primary);
+    expect_cmq_opcodes({"OWNED_", failure_kind, "_OPCODES"}, mock_cmq,
+                       expected_opcodes);
+    void'(manager.check_leaks(final_leaks, binding.make_handle()));
+    release_calls = 0;
+    foreach (host_mem.calls[i])
+      if (host_mem.calls[i] != null &&
+          host_mem.calls[i].method_name == "release")
+        release_calls++;
+
+    if (failure_kind == "allocate") begin
+      if (host_mem.live_allocations() != baseline_allocations ||
+          final_leaks != baseline_leaks || result == null ||
+          result.resource_h != null || result.final_resource_state_known ||
+          result.final_resource_state != RDMA_RESOURCE_NEW ||
+          release_calls != 0 || mapping != null || mr != null)
+        `uvm_error("OWNED_ALLOCATE_STATE",
+                   "allocation failure changed owned resource state")
+    end
+    else if (rollback_failure) begin
+      recovery = null;
+      if (result != null && result.resource_h != null)
+        status = manager.lookup_recovery(result.resource_h, recovery);
+      else
+        status = null;
+      expect_status("OWNED_DEREG_RECOVERY_LOOKUP", status, RDMA_SC_OK);
+      if (host_mem.live_allocations() != baseline_allocations + 1 ||
+          final_leaks != baseline_leaks + 1 || release_calls != 0 ||
+          result == null || !result.final_resource_state_known ||
+          result.final_resource_state != RDMA_RESOURCE_ERROR ||
+          result.rollback_statuses.size() != 1 ||
+          result.rollback_statuses[0] == null ||
+          result.rollback_statuses[0].code != RDMA_SC_UNKNOWN_HW_ERROR ||
+          mr == null || mr.state != RDMA_RESOURCE_ERROR ||
+          recovery == null ||
+          recovery.hardware_presence != RDMA_HW_PRESENCE_PRESENT ||
+          recovery.pending_steps.size() != 1 ||
+          recovery.pending_steps[0] != RDMA_CTRL_STEP_HW_MR_DEREGISTERED)
+        `uvm_error("OWNED_DEREG_RECOVERY",
+                   "rollback failure did not retain one owned ERROR MR")
+    end
+    else if (host_mem.live_allocations() != baseline_allocations ||
+             final_leaks != baseline_leaks || release_calls != 1 ||
+             result == null || !result.final_resource_state_known ||
+             result.final_resource_state != expected_state ||
+             result.recovery_required ||
+             result.rollback_statuses.size() != 0 || mr != null)
+      `uvm_error({"OWNED_", failure_kind, "_STATE"},
+                 "complete rollback did not restore owned baselines")
+
+    if (expected_opcodes.size() == 2) begin
+      key_alloc_body = null;
+      dereg_body = null;
+      if (mock_cmq.calls[0] == null ||
+          mock_cmq.calls[0].command == null ||
+          !$cast(key_alloc_body, mock_cmq.calls[0].command.body) ||
+          key_alloc_body == null || key_alloc_body.mr_h == null ||
+          mock_cmq.calls[1] == null ||
+          mock_cmq.calls[1].command == null ||
+          mock_cmq.calls[1].command.opcode_key == null ||
+          mock_cmq.calls[1].command.opcode_key.profile_name != "xtr_v1" ||
+          mock_cmq.calls[1].command.opcode_key.variant != "deregister" ||
+          !$cast(dereg_body, mock_cmq.calls[1].command.body) ||
+          dereg_body == null || dereg_body.mr_h == null ||
+          dereg_body.mr_h.kind != RDMA_RESOURCE_MR ||
+          dereg_body.mr_h.function_uid != binding.function_uid ||
+          dereg_body.mr_h.generation != binding.generation ||
+          dereg_body.mr_h.object_id != key_alloc_body.mr_h.object_id ||
+          dereg_body.stag_key != key_policy.fixed_key ||
+          dereg_body.next_state != RDMA_CONTEXT_INVALID)
+        `uvm_error({"OWNED_", failure_kind, "_DEREG_BODY"},
+                   "rollback MR_DEREGISTER command is malformed")
+    end
+  endtask
+
+  task automatic check_owned_mr_unattached_release_failure();
+    rdma_control_plane control;
+    rdma_fault_inject_resource_manager manager;
+    rdma_mock_cmq_port mock_cmq;
+    rdma_mock_stag_key_policy key_policy;
+    rdma_mock_host_mem host_mem;
+    rdma_function_binding binding;
+    rdma_register_mr_req request;
+    rdma_dma_request_context dma_context;
+    rdma_pd pd;
+    rdma_dma_mapping mapping;
+    rdma_mr mr;
+    rdma_control_result result;
+    rdma_status injected_status;
+    rdma_status status;
+    int unsigned baseline_allocations;
+    int unsigned baseline_leaks;
+    int unsigned final_leaks;
+    int unsigned release_calls;
+    bit [7:0] expected_opcodes[$];
+
+    setup_owned_mr_case(
+      "owned_unattached_release", 1'b1, control, manager, mock_cmq,
+      key_policy, host_mem, binding, request, dma_context, pd,
+      baseline_allocations, baseline_leaks
+    );
+    if (pd == null)
+      return;
+
+    // Keep the request valid while placing it outside the mapping returned by
+    // the host-memory adapter.  Inner registration then fails before create_mr
+    // can publish a registry resource.
+    request.iova.value += request.length + 4096;
+    injected_status = rdma_status::make(
+      RDMA_SC_UNKNOWN_HW_ERROR, "injected unattached mapping release failure"
+    );
+    status = host_mem.fail_next("release", injected_status);
+    expect_status("OWNED_UNATTACHED_RELEASE_INJECT", status, RDMA_SC_OK);
+
+    control.alloc_and_register_mr(binding, request, dma_context, 4096,
+                                  mapping, mr, result);
+    expect_recovery_fallback("OWNED_UNATTACHED_RELEASE", result,
+                             RDMA_SC_DMA_TRANSLATION);
+    expect_cmq_opcodes("OWNED_UNATTACHED_RELEASE_OPCODES", mock_cmq,
+                       expected_opcodes);
+    void'(manager.check_leaks(final_leaks, binding.make_handle()));
+    release_calls = 0;
+    foreach (host_mem.calls[i])
+      if (host_mem.calls[i] != null &&
+          host_mem.calls[i].method_name == "release")
+        release_calls++;
+
+    if (result == null || result.resource_h != null ||
+        result.recovery_required || result.final_resource_state_known ||
+        result.final_resource_state != RDMA_RESOURCE_NEW ||
+        result.rollback_statuses.size() != 1 ||
+        result.rollback_statuses[0] == null ||
+        result.rollback_statuses[0].code != RDMA_SC_UNKNOWN_HW_ERROR ||
+        mapping == null || mapping.state != RDMA_MAPPING_ACTIVE || mr != null ||
+        host_mem.live_allocations() != baseline_allocations + 1 ||
+        final_leaks != baseline_leaks || release_calls != 1)
+      `uvm_error(
+        "OWNED_UNATTACHED_RELEASE_STATE",
+        "failed unattached cleanup did not return caller-operable authority"
+      )
+
+    if (mapping != null) begin
+      status = host_mem.\release (mapping);
+      expect_status("OWNED_UNATTACHED_RELEASE_CALLER_CLEANUP", status,
+                    RDMA_SC_OK);
+      if (host_mem.live_allocations() != baseline_allocations)
+        `uvm_error("OWNED_UNATTACHED_RELEASE_CALLER_STATE",
+                   "caller could not release returned mapping authority")
+    end
+  endtask
+
+  task automatic check_owned_mr_prestage_release_failure();
+    rdma_control_plane control;
+    rdma_fault_inject_resource_manager manager;
+    rdma_mock_cmq_port mock_cmq;
+    rdma_mock_stag_key_policy key_policy;
+    rdma_mock_host_mem host_mem;
+    rdma_function_binding binding;
+    rdma_register_mr_req request;
+    rdma_dma_request_context dma_context;
+    rdma_pd pd;
+    rdma_dma_mapping mapping;
+    rdma_mr mr;
+    rdma_resource registry_resource;
+    rdma_mr registry_mr;
+    rdma_recovery_record recovery;
+    rdma_control_result result;
+    rdma_status injected_status;
+    rdma_status status;
+    int unsigned baseline_allocations;
+    int unsigned baseline_leaks;
+    int unsigned final_leaks;
+    int unsigned release_calls;
+    bit [7:0] expected_opcodes[$];
+
+    setup_owned_mr_case(
+      "owned_prestage_release", 1'b1, control, manager, mock_cmq,
+      key_policy, host_mem, binding, request, dma_context, pd,
+      baseline_allocations, baseline_leaks
+    );
+    if (pd == null)
+      return;
+
+    injected_status = rdma_status::make(
+      RDMA_SC_INVALID_STATE, "injected owned STAG derivation failure"
+    );
+    status = key_policy.fail_next(injected_status);
+    expect_status("OWNED_PRESTAGE_KEY_INJECT", status, RDMA_SC_OK);
+    injected_status = rdma_status::make(
+      RDMA_SC_UNKNOWN_HW_ERROR, "injected pre-stage mapping release failure"
+    );
+    status = host_mem.fail_next("release", injected_status);
+    expect_status("OWNED_PRESTAGE_RELEASE_INJECT", status, RDMA_SC_OK);
+
+    control.alloc_and_register_mr(binding, request, dma_context, 4096,
+                                  mapping, mr, result);
+    expect_recovery_fallback("OWNED_PRESTAGE_RELEASE", result,
+                             RDMA_SC_INVALID_STATE);
+    expect_cmq_opcodes("OWNED_PRESTAGE_RELEASE_OPCODES", mock_cmq,
+                       expected_opcodes);
+    registry_resource = null;
+    recovery = null;
+    if (result != null && result.resource_h != null) begin
+      status = manager.lookup(result.resource_h, registry_resource);
+      expect_status("OWNED_PRESTAGE_RESOURCE_LOOKUP", status, RDMA_SC_OK);
+      status = manager.lookup_recovery(result.resource_h, recovery);
+      expect_status("OWNED_PRESTAGE_RECOVERY_ABSENT", status,
+                    RDMA_SC_INVALID_STATE);
+    end
+    else begin
+      `uvm_error("OWNED_PRESTAGE_RESOURCE_HANDLE",
+                 "pre-stage fallback lost the reserved MR handle")
+    end
+    registry_mr = null;
+    void'($cast(registry_mr, registry_resource));
+    void'(manager.check_leaks(final_leaks, binding.make_handle()));
+    release_calls = 0;
+    foreach (host_mem.calls[i])
+      if (host_mem.calls[i] != null &&
+          host_mem.calls[i].method_name == "release")
+        release_calls++;
+
+    if (result == null || result.resource_h == null ||
+        !result.final_resource_state_known ||
+        result.final_resource_state != RDMA_RESOURCE_ALLOCATED ||
+        result.recovery_required || result.rollback_statuses.size() != 2 ||
+        result.rollback_statuses[0] == null ||
+        result.rollback_statuses[0].code != RDMA_SC_UNKNOWN_HW_ERROR ||
+        result.rollback_statuses[1] == null ||
+        result.rollback_statuses[1].code != RDMA_SC_INVALID_STATE ||
+        mapping == null || mapping.state != RDMA_MAPPING_ACTIVE || mr != null ||
+        registry_mr == null || registry_mr.handle == null ||
+        registry_mr.state != RDMA_RESOURCE_ALLOCATED ||
+        !same_handle_fields(result.resource_h, registry_mr.handle) ||
+        recovery != null ||
+        host_mem.live_allocations() != baseline_allocations + 1 ||
+        final_leaks != baseline_leaks + 1 || release_calls != 1)
+      `uvm_error(
+        "OWNED_PRESTAGE_RELEASE_STATE",
+        "pre-stage rollback fallback lost mapping or reservation authority"
+      )
+
+    if (mapping != null) begin
+      status = host_mem.\release (mapping);
+      expect_status("OWNED_PRESTAGE_CALLER_RELEASE", status, RDMA_SC_OK);
+    end
+    release_calls = 0;
+    foreach (host_mem.calls[i])
+      if (host_mem.calls[i] != null &&
+          host_mem.calls[i].method_name == "release")
+        release_calls++;
+    void'(manager.check_leaks(final_leaks, binding.make_handle()));
+    if (mapping == null || mapping.state != RDMA_MAPPING_RELEASED ||
+        host_mem.live_allocations() != baseline_allocations ||
+        final_leaks != baseline_leaks + 1 || release_calls != 2)
+      `uvm_error("OWNED_PRESTAGE_CALLER_STATE",
+                 "caller release retried or changed the retained reservation")
+  endtask
+
+  task automatic check_owned_mr_timeout_freeze_failure_no_mapping();
+    rdma_control_plane control;
+    rdma_fault_inject_resource_manager manager;
+    rdma_mock_cmq_port mock_cmq;
+    rdma_mock_stag_key_policy key_policy;
+    rdma_mock_host_mem host_mem;
+    rdma_function_binding binding;
+    rdma_register_mr_req request;
+    rdma_dma_request_context dma_context;
+    rdma_pd pd;
+    rdma_dma_mapping mapping;
+    rdma_mr mr;
+    rdma_resource registry_resource;
+    rdma_mr registry_mr;
+    rdma_recovery_record recovery;
+    rdma_control_result result;
+    rdma_status injected_status;
+    rdma_status status;
+    int unsigned baseline_allocations;
+    int unsigned baseline_leaks;
+    int unsigned final_leaks;
+    int unsigned release_calls;
+    bit [7:0] expected_opcodes[$];
+
+    setup_owned_mr_case(
+      "owned_timeout_freeze", 1'b1, control, manager, mock_cmq,
+      key_policy, host_mem, binding, request, dma_context, pd,
+      baseline_allocations, baseline_leaks
+    );
+    if (pd == null)
+      return;
+
+    injected_status = rdma_status::make(
+      RDMA_SC_RESOURCE_BUSY, "injected timeout recovery publication failure"
+    );
+    status = manager.fail_next_transition("mark_error", injected_status);
+    expect_status("OWNED_TIMEOUT_FREEZE_INJECT", status, RDMA_SC_OK);
+    mock_cmq.timeout_opcode(XTR_V1_OP_KEY_ALLOC);
+    expected_opcodes.push_back(XTR_V1_OP_KEY_ALLOC);
+
+    control.alloc_and_register_mr(binding, request, dma_context, 4096,
+                                  mapping, mr, result);
+    expect_recovery_fallback("OWNED_TIMEOUT_FREEZE", result,
+                             RDMA_SC_TIMEOUT);
+    expect_cmq_opcodes("OWNED_TIMEOUT_FREEZE_OPCODES", mock_cmq,
+                       expected_opcodes);
+    registry_resource = null;
+    recovery = null;
+    if (result != null && result.resource_h != null) begin
+      status = manager.lookup(result.resource_h, registry_resource);
+      expect_status("OWNED_TIMEOUT_FREEZE_LOOKUP", status, RDMA_SC_OK);
+      status = manager.lookup_recovery(result.resource_h, recovery);
+      expect_status("OWNED_TIMEOUT_FREEZE_RECOVERY_ABSENT", status,
+                    RDMA_SC_INVALID_STATE);
+    end
+    registry_mr = null;
+    void'($cast(registry_mr, registry_resource));
+    void'(manager.check_leaks(final_leaks, binding.make_handle()));
+    release_calls = 0;
+    foreach (host_mem.calls[i])
+      if (host_mem.calls[i] != null &&
+          host_mem.calls[i].method_name == "release")
+        release_calls++;
+
+    if (result == null || result.resource_h == null ||
+        !result.final_resource_state_known ||
+        result.final_resource_state != RDMA_RESOURCE_ALLOCATED ||
+        result.recovery_required || result.rollback_statuses.size() != 1 ||
+        result.rollback_statuses[0] == null ||
+        result.rollback_statuses[0].code != RDMA_SC_RESOURCE_BUSY ||
+        mapping != null || mr != null || registry_mr == null ||
+        registry_mr.state != RDMA_RESOURCE_ALLOCATED || recovery != null ||
+        host_mem.live_allocations() != baseline_allocations + 1 ||
+        final_leaks != baseline_leaks + 1 || release_calls != 0)
+      `uvm_error(
+        "OWNED_TIMEOUT_FREEZE_STATE",
+        "HW-unknown fallback exposed mapping release authority"
+      )
+  endtask
+
+  task automatic check_owned_mr_released_mapping_not_returned();
+    rdma_control_plane control;
+    rdma_fault_inject_resource_manager manager;
+    rdma_mock_cmq_port mock_cmq;
+    rdma_mock_stag_key_policy key_policy;
+    rdma_mock_host_mem host_mem;
+    rdma_function_binding binding;
+    rdma_register_mr_req request;
+    rdma_dma_request_context dma_context;
+    rdma_pd pd;
+    rdma_dma_mapping mapping;
+    rdma_mr mr;
+    rdma_resource registry_resource;
+    rdma_mr registry_mr;
+    rdma_recovery_record recovery;
+    rdma_control_result result;
+    rdma_status injected_status;
+    rdma_status status;
+    int unsigned baseline_allocations;
+    int unsigned baseline_leaks;
+    int unsigned final_leaks;
+    int unsigned release_calls;
+    bit [7:0] expected_opcodes[$];
+
+    setup_owned_mr_case(
+      "owned_released_mapping", 1'b1, control, manager, mock_cmq,
+      key_policy, host_mem, binding, request, dma_context, pd,
+      baseline_allocations, baseline_leaks
+    );
+    if (pd == null)
+      return;
+
+    injected_status = rdma_status::make(
+      RDMA_SC_INVALID_STATE, "injected owned STAG derivation failure"
+    );
+    status = key_policy.fail_next(injected_status);
+    expect_status("OWNED_RELEASED_MAPPING_KEY_INJECT", status, RDMA_SC_OK);
+    injected_status = rdma_status::make(
+      RDMA_SC_RESOURCE_BUSY, "injected reservation cleanup failure"
+    );
+    status = manager.fail_next_transition(
+      "release_reserved", injected_status
+    );
+    expect_status("OWNED_RELEASED_MAPPING_RESERVE_INJECT", status,
+                  RDMA_SC_OK);
+
+    control.alloc_and_register_mr(binding, request, dma_context, 4096,
+                                  mapping, mr, result);
+    expect_recovery_fallback("OWNED_RELEASED_MAPPING", result,
+                             RDMA_SC_INVALID_STATE);
+    expect_cmq_opcodes("OWNED_RELEASED_MAPPING_OPCODES", mock_cmq,
+                       expected_opcodes);
+    registry_resource = null;
+    recovery = null;
+    if (result != null && result.resource_h != null) begin
+      status = manager.lookup(result.resource_h, registry_resource);
+      expect_status("OWNED_RELEASED_MAPPING_LOOKUP", status, RDMA_SC_OK);
+      status = manager.lookup_recovery(result.resource_h, recovery);
+      expect_status("OWNED_RELEASED_MAPPING_RECOVERY_ABSENT", status,
+                    RDMA_SC_INVALID_STATE);
+    end
+    registry_mr = null;
+    void'($cast(registry_mr, registry_resource));
+    void'(manager.check_leaks(final_leaks, binding.make_handle()));
+    release_calls = 0;
+    foreach (host_mem.calls[i])
+      if (host_mem.calls[i] != null &&
+          host_mem.calls[i].method_name == "release")
+        release_calls++;
+
+    if (result == null || result.resource_h == null ||
+        !result.final_resource_state_known ||
+        result.final_resource_state != RDMA_RESOURCE_ALLOCATED ||
+        result.recovery_required || result.rollback_statuses.size() != 2 ||
+        result.rollback_statuses[0] == null ||
+        result.rollback_statuses[0].code != RDMA_SC_RESOURCE_BUSY ||
+        result.rollback_statuses[1] == null ||
+        result.rollback_statuses[1].code != RDMA_SC_INVALID_STATE ||
+        mapping != null || mr != null || registry_mr == null ||
+        registry_mr.state != RDMA_RESOURCE_ALLOCATED || recovery != null ||
+        host_mem.live_allocations() != baseline_allocations ||
+        final_leaks != baseline_leaks + 1 || release_calls != 1)
+      `uvm_error(
+        "OWNED_RELEASED_MAPPING_STATE",
+        "post-release fallback returned a stale active mapping snapshot"
+      )
+  endtask
+
+  task automatic check_owned_mr_success();
+    rdma_control_plane control;
+    rdma_fault_inject_resource_manager manager;
+    rdma_mock_cmq_port mock_cmq;
+    rdma_mock_stag_key_policy key_policy;
+    rdma_mock_host_mem host_mem;
+    rdma_function_binding binding;
+    rdma_register_mr_req request;
+    rdma_dma_request_context dma_context;
+    rdma_pd pd;
+    rdma_dma_mapping mapping;
+    rdma_mr mr;
+    rdma_mrt_model mrt;
+    rdma_control_result result;
+    int unsigned baseline_allocations;
+    int unsigned baseline_leaks;
+    int unsigned final_leaks;
+    bit [7:0] expected_opcodes[$];
+    bit registration_completed;
+
+    setup_owned_mr_case(
+      "owned_success", 1'b1, control, manager, mock_cmq, key_policy,
+      host_mem, binding, request, dma_context, pd, baseline_allocations,
+      baseline_leaks
+    );
+    if (pd == null)
+      return;
+    request.access.remote_write = 1'b1;
+    registration_completed = 1'b0;
+    fork : wait_for_owned_registration
+      begin
+        control.alloc_and_register_mr(binding, request, dma_context, 4096,
+                                      mapping, mr, result);
+        registration_completed = 1'b1;
+      end
+      begin
+        #(1us);
+      end
+    join_any
+    disable wait_for_owned_registration;
+    if (!registration_completed) begin
+      `uvm_error("OWNED_SUCCESS_DEADLOCK",
+                 "owned registration did not complete with its supplied lock")
+      return;
+    end
+    expect_result("OWNED_SUCCESS", result, RDMA_SC_OK);
+    expected_opcodes.push_back(XTR_V1_OP_KEY_ALLOC);
+    expect_cmq_opcodes("OWNED_SUCCESS_OPCODES", mock_cmq,
+                       expected_opcodes);
+    void'(manager.check_leaks(final_leaks, binding.make_handle()));
+    mrt = null;
+    if (mock_cmq.calls.size() != 0 && mock_cmq.calls[0] != null &&
+        mock_cmq.calls[0].command != null)
+      void'($cast(mrt, mock_cmq.calls[0].command.body));
+    if (mapping == null || mapping.state != RDMA_MAPPING_ACTIVE ||
+        mapping.owner_h != null ||
+        mapping.direction != RDMA_DMA_BIDIRECTIONAL ||
+        mapping.pasid_valid != dma_context.pasid_valid ||
+        mapping.pasid != dma_context.pasid ||
+        mr == null || mr.state != RDMA_RESOURCE_ACTIVE ||
+        mr.backing_refs.size() != 1 || mr.backing_refs[0] == null ||
+        mr.backing_refs[0].mapping == null ||
+        mr.backing_refs[0].ownership != RDMA_OWNERSHIP_CONTROL_PLANE ||
+        mr.backing_refs[0].release_complete ||
+        host_mem.live_allocations() != baseline_allocations + 1 ||
+        final_leaks != baseline_leaks + 1 ||
+        host_mem.calls.size() != 1 || host_mem.calls[0] == null ||
+        host_mem.calls[0].method_name != "allocate" ||
+        host_mem.calls[0].direction != RDMA_DMA_BIDIRECTIONAL ||
+        host_mem.calls[0].request_context == null ||
+        host_mem.calls[0].request_context == dma_context ||
+        host_mem.calls[0].request_context.pasid != dma_context.pasid ||
+        mrt == null || mrt.page_layout == null ||
+        mrt.page_layout.pbl_mode != RDMA_MR_PBL0 ||
+        mrt.page_layout.host_page_size != RDMA_MR_PAGE_4K ||
+        mrt.page_layout.address_mode != RDMA_MR_ADDRESS_VA_BASED ||
+        mrt.page_layout.pba0 != mapping.backing_addr)
+      `uvm_error("OWNED_SUCCESS_STATE",
+                 "owned PBL0 registration lost mapping authority or layout")
   endtask
 
   task automatic check_pd_lifecycle();
@@ -1117,6 +2025,7 @@ class rdma_control_plane_test extends uvm_test;
     longint unsigned original_backing_address;
     longint unsigned original_hmc_size;
     int unsigned original_first_pbl_index;
+    bit cmq_entered;
 
     control = rdma_control_plane::type_id::create("snapshot_control");
     manager = rdma_resource_manager::type_id::create("snapshot_manager");
@@ -1171,8 +2080,11 @@ class rdma_control_plane_test extends uvm_test;
         control.register_mr(binding, request, backing, mr, result);
       end
       begin
-        #1ns;
-        if (blocking_cmq.entered.try_get(1)) begin
+        blocking_cmq.wait_until_entered(1us, cmq_entered);
+        if (!cmq_entered)
+          `uvm_error("SNAPSHOT_SUCCESS_HANDSHAKE",
+                     "KEY_ALLOC did not enter the blocking CMQ")
+        else begin
           request.iova.value += 64'h0010_0000;
           request.length += 64'h1000;
           backing.backing_refs[0].ownership = RDMA_OWNERSHIP_CONTROL_PLANE;
@@ -1180,8 +2092,8 @@ class rdma_control_plane_test extends uvm_test;
           backing.hmc_refs[0].size += 64'h1000;
           backing.hmc_refs[0].first_pbl_index += 1'b1;
           backing.page_layout.first_pbl_index += 1'b1;
-          blocking_cmq.resume.put(1);
         end
+        blocking_cmq.resume_execute();
       end
     join
     expect_result("SNAPSHOT_SUCCESS", result, RDMA_SC_OK);
@@ -1249,15 +2161,18 @@ class rdma_control_plane_test extends uvm_test;
         control.register_mr(binding, request, backing, mr, result);
       end
       begin
-        #1ns;
-        if (blocking_cmq.entered.try_get(1)) begin
+        blocking_cmq.wait_until_entered(1us, cmq_entered);
+        if (!cmq_entered)
+          `uvm_error("SNAPSHOT_TIMEOUT_HANDSHAKE",
+                     "timed KEY_ALLOC did not enter the blocking CMQ")
+        else begin
           backing.backing_refs[0].ownership = RDMA_OWNERSHIP_CONTROL_PLANE;
           backing.backing_refs[0].mapping.backing_addr.value += 64'h4000;
           backing.hmc_refs[0].size += 64'h2000;
           backing.hmc_refs[0].first_pbl_index += 2;
           backing.page_layout.first_pbl_index += 2;
-          blocking_cmq.resume.put(1);
         end
+        blocking_cmq.resume_execute();
       end
     join
     expect_recovery_result("SNAPSHOT_TIMEOUT", result, RDMA_SC_TIMEOUT);
@@ -1308,6 +2223,7 @@ class rdma_control_plane_test extends uvm_test;
     rdma_control_result result;
     rdma_status status;
     longint unsigned lease_size;
+    bit cmq_entered;
 
     control = rdma_control_plane::type_id::create("post_cmq_control");
     probe_manager = rdma_recovery_probe_manager::type_id::create(
@@ -1358,12 +2274,15 @@ class rdma_control_plane_test extends uvm_test;
         control.register_mr(binding, request, backing, mr, result);
       end
       begin
-        #1ns;
-        if (blocking_cmq.entered.try_get(1)) begin
+        blocking_cmq.wait_until_entered(1us, cmq_entered);
+        if (!cmq_entered)
+          `uvm_error("POST_CMQ_BINDING_HANDSHAKE",
+                     "KEY_ALLOC did not enter the blocking CMQ")
+        else begin
           binding.generation++;
           binding.owner_h = binding.make_handle();
-          blocking_cmq.resume.put(1);
         end
+        blocking_cmq.resume_execute();
       end
     join
     expect_recovery_result("POST_CMQ_BINDING", result,
@@ -1460,13 +2379,16 @@ class rdma_control_plane_test extends uvm_test;
         control.register_mr(binding, request, backing, mr, result);
       end
       begin
-        #1ns;
-        if (blocking_cmq.entered.try_get(1)) begin
+        blocking_cmq.wait_until_entered(1us, cmq_entered);
+        if (!cmq_entered)
+          `uvm_error("POST_CMQ_HMC_HANDSHAKE",
+                     "KEY_ALLOC did not enter the blocking CMQ")
+        else begin
           status = hmc.\release (binding.make_handle(), RDMA_RESOURCE_MR,
                                  hmc_address);
           expect_status("POST_CMQ_HMC_RELEASE", status, RDMA_SC_OK);
-          blocking_cmq.resume.put(1);
         end
+        blocking_cmq.resume_execute();
       end
     join
     expect_recovery_result("POST_CMQ_HMC", result, RDMA_SC_INVALID_STATE);
@@ -2362,6 +3284,18 @@ class rdma_control_plane_test extends uvm_test;
   virtual task run_phase(uvm_phase phase);
     phase.raise_objection(this);
     check_configure_contract();
+    check_mock_typed_body_snapshot();
+    check_owned_mr_validation();
+    run_owned_mr_failure("allocate");
+    run_owned_mr_failure("key_alloc");
+    run_owned_mr_failure("commit_programmed");
+    run_owned_mr_failure("activate");
+    run_owned_mr_failure("deregister");
+    check_owned_mr_prestage_release_failure();
+    check_owned_mr_timeout_freeze_failure_no_mapping();
+    check_owned_mr_released_mapping_not_returned();
+    check_owned_mr_unattached_release_failure();
+    check_owned_mr_success();
     check_pd_lifecycle();
     check_borrowed_pbl0_registration();
     check_key_alloc_explicit_failure();
