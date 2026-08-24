@@ -60,8 +60,8 @@ is fatal and is never evaluated as Python or C.
 The `.hex` grammar is stable: marker, case, inputs, byte count, then one
 space-separated lowercase hex byte line.  Multiple cases are separated by one
 blank line.  The checker independently regenerates the complete file and
-requires byte-for-byte equality. `context.hex` contains exactly 11 cases in the
-order listed above: three 512-byte QPC images followed by eight 64-byte sparse
+requires byte-for-byte equality. `context.hex` contains exactly 13 cases in the
+order listed above: three 512-byte QPC images followed by ten 64-byte sparse
 bodies. Both the Python and SystemVerilog readers reject duplicate names,
 malformed/truncated/extra bytes, and incomplete trailing cases. The SV reader
 parses into a private queue and publishes no cases unless the complete file is
@@ -148,7 +148,7 @@ SV definitions. A drift in any of those three sources is fatal.
 The fixed CMQ request envelope owns qword 0 mask `8fff3fff00000000`; qwords
 1..7 are zero. The immutable lookup in
 `rdma_xtr_v1_image_masks.svh` supplies distinct masks for CQC create, MRT
-register PBL0/PBL1/PBL2, MRT key-allocate PBL0, SRQC create, CEQC create and
+register PBL0/PBL1/PBL2, MRT key-allocate PBL0/PBL1/PBL2, SRQC create, CEQC create and
 AEQC create. Every body mask is disjoint from the envelope, and each golden
 payload is zero outside its selected body mask. The checker holds an
 independent copy of these values rather than deriving expected ownership from
