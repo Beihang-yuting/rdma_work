@@ -4935,7 +4935,7 @@ class rdma_cmq_engine extends uvm_object;
     status = poll_ledger_status(ledger_used);
     if (!status.ok())
       return;
-    if (ledger_used == 0) begin
+    if (ledger_used == 0 && !profile_image_format_valid) begin
       status = rdma_status::success();
       return;
     end
@@ -5199,6 +5199,7 @@ class rdma_cmq_engine extends uvm_object;
   );
     rdma_status validation_status;
     rdma_status expiry_status;
+    rdma_cmq_ticket ticket_snapshot;
     int fifo_index;
     time remaining;
     time wait_time;
@@ -5222,15 +5223,25 @@ class rdma_cmq_engine extends uvm_object;
       engine_lock.put(1);
       return;
     end
-    fifo_index = terminal_index(ticket);
-    if (fifo_index < 0 && !ticket_is_outstanding(ticket)) begin
+    validation_status = checked_completion_ticket_snapshot(
+      ticket, ticket_snapshot
+    );
+    if (validation_status == null || !validation_status.ok()) begin
+      status = (validation_status == null) ?
+        invalid_state("CMQ wait ticket snapshot returned null status") :
+        validation_status;
+      engine_lock.put(1);
+      return;
+    end
+    fifo_index = terminal_index(ticket_snapshot);
+    if (fifo_index < 0 && !ticket_is_outstanding(ticket_snapshot)) begin
       status = invalid_argument("CMQ wait ticket is unknown or delivered");
       engine_lock.put(1);
       return;
     end
 
     forever begin
-      fifo_index = terminal_index(ticket);
+      fifo_index = terminal_index(ticket_snapshot);
       if (fifo_index >= 0) begin
         completion = terminal_fifo[fifo_index];
         terminal_fifo.delete(fifo_index);
@@ -5246,7 +5257,7 @@ class rdma_cmq_engine extends uvm_object;
       else begin
         poll_locked(status);
       end
-      fifo_index = terminal_index(ticket);
+      fifo_index = terminal_index(ticket_snapshot);
       if (fifo_index >= 0) begin
         completion = terminal_fifo[fifo_index];
         terminal_fifo.delete(fifo_index);
@@ -5260,17 +5271,17 @@ class rdma_cmq_engine extends uvm_object;
         engine_lock.put(1);
         return;
       end
-      if (!ticket_is_outstanding(ticket)) begin
+      if (!ticket_is_outstanding(ticket_snapshot)) begin
         status = invalid_argument("CMQ wait ticket is unknown or delivered");
         engine_lock.put(1);
         return;
       end
-      if ($time >= ticket.absolute_deadline) begin
+      if ($time >= ticket_snapshot.absolute_deadline) begin
         status = invalid_state("CMQ wait deadline produced no completion");
         engine_lock.put(1);
         return;
       end
-      remaining = ticket.absolute_deadline - $time;
+      remaining = ticket_snapshot.absolute_deadline - $time;
       wait_time = (remaining < 1ns) ? remaining : 1ns;
       engine_lock.put(1);
       #(wait_time);

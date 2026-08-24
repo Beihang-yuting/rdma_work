@@ -3501,6 +3501,40 @@ class rdma_cmq_engine_test extends uvm_test;
       `uvm_error(label, "empty poll changed authority or read host memory")
   endtask
 
+  task automatic expect_empty_poll_with_read(
+    string label,
+    rdma_cmq_engine_probe engine,
+    rdma_mock_host_mem mem
+  );
+    rdma_cmq_completion completions[$];
+    rdma_cmq_diagnostic diagnostics[$];
+    rdma_status status;
+    longint unsigned before_publish;
+    longint unsigned before_retire;
+    longint unsigned before_consume;
+
+    before_publish = engine.published_count();
+    before_retire = engine.retired_count();
+    before_consume = engine.cq_consumed_count();
+    mem.calls.delete();
+    engine.poll(completions, diagnostics, status);
+    expect_status({label, "_STATUS"}, status, RDMA_SC_OK);
+    if (completions.size() != 0 || diagnostics.size() != 0 ||
+        count_host_calls(mem, "read") != 1 ||
+        engine.state() != RDMA_CMQ_ENGINE_ACTIVE ||
+        engine.published_count() != before_publish ||
+        engine.retired_count() != before_retire ||
+        engine.cq_consumed_count() != before_consume ||
+        engine.tokens_in_use_count() != 0 ||
+        engine.slot_record_count() != 0 ||
+        engine.command_registry_count() != 0 ||
+        engine.entry_registry_count() != 0 ||
+        engine.terminal_fifo_count() != 0)
+      `uvm_error(label,
+                 "formatted empty poll changed authority or missed CQ read")
+    expect_poll_read_geometry({label, "_READ"}, mem, before_consume, 1);
+  endtask
+
   task automatic expect_inconsistent_empty_poll_without_read(
     string label,
     rdma_cmq_engine_probe engine,
@@ -5424,7 +5458,45 @@ class rdma_cmq_engine_test extends uvm_test;
         "partial-drain retry did not finish the retained command"
       )
     expect_poll_read_geometry("POLL_PARTIAL_DRAIN_RETRY_READ", mem, 1, 1);
-    expect_empty_poll_without_read("POLL_EMPTY_AFTER_DRAIN", engine, mem);
+    expect_empty_poll_with_read("POLL_EMPTY_AFTER_DRAIN", engine, mem);
+
+    // CQ backing persists independently of the software ledger.  Once the
+    // ring is fully retired, an owner-ready stale CQE at the current consumer
+    // slot must be diagnosed before a later command can reuse its identity.
+    write_profile_cqe(
+      "POLL_EMPTY_STALE_CQE", mem, mapping, profile, 2, 1'b1,
+      tickets[1], 0, raw_cqes[0]
+    );
+    mem.calls.delete();
+    engine.poll(completions, diagnostics, status);
+    expect_status("POLL_EMPTY_STALE_STATUS", status, RDMA_SC_CODEC_ERROR);
+    if (completions.size() != 0 || diagnostics.size() != 1 ||
+        engine.state() != RDMA_CMQ_ENGINE_POISONED ||
+        engine.published_count() != 2 || engine.retired_count() != 2 ||
+        engine.cq_consumed_count() != 2 ||
+        engine.tokens_in_use_count() != 0 ||
+        engine.slot_record_count() != 0 ||
+        engine.command_registry_count() != 0 ||
+        engine.entry_registry_count() != 0)
+      `uvm_error("POLL_EMPTY_STALE",
+                 "owner-ready stale CQE was ignored or changed authority")
+    if (diagnostics.size() == 1)
+      expect_poison_diagnostic(
+        "POLL_EMPTY_STALE_DIAGNOSTIC", engine, diagnostics[0],
+        RDMA_CMQ_DIAG_UNKNOWN_CQE, null, raw_cqes[0], active_binding, cmq
+      );
+    expect_poll_read_geometry("POLL_EMPTY_STALE_READ", mem, 2, 1);
+
+    request = make_command(
+      "poll_empty_stale_rejected", active_binding,
+      rdma_cmq_test_profile::TEST_OPCODE_A, 8'h48, 10us
+    );
+    engine.submit(request, ticket, status);
+    expect_status("POLL_EMPTY_STALE_LATER_SUBMIT", status,
+                  RDMA_SC_INVALID_STATE);
+    if (ticket != null)
+      `uvm_error("POLL_EMPTY_STALE_LATER_SUBMIT",
+                 "poisoned stale-CQE engine returned a later ticket")
 
     engine.shutdown(status);
     expect_status("INVALID_SHUTDOWN", status, RDMA_SC_OK);
@@ -8736,10 +8808,14 @@ class rdma_cmq_engine_test extends uvm_test;
     mem.calls.delete();
     engine.poll(completions, diagnostics, status);
     expect_status("LATE_SNAPSHOT_FAILURE_ONCE_STATUS", status, RDMA_SC_OK);
-    if (completions.size() != 0 || diagnostics.size() != 0 ||
-        count_host_calls(mem, "read") != 0)
+    if (completions.size() != 0 || diagnostics.size() != 0)
       `uvm_error("LATE_SNAPSHOT_FAILURE_ONCE",
                  "late diagnostic was delivered more than once")
+    if (count_host_calls(mem, "read") != 1)
+      `uvm_error("LATE_SNAPSHOT_FAILURE_ONCE_READ",
+                 "formatted empty ledger did not read its current CQ slot")
+    expect_poll_read_geometry("LATE_SNAPSHOT_FAILURE_ONCE_GEOMETRY",
+                              mem, 1, 1);
     engine.shutdown(status);
     expect_status("LATE_SNAPSHOT_FAILURE_SHUTDOWN", status, RDMA_SC_OK);
   endtask
@@ -9990,7 +10066,7 @@ class rdma_cmq_engine_test extends uvm_test;
         engine.cq_consumed_count() != 32)
       `uvm_error("POLL_OWNER_FLIP_EMPTY",
                  "old owner-1 CQE was reused after owner flip")
-    expect_poll_read_geometry("POLL_OWNER_FLIP_EMPTY_READ", mem, 32, 0);
+    expect_poll_read_geometry("POLL_OWNER_FLIP_EMPTY_READ", mem, 32, 1);
 
     wrapped_request = make_command(
       "poll_sequence_32", active_binding,
@@ -11120,6 +11196,185 @@ class rdma_cmq_engine_test extends uvm_test;
       `uvm_error("WAIT_POISON_RESET_RESULTS",
                  "reset did not return queued result and trusted cancel")
     expect_unconfigured("WAIT_POISON_RESET_STATE", engine);
+  endtask
+
+  task automatic check_wait_for_caller_ticket_detachment();
+    rdma_cmq_engine_probe engine;
+    rdma_mock_host_mem mem;
+    rdma_cmq_test_pcie pcie;
+    rdma_doorbell_scheduler scheduler;
+    rdma_cmq_test_profile profile;
+    rdma_function_binding prepared_binding;
+    rdma_function_binding active_binding;
+    rdma_cmq cmq;
+    rdma_cmq_runtime_desc runtime_desc;
+    rdma_dma_mapping mapping;
+    rdma_cmq_command_desc requests[];
+    rdma_cmq_command_desc request_c;
+    rdma_cmq_ticket tickets[];
+    rdma_cmq_ticket original_a;
+    rdma_cmq_ticket ticket_c;
+    rdma_cmq_ticket clone_fault_ticket;
+    rdma_cmq_clone_fault_function_handle clone_fault_function;
+    rdma_status item_statuses[];
+    rdma_status batch_status;
+    rdma_cmq_completion waited_completion;
+    rdma_cmq_completion completions[$];
+    rdma_cmq_diagnostic diagnostics[$];
+    rdma_hw_image raw_a;
+    rdma_hw_image raw_b;
+    rdma_hw_image raw_c;
+    rdma_status wait_status;
+    rdma_status status;
+    longint unsigned command_id_a;
+    longint unsigned command_id_b;
+
+    engine = rdma_cmq_engine_probe::type_id::create(
+      "wait_detached_ticket_engine"
+    );
+    mem = rdma_mock_host_mem::type_id::create("wait_detached_ticket_mem");
+    pcie = rdma_cmq_test_pcie::type_id::create(
+      "wait_detached_ticket_pcie"
+    );
+    scheduler = rdma_doorbell_scheduler::type_id::create(
+      "wait_detached_ticket_scheduler"
+    );
+    profile = rdma_cmq_test_profile::type_id::create(
+      "wait_detached_ticket_profile"
+    );
+    prepared_binding = make_binding(
+      "wait_detached_ticket_prepared", RDMA_BIND_PREPARED
+    );
+    active_binding = make_binding(
+      "wait_detached_ticket_active", RDMA_BIND_ACTIVE
+    );
+    cmq = make_cmq("wait_detached_ticket_cmq", prepared_binding);
+    prepare_active(
+      "WAIT_DETACHED_TICKET", engine, mem, pcie, scheduler, profile,
+      prepared_binding, active_binding, cmq, runtime_desc
+    );
+    mapping = engine.mapping_snapshot();
+
+    requests = new[2];
+    requests[0] = make_command(
+      "wait_detached_ticket_a", active_binding,
+      rdma_cmq_test_profile::TEST_OPCODE_A, 8'h61, 100ns
+    );
+    requests[1] = make_command(
+      "wait_detached_ticket_b", active_binding,
+      rdma_cmq_test_profile::TEST_OPCODE_B, 8'h62, 100ns
+    );
+    engine.submit_batch(requests, tickets, item_statuses, batch_status);
+    expect_status("WAIT_DETACHED_TICKET_SUBMIT", batch_status, RDMA_SC_OK);
+    if (tickets.size() != 2 || tickets[0] == null || tickets[1] == null) begin
+      `uvm_error("WAIT_DETACHED_TICKET_SUBMIT",
+                 "two-ticket mutation fixture is incomplete")
+      engine.shutdown(status);
+      return;
+    end
+    command_id_a = tickets[0].command_id;
+    command_id_b = tickets[1].command_id;
+    original_a = rdma_cmq_ticket::type_id::create(
+      "wait_detached_ticket_original_a"
+    );
+    original_a.copy(tickets[0]);
+
+    // wait_for releases the engine lock for its 1ns wait interval.  Mutate
+    // the exact caller-owned ticket handle to the other valid outstanding
+    // command during that interval, then complete B before A.
+    fork
+      begin
+        engine.wait_for(tickets[0], waited_completion, wait_status);
+      end
+      begin
+        #500ps;
+        tickets[0].copy(tickets[1]);
+        #250ps;
+        write_profile_cqe(
+          "WAIT_DETACHED_TICKET_B", mem, mapping, profile, 0, 1'b1,
+          tickets[1], 0, raw_b
+        );
+        #1ns;
+        write_profile_cqe(
+          "WAIT_DETACHED_TICKET_A", mem, mapping, profile, 1, 1'b1,
+          original_a, 0, raw_a
+        );
+      end
+    join
+    expect_status("WAIT_DETACHED_TICKET_WAIT", wait_status, RDMA_SC_OK);
+    if (waited_completion == null || waited_completion.ticket == null ||
+        waited_completion.ticket.command_id != command_id_a)
+      `uvm_error("WAIT_DETACHED_TICKET_WAIT",
+                 "wait_for followed caller mutation away from ticket A")
+
+    mem.calls.delete();
+    engine.poll(completions, diagnostics, status);
+    expect_status("WAIT_DETACHED_TICKET_POLL_B", status, RDMA_SC_OK);
+    if (completions.size() != 1 || diagnostics.size() != 0 ||
+        completions[0] == null || completions[0].ticket == null ||
+        completions[0].ticket.command_id != command_id_b)
+      `uvm_error("WAIT_DETACHED_TICKET_POLL_B",
+                 "wait_for consumed B or left A in the terminal FIFO")
+    expect_poll_read_geometry("WAIT_DETACHED_TICKET_POLL_B_READ", mem, 2, 1);
+
+    // A hostile but value-valid Function clone must be rejected before an
+    // already queued completion is consumed from the terminal FIFO.
+    request_c = make_command(
+      "wait_detached_ticket_c", active_binding,
+      rdma_cmq_test_profile::TEST_OPCODE_A, 8'h63, 100ns
+    );
+    engine.submit(request_c, ticket_c, status);
+    expect_status("WAIT_DETACHED_TICKET_SUBMIT_C", status, RDMA_SC_OK);
+    write_profile_cqe(
+      "WAIT_DETACHED_TICKET_C", mem, mapping, profile, 2, 1'b1,
+      ticket_c, 0, raw_c
+    );
+    engine.poll(completions, diagnostics, status);
+    expect_status("WAIT_DETACHED_TICKET_POLL_C", status, RDMA_SC_OK);
+    if (completions.size() != 1 || completions[0] == null ||
+        completions[0].ticket == null ||
+        completions[0].ticket.command_id != ticket_c.command_id ||
+        diagnostics.size() != 0) begin
+      `uvm_error("WAIT_DETACHED_TICKET_POLL_C",
+                 "snapshot-failure FIFO fixture did not complete C")
+      engine.shutdown(status);
+      return;
+    end
+    engine.seed_terminal_completion(completions[0]);
+    clone_fault_ticket = rdma_cmq_ticket::type_id::create(
+      "wait_detached_ticket_clone_fault"
+    );
+    clone_fault_ticket.copy(ticket_c);
+    clone_fault_function =
+      rdma_cmq_clone_fault_function_handle::type_id::create(
+        "wait_detached_ticket_clone_fault_function"
+      );
+    clone_fault_function.kind = ticket_c.function_h.kind;
+    clone_fault_function.function_uid = ticket_c.function_h.function_uid;
+    clone_fault_function.object_id = ticket_c.function_h.object_id;
+    clone_fault_function.generation = ticket_c.function_h.generation;
+    clone_fault_function.clone_fault = RDMA_CMQ_TEST_CLONE_NULL;
+    clone_fault_ticket.function_h = clone_fault_function;
+
+    mem.calls.delete();
+    engine.wait_for(clone_fault_ticket, waited_completion, status);
+    expect_status("WAIT_DETACHED_TICKET_CLONE_FAILURE", status,
+                  RDMA_SC_INVALID_STATE);
+    if (waited_completion != null || engine.terminal_fifo_count() != 1 ||
+        count_host_calls(mem, "read") != 0)
+      `uvm_error("WAIT_DETACHED_TICKET_CLONE_FAILURE",
+                 "snapshot failure consumed FIFO or touched CQ backing")
+    engine.wait_for(ticket_c, waited_completion, status);
+    expect_status("WAIT_DETACHED_TICKET_CLONE_RETRY", status, RDMA_SC_OK);
+    if (waited_completion == null || waited_completion.ticket == null ||
+        waited_completion.ticket.command_id != ticket_c.command_id ||
+        engine.terminal_fifo_count() != 0 ||
+        count_host_calls(mem, "read") != 0)
+      `uvm_error("WAIT_DETACHED_TICKET_CLONE_RETRY",
+                 "valid retry did not consume the retained FIFO item once")
+
+    engine.shutdown(status);
+    expect_status("WAIT_DETACHED_TICKET_SHUTDOWN", status, RDMA_SC_OK);
   endtask
 
   task automatic check_wait_for_fifo_and_deadline();
@@ -12304,6 +12559,7 @@ class rdma_cmq_engine_test extends uvm_test;
     check_poison_shutdown_release_retry_preserves_snapshot();
     check_wait_rejects_x_deadline_without_side_effects();
     check_wait_poison_lifecycle_boundaries();
+    check_wait_for_caller_ticket_detachment();
     check_wait_for_fifo_and_deadline();
     check_cancel_reset_and_shutdown_lifecycle();
     check_strict_cancel_audits_complete_ledger();
