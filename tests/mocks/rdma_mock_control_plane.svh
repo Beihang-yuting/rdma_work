@@ -60,6 +60,23 @@ typedef enum bit {
   RDMA_MOCK_CMQ_TIMEOUT
 } rdma_mock_cmq_outcome_kind_e;
 
+class rdma_mock_cmq_snapshot_engine extends rdma_cmq_engine;
+  `uvm_object_utils(rdma_mock_cmq_snapshot_engine)
+
+  function new(string name = "rdma_mock_cmq_snapshot_engine");
+    super.new(name);
+  endfunction
+
+  function rdma_status snapshot_command_for_mock(
+    rdma_cmq_command_desc source,
+    output rdma_cmq_command_desc snapshot,
+    output bit staging_invariant_failed
+  );
+    return snapshot_command_value(source, snapshot,
+                                  staging_invariant_failed);
+  endfunction
+endclass
+
 class rdma_mock_cmq_outcome extends uvm_object;
   `uvm_object_utils(rdma_mock_cmq_outcome)
 
@@ -81,11 +98,15 @@ class rdma_mock_cmq_port extends rdma_cmq_port;
   protected longint unsigned next_sequence;
   protected rdma_mock_cmq_outcome outcomes[bit [7:0]][$];
   protected rdma_cmq_completion late_completions[string][$];
+  protected rdma_mock_cmq_snapshot_engine snapshot_engine;
 
   function new(string name = "rdma_mock_cmq_port");
     super.new(name);
     calls.delete();
     next_sequence = 1;
+    snapshot_engine = rdma_mock_cmq_snapshot_engine::type_id::create(
+      {name, "_snapshot_engine"}
+    );
   endfunction
 
   protected function rdma_status invalid_argument(string message);
@@ -140,34 +161,34 @@ class rdma_mock_cmq_port extends rdma_cmq_port;
     rdma_cmq_command_desc source,
     output rdma_cmq_command_desc snapshot
   );
-    rdma_status validation_status;
-    uvm_object cloned_object;
+    rdma_status snapshot_status;
+    rdma_status status_copy;
+    bit staging_invariant_failed;
 
     snapshot = null;
-    if (source == null)
-      return invalid_argument("mock CMQ command is null");
-    validation_status = source.validate();
-    if (validation_status == null)
-      return invalid_state("mock CMQ command validation returned null");
-    if (!validation_status.ok())
-      return rdma_cmq_clone_status_value(validation_status);
-    cloned_object = source.clone();
-    if (cloned_object == null || !$cast(snapshot, cloned_object) ||
-        snapshot == source || snapshot.function_h == source.function_h ||
-        snapshot.opcode_key == source.opcode_key ||
-        (source.body != null && snapshot.body == source.body) ||
-        (source.qpc_signature_source != null &&
-         snapshot.qpc_signature_source == source.qpc_signature_source)) begin
+    staging_invariant_failed = 1'b0;
+    if (snapshot_engine == null)
+      return invalid_state("mock CMQ snapshot engine is unavailable");
+    snapshot_status = snapshot_engine.snapshot_command_for_mock(
+      source, snapshot, staging_invariant_failed
+    );
+    if (snapshot_status == null) begin
       snapshot = null;
-      return invalid_state("mock CMQ command snapshot is not detached");
+      return invalid_state("mock CMQ command snapshot returned null status");
     end
-    validation_status = snapshot.validate();
-    if (validation_status == null || !validation_status.ok()) begin
+    if (staging_invariant_failed) begin
       snapshot = null;
-      return (validation_status == null) ?
-        invalid_state("mock CMQ command snapshot validation returned null") :
-        rdma_cmq_clone_status_value(validation_status);
+      return invalid_state("mock CMQ command snapshot invariant failed");
     end
+    if (!snapshot_status.ok()) begin
+      snapshot = null;
+      status_copy = rdma_cmq_clone_status_value(snapshot_status);
+      return (status_copy == null) ?
+        invalid_state("mock CMQ command snapshot status copy failed") :
+        status_copy;
+    end
+    if (snapshot == null)
+      return invalid_state("mock CMQ command snapshot is null");
     return rdma_status::success();
   endfunction
 

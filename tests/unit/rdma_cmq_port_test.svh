@@ -19,6 +19,128 @@ class rdma_cmq_port_test extends rdma_cmq_engine_test;
     return binding;
   endfunction
 
+  task automatic check_mock_rejects_hostile_command_snapshots();
+    rdma_function_binding binding;
+    rdma_mock_cmq_port mock_cmq;
+    rdma_cmq_port port;
+    rdma_cmq_command_desc mutating_command;
+    rdma_cmq_command_desc alias_command;
+    rdma_cmq_command_desc recovery_command;
+    rdma_cmq_sqe_model mutating_body;
+    rdma_cmq_sqe_model alias_body;
+    rdma_cmq_clone_fault_function_handle mutating_function;
+    rdma_cmq_clone_fault_function_handle alias_function;
+    rdma_cmq_clone_fault_function_handle sibling_function;
+    rdma_function_handle saved_command_function;
+    rdma_cmq_opcode_key saved_command_opcode;
+    rdma_hw_model saved_command_body;
+    rdma_hw_image saved_command_signature;
+    rdma_function_handle saved_body_function;
+    rdma_handle saved_body_target;
+    rdma_cmq_ticket ticket;
+    rdma_cmq_completion completion;
+    rdma_status status;
+    int unsigned saved_object_id;
+    int unsigned saved_sibling_object_id;
+
+    binding = make_binding("mock_hostile_binding", RDMA_BIND_ACTIVE);
+    mock_cmq = rdma_mock_cmq_port::type_id::create("mock_hostile_cmq");
+    port = mock_cmq;
+
+    mutating_command = make_command(
+      "mock_mutating_command", binding, XTR_V1_OP_KEY_ALLOC, 8'h21, 1us
+    );
+    if (!$cast(mutating_body, mutating_command.body))
+      `uvm_fatal("MOCK_HOSTILE_SETUP", "mutating body type is invalid")
+    mutating_function =
+      rdma_cmq_clone_fault_function_handle::type_id::create(
+        "mock_mutating_function"
+      );
+    mutating_function.copy(mutating_command.function_h);
+    mutating_function.clone_fault = RDMA_CMQ_TEST_CLONE_MUTATE;
+    mutating_command.function_h = mutating_function;
+    saved_command_function = mutating_command.function_h;
+    saved_command_opcode = mutating_command.opcode_key;
+    saved_command_body = mutating_command.body;
+    saved_command_signature = mutating_command.qpc_signature_source;
+    saved_body_function = mutating_body.function_h;
+    saved_body_target = mutating_body.target_h;
+    saved_object_id = mutating_function.object_id;
+
+    port.execute(mutating_command, ticket, completion, status);
+    expect_status("MOCK_MUTATING_SNAPSHOT", status,
+                  RDMA_SC_INVALID_ARGUMENT);
+    if (ticket != null || completion != null || mock_cmq.calls.size() != 0)
+      `uvm_error("MOCK_MUTATING_EFFECTS",
+                 "mutating clone produced a ticket, completion, or call")
+    if (mutating_command.function_h != saved_command_function ||
+        mutating_command.opcode_key != saved_command_opcode ||
+        mutating_command.body != saved_command_body ||
+        mutating_command.qpc_signature_source != saved_command_signature ||
+        mutating_body.function_h != saved_body_function ||
+        mutating_body.target_h != saved_body_target ||
+        mutating_function.object_id != saved_object_id)
+      `uvm_error("MOCK_MUTATING_RESTORE",
+                 "mutating clone changed the caller-owned command graph")
+
+    alias_command = make_command(
+      "mock_alias_command", binding, XTR_V1_OP_KEY_ALLOC, 8'h22, 1us
+    );
+    if (!$cast(alias_body, alias_command.body))
+      `uvm_fatal("MOCK_HOSTILE_SETUP", "alias body type is invalid")
+    sibling_function =
+      rdma_cmq_clone_fault_function_handle::type_id::create(
+        "mock_alias_sibling_function"
+      );
+    sibling_function.copy(alias_body.function_h);
+    sibling_function.clone_fault = RDMA_CMQ_TEST_CLONE_GOOD;
+    alias_body.function_h = sibling_function;
+    alias_function = rdma_cmq_clone_fault_function_handle::type_id::create(
+      "mock_alias_function"
+    );
+    alias_function.copy(alias_command.function_h);
+    alias_function.clone_fault = RDMA_CMQ_TEST_CLONE_ALIAS;
+    alias_function.alias_target = sibling_function;
+    alias_function.alias_once = 1'b0;
+    alias_command.function_h = alias_function;
+    saved_command_function = alias_command.function_h;
+    saved_command_opcode = alias_command.opcode_key;
+    saved_command_body = alias_command.body;
+    saved_command_signature = alias_command.qpc_signature_source;
+    saved_body_function = alias_body.function_h;
+    saved_body_target = alias_body.target_h;
+    saved_object_id = alias_function.object_id;
+    saved_sibling_object_id = sibling_function.object_id;
+
+    port.execute(alias_command, ticket, completion, status);
+    expect_status("MOCK_ALIAS_SNAPSHOT", status, RDMA_SC_INVALID_ARGUMENT);
+    if (ticket != null || completion != null || mock_cmq.calls.size() != 0)
+      `uvm_error("MOCK_ALIAS_EFFECTS",
+                 "alias-laundered clone produced a ticket or call")
+    if (alias_command.function_h != saved_command_function ||
+        alias_command.opcode_key != saved_command_opcode ||
+        alias_command.body != saved_command_body ||
+        alias_command.qpc_signature_source != saved_command_signature ||
+        alias_body.function_h != saved_body_function ||
+        alias_body.target_h != saved_body_target ||
+        alias_function.object_id != saved_object_id ||
+        sibling_function.object_id != saved_sibling_object_id)
+      `uvm_error("MOCK_ALIAS_RESTORE",
+                 "alias-laundered clone changed its caller-owned source")
+
+    recovery_command = make_command(
+      "mock_hostile_recovery", binding, XTR_V1_OP_KEY_ALLOC, 8'h23, 1us
+    );
+    port.execute(recovery_command, ticket, completion, status);
+    expect_status("MOCK_HOSTILE_RECOVERY", status, RDMA_SC_OK);
+    if (ticket == null || completion == null ||
+        completion.status == null || mock_cmq.calls.size() != 1 ||
+        mock_cmq.calls[0] == null ||
+        mock_cmq.calls[0].\sequence  != 1 || ticket.command_id != 1)
+      `uvm_error("MOCK_HOSTILE_RECOVERY",
+                 "rejected snapshots advanced or polluted mock state")
+  endtask
+
   task automatic check_mock_fifo_status_and_reconcile();
     rdma_function_binding binding;
     rdma_mock_cmq_port mock_cmq;
@@ -342,6 +464,7 @@ class rdma_cmq_port_test extends rdma_cmq_engine_test;
     rdma_cmq_command_desc requests[];
     rdma_cmq_ticket tickets[];
     rdma_cmq_ticket forged_ticket;
+    rdma_cmq_ticket stale_ticket;
     rdma_status item_statuses[];
     rdma_status batch_status;
     rdma_status status;
@@ -351,6 +474,7 @@ class rdma_cmq_port_test extends rdma_cmq_engine_test;
     rdma_dma_mapping mapping;
     rdma_hw_image first_raw;
     rdma_hw_image second_raw;
+    rdma_hw_image third_raw;
     bit terminal_known;
 
     engine = rdma_cmq_engine_probe::type_id::create("reconcile_engine");
@@ -366,72 +490,117 @@ class rdma_cmq_port_test extends rdma_cmq_engine_test;
     cmq = make_cmq("reconcile_cmq", prepared_binding);
     prepare_active("RECONCILE", engine, mem, pcie, scheduler, profile,
                    prepared_binding, active_binding, cmq, runtime_desc);
-    requests = new[2];
+    requests = new[3];
     requests[0] = make_command("reconcile_first", active_binding,
                                rdma_cmq_test_profile::TEST_OPCODE_A,
                                8'h61, 5ns);
     requests[1] = make_command("reconcile_second", active_binding,
                                rdma_cmq_test_profile::TEST_OPCODE_B,
                                8'h62, 5ns);
+    requests[2] = make_command("reconcile_third", active_binding,
+                               rdma_cmq_test_profile::TEST_OPCODE_A,
+                               8'h63, 5ns);
     engine.submit_batch(requests, tickets, item_statuses, batch_status);
     expect_status("RECONCILE_SUBMIT", batch_status, RDMA_SC_OK);
-    if (tickets.size() != 2 || tickets[0] == null || tickets[1] == null) begin
-      `uvm_error("RECONCILE_SUBMIT", "two timeout tickets were not produced")
+    if (tickets.size() != 3 || tickets[0] == null || tickets[1] == null ||
+        tickets[2] == null) begin
+      `uvm_error("RECONCILE_SUBMIT", "three timeout tickets were not produced")
       engine.shutdown(status);
       return;
     end
     mapping = engine.mapping_snapshot();
     #10ns;
 
-    forged_ticket = rdma_cmq_clone_ticket_value(tickets[0],
+    forged_ticket = rdma_cmq_clone_ticket_value(tickets[1],
                                                 "reconcile forged");
     forged_ticket.command_id += 32;
     engine.reconcile_ticket(forged_ticket, terminal_known, completion, status);
     expect_status("RECONCILE_FORGED", status, RDMA_SC_INVALID_ARGUMENT);
     if (terminal_known || completion != null ||
         engine.terminal_fifo_count() != 0 ||
-        engine.quarantine_count() != 0 || engine.outstanding_count() != 2)
+        engine.diagnostic_fifo_count() != 0 ||
+        engine.quarantine_count() != 0 || engine.outstanding_count() != 3 ||
+        engine.cq_consumed_count() != 0 || engine.retired_count() != 0)
       `uvm_error("RECONCILE_FORGED_ISOLATION",
                  "forged ticket changed unrelated engine authority")
 
-    engine.reconcile_ticket(tickets[0], terminal_known, completion, status);
-    expect_status("RECONCILE_FIRST_TIMEOUT", status, RDMA_SC_TIMEOUT);
+    stale_ticket = rdma_cmq_clone_ticket_value(tickets[1],
+                                               "reconcile stale");
+    stale_ticket.function_h.generation++;
+    stale_ticket.cmq_h.generation++;
+    engine.reconcile_ticket(stale_ticket, terminal_known, completion, status);
+    expect_status("RECONCILE_STALE", status, RDMA_SC_INVALID_ARGUMENT);
+    if (terminal_known || completion != null ||
+        engine.terminal_fifo_count() != 0 ||
+        engine.diagnostic_fifo_count() != 0 ||
+        engine.quarantine_count() != 0 || engine.outstanding_count() != 3 ||
+        engine.cq_consumed_count() != 0 || engine.retired_count() != 0)
+      `uvm_error("RECONCILE_STALE_ISOLATION",
+                 "stale ticket changed unrelated engine authority")
+
+    engine.reconcile_ticket(tickets[1], terminal_known, completion, status);
+    expect_status("RECONCILE_MIDDLE_TIMEOUT", status, RDMA_SC_TIMEOUT);
     if (!terminal_known || completion == null || completion.status == null ||
         completion.ticket == null ||
-        completion.ticket.command_id != tickets[0].command_id ||
-        engine.terminal_fifo_count() != 1 ||
-        engine.quarantine_count() != 2 || engine.outstanding_count() != 0)
+        completion.ticket.command_id != tickets[1].command_id ||
+        completion.status.code != RDMA_SC_TIMEOUT ||
+        completion.raw_cqe != null ||
+        engine.terminal_fifo_count() != 2 ||
+        engine.diagnostic_fifo_count() != 0 ||
+        engine.quarantine_count() != 3 || engine.outstanding_count() != 0 ||
+        engine.cq_consumed_count() != 0 || engine.retired_count() != 0)
       `uvm_error("RECONCILE_TIMEOUT_ISOLATION",
-                 "first reconcile consumed or changed second timeout state")
+                 "middle reconcile changed outer terminal FIFO entries")
 
     write_profile_cqe("RECONCILE_LATE_FIRST", mem, mapping, profile,
                       0, 1'b1, tickets[0], 0, first_raw);
-    engine.reconcile_ticket(tickets[0], terminal_known, completion, status);
-    expect_status("RECONCILE_FIRST_LATE", status, RDMA_SC_TIMEOUT);
-    if (!terminal_known || completion == null || completion.status == null ||
-        completion.raw_cqe == null || completion.ticket == null ||
-        completion.ticket.command_id != tickets[0].command_id ||
-        engine.terminal_fifo_count() != 1 ||
-        engine.diagnostic_fifo_count() != 0 ||
-        engine.quarantine_count() != 1 ||
-        engine.cq_consumed_count() != 1 || engine.retired_count() != 1)
-      `uvm_error("RECONCILE_LATE_ISOLATION",
-                 "ticket-specific late reconcile consumed second state")
-
     write_profile_cqe("RECONCILE_LATE_SECOND", mem, mapping, profile,
                       1, 1'b1, tickets[1], 0, second_raw);
+    write_profile_cqe("RECONCILE_LATE_THIRD", mem, mapping, profile,
+                      2, 1'b1, tickets[2], 0, third_raw);
+    engine.reconcile_ticket(tickets[1], terminal_known, completion, status);
+    expect_status("RECONCILE_MIDDLE_LATE", status, RDMA_SC_TIMEOUT);
+    if (!terminal_known || completion == null || completion.status == null ||
+        completion.raw_cqe == null || completion.ticket == null ||
+        completion.ticket.command_id != tickets[1].command_id ||
+        completion.status.code != RDMA_SC_TIMEOUT ||
+        !engine.probe_same_image(completion.raw_cqe, second_raw) ||
+        engine.terminal_fifo_count() != 2 ||
+        engine.diagnostic_fifo_count() != 2 ||
+        engine.quarantine_count() != 0 ||
+        engine.cq_consumed_count() != 3 || engine.retired_count() != 3)
+      `uvm_error("RECONCILE_LATE_ISOLATION",
+                 "middle reconcile changed outer diagnostic FIFO entries")
+
     engine.poll(completions, diagnostics, status);
-    expect_status("RECONCILE_SECOND_POLL", status, RDMA_SC_OK);
-    if (completions.size() != 1 || diagnostics.size() != 1 ||
+    expect_status("RECONCILE_OUTER_POLL", status, RDMA_SC_OK);
+    if (completions.size() != 2 || diagnostics.size() != 2 ||
         completions[0] == null || completions[0].ticket == null ||
-        completions[0].ticket.command_id != tickets[1].command_id ||
+        completions[0].status == null ||
+        completions[1] == null || completions[1].ticket == null ||
+        completions[1].status == null ||
+        completions[0].ticket.command_id != tickets[0].command_id ||
+        completions[1].ticket.command_id != tickets[2].command_id ||
+        completions[0].status.code != RDMA_SC_TIMEOUT ||
+        completions[1].status.code != RDMA_SC_TIMEOUT ||
+        completions[0].raw_cqe != null || completions[1].raw_cqe != null ||
         diagnostics[0] == null || diagnostics[0].ticket == null ||
-        diagnostics[0].ticket.command_id != tickets[1].command_id ||
+        diagnostics[0].status == null || diagnostics[0].raw_cqe == null ||
+        diagnostics[1] == null || diagnostics[1].ticket == null ||
+        diagnostics[1].status == null || diagnostics[1].raw_cqe == null ||
+        diagnostics[0].ticket.command_id != tickets[0].command_id ||
+        diagnostics[1].ticket.command_id != tickets[2].command_id ||
+        diagnostics[0].kind != RDMA_CMQ_DIAG_LATE_COMPLETION ||
+        diagnostics[1].kind != RDMA_CMQ_DIAG_LATE_COMPLETION ||
+        !engine.probe_same_image(diagnostics[0].raw_cqe, first_raw) ||
+        !engine.probe_same_image(diagnostics[1].raw_cqe, third_raw) ||
         engine.terminal_fifo_count() != 0 ||
         engine.diagnostic_fifo_count() != 0 ||
-        engine.quarantine_count() != 0)
-      `uvm_error("RECONCILE_SECOND_ORDER",
-                 "second ticket terminal/diagnostic ordering was not retained")
+        engine.quarantine_count() != 0 ||
+        engine.outstanding_count() != 0 ||
+        engine.cq_consumed_count() != 3 || engine.retired_count() != 3)
+      `uvm_error("RECONCILE_OUTER_ORDER",
+                 "A/C terminal or diagnostic FIFO order was not retained")
 
     engine.shutdown(status);
     expect_status("RECONCILE_SHUTDOWN", status, RDMA_SC_OK);
@@ -439,6 +608,7 @@ class rdma_cmq_port_test extends rdma_cmq_engine_test;
 
   virtual task run_phase(uvm_phase phase);
     phase.raise_objection(this);
+    check_mock_rejects_hostile_command_snapshots();
     check_mock_fifo_status_and_reconcile();
     check_adapter_routes_real_engines_by_generation();
     check_real_engine_ticket_specific_reconcile();
