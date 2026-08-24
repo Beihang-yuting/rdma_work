@@ -804,11 +804,45 @@ endclass
 class rdma_rm_owned_alias_mapping extends rdma_dma_mapping;
   `uvm_object_utils(rdma_rm_owned_alias_mapping)
 
+  int unsigned clone_calls;
+  local longint unsigned allocation_token;
+  local static longint unsigned next_allocation_token = 1;
+
   function new(string name = "rdma_rm_owned_alias_mapping");
     super.new(name);
+    clone_calls = 0;
+    allocation_token = next_allocation_token;
+    next_allocation_token++;
+  endfunction
+
+  virtual function rdma_status snapshot_release_authority(
+    output rdma_dma_mapping snapshot
+  );
+    rdma_rm_owned_alias_mapping candidate;
+
+    candidate = rdma_rm_owned_alias_mapping::type_id::create(
+      {get_name(), "_authority"}
+    );
+    candidate.allocation_token = allocation_token;
+    snapshot = candidate;
+    return rdma_status::success();
+  endfunction
+
+  virtual function rdma_status release_authority_status(
+    rdma_dma_mapping snapshot
+  );
+    rdma_rm_owned_alias_mapping candidate;
+
+    if (!$cast(candidate, snapshot) || candidate == null ||
+        candidate.allocation_token != allocation_token)
+      return rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT, "test alias allocation authority changed"
+      );
+    return rdma_status::success();
   endfunction
 
   virtual function uvm_object clone();
+    clone_calls++;
     return this;
   endfunction
 endclass
@@ -816,19 +850,268 @@ endclass
 class rdma_rm_owned_drift_mapping extends rdma_dma_mapping;
   `uvm_object_utils(rdma_rm_owned_drift_mapping)
 
+  int unsigned clone_calls;
+  local longint unsigned allocation_token;
+  local static longint unsigned next_allocation_token = 1;
+
   function new(string name = "rdma_rm_owned_drift_mapping");
     super.new(name);
+    clone_calls = 0;
+    allocation_token = next_allocation_token;
+    next_allocation_token++;
+  endfunction
+
+  virtual function rdma_status snapshot_release_authority(
+    output rdma_dma_mapping snapshot
+  );
+    rdma_rm_owned_drift_mapping candidate;
+
+    candidate = rdma_rm_owned_drift_mapping::type_id::create(
+      {get_name(), "_authority"}
+    );
+    candidate.allocation_token = allocation_token;
+    snapshot = candidate;
+    return rdma_status::success();
+  endfunction
+
+  virtual function rdma_status release_authority_status(
+    rdma_dma_mapping snapshot
+  );
+    rdma_rm_owned_drift_mapping candidate;
+
+    if (!$cast(candidate, snapshot) || candidate == null ||
+        candidate.allocation_token != allocation_token)
+      return rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT, "test drift allocation authority changed"
+      );
+    return rdma_status::success();
+  endfunction
+
+  virtual function void do_copy(uvm_object rhs);
+    rdma_rm_owned_drift_mapping rhs_mapping;
+
+    super.do_copy(rhs);
+    if (!$cast(rhs_mapping, rhs) || rhs_mapping == null)
+      `uvm_fatal("RM_OWNED_COPY", "drift mapping copy cast failed")
+    allocation_token = rhs_mapping.allocation_token;
   endfunction
 
   virtual function uvm_object clone();
     uvm_object cloned_object;
     rdma_rm_owned_drift_mapping result;
 
+    clone_calls++;
     cloned_object = super.clone();
     if (!$cast(result, cloned_object))
       `uvm_fatal("RM_OWNED_CLONE", "drift mapping clone cast failed")
     result.size++;
     return result;
+  endfunction
+endclass
+
+// Registered exact-type clone whose public fields remain stable while its
+// controlled do_copy() override silently drops private release authority.
+class rdma_rm_owned_authority_loss_mapping extends rdma_dma_mapping;
+  `uvm_object_utils(rdma_rm_owned_authority_loss_mapping)
+
+  local longint unsigned allocation_token;
+  local bit allocation_token_initialized;
+  local bit drop_allocation_token_on_copy;
+
+  function new(string name = "rdma_rm_owned_authority_loss_mapping");
+    super.new(name);
+    allocation_token = 0;
+    allocation_token_initialized = 1'b0;
+    drop_allocation_token_on_copy = 1'b1;
+  endfunction
+
+  function void initialize_allocation_token(longint unsigned token);
+    allocation_token = token;
+    allocation_token_initialized = 1'b1;
+  endfunction
+
+  function void set_drop_allocation_token_on_copy(bit drop_token);
+    drop_allocation_token_on_copy = drop_token;
+  endfunction
+
+  virtual function void do_copy(uvm_object rhs);
+    rdma_rm_owned_authority_loss_mapping rhs_mapping;
+
+    super.do_copy(rhs);
+    if (!$cast(rhs_mapping, rhs) || rhs_mapping == null)
+      `uvm_fatal("RM_OWNED_COPY", "authority-loss mapping copy cast failed")
+    drop_allocation_token_on_copy =
+      rhs_mapping.drop_allocation_token_on_copy;
+    if (!rhs_mapping.drop_allocation_token_on_copy) begin
+      allocation_token = rhs_mapping.allocation_token;
+      allocation_token_initialized = rhs_mapping.allocation_token_initialized;
+    end
+  endfunction
+
+  virtual function rdma_status snapshot_release_authority(
+    output rdma_dma_mapping snapshot
+  );
+    rdma_rm_owned_authority_loss_mapping candidate;
+
+    snapshot = null;
+    if (!allocation_token_initialized)
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE, "test allocation token is not initialized"
+      );
+    candidate = rdma_rm_owned_authority_loss_mapping::type_id::create(
+      {get_name(), "_authority"}
+    );
+    candidate.allocation_token = allocation_token;
+    candidate.allocation_token_initialized = 1'b1;
+    snapshot = candidate;
+    return rdma_status::success();
+  endfunction
+
+  virtual function rdma_status release_authority_status(
+    rdma_dma_mapping snapshot
+  );
+    rdma_rm_owned_authority_loss_mapping candidate;
+
+    if (!$cast(candidate, snapshot) || candidate == null ||
+        !allocation_token_initialized ||
+        !candidate.allocation_token_initialized ||
+        allocation_token != candidate.allocation_token)
+      return rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT, "test allocation authority changed"
+      );
+    return rdma_status::success();
+  endfunction
+endclass
+
+typedef enum bit [1:0] {
+  RDMA_RM_AUTHORITY_HOOK_STABLE,
+  RDMA_RM_AUTHORITY_HOOK_MUTATE_SOURCE,
+  RDMA_RM_AUTHORITY_HOOK_MUTATE_RESULT,
+  RDMA_RM_AUTHORITY_HOOK_MUTATE_COMPLETION
+} rdma_rm_authority_hook_fault_e;
+
+class rdma_rm_authority_hook_controller extends uvm_object;
+  rdma_rm_authority_hook_fault_e fault;
+  rdma_dma_mapping original;
+  rdma_dma_mapping clone_result;
+
+  function new(string name = "rdma_rm_authority_hook_controller");
+    super.new(name);
+    fault = RDMA_RM_AUTHORITY_HOOK_STABLE;
+    original = null;
+    clone_result = null;
+  endfunction
+endclass
+
+// A registered mapping whose authority comparison remains successful while a
+// selected virtual hook mutates a public value field.
+class rdma_rm_owned_authority_hook_mapping extends rdma_dma_mapping;
+  `uvm_object_utils(rdma_rm_owned_authority_hook_mapping)
+
+  local longint unsigned allocation_token;
+  local bit allocation_token_initialized;
+  local rdma_rm_authority_hook_controller controller;
+
+  function new(string name = "rdma_rm_owned_authority_hook_mapping");
+    super.new(name);
+    allocation_token = 0;
+    allocation_token_initialized = 1'b0;
+    controller = null;
+  endfunction
+
+  function void initialize_allocation_token(longint unsigned token);
+    allocation_token = token;
+    allocation_token_initialized = 1'b1;
+    controller = new({get_name(), "_controller"});
+    controller.original = this;
+  endfunction
+
+  function void set_authority_hook_fault(
+    rdma_rm_authority_hook_fault_e fault
+  );
+    if (controller == null)
+      `uvm_fatal("RM_AUTHORITY_HOOK", "hook controller is not initialized")
+    controller.fault = fault;
+  endfunction
+
+  virtual function rdma_status snapshot_release_authority(
+    output rdma_dma_mapping snapshot
+  );
+    rdma_rm_owned_authority_hook_mapping candidate;
+
+    snapshot = null;
+    if (!allocation_token_initialized)
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE, "test allocation token is not initialized"
+      );
+    candidate = rdma_rm_owned_authority_hook_mapping::type_id::create(
+      {get_name(), "_authority"}
+    );
+    candidate.allocation_token = allocation_token;
+    candidate.allocation_token_initialized = 1'b1;
+    snapshot = candidate;
+    return rdma_status::success();
+  endfunction
+
+  virtual function rdma_status release_authority_status(
+    rdma_dma_mapping snapshot
+  );
+    rdma_rm_owned_authority_hook_mapping candidate;
+
+    if (!$cast(candidate, snapshot) || candidate == null ||
+        !allocation_token_initialized ||
+        !candidate.allocation_token_initialized ||
+        allocation_token != candidate.allocation_token)
+      return rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT, "test allocation authority changed"
+      );
+    if (controller != null) begin
+      if (controller.fault == RDMA_RM_AUTHORITY_HOOK_MUTATE_SOURCE &&
+          this == controller.original)
+        size++;
+      else if (controller.fault == RDMA_RM_AUTHORITY_HOOK_MUTATE_RESULT &&
+               this == controller.clone_result)
+        size++;
+    end
+    return rdma_status::success();
+  endfunction
+
+  virtual function rdma_status release_completion_status(
+    output bit release_complete
+  );
+    release_complete = 1'b0;
+    if (controller == null)
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE, "hook controller is not initialized"
+      );
+    if (controller.fault == RDMA_RM_AUTHORITY_HOOK_MUTATE_COMPLETION) begin
+      size++;
+      release_complete = 1'b1;
+    end
+    return rdma_status::success();
+  endfunction
+
+  virtual function uvm_object clone();
+    uvm_object cloned_object;
+    rdma_rm_owned_authority_hook_mapping result;
+
+    cloned_object = super.clone();
+    if (!$cast(result, cloned_object) || result == null)
+      `uvm_fatal("RM_AUTHORITY_HOOK", "hook mapping clone cast failed")
+    if (controller != null)
+      controller.clone_result = result;
+    return result;
+  endfunction
+
+  virtual function void do_copy(uvm_object rhs);
+    rdma_rm_owned_authority_hook_mapping rhs_mapping;
+
+    super.do_copy(rhs);
+    if (!$cast(rhs_mapping, rhs) || rhs_mapping == null)
+      `uvm_fatal("RM_AUTHORITY_HOOK", "hook mapping copy cast failed")
+    allocation_token = rhs_mapping.allocation_token;
+    allocation_token_initialized = rhs_mapping.allocation_token_initialized;
+    controller = rhs_mapping.controller;
   endfunction
 endclass
 
@@ -1340,11 +1623,14 @@ class rdma_resource_manager_test extends uvm_test;
     rdma_dma_mapping mappings[$];
     rdma_rm_owned_alias_mapping alias_mapping;
     rdma_rm_owned_drift_mapping drift_mapping;
+    rdma_rm_owned_authority_loss_mapping authority_loss_mapping;
+    rdma_rm_owned_authority_hook_mapping hook_mapping;
     rdma_rm_unregistered_mapping unregistered_mapping;
     rdma_rm_stable_unregistered_mapping stable_unregistered_mapping;
     rdma_dma_mapping base_mapping;
     string mapping_labels[$];
     rdma_backing_ref backing_ref;
+    longint unsigned hook_mapping_size;
 
     contract_rm = rdma_resource_manager::type_id::create(
       "owned_clone_contract_rm"
@@ -1372,6 +1658,13 @@ class rdma_resource_manager_test extends uvm_test;
     );
     mappings.push_back(drift_mapping);
     mapping_labels.push_back("DRIFT");
+    authority_loss_mapping =
+      rdma_rm_owned_authority_loss_mapping::type_id::create(
+        "owned_authority_loss_mapping"
+      );
+    authority_loss_mapping.initialize_allocation_token(64'hca10_a110_c001);
+    mappings.push_back(authority_loss_mapping);
+    mapping_labels.push_back("PRIVATE_AUTHORITY_LOSS");
     unregistered_mapping = new("owned_unregistered_mapping");
     mappings.push_back(unregistered_mapping);
     mapping_labels.push_back("MUTATING_UNREGISTERED");
@@ -1413,6 +1706,12 @@ class rdma_resource_manager_test extends uvm_test;
         {"OWNED_CLONE_CONTRACT_REJECT_", mapping_labels[i]},
         contract_rm.stage_allocated(candidate), RDMA_SC_INVALID_ARGUMENT
       );
+      if (i == 0 && alias_mapping.clone_calls != 1)
+        `uvm_error("OWNED_CLONE_CONTRACT_ALIAS_REACH",
+                   "alias rejection did not reach the custom clone fault")
+      if (i == 1 && drift_mapping.clone_calls != 1)
+        `uvm_error("OWNED_CLONE_CONTRACT_DRIFT_REACH",
+                   "drift rejection did not reach the custom clone fault")
       expect_status(
         {"OWNED_CLONE_CONTRACT_LOOKUP_", mapping_labels[i]},
         contract_rm.lookup(candidate.handle, resource), RDMA_SC_OK
@@ -1422,6 +1721,165 @@ class rdma_resource_manager_test extends uvm_test;
         `uvm_error("OWNED_CLONE_CONTRACT_ATOMIC",
                    "rejected owned clone changed the canonical MR")
     end
+
+    // The same private-authority check must run on the later commit copy.
+    // Preserve the token while staging, then drop it only for commit and prove
+    // both the canonical value and its staged marker remain retryable.
+    authority_loss_mapping =
+      rdma_rm_owned_authority_loss_mapping::type_id::create(
+        "owned_commit_authority_loss_mapping"
+      );
+    authority_loss_mapping.initialize_allocation_token(64'hca10_a110_c002);
+    authority_loss_mapping.set_drop_allocation_token_on_copy(1'b0);
+    authority_loss_mapping.function_h = contract_binding.make_handle();
+    authority_loss_mapping.requester_bdf = contract_binding.pcie.bdf;
+    authority_loss_mapping.backing_addr.value = 64'hca10_1000_0006_0000;
+    authority_loss_mapping.iova.value = 64'hca10_2000_0006_0000;
+    authority_loss_mapping.size = 64'h2000;
+    authority_loss_mapping.direction = RDMA_DMA_BIDIRECTIONAL;
+    authority_loss_mapping.permissions =
+      '{device_read:1'b1, device_write:1'b1, atomic:1'b0};
+    authority_loss_mapping.state = RDMA_MAPPING_ACTIVE;
+    authority_loss_mapping.owner_h = null;
+
+    expect_status(
+      "OWNED_CLONE_COMMIT_CREATE",
+      contract_rm.create_mr(contract_binding, contract_pd.handle, candidate),
+      RDMA_SC_OK
+    );
+    prepare_mr(candidate, authority_loss_mapping.iova.value);
+    backing_ref = rdma_backing_ref::type_id::create(
+      "owned_clone_commit_authority_loss_ref"
+    );
+    backing_ref.mapping = authority_loss_mapping;
+    backing_ref.ownership = RDMA_OWNERSHIP_CONTROL_PLANE;
+    candidate.backing_refs.push_back(backing_ref);
+    expect_status(
+      "OWNED_CLONE_COMMIT_STAGE",
+      contract_rm.stage_allocated(candidate), RDMA_SC_OK
+    );
+
+    authority_loss_mapping.set_drop_allocation_token_on_copy(1'b1);
+    expect_status(
+      "OWNED_CLONE_COMMIT_REJECT_PRIVATE_AUTHORITY_LOSS",
+      contract_rm.commit_programmed(candidate), RDMA_SC_INVALID_ARGUMENT
+    );
+    expect_status(
+      "OWNED_CLONE_COMMIT_LOOKUP_AFTER_REJECT",
+      contract_rm.lookup(candidate.handle, resource), RDMA_SC_OK
+    );
+    if (resource == null || resource.state != RDMA_RESOURCE_ALLOCATED ||
+        resource.backing_refs.size() != 1 ||
+        resource.backing_refs[0] == null ||
+        resource.backing_refs[0].mapping == null ||
+        resource.backing_refs[0].mapping.iova.value !=
+          authority_loss_mapping.iova.value ||
+        resource.backing_refs[0].mapping.state != RDMA_MAPPING_ACTIVE)
+      `uvm_error("OWNED_CLONE_COMMIT_ATOMIC",
+                 "rejected commit changed the canonical staged MR")
+
+    authority_loss_mapping.set_drop_allocation_token_on_copy(1'b0);
+    expect_status(
+      "OWNED_CLONE_COMMIT_RETRY",
+      contract_rm.commit_programmed(candidate), RDMA_SC_OK
+    );
+
+    hook_mapping = rdma_rm_owned_authority_hook_mapping::type_id::create(
+      "owned_source_authority_hook_mapping"
+    );
+    hook_mapping.initialize_allocation_token(64'hca10_a110_c003);
+    hook_mapping.function_h = contract_binding.make_handle();
+    hook_mapping.requester_bdf = contract_binding.pcie.bdf;
+    hook_mapping.backing_addr.value = 64'hca10_1000_0007_0000;
+    hook_mapping.iova.value = 64'hca10_2000_0007_0000;
+    hook_mapping.size = 64'h2000;
+    hook_mapping.direction = RDMA_DMA_BIDIRECTIONAL;
+    hook_mapping.permissions =
+      '{device_read:1'b1, device_write:1'b1, atomic:1'b0};
+    hook_mapping.state = RDMA_MAPPING_ACTIVE;
+    hook_mapping.owner_h = null;
+    expect_status(
+      "OWNED_SOURCE_HOOK_CREATE",
+      contract_rm.create_mr(contract_binding, contract_pd.handle, candidate),
+      RDMA_SC_OK
+    );
+    prepare_mr(candidate, hook_mapping.iova.value);
+    backing_ref = rdma_backing_ref::type_id::create(
+      "owned_source_authority_hook_ref"
+    );
+    backing_ref.mapping = hook_mapping;
+    backing_ref.ownership = RDMA_OWNERSHIP_CONTROL_PLANE;
+    candidate.backing_refs.push_back(backing_ref);
+    hook_mapping_size = hook_mapping.size;
+    hook_mapping.set_authority_hook_fault(
+      RDMA_RM_AUTHORITY_HOOK_MUTATE_SOURCE
+    );
+    expect_status(
+      "OWNED_SOURCE_HOOK_REJECT",
+      contract_rm.stage_allocated(candidate), RDMA_SC_INVALID_ARGUMENT
+    );
+    hook_mapping.set_authority_hook_fault(RDMA_RM_AUTHORITY_HOOK_STABLE);
+    expect_status(
+      "OWNED_SOURCE_HOOK_LOOKUP",
+      contract_rm.lookup(candidate.handle, resource), RDMA_SC_OK
+    );
+    if (hook_mapping.size != hook_mapping_size + 1 || resource == null ||
+        resource.state != RDMA_RESOURCE_ALLOCATED ||
+        resource.backing_refs.size() != 0)
+      `uvm_error("OWNED_SOURCE_HOOK_ATOMIC",
+                 "source hook mutation entered the canonical MR")
+
+    hook_mapping = rdma_rm_owned_authority_hook_mapping::type_id::create(
+      "owned_result_authority_hook_mapping"
+    );
+    hook_mapping.initialize_allocation_token(64'hca10_a110_c004);
+    hook_mapping.function_h = contract_binding.make_handle();
+    hook_mapping.requester_bdf = contract_binding.pcie.bdf;
+    hook_mapping.backing_addr.value = 64'hca10_1000_0008_0000;
+    hook_mapping.iova.value = 64'hca10_2000_0008_0000;
+    hook_mapping.size = 64'h2000;
+    hook_mapping.direction = RDMA_DMA_BIDIRECTIONAL;
+    hook_mapping.permissions =
+      '{device_read:1'b1, device_write:1'b1, atomic:1'b0};
+    hook_mapping.state = RDMA_MAPPING_ACTIVE;
+    hook_mapping.owner_h = null;
+    expect_status(
+      "OWNED_RESULT_HOOK_CREATE",
+      contract_rm.create_mr(contract_binding, contract_pd.handle, candidate),
+      RDMA_SC_OK
+    );
+    prepare_mr(candidate, hook_mapping.iova.value);
+    backing_ref = rdma_backing_ref::type_id::create(
+      "owned_result_authority_hook_ref"
+    );
+    backing_ref.mapping = hook_mapping;
+    backing_ref.ownership = RDMA_OWNERSHIP_CONTROL_PLANE;
+    candidate.backing_refs.push_back(backing_ref);
+    expect_status(
+      "OWNED_RESULT_HOOK_STAGE",
+      contract_rm.stage_allocated(candidate), RDMA_SC_OK
+    );
+    hook_mapping_size = hook_mapping.size;
+    hook_mapping.set_authority_hook_fault(
+      RDMA_RM_AUTHORITY_HOOK_MUTATE_RESULT
+    );
+    expect_status(
+      "OWNED_RESULT_HOOK_COMMIT_REJECT",
+      contract_rm.commit_programmed(candidate), RDMA_SC_INVALID_ARGUMENT
+    );
+    hook_mapping.set_authority_hook_fault(RDMA_RM_AUTHORITY_HOOK_STABLE);
+    expect_status(
+      "OWNED_RESULT_HOOK_LOOKUP",
+      contract_rm.lookup(candidate.handle, resource), RDMA_SC_OK
+    );
+    if (hook_mapping.size != hook_mapping_size || resource == null ||
+        resource.state != RDMA_RESOURCE_ALLOCATED ||
+        resource.backing_refs.size() != 1 ||
+        resource.backing_refs[0] == null ||
+        resource.backing_refs[0].mapping == null ||
+        resource.backing_refs[0].mapping.size != hook_mapping_size)
+      `uvm_error("OWNED_RESULT_HOOK_ATOMIC",
+                 "result hook mutation entered caller or canonical MR")
   endtask
 
   task automatic check_owned_mapping_capability_snapshots();
@@ -1575,6 +2033,191 @@ class rdma_resource_manager_test extends uvm_test;
     if (capability_mem.live_allocations() != 0)
       `uvm_error("OWNED_CAPABILITY_RELEASE_COUNT",
                  "canonical snapshots did not release each allocation once")
+  endtask
+
+  task automatic check_reserved_error_completion_proof();
+    rdma_resource_manager proof_rm;
+    rdma_mock_host_mem proof_mem;
+    rdma_function_binding proof_binding;
+    rdma_dma_request_context proof_context;
+    rdma_pd proof_pd;
+    rdma_mr proof_mr;
+    rdma_mr completion_hook_mr;
+    rdma_dma_mapping proof_mapping;
+    rdma_dma_mapping wrong_mapping;
+    rdma_dma_mapping forged_mapping;
+    rdma_rm_owned_authority_hook_mapping completion_hook_mapping;
+    rdma_backing_ref proof_ref;
+    rdma_backing_ref completion_hook_ref;
+    rdma_recovery_record recovery;
+    rdma_recovery_record recovery_lookup;
+    rdma_resource resource;
+    rdma_status status;
+
+    proof_rm = rdma_resource_manager::type_id::create(
+      "reserved_error_proof_rm"
+    );
+    proof_mem = rdma_mock_host_mem::type_id::create(
+      "reserved_error_proof_mem"
+    );
+    proof_binding = make_active_binding(
+      "reserved_error_proof_binding", 64'hca12_0000_0000_0001,
+      32'hca12_0101, 32'd92
+    );
+    proof_context = rdma_dma_request_context::type_id::create(
+      "reserved_error_proof_context"
+    );
+    proof_context.function_h = proof_binding.make_handle();
+    proof_context.requester_bdf = proof_binding.pcie.bdf;
+    proof_context.owner_h = null;
+
+    expect_status("RESERVED_PROOF_PD_CREATE",
+                  proof_rm.create_pd(proof_binding, proof_pd), RDMA_SC_OK);
+    expect_status("RESERVED_PROOF_PD_ACTIVATE",
+                  proof_rm.activate(proof_pd.handle), RDMA_SC_OK);
+    status = proof_mem.allocate(proof_context, 4096, 4096,
+                                RDMA_DMA_BIDIRECTIONAL, proof_mapping);
+    expect_status("RESERVED_PROOF_ALLOCATE", status, RDMA_SC_OK);
+    status = proof_mem.allocate(proof_context, 4096, 4096,
+                                RDMA_DMA_BIDIRECTIONAL, wrong_mapping);
+    expect_status("RESERVED_PROOF_WRONG_ALLOCATE", status, RDMA_SC_OK);
+    expect_status("RESERVED_PROOF_MR_CREATE",
+                  proof_rm.create_mr(proof_binding, proof_pd.handle,
+                                     proof_mr), RDMA_SC_OK);
+    proof_ref = rdma_backing_ref::type_id::create("reserved_proof_ref");
+    proof_ref.mapping = proof_mapping;
+    proof_ref.ownership = RDMA_OWNERSHIP_CONTROL_PLANE;
+    recovery = rdma_recovery_record::type_id::create(
+      "reserved_proof_recovery"
+    );
+    recovery.resource_h = clone_handle("RESERVED_PROOF_H", proof_mr.handle);
+    recovery.hardware_presence = RDMA_HW_PRESENCE_ABSENT;
+    recovery.pending_steps.push_back(RDMA_CTRL_STEP_BACKING_RELEASED);
+    recovery.backing_refs.push_back(proof_ref);
+    recovery.primary_status = rdma_status::make(
+      RDMA_SC_UNKNOWN_HW_ERROR, "reserved proof setup"
+    );
+    expect_status("RESERVED_PROOF_MARK",
+                  proof_rm.mark_reserved_error(proof_mr.handle, recovery),
+                  RDMA_SC_OK);
+
+    expect_status("RESERVED_PROOF_FORGED_LOOKUP",
+                  proof_rm.lookup_recovery(proof_mr.handle, recovery_lookup),
+                  RDMA_SC_OK);
+    forged_mapping = null;
+    if (recovery_lookup != null &&
+        recovery_lookup.backing_refs.size() == 1 &&
+        recovery_lookup.backing_refs[0] != null)
+      forged_mapping = recovery_lookup.backing_refs[0].mapping;
+    if (forged_mapping == null)
+      `uvm_fatal("RESERVED_PROOF_FORGED_LOOKUP",
+                 "forged-proof setup lost the retained mapping")
+    forged_mapping.state = RDMA_MAPPING_RELEASED;
+    expect_status("RESERVED_PROOF_FORGED_RELEASE_REJECT",
+                  proof_rm.complete_reserved_error(proof_mr.handle),
+                  RDMA_SC_INVALID_ARGUMENT);
+    if (proof_mem.live_allocations() != 2)
+      `uvm_error("RESERVED_PROOF_FORGED_ALLOCATION",
+                 "forged public state discarded a live allocation")
+
+    expect_status("RESERVED_PROOF_LIVE_REJECT",
+                  proof_rm.complete_reserved_error(proof_mr.handle),
+                  RDMA_SC_INVALID_ARGUMENT);
+    status = proof_mem.\release (wrong_mapping);
+    expect_status("RESERVED_PROOF_WRONG_RELEASE", status, RDMA_SC_OK);
+    expect_status("RESERVED_PROOF_WRONG_REJECT",
+                  proof_rm.complete_reserved_error(proof_mr.handle),
+                  RDMA_SC_INVALID_ARGUMENT);
+    expect_status("RESERVED_PROOF_ATOMIC_LOOKUP",
+                  proof_rm.lookup(proof_mr.handle, resource), RDMA_SC_OK);
+    expect_status("RESERVED_PROOF_ATOMIC_RECOVERY",
+                  proof_rm.lookup_recovery(proof_mr.handle, recovery_lookup),
+                  RDMA_SC_OK);
+    if (resource == null || resource.state != RDMA_RESOURCE_ERROR ||
+        recovery_lookup == null ||
+        recovery_lookup.pending_steps.size() != 1 ||
+        recovery_lookup.pending_steps[0] !=
+          RDMA_CTRL_STEP_BACKING_RELEASED)
+      `uvm_error("RESERVED_PROOF_ATOMIC",
+                 "invalid completion proof changed durable recovery")
+
+    status = proof_mem.\release (proof_mapping);
+    expect_status("RESERVED_PROOF_RELEASE", status, RDMA_SC_OK);
+    expect_status("RESERVED_PROOF_COMPLETE",
+                  proof_rm.complete_reserved_error(proof_mr.handle),
+                  RDMA_SC_OK);
+    expect_status("RESERVED_PROOF_RELEASED_LOOKUP",
+                  proof_rm.lookup(proof_mr.handle, resource),
+                  RDMA_SC_INVALID_STATE);
+    if (proof_mem.live_allocations() != 0)
+      `uvm_error("RESERVED_PROOF_RELEASE_COUNT",
+                 "reserved completion did not release allocations once")
+
+    completion_hook_mapping =
+      rdma_rm_owned_authority_hook_mapping::type_id::create(
+        "reserved_completion_hook_mapping"
+      );
+    completion_hook_mapping.initialize_allocation_token(
+      64'hca12_a110_c001
+    );
+    completion_hook_mapping.function_h = proof_binding.make_handle();
+    completion_hook_mapping.requester_bdf = proof_binding.pcie.bdf;
+    completion_hook_mapping.backing_addr.value = 64'hca12_1000_0000_0000;
+    completion_hook_mapping.iova.value = 64'hca12_2000_0000_0000;
+    completion_hook_mapping.size = 64'h2000;
+    completion_hook_mapping.direction = RDMA_DMA_BIDIRECTIONAL;
+    completion_hook_mapping.permissions =
+      '{device_read:1'b1, device_write:1'b1, atomic:1'b0};
+    completion_hook_mapping.state = RDMA_MAPPING_ACTIVE;
+    completion_hook_mapping.owner_h = null;
+    expect_status("RESERVED_COMPLETION_HOOK_MR_CREATE",
+                  proof_rm.create_mr(proof_binding, proof_pd.handle,
+                                     completion_hook_mr), RDMA_SC_OK);
+    prepare_mr(completion_hook_mr, completion_hook_mapping.iova.value);
+    completion_hook_ref = rdma_backing_ref::type_id::create(
+      "reserved_completion_hook_ref"
+    );
+    completion_hook_ref.mapping = completion_hook_mapping;
+    completion_hook_ref.ownership = RDMA_OWNERSHIP_CONTROL_PLANE;
+    recovery = rdma_recovery_record::type_id::create(
+      "reserved_completion_hook_recovery"
+    );
+    recovery.resource_h = clone_handle(
+      "RESERVED_COMPLETION_HOOK_H", completion_hook_mr.handle
+    );
+    recovery.hardware_presence = RDMA_HW_PRESENCE_ABSENT;
+    recovery.pending_steps.push_back(RDMA_CTRL_STEP_BACKING_RELEASED);
+    recovery.backing_refs.push_back(completion_hook_ref);
+    recovery.primary_status = rdma_status::make(
+      RDMA_SC_UNKNOWN_HW_ERROR, "completion hook mutation setup"
+    );
+    expect_status("RESERVED_COMPLETION_HOOK_MARK",
+                  proof_rm.mark_reserved_error(completion_hook_mr.handle,
+                                               recovery), RDMA_SC_OK);
+    completion_hook_mapping.set_authority_hook_fault(
+      RDMA_RM_AUTHORITY_HOOK_MUTATE_COMPLETION
+    );
+    expect_status("RESERVED_COMPLETION_HOOK_REJECT",
+                  proof_rm.complete_reserved_error(
+                    completion_hook_mr.handle
+                  ), RDMA_SC_INVALID_ARGUMENT);
+    completion_hook_mapping.set_authority_hook_fault(
+      RDMA_RM_AUTHORITY_HOOK_STABLE
+    );
+    expect_status("RESERVED_COMPLETION_HOOK_LOOKUP",
+                  proof_rm.lookup(completion_hook_mr.handle, resource),
+                  RDMA_SC_OK);
+    expect_status("RESERVED_COMPLETION_HOOK_RECOVERY",
+                  proof_rm.lookup_recovery(completion_hook_mr.handle,
+                                           recovery_lookup), RDMA_SC_OK);
+    if (resource == null || resource.state != RDMA_RESOURCE_ERROR ||
+        resource.backing_refs.size() != 0 || recovery_lookup == null ||
+        recovery_lookup.backing_refs.size() != 1 ||
+        recovery_lookup.backing_refs[0] == null ||
+        recovery_lookup.backing_refs[0].mapping == null ||
+        recovery_lookup.backing_refs[0].mapping.size != 64'h2000)
+      `uvm_error("RESERVED_COMPLETION_HOOK_ATOMIC",
+                 "completion query mutation changed canonical recovery")
   endtask
 
   function automatic bit same_handle_fields(rdma_handle lhs,
@@ -1956,6 +2599,7 @@ class rdma_resource_manager_test extends uvm_test;
     phase.raise_objection(this);
     check_owned_mapping_clone_contract_rejections();
     check_owned_mapping_capability_snapshots();
+    check_reserved_error_completion_proof();
 
     // PD and MR local IDs are hardware-width projections.  The inclusive
     // boundary succeeds, while the next fresh ID fails atomically without

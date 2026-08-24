@@ -28,6 +28,41 @@ class rdma_dma_mapping extends uvm_object;
     owner_h = null;
   endfunction
 
+  // Owned mappings are release capabilities.  Concrete allocation adapters
+  // must provide an opaque authority snapshot and prove equivalence without
+  // exposing their private identity representation.
+  virtual function rdma_status snapshot_release_authority(
+    output rdma_dma_mapping snapshot
+  );
+    snapshot = null;
+    return rdma_status::make(
+      RDMA_SC_UNSUPPORTED_OPCODE,
+      "DMA mapping does not support release authority snapshots"
+    );
+  endfunction
+
+  virtual function rdma_status release_authority_status(
+    rdma_dma_mapping snapshot
+  );
+    return rdma_status::make(
+      RDMA_SC_UNSUPPORTED_OPCODE,
+      "DMA mapping does not support release authority equivalence"
+    );
+  endfunction
+
+  // Concrete adapters keep the completion fact opaque and shared by all
+  // authority-preserving mapping copies.  Public mapping state is not proof
+  // that the backing allocation was actually released.
+  virtual function rdma_status release_completion_status(
+    output bit release_complete
+  );
+    release_complete = 1'b0;
+    return rdma_status::make(
+      RDMA_SC_UNSUPPORTED_OPCODE,
+      "DMA mapping does not support release completion queries"
+    );
+  endfunction
+
   virtual function void do_copy(uvm_object rhs);
     rdma_dma_mapping rhs_mapping;
     uvm_object cloned_object;

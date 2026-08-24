@@ -214,7 +214,7 @@ class rdma_resource_manager extends uvm_object;
            lhs.generation == rhs.generation;
   endfunction
 
-  protected function bit same_mapping_value(
+  protected function bit same_mapping_release_fields(
     rdma_dma_mapping lhs,
     rdma_dma_mapping rhs
   );
@@ -229,8 +229,65 @@ class rdma_resource_manager extends uvm_object;
            lhs.size == rhs.size &&
            lhs.direction == rhs.direction &&
            lhs.permissions == rhs.permissions &&
-           lhs.state == rhs.state &&
            same_mapping_handle_value(lhs.owner_h, rhs.owner_h);
+  endfunction
+
+  protected function bit same_mapping_value(
+    rdma_dma_mapping lhs,
+    rdma_dma_mapping rhs
+  );
+    if (lhs == null || rhs == null)
+      return lhs == rhs;
+    return same_mapping_release_fields(lhs, rhs) &&
+           lhs.state == rhs.state;
+  endfunction
+
+  protected function bit mapping_handles_detached(
+    rdma_dma_mapping lhs,
+    rdma_dma_mapping rhs
+  );
+    if (lhs == null || rhs == null)
+      return 1'b0;
+    return (lhs.function_h == null || rhs.function_h == null ||
+            lhs.function_h != rhs.function_h) &&
+           (lhs.owner_h == null || rhs.owner_h == null ||
+            lhs.owner_h != rhs.owner_h);
+  endfunction
+
+  protected function bit mapping_hook_value_intact(
+    rdma_dma_mapping current,
+    rdma_dma_mapping saved,
+    uvm_object_wrapper expected_type
+  );
+    uvm_object_wrapper current_type;
+
+    if (current == null || saved == null || current == saved ||
+        expected_type == null)
+      return 1'b0;
+    current_type = current.get_object_type();
+    return current_type != null && current_type == expected_type &&
+           same_mapping_value(current, saved) &&
+           mapping_handles_detached(current, saved);
+  endfunction
+
+  protected function bit owned_mapping_hook_graph_intact(
+    rdma_dma_mapping source,
+    rdma_dma_mapping result,
+    rdma_dma_mapping saved_value,
+    uvm_object_wrapper source_type,
+    rdma_dma_mapping authority_snapshot,
+    rdma_dma_mapping saved_authority,
+    uvm_object_wrapper authority_type
+  );
+    return source != result && source != authority_snapshot &&
+           result != authority_snapshot &&
+           mapping_hook_value_intact(source, saved_value, source_type) &&
+           mapping_hook_value_intact(result, saved_value, source_type) &&
+           mapping_hook_value_intact(authority_snapshot, saved_authority,
+                                     authority_type) &&
+           mapping_handles_detached(source, result) &&
+           mapping_handles_detached(source, authority_snapshot) &&
+           mapping_handles_detached(result, authority_snapshot);
   endfunction
 
   // An owned mapping is also the adapter's release capability.  Preserve its
@@ -242,10 +299,13 @@ class rdma_resource_manager extends uvm_object;
     output rdma_dma_mapping result
   );
     rdma_dma_mapping saved_value;
+    rdma_dma_mapping authority_snapshot;
+    rdma_dma_mapping saved_authority;
     rdma_status status;
     uvm_object cloned_object;
     uvm_object_wrapper source_type;
     uvm_object_wrapper result_type;
+    uvm_object_wrapper authority_type;
 
     result = null;
     if (source == null)
@@ -264,6 +324,31 @@ class rdma_resource_manager extends uvm_object;
         RDMA_SC_INVALID_ARGUMENT,
         {copy_label, " owned mapping type is not a registered subtype"}
       );
+    status = source.snapshot_release_authority(authority_snapshot);
+    if (status == null || !status.ok() || authority_snapshot == null ||
+        authority_snapshot == source ||
+        !same_mapping_value(source, saved_value)) begin
+      result = null;
+      return rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT,
+        {copy_label, " owned mapping authority snapshot is unsupported or invalid"}
+      );
+    end
+    authority_type = authority_snapshot.get_object_type();
+    status = project_mapping_value(
+      authority_snapshot, {copy_label, "_saved_authority"}, saved_authority
+    );
+    if (status == null || !status.ok() || authority_type == null ||
+        authority_type != source_type ||
+        !mapping_hook_value_intact(authority_snapshot, saved_authority,
+                                   authority_type) ||
+        !mapping_handles_detached(source, authority_snapshot)) begin
+      result = null;
+      return rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT,
+        {copy_label, " owned mapping authority snapshot changed value, type, or aliases"}
+      );
+    end
     cloned_object = source.clone();
     if (cloned_object == null || !$cast(result, cloned_object) ||
         result == source) begin
@@ -275,16 +360,108 @@ class rdma_resource_manager extends uvm_object;
     end
     result_type = result.get_object_type();
     if (result_type == null || result_type != source_type ||
-        !same_mapping_value(source, saved_value) ||
-        !same_mapping_value(result, saved_value) ||
-        (source.function_h != null &&
-         result.function_h == source.function_h) ||
-        (source.owner_h != null && result.owner_h == source.owner_h)) begin
+        !owned_mapping_hook_graph_intact(
+          source, result, saved_value, source_type,
+          authority_snapshot, saved_authority, authority_type
+        )) begin
       result = null;
       return rdma_status::make(
         RDMA_SC_INVALID_ARGUMENT,
         {copy_label, " owned mapping clone changed type, value, or aliases"}
       );
+    end
+    status = source.release_authority_status(authority_snapshot);
+    if (status == null || !status.ok() ||
+        !owned_mapping_hook_graph_intact(
+          source, result, saved_value, source_type,
+          authority_snapshot, saved_authority, authority_type
+        )) begin
+      result = null;
+      return rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT,
+        {copy_label, " owned mapping source authority hook changed value, authority, or aliases"}
+      );
+    end
+    status = result.release_authority_status(authority_snapshot);
+    if (status == null || !status.ok() ||
+        !owned_mapping_hook_graph_intact(
+          source, result, saved_value, source_type,
+          authority_snapshot, saved_authority, authority_type
+        )) begin
+      result = null;
+      return rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT,
+        {copy_label, " owned mapping result authority hook changed value, authority, or aliases"}
+      );
+    end
+    return rdma_status::success();
+  endfunction
+
+  // Completion is an adapter-defined opaque fact.  Invoke its virtual query
+  // only on an authority-preserving clone, and reject any public value, type,
+  // or handle-alias mutation at the hook boundary.
+  function rdma_status query_owned_release_completion(
+    rdma_dma_mapping mapping,
+    output bit release_complete
+  );
+    rdma_dma_mapping completion_query;
+    rdma_dma_mapping saved_mapping;
+    rdma_dma_mapping saved_query;
+    rdma_status status;
+    uvm_object_wrapper mapping_type;
+    uvm_object_wrapper query_type;
+
+    release_complete = 1'b0;
+    if (mapping == null)
+      return rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT, "release completion mapping is null"
+      );
+    mapping_type = mapping.get_object_type();
+    status = project_mapping_value(
+      mapping, "release completion input guard", saved_mapping
+    );
+    if (status == null || !status.ok() || mapping_type == null ||
+        !mapping_hook_value_intact(mapping, saved_mapping, mapping_type))
+      return rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT,
+        "release completion input guard is invalid"
+      );
+    status = clone_owned_mapping_value(
+      mapping, "release completion query", completion_query
+    );
+    if (status == null || !status.ok() || completion_query == null)
+      return rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT,
+        "release completion query clone is invalid"
+      );
+    query_type = completion_query.get_object_type();
+    status = project_mapping_value(
+      completion_query, "release completion query guard", saved_query
+    );
+    if (status == null || !status.ok() || query_type == null ||
+        query_type != mapping_type ||
+        !mapping_hook_value_intact(completion_query, saved_query,
+                                   query_type) ||
+        !mapping_handles_detached(mapping, completion_query))
+      return rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT,
+        "release completion query guard is invalid"
+      );
+    status = completion_query.release_completion_status(release_complete);
+    if (status == null ||
+        !mapping_hook_value_intact(mapping, saved_mapping, mapping_type) ||
+        !mapping_hook_value_intact(completion_query, saved_query,
+                                   query_type) ||
+        !mapping_handles_detached(mapping, completion_query)) begin
+      release_complete = 1'b0;
+      return rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT,
+        "release completion hook changed mapping value, type, or aliases"
+      );
+    end
+    if (!status.ok()) begin
+      release_complete = 1'b0;
+      return status;
     end
     return rdma_status::success();
   endfunction
@@ -2531,9 +2708,10 @@ class rdma_resource_manager extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  virtual function rdma_status mark_error(
+  protected function rdma_status mark_error_transition(
     rdma_handle handle,
-    rdma_recovery_record recovery
+    rdma_recovery_record recovery,
+    bit reserved_only
   );
     rdma_resource replacement;
     rdma_recovery_record recovery_copy;
@@ -2588,13 +2766,47 @@ class rdma_resource_manager extends uvm_object;
                                "recovery validation returned null");
     if (!status.ok())
       return status;
-    if (replacement.handle.kind == RDMA_RESOURCE_MR &&
-        replacement.state == RDMA_RESOURCE_ALLOCATED &&
-        !staged_allocations.exists(key))
+    if (reserved_only) begin
+      if (replacement.handle.kind != RDMA_RESOURCE_MR ||
+          replacement.state != RDMA_RESOURCE_ALLOCATED ||
+          staged_allocations.exists(key))
+        return rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "reserved ERROR requires an unstaged ALLOCATED MR"
+        );
+      if (recovery_copy.hardware_presence != RDMA_HW_PRESENCE_ABSENT ||
+          recovery_copy.ambiguous_ticket != null ||
+          recovery_copy.hmc_refs.size() != 0 ||
+          recovery_copy.pending_steps.size() != 1 ||
+          recovery_copy.pending_steps[0] !=
+            RDMA_CTRL_STEP_BACKING_RELEASED ||
+          recovery_copy.backing_refs.size() != 1)
+        return rdma_status::make(
+          RDMA_SC_INVALID_ARGUMENT,
+          "reserved ERROR recovery is not local backing cleanup"
+        );
+      foreach (recovery_copy.backing_refs[i]) begin
+        if (recovery_copy.backing_refs[i] == null ||
+            recovery_copy.backing_refs[i].ownership !=
+              RDMA_OWNERSHIP_CONTROL_PLANE ||
+            recovery_copy.backing_refs[i].release_complete ||
+            recovery_copy.backing_refs[i].mapping == null ||
+            recovery_copy.backing_refs[i].mapping.state !=
+              RDMA_MAPPING_ACTIVE)
+          return rdma_status::make(
+            RDMA_SC_INVALID_ARGUMENT,
+            "reserved ERROR backing authority is not owned and live"
+          );
+      end
+    end
+    else if (replacement.handle.kind == RDMA_RESOURCE_MR &&
+             replacement.state == RDMA_RESOURCE_ALLOCATED &&
+             !staged_allocations.exists(key)) begin
       return rdma_status::make(
         RDMA_SC_INVALID_STATE,
         "ALLOCATED MR requires staged key authority before ERROR"
       );
+    end
     replacement.state = RDMA_RESOURCE_ERROR;
     status = replacement.validate();
     if (status == null)
@@ -2605,6 +2817,85 @@ class rdma_resource_manager extends uvm_object;
     registry[key] = replacement;
     recovery_records[key] = recovery_copy;
     staged_allocations.delete(key);
+    return rdma_status::success();
+  endfunction
+
+  virtual function rdma_status mark_error(
+    rdma_handle handle,
+    rdma_recovery_record recovery
+  );
+    return mark_error_transition(handle, recovery, 1'b0);
+  endfunction
+
+  virtual function rdma_status mark_reserved_error(
+    rdma_handle handle,
+    rdma_recovery_record recovery
+  );
+    return mark_error_transition(handle, recovery, 1'b1);
+  endfunction
+
+  // Completes only the no-hardware recovery shape created by
+  // mark_reserved_error().  The control plane must release the retained
+  // backing authority before invoking this atomic local transition.
+  virtual function rdma_status complete_reserved_error(
+    rdma_handle handle
+  );
+    rdma_resource authoritative;
+    rdma_recovery_record recovery;
+    rdma_dma_mapping canonical_mapping;
+    rdma_status status;
+    bit release_complete;
+    string key;
+
+    status = registry_schema_status("complete reserved error");
+    if (!status.ok())
+      return status;
+    status = lookup(handle, authoritative);
+    if (!status.ok())
+      return status;
+    key = resource_key(authoritative.handle);
+    status = recovery_entry_schema_status(key, "complete reserved error");
+    if (!status.ok())
+      return status;
+    if (authoritative.handle.kind != RDMA_RESOURCE_MR ||
+        registry[key].state != RDMA_RESOURCE_ERROR ||
+        staged_allocations.exists(key) || !recovery_records.exists(key))
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "resource is not a reserved ERROR MR"
+      );
+    recovery = recovery_records[key];
+    if (recovery == null ||
+        recovery.hardware_presence != RDMA_HW_PRESENCE_ABSENT ||
+        recovery.ambiguous_ticket != null ||
+        recovery.hmc_refs.size() != 0 ||
+        recovery.pending_steps.size() != 1 ||
+        recovery.pending_steps[0] != RDMA_CTRL_STEP_BACKING_RELEASED ||
+        recovery.backing_refs.size() != 1 ||
+        recovery.backing_refs[0] == null ||
+        recovery.backing_refs[0].mapping == null)
+      return rdma_status::make(
+        RDMA_SC_RECOVERY_REQUIRED,
+        "reserved ERROR MR still requires non-local recovery"
+      );
+    // Public RELEASED state is forgeable; completion is proven solely by the
+    // adapter-sealed fact shared with the canonical recovery mapping.
+    canonical_mapping = recovery.backing_refs[0].mapping;
+    status = query_owned_release_completion(
+      canonical_mapping, release_complete
+    );
+    if (status == null || !status.ok() || !release_complete)
+      return rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT,
+        "reserved ERROR backing release is not opaquely complete"
+      );
+    if (has_dependents(registry[key]) ||
+        registry[key].outstanding_ids.size() != 0)
+      return rdma_status::make(
+        RDMA_SC_RESOURCE_BUSY,
+        "reserved ERROR MR still has live dependents or operations"
+      );
+    force_release_key(key);
     return rdma_status::success();
   endfunction
 

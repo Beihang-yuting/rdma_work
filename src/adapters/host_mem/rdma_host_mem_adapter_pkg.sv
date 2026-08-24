@@ -6,13 +6,66 @@ package rdma_host_mem_adapter_pkg;
   import rdma_adapter_pkg::*;
   `include "uvm_macros.svh"
 
+  class rdma_host_mem_release_seal extends uvm_object;
+    function new(string name = "rdma_host_mem_release_seal");
+      super.new(name);
+    endfunction
+  endclass
+
   // Handle identity is intentionally opaque.  It is shared by value-like
   // mapping copies, but there is no numeric token or public identity getter.
+  // Only the adapter retains the exact seal that can mark release completion.
   class rdma_host_mem_allocation_identity extends uvm_object;
     `uvm_object_utils(rdma_host_mem_allocation_identity)
 
+    local rdma_host_mem_release_seal release_seal;
+    local bit release_complete;
+
     function new(string name = "rdma_host_mem_allocation_identity");
       super.new(name);
+      release_seal = null;
+      release_complete = 1'b0;
+    endfunction
+
+    function rdma_status initialize(rdma_host_mem_release_seal seal);
+      if (seal == null)
+        return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                                 "host memory release seal is null");
+      if (release_seal != null)
+        return rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "host memory allocation identity is already sealed"
+        );
+      release_seal = seal;
+      return rdma_status::success();
+    endfunction
+
+    function rdma_status mark_release_complete(
+      rdma_host_mem_release_seal seal
+    );
+      if (seal == null || release_seal == null || seal != release_seal)
+        return rdma_status::make(
+          RDMA_SC_INVALID_ARGUMENT,
+          "host memory release completion seal is invalid"
+        );
+      if (release_complete)
+        return rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "host memory release is already complete"
+        );
+      release_complete = 1'b1;
+      return rdma_status::success();
+    endfunction
+
+    function rdma_status completion_status(output bit complete);
+      complete = 1'b0;
+      if (release_seal == null)
+        return rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "host memory allocation identity is not sealed"
+        );
+      complete = release_complete;
+      return rdma_status::success();
     endfunction
   endclass
 
@@ -26,7 +79,11 @@ package rdma_host_mem_adapter_pkg;
       allocation_identity = null;
     endfunction
 
-    function rdma_status initialize_allocation_identity();
+    function rdma_status initialize_allocation_identity(
+      rdma_host_mem_release_seal release_seal
+    );
+      rdma_status status;
+
       if (allocation_identity != null)
         return rdma_status::make(
           RDMA_SC_INVALID_STATE,
@@ -41,7 +98,40 @@ package rdma_host_mem_adapter_pkg;
           RDMA_SC_RESOURCE_EXHAUSTED,
           "host memory allocation identity creation failed"
         );
+      status = allocation_identity.initialize(release_seal);
+      if (status == null || !status.ok()) begin
+        allocation_identity = null;
+        if (status == null)
+          return rdma_status::make(
+            RDMA_SC_INVALID_STATE,
+            "host memory allocation identity sealing returned null"
+          );
+        return status;
+      end
       return rdma_status::success();
+    endfunction
+
+    function rdma_status mark_release_complete(
+      rdma_host_mem_release_seal release_seal
+    );
+      if (allocation_identity == null)
+        return rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "host memory allocation identity is not initialized"
+        );
+      return allocation_identity.mark_release_complete(release_seal);
+    endfunction
+
+    virtual function rdma_status release_completion_status(
+      output bit release_complete
+    );
+      release_complete = 1'b0;
+      if (allocation_identity == null)
+        return rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "host memory allocation identity is not initialized"
+        );
+      return allocation_identity.completion_status(release_complete);
     endfunction
 
     function bit same_allocation(rdma_host_mem_mapping rhs);
@@ -50,6 +140,33 @@ package rdma_host_mem_adapter_pkg;
       return allocation_identity != null &&
              rhs.allocation_identity != null &&
              allocation_identity == rhs.allocation_identity;
+    endfunction
+
+    virtual function rdma_status snapshot_release_authority(
+      output rdma_dma_mapping snapshot
+    );
+      rdma_host_mem_mapping typed_snapshot;
+      rdma_status status;
+
+      snapshot = null;
+      status = make_authority_snapshot(typed_snapshot);
+      if (status != null && status.ok())
+        snapshot = typed_snapshot;
+      return status;
+    endfunction
+
+    virtual function rdma_status release_authority_status(
+      rdma_dma_mapping snapshot
+    );
+      rdma_host_mem_mapping typed_snapshot;
+
+      if (!$cast(typed_snapshot, snapshot) || typed_snapshot == null ||
+          !same_allocation(typed_snapshot))
+        return rdma_status::make(
+          RDMA_SC_INVALID_ARGUMENT,
+          "host memory allocation release authority changed"
+        );
+      return rdma_status::success();
     endfunction
 
     function rdma_status make_authority_snapshot(
@@ -166,6 +283,8 @@ package rdma_host_mem_adapter_pkg;
     // IOVA cursor; successful offset mappings align and advance that cursor.
     bit [63:0] iova_base;
 
+    local rdma_host_mem_release_seal release_seal;
+
     protected rdma_host_mem_allocation_record allocations[$];
     protected bit iova_config_locked;
     protected bit [63:0] locked_iova_base;
@@ -176,6 +295,7 @@ package rdma_host_mem_adapter_pkg;
       super.new(name);
       mem = null;
       iova_base = '0;
+      release_seal = new("adapter_release_seal");
       iova_config_locked = 1'b0;
       locked_iova_base = '0;
       iova_cursor_valid = 1'b0;
@@ -456,7 +576,7 @@ package rdma_host_mem_adapter_pkg;
         return rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED,
                                  "DMA mapping creation failed");
       end
-      status = allocated_mapping.initialize_allocation_identity();
+      status = allocated_mapping.initialize_allocation_identity(release_seal);
       if (!status.ok()) begin
         mem.free(backing_address, `__FILE__, `__LINE__);
         return status;
@@ -580,9 +700,25 @@ package rdma_host_mem_adapter_pkg;
 
     virtual function rdma_status \release (rdma_dma_mapping mapping);
       int allocation_index;
+      rdma_host_mem_mapping concrete_mapping;
       rdma_status status;
 
       status = validate_mapping(mapping, allocation_index);
+      if (!status.ok())
+        return status;
+      if (!$cast(concrete_mapping, mapping) || concrete_mapping == null)
+        return rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "validated host memory mapping lost its concrete type"
+        );
+      // Functions cannot consume time, so sealing completion and freeing the
+      // backing are one adapter operation.  The exact seal is never exposed.
+      status = concrete_mapping.mark_release_complete(release_seal);
+      if (status == null)
+        return rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "host memory release completion marking returned null"
+        );
       if (!status.ok())
         return status;
       // The authoritative address and original manager select the allocation;

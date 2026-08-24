@@ -140,6 +140,7 @@ class rdma_adapter_contract_test extends uvm_test;
     rdma_mock_dma_mapping identity_mock_mapping_b;
     rdma_mock_dma_mapping identity_mock_mapping_snapshot;
     rdma_mock_dma_mapping third_mock_mapping;
+    rdma_mock_release_seal third_mock_release_seal;
     rdma_function_binding binding;
     rdma_packet tx_packet;
     rdma_packet observer_seed;
@@ -446,7 +447,7 @@ class rdma_adapter_contract_test extends uvm_test;
     if (!$cast(identity_mock_mapping, identity_mapping_a))
       `uvm_fatal("HOST_IDENTITY_TYPE",
                  "allocated mapping does not carry mock identity")
-    status = identity_mock_mapping.initialize_allocation_token();
+    status = identity_mock_mapping.initialize_allocation_token(null);
     expect_status("HOST_IDENTITY_REINITIALIZE", status,
                   RDMA_SC_INVALID_STATE);
     status = identity_mem_api.allocate(
@@ -459,7 +460,10 @@ class rdma_adapter_contract_test extends uvm_test;
     third_mock_mapping = rdma_mock_dma_mapping::type_id::create(
       "third_mock_mapping"
     );
-    status = third_mock_mapping.initialize_allocation_token();
+    third_mock_release_seal = new("third_mock_release_seal");
+    status = third_mock_mapping.initialize_allocation_token(
+      third_mock_release_seal
+    );
     expect_status("HOST_IDENTITY_THIRD_INIT", status, RDMA_SC_OK);
     if (identity_mock_mapping.same_allocation(identity_mock_mapping_b) ||
         third_mock_mapping.same_allocation(identity_mock_mapping) ||

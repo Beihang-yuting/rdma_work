@@ -187,20 +187,74 @@ class rdma_mock_host_mem_call extends uvm_object;
   endfunction
 endclass
 
+class rdma_mock_release_seal extends uvm_object;
+  function new(string name = "rdma_mock_release_seal");
+    super.new(name);
+  endfunction
+endclass
+
+class rdma_mock_release_completion extends uvm_object;
+  local rdma_mock_release_seal release_seal;
+  local bit release_complete;
+
+  function new(string name = "rdma_mock_release_completion");
+    super.new(name);
+    release_seal = null;
+    release_complete = 1'b0;
+  endfunction
+
+  function rdma_status initialize(rdma_mock_release_seal seal);
+    if (seal == null)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "mock release seal is null");
+    if (release_seal != null)
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "mock release completion is already sealed");
+    release_seal = seal;
+    return rdma_status::success();
+  endfunction
+
+  function rdma_status mark_complete(rdma_mock_release_seal seal);
+    if (seal == null || release_seal == null || seal != release_seal)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "mock release completion seal is invalid");
+    if (release_complete)
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "mock release is already complete");
+    release_complete = 1'b1;
+    return rdma_status::success();
+  endfunction
+
+  function rdma_status completion_status(output bit complete);
+    complete = 1'b0;
+    if (release_seal == null)
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "mock release completion is not sealed");
+    complete = release_complete;
+    return rdma_status::success();
+  endfunction
+endclass
+
 class rdma_mock_dma_mapping extends rdma_dma_mapping;
   `uvm_object_utils(rdma_mock_dma_mapping)
 
   local longint unsigned allocation_token;
   local bit allocation_token_initialized;
+  local rdma_mock_release_completion release_completion;
   local static longint unsigned next_token = 1;
 
   function new(string name = "rdma_mock_dma_mapping");
     super.new(name);
     allocation_token = 0;
     allocation_token_initialized = 1'b0;
+    release_completion = null;
   endfunction
 
-  function rdma_status initialize_allocation_token();
+  function rdma_status initialize_allocation_token(
+    rdma_mock_release_seal release_seal
+  );
+    rdma_status status;
+
     if (allocation_token_initialized)
       return rdma_status::make(RDMA_SC_INVALID_STATE,
                                "allocation token is already initialized");
@@ -210,6 +264,19 @@ class rdma_mock_dma_mapping extends rdma_dma_mapping;
     allocation_token = next_token;
     allocation_token_initialized = 1'b1;
     next_token++;
+    release_completion = new({get_name(), "_release_completion"});
+    status = release_completion.initialize(release_seal);
+    if (status == null || !status.ok()) begin
+      allocation_token = 0;
+      allocation_token_initialized = 1'b0;
+      release_completion = null;
+      if (status == null)
+        return rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "mock release completion initialization returned null"
+        );
+      return status;
+    end
     return rdma_status::success();
   endfunction
 
@@ -217,16 +284,77 @@ class rdma_mock_dma_mapping extends rdma_dma_mapping;
     if (rhs == null)
       return 1'b0;
     return allocation_token_initialized && rhs.allocation_token_initialized &&
-           allocation_token == rhs.allocation_token;
+           allocation_token == rhs.allocation_token &&
+           release_completion != null &&
+           release_completion == rhs.release_completion;
+  endfunction
+
+  function rdma_status mark_release_complete(
+    rdma_mock_release_seal release_seal
+  );
+    if (release_completion == null)
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "mock release completion is not initialized");
+    return release_completion.mark_complete(release_seal);
+  endfunction
+
+  virtual function rdma_status release_completion_status(
+    output bit release_complete
+  );
+    release_complete = 1'b0;
+    if (release_completion == null)
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "mock release completion is not initialized");
+    return release_completion.completion_status(release_complete);
+  endfunction
+
+  virtual function rdma_status snapshot_release_authority(
+    output rdma_dma_mapping snapshot
+  );
+    rdma_mock_dma_mapping candidate;
+
+    snapshot = null;
+    if (!allocation_token_initialized)
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE, "allocation token is not initialized"
+      );
+    candidate = rdma_mock_dma_mapping::type_id::create(
+      {get_name(), "_authority"}
+    );
+    if (candidate == null)
+      return rdma_status::make(
+        RDMA_SC_RESOURCE_EXHAUSTED,
+        "mock allocation authority creation failed"
+      );
+    candidate.allocation_token = allocation_token;
+    candidate.allocation_token_initialized = 1'b1;
+    candidate.release_completion = release_completion;
+    snapshot = candidate;
+    return rdma_status::success();
+  endfunction
+
+  virtual function rdma_status release_authority_status(
+    rdma_dma_mapping snapshot
+  );
+    rdma_mock_dma_mapping typed_snapshot;
+
+    if (!$cast(typed_snapshot, snapshot) || typed_snapshot == null ||
+        !same_allocation(typed_snapshot))
+      return rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT, "mock allocation release authority changed"
+      );
+    return rdma_status::success();
   endfunction
 
   virtual function void do_copy(uvm_object rhs);
     rdma_mock_dma_mapping rhs_mapping;
     bit destination_was_initialized;
     longint unsigned destination_token;
+    rdma_mock_release_completion destination_completion;
 
     destination_was_initialized = allocation_token_initialized;
     destination_token = allocation_token;
+    destination_completion = release_completion;
     super.do_copy(rhs);
     if (!$cast(rhs_mapping, rhs))
       `uvm_fatal("MOCK_COPY", "mock DMA mapping copy type mismatch")
@@ -234,10 +362,12 @@ class rdma_mock_dma_mapping extends rdma_dma_mapping;
       // Public mapping fields may be copied, but established identity is fixed.
       allocation_token = destination_token;
       allocation_token_initialized = 1'b1;
+      release_completion = destination_completion;
     end
     else begin
       allocation_token = rhs_mapping.allocation_token;
       allocation_token_initialized = rhs_mapping.allocation_token_initialized;
+      release_completion = rhs_mapping.release_completion;
     end
   endfunction
 endclass
@@ -265,6 +395,7 @@ class rdma_mock_host_mem extends rdma_host_mem_api;
   rdma_mock_call_trace call_trace;
   int writes_until_failure;
   rdma_status delayed_write_failure;
+  local rdma_mock_release_seal release_seal;
 
   function new(string name = "rdma_mock_host_mem");
     super.new(name);
@@ -273,6 +404,7 @@ class rdma_mock_host_mem extends rdma_host_mem_api;
     call_trace = null;
     writes_until_failure = -1;
     delayed_write_failure = null;
+    release_seal = new("mock_adapter_release_seal");
   endfunction
 
   function void set_call_trace(rdma_mock_call_trace trace);
@@ -439,7 +571,7 @@ class rdma_mock_host_mem extends rdma_host_mem_api;
     allocated_mapping = rdma_mock_dma_mapping::type_id::create(
       $sformatf("mapping_%0d", regions.size())
     );
-    token_status = allocated_mapping.initialize_allocation_token();
+    token_status = allocated_mapping.initialize_allocation_token(release_seal);
     if (!token_status.ok())
       return token_status;
     allocated_mapping.function_h =
@@ -563,7 +695,9 @@ class rdma_mock_host_mem extends rdma_host_mem_api;
 
   virtual function rdma_status \release (rdma_dma_mapping mapping);
     rdma_status failure;
+    rdma_status status;
     int region_index;
+    rdma_mock_dma_mapping concrete_mapping;
 
     record_call("release", null, mapping);
     failure = take_failure("release");
@@ -582,6 +716,17 @@ class rdma_mock_host_mem extends rdma_host_mem_api;
     if (regions[region_index].mapping.state != RDMA_MAPPING_ACTIVE)
       return rdma_status::make(RDMA_SC_INVALID_STATE,
                                "DMA allocation is not active");
+    if (!$cast(concrete_mapping, mapping) || concrete_mapping == null)
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "mock DMA mapping lost its concrete type");
+    status = concrete_mapping.mark_release_complete(release_seal);
+    if (status == null)
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "mock release completion marking returned null"
+      );
+    if (!status.ok())
+      return status;
     mapping.state = RDMA_MAPPING_RELEASED;
     regions[region_index].mapping.state = RDMA_MAPPING_RELEASED;
     return rdma_status::success();

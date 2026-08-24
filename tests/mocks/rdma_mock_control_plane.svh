@@ -52,7 +52,8 @@ class rdma_fault_inject_resource_manager extends rdma_resource_manager;
     rdma_status failure
   );
     if (!(transition_name inside {"commit_programmed", "activate",
-                                  "release_reserved", "mark_error"}))
+                                  "release_reserved", "mark_error",
+                                  "complete_reserved_error"}))
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "unknown resource transition");
     if (failure == null)
@@ -114,6 +115,17 @@ class rdma_fault_inject_resource_manager extends rdma_resource_manager;
     if (failure != null)
       return failure;
     return super.mark_error(handle, recovery);
+  endfunction
+
+  virtual function rdma_status complete_reserved_error(
+    rdma_handle handle
+  );
+    rdma_status failure;
+
+    failure = take_transition_failure("complete_reserved_error");
+    if (failure != null)
+      return failure;
+    return super.complete_reserved_error(handle);
   endfunction
 endclass
 
