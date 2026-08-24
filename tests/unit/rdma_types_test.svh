@@ -38,6 +38,20 @@ class rdma_types_test extends uvm_test;
                            enum_name, actual, expected))
   endfunction
 
+  function automatic void expect_status_category(
+    string check_name,
+    rdma_status_code_e code,
+    rdma_status_category_e expected_category
+  );
+    rdma_status_category_e actual_category;
+
+    actual_category = rdma_status::category_for(code);
+    if (actual_category != expected_category)
+      `uvm_error(check_name,
+                 $sformatf("expected %s, got %s",
+                           expected_category.name(), actual_category.name()))
+  endfunction
+
   task run_phase(uvm_phase phase);
     rdma_bdf_t bdf = '{segment:16'h0, bus:8'h42, device:5'h03,
                        function_num:3'h5};
@@ -69,7 +83,9 @@ class rdma_types_test extends uvm_test;
       RDMA_SC_QUEUE_FULL,
       RDMA_SC_QUEUE_EMPTY,
       RDMA_SC_UNKNOWN_HW_ERROR,
-      RDMA_SC_RESET_CANCELLED
+      RDMA_SC_RESET_CANCELLED,
+      RDMA_SC_RESOURCE_BUSY,
+      RDMA_SC_RECOVERY_REQUIRED
     };
     rdma_status_category_e categories[$] = '{
       RDMA_STATUS_STATE,
@@ -86,7 +102,9 @@ class rdma_types_test extends uvm_test;
       RDMA_STATUS_QUEUE,
       RDMA_STATUS_QUEUE,
       RDMA_STATUS_HARDWARE,
-      RDMA_STATUS_RESET
+      RDMA_STATUS_RESET,
+      RDMA_STATUS_RESOURCE,
+      RDMA_STATUS_STATE
     };
 
     phase.raise_objection(this);
@@ -129,6 +147,9 @@ class rdma_types_test extends uvm_test;
     check_enum_code("RDMA_SC_QUEUE_EMPTY", RDMA_SC_QUEUE_EMPTY, 5'd12);
     check_enum_code("RDMA_SC_UNKNOWN_HW_ERROR", RDMA_SC_UNKNOWN_HW_ERROR, 5'd13);
     check_enum_code("RDMA_SC_RESET_CANCELLED", RDMA_SC_RESET_CANCELLED, 5'd14);
+    check_enum_code("RDMA_SC_RESOURCE_BUSY", RDMA_SC_RESOURCE_BUSY, 5'd15);
+    check_enum_code("RDMA_SC_RECOVERY_REQUIRED", RDMA_SC_RECOVERY_REQUIRED,
+                    5'd16);
 
     check_enum_code("RDMA_STATUS_CONFIGURATION", RDMA_STATUS_CONFIGURATION, 4'd0);
     check_enum_code("RDMA_STATUS_RESOURCE", RDMA_STATUS_RESOURCE, 4'd1);
@@ -313,6 +334,11 @@ class rdma_types_test extends uvm_test;
                              rdma_status::category_for(codes[i]).name(),
                              categories[i].name()))
     end
+
+    expect_status_category("RESOURCE_BUSY", RDMA_SC_RESOURCE_BUSY,
+                           RDMA_STATUS_RESOURCE);
+    expect_status_category("RECOVERY_REQUIRED", RDMA_SC_RECOVERY_REQUIRED,
+                           RDMA_STATUS_STATE);
 
     message_status.hardware_code_valid = 1'b1;
     message_status.hardware_code = 32'hdead_beef;

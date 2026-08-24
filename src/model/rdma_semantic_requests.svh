@@ -172,18 +172,14 @@ class rdma_register_mr_req extends rdma_semantic_request;
   rdma_handle pd_h;
   rdma_iova_t iova;
   longint unsigned length;
-  bit [31:0] lkey;
-  bit [31:0] rkey;
-  rdma_dma_permission_t permissions;
+  rdma_rdma_access_t access;
 
   function new(string name = "rdma_register_mr_req");
     super.new(name);
     pd_h = null;
     iova = '0;
     length = '0;
-    lkey = '0;
-    rkey = '0;
-    permissions = '0;
+    access = '0;
   endfunction
 
   virtual function void do_copy(uvm_object rhs);
@@ -203,9 +199,7 @@ class rdma_register_mr_req extends rdma_semantic_request;
     end
     iova = rhs_req.iova;
     length = rhs_req.length;
-    lkey = rhs_req.lkey;
-    rkey = rhs_req.rkey;
-    permissions = rhs_req.permissions;
+    access = rhs_req.access;
   endfunction
 
   virtual function rdma_status validate();

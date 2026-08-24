@@ -29,14 +29,6 @@ typedef enum bit {
   RDMA_MR_ADDRESS_ZERO_BASED = 1'b1
 } rdma_mr_address_mode_e;
 
-typedef struct packed {
-  bit local_write;
-  bit remote_read;
-  bit remote_write;
-  bit memory_window_bind;
-  bit remote_atomic;
-} rdma_rdma_access_t;
-
 class rdma_ring_position extends uvm_object;
   `uvm_object_utils(rdma_ring_position)
 

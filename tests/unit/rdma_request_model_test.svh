@@ -202,9 +202,13 @@ class rdma_request_model_test extends uvm_test;
     register_mr.pd_h = pd_h;
     register_mr.iova.value = 64'h1111_0000;
     register_mr.length = 64'h4000;
-    register_mr.permissions = '{device_read:1'b1, device_write:1'b1,
-                                atomic:1'b0};
+    register_mr.access = '{local_write:1'b1, remote_read:1'b1,
+                           remote_write:1'b1, memory_window_bind:1'b0,
+                           remote_atomic:1'b0};
     expect_status("REGISTER_MR", register_mr.validate(), RDMA_SC_OK);
+    register_mr.access.remote_atomic = 1'b1;
+    if (!register_mr.access.remote_atomic)
+      `uvm_error("REGISTER_MR_ACCESS", "remote atomic access was lost")
     register_mr.owner = null;
     expect_status("REGISTER_MR_OWNER", register_mr.validate(),
                   RDMA_SC_INVALID_ARGUMENT);

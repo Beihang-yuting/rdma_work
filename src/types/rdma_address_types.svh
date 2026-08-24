@@ -23,3 +23,11 @@ typedef struct packed {
   bit device_write;
   bit atomic;
 } rdma_dma_permission_t;
+
+typedef struct packed {
+  bit local_write;
+  bit remote_read;
+  bit remote_write;
+  bit memory_window_bind;
+  bit remote_atomic;
+} rdma_rdma_access_t;

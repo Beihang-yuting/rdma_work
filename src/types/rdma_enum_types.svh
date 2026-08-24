@@ -13,7 +13,9 @@ typedef enum bit [4:0] {
   RDMA_SC_QUEUE_FULL         = 5'd11,
   RDMA_SC_QUEUE_EMPTY        = 5'd12,
   RDMA_SC_UNKNOWN_HW_ERROR   = 5'd13,
-  RDMA_SC_RESET_CANCELLED    = 5'd14
+  RDMA_SC_RESET_CANCELLED    = 5'd14,
+  RDMA_SC_RESOURCE_BUSY      = 5'd15,
+  RDMA_SC_RECOVERY_REQUIRED  = 5'd16
 } rdma_status_code_e;
 
 typedef enum bit [3:0] {
