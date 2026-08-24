@@ -21,6 +21,42 @@ class rdma_resource_manager_probe extends rdma_resource_manager;
   );
     return next_object_serial[kind];
   endfunction
+
+  function int unsigned observed_recovery_count();
+    return recovery_records.num();
+  endfunction
+endclass
+
+// Boundary injection is intentionally isolated from the behavior tests.  It
+// models corrupted allocator state without exposing registry mutation hooks.
+class rdma_width_probe_manager extends rdma_resource_manager;
+  function new(string name = "rdma_width_probe_manager");
+    super.new(name);
+  endfunction
+
+  function void set_next_local_id(rdma_resource_kind_e kind,
+                                  int unsigned value);
+    next_local_id[kind] = value;
+  endfunction
+
+  function void inject_free_local_id(rdma_resource_kind_e kind,
+                                     int unsigned value);
+    free_local_ids[kind].push_back(value);
+  endfunction
+
+  function int unsigned observed_next_object_serial(
+    rdma_resource_kind_e kind
+  );
+    return next_object_serial[kind];
+  endfunction
+
+  function int unsigned observed_free_local_id_count(
+    rdma_resource_kind_e kind
+  );
+    if (!free_local_ids.exists(kind))
+      return 0;
+    return free_local_ids[kind].size();
+  endfunction
 endclass
 
 class rdma_resource_manager_test extends uvm_test;
@@ -130,6 +166,15 @@ class rdma_resource_manager_test extends uvm_test;
     rdma_resource_manager function_release_rm;
     rdma_resource_manager_probe permanent_exhaustion_rm;
     rdma_resource_manager_probe exhaustion_rm;
+    rdma_width_probe_manager width_pd_rm;
+    rdma_width_probe_manager width_mr_rm;
+    rdma_width_probe_manager width_free_pd_rm;
+    rdma_width_probe_manager width_free_mr_rm;
+    rdma_resource_manager lifecycle_rm;
+    rdma_resource_manager allocated_error_rm;
+    rdma_resource_manager recovery_rm;
+    rdma_resource_manager_probe privileged_recovery_rm;
+    rdma_resource_manager stale_recovery_rm;
     rdma_hmc_allocator hmc;
     rdma_hmc_allocator hmc_exhaustion;
     rdma_hmc_allocator hmc_overflow;
@@ -143,6 +188,13 @@ class rdma_resource_manager_test extends uvm_test;
     rdma_function_binding function_wrap_binding;
     rdma_function_binding function_release_binding;
     rdma_function_binding permanent_exhaustion_binding;
+    rdma_function_binding width_binding;
+    rdma_function_binding width_binding_copy;
+    rdma_function_binding lifecycle_binding;
+    rdma_function_binding allocated_error_binding;
+    rdma_function_binding recovery_binding;
+    rdma_function_binding privileged_recovery_binding;
+    rdma_function_binding stale_recovery_binding;
     rdma_function_handle owner_h;
     rdma_function_handle owner_b_h;
     rdma_pd pd;
@@ -152,6 +204,17 @@ class rdma_resource_manager_test extends uvm_test;
     rdma_pd dep_pd;
     rdma_pd teardown_pd;
     rdma_pd exhausted_pd;
+    rdma_pd width_pd;
+    rdma_pd width_pd_failed;
+    rdma_pd width_mr_pd;
+    rdma_pd width_free_mr_pd;
+    rdma_pd lifecycle_pd;
+    rdma_pd allocated_error_pd;
+    rdma_pd wrong_stage_pd;
+    rdma_pd recovery_pd;
+    rdma_pd privileged_recovery_pd;
+    rdma_pd privileged_recovery_pd_reused;
+    rdma_pd stale_recovery_pd;
     rdma_function all_kind_function;
     rdma_pd all_kind_pd;
     rdma_pd generation_pd;
@@ -182,6 +245,12 @@ class rdma_resource_manager_test extends uvm_test;
     rdma_aeq permanent_exhaustion_aeq;
     rdma_mr dep_mr;
     rdma_mr teardown_mr;
+    rdma_mr width_mr;
+    rdma_mr width_mr_failed;
+    rdma_mr width_free_mr;
+    rdma_mr lifecycle_mr;
+    rdma_mr allocated_error_mr_first;
+    rdma_mr allocated_error_mr;
     rdma_cq cq_pool;
     rdma_cq dep_cq;
     rdma_cq teardown_cq;
@@ -193,6 +262,8 @@ class rdma_resource_manager_test extends uvm_test;
     rdma_ceq dep_ceq;
     rdma_ceq teardown_ceq;
     rdma_aeq frozen_aeq;
+    rdma_aeq width_probe_aeq;
+    rdma_aeq rollback_aeq;
     rdma_handle old_h;
     rdma_handle same_generation_old_h;
     rdma_handle frozen_qp_h;
@@ -202,14 +273,26 @@ class rdma_resource_manager_test extends uvm_test;
     rdma_handle snapshot_qp_h;
     rdma_handle rollback_h;
     rdma_handle function_release_h;
+    rdma_handle width_pd_h;
+    rdma_handle lifecycle_mr_h;
+    rdma_handle stale_recovery_h;
+    rdma_function_handle stale_recovery_owner;
+    rdma_function_handle privileged_recovery_owner;
     rdma_resource resource;
     rdma_resource second_resource;
+    rdma_recovery_record recovery_record;
+    rdma_recovery_record recovery_lookup;
+    rdma_recovery_record recovery_lookup_again;
+    rdma_recovery_record malformed_recovery;
+    rdma_recovery_record ready_recovery;
     rdma_status s;
     int unsigned leak_count;
     int unsigned pd_local_before_exhaustion;
     int unsigned pd_serial_before_exhaustion;
     int unsigned cmq_local_before_exhaustion;
     int unsigned cmq_serial_before_exhaustion;
+    int unsigned serial_before_width_failure;
+    int unsigned free_count_before_width_failure;
     rdma_hmc_fvm_addr_t hmc_base;
     rdma_hmc_fvm_addr_t hmc_addr;
     rdma_hmc_fvm_addr_t hmc_addr_two;
@@ -222,6 +305,749 @@ class rdma_resource_manager_test extends uvm_test;
     rdma_bdf_t snapshot_bdf;
 
     phase.raise_objection(this);
+
+    // PD and MR local IDs are hardware-width projections.  The inclusive
+    // boundary succeeds, while the next fresh ID fails atomically without
+    // consuming another incarnation serial or registering another resource.
+    width_pd_rm = new("width_pd_rm");
+    width_binding = make_active_binding(
+      "width_pd_binding", 64'h1d00_0000_0000_0001,
+      32'h1d00_0101, 32'd1
+    );
+    width_pd_rm.set_next_local_id(RDMA_RESOURCE_PD, 16'hffff);
+    expect_status("WIDTH_PD_LAST",
+                  width_pd_rm.create_pd(width_binding, width_pd),
+                  RDMA_SC_OK);
+    if (width_pd == null || width_pd.local_pd_id != 16'hffff)
+      `uvm_error("WIDTH_PD_LAST",
+                 "allocator did not return the last 16-bit PD ID")
+    width_pd_h = clone_handle("WIDTH_PD_LAST_H", width_pd.handle);
+    serial_before_width_failure =
+      width_pd_rm.observed_next_object_serial(RDMA_RESOURCE_PD);
+    expect_status("WIDTH_PD_EXHAUSTED",
+                  width_pd_rm.create_pd(width_binding, width_pd_failed),
+                  RDMA_SC_RESOURCE_EXHAUSTED);
+    if (width_pd_failed != null ||
+        width_pd_rm.observed_next_object_serial(RDMA_RESOURCE_PD) !=
+          serial_before_width_failure)
+      `uvm_error("WIDTH_PD_EXHAUSTED",
+                 "failed PD allocation consumed output or serial state")
+    expect_status("WIDTH_PD_FAILURE_LEAK_COUNT",
+                  width_pd_rm.check_leaks(leak_count),
+                  RDMA_SC_INVALID_STATE);
+    if (leak_count != 1)
+      `uvm_error("WIDTH_PD_FAILURE_LEAK_COUNT",
+                 $sformatf("expected one live PD, got %0d", leak_count))
+    expect_status("WIDTH_PD_RELEASE",
+                  width_pd_rm.\release (width_pd.handle), RDMA_SC_OK);
+    expect_status("WIDTH_PD_REUSE_LIMIT",
+                  width_pd_rm.create_pd(width_binding, width_pd_failed),
+                  RDMA_SC_OK);
+    if (width_pd_failed == null ||
+        width_pd_failed.local_pd_id != 16'hffff ||
+        width_pd_failed.handle.same_instance(width_pd_h))
+      `uvm_error("WIDTH_PD_REUSE_LIMIT",
+                 "valid boundary ID reuse lost incarnation uniqueness")
+    expect_status("WIDTH_PD_REUSE_RELEASE",
+                  width_pd_rm.\release (width_pd_failed.handle), RDMA_SC_OK);
+
+    width_mr_rm = new("width_mr_rm");
+    width_binding = make_active_binding(
+      "width_mr_binding", 64'h1d00_0000_0000_0002,
+      32'h1d00_0202, 32'd2
+    );
+    expect_status("WIDTH_MR_PD",
+                  width_mr_rm.create_pd(width_binding, width_mr_pd),
+                  RDMA_SC_OK);
+    width_mr_rm.set_next_local_id(RDMA_RESOURCE_MR, 24'hff_ffff);
+    expect_status("WIDTH_MR_LAST",
+                  width_mr_rm.create_mr(width_binding, width_mr_pd.handle,
+                                         width_mr),
+                  RDMA_SC_OK);
+    if (width_mr == null || width_mr.local_mr_id != 24'hff_ffff)
+      `uvm_error("WIDTH_MR_LAST",
+                 "allocator did not return the last 24-bit MR ID")
+    serial_before_width_failure =
+      width_mr_rm.observed_next_object_serial(RDMA_RESOURCE_MR);
+    expect_status("WIDTH_MR_EXHAUSTED",
+                  width_mr_rm.create_mr(width_binding, width_mr_pd.handle,
+                                         width_mr_failed),
+                  RDMA_SC_RESOURCE_EXHAUSTED);
+    if (width_mr_failed != null ||
+        width_mr_rm.observed_next_object_serial(RDMA_RESOURCE_MR) !=
+          serial_before_width_failure)
+      `uvm_error("WIDTH_MR_EXHAUSTED",
+                 "failed MR allocation consumed output or serial state")
+    expect_status("WIDTH_MR_FAILURE_LEAK_COUNT",
+                  width_mr_rm.check_leaks(leak_count),
+                  RDMA_SC_INVALID_STATE);
+    if (leak_count != 2)
+      `uvm_error("WIDTH_MR_FAILURE_LEAK_COUNT",
+                 $sformatf("expected PD plus MR, got %0d", leak_count))
+    expect_status("WIDTH_MR_RELEASE",
+                  width_mr_rm.\release (width_mr.handle), RDMA_SC_OK);
+    expect_status("WIDTH_MR_PD_RELEASE",
+                  width_mr_rm.\release (width_mr_pd.handle), RDMA_SC_OK);
+
+    // An invalid free-list head is neither returned nor silently discarded.
+    // The first failed allocation also must not install a binding source.
+    width_free_pd_rm = new("width_free_pd_rm");
+    width_binding = make_active_binding(
+      "width_free_pd_binding", 64'h1d00_0000_0000_0003,
+      32'h1d00_0303, 32'd3
+    );
+    width_binding_copy = make_active_binding(
+      "width_free_pd_binding_copy", 64'h1d00_0000_0000_0003,
+      32'h1d00_0303, 32'd3
+    );
+    width_free_pd_rm.inject_free_local_id(RDMA_RESOURCE_PD, 32'h0001_0000);
+    free_count_before_width_failure =
+      width_free_pd_rm.observed_free_local_id_count(RDMA_RESOURCE_PD);
+    serial_before_width_failure =
+      width_free_pd_rm.observed_next_object_serial(RDMA_RESOURCE_PD);
+    expect_status("WIDTH_PD_BAD_FREE",
+                  width_free_pd_rm.create_pd(width_binding, width_pd_failed),
+                  RDMA_SC_RESOURCE_EXHAUSTED);
+    if (width_pd_failed != null ||
+        width_free_pd_rm.observed_free_local_id_count(RDMA_RESOURCE_PD) !=
+          free_count_before_width_failure ||
+        width_free_pd_rm.observed_next_object_serial(RDMA_RESOURCE_PD) !=
+          serial_before_width_failure)
+      `uvm_error("WIDTH_PD_BAD_FREE",
+                 "invalid free-list PD ID mutated allocator state")
+    expect_status("WIDTH_PD_BAD_FREE_NO_LEAKS",
+                  width_free_pd_rm.check_leaks(leak_count), RDMA_SC_OK);
+    expect_status("WIDTH_PD_BAD_FREE_NO_BINDING",
+                  width_free_pd_rm.create_aeq(width_binding_copy,
+                                               width_probe_aeq),
+                  RDMA_SC_OK);
+    expect_status("WIDTH_PD_BAD_FREE_AEQ_RELEASE",
+                  width_free_pd_rm.\release (width_probe_aeq.handle),
+                  RDMA_SC_OK);
+
+    width_free_mr_rm = new("width_free_mr_rm");
+    width_binding = make_active_binding(
+      "width_free_mr_binding", 64'h1d00_0000_0000_0004,
+      32'h1d00_0404, 32'd4
+    );
+    expect_status("WIDTH_BAD_FREE_MR_PD",
+                  width_free_mr_rm.create_pd(width_binding,
+                                              width_free_mr_pd),
+                  RDMA_SC_OK);
+    width_free_mr_rm.inject_free_local_id(RDMA_RESOURCE_MR,
+                                           32'h0100_0000);
+    free_count_before_width_failure =
+      width_free_mr_rm.observed_free_local_id_count(RDMA_RESOURCE_MR);
+    serial_before_width_failure =
+      width_free_mr_rm.observed_next_object_serial(RDMA_RESOURCE_MR);
+    expect_status("WIDTH_MR_BAD_FREE",
+                  width_free_mr_rm.create_mr(width_binding,
+                                              width_free_mr_pd.handle,
+                                              width_free_mr),
+                  RDMA_SC_RESOURCE_EXHAUSTED);
+    if (width_free_mr != null ||
+        width_free_mr_rm.observed_free_local_id_count(RDMA_RESOURCE_MR) !=
+          free_count_before_width_failure ||
+        width_free_mr_rm.observed_next_object_serial(RDMA_RESOURCE_MR) !=
+          serial_before_width_failure)
+      `uvm_error("WIDTH_MR_BAD_FREE",
+                 "invalid free-list MR ID mutated allocator state")
+    expect_status("WIDTH_BAD_FREE_MR_PD_RELEASE",
+                  width_free_mr_rm.\release (width_free_mr_pd.handle),
+                  RDMA_SC_OK);
+
+    // ERROR snapshots require the key authority handed off by staging.  A raw
+    // ALLOCATED MR with a nonzero local ID and no lkey is rejected atomically;
+    // the same incarnation is accepted after full population and staging.
+    allocated_error_rm = rdma_resource_manager::type_id::create(
+      "allocated_error_rm"
+    );
+    allocated_error_binding = make_active_binding(
+      "allocated_error_binding", 64'he220_0000_0000_0004,
+      32'he220_0404, 32'd14
+    );
+    expect_status("ALLOC_ERROR_CREATE_PD",
+                  allocated_error_rm.create_pd(allocated_error_binding,
+                                                allocated_error_pd),
+                  RDMA_SC_OK);
+    expect_status("ALLOC_ERROR_CREATE_MR_FIRST",
+                  allocated_error_rm.create_mr(allocated_error_binding,
+                                                allocated_error_pd.handle,
+                                                allocated_error_mr_first),
+                  RDMA_SC_OK);
+    expect_status("ALLOC_ERROR_CREATE_MR",
+                  allocated_error_rm.create_mr(allocated_error_binding,
+                                                allocated_error_pd.handle,
+                                                allocated_error_mr),
+                  RDMA_SC_OK);
+    if (allocated_error_mr.local_mr_id == 0)
+      `uvm_error("ALLOC_ERROR_CREATE_MR",
+                 "test requires a nonzero unprogrammed MR local ID")
+    expect_status("ALLOC_ERROR_PD_RESERVED_BUSY",
+                  allocated_error_rm.release_reserved(
+                    allocated_error_pd.handle
+                  ), RDMA_SC_RESOURCE_BUSY);
+    expect_status("ALLOC_ERROR_PD_RESERVED_PRESERVED",
+                  allocated_error_rm.lookup(allocated_error_pd.handle,
+                                            resource),
+                  RDMA_SC_OK);
+    if (resource == null || resource.state != RDMA_RESOURCE_ALLOCATED)
+      `uvm_error("ALLOC_ERROR_PD_RESERVED_PRESERVED",
+                 "busy reservation rollback changed PD state")
+    recovery_record = rdma_recovery_record::type_id::create(
+      "allocated_error_recovery"
+    );
+    recovery_record.resource_h = clone_handle(
+      "ALLOC_ERROR_H", allocated_error_mr.handle
+    );
+    recovery_record.hardware_presence = RDMA_HW_PRESENCE_ABSENT;
+    recovery_record.primary_status = rdma_status::make(
+      RDMA_SC_RESET_CANCELLED, "programming aborted before key commit"
+    );
+    expect_status("ALLOC_ERROR_MARK_RAW",
+                  allocated_error_rm.mark_error(allocated_error_mr.handle,
+                                                recovery_record),
+                  RDMA_SC_INVALID_ARGUMENT);
+    expect_status("ALLOC_ERROR_RAW_LOOKUP",
+                  allocated_error_rm.lookup(allocated_error_mr.handle,
+                                            resource),
+                  RDMA_SC_OK);
+    if (resource == null || resource.state != RDMA_RESOURCE_ALLOCATED)
+      `uvm_error("ALLOC_ERROR_RAW_LOOKUP",
+                 "rejected raw MR recovery changed registry state")
+    expect_status("ALLOC_ERROR_RAW_NO_RECOVERY",
+                  allocated_error_rm.lookup_recovery(
+                    allocated_error_mr.handle, recovery_lookup
+                  ), RDMA_SC_INVALID_STATE);
+    allocated_error_mr.iova.value = 64'h2000_0000;
+    allocated_error_mr.length = 64'h4000;
+    allocated_error_mr.lkey = {
+      allocated_error_mr.local_mr_id[23:0], 8'ha5
+    };
+    allocated_error_mr.rkey = allocated_error_mr.lkey;
+    allocated_error_mr.access = '{local_write:1'b1, remote_read:1'b1,
+                                  remote_write:1'b0,
+                                  memory_window_bind:1'b0,
+                                  remote_atomic:1'b0};
+    expect_status("ALLOC_ERROR_STAGE",
+                  allocated_error_rm.stage_allocated(allocated_error_mr),
+                  RDMA_SC_OK);
+    expect_status("ALLOC_ERROR_MARK_STAGED",
+                  allocated_error_rm.mark_error(allocated_error_mr.handle,
+                                                recovery_record),
+                  RDMA_SC_OK);
+    expect_status("ALLOC_ERROR_STAGED_LOOKUP",
+                  allocated_error_rm.lookup(allocated_error_mr.handle,
+                                            resource),
+                  RDMA_SC_OK);
+    if (resource == null || resource.state != RDMA_RESOURCE_ERROR)
+      `uvm_error("ALLOC_ERROR_STAGED_LOOKUP",
+                 "staged exact incarnation did not enter ERROR")
+    expect_status("ALLOC_ERROR_FUNCTION_RELEASE",
+                  allocated_error_rm.release_function(
+                    allocated_error_binding.make_handle()
+                  ), RDMA_SC_OK);
+    expect_status("ALLOC_ERROR_NO_LEAKS",
+                  allocated_error_rm.check_leaks(leak_count), RDMA_SC_OK);
+
+    // Controlled lifecycle publication keeps the registry authoritative and
+    // detached from every candidate and lookup snapshot.
+    lifecycle_rm = rdma_resource_manager::type_id::create("lifecycle_rm");
+    lifecycle_binding = make_active_binding(
+      "lifecycle_binding", 64'h1c1f_0000_0000_0001,
+      32'h1c1f_0101, 32'd17
+    );
+    expect_status("LIFECYCLE_CREATE_PD",
+                  lifecycle_rm.create_pd(lifecycle_binding, lifecycle_pd),
+                  RDMA_SC_OK);
+    expect_status("LIFECYCLE_ACTIVATE_NULL",
+                  lifecycle_rm.activate(null), RDMA_SC_INVALID_ARGUMENT);
+    expect_status("LIFECYCLE_PD_ACTIVATE",
+                  lifecycle_rm.activate(lifecycle_pd.handle), RDMA_SC_OK);
+    expect_status("LIFECYCLE_PD_ACTIVATE_AGAIN",
+                  lifecycle_rm.activate(lifecycle_pd.handle),
+                  RDMA_SC_INVALID_STATE);
+    expect_status("LIFECYCLE_QUIESCE_NULL",
+                  lifecycle_rm.begin_quiesce(null),
+                  RDMA_SC_INVALID_ARGUMENT);
+    expect_status("LIFECYCLE_RESTORE_NULL",
+                  lifecycle_rm.restore_active(null),
+                  RDMA_SC_INVALID_ARGUMENT);
+    expect_status("LIFECYCLE_FINALIZE_NULL",
+                  lifecycle_rm.finalize_release(null),
+                  RDMA_SC_INVALID_ARGUMENT);
+    expect_status("LIFECYCLE_RELEASE_RESERVED_NULL",
+                  lifecycle_rm.release_reserved(null),
+                  RDMA_SC_INVALID_ARGUMENT);
+    expect_status("LIFECYCLE_CREATE_MR",
+                  lifecycle_rm.create_mr(lifecycle_binding,
+                                          lifecycle_pd.handle,
+                                          lifecycle_mr),
+                  RDMA_SC_OK);
+    expect_status("LIFECYCLE_PD_BUSY",
+                  lifecycle_rm.begin_quiesce(lifecycle_pd.handle),
+                  RDMA_SC_RESOURCE_BUSY);
+    expect_status("LIFECYCLE_PD_BUSY_STATE",
+                  lifecycle_rm.lookup(lifecycle_pd.handle, resource),
+                  RDMA_SC_OK);
+    if (resource == null || resource.state != RDMA_RESOURCE_ACTIVE)
+      `uvm_error("LIFECYCLE_PD_BUSY_STATE",
+                 "busy quiesce changed the PD state")
+
+    lifecycle_mr.iova.value = 64'h1000_0000;
+    lifecycle_mr.length = 64'h2000;
+    lifecycle_mr.lkey = {lifecycle_mr.local_mr_id[23:0], 8'h5a};
+    lifecycle_mr.rkey = lifecycle_mr.lkey;
+    lifecycle_mr.access = '{local_write:1'b1, remote_read:1'b1,
+                            remote_write:1'b0, memory_window_bind:1'b0,
+                            remote_atomic:1'b0};
+    lifecycle_mr_h = clone_handle("LIFECYCLE_MR_H", lifecycle_mr.handle);
+    expect_status("LIFECYCLE_COMMIT_NULL",
+                  lifecycle_rm.commit_programmed(null),
+                  RDMA_SC_INVALID_ARGUMENT);
+    expect_status("LIFECYCLE_COMMIT_BEFORE_STAGE",
+                  lifecycle_rm.commit_programmed(lifecycle_mr),
+                  RDMA_SC_INVALID_STATE);
+    expect_status("LIFECYCLE_ACTIVATE_ALLOCATED_MR",
+                  lifecycle_rm.activate(lifecycle_mr.handle),
+                  RDMA_SC_INVALID_STATE);
+    expect_status("LIFECYCLE_STAGE_NULL",
+                  lifecycle_rm.stage_allocated(null),
+                  RDMA_SC_INVALID_ARGUMENT);
+    wrong_stage_pd = rdma_pd::type_id::create("wrong_stage_pd");
+    wrong_stage_pd.handle = clone_handle("WRONG_STAGE_H",
+                                         lifecycle_mr.handle);
+    wrong_stage_pd.owner = clone_function_handle("WRONG_STAGE_OWNER",
+                                                  lifecycle_mr.owner);
+    wrong_stage_pd.state = RDMA_RESOURCE_ALLOCATED;
+    expect_status("LIFECYCLE_STAGE_WRONG_TYPE",
+                  lifecycle_rm.stage_allocated(wrong_stage_pd),
+                  RDMA_SC_INVALID_ARGUMENT);
+    lifecycle_mr.handle.object_id++;
+    expect_status("LIFECYCLE_STAGE_WRONG_INCARCATION",
+                  lifecycle_rm.stage_allocated(lifecycle_mr),
+                  RDMA_SC_INVALID_ARGUMENT);
+    lifecycle_mr.handle = lifecycle_mr_h;
+    lifecycle_mr.state = RDMA_RESOURCE_PROGRAMMED;
+    expect_status("LIFECYCLE_STAGE_WRONG_STATE",
+                  lifecycle_rm.stage_allocated(lifecycle_mr),
+                  RDMA_SC_INVALID_STATE);
+    lifecycle_mr.state = RDMA_RESOURCE_ALLOCATED;
+    lifecycle_mr.outstanding_ids.push_back(64'hfeed);
+    expect_status("LIFECYCLE_STAGE_INJECT_OUTSTANDING",
+                  lifecycle_rm.stage_allocated(lifecycle_mr),
+                  RDMA_SC_INVALID_ARGUMENT);
+    lifecycle_mr.outstanding_ids.delete();
+    expect_status("LIFECYCLE_STAGE",
+                  lifecycle_rm.stage_allocated(lifecycle_mr), RDMA_SC_OK);
+    lifecycle_mr.length = 64'h4000;
+    expect_status("LIFECYCLE_STAGE_LOOKUP",
+                  lifecycle_rm.lookup(lifecycle_mr.handle, resource),
+                  RDMA_SC_OK);
+    if (resource == null || resource.state != RDMA_RESOURCE_ALLOCATED ||
+        !$cast(width_mr_failed, resource) ||
+        width_mr_failed.length != 64'h2000)
+      `uvm_error("LIFECYCLE_STAGE_LOOKUP",
+                 "stage did not publish a detached ALLOCATED snapshot")
+    expect_status("LIFECYCLE_COMMIT_WRONG_TYPE",
+                  lifecycle_rm.commit_programmed(wrong_stage_pd),
+                  RDMA_SC_INVALID_ARGUMENT);
+    lifecycle_mr.state = RDMA_RESOURCE_PROGRAMMED;
+    expect_status("LIFECYCLE_COMMIT_WRONG_STATE",
+                  lifecycle_rm.commit_programmed(lifecycle_mr),
+                  RDMA_SC_INVALID_STATE);
+    lifecycle_mr.state = RDMA_RESOURCE_ALLOCATED;
+    lifecycle_mr.length = 0;
+    expect_status("LIFECYCLE_COMMIT_INVALID",
+                  lifecycle_rm.commit_programmed(lifecycle_mr),
+                  RDMA_SC_INVALID_ARGUMENT);
+    expect_status("LIFECYCLE_COMMIT_INVALID_STATE_PRESERVED",
+                  lifecycle_rm.lookup(lifecycle_mr.handle, resource),
+                  RDMA_SC_OK);
+    if (resource == null || resource.state != RDMA_RESOURCE_ALLOCATED)
+      `uvm_error("LIFECYCLE_COMMIT_INVALID_STATE_PRESERVED",
+                 "invalid commit mutated the staged registry state")
+    lifecycle_mr.length = 64'h2000;
+    expect_status("LIFECYCLE_PROGRAM",
+                  lifecycle_rm.commit_programmed(lifecycle_mr), RDMA_SC_OK);
+    lifecycle_mr.length = 64'h8000;
+    expect_status("LIFECYCLE_PROGRAM_LOOKUP",
+                  lifecycle_rm.lookup(lifecycle_mr.handle, resource),
+                  RDMA_SC_OK);
+    if (resource == null || resource.state != RDMA_RESOURCE_PROGRAMMED ||
+        !$cast(width_mr_failed, resource) ||
+        width_mr_failed.length != 64'h2000)
+      `uvm_error("LIFECYCLE_PROGRAM_LOOKUP",
+                 "commit did not publish a detached PROGRAMMED snapshot")
+    expect_status("LIFECYCLE_MR_ACTIVATE",
+                  lifecycle_rm.activate(lifecycle_mr.handle), RDMA_SC_OK);
+    expect_status("LIFECYCLE_RELEASE_ACTIVE",
+                  lifecycle_rm.release_reserved(lifecycle_mr.handle),
+                  RDMA_SC_INVALID_STATE);
+    expect_status("LIFECYCLE_COMPAT_RELEASE_ACTIVE",
+                  lifecycle_rm.\release (lifecycle_mr.handle),
+                  RDMA_SC_INVALID_STATE);
+    expect_status("LIFECYCLE_COMPAT_FREEZE_ACTIVE",
+                  lifecycle_rm.freeze(lifecycle_mr.handle),
+                  RDMA_SC_INVALID_STATE);
+
+    expect_status("OUTSTANDING_ZERO",
+                  lifecycle_rm.track_outstanding(lifecycle_mr.handle, 0),
+                  RDMA_SC_INVALID_ARGUMENT);
+    expect_status("OUTSTANDING_TRACK_NULL",
+                  lifecycle_rm.track_outstanding(null, 64'h1234),
+                  RDMA_SC_INVALID_ARGUMENT);
+    expect_status("OUTSTANDING_RETIRE_NULL",
+                  lifecycle_rm.retire_outstanding(null, 64'h1234),
+                  RDMA_SC_INVALID_ARGUMENT);
+    expect_status("OUTSTANDING_TRACK",
+                  lifecycle_rm.track_outstanding(lifecycle_mr.handle,
+                                                  64'h1234),
+                  RDMA_SC_OK);
+    expect_status("OUTSTANDING_DUPLICATE",
+                  lifecycle_rm.track_outstanding(lifecycle_mr.handle,
+                                                  64'h1234),
+                  RDMA_SC_INVALID_ARGUMENT);
+    expect_status("OUTSTANDING_LOOKUP",
+                  lifecycle_rm.lookup(lifecycle_mr.handle, resource),
+                  RDMA_SC_OK);
+    if (resource == null || resource.outstanding_ids.size() != 1 ||
+        resource.outstanding_ids[0] != 64'h1234)
+      `uvm_error("OUTSTANDING_LOOKUP",
+                 "registry did not authoritatively track one unique ID")
+    expect_status("OUTSTANDING_QUIESCE_BUSY",
+                  lifecycle_rm.begin_quiesce(lifecycle_mr.handle),
+                  RDMA_SC_RESOURCE_BUSY);
+    expect_status("OUTSTANDING_RETIRE_UNKNOWN",
+                  lifecycle_rm.retire_outstanding(lifecycle_mr.handle,
+                                                   64'h9999),
+                  RDMA_SC_INVALID_ARGUMENT);
+    expect_status("OUTSTANDING_RETIRE",
+                  lifecycle_rm.retire_outstanding(lifecycle_mr.handle,
+                                                   64'h1234),
+                  RDMA_SC_OK);
+    expect_status("OUTSTANDING_QUIESCE",
+                  lifecycle_rm.begin_quiesce(lifecycle_mr.handle),
+                  RDMA_SC_OK);
+    expect_status("OUTSTANDING_TRACK_QUIESCING",
+                  lifecycle_rm.track_outstanding(lifecycle_mr.handle,
+                                                  64'h5678),
+                  RDMA_SC_INVALID_STATE);
+    expect_status("LIFECYCLE_RESTORE",
+                  lifecycle_rm.restore_active(lifecycle_mr.handle),
+                  RDMA_SC_OK);
+    expect_status("LIFECYCLE_RESTORE_ACTIVE",
+                  lifecycle_rm.restore_active(lifecycle_mr.handle),
+                  RDMA_SC_INVALID_STATE);
+    expect_status("LIFECYCLE_MR_QUIESCE",
+                  lifecycle_rm.begin_quiesce(lifecycle_mr.handle),
+                  RDMA_SC_OK);
+    expect_status("LIFECYCLE_MR_FINALIZE",
+                  lifecycle_rm.finalize_release(lifecycle_mr.handle),
+                  RDMA_SC_OK);
+    expect_status("LIFECYCLE_PD_QUIESCE",
+                  lifecycle_rm.begin_quiesce(lifecycle_pd.handle),
+                  RDMA_SC_OK);
+    expect_status("LIFECYCLE_PD_FINALIZE",
+                  lifecycle_rm.finalize_release(lifecycle_pd.handle),
+                  RDMA_SC_OK);
+    expect_status("LIFECYCLE_CREATE_ROLLBACK",
+                  lifecycle_rm.create_aeq(lifecycle_binding, rollback_aeq),
+                  RDMA_SC_OK);
+    expect_status("LIFECYCLE_RELEASE_RESERVED",
+                  lifecycle_rm.release_reserved(rollback_aeq.handle),
+                  RDMA_SC_OK);
+    expect_status("LIFECYCLE_RELEASE_RESERVED_AGAIN",
+                  lifecycle_rm.release_reserved(rollback_aeq.handle),
+                  RDMA_SC_INVALID_STATE);
+
+    // ERROR owns a detached recovery record.  Neither normal release nor
+    // clearing a completed record may bypass the recovery release gate.
+    recovery_rm = rdma_resource_manager::type_id::create("recovery_rm");
+    recovery_binding = make_active_binding(
+      "recovery_binding", 64'he220_0000_0000_0001,
+      32'he220_0101, 32'd22
+    );
+    expect_status("RECOVERY_CREATE_PD",
+                  recovery_rm.create_pd(recovery_binding, recovery_pd),
+                  RDMA_SC_OK);
+    expect_status("RECOVERY_ACTIVATE_PD",
+                  recovery_rm.activate(recovery_pd.handle), RDMA_SC_OK);
+    recovery_record = rdma_recovery_record::type_id::create(
+      "recovery_record"
+    );
+    recovery_record.resource_h = clone_handle("RECOVERY_RECORD_H",
+                                               recovery_pd.handle);
+    recovery_record.hardware_presence = RDMA_HW_PRESENCE_PRESENT;
+    recovery_record.pending_steps.push_back(RDMA_CTRL_STEP_HW_DRAINED);
+    recovery_record.primary_status = rdma_status::make(
+      RDMA_SC_TIMEOUT, "hardware state is ambiguous"
+    );
+    malformed_recovery = rdma_recovery_record::type_id::create(
+      "malformed_recovery"
+    );
+    malformed_recovery.copy(recovery_record);
+    expect_status("RECOVERY_MARK_NULL_HANDLE",
+                  recovery_rm.mark_error(null, recovery_record),
+                  RDMA_SC_INVALID_ARGUMENT);
+    expect_status("RECOVERY_MARK_NULL_RECORD",
+                  recovery_rm.mark_error(recovery_pd.handle, null),
+                  RDMA_SC_INVALID_ARGUMENT);
+    expect_status("RECOVERY_LOOKUP_NULL",
+                  recovery_rm.lookup_recovery(null, recovery_lookup),
+                  RDMA_SC_INVALID_ARGUMENT);
+    expect_status("RECOVERY_LOOKUP_MISSING",
+                  recovery_rm.lookup_recovery(recovery_pd.handle,
+                                              recovery_lookup),
+                  RDMA_SC_INVALID_STATE);
+    malformed_recovery.primary_status = null;
+    expect_status("RECOVERY_MARK_MALFORMED",
+                  recovery_rm.mark_error(recovery_pd.handle,
+                                         malformed_recovery),
+                  RDMA_SC_INVALID_ARGUMENT);
+    malformed_recovery.copy(recovery_record);
+    malformed_recovery.resource_h.object_id++;
+    expect_status("RECOVERY_MARK_MISMATCH",
+                  recovery_rm.mark_error(recovery_pd.handle,
+                                         malformed_recovery),
+                  RDMA_SC_INVALID_ARGUMENT);
+    expect_status("RECOVERY_MALFORMED_STATE_PRESERVED",
+                  recovery_rm.lookup(recovery_pd.handle, resource),
+                  RDMA_SC_OK);
+    if (resource == null || resource.state != RDMA_RESOURCE_ACTIVE)
+      `uvm_error("RECOVERY_MALFORMED_STATE_PRESERVED",
+                 "malformed recovery changed resource state")
+    expect_status("RECOVERY_MARK_ERROR",
+                  recovery_rm.mark_error(recovery_pd.handle,
+                                         recovery_record),
+                  RDMA_SC_OK);
+    recovery_record.hardware_presence = RDMA_HW_PRESENCE_ABSENT;
+    recovery_record.pending_steps.delete();
+    expect_status("RECOVERY_LOOKUP",
+                  recovery_rm.lookup_recovery(recovery_pd.handle,
+                                              recovery_lookup),
+                  RDMA_SC_OK);
+    if (recovery_lookup == null ||
+        recovery_lookup.hardware_presence != RDMA_HW_PRESENCE_PRESENT ||
+        recovery_lookup.pending_steps.size() != 1)
+      `uvm_error("RECOVERY_LOOKUP",
+                 "mark_error did not retain a detached recovery record")
+    recovery_lookup.hardware_presence = RDMA_HW_PRESENCE_ABSENT;
+    recovery_lookup.pending_steps.delete();
+    expect_status("RECOVERY_LOOKUP_AGAIN",
+                  recovery_rm.lookup_recovery(recovery_pd.handle,
+                                              recovery_lookup_again),
+                  RDMA_SC_OK);
+    if (recovery_lookup_again == null ||
+        recovery_lookup_again.hardware_presence != RDMA_HW_PRESENCE_PRESENT ||
+        recovery_lookup_again.pending_steps.size() != 1)
+      `uvm_error("RECOVERY_LOOKUP_AGAIN",
+                 "caller mutation reached recovery side-table state")
+    expect_status("RECOVERY_ERROR_LOOKUP",
+                  recovery_rm.lookup(recovery_pd.handle, resource),
+                  RDMA_SC_OK);
+    if (resource == null || resource.state != RDMA_RESOURCE_ERROR)
+      `uvm_error("RECOVERY_ERROR_LOOKUP",
+                 "mark_error did not publish ERROR state")
+    expect_status("RECOVERY_ERROR_ACTIVATE",
+                  recovery_rm.activate(recovery_pd.handle),
+                  RDMA_SC_INVALID_STATE);
+    expect_status("RECOVERY_ERROR_RELEASE_RESERVED",
+                  recovery_rm.release_reserved(recovery_pd.handle),
+                  RDMA_SC_INVALID_STATE);
+    expect_status("RECOVERY_ERROR_COMPAT_RELEASE",
+                  recovery_rm.\release (recovery_pd.handle),
+                  RDMA_SC_RECOVERY_REQUIRED);
+    expect_status("RECOVERY_ERROR_FINALIZE_PRESENT",
+                  recovery_rm.finalize_release(recovery_pd.handle),
+                  RDMA_SC_RECOVERY_REQUIRED);
+    expect_status("RECOVERY_CLEAR_INCOMPLETE",
+                  recovery_rm.clear_recovery(recovery_pd.handle),
+                  RDMA_SC_RECOVERY_REQUIRED);
+    expect_status("RECOVERY_INCOMPLETE_RETAINED",
+                  recovery_rm.lookup_recovery(recovery_pd.handle,
+                                              recovery_lookup),
+                  RDMA_SC_OK);
+
+    ready_recovery = rdma_recovery_record::type_id::create(
+      "ready_recovery"
+    );
+    ready_recovery.resource_h = clone_handle("READY_RECOVERY_H",
+                                              recovery_pd.handle);
+    ready_recovery.hardware_presence = RDMA_HW_PRESENCE_ABSENT;
+    ready_recovery.primary_status = rdma_status::make(
+      RDMA_SC_TIMEOUT, "hardware absence confirmed"
+    );
+    ready_recovery.pending_steps.push_back(RDMA_CTRL_STEP_HW_DRAINED);
+    expect_status("RECOVERY_REMARK_PENDING_ONLY",
+                  recovery_rm.mark_error(recovery_pd.handle,
+                                         ready_recovery),
+                  RDMA_SC_OK);
+    expect_status("RECOVERY_FINALIZE_PENDING_ONLY",
+                  recovery_rm.finalize_release(recovery_pd.handle),
+                  RDMA_SC_RECOVERY_REQUIRED);
+    ready_recovery.pending_steps.delete();
+    ready_recovery.hardware_presence = RDMA_HW_PRESENCE_PRESENT;
+    expect_status("RECOVERY_REMARK_PRESENT_ONLY",
+                  recovery_rm.mark_error(recovery_pd.handle,
+                                         ready_recovery),
+                  RDMA_SC_OK);
+    expect_status("RECOVERY_FINALIZE_PRESENT_ONLY",
+                  recovery_rm.finalize_release(recovery_pd.handle),
+                  RDMA_SC_RECOVERY_REQUIRED);
+    ready_recovery.hardware_presence = RDMA_HW_PRESENCE_ABSENT;
+    expect_status("RECOVERY_REMARK_READY",
+                  recovery_rm.mark_error(recovery_pd.handle,
+                                         ready_recovery),
+                  RDMA_SC_OK);
+    expect_status("RECOVERY_CLEAR_READY",
+                  recovery_rm.clear_recovery(recovery_pd.handle),
+                  RDMA_SC_OK);
+    expect_status("RECOVERY_CLEARED_LOOKUP",
+                  recovery_rm.lookup_recovery(recovery_pd.handle,
+                                              recovery_lookup),
+                  RDMA_SC_INVALID_STATE);
+    expect_status("RECOVERY_CLEAR_NO_BYPASS",
+                  recovery_rm.finalize_release(recovery_pd.handle),
+                  RDMA_SC_RECOVERY_REQUIRED);
+    expect_status("RECOVERY_REATTACH_READY",
+                  recovery_rm.mark_error(recovery_pd.handle,
+                                         ready_recovery),
+                  RDMA_SC_OK);
+    expect_status("RECOVERY_FINALIZE",
+                  recovery_rm.finalize_release(recovery_pd.handle),
+                  RDMA_SC_OK);
+    expect_status("RECOVERY_RELEASED_LOOKUP",
+                  recovery_rm.lookup(recovery_pd.handle, resource),
+                  RDMA_SC_INVALID_STATE);
+
+    // Function retirement is the privileged reset boundary: its complete
+    // dependency-order preflight supplies hardware invalidation authority and
+    // may force an incomplete ERROR topology down without weakening any
+    // ordinary per-resource gate.
+    privileged_recovery_rm = new("privileged_recovery_rm");
+    privileged_recovery_binding = make_active_binding(
+      "privileged_recovery_binding", 64'he220_0000_0000_0003,
+      32'he220_0303, 32'd41
+    );
+    privileged_recovery_owner = privileged_recovery_binding.make_handle();
+    expect_status("PRIV_RECOVERY_CREATE",
+                  privileged_recovery_rm.create_pd(
+                    privileged_recovery_binding, privileged_recovery_pd
+                  ), RDMA_SC_OK);
+    expect_status("PRIV_RECOVERY_ACTIVATE",
+                  privileged_recovery_rm.activate(
+                    privileged_recovery_pd.handle
+                  ), RDMA_SC_OK);
+    recovery_record = rdma_recovery_record::type_id::create(
+      "privileged_unknown_recovery"
+    );
+    recovery_record.resource_h = clone_handle(
+      "PRIV_RECOVERY_H", privileged_recovery_pd.handle
+    );
+    recovery_record.hardware_presence = RDMA_HW_PRESENCE_UNKNOWN;
+    recovery_record.pending_steps.push_back(RDMA_CTRL_STEP_HW_DRAINED);
+    recovery_record.primary_status = rdma_status::make(
+      RDMA_SC_TIMEOUT, "reset owns ambiguous hardware invalidation"
+    );
+    expect_status("PRIV_RECOVERY_MARK",
+                  privileged_recovery_rm.mark_error(
+                    privileged_recovery_pd.handle, recovery_record
+                  ), RDMA_SC_OK);
+    expect_status("PRIV_RECOVERY_ORDINARY_FINALIZE",
+                  privileged_recovery_rm.finalize_release(
+                    privileged_recovery_pd.handle
+                  ), RDMA_SC_RECOVERY_REQUIRED);
+    expect_status("PRIV_RECOVERY_FUNCTION_RELEASE",
+                  privileged_recovery_rm.release_function(
+                    privileged_recovery_owner
+                  ), RDMA_SC_OK);
+    expect_status("PRIV_RECOVERY_NO_LEAKS",
+                  privileged_recovery_rm.check_leaks(
+                    leak_count, privileged_recovery_owner
+                  ), RDMA_SC_OK);
+    if (privileged_recovery_rm.observed_recovery_count() != 0)
+      `uvm_error("PRIV_RECOVERY_NO_LEAKS",
+                 "privileged ERROR teardown leaked recovery metadata")
+    expect_status("PRIV_RECOVERY_RECORD_RETIRED",
+                  privileged_recovery_rm.lookup_recovery(
+                    privileged_recovery_pd.handle, recovery_lookup
+                  ), RDMA_SC_STALE_GENERATION);
+    privileged_recovery_binding.generation++;
+    privileged_recovery_binding.owner_h =
+      privileged_recovery_binding.make_handle();
+    expect_status("PRIV_RECOVERY_ID_REUSE",
+                  privileged_recovery_rm.create_pd(
+                    privileged_recovery_binding,
+                    privileged_recovery_pd_reused
+                  ), RDMA_SC_OK);
+    if (privileged_recovery_pd_reused == null ||
+        privileged_recovery_pd_reused.local_pd_id !=
+          privileged_recovery_pd.local_pd_id ||
+        privileged_recovery_pd_reused.handle.same_instance(
+          privileged_recovery_pd.handle
+        ))
+      `uvm_error("PRIV_RECOVERY_ID_REUSE",
+                 "privileged ERROR teardown leaked ID/incarnation state")
+    expect_status("PRIV_RECOVERY_RELEASE_NEXT",
+                  privileged_recovery_rm.release_function(
+                    privileged_recovery_binding.make_handle()
+                  ), RDMA_SC_OK);
+
+    // Only mark_error receives the exact-key stale-generation exception.
+    // Other public operations retain ordinary live-binding authority checks.
+    stale_recovery_rm = rdma_resource_manager::type_id::create(
+      "stale_recovery_rm"
+    );
+    stale_recovery_binding = make_active_binding(
+      "stale_recovery_binding", 64'he220_0000_0000_0002,
+      32'he220_0202, 32'd31
+    );
+    stale_recovery_owner = stale_recovery_binding.make_handle();
+    expect_status("STALE_RECOVERY_CREATE",
+                  stale_recovery_rm.create_pd(stale_recovery_binding,
+                                               stale_recovery_pd),
+                  RDMA_SC_OK);
+    stale_recovery_h = clone_handle("STALE_RECOVERY_H",
+                                    stale_recovery_pd.handle);
+    ready_recovery = rdma_recovery_record::type_id::create(
+      "stale_ready_recovery"
+    );
+    ready_recovery.resource_h = clone_handle("STALE_READY_H",
+                                              stale_recovery_h);
+    ready_recovery.hardware_presence = RDMA_HW_PRESENCE_ABSENT;
+    ready_recovery.primary_status = rdma_status::make(
+      RDMA_SC_RESET_CANCELLED, "Function generation advanced"
+    );
+    stale_recovery_binding.generation++;
+    stale_recovery_binding.owner_h = stale_recovery_binding.make_handle();
+    expect_status("STALE_RECOVERY_MARK_EXCEPTION",
+                  stale_recovery_rm.mark_error(stale_recovery_h,
+                                                ready_recovery),
+                  RDMA_SC_OK);
+    expect_status("STALE_RECOVERY_ORDINARY_LOOKUP",
+                  stale_recovery_rm.lookup(stale_recovery_h, resource),
+                  RDMA_SC_STALE_GENERATION);
+    expect_status("STALE_RECOVERY_ACTIVATE",
+                  stale_recovery_rm.activate(stale_recovery_h),
+                  RDMA_SC_STALE_GENERATION);
+    expect_status("STALE_RECOVERY_RECORD_LOOKUP",
+                  stale_recovery_rm.lookup_recovery(stale_recovery_h,
+                                                    recovery_lookup),
+                  RDMA_SC_STALE_GENERATION);
+    expect_status("STALE_RECOVERY_CLEAR",
+                  stale_recovery_rm.clear_recovery(stale_recovery_h),
+                  RDMA_SC_STALE_GENERATION);
+    expect_status("STALE_RECOVERY_FINALIZE",
+                  stale_recovery_rm.finalize_release(stale_recovery_h),
+                  RDMA_SC_STALE_GENERATION);
+    expect_status("STALE_RECOVERY_PRIVILEGED_TEARDOWN",
+                  stale_recovery_rm.release_function(stale_recovery_owner),
+                  RDMA_SC_OK);
+    expect_status("STALE_RECOVERY_NO_LEAKS",
+                  stale_recovery_rm.check_leaks(leak_count,
+                                                stale_recovery_owner),
+                  RDMA_SC_OK);
 
     // Required minimal stale-generation scenario.
     rm = rdma_resource_manager::type_id::create("rm_stale");

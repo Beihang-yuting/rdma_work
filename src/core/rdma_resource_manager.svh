@@ -3,6 +3,8 @@ class rdma_resource_manager extends uvm_object;
 
   // Registry keys are exactly function_uid:generation:kind:object_id.
   protected rdma_resource registry[string];
+  protected bit staged_allocations[string];
+  protected rdma_recovery_record recovery_records[string];
   // The caller-owned reference is only a monotonic generation observer.  All
   // identity and configuration are read from the immutable deep-copy snapshot.
   protected rdma_function_binding generation_sources[string];
@@ -35,6 +37,16 @@ class rdma_resource_manager extends uvm_object;
                         RDMA_RESOURCE_QP, RDMA_RESOURCE_SRQ,
                         RDMA_RESOURCE_CMQ, RDMA_RESOURCE_CEQ,
                         RDMA_RESOURCE_AEQ};
+  endfunction
+
+  protected function int unsigned local_id_limit(
+    rdma_resource_kind_e kind
+  );
+    case (kind)
+      RDMA_RESOURCE_PD: return 16'hffff;
+      RDMA_RESOURCE_MR: return 24'hff_ffff;
+      default: return 32'hffff_ffff;
+    endcase
   endfunction
 
   protected function string resource_key(rdma_handle handle);
@@ -71,6 +83,42 @@ class rdma_resource_manager extends uvm_object;
       `uvm_fatal("RM_COPY_TYPE",
                  {copy_label, " resource clone type mismatch"})
     return cloned_resource;
+  endfunction
+
+  protected function rdma_recovery_record clone_recovery_value(
+    rdma_recovery_record source,
+    string copy_label
+  );
+    uvm_object cloned_object;
+    rdma_recovery_record cloned_recovery;
+
+    if (source == null)
+      return null;
+    cloned_object = source.clone();
+    if (cloned_object == null || !$cast(cloned_recovery, cloned_object))
+      `uvm_fatal("RM_COPY_TYPE",
+                 {copy_label, " recovery record clone mismatch"})
+    return cloned_recovery;
+  endfunction
+
+  protected function bit same_outstanding_ids(
+    rdma_resource lhs,
+    rdma_resource rhs
+  );
+    if (lhs == null || rhs == null ||
+        lhs.outstanding_ids.size() != rhs.outstanding_ids.size())
+      return 1'b0;
+    foreach (lhs.outstanding_ids[i]) begin
+      if (lhs.outstanding_ids[i] != rhs.outstanding_ids[i])
+        return 1'b0;
+    end
+    return 1'b1;
+  endfunction
+
+  protected function bit recovery_ready(rdma_recovery_record recovery);
+    return recovery != null &&
+           recovery.hardware_presence == RDMA_HW_PRESENCE_ABSENT &&
+           recovery.pending_steps.size() == 0;
   endfunction
 
   protected function rdma_function_binding clone_binding_value(
@@ -279,8 +327,10 @@ class rdma_resource_manager extends uvm_object;
     rdma_status status;
     rdma_function_binding trusted_binding;
     int unsigned serial;
+    int unsigned limit;
     string owner_key;
     bit registration_needed;
+    bit has_free_id;
 
     owner = null;
     handle = null;
@@ -299,11 +349,22 @@ class rdma_resource_manager extends uvm_object;
     if (serial > 32'h0fff_ffff)
       return rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED,
                                "resource incarnation serial is exhausted");
-    if ((!free_local_ids.exists(kind) ||
-         free_local_ids[kind].size() == 0) &&
-        next_local_id[kind] == 32'hffff_ffff)
+    limit = local_id_limit(kind);
+    has_free_id = free_local_ids.exists(kind) &&
+                  free_local_ids[kind].size() != 0;
+    if (has_free_id) begin
+      if (free_local_ids[kind][0] > limit)
+        return rdma_status::make(
+          RDMA_SC_RESOURCE_EXHAUSTED,
+          "resource free-list local ID exceeds the hardware width"
+        );
+    end
+    else if (next_local_id[kind] > limit ||
+             (limit == 32'hffff_ffff &&
+              next_local_id[kind] == 32'hffff_ffff)) begin
       return rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED,
                                "resource local ID pool is exhausted");
+    end
 
     if (has_conflicting_generation(owner))
       return rdma_status::make(
@@ -313,8 +374,7 @@ class rdma_resource_manager extends uvm_object;
     if (registration_needed)
       register_binding_context(binding, trusted_binding, owner, owner_key);
 
-    if (free_local_ids.exists(kind) &&
-        free_local_ids[kind].size() != 0)
+    if (has_free_id)
       local_id = free_local_ids[kind].pop_front();
     else begin
       local_id = next_local_id[kind];
@@ -490,6 +550,8 @@ class rdma_resource_manager extends uvm_object;
     kind = resource.resource_kind();
     local_id = resource_local_id(resource);
     resource.state = RDMA_RESOURCE_RELEASED;
+    recovery_records.delete(key);
+    staged_allocations.delete(key);
     free_local_ids[kind].push_back(local_id);
     registry.delete(key);
   endfunction
@@ -918,6 +980,425 @@ class rdma_resource_manager extends uvm_object;
                              "resource handle has been released");
   endfunction
 
+  virtual function rdma_status stage_allocated(rdma_resource candidate);
+    rdma_resource authoritative;
+    rdma_resource replacement;
+    rdma_status status;
+    string key;
+
+    if (candidate == null || candidate.handle == null)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "staged resource candidate is null");
+    if (candidate.state != RDMA_RESOURCE_ALLOCATED)
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "staged candidate must be ALLOCATED");
+    status = lookup(candidate.handle, authoritative);
+    if (!status.ok())
+      return status;
+    key = resource_key(candidate.handle);
+    if (registry[key].state != RDMA_RESOURCE_ALLOCATED)
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "registry resource is not ALLOCATED");
+    if (candidate.get_type_name() != authoritative.get_type_name())
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "staged candidate dynamic type changed");
+    if (candidate.owner == null || authoritative.owner == null ||
+        !candidate.owner.same_instance(authoritative.owner))
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "staged candidate owner changed");
+    if (!same_outstanding_ids(candidate, authoritative))
+      return rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT,
+        "outstanding operations require authoritative tracking"
+      );
+    replacement = clone_resource_value(candidate, "stage allocated");
+    replacement.state = RDMA_RESOURCE_ALLOCATED;
+    status = replacement.validate();
+    if (status == null)
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "staged candidate validation returned null");
+    if (!status.ok())
+      return status;
+    registry[key] = replacement;
+    staged_allocations[key] = 1'b1;
+    return rdma_status::success();
+  endfunction
+
+  virtual function rdma_status commit_programmed(rdma_resource candidate);
+    rdma_resource authoritative;
+    rdma_resource replacement;
+    rdma_status status;
+    string key;
+
+    if (candidate == null || candidate.handle == null)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "programmed resource candidate is null");
+    if (candidate.state != RDMA_RESOURCE_ALLOCATED)
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "programmed candidate must be ALLOCATED");
+    status = lookup(candidate.handle, authoritative);
+    if (!status.ok())
+      return status;
+    key = resource_key(candidate.handle);
+    if (registry[key].state != RDMA_RESOURCE_ALLOCATED ||
+        !staged_allocations.exists(key))
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "only a staged ALLOCATED resource can be programmed"
+      );
+    if (candidate.get_type_name() != authoritative.get_type_name())
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "programmed candidate dynamic type changed");
+    if (candidate.owner == null || authoritative.owner == null ||
+        !candidate.owner.same_instance(authoritative.owner))
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "programmed candidate owner changed");
+    if (!same_outstanding_ids(candidate, authoritative))
+      return rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT,
+        "outstanding operations require authoritative tracking"
+      );
+    replacement = clone_resource_value(candidate, "commit programmed");
+    replacement.state = RDMA_RESOURCE_PROGRAMMED;
+    status = replacement.validate();
+    if (status == null)
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "programmed candidate validation returned null"
+      );
+    if (!status.ok())
+      return status;
+    registry[key] = replacement;
+    staged_allocations.delete(key);
+    return rdma_status::success();
+  endfunction
+
+  virtual function rdma_status activate(rdma_handle handle);
+    rdma_resource authoritative;
+    rdma_resource replacement;
+    rdma_status status;
+    string key;
+
+    status = lookup(handle, authoritative);
+    if (!status.ok())
+      return status;
+    key = resource_key(handle);
+    if (handle.kind == RDMA_RESOURCE_PD) begin
+      if (registry[key].state != RDMA_RESOURCE_ALLOCATED)
+        return rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "PD activation requires ALLOCATED state"
+        );
+    end
+    else if (registry[key].state != RDMA_RESOURCE_PROGRAMMED) begin
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "non-PD activation requires PROGRAMMED state"
+      );
+    end
+    replacement = clone_resource_value(registry[key], "activate");
+    replacement.state = RDMA_RESOURCE_ACTIVE;
+    status = replacement.validate();
+    if (status == null)
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "active resource validation returned null");
+    if (!status.ok())
+      return status;
+    registry[key] = replacement;
+    staged_allocations.delete(key);
+    return rdma_status::success();
+  endfunction
+
+  virtual function rdma_status begin_quiesce(rdma_handle handle);
+    rdma_resource authoritative;
+    rdma_status status;
+    string key;
+
+    status = lookup(handle, authoritative);
+    if (!status.ok())
+      return status;
+    key = resource_key(handle);
+    if (registry[key].state != RDMA_RESOURCE_ACTIVE)
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "only ACTIVE resource can begin quiesce");
+    if (has_dependents(registry[key]))
+      return rdma_status::make(RDMA_SC_RESOURCE_BUSY,
+                               "resource still has live dependents");
+    if (registry[key].outstanding_ids.size() != 0)
+      return rdma_status::make(
+        RDMA_SC_RESOURCE_BUSY,
+        "resource still has outstanding operations"
+      );
+    registry[key].state = RDMA_RESOURCE_QUIESCING;
+    return rdma_status::success();
+  endfunction
+
+  virtual function rdma_status restore_active(rdma_handle handle);
+    rdma_resource authoritative;
+    rdma_resource replacement;
+    rdma_status status;
+    string key;
+
+    status = lookup(handle, authoritative);
+    if (!status.ok())
+      return status;
+    key = resource_key(handle);
+    if (registry[key].state != RDMA_RESOURCE_QUIESCING)
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "only QUIESCING resource can be restored ACTIVE"
+      );
+    replacement = clone_resource_value(registry[key], "restore active");
+    replacement.state = RDMA_RESOURCE_ACTIVE;
+    status = replacement.validate();
+    if (status == null)
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "restored resource validation returned null");
+    if (!status.ok())
+      return status;
+    registry[key] = replacement;
+    return rdma_status::success();
+  endfunction
+
+  virtual function rdma_status mark_error(
+    rdma_handle handle,
+    rdma_recovery_record recovery
+  );
+    rdma_resource replacement;
+    rdma_recovery_record recovery_copy;
+    rdma_function_handle related_owner;
+    rdma_status status;
+    string key;
+
+    if (handle == null || recovery == null)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "error handle or recovery record is null");
+    if (!valid_kind(handle.kind) ||
+        (handle.kind != RDMA_RESOURCE_FUNCTION &&
+         handle.object_id[31:28] != handle.kind))
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "error resource handle is malformed");
+    key = resource_key(handle);
+    if (!registry.exists(key)) begin
+      if (related_incarnation_owner(handle, related_owner))
+        return rdma_status::make(RDMA_SC_STALE_GENERATION,
+                                 "error resource generation is stale");
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "error resource incarnation is unknown");
+    end
+    if (registry[key] == null || registry[key].handle == null ||
+        !registry[key].handle.same_instance(handle))
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "error registry identity is inconsistent");
+    if (recovery.resource_h == null ||
+        !recovery.resource_h.same_instance(handle))
+      return rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT,
+        "recovery record does not match the resource incarnation"
+      );
+    status = recovery.validate();
+    if (status == null)
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "recovery validation returned null");
+    if (!status.ok())
+      return status;
+    replacement = clone_resource_value(registry[key], "mark error");
+    replacement.state = RDMA_RESOURCE_ERROR;
+    status = replacement.validate();
+    if (status == null)
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "ERROR resource validation returned null");
+    if (!status.ok())
+      return status;
+    recovery_copy = clone_recovery_value(recovery, "mark error");
+    registry[key] = replacement;
+    recovery_records[key] = recovery_copy;
+    staged_allocations.delete(key);
+    return rdma_status::success();
+  endfunction
+
+  virtual function rdma_status lookup_recovery(
+    rdma_handle handle,
+    output rdma_recovery_record recovery
+  );
+    rdma_resource authoritative;
+    rdma_status status;
+    string key;
+
+    recovery = null;
+    status = lookup(handle, authoritative);
+    if (!status.ok())
+      return status;
+    key = resource_key(handle);
+    if (!recovery_records.exists(key))
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "resource has no recovery record");
+    recovery = clone_recovery_value(recovery_records[key],
+                                    "lookup recovery");
+    return rdma_status::success();
+  endfunction
+
+  virtual function rdma_status clear_recovery(rdma_handle handle);
+    rdma_resource authoritative;
+    rdma_status status;
+    string key;
+
+    status = lookup(handle, authoritative);
+    if (!status.ok())
+      return status;
+    key = resource_key(handle);
+    if (registry[key].state != RDMA_RESOURCE_ERROR)
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "only ERROR resource recovery can be cleared");
+    if (!recovery_records.exists(key))
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "resource has no recovery record");
+    if (!recovery_ready(recovery_records[key]))
+      return rdma_status::make(
+        RDMA_SC_RECOVERY_REQUIRED,
+        "recovery cannot be cleared before hardware absence is proven"
+      );
+    recovery_records.delete(key);
+    return rdma_status::success();
+  endfunction
+
+  virtual function rdma_status finalize_release(rdma_handle handle);
+    rdma_resource authoritative;
+    rdma_status status;
+    string key;
+
+    status = lookup(handle, authoritative);
+    if (!status.ok())
+      return status;
+    if (handle.kind == RDMA_RESOURCE_FUNCTION)
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "Function resources require privileged Function teardown"
+      );
+    key = resource_key(handle);
+    if (registry[key].state == RDMA_RESOURCE_ERROR) begin
+      if (!recovery_records.exists(key) ||
+          !recovery_ready(recovery_records[key]))
+        return rdma_status::make(
+          RDMA_SC_RECOVERY_REQUIRED,
+          "ERROR resource still requires recovery"
+        );
+    end
+    else if (registry[key].state != RDMA_RESOURCE_QUIESCING) begin
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "only QUIESCING or recovered ERROR resource can be finalized"
+      );
+    end
+    if (has_dependents(registry[key]))
+      return rdma_status::make(RDMA_SC_RESOURCE_BUSY,
+                               "resource still has live dependents");
+    if (registry[key].outstanding_ids.size() != 0)
+      return rdma_status::make(
+        RDMA_SC_RESOURCE_BUSY,
+        "resource still has outstanding operations"
+      );
+    force_release_key(key);
+    return rdma_status::success();
+  endfunction
+
+  virtual function rdma_status release_reserved(rdma_handle handle);
+    rdma_resource authoritative;
+    rdma_status status;
+    string key;
+
+    status = lookup(handle, authoritative);
+    if (!status.ok())
+      return status;
+    if (handle.kind == RDMA_RESOURCE_FUNCTION)
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "Function resources require privileged Function teardown"
+      );
+    key = resource_key(handle);
+    if (registry[key].state != RDMA_RESOURCE_ALLOCATED)
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "only an ALLOCATED reservation can be rolled back"
+      );
+    if (has_dependents(registry[key]))
+      return rdma_status::make(RDMA_SC_RESOURCE_BUSY,
+                               "resource still has live dependents");
+    if (registry[key].outstanding_ids.size() != 0)
+      return rdma_status::make(
+        RDMA_SC_RESOURCE_BUSY,
+        "resource still has outstanding operations"
+      );
+    force_release_key(key);
+    return rdma_status::success();
+  endfunction
+
+  virtual function rdma_status track_outstanding(
+    rdma_handle handle,
+    longint unsigned outstanding_id
+  );
+    rdma_resource authoritative;
+    rdma_resource replacement;
+    rdma_status status;
+    string key;
+
+    if (outstanding_id == 0)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "outstanding operation ID is zero");
+    status = lookup(handle, authoritative);
+    if (!status.ok())
+      return status;
+    key = resource_key(handle);
+    if (registry[key].state != RDMA_RESOURCE_ACTIVE)
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "only ACTIVE resources accept outstanding operations"
+      );
+    foreach (registry[key].outstanding_ids[i]) begin
+      if (registry[key].outstanding_ids[i] == outstanding_id)
+        return rdma_status::make(
+          RDMA_SC_INVALID_ARGUMENT,
+          "outstanding operation ID is already tracked"
+        );
+    end
+    replacement = clone_resource_value(registry[key], "track outstanding");
+    replacement.outstanding_ids.push_back(outstanding_id);
+    registry[key] = replacement;
+    return rdma_status::success();
+  endfunction
+
+  virtual function rdma_status retire_outstanding(
+    rdma_handle handle,
+    longint unsigned outstanding_id
+  );
+    rdma_resource authoritative;
+    rdma_resource replacement;
+    rdma_status status;
+    string key;
+    int found_index;
+
+    status = lookup(handle, authoritative);
+    if (!status.ok())
+      return status;
+    key = resource_key(handle);
+    found_index = -1;
+    foreach (registry[key].outstanding_ids[i]) begin
+      if (registry[key].outstanding_ids[i] == outstanding_id) begin
+        found_index = i;
+        break;
+      end
+    end
+    if (found_index < 0)
+      return rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT,
+        "outstanding operation ID is not tracked"
+      );
+    replacement = clone_resource_value(registry[key], "retire outstanding");
+    replacement.outstanding_ids.delete(found_index);
+    registry[key] = replacement;
+    return rdma_status::success();
+  endfunction
+
   function rdma_status freeze(rdma_handle handle);
     rdma_resource ignored;
     rdma_status status;
@@ -948,6 +1429,11 @@ class rdma_resource_manager extends uvm_object;
         "Function resources require privileged Function teardown"
       );
     key = resource_key(handle);
+    if (registry[key].state == RDMA_RESOURCE_ERROR)
+      return rdma_status::make(
+        RDMA_SC_RECOVERY_REQUIRED,
+        "ERROR resource requires recovery finalization"
+      );
     if (registry[key].state != RDMA_RESOURCE_ALLOCATED)
       return rdma_status::make(RDMA_SC_INVALID_STATE,
                                "frozen resource requires Function teardown");
