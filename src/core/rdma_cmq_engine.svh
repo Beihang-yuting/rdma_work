@@ -731,10 +731,12 @@ class rdma_cmq_engine extends uvm_object;
   endfunction
 
   protected function rdma_status cancel_generation_locked(
-    int unsigned generation
+    int unsigned generation,
+    bit recover_poisoned_ledger
   );
     rdma_status status;
     rdma_cmq_completion staged_completions[CMQ_DEPTH];
+    bit staged_command_keys[string];
     int unsigned staged_count;
 
     if (prepared_binding == null)
@@ -746,13 +748,46 @@ class rdma_cmq_engine extends uvm_object;
       );
 
     staged_count = 0;
-    foreach (slots[i]) begin
-      rdma_cmq_slot_record record;
+    if (recover_poisoned_ledger) begin
+      foreach (slots[i]) begin
+        rdma_cmq_slot_record record;
+        string software_key;
 
-      record = slots[i];
-      if (record == null)
-        continue;
-      if (record.state == CMQ_SLOT_PUBLISHED) begin
+        record = slots[i];
+        if (record == null || record.state != CMQ_SLOT_PUBLISHED ||
+            record.ticket == null || record.ticket.function_h == null ||
+            record.ticket.cmq_h == null ||
+            !prepared_binding.accepts(record.ticket.function_h) ||
+            cmq_snapshot == null || cmq_snapshot.handle == null ||
+            !same_handle(record.ticket.cmq_h, cmq_snapshot.handle) ||
+            record.ticket.function_h.generation != generation ||
+            record.sq_index != i || record.ticket.sq_index != i ||
+            record.ticket.slot_sequence != record.slot_sequence ||
+            record.ticket.sq_wrap != record.sq_wrap ||
+            record.ticket.command_id[4:0] != record.command_token)
+          continue;
+        software_key = command_key(record.ticket);
+        if (staged_command_keys.exists(software_key))
+          continue;
+        status = make_cancel_completion(
+          record, staged_completions[staged_count]
+        );
+        if (status != null && status.ok() &&
+            staged_completions[staged_count] != null) begin
+          staged_command_keys[software_key] = 1'b1;
+          staged_count++;
+        end
+      end
+    end
+    else begin
+      foreach (slots[i]) begin
+        rdma_cmq_slot_record record;
+
+        record = slots[i];
+        if (record == null)
+          continue;
+        if (record.state != CMQ_SLOT_PUBLISHED)
+          continue;
         if (record.ticket == null || record.ticket.function_h == null ||
             record.ticket.cmq_h == null ||
             record.ticket.function_h.generation != generation)
@@ -781,14 +816,20 @@ class rdma_cmq_engine extends uvm_object;
       record = slots[i];
       if (record == null)
         continue;
-      if (record.state == CMQ_SLOT_PUBLISHED) begin
+      if (!recover_poisoned_ledger &&
+          record.state == CMQ_SLOT_PUBLISHED) begin
         token_index = record.command_token;
         token_in_use[token_index] = 1'b0;
         record.state = CMQ_SLOT_RESET_CANCELLED;
       end
-      // A timeout tombstone already released its token.  Do not write the
-      // token bitmap for quarantine: that token may name a newer command.
+      // Strict cancellation must not write the token bitmap for quarantine:
+      // that token may name a newer command.  Poison recovery clears the
+      // whole current-generation bitmap after removing every slot.
       slots[i] = null;
+    end
+    if (recover_poisoned_ledger) begin
+      foreach (token_in_use[i])
+        token_in_use[i] = 1'b0;
     end
     command_registry.delete();
     entry_registry.delete();
@@ -5112,7 +5153,7 @@ class rdma_cmq_engine extends uvm_object;
       engine_lock.put(1);
       return;
     end
-    status = cancel_generation_locked(generation);
+    status = cancel_generation_locked(generation, 1'b0);
     if (status != null && status.ok()) begin
       while (terminal_fifo.size() != 0)
         completions.push_back(terminal_fifo.pop_front());
@@ -5127,10 +5168,12 @@ class rdma_cmq_engine extends uvm_object;
     output rdma_status status
   );
     rdma_status release_status;
+    bit was_poisoned;
 
     completions.delete();
     status = invalid_state("CMQ reset did not complete");
     engine_lock.get(1);
+    was_poisoned = (engine_state == RDMA_CMQ_ENGINE_POISONED);
     if (engine_state == RDMA_CMQ_ENGINE_UNCONFIGURED) begin
       clear_configuration();
       status = rdma_status::success();
@@ -5148,7 +5191,9 @@ class rdma_cmq_engine extends uvm_object;
       return;
     end
     if (prepared_binding != null) begin
-      status = cancel_generation_locked(prepared_binding.generation);
+      status = cancel_generation_locked(
+        prepared_binding.generation, was_poisoned
+      );
       if (status == null || !status.ok()) begin
         if (status == null)
           status = invalid_state("CMQ reset cancellation returned null");
@@ -5261,7 +5306,9 @@ class rdma_cmq_engine extends uvm_object;
     end
     if (engine_state != RDMA_CMQ_ENGINE_POISONED &&
         prepared_binding != null) begin
-      cancel_status = cancel_generation_locked(prepared_binding.generation);
+      cancel_status = cancel_generation_locked(
+        prepared_binding.generation, 1'b0
+      );
       if (cancel_status == null || !cancel_status.ok()) begin
         status = (cancel_status == null) ?
           invalid_state("CMQ shutdown cancellation returned null") :

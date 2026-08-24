@@ -83,6 +83,12 @@ typedef enum int unsigned {
 } rdma_cmq_test_empty_ledger_fault_e;
 
 typedef enum int unsigned {
+  RDMA_CMQ_TEST_PUBLISHED_LEDGER_TOKEN_MISSING,
+  RDMA_CMQ_TEST_PUBLISHED_LEDGER_SLOT_MISSING,
+  RDMA_CMQ_TEST_PUBLISHED_LEDGER_REGISTRY_MISSING
+} rdma_cmq_test_published_ledger_fault_e;
+
+typedef enum int unsigned {
   RDMA_CMQ_TEST_POISON_RESERVED_BIT,
   RDMA_CMQ_TEST_POISON_UNSUPPORTED_OPCODE,
   RDMA_CMQ_TEST_POISON_OPCODE_MISMATCH,
@@ -2385,6 +2391,25 @@ class rdma_cmq_engine_probe extends rdma_cmq_engine;
       default: begin
       end
     endcase
+  endfunction
+
+  function bit tamper_published_ledger(
+    rdma_cmq_ticket ticket,
+    rdma_cmq_test_published_ledger_fault_e fault
+  );
+    if (ticket == null || ticket.sq_index >= 32 ||
+        slots[ticket.sq_index] == null)
+      return 1'b0;
+    case (fault)
+      RDMA_CMQ_TEST_PUBLISHED_LEDGER_TOKEN_MISSING:
+        token_in_use[ticket.command_id[4:0]] = 1'b0;
+      RDMA_CMQ_TEST_PUBLISHED_LEDGER_SLOT_MISSING:
+        slots[ticket.sq_index] = null;
+      RDMA_CMQ_TEST_PUBLISHED_LEDGER_REGISTRY_MISSING:
+        command_registry.delete(command_key(ticket));
+      default: return 1'b0;
+    endcase
+    return 1'b1;
   endfunction
 
   function bit tamper_slot_incarnation(int unsigned sq_index);
@@ -10990,6 +11015,172 @@ class rdma_cmq_engine_test extends uvm_test;
                  "idempotent shutdown released twice")
   endtask
 
+  task automatic check_poisoned_ledger_reset_recovery();
+    string fault_labels[3];
+    bit expect_cancel[3];
+
+    fault_labels[0] = "TOKEN_MISSING";
+    fault_labels[1] = "SLOT_MISSING";
+    fault_labels[2] = "REGISTRY_MISSING";
+    expect_cancel[0] = 1'b1;
+    expect_cancel[1] = 1'b0;
+    expect_cancel[2] = 1'b1;
+    for (int unsigned fault = 0; fault < 3; fault++) begin
+      rdma_cmq_engine_probe engine;
+      rdma_mock_host_mem mem;
+      rdma_cmq_test_pcie pcie;
+      rdma_doorbell_scheduler scheduler;
+      rdma_cmq_test_profile profile;
+      rdma_function_binding prepared_binding;
+      rdma_function_binding active_binding;
+      rdma_cmq cmq;
+      rdma_cmq_runtime_desc runtime_desc;
+      rdma_dma_mapping mapping;
+      rdma_cmq_command_desc request;
+      rdma_cmq_ticket ticket;
+      rdma_cmq_completion completions[$];
+      rdma_cmq_diagnostic diagnostics[$];
+      rdma_status status;
+      rdma_status cleanup_status;
+      byte data[];
+      byte one[];
+      int unsigned expected_release_calls;
+      string label;
+
+      label = {"POISONED_LEDGER_", fault_labels[fault]};
+      engine = rdma_cmq_engine_probe::type_id::create(
+        $sformatf("poisoned_ledger_engine_%0d", fault)
+      );
+      mem = rdma_mock_host_mem::type_id::create(
+        $sformatf("poisoned_ledger_mem_%0d", fault)
+      );
+      pcie = rdma_cmq_test_pcie::type_id::create(
+        $sformatf("poisoned_ledger_pcie_%0d", fault)
+      );
+      scheduler = rdma_doorbell_scheduler::type_id::create(
+        $sformatf("poisoned_ledger_scheduler_%0d", fault)
+      );
+      profile = rdma_cmq_test_profile::type_id::create(
+        $sformatf("poisoned_ledger_profile_%0d", fault)
+      );
+      prepared_binding = make_binding(
+        $sformatf("poisoned_ledger_prepared_%0d", fault),
+        RDMA_BIND_PREPARED
+      );
+      active_binding = make_binding(
+        $sformatf("poisoned_ledger_active_%0d", fault), RDMA_BIND_ACTIVE
+      );
+      cmq = make_cmq(
+        $sformatf("poisoned_ledger_cmq_%0d", fault), prepared_binding
+      );
+      prepare_active(
+        label, engine, mem, pcie, scheduler, profile, prepared_binding,
+        active_binding, cmq, runtime_desc
+      );
+      request = make_command(
+        $sformatf("poisoned_ledger_request_%0d", fault), active_binding,
+        rdma_cmq_test_profile::TEST_OPCODE_A, byte'(8'hb0 + fault), 10us
+      );
+      engine.submit(request, ticket, status);
+      expect_status({label, "_SUBMIT"}, status, RDMA_SC_OK);
+      mapping = engine.mapping_snapshot();
+      if (!engine.tamper_published_ledger(
+            ticket, rdma_cmq_test_published_ledger_fault_e'(fault)
+          ))
+        `uvm_error(label, "published ledger tamper setup failed")
+
+      mem.calls.delete();
+      engine.poll(completions, diagnostics, status);
+      expect_status({label, "_POLL"}, status, RDMA_SC_INVALID_STATE);
+      if (engine.state() != RDMA_CMQ_ENGINE_POISONED ||
+          completions.size() != 0 || diagnostics.size() != 0 ||
+          count_host_calls(mem, "read") != 0)
+        `uvm_error(label, "ledger corruption did not poison before CQ read")
+
+      if (fault == RDMA_CMQ_TEST_PUBLISHED_LEDGER_TOKEN_MISSING) begin
+        engine.cancel_generation(active_binding.generation,
+                                 completions, status);
+        expect_status({label, "_STRICT_CANCEL"}, status,
+                      RDMA_SC_INVALID_STATE);
+        if (completions.size() != 0 ||
+            engine.state() != RDMA_CMQ_ENGINE_POISONED ||
+            count_host_calls(mem, "release") != 0)
+          `uvm_error(label, "strict public cancel recovered poison")
+        expect_status(
+          {label, "_ARM_RELEASE_FAIL"},
+          mem.fail_next(
+            "release",
+            rdma_status::make(
+              RDMA_SC_UNKNOWN_HW_ERROR,
+              "injected poisoned-ledger reset release failure"
+            )
+          ),
+          RDMA_SC_OK
+        );
+        engine.reset(completions, status);
+        expect_status({label, "_RELEASE_FAIL"}, status,
+                      RDMA_SC_UNKNOWN_HW_ERROR);
+        if (completions.size() != 0 ||
+            engine.state() != RDMA_CMQ_ENGINE_POISONED ||
+            engine.mapping_snapshot() == null ||
+            engine.terminal_fifo_count() != 1 ||
+            count_host_calls(mem, "release") != 1 ||
+            mem.regions[0].mapping.state != RDMA_MAPPING_ACTIVE)
+          `uvm_error(label,
+                     "release failure lost staged recovery authority")
+      end
+
+      engine.reset(completions, status);
+      expect_status({label, "_RESET"}, status, RDMA_SC_OK);
+      if (status == null || !status.ok()) begin
+        engine.shutdown(cleanup_status);
+        continue;
+      end
+      expect_unconfigured({label, "_STATE"}, engine);
+      expected_release_calls =
+        (fault == RDMA_CMQ_TEST_PUBLISHED_LEDGER_TOKEN_MISSING) ? 2 : 1;
+      if (completions.size() != (expect_cancel[fault] ? 1 : 0) ||
+          count_host_calls(mem, "release") != expected_release_calls ||
+          mem.regions[0].mapping.state != RDMA_MAPPING_RELEASED ||
+          engine.mapping_snapshot() != null ||
+          engine.published_count() != 0 || engine.retired_count() != 0 ||
+          engine.cq_consumed_count() != 0 ||
+          engine.tokens_in_use_count() != 0 ||
+          engine.slot_record_count() != 0 ||
+          engine.command_registry_count() != 0 ||
+          engine.entry_registry_count() != 0)
+        `uvm_error(label, "poison recovery did not release all authority")
+      if (expect_cancel[fault] &&
+          (completions[0] == null || completions[0].ticket == null ||
+           completions[0].status == null ||
+           completions[0].ticket.command_id != ticket.command_id ||
+           completions[0].status.code != RDMA_SC_RESET_CANCELLED ||
+           completions[0].status.source_engine != RDMA_ENGINE_RESET ||
+           completions[0].status.function_uid !=
+             active_binding.function_uid ||
+           completions[0].status.generation != active_binding.generation ||
+           completions[0].status.resource_id != cmq.handle.object_id ||
+           completions[0].status.command_id != ticket.command_id))
+        `uvm_error(label, "poison recovery cancellation identity is wrong")
+
+      data = new[0];
+      status = mem.read(mapping, 0, 1, data);
+      if (status == null || status.ok())
+        `uvm_error(label, "poison recovery left old mapping readable")
+      one = new[1];
+      one[0] = 8'h5a;
+      status = mem.write(mapping, 0, one);
+      if (status == null || status.ok())
+        `uvm_error(label, "poison recovery left old mapping writable")
+
+      engine.reset(completions, status);
+      expect_status({label, "_RESET_ONCE"}, status, RDMA_SC_OK);
+      if (completions.size() != 0 ||
+          count_host_calls(mem, "release") != expected_release_calls)
+        `uvm_error(label, "poison recovery delivered or released twice")
+    end
+  endtask
+
   task automatic check_reset_fifo_retry_and_reprepare();
     rdma_cmq_engine_probe engine;
     rdma_mock_host_mem mem;
@@ -11005,6 +11196,7 @@ class rdma_cmq_engine_test extends uvm_test;
     rdma_cmq next_cmq;
     rdma_cmq_runtime_desc runtime_desc;
     rdma_dma_mapping mapping;
+    rdma_dma_mapping next_mapping;
     rdma_dma_mapping retained_mapping;
     rdma_cmq_command_desc requests[];
     rdma_cmq_ticket tickets[];
@@ -11022,6 +11214,7 @@ class rdma_cmq_engine_test extends uvm_test;
     rdma_hw_image poison_raw;
     rdma_status status;
     byte data[];
+    byte one[];
 
     engine = rdma_cmq_engine_probe::type_id::create("reset_fifo_engine");
     mem = rdma_mock_host_mem::type_id::create("reset_fifo_mem");
@@ -11266,6 +11459,12 @@ class rdma_cmq_engine_test extends uvm_test;
     if (status == null || status.ok())
       `uvm_error("POISON_RESET_OLD_MAPPING",
                  "poison reset left old mapping active")
+    one = new[1];
+    one[0] = 8'ha5;
+    status = mem.write(mapping, 0, one);
+    if (status == null || status.ok())
+      `uvm_error("POISON_RESET_OLD_MAPPING_WRITE",
+                 "poison reset left old mapping writable")
     next_prepared = make_binding("poison_reset_next_prepared",
                                  RDMA_BIND_PREPARED);
     next_active = make_binding("poison_reset_next_active", RDMA_BIND_ACTIVE);
@@ -11279,12 +11478,38 @@ class rdma_cmq_engine_test extends uvm_test;
     );
     prepare_active("POISON_RESET_NEXT", engine, mem, pcie, scheduler, profile,
                    next_prepared, next_active, next_cmq, runtime_desc);
+    requests = new[1];
+    requests[0] = make_command(
+      "poison_reset_next_request", next_active,
+      rdma_cmq_test_profile::TEST_OPCODE_A, 8'h68, 20ns
+    );
+    engine.submit_batch(requests, tickets, item_statuses, batch_status);
+    expect_status("POISON_RESET_NEXT_SUBMIT", batch_status, RDMA_SC_OK);
+    next_ticket = tickets[0];
+    next_mapping = engine.mapping_snapshot();
+    mem.calls.delete();
     engine.poll(completions, diagnostics, status);
     expect_status("POISON_RESET_NEXT_POLL", status, RDMA_SC_OK);
     if (completions.size() != 0 || diagnostics.size() != 0 ||
-        engine.state() != RDMA_CMQ_ENGINE_ACTIVE)
+        engine.state() != RDMA_CMQ_ENGINE_ACTIVE ||
+        engine.outstanding_count() != 1)
       `uvm_error("POISON_RESET_NEXT_POLL",
                  "old generation CQE influenced new generation")
+    expect_poll_read_geometry("POISON_RESET_NEXT_READ", mem, 0, 1);
+    write_profile_cqe(
+      "POISON_RESET_NEXT_CQE", mem, next_mapping, profile, 0, 1'b1,
+      next_ticket, 0, raw_a
+    );
+    mem.calls.delete();
+    engine.poll(completions, diagnostics, status);
+    expect_status("POISON_RESET_NEXT_COMPLETE", status, RDMA_SC_OK);
+    if (completions.size() != 1 || diagnostics.size() != 0 ||
+        completions[0] == null || completions[0].ticket == null ||
+        completions[0].ticket.command_id != next_ticket.command_id ||
+        engine.outstanding_count() != 0)
+      `uvm_error("POISON_RESET_NEXT_COMPLETE",
+                 "new generation CQE did not complete normally")
+    expect_poll_read_geometry("POISON_RESET_NEXT_COMPLETE_READ", mem, 0, 1);
     engine.shutdown(status);
     expect_status("POISON_RESET_NEXT_SHUTDOWN", status, RDMA_SC_OK);
   endtask
@@ -11340,6 +11565,7 @@ class rdma_cmq_engine_test extends uvm_test;
     check_poison_shutdown_release_retry_preserves_snapshot();
     check_wait_for_fifo_and_deadline();
     check_cancel_reset_and_shutdown_lifecycle();
+    check_poisoned_ledger_reset_recovery();
     check_reset_fifo_retry_and_reprepare();
     check_poll_backing_out_of_order_and_owner_wrap();
     check_retire_then_wrap_publication();
