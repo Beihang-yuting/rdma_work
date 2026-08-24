@@ -39,6 +39,7 @@ class rdma_cmq_port_test extends rdma_cmq_engine_test;
     rdma_handle saved_body_target;
     rdma_cmq_ticket ticket;
     rdma_cmq_completion completion;
+    rdma_status retained_outcome;
     rdma_status status;
     int unsigned saved_object_id;
     int unsigned saved_sibling_object_id;
@@ -46,6 +47,10 @@ class rdma_cmq_port_test extends rdma_cmq_engine_test;
     binding = make_binding("mock_hostile_binding", RDMA_BIND_ACTIVE);
     mock_cmq = rdma_mock_cmq_port::type_id::create("mock_hostile_cmq");
     port = mock_cmq;
+    retained_outcome = rdma_status::make(
+      RDMA_SC_DMA_PERMISSION, "retained hostile snapshot outcome"
+    );
+    mock_cmq.fail_opcode(XTR_V1_OP_KEY_ALLOC, retained_outcome);
 
     mutating_command = make_command(
       "mock_mutating_command", binding, XTR_V1_OP_KEY_ALLOC, 8'h21, 1us
@@ -101,7 +106,7 @@ class rdma_cmq_port_test extends rdma_cmq_engine_test;
     alias_function.copy(alias_command.function_h);
     alias_function.clone_fault = RDMA_CMQ_TEST_CLONE_ALIAS;
     alias_function.alias_target = sibling_function;
-    alias_function.alias_once = 1'b0;
+    alias_function.alias_once = 1'b1;
     alias_command.function_h = alias_function;
     saved_command_function = alias_command.function_h;
     saved_command_opcode = alias_command.opcode_key;
@@ -112,8 +117,13 @@ class rdma_cmq_port_test extends rdma_cmq_engine_test;
     saved_object_id = alias_function.object_id;
     saved_sibling_object_id = sibling_function.object_id;
 
+    rdma_cmq_clone_fault_function_handle::clear_fault_clone_calls();
     port.execute(alias_command, ticket, completion, status);
     expect_status("MOCK_ALIAS_SNAPSHOT", status, RDMA_SC_INVALID_ARGUMENT);
+    if (rdma_cmq_clone_fault_function_handle::fault_clone_call_count() != 1 ||
+        alias_function.alias_once != 1'b0)
+      `uvm_error("MOCK_ALIAS_HOOK",
+                 "one-shot alias hook did not execute exactly once")
     if (ticket != null || completion != null || mock_cmq.calls.size() != 0)
       `uvm_error("MOCK_ALIAS_EFFECTS",
                  "alias-laundered clone produced a ticket or call")
@@ -123,6 +133,7 @@ class rdma_cmq_port_test extends rdma_cmq_engine_test;
         alias_command.qpc_signature_source != saved_command_signature ||
         alias_body.function_h != saved_body_function ||
         alias_body.target_h != saved_body_target ||
+        alias_function.alias_target != saved_body_function ||
         alias_function.object_id != saved_object_id ||
         sibling_function.object_id != saved_sibling_object_id)
       `uvm_error("MOCK_ALIAS_RESTORE",
@@ -132,13 +143,15 @@ class rdma_cmq_port_test extends rdma_cmq_engine_test;
       "mock_hostile_recovery", binding, XTR_V1_OP_KEY_ALLOC, 8'h23, 1us
     );
     port.execute(recovery_command, ticket, completion, status);
-    expect_status("MOCK_HOSTILE_RECOVERY", status, RDMA_SC_OK);
+    expect_status("MOCK_HOSTILE_RECOVERY", status, RDMA_SC_DMA_PERMISSION);
     if (ticket == null || completion == null ||
         completion.status == null || mock_cmq.calls.size() != 1 ||
         mock_cmq.calls[0] == null ||
-        mock_cmq.calls[0].\sequence  != 1 || ticket.command_id != 1)
+        mock_cmq.calls[0].\sequence  != 1 || ticket.command_id != 1 ||
+        completion.status.code != RDMA_SC_DMA_PERMISSION ||
+        rdma_cmq_clone_fault_function_handle::fault_clone_call_count() != 1)
       `uvm_error("MOCK_HOSTILE_RECOVERY",
-                 "rejected snapshots advanced or polluted mock state")
+                 "rejected snapshots advanced sequence or consumed outcome")
   endtask
 
   task automatic check_mock_fifo_status_and_reconcile();
