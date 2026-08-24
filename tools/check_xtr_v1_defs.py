@@ -85,6 +85,18 @@ BODY_MASKS = {
         0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFF000,
         0x0000000000000FFF, 0,
     ),
+    "mrt_key_alloc_pbl1": (
+        0x6000000000FFFFFF, 0x00000000FF000000,
+        0xFFFFFFFFFFFFFFFF, 0xFF00BFFFFFFFFFFF,
+        0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFF000,
+        0xFFFFFFFFFFFFFFFF, 0,
+    ),
+    "mrt_key_alloc_pbl2": (
+        0x6000000000FFFFFF, 0x00000000FF000000,
+        0xFFFFFFFFFFFFFFFF, 0xFF00BFFFFFFFFFFF,
+        0xFFFFFFFFFFFFFFFF, 0xFFFFFFF000000000,
+        0x0000000000000FFF, 0,
+    ),
     "mrt_register_pbl1": (
         0x6000000000FFFFFF, 0x00000000FF000000,
         0xFFFFFFFFFF000000, 0xFF00BFFFFFFFFFFF,
@@ -137,6 +149,12 @@ CMQ_BODY_OWNERSHIP = {
     "XTR_V1_MRT_REGISTER_BODY_OWNERSHIP": (
         0x6000000000FFFFFF, 0x00000000FF000000,
         0xFFFFFFFFFF000000, 0xFF00BFFFFFFFFFFF,
+        0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFF000,
+        0xFFFFFFFFFFFFFFFF, 0,
+    ),
+    "XTR_V1_MRT_KEY_ALLOC_BODY_OWNERSHIP": (
+        0x6000000000FFFFFF, 0x00000000FF000000,
+        0xFFFFFFFFFFFFFFFF, 0xFF00BFFFFFFFFFFF,
         0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFF000,
         0xFFFFFFFFFFFFFFFF, 0,
     ),
@@ -2691,7 +2709,9 @@ def build_golden_cases() -> dict[str, list[GoldenCase]]:
     mrt_pbl0 = make_mrt("mrt_register_pbl0_boundary", 0, False)
     mrt_pbl1 = make_mrt("mrt_register_pbl1_boundary", 1, False)
     mrt_pbl2 = make_mrt("mrt_register_pbl2_boundary", 2, False)
-    mrt_key = make_mrt("mrt_key_alloc_pbl0_boundary", 0, True)
+    mrt_key0 = make_mrt("mrt_key_alloc_pbl0_boundary", 0, True)
+    mrt_key1 = make_mrt("mrt_key_alloc_pbl1_boundary", 1, True)
+    mrt_key2 = make_mrt("mrt_key_alloc_pbl2_boundary", 2, True)
 
     srqc = make_case("srqc_create_body_boundary", 64, (
         ("XTR_V1_SRQC_BODY_SRFQN", 0xFFFF, "srfqn=0xffff"),
@@ -2908,7 +2928,9 @@ def build_golden_cases() -> dict[str, list[GoldenCase]]:
             mrt_pbl0,
             mrt_pbl1,
             mrt_pbl2,
-            mrt_key,
+            mrt_key0,
+            mrt_key1,
+            mrt_key2,
             srqc,
             ceqc,
             aeqc,
@@ -3026,12 +3048,13 @@ def validate_context_contract(cases: list[GoldenCase]) -> None:
         "qpc_rc_boundary", "qpc_ud_boundary", "qpc_urc_boundary",
         "cqc_create_body_boundary", "mrt_register_pbl0_boundary",
         "mrt_register_pbl1_boundary", "mrt_register_pbl2_boundary",
-        "mrt_key_alloc_pbl0_boundary", "srqc_create_body_boundary",
+        "mrt_key_alloc_pbl0_boundary", "mrt_key_alloc_pbl1_boundary",
+        "mrt_key_alloc_pbl2_boundary", "srqc_create_body_boundary",
         "ceqc_create_body_boundary", "aeqc_create_body_boundary",
     ]
     if [case.name for case in cases] != expected_names:
         raise ValidationError("context golden case order/name contract drift")
-    if [len(case.payload) for case in cases] != [512, 512, 512] + [64] * 8:
+    if [len(case.payload) for case in cases] != [512, 512, 512] + [64] * 10:
         raise ValidationError("context golden byte-count contract drift")
 
     transport_codes = {"rc": 0, "ud": 3, "urc": 6}
@@ -3065,8 +3088,8 @@ def validate_context_contract(cases: list[GoldenCase]) -> None:
 
     mask_keys = [
         "cqc_create", "mrt_register_pbl0", "mrt_register_pbl1",
-        "mrt_register_pbl2", "mrt_key_alloc_pbl0", "srqc_create",
-        "ceqc_create", "aeqc_create",
+        "mrt_register_pbl2", "mrt_key_alloc_pbl0", "mrt_key_alloc_pbl1",
+        "mrt_key_alloc_pbl2", "srqc_create", "ceqc_create", "aeqc_create",
     ]
     for case, mask_key in zip(cases[3:], mask_keys):
         mask = BODY_MASKS[mask_key]
@@ -3104,6 +3127,18 @@ def validate_context_contract(cases: list[GoldenCase]) -> None:
             ("XTR_V1_MRT_BODY_HOST_PG_SIZE", "host_page"),
         ),
         "mrt_key_alloc_pbl0_boundary": (
+            ("XTR_V1_MRT_BODY_NXT_ST", "state"),
+            ("XTR_V1_MRT_BODY_ST", "state"),
+            ("XTR_V1_MRT_BODY_TYPE", "type"),
+            ("XTR_V1_MRT_BODY_HOST_PG_SIZE", "host_page"),
+        ),
+        "mrt_key_alloc_pbl1_boundary": (
+            ("XTR_V1_MRT_BODY_NXT_ST", "state"),
+            ("XTR_V1_MRT_BODY_ST", "state"),
+            ("XTR_V1_MRT_BODY_TYPE", "type"),
+            ("XTR_V1_MRT_BODY_HOST_PG_SIZE", "host_page"),
+        ),
+        "mrt_key_alloc_pbl2_boundary": (
             ("XTR_V1_MRT_BODY_NXT_ST", "state"),
             ("XTR_V1_MRT_BODY_ST", "state"),
             ("XTR_V1_MRT_BODY_TYPE", "type"),
@@ -3328,7 +3363,7 @@ def validate_context_contract(cases: list[GoldenCase]) -> None:
         if field_value(urc, stem) != 0:
             raise ValidationError(f"{urc.name} runtime SRBSN field is nonzero")
 
-    for case in cases[4:8]:
+    for case in cases[4:10]:
         direct_fields = (
             ("XTR_V1_MRT_BODY_STAG_IDX", "stag"),
             ("XTR_V1_MRT_BODY_NXT_ST", "state"),
@@ -3359,7 +3394,7 @@ def validate_context_contract(cases: list[GoldenCase]) -> None:
         stag = numeric_input(case, "stag")
         parent = field_value(case, "XTR_V1_MRT_BODY_PARENT_STAG_IDX")
         pbl = numeric_input(case, "pbl")
-        if case.name == "mrt_key_alloc_pbl0_boundary":
+        if case.name.startswith("mrt_key_alloc_"):
             if (inputs.get("opcode") != "0x04"
                     or inputs.get("parent") != "self"
                     or parent != stag):
@@ -3609,6 +3644,8 @@ def validate(kernel_root: Path) -> None:
         "XTR_V1_MRT_REGISTER_PBL1_BODY_MASK": BODY_MASKS["mrt_register_pbl1"],
         "XTR_V1_MRT_REGISTER_PBL2_BODY_MASK": BODY_MASKS["mrt_register_pbl2"],
         "XTR_V1_MRT_KEY_ALLOC_PBL0_BODY_MASK": BODY_MASKS["mrt_key_alloc_pbl0"],
+        "XTR_V1_MRT_KEY_ALLOC_PBL1_BODY_MASK": BODY_MASKS["mrt_key_alloc_pbl1"],
+        "XTR_V1_MRT_KEY_ALLOC_PBL2_BODY_MASK": BODY_MASKS["mrt_key_alloc_pbl2"],
         "XTR_V1_SRQC_CREATE_BODY_MASK": BODY_MASKS["srqc_create"],
         "XTR_V1_CEQC_CREATE_BODY_MASK": BODY_MASKS["ceqc_create"],
         "XTR_V1_AEQC_CREATE_BODY_MASK": BODY_MASKS["aeqc_create"],

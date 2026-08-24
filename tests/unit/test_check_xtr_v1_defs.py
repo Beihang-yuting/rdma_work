@@ -1212,6 +1212,12 @@ class Task11DefinitionTest(unittest.TestCase):
             0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFF000,
             0xFFFFFFFFFFFFFFFF, 0,
         ),
+        "XTR_V1_MRT_KEY_ALLOC_BODY_OWNERSHIP": (
+            0x6000000000FFFFFF, 0x00000000FF000000,
+            0xFFFFFFFFFFFFFFFF, 0xFF00BFFFFFFFFFFF,
+            0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFF000,
+            0xFFFFFFFFFFFFFFFF, 0,
+        ),
         "XTR_V1_MR_DEREGISTER_BODY_OWNERSHIP": (
             0x6000000000FFFFFF, 0x00000000FF000000, 0, 0, 0, 0, 0, 0,
         ),
@@ -1820,6 +1826,8 @@ class ReferenceEncodingTest(unittest.TestCase):
                 "mrt_register_pbl1_boundary",
                 "mrt_register_pbl2_boundary",
                 "mrt_key_alloc_pbl0_boundary",
+                "mrt_key_alloc_pbl1_boundary",
+                "mrt_key_alloc_pbl2_boundary",
                 "srqc_create_body_boundary",
                 "ceqc_create_body_boundary",
                 "aeqc_create_body_boundary",
@@ -1827,7 +1835,7 @@ class ReferenceEncodingTest(unittest.TestCase):
         )
         self.assertEqual(
             [len(case.payload) for case in context_cases],
-            [512, 512, 512] + [64] * 8,
+            [512, 512, 512] + [64] * 10,
         )
         self.assertEqual(len(cases["cmq"][0].payload), 64)
         self.assertEqual(len(cases["queue"][0].payload), 64)
@@ -1863,6 +1871,8 @@ class ReferenceEncodingTest(unittest.TestCase):
             "opcode=0x05,stag=0xffffff,state=2,key=0xff,parent=0,pd=0xffff,payload_vf=0xff,payload_vf_en=1,rights=0x1f,type=2,host_page=2,pbl=1,address_mode=1,invalidate=1,length=0x3fffffffffff,odp=1,start_va=0xffffffffffffffff,pba0=0xfffffffffffff,pba1=0xfffffffffffff,mr_sn=0xfff",
             "opcode=0x05,stag=0xffffff,state=2,key=0xff,parent=0,pd=0xffff,payload_vf=0xff,payload_vf_en=1,rights=0x1f,type=2,host_page=2,pbl=2,address_mode=1,invalidate=1,length=0x3fffffffffff,odp=1,start_va=0xffffffffffffffff,first_pbl=0xfffffff,mr_sn=0xfff",
             "opcode=0x04,stag=0xffffff,state=2,key=0xff,parent=self,pd=0xffff,payload_vf=0xff,payload_vf_en=1,rights=0x1f,type=2,host_page=2,pbl=0,address_mode=1,invalidate=1,length=0x3fffffffffff,odp=1,start_va=0xffffffffffffffff,pba0=0xfffffffffffff,mr_sn=0xfff",
+            "opcode=0x04,stag=0xffffff,state=2,key=0xff,parent=self,pd=0xffff,payload_vf=0xff,payload_vf_en=1,rights=0x1f,type=2,host_page=2,pbl=1,address_mode=1,invalidate=1,length=0x3fffffffffff,odp=1,start_va=0xffffffffffffffff,pba0=0xfffffffffffff,pba1=0xfffffffffffff,mr_sn=0xfff",
+            "opcode=0x04,stag=0xffffff,state=2,key=0xff,parent=self,pd=0xffff,payload_vf=0xff,payload_vf_en=1,rights=0x1f,type=2,host_page=2,pbl=2,address_mode=1,invalidate=1,length=0x3fffffffffff,odp=1,start_va=0xffffffffffffffff,first_pbl=0xfffffff,mr_sn=0xfff",
             "srfqn=0xffff,state=2,load_pi=0xff,shadow=0xfffffffffffff,pd=0xffff,pba=0xfffffffffffff,size=0xf,mode=3,pi_wrap=1,pi=0x7fff,limit=0x3fff,arm_sn=3",
             "eqn=0xfff,state=2,size=0x1f,next=0xfffffffffffff,current=0xfffffffffffff,current_valid=1,pi_wrap=1,pi=0x3ffff,mode=3,msix=0xffff,ci_wrap=1,ci=0x3ffff",
             "eqn=0xfff,state=2,size=0x1f,next=0xfffffffffffff,current=0xfffffffffffff,current_valid=1,pi_wrap=1,pi=0x3ffff,mode=3,msix=0xffff,ci_wrap=1,ci=0x3ffff",
@@ -1882,6 +1892,14 @@ class ReferenceEncodingTest(unittest.TestCase):
             "mrt_key_alloc_pbl0": (0x6000000000ffffff, 0x00000000ff000000,
                 0xffffffffffffffff, 0xff00bfffffffffff,
                 0xffffffffffffffff, 0xfffffffffffff000,
+                0x0000000000000fff, 0),
+            "mrt_key_alloc_pbl1": (0x6000000000ffffff, 0x00000000ff000000,
+                0xffffffffffffffff, 0xff00bfffffffffff,
+                0xffffffffffffffff, 0xfffffffffffff000,
+                0xffffffffffffffff, 0),
+            "mrt_key_alloc_pbl2": (0x6000000000ffffff, 0x00000000ff000000,
+                0xffffffffffffffff, 0xff00bfffffffffff,
+                0xffffffffffffffff, 0xfffffff000000000,
                 0x0000000000000fff, 0),
             "mrt_register_pbl1": (0x6000000000ffffff, 0x00000000ff000000,
                 0xffffffffff000000, 0xff00bfffffffffff,
@@ -2123,6 +2141,18 @@ class ReferenceEncodingTest(unittest.TestCase):
                 "XTR_V1_MRT_BODY_TYPE": {0, 1, 2},
                 "XTR_V1_MRT_BODY_HOST_PG_SIZE": {0, 1, 2},
             },
+            "mrt_key_alloc_pbl1_boundary": {
+                "XTR_V1_MRT_BODY_NXT_ST": {0, 1, 2},
+                "XTR_V1_MRT_BODY_ST": {0, 1, 2},
+                "XTR_V1_MRT_BODY_TYPE": {0, 1, 2},
+                "XTR_V1_MRT_BODY_HOST_PG_SIZE": {0, 1, 2},
+            },
+            "mrt_key_alloc_pbl2_boundary": {
+                "XTR_V1_MRT_BODY_NXT_ST": {0, 1, 2},
+                "XTR_V1_MRT_BODY_ST": {0, 1, 2},
+                "XTR_V1_MRT_BODY_TYPE": {0, 1, 2},
+                "XTR_V1_MRT_BODY_HOST_PG_SIZE": {0, 1, 2},
+            },
             "srqc_create_body_boundary": {
                 "XTR_V1_SRQC_BODY_SRFQ_ST": {0, 1, 2},
             },
@@ -2189,6 +2219,14 @@ class ReferenceEncodingTest(unittest.TestCase):
             "mrt_key_alloc_pbl0_boundary": (
                 "XTR_V1_MRT_BODY_PARENT_STAG_IDX",
             ),
+            "mrt_key_alloc_pbl1_boundary": (
+                "XTR_V1_MRT_BODY_PARENT_STAG_IDX",
+                "XTR_V1_MRT_BODY_PAYLOAD_PBA1",
+            ),
+            "mrt_key_alloc_pbl2_boundary": (
+                "XTR_V1_MRT_BODY_PARENT_STAG_IDX",
+                "XTR_V1_MRT_BODY_FIRST_PBL_IDX",
+            ),
         }
         for name, stems in fields_by_case.items():
             case = by_name[name]
@@ -2202,6 +2240,7 @@ class ReferenceEncodingTest(unittest.TestCase):
         for name in (
             "mrt_register_pbl0_boundary", "mrt_register_pbl1_boundary",
             "mrt_register_pbl2_boundary", "mrt_key_alloc_pbl0_boundary",
+            "mrt_key_alloc_pbl1_boundary", "mrt_key_alloc_pbl2_boundary",
         ):
             case = by_name[name]
             for item in case.inputs:

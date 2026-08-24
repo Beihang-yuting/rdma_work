@@ -593,8 +593,6 @@ virtual class rdma_xtr_v1_mrt_body_codec_base
     if (value > RDMA_MR_PBL2)
       return codec_error("xtr_v1 MRT PBL mode code is invalid");
     pbl_mode = rdma_mr_pbl_mode_e'(value[1:0]);
-    if (is_key_alloc() && pbl_mode != RDMA_MR_PBL0)
-      return codec_error("xtr_v1 KEY_ALLOC requires PBL0");
     return rdma_status::success();
   endfunction
 
@@ -708,8 +706,6 @@ virtual class rdma_xtr_v1_mrt_body_codec_base
         mrt.page_layout.mr_serial > 12'hfff ||
         mrt.page_layout.first_pbl_index > 28'hfff_ffff)
       return invalid_argument("MRT scalar exceeds xtr_v1 field/domain");
-    if (is_key_alloc() && mrt.page_layout.pbl_mode != RDMA_MR_PBL0)
-      return invalid_argument("xtr_v1 KEY_ALLOC requires PBL0");
     if (mrt.page_layout.pbl_mode inside {RDMA_MR_PBL0, RDMA_MR_PBL1}) begin
       status = encode_page(mrt.page_layout.pba0, "MRT PBA0", page);
       if (!status.ok()) return status;

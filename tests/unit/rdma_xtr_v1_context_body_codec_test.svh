@@ -1037,8 +1037,6 @@ class rdma_xtr_v1_context_body_codec_test extends uvm_test;
     if (!$cast(changed, clone_model(pbl0, "MRT_PAGE_64K"))) return;
     changed.page_layout.host_page_size = RDMA_MR_PAGE_64K;
     expect_encode_failure("MRT_PAGE_64K", register_codec, changed);
-    if (!$cast(changed, clone_model(pbl1, "MRT_KEY_PBL1"))) return;
-    expect_encode_failure("MRT_KEY_PBL1", key_codec, changed);
     if (!$cast(changed, clone_model(pbl0, "MRT_ERROR_STATE"))) return;
     changed.state = RDMA_CONTEXT_ERROR;
     expect_encode_failure("MRT_ERROR_STATE", register_codec, changed);
@@ -1302,7 +1300,9 @@ class rdma_xtr_v1_context_body_codec_test extends uvm_test;
     rdma_xtr_v1_golden_case mrt0_golden;
     rdma_xtr_v1_golden_case mrt1_golden;
     rdma_xtr_v1_golden_case mrt2_golden;
-    rdma_xtr_v1_golden_case mrt_key_golden;
+    rdma_xtr_v1_golden_case mrt_key0_golden;
+    rdma_xtr_v1_golden_case mrt_key1_golden;
+    rdma_xtr_v1_golden_case mrt_key2_golden;
     rdma_xtr_v1_golden_case srqc_golden;
     rdma_xtr_v1_golden_case ceqc_golden;
     rdma_xtr_v1_golden_case aeqc_golden;
@@ -1318,7 +1318,9 @@ class rdma_xtr_v1_context_body_codec_test extends uvm_test;
     rdma_hw_image mrt0_image;
     rdma_hw_image mrt1_image;
     rdma_hw_image mrt2_image;
-    rdma_hw_image mrt_key_image;
+    rdma_hw_image mrt_key0_image;
+    rdma_hw_image mrt_key1_image;
+    rdma_hw_image mrt_key2_image;
     rdma_hw_image srqc_image;
     rdma_hw_image ceqc_image;
     rdma_hw_image aeqc_image;
@@ -1357,13 +1359,16 @@ class rdma_xtr_v1_context_body_codec_test extends uvm_test;
     mrt0_golden = require_golden(cases, "mrt_register_pbl0_boundary");
     mrt1_golden = require_golden(cases, "mrt_register_pbl1_boundary");
     mrt2_golden = require_golden(cases, "mrt_register_pbl2_boundary");
-    mrt_key_golden = require_golden(cases, "mrt_key_alloc_pbl0_boundary");
+    mrt_key0_golden = require_golden(cases, "mrt_key_alloc_pbl0_boundary");
+    mrt_key1_golden = require_golden(cases, "mrt_key_alloc_pbl1_boundary");
+    mrt_key2_golden = require_golden(cases, "mrt_key_alloc_pbl2_boundary");
     srqc_golden = require_golden(cases, "srqc_create_body_boundary");
     ceqc_golden = require_golden(cases, "ceqc_create_body_boundary");
     aeqc_golden = require_golden(cases, "aeqc_create_body_boundary");
     if (cqc_golden == null || mrt0_golden == null ||
         mrt1_golden == null || mrt2_golden == null ||
-        mrt_key_golden == null || srqc_golden == null ||
+        mrt_key0_golden == null || mrt_key1_golden == null ||
+        mrt_key2_golden == null || srqc_golden == null ||
         ceqc_golden == null || aeqc_golden == null)
       `uvm_fatal("BODY_GOLDEN_REQUIRED",
                  "one or more required golden cases are unavailable")
@@ -1388,8 +1393,14 @@ class rdma_xtr_v1_context_body_codec_test extends uvm_test;
                            mrt2, mrt2_golden, RDMA_IMAGE_MRT,
                            mrt2.mr_h.generation, mrt2_image);
     check_golden_roundtrip("MRT_KEY_ALLOC_PBL0_GOLDEN", mrt_key_codec, mrt0,
-                           mrt_key_golden, RDMA_IMAGE_MRT,
-                           mrt0.mr_h.generation, mrt_key_image);
+                           mrt_key0_golden, RDMA_IMAGE_MRT,
+                           mrt0.mr_h.generation, mrt_key0_image);
+    check_golden_roundtrip("MRT_KEY_ALLOC_PBL1_GOLDEN", mrt_key_codec, mrt1,
+                           mrt_key1_golden, RDMA_IMAGE_MRT,
+                           mrt1.mr_h.generation, mrt_key1_image);
+    check_golden_roundtrip("MRT_KEY_ALLOC_PBL2_GOLDEN", mrt_key_codec, mrt2,
+                           mrt_key2_golden, RDMA_IMAGE_MRT,
+                           mrt2.mr_h.generation, mrt_key2_image);
     check_golden_roundtrip("SRQC_GOLDEN", srqc_codec, srqc, srqc_golden,
                            RDMA_IMAGE_SRQC, srqc.srq_h.generation,
                            srqc_image);
@@ -1409,7 +1420,7 @@ class rdma_xtr_v1_context_body_codec_test extends uvm_test;
     check_metadata_failures(cqc_codec, cqc_image);
     check_cqc_negatives(cqc_codec, cqc, cqc_image);
     check_mrt_negatives(mrt_key_codec, mrt_register_codec, mrt0, mrt1, mrt2,
-                        mrt_key_image, mrt0_image, mrt1_image, mrt2_image);
+                        mrt_key0_image, mrt0_image, mrt1_image, mrt2_image);
     check_srqc_negatives(srqc_codec, srqc, srqc_image);
     check_eq_negatives(ceqc_codec, aeqc_codec, ceqc, aeqc,
                        ceqc_image, aeqc_image);
@@ -1418,8 +1429,12 @@ class rdma_xtr_v1_context_body_codec_test extends uvm_test;
 
     check_reserved_qwords("CQC", cqc_codec, cqc_image, RDMA_IMAGE_CQC,
                           XTR_V1_OP_CQC_CREATE, RDMA_MR_PBL0);
-    check_reserved_qwords("MRT_KEY", mrt_key_codec, mrt_key_image,
+    check_reserved_qwords("MRT_KEY_PBL0", mrt_key_codec, mrt_key0_image,
                           RDMA_IMAGE_MRT, XTR_V1_OP_KEY_ALLOC, RDMA_MR_PBL0);
+    check_reserved_qwords("MRT_KEY_PBL1", mrt_key_codec, mrt_key1_image,
+                          RDMA_IMAGE_MRT, XTR_V1_OP_KEY_ALLOC, RDMA_MR_PBL1);
+    check_reserved_qwords("MRT_KEY_PBL2", mrt_key_codec, mrt_key2_image,
+                          RDMA_IMAGE_MRT, XTR_V1_OP_KEY_ALLOC, RDMA_MR_PBL2);
     check_reserved_qwords("MRT_PBL0", mrt_register_codec, mrt0_image,
                           RDMA_IMAGE_MRT, XTR_V1_OP_MR_REGISTER,
                           RDMA_MR_PBL0);

@@ -9,11 +9,12 @@ class rdma_xtr_v1_defs_test extends uvm_test;
   function void check_context_golden();
     rdma_xtr_v1_golden_case cases[$];
     string error;
-    string expected_names[11] = '{
+    string expected_names[13] = '{
       "qpc_rc_boundary", "qpc_ud_boundary", "qpc_urc_boundary",
       "cqc_create_body_boundary", "mrt_register_pbl0_boundary",
       "mrt_register_pbl1_boundary", "mrt_register_pbl2_boundary",
-      "mrt_key_alloc_pbl0_boundary", "srqc_create_body_boundary",
+      "mrt_key_alloc_pbl0_boundary", "mrt_key_alloc_pbl1_boundary",
+      "mrt_key_alloc_pbl2_boundary", "srqc_create_body_boundary",
       "ceqc_create_body_boundary", "aeqc_create_body_boundary"
     };
 
@@ -22,8 +23,8 @@ class rdma_xtr_v1_defs_test extends uvm_test;
       `uvm_error("GOLDEN", error)
       return;
     end
-    if (cases.size() != 11) begin
-      `uvm_error("GOLDEN", $sformatf("context case count %0d, expected 11",
+    if (cases.size() != 13) begin
+      `uvm_error("GOLDEN", $sformatf("context case count %0d, expected 13",
                                      cases.size()))
       return;
     end

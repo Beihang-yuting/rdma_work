@@ -428,7 +428,9 @@ Task 9.5 新增明确的 `*_BODY_*` 常量，避免把 local context 坐标与 f
 - `cqc_create_body_boundary`；
 - `mrt_register_pbl0_boundary`、`mrt_register_pbl1_boundary`、
   `mrt_register_pbl2_boundary`；
-- `mrt_key_alloc_pbl0_boundary`，用于锁定普通 MR 路径的 opcode 和 self-parent 差异；
+- `mrt_key_alloc_pbl0_boundary`、`mrt_key_alloc_pbl1_boundary`、
+  `mrt_key_alloc_pbl2_boundary`，用于锁定普通 MR 路径的 opcode、三种 PBL
+  layout 和 self-parent 差异；
 - `srqc_create_body_boundary`；
 - `ceqc_create_body_boundary`、`aeqc_create_body_boundary`。
 

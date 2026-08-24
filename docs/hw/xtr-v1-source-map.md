@@ -34,7 +34,7 @@ is fatal and is never evaluated as Python or C.
 |---|---:|---|---|---|
 | QPC `qpc_rc_boundary`, `qpc_ud_boundary`, `qpc_urc_boundary` | 512 each | big-endian per 64-bit qword; destination IP remains driver `memcpy` byte order | `qp.h` `XTRDMA_QPC_*`; byte placement from `qp.c:xtrdma_fill_rc_ud_qpc_info` and `xtrdma_fill_urc_qpc_info` | First three `context.hex` cases. Inputs freeze transport-specific backing, traffic class, address-vector, PSN/sequence semantics, thresholds and queue IDs. `ICOS=traffic_class[7:5]`, `DSCP=traffic_class[7:2]`, and `ECN=traffic_class[1:0]`; UD ECN is 0 and RC/URC ECN is 2. |
 | CQC `cqc_create_body_boundary` | 64 | big-endian per 64-bit qword | `cq.h` `XTRDMA_CMQ_CQC_*`, `cmq.h` CQN; `cq.c` local stores copied by `cmq.c:xtrdma_sc_cq_create` | Final sparse WQE coordinates: local byte 0..55 becomes byte 8..63. |
-| MRT register/key allocate, PBL0/1/2 | 64 each | big-endian per 64-bit qword | `cmq.h` `XTRDMA_CQPSQ_MRT_*`; `mr.c:xtrdma_hwreg_mr`, `cmq.c:xtrdma_sc_mr_register` | Four ordered cases freeze MR_REGISTER (`0x05`) PBL0/1/2 plus KEY_ALLOC (`0x04`) PBL0. KEY_ALLOC byte 16 bits 23:0 repeats its STAG; MR_REGISTER keeps them zero. |
+| MRT register/key allocate, PBL0/1/2 | 64 each | big-endian per 64-bit qword | `cmq.h` `XTRDMA_CQPSQ_MRT_*`; `mr.c:xtrdma_hwreg_mr`, `cmq.c:xtrdma_sc_alloc_key`, `cmq.c:xtrdma_sc_mr_register` | Six ordered cases freeze KEY_ALLOC (`0x04`) and MR_REGISTER (`0x05`) for PBL0/1/2. KEY_ALLOC byte 16 bits 23:0 repeats its STAG; MR_REGISTER keeps them zero. |
 | SRQC `srqc_create_body_boundary` | 64 | big-endian per 64-bit qword | `srq.h` `XTRDMA_SRFQ_CTX_*`; `srq.c:xtrdma_hw_create_srfqc` | Final sparse WQE coordinates: local byte 0..31 becomes byte 16..47. |
 | CEQC/AEQC create body boundaries | 64 each | big-endian per 64-bit qword | `event.h` `XTRDMA_EQ_CTX_*`; `event.c:xtrdma_hw_create_eq` | Shared EQC layout at final byte 16..47, with distinct case/opcode/image ownership. |
 | CMQ `qpc_create` | 64 | big-endian per 64-bit qword | `cmq.h` common/QPC fields and `xtrdma_cmq_opcode`; byte placement from `cmq.c` | `cmq.hex`: case 2, inputs 3, length 4, payload 5; `opcode=0,qpn=0x654321,index=27,valid=1,vfid_override=1,use_vfid=0x345,wrap=1,sq_cqn=0x15555,sign=1,rq_cqn=0xaaaa,buffer=0x123456789ab` |
@@ -79,13 +79,13 @@ registry keys and transport masks select the codec that authors the full
 | `qpc_ud_boundary` | 512 / 512 / big-endian per qword | `rdma_xtr_v1_qpc_ud_codec::encode_extension`, `rdma_xtr_v1_qpc_codec_base::{encode,decode,serialized_equal}` | `xtr_v1\|1\|qpc\|ud\|00` | UD coordinates admitted by `qpc_allowed_mask(RDMA_TRANSPORT_UD, ...)`; no CMQ envelope ownership |
 | `qpc_urc_boundary` | 512 / 512 / big-endian per qword | `rdma_xtr_v1_qpc_urc_codec::encode_extension`, `rdma_xtr_v1_qpc_codec_base::{encode,decode,serialized_equal}` | `xtr_v1\|1\|qpc\|urc\|00` | URC coordinates admitted by `qpc_allowed_mask(RDMA_TRANSPORT_URC, ...)`; no CMQ envelope ownership |
 
-The eight sparse bodies retain final CMQ SQE byte coordinates.  Each body is
+The ten sparse bodies retain final CMQ SQE byte coordinates. Each body is
 64-byte aligned and its mask is disjoint from the request envelope.
 
 | Sparse-body golden case | Bytes / alignment / endian | Source functions | Codec registry key | Mask owner |
 |---|---|---|---|---|
 | `cqc_create_body_boundary` | 64 / 64 / big-endian per qword | `rdma_xtr_v1_cqc_create_body_codec::{encode_body,decode_body}` through `rdma_xtr_v1_context_body_codec_base::{encode,decode,serialized_equal}` | `xtr_v1\|2\|cqc\|create\|0c` | `XTR_V1_CQC_CREATE_BODY_MASK` |
-| `mrt_key_alloc_pbl0_boundary` | 64 / 64 / big-endian per qword | `rdma_xtr_v1_mrt_key_alloc_body_codec::{encode_body,decode_body}` through `rdma_xtr_v1_mrt_body_codec_base::{encode_body,decode_body}` | `xtr_v1\|3\|mrt\|key_alloc\|04` | `XTR_V1_MRT_KEY_ALLOC_PBL0_BODY_MASK` |
+| `mrt_key_alloc_pbl0_boundary`, `mrt_key_alloc_pbl1_boundary`, `mrt_key_alloc_pbl2_boundary` | 64 / 64 / big-endian per qword | `rdma_xtr_v1_mrt_key_alloc_body_codec::{encode_body,decode_body}` through `rdma_xtr_v1_mrt_body_codec_base::{encode_body,decode_body}` | `xtr_v1\|3\|mrt\|key_alloc\|04` | exact `XTR_V1_MRT_KEY_ALLOC_PBL{0,1,2}_BODY_MASK` selected by PBL mode |
 | `mrt_register_pbl0_boundary` | 64 / 64 / big-endian per qword | `rdma_xtr_v1_mrt_register_body_codec::{encode_body,decode_body}` through `rdma_xtr_v1_mrt_body_codec_base::{encode_body,decode_body}` | `xtr_v1\|3\|mrt\|register\|05` | `XTR_V1_MRT_REGISTER_PBL0_BODY_MASK` |
 | `mrt_register_pbl1_boundary` | 64 / 64 / big-endian per qword | `rdma_xtr_v1_mrt_register_body_codec::{encode_body,decode_body}` through `rdma_xtr_v1_mrt_body_codec_base::{encode_body,decode_body}` | `xtr_v1\|3\|mrt\|register\|05` | `XTR_V1_MRT_REGISTER_PBL1_BODY_MASK` |
 | `mrt_register_pbl2_boundary` | 64 / 64 / big-endian per qword | `rdma_xtr_v1_mrt_register_body_codec::{encode_body,decode_body}` through `rdma_xtr_v1_mrt_body_codec_base::{encode_body,decode_body}` | `xtr_v1\|3\|mrt\|register\|05` | `XTR_V1_MRT_REGISTER_PBL2_BODY_MASK` |
@@ -104,15 +104,15 @@ it with `compose_request`, and the response is admitted by
 |---|---|---|---|---|
 | `qpc_rc_boundary`, `qpc_ud_boundary`, `qpc_urc_boundary` | 64 / 64 / big-endian per qword | `rdma_xtr_v1_cmq_request_composer::{build_body,compose_request}`, `rdma_xtr_v1_cmq_completion_codec::decode_completion` | body registry opcode `00`, input `RDMA_IMAGE_CMQ_SQE` | `XTR_V1_QPC_CREATE_BODY_OWNERSHIP`; the composer owns the checksum signature while the 512-byte QPC remains standalone |
 | `cqc_create_body_boundary` | 64 / 64 / big-endian per qword | `rdma_xtr_v1_cmq_request_composer::{build_body,compose_request}`, `rdma_xtr_v1_cmq_completion_codec::decode_completion` | body registry opcode `0c`, input `RDMA_IMAGE_CQC` | `XTR_V1_CQC_CREATE_BODY_MASK` |
-| `mrt_key_alloc_pbl0_boundary` | 64 / 64 / big-endian per qword | `rdma_xtr_v1_cmq_request_composer::{build_body,compose_request}`, `rdma_xtr_v1_cmq_completion_codec::decode_completion` | body registry opcode `04`, input `RDMA_IMAGE_MRT` | `XTR_V1_MRT_KEY_ALLOC_PBL0_BODY_MASK` |
+| `mrt_key_alloc_pbl0_boundary`, `mrt_key_alloc_pbl1_boundary`, `mrt_key_alloc_pbl2_boundary` | 64 / 64 / big-endian per qword | `rdma_xtr_v1_cmq_request_composer::{build_body,compose_request}`, `rdma_xtr_v1_cmq_completion_codec::decode_completion` | body registry opcode `04`, input `RDMA_IMAGE_MRT` | `XTR_V1_MRT_KEY_ALLOC_BODY_OWNERSHIP`; exact PBL0/PBL1/PBL2 mask is authenticated by the context codec |
 | `mrt_register_pbl0_boundary`, `mrt_register_pbl1_boundary`, `mrt_register_pbl2_boundary` | 64 / 64 / big-endian per qword | `rdma_xtr_v1_cmq_request_composer::{build_body,compose_request}`, `rdma_xtr_v1_cmq_completion_codec::decode_completion` | body registry opcode `05`, input `RDMA_IMAGE_MRT` | exact PBL0/PBL1/PBL2 register mask selected by the authenticated body |
 | `srqc_create_body_boundary` | 64 / 64 / big-endian per qword | `rdma_xtr_v1_cmq_request_composer::{build_body,compose_request}`, `rdma_xtr_v1_cmq_completion_codec::decode_completion` | body registry opcode `35`, input `RDMA_IMAGE_SRQC` | `XTR_V1_SRQC_CREATE_BODY_MASK` |
 | `ceqc_create_body_boundary` | 64 / 64 / big-endian per qword | `rdma_xtr_v1_cmq_request_composer::{build_body,compose_request}`, `rdma_xtr_v1_cmq_completion_codec::decode_completion` | body registry opcode `10`, input `RDMA_IMAGE_CEQC` | `XTR_V1_CEQC_CREATE_BODY_MASK` |
 | `aeqc_create_body_boundary` | 64 / 64 / big-endian per qword | `rdma_xtr_v1_cmq_request_composer::{build_body,compose_request}`, `rdma_xtr_v1_cmq_completion_codec::decode_completion` | body registry opcode `14`, input `RDMA_IMAGE_AEQC` | `XTR_V1_AEQC_CREATE_BODY_MASK` |
 
-KEY_ALLOC opcode `04` is the ordinary MR allocation path: it uses PBL0 and
-writes a self-parent STAG (`parent_stag_idx == stag_idx`).  MR_REGISTER opcode
-`05` is the register path for PBL0/PBL1/PBL2 and writes
+KEY_ALLOC opcode `04` is the ordinary MR allocation path for PBL0/PBL1/PBL2
+and writes a self-parent STAG (`parent_stag_idx == stag_idx`). MR_REGISTER
+opcode `05` also carries PBL0/PBL1/PBL2 layouts but writes
 `parent_stag_idx == 0`.
 
 ### Canonical URC create/modify image

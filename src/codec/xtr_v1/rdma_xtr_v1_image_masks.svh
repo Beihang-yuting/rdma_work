@@ -22,6 +22,18 @@ localparam bit [63:0] XTR_V1_MRT_KEY_ALLOC_PBL0_BODY_MASK [0:7] = '{
   64'hffffffffffffffff, 64'hfffffffffffff000,
   64'h0000000000000fff, 64'h0000000000000000
 };
+localparam bit [63:0] XTR_V1_MRT_KEY_ALLOC_PBL1_BODY_MASK [0:7] = '{
+  64'h6000000000ffffff, 64'h00000000ff000000,
+  64'hffffffffffffffff, 64'hff00bfffffffffff,
+  64'hffffffffffffffff, 64'hfffffffffffff000,
+  64'hffffffffffffffff, 64'h0000000000000000
+};
+localparam bit [63:0] XTR_V1_MRT_KEY_ALLOC_PBL2_BODY_MASK [0:7] = '{
+  64'h6000000000ffffff, 64'h00000000ff000000,
+  64'hffffffffffffffff, 64'hff00bfffffffffff,
+  64'hffffffffffffffff, 64'hfffffff000000000,
+  64'h0000000000000fff, 64'h0000000000000000
+};
 localparam bit [63:0] XTR_V1_MRT_REGISTER_PBL1_BODY_MASK [0:7] = '{
   64'h6000000000ffffff, 64'h00000000ff000000,
   64'hffffffffff000000, 64'hff00bfffffffffff,
@@ -79,6 +91,12 @@ localparam bit [63:0] XTR_V1_QPC_QUERY_BODY_OWNERSHIP [0:7] = '{
 localparam bit [63:0] XTR_V1_MRT_REGISTER_BODY_OWNERSHIP [0:7] = '{
   64'h6000000000ffffff, 64'h00000000ff000000,
   64'hffffffffff000000, 64'hff00bfffffffffff,
+  64'hffffffffffffffff, 64'hfffffffffffff000,
+  64'hffffffffffffffff, 64'h0000000000000000
+};
+localparam bit [63:0] XTR_V1_MRT_KEY_ALLOC_BODY_OWNERSHIP [0:7] = '{
+  64'h6000000000ffffff, 64'h00000000ff000000,
+  64'hffffffffffffffff, 64'hff00bfffffffffff,
   64'hffffffffffffffff, 64'hfffffffffffff000,
   64'hffffffffffffffff, 64'h0000000000000000
 };
@@ -162,9 +180,12 @@ function automatic bit body_mask(
     RDMA_IMAGE_MRT: begin
       case (opcode)
         XTR_V1_OP_KEY_ALLOC: begin
-          if (pbl_mode != 0)
-            return 0;
-          mask = XTR_V1_MRT_KEY_ALLOC_PBL0_BODY_MASK[qword_index];
+          case (pbl_mode)
+            0: mask = XTR_V1_MRT_KEY_ALLOC_PBL0_BODY_MASK[qword_index];
+            1: mask = XTR_V1_MRT_KEY_ALLOC_PBL1_BODY_MASK[qword_index];
+            2: mask = XTR_V1_MRT_KEY_ALLOC_PBL2_BODY_MASK[qword_index];
+            default: return 0;
+          endcase
         end
         XTR_V1_OP_MR_REGISTER: begin
           case (pbl_mode)

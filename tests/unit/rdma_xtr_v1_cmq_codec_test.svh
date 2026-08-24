@@ -187,7 +187,8 @@ class rdma_xtr_v1_cmq_codec_test extends uvm_test;
 
   function automatic rdma_mrt_model make_mrt(
     string name,
-    int unsigned stag_index
+    int unsigned stag_index,
+    rdma_mr_pbl_mode_e pbl_mode = RDMA_MR_PBL0
   );
     rdma_mrt_model mrt;
     mrt = rdma_mrt_model::type_id::create(name);
@@ -202,10 +203,16 @@ class rdma_xtr_v1_cmq_codec_test extends uvm_test;
                    remote_write:1'b0, memory_window_bind:1'b0,
                    remote_atomic:1'b0};
     mrt.object_type = 2'd0;
-    mrt.page_layout.pbl_mode = RDMA_MR_PBL0;
+    mrt.page_layout.pbl_mode = pbl_mode;
     mrt.page_layout.host_page_size = RDMA_MR_PAGE_4K;
     mrt.page_layout.address_mode = RDMA_MR_ADDRESS_VA_BASED;
     mrt.page_layout.pba0.value = 64'h0000_0000_0400_0000;
+    if (pbl_mode == RDMA_MR_PBL1)
+      mrt.page_layout.pba1.value = 64'h0000_0000_0400_1000;
+    else if (pbl_mode == RDMA_MR_PBL2) begin
+      mrt.page_layout.pba0.value = 0;
+      mrt.page_layout.first_pbl_index = 28'h123_4567;
+    end
     mrt.page_layout.payload_vf_enable = 1'b1;
     mrt.page_layout.payload_vf_id = 8'h5a;
     mrt.page_layout.mr_serial = 12'h678;
@@ -832,11 +839,12 @@ class rdma_xtr_v1_cmq_codec_test extends uvm_test;
   endfunction
 
   function automatic void check_ownership_oracles();
-    bit [7:0] opcodes[11] = '{
+    bit [7:0] opcodes[12] = '{
       XTR_V1_OP_QPC_CREATE,
       XTR_V1_OP_QPC_MODIFY,
       XTR_V1_OP_QPC_DELETE,
       XTR_V1_OP_QPC_QUERY,
+      XTR_V1_OP_KEY_ALLOC,
       XTR_V1_OP_MR_REGISTER,
       XTR_V1_OP_MR_DEREGISTER,
       XTR_V1_OP_OCC_FLUSH,
@@ -845,11 +853,12 @@ class rdma_xtr_v1_cmq_codec_test extends uvm_test;
       XTR_V1_OP_SRFQC_DELETE,
       XTR_V1_OP_TQ_FLUSH
     };
-    rdma_image_kind_e expected_kinds[11] = '{
+    rdma_image_kind_e expected_kinds[12] = '{
       RDMA_IMAGE_CMQ_SQE,
       RDMA_IMAGE_CMQ_SQE,
       RDMA_IMAGE_CMQ_SQE,
       RDMA_IMAGE_CMQ_SQE,
+      RDMA_IMAGE_MRT,
       RDMA_IMAGE_MRT,
       RDMA_IMAGE_CMQ_SQE,
       RDMA_IMAGE_CMQ_SQE,
@@ -858,12 +867,13 @@ class rdma_xtr_v1_cmq_codec_test extends uvm_test;
       RDMA_IMAGE_CMQ_SQE,
       RDMA_IMAGE_CMQ_SQE
     };
-    string labels[11] = '{
+    string labels[12] = '{
       "QPC create", "QPC modify", "QPC delete", "QPC query",
-      "MRT register", "MR deregister", "OCC flush", "CQ object ID",
+      "MRT key allocate", "MRT register", "MR deregister", "OCC flush",
+      "CQ object ID",
       "EQ object ID", "SRQ object ID", "empty body"
     };
-    bit [63:0] expected_masks[11][8] = '{
+    bit [63:0] expected_masks[12][8] = '{
       '{64'h0000000000ffffff, 64'hfffff801ff1fffff,
         64'h0000000000000000, 64'hfffffffffffffe00,
         64'h0000000000000000, 64'h0000000000000000,
@@ -880,6 +890,10 @@ class rdma_xtr_v1_cmq_codec_test extends uvm_test;
         64'h0000000000000000, 64'hfffffffffffffe00,
         64'h0000000000000000, 64'h0000000000000000,
         64'h0000000000000000, 64'h0000000000000000},
+      '{64'h6000000000ffffff, 64'h00000000ff000000,
+        64'hffffffffffffffff, 64'hff00bfffffffffff,
+        64'hffffffffffffffff, 64'hfffffffffffff000,
+        64'hffffffffffffffff, 64'h0000000000000000},
       '{64'h6000000000ffffff, 64'h00000000ff000000,
         64'hffffffffff000000, 64'hff00bfffffffffff,
         64'hffffffffffffffff, 64'hfffffffffffff000,
@@ -1106,6 +1120,8 @@ class rdma_xtr_v1_cmq_codec_test extends uvm_test;
     rdma_hw_image key_zero_image;
     rdma_hw_image register_zero_image;
     rdma_hw_image key_nonzero_image;
+    rdma_hw_image key_pbl1_image;
+    rdma_hw_image key_pbl2_image;
     rdma_hw_image qpc_source;
     rdma_hw_image result;
     rdma_status status;
@@ -1237,6 +1253,18 @@ class rdma_xtr_v1_cmq_codec_test extends uvm_test;
     key_nonzero_image = encode_context("KEY_ALLOC_NONZERO",
                                        XTR_V1_OP_KEY_ALLOC,
                                        make_mrt("mrt_nonzero", 1));
+    key_pbl1_image = encode_context(
+      "KEY_ALLOC_PBL1", XTR_V1_OP_KEY_ALLOC,
+      make_mrt("mrt_key_pbl1", 24'h123456, RDMA_MR_PBL1));
+    if (key_pbl1_image != null)
+      void'(compose_ok("KEY_ALLOC_PBL1", XTR_V1_OP_KEY_ALLOC,
+                       key_pbl1_image));
+    key_pbl2_image = encode_context(
+      "KEY_ALLOC_PBL2", XTR_V1_OP_KEY_ALLOC,
+      make_mrt("mrt_key_pbl2", 24'h654321, RDMA_MR_PBL2));
+    if (key_pbl2_image != null)
+      void'(compose_ok("KEY_ALLOC_PBL2", XTR_V1_OP_KEY_ALLOC,
+                       key_pbl2_image));
     envelope = make_envelope(XTR_V1_OP_MR_REGISTER);
     expect_compose_failure("KEY_ALLOC_NONZERO_AS_REGISTER", composer,
                            envelope, key_nonzero_image, null,
