@@ -2478,6 +2478,35 @@ class rdma_cmq_engine_probe extends rdma_cmq_engine;
     return 1'b1;
   endfunction
 
+  function bit tamper_balanced_cancel_membership(
+    rdma_cmq_ticket quarantined_ticket,
+    rdma_cmq_ticket published_ticket
+  );
+    rdma_cmq_slot_record quarantined_record;
+    int stray_token;
+
+    if (quarantined_ticket == null || published_ticket == null ||
+        quarantined_ticket.sq_index >= 32 ||
+        published_ticket.sq_index >= 32 ||
+        slots[quarantined_ticket.sq_index] == null ||
+        slots[published_ticket.sq_index] == null ||
+        slots[quarantined_ticket.sq_index].state !=
+          CMQ_SLOT_TIMED_OUT_QUARANTINED ||
+        slots[published_ticket.sq_index].state != CMQ_SLOT_PUBLISHED)
+      return 1'b0;
+    stray_token = -1;
+    foreach (token_in_use[i]) begin
+      if (stray_token < 0 && !token_in_use[i])
+        stray_token = i;
+    end
+    if (stray_token < 0)
+      return 1'b0;
+    quarantined_record = slots[quarantined_ticket.sq_index];
+    token_in_use[stray_token] = 1'b1;
+    command_registry["cancel-ledger-stray-member"] = quarantined_record;
+    return 1'b1;
+  endfunction
+
   function bit tamper_recovery_ticket_x(
     rdma_cmq_ticket ticket,
     rdma_cmq_test_recovery_x_fault_e fault
@@ -11509,6 +11538,137 @@ class rdma_cmq_engine_test extends uvm_test;
     end
   endtask
 
+  task automatic check_strict_cancel_audits_exact_membership();
+    rdma_cmq_engine_probe engine;
+    rdma_mock_host_mem mem;
+    rdma_cmq_test_pcie pcie;
+    rdma_doorbell_scheduler scheduler;
+    rdma_cmq_test_profile profile;
+    rdma_function_binding prepared_binding;
+    rdma_function_binding active_binding;
+    rdma_cmq cmq;
+    rdma_cmq_runtime_desc runtime_desc;
+    rdma_cmq_command_desc requests[];
+    rdma_cmq_ticket tickets[];
+    rdma_status item_statuses[];
+    rdma_status batch_status;
+    rdma_cmq_completion completions[$];
+    rdma_status status;
+    rdma_status cleanup_status;
+    longint unsigned before_publish;
+    longint unsigned before_retire;
+    longint unsigned before_consume;
+    int unsigned before_slots;
+    int unsigned before_tokens;
+    int unsigned before_commands;
+    int unsigned before_entries;
+    int unsigned before_terminal;
+    int unsigned before_diagnostics;
+
+    engine = rdma_cmq_engine_probe::type_id::create(
+      "strict_cancel_membership_engine"
+    );
+    mem = rdma_mock_host_mem::type_id::create(
+      "strict_cancel_membership_mem"
+    );
+    pcie = rdma_cmq_test_pcie::type_id::create(
+      "strict_cancel_membership_pcie"
+    );
+    scheduler = rdma_doorbell_scheduler::type_id::create(
+      "strict_cancel_membership_scheduler"
+    );
+    profile = rdma_cmq_test_profile::type_id::create(
+      "strict_cancel_membership_profile"
+    );
+    prepared_binding = make_binding(
+      "strict_cancel_membership_prepared", RDMA_BIND_PREPARED
+    );
+    active_binding = make_binding(
+      "strict_cancel_membership_active", RDMA_BIND_ACTIVE
+    );
+    cmq = make_cmq("strict_cancel_membership_cmq", prepared_binding);
+    prepare_active(
+      "STRICT_CANCEL_MEMBERSHIP", engine, mem, pcie, scheduler, profile,
+      prepared_binding, active_binding, cmq, runtime_desc
+    );
+    requests = new[2];
+    requests[0] = make_command(
+      "strict_cancel_membership_timeout", active_binding,
+      rdma_cmq_test_profile::TEST_OPCODE_A, 8'he8, 10ns
+    );
+    requests[1] = make_command(
+      "strict_cancel_membership_published", active_binding,
+      rdma_cmq_test_profile::TEST_OPCODE_B, 8'he9, 10us
+    );
+    engine.submit_batch(requests, tickets, item_statuses, batch_status);
+    expect_status("STRICT_CANCEL_MEMBERSHIP_SUBMIT", batch_status,
+                  RDMA_SC_OK);
+    #20ns;
+    engine.expire(completions, status);
+    expect_status("STRICT_CANCEL_MEMBERSHIP_EXPIRE", status, RDMA_SC_OK);
+    if (completions.size() != 1 || completions[0] == null ||
+        completions[0].status == null ||
+        completions[0].status.code != RDMA_SC_TIMEOUT ||
+        engine.slot_state_at(tickets[0].sq_index) !=
+          CMQ_SLOT_TIMED_OUT_QUARANTINED ||
+        engine.slot_state_at(tickets[1].sq_index) != CMQ_SLOT_PUBLISHED)
+      `uvm_error("STRICT_CANCEL_MEMBERSHIP_EXPIRE",
+                 "fixture did not create quarantined and published slots")
+    if (!engine.tamper_balanced_cancel_membership(
+          tickets[0], tickets[1]
+        ))
+      `uvm_error("STRICT_CANCEL_MEMBERSHIP_TAMPER",
+                 "balanced stray-membership tamper failed")
+    before_publish = engine.published_count();
+    before_retire = engine.retired_count();
+    before_consume = engine.cq_consumed_count();
+    before_slots = engine.slot_record_count();
+    before_tokens = engine.tokens_in_use_count();
+    before_commands = engine.command_registry_count();
+    before_entries = engine.entry_registry_count();
+    before_terminal = engine.terminal_fifo_count();
+    before_diagnostics = engine.diagnostic_fifo_count();
+    if (before_slots != 2 || before_tokens != 2 ||
+        before_commands != 2 || before_entries != 2)
+      `uvm_error("STRICT_CANCEL_MEMBERSHIP_TAMPER",
+                 "tamper did not preserve the intended coarse counts")
+
+    engine.cancel_generation(
+      active_binding.generation, completions, status
+    );
+    expect_status("STRICT_CANCEL_BALANCED_MEMBERSHIP_STATUS", status,
+                  RDMA_SC_INVALID_STATE);
+    if (completions.size() != 0 ||
+        engine.state() != RDMA_CMQ_ENGINE_POISONED ||
+        engine.published_count() != before_publish ||
+        engine.retired_count() != before_retire ||
+        engine.cq_consumed_count() != before_consume ||
+        engine.slot_record_count() != before_slots ||
+        engine.tokens_in_use_count() != before_tokens ||
+        engine.command_registry_count() != before_commands ||
+        engine.entry_registry_count() != before_entries ||
+        engine.terminal_fifo_count() != before_terminal ||
+        engine.diagnostic_fifo_count() != before_diagnostics)
+      `uvm_error("STRICT_CANCEL_BALANCED_MEMBERSHIP_ATOMICITY",
+                 "strict cancel mutated a balanced stray membership")
+
+    engine.reset(completions, status);
+    expect_status("STRICT_CANCEL_BALANCED_MEMBERSHIP_RESET", status,
+                  RDMA_SC_OK);
+    if (status == null || !status.ok()) begin
+      engine.shutdown(cleanup_status);
+      return;
+    end
+    if (completions.size() != 1 || completions[0] == null ||
+        completions[0].ticket == null || completions[0].status == null ||
+        completions[0].ticket.command_id != tickets[1].command_id ||
+        completions[0].status.code != RDMA_SC_RESET_CANCELLED ||
+        count_host_calls(mem, "release") != 1)
+      `uvm_error("STRICT_CANCEL_BALANCED_MEMBERSHIP_RECOVERY",
+                 "reset did not safely clear and release the poisoned set")
+    expect_unconfigured("STRICT_CANCEL_BALANCED_MEMBERSHIP_STATE", engine);
+  endtask
+
   task automatic check_poison_recovery_rejects_x_tickets();
     string fault_labels[2];
 
@@ -12147,6 +12307,7 @@ class rdma_cmq_engine_test extends uvm_test;
     check_wait_for_fifo_and_deadline();
     check_cancel_reset_and_shutdown_lifecycle();
     check_strict_cancel_audits_complete_ledger();
+    check_strict_cancel_audits_exact_membership();
     check_poison_recovery_rejects_x_tickets();
     check_poisoned_ledger_reset_recovery();
     check_reset_fifo_retry_and_reprepare();

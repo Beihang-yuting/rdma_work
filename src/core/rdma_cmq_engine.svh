@@ -764,17 +764,23 @@ class rdma_cmq_engine extends uvm_object;
   );
     rdma_status status;
     longint unsigned ledger_used;
+    int unsigned published_slot_count;
+    int unsigned token_count;
 
     status = poll_ledger_status(ledger_used);
     if (status == null || !status.ok())
       return (status == null) ?
         poison_status("CMQ cancel ledger audit returned null status") :
         status;
+    published_slot_count = 0;
+    token_count = 0;
     foreach (slots[i]) begin
       rdma_cmq_slot_record record;
       string hardware_key;
       string software_key;
 
+      if (token_in_use[i])
+        token_count++;
       record = slots[i];
       if (record == null)
         continue;
@@ -816,6 +822,7 @@ class rdma_cmq_engine extends uvm_object;
         return poison_status("CMQ cancel entry registry is inconsistent");
       software_key = command_key(record.ticket);
       if (record.state == CMQ_SLOT_PUBLISHED) begin
+        published_slot_count++;
         if (!command_registry.exists(software_key) ||
             command_registry[software_key] != record ||
             record.command_token >= CMQ_DEPTH ||
@@ -829,6 +836,11 @@ class rdma_cmq_engine extends uvm_object;
           "CMQ cancel terminal command remains in the registry"
         );
     end
+    if (published_slot_count != command_registry.num() ||
+        published_slot_count != token_count)
+      return poison_status(
+        "CMQ cancel published command membership is inconsistent"
+      );
     return rdma_status::success();
   endfunction
 
@@ -5441,9 +5453,9 @@ class rdma_cmq_engine extends uvm_object;
     end
     if (engine_state != RDMA_CMQ_ENGINE_POISONED &&
         prepared_binding != null) begin
-      // shutdown has no completion output and must retain only release
-      // authority on failure, so use the same best-effort quarantine cleanup
-      // as poison recovery rather than the public cancellation audit.
+      // shutdown has no completion output and intentionally does not report
+      // strict ledger-audit failures. It must retain only release authority on
+      // failure, so use the same best-effort cleanup as poison recovery.
       cancel_status = cancel_generation_locked(
         prepared_binding.generation, 1'b1
       );
