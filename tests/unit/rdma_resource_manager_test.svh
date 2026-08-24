@@ -1291,6 +1291,35 @@ class rdma_resource_manager_test extends uvm_test;
                   remote_atomic:1'b0};
   endfunction
 
+  function automatic bit same_handle_fields(rdma_handle lhs,
+                                             rdma_handle rhs);
+    if (lhs == null || rhs == null)
+      return lhs == rhs;
+    return lhs.kind == rhs.kind &&
+           lhs.function_uid == rhs.function_uid &&
+           lhs.object_id == rhs.object_id &&
+           lhs.generation == rhs.generation;
+  endfunction
+
+  function automatic bit same_status_fields(rdma_status lhs,
+                                             rdma_status rhs);
+    if (lhs == null || rhs == null)
+      return lhs == rhs;
+    return lhs.category == rhs.category &&
+           lhs.code == rhs.code &&
+           lhs.hardware_code == rhs.hardware_code &&
+           lhs.hardware_code_valid == rhs.hardware_code_valid &&
+           lhs.source_engine == rhs.source_engine &&
+           lhs.function_uid == rhs.function_uid &&
+           lhs.generation == rhs.generation &&
+           lhs.resource_id == rhs.resource_id &&
+           lhs.command_id == rhs.command_id &&
+           lhs.wr_id == rhs.wr_id &&
+           lhs.severity == rhs.severity &&
+           lhs.retryable == rhs.retryable &&
+           lhs.message == rhs.message;
+  endfunction
+
   task run_phase(uvm_phase phase);
     rdma_resource_manager rm;
     rdma_resource_manager dep_rm;
@@ -1319,6 +1348,9 @@ class rdma_resource_manager_test extends uvm_test;
     rdma_clone_probe_manager schema_rm;
     rdma_clone_probe_manager schema_lookup_rm;
     rdma_clone_probe_manager projection_rm;
+    rdma_clone_probe_manager composite_function_rm;
+    rdma_clone_probe_manager composite_mr_rm;
+    rdma_clone_probe_manager composite_recovery_rm;
     rdma_resource_manager allocated_error_rm;
     rdma_resource_manager recovery_rm;
     rdma_resource_manager_probe privileged_recovery_rm;
@@ -1350,9 +1382,15 @@ class rdma_resource_manager_test extends uvm_test;
     rdma_function_binding schema_lookup_binding;
     rdma_function_binding schema_nested_binding;
     rdma_function_binding projection_binding;
+    rdma_function_binding composite_mr_binding;
+    rdma_function_binding composite_recovery_binding;
     rdma_rm_schema_binding schema_binding_probe;
     rdma_rm_schema_pcie schema_pcie_probe;
     rdma_rm_schema_bar schema_bar_probe;
+    rdma_rm_schema_binding composite_function_binding;
+    rdma_rm_schema_pcie composite_function_pcie;
+    rdma_rm_schema_bar composite_function_bars[6];
+    rdma_rm_schema_function_handle composite_function_owner;
     rdma_function_binding allocated_error_binding;
     rdma_function_binding recovery_binding;
     rdma_function_binding privileged_recovery_binding;
@@ -1386,6 +1424,8 @@ class rdma_resource_manager_test extends uvm_test;
     rdma_pd projection_pd;
     rdma_pd projection_recovery_pd_a;
     rdma_pd projection_recovery_pd_b;
+    rdma_pd composite_mr_pd;
+    rdma_pd composite_recovery_pd;
     rdma_pd allocated_error_pd;
     rdma_pd wrong_stage_pd;
     rdma_pd recovery_pd;
@@ -1420,6 +1460,8 @@ class rdma_resource_manager_test extends uvm_test;
     rdma_function width_function_b_reused;
     rdma_function clone_gate_function;
     rdma_rm_fault_function clone_fault_function;
+    rdma_function composite_function;
+    rdma_function composite_function_lookup;
     rdma_pd function_release_pd;
     rdma_function permanent_exhaustion_function;
     rdma_pd permanent_exhaustion_pd;
@@ -1449,6 +1491,9 @@ class rdma_resource_manager_test extends uvm_test;
     rdma_mr projection_seed_mr;
     rdma_mr projection_nested_mr;
     rdma_mr projection_lookup_mr;
+    rdma_mr composite_mr_seed;
+    rdma_mr composite_mr_lookup;
+    rdma_rm_schema_mr composite_mr_candidate;
     rdma_rm_unregistered_mr projection_unregistered_mr;
     rdma_rm_unregistered_mr projection_unregistered_mr_leak;
     rdma_rm_unregistered_mr projection_mismatched_mr;
@@ -1532,6 +1577,7 @@ class rdma_resource_manager_test extends uvm_test;
     rdma_rm_unregistered_recovery projection_unregistered_recovery_leak;
     rdma_rm_lying_recovery projection_lying_recovery;
     rdma_rm_lying_recovery projection_lying_recovery_leak;
+    rdma_rm_schema_recovery composite_recovery;
     rdma_backing_ref clone_backing_ref;
     rdma_backing_ref schema_exact_backing_ref;
     rdma_backing_ref projection_unregistered_backing_ref;
@@ -1543,6 +1589,12 @@ class rdma_resource_manager_test extends uvm_test;
     rdma_rm_unregistered_mapping projection_unregistered_mapping_leak;
     rdma_rm_lying_mapping projection_lying_mapping;
     rdma_rm_lying_mapping projection_lying_mapping_leak;
+    rdma_rm_schema_backing_ref composite_backing_refs[2];
+    rdma_rm_schema_mapping composite_mappings[2];
+    rdma_rm_schema_hmc_ref composite_hmc_refs[2];
+    rdma_rm_schema_function_handle composite_mapping_functions[2];
+    rdma_rm_schema_handle composite_mapping_owners[2];
+    rdma_rm_schema_function_handle composite_hmc_owners[2];
     rdma_hmc_ref clone_hmc_ref;
     rdma_rm_schema_hmc_ref schema_hmc_probe;
     rdma_mr clone_lookup_mr;
@@ -1559,6 +1611,30 @@ class rdma_resource_manager_test extends uvm_test;
     rdma_rm_schema_ticket schema_ticket;
     rdma_rm_schema_status schema_status;
     rdma_rm_schema_function_handle schema_function_handle;
+    rdma_rm_schema_handle composite_mr_handle;
+    rdma_rm_schema_handle composite_mr_pd_handle;
+    rdma_rm_schema_handle composite_mr_dependency;
+    rdma_rm_schema_function_handle composite_mr_owner;
+    rdma_rm_schema_handle composite_recovery_resource;
+    rdma_rm_schema_ticket composite_recovery_ticket;
+    rdma_rm_schema_function_handle composite_ticket_function;
+    rdma_rm_schema_handle composite_ticket_cmq;
+    rdma_rm_schema_opcode composite_ticket_opcode;
+    rdma_rm_schema_status composite_primary_status;
+    rdma_rm_schema_status composite_rollback_statuses[2];
+    rdma_rm_schema_binding composite_binding_leak;
+    rdma_rm_schema_pcie composite_pcie_leak;
+    rdma_rm_schema_bar composite_bar_leak;
+    rdma_rm_schema_mr composite_mr_leak;
+    rdma_rm_schema_backing_ref composite_backing_leak;
+    rdma_rm_schema_mapping composite_mapping_leak;
+    rdma_rm_schema_hmc_ref composite_hmc_leak;
+    rdma_rm_schema_recovery composite_recovery_leak;
+    rdma_rm_schema_ticket composite_ticket_leak;
+    rdma_rm_schema_opcode composite_opcode_leak;
+    rdma_rm_schema_status composite_status_leak;
+    rdma_rm_schema_handle composite_handle_leak;
+    rdma_rm_schema_function_handle composite_function_handle_leak;
     rdma_handle mutating_clone_pd_ref;
     rdma_cmq_ticket mutating_clone_ticket_ref;
     longint unsigned mutating_clone_length;
@@ -2638,6 +2714,1080 @@ class rdma_resource_manager_test extends uvm_test;
                   ), RDMA_SC_OK);
     expect_status("PROJECTION_NO_LEAKS",
                   projection_rm.check_leaks(leak_count), RDMA_SC_OK);
+
+    // Composite 1: a registered Function carrier with registered PCIe/BAR
+    // nodes is normalized through the real Function registration path.
+    composite_function_rm = new("composite_function_rm");
+    composite_function_binding = new("composite_function_binding");
+    composite_function_pcie = new("composite_function_pcie");
+    composite_function_binding.pcie = composite_function_pcie;
+    composite_function_binding.function_uid = 64'hc0a1_0000_0000_0001;
+    composite_function_binding.notify_bar_id = 3'd3;
+    composite_function_binding.notify_base.value =
+      64'h0000_0001_0003_2000;
+    composite_function_binding.notify_size = 64'h2000;
+    composite_function_binding.notify_table_sel = 32'hc0a1_0101;
+    composite_function_binding.notify_table_index = 32'hc0a1_0202;
+    composite_function_binding.host_id = 32'hc0a1_0303;
+    composite_function_binding.pfvf_id = 32'hc0a1_0404;
+    composite_function_binding.rdma_vf_id = 32'hc0a1_0505;
+    composite_function_binding.global_function_id = 32'hc0a1_0606;
+    composite_function_binding.vsi_id = 32'hc0a1_0707;
+    composite_function_binding.dma_domain_id = 32'hc0a1_0808;
+    composite_function_binding.dma_domain_valid = 1'b1;
+    composite_function_binding.state = RDMA_BIND_ACTIVE;
+    composite_function_binding.generation = 32'hc0a1_0909;
+    composite_function_binding.notify_valid = 1'b1;
+    composite_function_binding.notify_ready = 1'b1;
+    composite_function_binding.dmi_valid = 1'b1;
+    composite_function_binding.dmi_ready = 1'b1;
+    composite_function_binding.vft_valid = 1'b1;
+    composite_function_binding.vft_ready = 1'b1;
+    composite_function_pcie.bdf =
+      '{segment:16'hc0a1, bus:8'h11, device:5'h12, function_num:3'h3};
+    composite_function_pcie.parent_pf_bdf =
+      '{segment:16'hc0a2, bus:8'h21, device:5'h13, function_num:3'h4};
+    composite_function_pcie.vf_index = 32'hc0a1_0a0a;
+    composite_function_pcie.mse = 1'b1;
+    composite_function_pcie.bme = 1'b1;
+    foreach (composite_function_bars[i]) begin
+      composite_function_bars[i] = new(
+        $sformatf("composite_function_bar_%0d", i)
+      );
+      composite_function_bars[i].bar_id = i;
+      composite_function_bars[i].base.value =
+        64'h0000_0001_0000_0000 + (i * 64'h0001_0000);
+      composite_function_bars[i].size = 64'h8000 + (i * 64'h1000);
+      composite_function_bars[i].enabled = (i != 2);
+      composite_function_bars[i].clone_calls = 0;
+      composite_function_pcie.bar[i] = composite_function_bars[i];
+    end
+    composite_function_owner = new("composite_function_owner");
+    composite_function_owner.kind = RDMA_RESOURCE_FUNCTION;
+    composite_function_owner.function_uid =
+      composite_function_binding.function_uid;
+    composite_function_owner.object_id =
+      composite_function_binding.global_function_id;
+    composite_function_owner.generation =
+      composite_function_binding.generation;
+    composite_function_owner.clone_calls = 0;
+    composite_function_binding.owner_h = composite_function_owner;
+    composite_function_binding.clone_calls = 0;
+    composite_function_pcie.clone_calls = 0;
+    expect_status(
+      "COMPOSITE_FUNCTION_CREATE",
+      composite_function_rm.create_function(composite_function_binding,
+                                            composite_function),
+      RDMA_SC_OK
+    );
+    if (composite_function_binding.clone_calls != 0 ||
+        composite_function_pcie.clone_calls != 0 ||
+        composite_function_owner.clone_calls != 0 ||
+        composite_function_binding.pcie != composite_function_pcie ||
+        composite_function_binding.owner_h != composite_function_owner ||
+        composite_function_binding.function_uid !=
+          64'hc0a1_0000_0000_0001 ||
+        composite_function_binding.notify_bar_id != 3'd3 ||
+        composite_function_binding.notify_base.value !=
+          64'h0000_0001_0003_2000 ||
+        composite_function_binding.notify_size != 64'h2000 ||
+        composite_function_binding.notify_table_sel != 32'hc0a1_0101 ||
+        composite_function_binding.notify_table_index != 32'hc0a1_0202 ||
+        composite_function_binding.host_id != 32'hc0a1_0303 ||
+        composite_function_binding.pfvf_id != 32'hc0a1_0404 ||
+        composite_function_binding.rdma_vf_id != 32'hc0a1_0505 ||
+        composite_function_binding.global_function_id != 32'hc0a1_0606 ||
+        composite_function_binding.vsi_id != 32'hc0a1_0707 ||
+        composite_function_binding.dma_domain_id != 32'hc0a1_0808 ||
+        !composite_function_binding.dma_domain_valid ||
+        composite_function_binding.state != RDMA_BIND_ACTIVE ||
+        composite_function_binding.generation != 32'hc0a1_0909 ||
+        !composite_function_binding.notify_valid ||
+        !composite_function_binding.notify_ready ||
+        !composite_function_binding.dmi_valid ||
+        !composite_function_binding.dmi_ready ||
+        !composite_function_binding.vft_valid ||
+        !composite_function_binding.vft_ready ||
+        composite_function_pcie.bdf.segment != 16'hc0a1 ||
+        composite_function_pcie.bdf.bus != 8'h11 ||
+        composite_function_pcie.bdf.device != 5'h12 ||
+        composite_function_pcie.bdf.function_num != 3'h3 ||
+        composite_function_pcie.parent_pf_bdf.segment != 16'hc0a2 ||
+        composite_function_pcie.parent_pf_bdf.bus != 8'h21 ||
+        composite_function_pcie.parent_pf_bdf.device != 5'h13 ||
+        composite_function_pcie.parent_pf_bdf.function_num != 3'h4 ||
+        composite_function_pcie.vf_index != 32'hc0a1_0a0a ||
+        !composite_function_pcie.mse || !composite_function_pcie.bme)
+      `uvm_error("COMPOSITE_FUNCTION_SOURCE",
+                 "Function carrier hook ran or a source sentinel changed")
+    foreach (composite_function_bars[i]) begin
+      if (composite_function_bars[i].clone_calls != 0 ||
+          composite_function_pcie.bar[i] != composite_function_bars[i] ||
+          composite_function_bars[i].bar_id != i ||
+          composite_function_bars[i].base.value !=
+            64'h0000_0001_0000_0000 + (i * 64'h0001_0000) ||
+          composite_function_bars[i].size !=
+            64'h8000 + (i * 64'h1000) ||
+          composite_function_bars[i].enabled != (i != 2))
+        `uvm_error("COMPOSITE_FUNCTION_BAR_SOURCE",
+                   $sformatf("BAR[%0d] hook ran or sentinel changed", i))
+    end
+    composite_binding_leak = null;
+    composite_pcie_leak = null;
+    composite_function_handle_leak = null;
+    if (composite_function == null || composite_function.binding == null ||
+        composite_function.binding.pcie == null ||
+        $cast(composite_binding_leak, composite_function.binding) ||
+        $cast(composite_pcie_leak, composite_function.binding.pcie) ||
+        $cast(composite_function_handle_leak, composite_function.handle) ||
+        $cast(composite_function_handle_leak,
+              composite_function.binding.owner_h) ||
+        $cast(composite_function_handle_leak, composite_function.owner) ||
+        composite_function.binding == composite_function_binding ||
+        composite_function.binding.pcie == composite_function_pcie ||
+        composite_function.binding.owner_h == composite_function_owner ||
+        composite_function.handle == composite_function_owner ||
+        composite_function.owner == composite_function_owner)
+      `uvm_error("COMPOSITE_FUNCTION_PUBLICATION",
+                 "Function publication retained a derived node or alias")
+    foreach (composite_function_bars[i]) begin
+      composite_bar_leak = null;
+      if (composite_function.binding.pcie.bar[i] == null ||
+          $cast(composite_bar_leak,
+                composite_function.binding.pcie.bar[i]) ||
+          composite_function.binding.pcie.bar[i] ==
+            composite_function_bars[i])
+        `uvm_error("COMPOSITE_FUNCTION_BAR_PUBLICATION",
+                   $sformatf("BAR[%0d] was not detached and built-in", i))
+    end
+    expect_status(
+      "COMPOSITE_FUNCTION_LOOKUP",
+      composite_function_rm.lookup(composite_function_owner, resource),
+      RDMA_SC_OK
+    );
+    composite_binding_leak = null;
+    composite_pcie_leak = null;
+    composite_function_handle_leak = null;
+    if (!$cast(composite_function_lookup, resource) ||
+        $cast(composite_binding_leak,
+              composite_function_lookup.binding) ||
+        $cast(composite_pcie_leak,
+              composite_function_lookup.binding.pcie) ||
+        $cast(composite_function_handle_leak,
+              composite_function_lookup.handle) ||
+        $cast(composite_function_handle_leak,
+              composite_function_lookup.binding.owner_h) ||
+        $cast(composite_function_handle_leak,
+              composite_function_lookup.owner) ||
+        composite_function_lookup == composite_function ||
+        composite_function_lookup.binding == composite_function.binding ||
+        composite_function_lookup.binding.pcie ==
+          composite_function.binding.pcie ||
+        composite_function_lookup.binding.owner_h ==
+          composite_function.binding.owner_h ||
+        composite_function_lookup.binding == composite_function_binding ||
+        composite_function_lookup.binding.function_uid !=
+          composite_function_binding.function_uid ||
+        composite_function_lookup.binding.notify_bar_id !=
+          composite_function_binding.notify_bar_id ||
+        composite_function_lookup.binding.notify_base !=
+          composite_function_binding.notify_base ||
+        composite_function_lookup.binding.notify_size !=
+          composite_function_binding.notify_size ||
+        composite_function_lookup.binding.notify_table_sel !=
+          composite_function_binding.notify_table_sel ||
+        composite_function_lookup.binding.notify_table_index !=
+          composite_function_binding.notify_table_index ||
+        composite_function_lookup.binding.host_id !=
+          composite_function_binding.host_id ||
+        composite_function_lookup.binding.pfvf_id !=
+          composite_function_binding.pfvf_id ||
+        composite_function_lookup.binding.rdma_vf_id !=
+          composite_function_binding.rdma_vf_id ||
+        composite_function_lookup.binding.global_function_id !=
+          composite_function_binding.global_function_id ||
+        composite_function_lookup.binding.vsi_id !=
+          composite_function_binding.vsi_id ||
+        composite_function_lookup.binding.dma_domain_id !=
+          composite_function_binding.dma_domain_id ||
+        composite_function_lookup.binding.dma_domain_valid !=
+          composite_function_binding.dma_domain_valid ||
+        composite_function_lookup.binding.state !=
+          composite_function_binding.state ||
+        composite_function_lookup.binding.generation !=
+          composite_function_binding.generation ||
+        !same_handle_fields(composite_function_lookup.binding.owner_h,
+                            composite_function_owner) ||
+        composite_function_lookup.binding.notify_valid !=
+          composite_function_binding.notify_valid ||
+        composite_function_lookup.binding.notify_ready !=
+          composite_function_binding.notify_ready ||
+        composite_function_lookup.binding.dmi_valid !=
+          composite_function_binding.dmi_valid ||
+        composite_function_lookup.binding.dmi_ready !=
+          composite_function_binding.dmi_ready ||
+        composite_function_lookup.binding.vft_valid !=
+          composite_function_binding.vft_valid ||
+        composite_function_lookup.binding.vft_ready !=
+          composite_function_binding.vft_ready ||
+        composite_function_lookup.binding.pcie.bdf !=
+          composite_function_pcie.bdf ||
+        composite_function_lookup.binding.pcie.parent_pf_bdf !=
+          composite_function_pcie.parent_pf_bdf ||
+        composite_function_lookup.binding.pcie.vf_index !=
+          composite_function_pcie.vf_index ||
+        composite_function_lookup.binding.pcie.mse !=
+          composite_function_pcie.mse ||
+        composite_function_lookup.binding.pcie.bme !=
+          composite_function_pcie.bme)
+      `uvm_error("COMPOSITE_FUNCTION_LOOKUP_FIELDS",
+                 "Function lookup lost a declared sentinel or detachment")
+    foreach (composite_function_bars[i]) begin
+      composite_bar_leak = null;
+      if ($cast(composite_bar_leak,
+                composite_function_lookup.binding.pcie.bar[i]) ||
+          composite_function_lookup.binding.pcie.bar[i] == null ||
+          composite_function_lookup.binding.pcie.bar[i] ==
+            composite_function_bars[i] ||
+          composite_function_lookup.binding.pcie.bar[i] ==
+            composite_function.binding.pcie.bar[i] ||
+          composite_function_lookup.binding.pcie.bar[i].bar_id !=
+            composite_function_bars[i].bar_id ||
+          composite_function_lookup.binding.pcie.bar[i].base !=
+            composite_function_bars[i].base ||
+          composite_function_lookup.binding.pcie.bar[i].size !=
+            composite_function_bars[i].size ||
+          composite_function_lookup.binding.pcie.bar[i].enabled !=
+            composite_function_bars[i].enabled)
+        `uvm_error("COMPOSITE_FUNCTION_BAR_LOOKUP",
+                   $sformatf("BAR[%0d] projection lost its sentinel", i))
+    end
+    expect_status("COMPOSITE_FUNCTION_RELEASE",
+                  composite_function_rm.release_function(
+                    composite_function_owner
+                  ), RDMA_SC_OK);
+    expect_status("COMPOSITE_FUNCTION_NO_LEAKS",
+                  composite_function_rm.check_leaks(leak_count), RDMA_SC_OK);
+    if (composite_function_binding.clone_calls != 0 ||
+        composite_function_pcie.clone_calls != 0 ||
+        composite_function_owner.clone_calls != 0 ||
+        composite_function_owner.kind != RDMA_RESOURCE_FUNCTION ||
+        composite_function_owner.function_uid !=
+          64'hc0a1_0000_0000_0001 ||
+        composite_function_owner.object_id != 32'hc0a1_0606 ||
+        composite_function_owner.generation != 32'hc0a1_0909)
+      `uvm_error("COMPOSITE_FUNCTION_POST_LIFECYCLE_HOOKS",
+                 "Function lifecycle invoked a hook or changed its handle")
+    foreach (composite_function_bars[i]) begin
+      if (composite_function_bars[i].clone_calls != 0)
+        `uvm_error("COMPOSITE_FUNCTION_BAR_POST_LIFECYCLE_HOOKS",
+                   $sformatf("BAR[%0d] hook ran during lifecycle", i))
+    end
+
+    // Composite 2: a registered MR root carries ordered registered backing,
+    // mapping, handle, and HMC nodes through stage/lookup/commit.
+    composite_mr_rm = new("composite_mr_rm");
+    composite_mr_binding = make_active_binding(
+      "composite_mr_binding", 64'hc0a2_0000_0000_0001,
+      32'hc0a2_0101, 32'hc0a2_0202
+    );
+    expect_status("COMPOSITE_MR_CREATE_PD",
+                  composite_mr_rm.create_pd(composite_mr_binding,
+                                            composite_mr_pd),
+                  RDMA_SC_OK);
+    expect_status("COMPOSITE_MR_CREATE",
+                  composite_mr_rm.create_mr(composite_mr_binding,
+                                            composite_mr_pd.handle,
+                                            composite_mr_seed),
+                  RDMA_SC_OK);
+    prepare_mr(composite_mr_seed, 64'hc0a2_1000_0000_0000);
+    composite_mr_candidate = new("composite_mr_candidate");
+    composite_mr_candidate.copy(composite_mr_seed);
+    composite_mr_candidate.extra_scalar = 32'hc0a2_e001;
+    composite_mr_candidate.hmc_fvm_addr.value =
+      64'hc0a2_2000_0000_0000;
+    composite_mr_candidate.hmc_fvm_addr_valid = 1'b1;
+    composite_mr_handle = new("composite_mr_handle");
+    composite_mr_handle.kind = composite_mr_seed.handle.kind;
+    composite_mr_handle.function_uid = composite_mr_seed.handle.function_uid;
+    composite_mr_handle.object_id = composite_mr_seed.handle.object_id;
+    composite_mr_handle.generation = composite_mr_seed.handle.generation;
+    composite_mr_handle.clone_calls = 0;
+    composite_mr_candidate.handle = composite_mr_handle;
+    composite_mr_owner = new("composite_mr_owner");
+    composite_mr_owner.kind = composite_mr_seed.owner.kind;
+    composite_mr_owner.function_uid = composite_mr_seed.owner.function_uid;
+    composite_mr_owner.object_id = composite_mr_seed.owner.object_id;
+    composite_mr_owner.generation = composite_mr_seed.owner.generation;
+    composite_mr_owner.clone_calls = 0;
+    composite_mr_candidate.owner = composite_mr_owner;
+    composite_mr_pd_handle = new("composite_mr_pd_handle");
+    composite_mr_pd_handle.kind = composite_mr_seed.pd_h.kind;
+    composite_mr_pd_handle.function_uid = composite_mr_seed.pd_h.function_uid;
+    composite_mr_pd_handle.object_id = composite_mr_seed.pd_h.object_id;
+    composite_mr_pd_handle.generation = composite_mr_seed.pd_h.generation;
+    composite_mr_pd_handle.clone_calls = 0;
+    composite_mr_candidate.pd_h = composite_mr_pd_handle;
+    composite_mr_candidate.extra_child = composite_mr_pd_handle;
+    composite_mr_dependency = new("composite_mr_dependency");
+    composite_mr_dependency.kind = composite_mr_seed.dependencies[0].kind;
+    composite_mr_dependency.function_uid =
+      composite_mr_seed.dependencies[0].function_uid;
+    composite_mr_dependency.object_id =
+      composite_mr_seed.dependencies[0].object_id;
+    composite_mr_dependency.generation =
+      composite_mr_seed.dependencies[0].generation;
+    composite_mr_dependency.clone_calls = 0;
+    composite_mr_candidate.dependencies[0] = composite_mr_dependency;
+    composite_mr_candidate.backing_refs.delete();
+    composite_mr_candidate.hmc_refs.delete();
+    foreach (composite_backing_refs[i]) begin
+      composite_mapping_functions[i] = new(
+        $sformatf("composite_mapping_function_%0d", i)
+      );
+      composite_mapping_functions[i].kind = RDMA_RESOURCE_FUNCTION;
+      composite_mapping_functions[i].function_uid =
+        composite_mr_binding.function_uid;
+      composite_mapping_functions[i].object_id =
+        composite_mr_binding.global_function_id;
+      composite_mapping_functions[i].generation =
+        composite_mr_binding.generation;
+      composite_mapping_functions[i].clone_calls = 0;
+      composite_mapping_owners[i] = new(
+        $sformatf("composite_mapping_owner_%0d", i)
+      );
+      composite_mapping_owners[i].kind = RDMA_RESOURCE_MR;
+      composite_mapping_owners[i].function_uid =
+        composite_mr_candidate.handle.function_uid;
+      composite_mapping_owners[i].object_id =
+        composite_mr_candidate.handle.object_id;
+      composite_mapping_owners[i].generation =
+        composite_mr_candidate.handle.generation;
+      composite_mapping_owners[i].clone_calls = 0;
+      composite_mappings[i] = new($sformatf("composite_mapping_%0d", i));
+      composite_mappings[i].function_h = composite_mapping_functions[i];
+      composite_mappings[i].requester_bdf = composite_mr_binding.pcie.bdf;
+      composite_mappings[i].pasid_valid = (i == 1);
+      composite_mappings[i].pasid = 20'hca200 + i;
+      composite_mappings[i].backing_addr.value =
+        64'hc0a2_3000_0000_0000 + (i * 64'h10000);
+      composite_mappings[i].iova.value =
+        64'hc0a2_4000_0000_0000 + (i * 64'h20000);
+      composite_mappings[i].size = 64'h3000 + (i * 64'h1000);
+      composite_mappings[i].direction =
+        (i == 0) ? RDMA_DMA_DEVICE_READ : RDMA_DMA_BIDIRECTIONAL;
+      composite_mappings[i].permissions =
+        (i == 0) ?
+          '{device_read:1'b1, device_write:1'b0, atomic:1'b0} :
+          '{device_read:1'b1, device_write:1'b1, atomic:1'b1};
+      composite_mappings[i].state = RDMA_MAPPING_ACTIVE;
+      composite_mappings[i].owner_h = composite_mapping_owners[i];
+      composite_mappings[i].clone_calls = 0;
+      composite_backing_refs[i] = new(
+        $sformatf("composite_backing_ref_%0d", i)
+      );
+      composite_backing_refs[i].mapping = composite_mappings[i];
+      composite_backing_refs[i].ownership =
+        (i == 0) ? RDMA_OWNERSHIP_BORROWED :
+                   RDMA_OWNERSHIP_CONTROL_PLANE;
+      composite_backing_refs[i].release_complete = (i == 1);
+      composite_backing_refs[i].clone_calls = 0;
+      composite_mr_candidate.backing_refs.push_back(
+        composite_backing_refs[i]
+      );
+      composite_hmc_owners[i] = new(
+        $sformatf("composite_hmc_owner_%0d", i)
+      );
+      composite_hmc_owners[i].kind = RDMA_RESOURCE_FUNCTION;
+      composite_hmc_owners[i].function_uid = composite_mr_binding.function_uid;
+      composite_hmc_owners[i].object_id =
+        composite_mr_binding.global_function_id;
+      composite_hmc_owners[i].generation = composite_mr_binding.generation;
+      composite_hmc_owners[i].clone_calls = 0;
+      composite_hmc_refs[i] = new(
+        $sformatf("composite_hmc_ref_%0d", i)
+      );
+      composite_hmc_refs[i].owner = composite_hmc_owners[i];
+      composite_hmc_refs[i].object_kind = RDMA_RESOURCE_MR;
+      composite_hmc_refs[i].address.value =
+        64'hc0a2_5000_0000_0000 + (i * 64'h4000);
+      composite_hmc_refs[i].size = 64'h5000 + (i * 64'h1000);
+      composite_hmc_refs[i].first_pbl_index = 32'hc0a2_1000 + i;
+      composite_hmc_refs[i].ownership =
+        (i == 0) ? RDMA_OWNERSHIP_BORROWED :
+                   RDMA_OWNERSHIP_CONTROL_PLANE;
+      composite_hmc_refs[i].release_complete = (i == 1);
+      composite_hmc_refs[i].clone_calls = 0;
+      composite_mr_candidate.hmc_refs.push_back(composite_hmc_refs[i]);
+    end
+    composite_mr_candidate.clone_calls = 0;
+    expect_status("COMPOSITE_MR_STAGE",
+                  composite_mr_rm.stage_allocated(composite_mr_candidate),
+                  RDMA_SC_OK);
+    if (composite_mr_candidate.clone_calls != 0 ||
+        composite_mr_handle.clone_calls != 0 ||
+        composite_mr_owner.clone_calls != 0 ||
+        composite_mr_pd_handle.clone_calls != 0 ||
+        composite_mr_dependency.clone_calls != 0 ||
+        composite_mr_candidate.handle != composite_mr_handle ||
+        composite_mr_candidate.owner != composite_mr_owner ||
+        composite_mr_candidate.pd_h != composite_mr_pd_handle ||
+        !same_handle_fields(composite_mr_candidate.handle,
+                            composite_mr_seed.handle) ||
+        !same_handle_fields(composite_mr_candidate.owner,
+                            composite_mr_seed.owner) ||
+        !same_handle_fields(composite_mr_candidate.pd_h,
+                            composite_mr_seed.pd_h) ||
+        composite_mr_candidate.extra_child != composite_mr_pd_handle ||
+        composite_mr_candidate.extra_scalar != 32'hc0a2_e001 ||
+        composite_mr_candidate.state != composite_mr_seed.state ||
+        composite_mr_candidate.local_mr_id !=
+          composite_mr_seed.local_mr_id ||
+        composite_mr_candidate.global_mr_id !=
+          composite_mr_seed.global_mr_id ||
+        composite_mr_candidate.iova.value !=
+          64'hc0a2_1000_0000_0000 ||
+        composite_mr_candidate.length != 64'h2000 ||
+        composite_mr_candidate.lkey != composite_mr_seed.lkey ||
+        composite_mr_candidate.rkey != composite_mr_seed.rkey ||
+        composite_mr_candidate.access != composite_mr_seed.access ||
+        composite_mr_candidate.mr_serial != composite_mr_seed.mr_serial ||
+        composite_mr_candidate.dependencies.size() != 1 ||
+        !same_handle_fields(composite_mr_candidate.dependencies[0],
+                            composite_mr_seed.dependencies[0]) ||
+        composite_mr_candidate.hmc_fvm_addr.value !=
+          64'hc0a2_2000_0000_0000 ||
+        !composite_mr_candidate.hmc_fvm_addr_valid ||
+        composite_mr_candidate.backing_refs.size() != 2 ||
+        composite_mr_candidate.hmc_refs.size() != 2)
+      `uvm_error("COMPOSITE_MR_SOURCE",
+                 "MR carrier hook ran, alias changed, or sentinel changed")
+    foreach (composite_backing_refs[i]) begin
+      if (composite_backing_refs[i].clone_calls != 0 ||
+          composite_mappings[i].clone_calls != 0 ||
+          composite_mapping_functions[i].clone_calls != 0 ||
+          composite_mapping_owners[i].clone_calls != 0 ||
+          composite_hmc_refs[i].clone_calls != 0 ||
+          composite_hmc_owners[i].clone_calls != 0 ||
+          composite_mr_candidate.backing_refs[i] !=
+            composite_backing_refs[i] ||
+          composite_backing_refs[i].mapping != composite_mappings[i] ||
+          composite_mappings[i].function_h !=
+            composite_mapping_functions[i] ||
+          composite_mappings[i].owner_h != composite_mapping_owners[i] ||
+          composite_mapping_functions[i].kind != RDMA_RESOURCE_FUNCTION ||
+          composite_mapping_functions[i].function_uid !=
+            composite_mr_binding.function_uid ||
+          composite_mapping_functions[i].object_id !=
+            composite_mr_binding.global_function_id ||
+          composite_mapping_functions[i].generation !=
+            composite_mr_binding.generation ||
+          composite_mapping_owners[i].kind != RDMA_RESOURCE_MR ||
+          composite_mapping_owners[i].function_uid !=
+            composite_mr_candidate.handle.function_uid ||
+          composite_mapping_owners[i].object_id !=
+            composite_mr_candidate.handle.object_id ||
+          composite_mapping_owners[i].generation !=
+            composite_mr_candidate.handle.generation ||
+          composite_mr_candidate.hmc_refs[i] != composite_hmc_refs[i] ||
+          composite_hmc_refs[i].owner != composite_hmc_owners[i] ||
+          composite_backing_refs[i].ownership !=
+            ((i == 0) ? RDMA_OWNERSHIP_BORROWED :
+                        RDMA_OWNERSHIP_CONTROL_PLANE) ||
+          composite_backing_refs[i].release_complete != (i == 1) ||
+          composite_mappings[i].requester_bdf !=
+            composite_mr_binding.pcie.bdf ||
+          composite_mappings[i].pasid_valid != (i == 1) ||
+          composite_mappings[i].pasid != 20'hca200 + i ||
+          composite_mappings[i].backing_addr.value !=
+            64'hc0a2_3000_0000_0000 + (i * 64'h10000) ||
+          composite_mappings[i].iova.value !=
+            64'hc0a2_4000_0000_0000 + (i * 64'h20000) ||
+          composite_mappings[i].size !=
+            64'h3000 + (i * 64'h1000) ||
+          composite_mappings[i].direction !=
+            ((i == 0) ? RDMA_DMA_DEVICE_READ :
+                        RDMA_DMA_BIDIRECTIONAL) ||
+          !composite_mappings[i].permissions.device_read ||
+          composite_mappings[i].permissions.device_write != (i == 1) ||
+          composite_mappings[i].permissions.atomic != (i == 1) ||
+          composite_mappings[i].state != RDMA_MAPPING_ACTIVE ||
+          composite_hmc_owners[i].kind != RDMA_RESOURCE_FUNCTION ||
+          composite_hmc_owners[i].function_uid !=
+            composite_mr_binding.function_uid ||
+          composite_hmc_owners[i].object_id !=
+            composite_mr_binding.global_function_id ||
+          composite_hmc_owners[i].generation !=
+            composite_mr_binding.generation ||
+          composite_hmc_refs[i].object_kind != RDMA_RESOURCE_MR ||
+          composite_hmc_refs[i].address.value !=
+            64'hc0a2_5000_0000_0000 + (i * 64'h4000) ||
+          composite_hmc_refs[i].size !=
+            64'h5000 + (i * 64'h1000) ||
+          composite_hmc_refs[i].first_pbl_index != 32'hc0a2_1000 + i ||
+          composite_hmc_refs[i].ownership !=
+            ((i == 0) ? RDMA_OWNERSHIP_BORROWED :
+                        RDMA_OWNERSHIP_CONTROL_PLANE) ||
+          composite_hmc_refs[i].release_complete != (i == 1))
+        `uvm_error("COMPOSITE_MR_NESTED_SOURCE",
+                   $sformatf("nested source[%0d] changed or dispatched", i))
+    end
+    expect_status("COMPOSITE_MR_LOOKUP",
+                  composite_mr_rm.lookup(composite_mr_handle, resource),
+                  RDMA_SC_OK);
+    composite_mr_leak = null;
+    composite_handle_leak = null;
+    composite_function_handle_leak = null;
+    if (!$cast(composite_mr_lookup, resource) ||
+        $cast(composite_mr_leak, resource) ||
+        $cast(composite_handle_leak, composite_mr_lookup.handle) ||
+        $cast(composite_function_handle_leak, composite_mr_lookup.owner) ||
+        $cast(composite_handle_leak, composite_mr_lookup.pd_h) ||
+        composite_mr_lookup.dependencies.size() != 1 ||
+        $cast(composite_handle_leak,
+              composite_mr_lookup.dependencies[0]) ||
+        composite_mr_lookup.handle == composite_mr_handle ||
+        composite_mr_lookup.owner == composite_mr_owner ||
+        composite_mr_lookup.pd_h == composite_mr_pd_handle ||
+        composite_mr_lookup.dependencies[0] == composite_mr_dependency ||
+        !same_handle_fields(composite_mr_lookup.handle,
+                            composite_mr_handle) ||
+        !same_handle_fields(composite_mr_lookup.owner,
+                            composite_mr_owner) ||
+        !same_handle_fields(composite_mr_lookup.pd_h,
+                            composite_mr_pd_handle) ||
+        !same_handle_fields(composite_mr_lookup.dependencies[0],
+                            composite_mr_dependency) ||
+        composite_mr_lookup.state != RDMA_RESOURCE_ALLOCATED ||
+        composite_mr_lookup.local_mr_id !=
+          composite_mr_candidate.local_mr_id ||
+        composite_mr_lookup.global_mr_id !=
+          composite_mr_candidate.global_mr_id ||
+        composite_mr_lookup.iova != composite_mr_candidate.iova ||
+        composite_mr_lookup.length != composite_mr_candidate.length ||
+        composite_mr_lookup.lkey != composite_mr_candidate.lkey ||
+        composite_mr_lookup.rkey != composite_mr_candidate.rkey ||
+        composite_mr_lookup.access != composite_mr_candidate.access ||
+        composite_mr_lookup.mr_serial != composite_mr_candidate.mr_serial ||
+        composite_mr_lookup.backing_refs.size() != 2 ||
+        composite_mr_lookup.hmc_refs.size() != 2 ||
+        composite_mr_lookup.hmc_fvm_addr.value !=
+          64'hc0a2_2000_0000_0000 ||
+        !composite_mr_lookup.hmc_fvm_addr_valid)
+      `uvm_error("COMPOSITE_MR_LOOKUP_ROOT",
+                 "MR lookup retained a subtype/alias or lost root fields")
+    foreach (composite_backing_refs[i]) begin
+      composite_backing_leak = null;
+      composite_mapping_leak = null;
+      composite_hmc_leak = null;
+      composite_function_handle_leak = null;
+      composite_handle_leak = null;
+      if (composite_mr_lookup.backing_refs[i] == null ||
+          composite_mr_lookup.backing_refs[i].mapping == null ||
+          composite_mr_lookup.hmc_refs[i] == null ||
+          $cast(composite_backing_leak,
+                composite_mr_lookup.backing_refs[i]) ||
+          $cast(composite_mapping_leak,
+                composite_mr_lookup.backing_refs[i].mapping) ||
+          $cast(composite_hmc_leak, composite_mr_lookup.hmc_refs[i]) ||
+          $cast(composite_function_handle_leak,
+                composite_mr_lookup.backing_refs[i].mapping.function_h) ||
+          $cast(composite_function_handle_leak,
+                composite_mr_lookup.hmc_refs[i].owner) ||
+          $cast(composite_handle_leak,
+                composite_mr_lookup.backing_refs[i].mapping.owner_h) ||
+          composite_mr_lookup.backing_refs[i] == composite_backing_refs[i] ||
+          composite_mr_lookup.backing_refs[i].mapping ==
+            composite_mappings[i] ||
+          composite_mr_lookup.backing_refs[i].mapping.function_h ==
+            composite_mapping_functions[i] ||
+          composite_mr_lookup.backing_refs[i].mapping.owner_h ==
+            composite_mapping_owners[i] ||
+          composite_mr_lookup.hmc_refs[i] == composite_hmc_refs[i] ||
+          composite_mr_lookup.hmc_refs[i].owner == composite_hmc_owners[i] ||
+          composite_mr_lookup.backing_refs[i].ownership !=
+            composite_backing_refs[i].ownership ||
+          composite_mr_lookup.backing_refs[i].release_complete !=
+            composite_backing_refs[i].release_complete ||
+          composite_mr_lookup.backing_refs[i].mapping.requester_bdf !=
+            composite_mappings[i].requester_bdf ||
+          composite_mr_lookup.backing_refs[i].mapping.pasid_valid !=
+            composite_mappings[i].pasid_valid ||
+          composite_mr_lookup.backing_refs[i].mapping.pasid !=
+            composite_mappings[i].pasid ||
+          composite_mr_lookup.backing_refs[i].mapping.backing_addr !=
+            composite_mappings[i].backing_addr ||
+          composite_mr_lookup.backing_refs[i].mapping.iova !=
+            composite_mappings[i].iova ||
+          composite_mr_lookup.backing_refs[i].mapping.size !=
+            composite_mappings[i].size ||
+          composite_mr_lookup.backing_refs[i].mapping.direction !=
+            composite_mappings[i].direction ||
+          composite_mr_lookup.backing_refs[i].mapping.permissions !=
+            composite_mappings[i].permissions ||
+          composite_mr_lookup.backing_refs[i].mapping.state !=
+            composite_mappings[i].state ||
+          !same_handle_fields(
+            composite_mr_lookup.backing_refs[i].mapping.function_h,
+            composite_mapping_functions[i]
+          ) ||
+          !same_handle_fields(
+            composite_mr_lookup.backing_refs[i].mapping.owner_h,
+            composite_mapping_owners[i]
+          ) ||
+          composite_mr_lookup.hmc_refs[i].object_kind !=
+            composite_hmc_refs[i].object_kind ||
+          composite_mr_lookup.hmc_refs[i].address !=
+            composite_hmc_refs[i].address ||
+          composite_mr_lookup.hmc_refs[i].size != composite_hmc_refs[i].size ||
+          composite_mr_lookup.hmc_refs[i].first_pbl_index !=
+            composite_hmc_refs[i].first_pbl_index ||
+          composite_mr_lookup.hmc_refs[i].ownership !=
+            composite_hmc_refs[i].ownership ||
+          composite_mr_lookup.hmc_refs[i].release_complete !=
+            composite_hmc_refs[i].release_complete ||
+          !same_handle_fields(composite_mr_lookup.hmc_refs[i].owner,
+                              composite_hmc_owners[i]))
+        `uvm_error("COMPOSITE_MR_LOOKUP_NESTED",
+                   $sformatf("nested projection[%0d] lost order/fields", i))
+    end
+    expect_status("COMPOSITE_MR_COMMIT",
+                  composite_mr_rm.commit_programmed(composite_mr_candidate),
+                  RDMA_SC_OK);
+    expect_status("COMPOSITE_MR_COMMIT_LOOKUP",
+                  composite_mr_rm.lookup(composite_mr_handle, resource),
+                  RDMA_SC_OK);
+    composite_mr_leak = null;
+    composite_handle_leak = null;
+    composite_function_handle_leak = null;
+    if (!$cast(composite_mr_lookup, resource) ||
+        $cast(composite_mr_leak, resource) ||
+        $cast(composite_handle_leak, composite_mr_lookup.handle) ||
+        $cast(composite_function_handle_leak, composite_mr_lookup.owner) ||
+        $cast(composite_handle_leak, composite_mr_lookup.pd_h) ||
+        composite_mr_lookup.dependencies.size() != 1 ||
+        $cast(composite_handle_leak,
+              composite_mr_lookup.dependencies[0]) ||
+        composite_mr_lookup.handle == composite_mr_handle ||
+        composite_mr_lookup.owner == composite_mr_owner ||
+        composite_mr_lookup.pd_h == composite_mr_pd_handle ||
+        composite_mr_lookup.dependencies[0] == composite_mr_dependency ||
+        composite_mr_lookup.state != RDMA_RESOURCE_PROGRAMMED ||
+        composite_mr_lookup.backing_refs.size() != 2 ||
+        composite_mr_lookup.hmc_refs.size() != 2 ||
+        composite_mr_lookup.backing_refs[0].mapping.backing_addr.value !=
+          64'hc0a2_3000_0000_0000 ||
+        composite_mr_lookup.backing_refs[1].mapping.backing_addr.value !=
+          64'hc0a2_3000_0001_0000 ||
+        composite_mr_lookup.hmc_refs[0].address.value !=
+          64'hc0a2_5000_0000_0000 ||
+        composite_mr_lookup.hmc_refs[1].address.value !=
+          64'hc0a2_5000_0000_4000)
+      `uvm_error("COMPOSITE_MR_COMMIT_FIELDS",
+                 "commit lost nested queue order or sentinels")
+    foreach (composite_backing_refs[i]) begin
+      composite_backing_leak = null;
+      composite_mapping_leak = null;
+      composite_hmc_leak = null;
+      composite_function_handle_leak = null;
+      composite_handle_leak = null;
+      if ($cast(composite_backing_leak,
+                composite_mr_lookup.backing_refs[i]) ||
+          $cast(composite_mapping_leak,
+                composite_mr_lookup.backing_refs[i].mapping) ||
+          $cast(composite_hmc_leak, composite_mr_lookup.hmc_refs[i]) ||
+          $cast(composite_function_handle_leak,
+                composite_mr_lookup.backing_refs[i].mapping.function_h) ||
+          $cast(composite_handle_leak,
+                composite_mr_lookup.backing_refs[i].mapping.owner_h) ||
+          $cast(composite_function_handle_leak,
+                composite_mr_lookup.hmc_refs[i].owner) ||
+          composite_mr_lookup.backing_refs[i] == composite_backing_refs[i] ||
+          composite_mr_lookup.backing_refs[i].mapping ==
+            composite_mappings[i] ||
+          composite_mr_lookup.backing_refs[i].mapping.function_h ==
+            composite_mapping_functions[i] ||
+          composite_mr_lookup.backing_refs[i].mapping.owner_h ==
+            composite_mapping_owners[i] ||
+          composite_mr_lookup.hmc_refs[i] == composite_hmc_refs[i] ||
+          composite_mr_lookup.hmc_refs[i].owner == composite_hmc_owners[i] ||
+          composite_mr_lookup.backing_refs[i].mapping.backing_addr.value !=
+            64'hc0a2_3000_0000_0000 + (i * 64'h10000) ||
+          composite_mr_lookup.hmc_refs[i].address.value !=
+            64'hc0a2_5000_0000_0000 + (i * 64'h4000))
+        `uvm_error("COMPOSITE_MR_COMMIT_NESTED",
+                   $sformatf("commit projection[%0d] retained subtype/alias",
+                             i))
+    end
+    expect_status("COMPOSITE_MR_RELEASE",
+                  composite_mr_rm.release_function(
+                    composite_mr_binding.make_handle()
+                  ), RDMA_SC_OK);
+    expect_status("COMPOSITE_MR_NO_LEAKS",
+                  composite_mr_rm.check_leaks(leak_count), RDMA_SC_OK);
+    if (composite_mr_candidate.clone_calls != 0 ||
+        composite_mr_handle.clone_calls != 0 ||
+        composite_mr_owner.clone_calls != 0 ||
+        composite_mr_pd_handle.clone_calls != 0 ||
+        composite_mr_dependency.clone_calls != 0 ||
+        composite_mr_candidate.handle != composite_mr_handle ||
+        composite_mr_candidate.owner != composite_mr_owner ||
+        composite_mr_candidate.pd_h != composite_mr_pd_handle ||
+        composite_mr_candidate.dependencies[0] != composite_mr_dependency ||
+        composite_mr_candidate.extra_child != composite_mr_pd_handle ||
+        composite_mr_candidate.extra_scalar != 32'hc0a2_e001 ||
+        composite_mr_candidate.iova.value !=
+          64'hc0a2_1000_0000_0000 ||
+        composite_mr_candidate.length != 64'h2000 ||
+        composite_mr_candidate.hmc_fvm_addr.value !=
+          64'hc0a2_2000_0000_0000 ||
+        !composite_mr_candidate.hmc_fvm_addr_valid)
+      `uvm_error("COMPOSITE_MR_POST_LIFECYCLE_SOURCE",
+                 "MR lifecycle invoked a root hook or changed its source")
+    foreach (composite_backing_refs[i]) begin
+      if (composite_backing_refs[i].clone_calls != 0 ||
+          composite_mappings[i].clone_calls != 0 ||
+          composite_mapping_functions[i].clone_calls != 0 ||
+          composite_mapping_owners[i].clone_calls != 0 ||
+          composite_hmc_refs[i].clone_calls != 0 ||
+          composite_hmc_owners[i].clone_calls != 0 ||
+          composite_mr_candidate.backing_refs[i] !=
+            composite_backing_refs[i] ||
+          composite_backing_refs[i].mapping != composite_mappings[i] ||
+          composite_mr_candidate.hmc_refs[i] != composite_hmc_refs[i] ||
+          composite_mappings[i].backing_addr.value !=
+            64'hc0a2_3000_0000_0000 + (i * 64'h10000) ||
+          composite_mappings[i].iova.value !=
+            64'hc0a2_4000_0000_0000 + (i * 64'h20000) ||
+          composite_hmc_refs[i].address.value !=
+            64'hc0a2_5000_0000_0000 + (i * 64'h4000))
+        `uvm_error("COMPOSITE_MR_POST_LIFECYCLE_HOOKS",
+                   $sformatf("nested source[%0d] changed during lifecycle",
+                             i))
+    end
+
+    // Composite 3: a registered recovery root carries a registered ticket,
+    // opcode, handles, and ordered status queue through mark/lookup.
+    composite_recovery_rm = new("composite_recovery_rm");
+    composite_recovery_binding = make_active_binding(
+      "composite_recovery_binding", 64'hc0a3_0000_0000_0001,
+      32'hc0a3_0101, 32'hc0a3_0202
+    );
+    expect_status("COMPOSITE_RECOVERY_CREATE_PD",
+                  composite_recovery_rm.create_pd(
+                    composite_recovery_binding, composite_recovery_pd
+                  ), RDMA_SC_OK);
+    composite_recovery = new("composite_recovery");
+    composite_recovery_resource = new("composite_recovery_resource");
+    composite_recovery_resource.kind = composite_recovery_pd.handle.kind;
+    composite_recovery_resource.function_uid =
+      composite_recovery_pd.handle.function_uid;
+    composite_recovery_resource.object_id =
+      composite_recovery_pd.handle.object_id;
+    composite_recovery_resource.generation =
+      composite_recovery_pd.handle.generation;
+    composite_recovery_resource.clone_calls = 0;
+    composite_recovery.resource_h = composite_recovery_resource;
+    composite_recovery.hardware_presence = RDMA_HW_PRESENCE_UNKNOWN;
+    composite_recovery.completed_steps.push_back(
+      RDMA_CTRL_STEP_RESOURCE_RESERVED
+    );
+    composite_recovery.completed_steps.push_back(
+      RDMA_CTRL_STEP_REGISTRY_PROGRAMMED
+    );
+    composite_recovery.pending_steps.push_back(RDMA_CTRL_STEP_HW_DRAINED);
+    composite_recovery.pending_steps.push_back(
+      RDMA_CTRL_STEP_BACKING_RELEASED
+    );
+    composite_recovery_ticket = new("composite_recovery_ticket");
+    composite_recovery_ticket.command_id = 64'hc0a3_1000_0000_0001;
+    composite_ticket_function = new("composite_ticket_function");
+    composite_ticket_function.kind = RDMA_RESOURCE_FUNCTION;
+    composite_ticket_function.function_uid =
+      composite_recovery_binding.function_uid;
+    composite_ticket_function.object_id =
+      composite_recovery_binding.global_function_id;
+    composite_ticket_function.generation =
+      composite_recovery_binding.generation;
+    composite_ticket_function.clone_calls = 0;
+    composite_recovery_ticket.function_h = composite_ticket_function;
+    composite_ticket_cmq = new("composite_ticket_cmq");
+    composite_ticket_cmq.kind = RDMA_RESOURCE_CMQ;
+    composite_ticket_cmq.function_uid =
+      composite_recovery_binding.function_uid;
+    composite_ticket_cmq.object_id = {RDMA_RESOURCE_CMQ, 28'h0c0_a301};
+    composite_ticket_cmq.generation = composite_recovery_binding.generation;
+    composite_ticket_cmq.clone_calls = 0;
+    composite_recovery_ticket.cmq_h = composite_ticket_cmq;
+    composite_recovery_ticket.slot_sequence = 64'd33;
+    composite_recovery_ticket.sq_index = 32'd1;
+    composite_recovery_ticket.sq_wrap = 1'b1;
+    composite_ticket_opcode = new("composite_ticket_opcode");
+    composite_ticket_opcode.profile_name = "composite_profile_c0a3";
+    composite_ticket_opcode.opcode = 32'hc0a3_2002;
+    composite_ticket_opcode.variant = "composite_variant_c0a3";
+    composite_ticket_opcode.clone_calls = 0;
+    composite_recovery_ticket.opcode_key = composite_ticket_opcode;
+    composite_recovery_ticket.absolute_deadline = 987ns;
+    composite_recovery_ticket.clone_calls = 0;
+    composite_recovery.ambiguous_ticket = composite_recovery_ticket;
+    composite_primary_status = new("composite_primary_status");
+    composite_primary_status.category = RDMA_STATUS_RESET;
+    composite_primary_status.code = RDMA_SC_RESET_CANCELLED;
+    composite_primary_status.hardware_code = 32'hc0a3_3003;
+    composite_primary_status.hardware_code_valid = 1'b1;
+    composite_primary_status.source_engine = RDMA_ENGINE_RESET;
+    composite_primary_status.function_uid =
+      composite_recovery_binding.function_uid;
+    composite_primary_status.generation =
+      composite_recovery_binding.generation;
+    composite_primary_status.resource_id = 64'hc0a3_4000_0000_0001;
+    composite_primary_status.command_id = 64'hc0a3_5000_0000_0001;
+    composite_primary_status.wr_id = 64'hc0a3_6000_0000_0001;
+    composite_primary_status.severity = RDMA_SEVERITY_FATAL;
+    composite_primary_status.retryable = 1'b1;
+    composite_primary_status.message = "composite primary c0a3";
+    composite_primary_status.clone_calls = 0;
+    composite_recovery.primary_status = composite_primary_status;
+    foreach (composite_rollback_statuses[i]) begin
+      composite_rollback_statuses[i] = new(
+        $sformatf("composite_rollback_status_%0d", i)
+      );
+      if (i == 0) begin
+        composite_rollback_statuses[i].category = RDMA_STATUS_DMA;
+        composite_rollback_statuses[i].code = RDMA_SC_DMA_TRANSLATION;
+        composite_rollback_statuses[i].source_engine = RDMA_ENGINE_DMA;
+        composite_rollback_statuses[i].severity = RDMA_SEVERITY_WARNING;
+        composite_rollback_statuses[i].retryable = 1'b1;
+      end
+      else begin
+        composite_rollback_statuses[i].category = RDMA_STATUS_PCIE;
+        composite_rollback_statuses[i].code = RDMA_SC_PCIE_COMPLETION;
+        composite_rollback_statuses[i].source_engine = RDMA_ENGINE_PCIE;
+        composite_rollback_statuses[i].severity = RDMA_SEVERITY_ERROR;
+        composite_rollback_statuses[i].retryable = 1'b0;
+      end
+      composite_rollback_statuses[i].hardware_code = 32'hc0a3_7000 + i;
+      composite_rollback_statuses[i].hardware_code_valid = (i == 0);
+      composite_rollback_statuses[i].function_uid =
+        composite_recovery_binding.function_uid;
+      composite_rollback_statuses[i].generation =
+        composite_recovery_binding.generation;
+      composite_rollback_statuses[i].resource_id =
+        64'hc0a3_8000_0000_0000 + i;
+      composite_rollback_statuses[i].command_id =
+        64'hc0a3_9000_0000_0000 + i;
+      composite_rollback_statuses[i].wr_id =
+        64'hc0a3_a000_0000_0000 + i;
+      composite_rollback_statuses[i].message =
+        $sformatf("composite rollback c0a3 %0d", i);
+      composite_rollback_statuses[i].clone_calls = 0;
+      composite_recovery.rollback_statuses.push_back(
+        composite_rollback_statuses[i]
+      );
+    end
+    composite_recovery.extra_scalar = 32'hc0a3_e002;
+    composite_recovery.extra_child = composite_recovery_resource;
+    composite_recovery.clone_calls = 0;
+    expect_status(
+      "COMPOSITE_RECOVERY_MARK",
+      composite_recovery_rm.mark_error(composite_recovery_pd.handle,
+                                       composite_recovery),
+      RDMA_SC_OK
+    );
+    if (composite_recovery.clone_calls != 0 ||
+        composite_recovery_resource.clone_calls != 0 ||
+        composite_recovery_ticket.clone_calls != 0 ||
+        composite_ticket_function.clone_calls != 0 ||
+        composite_ticket_cmq.clone_calls != 0 ||
+        composite_ticket_opcode.clone_calls != 0 ||
+        composite_primary_status.clone_calls != 0 ||
+        composite_recovery.resource_h != composite_recovery_resource ||
+        composite_recovery.ambiguous_ticket != composite_recovery_ticket ||
+        composite_recovery.primary_status != composite_primary_status ||
+        composite_recovery.extra_child != composite_recovery_resource ||
+        composite_recovery.extra_scalar != 32'hc0a3_e002 ||
+        composite_recovery.hardware_presence != RDMA_HW_PRESENCE_UNKNOWN ||
+        composite_recovery.completed_steps.size() != 2 ||
+        composite_recovery.completed_steps[0] !=
+          RDMA_CTRL_STEP_RESOURCE_RESERVED ||
+        composite_recovery.completed_steps[1] !=
+          RDMA_CTRL_STEP_REGISTRY_PROGRAMMED ||
+        composite_recovery.pending_steps.size() != 2 ||
+        composite_recovery.pending_steps[0] != RDMA_CTRL_STEP_HW_DRAINED ||
+        composite_recovery.pending_steps[1] !=
+          RDMA_CTRL_STEP_BACKING_RELEASED ||
+        composite_recovery_ticket.command_id !=
+          64'hc0a3_1000_0000_0001 ||
+        composite_recovery_ticket.function_h != composite_ticket_function ||
+        composite_recovery_ticket.cmq_h != composite_ticket_cmq ||
+        composite_recovery_ticket.slot_sequence != 64'd33 ||
+        composite_recovery_ticket.sq_index != 32'd1 ||
+        !composite_recovery_ticket.sq_wrap ||
+        composite_recovery_ticket.opcode_key != composite_ticket_opcode ||
+        composite_recovery_ticket.absolute_deadline != 987ns ||
+        composite_ticket_opcode.profile_name != "composite_profile_c0a3" ||
+        composite_ticket_opcode.opcode != 32'hc0a3_2002 ||
+        composite_ticket_opcode.variant != "composite_variant_c0a3" ||
+        composite_primary_status.category != RDMA_STATUS_RESET ||
+        composite_primary_status.code != RDMA_SC_RESET_CANCELLED ||
+        composite_primary_status.hardware_code != 32'hc0a3_3003 ||
+        !composite_primary_status.hardware_code_valid ||
+        composite_primary_status.source_engine != RDMA_ENGINE_RESET ||
+        composite_primary_status.function_uid !=
+          composite_recovery_binding.function_uid ||
+        composite_primary_status.generation !=
+          composite_recovery_binding.generation ||
+        composite_primary_status.resource_id !=
+          64'hc0a3_4000_0000_0001 ||
+        composite_primary_status.command_id !=
+          64'hc0a3_5000_0000_0001 ||
+        composite_primary_status.wr_id != 64'hc0a3_6000_0000_0001 ||
+        composite_primary_status.severity != RDMA_SEVERITY_FATAL ||
+        !composite_primary_status.retryable ||
+        composite_primary_status.message != "composite primary c0a3" ||
+        composite_recovery.rollback_statuses.size() != 2)
+      `uvm_error("COMPOSITE_RECOVERY_SOURCE",
+                 "recovery source hook ran or a sentinel/order changed")
+    foreach (composite_rollback_statuses[i]) begin
+      if (composite_rollback_statuses[i].clone_calls != 0 ||
+          composite_recovery.rollback_statuses[i] !=
+            composite_rollback_statuses[i] ||
+          composite_rollback_statuses[i].category !=
+            ((i == 0) ? RDMA_STATUS_DMA : RDMA_STATUS_PCIE) ||
+          composite_rollback_statuses[i].code !=
+            ((i == 0) ? RDMA_SC_DMA_TRANSLATION :
+                        RDMA_SC_PCIE_COMPLETION) ||
+          composite_rollback_statuses[i].hardware_code !=
+            32'hc0a3_7000 + i ||
+          composite_rollback_statuses[i].hardware_code_valid != (i == 0) ||
+          composite_rollback_statuses[i].source_engine !=
+            ((i == 0) ? RDMA_ENGINE_DMA : RDMA_ENGINE_PCIE) ||
+          composite_rollback_statuses[i].function_uid !=
+            composite_recovery_binding.function_uid ||
+          composite_rollback_statuses[i].generation !=
+            composite_recovery_binding.generation ||
+          composite_rollback_statuses[i].resource_id !=
+            64'hc0a3_8000_0000_0000 + i ||
+          composite_rollback_statuses[i].command_id !=
+            64'hc0a3_9000_0000_0000 + i ||
+          composite_rollback_statuses[i].wr_id !=
+            64'hc0a3_a000_0000_0000 + i ||
+          composite_rollback_statuses[i].severity !=
+            ((i == 0) ? RDMA_SEVERITY_WARNING : RDMA_SEVERITY_ERROR) ||
+          composite_rollback_statuses[i].retryable != (i == 0) ||
+          composite_rollback_statuses[i].message !=
+            $sformatf("composite rollback c0a3 %0d", i))
+        `uvm_error("COMPOSITE_RECOVERY_ROLLBACK_SOURCE",
+                   $sformatf("rollback status[%0d] changed/dispatched", i))
+    end
+    expect_status(
+      "COMPOSITE_RECOVERY_LOOKUP",
+      composite_recovery_rm.lookup_recovery(composite_recovery_resource,
+                                            recovery_lookup),
+      RDMA_SC_OK
+    );
+    composite_recovery_leak = null;
+    composite_handle_leak = null;
+    composite_ticket_leak = null;
+    composite_function_handle_leak = null;
+    composite_opcode_leak = null;
+    composite_status_leak = null;
+    if (recovery_lookup == null ||
+        $cast(composite_recovery_leak, recovery_lookup) ||
+        $cast(composite_handle_leak, recovery_lookup.resource_h) ||
+        $cast(composite_ticket_leak, recovery_lookup.ambiguous_ticket) ||
+        $cast(composite_function_handle_leak,
+              recovery_lookup.ambiguous_ticket.function_h) ||
+        $cast(composite_handle_leak,
+              recovery_lookup.ambiguous_ticket.cmq_h) ||
+        $cast(composite_opcode_leak,
+              recovery_lookup.ambiguous_ticket.opcode_key) ||
+        $cast(composite_status_leak, recovery_lookup.primary_status) ||
+        recovery_lookup == composite_recovery ||
+        recovery_lookup.resource_h == composite_recovery_resource ||
+        recovery_lookup.ambiguous_ticket == composite_recovery_ticket ||
+        recovery_lookup.ambiguous_ticket.function_h ==
+          composite_ticket_function ||
+        recovery_lookup.ambiguous_ticket.cmq_h == composite_ticket_cmq ||
+        recovery_lookup.ambiguous_ticket.opcode_key ==
+          composite_ticket_opcode ||
+        recovery_lookup.primary_status == composite_primary_status ||
+        !same_handle_fields(recovery_lookup.resource_h,
+                            composite_recovery_resource) ||
+        recovery_lookup.hardware_presence != RDMA_HW_PRESENCE_UNKNOWN ||
+        recovery_lookup.completed_steps.size() != 2 ||
+        recovery_lookup.completed_steps[0] !=
+          RDMA_CTRL_STEP_RESOURCE_RESERVED ||
+        recovery_lookup.completed_steps[1] !=
+          RDMA_CTRL_STEP_REGISTRY_PROGRAMMED ||
+        recovery_lookup.pending_steps.size() != 2 ||
+        recovery_lookup.pending_steps[0] != RDMA_CTRL_STEP_HW_DRAINED ||
+        recovery_lookup.pending_steps[1] != RDMA_CTRL_STEP_BACKING_RELEASED ||
+        recovery_lookup.ambiguous_ticket.command_id !=
+          composite_recovery_ticket.command_id ||
+        recovery_lookup.ambiguous_ticket.slot_sequence !=
+          composite_recovery_ticket.slot_sequence ||
+        recovery_lookup.ambiguous_ticket.sq_index !=
+          composite_recovery_ticket.sq_index ||
+        recovery_lookup.ambiguous_ticket.sq_wrap !=
+          composite_recovery_ticket.sq_wrap ||
+        recovery_lookup.ambiguous_ticket.absolute_deadline !=
+          composite_recovery_ticket.absolute_deadline ||
+        !same_handle_fields(recovery_lookup.ambiguous_ticket.function_h,
+                            composite_ticket_function) ||
+        !same_handle_fields(recovery_lookup.ambiguous_ticket.cmq_h,
+                            composite_ticket_cmq) ||
+        recovery_lookup.ambiguous_ticket.opcode_key.profile_name !=
+          composite_ticket_opcode.profile_name ||
+        recovery_lookup.ambiguous_ticket.opcode_key.opcode !=
+          composite_ticket_opcode.opcode ||
+        recovery_lookup.ambiguous_ticket.opcode_key.variant !=
+          composite_ticket_opcode.variant ||
+        !same_status_fields(recovery_lookup.primary_status,
+                            composite_primary_status) ||
+        recovery_lookup.rollback_statuses.size() != 2)
+      `uvm_error("COMPOSITE_RECOVERY_LOOKUP_ROOT",
+                 "recovery projection lost subtype, detachment, or fields")
+    foreach (composite_rollback_statuses[i]) begin
+      composite_status_leak = null;
+      if ($cast(composite_status_leak,
+                recovery_lookup.rollback_statuses[i]) ||
+          recovery_lookup.rollback_statuses[i] ==
+            composite_rollback_statuses[i] ||
+          !same_status_fields(recovery_lookup.rollback_statuses[i],
+                              composite_rollback_statuses[i]))
+        `uvm_error("COMPOSITE_RECOVERY_ROLLBACK_LOOKUP",
+                   $sformatf("rollback status[%0d] lost order/fields", i))
+    end
+    expect_status("COMPOSITE_RECOVERY_RELEASE",
+                  composite_recovery_rm.release_function(
+                    composite_recovery_binding.make_handle()
+                  ), RDMA_SC_OK);
+    expect_status("COMPOSITE_RECOVERY_NO_LEAKS",
+                  composite_recovery_rm.check_leaks(leak_count), RDMA_SC_OK);
+    if (composite_recovery.clone_calls != 0 ||
+        composite_recovery_resource.clone_calls != 0 ||
+        composite_recovery_ticket.clone_calls != 0 ||
+        composite_ticket_function.clone_calls != 0 ||
+        composite_ticket_cmq.clone_calls != 0 ||
+        composite_ticket_opcode.clone_calls != 0 ||
+        composite_primary_status.clone_calls != 0 ||
+        composite_recovery_resource.kind != composite_recovery_pd.handle.kind ||
+        composite_recovery_resource.function_uid !=
+          composite_recovery_pd.handle.function_uid ||
+        composite_recovery_resource.object_id !=
+          composite_recovery_pd.handle.object_id ||
+        composite_recovery_resource.generation !=
+          composite_recovery_pd.handle.generation)
+      `uvm_error("COMPOSITE_RECOVERY_POST_LIFECYCLE_HOOKS",
+                 "recovery lifecycle invoked a hook or changed its handle")
+    foreach (composite_rollback_statuses[i]) begin
+      if (composite_rollback_statuses[i].clone_calls != 0)
+        `uvm_error("COMPOSITE_RECOVERY_ROLLBACK_HOOKS",
+                   $sformatf("rollback status[%0d] hook ran", i))
+    end
+
     // Controlled lifecycle publication keeps the registry authoritative and
     // detached from every candidate and lookup snapshot.
     lifecycle_rm = rdma_resource_manager::type_id::create("lifecycle_rm");
