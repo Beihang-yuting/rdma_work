@@ -128,10 +128,10 @@ class rdma_control_plane_test extends uvm_test;
   endfunction
 
   task automatic check_configure_contract();
-    rdma_control_plane controls[7];
-    rdma_resource_manager managers[7];
-    rdma_mock_cmq_port cmqs[7];
-    rdma_mock_stag_key_policy policies[7];
+    rdma_control_plane controls[8];
+    rdma_resource_manager managers[8];
+    rdma_mock_cmq_port cmqs[8];
+    rdma_mock_stag_key_policy policies[8];
     rdma_mock_host_mem mem;
     rdma_hmc_allocator hmc;
     rdma_status status;
@@ -177,7 +177,16 @@ class rdma_control_plane_test extends uvm_test;
     status = controls[5].configure(managers[5], cmqs[5], policies[5], null,
                                    null, 1us);
     expect_status("CONFIGURE_OPTIONAL_ADAPTERS", status, RDMA_SC_OK);
-    status = controls[6].configure(managers[6], cmqs[6], policies[6]);
+    status = controls[6].configure(
+      .resource_manager(managers[6]),
+      .cmq_port(cmqs[6]),
+      .key_policy(policies[6]),
+      .host_mem(null),
+      .hmc_allocator(null),
+      .command_timeout(1us)
+    );
+    expect_status("CONFIGURE_NAMED_ARGUMENTS", status, RDMA_SC_OK);
+    status = controls[7].configure(managers[7], cmqs[7], policies[7]);
     expect_status("CONFIGURE_DEFAULT_ARGUMENTS", status, RDMA_SC_OK);
     if (mem.calls.size() != 0)
       `uvm_error("CONFIGURE_SIDE_EFFECT",

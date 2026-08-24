@@ -217,30 +217,30 @@ class rdma_control_plane extends uvm_object;
   endtask
 
   function rdma_status configure(
-    rdma_resource_manager manager_arg,
-    rdma_cmq_port cmq_arg,
-    rdma_stag_key_policy key_policy_arg,
-    rdma_host_mem_api host_mem_arg = null,
-    rdma_hmc_allocator hmc_allocator_arg = null,
-    time default_timeout_arg = 1us
+    rdma_resource_manager resource_manager,
+    rdma_cmq_port cmq_port,
+    rdma_stag_key_policy key_policy,
+    rdma_host_mem_api host_mem = null,
+    rdma_hmc_allocator hmc_allocator = null,
+    time command_timeout = 1us
   );
     if (configured)
       return invalid_state("control plane is already configured");
-    if (manager_arg == null)
+    if (resource_manager == null)
       return invalid_argument("resource manager is null");
-    if (cmq_arg == null)
+    if (cmq_port == null)
       return invalid_argument("CMQ port is null");
-    if (key_policy_arg == null)
+    if (key_policy == null)
       return invalid_argument("STAG key policy is null");
-    if (default_timeout_arg == 0)
+    if (command_timeout == 0)
       return invalid_argument("default control-plane timeout is zero");
 
-    manager = manager_arg;
-    cmq = cmq_arg;
-    key_policy = key_policy_arg;
-    host_mem = host_mem_arg;
-    hmc_allocator = hmc_allocator_arg;
-    default_timeout = default_timeout_arg;
+    this.manager = resource_manager;
+    this.cmq = cmq_port;
+    this.key_policy = key_policy;
+    this.host_mem = host_mem;
+    this.hmc_allocator = hmc_allocator;
+    default_timeout = command_timeout;
     configured = 1'b1;
     return rdma_status::success();
   endfunction
