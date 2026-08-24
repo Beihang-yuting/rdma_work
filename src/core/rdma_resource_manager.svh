@@ -25,6 +25,7 @@ class rdma_resource_manager extends uvm_object;
   // object from another independent pool.
   protected int unsigned next_local_id[rdma_resource_kind_e];
   protected int unsigned free_local_ids[rdma_resource_kind_e][$];
+  protected bit fresh_local_id_exhausted[rdma_resource_kind_e];
   protected int unsigned next_object_serial[rdma_resource_kind_e];
 
   function new(string name = "rdma_resource_manager");
@@ -47,6 +48,49 @@ class rdma_resource_manager extends uvm_object;
       RDMA_RESOURCE_MR: return 24'hff_ffff;
       default: return 32'hffff_ffff;
     endcase
+  endfunction
+
+  protected function rdma_status local_id_status(
+    rdma_resource_kind_e kind,
+    output bit has_free_id
+  );
+    int unsigned limit;
+
+    limit = local_id_limit(kind);
+    has_free_id = free_local_ids.exists(kind) &&
+                  free_local_ids[kind].size() != 0;
+    if (has_free_id) begin
+      if (free_local_ids[kind][0] > limit)
+        return rdma_status::make(
+          RDMA_SC_RESOURCE_EXHAUSTED,
+          "resource free-list local ID exceeds the hardware width"
+        );
+      return rdma_status::success();
+    end
+    if ((fresh_local_id_exhausted.exists(kind) &&
+         fresh_local_id_exhausted[kind]) || next_local_id[kind] > limit)
+      return rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED,
+                               "resource local ID pool is exhausted");
+    return rdma_status::success();
+  endfunction
+
+  protected function void consume_local_id(
+    rdma_resource_kind_e kind,
+    bit has_free_id,
+    output int unsigned local_id
+  );
+    int unsigned limit;
+
+    if (has_free_id) begin
+      local_id = free_local_ids[kind].pop_front();
+      return;
+    end
+    limit = local_id_limit(kind);
+    local_id = next_local_id[kind];
+    if (local_id == limit)
+      fresh_local_id_exhausted[kind] = 1'b1;
+    else
+      next_local_id[kind]++;
   endfunction
 
   protected function string resource_key(rdma_handle handle);
@@ -327,7 +371,6 @@ class rdma_resource_manager extends uvm_object;
     rdma_status status;
     rdma_function_binding trusted_binding;
     int unsigned serial;
-    int unsigned limit;
     string owner_key;
     bit registration_needed;
     bit has_free_id;
@@ -349,22 +392,9 @@ class rdma_resource_manager extends uvm_object;
     if (serial > 32'h0fff_ffff)
       return rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED,
                                "resource incarnation serial is exhausted");
-    limit = local_id_limit(kind);
-    has_free_id = free_local_ids.exists(kind) &&
-                  free_local_ids[kind].size() != 0;
-    if (has_free_id) begin
-      if (free_local_ids[kind][0] > limit)
-        return rdma_status::make(
-          RDMA_SC_RESOURCE_EXHAUSTED,
-          "resource free-list local ID exceeds the hardware width"
-        );
-    end
-    else if (next_local_id[kind] > limit ||
-             (limit == 32'hffff_ffff &&
-              next_local_id[kind] == 32'hffff_ffff)) begin
-      return rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED,
-                               "resource local ID pool is exhausted");
-    end
+    status = local_id_status(kind, has_free_id);
+    if (!status.ok())
+      return status;
 
     if (has_conflicting_generation(owner))
       return rdma_status::make(
@@ -374,12 +404,7 @@ class rdma_resource_manager extends uvm_object;
     if (registration_needed)
       register_binding_context(binding, trusted_binding, owner, owner_key);
 
-    if (has_free_id)
-      local_id = free_local_ids[kind].pop_front();
-    else begin
-      local_id = next_local_id[kind];
-      next_local_id[kind]++;
-    end
+    consume_local_id(kind, has_free_id, local_id);
     next_object_serial[kind] = serial + 1'b1;
 
     handle = rdma_handle::type_id::create("resource_handle");
@@ -569,6 +594,7 @@ class rdma_resource_manager extends uvm_object;
     string owner_key;
     int unsigned local_id;
     bit registration_needed;
+    bit has_free_id;
 
     function_resource = null;
     status = binding_context_status(binding, trusted_binding, owner,
@@ -587,20 +613,12 @@ class rdma_resource_manager extends uvm_object;
     if (incarnation_owners.exists(incarnation_key(owner)))
       return rdma_status::make(RDMA_SC_INVALID_STATE,
                                "Function incarnation was already released");
-    if ((!free_local_ids.exists(RDMA_RESOURCE_FUNCTION) ||
-         free_local_ids[RDMA_RESOURCE_FUNCTION].size() == 0) &&
-        next_local_id[RDMA_RESOURCE_FUNCTION] == 32'hffff_ffff)
-      return rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED,
-                               "Function local ID pool is exhausted");
+    status = local_id_status(RDMA_RESOURCE_FUNCTION, has_free_id);
+    if (!status.ok())
+      return status;
     if (registration_needed)
       register_binding_context(binding, trusted_binding, owner, owner_key);
-    if (free_local_ids.exists(RDMA_RESOURCE_FUNCTION) &&
-        free_local_ids[RDMA_RESOURCE_FUNCTION].size() != 0)
-      local_id = free_local_ids[RDMA_RESOURCE_FUNCTION].pop_front();
-    else begin
-      local_id = next_local_id[RDMA_RESOURCE_FUNCTION];
-      next_local_id[RDMA_RESOURCE_FUNCTION]++;
-    end
+    consume_local_id(RDMA_RESOURCE_FUNCTION, has_free_id, local_id);
     authoritative = rdma_function::type_id::create("function_resource");
     authoritative.handle = owner;
     authoritative.owner = rdma_clone_function_handle_value(owner,
@@ -1202,6 +1220,13 @@ class rdma_resource_manager extends uvm_object;
                                "recovery validation returned null");
     if (!status.ok())
       return status;
+    if (registry[key].resource_kind() == RDMA_RESOURCE_MR &&
+        registry[key].state == RDMA_RESOURCE_ALLOCATED &&
+        !staged_allocations.exists(key))
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "ALLOCATED MR requires staged key authority before ERROR"
+      );
     replacement = clone_resource_value(registry[key], "mark error");
     replacement.state = RDMA_RESOURCE_ERROR;
     status = replacement.validate();

@@ -168,6 +168,8 @@ class rdma_resource_manager_test extends uvm_test;
     rdma_resource_manager_probe exhaustion_rm;
     rdma_width_probe_manager width_pd_rm;
     rdma_width_probe_manager width_mr_rm;
+    rdma_width_probe_manager width_cq_rm;
+    rdma_width_probe_manager width_function_rm;
     rdma_width_probe_manager width_free_pd_rm;
     rdma_width_probe_manager width_free_mr_rm;
     rdma_resource_manager lifecycle_rm;
@@ -190,6 +192,9 @@ class rdma_resource_manager_test extends uvm_test;
     rdma_function_binding permanent_exhaustion_binding;
     rdma_function_binding width_binding;
     rdma_function_binding width_binding_copy;
+    rdma_function_binding width_function_binding_a;
+    rdma_function_binding width_function_binding_b;
+    rdma_function_binding width_function_binding_b_copy;
     rdma_function_binding lifecycle_binding;
     rdma_function_binding allocated_error_binding;
     rdma_function_binding recovery_binding;
@@ -238,6 +243,9 @@ class rdma_resource_manager_test extends uvm_test;
     rdma_function function_wrapped;
     rdma_function function_release_function;
     rdma_function function_release_lookup;
+    rdma_function width_function_a;
+    rdma_function width_function_b_failed;
+    rdma_function width_function_b_reused;
     rdma_pd function_release_pd;
     rdma_function permanent_exhaustion_function;
     rdma_pd permanent_exhaustion_pd;
@@ -249,9 +257,11 @@ class rdma_resource_manager_test extends uvm_test;
     rdma_mr width_mr_failed;
     rdma_mr width_free_mr;
     rdma_mr lifecycle_mr;
-    rdma_mr allocated_error_mr_first;
     rdma_mr allocated_error_mr;
     rdma_cq cq_pool;
+    rdma_cq width_cq;
+    rdma_cq width_cq_failed;
+    rdma_cq width_cq_reused;
     rdma_cq dep_cq;
     rdma_cq teardown_cq;
     rdma_qp dep_qp;
@@ -274,6 +284,8 @@ class rdma_resource_manager_test extends uvm_test;
     rdma_handle rollback_h;
     rdma_handle function_release_h;
     rdma_handle width_pd_h;
+    rdma_handle width_cq_h;
+    rdma_function_handle width_function_owner_a;
     rdma_handle lifecycle_mr_h;
     rdma_handle stale_recovery_h;
     rdma_function_handle stale_recovery_owner;
@@ -389,6 +401,160 @@ class rdma_resource_manager_test extends uvm_test;
     expect_status("WIDTH_MR_PD_RELEASE",
                   width_mr_rm.\release (width_mr_pd.handle), RDMA_SC_OK);
 
+    // The default 32-bit pool also owns its inclusive maximum.  Fresh-pool
+    // exhaustion must not wrap the counter, mutate the registry, or consume
+    // an incarnation; a released maximum remains reusable from the free list.
+    width_cq_rm = new("width_cq_rm");
+    width_binding = make_active_binding(
+      "width_cq_binding", 64'h1d00_0000_0000_0005,
+      32'h1d00_0505, 32'd5
+    );
+    width_cq_rm.set_next_local_id(RDMA_RESOURCE_CQ, 32'hffff_ffff);
+    expect_status("WIDTH_CQ_LAST",
+                  width_cq_rm.create_cq(width_binding, null, width_cq),
+                  RDMA_SC_OK);
+    if (width_cq == null) begin
+      `uvm_error("WIDTH_CQ_LAST",
+                 "allocator rejected the last 32-bit CQ ID")
+    end
+    else begin
+      if (width_cq.local_cq_id != 32'hffff_ffff)
+        `uvm_error("WIDTH_CQ_LAST",
+                   "allocator did not return the last 32-bit CQ ID")
+      width_cq_h = clone_handle("WIDTH_CQ_LAST_H", width_cq.handle);
+      serial_before_width_failure =
+        width_cq_rm.observed_next_object_serial(RDMA_RESOURCE_CQ);
+      free_count_before_width_failure =
+        width_cq_rm.observed_free_local_id_count(RDMA_RESOURCE_CQ);
+      expect_status("WIDTH_CQ_EXHAUSTED",
+                    width_cq_rm.create_cq(width_binding, null,
+                                           width_cq_failed),
+                    RDMA_SC_RESOURCE_EXHAUSTED);
+      if (width_cq_failed != null ||
+          width_cq_rm.observed_next_object_serial(RDMA_RESOURCE_CQ) !=
+            serial_before_width_failure ||
+          width_cq_rm.observed_free_local_id_count(RDMA_RESOURCE_CQ) !=
+            free_count_before_width_failure)
+        `uvm_error("WIDTH_CQ_EXHAUSTED",
+                   "failed CQ allocation mutated allocator state")
+      expect_status("WIDTH_CQ_FAILURE_LIVE",
+                    width_cq_rm.lookup(width_cq_h, resource), RDMA_SC_OK);
+      if (resource == null || resource.state != RDMA_RESOURCE_ALLOCATED)
+        `uvm_error("WIDTH_CQ_FAILURE_LIVE",
+                   "failed CQ allocation changed the live registry entry")
+      expect_status("WIDTH_CQ_FAILURE_LEAK_COUNT",
+                    width_cq_rm.check_leaks(leak_count),
+                    RDMA_SC_INVALID_STATE);
+      if (leak_count != 1)
+        `uvm_error("WIDTH_CQ_FAILURE_LEAK_COUNT",
+                   $sformatf("expected one live CQ, got %0d", leak_count))
+      expect_status("WIDTH_CQ_RELEASE",
+                    width_cq_rm.\release (width_cq_h), RDMA_SC_OK);
+      expect_status("WIDTH_CQ_REUSE_LIMIT",
+                    width_cq_rm.create_cq(width_binding, null,
+                                           width_cq_reused),
+                    RDMA_SC_OK);
+      if (width_cq_reused == null ||
+          width_cq_reused.local_cq_id != 32'hffff_ffff ||
+          width_cq_reused.handle.same_instance(width_cq_h))
+        `uvm_error("WIDTH_CQ_REUSE_LIMIT",
+                   "recycled maximum CQ ID lost incarnation uniqueness")
+      expect_status("WIDTH_CQ_REUSE_RELEASE",
+                    width_cq_rm.\release (width_cq_reused.handle),
+                    RDMA_SC_OK);
+      expect_status("WIDTH_CQ_NO_LEAKS",
+                    width_cq_rm.check_leaks(leak_count), RDMA_SC_OK);
+    end
+
+    // Function IDs share the same inclusive 32-bit boundary.  A failed
+    // allocation must not register its caller-owned binding, so a distinct
+    // binding object with the same identity can consume a recycled maximum.
+    width_function_rm = new("width_function_rm");
+    width_function_binding_a = make_active_binding(
+      "width_function_binding_a", 64'h1d00_0000_0000_0006,
+      32'h1d00_0606, 32'd6
+    );
+    width_function_binding_b = make_active_binding(
+      "width_function_binding_b", 64'h1d00_0000_0000_0007,
+      32'h1d00_0707, 32'd7
+    );
+    width_function_binding_b_copy = make_active_binding(
+      "width_function_binding_b_copy", 64'h1d00_0000_0000_0007,
+      32'h1d00_0707, 32'd7
+    );
+    width_function_rm.set_next_local_id(RDMA_RESOURCE_FUNCTION,
+                                         32'hffff_ffff);
+    expect_status(
+      "WIDTH_FUNCTION_LAST",
+      width_function_rm.create_function(width_function_binding_a,
+                                         width_function_a),
+      RDMA_SC_OK
+    );
+    if (width_function_a == null) begin
+      `uvm_error("WIDTH_FUNCTION_LAST",
+                 "allocator rejected the last 32-bit Function ID")
+    end
+    else begin
+      if (width_function_a.local_function_id != 32'hffff_ffff)
+        `uvm_error("WIDTH_FUNCTION_LAST",
+                   "allocator did not return the last 32-bit Function ID")
+      width_function_owner_a = clone_function_handle(
+        "WIDTH_FUNCTION_OWNER_A", width_function_a.owner
+      );
+      free_count_before_width_failure =
+        width_function_rm.observed_free_local_id_count(
+          RDMA_RESOURCE_FUNCTION
+        );
+      expect_status(
+        "WIDTH_FUNCTION_EXHAUSTED",
+        width_function_rm.create_function(width_function_binding_b,
+                                           width_function_b_failed),
+        RDMA_SC_RESOURCE_EXHAUSTED
+      );
+      if (width_function_b_failed != null ||
+          width_function_rm.observed_free_local_id_count(
+            RDMA_RESOURCE_FUNCTION
+          ) != free_count_before_width_failure)
+        `uvm_error("WIDTH_FUNCTION_EXHAUSTED",
+                   "failed Function allocation mutated allocator state")
+      expect_status("WIDTH_FUNCTION_FAILURE_LIVE",
+                    width_function_rm.lookup(width_function_a.handle,
+                                             resource),
+                    RDMA_SC_OK);
+      expect_status("WIDTH_FUNCTION_FAILURE_LEAK_COUNT",
+                    width_function_rm.check_leaks(leak_count),
+                    RDMA_SC_INVALID_STATE);
+      if (leak_count != 1)
+        `uvm_error("WIDTH_FUNCTION_FAILURE_LEAK_COUNT",
+                   $sformatf("expected one live Function, got %0d",
+                             leak_count))
+      expect_status(
+        "WIDTH_FUNCTION_RELEASE_A",
+        width_function_rm.release_function(width_function_owner_a),
+        RDMA_SC_OK
+      );
+      expect_status(
+        "WIDTH_FUNCTION_REUSE_LIMIT",
+        width_function_rm.create_function(width_function_binding_b_copy,
+                                           width_function_b_reused),
+        RDMA_SC_OK
+      );
+      if (width_function_b_reused == null ||
+          width_function_b_reused.local_function_id != 32'hffff_ffff ||
+          width_function_b_reused.handle.same_instance(
+            width_function_a.handle
+          ))
+        `uvm_error("WIDTH_FUNCTION_REUSE_LIMIT",
+                   "recycled maximum Function ID or binding was invalid")
+      expect_status(
+        "WIDTH_FUNCTION_RELEASE_B",
+        width_function_rm.release_function(width_function_b_reused.owner),
+        RDMA_SC_OK
+      );
+      expect_status("WIDTH_FUNCTION_NO_LEAKS",
+                    width_function_rm.check_leaks(leak_count), RDMA_SC_OK);
+    end
+
     // An invalid free-list head is neither returned nor silently discarded.
     // The first failed allocation also must not install a binding source.
     width_free_pd_rm = new("width_free_pd_rm");
@@ -457,8 +623,8 @@ class rdma_resource_manager_test extends uvm_test;
                   RDMA_SC_OK);
 
     // ERROR snapshots require the key authority handed off by staging.  A raw
-    // ALLOCATED MR with a nonzero local ID and no lkey is rejected atomically;
-    // the same incarnation is accepted after full population and staging.
+    // zero-ID ALLOCATED MR happens to validate after forcing ERROR, but must be
+    // rejected atomically until that incarnation is populated and staged.
     allocated_error_rm = rdma_resource_manager::type_id::create(
       "allocated_error_rm"
     );
@@ -470,19 +636,14 @@ class rdma_resource_manager_test extends uvm_test;
                   allocated_error_rm.create_pd(allocated_error_binding,
                                                 allocated_error_pd),
                   RDMA_SC_OK);
-    expect_status("ALLOC_ERROR_CREATE_MR_FIRST",
-                  allocated_error_rm.create_mr(allocated_error_binding,
-                                                allocated_error_pd.handle,
-                                                allocated_error_mr_first),
-                  RDMA_SC_OK);
     expect_status("ALLOC_ERROR_CREATE_MR",
                   allocated_error_rm.create_mr(allocated_error_binding,
                                                 allocated_error_pd.handle,
                                                 allocated_error_mr),
                   RDMA_SC_OK);
-    if (allocated_error_mr.local_mr_id == 0)
+    if (allocated_error_mr.local_mr_id != 0)
       `uvm_error("ALLOC_ERROR_CREATE_MR",
-                 "test requires a nonzero unprogrammed MR local ID")
+                 "test requires the first, zero-ID unprogrammed MR")
     expect_status("ALLOC_ERROR_PD_RESERVED_BUSY",
                   allocated_error_rm.release_reserved(
                     allocated_error_pd.handle
@@ -507,7 +668,7 @@ class rdma_resource_manager_test extends uvm_test;
     expect_status("ALLOC_ERROR_MARK_RAW",
                   allocated_error_rm.mark_error(allocated_error_mr.handle,
                                                 recovery_record),
-                  RDMA_SC_INVALID_ARGUMENT);
+                  RDMA_SC_INVALID_STATE);
     expect_status("ALLOC_ERROR_RAW_LOOKUP",
                   allocated_error_rm.lookup(allocated_error_mr.handle,
                                             resource),
