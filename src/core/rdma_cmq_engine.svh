@@ -82,6 +82,7 @@ class rdma_cmq_engine extends uvm_object;
   protected rdma_cmq_slot_record entry_registry[string];
   protected rdma_cmq_completion terminal_fifo[$];
   protected rdma_cmq_diagnostic diagnostic_fifo[$];
+  protected rdma_cmq_completion late_final_fifo[$];
   protected rdma_cmq_diagnostic last_poison;
   // The fixed CMQ profile API has no separate raw-CQE metadata hook.  A
   // profile therefore owns one endian/hardware-version format across its
@@ -125,6 +126,7 @@ class rdma_cmq_engine extends uvm_object;
   endfunction
 
   protected function rdma_status poison_status(string message);
+    late_final_fifo.delete();
     engine_state = RDMA_CMQ_ENGINE_POISONED;
     return invalid_state(message);
   endfunction
@@ -485,6 +487,18 @@ class rdma_cmq_engine extends uvm_object;
     return -1;
   endfunction
 
+  protected function int late_final_index(rdma_cmq_ticket ticket);
+    if (ticket == null)
+      return -1;
+    foreach (late_final_fifo[i]) begin
+      if (late_final_fifo[i] != null &&
+          late_final_fifo[i].ticket != null &&
+          same_ticket_value(late_final_fifo[i].ticket, ticket))
+        return i;
+    end
+    return -1;
+  endfunction
+
   protected function bit ticket_has_engine_authority(
     rdma_cmq_ticket ticket
   );
@@ -499,7 +513,7 @@ class rdma_cmq_engine extends uvm_object;
         !ticket.cmq_h.same_instance(cmq_snapshot.handle))
       return 1'b0;
     if (terminal_index(ticket) >= 0 || late_diagnostic_index(ticket) >= 0 ||
-        ticket_is_outstanding(ticket))
+        late_final_index(ticket) >= 0 || ticket_is_outstanding(ticket))
       return 1'b1;
     foreach (slots[i]) begin
       if (slots[i] != null && slots[i].ticket != null &&
@@ -562,35 +576,6 @@ class rdma_cmq_engine extends uvm_object;
     if (status == null || !status.ok()) begin
       diagnostic = null;
       return invalid_state("CMQ late diagnostic validation failed");
-    end
-    return rdma_status::success();
-  endfunction
-
-  protected function rdma_status make_reconciled_late_completion(
-    rdma_cmq_diagnostic diagnostic,
-    output rdma_cmq_completion completion
-  );
-    rdma_status validation_status;
-
-    completion = null;
-    if (diagnostic == null ||
-        diagnostic.kind != RDMA_CMQ_DIAG_LATE_COMPLETION ||
-        diagnostic.ticket == null || diagnostic.status == null ||
-        diagnostic.raw_cqe == null)
-      return invalid_state("CMQ late reconcile diagnostic is incomplete");
-    completion = rdma_cmq_completion::type_id::create(
-      "cmq_reconciled_late_completion"
-    );
-    if (completion == null)
-      return invalid_state("CMQ late reconcile completion construction failed");
-    completion.ticket = diagnostic.ticket;
-    completion.status = diagnostic.status;
-    completion.raw_cqe = diagnostic.raw_cqe;
-    completion.decoded_response = null;
-    validation_status = completion.validate();
-    if (validation_status == null || !validation_status.ok()) begin
-      completion = null;
-      return invalid_state("CMQ late reconcile completion validation failed");
     end
     return rdma_status::success();
   endfunction
@@ -715,6 +700,7 @@ class rdma_cmq_engine extends uvm_object;
     rdma_cmq_diagnostic diagnostic;
     rdma_cmq_diagnostic poison_snapshot;
 
+    late_final_fifo.delete();
     failure = rdma_status::make(RDMA_SC_CODEC_ERROR, message);
     failure.source_engine = RDMA_ENGINE_CMQ;
     if (prepared_binding != null) begin
@@ -3930,6 +3916,7 @@ class rdma_cmq_engine extends uvm_object;
     entry_registry.delete();
     terminal_fifo.delete();
     diagnostic_fifo.delete();
+    late_final_fifo.delete();
     last_poison = null;
     foreach (slots[i]) begin
       slots[i] = null;
@@ -4136,6 +4123,7 @@ class rdma_cmq_engine extends uvm_object;
     entry_registry.delete();
     terminal_fifo.delete();
     diagnostic_fifo.delete();
+    late_final_fifo.delete();
     foreach (slots[i]) begin
       slots[i] = null;
       token_in_use[i] = 1'b0;
@@ -5214,7 +5202,19 @@ class rdma_cmq_engine extends uvm_object;
             diagnostic_status;
           break;
         end
+        completion_status = make_polled_completion(
+          record, raw_snapshot, decoded, completion
+        );
+        if (completion_status == null || !completion_status.ok() ||
+            completion == null) begin
+          status = (completion_status == null) ?
+            invalid_state(
+              "CMQ late final completion construction returned null status"
+            ) : completion_status;
+          break;
+        end
         diagnostic_fifo.push_back(diagnostic);
+        late_final_fifo.push_back(completion);
         record.state = CMQ_SLOT_LATE_COMPLETED;
       end
       cq_consume_seq++;
@@ -5240,6 +5240,7 @@ class rdma_cmq_engine extends uvm_object;
       status = invalid_state("CMQ poll requires an ACTIVE engine");
       while (diagnostic_fifo.size() != 0)
         diagnostics.push_back(diagnostic_fifo.pop_front());
+      late_final_fifo.delete();
       engine_lock.put(1);
       return;
     end
@@ -5255,6 +5256,7 @@ class rdma_cmq_engine extends uvm_object;
       completions.push_back(terminal_fifo.pop_front());
     while (diagnostic_fifo.size() != 0)
       diagnostics.push_back(diagnostic_fifo.pop_front());
+    late_final_fifo.delete();
     engine_lock.put(1);
   endtask
 
@@ -5371,6 +5373,7 @@ class rdma_cmq_engine extends uvm_object;
     rdma_cmq_ticket ticket_snapshot;
     rdma_cmq_completion staged_completion;
     int fifo_index;
+    int final_index;
 
     terminal_known = 1'b0;
     completion = null;
@@ -5443,14 +5446,26 @@ class rdma_cmq_engine extends uvm_object;
 
     fifo_index = late_diagnostic_index(ticket_snapshot);
     if (fifo_index >= 0) begin
-      helper_status = make_reconciled_late_completion(
-        diagnostic_fifo[fifo_index], staged_completion
-      );
-      if (helper_status == null || !helper_status.ok() ||
-          staged_completion == null || staged_completion.status == null) begin
-        status = (helper_status == null) ?
-          invalid_state("CMQ late reconcile helper returned null status") :
-          helper_status;
+      final_index = late_final_index(ticket_snapshot);
+      if (final_index < 0) begin
+        status = invalid_state(
+          "CMQ late reconcile final completion is missing"
+        );
+        engine_lock.put(1);
+        return;
+      end
+      staged_completion = late_final_fifo[final_index];
+      if (diagnostic_fifo[fifo_index] == null ||
+          diagnostic_fifo[fifo_index].ticket == null ||
+          diagnostic_fifo[fifo_index].status == null ||
+          diagnostic_fifo[fifo_index].raw_cqe == null ||
+          staged_completion == null || staged_completion.ticket == null ||
+          staged_completion.status == null ||
+          staged_completion.raw_cqe == null ||
+          staged_completion.decoded_response == null ||
+          !same_ticket_value(diagnostic_fifo[fifo_index].ticket,
+                             staged_completion.ticket)) begin
+        status = invalid_state("CMQ late reconcile pair is incomplete");
         engine_lock.put(1);
         return;
       end
@@ -5461,8 +5476,17 @@ class rdma_cmq_engine extends uvm_object;
         return;
       end
       diagnostic_fifo.delete(fifo_index);
+      late_final_fifo.delete(final_index);
       completion = staged_completion;
       terminal_known = 1'b1;
+      engine_lock.put(1);
+      return;
+    end
+
+    if (late_final_index(ticket_snapshot) >= 0) begin
+      status = invalid_state(
+        "CMQ late reconcile diagnostic is missing"
+      );
       engine_lock.put(1);
       return;
     end
@@ -5536,6 +5560,7 @@ class rdma_cmq_engine extends uvm_object;
         return;
       end
     end
+    late_final_fifo.delete();
     if (backing_mapping == null || host_mem == null) begin
       engine_state = RDMA_CMQ_ENGINE_POISONED;
       status = invalid_state("CMQ reset release authority is missing");
@@ -5659,6 +5684,7 @@ class rdma_cmq_engine extends uvm_object;
     // undelivered results are deliberately discarded after ledger cleanup.
     terminal_fifo.delete();
     diagnostic_fifo.delete();
+    late_final_fifo.delete();
     if (backing_mapping == null || host_mem == null) begin
       retain_release_authority(backing_mapping, host_mem);
       status = invalid_state("CMQ shutdown release authority is missing");

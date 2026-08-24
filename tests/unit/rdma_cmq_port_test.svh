@@ -1,3 +1,15 @@
+class rdma_cmq_late_pair_probe extends rdma_cmq_engine_probe;
+  `uvm_object_utils(rdma_cmq_late_pair_probe)
+
+  function new(string name = "rdma_cmq_late_pair_probe");
+    super.new(name);
+  endfunction
+
+  function int unsigned late_final_count();
+    return late_final_fifo.size();
+  endfunction
+endclass
+
 class rdma_cmq_port_test extends rdma_cmq_engine_test;
   `uvm_component_utils(rdma_cmq_port_test)
 
@@ -475,7 +487,9 @@ class rdma_cmq_port_test extends rdma_cmq_engine_test;
     rdma_cmq cmq;
     rdma_cmq_runtime_desc runtime_desc;
     rdma_cmq_command_desc requests[];
+    rdma_cmq_command_desc failure_request;
     rdma_cmq_ticket tickets[];
+    rdma_cmq_ticket failure_ticket;
     rdma_cmq_ticket forged_ticket;
     rdma_cmq_ticket stale_ticket;
     rdma_status item_statuses[];
@@ -488,6 +502,7 @@ class rdma_cmq_port_test extends rdma_cmq_engine_test;
     rdma_hw_image first_raw;
     rdma_hw_image second_raw;
     rdma_hw_image third_raw;
+    rdma_hw_image failure_raw;
     bit terminal_known;
 
     engine = rdma_cmq_engine_probe::type_id::create("reconcile_engine");
@@ -572,11 +587,12 @@ class rdma_cmq_port_test extends rdma_cmq_engine_test;
     write_profile_cqe("RECONCILE_LATE_THIRD", mem, mapping, profile,
                       2, 1'b1, tickets[2], 0, third_raw);
     engine.reconcile_ticket(tickets[1], terminal_known, completion, status);
-    expect_status("RECONCILE_MIDDLE_LATE", status, RDMA_SC_TIMEOUT);
+    expect_status("RECONCILE_MIDDLE_LATE", status, RDMA_SC_OK);
     if (!terminal_known || completion == null || completion.status == null ||
         completion.raw_cqe == null || completion.ticket == null ||
         completion.ticket.command_id != tickets[1].command_id ||
-        completion.status.code != RDMA_SC_TIMEOUT ||
+        completion.status.code != RDMA_SC_OK ||
+        completion.decoded_response == null ||
         !engine.probe_same_image(completion.raw_cqe, second_raw) ||
         engine.terminal_fifo_count() != 2 ||
         engine.diagnostic_fifo_count() != 2 ||
@@ -584,6 +600,13 @@ class rdma_cmq_port_test extends rdma_cmq_engine_test;
         engine.cq_consumed_count() != 3 || engine.retired_count() != 3)
       `uvm_error("RECONCILE_LATE_ISOLATION",
                  "middle reconcile changed outer diagnostic FIFO entries")
+    if (completion != null && completion.status != null &&
+        completion.status.code == RDMA_SC_OK &&
+        completion.decoded_response != null)
+      expect_polled_completion(
+        "RECONCILE_MIDDLE_LATE_FINAL", engine, completion, tickets[1],
+        second_raw, 1'b1, 0, RDMA_SC_OK
+      );
 
     engine.poll(completions, diagnostics, status);
     expect_status("RECONCILE_OUTER_POLL", status, RDMA_SC_OK);
@@ -614,9 +637,211 @@ class rdma_cmq_port_test extends rdma_cmq_engine_test;
         engine.cq_consumed_count() != 3 || engine.retired_count() != 3)
       `uvm_error("RECONCILE_OUTER_ORDER",
                  "A/C terminal or diagnostic FIFO order was not retained")
+    if (diagnostics.size() == 2) begin
+      expect_late_diagnostic("RECONCILE_OUTER_FIRST_DIAGNOSTIC", engine,
+                             diagnostics[0], tickets[0], first_raw);
+      expect_late_diagnostic("RECONCILE_OUTER_THIRD_DIAGNOSTIC", engine,
+                             diagnostics[1], tickets[2], third_raw);
+    end
+
+    failure_request = make_command(
+      "reconcile_late_failure", active_binding,
+      rdma_cmq_test_profile::TEST_OPCODE_B, 8'h64, 5ns
+    );
+    engine.submit(failure_request, failure_ticket, status);
+    expect_status("RECONCILE_FAILURE_SUBMIT", status, RDMA_SC_OK);
+    if (failure_ticket == null) begin
+      `uvm_error("RECONCILE_FAILURE_SUBMIT",
+                 "late-failure ticket was not produced")
+      engine.shutdown(status);
+      return;
+    end
+    #10ns;
+    engine.reconcile_ticket(failure_ticket, terminal_known, completion,
+                            status);
+    expect_status("RECONCILE_FAILURE_TIMEOUT", status, RDMA_SC_TIMEOUT);
+    if (!terminal_known || completion == null || completion.status == null ||
+        completion.status.code != RDMA_SC_TIMEOUT ||
+        completion.raw_cqe != null)
+      `uvm_error("RECONCILE_FAILURE_TIMEOUT",
+                 "late-failure setup did not consume its timeout")
+    write_profile_cqe(
+      "RECONCILE_LATE_FAILURE", mem, mapping, profile, 3, 1'b1,
+      failure_ticket, XTR_V1_ECODE_EC_RCE_CQ_FULL, failure_raw
+    );
+    engine.reconcile_ticket(failure_ticket, terminal_known, completion,
+                            status);
+    expect_status("RECONCILE_LATE_FAILURE", status, RDMA_SC_QUEUE_FULL);
+    if (!terminal_known || completion == null || completion.status == null ||
+        completion.status.code != RDMA_SC_QUEUE_FULL ||
+        completion.decoded_response == null)
+      `uvm_error("RECONCILE_LATE_FAILURE",
+                 "late hardware failure was not returned as final status")
+    if (completion != null && completion.status != null &&
+        completion.status.code == RDMA_SC_QUEUE_FULL &&
+        completion.decoded_response != null)
+      expect_polled_completion(
+        "RECONCILE_LATE_FAILURE_FINAL", engine, completion, failure_ticket,
+        failure_raw, 1'b1, XTR_V1_ECODE_EC_RCE_CQ_FULL, RDMA_SC_QUEUE_FULL
+      );
 
     engine.shutdown(status);
     expect_status("RECONCILE_SHUTDOWN", status, RDMA_SC_OK);
+  endtask
+
+  task automatic check_real_engine_late_pair_cleanup();
+    rdma_cmq_late_pair_probe engine;
+    rdma_mock_host_mem mem;
+    rdma_cmq_test_pcie pcie;
+    rdma_doorbell_scheduler scheduler;
+    rdma_cmq_test_profile profile;
+    rdma_function_binding prepared_binding;
+    rdma_function_binding active_binding;
+    rdma_cmq cmq;
+    rdma_cmq_runtime_desc runtime_desc;
+    rdma_cmq_command_desc requests[];
+    rdma_cmq_ticket tickets[];
+    rdma_status item_statuses[];
+    rdma_status batch_status;
+    rdma_status status;
+    rdma_cmq_completion completion;
+    rdma_cmq_completion completions[$];
+    rdma_cmq_diagnostic diagnostics[$];
+    rdma_dma_mapping mapping;
+    rdma_hw_image raw_cqes[2];
+    bit terminal_known;
+    string label;
+
+    for (int unsigned mode = 0; mode < 4; mode++) begin
+      case (mode)
+        0: label = "LATE_PAIR_ACTIVE_POLL";
+        1: label = "LATE_PAIR_QUIESCED_POLL";
+        2: label = "LATE_PAIR_RESET";
+        default: label = "LATE_PAIR_SHUTDOWN";
+      endcase
+      engine = rdma_cmq_late_pair_probe::type_id::create(
+        $sformatf("late_pair_cleanup_engine_%0d", mode)
+      );
+      mem = rdma_mock_host_mem::type_id::create(
+        $sformatf("late_pair_cleanup_mem_%0d", mode)
+      );
+      pcie = rdma_cmq_test_pcie::type_id::create(
+        $sformatf("late_pair_cleanup_pcie_%0d", mode)
+      );
+      scheduler = rdma_doorbell_scheduler::type_id::create(
+        $sformatf("late_pair_cleanup_scheduler_%0d", mode)
+      );
+      profile = rdma_cmq_test_profile::type_id::create(
+        $sformatf("late_pair_cleanup_profile_%0d", mode)
+      );
+      prepared_binding = make_binding(
+        $sformatf("late_pair_cleanup_prepared_%0d", mode),
+        RDMA_BIND_PREPARED
+      );
+      active_binding = make_binding(
+        $sformatf("late_pair_cleanup_active_%0d", mode), RDMA_BIND_ACTIVE
+      );
+      cmq = make_cmq($sformatf("late_pair_cleanup_cmq_%0d", mode),
+                     prepared_binding);
+      prepare_active(label, engine, mem, pcie, scheduler, profile,
+                     prepared_binding, active_binding, cmq, runtime_desc);
+      requests = new[2];
+      foreach (requests[i]) begin
+        requests[i] = make_command(
+          $sformatf("late_pair_cleanup_request_%0d_%0d", mode, i),
+          active_binding,
+          (i == 0) ? rdma_cmq_test_profile::TEST_OPCODE_A :
+                     rdma_cmq_test_profile::TEST_OPCODE_B,
+          8'h70 + i, 5ns
+        );
+      end
+      engine.submit_batch(requests, tickets, item_statuses, batch_status);
+      expect_status({label, "_SUBMIT"}, batch_status, RDMA_SC_OK);
+      if (tickets.size() != 2 || tickets[0] == null || tickets[1] == null) begin
+        `uvm_error(label, "cleanup fixture did not produce two tickets")
+        engine.shutdown(status);
+        continue;
+      end
+      mapping = engine.mapping_snapshot();
+      #10ns;
+      foreach (tickets[i]) begin
+        engine.reconcile_ticket(tickets[i], terminal_known, completion,
+                                status);
+        expect_status($sformatf("%s_TIMEOUT_%0d", label, i), status,
+                      RDMA_SC_TIMEOUT);
+        if (!terminal_known || completion == null ||
+            completion.status == null ||
+            completion.status.code != RDMA_SC_TIMEOUT ||
+            completion.raw_cqe != null)
+          `uvm_error(label, "cleanup fixture did not consume its timeout")
+      end
+      foreach (tickets[i]) begin
+        write_profile_cqe(
+          $sformatf("%s_CQE_%0d", label, i), mem, mapping, profile, i,
+          1'b1, tickets[i], 0, raw_cqes[i]
+        );
+      end
+      engine.reconcile_ticket(tickets[0], terminal_known, completion, status);
+      expect_status({label, "_RECONCILE"}, status, RDMA_SC_OK);
+      if (!terminal_known || completion == null ||
+          completion.status == null || completion.status.code != RDMA_SC_OK ||
+          engine.diagnostic_fifo_count() != 1 ||
+          engine.late_final_count() != 1)
+        `uvm_error(label, "cleanup fixture did not retain one strict pair")
+
+      case (mode)
+        0: begin
+          engine.poll(completions, diagnostics, status);
+          expect_status({label, "_STATUS"}, status, RDMA_SC_OK);
+          if (completions.size() != 0 || diagnostics.size() != 1 ||
+              engine.diagnostic_fifo_count() != 0 ||
+              engine.late_final_count() != 0)
+            `uvm_error(label,
+                       "ACTIVE poll did not discard the paired final result")
+          else
+            expect_late_diagnostic({label, "_DIAGNOSTIC"}, engine,
+                                   diagnostics[0], tickets[1], raw_cqes[1]);
+          engine.shutdown(status);
+          expect_status({label, "_SHUTDOWN"}, status, RDMA_SC_OK);
+        end
+        1: begin
+          engine.cancel_generation(prepared_binding.generation,
+                                   completions, status);
+          expect_status({label, "_CANCEL"}, status, RDMA_SC_OK);
+          if (engine.late_final_count() != 1 ||
+              engine.diagnostic_fifo_count() != 1)
+            `uvm_error(label, "quiesce changed the retained late pair")
+          engine.poll(completions, diagnostics, status);
+          expect_status({label, "_STATUS"}, status, RDMA_SC_INVALID_STATE);
+          if (completions.size() != 0 || diagnostics.size() != 1 ||
+              engine.diagnostic_fifo_count() != 0 ||
+              engine.late_final_count() != 0)
+            `uvm_error(
+              label,
+              "non-ACTIVE poll did not discard the paired final result"
+            )
+          else
+            expect_late_diagnostic({label, "_DIAGNOSTIC"}, engine,
+                                   diagnostics[0], tickets[1], raw_cqes[1]);
+          engine.shutdown(status);
+          expect_status({label, "_SHUTDOWN"}, status, RDMA_SC_OK);
+        end
+        2: begin
+          engine.reset(completions, status);
+          expect_status({label, "_STATUS"}, status, RDMA_SC_OK);
+          if (engine.state() != RDMA_CMQ_ENGINE_UNCONFIGURED ||
+              engine.late_final_count() != 0)
+            `uvm_error(label, "reset retained a paired final result")
+        end
+        default: begin
+          engine.shutdown(status);
+          expect_status({label, "_STATUS"}, status, RDMA_SC_OK);
+          if (engine.state() != RDMA_CMQ_ENGINE_UNCONFIGURED ||
+              engine.late_final_count() != 0)
+            `uvm_error(label, "shutdown retained a paired final result")
+        end
+      endcase
+    end
   endtask
 
   virtual task run_phase(uvm_phase phase);
@@ -625,6 +850,7 @@ class rdma_cmq_port_test extends rdma_cmq_engine_test;
     check_mock_fifo_status_and_reconcile();
     check_adapter_routes_real_engines_by_generation();
     check_real_engine_ticket_specific_reconcile();
+    check_real_engine_late_pair_cleanup();
     phase.drop_objection(this);
   endtask
 endclass
