@@ -27,6 +27,128 @@ class rdma_control_plane_probe extends rdma_control_plane;
 
 endclass
 
+class rdma_blocking_mock_cmq_port extends rdma_mock_cmq_port;
+  `uvm_object_utils(rdma_blocking_mock_cmq_port)
+
+  semaphore entered;
+  semaphore resume;
+
+  function new(string name = "rdma_blocking_mock_cmq_port");
+    super.new(name);
+    entered = new(0);
+    resume = new(0);
+  endfunction
+
+  virtual task execute(
+    rdma_cmq_command_desc command,
+    output rdma_cmq_ticket ticket,
+    output rdma_cmq_completion completion,
+    output rdma_status status
+  );
+    entered.put(1);
+    resume.get(1);
+    super.execute(command, ticket, completion, status);
+  endtask
+
+endclass
+
+class rdma_recovery_probe_manager extends rdma_resource_manager;
+  `uvm_object_utils(rdma_recovery_probe_manager)
+
+  function new(string name = "rdma_recovery_probe_manager");
+    super.new(name);
+  endfunction
+
+  function rdma_status peek_resource(
+    rdma_handle handle,
+    output rdma_resource resource
+  );
+    string key;
+
+    resource = null;
+    if (handle == null)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "probe resource handle is null");
+    key = resource_key(handle);
+    if (!registry.exists(key))
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "probe resource is absent");
+    return project_resource_value(registry[key], "probe resource", resource);
+  endfunction
+
+  function rdma_status peek_recovery(
+    rdma_handle handle,
+    output rdma_recovery_record recovery
+  );
+    string key;
+
+    recovery = null;
+    if (handle == null)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "probe recovery handle is null");
+    key = resource_key(handle);
+    if (!recovery_records.exists(key))
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "probe recovery is absent");
+    return project_recovery_value(recovery_records[key], "probe recovery",
+                                  recovery);
+  endfunction
+
+endclass
+
+class rdma_fault_resource_manager extends rdma_recovery_probe_manager;
+  `uvm_object_utils(rdma_fault_resource_manager)
+
+  int unsigned release_reserved_calls;
+  int unsigned mark_error_calls;
+  protected rdma_status next_release_failure;
+  protected rdma_status next_mark_error_failure;
+
+  function new(string name = "rdma_fault_resource_manager");
+    super.new(name);
+    release_reserved_calls = 0;
+    mark_error_calls = 0;
+    next_release_failure = null;
+    next_mark_error_failure = null;
+  endfunction
+
+  function void fail_next_release_reserved(rdma_status failure);
+    next_release_failure = rdma_cmq_clone_status_value(failure);
+  endfunction
+
+  function void fail_next_mark_error(rdma_status failure);
+    next_mark_error_failure = rdma_cmq_clone_status_value(failure);
+  endfunction
+
+  virtual function rdma_status release_reserved(rdma_handle handle);
+    rdma_status failure;
+
+    release_reserved_calls++;
+    if (next_release_failure != null) begin
+      failure = rdma_cmq_clone_status_value(next_release_failure);
+      next_release_failure = null;
+      return failure;
+    end
+    return super.release_reserved(handle);
+  endfunction
+
+  virtual function rdma_status mark_error(
+    rdma_handle handle,
+    rdma_recovery_record recovery
+  );
+    rdma_status failure;
+
+    mark_error_calls++;
+    if (next_mark_error_failure != null) begin
+      failure = rdma_cmq_clone_status_value(next_mark_error_failure);
+      next_mark_error_failure = null;
+      return failure;
+    end
+    return super.mark_error(handle, recovery);
+  endfunction
+
+endclass
+
 class rdma_post_activate_snapshot_failure_manager extends
   rdma_resource_manager;
   `uvm_object_utils(rdma_post_activate_snapshot_failure_manager)
@@ -138,6 +260,29 @@ class rdma_control_plane_test extends uvm_test;
       `uvm_error(check_name, "recovery status and primary status are aliased")
     if (result.transaction_id == 0)
       `uvm_error(check_name, "recovery result has a zero transaction ID")
+    validation_status = result.validate();
+    expect_status({check_name, "_VALIDATE"}, validation_status, RDMA_SC_OK);
+  endfunction
+
+  function automatic void expect_recovery_fallback(
+    string check_name,
+    rdma_control_result result,
+    rdma_status_code_e expected_primary_code
+  );
+    rdma_status validation_status;
+
+    if (result == null) begin
+      `uvm_error(check_name, "control-plane recovery fallback is null")
+      return;
+    end
+    expect_status({check_name, "_STATUS"}, result.status,
+                  RDMA_SC_RECOVERY_REQUIRED);
+    expect_status({check_name, "_PRIMARY"}, result.primary_status,
+                  expected_primary_code);
+    if (result.status == result.primary_status)
+      `uvm_error(check_name, "fallback status and primary status are aliased")
+    if (result.transaction_id == 0)
+      `uvm_error(check_name, "fallback result has a zero transaction ID")
     validation_status = result.validate();
     expect_status({check_name, "_VALIDATE"}, validation_status, RDMA_SC_OK);
   endfunction
@@ -945,6 +1090,657 @@ class rdma_control_plane_test extends uvm_test;
     expect_status("KEY_ALLOC_TIMEOUT_HMC_LOOKUP", status, RDMA_SC_OK);
   endtask
 
+  task automatic check_register_mr_caller_snapshot();
+    rdma_control_plane control;
+    rdma_resource_manager manager;
+    rdma_blocking_mock_cmq_port blocking_cmq;
+    rdma_mock_stag_key_policy key_policy;
+    rdma_hmc_allocator hmc;
+    rdma_function_binding binding;
+    rdma_create_pd_req pd_request;
+    rdma_register_mr_req request;
+    rdma_mr_backing_desc backing;
+    rdma_hmc_ref hmc_ref;
+    rdma_hmc_fvm_addr_t hmc_base;
+    rdma_hmc_fvm_addr_t hmc_address;
+    rdma_pd pd;
+    rdma_mr mr;
+    rdma_resource resource;
+    rdma_mr registry_mr;
+    rdma_mrt_model mrt;
+    rdma_recovery_record recovery;
+    rdma_control_result result;
+    rdma_status status;
+    longint unsigned lease_size;
+    longint unsigned original_iova;
+    longint unsigned original_length;
+    longint unsigned original_backing_address;
+    longint unsigned original_hmc_size;
+    int unsigned original_first_pbl_index;
+
+    control = rdma_control_plane::type_id::create("snapshot_control");
+    manager = rdma_resource_manager::type_id::create("snapshot_manager");
+    blocking_cmq = rdma_blocking_mock_cmq_port::type_id::create(
+      "snapshot_cmq"
+    );
+    key_policy = rdma_mock_stag_key_policy::type_id::create(
+      "snapshot_policy"
+    );
+    hmc = rdma_hmc_allocator::type_id::create("snapshot_hmc");
+    hmc_base.value = 64'h0000_0004_5000_0000;
+    status = hmc.configure(hmc_base, 64'h8000);
+    expect_status("SNAPSHOT_HMC_CONFIGURE", status, RDMA_SC_OK);
+    binding = make_active_binding(
+      "snapshot_binding", 64'ha600_0000_0000_0001, 32'ha600_0101, 67
+    );
+    pd_request = make_create_pd_request("snapshot_pd_request", binding);
+    status = control.configure(manager, blocking_cmq, key_policy, null, hmc,
+                               7us);
+    expect_status("SNAPSHOT_CONFIGURE", status, RDMA_SC_OK);
+    control.create_pd(binding, pd_request, pd, result);
+    expect_result("SNAPSHOT_PD_CREATE", result, RDMA_SC_OK);
+    if (pd == null || pd.handle == null)
+      return;
+
+    request = make_register_mr_request("snapshot_success_request",
+                                       binding, pd);
+    backing = make_borrowed_pbl0_backing(
+      "snapshot_success_backing", binding, request, RDMA_MR_PBL2
+    );
+    status = hmc.allocate(binding.make_handle(), RDMA_RESOURCE_MR,
+                          64'h1000, 64'h1000, hmc_address);
+    expect_status("SNAPSHOT_SUCCESS_HMC_ALLOCATE", status, RDMA_SC_OK);
+    status = hmc.lookup(binding.make_handle(), RDMA_RESOURCE_MR,
+                        hmc_address, lease_size);
+    expect_status("SNAPSHOT_SUCCESS_HMC_LOOKUP", status, RDMA_SC_OK);
+    hmc_ref = make_borrowed_hmc_ref(
+      "snapshot_success_hmc_ref", binding, hmc_address, lease_size,
+      28'h000_0400
+    );
+    backing.hmc_refs.push_back(hmc_ref);
+    backing.page_layout.first_pbl_index = hmc_ref.first_pbl_index;
+    backing.backing_refs[0].mapping.owner_h = null;
+    original_iova = request.iova.value;
+    original_length = request.length;
+    original_backing_address =
+      backing.backing_refs[0].mapping.backing_addr.value;
+    original_hmc_size = backing.hmc_refs[0].size;
+    original_first_pbl_index = backing.hmc_refs[0].first_pbl_index;
+    fork
+      begin
+        control.register_mr(binding, request, backing, mr, result);
+      end
+      begin
+        #1ns;
+        if (blocking_cmq.entered.try_get(1)) begin
+          request.iova.value += 64'h0010_0000;
+          request.length += 64'h1000;
+          backing.backing_refs[0].ownership = RDMA_OWNERSHIP_CONTROL_PLANE;
+          backing.backing_refs[0].mapping.backing_addr.value += 64'h2000;
+          backing.hmc_refs[0].size += 64'h1000;
+          backing.hmc_refs[0].first_pbl_index += 1'b1;
+          backing.page_layout.first_pbl_index += 1'b1;
+          blocking_cmq.resume.put(1);
+        end
+      end
+    join
+    expect_result("SNAPSHOT_SUCCESS", result, RDMA_SC_OK);
+    if (mr == null || mr.handle == null || mr.state != RDMA_RESOURCE_ACTIVE)
+      `uvm_error("SNAPSHOT_SUCCESS_RESULT",
+                 "caller mutation prevented ACTIVE MR publication")
+    if (mr != null && mr.handle != null) begin
+      status = manager.lookup(mr.handle, resource);
+      expect_status("SNAPSHOT_SUCCESS_REGISTRY", status, RDMA_SC_OK);
+      if (!$cast(registry_mr, resource) || registry_mr == null ||
+          registry_mr.backing_refs.size() != 1 ||
+          registry_mr.hmc_refs.size() != 1 ||
+          registry_mr.iova.value != original_iova ||
+          registry_mr.length != original_length ||
+          registry_mr.backing_refs[0].ownership !=
+            RDMA_OWNERSHIP_BORROWED ||
+          registry_mr.backing_refs[0].mapping.backing_addr.value !=
+            original_backing_address ||
+          registry_mr.hmc_refs[0].size != original_hmc_size ||
+          registry_mr.hmc_refs[0].first_pbl_index !=
+            original_first_pbl_index)
+        `uvm_error("SNAPSHOT_SUCCESS_VALUES",
+                   "ACTIVE MR consumed caller mutations after KEY_ALLOC began")
+      else if (registry_mr.backing_refs[0] == backing.backing_refs[0] ||
+               registry_mr.backing_refs[0].mapping ==
+                 backing.backing_refs[0].mapping ||
+               registry_mr.hmc_refs[0] == backing.hmc_refs[0])
+        `uvm_error("SNAPSHOT_SUCCESS_ALIAS",
+                   "ACTIVE MR aliases caller-owned backing objects")
+    end
+    if (blocking_cmq.calls.size() != 1 ||
+        blocking_cmq.calls[0] == null ||
+        !$cast(mrt, blocking_cmq.calls[0].command.body) || mrt == null ||
+        mrt.iova.value != original_iova || mrt.length != original_length ||
+        mrt.page_layout == null ||
+        mrt.page_layout.first_pbl_index != original_first_pbl_index)
+      `uvm_error("SNAPSHOT_SUCCESS_COMMAND",
+                 "KEY_ALLOC command consumed caller mutations")
+
+    request = make_register_mr_request("snapshot_timeout_request",
+                                       binding, pd);
+    request.iova.value += 64'h0002_0000;
+    backing = make_borrowed_pbl0_backing(
+      "snapshot_timeout_backing", binding, request, RDMA_MR_PBL2
+    );
+    status = hmc.allocate(binding.make_handle(), RDMA_RESOURCE_MR,
+                          64'h1000, 64'h1000, hmc_address);
+    expect_status("SNAPSHOT_TIMEOUT_HMC_ALLOCATE", status, RDMA_SC_OK);
+    status = hmc.lookup(binding.make_handle(), RDMA_RESOURCE_MR,
+                        hmc_address, lease_size);
+    expect_status("SNAPSHOT_TIMEOUT_HMC_LOOKUP", status, RDMA_SC_OK);
+    hmc_ref = make_borrowed_hmc_ref(
+      "snapshot_timeout_hmc_ref", binding, hmc_address, lease_size,
+      28'h000_0500
+    );
+    backing.hmc_refs.push_back(hmc_ref);
+    backing.page_layout.first_pbl_index = hmc_ref.first_pbl_index;
+    original_backing_address =
+      backing.backing_refs[0].mapping.backing_addr.value;
+    original_hmc_size = backing.hmc_refs[0].size;
+    original_first_pbl_index = backing.hmc_refs[0].first_pbl_index;
+    blocking_cmq.timeout_opcode(XTR_V1_OP_KEY_ALLOC);
+    fork
+      begin
+        control.register_mr(binding, request, backing, mr, result);
+      end
+      begin
+        #1ns;
+        if (blocking_cmq.entered.try_get(1)) begin
+          backing.backing_refs[0].ownership = RDMA_OWNERSHIP_CONTROL_PLANE;
+          backing.backing_refs[0].mapping.backing_addr.value += 64'h4000;
+          backing.hmc_refs[0].size += 64'h2000;
+          backing.hmc_refs[0].first_pbl_index += 2;
+          backing.page_layout.first_pbl_index += 2;
+          blocking_cmq.resume.put(1);
+        end
+      end
+    join
+    expect_recovery_result("SNAPSHOT_TIMEOUT", result, RDMA_SC_TIMEOUT);
+    recovery = null;
+    if (result != null && result.resource_h != null) begin
+      status = manager.lookup_recovery(result.resource_h, recovery);
+      expect_status("SNAPSHOT_TIMEOUT_RECOVERY", status, RDMA_SC_OK);
+    end
+    if (recovery == null || recovery.backing_refs.size() != 1 ||
+        recovery.hmc_refs.size() != 1 ||
+        recovery.backing_refs[0].ownership != RDMA_OWNERSHIP_BORROWED ||
+        recovery.backing_refs[0].mapping.backing_addr.value !=
+          original_backing_address ||
+        recovery.hmc_refs[0].size != original_hmc_size ||
+        recovery.hmc_refs[0].first_pbl_index != original_first_pbl_index)
+      `uvm_error("SNAPSHOT_TIMEOUT_VALUES",
+                 "timeout recovery consumed caller mutations")
+    else if (recovery.backing_refs[0] == backing.backing_refs[0] ||
+             recovery.backing_refs[0].mapping ==
+               backing.backing_refs[0].mapping ||
+             recovery.hmc_refs[0] == backing.hmc_refs[0])
+      `uvm_error("SNAPSHOT_TIMEOUT_ALIAS",
+                 "timeout recovery aliases caller-owned backing objects")
+    if (blocking_cmq.calls.size() != 2)
+      `uvm_error("SNAPSHOT_COMMAND_COUNT",
+                 "snapshot regressions issued unexpected CMQ commands")
+  endtask
+
+  task automatic check_register_mr_post_cmq_fence();
+    rdma_control_plane control;
+    rdma_resource_manager manager;
+    rdma_recovery_probe_manager probe_manager;
+    rdma_blocking_mock_cmq_port blocking_cmq;
+    rdma_mock_stag_key_policy key_policy;
+    rdma_hmc_allocator hmc;
+    rdma_function_binding binding;
+    rdma_create_pd_req pd_request;
+    rdma_register_mr_req request;
+    rdma_mr_backing_desc backing;
+    rdma_hmc_ref hmc_ref;
+    rdma_hmc_fvm_addr_t hmc_base;
+    rdma_hmc_fvm_addr_t hmc_address;
+    rdma_pd pd;
+    rdma_mr mr;
+    rdma_mr registry_mr;
+    rdma_resource resource;
+    rdma_recovery_record recovery;
+    rdma_control_result result;
+    rdma_status status;
+    longint unsigned lease_size;
+
+    control = rdma_control_plane::type_id::create("post_cmq_control");
+    probe_manager = rdma_recovery_probe_manager::type_id::create(
+      "post_cmq_manager"
+    );
+    manager = probe_manager;
+    blocking_cmq = rdma_blocking_mock_cmq_port::type_id::create(
+      "post_cmq_cmq"
+    );
+    key_policy = rdma_mock_stag_key_policy::type_id::create(
+      "post_cmq_policy"
+    );
+    hmc = rdma_hmc_allocator::type_id::create("post_cmq_hmc");
+    hmc_base.value = 64'h0000_0004_6000_0000;
+    status = hmc.configure(hmc_base, 64'h8000);
+    expect_status("POST_CMQ_HMC_CONFIGURE", status, RDMA_SC_OK);
+    binding = make_active_binding(
+      "post_cmq_binding", 64'ha700_0000_0000_0001, 32'ha700_0101, 71
+    );
+    pd_request = make_create_pd_request("post_cmq_pd_request", binding);
+    status = control.configure(manager, blocking_cmq, key_policy, null, hmc,
+                               8us);
+    expect_status("POST_CMQ_CONFIGURE", status, RDMA_SC_OK);
+    control.create_pd(binding, pd_request, pd, result);
+    expect_result("POST_CMQ_PD_CREATE", result, RDMA_SC_OK);
+    if (pd == null || pd.handle == null)
+      return;
+
+    request = make_register_mr_request("post_cmq_binding_request",
+                                       binding, pd);
+    backing = make_borrowed_pbl0_backing(
+      "post_cmq_binding_backing", binding, request, RDMA_MR_PBL2
+    );
+    status = hmc.allocate(binding.make_handle(), RDMA_RESOURCE_MR,
+                          64'h1000, 64'h1000, hmc_address);
+    expect_status("POST_CMQ_BINDING_HMC_ALLOCATE", status, RDMA_SC_OK);
+    status = hmc.lookup(binding.make_handle(), RDMA_RESOURCE_MR,
+                        hmc_address, lease_size);
+    expect_status("POST_CMQ_BINDING_HMC_LOOKUP", status, RDMA_SC_OK);
+    hmc_ref = make_borrowed_hmc_ref(
+      "post_cmq_binding_hmc_ref", binding, hmc_address, lease_size,
+      28'h000_0600
+    );
+    backing.hmc_refs.push_back(hmc_ref);
+    backing.page_layout.first_pbl_index = hmc_ref.first_pbl_index;
+    fork
+      begin
+        control.register_mr(binding, request, backing, mr, result);
+      end
+      begin
+        #1ns;
+        if (blocking_cmq.entered.try_get(1)) begin
+          binding.generation++;
+          binding.owner_h = binding.make_handle();
+          blocking_cmq.resume.put(1);
+        end
+      end
+    join
+    expect_recovery_result("POST_CMQ_BINDING", result,
+                           RDMA_SC_STALE_GENERATION);
+    if (mr != null || result == null || result.resource_h == null ||
+        !result.final_resource_state_known ||
+        result.final_resource_state != RDMA_RESOURCE_ERROR ||
+        !result.recovery_required || result.completed_steps.size() != 4 ||
+        result.completed_steps[3] != RDMA_CTRL_STEP_HW_KEY_ALLOCATED ||
+        result.rollback_statuses.size() != 0)
+      `uvm_error("POST_CMQ_BINDING_RESULT",
+                 "binding fence did not preserve durable ERROR recovery")
+    recovery = null;
+    if (result != null && result.resource_h != null) begin
+      status = manager.lookup(result.resource_h, resource);
+      expect_status("POST_CMQ_BINDING_LOOKUP", status,
+                    RDMA_SC_STALE_GENERATION);
+      status = manager.lookup_recovery(result.resource_h, recovery);
+      expect_status("POST_CMQ_BINDING_RECOVERY", status,
+                    RDMA_SC_STALE_GENERATION);
+      status = probe_manager.peek_resource(result.resource_h, resource);
+      expect_status("POST_CMQ_BINDING_RAW_LOOKUP", status, RDMA_SC_OK);
+      if (!$cast(registry_mr, resource) || registry_mr == null ||
+          registry_mr.state != RDMA_RESOURCE_ERROR)
+        `uvm_error("POST_CMQ_BINDING_RAW_STATE",
+                   "binding fence raw registry state is not ERROR")
+      status = probe_manager.peek_recovery(result.resource_h, recovery);
+      expect_status("POST_CMQ_BINDING_RAW_RECOVERY", status, RDMA_SC_OK);
+    end
+    if (recovery == null ||
+        recovery.hardware_presence != RDMA_HW_PRESENCE_PRESENT ||
+        recovery.completed_steps != result.completed_steps ||
+        recovery.pending_steps.size() != 1 ||
+        recovery.pending_steps[0] != RDMA_CTRL_STEP_HW_MR_DEREGISTERED ||
+        recovery.primary_status == null ||
+        recovery.primary_status.code != RDMA_SC_STALE_GENERATION ||
+        recovery.backing_refs.size() != 1 ||
+        recovery.hmc_refs.size() != 1)
+      `uvm_error("POST_CMQ_BINDING_RECORD",
+                 "binding fence recovery record is incomplete")
+    else if (recovery.backing_refs[0] == backing.backing_refs[0] ||
+             recovery.hmc_refs[0] == backing.hmc_refs[0])
+      `uvm_error("POST_CMQ_BINDING_ALIAS",
+                 "binding fence recovery aliases caller backing")
+    if (blocking_cmq.calls.size() != 1 ||
+        blocking_cmq.calls[0] == null ||
+        blocking_cmq.calls[0].opcode != XTR_V1_OP_KEY_ALLOC)
+      `uvm_error("POST_CMQ_BINDING_COMMANDS",
+                 "binding fence issued unexpected hardware commands")
+
+    control = rdma_control_plane::type_id::create("post_cmq_hmc_control");
+    manager = rdma_resource_manager::type_id::create("post_cmq_hmc_manager");
+    blocking_cmq = rdma_blocking_mock_cmq_port::type_id::create(
+      "post_cmq_hmc_cmq"
+    );
+    key_policy = rdma_mock_stag_key_policy::type_id::create(
+      "post_cmq_hmc_policy"
+    );
+    hmc = rdma_hmc_allocator::type_id::create("post_cmq_hmc_allocator");
+    hmc_base.value = 64'h0000_0004_7000_0000;
+    status = hmc.configure(hmc_base, 64'h8000);
+    expect_status("POST_CMQ_HMC_FENCE_CONFIGURE", status, RDMA_SC_OK);
+    binding = make_active_binding(
+      "post_cmq_hmc_binding", 64'ha800_0000_0000_0001,
+      32'ha800_0101, 73
+    );
+    pd_request = make_create_pd_request("post_cmq_hmc_pd_request", binding);
+    status = control.configure(manager, blocking_cmq, key_policy, null, hmc,
+                               8us);
+    expect_status("POST_CMQ_HMC_CONTROL_CONFIGURE", status, RDMA_SC_OK);
+    control.create_pd(binding, pd_request, pd, result);
+    expect_result("POST_CMQ_HMC_PD_CREATE", result, RDMA_SC_OK);
+    if (pd == null || pd.handle == null)
+      return;
+
+    request = make_register_mr_request("post_cmq_hmc_request", binding, pd);
+    request.iova.value += 64'h0002_0000;
+    backing = make_borrowed_pbl0_backing(
+      "post_cmq_hmc_backing", binding, request, RDMA_MR_PBL2
+    );
+    status = hmc.allocate(binding.make_handle(), RDMA_RESOURCE_MR,
+                          64'h1000, 64'h1000, hmc_address);
+    expect_status("POST_CMQ_HMC_ALLOCATE", status, RDMA_SC_OK);
+    status = hmc.lookup(binding.make_handle(), RDMA_RESOURCE_MR,
+                        hmc_address, lease_size);
+    expect_status("POST_CMQ_HMC_LOOKUP", status, RDMA_SC_OK);
+    hmc_ref = make_borrowed_hmc_ref(
+      "post_cmq_hmc_ref", binding, hmc_address, lease_size, 28'h000_0700
+    );
+    backing.hmc_refs.push_back(hmc_ref);
+    backing.page_layout.first_pbl_index = hmc_ref.first_pbl_index;
+    fork
+      begin
+        control.register_mr(binding, request, backing, mr, result);
+      end
+      begin
+        #1ns;
+        if (blocking_cmq.entered.try_get(1)) begin
+          status = hmc.\release (binding.make_handle(), RDMA_RESOURCE_MR,
+                                 hmc_address);
+          expect_status("POST_CMQ_HMC_RELEASE", status, RDMA_SC_OK);
+          blocking_cmq.resume.put(1);
+        end
+      end
+    join
+    expect_recovery_result("POST_CMQ_HMC", result, RDMA_SC_INVALID_STATE);
+    if (mr == null || mr.handle == null ||
+        mr.state != RDMA_RESOURCE_ERROR || result == null ||
+        !result.final_resource_state_known ||
+        result.final_resource_state != RDMA_RESOURCE_ERROR ||
+        !result.recovery_required || result.completed_steps.size() != 4 ||
+        result.completed_steps[3] != RDMA_CTRL_STEP_HW_KEY_ALLOCATED)
+      `uvm_error("POST_CMQ_HMC_RESULT",
+                 "HMC fence did not preserve an ERROR MR")
+    recovery = null;
+    if (result != null && result.resource_h != null) begin
+      status = manager.lookup(result.resource_h, resource);
+      expect_status("POST_CMQ_HMC_STATE_LOOKUP", status, RDMA_SC_OK);
+      if (!$cast(registry_mr, resource) || registry_mr == null ||
+          registry_mr.state != RDMA_RESOURCE_ERROR)
+        `uvm_error("POST_CMQ_HMC_STATE",
+                   "HMC fence committed or lost the MR")
+      status = manager.lookup_recovery(result.resource_h, recovery);
+      expect_status("POST_CMQ_HMC_RECOVERY", status, RDMA_SC_OK);
+    end
+    if (recovery == null ||
+        recovery.hardware_presence != RDMA_HW_PRESENCE_PRESENT ||
+        recovery.completed_steps != result.completed_steps ||
+        recovery.pending_steps.size() != 1 ||
+        recovery.pending_steps[0] != RDMA_CTRL_STEP_HW_MR_DEREGISTERED ||
+        recovery.primary_status == null ||
+        recovery.primary_status.code != RDMA_SC_INVALID_STATE ||
+        recovery.backing_refs.size() != 1 ||
+        recovery.hmc_refs.size() != 1)
+      `uvm_error("POST_CMQ_HMC_RECORD",
+                 "HMC fence recovery record is incomplete")
+    else if (recovery.backing_refs[0] == backing.backing_refs[0] ||
+             recovery.hmc_refs[0] == backing.hmc_refs[0])
+      `uvm_error("POST_CMQ_HMC_ALIAS",
+                 "HMC fence recovery aliases caller backing")
+    if (blocking_cmq.calls.size() != 1 ||
+        blocking_cmq.calls[0] == null ||
+        blocking_cmq.calls[0].opcode != XTR_V1_OP_KEY_ALLOC)
+      `uvm_error("POST_CMQ_COMMANDS",
+                 "post-CMQ fences issued unexpected hardware commands")
+  endtask
+
+  task automatic check_register_mr_recovery_freeze_failures();
+    rdma_control_plane control;
+    rdma_fault_resource_manager manager;
+    rdma_mock_cmq_port mock_cmq;
+    rdma_mock_stag_key_policy key_policy;
+    rdma_hmc_allocator hmc;
+    rdma_function_binding binding;
+    rdma_create_pd_req pd_request;
+    rdma_register_mr_req request;
+    rdma_mr_backing_desc backing;
+    rdma_hmc_ref hmc_ref;
+    rdma_hmc_fvm_addr_t hmc_base;
+    rdma_hmc_fvm_addr_t hmc_address;
+    rdma_pd pd;
+    rdma_mr mr;
+    rdma_mr registry_mr;
+    rdma_resource resource;
+    rdma_recovery_record recovery;
+    rdma_control_result result;
+    rdma_status hardware_failure;
+    rdma_status release_failure;
+    rdma_status mark_error_failure;
+    rdma_status status;
+    longint unsigned lease_size;
+
+    control = rdma_control_plane::type_id::create("freeze_failure_control");
+    manager = rdma_fault_resource_manager::type_id::create(
+      "freeze_failure_manager"
+    );
+    mock_cmq = rdma_mock_cmq_port::type_id::create("freeze_failure_cmq");
+    key_policy = rdma_mock_stag_key_policy::type_id::create(
+      "freeze_failure_policy"
+    );
+    hmc = rdma_hmc_allocator::type_id::create("freeze_failure_hmc");
+    hmc_base.value = 64'h0000_0004_8000_0000;
+    status = hmc.configure(hmc_base, 64'h1_0000);
+    expect_status("FREEZE_FAILURE_HMC_CONFIGURE", status, RDMA_SC_OK);
+    binding = make_active_binding(
+      "freeze_failure_binding", 64'ha900_0000_0000_0001,
+      32'ha900_0101, 79
+    );
+    pd_request = make_create_pd_request("freeze_failure_pd_request",
+                                        binding);
+    status = control.configure(manager, mock_cmq, key_policy, null, hmc,
+                               9us);
+    expect_status("FREEZE_FAILURE_CONFIGURE", status, RDMA_SC_OK);
+    control.create_pd(binding, pd_request, pd, result);
+    expect_result("FREEZE_FAILURE_PD_CREATE", result, RDMA_SC_OK);
+    if (pd == null || pd.handle == null)
+      return;
+
+    hardware_failure = rdma_status::make(
+      RDMA_SC_UNKNOWN_HW_ERROR, "injected KEY_ALLOC failure"
+    );
+    release_failure = rdma_status::make(
+      RDMA_SC_RESOURCE_BUSY, "injected release_reserved failure"
+    );
+    mark_error_failure = rdma_status::make(
+      RDMA_SC_INVALID_STATE, "injected mark_error failure"
+    );
+
+    request = make_register_mr_request("freeze_release_request", binding,
+                                       pd);
+    backing = make_borrowed_pbl0_backing(
+      "freeze_release_backing", binding, request, RDMA_MR_PBL2
+    );
+    status = hmc.allocate(binding.make_handle(), RDMA_RESOURCE_MR,
+                          64'h1000, 64'h1000, hmc_address);
+    expect_status("FREEZE_RELEASE_HMC_ALLOCATE", status, RDMA_SC_OK);
+    status = hmc.lookup(binding.make_handle(), RDMA_RESOURCE_MR,
+                        hmc_address, lease_size);
+    expect_status("FREEZE_RELEASE_HMC_LOOKUP", status, RDMA_SC_OK);
+    hmc_ref = make_borrowed_hmc_ref(
+      "freeze_release_hmc_ref", binding, hmc_address, lease_size,
+      28'h000_0800
+    );
+    backing.hmc_refs.push_back(hmc_ref);
+    backing.page_layout.first_pbl_index = hmc_ref.first_pbl_index;
+    manager.fail_next_release_reserved(release_failure);
+    mock_cmq.fail_opcode(XTR_V1_OP_KEY_ALLOC, hardware_failure);
+    control.register_mr(binding, request, backing, mr, result);
+    expect_recovery_result("FREEZE_RELEASE", result,
+                           RDMA_SC_UNKNOWN_HW_ERROR);
+    if (mr == null || mr.handle == null ||
+        mr.state != RDMA_RESOURCE_ERROR || result == null ||
+        !result.final_resource_state_known ||
+        result.final_resource_state != RDMA_RESOURCE_ERROR ||
+        !result.recovery_required || result.rollback_statuses.size() != 1 ||
+        result.rollback_statuses[0] == null ||
+        result.rollback_statuses[0].code != RDMA_SC_RESOURCE_BUSY)
+      `uvm_error("FREEZE_RELEASE_RESULT",
+                 "release failure did not freeze durable ERROR recovery")
+    recovery = null;
+    if (result != null && result.resource_h != null) begin
+      status = manager.lookup(result.resource_h, resource);
+      expect_status("FREEZE_RELEASE_LOOKUP", status, RDMA_SC_OK);
+      if (!$cast(registry_mr, resource) || registry_mr == null ||
+          registry_mr.state != RDMA_RESOURCE_ERROR)
+        `uvm_error("FREEZE_RELEASE_STATE",
+                   "release failure registry state is not ERROR")
+      status = manager.lookup_recovery(result.resource_h, recovery);
+      expect_status("FREEZE_RELEASE_RECOVERY", status, RDMA_SC_OK);
+    end
+    if (recovery == null ||
+        recovery.hardware_presence != RDMA_HW_PRESENCE_ABSENT ||
+        recovery.completed_steps != result.completed_steps ||
+        recovery.pending_steps.size() != 0 ||
+        recovery.primary_status == null ||
+        recovery.primary_status.code != RDMA_SC_UNKNOWN_HW_ERROR ||
+        recovery.rollback_statuses.size() != 1 ||
+        recovery.rollback_statuses[0] == null ||
+        recovery.rollback_statuses[0].code != RDMA_SC_RESOURCE_BUSY ||
+        recovery.backing_refs.size() != 1 ||
+        recovery.hmc_refs.size() != 1)
+      `uvm_error("FREEZE_RELEASE_RECORD",
+                 "release failure recovery record is incomplete")
+    else if (recovery.backing_refs[0] == backing.backing_refs[0] ||
+             recovery.hmc_refs[0] == backing.hmc_refs[0])
+      `uvm_error("FREEZE_RELEASE_ALIAS",
+                 "release failure recovery aliases caller backing")
+    if (manager.release_reserved_calls != 1 ||
+        manager.mark_error_calls != 1)
+      `uvm_error("FREEZE_RELEASE_CALLS",
+                 "release failure did not attempt one recovery freeze")
+
+    request = make_register_mr_request("freeze_double_request", binding,
+                                       pd);
+    request.iova.value += 64'h0002_0000;
+    backing = make_borrowed_pbl0_backing(
+      "freeze_double_backing", binding, request, RDMA_MR_PBL2
+    );
+    status = hmc.allocate(binding.make_handle(), RDMA_RESOURCE_MR,
+                          64'h1000, 64'h1000, hmc_address);
+    expect_status("FREEZE_DOUBLE_HMC_ALLOCATE", status, RDMA_SC_OK);
+    status = hmc.lookup(binding.make_handle(), RDMA_RESOURCE_MR,
+                        hmc_address, lease_size);
+    expect_status("FREEZE_DOUBLE_HMC_LOOKUP", status, RDMA_SC_OK);
+    hmc_ref = make_borrowed_hmc_ref(
+      "freeze_double_hmc_ref", binding, hmc_address, lease_size,
+      28'h000_0900
+    );
+    backing.hmc_refs.push_back(hmc_ref);
+    backing.page_layout.first_pbl_index = hmc_ref.first_pbl_index;
+    manager.fail_next_release_reserved(release_failure);
+    manager.fail_next_mark_error(mark_error_failure);
+    mock_cmq.fail_opcode(XTR_V1_OP_KEY_ALLOC, hardware_failure);
+    control.register_mr(binding, request, backing, mr, result);
+    expect_recovery_fallback("FREEZE_DOUBLE", result,
+                             RDMA_SC_UNKNOWN_HW_ERROR);
+    if (mr != null || result == null || result.resource_h == null ||
+        !result.final_resource_state_known ||
+        result.final_resource_state != RDMA_RESOURCE_ALLOCATED ||
+        result.recovery_required || result.rollback_statuses.size() != 2 ||
+        result.rollback_statuses[0] == null ||
+        result.rollback_statuses[0].code != RDMA_SC_RESOURCE_BUSY ||
+        result.rollback_statuses[1] == null ||
+        result.rollback_statuses[1].code != RDMA_SC_INVALID_STATE)
+      `uvm_error("FREEZE_DOUBLE_RESULT",
+                 "double cleanup failure fallback is incomplete")
+    recovery = null;
+    if (result != null && result.resource_h != null) begin
+      status = manager.lookup(result.resource_h, resource);
+      expect_status("FREEZE_DOUBLE_LOOKUP", status, RDMA_SC_OK);
+      if (!$cast(registry_mr, resource) || registry_mr == null ||
+          registry_mr.state != RDMA_RESOURCE_ALLOCATED)
+        `uvm_error("FREEZE_DOUBLE_STATE",
+                   "double cleanup failure lost the ALLOCATED MR")
+      status = manager.lookup_recovery(result.resource_h, recovery);
+      expect_status("FREEZE_DOUBLE_RECOVERY", status,
+                    RDMA_SC_INVALID_STATE);
+    end
+    if (recovery != null || manager.release_reserved_calls != 2 ||
+        manager.mark_error_calls != 2)
+      `uvm_error("FREEZE_DOUBLE_CALLS",
+                 "double cleanup failure published recovery or skipped calls")
+
+    request = make_register_mr_request("freeze_timeout_request", binding,
+                                       pd);
+    request.iova.value += 64'h0004_0000;
+    backing = make_borrowed_pbl0_backing(
+      "freeze_timeout_backing", binding, request, RDMA_MR_PBL2
+    );
+    status = hmc.allocate(binding.make_handle(), RDMA_RESOURCE_MR,
+                          64'h1000, 64'h1000, hmc_address);
+    expect_status("FREEZE_TIMEOUT_HMC_ALLOCATE", status, RDMA_SC_OK);
+    status = hmc.lookup(binding.make_handle(), RDMA_RESOURCE_MR,
+                        hmc_address, lease_size);
+    expect_status("FREEZE_TIMEOUT_HMC_LOOKUP", status, RDMA_SC_OK);
+    hmc_ref = make_borrowed_hmc_ref(
+      "freeze_timeout_hmc_ref", binding, hmc_address, lease_size,
+      28'h000_0a00
+    );
+    backing.hmc_refs.push_back(hmc_ref);
+    backing.page_layout.first_pbl_index = hmc_ref.first_pbl_index;
+    manager.fail_next_mark_error(mark_error_failure);
+    mock_cmq.timeout_opcode(XTR_V1_OP_KEY_ALLOC);
+    control.register_mr(binding, request, backing, mr, result);
+    expect_recovery_fallback("FREEZE_TIMEOUT", result, RDMA_SC_TIMEOUT);
+    if (mr != null || result == null || result.resource_h == null ||
+        !result.final_resource_state_known ||
+        result.final_resource_state != RDMA_RESOURCE_ALLOCATED ||
+        result.recovery_required || result.rollback_statuses.size() != 1 ||
+        result.rollback_statuses[0] == null ||
+        result.rollback_statuses[0].code != RDMA_SC_INVALID_STATE)
+      `uvm_error("FREEZE_TIMEOUT_RESULT",
+                 "timeout freeze failure fallback is incomplete")
+    recovery = null;
+    if (result != null && result.resource_h != null) begin
+      status = manager.lookup(result.resource_h, resource);
+      expect_status("FREEZE_TIMEOUT_LOOKUP", status, RDMA_SC_OK);
+      if (!$cast(registry_mr, resource) || registry_mr == null ||
+          registry_mr.state != RDMA_RESOURCE_ALLOCATED)
+        `uvm_error("FREEZE_TIMEOUT_STATE",
+                   "timeout freeze failure lost the ALLOCATED MR")
+      status = manager.lookup_recovery(result.resource_h, recovery);
+      expect_status("FREEZE_TIMEOUT_RECOVERY", status,
+                    RDMA_SC_INVALID_STATE);
+    end
+    if (recovery != null || manager.release_reserved_calls != 2 ||
+        manager.mark_error_calls != 3 || mock_cmq.calls.size() != 3)
+      `uvm_error("FREEZE_TIMEOUT_CALLS",
+                 "timeout freeze failure published recovery or skipped calls")
+    foreach (mock_cmq.calls[i]) begin
+      if (mock_cmq.calls[i] == null ||
+          mock_cmq.calls[i].opcode != XTR_V1_OP_KEY_ALLOC)
+        `uvm_error("FREEZE_FAILURE_COMMANDS",
+                   "freeze failure test issued a non-KEY_ALLOC command")
+    end
+  endtask
+
   task automatic check_post_lock_revalidation();
     rdma_control_plane_probe binding_control;
     rdma_control_plane_probe request_control;
@@ -1570,6 +2366,9 @@ class rdma_control_plane_test extends uvm_test;
     check_borrowed_pbl0_registration();
     check_key_alloc_explicit_failure();
     check_key_alloc_timeout_recovery();
+    check_register_mr_caller_snapshot();
+    check_register_mr_post_cmq_fence();
+    check_register_mr_recovery_freeze_failures();
     check_borrowed_pbl1_pbl2_registration();
     check_register_mr_pre_cmq_rejections();
     check_post_activate_snapshot_cleanup();
