@@ -464,6 +464,40 @@ class rdma_control_plane extends uvm_object;
     result.final_resource_state_known = 1'b1;
   endtask
 
+  protected function void retain_mr_destroy_error(
+    rdma_mr mr_snapshot,
+    rdma_status primary_status,
+    rdma_control_result result,
+    rdma_hw_presence_e hardware_presence,
+    bit has_pending_step,
+    rdma_control_step_e pending_step,
+    rdma_cmq_ticket ambiguous_ticket,
+    output bit result_finalized
+  );
+    rdma_mr ignored_mr;
+    rdma_recovery_record recovery;
+
+    recovery = rdma_recovery_record::type_id::create(
+      "deregister_mr_recovery"
+    );
+    recovery.resource_h = snapshot_handle(mr_snapshot.handle);
+    recovery.hardware_presence = hardware_presence;
+    recovery.completed_steps = result.completed_steps;
+    if (has_pending_step)
+      recovery.pending_steps.push_back(pending_step);
+    recovery.backing_refs = mr_snapshot.backing_refs;
+    recovery.hmc_refs = mr_snapshot.hmc_refs;
+    recovery.ambiguous_ticket = rdma_cmq_clone_ticket_value(
+      ambiguous_ticket, "deregister MR recovery"
+    );
+    recovery.primary_status = rdma_cmq_clone_status_value(primary_status);
+    recovery.rollback_statuses = result.rollback_statuses;
+    finalize_mr_recovery(
+      mr_snapshot, recovery, primary_status, result, ignored_mr,
+      result_finalized
+    );
+  endfunction
+
   protected function void finish_result(
     rdma_control_result result,
     rdma_status operation_status
@@ -692,6 +726,26 @@ class rdma_control_plane extends uvm_object;
       return rdma_status::make(
         RDMA_SC_STALE_GENERATION,
         "destroy PD Function generation is stale"
+      );
+    return rdma_status::success();
+  endfunction
+
+  protected function rdma_status mr_handle_owner_status(
+    rdma_handle mr_h,
+    rdma_function_handle owner
+  );
+    if (mr_h == null)
+      return invalid_argument("deregister MR handle is null");
+    if (mr_h.kind != RDMA_RESOURCE_MR)
+      return invalid_argument("deregister MR handle kind is not MR");
+    if (owner == null || owner.kind != RDMA_RESOURCE_FUNCTION)
+      return invalid_state("deregister MR Function owner is invalid");
+    if (mr_h.function_uid != owner.function_uid)
+      return invalid_argument("deregister MR belongs to another Function");
+    if (mr_h.generation != owner.generation)
+      return rdma_status::make(
+        RDMA_SC_STALE_GENERATION,
+        "deregister MR Function generation is stale"
       );
     return rdma_status::success();
   endfunction
@@ -1017,6 +1071,398 @@ class rdma_control_plane extends uvm_object;
     end while (1'b0);
 
     finish_result(result, status);
+    if (function_lock != null)
+      function_lock.put(1);
+  endtask
+
+  task deregister_mr(
+    rdma_function_binding binding,
+    rdma_handle mr_h,
+    output rdma_control_result result
+  );
+    rdma_function_handle owner;
+    rdma_function_handle locked_owner;
+    rdma_resource resource;
+    rdma_mr mr_snapshot;
+    rdma_xtr_v1_occ_flush_body occ_body;
+    rdma_xtr_v1_mr_deregister_body deregister_body;
+    rdma_xtr_v1_cmq_empty_body drain_body;
+    rdma_cmq_command_desc command;
+    rdma_cmq_opcode_key opcode_key;
+    rdma_cmq_ticket ticket;
+    rdma_cmq_completion completion;
+    rdma_status status;
+    rdma_status primary_status;
+    rdma_status cleanup_status;
+    semaphore function_lock;
+    longint unsigned transaction_id;
+    bit result_finalized;
+
+    result = make_result();
+    result.resource_h = snapshot_handle(mr_h);
+    function_lock = null;
+    result_finalized = 1'b0;
+    reserve_transaction_id(transaction_id, status);
+    result.transaction_id = transaction_id;
+
+    do begin
+      if (status == null || !status.ok()) begin
+        status = checked_status(
+          status, "deregister MR transaction ID allocation returned null"
+        );
+        break;
+      end
+      status = configured_status();
+      if (status == null || !status.ok()) begin
+        status = checked_status(
+          status, "deregister MR configuration check returned null"
+        );
+        break;
+      end
+      status = binding_owner_status(binding, owner);
+      if (status == null || !status.ok()) begin
+        status = checked_status(
+          status, "deregister MR Function check returned null"
+        );
+        break;
+      end
+      status = mr_handle_owner_status(mr_h, owner);
+      if (status == null || !status.ok()) begin
+        status = checked_status(
+          status, "deregister MR handle check returned null"
+        );
+        break;
+      end
+
+      acquire_function_lock(owner, function_lock);
+      status = binding_owner_status(binding, locked_owner);
+      if (status == null || !status.ok()) begin
+        status = checked_status(
+          status, "post-lock deregister MR Function check returned null"
+        );
+        break;
+      end
+      status = same_owner_status(
+        locked_owner, owner, "post-lock deregister MR Function"
+      );
+      if (status == null || !status.ok()) begin
+        status = checked_status(
+          status, "post-lock deregister MR identity check returned null"
+        );
+        break;
+      end
+      status = mr_handle_owner_status(mr_h, locked_owner);
+      if (status == null || !status.ok()) begin
+        status = checked_status(
+          status, "post-lock deregister MR handle check returned null"
+        );
+        break;
+      end
+      status = manager.lookup(mr_h, resource);
+      if (status == null || !status.ok()) begin
+        status = checked_status(
+          status, "resource manager deregister MR lookup returned null"
+        );
+        break;
+      end
+      if (!$cast(mr_snapshot, resource) || mr_snapshot == null ||
+          mr_snapshot.handle == null || mr_snapshot.owner == null) begin
+        status = invalid_state(
+          "resource manager deregister MR snapshot is invalid"
+        );
+        break;
+      end
+      result.resource_h = snapshot_handle(mr_snapshot.handle);
+      result.final_resource_state = mr_snapshot.state;
+      result.final_resource_state_known = 1'b1;
+      status = same_owner_status(
+        mr_snapshot.owner, locked_owner, "deregister MR"
+      );
+      if (status == null || !status.ok()) begin
+        status = checked_status(
+          status, "deregister MR owner check returned null"
+        );
+        break;
+      end
+      if (mr_snapshot.state != RDMA_RESOURCE_ACTIVE) begin
+        status = invalid_state("deregister MR requires an ACTIVE MR");
+        break;
+      end
+      if (mr_snapshot.outstanding_ids.size() != 0) begin
+        status = rdma_status::make(
+          RDMA_SC_RESOURCE_BUSY,
+          "deregister MR has outstanding operations"
+        );
+        break;
+      end
+
+      status = manager.begin_quiesce(mr_snapshot.handle);
+      if (status == null || !status.ok()) begin
+        status = checked_status(
+          status, "resource manager MR quiesce returned null"
+        );
+        result.final_resource_state = RDMA_RESOURCE_ACTIVE;
+        break;
+      end
+      result.final_resource_state = RDMA_RESOURCE_QUIESCING;
+
+      if (mr_snapshot.hmc_refs.size() != 0) begin
+        occ_body = rdma_xtr_v1_occ_flush_body::type_id::create(
+          "deregister_mr_occ_flush_body"
+        );
+        occ_body.mr_serial_flush = 1'b1;
+        occ_body.pble = 1'b1;
+        occ_body.mr_serial = mr_snapshot.mr_serial[11:0];
+        opcode_key = rdma_cmq_opcode_key::type_id::create(
+          "deregister_mr_occ_flush_opcode"
+        );
+        opcode_key.profile_name = "xtr_v1";
+        opcode_key.opcode = XTR_V1_OP_OCC_FLUSH;
+        opcode_key.variant = "occ_flush";
+        command = rdma_cmq_command_desc::type_id::create(
+          "deregister_mr_occ_flush"
+        );
+        command.function_h = rdma_clone_function_handle_value(
+          locked_owner, "deregister MR OCC command"
+        );
+        command.opcode_key = opcode_key;
+        command.body = occ_body;
+        command.timeout = default_timeout;
+        ticket = null;
+        completion = null;
+        cmq.execute(command, ticket, completion, status);
+        status = checked_status(status, "OCC_FLUSH execution returned null");
+        if (!status.ok()) begin
+          primary_status = rdma_cmq_clone_status_value(status);
+          if (status.code == RDMA_SC_TIMEOUT) begin
+            retain_mr_destroy_error(
+              mr_snapshot, primary_status, result,
+              RDMA_HW_PRESENCE_UNKNOWN, 1'b1,
+              RDMA_CTRL_STEP_HW_OCC_FLUSHED, ticket, result_finalized
+            );
+          end
+          else begin
+            cleanup_status = manager.restore_active(mr_snapshot.handle);
+            cleanup_status = checked_status(
+              cleanup_status, "OCC failure restore ACTIVE returned null"
+            );
+            if (cleanup_status.ok()) begin
+              result.final_resource_state = RDMA_RESOURCE_ACTIVE;
+              status = primary_status;
+            end
+            else begin
+              result.rollback_statuses.push_back(
+                rdma_cmq_clone_status_value(cleanup_status)
+              );
+              retain_mr_destroy_error(
+                mr_snapshot, primary_status, result,
+                RDMA_HW_PRESENCE_PRESENT, 1'b0,
+                RDMA_CTRL_STEP_HW_OCC_FLUSHED, null, result_finalized
+              );
+            end
+          end
+          break;
+        end
+        result.completed_steps.push_back(RDMA_CTRL_STEP_HW_OCC_FLUSHED);
+      end
+
+      deregister_body = rdma_xtr_v1_mr_deregister_body::type_id::create(
+        "deregister_mr_body"
+      );
+      deregister_body.mr_h = project_handle(
+        mr_snapshot.handle, mr_snapshot.local_mr_id, RDMA_RESOURCE_MR
+      );
+      deregister_body.stag_key = mr_snapshot.lkey[7:0];
+      deregister_body.next_state = RDMA_CONTEXT_INVALID;
+      opcode_key = rdma_cmq_opcode_key::type_id::create(
+        "deregister_mr_opcode"
+      );
+      opcode_key.profile_name = "xtr_v1";
+      opcode_key.opcode = XTR_V1_OP_MR_DEREGISTER;
+      opcode_key.variant = "deregister";
+      command = rdma_cmq_command_desc::type_id::create(
+        "deregister_mr_command"
+      );
+      command.function_h = rdma_clone_function_handle_value(
+        locked_owner, "deregister MR command"
+      );
+      command.opcode_key = opcode_key;
+      command.body = deregister_body;
+      command.timeout = default_timeout;
+      ticket = null;
+      completion = null;
+      cmq.execute(command, ticket, completion, status);
+      status = checked_status(
+        status, "MR_DEREGISTER execution returned null"
+      );
+      if (!status.ok()) begin
+        primary_status = rdma_cmq_clone_status_value(status);
+        if (status.code == RDMA_SC_TIMEOUT) begin
+          retain_mr_destroy_error(
+            mr_snapshot, primary_status, result,
+            RDMA_HW_PRESENCE_UNKNOWN, 1'b1,
+            RDMA_CTRL_STEP_HW_MR_DEREGISTERED, ticket, result_finalized
+          );
+        end
+        else begin
+          cleanup_status = manager.restore_active(mr_snapshot.handle);
+          cleanup_status = checked_status(
+            cleanup_status,
+            "MR_DEREGISTER failure restore ACTIVE returned null"
+          );
+          if (cleanup_status.ok()) begin
+            result.final_resource_state = RDMA_RESOURCE_ACTIVE;
+            status = primary_status;
+          end
+          else begin
+            result.rollback_statuses.push_back(
+              rdma_cmq_clone_status_value(cleanup_status)
+            );
+            retain_mr_destroy_error(
+              mr_snapshot, primary_status, result,
+              RDMA_HW_PRESENCE_PRESENT, 1'b0,
+              RDMA_CTRL_STEP_HW_MR_DEREGISTERED, null,
+              result_finalized
+            );
+          end
+        end
+        break;
+      end
+      result.completed_steps.push_back(
+        RDMA_CTRL_STEP_HW_MR_DEREGISTERED
+      );
+
+      drain_body = rdma_xtr_v1_cmq_empty_body::type_id::create(
+        "deregister_mr_tq_flush_body"
+      );
+      opcode_key = rdma_cmq_opcode_key::type_id::create(
+        "deregister_mr_tq_flush_opcode"
+      );
+      opcode_key.profile_name = "xtr_v1";
+      opcode_key.opcode = XTR_V1_OP_TQ_FLUSH;
+      opcode_key.variant = "tq_flush";
+      command = rdma_cmq_command_desc::type_id::create(
+        "deregister_mr_tq_flush"
+      );
+      command.function_h = rdma_clone_function_handle_value(
+        locked_owner, "deregister MR TQ command"
+      );
+      command.opcode_key = opcode_key;
+      command.body = drain_body;
+      command.timeout = default_timeout;
+      ticket = null;
+      completion = null;
+      cmq.execute(command, ticket, completion, status);
+      status = checked_status(status, "TQ_FLUSH execution returned null");
+      if (!status.ok()) begin
+        primary_status = rdma_cmq_clone_status_value(status);
+        retain_mr_destroy_error(
+          mr_snapshot, primary_status, result, RDMA_HW_PRESENCE_ABSENT,
+          1'b1, RDMA_CTRL_STEP_HW_DRAINED,
+          (status.code == RDMA_SC_TIMEOUT) ? ticket : null,
+          result_finalized
+        );
+        break;
+      end
+      result.completed_steps.push_back(RDMA_CTRL_STEP_HW_DRAINED);
+
+      for (int i = int'(mr_snapshot.hmc_refs.size()) - 1;
+           i >= 0; i--) begin
+        if (mr_snapshot.hmc_refs[i] == null) begin
+          status = invalid_state("deregister MR HMC reference is null");
+          break;
+        end
+        if (mr_snapshot.hmc_refs[i].ownership !=
+              RDMA_OWNERSHIP_CONTROL_PLANE ||
+            mr_snapshot.hmc_refs[i].release_complete)
+          continue;
+        if (hmc_allocator == null)
+          status = invalid_state(
+            "owned deregister MR HMC allocator is unavailable"
+          );
+        else
+          status = hmc_allocator.\release (
+            mr_snapshot.hmc_refs[i].owner,
+            mr_snapshot.hmc_refs[i].object_kind,
+            mr_snapshot.hmc_refs[i].address
+          );
+        status = checked_status(
+          status, "owned deregister MR HMC release returned null"
+        );
+        if (!status.ok())
+          break;
+        mr_snapshot.hmc_refs[i].release_complete = 1'b1;
+      end
+      if (!status.ok()) begin
+        primary_status = rdma_cmq_clone_status_value(status);
+        retain_mr_destroy_error(
+          mr_snapshot, primary_status, result, RDMA_HW_PRESENCE_ABSENT,
+          1'b1, RDMA_CTRL_STEP_BACKING_RELEASED, null,
+          result_finalized
+        );
+        break;
+      end
+
+      for (int i = int'(mr_snapshot.backing_refs.size()) - 1;
+           i >= 0; i--) begin
+        if (mr_snapshot.backing_refs[i] == null ||
+            mr_snapshot.backing_refs[i].mapping == null) begin
+          status = invalid_state(
+            "deregister MR backing reference is null"
+          );
+          break;
+        end
+        if (mr_snapshot.backing_refs[i].ownership !=
+              RDMA_OWNERSHIP_CONTROL_PLANE ||
+            mr_snapshot.backing_refs[i].release_complete)
+          continue;
+        if (host_mem == null)
+          status = invalid_state(
+            "owned deregister MR host memory is unavailable"
+          );
+        else
+          status = host_mem.\release (
+            mr_snapshot.backing_refs[i].mapping
+          );
+        status = checked_status(
+          status, "owned deregister MR backing release returned null"
+        );
+        if (!status.ok())
+          break;
+        mr_snapshot.backing_refs[i].release_complete = 1'b1;
+      end
+      if (!status.ok()) begin
+        primary_status = rdma_cmq_clone_status_value(status);
+        retain_mr_destroy_error(
+          mr_snapshot, primary_status, result, RDMA_HW_PRESENCE_ABSENT,
+          1'b1, RDMA_CTRL_STEP_BACKING_RELEASED, null,
+          result_finalized
+        );
+        break;
+      end
+      result.completed_steps.push_back(RDMA_CTRL_STEP_BACKING_RELEASED);
+
+      status = manager.finalize_release(mr_snapshot.handle);
+      status = checked_status(
+        status, "resource manager MR release returned null"
+      );
+      if (!status.ok()) begin
+        primary_status = rdma_cmq_clone_status_value(status);
+        retain_mr_destroy_error(
+          mr_snapshot, primary_status, result, RDMA_HW_PRESENCE_ABSENT,
+          1'b1, RDMA_CTRL_STEP_RESOURCE_RELEASED, null,
+          result_finalized
+        );
+        break;
+      end
+      result.completed_steps.push_back(RDMA_CTRL_STEP_RESOURCE_RELEASED);
+      result.final_resource_state = RDMA_RESOURCE_RELEASED;
+      result.final_resource_state_known = 1'b1;
+      status = rdma_status::success();
+    end while (1'b0);
+
+    if (!result_finalized)
+      finish_result(result, status);
     if (function_lock != null)
       function_lock.put(1);
   endtask
