@@ -113,249 +113,746 @@ class rdma_resource_manager extends uvm_object;
                      owner.object_id, owner.generation);
   endfunction
 
-  protected function automatic bit has_exact_object_type(
-    uvm_object value,
-    uvm_object_wrapper expected_type
+  // Public carriers may be compatible subclasses, but only fields declared by
+  // the built-in model are authoritative.  The manager never invokes virtual
+  // type, clone, copy, resource-kind, or validation hooks on a carrier.  Every
+  // accepted graph is structurally projected into direct-new built-in storage.
+  // Future extension support requires an explicit trusted adapter here.
+  protected function rdma_status project_handle_value(
+    rdma_handle source,
+    string copy_label,
+    output rdma_handle result
   );
-    uvm_object_wrapper actual_type;
+    rdma_function_handle source_function;
+    rdma_function_handle result_function;
 
-    if (value == null || expected_type == null)
-      return 1'b0;
-    actual_type = value.get_object_type();
-    return actual_type != null && actual_type == expected_type;
-  endfunction
-
-  protected function automatic bit has_optional_exact_object_type(
-    uvm_object value,
-    uvm_object_wrapper expected_type
-  );
-    return value == null || has_exact_object_type(value, expected_type);
-  endfunction
-
-  protected function bit exact_function_handle_schema(rdma_handle value);
-    rdma_function_handle function_h;
-
-    if (value == null)
-      return 1'b0;
-    return has_exact_object_type(value, rdma_function_handle::get_type()) &&
-           $cast(function_h, value);
-  endfunction
-
-  protected function bit exact_resource_handle_schema(rdma_handle value);
-    if (value == null)
-      return 1'b0;
-    if (value.kind == RDMA_RESOURCE_FUNCTION)
-      return exact_function_handle_schema(value);
-    return has_exact_object_type(value, rdma_handle::get_type());
-  endfunction
-
-  protected function bit exact_mapping_schema(rdma_dma_mapping value);
-    if (!has_exact_object_type(value, rdma_dma_mapping::get_type()))
-      return 1'b0;
-    if (value.function_h != null &&
-        !exact_function_handle_schema(value.function_h))
-      return 1'b0;
-    if (value.owner_h != null &&
-        !exact_resource_handle_schema(value.owner_h))
-      return 1'b0;
-    return 1'b1;
-  endfunction
-
-  protected function bit exact_backing_ref_schema(rdma_backing_ref value);
-    if (!has_exact_object_type(value, rdma_backing_ref::get_type()))
-      return 1'b0;
-    return value.mapping == null || exact_mapping_schema(value.mapping);
-  endfunction
-
-  protected function bit exact_hmc_ref_schema(rdma_hmc_ref value);
-    if (!has_exact_object_type(value, rdma_hmc_ref::get_type()))
-      return 1'b0;
-    return value.owner == null || exact_function_handle_schema(value.owner);
-  endfunction
-
-  protected function bit exact_binding_schema(rdma_function_binding value);
-    if (!has_exact_object_type(value, rdma_function_binding::get_type()) ||
-        !has_exact_object_type(value.pcie,
-                               rdma_pcie_identity::get_type()))
-      return 1'b0;
-    foreach (value.pcie.bar[i]) begin
-      if (!has_exact_object_type(value.pcie.bar[i],
-                                 rdma_bar_info::get_type()))
-        return 1'b0;
-    end
-    if (value.owner_h != null &&
-        !exact_function_handle_schema(value.owner_h))
-      return 1'b0;
-    return 1'b1;
-  endfunction
-
-  protected function bit exact_resource_schema(rdma_resource value);
-    rdma_function function_value;
-    rdma_mr mr_value;
-    rdma_cq cq_value;
-    rdma_qp qp_value;
-    rdma_srq srq_value;
-
-    if (value == null)
-      return 1'b0;
-
-    // Trusted schema adapter point: future wrapper extensions must be
-    // explicitly enumerated here with a complete nested-graph validator.
-    if (has_exact_object_type(value, rdma_function::get_type())) begin
-      if (!$cast(function_value, value) ||
-          function_value.resource_kind() != RDMA_RESOURCE_FUNCTION ||
-          function_value.handle == null ||
-          !exact_function_handle_schema(function_value.handle) ||
-          !exact_binding_schema(function_value.binding))
-        return 1'b0;
-    end
-    else if (has_exact_object_type(value, rdma_pd::get_type())) begin
-      if (value.resource_kind() != RDMA_RESOURCE_PD)
-        return 1'b0;
-    end
-    else if (has_exact_object_type(value, rdma_mr::get_type())) begin
-      if (!$cast(mr_value, value) ||
-          mr_value.resource_kind() != RDMA_RESOURCE_MR ||
-          (mr_value.pd_h != null &&
-           !exact_resource_handle_schema(mr_value.pd_h)))
-        return 1'b0;
-    end
-    else if (has_exact_object_type(value, rdma_cq::get_type())) begin
-      if (!$cast(cq_value, value) ||
-          cq_value.resource_kind() != RDMA_RESOURCE_CQ ||
-          (cq_value.ceq_h != null &&
-           !exact_resource_handle_schema(cq_value.ceq_h)))
-        return 1'b0;
-    end
-    else if (has_exact_object_type(value, rdma_qp::get_type())) begin
-      if (!$cast(qp_value, value) ||
-          qp_value.resource_kind() != RDMA_RESOURCE_QP ||
-          (qp_value.pd_h != null &&
-           !exact_resource_handle_schema(qp_value.pd_h)) ||
-          (qp_value.send_cq_h != null &&
-           !exact_resource_handle_schema(qp_value.send_cq_h)) ||
-          (qp_value.recv_cq_h != null &&
-           !exact_resource_handle_schema(qp_value.recv_cq_h)) ||
-          (qp_value.srq_h != null &&
-           !exact_resource_handle_schema(qp_value.srq_h)))
-        return 1'b0;
-    end
-    else if (has_exact_object_type(value, rdma_srq::get_type())) begin
-      if (!$cast(srq_value, value) ||
-          srq_value.resource_kind() != RDMA_RESOURCE_SRQ ||
-          (srq_value.pd_h != null &&
-           !exact_resource_handle_schema(srq_value.pd_h)))
-        return 1'b0;
-    end
-    else if (has_exact_object_type(value, rdma_cmq::get_type())) begin
-      if (value.resource_kind() != RDMA_RESOURCE_CMQ)
-        return 1'b0;
-    end
-    else if (has_exact_object_type(value, rdma_ceq::get_type())) begin
-      if (value.resource_kind() != RDMA_RESOURCE_CEQ)
-        return 1'b0;
-    end
-    else if (has_exact_object_type(value, rdma_aeq::get_type())) begin
-      if (value.resource_kind() != RDMA_RESOURCE_AEQ)
-        return 1'b0;
+    result = null;
+    if (source == null)
+      return rdma_status::success();
+    if (source.kind == RDMA_RESOURCE_FUNCTION) begin
+      if (!$cast(source_function, source))
+        return rdma_status::make(
+          RDMA_SC_INVALID_ARGUMENT,
+          {copy_label, " Function handle is structurally incompatible"}
+        );
+      result_function = new({copy_label, "_function_handle"});
+      result = result_function;
     end
     else begin
-      return 1'b0;
+      result = new({copy_label, "_handle"});
     end
-
-    if (value.handle != null &&
-        !exact_resource_handle_schema(value.handle))
-      return 1'b0;
-    if (value.owner != null && !exact_function_handle_schema(value.owner))
-      return 1'b0;
-    foreach (value.backing_refs[i]) begin
-      if (value.backing_refs[i] != null &&
-          !exact_backing_ref_schema(value.backing_refs[i]))
-        return 1'b0;
-    end
-    foreach (value.hmc_refs[i]) begin
-      if (value.hmc_refs[i] != null &&
-          !exact_hmc_ref_schema(value.hmc_refs[i]))
-        return 1'b0;
-    end
-    foreach (value.dependencies[i]) begin
-      if (value.dependencies[i] != null &&
-          !exact_resource_handle_schema(value.dependencies[i]))
-        return 1'b0;
-    end
-    return 1'b1;
+    result.kind = source.kind;
+    result.function_uid = source.function_uid;
+    result.object_id = source.object_id;
+    result.generation = source.generation;
+    return rdma_status::success();
   endfunction
 
-  protected function bit exact_status_schema(rdma_status value);
-    return has_exact_object_type(value, rdma_status::get_type());
+  protected function rdma_status project_function_handle_value(
+    rdma_function_handle source,
+    string copy_label,
+    output rdma_function_handle result
+  );
+    result = null;
+    if (source == null)
+      return rdma_status::success();
+    result = new({copy_label, "_function_handle"});
+    result.kind = source.kind;
+    result.function_uid = source.function_uid;
+    result.object_id = source.object_id;
+    result.generation = source.generation;
+    return rdma_status::success();
   endfunction
 
-  protected function bit exact_opcode_schema(rdma_cmq_opcode_key value);
-    return has_exact_object_type(value, rdma_cmq_opcode_key::get_type());
+  protected function rdma_status project_mapping_value(
+    rdma_dma_mapping source,
+    string copy_label,
+    output rdma_dma_mapping result
+  );
+    rdma_status status;
+
+    result = null;
+    if (source == null)
+      return rdma_status::success();
+    result = new({copy_label, "_mapping"});
+    status = project_function_handle_value(
+      source.function_h, {copy_label, "_function"}, result.function_h
+    );
+    if (!status.ok()) begin
+      result = null;
+      return status;
+    end
+    status = project_handle_value(source.owner_h, {copy_label, "_owner"},
+                                  result.owner_h);
+    if (!status.ok()) begin
+      result = null;
+      return status;
+    end
+    result.requester_bdf = source.requester_bdf;
+    result.pasid_valid = source.pasid_valid;
+    result.pasid = source.pasid;
+    result.backing_addr = source.backing_addr;
+    result.iova = source.iova;
+    result.size = source.size;
+    result.direction = source.direction;
+    result.permissions = source.permissions;
+    result.state = source.state;
+    return rdma_status::success();
   endfunction
 
-  protected function bit exact_ticket_schema(rdma_cmq_ticket value);
-    if (!has_exact_object_type(value, rdma_cmq_ticket::get_type()))
-      return 1'b0;
-    if (value.function_h != null &&
-        !exact_function_handle_schema(value.function_h))
-      return 1'b0;
-    if (value.cmq_h != null && !exact_resource_handle_schema(value.cmq_h))
-      return 1'b0;
-    if (value.opcode_key != null &&
-        !exact_opcode_schema(value.opcode_key))
-      return 1'b0;
-    return 1'b1;
+  protected function rdma_status project_backing_ref_value(
+    rdma_backing_ref source,
+    string copy_label,
+    output rdma_backing_ref result
+  );
+    rdma_status status;
+
+    result = null;
+    if (source == null)
+      return rdma_status::success();
+    result = new({copy_label, "_backing_ref"});
+    result.mapping = null;
+    status = project_mapping_value(source.mapping, {copy_label, "_mapping"},
+                                   result.mapping);
+    if (!status.ok()) begin
+      result = null;
+      return status;
+    end
+    result.ownership = source.ownership;
+    result.release_complete = source.release_complete;
+    return rdma_status::success();
   endfunction
 
-  protected function bit exact_recovery_schema(rdma_recovery_record value);
-    if (!has_exact_object_type(value, rdma_recovery_record::get_type()))
-      return 1'b0;
-    if (value.resource_h != null &&
-        !exact_resource_handle_schema(value.resource_h))
-      return 1'b0;
-    foreach (value.backing_refs[i]) begin
-      if (value.backing_refs[i] != null &&
-          !exact_backing_ref_schema(value.backing_refs[i]))
-        return 1'b0;
+  protected function rdma_status project_hmc_ref_value(
+    rdma_hmc_ref source,
+    string copy_label,
+    output rdma_hmc_ref result
+  );
+    rdma_status status;
+
+    result = null;
+    if (source == null)
+      return rdma_status::success();
+    result = new({copy_label, "_hmc_ref"});
+    status = project_function_handle_value(
+      source.owner, {copy_label, "_owner"}, result.owner
+    );
+    if (!status.ok()) begin
+      result = null;
+      return status;
     end
-    foreach (value.hmc_refs[i]) begin
-      if (value.hmc_refs[i] != null &&
-          !exact_hmc_ref_schema(value.hmc_refs[i]))
-        return 1'b0;
+    result.object_kind = source.object_kind;
+    result.address = source.address;
+    result.size = source.size;
+    result.first_pbl_index = source.first_pbl_index;
+    result.ownership = source.ownership;
+    result.release_complete = source.release_complete;
+    return rdma_status::success();
+  endfunction
+
+  protected function rdma_status project_bar_value(
+    rdma_bar_info source,
+    string copy_label,
+    output rdma_bar_info result
+  );
+    result = null;
+    if (source == null)
+      return rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT,
+        {copy_label, " BAR metadata is null"}
+      );
+    result = new({copy_label, "_bar"});
+    result.bar_id = source.bar_id;
+    result.base = source.base;
+    result.size = source.size;
+    result.enabled = source.enabled;
+    return rdma_status::success();
+  endfunction
+
+  protected function rdma_status project_pcie_value(
+    rdma_pcie_identity source,
+    string copy_label,
+    output rdma_pcie_identity result
+  );
+    rdma_status status;
+
+    result = null;
+    if (source == null)
+      return rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT,
+        {copy_label, " PCIe identity is null"}
+      );
+    result = new({copy_label, "_pcie"});
+    foreach (result.bar[i])
+      result.bar[i] = null;
+    result.bdf = source.bdf;
+    result.parent_pf_bdf = source.parent_pf_bdf;
+    result.vf_index = source.vf_index;
+    result.mse = source.mse;
+    result.bme = source.bme;
+    foreach (source.bar[i]) begin
+      status = project_bar_value(
+        source.bar[i], $sformatf("%s_bar_%0d", copy_label, i),
+        result.bar[i]
+      );
+      if (!status.ok()) begin
+        result = null;
+        return status;
+      end
     end
-    if (value.ambiguous_ticket != null &&
-        !exact_ticket_schema(value.ambiguous_ticket))
-      return 1'b0;
-    if (value.primary_status != null &&
-        !exact_status_schema(value.primary_status))
-      return 1'b0;
-    foreach (value.rollback_statuses[i]) begin
-      if (value.rollback_statuses[i] != null &&
-          !exact_status_schema(value.rollback_statuses[i]))
-        return 1'b0;
+    return rdma_status::success();
+  endfunction
+
+  protected function rdma_status project_binding_value(
+    rdma_function_binding source,
+    string copy_label,
+    output rdma_function_binding result
+  );
+    rdma_status status;
+
+    result = null;
+    if (source == null)
+      return rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT,
+        {copy_label, " Function binding is null"}
+      );
+    result = new({copy_label, "_binding"});
+    result.pcie = null;
+    result.owner_h = null;
+    status = project_pcie_value(source.pcie, {copy_label, "_pcie"},
+                                result.pcie);
+    if (!status.ok()) begin
+      result = null;
+      return status;
     end
-    return 1'b1;
+    status = project_handle_value(source.owner_h, {copy_label, "_owner"},
+                                  result.owner_h);
+    if (!status.ok()) begin
+      result = null;
+      return status;
+    end
+    result.function_uid = source.function_uid;
+    result.notify_bar_id = source.notify_bar_id;
+    result.notify_base = source.notify_base;
+    result.notify_size = source.notify_size;
+    result.notify_table_sel = source.notify_table_sel;
+    result.notify_table_index = source.notify_table_index;
+    result.host_id = source.host_id;
+    result.pfvf_id = source.pfvf_id;
+    result.rdma_vf_id = source.rdma_vf_id;
+    result.global_function_id = source.global_function_id;
+    result.vsi_id = source.vsi_id;
+    result.dma_domain_id = source.dma_domain_id;
+    result.dma_domain_valid = source.dma_domain_valid;
+    result.state = source.state;
+    result.generation = source.generation;
+    result.notify_valid = source.notify_valid;
+    result.notify_ready = source.notify_ready;
+    result.dmi_valid = source.dmi_valid;
+    result.dmi_ready = source.dmi_ready;
+    result.vft_valid = source.vft_valid;
+    result.vft_ready = source.vft_ready;
+    return rdma_status::success();
+  endfunction
+
+  protected function rdma_status project_opcode_value(
+    rdma_cmq_opcode_key source,
+    string copy_label,
+    output rdma_cmq_opcode_key result
+  );
+    result = null;
+    if (source == null)
+      return rdma_status::success();
+    result = new({copy_label, "_opcode"});
+    result.profile_name = source.profile_name;
+    result.opcode = source.opcode;
+    result.variant = source.variant;
+    return rdma_status::success();
+  endfunction
+
+  protected function rdma_status project_status_value(
+    rdma_status source,
+    string copy_label,
+    output rdma_status result
+  );
+    result = null;
+    if (source == null)
+      return rdma_status::success();
+    result = new({copy_label, "_status"});
+    result.category = source.category;
+    result.code = source.code;
+    result.hardware_code = source.hardware_code;
+    result.hardware_code_valid = source.hardware_code_valid;
+    result.source_engine = source.source_engine;
+    result.function_uid = source.function_uid;
+    result.generation = source.generation;
+    result.resource_id = source.resource_id;
+    result.command_id = source.command_id;
+    result.wr_id = source.wr_id;
+    result.severity = source.severity;
+    result.retryable = source.retryable;
+    result.message = source.message;
+    return rdma_status::success();
+  endfunction
+
+  protected function rdma_status project_ticket_value(
+    rdma_cmq_ticket source,
+    string copy_label,
+    output rdma_cmq_ticket result
+  );
+    rdma_status status;
+
+    result = null;
+    if (source == null)
+      return rdma_status::success();
+    result = new({copy_label, "_ticket"});
+    status = project_function_handle_value(
+      source.function_h, {copy_label, "_function"}, result.function_h
+    );
+    if (!status.ok()) begin
+      result = null;
+      return status;
+    end
+    status = project_handle_value(source.cmq_h, {copy_label, "_cmq"},
+                                  result.cmq_h);
+    if (!status.ok()) begin
+      result = null;
+      return status;
+    end
+    status = project_opcode_value(source.opcode_key, {copy_label, "_opcode"},
+                                  result.opcode_key);
+    if (!status.ok()) begin
+      result = null;
+      return status;
+    end
+    result.command_id = source.command_id;
+    result.slot_sequence = source.slot_sequence;
+    result.sq_index = source.sq_index;
+    result.sq_wrap = source.sq_wrap;
+    result.absolute_deadline = source.absolute_deadline;
+    return rdma_status::success();
+  endfunction
+
+  protected function rdma_status project_recovery_value(
+    rdma_recovery_record source,
+    string copy_label,
+    output rdma_recovery_record result
+  );
+    rdma_backing_ref backing_copy;
+    rdma_hmc_ref hmc_copy;
+    rdma_status status_copy;
+    rdma_status status;
+
+    result = null;
+    if (source == null)
+      return rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT,
+        {copy_label, " recovery record is null"}
+      );
+    result = new({copy_label, "_recovery"});
+    status = project_handle_value(source.resource_h,
+                                  {copy_label, "_resource"},
+                                  result.resource_h);
+    if (!status.ok()) begin
+      result = null;
+      return status;
+    end
+    result.hardware_presence = source.hardware_presence;
+    result.completed_steps = source.completed_steps;
+    result.pending_steps = source.pending_steps;
+    result.backing_refs.delete();
+    foreach (source.backing_refs[i]) begin
+      status = project_backing_ref_value(
+        source.backing_refs[i], $sformatf("%s_backing_%0d", copy_label, i),
+        backing_copy
+      );
+      if (!status.ok()) begin
+        result = null;
+        return status;
+      end
+      result.backing_refs.push_back(backing_copy);
+    end
+    result.hmc_refs.delete();
+    foreach (source.hmc_refs[i]) begin
+      status = project_hmc_ref_value(
+        source.hmc_refs[i], $sformatf("%s_hmc_%0d", copy_label, i), hmc_copy
+      );
+      if (!status.ok()) begin
+        result = null;
+        return status;
+      end
+      result.hmc_refs.push_back(hmc_copy);
+    end
+    status = project_ticket_value(source.ambiguous_ticket,
+                                  {copy_label, "_ticket"},
+                                  result.ambiguous_ticket);
+    if (!status.ok()) begin
+      result = null;
+      return status;
+    end
+    status = project_status_value(source.primary_status,
+                                  {copy_label, "_primary"},
+                                  result.primary_status);
+    if (!status.ok()) begin
+      result = null;
+      return status;
+    end
+    result.rollback_statuses.delete();
+    foreach (source.rollback_statuses[i]) begin
+      status = project_status_value(
+        source.rollback_statuses[i],
+        $sformatf("%s_rollback_%0d", copy_label, i), status_copy
+      );
+      if (!status.ok()) begin
+        result = null;
+        return status;
+      end
+      result.rollback_statuses.push_back(status_copy);
+    end
+    return rdma_status::success();
+  endfunction
+
+  protected function rdma_status project_resource_base_fields(
+    rdma_resource source,
+    string copy_label,
+    rdma_resource result
+  );
+    rdma_backing_ref backing_copy;
+    rdma_hmc_ref hmc_copy;
+    rdma_handle dependency_copy;
+    rdma_status status;
+
+    status = project_handle_value(source.handle, {copy_label, "_handle"},
+                                  result.handle);
+    if (!status.ok())
+      return status;
+    status = project_function_handle_value(
+      source.owner, {copy_label, "_owner"}, result.owner
+    );
+    if (!status.ok())
+      return status;
+    result.state = source.state;
+    result.hmc_fvm_addr = source.hmc_fvm_addr;
+    result.hmc_fvm_addr_valid = source.hmc_fvm_addr_valid;
+    result.backing_refs.delete();
+    foreach (source.backing_refs[i]) begin
+      status = project_backing_ref_value(
+        source.backing_refs[i], $sformatf("%s_backing_%0d", copy_label, i),
+        backing_copy
+      );
+      if (!status.ok())
+        return status;
+      result.backing_refs.push_back(backing_copy);
+    end
+    result.hmc_refs.delete();
+    foreach (source.hmc_refs[i]) begin
+      status = project_hmc_ref_value(
+        source.hmc_refs[i], $sformatf("%s_hmc_%0d", copy_label, i), hmc_copy
+      );
+      if (!status.ok())
+        return status;
+      result.hmc_refs.push_back(hmc_copy);
+    end
+    result.dependencies.delete();
+    foreach (source.dependencies[i]) begin
+      status = project_handle_value(
+        source.dependencies[i],
+        $sformatf("%s_dependency_%0d", copy_label, i), dependency_copy
+      );
+      if (!status.ok())
+        return status;
+      result.dependencies.push_back(dependency_copy);
+    end
+    result.outstanding_ids = source.outstanding_ids;
+    return rdma_status::success();
+  endfunction
+
+  protected function void project_queue_fields(
+    rdma_queue_resource source,
+    rdma_queue_resource result
+  );
+    result.depth = source.depth;
+    result.producer_index = source.producer_index;
+    result.consumer_index = source.consumer_index;
+    result.producer_wrap = source.producer_wrap;
+    result.consumer_wrap = source.consumer_wrap;
+    result.queue_iova = source.queue_iova;
+  endfunction
+
+  protected function rdma_status project_resource_value(
+    rdma_resource source,
+    string copy_label,
+    output rdma_resource result
+  );
+    rdma_function source_function;
+    rdma_function result_function;
+    rdma_pd source_pd;
+    rdma_pd result_pd;
+    rdma_mr source_mr;
+    rdma_mr result_mr;
+    rdma_cq source_cq;
+    rdma_cq result_cq;
+    rdma_qp source_qp;
+    rdma_qp result_qp;
+    rdma_srq source_srq;
+    rdma_srq result_srq;
+    rdma_cmq source_cmq;
+    rdma_cmq result_cmq;
+    rdma_ceq source_ceq;
+    rdma_ceq result_ceq;
+    rdma_aeq source_aeq;
+    rdma_aeq result_aeq;
+    rdma_status status;
+
+    result = null;
+    if (source == null || source.handle == null ||
+        !valid_kind(source.handle.kind))
+      return rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT,
+        {copy_label, " resource carrier is structurally incompatible"}
+      );
+
+    case (source.handle.kind)
+      RDMA_RESOURCE_FUNCTION: begin
+        if (!$cast(source_function, source))
+          return rdma_status::make(
+            RDMA_SC_INVALID_ARGUMENT,
+            {copy_label, " Function carrier does not match handle kind"}
+          );
+        result_function = new({copy_label, "_function"});
+        result_function.binding = null;
+        result = result_function;
+      end
+      RDMA_RESOURCE_PD: begin
+        if (!$cast(source_pd, source))
+          return rdma_status::make(
+            RDMA_SC_INVALID_ARGUMENT,
+            {copy_label, " PD carrier does not match handle kind"}
+          );
+        result_pd = new({copy_label, "_pd"});
+        result = result_pd;
+      end
+      RDMA_RESOURCE_MR: begin
+        if (!$cast(source_mr, source))
+          return rdma_status::make(
+            RDMA_SC_INVALID_ARGUMENT,
+            {copy_label, " MR carrier does not match handle kind"}
+          );
+        result_mr = new({copy_label, "_mr"});
+        result = result_mr;
+      end
+      RDMA_RESOURCE_CQ: begin
+        if (!$cast(source_cq, source))
+          return rdma_status::make(
+            RDMA_SC_INVALID_ARGUMENT,
+            {copy_label, " CQ carrier does not match handle kind"}
+          );
+        result_cq = new({copy_label, "_cq"});
+        result = result_cq;
+      end
+      RDMA_RESOURCE_QP: begin
+        if (!$cast(source_qp, source))
+          return rdma_status::make(
+            RDMA_SC_INVALID_ARGUMENT,
+            {copy_label, " QP carrier does not match handle kind"}
+          );
+        result_qp = new({copy_label, "_qp"});
+        result = result_qp;
+      end
+      RDMA_RESOURCE_SRQ: begin
+        if (!$cast(source_srq, source))
+          return rdma_status::make(
+            RDMA_SC_INVALID_ARGUMENT,
+            {copy_label, " SRQ carrier does not match handle kind"}
+          );
+        result_srq = new({copy_label, "_srq"});
+        result = result_srq;
+      end
+      RDMA_RESOURCE_CMQ: begin
+        if (!$cast(source_cmq, source))
+          return rdma_status::make(
+            RDMA_SC_INVALID_ARGUMENT,
+            {copy_label, " CMQ carrier does not match handle kind"}
+          );
+        result_cmq = new({copy_label, "_cmq"});
+        result = result_cmq;
+      end
+      RDMA_RESOURCE_CEQ: begin
+        if (!$cast(source_ceq, source))
+          return rdma_status::make(
+            RDMA_SC_INVALID_ARGUMENT,
+            {copy_label, " CEQ carrier does not match handle kind"}
+          );
+        result_ceq = new({copy_label, "_ceq"});
+        result = result_ceq;
+      end
+      RDMA_RESOURCE_AEQ: begin
+        if (!$cast(source_aeq, source))
+          return rdma_status::make(
+            RDMA_SC_INVALID_ARGUMENT,
+            {copy_label, " AEQ carrier does not match handle kind"}
+          );
+        result_aeq = new({copy_label, "_aeq"});
+        result = result_aeq;
+      end
+      default:
+        return rdma_status::make(
+          RDMA_SC_INVALID_ARGUMENT,
+          {copy_label, " resource kind is invalid"}
+        );
+    endcase
+
+    status = project_resource_base_fields(source, copy_label, result);
+    if (!status.ok()) begin
+      result = null;
+      return status;
+    end
+
+    case (source.handle.kind)
+      RDMA_RESOURCE_FUNCTION: begin
+        result_function.local_function_id = source_function.local_function_id;
+        result_function.global_function_id =
+          source_function.global_function_id;
+        result_function.rdma_vf_id = source_function.rdma_vf_id;
+        result_function.vsi_id = source_function.vsi_id;
+        result_function.pfvf_id = source_function.pfvf_id;
+        status = project_binding_value(
+          source_function.binding, {copy_label, "_binding"},
+          result_function.binding
+        );
+      end
+      RDMA_RESOURCE_PD: begin
+        result_pd.local_pd_id = source_pd.local_pd_id;
+        result_pd.global_pd_id = source_pd.global_pd_id;
+      end
+      RDMA_RESOURCE_MR: begin
+        result_mr.local_mr_id = source_mr.local_mr_id;
+        result_mr.global_mr_id = source_mr.global_mr_id;
+        status = project_handle_value(
+          source_mr.pd_h, {copy_label, "_pd"}, result_mr.pd_h
+        );
+        result_mr.iova = source_mr.iova;
+        result_mr.length = source_mr.length;
+        result_mr.lkey = source_mr.lkey;
+        result_mr.rkey = source_mr.rkey;
+        result_mr.access = source_mr.access;
+        result_mr.mr_serial = source_mr.mr_serial;
+      end
+      RDMA_RESOURCE_CQ: begin
+        project_queue_fields(source_cq, result_cq);
+        result_cq.local_cq_id = source_cq.local_cq_id;
+        result_cq.global_cq_id = source_cq.global_cq_id;
+        status = project_handle_value(
+          source_cq.ceq_h, {copy_label, "_ceq"}, result_cq.ceq_h
+        );
+      end
+      RDMA_RESOURCE_QP: begin
+        result_qp.local_qp_id = source_qp.local_qp_id;
+        result_qp.global_qp_id = source_qp.global_qp_id;
+        result_qp.transport = source_qp.transport;
+        result_qp.qp_state = source_qp.qp_state;
+        result_qp.sq_depth = source_qp.sq_depth;
+        result_qp.rq_depth = source_qp.rq_depth;
+        result_qp.sq_producer_index = source_qp.sq_producer_index;
+        result_qp.sq_consumer_index = source_qp.sq_consumer_index;
+        result_qp.sq_wrap = source_qp.sq_wrap;
+        result_qp.sq_consumer_wrap = source_qp.sq_consumer_wrap;
+        result_qp.rq_producer_index = source_qp.rq_producer_index;
+        result_qp.rq_consumer_index = source_qp.rq_consumer_index;
+        result_qp.rq_wrap = source_qp.rq_wrap;
+        result_qp.rq_consumer_wrap = source_qp.rq_consumer_wrap;
+        result_qp.sq_iova = source_qp.sq_iova;
+        result_qp.rq_iova = source_qp.rq_iova;
+        status = project_handle_value(
+          source_qp.pd_h, {copy_label, "_pd"}, result_qp.pd_h
+        );
+        if (status.ok())
+          status = project_handle_value(
+            source_qp.send_cq_h, {copy_label, "_send_cq"},
+            result_qp.send_cq_h
+          );
+        if (status.ok())
+          status = project_handle_value(
+            source_qp.recv_cq_h, {copy_label, "_recv_cq"},
+            result_qp.recv_cq_h
+          );
+        if (status.ok())
+          status = project_handle_value(
+            source_qp.srq_h, {copy_label, "_srq"}, result_qp.srq_h
+          );
+      end
+      RDMA_RESOURCE_SRQ: begin
+        project_queue_fields(source_srq, result_srq);
+        result_srq.local_srq_id = source_srq.local_srq_id;
+        result_srq.global_srq_id = source_srq.global_srq_id;
+        result_srq.max_sge = source_srq.max_sge;
+        status = project_handle_value(
+          source_srq.pd_h, {copy_label, "_pd"}, result_srq.pd_h
+        );
+      end
+      RDMA_RESOURCE_CMQ: begin
+        project_queue_fields(source_cmq, result_cmq);
+        result_cmq.local_cmq_id = source_cmq.local_cmq_id;
+        result_cmq.global_cmq_id = source_cmq.global_cmq_id;
+        result_cmq.completion_producer_index =
+          source_cmq.completion_producer_index;
+        result_cmq.completion_consumer_index =
+          source_cmq.completion_consumer_index;
+        result_cmq.completion_wrap = source_cmq.completion_wrap;
+        result_cmq.completion_consumer_wrap =
+          source_cmq.completion_consumer_wrap;
+        result_cmq.completion_iova = source_cmq.completion_iova;
+      end
+      RDMA_RESOURCE_CEQ: begin
+        project_queue_fields(source_ceq, result_ceq);
+        result_ceq.local_ceq_id = source_ceq.local_ceq_id;
+        result_ceq.global_ceq_id = source_ceq.global_ceq_id;
+      end
+      RDMA_RESOURCE_AEQ: begin
+        project_queue_fields(source_aeq, result_aeq);
+        result_aeq.local_aeq_id = source_aeq.local_aeq_id;
+        result_aeq.global_aeq_id = source_aeq.global_aeq_id;
+      end
+    endcase
+
+    if (status == null || !status.ok()) begin
+      result = null;
+      if (status == null)
+        return rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          {copy_label, " projection returned null status"}
+        );
+      return status;
+    end
+    return rdma_status::success();
   endfunction
 
   protected function rdma_status registry_schema_status(string operation);
+    rdma_resource projected;
+    rdma_status status;
+
     foreach (registry[key]) begin
-      if (!exact_resource_schema(registry[key]))
-        return rdma_status::make(
-          RDMA_SC_INVALID_ARGUMENT,
-          {operation, " registry entry is outside the trusted schema"}
-        );
+      status = project_resource_value(
+        registry[key], {operation, "_registry_entry"}, projected
+      );
+      if (!status.ok())
+        return status;
+      registry[key] = projected;
     end
     return rdma_status::success();
   endfunction
 
   protected function rdma_status recovery_schema_status(string operation);
+    rdma_recovery_record projected;
+    rdma_status status;
+
     foreach (recovery_records[key]) begin
-      if (!exact_recovery_schema(recovery_records[key]))
-        return rdma_status::make(
-          RDMA_SC_INVALID_ARGUMENT,
-          {operation, " recovery entry is outside the trusted schema"}
-        );
+      status = project_recovery_value(
+        recovery_records[key], {operation, "_recovery_entry"}, projected
+      );
+      if (!status.ok())
+        return status;
+      recovery_records[key] = projected;
     end
     return rdma_status::success();
   endfunction
@@ -364,65 +861,16 @@ class rdma_resource_manager extends uvm_object;
     string key,
     string operation
   );
-    if (recovery_records.exists(key) &&
-        !exact_recovery_schema(recovery_records[key]))
-      return rdma_status::make(
-        RDMA_SC_INVALID_ARGUMENT,
-        {operation, " recovery entry is outside the trusted schema"}
-      );
-    return rdma_status::success();
-  endfunction
+    rdma_recovery_record projected;
+    rdma_status status;
 
-  protected function rdma_status clone_resource_value(
-    rdma_resource source,
-    string copy_label,
-    output rdma_resource result
-  );
-    uvm_object cloned_object;
-
-    result = null;
-    if (!exact_resource_schema(source))
-      return rdma_status::make(
-        RDMA_SC_INVALID_ARGUMENT,
-        {copy_label, " resource is outside the trusted schema"}
+    if (recovery_records.exists(key)) begin
+      status = project_recovery_value(
+        recovery_records[key], {operation, "_recovery_entry"}, projected
       );
-    cloned_object = source.clone();
-    if (cloned_object == null || cloned_object == source ||
-        !$cast(result, cloned_object) || !exact_resource_schema(result) ||
-        !same_resource_value(result, source) ||
-        !resource_graph_detached(result, source)) begin
-      result = null;
-      return rdma_status::make(
-        RDMA_SC_INVALID_ARGUMENT,
-        {copy_label, " resource clone violated the trusted schema"}
-      );
-    end
-    return rdma_status::success();
-  endfunction
-
-  protected function rdma_status clone_recovery_value(
-    rdma_recovery_record source,
-    string copy_label,
-    output rdma_recovery_record result
-  );
-    uvm_object cloned_object;
-
-    result = null;
-    if (!exact_recovery_schema(source))
-      return rdma_status::make(
-        RDMA_SC_INVALID_ARGUMENT,
-        {copy_label, " recovery record is outside the trusted schema"}
-      );
-    cloned_object = source.clone();
-    if (cloned_object == null || cloned_object == source ||
-        !$cast(result, cloned_object) || !exact_recovery_schema(result) ||
-        !same_recovery_value(result, source) ||
-        !recovery_graph_detached(result, source)) begin
-      result = null;
-      return rdma_status::make(
-        RDMA_SC_INVALID_ARGUMENT,
-        {copy_label, " recovery clone violated the trusted schema"}
-      );
+      if (!status.ok())
+        return status;
+      recovery_records[key] = projected;
     end
     return rdma_status::success();
   endfunction
@@ -445,15 +893,15 @@ class rdma_resource_manager extends uvm_object;
                                                rdma_handle rhs);
     if (lhs == null || rhs == null)
       return lhs == rhs;
-    return lhs.same_instance(rhs);
+    return lhs.kind == rhs.kind &&
+           lhs.function_uid == rhs.function_uid &&
+           lhs.object_id == rhs.object_id &&
+           lhs.generation == rhs.generation;
   endfunction
 
   protected function bit same_handle_value(rdma_handle lhs,
                                             rdma_handle rhs);
-    if (lhs == null || rhs == null)
-      return lhs == rhs;
-    return lhs.get_object_type() == rhs.get_object_type() &&
-           lhs.same_instance(rhs);
+    return same_handle_instance(lhs, rhs);
   endfunction
 
   protected function bit same_dependency_topology(rdma_resource lhs,
@@ -472,8 +920,7 @@ class rdma_resource_manager extends uvm_object;
                                                rdma_function_binding rhs);
     if (lhs == null || rhs == null)
       return lhs == rhs;
-    if (lhs.get_object_type() != rhs.get_object_type() ||
-        lhs.function_uid != rhs.function_uid ||
+    if (lhs.function_uid != rhs.function_uid ||
         lhs.notify_bar_id != rhs.notify_bar_id ||
         lhs.notify_base != rhs.notify_base ||
         lhs.notify_size != rhs.notify_size ||
@@ -494,8 +941,7 @@ class rdma_resource_manager extends uvm_object;
       return 1'b0;
     if (lhs.pcie == null || rhs.pcie == null)
       return lhs.pcie == rhs.pcie;
-    if (lhs.pcie.get_object_type() != rhs.pcie.get_object_type() ||
-        lhs.pcie.bdf != rhs.pcie.bdf ||
+    if (lhs.pcie.bdf != rhs.pcie.bdf ||
         lhs.pcie.parent_pf_bdf != rhs.pcie.parent_pf_bdf ||
         lhs.pcie.vf_index != rhs.pcie.vf_index ||
         lhs.pcie.mse != rhs.pcie.mse || lhs.pcie.bme != rhs.pcie.bme)
@@ -505,9 +951,7 @@ class rdma_resource_manager extends uvm_object;
         if (lhs.pcie.bar[i] != rhs.pcie.bar[i])
           return 1'b0;
       end
-      else if (lhs.pcie.bar[i].get_object_type() !=
-                 rhs.pcie.bar[i].get_object_type() ||
-               lhs.pcie.bar[i].bar_id != rhs.pcie.bar[i].bar_id ||
+      else if (lhs.pcie.bar[i].bar_id != rhs.pcie.bar[i].bar_id ||
                lhs.pcie.bar[i].base != rhs.pcie.bar[i].base ||
                lhs.pcie.bar[i].size != rhs.pcie.bar[i].size ||
                lhs.pcie.bar[i].enabled != rhs.pcie.bar[i].enabled)
@@ -541,8 +985,8 @@ class rdma_resource_manager extends uvm_object;
     bit fields_match;
 
     if (candidate == null || authoritative == null ||
-        candidate.get_object_type() != authoritative.get_object_type() ||
-        candidate.resource_kind() != authoritative.resource_kind() ||
+        candidate.handle == null || authoritative.handle == null ||
+        candidate.handle.kind != authoritative.handle.kind ||
         !same_handle_instance(candidate.handle, authoritative.handle) ||
         !same_handle_instance(candidate.owner, authoritative.owner) ||
         !same_dependency_topology(candidate, authoritative) ||
@@ -553,7 +997,7 @@ class rdma_resource_manager extends uvm_object;
       );
 
     fields_match = 1'b0;
-    case (authoritative.resource_kind())
+    case (authoritative.handle.kind)
       RDMA_RESOURCE_FUNCTION: begin
         if ($cast(candidate_function, candidate) &&
             $cast(authoritative_function, authoritative))
@@ -648,14 +1092,14 @@ class rdma_resource_manager extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  protected function rdma_status clone_public_resource_value(
+  protected function rdma_status project_public_resource_value(
     rdma_resource source,
     string copy_label,
     output rdma_resource result
   );
     rdma_status status;
 
-    status = clone_resource_value(source, copy_label, result);
+    status = project_resource_value(source, copy_label, result);
     if (!status.ok())
       return status;
     status = publication_identity_status(result, source);
@@ -666,495 +1110,12 @@ class rdma_resource_manager extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  protected function bit same_status_value(rdma_status lhs,
-                                            rdma_status rhs);
-    if (lhs == null || rhs == null)
-      return lhs == rhs;
-    return lhs.get_object_type() == rhs.get_object_type() &&
-           lhs.category == rhs.category && lhs.code == rhs.code &&
-           lhs.hardware_code == rhs.hardware_code &&
-           lhs.hardware_code_valid == rhs.hardware_code_valid &&
-           lhs.source_engine == rhs.source_engine &&
-           lhs.function_uid == rhs.function_uid &&
-           lhs.generation == rhs.generation &&
-           lhs.resource_id == rhs.resource_id &&
-           lhs.command_id == rhs.command_id && lhs.wr_id == rhs.wr_id &&
-           lhs.severity == rhs.severity && lhs.retryable == rhs.retryable &&
-           lhs.message == rhs.message;
-  endfunction
-
-  protected function bit same_ticket_value(rdma_cmq_ticket lhs,
-                                            rdma_cmq_ticket rhs);
-    if (lhs == null || rhs == null)
-      return lhs == rhs;
-    if (lhs.get_object_type() != rhs.get_object_type() ||
-        lhs.command_id != rhs.command_id ||
-        !same_handle_value(lhs.function_h, rhs.function_h) ||
-        !same_handle_value(lhs.cmq_h, rhs.cmq_h) ||
-        lhs.slot_sequence != rhs.slot_sequence ||
-        lhs.sq_index != rhs.sq_index || lhs.sq_wrap != rhs.sq_wrap ||
-        lhs.absolute_deadline != rhs.absolute_deadline)
-      return 1'b0;
-    if (lhs.opcode_key == null || rhs.opcode_key == null)
-      return lhs.opcode_key == rhs.opcode_key;
-    return lhs.opcode_key.get_object_type() ==
-             rhs.opcode_key.get_object_type() &&
-           lhs.opcode_key.profile_name == rhs.opcode_key.profile_name &&
-           lhs.opcode_key.opcode == rhs.opcode_key.opcode &&
-           lhs.opcode_key.variant == rhs.opcode_key.variant;
-  endfunction
-
-  protected function bit same_mapping_value(rdma_dma_mapping lhs,
-                                             rdma_dma_mapping rhs);
-    if (lhs == null || rhs == null)
-      return lhs == rhs;
-    if (lhs.get_object_type() != rhs.get_object_type() ||
-        !same_handle_instance(lhs.function_h, rhs.function_h) ||
-        !same_handle_instance(lhs.owner_h, rhs.owner_h))
-      return 1'b0;
-    if (lhs.function_h != null &&
-        lhs.function_h.get_object_type() != rhs.function_h.get_object_type())
-      return 1'b0;
-    if (lhs.owner_h != null &&
-        lhs.owner_h.get_object_type() != rhs.owner_h.get_object_type())
-      return 1'b0;
-    return lhs.requester_bdf == rhs.requester_bdf &&
-           lhs.pasid_valid == rhs.pasid_valid && lhs.pasid == rhs.pasid &&
-           lhs.backing_addr == rhs.backing_addr && lhs.iova == rhs.iova &&
-           lhs.size == rhs.size && lhs.direction == rhs.direction &&
-           lhs.permissions == rhs.permissions && lhs.state == rhs.state;
-  endfunction
-
-  protected function bit same_backing_ref_value(rdma_backing_ref lhs,
-                                                 rdma_backing_ref rhs);
-    if (lhs == null || rhs == null)
-      return lhs == rhs;
-    return lhs.get_object_type() == rhs.get_object_type() &&
-           lhs.ownership == rhs.ownership &&
-           lhs.release_complete == rhs.release_complete &&
-           same_mapping_value(lhs.mapping, rhs.mapping);
-  endfunction
-
-  protected function bit same_hmc_ref_value(rdma_hmc_ref lhs,
-                                             rdma_hmc_ref rhs);
-    if (lhs == null || rhs == null)
-      return lhs == rhs;
-    if (lhs.get_object_type() != rhs.get_object_type() ||
-        !same_handle_instance(lhs.owner, rhs.owner))
-      return 1'b0;
-    if (lhs.owner != null &&
-        lhs.owner.get_object_type() != rhs.owner.get_object_type())
-      return 1'b0;
-    return lhs.object_kind == rhs.object_kind &&
-           lhs.address == rhs.address && lhs.size == rhs.size &&
-           lhs.first_pbl_index == rhs.first_pbl_index &&
-           lhs.ownership == rhs.ownership &&
-           lhs.release_complete == rhs.release_complete;
-  endfunction
-
-  protected function bit same_resource_base_value(rdma_resource lhs,
-                                                   rdma_resource rhs);
-    if (lhs == null || rhs == null)
-      return lhs == rhs;
-    if (lhs.get_object_type() != rhs.get_object_type() ||
-        lhs.resource_kind() != rhs.resource_kind() ||
-        !same_handle_value(lhs.handle, rhs.handle) ||
-        !same_handle_value(lhs.owner, rhs.owner) ||
-        lhs.state != rhs.state ||
-        lhs.hmc_fvm_addr != rhs.hmc_fvm_addr ||
-        lhs.hmc_fvm_addr_valid != rhs.hmc_fvm_addr_valid ||
-        lhs.backing_refs.size() != rhs.backing_refs.size() ||
-        lhs.hmc_refs.size() != rhs.hmc_refs.size() ||
-        lhs.dependencies.size() != rhs.dependencies.size() ||
-        lhs.outstanding_ids.size() != rhs.outstanding_ids.size())
-      return 1'b0;
-    foreach (lhs.backing_refs[i]) begin
-      if (!same_backing_ref_value(lhs.backing_refs[i],
-                                  rhs.backing_refs[i]))
-        return 1'b0;
-    end
-    foreach (lhs.hmc_refs[i]) begin
-      if (!same_hmc_ref_value(lhs.hmc_refs[i], rhs.hmc_refs[i]))
-        return 1'b0;
-    end
-    foreach (lhs.dependencies[i]) begin
-      if (!same_handle_value(lhs.dependencies[i], rhs.dependencies[i]))
-        return 1'b0;
-    end
-    foreach (lhs.outstanding_ids[i]) begin
-      if (lhs.outstanding_ids[i] != rhs.outstanding_ids[i])
-        return 1'b0;
-    end
-    return 1'b1;
-  endfunction
-
-  protected function bit same_queue_resource_value(rdma_resource lhs,
-                                                    rdma_resource rhs);
-    rdma_queue_resource lhs_queue;
-    rdma_queue_resource rhs_queue;
-
-    if (!$cast(lhs_queue, lhs) || !$cast(rhs_queue, rhs))
-      return 1'b0;
-    return lhs_queue.depth == rhs_queue.depth &&
-           lhs_queue.producer_index == rhs_queue.producer_index &&
-           lhs_queue.consumer_index == rhs_queue.consumer_index &&
-           lhs_queue.producer_wrap == rhs_queue.producer_wrap &&
-           lhs_queue.consumer_wrap == rhs_queue.consumer_wrap &&
-           lhs_queue.queue_iova == rhs_queue.queue_iova;
-  endfunction
-
-  protected function bit same_resource_value(rdma_resource lhs,
-                                              rdma_resource rhs);
-    rdma_function lhs_function;
-    rdma_function rhs_function;
-    rdma_pd lhs_pd;
-    rdma_pd rhs_pd;
-    rdma_mr lhs_mr;
-    rdma_mr rhs_mr;
-    rdma_cq lhs_cq;
-    rdma_cq rhs_cq;
-    rdma_qp lhs_qp;
-    rdma_qp rhs_qp;
-    rdma_srq lhs_srq;
-    rdma_srq rhs_srq;
-    rdma_cmq lhs_cmq;
-    rdma_cmq rhs_cmq;
-    rdma_ceq lhs_ceq;
-    rdma_ceq rhs_ceq;
-    rdma_aeq lhs_aeq;
-    rdma_aeq rhs_aeq;
-
-    if (!same_resource_base_value(lhs, rhs))
-      return 1'b0;
-    case (rhs.resource_kind())
-      RDMA_RESOURCE_FUNCTION: begin
-        if (!$cast(lhs_function, lhs) || !$cast(rhs_function, rhs))
-          return 1'b0;
-        return lhs_function.local_function_id ==
-                 rhs_function.local_function_id &&
-               lhs_function.global_function_id ==
-                 rhs_function.global_function_id &&
-               lhs_function.rdma_vf_id == rhs_function.rdma_vf_id &&
-               lhs_function.vsi_id == rhs_function.vsi_id &&
-               lhs_function.pfvf_id == rhs_function.pfvf_id &&
-               same_binding_identity(lhs_function.binding,
-                                     rhs_function.binding);
-      end
-      RDMA_RESOURCE_PD: begin
-        if (!$cast(lhs_pd, lhs) || !$cast(rhs_pd, rhs))
-          return 1'b0;
-        return lhs_pd.local_pd_id == rhs_pd.local_pd_id &&
-               lhs_pd.global_pd_id == rhs_pd.global_pd_id;
-      end
-      RDMA_RESOURCE_MR: begin
-        if (!$cast(lhs_mr, lhs) || !$cast(rhs_mr, rhs))
-          return 1'b0;
-        return lhs_mr.local_mr_id == rhs_mr.local_mr_id &&
-               lhs_mr.global_mr_id == rhs_mr.global_mr_id &&
-               same_handle_value(lhs_mr.pd_h, rhs_mr.pd_h) &&
-               lhs_mr.iova == rhs_mr.iova &&
-               lhs_mr.length == rhs_mr.length &&
-               lhs_mr.lkey == rhs_mr.lkey &&
-               lhs_mr.rkey == rhs_mr.rkey &&
-               lhs_mr.access == rhs_mr.access &&
-               lhs_mr.mr_serial == rhs_mr.mr_serial;
-      end
-      RDMA_RESOURCE_CQ: begin
-        if (!$cast(lhs_cq, lhs) || !$cast(rhs_cq, rhs))
-          return 1'b0;
-        return same_queue_resource_value(lhs, rhs) &&
-               lhs_cq.local_cq_id == rhs_cq.local_cq_id &&
-               lhs_cq.global_cq_id == rhs_cq.global_cq_id &&
-               same_handle_value(lhs_cq.ceq_h, rhs_cq.ceq_h);
-      end
-      RDMA_RESOURCE_QP: begin
-        if (!$cast(lhs_qp, lhs) || !$cast(rhs_qp, rhs))
-          return 1'b0;
-        return lhs_qp.local_qp_id == rhs_qp.local_qp_id &&
-               lhs_qp.global_qp_id == rhs_qp.global_qp_id &&
-               lhs_qp.transport == rhs_qp.transport &&
-               lhs_qp.qp_state == rhs_qp.qp_state &&
-               lhs_qp.sq_depth == rhs_qp.sq_depth &&
-               lhs_qp.rq_depth == rhs_qp.rq_depth &&
-               lhs_qp.sq_producer_index == rhs_qp.sq_producer_index &&
-               lhs_qp.sq_consumer_index == rhs_qp.sq_consumer_index &&
-               lhs_qp.sq_wrap == rhs_qp.sq_wrap &&
-               lhs_qp.sq_consumer_wrap == rhs_qp.sq_consumer_wrap &&
-               lhs_qp.rq_producer_index == rhs_qp.rq_producer_index &&
-               lhs_qp.rq_consumer_index == rhs_qp.rq_consumer_index &&
-               lhs_qp.rq_wrap == rhs_qp.rq_wrap &&
-               lhs_qp.rq_consumer_wrap == rhs_qp.rq_consumer_wrap &&
-               lhs_qp.sq_iova == rhs_qp.sq_iova &&
-               lhs_qp.rq_iova == rhs_qp.rq_iova &&
-               same_handle_value(lhs_qp.pd_h, rhs_qp.pd_h) &&
-               same_handle_value(lhs_qp.send_cq_h, rhs_qp.send_cq_h) &&
-               same_handle_value(lhs_qp.recv_cq_h, rhs_qp.recv_cq_h) &&
-               same_handle_value(lhs_qp.srq_h, rhs_qp.srq_h);
-      end
-      RDMA_RESOURCE_SRQ: begin
-        if (!$cast(lhs_srq, lhs) || !$cast(rhs_srq, rhs))
-          return 1'b0;
-        return same_queue_resource_value(lhs, rhs) &&
-               lhs_srq.local_srq_id == rhs_srq.local_srq_id &&
-               lhs_srq.global_srq_id == rhs_srq.global_srq_id &&
-               lhs_srq.max_sge == rhs_srq.max_sge &&
-               same_handle_value(lhs_srq.pd_h, rhs_srq.pd_h);
-      end
-      RDMA_RESOURCE_CMQ: begin
-        if (!$cast(lhs_cmq, lhs) || !$cast(rhs_cmq, rhs))
-          return 1'b0;
-        return same_queue_resource_value(lhs, rhs) &&
-               lhs_cmq.local_cmq_id == rhs_cmq.local_cmq_id &&
-               lhs_cmq.global_cmq_id == rhs_cmq.global_cmq_id &&
-               lhs_cmq.completion_producer_index ==
-                 rhs_cmq.completion_producer_index &&
-               lhs_cmq.completion_consumer_index ==
-                 rhs_cmq.completion_consumer_index &&
-               lhs_cmq.completion_wrap == rhs_cmq.completion_wrap &&
-               lhs_cmq.completion_consumer_wrap ==
-                 rhs_cmq.completion_consumer_wrap &&
-               lhs_cmq.completion_iova == rhs_cmq.completion_iova;
-      end
-      RDMA_RESOURCE_CEQ: begin
-        if (!$cast(lhs_ceq, lhs) || !$cast(rhs_ceq, rhs))
-          return 1'b0;
-        return same_queue_resource_value(lhs, rhs) &&
-               lhs_ceq.local_ceq_id == rhs_ceq.local_ceq_id &&
-               lhs_ceq.global_ceq_id == rhs_ceq.global_ceq_id;
-      end
-      RDMA_RESOURCE_AEQ: begin
-        if (!$cast(lhs_aeq, lhs) || !$cast(rhs_aeq, rhs))
-          return 1'b0;
-        return same_queue_resource_value(lhs, rhs) &&
-               lhs_aeq.local_aeq_id == rhs_aeq.local_aeq_id &&
-               lhs_aeq.global_aeq_id == rhs_aeq.global_aeq_id;
-      end
-      default: return 1'b0;
-    endcase
-  endfunction
-
-  protected function void collect_mapping_graph(
-    rdma_dma_mapping value,
-    ref uvm_object nodes[$]
-  );
-    if (value == null)
-      return;
-    nodes.push_back(value);
-    if (value.function_h != null)
-      nodes.push_back(value.function_h);
-    if (value.owner_h != null)
-      nodes.push_back(value.owner_h);
-  endfunction
-
-  protected function void collect_backing_ref_graph(
-    rdma_backing_ref value,
-    ref uvm_object nodes[$]
-  );
-    if (value == null)
-      return;
-    nodes.push_back(value);
-    collect_mapping_graph(value.mapping, nodes);
-  endfunction
-
-  protected function void collect_hmc_ref_graph(
-    rdma_hmc_ref value,
-    ref uvm_object nodes[$]
-  );
-    if (value == null)
-      return;
-    nodes.push_back(value);
-    if (value.owner != null)
-      nodes.push_back(value.owner);
-  endfunction
-
-  protected function void collect_resource_graph(
-    rdma_resource value,
-    ref uvm_object nodes[$]
-  );
-    rdma_function function_value;
-    rdma_mr mr_value;
-    rdma_cq cq_value;
-    rdma_qp qp_value;
-    rdma_srq srq_value;
-
-    if (value == null)
-      return;
-    nodes.push_back(value);
-    if (value.handle != null)
-      nodes.push_back(value.handle);
-    if (value.owner != null)
-      nodes.push_back(value.owner);
-    foreach (value.backing_refs[i])
-      collect_backing_ref_graph(value.backing_refs[i], nodes);
-    foreach (value.hmc_refs[i])
-      collect_hmc_ref_graph(value.hmc_refs[i], nodes);
-    foreach (value.dependencies[i]) begin
-      if (value.dependencies[i] != null)
-        nodes.push_back(value.dependencies[i]);
-    end
-    case (value.resource_kind())
-      RDMA_RESOURCE_FUNCTION: begin
-        if ($cast(function_value, value) && function_value.binding != null) begin
-          nodes.push_back(function_value.binding);
-          if (function_value.binding.owner_h != null)
-            nodes.push_back(function_value.binding.owner_h);
-          if (function_value.binding.pcie != null) begin
-            nodes.push_back(function_value.binding.pcie);
-            foreach (function_value.binding.pcie.bar[i]) begin
-              if (function_value.binding.pcie.bar[i] != null)
-                nodes.push_back(function_value.binding.pcie.bar[i]);
-            end
-          end
-        end
-      end
-      RDMA_RESOURCE_MR: begin
-        if ($cast(mr_value, value) && mr_value.pd_h != null)
-          nodes.push_back(mr_value.pd_h);
-      end
-      RDMA_RESOURCE_CQ: begin
-        if ($cast(cq_value, value) && cq_value.ceq_h != null)
-          nodes.push_back(cq_value.ceq_h);
-      end
-      RDMA_RESOURCE_QP: begin
-        if ($cast(qp_value, value)) begin
-          if (qp_value.pd_h != null)
-            nodes.push_back(qp_value.pd_h);
-          if (qp_value.send_cq_h != null)
-            nodes.push_back(qp_value.send_cq_h);
-          if (qp_value.recv_cq_h != null)
-            nodes.push_back(qp_value.recv_cq_h);
-          if (qp_value.srq_h != null)
-            nodes.push_back(qp_value.srq_h);
-        end
-      end
-      RDMA_RESOURCE_SRQ: begin
-        if ($cast(srq_value, value) && srq_value.pd_h != null)
-          nodes.push_back(srq_value.pd_h);
-      end
-    endcase
-  endfunction
-
-  protected function bit resource_graph_detached(rdma_resource result,
-                                                 rdma_resource source);
-    uvm_object result_nodes[$];
-    uvm_object source_nodes[$];
-
-    if (result == null || source == null)
-      return result == source;
-    collect_resource_graph(result, result_nodes);
-    collect_resource_graph(source, source_nodes);
-    foreach (result_nodes[i]) begin
-      foreach (source_nodes[j]) begin
-        if (result_nodes[i] == source_nodes[j])
-          return 1'b0;
-      end
-    end
-    return 1'b1;
-  endfunction
-
-  protected function bit same_recovery_value(rdma_recovery_record lhs,
-                                              rdma_recovery_record rhs);
-    if (lhs == null || rhs == null)
-      return lhs == rhs;
-    if (lhs.get_object_type() != rhs.get_object_type() ||
-        !same_handle_value(lhs.resource_h, rhs.resource_h) ||
-        lhs.hardware_presence != rhs.hardware_presence ||
-        lhs.completed_steps.size() != rhs.completed_steps.size() ||
-        lhs.pending_steps.size() != rhs.pending_steps.size() ||
-        lhs.backing_refs.size() != rhs.backing_refs.size() ||
-        lhs.hmc_refs.size() != rhs.hmc_refs.size() ||
-        lhs.rollback_statuses.size() != rhs.rollback_statuses.size() ||
-        !same_ticket_value(lhs.ambiguous_ticket, rhs.ambiguous_ticket) ||
-        !same_status_value(lhs.primary_status, rhs.primary_status))
-      return 1'b0;
-    foreach (lhs.completed_steps[i]) begin
-      if (lhs.completed_steps[i] != rhs.completed_steps[i])
-        return 1'b0;
-    end
-    foreach (lhs.pending_steps[i]) begin
-      if (lhs.pending_steps[i] != rhs.pending_steps[i])
-        return 1'b0;
-    end
-    foreach (lhs.backing_refs[i]) begin
-      if (!same_backing_ref_value(lhs.backing_refs[i],
-                                  rhs.backing_refs[i]))
-        return 1'b0;
-    end
-    foreach (lhs.hmc_refs[i]) begin
-      if (!same_hmc_ref_value(lhs.hmc_refs[i], rhs.hmc_refs[i]))
-        return 1'b0;
-    end
-    foreach (lhs.rollback_statuses[i]) begin
-      if (!same_status_value(lhs.rollback_statuses[i],
-                             rhs.rollback_statuses[i]))
-        return 1'b0;
-    end
-    return 1'b1;
-  endfunction
-
-  protected function void collect_ticket_graph(
-    rdma_cmq_ticket value,
-    ref uvm_object nodes[$]
-  );
-    if (value == null)
-      return;
-    nodes.push_back(value);
-    if (value.function_h != null)
-      nodes.push_back(value.function_h);
-    if (value.cmq_h != null)
-      nodes.push_back(value.cmq_h);
-    if (value.opcode_key != null)
-      nodes.push_back(value.opcode_key);
-  endfunction
-
-  protected function void collect_recovery_graph(
-    rdma_recovery_record value,
-    ref uvm_object nodes[$]
-  );
-    if (value == null)
-      return;
-    nodes.push_back(value);
-    if (value.resource_h != null)
-      nodes.push_back(value.resource_h);
-    foreach (value.backing_refs[i])
-      collect_backing_ref_graph(value.backing_refs[i], nodes);
-    foreach (value.hmc_refs[i])
-      collect_hmc_ref_graph(value.hmc_refs[i], nodes);
-    collect_ticket_graph(value.ambiguous_ticket, nodes);
-    if (value.primary_status != null)
-      nodes.push_back(value.primary_status);
-    foreach (value.rollback_statuses[i]) begin
-      if (value.rollback_statuses[i] != null)
-        nodes.push_back(value.rollback_statuses[i]);
-    end
-  endfunction
-
-  protected function bit recovery_graph_detached(
-    rdma_recovery_record result,
-    rdma_recovery_record source
-  );
-    uvm_object result_nodes[$];
-    uvm_object source_nodes[$];
-
-    if (result == null || source == null)
-      return result == source;
-    collect_recovery_graph(result, result_nodes);
-    collect_recovery_graph(source, source_nodes);
-    foreach (result_nodes[i]) begin
-      foreach (source_nodes[j]) begin
-        if (result_nodes[i] == source_nodes[j])
-          return 1'b0;
-      end
-    end
-    return 1'b1;
-  endfunction
-
-  protected function rdma_status clone_public_recovery_value(
+  protected function rdma_status project_public_recovery_value(
     rdma_recovery_record source,
     string copy_label,
     output rdma_recovery_record result
   );
-    return clone_recovery_value(source, copy_label, result);
+    return project_recovery_value(source, copy_label, result);
   endfunction
 
   protected function bit recovery_ready(rdma_recovery_record recovery);
@@ -1162,115 +1123,6 @@ class rdma_resource_manager extends uvm_object;
            recovery.hardware_presence == RDMA_HW_PRESENCE_ABSENT &&
            recovery.pending_steps.size() == 0;
   endfunction
-
-  protected function bit binding_graph_detached(
-    rdma_function_binding result,
-    rdma_function_binding source
-  );
-    uvm_object result_nodes[$];
-    uvm_object source_nodes[$];
-
-    if (result == null || source == null)
-      return 1'b0;
-    result_nodes.push_back(result);
-    source_nodes.push_back(source);
-    result_nodes.push_back(result.pcie);
-    source_nodes.push_back(source.pcie);
-    if (result.owner_h != null)
-      result_nodes.push_back(result.owner_h);
-    if (source.owner_h != null)
-      source_nodes.push_back(source.owner_h);
-    foreach (result.pcie.bar[i])
-      result_nodes.push_back(result.pcie.bar[i]);
-    foreach (source.pcie.bar[i])
-      source_nodes.push_back(source.pcie.bar[i]);
-    foreach (result_nodes[i]) begin
-      foreach (source_nodes[j]) begin
-        if (result_nodes[i] == source_nodes[j])
-          return 1'b0;
-      end
-    end
-    return 1'b1;
-  endfunction
-
-  protected function rdma_status clone_binding_value(
-    rdma_function_binding source,
-    string copy_label,
-    output rdma_function_binding result
-  );
-    uvm_object cloned_object;
-
-    result = null;
-    if (!exact_binding_schema(source))
-      return rdma_status::make(
-        RDMA_SC_INVALID_ARGUMENT,
-        {copy_label, " Function binding is outside the trusted schema"}
-      );
-    cloned_object = source.clone();
-    if (cloned_object == null || cloned_object == source ||
-        !$cast(result, cloned_object) || !exact_binding_schema(result) ||
-        !same_binding_identity(result, source) ||
-        !binding_graph_detached(result, source)) begin
-      result = null;
-      return rdma_status::make(
-        RDMA_SC_INVALID_ARGUMENT,
-        {copy_label, " Function binding clone violated the trusted schema"}
-      );
-    end
-    return rdma_status::success();
-  endfunction
-
-  protected function rdma_status copy_handle_value(
-    rdma_handle source,
-    string copy_label,
-    output rdma_handle result
-  );
-    rdma_function_handle function_result;
-
-    result = null;
-    if (source == null)
-      return rdma_status::success();
-    if (has_exact_object_type(source, rdma_handle::get_type())) begin
-      result = new({copy_label, "_handle"});
-    end
-    else if (exact_function_handle_schema(source)) begin
-      function_result = new({copy_label, "_function_handle"});
-      result = function_result;
-    end
-    else begin
-      return rdma_status::make(
-        RDMA_SC_INVALID_ARGUMENT,
-        {copy_label, " handle is outside the trusted schema"}
-      );
-    end
-    result.kind = source.kind;
-    result.function_uid = source.function_uid;
-    result.object_id = source.object_id;
-    result.generation = source.generation;
-    return rdma_status::success();
-  endfunction
-
-  protected function rdma_status copy_function_handle_value(
-    rdma_function_handle source,
-    string copy_label,
-    output rdma_function_handle result
-  );
-    result = null;
-    if (source == null)
-      return rdma_status::success();
-    if (!exact_function_handle_schema(source))
-      return rdma_status::make(
-        RDMA_SC_INVALID_ARGUMENT,
-        {copy_label, " Function handle is outside the trusted schema"}
-      );
-    result = new({copy_label, "_function_handle"});
-    result.kind = source.kind;
-    result.function_uid = source.function_uid;
-    result.object_id = source.object_id;
-    result.generation = source.generation;
-    return rdma_status::success();
-  endfunction
-
   protected function rdma_function_handle binding_handle_value(
     rdma_function_binding binding,
     string handle_name
@@ -1323,6 +1175,7 @@ class rdma_resource_manager extends uvm_object;
     output bit registration_needed
   );
     rdma_status status;
+    rdma_function_binding projected_binding;
     int unsigned observed_generation;
     bit source_is_known;
 
@@ -1333,19 +1186,18 @@ class rdma_resource_manager extends uvm_object;
     if (binding == null)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "function binding is null");
-    if (!exact_binding_schema(binding))
-      return rdma_status::make(
-        RDMA_SC_INVALID_ARGUMENT,
-        "Function binding graph is outside the trusted schema"
-      );
+    status = project_binding_value(binding, "binding input",
+                                   projected_binding);
+    if (!status.ok())
+      return status;
     status = registry_schema_status("binding context");
     if (!status.ok())
       return status;
 
     source_is_known = source_key(binding, key);
     if (!source_is_known) begin
-      key = $sformatf("%016h:%08h", binding.function_uid,
-                      binding.global_function_id);
+      key = $sformatf("%016h:%08h", projected_binding.function_uid,
+                      projected_binding.global_function_id);
       if (binding_snapshots.exists(key))
         return rdma_status::make(
           RDMA_SC_INVALID_ARGUMENT,
@@ -1354,7 +1206,7 @@ class rdma_resource_manager extends uvm_object;
     end
 
     if (!binding_snapshots.exists(key)) begin
-      status = binding.validate();
+      status = projected_binding.validate();
       if (status == null)
         return rdma_status::make(
           RDMA_SC_INVALID_STATE,
@@ -1362,21 +1214,19 @@ class rdma_resource_manager extends uvm_object;
         );
       if (!status.ok())
         return status;
-      if (binding.state != RDMA_BIND_ACTIVE)
+      if (projected_binding.state != RDMA_BIND_ACTIVE)
         return rdma_status::make(RDMA_SC_INVALID_STATE,
                                  "function binding is not ACTIVE");
-      status = clone_binding_value(binding, "new binding", trusted_binding);
-      if (!status.ok())
-        return status;
-      observed_generation = binding.generation;
+      trusted_binding = projected_binding;
+      observed_generation = projected_binding.generation;
       registration_needed = 1'b1;
     end
     else begin
-      status = clone_binding_value(binding_snapshots[key],
+      status = project_binding_value(binding_snapshots[key],
                                    "trusted binding", trusted_binding);
       if (!status.ok())
         return status;
-      observed_generation = binding.generation;
+      observed_generation = projected_binding.generation;
       if (!generation_high_water.exists(key))
         return rdma_status::make(RDMA_SC_INVALID_STATE,
                                  "Function generation ledger is missing");
@@ -1410,6 +1260,11 @@ class rdma_resource_manager extends uvm_object;
       return rdma_status::make(RDMA_SC_STALE_GENERATION,
                                "Function generation is retired");
     status = trusted_binding.validate();
+    if (status == null)
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "Trusted Function binding validation returned null"
+      );
     if (!status.ok())
       return status;
     if (trusted_binding.state != RDMA_BIND_ACTIVE)
@@ -1427,7 +1282,7 @@ class rdma_resource_manager extends uvm_object;
     rdma_function_binding binding_copy;
     rdma_status status;
 
-    status = clone_binding_value(trusted_binding, "binding registry",
+    status = project_binding_value(trusted_binding, "binding registry",
                                  binding_copy);
     if (!status.ok())
       return status;
@@ -1612,21 +1467,21 @@ class rdma_resource_manager extends uvm_object;
     rdma_status status;
 
     published = null;
-    status = clone_resource_value(resource, {copy_label, " registry"},
+    status = project_resource_value(resource, {copy_label, " registry"},
                                   registry_copy);
     if (!status.ok())
       return status;
-    status = clone_resource_value(registry_copy, copy_label, published);
+    status = project_resource_value(registry_copy, copy_label, published);
     if (!status.ok())
       return status;
-    status = copy_function_handle_value(resource.owner,
+    status = project_function_handle_value(resource.owner,
                                         "resource_incarnation_owner",
                                         owner_copy);
     if (!status.ok()) begin
       published = null;
       return status;
     end
-    status = copy_handle_value(resource.handle, "resource_incarnation",
+    status = project_handle_value(resource.handle, "resource_incarnation",
                                handle_copy);
     if (!status.ok()) begin
       published = null;
@@ -1689,7 +1544,7 @@ class rdma_resource_manager extends uvm_object;
         "closing or failed dependency cannot admit new resources"
       );
     if (dependency_resource.owner == null ||
-        !dependency_resource.owner.same_instance(owner))
+        !same_handle_instance(dependency_resource.owner, owner))
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "resource dependency has another owner");
     return rdma_status::success();
@@ -1706,7 +1561,7 @@ class rdma_resource_manager extends uvm_object;
     rdma_aeq aeq;
     rdma_function function_resource;
 
-    case (resource.resource_kind())
+    case (resource.handle.kind)
       RDMA_RESOURCE_FUNCTION: begin
         if (!$cast(function_resource, resource))
           `uvm_fatal("RM_TYPE", "Function resource type mismatch")
@@ -1765,7 +1620,7 @@ class rdma_resource_manager extends uvm_object;
       return 1'b0;
     foreach (candidate.dependencies[i]) begin
       if (candidate.dependencies[i] != null &&
-          candidate.dependencies[i].same_instance(dependency))
+          same_handle_instance(candidate.dependencies[i], dependency))
         return 1'b1;
     end
     return 1'b0;
@@ -1777,9 +1632,9 @@ class rdma_resource_manager extends uvm_object;
         continue;
       if (resource_depends_on(registry[key], resource.handle))
         return 1'b1;
-      if (resource.resource_kind() == RDMA_RESOURCE_FUNCTION &&
+      if (resource.handle.kind == RDMA_RESOURCE_FUNCTION &&
           registry[key].owner != null &&
-          registry[key].owner.same_instance(resource.handle))
+          same_handle_instance(registry[key].owner, resource.handle))
         return 1'b1;
     end
     return 1'b0;
@@ -1791,7 +1646,7 @@ class rdma_resource_manager extends uvm_object;
     int unsigned local_id;
 
     resource = registry[key];
-    kind = resource.resource_kind();
+    kind = resource.handle.kind;
     local_id = resource_local_id(resource);
     if (local_id > local_id_limit(kind))
       `uvm_fatal("RM_LOCAL_ID",
@@ -1855,7 +1710,7 @@ class rdma_resource_manager extends uvm_object;
     consume_local_id(RDMA_RESOURCE_FUNCTION, has_free_id, local_id);
     authoritative = new("function_resource");
     authoritative.handle = owner;
-    status = copy_function_handle_value(owner, "Function owner",
+    status = project_function_handle_value(owner, "Function owner",
                                         authoritative.owner);
     if (!status.ok()) begin
       rollback_local_id_reservation(RDMA_RESOURCE_FUNCTION, local_id,
@@ -1872,7 +1727,7 @@ class rdma_resource_manager extends uvm_object;
     // rdma_function::new creates its default binding through the factory.
     // Replace it explicitly before any manager clone or validation dispatch.
     authoritative.binding = null;
-    status = clone_binding_value(trusted_binding, "Function resource",
+    status = project_binding_value(trusted_binding, "Function resource",
                                  authoritative.binding);
     if (!status.ok()) begin
       rollback_local_id_reservation(RDMA_RESOURCE_FUNCTION, local_id,
@@ -1964,9 +1819,9 @@ class rdma_resource_manager extends uvm_object;
     authoritative.state = RDMA_RESOURCE_ALLOCATED;
     authoritative.local_mr_id = local_id;
     authoritative.global_mr_id = handle.object_id;
-    status = copy_handle_value(pd_h, "MR PD", authoritative.pd_h);
+    status = project_handle_value(pd_h, "MR PD", authoritative.pd_h);
     if (status.ok())
-      status = copy_handle_value(pd_h, "MR dependency", dependency_copy);
+      status = project_handle_value(pd_h, "MR dependency", dependency_copy);
     if (!status.ok()) begin
       rollback_identity_reservation(RDMA_RESOURCE_MR, owner, local_id,
                                     used_free_id, registered_binding,
@@ -2021,9 +1876,9 @@ class rdma_resource_manager extends uvm_object;
     authoritative.local_cq_id = local_id;
     authoritative.global_cq_id = handle.object_id;
     if (ceq_h != null) begin
-      status = copy_handle_value(ceq_h, "CQ CEQ", authoritative.ceq_h);
+      status = project_handle_value(ceq_h, "CQ CEQ", authoritative.ceq_h);
       if (status.ok())
-        status = copy_handle_value(ceq_h, "CQ dependency",
+        status = project_handle_value(ceq_h, "CQ dependency",
                                    dependency_copy);
       if (!status.ok()) begin
         rollback_identity_reservation(RDMA_RESOURCE_CQ, owner, local_id,
@@ -2091,23 +1946,23 @@ class rdma_resource_manager extends uvm_object;
     authoritative.state = RDMA_RESOURCE_ALLOCATED;
     authoritative.local_qp_id = local_id;
     authoritative.global_qp_id = handle.object_id;
-    status = copy_handle_value(pd_h, "QP PD", authoritative.pd_h);
+    status = project_handle_value(pd_h, "QP PD", authoritative.pd_h);
     if (status.ok())
-      status = copy_handle_value(send_cq_h, "QP send CQ",
+      status = project_handle_value(send_cq_h, "QP send CQ",
                                  authoritative.send_cq_h);
     if (status.ok())
-      status = copy_handle_value(recv_cq_h, "QP receive CQ",
+      status = project_handle_value(recv_cq_h, "QP receive CQ",
                                  authoritative.recv_cq_h);
     if (status.ok())
-      status = copy_handle_value(pd_h, "QP PD dependency", dependency_copy);
+      status = project_handle_value(pd_h, "QP PD dependency", dependency_copy);
     if (status.ok()) begin
       authoritative.dependencies.push_back(dependency_copy);
-      status = copy_handle_value(send_cq_h, "QP send CQ dependency",
+      status = project_handle_value(send_cq_h, "QP send CQ dependency",
                                  dependency_copy);
     end
     if (status.ok()) begin
       authoritative.dependencies.push_back(dependency_copy);
-      status = copy_handle_value(recv_cq_h, "QP receive CQ dependency",
+      status = project_handle_value(recv_cq_h, "QP receive CQ dependency",
                                  dependency_copy);
     end
     if (status.ok())
@@ -2119,9 +1974,9 @@ class rdma_resource_manager extends uvm_object;
       return status;
     end
     if (srq_h != null) begin
-      status = copy_handle_value(srq_h, "QP SRQ", authoritative.srq_h);
+      status = project_handle_value(srq_h, "QP SRQ", authoritative.srq_h);
       if (status.ok())
-        status = copy_handle_value(srq_h, "QP SRQ dependency",
+        status = project_handle_value(srq_h, "QP SRQ dependency",
                                    dependency_copy);
       if (!status.ok()) begin
         rollback_identity_reservation(RDMA_RESOURCE_QP, owner, local_id,
@@ -2177,9 +2032,9 @@ class rdma_resource_manager extends uvm_object;
     authoritative.state = RDMA_RESOURCE_ALLOCATED;
     authoritative.local_srq_id = local_id;
     authoritative.global_srq_id = handle.object_id;
-    status = copy_handle_value(pd_h, "SRQ PD", authoritative.pd_h);
+    status = project_handle_value(pd_h, "SRQ PD", authoritative.pd_h);
     if (status.ok())
-      status = copy_handle_value(pd_h, "SRQ dependency", dependency_copy);
+      status = project_handle_value(pd_h, "SRQ dependency", dependency_copy);
     if (!status.ok()) begin
       rollback_identity_reservation(RDMA_RESOURCE_SRQ, owner, local_id,
                                     used_free_id, registered_binding,
@@ -2321,46 +2176,44 @@ class rdma_resource_manager extends uvm_object;
     string incarnation;
     rdma_resource authoritative;
     rdma_function_handle owner;
+    rdma_handle trusted_handle;
     rdma_status status;
 
     resource = null;
-    if (handle == null)
+    status = project_handle_value(handle, "lookup", trusted_handle);
+    if (!status.ok())
+      return status;
+    if (trusted_handle == null)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "resource handle is null");
-    if (!exact_resource_handle_schema(handle))
-      return rdma_status::make(
-        RDMA_SC_INVALID_ARGUMENT,
-        "resource handle is outside the trusted schema"
-      );
-    if (!valid_kind(handle.kind))
+    if (!valid_kind(trusted_handle.kind))
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "resource handle kind is invalid");
-    if (handle.kind != RDMA_RESOURCE_FUNCTION &&
-        handle.object_id[31:28] != handle.kind)
+    if (trusted_handle.kind != RDMA_RESOURCE_FUNCTION &&
+        trusted_handle.object_id[31:28] != trusted_handle.kind)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "resource incarnation kind prefix is invalid");
 
-    key = resource_key(handle);
+    key = resource_key(trusted_handle);
     if (registry.exists(key)) begin
-      authoritative = registry[key];
-      if (authoritative == null || authoritative.handle == null ||
-          !authoritative.handle.same_instance(handle))
+      status = project_resource_value(registry[key], "lookup registry entry",
+                                      authoritative);
+      if (!status.ok())
+        return status;
+      if (authoritative.handle == null ||
+          !same_handle_instance(authoritative.handle, trusted_handle))
         return rdma_status::make(RDMA_SC_INVALID_STATE,
                                  "registry identity is inconsistent");
-      if (!exact_resource_schema(authoritative))
-        return rdma_status::make(
-          RDMA_SC_INVALID_ARGUMENT,
-          "lookup registry entry is outside the trusted schema"
-        );
       status = owner_binding_status(authoritative.owner);
       if (!status.ok())
         return status;
-      return clone_resource_value(authoritative, "lookup", resource);
+      registry[key] = authoritative;
+      return project_resource_value(authoritative, "lookup", resource);
     end
 
-    incarnation = incarnation_key(handle);
+    incarnation = incarnation_key(trusted_handle);
     if (!incarnation_owners.exists(incarnation)) begin
-      if (related_incarnation_owner(handle, owner))
+      if (related_incarnation_owner(trusted_handle, owner))
         return rdma_status::make(RDMA_SC_STALE_GENERATION,
                                  "resource handle generation is stale");
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
@@ -2383,33 +2236,25 @@ class rdma_resource_manager extends uvm_object;
     rdma_status status;
     string key;
 
-    if (candidate == null || candidate.handle == null)
-      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                               "staged resource candidate is null");
-    if (!exact_resource_schema(candidate))
-      return rdma_status::make(
-        RDMA_SC_INVALID_ARGUMENT,
-        "staged resource candidate is outside the trusted schema"
-      );
-    if (candidate.state != RDMA_RESOURCE_ALLOCATED)
-      return rdma_status::make(RDMA_SC_INVALID_STATE,
-                               "staged candidate must be ALLOCATED");
-    status = lookup(candidate.handle, authoritative);
+    status = project_public_resource_value(candidate, "stage allocated",
+                                           replacement);
     if (!status.ok())
       return status;
-    key = resource_key(candidate.handle);
+    if (replacement.state != RDMA_RESOURCE_ALLOCATED)
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "staged candidate must be ALLOCATED");
+    status = lookup(replacement.handle, authoritative);
+    if (!status.ok())
+      return status;
+    key = resource_key(authoritative.handle);
     if (registry[key].state != RDMA_RESOURCE_ALLOCATED)
       return rdma_status::make(RDMA_SC_INVALID_STATE,
                                "registry resource is not ALLOCATED");
-    status = publication_identity_status(candidate, authoritative);
+    status = publication_identity_status(replacement, authoritative);
     if (!status.ok())
       return status;
-    status = clone_public_resource_value(candidate, "stage allocated",
-                                         replacement);
-    if (!status.ok())
-      return status;
-    if (replacement.resource_kind() != RDMA_RESOURCE_PD) begin
-      status = clone_public_resource_value(replacement, "stage prepared",
+    if (replacement.handle.kind != RDMA_RESOURCE_PD) begin
+      status = project_public_resource_value(replacement, "stage prepared",
                                            prepared);
       if (!status.ok())
         return status;
@@ -2441,37 +2286,29 @@ class rdma_resource_manager extends uvm_object;
     rdma_status status;
     string key;
 
-    if (candidate == null || candidate.handle == null)
-      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                               "programmed resource candidate is null");
-    if (!exact_resource_schema(candidate))
-      return rdma_status::make(
-        RDMA_SC_INVALID_ARGUMENT,
-        "programmed resource candidate is outside the trusted schema"
-      );
-    if (candidate.state != RDMA_RESOURCE_ALLOCATED)
-      return rdma_status::make(RDMA_SC_INVALID_STATE,
-                               "programmed candidate must be ALLOCATED");
-    status = lookup(candidate.handle, authoritative);
+    status = project_public_resource_value(candidate, "commit programmed",
+                                           replacement);
     if (!status.ok())
       return status;
-    if (authoritative.resource_kind() == RDMA_RESOURCE_PD)
+    if (replacement.state != RDMA_RESOURCE_ALLOCATED)
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "programmed candidate must be ALLOCATED");
+    status = lookup(replacement.handle, authoritative);
+    if (!status.ok())
+      return status;
+    if (authoritative.handle.kind == RDMA_RESOURCE_PD)
       return rdma_status::make(
         RDMA_SC_INVALID_STATE,
         "PD transitions directly from ALLOCATED to ACTIVE"
       );
-    key = resource_key(candidate.handle);
+    key = resource_key(authoritative.handle);
     if (registry[key].state != RDMA_RESOURCE_ALLOCATED ||
         !staged_allocations.exists(key))
       return rdma_status::make(
         RDMA_SC_INVALID_STATE,
         "only a staged ALLOCATED resource can be programmed"
       );
-    status = publication_identity_status(candidate, authoritative);
-    if (!status.ok())
-      return status;
-    status = clone_public_resource_value(candidate, "commit programmed",
-                                         replacement);
+    status = publication_identity_status(replacement, authoritative);
     if (!status.ok())
       return status;
     replacement.state = RDMA_RESOURCE_PROGRAMMED;
@@ -2497,8 +2334,8 @@ class rdma_resource_manager extends uvm_object;
     status = lookup(handle, authoritative);
     if (!status.ok())
       return status;
-    key = resource_key(handle);
-    if (handle.kind == RDMA_RESOURCE_PD) begin
+    key = resource_key(authoritative.handle);
+    if (authoritative.handle.kind == RDMA_RESOURCE_PD) begin
       if (registry[key].state != RDMA_RESOURCE_ALLOCATED)
         return rdma_status::make(
           RDMA_SC_INVALID_STATE,
@@ -2511,7 +2348,7 @@ class rdma_resource_manager extends uvm_object;
         "non-PD activation requires PROGRAMMED state"
       );
     end
-    status = clone_resource_value(registry[key], "activate", replacement);
+    status = project_resource_value(registry[key], "activate", replacement);
     if (!status.ok())
       return status;
     replacement.state = RDMA_RESOURCE_ACTIVE;
@@ -2528,6 +2365,7 @@ class rdma_resource_manager extends uvm_object;
 
   virtual function rdma_status begin_quiesce(rdma_handle handle);
     rdma_resource authoritative;
+    rdma_resource replacement;
     rdma_status status;
     string key;
 
@@ -2537,7 +2375,7 @@ class rdma_resource_manager extends uvm_object;
     status = lookup(handle, authoritative);
     if (!status.ok())
       return status;
-    key = resource_key(handle);
+    key = resource_key(authoritative.handle);
     if (registry[key].state != RDMA_RESOURCE_ACTIVE)
       return rdma_status::make(RDMA_SC_INVALID_STATE,
                                "only ACTIVE resource can begin quiesce");
@@ -2549,7 +2387,12 @@ class rdma_resource_manager extends uvm_object;
         RDMA_SC_RESOURCE_BUSY,
         "resource still has outstanding operations"
       );
-    registry[key].state = RDMA_RESOURCE_QUIESCING;
+    status = project_resource_value(registry[key], "begin quiesce",
+                                    replacement);
+    if (!status.ok())
+      return status;
+    replacement.state = RDMA_RESOURCE_QUIESCING;
+    registry[key] = replacement;
     return rdma_status::success();
   endfunction
 
@@ -2562,13 +2405,13 @@ class rdma_resource_manager extends uvm_object;
     status = lookup(handle, authoritative);
     if (!status.ok())
       return status;
-    key = resource_key(handle);
+    key = resource_key(authoritative.handle);
     if (registry[key].state != RDMA_RESOURCE_QUIESCING)
       return rdma_status::make(
         RDMA_SC_INVALID_STATE,
         "only QUIESCING resource can be restored ACTIVE"
       );
-    status = clone_resource_value(registry[key], "restore active",
+    status = project_resource_value(registry[key], "restore active",
                                   replacement);
     if (!status.ok())
       return status;
@@ -2590,49 +2433,46 @@ class rdma_resource_manager extends uvm_object;
     rdma_resource replacement;
     rdma_recovery_record recovery_copy;
     rdma_function_handle related_owner;
+    rdma_handle trusted_handle;
     rdma_status status;
     string key;
 
-    if (handle == null || recovery == null)
+    status = project_handle_value(handle, "mark error", trusted_handle);
+    if (!status.ok())
+      return status;
+    status = project_public_recovery_value(recovery, "mark error",
+                                           recovery_copy);
+    if (!status.ok())
+      return status;
+    if (trusted_handle == null)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                               "error handle or recovery record is null");
-    if (!exact_resource_handle_schema(handle) ||
-        !exact_recovery_schema(recovery))
-      return rdma_status::make(
-        RDMA_SC_INVALID_ARGUMENT,
-        "error input is outside the trusted schema"
-      );
-    if (!valid_kind(handle.kind) ||
-        (handle.kind != RDMA_RESOURCE_FUNCTION &&
-         handle.object_id[31:28] != handle.kind))
+                               "error resource handle is null");
+    if (!valid_kind(trusted_handle.kind) ||
+        (trusted_handle.kind != RDMA_RESOURCE_FUNCTION &&
+         trusted_handle.object_id[31:28] != trusted_handle.kind))
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "error resource handle is malformed");
-    key = resource_key(handle);
+    key = resource_key(trusted_handle);
     status = recovery_entry_schema_status(key, "mark error");
     if (!status.ok())
       return status;
     if (!registry.exists(key)) begin
-      if (related_incarnation_owner(handle, related_owner))
+      if (related_incarnation_owner(trusted_handle, related_owner))
         return rdma_status::make(RDMA_SC_STALE_GENERATION,
                                  "error resource generation is stale");
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "error resource incarnation is unknown");
     end
-    if (registry[key] == null || registry[key].handle == null ||
-        !registry[key].handle.same_instance(handle))
-      return rdma_status::make(RDMA_SC_INVALID_STATE,
-                               "error registry identity is inconsistent");
-    if (!exact_resource_schema(registry[key]))
-      return rdma_status::make(
-        RDMA_SC_INVALID_ARGUMENT,
-        "error registry entry is outside the trusted schema"
-      );
-    status = clone_public_recovery_value(recovery, "mark error",
-                                         recovery_copy);
+    status = project_resource_value(registry[key], "mark error registry",
+                                    replacement);
     if (!status.ok())
       return status;
+    if (replacement.handle == null ||
+        !same_handle_instance(replacement.handle, trusted_handle))
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "error registry identity is inconsistent");
     if (recovery_copy.resource_h == null ||
-        !recovery_copy.resource_h.same_instance(handle))
+        !same_handle_instance(recovery_copy.resource_h, trusted_handle))
       return rdma_status::make(
         RDMA_SC_INVALID_ARGUMENT,
         "recovery record does not match the resource incarnation"
@@ -2643,16 +2483,13 @@ class rdma_resource_manager extends uvm_object;
                                "recovery validation returned null");
     if (!status.ok())
       return status;
-    if (registry[key].resource_kind() == RDMA_RESOURCE_MR &&
-        registry[key].state == RDMA_RESOURCE_ALLOCATED &&
+    if (replacement.handle.kind == RDMA_RESOURCE_MR &&
+        replacement.state == RDMA_RESOURCE_ALLOCATED &&
         !staged_allocations.exists(key))
       return rdma_status::make(
         RDMA_SC_INVALID_STATE,
         "ALLOCATED MR requires staged key authority before ERROR"
       );
-    status = clone_resource_value(registry[key], "mark error", replacement);
-    if (!status.ok())
-      return status;
     replacement.state = RDMA_RESOURCE_ERROR;
     status = replacement.validate();
     if (status == null)
@@ -2675,22 +2512,17 @@ class rdma_resource_manager extends uvm_object;
     string key;
 
     recovery = null;
-    if (handle == null || !exact_resource_handle_schema(handle))
-      return rdma_status::make(
-        RDMA_SC_INVALID_ARGUMENT,
-        "recovery lookup handle is outside the trusted schema"
-      );
-    key = resource_key(handle);
-    status = recovery_entry_schema_status(key, "recovery lookup");
+    status = lookup(handle, authoritative);
     if (!status.ok())
       return status;
-    status = lookup(handle, authoritative);
+    key = resource_key(authoritative.handle);
+    status = recovery_entry_schema_status(key, "recovery lookup");
     if (!status.ok())
       return status;
     if (!recovery_records.exists(key))
       return rdma_status::make(RDMA_SC_INVALID_STATE,
                                "resource has no recovery record");
-    return clone_recovery_value(recovery_records[key], "lookup recovery",
+    return project_recovery_value(recovery_records[key], "lookup recovery",
                                 recovery);
   endfunction
 
@@ -2699,16 +2531,11 @@ class rdma_resource_manager extends uvm_object;
     rdma_status status;
     string key;
 
-    if (handle == null || !exact_resource_handle_schema(handle))
-      return rdma_status::make(
-        RDMA_SC_INVALID_ARGUMENT,
-        "clear recovery handle is outside the trusted schema"
-      );
-    key = resource_key(handle);
-    status = recovery_entry_schema_status(key, "clear recovery");
+    status = lookup(handle, authoritative);
     if (!status.ok())
       return status;
-    status = lookup(handle, authoritative);
+    key = resource_key(authoritative.handle);
+    status = recovery_entry_schema_status(key, "clear recovery");
     if (!status.ok())
       return status;
     if (registry[key].state != RDMA_RESOURCE_ERROR)
@@ -2731,22 +2558,17 @@ class rdma_resource_manager extends uvm_object;
     rdma_status status;
     string key;
 
-    if (handle == null || !exact_resource_handle_schema(handle))
-      return rdma_status::make(
-        RDMA_SC_INVALID_ARGUMENT,
-        "finalize handle is outside the trusted schema"
-      );
-    key = resource_key(handle);
     status = registry_schema_status("finalize release");
-    if (!status.ok())
-      return status;
-    status = recovery_entry_schema_status(key, "finalize release");
     if (!status.ok())
       return status;
     status = lookup(handle, authoritative);
     if (!status.ok())
       return status;
-    if (handle.kind == RDMA_RESOURCE_FUNCTION)
+    key = resource_key(authoritative.handle);
+    status = recovery_entry_schema_status(key, "finalize release");
+    if (!status.ok())
+      return status;
+    if (authoritative.handle.kind == RDMA_RESOURCE_FUNCTION)
       return rdma_status::make(
         RDMA_SC_INVALID_STATE,
         "Function resources require privileged Function teardown"
@@ -2782,22 +2604,17 @@ class rdma_resource_manager extends uvm_object;
     rdma_status status;
     string key;
 
-    if (handle == null || !exact_resource_handle_schema(handle))
-      return rdma_status::make(
-        RDMA_SC_INVALID_ARGUMENT,
-        "reserved release handle is outside the trusted schema"
-      );
-    key = resource_key(handle);
     status = registry_schema_status("release reserved");
-    if (!status.ok())
-      return status;
-    status = recovery_entry_schema_status(key, "release reserved");
     if (!status.ok())
       return status;
     status = lookup(handle, authoritative);
     if (!status.ok())
       return status;
-    if (handle.kind == RDMA_RESOURCE_FUNCTION)
+    key = resource_key(authoritative.handle);
+    status = recovery_entry_schema_status(key, "release reserved");
+    if (!status.ok())
+      return status;
+    if (authoritative.handle.kind == RDMA_RESOURCE_FUNCTION)
       return rdma_status::make(
         RDMA_SC_INVALID_STATE,
         "Function resources require privileged Function teardown"
@@ -2834,7 +2651,7 @@ class rdma_resource_manager extends uvm_object;
     status = lookup(handle, authoritative);
     if (!status.ok())
       return status;
-    key = resource_key(handle);
+    key = resource_key(authoritative.handle);
     if (registry[key].state != RDMA_RESOURCE_ACTIVE)
       return rdma_status::make(
         RDMA_SC_INVALID_STATE,
@@ -2847,7 +2664,7 @@ class rdma_resource_manager extends uvm_object;
           "outstanding operation ID is already tracked"
         );
     end
-    status = clone_resource_value(registry[key], "track outstanding",
+    status = project_resource_value(registry[key], "track outstanding",
                                   replacement);
     if (!status.ok())
       return status;
@@ -2869,7 +2686,7 @@ class rdma_resource_manager extends uvm_object;
     status = lookup(handle, authoritative);
     if (!status.ok())
       return status;
-    key = resource_key(handle);
+    key = resource_key(authoritative.handle);
     found_index = -1;
     foreach (registry[key].outstanding_ids[i]) begin
       if (registry[key].outstanding_ids[i] == outstanding_id) begin
@@ -2882,7 +2699,7 @@ class rdma_resource_manager extends uvm_object;
         RDMA_SC_INVALID_ARGUMENT,
         "outstanding operation ID is not tracked"
       );
-    status = clone_resource_value(registry[key], "retire outstanding",
+    status = project_resource_value(registry[key], "retire outstanding",
                                   replacement);
     if (!status.ok())
       return status;
@@ -2906,22 +2723,17 @@ class rdma_resource_manager extends uvm_object;
     rdma_status status;
     string key;
 
-    if (handle == null || !exact_resource_handle_schema(handle))
-      return rdma_status::make(
-        RDMA_SC_INVALID_ARGUMENT,
-        "release handle is outside the trusted schema"
-      );
-    key = resource_key(handle);
     status = registry_schema_status("release");
-    if (!status.ok())
-      return status;
-    status = recovery_entry_schema_status(key, "release");
     if (!status.ok())
       return status;
     status = lookup(handle, ignored);
     if (!status.ok())
       return status;
-    if (handle.kind == RDMA_RESOURCE_FUNCTION)
+    key = resource_key(ignored.handle);
+    status = recovery_entry_schema_status(key, "release");
+    if (!status.ok())
+      return status;
+    if (ignored.handle.kind == RDMA_RESOURCE_FUNCTION)
       return rdma_status::make(
         RDMA_SC_INVALID_STATE,
         "Function resources require privileged Function teardown"
@@ -2949,10 +2761,15 @@ class rdma_resource_manager extends uvm_object;
     int unsigned target_count;
     bit progress;
     bit blocked;
+    rdma_function_handle trusted_owner;
     rdma_status status;
 
-    if (!exact_function_handle_schema(owner) ||
-        owner.kind != RDMA_RESOURCE_FUNCTION)
+    status = project_function_handle_value(owner, "Function teardown",
+                                           trusted_owner);
+    if (!status.ok())
+      return status;
+    if (trusted_owner == null ||
+        trusted_owner.kind != RDMA_RESOURCE_FUNCTION)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "Function teardown handle is invalid");
     status = registry_schema_status("Function teardown");
@@ -2961,8 +2778,8 @@ class rdma_resource_manager extends uvm_object;
     status = recovery_schema_status("Function teardown");
     if (!status.ok())
       return status;
-    owner_key = function_key(owner);
-    generation_key = function_generation_key(owner);
+    owner_key = function_key(trusted_owner);
+    generation_key = function_generation_key(trusted_owner);
     if (!binding_snapshots.exists(owner_key))
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "Function teardown identity is unknown");
@@ -2977,7 +2794,7 @@ class rdma_resource_manager extends uvm_object;
     target_count = 0;
     foreach (registry[key]) begin
       if (registry[key].owner != null &&
-          registry[key].owner.same_instance(owner))
+          same_handle_instance(registry[key].owner, trusted_owner))
         target_count++;
     end
 
@@ -2985,19 +2802,20 @@ class rdma_resource_manager extends uvm_object;
       progress = 1'b0;
       foreach (registry[key]) begin
         if (selected.exists(key) || registry[key].owner == null ||
-            !registry[key].owner.same_instance(owner))
+            !same_handle_instance(registry[key].owner, trusted_owner))
           continue;
         blocked = 1'b0;
         foreach (registry[other_key]) begin
           if (key == other_key || selected.exists(other_key) ||
               registry[other_key].owner == null ||
-              !registry[other_key].owner.same_instance(owner))
+              !same_handle_instance(registry[other_key].owner,
+                                    trusted_owner))
             continue;
           if (resource_depends_on(registry[other_key],
                                   registry[key].handle))
             blocked = 1'b1;
-          if (registry[key].resource_kind() == RDMA_RESOURCE_FUNCTION &&
-              registry[other_key].resource_kind() !=
+          if (registry[key].handle.kind == RDMA_RESOURCE_FUNCTION &&
+              registry[other_key].handle.kind !=
                 RDMA_RESOURCE_FUNCTION)
             blocked = 1'b1;
         end
@@ -3022,21 +2840,27 @@ class rdma_resource_manager extends uvm_object;
     output int unsigned leak_count,
     input rdma_function_handle owner = null
   );
+    rdma_function_handle trusted_owner;
     rdma_status status;
 
     leak_count = 0;
-    if (owner != null &&
-        (!exact_function_handle_schema(owner) ||
-         owner.kind != RDMA_RESOURCE_FUNCTION))
-      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                               "leak filter is not a Function handle");
+    trusted_owner = null;
+    if (owner != null) begin
+      status = project_function_handle_value(owner, "leak filter",
+                                             trusted_owner);
+      if (!status.ok())
+        return status;
+      if (trusted_owner.kind != RDMA_RESOURCE_FUNCTION)
+        return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                                 "leak filter is not a Function handle");
+    end
     status = registry_schema_status("leak audit");
     if (!status.ok())
       return status;
     foreach (registry[key]) begin
-      if (owner == null ||
+      if (trusted_owner == null ||
           (registry[key].owner != null &&
-           registry[key].owner.same_instance(owner)))
+           same_handle_instance(registry[key].owner, trusted_owner)))
         leak_count++;
     end
     if (leak_count != 0)

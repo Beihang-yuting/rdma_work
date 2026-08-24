@@ -938,6 +938,175 @@ class rdma_rm_stateful_mr extends rdma_mr;
   endfunction
 endclass
 
+// These carriers model the two ways wrapper identity can be spoofed.  The
+// unregistered subclasses inherit the built-in wrapper, while the registered
+// subclasses deliberately report the built-in wrapper.  Neither extension is
+// authoritative at the resource-manager boundary.
+class rdma_rm_unregistered_mr extends rdma_mr;
+  int unsigned clone_calls;
+  int unsigned extra_scalar;
+  rdma_handle extra_child;
+
+  function new(string name = "rdma_rm_unregistered_mr");
+    super.new(name);
+    clone_calls = 0;
+    extra_scalar = 32'hc011_a001;
+    extra_child = null;
+  endfunction
+
+  virtual function uvm_object clone();
+    uvm_object result;
+
+    clone_calls++;
+    result = super.clone();
+    length++;
+    return result;
+  endfunction
+endclass
+
+class rdma_rm_lying_mr extends rdma_mr;
+  typedef uvm_object_registry#(rdma_rm_lying_mr,
+                               "rdma_rm_lying_mr") type_id;
+
+  static function type_id get_type();
+    return type_id::get();
+  endfunction
+
+  int unsigned clone_calls;
+  int unsigned extra_scalar;
+  rdma_handle extra_child;
+
+  function new(string name = "rdma_rm_lying_mr");
+    super.new(name);
+    clone_calls = 0;
+    extra_scalar = 32'hc011_a002;
+    extra_child = null;
+  endfunction
+
+  virtual function uvm_object_wrapper get_object_type();
+    return rdma_mr::get_type();
+  endfunction
+
+  virtual function uvm_object clone();
+    uvm_object result;
+
+    clone_calls++;
+    result = super.clone();
+    length++;
+    return result;
+  endfunction
+endclass
+
+class rdma_rm_unregistered_mapping extends rdma_dma_mapping;
+  int unsigned clone_calls;
+  int unsigned extra_scalar;
+  rdma_handle extra_child;
+
+  function new(string name = "rdma_rm_unregistered_mapping");
+    super.new(name);
+    clone_calls = 0;
+    extra_scalar = 32'hc011_b001;
+    extra_child = null;
+  endfunction
+
+  virtual function uvm_object clone();
+    uvm_object result;
+
+    clone_calls++;
+    result = super.clone();
+    size++;
+    return result;
+  endfunction
+endclass
+
+class rdma_rm_lying_mapping extends rdma_dma_mapping;
+  typedef uvm_object_registry#(rdma_rm_lying_mapping,
+                               "rdma_rm_lying_mapping") type_id;
+
+  static function type_id get_type();
+    return type_id::get();
+  endfunction
+
+  int unsigned clone_calls;
+  int unsigned extra_scalar;
+  rdma_handle extra_child;
+
+  function new(string name = "rdma_rm_lying_mapping");
+    super.new(name);
+    clone_calls = 0;
+    extra_scalar = 32'hc011_b002;
+    extra_child = null;
+  endfunction
+
+  virtual function uvm_object_wrapper get_object_type();
+    return rdma_dma_mapping::get_type();
+  endfunction
+
+  virtual function uvm_object clone();
+    uvm_object result;
+
+    clone_calls++;
+    result = super.clone();
+    size++;
+    return result;
+  endfunction
+endclass
+
+class rdma_rm_unregistered_recovery extends rdma_recovery_record;
+  int unsigned clone_calls;
+  int unsigned extra_scalar;
+  rdma_handle extra_child;
+
+  function new(string name = "rdma_rm_unregistered_recovery");
+    super.new(name);
+    clone_calls = 0;
+    extra_scalar = 32'hc011_c001;
+    extra_child = null;
+  endfunction
+
+  virtual function uvm_object clone();
+    uvm_object result;
+
+    clone_calls++;
+    result = super.clone();
+    hardware_presence = RDMA_HW_PRESENCE_PRESENT;
+    return result;
+  endfunction
+endclass
+
+class rdma_rm_lying_recovery extends rdma_recovery_record;
+  typedef uvm_object_registry#(rdma_rm_lying_recovery,
+                               "rdma_rm_lying_recovery") type_id;
+
+  static function type_id get_type();
+    return type_id::get();
+  endfunction
+
+  int unsigned clone_calls;
+  int unsigned extra_scalar;
+  rdma_handle extra_child;
+
+  function new(string name = "rdma_rm_lying_recovery");
+    super.new(name);
+    clone_calls = 0;
+    extra_scalar = 32'hc011_c002;
+    extra_child = null;
+  endfunction
+
+  virtual function uvm_object_wrapper get_object_type();
+    return rdma_recovery_record::get_type();
+  endfunction
+
+  virtual function uvm_object clone();
+    uvm_object result;
+
+    clone_calls++;
+    result = super.clone();
+    hardware_presence = RDMA_HW_PRESENCE_PRESENT;
+    return result;
+  endfunction
+endclass
+
 class rdma_clone_probe_manager extends rdma_resource_manager;
   function new(string name = "rdma_clone_probe_manager");
     super.new(name);
@@ -979,11 +1148,12 @@ class rdma_clone_probe_manager extends rdma_resource_manager;
       staged_allocations.delete(key);
   endfunction
 
-  function rdma_status probe_public_resource_clone(
+  function rdma_status probe_public_resource_projection(
     rdma_resource source,
     output rdma_resource result
   );
-    return clone_public_resource_value(source, "clone gate probe", result);
+    return project_public_resource_value(source, "projection gate probe",
+                                         result);
   endfunction
 
   function void reset_error_probe(rdma_resource replacement);
@@ -992,8 +1162,8 @@ class rdma_clone_probe_manager extends rdma_resource_manager;
     rdma_status status;
 
     key = resource_key(replacement.handle);
-    status = clone_resource_value(replacement, "error probe reset",
-                                  replacement_copy);
+    status = project_resource_value(replacement, "error probe reset",
+                                    replacement_copy);
     if (!status.ok())
       `uvm_fatal("RM_TEST_SCHEMA", status.convert2string())
     registry[key] = replacement_copy;
@@ -1148,6 +1318,7 @@ class rdma_resource_manager_test extends uvm_test;
     rdma_clone_probe_manager clone_gate_rm;
     rdma_clone_probe_manager schema_rm;
     rdma_clone_probe_manager schema_lookup_rm;
+    rdma_clone_probe_manager projection_rm;
     rdma_resource_manager allocated_error_rm;
     rdma_resource_manager recovery_rm;
     rdma_resource_manager_probe privileged_recovery_rm;
@@ -1178,6 +1349,7 @@ class rdma_resource_manager_test extends uvm_test;
     rdma_function_binding schema_binding;
     rdma_function_binding schema_lookup_binding;
     rdma_function_binding schema_nested_binding;
+    rdma_function_binding projection_binding;
     rdma_rm_schema_binding schema_binding_probe;
     rdma_rm_schema_pcie schema_pcie_probe;
     rdma_rm_schema_bar schema_bar_probe;
@@ -1211,6 +1383,9 @@ class rdma_resource_manager_test extends uvm_test;
     rdma_pd clone_recovery_pd;
     rdma_pd schema_pd;
     rdma_pd schema_recovery_pd;
+    rdma_pd projection_pd;
+    rdma_pd projection_recovery_pd_a;
+    rdma_pd projection_recovery_pd_b;
     rdma_pd allocated_error_pd;
     rdma_pd wrong_stage_pd;
     rdma_pd recovery_pd;
@@ -1271,6 +1446,14 @@ class rdma_resource_manager_test extends uvm_test;
     rdma_mr schema_nested_mr;
     rdma_mr schema_seed_mr;
     rdma_rm_stateful_mr schema_registry_mr;
+    rdma_mr projection_seed_mr;
+    rdma_mr projection_nested_mr;
+    rdma_mr projection_lookup_mr;
+    rdma_rm_unregistered_mr projection_unregistered_mr;
+    rdma_rm_unregistered_mr projection_unregistered_mr_leak;
+    rdma_rm_unregistered_mr projection_mismatched_mr;
+    rdma_rm_lying_mr projection_lying_mr;
+    rdma_rm_lying_mr projection_lying_mr_leak;
     rdma_mr allocated_error_mr;
     rdma_cq cq_pool;
     rdma_cq width_cq;
@@ -1345,11 +1528,21 @@ class rdma_resource_manager_test extends uvm_test;
     rdma_recovery_record schema_nested_recovery;
     rdma_rm_schema_recovery schema_registry_recovery;
     rdma_recovery_record schema_recovery_before;
+    rdma_rm_unregistered_recovery projection_unregistered_recovery;
+    rdma_rm_unregistered_recovery projection_unregistered_recovery_leak;
+    rdma_rm_lying_recovery projection_lying_recovery;
+    rdma_rm_lying_recovery projection_lying_recovery_leak;
     rdma_backing_ref clone_backing_ref;
     rdma_backing_ref schema_exact_backing_ref;
+    rdma_backing_ref projection_unregistered_backing_ref;
+    rdma_backing_ref projection_lying_backing_ref;
     rdma_dma_mapping clone_mapping;
     rdma_dma_mapping schema_mapping;
     rdma_rm_schema_mapping schema_mapping_probe;
+    rdma_rm_unregistered_mapping projection_unregistered_mapping;
+    rdma_rm_unregistered_mapping projection_unregistered_mapping_leak;
+    rdma_rm_lying_mapping projection_lying_mapping;
+    rdma_rm_lying_mapping projection_lying_mapping_leak;
     rdma_hmc_ref clone_hmc_ref;
     rdma_rm_schema_hmc_ref schema_hmc_probe;
     rdma_mr clone_lookup_mr;
@@ -1370,6 +1563,8 @@ class rdma_resource_manager_test extends uvm_test;
     rdma_cmq_ticket mutating_clone_ticket_ref;
     longint unsigned mutating_clone_length;
     rdma_hw_presence_e mutating_clone_presence;
+    longint unsigned projection_size_before;
+    rdma_hw_presence_e projection_presence_before;
     rdma_status s;
     int unsigned leak_count;
     int unsigned pd_local_before_exhaustion;
@@ -2073,619 +2268,376 @@ class rdma_resource_manager_test extends uvm_test;
     expect_status("DEPENDENCY_GATE_NO_LEAKS",
                   dependency_gate_rm.check_leaks(leak_count), RDMA_SC_OK);
 
-    // The resource manager accepts only the closed graph of built-in UVM
-    // wrappers.  A registered subtype must be rejected before any virtual
-    // clone/copy dispatch, even when all inherited fields are otherwise valid.
-    schema_lookup_rm = new("schema_lookup_rm");
-    schema_lookup_binding = make_active_binding(
-      "schema_lookup_binding", 64'h1c1f_5000_0000_0002,
-      32'h1c1f_5502, 32'd23
+    // Public values are carriers, not trusted UVM implementations.  Compatible
+    // subclasses are projected field-by-field into built-in manager storage;
+    // inherited or forged wrapper identity must never trigger a virtual hook.
+    void'(rdma_rm_lying_mr::get_type());
+    void'(rdma_rm_lying_mapping::get_type());
+    void'(rdma_rm_lying_recovery::get_type());
+    projection_rm = new("projection_rm");
+    projection_binding = make_active_binding(
+      "projection_binding", 64'h1c1f_5000_0000_0001,
+      32'h1c1f_5501, 32'd23
     );
-    expect_status("SCHEMA_LOOKUP_CREATE_PD",
-                  schema_lookup_rm.create_pd(schema_lookup_binding,
-                                             schema_pd),
+    expect_status("PROJECTION_CREATE_PD",
+                  projection_rm.create_pd(projection_binding, projection_pd),
                   RDMA_SC_OK);
-    expect_status("SCHEMA_LOOKUP_CREATE_MR",
-                  schema_lookup_rm.create_mr(schema_lookup_binding,
-                                             schema_pd.handle,
-                                             schema_seed_mr),
+    expect_status("PROJECTION_CREATE_MR",
+                  projection_rm.create_mr(projection_binding,
+                                          projection_pd.handle,
+                                          projection_seed_mr),
                   RDMA_SC_OK);
-    schema_registry_mr = new("schema_lookup_registry_mr");
-    schema_registry_mr.copy(schema_seed_mr);
-    schema_registry_mr.clone_calls = 0;
-    schema_lookup_rm.replace_authoritative(schema_registry_mr);
-    schema_generation_before =
-      schema_lookup_rm.observed_generation_high_water(
-        schema_lookup_binding.make_handle()
-      );
-    schema_lookup_binding.generation++;
-    expect_status("SCHEMA_LOOKUP_PRE_REFRESH_REJECT",
-                  schema_lookup_rm.lookup(schema_registry_mr.handle,
-                                          resource),
-                  RDMA_SC_INVALID_ARGUMENT);
-    if (resource != null || schema_registry_mr.clone_calls != 0 ||
-        schema_lookup_rm.observed_generation_high_water(
-          schema_lookup_binding.make_handle()
-        ) != schema_generation_before ||
-        schema_lookup_rm.observed_resource_probe(schema_registry_mr.handle) !=
-          schema_registry_mr)
-      `uvm_error("SCHEMA_LOOKUP_PRE_REFRESH_ATOMIC",
-                 "lookup refreshed generation state or changed corruption")
-    schema_lookup_binding.generation--;
-    schema_registry_recovery = new("schema_lookup_registry_recovery");
-    schema_registry_recovery.resource_h = clone_handle(
-      "SCHEMA_LOOKUP_RECOVERY_H", schema_pd.handle
-    );
-    schema_registry_recovery.hardware_presence = RDMA_HW_PRESENCE_ABSENT;
-    schema_registry_recovery.primary_status = rdma_status::make(
-      RDMA_SC_RESET_CANCELLED, "lookup recovery pre-refresh probe"
-    );
-    schema_registry_recovery.clone_calls = 0;
-    schema_lookup_rm.inject_recovery_probe(schema_pd.handle,
-                                           schema_registry_recovery);
-    schema_generation_before =
-      schema_lookup_rm.observed_generation_high_water(
-        schema_lookup_binding.make_handle()
-      );
-    schema_lookup_binding.generation++;
-    expect_status("SCHEMA_RECOVERY_PRE_REFRESH_REJECT",
-                  schema_lookup_rm.lookup_recovery(schema_pd.handle,
-                                                   recovery_lookup),
-                  RDMA_SC_INVALID_ARGUMENT);
-    if (recovery_lookup != null || schema_registry_recovery.clone_calls != 0 ||
-        schema_lookup_rm.observed_generation_high_water(
-          schema_lookup_binding.make_handle()
-        ) != schema_generation_before ||
-        schema_lookup_rm.observed_recovery_probe(schema_pd.handle) !=
-          schema_registry_recovery)
-      `uvm_error("SCHEMA_RECOVERY_PRE_REFRESH_ATOMIC",
-                 "recovery lookup refreshed generation state or cloned")
-    schema_lookup_binding.generation--;
-    leak_count = 32'h51a7_ffff;
-    expect_status("SCHEMA_CHECK_LEAKS_CORRUPT_REJECT",
-                  schema_lookup_rm.check_leaks(leak_count),
-                  RDMA_SC_INVALID_ARGUMENT);
-    if (leak_count != 0 ||
-        schema_lookup_rm.observed_resource_probe(schema_registry_mr.handle) !=
-          schema_registry_mr)
-      `uvm_error("SCHEMA_CHECK_LEAKS_CORRUPT_ATOMIC",
-                 "leak audit exposed a partial count or changed corruption")
-    expect_status("SCHEMA_DEPENDENT_SCAN_CORRUPT_REJECT",
-                  schema_lookup_rm.release_reserved(schema_pd.handle),
-                  RDMA_SC_INVALID_ARGUMENT);
-    if (schema_lookup_rm.observed_resource_probe(schema_pd.handle) == null ||
-        schema_lookup_rm.observed_resource_probe(schema_registry_mr.handle) !=
-          schema_registry_mr)
-      `uvm_error("SCHEMA_DEPENDENT_SCAN_CORRUPT_ATOMIC",
-                 "dependent scan released authority around corruption")
-    schema_function_handle = new("schema_derived_function_handle");
-    schema_function_handle.copy(schema_lookup_binding.make_handle());
-    schema_function_handle.clone_calls = 0;
-    expect_status("SCHEMA_DERIVED_OWNER_LEAK_REJECT",
-                  schema_lookup_rm.check_leaks(leak_count,
-                                               schema_function_handle),
-                  RDMA_SC_INVALID_ARGUMENT);
-    expect_status("SCHEMA_RELEASE_CORRUPT_REGISTRY_REJECT",
-                  schema_lookup_rm.release_function(
-                    schema_lookup_binding.make_handle()
-                  ),
-                  RDMA_SC_INVALID_ARGUMENT);
-    expect_status("SCHEMA_DERIVED_OWNER_RELEASE_REJECT",
-                  schema_lookup_rm.release_function(schema_function_handle),
-                  RDMA_SC_INVALID_ARGUMENT);
-    if (schema_function_handle.clone_calls != 0 ||
-        schema_lookup_rm.observed_resource_probe(schema_registry_mr.handle) !=
-          schema_registry_mr)
-      `uvm_error("SCHEMA_DERIVED_OWNER_ATOMIC",
-                 "derived Function handle was cloned or released authority")
+    prepare_mr(projection_seed_mr, 64'h6100_0000);
 
-    schema_rm = new("schema_rm");
-    schema_binding = make_active_binding(
-      "schema_binding", 64'h1c1f_5000_0000_0001,
-      32'h1c1f_5501, 32'd22
+    projection_unregistered_mr = new("projection_unregistered_mr");
+    projection_unregistered_mr.copy(projection_seed_mr);
+    projection_unregistered_mr.extra_scalar = 32'hc011_aa01;
+    projection_unregistered_mr.extra_child = clone_handle(
+      "PROJECTION_UNREGISTERED_MR_EXTRA", projection_seed_mr.pd_h
     );
-    schema_binding_probe = new("schema_derived_binding");
-    schema_binding_probe.copy(schema_binding);
-    schema_binding_probe.clone_calls = 0;
-    expect_status("SCHEMA_DERIVED_BINDING_REJECT",
-                  schema_rm.create_pd(schema_binding_probe, schema_pd),
-                  RDMA_SC_INVALID_ARGUMENT);
-    if (schema_pd != null || schema_binding_probe.clone_calls != 0)
-      `uvm_error("SCHEMA_DERIVED_BINDING_PREDISPATCH",
-                 "derived binding was cloned or returned a resource")
-    schema_nested_binding = new("schema_nested_pcie_binding");
-    schema_nested_binding.copy(schema_binding);
-    schema_pcie_probe = new("schema_derived_pcie");
-    schema_pcie_probe.copy(schema_binding.pcie);
-    schema_pcie_probe.clone_calls = 0;
-    schema_nested_binding.pcie = schema_pcie_probe;
-    expect_status("SCHEMA_DERIVED_PCIE_REJECT",
-                  schema_rm.create_pd(schema_nested_binding, schema_pd),
-                  RDMA_SC_INVALID_ARGUMENT);
-    if (schema_pd != null || schema_pcie_probe.clone_calls != 0)
-      `uvm_error("SCHEMA_DERIVED_PCIE_PREDISPATCH",
-                 "derived PCIe identity was cloned or returned a resource")
-    foreach (schema_binding.pcie.bar[i]) begin
-      schema_nested_binding = new(
-        $sformatf("schema_nested_bar_%0d_binding", i)
-      );
-      schema_nested_binding.copy(schema_binding);
-      schema_bar_probe = new($sformatf("schema_derived_bar_%0d", i));
-      schema_bar_probe.copy(schema_binding.pcie.bar[i]);
-      schema_bar_probe.clone_calls = 0;
-      schema_nested_binding.pcie.bar[i] = schema_bar_probe;
-      expect_status($sformatf("SCHEMA_DERIVED_BAR_%0d_REJECT", i),
-                    schema_rm.create_pd(schema_nested_binding, schema_pd),
-                    RDMA_SC_INVALID_ARGUMENT);
-      if (schema_pd != null || schema_bar_probe.clone_calls != 0)
-        `uvm_error("SCHEMA_DERIVED_BAR_PREDISPATCH",
-                   $sformatf("derived BAR[%0d] was cloned or published", i))
-    end
-    expect_status("SCHEMA_CREATE_PD",
-                  schema_rm.create_pd(schema_binding, schema_pd), RDMA_SC_OK);
-    if (schema_pd == null || schema_pd.local_pd_id != 0)
-      `uvm_error("SCHEMA_BINDING_REJECTION_ATOMIC",
-                 "rejected binding graph consumed allocator state")
-    schema_saved_pcie = schema_binding.pcie;
-    schema_pcie_probe = new("schema_registered_derived_pcie");
-    schema_pcie_probe.copy(schema_saved_pcie);
-    schema_pcie_probe.clone_calls = 0;
-    schema_binding.pcie = schema_pcie_probe;
-    expect_status("SCHEMA_REGISTERED_PCIE_REJECT",
-                  schema_rm.create_aeq(schema_binding,
-                                       schema_rejected_aeq),
-                  RDMA_SC_INVALID_ARGUMENT);
-    if (schema_rejected_aeq != null || schema_pcie_probe.clone_calls != 0)
-      `uvm_error("SCHEMA_REGISTERED_PCIE_PREDISPATCH",
-                 "registered derived PCIe graph was ignored or cloned")
-    schema_binding.pcie = schema_saved_pcie;
-    expect_status("SCHEMA_CREATE_MR",
-                  schema_rm.create_mr(schema_binding, schema_pd.handle,
-                                      schema_seed_mr),
+    projection_unregistered_mr.clone_calls = 0;
+    mutating_clone_length = projection_unregistered_mr.length;
+    expect_status("PROJECTION_UNREGISTERED_MR_STAGE",
+                  projection_rm.stage_allocated(projection_unregistered_mr),
                   RDMA_SC_OK);
-    prepare_mr(schema_seed_mr, 64'h6100_0000);
+    if (projection_unregistered_mr.clone_calls != 0 ||
+        projection_unregistered_mr.length != mutating_clone_length ||
+        projection_unregistered_mr.extra_scalar != 32'hc011_aa01 ||
+        projection_unregistered_mr.extra_child == null)
+      `uvm_error("PROJECTION_UNREGISTERED_MR_SOURCE",
+                 "unregistered MR virtual hook ran or source fields changed")
+    expect_status("PROJECTION_UNREGISTERED_MR_LOOKUP",
+                  projection_rm.lookup(projection_seed_mr.handle, resource),
+                  RDMA_SC_OK);
+    projection_unregistered_mr_leak = null;
+    projection_lookup_mr = null;
+    if (resource == null ||
+        !$cast(projection_lookup_mr, resource) ||
+        $cast(projection_unregistered_mr_leak, resource) ||
+        resource.handle == projection_unregistered_mr.handle ||
+        resource.owner == projection_unregistered_mr.owner ||
+        projection_lookup_mr.pd_h ==
+          projection_unregistered_mr.extra_child)
+      `uvm_error("PROJECTION_UNREGISTERED_MR_STORAGE",
+                 "unregistered MR, root handle, or extension child escaped projection")
+    expect_status("PROJECTION_UNREGISTERED_MR_COMMIT",
+                  projection_rm.commit_programmed(projection_unregistered_mr),
+                  RDMA_SC_OK);
+    expect_status("PROJECTION_UNREGISTERED_MR_ACTIVATE",
+                  projection_rm.activate(projection_seed_mr.handle),
+                  RDMA_SC_OK);
+    if (projection_unregistered_mr.clone_calls != 0 ||
+        projection_unregistered_mr.length != mutating_clone_length)
+      `uvm_error("PROJECTION_UNREGISTERED_MR_LIFECYCLE",
+                 "MR lifecycle dispatched through the public carrier")
 
-    schema_mr = new("schema_derived_mr");
-    schema_mr.copy(schema_seed_mr);
-    schema_handle = new("schema_extra_handle");
-    schema_handle.copy(schema_seed_mr.pd_h);
-    schema_mr.extra_scalar = 32'h51a7_ee01;
-    schema_mr.extra_child = schema_handle;
-    schema_mr.clone_calls = 0;
-    schema_handle.clone_calls = 0;
-    schema_authoritative =
-      schema_rm.observed_resource_probe(schema_seed_mr.handle);
-    expect_status("SCHEMA_DERIVED_MR_REJECT",
-                  schema_rm.stage_allocated(schema_mr),
-                  RDMA_SC_INVALID_ARGUMENT);
-    if (schema_mr.clone_calls != 0 || schema_handle.clone_calls != 0 ||
-        schema_mr.extra_scalar != 32'h51a7_ee01 ||
-        schema_mr.extra_child != schema_handle)
-      `uvm_error("SCHEMA_DERIVED_MR_PREDISPATCH",
-                 "derived MR was cloned or mutated before rejection")
-    if (schema_rm.observed_resource_probe(schema_seed_mr.handle) !=
-          schema_authoritative || schema_authoritative == null ||
-        schema_authoritative.state != RDMA_RESOURCE_ALLOCATED)
-      `uvm_error("SCHEMA_DERIVED_MR_ATOMIC",
-                 "derived MR rejection changed registry authority")
-    // Restore the exact authority after a RED implementation accepts the
-    // hostile candidate so later schema probes remain independent.
-    schema_rm.reset_publication_probe(schema_seed_mr, 1'b0);
-
-    schema_nested_mr = new("schema_nested_handle_mr");
-    schema_nested_mr.copy(schema_seed_mr);
-    schema_handle = new("schema_derived_pd_handle");
-    schema_handle.copy(schema_seed_mr.pd_h);
-    schema_nested_mr.pd_h = schema_handle;
-    schema_handle.clone_calls = 0;
-    schema_authoritative =
-      schema_rm.observed_resource_probe(schema_seed_mr.handle);
-    expect_status("SCHEMA_DERIVED_HANDLE_REJECT",
-                  schema_rm.stage_allocated(schema_nested_mr),
-                  RDMA_SC_INVALID_ARGUMENT);
-    if (schema_handle.clone_calls != 0 ||
-        schema_nested_mr.pd_h != schema_handle)
-      `uvm_error("SCHEMA_DERIVED_HANDLE_PREDISPATCH",
-                 "derived nested handle was cloned or replaced")
-    if (schema_rm.observed_resource_probe(schema_seed_mr.handle) !=
-          schema_authoritative)
-      `uvm_error("SCHEMA_DERIVED_HANDLE_ATOMIC",
-                 "nested-handle rejection changed registry authority")
-    schema_rm.reset_publication_probe(schema_seed_mr, 1'b0);
-
-    schema_nested_mr = new("schema_nested_function_handle_mr");
-    schema_nested_mr.copy(schema_seed_mr);
-    schema_function_handle = new("schema_derived_resource_owner");
-    schema_function_handle.copy(schema_seed_mr.owner);
-    schema_function_handle.clone_calls = 0;
-    schema_nested_mr.owner = schema_function_handle;
-    schema_authoritative =
-      schema_rm.observed_resource_probe(schema_seed_mr.handle);
-    expect_status("SCHEMA_DERIVED_FUNCTION_HANDLE_REJECT",
-                  schema_rm.stage_allocated(schema_nested_mr),
-                  RDMA_SC_INVALID_ARGUMENT);
-    if (schema_function_handle.clone_calls != 0 ||
-        schema_nested_mr.owner != schema_function_handle ||
-        schema_rm.observed_resource_probe(schema_seed_mr.handle) !=
-          schema_authoritative)
-      `uvm_error("SCHEMA_DERIVED_FUNCTION_HANDLE_PREDISPATCH",
-                 "derived Function owner was cloned or published")
-    schema_rm.reset_publication_probe(schema_seed_mr, 1'b0);
-
-    schema_nested_mr = new("schema_nested_ref_mr");
-    schema_nested_mr.copy(schema_seed_mr);
-    schema_mapping = new("schema_mapping");
-    schema_mapping.function_h = clone_function_handle(
-      "SCHEMA_MAPPING_FUNCTION", schema_binding.make_handle()
+    // A registered subtype can lie about get_object_type().  Inject it into the
+    // registry to cover later lookup/quiesce/restore paths as well as ingress.
+    projection_lying_mr = new("projection_lying_mr");
+    projection_lying_mr.copy(projection_unregistered_mr);
+    projection_lying_mr.state = RDMA_RESOURCE_ACTIVE;
+    projection_lying_mr.extra_scalar = 32'hc011_aa02;
+    projection_lying_mr.extra_child = clone_handle(
+      "PROJECTION_LYING_MR_EXTRA", projection_seed_mr.pd_h
     );
-    schema_mapping.requester_bdf = schema_binding.pcie.bdf;
-    schema_mapping.backing_addr.value = 64'h6200_0000;
-    schema_mapping.iova.value = 64'h6300_0000;
-    schema_mapping.size = 64'h1000;
-    schema_mapping.direction = RDMA_DMA_BIDIRECTIONAL;
-    schema_mapping.permissions =
+    projection_lying_mr.clone_calls = 0;
+    mutating_clone_length = projection_lying_mr.length;
+    projection_rm.replace_authoritative(projection_lying_mr);
+    expect_status("PROJECTION_LYING_MR_LOOKUP",
+                  projection_rm.lookup(projection_lying_mr.handle, resource),
+                  RDMA_SC_OK);
+    projection_lying_mr_leak = null;
+    projection_lookup_mr = null;
+    if (projection_lying_mr.clone_calls != 0 ||
+        projection_lying_mr.length != mutating_clone_length ||
+        projection_lying_mr.extra_scalar != 32'hc011_aa02 ||
+        !$cast(projection_lookup_mr, resource) ||
+        $cast(projection_lying_mr_leak, resource) ||
+        projection_lookup_mr.pd_h == projection_lying_mr.extra_child)
+      `uvm_error("PROJECTION_LYING_MR_LOOKUP_STORAGE",
+                 "lying MR hook ran, source changed, subtype escaped, or extension child leaked")
+    expect_status("PROJECTION_LYING_MR_QUIESCE",
+                  projection_rm.begin_quiesce(projection_lying_mr.handle),
+                  RDMA_SC_OK);
+    projection_lying_mr_leak = null;
+    if (projection_lying_mr.clone_calls != 0 ||
+        projection_lying_mr.state != RDMA_RESOURCE_ACTIVE ||
+        $cast(projection_lying_mr_leak,
+              projection_rm.observed_resource_probe(
+                projection_lying_mr.handle
+              )) ||
+        projection_rm.observed_resource_probe(
+          projection_lying_mr.handle
+        ).state != RDMA_RESOURCE_QUIESCING)
+      `uvm_error("PROJECTION_LYING_MR_QUIESCE_STORAGE",
+                 "quiesce retained or mutated a lying registry carrier")
+    expect_status("PROJECTION_LYING_MR_RESTORE",
+                  projection_rm.restore_active(projection_lying_mr.handle),
+                  RDMA_SC_OK);
+    if (projection_lying_mr.clone_calls != 0 ||
+        projection_lying_mr.state != RDMA_RESOURCE_ACTIVE)
+      `uvm_error("PROJECTION_LYING_MR_RESTORE_SOURCE",
+                 "restore dispatched through the lying registry carrier")
+
+    // handle.kind selects the built-in projection class.  A carrier whose
+    // declared resource class disagrees must fail with a null output and must
+    // not disturb the already-normalized registry entry.
+    projection_mismatched_mr = new("projection_mismatched_mr");
+    projection_mismatched_mr.copy(projection_seed_mr);
+    projection_mismatched_mr.handle.kind = RDMA_RESOURCE_PD;
+    resource = projection_seed_mr;
+    expect_status(
+      "PROJECTION_KIND_CLASS_MISMATCH",
+      projection_rm.probe_public_resource_projection(
+        projection_mismatched_mr, resource
+      ), RDMA_SC_INVALID_ARGUMENT
+    );
+    if (resource != null || projection_mismatched_mr.clone_calls != 0)
+      `uvm_error("PROJECTION_KIND_CLASS_MISMATCH_OUTPUT",
+                 "kind/class mismatch retained output or invoked a hook")
+    expect_status("PROJECTION_KIND_CLASS_MISMATCH_ROLLBACK",
+                  projection_rm.lookup(projection_seed_mr.handle, resource),
+                  RDMA_SC_OK);
+    if (resource == null || resource.state != RDMA_RESOURCE_ACTIVE)
+      `uvm_error("PROJECTION_KIND_CLASS_MISMATCH_ROLLBACK",
+                 "failed projection changed the authoritative registry")
+
+    // Nested inherited-wrapper and lying-wrapper mappings are independently
+    // projected; extension children cannot enter the registry graph.
+    expect_status("PROJECTION_CREATE_NESTED_MR",
+                  projection_rm.create_mr(projection_binding,
+                                          projection_pd.handle,
+                                          projection_nested_mr),
+                  RDMA_SC_OK);
+    prepare_mr(projection_nested_mr, 64'h6200_0000);
+    projection_unregistered_mapping =
+      new("projection_unregistered_mapping");
+    projection_unregistered_mapping.function_h = clone_function_handle(
+      "PROJECTION_UNREGISTERED_MAPPING_FUNCTION",
+      projection_binding.make_handle()
+    );
+    projection_unregistered_mapping.requester_bdf =
+      projection_binding.pcie.bdf;
+    projection_unregistered_mapping.backing_addr.value = 64'h6300_0000;
+    projection_unregistered_mapping.iova.value = 64'h6400_0000;
+    projection_unregistered_mapping.size = 64'h1000;
+    projection_unregistered_mapping.direction = RDMA_DMA_BIDIRECTIONAL;
+    projection_unregistered_mapping.permissions =
       '{device_read:1'b1, device_write:1'b1, atomic:1'b0};
-    schema_mapping.state = RDMA_MAPPING_ACTIVE;
-    schema_mapping.owner_h = clone_handle(
-      "SCHEMA_MAPPING_OWNER", schema_seed_mr.handle
+    projection_unregistered_mapping.state = RDMA_MAPPING_ACTIVE;
+    projection_unregistered_mapping.owner_h = clone_handle(
+      "PROJECTION_UNREGISTERED_MAPPING_OWNER", projection_nested_mr.handle
     );
-    schema_backing_ref = new("schema_derived_backing_ref");
-    schema_backing_ref.mapping = schema_mapping;
-    schema_backing_ref.ownership = RDMA_OWNERSHIP_CONTROL_PLANE;
-    schema_nested_mr.backing_refs.push_back(schema_backing_ref);
-    schema_backing_ref.clone_calls = 0;
-    schema_authoritative =
-      schema_rm.observed_resource_probe(schema_seed_mr.handle);
-    expect_status("SCHEMA_DERIVED_REF_REJECT",
-                  schema_rm.stage_allocated(schema_nested_mr),
-                  RDMA_SC_INVALID_ARGUMENT);
-    if (schema_backing_ref.clone_calls != 0 ||
-        schema_nested_mr.backing_refs[0] != schema_backing_ref)
-      `uvm_error("SCHEMA_DERIVED_REF_PREDISPATCH",
-                 "derived nested backing reference was cloned or replaced")
-    if (schema_rm.observed_resource_probe(schema_seed_mr.handle) !=
-          schema_authoritative)
-      `uvm_error("SCHEMA_DERIVED_REF_ATOMIC",
-                 "nested-reference rejection changed registry authority")
-    schema_rm.reset_publication_probe(schema_seed_mr, 1'b0);
-
-    schema_nested_mr = new("schema_nested_mapping_mr");
-    schema_nested_mr.copy(schema_seed_mr);
-    schema_exact_backing_ref = new("schema_exact_backing_ref");
-    schema_mapping_probe = new("schema_derived_mapping");
-    schema_mapping_probe.copy(schema_mapping);
-    schema_mapping_probe.clone_calls = 0;
-    schema_exact_backing_ref.mapping = schema_mapping_probe;
-    schema_exact_backing_ref.ownership = RDMA_OWNERSHIP_CONTROL_PLANE;
-    schema_nested_mr.backing_refs.push_back(schema_exact_backing_ref);
-    schema_authoritative =
-      schema_rm.observed_resource_probe(schema_seed_mr.handle);
-    expect_status("SCHEMA_DERIVED_MAPPING_REJECT",
-                  schema_rm.stage_allocated(schema_nested_mr),
-                  RDMA_SC_INVALID_ARGUMENT);
-    if (schema_mapping_probe.clone_calls != 0 ||
-        schema_exact_backing_ref.mapping != schema_mapping_probe ||
-        schema_rm.observed_resource_probe(schema_seed_mr.handle) !=
-          schema_authoritative)
-      `uvm_error("SCHEMA_DERIVED_MAPPING_PREDISPATCH",
-                 "derived mapping was cloned or published")
-    schema_rm.reset_publication_probe(schema_seed_mr, 1'b0);
-
-    schema_nested_mr = new("schema_nested_hmc_mr");
-    schema_nested_mr.copy(schema_seed_mr);
-    schema_hmc_probe = new("schema_derived_hmc_ref");
-    schema_hmc_probe.owner = clone_function_handle(
-      "SCHEMA_HMC_OWNER", schema_binding.make_handle()
+    projection_unregistered_mapping.extra_child = clone_handle(
+      "PROJECTION_UNREGISTERED_MAPPING_EXTRA", projection_nested_mr.pd_h
     );
-    schema_hmc_probe.object_kind = RDMA_RESOURCE_MR;
-    schema_hmc_probe.address.value = 64'h6400_0000;
-    schema_hmc_probe.size = 64'h1000;
-    schema_hmc_probe.first_pbl_index = 1;
-    schema_hmc_probe.ownership = RDMA_OWNERSHIP_CONTROL_PLANE;
-    schema_hmc_probe.clone_calls = 0;
-    schema_nested_mr.hmc_refs.push_back(schema_hmc_probe);
-    schema_authoritative =
-      schema_rm.observed_resource_probe(schema_seed_mr.handle);
-    expect_status("SCHEMA_DERIVED_HMC_REJECT",
-                  schema_rm.stage_allocated(schema_nested_mr),
-                  RDMA_SC_INVALID_ARGUMENT);
-    if (schema_hmc_probe.clone_calls != 0 ||
-        schema_nested_mr.hmc_refs[0] != schema_hmc_probe ||
-        schema_rm.observed_resource_probe(schema_seed_mr.handle) !=
-          schema_authoritative)
-      `uvm_error("SCHEMA_DERIVED_HMC_PREDISPATCH",
-                 "derived HMC reference was cloned or published")
-    schema_rm.reset_publication_probe(schema_seed_mr, 1'b0);
+    projection_unregistered_mapping.clone_calls = 0;
+    projection_unregistered_backing_ref =
+      new("projection_unregistered_backing_ref");
+    projection_unregistered_backing_ref.mapping =
+      projection_unregistered_mapping;
+    projection_unregistered_backing_ref.ownership =
+      RDMA_OWNERSHIP_CONTROL_PLANE;
+    projection_nested_mr.backing_refs.push_back(
+      projection_unregistered_backing_ref
+    );
 
-    // Corruption of an internal side table is contained.  Public read,
-    // lifecycle, and outstanding-operation APIs reject it without invoking
-    // the derived clone or replacing/mutating the corrupt entry.
-    schema_registry_mr = new("schema_registry_mr");
-    schema_registry_mr.copy(schema_seed_mr);
-    schema_registry_mr.state = RDMA_RESOURCE_ACTIVE;
-    schema_registry_mr.clone_calls = 0;
-    schema_rm.replace_authoritative(schema_registry_mr);
-    expect_status("SCHEMA_REGISTRY_LOOKUP_REJECT",
-                  schema_rm.lookup(schema_registry_mr.handle, resource),
-                  RDMA_SC_INVALID_ARGUMENT);
-    if (resource != null || schema_registry_mr.clone_calls != 0 ||
-        schema_rm.observed_resource_probe(schema_registry_mr.handle) !=
-          schema_registry_mr)
-      `uvm_error("SCHEMA_REGISTRY_LOOKUP_ATOMIC",
-                 "lookup cloned or replaced a derived registry entry")
-
-    schema_registry_mr.clone_calls = 0;
-    schema_registry_mr.state = RDMA_RESOURCE_ACTIVE;
-    expect_status("SCHEMA_REGISTRY_LIFECYCLE_REJECT",
-                  schema_rm.begin_quiesce(schema_registry_mr.handle),
-                  RDMA_SC_INVALID_ARGUMENT);
-    if (schema_registry_mr.clone_calls != 0 ||
-        schema_registry_mr.state != RDMA_RESOURCE_ACTIVE ||
-        schema_rm.observed_resource_probe(schema_registry_mr.handle) !=
-          schema_registry_mr)
-      `uvm_error("SCHEMA_REGISTRY_LIFECYCLE_ATOMIC",
-                 "lifecycle API cloned or mutated a derived registry entry")
-
-    schema_registry_mr.clone_calls = 0;
-    schema_registry_mr.state = RDMA_RESOURCE_ACTIVE;
-    schema_registry_mr.outstanding_ids.delete();
-    schema_rm.replace_authoritative(schema_registry_mr);
-    expect_status("SCHEMA_REGISTRY_TRACK_REJECT",
-                  schema_rm.track_outstanding(schema_registry_mr.handle,
-                                              64'h51a7_0001),
-                  RDMA_SC_INVALID_ARGUMENT);
-    if (schema_registry_mr.clone_calls != 0 ||
-        schema_registry_mr.outstanding_ids.size() != 0 ||
-        schema_rm.observed_resource_probe(schema_registry_mr.handle) !=
-          schema_registry_mr)
-      `uvm_error("SCHEMA_REGISTRY_TRACK_ATOMIC",
-                 "track API cloned or replaced a derived registry entry")
-
-    schema_registry_mr.clone_calls = 0;
-    schema_registry_mr.outstanding_ids.delete();
-    schema_registry_mr.outstanding_ids.push_back(64'h51a7_0002);
-    schema_rm.replace_authoritative(schema_registry_mr);
-    expect_status("SCHEMA_REGISTRY_RETIRE_REJECT",
-                  schema_rm.retire_outstanding(schema_registry_mr.handle,
-                                               64'h51a7_0002),
-                  RDMA_SC_INVALID_ARGUMENT);
-    if (schema_registry_mr.clone_calls != 0 ||
-        schema_registry_mr.outstanding_ids.size() != 1 ||
-        schema_registry_mr.outstanding_ids[0] != 64'h51a7_0002 ||
-        schema_rm.observed_resource_probe(schema_registry_mr.handle) !=
-          schema_registry_mr)
-      `uvm_error("SCHEMA_REGISTRY_RETIRE_ATOMIC",
-                 "retire API cloned or replaced a derived registry entry")
-    schema_rm.reset_publication_probe(schema_seed_mr, 1'b0);
-
-    expect_status("SCHEMA_CREATE_RECOVERY_PD",
-                  schema_rm.create_pd(schema_binding, schema_recovery_pd),
+    projection_lying_mapping = new("projection_lying_mapping");
+    projection_lying_mapping.function_h = clone_function_handle(
+      "PROJECTION_LYING_MAPPING_FUNCTION", projection_binding.make_handle()
+    );
+    projection_lying_mapping.requester_bdf = projection_binding.pcie.bdf;
+    projection_lying_mapping.backing_addr.value = 64'h6500_0000;
+    projection_lying_mapping.iova.value = 64'h6600_0000;
+    projection_lying_mapping.size = 64'h1000;
+    projection_lying_mapping.direction = RDMA_DMA_BIDIRECTIONAL;
+    projection_lying_mapping.permissions =
+      '{device_read:1'b1, device_write:1'b1, atomic:1'b0};
+    projection_lying_mapping.state = RDMA_MAPPING_ACTIVE;
+    projection_lying_mapping.owner_h = clone_handle(
+      "PROJECTION_LYING_MAPPING_OWNER", projection_nested_mr.handle
+    );
+    projection_lying_mapping.extra_child = clone_handle(
+      "PROJECTION_LYING_MAPPING_EXTRA", projection_nested_mr.pd_h
+    );
+    projection_lying_mapping.clone_calls = 0;
+    projection_lying_backing_ref = new("projection_lying_backing_ref");
+    projection_lying_backing_ref.mapping = projection_lying_mapping;
+    projection_lying_backing_ref.ownership = RDMA_OWNERSHIP_CONTROL_PLANE;
+    projection_nested_mr.backing_refs.push_back(
+      projection_lying_backing_ref
+    );
+    projection_size_before = projection_unregistered_mapping.size;
+    expect_status("PROJECTION_NESTED_MAPPING_STAGE",
+                  projection_rm.stage_allocated(projection_nested_mr),
                   RDMA_SC_OK);
-    schema_recovery = new("schema_derived_recovery");
-    schema_recovery.resource_h = clone_handle(
-      "SCHEMA_DERIVED_RECOVERY_H", schema_recovery_pd.handle
-    );
-    schema_recovery.hardware_presence = RDMA_HW_PRESENCE_ABSENT;
-    schema_recovery.primary_status = rdma_status::make(
-      RDMA_SC_RESET_CANCELLED, "derived recovery schema probe"
-    );
-    schema_recovery.extra_scalar = 32'h51a7_ee02;
-    schema_handle = new("schema_recovery_extra_handle");
-    schema_handle.copy(schema_recovery_pd.handle);
-    schema_recovery.extra_child = schema_handle;
-    schema_recovery.clone_calls = 0;
-    schema_handle.clone_calls = 0;
-    schema_authoritative =
-      schema_rm.observed_resource_probe(schema_recovery_pd.handle);
-    expect_status("SCHEMA_DERIVED_RECOVERY_REJECT",
-                  schema_rm.mark_error(schema_recovery_pd.handle,
-                                       schema_recovery),
-                  RDMA_SC_INVALID_ARGUMENT);
-    if (schema_recovery.clone_calls != 0 || schema_handle.clone_calls != 0 ||
-        schema_recovery.extra_scalar != 32'h51a7_ee02 ||
-        schema_recovery.extra_child != schema_handle)
-      `uvm_error("SCHEMA_DERIVED_RECOVERY_PREDISPATCH",
-                 "derived recovery was cloned or mutated before rejection")
-    if (schema_rm.observed_resource_probe(schema_recovery_pd.handle) !=
-          schema_authoritative || schema_authoritative == null ||
-        schema_authoritative.state != RDMA_RESOURCE_ALLOCATED ||
-        schema_rm.observed_recovery_probe(schema_recovery_pd.handle) != null)
-      `uvm_error("SCHEMA_DERIVED_RECOVERY_ATOMIC",
-                 "derived recovery rejection changed manager state")
-    schema_rm.reset_error_probe(schema_recovery_pd);
-
-    schema_nested_recovery = new("schema_nested_ticket_recovery");
-    schema_nested_recovery.resource_h = clone_handle(
-      "SCHEMA_NESTED_TICKET_H", schema_recovery_pd.handle
-    );
-    schema_nested_recovery.hardware_presence = RDMA_HW_PRESENCE_ABSENT;
-    schema_nested_recovery.primary_status = rdma_status::make(
-      RDMA_SC_RESET_CANCELLED, "nested ticket schema probe"
-    );
-    schema_ticket = new("schema_derived_ticket");
-    schema_ticket.command_id = 64'h51a7_1000_0000_0001;
-    schema_ticket.function_h = clone_function_handle(
-      "SCHEMA_TICKET_FUNCTION", schema_binding.make_handle()
-    );
-    schema_ticket.cmq_h = new("schema_ticket_cmq");
-    schema_ticket.cmq_h.kind = RDMA_RESOURCE_CMQ;
-    schema_ticket.cmq_h.function_uid = schema_binding.function_uid;
-    schema_ticket.cmq_h.object_id = {RDMA_RESOURCE_CMQ, 28'h000_0001};
-    schema_ticket.cmq_h.generation = schema_binding.generation;
-    schema_ticket.slot_sequence = 64'd1;
-    schema_ticket.sq_index = 32'd1;
-    schema_ticket.sq_wrap = 1'b0;
-    schema_opcode = new("schema_ticket_opcode");
-    schema_opcode.profile_name = "schema_probe";
-    schema_opcode.opcode = 32'h51a7;
-    schema_opcode.variant = "default";
-    schema_ticket.opcode_key = schema_opcode;
-    schema_ticket.absolute_deadline = 100ns;
-    schema_ticket.clone_calls = 0;
-    schema_nested_recovery.ambiguous_ticket = schema_ticket;
-    schema_authoritative =
-      schema_rm.observed_resource_probe(schema_recovery_pd.handle);
-    expect_status("SCHEMA_DERIVED_TICKET_REJECT",
-                  schema_rm.mark_error(schema_recovery_pd.handle,
-                                       schema_nested_recovery),
-                  RDMA_SC_INVALID_ARGUMENT);
-    if (schema_ticket.clone_calls != 0 ||
-        schema_nested_recovery.ambiguous_ticket != schema_ticket)
-      `uvm_error("SCHEMA_DERIVED_TICKET_PREDISPATCH",
-                 "derived recovery ticket was cloned or replaced")
-    if (schema_rm.observed_resource_probe(schema_recovery_pd.handle) !=
-          schema_authoritative ||
-        schema_rm.observed_recovery_probe(schema_recovery_pd.handle) != null)
-      `uvm_error("SCHEMA_DERIVED_TICKET_ATOMIC",
-                 "nested-ticket rejection changed manager state")
-    schema_rm.reset_error_probe(schema_recovery_pd);
-
-    schema_nested_recovery = new("schema_nested_opcode_recovery");
-    schema_nested_recovery.resource_h = clone_handle(
-      "SCHEMA_NESTED_OPCODE_H", schema_recovery_pd.handle
-    );
-    schema_nested_recovery.hardware_presence = RDMA_HW_PRESENCE_ABSENT;
-    schema_nested_recovery.primary_status = rdma_status::make(
-      RDMA_SC_RESET_CANCELLED, "nested opcode schema probe"
-    );
-    schema_exact_ticket = new("schema_exact_ticket");
-    schema_exact_ticket.command_id = 64'h51a7_1000_0000_0002;
-    schema_exact_ticket.function_h = clone_function_handle(
-      "SCHEMA_OPCODE_FUNCTION", schema_binding.make_handle()
-    );
-    schema_exact_ticket.cmq_h = new("schema_opcode_cmq");
-    schema_exact_ticket.cmq_h.kind = RDMA_RESOURCE_CMQ;
-    schema_exact_ticket.cmq_h.function_uid = schema_binding.function_uid;
-    schema_exact_ticket.cmq_h.object_id =
-      {RDMA_RESOURCE_CMQ, 28'h000_0002};
-    schema_exact_ticket.cmq_h.generation = schema_binding.generation;
-    schema_exact_ticket.slot_sequence = 64'd2;
-    schema_exact_ticket.sq_index = 32'd2;
-    schema_exact_ticket.sq_wrap = 1'b0;
-    schema_opcode_probe = new("schema_derived_opcode");
-    schema_opcode_probe.profile_name = "schema_probe";
-    schema_opcode_probe.opcode = 32'h51a8;
-    schema_opcode_probe.variant = "default";
-    schema_opcode_probe.clone_calls = 0;
-    schema_exact_ticket.opcode_key = schema_opcode_probe;
-    schema_exact_ticket.absolute_deadline = 100ns;
-    schema_nested_recovery.ambiguous_ticket = schema_exact_ticket;
-    schema_authoritative =
-      schema_rm.observed_resource_probe(schema_recovery_pd.handle);
-    expect_status("SCHEMA_DERIVED_OPCODE_REJECT",
-                  schema_rm.mark_error(schema_recovery_pd.handle,
-                                       schema_nested_recovery),
-                  RDMA_SC_INVALID_ARGUMENT);
-    if (schema_opcode_probe.clone_calls != 0 ||
-        schema_exact_ticket.opcode_key != schema_opcode_probe ||
-        schema_rm.observed_resource_probe(schema_recovery_pd.handle) !=
-          schema_authoritative ||
-        schema_rm.observed_recovery_probe(schema_recovery_pd.handle) != null)
-      `uvm_error("SCHEMA_DERIVED_OPCODE_PREDISPATCH",
-                 "derived opcode was cloned or published")
-    schema_rm.reset_error_probe(schema_recovery_pd);
-
-    schema_nested_recovery = new("schema_nested_status_recovery");
-    schema_nested_recovery.resource_h = clone_handle(
-      "SCHEMA_NESTED_STATUS_H", schema_recovery_pd.handle
-    );
-    schema_nested_recovery.hardware_presence = RDMA_HW_PRESENCE_ABSENT;
-    schema_status = new("schema_derived_status");
-    schema_status.category = RDMA_STATUS_RESET;
-    schema_status.code = RDMA_SC_RESET_CANCELLED;
-    schema_status.message = "nested status schema probe";
-    schema_status.clone_calls = 0;
-    schema_nested_recovery.primary_status = schema_status;
-    schema_authoritative =
-      schema_rm.observed_resource_probe(schema_recovery_pd.handle);
-    expect_status("SCHEMA_DERIVED_STATUS_REJECT",
-                  schema_rm.mark_error(schema_recovery_pd.handle,
-                                       schema_nested_recovery),
-                  RDMA_SC_INVALID_ARGUMENT);
-    if (schema_status.clone_calls != 0 ||
-        schema_nested_recovery.primary_status != schema_status)
-      `uvm_error("SCHEMA_DERIVED_STATUS_PREDISPATCH",
-                 "derived recovery status was cloned or replaced")
-    if (schema_rm.observed_resource_probe(schema_recovery_pd.handle) !=
-          schema_authoritative ||
-        schema_rm.observed_recovery_probe(schema_recovery_pd.handle) != null)
-      `uvm_error("SCHEMA_DERIVED_STATUS_ATOMIC",
-                 "nested-status rejection changed manager state")
-    schema_rm.reset_error_probe(schema_recovery_pd);
-
-    // An exact built-in recovery remains supported, then a derived object
-    // injected directly into the side table is rejected without clone/delete.
-    schema_nested_recovery = new("schema_exact_recovery");
-    schema_nested_recovery.resource_h = clone_handle(
-      "SCHEMA_EXACT_RECOVERY_H", schema_recovery_pd.handle
-    );
-    schema_nested_recovery.hardware_presence = RDMA_HW_PRESENCE_ABSENT;
-    schema_nested_recovery.primary_status = rdma_status::make(
-      RDMA_SC_RESET_CANCELLED, "exact recovery schema probe"
-    );
-    expect_status("SCHEMA_EXACT_RECOVERY_MARK",
-                  schema_rm.mark_error(schema_recovery_pd.handle,
-                                       schema_nested_recovery),
+    if (projection_unregistered_mapping.clone_calls != 0 ||
+        projection_lying_mapping.clone_calls != 0 ||
+        projection_unregistered_mapping.size != projection_size_before ||
+        projection_lying_mapping.size != projection_size_before)
+      `uvm_error("PROJECTION_NESTED_MAPPING_SOURCE",
+                 "nested mapping hook ran or source mapping changed")
+    expect_status("PROJECTION_NESTED_MAPPING_LOOKUP",
+                  projection_rm.lookup(projection_nested_mr.handle, resource),
                   RDMA_SC_OK);
-    expect_status("SCHEMA_EXACT_RECOVERY_LOOKUP",
-                  schema_rm.lookup_recovery(schema_recovery_pd.handle,
-                                            recovery_lookup),
-                  RDMA_SC_OK);
-    schema_registry_recovery = new("schema_registry_recovery");
-    schema_registry_recovery.copy(schema_nested_recovery);
-    schema_registry_recovery.clone_calls = 0;
-    schema_rm.inject_recovery_probe(schema_recovery_pd.handle,
-                                    schema_registry_recovery);
-    schema_recovery_before =
-      schema_rm.observed_recovery_probe(schema_recovery_pd.handle);
-    expect_status("SCHEMA_RECOVERY_TABLE_LOOKUP_REJECT",
-                  schema_rm.lookup_recovery(schema_recovery_pd.handle,
-                                            recovery_lookup),
-                  RDMA_SC_INVALID_ARGUMENT);
-    if (recovery_lookup != null || schema_registry_recovery.clone_calls != 0 ||
-        schema_rm.observed_recovery_probe(schema_recovery_pd.handle) !=
-          schema_recovery_before)
-      `uvm_error("SCHEMA_RECOVERY_TABLE_LOOKUP_ATOMIC",
-                 "lookup cloned or replaced a derived recovery entry")
-    schema_registry_recovery.clone_calls = 0;
-    schema_rm.inject_recovery_probe(schema_recovery_pd.handle,
-                                    schema_registry_recovery);
-    expect_status("SCHEMA_RECOVERY_TABLE_CLEAR_REJECT",
-                  schema_rm.clear_recovery(schema_recovery_pd.handle),
-                  RDMA_SC_INVALID_ARGUMENT);
-    if (schema_registry_recovery.clone_calls != 0 ||
-        schema_rm.observed_recovery_probe(schema_recovery_pd.handle) !=
-          schema_registry_recovery)
-      `uvm_error("SCHEMA_RECOVERY_TABLE_CLEAR_ATOMIC",
-                 "clear cloned or deleted a derived recovery entry")
-    schema_authoritative =
-      schema_rm.observed_resource_probe(schema_recovery_pd.handle);
-    expect_status("SCHEMA_RECOVERY_TABLE_FINALIZE_REJECT",
-                  schema_rm.finalize_release(schema_recovery_pd.handle),
-                  RDMA_SC_INVALID_ARGUMENT);
-    if (schema_rm.observed_resource_probe(schema_recovery_pd.handle) !=
-          schema_authoritative ||
-        schema_rm.observed_recovery_probe(schema_recovery_pd.handle) !=
-          schema_registry_recovery)
-      `uvm_error("SCHEMA_RECOVERY_TABLE_FINALIZE_ATOMIC",
-                 "finalize deleted corrupt recovery authority")
-    expect_status("SCHEMA_RECOVERY_TABLE_FUNCTION_RELEASE_REJECT",
-                  schema_rm.release_function(schema_binding.make_handle()),
-                  RDMA_SC_INVALID_ARGUMENT);
-    if (schema_rm.observed_resource_probe(schema_recovery_pd.handle) !=
-          schema_authoritative ||
-        schema_rm.observed_recovery_probe(schema_recovery_pd.handle) !=
-          schema_registry_recovery)
-      `uvm_error("SCHEMA_RECOVERY_TABLE_RELEASE_ATOMIC",
-                 "Function teardown deleted corrupt recovery authority")
-    schema_rm.inject_recovery_probe(schema_recovery_pd.handle,
-                                    schema_nested_recovery);
-    expect_status("SCHEMA_RELEASE_FUNCTION",
-                  schema_rm.release_function(schema_binding.make_handle()),
-                  RDMA_SC_OK);
-    expect_status("SCHEMA_NO_LEAKS",
-                  schema_rm.check_leaks(leak_count), RDMA_SC_OK);
+    projection_unregistered_mapping_leak = null;
+    projection_lying_mapping_leak = null;
+    if (resource == null || resource.backing_refs.size() != 2 ||
+        resource.backing_refs[0] == null ||
+        resource.backing_refs[1] == null ||
+        $cast(projection_unregistered_mapping_leak,
+              resource.backing_refs[0].mapping) ||
+        $cast(projection_lying_mapping_leak,
+              resource.backing_refs[1].mapping) ||
+        resource.backing_refs[0].mapping ==
+          projection_unregistered_mapping ||
+        resource.backing_refs[1].mapping == projection_lying_mapping ||
+        resource.backing_refs[0].mapping.function_h ==
+          projection_unregistered_mapping.extra_child ||
+        resource.backing_refs[0].mapping.owner_h ==
+          projection_unregistered_mapping.extra_child ||
+        resource.backing_refs[1].mapping.function_h ==
+          projection_lying_mapping.extra_child ||
+        resource.backing_refs[1].mapping.owner_h ==
+          projection_lying_mapping.extra_child)
+      `uvm_error("PROJECTION_NESTED_MAPPING_STORAGE",
+                 "mapping subtype, extension graph, or alias escaped projection")
 
+    // Recovery roots use the same carrier rule at ingress and on later table
+    // reads.  Both wrapper-spoof mechanisms must remain hook-free.
+    expect_status("PROJECTION_CREATE_RECOVERY_PD_A",
+                  projection_rm.create_pd(projection_binding,
+                                          projection_recovery_pd_a),
+                  RDMA_SC_OK);
+    projection_unregistered_recovery =
+      new("projection_unregistered_recovery");
+    projection_unregistered_recovery.resource_h = clone_handle(
+      "PROJECTION_UNREGISTERED_RECOVERY_H",
+      projection_recovery_pd_a.handle
+    );
+    projection_unregistered_recovery.hardware_presence =
+      RDMA_HW_PRESENCE_ABSENT;
+    projection_unregistered_recovery.primary_status = rdma_status::make(
+      RDMA_SC_RESET_CANCELLED, "unregistered recovery carrier"
+    );
+    projection_unregistered_recovery.extra_child = clone_handle(
+      "PROJECTION_UNREGISTERED_RECOVERY_EXTRA",
+      projection_recovery_pd_a.handle
+    );
+    projection_unregistered_recovery.clone_calls = 0;
+    projection_presence_before =
+      projection_unregistered_recovery.hardware_presence;
+    expect_status("PROJECTION_UNREGISTERED_RECOVERY_MARK",
+                  projection_rm.mark_error(
+                    projection_recovery_pd_a.handle,
+                    projection_unregistered_recovery
+                  ), RDMA_SC_OK);
+    if (projection_unregistered_recovery.clone_calls != 0 ||
+        projection_unregistered_recovery.hardware_presence !=
+          projection_presence_before ||
+        projection_unregistered_recovery.extra_scalar != 32'hc011_c001 ||
+        projection_unregistered_recovery.extra_child == null)
+      `uvm_error("PROJECTION_UNREGISTERED_RECOVERY_SOURCE",
+                 "unregistered recovery hook ran or source changed")
+    expect_status("PROJECTION_UNREGISTERED_RECOVERY_LOOKUP",
+                  projection_rm.lookup_recovery(
+                    projection_recovery_pd_a.handle, recovery_lookup
+                  ), RDMA_SC_OK);
+    projection_unregistered_recovery_leak = null;
+    if (recovery_lookup == null ||
+        $cast(projection_unregistered_recovery_leak, recovery_lookup) ||
+        recovery_lookup.resource_h ==
+          projection_unregistered_recovery.resource_h ||
+        recovery_lookup.resource_h ==
+          projection_unregistered_recovery.extra_child)
+      `uvm_error("PROJECTION_UNREGISTERED_RECOVERY_STORAGE",
+                 "unregistered recovery or handle alias escaped projection")
+    expect_status("PROJECTION_UNREGISTERED_RECOVERY_CLEAR",
+                  projection_rm.clear_recovery(
+                    projection_recovery_pd_a.handle
+                  ), RDMA_SC_OK);
+
+    expect_status("PROJECTION_CREATE_RECOVERY_PD_B",
+                  projection_rm.create_pd(projection_binding,
+                                          projection_recovery_pd_b),
+                  RDMA_SC_OK);
+    projection_lying_recovery = new("projection_lying_recovery");
+    projection_lying_recovery.resource_h = clone_handle(
+      "PROJECTION_LYING_RECOVERY_H", projection_recovery_pd_b.handle
+    );
+    projection_lying_recovery.hardware_presence = RDMA_HW_PRESENCE_ABSENT;
+    projection_lying_recovery.primary_status = rdma_status::make(
+      RDMA_SC_RESET_CANCELLED, "lying recovery carrier"
+    );
+    projection_lying_recovery.extra_child = clone_handle(
+      "PROJECTION_LYING_RECOVERY_EXTRA", projection_recovery_pd_b.handle
+    );
+    projection_lying_recovery.clone_calls = 0;
+    projection_presence_before = projection_lying_recovery.hardware_presence;
+    expect_status("PROJECTION_LYING_RECOVERY_MARK",
+                  projection_rm.mark_error(
+                    projection_recovery_pd_b.handle,
+                    projection_lying_recovery
+                  ), RDMA_SC_OK);
+    if (projection_lying_recovery.clone_calls != 0 ||
+        projection_lying_recovery.hardware_presence !=
+          projection_presence_before ||
+        projection_lying_recovery.extra_scalar != 32'hc011_c002)
+      `uvm_error("PROJECTION_LYING_RECOVERY_SOURCE",
+                 "lying recovery hook ran or source changed")
+    expect_status("PROJECTION_LYING_RECOVERY_LOOKUP",
+                  projection_rm.lookup_recovery(
+                    projection_recovery_pd_b.handle, recovery_lookup
+                  ), RDMA_SC_OK);
+    projection_lying_recovery_leak = null;
+    if (recovery_lookup == null ||
+        $cast(projection_lying_recovery_leak, recovery_lookup) ||
+        recovery_lookup.resource_h == projection_lying_recovery.extra_child)
+      `uvm_error("PROJECTION_LYING_RECOVERY_STORAGE",
+                 "lying recovery subtype or extension child escaped ingress projection")
+
+    // Simulate later table corruption with a fresh lying carrier.  Lookup must
+    // return a built-in projection and clear must remove it without dispatch.
+    projection_lying_recovery = new("projection_late_lying_recovery");
+    projection_lying_recovery.copy(recovery_lookup);
+    projection_lying_recovery.extra_child = clone_handle(
+      "PROJECTION_LATE_RECOVERY_EXTRA", projection_recovery_pd_b.handle
+    );
+    projection_lying_recovery.clone_calls = 0;
+    projection_presence_before = projection_lying_recovery.hardware_presence;
+    projection_rm.inject_recovery_probe(projection_recovery_pd_b.handle,
+                                        projection_lying_recovery);
+    expect_status("PROJECTION_LATE_RECOVERY_LOOKUP",
+                  projection_rm.lookup_recovery(
+                    projection_recovery_pd_b.handle, recovery_lookup_again
+                  ), RDMA_SC_OK);
+    projection_lying_recovery_leak = null;
+    if (projection_lying_recovery.clone_calls != 0 ||
+        projection_lying_recovery.hardware_presence !=
+          projection_presence_before ||
+        recovery_lookup_again == null ||
+        $cast(projection_lying_recovery_leak, recovery_lookup_again) ||
+        recovery_lookup_again.resource_h ==
+          projection_lying_recovery.extra_child)
+      `uvm_error("PROJECTION_LATE_RECOVERY_STORAGE",
+                 "later recovery lookup dispatched or retained subtype")
+    expect_status("PROJECTION_LATE_RECOVERY_CLEAR",
+                  projection_rm.clear_recovery(
+                    projection_recovery_pd_b.handle
+                  ), RDMA_SC_OK);
+    if (projection_lying_recovery.clone_calls != 0 ||
+        projection_rm.observed_recovery_probe(
+          projection_recovery_pd_b.handle
+        ) != null)
+      `uvm_error("PROJECTION_LATE_RECOVERY_CLEAR",
+                 "later recovery clear dispatched or retained carrier")
+
+    expect_status("PROJECTION_RELEASE_FUNCTION",
+                  projection_rm.release_function(
+                    projection_binding.make_handle()
+                  ), RDMA_SC_OK);
+    expect_status("PROJECTION_NO_LEAKS",
+                  projection_rm.check_leaks(leak_count), RDMA_SC_OK);
     // Controlled lifecycle publication keeps the registry authoritative and
     // detached from every candidate and lookup snapshot.
     lifecycle_rm = rdma_resource_manager::type_id::create("lifecycle_rm");
