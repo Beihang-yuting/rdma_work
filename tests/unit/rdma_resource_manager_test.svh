@@ -59,6 +59,112 @@ class rdma_width_probe_manager extends rdma_resource_manager;
   endfunction
 endclass
 
+typedef enum bit [2:0] {
+  RDMA_RM_CLONE_GOOD,
+  RDMA_RM_CLONE_SELF,
+  RDMA_RM_CLONE_WRONG,
+  RDMA_RM_CLONE_DRIFT,
+  RDMA_RM_CLONE_BACKING_DRIFT,
+  RDMA_RM_CLONE_HMC_DRIFT
+} rdma_rm_clone_fault_e;
+
+class rdma_rm_fault_mr extends rdma_mr;
+  `uvm_object_utils(rdma_rm_fault_mr)
+
+  rdma_rm_clone_fault_e clone_fault;
+
+  function new(string name = "rdma_rm_fault_mr");
+    super.new(name);
+    clone_fault = RDMA_RM_CLONE_GOOD;
+  endfunction
+
+  virtual function uvm_object clone();
+    uvm_object cloned_object;
+    rdma_rm_fault_mr cloned_mr;
+    rdma_pd wrong_pd;
+
+    case (clone_fault)
+      RDMA_RM_CLONE_SELF: return this;
+      RDMA_RM_CLONE_WRONG: begin
+        wrong_pd = rdma_pd::type_id::create("wrong_mr_clone");
+        wrong_pd.handle = rdma_clone_handle_value(handle, "wrong MR clone");
+        wrong_pd.owner = rdma_clone_function_handle_value(
+          owner, "wrong MR clone"
+        );
+        wrong_pd.state = state;
+        return wrong_pd;
+      end
+      RDMA_RM_CLONE_DRIFT: begin
+        cloned_object = super.clone();
+        if (!$cast(cloned_mr, cloned_object))
+          `uvm_fatal("RM_TEST_CLONE", "fault MR clone cast failed")
+        cloned_mr.local_mr_id++;
+        return cloned_mr;
+      end
+      default: return super.clone();
+    endcase
+  endfunction
+endclass
+
+class rdma_rm_fault_recovery extends rdma_recovery_record;
+  `uvm_object_utils(rdma_rm_fault_recovery)
+
+  rdma_rm_clone_fault_e clone_fault;
+
+  function new(string name = "rdma_rm_fault_recovery");
+    super.new(name);
+    clone_fault = RDMA_RM_CLONE_GOOD;
+  endfunction
+
+  virtual function uvm_object clone();
+    uvm_object cloned_object;
+    rdma_rm_fault_recovery cloned_recovery;
+
+    case (clone_fault)
+      RDMA_RM_CLONE_SELF: return this;
+      RDMA_RM_CLONE_DRIFT: begin
+        cloned_object = super.clone();
+        if (!$cast(cloned_recovery, cloned_object))
+          `uvm_fatal("RM_TEST_CLONE", "fault recovery clone cast failed")
+        cloned_recovery.resource_h.object_id++;
+        return cloned_recovery;
+      end
+      RDMA_RM_CLONE_BACKING_DRIFT: begin
+        cloned_object = super.clone();
+        if (!$cast(cloned_recovery, cloned_object) ||
+            cloned_recovery.backing_refs.size() == 0 ||
+            cloned_recovery.backing_refs[0] == null ||
+            cloned_recovery.backing_refs[0].mapping == null)
+          `uvm_fatal("RM_TEST_CLONE",
+                     "fault recovery backing clone setup failed")
+        cloned_recovery.backing_refs[0].mapping.iova.value++;
+        return cloned_recovery;
+      end
+      RDMA_RM_CLONE_HMC_DRIFT: begin
+        cloned_object = super.clone();
+        if (!$cast(cloned_recovery, cloned_object) ||
+            cloned_recovery.hmc_refs.size() == 0 ||
+            cloned_recovery.hmc_refs[0] == null)
+          `uvm_fatal("RM_TEST_CLONE",
+                     "fault recovery HMC clone setup failed")
+        cloned_recovery.hmc_refs[0].address.value++;
+        return cloned_recovery;
+      end
+      default: return super.clone();
+    endcase
+  endfunction
+endclass
+
+class rdma_clone_probe_manager extends rdma_resource_manager;
+  function new(string name = "rdma_clone_probe_manager");
+    super.new(name);
+  endfunction
+
+  function void replace_authoritative(rdma_resource replacement);
+    registry[resource_key(replacement.handle)] = replacement;
+  endfunction
+endclass
+
 class rdma_resource_manager_test extends uvm_test;
   `uvm_component_utils(rdma_resource_manager_test)
 
@@ -152,6 +258,17 @@ class rdma_resource_manager_test extends uvm_test;
     return binding;
   endfunction
 
+  function automatic void prepare_mr(rdma_mr mr,
+                                     longint unsigned iova_value);
+    mr.iova.value = iova_value;
+    mr.length = 64'h2000;
+    mr.lkey = {mr.local_mr_id[23:0], 8'h5a};
+    mr.rkey = mr.lkey;
+    mr.access = '{local_write:1'b1, remote_read:1'b1,
+                  remote_write:1'b0, memory_window_bind:1'b0,
+                  remote_atomic:1'b0};
+  endfunction
+
   task run_phase(uvm_phase phase);
     rdma_resource_manager rm;
     rdma_resource_manager dep_rm;
@@ -173,6 +290,10 @@ class rdma_resource_manager_test extends uvm_test;
     rdma_width_probe_manager width_free_pd_rm;
     rdma_width_probe_manager width_free_mr_rm;
     rdma_resource_manager lifecycle_rm;
+    rdma_width_probe_manager publication_rm;
+    rdma_resource_manager pd_commit_rm;
+    rdma_width_probe_manager dependency_gate_rm;
+    rdma_clone_probe_manager clone_gate_rm;
     rdma_resource_manager allocated_error_rm;
     rdma_resource_manager recovery_rm;
     rdma_resource_manager_probe privileged_recovery_rm;
@@ -196,6 +317,10 @@ class rdma_resource_manager_test extends uvm_test;
     rdma_function_binding width_function_binding_b;
     rdma_function_binding width_function_binding_b_copy;
     rdma_function_binding lifecycle_binding;
+    rdma_function_binding publication_binding;
+    rdma_function_binding pd_commit_binding;
+    rdma_function_binding dependency_gate_binding;
+    rdma_function_binding clone_gate_binding;
     rdma_function_binding allocated_error_binding;
     rdma_function_binding recovery_binding;
     rdma_function_binding privileged_recovery_binding;
@@ -214,6 +339,12 @@ class rdma_resource_manager_test extends uvm_test;
     rdma_pd width_mr_pd;
     rdma_pd width_free_mr_pd;
     rdma_pd lifecycle_pd;
+    rdma_pd publication_pd;
+    rdma_pd pd_commit_pd;
+    rdma_pd dependency_quiescing_pd;
+    rdma_pd dependency_error_pd;
+    rdma_pd clone_gate_pd;
+    rdma_pd clone_recovery_pd;
     rdma_pd allocated_error_pd;
     rdma_pd wrong_stage_pd;
     rdma_pd recovery_pd;
@@ -257,11 +388,24 @@ class rdma_resource_manager_test extends uvm_test;
     rdma_mr width_mr_failed;
     rdma_mr width_free_mr;
     rdma_mr lifecycle_mr;
+    rdma_mr publication_local_mr;
+    rdma_mr publication_global_mr;
+    rdma_mr publication_topology_mr;
+    rdma_mr publication_commit_mr;
+    rdma_mr publication_lookup_mr;
+    rdma_mr dependency_blocked_mr;
+    rdma_mr clone_seed_mr;
+    rdma_rm_fault_mr clone_authoritative_mr;
+    rdma_rm_fault_mr clone_candidate_mr;
+    rdma_rm_fault_mr clone_wrong_mr;
+    rdma_rm_fault_mr clone_drift_mr;
     rdma_mr allocated_error_mr;
     rdma_cq cq_pool;
     rdma_cq width_cq;
     rdma_cq width_cq_failed;
     rdma_cq width_cq_reused;
+    rdma_cq publication_cq;
+    rdma_cq publication_lookup_cq;
     rdma_cq dep_cq;
     rdma_cq teardown_cq;
     rdma_qp dep_qp;
@@ -297,6 +441,10 @@ class rdma_resource_manager_test extends uvm_test;
     rdma_recovery_record recovery_lookup_again;
     rdma_recovery_record malformed_recovery;
     rdma_recovery_record ready_recovery;
+    rdma_rm_fault_recovery clone_fault_recovery;
+    rdma_backing_ref clone_backing_ref;
+    rdma_dma_mapping clone_mapping;
+    rdma_hmc_ref clone_hmc_ref;
     rdma_status s;
     int unsigned leak_count;
     int unsigned pd_local_before_exhaustion;
@@ -305,6 +453,10 @@ class rdma_resource_manager_test extends uvm_test;
     int unsigned cmq_serial_before_exhaustion;
     int unsigned serial_before_width_failure;
     int unsigned free_count_before_width_failure;
+    int unsigned publication_serial_before;
+    int unsigned publication_free_before;
+    int unsigned publication_local_before;
+    int unsigned publication_global_before;
     rdma_hmc_fvm_addr_t hmc_base;
     rdma_hmc_fvm_addr_t hmc_addr;
     rdma_hmc_fvm_addr_t hmc_addr_two;
@@ -644,6 +796,31 @@ class rdma_resource_manager_test extends uvm_test;
     if (allocated_error_mr.local_mr_id != 0)
       `uvm_error("ALLOC_ERROR_CREATE_MR",
                  "test requires the first, zero-ID unprogrammed MR")
+    expect_status("ALLOC_ERROR_FREEZE_RAW",
+                  allocated_error_rm.freeze(allocated_error_mr.handle),
+                  RDMA_SC_INVALID_STATE);
+    expect_status("ALLOC_ERROR_FREEZE_RAW_LOOKUP",
+                  allocated_error_rm.lookup(allocated_error_mr.handle,
+                                            resource),
+                  RDMA_SC_OK);
+    if (resource == null || resource.state != RDMA_RESOURCE_ALLOCATED)
+      `uvm_error("ALLOC_ERROR_FREEZE_RAW_LOOKUP",
+                 "raw freeze attempt changed authoritative MR state")
+    expect_status("ALLOC_ERROR_STAGE_RAW",
+                  allocated_error_rm.stage_allocated(allocated_error_mr),
+                  RDMA_SC_INVALID_ARGUMENT);
+    expect_status("ALLOC_ERROR_STAGE_RAW_LOOKUP",
+                  allocated_error_rm.lookup(allocated_error_mr.handle,
+                                            resource),
+                  RDMA_SC_OK);
+    if (resource == null || resource.state != RDMA_RESOURCE_ALLOCATED)
+      `uvm_error("ALLOC_ERROR_STAGE_RAW_LOOKUP",
+                 "raw stage attempt changed authoritative MR state")
+    expect_status("ALLOC_ERROR_STAGE_RAW_NO_RECOVERY",
+                  allocated_error_rm.lookup_recovery(
+                    allocated_error_mr.handle, recovery_lookup
+                  ),
+                  RDMA_SC_INVALID_STATE);
     expect_status("ALLOC_ERROR_PD_RESERVED_BUSY",
                   allocated_error_rm.release_reserved(
                     allocated_error_pd.handle
@@ -710,6 +887,446 @@ class rdma_resource_manager_test extends uvm_test;
                   ), RDMA_SC_OK);
     expect_status("ALLOC_ERROR_NO_LEAKS",
                   allocated_error_rm.check_leaks(leak_count), RDMA_SC_OK);
+
+    // Publication may update programmable context, but allocator identity and
+    // dependency topology remain manager-owned across staging and commit.
+    publication_rm = new("publication_rm");
+    publication_binding = make_active_binding(
+      "publication_binding", 64'h1c1f_1000_0000_0001,
+      32'h1c1f_1101, 32'd18
+    );
+    expect_status("PUBLICATION_CREATE_PD",
+                  publication_rm.create_pd(publication_binding,
+                                            publication_pd),
+                  RDMA_SC_OK);
+    expect_status("PUBLICATION_CREATE_LOCAL_MR",
+                  publication_rm.create_mr(publication_binding,
+                                            publication_pd.handle,
+                                            publication_local_mr),
+                  RDMA_SC_OK);
+    prepare_mr(publication_local_mr, 64'h3100_0000);
+    publication_local_before = publication_local_mr.local_mr_id;
+    publication_serial_before =
+      publication_rm.observed_next_object_serial(RDMA_RESOURCE_MR);
+    publication_free_before =
+      publication_rm.observed_free_local_id_count(RDMA_RESOURCE_MR);
+    publication_local_mr.local_mr_id++;
+    publication_local_mr.lkey = {
+      publication_local_mr.local_mr_id[23:0], 8'h5a
+    };
+    publication_local_mr.rkey = publication_local_mr.lkey;
+    expect_status("PUBLICATION_REJECT_LOCAL_ID",
+                  publication_rm.stage_allocated(publication_local_mr),
+                  RDMA_SC_INVALID_ARGUMENT);
+    expect_status("PUBLICATION_LOCAL_ID_REGISTRY",
+                  publication_rm.lookup(publication_local_mr.handle,
+                                         resource),
+                  RDMA_SC_OK);
+    if (resource == null || !$cast(publication_lookup_mr, resource) ||
+        publication_lookup_mr.local_mr_id != publication_local_before)
+      `uvm_error("PUBLICATION_LOCAL_ID_REGISTRY",
+                 "rejected local-ID mutation changed authoritative MR")
+
+    expect_status("PUBLICATION_CREATE_GLOBAL_MR",
+                  publication_rm.create_mr(publication_binding,
+                                            publication_pd.handle,
+                                            publication_global_mr),
+                  RDMA_SC_OK);
+    prepare_mr(publication_global_mr, 64'h3200_0000);
+    publication_global_before = publication_global_mr.global_mr_id;
+    publication_global_mr.global_mr_id++;
+    expect_status("PUBLICATION_REJECT_GLOBAL_ID",
+                  publication_rm.stage_allocated(publication_global_mr),
+                  RDMA_SC_INVALID_ARGUMENT);
+    expect_status("PUBLICATION_GLOBAL_ID_REGISTRY",
+                  publication_rm.lookup(publication_global_mr.handle,
+                                         resource),
+                  RDMA_SC_OK);
+    if (resource == null || !$cast(publication_lookup_mr, resource) ||
+        publication_lookup_mr.global_mr_id != publication_global_before)
+      `uvm_error("PUBLICATION_GLOBAL_ID_REGISTRY",
+                 "rejected global-ID mutation changed authoritative MR")
+
+    expect_status("PUBLICATION_CREATE_TOPOLOGY_MR",
+                  publication_rm.create_mr(publication_binding,
+                                            publication_pd.handle,
+                                            publication_topology_mr),
+                  RDMA_SC_OK);
+    prepare_mr(publication_topology_mr, 64'h3300_0000);
+    publication_topology_mr.pd_h = null;
+    publication_topology_mr.dependencies.delete();
+    expect_status("PUBLICATION_REJECT_TOPOLOGY",
+                  publication_rm.stage_allocated(publication_topology_mr),
+                  RDMA_SC_INVALID_ARGUMENT);
+    expect_status("PUBLICATION_PD_STILL_BUSY",
+                  publication_rm.release_reserved(publication_pd.handle),
+                  RDMA_SC_RESOURCE_BUSY);
+
+    expect_status("PUBLICATION_CREATE_CQ",
+                  publication_rm.create_cq(publication_binding, null,
+                                            publication_cq),
+                  RDMA_SC_OK);
+    publication_cq.depth = 8;
+    publication_local_before = publication_cq.local_cq_id;
+    publication_global_before = publication_cq.global_cq_id;
+    publication_cq.local_cq_id++;
+    publication_cq.global_cq_id++;
+    expect_status("PUBLICATION_REJECT_CQ_IDS",
+                  publication_rm.stage_allocated(publication_cq),
+                  RDMA_SC_INVALID_ARGUMENT);
+    expect_status("PUBLICATION_CQ_REGISTRY",
+                  publication_rm.lookup(publication_cq.handle, resource),
+                  RDMA_SC_OK);
+    if (resource == null || !$cast(publication_lookup_cq, resource) ||
+        publication_lookup_cq.local_cq_id != publication_local_before ||
+        publication_lookup_cq.global_cq_id != publication_global_before)
+      `uvm_error("PUBLICATION_CQ_REGISTRY",
+                 "rejected CQ identity mutation changed registry")
+
+    expect_status("PUBLICATION_CREATE_COMMIT_MR",
+                  publication_rm.create_mr(publication_binding,
+                                            publication_pd.handle,
+                                            publication_commit_mr),
+                  RDMA_SC_OK);
+    prepare_mr(publication_commit_mr, 64'h3400_0000);
+    expect_status("PUBLICATION_STAGE_COMMIT_MR",
+                  publication_rm.stage_allocated(publication_commit_mr),
+                  RDMA_SC_OK);
+    publication_local_before = publication_commit_mr.local_mr_id;
+    publication_commit_mr.local_mr_id++;
+    publication_commit_mr.lkey = {
+      publication_commit_mr.local_mr_id[23:0], 8'h5a
+    };
+    publication_commit_mr.rkey = publication_commit_mr.lkey;
+    expect_status("PUBLICATION_REJECT_COMMIT_ID",
+                  publication_rm.commit_programmed(publication_commit_mr),
+                  RDMA_SC_INVALID_ARGUMENT);
+    expect_status("PUBLICATION_COMMIT_REGISTRY",
+                  publication_rm.lookup(publication_commit_mr.handle,
+                                         resource),
+                  RDMA_SC_OK);
+    if (resource == null || !$cast(publication_lookup_mr, resource) ||
+        publication_lookup_mr.state != RDMA_RESOURCE_ALLOCATED ||
+        publication_lookup_mr.local_mr_id != publication_local_before)
+      `uvm_error("PUBLICATION_COMMIT_REGISTRY",
+                 "rejected commit changed staged authoritative MR")
+    if (publication_rm.observed_next_object_serial(RDMA_RESOURCE_MR) !=
+          publication_serial_before + 3 ||
+        publication_rm.observed_free_local_id_count(RDMA_RESOURCE_MR) !=
+          publication_free_before)
+      `uvm_error("PUBLICATION_ALLOCATOR_ATOMIC",
+                 "publication attacks changed allocator bookkeeping")
+    expect_status("PUBLICATION_RELEASE_FUNCTION",
+                  publication_rm.release_function(
+                    publication_binding.make_handle()
+                  ),
+                  RDMA_SC_OK);
+    expect_status("PUBLICATION_NO_LEAKS",
+                  publication_rm.check_leaks(leak_count), RDMA_SC_OK);
+
+    // PD bypasses hardware programming and transitions directly from
+    // ALLOCATED to ACTIVE, even if a caller previously staged its snapshot.
+    pd_commit_rm = rdma_resource_manager::type_id::create("pd_commit_rm");
+    pd_commit_binding = make_active_binding(
+      "pd_commit_binding", 64'h1c1f_2000_0000_0001,
+      32'h1c1f_2201, 32'd19
+    );
+    expect_status("PD_COMMIT_CREATE",
+                  pd_commit_rm.create_pd(pd_commit_binding, pd_commit_pd),
+                  RDMA_SC_OK);
+    expect_status("PD_COMMIT_FREEZE_REJECT",
+                  pd_commit_rm.freeze(pd_commit_pd.handle),
+                  RDMA_SC_INVALID_STATE);
+    expect_status("PD_COMMIT_ORDINARY_REJECT",
+                  pd_commit_rm.commit_programmed(pd_commit_pd),
+                  RDMA_SC_INVALID_STATE);
+    expect_status("PD_COMMIT_STAGE",
+                  pd_commit_rm.stage_allocated(pd_commit_pd), RDMA_SC_OK);
+    expect_status("PD_COMMIT_STAGED_FREEZE_REJECT",
+                  pd_commit_rm.freeze(pd_commit_pd.handle),
+                  RDMA_SC_INVALID_STATE);
+    expect_status("PD_COMMIT_STAGED_REJECT",
+                  pd_commit_rm.commit_programmed(pd_commit_pd),
+                  RDMA_SC_INVALID_STATE);
+    expect_status("PD_COMMIT_STATE_PRESERVED",
+                  pd_commit_rm.lookup(pd_commit_pd.handle, resource),
+                  RDMA_SC_OK);
+    if (resource == null || resource.state != RDMA_RESOURCE_ALLOCATED)
+      `uvm_error("PD_COMMIT_STATE_PRESERVED",
+                 "PD commit attempt changed ALLOCATED state")
+    expect_status("PD_COMMIT_ACTIVATE",
+                  pd_commit_rm.activate(pd_commit_pd.handle), RDMA_SC_OK);
+    expect_status("PD_COMMIT_RELEASE_FUNCTION",
+                  pd_commit_rm.release_function(
+                    pd_commit_binding.make_handle()
+                  ),
+                  RDMA_SC_OK);
+    expect_status("PD_COMMIT_NO_LEAKS",
+                  pd_commit_rm.check_leaks(leak_count), RDMA_SC_OK);
+
+    // Dependencies that are closing or failed cannot admit new children.
+    dependency_gate_rm = new("dependency_gate_rm");
+    dependency_gate_binding = make_active_binding(
+      "dependency_gate_binding", 64'h1c1f_3000_0000_0001,
+      32'h1c1f_3301, 32'd20
+    );
+    expect_status("DEPENDENCY_QUIESCING_CREATE_PD",
+                  dependency_gate_rm.create_pd(dependency_gate_binding,
+                                                dependency_quiescing_pd),
+                  RDMA_SC_OK);
+    expect_status("DEPENDENCY_QUIESCING_ACTIVATE_PD",
+                  dependency_gate_rm.activate(dependency_quiescing_pd.handle),
+                  RDMA_SC_OK);
+    expect_status("DEPENDENCY_QUIESCING_BEGIN",
+                  dependency_gate_rm.begin_quiesce(
+                    dependency_quiescing_pd.handle
+                  ),
+                  RDMA_SC_OK);
+    expect_status("DEPENDENCY_ERROR_CREATE_PD",
+                  dependency_gate_rm.create_pd(dependency_gate_binding,
+                                                dependency_error_pd),
+                  RDMA_SC_OK);
+    recovery_record = rdma_recovery_record::type_id::create(
+      "dependency_error_recovery"
+    );
+    recovery_record.resource_h = clone_handle(
+      "DEPENDENCY_ERROR_H", dependency_error_pd.handle
+    );
+    recovery_record.hardware_presence = RDMA_HW_PRESENCE_ABSENT;
+    recovery_record.primary_status = rdma_status::make(
+      RDMA_SC_RESET_CANCELLED, "dependency failed before child creation"
+    );
+    expect_status("DEPENDENCY_ERROR_MARK",
+                  dependency_gate_rm.mark_error(dependency_error_pd.handle,
+                                                recovery_record),
+                  RDMA_SC_OK);
+    publication_serial_before =
+      dependency_gate_rm.observed_next_object_serial(RDMA_RESOURCE_MR);
+    publication_free_before =
+      dependency_gate_rm.observed_free_local_id_count(RDMA_RESOURCE_MR);
+    expect_status("DEPENDENCY_QUIESCING_REJECT_CHILD",
+                  dependency_gate_rm.create_mr(
+                    dependency_gate_binding, dependency_quiescing_pd.handle,
+                    dependency_blocked_mr
+                  ),
+                  RDMA_SC_INVALID_STATE);
+    if (dependency_blocked_mr != null ||
+        dependency_gate_rm.observed_next_object_serial(RDMA_RESOURCE_MR) !=
+          publication_serial_before ||
+        dependency_gate_rm.observed_free_local_id_count(RDMA_RESOURCE_MR) !=
+          publication_free_before)
+      `uvm_error("DEPENDENCY_QUIESCING_ATOMIC",
+                 "QUIESCING dependency consumed MR allocator state")
+    expect_status("DEPENDENCY_ERROR_REJECT_CHILD",
+                  dependency_gate_rm.create_mr(
+                    dependency_gate_binding, dependency_error_pd.handle,
+                    dependency_blocked_mr
+                  ),
+                  RDMA_SC_INVALID_STATE);
+    if (dependency_blocked_mr != null ||
+        dependency_gate_rm.observed_next_object_serial(RDMA_RESOURCE_MR) !=
+          publication_serial_before ||
+        dependency_gate_rm.observed_free_local_id_count(RDMA_RESOURCE_MR) !=
+          publication_free_before)
+      `uvm_error("DEPENDENCY_ERROR_ATOMIC",
+                 "ERROR dependency consumed MR allocator state")
+    expect_status("DEPENDENCY_GATE_LEAK_COUNT",
+                  dependency_gate_rm.check_leaks(leak_count),
+                  RDMA_SC_INVALID_STATE);
+    if (leak_count != 2)
+      `uvm_error("DEPENDENCY_GATE_LEAK_COUNT",
+                 $sformatf("rejected child creation left %0d resources",
+                           leak_count))
+    expect_status("DEPENDENCY_GATE_RELEASE_FUNCTION",
+                  dependency_gate_rm.release_function(
+                    dependency_gate_binding.make_handle()
+                  ),
+                  RDMA_SC_OK);
+    expect_status("DEPENDENCY_GATE_NO_LEAKS",
+                  dependency_gate_rm.check_leaks(leak_count), RDMA_SC_OK);
+
+    // Public clone inputs are untrusted: aliasing, wrong exact types, and
+    // identity drift must fail without publishing or defeating lookup copies.
+    clone_gate_rm = new("clone_gate_rm");
+    clone_gate_binding = make_active_binding(
+      "clone_gate_binding", 64'h1c1f_4000_0000_0001,
+      32'h1c1f_4401, 32'd21
+    );
+    expect_status("CLONE_GATE_CREATE_PD",
+                  clone_gate_rm.create_pd(clone_gate_binding,
+                                           clone_gate_pd),
+                  RDMA_SC_OK);
+    expect_status("CLONE_GATE_CREATE_MR",
+                  clone_gate_rm.create_mr(clone_gate_binding,
+                                           clone_gate_pd.handle,
+                                           clone_seed_mr),
+                  RDMA_SC_OK);
+    prepare_mr(clone_seed_mr, 64'h4100_0000);
+    clone_authoritative_mr = rdma_rm_fault_mr::type_id::create(
+      "clone_authoritative_mr"
+    );
+    clone_authoritative_mr.copy(clone_seed_mr);
+    clone_candidate_mr = rdma_rm_fault_mr::type_id::create(
+      "clone_candidate_mr"
+    );
+    clone_candidate_mr.copy(clone_seed_mr);
+    clone_gate_rm.replace_authoritative(clone_authoritative_mr);
+    clone_candidate_mr.clone_fault = RDMA_RM_CLONE_SELF;
+    expect_status("CLONE_GATE_STAGE_SELF",
+                  clone_gate_rm.stage_allocated(clone_candidate_mr),
+                  RDMA_SC_INVALID_ARGUMENT);
+    expect_status("CLONE_GATE_STAGE_SELF_LOOKUP",
+                  clone_gate_rm.lookup(clone_seed_mr.handle, resource),
+                  RDMA_SC_OK);
+    if (resource == null || resource == clone_candidate_mr ||
+        resource.state != RDMA_RESOURCE_ALLOCATED)
+      `uvm_error("CLONE_GATE_STAGE_SELF_LOOKUP",
+                 "self-clone stage changed or aliased the registry")
+
+    clone_candidate_mr.clone_fault = RDMA_RM_CLONE_GOOD;
+    expect_status("CLONE_GATE_STAGE_GOOD",
+                  clone_gate_rm.stage_allocated(clone_candidate_mr),
+                  RDMA_SC_OK);
+    clone_candidate_mr.clone_fault = RDMA_RM_CLONE_SELF;
+    expect_status("CLONE_GATE_COMMIT_SELF",
+                  clone_gate_rm.commit_programmed(clone_candidate_mr),
+                  RDMA_SC_INVALID_ARGUMENT);
+    expect_status("CLONE_GATE_COMMIT_SELF_LOOKUP",
+                  clone_gate_rm.lookup(clone_seed_mr.handle, resource),
+                  RDMA_SC_OK);
+    if (resource == null || resource == clone_candidate_mr ||
+        resource.state != RDMA_RESOURCE_ALLOCATED)
+      `uvm_error("CLONE_GATE_COMMIT_SELF_LOOKUP",
+                 "self-clone commit changed or aliased the registry")
+
+    clone_wrong_mr = rdma_rm_fault_mr::type_id::create("clone_wrong_mr");
+    clone_wrong_mr.copy(clone_seed_mr);
+    clone_wrong_mr.clone_fault = RDMA_RM_CLONE_WRONG;
+    expect_status("CLONE_GATE_STAGE_WRONG",
+                  clone_gate_rm.stage_allocated(clone_wrong_mr),
+                  RDMA_SC_INVALID_ARGUMENT);
+    clone_drift_mr = rdma_rm_fault_mr::type_id::create("clone_drift_mr");
+    clone_drift_mr.copy(clone_seed_mr);
+    clone_drift_mr.clone_fault = RDMA_RM_CLONE_DRIFT;
+    expect_status("CLONE_GATE_STAGE_DRIFT",
+                  clone_gate_rm.stage_allocated(clone_drift_mr),
+                  RDMA_SC_INVALID_ARGUMENT);
+
+    expect_status("CLONE_GATE_CREATE_RECOVERY_PD",
+                  clone_gate_rm.create_pd(clone_gate_binding,
+                                           clone_recovery_pd),
+                  RDMA_SC_OK);
+    clone_fault_recovery = rdma_rm_fault_recovery::type_id::create(
+      "clone_fault_recovery"
+    );
+    clone_fault_recovery.resource_h = clone_handle(
+      "CLONE_GATE_RECOVERY_H", clone_recovery_pd.handle
+    );
+    clone_fault_recovery.hardware_presence = RDMA_HW_PRESENCE_ABSENT;
+    clone_fault_recovery.primary_status = rdma_status::make(
+      RDMA_SC_RESET_CANCELLED, "clone authority probe"
+    );
+    clone_mapping = rdma_dma_mapping::type_id::create(
+      "clone_recovery_mapping"
+    );
+    clone_mapping.function_h = clone_function_handle(
+      "CLONE_GATE_MAPPING_OWNER", clone_gate_binding.make_handle()
+    );
+    clone_mapping.requester_bdf = clone_gate_binding.pcie.bdf;
+    clone_mapping.backing_addr.value = 64'h5100_0000;
+    clone_mapping.iova.value = 64'h5200_0000;
+    clone_mapping.size = 64'h1000;
+    clone_mapping.direction = RDMA_DMA_BIDIRECTIONAL;
+    clone_mapping.permissions =
+      '{device_read:1'b1, device_write:1'b1, atomic:1'b0};
+    clone_mapping.state = RDMA_MAPPING_ACTIVE;
+    clone_mapping.owner_h = clone_handle(
+      "CLONE_GATE_MAPPING_RESOURCE", clone_recovery_pd.handle
+    );
+    clone_backing_ref = rdma_backing_ref::type_id::create(
+      "clone_recovery_backing_ref"
+    );
+    clone_backing_ref.mapping = clone_mapping;
+    clone_backing_ref.ownership = RDMA_OWNERSHIP_CONTROL_PLANE;
+    clone_fault_recovery.backing_refs.push_back(clone_backing_ref);
+    clone_hmc_ref = rdma_hmc_ref::type_id::create(
+      "clone_recovery_hmc_ref"
+    );
+    clone_hmc_ref.owner = clone_function_handle(
+      "CLONE_GATE_HMC_OWNER", clone_gate_binding.make_handle()
+    );
+    clone_hmc_ref.address.value = 64'h5300_0000;
+    clone_hmc_ref.size = 64'h1000;
+    clone_hmc_ref.first_pbl_index = 32'd7;
+    clone_hmc_ref.ownership = RDMA_OWNERSHIP_CONTROL_PLANE;
+    clone_fault_recovery.hmc_refs.push_back(clone_hmc_ref);
+    clone_fault_recovery.clone_fault = RDMA_RM_CLONE_SELF;
+    expect_status("CLONE_GATE_RECOVERY_SELF",
+                  clone_gate_rm.mark_error(clone_recovery_pd.handle,
+                                           clone_fault_recovery),
+                  RDMA_SC_INVALID_ARGUMENT);
+    expect_status("CLONE_GATE_RECOVERY_STATE",
+                  clone_gate_rm.lookup(clone_recovery_pd.handle, resource),
+                  RDMA_SC_OK);
+    if (resource == null || resource.state != RDMA_RESOURCE_ALLOCATED)
+      `uvm_error("CLONE_GATE_RECOVERY_STATE",
+                 "self-clone recovery changed resource state")
+    expect_status("CLONE_GATE_RECOVERY_ABSENT",
+                  clone_gate_rm.lookup_recovery(clone_recovery_pd.handle,
+                                                recovery_lookup),
+                  RDMA_SC_INVALID_STATE);
+    clone_fault_recovery.clone_fault = RDMA_RM_CLONE_DRIFT;
+    expect_status("CLONE_GATE_RECOVERY_DRIFT",
+                  clone_gate_rm.mark_error(clone_recovery_pd.handle,
+                                           clone_fault_recovery),
+                  RDMA_SC_INVALID_ARGUMENT);
+    expect_status("CLONE_GATE_RECOVERY_DRIFT_STATE",
+                  clone_gate_rm.lookup(clone_recovery_pd.handle, resource),
+                  RDMA_SC_OK);
+    if (resource == null || resource.state != RDMA_RESOURCE_ALLOCATED)
+      `uvm_error("CLONE_GATE_RECOVERY_DRIFT_STATE",
+                 "identity-drifting recovery changed resource state")
+    expect_status("CLONE_GATE_RECOVERY_DRIFT_ABSENT",
+                  clone_gate_rm.lookup_recovery(clone_recovery_pd.handle,
+                                                recovery_lookup),
+                  RDMA_SC_INVALID_STATE);
+    clone_fault_recovery.clone_fault = RDMA_RM_CLONE_BACKING_DRIFT;
+    expect_status("CLONE_GATE_RECOVERY_BACKING_DRIFT",
+                  clone_gate_rm.mark_error(clone_recovery_pd.handle,
+                                           clone_fault_recovery),
+                  RDMA_SC_INVALID_ARGUMENT);
+    expect_status("CLONE_GATE_RECOVERY_BACKING_STATE",
+                  clone_gate_rm.lookup(clone_recovery_pd.handle, resource),
+                  RDMA_SC_OK);
+    if (resource == null || resource.state != RDMA_RESOURCE_ALLOCATED)
+      `uvm_error("CLONE_GATE_RECOVERY_BACKING_STATE",
+                 "backing-drifting recovery changed resource state")
+    expect_status("CLONE_GATE_RECOVERY_BACKING_ABSENT",
+                  clone_gate_rm.lookup_recovery(clone_recovery_pd.handle,
+                                                recovery_lookup),
+                  RDMA_SC_INVALID_STATE);
+    clone_fault_recovery.clone_fault = RDMA_RM_CLONE_HMC_DRIFT;
+    expect_status("CLONE_GATE_RECOVERY_HMC_DRIFT",
+                  clone_gate_rm.mark_error(clone_recovery_pd.handle,
+                                           clone_fault_recovery),
+                  RDMA_SC_INVALID_ARGUMENT);
+    expect_status("CLONE_GATE_RECOVERY_HMC_STATE",
+                  clone_gate_rm.lookup(clone_recovery_pd.handle, resource),
+                  RDMA_SC_OK);
+    if (resource == null || resource.state != RDMA_RESOURCE_ALLOCATED)
+      `uvm_error("CLONE_GATE_RECOVERY_HMC_STATE",
+                 "HMC-drifting recovery changed resource state")
+    expect_status("CLONE_GATE_RECOVERY_HMC_ABSENT",
+                  clone_gate_rm.lookup_recovery(clone_recovery_pd.handle,
+                                                recovery_lookup),
+                  RDMA_SC_INVALID_STATE);
+    expect_status("CLONE_GATE_RELEASE_FUNCTION",
+                  clone_gate_rm.release_function(
+                    clone_gate_binding.make_handle()
+                  ),
+                  RDMA_SC_OK);
+    expect_status("CLONE_GATE_NO_LEAKS",
+                  clone_gate_rm.check_leaks(leak_count), RDMA_SC_OK);
 
     // Controlled lifecycle publication keeps the registry authoritative and
     // detached from every candidate and lookup snapshot.
@@ -1589,22 +2206,29 @@ class rdma_resource_manager_test extends uvm_test;
                                         teardown_qp), RDMA_SC_OK);
     frozen_qp_h = clone_handle("TEARDOWN_QP_H", teardown_qp.handle);
     expect_status("TEARDOWN_FREEZE_PD",
-                  teardown_rm.freeze(teardown_pd.handle), RDMA_SC_OK);
+                  teardown_rm.freeze(teardown_pd.handle),
+                  RDMA_SC_INVALID_STATE);
     expect_status("TEARDOWN_FREEZE_CEQ",
-                  teardown_rm.freeze(teardown_ceq.handle), RDMA_SC_OK);
+                  teardown_rm.freeze(teardown_ceq.handle),
+                  RDMA_SC_INVALID_STATE);
     expect_status("TEARDOWN_FREEZE_CQ",
-                  teardown_rm.freeze(teardown_cq.handle), RDMA_SC_OK);
+                  teardown_rm.freeze(teardown_cq.handle),
+                  RDMA_SC_INVALID_STATE);
+    prepare_mr(teardown_mr, 64'h6100_0000);
+    expect_status("TEARDOWN_STAGE_MR",
+                  teardown_rm.stage_allocated(teardown_mr), RDMA_SC_OK);
     expect_status("TEARDOWN_FREEZE_MR",
                   teardown_rm.freeze(teardown_mr.handle), RDMA_SC_OK);
     expect_status("TEARDOWN_FREEZE_QP",
-                  teardown_rm.freeze(teardown_qp.handle), RDMA_SC_OK);
+                  teardown_rm.freeze(teardown_qp.handle),
+                  RDMA_SC_INVALID_STATE);
     expect_status("TEARDOWN_FROZEN_LOOKUP",
-                  teardown_rm.lookup(teardown_qp.handle, resource), RDMA_SC_OK);
+                  teardown_rm.lookup(teardown_mr.handle, resource), RDMA_SC_OK);
     if (resource == null || resource.state != RDMA_RESOURCE_PROGRAMMED)
       `uvm_error("TEARDOWN_FROZEN_LOOKUP",
                  "freeze did not publish PROGRAMMED state")
     expect_status("TEARDOWN_FROZEN_RELEASE",
-                  teardown_rm.\release (teardown_qp.handle),
+                  teardown_rm.\release (teardown_mr.handle),
                   RDMA_SC_INVALID_STATE);
     expect_status("TEARDOWN_HAS_LEAKS",
                   teardown_rm.check_leaks(leak_count, owner_h),

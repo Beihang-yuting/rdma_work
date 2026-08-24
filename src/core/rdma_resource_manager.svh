@@ -123,7 +123,9 @@ class rdma_resource_manager extends uvm_object;
     if (source == null)
       return null;
     cloned_object = source.clone();
-    if (cloned_object == null || !$cast(cloned_resource, cloned_object))
+    if (cloned_object == null || cloned_object == source ||
+        !$cast(cloned_resource, cloned_object) ||
+        cloned_resource.get_object_type() != source.get_object_type())
       `uvm_fatal("RM_COPY_TYPE",
                  {copy_label, " resource clone type mismatch"})
     return cloned_resource;
@@ -139,7 +141,9 @@ class rdma_resource_manager extends uvm_object;
     if (source == null)
       return null;
     cloned_object = source.clone();
-    if (cloned_object == null || !$cast(cloned_recovery, cloned_object))
+    if (cloned_object == null || cloned_object == source ||
+        !$cast(cloned_recovery, cloned_object) ||
+        cloned_recovery.get_object_type() != source.get_object_type())
       `uvm_fatal("RM_COPY_TYPE",
                  {copy_label, " recovery record clone mismatch"})
     return cloned_recovery;
@@ -159,6 +163,380 @@ class rdma_resource_manager extends uvm_object;
     return 1'b1;
   endfunction
 
+  protected function bit same_handle_instance(rdma_handle lhs,
+                                               rdma_handle rhs);
+    if (lhs == null || rhs == null)
+      return lhs == rhs;
+    return lhs.same_instance(rhs);
+  endfunction
+
+  protected function bit same_dependency_topology(rdma_resource lhs,
+                                                  rdma_resource rhs);
+    if (lhs == null || rhs == null ||
+        lhs.dependencies.size() != rhs.dependencies.size())
+      return 1'b0;
+    foreach (lhs.dependencies[i]) begin
+      if (!same_handle_instance(lhs.dependencies[i], rhs.dependencies[i]))
+        return 1'b0;
+    end
+    return 1'b1;
+  endfunction
+
+  protected function bit same_binding_identity(rdma_function_binding lhs,
+                                               rdma_function_binding rhs);
+    if (lhs == null || rhs == null)
+      return lhs == rhs;
+    if (lhs.function_uid != rhs.function_uid ||
+        lhs.notify_bar_id != rhs.notify_bar_id ||
+        lhs.notify_base != rhs.notify_base ||
+        lhs.notify_size != rhs.notify_size ||
+        lhs.notify_table_sel != rhs.notify_table_sel ||
+        lhs.notify_table_index != rhs.notify_table_index ||
+        lhs.host_id != rhs.host_id || lhs.pfvf_id != rhs.pfvf_id ||
+        lhs.rdma_vf_id != rhs.rdma_vf_id ||
+        lhs.global_function_id != rhs.global_function_id ||
+        lhs.vsi_id != rhs.vsi_id ||
+        lhs.dma_domain_id != rhs.dma_domain_id ||
+        lhs.dma_domain_valid != rhs.dma_domain_valid ||
+        lhs.state != rhs.state || lhs.generation != rhs.generation ||
+        lhs.notify_valid != rhs.notify_valid ||
+        lhs.notify_ready != rhs.notify_ready ||
+        lhs.dmi_valid != rhs.dmi_valid || lhs.dmi_ready != rhs.dmi_ready ||
+        lhs.vft_valid != rhs.vft_valid || lhs.vft_ready != rhs.vft_ready ||
+        !same_handle_instance(lhs.owner_h, rhs.owner_h))
+      return 1'b0;
+    if (lhs.pcie == null || rhs.pcie == null)
+      return lhs.pcie == rhs.pcie;
+    if (lhs.pcie.bdf != rhs.pcie.bdf ||
+        lhs.pcie.parent_pf_bdf != rhs.pcie.parent_pf_bdf ||
+        lhs.pcie.vf_index != rhs.pcie.vf_index ||
+        lhs.pcie.mse != rhs.pcie.mse || lhs.pcie.bme != rhs.pcie.bme)
+      return 1'b0;
+    foreach (lhs.pcie.bar[i]) begin
+      if (lhs.pcie.bar[i] == null || rhs.pcie.bar[i] == null) begin
+        if (lhs.pcie.bar[i] != rhs.pcie.bar[i])
+          return 1'b0;
+      end
+      else if (lhs.pcie.bar[i].bar_id != rhs.pcie.bar[i].bar_id ||
+               lhs.pcie.bar[i].base != rhs.pcie.bar[i].base ||
+               lhs.pcie.bar[i].size != rhs.pcie.bar[i].size ||
+               lhs.pcie.bar[i].enabled != rhs.pcie.bar[i].enabled)
+        return 1'b0;
+    end
+    return 1'b1;
+  endfunction
+
+  protected function rdma_status publication_identity_status(
+    rdma_resource candidate,
+    rdma_resource authoritative
+  );
+    rdma_function candidate_function;
+    rdma_function authoritative_function;
+    rdma_pd candidate_pd;
+    rdma_pd authoritative_pd;
+    rdma_mr candidate_mr;
+    rdma_mr authoritative_mr;
+    rdma_cq candidate_cq;
+    rdma_cq authoritative_cq;
+    rdma_qp candidate_qp;
+    rdma_qp authoritative_qp;
+    rdma_srq candidate_srq;
+    rdma_srq authoritative_srq;
+    rdma_cmq candidate_cmq;
+    rdma_cmq authoritative_cmq;
+    rdma_ceq candidate_ceq;
+    rdma_ceq authoritative_ceq;
+    rdma_aeq candidate_aeq;
+    rdma_aeq authoritative_aeq;
+    bit fields_match;
+
+    if (candidate == null || authoritative == null ||
+        candidate.get_object_type() != authoritative.get_object_type() ||
+        candidate.resource_kind() != authoritative.resource_kind() ||
+        !same_handle_instance(candidate.handle, authoritative.handle) ||
+        !same_handle_instance(candidate.owner, authoritative.owner) ||
+        !same_dependency_topology(candidate, authoritative) ||
+        !same_outstanding_ids(candidate, authoritative))
+      return rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT,
+        "published resource identity or topology changed"
+      );
+
+    fields_match = 1'b0;
+    case (authoritative.resource_kind())
+      RDMA_RESOURCE_FUNCTION: begin
+        if ($cast(candidate_function, candidate) &&
+            $cast(authoritative_function, authoritative))
+          fields_match = candidate_function.local_function_id ==
+                      authoritative_function.local_function_id &&
+                    candidate_function.global_function_id ==
+                      authoritative_function.global_function_id &&
+                    candidate_function.rdma_vf_id ==
+                      authoritative_function.rdma_vf_id &&
+                    candidate_function.vsi_id == authoritative_function.vsi_id &&
+                    candidate_function.pfvf_id ==
+                      authoritative_function.pfvf_id &&
+                    same_binding_identity(candidate_function.binding,
+                                          authoritative_function.binding);
+      end
+      RDMA_RESOURCE_PD: begin
+        if ($cast(candidate_pd, candidate) &&
+            $cast(authoritative_pd, authoritative))
+          fields_match = candidate_pd.local_pd_id == authoritative_pd.local_pd_id &&
+                    candidate_pd.global_pd_id == authoritative_pd.global_pd_id;
+      end
+      RDMA_RESOURCE_MR: begin
+        if ($cast(candidate_mr, candidate) &&
+            $cast(authoritative_mr, authoritative))
+          fields_match = candidate_mr.local_mr_id == authoritative_mr.local_mr_id &&
+                    candidate_mr.global_mr_id == authoritative_mr.global_mr_id &&
+                    same_handle_instance(candidate_mr.pd_h,
+                                         authoritative_mr.pd_h);
+      end
+      RDMA_RESOURCE_CQ: begin
+        if ($cast(candidate_cq, candidate) &&
+            $cast(authoritative_cq, authoritative))
+          fields_match = candidate_cq.local_cq_id == authoritative_cq.local_cq_id &&
+                    candidate_cq.global_cq_id == authoritative_cq.global_cq_id &&
+                    same_handle_instance(candidate_cq.ceq_h,
+                                         authoritative_cq.ceq_h);
+      end
+      RDMA_RESOURCE_QP: begin
+        if ($cast(candidate_qp, candidate) &&
+            $cast(authoritative_qp, authoritative))
+          fields_match = candidate_qp.local_qp_id == authoritative_qp.local_qp_id &&
+                    candidate_qp.global_qp_id == authoritative_qp.global_qp_id &&
+                    same_handle_instance(candidate_qp.pd_h,
+                                         authoritative_qp.pd_h) &&
+                    same_handle_instance(candidate_qp.send_cq_h,
+                                         authoritative_qp.send_cq_h) &&
+                    same_handle_instance(candidate_qp.recv_cq_h,
+                                         authoritative_qp.recv_cq_h) &&
+                    same_handle_instance(candidate_qp.srq_h,
+                                         authoritative_qp.srq_h);
+      end
+      RDMA_RESOURCE_SRQ: begin
+        if ($cast(candidate_srq, candidate) &&
+            $cast(authoritative_srq, authoritative))
+          fields_match = candidate_srq.local_srq_id ==
+                      authoritative_srq.local_srq_id &&
+                    candidate_srq.global_srq_id ==
+                      authoritative_srq.global_srq_id &&
+                    same_handle_instance(candidate_srq.pd_h,
+                                         authoritative_srq.pd_h);
+      end
+      RDMA_RESOURCE_CMQ: begin
+        if ($cast(candidate_cmq, candidate) &&
+            $cast(authoritative_cmq, authoritative))
+          fields_match = candidate_cmq.local_cmq_id ==
+                      authoritative_cmq.local_cmq_id &&
+                    candidate_cmq.global_cmq_id ==
+                      authoritative_cmq.global_cmq_id;
+      end
+      RDMA_RESOURCE_CEQ: begin
+        if ($cast(candidate_ceq, candidate) &&
+            $cast(authoritative_ceq, authoritative))
+          fields_match = candidate_ceq.local_ceq_id ==
+                      authoritative_ceq.local_ceq_id &&
+                    candidate_ceq.global_ceq_id ==
+                      authoritative_ceq.global_ceq_id;
+      end
+      RDMA_RESOURCE_AEQ: begin
+        if ($cast(candidate_aeq, candidate) &&
+            $cast(authoritative_aeq, authoritative))
+          fields_match = candidate_aeq.local_aeq_id ==
+                      authoritative_aeq.local_aeq_id &&
+                    candidate_aeq.global_aeq_id ==
+                      authoritative_aeq.global_aeq_id;
+      end
+    endcase
+    if (!fields_match)
+      return rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT,
+        "published resource manager-owned fields changed"
+      );
+    return rdma_status::success();
+  endfunction
+
+  protected function rdma_status clone_public_resource_value(
+    rdma_resource source,
+    string copy_label,
+    output rdma_resource result
+  );
+    uvm_object cloned_object;
+    rdma_status status;
+
+    result = null;
+    if (source == null)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               {copy_label, " resource is null"});
+    cloned_object = source.clone();
+    if (cloned_object == null || cloned_object == source ||
+        !$cast(result, cloned_object) ||
+        result.get_object_type() != source.get_object_type()) begin
+      result = null;
+      return rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT,
+        {copy_label, " resource clone is not a detached exact-type value"}
+      );
+    end
+    status = publication_identity_status(result, source);
+    if (!status.ok()) begin
+      result = null;
+      return status;
+    end
+    return rdma_status::success();
+  endfunction
+
+  protected function bit same_status_value(rdma_status lhs,
+                                            rdma_status rhs);
+    if (lhs == null || rhs == null)
+      return lhs == rhs;
+    return lhs.get_object_type() == rhs.get_object_type() &&
+           lhs.convert2string() == rhs.convert2string();
+  endfunction
+
+  protected function bit same_ticket_value(rdma_cmq_ticket lhs,
+                                            rdma_cmq_ticket rhs);
+    if (lhs == null || rhs == null)
+      return lhs == rhs;
+    if (lhs.get_object_type() != rhs.get_object_type() ||
+        lhs.command_id != rhs.command_id ||
+        !same_handle_instance(lhs.function_h, rhs.function_h) ||
+        !same_handle_instance(lhs.cmq_h, rhs.cmq_h) ||
+        lhs.slot_sequence != rhs.slot_sequence ||
+        lhs.sq_index != rhs.sq_index || lhs.sq_wrap != rhs.sq_wrap ||
+        lhs.absolute_deadline != rhs.absolute_deadline)
+      return 1'b0;
+    if (lhs.opcode_key == null || rhs.opcode_key == null)
+      return lhs.opcode_key == rhs.opcode_key;
+    return lhs.opcode_key.get_object_type() ==
+             rhs.opcode_key.get_object_type() &&
+           lhs.opcode_key.profile_name == rhs.opcode_key.profile_name &&
+           lhs.opcode_key.opcode == rhs.opcode_key.opcode &&
+           lhs.opcode_key.variant == rhs.opcode_key.variant;
+  endfunction
+
+  protected function bit same_mapping_value(rdma_dma_mapping lhs,
+                                             rdma_dma_mapping rhs);
+    if (lhs == null || rhs == null)
+      return lhs == rhs;
+    if (lhs.get_object_type() != rhs.get_object_type() ||
+        !same_handle_instance(lhs.function_h, rhs.function_h) ||
+        !same_handle_instance(lhs.owner_h, rhs.owner_h))
+      return 1'b0;
+    if (lhs.function_h != null &&
+        lhs.function_h.get_object_type() != rhs.function_h.get_object_type())
+      return 1'b0;
+    if (lhs.owner_h != null &&
+        lhs.owner_h.get_object_type() != rhs.owner_h.get_object_type())
+      return 1'b0;
+    return lhs.requester_bdf == rhs.requester_bdf &&
+           lhs.pasid_valid == rhs.pasid_valid && lhs.pasid == rhs.pasid &&
+           lhs.backing_addr == rhs.backing_addr && lhs.iova == rhs.iova &&
+           lhs.size == rhs.size && lhs.direction == rhs.direction &&
+           lhs.permissions == rhs.permissions && lhs.state == rhs.state;
+  endfunction
+
+  protected function bit same_backing_ref_value(rdma_backing_ref lhs,
+                                                 rdma_backing_ref rhs);
+    if (lhs == null || rhs == null)
+      return lhs == rhs;
+    return lhs.get_object_type() == rhs.get_object_type() &&
+           lhs.ownership == rhs.ownership &&
+           lhs.release_complete == rhs.release_complete &&
+           same_mapping_value(lhs.mapping, rhs.mapping);
+  endfunction
+
+  protected function bit same_hmc_ref_value(rdma_hmc_ref lhs,
+                                             rdma_hmc_ref rhs);
+    if (lhs == null || rhs == null)
+      return lhs == rhs;
+    if (lhs.get_object_type() != rhs.get_object_type() ||
+        !same_handle_instance(lhs.owner, rhs.owner))
+      return 1'b0;
+    if (lhs.owner != null &&
+        lhs.owner.get_object_type() != rhs.owner.get_object_type())
+      return 1'b0;
+    return lhs.object_kind == rhs.object_kind &&
+           lhs.address == rhs.address && lhs.size == rhs.size &&
+           lhs.first_pbl_index == rhs.first_pbl_index &&
+           lhs.ownership == rhs.ownership &&
+           lhs.release_complete == rhs.release_complete;
+  endfunction
+
+  protected function bit same_recovery_value(rdma_recovery_record lhs,
+                                              rdma_recovery_record rhs);
+    if (lhs == null || rhs == null)
+      return lhs == rhs;
+    if (lhs.get_object_type() != rhs.get_object_type() ||
+        !same_handle_instance(lhs.resource_h, rhs.resource_h) ||
+        lhs.hardware_presence != rhs.hardware_presence ||
+        lhs.completed_steps.size() != rhs.completed_steps.size() ||
+        lhs.pending_steps.size() != rhs.pending_steps.size() ||
+        lhs.backing_refs.size() != rhs.backing_refs.size() ||
+        lhs.hmc_refs.size() != rhs.hmc_refs.size() ||
+        lhs.rollback_statuses.size() != rhs.rollback_statuses.size() ||
+        !same_ticket_value(lhs.ambiguous_ticket, rhs.ambiguous_ticket) ||
+        !same_status_value(lhs.primary_status, rhs.primary_status))
+      return 1'b0;
+    foreach (lhs.completed_steps[i]) begin
+      if (lhs.completed_steps[i] != rhs.completed_steps[i])
+        return 1'b0;
+    end
+    foreach (lhs.pending_steps[i]) begin
+      if (lhs.pending_steps[i] != rhs.pending_steps[i])
+        return 1'b0;
+    end
+    foreach (lhs.backing_refs[i]) begin
+      if (!same_backing_ref_value(lhs.backing_refs[i],
+                                  rhs.backing_refs[i]))
+        return 1'b0;
+    end
+    foreach (lhs.hmc_refs[i]) begin
+      if (!same_hmc_ref_value(lhs.hmc_refs[i], rhs.hmc_refs[i]))
+        return 1'b0;
+    end
+    foreach (lhs.rollback_statuses[i]) begin
+      if (!same_status_value(lhs.rollback_statuses[i],
+                             rhs.rollback_statuses[i]))
+        return 1'b0;
+    end
+    return 1'b1;
+  endfunction
+
+  protected function rdma_status clone_public_recovery_value(
+    rdma_recovery_record source,
+    string copy_label,
+    output rdma_recovery_record result
+  );
+    uvm_object cloned_object;
+
+    result = null;
+    if (source == null)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               {copy_label, " recovery record is null"});
+    cloned_object = source.clone();
+    if (cloned_object == null || cloned_object == source ||
+        !$cast(result, cloned_object) ||
+        result.get_object_type() != source.get_object_type()) begin
+      result = null;
+      return rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT,
+        {copy_label,
+         " recovery clone is not a detached exact-type value"}
+      );
+    end
+    if (!same_recovery_value(result, source)) begin
+      result = null;
+      return rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT,
+        {copy_label, " recovery clone changed validated fields"}
+      );
+    end
+    return rdma_status::success();
+  endfunction
+
   protected function bit recovery_ready(rdma_recovery_record recovery);
     return recovery != null &&
            recovery.hardware_presence == RDMA_HW_PRESENCE_ABSENT &&
@@ -175,7 +553,9 @@ class rdma_resource_manager extends uvm_object;
     if (source == null)
       return null;
     cloned_object = source.clone();
-    if (cloned_object == null || !$cast(cloned_binding, cloned_object))
+    if (cloned_object == null || cloned_object == source ||
+        !$cast(cloned_binding, cloned_object) ||
+        cloned_binding.get_object_type() != source.get_object_type())
       `uvm_fatal("RM_COPY_TYPE",
                  {copy_label, " Function binding clone mismatch"})
     return cloned_binding;
@@ -469,6 +849,12 @@ class rdma_resource_manager extends uvm_object;
     status = lookup(dependency, dependency_resource);
     if (!status.ok())
       return status;
+    if (dependency_resource.state inside {RDMA_RESOURCE_QUIESCING,
+                                          RDMA_RESOURCE_ERROR})
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "closing or failed dependency cannot admit new resources"
+      );
     if (dependency_resource.owner == null ||
         !dependency_resource.owner.same_instance(owner))
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
@@ -574,6 +960,14 @@ class rdma_resource_manager extends uvm_object;
     resource = registry[key];
     kind = resource.resource_kind();
     local_id = resource_local_id(resource);
+    if (local_id > local_id_limit(kind))
+      `uvm_fatal("RM_LOCAL_ID",
+                 "authoritative local ID exceeds its hardware width")
+    foreach (free_local_ids[kind][i]) begin
+      if (free_local_ids[kind][i] == local_id)
+        `uvm_fatal("RM_LOCAL_ID",
+                   "authoritative local ID is already on the free list")
+    end
     resource.state = RDMA_RESOURCE_RELEASED;
     recovery_records.delete(key);
     staged_allocations.delete(key);
@@ -1000,6 +1394,7 @@ class rdma_resource_manager extends uvm_object;
 
   virtual function rdma_status stage_allocated(rdma_resource candidate);
     rdma_resource authoritative;
+    rdma_resource prepared;
     rdma_resource replacement;
     rdma_status status;
     string key;
@@ -1017,19 +1412,28 @@ class rdma_resource_manager extends uvm_object;
     if (registry[key].state != RDMA_RESOURCE_ALLOCATED)
       return rdma_status::make(RDMA_SC_INVALID_STATE,
                                "registry resource is not ALLOCATED");
-    if (candidate.get_type_name() != authoritative.get_type_name())
-      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                               "staged candidate dynamic type changed");
-    if (candidate.owner == null || authoritative.owner == null ||
-        !candidate.owner.same_instance(authoritative.owner))
-      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                               "staged candidate owner changed");
-    if (!same_outstanding_ids(candidate, authoritative))
-      return rdma_status::make(
-        RDMA_SC_INVALID_ARGUMENT,
-        "outstanding operations require authoritative tracking"
-      );
-    replacement = clone_resource_value(candidate, "stage allocated");
+    status = publication_identity_status(candidate, authoritative);
+    if (!status.ok())
+      return status;
+    status = clone_public_resource_value(candidate, "stage allocated",
+                                         replacement);
+    if (!status.ok())
+      return status;
+    if (replacement.resource_kind() != RDMA_RESOURCE_PD) begin
+      status = clone_public_resource_value(replacement, "stage prepared",
+                                           prepared);
+      if (!status.ok())
+        return status;
+      prepared.state = RDMA_RESOURCE_PROGRAMMED;
+      status = prepared.validate();
+      if (status == null)
+        return rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "prepared staged candidate validation returned null"
+        );
+      if (!status.ok())
+        return status;
+    end
     replacement.state = RDMA_RESOURCE_ALLOCATED;
     status = replacement.validate();
     if (status == null)
@@ -1057,6 +1461,11 @@ class rdma_resource_manager extends uvm_object;
     status = lookup(candidate.handle, authoritative);
     if (!status.ok())
       return status;
+    if (authoritative.resource_kind() == RDMA_RESOURCE_PD)
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "PD transitions directly from ALLOCATED to ACTIVE"
+      );
     key = resource_key(candidate.handle);
     if (registry[key].state != RDMA_RESOURCE_ALLOCATED ||
         !staged_allocations.exists(key))
@@ -1064,19 +1473,13 @@ class rdma_resource_manager extends uvm_object;
         RDMA_SC_INVALID_STATE,
         "only a staged ALLOCATED resource can be programmed"
       );
-    if (candidate.get_type_name() != authoritative.get_type_name())
-      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                               "programmed candidate dynamic type changed");
-    if (candidate.owner == null || authoritative.owner == null ||
-        !candidate.owner.same_instance(authoritative.owner))
-      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                               "programmed candidate owner changed");
-    if (!same_outstanding_ids(candidate, authoritative))
-      return rdma_status::make(
-        RDMA_SC_INVALID_ARGUMENT,
-        "outstanding operations require authoritative tracking"
-      );
-    replacement = clone_resource_value(candidate, "commit programmed");
+    status = publication_identity_status(candidate, authoritative);
+    if (!status.ok())
+      return status;
+    status = clone_public_resource_value(candidate, "commit programmed",
+                                         replacement);
+    if (!status.ok())
+      return status;
     replacement.state = RDMA_RESOURCE_PROGRAMMED;
     status = replacement.validate();
     if (status == null)
@@ -1208,13 +1611,17 @@ class rdma_resource_manager extends uvm_object;
         !registry[key].handle.same_instance(handle))
       return rdma_status::make(RDMA_SC_INVALID_STATE,
                                "error registry identity is inconsistent");
-    if (recovery.resource_h == null ||
-        !recovery.resource_h.same_instance(handle))
+    status = clone_public_recovery_value(recovery, "mark error",
+                                         recovery_copy);
+    if (!status.ok())
+      return status;
+    if (recovery_copy.resource_h == null ||
+        !recovery_copy.resource_h.same_instance(handle))
       return rdma_status::make(
         RDMA_SC_INVALID_ARGUMENT,
         "recovery record does not match the resource incarnation"
       );
-    status = recovery.validate();
+    status = recovery_copy.validate();
     if (status == null)
       return rdma_status::make(RDMA_SC_INVALID_STATE,
                                "recovery validation returned null");
@@ -1235,7 +1642,6 @@ class rdma_resource_manager extends uvm_object;
                                "ERROR resource validation returned null");
     if (!status.ok())
       return status;
-    recovery_copy = clone_recovery_value(recovery, "mark error");
     registry[key] = replacement;
     recovery_records[key] = recovery_copy;
     staged_allocations.delete(key);
@@ -1425,19 +1831,13 @@ class rdma_resource_manager extends uvm_object;
   endfunction
 
   function rdma_status freeze(rdma_handle handle);
-    rdma_resource ignored;
+    rdma_resource candidate;
     rdma_status status;
-    string key;
 
-    status = lookup(handle, ignored);
+    status = lookup(handle, candidate);
     if (!status.ok())
       return status;
-    key = resource_key(handle);
-    if (registry[key].state != RDMA_RESOURCE_ALLOCATED)
-      return rdma_status::make(RDMA_SC_INVALID_STATE,
-                               "only an ALLOCATED resource can be frozen");
-    registry[key].state = RDMA_RESOURCE_PROGRAMMED;
-    return rdma_status::success();
+    return commit_programmed(candidate);
   endfunction
 
   function rdma_status \release (rdma_handle handle);
