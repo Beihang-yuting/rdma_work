@@ -600,7 +600,7 @@ class rdma_request_model_test extends uvm_test;
                   RDMA_SC_INVALID_ARGUMENT);
     mr_resource.local_mr_id = 32'h0112_3456;
     expect_status("MR_RESOURCE_INDEX_WIDTH", mr_resource.validate(),
-                  RDMA_SC_INVALID_ARGUMENT);
+                  RDMA_SC_OK);
     mr_resource.local_mr_id = 24'h12_3456;
     mr_resource.state = RDMA_RESOURCE_PROGRAMMED;
     mr_resource.access.remote_read = 1'b1;

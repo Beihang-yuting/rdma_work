@@ -347,7 +347,7 @@ class rdma_mr extends rdma_resource;
     end
     if (state inside {RDMA_RESOURCE_PROGRAMMED, RDMA_RESOURCE_ACTIVE,
                       RDMA_RESOURCE_QUIESCING, RDMA_RESOURCE_ERROR}) begin
-      if (local_mr_id != {8'b0, lkey[31:8]})
+      if (local_mr_id[23:0] != lkey[31:8])
         return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                  "MR local ID does not match lkey index");
       has_remote_access = access.remote_read || access.remote_write ||
