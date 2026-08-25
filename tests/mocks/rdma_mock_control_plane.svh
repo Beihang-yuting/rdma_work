@@ -210,12 +210,12 @@ class rdma_mock_cmq_port extends rdma_cmq_port;
 
   rdma_mock_cmq_call calls[$];
   uvm_event entered;
+  uvm_event release_gate;
 
   protected longint unsigned next_sequence;
   protected rdma_mock_cmq_outcome outcomes[bit [7:0]][$];
   protected rdma_cmq_completion late_completions[string][$];
   protected rdma_mock_cmq_snapshot_engine snapshot_engine;
-  protected semaphore gate_tokens;
   protected bit gate_enabled;
   protected bit [7:0] gated_opcode;
   protected int unsigned gate_entered_count;
@@ -225,7 +225,7 @@ class rdma_mock_cmq_port extends rdma_cmq_port;
     calls.delete();
     next_sequence = 1;
     entered = new({name, "_entered"});
-    gate_tokens = new(0);
+    release_gate = new({name, "_release_gate"});
     gate_enabled = 1'b0;
     gated_opcode = '0;
     gate_entered_count = 0;
@@ -238,7 +238,7 @@ class rdma_mock_cmq_port extends rdma_cmq_port;
     gated_opcode = opcode;
     gate_enabled = 1'b1;
     gate_entered_count = 0;
-    gate_tokens = new(0);
+    release_gate.reset();
     entered.reset();
   endfunction
 
@@ -262,7 +262,7 @@ class rdma_mock_cmq_port extends rdma_cmq_port;
   endtask
 
   task release_one();
-    gate_tokens.put(1);
+    release_gate.trigger();
   endtask
 
   protected function rdma_status invalid_argument(string message);
@@ -505,7 +505,7 @@ class rdma_mock_cmq_port extends rdma_cmq_port;
       gate_enabled = 1'b0;
       gate_entered_count++;
       entered.trigger();
-      gate_tokens.get(1);
+      release_gate.wait_trigger();
     end
     helper_status = snapshot_command(command, command_snapshot);
     if (helper_status == null || !helper_status.ok()) begin
