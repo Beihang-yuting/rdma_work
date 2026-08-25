@@ -3830,19 +3830,37 @@ class rdma_control_plane_test extends uvm_test;
 
   task automatic check_function_concurrency();
     rdma_control_plane_probe control;
+    rdma_resource_manager manager;
+    rdma_mock_cmq_port mock_cmq;
+    rdma_mock_stag_key_policy key_policy;
     rdma_function_binding binding_a;
     rdma_function_binding binding_b;
-    rdma_function_handle owner_a;
     rdma_function_handle owner_b;
-    semaphore held_a;
-    semaphore contender_a;
-    semaphore lock_b;
+    rdma_function_handle contender_owner_a;
+    rdma_create_pd_req pd_request;
+    rdma_register_mr_req request;
+    rdma_mr_backing_desc backing;
+    rdma_pd pd;
+    rdma_mr mr;
+    rdma_control_result result;
+    rdma_status status;
+    semaphore held_b;
+    semaphore contender_lock_a;
+    semaphore contender_enable;
     semaphore contender_started;
     bit contender_a_acquired;
-    bit owner_b_acquired;
+    bit public_completed;
+    bit first_gate_observed;
+    bit cleanup_gate_observed;
+    bit held_b_released;
 
     control = rdma_control_plane_probe::type_id::create(
       "concurrency_control"
+    );
+    manager = rdma_resource_manager::type_id::create("concurrency_manager");
+    mock_cmq = rdma_mock_cmq_port::type_id::create("concurrency_cmq");
+    key_policy = rdma_mock_stag_key_policy::type_id::create(
+      "concurrency_policy"
     );
     binding_a = make_active_binding(
       "concurrency_binding_a", 64'hb100_0000_0000_0001,
@@ -3850,43 +3868,94 @@ class rdma_control_plane_test extends uvm_test;
     );
     binding_b = make_active_binding(
       "concurrency_binding_b", 64'hb200_0000_0000_0002,
-      32'hb200_0202, 83
+      32'hb200_0202, 79
     );
-    owner_a = binding_a.make_handle();
-    owner_b = binding_b.make_handle();
-    if (owner_a == null || owner_b == null)
+    if (binding_a.function_uid == binding_b.function_uid ||
+        binding_a.global_function_id == binding_b.global_function_id ||
+        binding_a.generation != binding_b.generation)
+      `uvm_fatal("FUNCTION_CONCURRENCY_FIXTURE",
+                 "Functions must be distinct with the same generation")
+    status = control.configure(manager, mock_cmq, key_policy, null, null,
+                               8us);
+    expect_status("FUNCTION_CONCURRENCY_CONFIGURE", status, RDMA_SC_OK);
+    pd_request = make_create_pd_request("concurrency_pd_request", binding_a);
+    control.create_pd(binding_a, pd_request, pd, result);
+    expect_result("FUNCTION_CONCURRENCY_PD", result, RDMA_SC_OK);
+    if (pd == null || pd.handle == null)
       return;
+    request = make_register_mr_request(
+      "concurrency_register_request", binding_a, pd
+    );
+    backing = make_borrowed_pbl0_backing(
+      "concurrency_register_backing", binding_a, request
+    );
+    owner_b = binding_b.make_handle();
+    contender_owner_a = binding_a.make_handle();
+    if (owner_b == null || contender_owner_a == null)
+      return;
+    contender_owner_a.generation++;
 
+    contender_enable = new(0);
     contender_started = new(0);
     contender_a_acquired = 1'b0;
-    owner_b_acquired = 1'b0;
-    control.acquire_test_function_lock(owner_a, held_a);
+    public_completed = 1'b0;
+    first_gate_observed = 1'b0;
+    cleanup_gate_observed = 1'b0;
+    held_b_released = 1'b0;
+    control.acquire_test_function_lock(owner_b, held_b);
+    mock_cmq.gate_opcode(XTR_V1_OP_KEY_ALLOC);
     // VCS W-2024.09-SP1 faults while reclaiming concurrent class-output
-    // handles, so probe the exact lock used by the public API directly.
+    // handles from multiple public calls, so keep one public registration.
     fork
       begin
-        contender_started.put(1);
-        control.acquire_test_function_lock(owner_a, contender_a);
-        contender_a_acquired = 1'b1;
-        control.release_test_function_lock(contender_a);
+        control.register_mr(binding_a, request, backing, mr, result);
+        public_completed = 1'b1;
       end
       begin
+        contender_enable.get(1);
+        contender_started.put(1);
+        control.acquire_test_function_lock(
+          contender_owner_a, contender_lock_a
+        );
+        contender_a_acquired = 1'b1;
+        control.release_test_function_lock(contender_lock_a);
+      end
+      begin
+        mock_cmq.wait_until_entered(1, 1us, first_gate_observed);
+        if (!first_gate_observed) begin
+          `uvm_error("DIFFERENT_FUNCTION_LOCK",
+                     "Function A did not reach CMQ while Function B was held")
+          control.release_test_function_lock(held_b);
+          held_b_released = 1'b1;
+          mock_cmq.wait_until_entered(1, 1us, cleanup_gate_observed);
+          if (!cleanup_gate_observed)
+            `uvm_error("DIFFERENT_FUNCTION_CLEANUP",
+                       "Function A did not reach CMQ after releasing B")
+        end
+        if (!held_b_released) begin
+          control.release_test_function_lock(held_b);
+          held_b_released = 1'b1;
+        end
+        contender_enable.put(1);
         contender_started.get(1);
-        control.acquire_test_function_lock(owner_b, lock_b);
-        owner_b_acquired = 1'b1;
         if (contender_a_acquired)
           `uvm_error("SAME_FUNCTION_LOCK",
-                     "same Function was not serialized")
-        control.release_test_function_lock(lock_b);
-        control.release_test_function_lock(held_a);
+                     "next generation bypassed the public Function A lock")
+        mock_cmq.release_one();
       end
     join
-    if (!owner_b_acquired)
-      `uvm_error("DIFFERENT_FUNCTION_LOCK",
-                 "different Function did not acquire its independent lock")
+    if (!public_completed)
+      `uvm_error("FUNCTION_CONCURRENCY_COMPLETE",
+                 "public Function A registration did not complete")
     if (!contender_a_acquired)
       `uvm_error("SAME_FUNCTION_RELEASE",
                  "same-Function contender did not resume after release")
+    expect_result("FUNCTION_CONCURRENCY_RESULT", result, RDMA_SC_OK);
+    if (mr == null || mock_cmq.calls.size() != 1 ||
+        mock_cmq.calls[0] == null ||
+        mock_cmq.calls[0].opcode != XTR_V1_OP_KEY_ALLOC)
+      `uvm_error("FUNCTION_CONCURRENCY_COMMAND",
+                 "public registration result or CMQ command is incomplete")
   endtask
 
   task automatic check_register_mr_pre_activate_generation_fence();
@@ -5247,7 +5316,7 @@ class rdma_control_plane_test extends uvm_test;
           binding.generation++;
           binding.owner_h = binding.make_handle();
         end
-        mock_cmq.release_all();
+        mock_cmq.release_one();
       end
     join
     expect_recovery_result(prefix, result, RDMA_SC_STALE_GENERATION);
