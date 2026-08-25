@@ -505,7 +505,7 @@ class rdma_mock_cmq_port extends rdma_cmq_port;
       gate_enabled = 1'b0;
       gate_entered_count++;
       entered.trigger();
-      release_gate.wait_trigger();
+      release_gate.wait_on();
     end
     helper_status = snapshot_command(command, command_snapshot);
     if (helper_status == null || !helper_status.ok()) begin

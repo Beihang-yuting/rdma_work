@@ -298,6 +298,51 @@ class rdma_cmq_port_test extends rdma_cmq_engine_test;
                  "mock call opcode order does not match execute order")
   endtask
 
+  task automatic check_mock_gate_prerelease();
+    rdma_function_binding binding;
+    rdma_mock_cmq_port mock_cmq;
+    rdma_cmq_port port;
+    rdma_cmq_command_desc command;
+    rdma_cmq_ticket ticket;
+    rdma_cmq_completion completion;
+    rdma_status status;
+    bit execute_completed;
+
+    binding = make_binding("mock_gate_prerelease_binding", RDMA_BIND_ACTIVE);
+    mock_cmq = rdma_mock_cmq_port::type_id::create(
+      "mock_gate_prerelease_cmq"
+    );
+    port = mock_cmq;
+    command = make_command(
+      "mock_gate_prerelease_command", binding, XTR_V1_OP_KEY_ALLOC,
+      8'h34, 1us
+    );
+    mock_cmq.gate_opcode(XTR_V1_OP_KEY_ALLOC);
+    mock_cmq.release_one();
+    execute_completed = 1'b0;
+    fork : wait_for_mock_gate_prerelease
+      begin
+        port.execute(command, ticket, completion, status);
+        execute_completed = 1'b1;
+      end
+      begin
+        #100ns;
+      end
+    join_any
+    disable wait_for_mock_gate_prerelease;
+
+    if (!execute_completed)
+      `uvm_error("MOCK_GATE_PRERELEASE_TIMEOUT",
+                 "pre-released mock gate did not complete execute")
+    else begin
+      expect_status("MOCK_GATE_PRERELEASE_STATUS", status, RDMA_SC_OK);
+      if (ticket == null || completion == null ||
+          completion.status == null || mock_cmq.calls.size() != 1)
+        `uvm_error("MOCK_GATE_PRERELEASE_RESULT",
+                   "pre-released mock gate returned an incomplete result")
+    end
+  endtask
+
   task automatic check_adapter_routes_real_engines_by_function();
     rdma_cmq_engine_port_adapter adapter;
     rdma_cmq_engine_probe engine_a;
@@ -338,6 +383,7 @@ class rdma_cmq_port_test extends rdma_cmq_engine_test;
     rdma_status status_b;
     rdma_function_handle wrong_owner;
     bit terminal_known;
+    bit routes_published;
 
     adapter = rdma_cmq_engine_port_adapter::type_id::create("adapter");
     engine_a = rdma_cmq_engine_probe::type_id::create("adapter_engine_a");
@@ -415,9 +461,39 @@ class rdma_cmq_port_test extends rdma_cmq_engine_test;
         adapter.execute(command_b, ticket_b, completion_b, status_b);
       end
     join_none
-    while (engine_a.outstanding_count() != 1 ||
-           engine_b.outstanding_count() != 1)
-      #1ns;
+    routes_published = 1'b0;
+    fork : wait_for_adapter_route_publication
+      begin
+        while (engine_a.outstanding_count() != 1 ||
+               engine_b.outstanding_count() != 1 ||
+               engine_a.published_count() != 1 ||
+               engine_b.published_count() != 1)
+          #1ns;
+        routes_published = 1'b1;
+      end
+      begin
+        #100ns;
+      end
+    join_any
+    disable wait_for_adapter_route_publication;
+    if (!routes_published) begin
+      `uvm_error(
+        "ADAPTER_REAL_ROUTE_TIMEOUT",
+        $sformatf(
+          {"Function routes did not publish before the observation ",
+           "deadline: A published=%0d outstanding=%0d, ",
+           "B published=%0d outstanding=%0d"},
+          engine_a.published_count(), engine_a.outstanding_count(),
+          engine_b.published_count(), engine_b.outstanding_count()
+        )
+      )
+      wait fork;
+      engine_a.shutdown(status);
+      expect_status("ADAPTER_TIMEOUT_SHUTDOWN_A", status, RDMA_SC_OK);
+      engine_b.shutdown(status);
+      expect_status("ADAPTER_TIMEOUT_SHUTDOWN_B", status, RDMA_SC_OK);
+      return;
+    end
     if (engine_a.outstanding_count() != 1 ||
         engine_b.outstanding_count() != 1 ||
         engine_a.published_count() != 1 ||
@@ -866,6 +942,7 @@ class rdma_cmq_port_test extends rdma_cmq_engine_test;
     phase.raise_objection(this);
     check_mock_rejects_hostile_command_snapshots();
     check_mock_fifo_status_and_reconcile();
+    check_mock_gate_prerelease();
     check_adapter_routes_real_engines_by_function();
     check_real_engine_ticket_specific_reconcile();
     check_real_engine_late_pair_cleanup();

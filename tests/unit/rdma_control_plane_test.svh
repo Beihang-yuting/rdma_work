@@ -3969,6 +3969,7 @@ class rdma_control_plane_test extends uvm_test;
     rdma_mr_backing_desc backing;
     rdma_pd pd;
     rdma_mr mr;
+    rdma_recovery_record recovery;
     rdma_control_result result;
     rdma_status status;
 
@@ -4007,10 +4008,27 @@ class rdma_control_plane_test extends uvm_test;
     control.register_mr(binding, request, backing, mr, result);
     expect_recovery_result("PRE_ACTIVATE_FENCE", result,
                            RDMA_SC_STALE_GENERATION);
+    status = manager.peek_recovery(result.resource_h, recovery);
+    expect_status("PRE_ACTIVATE_FENCE_RECOVERY_LOOKUP", status,
+                  RDMA_SC_OK);
     if (mr != null || result == null || result.resource_h == null ||
         !result.final_resource_state_known ||
         result.final_resource_state != RDMA_RESOURCE_ERROR ||
-        !result.recovery_required || manager.activate_calls != 0 ||
+        !result.recovery_required || recovery == null ||
+        recovery.primary_status == null ||
+        recovery.primary_status.code != RDMA_SC_STALE_GENERATION ||
+        recovery.hardware_presence != RDMA_HW_PRESENCE_ABSENT ||
+        recovery.ambiguous_ticket != null ||
+        recovery.completed_steps.size() != 5 ||
+        recovery.completed_steps[0] != RDMA_CTRL_STEP_RESOURCE_RESERVED ||
+        recovery.completed_steps[1] != RDMA_CTRL_STEP_BACKING_ATTACHED ||
+        recovery.completed_steps[2] != RDMA_CTRL_STEP_HW_KEY_ALLOCATED ||
+        recovery.completed_steps[3] != RDMA_CTRL_STEP_REGISTRY_PROGRAMMED ||
+        recovery.completed_steps[4] !=
+          RDMA_CTRL_STEP_HW_MR_DEREGISTERED ||
+        recovery.pending_steps.size() != 1 ||
+        recovery.pending_steps[0] != RDMA_CTRL_STEP_RESOURCE_RELEASED ||
+        manager.activate_calls != 0 ||
         mock_cmq.calls.size() != 2 || mock_cmq.calls[0] == null ||
         mock_cmq.calls[0].opcode != XTR_V1_OP_KEY_ALLOC ||
         mock_cmq.calls[1] == null ||
