@@ -1063,6 +1063,10 @@ git commit -m "feat: add batched multi-outstanding CMQ engine"
 
 ### Task 14: 用 CMQ 驱动控制面资源生命周期
 
+- [x] Task 14A：事务框架、CMQ port、PD/MR lifecycle（本计划）
+- [ ] Task 14B：CQ/SRQ/CEQ/AEQ lifecycle
+- [ ] Task 14C：QP create/modify/destroy lifecycle
+
 **Files:**
 - Create: `src/core/rdma_control_plane.svh`
 - Modify: `src/core/rdma_core_pkg.sv`
