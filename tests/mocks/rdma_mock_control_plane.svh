@@ -209,20 +209,89 @@ class rdma_mock_cmq_port extends rdma_cmq_port;
   `uvm_object_utils(rdma_mock_cmq_port)
 
   rdma_mock_cmq_call calls[$];
+  uvm_event entered;
+  uvm_event release_gate;
 
   protected longint unsigned next_sequence;
   protected rdma_mock_cmq_outcome outcomes[bit [7:0]][$];
   protected rdma_cmq_completion late_completions[string][$];
   protected rdma_mock_cmq_snapshot_engine snapshot_engine;
+  protected semaphore gate_tokens;
+  protected bit gate_enabled;
+  protected bit gate_all_matches;
+  protected bit gate_open;
+  protected bit [7:0] gated_opcode;
+  protected int unsigned gate_entered_count;
+  protected int unsigned gate_blocked_count;
 
   function new(string name = "rdma_mock_cmq_port");
     super.new(name);
     calls.delete();
     next_sequence = 1;
+    entered = new({name, "_entered"});
+    release_gate = new({name, "_release_gate"});
+    gate_tokens = new(0);
+    gate_enabled = 1'b0;
+    gate_all_matches = 1'b0;
+    gate_open = 1'b0;
+    gated_opcode = '0;
+    gate_entered_count = 0;
+    gate_blocked_count = 0;
     snapshot_engine = rdma_mock_cmq_snapshot_engine::type_id::create(
       {name, "_snapshot_engine"}
     );
   endfunction
+
+  function void gate_opcode(bit [7:0] opcode, bit all_matches = 1'b0);
+    gated_opcode = opcode;
+    gate_all_matches = all_matches;
+    gate_enabled = 1'b1;
+    gate_open = 1'b0;
+    gate_entered_count = 0;
+    gate_blocked_count = 0;
+    gate_tokens = new(0);
+    entered.reset();
+    release_gate.reset();
+  endfunction
+
+  function int unsigned entered_count();
+    return gate_entered_count;
+  endfunction
+
+  task wait_until_entered(
+    int unsigned expected_count,
+    time timeout,
+    output bit observed
+  );
+    observed = 1'b0;
+    fork : wait_for_mock_cmq_gate
+      begin
+        while (gate_entered_count < expected_count)
+          entered.wait_trigger();
+        observed = 1'b1;
+      end
+      begin
+        #(timeout);
+      end
+    join_any
+    disable wait_for_mock_cmq_gate;
+  endtask
+
+  task release_one();
+    release_gate.trigger();
+    if (gate_blocked_count != 0)
+      gate_tokens.put(1);
+  endtask
+
+  task release_all();
+    int unsigned blocked_count;
+
+    gate_open = 1'b1;
+    release_gate.trigger();
+    blocked_count = gate_blocked_count;
+    repeat (blocked_count)
+      gate_tokens.put(1);
+  endtask
 
   protected function rdma_status invalid_argument(string message);
     return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, message);
@@ -459,6 +528,18 @@ class rdma_mock_cmq_port extends rdma_cmq_port;
     ticket = null;
     completion = null;
     status = invalid_state("mock CMQ execute did not complete");
+    if (gate_enabled && command != null && command.opcode_key != null &&
+        command.opcode_key.opcode[7:0] == gated_opcode) begin
+      gate_entered_count++;
+      entered.trigger();
+      if (!gate_all_matches)
+        gate_enabled = 1'b0;
+      if (!gate_open) begin
+        gate_blocked_count++;
+        gate_tokens.get(1);
+        gate_blocked_count--;
+      end
+    end
     helper_status = snapshot_command(command, command_snapshot);
     if (helper_status == null || !helper_status.ok()) begin
       status = (helper_status == null) ?

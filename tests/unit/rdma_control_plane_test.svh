@@ -68,6 +68,48 @@ class rdma_control_plane_probe extends rdma_control_plane;
     hmc_allocator = replacement;
   endfunction
 
+  function void use_host_mem_for_test(rdma_host_mem_api replacement);
+    host_mem = replacement;
+  endfunction
+
+endclass
+
+class rdma_generation_mutating_host_mem extends rdma_mock_host_mem;
+  `uvm_object_utils(rdma_generation_mutating_host_mem)
+
+  protected rdma_mock_host_mem delegate;
+  protected rdma_function_binding mutation_target;
+
+  function new(string name = "rdma_generation_mutating_host_mem");
+    super.new(name);
+    delegate = null;
+    mutation_target = null;
+  endfunction
+
+  function void configure_mutation(
+    rdma_mock_host_mem release_delegate,
+    rdma_function_binding binding
+  );
+    delegate = release_delegate;
+    mutation_target = binding;
+  endfunction
+
+  virtual function rdma_status \release (rdma_dma_mapping mapping);
+    rdma_status status;
+
+    if (delegate == null)
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE, "release mutation delegate is null"
+      );
+    status = delegate.\release (mapping);
+    if (status != null && status.ok() && mutation_target != null) begin
+      mutation_target.generation++;
+      mutation_target.owner_h = mutation_target.make_handle();
+      mutation_target = null;
+    end
+    return status;
+  endfunction
+
 endclass
 
 class rdma_cp_mutating_completion_mapping extends rdma_mock_dma_mapping;
@@ -97,49 +139,6 @@ class rdma_cp_mutating_completion_mapping extends rdma_mock_dma_mapping;
       size++;
     return status;
   endfunction
-endclass
-
-class rdma_blocking_mock_cmq_port extends rdma_mock_cmq_port;
-  `uvm_object_utils(rdma_blocking_mock_cmq_port)
-
-  semaphore entered;
-  semaphore resume;
-
-  function new(string name = "rdma_blocking_mock_cmq_port");
-    super.new(name);
-    entered = new(0);
-    resume = new(0);
-  endfunction
-
-  virtual task execute(
-    rdma_cmq_command_desc command,
-    output rdma_cmq_ticket ticket,
-    output rdma_cmq_completion completion,
-    output rdma_status status
-  );
-    entered.put(1);
-    resume.get(1);
-    super.execute(command, ticket, completion, status);
-  endtask
-
-  task wait_until_entered(time timeout, output bit observed);
-    observed = 1'b0;
-    fork : wait_for_blocked_execute
-      begin
-        entered.get(1);
-        observed = 1'b1;
-      end
-      begin
-        #(timeout);
-      end
-    join_any
-    disable wait_for_blocked_execute;
-  endtask
-
-  task resume_execute();
-    resume.put(1);
-  endtask
-
 endclass
 
 class rdma_reconcile_fault_mock_cmq_port extends rdma_mock_cmq_port;
@@ -330,6 +329,48 @@ class rdma_fault_resource_manager extends rdma_recovery_probe_manager;
       return failure;
     end
     return super.restore_active(handle);
+  endfunction
+
+endclass
+
+class rdma_generation_mutating_resource_manager extends
+  rdma_fault_resource_manager;
+  `uvm_object_utils(rdma_generation_mutating_resource_manager)
+
+  protected rdma_function_binding mutation_target;
+  protected bit mutate_after_commit;
+  int unsigned activate_calls;
+
+  function new(string name = "rdma_generation_mutating_resource_manager");
+    super.new(name);
+    mutation_target = null;
+    mutate_after_commit = 1'b0;
+    activate_calls = 0;
+  endfunction
+
+  function void mutate_generation_on_next_commit(
+    rdma_function_binding binding
+  );
+    mutation_target = binding;
+    mutate_after_commit = 1'b1;
+  endfunction
+
+  virtual function rdma_status commit_programmed(rdma_resource candidate);
+    rdma_status status;
+
+    status = super.commit_programmed(candidate);
+    if (mutate_after_commit && status != null && status.ok() &&
+        mutation_target != null) begin
+      mutation_target.generation++;
+      mutation_target.owner_h = mutation_target.make_handle();
+      mutate_after_commit = 1'b0;
+    end
+    return status;
+  endfunction
+
+  virtual function rdma_status activate(rdma_handle handle);
+    activate_calls++;
+    return super.activate(handle);
   endfunction
 
 endclass
@@ -3351,7 +3392,7 @@ class rdma_control_plane_test extends uvm_test;
   task automatic check_register_mr_caller_snapshot();
     rdma_control_plane control;
     rdma_resource_manager manager;
-    rdma_blocking_mock_cmq_port blocking_cmq;
+    rdma_mock_cmq_port blocking_cmq;
     rdma_mock_stag_key_policy key_policy;
     rdma_hmc_allocator hmc;
     rdma_function_binding binding;
@@ -3379,7 +3420,7 @@ class rdma_control_plane_test extends uvm_test;
 
     control = rdma_control_plane::type_id::create("snapshot_control");
     manager = rdma_resource_manager::type_id::create("snapshot_manager");
-    blocking_cmq = rdma_blocking_mock_cmq_port::type_id::create(
+    blocking_cmq = rdma_mock_cmq_port::type_id::create(
       "snapshot_cmq"
     );
     key_policy = rdma_mock_stag_key_policy::type_id::create(
@@ -3425,12 +3466,13 @@ class rdma_control_plane_test extends uvm_test;
       backing.backing_refs[0].mapping.backing_addr.value;
     original_hmc_size = backing.hmc_refs[0].size;
     original_first_pbl_index = backing.hmc_refs[0].first_pbl_index;
+    blocking_cmq.gate_opcode(XTR_V1_OP_KEY_ALLOC);
     fork
       begin
         control.register_mr(binding, request, backing, mr, result);
       end
       begin
-        blocking_cmq.wait_until_entered(1us, cmq_entered);
+        blocking_cmq.wait_until_entered(1, 1us, cmq_entered);
         if (!cmq_entered)
           `uvm_error("SNAPSHOT_SUCCESS_HANDSHAKE",
                      "KEY_ALLOC did not enter the blocking CMQ")
@@ -3443,7 +3485,7 @@ class rdma_control_plane_test extends uvm_test;
           backing.hmc_refs[0].first_pbl_index += 1'b1;
           backing.page_layout.first_pbl_index += 1'b1;
         end
-        blocking_cmq.resume_execute();
+        blocking_cmq.release_one();
       end
     join
     expect_result("SNAPSHOT_SUCCESS", result, RDMA_SC_OK);
@@ -3506,12 +3548,13 @@ class rdma_control_plane_test extends uvm_test;
     original_hmc_size = backing.hmc_refs[0].size;
     original_first_pbl_index = backing.hmc_refs[0].first_pbl_index;
     blocking_cmq.timeout_opcode(XTR_V1_OP_KEY_ALLOC);
+    blocking_cmq.gate_opcode(XTR_V1_OP_KEY_ALLOC);
     fork
       begin
         control.register_mr(binding, request, backing, mr, result);
       end
       begin
-        blocking_cmq.wait_until_entered(1us, cmq_entered);
+        blocking_cmq.wait_until_entered(1, 1us, cmq_entered);
         if (!cmq_entered)
           `uvm_error("SNAPSHOT_TIMEOUT_HANDSHAKE",
                      "timed KEY_ALLOC did not enter the blocking CMQ")
@@ -3522,7 +3565,7 @@ class rdma_control_plane_test extends uvm_test;
           backing.hmc_refs[0].first_pbl_index += 2;
           backing.page_layout.first_pbl_index += 2;
         end
-        blocking_cmq.resume_execute();
+        blocking_cmq.release_one();
       end
     join
     expect_recovery_result("SNAPSHOT_TIMEOUT", result, RDMA_SC_TIMEOUT);
@@ -3555,7 +3598,7 @@ class rdma_control_plane_test extends uvm_test;
     rdma_control_plane control;
     rdma_resource_manager manager;
     rdma_recovery_probe_manager probe_manager;
-    rdma_blocking_mock_cmq_port blocking_cmq;
+    rdma_mock_cmq_port blocking_cmq;
     rdma_mock_stag_key_policy key_policy;
     rdma_hmc_allocator hmc;
     rdma_function_binding binding;
@@ -3580,7 +3623,7 @@ class rdma_control_plane_test extends uvm_test;
       "post_cmq_manager"
     );
     manager = probe_manager;
-    blocking_cmq = rdma_blocking_mock_cmq_port::type_id::create(
+    blocking_cmq = rdma_mock_cmq_port::type_id::create(
       "post_cmq_cmq"
     );
     key_policy = rdma_mock_stag_key_policy::type_id::create(
@@ -3619,12 +3662,13 @@ class rdma_control_plane_test extends uvm_test;
     );
     backing.hmc_refs.push_back(hmc_ref);
     backing.page_layout.first_pbl_index = hmc_ref.first_pbl_index;
+    blocking_cmq.gate_opcode(XTR_V1_OP_KEY_ALLOC);
     fork
       begin
         control.register_mr(binding, request, backing, mr, result);
       end
       begin
-        blocking_cmq.wait_until_entered(1us, cmq_entered);
+        blocking_cmq.wait_until_entered(1, 1us, cmq_entered);
         if (!cmq_entered)
           `uvm_error("POST_CMQ_BINDING_HANDSHAKE",
                      "KEY_ALLOC did not enter the blocking CMQ")
@@ -3632,7 +3676,7 @@ class rdma_control_plane_test extends uvm_test;
           binding.generation++;
           binding.owner_h = binding.make_handle();
         end
-        blocking_cmq.resume_execute();
+        blocking_cmq.release_one();
       end
     join
     expect_recovery_result("POST_CMQ_BINDING", result,
@@ -3685,7 +3729,7 @@ class rdma_control_plane_test extends uvm_test;
 
     control = rdma_control_plane::type_id::create("post_cmq_hmc_control");
     manager = rdma_resource_manager::type_id::create("post_cmq_hmc_manager");
-    blocking_cmq = rdma_blocking_mock_cmq_port::type_id::create(
+    blocking_cmq = rdma_mock_cmq_port::type_id::create(
       "post_cmq_hmc_cmq"
     );
     key_policy = rdma_mock_stag_key_policy::type_id::create(
@@ -3724,12 +3768,13 @@ class rdma_control_plane_test extends uvm_test;
     );
     backing.hmc_refs.push_back(hmc_ref);
     backing.page_layout.first_pbl_index = hmc_ref.first_pbl_index;
+    blocking_cmq.gate_opcode(XTR_V1_OP_KEY_ALLOC);
     fork
       begin
         control.register_mr(binding, request, backing, mr, result);
       end
       begin
-        blocking_cmq.wait_until_entered(1us, cmq_entered);
+        blocking_cmq.wait_until_entered(1, 1us, cmq_entered);
         if (!cmq_entered)
           `uvm_error("POST_CMQ_HMC_HANDSHAKE",
                      "KEY_ALLOC did not enter the blocking CMQ")
@@ -3738,7 +3783,7 @@ class rdma_control_plane_test extends uvm_test;
                                  hmc_address);
           expect_status("POST_CMQ_HMC_RELEASE", status, RDMA_SC_OK);
         end
-        blocking_cmq.resume_execute();
+        blocking_cmq.release_one();
       end
     join
     expect_recovery_result("POST_CMQ_HMC", result, RDMA_SC_INVALID_STATE);
@@ -3781,6 +3826,128 @@ class rdma_control_plane_test extends uvm_test;
         blocking_cmq.calls[0].opcode != XTR_V1_OP_KEY_ALLOC)
       `uvm_error("POST_CMQ_COMMANDS",
                  "post-CMQ fences issued unexpected hardware commands")
+  endtask
+
+  task automatic check_function_concurrency();
+    rdma_control_plane_probe control;
+    rdma_function_binding binding_a;
+    rdma_function_binding binding_b;
+    rdma_function_handle owner_a;
+    rdma_function_handle owner_b;
+    semaphore held_a;
+    semaphore contender_a;
+    semaphore lock_b;
+    semaphore contender_started;
+    bit contender_a_acquired;
+    bit owner_b_acquired;
+
+    control = rdma_control_plane_probe::type_id::create(
+      "concurrency_control"
+    );
+    binding_a = make_active_binding(
+      "concurrency_binding_a", 64'hb100_0000_0000_0001,
+      32'hb100_0101, 79
+    );
+    binding_b = make_active_binding(
+      "concurrency_binding_b", 64'hb200_0000_0000_0002,
+      32'hb200_0202, 83
+    );
+    owner_a = binding_a.make_handle();
+    owner_b = binding_b.make_handle();
+    if (owner_a == null || owner_b == null)
+      return;
+
+    contender_started = new(0);
+    contender_a_acquired = 1'b0;
+    owner_b_acquired = 1'b0;
+    control.acquire_test_function_lock(owner_a, held_a);
+    // VCS W-2024.09-SP1 faults while reclaiming concurrent class-output
+    // handles, so probe the exact lock used by the public API directly.
+    fork
+      begin
+        contender_started.put(1);
+        control.acquire_test_function_lock(owner_a, contender_a);
+        contender_a_acquired = 1'b1;
+        control.release_test_function_lock(contender_a);
+      end
+      begin
+        contender_started.get(1);
+        control.acquire_test_function_lock(owner_b, lock_b);
+        owner_b_acquired = 1'b1;
+        if (contender_a_acquired)
+          `uvm_error("SAME_FUNCTION_LOCK",
+                     "same Function was not serialized")
+        control.release_test_function_lock(lock_b);
+        control.release_test_function_lock(held_a);
+      end
+    join
+    if (!owner_b_acquired)
+      `uvm_error("DIFFERENT_FUNCTION_LOCK",
+                 "different Function did not acquire its independent lock")
+    if (!contender_a_acquired)
+      `uvm_error("SAME_FUNCTION_RELEASE",
+                 "same-Function contender did not resume after release")
+  endtask
+
+  task automatic check_register_mr_pre_activate_generation_fence();
+    rdma_control_plane control;
+    rdma_generation_mutating_resource_manager manager;
+    rdma_mock_cmq_port mock_cmq;
+    rdma_mock_stag_key_policy key_policy;
+    rdma_function_binding binding;
+    rdma_create_pd_req pd_request;
+    rdma_register_mr_req request;
+    rdma_mr_backing_desc backing;
+    rdma_pd pd;
+    rdma_mr mr;
+    rdma_control_result result;
+    rdma_status status;
+
+    control = rdma_control_plane::type_id::create(
+      "pre_activate_fence_control"
+    );
+    manager = rdma_generation_mutating_resource_manager::type_id::create(
+      "pre_activate_fence_manager"
+    );
+    mock_cmq = rdma_mock_cmq_port::type_id::create(
+      "pre_activate_fence_cmq"
+    );
+    key_policy = rdma_mock_stag_key_policy::type_id::create(
+      "pre_activate_fence_policy"
+    );
+    binding = make_active_binding(
+      "pre_activate_fence_binding", 64'hb300_0000_0000_0003,
+      32'hb300_0303, 89
+    );
+    status = control.configure(manager, mock_cmq, key_policy, null, null,
+                               8us);
+    expect_status("PRE_ACTIVATE_FENCE_CONFIGURE", status, RDMA_SC_OK);
+    pd_request = make_create_pd_request("pre_activate_fence_pd", binding);
+    control.create_pd(binding, pd_request, pd, result);
+    expect_result("PRE_ACTIVATE_FENCE_PD", result, RDMA_SC_OK);
+    if (pd == null || pd.handle == null)
+      return;
+    manager.activate_calls = 0;
+    request = make_register_mr_request(
+      "pre_activate_fence_request", binding, pd
+    );
+    backing = make_borrowed_pbl0_backing(
+      "pre_activate_fence_backing", binding, request
+    );
+    manager.mutate_generation_on_next_commit(binding);
+    control.register_mr(binding, request, backing, mr, result);
+    expect_recovery_result("PRE_ACTIVATE_FENCE", result,
+                           RDMA_SC_STALE_GENERATION);
+    if (mr != null || result == null || result.resource_h == null ||
+        !result.final_resource_state_known ||
+        result.final_resource_state != RDMA_RESOURCE_ERROR ||
+        !result.recovery_required || manager.activate_calls != 0 ||
+        mock_cmq.calls.size() != 2 || mock_cmq.calls[0] == null ||
+        mock_cmq.calls[0].opcode != XTR_V1_OP_KEY_ALLOC ||
+        mock_cmq.calls[1] == null ||
+        mock_cmq.calls[1].opcode != XTR_V1_OP_MR_DEREGISTER)
+      `uvm_error("PRE_ACTIVATE_FENCE_STATE",
+                 "stale programmed MR reached activate or lost recovery")
   endtask
 
   task automatic check_register_mr_recovery_freeze_failures();
@@ -4341,7 +4508,7 @@ class rdma_control_plane_test extends uvm_test;
   task automatic check_owned_post_lock_snapshot();
     rdma_control_plane_probe control;
     rdma_resource_manager manager;
-    rdma_blocking_mock_cmq_port blocking_cmq;
+    rdma_mock_cmq_port blocking_cmq;
     rdma_mock_stag_key_policy key_policy;
     rdma_mock_host_mem host_mem;
     rdma_function_binding binding;
@@ -4367,7 +4534,7 @@ class rdma_control_plane_test extends uvm_test;
     manager = rdma_resource_manager::type_id::create(
       "owned_snapshot_manager"
     );
-    blocking_cmq = rdma_blocking_mock_cmq_port::type_id::create(
+    blocking_cmq = rdma_mock_cmq_port::type_id::create(
       "owned_snapshot_cmq"
     );
     key_policy = rdma_mock_stag_key_policy::type_id::create(
@@ -4397,6 +4564,7 @@ class rdma_control_plane_test extends uvm_test;
     first_access = '{local_write:1'b1, remote_read:1'b1,
                      remote_write:1'b0, memory_window_bind:1'b0,
                      remote_atomic:1'b0};
+    blocking_cmq.gate_opcode(XTR_V1_OP_KEY_ALLOC);
     fork
       begin
         control.alloc_and_register_mr(
@@ -4409,7 +4577,7 @@ class rdma_control_plane_test extends uvm_test;
         request.access = first_access;
         dma_context.pasid = first_pasid;
         control.release_test_function_lock(held_lock);
-        blocking_cmq.wait_until_entered(1us, cmq_entered);
+        blocking_cmq.wait_until_entered(1, 1us, cmq_entered);
         if (!cmq_entered)
           `uvm_error("OWNED_SNAPSHOT_HANDSHAKE",
                      "owned registration did not reach blocking CMQ")
@@ -4421,7 +4589,7 @@ class rdma_control_plane_test extends uvm_test;
                              remote_atomic:1'b0};
           dma_context.pasid = 20'h2b222;
         end
-        blocking_cmq.resume_execute();
+        blocking_cmq.release_one();
       end
     join
     expect_result("OWNED_SNAPSHOT_RESULT", result, RDMA_SC_OK);
@@ -5030,6 +5198,157 @@ class rdma_control_plane_test extends uvm_test;
         manager.finalize_release_calls != 1)
       `uvm_error("MR_DEREG_OWNED_PBL2_CLEANUP",
                  "owned PBL2 backing was not released exactly once")
+  endtask
+
+  task automatic run_deregister_generation_fence(
+    string prefix,
+    rdma_mr_pbl_mode_e pbl_mode,
+    bit [7:0] gated_opcode,
+    rdma_hw_presence_e expected_presence,
+    rdma_control_step_e expected_pending_step,
+    int unsigned expected_command_count
+  );
+    rdma_control_plane_probe control;
+    rdma_fault_resource_manager manager;
+    rdma_mock_cmq_port mock_cmq;
+    rdma_mock_host_mem host_mem;
+    rdma_hmc_allocator hmc;
+    rdma_function_binding binding;
+    rdma_pd pd;
+    rdma_mr mr;
+    rdma_resource resource;
+    rdma_mr raw_mr;
+    rdma_dma_mapping mapping;
+    rdma_hmc_fvm_addr_t hmc_address;
+    rdma_control_result result;
+    rdma_recovery_record recovery;
+    rdma_status status;
+    int unsigned baseline_allocations;
+    bit observed;
+
+    setup_deregister_mr_case(
+      prefix, pbl_mode, RDMA_OWNERSHIP_BORROWED, control, manager,
+      mock_cmq, host_mem, hmc, binding, pd, mr, mapping, hmc_address,
+      baseline_allocations
+    );
+    if (mr == null || mr.handle == null)
+      return;
+    mock_cmq.gate_opcode(gated_opcode);
+    fork
+      begin
+        control.deregister_mr(binding, mr.handle, result);
+      end
+      begin
+        mock_cmq.wait_until_entered(1, 1us, observed);
+        if (!observed)
+          `uvm_error({prefix, "_HANDSHAKE"},
+                     "deregister command did not enter the CMQ gate")
+        else begin
+          binding.generation++;
+          binding.owner_h = binding.make_handle();
+        end
+        mock_cmq.release_all();
+      end
+    join
+    expect_recovery_result(prefix, result, RDMA_SC_STALE_GENERATION);
+    recovery = null;
+    resource = null;
+    status = manager.peek_resource(mr.handle, resource);
+    expect_status({prefix, "_RAW_RESOURCE"}, status, RDMA_SC_OK);
+    void'($cast(raw_mr, resource));
+    status = manager.peek_recovery(mr.handle, recovery);
+    expect_status({prefix, "_RAW_RECOVERY"}, status, RDMA_SC_OK);
+    if (raw_mr == null || raw_mr.state != RDMA_RESOURCE_ERROR ||
+        recovery == null ||
+        recovery.hardware_presence != expected_presence ||
+        recovery.primary_status == null ||
+        recovery.primary_status.code != RDMA_SC_STALE_GENERATION ||
+        recovery.pending_steps.size() != 1 ||
+        recovery.pending_steps[0] != expected_pending_step ||
+        result == null || !result.final_resource_state_known ||
+        result.final_resource_state != RDMA_RESOURCE_ERROR ||
+        !result.recovery_required ||
+        mock_cmq.calls.size() != expected_command_count ||
+        manager.finalize_release_calls != 0)
+      `uvm_error({prefix, "_STATE"},
+                 "stale deregistration continued or lost old authority")
+  endtask
+
+  task automatic check_deregister_generation_fences();
+    run_deregister_generation_fence(
+      "DEREG_OCC_GENERATION_FENCE", RDMA_MR_PBL2,
+      XTR_V1_OP_OCC_FLUSH, RDMA_HW_PRESENCE_PRESENT,
+      RDMA_CTRL_STEP_HW_MR_DEREGISTERED, 1
+    );
+    run_deregister_generation_fence(
+      "DEREG_MR_GENERATION_FENCE", RDMA_MR_PBL0,
+      XTR_V1_OP_MR_DEREGISTER, RDMA_HW_PRESENCE_ABSENT,
+      RDMA_CTRL_STEP_HW_DRAINED, 1
+    );
+    run_deregister_generation_fence(
+      "DEREG_TQ_GENERATION_FENCE", RDMA_MR_PBL0,
+      XTR_V1_OP_TQ_FLUSH, RDMA_HW_PRESENCE_ABSENT,
+      RDMA_CTRL_STEP_BACKING_RELEASED, 2
+    );
+    run_deregister_local_release_generation_fence();
+  endtask
+
+  task automatic run_deregister_local_release_generation_fence();
+    string prefix;
+    rdma_control_plane_probe control;
+    rdma_fault_resource_manager manager;
+    rdma_mock_cmq_port mock_cmq;
+    rdma_mock_host_mem host_mem;
+    rdma_generation_mutating_host_mem mutating_host_mem;
+    rdma_hmc_allocator hmc;
+    rdma_function_binding binding;
+    rdma_pd pd;
+    rdma_mr mr;
+    rdma_resource resource;
+    rdma_mr raw_mr;
+    rdma_dma_mapping mapping;
+    rdma_hmc_fvm_addr_t hmc_address;
+    rdma_control_result result;
+    rdma_recovery_record recovery;
+    rdma_status status;
+    int unsigned baseline_allocations;
+
+    prefix = "DEREG_RELEASE_GENERATION_FENCE";
+    setup_deregister_mr_case(
+      prefix, RDMA_MR_PBL0, RDMA_OWNERSHIP_CONTROL_PLANE,
+      control, manager, mock_cmq, host_mem, hmc, binding, pd, mr,
+      mapping, hmc_address, baseline_allocations
+    );
+    if (mr == null || mr.handle == null)
+      return;
+    mutating_host_mem = rdma_generation_mutating_host_mem::type_id::create(
+      "deregister_release_generation_mutator"
+    );
+    mutating_host_mem.configure_mutation(host_mem, binding);
+    control.use_host_mem_for_test(mutating_host_mem);
+    control.deregister_mr(binding, mr.handle, result);
+    expect_recovery_result(prefix, result, RDMA_SC_STALE_GENERATION);
+    recovery = null;
+    resource = null;
+    status = manager.peek_resource(mr.handle, resource);
+    expect_status({prefix, "_RAW_RESOURCE"}, status, RDMA_SC_OK);
+    void'($cast(raw_mr, resource));
+    status = manager.peek_recovery(mr.handle, recovery);
+    expect_status({prefix, "_RAW_RECOVERY"}, status, RDMA_SC_OK);
+    if (raw_mr == null || raw_mr.state != RDMA_RESOURCE_ERROR ||
+        recovery == null ||
+        recovery.hardware_presence != RDMA_HW_PRESENCE_ABSENT ||
+        recovery.primary_status == null ||
+        recovery.primary_status.code != RDMA_SC_STALE_GENERATION ||
+        recovery.pending_steps.size() != 1 ||
+        recovery.pending_steps[0] != RDMA_CTRL_STEP_RESOURCE_RELEASED ||
+        result == null || !result.final_resource_state_known ||
+        result.final_resource_state != RDMA_RESOURCE_ERROR ||
+        !result.recovery_required || mock_cmq.calls.size() != 2 ||
+        host_mem.live_allocations() != baseline_allocations ||
+        manager.finalize_release_calls != 0)
+      `uvm_error({prefix, "_STATE"},
+                 "stale local release finalized or lost old authority")
   endtask
 
   task automatic check_mr_deregister_failure_table();
@@ -6085,9 +6404,12 @@ class rdma_control_plane_test extends uvm_test;
     check_key_alloc_late_failure_recovery();
     check_register_mr_caller_snapshot();
     check_register_mr_post_cmq_fence();
+    check_function_concurrency();
+    check_register_mr_pre_activate_generation_fence();
     check_register_mr_recovery_freeze_failures();
     check_borrowed_pbl1_pbl2_registration();
     check_mr_deregister_success_and_busy();
+    check_deregister_generation_fences();
     check_mr_deregister_failure_table();
     check_register_mr_pre_cmq_rejections();
     check_post_activate_snapshot_cleanup();

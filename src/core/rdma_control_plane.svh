@@ -542,6 +542,27 @@ class rdma_control_plane extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  protected function rdma_status generation_fence(
+    rdma_function_binding binding,
+    rdma_function_handle expected_owner
+  );
+    if (binding == null || expected_owner == null)
+      return rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT, "generation fence authority is null"
+      );
+    if (binding.function_uid != expected_owner.function_uid ||
+        binding.global_function_id != expected_owner.object_id)
+      return rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT, "generation fence Function differs"
+      );
+    if (binding.generation != expected_owner.generation)
+      return rdma_status::make(
+        RDMA_SC_STALE_GENERATION,
+        "Function generation changed during transaction"
+      );
+    return rdma_status::success();
+  endfunction
+
   protected function rdma_status same_owner_status(
     rdma_function_handle candidate,
     rdma_function_handle expected,
@@ -1132,6 +1153,13 @@ class rdma_control_plane extends uvm_object;
         );
         break;
       end
+      status = generation_fence(binding, owner);
+      if (status == null || !status.ok()) begin
+        status = checked_status(
+          status, "initial deregister MR generation fence returned null"
+        );
+        break;
+      end
       status = mr_handle_owner_status(mr_h, owner);
       if (status == null || !status.ok()) begin
         status = checked_status(
@@ -1148,12 +1176,10 @@ class rdma_control_plane extends uvm_object;
         );
         break;
       end
-      status = same_owner_status(
-        locked_owner, owner, "post-lock deregister MR Function"
-      );
+      status = generation_fence(binding, owner);
       if (status == null || !status.ok()) begin
         status = checked_status(
-          status, "post-lock deregister MR identity check returned null"
+          status, "post-lock deregister MR generation fence returned null"
         );
         break;
       end
@@ -1270,6 +1296,19 @@ class rdma_control_plane extends uvm_object;
           break;
         end
         result.completed_steps.push_back(RDMA_CTRL_STEP_HW_OCC_FLUSHED);
+        status = generation_fence(binding, locked_owner);
+        status = checked_status(
+          status, "post-OCC_FLUSH generation fence returned null"
+        );
+        if (!status.ok()) begin
+          primary_status = rdma_cmq_clone_status_value(status);
+          retain_mr_destroy_error(
+            mr_snapshot, primary_status, result,
+            RDMA_HW_PRESENCE_PRESENT, 1'b1,
+            RDMA_CTRL_STEP_HW_MR_DEREGISTERED, null, result_finalized
+          );
+          break;
+        end
       end
 
       deregister_body = rdma_xtr_v1_mr_deregister_body::type_id::create(
@@ -1337,6 +1376,18 @@ class rdma_control_plane extends uvm_object;
       result.completed_steps.push_back(
         RDMA_CTRL_STEP_HW_MR_DEREGISTERED
       );
+      status = generation_fence(binding, locked_owner);
+      status = checked_status(
+        status, "post-MR_DEREGISTER generation fence returned null"
+      );
+      if (!status.ok()) begin
+        primary_status = rdma_cmq_clone_status_value(status);
+        retain_mr_destroy_error(
+          mr_snapshot, primary_status, result, RDMA_HW_PRESENCE_ABSENT,
+          1'b1, RDMA_CTRL_STEP_HW_DRAINED, null, result_finalized
+        );
+        break;
+      end
 
       drain_body = rdma_xtr_v1_cmq_empty_body::type_id::create(
         "deregister_mr_tq_flush_body"
@@ -1371,6 +1422,18 @@ class rdma_control_plane extends uvm_object;
         break;
       end
       result.completed_steps.push_back(RDMA_CTRL_STEP_HW_DRAINED);
+      status = generation_fence(binding, locked_owner);
+      status = checked_status(
+        status, "post-TQ_FLUSH generation fence returned null"
+      );
+      if (!status.ok()) begin
+        primary_status = rdma_cmq_clone_status_value(status);
+        retain_mr_destroy_error(
+          mr_snapshot, primary_status, result, RDMA_HW_PRESENCE_ABSENT,
+          1'b1, RDMA_CTRL_STEP_BACKING_RELEASED, null, result_finalized
+        );
+        break;
+      end
 
       for (int i = int'(mr_snapshot.hmc_refs.size()) - 1;
            i >= 0; i--) begin
@@ -1447,6 +1510,19 @@ class rdma_control_plane extends uvm_object;
         break;
       end
       result.completed_steps.push_back(RDMA_CTRL_STEP_BACKING_RELEASED);
+
+      status = generation_fence(binding, locked_owner);
+      status = checked_status(
+        status, "pre-finalize MR generation fence returned null"
+      );
+      if (!status.ok()) begin
+        primary_status = rdma_cmq_clone_status_value(status);
+        retain_mr_destroy_error(
+          mr_snapshot, primary_status, result, RDMA_HW_PRESENCE_ABSENT,
+          1'b1, RDMA_CTRL_STEP_RESOURCE_RELEASED, null, result_finalized
+        );
+        break;
+      end
 
       status = manager.finalize_release(mr_snapshot.handle);
       status = checked_status(
@@ -1540,6 +1616,13 @@ class rdma_control_plane extends uvm_object;
                                 "Function binding check returned null");
         break;
       end
+      status = generation_fence(binding, owner);
+      if (status == null || !status.ok()) begin
+        status = checked_status(
+          status, "initial register MR generation fence returned null"
+        );
+        break;
+      end
       status = register_mr_request_status(request, owner);
       if (status == null || !status.ok()) begin
         status = checked_status(
@@ -1567,12 +1650,10 @@ class rdma_control_plane extends uvm_object;
         );
         break;
       end
-      status = same_owner_status(
-        locked_owner, owner, "post-lock register MR binding"
-      );
+      status = generation_fence(binding, owner);
       if (status == null || !status.ok()) begin
         status = checked_status(
-          status, "post-lock Function identity check returned null"
+          status, "post-lock register MR generation fence returned null"
         );
         break;
       end
@@ -1811,11 +1892,9 @@ class rdma_control_plane extends uvm_object;
         );
       end
       else begin
-        status = same_owner_status(
-          live_owner, locked_owner, "post-KEY_ALLOC register MR binding"
-        );
+        status = generation_fence(binding, locked_owner);
         status = checked_status(
-          status, "post-KEY_ALLOC Function identity check returned null"
+          status, "post-KEY_ALLOC generation fence returned null"
         );
       end
       if (status.ok()) begin
@@ -1866,6 +1945,16 @@ class rdma_control_plane extends uvm_object;
       end
       result.final_resource_state = RDMA_RESOURCE_PROGRAMMED;
       result.completed_steps.push_back(RDMA_CTRL_STEP_REGISTRY_PROGRAMMED);
+
+      status = generation_fence(binding, locked_owner);
+      status = checked_status(
+        status, "pre-activate MR generation fence returned null"
+      );
+      if (!status.ok()) begin
+        rollback_mr_creation(reserved_mr, locked_owner, status, result,
+                             1'b1, 1'b1, mr, result_finalized);
+        break;
+      end
 
       status = manager.activate(reserved_mr.handle);
       if (status == null || !status.ok()) begin

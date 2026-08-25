@@ -298,7 +298,7 @@ class rdma_cmq_port_test extends rdma_cmq_engine_test;
                  "mock call opcode order does not match execute order")
   endtask
 
-  task automatic check_adapter_routes_real_engines_by_generation();
+  task automatic check_adapter_routes_real_engines_by_function();
     rdma_cmq_engine_port_adapter adapter;
     rdma_cmq_engine_probe engine_a;
     rdma_cmq_engine_probe engine_b;
@@ -356,10 +356,20 @@ class rdma_cmq_port_test extends rdma_cmq_engine_test;
     profile_b = rdma_cmq_test_profile::type_id::create("adapter_profile_b");
     prepared_a = make_binding("adapter_prepared_a", RDMA_BIND_PREPARED);
     active_a = make_binding("adapter_active_a", RDMA_BIND_ACTIVE);
-    prepared_b = next_generation_binding("adapter_prepared_b",
-                                         RDMA_BIND_PREPARED, 1);
-    active_b = next_generation_binding("adapter_active_b",
-                                       RDMA_BIND_ACTIVE, 1);
+    prepared_b = make_binding("adapter_prepared_b", RDMA_BIND_PREPARED);
+    prepared_b.function_uid = prepared_a.function_uid + 1'b1;
+    prepared_b.global_function_id = prepared_a.global_function_id + 1'b1;
+    prepared_b.pcie.bdf.function_num = 3'h2;
+    prepared_b.owner_h = prepared_b.make_handle();
+    active_b = make_binding("adapter_active_b", RDMA_BIND_ACTIVE);
+    active_b.function_uid = active_a.function_uid + 1'b1;
+    active_b.global_function_id = active_a.global_function_id + 1'b1;
+    active_b.pcie.bdf.function_num = 3'h2;
+    active_b.owner_h = active_b.make_handle();
+    if (prepared_a.function_uid == prepared_b.function_uid ||
+        prepared_a.global_function_id == prepared_b.global_function_id)
+      `uvm_fatal("ADAPTER_DISTINCT_FUNCTIONS",
+                 "adapter route fixture reused one Function")
     cmq_a = make_cmq("adapter_cmq_a", prepared_a);
     cmq_b = make_cmq("adapter_cmq_b", prepared_b);
     prepare_active("ADAPTER_A", engine_a, mem_a, pcie_a, scheduler_a,
@@ -413,7 +423,7 @@ class rdma_cmq_port_test extends rdma_cmq_engine_test;
         engine_a.published_count() != 1 ||
         engine_b.published_count() != 1)
       `uvm_error("ADAPTER_REAL_ROUTE",
-                 "commands did not reach their generation-specific engines")
+                 "commands did not reach their Function-specific engines")
     write_profile_cqe("ADAPTER_CQE_A", mem_a, mapping_a, profile_a,
                       0, 1'b1, cqe_hint_a, 0, raw_a);
     wait fork;
@@ -427,6 +437,14 @@ class rdma_cmq_port_test extends rdma_cmq_engine_test;
         completion_a.raw_cqe == null || completion_b.raw_cqe != null ||
         completion_a.ticket.function_h.generation != active_a.generation ||
         completion_b.ticket.function_h.generation != active_b.generation ||
+        completion_a.ticket.function_h.function_uid !=
+          active_a.function_uid ||
+        completion_b.ticket.function_h.function_uid !=
+          active_b.function_uid ||
+        completion_a.ticket.function_h.object_id !=
+          active_a.global_function_id ||
+        completion_b.ticket.function_h.object_id !=
+          active_b.global_function_id ||
         engine_a.outstanding_count() != 0 ||
         engine_b.outstanding_count() != 0 ||
         engine_a.quarantine_count() != 0 ||
@@ -848,7 +866,7 @@ class rdma_cmq_port_test extends rdma_cmq_engine_test;
     phase.raise_objection(this);
     check_mock_rejects_hostile_command_snapshots();
     check_mock_fifo_status_and_reconcile();
-    check_adapter_routes_real_engines_by_generation();
+    check_adapter_routes_real_engines_by_function();
     check_real_engine_ticket_specific_reconcile();
     check_real_engine_late_pair_cleanup();
     phase.drop_objection(this);
