@@ -1922,9 +1922,9 @@ class rdma_xtr_v1_context_cmq_regression_test extends uvm_test;
     if (!rdma_xtr_v1_golden_reader::read_all(
           "../hw/xtr_v1/golden_vectors/context.hex", cases, error))
       `uvm_fatal("E2E_GOLDEN_READ", error)
-    if (cases.size() != 11)
+    if (cases.size() != 13)
       `uvm_fatal("E2E_GOLDEN_COUNT",
-                 $sformatf("expected 11 context cases, got %0d",
+                 $sformatf("expected 13 context cases, got %0d",
                            cases.size()))
 
     if (!require_ok("E2E_LOOKUP_RC",
