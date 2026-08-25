@@ -2681,6 +2681,7 @@ class rdma_resource_manager extends uvm_object;
   virtual function rdma_status restore_active(rdma_handle handle);
     rdma_resource authoritative;
     rdma_resource replacement;
+    rdma_recovery_record recovery;
     rdma_status status;
     string key;
 
@@ -2688,10 +2689,71 @@ class rdma_resource_manager extends uvm_object;
     if (!status.ok())
       return status;
     key = resource_key(authoritative.handle);
-    if (registry[key].state != RDMA_RESOURCE_QUIESCING)
+    if (registry[key].state == RDMA_RESOURCE_ERROR) begin
+      status = recovery_entry_schema_status(key, "restore active");
+      if (!status.ok())
+        return status;
+      if (authoritative.handle.kind != RDMA_RESOURCE_MR ||
+          staged_allocations.exists(key) || !recovery_records.exists(key))
+        return rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "ERROR restore requires an unstaged MR recovery record"
+        );
+      recovery = recovery_records[key];
+      if (recovery == null ||
+          recovery.hardware_presence != RDMA_HW_PRESENCE_PRESENT ||
+          recovery.ambiguous_ticket != null ||
+          recovery.pending_steps.size() != 0 ||
+          !(recovery.completed_steps.size() == 0 ||
+            (recovery.completed_steps.size() == 1 &&
+             recovery.completed_steps[0] ==
+               RDMA_CTRL_STEP_HW_OCC_FLUSHED)))
+        return rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "ERROR MR recovery is not safe to restore ACTIVE"
+        );
+      foreach (recovery.backing_refs[i]) begin
+        if (recovery.backing_refs[i] == null ||
+            recovery.backing_refs[i].mapping == null ||
+            recovery.backing_refs[i].release_complete ||
+            recovery.backing_refs[i].mapping.state != RDMA_MAPPING_ACTIVE)
+          return rdma_status::make(
+            RDMA_SC_INVALID_STATE,
+            "ERROR MR recovery backing was released"
+          );
+      end
+      foreach (recovery.hmc_refs[i]) begin
+        if (recovery.hmc_refs[i] == null ||
+            recovery.hmc_refs[i].release_complete)
+          return rdma_status::make(
+            RDMA_SC_INVALID_STATE,
+            "ERROR MR recovery HMC reference was released"
+          );
+      end
+      foreach (registry[key].backing_refs[i]) begin
+        if (registry[key].backing_refs[i] == null ||
+            registry[key].backing_refs[i].mapping == null ||
+            registry[key].backing_refs[i].release_complete ||
+            registry[key].backing_refs[i].mapping.state !=
+              RDMA_MAPPING_ACTIVE)
+          return rdma_status::make(
+            RDMA_SC_INVALID_STATE,
+            "ERROR MR authoritative backing was released"
+          );
+      end
+      foreach (registry[key].hmc_refs[i]) begin
+        if (registry[key].hmc_refs[i] == null ||
+            registry[key].hmc_refs[i].release_complete)
+          return rdma_status::make(
+            RDMA_SC_INVALID_STATE,
+            "ERROR MR authoritative HMC reference was released"
+          );
+      end
+    end
+    else if (registry[key].state != RDMA_RESOURCE_QUIESCING)
       return rdma_status::make(
         RDMA_SC_INVALID_STATE,
-        "only QUIESCING resource can be restored ACTIVE"
+        "only QUIESCING or safe ERROR MR can be restored ACTIVE"
       );
     status = project_resource_value(registry[key], "restore active",
                                   replacement);
@@ -2705,6 +2767,8 @@ class rdma_resource_manager extends uvm_object;
     if (!status.ok())
       return status;
     registry[key] = replacement;
+    if (authoritative.state == RDMA_RESOURCE_ERROR)
+      recovery_records.delete(key);
     return rdma_status::success();
   endfunction
 

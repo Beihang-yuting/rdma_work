@@ -2220,6 +2220,180 @@ class rdma_resource_manager_test extends uvm_test;
                  "completion query mutation changed canonical recovery")
   endtask
 
+  task automatic create_restore_gate_mr(
+    string check_name,
+    rdma_resource_manager manager,
+    rdma_function_binding binding,
+    rdma_pd pd,
+    longint unsigned iova_value,
+    output rdma_mr mr
+  );
+    expect_status({check_name, "_CREATE"},
+                  manager.create_mr(binding, pd.handle, mr), RDMA_SC_OK);
+    if (mr == null)
+      return;
+    prepare_mr(mr, iova_value);
+    expect_status({check_name, "_STAGE"}, manager.stage_allocated(mr),
+                  RDMA_SC_OK);
+    expect_status({check_name, "_PROGRAM"}, manager.commit_programmed(mr),
+                  RDMA_SC_OK);
+    expect_status({check_name, "_ACTIVATE"}, manager.activate(mr.handle),
+                  RDMA_SC_OK);
+    expect_status({check_name, "_QUIESCE"},
+                  manager.begin_quiesce(mr.handle), RDMA_SC_OK);
+  endtask
+
+  function automatic rdma_recovery_record make_restore_gate_recovery(
+    string name,
+    rdma_mr mr
+  );
+    rdma_recovery_record recovery;
+
+    recovery = rdma_recovery_record::type_id::create(name);
+    recovery.resource_h = clone_handle({name, "_h"}, mr.handle);
+    recovery.hardware_presence = RDMA_HW_PRESENCE_PRESENT;
+    recovery.primary_status = rdma_status::make(
+      RDMA_SC_TIMEOUT, "late destroy failure is terminal"
+    );
+    return recovery;
+  endfunction
+
+  task automatic check_error_restore_active_gate();
+    rdma_resource_manager manager;
+    rdma_function_binding binding;
+    rdma_pd pd;
+    rdma_mr mr;
+    rdma_resource resource;
+    rdma_recovery_record recovery;
+    rdma_recovery_record recovery_lookup;
+    rdma_hmc_ref hmc_ref;
+
+    manager = rdma_resource_manager::type_id::create(
+      "error_restore_manager"
+    );
+    binding = make_active_binding(
+      "error_restore_binding", 64'he225_0000_0000_0001,
+      32'he225_0101, 32'd25
+    );
+    expect_status("ERROR_RESTORE_PD_CREATE",
+                  manager.create_pd(binding, pd), RDMA_SC_OK);
+    expect_status("ERROR_RESTORE_PD_ACTIVATE", manager.activate(pd.handle),
+                  RDMA_SC_OK);
+
+    create_restore_gate_mr(
+      "ERROR_RESTORE_EMPTY", manager, binding, pd,
+      64'he225_1000_0000_0000, mr
+    );
+    recovery = make_restore_gate_recovery("error_restore_empty", mr);
+    expect_status("ERROR_RESTORE_EMPTY_MARK",
+                  manager.mark_error(mr.handle, recovery), RDMA_SC_OK);
+    expect_status("ERROR_RESTORE_EMPTY_RUN", manager.restore_active(mr.handle),
+                  RDMA_SC_OK);
+    expect_status("ERROR_RESTORE_EMPTY_LOOKUP",
+                  manager.lookup(mr.handle, resource), RDMA_SC_OK);
+    expect_status("ERROR_RESTORE_EMPTY_CLEARED",
+                  manager.lookup_recovery(mr.handle, recovery_lookup),
+                  RDMA_SC_INVALID_STATE);
+    if (resource == null || resource.state != RDMA_RESOURCE_ACTIVE)
+      `uvm_error("ERROR_RESTORE_EMPTY_STATE",
+                 "safe ERROR recovery did not atomically restore ACTIVE")
+
+    create_restore_gate_mr(
+      "ERROR_RESTORE_OCC", manager, binding, pd,
+      64'he225_1000_0001_0000, mr
+    );
+    recovery = make_restore_gate_recovery("error_restore_occ", mr);
+    recovery.completed_steps.push_back(RDMA_CTRL_STEP_HW_OCC_FLUSHED);
+    expect_status("ERROR_RESTORE_OCC_MARK",
+                  manager.mark_error(mr.handle, recovery), RDMA_SC_OK);
+    expect_status("ERROR_RESTORE_OCC_RUN", manager.restore_active(mr.handle),
+                  RDMA_SC_OK);
+    expect_status("ERROR_RESTORE_OCC_LOOKUP",
+                  manager.lookup(mr.handle, resource), RDMA_SC_OK);
+    expect_status("ERROR_RESTORE_OCC_CLEARED",
+                  manager.lookup_recovery(mr.handle, recovery_lookup),
+                  RDMA_SC_INVALID_STATE);
+    if (resource == null || resource.state != RDMA_RESOURCE_ACTIVE)
+      `uvm_error("ERROR_RESTORE_OCC_STATE",
+                 "non-destructive OCC history blocked ACTIVE recovery")
+
+    create_restore_gate_mr(
+      "ERROR_RESTORE_ABSENT", manager, binding, pd,
+      64'he225_1000_0002_0000, mr
+    );
+    recovery = make_restore_gate_recovery("error_restore_absent", mr);
+    recovery.hardware_presence = RDMA_HW_PRESENCE_ABSENT;
+    expect_status("ERROR_RESTORE_ABSENT_MARK",
+                  manager.mark_error(mr.handle, recovery), RDMA_SC_OK);
+    expect_status("ERROR_RESTORE_ABSENT_REJECT",
+                  manager.restore_active(mr.handle), RDMA_SC_INVALID_STATE);
+
+    create_restore_gate_mr(
+      "ERROR_RESTORE_PENDING", manager, binding, pd,
+      64'he225_1000_0003_0000, mr
+    );
+    recovery = make_restore_gate_recovery("error_restore_pending", mr);
+    recovery.pending_steps.push_back(RDMA_CTRL_STEP_HW_MR_DEREGISTERED);
+    expect_status("ERROR_RESTORE_PENDING_MARK",
+                  manager.mark_error(mr.handle, recovery), RDMA_SC_OK);
+    expect_status("ERROR_RESTORE_PENDING_REJECT",
+                  manager.restore_active(mr.handle), RDMA_SC_INVALID_STATE);
+
+    create_restore_gate_mr(
+      "ERROR_RESTORE_CREATE", manager, binding, pd,
+      64'he225_1000_0004_0000, mr
+    );
+    recovery = make_restore_gate_recovery("error_restore_create", mr);
+    recovery.completed_steps.push_back(RDMA_CTRL_STEP_RESOURCE_RESERVED);
+    expect_status("ERROR_RESTORE_CREATE_MARK",
+                  manager.mark_error(mr.handle, recovery), RDMA_SC_OK);
+    expect_status("ERROR_RESTORE_CREATE_REJECT",
+                  manager.restore_active(mr.handle), RDMA_SC_INVALID_STATE);
+
+    create_restore_gate_mr(
+      "ERROR_RESTORE_DESTRUCTIVE", manager, binding, pd,
+      64'he225_1000_0005_0000, mr
+    );
+    recovery = make_restore_gate_recovery("error_restore_destructive", mr);
+    recovery.completed_steps.push_back(
+      RDMA_CTRL_STEP_HW_MR_DEREGISTERED
+    );
+    expect_status("ERROR_RESTORE_DESTRUCTIVE_MARK",
+                  manager.mark_error(mr.handle, recovery), RDMA_SC_OK);
+    expect_status("ERROR_RESTORE_DESTRUCTIVE_REJECT",
+                  manager.restore_active(mr.handle), RDMA_SC_INVALID_STATE);
+
+    create_restore_gate_mr(
+      "ERROR_RESTORE_RELEASED_REF", manager, binding, pd,
+      64'he225_1000_0006_0000, mr
+    );
+    recovery = make_restore_gate_recovery("error_restore_released_ref", mr);
+    hmc_ref = rdma_hmc_ref::type_id::create("error_restore_hmc_ref");
+    hmc_ref.owner = binding.make_handle();
+    hmc_ref.object_kind = RDMA_RESOURCE_MR;
+    hmc_ref.address.value = 64'he225_2000_0000_0000;
+    hmc_ref.size = 64'h1000;
+    hmc_ref.first_pbl_index = 28'h1;
+    hmc_ref.ownership = RDMA_OWNERSHIP_CONTROL_PLANE;
+    hmc_ref.release_complete = 1'b1;
+    recovery.hmc_refs.push_back(hmc_ref);
+    expect_status("ERROR_RESTORE_RELEASED_REF_MARK",
+                  manager.mark_error(mr.handle, recovery), RDMA_SC_OK);
+    expect_status("ERROR_RESTORE_RELEASED_REF_REJECT",
+                  manager.restore_active(mr.handle), RDMA_SC_INVALID_STATE);
+
+    recovery = rdma_recovery_record::type_id::create("error_restore_pd");
+    recovery.resource_h = clone_handle("ERROR_RESTORE_PD_H", pd.handle);
+    recovery.hardware_presence = RDMA_HW_PRESENCE_PRESENT;
+    recovery.primary_status = rdma_status::make(
+      RDMA_SC_TIMEOUT, "PD cannot use MR ERROR restore"
+    );
+    expect_status("ERROR_RESTORE_PD_MARK",
+                  manager.mark_error(pd.handle, recovery), RDMA_SC_OK);
+    expect_status("ERROR_RESTORE_PD_REJECT",
+                  manager.restore_active(pd.handle), RDMA_SC_INVALID_STATE);
+  endtask
+
   function automatic bit same_handle_fields(rdma_handle lhs,
                                              rdma_handle rhs);
     if (lhs == null || rhs == null)
@@ -2600,6 +2774,7 @@ class rdma_resource_manager_test extends uvm_test;
     check_owned_mapping_clone_contract_rejections();
     check_owned_mapping_capability_snapshots();
     check_reserved_error_completion_proof();
+    check_error_restore_active_gate();
 
     // PD and MR local IDs are hardware-width projections.  The inclusive
     // boundary succeeds, while the next fresh ID fails atomically without

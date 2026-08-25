@@ -132,6 +132,37 @@ class rdma_blocking_mock_cmq_port extends rdma_mock_cmq_port;
 
 endclass
 
+class rdma_reconcile_fault_mock_cmq_port extends rdma_mock_cmq_port;
+  `uvm_object_utils(rdma_reconcile_fault_mock_cmq_port)
+
+  protected rdma_status next_reconcile_failure;
+
+  function new(string name = "rdma_reconcile_fault_mock_cmq_port");
+    super.new(name);
+    next_reconcile_failure = null;
+  endfunction
+
+  function void fail_next_reconcile(rdma_status failure);
+    next_reconcile_failure = rdma_cmq_clone_status_value(failure);
+  endfunction
+
+  virtual task reconcile(
+    rdma_cmq_ticket ticket,
+    output bit terminal_known,
+    output rdma_cmq_completion completion,
+    output rdma_status status
+  );
+    if (next_reconcile_failure != null) begin
+      terminal_known = 1'b0;
+      completion = null;
+      status = rdma_cmq_clone_status_value(next_reconcile_failure);
+      next_reconcile_failure = null;
+      return;
+    end
+    super.reconcile(ticket, terminal_known, completion, status);
+  endtask
+endclass
+
 class rdma_recovery_probe_manager extends rdma_resource_manager;
   `uvm_object_utils(rdma_recovery_probe_manager)
 
@@ -431,6 +462,52 @@ class rdma_control_plane_test extends uvm_test;
     expect_status({check_name, "_VALIDATE"}, validation_status, RDMA_SC_OK);
   endfunction
 
+  function automatic void expect_completed_recovery(
+    string check_name,
+    rdma_control_result result,
+    rdma_status_code_e expected_primary_code
+  );
+    rdma_status validation_status;
+
+    if (result == null) begin
+      `uvm_error(check_name, "completed recovery result is null")
+      return;
+    end
+    expect_status({check_name, "_STATUS"}, result.status, RDMA_SC_OK);
+    expect_status({check_name, "_PRIMARY"}, result.primary_status,
+                  expected_primary_code);
+    if (result.transaction_id == 0 || result.recovery_required ||
+        !result.final_resource_state_known ||
+        result.final_resource_state != RDMA_RESOURCE_RELEASED)
+      `uvm_error(check_name,
+                 "completed recovery result does not publish RELEASED")
+    validation_status = result.validate();
+    expect_status({check_name, "_VALIDATE"}, validation_status, RDMA_SC_OK);
+  endfunction
+
+  function automatic void expect_restored_recovery(
+    string check_name,
+    rdma_control_result result,
+    rdma_status_code_e expected_primary_code
+  );
+    rdma_status validation_status;
+
+    if (result == null) begin
+      `uvm_error(check_name, "restored recovery result is null")
+      return;
+    end
+    expect_status({check_name, "_STATUS"}, result.status, RDMA_SC_OK);
+    expect_status({check_name, "_PRIMARY"}, result.primary_status,
+                  expected_primary_code);
+    if (result.transaction_id == 0 || result.recovery_required ||
+        !result.final_resource_state_known ||
+        result.final_resource_state != RDMA_RESOURCE_ACTIVE)
+      `uvm_error(check_name,
+                 "restored recovery result does not publish ACTIVE")
+    validation_status = result.validate();
+    expect_status({check_name, "_VALIDATE"}, validation_status, RDMA_SC_OK);
+  endfunction
+
   function automatic rdma_function_binding make_active_binding(
     string name,
     longint unsigned function_uid = 64'h0123_4567_89ab_cdef,
@@ -596,6 +673,114 @@ class rdma_control_plane_test extends uvm_test;
            lhs.function_uid == rhs.function_uid &&
            lhs.object_id == rhs.object_id &&
            lhs.generation == rhs.generation;
+  endfunction
+
+  function automatic bit same_status_fields(
+    rdma_status lhs,
+    rdma_status rhs
+  );
+    if (lhs == null || rhs == null)
+      return lhs == rhs;
+    return lhs.category == rhs.category && lhs.code == rhs.code &&
+           lhs.hardware_code == rhs.hardware_code &&
+           lhs.hardware_code_valid == rhs.hardware_code_valid &&
+           lhs.source_engine == rhs.source_engine &&
+           lhs.function_uid == rhs.function_uid &&
+           lhs.generation == rhs.generation &&
+           lhs.resource_id == rhs.resource_id &&
+           lhs.command_id == rhs.command_id && lhs.wr_id == rhs.wr_id &&
+           lhs.severity == rhs.severity && lhs.retryable == rhs.retryable &&
+           lhs.message == rhs.message;
+  endfunction
+
+  function automatic bit same_ticket_fields(
+    rdma_cmq_ticket lhs,
+    rdma_cmq_ticket rhs
+  );
+    if (lhs == null || rhs == null)
+      return lhs == rhs;
+    if (lhs.opcode_key == null || rhs.opcode_key == null)
+      return lhs.opcode_key == rhs.opcode_key;
+    return lhs.command_id == rhs.command_id &&
+           same_handle_fields(lhs.function_h, rhs.function_h) &&
+           same_handle_fields(lhs.cmq_h, rhs.cmq_h) &&
+           lhs.slot_sequence == rhs.slot_sequence &&
+           lhs.sq_index == rhs.sq_index && lhs.sq_wrap == rhs.sq_wrap &&
+           lhs.opcode_key.profile_name == rhs.opcode_key.profile_name &&
+           lhs.opcode_key.opcode == rhs.opcode_key.opcode &&
+           lhs.opcode_key.variant == rhs.opcode_key.variant &&
+           lhs.absolute_deadline == rhs.absolute_deadline;
+  endfunction
+
+  function automatic bit same_mapping_fields(
+    rdma_dma_mapping lhs,
+    rdma_dma_mapping rhs
+  );
+    if (lhs == null || rhs == null)
+      return lhs == rhs;
+    return same_handle_fields(lhs.function_h, rhs.function_h) &&
+           lhs.requester_bdf == rhs.requester_bdf &&
+           lhs.pasid_valid == rhs.pasid_valid && lhs.pasid == rhs.pasid &&
+           lhs.backing_addr == rhs.backing_addr && lhs.iova == rhs.iova &&
+           lhs.size == rhs.size && lhs.direction == rhs.direction &&
+           lhs.permissions == rhs.permissions && lhs.state == rhs.state &&
+           same_handle_fields(lhs.owner_h, rhs.owner_h);
+  endfunction
+
+  function automatic bit same_recovery_fields(
+    rdma_recovery_record lhs,
+    rdma_recovery_record rhs
+  );
+    if (lhs == null || rhs == null)
+      return lhs == rhs;
+    if (!same_handle_fields(lhs.resource_h, rhs.resource_h) ||
+        lhs.hardware_presence != rhs.hardware_presence ||
+        lhs.completed_steps != rhs.completed_steps ||
+        lhs.pending_steps != rhs.pending_steps ||
+        !same_ticket_fields(lhs.ambiguous_ticket,
+                            rhs.ambiguous_ticket) ||
+        !same_status_fields(lhs.primary_status, rhs.primary_status) ||
+        lhs.backing_refs.size() != rhs.backing_refs.size() ||
+        lhs.hmc_refs.size() != rhs.hmc_refs.size() ||
+        lhs.rollback_statuses.size() != rhs.rollback_statuses.size())
+      return 1'b0;
+    foreach (lhs.backing_refs[i]) begin
+      if (lhs.backing_refs[i] == null || rhs.backing_refs[i] == null) begin
+        if (lhs.backing_refs[i] != rhs.backing_refs[i])
+          return 1'b0;
+      end
+      else if (lhs.backing_refs[i].ownership !=
+                 rhs.backing_refs[i].ownership ||
+               lhs.backing_refs[i].release_complete !=
+                 rhs.backing_refs[i].release_complete ||
+               !same_mapping_fields(lhs.backing_refs[i].mapping,
+                                    rhs.backing_refs[i].mapping))
+        return 1'b0;
+    end
+    foreach (lhs.hmc_refs[i]) begin
+      if (lhs.hmc_refs[i] == null || rhs.hmc_refs[i] == null) begin
+        if (lhs.hmc_refs[i] != rhs.hmc_refs[i])
+          return 1'b0;
+      end
+      else if (!same_handle_fields(lhs.hmc_refs[i].owner,
+                                   rhs.hmc_refs[i].owner) ||
+               lhs.hmc_refs[i].object_kind !=
+                 rhs.hmc_refs[i].object_kind ||
+               lhs.hmc_refs[i].address != rhs.hmc_refs[i].address ||
+               lhs.hmc_refs[i].size != rhs.hmc_refs[i].size ||
+               lhs.hmc_refs[i].first_pbl_index !=
+                 rhs.hmc_refs[i].first_pbl_index ||
+               lhs.hmc_refs[i].ownership != rhs.hmc_refs[i].ownership ||
+               lhs.hmc_refs[i].release_complete !=
+                 rhs.hmc_refs[i].release_complete)
+        return 1'b0;
+    end
+    foreach (lhs.rollback_statuses[i]) begin
+      if (!same_status_fields(lhs.rollback_statuses[i],
+                              rhs.rollback_statuses[i]))
+        return 1'b0;
+    end
+    return 1'b1;
   endfunction
 
   function automatic rdma_hmc_ref make_borrowed_hmc_ref(
@@ -1512,7 +1697,8 @@ class rdma_control_plane_test extends uvm_test;
       control.recover_resource(binding, result.resource_h, recovery_result);
     else
       recovery_result = null;
-    expect_result("OWNED_PRESTAGE_RECOVER", recovery_result, RDMA_SC_OK);
+    expect_completed_recovery("OWNED_PRESTAGE_RECOVER", recovery_result,
+                              RDMA_SC_INVALID_STATE);
     if (result != null && result.resource_h != null) begin
       status = manager.lookup(result.resource_h, registry_resource);
       expect_status("OWNED_PRESTAGE_RELEASED", status,
@@ -1641,7 +1827,7 @@ class rdma_control_plane_test extends uvm_test;
     else
       recovery_result = null;
     expect_recovery_result("OWNED_PRESTAGE_DOUBLE_RETRY", recovery_result,
-                           RDMA_SC_RESOURCE_BUSY);
+                           RDMA_SC_INVALID_STATE);
     recovery = null;
     registry_resource = null;
     if (result != null && result.resource_h != null) begin
@@ -1676,7 +1862,7 @@ class rdma_control_plane_test extends uvm_test;
       recovery_result = null;
     expect_recovery_result(
       "OWNED_PRESTAGE_DOUBLE_COMPLETE_RETRY", recovery_result,
-      RDMA_SC_RESOURCE_BUSY
+      RDMA_SC_INVALID_STATE
     );
     recovery = null;
     registry_resource = null;
@@ -1717,8 +1903,8 @@ class rdma_control_plane_test extends uvm_test;
       control.recover_resource(binding, result.resource_h, recovery_result);
     else
       recovery_result = null;
-    expect_result("OWNED_PRESTAGE_DOUBLE_RECOVER", recovery_result,
-                  RDMA_SC_OK);
+    expect_completed_recovery("OWNED_PRESTAGE_DOUBLE_RECOVER",
+                              recovery_result, RDMA_SC_INVALID_STATE);
     if (result != null && result.resource_h != null) begin
       status = manager.lookup(result.resource_h, registry_resource);
       expect_status("OWNED_PRESTAGE_DOUBLE_RELEASED", status,
@@ -1735,6 +1921,122 @@ class rdma_control_plane_test extends uvm_test;
         manager.release_reserved_calls != 0)
       `uvm_error("OWNED_PRESTAGE_DOUBLE_RECOVER_STATE",
                  "reserved ERROR recovery did not finish exactly once")
+  endtask
+
+  task automatic check_owned_recovery_status_accumulation();
+    rdma_control_plane control;
+    rdma_fault_inject_resource_manager manager;
+    rdma_mock_cmq_port mock_cmq;
+    rdma_mock_stag_key_policy key_policy;
+    rdma_mock_host_mem host_mem;
+    rdma_function_binding binding;
+    rdma_register_mr_req request;
+    rdma_dma_request_context dma_context;
+    rdma_pd pd;
+    rdma_dma_mapping mapping;
+    rdma_mr mr;
+    rdma_resource resource;
+    rdma_control_result result;
+    rdma_control_result recovery_result;
+    rdma_control_result second_recovery_result;
+    rdma_recovery_record recovery;
+    rdma_status primary_failure;
+    rdma_status old_rollback_failure;
+    rdma_status new_rollback_failure;
+    rdma_status status;
+    int unsigned baseline_allocations;
+    int unsigned baseline_leaks;
+
+    setup_owned_mr_case(
+      "owned_recovery_accumulate", 1'b1, control, manager, mock_cmq,
+      key_policy, host_mem, binding, request, dma_context, pd,
+      baseline_allocations, baseline_leaks
+    );
+    if (pd == null)
+      return;
+
+    primary_failure = rdma_status::make(
+      RDMA_SC_INVALID_STATE, "injected activation primary failure"
+    );
+    status = manager.fail_next_transition("activate", primary_failure);
+    expect_status("RECOVERY_ACCUMULATE_PRIMARY_INJECT", status, RDMA_SC_OK);
+    old_rollback_failure = rdma_status::make(
+      RDMA_SC_UNKNOWN_HW_ERROR, "injected original rollback release failure"
+    );
+    status = host_mem.fail_next("release", old_rollback_failure);
+    expect_status("RECOVERY_ACCUMULATE_OLD_INJECT", status, RDMA_SC_OK);
+
+    control.alloc_and_register_mr(binding, request, dma_context, 4096,
+                                  mapping, mr, result);
+    expect_recovery_result("RECOVERY_ACCUMULATE_SETUP", result,
+                           RDMA_SC_INVALID_STATE);
+    status = manager.lookup_recovery(result.resource_h, recovery);
+    expect_status("RECOVERY_ACCUMULATE_SETUP_RECORD", status, RDMA_SC_OK);
+    if (recovery == null || recovery.primary_status == null ||
+        recovery.primary_status.code != RDMA_SC_INVALID_STATE ||
+        recovery.rollback_statuses.size() != 1 ||
+        recovery.rollback_statuses[0] == null ||
+        recovery.rollback_statuses[0].code != RDMA_SC_UNKNOWN_HW_ERROR ||
+        recovery.pending_steps.size() != 1 ||
+        recovery.pending_steps[0] != RDMA_CTRL_STEP_BACKING_RELEASED ||
+        recovery.hardware_presence != RDMA_HW_PRESENCE_ABSENT ||
+        mock_cmq.calls.size() != 2 || host_mem.calls.size() != 2)
+      `uvm_error("RECOVERY_ACCUMULATE_SETUP_STATE",
+                 "setup did not retain the original rollback history")
+
+    new_rollback_failure = rdma_status::make(
+      RDMA_SC_RESOURCE_BUSY, "injected recovery release failure"
+    );
+    status = host_mem.fail_next("release", new_rollback_failure);
+    expect_status("RECOVERY_ACCUMULATE_NEW_INJECT", status, RDMA_SC_OK);
+    control.recover_resource(binding, result.resource_h, recovery_result);
+    expect_recovery_result("RECOVERY_ACCUMULATE_RETRY", recovery_result,
+                           RDMA_SC_INVALID_STATE);
+    status = manager.lookup_recovery(result.resource_h, recovery);
+    expect_status("RECOVERY_ACCUMULATE_RETRY_RECORD", status, RDMA_SC_OK);
+    if (recovery_result.rollback_statuses.size() != 2 ||
+        recovery_result.rollback_statuses[0] == null ||
+        recovery_result.rollback_statuses[0].code !=
+          RDMA_SC_UNKNOWN_HW_ERROR ||
+        recovery_result.rollback_statuses[1] == null ||
+        recovery_result.rollback_statuses[1].code != RDMA_SC_RESOURCE_BUSY ||
+        recovery == null || recovery.primary_status == null ||
+        recovery.primary_status.code != RDMA_SC_INVALID_STATE ||
+        recovery.rollback_statuses.size() != 2 ||
+        recovery.rollback_statuses[0] == null ||
+        recovery.rollback_statuses[0].code != RDMA_SC_UNKNOWN_HW_ERROR ||
+        recovery.rollback_statuses[1] == null ||
+        recovery.rollback_statuses[1].code != RDMA_SC_RESOURCE_BUSY ||
+        recovery.pending_steps.size() != 1 ||
+        recovery.pending_steps[0] != RDMA_CTRL_STEP_BACKING_RELEASED ||
+        mock_cmq.calls.size() != 2 || host_mem.calls.size() != 3 ||
+        host_mem.live_allocations() != baseline_allocations + 1)
+      `uvm_error("RECOVERY_ACCUMULATE_RETRY_STATE",
+                 "recovery replaced primary or rollback history")
+
+    control.recover_resource(binding, result.resource_h, recovery_result);
+    expect_completed_recovery("RECOVERY_ACCUMULATE_COMPLETE",
+                              recovery_result, RDMA_SC_INVALID_STATE);
+    status = manager.lookup(result.resource_h, resource);
+    expect_status("RECOVERY_ACCUMULATE_RELEASED", status,
+                  RDMA_SC_INVALID_STATE);
+    if (recovery_result.rollback_statuses.size() != 2 ||
+        recovery_result.rollback_statuses[0] == null ||
+        recovery_result.rollback_statuses[0].code !=
+          RDMA_SC_UNKNOWN_HW_ERROR ||
+        recovery_result.rollback_statuses[1] == null ||
+        recovery_result.rollback_statuses[1].code != RDMA_SC_RESOURCE_BUSY ||
+        mock_cmq.calls.size() != 2 || host_mem.calls.size() != 4 ||
+        host_mem.live_allocations() != baseline_allocations)
+      `uvm_error("RECOVERY_ACCUMULATE_COMPLETE_STATE",
+                 "successful retry lost history or repeated hardware")
+    control.recover_resource(binding, result.resource_h,
+                             second_recovery_result);
+    expect_result("RECOVERY_ACCUMULATE_SECOND", second_recovery_result,
+                  RDMA_SC_INVALID_STATE);
+    if (mock_cmq.calls.size() != 2 || host_mem.calls.size() != 4)
+      `uvm_error("RECOVERY_ACCUMULATE_IDEMPOTENT",
+                 "released resource repeated a recovery side effect")
   endtask
 
   task automatic check_owned_recovery_completion_hook_guard();
@@ -1817,7 +2119,7 @@ class rdma_control_plane_test extends uvm_test;
     control.recover_resource(binding, result.resource_h, recovery_result);
     rdma_cp_mutating_completion_mapping::disarm_completion_mutation();
     expect_recovery_result("COMPLETION_HOOK_REJECT", recovery_result,
-                           RDMA_SC_INVALID_ARGUMENT);
+                           RDMA_SC_INVALID_STATE);
     recovery = null;
     registry_resource = null;
     status = manager.lookup(result.resource_h, registry_resource);
@@ -1848,7 +2150,8 @@ class rdma_control_plane_test extends uvm_test;
                  "completion hook mutation reached release or durable state")
 
     control.recover_resource(binding, result.resource_h, recovery_result);
-    expect_result("COMPLETION_HOOK_RECOVER", recovery_result, RDMA_SC_OK);
+    expect_completed_recovery("COMPLETION_HOOK_RECOVER", recovery_result,
+                              RDMA_SC_INVALID_STATE);
     status = manager.lookup(result.resource_h, registry_resource);
     expect_status("COMPLETION_HOOK_RELEASED", status,
                   RDMA_SC_INVALID_STATE);
@@ -2066,7 +2369,7 @@ class rdma_control_plane_test extends uvm_test;
     else
       recovery_result = null;
     expect_recovery_result("OWNED_RELEASED_MAPPING_RETRY", recovery_result,
-                           RDMA_SC_RESOURCE_BUSY);
+                           RDMA_SC_INVALID_STATE);
     recovery = null;
     registry_resource = null;
     if (result != null && result.resource_h != null) begin
@@ -2096,8 +2399,8 @@ class rdma_control_plane_test extends uvm_test;
       control.recover_resource(binding, result.resource_h, recovery_result);
     else
       recovery_result = null;
-    expect_result("OWNED_RELEASED_MAPPING_RECOVER", recovery_result,
-                  RDMA_SC_OK);
+    expect_completed_recovery("OWNED_RELEASED_MAPPING_RECOVER",
+                              recovery_result, RDMA_SC_INVALID_STATE);
     if (result != null && result.resource_h != null) begin
       status = manager.lookup(result.resource_h, registry_resource);
       expect_status("OWNED_RELEASED_MAPPING_RELEASED", status,
@@ -2589,7 +2892,7 @@ class rdma_control_plane_test extends uvm_test;
   task automatic check_key_alloc_timeout_recovery();
     rdma_control_plane control;
     rdma_resource_manager manager;
-    rdma_mock_cmq_port mock_cmq;
+    rdma_reconcile_fault_mock_cmq_port mock_cmq;
     rdma_mock_stag_key_policy key_policy;
     rdma_hmc_allocator hmc;
     rdma_function_binding binding;
@@ -2604,7 +2907,13 @@ class rdma_control_plane_test extends uvm_test;
     rdma_mr registry_mr;
     rdma_resource resource;
     rdma_control_result result;
+    rdma_control_result recovery_result;
+    rdma_control_result second_recovery_result;
     rdma_recovery_record recovery;
+    rdma_recovery_record recovery_before;
+    rdma_recovery_record recovery_after;
+    rdma_status reconcile_failure;
+    rdma_status reset_status;
     rdma_status status;
     longint unsigned lease_size;
     int unsigned baseline_leak_count;
@@ -2612,7 +2921,9 @@ class rdma_control_plane_test extends uvm_test;
 
     control = rdma_control_plane::type_id::create("timeout_control");
     manager = rdma_resource_manager::type_id::create("timeout_manager");
-    mock_cmq = rdma_mock_cmq_port::type_id::create("timeout_cmq");
+    mock_cmq = rdma_reconcile_fault_mock_cmq_port::type_id::create(
+      "timeout_cmq"
+    );
     key_policy = rdma_mock_stag_key_policy::type_id::create(
       "timeout_policy"
     );
@@ -2722,6 +3033,172 @@ class rdma_control_plane_test extends uvm_test;
     status = hmc.lookup(binding.make_handle(), RDMA_RESOURCE_MR,
                         hmc_address, lease_size);
     expect_status("KEY_ALLOC_TIMEOUT_HMC_LOOKUP", status, RDMA_SC_OK);
+
+    if (recovery != null && recovery.ambiguous_ticket != null) begin
+      recovery_before = recovery;
+      control.recover_resource(binding, result.resource_h,
+                               recovery_result);
+      expect_recovery_result("KEY_ALLOC_UNKNOWN", recovery_result,
+                             RDMA_SC_TIMEOUT);
+      status = manager.lookup_recovery(result.resource_h, recovery_after);
+      expect_status("KEY_ALLOC_UNKNOWN_RECORD", status, RDMA_SC_OK);
+      if (!same_recovery_fields(recovery_before, recovery_after) ||
+          mock_cmq.calls.size() != 1)
+        `uvm_error("KEY_ALLOC_UNKNOWN_STATE",
+                   "unknown terminal state mutated recovery or sent CMQ")
+
+      reconcile_failure = rdma_status::make(
+        RDMA_SC_RESOURCE_BUSY, "injected reconciliation transport failure"
+      );
+      mock_cmq.fail_next_reconcile(reconcile_failure);
+      control.recover_resource(binding, result.resource_h,
+                               recovery_result);
+      expect_recovery_result("KEY_ALLOC_UNKNOWN_FAILURE", recovery_result,
+                             RDMA_SC_TIMEOUT);
+      status = manager.lookup_recovery(result.resource_h, recovery_after);
+      expect_status("KEY_ALLOC_UNKNOWN_FAILURE_RECORD", status, RDMA_SC_OK);
+      if (!same_recovery_fields(recovery_before, recovery_after) ||
+          recovery_result.rollback_statuses.size() != 1 ||
+          recovery_result.rollback_statuses[0] == null ||
+          recovery_result.rollback_statuses[0].code !=
+            RDMA_SC_RESOURCE_BUSY || mock_cmq.calls.size() != 1)
+        `uvm_error(
+          "KEY_ALLOC_UNKNOWN_FAILURE_STATE",
+          "failed unknown reconciliation changed durable recovery"
+        )
+
+      reset_status = rdma_status::make(
+        RDMA_SC_RESET_CANCELLED, "late reset cancellation"
+      );
+      mock_cmq.push_late_completion(recovery_before.ambiguous_ticket,
+                                    reset_status);
+      control.recover_resource(binding, result.resource_h,
+                               recovery_result);
+      expect_recovery_result("KEY_ALLOC_RESET_CANCELLED", recovery_result,
+                             RDMA_SC_TIMEOUT);
+      status = manager.lookup_recovery(result.resource_h, recovery_after);
+      expect_status("KEY_ALLOC_RESET_CANCELLED_RECORD", status,
+                    RDMA_SC_OK);
+      if (!same_recovery_fields(recovery_before, recovery_after) ||
+          recovery_after.hardware_presence != RDMA_HW_PRESENCE_UNKNOWN ||
+          recovery_after.ambiguous_ticket == null ||
+          mock_cmq.calls.size() != 1)
+        `uvm_error("KEY_ALLOC_RESET_CANCELLED_STATE",
+                   "reset cancellation was treated as absence proof")
+
+      mock_cmq.push_late_completion(recovery_before.ambiguous_ticket,
+                                    rdma_status::success());
+      control.recover_resource(binding, result.resource_h,
+                               recovery_result);
+      expect_completed_recovery("KEY_ALLOC_LATE_SUCCESS", recovery_result,
+                                RDMA_SC_TIMEOUT);
+      if (mock_cmq.calls.size() != 2 || mock_cmq.calls[1] == null ||
+          mock_cmq.calls[1].opcode != XTR_V1_OP_MR_DEREGISTER ||
+          !recovery_result.final_resource_state_known ||
+          recovery_result.final_resource_state != RDMA_RESOURCE_RELEASED)
+        `uvm_error("KEY_ALLOC_LATE_SUCCESS_STATE",
+                   "late KEY_ALLOC success was not undone exactly once")
+      status = manager.lookup(result.resource_h, resource);
+      expect_status("KEY_ALLOC_LATE_SUCCESS_RELEASED", status,
+                    RDMA_SC_INVALID_STATE);
+      control.recover_resource(binding, result.resource_h,
+                               second_recovery_result);
+      expect_result("KEY_ALLOC_LATE_SUCCESS_SECOND", second_recovery_result,
+                    RDMA_SC_INVALID_STATE);
+      if (mock_cmq.calls.size() != 2)
+        `uvm_error("KEY_ALLOC_LATE_SUCCESS_IDEMPOTENT",
+                   "second recovery repeated a hardware side effect")
+    end
+  endtask
+
+  task automatic check_key_alloc_late_failure_recovery();
+    rdma_control_plane control;
+    rdma_fault_resource_manager manager;
+    rdma_mock_cmq_port mock_cmq;
+    rdma_mock_stag_key_policy key_policy;
+    rdma_function_binding binding;
+    rdma_create_pd_req pd_request;
+    rdma_register_mr_req request;
+    rdma_mr_backing_desc backing;
+    rdma_pd pd;
+    rdma_mr mr;
+    rdma_resource resource;
+    rdma_control_result result;
+    rdma_control_result recovery_result;
+    rdma_control_result second_recovery_result;
+    rdma_recovery_record recovery;
+    rdma_status late_failure;
+    rdma_status status;
+
+    control = rdma_control_plane::type_id::create(
+      "late_failure_control"
+    );
+    manager = rdma_fault_resource_manager::type_id::create(
+      "late_failure_manager"
+    );
+    mock_cmq = rdma_mock_cmq_port::type_id::create("late_failure_cmq");
+    key_policy = rdma_mock_stag_key_policy::type_id::create(
+      "late_failure_policy"
+    );
+    binding = make_active_binding(
+      "late_failure_binding", 64'ha510_0000_0000_0001,
+      32'ha510_0101, 60
+    );
+    status = control.configure(manager, mock_cmq, key_policy, null, null,
+                               6us);
+    expect_status("KEY_ALLOC_LATE_FAILURE_CONFIGURE", status, RDMA_SC_OK);
+    pd_request = make_create_pd_request(
+      "late_failure_pd_request", binding
+    );
+    control.create_pd(binding, pd_request, pd, result);
+    expect_result("KEY_ALLOC_LATE_FAILURE_PD", result, RDMA_SC_OK);
+    if (pd == null || pd.handle == null)
+      return;
+
+    request = make_register_mr_request(
+      "late_failure_request", binding, pd
+    );
+    backing = make_borrowed_pbl0_backing(
+      "late_failure_backing", binding, request
+    );
+    mock_cmq.timeout_opcode(XTR_V1_OP_KEY_ALLOC);
+    control.register_mr(binding, request, backing, mr, result);
+    expect_recovery_result("KEY_ALLOC_LATE_FAILURE_TIMEOUT", result,
+                           RDMA_SC_TIMEOUT);
+    if (mr == null || mr.state != RDMA_RESOURCE_ERROR)
+      `uvm_error("KEY_ALLOC_LATE_FAILURE_TIMEOUT_STATE",
+                 "ambiguous MR was discarded")
+    status = manager.lookup_recovery(result.resource_h, recovery);
+    expect_status("KEY_ALLOC_LATE_FAILURE_RECORD", status, RDMA_SC_OK);
+    if (recovery == null || recovery.ambiguous_ticket == null)
+      return;
+
+    late_failure = rdma_status::make(
+      RDMA_SC_UNKNOWN_HW_ERROR, "late KEY_ALLOC terminal failure"
+    );
+    mock_cmq.push_late_completion(recovery.ambiguous_ticket, late_failure);
+    control.recover_resource(binding, result.resource_h, recovery_result);
+    expect_completed_recovery("KEY_ALLOC_LATE_FAILURE", recovery_result,
+                              RDMA_SC_TIMEOUT);
+    if (mock_cmq.calls.size() != 1 || mock_cmq.calls[0] == null ||
+        mock_cmq.calls[0].opcode != XTR_V1_OP_KEY_ALLOC ||
+        manager.finalize_release_calls != 1 ||
+        backing.backing_refs[0] == null ||
+        backing.backing_refs[0].release_complete ||
+        backing.backing_refs[0].mapping == null ||
+        backing.backing_refs[0].mapping.state != RDMA_MAPPING_ACTIVE)
+      `uvm_error("KEY_ALLOC_LATE_FAILURE_STATE",
+                 "late failure sent deregister or changed borrowed backing")
+    status = manager.lookup(result.resource_h, resource);
+    expect_status("KEY_ALLOC_LATE_FAILURE_RELEASED", status,
+                  RDMA_SC_INVALID_STATE);
+    control.recover_resource(binding, result.resource_h,
+                             second_recovery_result);
+    expect_result("KEY_ALLOC_LATE_FAILURE_SECOND", second_recovery_result,
+                  RDMA_SC_INVALID_STATE);
+    if (mock_cmq.calls.size() != 1 || manager.finalize_release_calls != 1)
+      `uvm_error("KEY_ALLOC_LATE_FAILURE_IDEMPOTENT",
+                 "second recovery repeated a side effect")
   endtask
 
   task automatic check_register_mr_caller_snapshot();
@@ -4425,6 +4902,7 @@ class rdma_control_plane_test extends uvm_test;
     rdma_hmc_fvm_addr_t fault_hmc_base;
     rdma_control_result result;
     rdma_control_result recovery_result;
+    rdma_control_result second_recovery_result;
     rdma_recovery_record recovery;
     rdma_status injected_status;
     rdma_status status;
@@ -4555,6 +5033,53 @@ class rdma_control_plane_test extends uvm_test;
       `uvm_error("MR_DEREG_OCC_TIMEOUT_STATE",
                  "OCC timeout did not retain UNKNOWN ERROR recovery")
 
+    injected_status = rdma_status::make(
+      RDMA_SC_UNKNOWN_HW_ERROR, "late OCC terminal failure"
+    );
+    if (recovery != null && recovery.ambiguous_ticket != null)
+      mock_cmq.push_late_completion(recovery.ambiguous_ticket,
+                                    injected_status);
+    control.recover_resource(binding, mr.handle, recovery_result);
+    expect_restored_recovery("MR_DEREG_OCC_LATE_FAILURE", recovery_result,
+                             RDMA_SC_TIMEOUT);
+    status = manager.lookup(mr.handle, resource);
+    expect_status("MR_DEREG_OCC_LATE_FAILURE_LOOKUP", status, RDMA_SC_OK);
+    live_mr = null;
+    void'($cast(live_mr, resource));
+    status = manager.lookup_recovery(mr.handle, recovery);
+    expect_status("MR_DEREG_OCC_LATE_FAILURE_CLEARED", status,
+                  RDMA_SC_INVALID_STATE);
+    expected_opcodes.delete();
+    expected_opcodes.push_back(XTR_V1_OP_OCC_FLUSH);
+    expect_cmq_opcodes("MR_DEREG_OCC_LATE_FAILURE_ORDER", mock_cmq,
+                       expected_opcodes);
+    if (live_mr == null || live_mr.state != RDMA_RESOURCE_ACTIVE ||
+        recovery_result.rollback_statuses.size() != 1 ||
+        recovery_result.rollback_statuses[0] == null ||
+        recovery_result.rollback_statuses[0].code !=
+          RDMA_SC_UNKNOWN_HW_ERROR ||
+        manager.restore_active_calls != 1 ||
+        manager.mark_error_calls != 2 ||
+        manager.finalize_release_calls != 0 ||
+        host_mem.live_allocations() != baseline_allocations + 1 ||
+        host_mem.calls.size() != 1)
+      `uvm_error("MR_DEREG_OCC_LATE_FAILURE_STATE",
+                 "late OCC failure did not atomically restore ACTIVE")
+    control.recover_resource(binding, mr.handle, second_recovery_result);
+    expect_result("MR_DEREG_OCC_LATE_FAILURE_SECOND",
+                  second_recovery_result, RDMA_SC_INVALID_STATE);
+    if (mock_cmq.calls.size() != 1 || manager.restore_active_calls != 1 ||
+        manager.mark_error_calls != 2 || host_mem.calls.size() != 1)
+      `uvm_error("MR_DEREG_OCC_LATE_FAILURE_IDEMPOTENT",
+                 "restored OCC recovery repeated a side effect")
+    status = host_mem.\release (mapping);
+    expect_status("MR_DEREG_OCC_LATE_FAILURE_MAP_RELEASE", status,
+                  RDMA_SC_OK);
+    status = hmc.\release (binding.make_handle(), RDMA_RESOURCE_MR,
+                           hmc_address);
+    expect_status("MR_DEREG_OCC_LATE_FAILURE_HMC_RELEASE", status,
+                  RDMA_SC_OK);
+
     setup_deregister_mr_case(
       "dereg_command_failure", RDMA_MR_PBL0, RDMA_OWNERSHIP_BORROWED,
       control, manager, mock_cmq, host_mem, hmc, binding, pd, mr,
@@ -4667,6 +5192,122 @@ class rdma_control_plane_test extends uvm_test;
       `uvm_error("MR_DEREG_COMMAND_TIMEOUT_STATE",
                  "MR_DEREGISTER timeout did not retain UNKNOWN ERROR")
 
+    injected_status = rdma_status::make(
+      RDMA_SC_UNKNOWN_HW_ERROR, "late MR_DEREGISTER terminal failure"
+    );
+    if (recovery != null && recovery.ambiguous_ticket != null)
+      mock_cmq.push_late_completion(recovery.ambiguous_ticket,
+                                    injected_status);
+    control.recover_resource(binding, mr.handle, recovery_result);
+    expect_restored_recovery("MR_DEREG_COMMAND_LATE_FAILURE",
+                             recovery_result, RDMA_SC_TIMEOUT);
+    status = manager.lookup(mr.handle, resource);
+    expect_status("MR_DEREG_COMMAND_LATE_FAILURE_LOOKUP", status,
+                  RDMA_SC_OK);
+    live_mr = null;
+    void'($cast(live_mr, resource));
+    status = manager.lookup_recovery(mr.handle, recovery);
+    expect_status("MR_DEREG_COMMAND_LATE_FAILURE_CLEARED", status,
+                  RDMA_SC_INVALID_STATE);
+    expected_opcodes.delete();
+    expected_opcodes.push_back(XTR_V1_OP_MR_DEREGISTER);
+    expect_cmq_opcodes("MR_DEREG_COMMAND_LATE_FAILURE_ORDER", mock_cmq,
+                       expected_opcodes);
+    if (live_mr == null || live_mr.state != RDMA_RESOURCE_ACTIVE ||
+        recovery_result.rollback_statuses.size() != 1 ||
+        recovery_result.rollback_statuses[0] == null ||
+        recovery_result.rollback_statuses[0].code !=
+          RDMA_SC_UNKNOWN_HW_ERROR ||
+        manager.restore_active_calls != 1 ||
+        manager.mark_error_calls != 2 ||
+        manager.finalize_release_calls != 0 ||
+        host_mem.live_allocations() != baseline_allocations + 1 ||
+        host_mem.calls.size() != 1)
+      `uvm_error("MR_DEREG_COMMAND_LATE_FAILURE_STATE",
+                 "late MR_DEREGISTER failure did not restore ACTIVE")
+    control.recover_resource(binding, mr.handle, second_recovery_result);
+    expect_result("MR_DEREG_COMMAND_LATE_FAILURE_SECOND",
+                  second_recovery_result, RDMA_SC_INVALID_STATE);
+    if (mock_cmq.calls.size() != 1 || manager.restore_active_calls != 1 ||
+        manager.mark_error_calls != 2 || host_mem.calls.size() != 1)
+      `uvm_error("MR_DEREG_COMMAND_LATE_FAILURE_IDEMPOTENT",
+                 "restored MR_DEREGISTER recovery repeated a side effect")
+    status = host_mem.\release (mapping);
+    expect_status("MR_DEREG_COMMAND_LATE_FAILURE_MAP_RELEASE", status,
+                  RDMA_SC_OK);
+
+    setup_deregister_mr_case(
+      "dereg_late_restore_retry", RDMA_MR_PBL0,
+      RDMA_OWNERSHIP_BORROWED, control, manager, mock_cmq, host_mem, hmc,
+      binding, pd, mr, mapping, hmc_address, baseline_allocations
+    );
+    mock_cmq.timeout_opcode(XTR_V1_OP_MR_DEREGISTER);
+    control.deregister_mr(binding, mr.handle, result);
+    expect_recovery_result("MR_DEREG_LATE_RESTORE_RETRY_TIMEOUT", result,
+                           RDMA_SC_TIMEOUT);
+    status = manager.lookup_recovery(mr.handle, recovery);
+    expect_status("MR_DEREG_LATE_RESTORE_RETRY_RECOVERY", status,
+                  RDMA_SC_OK);
+    injected_status = rdma_status::make(
+      RDMA_SC_UNKNOWN_HW_ERROR,
+      "late MR_DEREGISTER failure before restore retry"
+    );
+    if (recovery != null && recovery.ambiguous_ticket != null)
+      mock_cmq.push_late_completion(recovery.ambiguous_ticket,
+                                    injected_status);
+    injected_status = rdma_status::make(
+      RDMA_SC_RESOURCE_BUSY, "injected late ACTIVE restore failure"
+    );
+    manager.fail_next_restore_active(injected_status);
+    control.recover_resource(binding, mr.handle, recovery_result);
+    expect_recovery_result("MR_DEREG_LATE_RESTORE_RETRY_FIRST",
+                           recovery_result, RDMA_SC_TIMEOUT);
+    status = manager.lookup_recovery(mr.handle, recovery);
+    expect_status("MR_DEREG_LATE_RESTORE_RETRY_FIRST_RECOVERY", status,
+                  RDMA_SC_OK);
+    expected_opcodes.delete();
+    expected_opcodes.push_back(XTR_V1_OP_MR_DEREGISTER);
+    expect_cmq_opcodes("MR_DEREG_LATE_RESTORE_RETRY_FIRST_ORDER", mock_cmq,
+                       expected_opcodes);
+    if (recovery == null ||
+        recovery.hardware_presence != RDMA_HW_PRESENCE_PRESENT ||
+        recovery.ambiguous_ticket != null ||
+        recovery.pending_steps.size() != 0 ||
+        recovery.completed_steps.size() != 0 ||
+        recovery.rollback_statuses.size() != 2 ||
+        recovery.rollback_statuses[0] == null ||
+        recovery.rollback_statuses[0].code != RDMA_SC_UNKNOWN_HW_ERROR ||
+        recovery.rollback_statuses[1] == null ||
+        recovery.rollback_statuses[1].code != RDMA_SC_RESOURCE_BUSY ||
+        manager.restore_active_calls != 1 ||
+        manager.mark_error_calls != 3 ||
+        manager.finalize_release_calls != 0 || mock_cmq.calls.size() != 1 ||
+        host_mem.calls.size() != 1)
+      `uvm_error("MR_DEREG_LATE_RESTORE_RETRY_FIRST_STATE",
+                 "failed late restore did not retain a retry-ready record")
+    control.recover_resource(binding, mr.handle, second_recovery_result);
+    expect_restored_recovery("MR_DEREG_LATE_RESTORE_RETRY_SECOND",
+                             second_recovery_result, RDMA_SC_TIMEOUT);
+    status = manager.lookup(mr.handle, resource);
+    expect_status("MR_DEREG_LATE_RESTORE_RETRY_SECOND_LOOKUP", status,
+                  RDMA_SC_OK);
+    live_mr = null;
+    void'($cast(live_mr, resource));
+    status = manager.lookup_recovery(mr.handle, recovery);
+    expect_status("MR_DEREG_LATE_RESTORE_RETRY_SECOND_CLEARED", status,
+                  RDMA_SC_INVALID_STATE);
+    if (live_mr == null || live_mr.state != RDMA_RESOURCE_ACTIVE ||
+        second_recovery_result.rollback_statuses.size() != 2 ||
+        manager.restore_active_calls != 2 ||
+        manager.mark_error_calls != 3 ||
+        manager.finalize_release_calls != 0 || mock_cmq.calls.size() != 1 ||
+        host_mem.calls.size() != 1)
+      `uvm_error("MR_DEREG_LATE_RESTORE_RETRY_SECOND_STATE",
+                 "retry-ready recovery replayed work or did not restore")
+    status = host_mem.\release (mapping);
+    expect_status("MR_DEREG_LATE_RESTORE_RETRY_MAP_RELEASE", status,
+                  RDMA_SC_OK);
+
     setup_deregister_mr_case(
       "dereg_drain_failure", RDMA_MR_PBL0, RDMA_OWNERSHIP_BORROWED,
       control, manager, mock_cmq, host_mem, hmc, binding, pd, mr,
@@ -4778,37 +5419,34 @@ class rdma_control_plane_test extends uvm_test;
     expect_cmq_opcodes("MR_DEREG_OWNED_RECOVERY_BOUNDARY_ORDER", mock_cmq,
                        expected_opcodes);
     control.recover_resource(binding, mr.handle, recovery_result);
-    expect_result("MR_DEREG_OWNED_RECOVERY_BOUNDARY", recovery_result,
-                  RDMA_SC_UNSUPPORTED_OPCODE);
+    expect_completed_recovery("MR_DEREG_OWNED_RECOVERY", recovery_result,
+                              RDMA_SC_INVALID_STATE);
     status = manager.lookup(mr.handle, resource);
-    expect_status("MR_DEREG_OWNED_RECOVERY_BOUNDARY_LOOKUP", status,
-                  RDMA_SC_OK);
-    live_mr = null;
-    void'($cast(live_mr, resource));
+    expect_status("MR_DEREG_OWNED_RECOVERY_RELEASED", status,
+                  RDMA_SC_INVALID_STATE);
     status = manager.lookup_recovery(mr.handle, recovery);
-    expect_status("MR_DEREG_OWNED_RECOVERY_BOUNDARY_RECORD", status,
-                  RDMA_SC_OK);
-    if (live_mr == null || live_mr.state != RDMA_RESOURCE_ERROR ||
-        recovery == null ||
-        recovery.hardware_presence != RDMA_HW_PRESENCE_ABSENT ||
-        recovery.completed_steps.size() != 2 ||
-        recovery.completed_steps[0] !=
-          RDMA_CTRL_STEP_HW_MR_DEREGISTERED ||
-        recovery.completed_steps[1] != RDMA_CTRL_STEP_HW_DRAINED ||
-        recovery.pending_steps.size() != 1 ||
-        recovery.pending_steps[0] != RDMA_CTRL_STEP_BACKING_RELEASED ||
-        recovery.backing_refs.size() != 1 ||
-        recovery.backing_refs[0] == null ||
-        recovery.backing_refs[0].release_complete ||
-        host_mem.live_allocations() != baseline_allocations + 1 ||
-        host_mem.calls.size() != 2 ||
-        host_mem.calls[0].method_name != "allocate" ||
-        host_mem.calls[1].method_name != "release" ||
-        mock_cmq.calls.size() != 2 ||
+    expect_status("MR_DEREG_OWNED_RECOVERY_CLEARED", status,
+                  RDMA_SC_INVALID_STATE);
+    if (host_mem.live_allocations() != baseline_allocations ||
+        host_mem.calls.size() != 3 || mock_cmq.calls.size() != 2 ||
         manager.restore_active_calls != 0 ||
-        manager.finalize_release_calls != 0)
-      `uvm_error("MR_DEREG_OWNED_RECOVERY_BOUNDARY_STATE",
-                 "Task 8 recovery consumed an active-origin MR record")
+        manager.mark_error_calls != 4 ||
+        manager.finalize_release_calls != 1)
+      `uvm_error("MR_DEREG_OWNED_RECOVERY_STATE",
+                 "recovery repeated deregister or skipped local release")
+    else if (host_mem.calls[0].method_name != "allocate" ||
+             host_mem.calls[1].method_name != "release" ||
+             host_mem.calls[2].method_name != "release")
+      `uvm_error("MR_DEREG_OWNED_RECOVERY_CALLS",
+                 "recovery issued the wrong host-memory operations")
+    control.recover_resource(binding, mr.handle, second_recovery_result);
+    expect_result("MR_DEREG_OWNED_RECOVERY_SECOND", second_recovery_result,
+                  RDMA_SC_INVALID_STATE);
+    if (host_mem.calls.size() != 3 || mock_cmq.calls.size() != 2 ||
+        manager.mark_error_calls != 4 ||
+        manager.finalize_release_calls != 1)
+      `uvm_error("MR_DEREG_OWNED_RECOVERY_IDEMPOTENT",
+                 "second recovery repeated a release side effect")
 
     setup_deregister_mr_case(
       "dereg_owned_hmc_release_failure", RDMA_MR_PBL2,
@@ -5009,6 +5647,7 @@ class rdma_control_plane_test extends uvm_test;
     run_owned_mr_failure("deregister_timeout");
     check_owned_mr_prestage_release_failure();
     check_owned_mr_prestage_double_cleanup_failure();
+    check_owned_recovery_status_accumulation();
     check_owned_mr_timeout_freeze_failure_no_mapping();
     check_owned_mr_released_mapping_not_returned();
     check_owned_mr_unattached_release_failure();
@@ -5017,6 +5656,7 @@ class rdma_control_plane_test extends uvm_test;
     check_borrowed_pbl0_registration();
     check_key_alloc_explicit_failure();
     check_key_alloc_timeout_recovery();
+    check_key_alloc_late_failure_recovery();
     check_register_mr_caller_snapshot();
     check_register_mr_post_cmq_fence();
     check_register_mr_recovery_freeze_failures();
