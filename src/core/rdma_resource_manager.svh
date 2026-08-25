@@ -397,6 +397,60 @@ class rdma_resource_manager extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // Recovery may carry a detached copy of an owned mapping, but matching
+  // public fields are not proof that it controls the same allocation.  Use an
+  // opaque authority snapshot from the authoritative mapping and require the
+  // recovery mapping to accept it, while retaining the same type, value, and
+  // alias guards used by the owned clone boundary.
+  protected function bit same_owned_mapping_authority(
+    rdma_dma_mapping authoritative,
+    rdma_dma_mapping recovery
+  );
+    rdma_dma_mapping saved_value;
+    rdma_dma_mapping authority_snapshot;
+    rdma_dma_mapping saved_authority;
+    rdma_status status;
+    uvm_object_wrapper mapping_type;
+    uvm_object_wrapper authority_type;
+
+    if (authoritative == null || recovery == null)
+      return 1'b0;
+    mapping_type = authoritative.get_object_type();
+    status = project_mapping_value(
+      authoritative, "owned authority correspondence value", saved_value
+    );
+    if (status == null || !status.ok() || mapping_type == null)
+      return 1'b0;
+    status = authoritative.snapshot_release_authority(authority_snapshot);
+    if (status == null || !status.ok() || authority_snapshot == null)
+      return 1'b0;
+    authority_type = authority_snapshot.get_object_type();
+    status = project_mapping_value(
+      authority_snapshot, "owned authority correspondence snapshot",
+      saved_authority
+    );
+    if (status == null || !status.ok() || authority_type == null ||
+        authority_type != mapping_type ||
+        !owned_mapping_hook_graph_intact(
+          authoritative, recovery, saved_value, mapping_type,
+          authority_snapshot, saved_authority, authority_type
+        ))
+      return 1'b0;
+    status = authoritative.release_authority_status(authority_snapshot);
+    if (status == null || !status.ok() ||
+        !owned_mapping_hook_graph_intact(
+          authoritative, recovery, saved_value, mapping_type,
+          authority_snapshot, saved_authority, authority_type
+        ))
+      return 1'b0;
+    status = recovery.release_authority_status(authority_snapshot);
+    return status != null && status.ok() &&
+           owned_mapping_hook_graph_intact(
+             authoritative, recovery, saved_value, mapping_type,
+             authority_snapshot, saved_authority, authority_type
+           );
+  endfunction
+
   // Completion is an adapter-defined opaque fact.  Invoke its virtual query
   // only on an authority-preserving clone, and reject any public value, type,
   // or handle-alias mutation at the hook boundary.
@@ -2683,6 +2737,8 @@ class rdma_resource_manager extends uvm_object;
     rdma_resource replacement;
     rdma_recovery_record recovery;
     rdma_status status;
+    bit authoritative_release_complete;
+    bit recovery_release_complete;
     string key;
 
     status = lookup(handle, authoritative);
@@ -2712,41 +2768,83 @@ class rdma_resource_manager extends uvm_object;
           RDMA_SC_INVALID_STATE,
           "ERROR MR recovery is not safe to restore ACTIVE"
         );
-      foreach (recovery.backing_refs[i]) begin
-        if (recovery.backing_refs[i] == null ||
-            recovery.backing_refs[i].mapping == null ||
-            recovery.backing_refs[i].release_complete ||
-            recovery.backing_refs[i].mapping.state != RDMA_MAPPING_ACTIVE)
-          return rdma_status::make(
-            RDMA_SC_INVALID_STATE,
-            "ERROR MR recovery backing was released"
-          );
-      end
-      foreach (recovery.hmc_refs[i]) begin
-        if (recovery.hmc_refs[i] == null ||
-            recovery.hmc_refs[i].release_complete)
-          return rdma_status::make(
-            RDMA_SC_INVALID_STATE,
-            "ERROR MR recovery HMC reference was released"
-          );
-      end
+      if (registry[key].backing_refs.size() !=
+            recovery.backing_refs.size() ||
+          registry[key].hmc_refs.size() != recovery.hmc_refs.size())
+        return rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "ERROR MR recovery reference cardinality changed"
+        );
       foreach (registry[key].backing_refs[i]) begin
         if (registry[key].backing_refs[i] == null ||
+            recovery.backing_refs[i] == null ||
             registry[key].backing_refs[i].mapping == null ||
+            recovery.backing_refs[i].mapping == null ||
+            registry[key].backing_refs[i].ownership !=
+              recovery.backing_refs[i].ownership ||
             registry[key].backing_refs[i].release_complete ||
+            recovery.backing_refs[i].release_complete ||
+            !same_mapping_value(
+              registry[key].backing_refs[i].mapping,
+              recovery.backing_refs[i].mapping
+            ) ||
             registry[key].backing_refs[i].mapping.state !=
               RDMA_MAPPING_ACTIVE)
           return rdma_status::make(
             RDMA_SC_INVALID_STATE,
-            "ERROR MR authoritative backing was released"
+            "ERROR MR recovery backing authority changed"
           );
+        if (registry[key].backing_refs[i].ownership ==
+              RDMA_OWNERSHIP_CONTROL_PLANE) begin
+          if (!same_owned_mapping_authority(
+                registry[key].backing_refs[i].mapping,
+                recovery.backing_refs[i].mapping
+              ))
+            return rdma_status::make(
+              RDMA_SC_INVALID_STATE,
+              "ERROR MR owned backing release authority changed"
+            );
+          status = query_owned_release_completion(
+            registry[key].backing_refs[i].mapping,
+            authoritative_release_complete
+          );
+          if (status == null || !status.ok() ||
+              authoritative_release_complete)
+            return rdma_status::make(
+              RDMA_SC_INVALID_STATE,
+              "ERROR MR authoritative owned backing was released"
+            );
+          status = query_owned_release_completion(
+            recovery.backing_refs[i].mapping, recovery_release_complete
+          );
+          if (status == null || !status.ok() || recovery_release_complete)
+            return rdma_status::make(
+              RDMA_SC_INVALID_STATE,
+              "ERROR MR recovery owned backing was released"
+            );
+        end
       end
       foreach (registry[key].hmc_refs[i]) begin
         if (registry[key].hmc_refs[i] == null ||
-            registry[key].hmc_refs[i].release_complete)
+            recovery.hmc_refs[i] == null ||
+            !same_mapping_handle_value(
+              registry[key].hmc_refs[i].owner,
+              recovery.hmc_refs[i].owner
+            ) ||
+            registry[key].hmc_refs[i].object_kind !=
+              recovery.hmc_refs[i].object_kind ||
+            registry[key].hmc_refs[i].address !=
+              recovery.hmc_refs[i].address ||
+            registry[key].hmc_refs[i].size != recovery.hmc_refs[i].size ||
+            registry[key].hmc_refs[i].first_pbl_index !=
+              recovery.hmc_refs[i].first_pbl_index ||
+            registry[key].hmc_refs[i].ownership !=
+              recovery.hmc_refs[i].ownership ||
+            registry[key].hmc_refs[i].release_complete ||
+            recovery.hmc_refs[i].release_complete)
           return rdma_status::make(
             RDMA_SC_INVALID_STATE,
-            "ERROR MR authoritative HMC reference was released"
+            "ERROR MR recovery HMC authority changed"
           );
       end
     end

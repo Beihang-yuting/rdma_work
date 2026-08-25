@@ -760,7 +760,10 @@ class rdma_control_plane extends uvm_object;
   );
     transaction_id = 0;
     status = invalid_state("transaction ID allocation did not complete");
-    lock_table_guard.get(1);
+    // Keep the uncontended guard off the blocking scheduler; a failed fast
+    // path still uses get() and preserves real contention semantics.
+    if (!lock_table_guard.try_get(1))
+      lock_table_guard.get(1);
     if (transaction_ids_exhausted) begin
       status = rdma_status::make(
         RDMA_SC_RESOURCE_EXHAUSTED,
@@ -786,7 +789,10 @@ class rdma_control_plane extends uvm_object;
 
     function_lock = null;
     key = function_key(owner);
-    lock_table_guard.get(1);
+    // Keep the uncontended guard off the blocking scheduler; a failed fast
+    // path still uses get() and preserves real contention semantics.
+    if (!lock_table_guard.try_get(1))
+      lock_table_guard.get(1);
     if (!function_locks.exists(key))
       function_locks[key] = new(1);
     function_lock = function_locks[key];
@@ -2677,6 +2683,7 @@ class rdma_control_plane extends uvm_object;
     bit has_hardware_pending;
     bit reserved_only;
     bit result_finalized;
+    bit defer_terminal_retry;
 
     result = make_result();
     function_lock = null;
@@ -2838,6 +2845,7 @@ class rdma_control_plane extends uvm_object;
           result_finalized = 1'b1;
           break;
         end
+        defer_terminal_retry = 1'b0;
         case (ticket.opcode_key.opcode)
           XTR_V1_OP_KEY_ALLOC: begin
             if (!recovery_step_pending(
@@ -2916,6 +2924,8 @@ class rdma_control_plane extends uvm_object;
                 remove_recovery_pending_step(
                   recovery, RDMA_CTRL_STEP_HW_MR_DEREGISTERED
                 );
+              else
+                defer_terminal_retry = 1'b1;
               recovery.rollback_statuses.push_back(
                 rdma_cmq_clone_status_value(completion_status)
               );
@@ -2936,6 +2946,7 @@ class rdma_control_plane extends uvm_object;
               recovery.rollback_statuses.push_back(
                 rdma_cmq_clone_status_value(completion_status)
               );
+              defer_terminal_retry = 1'b1;
             end
           end
           default: begin
@@ -2956,6 +2967,14 @@ class rdma_control_plane extends uvm_object;
           publish_recovery_required(
             recovery, result,
             "reconciled CMQ progress could not be persisted"
+          );
+          result_finalized = 1'b1;
+          break;
+        end
+        if (defer_terminal_retry) begin
+          publish_recovery_required(
+            recovery, result,
+            "terminal hardware failure was retained for a later retry"
           );
           result_finalized = 1'b1;
           break;

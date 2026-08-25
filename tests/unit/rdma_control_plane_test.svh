@@ -25,6 +25,16 @@ class rdma_control_plane_probe extends rdma_control_plane;
       function_lock.put(1);
   endtask
 
+  task acquire_test_lock_table_guard(output semaphore guard);
+    guard = lock_table_guard;
+    guard.get(1);
+  endtask
+
+  task release_test_lock_table_guard(semaphore guard);
+    if (guard != null)
+      guard.put(1);
+  endtask
+
   task register_mr_with_test_lock(
     rdma_function_binding binding,
     rdma_register_mr_req request,
@@ -1519,6 +1529,143 @@ class rdma_control_plane_test extends uvm_test;
         `uvm_error({"OWNED_", failure_kind, "_DEREG_BODY"},
                    "rollback MR_DEREGISTER command is malformed")
     end
+  endtask
+
+  task automatic check_creation_deregister_late_failure_deferred_retry();
+    rdma_control_plane control;
+    rdma_fault_inject_resource_manager manager;
+    rdma_mock_cmq_port mock_cmq;
+    rdma_mock_stag_key_policy key_policy;
+    rdma_mock_host_mem host_mem;
+    rdma_function_binding binding;
+    rdma_register_mr_req request;
+    rdma_dma_request_context dma_context;
+    rdma_pd pd;
+    rdma_dma_mapping mapping;
+    rdma_mr mr;
+    rdma_mr live_mr;
+    rdma_resource resource;
+    rdma_control_result result;
+    rdma_control_result recovery_result;
+    rdma_control_result second_recovery_result;
+    rdma_control_result third_recovery_result;
+    rdma_recovery_record recovery;
+    rdma_status injected_status;
+    rdma_status status;
+    int unsigned baseline_allocations;
+    int unsigned baseline_leaks;
+    int unsigned final_leaks;
+    bit [7:0] expected_opcodes[$];
+
+    setup_owned_mr_case(
+      "creation_dereg_late_failure", 1'b1, control, manager, mock_cmq,
+      key_policy, host_mem, binding, request, dma_context, pd,
+      baseline_allocations, baseline_leaks
+    );
+    if (pd == null)
+      return;
+    injected_status = rdma_status::make(
+      RDMA_SC_INVALID_STATE,
+      "injected creation commit before deregister timeout"
+    );
+    status = manager.fail_next_transition(
+      "commit_programmed", injected_status
+    );
+    expect_status("CREATION_DEREG_LATE_COMMIT_INJECT", status,
+                  RDMA_SC_OK);
+    mock_cmq.timeout_opcode(XTR_V1_OP_MR_DEREGISTER);
+    control.alloc_and_register_mr(binding, request, dma_context, 4096,
+                                  mapping, mr, result);
+    expect_recovery_result("CREATION_DEREG_LATE_TIMEOUT", result,
+                           RDMA_SC_INVALID_STATE);
+    if (result == null || result.resource_h == null)
+      return;
+    status = manager.lookup_recovery(result.resource_h, recovery);
+    expect_status("CREATION_DEREG_LATE_TIMEOUT_RECOVERY", status,
+                  RDMA_SC_OK);
+    expected_opcodes.push_back(XTR_V1_OP_KEY_ALLOC);
+    expected_opcodes.push_back(XTR_V1_OP_MR_DEREGISTER);
+    expect_cmq_opcodes("CREATION_DEREG_LATE_TIMEOUT_ORDER", mock_cmq,
+                       expected_opcodes);
+    if (recovery == null || recovery.ambiguous_ticket == null ||
+        recovery.hardware_presence != RDMA_HW_PRESENCE_UNKNOWN ||
+        recovery.pending_steps.size() != 1 ||
+        recovery.pending_steps[0] !=
+          RDMA_CTRL_STEP_HW_MR_DEREGISTERED ||
+        recovery.primary_status == null ||
+        recovery.primary_status.code != RDMA_SC_INVALID_STATE ||
+        host_mem.calls.size() != 1 ||
+        host_mem.calls[0].method_name != "allocate")
+      `uvm_error("CREATION_DEREG_LATE_TIMEOUT_STATE",
+                 "creation timeout did not retain its owned ERROR MR")
+    if (recovery == null || recovery.ambiguous_ticket == null)
+      return;
+
+    injected_status = rdma_status::make(
+      RDMA_SC_UNKNOWN_HW_ERROR,
+      "late creation MR_DEREGISTER terminal failure"
+    );
+    mock_cmq.push_late_completion(recovery.ambiguous_ticket,
+                                  injected_status);
+    control.recover_resource(binding, result.resource_h, recovery_result);
+    expect_recovery_result("CREATION_DEREG_LATE_FIRST", recovery_result,
+                           RDMA_SC_INVALID_STATE);
+    status = manager.lookup(result.resource_h, resource);
+    expect_status("CREATION_DEREG_LATE_FIRST_LOOKUP", status, RDMA_SC_OK);
+    live_mr = null;
+    void'($cast(live_mr, resource));
+    status = manager.lookup_recovery(result.resource_h, recovery);
+    expect_status("CREATION_DEREG_LATE_FIRST_RECOVERY", status,
+                  RDMA_SC_OK);
+    if (live_mr == null || live_mr.state != RDMA_RESOURCE_ERROR ||
+        recovery == null ||
+        recovery.hardware_presence != RDMA_HW_PRESENCE_PRESENT ||
+        recovery.ambiguous_ticket != null ||
+        recovery.pending_steps.size() != 1 ||
+        recovery.pending_steps[0] !=
+          RDMA_CTRL_STEP_HW_MR_DEREGISTERED ||
+        recovery.primary_status == null ||
+        recovery.primary_status.code != RDMA_SC_INVALID_STATE ||
+        recovery.rollback_statuses.size() != 2 ||
+        recovery.rollback_statuses[0] == null ||
+        recovery.rollback_statuses[0].code != RDMA_SC_TIMEOUT ||
+        recovery.rollback_statuses[1] == null ||
+        recovery.rollback_statuses[1].code !=
+          RDMA_SC_UNKNOWN_HW_ERROR ||
+        mock_cmq.calls.size() != 2 || host_mem.calls.size() != 1 ||
+        host_mem.live_allocations() != baseline_allocations + 1)
+      `uvm_error("CREATION_DEREG_LATE_FIRST_STATE",
+                 "late failure replayed deregister in the same call")
+    if (live_mr == null || recovery == null)
+      return;
+
+    control.recover_resource(binding, result.resource_h,
+                             second_recovery_result);
+    expect_completed_recovery("CREATION_DEREG_LATE_SECOND",
+                              second_recovery_result,
+                              RDMA_SC_INVALID_STATE);
+    expected_opcodes.push_back(XTR_V1_OP_MR_DEREGISTER);
+    expect_cmq_opcodes("CREATION_DEREG_LATE_SECOND_ORDER", mock_cmq,
+                       expected_opcodes);
+    status = manager.lookup(result.resource_h, resource);
+    expect_status("CREATION_DEREG_LATE_SECOND_RELEASED", status,
+                  RDMA_SC_INVALID_STATE);
+    void'(manager.check_leaks(final_leaks, binding.make_handle()));
+    if (host_mem.calls.size() != 2 ||
+        host_mem.calls[1].method_name != "release" ||
+        host_mem.live_allocations() != baseline_allocations ||
+        final_leaks != baseline_leaks)
+      `uvm_error("CREATION_DEREG_LATE_SECOND_STATE",
+                 "deferred retry did not release owned state once")
+
+    control.recover_resource(binding, result.resource_h,
+                             third_recovery_result);
+    expect_result("CREATION_DEREG_LATE_THIRD", third_recovery_result,
+                  RDMA_SC_INVALID_STATE);
+    if (mock_cmq.calls.size() != 3 || host_mem.calls.size() != 2 ||
+        host_mem.live_allocations() != baseline_allocations)
+      `uvm_error("CREATION_DEREG_LATE_THIRD_STATE",
+                 "completed creation recovery repeated a side effect")
   endtask
 
   task automatic check_owned_mr_unattached_release_failure();
@@ -4903,6 +5050,7 @@ class rdma_control_plane_test extends uvm_test;
     rdma_control_result result;
     rdma_control_result recovery_result;
     rdma_control_result second_recovery_result;
+    rdma_control_result third_recovery_result;
     rdma_recovery_record recovery;
     rdma_status injected_status;
     rdma_status status;
@@ -5342,6 +5490,68 @@ class rdma_control_plane_test extends uvm_test;
       `uvm_error("MR_DEREG_DRAIN_FAILURE_STATE",
                  "post-deregister drain failure recovery is wrong")
 
+    injected_status = rdma_status::make(
+      RDMA_SC_RESOURCE_BUSY,
+      "injected persistence failure after recovered TQ flush"
+    );
+    manager.fail_next_mark_error(injected_status);
+    control.recover_resource(binding, mr.handle, recovery_result);
+    expect_recovery_result("MR_DEREG_DRAIN_PERSIST_FIRST",
+                           recovery_result,
+                           RDMA_SC_UNKNOWN_HW_ERROR);
+    status = manager.lookup_recovery(mr.handle, recovery);
+    expect_status("MR_DEREG_DRAIN_PERSIST_FIRST_RECOVERY", status,
+                  RDMA_SC_OK);
+    expected_opcodes.push_back(XTR_V1_OP_TQ_FLUSH);
+    expect_cmq_opcodes("MR_DEREG_DRAIN_PERSIST_FIRST_ORDER", mock_cmq,
+                       expected_opcodes);
+    if (recovery == null ||
+        recovery.hardware_presence != RDMA_HW_PRESENCE_ABSENT ||
+        recovery.completed_steps.size() != 2 ||
+        recovery.completed_steps[0] !=
+          RDMA_CTRL_STEP_HW_MR_DEREGISTERED ||
+        recovery.completed_steps[1] != RDMA_CTRL_STEP_HW_DRAINED ||
+        recovery.pending_steps.size() != 1 ||
+        recovery.pending_steps[0] != RDMA_CTRL_STEP_BACKING_RELEASED ||
+        recovery.primary_status == null ||
+        recovery.primary_status.code != RDMA_SC_UNKNOWN_HW_ERROR ||
+        recovery.rollback_statuses.size() != 1 ||
+        recovery.rollback_statuses[0] == null ||
+        recovery.rollback_statuses[0].code != RDMA_SC_RESOURCE_BUSY ||
+        recovery_result.rollback_statuses.size() != 1 ||
+        recovery_result.rollback_statuses[0] == null ||
+        recovery_result.rollback_statuses[0].code !=
+          RDMA_SC_RESOURCE_BUSY ||
+        mock_cmq.calls.size() != 3 || host_mem.calls.size() != 1 ||
+        manager.mark_error_calls != 3 ||
+        manager.finalize_release_calls != 0)
+      `uvm_error("MR_DEREG_DRAIN_PERSIST_FIRST_STATE",
+                 "failed hardware progress persistence crossed a boundary")
+
+    control.recover_resource(binding, mr.handle, second_recovery_result);
+    expect_completed_recovery("MR_DEREG_DRAIN_PERSIST_SECOND",
+                              second_recovery_result,
+                              RDMA_SC_UNKNOWN_HW_ERROR);
+    status = manager.lookup(mr.handle, resource);
+    expect_status("MR_DEREG_DRAIN_PERSIST_SECOND_RELEASED", status,
+                  RDMA_SC_INVALID_STATE);
+    if (mock_cmq.calls.size() != 3 || host_mem.calls.size() != 1 ||
+        manager.mark_error_calls != 5 ||
+        manager.finalize_release_calls != 1)
+      `uvm_error("MR_DEREG_DRAIN_PERSIST_SECOND_STATE",
+                 "durable hardware progress was replayed on retry")
+    control.recover_resource(binding, mr.handle, third_recovery_result);
+    expect_result("MR_DEREG_DRAIN_PERSIST_THIRD", third_recovery_result,
+                  RDMA_SC_INVALID_STATE);
+    if (mock_cmq.calls.size() != 3 || host_mem.calls.size() != 1 ||
+        manager.mark_error_calls != 5 ||
+        manager.finalize_release_calls != 1)
+      `uvm_error("MR_DEREG_DRAIN_PERSIST_THIRD_STATE",
+                 "completed hardware-boundary recovery repeated work")
+    status = host_mem.\release (mapping);
+    expect_status("MR_DEREG_DRAIN_PERSIST_MAP_RELEASE", status,
+                  RDMA_SC_OK);
+
     setup_deregister_mr_case(
       "dereg_drain_timeout", RDMA_MR_PBL0, RDMA_OWNERSHIP_BORROWED,
       control, manager, mock_cmq, host_mem, hmc, binding, pd, mr,
@@ -5383,6 +5593,71 @@ class rdma_control_plane_test extends uvm_test;
       `uvm_error("MR_DEREG_DRAIN_TIMEOUT_STATE",
                  "TQ timeout did not retain detached ABSENT recovery")
 
+    injected_status = rdma_status::make(
+      RDMA_SC_UNKNOWN_HW_ERROR, "late TQ_FLUSH terminal failure"
+    );
+    if (recovery != null && recovery.ambiguous_ticket != null)
+      mock_cmq.push_late_completion(recovery.ambiguous_ticket,
+                                    injected_status);
+    control.recover_resource(binding, mr.handle, recovery_result);
+    expect_recovery_result("MR_DEREG_DRAIN_LATE_FAILURE_FIRST",
+                           recovery_result, RDMA_SC_TIMEOUT);
+    status = manager.lookup(mr.handle, resource);
+    expect_status("MR_DEREG_DRAIN_LATE_FAILURE_FIRST_LOOKUP", status,
+                  RDMA_SC_OK);
+    live_mr = null;
+    void'($cast(live_mr, resource));
+    status = manager.lookup_recovery(mr.handle, recovery);
+    expect_status("MR_DEREG_DRAIN_LATE_FAILURE_FIRST_RECOVERY", status,
+                  RDMA_SC_OK);
+    if (live_mr == null || live_mr.state != RDMA_RESOURCE_ERROR ||
+        recovery == null ||
+        recovery.hardware_presence != RDMA_HW_PRESENCE_ABSENT ||
+        recovery.ambiguous_ticket != null ||
+        recovery.completed_steps.size() != 1 ||
+        recovery.completed_steps[0] !=
+          RDMA_CTRL_STEP_HW_MR_DEREGISTERED ||
+        recovery.pending_steps.size() != 1 ||
+        recovery.pending_steps[0] != RDMA_CTRL_STEP_HW_DRAINED ||
+        recovery.primary_status == null ||
+        recovery.primary_status.code != RDMA_SC_TIMEOUT ||
+        recovery.rollback_statuses.size() != 1 ||
+        recovery.rollback_statuses[0] == null ||
+        recovery.rollback_statuses[0].code !=
+          RDMA_SC_UNKNOWN_HW_ERROR ||
+        mock_cmq.calls.size() != 2 || host_mem.calls.size() != 1 ||
+        manager.finalize_release_calls != 0)
+      `uvm_error("MR_DEREG_DRAIN_LATE_FAILURE_FIRST_STATE",
+                 "late TQ failure replayed the drain in the same call")
+    if (live_mr == null || recovery == null)
+      return;
+
+    control.recover_resource(binding, mr.handle, second_recovery_result);
+    expect_completed_recovery("MR_DEREG_DRAIN_LATE_FAILURE_SECOND",
+                              second_recovery_result, RDMA_SC_TIMEOUT);
+    expected_opcodes.push_back(XTR_V1_OP_TQ_FLUSH);
+    expect_cmq_opcodes("MR_DEREG_DRAIN_LATE_FAILURE_SECOND_ORDER",
+                       mock_cmq, expected_opcodes);
+    status = manager.lookup(mr.handle, resource);
+    expect_status("MR_DEREG_DRAIN_LATE_FAILURE_SECOND_RELEASED", status,
+                  RDMA_SC_INVALID_STATE);
+    if (host_mem.calls.size() != 1 ||
+        host_mem.live_allocations() != baseline_allocations + 1 ||
+        manager.finalize_release_calls != 1)
+      `uvm_error("MR_DEREG_DRAIN_LATE_FAILURE_SECOND_STATE",
+                 "deferred TQ retry did not finalize exactly once")
+
+    control.recover_resource(binding, mr.handle, third_recovery_result);
+    expect_result("MR_DEREG_DRAIN_LATE_FAILURE_THIRD",
+                  third_recovery_result, RDMA_SC_INVALID_STATE);
+    if (mock_cmq.calls.size() != 3 || host_mem.calls.size() != 1 ||
+        manager.finalize_release_calls != 1)
+      `uvm_error("MR_DEREG_DRAIN_LATE_FAILURE_THIRD_STATE",
+                 "completed drain recovery repeated a side effect")
+    status = host_mem.\release (mapping);
+    expect_status("MR_DEREG_DRAIN_LATE_FAILURE_MAP_RELEASE", status,
+                  RDMA_SC_OK);
+
     setup_deregister_mr_case(
       "dereg_owned_release_failure", RDMA_MR_PBL0,
       RDMA_OWNERSHIP_CONTROL_PLANE, control, manager, mock_cmq, host_mem,
@@ -5418,35 +5693,65 @@ class rdma_control_plane_test extends uvm_test;
     expected_opcodes.push_back(XTR_V1_OP_TQ_FLUSH);
     expect_cmq_opcodes("MR_DEREG_OWNED_RECOVERY_BOUNDARY_ORDER", mock_cmq,
                        expected_opcodes);
+    injected_status = rdma_status::make(
+      RDMA_SC_RESOURCE_BUSY,
+      "injected persistence failure after owned backing release"
+    );
+    manager.fail_next_mark_error(injected_status);
     control.recover_resource(binding, mr.handle, recovery_result);
-    expect_completed_recovery("MR_DEREG_OWNED_RECOVERY", recovery_result,
-                              RDMA_SC_INVALID_STATE);
-    status = manager.lookup(mr.handle, resource);
-    expect_status("MR_DEREG_OWNED_RECOVERY_RELEASED", status,
-                  RDMA_SC_INVALID_STATE);
+    expect_recovery_result("MR_DEREG_OWNED_RECOVERY_FIRST",
+                           recovery_result, RDMA_SC_INVALID_STATE);
     status = manager.lookup_recovery(mr.handle, recovery);
-    expect_status("MR_DEREG_OWNED_RECOVERY_CLEARED", status,
-                  RDMA_SC_INVALID_STATE);
+    expect_status("MR_DEREG_OWNED_RECOVERY_FIRST_RECORD", status,
+                  RDMA_SC_OK);
     if (host_mem.live_allocations() != baseline_allocations ||
         host_mem.calls.size() != 3 || mock_cmq.calls.size() != 2 ||
+        recovery == null ||
+        recovery.hardware_presence != RDMA_HW_PRESENCE_ABSENT ||
+        recovery.pending_steps.size() != 1 ||
+        recovery.pending_steps[0] != RDMA_CTRL_STEP_BACKING_RELEASED ||
+        recovery.backing_refs.size() != 1 ||
+        recovery.backing_refs[0] == null ||
+        !recovery.backing_refs[0].release_complete ||
+        recovery.primary_status == null ||
+        recovery.primary_status.code != RDMA_SC_INVALID_STATE ||
+        recovery.rollback_statuses.size() != 1 ||
+        recovery.rollback_statuses[0] == null ||
+        recovery.rollback_statuses[0].code != RDMA_SC_RESOURCE_BUSY ||
         manager.restore_active_calls != 0 ||
-        manager.mark_error_calls != 4 ||
-        manager.finalize_release_calls != 1)
-      `uvm_error("MR_DEREG_OWNED_RECOVERY_STATE",
-                 "recovery repeated deregister or skipped local release")
+        manager.mark_error_calls != 3 ||
+        manager.finalize_release_calls != 0)
+      `uvm_error("MR_DEREG_OWNED_RECOVERY_FIRST_STATE",
+                 "owned release persistence crossed the finalize boundary")
     else if (host_mem.calls[0].method_name != "allocate" ||
              host_mem.calls[1].method_name != "release" ||
              host_mem.calls[2].method_name != "release")
-      `uvm_error("MR_DEREG_OWNED_RECOVERY_CALLS",
+      `uvm_error("MR_DEREG_OWNED_RECOVERY_FIRST_CALLS",
                  "recovery issued the wrong host-memory operations")
+
     control.recover_resource(binding, mr.handle, second_recovery_result);
-    expect_result("MR_DEREG_OWNED_RECOVERY_SECOND", second_recovery_result,
+    expect_completed_recovery("MR_DEREG_OWNED_RECOVERY_SECOND",
+                              second_recovery_result,
+                              RDMA_SC_INVALID_STATE);
+    status = manager.lookup(mr.handle, resource);
+    expect_status("MR_DEREG_OWNED_RECOVERY_SECOND_RELEASED", status,
+                  RDMA_SC_INVALID_STATE);
+    status = manager.lookup_recovery(mr.handle, recovery);
+    expect_status("MR_DEREG_OWNED_RECOVERY_SECOND_CLEARED", status,
                   RDMA_SC_INVALID_STATE);
     if (host_mem.calls.size() != 3 || mock_cmq.calls.size() != 2 ||
-        manager.mark_error_calls != 4 ||
+        manager.mark_error_calls != 5 ||
+        manager.finalize_release_calls != 1)
+      `uvm_error("MR_DEREG_OWNED_RECOVERY_SECOND_STATE",
+                 "durable owned release was replayed on retry")
+    control.recover_resource(binding, mr.handle, third_recovery_result);
+    expect_result("MR_DEREG_OWNED_RECOVERY_THIRD", third_recovery_result,
+                  RDMA_SC_INVALID_STATE);
+    if (host_mem.calls.size() != 3 || mock_cmq.calls.size() != 2 ||
+        manager.mark_error_calls != 5 ||
         manager.finalize_release_calls != 1)
       `uvm_error("MR_DEREG_OWNED_RECOVERY_IDEMPOTENT",
-                 "second recovery repeated a release side effect")
+                 "completed owned recovery repeated a side effect")
 
     setup_deregister_mr_case(
       "dereg_owned_hmc_release_failure", RDMA_MR_PBL2,
@@ -5514,6 +5819,38 @@ class rdma_control_plane_test extends uvm_test;
       `uvm_error("MR_DEREG_OWNED_HMC_RELEASE_STATE",
                  "HMC release failure lost retryable owned authority")
 
+    control.use_hmc_allocator_for_test(hmc);
+    control.recover_resource(binding, mr.handle, recovery_result);
+    expect_completed_recovery("MR_DEREG_OWNED_HMC_RECOVERY",
+                              recovery_result,
+                              RDMA_SC_INVALID_ARGUMENT);
+    status = manager.lookup(mr.handle, resource);
+    expect_status("MR_DEREG_OWNED_HMC_RECOVERY_RELEASED", status,
+                  RDMA_SC_INVALID_STATE);
+    status = manager.lookup_recovery(mr.handle, recovery);
+    expect_status("MR_DEREG_OWNED_HMC_RECOVERY_CLEARED", status,
+                  RDMA_SC_INVALID_STATE);
+    status = hmc.lookup(binding.make_handle(), RDMA_RESOURCE_MR,
+                        hmc_address, lease_size);
+    expect_status("MR_DEREG_OWNED_HMC_RECOVERY_LEASE", status,
+                  RDMA_SC_INVALID_STATE);
+    if (mock_cmq.calls.size() != 3 ||
+        host_mem.live_allocations() != baseline_allocations ||
+        host_mem.calls.size() != 2 ||
+        host_mem.calls[1].method_name != "release" ||
+        manager.mark_error_calls != 5 ||
+        manager.finalize_release_calls != 1)
+      `uvm_error("MR_DEREG_OWNED_HMC_RECOVERY_STATE",
+                 "HMC recovery replayed hardware or skipped owned cleanup")
+    control.recover_resource(binding, mr.handle, second_recovery_result);
+    expect_result("MR_DEREG_OWNED_HMC_RECOVERY_SECOND",
+                  second_recovery_result, RDMA_SC_INVALID_STATE);
+    if (mock_cmq.calls.size() != 3 || host_mem.calls.size() != 2 ||
+        manager.mark_error_calls != 5 ||
+        manager.finalize_release_calls != 1)
+      `uvm_error("MR_DEREG_OWNED_HMC_RECOVERY_IDEMPOTENT",
+                 "completed HMC recovery repeated a side effect")
+
     setup_deregister_mr_case(
       "dereg_finalize_failure", RDMA_MR_PBL0,
       RDMA_OWNERSHIP_CONTROL_PLANE, control, manager, mock_cmq, host_mem,
@@ -5578,6 +5915,31 @@ class rdma_control_plane_test extends uvm_test;
         manager.finalize_release_calls != 1)
       `uvm_error("MR_DEREG_FINALIZE_BOUNDARY_STATE",
                  "manager completed an active-origin MR recovery record")
+
+    control.recover_resource(binding, mr.handle, recovery_result);
+    expect_completed_recovery("MR_DEREG_FINALIZE_RECOVERY_RUN",
+                              recovery_result, RDMA_SC_RESOURCE_BUSY);
+    status = manager.lookup(mr.handle, resource);
+    expect_status("MR_DEREG_FINALIZE_RECOVERY_RELEASED", status,
+                  RDMA_SC_INVALID_STATE);
+    status = manager.lookup_recovery(mr.handle, recovery);
+    expect_status("MR_DEREG_FINALIZE_RECOVERY_CLEARED", status,
+                  RDMA_SC_INVALID_STATE);
+    if (mock_cmq.calls.size() != 2 || host_mem.calls.size() != 2 ||
+        host_mem.live_allocations() != baseline_allocations ||
+        manager.mark_error_calls != 2 ||
+        manager.finalize_release_calls != 2)
+      `uvm_error("MR_DEREG_FINALIZE_RECOVERY_STATE",
+                 "finalize retry replayed hardware or backing cleanup")
+    control.recover_resource(binding, mr.handle, second_recovery_result);
+    expect_result("MR_DEREG_FINALIZE_RECOVERY_SECOND",
+                  second_recovery_result, RDMA_SC_INVALID_STATE);
+    if (mock_cmq.calls.size() != 2 || host_mem.calls.size() != 2 ||
+        manager.mark_error_calls != 2 ||
+        manager.finalize_release_calls != 2)
+      `uvm_error("MR_DEREG_FINALIZE_RECOVERY_IDEMPOTENT",
+                 "completed finalize recovery repeated a side effect")
+
   endtask
 
   task automatic check_transaction_id_exhaustion();
@@ -5634,6 +5996,69 @@ class rdma_control_plane_test extends uvm_test;
     expect_status("TXN_EXHAUSTED_CLEANUP_RELEASE", status, RDMA_SC_OK);
   endtask
 
+  task automatic check_lock_table_guard_contention();
+    rdma_control_plane_probe control;
+    rdma_resource_manager manager;
+    rdma_mock_cmq_port mock_cmq;
+    rdma_mock_stag_key_policy key_policy;
+    rdma_function_binding binding;
+    rdma_create_pd_req request;
+    rdma_pd pd;
+    rdma_control_result result;
+    rdma_status status;
+    semaphore held_guard;
+    bit request_completed;
+
+    control = rdma_control_plane_probe::type_id::create(
+      "guard_contention_control"
+    );
+    manager = rdma_resource_manager::type_id::create(
+      "guard_contention_manager"
+    );
+    mock_cmq = rdma_mock_cmq_port::type_id::create(
+      "guard_contention_cmq"
+    );
+    key_policy = rdma_mock_stag_key_policy::type_id::create(
+      "guard_contention_policy"
+    );
+    binding = make_active_binding(
+      "guard_contention_binding", 64'hfa00_0000_0000_0001,
+      32'hfa00_0101, 117
+    );
+    request = make_create_pd_request(
+      "guard_contention_request", binding
+    );
+    status = control.configure(manager, mock_cmq, key_policy);
+    expect_status("GUARD_CONTENTION_CONFIGURE", status, RDMA_SC_OK);
+
+    request_completed = 1'b0;
+    control.acquire_test_lock_table_guard(held_guard);
+    fork
+      begin
+        control.create_pd(binding, request, pd, result);
+        request_completed = 1'b1;
+      end
+      begin
+        #1ns;
+        if (request_completed)
+          `uvm_error("GUARD_CONTENTION_BLOCKED",
+                     "public API bypassed the held lock-table guard")
+        control.release_test_lock_table_guard(held_guard);
+      end
+    join
+
+    if (!request_completed)
+      `uvm_error("GUARD_CONTENTION_RELEASED",
+                 "public API did not resume after guard release")
+    expect_result("GUARD_CONTENTION_RESULT", result, RDMA_SC_OK);
+    if (pd == null || pd.handle == null)
+      return;
+    status = manager.begin_quiesce(pd.handle);
+    expect_status("GUARD_CONTENTION_CLEANUP_QUIESCE", status, RDMA_SC_OK);
+    status = manager.finalize_release(pd.handle);
+    expect_status("GUARD_CONTENTION_CLEANUP_RELEASE", status, RDMA_SC_OK);
+  endtask
+
   virtual task run_phase(uvm_phase phase);
     phase.raise_objection(this);
     check_configure_contract();
@@ -5645,6 +6070,7 @@ class rdma_control_plane_test extends uvm_test;
     run_owned_mr_failure("activate");
     run_owned_mr_failure("deregister");
     run_owned_mr_failure("deregister_timeout");
+    check_creation_deregister_late_failure_deferred_retry();
     check_owned_mr_prestage_release_failure();
     check_owned_mr_prestage_double_cleanup_failure();
     check_owned_recovery_status_accumulation();
@@ -5671,6 +6097,7 @@ class rdma_control_plane_test extends uvm_test;
     check_owned_post_lock_snapshot();
     check_transaction_id_exhaustion();
     check_owned_recovery_completion_hook_guard();
+    check_lock_table_guard_contention();
     phase.drop_objection(this);
   endtask
 endclass

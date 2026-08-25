@@ -2243,6 +2243,90 @@ class rdma_resource_manager_test extends uvm_test;
                   manager.begin_quiesce(mr.handle), RDMA_SC_OK);
   endtask
 
+  task automatic create_prepared_restore_gate_mr(
+    string check_name,
+    rdma_resource_manager manager,
+    rdma_function_binding binding,
+    rdma_pd pd,
+    longint unsigned iova_value,
+    output rdma_mr mr
+  );
+    expect_status({check_name, "_CREATE"},
+                  manager.create_mr(binding, pd.handle, mr), RDMA_SC_OK);
+    if (mr != null)
+      prepare_mr(mr, iova_value);
+  endtask
+
+  task automatic activate_restore_gate_mr(
+    string check_name,
+    rdma_resource_manager manager,
+    rdma_mr mr
+  );
+    if (mr == null)
+      return;
+    expect_status({check_name, "_STAGE"}, manager.stage_allocated(mr),
+                  RDMA_SC_OK);
+    expect_status({check_name, "_PROGRAM"}, manager.commit_programmed(mr),
+                  RDMA_SC_OK);
+    expect_status({check_name, "_ACTIVATE"}, manager.activate(mr.handle),
+                  RDMA_SC_OK);
+    expect_status({check_name, "_QUIESCE"},
+                  manager.begin_quiesce(mr.handle), RDMA_SC_OK);
+  endtask
+
+  function automatic void initialize_restore_gate_mapping(
+    rdma_dma_mapping mapping,
+    rdma_function_binding binding,
+    longint unsigned iova_value
+  );
+    if (mapping == null || binding == null)
+      return;
+    mapping.function_h = binding.make_handle();
+    mapping.requester_bdf = binding.pcie.bdf;
+    mapping.pasid_valid = 1'b1;
+    mapping.pasid = 20'he2251;
+    mapping.backing_addr.value = iova_value + 64'h1000_0000;
+    mapping.iova.value = iova_value;
+    mapping.size = 64'h2000;
+    mapping.direction = RDMA_DMA_BIDIRECTIONAL;
+    mapping.permissions =
+      '{device_read:1'b1, device_write:1'b1, atomic:1'b0};
+    mapping.state = RDMA_MAPPING_ACTIVE;
+    mapping.owner_h = null;
+  endfunction
+
+  function automatic rdma_backing_ref make_restore_gate_backing_ref(
+    string name,
+    rdma_dma_mapping mapping,
+    rdma_resource_ownership_e ownership
+  );
+    rdma_backing_ref backing_ref;
+
+    backing_ref = rdma_backing_ref::type_id::create(name);
+    backing_ref.mapping = mapping;
+    backing_ref.ownership = ownership;
+    backing_ref.release_complete = 1'b0;
+    return backing_ref;
+  endfunction
+
+  function automatic rdma_hmc_ref make_restore_gate_hmc_ref(
+    string name,
+    rdma_function_handle owner,
+    longint unsigned address_value
+  );
+    rdma_hmc_ref hmc_ref;
+
+    hmc_ref = rdma_hmc_ref::type_id::create(name);
+    hmc_ref.owner = owner;
+    hmc_ref.object_kind = RDMA_RESOURCE_MR;
+    hmc_ref.address.value = address_value;
+    hmc_ref.size = 64'h3000;
+    hmc_ref.first_pbl_index = 28'he2251;
+    hmc_ref.ownership = RDMA_OWNERSHIP_BORROWED;
+    hmc_ref.release_complete = 1'b0;
+    return hmc_ref;
+  endfunction
+
   function automatic rdma_recovery_record make_restore_gate_recovery(
     string name,
     rdma_mr mr
@@ -2392,6 +2476,336 @@ class rdma_resource_manager_test extends uvm_test;
                   manager.mark_error(pd.handle, recovery), RDMA_SC_OK);
     expect_status("ERROR_RESTORE_PD_REJECT",
                   manager.restore_active(pd.handle), RDMA_SC_INVALID_STATE);
+  endtask
+
+  task automatic check_error_restore_ref_authority_gate();
+    rdma_resource_manager manager;
+    rdma_function_binding binding;
+    rdma_function_binding other_binding;
+    rdma_pd pd;
+    rdma_mr mr;
+    rdma_recovery_record recovery;
+    rdma_dma_mapping authoritative_mapping;
+    rdma_dma_mapping recovery_mapping;
+    rdma_mock_dma_mapping authoritative_owned_mapping;
+    rdma_mock_dma_mapping recovery_owned_mapping;
+    rdma_mock_release_seal release_seal;
+    rdma_backing_ref authoritative_backing;
+    rdma_backing_ref recovery_backing;
+    rdma_hmc_ref authoritative_hmc;
+    rdma_hmc_ref recovery_hmc;
+    string check_name;
+
+    manager = rdma_resource_manager::type_id::create(
+      "error_restore_ref_manager"
+    );
+    binding = make_active_binding(
+      "error_restore_ref_binding", 64'he226_0000_0000_0001,
+      32'he226_0101, 32'd26
+    );
+    other_binding = make_active_binding(
+      "error_restore_ref_other_binding", 64'he226_0000_0000_0002,
+      32'he226_0102, 32'd26
+    );
+    expect_status("ERROR_RESTORE_REF_PD_CREATE",
+                  manager.create_pd(binding, pd), RDMA_SC_OK);
+    expect_status("ERROR_RESTORE_REF_PD_ACTIVATE",
+                  manager.activate(pd.handle), RDMA_SC_OK);
+
+    create_prepared_restore_gate_mr(
+      "ERROR_RESTORE_BACKING_OMITTED", manager, binding, pd,
+      64'he226_1000_0000_0000, mr
+    );
+    authoritative_mapping = rdma_dma_mapping::type_id::create(
+      "error_restore_backing_omitted_mapping"
+    );
+    initialize_restore_gate_mapping(
+      authoritative_mapping, binding, 64'he226_1000_0000_0000
+    );
+    authoritative_backing = make_restore_gate_backing_ref(
+      "error_restore_backing_omitted_ref", authoritative_mapping,
+      RDMA_OWNERSHIP_BORROWED
+    );
+    mr.backing_refs.push_back(authoritative_backing);
+    activate_restore_gate_mr("ERROR_RESTORE_BACKING_OMITTED", manager, mr);
+    recovery = make_restore_gate_recovery(
+      "error_restore_backing_omitted", mr
+    );
+    expect_status("ERROR_RESTORE_BACKING_OMITTED_MARK",
+                  manager.mark_error(mr.handle, recovery), RDMA_SC_OK);
+    expect_status("ERROR_RESTORE_BACKING_OMITTED_REJECT",
+                  manager.restore_active(mr.handle), RDMA_SC_INVALID_STATE);
+
+    create_prepared_restore_gate_mr(
+      "ERROR_RESTORE_BACKING_EXTRA", manager, binding, pd,
+      64'he226_1000_0001_0000, mr
+    );
+    activate_restore_gate_mr("ERROR_RESTORE_BACKING_EXTRA", manager, mr);
+    recovery = make_restore_gate_recovery("error_restore_backing_extra", mr);
+    recovery_mapping = rdma_dma_mapping::type_id::create(
+      "error_restore_backing_extra_mapping"
+    );
+    initialize_restore_gate_mapping(
+      recovery_mapping, binding, 64'he226_1000_0001_0000
+    );
+    recovery.backing_refs.push_back(make_restore_gate_backing_ref(
+      "error_restore_backing_extra_ref", recovery_mapping,
+      RDMA_OWNERSHIP_BORROWED
+    ));
+    expect_status("ERROR_RESTORE_BACKING_EXTRA_MARK",
+                  manager.mark_error(mr.handle, recovery), RDMA_SC_OK);
+    expect_status("ERROR_RESTORE_BACKING_EXTRA_REJECT",
+                  manager.restore_active(mr.handle), RDMA_SC_INVALID_STATE);
+
+    create_prepared_restore_gate_mr(
+      "ERROR_RESTORE_BACKING_DIFFERENT", manager, binding, pd,
+      64'he226_1000_0002_0000, mr
+    );
+    authoritative_mapping = rdma_dma_mapping::type_id::create(
+      "error_restore_backing_different_authoritative"
+    );
+    recovery_mapping = rdma_dma_mapping::type_id::create(
+      "error_restore_backing_different_recovery"
+    );
+    initialize_restore_gate_mapping(
+      authoritative_mapping, binding, 64'he226_1000_0002_0000
+    );
+    initialize_restore_gate_mapping(
+      recovery_mapping, binding, 64'he226_1000_0002_1000
+    );
+    authoritative_backing = make_restore_gate_backing_ref(
+      "error_restore_backing_different_authoritative_ref",
+      authoritative_mapping, RDMA_OWNERSHIP_BORROWED
+    );
+    mr.backing_refs.push_back(authoritative_backing);
+    activate_restore_gate_mr("ERROR_RESTORE_BACKING_DIFFERENT", manager, mr);
+    recovery = make_restore_gate_recovery(
+      "error_restore_backing_different", mr
+    );
+    recovery.backing_refs.push_back(make_restore_gate_backing_ref(
+      "error_restore_backing_different_recovery_ref", recovery_mapping,
+      RDMA_OWNERSHIP_BORROWED
+    ));
+    expect_status("ERROR_RESTORE_BACKING_DIFFERENT_MARK",
+                  manager.mark_error(mr.handle, recovery), RDMA_SC_OK);
+    expect_status("ERROR_RESTORE_BACKING_DIFFERENT_REJECT",
+                  manager.restore_active(mr.handle), RDMA_SC_INVALID_STATE);
+
+    release_seal = new("error_restore_ownership_seal");
+    authoritative_owned_mapping = rdma_mock_dma_mapping::type_id::create(
+      "error_restore_ownership_mapping"
+    );
+    expect_status("ERROR_RESTORE_OWNERSHIP_TOKEN",
+                  authoritative_owned_mapping.initialize_allocation_token(
+                    release_seal
+                  ), RDMA_SC_OK);
+    initialize_restore_gate_mapping(
+      authoritative_owned_mapping, binding, 64'he226_1000_0003_0000
+    );
+    create_prepared_restore_gate_mr(
+      "ERROR_RESTORE_BACKING_OWNERSHIP", manager, binding, pd,
+      authoritative_owned_mapping.iova.value, mr
+    );
+    authoritative_backing = make_restore_gate_backing_ref(
+      "error_restore_ownership_authoritative_ref",
+      authoritative_owned_mapping, RDMA_OWNERSHIP_BORROWED
+    );
+    mr.backing_refs.push_back(authoritative_backing);
+    activate_restore_gate_mr("ERROR_RESTORE_BACKING_OWNERSHIP", manager, mr);
+    recovery = make_restore_gate_recovery(
+      "error_restore_backing_ownership", mr
+    );
+    recovery.backing_refs.push_back(make_restore_gate_backing_ref(
+      "error_restore_ownership_recovery_ref", authoritative_owned_mapping,
+      RDMA_OWNERSHIP_CONTROL_PLANE
+    ));
+    expect_status("ERROR_RESTORE_BACKING_OWNERSHIP_MARK",
+                  manager.mark_error(mr.handle, recovery), RDMA_SC_OK);
+    expect_status("ERROR_RESTORE_BACKING_OWNERSHIP_REJECT",
+                  manager.restore_active(mr.handle), RDMA_SC_INVALID_STATE);
+
+    release_seal = new("error_restore_different_owned_seal");
+    authoritative_owned_mapping = rdma_mock_dma_mapping::type_id::create(
+      "error_restore_different_owned_authoritative"
+    );
+    recovery_owned_mapping = rdma_mock_dma_mapping::type_id::create(
+      "error_restore_different_owned_recovery"
+    );
+    expect_status("ERROR_RESTORE_DIFFERENT_OWNED_AUTH_TOKEN",
+                  authoritative_owned_mapping.initialize_allocation_token(
+                    release_seal
+                  ), RDMA_SC_OK);
+    expect_status("ERROR_RESTORE_DIFFERENT_OWNED_RECOVERY_TOKEN",
+                  recovery_owned_mapping.initialize_allocation_token(
+                    release_seal
+                  ), RDMA_SC_OK);
+    initialize_restore_gate_mapping(
+      authoritative_owned_mapping, binding, 64'he226_1000_0004_0000
+    );
+    initialize_restore_gate_mapping(
+      recovery_owned_mapping, binding, 64'he226_1000_0004_0000
+    );
+    create_prepared_restore_gate_mr(
+      "ERROR_RESTORE_DIFFERENT_OWNED", manager, binding, pd,
+      authoritative_owned_mapping.iova.value, mr
+    );
+    mr.backing_refs.push_back(make_restore_gate_backing_ref(
+      "error_restore_different_owned_authoritative_ref",
+      authoritative_owned_mapping, RDMA_OWNERSHIP_CONTROL_PLANE
+    ));
+    activate_restore_gate_mr("ERROR_RESTORE_DIFFERENT_OWNED", manager, mr);
+    recovery = make_restore_gate_recovery(
+      "error_restore_different_owned", mr
+    );
+    recovery.backing_refs.push_back(make_restore_gate_backing_ref(
+      "error_restore_different_owned_recovery_ref", recovery_owned_mapping,
+      RDMA_OWNERSHIP_CONTROL_PLANE
+    ));
+    expect_status("ERROR_RESTORE_DIFFERENT_OWNED_MARK",
+                  manager.mark_error(mr.handle, recovery), RDMA_SC_OK);
+    expect_status("ERROR_RESTORE_DIFFERENT_OWNED_REJECT",
+                  manager.restore_active(mr.handle), RDMA_SC_INVALID_STATE);
+
+    create_prepared_restore_gate_mr(
+      "ERROR_RESTORE_HMC_OMITTED", manager, binding, pd,
+      64'he226_1000_0005_0000, mr
+    );
+    authoritative_hmc = make_restore_gate_hmc_ref(
+      "error_restore_hmc_omitted_ref", binding.make_handle(),
+      64'he226_2000_0000_0000
+    );
+    mr.hmc_refs.push_back(authoritative_hmc);
+    activate_restore_gate_mr("ERROR_RESTORE_HMC_OMITTED", manager, mr);
+    recovery = make_restore_gate_recovery("error_restore_hmc_omitted", mr);
+    expect_status("ERROR_RESTORE_HMC_OMITTED_MARK",
+                  manager.mark_error(mr.handle, recovery), RDMA_SC_OK);
+    expect_status("ERROR_RESTORE_HMC_OMITTED_REJECT",
+                  manager.restore_active(mr.handle), RDMA_SC_INVALID_STATE);
+
+    create_prepared_restore_gate_mr(
+      "ERROR_RESTORE_HMC_EXTRA", manager, binding, pd,
+      64'he226_1000_0006_0000, mr
+    );
+    activate_restore_gate_mr("ERROR_RESTORE_HMC_EXTRA", manager, mr);
+    recovery = make_restore_gate_recovery("error_restore_hmc_extra", mr);
+    recovery.hmc_refs.push_back(make_restore_gate_hmc_ref(
+      "error_restore_hmc_extra_ref", binding.make_handle(),
+      64'he226_2000_0001_0000
+    ));
+    expect_status("ERROR_RESTORE_HMC_EXTRA_MARK",
+                  manager.mark_error(mr.handle, recovery), RDMA_SC_OK);
+    expect_status("ERROR_RESTORE_HMC_EXTRA_REJECT",
+                  manager.restore_active(mr.handle), RDMA_SC_INVALID_STATE);
+
+    for (int variant = 0; variant < 6; variant++) begin
+      check_name = $sformatf("ERROR_RESTORE_HMC_DIFFERENT_%0d", variant);
+      create_prepared_restore_gate_mr(
+        check_name, manager, binding, pd,
+        64'he226_1000_0010_0000 + (variant * 64'h1_0000), mr
+      );
+      authoritative_hmc = make_restore_gate_hmc_ref(
+        {check_name, "_AUTHORITATIVE"}, binding.make_handle(),
+        64'he226_2000_0010_0000 + (variant * 64'h1_0000)
+      );
+      mr.hmc_refs.push_back(authoritative_hmc);
+      activate_restore_gate_mr(check_name, manager, mr);
+      recovery = make_restore_gate_recovery(
+        {check_name, "_RECOVERY"}, mr
+      );
+      recovery_hmc = make_restore_gate_hmc_ref(
+        {check_name, "_RECOVERY_REF"}, binding.make_handle(),
+        authoritative_hmc.address.value
+      );
+      case (variant)
+        0: recovery_hmc.owner = other_binding.make_handle();
+        1: recovery_hmc.object_kind = RDMA_RESOURCE_PD;
+        2: recovery_hmc.address.value++;
+        3: recovery_hmc.size++;
+        4: recovery_hmc.first_pbl_index++;
+        5: recovery_hmc.ownership = RDMA_OWNERSHIP_CONTROL_PLANE;
+      endcase
+      recovery.hmc_refs.push_back(recovery_hmc);
+      if (variant == 1) begin
+        expect_status({check_name, "_MARK_REJECT"},
+                      manager.mark_error(mr.handle, recovery),
+                      RDMA_SC_INVALID_ARGUMENT);
+      end
+      else begin
+        expect_status({check_name, "_MARK"},
+                      manager.mark_error(mr.handle, recovery), RDMA_SC_OK);
+        expect_status({check_name, "_REJECT"},
+                      manager.restore_active(mr.handle),
+                      RDMA_SC_INVALID_STATE);
+      end
+    end
+
+    release_seal = new("error_restore_sealed_owned_seal");
+    authoritative_owned_mapping = rdma_mock_dma_mapping::type_id::create(
+      "error_restore_sealed_owned_mapping"
+    );
+    expect_status("ERROR_RESTORE_SEALED_OWNED_TOKEN",
+                  authoritative_owned_mapping.initialize_allocation_token(
+                    release_seal
+                  ), RDMA_SC_OK);
+    initialize_restore_gate_mapping(
+      authoritative_owned_mapping, binding, 64'he226_1000_0020_0000
+    );
+    create_prepared_restore_gate_mr(
+      "ERROR_RESTORE_SEALED_OWNED", manager, binding, pd,
+      authoritative_owned_mapping.iova.value, mr
+    );
+    authoritative_backing = make_restore_gate_backing_ref(
+      "error_restore_sealed_owned_ref", authoritative_owned_mapping,
+      RDMA_OWNERSHIP_CONTROL_PLANE
+    );
+    mr.backing_refs.push_back(authoritative_backing);
+    activate_restore_gate_mr("ERROR_RESTORE_SEALED_OWNED", manager, mr);
+    recovery = make_restore_gate_recovery(
+      "error_restore_sealed_owned", mr
+    );
+    recovery.backing_refs.push_back(authoritative_backing);
+    expect_status("ERROR_RESTORE_SEALED_OWNED_MARK",
+                  manager.mark_error(mr.handle, recovery), RDMA_SC_OK);
+    expect_status("ERROR_RESTORE_SEALED_OWNED_SEAL",
+                  authoritative_owned_mapping.mark_release_complete(
+                    release_seal
+                  ), RDMA_SC_OK);
+    expect_status("ERROR_RESTORE_SEALED_OWNED_REJECT",
+                  manager.restore_active(mr.handle), RDMA_SC_INVALID_STATE);
+
+    release_seal = new("error_restore_exact_owned_seal");
+    authoritative_owned_mapping = rdma_mock_dma_mapping::type_id::create(
+      "error_restore_exact_owned_mapping"
+    );
+    expect_status("ERROR_RESTORE_EXACT_OWNED_TOKEN",
+                  authoritative_owned_mapping.initialize_allocation_token(
+                    release_seal
+                  ), RDMA_SC_OK);
+    initialize_restore_gate_mapping(
+      authoritative_owned_mapping, binding, 64'he226_1000_0021_0000
+    );
+    create_prepared_restore_gate_mr(
+      "ERROR_RESTORE_EXACT", manager, binding, pd,
+      authoritative_owned_mapping.iova.value, mr
+    );
+    authoritative_backing = make_restore_gate_backing_ref(
+      "error_restore_exact_backing", authoritative_owned_mapping,
+      RDMA_OWNERSHIP_CONTROL_PLANE
+    );
+    authoritative_hmc = make_restore_gate_hmc_ref(
+      "error_restore_exact_hmc", binding.make_handle(),
+      64'he226_2000_0021_0000
+    );
+    mr.backing_refs.push_back(authoritative_backing);
+    mr.hmc_refs.push_back(authoritative_hmc);
+    activate_restore_gate_mr("ERROR_RESTORE_EXACT", manager, mr);
+    recovery = make_restore_gate_recovery("error_restore_exact", mr);
+    recovery.backing_refs.push_back(authoritative_backing);
+    recovery.hmc_refs.push_back(authoritative_hmc);
+    expect_status("ERROR_RESTORE_EXACT_MARK",
+                  manager.mark_error(mr.handle, recovery), RDMA_SC_OK);
+    expect_status("ERROR_RESTORE_EXACT_RUN",
+                  manager.restore_active(mr.handle), RDMA_SC_OK);
   endtask
 
   function automatic bit same_handle_fields(rdma_handle lhs,
@@ -2775,6 +3189,7 @@ class rdma_resource_manager_test extends uvm_test;
     check_owned_mapping_capability_snapshots();
     check_reserved_error_completion_proof();
     check_error_restore_active_gate();
+    check_error_restore_ref_authority_gate();
 
     // PD and MR local IDs are hardware-width projections.  The inclusive
     // boundary succeeds, while the next fresh ID fails atomically without
