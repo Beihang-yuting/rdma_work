@@ -18,15 +18,19 @@ Queue resource lifecycle 需要在 `rdma_function_binding` 中固定保存 queue
 | A5 | A2 仅加 vector queue delete | PASS，8000 ps，UVM 0/0/0 |
 | A6 | A2 加 `queue_dma = new(...)` | BAD，native SIGSEGV |
 | F2 | 完整 Task 1 使用 constructor direct-new 和 do_copy direct-new/copy | model test 0/0/0；control-plane native SIGSEGV |
+| V1 | 三个 snapshot 改为 `struct packed` value，完成值复制迁移 | model test 0/0/0；control-plane 仍 native SIGSEGV |
+| V1 trace | 保持 V1，逐语句追踪 control-plane | SIGSEGV 在后续 fork elaboration 暴露；更早的 xtr_v1 string/value-key 路径对无关 code shape 极度敏感，只有对象名 guard 能改变结果 |
 
-因此，问题不是 UVM factory 或 child `clone()` 独有；最小不安全条件是 binding constructor 新增 nested child allocation。继续更换 class allocation 方式不能满足目标环境约束。
+因此，问题不是 UVM factory 或 child `clone()` 独有；binding constructor 新增 nested child allocation 已被否定，packed aggregate 又在目标 VCS 上触发非局部 code-generation 敏感性。对象名 guard、测试专用 early return 或无关 codec 改写都不是可接受的修复。
+
+三个 snapshot 不参与 CMQ、doorbell、PCIe TLP 或 memory image 的直接 bit serialization，因此不需要连续位布局。最终设计使用 unpacked struct value；它保留值赋值和固定 schema，同时避免让目标 VCS 把 binding 内嵌 snapshot 当作 packed aggregate 优化。
 
 ## 数据模型
 
-三个现有公开类型名改为 packed struct，字段名保持不变：
+三个现有公开类型名改为 unpacked struct，字段名保持不变：
 
 ```systemverilog
-typedef struct packed {
+typedef struct {
   rdma_bdf_t requester_bdf;
   bit pasid_valid;
   bit [19:0] pasid;
@@ -34,7 +38,7 @@ typedef struct packed {
   int unsigned dma_domain_id;
 } rdma_queue_dma_context;
 
-typedef struct packed {
+typedef struct {
   int unsigned min_cq_depth;
   int unsigned max_cq_depth;
   int unsigned min_srq_depth;
@@ -46,7 +50,7 @@ typedef struct packed {
   longint unsigned max_sgb_bytes;
 } rdma_queue_capabilities;
 
-typedef struct packed {
+typedef struct {
   int unsigned function_local_vector;
   int unsigned hardware_eq_vector;
   int unsigned msix_table_index;
@@ -63,6 +67,8 @@ rdma_interrupt_vector_binding interrupt_vectors[$];
 ```
 
 这保持所有下游字段访问语法，不引入裸 DMA/IOVA 地址，也不改变 Function、BDF、PASID 或 domain authority 的来源。
+
+unpacked 仅表示字段没有连续 bit-level layout。三个类型仍是 SystemVerilog value type，assignment、function input 和 queue element copy 都按值执行。生产代码不得对它们使用 streaming operator、packed cast、`$bits` 布局假设或直接 wire/image serialization；需要硬件编码的字段仍由现有 codec 显式逐字段生成。
 
 ## 构造、复制与所有权
 
@@ -82,7 +88,7 @@ queue_caps = rhs_binding.queue_caps;
 interrupt_vectors = rhs_binding.interrupt_vectors;
 ```
 
-packed struct 和其 queue element 都按值复制。因此 source/destination 无 child handle alias，不需要 `clone()`、`new()`、null 分支或 factory cast。binding、PCIe identity、owner handle 等原有 class 的深拷贝规则不变。
+unpacked struct 和其 queue element 都按值复制。因此 source/destination 无 child handle alias，不需要 `clone()`、`new()`、null 分支或 factory cast。binding、PCIe identity、owner handle 等原有 class 的深拷贝规则不变。
 
 三个 snapshot type 不注册 UVM factory，不支持 subtype override，也不单独提供 `uvm_object` printing。它们是 binding schema 的组成部分，而非策略、adapter 或可替换 device model。
 
@@ -159,7 +165,7 @@ binding.interrupt_vectors.push_back(vector);
 
 ### Native-crash RED
 
-当前完整 Task 1 的 `rdma_control_plane_test` 在 compile/link 后稳定 native SIGSEGV，作为第二条 RED。struct conversion 后必须连续两次到达 8000 ps 且 UVM warning/error/fatal 为 0/0/0。
+当前 packed-value Task 1 的 `rdma_control_plane_test` 在 compile/link 后稳定 native SIGSEGV，作为 representation RED。只删除三个 typedef 的 `packed` keyword 后，测试必须连续两次到达 8000 ps 且 UVM warning/error/fatal 为 0/0/0；不得同时修改 codec、mock CMQ、测试顺序或对象名字来影响 VCS code shape。
 
 ### 回归
 
@@ -176,9 +182,13 @@ binding.interrupt_vectors.push_back(vector);
 
 每项必须为 UVM 0 warning / 0 error / 0 fatal。静态检查还必须证明三个 value snapshot type 没有残留 object allocation/copy/null 操作。
 
+静态检查还必须证明三个 typedef 是 `typedef struct {`，而不是 `typedef struct packed`，并且仓库中没有为该问题残留 `DBG_CP`、对象名 guard、typed-only return 或 xtr_v1 codec diff。
+
 ## 非目标
 
 - 不通过拆分或弱化 control-plane test 隐藏模拟器问题。
 - 不保留 caller-owned、lazy-init 或 builder-managed child class。
 - 不修改 VCS、UVM 或任何外部 VIP/host_mem 源码。
+- 不用测试对象名字、额外控制流、codec/string formatting 改写或 test-order change 规避 VCS 崩溃。
+- 不为 snapshot 恢复 packed layout；后续若确有硬件 image 需求，必须通过独立 codec 明确编码。
 - 不改变 Task 1 之外的 queue lifecycle policy、executor 或 recovery 行为。
