@@ -1,5 +1,7 @@
 # RDMA Function Binding Child Snapshot Construction Implementation Plan
 
+> **Superseded:** A6/F2 已证明 direct `new` 与 direct-new/copy 仍触发目标 VCS 的 native SIGSEGV。本计划不得执行；替代实施计划见 `2026-08-26-rdma-function-binding-value-snapshots.md`。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 消除 `rdma_function_binding` constructor 中新增 nested UVM factory allocation 触发的 VCS SIGSEGV，同时保持 queue DMA、capability 和 interrupt vector snapshot 的固定 schema、非空构造和深拷贝语义。
