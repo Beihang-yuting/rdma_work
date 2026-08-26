@@ -1,5 +1,7 @@
 # RDMA Function Binding Child Snapshot Construction Design
 
+> **Superseded:** 后续 A6/F2 诊断证明 direct `new` 与完整 direct-new/copy 设计仍会触发相同 VCS SIGSEGV。本文件不再作为实施依据；替代设计见 `2026-08-26-rdma-function-binding-value-snapshots-design.md`。
+
 ## 背景
 
 Queue resource lifecycle 为 `rdma_function_binding` 增加三个 Function-scoped snapshot：
