@@ -176,7 +176,7 @@ endclass
 
 ### Task 1: 固定 Queue DMA、Capability 和 Interrupt Snapshot
 
-> **Implementation update:** 本任务中将三个 snapshot 建模为 `uvm_object` child 的定义、构造和 deep-copy 步骤已被目标 VCS 的 A3/A4/A6/F2 证据推翻。Task 1 的实施与验收以 `../specs/2026-08-26-rdma-function-binding-value-snapshots-design.md` 和 `2026-08-26-rdma-function-binding-value-snapshots.md` 为准；本节其余 domain/PASID propagation、17 文件范围和 commit 目标保持有效。
+> **Implementation update:** 本任务中将三个 snapshot 建模为 `uvm_object` child 的定义、构造和 deep-copy 步骤已被目标 VCS 的 A3/A4/A6/F2 证据推翻；V1 又证明 packed value representation 仍触发非局部 VCS SIGSEGV。Task 1 的最终实施与验收以 `../specs/2026-08-26-rdma-function-binding-value-snapshots-design.md`、`2026-08-26-rdma-function-binding-value-snapshots.md` 和 `2026-08-26-rdma-function-binding-unpacked-value-snapshots.md` 为准；本节其余 domain/PASID propagation、17 文件范围和 commit 目标保持有效。
 
 **Files:**
 - Modify: `src/model/rdma_function_binding.svh`

@@ -1,5 +1,7 @@
 # RDMA Function Binding Value Snapshots Implementation Plan
 
+> **Representation update:** 本计划的 class-to-value migration、17 文件范围和测试仍有效，但 Step 3 的 `struct packed` 表示已被 V1 目标 VCS 证据推翻。最终 unpacked 表示与恢复验证改由 `2026-08-26-rdma-function-binding-unpacked-value-snapshots.md` 实施；不得重新执行本计划中的 packed typedef。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 将 queue DMA authority、queue capability 和 interrupt vector 从 binding-owned UVM child class 迁移为 packed value snapshot，消除目标 VCS 中 nested child allocation 引发的 native SIGSEGV，同时保持 Task 1 的公开字段、validation 和 authority propagation 契约。
