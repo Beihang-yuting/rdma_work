@@ -193,6 +193,8 @@ class rdma_resource_manager extends uvm_object;
     result.requester_bdf = source.requester_bdf;
     result.pasid_valid = source.pasid_valid;
     result.pasid = source.pasid;
+    result.dma_domain_valid = source.dma_domain_valid;
+    result.dma_domain_id = source.dma_domain_id;
     result.backing_addr = source.backing_addr;
     result.iova = source.iova;
     result.size = source.size;
@@ -224,6 +226,8 @@ class rdma_resource_manager extends uvm_object;
            lhs.requester_bdf == rhs.requester_bdf &&
            lhs.pasid_valid == rhs.pasid_valid &&
            lhs.pasid == rhs.pasid &&
+           lhs.dma_domain_valid == rhs.dma_domain_valid &&
+           lhs.dma_domain_id == rhs.dma_domain_id &&
            lhs.backing_addr.value == rhs.backing_addr.value &&
            lhs.iova.value == rhs.iova.value &&
            lhs.size == rhs.size &&
@@ -661,6 +665,9 @@ class rdma_resource_manager extends uvm_object;
       result = null;
       return status;
     end
+    result.queue_dma = source.queue_dma;
+    result.queue_caps = source.queue_caps;
+    result.interrupt_vectors = source.interrupt_vectors;
     status = project_handle_value(source.owner_h, {copy_label, "_owner"},
                                   result.owner_h);
     if (!status.ok()) begin
@@ -678,8 +685,6 @@ class rdma_resource_manager extends uvm_object;
     result.rdma_vf_id = source.rdma_vf_id;
     result.global_function_id = source.global_function_id;
     result.vsi_id = source.vsi_id;
-    result.dma_domain_id = source.dma_domain_id;
-    result.dma_domain_valid = source.dma_domain_valid;
     result.state = source.state;
     result.generation = source.generation;
     result.notify_valid = source.notify_valid;
@@ -1266,8 +1271,6 @@ class rdma_resource_manager extends uvm_object;
         lhs.rdma_vf_id != rhs.rdma_vf_id ||
         lhs.global_function_id != rhs.global_function_id ||
         lhs.vsi_id != rhs.vsi_id ||
-        lhs.dma_domain_id != rhs.dma_domain_id ||
-        lhs.dma_domain_valid != rhs.dma_domain_valid ||
         lhs.state != rhs.state || lhs.generation != rhs.generation ||
         lhs.notify_valid != rhs.notify_valid ||
         lhs.notify_ready != rhs.notify_ready ||
@@ -1275,6 +1278,36 @@ class rdma_resource_manager extends uvm_object;
         lhs.vft_valid != rhs.vft_valid || lhs.vft_ready != rhs.vft_ready ||
         !same_handle_value(lhs.owner_h, rhs.owner_h))
       return 1'b0;
+    if (lhs.queue_dma.requester_bdf != rhs.queue_dma.requester_bdf ||
+        lhs.queue_dma.pasid_valid != rhs.queue_dma.pasid_valid ||
+        lhs.queue_dma.pasid != rhs.queue_dma.pasid ||
+        lhs.queue_dma.dma_domain_valid != rhs.queue_dma.dma_domain_valid ||
+        lhs.queue_dma.dma_domain_id != rhs.queue_dma.dma_domain_id)
+      return 1'b0;
+    if (lhs.queue_caps.min_cq_depth != rhs.queue_caps.min_cq_depth ||
+        lhs.queue_caps.max_cq_depth != rhs.queue_caps.max_cq_depth ||
+        lhs.queue_caps.min_srq_depth != rhs.queue_caps.min_srq_depth ||
+        lhs.queue_caps.max_srq_depth != rhs.queue_caps.max_srq_depth ||
+        lhs.queue_caps.max_ceq_depth != rhs.queue_caps.max_ceq_depth ||
+        lhs.queue_caps.max_aeq_depth != rhs.queue_caps.max_aeq_depth ||
+        lhs.queue_caps.max_wq_sge != rhs.queue_caps.max_wq_sge ||
+        lhs.queue_caps.max_queue_ring_bytes !=
+          rhs.queue_caps.max_queue_ring_bytes ||
+        lhs.queue_caps.max_sgb_bytes != rhs.queue_caps.max_sgb_bytes)
+      return 1'b0;
+    if (lhs.interrupt_vectors.size() != rhs.interrupt_vectors.size())
+      return 1'b0;
+    foreach (lhs.interrupt_vectors[i]) begin
+      if (lhs.interrupt_vectors[i].function_local_vector !=
+            rhs.interrupt_vectors[i].function_local_vector ||
+          lhs.interrupt_vectors[i].hardware_eq_vector !=
+            rhs.interrupt_vectors[i].hardware_eq_vector ||
+          lhs.interrupt_vectors[i].msix_table_index !=
+            rhs.interrupt_vectors[i].msix_table_index ||
+          lhs.interrupt_vectors[i].enabled !=
+            rhs.interrupt_vectors[i].enabled)
+        return 1'b0;
+    end
     if (lhs.pcie == null || rhs.pcie == null)
       return lhs.pcie == rhs.pcie;
     if (lhs.pcie.bdf != rhs.pcie.bdf ||

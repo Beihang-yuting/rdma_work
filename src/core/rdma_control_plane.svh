@@ -652,10 +652,16 @@ class rdma_control_plane extends uvm_object;
     if (status == null || !status.ok())
       return checked_status(status,
                             "register MR backing owner check returned null");
-    if (backing.requester_bdf != binding.pcie.bdf)
+    if (backing.requester_bdf != binding.queue_dma.requester_bdf)
       return rdma_status::make(
         RDMA_SC_DMA_TRANSLATION,
         "register MR backing requester BDF does not match Function"
+      );
+    if (backing.pasid_valid != binding.queue_dma.pasid_valid ||
+        backing.pasid != binding.queue_dma.pasid)
+      return rdma_status::make(
+        RDMA_SC_DMA_TRANSLATION,
+        "register MR backing PASID does not match Function"
       );
     required_permissions = '0;
     required_permissions.device_read = 1'b1;
@@ -679,7 +685,9 @@ class rdma_control_plane extends uvm_object;
           "register MR backing PASID does not match mapping"
         );
       status = backing.backing_refs[i].mapping.check_access(
-        owner, backing.requester_bdf, request.iova, request.length,
+        owner, backing.requester_bdf, backing.pasid_valid, backing.pasid,
+        binding.queue_dma.dma_domain_valid,
+        binding.queue_dma.dma_domain_id, request.iova, request.length,
         required_direction, required_permissions
       );
       if (status == null)
@@ -2103,7 +2111,12 @@ class rdma_control_plane extends uvm_object;
         );
         break;
       end
-      if (dma_context.requester_bdf != binding.pcie.bdf) begin
+      if (dma_context.requester_bdf != binding.queue_dma.requester_bdf ||
+          dma_context.pasid_valid != binding.queue_dma.pasid_valid ||
+          dma_context.pasid != binding.queue_dma.pasid ||
+          dma_context.dma_domain_valid !=
+            binding.queue_dma.dma_domain_valid ||
+          dma_context.dma_domain_id != binding.queue_dma.dma_domain_id) begin
         status = rdma_status::make(
           RDMA_SC_DMA_TRANSLATION,
           "owned MR DMA requester BDF does not match Function"
@@ -2177,7 +2190,12 @@ class rdma_control_plane extends uvm_object;
         );
         break;
       end
-      if (dma_context.requester_bdf != binding.pcie.bdf) begin
+      if (dma_context.requester_bdf != binding.queue_dma.requester_bdf ||
+          dma_context.pasid_valid != binding.queue_dma.pasid_valid ||
+          dma_context.pasid != binding.queue_dma.pasid ||
+          dma_context.dma_domain_valid !=
+            binding.queue_dma.dma_domain_valid ||
+          dma_context.dma_domain_id != binding.queue_dma.dma_domain_id) begin
         status = rdma_status::make(
           RDMA_SC_DMA_TRANSLATION,
           "owned MR DMA requester BDF does not match Function"
@@ -2253,7 +2271,13 @@ class rdma_control_plane extends uvm_object;
         );
         break;
       end
-      if (frozen_context.requester_bdf != binding.pcie.bdf ||
+      if (frozen_context.requester_bdf !=
+            binding.queue_dma.requester_bdf ||
+          frozen_context.pasid_valid != binding.queue_dma.pasid_valid ||
+          frozen_context.pasid != binding.queue_dma.pasid ||
+          frozen_context.dma_domain_valid !=
+            binding.queue_dma.dma_domain_valid ||
+          frozen_context.dma_domain_id != binding.queue_dma.dma_domain_id ||
           frozen_context.owner_h != null) begin
         status = invalid_argument(
           "owned MR DMA context snapshot authority is invalid"

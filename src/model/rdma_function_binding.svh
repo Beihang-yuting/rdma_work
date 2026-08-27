@@ -109,6 +109,33 @@ class rdma_bar_decode extends uvm_object;
   endfunction
 endclass
 
+typedef struct {
+  rdma_bdf_t requester_bdf;
+  bit pasid_valid;
+  bit [19:0] pasid;
+  bit dma_domain_valid;
+  int unsigned dma_domain_id;
+} rdma_queue_dma_context;
+
+typedef struct {
+  int unsigned min_cq_depth;
+  int unsigned max_cq_depth;
+  int unsigned min_srq_depth;
+  int unsigned max_srq_depth;
+  int unsigned max_ceq_depth;
+  int unsigned max_aeq_depth;
+  int unsigned max_wq_sge;
+  longint unsigned max_queue_ring_bytes;
+  longint unsigned max_sgb_bytes;
+} rdma_queue_capabilities;
+
+typedef struct {
+  int unsigned function_local_vector;
+  int unsigned hardware_eq_vector;
+  int unsigned msix_table_index;
+  bit enabled;
+} rdma_interrupt_vector_binding;
+
 class rdma_function_binding extends uvm_object;
   `uvm_object_utils(rdma_function_binding)
 
@@ -127,8 +154,9 @@ class rdma_function_binding extends uvm_object;
   int unsigned global_function_id;
   int unsigned vsi_id;
 
-  int unsigned dma_domain_id;
-  bit dma_domain_valid;
+  rdma_queue_dma_context queue_dma;
+  rdma_queue_capabilities queue_caps;
+  rdma_interrupt_vector_binding interrupt_vectors[$];
   rdma_binding_state_e state;
   int unsigned generation;
   rdma_handle owner_h;
@@ -154,8 +182,9 @@ class rdma_function_binding extends uvm_object;
     rdma_vf_id = '0;
     global_function_id = '0;
     vsi_id = '0;
-    dma_domain_id = '0;
-    dma_domain_valid = 1'b0;
+    queue_dma = '{default:'0};
+    queue_caps = '{default:'0};
+    interrupt_vectors.delete();
     state = RDMA_BIND_DISCOVERED;
     generation = '0;
     owner_h = null;
@@ -193,8 +222,9 @@ class rdma_function_binding extends uvm_object;
     rdma_vf_id = rhs_binding.rdma_vf_id;
     global_function_id = rhs_binding.global_function_id;
     vsi_id = rhs_binding.vsi_id;
-    dma_domain_id = rhs_binding.dma_domain_id;
-    dma_domain_valid = rhs_binding.dma_domain_valid;
+    queue_dma = rhs_binding.queue_dma;
+    queue_caps = rhs_binding.queue_caps;
+    interrupt_vectors = rhs_binding.interrupt_vectors;
     state = rhs_binding.state;
     generation = rhs_binding.generation;
     if (rhs_binding.owner_h == null) begin
@@ -241,6 +271,46 @@ class rdma_function_binding extends uvm_object;
     if (pcie == null)
       return rdma_status::make(RDMA_SC_INVALID_STATE,
                                "PCIe identity is not instantiated");
+    if (!queue_dma.pasid_valid && queue_dma.pasid != 0)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "invalid queue PASID must be zero");
+    if (queue_dma.requester_bdf != pcie.bdf)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "queue requester BDF does not match PCIe BDF");
+    if (queue_caps.min_cq_depth == 0 ||
+        queue_caps.max_cq_depth == 0 ||
+        queue_caps.min_srq_depth == 0 ||
+        queue_caps.max_srq_depth == 0 ||
+        queue_caps.max_ceq_depth == 0 ||
+        queue_caps.max_aeq_depth == 0)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "queue depth capability is zero");
+    if (queue_caps.min_cq_depth > queue_caps.max_cq_depth)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "minimum CQ depth exceeds maximum");
+    if (queue_caps.min_srq_depth > queue_caps.max_srq_depth)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "minimum SRQ depth exceeds maximum");
+    if (queue_caps.max_wq_sge == 0)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "maximum WQ SGE capability is zero");
+    if (queue_caps.max_queue_ring_bytes == 0 ||
+        queue_caps.max_sgb_bytes == 0)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "queue ring or SGB byte capability is zero");
+    if (rdma_vf_id > 8'hff)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "RDMA VF ID exceeds 8 bits");
+    foreach (interrupt_vectors[i]) begin
+      for (int j = 0; j < i; j++) begin
+        if (interrupt_vectors[j].function_local_vector ==
+            interrupt_vectors[i].function_local_vector)
+          return rdma_status::make(
+            RDMA_SC_INVALID_ARGUMENT,
+            "interrupt Function-local vector is duplicated"
+          );
+      end
+    end
 
     foreach (pcie.bar[i]) begin
       if (pcie.bar[i] == null)
@@ -298,7 +368,7 @@ class rdma_function_binding extends uvm_object;
       if (owner_h.generation != generation)
         return rdma_status::make(RDMA_SC_STALE_GENERATION,
                                  "ACTIVE binding owner generation is stale");
-      if (!dma_domain_valid)
+      if (!queue_dma.dma_domain_valid)
         return rdma_status::make(RDMA_SC_INVALID_STATE,
                                  "ACTIVE binding has no DMA domain");
       if (!pcie.mse)

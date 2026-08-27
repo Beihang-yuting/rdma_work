@@ -7,7 +7,8 @@ override XTR_V1_ARCHIVE := /home/ubuntu/workspace/Desktop.zip
 override XTR_V1_ARCHIVE_PREFIX := dpu_kernel_rdma-version_0.1.32
 TEST ?= rdma_smoke_test
 VCS ?= vcs
-VCS_FLAGS := -full64 -sverilog -ntb_opts uvm-1.2 -timescale=1ns/1ps
+# Work around a VCS W-2024.09-SP1 class-codegen miscompile; not an RTL requirement.
+VCS_FLAGS := -full64 -sverilog -ntb_opts uvm-1.2 -timescale=1ns/1ps -debug_access+class
 SHELL := /bin/bash
 .SHELLFLAGS := -o pipefail -c
 

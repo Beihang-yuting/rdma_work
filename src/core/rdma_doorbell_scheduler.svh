@@ -684,7 +684,11 @@ class rdma_doorbell_scheduler extends uvm_object;
     read_permission = '{device_read:1'b1, device_write:1'b0, atomic:1'b0};
     status = dependency.mapping.check_access(
       desc.function_h,
-      binding.pcie.bdf,
+      binding.queue_dma.requester_bdf,
+      binding.queue_dma.pasid_valid,
+      binding.queue_dma.pasid,
+      binding.queue_dma.dma_domain_valid,
+      binding.queue_dma.dma_domain_id,
       first_iova,
       dependency.image.length,
       RDMA_DMA_DEVICE_READ,

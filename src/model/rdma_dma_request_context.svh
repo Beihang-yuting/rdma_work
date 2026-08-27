@@ -5,6 +5,8 @@ class rdma_dma_request_context extends uvm_object;
   rdma_bdf_t requester_bdf;
   bit pasid_valid;
   bit [19:0] pasid;
+  bit dma_domain_valid;
+  int unsigned dma_domain_id;
   rdma_handle owner_h;
 
   function new(string name = "rdma_dma_request_context");
@@ -13,6 +15,8 @@ class rdma_dma_request_context extends uvm_object;
     requester_bdf = '0;
     pasid_valid = 1'b0;
     pasid = '0;
+    dma_domain_valid = 1'b0;
+    dma_domain_id = '0;
     owner_h = null;
   endfunction
 
@@ -56,6 +60,8 @@ class rdma_dma_request_context extends uvm_object;
     requester_bdf = rhs_context.requester_bdf;
     pasid_valid = rhs_context.pasid_valid;
     pasid = rhs_context.pasid;
+    dma_domain_valid = rhs_context.dma_domain_valid;
+    dma_domain_id = rhs_context.dma_domain_id;
     if (rhs_context.owner_h == null) begin
       owner_h = null;
     end

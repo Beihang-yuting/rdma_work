@@ -4,7 +4,7 @@
 
 Queue resource lifecycle 需要在 `rdma_function_binding` 中固定保存 queue DMA authority、queue capability 和 interrupt vector snapshot，同时必须在 10.11.10.53 的 Synopsys VCS W-2024.09-SP1 上稳定运行。
 
-本设计将三个 binding-owned snapshot 定义为固定 schema 的 SystemVerilog value type，而不是 `uvm_object` child。它保留 `binding.queue_dma.*` 等调用形式，消除新增 child allocation、null/alias 状态和 factory override 对 binding schema 的影响。
+本设计将三个 binding-owned snapshot 定义为固定 schema 的 SystemVerilog value type，而不是 `uvm_object` child。它保留 `binding.queue_dma.*` 等调用形式，消除新增 child allocation、null/alias 状态和 factory override 对 binding schema 的影响。目标 VCS 还需要一个最小、明确隔离的 class-codegen workaround；该编译选项不是功能 RTL 要求。
 
 ## 决策依据
 
@@ -20,10 +20,16 @@ Queue resource lifecycle 需要在 `rdma_function_binding` 中固定保存 queue
 | F2 | 完整 Task 1 使用 constructor direct-new 和 do_copy direct-new/copy | model test 0/0/0；control-plane native SIGSEGV |
 | V1 | 三个 snapshot 改为 `struct packed` value，完成值复制迁移 | model test 0/0/0；control-plane 仍 native SIGSEGV |
 | V1 trace | 保持 V1，逐语句追踪 control-plane | SIGSEGV 在后续 fork elaboration 暴露；更早的 xtr_v1 string/value-key 路径对无关 code shape 极度敏感，只有对象名 guard 能改变结果 |
+| U1 | 三个 snapshot 改为 unpacked struct，不加编译 workaround | compile/link 成功；`[RNTST]` 后 native SIGSEGV |
+| P1 | 将 snapshot primitive flatten 到 binding | compile/link 成功；control-plane 仍 native SIGSEGV |
+| O0 | U1 仅加 `-O0` | compile/link 成功；control-plane 仍 native SIGSEGV |
+| D1 | U1 仅加 `-debug_access+class` | control-plane 正常到达 8000 ps，连续运行 UVM 0/0/0 |
+| PASID RED | D1 下 owned snapshot 把 `first_pasid` 固定为无 authority 的 `20'h1a111` | 正常运行而非 native crash；返回 `RDMA_SC_DMA_TRANSLATION`，UVM error 5 |
+| PASID GREEN | D1 下令 `first_pasid = binding.queue_dma.pasid` | authority 有效；保留 lock 前 request/access mutation 与 CMQ 后 PASID mutation，UVM 0/0/0 |
 
-因此，问题不是 UVM factory 或 child `clone()` 独有；binding constructor 新增 nested child allocation 已被否定，packed aggregate 又在目标 VCS 上触发非局部 code-generation 敏感性。对象名 guard、测试专用 early return 或无关 codec 改写都不是可接受的修复。
+因此，问题不是 UVM factory、child `clone()` 或 packed representation 独有；unpacked、primitive flatten 和 `-O0` 的负结果证明 representation 本身不能消除 W-2024.09-SP1 的非局部 class code-generation miscompile。对象名 guard、测试专用 early return 或无关 codec 改写都不是可接受的修复。
 
-三个 snapshot 不参与 CMQ、doorbell、PCIe TLP 或 memory image 的直接 bit serialization，因此不需要连续位布局。最终设计使用 unpacked struct value；它保留值赋值和固定 schema，同时避免让目标 VCS 把 binding 内嵌 snapshot 当作 packed aggregate 优化。
+三个 snapshot 不参与 CMQ、doorbell、PCIe TLP 或 memory image 的直接 bit serialization，因此不需要连续位布局。最终设计继续使用 unpacked struct value以表达 value semantics，并在 `sim/Makefile` 的 `VCS_FLAGS` 中精确增加 `-debug_access+class`，规避目标版本的 class-codegen miscompile。
 
 ## 数据模型
 
@@ -69,6 +75,17 @@ rdma_interrupt_vector_binding interrupt_vectors[$];
 这保持所有下游字段访问语法，不引入裸 DMA/IOVA 地址，也不改变 Function、BDF、PASID 或 domain authority 的来源。
 
 unpacked 仅表示字段没有连续 bit-level layout。三个类型仍是 SystemVerilog value type，assignment、function input 和 queue element copy 都按值执行。生产代码不得对它们使用 streaming operator、packed cast、`$bits` 布局假设或直接 wire/image serialization；需要硬件编码的字段仍由现有 codec 显式逐字段生成。
+
+## 目标工具链适配
+
+`sim/Makefile` 的公共 `VCS_FLAGS` 增加且只增加：
+
+```make
+# Work around a VCS W-2024.09-SP1 class-codegen miscompile; not an RTL requirement.
+VCS_FLAGS := ... -debug_access+class
+```
+
+该 flag 同时覆盖 core 与 host_mem target，使两者编译相同的 RDMA class graph。它只针对 W-2024.09-SP1 的已复现 codegen miscompile，不改变 snapshot schema、功能要求或外部 host_mem/UVM/VCS 源码，也不授权 `-O0`、`-debug_access+all`、`-kdb` 或其他 debug/code-shape workaround。
 
 ## 构造、复制与所有权
 
@@ -163,9 +180,13 @@ binding.interrupt_vectors.push_back(vector);
 
 该测试只观察公开值语义，不添加 production test-only API，也不测试 mock 行为。
 
-### Native-crash RED
+### Compiler-miscompile RED/GREEN
 
-当前 packed-value Task 1 的 `rdma_control_plane_test` 在 compile/link 后稳定 native SIGSEGV，作为 representation RED。只删除三个 typedef 的 `packed` keyword 后，测试必须连续两次到达 8000 ps 且 UVM warning/error/fatal 为 0/0/0；不得同时修改 codec、mock CMQ、测试顺序或对象名字来影响 VCS code shape。
+packed、unpacked、primitive flatten 和 `-O0` candidates 都在 compile/link 后于 `[RNTST]` 之后 native SIGSEGV，证明 unpacked representation alone 不是 crash fix。保持 unpacked schema并只增加 `-debug_access+class` 后，`rdma_control_plane_test` 必须连续两次到达 8000 ps且 UVM warning/error/fatal 为 0/0/0。不得修改 codec、mock CMQ、测试顺序、对象名字、timeout 或 fork structure 来影响 VCS code shape。
+
+### Fixed-authority PASID RED/GREEN
+
+owned snapshot test 在 lock 释放前更新第一次 request snapshot。若 `first_pasid` 使用与 binding authority 不同的固定 literal，最终 flag 下会正常运行到 `RDMA_SC_DMA_TRANSLATION` RED，而不是 native crash。测试必须用 `first_pasid = binding.queue_dma.pasid` 保持第一次 authority 有效，同时保留 request length/access mutation 和 CMQ 进入后的 `dma_context.pasid = 20'h2b222` mutation；这样 GREEN 仍证明 detached post-lock snapshot 不受 caller 后续修改影响。
 
 ### 回归
 
@@ -180,15 +201,16 @@ binding.interrupt_vectors.push_back(vector);
 - `rdma_doorbell_scheduler_test`
 - `rdma_host_mem_adapter_test`，使用 `/home/ubuntu/workspace/host_mem`
 
-每项必须为 UVM 0 warning / 0 error / 0 fatal。静态检查还必须证明三个 value snapshot type 没有残留 object allocation/copy/null 操作。
+每项必须 compile/link/run 成功并为 UVM 0 warning / 0 error / 0 fatal；最终 `rdma_control_plane_test` 总计运行两次。静态检查还必须证明三个 value snapshot type 没有残留 object allocation/copy/null 操作。
 
-静态检查还必须证明三个 typedef 是 `typedef struct {`，而不是 `typedef struct packed`，并且仓库中没有为该问题残留 `DBG_CP`、对象名 guard、typed-only return 或 xtr_v1 codec diff。
+静态检查还必须证明三个 typedef 是 `typedef struct {`，而不是 `typedef struct packed`；`VCS_FLAGS` 恰好含 `-debug_access+class` 而不含禁止 flags；仓库中没有为该问题残留 `DBG_CP`、对象名 guard、typed-only return 或 xtr_v1 codec diff。提交范围为原 Task 1 的 17 个 tracked files、`sim/Makefile` 和本次纠正的两份 docs，共 20 个 tracked files。
 
 ## 非目标
 
 - 不通过拆分或弱化 control-plane test 隐藏模拟器问题。
 - 不保留 caller-owned、lazy-init 或 builder-managed child class。
-- 不修改 VCS、UVM 或任何外部 VIP/host_mem 源码。
+- 不修改 VCS、UVM 或任何外部 VIP/host_mem 源码；`-debug_access+class` 是 repo-local build workaround，不是功能 RTL requirement。
 - 不用测试对象名字、额外控制流、codec/string formatting 改写或 test-order change 规避 VCS 崩溃。
+- 不使用 primitive flatten、direct-new snapshot、`-O0`、`-debug_access+all`、`-kdb`、direct-call probe、diagnostic marker 或 fork/timeout 改写。
 - 不为 snapshot 恢复 packed layout；后续若确有硬件 image 需求，必须通过独立 codec 明确编码。
 - 不改变 Task 1 之外的 queue lifecycle policy、executor 或 recovery 行为。

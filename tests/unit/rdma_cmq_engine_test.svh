@@ -2963,6 +2963,7 @@ class rdma_cmq_engine_test extends uvm_test;
     rdma_binding_state_e binding_state
   );
     rdma_function_binding binding;
+    rdma_interrupt_vector_binding vector;
 
     binding = rdma_function_binding::type_id::create(name);
     binding.function_uid = TEST_FUNCTION_UID;
@@ -2978,7 +2979,26 @@ class rdma_cmq_engine_test extends uvm_test;
     binding.notify_size = 64'h2000;
     binding.state = binding_state;
     binding.owner_h = binding.make_handle();
-    binding.dma_domain_valid = 1'b1;
+    binding.queue_dma.requester_bdf = binding.pcie.bdf;
+    binding.queue_dma.pasid_valid = 1'b1;
+    binding.queue_dma.pasid = 20'h34567;
+    binding.queue_dma.dma_domain_valid = 1'b1;
+    binding.queue_dma.dma_domain_id = 32'h1122_3344;
+    binding.queue_caps.min_cq_depth = 16;
+    binding.queue_caps.max_cq_depth = 32768;
+    binding.queue_caps.min_srq_depth = 16;
+    binding.queue_caps.max_srq_depth = 32768;
+    binding.queue_caps.max_ceq_depth = 4096;
+    binding.queue_caps.max_aeq_depth = 4096;
+    binding.queue_caps.max_wq_sge = 8;
+    binding.queue_caps.max_queue_ring_bytes = 32'h0020_0000;
+    binding.queue_caps.max_sgb_bytes = 32'h0040_0000;
+    vector = '{default:'0};
+    vector.function_local_vector = 3;
+    vector.hardware_eq_vector = 17;
+    vector.msix_table_index = 5;
+    vector.enabled = 1'b1;
+    binding.interrupt_vectors.push_back(vector);
     binding.pcie.mse = 1'b1;
     binding.pcie.bme = 1'b1;
     binding.notify_valid = 1'b1;
@@ -4153,6 +4173,8 @@ class rdma_cmq_engine_test extends uvm_test;
     scheduler = rdma_doorbell_scheduler::type_id::create("pasid_scheduler");
     profile = rdma_cmq_test_profile::type_id::create("pasid_profile");
     binding = make_binding("pasid_binding", RDMA_BIND_PREPARED);
+    binding.queue_dma.pasid_valid = 1'b0;
+    binding.queue_dma.pasid = '0;
     cmq = make_cmq("pasid_cmq", binding);
     engine.prepare(binding, cmq, 1'b0, 20'hfffff, mem, scheduler,
                    profile, runtime_desc, status);
@@ -4593,6 +4615,7 @@ class rdma_cmq_engine_test extends uvm_test;
 
     candidate = make_binding("bdf_candidate", RDMA_BIND_ACTIVE);
     candidate.pcie.bdf.bus++;
+    candidate.queue_dma.requester_bdf = candidate.pcie.bdf;
     engine.activate(candidate, status);
     expect_status("ACTIVATE_BDF", status, RDMA_SC_DMA_TRANSLATION);
 

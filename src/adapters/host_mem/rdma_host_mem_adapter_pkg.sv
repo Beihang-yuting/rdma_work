@@ -224,6 +224,8 @@ package rdma_host_mem_adapter_pkg;
       candidate.requester_bdf = requester_bdf;
       candidate.pasid_valid = pasid_valid;
       candidate.pasid = pasid;
+      candidate.dma_domain_valid = dma_domain_valid;
+      candidate.dma_domain_id = dma_domain_id;
       candidate.backing_addr = backing_addr;
       candidate.iova = iova;
       candidate.size = size;
@@ -344,6 +346,8 @@ package rdma_host_mem_adapter_pkg;
              candidate.requester_bdf == authority.requester_bdf &&
              candidate.pasid_valid == authority.pasid_valid &&
              candidate.pasid == authority.pasid &&
+             candidate.dma_domain_valid == authority.dma_domain_valid &&
+             candidate.dma_domain_id == authority.dma_domain_id &&
              candidate.backing_addr == authority.backing_addr &&
              candidate.iova == authority.iova &&
              candidate.size == authority.size &&
@@ -585,6 +589,8 @@ package rdma_host_mem_adapter_pkg;
       allocated_mapping.requester_bdf = request_context.requester_bdf;
       allocated_mapping.pasid_valid = request_context.pasid_valid;
       allocated_mapping.pasid = request_context.pasid;
+      allocated_mapping.dma_domain_valid = request_context.dma_domain_valid;
+      allocated_mapping.dma_domain_id = request_context.dma_domain_id;
       allocated_mapping.backing_addr.value = backing_address;
       allocated_mapping.iova.value = selected_iova;
       allocated_mapping.size = size;

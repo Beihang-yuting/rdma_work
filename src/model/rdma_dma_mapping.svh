@@ -5,6 +5,8 @@ class rdma_dma_mapping extends uvm_object;
   rdma_bdf_t requester_bdf;
   bit pasid_valid;
   bit [19:0] pasid;
+  bit dma_domain_valid;
+  int unsigned dma_domain_id;
   rdma_backing_addr_t backing_addr;
   rdma_iova_t iova;
   longint unsigned size;
@@ -19,6 +21,8 @@ class rdma_dma_mapping extends uvm_object;
     requester_bdf = '0;
     pasid_valid = 1'b0;
     pasid = '0;
+    dma_domain_valid = 1'b0;
+    dma_domain_id = '0;
     backing_addr = '0;
     iova = '0;
     size = '0;
@@ -81,6 +85,8 @@ class rdma_dma_mapping extends uvm_object;
     requester_bdf = rhs_mapping.requester_bdf;
     pasid_valid = rhs_mapping.pasid_valid;
     pasid = rhs_mapping.pasid;
+    dma_domain_valid = rhs_mapping.dma_domain_valid;
+    dma_domain_id = rhs_mapping.dma_domain_id;
     backing_addr = rhs_mapping.backing_addr;
     iova = rhs_mapping.iova;
     size = rhs_mapping.size;
@@ -100,6 +106,10 @@ class rdma_dma_mapping extends uvm_object;
   function rdma_status check_access(
     rdma_function_handle requested_function,
     rdma_bdf_t requested_requester_bdf,
+    bit requested_pasid_valid,
+    bit [19:0] requested_pasid,
+    bit requested_dma_domain_valid,
+    int unsigned requested_dma_domain_id,
     rdma_iova_t first_iova,
     longint unsigned length,
     rdma_dma_direction_e requested_direction,
@@ -131,6 +141,14 @@ class rdma_dma_mapping extends uvm_object;
     if (requested_requester_bdf != requester_bdf)
       return rdma_status::make(RDMA_SC_DMA_TRANSLATION,
                                "requester BDF does not match mapping");
+    if (requested_pasid_valid != pasid_valid ||
+        requested_pasid != pasid)
+      return rdma_status::make(RDMA_SC_DMA_TRANSLATION,
+                               "requester PASID does not match mapping");
+    if (requested_dma_domain_valid != dma_domain_valid ||
+        requested_dma_domain_id != dma_domain_id)
+      return rdma_status::make(RDMA_SC_DMA_TRANSLATION,
+                               "DMA domain does not match mapping");
     if (length == 0)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "DMA access length is zero");

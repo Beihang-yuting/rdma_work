@@ -1237,9 +1237,17 @@ class rdma_cmq_engine extends uvm_object;
     request_context.function_h = binding.make_handle();
     if (request_context.function_h == null)
       return invalid_state("CMQ DMA Function handle construction failed");
-    request_context.requester_bdf = binding.pcie.bdf;
-    request_context.pasid_valid = pasid_valid;
-    request_context.pasid = pasid_valid ? pasid : '0;
+    if (pasid_valid != binding.queue_dma.pasid_valid ||
+        (pasid_valid ? pasid : '0) != binding.queue_dma.pasid)
+      return rdma_status::make(
+        RDMA_SC_DMA_TRANSLATION,
+        "CMQ PASID does not match Function queue DMA authority"
+      );
+    request_context.requester_bdf = binding.queue_dma.requester_bdf;
+    request_context.pasid_valid = binding.queue_dma.pasid_valid;
+    request_context.pasid = binding.queue_dma.pasid;
+    request_context.dma_domain_valid = binding.queue_dma.dma_domain_valid;
+    request_context.dma_domain_id = binding.queue_dma.dma_domain_id;
     request_context.owner_h = rdma_clone_handle_value(
       cmq.handle, "CMQ DMA owner"
     );
@@ -1301,6 +1309,16 @@ class rdma_cmq_engine extends uvm_object;
       return rdma_status::make(
         RDMA_SC_DMA_PERMISSION,
         "CMQ mapping PASID authority does not match request"
+      );
+    if (mapping.dma_domain_valid != request_context.dma_domain_valid)
+      return rdma_status::make(
+        RDMA_SC_DMA_TRANSLATION,
+        "CMQ mapping DMA-domain-valid authority does not match request"
+      );
+    if (mapping.dma_domain_id != request_context.dma_domain_id)
+      return rdma_status::make(
+        RDMA_SC_DMA_TRANSLATION,
+        "CMQ mapping DMA domain authority does not match request"
       );
     if (mapping.owner_h == null || request_context.owner_h == null ||
         !same_handle(mapping.owner_h, request_context.owner_h))
@@ -1455,6 +1473,8 @@ class rdma_cmq_engine extends uvm_object;
            lhs.requester_bdf == rhs.requester_bdf &&
            lhs.pasid_valid == rhs.pasid_valid &&
            lhs.pasid == rhs.pasid &&
+           lhs.dma_domain_valid == rhs.dma_domain_valid &&
+           lhs.dma_domain_id == rhs.dma_domain_id &&
            lhs.backing_addr.value == rhs.backing_addr.value &&
            lhs.iova.value == rhs.iova.value &&
            lhs.size == rhs.size &&
@@ -3504,6 +3524,8 @@ class rdma_cmq_engine extends uvm_object;
     saved_value.requester_bdf = source.requester_bdf;
     saved_value.pasid_valid = source.pasid_valid;
     saved_value.pasid = source.pasid;
+    saved_value.dma_domain_valid = source.dma_domain_valid;
+    saved_value.dma_domain_id = source.dma_domain_id;
     saved_value.backing_addr = source.backing_addr;
     saved_value.iova = source.iova;
     saved_value.size = source.size;

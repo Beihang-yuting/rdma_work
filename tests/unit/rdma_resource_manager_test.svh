@@ -1571,12 +1571,13 @@ class rdma_resource_manager_test extends uvm_test;
     int unsigned generation = 32'd7
   );
     rdma_function_binding binding;
+    rdma_interrupt_vector_binding vector;
 
     binding = rdma_function_binding::type_id::create(name);
     binding.function_uid = function_uid;
     binding.generation = generation;
     binding.global_function_id = global_function_id;
-    binding.rdma_vf_id = 32'h9000_0202;
+    binding.rdma_vf_id = 8'h22;
     binding.pfvf_id = 32'h9000_0303;
     binding.pcie.vf_index = 32'h8000_8080;
     binding.pcie.bdf = '{segment:16'h1001, bus:8'h20, device:5'h03,
@@ -1591,7 +1592,26 @@ class rdma_resource_manager_test extends uvm_test;
     binding.notify_size = 64'h2000;
     binding.state = RDMA_BIND_ACTIVE;
     binding.owner_h = binding.make_handle();
-    binding.dma_domain_valid = 1'b1;
+    binding.queue_dma.requester_bdf = binding.pcie.bdf;
+    binding.queue_dma.pasid_valid = 1'b1;
+    binding.queue_dma.pasid = 20'he2251;
+    binding.queue_dma.dma_domain_valid = 1'b1;
+    binding.queue_dma.dma_domain_id = 32'h1122_3344;
+    binding.queue_caps.min_cq_depth = 16;
+    binding.queue_caps.max_cq_depth = 32768;
+    binding.queue_caps.min_srq_depth = 16;
+    binding.queue_caps.max_srq_depth = 32768;
+    binding.queue_caps.max_ceq_depth = 4096;
+    binding.queue_caps.max_aeq_depth = 4096;
+    binding.queue_caps.max_wq_sge = 8;
+    binding.queue_caps.max_queue_ring_bytes = 32'h0020_0000;
+    binding.queue_caps.max_sgb_bytes = 32'h0040_0000;
+    vector = '{default:'0};
+    vector.function_local_vector = 3;
+    vector.hardware_eq_vector = 17;
+    vector.msix_table_index = 5;
+    vector.enabled = 1'b1;
+    binding.interrupt_vectors.push_back(vector);
     binding.pcie.mse = 1'b1;
     binding.pcie.bme = 1'b1;
     binding.notify_valid = 1'b1;
@@ -2907,6 +2927,7 @@ class rdma_resource_manager_test extends uvm_test;
     rdma_rm_schema_binding composite_function_binding;
     rdma_rm_schema_pcie composite_function_pcie;
     rdma_rm_schema_bar composite_function_bars[6];
+    rdma_interrupt_vector_binding composite_function_vector;
     rdma_rm_schema_function_handle composite_function_owner;
     rdma_function_binding allocated_error_binding;
     rdma_function_binding recovery_binding;
@@ -4252,11 +4273,9 @@ class rdma_resource_manager_test extends uvm_test;
     composite_function_binding.notify_table_index = 32'hc0a1_0202;
     composite_function_binding.host_id = 32'hc0a1_0303;
     composite_function_binding.pfvf_id = 32'hc0a1_0404;
-    composite_function_binding.rdma_vf_id = 32'hc0a1_0505;
+    composite_function_binding.rdma_vf_id = 8'h05;
     composite_function_binding.global_function_id = 32'hc0a1_0606;
     composite_function_binding.vsi_id = 32'hc0a1_0707;
-    composite_function_binding.dma_domain_id = 32'hc0a1_0808;
-    composite_function_binding.dma_domain_valid = 1'b1;
     composite_function_binding.state = RDMA_BIND_ACTIVE;
     composite_function_binding.generation = 32'hc0a1_0909;
     composite_function_binding.notify_valid = 1'b1;
@@ -4272,6 +4291,30 @@ class rdma_resource_manager_test extends uvm_test;
     composite_function_pcie.vf_index = 32'hc0a1_0a0a;
     composite_function_pcie.mse = 1'b1;
     composite_function_pcie.bme = 1'b1;
+    composite_function_binding.queue_dma.requester_bdf =
+      composite_function_pcie.bdf;
+    composite_function_binding.queue_dma.pasid_valid = 1'b1;
+    composite_function_binding.queue_dma.pasid = 20'hc0a18;
+    composite_function_binding.queue_dma.dma_domain_id = 32'hc0a1_0808;
+    composite_function_binding.queue_dma.dma_domain_valid = 1'b1;
+    composite_function_binding.queue_caps.min_cq_depth = 16;
+    composite_function_binding.queue_caps.max_cq_depth = 32768;
+    composite_function_binding.queue_caps.min_srq_depth = 16;
+    composite_function_binding.queue_caps.max_srq_depth = 32768;
+    composite_function_binding.queue_caps.max_ceq_depth = 4096;
+    composite_function_binding.queue_caps.max_aeq_depth = 4096;
+    composite_function_binding.queue_caps.max_wq_sge = 8;
+    composite_function_binding.queue_caps.max_queue_ring_bytes =
+      32'h0020_0000;
+    composite_function_binding.queue_caps.max_sgb_bytes = 32'h0040_0000;
+    composite_function_vector = '{default:'0};
+    composite_function_vector.function_local_vector = 3;
+    composite_function_vector.hardware_eq_vector = 17;
+    composite_function_vector.msix_table_index = 5;
+    composite_function_vector.enabled = 1'b1;
+    composite_function_binding.interrupt_vectors.push_back(
+      composite_function_vector
+    );
     foreach (composite_function_bars[i]) begin
       composite_function_bars[i] = new(
         $sformatf("composite_function_bar_%0d", i)
@@ -4317,11 +4360,12 @@ class rdma_resource_manager_test extends uvm_test;
         composite_function_binding.notify_table_index != 32'hc0a1_0202 ||
         composite_function_binding.host_id != 32'hc0a1_0303 ||
         composite_function_binding.pfvf_id != 32'hc0a1_0404 ||
-        composite_function_binding.rdma_vf_id != 32'hc0a1_0505 ||
+        composite_function_binding.rdma_vf_id != 8'h05 ||
         composite_function_binding.global_function_id != 32'hc0a1_0606 ||
         composite_function_binding.vsi_id != 32'hc0a1_0707 ||
-        composite_function_binding.dma_domain_id != 32'hc0a1_0808 ||
-        !composite_function_binding.dma_domain_valid ||
+        composite_function_binding.queue_dma.dma_domain_id !=
+          32'hc0a1_0808 ||
+        !composite_function_binding.queue_dma.dma_domain_valid ||
         composite_function_binding.state != RDMA_BIND_ACTIVE ||
         composite_function_binding.generation != 32'hc0a1_0909 ||
         !composite_function_binding.notify_valid ||
@@ -4430,10 +4474,16 @@ class rdma_resource_manager_test extends uvm_test;
           composite_function_binding.global_function_id ||
         composite_function_lookup.binding.vsi_id !=
           composite_function_binding.vsi_id ||
-        composite_function_lookup.binding.dma_domain_id !=
-          composite_function_binding.dma_domain_id ||
-        composite_function_lookup.binding.dma_domain_valid !=
-          composite_function_binding.dma_domain_valid ||
+        composite_function_lookup.binding.queue_dma.dma_domain_id !=
+          composite_function_binding.queue_dma.dma_domain_id ||
+        composite_function_lookup.binding.queue_dma.dma_domain_valid !=
+          composite_function_binding.queue_dma.dma_domain_valid ||
+        composite_function_lookup.binding.queue_caps.max_queue_ring_bytes !=
+          composite_function_binding.queue_caps.max_queue_ring_bytes ||
+        composite_function_lookup.binding.interrupt_vectors.size() != 1 ||
+        composite_function_lookup.binding.interrupt_vectors[0].
+          function_local_vector !=
+          composite_function_vector.function_local_vector ||
         composite_function_lookup.binding.state !=
           composite_function_binding.state ||
         composite_function_lookup.binding.generation !=
@@ -5898,7 +5948,7 @@ class rdma_resource_manager_test extends uvm_test;
       "snapshot_binding", 64'h5a5a_0000_0000_0001,
       32'h5a5a_0101, 32'd11
     );
-    snapshot_binding.rdma_vf_id = 32'h5a5a_0202;
+    snapshot_binding.rdma_vf_id = 8'h22;
     snapshot_binding.vsi_id = 32'h5a5a_0303;
     snapshot_binding.pfvf_id = 32'h5a5a_0404;
     snapshot_bdf = snapshot_binding.pcie.bdf;
@@ -5907,13 +5957,13 @@ class rdma_resource_manager_test extends uvm_test;
                                               snapshot_function),
                   RDMA_SC_OK);
     if (snapshot_function == null ||
-        snapshot_function.rdma_vf_id != 32'h5a5a_0202 ||
+        snapshot_function.rdma_vf_id != 8'h22 ||
         snapshot_function.vsi_id != 32'h5a5a_0303 ||
         snapshot_function.pfvf_id != 32'h5a5a_0404)
       `uvm_error("SNAPSHOT_FUNCTION_LOGICAL_IDS",
                  "created Function omitted trusted logical identity fields")
     if (snapshot_function == null || snapshot_function.binding == null ||
-        snapshot_function.binding.rdma_vf_id != 32'h5a5a_0202 ||
+        snapshot_function.binding.rdma_vf_id != 8'h22 ||
         snapshot_function.binding.vsi_id != 32'h5a5a_0303 ||
         snapshot_function.binding.pfvf_id != 32'h5a5a_0404)
       `uvm_error("SNAPSHOT_FUNCTION_NESTED_IDS",
@@ -5965,7 +6015,7 @@ class rdma_resource_manager_test extends uvm_test;
                  "Function lookup returned the wrong resource type")
     end
     else begin
-      if (snapshot_function_lookup.rdma_vf_id != 32'h5a5a_0202 ||
+      if (snapshot_function_lookup.rdma_vf_id != 8'h22 ||
           snapshot_function_lookup.vsi_id != 32'h5a5a_0303 ||
           snapshot_function_lookup.pfvf_id != 32'h5a5a_0404)
         `uvm_error("SNAPSHOT_FUNCTION_LOGICAL_IDS_LOOKUP",
@@ -5975,7 +6025,7 @@ class rdma_resource_manager_test extends uvm_test;
             64'h5a5a_0000_0000_0001 ||
           snapshot_function_lookup.binding.global_function_id !=
             32'h5a5a_0101 ||
-          snapshot_function_lookup.binding.rdma_vf_id != 32'h5a5a_0202 ||
+          snapshot_function_lookup.binding.rdma_vf_id != 8'h22 ||
           snapshot_function_lookup.binding.vsi_id != 32'h5a5a_0303 ||
           snapshot_function_lookup.binding.pfvf_id != 32'h5a5a_0404 ||
           snapshot_function_lookup.binding.host_id != 0 ||

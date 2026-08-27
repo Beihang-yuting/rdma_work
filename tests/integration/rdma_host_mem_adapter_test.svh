@@ -121,12 +121,13 @@ class rdma_host_mem_adapter_test extends uvm_test;
 
   function automatic rdma_function_binding make_active_binding(string name);
     rdma_function_binding binding;
+    rdma_interrupt_vector_binding vector;
 
     binding = rdma_function_binding::type_id::create(name);
     binding.function_uid = 64'hca12_0000_0000_0001;
     binding.generation = 32'd92;
     binding.global_function_id = 32'hca12_0101;
-    binding.rdma_vf_id = 32'hca12_0202;
+    binding.rdma_vf_id = 8'h22;
     binding.pfvf_id = 32'hca12_0303;
     binding.pcie.vf_index = 32'hca12_0404;
     binding.pcie.bdf = '{segment:16'h1001, bus:8'h20, device:5'h03,
@@ -141,7 +142,26 @@ class rdma_host_mem_adapter_test extends uvm_test;
     binding.notify_size = 64'h2000;
     binding.state = RDMA_BIND_ACTIVE;
     binding.owner_h = binding.make_handle();
-    binding.dma_domain_valid = 1'b1;
+    binding.queue_dma.requester_bdf = binding.pcie.bdf;
+    binding.queue_dma.pasid_valid = 1'b1;
+    binding.queue_dma.pasid = 20'h34567;
+    binding.queue_dma.dma_domain_valid = 1'b1;
+    binding.queue_dma.dma_domain_id = 32'h1122_3344;
+    binding.queue_caps.min_cq_depth = 16;
+    binding.queue_caps.max_cq_depth = 32768;
+    binding.queue_caps.min_srq_depth = 16;
+    binding.queue_caps.max_srq_depth = 32768;
+    binding.queue_caps.max_ceq_depth = 4096;
+    binding.queue_caps.max_aeq_depth = 4096;
+    binding.queue_caps.max_wq_sge = 8;
+    binding.queue_caps.max_queue_ring_bytes = 32'h0020_0000;
+    binding.queue_caps.max_sgb_bytes = 32'h0040_0000;
+    vector = '{default:'0};
+    vector.function_local_vector = 3;
+    vector.hardware_eq_vector = 17;
+    vector.msix_table_index = 5;
+    vector.enabled = 1'b1;
+    binding.interrupt_vectors.push_back(vector);
     binding.pcie.mse = 1'b1;
     binding.pcie.bme = 1'b1;
     binding.notify_valid = 1'b1;
@@ -201,8 +221,13 @@ class rdma_host_mem_adapter_test extends uvm_test;
     identity_binding = make_active_binding("manager_identity_binding");
     identity_context = make_dma_context(
       "manager_identity_context", identity_binding.make_handle(),
-      identity_binding.pcie.bdf
+      identity_binding.queue_dma.requester_bdf,
+      identity_binding.queue_dma.pasid_valid,
+      identity_binding.queue_dma.pasid
     );
+    identity_context.dma_domain_valid =
+      identity_binding.queue_dma.dma_domain_valid;
+    identity_context.dma_domain_id = identity_binding.queue_dma.dma_domain_id;
 
     expect_status("MANAGER_IDENTITY_PD_CREATE",
                   identity_rm.create_pd(identity_binding, identity_pd),
@@ -446,6 +471,8 @@ class rdma_host_mem_adapter_test extends uvm_test;
       '{segment:16'h0000, bus:8'h53, device:5'h02, function_num:3'h5};
     request_context.pasid_valid = 1'b1;
     request_context.pasid = 20'habcde;
+    request_context.dma_domain_valid = 1'b1;
+    request_context.dma_domain_id = 32'h1122_3344;
     request_context.owner_h = rdma_handle::type_id::create("cmq_owner");
     request_context.owner_h.kind = RDMA_RESOURCE_CMQ;
     request_context.owner_h.function_uid =
@@ -731,7 +758,10 @@ class rdma_host_mem_adapter_test extends uvm_test;
         !mapping.function_h.same_instance(request_context.function_h) ||
         mapping.requester_bdf != request_context.requester_bdf ||
         mapping.pasid_valid != request_context.pasid_valid ||
-        mapping.pasid != request_context.pasid || mapping.owner_h == null ||
+        mapping.pasid != request_context.pasid ||
+        mapping.dma_domain_valid != request_context.dma_domain_valid ||
+        mapping.dma_domain_id != request_context.dma_domain_id ||
+        mapping.owner_h == null ||
         mapping.owner_h == request_context.owner_h ||
         !mapping.owner_h.same_instance(request_context.owner_h))
       `uvm_error("REQUEST_AUTHORITY_CLONE",
@@ -744,12 +774,17 @@ class rdma_host_mem_adapter_test extends uvm_test;
     request_context.requester_bdf.bus = 8'hff;
     request_context.pasid_valid = 1'b0;
     request_context.pasid = 20'h12345;
+    request_context.dma_domain_valid = 1'b0;
+    request_context.dma_domain_id = 32'hffff_ffff;
     request_context.owner_h.object_id = 32'hffff_ffff;
     if (mapping.function_h.generation !=
           request_context_snapshot.function_h.generation ||
         mapping.requester_bdf != request_context_snapshot.requester_bdf ||
         mapping.pasid_valid != request_context_snapshot.pasid_valid ||
         mapping.pasid != request_context_snapshot.pasid ||
+        mapping.dma_domain_valid !=
+          request_context_snapshot.dma_domain_valid ||
+        mapping.dma_domain_id != request_context_snapshot.dma_domain_id ||
         mapping.owner_h == null ||
         mapping.owner_h.object_id != request_context_snapshot.owner_h.object_id ||
         valid_clone.function_h.generation !=
@@ -757,6 +792,9 @@ class rdma_host_mem_adapter_test extends uvm_test;
         valid_clone.requester_bdf != request_context_snapshot.requester_bdf ||
         valid_clone.pasid_valid != request_context_snapshot.pasid_valid ||
         valid_clone.pasid != request_context_snapshot.pasid ||
+        valid_clone.dma_domain_valid !=
+          request_context_snapshot.dma_domain_valid ||
+        valid_clone.dma_domain_id != request_context_snapshot.dma_domain_id ||
         valid_clone.owner_h == null ||
         valid_clone.owner_h.object_id !=
           request_context_snapshot.owner_h.object_id)

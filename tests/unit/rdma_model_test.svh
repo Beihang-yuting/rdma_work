@@ -23,12 +23,13 @@ class rdma_model_test extends uvm_test;
 
   function automatic rdma_function_binding make_valid_binding(string name);
     rdma_function_binding binding;
+    rdma_interrupt_vector_binding vector;
 
     binding = rdma_function_binding::type_id::create(name);
     binding.function_uid = 64'h0123_4567_89ab_cdef;
     binding.generation = 32'd7;
     binding.global_function_id = 32'h9000_0101;
-    binding.rdma_vf_id = 32'h9000_0202;
+    binding.rdma_vf_id = 8'h22;
     binding.vsi_id = 32'h9000_0303;
     binding.notify_table_sel = 32'h9000_0404;
     binding.notify_table_index = 32'h9000_0505;
@@ -45,13 +46,33 @@ class rdma_model_test extends uvm_test;
     binding.notify_bar_id = 3'd0;
     binding.notify_base.value = 64'h0000_0000_8000_2000;
     binding.notify_size = 64'h2000;
+    binding.queue_dma.requester_bdf = binding.pcie.bdf;
+    binding.queue_dma.pasid_valid = 1'b1;
+    binding.queue_dma.pasid = 20'habcde;
+    binding.queue_dma.dma_domain_valid = 1'b1;
+    binding.queue_dma.dma_domain_id = 32'h1122_3344;
+    binding.queue_caps.min_cq_depth = 16;
+    binding.queue_caps.max_cq_depth = 32768;
+    binding.queue_caps.min_srq_depth = 16;
+    binding.queue_caps.max_srq_depth = 32768;
+    binding.queue_caps.max_ceq_depth = 4096;
+    binding.queue_caps.max_aeq_depth = 4096;
+    binding.queue_caps.max_wq_sge = 8;
+    binding.queue_caps.max_queue_ring_bytes = 32'h0020_0000;
+    binding.queue_caps.max_sgb_bytes = 32'h0040_0000;
+    vector = '{default:'0};
+    vector.function_local_vector = 3;
+    vector.hardware_eq_vector = 17;
+    vector.msix_table_index = 5;
+    vector.enabled = 1'b1;
+    binding.interrupt_vectors.push_back(vector);
     binding.state = RDMA_BIND_BOUND;
     return binding;
   endfunction
 
   function automatic void enable_active_binding(rdma_function_binding binding);
     binding.state = RDMA_BIND_ACTIVE;
-    binding.dma_domain_valid = 1'b1;
+    binding.queue_dma.dma_domain_valid = 1'b1;
     binding.pcie.mse = 1'b1;
     binding.pcie.bme = 1'b1;
     binding.notify_valid = 1'b1;
@@ -74,6 +95,8 @@ class rdma_model_test extends uvm_test;
     mapping.requester_bdf = requester_bdf;
     mapping.pasid_valid = 1'b1;
     mapping.pasid = 20'habcde;
+    mapping.dma_domain_valid = 1'b1;
+    mapping.dma_domain_id = 32'h1122_3344;
     mapping.backing_addr.value = 64'h0000_0000_4000_0000;
     mapping.iova.value = 64'h0000_0001_0000_0000;
     mapping.size = 64'h1000;
@@ -82,6 +105,55 @@ class rdma_model_test extends uvm_test;
                             atomic:1'b0};
     mapping.state = RDMA_MAPPING_ACTIVE;
     return mapping;
+  endfunction
+
+  function automatic rdma_status check_mapping_access(
+    rdma_dma_mapping mapping,
+    rdma_function_handle requested_function,
+    rdma_bdf_t requested_requester_bdf,
+    rdma_iova_t first_iova,
+    longint unsigned length,
+    rdma_dma_direction_e requested_direction,
+    rdma_dma_permission_t requested_permissions
+  );
+    return mapping.check_access(
+      requested_function, requested_requester_bdf,
+      mapping.pasid_valid, mapping.pasid,
+      mapping.dma_domain_valid, mapping.dma_domain_id,
+      first_iova, length, requested_direction, requested_permissions
+    );
+  endfunction
+
+  function automatic void check_binding_snapshot_value_semantics();
+    rdma_function_binding source;
+    rdma_function_binding destination;
+
+    source = make_valid_binding("binding_value_source");
+    destination = make_valid_binding("binding_value_destination");
+
+    source.queue_dma.pasid = 20'h34567;
+    source.queue_dma.dma_domain_id = 32'h1122_3344;
+    source.queue_caps.max_queue_ring_bytes = 64'h0020_0000;
+    source.queue_caps.max_sgb_bytes = 64'h0040_0000;
+    source.interrupt_vectors[0].hardware_eq_vector = 17;
+
+    destination.queue_dma = source.queue_dma;
+    destination.queue_caps = source.queue_caps;
+    destination.interrupt_vectors = source.interrupt_vectors;
+
+    destination.queue_dma.pasid = 20'h54321;
+    destination.queue_dma.dma_domain_id = 32'h5566_7788;
+    destination.queue_caps.max_queue_ring_bytes = 64'h0040_0000;
+    destination.queue_caps.max_sgb_bytes = 64'h0080_0000;
+    destination.interrupt_vectors[0].hardware_eq_vector = 29;
+
+    if (source.queue_dma.pasid != 20'h34567 ||
+        source.queue_dma.dma_domain_id != 32'h1122_3344 ||
+        source.queue_caps.max_queue_ring_bytes != 64'h0020_0000 ||
+        source.queue_caps.max_sgb_bytes != 64'h0040_0000 ||
+        source.interrupt_vectors[0].hardware_eq_vector != 17)
+      `uvm_error("BIND_VALUE_ALIAS",
+                 "assigned binding snapshots alias the source")
   endfunction
 
   task run_phase(uvm_phase phase);
@@ -302,8 +374,8 @@ class rdma_model_test extends uvm_test;
     binding_for_copy.notify_bar_id = 3'd4;
     binding_for_copy.pcie.mse = 1'b1;
     binding_for_copy.pcie.bme = 1'b1;
-    binding_for_copy.dma_domain_id = 32'h8100_0001;
-    binding_for_copy.dma_domain_valid = 1'b1;
+    binding_for_copy.queue_dma.dma_domain_id = 32'h8100_0001;
+    binding_for_copy.queue_dma.dma_domain_valid = 1'b1;
     binding_for_copy.state = RDMA_BIND_QUIESCING;
     binding_for_copy.owner_h = binding_for_copy.make_handle();
     binding_for_copy.notify_valid = 1'b1;
@@ -330,9 +402,10 @@ class rdma_model_test extends uvm_test;
           binding_clone.global_function_id !=
             binding_for_copy.global_function_id ||
           binding_clone.vsi_id != binding_for_copy.vsi_id ||
-          binding_clone.dma_domain_id != binding_for_copy.dma_domain_id ||
-          binding_clone.dma_domain_valid !=
-            binding_for_copy.dma_domain_valid ||
+          binding_clone.queue_dma.dma_domain_id !=
+            binding_for_copy.queue_dma.dma_domain_id ||
+          binding_clone.queue_dma.dma_domain_valid !=
+            binding_for_copy.queue_dma.dma_domain_valid ||
           binding_clone.state != binding_for_copy.state ||
           binding_clone.generation != binding_for_copy.generation ||
           binding_clone.notify_valid != binding_for_copy.notify_valid ||
@@ -457,10 +530,10 @@ class rdma_model_test extends uvm_test;
     expect_status("ACTIVE_OWNER_FUNCTION", active_binding.validate(),
                   RDMA_SC_INVALID_STATE);
     active_binding.owner_h.function_uid--;
-    active_binding.dma_domain_valid = 1'b0;
+    active_binding.queue_dma.dma_domain_valid = 1'b0;
     expect_status("ACTIVE_DMA_DOMAIN", active_binding.validate(),
                   RDMA_SC_INVALID_STATE);
-    active_binding.dma_domain_valid = 1'b1;
+    active_binding.queue_dma.dma_domain_valid = 1'b1;
     active_binding.pcie.mse = 1'b0;
     expect_status("ACTIVE_MSE", active_binding.validate(),
                   RDMA_SC_INVALID_STATE);
@@ -518,6 +591,8 @@ class rdma_model_test extends uvm_test;
           mapping_clone.requester_bdf != mapping.requester_bdf ||
           mapping_clone.pasid_valid != mapping.pasid_valid ||
           mapping_clone.pasid != mapping.pasid ||
+          mapping_clone.dma_domain_valid != mapping.dma_domain_valid ||
+          mapping_clone.dma_domain_id != mapping.dma_domain_id ||
           mapping_clone.backing_addr != mapping.backing_addr ||
           mapping_clone.iova != mapping.iova ||
           mapping_clone.size != mapping.size ||
@@ -557,55 +632,56 @@ class rdma_model_test extends uvm_test;
     atomic_permission = '{device_read:1'b1, device_write:1'b0, atomic:1'b1};
 
     expect_status("DMA_FULL_RANGE",
-                  mapping.check_access(requested_h, requester_bdf,
+                  check_mapping_access(mapping, requested_h, requester_bdf,
                                        request_iova, mapping.size,
                                        RDMA_DMA_BIDIRECTIONAL,
                                        read_write_permission),
                   RDMA_SC_OK);
     request_iova.value = mapping.iova.value + mapping.size - 1'b1;
     expect_status("DMA_LAST_BYTE",
-                  mapping.check_access(requested_h, requester_bdf,
+                  check_mapping_access(mapping, requested_h, requester_bdf,
                                        request_iova, 64'd1,
                                        RDMA_DMA_DEVICE_READ,
                                        read_permission),
                   RDMA_SC_OK);
     request_iova.value = mapping.iova.value + mapping.size;
     expect_status("DMA_END_EXCLUSIVE",
-                  mapping.check_access(requested_h, requester_bdf,
+                  check_mapping_access(mapping, requested_h, requester_bdf,
                                        request_iova, 64'd1,
                                        RDMA_DMA_DEVICE_READ,
                                        read_permission),
                   RDMA_SC_DMA_TRANSLATION);
     request_iova.value = mapping.iova.value - 1'b1;
     expect_status("DMA_BEFORE_START",
-                  mapping.check_access(requested_h, requester_bdf,
+                  check_mapping_access(mapping, requested_h, requester_bdf,
                                        request_iova, 64'd1,
                                        RDMA_DMA_DEVICE_READ,
                                        read_permission),
                   RDMA_SC_DMA_TRANSLATION);
     request_iova.value = mapping.iova.value;
     expect_status("DMA_ZERO_LENGTH",
-                  mapping.check_access(requested_h, requester_bdf,
+                  check_mapping_access(mapping, requested_h, requester_bdf,
                                        request_iova, 64'd0,
                                        RDMA_DMA_DEVICE_READ,
                                        read_permission),
                   RDMA_SC_INVALID_ARGUMENT);
     request_iova.value = 64'hffff_ffff_ffff_fff0;
     expect_status("DMA_REQUEST_OVERFLOW",
-                  mapping.check_access(requested_h, requester_bdf,
+                  check_mapping_access(mapping, requested_h, requester_bdf,
                                        request_iova, 64'h20,
                                        RDMA_DMA_DEVICE_READ,
                                        read_permission),
                   RDMA_SC_DMA_TRANSLATION);
     request_iova = mapping.iova;
     expect_status("DMA_NULL_REQUEST_HANDLE",
-                  mapping.check_access(null, requester_bdf, request_iova,
+                  check_mapping_access(mapping, null, requester_bdf,
+                                       request_iova,
                                        64'd1, RDMA_DMA_DEVICE_READ,
                                        read_permission),
                   RDMA_SC_INVALID_ARGUMENT);
     mapping.function_h = null;
     expect_status("DMA_NULL_MAPPING_HANDLE",
-                  mapping.check_access(requested_h, requester_bdf,
+                  check_mapping_access(mapping, requested_h, requester_bdf,
                                        request_iova, 64'd1,
                                        RDMA_DMA_DEVICE_READ,
                                        read_permission),
@@ -613,7 +689,7 @@ class rdma_model_test extends uvm_test;
     mapping.function_h = function_h;
     requested_h.generation++;
     expect_status("DMA_STALE_HANDLE",
-                  mapping.check_access(requested_h, requester_bdf,
+                  check_mapping_access(mapping, requested_h, requester_bdf,
                                        request_iova, 64'd1,
                                        RDMA_DMA_DEVICE_READ,
                                        read_permission),
@@ -622,15 +698,16 @@ class rdma_model_test extends uvm_test;
     wrong_h = binding.make_handle();
     wrong_h.function_uid++;
     expect_status("DMA_WRONG_FUNCTION",
-                  mapping.check_access(wrong_h, requester_bdf, request_iova,
+                  check_mapping_access(mapping, wrong_h, requester_bdf,
+                                       request_iova,
                                        64'd1, RDMA_DMA_DEVICE_READ,
                                        read_permission),
                   RDMA_SC_DMA_TRANSLATION);
     wrong_h = binding.make_handle();
     wrong_h.function_uid++;
     wrong_h.generation++;
-    wrong_function_status = mapping.check_access(
-      wrong_h, requester_bdf, request_iova, 64'd1,
+    wrong_function_status = check_mapping_access(
+      mapping, wrong_h, requester_bdf, request_iova, 64'd1,
       RDMA_DMA_DEVICE_READ, read_permission
     );
     expect_status("DMA_WRONG_FUNCTION_AND_GENERATION",
@@ -642,7 +719,7 @@ class rdma_model_test extends uvm_test;
                  "unrelated function was misdiagnosed as stale")
     requester_bdf.function_num++;
     expect_status("DMA_WRONG_REQUESTER",
-                  mapping.check_access(requested_h, requester_bdf,
+                  check_mapping_access(mapping, requested_h, requester_bdf,
                                        request_iova, 64'd1,
                                        RDMA_DMA_DEVICE_READ,
                                        read_permission),
@@ -650,7 +727,7 @@ class rdma_model_test extends uvm_test;
     requester_bdf = binding.pcie.bdf;
     mapping.state = RDMA_MAPPING_FROZEN;
     expect_status("DMA_STATE",
-                  mapping.check_access(requested_h, requester_bdf,
+                  check_mapping_access(mapping, requested_h, requester_bdf,
                                        request_iova, 64'd1,
                                        RDMA_DMA_DEVICE_READ,
                                        read_permission),
@@ -658,31 +735,31 @@ class rdma_model_test extends uvm_test;
     mapping.state = RDMA_MAPPING_ACTIVE;
     mapping.direction = RDMA_DMA_DEVICE_READ;
     expect_status("DMA_DIRECTION_OK",
-                  mapping.check_access(requested_h, requester_bdf,
+                  check_mapping_access(mapping, requested_h, requester_bdf,
                                        request_iova, 64'd1,
                                        RDMA_DMA_DEVICE_READ,
                                        read_permission),
                   RDMA_SC_OK);
     expect_status("DMA_DIRECTION_DENIED",
-                  mapping.check_access(requested_h, requester_bdf,
+                  check_mapping_access(mapping, requested_h, requester_bdf,
                                        request_iova, 64'd1,
                                        RDMA_DMA_DEVICE_WRITE,
                                        write_permission),
                   RDMA_SC_DMA_PERMISSION);
     mapping.direction = RDMA_DMA_BIDIRECTIONAL;
     expect_status("DMA_EMPTY_PERMISSION",
-                  mapping.check_access(requested_h, requester_bdf,
+                  check_mapping_access(mapping, requested_h, requester_bdf,
                                        request_iova, 64'd1,
                                        RDMA_DMA_DEVICE_READ, '0),
                   RDMA_SC_DMA_PERMISSION);
     expect_status("DMA_BIDI_PERMISSION",
-                  mapping.check_access(requested_h, requester_bdf,
+                  check_mapping_access(mapping, requested_h, requester_bdf,
                                        request_iova, 64'd1,
                                        RDMA_DMA_BIDIRECTIONAL,
                                        read_permission),
                   RDMA_SC_DMA_PERMISSION);
     mapping.permissions = read_permission;
-    subset_status = mapping.check_access(requested_h, requester_bdf,
+    subset_status = check_mapping_access(mapping, requested_h, requester_bdf,
                                          request_iova, 64'd1,
                                          RDMA_DMA_DEVICE_READ,
                                          atomic_permission);
@@ -696,7 +773,7 @@ class rdma_model_test extends uvm_test;
     mapping.size = 64'h20;
     request_iova = mapping.iova;
     expect_status("DMA_MAPPING_OVERFLOW",
-                  mapping.check_access(requested_h, requester_bdf,
+                  check_mapping_access(mapping, requested_h, requester_bdf,
                                        request_iova, 64'd1,
                                        RDMA_DMA_DEVICE_READ,
                                        read_permission),
@@ -800,6 +877,8 @@ class rdma_model_test extends uvm_test;
           `uvm_error("HW_IMAGE_CLONE", "hardware image queues alias source")
       end
     end
+
+    check_binding_snapshot_value_semantics();
 
     phase.drop_objection(this);
   endtask

@@ -566,12 +566,13 @@ class rdma_control_plane_test extends uvm_test;
     int unsigned generation = 32'd7
   );
     rdma_function_binding binding;
+    rdma_interrupt_vector_binding vector;
 
     binding = rdma_function_binding::type_id::create(name);
     binding.function_uid = function_uid;
     binding.generation = generation;
     binding.global_function_id = global_function_id;
-    binding.rdma_vf_id = 32'h9000_0202;
+    binding.rdma_vf_id = 8'h22;
     binding.pfvf_id = 32'h9000_0303;
     binding.pcie.vf_index = 32'h8000_8080;
     binding.pcie.bdf = '{segment:16'h1001, bus:8'h20, device:5'h03,
@@ -586,7 +587,26 @@ class rdma_control_plane_test extends uvm_test;
     binding.notify_size = 64'h2000;
     binding.state = RDMA_BIND_ACTIVE;
     binding.owner_h = binding.make_handle();
-    binding.dma_domain_valid = 1'b1;
+    binding.queue_dma.requester_bdf = binding.pcie.bdf;
+    binding.queue_dma.pasid_valid = 1'b1;
+    binding.queue_dma.pasid = 20'habcde;
+    binding.queue_dma.dma_domain_valid = 1'b1;
+    binding.queue_dma.dma_domain_id = 32'h1122_3344;
+    binding.queue_caps.min_cq_depth = 16;
+    binding.queue_caps.max_cq_depth = 32768;
+    binding.queue_caps.min_srq_depth = 16;
+    binding.queue_caps.max_srq_depth = 32768;
+    binding.queue_caps.max_ceq_depth = 4096;
+    binding.queue_caps.max_aeq_depth = 4096;
+    binding.queue_caps.max_wq_sge = 8;
+    binding.queue_caps.max_queue_ring_bytes = 32'h0020_0000;
+    binding.queue_caps.max_sgb_bytes = 32'h0040_0000;
+    vector = '{default:'0};
+    vector.function_local_vector = 3;
+    vector.hardware_eq_vector = 17;
+    vector.msix_table_index = 5;
+    vector.enabled = 1'b1;
+    binding.interrupt_vectors.push_back(vector);
     binding.pcie.mse = 1'b1;
     binding.pcie.bme = 1'b1;
     binding.notify_valid = 1'b1;
@@ -639,9 +659,11 @@ class rdma_control_plane_test extends uvm_test;
 
     dma_context = rdma_dma_request_context::type_id::create(name);
     dma_context.function_h = binding.make_handle();
-    dma_context.requester_bdf = binding.pcie.bdf;
-    dma_context.pasid_valid = 1'b1;
-    dma_context.pasid = 20'h5a123;
+    dma_context.requester_bdf = binding.queue_dma.requester_bdf;
+    dma_context.pasid_valid = binding.queue_dma.pasid_valid;
+    dma_context.pasid = binding.queue_dma.pasid;
+    dma_context.dma_domain_valid = binding.queue_dma.dma_domain_valid;
+    dma_context.dma_domain_id = binding.queue_dma.dma_domain_id;
     dma_context.owner_h = null;
     return dma_context;
   endfunction
@@ -659,9 +681,9 @@ class rdma_control_plane_test extends uvm_test;
 
     backing = rdma_mr_backing_desc::type_id::create(name);
     backing.function_h = binding.make_handle();
-    backing.requester_bdf = binding.pcie.bdf;
-    backing.pasid_valid = 1'b1;
-    backing.pasid = 20'habcde;
+    backing.requester_bdf = binding.queue_dma.requester_bdf;
+    backing.pasid_valid = binding.queue_dma.pasid_valid;
+    backing.pasid = binding.queue_dma.pasid;
 
     ref_count = (pbl_mode == RDMA_MR_PBL1) ? 2 : 1;
     for (int unsigned i = 0; i < ref_count; i++) begin
@@ -672,6 +694,8 @@ class rdma_control_plane_test extends uvm_test;
       mapping.requester_bdf = backing.requester_bdf;
       mapping.pasid_valid = backing.pasid_valid;
       mapping.pasid = backing.pasid;
+      mapping.dma_domain_valid = binding.queue_dma.dma_domain_valid;
+      mapping.dma_domain_id = binding.queue_dma.dma_domain_id;
       mapping.backing_addr.value = 64'h0000_0002_0000_0000 +
                                    (i * 64'h1000);
       mapping.iova = request.iova;
@@ -4647,7 +4671,7 @@ class rdma_control_plane_test extends uvm_test;
     owner = binding.make_handle();
     control.acquire_test_function_lock(owner, held_lock);
     first_length = 64'h3000;
-    first_pasid = 20'h1a111;
+    first_pasid = binding.queue_dma.pasid;
     first_access = '{local_write:1'b1, remote_read:1'b1,
                      remote_write:1'b0, memory_window_bind:1'b0,
                      remote_atomic:1'b0};

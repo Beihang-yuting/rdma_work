@@ -503,6 +503,8 @@ class rdma_mock_host_mem extends rdma_host_mem_api;
            candidate.requester_bdf == authority.requester_bdf &&
            candidate.pasid_valid == authority.pasid_valid &&
            candidate.pasid == authority.pasid &&
+           candidate.dma_domain_valid == authority.dma_domain_valid &&
+           candidate.dma_domain_id == authority.dma_domain_id &&
            same_handle(candidate.owner_h, authority.owner_h);
   endfunction
 
@@ -579,6 +581,8 @@ class rdma_mock_host_mem extends rdma_host_mem_api;
     allocated_mapping.requester_bdf = request_context.requester_bdf;
     allocated_mapping.pasid_valid = request_context.pasid_valid;
     allocated_mapping.pasid = request_context.pasid;
+    allocated_mapping.dma_domain_valid = request_context.dma_domain_valid;
+    allocated_mapping.dma_domain_id = request_context.dma_domain_id;
     allocated_mapping.backing_addr.value = aligned_address;
     allocated_mapping.iova.value = aligned_address;
     allocated_mapping.size = size;

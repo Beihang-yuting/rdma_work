@@ -63,13 +63,40 @@ class rdma_adapter_contract_test extends uvm_test;
 
   function automatic rdma_function_binding make_binding(string name);
     rdma_function_binding binding;
+    rdma_interrupt_vector_binding vector;
 
     binding = rdma_function_binding::type_id::create(name);
     binding.function_uid = 64'h1234_5678_9abc_def0;
     binding.global_function_id = 32'h1020_3040;
     binding.generation = 32'd17;
-    binding.notify_base.value = 64'h8000_1000;
-    binding.dma_domain_id = 32'h55aa;
+    binding.pcie.bdf = '{segment:16'h1, bus:8'h22, device:5'h3,
+                         function_num:3'h4};
+    binding.pcie.bar[0].base.value = 64'h8000_0000;
+    binding.pcie.bar[0].size = 64'h4000;
+    binding.pcie.bar[0].enabled = 1'b1;
+    binding.notify_bar_id = 0;
+    binding.notify_base.value = 64'h8000_2000;
+    binding.notify_size = 64'h2000;
+    binding.queue_dma.requester_bdf = binding.pcie.bdf;
+    binding.queue_dma.pasid_valid = 1'b1;
+    binding.queue_dma.pasid = 20'h34567;
+    binding.queue_dma.dma_domain_valid = 1'b1;
+    binding.queue_dma.dma_domain_id = 32'h1122_3344;
+    binding.queue_caps.min_cq_depth = 16;
+    binding.queue_caps.max_cq_depth = 32768;
+    binding.queue_caps.min_srq_depth = 16;
+    binding.queue_caps.max_srq_depth = 32768;
+    binding.queue_caps.max_ceq_depth = 4096;
+    binding.queue_caps.max_aeq_depth = 4096;
+    binding.queue_caps.max_wq_sge = 8;
+    binding.queue_caps.max_queue_ring_bytes = 32'h0020_0000;
+    binding.queue_caps.max_sgb_bytes = 32'h0040_0000;
+    vector = '{default:'0};
+    vector.function_local_vector = 3;
+    vector.hardware_eq_vector = 17;
+    vector.msix_table_index = 5;
+    vector.enabled = 1'b1;
+    binding.interrupt_vectors.push_back(vector);
     return binding;
   endfunction
 
@@ -142,6 +169,7 @@ class rdma_adapter_contract_test extends uvm_test;
     rdma_mock_dma_mapping third_mock_mapping;
     rdma_mock_release_seal third_mock_release_seal;
     rdma_function_binding binding;
+    rdma_dma_permission_t read_permission;
     rdma_packet tx_packet;
     rdma_packet observer_seed;
     rdma_packet rx_source;
@@ -179,8 +207,10 @@ class rdma_adapter_contract_test extends uvm_test;
     owner_h.object_id = 32'h4455_6677;
     owner_h.generation = function_h.generation;
     request_context = make_dma_context(
-      "request_context", function_h, bdf, 1'b1, 20'habcde, owner_h
+      "request_context", function_h, bdf, 1'b1, 20'h34567, owner_h
     );
+    request_context.dma_domain_valid = 1'b1;
+    request_context.dma_domain_id = 32'h1122_3344;
     cfg_offset.value = 12'habc;
     bar_address.value = 64'h9000_0040;
 
@@ -279,7 +309,9 @@ class rdma_adapter_contract_test extends uvm_test;
         mapping.function_h == null ||
         mapping.function_h.generation != function_h.generation ||
         mapping.requester_bdf != bdf || !mapping.pasid_valid ||
-        mapping.pasid != 20'habcde || mapping.owner_h == null ||
+        mapping.pasid != 20'h34567 || !mapping.dma_domain_valid ||
+        mapping.dma_domain_id != 32'h1122_3344 ||
+        mapping.owner_h == null ||
         mapping.owner_h == request_context.owner_h ||
         !mapping.owner_h.same_instance(request_context.owner_h))
       `uvm_error("HOST_ALLOCATE", "host adapter contract failed")
@@ -293,30 +325,54 @@ class rdma_adapter_contract_test extends uvm_test;
         mem.calls[0].request_context.function_h.generation != 17 ||
         mem.calls[0].request_context.requester_bdf != bdf ||
         !mem.calls[0].request_context.pasid_valid ||
-        mem.calls[0].request_context.pasid != 20'habcde ||
+        mem.calls[0].request_context.pasid != 20'h34567 ||
+        !mem.calls[0].request_context.dma_domain_valid ||
+        mem.calls[0].request_context.dma_domain_id != 32'h1122_3344 ||
         mem.calls[0].request_context.owner_h == null ||
         mem.calls[0].request_context.owner_h.object_id != 32'h4455_6677 ||
         mem.calls[0].size != 4096 || mem.calls[0].alignment != 4096)
       `uvm_error("HOST_RECORD", "allocate call was not recorded by value")
+
+    binding = make_binding("queue_binding");
+    expect_status("QUEUE_BINDING", binding.validate(), RDMA_SC_OK);
+    read_permission = '{device_read:1'b1, device_write:1'b0, atomic:1'b0};
+    expect_status("DOMAIN_MATCH", mapping.check_access(
+      binding.make_handle(), binding.queue_dma.requester_bdf,
+      binding.queue_dma.pasid_valid, binding.queue_dma.pasid,
+      binding.queue_dma.dma_domain_valid, binding.queue_dma.dma_domain_id,
+      mapping.iova, 4096, RDMA_DMA_DEVICE_READ, read_permission), RDMA_SC_OK);
+    expect_status("DOMAIN_MISMATCH", mapping.check_access(
+      binding.make_handle(), binding.queue_dma.requester_bdf,
+      1'b1, 20'h34567, 1'b1, 32'h1122_3345,
+      mapping.iova, 4096, RDMA_DMA_DEVICE_READ, read_permission),
+      RDMA_SC_DMA_TRANSLATION);
     request_context.function_h.generation = 32'd99;
     request_context.requester_bdf.bus = 8'hff;
     request_context.pasid_valid = 1'b0;
     request_context.pasid = 20'h12345;
+    request_context.dma_domain_valid = 1'b0;
+    request_context.dma_domain_id = 32'hffff_ffff;
     request_context.owner_h.object_id = 32'hffff_ffff;
     if (mapping.function_h.generation != 17 ||
         mapping.requester_bdf != bdf || !mapping.pasid_valid ||
-        mapping.pasid != 20'habcde || mapping.owner_h == null ||
+        mapping.pasid != 20'h34567 || !mapping.dma_domain_valid ||
+        mapping.dma_domain_id != 32'h1122_3344 ||
+        mapping.owner_h == null ||
         mapping.owner_h.object_id != 32'h4455_6677 ||
         mem.calls[0].request_context.function_h.generation != 17 ||
         mem.calls[0].request_context.requester_bdf != bdf ||
         !mem.calls[0].request_context.pasid_valid ||
-        mem.calls[0].request_context.pasid != 20'habcde ||
+        mem.calls[0].request_context.pasid != 20'h34567 ||
+        !mem.calls[0].request_context.dma_domain_valid ||
+        mem.calls[0].request_context.dma_domain_id != 32'h1122_3344 ||
         mem.calls[0].request_context.owner_h.object_id != 32'h4455_6677 ||
         mem.regions.size() != 1 || mem.regions[0].mapping == null ||
         mem.regions[0].mapping.function_h.generation != 17 ||
         mem.regions[0].mapping.requester_bdf != bdf ||
         !mem.regions[0].mapping.pasid_valid ||
-        mem.regions[0].mapping.pasid != 20'habcde ||
+        mem.regions[0].mapping.pasid != 20'h34567 ||
+        !mem.regions[0].mapping.dma_domain_valid ||
+        mem.regions[0].mapping.dma_domain_id != 32'h1122_3344 ||
         mem.regions[0].mapping.owner_h == null ||
         mem.regions[0].mapping.owner_h.object_id != 32'h4455_6677)
       `uvm_error("HOST_CONTEXT_SNAPSHOT",
