@@ -796,6 +796,8 @@ class rdma_control_plane_test extends uvm_test;
     return same_handle_fields(lhs.function_h, rhs.function_h) &&
            lhs.requester_bdf == rhs.requester_bdf &&
            lhs.pasid_valid == rhs.pasid_valid && lhs.pasid == rhs.pasid &&
+           lhs.dma_domain_valid == rhs.dma_domain_valid &&
+           lhs.dma_domain_id == rhs.dma_domain_id &&
            lhs.backing_addr == rhs.backing_addr && lhs.iova == rhs.iova &&
            lhs.size == rhs.size && lhs.direction == rhs.direction &&
            lhs.permissions == rhs.permissions && lhs.state == rhs.state &&
@@ -996,7 +998,8 @@ class rdma_control_plane_test extends uvm_test;
     int unsigned alignment,
     rdma_status_code_e expected_code,
     int unsigned baseline_allocations,
-    int unsigned baseline_leaks
+    int unsigned baseline_leaks,
+    string expected_message = ""
   );
     rdma_dma_mapping mapping;
     rdma_mr mr;
@@ -1007,6 +1010,11 @@ class rdma_control_plane_test extends uvm_test;
     control.alloc_and_register_mr(binding, request, dma_context, alignment,
                                   mapping, mr, result);
     expect_result(check_name, result, expected_code);
+    if (expected_message != "" &&
+        (result == null || result.primary_status == null ||
+         result.primary_status.message != expected_message))
+      `uvm_error(check_name,
+                 "pre-allocation rejection diagnostic is inaccurate")
     expect_cmq_opcodes({check_name, "_OPCODES"}, mock_cmq,
                        expected_opcodes);
     void'(manager.check_leaks(final_leaks, binding.make_handle()));
@@ -1285,6 +1293,7 @@ class rdma_control_plane_test extends uvm_test;
     rdma_pd pd;
     rdma_function_handle saved_function;
     rdma_bdf_t saved_bdf;
+    int unsigned saved_dma_domain_id;
     longint unsigned saved_length;
     int unsigned baseline_allocations;
     int unsigned baseline_leaks;
@@ -1324,6 +1333,16 @@ class rdma_control_plane_test extends uvm_test;
       baseline_allocations, baseline_leaks
     );
     dma_context.requester_bdf = saved_bdf;
+
+    saved_dma_domain_id = dma_context.dma_domain_id;
+    dma_context.dma_domain_id++;
+    expect_owned_preallocate_reject(
+      "OWNED_DOMAIN_MISMATCH", control, manager, mock_cmq, host_mem,
+      binding, request, dma_context, 4096, RDMA_SC_DMA_TRANSLATION,
+      baseline_allocations, baseline_leaks,
+      "owned MR DMA authority does not match Function"
+    );
+    dma_context.dma_domain_id = saved_dma_domain_id;
 
     dma_context.owner_h = rdma_clone_handle_value(
       request.pd_h, "owned validation DMA owner"

@@ -4641,6 +4641,8 @@ class rdma_resource_manager_test extends uvm_test;
       composite_mappings[i].requester_bdf = composite_mr_binding.pcie.bdf;
       composite_mappings[i].pasid_valid = (i == 1);
       composite_mappings[i].pasid = 20'hca200 + i;
+      composite_mappings[i].dma_domain_valid = 1'b1;
+      composite_mappings[i].dma_domain_id = 32'hca2d_0000 + i;
       composite_mappings[i].backing_addr.value =
         64'hc0a2_3000_0000_0000 + (i * 64'h10000);
       composite_mappings[i].iova.value =
@@ -4884,6 +4886,10 @@ class rdma_resource_manager_test extends uvm_test;
             composite_mappings[i].pasid_valid ||
           composite_mr_lookup.backing_refs[i].mapping.pasid !=
             composite_mappings[i].pasid ||
+          composite_mr_lookup.backing_refs[i].mapping.dma_domain_valid !=
+            composite_mappings[i].dma_domain_valid ||
+          composite_mr_lookup.backing_refs[i].mapping.dma_domain_id !=
+            composite_mappings[i].dma_domain_id ||
           composite_mr_lookup.backing_refs[i].mapping.backing_addr !=
             composite_mappings[i].backing_addr ||
           composite_mr_lookup.backing_refs[i].mapping.iova !=
@@ -4980,6 +4986,10 @@ class rdma_resource_manager_test extends uvm_test;
             composite_mapping_owners[i] ||
           composite_mr_lookup.hmc_refs[i] == composite_hmc_refs[i] ||
           composite_mr_lookup.hmc_refs[i].owner == composite_hmc_owners[i] ||
+          composite_mr_lookup.backing_refs[i].mapping.dma_domain_valid !=
+            composite_mappings[i].dma_domain_valid ||
+          composite_mr_lookup.backing_refs[i].mapping.dma_domain_id !=
+            composite_mappings[i].dma_domain_id ||
           composite_mr_lookup.backing_refs[i].mapping.backing_addr.value !=
             64'hc0a2_3000_0000_0000 + (i * 64'h10000) ||
           composite_mr_lookup.hmc_refs[i].address.value !=
@@ -5028,6 +5038,8 @@ class rdma_resource_manager_test extends uvm_test;
             64'hc0a2_3000_0000_0000 + (i * 64'h10000) ||
           composite_mappings[i].iova.value !=
             64'hc0a2_4000_0000_0000 + (i * 64'h20000) ||
+          !composite_mappings[i].dma_domain_valid ||
+          composite_mappings[i].dma_domain_id != 32'hca2d_0000 + i ||
           composite_hmc_refs[i].address.value !=
             64'hc0a2_5000_0000_0000 + (i * 64'h4000))
         `uvm_error("COMPOSITE_MR_POST_LIFECYCLE_HOOKS",

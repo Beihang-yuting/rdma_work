@@ -2224,6 +2224,8 @@ typedef enum int unsigned {
   RDMA_CMQ_TAMPER_BDF,
   RDMA_CMQ_TAMPER_PASID_VALID,
   RDMA_CMQ_TAMPER_PASID,
+  RDMA_CMQ_TAMPER_DMA_DOMAIN_VALID,
+  RDMA_CMQ_TAMPER_DMA_DOMAIN,
   RDMA_CMQ_TAMPER_OWNER_NULL,
   RDMA_CMQ_TAMPER_OWNER_KIND,
   RDMA_CMQ_TAMPER_OWNER_UID,
@@ -2650,6 +2652,11 @@ class rdma_cmq_engine_probe extends rdma_cmq_engine;
         backing_mapping.pasid_valid = !backing_mapping.pasid_valid;
       RDMA_CMQ_TAMPER_PASID:
         backing_mapping.pasid++;
+      RDMA_CMQ_TAMPER_DMA_DOMAIN_VALID:
+        backing_mapping.dma_domain_valid =
+          !backing_mapping.dma_domain_valid;
+      RDMA_CMQ_TAMPER_DMA_DOMAIN:
+        backing_mapping.dma_domain_id++;
       RDMA_CMQ_TAMPER_OWNER_NULL:
         backing_mapping.owner_h = null;
       RDMA_CMQ_TAMPER_OWNER_KIND:
@@ -3836,6 +3843,8 @@ class rdma_cmq_engine_test extends uvm_test;
     return same_nullable_handle(lhs.function_h, rhs.function_h) &&
            lhs.requester_bdf == rhs.requester_bdf &&
            lhs.pasid_valid == rhs.pasid_valid && lhs.pasid == rhs.pasid &&
+           lhs.dma_domain_valid == rhs.dma_domain_valid &&
+           lhs.dma_domain_id == rhs.dma_domain_id &&
            lhs.backing_addr == rhs.backing_addr && lhs.iova == rhs.iova &&
            lhs.size == rhs.size && lhs.direction == rhs.direction &&
            lhs.permissions == rhs.permissions && lhs.state == rhs.state &&
@@ -4566,6 +4575,9 @@ class rdma_cmq_engine_test extends uvm_test;
     expected_codes[RDMA_CMQ_TAMPER_BDF] = RDMA_SC_DMA_TRANSLATION;
     expected_codes[RDMA_CMQ_TAMPER_PASID_VALID] = RDMA_SC_DMA_PERMISSION;
     expected_codes[RDMA_CMQ_TAMPER_PASID] = RDMA_SC_DMA_PERMISSION;
+    expected_codes[RDMA_CMQ_TAMPER_DMA_DOMAIN_VALID] =
+      RDMA_SC_DMA_TRANSLATION;
+    expected_codes[RDMA_CMQ_TAMPER_DMA_DOMAIN] = RDMA_SC_DMA_TRANSLATION;
     expected_codes[RDMA_CMQ_TAMPER_OWNER_NULL] = RDMA_SC_DMA_TRANSLATION;
     expected_codes[RDMA_CMQ_TAMPER_OWNER_KIND] = RDMA_SC_DMA_TRANSLATION;
     expected_codes[RDMA_CMQ_TAMPER_OWNER_UID] = RDMA_SC_DMA_TRANSLATION;

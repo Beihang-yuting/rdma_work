@@ -111,17 +111,11 @@ unpacked struct 和其 queue element 都按值复制。因此 source/destination
 
 ## Validation
 
-DMA 和 capability validation 由 package-level value helper 提供：
-
-```systemverilog
-function automatic rdma_status rdma_validate_queue_dma_context(
-  input rdma_queue_dma_context context
-);
-
-function automatic rdma_status rdma_validate_queue_capabilities(
-  input rdma_queue_capabilities capabilities
-);
-```
+DMA、capability、PCIe identity、interrupt vector 和 lifecycle validation
+由 `rdma_function_binding::validate()` inline 执行。snapshot 是 binding schema 的
+value 字段，不发布独立的 package-level validation helper；需要结合
+`pcie.bdf` 或 ACTIVE lifecycle state 的规则也因此在同一个 binding validator 中
+评估。
 
 规则保持为：
 

@@ -2119,7 +2119,7 @@ class rdma_control_plane extends uvm_object;
           dma_context.dma_domain_id != binding.queue_dma.dma_domain_id) begin
         status = rdma_status::make(
           RDMA_SC_DMA_TRANSLATION,
-          "owned MR DMA requester BDF does not match Function"
+          "owned MR DMA authority does not match Function"
         );
         break;
       end
@@ -2198,7 +2198,7 @@ class rdma_control_plane extends uvm_object;
           dma_context.dma_domain_id != binding.queue_dma.dma_domain_id) begin
         status = rdma_status::make(
           RDMA_SC_DMA_TRANSLATION,
-          "owned MR DMA requester BDF does not match Function"
+          "owned MR DMA authority does not match Function"
         );
         break;
       end
