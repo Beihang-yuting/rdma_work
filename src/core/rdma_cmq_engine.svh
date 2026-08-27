@@ -4210,6 +4210,28 @@ class rdma_cmq_engine extends uvm_object;
       engine_lock.put(1);
       return;
     end
+    if (binding_candidate.queue_dma.pasid_valid !=
+          prepared_binding.queue_dma.pasid_valid ||
+        binding_candidate.queue_dma.pasid !=
+          prepared_binding.queue_dma.pasid) begin
+      status = rdma_status::make(
+        RDMA_SC_DMA_TRANSLATION,
+        "CMQ ACTIVE binding PASID does not match PREPARED"
+      );
+      engine_lock.put(1);
+      return;
+    end
+    if (binding_candidate.queue_dma.dma_domain_valid !=
+          prepared_binding.queue_dma.dma_domain_valid ||
+        binding_candidate.queue_dma.dma_domain_id !=
+          prepared_binding.queue_dma.dma_domain_id) begin
+      status = rdma_status::make(
+        RDMA_SC_DMA_TRANSLATION,
+        "CMQ ACTIVE binding DMA domain does not match PREPARED"
+      );
+      engine_lock.put(1);
+      return;
+    end
     status = mapping_authority_status(backing_mapping, dma_context);
     if (!status.ok()) begin
       engine_lock.put(1);

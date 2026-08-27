@@ -142,7 +142,8 @@ class rdma_dma_mapping extends uvm_object;
       return rdma_status::make(RDMA_SC_DMA_TRANSLATION,
                                "requester BDF does not match mapping");
     if (requested_pasid_valid != pasid_valid ||
-        requested_pasid != pasid)
+        (requested_pasid_valid ? requested_pasid : '0) !=
+          (pasid_valid ? pasid : '0))
       return rdma_status::make(RDMA_SC_DMA_TRANSLATION,
                                "requester PASID does not match mapping");
     if (requested_dma_domain_valid != dma_domain_valid ||

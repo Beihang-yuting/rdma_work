@@ -637,6 +637,15 @@ class rdma_model_test extends uvm_test;
                                        RDMA_DMA_BIDIRECTIONAL,
                                        read_write_permission),
                   RDMA_SC_OK);
+    mapping.pasid_valid = 1'b0;
+    mapping.pasid = '0;
+    expect_status("DMA_INVALID_PASID_NORMALIZE", mapping.check_access(
+      requested_h, requester_bdf, 1'b0, 20'hfffff,
+      mapping.dma_domain_valid, mapping.dma_domain_id,
+      request_iova, mapping.size, RDMA_DMA_BIDIRECTIONAL,
+      read_write_permission), RDMA_SC_OK);
+    mapping.pasid_valid = 1'b1;
+    mapping.pasid = 20'habcde;
     request_iova.value = mapping.iova.value + mapping.size - 1'b1;
     expect_status("DMA_LAST_BYTE",
                   check_mapping_access(mapping, requested_h, requester_bdf,

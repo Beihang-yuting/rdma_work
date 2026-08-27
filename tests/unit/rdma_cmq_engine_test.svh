@@ -4656,6 +4656,64 @@ class rdma_cmq_engine_test extends uvm_test;
     if (count_host_calls(mem, "release") != 1)
       `uvm_error("ACTIVATE_SHUTDOWN_IDEMPOTENT",
                  "idempotent ACTIVE shutdown released backing again")
+
+    for (int unsigned authority_case = 0; authority_case < 4;
+         authority_case++) begin
+      engine = rdma_cmq_engine_probe::type_id::create(
+        $sformatf("activate_authority_engine_%0d", authority_case)
+      );
+      mem = rdma_mock_host_mem::type_id::create(
+        $sformatf("activate_authority_mem_%0d", authority_case)
+      );
+      scheduler = rdma_doorbell_scheduler::type_id::create(
+        $sformatf("activate_authority_scheduler_%0d", authority_case)
+      );
+      profile = rdma_cmq_test_profile::type_id::create(
+        $sformatf("activate_authority_profile_%0d", authority_case)
+      );
+      prepared_binding = make_binding(
+        $sformatf("activate_authority_prepared_%0d", authority_case),
+        RDMA_BIND_PREPARED
+      );
+      active_binding = make_binding(
+        $sformatf("activate_authority_active_%0d", authority_case),
+        RDMA_BIND_ACTIVE
+      );
+      case (authority_case)
+        0: begin
+          active_binding.queue_dma.pasid_valid = 1'b0;
+          active_binding.queue_dma.pasid = '0;
+        end
+        1: active_binding.queue_dma.pasid++;
+        2: begin
+          prepared_binding.queue_dma.dma_domain_valid = 1'b0;
+          prepared_binding.queue_dma.dma_domain_id = '0;
+        end
+        3: active_binding.queue_dma.dma_domain_id++;
+      endcase
+      cmq = make_cmq(
+        $sformatf("activate_authority_cmq_%0d", authority_case),
+        prepared_binding
+      );
+      prepare_defaults(
+        $sformatf("ACTIVATE_AUTHORITY_PREPARE_%0d", authority_case),
+        engine, mem, prepared_binding, cmq, scheduler, profile,
+        runtime_desc
+      );
+      engine.activate(active_binding, status);
+      expect_status(
+        $sformatf("ACTIVATE_AUTHORITY_%0d", authority_case), status,
+        RDMA_SC_DMA_TRANSLATION
+      );
+      if (engine.state() != RDMA_CMQ_ENGINE_PREPARED)
+        `uvm_error("ACTIVATE_AUTHORITY_ATOMIC",
+                   "authority mismatch changed the PREPARED state")
+      engine.shutdown(status);
+      expect_status(
+        $sformatf("ACTIVATE_AUTHORITY_SHUTDOWN_%0d", authority_case),
+        status, RDMA_SC_OK
+      );
+    end
   endtask
 
   task automatic check_prepared_shutdown_lifecycle();
