@@ -2209,6 +2209,113 @@ class rdma_queue_lifecycle_test extends uvm_test;
     return count;
   endfunction
 
+  function automatic int unsigned count_executor_recovery_step(
+    rdma_control_step_e steps[$], rdma_control_step_e expected
+  );
+    int unsigned count;
+
+    count = 0;
+    foreach (steps[i])
+      if (steps[i] == expected)
+        count++;
+    return count;
+  endfunction
+
+  function automatic int unsigned count_executor_rollback_code(
+    rdma_status statuses[$], rdma_status_code_e expected
+  );
+    int unsigned count;
+
+    count = 0;
+    foreach (statuses[i])
+      if (statuses[i] != null && statuses[i].code == expected)
+        count++;
+    return count;
+  endfunction
+
+  task automatic retry_executor_local_cleanup(
+    string label,
+    rdma_resource_manager manager,
+    rdma_queue_executor_trace_mem mem,
+    rdma_queue_executor_trace_context context_backing,
+    rdma_handle resource_h
+  );
+    rdma_recovery_record recovery;
+    rdma_resource snapshot;
+    rdma_status status;
+    bit release_complete;
+    bit backing_step_completed;
+
+    status = manager.lookup_recovery(resource_h, recovery);
+    expect_status({label, "_RETRY_LOOKUP"}, status, RDMA_SC_OK);
+    if (recovery == null || recovery.queue_plan == null) begin
+      `uvm_error(label, "retry recovery plan is unavailable")
+      return;
+    end
+    if (recovery.queue_plan.context_ref != null &&
+        !recovery.queue_plan.context_ref.release_complete) begin
+      release_complete = 1'b0;
+      status = context_backing.query_release_completion(
+        recovery.queue_plan.context_ref, release_complete
+      );
+      expect_status({label, "_CONTEXT_QUERY"}, status, RDMA_SC_OK);
+      if (!release_complete) begin
+        status = context_backing.\release (
+          recovery.queue_plan.context_ref
+        );
+        expect_status({label, "_CONTEXT_RELEASE"}, status, RDMA_SC_OK);
+      end
+      status = manager.record_queue_context_cleanup_complete(resource_h);
+      expect_status({label, "_CONTEXT_PROGRESS"}, status, RDMA_SC_OK);
+    end
+    for (int i = int'(recovery.queue_plan.refs.size()) - 1; i >= 0; i--) begin
+      if (recovery.queue_plan.refs[i] == null ||
+          recovery.queue_plan.refs[i].ownership !=
+            RDMA_OWNERSHIP_CONTROL_PLANE ||
+          recovery.queue_plan.refs[i].cleanup_complete)
+        continue;
+      release_complete = 1'b0;
+      status = recovery.queue_plan.refs[i].mapping.release_completion_status(
+        release_complete
+      );
+      expect_status($sformatf("%s_REF_%0d_QUERY", label, i), status,
+                    RDMA_SC_OK);
+      if (!release_complete) begin
+        status = mem.\release (recovery.queue_plan.refs[i].mapping);
+        expect_status($sformatf("%s_REF_%0d_RELEASE", label, i), status,
+                      RDMA_SC_OK);
+      end
+      status = manager.record_queue_cleanup_complete(
+        resource_h, recovery.queue_plan.refs[i].role
+      );
+      expect_status($sformatf("%s_REF_%0d_PROGRESS", label, i), status,
+                    RDMA_SC_OK);
+    end
+    recovery = null;
+    status = manager.lookup_recovery(resource_h, recovery);
+    expect_status({label, "_RETRY_REFRESH"}, status, RDMA_SC_OK);
+    if (recovery == null) begin
+      `uvm_error(label, "retry recovery refresh is unavailable")
+      return;
+    end
+    for (int i = int'(recovery.pending_steps.size()) - 1; i >= 0; i--)
+      if (recovery.pending_steps[i] == RDMA_CTRL_STEP_BACKING_RELEASED)
+        recovery.pending_steps.delete(i);
+    backing_step_completed = 1'b0;
+    foreach (recovery.completed_steps[i])
+      if (recovery.completed_steps[i] == RDMA_CTRL_STEP_BACKING_RELEASED)
+        backing_step_completed = 1'b1;
+    if (!backing_step_completed)
+      recovery.completed_steps.push_back(RDMA_CTRL_STEP_BACKING_RELEASED);
+    status = manager.mark_error(resource_h, recovery);
+    expect_status({label, "_RETRY_PERSIST"}, status, RDMA_SC_OK);
+    status = manager.finalize_release(resource_h);
+    expect_status({label, "_RETRY_FINALIZE"}, status, RDMA_SC_OK);
+    status = manager.lookup(resource_h, snapshot);
+    expect_status({label, "_RETRY_RELEASED"}, status,
+                  RDMA_SC_INVALID_STATE);
+  endtask
+
   task automatic check_executor_positive_case(
     rdma_resource_kind_e kind, bit borrowed
   );
@@ -2430,6 +2537,430 @@ class rdma_queue_lifecycle_test extends uvm_test;
     end
   endtask
 
+  task automatic check_executor_cq_reset_cancelled();
+    for (int unsigned mode = 0; mode < 3; mode++) begin
+      string label;
+      rdma_function_binding binding;
+      rdma_fault_inject_resource_manager manager;
+      rdma_ceq dependency;
+      rdma_queue_executor_trace_mem mem;
+      rdma_queue_executor_trace_context context_backing;
+      rdma_mock_cmq_port cmq;
+      rdma_queue_lifecycle_executor executor;
+      rdma_semantic_request request;
+      rdma_queue_resource queue;
+      rdma_control_result result;
+      rdma_recovery_record recovery;
+      rdma_status primary;
+      rdma_status reset_status;
+      rdma_status status;
+      rdma_queue_ambiguous_operation_e expected_operation;
+      rdma_hw_presence_e expected_presence;
+      bit [7:0] expected_ticket_opcode;
+
+      label = $sformatf("EXEC_CQ_RESET_%0d", mode);
+      binding = make_binding({label, "_binding"});
+      manager = rdma_fault_inject_resource_manager::type_id::create(
+        {label, "_manager"}
+      );
+      expect_status({label, "_DEPENDENCY"},
+                    manager.create_ceq(binding, dependency), RDMA_SC_OK);
+      mem = rdma_queue_executor_trace_mem::type_id::create({label, "_mem"});
+      context_backing = rdma_queue_executor_trace_context::type_id::create(
+        {label, "_context"}
+      );
+      cmq = rdma_mock_cmq_port::type_id::create({label, "_cmq"});
+      executor = rdma_queue_lifecycle_executor::type_id::create(
+        {label, "_executor"}
+      );
+      expect_status({label, "_CONFIGURE"}, executor.configure(
+        manager, cmq, mem, context_backing, 100ns), RDMA_SC_OK);
+      request = make_executor_request({label, "_request"}, RDMA_RESOURCE_CQ,
+                                      binding, dependency, 1'b0);
+      primary = rdma_status::make(RDMA_SC_UNKNOWN_HW_ERROR,
+                                  {label, " primary"});
+      reset_status = rdma_status::make(RDMA_SC_RESET_CANCELLED,
+                                       {label, " reset cancelled"});
+      case (mode)
+        0: begin
+          cmq.fail_opcode(8'h0c, reset_status);
+          expected_operation = RDMA_QUEUE_AMBIG_CREATE;
+          expected_presence = RDMA_HW_PRESENCE_UNKNOWN;
+          expected_ticket_opcode = 8'h0c;
+        end
+        1: begin
+          void'(manager.fail_next_transition("commit_programmed", primary));
+          cmq.fail_opcode(8'h0e, reset_status);
+          expected_operation = RDMA_QUEUE_AMBIG_DELETE;
+          expected_presence = RDMA_HW_PRESENCE_UNKNOWN;
+          expected_ticket_opcode = 8'h0e;
+        end
+        default: begin
+          void'(manager.fail_next_transition("commit_programmed", primary));
+          cmq.fail_opcode(8'h0a, reset_status);
+          expected_operation = RDMA_QUEUE_AMBIG_OCC_FLUSH;
+          expected_presence = RDMA_HW_PRESENCE_ABSENT;
+          expected_ticket_opcode = 8'h0a;
+        end
+      endcase
+      executor.create_locked(binding, binding.make_handle(), request,
+                             64'd400 + mode, queue, result);
+      if (result == null || result.status == null ||
+          result.primary_status == null ||
+          result.status.code != RDMA_SC_RECOVERY_REQUIRED ||
+          result.primary_status.code != (mode == 0 ?
+            RDMA_SC_RESET_CANCELLED : RDMA_SC_UNKNOWN_HW_ERROR) ||
+          !result.recovery_required || queue == null ||
+          queue.state != RDMA_RESOURCE_ERROR)
+        `uvm_error(label, "reset cancellation did not retain CQ ERROR")
+      status = manager.lookup_recovery(result.resource_h, recovery);
+      expect_status({label, "_RECOVERY"}, status, RDMA_SC_OK);
+      if (recovery == null || recovery.queue_plan == null ||
+          recovery.ambiguous_queue_operation != expected_operation ||
+          recovery.hardware_presence != expected_presence ||
+          recovery.ambiguous_ticket == null ||
+          recovery.ambiguous_ticket.opcode_key == null ||
+          recovery.ambiguous_ticket.opcode_key.opcode !=
+            expected_ticket_opcode ||
+          count_executor_recovery_step(
+            recovery.pending_steps, RDMA_CTRL_STEP_BACKING_RELEASED
+          ) != 1)
+        `uvm_error(label,
+                   "reset recovery lost CQ operation/ticket/plan authority")
+      if (mode != 0 && count_executor_rollback_code(
+            result.rollback_statuses, RDMA_SC_RESET_CANCELLED
+          ) != 1)
+        `uvm_error(label, "rollback reset status was not aggregated")
+      if (count_executor_host_calls(mem, "release") != 0 ||
+          context_backing.release_call_count != 0 ||
+          manager.release_reserved_calls != 0)
+        `uvm_error(label, "ambiguous CQ outcome released local authority")
+      status = manager.release_reserved(dependency.handle);
+      expect_status({label, "_DEPENDENCY_RETAINED"}, status,
+                    RDMA_SC_RESOURCE_BUSY);
+    end
+  endtask
+
+  task automatic check_executor_local_cleanup_recovery();
+    string label;
+    rdma_function_binding binding;
+    rdma_fault_inject_resource_manager manager;
+    rdma_ceq dependency;
+    rdma_queue_executor_trace_mem mem;
+    rdma_queue_executor_trace_context context_backing;
+    rdma_mock_cmq_port cmq;
+    rdma_queue_lifecycle_executor executor;
+    rdma_semantic_request request;
+    rdma_queue_resource queue;
+    rdma_control_result result;
+    rdma_recovery_record recovery;
+    rdma_status primary;
+    rdma_status cleanup_failure;
+    rdma_status status;
+
+    label = "EXEC_CQ_CONTEXT_CLEANUP_RECOVERY";
+    binding = make_binding({label, "_binding"});
+    manager = rdma_fault_inject_resource_manager::type_id::create(
+      {label, "_manager"}
+    );
+    expect_status({label, "_DEPENDENCY"},
+                  manager.create_ceq(binding, dependency), RDMA_SC_OK);
+    mem = rdma_queue_executor_trace_mem::type_id::create({label, "_mem"});
+    context_backing = rdma_queue_executor_trace_context::type_id::create(
+      {label, "_context"}
+    );
+    cmq = rdma_mock_cmq_port::type_id::create({label, "_cmq"});
+    executor = rdma_queue_lifecycle_executor::type_id::create(
+      {label, "_executor"}
+    );
+    expect_status({label, "_CONFIGURE"}, executor.configure(
+      manager, cmq, mem, context_backing, 100ns), RDMA_SC_OK);
+    request = make_executor_request({label, "_request"}, RDMA_RESOURCE_CQ,
+                                    binding, dependency, 1'b0);
+    primary = rdma_status::make(RDMA_SC_UNKNOWN_HW_ERROR,
+                                {label, " primary"});
+    cleanup_failure = rdma_status::make(RDMA_SC_DMA_TRANSLATION,
+                                        {label, " context release"});
+    void'(context_backing.fail_next("write", primary));
+    void'(context_backing.fail_next("release", cleanup_failure));
+    executor.create_locked(binding, binding.make_handle(), request, 64'd410,
+                           queue, result);
+    if (result == null || result.status == null ||
+        result.primary_status == null ||
+        result.status.code != RDMA_SC_RECOVERY_REQUIRED ||
+        result.primary_status.code != RDMA_SC_UNKNOWN_HW_ERROR ||
+        !result.recovery_required || queue == null ||
+        queue.state != RDMA_RESOURCE_ERROR ||
+        manager.release_reserved_calls != 0 || mem.live_allocations() != 0 ||
+        count_executor_rollback_code(
+          result.rollback_statuses, RDMA_SC_DMA_TRANSLATION
+        ) != 1)
+      `uvm_error(label,
+                 "context cleanup failure discarded durable CQ authority")
+    status = manager.lookup_recovery(result.resource_h, recovery);
+    expect_status({label, "_RECOVERY"}, status, RDMA_SC_OK);
+    if (recovery == null || recovery.queue_plan == null ||
+        recovery.queue_plan.context_ref == null ||
+        recovery.queue_plan.context_ref.release_complete ||
+        recovery.hardware_presence != RDMA_HW_PRESENCE_ABSENT ||
+        recovery.ambiguous_queue_operation != RDMA_QUEUE_AMBIG_NONE ||
+        recovery.ambiguous_ticket != null ||
+        recovery.queue_create_opcode == null ||
+        recovery.queue_create_opcode.opcode != 8'h0c ||
+        count_executor_recovery_step(
+          recovery.pending_steps, RDMA_CTRL_STEP_BACKING_RELEASED
+        ) != 1)
+      `uvm_error(label, "context cleanup recovery schema is incomplete")
+    retry_executor_local_cleanup(label, manager, mem, context_backing,
+                                 result.resource_h);
+    if (count_executor_host_calls(mem, "release") != 2 ||
+        context_backing.release_call_count != 1 ||
+        mem.live_allocations() != 0)
+      `uvm_error(label, "cleanup retry duplicated or omitted exact authority")
+    status = manager.release_reserved(dependency.handle);
+    expect_status({label, "_DEPENDENCY_RELEASED"}, status, RDMA_SC_OK);
+  endtask
+
+  task automatic check_executor_prestage_cleanup_recovery();
+    for (int unsigned mode = 0; mode < 2; mode++) begin
+      string label;
+      rdma_resource_kind_e kind;
+      rdma_function_binding binding;
+      rdma_fault_inject_resource_manager manager;
+      rdma_ceq dependency;
+      rdma_queue_executor_trace_mem mem;
+      rdma_queue_executor_trace_context context_backing;
+      rdma_mock_cmq_port cmq;
+      rdma_queue_lifecycle_executor executor;
+      rdma_semantic_request request;
+      rdma_queue_resource queue;
+      rdma_control_result result;
+      rdma_recovery_record recovery;
+      rdma_status primary;
+      rdma_status cleanup_failure;
+      rdma_status status;
+
+      kind = mode == 0 ? RDMA_RESOURCE_CQ : RDMA_RESOURCE_CEQ;
+      label = $sformatf("EXEC_PRESTAGE_%s_CLEANUP", kind.name());
+      binding = make_binding({label, "_binding"});
+      manager = rdma_fault_inject_resource_manager::type_id::create(
+        {label, "_manager"}
+      );
+      dependency = null;
+      if (kind == RDMA_RESOURCE_CQ)
+        expect_status({label, "_DEPENDENCY"},
+                      manager.create_ceq(binding, dependency), RDMA_SC_OK);
+      mem = rdma_queue_executor_trace_mem::type_id::create({label, "_mem"});
+      mem.queue_kind = kind;
+      context_backing = rdma_queue_executor_trace_context::type_id::create(
+        {label, "_context"}
+      );
+      cmq = rdma_mock_cmq_port::type_id::create({label, "_cmq"});
+      executor = rdma_queue_lifecycle_executor::type_id::create(
+        {label, "_executor"}
+      );
+      expect_status({label, "_CONFIGURE"}, executor.configure(
+        manager, cmq, mem, context_backing, 100ns), RDMA_SC_OK);
+      request = make_executor_request({label, "_request"}, kind, binding,
+                                      dependency, 1'b0);
+      primary = rdma_status::make(RDMA_SC_UNKNOWN_HW_ERROR,
+                                  {label, " stage"});
+      cleanup_failure = rdma_status::make(RDMA_SC_DMA_TRANSLATION,
+                                          {label, " local release"});
+      void'(manager.fail_next_transition("stage_allocated", primary));
+      if (kind == RDMA_RESOURCE_CQ)
+        void'(context_backing.fail_next("release", cleanup_failure));
+      else
+        void'(mem.fail_next("release", cleanup_failure));
+      executor.create_locked(binding, binding.make_handle(), request,
+                             64'd420 + mode, queue, result);
+      status = manager.lookup_recovery(result.resource_h, recovery);
+      expect_status({label, "_RECOVERY"}, status, RDMA_SC_OK);
+      if (result == null || result.status == null ||
+          result.primary_status == null ||
+          result.status.code != RDMA_SC_RECOVERY_REQUIRED ||
+          result.primary_status.code != RDMA_SC_UNKNOWN_HW_ERROR ||
+          !result.recovery_required || queue == null ||
+          queue.state != RDMA_RESOURCE_ERROR || recovery == null ||
+          recovery.queue_plan == null ||
+          recovery.queue_plan.resource_kind != kind ||
+          recovery.hardware_presence != RDMA_HW_PRESENCE_ABSENT ||
+          recovery.queue_intent != RDMA_QUEUE_RECOVER_CREATE_ROLLBACK ||
+          recovery.ambiguous_queue_operation != RDMA_QUEUE_AMBIG_NONE ||
+          recovery.ambiguous_ticket != null ||
+          count_executor_rollback_code(
+            result.rollback_statuses, RDMA_SC_DMA_TRANSLATION
+          ) != 1 ||
+          count_executor_recovery_step(
+            recovery.pending_steps, RDMA_CTRL_STEP_BACKING_RELEASED
+          ) != 1 || manager.release_reserved_calls != 0)
+        `uvm_error(label,
+                   "pre-stage cleanup failure lost transaction authority")
+      retry_executor_local_cleanup(label, manager, mem, context_backing,
+                                   result.resource_h);
+      if (kind == RDMA_RESOURCE_CQ) begin
+        if (count_executor_host_calls(mem, "release") != 2 ||
+            context_backing.release_call_count != 1)
+          `uvm_error(label, "CQ pre-stage retry duplicated local authority")
+        status = manager.release_reserved(dependency.handle);
+        expect_status({label, "_DEPENDENCY_RELEASED"}, status, RDMA_SC_OK);
+      end
+      else if (count_executor_host_calls(mem, "release") != 3)
+        `uvm_error(label, "EQ pre-stage retry used the wrong host authority")
+    end
+  endtask
+
+  task automatic check_executor_eq_rollback_recovery();
+    rdma_resource_kind_e kinds[$];
+
+    kinds.push_back(RDMA_RESOURCE_CEQ);
+    kinds.push_back(RDMA_RESOURCE_AEQ);
+    foreach (kinds[kind_index]) begin
+      for (int unsigned scenario = 0; scenario < 6; scenario++) begin
+        string label;
+        rdma_resource_kind_e kind;
+        bit borrowed;
+        bit [7:0] create_opcode;
+        bit [7:0] delete_opcode;
+        bit [7:0] query_opcode;
+        rdma_function_binding binding;
+        rdma_fault_inject_resource_manager manager;
+        rdma_queue_executor_trace_mem mem;
+        rdma_queue_executor_trace_context context_backing;
+        rdma_mock_cmq_port cmq;
+        rdma_queue_lifecycle_executor executor;
+        rdma_semantic_request request;
+        rdma_queue_resource queue;
+        rdma_control_result result;
+        rdma_recovery_record recovery;
+        rdma_status primary;
+        rdma_status reset_status;
+        rdma_status cleanup_failure;
+        rdma_status status;
+        int unsigned expected_release_calls;
+
+        kind = kinds[kind_index];
+        borrowed = scenario inside {1, 3, 5};
+        create_opcode = kind == RDMA_RESOURCE_CEQ ? 8'h10 : 8'h14;
+        delete_opcode = kind == RDMA_RESOURCE_CEQ ? 8'h12 : 8'h16;
+        query_opcode = kind == RDMA_RESOURCE_CEQ ? 8'h13 : 8'h17;
+        label = $sformatf("EXEC_%s_ROLLBACK_%0d", kind.name(), scenario);
+        binding = make_binding({label, "_binding"});
+        manager = rdma_fault_inject_resource_manager::type_id::create(
+          {label, "_manager"}
+        );
+        mem = rdma_queue_executor_trace_mem::type_id::create({label, "_mem"});
+        mem.queue_kind = kind;
+        context_backing = rdma_queue_executor_trace_context::type_id::create(
+          {label, "_context"}
+        );
+        cmq = rdma_mock_cmq_port::type_id::create({label, "_cmq"});
+        executor = rdma_queue_lifecycle_executor::type_id::create(
+          {label, "_executor"}
+        );
+        expect_status({label, "_CONFIGURE"}, executor.configure(
+          manager, cmq, mem, context_backing, 100ns), RDMA_SC_OK);
+        request = make_executor_request({label, "_request"}, kind, binding,
+                                        null, borrowed);
+        primary = rdma_status::make(RDMA_SC_UNKNOWN_HW_ERROR,
+                                    {label, " primary"});
+        reset_status = rdma_status::make(RDMA_SC_RESET_CANCELLED,
+                                         {label, " reset cancelled"});
+        cleanup_failure = rdma_status::make(RDMA_SC_DMA_TRANSLATION,
+                                            {label, " host release"});
+        if (scenario != 2)
+          void'(manager.fail_next_transition("commit_programmed", primary));
+        case (scenario)
+          2: cmq.fail_opcode(create_opcode, reset_status);
+          3: cmq.fail_opcode(delete_opcode, reset_status);
+          4, 5: void'(mem.fail_next("release", cleanup_failure));
+          default: begin end
+        endcase
+        executor.create_locked(binding, binding.make_handle(), request,
+                               64'd500 + kind_index * 10 + scenario,
+                               queue, result);
+        foreach (cmq.calls[i])
+          if (cmq.calls[i].opcode == 8'h0a)
+            `uvm_error(label, "EQ rollback issued a CQ OCC flush")
+        if (scenario inside {0, 1}) begin
+          expected_release_calls = borrowed ? 1 : 2;
+          if (queue != null || result == null || result.status == null ||
+              result.primary_status == null || result.recovery_required ||
+              result.status.code != RDMA_SC_UNKNOWN_HW_ERROR ||
+              result.primary_status.code != RDMA_SC_UNKNOWN_HW_ERROR ||
+              !result.final_resource_state_known ||
+              result.final_resource_state != RDMA_RESOURCE_RELEASED ||
+              cmq.calls.size() != 2 ||
+              cmq.calls[0].opcode != create_opcode ||
+              cmq.calls[1].opcode != delete_opcode ||
+              count_executor_host_calls(mem, "release") !=
+                expected_release_calls ||
+              manager.release_reserved_calls != 1 ||
+              mem.live_allocations() != 0)
+            `uvm_error(label, "definitive EQ rollback was not fail-atomic")
+          continue;
+        end
+        if (scenario inside {2, 3}) begin
+          status = manager.lookup_recovery(result.resource_h, recovery);
+          expect_status({label, "_RECOVERY"}, status, RDMA_SC_OK);
+          if (result == null || result.status == null ||
+              result.primary_status == null ||
+              result.status.code != RDMA_SC_RECOVERY_REQUIRED ||
+              result.primary_status.code != (scenario == 2 ?
+                RDMA_SC_RESET_CANCELLED : RDMA_SC_UNKNOWN_HW_ERROR) ||
+              !result.recovery_required || queue == null ||
+              queue.state != RDMA_RESOURCE_ERROR || recovery == null ||
+              recovery.queue_plan == null ||
+              recovery.queue_plan.refs[0].ownership != (borrowed ?
+                RDMA_OWNERSHIP_BORROWED : RDMA_OWNERSHIP_CONTROL_PLANE) ||
+              recovery.hardware_presence != RDMA_HW_PRESENCE_UNKNOWN ||
+              recovery.ambiguous_queue_operation != (scenario == 2 ?
+                RDMA_QUEUE_AMBIG_CREATE : RDMA_QUEUE_AMBIG_DELETE) ||
+              recovery.ambiguous_ticket == null ||
+              recovery.ambiguous_ticket.opcode_key == null ||
+              recovery.ambiguous_ticket.opcode_key.opcode != (scenario == 2 ?
+                create_opcode : delete_opcode) ||
+              recovery.queue_create_opcode.opcode != create_opcode ||
+              recovery.queue_delete_opcode.opcode != delete_opcode ||
+              recovery.queue_query_opcode.opcode != query_opcode ||
+              count_executor_host_calls(mem, "release") != 0 ||
+              manager.release_reserved_calls != 0)
+            `uvm_error(label, "reset-cancelled EQ authority was not retained")
+          continue;
+        end
+        status = manager.lookup_recovery(result.resource_h, recovery);
+        expect_status({label, "_RECOVERY"}, status, RDMA_SC_OK);
+        expected_release_calls = borrowed ? 1 : 2;
+        if (result == null || result.status == null ||
+            result.primary_status == null ||
+            result.status.code != RDMA_SC_RECOVERY_REQUIRED ||
+            result.primary_status.code != RDMA_SC_UNKNOWN_HW_ERROR ||
+            !result.recovery_required || queue == null ||
+            queue.state != RDMA_RESOURCE_ERROR || recovery == null ||
+            recovery.queue_plan == null ||
+            recovery.hardware_presence != RDMA_HW_PRESENCE_ABSENT ||
+            recovery.ambiguous_queue_operation != RDMA_QUEUE_AMBIG_NONE ||
+            recovery.ambiguous_ticket != null ||
+            count_executor_rollback_code(
+              result.rollback_statuses, RDMA_SC_DMA_TRANSLATION
+            ) != 1 ||
+            count_executor_recovery_step(
+              recovery.pending_steps, RDMA_CTRL_STEP_BACKING_RELEASED
+            ) != 1 ||
+            count_executor_host_calls(mem, "release") !=
+              expected_release_calls ||
+            manager.release_reserved_calls != 0 ||
+            mem.live_allocations() != 1)
+          `uvm_error(label, "EQ cleanup failure lost durable authority")
+        retry_executor_local_cleanup(label, manager, mem, context_backing,
+                                     result.resource_h);
+        if (count_executor_host_calls(mem, "release") !=
+              expected_release_calls + 1 || mem.live_allocations() != 0)
+          `uvm_error(label, "EQ cleanup retry used the wrong authority")
+      end
+    end
+  endtask
+
   task automatic check_executor_srq_unsupported();
     rdma_function_binding binding;
     rdma_fault_inject_resource_manager manager;
@@ -2487,6 +3018,10 @@ class rdma_queue_lifecycle_test extends uvm_test;
     check_executor_positive_case(RDMA_RESOURCE_AEQ, 1'b1);
     for (int unsigned mode = 0; mode < 12; mode++)
       check_executor_failure_case(mode);
+    check_executor_cq_reset_cancelled();
+    check_executor_local_cleanup_recovery();
+    check_executor_prestage_cleanup_recovery();
+    check_executor_eq_rollback_recovery();
     check_executor_srq_unsupported();
   endtask
 

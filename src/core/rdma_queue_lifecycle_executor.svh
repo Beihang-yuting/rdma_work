@@ -44,6 +44,18 @@ class rdma_queue_lifecycle_executor extends uvm_object;
     return status;
   endfunction
 
+  protected function bit cmq_outcome_ambiguous(
+    rdma_status status,
+    rdma_cmq_completion completion
+  );
+    if (status == null || completion == null || completion.status == null)
+      return 1'b1;
+    return status.code inside {RDMA_SC_TIMEOUT, RDMA_SC_RESET_CANCELLED} ||
+           completion.status.code inside {
+             RDMA_SC_TIMEOUT, RDMA_SC_RESET_CANCELLED
+           };
+  endfunction
+
   function rdma_status configure(
     rdma_resource_manager manager,
     rdma_cmq_port cmq,
@@ -249,6 +261,15 @@ class rdma_queue_lifecycle_executor extends uvm_object;
     endcase
   endfunction
 
+  protected function bit [7:0] create_opcode(rdma_resource_kind_e kind);
+    case (kind)
+      RDMA_RESOURCE_CQ:  return XTR_V1_OP_CQC_CREATE;
+      RDMA_RESOURCE_CEQ: return XTR_V1_OP_CEQC_CREATE;
+      RDMA_RESOURCE_AEQ: return XTR_V1_OP_AEQC_CREATE;
+      default:           return 8'h00;
+    endcase
+  endfunction
+
   protected function bit [7:0] query_opcode(rdma_resource_kind_e kind);
     case (kind)
       RDMA_RESOURCE_CQ:  return XTR_V1_OP_CQC_QUERY;
@@ -344,6 +365,7 @@ class rdma_queue_lifecycle_executor extends uvm_object;
     rdma_queue_ambiguous_operation_e ambiguous_operation,
     rdma_cmq_ticket ticket,
     bit pending_delete,
+    bit pending_local_cleanup,
     output rdma_recovery_record recovery
   );
     rdma_cmq_command_desc delete_command;
@@ -352,7 +374,6 @@ class rdma_queue_lifecycle_executor extends uvm_object;
 
     recovery = null;
     if (policy == null || resource == null || plan == null ||
-        create_command == null || create_command.opcode_key == null ||
         primary == null || result == null)
       return invalid_argument("queue recovery input is incomplete");
     status = normalize_status(policy.build_object_command(
@@ -372,6 +393,8 @@ class rdma_queue_lifecycle_executor extends uvm_object;
     recovery.completed_steps = result.completed_steps;
     if (pending_delete)
       recovery.pending_steps.push_back(RDMA_CTRL_STEP_HW_CONTEXT_DELETED);
+    if (pending_local_cleanup)
+      recovery.pending_steps.push_back(RDMA_CTRL_STEP_BACKING_RELEASED);
     recovery.ambiguous_ticket = rdma_cmq_clone_ticket_value(
       ticket, "queue recovery"
     );
@@ -380,11 +403,26 @@ class rdma_queue_lifecycle_executor extends uvm_object;
     recovery.queue_recovery_valid = 1'b1;
     recovery.queue_intent = RDMA_QUEUE_RECOVER_CREATE_ROLLBACK;
     recovery.ambiguous_queue_operation = ambiguous_operation;
-    recovery.ambiguous_role = plan.refs.size() == 0 ?
-      RDMA_QUEUE_ROLE_CQ_RING : plan.refs[0].role;
-    recovery.queue_create_opcode = rdma_cmq_clone_opcode_key_value(
-      create_command.opcode_key, "queue recovery create"
-    );
+    if (ambiguous_operation == RDMA_QUEUE_AMBIG_OCC_FLUSH &&
+        plan.flush_targets.size() != 0)
+      recovery.ambiguous_role = plan.flush_targets[0].role;
+    else
+      recovery.ambiguous_role = plan.refs.size() == 0 ?
+        RDMA_QUEUE_ROLE_CQ_RING : plan.refs[0].role;
+    if (create_command != null && create_command.opcode_key != null) begin
+      recovery.queue_create_opcode = rdma_cmq_clone_opcode_key_value(
+        create_command.opcode_key, "queue recovery create"
+      );
+    end
+    else begin
+      recovery.queue_create_opcode = rdma_cmq_opcode_key::type_id::create(
+        "queue_recovery_create_opcode"
+      );
+      recovery.queue_create_opcode.profile_name = "xtr_v1";
+      recovery.queue_create_opcode.opcode =
+        create_opcode(resource.resource_kind());
+      recovery.queue_create_opcode.variant = "create";
+    end
     recovery.queue_delete_opcode = rdma_cmq_clone_opcode_key_value(
       delete_command.opcode_key, "queue recovery delete"
     );
@@ -444,6 +482,7 @@ class rdma_queue_lifecycle_executor extends uvm_object;
     rdma_queue_ambiguous_operation_e ambiguous_operation,
     rdma_cmq_ticket ticket,
     bit pending_delete,
+    bit pending_local_cleanup,
     output rdma_queue_resource queue
   );
     rdma_recovery_record recovery;
@@ -453,13 +492,14 @@ class rdma_queue_lifecycle_executor extends uvm_object;
     queue = null;
     status = build_recovery(policy, resource, plan, create_command, primary,
                             result, presence, ambiguous_operation, ticket,
-                            pending_delete, recovery);
+                            pending_delete, pending_local_cleanup, recovery);
     status = normalize_status(status, "queue recovery build returned null");
     if (status.ok())
       status = normalize_status(manager.mark_error(resource.handle, recovery),
                                 "queue mark ERROR returned null");
-    if (!status.ok())
+    if (!status.ok()) begin
       append_rollback(result, status);
+    end
     else begin
       status = normalize_status(manager.lookup(resource.handle, snapshot),
                                 "queue ERROR lookup returned null");
@@ -496,15 +536,13 @@ class rdma_queue_lifecycle_executor extends uvm_object;
       append_rollback(result, status);
       retain_recovery(policy, resource, plan, create_command, primary, result,
                       RDMA_HW_PRESENCE_PRESENT, RDMA_QUEUE_AMBIG_NONE, null,
-                      1'b1, queue);
+                      1'b1, 1'b1, queue);
       return;
     end
     ticket = null;
     completion = null;
     cmq.execute(command, ticket, completion, status);
-    ambiguous = status == null || completion == null ||
-                (completion != null && completion.status == null) ||
-                (status != null && status.code == RDMA_SC_TIMEOUT);
+    ambiguous = cmq_outcome_ambiguous(status, completion);
     status = normalize_status(status, "queue rollback delete result was lost");
     if (status.ok() &&
         (completion == null || completion.status == null))
@@ -515,7 +553,7 @@ class rdma_queue_lifecycle_executor extends uvm_object;
       retain_recovery(policy, resource, plan, create_command, primary, result,
                       presence,
                       ambiguous ? RDMA_QUEUE_AMBIG_DELETE : RDMA_QUEUE_AMBIG_NONE,
-                      ambiguous ? ticket : null, 1'b1, queue);
+                      ambiguous ? ticket : null, 1'b1, 1'b1, queue);
       return;
     end
     result.completed_steps.push_back(RDMA_CTRL_STEP_HW_CONTEXT_DELETED);
@@ -527,9 +565,7 @@ class rdma_queue_lifecycle_executor extends uvm_object;
         ticket = null;
         completion = null;
         cmq.execute(command, ticket, completion, status);
-        ambiguous = status == null || completion == null ||
-                    (completion != null && completion.status == null) ||
-                    (status != null && status.code == RDMA_SC_TIMEOUT);
+        ambiguous = cmq_outcome_ambiguous(status, completion);
         status = normalize_status(status, "CQ rollback flush result was lost");
         if (status.ok() &&
             (completion == null || completion.status == null))
@@ -542,7 +578,7 @@ class rdma_queue_lifecycle_executor extends uvm_object;
                         RDMA_HW_PRESENCE_ABSENT,
                         ambiguous ? RDMA_QUEUE_AMBIG_OCC_FLUSH :
                                     RDMA_QUEUE_AMBIG_NONE,
-                        ambiguous ? ticket : null, 1'b0, queue);
+                        ambiguous ? ticket : null, 1'b0, 1'b1, queue);
         return;
       end
       result.completed_steps.push_back(RDMA_CTRL_STEP_HW_OCC_FLUSHED);
@@ -552,7 +588,8 @@ class rdma_queue_lifecycle_executor extends uvm_object;
       rdma_recovery_record recovery;
       status = build_recovery(policy, resource, plan, create_command, primary,
                               result, RDMA_HW_PRESENCE_ABSENT,
-                              RDMA_QUEUE_AMBIG_NONE, null, 1'b0, recovery);
+                              RDMA_QUEUE_AMBIG_NONE, null, 1'b0, 1'b0,
+                              recovery);
       if (status.ok())
         status = normalize_status(manager.mark_error(resource.handle, recovery),
                                   "programmed queue mark ERROR returned null");
@@ -565,12 +602,9 @@ class rdma_queue_lifecycle_executor extends uvm_object;
     status = cleanup_local(plan, result, registry_programmed,
                            resource.handle);
     if (!status.ok()) begin
-      if (!registry_programmed)
-        retain_recovery(policy, resource, plan, create_command, primary, result,
-                        RDMA_HW_PRESENCE_ABSENT, RDMA_QUEUE_AMBIG_NONE, null,
-                        1'b0, queue);
-      else
-        publish_failure(primary, result, RDMA_RESOURCE_ERROR, 1'b1, 1'b1);
+      retain_recovery(policy, resource, plan, create_command, primary, result,
+                      RDMA_HW_PRESENCE_ABSENT, RDMA_QUEUE_AMBIG_NONE, null,
+                      1'b0, 1'b1, queue);
       return;
     end
     status = registry_programmed ? manager.finalize_release(resource.handle) :
@@ -587,24 +621,37 @@ class rdma_queue_lifecycle_executor extends uvm_object;
   endtask
 
   protected function void rollback_local(
+    rdma_queue_lifecycle_policy policy,
     rdma_queue_resource resource,
     rdma_queue_backing_plan plan,
+    rdma_cmq_command_desc create_command,
     rdma_status primary,
-    rdma_control_result result
+    rdma_control_result result,
+    output rdma_queue_resource queue
   );
     rdma_status status;
 
+    queue = null;
     status = cleanup_local(plan, result, 1'b0,
                            resource == null ? null : resource.handle);
+    if (!status.ok() && resource != null && plan != null) begin
+      retain_recovery(policy, resource, plan, create_command, primary, result,
+                      RDMA_HW_PRESENCE_ABSENT, RDMA_QUEUE_AMBIG_NONE, null,
+                      1'b0, 1'b1, queue);
+      return;
+    end
     if (resource != null) begin
       status = normalize_status(manager.release_reserved(resource.handle),
                                 "queue reservation release returned null");
-      if (!status.ok()) append_rollback(result, status);
+      if (!status.ok()) begin
+        append_rollback(result, status);
+      end
       else result.completed_steps.push_back(RDMA_CTRL_STEP_RESOURCE_RELEASED);
     end
     publish_failure(primary, result,
-      resource == null ? RDMA_RESOURCE_NEW : RDMA_RESOURCE_RELEASED,
-      resource != null, result.rollback_statuses.size() != 0);
+      resource == null ? RDMA_RESOURCE_NEW :
+      (status.ok() ? RDMA_RESOURCE_RELEASED : RDMA_RESOURCE_ALLOCATED),
+      resource != null, !status.ok());
   endfunction
 
   task create_locked(
@@ -694,14 +741,16 @@ class rdma_queue_lifecycle_executor extends uvm_object;
       result.completed_steps.push_back(RDMA_CTRL_STEP_RESOURCE_RESERVED);
       status = populate_resource(reserved, preflight);
       if (!status.ok()) begin
-        rollback_local(reserved, null, status, result);
+        rollback_local(policy, reserved, null, create_command, status, result,
+                       queue);
         return;
       end
       status = normalize_status(planner.materialize(
         binding, preflight, reserved.handle, plan
       ), "queue planner materialize returned null");
       if (!status.ok()) begin
-        rollback_local(reserved, null, status, result);
+        rollback_local(policy, reserved, null, create_command, status, result,
+                       queue);
         return;
       end
       result.completed_steps.push_back(RDMA_CTRL_STEP_BACKING_ATTACHED);
@@ -709,7 +758,8 @@ class rdma_queue_lifecycle_executor extends uvm_object;
         rdma_cq cq;
         if (!$cast(cq, reserved)) begin
           status = invalid_state("reserved CQ type was lost");
-          rollback_local(reserved, plan, status, result);
+          rollback_local(policy, reserved, plan, create_command, status,
+                         result, queue);
           return;
         end
         status = normalize_status(context_backing.acquire(
@@ -717,7 +767,8 @@ class rdma_queue_lifecycle_executor extends uvm_object;
         ), "CQ context acquire returned null");
         if (!status.ok() || context_ref == null) begin
           if (status.ok()) status = invalid_state("CQ context acquire is null");
-          rollback_local(reserved, plan, status, result);
+          rollback_local(policy, reserved, plan, create_command, status,
+                         result, queue);
           return;
         end
         plan.context_ref = context_ref;
@@ -727,19 +778,22 @@ class rdma_queue_lifecycle_executor extends uvm_object;
       status = normalize_status(manager.stage_allocated(reserved),
                                 "queue stage allocated returned null");
       if (!status.ok()) begin
-        rollback_local(reserved, plan, status, result);
+        rollback_local(policy, reserved, plan, create_command, status, result,
+                       queue);
         return;
       end
       status = initialize_plan(binding, plan);
       if (!status.ok()) begin
-        rollback_local(reserved, plan, status, result);
+        rollback_local(policy, reserved, plan, create_command, status, result,
+                       queue);
         return;
       end
       builder_resource = reserved;
       if (reserved.resource_kind() == RDMA_RESOURCE_CQ) begin
         status = cq_builder_view(reserved, builder_resource);
         if (!status.ok()) begin
-          rollback_local(reserved, plan, status, result);
+          rollback_local(policy, reserved, plan, create_command, status,
+                         result, queue);
           return;
         end
       end
@@ -747,7 +801,8 @@ class rdma_queue_lifecycle_executor extends uvm_object;
         builder_resource, plan, context_model, slot_image, shadow_image
       ), "queue context builder returned null");
       if (!status.ok()) begin
-        rollback_local(reserved, plan, status, result);
+        rollback_local(policy, reserved, plan, create_command, status, result,
+                       queue);
         return;
       end
       if (reserved.resource_kind() == RDMA_RESOURCE_CQ) begin
@@ -760,7 +815,8 @@ class rdma_queue_lifecycle_executor extends uvm_object;
             shadow_image
           ), "CQ context shadow write returned null");
         if (!status.ok()) begin
-          rollback_local(reserved, plan, status, result);
+          rollback_local(policy, reserved, plan, create_command, status,
+                         result, queue);
           return;
         end
       end
@@ -769,15 +825,14 @@ class rdma_queue_lifecycle_executor extends uvm_object;
         create_command
       ), "queue create descriptor returned null");
       if (!status.ok()) begin
-        rollback_local(reserved, plan, status, result);
+        rollback_local(policy, reserved, plan, create_command, status, result,
+                       queue);
         return;
       end
       ticket = null;
       completion = null;
       cmq.execute(create_command, ticket, completion, status);
-      cmq_ambiguous = status == null || completion == null ||
-                      (completion != null && completion.status == null) ||
-                      (status != null && status.code == RDMA_SC_TIMEOUT);
+      cmq_ambiguous = cmq_outcome_ambiguous(status, completion);
       status = normalize_status(status, "queue create result was lost");
       if (status.ok() &&
           (completion == null || completion.status == null))
@@ -787,10 +842,11 @@ class rdma_queue_lifecycle_executor extends uvm_object;
         if (cmq_ambiguous) begin
           retain_recovery(policy, reserved, plan, create_command, primary,
                           result, RDMA_HW_PRESENCE_UNKNOWN,
-                          RDMA_QUEUE_AMBIG_CREATE, ticket, 1'b1, queue);
+                          RDMA_QUEUE_AMBIG_CREATE, ticket, 1'b1, 1'b1, queue);
         end
         else begin
-          rollback_local(reserved, plan, primary, result);
+          rollback_local(policy, reserved, plan, create_command, primary,
+                         result, queue);
         end
         return;
       end

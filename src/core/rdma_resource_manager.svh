@@ -3947,25 +3947,130 @@ class rdma_resource_manager extends uvm_object;
                                         RDMA_RESOURCE_CEQ, RDMA_RESOURCE_AEQ}) begin
       rdma_queue_resource queue_replacement;
       rdma_queue_backing_plan authoritative_plan;
+      rdma_queue_backing_plan recovery_plan;
+      bit transaction_local_recovery;
 
       if (!recovery_copy.queue_recovery_valid ||
-          !$cast(queue_replacement, replacement) ||
-          queue_replacement.queue_plan == null)
+          !$cast(queue_replacement, replacement))
         return rdma_status::make(
           RDMA_SC_INVALID_ARGUMENT,
           "queue ERROR recovery lacks authoritative queue plan"
         );
-      // A QUIESCING progress record lives only in the registry.  Make that
-      // snapshot authoritative when ERROR recovery begins so callers cannot
-      // erase already-proven cleanup by supplying an older plan.
-      status = project_queue_plan_value(queue_replacement.queue_plan,
-                                        "mark error authoritative queue plan",
-                                        authoritative_plan);
-      if (status == null)
-        return rdma_status::make(RDMA_SC_INVALID_STATE,
-                                 "queue ERROR plan projection returned null");
-      if (!status.ok()) return status;
-      recovery_copy.queue_plan = authoritative_plan;
+      transaction_local_recovery = queue_replacement.queue_plan == null;
+      if (transaction_local_recovery) begin
+        if (queue_replacement.state != RDMA_RESOURCE_ALLOCATED ||
+            staged_allocations.exists(key) ||
+            recovery_copy.hardware_presence != RDMA_HW_PRESENCE_ABSENT ||
+            recovery_copy.queue_intent !=
+              RDMA_QUEUE_RECOVER_CREATE_ROLLBACK ||
+            recovery_copy.ambiguous_queue_operation != RDMA_QUEUE_AMBIG_NONE ||
+            recovery_copy.ambiguous_ticket != null ||
+            recovery_copy.pending_steps.size() != 1 ||
+            recovery_copy.pending_steps[0] !=
+              RDMA_CTRL_STEP_BACKING_RELEASED ||
+            recovery_copy.queue_plan == null ||
+            recovery_copy.queue_plan.resource_kind !=
+              queue_replacement.resource_kind())
+          return rdma_status::make(
+            RDMA_SC_INVALID_ARGUMENT,
+            "unstaged queue ERROR recovery is not canonical local rollback"
+          );
+        foreach (recovery_copy.completed_steps[i]) begin
+          if (rdma_control_step_is_hardware(recovery_copy.completed_steps[i]))
+            return rdma_status::make(
+              RDMA_SC_INVALID_ARGUMENT,
+              "unstaged queue ERROR recovery contains hardware history"
+            );
+        end
+        foreach (recovery_copy.queue_plan.refs[i]) begin
+          if (recovery_copy.queue_plan.refs[i] == null ||
+              recovery_copy.queue_plan.refs[i].mapping == null ||
+              !same_handle_instance(
+                recovery_copy.queue_plan.refs[i].mapping.function_h,
+                queue_replacement.owner
+              ) ||
+              (recovery_copy.queue_plan.refs[i].ownership ==
+                 RDMA_OWNERSHIP_CONTROL_PLANE &&
+               !same_handle_instance(
+                 recovery_copy.queue_plan.refs[i].mapping.owner_h,
+                 trusted_handle
+               )))
+            return rdma_status::make(
+              RDMA_SC_INVALID_ARGUMENT,
+              "unstaged queue ERROR backing owner is not authoritative"
+            );
+          foreach (recovery_copy.queue_plan.refs[i].additional_segments[j]) begin
+            if (recovery_copy.queue_plan.refs[i].additional_segments[j] == null ||
+                recovery_copy.queue_plan.refs[i].additional_segments[j].mapping ==
+                  null ||
+                !same_handle_instance(
+                  recovery_copy.queue_plan.refs[i].additional_segments[j].
+                    mapping.function_h,
+                  queue_replacement.owner
+                ) ||
+                (recovery_copy.queue_plan.refs[i].additional_segments[j].
+                   ownership == RDMA_OWNERSHIP_CONTROL_PLANE &&
+                 !same_handle_instance(
+                   recovery_copy.queue_plan.refs[i].additional_segments[j].
+                     mapping.owner_h,
+                   trusted_handle
+                 )))
+              return rdma_status::make(
+                RDMA_SC_INVALID_ARGUMENT,
+                "unstaged queue ERROR segment owner is not authoritative"
+              );
+          end
+        end
+        if (recovery_copy.queue_plan.context_ref != null &&
+            !same_handle_instance(
+              recovery_copy.queue_plan.context_ref.owner,
+              queue_replacement.owner
+            ))
+          return rdma_status::make(
+            RDMA_SC_INVALID_ARGUMENT,
+            "unstaged queue ERROR context owner is not authoritative"
+          );
+        status = project_queue_plan_value(
+          recovery_copy.queue_plan, "mark error transaction resource plan",
+          authoritative_plan
+        );
+        if (status == null)
+          return rdma_status::make(
+            RDMA_SC_INVALID_STATE,
+            "transaction resource plan projection returned null"
+          );
+        if (!status.ok()) return status;
+        status = project_queue_plan_value(
+          recovery_copy.queue_plan, "mark error transaction recovery plan",
+          recovery_plan
+        );
+        if (status == null)
+          return rdma_status::make(
+            RDMA_SC_INVALID_STATE,
+            "transaction recovery plan projection returned null"
+          );
+        if (!status.ok()) return status;
+        queue_replacement.queue_plan = authoritative_plan;
+        queue_replacement.depth = authoritative_plan.rings[0].depth;
+        recovery_copy.queue_plan = recovery_plan;
+        replacement = queue_replacement;
+      end
+      else begin
+        // A QUIESCING progress record lives only in the registry.  Make that
+        // snapshot authoritative when ERROR recovery begins so callers cannot
+        // erase already-proven cleanup by supplying an older plan.
+        status = project_queue_plan_value(
+          queue_replacement.queue_plan,
+          "mark error authoritative queue plan", authoritative_plan
+        );
+        if (status == null)
+          return rdma_status::make(
+            RDMA_SC_INVALID_STATE,
+            "queue ERROR plan projection returned null"
+          );
+        if (!status.ok()) return status;
+        recovery_copy.queue_plan = authoritative_plan;
+      end
       status = recovery_copy.validate();
       if (status == null)
         return rdma_status::make(RDMA_SC_INVALID_STATE,

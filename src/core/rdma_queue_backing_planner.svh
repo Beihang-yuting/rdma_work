@@ -1021,6 +1021,35 @@ class rdma_queue_backing_planner extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  protected function rdma_status release_local_mapping(
+    rdma_dma_mapping mapping
+  );
+    rdma_dma_mapping release_authority;
+    rdma_status status;
+
+    if (mapping == null)
+      return invalid_argument("queue cleanup mapping is null");
+    status = normalize_status(mapping.snapshot_release_authority(
+      release_authority
+    ), "queue cleanup authority snapshot returned null");
+    if (!status.ok() || release_authority == null)
+      return status.ok() ?
+        invalid_state("queue cleanup authority snapshot is null") : status;
+    status = normalize_status(mapping.release_authority_status(
+      release_authority
+    ), "queue cleanup authority check returned null");
+    if (!status.ok())
+      return status;
+    release_authority.copy(mapping);
+    status = normalize_status(mapping.release_authority_status(
+      release_authority
+    ), "copied queue cleanup authority check returned null");
+    if (!status.ok())
+      return status;
+    return normalize_status(host_mem.\release (release_authority),
+                            "queue host release returned null");
+  endfunction
+
   function rdma_status cleanup_local_role(
     rdma_queue_backing_ref ref_value,
     output bit complete
@@ -1046,8 +1075,7 @@ class rdma_queue_backing_planner extends uvm_object;
     if (!status.ok())
       return status;
     if (!release_complete) begin
-      status = normalize_status(host_mem.\release (ref_value.mapping),
-                                "queue host release returned null");
+      status = release_local_mapping(ref_value.mapping);
       if (!status.ok())
         return status;
       release_complete = 1'b0;
@@ -1076,9 +1104,9 @@ class rdma_queue_backing_planner extends uvm_object;
         return status;
       if (release_complete)
         continue;
-      status = normalize_status(host_mem.\release (
+      status = release_local_mapping(
         ref_value.additional_segments[i].mapping
-      ), "queue segment host release returned null");
+      );
       if (!status.ok())
         return status;
       release_complete = 1'b0;
