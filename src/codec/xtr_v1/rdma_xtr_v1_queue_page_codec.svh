@@ -24,7 +24,7 @@ class rdma_xtr_v1_queue_pd_codec extends uvm_object;
     super.new(name);
   endfunction
 
-  function rdma_status encode_entry(
+  virtual function rdma_status encode_entry(
     rdma_xtr_v1_queue_pd_entry entry,
     inout byte unsigned bytes[]
   );

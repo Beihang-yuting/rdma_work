@@ -1,3 +1,32 @@
+class rdma_xtr_v1_queue_pd_fault_codec extends rdma_xtr_v1_queue_pd_codec;
+  `uvm_object_utils(rdma_xtr_v1_queue_pd_fault_codec)
+
+  int unsigned call_count;
+  int unsigned delegated_success_count;
+
+  function new(string name = "rdma_xtr_v1_queue_pd_fault_codec");
+    super.new(name);
+    call_count = 0;
+    delegated_success_count = 0;
+  endfunction
+
+  virtual function rdma_status encode_entry(
+    rdma_xtr_v1_queue_pd_entry entry,
+    inout byte unsigned bytes[]
+  );
+    rdma_status status;
+
+    call_count++;
+    if (call_count == 2)
+      return rdma_status::make(RDMA_SC_CODEC_ERROR,
+                               "injected second-entry encode failure");
+    status = super.encode_entry(entry, bytes);
+    if (status.ok())
+      delegated_success_count++;
+    return status;
+  endfunction
+endclass
+
 class rdma_xtr_v1_queue_page_codec_test extends uvm_test;
   `uvm_component_utils(rdma_xtr_v1_queue_page_codec_test)
 
@@ -58,6 +87,7 @@ class rdma_xtr_v1_queue_page_codec_test extends uvm_test;
 
   task run_phase(uvm_phase phase);
     rdma_xtr_v1_queue_pd_entry entry;
+    rdma_xtr_v1_queue_pd_fault_codec fault_codec;
     rdma_queue_dma_page_ref pages[$];
     byte unsigned bytes[];
     byte unsigned expected[];
@@ -162,6 +192,34 @@ class rdma_xtr_v1_queue_page_codec_test extends uvm_test;
     expect_status("TABLE_PAGE_VALUE", codec.encode_table(pages, 8'h05, bytes),
                   RDMA_SC_DMA_TRANSLATION);
     expect_sentinel("TABLE_PAGE_VALUE_ATOMIC", bytes);
+
+    pages.delete();
+    pages.push_back(make_page("table_unaligned",
+                              64'h0000_0002_1000_0001, 0));
+    reset_sentinel(bytes);
+    expect_status("TABLE_PAGE_UNALIGNED",
+                  codec.encode_table(pages, 8'h05, bytes),
+                  RDMA_SC_INVALID_ARGUMENT);
+    expect_sentinel("TABLE_PAGE_UNALIGNED_ATOMIC", bytes);
+
+    pages.delete();
+    pages.push_back(make_page("fault_page0", 64'h0000_0002_2000_0000, 0));
+    pages.push_back(make_page("fault_page1", 64'h0000_0002_2000_1000,
+                              4096));
+    fault_codec = rdma_xtr_v1_queue_pd_fault_codec::type_id::create(
+        "fault_codec");
+    bytes = '{8'hc3, 8'h5a, 8'h00, 8'hff, 8'h19, 8'he7, 8'h42};
+    expected = '{8'hc3, 8'h5a, 8'h00, 8'hff, 8'h19, 8'he7, 8'h42};
+    expect_status("TABLE_LATE_ENTRY_FAILURE",
+                  fault_codec.encode_table(pages, 8'h05, bytes),
+                  RDMA_SC_CODEC_ERROR);
+    if (fault_codec.call_count != 2 ||
+        fault_codec.delegated_success_count != 1)
+      `uvm_error("TABLE_LATE_ENTRY_PATH",
+                 "fault was not injected after one encoded temporary entry")
+    if (bytes != expected)
+      `uvm_error("TABLE_LATE_ENTRY_ATOMIC",
+                 "later entry failure changed caller table output")
 
     pages.delete();
     pages.push_back(make_page("gap0", 64'h0000_0003_0000_0000, 0));
