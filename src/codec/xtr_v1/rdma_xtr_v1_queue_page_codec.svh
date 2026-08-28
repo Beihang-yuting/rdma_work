@@ -1,0 +1,110 @@
+class rdma_xtr_v1_queue_pd_entry extends uvm_object;
+  `uvm_object_utils(rdma_xtr_v1_queue_pd_entry)
+
+  rdma_iova_t page_iova;
+  int unsigned rdma_vf_id;
+  bit valid;
+
+  function new(string name = "rdma_xtr_v1_queue_pd_entry");
+    super.new(name);
+    page_iova = '0;
+    rdma_vf_id = 0;
+    valid = 1'b0;
+  endfunction
+endclass
+
+class rdma_xtr_v1_queue_pd_codec extends uvm_object;
+  `uvm_object_utils(rdma_xtr_v1_queue_pd_codec)
+
+  localparam int unsigned PAGE_BYTES = 4096;
+  localparam int unsigned MAX_PAGES = 512;
+  localparam int unsigned TABLE_BYTES = MAX_PAGES * 8;
+
+  function new(string name = "rdma_xtr_v1_queue_pd_codec");
+    super.new(name);
+  endfunction
+
+  function rdma_status encode_entry(
+    rdma_xtr_v1_queue_pd_entry entry,
+    inout byte unsigned bytes[]
+  );
+    bit [63:0] word;
+    byte unsigned encoded[];
+
+    if (entry == null)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "queue PD entry is null");
+    if (!rdma_queue_aligned(entry.page_iova.value, PAGE_BYTES))
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "queue PD entry IOVA is unaligned");
+    if (entry.rdma_vf_id > 8'hff)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "queue PD entry VF ID exceeds eight bits");
+
+    word = (entry.page_iova.value & 64'hffff_ffff_ffff_f000) |
+           ((longint'(entry.rdma_vf_id) & 64'hff) << 4) |
+           longint'(entry.valid);
+    encoded = new[8];
+    for (int unsigned i = 0; i < 8; i++)
+      encoded[i] = word[63 - i*8 -: 8];
+    bytes = encoded;
+    return rdma_status::success();
+  endfunction
+
+  function rdma_status encode_table(
+    rdma_queue_dma_page_ref pages[$],
+    int unsigned rdma_vf_id,
+    inout byte unsigned bytes[]
+  );
+    rdma_status status;
+    byte unsigned encoded[];
+    byte unsigned entry_bytes[];
+    rdma_xtr_v1_queue_pd_entry entry;
+    longint unsigned expected_offset;
+    longint unsigned logical_index;
+
+    if (rdma_vf_id > 8'hff)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "queue PD table VF ID exceeds eight bits");
+    if (pages.size() == 0 || pages.size() > MAX_PAGES)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "queue PD table page count is outside 1..512");
+
+    // Preflight every page before allocating or publishing any output.
+    foreach (pages[i]) begin
+      if (pages[i] == null)
+        return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                                 "queue PD table contains a null page");
+      status = pages[i].validate();
+      if (!status.ok())
+        return status;
+      expected_offset = longint'(i) * PAGE_BYTES;
+      if (pages[i].logical_page_offset != expected_offset)
+        return rdma_status::make(
+            RDMA_SC_INVALID_ARGUMENT,
+            "queue PD table logical page offsets are not contiguous");
+    end
+
+    encoded = new[TABLE_BYTES];
+    foreach (encoded[i])
+      encoded[i] = 8'h00;
+
+    foreach (pages[i]) begin
+      logical_index = pages[i].logical_page_offset / PAGE_BYTES;
+      entry = rdma_xtr_v1_queue_pd_entry::type_id::create(
+          $sformatf("queue_pd_entry_%0d", logical_index));
+      entry.page_iova = pages[i].page_iova;
+      entry.rdma_vf_id = rdma_vf_id;
+      entry.valid = 1'b1;
+      entry_bytes = new[0];
+      status = encode_entry(entry, entry_bytes);
+      if (!status.ok())
+        return status;
+      for (int unsigned j = 0; j < 8; j++)
+        encoded[(logical_index * 8) + j] = entry_bytes[j];
+    end
+
+    bytes = encoded;
+    return rdma_status::success();
+  endfunction
+endclass
