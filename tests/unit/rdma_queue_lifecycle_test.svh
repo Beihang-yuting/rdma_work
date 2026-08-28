@@ -1,3 +1,81 @@
+class rdma_queue_planner_nth_fail_mem extends rdma_mock_host_mem;
+  `uvm_object_utils(rdma_queue_planner_nth_fail_mem)
+
+  int unsigned allocate_attempt;
+  int unsigned fail_on_allocate;
+
+  function new(string name = "rdma_queue_planner_nth_fail_mem");
+    super.new(name);
+    allocate_attempt = 0;
+    fail_on_allocate = 0;
+  endfunction
+
+  virtual function rdma_status allocate(
+    rdma_dma_request_context request_context,
+    int unsigned size,
+    int unsigned alignment,
+    rdma_dma_direction_e direction,
+    output rdma_dma_mapping mapping
+  );
+    allocate_attempt++;
+    if (allocate_attempt == fail_on_allocate)
+      void'(fail_next("allocate", rdma_status::make(
+        RDMA_SC_RESOURCE_EXHAUSTED, "injected planner allocation failure"
+      )));
+    return super.allocate(request_context, size, alignment, direction,
+                          mapping);
+  endfunction
+endclass
+
+class rdma_queue_planner_snapshot_fail_mapping extends rdma_mock_dma_mapping;
+  `uvm_object_utils(rdma_queue_planner_snapshot_fail_mapping)
+
+  function new(string name = "rdma_queue_planner_snapshot_fail_mapping");
+    super.new(name);
+  endfunction
+
+  virtual function rdma_status snapshot_release_authority(
+    output rdma_dma_mapping snapshot
+  );
+    snapshot = null;
+    return rdma_status::make(RDMA_SC_INVALID_STATE,
+                             "injected authority snapshot failure");
+  endfunction
+endclass
+
+class rdma_queue_planner_snapshot_fail_mem extends rdma_mock_host_mem;
+  `uvm_object_utils(rdma_queue_planner_snapshot_fail_mem)
+
+  function new(string name = "rdma_queue_planner_snapshot_fail_mem");
+    super.new(name);
+  endfunction
+
+  virtual function rdma_status allocate(
+    rdma_dma_request_context request_context,
+    int unsigned size,
+    int unsigned alignment,
+    rdma_dma_direction_e direction,
+    output rdma_dma_mapping mapping
+  );
+    rdma_dma_mapping allocated_mapping;
+    rdma_queue_planner_snapshot_fail_mapping failure_mapping;
+    rdma_status status;
+
+    mapping = null;
+    status = super.allocate(request_context, size, alignment, direction,
+                            allocated_mapping);
+    if (status == null || !status.ok())
+      return status;
+    failure_mapping =
+      rdma_queue_planner_snapshot_fail_mapping::type_id::create(
+        "snapshot_failure_mapping"
+      );
+    failure_mapping.copy(allocated_mapping);
+    mapping = failure_mapping;
+    return rdma_status::success();
+  endfunction
+endclass
+
 class rdma_queue_lifecycle_test extends uvm_test;
   `uvm_component_utils(rdma_queue_lifecycle_test)
 
@@ -168,6 +246,97 @@ class rdma_queue_lifecycle_test extends uvm_test;
     ref_value.mapping_offset = offset;
     ref_value.length = length;
     return ref_value;
+  endfunction
+
+  function automatic int unsigned count_planner_host_calls(
+    rdma_mock_host_mem mem,
+    string method_name
+  );
+    int unsigned count;
+
+    count = 0;
+    foreach (mem.calls[i]) begin
+      if (mem.calls[i].method_name == method_name)
+        count++;
+    end
+    return count;
+  endfunction
+
+  function automatic rdma_queue_preflight make_planner_preflight(
+    string name,
+    rdma_resource_kind_e kind,
+    rdma_queue_backing_mode_e mode,
+    bit include_sgb = 1'b0,
+    int unsigned depth = 64
+  );
+    rdma_queue_preflight preflight;
+
+    preflight = rdma_queue_preflight::type_id::create(name);
+    preflight.resource_kind = kind;
+    preflight.depth = depth;
+    preflight.cqe_size_bytes = 64;
+    preflight.max_sge = include_sgb ? 4 : 2;
+    preflight.limit_threshold = 16;
+    preflight.backing_spec = rdma_queue_backing_spec::type_id::create(
+      {name, "_spec"}
+    );
+    preflight.backing_spec.mode = mode;
+    case (kind)
+      RDMA_RESOURCE_CQ: begin
+        preflight.required_rings.push_back(make_ring(
+          {name, "_cq"}, RDMA_QUEUE_ROLE_CQ_RING, depth, 64, 1'b1
+        ));
+      end
+      RDMA_RESOURCE_SRQ: begin
+        preflight.required_rings.push_back(make_ring(
+          {name, "_srq"}, RDMA_QUEUE_ROLE_SRQ_RING, depth, 64, 1'b0
+        ));
+        preflight.required_rings.push_back(make_ring(
+          {name, "_srfq"}, RDMA_QUEUE_ROLE_SRFQ_RING, depth, 64, 1'b0
+        ));
+        if (include_sgb)
+          preflight.required_rings.push_back(make_ring(
+            {name, "_sgb"}, RDMA_QUEUE_ROLE_SRQ_SGB, depth, 512, 1'b0
+          ));
+      end
+      RDMA_RESOURCE_CEQ: begin
+        preflight.required_rings.push_back(make_ring(
+          {name, "_ceq"}, RDMA_QUEUE_ROLE_CEQ_RING, depth, 16, 1'b1
+        ));
+      end
+      RDMA_RESOURCE_AEQ: begin
+        preflight.required_rings.push_back(make_ring(
+          {name, "_aeq"}, RDMA_QUEUE_ROLE_AEQ_RING, depth, 16, 1'b1
+        ));
+      end
+      default: begin
+      end
+    endcase
+    return preflight;
+  endfunction
+
+  function automatic void add_borrowed_slice(
+    rdma_queue_preflight preflight,
+    string name,
+    rdma_queue_backing_role_e role,
+    rdma_dma_mapping mapping,
+    longint unsigned mapping_offset,
+    longint unsigned length,
+    longint unsigned logical_offset = 0
+  );
+    rdma_queue_backing_slice slice;
+
+    slice = make_slice(name, role, mapping, mapping_offset, length);
+    slice.logical_queue_offset = logical_offset;
+    preflight.backing_spec.slices.push_back(slice);
+  endfunction
+
+  function automatic void expect_planner_no_host_calls(
+    string label,
+    rdma_mock_host_mem mem
+  );
+    if (mem.calls.size() != 0)
+      `uvm_error(label, "borrowed validation performed a host-memory call")
   endfunction
 
   function automatic rdma_context_backing_ref make_context_ref(
@@ -495,6 +664,724 @@ class rdma_queue_lifecycle_test extends uvm_test;
     expect_status("CQ_REJECTS_AEQ_REQUEST",
       cq_policy.preflight(binding, aeq_req, manager, preflight),
       RDMA_SC_INVALID_ARGUMENT);
+  endfunction
+
+  function automatic void check_backing_planner_positive();
+    rdma_function_binding binding;
+    rdma_function_handle owner;
+    rdma_handle resource_h;
+    rdma_queue_backing_planner planner;
+    rdma_mock_host_mem mem;
+    rdma_queue_preflight preflight;
+    rdma_queue_backing_plan plan;
+    rdma_dma_mapping mapping;
+    rdma_xtr_v1_queue_pd_codec pd_codec;
+    rdma_status status;
+    byte data[];
+    bit complete;
+
+    binding = make_binding("planner_binding");
+    owner = binding.make_handle();
+    pd_codec = rdma_xtr_v1_queue_pd_codec::type_id::create(
+      "planner_pd_codec"
+    );
+
+    // Owned CQ: payload then PD, both authority snapshots, IOVA pages, and
+    // complete zero/PD initialization.
+    mem = rdma_mock_host_mem::type_id::create("owned_cq_mem");
+    planner = rdma_queue_backing_planner::type_id::create("owned_cq_planner");
+    expect_status("OWNED_CQ_CONFIGURE", planner.configure(mem), RDMA_SC_OK);
+    preflight = make_planner_preflight(
+      "owned_cq_preflight", RDMA_RESOURCE_CQ, RDMA_QUEUE_BACKING_OWNED
+    );
+    resource_h = make_handle("owned_cq_resource", owner,
+                             RDMA_RESOURCE_CQ, 32'h1001);
+    expect_status("OWNED_CQ_SPEC", planner.validate_spec(binding, preflight),
+                  RDMA_SC_OK);
+    plan = null;
+    expect_status("OWNED_CQ_PLAN", planner.materialize(
+      binding, preflight, resource_h, plan), RDMA_SC_OK);
+    if (plan == null || plan.context_ref != null || plan.rings.size() != 1 ||
+        plan.refs.size() != 2 ||
+        plan.refs[0].role != RDMA_QUEUE_ROLE_CQ_RING ||
+        plan.refs[1].role != RDMA_QUEUE_ROLE_CQ_PD ||
+        plan.refs[0].ownership != RDMA_OWNERSHIP_CONTROL_PLANE ||
+        plan.refs[1].ownership != RDMA_OWNERSHIP_CONTROL_PLANE ||
+        plan.rings[0].pages.size() != 1 ||
+        plan.rings[0].pages[0].page_iova.value !=
+          plan.refs[0].mapping.iova.value ||
+        plan.flush_targets.size() != 1 ||
+        plan.flush_targets[0].role != RDMA_QUEUE_ROLE_CQ_PD ||
+        plan.flush_targets[0].phase != RDMA_QUEUE_FLUSH_POST_DELETE)
+      `uvm_error("OWNED_CQ_PLAN", "owned CQ plan geometry is incorrect")
+    if (count_planner_host_calls(mem, "allocate") != 2 ||
+        mem.calls[0].size != 4096 || mem.calls[0].alignment != 4096 ||
+        mem.calls[0].direction != RDMA_DMA_DEVICE_WRITE ||
+        mem.calls[1].size != 4096 || mem.calls[1].alignment != 4096 ||
+        mem.calls[1].direction != RDMA_DMA_DEVICE_READ ||
+        mem.calls[0].request_context == null ||
+        mem.calls[0].request_context.owner_h == null ||
+        !mem.calls[0].request_context.owner_h.same_instance(resource_h) ||
+        mem.calls[0].request_context.requester_bdf !=
+          binding.queue_dma.requester_bdf ||
+        mem.calls[0].request_context.dma_domain_id !=
+          binding.queue_dma.dma_domain_id)
+      `uvm_error("OWNED_CQ_ALLOC", "owned CQ allocation contract is wrong")
+    status = mem.regions[0].mapping.release_authority_status(
+      plan.refs[0].mapping
+    );
+    expect_status("OWNED_CQ_PAYLOAD_AUTHORITY", status, RDMA_SC_OK);
+    status = mem.regions[1].mapping.release_authority_status(
+      plan.refs[1].mapping
+    );
+    expect_status("OWNED_CQ_PD_AUTHORITY", status, RDMA_SC_OK);
+    expect_status("OWNED_CQ_INITIALIZE", planner.initialize_payload_and_pd(
+      binding, plan, pd_codec), RDMA_SC_OK);
+    if (count_planner_host_calls(mem, "write") != 2)
+      `uvm_error("OWNED_CQ_INITIALIZE", "CQ initialization write count is wrong")
+    expect_status("OWNED_CQ_READ_PAYLOAD",
+      mem.read(plan.refs[0].mapping, 0, 4096, data), RDMA_SC_OK);
+    foreach (data[i]) begin
+      if (data[i] != 0) begin
+        `uvm_error("OWNED_CQ_ZERO", "CQ payload was not zero initialized")
+        break;
+      end
+    end
+    expect_status("OWNED_CQ_READ_PD",
+      mem.read(plan.refs[1].mapping, 0, 4096, data), RDMA_SC_OK);
+    if (data.size() != 4096 || data[0] != 8'h00 || data[1] != 8'h00 ||
+        data[2] != 8'h00 || data[3] != 8'h01 || data[4] != 8'h00 ||
+        data[5] != 8'h00 || data[6] != 8'h02 || data[7] != 8'h21)
+      `uvm_error("OWNED_CQ_PD", "CQ page directory first entry is wrong")
+    for (int unsigned i = 8; i < data.size(); i++) begin
+      if (data[i] != 0) begin
+        `uvm_error("OWNED_CQ_PD", "unused CQ PD bytes are not zero")
+        break;
+      end
+    end
+    complete = 1'b0;
+    expect_status("OWNED_CQ_PAYLOAD_CLEANUP",
+      planner.cleanup_local_role(plan.refs[0], complete), RDMA_SC_OK);
+    if (!complete || count_planner_host_calls(mem, "release") != 1)
+      `uvm_error("OWNED_CQ_PAYLOAD_CLEANUP", "owned cleanup did not complete")
+    complete = 1'b0;
+    expect_status("OWNED_CQ_PAYLOAD_CLEANUP_AGAIN",
+      planner.cleanup_local_role(plan.refs[0], complete), RDMA_SC_OK);
+    if (!complete || count_planner_host_calls(mem, "release") != 1)
+      `uvm_error("OWNED_CQ_PAYLOAD_CLEANUP_AGAIN",
+                 "owned cleanup was not exactly once")
+    complete = 1'b0;
+    expect_status("OWNED_CQ_PD_CLEANUP",
+      planner.cleanup_local_role(plan.refs[1], complete), RDMA_SC_OK);
+
+    // Borrowed CQ proves that the device page list uses IOVA, not backing.
+    mem = rdma_mock_host_mem::type_id::create("borrowed_cq_mem");
+    planner = rdma_queue_backing_planner::type_id::create(
+      "borrowed_cq_planner"
+    );
+    expect_status("BORROWED_CQ_CONFIGURE", planner.configure(mem), RDMA_SC_OK);
+    preflight = make_planner_preflight(
+      "borrowed_cq_preflight", RDMA_RESOURCE_CQ,
+      RDMA_QUEUE_BACKING_BORROWED
+    );
+    mapping = make_mapping("borrowed_cq_mapping", binding,
+      64'h0000_0021_0000_0000, 64'h0000_0099_0000_0000, 4096);
+    add_borrowed_slice(preflight, "borrowed_cq_slice",
+      RDMA_QUEUE_ROLE_CQ_RING, mapping, 0, 4096);
+    resource_h = make_handle("borrowed_cq_resource", owner,
+                             RDMA_RESOURCE_CQ, 32'h1002);
+    expect_status("BORROWED_CQ_SPEC", planner.validate_spec(
+      binding, preflight), RDMA_SC_OK);
+    expect_planner_no_host_calls("BORROWED_CQ_SPEC", mem);
+    plan = null;
+    expect_status("BORROWED_PLAN", planner.materialize(
+      binding, preflight, resource_h, plan), RDMA_SC_OK);
+    if (plan == null || plan.refs.size() != 2 ||
+        plan.refs[0].ownership != RDMA_OWNERSHIP_BORROWED ||
+        plan.rings[0].pages[0].page_iova.value !=
+          64'h0000_0021_0000_0000)
+      `uvm_error("BORROWED_PLAN", "page list did not use mapping IOVA")
+    if (plan != null && plan.refs[0].mapping.backing_addr.value ==
+                        plan.rings[0].pages[0].page_iova.value)
+      `uvm_error("BORROWED_PLAN", "fixture failed to separate address spaces")
+    if (count_planner_host_calls(mem, "allocate") != 1 ||
+        mem.calls[0].direction != RDMA_DMA_DEVICE_READ)
+      `uvm_error("BORROWED_PLAN", "borrowed CQ allocated more than its PD")
+    complete = 1'b0;
+    expect_status("BORROWED_CQ_CLEANUP",
+      planner.cleanup_local_role(plan.refs[0], complete), RDMA_SC_OK);
+    if (!complete || count_planner_host_calls(mem, "release") != 0)
+      `uvm_error("BORROWED_CQ_CLEANUP", "borrowed cleanup called release")
+    complete = 1'b0;
+    expect_status("BORROWED_CQ_PD_CLEANUP",
+      planner.cleanup_local_role(plan.refs[1], complete), RDMA_SC_OK);
+
+    // Owned and borrowed compound SRQ plans use request payload order and
+    // fixed SRQ_PD/SRFQ_PD order, with no planner-owned context authority.
+    mem = rdma_mock_host_mem::type_id::create("owned_srq_mem");
+    planner = rdma_queue_backing_planner::type_id::create(
+      "owned_srq_planner"
+    );
+    expect_status("OWNED_SRQ_CONFIGURE", planner.configure(mem), RDMA_SC_OK);
+    preflight = make_planner_preflight(
+      "owned_srq_preflight", RDMA_RESOURCE_SRQ,
+      RDMA_QUEUE_BACKING_OWNED, 1'b1
+    );
+    resource_h = make_handle("owned_srq_resource", owner,
+                             RDMA_RESOURCE_SRQ, 32'h2001);
+    plan = null;
+    expect_status("OWNED_SRQ_PLAN", planner.materialize(
+      binding, preflight, resource_h, plan), RDMA_SC_OK);
+    if (plan == null || plan.context_ref != null || plan.rings.size() != 3 ||
+        plan.refs.size() != 5 ||
+        plan.refs[0].role != RDMA_QUEUE_ROLE_SRQ_RING ||
+        plan.refs[1].role != RDMA_QUEUE_ROLE_SRFQ_RING ||
+        plan.refs[2].role != RDMA_QUEUE_ROLE_SRQ_SGB ||
+        plan.refs[3].role != RDMA_QUEUE_ROLE_SRQ_PD ||
+        plan.refs[4].role != RDMA_QUEUE_ROLE_SRFQ_PD ||
+        plan.flush_targets.size() != 2 ||
+        plan.flush_targets[0].role != RDMA_QUEUE_ROLE_SRFQ_PD ||
+        plan.flush_targets[1].role != RDMA_QUEUE_ROLE_SRQ_PD)
+      `uvm_error("OWNED_SRQ_PLAN", "owned SRQ role ordering is wrong")
+    if (count_planner_host_calls(mem, "allocate") != 5 ||
+        mem.calls[0].direction != RDMA_DMA_DEVICE_READ ||
+        mem.calls[1].direction != RDMA_DMA_DEVICE_READ ||
+        mem.calls[2].direction != RDMA_DMA_DEVICE_READ ||
+        mem.calls[3].direction != RDMA_DMA_DEVICE_READ ||
+        mem.calls[4].direction != RDMA_DMA_DEVICE_READ ||
+        mem.calls[2].size != 32768)
+      `uvm_error("OWNED_SRQ_PLAN", "owned SRQ allocations are incorrect")
+    foreach (plan.refs[i]) begin
+      complete = 1'b0;
+      expect_status($sformatf("OWNED_SRQ_CLEANUP_%0d", i),
+        planner.cleanup_local_role(plan.refs[i], complete), RDMA_SC_OK);
+    end
+    if (count_planner_host_calls(mem, "release") != 5)
+      `uvm_error("OWNED_SRQ_CLEANUP", "owned SRQ release count is wrong")
+
+    mem = rdma_mock_host_mem::type_id::create("borrowed_srq_mem");
+    planner = rdma_queue_backing_planner::type_id::create(
+      "borrowed_srq_planner"
+    );
+    expect_status("BORROWED_SRQ_CONFIGURE", planner.configure(mem), RDMA_SC_OK);
+    preflight = make_planner_preflight(
+      "borrowed_srq_preflight", RDMA_RESOURCE_SRQ,
+      RDMA_QUEUE_BACKING_BORROWED, 1'b1
+    );
+    mapping = make_mapping("borrowed_srq_ring_mapping", binding,
+      64'h0000_0030_0000_0000, 64'h0000_00a0_0000_0000, 4096);
+    add_borrowed_slice(preflight, "borrowed_srq_ring",
+      RDMA_QUEUE_ROLE_SRQ_RING, mapping, 0, 4096);
+    mapping = make_mapping("borrowed_srfq_ring_mapping", binding,
+      64'h0000_0031_0000_0000, 64'h0000_00a1_0000_0000, 4096);
+    add_borrowed_slice(preflight, "borrowed_srfq_ring",
+      RDMA_QUEUE_ROLE_SRFQ_RING, mapping, 0, 4096);
+    mapping = make_mapping("borrowed_sgb_mapping", binding,
+      64'h0000_0032_0000_0000, 64'h0000_00a2_0000_0000, 32768);
+    add_borrowed_slice(preflight, "borrowed_sgb",
+      RDMA_QUEUE_ROLE_SRQ_SGB, mapping, 0, 32768);
+    resource_h = make_handle("borrowed_srq_resource", owner,
+                             RDMA_RESOURCE_SRQ, 32'h2002);
+    plan = null;
+    expect_status("BORROWED_SRQ_PLAN", planner.materialize(
+      binding, preflight, resource_h, plan), RDMA_SC_OK);
+    if (plan == null || plan.refs.size() != 5 ||
+        plan.refs[0].ownership != RDMA_OWNERSHIP_BORROWED ||
+        plan.refs[1].ownership != RDMA_OWNERSHIP_BORROWED ||
+        plan.refs[2].ownership != RDMA_OWNERSHIP_BORROWED ||
+        count_planner_host_calls(mem, "allocate") != 2)
+      `uvm_error("BORROWED_SRQ_PLAN", "borrowed SRQ role ownership is wrong")
+    foreach (plan.refs[i]) begin
+      complete = 1'b0;
+      expect_status($sformatf("BORROWED_SRQ_CLEANUP_%0d", i),
+        planner.cleanup_local_role(plan.refs[i], complete), RDMA_SC_OK);
+    end
+    if (count_planner_host_calls(mem, "release") != 2)
+      `uvm_error("BORROWED_SRQ_CLEANUP", "borrowed SRQ released payload")
+
+    // CEQ is owned and AEQ borrowed; neither planner plan has context/flush.
+    mem = rdma_mock_host_mem::type_id::create("owned_ceq_mem");
+    planner = rdma_queue_backing_planner::type_id::create("owned_ceq_planner");
+    expect_status("OWNED_CEQ_CONFIGURE", planner.configure(mem), RDMA_SC_OK);
+    preflight = make_planner_preflight(
+      "owned_ceq_preflight", RDMA_RESOURCE_CEQ, RDMA_QUEUE_BACKING_OWNED
+    );
+    resource_h = make_handle("owned_ceq_resource", owner,
+                             RDMA_RESOURCE_CEQ, 32'h3001);
+    plan = null;
+    expect_status("OWNED_CEQ_PLAN", planner.materialize(
+      binding, preflight, resource_h, plan), RDMA_SC_OK);
+    if (plan == null || plan.context_ref != null ||
+        plan.flush_targets.size() != 0 || plan.refs.size() != 2 ||
+        plan.refs[0].role != RDMA_QUEUE_ROLE_CEQ_RING ||
+        plan.refs[1].role != RDMA_QUEUE_ROLE_CEQ_PD)
+      `uvm_error("OWNED_CEQ_PLAN", "CEQ plan roles are incorrect")
+    expect_status("OWNED_CEQ_VALIDATE", plan.validate(), RDMA_SC_OK);
+    foreach (plan.refs[i]) begin
+      complete = 1'b0;
+      expect_status($sformatf("OWNED_CEQ_CLEANUP_%0d", i),
+        planner.cleanup_local_role(plan.refs[i], complete), RDMA_SC_OK);
+    end
+
+    mem = rdma_mock_host_mem::type_id::create("borrowed_aeq_mem");
+    planner = rdma_queue_backing_planner::type_id::create(
+      "borrowed_aeq_planner"
+    );
+    expect_status("BORROWED_AEQ_CONFIGURE", planner.configure(mem), RDMA_SC_OK);
+    preflight = make_planner_preflight(
+      "borrowed_aeq_preflight", RDMA_RESOURCE_AEQ,
+      RDMA_QUEUE_BACKING_BORROWED
+    );
+    mapping = make_mapping("borrowed_aeq_mapping", binding,
+      64'h0000_0040_0000_0000, 64'h0000_00b0_0000_0000, 4096);
+    add_borrowed_slice(preflight, "borrowed_aeq_slice",
+      RDMA_QUEUE_ROLE_AEQ_RING, mapping, 0, 4096);
+    resource_h = make_handle("borrowed_aeq_resource", owner,
+                             RDMA_RESOURCE_AEQ, 32'h4001);
+    plan = null;
+    expect_status("BORROWED_AEQ_PLAN", planner.materialize(
+      binding, preflight, resource_h, plan), RDMA_SC_OK);
+    if (plan == null || plan.refs[0].role != RDMA_QUEUE_ROLE_AEQ_RING ||
+        plan.refs[1].role != RDMA_QUEUE_ROLE_AEQ_PD ||
+        plan.context_ref != null || plan.flush_targets.size() != 0)
+      `uvm_error("BORROWED_AEQ_PLAN", "AEQ plan roles are incorrect")
+    expect_status("BORROWED_AEQ_VALIDATE", plan.validate(), RDMA_SC_OK);
+    foreach (plan.refs[i]) begin
+      complete = 1'b0;
+      expect_status($sformatf("BORROWED_AEQ_CLEANUP_%0d", i),
+        planner.cleanup_local_role(plan.refs[i], complete), RDMA_SC_OK);
+    end
+  endfunction
+
+  function automatic void check_backing_planner_negative();
+    rdma_function_binding binding;
+    rdma_function_handle owner;
+    rdma_queue_backing_planner planner;
+    rdma_mock_host_mem mem;
+    rdma_queue_preflight preflight;
+    rdma_queue_backing_plan plan;
+    rdma_dma_mapping first_mapping;
+    rdma_dma_mapping second_mapping;
+    rdma_queue_backing_slice slice;
+    rdma_handle resource_h;
+
+    binding = make_binding("planner_negative_binding");
+    owner = binding.make_handle();
+    mem = rdma_mock_host_mem::type_id::create("planner_negative_mem");
+    planner = rdma_queue_backing_planner::type_id::create(
+      "planner_negative"
+    );
+    expect_status("PLANNER_NEGATIVE_CONFIGURE", planner.configure(mem),
+                  RDMA_SC_OK);
+
+    preflight = make_planner_preflight(
+      "missing_role", RDMA_RESOURCE_CQ, RDMA_QUEUE_BACKING_BORROWED
+    );
+    expect_status("PLANNER_MISSING_ROLE", planner.validate_spec(
+      binding, preflight), RDMA_SC_INVALID_ARGUMENT);
+
+    preflight = make_planner_preflight(
+      "extra_role", RDMA_RESOURCE_CQ, RDMA_QUEUE_BACKING_BORROWED
+    );
+    first_mapping = make_mapping("extra_role_cq", binding,
+      64'h0000_0050_0000_0000, 64'h0000_00c0_0000_0000, 4096);
+    second_mapping = make_mapping("extra_role_srq", binding,
+      64'h0000_0051_0000_0000, 64'h0000_00c1_0000_0000, 4096);
+    add_borrowed_slice(preflight, "extra_role_cq_slice",
+      RDMA_QUEUE_ROLE_CQ_RING, first_mapping, 0, 4096);
+    add_borrowed_slice(preflight, "extra_role_srq_slice",
+      RDMA_QUEUE_ROLE_SRQ_RING, second_mapping, 0, 4096);
+    expect_status("PLANNER_EXTRA_ROLE", planner.validate_spec(
+      binding, preflight), RDMA_SC_INVALID_ARGUMENT);
+
+    preflight = make_planner_preflight(
+      "logical_hole", RDMA_RESOURCE_CQ, RDMA_QUEUE_BACKING_BORROWED,
+      1'b0, 128
+    );
+    first_mapping = make_mapping("logical_hole_mapping", binding,
+      64'h0000_0052_0000_0000, 64'h0000_00c2_0000_0000, 12288);
+    add_borrowed_slice(preflight, "logical_hole_first",
+      RDMA_QUEUE_ROLE_CQ_RING, first_mapping, 0, 4096, 0);
+    add_borrowed_slice(preflight, "logical_hole_second",
+      RDMA_QUEUE_ROLE_CQ_RING, first_mapping, 8192, 4096, 8192);
+    expect_status("PLANNER_LOGICAL_HOLE", planner.validate_spec(
+      binding, preflight), RDMA_SC_INVALID_ARGUMENT);
+
+    preflight = make_planner_preflight(
+      "logical_overlap", RDMA_RESOURCE_CQ, RDMA_QUEUE_BACKING_BORROWED,
+      1'b0, 128
+    );
+    first_mapping = make_mapping("logical_overlap_mapping", binding,
+      64'h0000_0053_0000_0000, 64'h0000_00c3_0000_0000, 8192);
+    add_borrowed_slice(preflight, "logical_overlap_first",
+      RDMA_QUEUE_ROLE_CQ_RING, first_mapping, 0, 4096, 0);
+    add_borrowed_slice(preflight, "logical_overlap_second",
+      RDMA_QUEUE_ROLE_CQ_RING, first_mapping, 4096, 4096, 0);
+    expect_status("PLANNER_LOGICAL_OVERLAP", planner.validate_spec(
+      binding, preflight), RDMA_SC_INVALID_ARGUMENT);
+
+    preflight = make_planner_preflight(
+      "iova_overlap", RDMA_RESOURCE_SRQ, RDMA_QUEUE_BACKING_BORROWED
+    );
+    first_mapping = make_mapping("iova_overlap_first", binding,
+      64'h0000_0054_0000_0000, 64'h0000_00c4_0000_0000, 4096);
+    second_mapping = make_mapping("iova_overlap_second", binding,
+      64'h0000_0054_0000_0000, 64'h0000_00c5_0000_0000, 4096);
+    add_borrowed_slice(preflight, "iova_overlap_srq",
+      RDMA_QUEUE_ROLE_SRQ_RING, first_mapping, 0, 4096);
+    add_borrowed_slice(preflight, "iova_overlap_srfq",
+      RDMA_QUEUE_ROLE_SRFQ_RING, second_mapping, 0, 4096);
+    expect_status("PLANNER_DEVICE_IOVA_OVERLAP", planner.validate_spec(
+      binding, preflight), RDMA_SC_INVALID_ARGUMENT);
+
+    preflight = make_planner_preflight(
+      "backing_overlap", RDMA_RESOURCE_SRQ, RDMA_QUEUE_BACKING_BORROWED
+    );
+    first_mapping = make_mapping("backing_overlap_first", binding,
+      64'h0000_0055_0000_0000, 64'h0000_00c6_0000_0000, 4096);
+    second_mapping = make_mapping("backing_overlap_second", binding,
+      64'h0000_0056_0000_0000, 64'h0000_00c6_0000_0000, 4096);
+    add_borrowed_slice(preflight, "backing_overlap_srq",
+      RDMA_QUEUE_ROLE_SRQ_RING, first_mapping, 0, 4096);
+    add_borrowed_slice(preflight, "backing_overlap_srfq",
+      RDMA_QUEUE_ROLE_SRFQ_RING, second_mapping, 0, 4096);
+    expect_status("PLANNER_HOST_BACKING_OVERLAP", planner.validate_spec(
+      binding, preflight), RDMA_SC_INVALID_ARGUMENT);
+
+    // Inclusive ranges ending at the top of the 64-bit address space still
+    // overlap; an exclusive-end calculation would wrap both ends to zero.
+    preflight = make_planner_preflight(
+      "top_iova_overlap", RDMA_RESOURCE_SRQ, RDMA_QUEUE_BACKING_BORROWED
+    );
+    first_mapping = make_mapping("top_iova_overlap_first", binding,
+      64'hffff_ffff_ffff_f000, 64'h0000_00c7_0000_0000, 4096);
+    second_mapping = make_mapping("top_iova_overlap_second", binding,
+      64'hffff_ffff_ffff_f000, 64'h0000_00c8_0000_0000, 4096);
+    add_borrowed_slice(preflight, "top_iova_overlap_srq",
+      RDMA_QUEUE_ROLE_SRQ_RING, first_mapping, 0, 4096);
+    add_borrowed_slice(preflight, "top_iova_overlap_srfq",
+      RDMA_QUEUE_ROLE_SRFQ_RING, second_mapping, 0, 4096);
+    expect_status("PLANNER_TOP_IOVA_OVERLAP", planner.validate_spec(
+      binding, preflight), RDMA_SC_INVALID_ARGUMENT);
+
+    preflight = make_planner_preflight(
+      "short_role", RDMA_RESOURCE_CQ, RDMA_QUEUE_BACKING_BORROWED,
+      1'b0, 128
+    );
+    first_mapping = make_mapping("short_role_mapping", binding,
+      64'h0000_0057_0000_0000, 64'h0000_00c7_0000_0000, 4096);
+    add_borrowed_slice(preflight, "short_role_slice",
+      RDMA_QUEUE_ROLE_CQ_RING, first_mapping, 0, 4096);
+    expect_status("PLANNER_LENGTH_INSUFFICIENT", planner.validate_spec(
+      binding, preflight), RDMA_SC_INVALID_ARGUMENT);
+
+    preflight = make_planner_preflight(
+      "unaligned_role", RDMA_RESOURCE_CQ, RDMA_QUEUE_BACKING_BORROWED
+    );
+    first_mapping = make_mapping("unaligned_role_mapping", binding,
+      64'h0000_0058_0000_0000, 64'h0000_00c8_0000_0000, 8192);
+    add_borrowed_slice(preflight, "unaligned_role_slice",
+      RDMA_QUEUE_ROLE_CQ_RING, first_mapping, 1, 4096);
+    expect_status("PLANNER_UNALIGNED_OFFSET", planner.validate_spec(
+      binding, preflight), RDMA_SC_INVALID_ARGUMENT);
+
+    preflight = make_planner_preflight(
+      "bdf_mismatch", RDMA_RESOURCE_CQ, RDMA_QUEUE_BACKING_BORROWED
+    );
+    first_mapping = make_mapping("bdf_mismatch_mapping", binding,
+      64'h0000_0059_0000_0000, 64'h0000_00c9_0000_0000, 4096);
+    first_mapping.requester_bdf.bus++;
+    add_borrowed_slice(preflight, "bdf_mismatch_slice",
+      RDMA_QUEUE_ROLE_CQ_RING, first_mapping, 0, 4096);
+    expect_status("PLANNER_BDF_MISMATCH", planner.validate_spec(
+      binding, preflight), RDMA_SC_DMA_TRANSLATION);
+
+    preflight = make_planner_preflight(
+      "pasid_mismatch", RDMA_RESOURCE_CQ, RDMA_QUEUE_BACKING_BORROWED
+    );
+    first_mapping = make_mapping("pasid_mismatch_mapping", binding,
+      64'h0000_005a_0000_0000, 64'h0000_00ca_0000_0000, 4096);
+    first_mapping.pasid_valid = 1'b1;
+    first_mapping.pasid = 20'h12345;
+    add_borrowed_slice(preflight, "pasid_mismatch_slice",
+      RDMA_QUEUE_ROLE_CQ_RING, first_mapping, 0, 4096);
+    expect_status("PLANNER_PASID_MISMATCH", planner.validate_spec(
+      binding, preflight), RDMA_SC_DMA_TRANSLATION);
+
+    preflight = make_planner_preflight(
+      "domain_mismatch", RDMA_RESOURCE_CQ, RDMA_QUEUE_BACKING_BORROWED
+    );
+    first_mapping = make_mapping("domain_mismatch_mapping", binding,
+      64'h0000_005b_0000_0000, 64'h0000_00cb_0000_0000, 4096);
+    first_mapping.dma_domain_id++;
+    add_borrowed_slice(preflight, "domain_mismatch_slice",
+      RDMA_QUEUE_ROLE_CQ_RING, first_mapping, 0, 4096);
+    expect_status("PLANNER_DOMAIN_MISMATCH", planner.validate_spec(
+      binding, preflight), RDMA_SC_DMA_TRANSLATION);
+
+    preflight = make_planner_preflight(
+      "generation_mismatch", RDMA_RESOURCE_CQ, RDMA_QUEUE_BACKING_BORROWED
+    );
+    first_mapping = make_mapping("generation_mismatch_mapping", binding,
+      64'h0000_005c_0000_0000, 64'h0000_00cc_0000_0000, 4096);
+    first_mapping.function_h.generation++;
+    add_borrowed_slice(preflight, "generation_mismatch_slice",
+      RDMA_QUEUE_ROLE_CQ_RING, first_mapping, 0, 4096);
+    expect_status("PLANNER_GENERATION_MISMATCH", planner.validate_spec(
+      binding, preflight), RDMA_SC_STALE_GENERATION);
+
+    preflight = make_planner_preflight(
+      "direction_mismatch", RDMA_RESOURCE_CQ, RDMA_QUEUE_BACKING_BORROWED
+    );
+    first_mapping = make_mapping("direction_mismatch_mapping", binding,
+      64'h0000_005d_0000_0000, 64'h0000_00cd_0000_0000, 4096);
+    first_mapping.direction = RDMA_DMA_DEVICE_READ;
+    add_borrowed_slice(preflight, "direction_mismatch_slice",
+      RDMA_QUEUE_ROLE_CQ_RING, first_mapping, 0, 4096);
+    expect_status("PLANNER_DIRECTION_MISMATCH", planner.validate_spec(
+      binding, preflight), RDMA_SC_DMA_PERMISSION);
+
+    // A split inside a 512-byte SGB slot must fail before allocation.  The
+    // first fragment deliberately violates the slot granularity.
+    preflight = make_planner_preflight(
+      "sgb_cross_slice", RDMA_RESOURCE_SRQ, RDMA_QUEUE_BACKING_BORROWED,
+      1'b1
+    );
+    first_mapping = make_mapping("sgb_cross_srq", binding,
+      64'h0000_005e_0000_0000, 64'h0000_00ce_0000_0000, 4096);
+    add_borrowed_slice(preflight, "sgb_cross_srq_slice",
+      RDMA_QUEUE_ROLE_SRQ_RING, first_mapping, 0, 4096);
+    second_mapping = make_mapping("sgb_cross_srfq", binding,
+      64'h0000_005f_0000_0000, 64'h0000_00cf_0000_0000, 4096);
+    add_borrowed_slice(preflight, "sgb_cross_srfq_slice",
+      RDMA_QUEUE_ROLE_SRFQ_RING, second_mapping, 0, 4096);
+    first_mapping = make_mapping("sgb_cross_payload", binding,
+      64'h0000_0060_0000_0000, 64'h0000_00d0_0000_0000, 32768);
+    add_borrowed_slice(preflight, "sgb_cross_first",
+      RDMA_QUEUE_ROLE_SRQ_SGB, first_mapping, 0, 256, 0);
+    add_borrowed_slice(preflight, "sgb_cross_second",
+      RDMA_QUEUE_ROLE_SRQ_SGB, first_mapping, 256, 32512, 256);
+    expect_status("PLANNER_SGB_SLOT_CROSSES_SLICE", planner.validate_spec(
+      binding, preflight), RDMA_SC_INVALID_ARGUMENT);
+
+    // 64 Mi entries * 64 bytes is 4 GiB: a naive 32-bit multiplication wraps
+    // to zero, while checked widening must reject the host API width.
+    preflight = make_planner_preflight(
+      "multiply_overflow", RDMA_RESOURCE_CQ, RDMA_QUEUE_BACKING_OWNED,
+      1'b0, 32'h0400_0000
+    );
+    preflight.required_rings[0].logical_bytes = 0;
+    preflight.required_rings[0].storage_bytes = 4096;
+    preflight.required_rings[0].page_count = 1;
+    expect_status("PLANNER_CHECKED_MULTIPLICATION", planner.validate_spec(
+      binding, preflight), RDMA_SC_INVALID_ARGUMENT);
+
+    expect_planner_no_host_calls("PLANNER_NEGATIVE_MATRIX", mem);
+
+    // Any materialization failure clears a stale caller output.
+    preflight = make_planner_preflight(
+      "atomic_failure", RDMA_RESOURCE_CQ, RDMA_QUEUE_BACKING_BORROWED
+    );
+    first_mapping = make_mapping("atomic_failure_mapping", binding,
+      64'h0000_0061_0000_0000, 64'h0000_00d1_0000_0000, 4096);
+    add_borrowed_slice(preflight, "atomic_failure_slice",
+      RDMA_QUEUE_ROLE_CQ_RING, first_mapping, 0, 4096);
+    resource_h = make_handle("wrong_kind_resource", owner,
+                             RDMA_RESOURCE_SRQ, 32'h5001);
+    plan = rdma_queue_backing_plan::type_id::create("stale_planner_output");
+    expect_status("PLANNER_OUTPUT_ATOMIC", planner.materialize(
+      binding, preflight, resource_h, plan), RDMA_SC_INVALID_ARGUMENT);
+    if (plan != null)
+      `uvm_error("PLANNER_OUTPUT_ATOMIC", "failed materialize leaked a plan")
+    expect_planner_no_host_calls("PLANNER_OUTPUT_ATOMIC", mem);
+  endfunction
+
+  function automatic void check_backing_planner_rollback_and_cleanup();
+    rdma_function_binding binding;
+    rdma_function_handle owner;
+    rdma_handle resource_h;
+    rdma_queue_backing_planner planner;
+    rdma_queue_planner_nth_fail_mem fail_mem;
+    rdma_queue_planner_snapshot_fail_mem snapshot_mem;
+    rdma_mock_host_mem cleanup_mem;
+    rdma_queue_preflight preflight;
+    rdma_queue_backing_plan plan;
+    rdma_dma_mapping borrowed_mapping;
+    int unsigned release_ordinal;
+    longint unsigned expected_release_iova[4];
+    bit complete;
+
+    binding = make_binding("planner_rollback_binding");
+    owner = binding.make_handle();
+
+    // A late SRQ PD allocation failure releases every prior owned role in
+    // strict reverse acquisition order and publishes no partial plan.
+    fail_mem = rdma_queue_planner_nth_fail_mem::type_id::create(
+      "late_srq_allocation_failure_mem"
+    );
+    fail_mem.fail_on_allocate = 5;
+    planner = rdma_queue_backing_planner::type_id::create(
+      "late_srq_allocation_failure_planner"
+    );
+    expect_status("ROLLBACK_CONFIGURE", planner.configure(fail_mem),
+                  RDMA_SC_OK);
+    preflight = make_planner_preflight(
+      "rollback_srq_preflight", RDMA_RESOURCE_SRQ,
+      RDMA_QUEUE_BACKING_OWNED, 1'b1
+    );
+    resource_h = make_handle("rollback_srq_resource", owner,
+                             RDMA_RESOURCE_SRQ, 32'h6001);
+    plan = rdma_queue_backing_plan::type_id::create("stale_rollback_plan");
+    expect_status("ROLLBACK_LATE_PD_ALLOC", planner.materialize(
+      binding, preflight, resource_h, plan), RDMA_SC_RESOURCE_EXHAUSTED);
+    if (plan != null || count_planner_host_calls(fail_mem, "allocate") != 5 ||
+        count_planner_host_calls(fail_mem, "release") != 4 ||
+        fail_mem.live_allocations() != 0)
+      `uvm_error("ROLLBACK_LATE_PD_ALLOC",
+                 "late allocation failure leaked an owned role")
+    expected_release_iova[0] = 64'h0000_0001_0000_a000;
+    expected_release_iova[1] = 64'h0000_0001_0000_2000;
+    expected_release_iova[2] = 64'h0000_0001_0000_1000;
+    expected_release_iova[3] = 64'h0000_0001_0000_0000;
+    release_ordinal = 0;
+    foreach (fail_mem.calls[i]) begin
+      if (fail_mem.calls[i].method_name != "release")
+        continue;
+      if (release_ordinal >= 4 || fail_mem.calls[i].mapping == null ||
+          fail_mem.calls[i].mapping.iova.value !=
+            expected_release_iova[release_ordinal])
+        `uvm_error("ROLLBACK_REVERSE_ORDER",
+                   "owned roles were not released in reverse order")
+      release_ordinal++;
+    end
+
+    // A failed reverse-order release must not prevent rollback from
+    // attempting every earlier acquisition.
+    fail_mem = rdma_queue_planner_nth_fail_mem::type_id::create(
+      "rollback_release_failure_mem"
+    );
+    fail_mem.fail_on_allocate = 5;
+    expect_status("ARM_ROLLBACK_RELEASE_FAILURE", fail_mem.fail_next(
+      "release", rdma_status::make(
+        RDMA_SC_DMA_TRANSLATION, "injected rollback release failure"
+      )), RDMA_SC_OK);
+    planner = rdma_queue_backing_planner::type_id::create(
+      "rollback_release_failure_planner"
+    );
+    expect_status("ROLLBACK_RELEASE_FAILURE_CONFIGURE",
+      planner.configure(fail_mem), RDMA_SC_OK);
+    preflight = make_planner_preflight(
+      "rollback_release_failure_preflight", RDMA_RESOURCE_SRQ,
+      RDMA_QUEUE_BACKING_OWNED, 1'b1
+    );
+    resource_h = make_handle("rollback_release_failure_resource", owner,
+                             RDMA_RESOURCE_SRQ, 32'h6005);
+    plan = null;
+    expect_status("ROLLBACK_RELEASE_FAILURE", planner.materialize(
+      binding, preflight, resource_h, plan), RDMA_SC_DMA_TRANSLATION);
+    if (plan != null || count_planner_host_calls(fail_mem, "allocate") != 5 ||
+        count_planner_host_calls(fail_mem, "release") != 4 ||
+        fail_mem.live_allocations() != 1)
+      `uvm_error("ROLLBACK_RELEASE_FAILURE",
+                 "rollback stopped after its first release failure")
+
+    // A borrowed payload is detached, not released, when its owned PD
+    // acquisition fails.
+    fail_mem = rdma_queue_planner_nth_fail_mem::type_id::create(
+      "borrowed_pd_failure_mem"
+    );
+    fail_mem.fail_on_allocate = 1;
+    planner = rdma_queue_backing_planner::type_id::create(
+      "borrowed_pd_failure_planner"
+    );
+    expect_status("BORROWED_PD_FAILURE_CONFIGURE", planner.configure(fail_mem),
+                  RDMA_SC_OK);
+    preflight = make_planner_preflight(
+      "borrowed_pd_failure_preflight", RDMA_RESOURCE_CQ,
+      RDMA_QUEUE_BACKING_BORROWED
+    );
+    borrowed_mapping = make_mapping("borrowed_pd_failure_mapping", binding,
+      64'h0000_0070_0000_0000, 64'h0000_00e0_0000_0000, 4096);
+    add_borrowed_slice(preflight, "borrowed_pd_failure_slice",
+      RDMA_QUEUE_ROLE_CQ_RING, borrowed_mapping, 0, 4096);
+    resource_h = make_handle("borrowed_pd_failure_resource", owner,
+                             RDMA_RESOURCE_CQ, 32'h6002);
+    plan = null;
+    expect_status("BORROWED_PD_FAILURE", planner.materialize(
+      binding, preflight, resource_h, plan), RDMA_SC_RESOURCE_EXHAUSTED);
+    if (plan != null || count_planner_host_calls(fail_mem, "allocate") != 1 ||
+        count_planner_host_calls(fail_mem, "release") != 0)
+      `uvm_error("BORROWED_PD_FAILURE",
+                 "borrowed rollback released caller backing")
+
+    // The allocated mapping itself remains rollback authority until its
+    // snapshot succeeds; a snapshot failure therefore releases exactly once.
+    snapshot_mem = rdma_queue_planner_snapshot_fail_mem::type_id::create(
+      "snapshot_failure_mem"
+    );
+    planner = rdma_queue_backing_planner::type_id::create(
+      "snapshot_failure_planner"
+    );
+    expect_status("SNAPSHOT_FAILURE_CONFIGURE", planner.configure(snapshot_mem),
+                  RDMA_SC_OK);
+    preflight = make_planner_preflight(
+      "snapshot_failure_preflight", RDMA_RESOURCE_CEQ,
+      RDMA_QUEUE_BACKING_OWNED
+    );
+    resource_h = make_handle("snapshot_failure_resource", owner,
+                             RDMA_RESOURCE_CEQ, 32'h6003);
+    plan = null;
+    expect_status("SNAPSHOT_FAILURE", planner.materialize(
+      binding, preflight, resource_h, plan), RDMA_SC_INVALID_STATE);
+    if (plan != null ||
+        count_planner_host_calls(snapshot_mem, "allocate") != 1 ||
+        count_planner_host_calls(snapshot_mem, "release") != 1 ||
+        snapshot_mem.live_allocations() != 0)
+      `uvm_error("SNAPSHOT_FAILURE",
+                 "snapshot failure lost allocation rollback authority")
+
+    // Release failures are retryable.  Once the mapping completion authority
+    // reports complete, later cleanup calls do not invoke release again.
+    cleanup_mem = rdma_mock_host_mem::type_id::create("cleanup_failure_mem");
+    planner = rdma_queue_backing_planner::type_id::create(
+      "cleanup_failure_planner"
+    );
+    expect_status("CLEANUP_FAILURE_CONFIGURE", planner.configure(cleanup_mem),
+                  RDMA_SC_OK);
+    preflight = make_planner_preflight(
+      "cleanup_failure_preflight", RDMA_RESOURCE_CEQ,
+      RDMA_QUEUE_BACKING_OWNED
+    );
+    resource_h = make_handle("cleanup_failure_resource", owner,
+                             RDMA_RESOURCE_CEQ, 32'h6004);
+    plan = null;
+    expect_status("CLEANUP_FAILURE_PLAN", planner.materialize(
+      binding, preflight, resource_h, plan), RDMA_SC_OK);
+    expect_status("ARM_CLEANUP_FAILURE", cleanup_mem.fail_next(
+      "release", rdma_status::make(
+        RDMA_SC_DMA_TRANSLATION, "injected planner release failure"
+      )), RDMA_SC_OK);
+    complete = 1'b1;
+    expect_status("CLEANUP_FAILURE_FIRST",
+      planner.cleanup_local_role(plan.refs[0], complete),
+      RDMA_SC_DMA_TRANSLATION);
+    if (complete || count_planner_host_calls(cleanup_mem, "release") != 1)
+      `uvm_error("CLEANUP_FAILURE_FIRST",
+                 "failed cleanup incorrectly reported completion")
+    complete = 1'b0;
+    expect_status("CLEANUP_FAILURE_RETRY",
+      planner.cleanup_local_role(plan.refs[0], complete), RDMA_SC_OK);
+    if (!complete || count_planner_host_calls(cleanup_mem, "release") != 2)
+      `uvm_error("CLEANUP_FAILURE_RETRY", "cleanup retry did not complete")
+    complete = 1'b0;
+    expect_status("CLEANUP_FAILURE_IDEMPOTENT",
+      planner.cleanup_local_role(plan.refs[0], complete), RDMA_SC_OK);
+    if (!complete || count_planner_host_calls(cleanup_mem, "release") != 2)
+      `uvm_error("CLEANUP_FAILURE_IDEMPOTENT",
+                 "completed cleanup repeated release")
+    complete = 1'b0;
+    expect_status("CLEANUP_FAILURE_PD",
+      planner.cleanup_local_role(plan.refs[1], complete), RDMA_SC_OK);
   endfunction
 
   function automatic void check_contexts_and_commands();
@@ -856,6 +1743,9 @@ class rdma_queue_lifecycle_test extends uvm_test;
   task run_phase(uvm_phase phase);
     phase.raise_objection(this);
     check_preflight();
+    check_backing_planner_positive();
+    check_backing_planner_negative();
+    check_backing_planner_rollback_and_cleanup();
     check_contexts_and_commands();
     phase.drop_objection(this);
   endtask
