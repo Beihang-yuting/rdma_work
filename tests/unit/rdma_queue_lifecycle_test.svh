@@ -633,6 +633,16 @@ class rdma_queue_lifecycle_test extends uvm_test;
     expect_status("CQC_QUERY_COMMAND",
       cq_policy.build_object_command(8'h0f, owner, cq, 100ns, command),
       RDMA_SC_OK);
+    cq.owner = foreign_owner;
+    command = rdma_cmq_command_desc::type_id::create(
+      "stale_cq_foreign_resource_delete");
+    expect_status("CQC_DELETE_REJECTS_FOREIGN_RESOURCE_OWNER",
+      cq_policy.build_object_command(8'h0e, owner, cq, 100ns, command),
+      RDMA_SC_INVALID_ARGUMENT);
+    if (command != null)
+      `uvm_error("CQC_DELETE_REJECTS_FOREIGN_RESOURCE_OWNER",
+                 "failed foreign-resource delete leaked caller output")
+    cq.owner = owner;
 
     target = rdma_queue_flush_target::type_id::create("cq_flush_target");
     target.role = RDMA_QUEUE_ROLE_CQ_PD;
@@ -708,6 +718,16 @@ class rdma_queue_lifecycle_test extends uvm_test;
     expect_status("SRFQC_QUERY_COMMAND",
       srq_policy.build_object_command(8'h38, owner, srq, 100ns, command),
       RDMA_SC_OK);
+    srq.owner = foreign_owner;
+    command = rdma_cmq_command_desc::type_id::create(
+      "stale_srq_foreign_resource_query");
+    expect_status("SRFQC_QUERY_REJECTS_FOREIGN_RESOURCE_OWNER",
+      srq_policy.build_object_command(8'h38, owner, srq, 100ns, command),
+      RDMA_SC_INVALID_ARGUMENT);
+    if (command != null)
+      `uvm_error("SRFQC_QUERY_REJECTS_FOREIGN_RESOURCE_OWNER",
+                 "failed foreign-resource query leaked caller output")
+    srq.owner = owner;
 
     ceq_plan = make_eq_plan("ceq_plan", binding, RDMA_RESOURCE_CEQ);
     ceq = rdma_ceq::type_id::create("ceq_builder_view");
@@ -746,6 +766,16 @@ class rdma_queue_lifecycle_test extends uvm_test;
     expect_status("CEQC_QUERY_COMMAND",
       ceq_policy.build_object_command(8'h13, owner, ceq, 100ns, command),
       RDMA_SC_OK);
+    ceq.owner = foreign_owner;
+    command = rdma_cmq_command_desc::type_id::create(
+      "stale_ceq_foreign_resource_delete");
+    expect_status("CEQC_DELETE_REJECTS_FOREIGN_RESOURCE_OWNER",
+      ceq_policy.build_object_command(8'h12, owner, ceq, 100ns, command),
+      RDMA_SC_INVALID_ARGUMENT);
+    if (command != null)
+      `uvm_error("CEQC_DELETE_REJECTS_FOREIGN_RESOURCE_OWNER",
+                 "failed foreign-resource delete leaked caller output")
+    ceq.owner = owner;
 
     aeq_plan = make_eq_plan("aeq_plan", binding, RDMA_RESOURCE_AEQ);
     aeq = rdma_aeq::type_id::create("aeq_builder_view");
@@ -781,6 +811,16 @@ class rdma_queue_lifecycle_test extends uvm_test;
     expect_status("AEQC_QUERY_COMMAND",
       aeq_policy.build_object_command(8'h17, owner, aeq, 100ns, command),
       RDMA_SC_OK);
+    aeq.owner = foreign_owner;
+    command = rdma_cmq_command_desc::type_id::create(
+      "stale_aeq_foreign_resource_query");
+    expect_status("AEQC_QUERY_REJECTS_FOREIGN_RESOURCE_OWNER",
+      aeq_policy.build_object_command(8'h17, owner, aeq, 100ns, command),
+      RDMA_SC_INVALID_ARGUMENT);
+    if (command != null)
+      `uvm_error("AEQC_QUERY_REJECTS_FOREIGN_RESOURCE_OWNER",
+                 "failed foreign-resource query leaked caller output")
+    aeq.owner = owner;
 
     wrong_resource = rdma_queue_resource::type_id::create("wrong_resource");
     slot_image = '{8'haa};

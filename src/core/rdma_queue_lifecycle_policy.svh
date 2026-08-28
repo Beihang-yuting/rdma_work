@@ -67,10 +67,9 @@ virtual class rdma_queue_lifecycle_policy extends uvm_object;
     return rdma_handle_owner_status(resource.handle, resource.owner);
   endfunction
 
-  protected function rdma_status command_owner_status(
+  protected function rdma_status command_resource_owner_status(
     rdma_function_handle owner,
     rdma_queue_resource resource,
-    rdma_handle context_h,
     rdma_resource_kind_e expected_kind
   );
     rdma_status status;
@@ -80,6 +79,20 @@ virtual class rdma_queue_lifecycle_policy extends uvm_object;
       return status;
     if (!same_function(owner, resource.owner))
       return invalid_argument("queue command owner does not match resource");
+    return rdma_status::success();
+  endfunction
+
+  protected function rdma_status command_owner_status(
+    rdma_function_handle owner,
+    rdma_queue_resource resource,
+    rdma_handle context_h,
+    rdma_resource_kind_e expected_kind
+  );
+    rdma_status status;
+
+    status = command_resource_owner_status(owner, resource, expected_kind);
+    if (!status.ok())
+      return status;
     if (context_h == null || context_h.kind != expected_kind)
       return invalid_argument("queue command context handle is invalid");
     return rdma_handle_owner_status(context_h, owner);
@@ -719,9 +732,12 @@ class rdma_cq_lifecycle_policy extends rdma_queue_lifecycle_policy;
     rdma_queue_resource resource, time timeout,
     output rdma_cmq_command_desc command);
     rdma_cq cq;
+    rdma_status status;
     command = null;
     if (!$cast(cq, resource))
       return invalid_argument("CQ object command requires rdma_cq");
+    status = command_resource_owner_status(owner, cq, RDMA_RESOURCE_CQ);
+    if (!status.ok()) return status;
     return build_object_desc(opcode, XTR_V1_OP_CQC_DELETE,
       XTR_V1_OP_CQC_QUERY, owner, cq.handle, RDMA_RESOURCE_CQ,
       cq.local_cq_id, 21, timeout, command);
@@ -929,9 +945,12 @@ class rdma_srq_lifecycle_policy extends rdma_queue_lifecycle_policy;
     rdma_queue_resource resource, time timeout,
     output rdma_cmq_command_desc command);
     rdma_srq srq;
+    rdma_status status;
     command = null;
     if (!$cast(srq, resource))
       return invalid_argument("SRQ object command requires rdma_srq");
+    status = command_resource_owner_status(owner, srq, RDMA_RESOURCE_SRQ);
+    if (!status.ok()) return status;
     return build_object_desc(opcode, XTR_V1_OP_SRFQC_DELETE,
       XTR_V1_OP_SRFQC_QUERY, owner, srq.handle, RDMA_RESOURCE_SRQ,
       srq.local_srq_id, 16, timeout, command);
@@ -1101,9 +1120,12 @@ class rdma_ceq_lifecycle_policy extends rdma_queue_lifecycle_policy;
     rdma_queue_resource resource, time timeout,
     output rdma_cmq_command_desc command);
     rdma_ceq ceq;
+    rdma_status status;
     command = null;
     if (!$cast(ceq, resource))
       return invalid_argument("CEQ object command requires rdma_ceq");
+    status = command_resource_owner_status(owner, ceq, RDMA_RESOURCE_CEQ);
+    if (!status.ok()) return status;
     return build_object_desc(opcode, XTR_V1_OP_CEQC_DELETE,
       XTR_V1_OP_CEQC_QUERY, owner, ceq.handle, RDMA_RESOURCE_CEQ,
       ceq.local_ceq_id, 12, timeout, command);
@@ -1268,9 +1290,12 @@ class rdma_aeq_lifecycle_policy extends rdma_queue_lifecycle_policy;
     rdma_queue_resource resource, time timeout,
     output rdma_cmq_command_desc command);
     rdma_aeq aeq;
+    rdma_status status;
     command = null;
     if (!$cast(aeq, resource))
       return invalid_argument("AEQ object command requires rdma_aeq");
+    status = command_resource_owner_status(owner, aeq, RDMA_RESOURCE_AEQ);
+    if (!status.ok()) return status;
     return build_object_desc(opcode, XTR_V1_OP_AEQC_DELETE,
       XTR_V1_OP_AEQC_QUERY, owner, aeq.handle, RDMA_RESOURCE_AEQ,
       aeq.local_aeq_id, 12, timeout, command);
