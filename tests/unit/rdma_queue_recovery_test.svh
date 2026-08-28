@@ -341,7 +341,8 @@ class rdma_queue_recovery_test extends rdma_queue_lifecycle_test;
     string label,
     rdma_resource_kind_e kind,
     bit [7:0] absent_ecode,
-    bit [7:0] unknown_ecode
+    bit [7:0] unknown_ecode,
+    bit expect_absent
   );
     rdma_function_binding binding;
     rdma_fault_inject_resource_manager manager;
@@ -404,12 +405,15 @@ class rdma_queue_recovery_test extends rdma_queue_lifecycle_test;
     end
     owner = !ticket.sq_wrap;
     completion = make_query_completion(
-      {label, "_ABSENT"}, policy, queue, ticket,
+      {label, expect_absent ? "_ABSENT" : "_NONZERO"}, policy, queue, ticket,
       query_status(ticket, RDMA_SC_UNKNOWN_HW_ERROR, absent_ecode),
       query_opcode_value, absent_ecode, owner, ticket.sq_index,
       ticket.sq_wrap, 1'b0);
-    query_result_is({label, "_ABSENT"}, policy, queue, completion,
-                    RDMA_HW_PRESENCE_ABSENT, 1'b1);
+    query_result_is({label, expect_absent ? "_ABSENT" : "_NONZERO"}, policy,
+                    queue, completion,
+                    expect_absent ? RDMA_HW_PRESENCE_ABSENT :
+                      RDMA_HW_PRESENCE_UNKNOWN,
+                    expect_absent);
 
     completion = make_query_completion(
       {label, "_UNKNOWN"}, policy, queue, ticket,
@@ -422,22 +426,22 @@ class rdma_queue_recovery_test extends rdma_queue_lifecycle_test;
 
   task automatic check_query_profile_absence_matrix();
     check_query_absent_case("QUERY_CQC_F3", RDMA_RESOURCE_CQ,
-                            XTR_V1_ECODE_EC_RCE_CQC_INVLD, 8'h7b);
+                            XTR_V1_ECODE_EC_RCE_CQC_INVLD, 8'h7b, 1'b1);
     check_query_absent_case("QUERY_CEQC_F7", RDMA_RESOURCE_CEQ,
-                            XTR_V1_ECODE_EC_RCE_CEQC_INVLD, 8'h7b);
+                            XTR_V1_ECODE_EC_RCE_CEQC_INVLD, 8'h7b, 1'b1);
     check_query_absent_case("QUERY_AEQC_FA", RDMA_RESOURCE_AEQ,
-                            XTR_V1_ECODE_EC_RCE_AEQC_INVLD, 8'h7b);
+                            XTR_V1_ECODE_EC_RCE_AEQC_INVLD, 8'h7b, 1'b1);
     check_query_absent_case("QUERY_SRFQC_7B", RDMA_RESOURCE_SRQ,
-                            8'hff, 8'h7b);
+                            8'hff, 8'h7b, 1'b0);
     check_query_absent_case("QUERY_SRFQC_ARBITRARY", RDMA_RESOURCE_SRQ,
-                            8'hff, 8'h55);
+                            8'hff, 8'h55, 1'b0);
   endtask
 
   // A QUERY can prove that the hardware object is absent before the
-  // remaining SRQ pre-delete OCC barrier has completed.  Absence is not a
+  // remaining CQ post-delete OCC barrier has completed.  Absence is not a
   // license to release local authority: recovery must retain ERROR and leave
   // every backing/context release pending until the barrier is terminal.
-  task automatic check_query_absent_before_srq_occ_barrier();
+  task automatic check_query_absent_before_cq_occ_barrier();
     string label;
     rdma_function_binding binding;
     rdma_fault_inject_resource_manager manager;
@@ -454,8 +458,8 @@ class rdma_queue_recovery_test extends rdma_queue_lifecycle_test;
     rdma_ceq ceq_dependency;
     rdma_recovery_record recovery;
     rdma_resource error_resource;
-    rdma_srq srq;
-    rdma_srq_lifecycle_policy policy;
+    rdma_cq cq;
+    rdma_cq_lifecycle_policy policy;
     rdma_cmq_ticket query_ticket;
     rdma_cmq_completion absent_completion;
     rdma_status status;
@@ -463,17 +467,20 @@ class rdma_queue_recovery_test extends rdma_queue_lifecycle_test;
     bit barrier_pending;
 
     label = "RECOVERY_QUERY_ABSENT_OCC_BARRIER";
-    create_destroy_fixture(label, RDMA_RESOURCE_SRQ, binding, manager, mem,
+    create_destroy_fixture(label, RDMA_RESOURCE_CQ, binding, manager, mem,
                            context_backing, cmq, trace, executor, queue,
                            create_result, ceq_dependency, pd_dependency);
-    if (!$cast(srq, queue)) begin
-      `uvm_error(label, "SRQ barrier fixture did not produce an SRQ")
+    if (!$cast(cq, queue)) begin
+      `uvm_error(label, "CQ barrier fixture did not produce a CQ")
       return;
     end
 
-    // Lose the first pre-delete flush.  Its late success is reconciled below;
-    // the second pre-delete target is deliberately left pending.
-    cmq.timeout_opcode(XTR_V1_OP_OCC_FLUSH);
+    // Return a non-OK/null outcome for DELETE without pre-submit proof.  The
+    // queue remains ERROR with UNKNOWN hardware presence, so recovery issues
+    // a typed QUERY before retrying the post-delete OCC barrier.
+    cmq.nonok_null_without_proof = 1'b1;
+    cmq.nonok_null_status = rdma_status::make(
+      RDMA_SC_INVALID_STATE, "injected CQ delete outcome without proof");
     executor.destroy_locked(binding, binding.make_handle(),
                             make_destroy_request({label, "_destroy"},
                                                   binding, queue.handle),
@@ -488,17 +495,15 @@ class rdma_queue_recovery_test extends rdma_queue_lifecycle_test;
         result.status.code != RDMA_SC_RECOVERY_REQUIRED ||
         !result.recovery_required || error_resource == null ||
         error_resource.state != RDMA_RESOURCE_ERROR ||
-        recovery == null || recovery.ambiguous_ticket == null ||
-        recovery.ambiguous_queue_operation != RDMA_QUEUE_AMBIG_OCC_FLUSH ||
+        recovery == null || recovery.ambiguous_ticket != null ||
+        recovery.ambiguous_queue_operation != RDMA_QUEUE_AMBIG_DELETE ||
         mem.release_ordinal != 0 || context_backing.release_call_count != 0)
       `uvm_error(label,
-                 "ambiguous first SRQ OCC did not retain ERROR authority")
+                 "ambiguous CQ delete did not retain ERROR authority")
 
-    cmq.push_late_completion(recovery.ambiguous_ticket,
-                             rdma_status::success("late first SRQ flush"));
     // Force QUERY itself through the ticket reconciliation path, where this
     // test can provide an authenticated invalid-context (ABSENT) completion.
-    cmq.timeout_opcode(XTR_V1_OP_SRFQC_QUERY);
+    cmq.timeout_opcode(XTR_V1_OP_CQC_QUERY);
     executor.recover_locked(binding, binding.make_handle(), queue.handle,
                             64'd2301, recovery_result);
     status = manager.lookup_recovery(queue.handle, recovery);
@@ -506,31 +511,33 @@ class rdma_queue_recovery_test extends rdma_queue_lifecycle_test;
                   RDMA_SC_OK);
     if (recovery == null || recovery.ambiguous_ticket == null ||
         recovery.ambiguous_ticket.opcode_key == null ||
-        recovery.ambiguous_ticket.opcode_key.opcode != XTR_V1_OP_SRFQC_QUERY ||
+        recovery.ambiguous_ticket.opcode_key.opcode != XTR_V1_OP_CQC_QUERY ||
         recovery.hardware_presence != RDMA_HW_PRESENCE_UNKNOWN ||
         mem.release_ordinal != 0 || context_backing.release_call_count != 0)
-      `uvm_error(label, "ambiguous SRQ QUERY lost durable no-release state")
+      `uvm_error(label, "ambiguous CQ QUERY lost durable no-release state")
     query_ticket = recovery.ambiguous_ticket;
 
-    policy = rdma_srq_lifecycle_policy::type_id::create(
+    policy = rdma_cq_lifecycle_policy::type_id::create(
       {label, "_policy"});
     absent_completion = make_query_completion(
-      {label, "_absent"}, policy, srq, query_ticket,
-      query_status(query_ticket, RDMA_SC_UNKNOWN_HW_ERROR, 8'hff),
-      XTR_V1_OP_SRFQC_QUERY, 8'hff, !query_ticket.sq_wrap,
+      {label, "_absent"}, policy, cq, query_ticket,
+      query_status(query_ticket, RDMA_SC_UNKNOWN_HW_ERROR,
+                   XTR_V1_ECODE_EC_RCE_CQC_INVLD),
+      XTR_V1_OP_CQC_QUERY, XTR_V1_ECODE_EC_RCE_CQC_INVLD,
+      !query_ticket.sq_wrap,
       query_ticket.sq_index, query_ticket.sq_wrap, 1'b0);
     if (absent_completion == null ||
-        !query_result_is({label, "_CLASSIFY_ABSENT"}, policy, srq,
+        !query_result_is({label, "_CLASSIFY_ABSENT"}, policy, cq,
                          absent_completion, RDMA_HW_PRESENCE_ABSENT, 1'b1))
-      `uvm_error(label, "SRQ QUERY absence completion was not authenticated")
+      `uvm_error(label, "CQ QUERY absence completion was not authenticated")
     cmq.script_reconcile(query_ticket, 1'b1, absent_completion,
-                         rdma_status::success("late SRQ QUERY absence"));
+                         rdma_status::success("late CQ QUERY absence"));
 
-    // QUERY absence is conclusive, but the second pre-delete OCC barrier is
+    // QUERY absence is conclusive, but the post-delete OCC barrier is
     // not.  A definitive OCC failure must retain ERROR and must not release
     // any local mapping, context, dependency, or reservation.
     flush_failure = rdma_status::make(RDMA_SC_UNKNOWN_HW_ERROR,
-                                      "second SRQ flush still failed");
+                                      "CQ post-delete flush still failed");
     cmq.fail_opcode(XTR_V1_OP_OCC_FLUSH, flush_failure);
     executor.recover_locked(binding, binding.make_handle(), queue.handle,
                             64'd2302, recovery_result);
@@ -546,7 +553,7 @@ class rdma_queue_recovery_test extends rdma_queue_lifecycle_test;
         if (recovery.queue_plan.flush_targets[i] != null &&
             !recovery.queue_plan.flush_targets[i].flush_complete &&
             recovery.queue_plan.flush_targets[i].phase ==
-              RDMA_QUEUE_FLUSH_PRE_DELETE)
+              RDMA_QUEUE_FLUSH_POST_DELETE)
           barrier_pending = 1'b1;
     if (recovery_result == null || recovery_result.status == null ||
         recovery_result.status.code != RDMA_SC_RECOVERY_REQUIRED ||
@@ -557,7 +564,95 @@ class rdma_queue_recovery_test extends rdma_queue_lifecycle_test;
         mem.release_ordinal != 0 || context_backing.release_call_count != 0 ||
         manager.release_reserved_calls != 0)
       `uvm_error(label,
-                 "QUERY ABSENT crossed incomplete SRQ OCC barrier or released local authority")
+                 "QUERY ABSENT crossed incomplete CQ OCC barrier or released local authority")
+  endtask
+
+  // Physical context release can succeed while its registry progress update
+  // fails.  Recovery must persist the progress gap, query the opaque release
+  // authority on retry, and avoid invoking the external release a second
+  // time before finalizing the queue.
+  task automatic check_context_progress_failure_exactly_once();
+    string label;
+    rdma_function_binding binding;
+    rdma_fault_inject_resource_manager manager;
+    rdma_queue_destroy_trace_mem mem;
+    rdma_queue_destroy_trace_context context_backing;
+    rdma_queue_destroy_trace_cmq cmq;
+    rdma_mock_call_trace trace;
+    rdma_queue_lifecycle_executor executor;
+    rdma_queue_resource queue;
+    rdma_control_result create_result;
+    rdma_control_result destroy_result;
+    rdma_control_result first_recovery_result;
+    rdma_control_result second_recovery_result;
+    rdma_ceq ceq_dependency;
+    rdma_pd pd_dependency;
+    rdma_recovery_record recovery;
+    rdma_resource error_resource;
+    rdma_status status;
+    rdma_status flush_failure;
+    rdma_status progress_failure;
+    int unsigned host_release_count;
+    int unsigned context_release_count;
+
+    label = "RECOVERY_CONTEXT_PROGRESS_EXACTLY_ONCE";
+    create_destroy_fixture(label, RDMA_RESOURCE_CQ, binding, manager, mem,
+                           context_backing, cmq, trace, executor, queue,
+                           create_result, ceq_dependency, pd_dependency);
+    flush_failure = rdma_status::make(RDMA_SC_UNKNOWN_HW_ERROR,
+                                      "initial CQ post-delete flush failure");
+    cmq.fail_opcode(XTR_V1_OP_OCC_FLUSH, flush_failure);
+    executor.destroy_locked(binding, binding.make_handle(),
+                            make_destroy_request({label, "_destroy"},
+                                                  binding, queue.handle),
+                            64'd2310, destroy_result);
+    status = manager.lookup_recovery(queue.handle, recovery);
+    expect_status({label, "_INITIAL_RECOVERY"}, status, RDMA_SC_OK);
+    status = manager.lookup(queue.handle, error_resource);
+    expect_status({label, "_INITIAL_ERROR"}, status, RDMA_SC_OK);
+    if (destroy_result == null || destroy_result.status == null ||
+        destroy_result.status.code != RDMA_SC_RECOVERY_REQUIRED ||
+        !destroy_result.recovery_required || error_resource == null ||
+        error_resource.state != RDMA_RESOURCE_ERROR || recovery == null ||
+        recovery.hardware_presence != RDMA_HW_PRESENCE_ABSENT ||
+        recovery.queue_plan == null || recovery.queue_plan.context_ref == null ||
+        recovery.queue_plan.context_ref.release_complete ||
+        mem.release_ordinal != 0 || context_backing.release_call_count != 0)
+      `uvm_error(label, "initial cleanup-progress fixture was not retained")
+    progress_failure = rdma_status::make(
+      RDMA_SC_DMA_TRANSLATION, "injected context progress persistence failure");
+    expect_status({label, "_INJECT_PROGRESS"},
+                  manager.fail_next_transition(
+                    "record_queue_context_cleanup_complete",
+                    progress_failure), RDMA_SC_OK);
+    executor.recover_locked(binding, binding.make_handle(), queue.handle,
+                            64'd2311, first_recovery_result);
+    status = manager.lookup_recovery(queue.handle, recovery);
+    expect_status({label, "_FIRST_RECOVERY"}, status, RDMA_SC_OK);
+    host_release_count = count_executor_host_calls(mem, "release");
+    context_release_count = context_backing.release_call_count;
+    if (first_recovery_result == null || first_recovery_result.status == null ||
+        first_recovery_result.status.code != RDMA_SC_RECOVERY_REQUIRED ||
+        !first_recovery_result.recovery_required || recovery == null ||
+        recovery.queue_plan == null || recovery.queue_plan.context_ref == null ||
+        recovery.queue_plan.context_ref.release_complete ||
+        context_release_count != 1 || host_release_count != 2 ||
+        mem.live_allocations() != 0)
+      `uvm_error(label,
+                 "context release/progress failure did not retain exactly-once gap")
+
+    executor.recover_locked(binding, binding.make_handle(), queue.handle,
+                            64'd2312, second_recovery_result);
+    status = manager.lookup(queue.handle, error_resource);
+    expect_status({label, "_SECOND_LOOKUP"}, status, RDMA_SC_INVALID_STATE);
+    if (second_recovery_result == null || !second_recovery_result.ok() ||
+        second_recovery_result.recovery_required ||
+        second_recovery_result.final_resource_state != RDMA_RESOURCE_RELEASED ||
+        context_backing.release_call_count != context_release_count ||
+        count_executor_host_calls(mem, "release") != host_release_count ||
+        mem.live_allocations() != 0)
+      `uvm_error(label,
+                 "context progress retry duplicated a physical release")
   endtask
 
   task automatic check_create_timeout_matrix();
@@ -777,7 +872,8 @@ class rdma_queue_recovery_test extends rdma_queue_lifecycle_test;
     phase.raise_objection(this);
     check_query_classifier_matrix();
     check_query_profile_absence_matrix();
-    check_query_absent_before_srq_occ_barrier();
+    check_query_absent_before_cq_occ_barrier();
+    check_context_progress_failure_exactly_once();
     // Reuse the lifecycle executor's focused fault matrices here as well:
     // they assert ambiguous OCC ERROR retention/no-release and persisted
     // local-cleanup retries without duplicate physical releases.

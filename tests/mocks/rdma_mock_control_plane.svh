@@ -55,7 +55,9 @@ class rdma_fault_inject_resource_manager extends rdma_resource_manager;
   );
     if (!(transition_name inside {"stage_allocated", "commit_programmed", "activate",
                                   "release_reserved", "mark_error",
-                                  "complete_reserved_error"}))
+                                  "complete_reserved_error",
+                                  "record_queue_context_cleanup_complete",
+                                  "record_queue_cleanup_complete"}))
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "unknown resource transition");
     if (failure == null)
@@ -138,6 +140,30 @@ class rdma_fault_inject_resource_manager extends rdma_resource_manager;
     if (failure != null)
       return failure;
     return super.complete_reserved_error(handle);
+  endfunction
+
+  virtual function rdma_status record_queue_context_cleanup_complete(
+    rdma_handle handle
+  );
+    rdma_status failure;
+
+    failure = take_transition_failure(
+      "record_queue_context_cleanup_complete");
+    if (failure != null)
+      return failure;
+    return super.record_queue_context_cleanup_complete(handle);
+  endfunction
+
+  virtual function rdma_status record_queue_cleanup_complete(
+    rdma_handle handle,
+    rdma_queue_backing_role_e role
+  );
+    rdma_status failure;
+
+    failure = take_transition_failure("record_queue_cleanup_complete");
+    if (failure != null)
+      return failure;
+    return super.record_queue_cleanup_complete(handle, role);
   endfunction
 endclass
 

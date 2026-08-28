@@ -490,9 +490,13 @@ class rdma_queue_lifecycle_executor extends uvm_object;
       recovery.pending_steps.push_back(RDMA_CTRL_STEP_HW_CONTEXT_DELETED);
     if (pending_local_cleanup)
       recovery.pending_steps.push_back(RDMA_CTRL_STEP_BACKING_RELEASED);
-    recovery.ambiguous_ticket = rdma_cmq_clone_ticket_value(
-      ticket, "queue recovery"
-    );
+    // A ticket is retained only when the adapter reported an ambiguous
+    // outcome.  Definitive failures still return a ticket in many CMQ
+    // adapters, but that ticket is not evidence awaiting reconciliation; if
+    // it were persisted here, recovery would stop waiting for a terminal
+    // result and never retry the failed operation.
+    recovery.ambiguous_ticket = ambiguous_operation == RDMA_QUEUE_AMBIG_NONE ?
+      null : rdma_cmq_clone_ticket_value(ticket, "queue recovery");
     recovery.primary_status = rdma_cmq_clone_status_value(primary);
     recovery.rollback_statuses = result.rollback_statuses;
     recovery.queue_recovery_valid = 1'b1;

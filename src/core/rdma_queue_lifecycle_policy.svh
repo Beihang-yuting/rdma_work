@@ -718,6 +718,7 @@ virtual class rdma_queue_lifecycle_policy extends uvm_object;
     int unsigned payload_offset,
     int unsigned payload_length,
     bit [7:0] absent_ecode,
+    bit absent_ecode_valid,
     output rdma_hw_presence_e presence,
     output bit conclusive
   );
@@ -772,12 +773,12 @@ virtual class rdma_queue_lifecycle_policy extends uvm_object;
       return rdma_status::success();
 
     // Error ecodes are meaningful only when authenticated to this exact
-    // query opcode.  Query errors commonly carry no object bytes, so apply
-    // the absent whitelist before the success-payload length check.  A
-    // whitelist value paired with an OK status is malformed, and all other
-    // nonzero ecodes remain inconclusive even if their bytes happen to decode
-    // as a valid context.
-    if (payload.command_ecode == absent_ecode) begin
+    // query opcode.  Profiles with an absence whitelist commonly carry no
+    // object bytes, so apply that whitelist before the success-payload length
+    // check.  A whitelist value paired with an OK status is malformed, and
+    // all other nonzero ecodes remain inconclusive even if their bytes happen
+    // to decode as a valid context.
+    if (absent_ecode_valid && payload.command_ecode == absent_ecode) begin
       if (!completion.status.ok() &&
           (!completion.status.hardware_code_valid ||
            completion.status.hardware_code[7:0] == payload.command_ecode)) begin
@@ -1087,7 +1088,7 @@ class rdma_cq_lifecycle_policy extends rdma_queue_lifecycle_policy;
   );
     return classify_query_common(resource, completion, XTR_V1_OP_CQC_QUERY,
       XTR_V1_OP_CQC_CREATE, RDMA_IMAGE_CQC, "cqc", 8, 56,
-      XTR_V1_ECODE_EC_RCE_CQC_INVLD, presence, conclusive);
+      XTR_V1_ECODE_EC_RCE_CQC_INVLD, 1'b1, presence, conclusive);
   endfunction
   virtual function void hardware_cleanup_roles(output rdma_queue_backing_role_e flush_roles[$], output rdma_queue_flush_phase_e flush_phases[$], output bit delete_before_flush); flush_roles.delete(); flush_phases.delete(); delete_before_flush=1'b1; flush_roles.push_back(RDMA_QUEUE_ROLE_CQ_PD); flush_phases.push_back(RDMA_QUEUE_FLUSH_POST_DELETE); endfunction
   virtual function void local_cleanup_roles(output rdma_queue_backing_role_e roles[$], output bit release_context_first); roles.delete(); release_context_first=1'b1; roles.push_back(RDMA_QUEUE_ROLE_CQ_PD); roles.push_back(RDMA_QUEUE_ROLE_CQ_RING); endfunction
@@ -1333,7 +1334,7 @@ class rdma_srq_lifecycle_policy extends rdma_queue_lifecycle_policy;
   );
     return classify_query_common(resource, completion, XTR_V1_OP_SRFQC_QUERY,
       XTR_V1_OP_SRFQC_CREATE, RDMA_IMAGE_SRQC, "srqc", 16, 32,
-      8'hff, presence, conclusive);
+      8'hff, 1'b0, presence, conclusive);
   endfunction
   virtual function void hardware_cleanup_roles(output rdma_queue_backing_role_e flush_roles[$], output rdma_queue_flush_phase_e flush_phases[$], output bit delete_before_flush); flush_roles.delete(); flush_phases.delete(); delete_before_flush=1'b0; flush_roles.push_back(RDMA_QUEUE_ROLE_SRFQ_PD); flush_phases.push_back(RDMA_QUEUE_FLUSH_PRE_DELETE); flush_roles.push_back(RDMA_QUEUE_ROLE_SRQ_PD); flush_phases.push_back(RDMA_QUEUE_FLUSH_PRE_DELETE); endfunction
   virtual function void local_cleanup_roles(output rdma_queue_backing_role_e roles[$], output bit release_context_first); roles.delete(); release_context_first=1'b1; roles.push_back(RDMA_QUEUE_ROLE_SRFQ_PD); roles.push_back(RDMA_QUEUE_ROLE_SRQ_PD); roles.push_back(RDMA_QUEUE_ROLE_SRQ_SGB); roles.push_back(RDMA_QUEUE_ROLE_SRFQ_RING); roles.push_back(RDMA_QUEUE_ROLE_SRQ_RING); endfunction
@@ -1534,7 +1535,7 @@ class rdma_ceq_lifecycle_policy extends rdma_queue_lifecycle_policy;
   );
     return classify_query_common(resource, completion, XTR_V1_OP_CEQC_QUERY,
       XTR_V1_OP_CEQC_CREATE, RDMA_IMAGE_CEQC, "ceqc", 16, 32,
-      XTR_V1_ECODE_EC_RCE_CEQC_INVLD, presence, conclusive);
+      XTR_V1_ECODE_EC_RCE_CEQC_INVLD, 1'b1, presence, conclusive);
   endfunction
   virtual function void hardware_cleanup_roles(output rdma_queue_backing_role_e flush_roles[$], output rdma_queue_flush_phase_e flush_phases[$], output bit delete_before_flush); flush_roles.delete(); flush_phases.delete(); delete_before_flush=1'b1; endfunction
   virtual function void local_cleanup_roles(output rdma_queue_backing_role_e roles[$], output bit release_context_first); roles.delete(); release_context_first=1'b0; roles.push_back(RDMA_QUEUE_ROLE_CEQ_PD); roles.push_back(RDMA_QUEUE_ROLE_CEQ_RING); endfunction
@@ -1735,7 +1736,7 @@ class rdma_aeq_lifecycle_policy extends rdma_queue_lifecycle_policy;
   );
     return classify_query_common(resource, completion, XTR_V1_OP_AEQC_QUERY,
       XTR_V1_OP_AEQC_CREATE, RDMA_IMAGE_AEQC, "aeqc", 16, 32,
-      XTR_V1_ECODE_EC_RCE_AEQC_INVLD, presence, conclusive);
+      XTR_V1_ECODE_EC_RCE_AEQC_INVLD, 1'b1, presence, conclusive);
   endfunction
   virtual function void hardware_cleanup_roles(output rdma_queue_backing_role_e flush_roles[$], output rdma_queue_flush_phase_e flush_phases[$], output bit delete_before_flush); flush_roles.delete(); flush_phases.delete(); delete_before_flush=1'b1; endfunction
   virtual function void local_cleanup_roles(output rdma_queue_backing_role_e roles[$], output bit release_context_first); roles.delete(); release_context_first=1'b0; roles.push_back(RDMA_QUEUE_ROLE_AEQ_PD); roles.push_back(RDMA_QUEUE_ROLE_AEQ_RING); endfunction
