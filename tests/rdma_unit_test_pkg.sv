@@ -20,6 +20,7 @@ package rdma_unit_test_pkg;
 
   `include "rdma_mock_adapters.svh"
   `include "mocks/rdma_mock_control_plane.svh"
+  `include "mocks/rdma_mock_context_backing.svh"
   `include "support/rdma_xtr_v1_golden_reader.svh"
   `include "unit/rdma_smoke_test.svh"
   `include "unit/rdma_types_test.svh"
@@ -31,6 +32,7 @@ package rdma_unit_test_pkg;
   `include "unit/rdma_adapter_contract_test.svh"
   `include "unit/rdma_resource_manager_test.svh"
   `include "unit/rdma_queue_lifecycle_models_test.svh"
+  `include "unit/rdma_context_backing_contract_test.svh"
   `include "unit/rdma_doorbell_scheduler_test.svh"
   `include "unit/rdma_cmq_engine_test.svh"
   `include "unit/rdma_cmq_port_test.svh"

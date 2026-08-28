@@ -5,6 +5,7 @@ package rdma_adapter_pkg;
   `include "uvm_macros.svh"
 
   `include "rdma_host_mem_api.svh"
+  `include "rdma_context_backing_api.svh"
   `include "rdma_pcie_api.svh"
   `include "rdma_function_table_api.svh"
   `include "rdma_net_api.svh"
