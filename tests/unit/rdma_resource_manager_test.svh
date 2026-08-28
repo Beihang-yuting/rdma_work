@@ -3898,12 +3898,14 @@ class rdma_resource_manager_test extends uvm_test;
       rdma_function_binding queue_binding;
       rdma_cq cq_last;
       rdma_cq cq_overflow;
+      rdma_pd srq_width_pd;
       rdma_srq srq_last;
       rdma_srq srq_overflow;
       rdma_ceq ceq_last;
       rdma_ceq ceq_overflow;
       rdma_aeq aeq_last;
       rdma_aeq aeq_overflow;
+      rdma_pd queue_recovery_pd;
       rdma_srq srq;
       rdma_srq restored_srq;
       rdma_srq late_failure_before_srq;
@@ -3922,6 +3924,8 @@ class rdma_resource_manager_test extends uvm_test;
       int unsigned local_before;
       int unsigned registry_before;
       int unsigned free_before;
+      int unsigned srq_width_leak_count;
+      int unsigned queue_recovery_leak_count;
 
       queue_binding = make_active_binding(
         "queue_width_binding", 64'h1d00_0000_0000_0008,
@@ -3948,15 +3952,20 @@ class rdma_resource_manager_test extends uvm_test;
         `uvm_error("WIDTH_CQ_21_ATOMIC", "CQ width failure changed allocator state")
 
       srq_width_rm = new("srq_width_rm");
+      expect_status("WIDTH_SRQ_PD_CREATE",
+                    srq_width_rm.create_pd(queue_binding, srq_width_pd),
+                    RDMA_SC_OK);
       srq_width_rm.seed_next_local_id(RDMA_RESOURCE_SRQ, 16'hffff);
       expect_status("WIDTH_SRQ_16_LAST",
-                    srq_width_rm.create_srq(queue_binding, null, srq_last),
+                    srq_width_rm.create_srq(queue_binding, srq_width_pd.handle,
+                                            srq_last),
                     RDMA_SC_OK);
       local_before = srq_width_rm.observed_next_local_id(RDMA_RESOURCE_SRQ);
       registry_before = srq_width_rm.observed_registry_count();
       free_before = srq_width_rm.observed_free_local_id_count(RDMA_RESOURCE_SRQ);
       expect_status("WIDTH_SRQ_16_EXHAUSTED",
-                    srq_width_rm.create_srq(queue_binding, null, srq_overflow),
+                    srq_width_rm.create_srq(queue_binding, srq_width_pd.handle,
+                                            srq_overflow),
                     RDMA_SC_RESOURCE_EXHAUSTED);
       if (srq_last == null || srq_last.local_srq_id != 16'hffff ||
           srq_overflow != null ||
@@ -3964,6 +3973,14 @@ class rdma_resource_manager_test extends uvm_test;
           srq_width_rm.observed_registry_count() != registry_before ||
           srq_width_rm.observed_free_local_id_count(RDMA_RESOURCE_SRQ) != free_before)
         `uvm_error("WIDTH_SRQ_16_ATOMIC", "SRQ width boundary is not atomic")
+      expect_status("WIDTH_SRQ_16_RELEASE", srq_width_rm.\release (srq_last.handle),
+                    RDMA_SC_OK);
+      expect_status("WIDTH_SRQ_PD_RELEASE",
+                    srq_width_rm.\release (srq_width_pd.handle), RDMA_SC_OK);
+      expect_status("WIDTH_SRQ_NO_LEAKS",
+                    srq_width_rm.check_leaks(srq_width_leak_count), RDMA_SC_OK);
+      if (srq_width_leak_count != 0)
+        `uvm_error("WIDTH_SRQ_NO_LEAKS", "SRQ width fixture leaked resources")
 
       ceq_width_rm = new("ceq_width_rm");
       ceq_width_rm.seed_next_local_id(RDMA_RESOURCE_CEQ, 12'hfff);
@@ -4000,8 +4017,12 @@ class rdma_resource_manager_test extends uvm_test;
         `uvm_error("WIDTH_AEQ_12_ATOMIC", "AEQ width boundary is not atomic")
 
       queue_recovery_manager = new("queue_recovery_manager");
+      expect_status("QUEUE_RECOVERY_PD_CREATE", queue_recovery_manager.create_pd(
+        queue_binding, queue_recovery_pd), RDMA_SC_OK);
       expect_status("QUEUE_RECOVERY_CREATE",
-                    queue_recovery_manager.create_srq(queue_binding, null, srq),
+                    queue_recovery_manager.create_srq(queue_binding,
+                                                      queue_recovery_pd.handle,
+                                                      srq),
                     RDMA_SC_OK);
       srq.depth = 32;
       srq.max_sge = 4;
@@ -4262,6 +4283,14 @@ class rdma_resource_manager_test extends uvm_test;
             queue_plan.flush_targets[1].flush_complete)
         `uvm_error("RESTORE_SRQ_RESET",
                    "safe SRQ restore did not reset progress and ambiguity")
+      expect_status("RESTORE_QUEUE_RELEASE", queue_recovery_manager.\release (
+        srq.handle), RDMA_SC_OK);
+      expect_status("RESTORE_QUEUE_PD_RELEASE", queue_recovery_manager.\release (
+        queue_recovery_pd.handle), RDMA_SC_OK);
+      expect_status("RESTORE_QUEUE_NO_LEAKS", queue_recovery_manager.check_leaks(
+        queue_recovery_leak_count), RDMA_SC_OK);
+      if (queue_recovery_leak_count != 0)
+        `uvm_error("RESTORE_QUEUE_NO_LEAKS", "queue recovery fixture leaked resources")
     end
 
     // PD and MR local IDs are hardware-width projections.  The inclusive
