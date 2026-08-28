@@ -2003,6 +2003,18 @@ class rdma_resource_manager_test extends uvm_test;
     return ref_value;
   endfunction
 
+  function automatic rdma_cmq_opcode_key make_queue_test_opcode(
+    string name,
+    string variant
+  );
+    rdma_cmq_opcode_key opcode_key;
+
+    opcode_key = rdma_cmq_opcode_key::type_id::create(name);
+    opcode_key.profile_name = "generic_profile";
+    opcode_key.variant = variant;
+    return opcode_key;
+  endfunction
+
   function automatic rdma_queue_backing_plan make_queue_test_plan(
     string name,
     rdma_resource_kind_e kind,
@@ -3527,6 +3539,7 @@ class rdma_resource_manager_test extends uvm_test;
     rdma_mr all_kind_mr;
     rdma_cq all_kind_cq;
     rdma_cq all_kind_lookup_cq;
+    rdma_queue_resource all_kind_lookup_queue;
     rdma_qp all_kind_qp;
     rdma_srq all_kind_srq;
     rdma_srq all_kind_lookup_srq;
@@ -4228,8 +4241,10 @@ class rdma_resource_manager_test extends uvm_test;
       if (!$cast(late_failure_before_srq, resource))
         `uvm_fatal("RESTORE_LATE_FAILURE", "SRQ snapshot cast failed")
       queue_recovery_manager.force_queue_restore_late_failure = 1'b1;
+      // The observer removes a required PD reference, so the prepared queue
+      // fails argument validation after reset preparation but before publish.
       expect_status("RESTORE_LATE_FAILURE", queue_recovery_manager.
-        restore_active(srq.handle), RDMA_SC_INVALID_STATE);
+        restore_active(srq.handle), RDMA_SC_INVALID_ARGUMENT);
       queue_recovery_manager.force_queue_restore_late_failure = 1'b0;
       expect_status("RESTORE_LATE_FAILURE_AFTER_RECOVERY", queue_recovery_manager.
         lookup_recovery(srq.handle, queue_recovery_lookup), RDMA_SC_OK);
@@ -4283,10 +4298,8 @@ class rdma_resource_manager_test extends uvm_test;
             queue_plan.flush_targets[1].flush_complete)
         `uvm_error("RESTORE_SRQ_RESET",
                    "safe SRQ restore did not reset progress and ambiguity")
-      expect_status("RESTORE_QUEUE_RELEASE", queue_recovery_manager.\release (
-        srq.handle), RDMA_SC_OK);
-      expect_status("RESTORE_QUEUE_PD_RELEASE", queue_recovery_manager.\release (
-        queue_recovery_pd.handle), RDMA_SC_OK);
+      expect_status("RESTORE_QUEUE_FUNCTION_RELEASE", queue_recovery_manager.
+        release_function(queue_binding.make_handle()), RDMA_SC_OK);
       expect_status("RESTORE_QUEUE_NO_LEAKS", queue_recovery_manager.check_leaks(
         queue_recovery_leak_count), RDMA_SC_OK);
       if (queue_recovery_leak_count != 0)
@@ -4376,7 +4389,7 @@ class rdma_resource_manager_test extends uvm_test;
     expect_status("WIDTH_MR_PD_RELEASE",
                   width_mr_rm.\release (width_mr_pd.handle), RDMA_SC_OK);
 
-    // The default 32-bit pool also owns its inclusive maximum.  Fresh-pool
+    // The CQ wire-width pool owns its inclusive 21-bit maximum.  Fresh-pool
     // exhaustion must not wrap the counter, mutate the registry, or consume
     // an incarnation; a released maximum remains reusable from the free list.
     width_cq_rm = new("width_cq_rm");
@@ -4384,18 +4397,18 @@ class rdma_resource_manager_test extends uvm_test;
       "width_cq_binding", 64'h1d00_0000_0000_0005,
       32'h1d00_0505, 32'd5
     );
-    width_cq_rm.set_next_local_id(RDMA_RESOURCE_CQ, 32'hffff_ffff);
+    width_cq_rm.set_next_local_id(RDMA_RESOURCE_CQ, 21'h1f_ffff);
     expect_status("WIDTH_CQ_LAST",
                   width_cq_rm.create_cq(width_binding, null, width_cq),
                   RDMA_SC_OK);
     if (width_cq == null) begin
       `uvm_error("WIDTH_CQ_LAST",
-                 "allocator rejected the last 32-bit CQ ID")
+                 "allocator rejected the last 21-bit CQ ID")
     end
     else begin
-      if (width_cq.local_cq_id != 32'hffff_ffff)
+      if (width_cq.local_cq_id != 21'h1f_ffff)
         `uvm_error("WIDTH_CQ_LAST",
-                   "allocator did not return the last 32-bit CQ ID")
+                   "allocator did not return the last 21-bit CQ ID")
       width_cq_h = clone_handle("WIDTH_CQ_LAST_H", width_cq.handle);
       serial_before_width_failure =
         width_cq_rm.observed_next_object_serial(RDMA_RESOURCE_CQ);
@@ -4430,7 +4443,7 @@ class rdma_resource_manager_test extends uvm_test;
                                            width_cq_reused),
                     RDMA_SC_OK);
       if (width_cq_reused == null ||
-          width_cq_reused.local_cq_id != 32'hffff_ffff ||
+          width_cq_reused.local_cq_id != 21'h1f_ffff ||
           width_cq_reused.handle.same_instance(width_cq_h))
         `uvm_error("WIDTH_CQ_REUSE_LIMIT",
                    "recycled maximum CQ ID lost incarnation uniqueness")
@@ -7825,6 +7838,40 @@ class rdma_resource_manager_test extends uvm_test;
       recovery_record.primary_status = rdma_status::make(
         RDMA_SC_RESET_CANCELLED, "all-kind exact recovery probe"
       );
+      if (all_kind_resources[i].resource_kind() inside {
+            RDMA_RESOURCE_CQ, RDMA_RESOURCE_SRQ,
+            RDMA_RESOURCE_CEQ, RDMA_RESOURCE_AEQ
+          }) begin
+        if (!$cast(all_kind_lookup_queue, resource) ||
+            all_kind_lookup_queue.queue_plan == null)
+          `uvm_fatal("ALL_KIND_QUEUE_RECOVERY",
+                     "queue lookup lacks an authoritative recovery plan")
+        recovery_record.queue_recovery_valid = 1'b1;
+        recovery_record.queue_intent = RDMA_QUEUE_RECOVER_NORMAL_DESTROY;
+        recovery_record.ambiguous_queue_operation = RDMA_QUEUE_AMBIG_NONE;
+        case (all_kind_resources[i].resource_kind())
+          RDMA_RESOURCE_CQ:
+            recovery_record.ambiguous_role = RDMA_QUEUE_ROLE_CQ_RING;
+          RDMA_RESOURCE_SRQ:
+            recovery_record.ambiguous_role = RDMA_QUEUE_ROLE_SRQ_RING;
+          RDMA_RESOURCE_CEQ:
+            recovery_record.ambiguous_role = RDMA_QUEUE_ROLE_CEQ_RING;
+          RDMA_RESOURCE_AEQ:
+            recovery_record.ambiguous_role = RDMA_QUEUE_ROLE_AEQ_RING;
+          default: begin
+          end
+        endcase
+        recovery_record.queue_plan = all_kind_lookup_queue.queue_plan;
+        recovery_record.queue_create_opcode = make_queue_test_opcode(
+          $sformatf("all_kind_%0d_create", i), "create"
+        );
+        recovery_record.queue_delete_opcode = make_queue_test_opcode(
+          $sformatf("all_kind_%0d_delete", i), "delete"
+        );
+        recovery_record.queue_query_opcode = make_queue_test_opcode(
+          $sformatf("all_kind_%0d_query", i), "query"
+        );
+      end
       expect_status(
         $sformatf("ALL_KIND_%s_MARK_ERROR",
                   all_kind_resources[i].resource_kind().name()),
