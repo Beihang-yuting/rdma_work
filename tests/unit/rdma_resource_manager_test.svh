@@ -68,6 +68,187 @@ class rdma_width_probe_manager extends rdma_resource_manager;
       return 0;
     return free_local_ids[kind].size();
   endfunction
+
+  function int unsigned observed_registry_count();
+    return registry.num();
+  endfunction
+endclass
+
+// This adapter deliberately gives each projected mapping copy its own
+// completion fact while retaining common opaque release authority.  It models
+// a corrupted snapshot that claims a release occurred on only one side of the
+// restore comparison.
+class rdma_rm_independent_release_mapping extends rdma_dma_mapping;
+  `uvm_object_utils(rdma_rm_independent_release_mapping)
+
+  local longint unsigned allocation_token;
+  local bit allocation_token_initialized;
+  local bit release_complete;
+  local static longint unsigned next_allocation_token = 1;
+
+  function new(string name = "rdma_rm_independent_release_mapping");
+    super.new(name);
+    allocation_token = 0;
+    allocation_token_initialized = 1'b0;
+    release_complete = 1'b0;
+  endfunction
+
+  function void initialize_release_authority();
+    allocation_token = next_allocation_token;
+    allocation_token_initialized = 1'b1;
+    next_allocation_token++;
+  endfunction
+
+  function void set_release_complete(bit value);
+    release_complete = value;
+  endfunction
+
+  virtual function rdma_status snapshot_release_authority(
+    output rdma_dma_mapping snapshot
+  );
+    rdma_rm_independent_release_mapping candidate;
+
+    snapshot = null;
+    if (!allocation_token_initialized)
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE, "independent release authority is uninitialized"
+      );
+    candidate = rdma_rm_independent_release_mapping::type_id::create(
+      {get_name(), "_authority"}
+    );
+    candidate.allocation_token = allocation_token;
+    candidate.allocation_token_initialized = 1'b1;
+    snapshot = candidate;
+    return rdma_status::success();
+  endfunction
+
+  virtual function rdma_status release_authority_status(
+    rdma_dma_mapping snapshot
+  );
+    rdma_rm_independent_release_mapping candidate;
+
+    if (!$cast(candidate, snapshot) || candidate == null ||
+        !allocation_token_initialized ||
+        !candidate.allocation_token_initialized ||
+        candidate.allocation_token != allocation_token)
+      return rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT, "independent release authority changed"
+      );
+    return rdma_status::success();
+  endfunction
+
+  virtual function rdma_status release_completion_status(
+    output bit release_complete
+  );
+    release_complete = this.release_complete;
+    return rdma_status::success();
+  endfunction
+
+  virtual function void do_copy(uvm_object rhs);
+    rdma_rm_independent_release_mapping rhs_mapping;
+
+    super.do_copy(rhs);
+    if (!$cast(rhs_mapping, rhs) || rhs_mapping == null)
+      `uvm_fatal("RM_INDEPENDENT_RELEASE", "mapping copy cast failed")
+    allocation_token = rhs_mapping.allocation_token;
+    allocation_token_initialized = rhs_mapping.allocation_token_initialized;
+    release_complete = rhs_mapping.release_complete;
+  endfunction
+endclass
+
+class rdma_queue_recovery_probe_manager extends rdma_resource_manager;
+  rdma_recovery_record observed_pre_retire_recovery;
+
+  function new(string name = "rdma_queue_recovery_probe_manager");
+    super.new(name);
+    observed_pre_retire_recovery = null;
+  endfunction
+
+  function void swap_recovery_refs(rdma_handle handle, int unsigned lhs,
+                                   int unsigned rhs);
+    rdma_queue_backing_ref saved;
+    string key;
+    key = resource_key(handle);
+    saved = recovery_records[key].queue_plan.refs[lhs];
+    recovery_records[key].queue_plan.refs[lhs] =
+      recovery_records[key].queue_plan.refs[rhs];
+    recovery_records[key].queue_plan.refs[rhs] = saved;
+  endfunction
+
+  function void set_queue_cleanup(rdma_handle handle, bit recovery_side,
+                                  rdma_queue_backing_role_e role, bit value);
+    string key;
+    key = resource_key(handle);
+    if (recovery_side) begin
+      foreach (recovery_records[key].queue_plan.refs[i])
+        if (recovery_records[key].queue_plan.refs[i].role == role)
+          recovery_records[key].queue_plan.refs[i].cleanup_complete = value;
+      if (recovery_records[key].queue_plan.context_ref != null)
+        recovery_records[key].queue_plan.context_ref.release_complete = value;
+    end
+    else begin
+      rdma_queue_resource queue_resource;
+      if ($cast(queue_resource, registry[key])) begin
+        foreach (queue_resource.queue_plan.refs[i])
+          if (queue_resource.queue_plan.refs[i].role == role)
+            queue_resource.queue_plan.refs[i].cleanup_complete = value;
+        if (queue_resource.queue_plan.context_ref != null)
+          queue_resource.queue_plan.context_ref.release_complete = value;
+      end
+    end
+  endfunction
+
+  function void clear_queue_ambiguity(rdma_handle handle);
+    string key;
+    key = resource_key(handle);
+    recovery_records[key].ambiguous_queue_operation = RDMA_QUEUE_AMBIG_NONE;
+    recovery_records[key].ambiguous_role = RDMA_QUEUE_ROLE_CQ_RING;
+    recovery_records[key].ambiguous_ticket = null;
+  endfunction
+
+  function void set_queue_release_evidence(
+    rdma_handle handle,
+    bit recovery_side,
+    rdma_queue_backing_role_e role,
+    bit value
+  );
+    rdma_queue_backing_plan plan;
+    rdma_queue_resource queue_resource;
+    rdma_rm_independent_release_mapping mapping;
+    string key;
+
+    key = resource_key(handle);
+    plan = null;
+    if (recovery_side)
+      plan = recovery_records[key].queue_plan;
+    else if ($cast(queue_resource, registry[key]))
+      plan = queue_resource.queue_plan;
+    if (plan == null)
+      `uvm_fatal("QUEUE_RELEASE_EVIDENCE", "queue plan is unavailable")
+    foreach (plan.refs[i]) begin
+      if (plan.refs[i] != null && plan.refs[i].role == role) begin
+        if (!$cast(mapping, plan.refs[i].mapping) || mapping == null)
+          `uvm_fatal("QUEUE_RELEASE_EVIDENCE", "queue mapping type mismatch")
+        mapping.set_release_complete(value);
+        return;
+      end
+    end
+    `uvm_fatal("QUEUE_RELEASE_EVIDENCE", "queue role is unavailable")
+  endfunction
+
+  virtual function void queue_restore_pre_publish_observer(
+    rdma_recovery_record prepared_recovery
+  );
+    uvm_object cloned_object;
+
+    observed_pre_retire_recovery = null;
+    if (prepared_recovery == null)
+      return;
+    cloned_object = prepared_recovery.clone();
+    if (cloned_object == null ||
+        !$cast(observed_pre_retire_recovery, cloned_object))
+      `uvm_fatal("QUEUE_RESTORE_OBSERVER", "recovery snapshot clone failed")
+  endfunction
 endclass
 
 typedef enum bit [5:0] {
@@ -1658,6 +1839,28 @@ class rdma_resource_manager_test extends uvm_test;
     mapping.iova.value = iova_value;
     mapping.backing_addr.value = iova_value + 64'h1000_0000;
     mapping.size = control_plane_owned ? 4096 : 64'h20_0000;
+    mapping.direction = RDMA_DMA_BIDIRECTIONAL;
+    mapping.permissions =
+      '{device_read:1'b1, device_write:1'b1, atomic:1'b0};
+    mapping.state = RDMA_MAPPING_ACTIVE;
+    return mapping;
+  endfunction
+
+  function automatic rdma_dma_mapping make_independent_queue_test_mapping(
+    string name,
+    rdma_function_handle owner,
+    rdma_handle owner_h,
+    longint unsigned iova_value
+  );
+    rdma_rm_independent_release_mapping mapping;
+
+    mapping = rdma_rm_independent_release_mapping::type_id::create(name);
+    mapping.initialize_release_authority();
+    mapping.function_h = clone_function_handle({name, "_function"}, owner);
+    mapping.owner_h = clone_handle({name, "_owner"}, owner_h);
+    mapping.iova.value = iova_value;
+    mapping.backing_addr.value = iova_value + 64'h1000_0000;
+    mapping.size = 4096;
     mapping.direction = RDMA_DMA_BIDIRECTIONAL;
     mapping.permissions =
       '{device_read:1'b1, device_write:1'b1, atomic:1'b0};
@@ -3609,7 +3812,7 @@ class rdma_resource_manager_test extends uvm_test;
       rdma_width_probe_manager srq_width_rm;
       rdma_width_probe_manager ceq_width_rm;
       rdma_width_probe_manager aeq_width_rm;
-      rdma_resource_manager queue_recovery_manager;
+      rdma_queue_recovery_probe_manager queue_recovery_manager;
       rdma_function_binding queue_binding;
       rdma_cq cq_last;
       rdma_cq cq_overflow;
@@ -3620,6 +3823,7 @@ class rdma_resource_manager_test extends uvm_test;
       rdma_aeq aeq_last;
       rdma_aeq aeq_overflow;
       rdma_srq srq;
+      rdma_srq restored_srq;
       rdma_recovery_record queue_recovery;
       rdma_recovery_record queue_recovery_lookup;
       rdma_cmq_ticket queue_ticket;
@@ -3631,6 +3835,8 @@ class rdma_resource_manager_test extends uvm_test;
       rdma_dma_mapping sgb_mapping;
       int unsigned serial_before;
       int unsigned local_before;
+      int unsigned registry_before;
+      int unsigned free_before;
 
       queue_binding = make_active_binding(
         "queue_width_binding", 64'h1d00_0000_0000_0008,
@@ -3643,12 +3849,16 @@ class rdma_resource_manager_test extends uvm_test;
                     RDMA_SC_OK);
       serial_before = cq_width_rm.observed_next_object_serial(RDMA_RESOURCE_CQ);
       local_before = cq_width_rm.observed_next_local_id(RDMA_RESOURCE_CQ);
+      registry_before = cq_width_rm.observed_registry_count();
+      free_before = cq_width_rm.observed_free_local_id_count(RDMA_RESOURCE_CQ);
       expect_status("WIDTH_CQ_21_EXHAUSTED",
                     cq_width_rm.create_cq(queue_binding, null, cq_overflow),
                     RDMA_SC_RESOURCE_EXHAUSTED);
       if (cq_last == null || cq_last.local_cq_id != 21'h1f_ffff ||
           cq_overflow != null ||
           cq_width_rm.observed_next_local_id(RDMA_RESOURCE_CQ) != local_before ||
+          cq_width_rm.observed_registry_count() != registry_before ||
+          cq_width_rm.observed_free_local_id_count(RDMA_RESOURCE_CQ) != free_before ||
           cq_width_rm.observed_next_object_serial(RDMA_RESOURCE_CQ) != serial_before)
         `uvm_error("WIDTH_CQ_21_ATOMIC", "CQ width failure changed allocator state")
 
@@ -3658,12 +3868,16 @@ class rdma_resource_manager_test extends uvm_test;
                     srq_width_rm.create_srq(queue_binding, null, srq_last),
                     RDMA_SC_OK);
       local_before = srq_width_rm.observed_next_local_id(RDMA_RESOURCE_SRQ);
+      registry_before = srq_width_rm.observed_registry_count();
+      free_before = srq_width_rm.observed_free_local_id_count(RDMA_RESOURCE_SRQ);
       expect_status("WIDTH_SRQ_16_EXHAUSTED",
                     srq_width_rm.create_srq(queue_binding, null, srq_overflow),
                     RDMA_SC_RESOURCE_EXHAUSTED);
       if (srq_last == null || srq_last.local_srq_id != 16'hffff ||
           srq_overflow != null ||
-          srq_width_rm.observed_next_local_id(RDMA_RESOURCE_SRQ) != local_before)
+          srq_width_rm.observed_next_local_id(RDMA_RESOURCE_SRQ) != local_before ||
+          srq_width_rm.observed_registry_count() != registry_before ||
+          srq_width_rm.observed_free_local_id_count(RDMA_RESOURCE_SRQ) != free_before)
         `uvm_error("WIDTH_SRQ_16_ATOMIC", "SRQ width boundary is not atomic")
 
       ceq_width_rm = new("ceq_width_rm");
@@ -3671,12 +3885,16 @@ class rdma_resource_manager_test extends uvm_test;
       expect_status("WIDTH_CEQ_12_LAST",
                     ceq_width_rm.create_ceq(queue_binding, ceq_last), RDMA_SC_OK);
       local_before = ceq_width_rm.observed_next_local_id(RDMA_RESOURCE_CEQ);
+      registry_before = ceq_width_rm.observed_registry_count();
+      free_before = ceq_width_rm.observed_free_local_id_count(RDMA_RESOURCE_CEQ);
       expect_status("WIDTH_CEQ_12_EXHAUSTED",
                     ceq_width_rm.create_ceq(queue_binding, ceq_overflow),
                     RDMA_SC_RESOURCE_EXHAUSTED);
       if (ceq_last == null || ceq_last.local_ceq_id != 12'hfff ||
           ceq_overflow != null ||
-          ceq_width_rm.observed_next_local_id(RDMA_RESOURCE_CEQ) != local_before)
+          ceq_width_rm.observed_next_local_id(RDMA_RESOURCE_CEQ) != local_before ||
+          ceq_width_rm.observed_registry_count() != registry_before ||
+          ceq_width_rm.observed_free_local_id_count(RDMA_RESOURCE_CEQ) != free_before)
         `uvm_error("WIDTH_CEQ_12_ATOMIC", "CEQ width boundary is not atomic")
 
       aeq_width_rm = new("aeq_width_rm");
@@ -3684,12 +3902,16 @@ class rdma_resource_manager_test extends uvm_test;
       expect_status("WIDTH_AEQ_12_LAST",
                     aeq_width_rm.create_aeq(queue_binding, aeq_last), RDMA_SC_OK);
       local_before = aeq_width_rm.observed_next_local_id(RDMA_RESOURCE_AEQ);
+      registry_before = aeq_width_rm.observed_registry_count();
+      free_before = aeq_width_rm.observed_free_local_id_count(RDMA_RESOURCE_AEQ);
       expect_status("WIDTH_AEQ_12_EXHAUSTED",
                     aeq_width_rm.create_aeq(queue_binding, aeq_overflow),
                     RDMA_SC_RESOURCE_EXHAUSTED);
       if (aeq_last == null || aeq_last.local_aeq_id != 12'hfff ||
           aeq_overflow != null ||
-          aeq_width_rm.observed_next_local_id(RDMA_RESOURCE_AEQ) != local_before)
+          aeq_width_rm.observed_next_local_id(RDMA_RESOURCE_AEQ) != local_before ||
+          aeq_width_rm.observed_registry_count() != registry_before ||
+          aeq_width_rm.observed_free_local_id_count(RDMA_RESOURCE_AEQ) != free_before)
         `uvm_error("WIDTH_AEQ_12_ATOMIC", "AEQ width boundary is not atomic")
 
       queue_recovery_manager = new("queue_recovery_manager");
@@ -3703,9 +3925,9 @@ class rdma_resource_manager_test extends uvm_test;
         "queue_recovery_plan", RDMA_RESOURCE_SRQ, srq.depth, srq.owner,
         srq.handle, srq.local_srq_id
       );
-      sgb_mapping = make_queue_test_mapping(
+      sgb_mapping = make_independent_queue_test_mapping(
         "queue_recovery_sgb_mapping", srq.owner, srq.handle,
-        64'h0000_5200_0000_0000, 1'b1
+        64'h0000_5200_0000_0000
       );
       sgb_ring = make_queue_test_ring(
         "queue_recovery_sgb_ring", RDMA_QUEUE_ROLE_SRQ_SGB, srq.depth,
@@ -3728,11 +3950,6 @@ class rdma_resource_manager_test extends uvm_test;
       expect_status("QUIESCING_FLUSH_PROGRESS", queue_recovery_manager.
         record_queue_flush_complete(srq.handle, RDMA_QUEUE_ROLE_SRFQ_PD),
         RDMA_SC_OK);
-      expect_status("QUIESCING_CLEANUP_PROGRESS", queue_recovery_manager.
-        record_queue_cleanup_complete(srq.handle, RDMA_QUEUE_ROLE_SRQ_SGB),
-        RDMA_SC_OK);
-      expect_status("QUIESCING_CONTEXT_PROGRESS", queue_recovery_manager.
-        record_queue_context_cleanup_complete(srq.handle), RDMA_SC_OK);
 
       queue_recovery = rdma_recovery_record::type_id::create("queue_recovery");
       queue_recovery.resource_h = clone_handle("QUEUE_RECOVERY_H", srq.handle);
@@ -3772,11 +3989,19 @@ class rdma_resource_manager_test extends uvm_test;
       expect_status("QUEUE_RECOVERY_ERROR",
                     queue_recovery_manager.mark_error(srq.handle, queue_recovery),
                     RDMA_SC_OK);
+      // The recovery plan may legitimately have a different serialization
+      // order.  A role-based update must not use the resource-plan index.
+      queue_recovery_manager.swap_recovery_refs(srq.handle, 0, 4);
+      expect_status("REORDERED_CLEANUP_PROGRESS", queue_recovery_manager.
+        record_queue_cleanup_complete(srq.handle, RDMA_QUEUE_ROLE_SRQ_SGB),
+        RDMA_SC_OK);
+      expect_status("REORDERED_CONTEXT_PROGRESS", queue_recovery_manager.
+        record_queue_context_cleanup_complete(srq.handle), RDMA_SC_OK);
       expect_status("QUEUE_PROGRESS_LOOKUP", queue_recovery_manager.lookup_recovery(
         srq.handle, queue_recovery_lookup), RDMA_SC_OK);
       if (queue_recovery_lookup == null ||
           !queue_recovery_lookup.queue_plan.flush_targets[0].flush_complete ||
-          !queue_recovery_lookup.queue_plan.refs[4].cleanup_complete ||
+          !queue_recovery_lookup.queue_plan.refs[0].cleanup_complete ||
           !queue_recovery_lookup.queue_plan.context_ref.release_complete ||
           queue_recovery_lookup.queue_plan == queue_recovery.queue_plan ||
           queue_recovery_lookup.queue_create_opcode ==
@@ -3786,6 +4011,73 @@ class rdma_resource_manager_test extends uvm_test;
           queue_recovery_lookup.queue_query_opcode ==
             queue_recovery.queue_query_opcode)
         `uvm_error("QUEUE_PROGRESS_PERSIST", "queue progress was not persisted")
+
+      // Check registry and recovery evidence independently: either side's
+      // destructive cleanup proof blocks restore.  Once both are live and
+      // present, SRQ restore succeeds and resets both pre-delete flushes.
+      queue_recovery_manager.clear_queue_ambiguity(srq.handle);
+      expect_status("RESTORE_BOTH_DESTRUCTIVE", queue_recovery_manager.
+        restore_active(srq.handle), RDMA_SC_INVALID_STATE);
+      queue_recovery_manager.set_queue_cleanup(
+        srq.handle, 1'b1, RDMA_QUEUE_ROLE_SRQ_SGB, 1'b0
+      );
+      expect_status("RESTORE_REGISTRY_DESTRUCTIVE", queue_recovery_manager.
+        restore_active(srq.handle), RDMA_SC_INVALID_STATE);
+      queue_recovery_manager.set_queue_cleanup(
+        srq.handle, 1'b0, RDMA_QUEUE_ROLE_SRQ_SGB, 1'b0
+      );
+      queue_recovery_manager.set_queue_cleanup(
+        srq.handle, 1'b1, RDMA_QUEUE_ROLE_SRQ_SGB, 1'b1
+      );
+      expect_status("RESTORE_RECOVERY_DESTRUCTIVE", queue_recovery_manager.
+        restore_active(srq.handle), RDMA_SC_INVALID_STATE);
+      queue_recovery_manager.set_queue_cleanup(
+        srq.handle, 1'b1, RDMA_QUEUE_ROLE_SRQ_SGB, 1'b0
+      );
+      // Completion is deliberately held in one detached snapshot at a time.
+      // Removing either release-completion query must make one of these
+      // independently corrupt recovery records restore incorrectly.
+      queue_recovery_manager.set_queue_release_evidence(
+        srq.handle, 1'b1, RDMA_QUEUE_ROLE_SRQ_SGB, 1'b1
+      );
+      expect_status("RESTORE_RECOVERY_RELEASED", queue_recovery_manager.
+        restore_active(srq.handle), RDMA_SC_INVALID_STATE);
+      queue_recovery_manager.set_queue_release_evidence(
+        srq.handle, 1'b1, RDMA_QUEUE_ROLE_SRQ_SGB, 1'b0
+      );
+      queue_recovery_manager.set_queue_release_evidence(
+        srq.handle, 1'b0, RDMA_QUEUE_ROLE_SRQ_SGB, 1'b1
+      );
+      expect_status("RESTORE_REGISTRY_RELEASED", queue_recovery_manager.
+        restore_active(srq.handle), RDMA_SC_INVALID_STATE);
+      queue_recovery_manager.set_queue_release_evidence(
+        srq.handle, 1'b0, RDMA_QUEUE_ROLE_SRQ_SGB, 1'b0
+      );
+      expect_status("RESTORE_QUEUE_SAFE", queue_recovery_manager.
+        restore_active(srq.handle), RDMA_SC_OK);
+      expect_status("RESTORE_QUEUE_LOOKUP", queue_recovery_manager.lookup(
+        srq.handle, resource), RDMA_SC_OK);
+      if (!$cast(restored_srq, resource) ||
+          restored_srq.state != RDMA_RESOURCE_ACTIVE ||
+          restored_srq.queue_plan.flush_targets.size() != 2 ||
+          restored_srq.queue_plan.flush_targets[0].flush_complete ||
+          restored_srq.queue_plan.flush_targets[1].flush_complete ||
+          queue_recovery_manager.observed_pre_retire_recovery == null ||
+          queue_recovery_manager.observed_pre_retire_recovery.
+            ambiguous_queue_operation != RDMA_QUEUE_AMBIG_NONE ||
+          queue_recovery_manager.observed_pre_retire_recovery.
+            ambiguous_role != RDMA_QUEUE_ROLE_CQ_RING ||
+          queue_recovery_manager.observed_pre_retire_recovery.
+            ambiguous_ticket != null ||
+          queue_recovery_manager.observed_pre_retire_recovery.queue_plan == null ||
+          queue_recovery_manager.observed_pre_retire_recovery.
+            queue_plan.flush_targets.size() != 2 ||
+          queue_recovery_manager.observed_pre_retire_recovery.
+            queue_plan.flush_targets[0].flush_complete ||
+          queue_recovery_manager.observed_pre_retire_recovery.
+            queue_plan.flush_targets[1].flush_complete)
+        `uvm_error("RESTORE_SRQ_RESET",
+                   "safe SRQ restore did not reset progress and ambiguity")
     end
 
     // PD and MR local IDs are hardware-width projections.  The inclusive

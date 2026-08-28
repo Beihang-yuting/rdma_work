@@ -3293,6 +3293,15 @@ class rdma_resource_manager extends uvm_object;
                                  "queue context progress");
   endfunction
 
+  // Queue recovery metadata is retired immediately after the ACTIVE
+  // replacement is published.  Keep a protected observation point at the
+  // atomic boundary so derived managers can audit the prepared metadata
+  // without extending its lifetime or changing publication ordering.
+  protected virtual function void queue_restore_pre_publish_observer(
+    rdma_recovery_record prepared_recovery
+  );
+  endfunction
+
   virtual function rdma_status restore_active(rdma_handle handle);
     rdma_resource authoritative;
     rdma_resource replacement;
@@ -3579,6 +3588,10 @@ class rdma_resource_manager extends uvm_object;
                                "restored resource validation returned null");
     if (!status.ok())
       return status;
+    if (authoritative.state == RDMA_RESOURCE_ERROR &&
+        authoritative.handle.kind inside {RDMA_RESOURCE_CQ, RDMA_RESOURCE_SRQ,
+                                          RDMA_RESOURCE_CEQ, RDMA_RESOURCE_AEQ})
+      queue_restore_pre_publish_observer(recovery);
     registry[key] = replacement;
     if (authoritative.state == RDMA_RESOURCE_ERROR)
       recovery_records.delete(key);
