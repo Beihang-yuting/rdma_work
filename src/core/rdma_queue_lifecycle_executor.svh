@@ -1074,6 +1074,7 @@ class rdma_queue_lifecycle_executor extends uvm_object;
     bit done;
     bit creation_origin;
     bit local_done;
+    bit predelete_target;
     int target_index;
     int unsigned i;
     rdma_queue_backing_role_e target_role;
@@ -1193,6 +1194,7 @@ class rdma_queue_lifecycle_executor extends uvm_object;
           classify_status = normalize_status(classify_status,
             "queue QUERY classification returned null");
           recovery.ambiguous_ticket = null;
+          recovery.ambiguous_queue_operation = RDMA_QUEUE_AMBIG_NONE;
           if (classify_status.ok() && query_conclusive) begin
             recovery.hardware_presence = query_presence;
             if (query_presence == RDMA_HW_PRESENCE_ABSENT)
@@ -1224,6 +1226,7 @@ class rdma_queue_lifecycle_executor extends uvm_object;
         end
         else if (ticket.opcode_key.opcode == create_opcode(queue.resource_kind())) begin
           recovery.ambiguous_ticket = null;
+          recovery.ambiguous_queue_operation = RDMA_QUEUE_AMBIG_NONE;
           if (completion_status.ok()) begin
             recovery.hardware_presence = RDMA_HW_PRESENCE_PRESENT;
             recovery_complete_step(recovery, RDMA_CTRL_STEP_HW_CONTEXT_CREATED);
@@ -1246,6 +1249,7 @@ class rdma_queue_lifecycle_executor extends uvm_object;
         end
         else if (ticket.opcode_key.opcode == delete_opcode(queue.resource_kind())) begin
           recovery.ambiguous_ticket = null;
+          recovery.ambiguous_queue_operation = RDMA_QUEUE_AMBIG_NONE;
           if (completion_status.ok()) begin
             recovery.hardware_presence = RDMA_HW_PRESENCE_ABSENT;
             recovery_complete_step(recovery, RDMA_CTRL_STEP_HW_CONTEXT_DELETED);
@@ -1264,6 +1268,39 @@ class rdma_queue_lifecycle_executor extends uvm_object;
             break;
           end
           if (!completion_status.ok()) begin
+            // A normal destroy has not started any local cleanup at this
+            // point.  A definitive terminal delete failure therefore proves
+            // that the queue is still PRESENT and is safe to restore to its
+            // pre-destroy ACTIVE publication.  Keep create-rollback recovery
+            // on the destructive retry path: a failed create must still be
+            // unwound, never resurrected.
+            if (!creation_origin && recovery.hardware_presence ==
+                  RDMA_HW_PRESENCE_PRESENT) begin
+              status = normalize_status(manager.restore_active(resource_h),
+                "queue delete failure restore ACTIVE returned null");
+              if (status.ok()) begin
+                project_queue_recovery_result(recovery, result);
+                // The terminal failure is the operation's observable result;
+                // the durable primary timeout remains in the recovery history
+                // and rollback list for callers that inspect it.
+                result.status = rdma_cmq_clone_status_value(completion_status);
+                result.final_resource_state = RDMA_RESOURCE_ACTIVE;
+                result.final_resource_state_known = 1'b1;
+                result.recovery_required = 1'b0;
+                done = 1'b1;
+                break;
+              end
+              recovery.rollback_statuses.push_back(
+                rdma_cmq_clone_status_value(status));
+              persist_status = persist_queue_recovery(resource_h, recovery);
+              publish_queue_recovery_required(recovery, result,
+                "queue delete failure ACTIVE restore still requires recovery");
+              if (!persist_status.ok())
+                result.rollback_statuses.push_back(
+                  rdma_cmq_clone_status_value(persist_status));
+              done = 1'b1;
+              break;
+            end
             publish_queue_recovery_required(recovery, result,
               "queue delete terminal failure requires a retry");
             done = 1'b1;
@@ -1272,6 +1309,16 @@ class rdma_queue_lifecycle_executor extends uvm_object;
         end
         else if (ticket.opcode_key.opcode == XTR_V1_OP_OCC_FLUSH) begin
           recovery.ambiguous_ticket = null;
+          recovery.ambiguous_queue_operation = RDMA_QUEUE_AMBIG_NONE;
+          predelete_target = 1'b0;
+          foreach (recovery.queue_plan.flush_targets[i]) begin
+            if (recovery.queue_plan.flush_targets[i] != null &&
+                recovery.queue_plan.flush_targets[i].role ==
+                  recovery.ambiguous_role &&
+                recovery.queue_plan.flush_targets[i].phase ==
+                  RDMA_QUEUE_FLUSH_PRE_DELETE)
+              predelete_target = 1'b1;
+          end
           if (completion_status.ok()) begin
             target_index = -1;
             foreach (recovery.queue_plan.flush_targets[i]) begin
@@ -1312,8 +1359,42 @@ class rdma_queue_lifecycle_executor extends uvm_object;
           else begin
             // Keep this role incomplete and stop at the barrier.  A later
             // recovery invocation may retry the exact target.
+            if (!creation_origin && predelete_target)
+              recovery.hardware_presence = RDMA_HW_PRESENCE_PRESENT;
             recovery.rollback_statuses.push_back(
               rdma_cmq_clone_status_value(completion_status));
+            if (!creation_origin && predelete_target) begin
+              persist_status = persist_queue_recovery(resource_h, recovery);
+              if (persist_status.ok()) begin
+                status = normalize_status(manager.restore_active(resource_h),
+                  "queue OCC failure restore ACTIVE returned null");
+                if (status.ok()) begin
+                  project_queue_recovery_result(recovery, result);
+                  result.status = rdma_cmq_clone_status_value(
+                    completion_status);
+                  result.final_resource_state = RDMA_RESOURCE_ACTIVE;
+                  result.final_resource_state_known = 1'b1;
+                  result.recovery_required = 1'b0;
+                  done = 1'b1;
+                  break;
+                end
+                recovery.rollback_statuses.push_back(
+                  rdma_cmq_clone_status_value(status));
+              end
+              else
+                recovery.rollback_statuses.push_back(
+                  rdma_cmq_clone_status_value(persist_status));
+              // If either persistence or the atomic restore failed, retain
+              // the PRESENT recovery record for a later retry.
+              persist_status = persist_queue_recovery(resource_h, recovery);
+              publish_queue_recovery_required(recovery, result,
+                "queue OCC failure ACTIVE restore still requires recovery");
+              if (!persist_status.ok())
+                result.rollback_statuses.push_back(
+                  rdma_cmq_clone_status_value(persist_status));
+              done = 1'b1;
+              break;
+            end
             persist_status = persist_queue_recovery(resource_h, recovery);
             publish_queue_recovery_required(recovery, result,
               "queue OCC target still requires recovery");

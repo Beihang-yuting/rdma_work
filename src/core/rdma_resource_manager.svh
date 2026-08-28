@@ -4500,10 +4500,18 @@ class rdma_resource_manager extends uvm_object;
         replacement = queue_replacement;
       end
       else if (reservation_release_recovery) begin
-        if (queue_replacement.state != RDMA_RESOURCE_ALLOCATED)
+        // A reservation-only queue rollback is first persisted while the
+        // resource is ALLOCATED, then may be retried after mark_error()
+        // published the durable ERROR record.  Keep accepting the canonical
+        // snapshot in that ERROR state so a subsequent recovery invocation
+        // can atomically consume RESOURCE_RELEASED; rejecting it here would
+        // strand a successfully cleaned-up ambiguous create forever.
+        if (queue_replacement.state != RDMA_RESOURCE_ALLOCATED &&
+            !(queue_replacement.state == RDMA_RESOURCE_ERROR &&
+              recovery_records.exists(key)))
           return rdma_status::make(
             RDMA_SC_INVALID_STATE,
-            "queue reservation recovery requires ALLOCATED authority"
+            "queue reservation recovery requires ALLOCATED or ERROR authority"
           );
         status = queue_reservation_release_plan_status(
           queue_replacement.queue_plan, recovery_copy.queue_plan

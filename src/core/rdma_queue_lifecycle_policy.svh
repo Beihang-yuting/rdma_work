@@ -644,6 +644,68 @@ virtual class rdma_queue_lifecycle_policy extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // The CMQ engine authenticates the CQ owner/slot while polling the raw CQE
+  // and then snapshots the decoded payload.  Recovery may receive a scripted
+  // or delayed completion instead of the original poll path, so repeat the
+  // immutable identity checks at this boundary.  In particular, SQ wrap is
+  // ticket identity; CQ owner is the phase bit carried by the raw CQE and is
+  // intentionally not inferred from SQ wrap.
+  protected function bit query_completion_identity_matches(
+    rdma_cmq_completion completion,
+    rdma_xtr_v1_cmq_completion payload
+  );
+    bit [63:0] qword0;
+    bit raw_owner;
+    bit [7:0] raw_opcode;
+    bit [7:0] raw_ecode;
+    bit [4:0] raw_wqe_index;
+    bit raw_wrap;
+
+    if (completion == null || completion.ticket == null ||
+        completion.ticket.function_h == null || completion.ticket.cmq_h == null ||
+        completion.ticket.opcode_key == null || completion.status == null ||
+        payload == null || completion.raw_cqe == null)
+      return 1'b0;
+    if (completion.raw_cqe.length != 64 ||
+        completion.raw_cqe.bytes.size() != 64 ||
+        completion.raw_cqe.endian != RDMA_ENDIAN_BIG ||
+        completion.raw_cqe.image_kind != RDMA_IMAGE_CMQ_CQE ||
+        completion.raw_cqe.hardware_version != XTR_V1_HW_VERSION ||
+        completion.raw_cqe.write_target_kind != RDMA_HW_TARGET_NONE ||
+        completion.raw_cqe.backing_target.value != 0 ||
+        completion.raw_cqe.hmc_target.value != 0 ||
+        completion.raw_cqe.bar_target.value != 0 ||
+        completion.raw_cqe.function_generation !=
+          completion.ticket.function_h.generation)
+      return 1'b0;
+
+    qword0 = '0;
+    for (int unsigned i = 0; i < 8; i++)
+      qword0 = {qword0[55:0], completion.raw_cqe.bytes[i]};
+    raw_owner = qword0[63];
+    raw_wrap = qword0[45];
+    raw_wqe_index = qword0[44:40];
+    raw_opcode = qword0[39:32];
+    raw_ecode = qword0[31:24];
+
+    if (completion.ticket.opcode_key.opcode != raw_opcode ||
+        payload.opcode != raw_opcode || payload.command_ecode != raw_ecode ||
+        payload.wqe_index != raw_wqe_index || payload.wrap != raw_wrap ||
+        payload.owner != raw_owner ||
+        payload.opcode != completion.ticket.opcode_key.opcode ||
+        payload.wqe_index != completion.ticket.sq_index[4:0] ||
+        payload.wrap != completion.ticket.sq_wrap)
+      return 1'b0;
+    if (completion.status.source_engine != RDMA_ENGINE_CMQ ||
+        completion.status.function_uid !=
+          completion.ticket.function_h.function_uid ||
+        completion.status.generation != completion.ticket.function_h.generation ||
+        completion.status.resource_id != completion.ticket.cmq_h.object_id ||
+        completion.status.command_id != completion.ticket.command_id)
+      return 1'b0;
+    return 1'b1;
+  endfunction
+
   protected function rdma_status classify_query_common(
     rdma_queue_resource resource,
     rdma_cmq_completion completion,
@@ -700,20 +762,35 @@ virtual class rdma_queue_lifecycle_policy extends uvm_object;
       return rdma_status::success();
     if (!$cast(payload, completion.decoded_response) || payload == null)
       return rdma_status::success();
+    if (!same_function(completion.ticket.function_h, resource.owner) ||
+        !query_completion_identity_matches(completion, payload))
+      return rdma_status::success();
     if (payload.opcode != expected_query_opcode ||
         payload.opcode != completion.ticket.opcode_key.opcode)
       return rdma_status::success();
 
     // Error ecodes are meaningful only when authenticated to this exact
     // query opcode.  Query errors commonly carry no object bytes, so apply
-    // the absent whitelist before the success-payload length check.
+    // the absent whitelist before the success-payload length check.  A
+    // whitelist value paired with an OK status is malformed, and all other
+    // nonzero ecodes remain inconclusive even if their bytes happen to decode
+    // as a valid context.
     if (payload.command_ecode == absent_ecode) begin
-      presence = RDMA_HW_PRESENCE_ABSENT;
-      conclusive = 1'b1;
+      if (!completion.status.ok() &&
+          (!completion.status.hardware_code_valid ||
+           completion.status.hardware_code[7:0] == payload.command_ecode)) begin
+        presence = RDMA_HW_PRESENCE_ABSENT;
+        conclusive = 1'b1;
+      end
       return rdma_status::success();
     end
+    if (payload.command_ecode != XTR_V1_CMQ_SUCCESS_ECODE)
+      return rdma_status::success();
     if (!completion.status.ok() || payload.object_payload.size() !=
         payload_length)
+      return rdma_status::success();
+    if (completion.status.hardware_code_valid &&
+        completion.status.hardware_code[7:0] != XTR_V1_CMQ_SUCCESS_ECODE)
       return rdma_status::success();
     if (payload_offset + payload_length > 64)
       return invalid_state("query payload bounds exceed context image");

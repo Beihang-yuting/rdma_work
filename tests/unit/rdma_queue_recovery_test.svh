@@ -5,6 +5,460 @@
 class rdma_queue_recovery_test extends rdma_queue_lifecycle_test;
   `uvm_component_utils(rdma_queue_recovery_test)
 
+  // Build a status with the same identity envelope that the real CMQ engine
+  // attaches to a completion.  Recovery must not trust a status whose
+  // command/function identity differs from the ticket being reconciled.
+  function automatic rdma_status query_status(
+    rdma_cmq_ticket ticket,
+    rdma_status_code_e code,
+    bit [7:0] hardware_ecode
+  );
+    rdma_status status;
+
+    status = rdma_status::make(code, "query test status");
+    if (ticket == null || ticket.function_h == null || ticket.cmq_h == null)
+      return status;
+    status.source_engine = RDMA_ENGINE_CMQ;
+    status.function_uid = ticket.function_h.function_uid;
+    status.generation = ticket.function_h.generation;
+    status.resource_id = ticket.cmq_h.object_id;
+    status.command_id = ticket.command_id;
+    if (hardware_ecode != 8'h00) begin
+      status.hardware_code_valid = 1'b1;
+      status.hardware_code = {24'h0, hardware_ecode};
+    end
+    return status;
+  endfunction
+
+  function automatic rdma_hw_image make_query_raw(
+    string name,
+    rdma_cmq_ticket ticket,
+    rdma_xtr_v1_cmq_completion payload
+  );
+    rdma_hw_image image;
+    bit [63:0] qword0;
+
+    image = rdma_hw_image::type_id::create(name);
+    for (int unsigned i = 0; i < 64; i++)
+      image.bytes.push_back(8'h00);
+    qword0 = '0;
+    qword0[63] = payload.owner;
+    qword0[45] = payload.wrap;
+    qword0[44:40] = payload.wqe_index;
+    qword0[39:32] = payload.opcode;
+    qword0[31:24] = payload.command_ecode;
+    for (int unsigned i = 0; i < 8; i++)
+      image.bytes[i] = qword0[63 - (i * 8) -: 8];
+    image.length = 64;
+    image.alignment = 64;
+    image.endian = RDMA_ENDIAN_BIG;
+    image.image_kind = RDMA_IMAGE_CMQ_CQE;
+    image.hardware_version = XTR_V1_HW_VERSION;
+    image.function_generation = ticket == null || ticket.function_h == null ?
+      1 : ticket.function_h.generation;
+    image.write_target_kind = RDMA_HW_TARGET_NONE;
+    image.backing_target = '0;
+    image.hmc_target = '0;
+    image.bar_target = '0;
+    return image;
+  endfunction
+
+  function automatic rdma_cmq_completion make_query_completion(
+    string name,
+    rdma_queue_lifecycle_policy policy,
+    rdma_queue_resource queue,
+    rdma_cmq_ticket ticket,
+    rdma_status status,
+    bit [7:0] query_opcode,
+    bit [7:0] ecode,
+    bit owner,
+    int unsigned wqe_index,
+    bit wrap,
+    bit use_canonical_payload = 1'b1
+  );
+    rdma_cmq_completion completion;
+    rdma_xtr_v1_cmq_completion payload;
+    rdma_hw_model model;
+    byte unsigned slot_image[];
+    byte unsigned shadow_image[];
+    int unsigned offset;
+    int unsigned length;
+    rdma_status build_status;
+
+    completion = null;
+    if (policy == null || queue == null || ticket == null || status == null)
+      return null;
+    case (queue.resource_kind())
+      RDMA_RESOURCE_CQ: begin offset = 8;  length = 56; end
+      default:           begin offset = 16; length = 32; end
+    endcase
+    payload = rdma_xtr_v1_cmq_completion::type_id::create(
+      {name, "_payload"});
+    payload.owner = owner;
+    payload.opcode = query_opcode;
+    payload.command_ecode = ecode;
+    payload.wqe_index = wqe_index[4:0];
+    payload.wrap = wrap;
+    if (use_canonical_payload) begin
+      build_status = policy.build_create_context(
+        queue, queue.queue_plan, model, slot_image, shadow_image
+      );
+      if (build_status == null || !build_status.ok() ||
+          slot_image.size() != 64 || offset + length > slot_image.size())
+        return null;
+      payload.object_payload = new[length];
+      for (int unsigned i = 0; i < length; i++)
+        payload.object_payload[i] = slot_image[offset + i];
+    end
+    else
+      payload.object_payload = new[0];
+    completion = rdma_cmq_completion::type_id::create(name);
+    completion.ticket = rdma_cmq_clone_ticket_value(ticket,
+                                                      "query test ticket");
+    completion.status = rdma_cmq_clone_status_value(status);
+    completion.decoded_response = payload;
+    completion.raw_cqe = make_query_raw({name, "_raw"}, ticket, payload);
+    if (completion.ticket == null || completion.status == null ||
+        completion.raw_cqe == null)
+      return null;
+    return completion;
+  endfunction
+
+  function automatic rdma_cmq_completion clone_query_completion(
+    rdma_cmq_completion source,
+    string name
+  );
+    uvm_object cloned;
+    rdma_cmq_completion copy;
+
+    copy = null;
+    if (source == null)
+      return null;
+    cloned = source.clone();
+    if (cloned != null)
+      void'($cast(copy, cloned));
+    return copy;
+  endfunction
+
+  function automatic bit query_result_is(
+    string label,
+    rdma_queue_lifecycle_policy policy,
+    rdma_queue_resource queue,
+    rdma_cmq_completion completion,
+    rdma_hw_presence_e expected_presence,
+    bit expected_conclusive
+  );
+    rdma_hw_presence_e presence;
+    bit conclusive;
+    rdma_status status;
+
+    presence = RDMA_HW_PRESENCE_UNKNOWN;
+    conclusive = 1'b0;
+    status = policy.classify_query_completion(queue, completion, presence,
+                                              conclusive);
+    if (status == null || !status.ok() || presence != expected_presence ||
+        conclusive != expected_conclusive) begin
+      `uvm_error(label, $sformatf(
+        "query classification mismatch: status=%s presence=%s conclusive=%0b",
+        status == null ? "null" : status.code.name(), presence.name(),
+        conclusive))
+      return 1'b0;
+    end
+    return 1'b1;
+  endfunction
+
+  // A compact real-resource fixture used by the classifier tests.  The
+  // inherited fixture allocates an authoritative queue plan, so typed QUERY
+  // decoding exercises the same context codecs used by recovery.
+  task automatic make_query_fixture(
+    string label,
+    rdma_resource_kind_e kind,
+    output rdma_function_binding binding,
+    output rdma_fault_inject_resource_manager manager,
+    output rdma_queue_destroy_trace_mem mem,
+    output rdma_queue_destroy_trace_context context_backing,
+    output rdma_queue_destroy_trace_cmq cmq,
+    output rdma_mock_call_trace trace,
+    output rdma_queue_lifecycle_executor executor,
+    output rdma_queue_resource queue,
+    output rdma_control_result create_result,
+    output rdma_ceq ceq_dependency,
+    output rdma_pd pd_dependency
+  );
+    create_destroy_fixture(label, kind, binding, manager, mem,
+                           context_backing, cmq, trace, executor, queue,
+                           create_result, ceq_dependency, pd_dependency);
+  endtask
+
+  task automatic check_query_classifier_matrix();
+    string label;
+    rdma_function_binding binding;
+    rdma_fault_inject_resource_manager manager;
+    rdma_queue_destroy_trace_mem mem;
+    rdma_queue_destroy_trace_context context_backing;
+    rdma_queue_destroy_trace_cmq cmq;
+    rdma_mock_call_trace trace;
+    rdma_queue_lifecycle_executor executor;
+    rdma_queue_resource queue;
+    rdma_control_result create_result;
+    rdma_ceq ceq_dependency;
+    rdma_pd pd_dependency;
+    rdma_ceq ceq;
+    rdma_ceq_lifecycle_policy policy;
+    rdma_cmq_command_desc command;
+    rdma_cmq_ticket ticket;
+    rdma_cmq_completion ignored_completion;
+    rdma_cmq_completion completion;
+    rdma_cmq_completion copy;
+    rdma_xtr_v1_cmq_completion payload;
+    rdma_status status;
+
+    label = "QUERY_CLASSIFIER";
+    make_query_fixture({label, "_FIXTURE"}, RDMA_RESOURCE_CEQ, binding,
+                       manager, mem, context_backing, cmq, trace, executor,
+                       queue, create_result, ceq_dependency, pd_dependency);
+    if (!$cast(ceq, queue)) begin
+      `uvm_error(label, "classifier fixture is not a CEQ")
+      return;
+    end
+    policy = rdma_ceq_lifecycle_policy::type_id::create(
+      {label, "_policy"});
+    status = policy.build_object_command(XTR_V1_OP_CEQC_QUERY,
+                                         binding.make_handle(), ceq, 100ns,
+                                         command);
+    expect_status({label, "_BUILD"}, status, RDMA_SC_OK);
+    cmq.execute(command, ticket, ignored_completion, status);
+    expect_status({label, "_TICKET"}, status, RDMA_SC_OK);
+    if (ticket == null) begin
+      `uvm_error(label, "classifier query ticket was not created")
+      return;
+    end
+
+    completion = make_query_completion(
+      {label, "_VALID"}, policy, ceq, ticket,
+      query_status(ticket, RDMA_SC_OK, 8'h00), XTR_V1_OP_CEQC_QUERY,
+      8'h00, !((ticket.slot_sequence / 32) & 1'b1), ticket.sq_index,
+      ticket.sq_wrap
+    );
+    if (completion == null || !$cast(payload, completion.decoded_response)) begin
+      `uvm_error(label, "valid typed QUERY completion could not be built")
+      return;
+    end
+    query_result_is({label, "_TYPED_SUCCESS"}, policy, ceq, completion,
+                    RDMA_HW_PRESENCE_PRESENT, 1'b1);
+
+    // A whitelisted invalid-context ecode is absence evidence only when the
+    // command status is non-OK.  In particular, an OK status paired with f7
+    // must not be accepted as either PRESENT or ABSENT.
+    copy = make_query_completion(
+      {label, "_OK_WHITELIST"}, policy, ceq, ticket,
+      query_status(ticket, RDMA_SC_OK, XTR_V1_ECODE_EC_RCE_CEQC_INVLD),
+      XTR_V1_OP_CEQC_QUERY, XTR_V1_ECODE_EC_RCE_CEQC_INVLD,
+      payload.owner, ticket.sq_index, ticket.sq_wrap
+    );
+    query_result_is({label, "_OK_WHITELIST"}, policy, ceq, copy,
+                    RDMA_HW_PRESENCE_UNKNOWN, 1'b0);
+    copy = make_query_completion(
+      {label, "_ABSENT_WHITELIST"}, policy, ceq, ticket,
+      query_status(ticket, RDMA_SC_UNKNOWN_HW_ERROR,
+                   XTR_V1_ECODE_EC_RCE_CEQC_INVLD),
+      XTR_V1_OP_CEQC_QUERY, XTR_V1_ECODE_EC_RCE_CEQC_INVLD,
+      payload.owner, ticket.sq_index, ticket.sq_wrap
+    );
+    query_result_is({label, "_ABSENT_WHITELIST"}, policy, ceq, copy,
+                    RDMA_HW_PRESENCE_ABSENT, 1'b1);
+
+    // Every nonzero ecode outside the per-opcode absence whitelist remains
+    // UNKNOWN, even if all context bytes decode as a valid typed object.
+    copy = make_query_completion(
+      {label, "_SRFQ_ECODE"}, policy, ceq, ticket,
+      query_status(ticket, RDMA_SC_UNKNOWN_HW_ERROR, 8'h7b),
+      XTR_V1_OP_CEQC_QUERY, 8'h7b, payload.owner, ticket.sq_index,
+      ticket.sq_wrap
+    );
+    query_result_is({label, "_SRFQ_ECODE"}, policy, ceq, copy,
+                    RDMA_HW_PRESENCE_UNKNOWN, 1'b0);
+    copy = make_query_completion(
+      {label, "_ARBITRARY_ECODE"}, policy, ceq, ticket,
+      query_status(ticket, RDMA_SC_UNKNOWN_HW_ERROR, 8'h55),
+      XTR_V1_OP_CEQC_QUERY, 8'h55, payload.owner, ticket.sq_index,
+      ticket.sq_wrap
+    );
+    query_result_is({label, "_ARBITRARY_ECODE"}, policy, ceq, copy,
+                    RDMA_HW_PRESENCE_UNKNOWN, 1'b0);
+
+    copy = clone_query_completion(completion, {label, "_TIMEOUT"});
+    copy.status = query_status(copy.ticket, RDMA_SC_TIMEOUT, 8'h00);
+    query_result_is({label, "_TIMEOUT"}, policy, ceq, copy,
+                    RDMA_HW_PRESENCE_UNKNOWN, 1'b0);
+    copy = clone_query_completion(completion, {label, "_FAILURE"});
+    copy.status = query_status(copy.ticket, RDMA_SC_UNKNOWN_HW_ERROR, 8'h44);
+    if ($cast(payload, copy.decoded_response)) payload.command_ecode = 8'h44;
+    query_result_is({label, "_FAILURE"}, policy, ceq, copy,
+                    RDMA_HW_PRESENCE_UNKNOWN, 1'b0);
+
+    // Mutating any authenticated completion field must invalidate typed
+    // presence evidence.  The raw CQE remains the engine-authenticated
+    // source for owner/opcode/index/wrap in these cases.
+    copy = clone_query_completion(completion, {label, "_BAD_OPCODE"});
+    if ($cast(payload, copy.decoded_response)) payload.opcode = 8'h12;
+    query_result_is({label, "_BAD_OPCODE"}, policy, ceq, copy,
+                    RDMA_HW_PRESENCE_UNKNOWN, 1'b0);
+    copy = clone_query_completion(completion, {label, "_BAD_INDEX"});
+    if ($cast(payload, copy.decoded_response)) payload.wqe_index++;
+    query_result_is({label, "_BAD_INDEX"}, policy, ceq, copy,
+                    RDMA_HW_PRESENCE_UNKNOWN, 1'b0);
+    copy = clone_query_completion(completion, {label, "_BAD_WRAP"});
+    if ($cast(payload, copy.decoded_response)) payload.wrap = ~payload.wrap;
+    query_result_is({label, "_BAD_WRAP"}, policy, ceq, copy,
+                    RDMA_HW_PRESENCE_UNKNOWN, 1'b0);
+    copy = clone_query_completion(completion, {label, "_BAD_OWNER"});
+    if ($cast(payload, copy.decoded_response)) payload.owner = ~payload.owner;
+    query_result_is({label, "_BAD_OWNER"}, policy, ceq, copy,
+                    RDMA_HW_PRESENCE_UNKNOWN, 1'b0);
+    copy = clone_query_completion(completion, {label, "_BAD_FUNCTION"});
+    copy.ticket.function_h.function_uid++;
+    query_result_is({label, "_BAD_FUNCTION"}, policy, ceq, copy,
+                    RDMA_HW_PRESENCE_UNKNOWN, 1'b0);
+  endtask
+
+  task automatic check_create_timeout_matrix();
+    for (int unsigned scenario = 0; scenario < 3; scenario++) begin
+      string label;
+      rdma_function_binding binding;
+      rdma_fault_inject_resource_manager manager;
+      rdma_queue_destroy_trace_mem mem;
+      rdma_queue_destroy_trace_context context_backing;
+      rdma_queue_destroy_trace_cmq cmq;
+      rdma_mock_call_trace trace;
+      rdma_queue_lifecycle_executor executor;
+      rdma_queue_resource queue;
+      rdma_control_result create_result;
+      rdma_control_result result;
+      rdma_ceq ceq_dependency;
+      rdma_pd pd_dependency;
+      rdma_semantic_request request;
+      rdma_recovery_record recovery;
+      rdma_status status;
+
+      label = $sformatf("CREATE_TIMEOUT_%0d", scenario);
+      binding = make_binding({label, "_binding"});
+      manager = rdma_fault_inject_resource_manager::type_id::create(
+        {label, "_manager"});
+      ceq_dependency = null;
+      pd_dependency = null;
+      status = manager.create_ceq(binding, ceq_dependency);
+      expect_status({label, "_CEQ"}, status, RDMA_SC_OK);
+      mem = rdma_queue_destroy_trace_mem::type_id::create({label, "_mem"});
+      mem.queue_kind = RDMA_RESOURCE_CEQ;
+      context_backing = rdma_queue_destroy_trace_context::type_id::create(
+        {label, "_context"});
+      cmq = rdma_queue_destroy_trace_cmq::type_id::create({label, "_cmq"});
+      trace = rdma_mock_call_trace::type_id::create({label, "_trace"});
+      mem.set_shared_trace(trace);
+      context_backing.set_call_trace(trace);
+      cmq.set_call_trace(trace);
+      executor = rdma_queue_lifecycle_executor::type_id::create(
+        {label, "_executor"});
+      expect_status({label, "_CONFIGURE"}, executor.configure(
+        manager, cmq, mem, context_backing, 100ns), RDMA_SC_OK);
+      request = make_executor_request({label, "_request"},
+                                      RDMA_RESOURCE_CEQ, binding,
+                                      ceq_dependency, 1'b0);
+      cmq.timeout_opcode(XTR_V1_OP_CEQC_CREATE);
+      queue = null;
+      result = null;
+      executor.create_locked(binding, binding.make_handle(), request,
+                             64'd2000 + scenario, queue, result);
+      if (result == null || result.status == null ||
+          result.status.code != RDMA_SC_RECOVERY_REQUIRED ||
+          !result.recovery_required || queue == null) begin
+        `uvm_error(label, "create timeout did not retain ERROR recovery")
+        continue;
+      end
+      status = manager.lookup_recovery(queue.handle, recovery);
+      expect_status({label, "_LOOKUP"}, status, RDMA_SC_OK);
+      if (recovery == null || recovery.ambiguous_ticket == null ||
+          recovery.ambiguous_queue_operation != RDMA_QUEUE_AMBIG_CREATE)
+        `uvm_error(label, "create timeout ticket was not retained")
+      if (scenario == 0)
+        cmq.push_late_completion(recovery.ambiguous_ticket,
+                                 rdma_status::success("late create success"));
+      else if (scenario == 1)
+        cmq.push_late_completion(recovery.ambiguous_ticket,
+                                 rdma_status::make(RDMA_SC_UNKNOWN_HW_ERROR,
+                                                    "late create failure"));
+      executor.recover_locked(binding, binding.make_handle(), queue.handle,
+                              64'd2100 + scenario, result);
+      if (scenario == 2) begin
+        if (result == null || result.status == null ||
+            result.status.code != RDMA_SC_RECOVERY_REQUIRED ||
+            !result.recovery_required)
+          `uvm_error(label, "pending create remained unresolved")
+      end
+      else if (result == null || !result.ok() || result.recovery_required ||
+               result.final_resource_state != RDMA_RESOURCE_RELEASED)
+        `uvm_error(label, "terminal create evidence did not finish rollback")
+    end
+  endtask
+
+  task automatic check_delete_timeout_failure_restore();
+    string label;
+    string expected[$];
+    rdma_function_binding binding;
+    rdma_fault_inject_resource_manager manager;
+    rdma_queue_destroy_trace_mem mem;
+    rdma_queue_destroy_trace_context context_backing;
+    rdma_queue_destroy_trace_cmq cmq;
+    rdma_mock_call_trace trace;
+    rdma_queue_lifecycle_executor executor;
+    rdma_queue_resource queue;
+    rdma_control_result create_result;
+    rdma_control_result result;
+    rdma_control_result recovery_result;
+    rdma_ceq ceq_dependency;
+    rdma_pd pd_dependency;
+    rdma_destroy_resource_req request;
+    rdma_recovery_record recovery;
+    rdma_resource snapshot;
+    rdma_status failure;
+    rdma_status status;
+    int unsigned cmq_before;
+
+    label = "DELETE_TIMEOUT_LATE_FAILURE_RESTORE";
+    make_query_fixture(label, RDMA_RESOURCE_CEQ, binding, manager, mem,
+                       context_backing, cmq, trace, executor, queue,
+                       create_result, ceq_dependency, pd_dependency);
+    request = make_destroy_request({label, "_request"}, binding, queue.handle);
+    cmq.timeout_opcode(XTR_V1_OP_CEQC_DELETE);
+    cmq_before = cmq.calls.size();
+    executor.destroy_locked(binding, binding.make_handle(), request, 64'd2200,
+                            result);
+    status = manager.lookup_recovery(queue.handle, recovery);
+    expect_status({label, "_LOOKUP"}, status, RDMA_SC_OK);
+    if (recovery == null || recovery.ambiguous_ticket == null)
+      `uvm_error(label, "delete timeout ticket was not retained")
+    failure = rdma_status::make(RDMA_SC_UNKNOWN_HW_ERROR,
+                                "late definitive delete failure");
+    cmq.push_late_completion(recovery.ambiguous_ticket, failure);
+    recovery_result = null;
+    executor.recover_locked(binding, binding.make_handle(), queue.handle,
+                            64'd2201, recovery_result);
+    if (recovery_result == null || recovery_result.status == null ||
+        recovery_result.final_resource_state != RDMA_RESOURCE_ACTIVE ||
+        !recovery_result.final_resource_state_known ||
+        recovery_result.recovery_required || recovery_result.status.code !=
+          RDMA_SC_UNKNOWN_HW_ERROR)
+      `uvm_error(label, "late delete failure did not restore ACTIVE")
+    status = manager.lookup(queue.handle, snapshot);
+    expect_status({label, "_ACTIVE"}, status, RDMA_SC_OK);
+    if (snapshot == null || snapshot.state != RDMA_RESOURCE_ACTIVE)
+      `uvm_error(label, "manager did not publish restored ACTIVE queue")
+    if (cmq.calls.size() != cmq_before + 1 || mem.release_ordinal != 0 ||
+        context_backing.release_call_count != 0)
+      `uvm_error(label, "restore path issued destructive/local cleanup")
+  endtask
+
   function new(string name = "rdma_queue_recovery_test",
                uvm_component parent = null);
     super.new(name, parent);
@@ -83,7 +537,10 @@ class rdma_queue_recovery_test extends rdma_queue_lifecycle_test;
 
   task run_phase(uvm_phase phase);
     phase.raise_objection(this);
+    check_query_classifier_matrix();
+    check_create_timeout_matrix();
     check_late_delete_success_recovery();
+    check_delete_timeout_failure_restore();
     phase.drop_objection(this);
   endtask
 endclass

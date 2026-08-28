@@ -9,9 +9,20 @@ the login-shell environment from `~/.bashrc`.
 | `PATH="/tmp/rdma_sshpass_wrapper_codex:$PATH" SSHPASS=123 scripts/run_vcs53.sh core rdma_cmq_port_test` | 0 | warning=0, error=0, fatal=0 |
 | `PATH="/tmp/rdma_sshpass_wrapper_codex:$PATH" SSHPASS=123 scripts/run_vcs53.sh core rdma_control_plane_test` | 0 | warning=0, error=0, fatal=0 |
 
-The focused late-delete case now reconciles the terminal delete completion,
-persists local cleanup progress, and finalizes the normal-destroy queue.  The
-recovery executor selects `finalize_release()` from the recovery intent; only
+The focused recovery matrix also covers authenticated typed QUERY evidence:
+raw-CQE owner/opcode/ecode/WQE/wrap and CMQ ticket/status identity are
+cross-checked before a response can prove PRESENT.  Only the opcode-specific
+invalid-context whitelist can prove ABSENT, and only with a non-OK command
+status; SRFQ and arbitrary nonzero ecodes remain UNKNOWN.  QUERY evidence never
+crosses an incomplete OCC barrier.
+
+Create timeout recovery was exercised for late success, definitive late
+failure, and still-pending outcomes.  Late success/failure rolls back the
+ambiguous create and reaches `RESOURCE_RELEASED`; a pending ticket remains an
+ERROR recovery record.  A normal-destroy late delete failure and a failed
+pre-delete SRQ OCC completion restore the already-published queue to ACTIVE
+without issuing destructive or local-release side effects.  The recovery
+executor selects `finalize_release()` from the recovery intent; only
 create-rollback recovery persists the reservation-only `RESOURCE_RELEASED`
 pending step required by `release_reserved()`.
 
