@@ -4241,6 +4241,49 @@ class rdma_resource_manager extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // Compare the durable progress portion of two recovery snapshots.  Calls
+  // that merely re-publish an identical ERROR snapshot are rejected, while a
+  // changed pending/completed bit or cleanup proof is accepted atomically.
+  protected function bit same_queue_recovery_progress(
+    rdma_recovery_record lhs,
+    rdma_recovery_record rhs
+  );
+    if (lhs == null || rhs == null)
+      return 1'b0;
+    if (lhs.completed_steps.size() != rhs.completed_steps.size() ||
+        lhs.pending_steps.size() != rhs.pending_steps.size() ||
+        lhs.rollback_statuses.size() != rhs.rollback_statuses.size())
+      return 1'b0;
+    foreach (lhs.completed_steps[i])
+      if (lhs.completed_steps[i] != rhs.completed_steps[i]) return 1'b0;
+    foreach (lhs.pending_steps[i])
+      if (lhs.pending_steps[i] != rhs.pending_steps[i]) return 1'b0;
+    if (lhs.queue_plan == null || rhs.queue_plan == null)
+      return lhs.queue_plan == rhs.queue_plan;
+    if (lhs.queue_plan.refs.size() != rhs.queue_plan.refs.size() ||
+        lhs.queue_plan.flush_targets.size() != rhs.queue_plan.flush_targets.size())
+      return 1'b0;
+    foreach (lhs.queue_plan.refs[i]) begin
+      if (lhs.queue_plan.refs[i] == null || rhs.queue_plan.refs[i] == null ||
+          lhs.queue_plan.refs[i].cleanup_complete !=
+            rhs.queue_plan.refs[i].cleanup_complete)
+        return 1'b0;
+    end
+    foreach (lhs.queue_plan.flush_targets[i]) begin
+      if (lhs.queue_plan.flush_targets[i] == null ||
+          rhs.queue_plan.flush_targets[i] == null ||
+          lhs.queue_plan.flush_targets[i].flush_complete !=
+            rhs.queue_plan.flush_targets[i].flush_complete)
+        return 1'b0;
+    end
+    if ((lhs.queue_plan.context_ref == null) !=
+        (rhs.queue_plan.context_ref == null)) return 1'b0;
+    if (lhs.queue_plan.context_ref != null &&
+        lhs.queue_plan.context_ref.release_complete !=
+          rhs.queue_plan.context_ref.release_complete) return 1'b0;
+    return 1'b1;
+  endfunction
+
   protected function rdma_status mark_error_transition(
     rdma_handle handle,
     rdma_recovery_record recovery,
@@ -4385,6 +4428,12 @@ class rdma_resource_manager extends uvm_object;
       transaction_local_recovery = queue_replacement.queue_plan == null;
       reservation_release_recovery =
         canonical_queue_reservation_release_recovery(recovery_copy);
+      if (reservation_release_recovery &&
+          queue_replacement.state == RDMA_RESOURCE_ERROR &&
+          recovery_records.exists(key) && recovery_records[key] != null &&
+          same_queue_recovery_progress(recovery_records[key], recovery_copy))
+        return rdma_status::make(RDMA_SC_INVALID_STATE,
+                                 "ERROR recovery publication replay");
       has_resource_release_step = 1'b0;
       foreach (recovery_copy.pending_steps[i])
         if (recovery_copy.pending_steps[i] ==
