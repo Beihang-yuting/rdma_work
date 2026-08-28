@@ -634,12 +634,17 @@ class rdma_resource_manager extends uvm_object;
     foreach (authoritative.refs[i]) begin
       if (!same_queue_backing_ref_value(authoritative.refs[i],
                                         candidate.refs[i]) ||
-          candidate.refs[i] == null || !candidate.refs[i].cleanup_complete)
+          candidate.refs[i] == null)
         return rdma_status::make(
           RDMA_SC_INVALID_ARGUMENT,
-          "queue reservation recovery backing is not completely released"
+          "queue reservation recovery backing authority changed"
         );
       if (candidate.refs[i].ownership == RDMA_OWNERSHIP_CONTROL_PLANE) begin
+        if (!candidate.refs[i].cleanup_complete)
+          return rdma_status::make(
+            RDMA_SC_INVALID_ARGUMENT,
+            "queue reservation recovery owned backing is not released"
+          );
         if (!same_owned_queue_backing_ref_authority(authoritative.refs[i],
                                                     candidate.refs[i]))
           return rdma_status::make(
@@ -665,6 +670,33 @@ class rdma_resource_manager extends uvm_object;
             );
         end
       end
+      else if (candidate.refs[i].ownership == RDMA_OWNERSHIP_BORROWED) begin
+        if (authoritative.refs[i].cleanup_complete ||
+            candidate.refs[i].cleanup_complete ||
+            candidate.refs[i].mapping == null ||
+            candidate.refs[i].mapping.state != RDMA_MAPPING_ACTIVE)
+          return rdma_status::make(
+            RDMA_SC_INVALID_ARGUMENT,
+            "queue reservation recovery borrowed backing was released"
+          );
+        foreach (candidate.refs[i].additional_segments[j]) begin
+          if (candidate.refs[i].additional_segments[j] == null ||
+              candidate.refs[i].additional_segments[j].ownership !=
+                RDMA_OWNERSHIP_BORROWED ||
+              candidate.refs[i].additional_segments[j].mapping == null ||
+              candidate.refs[i].additional_segments[j].mapping.state !=
+                RDMA_MAPPING_ACTIVE)
+            return rdma_status::make(
+              RDMA_SC_INVALID_ARGUMENT,
+              "queue reservation recovery borrowed segment was released"
+            );
+        end
+      end
+      else
+        return rdma_status::make(
+          RDMA_SC_INVALID_ARGUMENT,
+          "queue reservation recovery backing ownership is invalid"
+        );
     end
     if (candidate.context_ref != null &&
         !same_released_queue_context_value(authoritative.context_ref,
@@ -685,10 +717,71 @@ class rdma_resource_manager extends uvm_object;
           !same_queue_backing_ref_value(
             authoritative.flush_targets[i].pd_ref,
             candidate.flush_targets[i].pd_ref
-          ) || !candidate.flush_targets[i].pd_ref.cleanup_complete)
+          ))
         return rdma_status::make(
           RDMA_SC_INVALID_ARGUMENT,
           "queue reservation recovery flush authority changed"
+        );
+      if (candidate.flush_targets[i].pd_ref.ownership ==
+            RDMA_OWNERSHIP_CONTROL_PLANE) begin
+        if (!candidate.flush_targets[i].pd_ref.cleanup_complete ||
+            !same_owned_queue_backing_ref_authority(
+              authoritative.flush_targets[i].pd_ref,
+              candidate.flush_targets[i].pd_ref
+            ))
+          return rdma_status::make(
+            RDMA_SC_INVALID_ARGUMENT,
+            "queue reservation recovery flush release authority changed"
+          );
+        status = query_owned_release_completion(
+          candidate.flush_targets[i].pd_ref.mapping, release_complete
+        );
+        if (status == null || !status.ok() || !release_complete)
+          return rdma_status::make(
+            RDMA_SC_INVALID_ARGUMENT,
+            "queue reservation recovery flush lacks completion proof"
+          );
+        foreach (candidate.flush_targets[i].pd_ref.additional_segments[j]) begin
+          status = query_owned_release_completion(
+            candidate.flush_targets[i].pd_ref.additional_segments[j].mapping,
+            release_complete
+          );
+          if (status == null || !status.ok() || !release_complete)
+            return rdma_status::make(
+              RDMA_SC_INVALID_ARGUMENT,
+              "queue reservation recovery flush segment lacks completion proof"
+            );
+        end
+      end
+      else if (candidate.flush_targets[i].pd_ref.ownership ==
+                 RDMA_OWNERSHIP_BORROWED) begin
+        if (authoritative.flush_targets[i].pd_ref.cleanup_complete ||
+            candidate.flush_targets[i].pd_ref.cleanup_complete ||
+            candidate.flush_targets[i].pd_ref.mapping == null ||
+            candidate.flush_targets[i].pd_ref.mapping.state !=
+              RDMA_MAPPING_ACTIVE)
+          return rdma_status::make(
+            RDMA_SC_INVALID_ARGUMENT,
+            "queue reservation recovery borrowed flush backing was released"
+          );
+        foreach (candidate.flush_targets[i].pd_ref.additional_segments[j]) begin
+          if (candidate.flush_targets[i].pd_ref.additional_segments[j] == null ||
+              candidate.flush_targets[i].pd_ref.additional_segments[j].ownership !=
+                RDMA_OWNERSHIP_BORROWED ||
+              candidate.flush_targets[i].pd_ref.additional_segments[j].mapping ==
+                null ||
+              candidate.flush_targets[i].pd_ref.additional_segments[j].mapping.
+                state != RDMA_MAPPING_ACTIVE)
+            return rdma_status::make(
+              RDMA_SC_INVALID_ARGUMENT,
+              "queue reservation recovery borrowed flush segment was released"
+            );
+        end
+      end
+      else
+        return rdma_status::make(
+          RDMA_SC_INVALID_ARGUMENT,
+          "queue reservation recovery flush ownership is invalid"
         );
     end
     return rdma_status::success();
@@ -706,12 +799,17 @@ class rdma_resource_manager extends uvm_object;
         RDMA_SC_INVALID_ARGUMENT, "queue local release plan is missing"
       );
     foreach (candidate.refs[i]) begin
-      if (candidate.refs[i] == null || !candidate.refs[i].cleanup_complete)
+      if (candidate.refs[i] == null)
         return rdma_status::make(
           RDMA_SC_INVALID_ARGUMENT,
-          "queue local release backing is incomplete"
+          "queue local release backing is missing"
         );
       if (candidate.refs[i].ownership == RDMA_OWNERSHIP_CONTROL_PLANE) begin
+        if (!candidate.refs[i].cleanup_complete)
+          return rdma_status::make(
+            RDMA_SC_INVALID_ARGUMENT,
+            "queue local owned release backing is incomplete"
+          );
         status = query_owned_release_completion(candidate.refs[i].mapping,
                                                 release_complete);
         if (status == null || !status.ok() || !release_complete)
@@ -731,6 +829,32 @@ class rdma_resource_manager extends uvm_object;
             );
         end
       end
+      else if (candidate.refs[i].ownership == RDMA_OWNERSHIP_BORROWED) begin
+        if (candidate.refs[i].cleanup_complete ||
+            candidate.refs[i].mapping == null ||
+            candidate.refs[i].mapping.state != RDMA_MAPPING_ACTIVE)
+          return rdma_status::make(
+            RDMA_SC_INVALID_ARGUMENT,
+            "queue local borrowed backing was released"
+          );
+        foreach (candidate.refs[i].additional_segments[j]) begin
+          if (candidate.refs[i].additional_segments[j] == null ||
+              candidate.refs[i].additional_segments[j].ownership !=
+                RDMA_OWNERSHIP_BORROWED ||
+              candidate.refs[i].additional_segments[j].mapping == null ||
+              candidate.refs[i].additional_segments[j].mapping.state !=
+                RDMA_MAPPING_ACTIVE)
+            return rdma_status::make(
+              RDMA_SC_INVALID_ARGUMENT,
+              "queue local borrowed segment was released"
+            );
+        end
+      end
+      else
+        return rdma_status::make(
+          RDMA_SC_INVALID_ARGUMENT,
+          "queue local release backing ownership is invalid"
+        );
     end
     if (candidate.context_ref != null) begin
       if (!$cast(token, candidate.context_ref.slot_token) ||
@@ -744,11 +868,66 @@ class rdma_resource_manager extends uvm_object;
     end
     foreach (candidate.flush_targets[i]) begin
       if (candidate.flush_targets[i] == null ||
-          candidate.flush_targets[i].pd_ref == null ||
-          !candidate.flush_targets[i].pd_ref.cleanup_complete)
+          candidate.flush_targets[i].pd_ref == null)
         return rdma_status::make(
           RDMA_SC_INVALID_ARGUMENT,
-          "queue local release flush backing is incomplete"
+          "queue local release flush backing is missing"
+        );
+      if (candidate.flush_targets[i].pd_ref.ownership ==
+            RDMA_OWNERSHIP_CONTROL_PLANE) begin
+        if (!candidate.flush_targets[i].pd_ref.cleanup_complete)
+          return rdma_status::make(
+            RDMA_SC_INVALID_ARGUMENT,
+            "queue local owned flush backing is incomplete"
+          );
+        status = query_owned_release_completion(
+          candidate.flush_targets[i].pd_ref.mapping, release_complete
+        );
+        if (status == null || !status.ok() || !release_complete)
+          return rdma_status::make(
+            RDMA_SC_INVALID_ARGUMENT,
+            "queue local owned flush backing proof is incomplete"
+          );
+        foreach (candidate.flush_targets[i].pd_ref.additional_segments[j]) begin
+          status = query_owned_release_completion(
+            candidate.flush_targets[i].pd_ref.additional_segments[j].mapping,
+            release_complete
+          );
+          if (status == null || !status.ok() || !release_complete)
+            return rdma_status::make(
+              RDMA_SC_INVALID_ARGUMENT,
+              "queue local owned flush segment proof is incomplete"
+            );
+        end
+      end
+      else if (candidate.flush_targets[i].pd_ref.ownership ==
+                 RDMA_OWNERSHIP_BORROWED) begin
+        if (candidate.flush_targets[i].pd_ref.cleanup_complete ||
+            candidate.flush_targets[i].pd_ref.mapping == null ||
+            candidate.flush_targets[i].pd_ref.mapping.state !=
+              RDMA_MAPPING_ACTIVE)
+          return rdma_status::make(
+            RDMA_SC_INVALID_ARGUMENT,
+            "queue local borrowed flush backing was released"
+          );
+        foreach (candidate.flush_targets[i].pd_ref.additional_segments[j]) begin
+          if (candidate.flush_targets[i].pd_ref.additional_segments[j] == null ||
+              candidate.flush_targets[i].pd_ref.additional_segments[j].ownership !=
+                RDMA_OWNERSHIP_BORROWED ||
+              candidate.flush_targets[i].pd_ref.additional_segments[j].mapping ==
+                null ||
+              candidate.flush_targets[i].pd_ref.additional_segments[j].mapping.
+                state != RDMA_MAPPING_ACTIVE)
+            return rdma_status::make(
+              RDMA_SC_INVALID_ARGUMENT,
+              "queue local borrowed flush segment was released"
+            );
+        end
+      end
+      else
+        return rdma_status::make(
+          RDMA_SC_INVALID_ARGUMENT,
+          "queue local release flush ownership is invalid"
         );
     end
     return rdma_status::success();

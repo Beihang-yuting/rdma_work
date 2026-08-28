@@ -2209,6 +2209,20 @@ class rdma_queue_lifecycle_test extends uvm_test;
     return count;
   endfunction
 
+  function automatic int unsigned count_executor_host_releases_for_backing(
+    rdma_mock_host_mem mem, longint unsigned backing_address
+  );
+    int unsigned count;
+
+    count = 0;
+    foreach (mem.calls[i])
+      if (mem.calls[i] != null && mem.calls[i].method_name == "release" &&
+          mem.calls[i].mapping != null &&
+          mem.calls[i].mapping.backing_addr.value == backing_address)
+        count++;
+    return count;
+  endfunction
+
   function automatic int unsigned count_executor_recovery_step(
     rdma_control_step_e steps[$], rdma_control_step_e expected
   );
@@ -2821,8 +2835,10 @@ class rdma_queue_lifecycle_test extends uvm_test;
     kinds.push_back(RDMA_RESOURCE_CEQ);
     kinds.push_back(RDMA_RESOURCE_AEQ);
     foreach (kinds[kind_index]) begin
+      for (int unsigned borrow_mode = 0; borrow_mode < 2; borrow_mode++) begin
       string label;
       rdma_resource_kind_e kind;
+      bit borrowed;
       rdma_function_binding binding;
       rdma_fault_inject_resource_manager manager;
       rdma_ceq dependency;
@@ -2831,6 +2847,12 @@ class rdma_queue_lifecycle_test extends uvm_test;
       rdma_mock_cmq_port cmq;
       rdma_queue_lifecycle_executor executor;
       rdma_semantic_request request;
+      rdma_create_cq_req borrowed_cq_request;
+      rdma_create_ceq_req borrowed_ceq_request;
+      rdma_create_aeq_req borrowed_aeq_request;
+      rdma_dma_mapping borrowed_primary_mapping;
+      rdma_dma_mapping borrowed_segment_mapping;
+      rdma_queue_backing_slice borrowed_slice;
       rdma_queue_resource queue;
       rdma_control_result result;
       rdma_recovery_record recovery;
@@ -2840,10 +2862,15 @@ class rdma_queue_lifecycle_test extends uvm_test;
       rdma_status status;
       int unsigned host_release_count;
       int unsigned context_release_count;
+      int unsigned expected_host_releases;
+      longint unsigned borrowed_primary_backing;
+      longint unsigned borrowed_segment_backing;
       bit release_complete;
 
       kind = kinds[kind_index];
-      label = $sformatf("EXEC_%s_RESERVATION_RELEASE_RECOVERY", kind.name());
+      borrowed = borrow_mode != 0;
+      label = $sformatf("EXEC_%s_%s_RESERVATION_RELEASE_RECOVERY",
+                        kind.name(), borrowed ? "BORROWED" : "OWNED");
       binding = make_binding({label, "_binding"});
       manager = rdma_fault_inject_resource_manager::type_id::create(
         {label, "_manager"}
@@ -2864,7 +2891,92 @@ class rdma_queue_lifecycle_test extends uvm_test;
       expect_status({label, "_CONFIGURE"}, executor.configure(
         manager, cmq, mem, context_backing, 100ns), RDMA_SC_OK);
       request = make_executor_request({label, "_request"}, kind, binding,
-                                      dependency, 1'b0);
+                                      dependency, borrowed);
+      if (borrowed) begin
+        case (kind)
+          RDMA_RESOURCE_CQ: begin
+            if (!$cast(borrowed_cq_request, request))
+              `uvm_fatal(label, "borrowed CQ request cast failed")
+            borrowed_cq_request.depth = 128;
+            borrowed_cq_request.ring_backing.slices.delete();
+            borrowed_primary_backing = 64'hdead_0000_0000_0000;
+            borrowed_segment_backing = 64'hdead_0000_0000_1000;
+            borrowed_primary_mapping = make_mapping(
+              {label, "_borrowed_primary"}, binding,
+              64'h0000_0030_0000_0000, borrowed_primary_backing, 4096
+            );
+            borrowed_segment_mapping = make_mapping(
+              {label, "_borrowed_segment"}, binding,
+              64'h0000_0030_0000_1000, borrowed_segment_backing, 4096
+            );
+            borrowed_slice = make_slice(
+              {label, "_borrowed_primary_slice"}, RDMA_QUEUE_ROLE_CQ_RING,
+              borrowed_primary_mapping, 0, 4096
+            );
+            borrowed_cq_request.ring_backing.slices.push_back(borrowed_slice);
+            borrowed_slice = make_slice(
+              {label, "_borrowed_segment_slice"}, RDMA_QUEUE_ROLE_CQ_RING,
+              borrowed_segment_mapping, 0, 4096
+            );
+            borrowed_slice.logical_queue_offset = 4096;
+            borrowed_cq_request.ring_backing.slices.push_back(borrowed_slice);
+          end
+          RDMA_RESOURCE_CEQ: begin
+            if (!$cast(borrowed_ceq_request, request))
+              `uvm_fatal(label, "borrowed CEQ request cast failed")
+            borrowed_ceq_request.depth = 512;
+            borrowed_ceq_request.ring_backing.slices.delete();
+            borrowed_primary_backing = 64'hdead_1000_0000_0000;
+            borrowed_segment_backing = 64'hdead_1000_0000_1000;
+            borrowed_primary_mapping = make_mapping(
+              {label, "_borrowed_primary"}, binding,
+              64'h0000_0031_0000_0000, borrowed_primary_backing, 4096
+            );
+            borrowed_segment_mapping = make_mapping(
+              {label, "_borrowed_segment"}, binding,
+              64'h0000_0031_0000_1000, borrowed_segment_backing, 4096
+            );
+            borrowed_slice = make_slice(
+              {label, "_borrowed_primary_slice"}, RDMA_QUEUE_ROLE_CEQ_RING,
+              borrowed_primary_mapping, 0, 4096
+            );
+            borrowed_ceq_request.ring_backing.slices.push_back(borrowed_slice);
+            borrowed_slice = make_slice(
+              {label, "_borrowed_segment_slice"}, RDMA_QUEUE_ROLE_CEQ_RING,
+              borrowed_segment_mapping, 0, 4096
+            );
+            borrowed_slice.logical_queue_offset = 4096;
+            borrowed_ceq_request.ring_backing.slices.push_back(borrowed_slice);
+          end
+          default: begin
+            if (!$cast(borrowed_aeq_request, request))
+              `uvm_fatal(label, "borrowed AEQ request cast failed")
+            borrowed_aeq_request.depth = 512;
+            borrowed_aeq_request.ring_backing.slices.delete();
+            borrowed_primary_backing = 64'hdead_2000_0000_0000;
+            borrowed_segment_backing = 64'hdead_2000_0000_1000;
+            borrowed_primary_mapping = make_mapping(
+              {label, "_borrowed_primary"}, binding,
+              64'h0000_0032_0000_0000, borrowed_primary_backing, 4096
+            );
+            borrowed_segment_mapping = make_mapping(
+              {label, "_borrowed_segment"}, binding,
+              64'h0000_0032_0000_1000, borrowed_segment_backing, 4096
+            );
+            borrowed_slice = make_slice(
+              {label, "_borrowed_primary_slice"}, RDMA_QUEUE_ROLE_AEQ_RING,
+              borrowed_primary_mapping, 0, 4096
+            );
+            borrowed_aeq_request.ring_backing.slices.push_back(borrowed_slice);
+            borrowed_slice = make_slice(
+              {label, "_borrowed_segment_slice"}, RDMA_QUEUE_ROLE_AEQ_RING,
+              borrowed_segment_mapping, 0, 4096
+            );
+            borrowed_slice.logical_queue_offset = 4096;
+            borrowed_aeq_request.ring_backing.slices.push_back(borrowed_slice);
+          end
+        endcase
+      end
       primary = rdma_status::make(RDMA_SC_UNKNOWN_HW_ERROR,
                                   {label, " payload write"});
       release_failure = rdma_status::make(RDMA_SC_RESOURCE_BUSY,
@@ -2873,9 +2985,11 @@ class rdma_queue_lifecycle_test extends uvm_test;
       void'(manager.fail_next_transition("release_reserved", release_failure));
 
       executor.create_locked(binding, binding.make_handle(), request,
-                             64'd430 + kind_index, queue, result);
+                             64'd430 + kind_index * 2 + borrow_mode,
+                             queue, result);
       status = manager.lookup_recovery(result.resource_h, recovery);
       expect_status({label, "_RECOVERY"}, status, RDMA_SC_OK);
+      expected_host_releases = borrowed ? 1 : 2;
       if (result == null || result.status == null ||
           result.primary_status == null ||
           result.status.code != RDMA_SC_RECOVERY_REQUIRED ||
@@ -2902,6 +3016,15 @@ class rdma_queue_lifecycle_test extends uvm_test;
           count_executor_rollback_code(
             result.rollback_statuses, RDMA_SC_RESOURCE_BUSY
           ) != 1 || manager.release_reserved_calls != 1 ||
+          count_executor_host_calls(mem, "release") !=
+            expected_host_releases ||
+          (borrowed &&
+           (count_executor_host_releases_for_backing(
+              mem, borrowed_primary_backing
+            ) != 0 ||
+            count_executor_host_releases_for_backing(
+              mem, borrowed_segment_backing
+            ) != 0)) ||
           cmq.calls.size() != 0 || mem.live_allocations() != 0)
         `uvm_error(label,
                    "reservation release failure lost durable queue authority")
@@ -2909,23 +3032,48 @@ class rdma_queue_lifecycle_test extends uvm_test;
         foreach (recovery.queue_plan.refs[i]) begin
           release_complete = 1'b0;
           if (recovery.queue_plan.refs[i] == null ||
-              !recovery.queue_plan.refs[i].cleanup_complete ||
               recovery.queue_plan.refs[i].mapping == null ||
               recovery.queue_plan.refs[i].mapping.function_h == null ||
               !recovery.queue_plan.refs[i].mapping.function_h.same_instance(
                 binding.make_handle()
-              ) ||
-              (recovery.queue_plan.refs[i].ownership ==
-                 RDMA_OWNERSHIP_CONTROL_PLANE &&
-               (recovery.queue_plan.refs[i].mapping.owner_h == null ||
-                !recovery.queue_plan.refs[i].mapping.owner_h.same_instance(
-                  result.resource_h
-                ) ||
-                recovery.queue_plan.refs[i].mapping.
-                  release_completion_status(release_complete) == null ||
-                !release_complete)))
+              ))
             `uvm_error(
               label, "reservation recovery backing proof is not authoritative"
+            )
+          else if (recovery.queue_plan.refs[i].ownership ==
+                     RDMA_OWNERSHIP_BORROWED) begin
+            if (recovery.queue_plan.refs[i].cleanup_complete ||
+                recovery.queue_plan.refs[i].mapping.state !=
+                  RDMA_MAPPING_ACTIVE ||
+                recovery.queue_plan.refs[i].additional_segments.size() != 1)
+              `uvm_error(
+                label, "borrowed reservation recovery forged completion"
+              )
+            foreach (recovery.queue_plan.refs[i].additional_segments[j]) begin
+              if (recovery.queue_plan.refs[i].additional_segments[j] == null ||
+                  recovery.queue_plan.refs[i].additional_segments[j].ownership !=
+                    RDMA_OWNERSHIP_BORROWED ||
+                  recovery.queue_plan.refs[i].additional_segments[j].mapping ==
+                    null ||
+                  recovery.queue_plan.refs[i].additional_segments[j].mapping.
+                    state != RDMA_MAPPING_ACTIVE)
+                `uvm_error(
+                  label, "borrowed reservation segment authority was released"
+                )
+            end
+          end
+          else if (recovery.queue_plan.refs[i].ownership !=
+                     RDMA_OWNERSHIP_CONTROL_PLANE ||
+                   !recovery.queue_plan.refs[i].cleanup_complete ||
+                   recovery.queue_plan.refs[i].mapping.owner_h == null ||
+                   !recovery.queue_plan.refs[i].mapping.owner_h.same_instance(
+                     result.resource_h
+                   ) ||
+                   recovery.queue_plan.refs[i].mapping.
+                     release_completion_status(release_complete) == null ||
+                   !release_complete)
+            `uvm_error(
+              label, "owned reservation recovery lacks completion proof"
             )
         end
         if ((kind == RDMA_RESOURCE_CQ &&
@@ -2959,6 +3107,7 @@ class rdma_queue_lifecycle_test extends uvm_test;
       if (dependency != null) begin
         status = manager.release_reserved(dependency.handle);
         expect_status({label, "_DEPENDENCY_RELEASED"}, status, RDMA_SC_OK);
+      end
       end
     end
   endtask
