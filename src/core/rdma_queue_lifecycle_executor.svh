@@ -46,14 +46,25 @@ class rdma_queue_lifecycle_executor extends uvm_object;
 
   protected function bit cmq_outcome_ambiguous(
     rdma_status status,
+    rdma_cmq_ticket ticket,
     rdma_cmq_completion completion
   );
-    if (status == null || completion == null || completion.status == null)
+    // A null status means the adapter did not provide an outcome at all.  A
+    // timeout/reset is inherently ambiguous even when the adapter did return
+    // a status.  Conversely, a non-OK validation status with no ticket and no
+    // completion is a definitive pre-submit rejection: no destructive command
+    // could have reached hardware and the caller may safely restore ACTIVE.
+    if (status == null)
       return 1'b1;
-    return status.code inside {RDMA_SC_TIMEOUT, RDMA_SC_RESET_CANCELLED} ||
-           completion.status.code inside {
-             RDMA_SC_TIMEOUT, RDMA_SC_RESET_CANCELLED
-           };
+    if (status.code inside {RDMA_SC_TIMEOUT, RDMA_SC_RESET_CANCELLED})
+      return 1'b1;
+    if (completion != null && completion.status != null &&
+        completion.status.code inside {RDMA_SC_TIMEOUT,
+                                       RDMA_SC_RESET_CANCELLED})
+      return 1'b1;
+    if (completion == null || completion.status == null)
+      return status.ok() || ticket != null;
+    return 1'b0;
   endfunction
 
   function rdma_status configure(
@@ -359,6 +370,9 @@ class rdma_queue_lifecycle_executor extends uvm_object;
       else begin
         released_any = 1'b1;
         if (record_progress) begin
+          // Persist the context completion immediately after its physical
+          // release.  This leaves an authoritative proof in the manager even
+          // if a later backing role fails and recovery must resume.
           status = normalize_status(
             manager.record_queue_context_cleanup_complete(resource_h),
             "queue context progress returned null"
@@ -652,7 +666,7 @@ class rdma_queue_lifecycle_executor extends uvm_object;
         ticket = null;
         completion = null;
         cmq.execute(command, ticket, completion, status);
-        ambiguous = cmq_outcome_ambiguous(status, completion);
+        ambiguous = cmq_outcome_ambiguous(status, ticket, completion);
         status = normalize_status(status,
           "queue rollback pre-delete flush result was lost");
         if (status.ok() &&
@@ -686,7 +700,7 @@ class rdma_queue_lifecycle_executor extends uvm_object;
     ticket = null;
     completion = null;
     cmq.execute(command, ticket, completion, status);
-    ambiguous = cmq_outcome_ambiguous(status, completion);
+    ambiguous = cmq_outcome_ambiguous(status, ticket, completion);
     status = normalize_status(status, "queue rollback delete result was lost");
     if (status.ok() &&
         (completion == null || completion.status == null))
@@ -713,7 +727,7 @@ class rdma_queue_lifecycle_executor extends uvm_object;
         ticket = null;
         completion = null;
         cmq.execute(command, ticket, completion, status);
-        ambiguous = cmq_outcome_ambiguous(status, completion);
+        ambiguous = cmq_outcome_ambiguous(status, ticket, completion);
         status = normalize_status(status,
                                   "queue rollback post-delete flush result was lost");
         if (status.ok() &&
@@ -1028,7 +1042,7 @@ class rdma_queue_lifecycle_executor extends uvm_object;
       ticket = null;
       completion = null;
       cmq.execute(create_command, ticket, completion, status);
-      cmq_ambiguous = cmq_outcome_ambiguous(status, completion);
+      cmq_ambiguous = cmq_outcome_ambiguous(status, ticket, completion);
       status = normalize_status(status, "queue create result was lost");
       if (status.ok() &&
           (completion == null || completion.status == null))
@@ -1113,7 +1127,7 @@ class rdma_queue_lifecycle_executor extends uvm_object;
     rdma_cmq_completion completion;
     bit delete_before_flush, release_context_first, ambiguous, hardware_absent;
     rdma_queue_ambiguous_operation_e ambiguous_op;
-    int unsigned i, j, k, count;
+    int unsigned i, j, k, count, ref_cursor, ref_role_count;
 
     result = make_result(transaction_id);
     status = rdma_status::success(); ambiguous_op = RDMA_QUEUE_AMBIG_NONE;
@@ -1157,12 +1171,30 @@ class rdma_queue_lifecycle_executor extends uvm_object;
       if (release_context_first != (plan.context_ref != null))
         status = invalid_state("local cleanup context recipe mismatch");
       // cleanup_local() walks refs in reverse planner order; enforce that
-      // planner order exactly projects the policy recipe.
-      for (k = 0; k < local_roles.size() && k < plan.refs.size(); k++) begin
-        if (plan.refs[plan.refs.size()-1-k] == null ||
-            plan.refs[plan.refs.size()-1-k].role != local_roles[k])
+      // planner order exactly projects the policy recipe.  SRQ_SGB is an
+      // optional role for max_sge <= 2, so skip that recipe entry when the
+      // canonical plan intentionally omits it.
+      ref_cursor = plan.refs.size();
+      for (k = 0; k < local_roles.size(); k++) begin
+        ref_role_count = 0;
+        foreach (plan.refs[j]) begin
+          if (plan.refs[j] != null && plan.refs[j].role == local_roles[k])
+            ref_role_count++;
+        end
+        if (ref_role_count == 0 && queue.resource_kind() == RDMA_RESOURCE_SRQ &&
+            local_roles[k] == RDMA_QUEUE_ROLE_SRQ_SGB)
+          continue;
+        if (ref_cursor == 0) begin
+          status = invalid_state("planner local cleanup order diverges from recipe");
+          continue;
+        end
+        ref_cursor--;
+        if (plan.refs[ref_cursor] == null ||
+            plan.refs[ref_cursor].role != local_roles[k])
           status = invalid_state("planner local cleanup order diverges from recipe");
       end
+      if (ref_cursor != 0)
+        status = invalid_state("planner local cleanup has unlisted roles");
     end
     if (status.ok()) status = normalize_status(manager.begin_quiesce(queue.handle), "queue begin quiesce returned null");
     if (status.ok()) begin
@@ -1171,8 +1203,25 @@ class rdma_queue_lifecycle_executor extends uvm_object;
       if (!delete_before_flush) begin
         for (i = 0; i < flush_roles.size(); i++) begin
           foreach (plan.flush_targets[j]) if (plan.flush_targets[j].role == flush_roles[i]) begin
-            ticket = null; completion = null; command = null; ambiguous = 1'b0; status = normalize_status(policy.build_flush_command(expected_owner, plan.flush_targets[j], command_timeout, command), "flush descriptor returned null");
-            if (status.ok()) begin ticket = null; completion = null; cmq.execute(command, ticket, completion, step_status); status = normalize_status(step_status, "flush result was lost"); ambiguous = cmq_outcome_ambiguous(status, completion); if (completion == null || completion.status == null) status = invalid_state("flush completion was lost"); end
+            ticket = null;
+            completion = null;
+            command = null;
+            ambiguous = 1'b0;
+            status = normalize_status(policy.build_flush_command(
+              expected_owner, plan.flush_targets[j], command_timeout, command
+            ), "flush descriptor returned null");
+            if (status.ok()) begin
+              ticket = null;
+              completion = null;
+              step_status = null;
+              cmq.execute(command, ticket, completion, step_status);
+              ambiguous = cmq_outcome_ambiguous(step_status, ticket,
+                                                completion);
+              status = normalize_status(step_status, "flush result was lost");
+              if (status.ok() &&
+                  (completion == null || completion.status == null))
+                status = invalid_state("flush completion was lost");
+            end
             if (ambiguous) ambiguous_op = RDMA_QUEUE_AMBIG_OCC_FLUSH;
             if (status.ok() && completion != null && completion.status != null && completion.status.ok()) begin status = normalize_status(manager.record_queue_flush_complete(queue.handle, flush_roles[i]), "flush progress returned null"); if (status.ok()) result.completed_steps.push_back(RDMA_CTRL_STEP_HW_OCC_FLUSHED); end
             if (!status.ok()) break;
@@ -1181,16 +1230,52 @@ class rdma_queue_lifecycle_executor extends uvm_object;
         end
       end
       if (status.ok()) begin
-        ticket = null; completion = null; command = null; status = normalize_status(policy.build_object_command(delete_opcode(queue.resource_kind()), expected_owner, queue, command_timeout, command), "delete descriptor returned null");
+        ticket = null;
+        completion = null;
+        command = null;
+        status = normalize_status(policy.build_object_command(
+          delete_opcode(queue.resource_kind()), expected_owner, queue,
+          command_timeout, command
+        ), "delete descriptor returned null");
         ambiguous = 1'b0;
-        if (status.ok()) begin ticket = null; completion = null; cmq.execute(command, ticket, completion, step_status); status = normalize_status(step_status, "delete result was lost"); ambiguous = cmq_outcome_ambiguous(status, completion); if (completion == null || completion.status == null) status = invalid_state("delete completion was lost"); if (ambiguous) ambiguous_op = RDMA_QUEUE_AMBIG_DELETE; end
+        if (status.ok()) begin
+          ticket = null;
+          completion = null;
+          step_status = null;
+          cmq.execute(command, ticket, completion, step_status);
+          ambiguous = cmq_outcome_ambiguous(step_status, ticket,
+                                            completion);
+          status = normalize_status(step_status, "delete result was lost");
+          if (status.ok() &&
+              (completion == null || completion.status == null))
+            status = invalid_state("delete completion was lost");
+          if (ambiguous)
+            ambiguous_op = RDMA_QUEUE_AMBIG_DELETE;
+        end
         if (status.ok() && completion != null && completion.status != null && completion.status.ok()) begin hardware_absent = 1'b1; result.completed_steps.push_back(RDMA_CTRL_STEP_HW_CONTEXT_DELETED); end
       end
       if (status.ok() && delete_before_flush) begin
         for (i = 0; i < flush_roles.size(); i++) begin
           foreach (plan.flush_targets[j]) if (plan.flush_targets[j].role == flush_roles[i]) begin
-            ticket = null; completion = null; command = null; ambiguous = 1'b0; status = normalize_status(policy.build_flush_command(expected_owner, plan.flush_targets[j], command_timeout, command), "flush descriptor returned null");
-            if (status.ok()) begin ticket = null; completion = null; cmq.execute(command, ticket, completion, step_status); status = normalize_status(step_status, "flush result was lost"); ambiguous = cmq_outcome_ambiguous(status, completion); if (completion == null || completion.status == null) status = invalid_state("flush completion was lost"); end
+            ticket = null;
+            completion = null;
+            command = null;
+            ambiguous = 1'b0;
+            status = normalize_status(policy.build_flush_command(
+              expected_owner, plan.flush_targets[j], command_timeout, command
+            ), "flush descriptor returned null");
+            if (status.ok()) begin
+              ticket = null;
+              completion = null;
+              step_status = null;
+              cmq.execute(command, ticket, completion, step_status);
+              ambiguous = cmq_outcome_ambiguous(step_status, ticket,
+                                                completion);
+              status = normalize_status(step_status, "flush result was lost");
+              if (status.ok() &&
+                  (completion == null || completion.status == null))
+                status = invalid_state("flush completion was lost");
+            end
             if (ambiguous) ambiguous_op = RDMA_QUEUE_AMBIG_OCC_FLUSH;
             if (status.ok() && completion != null && completion.status != null && completion.status.ok()) begin status = normalize_status(manager.record_queue_flush_complete(queue.handle, flush_roles[i]), "flush progress returned null"); if (status.ok()) result.completed_steps.push_back(RDMA_CTRL_STEP_HW_OCC_FLUSHED); end
             if (!status.ok()) break;

@@ -3841,7 +3841,6 @@ class rdma_resource_manager extends uvm_object;
     rdma_queue_resource resource_queue;
     rdma_status status;
     bit has_recovery;
-    bit sgb_cleanup_complete;
     string key;
 
     status = queue_progress_snapshots(handle, "queue context progress", key,
@@ -3852,18 +3851,14 @@ class rdma_resource_manager extends uvm_object;
         resource_queue.queue_plan.context_ref.release_complete)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "queue context cleanup is absent or complete");
-    sgb_cleanup_complete = 1'b0;
-    foreach (resource_queue.queue_plan.refs[i]) begin
-      if (resource_queue.queue_plan.refs[i] != null &&
-          resource_queue.queue_plan.refs[i].role == RDMA_QUEUE_ROLE_SRQ_SGB)
-        sgb_cleanup_complete = resource_queue.queue_plan.refs[i].cleanup_complete;
-    end
-    if (resource_queue.handle.kind == RDMA_RESOURCE_SRQ && !sgb_cleanup_complete)
-      return rdma_status::make(RDMA_SC_INVALID_STATE,
-                               "SRQ context cleanup requires SGB cleanup");
+    // Context release is the first local action, so its completion bit must
+    // stand on its own.  In particular, SRQ payload roles are released after
+    // this call; requiring SGB progress here would either invert the recipe
+    // or leave an already-released context unrecorded during recovery.
     resource_queue.queue_plan.context_ref.release_complete = 1'b1;
-    if (has_recovery)
+    if (has_recovery) begin
       recovery_copy.queue_plan.context_ref.release_complete = 1'b1;
+    end
     return commit_queue_progress(key, resource_copy, recovery_copy, has_recovery,
                                  "queue context progress");
   endfunction

@@ -231,6 +231,191 @@ class rdma_queue_executor_trace_context extends rdma_mock_context_backing;
   endfunction
 endclass
 
+// Destroy-specific adapters keep a semantic trace in addition to the raw
+// mock call logs.  The lifecycle executor intentionally talks to abstract
+// adapters, so observing the adapter boundary is the most stable way for the
+// behavioral tests to prove the hardware/local ordering contract.
+class rdma_queue_destroy_trace_mem extends rdma_queue_executor_trace_mem;
+  `uvm_object_utils(rdma_queue_destroy_trace_mem)
+
+  bit include_sgb;
+  int unsigned release_ordinal;
+
+  function new(string name = "rdma_queue_destroy_trace_mem");
+    super.new(name);
+    include_sgb = 1'b0;
+    release_ordinal = 0;
+  endfunction
+
+  function void reset_destroy_trace();
+    release_ordinal = 0;
+  endfunction
+
+  protected function string release_role(int unsigned ordinal);
+    case (queue_kind)
+      RDMA_RESOURCE_CQ: begin
+        return ordinal == 1 ? "CQ_PD" : "CQ_RING";
+      end
+      RDMA_RESOURCE_SRQ: begin
+        if (include_sgb) begin
+          case (ordinal)
+            1: return "SRFQ_PD";
+            2: return "SRQ_PD";
+            3: return "SRQ_SGB";
+            4: return "SRFQ_RING";
+            default: return "SRQ_RING";
+          endcase
+        end
+        case (ordinal)
+          1: return "SRFQ_PD";
+          2: return "SRQ_PD";
+          3: return "SRFQ_RING";
+          default: return "SRQ_RING";
+        endcase
+      end
+      RDMA_RESOURCE_CEQ: begin
+        return ordinal == 1 ? "CEQ_PD" : "CEQ_RING";
+      end
+      default: begin
+        return ordinal == 1 ? "AEQ_PD" : "AEQ_RING";
+      end
+    endcase
+  endfunction
+
+  virtual function rdma_status \release (rdma_dma_mapping mapping);
+    rdma_status status;
+    string role;
+    bit is_pd;
+
+    status = super.\release (mapping);
+    if (status != null && status.ok() && shared_trace != null) begin
+      release_ordinal++;
+      role = release_role(release_ordinal);
+      is_pd = (queue_kind == RDMA_RESOURCE_CQ && release_ordinal == 1) ||
+              (queue_kind == RDMA_RESOURCE_SRQ && release_ordinal <= 2) ||
+              (queue_kind inside {RDMA_RESOURCE_CEQ, RDMA_RESOURCE_AEQ} &&
+               release_ordinal == 1);
+      if (is_pd)
+        shared_trace.record({"host_release:", role});
+      else
+        shared_trace.record({"detach_or_release:", role});
+    end
+    return status;
+  endfunction
+endclass
+
+class rdma_queue_destroy_trace_context extends rdma_queue_executor_trace_context;
+  `uvm_object_utils(rdma_queue_destroy_trace_context)
+
+  function new(string name = "rdma_queue_destroy_trace_context");
+    super.new(name);
+  endfunction
+
+  virtual function rdma_status \release (
+    rdma_context_backing_ref context_ref
+  );
+    rdma_status status;
+
+    status = super.\release (context_ref);
+    if (status != null && status.ok() && shared_trace != null)
+      shared_trace.record("context_release");
+    return status;
+  endfunction
+endclass
+
+class rdma_queue_destroy_trace_cmq extends rdma_mock_cmq_port;
+  `uvm_object_utils(rdma_queue_destroy_trace_cmq)
+
+  rdma_mock_call_trace semantic_trace;
+  rdma_resource_kind_e destroy_kind;
+  int unsigned destroy_call_ordinal;
+  bit trace_destroy;
+  bit reject_next_flush;
+  int unsigned reject_flush_ordinal;
+  int unsigned flush_attempt_ordinal;
+  rdma_status reject_flush_status;
+  bit lose_next_completion;
+
+  function new(string name = "rdma_queue_destroy_trace_cmq");
+    super.new(name);
+    semantic_trace = null;
+    destroy_kind = RDMA_RESOURCE_CQ;
+    destroy_call_ordinal = 0;
+    trace_destroy = 1'b0;
+    reject_next_flush = 1'b0;
+    reject_flush_ordinal = 1;
+    flush_attempt_ordinal = 0;
+    reject_flush_status = null;
+    lose_next_completion = 1'b0;
+  endfunction
+
+  function void begin_destroy_trace(
+    rdma_mock_call_trace trace,
+    rdma_resource_kind_e kind
+  );
+    semantic_trace = trace;
+    destroy_kind = kind;
+    destroy_call_ordinal = 0;
+    flush_attempt_ordinal = 0;
+    trace_destroy = 1'b1;
+  endfunction
+
+  protected function string flush_role(int unsigned ordinal);
+    if (destroy_kind == RDMA_RESOURCE_SRQ)
+      return ordinal == 1 ? "SRFQ_PD" : "SRQ_PD";
+    return "CQ_PD";
+  endfunction
+
+  virtual task execute(
+    rdma_cmq_command_desc command,
+    output rdma_cmq_ticket ticket,
+    output rdma_cmq_completion completion,
+    output rdma_status status
+  );
+    rdma_mock_call_trace saved_trace;
+    int unsigned prior_calls;
+    bit is_flush;
+
+    prior_calls = calls.size();
+    is_flush = command != null && command.opcode_key != null &&
+               command.opcode_key.opcode[7:0] == XTR_V1_OP_OCC_FLUSH;
+    if (is_flush)
+      flush_attempt_ordinal++;
+    if (reject_next_flush && is_flush &&
+        flush_attempt_ordinal == reject_flush_ordinal) begin
+      reject_next_flush = 1'b0;
+      ticket = null;
+      completion = null;
+      status = reject_flush_status == null ?
+        rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                          "injected pre-submit flush validation failure") :
+        rdma_cmq_clone_status_value(reject_flush_status);
+      return;
+    end
+    saved_trace = call_trace;
+    if (trace_destroy)
+      call_trace = null;
+    super.execute(command, ticket, completion, status);
+    call_trace = saved_trace;
+    if (lose_next_completion && trace_destroy && calls.size() > prior_calls &&
+        destroy_call_ordinal == 0) begin
+      // Only consume this injection for the first destructive command.  The
+      // completion is deliberately removed after the CMQ has allocated its
+      // ticket, modelling a lost/null completion at the executor boundary.
+      lose_next_completion = 1'b0;
+      completion = null;
+    end
+    if (trace_destroy && semantic_trace != null && calls.size() > prior_calls) begin
+      destroy_call_ordinal++;
+      if (is_flush)
+        semantic_trace.record({"cmq:0a:", flush_role(destroy_call_ordinal)});
+      else
+        semantic_trace.record($sformatf("cmq:%02x",
+                                        calls[calls.size()-1].opcode));
+    end
+  endtask
+endclass
+
 class rdma_queue_executor_generation_fail extends
   rdma_queue_lifecycle_executor;
   `uvm_object_utils(rdma_queue_executor_generation_fail)
@@ -2214,6 +2399,139 @@ class rdma_queue_lifecycle_test extends uvm_test;
     endcase
   endfunction
 
+  function automatic rdma_create_srq_req make_executor_srq_request(
+    string name,
+    rdma_function_binding binding,
+    rdma_pd dependency,
+    int unsigned max_sge = 4
+  );
+    rdma_create_srq_req request;
+
+    request = rdma_create_srq_req::type_id::create(name);
+    request.owner = binding.make_handle();
+    request.depth = 64;
+    request.max_sge = max_sge;
+    request.limit_threshold = 16;
+    request.pd_h = dependency == null ? null : dependency.handle;
+    request.payload_backing.mode = RDMA_QUEUE_BACKING_OWNED;
+    return request;
+  endfunction
+
+  // Build one real ACTIVE queue through the lifecycle executor and return all
+  // adapters needed by a subsequent destroy/failure assertion.  Keeping each
+  // case isolated ensures that release authority from one scenario cannot
+  // accidentally satisfy another scenario.
+  task automatic create_destroy_fixture(
+    string label,
+    rdma_resource_kind_e kind,
+    output rdma_function_binding binding,
+    output rdma_fault_inject_resource_manager manager,
+    output rdma_queue_destroy_trace_mem mem,
+    output rdma_queue_destroy_trace_context context_backing,
+    output rdma_queue_destroy_trace_cmq cmq,
+    output rdma_mock_call_trace trace,
+    output rdma_queue_lifecycle_executor executor,
+    output rdma_queue_resource queue,
+    output rdma_control_result create_result,
+    output rdma_ceq ceq_dependency,
+    output rdma_pd pd_dependency
+  );
+    rdma_semantic_request request;
+
+    binding = make_binding({label, "_binding"});
+    manager = rdma_fault_inject_resource_manager::type_id::create(
+      {label, "_manager"}
+    );
+    ceq_dependency = null;
+    pd_dependency = null;
+    if (kind == RDMA_RESOURCE_CQ)
+      expect_status({label, "_CEQ"},
+                    manager.create_ceq(binding, ceq_dependency), RDMA_SC_OK);
+    else if (kind == RDMA_RESOURCE_SRQ)
+      expect_status({label, "_PD"},
+                    manager.create_pd(binding, pd_dependency), RDMA_SC_OK);
+
+    mem = rdma_queue_destroy_trace_mem::type_id::create(
+      {label, "_mem"}
+    );
+    mem.queue_kind = kind;
+    mem.include_sgb = kind == RDMA_RESOURCE_SRQ;
+    context_backing = rdma_queue_destroy_trace_context::type_id::create(
+      {label, "_context"}
+    );
+    cmq = rdma_queue_destroy_trace_cmq::type_id::create(
+      {label, "_cmq"}
+    );
+    trace = rdma_mock_call_trace::type_id::create({label, "_trace"});
+    mem.set_shared_trace(trace);
+    context_backing.set_call_trace(trace);
+    cmq.set_call_trace(trace);
+    executor = rdma_queue_lifecycle_executor::type_id::create(
+      {label, "_executor"}
+    );
+    expect_status({label, "_CONFIGURE"}, executor.configure(
+      manager, cmq, mem, context_backing, 100ns
+    ), RDMA_SC_OK);
+
+    if (kind == RDMA_RESOURCE_SRQ)
+      request = make_executor_srq_request({label, "_request"}, binding,
+                                           pd_dependency, 4);
+    else
+      request = make_executor_request({label, "_request"}, kind, binding,
+                                       ceq_dependency, 1'b0);
+    queue = null;
+    create_result = null;
+    executor.create_locked(binding, binding.make_handle(), request,
+                           64'd1000, queue, create_result);
+    if (create_result == null || !create_result.ok() || queue == null ||
+        queue.state != RDMA_RESOURCE_ACTIVE)
+      `uvm_error(label, $sformatf(
+        "fixture did not publish ACTIVE queue: %s",
+        create_result == null || create_result.status == null ? "null" :
+          create_result.status.convert2string()))
+
+    trace.clear();
+    context_backing.call_trace.delete();
+    cmq.begin_destroy_trace(trace, kind);
+    mem.reset_destroy_trace();
+  endtask
+
+  function automatic rdma_destroy_resource_req make_destroy_request(
+    string name,
+    rdma_function_binding binding,
+    rdma_handle target
+  );
+    rdma_destroy_resource_req request;
+
+    request = rdma_destroy_resource_req::type_id::create(name);
+    request.owner = binding.make_handle();
+    request.target_h = target;
+    return request;
+  endfunction
+
+  function automatic void expect_destroy_trace(
+    string label,
+    rdma_mock_call_trace trace,
+    string expected[$]
+  );
+    if (trace == null || trace.calls.size() != expected.size()) begin
+      if (trace == null)
+        `uvm_error(label, $sformatf(
+          "destroy trace is null, expected %0d calls", expected.size()))
+      else
+        `uvm_error(label, $sformatf(
+          "destroy trace has %0d calls, expected %0d: %p",
+          trace.calls.size(), expected.size(), trace.calls))
+      return;
+    end
+    foreach (expected[i]) begin
+      if (trace.calls[i] != expected[i])
+        `uvm_error(label, $sformatf(
+          "destroy trace[%0d] is %s, expected %s", i,
+          trace.calls[i], expected[i]))
+    end
+  endfunction
+
   function automatic int unsigned count_executor_host_calls(
     rdma_mock_host_mem mem, string method_name
   );
@@ -3493,6 +3811,485 @@ class rdma_queue_lifecycle_test extends uvm_test;
       `uvm_error("OPTIONAL_CONTEXT_CEQ", "EQ create did not allow null context")
   endtask
 
+  task automatic check_destroy_success_traces();
+    rdma_resource_kind_e kinds[$];
+
+    kinds.push_back(RDMA_RESOURCE_CQ);
+    kinds.push_back(RDMA_RESOURCE_SRQ);
+    kinds.push_back(RDMA_RESOURCE_CEQ);
+    kinds.push_back(RDMA_RESOURCE_AEQ);
+    foreach (kinds[kind_index]) begin
+      string label;
+      string expected[$];
+      rdma_resource_kind_e kind;
+      rdma_function_binding binding;
+      rdma_fault_inject_resource_manager manager;
+      rdma_queue_destroy_trace_mem mem;
+      rdma_queue_destroy_trace_context context_backing;
+      rdma_queue_destroy_trace_cmq cmq;
+      rdma_mock_call_trace trace;
+      rdma_queue_lifecycle_executor executor;
+      rdma_queue_resource queue;
+      rdma_control_result create_result;
+      rdma_control_result result;
+      rdma_ceq ceq_dependency;
+      rdma_pd pd_dependency;
+      rdma_destroy_resource_req request;
+      rdma_resource looked_up;
+      rdma_status status;
+      int unsigned cmq_before;
+      int unsigned expected_cmq_calls;
+
+      kind = kinds[kind_index];
+      label = $sformatf("DESTROY_%s_SUCCESS", kind.name());
+      create_destroy_fixture(label, kind, binding, manager, mem,
+                             context_backing, cmq, trace, executor, queue,
+                             create_result, ceq_dependency, pd_dependency);
+      if (queue == null || create_result == null || !create_result.ok())
+        continue;
+      request = make_destroy_request({label, "_request"}, binding,
+                                     queue.handle);
+      cmq_before = cmq.calls.size();
+      result = null;
+      executor.destroy_locked(binding, binding.make_handle(), request,
+                              64'd1100 + kind_index, result);
+      case (kind)
+        RDMA_RESOURCE_CQ: begin
+          expected = '{"cmq:0e", "cmq:0a:CQ_PD", "context_release",
+                       "host_release:CQ_PD", "detach_or_release:CQ_RING"};
+          expected_cmq_calls = 2;
+        end
+        RDMA_RESOURCE_SRQ: begin
+          expected = '{"cmq:0a:SRFQ_PD", "cmq:0a:SRQ_PD", "cmq:37",
+                       "context_release", "host_release:SRFQ_PD",
+                       "host_release:SRQ_PD", "detach_or_release:SRQ_SGB",
+                       "detach_or_release:SRFQ_RING",
+                       "detach_or_release:SRQ_RING"};
+          expected_cmq_calls = 3;
+        end
+        RDMA_RESOURCE_CEQ: begin
+          expected = '{"cmq:12", "host_release:CEQ_PD",
+                       "detach_or_release:CEQ_RING"};
+          expected_cmq_calls = 1;
+        end
+        default: begin
+          expected = '{"cmq:16", "host_release:AEQ_PD",
+                       "detach_or_release:AEQ_RING"};
+          expected_cmq_calls = 1;
+        end
+      endcase
+      expect_destroy_trace(label, trace, expected);
+      if (result == null || result.status == null || !result.ok() ||
+          result.final_resource_state != RDMA_RESOURCE_RELEASED ||
+          !result.final_resource_state_known || result.recovery_required ||
+          cmq.calls.size() != cmq_before + expected_cmq_calls)
+        `uvm_error(label, $sformatf(
+          "destroy did not complete atomically: result=%s cmq=%0d/%0d",
+          result == null || result.status == null ? "null" :
+            result.status.convert2string(), cmq.calls.size(),
+          cmq_before + expected_cmq_calls))
+      status = manager.lookup(request.target_h, looked_up);
+      expect_status({label, "_LOOKUP_RELEASED"}, status,
+                    RDMA_SC_INVALID_STATE);
+      if (kind == RDMA_RESOURCE_CQ && ceq_dependency != null)
+        expect_status({label, "_CEQ_RELEASE"},
+                      manager.release_reserved(ceq_dependency.handle),
+                      RDMA_SC_OK);
+      if (kind == RDMA_RESOURCE_SRQ && pd_dependency != null)
+        expect_status({label, "_PD_RELEASE"},
+                      manager.release_reserved(pd_dependency.handle),
+                      RDMA_SC_OK);
+    end
+  endtask
+
+  task automatic check_destroy_busy_guards();
+    string label;
+    rdma_function_binding binding;
+    rdma_fault_inject_resource_manager manager;
+    rdma_queue_destroy_trace_mem mem;
+    rdma_queue_destroy_trace_context context_backing;
+    rdma_queue_destroy_trace_cmq cmq;
+    rdma_mock_call_trace trace;
+    rdma_queue_lifecycle_executor executor;
+    rdma_queue_resource queue;
+    rdma_control_result create_result;
+    rdma_control_result result;
+    rdma_ceq ceq_dependency;
+    rdma_pd pd_dependency;
+    rdma_pd qp_pd;
+    rdma_cq qp_cq;
+    rdma_qp qp;
+    rdma_destroy_resource_req request;
+    rdma_resource looked_up;
+    rdma_status status;
+    int unsigned cmq_before;
+
+    // A QP retaining a CQ is a real dependency edge in the manager graph.
+    label = "DESTROY_BUSY_CQ_DEPENDENT_QP";
+    create_destroy_fixture(label, RDMA_RESOURCE_CQ, binding, manager, mem,
+                           context_backing, cmq, trace, executor, queue,
+                           create_result, ceq_dependency, pd_dependency);
+    status = manager.create_pd(binding, qp_pd);
+    expect_status({label, "_QP_PD"}, status, RDMA_SC_OK);
+    qp = null;
+    status = manager.create_qp(binding, qp_pd.handle, queue.handle,
+                               queue.handle, null, qp);
+    expect_status({label, "_QP"}, status, RDMA_SC_OK);
+    request = make_destroy_request({label, "_request"}, binding, queue.handle);
+    cmq_before = cmq.calls.size();
+    result = null;
+    executor.destroy_locked(binding, binding.make_handle(), request, 64'd1200,
+                            result);
+    if (result == null || result.status == null ||
+        result.status.code != RDMA_SC_RESOURCE_BUSY ||
+        result.final_resource_state_known || cmq.calls.size() != cmq_before)
+      `uvm_error(label, "CQ dependent destroy submitted or changed state")
+    status = manager.lookup(queue.handle, looked_up);
+    expect_status({label, "_ACTIVE"}, status, RDMA_SC_OK);
+    if (looked_up == null || looked_up.state != RDMA_RESOURCE_ACTIVE)
+      `uvm_error(label, "CQ dependent busy guard did not preserve ACTIVE")
+    expect_status({label, "_QP_RELEASE"}, manager.release_reserved(qp.handle),
+                  RDMA_SC_OK);
+    trace.clear();
+    cmq.begin_destroy_trace(trace, RDMA_RESOURCE_CQ);
+    mem.reset_destroy_trace();
+    executor.destroy_locked(binding, binding.make_handle(), request, 64'd1201,
+                            result);
+    if (result == null || !result.ok())
+      `uvm_error(label, "CQ destroy did not succeed after dependent release")
+    expect_status({label, "_QP_PD_RELEASE"},
+                  manager.release_reserved(qp_pd.handle), RDMA_SC_OK);
+    expect_status({label, "_CEQ_RELEASE"},
+                  manager.release_reserved(ceq_dependency.handle), RDMA_SC_OK);
+
+    // An SRQ dependency is independently guarded; use a bare ALLOCATED CQ
+    // for the QP's mandatory send/receive CQ references.
+    label = "DESTROY_BUSY_SRQ_DEPENDENT_QP";
+    create_destroy_fixture(label, RDMA_RESOURCE_SRQ, binding, manager, mem,
+                           context_backing, cmq, trace, executor, queue,
+                           create_result, ceq_dependency, pd_dependency);
+    status = manager.create_cq(binding, null, qp_cq);
+    expect_status({label, "_QP_CQ"}, status, RDMA_SC_OK);
+    qp = null;
+    status = manager.create_qp(binding, pd_dependency.handle, qp_cq.handle,
+                               qp_cq.handle, queue.handle, qp);
+    expect_status({label, "_QP"}, status, RDMA_SC_OK);
+    request = make_destroy_request({label, "_request"}, binding, queue.handle);
+    cmq_before = cmq.calls.size();
+    executor.destroy_locked(binding, binding.make_handle(), request, 64'd1210,
+                            result);
+    if (result == null || result.status == null ||
+        result.status.code != RDMA_SC_RESOURCE_BUSY ||
+        result.final_resource_state_known || cmq.calls.size() != cmq_before)
+      `uvm_error(label, "SRQ dependent destroy submitted or changed state")
+    expect_status({label, "_QP_RELEASE"}, manager.release_reserved(qp.handle),
+                  RDMA_SC_OK);
+    expect_status({label, "_QP_CQ_RELEASE"},
+                  manager.release_reserved(qp_cq.handle), RDMA_SC_OK);
+    trace.clear();
+    cmq.begin_destroy_trace(trace, RDMA_RESOURCE_SRQ);
+    mem.reset_destroy_trace();
+    executor.destroy_locked(binding, binding.make_handle(), request, 64'd1211,
+                            result);
+    if (result == null || !result.ok())
+      `uvm_error(label, "SRQ destroy did not succeed after dependent release")
+    expect_status({label, "_PD_RELEASE"},
+                  manager.release_reserved(pd_dependency.handle), RDMA_SC_OK);
+
+    // Outstanding operation tracking is a separate busy source and must be
+    // rejected before any CMQ submission as well.
+    label = "DESTROY_BUSY_OUTSTANDING";
+    create_destroy_fixture(label, RDMA_RESOURCE_CEQ, binding, manager, mem,
+                           context_backing, cmq, trace, executor, queue,
+                           create_result, ceq_dependency, pd_dependency);
+    expect_status({label, "_TRACK"}, manager.track_outstanding(
+      queue.handle, 64'hd357_0001), RDMA_SC_OK);
+    request = make_destroy_request({label, "_request"}, binding, queue.handle);
+    cmq_before = cmq.calls.size();
+    executor.destroy_locked(binding, binding.make_handle(), request, 64'd1220,
+                            result);
+    if (result == null || result.status == null ||
+        result.status.code != RDMA_SC_RESOURCE_BUSY ||
+        result.final_resource_state_known || cmq.calls.size() != cmq_before)
+      `uvm_error(label, "outstanding operation bypassed destroy busy guard")
+    expect_status({label, "_RETIRE"}, manager.retire_outstanding(
+      queue.handle, 64'hd357_0001), RDMA_SC_OK);
+    trace.clear();
+    cmq.begin_destroy_trace(trace, RDMA_RESOURCE_CEQ);
+    mem.reset_destroy_trace();
+    executor.destroy_locked(binding, binding.make_handle(), request, 64'd1221,
+                            result);
+    if (result == null || !result.ok())
+      `uvm_error(label, "outstanding busy resource did not destroy after retire")
+  endtask
+
+  task automatic check_destroy_srq_restore_retry();
+    string label;
+    string expected[$];
+    rdma_function_binding binding;
+    rdma_fault_inject_resource_manager manager;
+    rdma_queue_destroy_trace_mem mem;
+    rdma_queue_destroy_trace_context context_backing;
+    rdma_queue_destroy_trace_cmq cmq;
+    rdma_mock_call_trace trace;
+    rdma_queue_lifecycle_executor executor;
+    rdma_queue_resource queue;
+    rdma_control_result create_result;
+    rdma_control_result result;
+    rdma_ceq ceq_dependency;
+    rdma_pd pd_dependency;
+    rdma_destroy_resource_req request;
+    rdma_resource snapshot;
+    rdma_srq srq_snapshot;
+    rdma_status status;
+    int unsigned cmq_before;
+
+    label = "DESTROY_SRQ_RESTORE_RETRY";
+    create_destroy_fixture(label, RDMA_RESOURCE_SRQ, binding, manager, mem,
+                           context_backing, cmq, trace, executor, queue,
+                           create_result, ceq_dependency, pd_dependency);
+    request = make_destroy_request({label, "_request"}, binding, queue.handle);
+    cmq.reject_next_flush = 1'b1;
+    cmq.reject_flush_ordinal = 2;
+    cmq.reject_flush_status = rdma_status::make(
+      RDMA_SC_INVALID_ARGUMENT, "injected second-flush pre-submit failure");
+    cmq_before = cmq.calls.size();
+    result = null;
+    executor.destroy_locked(binding, binding.make_handle(), request, 64'd1300,
+                            result);
+    expected = '{"cmq:0a:SRFQ_PD"};
+    expect_destroy_trace({label, "_FIRST_TRACE"}, trace, expected);
+    if (result == null || result.status == null ||
+        result.status.code != RDMA_SC_INVALID_ARGUMENT ||
+        result.final_resource_state != RDMA_RESOURCE_ACTIVE ||
+        !result.final_resource_state_known || result.recovery_required ||
+        cmq.calls.size() != cmq_before + 1 ||
+        mem.release_ordinal != 0 || context_backing.release_call_count != 0)
+      `uvm_error(label,
+                 "pre-submit SRQ flush failure did not restore ACTIVE safely")
+    status = manager.lookup(queue.handle, snapshot);
+    expect_status({label, "_ACTIVE_LOOKUP"}, status, RDMA_SC_OK);
+    if (!$cast(srq_snapshot, snapshot) || srq_snapshot == null ||
+        srq_snapshot.state != RDMA_RESOURCE_ACTIVE ||
+        srq_snapshot.queue_plan == null ||
+        srq_snapshot.queue_plan.flush_targets.size() != 2)
+      `uvm_error(label, "restored SRQ snapshot is not typed or complete")
+    else begin
+      foreach (srq_snapshot.queue_plan.flush_targets[i])
+        if (srq_snapshot.queue_plan.flush_targets[i] == null ||
+            srq_snapshot.queue_plan.flush_targets[i].flush_complete)
+          `uvm_error(label, "restored SRQ retained stale flush progress")
+    end
+    foreach (cmq.calls[i]) begin
+      if (i > cmq_before && cmq.calls[i].opcode == XTR_V1_OP_SRFQC_DELETE)
+        `uvm_error(label, "failed second flush issued SRQ delete")
+    end
+
+    trace.clear();
+    cmq.begin_destroy_trace(trace, RDMA_RESOURCE_SRQ);
+    mem.reset_destroy_trace();
+    executor.destroy_locked(binding, binding.make_handle(), request, 64'd1301,
+                            result);
+    expected = '{"cmq:0a:SRFQ_PD", "cmq:0a:SRQ_PD", "cmq:37",
+                 "context_release", "host_release:SRFQ_PD",
+                 "host_release:SRQ_PD", "detach_or_release:SRQ_SGB",
+                 "detach_or_release:SRFQ_RING", "detach_or_release:SRQ_RING"};
+    expect_destroy_trace({label, "_RETRY_TRACE"}, trace, expected);
+    if (result == null || !result.ok() || cmq.calls.size() != cmq_before + 4)
+      `uvm_error(label, "SRQ retry did not resend both flushes and delete")
+    expect_status({label, "_PD_RELEASE"},
+                  manager.release_reserved(pd_dependency.handle), RDMA_SC_OK);
+  endtask
+
+  task automatic check_destroy_failure_matrix();
+    for (int unsigned scenario = 0; scenario < 4; scenario++) begin
+      string label;
+      string expected[$];
+      rdma_function_binding binding;
+      rdma_fault_inject_resource_manager manager;
+      rdma_queue_destroy_trace_mem mem;
+      rdma_queue_destroy_trace_context context_backing;
+      rdma_queue_destroy_trace_cmq cmq;
+      rdma_mock_call_trace trace;
+      rdma_queue_lifecycle_executor executor;
+      rdma_queue_resource queue;
+      rdma_control_result create_result;
+      rdma_control_result result;
+      rdma_ceq ceq_dependency;
+      rdma_pd pd_dependency;
+      rdma_destroy_resource_req request;
+      rdma_resource error_resource;
+      rdma_recovery_record recovery;
+      rdma_status injected;
+      rdma_status status;
+      int unsigned cmq_before;
+
+      label = $sformatf("DESTROY_CQ_FAILURE_%0d", scenario);
+      create_destroy_fixture(label, RDMA_RESOURCE_CQ, binding, manager, mem,
+                             context_backing, cmq, trace, executor, queue,
+                             create_result, ceq_dependency, pd_dependency);
+      request = make_destroy_request({label, "_request"}, binding,
+                                     queue.handle);
+      case (scenario)
+        0: begin
+          injected = rdma_status::make(RDMA_SC_UNKNOWN_HW_ERROR,
+                                       "ticketed nonzero hardware ecode");
+          injected.hardware_code_valid = 1'b1;
+          injected.hardware_code = 16'h5a5a;
+          cmq.fail_opcode(XTR_V1_OP_CQC_DELETE, injected);
+        end
+        1: cmq.timeout_opcode(XTR_V1_OP_CQC_DELETE);
+        2: cmq.fail_opcode(XTR_V1_OP_CQC_DELETE,
+                           rdma_status::make(RDMA_SC_RESET_CANCELLED,
+                                              "destroy reset cancelled"));
+        default: cmq.lose_next_completion = 1'b1;
+      endcase
+      cmq_before = cmq.calls.size();
+      result = null;
+      executor.destroy_locked(binding, binding.make_handle(), request,
+                              64'd1400 + scenario, result);
+      expected = '{"cmq:0e"};
+      expect_destroy_trace(label, trace, expected);
+      if (result == null || result.status == null ||
+          result.status.code != RDMA_SC_RECOVERY_REQUIRED ||
+          !result.recovery_required || result.final_resource_state !=
+            RDMA_RESOURCE_ERROR || !result.final_resource_state_known ||
+          cmq.calls.size() != cmq_before + 1 ||
+          mem.release_ordinal != 0 || context_backing.release_call_count != 0)
+        `uvm_error(label, "destructive failure did not stop in ERROR recovery")
+      status = manager.lookup(request.target_h, error_resource);
+      expect_status({label, "_ERROR_LOOKUP"}, status, RDMA_SC_OK);
+      if (error_resource == null || error_resource.state != RDMA_RESOURCE_ERROR)
+        `uvm_error(label, "failure did not publish an ERROR queue")
+      status = manager.lookup_recovery(request.target_h, recovery);
+      expect_status({label, "_RECOVERY"}, status, RDMA_SC_OK);
+      if (recovery == null || recovery.queue_plan == null ||
+          recovery.ambiguous_ticket == null ||
+          recovery.ambiguous_queue_operation != (scenario == 0 ?
+            RDMA_QUEUE_AMBIG_NONE : RDMA_QUEUE_AMBIG_DELETE) ||
+          count_executor_recovery_step(recovery.pending_steps,
+                                        RDMA_CTRL_STEP_HW_CONTEXT_DELETED) != 1 ||
+          count_executor_recovery_step(recovery.pending_steps,
+                                        RDMA_CTRL_STEP_BACKING_RELEASED) != 1)
+        `uvm_error(label, "recovery lost ticket/operation/cleanup authority")
+      if (scenario == 0 &&
+          (recovery.primary_status == null ||
+           !recovery.primary_status.hardware_code_valid ||
+           recovery.primary_status.hardware_code != 16'h5a5a))
+        `uvm_error(label, "ticketed hardware ecode was not preserved")
+      if (scenario == 1 &&
+          (result.primary_status == null ||
+           result.primary_status.code != RDMA_SC_TIMEOUT))
+        `uvm_error(label, "timeout status was not retained as primary")
+      if (scenario == 2 &&
+          (result.primary_status == null ||
+           result.primary_status.code != RDMA_SC_RESET_CANCELLED))
+        `uvm_error(label, "reset-cancel status was not retained as primary")
+    end
+  endtask
+
+  task automatic check_destroy_srq_flush_failure();
+    string label;
+    string expected[$];
+    rdma_function_binding binding;
+    rdma_fault_inject_resource_manager manager;
+    rdma_queue_destroy_trace_mem mem;
+    rdma_queue_destroy_trace_context context_backing;
+    rdma_queue_destroy_trace_cmq cmq;
+    rdma_mock_call_trace trace;
+    rdma_queue_lifecycle_executor executor;
+    rdma_queue_resource queue;
+    rdma_control_result create_result;
+    rdma_control_result result;
+    rdma_ceq ceq_dependency;
+    rdma_pd pd_dependency;
+    rdma_destroy_resource_req request;
+    rdma_recovery_record recovery;
+    rdma_resource error_resource;
+    rdma_status status;
+
+    label = "DESTROY_SRQ_FLUSH_RESET";
+    create_destroy_fixture(label, RDMA_RESOURCE_SRQ, binding, manager, mem,
+                           context_backing, cmq, trace, executor, queue,
+                           create_result, ceq_dependency, pd_dependency);
+    cmq.fail_opcode(XTR_V1_OP_OCC_FLUSH,
+                    rdma_status::make(RDMA_SC_RESET_CANCELLED,
+                                      "SRQ flush reset cancelled"));
+    request = make_destroy_request({label, "_request"}, binding, queue.handle);
+    result = null;
+    executor.destroy_locked(binding, binding.make_handle(), request, 64'd1450,
+                            result);
+    expected = '{"cmq:0a:SRFQ_PD"};
+    expect_destroy_trace(label, trace, expected);
+    if (result == null || result.status == null ||
+        result.status.code != RDMA_SC_RECOVERY_REQUIRED ||
+        result.primary_status == null ||
+        result.primary_status.code != RDMA_SC_RESET_CANCELLED ||
+        mem.release_ordinal != 0 || context_backing.release_call_count != 0)
+      `uvm_error(label, "SRQ flush reset did not stop recipe in ERROR")
+    status = manager.lookup_recovery(queue.handle, recovery);
+    expect_status({label, "_RECOVERY"}, status, RDMA_SC_OK);
+    if (recovery == null || recovery.ambiguous_queue_operation !=
+          RDMA_QUEUE_AMBIG_OCC_FLUSH || recovery.ambiguous_ticket == null)
+      `uvm_error(label, "SRQ flush reset lost OCC_FLUSH ticket authority")
+    status = manager.lookup(queue.handle, error_resource);
+    expect_status({label, "_ERROR"}, status, RDMA_SC_OK);
+    if (error_resource == null || error_resource.state != RDMA_RESOURCE_ERROR)
+      `uvm_error(label, "SRQ flush reset did not publish ERROR")
+  endtask
+
+  task automatic check_public_destroy_success();
+    rdma_control_plane control;
+    rdma_resource_manager manager;
+    rdma_mock_cmq_port cmq;
+    rdma_mock_stag_key_policy key_policy;
+    rdma_mock_host_mem host_mem;
+    rdma_function_binding binding;
+    rdma_create_ceq_req request;
+    rdma_destroy_resource_req destroy_request;
+    rdma_ceq ceq;
+    rdma_control_result result;
+    rdma_resource looked_up;
+    rdma_status status;
+    int unsigned cmq_before;
+    int unsigned release_before;
+
+    control = rdma_control_plane::type_id::create("PUBLIC_DESTROY_control");
+    manager = rdma_resource_manager::type_id::create("PUBLIC_DESTROY_manager");
+    cmq = rdma_mock_cmq_port::type_id::create("PUBLIC_DESTROY_cmq");
+    key_policy = rdma_mock_stag_key_policy::type_id::create(
+      "PUBLIC_DESTROY_key_policy");
+    host_mem = rdma_mock_host_mem::type_id::create("PUBLIC_DESTROY_mem");
+    binding = make_binding("PUBLIC_DESTROY_binding");
+    status = control.configure(manager, cmq, key_policy, host_mem, null, null,
+                               100ns);
+    expect_status("PUBLIC_DESTROY_CONFIGURE", status, RDMA_SC_OK);
+    request = rdma_create_ceq_req::type_id::create("PUBLIC_DESTROY_request");
+    request.owner = binding.make_handle();
+    request.depth = 64;
+    request.vector_id = 3;
+    control.create_ceq(binding, request, ceq, result);
+    if (ceq == null || result == null || !result.ok()) begin
+      `uvm_error("PUBLIC_DESTROY_CREATE", "public CEQ fixture failed")
+      return;
+    end
+    cmq_before = cmq.calls.size();
+    release_before = count_executor_host_calls(host_mem, "release");
+    destroy_request = make_destroy_request("PUBLIC_DESTROY_destroy_request",
+                                           binding, ceq.handle);
+    control.destroy_ceq(binding, destroy_request, result);
+    if (result == null || result.status == null || !result.ok() ||
+        result.final_resource_state != RDMA_RESOURCE_RELEASED ||
+        cmq.calls.size() != cmq_before + 1 ||
+        cmq.calls[cmq.calls.size()-1].opcode != XTR_V1_OP_CEQC_DELETE ||
+        count_executor_host_calls(host_mem, "release") != release_before + 2)
+      `uvm_error("PUBLIC_DESTROY_SUCCESS",
+                 "public CEQ destroy did not complete in order")
+    status = manager.lookup(ceq.handle, looked_up);
+    expect_status("PUBLIC_DESTROY_RELEASED_LOOKUP", status,
+                  RDMA_SC_INVALID_STATE);
+  endtask
+
   task automatic check_destroy_recipe_contract();
     rdma_queue_lifecycle_policy policy;
     rdma_queue_backing_role_e fr[$], lr[$];
@@ -3541,6 +4338,12 @@ class rdma_queue_lifecycle_test extends uvm_test;
     check_backing_planner_rollback_and_cleanup();
     check_contexts_and_commands();
     check_executor_context_optional_for_eq();
+    check_destroy_success_traces();
+    check_destroy_busy_guards();
+    check_destroy_srq_restore_retry();
+    check_destroy_failure_matrix();
+    check_destroy_srq_flush_failure();
+    check_public_destroy_success();
     check_destroy_recipe_contract();
     check_destroy_invalid_matrix();
     check_create_executor();
