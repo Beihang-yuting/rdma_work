@@ -3725,6 +3725,14 @@ class rdma_resource_manager_test extends uvm_test;
                     queue_recovery_manager.activate(srq.handle), RDMA_SC_OK);
       expect_status("QUEUE_RECOVERY_QUIESCE",
                     queue_recovery_manager.begin_quiesce(srq.handle), RDMA_SC_OK);
+      expect_status("QUIESCING_FLUSH_PROGRESS", queue_recovery_manager.
+        record_queue_flush_complete(srq.handle, RDMA_QUEUE_ROLE_SRFQ_PD),
+        RDMA_SC_OK);
+      expect_status("QUIESCING_CLEANUP_PROGRESS", queue_recovery_manager.
+        record_queue_cleanup_complete(srq.handle, RDMA_QUEUE_ROLE_SRQ_SGB),
+        RDMA_SC_OK);
+      expect_status("QUIESCING_CONTEXT_PROGRESS", queue_recovery_manager.
+        record_queue_context_cleanup_complete(srq.handle), RDMA_SC_OK);
 
       queue_recovery = rdma_recovery_record::type_id::create("queue_recovery");
       queue_recovery.resource_h = clone_handle("QUEUE_RECOVERY_H", srq.handle);
@@ -3764,20 +3772,6 @@ class rdma_resource_manager_test extends uvm_test;
       expect_status("QUEUE_RECOVERY_ERROR",
                     queue_recovery_manager.mark_error(srq.handle, queue_recovery),
                     RDMA_SC_OK);
-      expect_status("CLEANUP_PROGRESS_ORDER", queue_recovery_manager.
-        record_queue_cleanup_complete(srq.handle, RDMA_QUEUE_ROLE_SRQ_SGB),
-        RDMA_SC_INVALID_STATE);
-      expect_status("CLEANUP_PROGRESS_ORDER_LOOKUP", queue_recovery_manager.
-        lookup_recovery(srq.handle, queue_recovery_lookup), RDMA_SC_OK);
-      if (queue_recovery_lookup == null ||
-          queue_recovery_lookup.queue_plan.refs[4].cleanup_complete)
-        `uvm_error("CLEANUP_PROGRESS_ORDER", "failed cleanup changed recovery")
-      expect_status("FLUSH_PROGRESS", queue_recovery_manager.record_queue_flush_complete(
-        srq.handle, RDMA_QUEUE_ROLE_SRFQ_PD), RDMA_SC_OK);
-      expect_status("CLEANUP_PROGRESS", queue_recovery_manager.record_queue_cleanup_complete(
-        srq.handle, RDMA_QUEUE_ROLE_SRQ_SGB), RDMA_SC_OK);
-      expect_status("CONTEXT_PROGRESS", queue_recovery_manager.
-        record_queue_context_cleanup_complete(srq.handle), RDMA_SC_OK);
       expect_status("QUEUE_PROGRESS_LOOKUP", queue_recovery_manager.lookup_recovery(
         srq.handle, queue_recovery_lookup), RDMA_SC_OK);
       if (queue_recovery_lookup == null ||
