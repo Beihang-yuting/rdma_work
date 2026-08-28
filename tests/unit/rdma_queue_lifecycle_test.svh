@@ -4240,7 +4240,6 @@ class rdma_queue_lifecycle_test extends uvm_test;
       status = manager.lookup_recovery(request.target_h, recovery);
       expect_status({label, "_RECOVERY"}, status, RDMA_SC_OK);
       if (recovery == null || recovery.queue_plan == null ||
-          recovery.ambiguous_ticket == null ||
           recovery.ambiguous_queue_operation != (scenario == 0 ?
             RDMA_QUEUE_AMBIG_NONE : RDMA_QUEUE_AMBIG_DELETE) ||
           count_executor_recovery_step(recovery.pending_steps,
@@ -4248,6 +4247,10 @@ class rdma_queue_lifecycle_test extends uvm_test;
           count_executor_recovery_step(recovery.pending_steps,
                                         RDMA_CTRL_STEP_BACKING_RELEASED) != 1)
         `uvm_error(label, "recovery lost ticket/operation/cleanup authority")
+      else if (scenario == 0 && recovery.ambiguous_ticket != null)
+        `uvm_error(label, "definitive delete failure retained an ambiguous ticket")
+      else if (scenario != 0 && recovery.ambiguous_ticket == null)
+        `uvm_error(label, "ambiguous delete failure lost its ticket")
       if (scenario == 0 &&
           (recovery.primary_status == null ||
            !recovery.primary_status.hardware_code_valid ||
