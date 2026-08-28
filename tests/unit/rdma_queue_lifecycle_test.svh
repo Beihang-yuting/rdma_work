@@ -335,6 +335,11 @@ class rdma_queue_destroy_trace_cmq extends rdma_mock_cmq_port;
   int unsigned flush_attempt_ordinal;
   rdma_status reject_flush_status;
   bit lose_next_completion;
+  // Model an adapter that has already crossed the CMQ boundary but returns a
+  // non-OK status without either ticket or completion.  No explicit
+  // pre-submit proof accompanies this outcome, so destroy must fail closed.
+  bit nonok_null_without_proof;
+  rdma_status nonok_null_status;
 
   function new(string name = "rdma_queue_destroy_trace_cmq");
     super.new(name);
@@ -347,6 +352,8 @@ class rdma_queue_destroy_trace_cmq extends rdma_mock_cmq_port;
     flush_attempt_ordinal = 0;
     reject_flush_status = null;
     lose_next_completion = 1'b0;
+    nonok_null_without_proof = 1'b0;
+    nonok_null_status = null;
   endfunction
 
   function void begin_destroy_trace(
@@ -376,6 +383,9 @@ class rdma_queue_destroy_trace_cmq extends rdma_mock_cmq_port;
     int unsigned prior_calls;
     bit is_flush;
 
+    // This override can return before super.execute(); reset the proof bit at
+    // the adapter boundary so evidence from an earlier step cannot leak.
+    last_execute_no_submit_proven = 1'b0;
     prior_calls = calls.size();
     is_flush = command != null && command.opcode_key != null &&
                command.opcode_key.opcode[7:0] == XTR_V1_OP_OCC_FLUSH;
@@ -384,6 +394,10 @@ class rdma_queue_destroy_trace_cmq extends rdma_mock_cmq_port;
     if (reject_next_flush && is_flush &&
         flush_attempt_ordinal == reject_flush_ordinal) begin
       reject_next_flush = 1'b0;
+      // This injection is intentionally a definitive pre-submit validation
+      // rejection; unlike the null-outcome regression below, it carries an
+      // explicit adapter proof and may restore ACTIVE.
+      last_execute_no_submit_proven = 1'b1;
       ticket = null;
       completion = null;
       status = reject_flush_status == null ?
@@ -397,6 +411,16 @@ class rdma_queue_destroy_trace_cmq extends rdma_mock_cmq_port;
       call_trace = null;
     super.execute(command, ticket, completion, status);
     call_trace = saved_trace;
+    if (nonok_null_without_proof && trace_destroy &&
+        calls.size() > prior_calls && destroy_call_ordinal == 0) begin
+      nonok_null_without_proof = 1'b0;
+      ticket = null;
+      completion = null;
+      status = nonok_null_status == null ?
+        rdma_status::make(RDMA_SC_INVALID_STATE,
+                          "injected non-OK null CMQ outcome") :
+        rdma_cmq_clone_status_value(nonok_null_status);
+    end
     if (lose_next_completion && trace_destroy && calls.size() > prior_calls &&
         destroy_call_ordinal == 0) begin
       // Only consume this injection for the first destructive command.  The
@@ -2434,7 +2458,8 @@ class rdma_queue_lifecycle_test extends uvm_test;
     output rdma_queue_resource queue,
     output rdma_control_result create_result,
     output rdma_ceq ceq_dependency,
-    output rdma_pd pd_dependency
+    output rdma_pd pd_dependency,
+    input bit borrowed = 1'b0
   );
     rdma_semantic_request request;
 
@@ -2478,7 +2503,7 @@ class rdma_queue_lifecycle_test extends uvm_test;
                                            pd_dependency, 4);
     else
       request = make_executor_request({label, "_request"}, kind, binding,
-                                       ceq_dependency, 1'b0);
+                                       ceq_dependency, borrowed);
     queue = null;
     create_result = null;
     executor.create_locked(binding, binding.make_handle(), request,
@@ -3902,6 +3927,57 @@ class rdma_queue_lifecycle_test extends uvm_test;
     end
   endtask
 
+  task automatic check_destroy_borrowed_eq_detach();
+    string label;
+    string expected[$];
+    rdma_function_binding binding;
+    rdma_fault_inject_resource_manager manager;
+    rdma_queue_destroy_trace_mem mem;
+    rdma_queue_destroy_trace_context context_backing;
+    rdma_queue_destroy_trace_cmq cmq;
+    rdma_mock_call_trace trace;
+    rdma_queue_lifecycle_executor executor;
+    rdma_queue_resource queue;
+    rdma_control_result create_result;
+    rdma_control_result result;
+    rdma_ceq ceq_dependency;
+    rdma_pd pd_dependency;
+    rdma_destroy_resource_req request;
+    rdma_resource looked_up;
+    rdma_status status;
+    bit borrowed_ring_seen;
+
+    label = "DESTROY_BORROWED_CEQ";
+    create_destroy_fixture(label, RDMA_RESOURCE_CEQ, binding, manager, mem,
+                           context_backing, cmq, trace, executor, queue,
+                           create_result, ceq_dependency, pd_dependency,
+                           1'b1);
+    borrowed_ring_seen = 1'b0;
+    if (queue != null && queue.queue_plan != null)
+      foreach (queue.queue_plan.refs[i])
+        if (queue.queue_plan.refs[i] != null &&
+            queue.queue_plan.refs[i].role == RDMA_QUEUE_ROLE_CEQ_RING &&
+            queue.queue_plan.refs[i].ownership == RDMA_OWNERSHIP_BORROWED)
+          borrowed_ring_seen = 1'b1;
+    if (!borrowed_ring_seen)
+      `uvm_error(label, "fixture did not retain a borrowed CEQ ring")
+    request = make_destroy_request({label, "_request"}, binding,
+                                   queue.handle);
+    result = null;
+    executor.destroy_locked(binding, binding.make_handle(), request,
+                            64'd1170, result);
+    expected = '{"cmq:12", "host_release:CEQ_PD"};
+    expect_destroy_trace(label, trace, expected);
+    if (result == null || !result.ok() ||
+        result.final_resource_state != RDMA_RESOURCE_RELEASED ||
+        !result.final_resource_state_known || result.recovery_required)
+      `uvm_error(label, "borrowed CEQ destroy did not complete")
+    if (count_executor_host_calls(mem, "release") != 1)
+      `uvm_error(label, "borrowed CEQ ring unexpectedly reached host release")
+    status = manager.lookup(request.target_h, looked_up);
+    expect_status({label, "_RELEASED_LOOKUP"}, status, RDMA_SC_INVALID_STATE);
+  endtask
+
   task automatic check_destroy_busy_guards();
     string label;
     rdma_function_binding binding;
@@ -4238,6 +4314,128 @@ class rdma_queue_lifecycle_test extends uvm_test;
       `uvm_error(label, "SRQ flush reset did not publish ERROR")
   endtask
 
+  // A non-OK CMQ status with no ticket/completion does not, by itself, prove
+  // that a destructive command was rejected before submission.  The executor
+  // must retain ERROR recovery until an adapter supplies explicit proof.
+  task automatic check_destroy_nonok_null_outcome_fail_closed();
+    string label;
+    string expected[$];
+    rdma_function_binding binding;
+    rdma_fault_inject_resource_manager manager;
+    rdma_queue_destroy_trace_mem mem;
+    rdma_queue_destroy_trace_context context_backing;
+    rdma_queue_destroy_trace_cmq cmq;
+    rdma_mock_call_trace trace;
+    rdma_queue_lifecycle_executor executor;
+    rdma_queue_resource queue;
+    rdma_control_result create_result;
+    rdma_control_result result;
+    rdma_ceq ceq_dependency;
+    rdma_pd pd_dependency;
+    rdma_destroy_resource_req request;
+    rdma_recovery_record recovery;
+    rdma_resource error_resource;
+    rdma_status status;
+
+    label = "DESTROY_NONOK_NULL_NO_PROOF";
+    create_destroy_fixture(label, RDMA_RESOURCE_CQ, binding, manager, mem,
+                           context_backing, cmq, trace, executor, queue,
+                           create_result, ceq_dependency, pd_dependency);
+    cmq.nonok_null_without_proof = 1'b1;
+    cmq.nonok_null_status = rdma_status::make(
+      RDMA_SC_INVALID_STATE, "injected post-boundary null outcome");
+    request = make_destroy_request({label, "_request"}, binding,
+                                   queue.handle);
+    result = null;
+    executor.destroy_locked(binding, binding.make_handle(), request,
+                            64'd1460, result);
+    expected = '{"cmq:0e"};
+    expect_destroy_trace(label, trace, expected);
+    if (result == null || result.status == null ||
+        result.status.code != RDMA_SC_RECOVERY_REQUIRED ||
+        !result.recovery_required || !result.final_resource_state_known ||
+        result.final_resource_state != RDMA_RESOURCE_ERROR ||
+        mem.release_ordinal != 0 || context_backing.release_call_count != 0)
+      `uvm_error(label,
+                 "non-OK null outcome was incorrectly restored to ACTIVE")
+    status = manager.lookup(queue.handle, error_resource);
+    expect_status({label, "_ERROR_LOOKUP"}, status, RDMA_SC_OK);
+    if (error_resource == null || error_resource.state != RDMA_RESOURCE_ERROR)
+      `uvm_error(label, "non-OK null outcome did not publish ERROR")
+    status = manager.lookup_recovery(queue.handle, recovery);
+    expect_status({label, "_RECOVERY"}, status, RDMA_SC_OK);
+    if (recovery == null || recovery.queue_plan == null ||
+        recovery.hardware_presence != RDMA_HW_PRESENCE_UNKNOWN ||
+        recovery.ambiguous_queue_operation != RDMA_QUEUE_AMBIG_DELETE ||
+        recovery.ambiguous_ticket != null ||
+        count_executor_recovery_step(recovery.pending_steps,
+                                      RDMA_CTRL_STEP_HW_CONTEXT_DELETED) != 1 ||
+        count_executor_recovery_step(recovery.pending_steps,
+                                      RDMA_CTRL_STEP_BACKING_RELEASED) != 1)
+      `uvm_error(label, "null outcome recovery lost delete authority")
+  endtask
+
+  task automatic check_destroy_cq_post_delete_flush_failure();
+    string label;
+    string expected[$];
+    rdma_function_binding binding;
+    rdma_fault_inject_resource_manager manager;
+    rdma_queue_destroy_trace_mem mem;
+    rdma_queue_destroy_trace_context context_backing;
+    rdma_queue_destroy_trace_cmq cmq;
+    rdma_mock_call_trace trace;
+    rdma_queue_lifecycle_executor executor;
+    rdma_queue_resource queue;
+    rdma_control_result create_result;
+    rdma_control_result result;
+    rdma_ceq ceq_dependency;
+    rdma_pd pd_dependency;
+    rdma_destroy_resource_req request;
+    rdma_recovery_record recovery;
+    rdma_resource error_resource;
+    rdma_status status;
+
+    label = "DESTROY_CQ_POST_DELETE_FLUSH_FAILURE";
+    create_destroy_fixture(label, RDMA_RESOURCE_CQ, binding, manager, mem,
+                           context_backing, cmq, trace, executor, queue,
+                           create_result, ceq_dependency, pd_dependency);
+    cmq.reject_next_flush = 1'b1;
+    cmq.reject_flush_ordinal = 1;
+    cmq.reject_flush_status = rdma_status::make(
+      RDMA_SC_INVALID_ARGUMENT, "injected CQ post-delete flush rejection");
+    request = make_destroy_request({label, "_request"}, binding,
+                                   queue.handle);
+    result = null;
+    executor.destroy_locked(binding, binding.make_handle(), request,
+                            64'd1470, result);
+    expected = '{"cmq:0e"};
+    expect_destroy_trace(label, trace, expected);
+    if (result == null || result.status == null ||
+        result.status.code != RDMA_SC_RECOVERY_REQUIRED ||
+        !result.recovery_required || !result.final_resource_state_known ||
+        result.final_resource_state != RDMA_RESOURCE_ERROR ||
+        mem.release_ordinal != 0 || context_backing.release_call_count != 0)
+      `uvm_error(label, "CQ post-delete flush failure was not retained")
+    status = manager.lookup(queue.handle, error_resource);
+    expect_status({label, "_ERROR_LOOKUP"}, status, RDMA_SC_OK);
+    if (error_resource == null || error_resource.state != RDMA_RESOURCE_ERROR)
+      `uvm_error(label, "CQ post-delete flush failure restored ACTIVE")
+    status = manager.lookup_recovery(queue.handle, recovery);
+    expect_status({label, "_RECOVERY"}, status, RDMA_SC_OK);
+    if (recovery == null || recovery.queue_plan == null ||
+        recovery.hardware_presence != RDMA_HW_PRESENCE_ABSENT ||
+        recovery.ambiguous_queue_operation != RDMA_QUEUE_AMBIG_NONE ||
+        recovery.ambiguous_ticket != null ||
+        count_executor_recovery_step(recovery.completed_steps,
+                                      RDMA_CTRL_STEP_HW_CONTEXT_DELETED) != 1 ||
+        count_executor_recovery_step(recovery.pending_steps,
+                                      RDMA_CTRL_STEP_BACKING_RELEASED) != 1 ||
+        count_executor_recovery_step(recovery.pending_steps,
+                                      RDMA_CTRL_STEP_HW_CONTEXT_DELETED) != 0)
+      `uvm_error(label,
+                 "CQ post-delete failure lost ABSENT hardware recovery state")
+  endtask
+
   task automatic check_public_destroy_success();
     rdma_control_plane control;
     rdma_resource_manager manager;
@@ -4339,8 +4537,11 @@ class rdma_queue_lifecycle_test extends uvm_test;
     check_contexts_and_commands();
     check_executor_context_optional_for_eq();
     check_destroy_success_traces();
+    check_destroy_borrowed_eq_detach();
     check_destroy_busy_guards();
     check_destroy_srq_restore_retry();
+    check_destroy_nonok_null_outcome_fail_closed();
+    check_destroy_cq_post_delete_flush_failure();
     check_destroy_failure_matrix();
     check_destroy_srq_flush_failure();
     check_public_destroy_success();

@@ -230,6 +230,9 @@ class rdma_mock_cmq_port extends rdma_cmq_port;
   protected bit [7:0] gated_opcode;
   protected int unsigned gate_target_count;
   protected int unsigned gate_entered_count;
+  // Evidence is scoped to the most recent execute() call.  It is asserted
+  // only on mock adapter paths that return before recording a CMQ call.
+  protected bit last_execute_no_submit_proven;
 
   function new(string name = "rdma_mock_cmq_port");
     super.new(name);
@@ -242,9 +245,14 @@ class rdma_mock_cmq_port extends rdma_cmq_port;
     gated_opcode = '0;
     gate_target_count = 1;
     gate_entered_count = 0;
+    last_execute_no_submit_proven = 1'b0;
     snapshot_engine = rdma_mock_cmq_snapshot_engine::type_id::create(
       {name, "_snapshot_engine"}
     );
+  endfunction
+
+  virtual function bit last_execute_definitive_no_submit();
+    return last_execute_no_submit_proven;
   endfunction
 
   function void set_call_trace(rdma_mock_call_trace trace);
@@ -522,6 +530,7 @@ class rdma_mock_cmq_port extends rdma_cmq_port;
     rdma_mock_cmq_outcome outcome;
     bit [7:0] opcode;
 
+    last_execute_no_submit_proven = 1'b0;
     ticket = null;
     completion = null;
     status = invalid_state("mock CMQ execute did not complete");
@@ -533,6 +542,9 @@ class rdma_mock_cmq_port extends rdma_cmq_port;
     end
     helper_status = snapshot_command(command, command_snapshot);
     if (helper_status == null || !helper_status.ok()) begin
+      // No call record exists, so the mock can prove this was rejected before
+      // submission.
+      last_execute_no_submit_proven = 1'b1;
       status = (helper_status == null) ?
         invalid_state("mock CMQ command snapshot returned null status") :
         helper_status;
@@ -543,6 +555,8 @@ class rdma_mock_cmq_port extends rdma_cmq_port;
       call_trace.record($sformatf("cmq:%02x", opcode));
     helper_status = make_ticket(command_snapshot, next_sequence, ticket);
     if (helper_status == null || !helper_status.ok() || ticket == null) begin
+      // Ticket construction precedes call publication in this adapter.
+      last_execute_no_submit_proven = 1'b1;
       status = (helper_status == null) ?
         invalid_state("mock CMQ ticket helper returned null status") :
         helper_status;
@@ -556,6 +570,7 @@ class rdma_mock_cmq_port extends rdma_cmq_port;
     call_record.ticket = rdma_cmq_clone_ticket_value(ticket,
                                                      "mock CMQ call");
     if (call_record.ticket == null) begin
+      last_execute_no_submit_proven = 1'b1;
       ticket = null;
       status = invalid_state("mock CMQ call ticket snapshot failed");
       return;

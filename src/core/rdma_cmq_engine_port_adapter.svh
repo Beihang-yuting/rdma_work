@@ -2,9 +2,19 @@ class rdma_cmq_engine_port_adapter extends rdma_cmq_port;
   `uvm_object_utils(rdma_cmq_engine_port_adapter)
 
   protected rdma_cmq_engine engines[string];
+  // Set only when this adapter returns from a validation guard that runs
+  // before handing a command to the CMQ engine.  Engine submit/wait failures
+  // intentionally remain unclassified because they may have crossed the
+  // hardware boundary.
+  protected bit last_execute_no_submit_proven;
 
   function new(string name = "rdma_cmq_engine_port_adapter");
     super.new(name);
+    last_execute_no_submit_proven = 1'b0;
+  endfunction
+
+  virtual function bit last_execute_definitive_no_submit();
+    return last_execute_no_submit_proven;
   endfunction
 
   protected function string function_key(rdma_function_handle owner);
@@ -49,16 +59,19 @@ class rdma_cmq_engine_port_adapter extends rdma_cmq_port;
     rdma_status engine_status;
     string key;
 
+    last_execute_no_submit_proven = 1'b0;
     ticket = null;
     completion = null;
     status = invalid_state("CMQ port execute did not complete");
     if (command == null || command.function_h == null ||
         command.function_h.kind != RDMA_RESOURCE_FUNCTION) begin
+      last_execute_no_submit_proven = 1'b1;
       status = invalid_state("CMQ port command Function is unavailable");
       return;
     end
     key = function_key(command.function_h);
     if (!engines.exists(key) || engines[key] == null) begin
+      last_execute_no_submit_proven = 1'b1;
       status = invalid_state("CMQ port Function has no bound engine");
       return;
     end

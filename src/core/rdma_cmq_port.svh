@@ -16,4 +16,12 @@ virtual class rdma_cmq_port extends uvm_object;
     output rdma_cmq_completion completion,
     output rdma_status status
   );
+
+  // A missing ticket/completion is not proof that a command was rejected
+  // before submission.  An adapter may override this observation when it can
+  // prove that the most recent execute() failed in its own pre-submit
+  // validation path.  The conservative default is fail-closed.
+  virtual function bit last_execute_definitive_no_submit();
+    return 1'b0;
+  endfunction
 endclass

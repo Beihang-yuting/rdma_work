@@ -51,9 +51,10 @@ class rdma_queue_lifecycle_executor extends uvm_object;
   );
     // A null status means the adapter did not provide an outcome at all.  A
     // timeout/reset is inherently ambiguous even when the adapter did return
-    // a status.  Conversely, a non-OK validation status with no ticket and no
-    // completion is a definitive pre-submit rejection: no destructive command
-    // could have reached hardware and the caller may safely restore ACTIVE.
+    // a status.  A missing ticket/completion is ambiguous by default: status
+    // code alone cannot prove that a destructive command was rejected before
+    // submission.  Only an explicit adapter proof may make that a definitive
+    // no-submit outcome and permit ACTIVE restoration.
     if (status == null)
       return 1'b1;
     if (status.code inside {RDMA_SC_TIMEOUT, RDMA_SC_RESET_CANCELLED})
@@ -62,8 +63,11 @@ class rdma_queue_lifecycle_executor extends uvm_object;
         completion.status.code inside {RDMA_SC_TIMEOUT,
                                        RDMA_SC_RESET_CANCELLED})
       return 1'b1;
-    if (completion == null || completion.status == null)
-      return status.ok() || ticket != null;
+    if (completion == null || completion.status == null) begin
+      if (status.ok() || ticket != null)
+        return 1'b1;
+      return cmq == null || !cmq.last_execute_definitive_no_submit();
+    end
     return 1'b0;
   endfunction
 
