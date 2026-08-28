@@ -37,8 +37,8 @@ function automatic bit rdma_queue_role_is_payload(rdma_queue_backing_role_e role
 endfunction
 function automatic bit rdma_queue_role_is_ring(rdma_queue_backing_role_e role);
   return role inside {RDMA_QUEUE_ROLE_CQ_RING, RDMA_QUEUE_ROLE_SRQ_RING,
-                      RDMA_QUEUE_ROLE_SRFQ_RING, RDMA_QUEUE_ROLE_CEQ_RING,
-                      RDMA_QUEUE_ROLE_AEQ_RING};
+                      RDMA_QUEUE_ROLE_SRFQ_RING, RDMA_QUEUE_ROLE_SRQ_SGB,
+                      RDMA_QUEUE_ROLE_CEQ_RING, RDMA_QUEUE_ROLE_AEQ_RING};
 endfunction
 function automatic bit rdma_queue_role_is_pd(rdma_queue_backing_role_e role);
   return role inside {RDMA_QUEUE_ROLE_CQ_PD, RDMA_QUEUE_ROLE_SRQ_PD,
@@ -68,6 +68,9 @@ function automatic rdma_status rdma_queue_queue_range_status(
     return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "queue range is unaligned");
   if (mapping.iova.value > 64'hffff_ffff_ffff_ffff - offset)
     return rdma_status::make(RDMA_SC_DMA_TRANSLATION, "IOVA offset overflows");
+  if (!rdma_queue_aligned(mapping.iova.value + offset, alignment))
+    return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                             "effective queue IOVA is unaligned");
   return rdma_status::success();
 endfunction
 
@@ -101,24 +104,36 @@ class rdma_queue_completion_authority extends uvm_object;
   endfunction
 endclass
 
-class rdma_queue_opaque_slot_token extends uvm_object;
-  `uvm_object_utils(rdma_queue_opaque_slot_token)
+class rdma_queue_slot_token_contract extends uvm_object;
+  `uvm_object_utils(rdma_queue_slot_token_contract)
   rdma_queue_completion_authority completion_authority;
 
-  function new(string name = "rdma_queue_opaque_slot_token");
+  function new(string name = "rdma_queue_slot_token_contract");
     super.new(name);
     completion_authority = null;
   endfunction
+
   virtual function void do_copy(uvm_object rhs);
-    rdma_queue_opaque_slot_token r;
+    rdma_queue_slot_token_contract r;
+
     super.do_copy(rhs);
-    if (!$cast(r, rhs)) `uvm_fatal("RDMA_COPY_TYPE", "slot token copy mismatch");
+    if (!$cast(r, rhs))
+      `uvm_fatal("RDMA_COPY_TYPE", "slot token contract copy mismatch");
     completion_authority = r.completion_authority;
   endfunction
+
   virtual function rdma_status validate();
     if (completion_authority == null)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "slot token authority missing");
     return completion_authority.validate();
+  endfunction
+endclass
+
+class rdma_queue_opaque_slot_token extends rdma_queue_slot_token_contract;
+  `uvm_object_utils(rdma_queue_opaque_slot_token)
+
+  function new(string name = "rdma_queue_opaque_slot_token");
+    super.new(name);
   endfunction
 endclass
 
@@ -341,9 +356,8 @@ class rdma_queue_ring_layout extends uvm_object;
     end
   endfunction
 
-  virtual function rdma_status validate();
+  virtual function rdma_status validate_metadata();
     longint unsigned expected;
-    rdma_status s;
 
     if (!rdma_queue_role_is_ring(role) || entry_size_bytes == 0 || depth == 0)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "ring metadata invalid");
@@ -355,11 +369,28 @@ class rdma_queue_ring_layout extends uvm_object;
         storage_bytes < logical_bytes)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "ring layout size invalid");
     if (page_count == 0 || page_count > 512 ||
-        page_count != storage_bytes / 4096 || pages.size() != page_count)
+        page_count != storage_bytes / 4096)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "ring page count invalid");
+    return rdma_status::success();
+  endfunction
+
+  virtual function rdma_status validate();
+    rdma_status s;
+
+    s = validate_metadata();
+    if (!s.ok())
+      return s;
+    if (role == RDMA_QUEUE_ROLE_SRQ_SGB && pages.size() == 0)
+      return rdma_status::success();
+    if (pages.size() != page_count)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "ring materialized page count invalid");
     foreach (pages[i]) begin
       if (pages[i] == null)
         return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "null page");
+      if (pages[i].role != role)
+        return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                                 "page role does not match ring role");
       s = pages[i].validate();
       if (!s.ok())
         return s;
@@ -472,6 +503,8 @@ class rdma_context_backing_ref extends uvm_object;
     uvm_object c;
     rdma_function_handle f;
     rdma_hmc_ref h;
+    rdma_queue_slot_token_contract source_token;
+    rdma_queue_slot_token_contract cloned_token;
 
     super.do_copy(rhs);
     if (!$cast(r, rhs))
@@ -494,8 +527,13 @@ class rdma_context_backing_ref extends uvm_object;
     if (r.slot_token == null) begin
       slot_token = null;
     end else begin
+      if (!$cast(source_token, r.slot_token))
+        `uvm_fatal("RDMA_COPY_TYPE", "source slot token contract invalid");
       c = r.slot_token.clone();
-      if (c == null || c == r.slot_token)
+      if (c == null || c == r.slot_token || !$cast(cloned_token, c) ||
+          cloned_token.completion_authority == null ||
+          cloned_token.completion_authority !==
+            source_token.completion_authority)
         `uvm_fatal("RDMA_COPY_TYPE", "opaque token clone failure");
       slot_token = c;
     end
@@ -511,7 +549,7 @@ class rdma_context_backing_ref extends uvm_object;
 
   virtual function rdma_status validate();
     rdma_status s;
-    rdma_queue_opaque_slot_token token;
+    rdma_queue_slot_token_contract token;
 
     if (owner == null || owner.kind != RDMA_RESOURCE_FUNCTION)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "context owner invalid");
@@ -523,7 +561,7 @@ class rdma_context_backing_ref extends uvm_object;
                                "context authority missing");
     if (!$cast(token, slot_token))
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                               "slot token type invalid");
+                               "slot token contract invalid");
     s = token.validate();
     if (!s.ok())
       return s;
@@ -815,7 +853,10 @@ class rdma_queue_preflight extends uvm_object;
       if (required_rings[i] == null)
         return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                  "null required ring");
-      s = required_rings[i].validate();
+      if (required_rings[i].pages.size() == 0)
+        s = required_rings[i].validate_metadata();
+      else
+        s = required_rings[i].validate();
       if (!s.ok())
         return s;
     end
