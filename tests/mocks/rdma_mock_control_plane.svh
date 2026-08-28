@@ -228,6 +228,7 @@ class rdma_mock_cmq_port extends rdma_cmq_port;
   protected rdma_mock_cmq_snapshot_engine snapshot_engine;
   protected bit gate_enabled;
   protected bit [7:0] gated_opcode;
+  protected int unsigned gate_target_count;
   protected int unsigned gate_entered_count;
 
   function new(string name = "rdma_mock_cmq_port");
@@ -239,6 +240,7 @@ class rdma_mock_cmq_port extends rdma_cmq_port;
     call_trace = null;
     gate_enabled = 1'b0;
     gated_opcode = '0;
+    gate_target_count = 1;
     gate_entered_count = 0;
     snapshot_engine = rdma_mock_cmq_snapshot_engine::type_id::create(
       {name, "_snapshot_engine"}
@@ -250,8 +252,15 @@ class rdma_mock_cmq_port extends rdma_cmq_port;
   endfunction
 
   function void gate_opcode(bit [7:0] opcode);
+    gate_opcode_count(opcode, 1);
+  endfunction
+
+  // Hold all matching CMQ executions until release_one(), allowing tests to
+  // establish a deterministic multi-Function barrier.
+  function void gate_opcode_count(bit [7:0] opcode, int unsigned count);
     gated_opcode = opcode;
     gate_enabled = 1'b1;
+    gate_target_count = (count == 0) ? 1 : count;
     gate_entered_count = 0;
     release_gate.reset();
     entered.reset();
@@ -277,6 +286,7 @@ class rdma_mock_cmq_port extends rdma_cmq_port;
   endtask
 
   task release_one();
+    gate_enabled = 1'b0;
     release_gate.trigger();
   endtask
 
@@ -517,7 +527,6 @@ class rdma_mock_cmq_port extends rdma_cmq_port;
     status = invalid_state("mock CMQ execute did not complete");
     if (gate_enabled && command != null && command.opcode_key != null &&
         command.opcode_key.opcode[7:0] == gated_opcode) begin
-      gate_enabled = 1'b0;
       gate_entered_count++;
       entered.trigger();
       release_gate.wait_on();

@@ -474,7 +474,7 @@ class rdma_control_plane_cmq_engine_test extends uvm_test;
     );
     expect_status("REAL_ENGINE_RESPONDER", status, RDMA_SC_OK);
     status = control.configure(manager, adapter, key_policy, mock_mem,
-                               null, 40ns);
+                               null, null, 40ns);
     expect_status("REAL_ENGINE_CONTROL_CONFIGURE", status, RDMA_SC_OK);
 
     cmq_backing_only_baseline = mock_mem.live_allocations();

@@ -668,6 +668,100 @@ class rdma_control_plane_test extends uvm_test;
     return dma_context;
   endfunction
 
+  function automatic rdma_queue_backing_slice make_queue_borrowed_slice(
+    string name,
+    rdma_function_binding binding,
+    rdma_queue_backing_role_e role,
+    longint unsigned iova,
+    longint unsigned backing
+  );
+    rdma_dma_mapping mapping;
+    rdma_queue_backing_slice slice;
+
+    mapping = rdma_dma_mapping::type_id::create({name, "_mapping"});
+    mapping.function_h = binding.make_handle();
+    mapping.requester_bdf = binding.queue_dma.requester_bdf;
+    mapping.pasid_valid = binding.queue_dma.pasid_valid;
+    mapping.pasid = binding.queue_dma.pasid;
+    mapping.dma_domain_valid = binding.queue_dma.dma_domain_valid;
+    mapping.dma_domain_id = binding.queue_dma.dma_domain_id;
+    mapping.iova.value = iova;
+    mapping.backing_addr.value = backing;
+    mapping.size = 4096;
+    mapping.direction = RDMA_DMA_BIDIRECTIONAL;
+    mapping.permissions =
+      '{device_read:1'b1, device_write:1'b1, atomic:1'b0};
+    mapping.state = RDMA_MAPPING_ACTIVE;
+    slice = rdma_queue_backing_slice::type_id::create({name, "_slice"});
+    slice.role = role;
+    slice.mapping = mapping;
+    slice.mapping_offset = 0;
+    slice.length = 4096;
+    slice.logical_queue_offset = 0;
+    return slice;
+  endfunction
+
+  function automatic rdma_create_cq_req make_create_cq_request(
+    string name,
+    rdma_function_binding binding,
+    rdma_ceq dependency
+  );
+    rdma_create_cq_req request;
+
+    request = rdma_create_cq_req::type_id::create(name);
+    request.owner = binding.make_handle();
+    request.depth = 64;
+    request.cqe_size_bytes = 64;
+    request.ceq_h = dependency.handle;
+    request.ring_backing.mode = RDMA_QUEUE_BACKING_OWNED;
+    return request;
+  endfunction
+
+  function automatic rdma_create_srq_req make_create_srq_request(
+    string name,
+    rdma_function_binding binding,
+    rdma_pd dependency
+  );
+    rdma_create_srq_req request;
+
+    request = rdma_create_srq_req::type_id::create(name);
+    request.owner = binding.make_handle();
+    request.depth = 64;
+    request.max_sge = 2;
+    request.limit_threshold = 16;
+    request.pd_h = dependency.handle;
+    request.payload_backing.mode = RDMA_QUEUE_BACKING_OWNED;
+    return request;
+  endfunction
+
+  function automatic rdma_create_ceq_req make_create_ceq_request(
+    string name,
+    rdma_function_binding binding
+  );
+    rdma_create_ceq_req request;
+
+    request = rdma_create_ceq_req::type_id::create(name);
+    request.owner = binding.make_handle();
+    request.depth = 64;
+    request.vector_id = 3;
+    request.ring_backing.mode = RDMA_QUEUE_BACKING_OWNED;
+    return request;
+  endfunction
+
+  function automatic rdma_create_aeq_req make_create_aeq_request(
+    string name,
+    rdma_function_binding binding
+  );
+    rdma_create_aeq_req request;
+
+    request = rdma_create_aeq_req::type_id::create(name);
+    request.owner = binding.make_handle();
+    request.depth = 64;
+    request.vector_id = 3;
+    request.ring_backing.mode = RDMA_QUEUE_BACKING_OWNED;
+    return request;
+  endfunction
+
   function automatic rdma_mr_backing_desc make_borrowed_pbl0_backing(
     string name,
     rdma_function_binding binding,
@@ -970,7 +1064,7 @@ class rdma_control_plane_test extends uvm_test;
     );
     status = control.configure(
       manager, mock_cmq, key_policy,
-      inject_host_mem ? host_mem : null, null, 2us
+      inject_host_mem ? host_mem : null, null, null, 2us
     );
     expect_status({prefix, "_CONFIGURE"}, status, RDMA_SC_OK);
     pd_request = make_create_pd_request({prefix, "_pd_request"}, binding);
@@ -1079,7 +1173,7 @@ class rdma_control_plane_test extends uvm_test;
       32'hd900_0101, 93
     );
     status = control.configure(manager, mock_cmq, key_policy, host_mem,
-                               hmc, 4us);
+                               hmc, null, 4us);
     expect_status({prefix, "_CONFIGURE"}, status, RDMA_SC_OK);
     pd_request = make_create_pd_request({prefix, "_pd_request"}, binding);
     control.create_pd(binding, pd_request, pd, result);
@@ -1186,28 +1280,28 @@ class rdma_control_plane_test extends uvm_test;
     end
 
     status = controls[0].configure(null, cmqs[0], policies[0], mem, hmc,
-                                   1us);
+                                   null, 1us);
     expect_status("CONFIGURE_NULL_MANAGER", status,
                   RDMA_SC_INVALID_ARGUMENT);
     status = controls[1].configure(managers[1], null, policies[1], mem, hmc,
-                                   1us);
+                                   null, 1us);
     expect_status("CONFIGURE_NULL_CMQ", status, RDMA_SC_INVALID_ARGUMENT);
     status = controls[2].configure(managers[2], cmqs[2], null, mem, hmc,
-                                   1us);
+                                   null, 1us);
     expect_status("CONFIGURE_NULL_POLICY", status,
                   RDMA_SC_INVALID_ARGUMENT);
     status = controls[3].configure(managers[3], cmqs[3], policies[3], mem,
-                                   hmc, 0ns);
+                                   hmc, null, 0ns);
     expect_status("CONFIGURE_ZERO_TIMEOUT", status,
                   RDMA_SC_INVALID_ARGUMENT);
     status = controls[4].configure(managers[4], cmqs[4], policies[4], mem,
-                                   hmc, 1us);
+                                   hmc, null, 1us);
     expect_status("CONFIGURE_OK", status, RDMA_SC_OK);
     status = controls[4].configure(managers[4], cmqs[4], policies[4], mem,
-                                   hmc, 1us);
+                                   hmc, null, 1us);
     expect_status("CONFIGURE_REPEAT", status, RDMA_SC_INVALID_STATE);
     status = controls[5].configure(managers[5], cmqs[5], policies[5], null,
-                                   null, 1us);
+                                   null, null, 1us);
     expect_status("CONFIGURE_OPTIONAL_ADAPTERS", status, RDMA_SC_OK);
     status = controls[6].configure(
       .resource_manager(managers[6]),
@@ -1215,6 +1309,7 @@ class rdma_control_plane_test extends uvm_test;
       .key_policy(policies[6]),
       .host_mem(null),
       .hmc_allocator(null),
+      .context_backing(null),
       .command_timeout(1us)
     );
     expect_status("CONFIGURE_NAMED_ARGUMENTS", status, RDMA_SC_OK);
@@ -2767,7 +2862,7 @@ class rdma_control_plane_test extends uvm_test;
     request = make_create_pd_request("request", binding);
 
     status = control.configure(manager, mock_cmq, key_policy, mock_mem, hmc,
-                               1us);
+                               null, 1us);
     expect_status("CONFIGURE", status, RDMA_SC_OK);
     control.create_pd(binding, request, pd, result);
     expect_result("PD_CREATE", result, RDMA_SC_OK);
@@ -2985,7 +3080,7 @@ class rdma_control_plane_test extends uvm_test;
     );
     pd_request = make_create_pd_request("pbl0_pd_request", binding);
     status = control.configure(manager, mock_cmq, key_policy, null, null,
-                               2us);
+                               null, 2us);
     expect_status("PBL0_CONFIGURE", status, RDMA_SC_OK);
     control.create_pd(binding, pd_request, pd, result);
     expect_result("PBL0_PD_CREATE", result, RDMA_SC_OK);
@@ -3051,7 +3146,7 @@ class rdma_control_plane_test extends uvm_test;
     );
     pd_request = make_create_pd_request("fail_pd_request", binding);
     status = control.configure(manager, mock_cmq, key_policy, null, hmc,
-                               5us);
+                               null, 5us);
     expect_status("FAIL_CONFIGURE", status, RDMA_SC_OK);
     control.create_pd(binding, pd_request, pd, result);
     expect_result("FAIL_PD_CREATE", result, RDMA_SC_OK);
@@ -3167,7 +3262,7 @@ class rdma_control_plane_test extends uvm_test;
     );
     pd_request = make_create_pd_request("timeout_pd_request", binding);
     status = control.configure(manager, mock_cmq, key_policy, null, hmc,
-                               6us);
+                               null, 6us);
     expect_status("TIMEOUT_CONFIGURE", status, RDMA_SC_OK);
     control.create_pd(binding, pd_request, pd, result);
     expect_result("TIMEOUT_PD_CREATE", result, RDMA_SC_OK);
@@ -3376,7 +3471,7 @@ class rdma_control_plane_test extends uvm_test;
       32'ha510_0101, 60
     );
     status = control.configure(manager, mock_cmq, key_policy, null, null,
-                               6us);
+                               null, 6us);
     expect_status("KEY_ALLOC_LATE_FAILURE_CONFIGURE", status, RDMA_SC_OK);
     pd_request = make_create_pd_request(
       "late_failure_pd_request", binding
@@ -3478,7 +3573,7 @@ class rdma_control_plane_test extends uvm_test;
     );
     pd_request = make_create_pd_request("snapshot_pd_request", binding);
     status = control.configure(manager, blocking_cmq, key_policy, null, hmc,
-                               7us);
+                               null, 7us);
     expect_status("SNAPSHOT_CONFIGURE", status, RDMA_SC_OK);
     control.create_pd(binding, pd_request, pd, result);
     expect_result("SNAPSHOT_PD_CREATE", result, RDMA_SC_OK);
@@ -3681,7 +3776,7 @@ class rdma_control_plane_test extends uvm_test;
     );
     pd_request = make_create_pd_request("post_cmq_pd_request", binding);
     status = control.configure(manager, blocking_cmq, key_policy, null, hmc,
-                               8us);
+                               null, 8us);
     expect_status("POST_CMQ_CONFIGURE", status, RDMA_SC_OK);
     control.create_pd(binding, pd_request, pd, result);
     expect_result("POST_CMQ_PD_CREATE", result, RDMA_SC_OK);
@@ -3788,7 +3883,7 @@ class rdma_control_plane_test extends uvm_test;
     );
     pd_request = make_create_pd_request("post_cmq_hmc_pd_request", binding);
     status = control.configure(manager, blocking_cmq, key_policy, null, hmc,
-                               8us);
+                               null, 8us);
     expect_status("POST_CMQ_HMC_CONTROL_CONFIGURE", status, RDMA_SC_OK);
     control.create_pd(binding, pd_request, pd, result);
     expect_result("POST_CMQ_HMC_PD_CREATE", result, RDMA_SC_OK);
@@ -3919,7 +4014,7 @@ class rdma_control_plane_test extends uvm_test;
       `uvm_fatal("FUNCTION_CONCURRENCY_FIXTURE",
                  "Functions must be distinct with the same generation")
     status = control.configure(manager, mock_cmq, key_policy, null, null,
-                               8us);
+                               null, 8us);
     expect_status("FUNCTION_CONCURRENCY_CONFIGURE", status, RDMA_SC_OK);
     pd_request = make_create_pd_request("concurrency_pd_request", binding_a);
     control.create_pd(binding_a, pd_request, pd, result);
@@ -4033,7 +4128,7 @@ class rdma_control_plane_test extends uvm_test;
       32'hb300_0303, 89
     );
     status = control.configure(manager, mock_cmq, key_policy, null, null,
-                               8us);
+                               null, 8us);
     expect_status("PRE_ACTIVATE_FENCE_CONFIGURE", status, RDMA_SC_OK);
     pd_request = make_create_pd_request("pre_activate_fence_pd", binding);
     control.create_pd(binding, pd_request, pd, result);
@@ -4124,7 +4219,7 @@ class rdma_control_plane_test extends uvm_test;
     pd_request = make_create_pd_request("freeze_failure_pd_request",
                                         binding);
     status = control.configure(manager, mock_cmq, key_policy, null, hmc,
-                               9us);
+                               null, 9us);
     expect_status("FREEZE_FAILURE_CONFIGURE", status, RDMA_SC_OK);
     control.create_pd(binding, pd_request, pd, result);
     expect_result("FREEZE_FAILURE_PD_CREATE", result, RDMA_SC_OK);
@@ -4676,7 +4771,7 @@ class rdma_control_plane_test extends uvm_test;
       32'hf320_0101, 65
     );
     status = control.configure(
-      manager, blocking_cmq, key_policy, host_mem, null, 3us
+      manager, blocking_cmq, key_policy, host_mem, null, null, 3us
     );
     expect_status("OWNED_SNAPSHOT_CONFIGURE", status, RDMA_SC_OK);
     pd_request = make_create_pd_request("owned_snapshot_pd_request", binding);
@@ -4779,7 +4874,7 @@ class rdma_control_plane_test extends uvm_test;
     );
     pd_request = make_create_pd_request("reject_pd_request", binding);
     status = control.configure(manager, mock_cmq, key_policy, null, hmc,
-                               4us);
+                               null, 4us);
     expect_status("REJECT_CONFIGURE", status, RDMA_SC_OK);
     control.create_pd(binding, pd_request, pd, result);
     expect_result("REJECT_PD_CREATE", result, RDMA_SC_OK);
@@ -5010,7 +5105,7 @@ class rdma_control_plane_test extends uvm_test;
     );
     pd_request = make_create_pd_request("pbl12_pd_request", binding);
     status = control.configure(manager, mock_cmq, key_policy, null, hmc,
-                               3us);
+                               null, 3us);
     expect_status("PBL12_CONFIGURE", status, RDMA_SC_OK);
     control.create_pd(binding, pd_request, pd, result);
     expect_result("PBL12_PD_CREATE", result, RDMA_SC_OK);
@@ -6414,7 +6509,7 @@ class rdma_control_plane_test extends uvm_test;
     );
     request = make_create_pd_request("exhaust_request", binding);
     status = control.configure(manager, mock_cmq, key_policy, null, null,
-                               1us);
+                               null, 1us);
     expect_status("TXN_CONFIGURE", status, RDMA_SC_OK);
     control.force_transaction_allocator(64'hffff_ffff_ffff_ffff, 1'b0);
     control.create_pd(binding, request, pd, result);
@@ -6508,6 +6603,103 @@ class rdma_control_plane_test extends uvm_test;
     expect_status("GUARD_CONTENTION_CLEANUP_RELEASE", status, RDMA_SC_OK);
   endtask
 
+  // Catches a missing typed facade, wrong resource projection, or a facade
+  // that lets a mismatched destroy handle reach the queue executor.
+  task automatic check_typed_queue_facade();
+    rdma_control_plane control;
+    rdma_resource_manager manager;
+    rdma_mock_cmq_port cmq;
+    rdma_mock_stag_key_policy key_policy;
+    rdma_mock_host_mem host_mem;
+    rdma_mock_context_backing context_backing;
+    rdma_function_binding binding;
+    rdma_create_pd_req pd_request;
+    rdma_create_cq_req cq_request;
+    rdma_create_srq_req srq_request;
+    rdma_create_ceq_req ceq_request;
+    rdma_create_aeq_req aeq_request;
+    rdma_destroy_resource_req destroy_request;
+    rdma_pd pd;
+    rdma_ceq dependency;
+    rdma_cq cq;
+    rdma_srq srq;
+    rdma_ceq ceq;
+    rdma_aeq aeq;
+    rdma_control_result result;
+    rdma_status status;
+    int unsigned cmq_before;
+
+    control = rdma_control_plane::type_id::create("typed_queue_control");
+    manager = rdma_resource_manager::type_id::create("typed_queue_manager");
+    cmq = rdma_mock_cmq_port::type_id::create("typed_queue_cmq");
+    key_policy = rdma_mock_stag_key_policy::type_id::create(
+      "typed_queue_policy"
+    );
+    host_mem = rdma_mock_host_mem::type_id::create("typed_queue_mem");
+    context_backing = rdma_mock_context_backing::type_id::create(
+      "typed_queue_context"
+    );
+    binding = make_active_binding(
+      "typed_queue_binding", 64'hfb00_0000_0000_0001, 32'hfb00_0101, 121
+    );
+    status = control.configure(manager, cmq, key_policy, host_mem, null,
+                               context_backing, 2us);
+    expect_status("TYPED_QUEUE_CONFIGURE", status, RDMA_SC_OK);
+    pd_request = make_create_pd_request("typed_queue_pd_request", binding);
+    control.create_pd(binding, pd_request, pd, result);
+    expect_result("TYPED_QUEUE_PD", result, RDMA_SC_OK);
+    status = manager.create_ceq(binding, dependency);
+    expect_status("TYPED_QUEUE_DEPENDENCY", status, RDMA_SC_OK);
+    if (pd == null || dependency == null)
+      return;
+
+    cq_request = make_create_cq_request("typed_queue_cq_request", binding,
+                                        dependency);
+    control.create_cq(binding, cq_request, cq, result);
+    if (result == null || !result.ok() || cq == null ||
+        cq.state != RDMA_RESOURCE_ACTIVE)
+      `uvm_error("CP_CREATE_CQ", $sformatf("typed CQ facade failed: %s",
+        result == null || result.status == null ? "null" :
+          result.status.convert2string()))
+
+    srq_request = make_create_srq_request("typed_queue_srq_request", binding,
+                                          pd);
+    control.create_srq(binding, srq_request, srq, result);
+    if (result == null || !result.ok() || srq == null ||
+        srq.state != RDMA_RESOURCE_ACTIVE)
+      `uvm_error("CP_CREATE_SRQ", $sformatf("typed SRQ facade failed: %s",
+        result == null || result.status == null ? "null" :
+          result.status.convert2string()))
+
+    ceq_request = make_create_ceq_request("typed_queue_ceq_request", binding);
+    control.create_ceq(binding, ceq_request, ceq, result);
+    if (result == null || !result.ok() || ceq == null ||
+        ceq.state != RDMA_RESOURCE_ACTIVE)
+      `uvm_error("CP_CREATE_CEQ", $sformatf("typed CEQ facade failed: %s",
+        result == null || result.status == null ? "null" :
+          result.status.convert2string()))
+
+    aeq_request = make_create_aeq_request("typed_queue_aeq_request", binding);
+    control.create_aeq(binding, aeq_request, aeq, result);
+    if (result == null || !result.ok() || aeq == null ||
+        aeq.state != RDMA_RESOURCE_ACTIVE)
+      `uvm_error("CP_CREATE_AEQ", $sformatf("typed AEQ facade failed: %s",
+        result == null || result.status == null ? "null" :
+          result.status.convert2string()))
+
+    destroy_request = rdma_destroy_resource_req::type_id::create(
+      "typed_queue_destroy_request"
+    );
+    destroy_request.owner = binding.make_handle();
+    destroy_request.target_h = cq == null ? null : cq.handle;
+    cmq_before = cmq.calls.size();
+    control.destroy_ceq(binding, destroy_request, result);
+    if (result == null || result.status == null ||
+        result.status.code != RDMA_SC_INVALID_ARGUMENT ||
+        cmq.calls.size() != cmq_before)
+      `uvm_error("CP_KIND_GUARD", "CEQ API accepted a CQ handle")
+  endtask
+
   virtual task run_phase(uvm_phase phase);
     phase.raise_objection(this);
     check_configure_contract();
@@ -6550,6 +6742,7 @@ class rdma_control_plane_test extends uvm_test;
     check_transaction_id_exhaustion();
     check_owned_recovery_completion_hook_guard();
     check_lock_table_guard_contention();
+    check_typed_queue_facade();
     phase.drop_objection(this);
   endtask
 endclass

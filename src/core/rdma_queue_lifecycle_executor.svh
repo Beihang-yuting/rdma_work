@@ -65,16 +65,17 @@ class rdma_queue_lifecycle_executor extends uvm_object;
   );
     rdma_status status;
 
-    if (manager == null || cmq == null || host_mem == null ||
-        context_backing == null || command_timeout == 0)
+    if (manager == null || cmq == null || command_timeout == 0)
       return invalid_argument("queue executor configuration is incomplete");
     if (cq_policy == null || srq_policy == null || ceq_policy == null ||
         aeq_policy == null || planner == null || pd_codec == null)
       return invalid_state("queue executor policy construction failed");
-    status = normalize_status(planner.configure(host_mem),
-                              "queue planner configure returned null");
-    if (!status.ok())
-      return status;
+    if (host_mem != null) begin
+      status = normalize_status(planner.configure(host_mem),
+                                "queue planner configure returned null");
+      if (!status.ok())
+        return status;
+    end
     this.manager = manager;
     this.cmq = cmq;
     this.host_mem = host_mem;
@@ -841,7 +842,7 @@ class rdma_queue_lifecycle_executor extends uvm_object;
         break;
       end
       if (manager == null || cmq == null || host_mem == null ||
-          context_backing == null || command_timeout == 0) begin
+          command_timeout == 0) begin
         status = invalid_state("queue executor is not configured");
         break;
       end
@@ -857,6 +858,13 @@ class rdma_queue_lifecycle_executor extends uvm_object;
       if (!status.ok()) break;
       status = select_policy(request, policy);
       if (!status.ok()) break;
+      if ((policy == cq_policy || policy == srq_policy) &&
+          context_backing == null) begin
+        status = invalid_state(
+          "CQ/SRQ queue create requires a context-backing adapter"
+        );
+        break;
+      end
       status = normalize_status(policy.preflight(binding, request, manager,
                                                   preflight),
                                 "queue policy preflight returned null");
@@ -1068,6 +1076,37 @@ class rdma_queue_lifecycle_executor extends uvm_object;
       return;
     end while (1'b0);
 
+    publish_failure(status, result, RDMA_RESOURCE_NEW, 1'b0, 1'b0);
+  endtask
+
+  // Queue destruction is intentionally not routed through recovery until the
+  // dedicated delete/recovery transaction is introduced.  Keeping this
+  // locked entry point makes the facade use the same ownership boundary as
+  // create without inventing a second control-plane lock domain.
+  task destroy_locked(
+    rdma_function_binding binding,
+    rdma_function_handle expected_owner,
+    rdma_destroy_resource_req request,
+    longint unsigned transaction_id,
+    output rdma_control_result result
+  );
+    rdma_status status;
+
+    result = make_result(transaction_id);
+    if (transaction_id == 0)
+      status = invalid_argument("queue transaction ID is zero");
+    else if (binding == null || expected_owner == null || request == null ||
+             request.target_h == null)
+      status = invalid_argument("queue destroy authority is incomplete");
+    else begin
+      result.resource_h = rdma_clone_handle_value(
+        request.target_h, "queue destroy result"
+      );
+      status = rdma_status::make(
+        RDMA_SC_UNSUPPORTED_OPCODE,
+        "queue destroy transaction is not implemented"
+      );
+    end
     publish_failure(status, result, RDMA_RESOURCE_NEW, 1'b0, 1'b0);
   endtask
 endclass

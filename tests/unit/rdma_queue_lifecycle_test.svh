@@ -3458,6 +3458,41 @@ class rdma_queue_lifecycle_test extends uvm_test;
     check_executor_srq_rollback_order();
   endtask
 
+  task automatic check_executor_context_optional_for_eq();
+    rdma_function_binding binding;
+    rdma_fault_inject_resource_manager manager;
+    rdma_queue_executor_trace_mem mem;
+    rdma_mock_cmq_port cmq;
+    rdma_queue_lifecycle_executor executor;
+    rdma_semantic_request request;
+    rdma_queue_resource queue;
+    rdma_control_result result;
+
+    binding = make_binding("optional_context_binding");
+    manager = rdma_fault_inject_resource_manager::type_id::create(
+      "optional_context_manager"
+    );
+    mem = rdma_queue_executor_trace_mem::type_id::create(
+      "optional_context_mem"
+    );
+    mem.queue_kind = RDMA_RESOURCE_CEQ;
+    cmq = rdma_mock_cmq_port::type_id::create("optional_context_cmq");
+    executor = rdma_queue_lifecycle_executor::type_id::create(
+      "optional_context_executor"
+    );
+    expect_status("OPTIONAL_CONTEXT_CONFIGURE",
+                  executor.configure(manager, cmq, mem, null, 100ns),
+                  RDMA_SC_OK);
+    request = make_executor_request("optional_context_ceq_request",
+                                    RDMA_RESOURCE_CEQ, binding, null, 1'b0);
+    executor.create_locked(binding, binding.make_handle(), request, 64'd701,
+                           queue, result);
+    if (result == null || !result.ok() || queue == null ||
+        queue.resource_kind() != RDMA_RESOURCE_CEQ ||
+        queue.state != RDMA_RESOURCE_ACTIVE)
+      `uvm_error("OPTIONAL_CONTEXT_CEQ", "EQ create did not allow null context")
+  endtask
+
   task run_phase(uvm_phase phase);
     phase.raise_objection(this);
     check_preflight();
@@ -3465,6 +3500,7 @@ class rdma_queue_lifecycle_test extends uvm_test;
     check_backing_planner_negative();
     check_backing_planner_rollback_and_cleanup();
     check_contexts_and_commands();
+    check_executor_context_optional_for_eq();
     check_create_executor();
     phase.drop_objection(this);
   endtask

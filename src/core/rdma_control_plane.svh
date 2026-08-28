@@ -6,6 +6,8 @@ class rdma_control_plane extends uvm_object;
   protected rdma_stag_key_policy key_policy;
   protected rdma_host_mem_api host_mem;
   protected rdma_hmc_allocator hmc_allocator;
+  protected rdma_context_backing_api context_backing;
+  protected rdma_queue_lifecycle_executor queue_executor;
   protected time default_timeout;
   protected bit configured;
 
@@ -21,6 +23,8 @@ class rdma_control_plane extends uvm_object;
     key_policy = null;
     host_mem = null;
     hmc_allocator = null;
+    context_backing = null;
+    queue_executor = null;
     default_timeout = 0;
     configured = 1'b0;
     next_transaction_id = 1;
@@ -835,8 +839,11 @@ class rdma_control_plane extends uvm_object;
     rdma_stag_key_policy key_policy,
     rdma_host_mem_api host_mem = null,
     rdma_hmc_allocator hmc_allocator = null,
+    rdma_context_backing_api context_backing = null,
     time command_timeout = 1us
   );
+    rdma_status status;
+
     if (configured)
       return invalid_state("control plane is already configured");
     if (resource_manager == null)
@@ -853,10 +860,333 @@ class rdma_control_plane extends uvm_object;
     this.key_policy = key_policy;
     this.host_mem = host_mem;
     this.hmc_allocator = hmc_allocator;
+    this.context_backing = context_backing;
     default_timeout = command_timeout;
+    queue_executor = rdma_queue_lifecycle_executor::type_id::create(
+      "control_plane_queue_executor"
+    );
+    if (queue_executor == null)
+      return invalid_state("queue lifecycle executor construction failed");
+    status = queue_executor.configure(
+      resource_manager, cmq_port, host_mem, context_backing, command_timeout
+    );
+    status = checked_status(status, "queue executor configure returned null");
+    if (!status.ok()) begin
+      queue_executor = null;
+      return status;
+    end
     configured = 1'b1;
     return rdma_status::success();
   endfunction
+
+  protected function rdma_status queue_request_status(
+    rdma_semantic_request request,
+    rdma_function_handle owner,
+    string label
+  );
+    rdma_status status;
+
+    if (request == null)
+      return invalid_argument({label, " request is null"});
+    status = request.validate();
+    if (status == null)
+      return invalid_state({label, " request validation returned null"});
+    if (!status.ok())
+      return rdma_cmq_clone_status_value(status);
+    return same_owner_status(request.owner, owner, label);
+  endfunction
+
+  protected function rdma_status queue_target_owner_status(
+    rdma_handle target,
+    rdma_function_handle owner,
+    string label
+  );
+    if (target == null)
+      return invalid_argument({label, " target handle is null"});
+    if (owner == null || owner.kind != RDMA_RESOURCE_FUNCTION)
+      return invalid_state({label, " Function owner is invalid"});
+    if (target.function_uid != owner.function_uid)
+      return invalid_argument({label, " target belongs to another Function"});
+    if (target.generation != owner.generation)
+      return rdma_status::make(RDMA_SC_STALE_GENERATION,
+                               {label, " target generation is stale"});
+    return rdma_status::success();
+  endfunction
+
+  protected task create_queue_facade(
+    rdma_function_binding binding,
+    rdma_semantic_request request,
+    bit requires_context,
+    output rdma_queue_resource queue,
+    output rdma_control_result result
+  );
+    rdma_function_handle owner;
+    rdma_function_handle locked_owner;
+    rdma_status status;
+    semaphore function_lock;
+    longint unsigned transaction_id;
+
+    queue = null;
+    result = make_result();
+    function_lock = null;
+    reserve_transaction_id(transaction_id, status);
+    result.transaction_id = transaction_id;
+    do begin
+      if (status == null || !status.ok()) begin
+        status = checked_status(status,
+                                "queue transaction ID allocation returned null");
+        break;
+      end
+      status = configured_status();
+      if (status == null || !status.ok()) begin
+        status = checked_status(status,
+                                "queue control-plane configuration check returned null");
+        break;
+      end
+      if (queue_executor == null) begin
+        status = invalid_state("queue lifecycle executor is unavailable");
+        break;
+      end
+      if (host_mem == null) begin
+        status = invalid_state("queue create requires a host-memory adapter");
+        break;
+      end
+      if (requires_context && context_backing == null) begin
+        status = invalid_state(
+          "CQ/SRQ queue create requires a context-backing adapter"
+        );
+        break;
+      end
+      status = binding_owner_status(binding, owner);
+      if (status == null || !status.ok()) begin
+        status = checked_status(status,
+                                "queue Function binding check returned null");
+        break;
+      end
+      status = queue_request_status(request, owner, "queue create request");
+      if (status == null || !status.ok()) begin
+        status = checked_status(status,
+                                "queue create request check returned null");
+        break;
+      end
+
+      acquire_function_lock(owner, function_lock);
+      status = binding_owner_status(binding, locked_owner);
+      if (status == null || !status.ok()) begin
+        status = checked_status(status,
+                                "post-lock queue Function check returned null");
+        break;
+      end
+      status = same_owner_status(locked_owner, owner,
+                                 "post-lock queue Function");
+      if (status == null || !status.ok()) begin
+        status = checked_status(status,
+                                "post-lock queue Function identity returned null");
+        break;
+      end
+      status = queue_request_status(request, locked_owner,
+                                    "post-lock queue create request");
+      if (status == null || !status.ok()) begin
+        status = checked_status(status,
+                                "post-lock queue request check returned null");
+        break;
+      end
+      queue_executor.create_locked(binding, owner, request, transaction_id,
+                                   queue, result);
+      status = (result == null) ?
+        invalid_state("queue executor returned a null result") :
+        rdma_cmq_clone_status_value(result.status);
+      if (status == null)
+        status = invalid_state("queue executor result status is null");
+      break;
+    end while (1'b0);
+    if (result == null)
+      result = make_result();
+    if (status == null || !status.ok()) begin
+      queue = null;
+      finish_result(result, status);
+    end
+    if (function_lock != null)
+      function_lock.put(1);
+  endtask
+
+  protected task destroy_queue_facade(
+    rdma_function_binding binding,
+    rdma_destroy_resource_req request,
+    rdma_resource_kind_e expected_kind,
+    output rdma_control_result result
+  );
+    rdma_function_handle owner;
+    rdma_function_handle locked_owner;
+    rdma_status status;
+    semaphore function_lock;
+    longint unsigned transaction_id;
+
+    result = make_result();
+    function_lock = null;
+    reserve_transaction_id(transaction_id, status);
+    result.transaction_id = transaction_id;
+    do begin
+      if (status == null || !status.ok()) begin
+        status = checked_status(status,
+                                "queue destroy transaction ID returned null");
+        break;
+      end
+      status = configured_status();
+      if (status == null || !status.ok()) begin
+        status = checked_status(status,
+                                "queue destroy configuration check returned null");
+        break;
+      end
+      status = binding_owner_status(binding, owner);
+      if (status == null || !status.ok()) begin
+        status = checked_status(status,
+                                "queue destroy Function check returned null");
+        break;
+      end
+      status = queue_request_status(request, owner, "queue destroy request");
+      if (status == null || !status.ok()) begin
+        status = checked_status(status,
+                                "queue destroy request check returned null");
+        break;
+      end
+      if (request.target_h.kind != expected_kind) begin
+        status = invalid_argument("queue destroy target kind is invalid");
+        break;
+      end
+      status = queue_target_owner_status(request.target_h, owner,
+                                         "queue destroy target");
+      if (status == null || !status.ok()) break;
+
+      acquire_function_lock(owner, function_lock);
+      status = binding_owner_status(binding, locked_owner);
+      if (status == null || !status.ok()) begin
+        status = checked_status(status,
+                                "post-lock queue destroy Function returned null");
+        break;
+      end
+      status = same_owner_status(locked_owner, owner,
+                                 "post-lock queue destroy Function");
+      if (status == null || !status.ok()) break;
+      if (request.target_h.kind != expected_kind) begin
+        status = invalid_argument("post-lock queue destroy target kind is invalid");
+        break;
+      end
+      status = queue_target_owner_status(request.target_h, locked_owner,
+                                         "post-lock queue destroy target");
+      if (status == null || !status.ok()) break;
+      queue_executor.destroy_locked(binding, owner, request,
+                                    transaction_id, result);
+      status = (result == null) ?
+        invalid_state("queue destroy executor returned null result") :
+        rdma_cmq_clone_status_value(result.status);
+      break;
+    end while (1'b0);
+    if (status == null || !status.ok())
+      finish_result(result, status);
+    if (function_lock != null)
+      function_lock.put(1);
+  endtask
+
+  task create_cq(
+    rdma_function_binding binding,
+    rdma_create_cq_req request,
+    output rdma_cq cq,
+    output rdma_control_result result
+  );
+    rdma_queue_resource queue;
+    cq = null;
+    create_queue_facade(binding, request, 1'b1, queue, result);
+    if (result != null && result.ok()) begin
+      if (!$cast(cq, queue) || cq == null || cq.state != RDMA_RESOURCE_ACTIVE) begin
+        cq = null;
+        finish_result(result, invalid_state("typed CQ projection is invalid"));
+      end
+    end
+  endtask
+
+  task create_srq(
+    rdma_function_binding binding,
+    rdma_create_srq_req request,
+    output rdma_srq srq,
+    output rdma_control_result result
+  );
+    rdma_queue_resource queue;
+    srq = null;
+    create_queue_facade(binding, request, 1'b1, queue, result);
+    if (result != null && result.ok()) begin
+      if (!$cast(srq, queue) || srq == null || srq.state != RDMA_RESOURCE_ACTIVE) begin
+        srq = null;
+        finish_result(result, invalid_state("typed SRQ projection is invalid"));
+      end
+    end
+  endtask
+
+  task create_ceq(
+    rdma_function_binding binding,
+    rdma_create_ceq_req request,
+    output rdma_ceq ceq,
+    output rdma_control_result result
+  );
+    rdma_queue_resource queue;
+    ceq = null;
+    create_queue_facade(binding, request, 1'b0, queue, result);
+    if (result != null && result.ok()) begin
+      if (!$cast(ceq, queue) || ceq == null || ceq.state != RDMA_RESOURCE_ACTIVE) begin
+        ceq = null;
+        finish_result(result, invalid_state("typed CEQ projection is invalid"));
+      end
+    end
+  endtask
+
+  task create_aeq(
+    rdma_function_binding binding,
+    rdma_create_aeq_req request,
+    output rdma_aeq aeq,
+    output rdma_control_result result
+  );
+    rdma_queue_resource queue;
+    aeq = null;
+    create_queue_facade(binding, request, 1'b0, queue, result);
+    if (result != null && result.ok()) begin
+      if (!$cast(aeq, queue) || aeq == null || aeq.state != RDMA_RESOURCE_ACTIVE) begin
+        aeq = null;
+        finish_result(result, invalid_state("typed AEQ projection is invalid"));
+      end
+    end
+  endtask
+
+  task destroy_cq(
+    rdma_function_binding binding,
+    rdma_destroy_resource_req request,
+    output rdma_control_result result
+  );
+    destroy_queue_facade(binding, request, RDMA_RESOURCE_CQ, result);
+  endtask
+
+  task destroy_srq(
+    rdma_function_binding binding,
+    rdma_destroy_resource_req request,
+    output rdma_control_result result
+  );
+    destroy_queue_facade(binding, request, RDMA_RESOURCE_SRQ, result);
+  endtask
+
+  task destroy_ceq(
+    rdma_function_binding binding,
+    rdma_destroy_resource_req request,
+    output rdma_control_result result
+  );
+    destroy_queue_facade(binding, request, RDMA_RESOURCE_CEQ, result);
+  endtask
+
+  task destroy_aeq(
+    rdma_function_binding binding,
+    rdma_destroy_resource_req request,
+    output rdma_control_result result
+  );
+    destroy_queue_facade(binding, request, RDMA_RESOURCE_AEQ, result);
+  endtask
 
   task create_pd(
     rdma_function_binding binding,
