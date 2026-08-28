@@ -9,6 +9,7 @@ package rdma_core_pkg;
   `include "rdma_stag_key_policy.svh"
   `include "rdma_hmc_allocator.svh"
   `include "rdma_resource_manager.svh"
+  `include "rdma_queue_lifecycle_policy.svh"
   `include "rdma_doorbell_scheduler.svh"
   `include "rdma_cmq_port.svh"
   `include "rdma_control_plane.svh"
