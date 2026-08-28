@@ -2885,6 +2885,14 @@ class rdma_queue_lifecycle_test extends uvm_test;
                     RDMA_SC_RESOURCE_BUSY);
       return;
     end
+    if (mode == 9) begin
+      if (result.status.code != RDMA_SC_STALE_GENERATION ||
+          cmq.calls.size() != 1 || manager.release_reserved_calls != 0)
+        `uvm_error(label, "stale generation crossed rollback authority")
+      status = manager.release_reserved(dependency.handle);
+      expect_status({label, "_DEPENDENCY_RELEASE"}, status, RDMA_SC_OK);
+      return;
+    end
     if (queue != null || result.recovery_required ||
         result.status.code != result.primary_status.code ||
         !result.final_resource_state_known ||
