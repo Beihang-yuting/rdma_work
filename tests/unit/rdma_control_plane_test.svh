@@ -6700,6 +6700,202 @@ class rdma_control_plane_test extends uvm_test;
       `uvm_error("CP_KIND_GUARD", "CEQ API accepted a CQ handle")
   endtask
 
+  task automatic check_typed_queue_lock_serialization();
+    rdma_control_plane_probe control;
+    rdma_resource_manager manager;
+    rdma_mock_cmq_port cmq;
+    rdma_mock_stag_key_policy key_policy;
+    rdma_mock_host_mem host_mem;
+    rdma_mock_context_backing context_backing;
+    rdma_function_binding binding;
+    rdma_create_pd_req pd_request;
+    rdma_register_mr_req mr_request;
+    rdma_mr_backing_desc backing;
+    rdma_create_cq_req cq_request;
+    rdma_pd pd;
+    rdma_ceq dependency;
+    rdma_mr mr;
+    rdma_cq cq;
+    rdma_control_result result;
+    rdma_control_result cq_result;
+    rdma_status status;
+    bit mr_entered;
+    bit cq_done;
+    bit entered;
+
+    control = rdma_control_plane_probe::type_id::create("serial_control");
+    manager = rdma_resource_manager::type_id::create("serial_manager");
+    cmq = rdma_mock_cmq_port::type_id::create("serial_cmq");
+    key_policy = rdma_mock_stag_key_policy::type_id::create("serial_policy");
+    host_mem = rdma_mock_host_mem::type_id::create("serial_mem");
+    context_backing = rdma_mock_context_backing::type_id::create("serial_context");
+    binding = make_active_binding("serial_binding", 64'hfc00_0000_0000_0001,
+                                  32'hfc00_0101, 131);
+    status = control.configure(manager, cmq, key_policy, host_mem, null,
+                               context_backing, 2us);
+    expect_status("SERIAL_CONFIGURE", status, RDMA_SC_OK);
+    pd_request = make_create_pd_request("serial_pd_request", binding);
+    control.create_pd(binding, pd_request, pd, result);
+    expect_result("SERIAL_PD", result, RDMA_SC_OK);
+    status = manager.create_ceq(binding, dependency);
+    expect_status("SERIAL_DEPENDENCY", status, RDMA_SC_OK);
+    if (pd == null || dependency == null)
+      return;
+    mr_request = make_register_mr_request("serial_mr_request", binding, pd);
+    backing = make_borrowed_pbl0_backing("serial_mr_backing", binding,
+                                          mr_request);
+    cq_request = make_create_cq_request("serial_cq_request", binding,
+                                        dependency);
+    cmq.gate_opcode(XTR_V1_OP_KEY_ALLOC);
+    mr_entered = 1'b0;
+    cq_done = 1'b0;
+    fork
+      begin
+        control.register_mr(binding, mr_request, backing, mr, result);
+        mr_entered = 1'b1;
+      end
+      begin
+        cmq.wait_until_entered(1, 1us, entered);
+        if (!entered)
+          `uvm_error("SERIAL_MR_GATE", "MR did not enter the CMQ gate")
+        else begin
+          fork
+            begin
+              control.create_cq(binding, cq_request, cq, cq_result);
+              cq_done = 1'b1;
+            end
+          join_none
+          #1ns;
+          if (cmq.calls.size() != 0)
+            `uvm_error("SERIAL_CMQ_OVERLAP",
+                       "same-Function CQ reached CMQ while MR was gated")
+          cmq.release_one();
+          wait (cq_done);
+        end
+      end
+    join
+    expect_result("SERIAL_MR_RESULT", result, RDMA_SC_OK);
+    expect_result("SERIAL_CQ_RESULT", cq_result, RDMA_SC_OK);
+  endtask
+
+  task automatic check_typed_queue_cross_function_barrier();
+    rdma_control_plane controls[2];
+    rdma_resource_manager managers[2];
+    rdma_mock_host_mem mem[2];
+    rdma_mock_context_backing contexts[2];
+    rdma_mock_stag_key_policy policies[2];
+    rdma_function_binding bindings[2];
+    rdma_mock_cmq_port cmq;
+    rdma_create_ceq_req requests[2];
+    rdma_ceq ceqs[2];
+    rdma_control_result results[2];
+    rdma_status status;
+    bit done[2];
+    bit entered;
+
+    cmq = rdma_mock_cmq_port::type_id::create("cross_function_cmq");
+    for (int unsigned i = 0; i < 2; i++) begin
+      controls[i] = rdma_control_plane::type_id::create(
+        $sformatf("cross_function_control_%0d", i)
+      );
+      managers[i] = rdma_resource_manager::type_id::create(
+        $sformatf("cross_function_manager_%0d", i)
+      );
+      mem[i] = rdma_mock_host_mem::type_id::create(
+        $sformatf("cross_function_mem_%0d", i)
+      );
+      contexts[i] = rdma_mock_context_backing::type_id::create(
+        $sformatf("cross_function_context_%0d", i)
+      );
+      policies[i] = rdma_mock_stag_key_policy::type_id::create(
+        $sformatf("cross_function_policy_%0d", i)
+      );
+      bindings[i] = make_active_binding(
+        $sformatf("cross_function_binding_%0d", i),
+        64'hfd00_0000_0000_0000 + i + 1,
+        32'hfd00_0101 + i, 137
+      );
+      status = controls[i].configure(managers[i], cmq, policies[i], mem[i],
+                                     null, contexts[i], 2us);
+      expect_status($sformatf("CROSS_FUNCTION_CONFIGURE_%0d", i), status,
+                    RDMA_SC_OK);
+      requests[i] = make_create_ceq_request(
+        $sformatf("cross_function_request_%0d", i), bindings[i]
+      );
+      done[i] = 1'b0;
+    end
+
+    cmq.gate_opcode_count(XTR_V1_OP_CEQC_CREATE, 2);
+    fork
+      begin
+        controls[0].create_ceq(bindings[0], requests[0], ceqs[0], results[0]);
+        done[0] = 1'b1;
+      end
+      begin
+        controls[1].create_ceq(bindings[1], requests[1], ceqs[1], results[1]);
+        done[1] = 1'b1;
+      end
+      begin
+        cmq.wait_until_entered(2, 1us, entered);
+        if (!entered)
+          `uvm_error("CROSS_FUNCTION_BARRIER", "both EQ creates did not enter")
+        cmq.release_one();
+        wait (done[0] && done[1]);
+      end
+    join
+    expect_result("CROSS_FUNCTION_RESULT_A", results[0], RDMA_SC_OK);
+    expect_result("CROSS_FUNCTION_RESULT_B", results[1], RDMA_SC_OK);
+  endtask
+
+  task automatic check_typed_queue_rebind_while_waiting();
+    rdma_control_plane_probe control;
+    rdma_resource_manager manager;
+    rdma_mock_cmq_port cmq;
+    rdma_mock_stag_key_policy policy;
+    rdma_mock_host_mem mem;
+    rdma_mock_context_backing context_adapter;
+    rdma_function_binding binding;
+    rdma_ceq dependency;
+    rdma_create_cq_req request;
+    rdma_cq cq;
+    rdma_control_result result;
+    rdma_status status;
+    semaphore held_lock;
+    int unsigned baseline_allocations;
+
+    control = rdma_control_plane_probe::type_id::create("rebind_control");
+    manager = rdma_resource_manager::type_id::create("rebind_manager");
+    cmq = rdma_mock_cmq_port::type_id::create("rebind_cmq");
+    policy = rdma_mock_stag_key_policy::type_id::create("rebind_policy");
+    mem = rdma_mock_host_mem::type_id::create("rebind_mem");
+    context_adapter = rdma_mock_context_backing::type_id::create("rebind_context");
+    binding = make_active_binding("rebind_binding", 64'hfe00_0000_0000_0001,
+                                  32'hfe00_0101, 149);
+    status = control.configure(manager, cmq, policy, mem, null, context_adapter, 2us);
+    expect_status("REBIND_CONFIGURE", status, RDMA_SC_OK);
+    status = manager.create_ceq(binding, dependency);
+    expect_status("REBIND_DEPENDENCY", status, RDMA_SC_OK);
+    if (dependency == null)
+      return;
+    request = make_create_cq_request("rebind_request", binding, dependency);
+    baseline_allocations = mem.live_allocations();
+    control.acquire_test_function_lock(binding.make_handle(), held_lock);
+    fork
+      begin
+        control.create_cq(binding, request, cq, result);
+      end
+      begin
+        #1ns;
+        binding.generation++;
+        binding.owner_h = binding.make_handle();
+        control.release_test_function_lock(held_lock);
+      end
+    join
+    expect_result("REBIND_RESULT", result, RDMA_SC_STALE_GENERATION);
+    if (cq != null || mem.live_allocations() != baseline_allocations)
+      `uvm_error("REBIND_NO_BACKING", "stale queue create allocated backing")
+  endtask
+
   virtual task run_phase(uvm_phase phase);
     phase.raise_objection(this);
     check_configure_contract();
@@ -6743,6 +6939,9 @@ class rdma_control_plane_test extends uvm_test;
     check_owned_recovery_completion_hook_guard();
     check_lock_table_guard_contention();
     check_typed_queue_facade();
+    check_typed_queue_lock_serialization();
+    check_typed_queue_cross_function_barrier();
+    check_typed_queue_rebind_while_waiting();
     phase.drop_objection(this);
   endtask
 endclass

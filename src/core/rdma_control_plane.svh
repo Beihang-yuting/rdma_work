@@ -917,6 +917,7 @@ class rdma_control_plane extends uvm_object;
     rdma_function_binding binding,
     rdma_semantic_request request,
     bit requires_context,
+    rdma_resource_kind_e expected_kind,
     output rdma_queue_resource queue,
     output rdma_control_result result
   );
@@ -993,6 +994,13 @@ class rdma_control_plane extends uvm_object;
       end
       queue_executor.create_locked(binding, owner, request, transaction_id,
                                    queue, result);
+      if (result != null && result.ok() &&
+          (queue == null || queue.resource_kind() != expected_kind)) begin
+        queue = null;
+        status = invalid_state("queue executor returned the wrong resource kind");
+        finish_result(result, status);
+        break;
+      end
       status = (result == null) ?
         invalid_state("queue executor returned a null result") :
         rdma_cmq_clone_status_value(result.status);
@@ -1096,7 +1104,7 @@ class rdma_control_plane extends uvm_object;
   );
     rdma_queue_resource queue;
     cq = null;
-    create_queue_facade(binding, request, 1'b1, queue, result);
+    create_queue_facade(binding, request, 1'b1, RDMA_RESOURCE_CQ, queue, result);
     if (result != null && result.ok()) begin
       if (!$cast(cq, queue) || cq == null || cq.state != RDMA_RESOURCE_ACTIVE) begin
         cq = null;
@@ -1113,7 +1121,7 @@ class rdma_control_plane extends uvm_object;
   );
     rdma_queue_resource queue;
     srq = null;
-    create_queue_facade(binding, request, 1'b1, queue, result);
+    create_queue_facade(binding, request, 1'b1, RDMA_RESOURCE_SRQ, queue, result);
     if (result != null && result.ok()) begin
       if (!$cast(srq, queue) || srq == null || srq.state != RDMA_RESOURCE_ACTIVE) begin
         srq = null;
@@ -1130,7 +1138,7 @@ class rdma_control_plane extends uvm_object;
   );
     rdma_queue_resource queue;
     ceq = null;
-    create_queue_facade(binding, request, 1'b0, queue, result);
+    create_queue_facade(binding, request, 1'b0, RDMA_RESOURCE_CEQ, queue, result);
     if (result != null && result.ok()) begin
       if (!$cast(ceq, queue) || ceq == null || ceq.state != RDMA_RESOURCE_ACTIVE) begin
         ceq = null;
@@ -1147,7 +1155,7 @@ class rdma_control_plane extends uvm_object;
   );
     rdma_queue_resource queue;
     aeq = null;
-    create_queue_facade(binding, request, 1'b0, queue, result);
+    create_queue_facade(binding, request, 1'b0, RDMA_RESOURCE_AEQ, queue, result);
     if (result != null && result.ok()) begin
       if (!$cast(aeq, queue) || aeq == null || aeq.state != RDMA_RESOURCE_ACTIVE) begin
         aeq = null;
