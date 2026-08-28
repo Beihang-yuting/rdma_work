@@ -36,20 +36,118 @@ class rdma_context_backing_contract_test extends uvm_test;
     return binding;
   endfunction
 
+  function automatic bit bytes_equal(
+    byte unsigned lhs[],
+    byte unsigned rhs[]
+  );
+    if (lhs.size() != rhs.size())
+      return 1'b0;
+    foreach (lhs[i]) begin
+      if (lhs[i] != rhs[i])
+        return 1'b0;
+    end
+    return 1'b1;
+  endfunction
+
+  function automatic void snapshot_slot(
+    string check_name,
+    rdma_mock_context_backing context_api,
+    rdma_context_backing_ref context_ref,
+    output byte unsigned snapshot[]
+  );
+    rdma_status status;
+
+    snapshot = new[context_ref.slot_length];
+    foreach (snapshot[i]) begin
+      status = context_api.read_slot_byte(context_ref, i, snapshot[i]);
+      if (status == null || !status.ok())
+        `uvm_error(
+          check_name,
+          $sformatf("failed reading slot byte %0d", i)
+        )
+    end
+  endfunction
+
+  function automatic void expect_slots_unchanged(
+    string check_name,
+    rdma_mock_context_backing context_api,
+    rdma_context_backing_ref first_ref,
+    byte unsigned first_before[],
+    rdma_context_backing_ref second_ref,
+    byte unsigned second_before[]
+  );
+    byte unsigned first_after[];
+    byte unsigned second_after[];
+
+    snapshot_slot({check_name, "_FIRST_READ"}, context_api, first_ref,
+                  first_after);
+    snapshot_slot({check_name, "_SECOND_READ"}, context_api, second_ref,
+                  second_after);
+    if (!bytes_equal(first_before, first_after))
+      `uvm_error(check_name, "failed operation changed target slot")
+    if (!bytes_equal(second_before, second_after))
+      `uvm_error(check_name, "failed operation changed adjacent slot")
+  endfunction
+
+  function automatic void expect_trace(
+    rdma_mock_context_backing context_api,
+    string expected[$]
+  );
+    if (context_api.call_trace.size() != expected.size()) begin
+      `uvm_error(
+        "CALL_TRACE_SIZE",
+        $sformatf("expected %0d calls got %0d",
+                  expected.size(), context_api.call_trace.size())
+      )
+      return;
+    end
+    foreach (expected[i]) begin
+      if (context_api.call_trace[i] != expected[i])
+        `uvm_error(
+          "CALL_TRACE_ORDER",
+          $sformatf("call %0d expected %s got %s", i, expected[i],
+                    context_api.call_trace[i])
+        )
+    end
+  endfunction
+
   task run_phase(uvm_phase phase);
     rdma_mock_context_backing context_api;
     rdma_function_binding binding;
-    rdma_context_backing_ref cq_ref, cq_clone, neighbor_ref, srq_ref;
-    rdma_context_backing_ref bad_ref;
+    rdma_context_backing_ref failed_ref, cq_ref, cq_clone;
+    rdma_context_backing_ref neighbor_ref, srq_ref, bad_ref;
     rdma_queue_slot_token_contract cq_token, clone_token;
+    rdma_queue_slot_token_contract neighbor_token, srq_token;
     uvm_object cloned;
-    byte bytes[];
-    byte observed;
+    byte unsigned bytes[];
+    byte unsigned cq_snapshot[];
+    byte unsigned neighbor_snapshot[];
+    byte unsigned cq_after_success[];
+    byte unsigned neighbor_after_seed[];
+    byte unsigned srq_after_success[];
+    string expected_trace[$];
     bit complete;
 
     phase.raise_objection(this);
     context_api = rdma_mock_context_backing::type_id::create("context_api");
     binding = make_binding("binding");
+
+    expect_status(
+      "ACQUIRE_FAILURE_QUEUE",
+      context_api.fail_next(
+        "acquire",
+        rdma_status::make(RDMA_SC_TIMEOUT, "injected acquire failure")
+      ),
+      RDMA_SC_OK
+    );
+    expect_status(
+      "CQC_INJECTED_ACQUIRE",
+      context_api.acquire(binding, RDMA_RESOURCE_CQ, 20, failed_ref),
+      RDMA_SC_TIMEOUT
+    );
+    if (failed_ref != null || context_api.slots.size() != 0 ||
+        context_api.release_call_count != 0)
+      `uvm_error("CQC_INJECTED_ACQUIRE", "failed acquire changed mock state")
 
     expect_status(
       "CQC_ACQUIRE",
@@ -72,33 +170,17 @@ class rdma_context_backing_contract_test extends uvm_test;
         clone_token.completion_authority !== cq_token.completion_authority)
       `uvm_error("CQC_CLONE", "CQC clone lost shared completion authority")
 
-    bytes = new[8];
-    foreach (bytes[i]) bytes[i] = byte'(8'ha0 + i);
-    expect_status(
-      "CQC_SHADOW_WRITE",
-      context_api.write(cq_ref, 48, bytes),
-      RDMA_SC_OK
-    );
-    bytes = new[9];
-    foreach (bytes[i]) bytes[i] = 8'h5a;
-    expect_status(
-      "CQC_BOUNDS",
-      context_api.write(cq_ref, 48, bytes),
-      RDMA_SC_DMA_TRANSLATION
-    );
-    expect_status(
-      "CQC_ATOMIC_READ",
-      context_api.read_slot_byte(cq_ref, 48, observed),
-      RDMA_SC_OK
-    );
-    if (observed != 8'ha0)
-      `uvm_error("CQC_ATOMIC", "failed write partially changed the slot")
-
     expect_status(
       "CQC_NEIGHBOR_ACQUIRE",
       context_api.acquire(binding, RDMA_RESOURCE_CQ, 22, neighbor_ref),
       RDMA_SC_OK
     );
+    if (!$cast(neighbor_token, neighbor_ref.slot_token) ||
+        neighbor_token.completion_authority == null ||
+        neighbor_token === cq_token ||
+        neighbor_token.completion_authority === cq_token.completion_authority)
+      `uvm_error("CQC_NEIGHBOR_TOKEN", "separate acquires share authority")
+
     bytes = new[1];
     bytes[0] = 8'hc7;
     expect_status(
@@ -106,27 +188,62 @@ class rdma_context_backing_contract_test extends uvm_test;
       context_api.write(neighbor_ref, 0, bytes),
       RDMA_SC_OK
     );
+    snapshot_slot("CQC_NEIGHBOR_SEED_READ", context_api, neighbor_ref,
+                  neighbor_after_seed);
+    foreach (neighbor_after_seed[i]) begin
+      if (neighbor_after_seed[i] != (i == 0 ? 8'hc7 : 8'h00))
+        `uvm_error("CQC_NEIGHBOR_SEED", "neighbor seed write was ignored")
+    end
+
+    bytes = new[8];
+    foreach (bytes[i]) bytes[i] = byte'(8'ha0 + i);
     expect_status(
-      "CQC_QUEUE_FAILURE",
+      "CQC_SHADOW_WRITE",
+      context_api.write(cq_ref, 48, bytes),
+      RDMA_SC_OK
+    );
+    snapshot_slot("CQC_SHADOW_READ", context_api, cq_ref, cq_after_success);
+    foreach (cq_after_success[i]) begin
+      if (i >= 48 && i < 56) begin
+        if (cq_after_success[i] != byte'(8'ha0 + i - 48))
+          `uvm_error("CQC_SHADOW_READ", "CQ shadow byte was not written")
+      end else if (cq_after_success[i] != 8'h00) begin
+        `uvm_error("CQC_SHADOW_READ", "CQ shadow write changed another byte")
+      end
+    end
+
+    snapshot_slot("CQC_BOUNDS_BEFORE", context_api, cq_ref, cq_snapshot);
+    snapshot_slot("CQC_BOUNDS_NEIGHBOR_BEFORE", context_api, neighbor_ref,
+                  neighbor_snapshot);
+    bytes = new[9];
+    foreach (bytes[i]) bytes[i] = 8'h5a;
+    expect_status(
+      "CQC_BOUNDS",
+      context_api.write(cq_ref, 48, bytes),
+      RDMA_SC_DMA_TRANSLATION
+    );
+    expect_slots_unchanged("CQC_BOUNDS_ATOMIC", context_api, cq_ref,
+                           cq_snapshot, neighbor_ref, neighbor_snapshot);
+
+    expect_status(
+      "WRITE_FAILURE_QUEUE",
       context_api.fail_next(
         "write",
         rdma_status::make(RDMA_SC_TIMEOUT, "injected write failure")
       ),
       RDMA_SC_OK
     );
-    bytes[0] = 8'h3c;
+    bytes = new[64];
+    foreach (bytes[i]) bytes[i] = byte'(8'h30 + i);
     expect_status(
       "CQC_INJECTED_WRITE",
       context_api.write(neighbor_ref, 0, bytes),
       RDMA_SC_TIMEOUT
     );
-    expect_status(
-      "CQC_INJECTED_ATOMIC_READ",
-      context_api.read_slot_byte(neighbor_ref, 0, observed),
-      RDMA_SC_OK
-    );
-    if (observed != 8'hc7)
-      `uvm_error("CQC_INJECTED_ATOMIC", "failed call changed slot data")
+    expect_slots_unchanged("CQC_INJECTED_WRITE_ATOMIC", context_api,
+                           neighbor_ref, neighbor_snapshot, cq_ref,
+                           cq_snapshot);
+
     bytes = new[2];
     bytes[0] = 8'h11;
     bytes[1] = 8'h22;
@@ -135,23 +252,22 @@ class rdma_context_backing_contract_test extends uvm_test;
       context_api.write(cq_ref, 63, bytes),
       RDMA_SC_DMA_TRANSLATION
     );
-    expect_status(
-      "CQC_NEIGHBOR_READ",
-      context_api.read_slot_byte(neighbor_ref, 0, observed),
-      RDMA_SC_OK
-    );
-    if (observed != 8'hc7)
-      `uvm_error("CQC_NEIGHBOR", "cross-slot write corrupted neighbor")
+    expect_slots_unchanged("CQC_CROSS_SLOT_ATOMIC", context_api, cq_ref,
+                           cq_snapshot, neighbor_ref, neighbor_snapshot);
 
+    bytes = new[1];
+    bytes[0] = 8'he1;
     cloned = cq_ref.clone();
     void'($cast(bad_ref, cloned));
     bad_ref.local_id++;
-    bytes = new[1];
     expect_status(
       "CQC_LOCAL_ID_AUTHORITY",
       context_api.write(bad_ref, 0, bytes),
       RDMA_SC_INVALID_ARGUMENT
     );
+    expect_slots_unchanged("CQC_LOCAL_ID_ATOMIC", context_api, cq_ref,
+                           cq_snapshot, neighbor_ref, neighbor_snapshot);
+
     cloned = cq_ref.clone();
     void'($cast(bad_ref, cloned));
     bad_ref.resource_kind = RDMA_RESOURCE_SRQ;
@@ -160,6 +276,9 @@ class rdma_context_backing_contract_test extends uvm_test;
       context_api.write(bad_ref, 0, bytes),
       RDMA_SC_INVALID_ARGUMENT
     );
+    expect_slots_unchanged("CQC_KIND_ATOMIC", context_api, cq_ref,
+                           cq_snapshot, neighbor_ref, neighbor_snapshot);
+
     cloned = cq_ref.clone();
     void'($cast(bad_ref, cloned));
     bad_ref.owner.function_uid++;
@@ -168,29 +287,118 @@ class rdma_context_backing_contract_test extends uvm_test;
       context_api.write(bad_ref, 0, bytes),
       RDMA_SC_INVALID_ARGUMENT
     );
+    expect_slots_unchanged("CQC_OWNER_ATOMIC", context_api, cq_ref,
+                           cq_snapshot, neighbor_ref, neighbor_snapshot);
+
     cloned = cq_ref.clone();
     void'($cast(bad_ref, cloned));
-    bad_ref.slot_token = rdma_queue_opaque_slot_token::type_id::create(
-      "unrecognized_token"
-    );
+    bad_ref.slot_token = neighbor_ref.slot_token;
     expect_status(
-      "CQC_TOKEN_AUTHORITY",
+      "CQC_NEIGHBOR_TOKEN_AUTHORITY",
       context_api.write(bad_ref, 0, bytes),
       RDMA_SC_INVALID_ARGUMENT
     );
+    expect_slots_unchanged("CQC_NEIGHBOR_TOKEN_ATOMIC", context_api, cq_ref,
+                           cq_snapshot, neighbor_ref, neighbor_snapshot);
+
+    expect_status(
+      "QUERY_FAILURE_QUEUE",
+      context_api.fail_next(
+        "query_release_completion",
+        rdma_status::make(RDMA_SC_TIMEOUT, "injected query failure")
+      ),
+      RDMA_SC_OK
+    );
+    complete = 1'b1;
+    expect_status(
+      "CQC_INJECTED_QUERY",
+      context_api.query_release_completion(cq_ref, complete),
+      RDMA_SC_TIMEOUT
+    );
+    if (complete || context_api.release_call_count != 0)
+      `uvm_error("CQC_INJECTED_QUERY", "failed query changed release state")
+    repeat (2) begin
+      complete = 1'b1;
+      expect_status(
+        "CQC_QUERY_BEFORE_RELEASE",
+        context_api.query_release_completion(cq_ref, complete),
+        RDMA_SC_OK
+      );
+      if (complete || context_api.release_call_count != 0)
+        `uvm_error("CQC_QUERY_BEFORE_RELEASE", "query mutated release state")
+    end
+    complete = 1'b1;
+    expect_status(
+      "CQC_NEIGHBOR_QUERY_BEFORE_RELEASE",
+      context_api.query_release_completion(neighbor_ref, complete),
+      RDMA_SC_OK
+    );
+    if (complete || context_api.release_call_count != 0)
+      `uvm_error("CQC_NEIGHBOR_QUERY_BEFORE_RELEASE",
+                 "neighbor unexpectedly reports completion")
+
+    expect_status(
+      "RELEASE_FAILURE_QUEUE",
+      context_api.fail_next(
+        "release",
+        rdma_status::make(RDMA_SC_TIMEOUT, "injected release failure")
+      ),
+      RDMA_SC_OK
+    );
+    expect_status(
+      "CQC_INJECTED_RELEASE",
+      context_api.\release (cq_ref),
+      RDMA_SC_TIMEOUT
+    );
+    if (context_api.release_call_count != 0 || cq_ref.release_complete)
+      `uvm_error("CQC_INJECTED_RELEASE", "failed release changed state/count")
+    complete = 1'b1;
+    expect_status(
+      "CQC_QUERY_AFTER_FAILED_RELEASE",
+      context_api.query_release_completion(cq_ref, complete),
+      RDMA_SC_OK
+    );
+    if (complete || context_api.release_call_count != 0)
+      `uvm_error("CQC_QUERY_AFTER_FAILED_RELEASE", "failed release completed")
+    complete = 1'b1;
+    expect_status(
+      "CQC_NEIGHBOR_AFTER_FAILED_RELEASE",
+      context_api.query_release_completion(neighbor_ref, complete),
+      RDMA_SC_OK
+    );
+    if (complete || context_api.release_call_count != 0)
+      `uvm_error("CQC_NEIGHBOR_AFTER_FAILED_RELEASE",
+                 "failed release completed neighboring slot")
 
     expect_status(
       "CQC_RELEASE",
       context_api.\release (cq_ref),
       RDMA_SC_OK
     );
+    complete = 1'b0;
     expect_status(
       "CQC_QUERY_CLONE",
       context_api.query_release_completion(cq_clone, complete),
       RDMA_SC_OK
     );
     if (!complete || context_api.release_call_count != 1)
-      `uvm_error("CQC_RELEASE", "release completion is not exactly-once")
+      `uvm_error("CQC_RELEASE", "clone cannot prove exactly-once release")
+    complete = 1'b0;
+    expect_status(
+      "CQC_QUERY_AFTER_RELEASE_AGAIN",
+      context_api.query_release_completion(cq_ref, complete),
+      RDMA_SC_OK
+    );
+    if (!complete || context_api.release_call_count != 1)
+      `uvm_error("CQC_QUERY_AFTER_RELEASE_AGAIN", "query mutated completion")
+    complete = 1'b1;
+    expect_status(
+      "CQC_NEIGHBOR_ISOLATION",
+      context_api.query_release_completion(neighbor_ref, complete),
+      RDMA_SC_OK
+    );
+    if (complete || context_api.release_call_count != 1)
+      `uvm_error("CQC_NEIGHBOR_ISOLATION", "release authority is global")
     expect_status(
       "CQC_RELEASE_TWICE",
       context_api.\release (cq_clone),
@@ -204,21 +412,96 @@ class rdma_context_backing_contract_test extends uvm_test;
       context_api.acquire(binding, RDMA_RESOURCE_SRQ, 7, srq_ref),
       RDMA_SC_OK
     );
-    if (srq_ref == null || srq_ref.slot_length < 32 ||
+    if (srq_ref == null || srq_ref.slot_length != 32 ||
         srq_ref.shadow_view_offset != 28 ||
         srq_ref.shadow_view_length != 4 ||
         (srq_ref.shadow_pointer_base.value & 4095) != 0)
       `uvm_error("SRQC_REF", "SRQC slot/view geometry is incorrect")
+    if (!$cast(srq_token, srq_ref.slot_token) ||
+        srq_token.completion_authority == null ||
+        srq_token === cq_token || srq_token === neighbor_token ||
+        srq_token.completion_authority === cq_token.completion_authority ||
+        srq_token.completion_authority ===
+          neighbor_token.completion_authority)
+      `uvm_error("SRQC_TOKEN", "SRQ acquire shares token authority")
+
     bytes = new[32];
-    foreach (bytes[i]) bytes[i] = byte'(i);
+    foreach (bytes[i]) bytes[i] = byte'(8'h40 + i);
     expect_status(
       "SRQC_FULL_SLOT_WRITE",
       context_api.write(srq_ref, 0, bytes),
       RDMA_SC_OK
     );
+    snapshot_slot("SRQC_FULL_SLOT_READ", context_api, srq_ref,
+                  srq_after_success);
+    foreach (srq_after_success[i]) begin
+      if (srq_after_success[i] != byte'(8'h40 + i))
+        `uvm_error("SRQC_FULL_SLOT_READ", "SRQ full-slot write was ignored")
+    end
+    complete = 1'b1;
+    expect_status(
+      "SRQC_QUERY_BEFORE_RELEASE",
+      context_api.query_release_completion(srq_ref, complete),
+      RDMA_SC_OK
+    );
+    if (complete || context_api.release_call_count != 1)
+      `uvm_error("SRQC_QUERY_BEFORE_RELEASE", "SRQ completion is not isolated")
 
-    if (context_api.call_trace.size() < 10)
-      `uvm_error("CALL_TRACE", "context backing call trace is incomplete")
+    expect_status(
+      "CQC_NEIGHBOR_RELEASE",
+      context_api.\release (neighbor_ref),
+      RDMA_SC_OK
+    );
+    complete = 1'b1;
+    expect_status(
+      "SRQC_QUERY_AFTER_NEIGHBOR_RELEASE",
+      context_api.query_release_completion(srq_ref, complete),
+      RDMA_SC_OK
+    );
+    if (complete || context_api.release_call_count != 2)
+      `uvm_error("SRQC_QUERY_AFTER_NEIGHBOR_RELEASE",
+                 "neighbor release completed SRQ")
+    complete = 1'b0;
+    expect_status(
+      "CQC_QUERY_AFTER_NEIGHBOR_RELEASE",
+      context_api.query_release_completion(cq_clone, complete),
+      RDMA_SC_OK
+    );
+    if (!complete || context_api.release_call_count != 2)
+      `uvm_error("CQC_QUERY_AFTER_NEIGHBOR_RELEASE",
+                 "later release changed CQC completion")
+
+    expected_trace.push_back("acquire");
+    expected_trace.push_back("acquire");
+    expected_trace.push_back("acquire");
+    expected_trace.push_back("write");
+    expected_trace.push_back("write");
+    expected_trace.push_back("write");
+    expected_trace.push_back("write");
+    expected_trace.push_back("write");
+    expected_trace.push_back("write");
+    expected_trace.push_back("write");
+    expected_trace.push_back("write");
+    expected_trace.push_back("write");
+    expected_trace.push_back("query_release_completion");
+    expected_trace.push_back("query_release_completion");
+    expected_trace.push_back("query_release_completion");
+    expected_trace.push_back("query_release_completion");
+    expected_trace.push_back("release");
+    expected_trace.push_back("query_release_completion");
+    expected_trace.push_back("query_release_completion");
+    expected_trace.push_back("release");
+    expected_trace.push_back("query_release_completion");
+    expected_trace.push_back("query_release_completion");
+    expected_trace.push_back("query_release_completion");
+    expected_trace.push_back("release");
+    expected_trace.push_back("acquire");
+    expected_trace.push_back("write");
+    expected_trace.push_back("query_release_completion");
+    expected_trace.push_back("release");
+    expected_trace.push_back("query_release_completion");
+    expected_trace.push_back("query_release_completion");
+    expect_trace(context_api, expected_trace);
 
     phase.drop_objection(this);
   endtask

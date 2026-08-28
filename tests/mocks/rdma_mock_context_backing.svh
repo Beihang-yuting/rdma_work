@@ -17,7 +17,7 @@ class rdma_mock_context_slot extends uvm_object;
   longint unsigned shadow_view_offset;
   longint unsigned shadow_view_length;
   rdma_backing_addr_t shadow_pointer_base;
-  byte data[];
+  byte unsigned data[];
   bit released;
   int unsigned release_count;
 
@@ -207,7 +207,7 @@ class rdma_mock_context_backing extends rdma_context_backing_api;
   virtual function rdma_status write(
     rdma_context_backing_ref context_ref,
     longint unsigned offset,
-    byte data[]
+    byte unsigned data[]
   );
     rdma_status forced;
     rdma_mock_context_slot slot;
@@ -285,7 +285,7 @@ class rdma_mock_context_backing extends rdma_context_backing_api;
   function rdma_status read_slot_byte(
     rdma_context_backing_ref context_ref,
     longint unsigned offset,
-    output byte value
+    output byte unsigned value
   );
     rdma_mock_context_slot slot;
     value = 0;
