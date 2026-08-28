@@ -149,6 +149,7 @@ class rdma_queue_lifecycle_executor extends uvm_object;
     rdma_queue_preflight preflight
   );
     rdma_cq cq;
+    rdma_srq srq;
     rdma_ceq ceq;
     rdma_aeq aeq;
 
@@ -166,6 +167,12 @@ class rdma_queue_lifecycle_executor extends uvm_object;
           return invalid_state("CQ reservation local ID exceeds 21 bits");
         cq.cqe_size_bytes = preflight.cqe_size_bytes;
       end
+      RDMA_RESOURCE_SRQ: begin
+        if (!$cast(srq, resource) || srq.local_srq_id > 16'hffff)
+          return invalid_state("SRQ reservation local ID exceeds 16 bits");
+        srq.max_sge = preflight.max_sge;
+        srq.limit_threshold = preflight.limit_threshold;
+      end
       RDMA_RESOURCE_CEQ: begin
         if (!$cast(ceq, resource) || ceq.local_ceq_id > 12'hfff)
           return invalid_state("CEQ reservation local ID exceeds 12 bits");
@@ -182,7 +189,7 @@ class rdma_queue_lifecycle_executor extends uvm_object;
       end
       default:
         return rdma_status::make(RDMA_SC_UNSUPPORTED_OPCODE,
-                                 "SRQ compound create is not implemented");
+                                 "queue resource type is unsupported");
     endcase
     return rdma_status::success();
   endfunction
@@ -224,6 +231,41 @@ class rdma_queue_lifecycle_executor extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  protected function rdma_status srq_builder_view(
+    rdma_queue_resource authoritative,
+    output rdma_queue_resource builder_resource
+  );
+    rdma_srq srq;
+    rdma_srq builder_srq;
+    rdma_resource dependency_resource;
+    rdma_pd pd;
+    rdma_handle projected_pd;
+    rdma_status status;
+    uvm_object cloned_object;
+
+    builder_resource = null;
+    if (!$cast(srq, authoritative) || srq.pd_h == null)
+      return invalid_argument("SRQ builder projection requires SRQ PD");
+    cloned_object = srq.clone();
+    if (cloned_object == null || !$cast(builder_srq, cloned_object) ||
+        builder_srq == srq)
+      return invalid_state("SRQ builder projection clone failed");
+    status = normalize_status(manager.lookup(srq.pd_h, dependency_resource),
+                              "SRQ PD lookup returned null");
+    if (!status.ok())
+      return status;
+    if (!$cast(pd, dependency_resource) || pd.local_pd_id > 16'hffff)
+      return invalid_state("SRQ PD projection is invalid");
+    projected_pd = rdma_clone_handle_value(srq.pd_h,
+                                           "SRQ local PD projection");
+    if (projected_pd == null)
+      return invalid_state("SRQ local PD projection clone failed");
+    projected_pd.object_id = pd.local_pd_id;
+    builder_srq.pd_h = projected_pd;
+    builder_resource = builder_srq;
+    return rdma_status::success();
+  endfunction
+
   protected function rdma_status initialize_plan(
     rdma_function_binding binding,
     rdma_queue_backing_plan authoritative_plan
@@ -255,6 +297,7 @@ class rdma_queue_lifecycle_executor extends uvm_object;
   protected function bit [7:0] delete_opcode(rdma_resource_kind_e kind);
     case (kind)
       RDMA_RESOURCE_CQ:  return XTR_V1_OP_CQC_DELETE;
+      RDMA_RESOURCE_SRQ: return XTR_V1_OP_SRFQC_DELETE;
       RDMA_RESOURCE_CEQ: return XTR_V1_OP_CEQC_DELETE;
       RDMA_RESOURCE_AEQ: return XTR_V1_OP_AEQC_DELETE;
       default:           return 8'h00;
@@ -264,6 +307,7 @@ class rdma_queue_lifecycle_executor extends uvm_object;
   protected function bit [7:0] create_opcode(rdma_resource_kind_e kind);
     case (kind)
       RDMA_RESOURCE_CQ:  return XTR_V1_OP_CQC_CREATE;
+      RDMA_RESOURCE_SRQ: return XTR_V1_OP_SRFQC_CREATE;
       RDMA_RESOURCE_CEQ: return XTR_V1_OP_CEQC_CREATE;
       RDMA_RESOURCE_AEQ: return XTR_V1_OP_AEQC_CREATE;
       default:           return 8'h00;
@@ -273,6 +317,7 @@ class rdma_queue_lifecycle_executor extends uvm_object;
   protected function bit [7:0] query_opcode(rdma_resource_kind_e kind);
     case (kind)
       RDMA_RESOURCE_CQ:  return XTR_V1_OP_CQC_QUERY;
+      RDMA_RESOURCE_SRQ: return XTR_V1_OP_SRFQC_QUERY;
       RDMA_RESOURCE_CEQ: return XTR_V1_OP_CEQC_QUERY;
       RDMA_RESOURCE_AEQ: return XTR_V1_OP_AEQC_QUERY;
       default:           return 8'h00;
@@ -403,9 +448,16 @@ class rdma_queue_lifecycle_executor extends uvm_object;
     recovery.queue_recovery_valid = 1'b1;
     recovery.queue_intent = RDMA_QUEUE_RECOVER_CREATE_ROLLBACK;
     recovery.ambiguous_queue_operation = ambiguous_operation;
-    if (ambiguous_operation == RDMA_QUEUE_AMBIG_OCC_FLUSH &&
-        plan.flush_targets.size() != 0)
-      recovery.ambiguous_role = plan.flush_targets[0].role;
+    if (ambiguous_operation == RDMA_QUEUE_AMBIG_OCC_FLUSH) begin
+      recovery.ambiguous_role = RDMA_QUEUE_ROLE_CQ_RING;
+      foreach (plan.flush_targets[i]) begin
+        if (plan.flush_targets[i] != null &&
+            !plan.flush_targets[i].flush_complete) begin
+          recovery.ambiguous_role = plan.flush_targets[i].role;
+          break;
+        end
+      end
+    end
     else
       recovery.ambiguous_role = plan.refs.size() == 0 ?
         RDMA_QUEUE_ROLE_CQ_RING : plan.refs[0].role;
@@ -572,6 +624,38 @@ class rdma_queue_lifecycle_executor extends uvm_object;
     bit ambiguous;
 
     queue = null;
+    foreach (plan.flush_targets[i]) begin
+      if (plan.flush_targets[i] == null ||
+          plan.flush_targets[i].phase != RDMA_QUEUE_FLUSH_PRE_DELETE ||
+          plan.flush_targets[i].flush_complete)
+        continue;
+      status = normalize_status(policy.build_flush_command(
+        resource.owner, plan.flush_targets[i], command_timeout, command
+      ), "queue rollback pre-delete flush descriptor returned null");
+      if (status.ok()) begin
+        ticket = null;
+        completion = null;
+        cmq.execute(command, ticket, completion, status);
+        ambiguous = cmq_outcome_ambiguous(status, completion);
+        status = normalize_status(status,
+          "queue rollback pre-delete flush result was lost");
+        if (status.ok() &&
+            (completion == null || completion.status == null))
+          status = invalid_state("queue rollback pre-delete flush completion was lost");
+      end
+      else ambiguous = 1'b0;
+      if (!status.ok()) begin
+        append_rollback(result, status);
+        retain_recovery(policy, resource, plan, create_command, primary, result,
+                        RDMA_HW_PRESENCE_PRESENT,
+                        ambiguous ? RDMA_QUEUE_AMBIG_OCC_FLUSH :
+                                    RDMA_QUEUE_AMBIG_NONE,
+                        ambiguous ? ticket : null, 1'b1, 1'b1, queue);
+        return;
+      end
+      plan.flush_targets[i].flush_complete = 1'b1;
+      result.completed_steps.push_back(RDMA_CTRL_STEP_HW_OCC_FLUSHED);
+    end
     status = normalize_status(policy.build_object_command(
       delete_opcode(resource.resource_kind()), resource.owner, resource,
       command_timeout, command
@@ -601,19 +685,26 @@ class rdma_queue_lifecycle_executor extends uvm_object;
       return;
     end
     result.completed_steps.push_back(RDMA_CTRL_STEP_HW_CONTEXT_DELETED);
-    if (resource.resource_kind() == RDMA_RESOURCE_CQ) begin
+    foreach (plan.flush_targets[i]) begin
+      if (plan.flush_targets[i] == null ||
+          plan.flush_targets[i].phase != RDMA_QUEUE_FLUSH_POST_DELETE ||
+          plan.flush_targets[i].flush_complete)
+        continue;
       status = normalize_status(policy.build_flush_command(
-        resource.owner, plan.flush_targets[0], command_timeout, command
-      ), "CQ rollback flush descriptor returned null");
+        resource.owner, plan.flush_targets[i], command_timeout, command
+      ), "queue rollback post-delete flush descriptor returned null");
       if (status.ok()) begin
         ticket = null;
         completion = null;
         cmq.execute(command, ticket, completion, status);
         ambiguous = cmq_outcome_ambiguous(status, completion);
-        status = normalize_status(status, "CQ rollback flush result was lost");
+        status = normalize_status(status,
+                                  "queue rollback post-delete flush result was lost");
         if (status.ok() &&
             (completion == null || completion.status == null))
-          status = invalid_state("CQ rollback flush completion was lost");
+          status = invalid_state(
+            "queue rollback post-delete flush completion was lost"
+          );
       end
       else ambiguous = 1'b0;
       if (!status.ok()) begin
@@ -625,6 +716,7 @@ class rdma_queue_lifecycle_executor extends uvm_object;
                         ambiguous ? ticket : null, 1'b0, 1'b1, queue);
         return;
       end
+      plan.flush_targets[i].flush_complete = 1'b1;
       result.completed_steps.push_back(RDMA_CTRL_STEP_HW_OCC_FLUSHED);
     end
 
@@ -724,6 +816,7 @@ class rdma_queue_lifecycle_executor extends uvm_object;
     rdma_context_backing_ref context_ref;
     rdma_hw_model context_model;
     byte unsigned slot_image[];
+    byte unsigned authorized_slot_image[];
     byte unsigned shadow_image[];
     rdma_cmq_command_desc create_command;
     rdma_cmq_ticket ticket;
@@ -731,7 +824,6 @@ class rdma_queue_lifecycle_executor extends uvm_object;
     rdma_resource active_snapshot;
     rdma_status status;
     rdma_status primary;
-    rdma_create_srq_req srq_request;
     bit cmq_ambiguous;
 
     queue = null;
@@ -765,13 +857,6 @@ class rdma_queue_lifecycle_executor extends uvm_object;
       if (!status.ok()) break;
       status = select_policy(request, policy);
       if (!status.ok()) break;
-      if ($cast(srq_request, request)) begin
-        status = rdma_status::make(
-          RDMA_SC_UNSUPPORTED_OPCODE,
-          "SRQ compound create is deferred until compound rollback exists"
-        );
-        break;
-      end
       status = normalize_status(policy.preflight(binding, request, manager,
                                                   preflight),
                                 "queue policy preflight returned null");
@@ -808,19 +893,34 @@ class rdma_queue_lifecycle_executor extends uvm_object;
         return;
       end
       result.completed_steps.push_back(RDMA_CTRL_STEP_BACKING_ATTACHED);
-      if (reserved.resource_kind() == RDMA_RESOURCE_CQ) begin
-        rdma_cq cq;
-        if (!$cast(cq, reserved)) begin
-          status = invalid_state("reserved CQ type was lost");
-          rollback_local(policy, reserved, plan, create_command, status,
-                         result, queue);
-          return;
+      if (reserved.resource_kind() inside {RDMA_RESOURCE_CQ,
+                                           RDMA_RESOURCE_SRQ}) begin
+        int unsigned local_id;
+        if (reserved.resource_kind() == RDMA_RESOURCE_CQ) begin
+          rdma_cq cq;
+          if (!$cast(cq, reserved)) begin
+            status = invalid_state("reserved CQ type was lost");
+            rollback_local(policy, reserved, plan, create_command, status,
+                           result, queue);
+            return;
+          end
+          local_id = cq.local_cq_id;
+        end
+        else begin
+          rdma_srq srq;
+          if (!$cast(srq, reserved)) begin
+            status = invalid_state("reserved SRQ type was lost");
+            rollback_local(policy, reserved, plan, create_command, status,
+                           result, queue);
+            return;
+          end
+          local_id = srq.local_srq_id;
         end
         status = normalize_status(context_backing.acquire(
-          binding, RDMA_RESOURCE_CQ, cq.local_cq_id, context_ref
-        ), "CQ context acquire returned null");
+          binding, reserved.resource_kind(), local_id, context_ref
+        ), "queue context acquire returned null");
         if (!status.ok() || context_ref == null) begin
-          if (status.ok()) status = invalid_state("CQ context acquire is null");
+          if (status.ok()) status = invalid_state("queue context acquire is null");
           rollback_local(policy, reserved, plan, create_command, status,
                          result, queue);
           return;
@@ -851,6 +951,14 @@ class rdma_queue_lifecycle_executor extends uvm_object;
           return;
         end
       end
+      else if (reserved.resource_kind() == RDMA_RESOURCE_SRQ) begin
+        status = srq_builder_view(reserved, builder_resource);
+        if (!status.ok()) begin
+          rollback_local(policy, reserved, plan, create_command, status,
+                         result, queue);
+          return;
+        end
+      end
       status = normalize_status(policy.build_create_context(
         builder_resource, plan, context_model, slot_image, shadow_image
       ), "queue context builder returned null");
@@ -859,15 +967,26 @@ class rdma_queue_lifecycle_executor extends uvm_object;
                        queue);
         return;
       end
-      if (reserved.resource_kind() == RDMA_RESOURCE_CQ) begin
+      if (reserved.resource_kind() inside {RDMA_RESOURCE_CQ,
+                                           RDMA_RESOURCE_SRQ}) begin
+        if (plan.context_ref == null ||
+            slot_image.size() < plan.context_ref.slot_length) begin
+          status = invalid_state("queue context image is smaller than slot");
+          rollback_local(policy, reserved, plan, create_command, status,
+                         result, queue);
+          return;
+        end
+        authorized_slot_image = new[plan.context_ref.slot_length];
+        foreach (authorized_slot_image[i])
+          authorized_slot_image[i] = slot_image[i];
         status = normalize_status(context_backing.write(
-          plan.context_ref, 0, slot_image
-        ), "CQ context slot write returned null");
+          plan.context_ref, 0, authorized_slot_image
+        ), "queue context slot write returned null");
         if (status.ok())
           status = normalize_status(context_backing.write(
             plan.context_ref, plan.context_ref.shadow_view_offset,
             shadow_image
-          ), "CQ context shadow write returned null");
+          ), "queue context shadow write returned null");
         if (!status.ok()) begin
           rollback_local(policy, reserved, plan, create_command, status,
                          result, queue);

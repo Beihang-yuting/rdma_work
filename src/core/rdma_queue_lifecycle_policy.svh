@@ -409,7 +409,7 @@ virtual class rdma_queue_lifecycle_policy extends uvm_object;
       return invalid_argument("queue context belongs to another Function");
     if (context_ref.resource_kind != kind ||
         context_ref.local_id != local_id ||
-        context_ref.slot_length != 64 ||
+        context_ref.slot_length != (kind == RDMA_RESOURCE_SRQ ? 32 : 64) ||
         context_ref.shadow_view_offset != view_offset ||
         context_ref.shadow_view_length != view_length ||
         context_ref.shadow_pointer_base.value == 0 ||

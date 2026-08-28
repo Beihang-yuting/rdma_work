@@ -174,10 +174,21 @@ class rdma_queue_executor_trace_mem extends rdma_queue_planner_nth_fail_mem;
     write_ordinal++;
     case (queue_kind)
       RDMA_RESOURCE_CQ:  prefix = "CQ";
+      RDMA_RESOURCE_SRQ: prefix = "SRQ";
       RDMA_RESOURCE_CEQ: prefix = "CEQ";
       default:           prefix = "AEQ";
     endcase
-    role = (write_ordinal == 1) ? {prefix, "_RING"} : {prefix, "_PD"};
+    if (queue_kind == RDMA_RESOURCE_SRQ) begin
+      case (write_ordinal)
+        1: role = "SRQ_RING";
+        2: role = "SRFQ_RING";
+        3: role = "SRQ_SGB";
+        4: role = "SRQ_PD";
+        default: role = "SRFQ_PD";
+      endcase
+    end
+    else
+      role = (write_ordinal == 1) ? {prefix, "_RING"} : {prefix, "_PD"};
     if (shared_trace != null)
       shared_trace.record({"host_write:", role});
     if (find_region(mapping) < 0) begin
@@ -210,8 +221,12 @@ class rdma_queue_executor_trace_context extends rdma_mock_context_backing;
   );
     if (shared_trace != null)
       shared_trace.record(offset == 0 ?
-        "context_write:CQC_CONTEXT_SLOT" :
-        "context_write:CQC_CONTEXT_SHADOW");
+        (context_ref != null && context_ref.resource_kind == RDMA_RESOURCE_SRQ ?
+          "context_write:SRFQC_CONTEXT_SLOT" :
+          "context_write:CQC_CONTEXT_SLOT") :
+        (context_ref != null && context_ref.resource_kind == RDMA_RESOURCE_SRQ ?
+          "context_write:SRFQC_CONTEXT_SHADOW" :
+          "context_write:CQC_CONTEXT_SHADOW"));
     return super.write(context_ref, offset, data);
   endfunction
 endclass
@@ -584,6 +599,7 @@ class rdma_queue_lifecycle_test extends uvm_test;
                                  srfq_pd_mapping, 0, 4096));
     plan.context_ref = make_context_ref("srqc_context", binding,
       RDMA_RESOURCE_SRQ, 16'h2345, 64'h0000_0008_3333_3000, 28, 4);
+    plan.context_ref.slot_length = 32;
     return plan;
   endfunction
 
@@ -3263,9 +3279,117 @@ class rdma_queue_lifecycle_test extends uvm_test;
     end
   endtask
 
-  task automatic check_executor_srq_unsupported();
+  task automatic check_executor_srq_compound_create();
     rdma_function_binding binding;
     rdma_fault_inject_resource_manager manager;
+    rdma_pd pd_dependency;
+    rdma_queue_executor_trace_mem mem;
+    rdma_queue_executor_trace_context context_backing;
+    rdma_mock_cmq_port cmq;
+    rdma_mock_call_trace trace;
+    rdma_queue_lifecycle_executor executor;
+    rdma_create_srq_req request;
+    rdma_queue_resource queue;
+    rdma_control_result result;
+    rdma_srq srq;
+    rdma_status status;
+    byte unsigned shadow_byte;
+
+    binding = make_binding("EXEC_SRQ_COMPOUND_binding");
+    manager = rdma_fault_inject_resource_manager::type_id::create(
+      "EXEC_SRQ_COMPOUND_manager"
+    );
+    pd_dependency = null;
+    expect_status("EXEC_SRQ_COMPOUND_PD",
+                  manager.create_pd(binding, pd_dependency), RDMA_SC_OK);
+    mem = rdma_queue_executor_trace_mem::type_id::create(
+      "EXEC_SRQ_COMPOUND_mem"
+    );
+    mem.queue_kind = RDMA_RESOURCE_SRQ;
+    context_backing = rdma_queue_executor_trace_context::type_id::create(
+      "EXEC_SRQ_COMPOUND_context"
+    );
+    cmq = rdma_mock_cmq_port::type_id::create("EXEC_SRQ_COMPOUND_cmq");
+    trace = rdma_mock_call_trace::type_id::create("EXEC_SRQ_COMPOUND_trace");
+    mem.set_shared_trace(trace);
+    context_backing.set_call_trace(trace);
+    cmq.set_call_trace(trace);
+    executor = rdma_queue_lifecycle_executor::type_id::create(
+      "EXEC_SRQ_COMPOUND_executor"
+    );
+    expect_status("EXEC_SRQ_COMPOUND_CONFIGURE", executor.configure(
+      manager, cmq, mem, context_backing, 100ns), RDMA_SC_OK);
+    request = rdma_create_srq_req::type_id::create(
+      "EXEC_SRQ_COMPOUND_request"
+    );
+    request.owner = binding.make_handle();
+    request.depth = 64;
+    request.max_sge = 4;
+    request.limit_threshold = 16;
+    request.pd_h = pd_dependency.handle;
+    request.payload_backing.mode = RDMA_QUEUE_BACKING_OWNED;
+    executor.create_locked(binding, binding.make_handle(), request, 64'd300,
+                           queue, result);
+    if (result == null || !result.ok() || !$cast(srq, queue) ||
+        srq.state != RDMA_RESOURCE_ACTIVE)
+      `uvm_error("EXEC_SRQ_COMPOUND", $sformatf(
+        "SRQ did not become ACTIVE: %s",
+        result == null || result.status == null ? "null" :
+          result.status.convert2string()))
+    if (srq != null && (srq.queue_plan == null ||
+        srq.queue_plan.refs.size() != 5 ||
+        srq.queue_plan.refs[0].role != RDMA_QUEUE_ROLE_SRQ_RING ||
+        srq.queue_plan.refs[1].role != RDMA_QUEUE_ROLE_SRFQ_RING ||
+        srq.queue_plan.refs[2].role != RDMA_QUEUE_ROLE_SRQ_SGB ||
+        srq.queue_plan.refs[3].role != RDMA_QUEUE_ROLE_SRQ_PD ||
+        srq.queue_plan.refs[4].role != RDMA_QUEUE_ROLE_SRFQ_PD ||
+        srq.queue_plan.context_ref == null))
+      `uvm_error("EXEC_SRQ_COMPOUND", "SRQ backing roles are incomplete")
+    if (srq != null && (srq.pd_h == null ||
+                        !srq.pd_h.same_instance(pd_dependency.handle)))
+      `uvm_error("EXEC_SRQ_COMPOUND",
+                 "SRQ registry dependency was replaced with a local ID")
+    if (trace.calls.size() != 8 ||
+        trace.calls[0] != "host_write:SRQ_RING" ||
+        trace.calls[1] != "host_write:SRFQ_RING" ||
+        trace.calls[2] != "host_write:SRQ_SGB" ||
+        trace.calls[3] != "host_write:SRQ_PD" ||
+        trace.calls[4] != "host_write:SRFQ_PD" ||
+        trace.calls[5] != "context_write:SRFQC_CONTEXT_SLOT" ||
+        trace.calls[6] != "context_write:SRFQC_CONTEXT_SHADOW" ||
+        trace.calls[7] != "cmq:35")
+      `uvm_error("EXEC_SRQ_COMPOUND", $sformatf(
+        "SRQ create trace is not canonical: %p", trace.calls))
+    if (srq != null && srq.queue_plan != null) begin
+      for (int unsigned offset = 28; offset < 32; offset++) begin
+        shadow_byte = '0;
+        status = context_backing.read_slot_byte(srq.queue_plan.context_ref,
+                                                offset, shadow_byte);
+        expect_status($sformatf("EXEC_SRQ_SHADOW_%0d", offset), status,
+                      RDMA_SC_OK);
+        if (shadow_byte != (offset == 31 ? 8'h10 : 8'h00))
+          `uvm_error("EXEC_SRQ_SHADOW", "SRFQC shadow is not 00 00 00 10")
+      end
+    end
+
+    request.max_sge = 2;
+    queue = null;
+    result = null;
+    executor.create_locked(binding, binding.make_handle(), request, 64'd301,
+                           queue, result);
+    if (result == null || !result.ok() || !$cast(srq, queue) ||
+        srq.queue_plan == null || srq.queue_plan.refs.size() != 4 ||
+        srq.queue_plan.refs[0].role != RDMA_QUEUE_ROLE_SRQ_RING ||
+        srq.queue_plan.refs[1].role != RDMA_QUEUE_ROLE_SRFQ_RING ||
+        srq.queue_plan.refs[2].role != RDMA_QUEUE_ROLE_SRQ_PD ||
+        srq.queue_plan.refs[3].role != RDMA_QUEUE_ROLE_SRFQ_PD)
+      `uvm_error("EXEC_SRQ_NO_SGB", "max_sge=2 unexpectedly allocated SGB")
+  endtask
+
+  task automatic check_executor_srq_rollback_order();
+    rdma_function_binding binding;
+    rdma_fault_inject_resource_manager manager;
+    rdma_pd pd_dependency;
     rdma_queue_executor_trace_mem mem;
     rdma_queue_executor_trace_context context_backing;
     rdma_mock_cmq_port cmq;
@@ -3274,41 +3398,46 @@ class rdma_queue_lifecycle_test extends uvm_test;
     rdma_queue_resource queue;
     rdma_control_result result;
 
-    binding = make_binding("EXEC_SRQ_UNSUPPORTED_binding");
+    binding = make_binding("EXEC_SRQ_ROLLBACK_binding");
     manager = rdma_fault_inject_resource_manager::type_id::create(
-      "EXEC_SRQ_UNSUPPORTED_manager"
+      "EXEC_SRQ_ROLLBACK_manager"
     );
+    pd_dependency = null;
+    expect_status("EXEC_SRQ_ROLLBACK_PD",
+                  manager.create_pd(binding, pd_dependency), RDMA_SC_OK);
     mem = rdma_queue_executor_trace_mem::type_id::create(
-      "EXEC_SRQ_UNSUPPORTED_mem"
+      "EXEC_SRQ_ROLLBACK_mem"
     );
+    mem.queue_kind = RDMA_RESOURCE_SRQ;
     context_backing = rdma_queue_executor_trace_context::type_id::create(
-      "EXEC_SRQ_UNSUPPORTED_context"
+      "EXEC_SRQ_ROLLBACK_context"
     );
-    cmq = rdma_mock_cmq_port::type_id::create("EXEC_SRQ_UNSUPPORTED_cmq");
+    cmq = rdma_mock_cmq_port::type_id::create("EXEC_SRQ_ROLLBACK_cmq");
     executor = rdma_queue_lifecycle_executor::type_id::create(
-      "EXEC_SRQ_UNSUPPORTED_executor"
+      "EXEC_SRQ_ROLLBACK_executor"
     );
-    expect_status("EXEC_SRQ_UNSUPPORTED_CONFIGURE", executor.configure(
+    expect_status("EXEC_SRQ_ROLLBACK_CONFIGURE", executor.configure(
       manager, cmq, mem, context_backing, 100ns), RDMA_SC_OK);
-    request = rdma_create_srq_req::type_id::create(
-      "EXEC_SRQ_UNSUPPORTED_request"
-    );
+    request = rdma_create_srq_req::type_id::create("EXEC_SRQ_ROLLBACK_request");
     request.owner = binding.make_handle();
     request.depth = 64;
     request.max_sge = 4;
     request.limit_threshold = 16;
-    executor.create_locked(binding, binding.make_handle(), request, 64'd300,
+    request.pd_h = pd_dependency.handle;
+    request.payload_backing.mode = RDMA_QUEUE_BACKING_OWNED;
+    void'(manager.fail_next_transition("commit_programmed",
+      rdma_status::make(RDMA_SC_UNKNOWN_HW_ERROR, "injected SRQ commit")));
+    executor.create_locked(binding, binding.make_handle(), request, 64'd302,
                            queue, result);
     if (queue != null || result == null || result.status == null ||
         result.primary_status == null ||
-        result.status.code != RDMA_SC_UNSUPPORTED_OPCODE ||
-        result.primary_status.code != RDMA_SC_UNSUPPORTED_OPCODE ||
-        result.resource_h != null || result.final_resource_state_known ||
-        result.recovery_required || manager.release_reserved_calls != 0 ||
-        mem.calls.size() != 0 || context_backing.call_trace.size() != 0 ||
-        cmq.calls.size() != 0)
-      `uvm_error("EXEC_SRQ_UNSUPPORTED",
-                 "deferred SRQ create had reservation or adapter side effects")
+        result.status.code != RDMA_SC_UNKNOWN_HW_ERROR ||
+        result.primary_status.code != RDMA_SC_UNKNOWN_HW_ERROR ||
+        cmq.calls.size() != 4 || cmq.calls[0].opcode != 8'h35 ||
+        cmq.calls[1].opcode != 8'h0a || cmq.calls[2].opcode != 8'h0a ||
+        cmq.calls[3].opcode != 8'h37)
+      `uvm_error("EXEC_SRQ_ROLLBACK",
+                 "SRQ rollback was not SRFQ_PD, SRQ_PD, then SRQC delete")
   endtask
 
   task automatic check_create_executor();
@@ -3325,7 +3454,8 @@ class rdma_queue_lifecycle_test extends uvm_test;
     check_executor_prestage_cleanup_recovery();
     check_executor_reservation_release_recovery();
     check_executor_eq_rollback_recovery();
-    check_executor_srq_unsupported();
+    check_executor_srq_compound_create();
+    check_executor_srq_rollback_order();
   endtask
 
   task run_phase(uvm_phase phase);
