@@ -42,11 +42,14 @@ class rdma_fault_inject_resource_manager extends rdma_resource_manager;
 
   int unsigned release_reserved_calls;
   protected rdma_status transition_failures[string];
+  protected rdma_status role_failures[string];
+  protected int unsigned transition_ordinals[string];
 
   function new(string name = "rdma_fault_inject_resource_manager");
     super.new(name);
     release_reserved_calls = 0;
     transition_failures.delete();
+    role_failures.delete(); transition_ordinals.delete();
   endfunction
 
   function rdma_status fail_next_transition(
@@ -68,6 +71,20 @@ class rdma_fault_inject_resource_manager extends rdma_resource_manager;
     return rdma_status::success();
   endfunction
 
+  function void fail_role_call(string method_name,
+                               rdma_queue_backing_role_e role,
+                               int unsigned ordinal,
+                               rdma_status failure);
+    if (failure != null && ordinal != 0)
+      role_failures[$sformatf("%s:%0d:%0d", method_name, role, ordinal)] =
+        rdma_cmq_clone_status_value(failure);
+  endfunction
+
+  function void reset();
+    transition_failures.delete(); role_failures.delete();
+    transition_ordinals.delete(); release_reserved_calls = 0;
+  endfunction
+
   virtual function rdma_status stage_allocated(rdma_resource candidate);
     rdma_status failure;
 
@@ -81,6 +98,21 @@ class rdma_fault_inject_resource_manager extends rdma_resource_manager;
     string transition_name
   );
     rdma_status failure;
+    string parsed_method;
+    int unsigned parsed_role, parsed_ordinal, ordinal;
+
+    transition_ordinals[transition_name]++;
+    ordinal = transition_ordinals[transition_name];
+    foreach (role_failures[key]) begin
+      parsed_method = ""; parsed_role = 0; parsed_ordinal = 0;
+      if ($sscanf(key, "%[^:]:%d:%d", parsed_method, parsed_role,
+                  parsed_ordinal) == 3 && parsed_method == transition_name &&
+          parsed_ordinal == ordinal) begin
+        failure = rdma_cmq_clone_status_value(role_failures[key]);
+        role_failures.delete(key);
+        return failure;
+      end
+    end
 
     if (!transition_failures.exists(transition_name))
       return null;
@@ -278,6 +310,7 @@ class rdma_mock_cmq_port extends rdma_cmq_port;
   // Evidence is scoped to the most recent execute() call.  It is asserted
   // only on mock adapter paths that return before recording a CMQ call.
   protected bit last_execute_no_submit_proven;
+  protected rdma_status role_failures[string];
 
   function new(string name = "rdma_mock_cmq_port");
     super.new(name);
@@ -294,6 +327,7 @@ class rdma_mock_cmq_port extends rdma_cmq_port;
     gate_target_count = 1;
     gate_entered_count = 0;
     last_execute_no_submit_proven = 1'b0;
+    role_failures.delete();
     snapshot_engine = rdma_mock_cmq_snapshot_engine::type_id::create(
       {name, "_snapshot_engine"}
     );
@@ -309,6 +343,55 @@ class rdma_mock_cmq_port extends rdma_cmq_port;
 
   function void gate_opcode(bit [7:0] opcode);
     gate_opcode_count(opcode, 1);
+  endfunction
+
+  // Lifecycle-test naming for the CMQ pause barrier.  The gate only waits on
+  // the selected opcode and does not hold any adapter mutex, so other
+  // Functions may continue to enter execute().
+  task pause_cmq_opcode(bit [7:0] opcode);
+    gate_opcode(opcode);
+  endtask
+
+  task wait_until_paused(bit [7:0] opcode);
+    bit observed;
+    while (!gate_enabled || gated_opcode != opcode || gate_entered_count == 0)
+      #1;
+    observed = 1'b1;
+  endtask
+
+  function void release_cmq_opcode(bit [7:0] opcode);
+    if (gate_enabled && gated_opcode == opcode)
+      release_one();
+  endfunction
+
+  function void fail_role_call(string method_name,
+                               rdma_queue_backing_role_e role,
+                               int unsigned ordinal,
+                               rdma_status status);
+    if (status != null && ordinal != 0) begin
+      role_failures[$sformatf("%s:%0d:%0d", method_name, role, ordinal)] =
+        rdma_cmq_clone_status_value(status);
+      // CMQ lifecycle points are represented by opcode outcomes.  This keeps
+      // the machine-readable method+role+ordinal API useful even though the
+      // port itself only observes execute(opcode).
+      if (method_name == "create_submit" || method_name == "create_terminal" ||
+          method_name == "delete")
+        fail_opcode((method_name == "delete") ? XTR_V1_OP_CQC_DELETE :
+                    XTR_V1_OP_CQC_CREATE, status);
+      else if (method_name.substr(0, 5) == "flush" ||
+               method_name.substr(0, 9) == "pre_flush" ||
+               method_name.substr(0, 10) == "post_flush")
+        fail_opcode(XTR_V1_OP_OCC_FLUSH, status);
+    end
+  endfunction
+
+  function void reset();
+    calls.delete(); outcomes.delete(); late_completions.delete();
+    reconcile_scripts.delete(); next_sequence = 1;
+    role_failures.delete();
+    gate_enabled = 1'b0; gate_entered_count = 0; gate_target_count = 1;
+    last_execute_no_submit_proven = 1'b0;
+    entered.reset(); release_gate.reset();
   endfunction
 
   // Hold all matching CMQ executions until release_one(), allowing tests to

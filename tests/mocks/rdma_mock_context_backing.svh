@@ -44,6 +44,8 @@ class rdma_mock_context_backing extends rdma_context_backing_api;
   string call_trace[$];
   int unsigned release_call_count;
   rdma_status failure_queue[string][$];
+  rdma_status role_failures[string];
+  int unsigned method_ordinals[string];
 
   function new(string name = "rdma_mock_context_backing");
     super.new(name);
@@ -65,6 +67,20 @@ class rdma_mock_context_backing extends rdma_context_backing_api;
     return rdma_status::success();
   endfunction
 
+  function void fail_role_call(string method_name,
+                               rdma_queue_backing_role_e role,
+                               int unsigned ordinal,
+                               rdma_status status);
+    if (status != null && ordinal != 0)
+      role_failures[$sformatf("%s:%0d:%0d", method_name, role, ordinal)] =
+        rdma_mock_clone_status(status);
+  endfunction
+
+  function void reset();
+    slots.delete(); call_trace.delete(); failure_queue.delete();
+    role_failures.delete(); method_ordinals.delete(); release_call_count = 0;
+  endfunction
+
   function automatic rdma_status consume_failure(string method_name);
     rdma_status status;
     if (!failure_queue.exists(method_name) ||
@@ -72,6 +88,24 @@ class rdma_mock_context_backing extends rdma_context_backing_api;
       return null;
     status = failure_queue[method_name].pop_front();
     return status;
+  endfunction
+
+  function automatic rdma_status consume_role_failure(string method_name);
+    rdma_status status;
+    string parsed_method;
+    int unsigned parsed_role, parsed_ordinal, ordinal;
+    ordinal = method_ordinals.exists(method_name) ? method_ordinals[method_name] : 0;
+    foreach (role_failures[key]) begin
+      parsed_method = ""; parsed_role = 0; parsed_ordinal = 0;
+      if ($sscanf(key, "%[^:]:%d:%d", parsed_method, parsed_role,
+                  parsed_ordinal) == 3 && parsed_method == method_name &&
+          parsed_ordinal == ordinal) begin
+        status = rdma_mock_clone_status(role_failures[key]);
+        role_failures.delete(key);
+        return status;
+      end
+    end
+    return null;
   endfunction
 
   function automatic rdma_mock_context_slot find_slot(
@@ -136,6 +170,9 @@ class rdma_mock_context_backing extends rdma_context_backing_api;
 
     context_ref = null;
     call_trace.push_back("acquire");
+    method_ordinals["acquire"]++;
+    forced = consume_role_failure("acquire");
+    if (forced != null) return forced;
     forced = consume_failure("acquire");
     if (forced != null)
       return forced;
@@ -214,6 +251,9 @@ class rdma_mock_context_backing extends rdma_context_backing_api;
     longint unsigned i;
 
     call_trace.push_back("write");
+    method_ordinals["write"]++;
+    forced = consume_role_failure("write");
+    if (forced != null) return forced;
     forced = consume_failure("write");
     if (forced != null)
       return forced;
@@ -244,6 +284,9 @@ class rdma_mock_context_backing extends rdma_context_backing_api;
     rdma_mock_context_slot slot;
 
     call_trace.push_back("release");
+    method_ordinals["release"]++;
+    forced = consume_role_failure("release");
+    if (forced != null) return forced;
     forced = consume_failure("release");
     if (forced != null)
       return forced;
@@ -271,6 +314,9 @@ class rdma_mock_context_backing extends rdma_context_backing_api;
 
     complete = 0;
     call_trace.push_back("query_release_completion");
+    method_ordinals["query_release_completion"]++;
+    forced = consume_role_failure("query_release_completion");
+    if (forced != null) return forced;
     forced = consume_failure("query_release_completion");
     if (forced != null)
       return forced;

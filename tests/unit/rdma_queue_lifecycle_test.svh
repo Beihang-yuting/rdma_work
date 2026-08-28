@@ -4528,6 +4528,7 @@ class rdma_queue_lifecycle_test extends uvm_test;
       `uvm_error("DESTROY_INVALID", "invalid destroy did not fail closed")
   endtask
 
+
   task run_phase(uvm_phase phase);
     phase.raise_objection(this);
     check_preflight();
