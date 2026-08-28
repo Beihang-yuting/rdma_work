@@ -1623,6 +1623,255 @@ class rdma_resource_manager_test extends uvm_test;
     return binding;
   endfunction
 
+  function automatic rdma_dma_mapping make_queue_test_mapping(
+    string name,
+    rdma_function_handle owner,
+    rdma_handle owner_h,
+    longint unsigned iova_value,
+    bit control_plane_owned
+  );
+    rdma_dma_mapping mapping;
+    rdma_rm_owned_authority_hook_mapping owned_mapping;
+
+    if (control_plane_owned) begin
+      owned_mapping =
+        rdma_rm_owned_authority_hook_mapping::type_id::create(name);
+      owned_mapping.initialize_allocation_token(iova_value);
+      mapping = owned_mapping;
+    end
+    else begin
+      mapping = rdma_dma_mapping::type_id::create(name);
+    end
+    mapping.function_h = clone_function_handle({name, "_function"}, owner);
+    mapping.owner_h = clone_handle({name, "_owner"}, owner_h);
+    mapping.iova.value = iova_value;
+    mapping.backing_addr.value = iova_value + 64'h1000_0000;
+    mapping.size = control_plane_owned ? 4096 : 64'h20_0000;
+    mapping.direction = RDMA_DMA_BIDIRECTIONAL;
+    mapping.permissions =
+      '{device_read:1'b1, device_write:1'b1, atomic:1'b0};
+    mapping.state = RDMA_MAPPING_ACTIVE;
+    return mapping;
+  endfunction
+
+  function automatic rdma_queue_ring_layout make_queue_test_ring(
+    string name,
+    rdma_queue_backing_role_e role,
+    int unsigned depth,
+    int unsigned entry_size_bytes,
+    rdma_dma_mapping mapping
+  );
+    rdma_queue_ring_layout ring;
+    rdma_queue_dma_page_ref page;
+    longint unsigned logical_bytes;
+    longint unsigned storage_bytes;
+
+    logical_bytes = depth * entry_size_bytes;
+    storage_bytes = ((logical_bytes + 4095) / 4096) * 4096;
+    ring = rdma_queue_ring_layout::type_id::create(name);
+    ring.role = role;
+    ring.entry_size_bytes = entry_size_bytes;
+    ring.depth = depth;
+    ring.logical_bytes = logical_bytes;
+    ring.storage_bytes = storage_bytes;
+    ring.page_count = storage_bytes / 4096;
+    ring.initial_polarity = 1'b1;
+    for (int unsigned i = 0; i < ring.page_count; i++) begin
+      page = rdma_queue_dma_page_ref::type_id::create(
+        $sformatf("%s_page_%0d", name, i)
+      );
+      page.role = role;
+      page.mapping = mapping;
+      page.mapping_offset = i * 4096;
+      page.logical_page_offset = i * 4096;
+      page.page_iova.value = mapping.iova.value + i * 4096;
+      ring.pages.push_back(page);
+    end
+    return ring;
+  endfunction
+
+  function automatic rdma_queue_backing_ref make_queue_test_ref(
+    string name,
+    rdma_queue_backing_role_e role,
+    rdma_dma_mapping mapping,
+    longint unsigned length,
+    rdma_resource_ownership_e ownership
+  );
+    rdma_queue_backing_ref ref_value;
+
+    ref_value = rdma_queue_backing_ref::type_id::create(name);
+    ref_value.role = role;
+    ref_value.mapping = mapping;
+    ref_value.length = length;
+    ref_value.ownership = ownership;
+    return ref_value;
+  endfunction
+
+  function automatic rdma_queue_backing_plan make_queue_test_plan(
+    string name,
+    rdma_resource_kind_e kind,
+    int unsigned depth,
+    rdma_function_handle owner,
+    rdma_handle owner_h,
+    int unsigned local_id
+  );
+    rdma_queue_backing_plan plan;
+    rdma_queue_ring_layout ring;
+    rdma_queue_backing_ref ring_ref;
+    rdma_queue_backing_ref pd_ref;
+    rdma_queue_flush_target flush_target;
+    rdma_context_backing_ref context_ref;
+    rdma_queue_opaque_slot_token token;
+    rdma_queue_completion_authority completion_authority;
+    rdma_hmc_ref hmc_ref;
+    rdma_dma_mapping ring_mapping;
+    rdma_dma_mapping pd_mapping;
+    rdma_queue_backing_role_e ring_role;
+    rdma_queue_backing_role_e pd_role;
+    int unsigned entry_size;
+
+    plan = rdma_queue_backing_plan::type_id::create(name);
+    plan.resource_kind = kind;
+    case (kind)
+      RDMA_RESOURCE_CQ: begin
+        ring_role = RDMA_QUEUE_ROLE_CQ_RING;
+        pd_role = RDMA_QUEUE_ROLE_CQ_PD;
+        entry_size = 64;
+      end
+      RDMA_RESOURCE_CEQ: begin
+        ring_role = RDMA_QUEUE_ROLE_CEQ_RING;
+        pd_role = RDMA_QUEUE_ROLE_CEQ_PD;
+        entry_size = 16;
+      end
+      RDMA_RESOURCE_AEQ: begin
+        ring_role = RDMA_QUEUE_ROLE_AEQ_RING;
+        pd_role = RDMA_QUEUE_ROLE_AEQ_PD;
+        entry_size = 16;
+      end
+      default: begin
+        ring_role = RDMA_QUEUE_ROLE_SRQ_RING;
+        pd_role = RDMA_QUEUE_ROLE_SRQ_PD;
+        entry_size = 64;
+      end
+    endcase
+
+    ring_mapping = make_queue_test_mapping(
+      {name, "_ring_mapping"}, owner, owner_h,
+      64'h0000_4000_0000_0000 + longint'(kind) * 64'h0100_0000,
+      1'b0
+    );
+    ring = make_queue_test_ring({name, "_ring"}, ring_role, depth,
+                                entry_size, ring_mapping);
+    ring_ref = make_queue_test_ref(
+      {name, "_ring_ref"}, ring_role, ring_mapping, ring.storage_bytes,
+      RDMA_OWNERSHIP_BORROWED
+    );
+    pd_mapping = make_queue_test_mapping(
+      {name, "_pd_mapping"}, owner, owner_h,
+      64'h0000_5000_0000_0000 + longint'(kind) * 64'h0100_0000,
+      1'b1
+    );
+    pd_ref = make_queue_test_ref(
+      {name, "_pd_ref"}, pd_role, pd_mapping, 4096,
+      RDMA_OWNERSHIP_CONTROL_PLANE
+    );
+    plan.rings.push_back(ring);
+    plan.refs.push_back(ring_ref);
+    plan.refs.push_back(pd_ref);
+
+    if (kind == RDMA_RESOURCE_CQ || kind == RDMA_RESOURCE_SRQ) begin
+      context_ref = rdma_context_backing_ref::type_id::create(
+        {name, "_context"}
+      );
+      context_ref.owner = clone_function_handle({name, "_context_owner"},
+                                                owner);
+      context_ref.resource_kind = kind;
+      context_ref.local_id = local_id;
+      token = rdma_queue_opaque_slot_token::type_id::create(
+        {name, "_token"}
+      );
+      completion_authority =
+        rdma_queue_completion_authority::type_id::create(
+          {name, "_completion_authority"}
+        );
+      token.completion_authority = completion_authority;
+      context_ref.slot_token = token;
+      hmc_ref = rdma_hmc_ref::type_id::create({name, "_hmc_ref"});
+      hmc_ref.owner = clone_function_handle({name, "_hmc_owner"}, owner);
+      hmc_ref.object_kind = RDMA_RESOURCE_MR;
+      hmc_ref.address.value =
+        64'h0000_6000_0000_0000 + longint'(kind) * 64'h1000;
+      hmc_ref.size = 4096;
+      hmc_ref.first_pbl_index = local_id + 1;
+      hmc_ref.ownership = RDMA_OWNERSHIP_CONTROL_PLANE;
+      context_ref.hmc_ref = hmc_ref;
+      context_ref.shadow_pointer_base.value =
+        64'h0000_7000_0000_0000 + longint'(kind) * 64'h1000;
+      context_ref.slot_length = 64;
+      context_ref.shadow_view_offset = 0;
+      context_ref.shadow_view_length = 32;
+      plan.context_ref = context_ref;
+    end
+
+    if (kind == RDMA_RESOURCE_CQ) begin
+      flush_target = rdma_queue_flush_target::type_id::create(
+        {name, "_flush"}
+      );
+      flush_target.role = RDMA_QUEUE_ROLE_CQ_PD;
+      flush_target.phase = RDMA_QUEUE_FLUSH_POST_DELETE;
+      flush_target.pd_ref = pd_ref;
+      plan.flush_targets.push_back(flush_target);
+    end
+    else if (kind == RDMA_RESOURCE_SRQ) begin
+      rdma_queue_ring_layout srfq_ring;
+      rdma_queue_backing_ref srfq_ring_ref;
+      rdma_queue_backing_ref srfq_pd_ref;
+      rdma_dma_mapping srfq_ring_mapping;
+      rdma_dma_mapping srfq_pd_mapping;
+
+      srfq_ring_mapping = make_queue_test_mapping(
+        {name, "_srfq_ring_mapping"}, owner, owner_h,
+        64'h0000_4100_0000_0000, 1'b0
+      );
+      srfq_ring = make_queue_test_ring(
+        {name, "_srfq_ring"}, RDMA_QUEUE_ROLE_SRFQ_RING, depth, 64,
+        srfq_ring_mapping
+      );
+      srfq_ring_ref = make_queue_test_ref(
+        {name, "_srfq_ring_ref"}, RDMA_QUEUE_ROLE_SRFQ_RING,
+        srfq_ring_mapping, srfq_ring.storage_bytes,
+        RDMA_OWNERSHIP_BORROWED
+      );
+      srfq_pd_mapping = make_queue_test_mapping(
+        {name, "_srfq_pd_mapping"}, owner, owner_h,
+        64'h0000_5100_0000_0000, 1'b1
+      );
+      srfq_pd_ref = make_queue_test_ref(
+        {name, "_srfq_pd_ref"}, RDMA_QUEUE_ROLE_SRFQ_PD,
+        srfq_pd_mapping, 4096, RDMA_OWNERSHIP_CONTROL_PLANE
+      );
+      plan.rings.push_back(srfq_ring);
+      plan.refs.push_back(srfq_ring_ref);
+      plan.refs.push_back(srfq_pd_ref);
+
+      flush_target = rdma_queue_flush_target::type_id::create(
+        {name, "_srfq_flush"}
+      );
+      flush_target.role = RDMA_QUEUE_ROLE_SRFQ_PD;
+      flush_target.phase = RDMA_QUEUE_FLUSH_PRE_DELETE;
+      flush_target.pd_ref = srfq_pd_ref;
+      plan.flush_targets.push_back(flush_target);
+      flush_target = rdma_queue_flush_target::type_id::create(
+        {name, "_srq_flush"}
+      );
+      flush_target.role = RDMA_QUEUE_ROLE_SRQ_PD;
+      flush_target.phase = RDMA_QUEUE_FLUSH_PRE_DELETE;
+      flush_target.pd_ref = pd_ref;
+      plan.flush_targets.push_back(flush_target);
+    end
+    return plan;
+  endfunction
+
   function automatic void prepare_mr(rdma_mr mr,
                                      longint unsigned iova_value);
     mr.iova.value = iova_value;
@@ -2892,6 +3141,7 @@ class rdma_resource_manager_test extends uvm_test;
     rdma_resource_manager recovery_rm;
     rdma_resource_manager_probe privileged_recovery_rm;
     rdma_resource_manager stale_recovery_rm;
+    rdma_resource_manager queue_snapshot_rm;
     rdma_hmc_allocator hmc;
     rdma_hmc_allocator hmc_exhaustion;
     rdma_hmc_allocator hmc_overflow;
@@ -2933,6 +3183,7 @@ class rdma_resource_manager_test extends uvm_test;
     rdma_function_binding recovery_binding;
     rdma_function_binding privileged_recovery_binding;
     rdma_function_binding stale_recovery_binding;
+    rdma_function_binding queue_snapshot_binding;
     rdma_function_handle owner_h;
     rdma_function_handle owner_b_h;
     rdma_pd pd;
@@ -3044,6 +3295,9 @@ class rdma_resource_manager_test extends uvm_test;
     rdma_cq width_cq_reused;
     rdma_cq publication_cq;
     rdma_cq publication_lookup_cq;
+    rdma_cq queue_snapshot_cq;
+    rdma_cq queue_snapshot_lookup_cq;
+    rdma_ceq queue_snapshot_ceq;
     rdma_cq dep_cq;
     rdma_cq teardown_cq;
     rdma_cq clone_kind_cq_seed;
@@ -3199,6 +3453,14 @@ class rdma_resource_manager_test extends uvm_test;
     rdma_hmc_fvm_addr_t hmc_other_addr;
     rdma_iova_t equal_iova;
     rdma_dma_mapping untouched_mapping;
+    rdma_queue_backing_plan queue_snapshot_plan;
+    rdma_queue_slot_token_contract queue_snapshot_source_token;
+    rdma_queue_slot_token_contract queue_snapshot_stored_token;
+    rdma_queue_completion_authority queue_snapshot_source_authority;
+    rdma_queue_completion_authority queue_snapshot_replacement_authority;
+    rdma_dma_mapping queue_snapshot_authority;
+    rdma_dma_mapping queue_snapshot_unsupported_authority;
+    rdma_rm_owned_authority_hook_mapping queue_snapshot_borrowed_leak;
     longint unsigned lease_size;
     string hmc_type_name;
     string iova_type_name;
@@ -3211,6 +3473,109 @@ class rdma_resource_manager_test extends uvm_test;
     check_reserved_error_completion_proof();
     check_error_restore_active_gate();
     check_error_restore_ref_authority_gate();
+
+    queue_snapshot_rm =
+      rdma_resource_manager::type_id::create("queue_snapshot_rm");
+    queue_snapshot_binding = make_active_binding(
+      "queue_snapshot_binding", 64'h5155_4555_4500_0001,
+      32'h5155_0101, 32'd51
+    );
+    expect_status(
+      "QUEUE_SNAPSHOT_CREATE_CEQ",
+      queue_snapshot_rm.create_ceq(queue_snapshot_binding,
+                                   queue_snapshot_ceq),
+      RDMA_SC_OK
+    );
+    expect_status(
+      "QUEUE_SNAPSHOT_CREATE_CQ",
+      queue_snapshot_rm.create_cq(queue_snapshot_binding,
+                                  queue_snapshot_ceq.handle,
+                                  queue_snapshot_cq),
+      RDMA_SC_OK
+    );
+    queue_snapshot_cq.depth = 128;
+    queue_snapshot_cq.cqe_size_bytes = 64;
+    expect_status(
+      "QUEUE_SNAPSHOT_STAGE_REQUIRES_PROGRAMMED_PLAN",
+      queue_snapshot_rm.stage_allocated(queue_snapshot_cq),
+      RDMA_SC_INVALID_ARGUMENT
+    );
+    queue_snapshot_plan = make_queue_test_plan(
+      "queue_snapshot_plan", RDMA_RESOURCE_CQ, queue_snapshot_cq.depth,
+      queue_snapshot_cq.owner, queue_snapshot_cq.handle,
+      queue_snapshot_cq.local_cq_id
+    );
+    queue_snapshot_cq.queue_plan = queue_snapshot_plan;
+    if (!$cast(queue_snapshot_source_token,
+               queue_snapshot_plan.context_ref.slot_token))
+      `uvm_fatal("QUEUE_SNAPSHOT_TOKEN", "source token contract cast failed")
+    queue_snapshot_source_authority =
+      queue_snapshot_source_token.completion_authority;
+    expect_status(
+      "QUEUE_SNAPSHOT_OWNED_AUTHORITY",
+      queue_snapshot_plan.refs[1].mapping.snapshot_release_authority(
+        queue_snapshot_authority
+      ),
+      RDMA_SC_OK
+    );
+    expect_status(
+      "QUEUE_SNAPSHOT_STAGE",
+      queue_snapshot_rm.stage_allocated(queue_snapshot_cq), RDMA_SC_OK
+    );
+
+    queue_snapshot_plan.rings[0].depth = 64;
+    queue_snapshot_plan.refs[0].mapping.size = 4096;
+    queue_snapshot_replacement_authority =
+      rdma_queue_completion_authority::type_id::create(
+        "queue_snapshot_replacement_authority"
+      );
+    queue_snapshot_source_token.completion_authority =
+      queue_snapshot_replacement_authority;
+    expect_status(
+      "QUEUE_SNAPSHOT_LOOKUP",
+      queue_snapshot_rm.lookup(queue_snapshot_cq.handle, resource),
+      RDMA_SC_OK
+    );
+    if (!$cast(queue_snapshot_lookup_cq, resource) ||
+        queue_snapshot_lookup_cq.queue_plan == null ||
+        queue_snapshot_lookup_cq.queue_plan == queue_snapshot_plan ||
+        queue_snapshot_lookup_cq.queue_plan.rings[0].depth != 128 ||
+        queue_snapshot_lookup_cq.queue_plan.refs[0].mapping.size !=
+          64'h20_0000 ||
+        queue_snapshot_lookup_cq.queue_plan.rings[0] ==
+          queue_snapshot_plan.rings[0] ||
+        queue_snapshot_lookup_cq.queue_plan.refs[0].mapping ==
+          queue_snapshot_plan.refs[0].mapping ||
+        queue_snapshot_lookup_cq.backing_refs.size() != 0 ||
+        queue_snapshot_lookup_cq.hmc_refs.size() != 0)
+      `uvm_error("QUEUE_SNAPSHOT_ISOLATION",
+                 "registry queue plan aliased caller state or duplicated authority")
+    else begin
+      if (!$cast(queue_snapshot_stored_token,
+                 queue_snapshot_lookup_cq.queue_plan.context_ref.slot_token) ||
+          queue_snapshot_stored_token == queue_snapshot_source_token ||
+          queue_snapshot_stored_token.completion_authority !==
+            queue_snapshot_source_authority)
+        `uvm_error("QUEUE_SNAPSHOT_TOKEN_ISOLATION",
+                   "registry context token aliased caller token mutation")
+      expect_status(
+        "QUEUE_SNAPSHOT_OWNED_AUTHORITY_PRESERVED",
+        queue_snapshot_lookup_cq.queue_plan.refs[1].mapping.
+          release_authority_status(queue_snapshot_authority),
+        RDMA_SC_OK
+      );
+      queue_snapshot_borrowed_leak = null;
+      if ($cast(queue_snapshot_borrowed_leak,
+                queue_snapshot_lookup_cq.queue_plan.refs[0].mapping))
+        `uvm_error("QUEUE_SNAPSHOT_BORROWED_DETACH",
+                   "borrowed mapping retained releasable adapter subtype")
+      expect_status(
+        "QUEUE_SNAPSHOT_BORROWED_NONRELEASABLE",
+        queue_snapshot_lookup_cq.queue_plan.refs[0].mapping.
+          snapshot_release_authority(queue_snapshot_unsupported_authority),
+        RDMA_SC_UNSUPPORTED_OPCODE
+      );
+    end
 
     // PD and MR local IDs are hardware-width projections.  The inclusive
     // boundary succeeds, while the next fresh ID fails atomically without
@@ -6634,13 +6999,37 @@ class rdma_resource_manager_test extends uvm_test;
                   RDMA_SC_OK);
     prepare_mr(all_kind_mr, 64'h7100_0000);
     all_kind_ceq.depth = 8;
+    all_kind_ceq.function_local_vector = 3;
+    all_kind_ceq.hardware_vector = 17;
+    all_kind_ceq.msix_table_index = 5;
+    all_kind_ceq.queue_plan = make_queue_test_plan(
+      "all_kind_ceq_plan", RDMA_RESOURCE_CEQ, all_kind_ceq.depth,
+      all_kind_ceq.owner, all_kind_ceq.handle, all_kind_ceq.local_ceq_id
+    );
     all_kind_cq.depth = 8;
-    all_kind_srq.depth = 8;
+    all_kind_cq.cqe_size_bytes = 64;
+    all_kind_cq.queue_plan = make_queue_test_plan(
+      "all_kind_cq_plan", RDMA_RESOURCE_CQ, all_kind_cq.depth,
+      all_kind_cq.owner, all_kind_cq.handle, all_kind_cq.local_cq_id
+    );
+    all_kind_srq.depth = 16;
     all_kind_srq.max_sge = 4;
+    all_kind_srq.limit_threshold = 16;
+    all_kind_srq.queue_plan = make_queue_test_plan(
+      "all_kind_srq_plan", RDMA_RESOURCE_SRQ, all_kind_srq.depth,
+      all_kind_srq.owner, all_kind_srq.handle, all_kind_srq.local_srq_id
+    );
     all_kind_qp.sq_depth = 8;
     all_kind_qp.rq_depth = 8;
     all_kind_cmq.depth = 8;
     all_kind_aeq.depth = 8;
+    all_kind_aeq.function_local_vector = 3;
+    all_kind_aeq.hardware_vector = 17;
+    all_kind_aeq.msix_table_index = 5;
+    all_kind_aeq.queue_plan = make_queue_test_plan(
+      "all_kind_aeq_plan", RDMA_RESOURCE_AEQ, all_kind_aeq.depth,
+      all_kind_aeq.owner, all_kind_aeq.handle, all_kind_aeq.local_aeq_id
+    );
     all_kind_resources.delete();
     all_kind_resources.push_back(all_kind_function);
     all_kind_resources.push_back(all_kind_pd);

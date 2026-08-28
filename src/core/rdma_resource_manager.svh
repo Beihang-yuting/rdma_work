@@ -908,16 +908,254 @@ class rdma_resource_manager extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  protected function void project_queue_fields(
-    rdma_queue_resource source,
-    rdma_queue_resource result
+  protected function rdma_status project_queue_page_value(
+    rdma_queue_dma_page_ref source,
+    string copy_label,
+    output rdma_queue_dma_page_ref result
   );
+    rdma_status status;
+
+    result = null;
+    if (source == null)
+      return rdma_status::success();
+    result = new({copy_label, "_page"});
+    result.role = source.role;
+    result.mapping_offset = source.mapping_offset;
+    result.logical_page_offset = source.logical_page_offset;
+    result.page_iova = source.page_iova;
+    status = project_mapping_value(source.mapping,
+                                   {copy_label, "_mapping"},
+                                   result.mapping);
+    if (!status.ok())
+      result = null;
+    return status;
+  endfunction
+
+  protected function rdma_status project_queue_ring_value(
+    rdma_queue_ring_layout source,
+    string copy_label,
+    output rdma_queue_ring_layout result
+  );
+    rdma_queue_dma_page_ref page_copy;
+    rdma_status status;
+
+    result = null;
+    if (source == null)
+      return rdma_status::success();
+    result = new({copy_label, "_ring"});
+    result.role = source.role;
+    result.entry_size_bytes = source.entry_size_bytes;
+    result.depth = source.depth;
+    result.logical_bytes = source.logical_bytes;
+    result.storage_bytes = source.storage_bytes;
+    result.page_count = source.page_count;
+    result.initial_polarity = source.initial_polarity;
+    foreach (source.pages[i]) begin
+      status = project_queue_page_value(
+        source.pages[i], $sformatf("%s_page_%0d", copy_label, i), page_copy
+      );
+      if (!status.ok()) begin
+        result = null;
+        return status;
+      end
+      result.pages.push_back(page_copy);
+    end
+    return rdma_status::success();
+  endfunction
+
+  protected function rdma_status project_queue_backing_ref_value(
+    rdma_queue_backing_ref source,
+    string copy_label,
+    output rdma_queue_backing_ref result
+  );
+    rdma_status status;
+
+    result = null;
+    if (source == null)
+      return rdma_status::success();
+    result = new({copy_label, "_ref"});
+    result.role = source.role;
+    result.ownership = source.ownership;
+    result.mapping_offset = source.mapping_offset;
+    result.length = source.length;
+    result.logical_queue_offset = source.logical_queue_offset;
+    result.cleanup_complete = source.cleanup_complete;
+    if (source.ownership == RDMA_OWNERSHIP_CONTROL_PLANE)
+      status = clone_owned_mapping_value(source.mapping,
+                                         {copy_label, "_owned_mapping"},
+                                         result.mapping);
+    else
+      status = project_mapping_value(source.mapping,
+                                     {copy_label, "_borrowed_mapping"},
+                                     result.mapping);
+    if (!status.ok())
+      result = null;
+    return status;
+  endfunction
+
+  protected function rdma_status project_queue_slot_token_value(
+    uvm_object source,
+    string copy_label,
+    output uvm_object result
+  );
+    rdma_queue_slot_token_contract source_token;
+    rdma_queue_slot_token_contract result_token;
+    uvm_object cloned_object;
+
+    result = null;
+    if (source == null)
+      return rdma_status::success();
+    if (!$cast(source_token, source) ||
+        source_token.completion_authority == null)
+      return rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT,
+        {copy_label, " slot token contract is invalid"}
+      );
+    cloned_object = source_token.clone();
+    if (cloned_object == null || cloned_object == source ||
+        !$cast(result_token, cloned_object) ||
+        result_token.completion_authority == null ||
+        result_token.completion_authority !==
+          source_token.completion_authority)
+      return rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT,
+        {copy_label, " slot token clone lost opaque authority"}
+      );
+    result = result_token;
+    return rdma_status::success();
+  endfunction
+
+  protected function rdma_status project_queue_context_value(
+    rdma_context_backing_ref source,
+    string copy_label,
+    output rdma_context_backing_ref result
+  );
+    rdma_status status;
+
+    result = null;
+    if (source == null)
+      return rdma_status::success();
+    result = new({copy_label, "_context"});
+    status = project_function_handle_value(
+      source.owner, {copy_label, "_owner"}, result.owner
+    );
+    if (status.ok())
+      status = project_queue_slot_token_value(
+        source.slot_token, {copy_label, "_token"}, result.slot_token
+      );
+    if (status.ok())
+      status = project_hmc_ref_value(
+        source.hmc_ref, {copy_label, "_hmc"}, result.hmc_ref
+      );
+    if (!status.ok()) begin
+      result = null;
+      return status;
+    end
+    result.resource_kind = source.resource_kind;
+    result.local_id = source.local_id;
+    result.shadow_pointer_base = source.shadow_pointer_base;
+    result.slot_length = source.slot_length;
+    result.shadow_view_offset = source.shadow_view_offset;
+    result.shadow_view_length = source.shadow_view_length;
+    result.release_complete = source.release_complete;
+    return rdma_status::success();
+  endfunction
+
+  protected function rdma_status project_queue_flush_target_value(
+    rdma_queue_flush_target source,
+    string copy_label,
+    output rdma_queue_flush_target result
+  );
+    rdma_status status;
+
+    result = null;
+    if (source == null)
+      return rdma_status::success();
+    result = new({copy_label, "_flush"});
+    result.role = source.role;
+    result.phase = source.phase;
+    result.flush_complete = source.flush_complete;
+    status = project_queue_backing_ref_value(
+      source.pd_ref, {copy_label, "_pd_ref"}, result.pd_ref
+    );
+    if (!status.ok())
+      result = null;
+    return status;
+  endfunction
+
+  protected function rdma_status project_queue_plan_value(
+    rdma_queue_backing_plan source,
+    string copy_label,
+    output rdma_queue_backing_plan result
+  );
+    rdma_queue_ring_layout ring_copy;
+    rdma_queue_backing_ref ref_copy;
+    rdma_queue_flush_target flush_copy;
+    rdma_status status;
+
+    result = null;
+    if (source == null)
+      return rdma_status::success();
+    result = new({copy_label, "_plan"});
+    result.resource_kind = source.resource_kind;
+    foreach (source.rings[i]) begin
+      status = project_queue_ring_value(
+        source.rings[i], $sformatf("%s_ring_%0d", copy_label, i), ring_copy
+      );
+      if (!status.ok()) begin
+        result = null;
+        return status;
+      end
+      result.rings.push_back(ring_copy);
+    end
+    foreach (source.refs[i]) begin
+      status = project_queue_backing_ref_value(
+        source.refs[i], $sformatf("%s_ref_%0d", copy_label, i), ref_copy
+      );
+      if (!status.ok()) begin
+        result = null;
+        return status;
+      end
+      result.refs.push_back(ref_copy);
+    end
+    status = project_queue_context_value(
+      source.context_ref, {copy_label, "_context"}, result.context_ref
+    );
+    if (!status.ok()) begin
+      result = null;
+      return status;
+    end
+    foreach (source.flush_targets[i]) begin
+      status = project_queue_flush_target_value(
+        source.flush_targets[i],
+        $sformatf("%s_flush_%0d", copy_label, i), flush_copy
+      );
+      if (!status.ok()) begin
+        result = null;
+        return status;
+      end
+      result.flush_targets.push_back(flush_copy);
+    end
+    return rdma_status::success();
+  endfunction
+
+  protected function rdma_status project_queue_fields(
+    rdma_queue_resource source,
+    rdma_queue_resource result,
+    string copy_label
+  );
+    rdma_status status;
+
     result.depth = source.depth;
     result.producer_index = source.producer_index;
     result.consumer_index = source.consumer_index;
     result.producer_wrap = source.producer_wrap;
     result.consumer_wrap = source.consumer_wrap;
     result.queue_iova = source.queue_iova;
+    status = project_queue_plan_value(source.queue_plan,
+                                      {copy_label, "_queue_plan"},
+                                      result.queue_plan);
+    return status;
   endfunction
 
   protected function rdma_status project_resource_value(
@@ -1080,12 +1318,14 @@ class rdma_resource_manager extends uvm_object;
         result_mr.mr_serial = source_mr.mr_serial;
       end
       RDMA_RESOURCE_CQ: begin
-        project_queue_fields(source_cq, result_cq);
+        status = project_queue_fields(source_cq, result_cq, copy_label);
         result_cq.local_cq_id = source_cq.local_cq_id;
         result_cq.global_cq_id = source_cq.global_cq_id;
-        status = project_handle_value(
-          source_cq.ceq_h, {copy_label, "_ceq"}, result_cq.ceq_h
-        );
+        result_cq.cqe_size_bytes = source_cq.cqe_size_bytes;
+        if (status.ok())
+          status = project_handle_value(
+            source_cq.ceq_h, {copy_label, "_ceq"}, result_cq.ceq_h
+          );
       end
       RDMA_RESOURCE_QP: begin
         result_qp.local_qp_id = source_qp.local_qp_id;
@@ -1123,16 +1363,18 @@ class rdma_resource_manager extends uvm_object;
           );
       end
       RDMA_RESOURCE_SRQ: begin
-        project_queue_fields(source_srq, result_srq);
+        status = project_queue_fields(source_srq, result_srq, copy_label);
         result_srq.local_srq_id = source_srq.local_srq_id;
         result_srq.global_srq_id = source_srq.global_srq_id;
         result_srq.max_sge = source_srq.max_sge;
-        status = project_handle_value(
-          source_srq.pd_h, {copy_label, "_pd"}, result_srq.pd_h
-        );
+        result_srq.limit_threshold = source_srq.limit_threshold;
+        if (status.ok())
+          status = project_handle_value(
+            source_srq.pd_h, {copy_label, "_pd"}, result_srq.pd_h
+          );
       end
       RDMA_RESOURCE_CMQ: begin
-        project_queue_fields(source_cmq, result_cmq);
+        status = project_queue_fields(source_cmq, result_cmq, copy_label);
         result_cmq.local_cmq_id = source_cmq.local_cmq_id;
         result_cmq.global_cmq_id = source_cmq.global_cmq_id;
         result_cmq.completion_producer_index =
@@ -1145,14 +1387,20 @@ class rdma_resource_manager extends uvm_object;
         result_cmq.completion_iova = source_cmq.completion_iova;
       end
       RDMA_RESOURCE_CEQ: begin
-        project_queue_fields(source_ceq, result_ceq);
+        status = project_queue_fields(source_ceq, result_ceq, copy_label);
         result_ceq.local_ceq_id = source_ceq.local_ceq_id;
         result_ceq.global_ceq_id = source_ceq.global_ceq_id;
+        result_ceq.function_local_vector = source_ceq.function_local_vector;
+        result_ceq.hardware_vector = source_ceq.hardware_vector;
+        result_ceq.msix_table_index = source_ceq.msix_table_index;
       end
       RDMA_RESOURCE_AEQ: begin
-        project_queue_fields(source_aeq, result_aeq);
+        status = project_queue_fields(source_aeq, result_aeq, copy_label);
         result_aeq.local_aeq_id = source_aeq.local_aeq_id;
         result_aeq.global_aeq_id = source_aeq.global_aeq_id;
+        result_aeq.function_local_vector = source_aeq.function_local_vector;
+        result_aeq.hardware_vector = source_aeq.hardware_vector;
+        result_aeq.msix_table_index = source_aeq.msix_table_index;
       end
     endcase
 

@@ -31,6 +31,190 @@ class rdma_request_model_test extends uvm_test;
     return handle;
   endfunction
 
+  function automatic rdma_dma_mapping make_queue_mapping(
+    string name,
+    rdma_function_handle owner,
+    longint unsigned iova_value
+  );
+    rdma_dma_mapping mapping;
+
+    mapping = rdma_dma_mapping::type_id::create(name);
+    mapping.function_h = owner;
+    mapping.iova.value = iova_value;
+    mapping.backing_addr.value = iova_value + 64'h1000_0000;
+    mapping.size = 64'h1_0000;
+    mapping.state = RDMA_MAPPING_ACTIVE;
+    return mapping;
+  endfunction
+
+  function automatic rdma_queue_ring_layout make_queue_ring(
+    string name,
+    rdma_queue_backing_role_e role,
+    int unsigned depth,
+    rdma_dma_mapping mapping
+  );
+    rdma_queue_ring_layout ring;
+    rdma_queue_dma_page_ref page;
+    longint unsigned storage_bytes;
+
+    ring = rdma_queue_ring_layout::type_id::create(name);
+    ring.role = role;
+    ring.entry_size_bytes = 64;
+    ring.depth = depth;
+    ring.logical_bytes = depth * 64;
+    storage_bytes = ((ring.logical_bytes + 4095) / 4096) * 4096;
+    ring.storage_bytes = storage_bytes;
+    ring.page_count = storage_bytes / 4096;
+    ring.initial_polarity = 1'b1;
+    for (int unsigned i = 0; i < ring.page_count; i++) begin
+      page = rdma_queue_dma_page_ref::type_id::create(
+        $sformatf("%s_page_%0d", name, i)
+      );
+      page.role = role;
+      page.mapping = mapping;
+      page.mapping_offset = i * 4096;
+      page.logical_page_offset = i * 4096;
+      page.page_iova.value = mapping.iova.value + i * 4096;
+      ring.pages.push_back(page);
+    end
+    return ring;
+  endfunction
+
+  function automatic rdma_queue_backing_ref make_queue_ref(
+    string name,
+    rdma_queue_backing_role_e role,
+    rdma_dma_mapping mapping,
+    longint unsigned length,
+    rdma_resource_ownership_e ownership
+  );
+    rdma_queue_backing_ref ref_value;
+
+    ref_value = rdma_queue_backing_ref::type_id::create(name);
+    ref_value.role = role;
+    ref_value.mapping = mapping;
+    ref_value.length = length;
+    ref_value.ownership = ownership;
+    return ref_value;
+  endfunction
+
+  function automatic rdma_context_backing_ref make_queue_context(
+    string name,
+    rdma_resource_kind_e kind,
+    rdma_function_handle owner
+  );
+    rdma_context_backing_ref context_ref;
+    rdma_queue_opaque_slot_token token;
+    rdma_queue_completion_authority authority;
+
+    context_ref = rdma_context_backing_ref::type_id::create(name);
+    context_ref.owner = owner;
+    context_ref.resource_kind = kind;
+    token = rdma_queue_opaque_slot_token::type_id::create({name, "_token"});
+    authority = rdma_queue_completion_authority::type_id::create(
+      {name, "_authority"}
+    );
+    token.completion_authority = authority;
+    context_ref.slot_token = token;
+    context_ref.hmc_ref = rdma_hmc_ref::type_id::create({name, "_hmc"});
+    context_ref.hmc_ref.owner = owner;
+    context_ref.hmc_ref.object_kind = RDMA_RESOURCE_MR;
+    context_ref.hmc_ref.size = 4096;
+    context_ref.hmc_ref.first_pbl_index = 1;
+    context_ref.shadow_pointer_base.value = 64'h8000_0000;
+    context_ref.slot_length = 64;
+    context_ref.shadow_view_length = 32;
+    return context_ref;
+  endfunction
+
+  function automatic rdma_queue_backing_plan make_queue_plan(
+    string name,
+    rdma_resource_kind_e kind,
+    int unsigned depth,
+    rdma_function_handle owner
+  );
+    rdma_queue_backing_plan plan;
+    rdma_dma_mapping mapping;
+    rdma_queue_ring_layout ring;
+    rdma_queue_backing_ref ring_ref;
+    rdma_queue_backing_ref pd_ref;
+    rdma_queue_flush_target flush_target;
+
+    plan = rdma_queue_backing_plan::type_id::create(name);
+    plan.resource_kind = kind;
+    mapping = make_queue_mapping({name, "_mapping"}, owner,
+                                 64'h4000_0000);
+    if (kind == RDMA_RESOURCE_CQ) begin
+      ring = make_queue_ring({name, "_ring"}, RDMA_QUEUE_ROLE_CQ_RING,
+                             depth, mapping);
+      ring_ref = make_queue_ref({name, "_ring_ref"},
+                                RDMA_QUEUE_ROLE_CQ_RING, mapping,
+                                ring.storage_bytes,
+                                RDMA_OWNERSHIP_BORROWED);
+      pd_ref = make_queue_ref({name, "_pd_ref"}, RDMA_QUEUE_ROLE_CQ_PD,
+                              mapping, 4096,
+                              RDMA_OWNERSHIP_CONTROL_PLANE);
+      plan.rings.push_back(ring);
+      plan.refs.push_back(ring_ref);
+      plan.refs.push_back(pd_ref);
+      plan.context_ref = make_queue_context({name, "_context"}, kind,
+                                            owner);
+      flush_target = rdma_queue_flush_target::type_id::create(
+        {name, "_flush"}
+      );
+      flush_target.role = RDMA_QUEUE_ROLE_CQ_PD;
+      flush_target.phase = RDMA_QUEUE_FLUSH_POST_DELETE;
+      flush_target.pd_ref = pd_ref;
+      plan.flush_targets.push_back(flush_target);
+    end
+    else begin
+      rdma_queue_ring_layout srfq_ring;
+      rdma_queue_backing_ref srfq_ref;
+      rdma_queue_backing_ref srfq_pd;
+
+      ring = make_queue_ring({name, "_srq_ring"},
+                             RDMA_QUEUE_ROLE_SRQ_RING, depth, mapping);
+      srfq_ring = make_queue_ring({name, "_srfq_ring"},
+                                  RDMA_QUEUE_ROLE_SRFQ_RING, depth, mapping);
+      ring_ref = make_queue_ref({name, "_srq_ref"},
+                                RDMA_QUEUE_ROLE_SRQ_RING, mapping,
+                                ring.storage_bytes,
+                                RDMA_OWNERSHIP_BORROWED);
+      srfq_ref = make_queue_ref({name, "_srfq_ref"},
+                                RDMA_QUEUE_ROLE_SRFQ_RING, mapping,
+                                srfq_ring.storage_bytes,
+                                RDMA_OWNERSHIP_BORROWED);
+      pd_ref = make_queue_ref({name, "_srq_pd"}, RDMA_QUEUE_ROLE_SRQ_PD,
+                              mapping, 4096,
+                              RDMA_OWNERSHIP_CONTROL_PLANE);
+      srfq_pd = make_queue_ref({name, "_srfq_pd"},
+                               RDMA_QUEUE_ROLE_SRFQ_PD, mapping, 4096,
+                               RDMA_OWNERSHIP_CONTROL_PLANE);
+      plan.rings.push_back(ring);
+      plan.rings.push_back(srfq_ring);
+      plan.refs.push_back(ring_ref);
+      plan.refs.push_back(srfq_ref);
+      plan.refs.push_back(pd_ref);
+      plan.refs.push_back(srfq_pd);
+      plan.context_ref = make_queue_context({name, "_context"}, kind,
+                                            owner);
+      flush_target = rdma_queue_flush_target::type_id::create(
+        {name, "_srfq_flush"}
+      );
+      flush_target.role = RDMA_QUEUE_ROLE_SRFQ_PD;
+      flush_target.phase = RDMA_QUEUE_FLUSH_PRE_DELETE;
+      flush_target.pd_ref = srfq_pd;
+      plan.flush_targets.push_back(flush_target);
+      flush_target = rdma_queue_flush_target::type_id::create(
+        {name, "_srq_flush"}
+      );
+      flush_target.role = RDMA_QUEUE_ROLE_SRQ_PD;
+      flush_target.phase = RDMA_QUEUE_FLUSH_PRE_DELETE;
+      flush_target.pd_ref = pd_ref;
+      plan.flush_targets.push_back(flush_target);
+    end
+    return plan;
+  endfunction
+
   function automatic void expect_status(
     string check_name,
     rdma_status status,
@@ -63,9 +247,13 @@ class rdma_request_model_test extends uvm_test;
     rdma_register_mr_req register_mr;
     rdma_register_mr_req register_mr_clone;
     rdma_create_cq_req create_cq;
+    rdma_create_cq_req create_cq_clone;
     rdma_create_srq_req create_srq;
+    rdma_create_srq_req create_srq_clone;
     rdma_create_ceq_req create_ceq;
+    rdma_create_ceq_req create_ceq_clone;
     rdma_create_aeq_req create_aeq;
+    rdma_create_aeq_req create_aeq_clone;
     rdma_destroy_resource_req destroy_resource;
     rdma_modify_qp_req modify_qp;
     rdma_post_send_req post_send;
@@ -249,55 +437,134 @@ class rdma_request_model_test extends uvm_test;
     register_mr.pd_h = pd_h;
 
     create_cq = rdma_create_cq_req::type_id::create("create_cq");
+    if (create_cq.cqe_size_bytes != 64 || create_cq.ring_backing == null ||
+        create_cq.ring_backing.mode != RDMA_QUEUE_BACKING_OWNED)
+      `uvm_error("CREATE_CQ_DEFAULTS",
+                 "CQ request defaults do not describe a 64-byte owned ring")
     create_cq.owner = function_h;
     create_cq.depth = 256;
     create_cq.ceq_h = ceq_h;
     expect_status("CREATE_CQ", create_cq.validate(), RDMA_SC_OK);
-    create_cq.owner = null;
-    expect_status("CREATE_CQ_OWNER", create_cq.validate(),
+    create_cq.cqe_size_bytes = 48;
+    expect_status("CREATE_CQ_CQE_SIZE", create_cq.validate(),
                   RDMA_SC_INVALID_ARGUMENT);
+    create_cq.cqe_size_bytes = 64;
+    cloned_object = create_cq.clone();
+    if (!$cast(create_cq_clone, cloned_object) ||
+        create_cq_clone.ceq_h == null ||
+        create_cq_clone.ring_backing == null ||
+        create_cq_clone.ceq_h == create_cq.ceq_h ||
+        create_cq_clone.ring_backing == create_cq.ring_backing ||
+        create_cq_clone.cqe_size_bytes != 64)
+      `uvm_error("CREATE_CQ_CLONE",
+                 "CQ request clone lost or aliased typed fields")
+    else begin
+      create_cq_clone.ring_backing.mode = RDMA_QUEUE_BACKING_BORROWED;
+      create_cq_clone.ceq_h.object_id++;
+      if (create_cq.ring_backing.mode != RDMA_QUEUE_BACKING_OWNED ||
+          create_cq.ceq_h.object_id != 32'h606)
+        `uvm_error("CREATE_CQ_CLONE",
+                   "CQ request clone mutation reached source")
+    end
+    create_cq.owner = null;
+    expect_status("CREATE_CQ_STRUCTURAL_ONLY", create_cq.validate(),
+                  RDMA_SC_OK);
     create_cq.owner = function_h;
     create_cq.ceq_h = null;
     expect_status("CREATE_CQ_OPTIONAL_CEQ", create_cq.validate(), RDMA_SC_OK);
     mismatched_h = make_handle("cq_cross_ceq_h", RDMA_RESOURCE_CEQ, 32'h906);
     mismatched_h.function_uid++;
     create_cq.ceq_h = mismatched_h;
-    expect_status("CREATE_CQ_CEQ_OWNER", create_cq.validate(),
-                  RDMA_SC_INVALID_ARGUMENT);
+    expect_status("CREATE_CQ_CEQ_PREFLIGHT", create_cq.validate(),
+                  RDMA_SC_OK);
     create_cq.ceq_h = ceq_h;
     create_cq.depth = 0;
     expect_status("CREATE_CQ_DEPTH", create_cq.validate(),
                   RDMA_SC_INVALID_ARGUMENT);
+    create_cq.depth = 256;
+    create_cq.ring_backing = null;
+    expect_status("CREATE_CQ_BACKING", create_cq.validate(),
+                  RDMA_SC_INVALID_ARGUMENT);
 
     create_srq = rdma_create_srq_req::type_id::create("create_srq");
+    if (create_srq.limit_threshold != 16 ||
+        create_srq.payload_backing == null ||
+        create_srq.payload_backing.mode != RDMA_QUEUE_BACKING_OWNED)
+      `uvm_error("CREATE_SRQ_DEFAULTS",
+                 "SRQ request defaults do not describe threshold 16 owned payload")
     create_srq.owner = function_h;
     create_srq.depth = 128;
     create_srq.max_sge = 2;
     create_srq.pd_h = pd_h;
     expect_status("CREATE_SRQ", create_srq.validate(), RDMA_SC_OK);
-    create_srq.owner = null;
-    expect_status("CREATE_SRQ_OWNER", create_srq.validate(),
+    create_srq.limit_threshold = 18;
+    expect_status("CREATE_SRQ_LIMIT_ALIGN", create_srq.validate(),
                   RDMA_SC_INVALID_ARGUMENT);
+    create_srq.limit_threshold = 12;
+    expect_status("CREATE_SRQ_LIMIT_MIN", create_srq.validate(),
+                  RDMA_SC_INVALID_ARGUMENT);
+    create_srq.limit_threshold = 132;
+    expect_status("CREATE_SRQ_LIMIT_DEPTH", create_srq.validate(),
+                  RDMA_SC_INVALID_ARGUMENT);
+    create_srq.limit_threshold = 16;
+    cloned_object = create_srq.clone();
+    if (!$cast(create_srq_clone, cloned_object) ||
+        create_srq_clone.pd_h == null ||
+        create_srq_clone.payload_backing == null ||
+        create_srq_clone.pd_h == create_srq.pd_h ||
+        create_srq_clone.payload_backing == create_srq.payload_backing ||
+        create_srq_clone.limit_threshold != 16)
+      `uvm_error("CREATE_SRQ_CLONE",
+                 "SRQ request clone lost or aliased typed fields")
+    create_srq.owner = null;
+    expect_status("CREATE_SRQ_STRUCTURAL_ONLY", create_srq.validate(),
+                  RDMA_SC_OK);
     create_srq.owner = function_h;
     create_srq.pd_h = cq_h;
-    expect_status("CREATE_SRQ_PD", create_srq.validate(),
-                  RDMA_SC_INVALID_ARGUMENT);
+    expect_status("CREATE_SRQ_PD_PREFLIGHT", create_srq.validate(),
+                  RDMA_SC_OK);
     mismatched_h = make_handle("srq_stale_pd_h", RDMA_RESOURCE_PD, 32'h907);
     mismatched_h.generation++;
     create_srq.pd_h = mismatched_h;
-    expect_status("CREATE_SRQ_PD_GENERATION", create_srq.validate(),
-                  RDMA_SC_STALE_GENERATION);
+    expect_status("CREATE_SRQ_PD_GENERATION_PREFLIGHT", create_srq.validate(),
+                  RDMA_SC_OK);
     create_srq.pd_h = pd_h;
     create_srq.max_sge = 0;
     expect_status("CREATE_SRQ_SGE", create_srq.validate(),
                   RDMA_SC_INVALID_ARGUMENT);
+    create_srq.max_sge = 2;
+    create_srq.payload_backing = null;
+    expect_status("CREATE_SRQ_BACKING", create_srq.validate(),
+                  RDMA_SC_INVALID_ARGUMENT);
 
     create_ceq = rdma_create_ceq_req::type_id::create("create_ceq");
+    if (create_ceq.ring_backing == null ||
+        create_ceq.ring_backing.mode != RDMA_QUEUE_BACKING_OWNED)
+      `uvm_error("CREATE_CEQ_DEFAULTS", "CEQ ring backing default is invalid")
     create_ceq.depth = 64;
+    create_ceq.vector_id = 3;
     expect_status("CREATE_CEQ", create_ceq.validate(), RDMA_SC_OK);
+    cloned_object = create_ceq.clone();
+    if (!$cast(create_ceq_clone, cloned_object) ||
+        create_ceq_clone.ring_backing == null ||
+        create_ceq_clone.ring_backing == create_ceq.ring_backing ||
+        create_ceq_clone.vector_id != 3)
+      `uvm_error("CREATE_CEQ_CLONE",
+                 "CEQ request clone lost or aliased typed fields")
     create_aeq = rdma_create_aeq_req::type_id::create("create_aeq");
+    if (create_aeq.ring_backing == null ||
+        create_aeq.ring_backing.mode != RDMA_QUEUE_BACKING_OWNED)
+      `uvm_error("CREATE_AEQ_DEFAULTS", "AEQ ring backing default is invalid")
     create_aeq.depth = 64;
+    create_aeq.vector_id = 3;
     expect_status("CREATE_AEQ", create_aeq.validate(), RDMA_SC_OK);
+    cloned_object = create_aeq.clone();
+    if (!$cast(create_aeq_clone, cloned_object) ||
+        create_aeq_clone.ring_backing == null ||
+        create_aeq_clone.ring_backing == create_aeq.ring_backing ||
+        create_aeq_clone.vector_id != 3)
+      `uvm_error("CREATE_AEQ_CLONE",
+                 "AEQ request clone lost or aliased typed fields")
 
     destroy_resource =
       rdma_destroy_resource_req::type_id::create("destroy_resource");
@@ -691,6 +958,9 @@ class rdma_request_model_test extends uvm_test;
     cq_resource.producer_wrap = 1'b1;
     cq_resource.consumer_wrap = 1'b1;
     cq_resource.queue_iova.value = 64'h4100_0000;
+    cq_resource.queue_plan = make_queue_plan(
+      "cq_resource_plan", RDMA_RESOURCE_CQ, cq_resource.depth, function_h
+    );
     expect_status("CQ_RESOURCE", cq_resource.validate(), RDMA_SC_OK);
     cq_resource.ceq_h = null;
     expect_status("CQ_RESOURCE_CEQ", cq_resource.validate(),
@@ -964,7 +1234,12 @@ class rdma_request_model_test extends uvm_test;
     srq_resource.state = RDMA_RESOURCE_PROGRAMMED;
     srq_resource.depth = 128;
     srq_resource.max_sge = 2;
+    srq_resource.limit_threshold = 16;
     srq_resource.pd_h = pd_h;
+    srq_resource.queue_plan = make_queue_plan(
+      "srq_resource_plan", RDMA_RESOURCE_SRQ, srq_resource.depth,
+      function_h
+    );
     expect_status("SRQ_RESOURCE", srq_resource.validate(), RDMA_SC_OK);
     mismatched_h = make_handle("srq_resource_cross_pd_h", RDMA_RESOURCE_PD,
                                32'h90d);

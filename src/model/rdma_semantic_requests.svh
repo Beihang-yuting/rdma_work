@@ -225,22 +225,28 @@ class rdma_create_cq_req extends rdma_semantic_request;
   `uvm_object_utils(rdma_create_cq_req)
 
   int unsigned depth;
+  int unsigned cqe_size_bytes;
   rdma_handle ceq_h;
+  rdma_queue_backing_spec ring_backing;
 
   function new(string name = "rdma_create_cq_req");
     super.new(name);
     depth = '0;
+    cqe_size_bytes = 64;
     ceq_h = null;
+    ring_backing = rdma_queue_backing_spec::type_id::create("ring_backing");
   endfunction
 
   virtual function void do_copy(uvm_object rhs);
     rdma_create_cq_req rhs_req;
     uvm_object cloned_object;
+    rdma_queue_backing_spec cloned_backing;
 
     super.do_copy(rhs);
     if (!$cast(rhs_req, rhs))
       `uvm_fatal("RDMA_COPY_TYPE", "create CQ request copy type mismatch")
     depth = rhs_req.depth;
+    cqe_size_bytes = rhs_req.cqe_size_bytes;
     if (rhs_req.ceq_h == null) begin
       ceq_h = null;
     end
@@ -248,6 +254,17 @@ class rdma_create_cq_req extends rdma_semantic_request;
       cloned_object = rhs_req.ceq_h.clone();
       if (cloned_object == null || !$cast(ceq_h, cloned_object))
         `uvm_fatal("RDMA_COPY_TYPE", "CEQ handle clone type mismatch")
+    end
+    if (rhs_req.ring_backing == null) begin
+      ring_backing = null;
+    end
+    else begin
+      cloned_object = rhs_req.ring_backing.clone();
+      if (cloned_object == null ||
+          !$cast(cloned_backing, cloned_object) ||
+          cloned_backing == rhs_req.ring_backing)
+        `uvm_fatal("RDMA_COPY_TYPE", "CQ ring backing clone mismatch")
+      ring_backing = cloned_backing;
     end
   endfunction
 
@@ -257,20 +274,18 @@ class rdma_create_cq_req extends rdma_semantic_request;
     status = super.validate();
     if (!status.ok())
       return status;
-    if (owner == null || owner.kind != RDMA_RESOURCE_FUNCTION)
-      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                               "CQ requires a function owner");
-    if (ceq_h != null) begin
-      if (ceq_h.kind != RDMA_RESOURCE_CEQ)
-        return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                                 "CQ CEQ handle is invalid");
-      status = rdma_handle_owner_status(ceq_h, owner);
-      if (!status.ok())
-        return status;
-    end
     if (!rdma_is_power_of_two(depth))
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "CQ depth is not a nonzero power of two");
+    if (!(cqe_size_bytes inside {32, 64, 128}))
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "CQ entry size is invalid");
+    if (ring_backing == null)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "CQ ring backing is null");
+    status = ring_backing.validate();
+    if (!status.ok())
+      return status;
     return rdma_status::success();
   endfunction
 endclass
@@ -391,24 +406,31 @@ class rdma_create_srq_req extends rdma_semantic_request;
 
   int unsigned depth;
   int unsigned max_sge;
+  int unsigned limit_threshold;
   rdma_handle pd_h;
+  rdma_queue_backing_spec payload_backing;
 
   function new(string name = "rdma_create_srq_req");
     super.new(name);
     depth = '0;
     max_sge = '0;
+    limit_threshold = 16;
     pd_h = null;
+    payload_backing =
+      rdma_queue_backing_spec::type_id::create("payload_backing");
   endfunction
 
   virtual function void do_copy(uvm_object rhs);
     rdma_create_srq_req rhs_req;
     uvm_object cloned_object;
+    rdma_queue_backing_spec cloned_backing;
 
     super.do_copy(rhs);
     if (!$cast(rhs_req, rhs))
       `uvm_fatal("RDMA_COPY_TYPE", "create SRQ request copy type mismatch")
     depth = rhs_req.depth;
     max_sge = rhs_req.max_sge;
+    limit_threshold = rhs_req.limit_threshold;
     if (rhs_req.pd_h == null) begin
       pd_h = null;
     end
@@ -416,6 +438,17 @@ class rdma_create_srq_req extends rdma_semantic_request;
       cloned_object = rhs_req.pd_h.clone();
       if (cloned_object == null || !$cast(pd_h, cloned_object))
         `uvm_fatal("RDMA_COPY_TYPE", "PD handle clone type mismatch")
+    end
+    if (rhs_req.payload_backing == null) begin
+      payload_backing = null;
+    end
+    else begin
+      cloned_object = rhs_req.payload_backing.clone();
+      if (cloned_object == null ||
+          !$cast(cloned_backing, cloned_object) ||
+          cloned_backing == rhs_req.payload_backing)
+        `uvm_fatal("RDMA_COPY_TYPE", "SRQ payload backing clone mismatch")
+      payload_backing = cloned_backing;
     end
   endfunction
 
@@ -431,10 +464,14 @@ class rdma_create_srq_req extends rdma_semantic_request;
     if (max_sge == 0)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "SRQ maximum SGE count is zero");
-    if (pd_h != null && pd_h.kind != RDMA_RESOURCE_PD)
+    if (limit_threshold < 16 || limit_threshold > depth ||
+        limit_threshold % 4 != 0)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                               "SRQ requires a PD handle");
-    status = rdma_handle_owner_status(pd_h, owner);
+                               "SRQ limit threshold is invalid");
+    if (payload_backing == null)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "SRQ payload backing is null");
+    status = payload_backing.validate();
     if (!status.ok())
       return status;
     return rdma_status::success();
@@ -444,20 +481,37 @@ endclass
 class rdma_create_ceq_req extends rdma_semantic_request;
   `uvm_object_utils(rdma_create_ceq_req)
 
-  int unsigned depth;
+  int unsigned depth, vector_id;
+  rdma_queue_backing_spec ring_backing;
 
   function new(string name = "rdma_create_ceq_req");
     super.new(name);
     depth = '0;
+    vector_id = '0;
+    ring_backing = rdma_queue_backing_spec::type_id::create("ring_backing");
   endfunction
 
   virtual function void do_copy(uvm_object rhs);
     rdma_create_ceq_req rhs_req;
+    uvm_object cloned_object;
+    rdma_queue_backing_spec cloned_backing;
 
     super.do_copy(rhs);
     if (!$cast(rhs_req, rhs))
       `uvm_fatal("RDMA_COPY_TYPE", "create CEQ request copy type mismatch")
     depth = rhs_req.depth;
+    vector_id = rhs_req.vector_id;
+    if (rhs_req.ring_backing == null) begin
+      ring_backing = null;
+    end
+    else begin
+      cloned_object = rhs_req.ring_backing.clone();
+      if (cloned_object == null ||
+          !$cast(cloned_backing, cloned_object) ||
+          cloned_backing == rhs_req.ring_backing)
+        `uvm_fatal("RDMA_COPY_TYPE", "CEQ ring backing clone mismatch")
+      ring_backing = cloned_backing;
+    end
   endfunction
 
   virtual function rdma_status validate();
@@ -469,6 +523,12 @@ class rdma_create_ceq_req extends rdma_semantic_request;
     if (!rdma_is_power_of_two(depth))
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "CEQ depth is not a nonzero power of two");
+    if (ring_backing == null)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "CEQ ring backing is null");
+    status = ring_backing.validate();
+    if (!status.ok())
+      return status;
     return rdma_status::success();
   endfunction
 endclass
@@ -476,20 +536,37 @@ endclass
 class rdma_create_aeq_req extends rdma_semantic_request;
   `uvm_object_utils(rdma_create_aeq_req)
 
-  int unsigned depth;
+  int unsigned depth, vector_id;
+  rdma_queue_backing_spec ring_backing;
 
   function new(string name = "rdma_create_aeq_req");
     super.new(name);
     depth = '0;
+    vector_id = '0;
+    ring_backing = rdma_queue_backing_spec::type_id::create("ring_backing");
   endfunction
 
   virtual function void do_copy(uvm_object rhs);
     rdma_create_aeq_req rhs_req;
+    uvm_object cloned_object;
+    rdma_queue_backing_spec cloned_backing;
 
     super.do_copy(rhs);
     if (!$cast(rhs_req, rhs))
       `uvm_fatal("RDMA_COPY_TYPE", "create AEQ request copy type mismatch")
     depth = rhs_req.depth;
+    vector_id = rhs_req.vector_id;
+    if (rhs_req.ring_backing == null) begin
+      ring_backing = null;
+    end
+    else begin
+      cloned_object = rhs_req.ring_backing.clone();
+      if (cloned_object == null ||
+          !$cast(cloned_backing, cloned_object) ||
+          cloned_backing == rhs_req.ring_backing)
+        `uvm_fatal("RDMA_COPY_TYPE", "AEQ ring backing clone mismatch")
+      ring_backing = cloned_backing;
+    end
   endfunction
 
   virtual function rdma_status validate();
@@ -501,6 +578,12 @@ class rdma_create_aeq_req extends rdma_semantic_request;
     if (!rdma_is_power_of_two(depth))
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "AEQ depth is not a nonzero power of two");
+    if (ring_backing == null)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "AEQ ring backing is null");
+    status = ring_backing.validate();
+    if (!status.ok())
+      return status;
     return rdma_status::success();
   endfunction
 endclass

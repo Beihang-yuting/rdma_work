@@ -149,6 +149,7 @@ class rdma_queue_resource extends rdma_resource;
   bit producer_wrap;
   bit consumer_wrap;
   rdma_iova_t queue_iova;
+  rdma_queue_backing_plan queue_plan;
 
   function new(string name = "rdma_queue_resource");
     super.new(name);
@@ -158,10 +159,13 @@ class rdma_queue_resource extends rdma_resource;
     producer_wrap = 1'b0;
     consumer_wrap = 1'b0;
     queue_iova = '0;
+    queue_plan = null;
   endfunction
 
   virtual function void do_copy(uvm_object rhs);
     rdma_queue_resource rhs_queue;
+    uvm_object cloned_object;
+    rdma_queue_backing_plan cloned_plan;
 
     super.do_copy(rhs);
     if (!$cast(rhs_queue, rhs))
@@ -172,14 +176,44 @@ class rdma_queue_resource extends rdma_resource;
     producer_wrap = rhs_queue.producer_wrap;
     consumer_wrap = rhs_queue.consumer_wrap;
     queue_iova = rhs_queue.queue_iova;
+    if (rhs_queue.queue_plan == null) begin
+      queue_plan = null;
+    end
+    else begin
+      cloned_object = rhs_queue.queue_plan.clone();
+      if (cloned_object == null || !$cast(cloned_plan, cloned_object) ||
+          cloned_plan == rhs_queue.queue_plan)
+        `uvm_fatal("RDMA_COPY_TYPE", "queue plan clone mismatch")
+      queue_plan = cloned_plan;
+    end
   endfunction
 
   virtual function rdma_status validate();
     rdma_status status;
+    bit lifecycle_queue;
+    bit plan_required;
 
     status = super.validate();
     if (!status.ok())
       return status;
+    lifecycle_queue = resource_kind() inside {
+      RDMA_RESOURCE_CQ, RDMA_RESOURCE_SRQ,
+      RDMA_RESOURCE_CEQ, RDMA_RESOURCE_AEQ
+    };
+    plan_required = state inside {
+      RDMA_RESOURCE_ALLOCATED, RDMA_RESOURCE_PROGRAMMED,
+      RDMA_RESOURCE_ACTIVE,
+      RDMA_RESOURCE_QUIESCING, RDMA_RESOURCE_ERROR
+    };
+    if (lifecycle_queue &&
+        (backing_refs.size() != 0 || hmc_refs.size() != 0))
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "queue authority must be represented only by the queue plan"
+      );
+    if (lifecycle_queue && state == RDMA_RESOURCE_ALLOCATED &&
+        depth == 0 && queue_plan == null)
+      return rdma_status::success();
     if (!rdma_is_power_of_two(depth))
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "queue depth is not a nonzero power of two");
@@ -190,6 +224,17 @@ class rdma_queue_resource extends rdma_resource;
                                consumer_index, consumer_wrap))
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "queue producer and consumer state is invalid");
+    if (lifecycle_queue && plan_required) begin
+      if (queue_plan == null)
+        return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                                 "programmed queue plan is null");
+      if (queue_plan.resource_kind != resource_kind())
+        return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                                 "queue plan kind does not match resource");
+      status = queue_plan.validate();
+      if (!status.ok())
+        return status;
+    end
     return rdma_status::success();
   endfunction
 endclass
@@ -366,12 +411,14 @@ class rdma_cq extends rdma_queue_resource;
 
   int unsigned local_cq_id;
   int unsigned global_cq_id;
+  int unsigned cqe_size_bytes;
   rdma_handle ceq_h;
 
   function new(string name = "rdma_cq");
     super.new(name);
     local_cq_id = '0;
     global_cq_id = '0;
+    cqe_size_bytes = 64;
     ceq_h = null;
   endfunction
 
@@ -387,6 +434,7 @@ class rdma_cq extends rdma_queue_resource;
       `uvm_fatal("RDMA_COPY_TYPE", "CQ resource copy type mismatch")
     local_cq_id = rhs_cq.local_cq_id;
     global_cq_id = rhs_cq.global_cq_id;
+    cqe_size_bytes = rhs_cq.cqe_size_bytes;
     ceq_h = rdma_clone_handle_value(rhs_cq.ceq_h, "CQ CEQ");
   endfunction
 
@@ -396,7 +444,13 @@ class rdma_cq extends rdma_queue_resource;
     status = super.validate();
     if (!status.ok())
       return status;
-    if (state inside {RDMA_RESOURCE_PROGRAMMED, RDMA_RESOURCE_ACTIVE}) begin
+    if (state inside {
+          RDMA_RESOURCE_PROGRAMMED, RDMA_RESOURCE_ACTIVE,
+          RDMA_RESOURCE_QUIESCING, RDMA_RESOURCE_ERROR
+        }) begin
+      if (!(cqe_size_bytes inside {32, 64, 128}))
+        return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                                 "CQ entry size is invalid");
       if (ceq_h != null && ceq_h.kind != RDMA_RESOURCE_CEQ)
         return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                  "CQ CEQ handle is invalid");
@@ -555,6 +609,7 @@ class rdma_srq extends rdma_queue_resource;
   int unsigned local_srq_id;
   int unsigned global_srq_id;
   int unsigned max_sge;
+  int unsigned limit_threshold;
   rdma_handle pd_h;
 
   function new(string name = "rdma_srq");
@@ -562,6 +617,7 @@ class rdma_srq extends rdma_queue_resource;
     local_srq_id = '0;
     global_srq_id = '0;
     max_sge = '0;
+    limit_threshold = 16;
     pd_h = null;
   endfunction
 
@@ -578,6 +634,7 @@ class rdma_srq extends rdma_queue_resource;
     local_srq_id = rhs_srq.local_srq_id;
     global_srq_id = rhs_srq.global_srq_id;
     max_sge = rhs_srq.max_sge;
+    limit_threshold = rhs_srq.limit_threshold;
     pd_h = rdma_clone_handle_value(rhs_srq.pd_h, "SRQ PD");
   endfunction
 
@@ -587,7 +644,10 @@ class rdma_srq extends rdma_queue_resource;
     status = super.validate();
     if (!status.ok())
       return status;
-    if (state inside {RDMA_RESOURCE_PROGRAMMED, RDMA_RESOURCE_ACTIVE}) begin
+    if (state inside {
+          RDMA_RESOURCE_PROGRAMMED, RDMA_RESOURCE_ACTIVE,
+          RDMA_RESOURCE_QUIESCING, RDMA_RESOURCE_ERROR
+        }) begin
       if (pd_h != null && pd_h.kind != RDMA_RESOURCE_PD)
         return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                  "SRQ PD handle is invalid");
@@ -597,6 +657,10 @@ class rdma_srq extends rdma_queue_resource;
       if (max_sge == 0)
         return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                  "SRQ maximum SGE count is zero");
+      if (limit_threshold < 16 || limit_threshold > depth ||
+          limit_threshold % 4 != 0)
+        return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                                 "SRQ limit threshold is invalid");
     end
     return rdma_status::success();
   endfunction
@@ -607,11 +671,17 @@ class rdma_ceq extends rdma_queue_resource;
 
   int unsigned local_ceq_id;
   int unsigned global_ceq_id;
+  int unsigned function_local_vector;
+  int unsigned hardware_vector;
+  int unsigned msix_table_index;
 
   function new(string name = "rdma_ceq");
     super.new(name);
     local_ceq_id = '0;
     global_ceq_id = '0;
+    function_local_vector = '0;
+    hardware_vector = '0;
+    msix_table_index = '0;
   endfunction
 
   virtual function rdma_resource_kind_e resource_kind();
@@ -626,6 +696,9 @@ class rdma_ceq extends rdma_queue_resource;
       `uvm_fatal("RDMA_COPY_TYPE", "CEQ resource copy type mismatch")
     local_ceq_id = rhs_ceq.local_ceq_id;
     global_ceq_id = rhs_ceq.global_ceq_id;
+    function_local_vector = rhs_ceq.function_local_vector;
+    hardware_vector = rhs_ceq.hardware_vector;
+    msix_table_index = rhs_ceq.msix_table_index;
   endfunction
 endclass
 
@@ -634,11 +707,17 @@ class rdma_aeq extends rdma_queue_resource;
 
   int unsigned local_aeq_id;
   int unsigned global_aeq_id;
+  int unsigned function_local_vector;
+  int unsigned hardware_vector;
+  int unsigned msix_table_index;
 
   function new(string name = "rdma_aeq");
     super.new(name);
     local_aeq_id = '0;
     global_aeq_id = '0;
+    function_local_vector = '0;
+    hardware_vector = '0;
+    msix_table_index = '0;
   endfunction
 
   virtual function rdma_resource_kind_e resource_kind();
@@ -653,6 +732,9 @@ class rdma_aeq extends rdma_queue_resource;
       `uvm_fatal("RDMA_COPY_TYPE", "AEQ resource copy type mismatch")
     local_aeq_id = rhs_aeq.local_aeq_id;
     global_aeq_id = rhs_aeq.global_aeq_id;
+    function_local_vector = rhs_aeq.function_local_vector;
+    hardware_vector = rhs_aeq.hardware_vector;
+    msix_table_index = rhs_aeq.msix_table_index;
   endfunction
 endclass
 

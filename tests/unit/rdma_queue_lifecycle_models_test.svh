@@ -51,6 +51,21 @@ class rdma_queue_lifecycle_models_test extends uvm_test;
     return mapping;
   endfunction
 
+  function automatic rdma_handle make_resource_handle(
+    string name,
+    rdma_resource_kind_e kind,
+    rdma_function_handle owner
+  );
+    rdma_handle handle;
+
+    handle = rdma_handle::type_id::create(name);
+    handle.kind = kind;
+    handle.function_uid = owner.function_uid;
+    handle.object_id = {kind, 28'h12345};
+    handle.generation = owner.generation;
+    return handle;
+  endfunction
+
   task run_phase(uvm_phase phase);
     rdma_queue_backing_slice slice, slice_clone, metadata_slice;
     rdma_queue_backing_spec spec, metadata_spec;
@@ -70,6 +85,10 @@ class rdma_queue_lifecycle_models_test extends uvm_test;
     rdma_queue_opaque_slot_token token, cloned_token;
     rdma_test_slot_token adapter_token;
     rdma_queue_preflight preflight;
+    rdma_cq cq, cq_clone;
+    rdma_srq srq, srq_clone;
+    rdma_ceq ceq, ceq_clone;
+    rdma_aeq aeq, aeq_clone;
     uvm_object cloned;
 
     phase.raise_objection(this);
@@ -267,6 +286,71 @@ class rdma_queue_lifecycle_models_test extends uvm_test;
         "custom token clone did not preserve shared completion authority"
       )
 
+    cq = rdma_cq::type_id::create("cq_resource_snapshot");
+    cq.handle = make_resource_handle("cq_resource_h", RDMA_RESOURCE_CQ,
+                                     mapping.function_h);
+    cq.owner = mapping.function_h;
+    cq.state = RDMA_RESOURCE_ALLOCATED;
+    expect_status("CQ_ALLOCATED_RESERVATION", cq.validate(), RDMA_SC_OK);
+    cq.depth = 128;
+    expect_status("CQ_ALLOCATED_PLAN_REQUIRED", cq.validate(),
+                  RDMA_SC_INVALID_ARGUMENT);
+    cq.queue_plan = plan;
+    expect_status("CQ_ALLOCATED_PLAN", cq.validate(), RDMA_SC_OK);
+    cq.queue_plan.resource_kind = RDMA_RESOURCE_AEQ;
+    expect_status("CQ_ALLOCATED_PLAN_KIND", cq.validate(),
+                  RDMA_SC_INVALID_ARGUMENT);
+    cq.queue_plan.resource_kind = RDMA_RESOURCE_CQ;
+    cq.queue_plan = null;
+    cq.state = RDMA_RESOURCE_PROGRAMMED;
+    expect_status("CQ_PROGRAMMED_PLAN_REQUIRED", cq.validate(),
+                  RDMA_SC_INVALID_ARGUMENT);
+    cq.cqe_size_bytes = 64;
+    cq.ceq_h = make_resource_handle("cq_ceq_h", RDMA_RESOURCE_CEQ,
+                                    mapping.function_h);
+    cq.queue_plan = plan;
+    expect_status("CQ_RESOURCE_PLAN", cq.validate(), RDMA_SC_OK);
+    cq.cqe_size_bytes = 48;
+    expect_status("CQ_RESOURCE_CQE_SIZE", cq.validate(),
+                  RDMA_SC_INVALID_ARGUMENT);
+    cq.state = RDMA_RESOURCE_QUIESCING;
+    expect_status("CQ_QUIESCING_CQE_SIZE", cq.validate(),
+                  RDMA_SC_INVALID_ARGUMENT);
+    cq.state = RDMA_RESOURCE_ERROR;
+    expect_status("CQ_ERROR_CQE_SIZE", cq.validate(),
+                  RDMA_SC_INVALID_ARGUMENT);
+    cq.state = RDMA_RESOURCE_PROGRAMMED;
+    cq.cqe_size_bytes = 64;
+    cq.backing_refs.push_back(null);
+    expect_status("CQ_SINGLE_QUEUE_AUTHORITY_BACKING", cq.validate(),
+                  RDMA_SC_INVALID_STATE);
+    cq.backing_refs.delete();
+    cq.hmc_refs.push_back(null);
+    expect_status("CQ_SINGLE_QUEUE_AUTHORITY_HMC", cq.validate(),
+                  RDMA_SC_INVALID_STATE);
+    cq.hmc_refs.delete();
+    cloned = cq.clone();
+    if (!$cast(cq_clone, cloned) || cq_clone.queue_plan == null ||
+        cq_clone.queue_plan == cq.queue_plan ||
+        cq_clone.queue_plan.rings[0] == cq.queue_plan.rings[0] ||
+        cq_clone.queue_plan.rings[0].pages[0] ==
+          cq.queue_plan.rings[0].pages[0] ||
+        cq_clone.queue_plan.rings[0].pages[0].mapping ==
+          cq.queue_plan.rings[0].pages[0].mapping ||
+        cq_clone.queue_plan.context_ref == cq.queue_plan.context_ref ||
+        cq_clone.cqe_size_bytes != 64)
+      `uvm_error("CQ_RESOURCE_DEEP_COPY",
+                 "CQ copy lost metadata or aliased its queue plan")
+    else begin
+      cq_clone.queue_plan.rings[0].depth = 64;
+      if (cq.queue_plan.rings[0].depth != 128)
+        `uvm_error("CQ_RESOURCE_DEEP_COPY",
+                   "CQ plan mutation reached source")
+    end
+    cq.queue_plan.resource_kind = RDMA_RESOURCE_AEQ;
+    expect_status("CQ_PLAN_KIND", cq.validate(), RDMA_SC_INVALID_ARGUMENT);
+    cq.queue_plan.resource_kind = RDMA_RESOURCE_CQ;
+
     pd.role = RDMA_QUEUE_ROLE_SRFQ_PD;
     ft.pd_ref = pd;
     srq_plan = rdma_queue_backing_plan::type_id::create("srq_plan");
@@ -309,6 +393,36 @@ class rdma_queue_lifecycle_models_test extends uvm_test;
     srq_plan.flush_targets.push_back(ft);
     expect_status("SRQ_PLAN_NO_SGB", srq_plan.validate(), RDMA_SC_OK);
 
+    srq = rdma_srq::type_id::create("srq_resource_snapshot");
+    srq.handle = make_resource_handle("srq_resource_h", RDMA_RESOURCE_SRQ,
+                                      mapping.function_h);
+    srq.owner = mapping.function_h;
+    srq.state = RDMA_RESOURCE_PROGRAMMED;
+    srq.depth = 128;
+    srq.max_sge = 4;
+    srq.limit_threshold = 16;
+    srq.pd_h = make_resource_handle("srq_pd_h", RDMA_RESOURCE_PD,
+                                    mapping.function_h);
+    srq.queue_plan = srq_plan;
+    expect_status("SRQ_RESOURCE_PLAN", srq.validate(), RDMA_SC_OK);
+    srq.limit_threshold = 18;
+    expect_status("SRQ_RESOURCE_LIMIT", srq.validate(),
+                  RDMA_SC_INVALID_ARGUMENT);
+    srq.state = RDMA_RESOURCE_QUIESCING;
+    expect_status("SRQ_QUIESCING_LIMIT", srq.validate(),
+                  RDMA_SC_INVALID_ARGUMENT);
+    srq.state = RDMA_RESOURCE_ERROR;
+    expect_status("SRQ_ERROR_LIMIT", srq.validate(),
+                  RDMA_SC_INVALID_ARGUMENT);
+    srq.state = RDMA_RESOURCE_PROGRAMMED;
+    srq.limit_threshold = 16;
+    cloned = srq.clone();
+    if (!$cast(srq_clone, cloned) || srq_clone.queue_plan == null ||
+        srq_clone.queue_plan == srq.queue_plan ||
+        srq_clone.limit_threshold != 16)
+      `uvm_error("SRQ_RESOURCE_DEEP_COPY",
+                 "SRQ copy lost metadata or aliased its queue plan")
+
     sgb_ref = rdma_queue_backing_ref::type_id::create("sgb_ref");
     sgb_ref.mapping = mapping;
     sgb_ref.role = RDMA_QUEUE_ROLE_SRQ_SGB;
@@ -344,6 +458,24 @@ class rdma_queue_lifecycle_models_test extends uvm_test;
     eq_plan.refs.push_back(pd);
     expect_status("CEQ_PLAN", eq_plan.validate(), RDMA_SC_OK);
 
+    ceq = rdma_ceq::type_id::create("ceq_resource_snapshot");
+    ceq.handle = make_resource_handle("ceq_resource_h", RDMA_RESOURCE_CEQ,
+                                      mapping.function_h);
+    ceq.owner = mapping.function_h;
+    ceq.state = RDMA_RESOURCE_PROGRAMMED;
+    ceq.depth = 128;
+    ceq.function_local_vector = 3;
+    ceq.hardware_vector = 17;
+    ceq.msix_table_index = 5;
+    ceq.queue_plan = eq_plan;
+    expect_status("CEQ_RESOURCE_PLAN", ceq.validate(), RDMA_SC_OK);
+    cloned = ceq.clone();
+    if (!$cast(ceq_clone, cloned) || ceq_clone.queue_plan == ceq.queue_plan ||
+        ceq_clone.function_local_vector != 3 ||
+        ceq_clone.hardware_vector != 17 || ceq_clone.msix_table_index != 5)
+      `uvm_error("CEQ_RESOURCE_DEEP_COPY",
+                 "CEQ copy lost vector metadata or aliased its plan")
+
     eq_plan.resource_kind = RDMA_RESOURCE_AEQ;
     layout.role = RDMA_QUEUE_ROLE_AEQ_RING;
     foreach (layout.pages[i])
@@ -354,6 +486,23 @@ class rdma_queue_lifecycle_models_test extends uvm_test;
     eq_plan.refs[0] = ring_ref;
     eq_plan.refs[1] = pd;
     expect_status("AEQ_PLAN", eq_plan.validate(), RDMA_SC_OK);
+    aeq = rdma_aeq::type_id::create("aeq_resource_snapshot");
+    aeq.handle = make_resource_handle("aeq_resource_h", RDMA_RESOURCE_AEQ,
+                                      mapping.function_h);
+    aeq.owner = mapping.function_h;
+    aeq.state = RDMA_RESOURCE_PROGRAMMED;
+    aeq.depth = 128;
+    aeq.function_local_vector = 3;
+    aeq.hardware_vector = 17;
+    aeq.msix_table_index = 5;
+    aeq.queue_plan = eq_plan;
+    expect_status("AEQ_RESOURCE_PLAN", aeq.validate(), RDMA_SC_OK);
+    cloned = aeq.clone();
+    if (!$cast(aeq_clone, cloned) || aeq_clone.queue_plan == aeq.queue_plan ||
+        aeq_clone.function_local_vector != 3 ||
+        aeq_clone.hardware_vector != 17 || aeq_clone.msix_table_index != 5)
+      `uvm_error("AEQ_RESOURCE_DEEP_COPY",
+                 "AEQ copy lost vector metadata or aliased its plan")
     eq_plan.refs.push_back(pd2);
     expect_status(
       "AEQ_EXTRA_ROLE",
