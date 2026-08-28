@@ -76,8 +76,9 @@ class rdma_queue_lifecycle_models_test extends uvm_test;
     rdma_iova_t iova;
     rdma_backing_addr_t base, old_base;
     rdma_queue_flush_target ft;
-    rdma_queue_backing_ref pd, ring_ref, ring_ref2;
+    rdma_queue_backing_ref pd, ring_ref, ring_ref2, grouped_ref_clone;
     rdma_queue_backing_ref sgb_ref, pd2, pd3;
+    rdma_queue_backing_segment additional_segment;
     rdma_queue_backing_plan plan, srq_plan, eq_plan;
     rdma_context_backing_ref ctx, ctx_clone;
     rdma_hmc_ref hmc;
@@ -218,11 +219,71 @@ class rdma_queue_lifecycle_models_test extends uvm_test;
     ring_ref.mapping = mapping;
     ring_ref.length = 8192;
     ring_ref.ownership = RDMA_OWNERSHIP_BORROWED;
+
+    additional_segment = rdma_queue_backing_segment::type_id::create(
+      "ring_ref_additional_segment"
+    );
+    additional_segment.role = RDMA_QUEUE_ROLE_CQ_RING;
+    additional_segment.mapping = make_mapping("ring_ref_segment_mapping");
+    additional_segment.mapping.iova.value += 64'h0000_0000_0001_0000;
+    additional_segment.mapping.backing_addr.value +=
+      64'h0000_0000_0002_0000;
+    additional_segment.ownership = RDMA_OWNERSHIP_BORROWED;
+    additional_segment.mapping_offset = 4096;
+    additional_segment.length = 4096;
+    additional_segment.logical_queue_offset = 8192;
+    ring_ref.additional_segments.push_back(additional_segment);
+    expect_status("GROUPED_REF_VALID", ring_ref.validate(), RDMA_SC_OK);
+
+    cloned = ring_ref.clone();
+    if (!$cast(grouped_ref_clone, cloned) || grouped_ref_clone == ring_ref ||
+        grouped_ref_clone.additional_segments.size() != 1 ||
+        grouped_ref_clone.additional_segments[0] == additional_segment ||
+        grouped_ref_clone.additional_segments[0].mapping ==
+          additional_segment.mapping ||
+        grouped_ref_clone.additional_segments[0].role !=
+          RDMA_QUEUE_ROLE_CQ_RING ||
+        grouped_ref_clone.additional_segments[0].ownership !=
+          RDMA_OWNERSHIP_BORROWED ||
+        grouped_ref_clone.additional_segments[0].mapping_offset != 4096 ||
+        grouped_ref_clone.additional_segments[0].length != 4096 ||
+        grouped_ref_clone.additional_segments[0].logical_queue_offset != 8192)
+      `uvm_error("GROUPED_REF_DEEP_COPY",
+                 "additional backing segment was not deeply copied")
+    else begin
+      grouped_ref_clone.additional_segments[0].length = 8192;
+      if (additional_segment.length != 4096)
+        `uvm_error("GROUPED_REF_DEEP_COPY",
+                   "additional segment mutation reached source")
+    end
+
+    additional_segment.role = RDMA_QUEUE_ROLE_AEQ_RING;
+    expect_status("GROUPED_REF_ROLE_MISMATCH", ring_ref.validate(),
+                  RDMA_SC_INVALID_ARGUMENT);
+    additional_segment.role = RDMA_QUEUE_ROLE_CQ_RING;
+    additional_segment.ownership = RDMA_OWNERSHIP_CONTROL_PLANE;
+    expect_status("GROUPED_REF_OWNERSHIP_MISMATCH", ring_ref.validate(),
+                  RDMA_SC_INVALID_ARGUMENT);
+    additional_segment.ownership = RDMA_OWNERSHIP_BORROWED;
+    additional_segment.mapping_offset = 1;
+    expect_status("GROUPED_REF_SEGMENT_RANGE", ring_ref.validate(),
+                  RDMA_SC_INVALID_ARGUMENT);
+    additional_segment.mapping_offset = 4096;
+    additional_segment.logical_queue_offset = 12288;
+    expect_status("GROUPED_REF_LOGICAL_HOLE", ring_ref.validate(),
+                  RDMA_SC_INVALID_ARGUMENT);
+    additional_segment.logical_queue_offset = 8192;
+    ring_ref.additional_segments.delete();
+
     pd = rdma_queue_backing_ref::type_id::create("pd");
     pd.role = RDMA_QUEUE_ROLE_CQ_PD;
     pd.mapping = mapping;
     pd.length = 4096;
     pd.ownership = RDMA_OWNERSHIP_CONTROL_PLANE;
+    pd.additional_segments.push_back(additional_segment);
+    expect_status("GROUPED_PD_REJECTED", pd.validate(),
+                  RDMA_SC_INVALID_ARGUMENT);
+    pd.additional_segments.delete();
     ft = rdma_queue_flush_target::type_id::create("ft");
     ft.role = RDMA_QUEUE_ROLE_CQ_PD;
     ft.phase = RDMA_QUEUE_FLUSH_POST_DELETE;
@@ -444,6 +505,18 @@ class rdma_queue_lifecycle_models_test extends uvm_test;
     srq_plan.refs.push_back(sgb_ref);
     srq_plan.rings.push_back(sgb_layout);
     expect_status("SRQ_PLAN_SGB", srq_plan.validate(), RDMA_SC_OK);
+
+    sgb_layout.entry_size_bytes = 512;
+    sgb_layout.depth = 8192;
+    sgb_layout.logical_bytes = 64'h0040_0000;
+    sgb_layout.storage_bytes = 64'h0040_0000;
+    sgb_layout.page_count = 1024;
+    expect_status("SGB_ABOVE_PD_CEILING", sgb_layout.validate(), RDMA_SC_OK);
+    sgb_layout.entry_size_bytes = layout2.entry_size_bytes;
+    sgb_layout.depth = layout2.depth;
+    sgb_layout.logical_bytes = layout2.logical_bytes;
+    sgb_layout.storage_bytes = layout2.storage_bytes;
+    sgb_layout.page_count = layout2.page_count;
 
     sgb_layout.copy(layout2);
     sgb_layout.role = RDMA_QUEUE_ROLE_CQ_RING;

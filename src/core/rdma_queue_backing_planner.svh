@@ -97,12 +97,16 @@ class rdma_queue_backing_planner extends uvm_object;
     capability_limit = (ring.role == RDMA_QUEUE_ROLE_SRQ_SGB) ?
       binding.queue_caps.max_sgb_bytes :
       binding.queue_caps.max_queue_ring_bytes;
-    if (storage_bytes > capability_limit || storage_bytes > 64'h0020_0000)
+    if (storage_bytes > capability_limit)
       return invalid_argument("queue ring exceeds Function capability");
+    if (ring.role != RDMA_QUEUE_ROLE_SRQ_SGB &&
+        storage_bytes > 64'h0020_0000)
+      return invalid_argument("queue ring exceeds one page directory");
     if (ring.logical_bytes != logical_bytes ||
         ring.storage_bytes != storage_bytes ||
         ring.page_count != storage_bytes / 4096 ||
-        ring.page_count == 0 || ring.page_count > 512)
+        ring.page_count == 0 ||
+        (ring.role != RDMA_QUEUE_ROLE_SRQ_SGB && ring.page_count > 512))
       return invalid_argument("queue preflight ring layout is not canonical");
     return rdma_status::success();
   endfunction
@@ -287,8 +291,7 @@ class rdma_queue_backing_planner extends uvm_object;
       first_iova_last = first_iova + spec.slices[i].length - 1'b1;
       first_backing_last = first_backing + spec.slices[i].length - 1'b1;
       for (int j = 0; j < i; j++) begin
-        if (spec.slices[j] == null || spec.slices[j].mapping == null ||
-            spec.slices[j].role == spec.slices[i].role)
+        if (spec.slices[j] == null || spec.slices[j].mapping == null)
           continue;
         second_iova = spec.slices[j].mapping.iova.value +
                       spec.slices[j].mapping_offset;
@@ -469,9 +472,9 @@ class rdma_queue_backing_planner extends uvm_object;
     if (!status.ok())
       return release_acquired_mapping(acquired_mapping, status);
 
-    // Snapshot release authority immediately before publishing the acquired
-    // mapping.  The snapshot is opaque proof; the acquired mapping retains
-    // the authoritative public geometry stored in the plan.
+    // Publish a detached authority snapshot carrying the acquired mapping's
+    // checked public geometry.  The snapshot's opaque allocation identity is
+    // established before copy and therefore remains fixed by adapter do_copy.
     authority_snapshot = null;
     status = normalize_status(acquired_mapping.snapshot_release_authority(
       authority_snapshot), "queue release authority snapshot returned null");
@@ -479,6 +482,11 @@ class rdma_queue_backing_planner extends uvm_object;
       return release_acquired_mapping(acquired_mapping, status);
     status = normalize_status(acquired_mapping.release_authority_status(
       authority_snapshot), "queue release authority check returned null");
+    if (!status.ok())
+      return release_acquired_mapping(acquired_mapping, status);
+    authority_snapshot.copy(acquired_mapping);
+    status = normalize_status(acquired_mapping.release_authority_status(
+      authority_snapshot), "copied queue release authority check returned null");
     if (!status.ok())
       return release_acquired_mapping(acquired_mapping, status);
 
@@ -490,7 +498,7 @@ class rdma_queue_backing_planner extends uvm_object;
         rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED,
                           "queue backing ref creation failed"));
     ref_value.role = role;
-    ref_value.mapping = acquired_mapping;
+    ref_value.mapping = authority_snapshot;
     ref_value.ownership = RDMA_OWNERSHIP_CONTROL_PLANE;
     ref_value.mapping_offset = 0;
     ref_value.length = length;
@@ -567,7 +575,12 @@ class rdma_queue_backing_planner extends uvm_object;
     output rdma_queue_backing_ref ref_value
   );
     rdma_queue_backing_slice first_slice;
+    rdma_queue_backing_slice next_slice;
     rdma_queue_backing_slice page_slice;
+    rdma_queue_backing_segment segment;
+    rdma_dma_mapping segment_mapping;
+    uvm_object cloned_object;
+    longint unsigned next_logical_offset;
     longint unsigned slice_relative_offset;
     longint unsigned page_end;
     int match_count;
@@ -595,6 +608,43 @@ class rdma_queue_backing_planner extends uvm_object;
     ref_value.mapping_offset = first_slice.mapping_offset;
     ref_value.length = first_slice.length;
     ref_value.logical_queue_offset = first_slice.logical_queue_offset;
+
+    next_logical_offset = first_slice.length;
+    while (next_logical_offset < ring.storage_bytes) begin
+      next_slice = null;
+      match_count = 0;
+      foreach (preflight.backing_spec.slices[i]) begin
+        if (preflight.backing_spec.slices[i] != null &&
+            preflight.backing_spec.slices[i].role == ring.role &&
+            preflight.backing_spec.slices[i].logical_queue_offset ==
+              next_logical_offset) begin
+          next_slice = preflight.backing_spec.slices[i];
+          match_count++;
+        end
+      end
+      if (match_count != 1 || next_slice == null)
+        return invalid_argument("borrowed queue segments are not contiguous");
+      cloned_object = next_slice.mapping.clone();
+      if (cloned_object == null ||
+          !$cast(segment_mapping, cloned_object) ||
+          segment_mapping == next_slice.mapping)
+        return invalid_state("borrowed queue segment mapping clone failed");
+      segment = rdma_queue_backing_segment::type_id::create(
+        $sformatf("queue_borrowed_segment_%0d_%0d", ring.role,
+                  ref_value.additional_segments.size())
+      );
+      if (segment == null)
+        return rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED,
+                                 "borrowed queue segment creation failed");
+      segment.role = ring.role;
+      segment.mapping = segment_mapping;
+      segment.ownership = RDMA_OWNERSHIP_BORROWED;
+      segment.mapping_offset = next_slice.mapping_offset;
+      segment.length = next_slice.length;
+      segment.logical_queue_offset = next_slice.logical_queue_offset;
+      ref_value.additional_segments.push_back(segment);
+      next_logical_offset += next_slice.length;
+    end
     if (ring.role == RDMA_QUEUE_ROLE_SRQ_SGB)
       return normalize_status(ref_value.validate(),
                               "borrowed SGB ref validation returned null");
@@ -932,6 +982,17 @@ class rdma_queue_backing_planner extends uvm_object;
       ), "queue payload zero-write returned null");
       if (!status.ok())
         return status;
+      foreach (plan.refs[i].additional_segments[j]) begin
+        zeros = new[int'(plan.refs[i].additional_segments[j].length)];
+        foreach (zeros[k])
+          zeros[k] = 0;
+        status = normalize_status(host_mem.write(
+          plan.refs[i].additional_segments[j].mapping,
+          plan.refs[i].additional_segments[j].mapping_offset, zeros
+        ), "queue payload segment zero-write returned null");
+        if (!status.ok())
+          return status;
+      end
     end
 
     foreach (plan.rings[i]) begin
@@ -978,27 +1039,59 @@ class rdma_queue_backing_planner extends uvm_object;
     end
     if (ref_value.ownership != RDMA_OWNERSHIP_CONTROL_PLANE)
       return invalid_argument("queue cleanup ownership is invalid");
+    ref_value.cleanup_complete = 1'b0;
     release_complete = 1'b0;
     status = normalize_status(ref_value.mapping.release_completion_status(
       release_complete), "queue release completion query returned null");
     if (!status.ok())
       return status;
-    if (release_complete) begin
-      ref_value.cleanup_complete = 1'b1;
-      complete = 1'b1;
-      return rdma_status::success();
+    if (!release_complete) begin
+      status = normalize_status(host_mem.\release (ref_value.mapping),
+                                "queue host release returned null");
+      if (!status.ok())
+        return status;
+      release_complete = 1'b0;
+      status = normalize_status(ref_value.mapping.release_completion_status(
+        release_complete), "queue release completion recheck returned null");
+      if (!status.ok())
+        return status;
+      if (!release_complete)
+        return invalid_state("queue host release did not complete");
     end
-    status = normalize_status(host_mem.\release (ref_value.mapping),
-                              "queue host release returned null");
-    if (!status.ok())
-      return status;
-    release_complete = 1'b0;
-    status = normalize_status(ref_value.mapping.release_completion_status(
-      release_complete), "queue release completion recheck returned null");
-    if (!status.ok())
-      return status;
-    if (!release_complete)
-      return invalid_state("queue host release did not complete");
+
+    foreach (ref_value.additional_segments[i]) begin
+      if (ref_value.additional_segments[i] == null ||
+          ref_value.additional_segments[i].mapping == null)
+        return invalid_argument("queue cleanup segment is null");
+      if (ref_value.additional_segments[i].ownership !=
+            RDMA_OWNERSHIP_CONTROL_PLANE)
+        return invalid_argument("queue cleanup segment ownership is invalid");
+      release_complete = 1'b0;
+      status = normalize_status(
+        ref_value.additional_segments[i].mapping.release_completion_status(
+          release_complete
+        ), "queue segment release completion query returned null"
+      );
+      if (!status.ok())
+        return status;
+      if (release_complete)
+        continue;
+      status = normalize_status(host_mem.\release (
+        ref_value.additional_segments[i].mapping
+      ), "queue segment host release returned null");
+      if (!status.ok())
+        return status;
+      release_complete = 1'b0;
+      status = normalize_status(
+        ref_value.additional_segments[i].mapping.release_completion_status(
+          release_complete
+        ), "queue segment release completion recheck returned null"
+      );
+      if (!status.ok())
+        return status;
+      if (!release_complete)
+        return invalid_state("queue segment host release did not complete");
+    end
     ref_value.cleanup_complete = 1'b1;
     complete = 1'b1;
     return rdma_status::success();

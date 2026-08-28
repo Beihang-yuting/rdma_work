@@ -227,8 +227,12 @@ virtual class rdma_queue_lifecycle_policy extends uvm_object;
     storage_bytes = (logical_bytes + 4095) & 64'hffff_ffff_ffff_f000;
     if (storage_bytes > capability_limit)
       return invalid_argument("queue ring exceeds Function capability");
-    if (storage_bytes > 64'h0020_0000)
+    if (role == RDMA_QUEUE_ROLE_SRQ_SGB) begin
+      if (storage_bytes > 32'hffff_ffff)
+        return invalid_argument("queue SGB exceeds host allocation width");
+    end else if (storage_bytes > 64'h0020_0000) begin
       return invalid_argument("queue ring exceeds one page directory");
+    end
 
     candidate = rdma_queue_ring_layout::type_id::create(name);
     candidate.role = role;

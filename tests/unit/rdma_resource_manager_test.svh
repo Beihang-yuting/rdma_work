@@ -303,6 +303,76 @@ class rdma_queue_recovery_probe_manager extends rdma_resource_manager;
     `uvm_fatal("QUEUE_RELEASE_EVIDENCE", "queue role is unavailable")
   endfunction
 
+  function void set_queue_segment_iova(
+    rdma_handle handle,
+    bit recovery_side,
+    rdma_queue_backing_role_e role,
+    int unsigned segment_index,
+    longint unsigned iova_value
+  );
+    rdma_queue_backing_plan plan;
+    rdma_queue_resource queue_resource;
+    string key;
+
+    key = resource_key(handle);
+    plan = null;
+    if (recovery_side)
+      plan = recovery_records[key].queue_plan;
+    else if ($cast(queue_resource, registry[key]))
+      plan = queue_resource.queue_plan;
+    if (plan == null)
+      `uvm_fatal("QUEUE_SEGMENT_IOVA", "queue plan is unavailable")
+    foreach (plan.refs[i]) begin
+      if (plan.refs[i] != null && plan.refs[i].role == role) begin
+        if (segment_index >= plan.refs[i].additional_segments.size() ||
+            plan.refs[i].additional_segments[segment_index] == null ||
+            plan.refs[i].additional_segments[segment_index].mapping == null)
+          `uvm_fatal("QUEUE_SEGMENT_IOVA",
+                     "queue backing segment is unavailable")
+        plan.refs[i].additional_segments[segment_index].mapping.iova.value =
+          iova_value;
+        return;
+      end
+    end
+    `uvm_fatal("QUEUE_SEGMENT_IOVA", "queue role is unavailable")
+  endfunction
+
+  function void set_queue_segment_release_evidence(
+    rdma_handle handle,
+    bit recovery_side,
+    rdma_queue_backing_role_e role,
+    int unsigned segment_index,
+    bit value
+  );
+    rdma_queue_backing_plan plan;
+    rdma_queue_resource queue_resource;
+    rdma_rm_independent_release_mapping mapping;
+    string key;
+
+    key = resource_key(handle);
+    plan = null;
+    if (recovery_side)
+      plan = recovery_records[key].queue_plan;
+    else if ($cast(queue_resource, registry[key]))
+      plan = queue_resource.queue_plan;
+    if (plan == null)
+      `uvm_fatal("QUEUE_SEGMENT_RELEASE", "queue plan is unavailable")
+    foreach (plan.refs[i]) begin
+      if (plan.refs[i] != null && plan.refs[i].role == role) begin
+        if (segment_index >= plan.refs[i].additional_segments.size() ||
+            plan.refs[i].additional_segments[segment_index] == null ||
+            !$cast(mapping,
+              plan.refs[i].additional_segments[segment_index].mapping) ||
+            mapping == null)
+          `uvm_fatal("QUEUE_SEGMENT_RELEASE",
+                     "queue backing segment mapping is unavailable")
+        mapping.set_release_complete(value);
+        return;
+      end
+    end
+    `uvm_fatal("QUEUE_SEGMENT_RELEASE", "queue role is unavailable")
+  endfunction
+
   virtual function void queue_restore_pre_publish_observer(
     rdma_recovery_record prepared_recovery
   );
@@ -3766,7 +3836,9 @@ class rdma_resource_manager_test extends uvm_test;
     rdma_hmc_fvm_addr_t hmc_other_addr;
     rdma_iova_t equal_iova;
     rdma_dma_mapping untouched_mapping;
+    rdma_dma_mapping queue_snapshot_segment_mapping;
     rdma_queue_backing_plan queue_snapshot_plan;
+    rdma_queue_backing_segment queue_snapshot_segment;
     rdma_queue_slot_token_contract queue_snapshot_source_token;
     rdma_queue_slot_token_contract queue_snapshot_stored_token;
     rdma_queue_completion_authority queue_snapshot_source_authority;
@@ -3818,6 +3890,23 @@ class rdma_resource_manager_test extends uvm_test;
       queue_snapshot_cq.owner, queue_snapshot_cq.handle,
       queue_snapshot_cq.local_cq_id
     );
+    queue_snapshot_segment_mapping = make_queue_test_mapping(
+      "queue_snapshot_segment_mapping", queue_snapshot_cq.owner,
+      queue_snapshot_cq.handle, 64'h0000_4300_0000_0000, 1'b0
+    );
+    queue_snapshot_segment = rdma_queue_backing_segment::type_id::create(
+      "queue_snapshot_segment"
+    );
+    queue_snapshot_segment.role = RDMA_QUEUE_ROLE_CQ_RING;
+    queue_snapshot_segment.mapping = queue_snapshot_segment_mapping;
+    queue_snapshot_segment.ownership = RDMA_OWNERSHIP_BORROWED;
+    queue_snapshot_segment.mapping_offset = 4096;
+    queue_snapshot_segment.length = 4096;
+    queue_snapshot_segment.logical_queue_offset =
+      queue_snapshot_plan.refs[0].length;
+    queue_snapshot_plan.refs[0].additional_segments.push_back(
+      queue_snapshot_segment
+    );
     queue_snapshot_cq.queue_plan = queue_snapshot_plan;
     if (!$cast(queue_snapshot_source_token,
                queue_snapshot_plan.context_ref.slot_token))
@@ -3847,6 +3936,8 @@ class rdma_resource_manager_test extends uvm_test;
 
     queue_snapshot_plan.rings[0].depth = 64;
     queue_snapshot_plan.refs[0].mapping.size = 4096;
+    queue_snapshot_segment.length = 8192;
+    queue_snapshot_segment.mapping.iova.value += 64'h0000_0000_0001_0000;
     queue_snapshot_replacement_authority =
       rdma_queue_completion_authority::type_id::create(
         "queue_snapshot_replacement_authority"
@@ -3868,6 +3959,20 @@ class rdma_resource_manager_test extends uvm_test;
           queue_snapshot_plan.rings[0] ||
         queue_snapshot_lookup_cq.queue_plan.refs[0].mapping ==
           queue_snapshot_plan.refs[0].mapping ||
+        queue_snapshot_lookup_cq.queue_plan.refs[0].additional_segments.size()
+          != 1 ||
+        queue_snapshot_lookup_cq.queue_plan.refs[0].additional_segments[0] ==
+          queue_snapshot_segment ||
+        queue_snapshot_lookup_cq.queue_plan.refs[0].additional_segments[0].
+          mapping == queue_snapshot_segment.mapping ||
+        queue_snapshot_lookup_cq.queue_plan.refs[0].additional_segments[0].
+          mapping.iova.value != 64'h0000_4300_0000_0000 ||
+        queue_snapshot_lookup_cq.queue_plan.refs[0].additional_segments[0].
+          mapping_offset != 4096 ||
+        queue_snapshot_lookup_cq.queue_plan.refs[0].additional_segments[0].
+          length != 4096 ||
+        queue_snapshot_lookup_cq.queue_plan.refs[0].additional_segments[0].
+          logical_queue_offset != 8192 ||
         queue_snapshot_lookup_cq.cqe_size_bytes != 128 ||
         queue_snapshot_lookup_cq.backing_refs.size() != 0 ||
         queue_snapshot_lookup_cq.hmc_refs.size() != 0)
@@ -3932,7 +4037,9 @@ class rdma_resource_manager_test extends uvm_test;
       rdma_cmq_opcode_key queue_query_opcode;
       rdma_queue_ring_layout sgb_ring;
       rdma_queue_backing_ref sgb_ref;
+      rdma_queue_backing_segment sgb_segment;
       rdma_dma_mapping sgb_mapping;
+      rdma_dma_mapping sgb_segment_mapping;
       int unsigned serial_before;
       int unsigned local_before;
       int unsigned registry_before;
@@ -4056,6 +4163,20 @@ class rdma_resource_manager_test extends uvm_test;
         "queue_recovery_sgb_ref", RDMA_QUEUE_ROLE_SRQ_SGB, sgb_mapping,
         sgb_ring.storage_bytes, RDMA_OWNERSHIP_CONTROL_PLANE
       );
+      sgb_segment_mapping = make_independent_queue_test_mapping(
+        "queue_recovery_sgb_segment_mapping", srq.owner, srq.handle,
+        64'h0000_5300_0000_0000
+      );
+      sgb_segment = rdma_queue_backing_segment::type_id::create(
+        "queue_recovery_sgb_segment"
+      );
+      sgb_segment.role = RDMA_QUEUE_ROLE_SRQ_SGB;
+      sgb_segment.mapping = sgb_segment_mapping;
+      sgb_segment.ownership = RDMA_OWNERSHIP_CONTROL_PLANE;
+      sgb_segment.mapping_offset = 0;
+      sgb_segment.length = 4096;
+      sgb_segment.logical_queue_offset = sgb_ref.length;
+      sgb_ref.additional_segments.push_back(sgb_segment);
       srq.queue_plan.rings.push_back(sgb_ring);
       srq.queue_plan.refs.push_back(sgb_ref);
       expect_status("QUEUE_RECOVERY_STAGE",
@@ -4167,6 +4288,23 @@ class rdma_resource_manager_test extends uvm_test;
       queue_recovery_manager.set_queue_flush_complete(
         srq.handle, 1'b1, RDMA_QUEUE_ROLE_SRFQ_PD, 1'b1
       );
+      queue_recovery_manager.set_queue_segment_iova(
+        srq.handle, 1'b1, RDMA_QUEUE_ROLE_SRQ_SGB, 0,
+        64'h0000_5300_0000_1000
+      );
+      expect_status("SEGMENT_DIVERGED_CLEANUP", queue_recovery_manager.
+        record_queue_cleanup_complete(srq.handle, RDMA_QUEUE_ROLE_SRQ_SGB),
+        RDMA_SC_INVALID_STATE);
+      queue_recovery_manager.set_queue_cleanup(
+        srq.handle, 1'b0, RDMA_QUEUE_ROLE_SRQ_SGB, 1'b0
+      );
+      queue_recovery_manager.set_queue_cleanup(
+        srq.handle, 1'b1, RDMA_QUEUE_ROLE_SRQ_SGB, 1'b0
+      );
+      queue_recovery_manager.set_queue_segment_iova(
+        srq.handle, 1'b1, RDMA_QUEUE_ROLE_SRQ_SGB, 0,
+        64'h0000_5300_0000_0000
+      );
       expect_status("REORDERED_CLEANUP_PROGRESS", queue_recovery_manager.
         record_queue_cleanup_complete(srq.handle, RDMA_QUEUE_ROLE_SRQ_SGB),
         RDMA_SC_OK);
@@ -4227,6 +4365,24 @@ class rdma_resource_manager_test extends uvm_test;
         restore_active(srq.handle), RDMA_SC_INVALID_STATE);
       queue_recovery_manager.set_queue_release_evidence(
         srq.handle, 1'b0, RDMA_QUEUE_ROLE_SRQ_SGB, 1'b0
+      );
+      queue_recovery_manager.set_queue_segment_release_evidence(
+        srq.handle, 1'b1, RDMA_QUEUE_ROLE_SRQ_SGB, 0, 1'b1
+      );
+      expect_status("RESTORE_RECOVERY_SEGMENT_RELEASED",
+        queue_recovery_manager.restore_active(srq.handle),
+        RDMA_SC_INVALID_STATE);
+      queue_recovery_manager.set_queue_segment_release_evidence(
+        srq.handle, 1'b1, RDMA_QUEUE_ROLE_SRQ_SGB, 0, 1'b0
+      );
+      queue_recovery_manager.set_queue_segment_release_evidence(
+        srq.handle, 1'b0, RDMA_QUEUE_ROLE_SRQ_SGB, 0, 1'b1
+      );
+      expect_status("RESTORE_REGISTRY_SEGMENT_RELEASED",
+        queue_recovery_manager.restore_active(srq.handle),
+        RDMA_SC_INVALID_STATE);
+      queue_recovery_manager.set_queue_segment_release_evidence(
+        srq.handle, 1'b0, RDMA_QUEUE_ROLE_SRQ_SGB, 0, 1'b0
       );
       // Force only the detached replacement to fail after reset preparation.
       // The ERROR registry object and recovery evidence must remain exactly

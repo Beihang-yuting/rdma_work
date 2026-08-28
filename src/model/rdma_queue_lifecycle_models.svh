@@ -365,10 +365,18 @@ class rdma_queue_ring_layout extends uvm_object;
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "ring size overflows");
     expected = depth * entry_size_bytes;
     if (logical_bytes != expected || storage_bytes < 4096 ||
-        storage_bytes > 2 * 1024 * 1024 || storage_bytes % 4096 != 0 ||
-        storage_bytes < logical_bytes)
+        storage_bytes % 4096 != 0 || storage_bytes < logical_bytes)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "ring layout size invalid");
-    if (page_count == 0 || page_count > 512 ||
+    if (role == RDMA_QUEUE_ROLE_SRQ_SGB) begin
+      if (storage_bytes > 32'hffff_ffff)
+        return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                                 "SGB storage exceeds API width");
+    end else if (storage_bytes > 2 * 1024 * 1024) begin
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "PD-backed ring storage exceeds ceiling");
+    end
+    if (page_count == 0 ||
+        (role != RDMA_QUEUE_ROLE_SRQ_SGB && page_count > 512) ||
         page_count != storage_bytes / 4096)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "ring page count invalid");
     return rdma_status::success();
@@ -399,12 +407,79 @@ class rdma_queue_ring_layout extends uvm_object;
   endfunction
 endclass
 
+class rdma_queue_backing_segment extends uvm_object;
+  `uvm_object_utils(rdma_queue_backing_segment)
+  rdma_queue_backing_role_e role;
+  rdma_dma_mapping mapping;
+  rdma_resource_ownership_e ownership;
+  longint unsigned mapping_offset;
+  longint unsigned length;
+  longint unsigned logical_queue_offset;
+
+  function new(string name = "rdma_queue_backing_segment");
+    super.new(name);
+    role = RDMA_QUEUE_ROLE_CQ_RING;
+    mapping = null;
+    ownership = RDMA_OWNERSHIP_BORROWED;
+    mapping_offset = 0;
+    length = 0;
+    logical_queue_offset = 0;
+  endfunction
+
+  virtual function void do_copy(uvm_object rhs);
+    rdma_queue_backing_segment r;
+    uvm_object cloned_object;
+    rdma_dma_mapping cloned_mapping;
+
+    super.do_copy(rhs);
+    if (!$cast(r, rhs))
+      `uvm_fatal("RDMA_COPY_TYPE", "backing segment copy mismatch");
+    role = r.role;
+    ownership = r.ownership;
+    mapping_offset = r.mapping_offset;
+    length = r.length;
+    logical_queue_offset = r.logical_queue_offset;
+    if (r.mapping == null) begin
+      mapping = null;
+    end else begin
+      cloned_object = r.mapping.clone();
+      if (cloned_object == null ||
+          !$cast(cloned_mapping, cloned_object) ||
+          cloned_mapping == r.mapping)
+        `uvm_fatal("RDMA_COPY_TYPE", "backing segment mapping clone failure");
+      mapping = cloned_mapping;
+    end
+  endfunction
+
+  virtual function rdma_status validate();
+    longint unsigned alignment;
+
+    if (!rdma_queue_role_is_payload(role))
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "backing segment role is not payload");
+    if (!(ownership inside {RDMA_OWNERSHIP_BORROWED,
+                            RDMA_OWNERSHIP_CONTROL_PLANE}))
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "backing segment ownership invalid");
+    alignment = (role == RDMA_QUEUE_ROLE_SRQ_SGB) ? 512 : 4096;
+    if (!rdma_queue_aligned(logical_queue_offset, alignment))
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "backing segment logical offset unaligned");
+    if (!rdma_queue_add_ok(logical_queue_offset, length))
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "backing segment logical range overflows");
+    return rdma_queue_queue_range_status(mapping, mapping_offset, length,
+                                         alignment);
+  endfunction
+endclass
+
 class rdma_queue_backing_ref extends uvm_object;
   `uvm_object_utils(rdma_queue_backing_ref)
   rdma_queue_backing_role_e role;
   rdma_dma_mapping mapping;
   rdma_resource_ownership_e ownership;
   longint unsigned mapping_offset, length, logical_queue_offset;
+  rdma_queue_backing_segment additional_segments[$];
   bit cleanup_complete;
   function new(string name="rdma_queue_backing_ref");
     super.new(name);
@@ -421,6 +496,7 @@ class rdma_queue_backing_ref extends uvm_object;
     rdma_queue_backing_ref r;
     uvm_object c;
     rdma_dma_mapping m;
+    rdma_queue_backing_segment segment;
 
     super.do_copy(rhs);
     if (!$cast(r, rhs))
@@ -431,6 +507,7 @@ class rdma_queue_backing_ref extends uvm_object;
     length = r.length;
     logical_queue_offset = r.logical_queue_offset;
     cleanup_complete = r.cleanup_complete;
+    additional_segments.delete();
     if (r.mapping == null) begin
       mapping = null;
     end else begin
@@ -439,11 +516,21 @@ class rdma_queue_backing_ref extends uvm_object;
         `uvm_fatal("RDMA_COPY_TYPE", "backing mapping clone failure");
       mapping = m;
     end
+    foreach (r.additional_segments[i]) begin
+      if (r.additional_segments[i] == null)
+        `uvm_fatal("RDMA_COPY_TYPE", "null additional backing segment");
+      c = r.additional_segments[i].clone();
+      if (c == null || !$cast(segment, c) ||
+          segment == r.additional_segments[i])
+        `uvm_fatal("RDMA_COPY_TYPE", "additional backing segment clone failure");
+      additional_segments.push_back(segment);
+    end
   endfunction
 
   virtual function rdma_status validate();
     rdma_status s;
     longint unsigned align;
+    longint unsigned next_logical_offset;
 
     if (!(ownership inside {RDMA_OWNERSHIP_BORROWED,
                             RDMA_OWNERSHIP_CONTROL_PLANE}))
@@ -454,6 +541,9 @@ class rdma_queue_backing_ref extends uvm_object;
         ownership != RDMA_OWNERSHIP_CONTROL_PLANE)
       return rdma_status::make(RDMA_SC_INVALID_STATE,
                                "PD backing must be control-plane owned");
+    if (rdma_queue_role_is_pd(role) && additional_segments.size() != 0)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "PD backing cannot contain additional segments");
     align = (role == RDMA_QUEUE_ROLE_SRQ_SGB) ? 512 : 4096;
     s = rdma_queue_queue_range_status(mapping, mapping_offset, length, align);
     if (!s.ok())
@@ -467,6 +557,30 @@ class rdma_queue_backing_ref extends uvm_object;
     if (cleanup_complete && ownership == RDMA_OWNERSHIP_BORROWED)
       return rdma_status::make(RDMA_SC_INVALID_STATE,
                                "borrowed backing cleaned");
+    next_logical_offset = logical_queue_offset + length;
+    foreach (additional_segments[i]) begin
+      if (additional_segments[i] == null)
+        return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                                 "additional backing segment is null");
+      if (additional_segments[i].role != role)
+        return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                                 "additional backing segment role mismatch");
+      if (additional_segments[i].ownership != ownership)
+        return rdma_status::make(
+          RDMA_SC_INVALID_ARGUMENT,
+          "additional backing segment ownership mismatch"
+        );
+      s = additional_segments[i].validate();
+      if (!s.ok())
+        return s;
+      if (additional_segments[i].logical_queue_offset != next_logical_offset)
+        return rdma_status::make(
+          RDMA_SC_INVALID_ARGUMENT,
+          "additional backing segments are not logically contiguous"
+        );
+      next_logical_offset = additional_segments[i].logical_queue_offset +
+                            additional_segments[i].length;
+    end
     return rdma_status::success();
   endfunction
 endclass

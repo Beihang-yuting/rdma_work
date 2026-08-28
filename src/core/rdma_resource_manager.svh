@@ -459,6 +459,66 @@ class rdma_resource_manager extends uvm_object;
            );
   endfunction
 
+  protected function bit same_queue_backing_ref_value(
+    rdma_queue_backing_ref lhs,
+    rdma_queue_backing_ref rhs
+  );
+    if (lhs == null || rhs == null)
+      return lhs == rhs;
+    if (lhs.role != rhs.role || lhs.ownership != rhs.ownership ||
+        lhs.mapping_offset != rhs.mapping_offset ||
+        lhs.length != rhs.length ||
+        lhs.logical_queue_offset != rhs.logical_queue_offset ||
+        lhs.additional_segments.size() != rhs.additional_segments.size() ||
+        !same_mapping_value(lhs.mapping, rhs.mapping))
+      return 1'b0;
+    foreach (lhs.additional_segments[i]) begin
+      if (lhs.additional_segments[i] == null ||
+          rhs.additional_segments[i] == null ||
+          lhs.additional_segments[i].role != rhs.additional_segments[i].role ||
+          lhs.additional_segments[i].ownership !=
+            rhs.additional_segments[i].ownership ||
+          lhs.additional_segments[i].mapping_offset !=
+            rhs.additional_segments[i].mapping_offset ||
+          lhs.additional_segments[i].length !=
+            rhs.additional_segments[i].length ||
+          lhs.additional_segments[i].logical_queue_offset !=
+            rhs.additional_segments[i].logical_queue_offset ||
+          !same_mapping_value(lhs.additional_segments[i].mapping,
+                              rhs.additional_segments[i].mapping))
+        return 1'b0;
+    end
+    return 1'b1;
+  endfunction
+
+  protected function bit same_owned_queue_backing_ref_authority(
+    rdma_queue_backing_ref authoritative,
+    rdma_queue_backing_ref recovery
+  );
+    if (authoritative == null || recovery == null ||
+        authoritative.ownership != RDMA_OWNERSHIP_CONTROL_PLANE ||
+        recovery.ownership != RDMA_OWNERSHIP_CONTROL_PLANE ||
+        authoritative.additional_segments.size() !=
+          recovery.additional_segments.size() ||
+        !same_owned_mapping_authority(authoritative.mapping,
+                                      recovery.mapping))
+      return 1'b0;
+    foreach (authoritative.additional_segments[i]) begin
+      if (authoritative.additional_segments[i] == null ||
+          recovery.additional_segments[i] == null ||
+          authoritative.additional_segments[i].ownership !=
+            RDMA_OWNERSHIP_CONTROL_PLANE ||
+          recovery.additional_segments[i].ownership !=
+            RDMA_OWNERSHIP_CONTROL_PLANE ||
+          !same_owned_mapping_authority(
+            authoritative.additional_segments[i].mapping,
+            recovery.additional_segments[i].mapping
+          ))
+        return 1'b0;
+    end
+    return 1'b1;
+  endfunction
+
   // Completion is an adapter-defined opaque fact.  Invoke its virtual query
   // only on an authority-preserving clone, and reject any public value, type,
   // or handle-alias mutation at the hook boundary.
@@ -997,6 +1057,7 @@ class rdma_resource_manager extends uvm_object;
     string copy_label,
     output rdma_queue_backing_ref result
   );
+    rdma_queue_backing_segment segment_copy;
     rdma_status status;
 
     result = null;
@@ -1017,9 +1078,45 @@ class rdma_resource_manager extends uvm_object;
       status = project_mapping_value(source.mapping,
                                      {copy_label, "_borrowed_mapping"},
                                      result.mapping);
-    if (!status.ok())
+    if (!status.ok()) begin
       result = null;
-    return status;
+      return status;
+    end
+    foreach (source.additional_segments[i]) begin
+      segment_copy = new($sformatf("%s_segment_%0d", copy_label, i));
+      if (source.additional_segments[i] == null) begin
+        result = null;
+        return rdma_status::make(
+          RDMA_SC_INVALID_ARGUMENT,
+          {copy_label, " additional backing segment is null"}
+        );
+      end
+      segment_copy.role = source.additional_segments[i].role;
+      segment_copy.ownership = source.additional_segments[i].ownership;
+      segment_copy.mapping_offset =
+        source.additional_segments[i].mapping_offset;
+      segment_copy.length = source.additional_segments[i].length;
+      segment_copy.logical_queue_offset =
+        source.additional_segments[i].logical_queue_offset;
+      if (segment_copy.ownership == RDMA_OWNERSHIP_CONTROL_PLANE)
+        status = clone_owned_mapping_value(
+          source.additional_segments[i].mapping,
+          $sformatf("%s_segment_%0d_owned_mapping", copy_label, i),
+          segment_copy.mapping
+        );
+      else
+        status = project_mapping_value(
+          source.additional_segments[i].mapping,
+          $sformatf("%s_segment_%0d_borrowed_mapping", copy_label, i),
+          segment_copy.mapping
+        );
+      if (!status.ok()) begin
+        result = null;
+        return status;
+      end
+      result.additional_segments.push_back(segment_copy);
+    end
+    return rdma_status::success();
   endfunction
 
   protected function rdma_status project_queue_slot_token_value(
@@ -3262,9 +3359,13 @@ class rdma_resource_manager extends uvm_object;
           recovery_copy.queue_plan.refs[recovery_ref_index].cleanup_complete ||
           recovery_copy.queue_plan.refs[recovery_ref_index].ownership !=
             RDMA_OWNERSHIP_CONTROL_PLANE ||
-          !same_mapping_value(
-            recovery_copy.queue_plan.refs[recovery_ref_index].mapping,
-            resource_queue.queue_plan.refs[ref_index].mapping
+          !same_queue_backing_ref_value(
+            recovery_copy.queue_plan.refs[recovery_ref_index],
+            resource_queue.queue_plan.refs[ref_index]
+          ) ||
+          !same_owned_queue_backing_ref_authority(
+            resource_queue.queue_plan.refs[ref_index],
+            recovery_copy.queue_plan.refs[recovery_ref_index]
           ))
         return rdma_status::make(RDMA_SC_INVALID_STATE,
                                  "recovery cleanup role authority diverged");
@@ -3542,10 +3643,10 @@ class rdma_resource_manager extends uvm_object;
               recovery_ref_count++;
               if (recovery.queue_plan.refs[j].cleanup_complete ||
                   authoritative_queue.queue_plan.refs[i].cleanup_complete ||
-                  recovery.queue_plan.refs[j].ownership !=
-                    authoritative_queue.queue_plan.refs[i].ownership ||
-                  !same_mapping_value(recovery.queue_plan.refs[j].mapping,
-                                      authoritative_queue.queue_plan.refs[i].mapping) ||
+                  !same_queue_backing_ref_value(
+                    recovery.queue_plan.refs[j],
+                    authoritative_queue.queue_plan.refs[i]
+                  ) ||
                   recovery.queue_plan.refs[j].mapping == null ||
                   recovery.queue_plan.refs[j].mapping.state != RDMA_MAPPING_ACTIVE)
                 return rdma_status::make(
@@ -3554,6 +3655,14 @@ class rdma_resource_manager extends uvm_object;
                 );
               if (recovery.queue_plan.refs[j].ownership ==
                     RDMA_OWNERSHIP_CONTROL_PLANE) begin
+                if (!same_owned_queue_backing_ref_authority(
+                      authoritative_queue.queue_plan.refs[i],
+                      recovery.queue_plan.refs[j]
+                    ))
+                  return rdma_status::make(
+                    RDMA_SC_INVALID_STATE,
+                    "ERROR queue owned backing release authority changed"
+                  );
                 status = query_owned_release_completion(
                   recovery.queue_plan.refs[j].mapping, release_complete
                 );
@@ -3570,6 +3679,43 @@ class rdma_resource_manager extends uvm_object;
                     RDMA_SC_INVALID_STATE,
                     "ERROR queue authoritative backing was released"
                   );
+                foreach (recovery.queue_plan.refs[j].additional_segments[k]) begin
+                  if (recovery.queue_plan.refs[j].additional_segments[k] == null ||
+                      authoritative_queue.queue_plan.refs[i].
+                        additional_segments[k] == null ||
+                      recovery.queue_plan.refs[j].additional_segments[k].mapping ==
+                        null ||
+                      authoritative_queue.queue_plan.refs[i].
+                        additional_segments[k].mapping == null ||
+                      recovery.queue_plan.refs[j].additional_segments[k].
+                        mapping.state != RDMA_MAPPING_ACTIVE ||
+                      authoritative_queue.queue_plan.refs[i].
+                        additional_segments[k].mapping.state !=
+                          RDMA_MAPPING_ACTIVE)
+                    return rdma_status::make(
+                      RDMA_SC_INVALID_STATE,
+                      "ERROR queue backing segment authority changed"
+                    );
+                  status = query_owned_release_completion(
+                    recovery.queue_plan.refs[j].additional_segments[k].mapping,
+                    release_complete
+                  );
+                  if (status == null || !status.ok() || release_complete)
+                    return rdma_status::make(
+                      RDMA_SC_INVALID_STATE,
+                      "ERROR queue recovery backing segment was released"
+                    );
+                  status = query_owned_release_completion(
+                    authoritative_queue.queue_plan.refs[i].
+                      additional_segments[k].mapping,
+                    release_complete
+                  );
+                  if (status == null || !status.ok() || release_complete)
+                    return rdma_status::make(
+                      RDMA_SC_INVALID_STATE,
+                      "ERROR queue authoritative backing segment was released"
+                    );
+                end
               end
             end
           end

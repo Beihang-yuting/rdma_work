@@ -76,6 +76,77 @@ class rdma_queue_planner_snapshot_fail_mem extends rdma_mock_host_mem;
   endfunction
 endclass
 
+class rdma_queue_planner_observing_mem extends rdma_mock_host_mem;
+  `uvm_object_utils(rdma_queue_planner_observing_mem)
+
+  rdma_dma_mapping last_allocated_mapping;
+  rdma_dma_mapping allocated_mappings[$];
+
+  function new(string name = "rdma_queue_planner_observing_mem");
+    super.new(name);
+    last_allocated_mapping = null;
+  endfunction
+
+  virtual function rdma_status allocate(
+    rdma_dma_request_context request_context,
+    int unsigned size,
+    int unsigned alignment,
+    rdma_dma_direction_e direction,
+    output rdma_dma_mapping mapping
+  );
+    rdma_status status;
+
+    status = super.allocate(request_context, size, alignment, direction,
+                            mapping);
+    if (status != null && status.ok()) begin
+      last_allocated_mapping = mapping;
+      allocated_mappings.push_back(mapping);
+    end
+    return status;
+  endfunction
+endclass
+
+class rdma_queue_planner_second_release_fail_mem extends rdma_mock_host_mem;
+  `uvm_object_utils(rdma_queue_planner_second_release_fail_mem)
+
+  int unsigned release_attempt;
+
+  function new(string name = "rdma_queue_planner_second_release_fail_mem");
+    super.new(name);
+    release_attempt = 0;
+  endfunction
+
+  virtual function rdma_status \release (rdma_dma_mapping mapping);
+    release_attempt++;
+    if (release_attempt == 2)
+      void'(fail_next("release", rdma_status::make(
+        RDMA_SC_DMA_TRANSLATION, "injected second-segment release failure"
+      )));
+    return super.\release (mapping);
+  endfunction
+endclass
+
+class rdma_queue_planner_write_observer_mem extends rdma_mock_host_mem;
+  `uvm_object_utils(rdma_queue_planner_write_observer_mem)
+
+  function new(string name = "rdma_queue_planner_write_observer_mem");
+    super.new(name);
+  endfunction
+
+  virtual function rdma_status write(
+    rdma_dma_mapping mapping,
+    longint unsigned offset,
+    byte data[]
+  );
+    void'(record_call("write", null, mapping, data.size(), 0,
+                      RDMA_DMA_DEVICE_READ, offset, data));
+    if (mapping == null || mapping.state != RDMA_MAPPING_ACTIVE)
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "observed mapping is not active");
+    return rdma_status::success();
+  endfunction
+endclass
+
 class rdma_queue_lifecycle_test extends uvm_test;
   `uvm_component_utils(rdma_queue_lifecycle_test)
 
@@ -590,6 +661,15 @@ class rdma_queue_lifecycle_test extends uvm_test;
         preflight.required_rings[2].role != RDMA_QUEUE_ROLE_SRQ_SGB ||
         preflight.required_rings[2].entry_size_bytes != 512)
       `uvm_error("SRQ_PREFLIGHT", "SRQ/SRFQ/SGB layout is incorrect")
+    srq_req.depth = 8192;
+    expect_status("SRQ_SGB_ABOVE_PD_CEILING",
+      srq_policy.preflight(binding, srq_req, manager, preflight), RDMA_SC_OK);
+    if (preflight == null || preflight.required_rings.size() != 3 ||
+        preflight.required_rings[2].storage_bytes != 64'h0040_0000 ||
+        preflight.required_rings[2].page_count != 1024)
+      `uvm_error("SRQ_SGB_ABOVE_PD_CEILING",
+                 "large SGB layout inherited the PD-backed ring ceiling")
+    srq_req.depth = 64;
     srq_req.max_sge = 2;
     expect_status("SRQ_NO_SGB",
       srq_policy.preflight(binding, srq_req, manager, preflight), RDMA_SC_OK);
@@ -672,9 +752,12 @@ class rdma_queue_lifecycle_test extends uvm_test;
     rdma_handle resource_h;
     rdma_queue_backing_planner planner;
     rdma_mock_host_mem mem;
+    rdma_queue_planner_observing_mem observing_mem;
     rdma_queue_preflight preflight;
     rdma_queue_backing_plan plan;
     rdma_dma_mapping mapping;
+    rdma_dma_mapping second_mapping;
+    rdma_queue_planner_write_observer_mem fragmented_mem;
     rdma_xtr_v1_queue_pd_codec pd_codec;
     rdma_status status;
     byte data[];
@@ -688,7 +771,10 @@ class rdma_queue_lifecycle_test extends uvm_test;
 
     // Owned CQ: payload then PD, both authority snapshots, IOVA pages, and
     // complete zero/PD initialization.
-    mem = rdma_mock_host_mem::type_id::create("owned_cq_mem");
+    observing_mem = rdma_queue_planner_observing_mem::type_id::create(
+      "owned_cq_mem"
+    );
+    mem = observing_mem;
     planner = rdma_queue_backing_planner::type_id::create("owned_cq_planner");
     expect_status("OWNED_CQ_CONFIGURE", planner.configure(mem), RDMA_SC_OK);
     preflight = make_planner_preflight(
@@ -735,6 +821,15 @@ class rdma_queue_lifecycle_test extends uvm_test;
       plan.refs[1].mapping
     );
     expect_status("OWNED_CQ_PD_AUTHORITY", status, RDMA_SC_OK);
+    if (observing_mem.allocated_mappings.size() != 2 ||
+        plan.refs[0].mapping == observing_mem.allocated_mappings[0] ||
+        plan.refs[1].mapping == observing_mem.allocated_mappings[1] ||
+        plan.refs[0].mapping.iova.value !=
+          observing_mem.allocated_mappings[0].iova.value ||
+        plan.refs[1].mapping.iova.value !=
+          observing_mem.allocated_mappings[1].iova.value)
+      `uvm_error("OWNED_CQ_DISTINCT_AUTHORITY_SNAPSHOT",
+                 "planner published the acquired mapping as cleanup authority")
     expect_status("OWNED_CQ_INITIALIZE", planner.initialize_payload_and_pd(
       binding, plan, pd_codec), RDMA_SC_OK);
     if (count_planner_host_calls(mem, "write") != 2)
@@ -816,6 +911,104 @@ class rdma_queue_lifecycle_test extends uvm_test;
     expect_status("BORROWED_CQ_PD_CLEANUP",
       planner.cleanup_local_role(plan.refs[1], complete), RDMA_SC_OK);
 
+    // A fragmented role remains one top-level ref while retaining every
+    // authoritative slice.  First cover adjacent slices of one mapping.
+    mem = rdma_mock_host_mem::type_id::create("fragmented_same_mapping_mem");
+    planner = rdma_queue_backing_planner::type_id::create(
+      "fragmented_same_mapping_planner"
+    );
+    expect_status("FRAGMENTED_SAME_CONFIGURE", planner.configure(mem),
+                  RDMA_SC_OK);
+    preflight = make_planner_preflight(
+      "fragmented_same_preflight", RDMA_RESOURCE_CQ,
+      RDMA_QUEUE_BACKING_BORROWED, 1'b0, 128
+    );
+    mapping = make_mapping("fragmented_same_mapping", binding,
+      64'h0000_0022_0000_0000, 64'h0000_009a_0000_0000, 8192);
+    add_borrowed_slice(preflight, "fragmented_same_first",
+      RDMA_QUEUE_ROLE_CQ_RING, mapping, 0, 4096, 0);
+    add_borrowed_slice(preflight, "fragmented_same_second",
+      RDMA_QUEUE_ROLE_CQ_RING, mapping, 4096, 4096, 4096);
+    resource_h = make_handle("fragmented_same_resource", owner,
+                             RDMA_RESOURCE_CQ, 32'h1003);
+    plan = null;
+    expect_status("FRAGMENTED_SAME_PLAN", planner.materialize(
+      binding, preflight, resource_h, plan), RDMA_SC_OK);
+    if (plan == null || plan.refs.size() != 2 ||
+        plan.refs[0].additional_segments.size() != 1 ||
+        plan.refs[0].additional_segments[0].mapping_offset != 4096 ||
+        plan.refs[0].additional_segments[0].logical_queue_offset != 4096 ||
+        plan.rings[0].pages.size() != 2 ||
+        plan.rings[0].pages[1].page_iova.value !=
+          64'h0000_0022_0000_1000)
+      `uvm_error("FRAGMENTED_SAME_PLAN",
+                 "same-mapping fragments lost grouped authority")
+    complete = 1'b0;
+    expect_status("FRAGMENTED_SAME_PD_CLEANUP",
+      planner.cleanup_local_role(plan.refs[1], complete), RDMA_SC_OK);
+
+    // Then cover two mappings and prove initialization writes both physical
+    // segments rather than only the primary slice.
+    fragmented_mem = rdma_queue_planner_write_observer_mem::type_id::create(
+      "fragmented_multi_mapping_mem"
+    );
+    planner = rdma_queue_backing_planner::type_id::create(
+      "fragmented_multi_mapping_planner"
+    );
+    expect_status("FRAGMENTED_MULTI_CONFIGURE",
+      planner.configure(fragmented_mem), RDMA_SC_OK);
+    preflight = make_planner_preflight(
+      "fragmented_multi_preflight", RDMA_RESOURCE_CQ,
+      RDMA_QUEUE_BACKING_BORROWED, 1'b0, 128
+    );
+    mapping = make_mapping("fragmented_multi_first_mapping", binding,
+      64'h0000_0023_0000_0000, 64'h0000_009b_0000_0000, 4096);
+    second_mapping = make_mapping("fragmented_multi_second_mapping", binding,
+      64'h0000_0024_0000_0000, 64'h0000_009c_0000_0000, 8192);
+    add_borrowed_slice(preflight, "fragmented_multi_first",
+      RDMA_QUEUE_ROLE_CQ_RING, mapping, 0, 4096, 0);
+    add_borrowed_slice(preflight, "fragmented_multi_second",
+      RDMA_QUEUE_ROLE_CQ_RING, second_mapping, 4096, 4096, 4096);
+    resource_h = make_handle("fragmented_multi_resource", owner,
+                             RDMA_RESOURCE_CQ, 32'h1004);
+    plan = null;
+    expect_status("FRAGMENTED_MULTI_PLAN", planner.materialize(
+      binding, preflight, resource_h, plan), RDMA_SC_OK);
+    if (plan == null || plan.refs[0].additional_segments.size() != 1 ||
+        plan.rings[0].pages.size() != 2 ||
+        plan.rings[0].pages[0].page_iova.value !=
+          64'h0000_0023_0000_0000 ||
+        plan.rings[0].pages[1].page_iova.value !=
+          64'h0000_0024_0000_1000)
+      `uvm_error("FRAGMENTED_MULTI_PLAN",
+                 "multi-mapping fragments lost grouped authority")
+    expect_status("FRAGMENTED_MULTI_INITIALIZE",
+      planner.initialize_payload_and_pd(binding, plan, pd_codec), RDMA_SC_OK);
+    if (count_planner_host_calls(fragmented_mem, "write") != 3 ||
+        fragmented_mem.calls[1].mapping.iova.value !=
+          64'h0000_0023_0000_0000 ||
+        fragmented_mem.calls[1].offset != 0 ||
+        fragmented_mem.calls[1].data.size() != 4096 ||
+        fragmented_mem.calls[2].mapping.iova.value !=
+          64'h0000_0024_0000_0000 ||
+        fragmented_mem.calls[2].offset != 4096 ||
+        fragmented_mem.calls[2].data.size() != 4096)
+      `uvm_error("FRAGMENTED_MULTI_INITIALIZE",
+                 "initialization did not write every borrowed segment")
+    else begin
+      foreach (fragmented_mem.calls[1].data[i]) begin
+        if (fragmented_mem.calls[1].data[i] != 0)
+          `uvm_error("FRAGMENTED_MULTI_ZERO", "primary segment was not zeroed")
+      end
+      foreach (fragmented_mem.calls[2].data[i]) begin
+        if (fragmented_mem.calls[2].data[i] != 0)
+          `uvm_error("FRAGMENTED_MULTI_ZERO", "additional segment was not zeroed")
+      end
+    end
+    complete = 1'b0;
+    expect_status("FRAGMENTED_MULTI_PD_CLEANUP",
+      planner.cleanup_local_role(plan.refs[1], complete), RDMA_SC_OK);
+
     // Owned and borrowed compound SRQ plans use request payload order and
     // fixed SRQ_PD/SRFQ_PD order, with no planner-owned context authority.
     mem = rdma_mock_host_mem::type_id::create("owned_srq_mem");
@@ -878,8 +1071,10 @@ class rdma_queue_lifecycle_test extends uvm_test;
       RDMA_QUEUE_ROLE_SRFQ_RING, mapping, 0, 4096);
     mapping = make_mapping("borrowed_sgb_mapping", binding,
       64'h0000_0032_0000_0000, 64'h0000_00a2_0000_0000, 32768);
-    add_borrowed_slice(preflight, "borrowed_sgb",
-      RDMA_QUEUE_ROLE_SRQ_SGB, mapping, 0, 32768);
+    add_borrowed_slice(preflight, "borrowed_sgb_first",
+      RDMA_QUEUE_ROLE_SRQ_SGB, mapping, 0, 16384, 0);
+    add_borrowed_slice(preflight, "borrowed_sgb_second",
+      RDMA_QUEUE_ROLE_SRQ_SGB, mapping, 16384, 16384, 16384);
     resource_h = make_handle("borrowed_srq_resource", owner,
                              RDMA_RESOURCE_SRQ, 32'h2002);
     plan = null;
@@ -889,6 +1084,9 @@ class rdma_queue_lifecycle_test extends uvm_test;
         plan.refs[0].ownership != RDMA_OWNERSHIP_BORROWED ||
         plan.refs[1].ownership != RDMA_OWNERSHIP_BORROWED ||
         plan.refs[2].ownership != RDMA_OWNERSHIP_BORROWED ||
+        plan.refs[2].additional_segments.size() != 1 ||
+        plan.refs[2].additional_segments[0].mapping_offset != 16384 ||
+        plan.refs[2].additional_segments[0].logical_queue_offset != 16384 ||
         count_planner_host_calls(mem, "allocate") != 2)
       `uvm_error("BORROWED_SRQ_PLAN", "borrowed SRQ role ownership is wrong")
     foreach (plan.refs[i]) begin
@@ -898,6 +1096,19 @@ class rdma_queue_lifecycle_test extends uvm_test;
     end
     if (count_planner_host_calls(mem, "release") != 2)
       `uvm_error("BORROWED_SRQ_CLEANUP", "borrowed SRQ released payload")
+
+    mem = rdma_mock_host_mem::type_id::create("large_sgb_mem");
+    planner = rdma_queue_backing_planner::type_id::create(
+      "large_sgb_planner"
+    );
+    expect_status("LARGE_SGB_CONFIGURE", planner.configure(mem), RDMA_SC_OK);
+    preflight = make_planner_preflight(
+      "large_sgb_preflight", RDMA_RESOURCE_SRQ,
+      RDMA_QUEUE_BACKING_OWNED, 1'b1, 8192
+    );
+    expect_status("LARGE_SGB_SPEC", planner.validate_spec(binding, preflight),
+                  RDMA_SC_OK);
+    expect_planner_no_host_calls("LARGE_SGB_SPEC", mem);
 
     // CEQ is owned and AEQ borrowed; neither planner plan has context/flush.
     mem = rdma_mock_host_mem::type_id::create("owned_ceq_mem");
@@ -1019,6 +1230,38 @@ class rdma_queue_lifecycle_test extends uvm_test;
       RDMA_QUEUE_ROLE_CQ_RING, first_mapping, 4096, 4096, 0);
     expect_status("PLANNER_LOGICAL_OVERLAP", planner.validate_spec(
       binding, preflight), RDMA_SC_INVALID_ARGUMENT);
+
+    preflight = make_planner_preflight(
+      "same_role_iova_overlap", RDMA_RESOURCE_CQ,
+      RDMA_QUEUE_BACKING_BORROWED, 1'b0, 128
+    );
+    first_mapping = make_mapping("same_role_iova_first", binding,
+      64'h0000_0053_1000_0000, 64'h0000_00c3_1000_0000, 4096);
+    second_mapping = make_mapping("same_role_iova_second", binding,
+      64'h0000_0053_1000_0000, 64'h0000_00c3_2000_0000, 4096);
+    add_borrowed_slice(preflight, "same_role_iova_first_slice",
+      RDMA_QUEUE_ROLE_CQ_RING, first_mapping, 0, 4096, 0);
+    add_borrowed_slice(preflight, "same_role_iova_second_slice",
+      RDMA_QUEUE_ROLE_CQ_RING, second_mapping, 0, 4096, 4096);
+    expect_status("PLANNER_SAME_ROLE_IOVA_OVERLAP", planner.validate_spec(
+      binding, preflight), RDMA_SC_INVALID_ARGUMENT);
+
+    // Inclusive host ranges at the top of the address space are compared for
+    // same-role fragments as well as for different roles.
+    preflight = make_planner_preflight(
+      "same_role_top_backing_overlap", RDMA_RESOURCE_CQ,
+      RDMA_QUEUE_BACKING_BORROWED, 1'b0, 128
+    );
+    first_mapping = make_mapping("same_role_top_backing_first", binding,
+      64'h0000_0053_2000_0000, 64'hffff_ffff_ffff_f000, 4096);
+    second_mapping = make_mapping("same_role_top_backing_second", binding,
+      64'h0000_0053_3000_0000, 64'hffff_ffff_ffff_f000, 4096);
+    add_borrowed_slice(preflight, "same_role_top_backing_first_slice",
+      RDMA_QUEUE_ROLE_CQ_RING, first_mapping, 0, 4096, 0);
+    add_borrowed_slice(preflight, "same_role_top_backing_second_slice",
+      RDMA_QUEUE_ROLE_CQ_RING, second_mapping, 0, 4096, 4096);
+    expect_status("PLANNER_SAME_ROLE_TOP_BACKING_OVERLAP",
+      planner.validate_spec(binding, preflight), RDMA_SC_INVALID_ARGUMENT);
 
     preflight = make_planner_preflight(
       "iova_overlap", RDMA_RESOURCE_SRQ, RDMA_QUEUE_BACKING_BORROWED
@@ -1204,8 +1447,10 @@ class rdma_queue_lifecycle_test extends uvm_test;
     rdma_queue_planner_nth_fail_mem fail_mem;
     rdma_queue_planner_snapshot_fail_mem snapshot_mem;
     rdma_mock_host_mem cleanup_mem;
+    rdma_queue_planner_second_release_fail_mem grouped_cleanup_mem;
     rdma_queue_preflight preflight;
     rdma_queue_backing_plan plan;
+    rdma_queue_backing_segment cleanup_segment;
     rdma_dma_mapping borrowed_mapping;
     int unsigned release_ordinal;
     longint unsigned expected_release_iova[4];
@@ -1381,6 +1626,63 @@ class rdma_queue_lifecycle_test extends uvm_test;
                  "completed cleanup repeated release")
     complete = 1'b0;
     expect_status("CLEANUP_FAILURE_PD",
+      planner.cleanup_local_role(plan.refs[1], complete), RDMA_SC_OK);
+
+    // A grouped owned role can partially complete.  Retry must query each
+    // segment and skip the primary allocation that the first attempt already
+    // released before retrying the failed later segment.
+    grouped_cleanup_mem =
+      rdma_queue_planner_second_release_fail_mem::type_id::create(
+        "grouped_cleanup_mem"
+      );
+    planner = rdma_queue_backing_planner::type_id::create(
+      "grouped_cleanup_planner"
+    );
+    expect_status("GROUPED_CLEANUP_CONFIGURE",
+      planner.configure(grouped_cleanup_mem), RDMA_SC_OK);
+    preflight = make_planner_preflight(
+      "grouped_cleanup_preflight", RDMA_RESOURCE_CEQ,
+      RDMA_QUEUE_BACKING_OWNED
+    );
+    resource_h = make_handle("grouped_cleanup_resource", owner,
+                             RDMA_RESOURCE_CEQ, 32'h6006);
+    plan = null;
+    expect_status("GROUPED_CLEANUP_PLAN", planner.materialize(
+      binding, preflight, resource_h, plan), RDMA_SC_OK);
+    cleanup_segment = rdma_queue_backing_segment::type_id::create(
+      "grouped_cleanup_segment"
+    );
+    cleanup_segment.role = RDMA_QUEUE_ROLE_CEQ_RING;
+    cleanup_segment.mapping = plan.refs[1].mapping;
+    cleanup_segment.ownership = RDMA_OWNERSHIP_CONTROL_PLANE;
+    cleanup_segment.mapping_offset = 0;
+    cleanup_segment.length = 4096;
+    cleanup_segment.logical_queue_offset = plan.refs[0].length;
+    plan.refs[0].additional_segments.push_back(cleanup_segment);
+    complete = 1'b1;
+    expect_status("GROUPED_CLEANUP_PARTIAL",
+      planner.cleanup_local_role(plan.refs[0], complete),
+      RDMA_SC_DMA_TRANSLATION);
+    if (complete ||
+        count_planner_host_calls(grouped_cleanup_mem, "release") != 2)
+      `uvm_error("GROUPED_CLEANUP_PARTIAL",
+                 "partial grouped cleanup did not preserve retry state")
+    complete = 1'b0;
+    expect_status("GROUPED_CLEANUP_RETRY",
+      planner.cleanup_local_role(plan.refs[0], complete), RDMA_SC_OK);
+    if (!complete ||
+        count_planner_host_calls(grouped_cleanup_mem, "release") != 3)
+      `uvm_error("GROUPED_CLEANUP_RETRY",
+                 "retry re-released a completed segment")
+    complete = 1'b0;
+    expect_status("GROUPED_CLEANUP_IDEMPOTENT",
+      planner.cleanup_local_role(plan.refs[0], complete), RDMA_SC_OK);
+    if (!complete ||
+        count_planner_host_calls(grouped_cleanup_mem, "release") != 3)
+      `uvm_error("GROUPED_CLEANUP_IDEMPOTENT",
+                 "completed grouped cleanup repeated release")
+    complete = 1'b0;
+    expect_status("GROUPED_CLEANUP_PD_ALREADY_COMPLETE",
       planner.cleanup_local_role(plan.refs[1], complete), RDMA_SC_OK);
   endfunction
 
