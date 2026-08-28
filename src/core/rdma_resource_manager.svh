@@ -3182,9 +3182,33 @@ class rdma_resource_manager extends uvm_object;
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "queue flush role is absent, duplicated, or complete");
     foreach (resource_queue.queue_plan.flush_targets[i]) begin
-      if (i < target_index && !resource_queue.queue_plan.flush_targets[i].flush_complete)
+      int unsigned recovery_predecessor_count;
+
+      if (i >= target_index)
+        continue;
+      if (!resource_queue.queue_plan.flush_targets[i].flush_complete)
         return rdma_status::make(RDMA_SC_INVALID_STATE,
                                  "queue flush predecessor is incomplete");
+      if (has_recovery) begin
+        recovery_predecessor_count = 0;
+        foreach (recovery_copy.queue_plan.flush_targets[j]) begin
+          if (recovery_copy.queue_plan.flush_targets[j] != null &&
+              recovery_copy.queue_plan.flush_targets[j].role ==
+                resource_queue.queue_plan.flush_targets[i].role) begin
+            recovery_predecessor_count++;
+            if (!recovery_copy.queue_plan.flush_targets[j].flush_complete)
+              return rdma_status::make(
+                RDMA_SC_INVALID_STATE,
+                "recovery queue flush predecessor is incomplete"
+              );
+          end
+        end
+        if (recovery_predecessor_count != 1)
+          return rdma_status::make(
+            RDMA_SC_INVALID_STATE,
+            "recovery queue flush predecessor is absent or duplicated"
+          );
+      end
     end
     resource_queue.queue_plan.flush_targets[target_index].flush_complete = 1'b1;
     if (has_recovery)
@@ -3206,6 +3230,10 @@ class rdma_resource_manager extends uvm_object;
     int unsigned recovery_ref_index;
     rdma_status status;
     bit has_recovery;
+    int unsigned srfq_flush_count;
+    int unsigned recovery_srfq_flush_count;
+    bit srfq_flush_complete;
+    bit recovery_srfq_flush_complete;
     string key;
 
     status = queue_progress_snapshots(handle, "queue cleanup progress", key,
@@ -3246,11 +3274,43 @@ class rdma_resource_manager extends uvm_object;
           RDMA_OWNERSHIP_CONTROL_PLANE)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "queue cleanup role is not uniquely owned and pending");
-    if (role == RDMA_QUEUE_ROLE_SRQ_SGB &&
-        (resource_queue.queue_plan.flush_targets.size() == 0 ||
-         !resource_queue.queue_plan.flush_targets[0].flush_complete))
-      return rdma_status::make(RDMA_SC_INVALID_STATE,
-                               "SRQ SGB cleanup requires SRFQ flush completion");
+    if (role == RDMA_QUEUE_ROLE_SRQ_SGB) begin
+      srfq_flush_count = 0;
+      srfq_flush_complete = 1'b0;
+      foreach (resource_queue.queue_plan.flush_targets[i]) begin
+        if (resource_queue.queue_plan.flush_targets[i] != null &&
+            resource_queue.queue_plan.flush_targets[i].role ==
+              RDMA_QUEUE_ROLE_SRFQ_PD) begin
+          srfq_flush_count++;
+          srfq_flush_complete =
+            resource_queue.queue_plan.flush_targets[i].flush_complete;
+        end
+      end
+      if (srfq_flush_count != 1 || !srfq_flush_complete)
+        return rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "SRQ SGB cleanup requires authoritative SRFQ flush completion"
+        );
+      if (has_recovery) begin
+        recovery_srfq_flush_count = 0;
+        recovery_srfq_flush_complete = 1'b0;
+        foreach (recovery_copy.queue_plan.flush_targets[i]) begin
+          if (recovery_copy.queue_plan.flush_targets[i] != null &&
+              recovery_copy.queue_plan.flush_targets[i].role ==
+                RDMA_QUEUE_ROLE_SRFQ_PD) begin
+            recovery_srfq_flush_count++;
+            recovery_srfq_flush_complete =
+              recovery_copy.queue_plan.flush_targets[i].flush_complete;
+          end
+        end
+        if (recovery_srfq_flush_count != 1 ||
+            !recovery_srfq_flush_complete)
+          return rdma_status::make(
+            RDMA_SC_INVALID_STATE,
+            "SRQ SGB cleanup requires recovery SRFQ flush completion"
+          );
+      end
+    end
     resource_queue.queue_plan.refs[ref_index].cleanup_complete = 1'b1;
     if (has_recovery)
       recovery_copy.queue_plan.refs[recovery_ref_index].cleanup_complete = 1'b1;
@@ -3302,10 +3362,19 @@ class rdma_resource_manager extends uvm_object;
   );
   endfunction
 
+  // This protected boundary observes detached queue replacements only.  It is
+  // intentionally before their final validation and never exposes a live
+  // registry or recovery-record object to the caller.
+  protected virtual function void queue_restore_pre_validate_observer(
+    rdma_resource prepared_resource
+  );
+  endfunction
+
   virtual function rdma_status restore_active(rdma_handle handle);
     rdma_resource authoritative;
     rdma_resource replacement;
     rdma_recovery_record recovery;
+    rdma_recovery_record recovery_replacement;
     rdma_status status;
     bit authoritative_release_complete;
     bit recovery_release_complete;
@@ -3422,7 +3491,6 @@ class rdma_resource_manager extends uvm_object;
                                                   RDMA_RESOURCE_SRQ,
                                                   RDMA_RESOURCE_CEQ,
                                                   RDMA_RESOURCE_AEQ}) begin
-        rdma_queue_resource queue_replacement;
         rdma_queue_resource authoritative_queue;
         bit destructive_cleanup;
         int unsigned recovery_ref_count;
@@ -3524,17 +3592,27 @@ class rdma_resource_manager extends uvm_object;
             RDMA_SC_INVALID_STATE,
             "ERROR queue context cleanup or authority changed"
           );
-        status = project_resource_value(registry[key], "restore queue active",
-                                        replacement);
-        if (!status.ok() || !$cast(queue_replacement, replacement))
+        status = project_recovery_value(recovery, "restore queue recovery",
+                                        recovery_replacement);
+        if (!status.ok() || recovery_replacement == null)
           return status.ok() ? rdma_status::make(
-            RDMA_SC_INVALID_STATE, "ERROR queue restore type mismatch"
+            RDMA_SC_INVALID_STATE, "ERROR queue recovery replacement is missing"
           ) : status;
+        recovery_replacement.ambiguous_queue_operation = RDMA_QUEUE_AMBIG_NONE;
+        recovery_replacement.ambiguous_role = RDMA_QUEUE_ROLE_CQ_RING;
+        recovery_replacement.ambiguous_ticket = null;
         if (authoritative.handle.kind == RDMA_RESOURCE_SRQ) begin
-          foreach (queue_replacement.queue_plan.flush_targets[i])
-            queue_replacement.queue_plan.flush_targets[i].flush_complete = 1'b0;
+          foreach (recovery_replacement.queue_plan.flush_targets[i])
+            recovery_replacement.queue_plan.flush_targets[i].flush_complete = 1'b0;
         end
-        replacement = queue_replacement;
+        status = recovery_replacement.validate();
+        if (status == null)
+          return rdma_status::make(
+            RDMA_SC_INVALID_STATE,
+            "restored queue recovery validation returned null"
+          );
+        if (!status.ok())
+          return status;
       end
       else
         return rdma_status::make(RDMA_SC_INVALID_STATE,
@@ -3558,7 +3636,7 @@ class rdma_resource_manager extends uvm_object;
       if (!$cast(queue_replacement, replacement))
         return rdma_status::make(RDMA_SC_INVALID_STATE,
                                  "restored queue resource type mismatch");
-      status = project_queue_plan_value(recovery.queue_plan,
+      status = project_queue_plan_value(recovery_replacement.queue_plan,
                                         "restore active queue plan",
                                         restored_plan);
       if (!status.ok() || restored_plan == null)
@@ -3571,17 +3649,12 @@ class rdma_resource_manager extends uvm_object;
           queue_replacement.queue_plan.flush_targets[i].flush_complete = 1'b0;
       end
       replacement = queue_replacement;
-      // Prepare the recovery replacement alongside the resource replacement;
-      // the entry is then retired after the single safe ACTIVE publication.
-      recovery.ambiguous_queue_operation = RDMA_QUEUE_AMBIG_NONE;
-      recovery.ambiguous_role = RDMA_QUEUE_ROLE_CQ_RING;
-      recovery.ambiguous_ticket = null;
-      if (authoritative.handle.kind == RDMA_RESOURCE_SRQ) begin
-        foreach (recovery.queue_plan.flush_targets[i])
-          recovery.queue_plan.flush_targets[i].flush_complete = 1'b0;
-      end
     end
     replacement.state = RDMA_RESOURCE_ACTIVE;
+    if (authoritative.state == RDMA_RESOURCE_ERROR &&
+        authoritative.handle.kind inside {RDMA_RESOURCE_CQ, RDMA_RESOURCE_SRQ,
+                                          RDMA_RESOURCE_CEQ, RDMA_RESOURCE_AEQ})
+      queue_restore_pre_validate_observer(replacement);
     status = replacement.validate();
     if (status == null)
       return rdma_status::make(RDMA_SC_INVALID_STATE,
@@ -3591,7 +3664,7 @@ class rdma_resource_manager extends uvm_object;
     if (authoritative.state == RDMA_RESOURCE_ERROR &&
         authoritative.handle.kind inside {RDMA_RESOURCE_CQ, RDMA_RESOURCE_SRQ,
                                           RDMA_RESOURCE_CEQ, RDMA_RESOURCE_AEQ})
-      queue_restore_pre_publish_observer(recovery);
+      queue_restore_pre_publish_observer(recovery_replacement);
     registry[key] = replacement;
     if (authoritative.state == RDMA_RESOURCE_ERROR)
       recovery_records.delete(key);

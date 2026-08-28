@@ -158,10 +158,12 @@ endclass
 
 class rdma_queue_recovery_probe_manager extends rdma_resource_manager;
   rdma_recovery_record observed_pre_retire_recovery;
+  bit force_queue_restore_late_failure;
 
   function new(string name = "rdma_queue_recovery_probe_manager");
     super.new(name);
     observed_pre_retire_recovery = null;
+    force_queue_restore_late_failure = 1'b0;
   endfunction
 
   function void swap_recovery_refs(rdma_handle handle, int unsigned lhs,
@@ -206,6 +208,71 @@ class rdma_queue_recovery_probe_manager extends rdma_resource_manager;
     recovery_records[key].ambiguous_ticket = null;
   endfunction
 
+  function void set_queue_ambiguity(
+    rdma_handle handle,
+    rdma_queue_ambiguous_operation_e operation,
+    rdma_queue_backing_role_e role
+  );
+    string key;
+
+    key = resource_key(handle);
+    recovery_records[key].ambiguous_queue_operation = operation;
+    recovery_records[key].ambiguous_role = role;
+    recovery_records[key].ambiguous_ticket = null;
+  endfunction
+
+  function void set_queue_flush_complete(
+    rdma_handle handle,
+    bit recovery_side,
+    rdma_queue_backing_role_e role,
+    bit value
+  );
+    rdma_queue_backing_plan plan;
+    rdma_queue_resource queue_resource;
+    string key;
+
+    key = resource_key(handle);
+    plan = null;
+    if (recovery_side)
+      plan = recovery_records[key].queue_plan;
+    else if ($cast(queue_resource, registry[key]))
+      plan = queue_resource.queue_plan;
+    if (plan == null)
+      `uvm_fatal("QUEUE_FLUSH_PROGRESS", "queue plan is unavailable")
+    foreach (plan.flush_targets[i]) begin
+      if (plan.flush_targets[i] != null && plan.flush_targets[i].role == role) begin
+        plan.flush_targets[i].flush_complete = value;
+        return;
+      end
+    end
+    `uvm_fatal("QUEUE_FLUSH_PROGRESS", "queue flush role is unavailable")
+  endfunction
+
+  function bit observed_queue_flush_complete(
+    rdma_handle handle,
+    bit recovery_side,
+    rdma_queue_backing_role_e role
+  );
+    rdma_queue_backing_plan plan;
+    rdma_queue_resource queue_resource;
+    string key;
+
+    key = resource_key(handle);
+    plan = null;
+    if (recovery_side)
+      plan = recovery_records[key].queue_plan;
+    else if ($cast(queue_resource, registry[key]))
+      plan = queue_resource.queue_plan;
+    if (plan == null)
+      `uvm_fatal("QUEUE_FLUSH_PROGRESS", "queue plan is unavailable")
+    foreach (plan.flush_targets[i]) begin
+      if (plan.flush_targets[i] != null && plan.flush_targets[i].role == role)
+        return plan.flush_targets[i].flush_complete;
+    end
+    `uvm_fatal("QUEUE_FLUSH_PROGRESS", "queue flush role is unavailable")
+    return 1'b0;
+  endfunction
+
   function void set_queue_release_evidence(
     rdma_handle handle,
     bit recovery_side,
@@ -248,6 +315,21 @@ class rdma_queue_recovery_probe_manager extends rdma_resource_manager;
     if (cloned_object == null ||
         !$cast(observed_pre_retire_recovery, cloned_object))
       `uvm_fatal("QUEUE_RESTORE_OBSERVER", "recovery snapshot clone failed")
+  endfunction
+
+  virtual function void queue_restore_pre_validate_observer(
+    rdma_resource prepared_resource
+  );
+    rdma_queue_resource queue_resource;
+
+    if (!force_queue_restore_late_failure ||
+        !$cast(queue_resource, prepared_resource) ||
+        queue_resource.queue_plan == null ||
+        queue_resource.queue_plan.flush_targets.size() == 0)
+      return;
+    // Corrupt only the prepared resource after recovery reset preparation.
+    // The manager must reject it without leaking any prepared state live.
+    queue_resource.queue_plan.flush_targets[0].pd_ref = null;
   endfunction
 endclass
 
@@ -3824,8 +3906,11 @@ class rdma_resource_manager_test extends uvm_test;
       rdma_aeq aeq_overflow;
       rdma_srq srq;
       rdma_srq restored_srq;
+      rdma_srq late_failure_before_srq;
+      rdma_srq late_failure_after_srq;
       rdma_recovery_record queue_recovery;
       rdma_recovery_record queue_recovery_lookup;
+      rdma_recovery_record late_failure_recovery_before;
       rdma_cmq_ticket queue_ticket;
       rdma_cmq_opcode_key queue_create_opcode;
       rdma_cmq_opcode_key queue_delete_opcode;
@@ -3989,9 +4074,65 @@ class rdma_resource_manager_test extends uvm_test;
       expect_status("QUEUE_RECOVERY_ERROR",
                     queue_recovery_manager.mark_error(srq.handle, queue_recovery),
                     RDMA_SC_OK);
+      // Each detached plan must independently prove the predecessor before a
+      // later SRQ flush can be recorded.  Rejection cannot publish either
+      // target's progress bit.
+      queue_recovery_manager.set_queue_flush_complete(
+        srq.handle, 1'b1, RDMA_QUEUE_ROLE_SRFQ_PD, 1'b0
+      );
+      expect_status("RECOVERY_FLUSH_PREDECESSOR_REJECT", queue_recovery_manager.
+        record_queue_flush_complete(srq.handle, RDMA_QUEUE_ROLE_SRQ_PD),
+        RDMA_SC_INVALID_STATE);
+      if (!queue_recovery_manager.observed_queue_flush_complete(
+            srq.handle, 1'b0, RDMA_QUEUE_ROLE_SRFQ_PD) ||
+          queue_recovery_manager.observed_queue_flush_complete(
+            srq.handle, 1'b1, RDMA_QUEUE_ROLE_SRFQ_PD) ||
+          queue_recovery_manager.observed_queue_flush_complete(
+            srq.handle, 1'b0, RDMA_QUEUE_ROLE_SRQ_PD) ||
+          queue_recovery_manager.observed_queue_flush_complete(
+            srq.handle, 1'b1, RDMA_QUEUE_ROLE_SRQ_PD))
+        `uvm_error("RECOVERY_FLUSH_PREDECESSOR_ATOMIC",
+                   "failed recovery predecessor check published progress")
+      queue_recovery_manager.set_queue_flush_complete(
+        srq.handle, 1'b1, RDMA_QUEUE_ROLE_SRFQ_PD, 1'b1
+      );
+      queue_recovery_manager.set_queue_flush_complete(
+        srq.handle, 1'b0, RDMA_QUEUE_ROLE_SRFQ_PD, 1'b0
+      );
+      expect_status("REGISTRY_FLUSH_PREDECESSOR_REJECT", queue_recovery_manager.
+        record_queue_flush_complete(srq.handle, RDMA_QUEUE_ROLE_SRQ_PD),
+        RDMA_SC_INVALID_STATE);
+      if (queue_recovery_manager.observed_queue_flush_complete(
+            srq.handle, 1'b0, RDMA_QUEUE_ROLE_SRFQ_PD) ||
+          !queue_recovery_manager.observed_queue_flush_complete(
+            srq.handle, 1'b1, RDMA_QUEUE_ROLE_SRFQ_PD) ||
+          queue_recovery_manager.observed_queue_flush_complete(
+            srq.handle, 1'b0, RDMA_QUEUE_ROLE_SRQ_PD) ||
+          queue_recovery_manager.observed_queue_flush_complete(
+            srq.handle, 1'b1, RDMA_QUEUE_ROLE_SRQ_PD))
+        `uvm_error("REGISTRY_FLUSH_PREDECESSOR_ATOMIC",
+                   "failed registry predecessor check published progress")
+      queue_recovery_manager.set_queue_flush_complete(
+        srq.handle, 1'b0, RDMA_QUEUE_ROLE_SRFQ_PD, 1'b1
+      );
       // The recovery plan may legitimately have a different serialization
       // order.  A role-based update must not use the resource-plan index.
       queue_recovery_manager.swap_recovery_refs(srq.handle, 0, 4);
+      queue_recovery_manager.set_queue_flush_complete(
+        srq.handle, 1'b1, RDMA_QUEUE_ROLE_SRFQ_PD, 1'b0
+      );
+      expect_status("RECOVERY_SGB_PREDECESSOR_REJECT", queue_recovery_manager.
+        record_queue_cleanup_complete(srq.handle, RDMA_QUEUE_ROLE_SRQ_SGB),
+        RDMA_SC_INVALID_STATE);
+      expect_status("RECOVERY_SGB_PREDECESSOR_LOOKUP", queue_recovery_manager.
+        lookup_recovery(srq.handle, queue_recovery_lookup), RDMA_SC_OK);
+      if (queue_recovery_lookup == null ||
+          queue_recovery_lookup.queue_plan.refs[0].cleanup_complete)
+        `uvm_error("RECOVERY_SGB_PREDECESSOR_ATOMIC",
+                   "failed SGB predecessor check published cleanup")
+      queue_recovery_manager.set_queue_flush_complete(
+        srq.handle, 1'b1, RDMA_QUEUE_ROLE_SRFQ_PD, 1'b1
+      );
       expect_status("REORDERED_CLEANUP_PROGRESS", queue_recovery_manager.
         record_queue_cleanup_complete(srq.handle, RDMA_QUEUE_ROLE_SRQ_SGB),
         RDMA_SC_OK);
@@ -4053,6 +4194,49 @@ class rdma_resource_manager_test extends uvm_test;
       queue_recovery_manager.set_queue_release_evidence(
         srq.handle, 1'b0, RDMA_QUEUE_ROLE_SRQ_SGB, 1'b0
       );
+      // Force only the detached replacement to fail after reset preparation.
+      // The ERROR registry object and recovery evidence must remain exactly
+      // recoverable for the following successful restore attempt.
+      queue_recovery_manager.set_queue_ambiguity(
+        srq.handle, RDMA_QUEUE_AMBIG_CREATE, RDMA_QUEUE_ROLE_SRQ_RING
+      );
+      expect_status("RESTORE_LATE_FAILURE_BEFORE_RECOVERY", queue_recovery_manager.
+        lookup_recovery(srq.handle, late_failure_recovery_before), RDMA_SC_OK);
+      expect_status("RESTORE_LATE_FAILURE_BEFORE_RESOURCE", queue_recovery_manager.
+        lookup(srq.handle, resource), RDMA_SC_OK);
+      if (!$cast(late_failure_before_srq, resource))
+        `uvm_fatal("RESTORE_LATE_FAILURE", "SRQ snapshot cast failed")
+      queue_recovery_manager.force_queue_restore_late_failure = 1'b1;
+      expect_status("RESTORE_LATE_FAILURE", queue_recovery_manager.
+        restore_active(srq.handle), RDMA_SC_INVALID_STATE);
+      queue_recovery_manager.force_queue_restore_late_failure = 1'b0;
+      expect_status("RESTORE_LATE_FAILURE_AFTER_RECOVERY", queue_recovery_manager.
+        lookup_recovery(srq.handle, queue_recovery_lookup), RDMA_SC_OK);
+      expect_status("RESTORE_LATE_FAILURE_AFTER_RESOURCE", queue_recovery_manager.
+        lookup(srq.handle, resource), RDMA_SC_OK);
+      if (!$cast(late_failure_after_srq, resource) ||
+          late_failure_recovery_before == null || queue_recovery_lookup == null ||
+          late_failure_after_srq.state != late_failure_before_srq.state ||
+          late_failure_after_srq.state != RDMA_RESOURCE_ERROR ||
+          late_failure_after_srq.queue_plan.flush_targets.size() != 2 ||
+          late_failure_before_srq.queue_plan.flush_targets.size() != 2 ||
+          late_failure_after_srq.queue_plan.flush_targets[0].flush_complete !=
+            late_failure_before_srq.queue_plan.flush_targets[0].flush_complete ||
+          late_failure_after_srq.queue_plan.flush_targets[1].flush_complete !=
+            late_failure_before_srq.queue_plan.flush_targets[1].flush_complete ||
+          queue_recovery_lookup.ambiguous_queue_operation !=
+            late_failure_recovery_before.ambiguous_queue_operation ||
+          queue_recovery_lookup.ambiguous_role !=
+            late_failure_recovery_before.ambiguous_role ||
+          queue_recovery_lookup.ambiguous_ticket != null ||
+          late_failure_recovery_before.ambiguous_ticket != null ||
+          queue_recovery_lookup.queue_plan.flush_targets.size() != 2 ||
+          queue_recovery_lookup.queue_plan.flush_targets[0].flush_complete !=
+            late_failure_recovery_before.queue_plan.flush_targets[0].flush_complete ||
+          queue_recovery_lookup.queue_plan.flush_targets[1].flush_complete !=
+            late_failure_recovery_before.queue_plan.flush_targets[1].flush_complete)
+        `uvm_error("RESTORE_LATE_FAILURE_ATOMIC",
+                   "late restore failure changed live queue recovery evidence")
       expect_status("RESTORE_QUEUE_SAFE", queue_recovery_manager.
         restore_active(srq.handle), RDMA_SC_OK);
       expect_status("RESTORE_QUEUE_LOOKUP", queue_recovery_manager.lookup(
