@@ -3230,11 +3230,15 @@ class rdma_resource_manager_test extends uvm_test;
     rdma_pd rollback_pd;
     rdma_mr all_kind_mr;
     rdma_cq all_kind_cq;
+    rdma_cq all_kind_lookup_cq;
     rdma_qp all_kind_qp;
     rdma_srq all_kind_srq;
+    rdma_srq all_kind_lookup_srq;
     rdma_cmq all_kind_cmq;
     rdma_ceq all_kind_ceq;
+    rdma_ceq all_kind_lookup_ceq;
     rdma_aeq all_kind_aeq;
+    rdma_aeq all_kind_lookup_aeq;
     rdma_function snapshot_function;
     rdma_function snapshot_function_lookup;
     rdma_function function_a;
@@ -3518,6 +3522,15 @@ class rdma_resource_manager_test extends uvm_test;
       ),
       RDMA_SC_OK
     );
+    queue_snapshot_plan.context_ref.hmc_ref.ownership =
+      RDMA_OWNERSHIP_BORROWED;
+    expect_status(
+      "QUEUE_SNAPSHOT_STAGE_BORROWED_CONTEXT_HMC",
+      queue_snapshot_rm.stage_allocated(queue_snapshot_cq),
+      RDMA_SC_INVALID_STATE
+    );
+    queue_snapshot_plan.context_ref.hmc_ref.ownership =
+      RDMA_OWNERSHIP_CONTROL_PLANE;
     expect_status(
       "QUEUE_SNAPSHOT_STAGE",
       queue_snapshot_rm.stage_allocated(queue_snapshot_cq), RDMA_SC_OK
@@ -3546,6 +3559,7 @@ class rdma_resource_manager_test extends uvm_test;
           queue_snapshot_plan.rings[0] ||
         queue_snapshot_lookup_cq.queue_plan.refs[0].mapping ==
           queue_snapshot_plan.refs[0].mapping ||
+        queue_snapshot_lookup_cq.cqe_size_bytes != 64 ||
         queue_snapshot_lookup_cq.backing_refs.size() != 0 ||
         queue_snapshot_lookup_cq.hmc_refs.size() != 0)
       `uvm_error("QUEUE_SNAPSHOT_ISOLATION",
@@ -7066,6 +7080,38 @@ class rdma_resource_manager_test extends uvm_test;
       if (resource == null || resource.state != RDMA_RESOURCE_ACTIVE)
         `uvm_error("ALL_KIND_LOOKUP",
                    "exact lifecycle lookup did not return ACTIVE authority")
+      case (all_kind_resources[i].resource_kind())
+        RDMA_RESOURCE_CQ: begin
+          if (!$cast(all_kind_lookup_cq, resource) ||
+              all_kind_lookup_cq.cqe_size_bytes != 64)
+            `uvm_error("ALL_KIND_CQ_METADATA",
+                       "CQ lookup lost entry-size metadata")
+        end
+        RDMA_RESOURCE_SRQ: begin
+          if (!$cast(all_kind_lookup_srq, resource) ||
+              all_kind_lookup_srq.limit_threshold != 16)
+            `uvm_error("ALL_KIND_SRQ_METADATA",
+                       "SRQ lookup lost limit-threshold metadata")
+        end
+        RDMA_RESOURCE_CEQ: begin
+          if (!$cast(all_kind_lookup_ceq, resource) ||
+              all_kind_lookup_ceq.function_local_vector != 3 ||
+              all_kind_lookup_ceq.hardware_vector != 17 ||
+              all_kind_lookup_ceq.msix_table_index != 5)
+            `uvm_error("ALL_KIND_CEQ_METADATA",
+                       "CEQ lookup lost vector metadata")
+        end
+        RDMA_RESOURCE_AEQ: begin
+          if (!$cast(all_kind_lookup_aeq, resource) ||
+              all_kind_lookup_aeq.function_local_vector != 3 ||
+              all_kind_lookup_aeq.hardware_vector != 17 ||
+              all_kind_lookup_aeq.msix_table_index != 5)
+            `uvm_error("ALL_KIND_AEQ_METADATA",
+                       "AEQ lookup lost vector metadata")
+        end
+        default: begin
+        end
+      endcase
       recovery_record = new(
         $sformatf("all_kind_%s_recovery",
                   all_kind_resources[i].resource_kind().name())

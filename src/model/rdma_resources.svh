@@ -234,6 +234,14 @@ class rdma_queue_resource extends rdma_resource;
       status = queue_plan.validate();
       if (!status.ok())
         return status;
+      if (resource_kind() inside {RDMA_RESOURCE_CQ, RDMA_RESOURCE_SRQ} &&
+          (queue_plan.context_ref == null ||
+           queue_plan.context_ref.hmc_ref == null ||
+           queue_plan.context_ref.hmc_ref.ownership !=
+             RDMA_OWNERSHIP_CONTROL_PLANE))
+        return rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "CQ/SRQ context HMC must be control-plane owned");
     end
     return rdma_status::success();
   endfunction

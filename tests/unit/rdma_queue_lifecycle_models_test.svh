@@ -296,6 +296,10 @@ class rdma_queue_lifecycle_models_test extends uvm_test;
     expect_status("CQ_ALLOCATED_PLAN_REQUIRED", cq.validate(),
                   RDMA_SC_INVALID_ARGUMENT);
     cq.queue_plan = plan;
+    expect_status("CQ_BORROWED_CONTEXT_HMC", cq.validate(),
+                  RDMA_SC_INVALID_STATE);
+    cq.queue_plan.context_ref.hmc_ref.ownership =
+      RDMA_OWNERSHIP_CONTROL_PLANE;
     expect_status("CQ_ALLOCATED_PLAN", cq.validate(), RDMA_SC_OK);
     cq.queue_plan.resource_kind = RDMA_RESOURCE_AEQ;
     expect_status("CQ_ALLOCATED_PLAN_KIND", cq.validate(),
@@ -404,6 +408,11 @@ class rdma_queue_lifecycle_models_test extends uvm_test;
     srq.pd_h = make_resource_handle("srq_pd_h", RDMA_RESOURCE_PD,
                                     mapping.function_h);
     srq.queue_plan = srq_plan;
+    srq.queue_plan.context_ref.hmc_ref.ownership = RDMA_OWNERSHIP_BORROWED;
+    expect_status("SRQ_BORROWED_CONTEXT_HMC", srq.validate(),
+                  RDMA_SC_INVALID_STATE);
+    srq.queue_plan.context_ref.hmc_ref.ownership =
+      RDMA_OWNERSHIP_CONTROL_PLANE;
     expect_status("SRQ_RESOURCE_PLAN", srq.validate(), RDMA_SC_OK);
     srq.limit_threshold = 18;
     expect_status("SRQ_RESOURCE_LIMIT", srq.validate(),
