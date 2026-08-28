@@ -92,14 +92,12 @@ class rdma_mock_context_backing extends rdma_context_backing_api;
 
   function automatic rdma_status consume_role_failure(string method_name);
     rdma_status status;
-    string parsed_method;
-    int unsigned parsed_role, parsed_ordinal, ordinal;
+    int unsigned ordinal;
     ordinal = method_ordinals.exists(method_name) ? method_ordinals[method_name] : 0;
-    foreach (role_failures[key]) begin
-      parsed_method = ""; parsed_role = 0; parsed_ordinal = 0;
-      if ($sscanf(key, "%[^:]:%d:%d", parsed_method, parsed_role,
-                  parsed_ordinal) == 3 && parsed_method == method_name &&
-          parsed_ordinal == ordinal) begin
+    for (int unsigned role = 0; role < 32; role++) begin
+      string key;
+      key = $sformatf("%s:%0d:%0d", method_name, role, ordinal);
+      if (role_failures.exists(key)) begin
         status = rdma_mock_clone_status(role_failures[key]);
         role_failures.delete(key);
         return status;

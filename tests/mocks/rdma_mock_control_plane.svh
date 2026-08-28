@@ -98,16 +98,14 @@ class rdma_fault_inject_resource_manager extends rdma_resource_manager;
     string transition_name
   );
     rdma_status failure;
-    string parsed_method;
-    int unsigned parsed_role, parsed_ordinal, ordinal;
+    int unsigned ordinal;
 
     transition_ordinals[transition_name]++;
     ordinal = transition_ordinals[transition_name];
-    foreach (role_failures[key]) begin
-      parsed_method = ""; parsed_role = 0; parsed_ordinal = 0;
-      if ($sscanf(key, "%[^:]:%d:%d", parsed_method, parsed_role,
-                  parsed_ordinal) == 3 && parsed_method == transition_name &&
-          parsed_ordinal == ordinal) begin
+    for (int unsigned role = 0; role < 32; role++) begin
+      string key;
+      key = $sformatf("%s:%0d:%0d", transition_name, role, ordinal);
+      if (role_failures.exists(key)) begin
         failure = rdma_cmq_clone_status_value(role_failures[key]);
         role_failures.delete(key);
         return failure;
