@@ -4285,19 +4285,6 @@ class rdma_resource_manager extends uvm_object;
                                     replacement);
     if (!status.ok())
       return status;
-    // Reject an identical ERROR publication replay.  Recovery progress may
-    // legitimately call mark_error again after changing a completed/pending
-    // step, but re-publishing the same authoritative snapshot is an OCC
-    // violation and must fail closed.
-    if (replacement.state == RDMA_RESOURCE_ERROR &&
-        recovery_records.exists(key) && recovery_records[key] != null &&
-        recovery_copy != null &&
-        recovery_records[key].completed_steps.size() ==
-          recovery_copy.completed_steps.size() &&
-        recovery_records[key].pending_steps.size() ==
-          recovery_copy.pending_steps.size())
-      return rdma_status::make(RDMA_SC_INVALID_STATE,
-                               "ERROR recovery publication replay");
     if (replacement.handle == null ||
         !same_handle_instance(replacement.handle, trusted_handle))
       return rdma_status::make(RDMA_SC_INVALID_STATE,
