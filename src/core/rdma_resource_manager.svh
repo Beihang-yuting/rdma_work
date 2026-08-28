@@ -46,6 +46,10 @@ class rdma_resource_manager extends uvm_object;
     case (kind)
       RDMA_RESOURCE_PD: return 16'hffff;
       RDMA_RESOURCE_MR: return 24'hff_ffff;
+      RDMA_RESOURCE_CQ: return 21'h1f_ffff;
+      RDMA_RESOURCE_SRQ: return 16'hffff;
+      RDMA_RESOURCE_CEQ,
+      RDMA_RESOURCE_AEQ: return 12'hfff;
       default: return 32'hffff_ffff;
     endcase
   endfunction
@@ -783,6 +787,8 @@ class rdma_resource_manager extends uvm_object;
     rdma_hmc_ref hmc_copy;
     rdma_status status_copy;
     rdma_status status;
+    rdma_cmq_opcode_key opcode_copy;
+    rdma_queue_backing_plan plan_copy;
 
     result = null;
     if (source == null)
@@ -850,6 +856,29 @@ class rdma_resource_manager extends uvm_object;
       end
       result.rollback_statuses.push_back(status_copy);
     end
+    result.queue_recovery_valid = source.queue_recovery_valid;
+    result.queue_intent = source.queue_intent;
+    result.ambiguous_queue_operation = source.ambiguous_queue_operation;
+    result.ambiguous_role = source.ambiguous_role;
+    status = project_opcode_value(source.queue_create_opcode,
+                                  {copy_label, "_queue_create"},
+                                  opcode_copy);
+    if (!status.ok()) begin result = null; return status; end
+    result.queue_create_opcode = opcode_copy;
+    status = project_opcode_value(source.queue_delete_opcode,
+                                  {copy_label, "_queue_delete"},
+                                  opcode_copy);
+    if (!status.ok()) begin result = null; return status; end
+    result.queue_delete_opcode = opcode_copy;
+    status = project_opcode_value(source.queue_query_opcode,
+                                  {copy_label, "_queue_query"},
+                                  opcode_copy);
+    if (!status.ok()) begin result = null; return status; end
+    result.queue_query_opcode = opcode_copy;
+    status = project_queue_plan_value(source.queue_plan,
+                                      {copy_label, "_queue_plan"}, plan_copy);
+    if (!status.ok()) begin result = null; return status; end
+    result.queue_plan = plan_copy;
     return rdma_status::success();
   endfunction
 
@@ -3013,6 +3042,201 @@ class rdma_resource_manager extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  protected function rdma_status queue_progress_snapshots(
+    rdma_handle handle,
+    string operation,
+    output string key,
+    output rdma_resource resource_copy,
+    output rdma_recovery_record recovery_copy,
+    output bit has_recovery
+  );
+    rdma_resource authoritative;
+    rdma_queue_resource queue_resource;
+    rdma_status status;
+
+    key = "";
+    resource_copy = null;
+    recovery_copy = null;
+    has_recovery = 1'b0;
+    status = lookup(handle, authoritative);
+    if (!status.ok()) return status;
+    key = resource_key(authoritative.handle);
+    if (!(authoritative.handle.kind inside {RDMA_RESOURCE_CQ, RDMA_RESOURCE_SRQ,
+                                            RDMA_RESOURCE_CEQ, RDMA_RESOURCE_AEQ}) ||
+        !(registry[key].state inside {RDMA_RESOURCE_QUIESCING,
+                                      RDMA_RESOURCE_ERROR}))
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "queue progress requires QUIESCING or ERROR queue");
+    status = project_resource_value(registry[key], {operation, " resource"},
+                                    resource_copy);
+    if (!status.ok() || !$cast(queue_resource, resource_copy) ||
+        queue_resource.queue_plan == null)
+      return status.ok() ? rdma_status::make(
+        RDMA_SC_INVALID_STATE, "queue progress resource plan is missing"
+      ) : status;
+    status = queue_resource.queue_plan.validate();
+    if (status == null || !status.ok()) return status;
+    if (registry[key].state == RDMA_RESOURCE_ERROR) begin
+      if (!recovery_records.exists(key))
+        return rdma_status::make(RDMA_SC_INVALID_STATE,
+                                 "ERROR queue has no recovery record");
+      status = project_recovery_value(recovery_records[key],
+                                      {operation, " recovery"}, recovery_copy);
+      if (!status.ok()) return status;
+      if (recovery_copy == null || !recovery_copy.queue_recovery_valid ||
+          recovery_copy.queue_plan == null ||
+          recovery_copy.queue_plan.resource_kind != authoritative.handle.kind)
+        return rdma_status::make(RDMA_SC_INVALID_STATE,
+                                 "ERROR queue recovery schema is incomplete");
+      status = recovery_copy.validate();
+      if (status == null || !status.ok()) return status;
+      has_recovery = 1'b1;
+    end
+    return rdma_status::success();
+  endfunction
+
+  protected function rdma_status commit_queue_progress(
+    string key,
+    rdma_resource resource_copy,
+    rdma_recovery_record recovery_copy,
+    bit has_recovery,
+    string operation
+  );
+    rdma_status status;
+
+    status = resource_copy.validate();
+    if (status == null || !status.ok()) return status;
+    if (has_recovery) begin
+      status = recovery_copy.validate();
+      if (status == null || !status.ok()) return status;
+    end
+    // Both complete snapshots have passed validation; publish them together at
+    // the single authoritative replacement point.
+    registry[key] = resource_copy;
+    if (has_recovery)
+      recovery_records[key] = recovery_copy;
+    return rdma_status::success();
+  endfunction
+
+  virtual function rdma_status record_queue_flush_complete(
+    rdma_handle handle,
+    rdma_queue_backing_role_e role
+  );
+    rdma_resource resource_copy;
+    rdma_recovery_record recovery_copy;
+    rdma_queue_resource resource_queue;
+    int unsigned role_count;
+    int unsigned target_index;
+    rdma_status status;
+    bit has_recovery;
+    string key;
+
+    status = queue_progress_snapshots(handle, "queue flush progress", key,
+                                      resource_copy, recovery_copy, has_recovery);
+    if (!status.ok()) return status;
+    if (!$cast(resource_queue, resource_copy))
+      return rdma_status::make(RDMA_SC_INVALID_STATE, "queue resource cast failed");
+    role_count = 0;
+    foreach (resource_queue.queue_plan.flush_targets[i]) begin
+      if (resource_queue.queue_plan.flush_targets[i] != null &&
+          resource_queue.queue_plan.flush_targets[i].role == role) begin
+        role_count++;
+        target_index = i;
+      end
+    end
+    if (role_count != 1 || resource_queue.queue_plan.flush_targets[target_index].flush_complete)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "queue flush role is absent, duplicated, or complete");
+    foreach (resource_queue.queue_plan.flush_targets[i]) begin
+      if (i < target_index && !resource_queue.queue_plan.flush_targets[i].flush_complete)
+        return rdma_status::make(RDMA_SC_INVALID_STATE,
+                                 "queue flush predecessor is incomplete");
+    end
+    resource_queue.queue_plan.flush_targets[target_index].flush_complete = 1'b1;
+    if (has_recovery)
+      recovery_copy.queue_plan.flush_targets[target_index].flush_complete = 1'b1;
+    return commit_queue_progress(key, resource_copy, recovery_copy, has_recovery,
+                                 "queue flush progress");
+  endfunction
+
+  virtual function rdma_status record_queue_cleanup_complete(
+    rdma_handle handle,
+    rdma_queue_backing_role_e role
+  );
+    rdma_resource resource_copy;
+    rdma_recovery_record recovery_copy;
+    rdma_queue_resource resource_queue;
+    int unsigned role_count;
+    int unsigned ref_index;
+    rdma_status status;
+    bit has_recovery;
+    string key;
+
+    status = queue_progress_snapshots(handle, "queue cleanup progress", key,
+                                      resource_copy, recovery_copy, has_recovery);
+    if (!status.ok()) return status;
+    if (!$cast(resource_queue, resource_copy))
+      return rdma_status::make(RDMA_SC_INVALID_STATE, "queue resource cast failed");
+    role_count = 0;
+    foreach (resource_queue.queue_plan.refs[i]) begin
+      if (resource_queue.queue_plan.refs[i] != null &&
+          resource_queue.queue_plan.refs[i].role == role) begin
+        role_count++;
+        ref_index = i;
+      end
+    end
+    if (role_count != 1 || resource_queue.queue_plan.refs[ref_index].cleanup_complete ||
+        resource_queue.queue_plan.refs[ref_index].ownership !=
+          RDMA_OWNERSHIP_CONTROL_PLANE)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "queue cleanup role is not uniquely owned and pending");
+    if (role == RDMA_QUEUE_ROLE_SRQ_SGB &&
+        (resource_queue.queue_plan.flush_targets.size() == 0 ||
+         !resource_queue.queue_plan.flush_targets[0].flush_complete))
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "SRQ SGB cleanup requires SRFQ flush completion");
+    resource_queue.queue_plan.refs[ref_index].cleanup_complete = 1'b1;
+    if (has_recovery)
+      recovery_copy.queue_plan.refs[ref_index].cleanup_complete = 1'b1;
+    return commit_queue_progress(key, resource_copy, recovery_copy, has_recovery,
+                                 "queue cleanup progress");
+  endfunction
+
+  virtual function rdma_status record_queue_context_cleanup_complete(
+    rdma_handle handle
+  );
+    rdma_resource resource_copy;
+    rdma_recovery_record recovery_copy;
+    rdma_queue_resource resource_queue;
+    rdma_status status;
+    bit has_recovery;
+    bit sgb_cleanup_complete;
+    string key;
+
+    status = queue_progress_snapshots(handle, "queue context progress", key,
+                                      resource_copy, recovery_copy, has_recovery);
+    if (!status.ok()) return status;
+    if (!$cast(resource_queue, resource_copy) ||
+        resource_queue.queue_plan.context_ref == null ||
+        resource_queue.queue_plan.context_ref.release_complete)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "queue context cleanup is absent or complete");
+    sgb_cleanup_complete = 1'b0;
+    foreach (resource_queue.queue_plan.refs[i]) begin
+      if (resource_queue.queue_plan.refs[i] != null &&
+          resource_queue.queue_plan.refs[i].role == RDMA_QUEUE_ROLE_SRQ_SGB)
+        sgb_cleanup_complete = resource_queue.queue_plan.refs[i].cleanup_complete;
+    end
+    if (resource_queue.handle.kind == RDMA_RESOURCE_SRQ && !sgb_cleanup_complete)
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "SRQ context cleanup requires SGB cleanup");
+    resource_queue.queue_plan.context_ref.release_complete = 1'b1;
+    if (has_recovery)
+      recovery_copy.queue_plan.context_ref.release_complete = 1'b1;
+    return commit_queue_progress(key, resource_copy, recovery_copy, has_recovery,
+                                 "queue context progress");
+  endfunction
+
   virtual function rdma_status restore_active(rdma_handle handle);
     rdma_resource authoritative;
     rdma_resource replacement;
@@ -3030,8 +3254,8 @@ class rdma_resource_manager extends uvm_object;
       status = recovery_entry_schema_status(key, "restore active");
       if (!status.ok())
         return status;
-      if (authoritative.handle.kind != RDMA_RESOURCE_MR ||
-          staged_allocations.exists(key) || !recovery_records.exists(key))
+      if (authoritative.handle.kind == RDMA_RESOURCE_MR) begin
+      if (staged_allocations.exists(key) || !recovery_records.exists(key))
         return rdma_status::make(
           RDMA_SC_INVALID_STATE,
           "ERROR restore requires an unstaged MR recovery record"
@@ -3128,6 +3352,55 @@ class rdma_resource_manager extends uvm_object;
             "ERROR MR recovery HMC authority changed"
           );
       end
+      end
+      else if (authoritative.handle.kind inside {RDMA_RESOURCE_CQ,
+                                                  RDMA_RESOURCE_SRQ,
+                                                  RDMA_RESOURCE_CEQ,
+                                                  RDMA_RESOURCE_AEQ}) begin
+        rdma_queue_resource queue_replacement;
+        bit destructive_cleanup;
+
+        if (staged_allocations.exists(key) || !recovery_records.exists(key))
+          return rdma_status::make(
+            RDMA_SC_INVALID_STATE,
+            "ERROR queue restore requires an unstaged queue recovery record"
+          );
+        recovery = recovery_records[key];
+        if (recovery == null || !recovery.queue_recovery_valid ||
+            recovery.hardware_presence != RDMA_HW_PRESENCE_PRESENT ||
+            recovery.ambiguous_ticket != null || recovery.queue_plan == null ||
+            recovery.queue_plan.resource_kind != authoritative.handle.kind)
+          return rdma_status::make(
+            RDMA_SC_INVALID_STATE,
+            "ERROR queue recovery is not present and unambiguous"
+          );
+        destructive_cleanup = recovery.queue_plan.context_ref != null &&
+                              recovery.queue_plan.context_ref.release_complete;
+        foreach (recovery.queue_plan.refs[i]) begin
+          if (recovery.queue_plan.refs[i] != null &&
+              recovery.queue_plan.refs[i].cleanup_complete)
+            destructive_cleanup = 1'b1;
+        end
+        if (destructive_cleanup)
+          return rdma_status::make(
+            RDMA_SC_INVALID_STATE,
+            "ERROR queue recovery includes destructive local cleanup"
+          );
+        status = project_resource_value(registry[key], "restore queue active",
+                                        replacement);
+        if (!status.ok() || !$cast(queue_replacement, replacement))
+          return status.ok() ? rdma_status::make(
+            RDMA_SC_INVALID_STATE, "ERROR queue restore type mismatch"
+          ) : status;
+        if (authoritative.handle.kind == RDMA_RESOURCE_SRQ) begin
+          foreach (queue_replacement.queue_plan.flush_targets[i])
+            queue_replacement.queue_plan.flush_targets[i].flush_complete = 1'b0;
+        end
+        replacement = queue_replacement;
+      end
+      else
+        return rdma_status::make(RDMA_SC_INVALID_STATE,
+                                 "ERROR restore supports MR or lifecycle queue only");
     end
     else if (registry[key].state != RDMA_RESOURCE_QUIESCING)
       return rdma_status::make(
@@ -3138,6 +3411,29 @@ class rdma_resource_manager extends uvm_object;
                                   replacement);
     if (!status.ok())
       return status;
+    if (authoritative.state == RDMA_RESOURCE_ERROR &&
+        authoritative.handle.kind inside {RDMA_RESOURCE_CQ, RDMA_RESOURCE_SRQ,
+                                          RDMA_RESOURCE_CEQ, RDMA_RESOURCE_AEQ}) begin
+      rdma_queue_resource queue_replacement;
+      rdma_queue_backing_plan restored_plan;
+
+      if (!$cast(queue_replacement, replacement))
+        return rdma_status::make(RDMA_SC_INVALID_STATE,
+                                 "restored queue resource type mismatch");
+      status = project_queue_plan_value(recovery.queue_plan,
+                                        "restore active queue plan",
+                                        restored_plan);
+      if (!status.ok() || restored_plan == null)
+        return status.ok() ? rdma_status::make(
+          RDMA_SC_INVALID_STATE, "restored queue plan is missing"
+        ) : status;
+      queue_replacement.queue_plan = restored_plan;
+      if (authoritative.handle.kind == RDMA_RESOURCE_SRQ) begin
+        foreach (queue_replacement.queue_plan.flush_targets[i])
+          queue_replacement.queue_plan.flush_targets[i].flush_complete = 1'b0;
+      end
+      replacement = queue_replacement;
+    end
     replacement.state = RDMA_RESOURCE_ACTIVE;
     status = replacement.validate();
     if (status == null)

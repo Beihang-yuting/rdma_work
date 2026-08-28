@@ -148,6 +148,7 @@ class rdma_control_plane_models_test extends uvm_test;
     rdma_recovery_record recovery;
     rdma_recovery_record recovery_clone;
     rdma_cmq_ticket ticket;
+    rdma_recovery_record mr_recovery;
     rdma_status saved_status;
     rdma_status saved_primary_status;
     rdma_mr_page_layout saved_page_layout;
@@ -161,6 +162,15 @@ class rdma_control_plane_models_test extends uvm_test;
     uvm_object cloned_object;
 
     phase.raise_objection(this);
+
+    if (RDMA_CTRL_STEP_RESOURCE_RESERVED != 0 ||
+        RDMA_CTRL_STEP_RESOURCE_RELEASED != 10 ||
+        RDMA_CTRL_STEP_HW_CONTEXT_CREATED != 11 ||
+        RDMA_CTRL_STEP_HW_CONTEXT_DELETED != 12 ||
+        !rdma_control_step_valid(RDMA_CTRL_STEP_HW_CONTEXT_CREATED) ||
+        !rdma_control_step_is_hardware(RDMA_CTRL_STEP_HW_CONTEXT_DELETED))
+      `uvm_error("CONTROL_STEP_ENCODING",
+                 "control step values or hardware classification changed")
 
     function_h = make_function("function_h");
     mapping = make_mapping("mapping", function_h,
@@ -487,6 +497,18 @@ class rdma_control_plane_models_test extends uvm_test;
                         "deregister not confirmed")
     );
     expect_status("RECOVERY", recovery.validate(), RDMA_SC_OK);
+
+    // The queue recovery discriminator is explicitly opt-in: the established
+    // MR record remains valid with the queue schema disabled.
+    mr_recovery = rdma_recovery_record::type_id::create("mr_recovery");
+    mr_recovery.resource_h = make_resource("mr_recovery_resource");
+    mr_recovery.hardware_presence = RDMA_HW_PRESENCE_PRESENT;
+    mr_recovery.primary_status = rdma_status::make(
+      RDMA_SC_TIMEOUT, "MR recovery remains on the legacy schema"
+    );
+    mr_recovery.queue_recovery_valid = 1'b0;
+    expect_status("MR_RECOVERY_LEGACY_SCHEMA", mr_recovery.validate(),
+                  RDMA_SC_OK);
 
     cloned_object = recovery.clone();
     if (!$cast(recovery_clone, cloned_object))

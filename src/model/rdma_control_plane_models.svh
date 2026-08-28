@@ -9,7 +9,9 @@ typedef enum bit [3:0] {
   RDMA_CTRL_STEP_HW_MR_DEREGISTERED,
   RDMA_CTRL_STEP_HW_DRAINED,
   RDMA_CTRL_STEP_BACKING_RELEASED,
-  RDMA_CTRL_STEP_RESOURCE_RELEASED
+  RDMA_CTRL_STEP_RESOURCE_RELEASED,
+  RDMA_CTRL_STEP_HW_CONTEXT_CREATED,
+  RDMA_CTRL_STEP_HW_CONTEXT_DELETED
 } rdma_control_step_e;
 
 function automatic bit rdma_control_step_valid(rdma_control_step_e step);
@@ -24,7 +26,9 @@ function automatic bit rdma_control_step_valid(rdma_control_step_e step);
     RDMA_CTRL_STEP_HW_MR_DEREGISTERED,
     RDMA_CTRL_STEP_HW_DRAINED,
     RDMA_CTRL_STEP_BACKING_RELEASED,
-    RDMA_CTRL_STEP_RESOURCE_RELEASED
+    RDMA_CTRL_STEP_RESOURCE_RELEASED,
+    RDMA_CTRL_STEP_HW_CONTEXT_CREATED,
+    RDMA_CTRL_STEP_HW_CONTEXT_DELETED
   };
 endfunction
 
@@ -35,7 +39,9 @@ function automatic bit rdma_control_step_is_hardware(
     RDMA_CTRL_STEP_HW_KEY_ALLOCATED,
     RDMA_CTRL_STEP_HW_OCC_FLUSHED,
     RDMA_CTRL_STEP_HW_MR_DEREGISTERED,
-    RDMA_CTRL_STEP_HW_DRAINED
+    RDMA_CTRL_STEP_HW_DRAINED,
+    RDMA_CTRL_STEP_HW_CONTEXT_CREATED,
+    RDMA_CTRL_STEP_HW_CONTEXT_DELETED
   };
 endfunction
 
@@ -270,6 +276,14 @@ class rdma_recovery_record extends uvm_object;
   rdma_cmq_ticket ambiguous_ticket;
   rdma_status primary_status;
   rdma_status rollback_statuses[$];
+  bit queue_recovery_valid;
+  rdma_queue_recovery_intent_e queue_intent;
+  rdma_queue_ambiguous_operation_e ambiguous_queue_operation;
+  rdma_queue_backing_role_e ambiguous_role;
+  rdma_cmq_opcode_key queue_create_opcode;
+  rdma_cmq_opcode_key queue_delete_opcode;
+  rdma_cmq_opcode_key queue_query_opcode;
+  rdma_queue_backing_plan queue_plan;
 
   function new(string name = "rdma_recovery_record");
     super.new(name);
@@ -277,6 +291,14 @@ class rdma_recovery_record extends uvm_object;
     hardware_presence = RDMA_HW_PRESENCE_UNKNOWN;
     ambiguous_ticket = null;
     primary_status = null;
+    queue_recovery_valid = 1'b0;
+    queue_intent = RDMA_QUEUE_RECOVER_CREATE_ROLLBACK;
+    ambiguous_queue_operation = RDMA_QUEUE_AMBIG_NONE;
+    ambiguous_role = RDMA_QUEUE_ROLE_CQ_RING;
+    queue_create_opcode = null;
+    queue_delete_opcode = null;
+    queue_query_opcode = null;
+    queue_plan = null;
   endfunction
 
   virtual function rdma_status validate();
@@ -348,6 +370,49 @@ class rdma_recovery_record extends uvm_object;
         RDMA_SC_INVALID_STATE,
         "unknown hardware presence lacks an ambiguous ticket or hardware step"
       );
+    if (resource_h.kind == RDMA_RESOURCE_MR && queue_recovery_valid)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "MR recovery cannot use queue schema");
+    if (queue_recovery_valid) begin
+      if (!(resource_h.kind inside {RDMA_RESOURCE_CQ, RDMA_RESOURCE_SRQ,
+                                    RDMA_RESOURCE_CEQ, RDMA_RESOURCE_AEQ}))
+        return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                                 "queue recovery resource kind is invalid");
+      if (!(queue_intent inside {RDMA_QUEUE_RECOVER_CREATE_ROLLBACK,
+                                 RDMA_QUEUE_RECOVER_NORMAL_DESTROY}) ||
+          !(ambiguous_queue_operation inside {RDMA_QUEUE_AMBIG_NONE,
+                                               RDMA_QUEUE_AMBIG_CREATE,
+                                               RDMA_QUEUE_AMBIG_DELETE,
+                                               RDMA_QUEUE_AMBIG_OCC_FLUSH}) ||
+          !rdma_queue_role_is_payload(ambiguous_role) &&
+          !rdma_queue_role_is_pd(ambiguous_role))
+        return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                                 "queue recovery enum value is invalid");
+      if (queue_plan == null || queue_plan.resource_kind != resource_h.kind)
+        return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                                 "queue recovery plan kind does not match");
+      status = queue_plan.validate();
+      if (status == null || !status.ok())
+        return status == null ? rdma_status::make(
+          RDMA_SC_INVALID_STATE, "queue recovery plan validation returned null"
+        ) : status;
+      if (queue_create_opcode == null || queue_delete_opcode == null ||
+          queue_query_opcode == null)
+        return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                                 "queue recovery opcode key is null");
+      status = queue_create_opcode.validate();
+      if (status == null || !status.ok()) return status;
+      status = queue_delete_opcode.validate();
+      if (status == null || !status.ok()) return status;
+      status = queue_query_opcode.validate();
+      if (status == null || !status.ok()) return status;
+      if (ambiguous_queue_operation == RDMA_QUEUE_AMBIG_OCC_FLUSH &&
+          (!rdma_queue_role_is_pd(ambiguous_role) || ambiguous_ticket == null))
+        return rdma_status::make(
+          RDMA_SC_INVALID_ARGUMENT,
+          "ambiguous queue OCC flush requires a PD role and ticket"
+        );
+    end
     return rdma_status::success();
   endfunction
 
@@ -356,6 +421,7 @@ class rdma_recovery_record extends uvm_object;
     uvm_object cloned_object;
     rdma_backing_ref cloned_backing_ref;
     rdma_hmc_ref cloned_hmc_ref;
+    uvm_object cloned_plan_object;
 
     super.do_copy(rhs);
     if (!$cast(rhs_record, rhs))
@@ -401,5 +467,28 @@ class rdma_recovery_record extends uvm_object;
       rollback_statuses.push_back(
         rdma_cmq_clone_status_value(rhs_record.rollback_statuses[i])
       );
+    queue_recovery_valid = rhs_record.queue_recovery_valid;
+    queue_intent = rhs_record.queue_intent;
+    ambiguous_queue_operation = rhs_record.ambiguous_queue_operation;
+    ambiguous_role = rhs_record.ambiguous_role;
+    queue_create_opcode = rdma_cmq_clone_opcode_key_value(
+      rhs_record.queue_create_opcode, "recovery queue create"
+    );
+    queue_delete_opcode = rdma_cmq_clone_opcode_key_value(
+      rhs_record.queue_delete_opcode, "recovery queue delete"
+    );
+    queue_query_opcode = rdma_cmq_clone_opcode_key_value(
+      rhs_record.queue_query_opcode, "recovery queue query"
+    );
+    if (rhs_record.queue_plan == null) begin
+      queue_plan = null;
+    end
+    else begin
+      cloned_plan_object = rhs_record.queue_plan.clone();
+      if (cloned_plan_object == null ||
+          !$cast(queue_plan, cloned_plan_object) ||
+          queue_plan == rhs_record.queue_plan)
+        `uvm_fatal("RDMA_COPY_TYPE", "recovery queue plan clone mismatch")
+    end
   endfunction
 endclass

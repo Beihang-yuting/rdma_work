@@ -39,6 +39,11 @@ class rdma_width_probe_manager extends rdma_resource_manager;
     next_local_id[kind] = value;
   endfunction
 
+  function void seed_next_local_id(rdma_resource_kind_e kind,
+                                   int unsigned value);
+    next_local_id[kind] = value;
+  endfunction
+
   function void inject_free_local_id(rdma_resource_kind_e kind,
                                      int unsigned value);
     free_local_ids[kind].push_back(value);
@@ -48,6 +53,12 @@ class rdma_width_probe_manager extends rdma_resource_manager;
     rdma_resource_kind_e kind
   );
     return next_object_serial[kind];
+  endfunction
+
+  function int unsigned observed_next_local_id(
+    rdma_resource_kind_e kind
+  );
+    return next_local_id[kind];
   endfunction
 
   function int unsigned observed_free_local_id_count(
@@ -3589,6 +3600,198 @@ class rdma_resource_manager_test extends uvm_test;
           snapshot_release_authority(queue_snapshot_unsupported_authority),
         RDMA_SC_UNSUPPORTED_OPCODE
       );
+    end
+
+    // Queue local IDs use their wire widths and reject the next fresh value
+    // without changing the live registry or allocator cursor.
+    begin : queue_width_and_recovery
+      rdma_width_probe_manager cq_width_rm;
+      rdma_width_probe_manager srq_width_rm;
+      rdma_width_probe_manager ceq_width_rm;
+      rdma_width_probe_manager aeq_width_rm;
+      rdma_resource_manager queue_recovery_manager;
+      rdma_function_binding queue_binding;
+      rdma_cq cq_last;
+      rdma_cq cq_overflow;
+      rdma_srq srq_last;
+      rdma_srq srq_overflow;
+      rdma_ceq ceq_last;
+      rdma_ceq ceq_overflow;
+      rdma_aeq aeq_last;
+      rdma_aeq aeq_overflow;
+      rdma_srq srq;
+      rdma_recovery_record queue_recovery;
+      rdma_recovery_record queue_recovery_lookup;
+      rdma_cmq_ticket queue_ticket;
+      rdma_cmq_opcode_key queue_create_opcode;
+      rdma_cmq_opcode_key queue_delete_opcode;
+      rdma_cmq_opcode_key queue_query_opcode;
+      rdma_queue_ring_layout sgb_ring;
+      rdma_queue_backing_ref sgb_ref;
+      rdma_dma_mapping sgb_mapping;
+      int unsigned serial_before;
+      int unsigned local_before;
+
+      queue_binding = make_active_binding(
+        "queue_width_binding", 64'h1d00_0000_0000_0008,
+        32'h1d00_0808, 32'd8
+      );
+      cq_width_rm = new("cq_width_rm");
+      cq_width_rm.seed_next_local_id(RDMA_RESOURCE_CQ, 21'h1f_ffff);
+      expect_status("WIDTH_CQ_21_LAST",
+                    cq_width_rm.create_cq(queue_binding, null, cq_last),
+                    RDMA_SC_OK);
+      serial_before = cq_width_rm.observed_next_object_serial(RDMA_RESOURCE_CQ);
+      local_before = cq_width_rm.observed_next_local_id(RDMA_RESOURCE_CQ);
+      expect_status("WIDTH_CQ_21_EXHAUSTED",
+                    cq_width_rm.create_cq(queue_binding, null, cq_overflow),
+                    RDMA_SC_RESOURCE_EXHAUSTED);
+      if (cq_last == null || cq_last.local_cq_id != 21'h1f_ffff ||
+          cq_overflow != null ||
+          cq_width_rm.observed_next_local_id(RDMA_RESOURCE_CQ) != local_before ||
+          cq_width_rm.observed_next_object_serial(RDMA_RESOURCE_CQ) != serial_before)
+        `uvm_error("WIDTH_CQ_21_ATOMIC", "CQ width failure changed allocator state")
+
+      srq_width_rm = new("srq_width_rm");
+      srq_width_rm.seed_next_local_id(RDMA_RESOURCE_SRQ, 16'hffff);
+      expect_status("WIDTH_SRQ_16_LAST",
+                    srq_width_rm.create_srq(queue_binding, null, srq_last),
+                    RDMA_SC_OK);
+      local_before = srq_width_rm.observed_next_local_id(RDMA_RESOURCE_SRQ);
+      expect_status("WIDTH_SRQ_16_EXHAUSTED",
+                    srq_width_rm.create_srq(queue_binding, null, srq_overflow),
+                    RDMA_SC_RESOURCE_EXHAUSTED);
+      if (srq_last == null || srq_last.local_srq_id != 16'hffff ||
+          srq_overflow != null ||
+          srq_width_rm.observed_next_local_id(RDMA_RESOURCE_SRQ) != local_before)
+        `uvm_error("WIDTH_SRQ_16_ATOMIC", "SRQ width boundary is not atomic")
+
+      ceq_width_rm = new("ceq_width_rm");
+      ceq_width_rm.seed_next_local_id(RDMA_RESOURCE_CEQ, 12'hfff);
+      expect_status("WIDTH_CEQ_12_LAST",
+                    ceq_width_rm.create_ceq(queue_binding, ceq_last), RDMA_SC_OK);
+      local_before = ceq_width_rm.observed_next_local_id(RDMA_RESOURCE_CEQ);
+      expect_status("WIDTH_CEQ_12_EXHAUSTED",
+                    ceq_width_rm.create_ceq(queue_binding, ceq_overflow),
+                    RDMA_SC_RESOURCE_EXHAUSTED);
+      if (ceq_last == null || ceq_last.local_ceq_id != 12'hfff ||
+          ceq_overflow != null ||
+          ceq_width_rm.observed_next_local_id(RDMA_RESOURCE_CEQ) != local_before)
+        `uvm_error("WIDTH_CEQ_12_ATOMIC", "CEQ width boundary is not atomic")
+
+      aeq_width_rm = new("aeq_width_rm");
+      aeq_width_rm.seed_next_local_id(RDMA_RESOURCE_AEQ, 12'hfff);
+      expect_status("WIDTH_AEQ_12_LAST",
+                    aeq_width_rm.create_aeq(queue_binding, aeq_last), RDMA_SC_OK);
+      local_before = aeq_width_rm.observed_next_local_id(RDMA_RESOURCE_AEQ);
+      expect_status("WIDTH_AEQ_12_EXHAUSTED",
+                    aeq_width_rm.create_aeq(queue_binding, aeq_overflow),
+                    RDMA_SC_RESOURCE_EXHAUSTED);
+      if (aeq_last == null || aeq_last.local_aeq_id != 12'hfff ||
+          aeq_overflow != null ||
+          aeq_width_rm.observed_next_local_id(RDMA_RESOURCE_AEQ) != local_before)
+        `uvm_error("WIDTH_AEQ_12_ATOMIC", "AEQ width boundary is not atomic")
+
+      queue_recovery_manager = new("queue_recovery_manager");
+      expect_status("QUEUE_RECOVERY_CREATE",
+                    queue_recovery_manager.create_srq(queue_binding, null, srq),
+                    RDMA_SC_OK);
+      srq.depth = 32;
+      srq.max_sge = 4;
+      srq.limit_threshold = 20;
+      srq.queue_plan = make_queue_test_plan(
+        "queue_recovery_plan", RDMA_RESOURCE_SRQ, srq.depth, srq.owner,
+        srq.handle, srq.local_srq_id
+      );
+      sgb_mapping = make_queue_test_mapping(
+        "queue_recovery_sgb_mapping", srq.owner, srq.handle,
+        64'h0000_5200_0000_0000, 1'b1
+      );
+      sgb_ring = make_queue_test_ring(
+        "queue_recovery_sgb_ring", RDMA_QUEUE_ROLE_SRQ_SGB, srq.depth,
+        64, sgb_mapping
+      );
+      sgb_ref = make_queue_test_ref(
+        "queue_recovery_sgb_ref", RDMA_QUEUE_ROLE_SRQ_SGB, sgb_mapping,
+        sgb_ring.storage_bytes, RDMA_OWNERSHIP_CONTROL_PLANE
+      );
+      srq.queue_plan.rings.push_back(sgb_ring);
+      srq.queue_plan.refs.push_back(sgb_ref);
+      expect_status("QUEUE_RECOVERY_STAGE",
+                    queue_recovery_manager.stage_allocated(srq), RDMA_SC_OK);
+      expect_status("QUEUE_RECOVERY_COMMIT",
+                    queue_recovery_manager.commit_programmed(srq), RDMA_SC_OK);
+      expect_status("QUEUE_RECOVERY_ACTIVATE",
+                    queue_recovery_manager.activate(srq.handle), RDMA_SC_OK);
+      expect_status("QUEUE_RECOVERY_QUIESCE",
+                    queue_recovery_manager.begin_quiesce(srq.handle), RDMA_SC_OK);
+
+      queue_recovery = rdma_recovery_record::type_id::create("queue_recovery");
+      queue_recovery.resource_h = clone_handle("QUEUE_RECOVERY_H", srq.handle);
+      queue_recovery.hardware_presence = RDMA_HW_PRESENCE_PRESENT;
+      queue_recovery.primary_status = rdma_status::make(
+        RDMA_SC_TIMEOUT, "queue progress requires recovery"
+      );
+      queue_recovery.queue_recovery_valid = 1'b1;
+      queue_recovery.queue_intent = RDMA_QUEUE_RECOVER_NORMAL_DESTROY;
+      queue_recovery.ambiguous_queue_operation = RDMA_QUEUE_AMBIG_OCC_FLUSH;
+      queue_recovery.ambiguous_role = RDMA_QUEUE_ROLE_SRFQ_PD;
+      queue_recovery.queue_plan = srq.queue_plan;
+      queue_create_opcode = new("queue_create_opcode");
+      queue_delete_opcode = new("queue_delete_opcode");
+      queue_query_opcode = new("queue_query_opcode");
+      queue_create_opcode.profile_name = "generic_profile";
+      queue_delete_opcode.profile_name = "generic_profile";
+      queue_query_opcode.profile_name = "generic_profile";
+      queue_create_opcode.variant = "create";
+      queue_delete_opcode.variant = "delete";
+      queue_query_opcode.variant = "query";
+      queue_recovery.queue_create_opcode = queue_create_opcode;
+      queue_recovery.queue_delete_opcode = queue_delete_opcode;
+      queue_recovery.queue_query_opcode = queue_query_opcode;
+      queue_ticket = new("queue_recovery_ticket");
+      queue_ticket.command_id = 64'h1234;
+      queue_ticket.function_h = clone_function_handle("QUEUE_TICKET_F", srq.owner);
+      queue_ticket.cmq_h = new("queue_ticket_cmq_h");
+      queue_ticket.cmq_h.kind = RDMA_RESOURCE_CMQ;
+      queue_ticket.cmq_h.function_uid = srq.handle.function_uid;
+      queue_ticket.cmq_h.object_id = {RDMA_RESOURCE_CMQ, 28'h1};
+      queue_ticket.cmq_h.generation = srq.handle.generation;
+      queue_ticket.opcode_key = queue_create_opcode;
+      queue_ticket.absolute_deadline = 64'd100;
+      queue_recovery.ambiguous_ticket = queue_ticket;
+      expect_status("QUEUE_RECOVERY", queue_recovery.validate(), RDMA_SC_OK);
+      expect_status("QUEUE_RECOVERY_ERROR",
+                    queue_recovery_manager.mark_error(srq.handle, queue_recovery),
+                    RDMA_SC_OK);
+      expect_status("CLEANUP_PROGRESS_ORDER", queue_recovery_manager.
+        record_queue_cleanup_complete(srq.handle, RDMA_QUEUE_ROLE_SRQ_SGB),
+        RDMA_SC_INVALID_STATE);
+      expect_status("CLEANUP_PROGRESS_ORDER_LOOKUP", queue_recovery_manager.
+        lookup_recovery(srq.handle, queue_recovery_lookup), RDMA_SC_OK);
+      if (queue_recovery_lookup == null ||
+          queue_recovery_lookup.queue_plan.refs[4].cleanup_complete)
+        `uvm_error("CLEANUP_PROGRESS_ORDER", "failed cleanup changed recovery")
+      expect_status("FLUSH_PROGRESS", queue_recovery_manager.record_queue_flush_complete(
+        srq.handle, RDMA_QUEUE_ROLE_SRFQ_PD), RDMA_SC_OK);
+      expect_status("CLEANUP_PROGRESS", queue_recovery_manager.record_queue_cleanup_complete(
+        srq.handle, RDMA_QUEUE_ROLE_SRQ_SGB), RDMA_SC_OK);
+      expect_status("CONTEXT_PROGRESS", queue_recovery_manager.
+        record_queue_context_cleanup_complete(srq.handle), RDMA_SC_OK);
+      expect_status("QUEUE_PROGRESS_LOOKUP", queue_recovery_manager.lookup_recovery(
+        srq.handle, queue_recovery_lookup), RDMA_SC_OK);
+      if (queue_recovery_lookup == null ||
+          !queue_recovery_lookup.queue_plan.flush_targets[0].flush_complete ||
+          !queue_recovery_lookup.queue_plan.refs[4].cleanup_complete ||
+          !queue_recovery_lookup.queue_plan.context_ref.release_complete ||
+          queue_recovery_lookup.queue_plan == queue_recovery.queue_plan ||
+          queue_recovery_lookup.queue_create_opcode ==
+            queue_recovery.queue_create_opcode ||
+          queue_recovery_lookup.queue_delete_opcode ==
+            queue_recovery.queue_delete_opcode ||
+          queue_recovery_lookup.queue_query_opcode ==
+            queue_recovery.queue_query_opcode)
+        `uvm_error("QUEUE_PROGRESS_PERSIST", "queue progress was not persisted")
     end
 
     // PD and MR local IDs are hardware-width projections.  The inclusive
