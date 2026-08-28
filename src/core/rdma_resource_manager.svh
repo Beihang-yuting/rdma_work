@@ -4210,6 +4210,21 @@ class rdma_resource_manager extends uvm_object;
       end
       replacement = queue_replacement;
     end
+    // A failed pre-delete SRQ flush may leave the first progress bit set;
+    // restoring ACTIVE is permitted only for definitive no-change failures,
+    // and must clear all pre-delete progress so the next destroy retries both
+    // commands from a clean authority snapshot.
+    if (authoritative.state == RDMA_RESOURCE_QUIESCING &&
+        authoritative.handle.kind == RDMA_RESOURCE_SRQ) begin
+      rdma_queue_resource queue_replacement;
+      if (!$cast(queue_replacement, replacement) ||
+          queue_replacement.queue_plan == null)
+        return rdma_status::make(RDMA_SC_INVALID_STATE,
+                                 "restored SRQ plan is missing");
+      foreach (queue_replacement.queue_plan.flush_targets[i])
+        queue_replacement.queue_plan.flush_targets[i].flush_complete = 1'b0;
+      replacement = queue_replacement;
+    end
     replacement.state = RDMA_RESOURCE_ACTIVE;
     if (authoritative.state == RDMA_RESOURCE_ERROR &&
         authoritative.handle.kind inside {RDMA_RESOURCE_CQ, RDMA_RESOURCE_SRQ,

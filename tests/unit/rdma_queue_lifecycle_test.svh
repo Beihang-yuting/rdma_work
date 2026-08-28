@@ -3493,6 +3493,46 @@ class rdma_queue_lifecycle_test extends uvm_test;
       `uvm_error("OPTIONAL_CONTEXT_CEQ", "EQ create did not allow null context")
   endtask
 
+  task automatic check_destroy_recipe_contract();
+    rdma_queue_lifecycle_policy policy;
+    rdma_queue_backing_role_e fr[$], lr[$];
+    rdma_queue_flush_phase_e fp[$];
+    bit d, c;
+    policy = rdma_cq_lifecycle_policy::type_id::create("recipe_cq");
+    policy.hardware_cleanup_roles(fr, fp, d);
+    if (fr.size()!=1 || fr[0]!=RDMA_QUEUE_ROLE_CQ_PD || fp[0]!=RDMA_QUEUE_FLUSH_POST_DELETE || !d)
+      `uvm_error("DESTROY_RECIPE_CQ", "CQ recipe mismatch")
+    policy.local_cleanup_roles(lr, c);
+    if (!c || lr.size()!=2 || lr[0]!=RDMA_QUEUE_ROLE_CQ_PD || lr[1]!=RDMA_QUEUE_ROLE_CQ_RING)
+      `uvm_error("DESTROY_RECIPE_CQ_LOCAL", "CQ local recipe mismatch")
+    policy = rdma_srq_lifecycle_policy::type_id::create("recipe_srq");
+    policy.hardware_cleanup_roles(fr, fp, d);
+    if (d || fr.size()!=2 || fr[0]!=RDMA_QUEUE_ROLE_SRFQ_PD || fr[1]!=RDMA_QUEUE_ROLE_SRQ_PD)
+      `uvm_error("DESTROY_RECIPE_SRQ", "SRQ recipe mismatch")
+    policy = rdma_ceq_lifecycle_policy::type_id::create("recipe_ceq");
+    policy.hardware_cleanup_roles(fr, fp, d);
+    if (!d || fr.size()!=0)
+      `uvm_error("DESTROY_RECIPE_CEQ", "CEQ recipe mismatch")
+    policy = rdma_aeq_lifecycle_policy::type_id::create("recipe_aeq");
+    policy.hardware_cleanup_roles(fr, fp, d);
+    if (!d || fr.size()!=0)
+      `uvm_error("DESTROY_RECIPE_AEQ", "AEQ recipe mismatch")
+  endtask
+
+  task automatic check_destroy_invalid_matrix();
+    rdma_queue_lifecycle_executor ex;
+    rdma_function_binding b;
+    rdma_destroy_resource_req req;
+    rdma_control_result res;
+    ex = rdma_queue_lifecycle_executor::type_id::create("destroy_matrix_ex");
+    b = make_binding("destroy_matrix_binding");
+    req = rdma_destroy_resource_req::type_id::create("destroy_matrix_req");
+    req.target_h = null;
+    ex.destroy_locked(b, b.make_handle(), req, 32'd900, res);
+    if (res == null || res.status == null || res.status.code != RDMA_SC_INVALID_ARGUMENT)
+      `uvm_error("DESTROY_INVALID", "invalid destroy did not fail closed")
+  endtask
+
   task run_phase(uvm_phase phase);
     phase.raise_objection(this);
     check_preflight();
@@ -3501,6 +3541,8 @@ class rdma_queue_lifecycle_test extends uvm_test;
     check_backing_planner_rollback_and_cleanup();
     check_contexts_and_commands();
     check_executor_context_optional_for_eq();
+    check_destroy_recipe_contract();
+    check_destroy_invalid_matrix();
     check_create_executor();
     phase.drop_objection(this);
   endtask
