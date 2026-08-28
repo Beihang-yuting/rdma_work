@@ -147,6 +147,98 @@ class rdma_queue_planner_write_observer_mem extends rdma_mock_host_mem;
   endfunction
 endclass
 
+class rdma_queue_executor_trace_mem extends rdma_queue_planner_nth_fail_mem;
+  `uvm_object_utils(rdma_queue_executor_trace_mem)
+
+  rdma_resource_kind_e queue_kind;
+  int unsigned write_ordinal;
+  rdma_mock_call_trace shared_trace;
+
+  function new(string name = "rdma_queue_executor_trace_mem");
+    super.new(name);
+    queue_kind = RDMA_RESOURCE_CQ;
+    write_ordinal = 0;
+    shared_trace = null;
+  endfunction
+
+  function void set_shared_trace(rdma_mock_call_trace trace);
+    shared_trace = trace;
+  endfunction
+
+  virtual function rdma_status write(
+    rdma_dma_mapping mapping, longint unsigned offset, byte data[]
+  );
+    string prefix;
+    string role;
+
+    write_ordinal++;
+    case (queue_kind)
+      RDMA_RESOURCE_CQ:  prefix = "CQ";
+      RDMA_RESOURCE_CEQ: prefix = "CEQ";
+      default:           prefix = "AEQ";
+    endcase
+    role = (write_ordinal == 1) ? {prefix, "_RING"} : {prefix, "_PD"};
+    if (shared_trace != null)
+      shared_trace.record({"host_write:", role});
+    if (find_region(mapping) < 0) begin
+      void'(record_call("write", null, mapping, data.size(), 0,
+                        RDMA_DMA_DEVICE_READ, offset, data));
+      return rdma_status::success();
+    end
+    return super.write(mapping, offset, data);
+  endfunction
+endclass
+
+class rdma_queue_executor_trace_context extends rdma_mock_context_backing;
+  `uvm_object_utils(rdma_queue_executor_trace_context)
+
+  rdma_mock_call_trace shared_trace;
+
+  function new(string name = "rdma_queue_executor_trace_context");
+    super.new(name);
+    shared_trace = null;
+  endfunction
+
+  function void set_call_trace(rdma_mock_call_trace trace);
+    shared_trace = trace;
+  endfunction
+
+  virtual function rdma_status write(
+    rdma_context_backing_ref context_ref,
+    longint unsigned offset,
+    byte unsigned data[]
+  );
+    if (shared_trace != null)
+      shared_trace.record(offset == 0 ?
+        "context_write:CQC_CONTEXT_SLOT" :
+        "context_write:CQC_CONTEXT_SHADOW");
+    return super.write(context_ref, offset, data);
+  endfunction
+endclass
+
+class rdma_queue_executor_generation_fail extends
+  rdma_queue_lifecycle_executor;
+  `uvm_object_utils(rdma_queue_executor_generation_fail)
+
+  int unsigned generation_checks;
+
+  function new(string name = "rdma_queue_executor_generation_fail");
+    super.new(name);
+    generation_checks = 0;
+  endfunction
+
+  protected virtual function rdma_status generation_status(
+    rdma_function_binding binding,
+    rdma_function_handle expected_owner
+  );
+    generation_checks++;
+    if (generation_checks == 2)
+      return rdma_status::make(RDMA_SC_STALE_GENERATION,
+                               "injected post-create generation change");
+    return super.generation_status(binding, expected_owner);
+  endfunction
+endclass
+
 class rdma_queue_lifecycle_test extends uvm_test;
   `uvm_component_utils(rdma_queue_lifecycle_test)
 
@@ -2042,6 +2134,362 @@ class rdma_queue_lifecycle_test extends uvm_test;
                  "failed flush command leaked caller output")
   endfunction
 
+  function automatic rdma_semantic_request make_executor_request(
+    string name,
+    rdma_resource_kind_e kind,
+    rdma_function_binding binding,
+    rdma_ceq dependency,
+    bit borrowed
+  );
+    rdma_create_cq_req cq_req;
+    rdma_create_ceq_req ceq_req;
+    rdma_create_aeq_req aeq_req;
+    rdma_dma_mapping mapping;
+    rdma_queue_backing_slice slice;
+    rdma_queue_backing_role_e role;
+
+    case (kind)
+      RDMA_RESOURCE_CQ: begin
+        cq_req = rdma_create_cq_req::type_id::create(name);
+        cq_req.owner = binding.make_handle();
+        cq_req.depth = 64;
+        cq_req.cqe_size_bytes = 64;
+        cq_req.ceq_h = dependency == null ? null : dependency.handle;
+        if (borrowed) begin
+          cq_req.ring_backing.mode = RDMA_QUEUE_BACKING_BORROWED;
+          role = RDMA_QUEUE_ROLE_CQ_RING;
+          mapping = make_mapping({name, "_mapping"}, binding,
+            64'h0000_0030_0000_0000, 64'hdead_0000_0000_0000, 4096);
+          slice = make_slice({name, "_slice"}, role, mapping, 0, 4096);
+          cq_req.ring_backing.slices.push_back(slice);
+        end
+        return cq_req;
+      end
+      RDMA_RESOURCE_CEQ: begin
+        ceq_req = rdma_create_ceq_req::type_id::create(name);
+        ceq_req.owner = binding.make_handle();
+        ceq_req.depth = 64;
+        ceq_req.vector_id = 3;
+        if (borrowed) begin
+          ceq_req.ring_backing.mode = RDMA_QUEUE_BACKING_BORROWED;
+          role = RDMA_QUEUE_ROLE_CEQ_RING;
+          mapping = make_mapping({name, "_mapping"}, binding,
+            64'h0000_0031_0000_0000, 64'hdead_1000_0000_0000, 4096);
+          slice = make_slice({name, "_slice"}, role, mapping, 0, 4096);
+          ceq_req.ring_backing.slices.push_back(slice);
+        end
+        return ceq_req;
+      end
+      default: begin
+        aeq_req = rdma_create_aeq_req::type_id::create(name);
+        aeq_req.owner = binding.make_handle();
+        aeq_req.depth = 64;
+        aeq_req.vector_id = 3;
+        if (borrowed) begin
+          aeq_req.ring_backing.mode = RDMA_QUEUE_BACKING_BORROWED;
+          role = RDMA_QUEUE_ROLE_AEQ_RING;
+          mapping = make_mapping({name, "_mapping"}, binding,
+            64'h0000_0032_0000_0000, 64'hdead_2000_0000_0000, 4096);
+          slice = make_slice({name, "_slice"}, role, mapping, 0, 4096);
+          aeq_req.ring_backing.slices.push_back(slice);
+        end
+        return aeq_req;
+      end
+    endcase
+  endfunction
+
+  function automatic int unsigned count_executor_host_calls(
+    rdma_mock_host_mem mem, string method_name
+  );
+    int unsigned count;
+    count = 0;
+    foreach (mem.calls[i])
+      if (mem.calls[i].method_name == method_name)
+        count++;
+    return count;
+  endfunction
+
+  task automatic check_executor_positive_case(
+    rdma_resource_kind_e kind, bit borrowed
+  );
+    string label;
+    string prefix;
+    rdma_function_binding binding;
+    rdma_fault_inject_resource_manager manager;
+    rdma_ceq dependency;
+    rdma_queue_executor_trace_mem mem;
+    rdma_queue_executor_trace_context context_backing;
+    rdma_mock_cmq_port cmq;
+    rdma_mock_call_trace trace;
+    rdma_queue_lifecycle_executor executor;
+    rdma_semantic_request request;
+    rdma_queue_resource queue;
+    rdma_control_result result;
+    rdma_resource looked_up;
+    rdma_status status;
+    int unsigned expected_live;
+
+    label = $sformatf("EXEC_%s_%s", kind.name(),
+                      borrowed ? "BORROWED" : "OWNED");
+    case (kind)
+      RDMA_RESOURCE_CQ:  prefix = "CQ";
+      RDMA_RESOURCE_CEQ: prefix = "CEQ";
+      default:           prefix = "AEQ";
+    endcase
+    binding = make_binding({label, "_binding"});
+    manager = rdma_fault_inject_resource_manager::type_id::create(
+      {label, "_manager"});
+    dependency = null;
+    if (kind == RDMA_RESOURCE_CQ)
+      expect_status({label, "_DEPENDENCY"},
+                    manager.create_ceq(binding, dependency), RDMA_SC_OK);
+    mem = rdma_queue_executor_trace_mem::type_id::create({label, "_mem"});
+    mem.queue_kind = kind;
+    context_backing = rdma_queue_executor_trace_context::type_id::create(
+      {label, "_context"});
+    cmq = rdma_mock_cmq_port::type_id::create({label, "_cmq"});
+    trace = rdma_mock_call_trace::type_id::create({label, "_trace"});
+    mem.set_shared_trace(trace);
+    context_backing.set_call_trace(trace);
+    cmq.set_call_trace(trace);
+    executor = rdma_queue_lifecycle_executor::type_id::create(
+      {label, "_executor"});
+    expect_status({label, "_CONFIGURE"}, executor.configure(
+      manager, cmq, mem, context_backing, 100ns), RDMA_SC_OK);
+    request = make_executor_request({label, "_request"}, kind, binding,
+                                    dependency, borrowed);
+    queue = null;
+    result = null;
+    executor.create_locked(binding, binding.make_handle(), request, 64'd101,
+                           queue, result);
+    if (result == null || !result.ok() || result.transaction_id != 64'd101 ||
+        result.status == null || result.primary_status == null ||
+        result.status.code != RDMA_SC_OK ||
+        result.primary_status.code != RDMA_SC_OK || queue == null ||
+        queue.state != RDMA_RESOURCE_ACTIVE ||
+        !result.final_resource_state_known ||
+        result.final_resource_state != RDMA_RESOURCE_ACTIVE)
+      `uvm_error(label, $sformatf(
+        "create did not publish ACTIVE: status=%s primary=%s trace=%p",
+        result == null || result.status == null ? "null" :
+          result.status.convert2string(),
+        result == null || result.primary_status == null ? "null" :
+          result.primary_status.convert2string(), trace.calls))
+    status = manager.lookup(queue == null ? null : queue.handle, looked_up);
+    expect_status({label, "_LOOKUP"}, status, RDMA_SC_OK);
+    if (looked_up == null || looked_up.state != RDMA_RESOURCE_ACTIVE)
+      `uvm_error(label, "registry did not retain the ACTIVE queue")
+    if (manager.release_reserved_calls != 0 ||
+        count_executor_host_calls(mem, "release") != 0 ||
+        context_backing.release_call_count != 0)
+      `uvm_error(label, "successful create released acquired authority")
+    expected_live = borrowed ? 1 : 2;
+    if (mem.live_allocations() != expected_live)
+      `uvm_error(label, "successful create retained the wrong owned count")
+    if (trace.calls.size() != (kind == RDMA_RESOURCE_CQ ? 5 : 3) ||
+        trace.calls[0] != {"host_write:", prefix, "_RING"} ||
+        trace.calls[1] != {"host_write:", prefix, "_PD"})
+      `uvm_error(label, $sformatf(
+        "payload/PD trace prefix is not canonical: %p", trace.calls))
+    if (kind == RDMA_RESOURCE_CQ) begin
+      if (trace.calls.size() == 5 &&
+          (trace.calls[2] != "context_write:CQC_CONTEXT_SLOT" ||
+           trace.calls[3] != "context_write:CQC_CONTEXT_SHADOW" ||
+           trace.calls[4] != "cmq:0c"))
+        `uvm_error(label, "CQ context/create trace is out of order")
+      if (dependency != null) begin
+        status = manager.release_reserved(dependency.handle);
+        expect_status({label, "_DEPENDENCY_RETAINED"}, status,
+                      RDMA_SC_RESOURCE_BUSY);
+      end
+    end
+    else if (trace.calls.size() == 3 &&
+             trace.calls[2] != (kind == RDMA_RESOURCE_CEQ ?
+                                "cmq:10" : "cmq:14"))
+      `uvm_error(label, "EQ create trace is out of order")
+    if (kind != RDMA_RESOURCE_CQ && context_backing.call_trace.size() != 0)
+      `uvm_error(label, "EQ create touched context backing")
+  endtask
+
+  task automatic check_executor_failure_case(int unsigned mode);
+    string label;
+    rdma_function_binding binding;
+    rdma_fault_inject_resource_manager manager;
+    rdma_ceq dependency;
+    rdma_queue_executor_trace_mem mem;
+    rdma_queue_executor_trace_context context_backing;
+    rdma_mock_cmq_port cmq;
+    rdma_queue_lifecycle_executor executor;
+    rdma_semantic_request request;
+    rdma_queue_resource queue;
+    rdma_control_result result;
+    rdma_resource looked_up;
+    rdma_recovery_record recovery;
+    rdma_status injected;
+    rdma_status status;
+    bit gate_observed;
+    int unsigned expected_releases;
+    int unsigned expected_context_releases;
+    int unsigned expected_reservation_releases;
+
+    label = $sformatf("EXEC_FAIL_%0d", mode);
+    binding = make_binding({label, "_binding"});
+    manager = rdma_fault_inject_resource_manager::type_id::create(
+      {label, "_manager"});
+    expect_status({label, "_DEPENDENCY"},
+                  manager.create_ceq(binding, dependency), RDMA_SC_OK);
+    mem = rdma_queue_executor_trace_mem::type_id::create({label, "_mem"});
+    context_backing = rdma_queue_executor_trace_context::type_id::create(
+      {label, "_context"});
+    cmq = rdma_mock_cmq_port::type_id::create({label, "_cmq"});
+    if (mode == 9)
+      executor = rdma_queue_executor_generation_fail::type_id::create(
+        {label, "_executor"});
+    else
+      executor = rdma_queue_lifecycle_executor::type_id::create(
+        {label, "_executor"});
+    expect_status({label, "_CONFIGURE"}, executor.configure(
+      manager, cmq, mem, context_backing, 100ns), RDMA_SC_OK);
+    request = make_executor_request({label, "_request"}, RDMA_RESOURCE_CQ,
+                                    binding, dependency, 1'b0);
+    injected = rdma_status::make(RDMA_SC_UNKNOWN_HW_ERROR,
+                                 {label, " injected failure"});
+    case (mode)
+      0: mem.fail_on_allocate = 1;
+      1: mem.fail_on_allocate = 2;
+      2: void'(mem.fail_write_at(1, injected));
+      3: void'(mem.fail_write_at(2, injected));
+      4: void'(context_backing.fail_next("acquire", injected));
+      5: void'(context_backing.fail_next("write", injected));
+      6: void'(manager.fail_next_transition("stage_allocated", injected));
+      7: cmq.fail_opcode(8'h0c, injected);
+      8: cmq.timeout_opcode(8'h0c);
+      9: begin end
+      10: void'(manager.fail_next_transition("commit_programmed", injected));
+      11: void'(manager.fail_next_transition("activate", injected));
+      default: `uvm_fatal(label, "unknown failure mode")
+    endcase
+    queue = null;
+    result = null;
+    executor.create_locked(binding, binding.make_handle(), request,
+                           64'd200 + mode, queue, result);
+    if (result == null || result.transaction_id != 64'd200 + mode ||
+        result.status == null || result.primary_status == null || result.ok())
+      `uvm_error(label, "failure result is incomplete or spuriously successful")
+    if (mode == 8) begin
+      if (result.status.code != RDMA_SC_RECOVERY_REQUIRED ||
+          result.primary_status.code != RDMA_SC_TIMEOUT ||
+          !result.recovery_required || queue == null ||
+          queue.state != RDMA_RESOURCE_ERROR)
+        `uvm_error(label, "timeout did not return canonical ERROR recovery")
+      status = manager.lookup_recovery(result.resource_h, recovery);
+      expect_status({label, "_RECOVERY"}, status, RDMA_SC_OK);
+      if (recovery == null || !recovery.queue_recovery_valid ||
+          recovery.queue_intent != RDMA_QUEUE_RECOVER_CREATE_ROLLBACK ||
+          recovery.ambiguous_queue_operation != RDMA_QUEUE_AMBIG_CREATE ||
+          recovery.ambiguous_ticket == null || recovery.queue_plan == null ||
+          recovery.hardware_presence != RDMA_HW_PRESENCE_UNKNOWN ||
+          recovery.queue_create_opcode == null ||
+          recovery.queue_create_opcode.opcode != 8'h0c ||
+          recovery.queue_delete_opcode == null ||
+          recovery.queue_delete_opcode.opcode != 8'h0e ||
+          recovery.queue_query_opcode == null ||
+          recovery.queue_query_opcode.opcode != 8'h0f)
+        `uvm_error(label, "timeout recovery lost queue plan/ticket/opcodes")
+      if (count_executor_host_calls(mem, "release") != 0 ||
+          context_backing.release_call_count != 0 ||
+          manager.release_reserved_calls != 0)
+        `uvm_error(label, "ambiguous create destroyed retained authority")
+      status = manager.release_reserved(dependency.handle);
+      expect_status({label, "_DEPENDENCY_RETAINED"}, status,
+                    RDMA_SC_RESOURCE_BUSY);
+      return;
+    end
+    if (queue != null || result.recovery_required ||
+        result.status.code != result.primary_status.code ||
+        !result.final_resource_state_known ||
+        result.final_resource_state != RDMA_RESOURCE_RELEASED)
+      `uvm_error(label, "definitive failure did not finish fail-atomically")
+    status = manager.lookup(result.resource_h, looked_up);
+    expect_status({label, "_RELEASED_LOOKUP"}, status,
+                  RDMA_SC_INVALID_STATE);
+    expected_releases = (mode == 0) ? 0 : (mode == 1 ? 1 : 2);
+    expected_context_releases = mode inside {2, 3, 5, 6, 7, 9, 10, 11} ?
+                                1 : 0;
+    expected_reservation_releases = mode == 11 ? 0 : 1;
+    if (count_executor_host_calls(mem, "release") != expected_releases ||
+        context_backing.release_call_count != expected_context_releases ||
+        manager.release_reserved_calls != expected_reservation_releases)
+      `uvm_error(label, "rollback release cardinality is incorrect")
+    status = manager.release_reserved(dependency.handle);
+    expect_status({label, "_DEPENDENCY_RELEASED"}, status, RDMA_SC_OK);
+    if (mode inside {9, 10, 11}) begin
+      if (cmq.calls.size() != 3 || cmq.calls[0].opcode != 8'h0c ||
+          cmq.calls[1].opcode != 8'h0e || cmq.calls[2].opcode != 8'h0a)
+        `uvm_error(label, "post-create rollback omitted delete/CQ_PD flush")
+    end
+  endtask
+
+  task automatic check_executor_srq_unsupported();
+    rdma_function_binding binding;
+    rdma_fault_inject_resource_manager manager;
+    rdma_queue_executor_trace_mem mem;
+    rdma_queue_executor_trace_context context_backing;
+    rdma_mock_cmq_port cmq;
+    rdma_queue_lifecycle_executor executor;
+    rdma_create_srq_req request;
+    rdma_queue_resource queue;
+    rdma_control_result result;
+
+    binding = make_binding("EXEC_SRQ_UNSUPPORTED_binding");
+    manager = rdma_fault_inject_resource_manager::type_id::create(
+      "EXEC_SRQ_UNSUPPORTED_manager"
+    );
+    mem = rdma_queue_executor_trace_mem::type_id::create(
+      "EXEC_SRQ_UNSUPPORTED_mem"
+    );
+    context_backing = rdma_queue_executor_trace_context::type_id::create(
+      "EXEC_SRQ_UNSUPPORTED_context"
+    );
+    cmq = rdma_mock_cmq_port::type_id::create("EXEC_SRQ_UNSUPPORTED_cmq");
+    executor = rdma_queue_lifecycle_executor::type_id::create(
+      "EXEC_SRQ_UNSUPPORTED_executor"
+    );
+    expect_status("EXEC_SRQ_UNSUPPORTED_CONFIGURE", executor.configure(
+      manager, cmq, mem, context_backing, 100ns), RDMA_SC_OK);
+    request = rdma_create_srq_req::type_id::create(
+      "EXEC_SRQ_UNSUPPORTED_request"
+    );
+    request.owner = binding.make_handle();
+    request.depth = 64;
+    request.max_sge = 4;
+    request.limit_threshold = 16;
+    executor.create_locked(binding, binding.make_handle(), request, 64'd300,
+                           queue, result);
+    if (queue != null || result == null || result.status == null ||
+        result.primary_status == null ||
+        result.status.code != RDMA_SC_UNSUPPORTED_OPCODE ||
+        result.primary_status.code != RDMA_SC_UNSUPPORTED_OPCODE ||
+        result.resource_h != null || result.final_resource_state_known ||
+        result.recovery_required || manager.release_reserved_calls != 0 ||
+        mem.calls.size() != 0 || context_backing.call_trace.size() != 0 ||
+        cmq.calls.size() != 0)
+      `uvm_error("EXEC_SRQ_UNSUPPORTED",
+                 "deferred SRQ create had reservation or adapter side effects")
+  endtask
+
+  task automatic check_create_executor();
+    check_executor_positive_case(RDMA_RESOURCE_CQ, 1'b0);
+    check_executor_positive_case(RDMA_RESOURCE_CQ, 1'b1);
+    check_executor_positive_case(RDMA_RESOURCE_CEQ, 1'b0);
+    check_executor_positive_case(RDMA_RESOURCE_CEQ, 1'b1);
+    check_executor_positive_case(RDMA_RESOURCE_AEQ, 1'b0);
+    check_executor_positive_case(RDMA_RESOURCE_AEQ, 1'b1);
+    for (int unsigned mode = 0; mode < 12; mode++)
+      check_executor_failure_case(mode);
+    check_executor_srq_unsupported();
+  endtask
+
   task run_phase(uvm_phase phase);
     phase.raise_objection(this);
     check_preflight();
@@ -2049,6 +2497,7 @@ class rdma_queue_lifecycle_test extends uvm_test;
     check_backing_planner_negative();
     check_backing_planner_rollback_and_cleanup();
     check_contexts_and_commands();
+    check_create_executor();
     phase.drop_objection(this);
   endtask
 endclass

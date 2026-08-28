@@ -53,7 +53,7 @@ class rdma_fault_inject_resource_manager extends rdma_resource_manager;
     string transition_name,
     rdma_status failure
   );
-    if (!(transition_name inside {"commit_programmed", "activate",
+    if (!(transition_name inside {"stage_allocated", "commit_programmed", "activate",
                                   "release_reserved", "mark_error",
                                   "complete_reserved_error"}))
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
@@ -64,6 +64,15 @@ class rdma_fault_inject_resource_manager extends rdma_resource_manager;
     transition_failures[transition_name] =
       rdma_cmq_clone_status_value(failure);
     return rdma_status::success();
+  endfunction
+
+  virtual function rdma_status stage_allocated(rdma_resource candidate);
+    rdma_status failure;
+
+    failure = take_transition_failure("stage_allocated");
+    if (failure != null)
+      return failure;
+    return super.stage_allocated(candidate);
   endfunction
 
   protected function rdma_status take_transition_failure(
@@ -211,6 +220,7 @@ class rdma_mock_cmq_port extends rdma_cmq_port;
   rdma_mock_cmq_call calls[$];
   uvm_event entered;
   uvm_event release_gate;
+  rdma_mock_call_trace call_trace;
 
   protected longint unsigned next_sequence;
   protected rdma_mock_cmq_outcome outcomes[bit [7:0]][$];
@@ -226,12 +236,17 @@ class rdma_mock_cmq_port extends rdma_cmq_port;
     next_sequence = 1;
     entered = new({name, "_entered"});
     release_gate = new({name, "_release_gate"});
+    call_trace = null;
     gate_enabled = 1'b0;
     gated_opcode = '0;
     gate_entered_count = 0;
     snapshot_engine = rdma_mock_cmq_snapshot_engine::type_id::create(
       {name, "_snapshot_engine"}
     );
+  endfunction
+
+  function void set_call_trace(rdma_mock_call_trace trace);
+    call_trace = trace;
   endfunction
 
   function void gate_opcode(bit [7:0] opcode);
@@ -515,6 +530,8 @@ class rdma_mock_cmq_port extends rdma_cmq_port;
       return;
     end
     opcode = command_snapshot.opcode_key.opcode[7:0];
+    if (call_trace != null)
+      call_trace.record($sformatf("cmq:%02x", opcode));
     helper_status = make_ticket(command_snapshot, next_sequence, ticket);
     if (helper_status == null || !helper_status.ok() || ticket == null) begin
       status = (helper_status == null) ?

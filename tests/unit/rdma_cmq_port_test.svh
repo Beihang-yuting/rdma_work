@@ -406,11 +406,13 @@ class rdma_cmq_port_test extends rdma_cmq_engine_test;
     prepared_b.function_uid = prepared_a.function_uid + 1'b1;
     prepared_b.global_function_id = prepared_a.global_function_id + 1'b1;
     prepared_b.pcie.bdf.function_num = 3'h2;
+    prepared_b.queue_dma.requester_bdf = prepared_b.pcie.bdf;
     prepared_b.owner_h = prepared_b.make_handle();
     active_b = make_binding("adapter_active_b", RDMA_BIND_ACTIVE);
     active_b.function_uid = active_a.function_uid + 1'b1;
     active_b.global_function_id = active_a.global_function_id + 1'b1;
     active_b.pcie.bdf.function_num = 3'h2;
+    active_b.queue_dma.requester_bdf = active_b.pcie.bdf;
     active_b.owner_h = active_b.make_handle();
     if (prepared_a.function_uid == prepared_b.function_uid ||
         prepared_a.global_function_id == prepared_b.global_function_id)

@@ -7,6 +7,9 @@ virtual class rdma_queue_lifecycle_policy extends uvm_object;
   pure virtual function rdma_status preflight(
     rdma_function_binding binding, rdma_semantic_request request,
     rdma_resource_manager manager, output rdma_queue_preflight result);
+  pure virtual function rdma_status reserve_resource(
+    rdma_resource_manager manager, rdma_function_binding binding,
+    rdma_semantic_request request, output rdma_queue_resource resource);
   pure virtual function rdma_status build_create_context(
     rdma_queue_resource resource, rdma_queue_backing_plan plan,
     output rdma_hw_model context_model,
@@ -587,6 +590,25 @@ class rdma_cq_lifecycle_policy extends rdma_queue_lifecycle_policy;
     return RDMA_RESOURCE_CQ;
   endfunction
 
+  virtual function rdma_status reserve_resource(
+    rdma_resource_manager manager, rdma_function_binding binding,
+    rdma_semantic_request request, output rdma_queue_resource resource);
+    rdma_create_cq_req cq_request;
+    rdma_cq cq;
+
+    resource = null;
+    if (manager == null || binding == null ||
+        !$cast(cq_request, request))
+      return invalid_argument("CQ reservation input is invalid");
+    begin
+      rdma_status status;
+      status = manager.create_cq(binding, cq_request.ceq_h, cq);
+      if (status != null && status.ok())
+        resource = cq;
+      return status;
+    end
+  endfunction
+
   virtual function rdma_status preflight(
     rdma_function_binding binding, rdma_semantic_request request,
     rdma_resource_manager manager, output rdma_queue_preflight result);
@@ -767,6 +789,25 @@ class rdma_srq_lifecycle_policy extends rdma_queue_lifecycle_policy;
 
   virtual function rdma_resource_kind_e resource_kind();
     return RDMA_RESOURCE_SRQ;
+  endfunction
+
+  virtual function rdma_status reserve_resource(
+    rdma_resource_manager manager, rdma_function_binding binding,
+    rdma_semantic_request request, output rdma_queue_resource resource);
+    rdma_create_srq_req srq_request;
+    rdma_srq srq;
+
+    resource = null;
+    if (manager == null || binding == null ||
+        !$cast(srq_request, request))
+      return invalid_argument("SRQ reservation input is invalid");
+    begin
+      rdma_status status;
+      status = manager.create_srq(binding, srq_request.pd_h, srq);
+      if (status != null && status.ok())
+        resource = srq;
+      return status;
+    end
   endfunction
 
   virtual function rdma_status preflight(
@@ -984,6 +1025,25 @@ class rdma_ceq_lifecycle_policy extends rdma_queue_lifecycle_policy;
     return RDMA_RESOURCE_CEQ;
   endfunction
 
+  virtual function rdma_status reserve_resource(
+    rdma_resource_manager manager, rdma_function_binding binding,
+    rdma_semantic_request request, output rdma_queue_resource resource);
+    rdma_create_ceq_req ceq_request;
+    rdma_ceq ceq;
+
+    resource = null;
+    if (manager == null || binding == null ||
+        !$cast(ceq_request, request))
+      return invalid_argument("CEQ reservation input is invalid");
+    begin
+      rdma_status status;
+      status = manager.create_ceq(binding, ceq);
+      if (status != null && status.ok())
+        resource = ceq;
+      return status;
+    end
+  endfunction
+
   virtual function rdma_status preflight(
     rdma_function_binding binding, rdma_semantic_request request,
     rdma_resource_manager manager, output rdma_queue_preflight result);
@@ -1152,6 +1212,25 @@ class rdma_aeq_lifecycle_policy extends rdma_queue_lifecycle_policy;
 
   virtual function rdma_resource_kind_e resource_kind();
     return RDMA_RESOURCE_AEQ;
+  endfunction
+
+  virtual function rdma_status reserve_resource(
+    rdma_resource_manager manager, rdma_function_binding binding,
+    rdma_semantic_request request, output rdma_queue_resource resource);
+    rdma_create_aeq_req aeq_request;
+    rdma_aeq aeq;
+
+    resource = null;
+    if (manager == null || binding == null ||
+        !$cast(aeq_request, request))
+      return invalid_argument("AEQ reservation input is invalid");
+    begin
+      rdma_status status;
+      status = manager.create_aeq(binding, aeq);
+      if (status != null && status.ok())
+        resource = aeq;
+      return status;
+    end
   endfunction
 
   virtual function rdma_status preflight(
