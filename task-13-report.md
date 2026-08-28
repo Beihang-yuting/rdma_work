@@ -16,6 +16,14 @@ invalid-context whitelist can prove ABSENT, and only with a non-OK command
 status; SRFQ and arbitrary nonzero ecodes remain UNKNOWN.  QUERY evidence never
 crosses an incomplete OCC barrier.
 
+The recovery test now drives an SRQ through a timed-out first pre-delete OCC,
+late OCC success, an authenticated QUERY ABSENT reconciliation, and a
+definitive failure of the remaining pre-delete OCC.  The queue remains ERROR
+with an incomplete OCC target and no host/context/reservation release.  The
+inherited executor matrices are also run from this focused test: ambiguous CQ
+OCC outcomes retain ERROR/no-release, and a failed context cleanup can be
+retried exactly once without duplicating physical releases.
+
 Create timeout recovery was exercised for late success, definitive late
 failure, and still-pending outcomes.  Late success/failure rolls back the
 ambiguous create and reaches `RESOURCE_RELEASED`; a pending ticket remains an

@@ -668,6 +668,7 @@ virtual class rdma_queue_lifecycle_policy extends uvm_object;
       return 1'b0;
     if (completion.raw_cqe.length != 64 ||
         completion.raw_cqe.bytes.size() != 64 ||
+        completion.raw_cqe.alignment != 64 ||
         completion.raw_cqe.endian != RDMA_ENDIAN_BIG ||
         completion.raw_cqe.image_kind != RDMA_IMAGE_CMQ_CQE ||
         completion.raw_cqe.hardware_version != XTR_V1_HW_VERSION ||
@@ -689,6 +690,7 @@ virtual class rdma_queue_lifecycle_policy extends uvm_object;
     raw_ecode = qword0[31:24];
 
     if (completion.ticket.opcode_key.opcode != raw_opcode ||
+        raw_owner != !completion.ticket.sq_wrap ||
         payload.opcode != raw_opcode || payload.command_ecode != raw_ecode ||
         payload.wqe_index != raw_wqe_index || payload.wrap != raw_wrap ||
         payload.owner != raw_owner ||
