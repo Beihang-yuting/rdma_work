@@ -120,6 +120,7 @@ class rdma_request_model_test extends uvm_test;
     context_ref.hmc_ref.object_kind = RDMA_RESOURCE_MR;
     context_ref.hmc_ref.size = 4096;
     context_ref.hmc_ref.first_pbl_index = 1;
+    context_ref.hmc_ref.ownership = RDMA_OWNERSHIP_CONTROL_PLANE;
     context_ref.shadow_pointer_base.value = 64'h8000_0000;
     context_ref.slot_length = 64;
     context_ref.shadow_view_length = 32;

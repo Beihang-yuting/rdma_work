@@ -3498,7 +3498,7 @@ class rdma_resource_manager_test extends uvm_test;
       RDMA_SC_OK
     );
     queue_snapshot_cq.depth = 128;
-    queue_snapshot_cq.cqe_size_bytes = 64;
+    queue_snapshot_cq.cqe_size_bytes = 128;
     expect_status(
       "QUEUE_SNAPSHOT_STAGE_REQUIRES_PROGRAMMED_PLAN",
       queue_snapshot_rm.stage_allocated(queue_snapshot_cq),
@@ -3559,7 +3559,7 @@ class rdma_resource_manager_test extends uvm_test;
           queue_snapshot_plan.rings[0] ||
         queue_snapshot_lookup_cq.queue_plan.refs[0].mapping ==
           queue_snapshot_plan.refs[0].mapping ||
-        queue_snapshot_lookup_cq.cqe_size_bytes != 64 ||
+        queue_snapshot_lookup_cq.cqe_size_bytes != 128 ||
         queue_snapshot_lookup_cq.backing_refs.size() != 0 ||
         queue_snapshot_lookup_cq.hmc_refs.size() != 0)
       `uvm_error("QUEUE_SNAPSHOT_ISOLATION",
@@ -7021,14 +7021,14 @@ class rdma_resource_manager_test extends uvm_test;
       all_kind_ceq.owner, all_kind_ceq.handle, all_kind_ceq.local_ceq_id
     );
     all_kind_cq.depth = 8;
-    all_kind_cq.cqe_size_bytes = 64;
+    all_kind_cq.cqe_size_bytes = 128;
     all_kind_cq.queue_plan = make_queue_test_plan(
       "all_kind_cq_plan", RDMA_RESOURCE_CQ, all_kind_cq.depth,
       all_kind_cq.owner, all_kind_cq.handle, all_kind_cq.local_cq_id
     );
-    all_kind_srq.depth = 16;
+    all_kind_srq.depth = 32;
     all_kind_srq.max_sge = 4;
-    all_kind_srq.limit_threshold = 16;
+    all_kind_srq.limit_threshold = 20;
     all_kind_srq.queue_plan = make_queue_test_plan(
       "all_kind_srq_plan", RDMA_RESOURCE_SRQ, all_kind_srq.depth,
       all_kind_srq.owner, all_kind_srq.handle, all_kind_srq.local_srq_id
@@ -7083,13 +7083,13 @@ class rdma_resource_manager_test extends uvm_test;
       case (all_kind_resources[i].resource_kind())
         RDMA_RESOURCE_CQ: begin
           if (!$cast(all_kind_lookup_cq, resource) ||
-              all_kind_lookup_cq.cqe_size_bytes != 64)
+              all_kind_lookup_cq.cqe_size_bytes != 128)
             `uvm_error("ALL_KIND_CQ_METADATA",
                        "CQ lookup lost entry-size metadata")
         end
         RDMA_RESOURCE_SRQ: begin
           if (!$cast(all_kind_lookup_srq, resource) ||
-              all_kind_lookup_srq.limit_threshold != 16)
+              all_kind_lookup_srq.limit_threshold != 20)
             `uvm_error("ALL_KIND_SRQ_METADATA",
                        "SRQ lookup lost limit-threshold metadata")
         end
