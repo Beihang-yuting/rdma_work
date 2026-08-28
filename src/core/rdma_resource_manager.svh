@@ -519,6 +519,241 @@ class rdma_resource_manager extends uvm_object;
     return 1'b1;
   endfunction
 
+  protected function bit same_queue_ring_value(
+    rdma_queue_ring_layout lhs,
+    rdma_queue_ring_layout rhs
+  );
+    if (lhs == null || rhs == null)
+      return lhs == rhs;
+    if (lhs.role != rhs.role ||
+        lhs.entry_size_bytes != rhs.entry_size_bytes ||
+        lhs.depth != rhs.depth || lhs.logical_bytes != rhs.logical_bytes ||
+        lhs.storage_bytes != rhs.storage_bytes ||
+        lhs.page_count != rhs.page_count ||
+        lhs.initial_polarity != rhs.initial_polarity ||
+        lhs.pages.size() != rhs.pages.size())
+      return 1'b0;
+    foreach (lhs.pages[i]) begin
+      if (lhs.pages[i] == null || rhs.pages[i] == null ||
+          lhs.pages[i].role != rhs.pages[i].role ||
+          lhs.pages[i].mapping_offset != rhs.pages[i].mapping_offset ||
+          lhs.pages[i].logical_page_offset !=
+            rhs.pages[i].logical_page_offset ||
+          lhs.pages[i].page_iova.value != rhs.pages[i].page_iova.value ||
+          !same_mapping_value(lhs.pages[i].mapping, rhs.pages[i].mapping))
+        return 1'b0;
+    end
+    return 1'b1;
+  endfunction
+
+  protected function bit same_released_queue_context_value(
+    rdma_context_backing_ref authoritative,
+    rdma_context_backing_ref candidate
+  );
+    rdma_queue_slot_token_contract authoritative_token;
+    rdma_queue_slot_token_contract candidate_token;
+
+    if (authoritative == null || candidate == null)
+      return authoritative == candidate;
+    if (!$cast(authoritative_token, authoritative.slot_token) ||
+        !$cast(candidate_token, candidate.slot_token) ||
+        authoritative_token.completion_authority == null ||
+        candidate_token.completion_authority == null ||
+        authoritative_token.completion_authority !==
+          candidate_token.completion_authority ||
+        !candidate_token.completion_authority.complete ||
+        !candidate.release_complete ||
+        !same_handle_instance(authoritative.owner, candidate.owner) ||
+        authoritative.resource_kind != candidate.resource_kind ||
+        authoritative.local_id != candidate.local_id ||
+        authoritative.shadow_pointer_base.value !=
+          candidate.shadow_pointer_base.value ||
+        authoritative.slot_length != candidate.slot_length ||
+        authoritative.shadow_view_offset != candidate.shadow_view_offset ||
+        authoritative.shadow_view_length != candidate.shadow_view_length ||
+        authoritative.hmc_ref == null || candidate.hmc_ref == null ||
+        !same_mapping_handle_value(authoritative.hmc_ref.owner,
+                                   candidate.hmc_ref.owner) ||
+        authoritative.hmc_ref.object_kind != candidate.hmc_ref.object_kind ||
+        authoritative.hmc_ref.address.value != candidate.hmc_ref.address.value ||
+        authoritative.hmc_ref.size != candidate.hmc_ref.size ||
+        authoritative.hmc_ref.first_pbl_index !=
+          candidate.hmc_ref.first_pbl_index ||
+        authoritative.hmc_ref.ownership != candidate.hmc_ref.ownership ||
+        authoritative.hmc_ref.release_complete !=
+          candidate.hmc_ref.release_complete)
+      return 1'b0;
+    return 1'b1;
+  endfunction
+
+  protected function bit canonical_queue_reservation_release_recovery(
+    rdma_recovery_record recovery
+  );
+    int unsigned backing_completed;
+
+    if (recovery == null || !recovery.queue_recovery_valid ||
+        recovery.hardware_presence != RDMA_HW_PRESENCE_ABSENT ||
+        recovery.queue_intent != RDMA_QUEUE_RECOVER_CREATE_ROLLBACK ||
+        recovery.ambiguous_queue_operation != RDMA_QUEUE_AMBIG_NONE ||
+        recovery.ambiguous_ticket != null || recovery.queue_plan == null ||
+        recovery.pending_steps.size() != 1 ||
+        recovery.pending_steps[0] != RDMA_CTRL_STEP_RESOURCE_RELEASED)
+      return 1'b0;
+    backing_completed = 0;
+    foreach (recovery.completed_steps[i])
+      if (recovery.completed_steps[i] == RDMA_CTRL_STEP_BACKING_RELEASED)
+        backing_completed++;
+    return backing_completed == 1;
+  endfunction
+
+  protected function rdma_status queue_reservation_release_plan_status(
+    rdma_queue_backing_plan authoritative,
+    rdma_queue_backing_plan candidate
+  );
+    rdma_status status;
+    bit release_complete;
+
+    if (authoritative == null || candidate == null ||
+        authoritative.resource_kind != candidate.resource_kind ||
+        authoritative.rings.size() != candidate.rings.size() ||
+        authoritative.refs.size() != candidate.refs.size() ||
+        authoritative.flush_targets.size() != candidate.flush_targets.size() ||
+        ((authoritative.context_ref == null) !=
+         (candidate.context_ref == null)))
+      return rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT,
+        "queue reservation recovery plan shape changed"
+      );
+    foreach (authoritative.rings[i]) begin
+      if (!same_queue_ring_value(authoritative.rings[i], candidate.rings[i]))
+        return rdma_status::make(
+          RDMA_SC_INVALID_ARGUMENT,
+          "queue reservation recovery ring authority changed"
+        );
+    end
+    foreach (authoritative.refs[i]) begin
+      if (!same_queue_backing_ref_value(authoritative.refs[i],
+                                        candidate.refs[i]) ||
+          candidate.refs[i] == null || !candidate.refs[i].cleanup_complete)
+        return rdma_status::make(
+          RDMA_SC_INVALID_ARGUMENT,
+          "queue reservation recovery backing is not completely released"
+        );
+      if (candidate.refs[i].ownership == RDMA_OWNERSHIP_CONTROL_PLANE) begin
+        if (!same_owned_queue_backing_ref_authority(authoritative.refs[i],
+                                                    candidate.refs[i]))
+          return rdma_status::make(
+            RDMA_SC_INVALID_ARGUMENT,
+            "queue reservation recovery backing authority changed"
+          );
+        status = query_owned_release_completion(candidate.refs[i].mapping,
+                                                release_complete);
+        if (status == null || !status.ok() || !release_complete)
+          return rdma_status::make(
+            RDMA_SC_INVALID_ARGUMENT,
+            "queue reservation recovery backing lacks completion proof"
+          );
+        foreach (candidate.refs[i].additional_segments[j]) begin
+          status = query_owned_release_completion(
+            candidate.refs[i].additional_segments[j].mapping,
+            release_complete
+          );
+          if (status == null || !status.ok() || !release_complete)
+            return rdma_status::make(
+              RDMA_SC_INVALID_ARGUMENT,
+              "queue reservation recovery segment lacks completion proof"
+            );
+        end
+      end
+    end
+    if (candidate.context_ref != null &&
+        !same_released_queue_context_value(authoritative.context_ref,
+                                           candidate.context_ref))
+      return rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT,
+        "queue reservation recovery context lacks completion proof"
+      );
+    foreach (authoritative.flush_targets[i]) begin
+      if (authoritative.flush_targets[i] == null ||
+          candidate.flush_targets[i] == null ||
+          authoritative.flush_targets[i].role !=
+            candidate.flush_targets[i].role ||
+          authoritative.flush_targets[i].phase !=
+            candidate.flush_targets[i].phase ||
+          authoritative.flush_targets[i].flush_complete !=
+            candidate.flush_targets[i].flush_complete ||
+          !same_queue_backing_ref_value(
+            authoritative.flush_targets[i].pd_ref,
+            candidate.flush_targets[i].pd_ref
+          ) || !candidate.flush_targets[i].pd_ref.cleanup_complete)
+        return rdma_status::make(
+          RDMA_SC_INVALID_ARGUMENT,
+          "queue reservation recovery flush authority changed"
+        );
+    end
+    return rdma_status::success();
+  endfunction
+
+  protected function rdma_status queue_local_release_plan_status(
+    rdma_queue_backing_plan candidate
+  );
+    rdma_queue_slot_token_contract token;
+    rdma_status status;
+    bit release_complete;
+
+    if (candidate == null)
+      return rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT, "queue local release plan is missing"
+      );
+    foreach (candidate.refs[i]) begin
+      if (candidate.refs[i] == null || !candidate.refs[i].cleanup_complete)
+        return rdma_status::make(
+          RDMA_SC_INVALID_ARGUMENT,
+          "queue local release backing is incomplete"
+        );
+      if (candidate.refs[i].ownership == RDMA_OWNERSHIP_CONTROL_PLANE) begin
+        status = query_owned_release_completion(candidate.refs[i].mapping,
+                                                release_complete);
+        if (status == null || !status.ok() || !release_complete)
+          return rdma_status::make(
+            RDMA_SC_INVALID_ARGUMENT,
+            "queue local release backing proof is incomplete"
+          );
+        foreach (candidate.refs[i].additional_segments[j]) begin
+          status = query_owned_release_completion(
+            candidate.refs[i].additional_segments[j].mapping,
+            release_complete
+          );
+          if (status == null || !status.ok() || !release_complete)
+            return rdma_status::make(
+              RDMA_SC_INVALID_ARGUMENT,
+              "queue local release segment proof is incomplete"
+            );
+        end
+      end
+    end
+    if (candidate.context_ref != null) begin
+      if (!$cast(token, candidate.context_ref.slot_token) ||
+          token.completion_authority == null ||
+          !token.completion_authority.complete ||
+          !candidate.context_ref.release_complete)
+        return rdma_status::make(
+          RDMA_SC_INVALID_ARGUMENT,
+          "queue local release context proof is incomplete"
+        );
+    end
+    foreach (candidate.flush_targets[i]) begin
+      if (candidate.flush_targets[i] == null ||
+          candidate.flush_targets[i].pd_ref == null ||
+          !candidate.flush_targets[i].pd_ref.cleanup_complete)
+        return rdma_status::make(
+          RDMA_SC_INVALID_ARGUMENT,
+          "queue local release flush backing is incomplete"
+        );
+    end
+    return rdma_status::success();
+  endfunction
+
   // Completion is an adapter-defined opaque fact.  Invoke its virtual query
   // only on an authority-preserving clone, and reject any public value, type,
   // or handle-alias mutation at the hook boundary.
@@ -3949,6 +4184,8 @@ class rdma_resource_manager extends uvm_object;
       rdma_queue_backing_plan authoritative_plan;
       rdma_queue_backing_plan recovery_plan;
       bit transaction_local_recovery;
+      bit reservation_release_recovery;
+      bit has_resource_release_step;
 
       if (!recovery_copy.queue_recovery_valid ||
           !$cast(queue_replacement, replacement))
@@ -3957,6 +4194,18 @@ class rdma_resource_manager extends uvm_object;
           "queue ERROR recovery lacks authoritative queue plan"
         );
       transaction_local_recovery = queue_replacement.queue_plan == null;
+      reservation_release_recovery =
+        canonical_queue_reservation_release_recovery(recovery_copy);
+      has_resource_release_step = 1'b0;
+      foreach (recovery_copy.pending_steps[i])
+        if (recovery_copy.pending_steps[i] ==
+              RDMA_CTRL_STEP_RESOURCE_RELEASED)
+          has_resource_release_step = 1'b1;
+      if (has_resource_release_step && !reservation_release_recovery)
+        return rdma_status::make(
+          RDMA_SC_INVALID_ARGUMENT,
+          "queue reservation release recovery is not canonical"
+        );
       if (transaction_local_recovery) begin
         if (queue_replacement.state != RDMA_RESOURCE_ALLOCATED ||
             staged_allocations.exists(key) ||
@@ -3966,8 +4215,10 @@ class rdma_resource_manager extends uvm_object;
             recovery_copy.ambiguous_queue_operation != RDMA_QUEUE_AMBIG_NONE ||
             recovery_copy.ambiguous_ticket != null ||
             recovery_copy.pending_steps.size() != 1 ||
-            recovery_copy.pending_steps[0] !=
-              RDMA_CTRL_STEP_BACKING_RELEASED ||
+            !(recovery_copy.pending_steps[0] inside {
+              RDMA_CTRL_STEP_BACKING_RELEASED,
+              RDMA_CTRL_STEP_RESOURCE_RELEASED
+            }) ||
             recovery_copy.queue_plan == null ||
             recovery_copy.queue_plan.resource_kind !=
               queue_replacement.resource_kind())
@@ -4030,6 +4281,10 @@ class rdma_resource_manager extends uvm_object;
             RDMA_SC_INVALID_ARGUMENT,
             "unstaged queue ERROR context owner is not authoritative"
           );
+        if (reservation_release_recovery) begin
+          status = queue_local_release_plan_status(recovery_copy.queue_plan);
+          if (!status.ok()) return status;
+        end
         status = project_queue_plan_value(
           recovery_copy.queue_plan, "mark error transaction resource plan",
           authoritative_plan
@@ -4048,6 +4303,41 @@ class rdma_resource_manager extends uvm_object;
           return rdma_status::make(
             RDMA_SC_INVALID_STATE,
             "transaction recovery plan projection returned null"
+          );
+        if (!status.ok()) return status;
+        queue_replacement.queue_plan = authoritative_plan;
+        queue_replacement.depth = authoritative_plan.rings[0].depth;
+        recovery_copy.queue_plan = recovery_plan;
+        replacement = queue_replacement;
+      end
+      else if (reservation_release_recovery) begin
+        if (queue_replacement.state != RDMA_RESOURCE_ALLOCATED)
+          return rdma_status::make(
+            RDMA_SC_INVALID_STATE,
+            "queue reservation recovery requires ALLOCATED authority"
+          );
+        status = queue_reservation_release_plan_status(
+          queue_replacement.queue_plan, recovery_copy.queue_plan
+        );
+        if (!status.ok()) return status;
+        status = project_queue_plan_value(
+          recovery_copy.queue_plan,
+          "mark error reservation resource plan", authoritative_plan
+        );
+        if (status == null)
+          return rdma_status::make(
+            RDMA_SC_INVALID_STATE,
+            "reservation resource plan projection returned null"
+          );
+        if (!status.ok()) return status;
+        status = project_queue_plan_value(
+          recovery_copy.queue_plan,
+          "mark error reservation recovery plan", recovery_plan
+        );
+        if (status == null)
+          return rdma_status::make(
+            RDMA_SC_INVALID_STATE,
+            "reservation recovery plan projection returned null"
           );
         if (!status.ok()) return status;
         queue_replacement.queue_plan = authoritative_plan;
@@ -4298,6 +4588,8 @@ class rdma_resource_manager extends uvm_object;
 
   virtual function rdma_status release_reserved(rdma_handle handle);
     rdma_resource authoritative;
+    rdma_queue_resource queue_resource;
+    rdma_recovery_record recovery;
     rdma_status status;
     string key;
 
@@ -4316,6 +4608,34 @@ class rdma_resource_manager extends uvm_object;
         RDMA_SC_INVALID_STATE,
         "Function resources require privileged Function teardown"
       );
+    if (registry[key].state == RDMA_RESOURCE_ERROR) begin
+      if (!recovery_records.exists(key))
+        return rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "ERROR reservation has no recovery record"
+        );
+      recovery = recovery_records[key];
+      if (!$cast(queue_resource, registry[key]) ||
+          !canonical_queue_reservation_release_recovery(recovery))
+        return rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "ERROR resource is not a queue reservation release recovery"
+        );
+      status = queue_reservation_release_plan_status(
+        queue_resource.queue_plan, recovery.queue_plan
+      );
+      if (!status.ok()) return status;
+      if (has_dependents(registry[key]))
+        return rdma_status::make(RDMA_SC_RESOURCE_BUSY,
+                                 "resource still has live dependents");
+      if (registry[key].outstanding_ids.size() != 0)
+        return rdma_status::make(
+          RDMA_SC_RESOURCE_BUSY,
+          "resource still has outstanding operations"
+        );
+      force_release_key(key);
+      return rdma_status::success();
+    end
     if (registry[key].state != RDMA_RESOURCE_ALLOCATED)
       return rdma_status::make(
         RDMA_SC_INVALID_STATE,

@@ -2722,7 +2722,7 @@ class rdma_queue_lifecycle_test extends uvm_test;
   endtask
 
   task automatic check_executor_prestage_cleanup_recovery();
-    for (int unsigned mode = 0; mode < 2; mode++) begin
+    for (int unsigned mode = 0; mode < 3; mode++) begin
       string label;
       rdma_resource_kind_e kind;
       rdma_function_binding binding;
@@ -2740,7 +2740,11 @@ class rdma_queue_lifecycle_test extends uvm_test;
       rdma_status cleanup_failure;
       rdma_status status;
 
-      kind = mode == 0 ? RDMA_RESOURCE_CQ : RDMA_RESOURCE_CEQ;
+      case (mode)
+        0: kind = RDMA_RESOURCE_CQ;
+        1: kind = RDMA_RESOURCE_CEQ;
+        default: kind = RDMA_RESOURCE_AEQ;
+      endcase
       label = $sformatf("EXEC_PRESTAGE_%s_CLEANUP", kind.name());
       binding = make_binding({label, "_binding"});
       manager = rdma_fault_inject_resource_manager::type_id::create(
@@ -2807,6 +2811,155 @@ class rdma_queue_lifecycle_test extends uvm_test;
       end
       else if (count_executor_host_calls(mem, "release") != 3)
         `uvm_error(label, "EQ pre-stage retry used the wrong host authority")
+    end
+  endtask
+
+  task automatic check_executor_reservation_release_recovery();
+    rdma_resource_kind_e kinds[$];
+
+    kinds.push_back(RDMA_RESOURCE_CQ);
+    kinds.push_back(RDMA_RESOURCE_CEQ);
+    kinds.push_back(RDMA_RESOURCE_AEQ);
+    foreach (kinds[kind_index]) begin
+      string label;
+      rdma_resource_kind_e kind;
+      rdma_function_binding binding;
+      rdma_fault_inject_resource_manager manager;
+      rdma_ceq dependency;
+      rdma_queue_executor_trace_mem mem;
+      rdma_queue_executor_trace_context context_backing;
+      rdma_mock_cmq_port cmq;
+      rdma_queue_lifecycle_executor executor;
+      rdma_semantic_request request;
+      rdma_queue_resource queue;
+      rdma_control_result result;
+      rdma_recovery_record recovery;
+      rdma_resource snapshot;
+      rdma_status primary;
+      rdma_status release_failure;
+      rdma_status status;
+      int unsigned host_release_count;
+      int unsigned context_release_count;
+      bit release_complete;
+
+      kind = kinds[kind_index];
+      label = $sformatf("EXEC_%s_RESERVATION_RELEASE_RECOVERY", kind.name());
+      binding = make_binding({label, "_binding"});
+      manager = rdma_fault_inject_resource_manager::type_id::create(
+        {label, "_manager"}
+      );
+      dependency = null;
+      if (kind == RDMA_RESOURCE_CQ)
+        expect_status({label, "_DEPENDENCY"},
+                      manager.create_ceq(binding, dependency), RDMA_SC_OK);
+      mem = rdma_queue_executor_trace_mem::type_id::create({label, "_mem"});
+      mem.queue_kind = kind;
+      context_backing = rdma_queue_executor_trace_context::type_id::create(
+        {label, "_context"}
+      );
+      cmq = rdma_mock_cmq_port::type_id::create({label, "_cmq"});
+      executor = rdma_queue_lifecycle_executor::type_id::create(
+        {label, "_executor"}
+      );
+      expect_status({label, "_CONFIGURE"}, executor.configure(
+        manager, cmq, mem, context_backing, 100ns), RDMA_SC_OK);
+      request = make_executor_request({label, "_request"}, kind, binding,
+                                      dependency, 1'b0);
+      primary = rdma_status::make(RDMA_SC_UNKNOWN_HW_ERROR,
+                                  {label, " payload write"});
+      release_failure = rdma_status::make(RDMA_SC_RESOURCE_BUSY,
+                                          {label, " reservation release"});
+      void'(mem.fail_next("write", primary));
+      void'(manager.fail_next_transition("release_reserved", release_failure));
+
+      executor.create_locked(binding, binding.make_handle(), request,
+                             64'd430 + kind_index, queue, result);
+      status = manager.lookup_recovery(result.resource_h, recovery);
+      expect_status({label, "_RECOVERY"}, status, RDMA_SC_OK);
+      if (result == null || result.status == null ||
+          result.primary_status == null ||
+          result.status.code != RDMA_SC_RECOVERY_REQUIRED ||
+          result.primary_status.code != RDMA_SC_UNKNOWN_HW_ERROR ||
+          !result.recovery_required || !result.final_resource_state_known ||
+          result.final_resource_state != RDMA_RESOURCE_ERROR ||
+          queue == null || queue.state != RDMA_RESOURCE_ERROR ||
+          queue.queue_plan == null || recovery == null ||
+          recovery.queue_plan == null ||
+          recovery.queue_plan == queue.queue_plan ||
+          recovery.hardware_presence != RDMA_HW_PRESENCE_ABSENT ||
+          recovery.queue_intent != RDMA_QUEUE_RECOVER_CREATE_ROLLBACK ||
+          recovery.ambiguous_queue_operation != RDMA_QUEUE_AMBIG_NONE ||
+          recovery.ambiguous_ticket != null ||
+          count_executor_recovery_step(
+            recovery.pending_steps, RDMA_CTRL_STEP_RESOURCE_RELEASED
+          ) != 1 ||
+          count_executor_recovery_step(
+            recovery.pending_steps, RDMA_CTRL_STEP_BACKING_RELEASED
+          ) != 0 ||
+          count_executor_recovery_step(
+            recovery.completed_steps, RDMA_CTRL_STEP_BACKING_RELEASED
+          ) != 1 ||
+          count_executor_rollback_code(
+            result.rollback_statuses, RDMA_SC_RESOURCE_BUSY
+          ) != 1 || manager.release_reserved_calls != 1 ||
+          cmq.calls.size() != 0 || mem.live_allocations() != 0)
+        `uvm_error(label,
+                   "reservation release failure lost durable queue authority")
+      if (recovery != null && recovery.queue_plan != null) begin
+        foreach (recovery.queue_plan.refs[i]) begin
+          release_complete = 1'b0;
+          if (recovery.queue_plan.refs[i] == null ||
+              !recovery.queue_plan.refs[i].cleanup_complete ||
+              recovery.queue_plan.refs[i].mapping == null ||
+              recovery.queue_plan.refs[i].mapping.function_h == null ||
+              !recovery.queue_plan.refs[i].mapping.function_h.same_instance(
+                binding.make_handle()
+              ) ||
+              (recovery.queue_plan.refs[i].ownership ==
+                 RDMA_OWNERSHIP_CONTROL_PLANE &&
+               (recovery.queue_plan.refs[i].mapping.owner_h == null ||
+                !recovery.queue_plan.refs[i].mapping.owner_h.same_instance(
+                  result.resource_h
+                ) ||
+                recovery.queue_plan.refs[i].mapping.
+                  release_completion_status(release_complete) == null ||
+                !release_complete)))
+            `uvm_error(
+              label, "reservation recovery backing proof is not authoritative"
+            )
+        end
+        if ((kind == RDMA_RESOURCE_CQ &&
+             (recovery.queue_plan.context_ref == null ||
+              !recovery.queue_plan.context_ref.release_complete)) ||
+            (kind != RDMA_RESOURCE_CQ &&
+             recovery.queue_plan.context_ref != null))
+          `uvm_error(label,
+                     "reservation recovery context cleanup proof is invalid")
+      end
+
+      status = manager.mark_error(result.resource_h, recovery);
+      expect_status({label, "_REJECT_ERROR_REPLAY"}, status,
+                    RDMA_SC_INVALID_STATE);
+      host_release_count = count_executor_host_calls(mem, "release");
+      context_release_count = context_backing.release_call_count;
+      status = manager.release_reserved(result.resource_h);
+      expect_status({label, "_RETRY_RELEASE"}, status, RDMA_SC_OK);
+      status = manager.lookup(result.resource_h, snapshot);
+      expect_status({label, "_RETRY_RELEASED"}, status,
+                    RDMA_SC_INVALID_STATE);
+      status = manager.release_reserved(result.resource_h);
+      expect_status({label, "_RETRY_EXACTLY_ONCE"}, status,
+                    RDMA_SC_INVALID_STATE);
+      if (manager.release_reserved_calls != 3 ||
+          count_executor_host_calls(mem, "release") != host_release_count ||
+          context_backing.release_call_count != context_release_count ||
+          mem.live_allocations() != 0)
+        `uvm_error(label,
+                   "reservation retry repeated local or registry release")
+      if (dependency != null) begin
+        status = manager.release_reserved(dependency.handle);
+        expect_status({label, "_DEPENDENCY_RELEASED"}, status, RDMA_SC_OK);
+      end
     end
   endtask
 
@@ -3021,6 +3174,7 @@ class rdma_queue_lifecycle_test extends uvm_test;
     check_executor_cq_reset_cancelled();
     check_executor_local_cleanup_recovery();
     check_executor_prestage_cleanup_recovery();
+    check_executor_reservation_release_recovery();
     check_executor_eq_rollback_recovery();
     check_executor_srq_unsupported();
   endtask

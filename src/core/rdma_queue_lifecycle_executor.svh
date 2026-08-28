@@ -510,6 +510,50 @@ class rdma_queue_lifecycle_executor extends uvm_object;
     publish_failure(primary, result, RDMA_RESOURCE_ERROR, status.ok(), 1'b1);
   endfunction
 
+  protected function void retain_reservation_release_recovery(
+    rdma_queue_lifecycle_policy policy,
+    rdma_queue_resource resource,
+    rdma_queue_backing_plan plan,
+    rdma_cmq_command_desc create_command,
+    rdma_status primary,
+    rdma_control_result result,
+    output rdma_queue_resource queue
+  );
+    rdma_recovery_record recovery;
+    rdma_resource snapshot;
+    rdma_status status;
+
+    queue = null;
+    status = build_recovery(
+      policy, resource, plan, create_command, primary, result,
+      RDMA_HW_PRESENCE_ABSENT, RDMA_QUEUE_AMBIG_NONE, null,
+      1'b0, 1'b0, recovery
+    );
+    status = normalize_status(
+      status, "queue reservation recovery build returned null"
+    );
+    if (status.ok()) begin
+      recovery.pending_steps.push_back(RDMA_CTRL_STEP_RESOURCE_RELEASED);
+      status = normalize_status(
+        recovery.validate(), "queue reservation recovery validation returned null"
+      );
+    end
+    if (status.ok())
+      status = normalize_status(manager.mark_error(resource.handle, recovery),
+                                "queue reservation mark ERROR returned null");
+    if (!status.ok()) begin
+      append_rollback(result, status);
+    end
+    else begin
+      status = normalize_status(manager.lookup(resource.handle, snapshot),
+                                "queue reservation ERROR lookup returned null");
+      if (status.ok() && !$cast(queue, snapshot))
+        status = invalid_state("queue reservation ERROR snapshot type mismatch");
+      if (!status.ok()) append_rollback(result, status);
+    end
+    publish_failure(primary, result, RDMA_RESOURCE_ERROR, status.ok(), 1'b1);
+  endfunction
+
   protected task rollback_created(
     rdma_queue_lifecycle_policy policy,
     rdma_queue_resource resource,
@@ -612,8 +656,12 @@ class rdma_queue_lifecycle_executor extends uvm_object;
     status = normalize_status(status, "queue reservation release returned null");
     if (!status.ok()) begin
       append_rollback(result, status);
-      publish_failure(primary, result, RDMA_RESOURCE_ERROR,
-                      registry_programmed, 1'b1);
+      if (!registry_programmed)
+        retain_reservation_release_recovery(
+          policy, resource, plan, create_command, primary, result, queue
+        );
+      else
+        publish_failure(primary, result, RDMA_RESOURCE_ERROR, 1'b1, 1'b1);
       return;
     end
     result.completed_steps.push_back(RDMA_CTRL_STEP_RESOURCE_RELEASED);
@@ -645,6 +693,12 @@ class rdma_queue_lifecycle_executor extends uvm_object;
                                 "queue reservation release returned null");
       if (!status.ok()) begin
         append_rollback(result, status);
+        if (plan != null) begin
+          retain_reservation_release_recovery(
+            policy, resource, plan, create_command, primary, result, queue
+          );
+          return;
+        end
       end
       else result.completed_steps.push_back(RDMA_CTRL_STEP_RESOURCE_RELEASED);
     end
