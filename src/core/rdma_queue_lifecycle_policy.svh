@@ -26,6 +26,17 @@ virtual class rdma_queue_lifecycle_policy extends uvm_object;
   pure virtual function rdma_status build_flush_command(
     rdma_function_handle owner, rdma_queue_flush_target target,
     time timeout, output rdma_cmq_command_desc command);
+  // Classify a terminal QUERY completion as trustworthy hardware-presence
+  // evidence.  A successful status alone is deliberately insufficient: the
+  // response payload must authenticate to the profile's typed context codec
+  // and identify this queue's local object ID.  Inconclusive responses leave
+  // the outputs at UNKNOWN/0 and return a status suitable for continued
+  // recovery.
+  pure virtual function rdma_status classify_query_completion(
+    rdma_queue_resource resource,
+    rdma_cmq_completion completion,
+    output rdma_hw_presence_e presence,
+    output bit conclusive);
   pure virtual function void hardware_cleanup_roles(
     output rdma_queue_backing_role_e flush_roles[$],
     output rdma_queue_flush_phase_e flush_phases[$],
@@ -584,6 +595,210 @@ virtual class rdma_queue_lifecycle_policy extends uvm_object;
     return build_command_desc(owner, XTR_V1_OP_OCC_FLUSH, "occ_flush",
                               body, timeout, command);
   endfunction
+
+  // Build a context image suitable for QUERY decoding.  The returned query
+  // slices contain all object-identifying fields, while a few create-context
+  // builders require dependency handles that are not part of the queue's
+  // authoritative local-ID projection (for example a CQ's CEQ handle or an
+  // SRQ's PD handle).  Use harmless in-range placeholders for those fields;
+  // the query payload is overlaid below before decoding, so no placeholder
+  // can become presence evidence.
+  protected function rdma_status query_builder_view(
+    rdma_queue_resource resource,
+    output rdma_queue_resource builder_resource
+  );
+    uvm_object cloned_object;
+    rdma_cq cq;
+    rdma_srq srq;
+    rdma_handle placeholder;
+
+    builder_resource = null;
+    if (resource == null)
+      return invalid_argument("query resource is null");
+    cloned_object = resource.clone();
+    if (cloned_object == null || !$cast(builder_resource, cloned_object) ||
+        builder_resource == resource)
+      return invalid_state("query builder resource clone failed");
+    case (resource.resource_kind())
+      RDMA_RESOURCE_CQ: begin
+        if (!$cast(cq, builder_resource))
+          return invalid_state("query CQ builder projection failed");
+        // CQC's CEQN is in the returned payload.  A null dependency is
+        // explicitly supported by the CQC builder and avoids confusing the
+        // opaque registry incarnation ID with the 12-bit local CEQ ID.
+        cq.ceq_h = null;
+      end
+      RDMA_RESOURCE_SRQ: begin
+        if (!$cast(srq, builder_resource) || srq.pd_h == null)
+          return invalid_state("query SRQ builder projection failed");
+        placeholder = rdma_handle::type_id::create("query_pd_placeholder");
+        placeholder.kind = RDMA_RESOURCE_PD;
+        placeholder.function_uid = srq.handle.function_uid;
+        placeholder.generation = srq.handle.generation;
+        placeholder.object_id = 0;
+        srq.pd_h = placeholder;
+      end
+      default: begin
+      end
+    endcase
+    return rdma_status::success();
+  endfunction
+
+  protected function rdma_status classify_query_common(
+    rdma_queue_resource resource,
+    rdma_cmq_completion completion,
+    bit [7:0] expected_query_opcode,
+    bit [7:0] expected_create_opcode,
+    rdma_image_kind_e image_kind,
+    string object_type,
+    int unsigned payload_offset,
+    int unsigned payload_length,
+    bit [7:0] absent_ecode,
+    output rdma_hw_presence_e presence,
+    output bit conclusive
+  );
+    rdma_xtr_v1_cmq_completion payload;
+    rdma_queue_resource builder_resource;
+    rdma_queue_backing_plan plan;
+    rdma_hw_model canonical_model;
+    byte unsigned canonical_bytes[];
+    byte unsigned ignored_shadow[];
+    rdma_hw_image query_image;
+    rdma_codec_registry registry;
+    rdma_codec_key key;
+    rdma_codec_base codec;
+    rdma_hw_model decoded_model;
+    rdma_status status;
+    bit typed_match;
+
+    presence = RDMA_HW_PRESENCE_UNKNOWN;
+    conclusive = 1'b0;
+
+    if (resource == null || resource.handle == null || resource.owner == null)
+      return invalid_argument("query classification resource identity is incomplete");
+    if (resource.resource_kind() == RDMA_RESOURCE_CQ &&
+        image_kind != RDMA_IMAGE_CQC)
+      return invalid_state("query CQC image kind is inconsistent");
+    if (resource.resource_kind() == RDMA_RESOURCE_SRQ &&
+        image_kind != RDMA_IMAGE_SRQC)
+      return invalid_state("query SRQC image kind is inconsistent");
+    if (resource.resource_kind() == RDMA_RESOURCE_CEQ &&
+        image_kind != RDMA_IMAGE_CEQC)
+      return invalid_state("query CEQC image kind is inconsistent");
+    if (resource.resource_kind() == RDMA_RESOURCE_AEQ &&
+        image_kind != RDMA_IMAGE_AEQC)
+      return invalid_state("query AEQC image kind is inconsistent");
+
+    if (completion == null || completion.ticket == null ||
+        completion.ticket.opcode_key == null || completion.status == null)
+      return rdma_status::success();
+    if (!completion.status.ok() &&
+        completion.status.code inside {RDMA_SC_TIMEOUT,
+                                      RDMA_SC_RESET_CANCELLED})
+      return rdma_status::success();
+    if (completion.ticket.opcode_key.opcode != expected_query_opcode)
+      return rdma_status::success();
+    if (!$cast(payload, completion.decoded_response) || payload == null)
+      return rdma_status::success();
+    if (payload.opcode != expected_query_opcode ||
+        payload.opcode != completion.ticket.opcode_key.opcode)
+      return rdma_status::success();
+
+    // Error ecodes are meaningful only when authenticated to this exact
+    // query opcode.  Query errors commonly carry no object bytes, so apply
+    // the absent whitelist before the success-payload length check.
+    if (payload.command_ecode == absent_ecode) begin
+      presence = RDMA_HW_PRESENCE_ABSENT;
+      conclusive = 1'b1;
+      return rdma_status::success();
+    end
+    if (!completion.status.ok() || payload.object_payload.size() !=
+        payload_length)
+      return rdma_status::success();
+    if (payload_offset + payload_length > 64)
+      return invalid_state("query payload bounds exceed context image");
+
+    plan = resource.queue_plan;
+    if (plan == null || plan.resource_kind != resource.resource_kind())
+      return rdma_status::success();
+    status = query_builder_view(resource, builder_resource);
+    if (!status.ok())
+      return status;
+    status = build_create_context(builder_resource, plan, canonical_model,
+                                  canonical_bytes, ignored_shadow);
+    if (!status.ok() || canonical_model == null ||
+        canonical_bytes.size() != 64)
+      return status.ok() ? rdma_status::success() : status;
+
+    query_image = rdma_hw_image::type_id::create("query_context_image");
+    if (query_image == null)
+      return invalid_state("query context image allocation failed");
+    foreach (canonical_bytes[i]) query_image.bytes.push_back(canonical_bytes[i]);
+    foreach (payload.object_payload[i])
+      query_image.bytes[payload_offset + i] = payload.object_payload[i];
+    query_image.length = 64;
+    query_image.alignment = 64;
+    query_image.endian = RDMA_ENDIAN_BIG;
+    query_image.image_kind = image_kind;
+    query_image.hardware_version = XTR_V1_HW_VERSION;
+    query_image.function_generation = resource.owner.generation;
+    query_image.write_target_kind = RDMA_HW_TARGET_NONE;
+    query_image.backing_target = '0;
+    query_image.hmc_target = '0;
+    query_image.bar_target = '0;
+
+    registry = rdma_codec_registry::type_id::create("query_context_registry");
+    status = rdma_xtr_v1_register_context_body_codecs(registry);
+    if (!status.ok()) return status;
+    key.hw_version = "xtr_v1";
+    key.image_kind = image_kind;
+    key.object_type = object_type;
+    key.variant = "create";
+    key.opcode = expected_create_opcode;
+    status = registry.lookup(key, codec);
+    if (!status.ok()) return status;
+    status = codec.decode(query_image, decoded_model);
+    if (!status.ok() || decoded_model == null)
+      return rdma_status::success();
+
+    typed_match = 1'b0;
+    case (resource.resource_kind())
+      RDMA_RESOURCE_CQ: begin
+        rdma_cq cq;
+        rdma_cqc_model cqc;
+        typed_match = $cast(cq, resource) && $cast(cqc, decoded_model) &&
+                      cqc.cq_h != null && cqc.cq_h.kind == RDMA_RESOURCE_CQ &&
+                      cqc.cq_h.object_id == cq.local_cq_id;
+      end
+      RDMA_RESOURCE_SRQ: begin
+        rdma_srq srq;
+        rdma_srqc_model srqc;
+        typed_match = $cast(srq, resource) && $cast(srqc, decoded_model) &&
+                      srqc.srq_h != null && srqc.srq_h.kind == RDMA_RESOURCE_SRQ &&
+                      srqc.srq_h.object_id == srq.local_srq_id;
+      end
+      RDMA_RESOURCE_CEQ: begin
+        rdma_ceq ceq;
+        rdma_ceqc_model ceqc;
+        typed_match = $cast(ceq, resource) && $cast(ceqc, decoded_model) &&
+                      ceqc.ceq_h != null && ceqc.ceq_h.kind == RDMA_RESOURCE_CEQ &&
+                      ceqc.ceq_h.object_id == ceq.local_ceq_id;
+      end
+      RDMA_RESOURCE_AEQ: begin
+        rdma_aeq aeq;
+        rdma_aeqc_model aeqc;
+        typed_match = $cast(aeq, resource) && $cast(aeqc, decoded_model) &&
+                      aeqc.aeq_h != null && aeqc.aeq_h.kind == RDMA_RESOURCE_AEQ &&
+                      aeqc.aeq_h.object_id == aeq.local_aeq_id;
+      end
+      default: typed_match = 1'b0;
+    endcase
+    if (typed_match) begin
+      presence = RDMA_HW_PRESENCE_PRESENT;
+      conclusive = 1'b1;
+    end
+    return rdma_status::success();
+  endfunction
 endclass
 
 class rdma_cq_lifecycle_policy extends rdma_queue_lifecycle_policy;
@@ -784,6 +999,16 @@ class rdma_cq_lifecycle_policy extends rdma_queue_lifecycle_policy;
         target.phase != RDMA_QUEUE_FLUSH_POST_DELETE)
       return invalid_argument("CQ flush target is not CQ_PD/POST_DELETE");
     return build_pd_flush_desc(owner, target, timeout, command);
+  endfunction
+  virtual function rdma_status classify_query_completion(
+    rdma_queue_resource resource,
+    rdma_cmq_completion completion,
+    output rdma_hw_presence_e presence,
+    output bit conclusive
+  );
+    return classify_query_common(resource, completion, XTR_V1_OP_CQC_QUERY,
+      XTR_V1_OP_CQC_CREATE, RDMA_IMAGE_CQC, "cqc", 8, 56,
+      XTR_V1_ECODE_EC_RCE_CQC_INVLD, presence, conclusive);
   endfunction
   virtual function void hardware_cleanup_roles(output rdma_queue_backing_role_e flush_roles[$], output rdma_queue_flush_phase_e flush_phases[$], output bit delete_before_flush); flush_roles.delete(); flush_phases.delete(); delete_before_flush=1'b1; flush_roles.push_back(RDMA_QUEUE_ROLE_CQ_PD); flush_phases.push_back(RDMA_QUEUE_FLUSH_POST_DELETE); endfunction
   virtual function void local_cleanup_roles(output rdma_queue_backing_role_e roles[$], output bit release_context_first); roles.delete(); release_context_first=1'b1; roles.push_back(RDMA_QUEUE_ROLE_CQ_PD); roles.push_back(RDMA_QUEUE_ROLE_CQ_RING); endfunction
@@ -1021,6 +1246,16 @@ class rdma_srq_lifecycle_policy extends rdma_queue_lifecycle_policy;
       return invalid_argument("SRQ flush target is not a pre-delete PD");
     return build_pd_flush_desc(owner, target, timeout, command);
   endfunction
+  virtual function rdma_status classify_query_completion(
+    rdma_queue_resource resource,
+    rdma_cmq_completion completion,
+    output rdma_hw_presence_e presence,
+    output bit conclusive
+  );
+    return classify_query_common(resource, completion, XTR_V1_OP_SRFQC_QUERY,
+      XTR_V1_OP_SRFQC_CREATE, RDMA_IMAGE_SRQC, "srqc", 16, 32,
+      8'hff, presence, conclusive);
+  endfunction
   virtual function void hardware_cleanup_roles(output rdma_queue_backing_role_e flush_roles[$], output rdma_queue_flush_phase_e flush_phases[$], output bit delete_before_flush); flush_roles.delete(); flush_phases.delete(); delete_before_flush=1'b0; flush_roles.push_back(RDMA_QUEUE_ROLE_SRFQ_PD); flush_phases.push_back(RDMA_QUEUE_FLUSH_PRE_DELETE); flush_roles.push_back(RDMA_QUEUE_ROLE_SRQ_PD); flush_phases.push_back(RDMA_QUEUE_FLUSH_PRE_DELETE); endfunction
   virtual function void local_cleanup_roles(output rdma_queue_backing_role_e roles[$], output bit release_context_first); roles.delete(); release_context_first=1'b1; roles.push_back(RDMA_QUEUE_ROLE_SRFQ_PD); roles.push_back(RDMA_QUEUE_ROLE_SRQ_PD); roles.push_back(RDMA_QUEUE_ROLE_SRQ_SGB); roles.push_back(RDMA_QUEUE_ROLE_SRFQ_RING); roles.push_back(RDMA_QUEUE_ROLE_SRQ_RING); endfunction
 endclass
@@ -1212,6 +1447,16 @@ class rdma_ceq_lifecycle_policy extends rdma_queue_lifecycle_policy;
     command = null;
     return unsupported("CEQ lifecycle has no OCC flush command");
   endfunction
+  virtual function rdma_status classify_query_completion(
+    rdma_queue_resource resource,
+    rdma_cmq_completion completion,
+    output rdma_hw_presence_e presence,
+    output bit conclusive
+  );
+    return classify_query_common(resource, completion, XTR_V1_OP_CEQC_QUERY,
+      XTR_V1_OP_CEQC_CREATE, RDMA_IMAGE_CEQC, "ceqc", 16, 32,
+      XTR_V1_ECODE_EC_RCE_CEQC_INVLD, presence, conclusive);
+  endfunction
   virtual function void hardware_cleanup_roles(output rdma_queue_backing_role_e flush_roles[$], output rdma_queue_flush_phase_e flush_phases[$], output bit delete_before_flush); flush_roles.delete(); flush_phases.delete(); delete_before_flush=1'b1; endfunction
   virtual function void local_cleanup_roles(output rdma_queue_backing_role_e roles[$], output bit release_context_first); roles.delete(); release_context_first=1'b0; roles.push_back(RDMA_QUEUE_ROLE_CEQ_PD); roles.push_back(RDMA_QUEUE_ROLE_CEQ_RING); endfunction
 endclass
@@ -1402,6 +1647,16 @@ class rdma_aeq_lifecycle_policy extends rdma_queue_lifecycle_policy;
     time timeout, output rdma_cmq_command_desc command);
     command = null;
     return unsupported("AEQ lifecycle has no OCC flush command");
+  endfunction
+  virtual function rdma_status classify_query_completion(
+    rdma_queue_resource resource,
+    rdma_cmq_completion completion,
+    output rdma_hw_presence_e presence,
+    output bit conclusive
+  );
+    return classify_query_common(resource, completion, XTR_V1_OP_AEQC_QUERY,
+      XTR_V1_OP_AEQC_CREATE, RDMA_IMAGE_AEQC, "aeqc", 16, 32,
+      XTR_V1_ECODE_EC_RCE_AEQC_INVLD, presence, conclusive);
   endfunction
   virtual function void hardware_cleanup_roles(output rdma_queue_backing_role_e flush_roles[$], output rdma_queue_flush_phase_e flush_phases[$], output bit delete_before_flush); flush_roles.delete(); flush_phases.delete(); delete_before_flush=1'b1; endfunction
   virtual function void local_cleanup_roles(output rdma_queue_backing_role_e roles[$], output bit release_context_first); roles.delete(); release_context_first=1'b0; roles.push_back(RDMA_QUEUE_ROLE_AEQ_PD); roles.push_back(RDMA_QUEUE_ROLE_AEQ_RING); endfunction

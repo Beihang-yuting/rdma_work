@@ -3117,6 +3117,7 @@ class rdma_control_plane extends uvm_object;
     rdma_function_handle locked_owner;
     rdma_resource resource;
     rdma_mr error_mr;
+    rdma_queue_resource error_queue;
     rdma_recovery_record recovery;
     rdma_cmq_ticket ticket;
     rdma_cmq_completion completion;
@@ -3163,10 +3164,17 @@ class rdma_control_plane extends uvm_object;
                                 "recovery Function check returned null");
         break;
       end
-      if (resource_h == null || resource_h.kind != RDMA_RESOURCE_MR) begin
-        status = invalid_argument("recovery requires an MR handle");
+      if (resource_h == null ||
+          !(resource_h.kind inside {RDMA_RESOURCE_MR, RDMA_RESOURCE_CQ,
+                                    RDMA_RESOURCE_SRQ, RDMA_RESOURCE_CEQ,
+                                    RDMA_RESOURCE_AEQ})) begin
+        status = invalid_argument("recovery handle kind is unsupported");
         break;
       end
+      status = queue_target_owner_status(resource_h, owner,
+                                         "recovery target");
+      if (status == null || !status.ok())
+        break;
 
       acquire_function_lock(owner, function_lock);
       status = binding_owner_status(binding, locked_owner);
@@ -3188,6 +3196,37 @@ class rdma_control_plane extends uvm_object;
       status = checked_status(status, "recovery lookup returned null");
       if (!status.ok())
         break;
+
+      // Queue recovery is policy-driven and lives in the queue executor.  Do
+      // this dispatch while the same per-Function lock used by create/destroy
+      // is held; the executor never allocates IDs or acquires another lock.
+      if (resource_h.kind inside {RDMA_RESOURCE_CQ, RDMA_RESOURCE_SRQ,
+                                  RDMA_RESOURCE_CEQ, RDMA_RESOURCE_AEQ}) begin
+        if (queue_executor == null) begin
+          status = invalid_state("queue lifecycle executor is unavailable");
+          break;
+        end
+        if (!$cast(error_queue, resource) || error_queue == null ||
+            error_queue.state != RDMA_RESOURCE_ERROR) begin
+          status = invalid_state("recovery requires an ERROR queue");
+          break;
+        end
+        status = same_owner_status(error_queue.owner, locked_owner,
+                                   "recovery queue");
+        if (status == null || !status.ok())
+          break;
+        queue_executor.recover_locked(
+          binding, locked_owner, resource_h, transaction_id, result
+        );
+        if (result == null) begin
+          result = make_result();
+          result.transaction_id = transaction_id;
+          status = invalid_state("queue recovery executor returned null result");
+          break;
+        end
+        result_finalized = 1'b1;
+        break;
+      end
       if (!$cast(error_mr, resource) || error_mr == null ||
           error_mr.state != RDMA_RESOURCE_ERROR) begin
         status = invalid_state("recovery requires an ERROR MR");

@@ -206,10 +206,28 @@ class rdma_mock_cmq_outcome extends uvm_object;
 
   rdma_mock_cmq_outcome_kind_e kind;
   rdma_status status;
+  // Optional decoded payload used by scripted QUERY completions.
+  uvm_object decoded_response;
 
   function new(string name = "rdma_mock_cmq_outcome");
     super.new(name);
     kind = RDMA_MOCK_CMQ_COMPLETION;
+    status = null;
+    decoded_response = null;
+  endfunction
+endclass
+
+class rdma_mock_cmq_reconcile_script extends uvm_object;
+  `uvm_object_utils(rdma_mock_cmq_reconcile_script)
+
+  bit terminal_known;
+  rdma_cmq_completion completion;
+  rdma_status status;
+
+  function new(string name = "rdma_mock_cmq_reconcile_script");
+    super.new(name);
+    terminal_known = 1'b0;
+    completion = null;
     status = null;
   endfunction
 endclass
@@ -225,6 +243,7 @@ class rdma_mock_cmq_port extends rdma_cmq_port;
   protected longint unsigned next_sequence;
   protected rdma_mock_cmq_outcome outcomes[bit [7:0]][$];
   protected rdma_cmq_completion late_completions[string][$];
+  protected rdma_mock_cmq_reconcile_script reconcile_scripts[string][$];
   protected rdma_mock_cmq_snapshot_engine snapshot_engine;
   protected bit gate_enabled;
   protected bit [7:0] gated_opcode;
@@ -237,6 +256,9 @@ class rdma_mock_cmq_port extends rdma_cmq_port;
   function new(string name = "rdma_mock_cmq_port");
     super.new(name);
     calls.delete();
+    outcomes.delete();
+    late_completions.delete();
+    reconcile_scripts.delete();
     next_sequence = 1;
     entered = new({name, "_entered"});
     release_gate = new({name, "_release_gate"});
@@ -489,6 +511,66 @@ class rdma_mock_cmq_port extends rdma_cmq_port;
     outcomes[opcode].push_back(outcome);
   endfunction
 
+  // Queue recovery tests can prescribe reconciliation independently of the
+  // late-completion FIFO.  The script is keyed by the complete ticket
+  // identity, so unrelated commands cannot consume its terminal evidence.
+  function void script_reconcile(
+    rdma_cmq_ticket ticket,
+    bit terminal_known,
+    rdma_cmq_completion completion,
+    rdma_status status
+  );
+    rdma_mock_cmq_reconcile_script script;
+    uvm_object cloned_object;
+    rdma_cmq_completion completion_copy;
+    string key;
+
+    if (ticket == null || ticket.function_h == null || ticket.cmq_h == null ||
+        ticket.opcode_key == null)
+      return;
+    key = ticket_key(ticket);
+    script = rdma_mock_cmq_reconcile_script::type_id::create(
+      "mock_reconcile_script"
+    );
+    script.terminal_known = terminal_known;
+    script.status = status == null ? rdma_status::success() :
+                    rdma_cmq_clone_status_value(status);
+    if (completion != null) begin
+      cloned_object = completion.clone();
+      if (cloned_object != null && $cast(completion_copy, cloned_object)) begin
+        if (completion_copy.ticket == null)
+          completion_copy.ticket = rdma_cmq_clone_ticket_value(
+            ticket, "scripted reconcile ticket"
+          );
+        script.completion = completion_copy;
+      end
+    end
+    reconcile_scripts[key].push_back(script);
+  endfunction
+
+  // Script a terminal QUERY result.  Response payload may be a
+  // rdma_xtr_v1_cmq_completion payload or any other uvm_object; the policy
+  // classifier decides whether the object is authentic evidence.
+  function void script_query_context(
+    bit [7:0] opcode,
+    uvm_object response_context,
+    rdma_status status
+  );
+    rdma_mock_cmq_outcome outcome;
+
+    if (status == null)
+      return;
+    outcome = rdma_mock_cmq_outcome::type_id::create(
+      "mock_query_outcome"
+    );
+    outcome.kind = RDMA_MOCK_CMQ_COMPLETION;
+    outcome.status = rdma_cmq_clone_status_value(status);
+    outcome.decoded_response = rdma_cmq_clone_object_value(
+      response_context, "scripted query response"
+    );
+    outcomes[opcode].push_back(outcome);
+  endfunction
+
   function void push_late_completion(
     rdma_cmq_ticket ticket,
     rdma_status status
@@ -590,6 +672,11 @@ class rdma_mock_cmq_port extends rdma_cmq_port;
       result_status = (outcome == null) ? rdma_status::success() :
                       rdma_cmq_clone_status_value(outcome.status);
       completion = make_completion(ticket, result_status, 1'b1);
+      if (completion != null && outcome != null &&
+          outcome.decoded_response != null)
+        completion.decoded_response = rdma_cmq_clone_object_value(
+          outcome.decoded_response, "mock scripted query response"
+        );
     end
     if (result_status == null || completion == null ||
         completion.status == null) begin
@@ -611,6 +698,9 @@ class rdma_mock_cmq_port extends rdma_cmq_port;
     output rdma_status status
   );
     rdma_status validation_status;
+    rdma_mock_cmq_reconcile_script script;
+    uvm_object cloned_object;
+    rdma_cmq_completion completion_copy;
     string key;
 
     terminal_known = 1'b0;
@@ -626,6 +716,31 @@ class rdma_mock_cmq_port extends rdma_cmq_port;
       return;
     end
     key = ticket_key(ticket);
+    if (reconcile_scripts.exists(key) &&
+        reconcile_scripts[key].size() != 0) begin
+      script = reconcile_scripts[key].pop_front();
+      if (script == null) begin
+        status = invalid_state("mock reconcile script is null");
+        return;
+      end
+      terminal_known = script.terminal_known;
+      status = script.status == null ? rdma_status::success() :
+               rdma_cmq_clone_status_value(script.status);
+      if (script.completion != null) begin
+        cloned_object = script.completion.clone();
+        if (cloned_object == null || !$cast(completion_copy, cloned_object)) begin
+          completion = null;
+          status = invalid_state("mock reconcile script completion clone failed");
+          return;
+        end
+        if (completion_copy.ticket == null)
+          completion_copy.ticket = rdma_cmq_clone_ticket_value(
+            ticket, "mock scripted reconcile ticket"
+          );
+        completion = completion_copy;
+      end
+      return;
+    end
     if (!late_completions.exists(key) || late_completions[key].size() == 0) begin
       status = rdma_status::success();
       return;

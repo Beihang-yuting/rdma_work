@@ -365,8 +365,38 @@ class rdma_queue_lifecycle_executor extends uvm_object;
     if (plan == null)
       return rdma_status::success();
     if (plan.context_ref != null && !plan.context_ref.release_complete) begin
-      status = normalize_status(context_backing.\release (plan.context_ref),
-                                "queue context release returned null");
+      bit context_complete;
+
+      context_complete = 1'b0;
+      if (context_backing == null) begin
+        status = invalid_state("queue context backing adapter is unavailable");
+      end
+      else begin
+        // A context release can complete remotely while the process is
+        // between the adapter call and its durable progress update.  Always
+        // consult the opaque completion authority first so a retry never
+        // invokes release twice.
+        status = normalize_status(
+          context_backing.query_release_completion(
+            plan.context_ref, context_complete
+          ), "queue context completion query returned null"
+        );
+        if (status.ok() && !context_complete)
+          status = normalize_status(
+            context_backing.\release (plan.context_ref),
+            "queue context release returned null"
+          );
+        if (status.ok()) begin
+          context_complete = 1'b0;
+          status = normalize_status(
+            context_backing.query_release_completion(
+              plan.context_ref, context_complete
+            ), "queue context completion recheck returned null"
+          );
+          if (status.ok() && !context_complete)
+            status = invalid_state("queue context release did not complete");
+        end
+      end
       if (!status.ok()) begin
         append_rollback(result, status);
         if (first_failure == null) first_failure = status;
@@ -640,6 +670,185 @@ class rdma_queue_lifecycle_executor extends uvm_object;
     publish_failure(primary, result, RDMA_RESOURCE_ERROR, status.ok(), 1'b1);
   endfunction
 
+  // Recovery metadata is intentionally manipulated through small, local
+  // helpers rather than relying on queue ordering in pending_steps.  The
+  // latter is a coarse transaction history; the authoritative per-role
+  // completion bits live in queue_plan and are updated atomically by the
+  // resource manager.
+  protected function bit recovery_step_completed(
+    rdma_recovery_record recovery,
+    rdma_control_step_e step
+  );
+    if (recovery == null)
+      return 1'b0;
+    foreach (recovery.completed_steps[i])
+      if (recovery.completed_steps[i] == step)
+        return 1'b1;
+    return 1'b0;
+  endfunction
+
+  protected function bit recovery_step_pending(
+    rdma_recovery_record recovery,
+    rdma_control_step_e step
+  );
+    if (recovery == null)
+      return 1'b0;
+    foreach (recovery.pending_steps[i])
+      if (recovery.pending_steps[i] == step)
+        return 1'b1;
+    return 1'b0;
+  endfunction
+
+  protected function void recovery_remove_step(
+    rdma_recovery_record recovery,
+    rdma_control_step_e step
+  );
+    if (recovery == null)
+      return;
+    for (int i = int'(recovery.pending_steps.size()) - 1; i >= 0; i--)
+      if (recovery.pending_steps[i] == step)
+        recovery.pending_steps.delete(i);
+  endfunction
+
+  protected function void recovery_complete_step(
+    rdma_recovery_record recovery,
+    rdma_control_step_e step
+  );
+    if (recovery == null)
+      return;
+    recovery_remove_step(recovery, step);
+    if (!recovery_step_completed(recovery, step))
+      recovery.completed_steps.push_back(step);
+  endfunction
+
+  protected function void recovery_queue_step(
+    rdma_recovery_record recovery,
+    rdma_control_step_e step
+  );
+    if (recovery == null || recovery_step_completed(recovery, step) ||
+        recovery_step_pending(recovery, step))
+      return;
+    recovery.pending_steps.push_back(step);
+  endfunction
+
+  protected function rdma_status queue_policy_for_kind(
+    rdma_resource_kind_e kind,
+    output rdma_queue_lifecycle_policy policy
+  );
+    policy = null;
+    case (kind)
+      RDMA_RESOURCE_CQ:  policy = cq_policy;
+      RDMA_RESOURCE_SRQ: policy = srq_policy;
+      RDMA_RESOURCE_CEQ: policy = ceq_policy;
+      RDMA_RESOURCE_AEQ: policy = aeq_policy;
+      default:
+        return rdma_status::make(RDMA_SC_UNSUPPORTED_OPCODE,
+                                 "queue recovery kind is unsupported");
+    endcase
+    if (policy == null)
+      return invalid_state("queue recovery policy is unavailable");
+    return rdma_status::success();
+  endfunction
+
+  protected function void project_queue_recovery_result(
+    rdma_recovery_record recovery,
+    rdma_control_result result
+  );
+    if (recovery == null || result == null)
+      return;
+    result.completed_steps = recovery.completed_steps;
+    result.primary_status = rdma_cmq_clone_status_value(
+      recovery.primary_status
+    );
+    result.rollback_statuses.delete();
+    foreach (recovery.rollback_statuses[i])
+      result.rollback_statuses.push_back(
+        rdma_cmq_clone_status_value(recovery.rollback_statuses[i])
+      );
+  endfunction
+
+  protected function void publish_queue_recovery_required(
+    rdma_recovery_record recovery,
+    rdma_control_result result,
+    string message
+  );
+    project_queue_recovery_result(recovery, result);
+    result.status = rdma_status::make(RDMA_SC_RECOVERY_REQUIRED, message);
+    result.final_resource_state = RDMA_RESOURCE_ERROR;
+    result.final_resource_state_known = 1'b1;
+    result.recovery_required = 1'b1;
+  endfunction
+
+  protected function rdma_status persist_queue_recovery(
+    rdma_handle resource_h,
+    rdma_recovery_record recovery
+  );
+    rdma_status status;
+
+    if (manager == null || resource_h == null || recovery == null)
+      return invalid_argument("queue recovery persistence input is incomplete");
+    status = manager.mark_error(resource_h, recovery);
+    return normalize_status(status, "queue recovery persistence returned null");
+  endfunction
+
+  protected function bit queue_flushes_complete(
+    rdma_queue_backing_plan plan
+  );
+    if (plan == null)
+      return 1'b0;
+    foreach (plan.flush_targets[i]) begin
+      if (plan.flush_targets[i] == null ||
+          !plan.flush_targets[i].flush_complete)
+        return 1'b0;
+    end
+    return 1'b1;
+  endfunction
+
+  protected function bit queue_local_cleanup_complete(
+    rdma_queue_backing_plan plan
+  );
+    if (plan == null)
+      return 1'b0;
+    if (plan.context_ref != null && !plan.context_ref.release_complete)
+      return 1'b0;
+    foreach (plan.refs[i]) begin
+      if (plan.refs[i] == null)
+        return 1'b0;
+      // Borrowed mappings are detached, not released, and therefore retain
+      // cleanup_complete=0 by contract.
+      if (plan.refs[i].ownership == RDMA_OWNERSHIP_CONTROL_PLANE &&
+          !plan.refs[i].cleanup_complete)
+        return 1'b0;
+    end
+    return 1'b1;
+  endfunction
+
+  protected task execute_queue_command(
+    rdma_cmq_command_desc command,
+    output rdma_cmq_ticket ticket,
+    output rdma_cmq_completion completion,
+    output rdma_status status,
+    output bit ambiguous
+  );
+    rdma_status execute_status;
+
+    ticket = null;
+    completion = null;
+    ambiguous = 1'b0;
+    status = invalid_state("queue CMQ command was not executed");
+    if (cmq == null || command == null) begin
+      status = invalid_argument("queue CMQ command is incomplete");
+      return;
+    end
+    execute_status = null;
+    cmq.execute(command, ticket, completion, execute_status);
+    ambiguous = cmq_outcome_ambiguous(execute_status, ticket, completion);
+    status = normalize_status(execute_status,
+                              "queue CMQ execution returned null");
+    if (status.ok() && (completion == null || completion.status == null))
+      status = invalid_state("queue CMQ completion was lost");
+  endtask
+
   protected task rollback_created(
     rdma_queue_lifecycle_policy policy,
     rdma_queue_resource resource,
@@ -833,6 +1042,715 @@ class rdma_queue_lifecycle_executor extends uvm_object;
       (status.ok() ? RDMA_RESOURCE_RELEASED : RDMA_RESOURCE_ALLOCATED),
       resource != null, !status.ok());
   endfunction
+
+  // Recover an ERROR queue while the caller owns the per-Function lifecycle
+  // semaphore.  Transaction-ID allocation and locking deliberately remain in
+  // the control-plane facade; this task only advances the durable queue
+  // recipe and never publishes an ACTIVE object itself.
+  task recover_locked(
+    rdma_function_binding binding,
+    rdma_function_handle expected_owner,
+    rdma_handle resource_h,
+    longint unsigned transaction_id,
+    output rdma_control_result result
+  );
+    rdma_resource snapshot;
+    rdma_queue_resource queue;
+    rdma_queue_lifecycle_policy policy;
+    rdma_recovery_record recovery;
+    rdma_recovery_record refreshed;
+    rdma_cmq_command_desc command;
+    rdma_cmq_ticket ticket;
+    rdma_cmq_completion completion;
+    rdma_status status;
+    rdma_status completion_status;
+    rdma_status classify_status;
+    rdma_status persist_status;
+    rdma_status reconcile_status;
+    rdma_hw_presence_e query_presence;
+    bit query_conclusive;
+    bit terminal_known;
+    bit ambiguous;
+    bit done;
+    bit creation_origin;
+    bit local_done;
+    int target_index;
+    int unsigned i;
+    rdma_queue_backing_role_e target_role;
+    rdma_queue_flush_phase_e target_phase;
+
+    result = make_result(transaction_id);
+    done = 1'b0;
+    status = rdma_status::success();
+
+    do begin
+      if (transaction_id == 0) begin
+        status = invalid_argument("queue recovery transaction ID is zero");
+        break;
+      end
+      if (manager == null || cmq == null || command_timeout == 0) begin
+        status = invalid_state("queue recovery executor is not configured");
+        break;
+      end
+      if (binding == null || expected_owner == null || resource_h == null) begin
+        status = invalid_argument("queue recovery authority is incomplete");
+        break;
+      end
+      status = generation_status(binding, expected_owner);
+      if (!status.ok()) break;
+      status = queue_policy_for_kind(resource_h.kind, policy);
+      if (!status.ok()) break;
+
+      status = normalize_status(manager.lookup(resource_h, snapshot),
+                                "queue recovery lookup returned null");
+      if (!status.ok()) break;
+      if (!$cast(queue, snapshot) || queue == null ||
+          queue.state != RDMA_RESOURCE_ERROR) begin
+        status = invalid_state("queue recovery requires an ERROR queue");
+        break;
+      end
+      if (!same_owner(queue.owner, expected_owner)) begin
+        status = invalid_argument("queue recovery owner mismatch");
+        break;
+      end
+      result.resource_h = rdma_clone_handle_value(queue.handle,
+                                                   "queue recovery result");
+      status = normalize_status(manager.lookup_recovery(resource_h, recovery),
+                                "queue recovery record lookup returned null");
+      if (!status.ok()) break;
+      if (recovery == null || !recovery.queue_recovery_valid ||
+          recovery.queue_plan == null || recovery.primary_status == null) begin
+        status = invalid_state("queue recovery record is incomplete");
+        break;
+      end
+      if (recovery.resource_h == null ||
+          !recovery.resource_h.same_instance(queue.handle) ||
+          recovery.queue_plan.resource_kind != queue.resource_kind()) begin
+        status = invalid_state("queue recovery record identity is inconsistent");
+        break;
+      end
+      status = normalize_status(recovery.validate(),
+                                "queue recovery record validation returned null");
+      if (!status.ok()) break;
+      creation_origin = recovery.queue_intent == RDMA_QUEUE_RECOVER_CREATE_ROLLBACK;
+      project_queue_recovery_result(recovery, result);
+
+      // Reconcile any earlier ambiguous command before issuing another CMQ
+      // command for this queue.
+      if (recovery.ambiguous_ticket != null) begin
+        ticket = recovery.ambiguous_ticket;
+        terminal_known = 1'b0;
+        completion = null;
+        reconcile_status = null;
+        cmq.reconcile(ticket, terminal_known, completion, reconcile_status);
+        reconcile_status = normalize_status(reconcile_status,
+          "queue CMQ reconciliation returned null");
+        if (!terminal_known) begin
+          publish_queue_recovery_required(recovery, result,
+            "ambiguous queue command has no terminal result");
+          if (!reconcile_status.ok())
+            result.rollback_statuses.push_back(
+              rdma_cmq_clone_status_value(reconcile_status));
+          done = 1'b1;
+          break;
+        end
+        if (completion == null || completion.status == null) begin
+          recovery.rollback_statuses.push_back(
+            invalid_state("queue reconciliation completion is incomplete"));
+          void'(persist_queue_recovery(resource_h, recovery));
+          publish_queue_recovery_required(recovery, result,
+            "queue reconciliation still requires recovery");
+          done = 1'b1;
+          break;
+        end
+        completion_status = normalize_status(completion.status,
+          "queue reconciliation status returned null");
+        if (completion_status.code inside {RDMA_SC_TIMEOUT,
+                                          RDMA_SC_RESET_CANCELLED}) begin
+          publish_queue_recovery_required(recovery, result,
+            "queue reconciliation has no trustworthy terminal evidence");
+          done = 1'b1;
+          break;
+        end
+        if (ticket.opcode_key == null) begin
+          recovery.rollback_statuses.push_back(
+            invalid_state("queue reconciliation ticket has no opcode"));
+          void'(persist_queue_recovery(resource_h, recovery));
+          publish_queue_recovery_required(recovery, result,
+            "queue reconciliation ticket is invalid");
+          done = 1'b1;
+          break;
+        end
+
+        // A QUERY can itself be ambiguous.  Its terminal result is handled
+        // through the same ticket field, but is classified rather than
+        // projected as a create/delete completion.
+        if (ticket.opcode_key.opcode == query_opcode(queue.resource_kind())) begin
+          query_presence = RDMA_HW_PRESENCE_UNKNOWN;
+          query_conclusive = 1'b0;
+          classify_status = policy.classify_query_completion(
+            queue, completion, query_presence, query_conclusive);
+          classify_status = normalize_status(classify_status,
+            "queue QUERY classification returned null");
+          recovery.ambiguous_ticket = null;
+          if (classify_status.ok() && query_conclusive) begin
+            recovery.hardware_presence = query_presence;
+            if (query_presence == RDMA_HW_PRESENCE_ABSENT)
+              recovery_remove_step(recovery, RDMA_CTRL_STEP_HW_CONTEXT_DELETED);
+            else
+              recovery_queue_step(recovery, RDMA_CTRL_STEP_HW_CONTEXT_DELETED);
+            persist_status = persist_queue_recovery(resource_h, recovery);
+            if (!persist_status.ok()) begin
+              publish_queue_recovery_required(recovery, result,
+                "reconciled queue QUERY progress could not be persisted");
+              done = 1'b1;
+              break;
+            end
+          end
+          else begin
+            if (!classify_status.ok())
+              recovery.rollback_statuses.push_back(
+                rdma_cmq_clone_status_value(classify_status));
+            recovery.hardware_presence = RDMA_HW_PRESENCE_UNKNOWN;
+            persist_status = persist_queue_recovery(resource_h, recovery);
+            publish_queue_recovery_required(recovery, result,
+              "reconciled queue QUERY was inconclusive");
+            if (!persist_status.ok())
+              result.rollback_statuses.push_back(
+                rdma_cmq_clone_status_value(persist_status));
+            done = 1'b1;
+            break;
+          end
+        end
+        else if (ticket.opcode_key.opcode == create_opcode(queue.resource_kind())) begin
+          recovery.ambiguous_ticket = null;
+          if (completion_status.ok()) begin
+            recovery.hardware_presence = RDMA_HW_PRESENCE_PRESENT;
+            recovery_complete_step(recovery, RDMA_CTRL_STEP_HW_CONTEXT_CREATED);
+            recovery_queue_step(recovery, RDMA_CTRL_STEP_HW_CONTEXT_DELETED);
+          end
+          else begin
+            // Definitive create failure proves no queue object was installed.
+            recovery.hardware_presence = RDMA_HW_PRESENCE_ABSENT;
+            recovery_remove_step(recovery, RDMA_CTRL_STEP_HW_CONTEXT_DELETED);
+            recovery.rollback_statuses.push_back(
+              rdma_cmq_clone_status_value(completion_status));
+          end
+          persist_status = persist_queue_recovery(resource_h, recovery);
+          if (!persist_status.ok()) begin
+            publish_queue_recovery_required(recovery, result,
+              "reconciled queue create progress could not be persisted");
+            done = 1'b1;
+            break;
+          end
+        end
+        else if (ticket.opcode_key.opcode == delete_opcode(queue.resource_kind())) begin
+          recovery.ambiguous_ticket = null;
+          if (completion_status.ok()) begin
+            recovery.hardware_presence = RDMA_HW_PRESENCE_ABSENT;
+            recovery_complete_step(recovery, RDMA_CTRL_STEP_HW_CONTEXT_DELETED);
+          end
+          else begin
+            recovery.hardware_presence = RDMA_HW_PRESENCE_PRESENT;
+            recovery_queue_step(recovery, RDMA_CTRL_STEP_HW_CONTEXT_DELETED);
+            recovery.rollback_statuses.push_back(
+              rdma_cmq_clone_status_value(completion_status));
+          end
+          persist_status = persist_queue_recovery(resource_h, recovery);
+          if (!persist_status.ok()) begin
+            publish_queue_recovery_required(recovery, result,
+              "reconciled queue delete progress could not be persisted");
+            done = 1'b1;
+            break;
+          end
+          if (!completion_status.ok()) begin
+            publish_queue_recovery_required(recovery, result,
+              "queue delete terminal failure requires a retry");
+            done = 1'b1;
+            break;
+          end
+        end
+        else if (ticket.opcode_key.opcode == XTR_V1_OP_OCC_FLUSH) begin
+          recovery.ambiguous_ticket = null;
+          if (completion_status.ok()) begin
+            target_index = -1;
+            foreach (recovery.queue_plan.flush_targets[i]) begin
+              if (recovery.queue_plan.flush_targets[i] != null &&
+                  recovery.queue_plan.flush_targets[i].role ==
+                    recovery.ambiguous_role) begin
+                target_index = int'(i);
+                break;
+              end
+            end
+            if (target_index < 0) begin
+              recovery.rollback_statuses.push_back(
+                invalid_state("reconciled OCC target is missing"));
+              void'(persist_queue_recovery(resource_h, recovery));
+              publish_queue_recovery_required(recovery, result,
+                "queue OCC target cannot be identified");
+              done = 1'b1;
+              break;
+            end
+            if (!recovery.queue_plan.flush_targets[target_index].flush_complete) begin
+              status = normalize_status(
+                manager.record_queue_flush_complete(
+                  resource_h, recovery.ambiguous_role),
+                "reconciled queue OCC progress returned null");
+              if (!status.ok()) begin
+                recovery.rollback_statuses.push_back(
+                  rdma_cmq_clone_status_value(status));
+                void'(persist_queue_recovery(resource_h, recovery));
+                publish_queue_recovery_required(recovery, result,
+                  "reconciled queue OCC progress failed");
+                done = 1'b1;
+                break;
+              end
+            end
+            recovery.queue_plan.flush_targets[target_index].flush_complete = 1'b1;
+            recovery_complete_step(recovery, RDMA_CTRL_STEP_HW_OCC_FLUSHED);
+          end
+          else begin
+            // Keep this role incomplete and stop at the barrier.  A later
+            // recovery invocation may retry the exact target.
+            recovery.rollback_statuses.push_back(
+              rdma_cmq_clone_status_value(completion_status));
+            persist_status = persist_queue_recovery(resource_h, recovery);
+            publish_queue_recovery_required(recovery, result,
+              "queue OCC target still requires recovery");
+            if (!persist_status.ok())
+              result.rollback_statuses.push_back(
+                rdma_cmq_clone_status_value(persist_status));
+            done = 1'b1;
+            break;
+          end
+          persist_status = persist_queue_recovery(resource_h, recovery);
+          if (!persist_status.ok()) begin
+            publish_queue_recovery_required(recovery, result,
+              "reconciled queue OCC progress could not be persisted");
+            done = 1'b1;
+            break;
+          end
+        end
+        else begin
+          recovery.rollback_statuses.push_back(
+            rdma_status::make(RDMA_SC_UNSUPPORTED_OPCODE,
+                              "queue recovery ticket opcode is unsupported"));
+          void'(persist_queue_recovery(resource_h, recovery));
+          publish_queue_recovery_required(recovery, result,
+            "queue recovery ticket opcode is unsupported");
+          done = 1'b1;
+          break;
+        end
+      end
+
+      // If presence remains unknown, issue exactly one typed QUERY.  QUERY
+      // establishes only object presence, never OCC completion.
+      if (recovery.hardware_presence == RDMA_HW_PRESENCE_UNKNOWN &&
+          recovery.ambiguous_ticket == null) begin
+        status = normalize_status(policy.build_object_command(
+          query_opcode(queue.resource_kind()), expected_owner, queue,
+          command_timeout, command),
+          "queue recovery QUERY descriptor returned null");
+        if (!status.ok()) begin
+          recovery.rollback_statuses.push_back(
+            rdma_cmq_clone_status_value(status));
+          void'(persist_queue_recovery(resource_h, recovery));
+          publish_queue_recovery_required(recovery, result,
+            "queue QUERY descriptor could not be built");
+          done = 1'b1;
+          break;
+        end
+        execute_queue_command(command, ticket, completion, status, ambiguous);
+        if (ambiguous) begin
+          recovery.ambiguous_ticket = rdma_cmq_clone_ticket_value(
+            ticket, "queue QUERY recovery");
+          recovery.ambiguous_queue_operation =
+            (creation_origin && !recovery_step_completed(
+              recovery, RDMA_CTRL_STEP_HW_CONTEXT_CREATED)) ?
+              RDMA_QUEUE_AMBIG_CREATE : RDMA_QUEUE_AMBIG_DELETE;
+          persist_status = persist_queue_recovery(resource_h, recovery);
+          publish_queue_recovery_required(recovery, result,
+            "queue QUERY has no terminal result");
+          if (!persist_status.ok())
+            result.rollback_statuses.push_back(
+              rdma_cmq_clone_status_value(persist_status));
+          done = 1'b1;
+          break;
+        end
+        if (!status.ok() || completion == null || completion.status == null) begin
+          if (status == null) status = invalid_state("queue QUERY result is null");
+          recovery.rollback_statuses.push_back(
+            rdma_cmq_clone_status_value(status));
+          void'(persist_queue_recovery(resource_h, recovery));
+          publish_queue_recovery_required(recovery, result,
+            "queue QUERY failed to establish presence");
+          done = 1'b1;
+          break;
+        end
+        query_presence = RDMA_HW_PRESENCE_UNKNOWN;
+        query_conclusive = 1'b0;
+        classify_status = policy.classify_query_completion(
+          queue, completion, query_presence, query_conclusive);
+        classify_status = normalize_status(classify_status,
+          "queue QUERY classification returned null");
+        if (!classify_status.ok() || !query_conclusive) begin
+          if (!classify_status.ok())
+            recovery.rollback_statuses.push_back(
+              rdma_cmq_clone_status_value(classify_status));
+          void'(persist_queue_recovery(resource_h, recovery));
+          publish_queue_recovery_required(recovery, result,
+            "queue QUERY response is inconclusive");
+          done = 1'b1;
+          break;
+        end
+        recovery.hardware_presence = query_presence;
+        if (query_presence == RDMA_HW_PRESENCE_ABSENT)
+          recovery_remove_step(recovery, RDMA_CTRL_STEP_HW_CONTEXT_DELETED);
+        else
+          recovery_queue_step(recovery, RDMA_CTRL_STEP_HW_CONTEXT_DELETED);
+        persist_status = persist_queue_recovery(resource_h, recovery);
+        if (!persist_status.ok()) begin
+          publish_queue_recovery_required(recovery, result,
+            "queue QUERY progress could not be persisted");
+          done = 1'b1;
+          break;
+        end
+      end
+
+      if (recovery.hardware_presence == RDMA_HW_PRESENCE_UNKNOWN) begin
+        publish_queue_recovery_required(recovery, result,
+          "queue hardware presence remains unknown");
+        done = 1'b1;
+        break;
+      end
+
+      // Execute persisted OCC targets in order.  This enforces the SRQ
+      // pre-delete barrier and defers CQ post-delete flushes until absence.
+      for (i = 0; i < recovery.queue_plan.flush_targets.size(); i++) begin
+        if (recovery.queue_plan.flush_targets[i] == null) begin
+          recovery.rollback_statuses.push_back(
+            invalid_state("queue recovery flush target is null"));
+          void'(persist_queue_recovery(resource_h, recovery));
+          publish_queue_recovery_required(recovery, result,
+            "queue OCC recipe is invalid");
+          done = 1'b1;
+          break;
+        end
+        if (recovery.queue_plan.flush_targets[i].flush_complete)
+          continue;
+        target_phase = recovery.queue_plan.flush_targets[i].phase;
+        if (target_phase == RDMA_QUEUE_FLUSH_POST_DELETE &&
+            recovery.hardware_presence != RDMA_HW_PRESENCE_ABSENT)
+          continue;
+        target_role = recovery.queue_plan.flush_targets[i].role;
+        status = normalize_status(policy.build_flush_command(
+          expected_owner, recovery.queue_plan.flush_targets[i],
+          command_timeout, command),
+          "queue recovery OCC descriptor returned null");
+        if (!status.ok()) begin
+          recovery.rollback_statuses.push_back(
+            rdma_cmq_clone_status_value(status));
+          void'(persist_queue_recovery(resource_h, recovery));
+          publish_queue_recovery_required(recovery, result,
+            "queue OCC descriptor could not be built");
+          done = 1'b1;
+          break;
+        end
+        execute_queue_command(command, ticket, completion, status, ambiguous);
+        if (ambiguous) begin
+          recovery.ambiguous_ticket = rdma_cmq_clone_ticket_value(
+            ticket, "queue OCC recovery");
+          recovery.ambiguous_queue_operation = RDMA_QUEUE_AMBIG_OCC_FLUSH;
+          recovery.ambiguous_role = target_role;
+          persist_status = persist_queue_recovery(resource_h, recovery);
+          publish_queue_recovery_required(recovery, result,
+            "queue OCC target has no terminal result");
+          if (!persist_status.ok())
+            result.rollback_statuses.push_back(
+              rdma_cmq_clone_status_value(persist_status));
+          done = 1'b1;
+          break;
+        end
+        if (!status.ok()) begin
+          recovery.rollback_statuses.push_back(
+            rdma_cmq_clone_status_value(status));
+          persist_status = persist_queue_recovery(resource_h, recovery);
+          publish_queue_recovery_required(recovery, result,
+            "queue OCC target failed");
+          if (!persist_status.ok())
+            result.rollback_statuses.push_back(
+              rdma_cmq_clone_status_value(persist_status));
+          done = 1'b1;
+          break;
+        end
+        status = normalize_status(manager.record_queue_flush_complete(
+          resource_h, target_role), "queue OCC progress returned null");
+        if (!status.ok()) begin
+          recovery.rollback_statuses.push_back(
+            rdma_cmq_clone_status_value(status));
+          void'(persist_queue_recovery(resource_h, recovery));
+          publish_queue_recovery_required(recovery, result,
+            "queue OCC progress could not be persisted");
+          done = 1'b1;
+          break;
+        end
+        recovery.queue_plan.flush_targets[i].flush_complete = 1'b1;
+        recovery_complete_step(recovery, RDMA_CTRL_STEP_HW_OCC_FLUSHED);
+        persist_status = persist_queue_recovery(resource_h, recovery);
+        if (!persist_status.ok()) begin
+          publish_queue_recovery_required(recovery, result,
+            "queue OCC progress could not be persisted");
+          done = 1'b1;
+          break;
+        end
+      end
+      if (done) break;
+
+      // A PRESENT queue still needs delete.  For SRQ this is reached only
+      // after all pre-delete OCC targets above are complete.
+      if (recovery.hardware_presence == RDMA_HW_PRESENCE_PRESENT &&
+          !recovery_step_completed(recovery, RDMA_CTRL_STEP_HW_CONTEXT_DELETED)) begin
+        for (i = 0; i < recovery.queue_plan.flush_targets.size(); i++) begin
+          if (recovery.queue_plan.flush_targets[i] != null &&
+              recovery.queue_plan.flush_targets[i].phase ==
+                RDMA_QUEUE_FLUSH_PRE_DELETE &&
+              !recovery.queue_plan.flush_targets[i].flush_complete) begin
+            publish_queue_recovery_required(recovery, result,
+              "queue pre-delete OCC barrier is incomplete");
+            done = 1'b1;
+            break;
+          end
+        end
+        if (done) break;
+        status = normalize_status(policy.build_object_command(
+          delete_opcode(queue.resource_kind()), expected_owner, queue,
+          command_timeout, command),
+          "queue recovery delete descriptor returned null");
+        if (!status.ok()) begin
+          recovery.rollback_statuses.push_back(
+            rdma_cmq_clone_status_value(status));
+          void'(persist_queue_recovery(resource_h, recovery));
+          publish_queue_recovery_required(recovery, result,
+            "queue delete descriptor could not be built");
+          done = 1'b1;
+          break;
+        end
+        execute_queue_command(command, ticket, completion, status, ambiguous);
+        if (ambiguous) begin
+          recovery.ambiguous_ticket = rdma_cmq_clone_ticket_value(
+            ticket, "queue delete recovery");
+          recovery.ambiguous_queue_operation = RDMA_QUEUE_AMBIG_DELETE;
+          recovery.ambiguous_role = recovery.queue_plan.refs.size() == 0 ?
+            RDMA_QUEUE_ROLE_CQ_RING : recovery.queue_plan.refs[0].role;
+          recovery.hardware_presence = RDMA_HW_PRESENCE_UNKNOWN;
+          persist_status = persist_queue_recovery(resource_h, recovery);
+          publish_queue_recovery_required(recovery, result,
+            "queue delete has no terminal result");
+          if (!persist_status.ok())
+            result.rollback_statuses.push_back(
+              rdma_cmq_clone_status_value(persist_status));
+          done = 1'b1;
+          break;
+        end
+        if (!status.ok()) begin
+          recovery.hardware_presence = RDMA_HW_PRESENCE_PRESENT;
+          recovery_queue_step(recovery, RDMA_CTRL_STEP_HW_CONTEXT_DELETED);
+          recovery.rollback_statuses.push_back(
+            rdma_cmq_clone_status_value(status));
+          persist_status = persist_queue_recovery(resource_h, recovery);
+          publish_queue_recovery_required(recovery, result,
+            "queue delete failed");
+          if (!persist_status.ok())
+            result.rollback_statuses.push_back(
+              rdma_cmq_clone_status_value(persist_status));
+          done = 1'b1;
+          break;
+        end
+        recovery.hardware_presence = RDMA_HW_PRESENCE_ABSENT;
+        recovery_complete_step(recovery, RDMA_CTRL_STEP_HW_CONTEXT_DELETED);
+        persist_status = persist_queue_recovery(resource_h, recovery);
+        if (!persist_status.ok()) begin
+          publish_queue_recovery_required(recovery, result,
+            "queue delete progress could not be persisted");
+          done = 1'b1;
+          break;
+        end
+      end
+
+      if (recovery.hardware_presence != RDMA_HW_PRESENCE_ABSENT) begin
+        publish_queue_recovery_required(recovery, result,
+          "queue hardware absence is not proven");
+        done = 1'b1;
+        break;
+      end
+
+      // The first OCC loop intentionally skipped post-delete targets while
+      // PRESENT.  Revisit those targets after delete/QUERY absence.
+      for (i = 0; i < recovery.queue_plan.flush_targets.size(); i++) begin
+        if (recovery.queue_plan.flush_targets[i] == null ||
+            recovery.queue_plan.flush_targets[i].flush_complete ||
+            recovery.queue_plan.flush_targets[i].phase !=
+              RDMA_QUEUE_FLUSH_POST_DELETE)
+          continue;
+        target_role = recovery.queue_plan.flush_targets[i].role;
+        status = normalize_status(policy.build_flush_command(
+          expected_owner, recovery.queue_plan.flush_targets[i],
+          command_timeout, command),
+          "queue post-delete OCC descriptor returned null");
+        if (!status.ok()) begin
+          recovery.rollback_statuses.push_back(
+            rdma_cmq_clone_status_value(status));
+          void'(persist_queue_recovery(resource_h, recovery));
+          publish_queue_recovery_required(recovery, result,
+            "queue post-delete OCC descriptor failed");
+          done = 1'b1;
+          break;
+        end
+        execute_queue_command(command, ticket, completion, status, ambiguous);
+        if (ambiguous) begin
+          recovery.ambiguous_ticket = rdma_cmq_clone_ticket_value(
+            ticket, "queue post-delete OCC recovery");
+          recovery.ambiguous_queue_operation = RDMA_QUEUE_AMBIG_OCC_FLUSH;
+          recovery.ambiguous_role = target_role;
+          persist_status = persist_queue_recovery(resource_h, recovery);
+          publish_queue_recovery_required(recovery, result,
+            "queue post-delete OCC has no terminal result");
+          if (!persist_status.ok())
+            result.rollback_statuses.push_back(
+              rdma_cmq_clone_status_value(persist_status));
+          done = 1'b1;
+          break;
+        end
+        if (!status.ok()) begin
+          recovery.rollback_statuses.push_back(
+            rdma_cmq_clone_status_value(status));
+          persist_status = persist_queue_recovery(resource_h, recovery);
+          publish_queue_recovery_required(recovery, result,
+            "queue post-delete OCC failed");
+          if (!persist_status.ok())
+            result.rollback_statuses.push_back(
+              rdma_cmq_clone_status_value(persist_status));
+          done = 1'b1;
+          break;
+        end
+        status = normalize_status(manager.record_queue_flush_complete(
+          resource_h, target_role), "queue post-delete OCC progress returned null");
+        if (!status.ok()) begin
+          recovery.rollback_statuses.push_back(
+            rdma_cmq_clone_status_value(status));
+          void'(persist_queue_recovery(resource_h, recovery));
+          publish_queue_recovery_required(recovery, result,
+            "queue post-delete OCC progress failed");
+          done = 1'b1;
+          break;
+        end
+        recovery.queue_plan.flush_targets[i].flush_complete = 1'b1;
+        recovery_complete_step(recovery, RDMA_CTRL_STEP_HW_OCC_FLUSHED);
+        persist_status = persist_queue_recovery(resource_h, recovery);
+        if (!persist_status.ok()) begin
+          publish_queue_recovery_required(recovery, result,
+            "queue post-delete OCC progress failed");
+          done = 1'b1;
+          break;
+        end
+      end
+      if (done) break;
+      if (!queue_flushes_complete(recovery.queue_plan)) begin
+        publish_queue_recovery_required(recovery, result,
+          "queue OCC recipe remains incomplete");
+        done = 1'b1;
+        break;
+      end
+
+      local_done = queue_local_cleanup_complete(recovery.queue_plan);
+      if (!local_done) begin
+        status = cleanup_local(recovery.queue_plan, result, 1'b1, resource_h);
+        status = normalize_status(status,
+          "queue local recovery cleanup returned null");
+        refreshed = null;
+        persist_status = manager.lookup_recovery(resource_h, refreshed);
+        persist_status = normalize_status(persist_status,
+          "queue local recovery refresh returned null");
+        if (persist_status.ok() && refreshed != null)
+          recovery = refreshed;
+        if (!status.ok()) begin
+          recovery.rollback_statuses.push_back(
+            rdma_cmq_clone_status_value(status));
+          void'(persist_queue_recovery(resource_h, recovery));
+          publish_queue_recovery_required(recovery, result,
+            "queue local cleanup still requires recovery");
+          done = 1'b1;
+          break;
+        end
+        if (!persist_status.ok()) begin
+          recovery.rollback_statuses.push_back(
+            rdma_cmq_clone_status_value(persist_status));
+          publish_queue_recovery_required(recovery, result,
+            "queue local cleanup progress is unavailable");
+          done = 1'b1;
+          break;
+        end
+      end
+      local_done = queue_local_cleanup_complete(recovery.queue_plan);
+      if (!local_done) begin
+        publish_queue_recovery_required(recovery, result,
+          "queue local cleanup remains incomplete");
+        done = 1'b1;
+        break;
+      end
+
+      recovery_complete_step(recovery, RDMA_CTRL_STEP_BACKING_RELEASED);
+      // A normal destroy is an unstaged, already-published queue.  Its ERROR
+      // recovery schema must not advertise RESOURCE_RELEASED while the
+      // registry entry is still present: manager.mark_error() reserves that
+      // pending step for the canonical create-rollback reservation shape.
+      // Create-rollback recovery is the one exception; release_reserved()
+      // consumes that canonical pending step after the recovery is persisted.
+      if (creation_origin)
+        recovery_queue_step(recovery, RDMA_CTRL_STEP_RESOURCE_RELEASED);
+      persist_status = persist_queue_recovery(resource_h, recovery);
+      if (!persist_status.ok()) begin
+        publish_queue_recovery_required(recovery, result,
+          "queue backing progress could not be persisted");
+        done = 1'b1;
+        break;
+      end
+
+      // The recovery intent, not the partial step history, selects the
+      // registry transition.  A normal destroy starts with an ACTIVE queue
+      // whose recovery result deliberately contains only destroy progress;
+      // using the absence of create steps here would misclassify it as an
+      // ALLOCATED reservation and route it through release_reserved().
+      if (creation_origin)
+        status = manager.release_reserved(resource_h);
+      else
+        status = manager.finalize_release(resource_h);
+      status = normalize_status(status,
+        "queue recovery final release returned null");
+      if (!status.ok()) begin
+        recovery.rollback_statuses.push_back(
+          rdma_cmq_clone_status_value(status));
+        void'(persist_queue_recovery(resource_h, recovery));
+        publish_queue_recovery_required(recovery, result,
+          "queue resource finalization still requires recovery");
+        done = 1'b1;
+        break;
+      end
+      recovery_complete_step(recovery, RDMA_CTRL_STEP_RESOURCE_RELEASED);
+      project_queue_recovery_result(recovery, result);
+      result.status = rdma_status::success();
+      result.final_resource_state = RDMA_RESOURCE_RELEASED;
+      result.final_resource_state_known = 1'b1;
+      result.recovery_required = 1'b0;
+      done = 1'b1;
+    end while (1'b0);
+
+    if (!done) begin
+      if (status == null)
+        status = invalid_state("queue recovery returned null");
+      publish_failure(status, result, RDMA_RESOURCE_NEW, 1'b0, 1'b0);
+    end
+  endtask
 
   task create_locked(
     rdma_function_binding binding,
