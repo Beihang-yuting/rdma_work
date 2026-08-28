@@ -2837,16 +2837,16 @@ class rdma_queue_lifecycle_test extends uvm_test;
     case (mode)
       0: mem.fail_on_allocate = 1;
       1: mem.fail_on_allocate = 2;
-      2: void'(mem.fail_write_at(1, injected));
-      3: void'(mem.fail_write_at(2, injected));
-      4: void'(context_backing.fail_next("acquire", injected));
-      5: void'(context_backing.fail_next("write", injected));
-      6: void'(manager.fail_next_transition("stage_allocated", injected));
-      7: cmq.fail_opcode(8'h0c, injected);
+      2: mem.fail_role_call("write", RDMA_QUEUE_ROLE_CQ_RING, 1, injected);
+      3: mem.fail_role_call("write", RDMA_QUEUE_ROLE_CQ_RING, 2, injected);
+      4: context_backing.fail_role_call("acquire", RDMA_QUEUE_ROLE_CQ_RING, 1, injected);
+      5: context_backing.fail_role_call("write", RDMA_QUEUE_ROLE_CQ_RING, 1, injected);
+      6: manager.fail_role_call("stage_allocated", RDMA_QUEUE_ROLE_CQ_RING, 1, injected);
+      7: cmq.fail_role_call("create_terminal", RDMA_QUEUE_ROLE_CQ_RING, 1, injected);
       8: cmq.timeout_opcode(8'h0c);
       9: begin end
-      10: void'(manager.fail_next_transition("commit_programmed", injected));
-      11: void'(manager.fail_next_transition("activate", injected));
+      10: manager.fail_role_call("commit_programmed", RDMA_QUEUE_ROLE_CQ_RING, 1, injected);
+      11: manager.fail_role_call("activate", RDMA_QUEUE_ROLE_CQ_RING, 1, injected);
       default: `uvm_fatal(label, "unknown failure mode")
     endcase
     queue = null;

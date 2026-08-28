@@ -160,6 +160,16 @@ class rdma_queue_lifecycle_executor extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // Named checkpoint used by lifecycle paths at lock/terminal boundaries.
+  // Keeping it virtual lets tests inject a rebind while a CMQ gate is held
+  // without mutating transaction-local authority.
+  protected virtual function rdma_status live_binding_fence(
+    rdma_function_binding binding,
+    rdma_function_handle expected_owner
+  );
+    return generation_status(binding, expected_owner);
+  endfunction
+
   protected function rdma_status populate_resource(
     rdma_queue_resource resource,
     rdma_queue_preflight preflight
@@ -1101,7 +1111,7 @@ class rdma_queue_lifecycle_executor extends uvm_object;
         status = invalid_argument("queue recovery authority is incomplete");
         break;
       end
-      status = generation_status(binding, expected_owner);
+      status = live_binding_fence(binding, expected_owner);
       if (!status.ok()) break;
       status = queue_policy_for_kind(resource_h.kind, policy);
       if (!status.ok()) break;
@@ -1882,7 +1892,7 @@ class rdma_queue_lifecycle_executor extends uvm_object;
         status = invalid_state("queue executor is not configured");
         break;
       end
-      status = generation_status(binding, expected_owner);
+      status = live_binding_fence(binding, expected_owner);
       if (!status.ok()) break;
       if (request == null || request.owner == null ||
           !same_owner(request.owner, expected_owner)) begin
@@ -2068,7 +2078,7 @@ class rdma_queue_lifecycle_executor extends uvm_object;
         return;
       end
       result.completed_steps.push_back(RDMA_CTRL_STEP_HW_CONTEXT_CREATED);
-      status = generation_status(binding, expected_owner);
+      status = live_binding_fence(binding, expected_owner);
       if (!status.ok()) begin
         rollback_created(policy, reserved, plan, create_command, status,
                          result, 1'b0, queue);
@@ -2141,7 +2151,7 @@ class rdma_queue_lifecycle_executor extends uvm_object;
     if (transaction_id == 0) status = invalid_argument("queue transaction ID is zero");
     else if (manager == null || cmq == null || binding == null || expected_owner == null || request == null || request.target_h == null)
       status = invalid_argument("queue destroy authority is incomplete");
-    if (status.ok()) status = generation_status(binding, expected_owner);
+    if (status.ok()) status = live_binding_fence(binding, expected_owner);
     if (status.ok()) begin
       result.resource_h = rdma_clone_handle_value(request.target_h, "queue destroy result");
       status = normalize_status(manager.lookup(request.target_h, snapshot), "queue destroy lookup returned null");
