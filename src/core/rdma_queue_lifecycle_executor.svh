@@ -2300,8 +2300,10 @@ class rdma_queue_lifecycle_executor extends uvm_object;
           if (!status.ok()) break;
         end
       end
+      if (status.ok()) status = live_binding_fence(binding, expected_owner);
       if (status.ok()) begin
         status = cleanup_local(plan, result, 1'b1, queue.handle);
+        if (status.ok()) status = live_binding_fence(binding, expected_owner);
         if (status.ok()) status = normalize_status(manager.finalize_release(queue.handle), "queue finalize release returned null");
       end
       if (!status.ok()) begin
