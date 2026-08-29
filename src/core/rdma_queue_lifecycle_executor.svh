@@ -364,8 +364,8 @@ class rdma_queue_lifecycle_executor extends uvm_object;
     rdma_control_result result,
     bit record_progress,
     rdma_handle resource_h,
-    rdma_function_binding binding = null,
-    rdma_function_handle expected_owner = null
+    input rdma_function_binding binding = null,
+    input rdma_function_handle expected_owner = null
   );
     rdma_status status;
     rdma_status first_failure;
@@ -875,8 +875,8 @@ class rdma_queue_lifecycle_executor extends uvm_object;
     output rdma_cmq_completion completion,
     output rdma_status status,
     output bit ambiguous,
-    rdma_function_binding binding = null,
-    rdma_function_handle expected_owner = null
+    input rdma_function_binding binding = null,
+    input rdma_function_handle expected_owner = null
   );
     rdma_status execute_status;
 

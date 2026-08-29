@@ -90,20 +90,29 @@ class rdma_mock_context_backing extends rdma_context_backing_api;
     return status;
   endfunction
 
-  function automatic rdma_status consume_role_failure(string method_name);
+  function automatic rdma_status consume_role_failure(
+    string method_name,
+    rdma_queue_backing_role_e role
+  );
     rdma_status status;
     int unsigned ordinal;
+    string key;
+
     ordinal = method_ordinals.exists(method_name) ? method_ordinals[method_name] : 0;
-    for (int unsigned role = 0; role < 32; role++) begin
-      string key;
-      key = $sformatf("%s:%0d:%0d", method_name, role, ordinal);
-      if (role_failures.exists(key)) begin
-        status = rdma_mock_clone_status(role_failures[key]);
-        role_failures.delete(key);
-        return status;
-      end
+    key = $sformatf("%s:%0d:%0d", method_name, role, ordinal);
+    if (role_failures.exists(key)) begin
+      status = rdma_mock_clone_status(role_failures[key]);
+      role_failures.delete(key);
+      return status;
     end
     return null;
+  endfunction
+
+  function automatic rdma_queue_backing_role_e context_role(
+    rdma_resource_kind_e resource_kind
+  );
+    return (resource_kind == RDMA_RESOURCE_SRQ) ?
+      RDMA_QUEUE_ROLE_SRQ_RING : RDMA_QUEUE_ROLE_CQ_RING;
   endfunction
 
   function automatic rdma_mock_context_slot find_slot(
@@ -169,7 +178,7 @@ class rdma_mock_context_backing extends rdma_context_backing_api;
     context_ref = null;
     call_trace.push_back("acquire");
     method_ordinals["acquire"]++;
-    forced = consume_role_failure("acquire");
+    forced = consume_role_failure("acquire", context_role(resource_kind));
     if (forced != null) return forced;
     forced = consume_failure("acquire");
     if (forced != null)
@@ -250,7 +259,8 @@ class rdma_mock_context_backing extends rdma_context_backing_api;
 
     call_trace.push_back("write");
     method_ordinals["write"]++;
-    forced = consume_role_failure("write");
+    forced = consume_role_failure("write", context_role(
+      context_ref == null ? RDMA_RESOURCE_CQ : context_ref.resource_kind));
     if (forced != null) return forced;
     forced = consume_failure("write");
     if (forced != null)
@@ -283,7 +293,8 @@ class rdma_mock_context_backing extends rdma_context_backing_api;
 
     call_trace.push_back("release");
     method_ordinals["release"]++;
-    forced = consume_role_failure("release");
+    forced = consume_role_failure("release", context_role(
+      context_ref == null ? RDMA_RESOURCE_CQ : context_ref.resource_kind));
     if (forced != null) return forced;
     forced = consume_failure("release");
     if (forced != null)
@@ -313,7 +324,8 @@ class rdma_mock_context_backing extends rdma_context_backing_api;
     complete = 0;
     call_trace.push_back("query_release_completion");
     method_ordinals["query_release_completion"]++;
-    forced = consume_role_failure("query_release_completion");
+    forced = consume_role_failure("query_release_completion", context_role(
+      context_ref == null ? RDMA_RESOURCE_CQ : context_ref.resource_kind));
     if (forced != null) return forced;
     forced = consume_failure("query_release_completion");
     if (forced != null)

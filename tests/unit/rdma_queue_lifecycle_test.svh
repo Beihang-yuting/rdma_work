@@ -2838,7 +2838,7 @@ class rdma_queue_lifecycle_test extends uvm_test;
       0: mem.fail_on_allocate = 1;
       1: mem.fail_on_allocate = 2;
       2: mem.fail_role_call("write", RDMA_QUEUE_ROLE_CQ_RING, 1, injected);
-      3: mem.fail_role_call("write", RDMA_QUEUE_ROLE_CQ_RING, 2, injected);
+      3: mem.fail_role_call("write", RDMA_QUEUE_ROLE_CQ_PD, 2, injected);
       4: context_backing.fail_role_call("acquire", RDMA_QUEUE_ROLE_CQ_RING, 1, injected);
       5: context_backing.fail_role_call("write", RDMA_QUEUE_ROLE_CQ_RING, 1, injected);
       6: manager.fail_role_call("stage_allocated", RDMA_QUEUE_ROLE_CQ_RING, 1, injected);
@@ -2887,7 +2887,9 @@ class rdma_queue_lifecycle_test extends uvm_test;
     end
     if (mode == 9) begin
       if (result.status.code != RDMA_SC_STALE_GENERATION ||
-          cmq.calls.size() != 1 || manager.release_reserved_calls != 0)
+          cmq.calls.size() != 0 || manager.release_reserved_calls != 1 ||
+          result.final_resource_state != RDMA_RESOURCE_RELEASED ||
+          !result.final_resource_state_known || result.recovery_required)
         `uvm_error(label, "stale generation crossed rollback authority")
       status = manager.release_reserved(dependency.handle);
       expect_status({label, "_DEPENDENCY_RELEASE"}, status, RDMA_SC_OK);

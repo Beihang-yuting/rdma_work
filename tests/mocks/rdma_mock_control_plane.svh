@@ -88,28 +88,29 @@ class rdma_fault_inject_resource_manager extends rdma_resource_manager;
   virtual function rdma_status stage_allocated(rdma_resource candidate);
     rdma_status failure;
 
-    failure = take_transition_failure("stage_allocated");
+    failure = take_transition_failure("stage_allocated",
+      queue_role_for_kind(candidate == null ? RDMA_RESOURCE_CQ :
+                          candidate.resource_kind()));
     if (failure != null)
       return failure;
     return super.stage_allocated(candidate);
   endfunction
 
   protected function rdma_status take_transition_failure(
-    string transition_name
+    string transition_name,
+    rdma_queue_backing_role_e role
   );
     rdma_status failure;
     int unsigned ordinal;
+    string key;
 
     transition_ordinals[transition_name]++;
     ordinal = transition_ordinals[transition_name];
-    for (int unsigned role = 0; role < 32; role++) begin
-      string key;
-      key = $sformatf("%s:%0d:%0d", transition_name, role, ordinal);
-      if (role_failures.exists(key)) begin
-        failure = rdma_cmq_clone_status_value(role_failures[key]);
-        role_failures.delete(key);
-        return failure;
-      end
+    key = $sformatf("%s:%0d:%0d", transition_name, role, ordinal);
+    if (role_failures.exists(key)) begin
+      failure = rdma_cmq_clone_status_value(role_failures[key]);
+      role_failures.delete(key);
+      return failure;
     end
 
     if (!transition_failures.exists(transition_name))
@@ -121,10 +122,23 @@ class rdma_fault_inject_resource_manager extends rdma_resource_manager;
     return failure;
   endfunction
 
+  protected function rdma_queue_backing_role_e queue_role_for_kind(
+    rdma_resource_kind_e kind
+  );
+    case (kind)
+      RDMA_RESOURCE_SRQ: return RDMA_QUEUE_ROLE_SRQ_RING;
+      RDMA_RESOURCE_CEQ: return RDMA_QUEUE_ROLE_CEQ_RING;
+      RDMA_RESOURCE_AEQ: return RDMA_QUEUE_ROLE_AEQ_RING;
+      default: return RDMA_QUEUE_ROLE_CQ_RING;
+    endcase
+  endfunction
+
   virtual function rdma_status commit_programmed(rdma_resource candidate);
     rdma_status failure;
 
-    failure = take_transition_failure("commit_programmed");
+    failure = take_transition_failure("commit_programmed",
+      queue_role_for_kind(candidate == null ? RDMA_RESOURCE_CQ :
+                          candidate.resource_kind()));
     if (failure != null)
       return failure;
     return super.commit_programmed(candidate);
@@ -133,7 +147,8 @@ class rdma_fault_inject_resource_manager extends rdma_resource_manager;
   virtual function rdma_status activate(rdma_handle handle);
     rdma_status failure;
 
-    failure = take_transition_failure("activate");
+    failure = take_transition_failure("activate", queue_role_for_kind(
+      handle == null ? RDMA_RESOURCE_CQ : handle.kind));
     if (failure != null)
       return failure;
     return super.activate(handle);
@@ -143,7 +158,8 @@ class rdma_fault_inject_resource_manager extends rdma_resource_manager;
     rdma_status failure;
 
     release_reserved_calls++;
-    failure = take_transition_failure("release_reserved");
+    failure = take_transition_failure("release_reserved", queue_role_for_kind(
+      handle == null ? RDMA_RESOURCE_CQ : handle.kind));
     if (failure != null)
       return failure;
     return super.release_reserved(handle);
@@ -155,7 +171,10 @@ class rdma_fault_inject_resource_manager extends rdma_resource_manager;
   );
     rdma_status failure;
 
-    failure = take_transition_failure("mark_error");
+    failure = take_transition_failure("mark_error",
+      (recovery != null && recovery.queue_recovery_valid) ?
+        recovery.ambiguous_role : queue_role_for_kind(
+          handle == null ? RDMA_RESOURCE_CQ : handle.kind));
     if (failure != null)
       return failure;
     return super.mark_error(handle, recovery);
@@ -166,7 +185,8 @@ class rdma_fault_inject_resource_manager extends rdma_resource_manager;
   );
     rdma_status failure;
 
-    failure = take_transition_failure("complete_reserved_error");
+    failure = take_transition_failure("complete_reserved_error",
+      queue_role_for_kind(handle == null ? RDMA_RESOURCE_CQ : handle.kind));
     if (failure != null)
       return failure;
     return super.complete_reserved_error(handle);
@@ -178,7 +198,8 @@ class rdma_fault_inject_resource_manager extends rdma_resource_manager;
     rdma_status failure;
 
     failure = take_transition_failure(
-      "record_queue_context_cleanup_complete");
+      "record_queue_context_cleanup_complete", queue_role_for_kind(
+        handle == null ? RDMA_RESOURCE_CQ : handle.kind));
     if (failure != null)
       return failure;
     return super.record_queue_context_cleanup_complete(handle);
@@ -190,7 +211,7 @@ class rdma_fault_inject_resource_manager extends rdma_resource_manager;
   );
     rdma_status failure;
 
-    failure = take_transition_failure("record_queue_cleanup_complete");
+    failure = take_transition_failure("record_queue_cleanup_complete", role);
     if (failure != null)
       return failure;
     return super.record_queue_cleanup_complete(handle, role);
@@ -309,6 +330,7 @@ class rdma_mock_cmq_port extends rdma_cmq_port;
   // only on mock adapter paths that return before recording a CMQ call.
   protected bit last_execute_no_submit_proven;
   protected rdma_status role_failures[string];
+  protected int unsigned method_ordinals[string];
 
   function new(string name = "rdma_mock_cmq_port");
     super.new(name);
@@ -326,6 +348,7 @@ class rdma_mock_cmq_port extends rdma_cmq_port;
     gate_entered_count = 0;
     last_execute_no_submit_proven = 1'b0;
     role_failures.delete();
+    method_ordinals.delete();
     snapshot_engine = rdma_mock_cmq_snapshot_engine::type_id::create(
       {name, "_snapshot_engine"}
     );
@@ -369,17 +392,6 @@ class rdma_mock_cmq_port extends rdma_cmq_port;
     if (status != null && ordinal != 0) begin
       role_failures[$sformatf("%s:%0d:%0d", method_name, role, ordinal)] =
         rdma_cmq_clone_status_value(status);
-      // CMQ lifecycle points are represented by opcode outcomes.  This keeps
-      // the machine-readable method+role+ordinal API useful even though the
-      // port itself only observes execute(opcode).
-      if (method_name == "create_submit" || method_name == "create_terminal" ||
-          method_name == "delete")
-        fail_opcode((method_name == "delete") ? XTR_V1_OP_CQC_DELETE :
-                    XTR_V1_OP_CQC_CREATE, status);
-      else if (method_name.substr(0, 5) == "flush" ||
-               method_name.substr(0, 9) == "pre_flush" ||
-               method_name.substr(0, 10) == "post_flush")
-        fail_opcode(XTR_V1_OP_OCC_FLUSH, status);
     end
   endfunction
 
@@ -387,6 +399,7 @@ class rdma_mock_cmq_port extends rdma_cmq_port;
     calls.delete(); outcomes.delete(); late_completions.delete();
     reconcile_scripts.delete(); next_sequence = 1;
     role_failures.delete();
+    method_ordinals.delete();
     gate_enabled = 1'b0; gate_entered_count = 0; gate_target_count = 1;
     last_execute_no_submit_proven = 1'b0;
     entered.reset(); release_gate.reset();
@@ -433,6 +446,53 @@ class rdma_mock_cmq_port extends rdma_cmq_port;
 
   protected function rdma_status invalid_state(string message);
     return rdma_status::make(RDMA_SC_INVALID_STATE, message);
+  endfunction
+
+  protected function rdma_queue_backing_role_e execute_role(
+    bit [7:0] opcode,
+    int unsigned flush_ordinal
+  );
+    string key;
+
+    case (opcode)
+      XTR_V1_OP_CQC_CREATE, XTR_V1_OP_CQC_DELETE,
+      XTR_V1_OP_CQC_QUERY: return RDMA_QUEUE_ROLE_CQ_RING;
+      XTR_V1_OP_SRFQC_CREATE, XTR_V1_OP_SRFQC_DELETE,
+      XTR_V1_OP_SRFQC_QUERY: return RDMA_QUEUE_ROLE_SRQ_RING;
+      XTR_V1_OP_CEQC_CREATE, XTR_V1_OP_CEQC_DELETE,
+      XTR_V1_OP_CEQC_QUERY: return RDMA_QUEUE_ROLE_CEQ_RING;
+      XTR_V1_OP_AEQC_CREATE, XTR_V1_OP_AEQC_DELETE,
+      XTR_V1_OP_AEQC_QUERY: return RDMA_QUEUE_ROLE_AEQ_RING;
+      XTR_V1_OP_OCC_FLUSH: begin
+        // SRQ has two ordered PD flushes.  CQ has one post-delete PD flush;
+        // prefer an explicitly scripted CQ role when present, otherwise use
+        // the canonical SRQ ordinal mapping.
+        key = $sformatf("pre_flush_%0d:%0d:%0d", flush_ordinal - 1,
+                        RDMA_QUEUE_ROLE_CQ_PD, flush_ordinal);
+        if (role_failures.exists(key)) return RDMA_QUEUE_ROLE_CQ_PD;
+        key = $sformatf("post_flush_%0d:%0d:%0d", flush_ordinal - 1,
+                        RDMA_QUEUE_ROLE_CQ_PD, flush_ordinal);
+        if (role_failures.exists(key)) return RDMA_QUEUE_ROLE_CQ_PD;
+        return flush_ordinal == 1 ? RDMA_QUEUE_ROLE_SRFQ_PD :
+                                     RDMA_QUEUE_ROLE_SRQ_PD;
+      end
+      default: return RDMA_QUEUE_ROLE_CQ_RING;
+    endcase
+  endfunction
+
+  protected function rdma_status take_role_failure(
+    string method_name,
+    rdma_queue_backing_role_e role,
+    int unsigned ordinal
+  );
+    string key;
+    rdma_status failure;
+
+    key = $sformatf("%s:%0d:%0d", method_name, role, ordinal);
+    if (!role_failures.exists(key)) return null;
+    failure = rdma_cmq_clone_status_value(role_failures[key]);
+    role_failures.delete(key);
+    return failure;
   endfunction
 
   protected function bit same_ticket(
@@ -717,7 +777,12 @@ class rdma_mock_cmq_port extends rdma_cmq_port;
     rdma_cmq_command_desc command_snapshot;
     rdma_mock_cmq_call call_record;
     rdma_mock_cmq_outcome outcome;
+    rdma_status scripted_failure;
     bit [7:0] opcode;
+    rdma_queue_backing_role_e role;
+    int unsigned method_ordinal;
+    int unsigned flush_ordinal;
+    string method_name;
 
     last_execute_no_submit_proven = 1'b0;
     ticket = null;
@@ -767,8 +832,60 @@ class rdma_mock_cmq_port extends rdma_cmq_port;
     calls.push_back(call_record);
     next_sequence++;
 
+    scripted_failure = null;
+    method_name = "";
+    method_ordinal = 0;
+    flush_ordinal = 0;
+    if (opcode inside {XTR_V1_OP_CQC_CREATE, XTR_V1_OP_SRFQC_CREATE,
+                       XTR_V1_OP_CEQC_CREATE, XTR_V1_OP_AEQC_CREATE}) begin
+      method_name = "create_terminal";
+      method_ordinals[method_name]++;
+      method_ordinal = method_ordinals[method_name];
+      role = execute_role(opcode, 0);
+      scripted_failure = take_role_failure(method_name, role, method_ordinal);
+      if (scripted_failure == null)
+        scripted_failure = take_role_failure("create_submit", role,
+                                             method_ordinal);
+    end
+    else if (opcode inside {XTR_V1_OP_CQC_DELETE, XTR_V1_OP_SRFQC_DELETE,
+                            XTR_V1_OP_CEQC_DELETE, XTR_V1_OP_AEQC_DELETE}) begin
+      method_name = "delete";
+      method_ordinals[method_name]++;
+      method_ordinal = method_ordinals[method_name];
+      role = execute_role(opcode, 0);
+      scripted_failure = take_role_failure(method_name, role, method_ordinal);
+    end
+    else if (opcode inside {XTR_V1_OP_CQC_QUERY, XTR_V1_OP_SRFQC_QUERY,
+                            XTR_V1_OP_CEQC_QUERY, XTR_V1_OP_AEQC_QUERY}) begin
+      method_name = "query";
+      method_ordinals[method_name]++;
+      method_ordinal = method_ordinals[method_name];
+      role = execute_role(opcode, 0);
+      scripted_failure = take_role_failure(method_name, role, method_ordinal);
+    end
+    else if (opcode == XTR_V1_OP_OCC_FLUSH) begin
+      method_name = "flush";
+      method_ordinals[method_name]++;
+      flush_ordinal = method_ordinals[method_name];
+      role = execute_role(opcode, flush_ordinal);
+      scripted_failure = take_role_failure(
+        {"pre_flush_", $sformatf("%0d", flush_ordinal - 1)}, role,
+        flush_ordinal);
+      if (scripted_failure == null)
+        scripted_failure = take_role_failure(
+          {"post_flush_", $sformatf("%0d", flush_ordinal - 1)}, role,
+          flush_ordinal);
+      if (scripted_failure == null)
+        scripted_failure = take_role_failure("flush", role, flush_ordinal);
+    end
+
     outcome = null;
-    if (outcomes.exists(opcode) && outcomes[opcode].size() != 0)
+    if (scripted_failure != null) begin
+      outcome = new("mock_role_failure_outcome");
+      outcome.kind = RDMA_MOCK_CMQ_COMPLETION;
+      outcome.status = scripted_failure;
+    end
+    else if (outcomes.exists(opcode) && outcomes[opcode].size() != 0)
       outcome = outcomes[opcode].pop_front();
     if (outcome != null && outcome.kind == RDMA_MOCK_CMQ_TIMEOUT) begin
       result_status = rdma_status::make(RDMA_SC_TIMEOUT,

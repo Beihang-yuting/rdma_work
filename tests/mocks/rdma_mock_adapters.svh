@@ -395,6 +395,7 @@ class rdma_mock_host_mem extends rdma_host_mem_api;
   // the oldest matching method+ordinal entry.
   rdma_status role_failures[string];
   int unsigned method_ordinals[string];
+  rdma_queue_backing_role_e mapping_roles[longint unsigned];
   longint unsigned next_sequence;
   longint unsigned next_address;
   rdma_mock_call_trace call_trace;
@@ -464,6 +465,7 @@ class rdma_mock_host_mem extends rdma_host_mem_api;
   function void reset();
     calls.delete(); regions.delete(); failures.delete();
     role_failures.delete(); method_ordinals.delete();
+    mapping_roles.delete();
     next_sequence = 0;
     next_address = 64'h0000_0001_0000_0000;
     writes_until_failure = -1; delayed_write_failure = null;
@@ -479,21 +481,73 @@ class rdma_mock_host_mem extends rdma_host_mem_api;
     return result;
   endfunction
 
-  function automatic rdma_status take_role_failure(string method_name);
+  function automatic rdma_status take_role_failure(
+    string method_name,
+    rdma_queue_backing_role_e role
+  );
     rdma_status result;
-    int unsigned parsed_ordinal;
     int unsigned ordinal;
+    string key;
+
     ordinal = method_ordinals.exists(method_name) ? method_ordinals[method_name] : 0;
-    for (int unsigned role = 0; role < 32; role++) begin
-      string key;
-      key = $sformatf("%s:%0d:%0d", method_name, role, ordinal);
-      if (role_failures.exists(key)) begin
-        result = rdma_mock_clone_status(role_failures[key]);
-        role_failures.delete(key);
-        return result;
-      end
+    key = $sformatf("%s:%0d:%0d", method_name, role, ordinal);
+    if (role_failures.exists(key)) begin
+      result = rdma_mock_clone_status(role_failures[key]);
+      role_failures.delete(key);
+      return result;
     end
     return null;
+  endfunction
+
+  function automatic bit mapping_role(
+    rdma_dma_mapping mapping,
+    output rdma_queue_backing_role_e role
+  );
+    role = RDMA_QUEUE_ROLE_CQ_RING;
+    if (mapping == null || !mapping_roles.exists(mapping.iova.value))
+      return 1'b0;
+    role = mapping_roles[mapping.iova.value];
+    return 1'b1;
+  endfunction
+
+  function automatic rdma_queue_backing_role_e request_role(
+    rdma_dma_request_context request_context,
+    int unsigned size,
+    int unsigned alignment
+  );
+    rdma_resource_kind_e kind;
+    int unsigned ordinal;
+
+    if (request_context != null && request_context.queue_role_valid &&
+        request_context.queue_role <=
+          int'(RDMA_QUEUE_ROLE_SRFQC_CONTEXT_SHADOW))
+      return rdma_queue_backing_role_e'(request_context.queue_role);
+    if (request_context == null || request_context.owner_h == null)
+      return RDMA_QUEUE_ROLE_CQ_RING;
+    kind = request_context.owner_h.kind;
+    ordinal = method_ordinals.exists("allocate") ?
+      method_ordinals["allocate"] : 1;
+    case (kind)
+      RDMA_RESOURCE_CQ:
+        return (size == 4096 && alignment == 4096) ?
+          RDMA_QUEUE_ROLE_CQ_PD : RDMA_QUEUE_ROLE_CQ_RING;
+      RDMA_RESOURCE_SRQ: begin
+        if (alignment == 512)
+          return RDMA_QUEUE_ROLE_SRQ_SGB;
+        if (size == 4096)
+          return (ordinal >= 5) ? RDMA_QUEUE_ROLE_SRFQ_PD :
+                                  RDMA_QUEUE_ROLE_SRQ_PD;
+        return (ordinal == 2) ? RDMA_QUEUE_ROLE_SRFQ_RING :
+                                RDMA_QUEUE_ROLE_SRQ_RING;
+      end
+      RDMA_RESOURCE_CEQ:
+        return (size == 4096 && alignment == 4096) ?
+          RDMA_QUEUE_ROLE_CEQ_PD : RDMA_QUEUE_ROLE_CEQ_RING;
+      RDMA_RESOURCE_AEQ:
+        return (size == 4096 && alignment == 4096) ?
+          RDMA_QUEUE_ROLE_AEQ_PD : RDMA_QUEUE_ROLE_AEQ_RING;
+      default: return RDMA_QUEUE_ROLE_CQ_RING;
+    endcase
   endfunction
 
   function automatic rdma_mock_host_mem_call record_call(
@@ -580,13 +634,15 @@ class rdma_mock_host_mem extends rdma_host_mem_api;
     rdma_status token_status;
     rdma_mock_memory_region region;
     rdma_mock_dma_mapping allocated_mapping;
+    rdma_queue_backing_role_e role;
     longint unsigned aligned_address;
     longint unsigned alignment_mask;
 
     mapping = null;
     record_call("allocate", request_context, null, size, alignment,
                 direction);
-    failure = take_role_failure("allocate");
+    role = request_role(request_context, size, alignment);
+    failure = take_role_failure("allocate", role);
     if (failure != null) return failure;
     if (request_context == null)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
@@ -641,6 +697,7 @@ class rdma_mock_host_mem extends rdma_host_mem_api;
       rdma_clone_handle_value(request_context.owner_h,
                               "mock host memory mapping owner");
     mapping = allocated_mapping;
+    mapping_roles[allocated_mapping.iova.value] = role;
 
     region = rdma_mock_memory_region::type_id::create(
       $sformatf("region_%0d", regions.size())
@@ -660,10 +717,12 @@ class rdma_mock_host_mem extends rdma_host_mem_api;
     rdma_status failure;
     int region_index;
     longint unsigned allocated_size;
+    rdma_queue_backing_role_e role;
 
     record_call("write", null, mapping, data.size(), 0,
                 RDMA_DMA_DEVICE_READ, offset, data);
-    failure = take_role_failure("write");
+    void'(mapping_role(mapping, role));
+    failure = take_role_failure("write", role);
     if (failure != null) return failure;
     if (writes_until_failure == 0) begin
       failure = rdma_mock_clone_status(delayed_write_failure);
@@ -710,10 +769,12 @@ class rdma_mock_host_mem extends rdma_host_mem_api;
     rdma_status failure;
     int region_index;
     longint unsigned allocated_size;
+    rdma_queue_backing_role_e role;
 
     record_call("read", null, mapping, size, 0, RDMA_DMA_DEVICE_READ,
                 offset);
-    failure = take_role_failure("read");
+    void'(mapping_role(mapping, role));
+    failure = take_role_failure("read", role);
     if (failure != null) return failure;
     data = new[0];
     failure = take_failure("read");
@@ -750,9 +811,11 @@ class rdma_mock_host_mem extends rdma_host_mem_api;
     rdma_status status;
     int region_index;
     rdma_mock_dma_mapping concrete_mapping;
+    rdma_queue_backing_role_e role;
 
     record_call("release", null, mapping);
-    failure = take_role_failure("release");
+    void'(mapping_role(mapping, role));
+    failure = take_role_failure("release", role);
     if (failure != null) return failure;
     failure = take_failure("release");
     if (failure != null)
@@ -824,6 +887,7 @@ class rdma_mock_pcie extends rdma_pcie_api;
   rdma_bar_decode decode_response;
   rdma_mock_call_trace call_trace;
   rdma_status role_failures[string];
+  int unsigned method_ordinals[string];
 
   function new(string name = "rdma_mock_pcie");
     super.new(name);
@@ -864,7 +928,24 @@ class rdma_mock_pcie extends rdma_pcie_api;
 
   function void reset();
     calls.delete(); failures.delete(); role_failures.delete();
+    method_ordinals.delete();
     next_sequence = 0;
+  endfunction
+
+  function automatic rdma_status take_role_failure(
+    string method_name,
+    rdma_queue_backing_role_e role
+  );
+    string key;
+    rdma_status result;
+    int unsigned ordinal;
+
+    ordinal = method_ordinals.exists(method_name) ? method_ordinals[method_name] : 0;
+    key = $sformatf("%s:%0d:%0d", method_name, role, ordinal);
+    if (!role_failures.exists(key)) return null;
+    result = rdma_mock_clone_status(role_failures[key]);
+    role_failures.delete(key);
+    return result;
   endfunction
 
   function automatic rdma_status take_failure(string method_name);
@@ -895,6 +976,7 @@ class rdma_mock_pcie extends rdma_pcie_api;
     next_sequence++;
     call_record.call_sequence = next_sequence;
     call_record.method_name = method_name;
+    method_ordinals[method_name]++;
     call_record.target = target;
     call_record.offset = offset;
     call_record.cfg_data = cfg_data;
@@ -916,7 +998,8 @@ class rdma_mock_pcie extends rdma_pcie_api;
   );
     record_call("cfg_read32", target, offset);
     data = '0;
-    status = take_failure("cfg_read32");
+    status = take_role_failure("cfg_read32", RDMA_QUEUE_ROLE_CQ_RING);
+    if (status == null) status = take_failure("cfg_read32");
     if (status != null)
       return;
     data = cfg_read_value;
@@ -931,7 +1014,8 @@ class rdma_mock_pcie extends rdma_pcie_api;
     output rdma_status status
   );
     record_call("cfg_write32", target, offset, data, byte_enable);
-    status = take_failure("cfg_write32");
+    status = take_role_failure("cfg_write32", RDMA_QUEUE_ROLE_CQ_RING);
+    if (status == null) status = take_failure("cfg_write32");
     if (status == null)
       status = rdma_status::success();
   endtask
@@ -943,7 +1027,8 @@ class rdma_mock_pcie extends rdma_pcie_api;
     output rdma_status status
   );
     record_call("mmio_write", '0, '0, '0, '0, function_h, address, data);
-    status = take_failure("mmio_write");
+    status = take_role_failure("mmio_write", RDMA_QUEUE_ROLE_CQ_RING);
+    if (status == null) status = take_failure("mmio_write");
     if (status == null)
       status = rdma_status::success();
   endtask
@@ -953,7 +1038,8 @@ class rdma_mock_pcie extends rdma_pcie_api;
     output rdma_status status
   );
     record_call("dma_visibility_barrier", '0, '0, '0, '0, function_h);
-    status = take_failure("dma_visibility_barrier");
+    status = take_role_failure("dma_visibility_barrier", RDMA_QUEUE_ROLE_CQ_RING);
+    if (status == null) status = take_failure("dma_visibility_barrier");
     if (status == null)
       status = rdma_status::success();
   endtask
@@ -963,7 +1049,8 @@ class rdma_mock_pcie extends rdma_pcie_api;
     output rdma_status status
   );
     record_call("mmio_ordering_barrier", '0, '0, '0, '0, function_h);
-    status = take_failure("mmio_ordering_barrier");
+    status = take_role_failure("mmio_ordering_barrier", RDMA_QUEUE_ROLE_CQ_RING);
+    if (status == null) status = take_failure("mmio_ordering_barrier");
     if (status == null)
       status = rdma_status::success();
   endtask
@@ -976,7 +1063,8 @@ class rdma_mock_pcie extends rdma_pcie_api;
 
     record_call("get_function_info", bdf);
     info = null;
-    failure = take_failure("get_function_info");
+    failure = take_role_failure("get_function_info", RDMA_QUEUE_ROLE_CQ_RING);
+    if (failure == null) failure = take_failure("get_function_info");
     if (failure != null)
       return failure;
     if (function_info_response == null)
@@ -994,7 +1082,8 @@ class rdma_mock_pcie extends rdma_pcie_api;
 
     record_call("decode_bar", '0, '0, '0, '0, null, address);
     result = null;
-    failure = take_failure("decode_bar");
+    failure = take_role_failure("decode_bar", RDMA_QUEUE_ROLE_CQ_RING);
+    if (failure == null) failure = take_failure("decode_bar");
     if (failure != null)
       return failure;
     if (decode_response == null)
@@ -1026,6 +1115,7 @@ class rdma_mock_function_table extends rdma_function_table_api;
   rdma_mock_function_table_call calls[$];
   rdma_status failures[string];
   rdma_status role_failures[string];
+  int unsigned method_ordinals[string];
   longint unsigned next_sequence;
 
   function new(string name = "rdma_mock_function_table");
@@ -1058,7 +1148,24 @@ class rdma_mock_function_table extends rdma_function_table_api;
 
   function void reset();
     calls.delete(); failures.delete(); role_failures.delete();
+    method_ordinals.delete();
     next_sequence = 0;
+  endfunction
+
+  function automatic rdma_status take_role_failure(
+    string method_name,
+    rdma_queue_backing_role_e role
+  );
+    string key;
+    rdma_status result;
+    int unsigned ordinal;
+
+    ordinal = method_ordinals.exists(method_name) ? method_ordinals[method_name] : 0;
+    key = $sformatf("%s:%0d:%0d", method_name, role, ordinal);
+    if (!role_failures.exists(key)) return null;
+    result = rdma_mock_clone_status(role_failures[key]);
+    role_failures.delete(key);
+    return result;
   endfunction
 
   function automatic rdma_status take_failure(string method_name);
@@ -1081,6 +1188,7 @@ class rdma_mock_function_table extends rdma_function_table_api;
     next_sequence++;
     call_record.call_sequence = next_sequence;
     call_record.method_name = method_name;
+    method_ordinals[method_name]++;
     call_record.binding = rdma_mock_clone_binding(binding);
     calls.push_back(call_record);
   endfunction
@@ -1089,7 +1197,8 @@ class rdma_mock_function_table extends rdma_function_table_api;
                                rdma_function_binding binding,
                                output rdma_status status);
     record_call(method_name, binding);
-    status = take_failure(method_name);
+    status = take_role_failure(method_name, RDMA_QUEUE_ROLE_CQ_RING);
+    if (status == null) status = take_failure(method_name);
     if (status == null)
       status = rdma_status::success();
   endtask

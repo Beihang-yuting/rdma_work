@@ -461,6 +461,11 @@ class rdma_queue_backing_planner extends uvm_object;
     if (length == 0 || length > 32'hffff_ffff)
       return invalid_argument("queue allocation length exceeds API width");
     acquired_mapping = null;
+    // Carry the logical backing role through the otherwise role-agnostic DMA
+    // adapter boundary.  Deterministic mocks use this hint to consume the
+    // exact (method, role, ordinal) fault entry; real adapters ignore it.
+    request_context.queue_role_valid = 1'b1;
+    request_context.queue_role = int'(role);
     status = normalize_status(host_mem.allocate(
       request_context, int'(length), int'(alignment), direction,
       acquired_mapping

@@ -8,6 +8,11 @@ class rdma_dma_request_context extends uvm_object;
   bit dma_domain_valid;
   int unsigned dma_domain_id;
   rdma_handle owner_h;
+  // Optional queue-backing role hint used by deterministic lifecycle mocks.
+  // The production DMA contract does not depend on this metadata; callers
+  // that do not model queue backing leave it invalid.
+  bit queue_role_valid;
+  int unsigned queue_role;
 
   function new(string name = "rdma_dma_request_context");
     super.new(name);
@@ -18,6 +23,8 @@ class rdma_dma_request_context extends uvm_object;
     dma_domain_valid = 1'b0;
     dma_domain_id = '0;
     owner_h = null;
+    queue_role_valid = 1'b0;
+    queue_role = '0;
   endfunction
 
   function rdma_status validate();
@@ -62,6 +69,8 @@ class rdma_dma_request_context extends uvm_object;
     pasid = rhs_context.pasid;
     dma_domain_valid = rhs_context.dma_domain_valid;
     dma_domain_id = rhs_context.dma_domain_id;
+    queue_role_valid = rhs_context.queue_role_valid;
+    queue_role = rhs_context.queue_role;
     if (rhs_context.owner_h == null) begin
       owner_h = null;
     end
