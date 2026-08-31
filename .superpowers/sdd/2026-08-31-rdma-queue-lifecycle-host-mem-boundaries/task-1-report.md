@@ -14,3 +14,7 @@ The normal-repository success test and real checker remain blocked until the pol
 ## Round 1 fixes
 
 Integrated `rdma_queue_base_from_iova` in policy `backing_iova`, hardened explicit core-file and class parsing checks, and added malformed/missing fixture coverage. `python3 -m unittest tests.unit.test_check_queue_lifecycle` passes (11 tests); `python3 tools/check_queue_lifecycle.py` exits 0; `git diff --check` is clean. Commit: `235a5e165a0bae71495a6f3da2fa93f885da43ed`.
+
+## Round 2 fixes
+
+Helper detection now strips comments; added a comment-forgery negative test and modified frozen-ABI fixture test. 13 unittest tests pass, real checker exits 0, and `git diff --check` is clean.

@@ -58,6 +58,14 @@ class QueueLifecycleCheckerTest(unittest.TestCase):
             p.write_text(p.read_text().replace("rdma_queue_base_from_iova", "missing_helper"))
             with self.assertRaisesRegex(CHECKER.ValidationError, "rdma_queue_base_from_iova"): CHECKER.validate_iova_only(root)
 
+    def test_iova_helper_comment_does_not_satisfy_requirement(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            root = copied_repo(Path(d)); p = root / REQUIRED_SOURCE_FILES[0]
+            t = p.read_text().replace("rdma_queue_base_from_iova", "removed_helper")
+            p.write_text(t + "\n// rdma_queue_base_from_iova(iova, base);\n")
+            with self.assertRaisesRegex(CHECKER.ValidationError, "rdma_queue_base_from_iova"): CHECKER.validate_iova_only(root)
+
     def test_public_api_rejects_raw_address_fields(self):
         import tempfile
         classes = ("rdma_create_cq_req", "rdma_create_srq_req", "rdma_create_ceq_req", "rdma_create_aeq_req")
@@ -110,6 +118,13 @@ class QueueLifecycleCheckerTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             with patch.object(CHECKER.subprocess, "run", side_effect=subprocess.CalledProcessError(1, "git")):
                 with self.assertRaisesRegex(CHECKER.ValidationError, "frozen ABI"): CHECKER.validate_frozen_queue_abi(Path(d))
+
+    def test_modified_frozen_abi_fixture_is_rejected(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            root = copied_repo(Path(d)); p = root / CHECKER.FROZEN_ABI[0]
+            p.write_text(p.read_text() + "\n// unauthorized ABI change\n")
+            with self.assertRaises(CHECKER.ValidationError): CHECKER.validate_frozen_queue_abi(root)
 
 
 if __name__ == "__main__":

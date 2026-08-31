@@ -34,7 +34,8 @@ def validate_iova_only(repo_root: Path) -> None:
     for relative in IOVA_CONSUMERS:
         reject(read(repo_root, relative), r"\b\.backing_addr\b", f"IOVA-only boundary violated in {relative}")
     policy = read(repo_root, IOVA_CONSUMERS[0])
-    if not re.search(r"\brdma_queue_base_from_iova\s*\(", policy, re.MULTILINE):
+    policy_code = re.sub(r"//.*?$|/\*.*?\*/", "", policy, flags=re.MULTILINE | re.DOTALL)
+    if not re.search(r"\brdma_queue_base_from_iova\s*\(", policy_code, re.MULTILINE):
         raise ValidationError("IOVA-only boundary requires rdma_queue_base_from_iova in policy")
 
 
