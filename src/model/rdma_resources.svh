@@ -1,3 +1,5 @@
+typedef class rdma_qpc_model;
+
 function automatic rdma_handle rdma_clone_handle_value(
   rdma_handle source,
   string copy_label
@@ -493,6 +495,8 @@ class rdma_qp extends rdma_resource;
   rdma_handle send_cq_h;
   rdma_handle recv_cq_h;
   rdma_handle srq_h;
+  rdma_qp_backing_plan qp_plan;
+  rdma_qpc_model programmed_qpc;
 
   function new(string name = "rdma_qp");
     super.new(name);
@@ -516,6 +520,8 @@ class rdma_qp extends rdma_resource;
     send_cq_h = null;
     recv_cq_h = null;
     srq_h = null;
+    qp_plan = null;
+    programmed_qpc = null;
   endfunction
 
   virtual function rdma_resource_kind_e resource_kind();
@@ -548,6 +554,22 @@ class rdma_qp extends rdma_resource;
     send_cq_h = rdma_clone_handle_value(rhs_qp.send_cq_h, "QP send CQ");
     recv_cq_h = rdma_clone_handle_value(rhs_qp.recv_cq_h, "QP receive CQ");
     srq_h = rdma_clone_handle_value(rhs_qp.srq_h, "QP SRQ");
+    if (rhs_qp.qp_plan == null) qp_plan = null;
+    else begin
+      uvm_object cloned_object;
+      cloned_object = rhs_qp.qp_plan.clone();
+      if (cloned_object == null || !$cast(qp_plan, cloned_object) ||
+          qp_plan == rhs_qp.qp_plan)
+        `uvm_fatal("RDMA_COPY_TYPE", "QP backing plan clone mismatch")
+    end
+    if (rhs_qp.programmed_qpc == null) programmed_qpc = null;
+    else begin
+      uvm_object cloned_object;
+      cloned_object = rhs_qp.programmed_qpc.clone();
+      if (cloned_object == null || !$cast(programmed_qpc, cloned_object) ||
+          programmed_qpc == rhs_qp.programmed_qpc)
+        `uvm_fatal("RDMA_COPY_TYPE", "QP programmed QPC clone mismatch")
+    end
   endfunction
 
   virtual function rdma_status validate();
@@ -579,6 +601,33 @@ class rdma_qp extends rdma_resource;
                            RDMA_QPS_ERROR}))
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "QP state is invalid");
+    if (state inside {RDMA_RESOURCE_PROGRAMMED, RDMA_RESOURCE_ACTIVE,
+                      RDMA_RESOURCE_QUIESCING, RDMA_RESOURCE_ERROR}) begin
+      if (qp_plan == null || programmed_qpc == null ||
+          backing_refs.size() != 0 || hmc_refs.size() != 0)
+        return rdma_status::make(RDMA_SC_INVALID_STATE,
+                                 "QP backing authority is incomplete or split");
+      status = qp_plan.validate();
+      if (!status.ok()) return status;
+      status = programmed_qpc.validate();
+      if (!status.ok()) return status;
+      if (qp_plan.transport != transport || programmed_qpc.transport != transport ||
+          qp_plan.sq_depth != sq_depth || qp_plan.rq_depth != rq_depth)
+        return rdma_status::make(RDMA_SC_INVALID_STATE,
+                                 "QP programmed authority does not match resource");
+      if (srq_h != null) begin
+        status = rdma_handle_owner_status(srq_h, owner);
+        if (!status.ok()) return status;
+      end
+      if ((srq_h == null) != (qp_plan.rq_source_h == null) ||
+          (srq_h != null &&
+           (!srq_h.same_instance(qp_plan.rq_source_h) ||
+            programmed_qpc.srq_h == null ||
+            !srq_h.same_instance(programmed_qpc.srq_h))) ||
+          (srq_h == null && programmed_qpc.srq_h != null))
+        return rdma_status::make(RDMA_SC_INVALID_STATE,
+                                 "QP SRQ authority does not match resource");
+    end
     if (state inside {RDMA_RESOURCE_PROGRAMMED, RDMA_RESOURCE_ACTIVE}) begin
       if (pd_h != null && pd_h.kind != RDMA_RESOURCE_PD)
         return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,

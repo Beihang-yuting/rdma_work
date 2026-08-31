@@ -66,6 +66,53 @@ class rdma_queue_lifecycle_models_test extends uvm_test;
     return handle;
   endfunction
 
+  // Catches accidental acceptance of QP roles by legacy queue predicates.
+  function automatic rdma_qp_ring_layout make_qp_ring(
+    string name,
+    rdma_queue_backing_role_e role,
+    int unsigned depth
+  );
+    rdma_qp_ring_layout ring;
+
+    ring = rdma_qp_ring_layout::type_id::create(name);
+    ring.role = role;
+    ring.entry_size_bytes = 64;
+    ring.depth = depth;
+    ring.logical_bytes = depth * 64;
+    ring.storage_bytes = ((ring.logical_bytes + 4095) / 4096) * 4096;
+    ring.object_mode = RDMA_OBJECT_INDIRECT_4K;
+    return ring;
+  endfunction
+
+  function automatic rdma_context_backing_ref make_qp_context(
+    string name,
+    rdma_function_handle owner
+  );
+    rdma_context_backing_ref context_ref;
+    rdma_queue_opaque_slot_token token;
+    rdma_queue_completion_authority authority;
+
+    context_ref = rdma_context_backing_ref::type_id::create(name);
+    context_ref.owner = owner;
+    context_ref.resource_kind = RDMA_RESOURCE_QP;
+    token = rdma_queue_opaque_slot_token::type_id::create({name, "_token"});
+    authority = rdma_queue_completion_authority::type_id::create(
+      {name, "_authority"}
+    );
+    token.completion_authority = authority;
+    context_ref.slot_token = token;
+    context_ref.hmc_ref = rdma_hmc_ref::type_id::create({name, "_hmc"});
+    context_ref.hmc_ref.owner = owner;
+    context_ref.hmc_ref.object_kind = RDMA_RESOURCE_MR;
+    context_ref.hmc_ref.size = 512;
+    context_ref.hmc_ref.first_pbl_index = 1;
+    context_ref.hmc_ref.ownership = RDMA_OWNERSHIP_CONTROL_PLANE;
+    context_ref.shadow_pointer_base.value = 64'h8000_0000;
+    context_ref.slot_length = 512;
+    context_ref.shadow_view_length = 512;
+    return context_ref;
+  endfunction
+
   task run_phase(uvm_phase phase);
     rdma_queue_backing_slice slice, slice_clone, metadata_slice;
     rdma_queue_backing_spec spec, metadata_spec;
@@ -80,6 +127,10 @@ class rdma_queue_lifecycle_models_test extends uvm_test;
     rdma_queue_backing_ref sgb_ref, pd2, pd3;
     rdma_queue_backing_segment additional_segment;
     rdma_queue_backing_plan plan, srq_plan, eq_plan;
+    rdma_qp_backing_plan qp_plan, qp_plan_clone;
+    rdma_qp_ring_layout qp_ring;
+    rdma_qp_backing_ref qp_ref, qp_pd_ref, qp_rq_ref, qp_rq_pd_ref;
+    rdma_qp_backing_ref urc_rsq_ref, urc_rdsq_ref, urc_dsq_ref;
     rdma_context_backing_ref ctx, ctx_clone;
     rdma_hmc_ref hmc;
     rdma_queue_completion_authority authority;
@@ -109,7 +160,116 @@ class rdma_queue_lifecycle_models_test extends uvm_test;
         RDMA_QUEUE_ROLE_SRFQC_CONTEXT_SHADOW != 4'd12)
       `uvm_error("ROLE_ENUM", "role enum values changed")
 
+    if (RDMA_QUEUE_ROLE_QP_SQ_RING != 5'd13 ||
+        RDMA_QUEUE_ROLE_QP_RQ_RING != 5'd14 ||
+        RDMA_QUEUE_ROLE_QP_SQ_PD != 5'd15 ||
+        RDMA_QUEUE_ROLE_QP_RQ_PD != 5'd16 ||
+        RDMA_QUEUE_ROLE_QP_URC_RSQ != 5'd17 ||
+        RDMA_QUEUE_ROLE_QP_URC_RDSQ != 5'd18 ||
+        RDMA_QUEUE_ROLE_QP_URC_DSQ != 5'd19 ||
+        rdma_queue_role_is_payload(RDMA_QUEUE_ROLE_QP_SQ_RING) ||
+        rdma_queue_role_is_pd(RDMA_QUEUE_ROLE_QP_SQ_PD) ||
+        !rdma_qp_role_is_payload(RDMA_QUEUE_ROLE_QP_SQ_RING) ||
+        !rdma_qp_role_is_pd(RDMA_QUEUE_ROLE_QP_SQ_PD))
+      `uvm_error("QP_ROLE_ISOLATION",
+                 "QP role values or legacy predicate isolation changed")
+
     mapping = make_mapping("mapping");
+
+    qp_ring = make_qp_ring("qp_sq_ring", RDMA_QUEUE_ROLE_QP_SQ_RING, 128);
+    qp_ref = rdma_qp_backing_ref::type_id::create("qp_sq_ref");
+    qp_ref.role = RDMA_QUEUE_ROLE_QP_SQ_RING;
+    qp_ref.mapping = mapping;
+    qp_ref.length = 8192;
+    qp_ref.ownership = RDMA_OWNERSHIP_BORROWED;
+    qp_pd_ref = rdma_qp_backing_ref::type_id::create("qp_sq_pd_ref");
+    qp_pd_ref.role = RDMA_QUEUE_ROLE_QP_SQ_PD;
+    qp_pd_ref.mapping = make_mapping("qp_pd_mapping");
+    qp_pd_ref.length = 4096;
+    qp_pd_ref.ownership = RDMA_OWNERSHIP_CONTROL_PLANE;
+    qp_rq_ref = rdma_qp_backing_ref::type_id::create("qp_rq_ref");
+    qp_rq_ref.role = RDMA_QUEUE_ROLE_QP_RQ_RING;
+    qp_rq_ref.mapping = make_mapping("qp_rq_mapping");
+    qp_rq_ref.length = 8192;
+    qp_rq_ref.ownership = RDMA_OWNERSHIP_BORROWED;
+    qp_rq_pd_ref = rdma_qp_backing_ref::type_id::create("qp_rq_pd_ref");
+    qp_rq_pd_ref.role = RDMA_QUEUE_ROLE_QP_RQ_PD;
+    qp_rq_pd_ref.mapping = make_mapping("qp_rq_pd_mapping");
+    qp_rq_pd_ref.length = 4096;
+    qp_rq_pd_ref.ownership = RDMA_OWNERSHIP_CONTROL_PLANE;
+    qp_plan = rdma_qp_backing_plan::type_id::create("qp_plan");
+    qp_plan.transport = RDMA_TRANSPORT_RC;
+    qp_plan.sq_depth = 128;
+    qp_plan.rq_depth = 128;
+    qp_plan.sq_ring = qp_ring;
+    qp_plan.sq_ref = qp_ref;
+    qp_plan.sq_pd_ref = qp_pd_ref;
+    qp_plan.rq_ring = make_qp_ring("qp_rq_ring", RDMA_QUEUE_ROLE_QP_RQ_RING,
+                                   128);
+    qp_plan.rq_ref = qp_rq_ref;
+    qp_plan.rq_pd_ref = qp_rq_pd_ref;
+    qp_plan.context_ref = make_qp_context("qp_context", mapping.function_h);
+    expect_status("QP_PLAN_VALID", qp_plan.validate(), RDMA_SC_OK);
+    qp_plan.context_ref.hmc_ref.ownership = RDMA_OWNERSHIP_BORROWED;
+    expect_status("QP_PLAN_CONTEXT_OWNERSHIP", qp_plan.validate(),
+                  RDMA_SC_INVALID_STATE);
+    qp_plan.context_ref.hmc_ref.ownership = RDMA_OWNERSHIP_CONTROL_PLANE;
+    qp_plan.sq_ref = null;
+    expect_status("QP_PLAN_NULL_SQ_REF", qp_plan.validate(),
+                  RDMA_SC_INVALID_STATE);
+    qp_plan.sq_ref = qp_ref;
+    qp_plan.context_ref.slot_length = 1024;
+    qp_plan.context_ref.shadow_view_length = 1024;
+    expect_status("QP_PLAN_CONTEXT_GEOMETRY", qp_plan.validate(),
+                  RDMA_SC_INVALID_ARGUMENT);
+    qp_plan.context_ref.slot_length = 512;
+    qp_plan.context_ref.shadow_view_length = 512;
+    qp_plan.context_ref = null;
+    expect_status("QP_PLAN_NULL_CONTEXT", qp_plan.validate(), RDMA_SC_INVALID_STATE);
+    qp_plan.context_ref = make_qp_context("qp_context_copy", mapping.function_h);
+    cloned = qp_plan.clone();
+    if (!$cast(qp_plan_clone, cloned) || qp_plan_clone == qp_plan ||
+        qp_plan_clone.sq_ring == qp_plan.sq_ring ||
+        qp_plan_clone.sq_ref == qp_plan.sq_ref ||
+        qp_plan_clone.sq_ref.mapping == qp_plan.sq_ref.mapping)
+      `uvm_error("QP_PLAN_DEEP_COPY", "QP plan clone aliases source graph")
+    else begin
+      qp_plan.sq_ref.mapping.iova.value = 64'h0000_1000_0010_0000;
+      qp_plan.sq_pd_ref.cleanup_complete = 1'b1;
+      if (qp_plan_clone.sq_ref.mapping.iova.value !=
+            64'h0000_1000_0000_0000 ||
+          qp_plan_clone.sq_pd_ref.cleanup_complete)
+        `uvm_error("QP_PLAN_SNAPSHOT",
+                   "caller plan mutation reached cloned snapshot")
+      qp_plan.sq_ref.mapping.iova.value = 64'h0000_1000_0000_0000;
+      qp_plan.sq_pd_ref.cleanup_complete = 1'b0;
+    end
+    urc_rsq_ref = rdma_qp_backing_ref::type_id::create("urc_rsq_ref");
+    urc_rsq_ref.role = RDMA_QUEUE_ROLE_QP_URC_RSQ;
+    urc_rsq_ref.mapping = make_mapping("urc_rsq_mapping");
+    urc_rsq_ref.length = 4096;
+    urc_rsq_ref.ownership = RDMA_OWNERSHIP_CONTROL_PLANE;
+    urc_rdsq_ref = rdma_qp_backing_ref::type_id::create("urc_rdsq_ref");
+    urc_rdsq_ref.role = RDMA_QUEUE_ROLE_QP_URC_RDSQ;
+    urc_rdsq_ref.mapping = make_mapping("urc_rdsq_mapping");
+    urc_rdsq_ref.length = 4096;
+    urc_rdsq_ref.ownership = RDMA_OWNERSHIP_CONTROL_PLANE;
+    urc_dsq_ref = rdma_qp_backing_ref::type_id::create("urc_dsq_ref");
+    urc_dsq_ref.role = RDMA_QUEUE_ROLE_QP_URC_DSQ;
+    urc_dsq_ref.mapping = make_mapping("urc_dsq_mapping");
+    urc_dsq_ref.length = 8192;
+    urc_dsq_ref.ownership = RDMA_OWNERSHIP_CONTROL_PLANE;
+    qp_plan.transport = RDMA_TRANSPORT_URC;
+    qp_plan.urc_refs.push_back(urc_rsq_ref);
+    qp_plan.urc_refs.push_back(urc_rdsq_ref);
+    expect_status("QP_PLAN_URC_INCOMPLETE", qp_plan.validate(),
+                  RDMA_SC_INVALID_STATE);
+    qp_plan.urc_refs.push_back(urc_dsq_ref);
+    expect_status("QP_PLAN_URC", qp_plan.validate(), RDMA_SC_OK);
+    qp_plan.transport = RDMA_TRANSPORT_RC;
+    expect_status("QP_PLAN_RC_URC_REFS", qp_plan.validate(),
+                  RDMA_SC_INVALID_STATE);
+    qp_plan.urc_refs.delete();
     slice = rdma_queue_backing_slice::type_id::create("slice");
     slice.role = RDMA_QUEUE_ROLE_CQ_RING;
     slice.mapping = mapping;
@@ -320,6 +480,10 @@ class rdma_queue_lifecycle_models_test extends uvm_test;
     plan.refs.push_back(ring_ref);
     plan.refs.push_back(pd);
     plan.context_ref = ctx;
+    ring_ref.role = RDMA_QUEUE_ROLE_QP_SQ_RING;
+    expect_status("LEGACY_PLAN_QP_ROLE", plan.validate(),
+                  RDMA_SC_INVALID_ARGUMENT);
+    ring_ref.role = RDMA_QUEUE_ROLE_CQ_RING;
     expect_status("CTX_VALID", ctx.validate(), RDMA_SC_OK);
     expect_status("AUTHORITY_VALID", authority.validate(), RDMA_SC_OK);
 

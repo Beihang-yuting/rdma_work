@@ -264,6 +264,98 @@ class rdma_control_result extends uvm_object;
   endfunction
 endclass
 
+typedef enum bit [1:0] { RDMA_QP_RECOVER_CREATE_ROLLBACK,
+                         RDMA_QP_RECOVER_MODIFY_RECONCILE,
+                         RDMA_QP_RECOVER_NORMAL_DESTROY }
+  rdma_qp_recovery_intent_e;
+
+typedef enum bit [1:0] { RDMA_QP_AMBIG_NONE, RDMA_QP_AMBIG_CREATE,
+                         RDMA_QP_AMBIG_MODIFY, RDMA_QP_AMBIG_DELETE }
+  rdma_qp_ambiguous_operation_e;
+
+class rdma_qp_recovery_state extends uvm_object;
+  `uvm_object_utils(rdma_qp_recovery_state)
+  rdma_qp_recovery_intent_e intent;
+  rdma_qp_ambiguous_operation_e ambiguous_operation;
+  rdma_qpc_model prior_qpc;
+  rdma_qpc_model candidate_qpc;
+  rdma_qp_backing_plan qp_plan;
+  rdma_context_backing_ref context_ref;
+  rdma_dma_mapping staging_mapping;
+  rdma_dma_mapping query_mapping;
+  rdma_cmq_opcode_key create_opcode;
+  rdma_cmq_opcode_key modify_opcode;
+  rdma_cmq_opcode_key delete_opcode;
+  rdma_cmq_opcode_key query_opcode;
+  rdma_cmq_ticket ambiguous_ticket;
+  bit role_complete[20];
+
+  function new(string name = "rdma_qp_recovery_state");
+    super.new(name);
+    intent = RDMA_QP_RECOVER_CREATE_ROLLBACK;
+    ambiguous_operation = RDMA_QP_AMBIG_NONE;
+    prior_qpc = null;
+    candidate_qpc = null;
+    qp_plan = null;
+    context_ref = null;
+    staging_mapping = null;
+    query_mapping = null;
+    create_opcode = null;
+    modify_opcode = null;
+    delete_opcode = null;
+    query_opcode = null;
+    ambiguous_ticket = null;
+    foreach (role_complete[i]) role_complete[i] = 0;
+  endfunction
+
+  virtual function rdma_status validate();
+    rdma_status status;
+    if (!(intent inside {RDMA_QP_RECOVER_CREATE_ROLLBACK,
+                         RDMA_QP_RECOVER_MODIFY_RECONCILE,
+                         RDMA_QP_RECOVER_NORMAL_DESTROY}) ||
+        !(ambiguous_operation inside {RDMA_QP_AMBIG_NONE, RDMA_QP_AMBIG_CREATE,
+                                      RDMA_QP_AMBIG_MODIFY, RDMA_QP_AMBIG_DELETE}))
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "QP recovery enum is invalid");
+    if (qp_plan == null || context_ref == null)
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "QP recovery authority is incomplete");
+    status = qp_plan.validate(); if (!status.ok()) return status;
+    status = context_ref.validate(); if (!status.ok()) return status;
+    if (context_ref.resource_kind != RDMA_RESOURCE_QP)
+      return rdma_status::make(RDMA_SC_INVALID_STATE, "QP recovery context invalid");
+    if (prior_qpc != null) begin status = prior_qpc.validate(); if (!status.ok()) return status; end
+    if (candidate_qpc != null) begin status = candidate_qpc.validate(); if (!status.ok()) return status; end
+    if (ambiguous_operation != RDMA_QP_AMBIG_NONE && ambiguous_ticket == null)
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "ambiguous QP recovery lacks ticket");
+    return rdma_status::success();
+  endfunction
+
+  virtual function void do_copy(uvm_object rhs);
+    rdma_qp_recovery_state r;
+    uvm_object c;
+    super.do_copy(rhs);
+    if (!$cast(r, rhs)) `uvm_fatal("RDMA_COPY_TYPE", "QP recovery copy mismatch")
+    intent = r.intent;
+    ambiguous_operation = r.ambiguous_operation;
+    role_complete = r.role_complete;
+    prior_qpc = null; candidate_qpc = null; qp_plan = null; context_ref = null;
+    staging_mapping = null; query_mapping = null;
+    if (r.prior_qpc != null) begin c = r.prior_qpc.clone(); if (!$cast(prior_qpc, c)) `uvm_fatal("RDMA_COPY_TYPE", "prior QPC clone failure") end
+    if (r.candidate_qpc != null) begin c = r.candidate_qpc.clone(); if (!$cast(candidate_qpc, c)) `uvm_fatal("RDMA_COPY_TYPE", "candidate QPC clone failure") end
+    if (r.qp_plan != null) begin c = r.qp_plan.clone(); if (!$cast(qp_plan, c)) `uvm_fatal("RDMA_COPY_TYPE", "QP plan clone failure") end
+    if (r.context_ref != null) begin c = r.context_ref.clone(); if (!$cast(context_ref, c)) `uvm_fatal("RDMA_COPY_TYPE", "QP context clone failure") end
+    if (r.staging_mapping != null) begin c = r.staging_mapping.clone(); if (!$cast(staging_mapping, c)) `uvm_fatal("RDMA_COPY_TYPE", "staging mapping clone failure") end
+    if (r.query_mapping != null) begin c = r.query_mapping.clone(); if (!$cast(query_mapping, c)) `uvm_fatal("RDMA_COPY_TYPE", "query mapping clone failure") end
+    create_opcode = rdma_cmq_clone_opcode_key_value(r.create_opcode, "QP recovery create");
+    modify_opcode = rdma_cmq_clone_opcode_key_value(r.modify_opcode, "QP recovery modify");
+    delete_opcode = rdma_cmq_clone_opcode_key_value(r.delete_opcode, "QP recovery delete");
+    query_opcode = rdma_cmq_clone_opcode_key_value(r.query_opcode, "QP recovery query");
+    ambiguous_ticket = rdma_cmq_clone_ticket_value(r.ambiguous_ticket, "QP recovery");
+  endfunction
+endclass
+
 class rdma_recovery_record extends uvm_object;
   `uvm_object_utils(rdma_recovery_record)
 
@@ -284,6 +376,8 @@ class rdma_recovery_record extends uvm_object;
   rdma_cmq_opcode_key queue_delete_opcode;
   rdma_cmq_opcode_key queue_query_opcode;
   rdma_queue_backing_plan queue_plan;
+  bit qp_recovery_valid;
+  rdma_qp_recovery_state qp_recovery;
 
   function new(string name = "rdma_recovery_record");
     super.new(name);
@@ -299,6 +393,8 @@ class rdma_recovery_record extends uvm_object;
     queue_delete_opcode = null;
     queue_query_opcode = null;
     queue_plan = null;
+    qp_recovery_valid = 1'b0;
+    qp_recovery = null;
   endfunction
 
   virtual function rdma_status validate();
@@ -373,6 +469,16 @@ class rdma_recovery_record extends uvm_object;
     if (resource_h.kind == RDMA_RESOURCE_MR && queue_recovery_valid)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "MR recovery cannot use queue schema");
+    if (resource_h.kind == RDMA_RESOURCE_QP && !qp_recovery_valid)
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "QP recovery lacks QP schema");
+    if (qp_recovery_valid) begin
+      if (resource_h.kind != RDMA_RESOURCE_QP || qp_recovery == null)
+        return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                                 "QP recovery resource/schema mismatch");
+      status = qp_recovery.validate();
+      if (!status.ok()) return status;
+    end
     if (queue_recovery_valid) begin
       if (!(resource_h.kind inside {RDMA_RESOURCE_CQ, RDMA_RESOURCE_SRQ,
                                     RDMA_RESOURCE_CEQ, RDMA_RESOURCE_AEQ}))
@@ -489,6 +595,14 @@ class rdma_recovery_record extends uvm_object;
           !$cast(queue_plan, cloned_plan_object) ||
           queue_plan == rhs_record.queue_plan)
         `uvm_fatal("RDMA_COPY_TYPE", "recovery queue plan clone mismatch")
+    end
+    qp_recovery_valid = rhs_record.qp_recovery_valid;
+    if (rhs_record.qp_recovery == null) qp_recovery = null;
+    else begin
+      cloned_plan_object = rhs_record.qp_recovery.clone();
+      if (cloned_plan_object == null || !$cast(qp_recovery, cloned_plan_object) ||
+          qp_recovery == rhs_record.qp_recovery)
+        `uvm_fatal("RDMA_COPY_TYPE", "recovery QP state clone mismatch")
     end
   endfunction
 endclass
