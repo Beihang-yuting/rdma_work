@@ -14,6 +14,7 @@ package rdma_core_pkg;
   `include "rdma_doorbell_scheduler.svh"
   `include "rdma_cmq_port.svh"
   `include "rdma_queue_lifecycle_executor.svh"
+  `include "rdma_qp_lifecycle_executor.svh"
   `include "rdma_control_plane.svh"
   `include "rdma_cmq_engine.svh"
   `include "rdma_cmq_engine_port_adapter.svh"

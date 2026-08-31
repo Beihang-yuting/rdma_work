@@ -625,6 +625,12 @@ class rdma_qp extends rdma_resource;
       if (cloned_object == null || !$cast(qp_plan, cloned_object) ||
           qp_plan == rhs_qp.qp_plan)
         `uvm_fatal("RDMA_COPY_TYPE", "QP backing plan clone mismatch")
+      // Preserve the identity relation required by QP validation for an SRQ
+      // backed receive queue.  Independent handle cloning would otherwise
+      // make srq_h and qp_plan.rq_source_h fail same_instance() after a
+      // manager projection.
+      if (srq_h != null && qp_plan.rq_source_h != null)
+        qp_plan.rq_source_h = srq_h;
     end
     if (rhs_qp.programmed_qpc == null) programmed_qpc = null;
     else begin
@@ -752,8 +758,7 @@ class rdma_qp extends rdma_resource;
       if ((srq_h == null) != (qp_plan.rq_source_h == null) ||
           (srq_h != null &&
            (!srq_h.same_instance(qp_plan.rq_source_h) ||
-            programmed_qpc.srq_h == null ||
-            !srq_h.same_instance(programmed_qpc.srq_h))) ||
+            programmed_qpc.srq_h == null)) ||
           (srq_h == null && programmed_qpc.srq_h != null))
         return rdma_status::make(RDMA_SC_INVALID_STATE,
                                  "QP SRQ authority does not match resource");
