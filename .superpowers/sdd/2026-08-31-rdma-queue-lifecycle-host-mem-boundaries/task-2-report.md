@@ -28,3 +28,14 @@ reservation.
 
 VCS53 integration compilation and runtime assertions remain unverified until
 the pinned host_mem checkout is readable on the simulation host.
+
+## Fix round 1
+
+Added direct page-level IOVA-versus-backing assertions and expanded post-
+allocation caller mutation isolation to both ring and PD mappings. The fixture
+now mutates and verifies PASID-valid and DMA-domain-valid bits in addition to
+requester BDF, PASID, domain ID, direction, IOVA/backing, Function, and owner
+authority snapshots.
+
+`git diff --check` passed. The pinned VCS53 command remains blocked at the same
+host_mem preflight path/readability check described above.

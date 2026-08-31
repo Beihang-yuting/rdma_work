@@ -431,6 +431,11 @@ class rdma_host_mem_adapter_test extends uvm_test;
     rdma_backing_addr_t saved_backing;
     rdma_function_handle saved_function;
     rdma_handle saved_owner;
+    rdma_iova_t saved_pd_iova;
+    rdma_backing_addr_t saved_pd_backing;
+    rdma_function_handle saved_pd_function;
+    rdma_handle saved_pd_owner;
+    rdma_dma_direction_e saved_pd_direction;
 
     queue_hm = $unit::host_mem_manager::type_id::create("queue_hm");
     queue_hm.init_region(64'h0000_0008_0000_0000,
@@ -502,8 +507,16 @@ class rdma_host_mem_adapter_test extends uvm_test;
     saved_backing = ring_ref.mapping.backing_addr;
     saved_function = ring_ref.mapping.function_h;
     saved_owner = ring_ref.mapping.owner_h;
+    saved_pd_iova = pd_ref.mapping.iova;
+    saved_pd_backing = pd_ref.mapping.backing_addr;
+    saved_pd_function = pd_ref.mapping.function_h;
+    saved_pd_owner = pd_ref.mapping.owner_h;
+    saved_pd_direction = pd_ref.mapping.direction;
     if (ring_ref.mapping.iova.value == 0 ||
-        ring_ref.mapping.iova.value == ring_ref.mapping.backing_addr.value)
+        ring_ref.mapping.iova.value == ring_ref.mapping.backing_addr.value ||
+        plan.rings[0].pages[0].page_iova.value == 0 ||
+        plan.rings[0].pages[0].page_iova.value ==
+          ring_ref.mapping.backing_addr.value)
       `uvm_error("QUEUE_IOVA", "queue IOVA must be nonzero and translated")
     if (ring_ref.mapping.requester_bdf != saved_bdf ||
         ring_ref.mapping.pasid_valid != saved_pasid_valid ||
@@ -547,15 +560,30 @@ class rdma_host_mem_adapter_test extends uvm_test;
 
     // Mutating the caller's binding after allocation must not alter authority.
     binding.queue_dma.requester_bdf.bus = binding.queue_dma.requester_bdf.bus + 1'b1;
+    binding.queue_dma.pasid_valid = ~binding.queue_dma.pasid_valid;
     binding.queue_dma.pasid = binding.queue_dma.pasid ^ 20'h1;
+    binding.queue_dma.dma_domain_valid = ~binding.queue_dma.dma_domain_valid;
     binding.queue_dma.dma_domain_id = binding.queue_dma.dma_domain_id ^ 32'h1;
     if (ring_ref.mapping.requester_bdf != saved_bdf ||
+        ring_ref.mapping.pasid_valid != saved_pasid_valid ||
         ring_ref.mapping.pasid != saved_pasid ||
+        ring_ref.mapping.dma_domain_valid != saved_domain_valid ||
         ring_ref.mapping.dma_domain_id != saved_domain_id ||
+        ring_ref.mapping.direction != RDMA_DMA_DEVICE_WRITE ||
         ring_ref.mapping.iova != saved_iova ||
         ring_ref.mapping.backing_addr != saved_backing ||
         !ring_ref.mapping.function_h.same_instance(saved_function) ||
-        !ring_ref.mapping.owner_h.same_instance(saved_owner))
+        !ring_ref.mapping.owner_h.same_instance(saved_owner) ||
+        pd_ref.mapping.requester_bdf != saved_bdf ||
+        pd_ref.mapping.pasid_valid != saved_pasid_valid ||
+        pd_ref.mapping.pasid != saved_pasid ||
+        pd_ref.mapping.dma_domain_valid != saved_domain_valid ||
+        pd_ref.mapping.dma_domain_id != saved_domain_id ||
+        pd_ref.mapping.direction != saved_pd_direction ||
+        pd_ref.mapping.iova != saved_pd_iova ||
+        pd_ref.mapping.backing_addr != saved_pd_backing ||
+        !pd_ref.mapping.function_h.same_instance(saved_pd_function) ||
+        !pd_ref.mapping.owner_h.same_instance(saved_pd_owner))
       `uvm_error("QUEUE_AUTHORITY_MUTATION",
                  "mapping authority changed with caller context")
 
