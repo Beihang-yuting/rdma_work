@@ -4021,6 +4021,11 @@ class rdma_resource_manager extends uvm_object;
                                            replacement);
     if (!status.ok())
       return status;
+    if (replacement.handle.kind == RDMA_RESOURCE_QP)
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "QP resources require QP-specific programming attachment"
+      );
     if (replacement.state != RDMA_RESOURCE_ALLOCATED)
       return rdma_status::make(RDMA_SC_INVALID_STATE,
                                "staged candidate must be ALLOCATED");
@@ -4071,6 +4076,11 @@ class rdma_resource_manager extends uvm_object;
                                            replacement);
     if (!status.ok())
       return status;
+    if (replacement.handle.kind == RDMA_RESOURCE_QP)
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "QP resources require QP-specific programmed commit"
+      );
     if (replacement.state != RDMA_RESOURCE_ALLOCATED)
       return rdma_status::make(RDMA_SC_INVALID_STATE,
                                "programmed candidate must be ALLOCATED");
@@ -4270,10 +4280,14 @@ class rdma_resource_manager extends uvm_object;
     rdma_resource projected;
     rdma_qp authoritative_qp;
     rdma_qp replacement;
+    rdma_qpc_model requested_qpc;
+    rdma_qp_state_e requested_qp_state;
     rdma_recovery_record recovery;
     rdma_status status;
+    bit release_complete;
     string key;
     bit reconciliation;
+    bit restore_prior;
 
     status = project_public_resource_value(candidate, "commit QP programmed",
                                            projected);
@@ -4303,6 +4317,26 @@ class rdma_resource_manager extends uvm_object;
         return rdma_status::make(
           RDMA_SC_INVALID_STATE, "programmed QP commit requires ACTIVE state"
         );
+      requested_qp_state = replacement.qp_state;
+      status = project_qpc_value(
+        replacement.programmed_qpc, "commit QP requested QPC",
+        requested_qpc
+      );
+      if (!status.ok() || requested_qpc == null)
+        return status.ok() ? rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "requested QP programmed QPC projection failed"
+        ) : status;
+      status = project_resource_value(
+        registry[key], "commit QP authoritative resource", projected
+      );
+      if (!status.ok() || !$cast(replacement, projected))
+        return status.ok() ? rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "authoritative QP programmed projection failed"
+        ) : status;
+      replacement.programmed_qpc = requested_qpc;
+      replacement.qp_state = requested_qp_state;
     end
     else begin
       status = recovery_entry_schema_status(key, "commit QP programmed");
@@ -4313,17 +4347,67 @@ class rdma_resource_manager extends uvm_object;
           RDMA_SC_INVALID_STATE, "ERROR QP lacks modify recovery"
         );
       recovery = recovery_records[key];
+      restore_prior = recovery.qp_recovery_valid &&
+        recovery.qp_recovery != null &&
+        same_qpc_value(replacement.programmed_qpc,
+                       recovery.qp_recovery.prior_qpc);
       if (!recovery.qp_recovery_valid || recovery.qp_recovery == null ||
           recovery.qp_recovery.intent !=
             RDMA_QP_RECOVER_MODIFY_RECONCILE ||
-          !(same_qpc_value(replacement.programmed_qpc,
-                           recovery.qp_recovery.prior_qpc) ||
+          !(restore_prior ||
             same_qpc_value(replacement.programmed_qpc,
                            recovery.qp_recovery.candidate_qpc)))
         return rdma_status::make(
           RDMA_SC_INVALID_ARGUMENT,
           "programmed QP does not match a reconciliation candidate"
         );
+      if (recovery.qp_recovery.ambiguous_operation != RDMA_QP_AMBIG_NONE ||
+          recovery.qp_recovery.ambiguous_ticket != null)
+        return rdma_status::make(
+          RDMA_SC_RECOVERY_REQUIRED,
+          "QP recovery ambiguity is not resolved"
+        );
+      if (recovery.qp_recovery.staging_mapping != null) begin
+        status = query_owned_release_completion(
+          recovery.qp_recovery.staging_mapping, release_complete
+        );
+        if (status == null || !status.ok() || !release_complete)
+          return rdma_status::make(
+            RDMA_SC_RECOVERY_REQUIRED,
+            "QP recovery staging release is not complete"
+          );
+      end
+      if (recovery.qp_recovery.query_mapping != null) begin
+        status = query_owned_release_completion(
+          recovery.qp_recovery.query_mapping, release_complete
+        );
+        if (status == null || !status.ok() || !release_complete)
+          return rdma_status::make(
+            RDMA_SC_RECOVERY_REQUIRED,
+            "QP recovery query release is not complete"
+          );
+      end
+      status = project_resource_value(
+        registry[key], "commit QP reconciliation", projected
+      );
+      if (!status.ok() || !$cast(replacement, projected))
+        return status.ok() ? rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "authoritative QP reconciliation projection failed"
+        ) : status;
+      status = project_qpc_value(
+        restore_prior ? recovery.qp_recovery.prior_qpc :
+                        recovery.qp_recovery.candidate_qpc,
+        "commit QP selected reconciliation QPC",
+        replacement.programmed_qpc
+      );
+      if (!status.ok() || replacement.programmed_qpc == null)
+        return status.ok() ? rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "selected QP reconciliation QPC projection failed"
+        ) : status;
+      replacement.qp_state = restore_prior ? authoritative_qp.qp_state :
+                                             replacement.programmed_qpc.state;
       replacement.state = RDMA_RESOURCE_ACTIVE;
     end
     status = replacement.validate();
@@ -4348,9 +4432,12 @@ class rdma_resource_manager extends uvm_object;
     rdma_qp authoritative_qp;
     rdma_qp replacement;
     rdma_qp_recovery_state recovery_copy;
+    rdma_qp_recovery_state existing_recovery;
     rdma_recovery_record record_copy;
     rdma_status status;
     string key;
+    bit error_replacement;
+    bit progress_changed;
 
     status = lookup(qp_h, authoritative);
     if (!status.ok() || !$cast(authoritative_qp, authoritative))
@@ -4358,13 +4445,26 @@ class rdma_resource_manager extends uvm_object;
         RDMA_SC_INVALID_ARGUMENT, "QP ERROR target is not a QP"
       ) : status;
     key = resource_key(authoritative.handle);
-    if (!(registry[key].state inside {RDMA_RESOURCE_PROGRAMMED,
-                                      RDMA_RESOURCE_ACTIVE,
-                                      RDMA_RESOURCE_QUIESCING}) ||
-        recovery_records.exists(key))
+    error_replacement =
+      (registry[key].state == RDMA_RESOURCE_ERROR) &&
+      recovery_records.exists(key) &&
+      (recovery_records[key] != null) &&
+      recovery_records[key].qp_recovery_valid &&
+      (recovery_records[key].qp_recovery != null);
+    if ((!(registry[key].state inside {RDMA_RESOURCE_PROGRAMMED,
+                                       RDMA_RESOURCE_ACTIVE,
+                                       RDMA_RESOURCE_QUIESCING}) &&
+         !error_replacement) ||
+        ((registry[key].state != RDMA_RESOURCE_ERROR) &&
+         recovery_records.exists(key)))
       return rdma_status::make(
         RDMA_SC_INVALID_STATE, "QP cannot enter ERROR from its current state"
       );
+    if (error_replacement) begin
+      status = recovery_entry_schema_status(key, "replace QP ERROR recovery");
+      if (!status.ok())
+        return status;
+    end
     status = project_qp_recovery_value(recovery, "mark QP ERROR",
                                        recovery_copy);
     if (!status.ok() || recovery_copy == null)
@@ -4385,6 +4485,75 @@ class rdma_resource_manager extends uvm_object;
       return rdma_status::make(
         RDMA_SC_INVALID_ARGUMENT, "QP recovery authority changed"
       );
+    if (recovery_copy.intent inside {
+          RDMA_QP_RECOVER_MODIFY_RECONCILE,
+          RDMA_QP_RECOVER_NORMAL_DESTROY
+        } &&
+        !same_qpc_value(recovery_copy.prior_qpc,
+                         authoritative_qp.programmed_qpc))
+      return rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT,
+        "QP recovery prior QPC is not authoritative"
+      );
+    if (recovery_copy.intent == RDMA_QP_RECOVER_CREATE_ROLLBACK &&
+        recovery_copy.candidate_qpc != null &&
+        !same_qpc_value(recovery_copy.candidate_qpc,
+                         authoritative_qp.programmed_qpc))
+      return rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT,
+        "QP create recovery candidate QPC is not authoritative"
+      );
+    if (error_replacement) begin
+      existing_recovery = recovery_records[key].qp_recovery;
+      progress_changed = 1'b0;
+      foreach (existing_recovery.role_complete[i])
+        if (existing_recovery.role_complete[i] !=
+            recovery_copy.role_complete[i])
+          progress_changed = 1'b1;
+      if (existing_recovery.ambiguous_operation == RDMA_QP_AMBIG_NONE ||
+          existing_recovery.ambiguous_ticket == null ||
+          recovery_copy.ambiguous_operation != RDMA_QP_AMBIG_NONE ||
+          recovery_copy.ambiguous_ticket != null ||
+          recovery_copy.intent != existing_recovery.intent ||
+          !same_qpc_value(recovery_copy.prior_qpc,
+                           existing_recovery.prior_qpc) ||
+          !same_qpc_value(recovery_copy.candidate_qpc,
+                           existing_recovery.candidate_qpc) ||
+          !same_qp_plan_value(recovery_copy.qp_plan,
+                              existing_recovery.qp_plan) ||
+          !same_context_value(recovery_copy.context_ref,
+                              existing_recovery.context_ref) ||
+          !same_mapping_value(recovery_copy.staging_mapping,
+                              existing_recovery.staging_mapping) ||
+          recovery_copy.staging_mapping != null &&
+            !same_owned_mapping_authority(
+              recovery_copy.staging_mapping,
+              existing_recovery.staging_mapping
+            ) ||
+          !same_mapping_value(recovery_copy.query_mapping,
+                              existing_recovery.query_mapping) ||
+          recovery_copy.query_mapping != null &&
+            !same_owned_mapping_authority(
+              recovery_copy.query_mapping,
+              existing_recovery.query_mapping
+            ) ||
+          !rdma_qp_recovery_opcode_equivalent(
+            recovery_copy.create_opcode, existing_recovery.create_opcode
+          ) ||
+          !rdma_qp_recovery_opcode_equivalent(
+            recovery_copy.modify_opcode, existing_recovery.modify_opcode
+          ) ||
+          !rdma_qp_recovery_opcode_equivalent(
+            recovery_copy.delete_opcode, existing_recovery.delete_opcode
+          ) ||
+          !rdma_qp_recovery_opcode_equivalent(
+            recovery_copy.query_opcode, existing_recovery.query_opcode
+          ) || progress_changed)
+        return rdma_status::make(
+          RDMA_SC_INVALID_ARGUMENT,
+          "QP ERROR replacement changed retained authority or progress"
+        );
+    end
     status = project_resource_value(registry[key], "mark QP ERROR resource",
                                     projected);
     if (!status.ok() || !$cast(replacement, projected))
@@ -4400,20 +4569,30 @@ class rdma_resource_manager extends uvm_object;
     if (!status.ok())
       return status;
 
-    record_copy = new("qp_recovery_record");
-    status = project_handle_value(authoritative.handle, "QP recovery handle",
-                                  record_copy.resource_h);
-    if (!status.ok())
-      return status;
-    record_copy.hardware_presence =
-      recovery_copy.intent == RDMA_QP_RECOVER_CREATE_ROLLBACK &&
-      recovery_copy.ambiguous_operation == RDMA_QP_AMBIG_NONE ?
-        RDMA_HW_PRESENCE_ABSENT : RDMA_HW_PRESENCE_PRESENT;
-    record_copy.primary_status = rdma_status::make(
-      RDMA_SC_RECOVERY_REQUIRED, "QP requires lifecycle recovery"
-    );
-    record_copy.qp_recovery_valid = 1'b1;
-    record_copy.qp_recovery = recovery_copy;
+    if (error_replacement) begin
+      status = project_recovery_value(
+        recovery_records[key], "replace QP ERROR record", record_copy
+      );
+      if (!status.ok())
+        return status;
+      record_copy.qp_recovery = recovery_copy;
+    end
+    else begin
+      record_copy = new("qp_recovery_record");
+      status = project_handle_value(authoritative.handle, "QP recovery handle",
+                                    record_copy.resource_h);
+      if (!status.ok())
+        return status;
+      record_copy.hardware_presence =
+        recovery_copy.intent == RDMA_QP_RECOVER_CREATE_ROLLBACK &&
+        recovery_copy.ambiguous_operation == RDMA_QP_AMBIG_NONE ?
+          RDMA_HW_PRESENCE_ABSENT : RDMA_HW_PRESENCE_PRESENT;
+      record_copy.primary_status = rdma_status::make(
+        RDMA_SC_RECOVERY_REQUIRED, "QP requires lifecycle recovery"
+      );
+      record_copy.qp_recovery_valid = 1'b1;
+      record_copy.qp_recovery = recovery_copy;
+    end
     status = record_copy.validate();
     if (status == null)
       return rdma_status::make(
@@ -4627,6 +4806,7 @@ class rdma_resource_manager extends uvm_object;
     rdma_qp_backing_ref recovery_ref;
     rdma_status status;
     bit has_recovery;
+    bit release_complete;
     string key;
 
     if (!rdma_qp_role_is_payload(role) && !rdma_qp_role_is_pd(role))
@@ -4650,6 +4830,43 @@ class rdma_resource_manager extends uvm_object;
         RDMA_SC_INVALID_ARGUMENT,
         "QP cleanup role is absent, borrowed, or already complete"
       );
+    if (resource_copy.qp_plan.context_ref == null ||
+        !resource_copy.qp_plan.context_ref.release_complete ||
+        has_recovery &&
+          (recovery_copy.qp_recovery.context_ref == null ||
+           !recovery_copy.qp_recovery.context_ref.release_complete ||
+           recovery_copy.qp_recovery.qp_plan.context_ref == null ||
+           !recovery_copy.qp_recovery.qp_plan.context_ref.release_complete))
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "QP context cleanup must precede owned backing cleanup"
+      );
+    status = query_owned_release_completion(resource_ref.mapping,
+                                            release_complete);
+    if (status == null || !status.ok())
+      return status == null ? rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "QP backing completion query returned null"
+      ) : status;
+    if (!release_complete)
+      return rdma_status::make(
+        RDMA_SC_RECOVERY_REQUIRED,
+        "QP backing release is not opaquely complete"
+      );
+    if (has_recovery) begin
+      status = query_owned_release_completion(recovery_ref.mapping,
+                                              release_complete);
+      if (status == null || !status.ok())
+        return status == null ? rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "QP recovery backing completion query returned null"
+        ) : status;
+      if (!release_complete)
+        return rdma_status::make(
+          RDMA_SC_RECOVERY_REQUIRED,
+          "QP recovery backing release is not opaquely complete"
+        );
+    end
     resource_ref.cleanup_complete = 1'b1;
     if (has_recovery) begin
       recovery_ref.cleanup_complete = 1'b1;
@@ -4664,6 +4881,8 @@ class rdma_resource_manager extends uvm_object;
   );
     rdma_qp resource_copy;
     rdma_recovery_record recovery_copy;
+    rdma_queue_slot_token_contract resource_token;
+    rdma_queue_slot_token_contract recovery_token;
     rdma_status status;
     bit has_recovery;
     string key;
@@ -4684,6 +4903,47 @@ class rdma_resource_manager extends uvm_object;
         RDMA_SC_INVALID_ARGUMENT,
         "QP context cleanup is absent or already complete"
       );
+    if (!resource_copy.qp_plan.cleanup_complete ||
+        !resource_copy.qp_plan.sq_pd_flush_complete ||
+        resource_copy.qp_plan.rq_source_h == null &&
+          !resource_copy.qp_plan.rq_pd_flush_complete ||
+        has_recovery &&
+          (!recovery_copy.qp_recovery.qp_plan.cleanup_complete ||
+           !recovery_copy.qp_recovery.qp_plan.sq_pd_flush_complete ||
+           recovery_copy.qp_recovery.qp_plan.rq_source_h == null &&
+             !recovery_copy.qp_recovery.qp_plan.rq_pd_flush_complete))
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "QP required flushes must precede context cleanup"
+      );
+    if (!$cast(resource_token,
+               resource_copy.qp_plan.context_ref.slot_token) ||
+        resource_token.completion_authority == null)
+      return rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT,
+        "QP context completion authority is invalid"
+      );
+    if (!resource_token.completion_authority.complete)
+      return rdma_status::make(
+        RDMA_SC_RECOVERY_REQUIRED,
+        "QP context release is not opaquely complete"
+      );
+    if (has_recovery) begin
+      if (!$cast(recovery_token,
+                 recovery_copy.qp_recovery.context_ref.slot_token) ||
+          recovery_token.completion_authority == null ||
+          recovery_token.completion_authority !==
+            resource_token.completion_authority)
+        return rdma_status::make(
+          RDMA_SC_INVALID_ARGUMENT,
+          "QP recovery context completion authority changed"
+        );
+      if (!recovery_token.completion_authority.complete)
+        return rdma_status::make(
+          RDMA_SC_RECOVERY_REQUIRED,
+          "QP recovery context release is not opaquely complete"
+        );
+    end
     resource_copy.qp_plan.context_ref.release_complete = 1'b1;
     if (has_recovery) begin
       recovery_copy.qp_recovery.context_ref.release_complete = 1'b1;
@@ -4695,11 +4955,17 @@ class rdma_resource_manager extends uvm_object;
 
   protected function bit qp_plan_cleanup_ready(rdma_qp_backing_plan plan);
     rdma_qp_backing_ref refs[$];
+    rdma_queue_slot_token_contract token;
+    rdma_status status;
+    bit release_complete;
 
     if (plan == null || !plan.cleanup_complete ||
         !plan.sq_pd_flush_complete ||
         (plan.rq_source_h == null && !plan.rq_pd_flush_complete) ||
-        plan.context_ref == null || !plan.context_ref.release_complete)
+        plan.context_ref == null || !plan.context_ref.release_complete ||
+        !$cast(token, plan.context_ref.slot_token) ||
+        token.completion_authority == null ||
+        !token.completion_authority.complete)
       return 1'b0;
     refs.push_back(plan.sq_ref);
     refs.push_back(plan.sq_pd_ref);
@@ -4715,6 +4981,12 @@ class rdma_resource_manager extends uvm_object;
       if (refs[i].ownership == RDMA_OWNERSHIP_CONTROL_PLANE &&
           !refs[i].cleanup_complete)
         return 1'b0;
+      if (refs[i].ownership == RDMA_OWNERSHIP_CONTROL_PLANE) begin
+        status = query_owned_release_completion(refs[i].mapping,
+                                                release_complete);
+        if (status == null || !status.ok() || !release_complete)
+          return 1'b0;
+      end
       if (refs[i].ownership == RDMA_OWNERSHIP_BORROWED &&
           refs[i].cleanup_complete)
         return 1'b0;
@@ -4726,7 +4998,11 @@ class rdma_resource_manager extends uvm_object;
     rdma_resource authoritative;
     rdma_qp authoritative_qp;
     rdma_recovery_record recovery;
+    rdma_queue_slot_token_contract resource_context_token;
+    rdma_queue_slot_token_contract recovery_context_token;
+    rdma_queue_slot_token_contract recovery_plan_context_token;
     rdma_status status;
+    bit release_complete;
     string key;
 
     status = registry_schema_status("finalize QP release");
@@ -4766,13 +5042,61 @@ class rdma_resource_manager extends uvm_object;
         return rdma_status::make(RDMA_SC_RECOVERY_REQUIRED,
                                  "ERROR QP recovery is missing");
       recovery = recovery_records[key];
+      if (recovery.qp_recovery == null ||
+          recovery.qp_recovery.context_ref == null ||
+          recovery.qp_recovery.qp_plan == null ||
+          recovery.qp_recovery.qp_plan.context_ref == null ||
+          !$cast(resource_context_token,
+                 authoritative_qp.qp_plan.context_ref.slot_token) ||
+          !$cast(recovery_context_token,
+                 recovery.qp_recovery.context_ref.slot_token) ||
+          !$cast(recovery_plan_context_token,
+                 recovery.qp_recovery.qp_plan.context_ref.slot_token) ||
+          resource_context_token.completion_authority == null ||
+          recovery_context_token.completion_authority == null ||
+          recovery_plan_context_token.completion_authority == null ||
+          recovery_context_token.completion_authority !==
+            resource_context_token.completion_authority ||
+          recovery_plan_context_token.completion_authority !==
+            resource_context_token.completion_authority)
+        return rdma_status::make(
+          RDMA_SC_INVALID_ARGUMENT,
+          "QP recovery context completion authority changed"
+        );
+      if (!recovery_context_token.completion_authority.complete)
+        return rdma_status::make(
+          RDMA_SC_RECOVERY_REQUIRED,
+          "QP recovery context release is not opaquely complete"
+        );
       if (!recovery.qp_recovery_valid || recovery.qp_recovery == null ||
+          recovery.qp_recovery.ambiguous_operation != RDMA_QP_AMBIG_NONE ||
+          recovery.qp_recovery.ambiguous_ticket != null ||
           !qp_plan_cleanup_ready(recovery.qp_recovery.qp_plan) ||
           recovery.qp_recovery.context_ref == null ||
           !recovery.qp_recovery.context_ref.release_complete)
         return rdma_status::make(
           RDMA_SC_RECOVERY_REQUIRED, "QP recovery cleanup is not complete"
         );
+      if (recovery.qp_recovery.staging_mapping != null) begin
+        status = query_owned_release_completion(
+          recovery.qp_recovery.staging_mapping, release_complete
+        );
+        if (status == null || !status.ok() || !release_complete)
+          return rdma_status::make(
+            RDMA_SC_RECOVERY_REQUIRED,
+            "QP recovery staging release is not complete"
+          );
+      end
+      if (recovery.qp_recovery.query_mapping != null) begin
+        status = query_owned_release_completion(
+          recovery.qp_recovery.query_mapping, release_complete
+        );
+        if (status == null || !status.ok() || !release_complete)
+          return rdma_status::make(
+            RDMA_SC_RECOVERY_REQUIRED,
+            "QP recovery query release is not complete"
+          );
+      end
     end
     if (has_dependents(registry[key]) ||
         registry[key].outstanding_ids.size() != 0)
@@ -5532,6 +5856,12 @@ class rdma_resource_manager extends uvm_object;
     status = project_handle_value(handle, "mark error", trusted_handle);
     if (!status.ok())
       return status;
+    if (trusted_handle != null &&
+        trusted_handle.kind == RDMA_RESOURCE_QP)
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "QP resources require QP-specific ERROR publication"
+      );
     status = project_public_recovery_value(recovery, "mark error",
                                            recovery_copy);
     if (!status.ok())
