@@ -199,7 +199,7 @@ class rdma_queue_backing_slice extends uvm_object;
   endfunction
 
   virtual function rdma_status validate();
-    if (!rdma_queue_role_is_payload(role))
+    if (!rdma_queue_role_is_payload(role) && !rdma_qp_role_is_payload(role))
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "slice role is not payload");
     if (!rdma_queue_aligned(logical_queue_offset,
                             role == RDMA_QUEUE_ROLE_SRQ_SGB ? 512 : 4096))
@@ -478,7 +478,7 @@ class rdma_queue_backing_segment extends uvm_object;
   virtual function rdma_status validate();
     longint unsigned alignment;
 
-    if (!rdma_queue_role_is_payload(role))
+    if (!rdma_queue_role_is_payload(role) && !rdma_qp_role_is_payload(role))
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "backing segment role is not payload");
     if (!(ownership inside {RDMA_OWNERSHIP_BORROWED,
@@ -984,6 +984,7 @@ class rdma_qp_backing_ref extends uvm_object;
   rdma_resource_ownership_e ownership;
   longint unsigned mapping_offset;
   longint unsigned length;
+  rdma_queue_backing_segment additional_segments[$];
   bit cleanup_complete;
 
   function new(string name = "rdma_qp_backing_ref");
@@ -1013,6 +1014,14 @@ class rdma_qp_backing_ref extends uvm_object;
       if (c == null || !$cast(mapping, c) || mapping == r.mapping)
         `uvm_fatal("RDMA_COPY_TYPE", "QP backing mapping clone failure")
     end
+    additional_segments.delete();
+    foreach (r.additional_segments[i]) begin
+      rdma_queue_backing_segment segment;
+      c = r.additional_segments[i].clone();
+      if (c == null || !$cast(segment, c) || segment == r.additional_segments[i])
+        `uvm_fatal("RDMA_COPY_TYPE", "QP additional backing segment clone failure")
+      additional_segments.push_back(segment);
+    end
   endfunction
 
   virtual function rdma_status validate();
@@ -1034,6 +1043,24 @@ class rdma_qp_backing_ref extends uvm_object;
       return rdma_status::make(RDMA_SC_INVALID_STATE, "borrowed QP backing cleaned");
     status = rdma_queue_queue_range_status(mapping, mapping_offset, length, 4096);
     if (!status.ok()) return status;
+    if (rdma_qp_role_is_pd(role) && additional_segments.size() != 0)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "QP PD backing cannot have segments");
+    begin
+      longint unsigned next_logical_offset;
+      next_logical_offset = length;
+      foreach (additional_segments[i]) begin
+        if (additional_segments[i] == null ||
+            additional_segments[i].role != role ||
+            additional_segments[i].ownership != ownership ||
+            additional_segments[i].logical_queue_offset != next_logical_offset)
+          return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                                   "QP backing segments are not contiguous");
+        status = additional_segments[i].validate();
+        if (!status.ok()) return status;
+        next_logical_offset += additional_segments[i].length;
+      end
+    end
     if ((role inside {RDMA_QUEUE_ROLE_QP_URC_RSQ,
                       RDMA_QUEUE_ROLE_QP_URC_RDSQ}) && length != 4096 ||
         role == RDMA_QUEUE_ROLE_QP_URC_DSQ && length != 8192)
@@ -1136,7 +1163,9 @@ class rdma_qp_backing_plan extends uvm_object;
     status = sq_ref.validate(); if (!status.ok()) return status;
     status = sq_pd_ref.validate(); if (!status.ok()) return status;
     if (sq_ref.role != RDMA_QUEUE_ROLE_QP_SQ_RING ||
-        sq_ref.length != sq_ring.storage_bytes ||
+        (sq_ref.length + (sq_ref.additional_segments.size() == 0 ? 0 :
+          sq_ref.additional_segments[sq_ref.additional_segments.size()-1].logical_queue_offset +
+          sq_ref.additional_segments[sq_ref.additional_segments.size()-1].length - sq_ref.length)) != sq_ring.storage_bytes ||
         sq_pd_ref.role != RDMA_QUEUE_ROLE_QP_SQ_PD ||
         sq_pd_ref.length != 4096)
       return rdma_status::make(RDMA_SC_INVALID_STATE, "QP SQ references do not match ring");
@@ -1148,7 +1177,9 @@ class rdma_qp_backing_plan extends uvm_object;
       status = rq_pd_ref.validate(); if (!status.ok()) return status;
       if (rq_ring.role != RDMA_QUEUE_ROLE_QP_RQ_RING || rq_ring.depth != rq_depth ||
           rq_ref.role != RDMA_QUEUE_ROLE_QP_RQ_RING ||
-          rq_ref.length != rq_ring.storage_bytes ||
+          (rq_ref.length + (rq_ref.additional_segments.size() == 0 ? 0 :
+            rq_ref.additional_segments[rq_ref.additional_segments.size()-1].logical_queue_offset +
+            rq_ref.additional_segments[rq_ref.additional_segments.size()-1].length - rq_ref.length)) != rq_ring.storage_bytes ||
           rq_pd_ref.role != RDMA_QUEUE_ROLE_QP_RQ_PD ||
           rq_pd_ref.length != 4096)
         return rdma_status::make(RDMA_SC_INVALID_STATE, "QP private RQ references invalid");

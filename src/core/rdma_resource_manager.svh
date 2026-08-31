@@ -1745,6 +1745,29 @@ class rdma_resource_manager extends uvm_object;
     result.mapping_offset = source.mapping_offset;
     result.length = source.length;
     result.cleanup_complete = source.cleanup_complete;
+    result.additional_segments.delete();
+    foreach (source.additional_segments[i]) begin
+      rdma_queue_backing_segment segment;
+      if (source.additional_segments[i] == null) begin
+        result = null;
+        return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                                 "QP backing segment is null");
+      end
+      segment = new({copy_label, "_segment"});
+      segment.role = source.additional_segments[i].role;
+      segment.ownership = source.additional_segments[i].ownership;
+      segment.mapping_offset = source.additional_segments[i].mapping_offset;
+      segment.length = source.additional_segments[i].length;
+      segment.logical_queue_offset = source.additional_segments[i].logical_queue_offset;
+      if (segment.ownership == RDMA_OWNERSHIP_CONTROL_PLANE)
+        status = clone_owned_mapping_value(source.additional_segments[i].mapping,
+          {copy_label, "_segment_mapping"}, segment.mapping);
+      else
+        status = project_mapping_value(source.additional_segments[i].mapping,
+          {copy_label, "_segment_mapping"}, segment.mapping);
+      if (!status.ok()) begin result = null; return status; end
+      result.additional_segments.push_back(segment);
+    end
     return rdma_status::success();
   endfunction
 
@@ -1999,8 +2022,19 @@ class rdma_resource_manager extends uvm_object;
       return lhs == rhs;
     if (lhs.role != rhs.role || lhs.ownership != rhs.ownership ||
         lhs.mapping_offset != rhs.mapping_offset || lhs.length != rhs.length ||
-        lhs.cleanup_complete != rhs.cleanup_complete)
+        lhs.cleanup_complete != rhs.cleanup_complete ||
+        lhs.additional_segments.size() != rhs.additional_segments.size())
       return 1'b0;
+    foreach (lhs.additional_segments[i]) begin
+      if (lhs.additional_segments[i] == null || rhs.additional_segments[i] == null ||
+          lhs.additional_segments[i].role != rhs.additional_segments[i].role ||
+          lhs.additional_segments[i].ownership != rhs.additional_segments[i].ownership ||
+          lhs.additional_segments[i].mapping_offset != rhs.additional_segments[i].mapping_offset ||
+          lhs.additional_segments[i].length != rhs.additional_segments[i].length ||
+          lhs.additional_segments[i].logical_queue_offset != rhs.additional_segments[i].logical_queue_offset ||
+          !same_mapping_value(lhs.additional_segments[i].mapping,
+                              rhs.additional_segments[i].mapping)) return 1'b0;
+    end
     if (lhs.ownership == RDMA_OWNERSHIP_CONTROL_PLANE)
       return same_mapping_value(lhs.mapping, rhs.mapping) &&
              same_owned_mapping_authority(lhs.mapping, rhs.mapping);

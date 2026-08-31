@@ -33,6 +33,21 @@ class rdma_qp_lifecycle_executor extends uvm_object;
     return status == null ? invalid_state(message) : status;
   endfunction
 
+  protected function rdma_status live_binding_fence(
+    rdma_function_binding binding, rdma_function_handle expected_owner
+  );
+    rdma_status status;
+    if (binding == null || expected_owner == null)
+      return invalid_argument("QP binding fence input is null");
+    status = normalize_status(binding.validate(), "QP binding fence returned null");
+    if (!status.ok()) return status;
+    if (binding.state != RDMA_BIND_ACTIVE ||
+        !binding.make_handle().same_instance(expected_owner))
+      return rdma_status::make(RDMA_SC_STALE_GENERATION,
+                               "QP binding generation is stale");
+    return rdma_status::success();
+  endfunction
+
   function rdma_status configure(
     rdma_resource_manager manager,
     rdma_cmq_port cmq,
@@ -111,25 +126,39 @@ class rdma_qp_lifecycle_executor extends uvm_object;
     if (!status.ok()) return status;
     if (mapping == null || mapping.size < length ||
         (mapping.iova.value & 64'hfff) != 0 ||
-        (mapping.backing_addr.value & 64'hfff) != 0)
+        (mapping.backing_addr.value & 64'hfff) != 0) begin
+      void'(host_mem.\release (mapping));
       return invalid_state("QP backing allocation geometry is invalid");
+    end
     status = normalize_status(mapping.snapshot_release_authority(authority),
                               "QP backing authority snapshot returned null");
-    if (!status.ok() || authority == null) return status.ok() ?
-      invalid_state("QP backing authority snapshot is null") : status;
+    if (!status.ok() || authority == null) begin
+      void'(host_mem.\release (mapping));
+      return status.ok() ? invalid_state("QP backing authority snapshot is null") : status;
+    end
+    status = normalize_status(mapping.release_authority_status(authority),
+      "QP backing authority equivalence returned null");
+    if (!status.ok()) begin void'(host_mem.\release (mapping)); return status; end
     authority.copy(mapping);
+    status = normalize_status(mapping.release_authority_status(authority),
+      "QP copied backing authority equivalence returned null");
+    if (!status.ok()) begin void'(host_mem.\release (mapping)); return status; end
     backing_ref = rdma_qp_backing_ref::type_id::create(
       $sformatf("qp_ref_%0d", role)
     );
-    if (backing_ref == null)
+    if (backing_ref == null) begin
+      void'(host_mem.\release (mapping));
       return rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED,
                                "QP backing reference allocation failed");
+    end
     backing_ref.role = role;
     backing_ref.mapping = authority;
     backing_ref.ownership = RDMA_OWNERSHIP_CONTROL_PLANE;
     backing_ref.mapping_offset = 0;
     backing_ref.length = length;
-    return backing_ref.validate();
+    status = backing_ref.validate();
+    if (!status.ok()) begin void'(host_mem.\release (mapping)); backing_ref = null; end
+    return status;
   endfunction
 
   protected function rdma_status clone_borrowed_ref(
@@ -141,15 +170,15 @@ class rdma_qp_lifecycle_executor extends uvm_object;
     uvm_object cloned;
 
     backing_ref = null;
-    if (spec == null || spec.slices.size() != 1 || spec.slices[0] == null ||
-        spec.slices[0].mapping == null || spec.slices[0].role != role ||
-        spec.slices[0].logical_queue_offset != 0 ||
-        spec.slices[0].length != length)
-      return invalid_argument("QP borrowed backing is not one canonical range");
+    if (spec == null || spec.slices.size() == 0)
+      return invalid_argument("QP borrowed backing is empty");
     backing_ref = rdma_qp_backing_ref::type_id::create("qp_borrowed_ref");
     if (backing_ref == null)
       return rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED,
                                "QP borrowed reference allocation failed");
+    if (spec.slices[0] == null || spec.slices[0].mapping == null ||
+        spec.slices[0].role != role || spec.slices[0].logical_queue_offset != 0)
+      return invalid_argument("QP borrowed backing first slice is invalid");
     cloned = spec.slices[0].mapping.clone();
     if (cloned == null || !$cast(backing_ref.mapping, cloned) ||
         backing_ref.mapping == spec.slices[0].mapping)
@@ -157,7 +186,35 @@ class rdma_qp_lifecycle_executor extends uvm_object;
     backing_ref.role = role;
     backing_ref.ownership = RDMA_OWNERSHIP_BORROWED;
     backing_ref.mapping_offset = spec.slices[0].mapping_offset;
-    backing_ref.length = length;
+    backing_ref.length = spec.slices[0].length;
+    begin
+      longint unsigned covered;
+      covered = backing_ref.length;
+      for (int i = 1; i < spec.slices.size(); i++) begin
+        rdma_queue_backing_segment segment;
+        rdma_dma_mapping mapping_clone;
+        if (spec.slices[i] == null || spec.slices[i].mapping == null ||
+            spec.slices[i].role != role ||
+            spec.slices[i].logical_queue_offset != covered)
+          return invalid_argument("QP borrowed backing is not contiguous");
+        cloned = spec.slices[i].mapping.clone();
+        if (cloned == null || !$cast(mapping_clone, cloned) ||
+            mapping_clone == spec.slices[i].mapping)
+          return invalid_state("QP borrowed segment clone failed");
+        segment = rdma_queue_backing_segment::type_id::create("qp_borrowed_segment");
+        if (segment == null) return rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED,
+          "QP borrowed segment allocation failed");
+        segment.role = role; segment.mapping = mapping_clone;
+        segment.ownership = RDMA_OWNERSHIP_BORROWED;
+        segment.mapping_offset = spec.slices[i].mapping_offset;
+        segment.length = spec.slices[i].length;
+        segment.logical_queue_offset = covered;
+        backing_ref.additional_segments.push_back(segment);
+        covered += segment.length;
+      end
+      if (covered != length)
+        return invalid_argument("QP borrowed backing does not cover ring");
+    end
     return backing_ref.validate();
   endfunction
 
@@ -199,14 +256,42 @@ class rdma_qp_lifecycle_executor extends uvm_object;
     rdma_queue_dma_page_ref pages[$];
     rdma_queue_dma_page_ref page;
     rdma_status status;
+    longint unsigned payload_bytes;
 
-    zeros = new[int'(payload_ref.length)];
-    foreach (zeros[i]) zeros[i] = 0;
-    status = normalize_status(host_mem.write(payload_ref.mapping,
-      payload_ref.mapping_offset, zeros), "QP payload zero-write returned null");
-    if (!status.ok()) return status;
-    for (longint unsigned offset = 0; offset < payload_ref.length;
+    payload_bytes = payload_ref.length;
+    foreach (payload_ref.additional_segments[i])
+      payload_bytes += payload_ref.additional_segments[i].length;
+    // QP refs retain the first borrowed range directly and subsequent ranges
+    // as detached segments. Resolve each 4 KiB logical page through that
+    // canonical coverage instead of assuming a single mapping.
+
+    if (payload_ref.ownership == RDMA_OWNERSHIP_CONTROL_PLANE) begin
+      zeros = new[int'(payload_ref.length)];
+      foreach (zeros[i]) zeros[i] = 0;
+      status = normalize_status(host_mem.write(payload_ref.mapping,
+        payload_ref.mapping_offset, zeros), "QP payload zero-write returned null");
+      if (!status.ok()) return status;
+    end
+    for (longint unsigned offset = 0; offset < payload_bytes;
          offset += 4096) begin
+      rdma_dma_mapping page_mapping;
+      longint unsigned page_mapping_offset;
+      page_mapping = null;
+      page_mapping_offset = 0;
+      if (offset < payload_ref.length) begin
+        page_mapping = payload_ref.mapping;
+        page_mapping_offset = payload_ref.mapping_offset + offset;
+      end else foreach (payload_ref.additional_segments[i]) begin
+        if (payload_ref.additional_segments[i] != null &&
+            offset >= payload_ref.additional_segments[i].logical_queue_offset &&
+            offset < payload_ref.additional_segments[i].logical_queue_offset +
+                     payload_ref.additional_segments[i].length) begin
+          page_mapping = payload_ref.additional_segments[i].mapping;
+          page_mapping_offset = payload_ref.additional_segments[i].mapping_offset +
+            offset - payload_ref.additional_segments[i].logical_queue_offset;
+        end
+      end
+      if (page_mapping == null) return invalid_state("QP payload page coverage is incomplete");
       page = rdma_queue_dma_page_ref::type_id::create("qp_pd_page");
       if (page == null)
         return rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED,
@@ -215,11 +300,10 @@ class rdma_qp_lifecycle_executor extends uvm_object;
       // reference validator predates QP-only roles, so use its neutral ring
       // discriminator while preserving QP role authority in the plan/ref.
       page.role = RDMA_QUEUE_ROLE_CQ_RING;
-      page.mapping = payload_ref.mapping;
-      page.mapping_offset = payload_ref.mapping_offset + offset;
+      page.mapping = page_mapping;
+      page.mapping_offset = page_mapping_offset;
       page.logical_page_offset = offset;
-      page.page_iova.value = payload_ref.mapping.iova.value +
-                             payload_ref.mapping_offset + offset;
+      page.page_iova.value = page_mapping.iova.value + page_mapping_offset;
       status = page.validate();
       if (!status.ok()) return status;
       pages.push_back(page);
@@ -470,6 +554,8 @@ class rdma_qp_lifecycle_executor extends uvm_object;
   function rdma_status encode_qpc_staging(
     rdma_function_binding binding,
     rdma_qpc_model model,
+    rdma_handle authoritative_qp_h,
+    rdma_function_handle expected_owner,
     output rdma_dma_mapping staging,
     output rdma_hw_image image
   );
@@ -485,7 +571,8 @@ class rdma_qp_lifecycle_executor extends uvm_object;
 
     staging = null;
     image = null;
-    if (binding == null || model == null || host_mem == null || qpc_codecs == null)
+    if (binding == null || model == null || authoritative_qp_h == null ||
+        expected_owner == null || host_mem == null || qpc_codecs == null)
       return invalid_argument("QPC staging input is null");
     status = model.validate();
     if (!status.ok()) return status;
@@ -513,7 +600,7 @@ class rdma_qp_lifecycle_executor extends uvm_object;
     if (!status.ok()) return status;
     if (!equal) return rdma_status::make(RDMA_SC_CODEC_ERROR,
                                          {"QPC round-trip mismatch: ", mismatch});
-    status = make_dma_context(binding, model.qp_h, RDMA_QUEUE_ROLE_QP_SQ_PD,
+    status = make_dma_context(binding, authoritative_qp_h, RDMA_QUEUE_ROLE_QP_SQ_PD,
                               request_context);
     if (!status.ok()) return status;
     request_context.queue_role_valid = 1'b0;
@@ -529,7 +616,7 @@ class rdma_qp_lifecycle_executor extends uvm_object;
     status = normalize_status(host_mem.write(staging, 0, data),
       "QPC staging write returned null");
     if (!status.ok()) return status;
-    return normalize_status(binding.validate(), "QPC staging fence returned null");
+    return live_binding_fence(binding, expected_owner);
   endfunction
 
   task create_locked(
@@ -558,11 +645,7 @@ class rdma_qp_lifecycle_executor extends uvm_object;
       result.status = invalid_state("QP executor is not configured");
       return;
     end
-    status = binding.validate();
-    if (status.ok() && (binding.state != RDMA_BIND_ACTIVE ||
-                        !binding.make_handle().same_instance(expected_owner)))
-      status = rdma_status::make(RDMA_SC_STALE_GENERATION,
-                                 "QP create binding generation is stale");
+    status = live_binding_fence(binding, expected_owner);
     if (status.ok()) status = request.validate_queue_caps(binding.queue_caps);
     if (status.ok()) status = manager.create_qp(binding, request.pd_h,
       request.send_cq_h, request.recv_cq_h, request.srq_h, candidate);
@@ -570,7 +653,11 @@ class rdma_qp_lifecycle_executor extends uvm_object;
       status = invalid_argument("QP local QPN exceeds 21 bits");
     if (status.ok()) status = materialize_plan(binding, candidate, request, plan);
     if (status.ok()) status = build_qpc_model(binding, candidate, request, plan, model);
-    if (status.ok()) status = encode_qpc_staging(binding, model, staging, image);
+    if (status.ok()) status = encode_qpc_staging(binding, model, candidate.handle,
+                                                  expected_owner, staging, image);
+    if (status.ok()) begin
+      status = live_binding_fence(binding, expected_owner);
+    end
     if (status.ok()) begin
       candidate.transport = request.transport;
       candidate.qp_state = RDMA_QPS_RESET;

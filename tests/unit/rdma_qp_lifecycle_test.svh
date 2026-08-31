@@ -107,6 +107,17 @@ class rdma_qp_lifecycle_test extends uvm_test;
     return attrs;
   endfunction
 
+  function automatic rdma_qp_context_attributes make_ud_attrs(string name);
+    rdma_qp_context_attributes attrs;
+    rdma_qpc_ud_ext ext;
+    attrs = make_rc_attrs(name);
+    attrs.address_vector.traffic_class = 8'hac;
+    ext = rdma_qpc_ud_ext::type_id::create({name, "_ud"});
+    ext.qkey = 32'h1111_2222;
+    attrs.transport_ext = ext;
+    return attrs;
+  endfunction
+
   function automatic rdma_create_qp_req make_request(
     string name, rdma_function_binding binding, rdma_pd pd, rdma_cq cq,
     rdma_transport_e transport
@@ -124,7 +135,8 @@ class rdma_qp_lifecycle_test extends uvm_test;
     request.send_cq_h = rdma_clone_handle_value(cq.handle, "test QP send CQ");
     request.recv_cq_h = rdma_clone_handle_value(cq.handle, "test QP receive CQ");
     request.context_attrs = transport == RDMA_TRANSPORT_URC ?
-      make_urc_attrs({name, "_attrs"}) : make_rc_attrs({name, "_attrs"});
+      make_urc_attrs({name, "_attrs"}) : transport == RDMA_TRANSPORT_UD ?
+      make_ud_attrs({name, "_attrs"}) : make_rc_attrs({name, "_attrs"});
     return request;
   endfunction
 
@@ -195,6 +207,24 @@ class rdma_qp_lifecycle_test extends uvm_test;
     if (staging_mapping == null || qp == null || qp.qp_plan == null ||
         staging_mapping.iova.value == qp.qp_plan.context_ref.shadow_pointer_base.value)
       `uvm_error("RC_PLAN", "staging mapping was not distinct from QPC context")
+    foreach (mem.calls[i])
+      if (mem.calls[i].method_name == "allocate" && mem.calls[i].size == 512 &&
+          (mem.calls[i].request_context == null ||
+           mem.calls[i].request_context.owner_h == null || qp == null ||
+           !mem.calls[i].request_context.owner_h.same_instance(qp.handle)))
+        `uvm_error("RC_PLAN", "staging DMA owner was not the global QP handle")
+  endtask
+
+  task automatic check_ud_semantic_round_trip();
+    rdma_mock_host_mem mem;
+    rdma_qp qp;
+    rdma_qpc_ud_ext ud_ext;
+    create_qp_fixture("UD_QPC", RDMA_TRANSPORT_UD, mem, qp);
+    ud_ext = null;
+    if (qp == null || qp.programmed_qpc == null ||
+        qp.programmed_qpc.transport != RDMA_TRANSPORT_UD ||
+        !$cast(ud_ext, qp.programmed_qpc.transport_ext))
+      `uvm_error("UD_QPC", "UD QPC was not materialized through its codec")
   endtask
 
   task automatic check_urc_internal_geometry();
@@ -300,6 +330,7 @@ class rdma_qp_lifecycle_test extends uvm_test;
   task run_phase(uvm_phase phase);
     phase.raise_objection(this);
     check_rc_plan_and_staging_authority();
+    check_ud_semantic_round_trip();
     check_rc_srq_geometry();
     check_urc_internal_geometry();
     phase.drop_objection(this);

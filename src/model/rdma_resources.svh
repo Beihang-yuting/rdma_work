@@ -76,10 +76,22 @@ function automatic rdma_status rdma_qp_mapping_authority_status(
       !backing_ref.mapping.function_h.same_instance(owner))
     return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                              {label, " mapping Function does not match"});
-  if (backing_ref.mapping.owner_h == null ||
-      !backing_ref.mapping.owner_h.same_instance(qp_h))
+  if (backing_ref.ownership == RDMA_OWNERSHIP_CONTROL_PLANE &&
+      (backing_ref.mapping.owner_h == null ||
+       !backing_ref.mapping.owner_h.same_instance(qp_h)))
     return rdma_status::make(RDMA_SC_INVALID_STATE,
-                             {label, " mapping QP owner does not match"});
+                               {label, " mapping QP owner does not match"});
+  foreach (backing_ref.additional_segments[i]) begin
+    if (backing_ref.additional_segments[i] == null ||
+        backing_ref.additional_segments[i].mapping == null ||
+        backing_ref.additional_segments[i].mapping.function_h == null ||
+        !backing_ref.additional_segments[i].mapping.function_h.same_instance(owner) ||
+        (backing_ref.additional_segments[i].ownership == RDMA_OWNERSHIP_CONTROL_PLANE &&
+         (backing_ref.additional_segments[i].mapping.owner_h == null ||
+          !backing_ref.additional_segments[i].mapping.owner_h.same_instance(qp_h))))
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               {label, " segment mapping authority is invalid"});
+  end
   return rdma_status::success();
 endfunction
 
@@ -625,12 +637,6 @@ class rdma_qp extends rdma_resource;
       if (cloned_object == null || !$cast(qp_plan, cloned_object) ||
           qp_plan == rhs_qp.qp_plan)
         `uvm_fatal("RDMA_COPY_TYPE", "QP backing plan clone mismatch")
-      // Preserve the identity relation required by QP validation for an SRQ
-      // backed receive queue.  Independent handle cloning would otherwise
-      // make srq_h and qp_plan.rq_source_h fail same_instance() after a
-      // manager projection.
-      if (srq_h != null && qp_plan.rq_source_h != null)
-        qp_plan.rq_source_h = srq_h;
     end
     if (rhs_qp.programmed_qpc == null) programmed_qpc = null;
     else begin
