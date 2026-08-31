@@ -1,7 +1,8 @@
 # RDMA Task 14B CQ/SRQ/CEQ/AEQ 生命周期设计
 
 日期：2026-08-26
-状态：设计已确认，等待书面规格复核
+状态：已实现；完成证据由 `scripts/run_queue_lifecycle_regression53.sh`、
+`tools/check_queue_lifecycle.py` 和 host_mem integration test 提供
 
 ## 1. 目标
 
