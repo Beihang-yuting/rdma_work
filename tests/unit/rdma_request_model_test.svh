@@ -475,6 +475,7 @@ class rdma_request_model_test extends uvm_test;
     rdma_qp qp_resource_clone;
     rdma_qp_recovery_state qp_recovery;
     rdma_qp_recovery_state qp_recovery_clone;
+    rdma_qp_recovery_state split_qp_recovery;
     rdma_recovery_record qp_recovery_record;
     rdma_qp_ring_layout saved_qp_rq_ring;
     rdma_qp_backing_ref saved_qp_rq_ref;
@@ -953,6 +954,8 @@ class rdma_request_model_test extends uvm_test;
     cloned_object = qp_recovery.qp_plan.context_ref.clone();
     if (!$cast(qp_recovery.context_ref, cloned_object))
       `uvm_fatal("QP_RECOVERY_SETUP", "QP context clone lost type")
+    qp_recovery.qp_plan.context_ref.local_id = qp_h.object_id;
+    qp_recovery.context_ref.local_id = qp_h.object_id;
     qp_recovery.staging_mapping = make_recovery_mapping(
       "qp_recovery_staging", function_h, qp_h, 64'h8100_0000
     );
@@ -973,6 +976,20 @@ class rdma_request_model_test extends uvm_test;
     );
     qp_recovery.role_complete[RDMA_QUEUE_ROLE_QP_SQ_PD] = 1'b1;
     expect_status("QP_RECOVERY", qp_recovery.validate(), RDMA_SC_OK);
+    cloned_object = qp_recovery.clone();
+    if (!$cast(split_qp_recovery, cloned_object))
+      `uvm_fatal("QP_RECOVERY_SPLIT_SETUP",
+                 "split-identity QP recovery clone lost type")
+    split_qp_recovery.qp_plan.context_ref.local_id = 21'h1_2345;
+    split_qp_recovery.context_ref.local_id = 21'h1_2345;
+    split_qp_recovery.prior_qpc.qp_h.object_id = 21'h1_2345;
+    split_qp_recovery.candidate_qpc.qp_h.object_id = 21'h1_2345;
+    if (split_qp_recovery.qp_plan.sq_ref.mapping.owner_h.object_id ==
+        split_qp_recovery.context_ref.local_id)
+      `uvm_fatal("QP_RECOVERY_SPLIT_SETUP",
+                 "registry-global QP ID must differ from local QPN")
+    expect_status("QP_RECOVERY_SPLIT_GLOBAL_LOCAL_IDENTITY",
+                  split_qp_recovery.validate(), RDMA_SC_OK);
     qp_recovery.ambiguous_ticket = make_recovery_ticket(
       "qp_unexpected_ticket", function_h, cmq_h, qp_recovery.modify_opcode
     );
@@ -1026,6 +1043,10 @@ class rdma_request_model_test extends uvm_test;
     expect_status("QP_RECOVERY_CANDIDATE_FUNCTION", qp_recovery.validate(),
                   RDMA_SC_INVALID_ARGUMENT);
     qp_recovery.candidate_qpc.qp_h.function_uid--;
+    qp_recovery.candidate_qpc.qp_h.generation++;
+    expect_status("QP_RECOVERY_CANDIDATE_GENERATION", qp_recovery.validate(),
+                  RDMA_SC_STALE_GENERATION);
+    qp_recovery.candidate_qpc.qp_h.generation--;
     qp_recovery.ambiguous_operation = RDMA_QP_AMBIG_MODIFY;
     qp_recovery.ambiguous_ticket = make_recovery_ticket(
       "qp_modify_ticket", function_h, cmq_h, qp_recovery.modify_opcode

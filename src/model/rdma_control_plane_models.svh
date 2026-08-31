@@ -547,20 +547,35 @@ class rdma_qp_recovery_state extends uvm_object;
       status = prior_qpc.validate();
       if (!status.ok()) return status;
       if (prior_qpc.qp_h == null ||
-          !prior_qpc.qp_h.same_instance(recovery_qp_h))
+          prior_qpc.qp_h.kind != RDMA_RESOURCE_QP)
         return rdma_status::make(
           RDMA_SC_INVALID_STATE,
           "prior QPC does not belong to the recovered QP"
+        );
+      status = rdma_handle_owner_status(prior_qpc.qp_h, context_ref.owner);
+      if (!status.ok()) return status;
+      if (prior_qpc.qp_h.object_id != context_ref.local_id)
+        return rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "prior QPC local QPN does not match the recovery context"
         );
     end
     if (candidate_qpc != null) begin
       status = candidate_qpc.validate();
       if (!status.ok()) return status;
       if (candidate_qpc.qp_h == null ||
-          !candidate_qpc.qp_h.same_instance(recovery_qp_h))
+          candidate_qpc.qp_h.kind != RDMA_RESOURCE_QP)
         return rdma_status::make(
           RDMA_SC_INVALID_STATE,
           "candidate QPC does not belong to the recovered QP"
+        );
+      status = rdma_handle_owner_status(candidate_qpc.qp_h,
+                                        context_ref.owner);
+      if (!status.ok()) return status;
+      if (candidate_qpc.qp_h.object_id != context_ref.local_id)
+        return rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "candidate QPC local QPN does not match the recovery context"
         );
     end
     if (create_opcode == null || modify_opcode == null ||
