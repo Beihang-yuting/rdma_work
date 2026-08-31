@@ -122,3 +122,61 @@ git diff --check
 
 Both VCS53 tests completed with zero UVM warnings, errors, or fatals
 (`0/0/0`).  `git diff --check` completed with no diagnostics.
+
+## Fix round 2: recovery retirement gates
+
+Round 2 preserves the same nine public QP manager signatures and does not
+modify any Task 1 model file.  It closes four authority gaps left by the first
+fix round:
+
+- Successful ERROR context cleanup now requires resolved ambiguity and
+  atomically records outer recovery hardware presence as ABSENT.
+- ERROR finalization independently requires ABSENT; QUIESCING finalization is
+  unchanged.
+- Owned backing cleanup follows the exact reverse dependency order
+  `URC_DSQ -> URC_RDSQ -> URC_RSQ -> RQ_PD -> SQ_PD -> RQ_RING -> SQ_RING`,
+  while absent, SRQ-owned, and borrowed roles are skipped.
+- Modify reconciliation validates the caller as the complete desired ACTIVE
+  replacement before any recovery gate or caller-sanitizing publication:
+  exact retained QPC, its matching semantic state, and every unrelated QP
+  field from the authoritative ERROR snapshot.
+
+### Round-2 focused RED/GREEN evidence
+
+Every behavioral run below used
+`scripts/run_vcs53.sh core rdma_resource_manager_test` on VCS53.
+
+| Behavior | RED evidence | GREEN evidence |
+| --- | --- | --- |
+| ERROR context cleanup persists hardware absence | `QP_CONTEXT_ABSENCE`, 0/1/0 | 0/0/0 |
+| Unresolved ambiguity blocks context cleanup atomically | gate, atomicity, and follow-on duplicate assertions, 0/3/0 | 0/0/0 |
+| ERROR finalization explicitly requires ABSENT | gate plus resource/recovery atomicity cascade, 0/6/0 | 0/0/0 |
+| RC reverse cleanup requires RQ_PD before SQ_PD | predecessor, post-proof predecessor, atomicity, and follow-on cleanup, 0/4/0 | 0/0/0 |
+| URC exact reverse order requires DSQ before RDSQ before RSQ | two predecessor gates, two atomicity checks, and follow-on cleanup, 0/6/0 | 0/0/0 |
+| Reconciliation rejects semantic/index/IOVA mismatch before publication | three rejection and six registry/recovery atomicity assertions, 0/9/0 | 0/0/0 |
+
+The lifecycle test also proves that borrowed SQ/RQ ring refs neither require
+cleanup for finalization nor accept an owned-cleanup completion record.  The
+URC fixture completes all three opaque releases before its order probes, so
+the failures isolate predecessor ordering rather than release-completion
+readiness.  Reconciliation rejection coverage snapshots both registry and
+recovery after semantic-state, queue-index, IOVA, retained-QPC,
+address-vector, behavior, query-release, staging-release, and ambiguity-gate
+failures.
+
+One test-only hardware-presence setter in the probe manager creates the
+otherwise unreachable inconsistent recovery fixture needed to prove the
+finalization gate.  It does not alter production API surface.
+
+### Round-2 final verification
+
+Final evidence is recorded from the final tree with:
+
+```text
+scripts/run_vcs53.sh core rdma_resource_manager_test
+scripts/run_vcs53.sh core rdma_context_backing_contract_test
+git diff --check
+```
+
+Both final VCS53 runs completed with pristine UVM summaries (`0/0/0`).
+`git diff --check` completed with no diagnostics.

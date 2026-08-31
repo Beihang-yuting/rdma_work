@@ -2197,6 +2197,43 @@ class rdma_resource_manager extends uvm_object;
            same_qpc_extension_value(lhs.transport_ext, rhs.transport_ext);
   endfunction
 
+  protected function bit same_qp_reconciliation_value(
+    rdma_qp lhs,
+    rdma_qp rhs
+  );
+    if (lhs == null || rhs == null)
+      return lhs == rhs;
+    return same_handle_instance(lhs.handle, rhs.handle) &&
+           same_handle_instance(lhs.owner, rhs.owner) &&
+           lhs.state == rhs.state &&
+           lhs.backing_refs.size() == rhs.backing_refs.size() &&
+           lhs.hmc_refs.size() == rhs.hmc_refs.size() &&
+           same_dependency_topology(lhs, rhs) &&
+           same_outstanding_ids(lhs, rhs) &&
+           lhs.hmc_fvm_addr == rhs.hmc_fvm_addr &&
+           lhs.hmc_fvm_addr_valid == rhs.hmc_fvm_addr_valid &&
+           lhs.local_qp_id == rhs.local_qp_id &&
+           lhs.global_qp_id == rhs.global_qp_id &&
+           lhs.transport == rhs.transport && lhs.qp_state == rhs.qp_state &&
+           lhs.sq_depth == rhs.sq_depth && lhs.rq_depth == rhs.rq_depth &&
+           lhs.sq_producer_index == rhs.sq_producer_index &&
+           lhs.sq_consumer_index == rhs.sq_consumer_index &&
+           lhs.sq_wrap == rhs.sq_wrap &&
+           lhs.sq_consumer_wrap == rhs.sq_consumer_wrap &&
+           lhs.rq_producer_index == rhs.rq_producer_index &&
+           lhs.rq_consumer_index == rhs.rq_consumer_index &&
+           lhs.rq_wrap == rhs.rq_wrap &&
+           lhs.rq_consumer_wrap == rhs.rq_consumer_wrap &&
+           lhs.sq_iova.value == rhs.sq_iova.value &&
+           lhs.rq_iova.value == rhs.rq_iova.value &&
+           same_handle_instance(lhs.pd_h, rhs.pd_h) &&
+           same_handle_instance(lhs.send_cq_h, rhs.send_cq_h) &&
+           same_handle_instance(lhs.recv_cq_h, rhs.recv_cq_h) &&
+           same_handle_instance(lhs.srq_h, rhs.srq_h) &&
+           same_qp_plan_value(lhs.qp_plan, rhs.qp_plan) &&
+           same_qpc_value(lhs.programmed_qpc, rhs.programmed_qpc);
+  endfunction
+
   protected function rdma_status project_qp_recovery_value(
     rdma_qp_recovery_state source,
     string copy_label,
@@ -4280,6 +4317,7 @@ class rdma_resource_manager extends uvm_object;
     rdma_resource projected;
     rdma_qp authoritative_qp;
     rdma_qp replacement;
+    rdma_qp expected_replacement;
     rdma_qpc_model requested_qpc;
     rdma_qp_state_e requested_qp_state;
     rdma_recovery_record recovery;
@@ -4361,6 +4399,34 @@ class rdma_resource_manager extends uvm_object;
           RDMA_SC_INVALID_ARGUMENT,
           "programmed QP does not match a reconciliation candidate"
         );
+      status = project_resource_value(
+        registry[key], "commit QP expected reconciliation", projected
+      );
+      if (!status.ok() || !$cast(expected_replacement, projected))
+        return status.ok() ? rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "expected QP reconciliation projection failed"
+        ) : status;
+      status = project_qpc_value(
+        restore_prior ? recovery.qp_recovery.prior_qpc :
+                        recovery.qp_recovery.candidate_qpc,
+        "commit QP expected reconciliation QPC",
+        expected_replacement.programmed_qpc
+      );
+      if (!status.ok() || expected_replacement.programmed_qpc == null)
+        return status.ok() ? rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "expected QP reconciliation QPC projection failed"
+        ) : status;
+      expected_replacement.qp_state = restore_prior ?
+        authoritative_qp.qp_state : expected_replacement.programmed_qpc.state;
+      expected_replacement.state = RDMA_RESOURCE_ACTIVE;
+      if (!same_qp_reconciliation_value(replacement,
+                                         expected_replacement))
+        return rdma_status::make(
+          RDMA_SC_INVALID_ARGUMENT,
+          "programmed QP is not the complete reconciliation replacement"
+        );
       if (recovery.qp_recovery.ambiguous_operation != RDMA_QP_AMBIG_NONE ||
           recovery.qp_recovery.ambiguous_ticket != null)
         return rdma_status::make(
@@ -4387,28 +4453,7 @@ class rdma_resource_manager extends uvm_object;
             "QP recovery query release is not complete"
           );
       end
-      status = project_resource_value(
-        registry[key], "commit QP reconciliation", projected
-      );
-      if (!status.ok() || !$cast(replacement, projected))
-        return status.ok() ? rdma_status::make(
-          RDMA_SC_INVALID_STATE,
-          "authoritative QP reconciliation projection failed"
-        ) : status;
-      status = project_qpc_value(
-        restore_prior ? recovery.qp_recovery.prior_qpc :
-                        recovery.qp_recovery.candidate_qpc,
-        "commit QP selected reconciliation QPC",
-        replacement.programmed_qpc
-      );
-      if (!status.ok() || replacement.programmed_qpc == null)
-        return status.ok() ? rdma_status::make(
-          RDMA_SC_INVALID_STATE,
-          "selected QP reconciliation QPC projection failed"
-        ) : status;
-      replacement.qp_state = restore_prior ? authoritative_qp.qp_state :
-                                             replacement.programmed_qpc.state;
-      replacement.state = RDMA_RESOURCE_ACTIVE;
+      replacement = expected_replacement;
     end
     status = replacement.validate();
     if (status == null)
@@ -4629,6 +4674,76 @@ class rdma_resource_manager extends uvm_object;
     return null;
   endfunction
 
+  protected function bit qp_owned_cleanup_role_complete(
+    rdma_qp_backing_plan plan,
+    rdma_queue_backing_role_e role
+  );
+    rdma_qp_backing_ref backing_ref;
+
+    if (plan == null)
+      return 1'b0;
+    if (plan.rq_source_h != null &&
+        role inside {RDMA_QUEUE_ROLE_QP_RQ_RING,
+                     RDMA_QUEUE_ROLE_QP_RQ_PD})
+      return 1'b1;
+    backing_ref = qp_plan_ref(plan, role);
+    return backing_ref == null ||
+           backing_ref.ownership != RDMA_OWNERSHIP_CONTROL_PLANE ||
+           backing_ref.cleanup_complete;
+  endfunction
+
+  protected function bit qp_cleanup_predecessors_complete(
+    rdma_qp_backing_plan plan,
+    rdma_queue_backing_role_e role
+  );
+    bit urc_dsq_complete;
+    bit urc_rdsq_complete;
+    bit urc_rsq_complete;
+    bit rq_pd_complete;
+    bit sq_pd_complete;
+    bit rq_ring_complete;
+
+    urc_dsq_complete = qp_owned_cleanup_role_complete(
+      plan, RDMA_QUEUE_ROLE_QP_URC_DSQ
+    );
+    urc_rdsq_complete = qp_owned_cleanup_role_complete(
+      plan, RDMA_QUEUE_ROLE_QP_URC_RDSQ
+    );
+    urc_rsq_complete = qp_owned_cleanup_role_complete(
+      plan, RDMA_QUEUE_ROLE_QP_URC_RSQ
+    );
+    rq_pd_complete = qp_owned_cleanup_role_complete(
+      plan, RDMA_QUEUE_ROLE_QP_RQ_PD
+    );
+    sq_pd_complete = qp_owned_cleanup_role_complete(
+      plan, RDMA_QUEUE_ROLE_QP_SQ_PD
+    );
+    rq_ring_complete = qp_owned_cleanup_role_complete(
+      plan, RDMA_QUEUE_ROLE_QP_RQ_RING
+    );
+    case (role)
+      RDMA_QUEUE_ROLE_QP_URC_DSQ:
+        return 1'b1;
+      RDMA_QUEUE_ROLE_QP_URC_RDSQ:
+        return urc_dsq_complete;
+      RDMA_QUEUE_ROLE_QP_URC_RSQ:
+        return urc_dsq_complete && urc_rdsq_complete;
+      RDMA_QUEUE_ROLE_QP_RQ_PD:
+        return urc_dsq_complete && urc_rdsq_complete && urc_rsq_complete;
+      RDMA_QUEUE_ROLE_QP_SQ_PD:
+        return urc_dsq_complete && urc_rdsq_complete && urc_rsq_complete &&
+               rq_pd_complete;
+      RDMA_QUEUE_ROLE_QP_RQ_RING:
+        return urc_dsq_complete && urc_rdsq_complete && urc_rsq_complete &&
+               rq_pd_complete && sq_pd_complete;
+      RDMA_QUEUE_ROLE_QP_SQ_RING:
+        return urc_dsq_complete && urc_rdsq_complete && urc_rsq_complete &&
+               rq_pd_complete && sq_pd_complete && rq_ring_complete;
+      default:
+        return 1'b0;
+    endcase
+  endfunction
+
   protected function rdma_status qp_progress_snapshots(
     rdma_handle qp_h,
     string operation,
@@ -4830,6 +4945,14 @@ class rdma_resource_manager extends uvm_object;
         RDMA_SC_INVALID_ARGUMENT,
         "QP cleanup role is absent, borrowed, or already complete"
       );
+    if (!qp_cleanup_predecessors_complete(resource_copy.qp_plan, role) ||
+        has_recovery && !qp_cleanup_predecessors_complete(
+          recovery_copy.qp_recovery.qp_plan, role
+        ))
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "QP owned backing cleanup predecessor is incomplete"
+      );
     if (resource_copy.qp_plan.context_ref == null ||
         !resource_copy.qp_plan.context_ref.release_complete ||
         has_recovery &&
@@ -4916,6 +5039,14 @@ class rdma_resource_manager extends uvm_object;
         RDMA_SC_INVALID_STATE,
         "QP required flushes must precede context cleanup"
       );
+    if (has_recovery &&
+        (recovery_copy.qp_recovery.ambiguous_operation !=
+           RDMA_QP_AMBIG_NONE ||
+         recovery_copy.qp_recovery.ambiguous_ticket != null))
+      return rdma_status::make(
+        RDMA_SC_RECOVERY_REQUIRED,
+        "QP recovery ambiguity must be resolved before context cleanup"
+      );
     if (!$cast(resource_token,
                resource_copy.qp_plan.context_ref.slot_token) ||
         resource_token.completion_authority == null)
@@ -4948,6 +5079,7 @@ class rdma_resource_manager extends uvm_object;
     if (has_recovery) begin
       recovery_copy.qp_recovery.context_ref.release_complete = 1'b1;
       recovery_copy.qp_recovery.qp_plan.context_ref.release_complete = 1'b1;
+      recovery_copy.hardware_presence = RDMA_HW_PRESENCE_ABSENT;
     end
     return commit_qp_progress(key, resource_copy, recovery_copy, has_recovery,
                               "QP context cleanup");
@@ -5042,6 +5174,11 @@ class rdma_resource_manager extends uvm_object;
         return rdma_status::make(RDMA_SC_RECOVERY_REQUIRED,
                                  "ERROR QP recovery is missing");
       recovery = recovery_records[key];
+      if (recovery.hardware_presence != RDMA_HW_PRESENCE_ABSENT)
+        return rdma_status::make(
+          RDMA_SC_RECOVERY_REQUIRED,
+          "ERROR QP hardware absence is not established"
+        );
       if (recovery.qp_recovery == null ||
           recovery.qp_recovery.context_ref == null ||
           recovery.qp_recovery.qp_plan == null ||
