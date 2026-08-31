@@ -115,9 +115,10 @@ class rdma_context_backing_contract_test extends uvm_test;
     rdma_mock_context_backing context_api;
     rdma_function_binding binding;
     rdma_context_backing_ref failed_ref, cq_ref, cq_clone;
-    rdma_context_backing_ref neighbor_ref, srq_ref, bad_ref;
+    rdma_context_backing_ref neighbor_ref, srq_ref, qp_ref, qp_clone, bad_ref;
     rdma_queue_slot_token_contract cq_token, clone_token;
-    rdma_queue_slot_token_contract neighbor_token, srq_token;
+    rdma_queue_slot_token_contract neighbor_token, srq_token, qp_token;
+    rdma_queue_slot_token_contract qp_clone_token;
     uvm_object cloned;
     byte unsigned bytes[];
     byte unsigned cq_snapshot[];
@@ -471,6 +472,101 @@ class rdma_context_backing_contract_test extends uvm_test;
       `uvm_error("CQC_QUERY_AFTER_NEIGHBOR_RELEASE",
                  "later release changed CQC completion")
 
+    // QP_SQ_RING is only the mock's QP context fault-routing discriminator;
+    // the acquired authority remains a QPC context, not SQ backing.
+    context_api.fail_role_call(
+      "acquire", RDMA_QUEUE_ROLE_QP_SQ_RING, 5,
+      rdma_status::make(RDMA_SC_TIMEOUT, "injected QP context acquire failure")
+    );
+    expect_status(
+      "QPC_ROLE_INJECTED_ACQUIRE",
+      context_api.acquire(binding, RDMA_RESOURCE_QP, 17, failed_ref),
+      RDMA_SC_TIMEOUT
+    );
+    if (failed_ref != null || context_api.slots.size() != 3)
+      `uvm_error("QPC_ROLE_INJECTED_ACQUIRE",
+                 "failed QP context acquire changed mock state")
+
+    expect_status(
+      "QPC_ACQUIRE",
+      context_api.acquire(binding, RDMA_RESOURCE_QP, 17, qp_ref),
+      RDMA_SC_OK
+    );
+    if (qp_ref == null || qp_ref.resource_kind != RDMA_RESOURCE_QP ||
+        qp_ref.local_id != 17 || qp_ref.owner == null ||
+        !qp_ref.owner.same_instance(binding.make_handle()) ||
+        qp_ref.slot_length != 512 || qp_ref.shadow_view_offset != 0 ||
+        qp_ref.shadow_view_length != 512 ||
+        (qp_ref.shadow_pointer_base.value & 511) != 0 ||
+        qp_ref.hmc_ref == null || qp_ref.hmc_ref.size != 512 ||
+        qp_ref.hmc_ref.ownership != RDMA_OWNERSHIP_CONTROL_PLANE)
+      `uvm_error("QPC_REF", "QP context slot authority is incorrect")
+    if (qp_ref != null) begin
+    if (!$cast(qp_token, qp_ref.slot_token) ||
+        qp_token.completion_authority == null || qp_token === cq_token ||
+        qp_token === neighbor_token || qp_token === srq_token)
+      `uvm_error("QPC_TOKEN", "QP context lacks isolated opaque authority")
+
+    cloned = qp_ref.clone();
+    if (cloned == null || !$cast(qp_clone, cloned) || qp_clone === qp_ref ||
+        !$cast(qp_clone_token, qp_clone.slot_token) ||
+        qp_clone_token === qp_token ||
+        qp_clone_token.completion_authority !== qp_token.completion_authority)
+      `uvm_error("QPC_CLONE", "QP context clone lost release authority")
+
+    bytes = new[512];
+    foreach (bytes[i]) bytes[i] = byte'(i);
+    expect_status("QPC_FULL_SLOT_WRITE",
+                  context_api.write(qp_ref, 0, bytes), RDMA_SC_OK);
+    expect_status("QPC_LAST_BYTE_READ",
+                  context_api.read_slot_byte(qp_ref, 511, bytes[0]),
+                  RDMA_SC_OK);
+    if (bytes[0] != 8'hff)
+      `uvm_error("QPC_LAST_BYTE_READ", "QP context write was not retained")
+
+    context_api.fail_role_call(
+      "query_release_completion", RDMA_QUEUE_ROLE_QP_SQ_RING, 13,
+      rdma_status::make(RDMA_SC_TIMEOUT, "injected QP context query failure")
+    );
+    complete = 1'b1;
+    expect_status(
+      "QPC_ROLE_INJECTED_QUERY",
+      context_api.query_release_completion(qp_ref, complete), RDMA_SC_TIMEOUT
+    );
+    if (complete || context_api.release_call_count != 2)
+      `uvm_error("QPC_ROLE_INJECTED_QUERY",
+                 "failed QP query changed completion state")
+    expect_status(
+      "QPC_QUERY_BEFORE_RELEASE",
+      context_api.query_release_completion(qp_ref, complete), RDMA_SC_OK
+    );
+    if (complete)
+      `uvm_error("QPC_QUERY_BEFORE_RELEASE",
+                 "QP context completed before release")
+
+    context_api.fail_role_call(
+      "release", RDMA_QUEUE_ROLE_QP_SQ_RING, 5,
+      rdma_status::make(RDMA_SC_TIMEOUT, "injected QP context release failure")
+    );
+    expect_status("QPC_ROLE_INJECTED_RELEASE",
+                  context_api.\release (qp_ref), RDMA_SC_TIMEOUT);
+    if (context_api.release_call_count != 2 || qp_ref.release_complete)
+      `uvm_error("QPC_ROLE_INJECTED_RELEASE",
+                 "failed QP release changed completion state")
+    expect_status("QPC_RELEASE", context_api.\release (qp_ref), RDMA_SC_OK);
+    complete = 1'b0;
+    expect_status(
+      "QPC_QUERY_CLONE_AFTER_RELEASE",
+      context_api.query_release_completion(qp_clone, complete), RDMA_SC_OK
+    );
+    if (!complete || context_api.release_call_count != 3)
+      `uvm_error("QPC_RELEASE", "QP clone cannot prove one release")
+    expect_status("QPC_RELEASE_TWICE",
+                  context_api.\release (qp_clone), RDMA_SC_INVALID_STATE);
+    if (context_api.release_call_count != 3)
+      `uvm_error("QPC_RELEASE_COUNT", "duplicate QP release reached backing")
+    end
+
     expected_trace.push_back("acquire");
     expected_trace.push_back("acquire");
     expected_trace.push_back("acquire");
@@ -501,6 +597,15 @@ class rdma_context_backing_contract_test extends uvm_test;
     expected_trace.push_back("release");
     expected_trace.push_back("query_release_completion");
     expected_trace.push_back("query_release_completion");
+    expected_trace.push_back("acquire");
+    expected_trace.push_back("acquire");
+    expected_trace.push_back("write");
+    expected_trace.push_back("query_release_completion");
+    expected_trace.push_back("query_release_completion");
+    expected_trace.push_back("release");
+    expected_trace.push_back("release");
+    expected_trace.push_back("query_release_completion");
+    expected_trace.push_back("release");
     expect_trace(context_api, expected_trace);
 
     phase.drop_objection(this);

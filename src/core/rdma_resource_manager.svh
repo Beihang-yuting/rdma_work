@@ -27,6 +27,10 @@ class rdma_resource_manager extends uvm_object;
   protected int unsigned free_local_ids[rdma_resource_kind_e][$];
   protected bit fresh_local_id_exhausted[rdma_resource_kind_e];
   protected int unsigned next_object_serial[rdma_resource_kind_e];
+  // QPC sequence is an incarnation counter for a local QPN within one exact
+  // Function generation.  Entries intentionally outlive QP finalization so a
+  // reused QPN receives the next sequence value.
+  protected bit [7:0] qp_sequences[string];
 
   function new(string name = "rdma_resource_manager");
     super.new(name);
@@ -47,6 +51,7 @@ class rdma_resource_manager extends uvm_object;
       RDMA_RESOURCE_PD: return 16'hffff;
       RDMA_RESOURCE_MR: return 24'hff_ffff;
       RDMA_RESOURCE_CQ: return 21'h1f_ffff;
+      RDMA_RESOURCE_QP: return 21'h1f_ffff;
       RDMA_RESOURCE_SRQ: return 16'hffff;
       RDMA_RESOURCE_CEQ,
       RDMA_RESOURCE_AEQ: return 12'hfff;
@@ -115,6 +120,14 @@ class rdma_resource_manager extends uvm_object;
   );
     return $sformatf("%016h:%08h:%08h", owner.function_uid,
                      owner.object_id, owner.generation);
+  endfunction
+
+  protected function string qp_sequence_key(
+    rdma_function_handle owner,
+    int unsigned local_qpn
+  );
+    return $sformatf("%016h:%08h:%08h:%06h", owner.function_uid,
+                     owner.object_id, owner.generation, local_qpn);
   endfunction
 
   // Public carriers may be compatible subclasses, but only fields declared by
@@ -1263,6 +1276,7 @@ class rdma_resource_manager extends uvm_object;
     rdma_status status;
     rdma_cmq_opcode_key opcode_copy;
     rdma_queue_backing_plan plan_copy;
+    rdma_qp_recovery_state qp_recovery_copy;
 
     result = null;
     if (source == null)
@@ -1353,6 +1367,12 @@ class rdma_resource_manager extends uvm_object;
                                       {copy_label, "_queue_plan"}, plan_copy);
     if (!status.ok()) begin result = null; return status; end
     result.queue_plan = plan_copy;
+    result.qp_recovery_valid = source.qp_recovery_valid;
+    status = project_qp_recovery_value(
+      source.qp_recovery, {copy_label, "_qp_recovery"}, qp_recovery_copy
+    );
+    if (!status.ok()) begin result = null; return status; end
+    result.qp_recovery = qp_recovery_copy;
     return rdma_status::success();
   endfunction
 
@@ -1679,6 +1699,565 @@ class rdma_resource_manager extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  protected function rdma_status project_qp_ring_value(
+    rdma_qp_ring_layout source,
+    string copy_label,
+    output rdma_qp_ring_layout result
+  );
+    result = null;
+    if (source == null)
+      return rdma_status::success();
+    result = new({copy_label, "_ring"});
+    result.role = source.role;
+    result.entry_size_bytes = source.entry_size_bytes;
+    result.depth = source.depth;
+    result.logical_bytes = source.logical_bytes;
+    result.storage_bytes = source.storage_bytes;
+    result.object_mode = source.object_mode;
+    return rdma_status::success();
+  endfunction
+
+  protected function rdma_status project_qp_backing_ref_value(
+    rdma_qp_backing_ref source,
+    string copy_label,
+    output rdma_qp_backing_ref result
+  );
+    rdma_status status;
+
+    result = null;
+    if (source == null)
+      return rdma_status::success();
+    result = new({copy_label, "_ref"});
+    if (source.ownership == RDMA_OWNERSHIP_CONTROL_PLANE)
+      status = clone_owned_mapping_value(
+        source.mapping, {copy_label, "_owned_mapping"}, result.mapping
+      );
+    else
+      status = project_mapping_value(
+        source.mapping, {copy_label, "_borrowed_mapping"}, result.mapping
+      );
+    if (!status.ok()) begin
+      result = null;
+      return status;
+    end
+    result.role = source.role;
+    result.ownership = source.ownership;
+    result.mapping_offset = source.mapping_offset;
+    result.length = source.length;
+    result.cleanup_complete = source.cleanup_complete;
+    return rdma_status::success();
+  endfunction
+
+  protected function rdma_status project_qp_plan_value(
+    rdma_qp_backing_plan source,
+    string copy_label,
+    output rdma_qp_backing_plan result
+  );
+    rdma_qp_backing_ref ref_copy;
+    rdma_status status;
+
+    result = null;
+    if (source == null)
+      return rdma_status::success();
+    result = new({copy_label, "_plan"});
+    result.transport = source.transport;
+    result.sq_depth = source.sq_depth;
+    result.rq_depth = source.rq_depth;
+    result.sq_pd_flush_complete = source.sq_pd_flush_complete;
+    result.rq_pd_flush_complete = source.rq_pd_flush_complete;
+    result.cleanup_complete = source.cleanup_complete;
+    status = project_qp_ring_value(source.sq_ring, {copy_label, "_sq"},
+                                   result.sq_ring);
+    if (status.ok())
+      status = project_qp_ring_value(source.rq_ring, {copy_label, "_rq"},
+                                     result.rq_ring);
+    if (status.ok())
+      status = project_qp_backing_ref_value(
+        source.sq_ref, {copy_label, "_sq"}, result.sq_ref
+      );
+    if (status.ok())
+      status = project_qp_backing_ref_value(
+        source.rq_ref, {copy_label, "_rq"}, result.rq_ref
+      );
+    if (status.ok())
+      status = project_qp_backing_ref_value(
+        source.sq_pd_ref, {copy_label, "_sq_pd"}, result.sq_pd_ref
+      );
+    if (status.ok())
+      status = project_qp_backing_ref_value(
+        source.rq_pd_ref, {copy_label, "_rq_pd"}, result.rq_pd_ref
+      );
+    if (status.ok())
+      status = project_handle_value(source.rq_source_h,
+                                    {copy_label, "_rq_source"},
+                                    result.rq_source_h);
+    if (status.ok()) begin
+      result.urc_refs.delete();
+      foreach (source.urc_refs[i]) begin
+        status = project_qp_backing_ref_value(
+          source.urc_refs[i], $sformatf("%s_urc_%0d", copy_label, i),
+          ref_copy
+        );
+        if (!status.ok()) break;
+        result.urc_refs.push_back(ref_copy);
+      end
+    end
+    if (status.ok())
+      status = project_queue_context_value(
+        source.context_ref, {copy_label, "_context"}, result.context_ref
+      );
+    if (!status.ok())
+      result = null;
+    return status;
+  endfunction
+
+  protected function rdma_status project_address_vector_value(
+    rdma_address_vector source,
+    string copy_label,
+    output rdma_address_vector result
+  );
+    result = null;
+    if (source == null)
+      return rdma_status::success();
+    result = new({copy_label, "_address_vector"});
+    result.source_address_index = source.source_address_index;
+    result.source_vport = source.source_vport;
+    result.destination_vport = source.destination_vport;
+    result.destination_port = source.destination_port;
+    result.destination_mac = source.destination_mac;
+    foreach (result.destination_ip[i])
+      result.destination_ip[i] = source.destination_ip[i];
+    result.ipv6 = source.ipv6;
+    result.vlan_enable = source.vlan_enable;
+    result.cfi = source.cfi;
+    result.lag_enable = source.lag_enable;
+    result.tunnel_enable = source.tunnel_enable;
+    result.forwarding_enable = source.forwarding_enable;
+    result.vlan_id = source.vlan_id;
+    result.traffic_class = source.traffic_class;
+    result.flow_label = source.flow_label;
+    result.hop_limit = source.hop_limit;
+    result.udp_source_port = source.udp_source_port;
+    return rdma_status::success();
+  endfunction
+
+  protected function rdma_status project_qpc_behavior_value(
+    rdma_qpc_behavior source,
+    string copy_label,
+    output rdma_qpc_behavior result
+  );
+    result = null;
+    if (source == null)
+      return rdma_status::success();
+    result = new({copy_label, "_behavior"});
+    result.transport_version = source.transport_version;
+    result.migration_enable = source.migration_enable;
+    result.tx_endian_swap = source.tx_endian_swap;
+    result.rx_endian_swap = source.rx_endian_swap;
+    result.read_after_write_fence = source.read_after_write_fence;
+    result.atomic_after_atomic_fence = source.atomic_after_atomic_fence;
+    result.\priority = source.\priority ;
+    return rdma_status::success();
+  endfunction
+
+  protected function rdma_status project_qpc_extension_value(
+    rdma_qpc_transport_ext source,
+    string copy_label,
+    output rdma_qpc_transport_ext result
+  );
+    rdma_qpc_rc_ext source_rc;
+    rdma_qpc_rc_ext result_rc;
+    rdma_qpc_ud_ext source_ud;
+    rdma_qpc_ud_ext result_ud;
+    rdma_qpc_urc_ext source_urc;
+    rdma_qpc_urc_ext result_urc;
+
+    result = null;
+    if (source == null)
+      return rdma_status::success();
+    if ($cast(source_rc, source)) begin
+      result_rc = new({copy_label, "_rc"});
+      result_rc.remote_qpn = source_rc.remote_qpn;
+      result_rc.send_psn = source_rc.send_psn;
+      result_rc.recv_psn = source_rc.recv_psn;
+      result_rc.retry_count = source_rc.retry_count;
+      result_rc.rnr_retry_count = source_rc.rnr_retry_count;
+      result = result_rc;
+    end
+    else if ($cast(source_ud, source)) begin
+      result_ud = new({copy_label, "_ud"});
+      result_ud.qkey = source_ud.qkey;
+      result = result_ud;
+    end
+    else if ($cast(source_urc, source)) begin
+      result_urc = new({copy_label, "_urc"});
+      result_urc.remote_qpn = source_urc.remote_qpn;
+      result_urc.rbsn = source_urc.rbsn;
+      result_urc.dbsn = source_urc.dbsn;
+      result_urc.rpsn = source_urc.rpsn;
+      result_urc.dpsn = source_urc.dpsn;
+      if (source_urc.queues == null)
+        result_urc.queues = null;
+      else begin
+        result_urc.queues = new({copy_label, "_urc_queues"});
+        result_urc.queues.rsq_backing = source_urc.queues.rsq_backing;
+        result_urc.queues.rdsq_backing = source_urc.queues.rdsq_backing;
+        result_urc.queues.dsq_backing = source_urc.queues.dsq_backing;
+        result_urc.queues.rsq_depth = source_urc.queues.rsq_depth;
+        result_urc.queues.rdsq_depth = source_urc.queues.rdsq_depth;
+        result_urc.queues.rdsq_fetch_count =
+          source_urc.queues.rdsq_fetch_count;
+        result_urc.queues.dsq_fetch_count =
+          source_urc.queues.dsq_fetch_count;
+        result_urc.queues.rq_sequence_threshold_entries =
+          source_urc.queues.rq_sequence_threshold_entries;
+        result_urc.queues.sq_completion_threshold_entries =
+          source_urc.queues.sq_completion_threshold_entries;
+      end
+      result = result_urc;
+    end
+    else
+      return rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT,
+        {copy_label, " QPC transport extension is incompatible"}
+      );
+    return rdma_status::success();
+  endfunction
+
+  protected function rdma_status project_qpc_value(
+    rdma_qpc_model source,
+    string copy_label,
+    output rdma_qpc_model result
+  );
+    rdma_status status;
+
+    result = null;
+    if (source == null)
+      return rdma_status::success();
+    result = new({copy_label, "_qpc"});
+    status = project_handle_value(source.qp_h, {copy_label, "_qp"},
+                                  result.qp_h);
+    if (status.ok())
+      status = project_handle_value(source.pd_h, {copy_label, "_pd"},
+                                    result.pd_h);
+    if (status.ok())
+      status = project_handle_value(source.send_cq_h,
+                                    {copy_label, "_send_cq"},
+                                    result.send_cq_h);
+    if (status.ok())
+      status = project_handle_value(source.recv_cq_h,
+                                    {copy_label, "_recv_cq"},
+                                    result.recv_cq_h);
+    if (status.ok())
+      status = project_handle_value(source.srq_h, {copy_label, "_srq"},
+                                    result.srq_h);
+    if (!status.ok()) begin
+      result = null;
+      return status;
+    end
+    result.transport = source.transport;
+    result.state = source.state;
+    result.host_id = source.host_id;
+    result.vf_id = source.vf_id;
+    result.stat_index = source.stat_index;
+    result.pkey = source.pkey;
+    result.qp_sequence = source.qp_sequence;
+    result.access = source.access;
+    result.path_mtu_bytes = source.path_mtu_bytes;
+    result.sq_depth = source.sq_depth;
+    result.rq_depth = source.rq_depth;
+    result.sq_backing = source.sq_backing;
+    result.rq_backing = source.rq_backing;
+    result.context_backing = source.context_backing;
+    result.sq_mode = source.sq_mode;
+    result.rq_mode = source.rq_mode;
+    result.signature_enable = source.signature_enable;
+    result.tx_flow_control = source.tx_flow_control;
+    result.rx_flow_control = source.rx_flow_control;
+    status = project_address_vector_value(
+      source.address_vector, {copy_label, "_av"}, result.address_vector
+    );
+    if (status.ok())
+      status = project_qpc_behavior_value(
+        source.behavior, {copy_label, "_behavior"}, result.behavior
+      );
+    if (status.ok())
+      status = project_qpc_extension_value(
+        source.transport_ext, {copy_label, "_extension"},
+        result.transport_ext
+      );
+    if (!status.ok())
+      result = null;
+    return status;
+  endfunction
+
+  protected function bit same_qp_backing_ref_value(
+    rdma_qp_backing_ref lhs,
+    rdma_qp_backing_ref rhs
+  );
+    if (lhs == null || rhs == null)
+      return lhs == rhs;
+    if (lhs.role != rhs.role || lhs.ownership != rhs.ownership ||
+        lhs.mapping_offset != rhs.mapping_offset || lhs.length != rhs.length ||
+        lhs.cleanup_complete != rhs.cleanup_complete)
+      return 1'b0;
+    if (lhs.ownership == RDMA_OWNERSHIP_CONTROL_PLANE)
+      return same_mapping_value(lhs.mapping, rhs.mapping) &&
+             same_owned_mapping_authority(lhs.mapping, rhs.mapping);
+    return same_mapping_value(lhs.mapping, rhs.mapping);
+  endfunction
+
+  protected function bit same_qp_ring_value(
+    rdma_qp_ring_layout lhs,
+    rdma_qp_ring_layout rhs
+  );
+    if (lhs == null || rhs == null)
+      return lhs == rhs;
+    return lhs.role == rhs.role &&
+           lhs.entry_size_bytes == rhs.entry_size_bytes &&
+           lhs.depth == rhs.depth && lhs.logical_bytes == rhs.logical_bytes &&
+           lhs.storage_bytes == rhs.storage_bytes &&
+           lhs.object_mode == rhs.object_mode;
+  endfunction
+
+  protected function bit same_context_value(
+    rdma_context_backing_ref lhs,
+    rdma_context_backing_ref rhs
+  );
+    rdma_queue_slot_token_contract lhs_token;
+    rdma_queue_slot_token_contract rhs_token;
+
+    if (lhs == null || rhs == null)
+      return lhs == rhs;
+    if (!$cast(lhs_token, lhs.slot_token) || !$cast(rhs_token, rhs.slot_token) ||
+        lhs_token.completion_authority == null ||
+        rhs_token.completion_authority == null)
+      return 1'b0;
+    return lhs_token.completion_authority === rhs_token.completion_authority &&
+           same_handle_instance(lhs.owner, rhs.owner) &&
+           lhs.resource_kind == rhs.resource_kind &&
+           lhs.local_id == rhs.local_id &&
+           lhs.shadow_pointer_base.value == rhs.shadow_pointer_base.value &&
+           lhs.slot_length == rhs.slot_length &&
+           lhs.shadow_view_offset == rhs.shadow_view_offset &&
+           lhs.shadow_view_length == rhs.shadow_view_length &&
+           lhs.release_complete == rhs.release_complete &&
+           lhs.hmc_ref != null && rhs.hmc_ref != null &&
+           same_handle_instance(lhs.hmc_ref.owner, rhs.hmc_ref.owner) &&
+           lhs.hmc_ref.object_kind == rhs.hmc_ref.object_kind &&
+           lhs.hmc_ref.address.value == rhs.hmc_ref.address.value &&
+           lhs.hmc_ref.size == rhs.hmc_ref.size &&
+           lhs.hmc_ref.first_pbl_index == rhs.hmc_ref.first_pbl_index &&
+           lhs.hmc_ref.ownership == rhs.hmc_ref.ownership &&
+           lhs.hmc_ref.release_complete == rhs.hmc_ref.release_complete;
+  endfunction
+
+  protected function bit same_qp_plan_value(
+    rdma_qp_backing_plan lhs,
+    rdma_qp_backing_plan rhs
+  );
+    if (lhs == null || rhs == null)
+      return lhs == rhs;
+    if (lhs.transport != rhs.transport || lhs.sq_depth != rhs.sq_depth ||
+        lhs.rq_depth != rhs.rq_depth ||
+        lhs.sq_pd_flush_complete != rhs.sq_pd_flush_complete ||
+        lhs.rq_pd_flush_complete != rhs.rq_pd_flush_complete ||
+        lhs.cleanup_complete != rhs.cleanup_complete ||
+        !same_qp_ring_value(lhs.sq_ring, rhs.sq_ring) ||
+        !same_qp_ring_value(lhs.rq_ring, rhs.rq_ring) ||
+        !same_qp_backing_ref_value(lhs.sq_ref, rhs.sq_ref) ||
+        !same_qp_backing_ref_value(lhs.rq_ref, rhs.rq_ref) ||
+        !same_qp_backing_ref_value(lhs.sq_pd_ref, rhs.sq_pd_ref) ||
+        !same_qp_backing_ref_value(lhs.rq_pd_ref, rhs.rq_pd_ref) ||
+        !same_handle_instance(lhs.rq_source_h, rhs.rq_source_h) ||
+        lhs.urc_refs.size() != rhs.urc_refs.size() ||
+        !same_context_value(lhs.context_ref, rhs.context_ref))
+      return 1'b0;
+    foreach (lhs.urc_refs[i])
+      if (!same_qp_backing_ref_value(lhs.urc_refs[i], rhs.urc_refs[i]))
+        return 1'b0;
+    return 1'b1;
+  endfunction
+
+  protected function bit same_address_vector_value(
+    rdma_address_vector lhs,
+    rdma_address_vector rhs
+  );
+    if (lhs == null || rhs == null)
+      return lhs == rhs;
+    if (lhs.source_address_index != rhs.source_address_index ||
+        lhs.source_vport != rhs.source_vport ||
+        lhs.destination_vport != rhs.destination_vport ||
+        lhs.destination_port != rhs.destination_port ||
+        lhs.destination_mac != rhs.destination_mac || lhs.ipv6 != rhs.ipv6 ||
+        lhs.vlan_enable != rhs.vlan_enable || lhs.cfi != rhs.cfi ||
+        lhs.lag_enable != rhs.lag_enable ||
+        lhs.tunnel_enable != rhs.tunnel_enable ||
+        lhs.forwarding_enable != rhs.forwarding_enable ||
+        lhs.vlan_id != rhs.vlan_id ||
+        lhs.traffic_class != rhs.traffic_class ||
+        lhs.flow_label != rhs.flow_label || lhs.hop_limit != rhs.hop_limit ||
+        lhs.udp_source_port != rhs.udp_source_port)
+      return 1'b0;
+    foreach (lhs.destination_ip[i])
+      if (lhs.destination_ip[i] != rhs.destination_ip[i])
+        return 1'b0;
+    return 1'b1;
+  endfunction
+
+  protected function bit same_qpc_behavior_value(
+    rdma_qpc_behavior lhs,
+    rdma_qpc_behavior rhs
+  );
+    if (lhs == null || rhs == null)
+      return lhs == rhs;
+    return lhs.transport_version == rhs.transport_version &&
+           lhs.migration_enable == rhs.migration_enable &&
+           lhs.tx_endian_swap == rhs.tx_endian_swap &&
+           lhs.rx_endian_swap == rhs.rx_endian_swap &&
+           lhs.read_after_write_fence == rhs.read_after_write_fence &&
+           lhs.atomic_after_atomic_fence == rhs.atomic_after_atomic_fence &&
+           lhs.\priority == rhs.\priority ;
+  endfunction
+
+  protected function bit same_qpc_extension_value(
+    rdma_qpc_transport_ext lhs,
+    rdma_qpc_transport_ext rhs
+  );
+    rdma_qpc_rc_ext lhs_rc;
+    rdma_qpc_rc_ext rhs_rc;
+    rdma_qpc_ud_ext lhs_ud;
+    rdma_qpc_ud_ext rhs_ud;
+    rdma_qpc_urc_ext lhs_urc;
+    rdma_qpc_urc_ext rhs_urc;
+
+    if (lhs == null || rhs == null)
+      return lhs == rhs;
+    if ($cast(lhs_rc, lhs) && $cast(rhs_rc, rhs))
+      return lhs_rc.remote_qpn == rhs_rc.remote_qpn &&
+             lhs_rc.send_psn == rhs_rc.send_psn &&
+             lhs_rc.recv_psn == rhs_rc.recv_psn &&
+             lhs_rc.retry_count == rhs_rc.retry_count &&
+             lhs_rc.rnr_retry_count == rhs_rc.rnr_retry_count;
+    if ($cast(lhs_ud, lhs) && $cast(rhs_ud, rhs))
+      return lhs_ud.qkey == rhs_ud.qkey;
+    if ($cast(lhs_urc, lhs) && $cast(rhs_urc, rhs)) begin
+      if (lhs_urc.remote_qpn != rhs_urc.remote_qpn ||
+          lhs_urc.rbsn != rhs_urc.rbsn || lhs_urc.dbsn != rhs_urc.dbsn ||
+          lhs_urc.rpsn != rhs_urc.rpsn || lhs_urc.dpsn != rhs_urc.dpsn ||
+          lhs_urc.queues == null || rhs_urc.queues == null)
+        return 1'b0;
+      return lhs_urc.queues.rsq_backing.value ==
+               rhs_urc.queues.rsq_backing.value &&
+             lhs_urc.queues.rdsq_backing.value ==
+               rhs_urc.queues.rdsq_backing.value &&
+             lhs_urc.queues.dsq_backing.value ==
+               rhs_urc.queues.dsq_backing.value &&
+             lhs_urc.queues.rsq_depth == rhs_urc.queues.rsq_depth &&
+             lhs_urc.queues.rdsq_depth == rhs_urc.queues.rdsq_depth &&
+             lhs_urc.queues.rdsq_fetch_count ==
+               rhs_urc.queues.rdsq_fetch_count &&
+             lhs_urc.queues.dsq_fetch_count ==
+               rhs_urc.queues.dsq_fetch_count &&
+             lhs_urc.queues.rq_sequence_threshold_entries ==
+               rhs_urc.queues.rq_sequence_threshold_entries &&
+             lhs_urc.queues.sq_completion_threshold_entries ==
+               rhs_urc.queues.sq_completion_threshold_entries;
+    end
+    return 1'b0;
+  endfunction
+
+  protected function bit same_qpc_value(
+    rdma_qpc_model lhs,
+    rdma_qpc_model rhs
+  );
+    if (lhs == null || rhs == null)
+      return lhs == rhs;
+    return same_handle_instance(lhs.qp_h, rhs.qp_h) &&
+           same_handle_instance(lhs.pd_h, rhs.pd_h) &&
+           same_handle_instance(lhs.send_cq_h, rhs.send_cq_h) &&
+           same_handle_instance(lhs.recv_cq_h, rhs.recv_cq_h) &&
+           same_handle_instance(lhs.srq_h, rhs.srq_h) &&
+           lhs.transport == rhs.transport && lhs.state == rhs.state &&
+           lhs.host_id == rhs.host_id && lhs.vf_id == rhs.vf_id &&
+           lhs.stat_index == rhs.stat_index && lhs.pkey == rhs.pkey &&
+           lhs.qp_sequence == rhs.qp_sequence && lhs.access == rhs.access &&
+           lhs.path_mtu_bytes == rhs.path_mtu_bytes &&
+           lhs.sq_depth == rhs.sq_depth && lhs.rq_depth == rhs.rq_depth &&
+           lhs.sq_backing.value == rhs.sq_backing.value &&
+           lhs.rq_backing.value == rhs.rq_backing.value &&
+           lhs.context_backing.value == rhs.context_backing.value &&
+           lhs.sq_mode == rhs.sq_mode && lhs.rq_mode == rhs.rq_mode &&
+           lhs.signature_enable == rhs.signature_enable &&
+           lhs.tx_flow_control == rhs.tx_flow_control &&
+           lhs.rx_flow_control == rhs.rx_flow_control &&
+           same_address_vector_value(lhs.address_vector,
+                                     rhs.address_vector) &&
+           same_qpc_behavior_value(lhs.behavior, rhs.behavior) &&
+           same_qpc_extension_value(lhs.transport_ext, rhs.transport_ext);
+  endfunction
+
+  protected function rdma_status project_qp_recovery_value(
+    rdma_qp_recovery_state source,
+    string copy_label,
+    output rdma_qp_recovery_state result
+  );
+    rdma_status status;
+
+    result = null;
+    if (source == null)
+      return rdma_status::success();
+    result = new({copy_label, "_qp_recovery"});
+    result.intent = source.intent;
+    result.ambiguous_operation = source.ambiguous_operation;
+    result.role_complete = source.role_complete;
+    status = project_qpc_value(source.prior_qpc, {copy_label, "_prior"},
+                               result.prior_qpc);
+    if (status.ok())
+      status = project_qpc_value(source.candidate_qpc,
+                                 {copy_label, "_candidate"},
+                                 result.candidate_qpc);
+    if (status.ok())
+      status = project_qp_plan_value(source.qp_plan, {copy_label, "_plan"},
+                                     result.qp_plan);
+    if (status.ok())
+      status = project_queue_context_value(
+        source.context_ref, {copy_label, "_context"}, result.context_ref
+      );
+    if (status.ok() && source.staging_mapping != null)
+      status = clone_owned_mapping_value(
+        source.staging_mapping, {copy_label, "_staging"},
+        result.staging_mapping
+      );
+    if (status.ok() && source.query_mapping != null)
+      status = clone_owned_mapping_value(
+        source.query_mapping, {copy_label, "_query"}, result.query_mapping
+      );
+    if (status.ok())
+      status = project_opcode_value(source.create_opcode,
+                                    {copy_label, "_create"},
+                                    result.create_opcode);
+    if (status.ok())
+      status = project_opcode_value(source.modify_opcode,
+                                    {copy_label, "_modify"},
+                                    result.modify_opcode);
+    if (status.ok())
+      status = project_opcode_value(source.delete_opcode,
+                                    {copy_label, "_delete"},
+                                    result.delete_opcode);
+    if (status.ok())
+      status = project_opcode_value(source.query_opcode,
+                                    {copy_label, "_query_opcode"},
+                                    result.query_opcode);
+    if (status.ok())
+      status = project_ticket_value(source.ambiguous_ticket,
+                                    {copy_label, "_ticket"},
+                                    result.ambiguous_ticket);
+    if (!status.ok())
+      result = null;
+    return status;
+  endfunction
+
   protected function rdma_status project_queue_fields(
     rdma_queue_resource source,
     rdma_queue_resource result,
@@ -1900,6 +2479,15 @@ class rdma_resource_manager extends uvm_object;
         if (status.ok())
           status = project_handle_value(
             source_qp.srq_h, {copy_label, "_srq"}, result_qp.srq_h
+          );
+        if (status.ok())
+          status = project_qp_plan_value(
+            source_qp.qp_plan, {copy_label, "_qp_plan"}, result_qp.qp_plan
+          );
+        if (status.ok())
+          status = project_qpc_value(
+            source_qp.programmed_qpc, {copy_label, "_programmed_qpc"},
+            result_qp.programmed_qpc
           );
       end
       RDMA_RESOURCE_SRQ: begin
@@ -3075,6 +3663,7 @@ class rdma_resource_manager extends uvm_object;
     int unsigned prior_serial;
     bit used_free_id;
     bit registered_binding;
+    string sequence_key;
 
     qp = null;
     status = active_binding_status(binding, owner);
@@ -3152,6 +3741,41 @@ class rdma_resource_manager extends uvm_object;
     end
     if (!$cast(qp, published))
       `uvm_fatal("RM_COPY_TYPE", "published QP type mismatch")
+    sequence_key = qp_sequence_key(owner, local_id);
+    if (qp_sequences.exists(sequence_key))
+      qp_sequences[sequence_key]++;
+    else
+      qp_sequences[sequence_key] = '0;
+    return rdma_status::success();
+  endfunction
+
+  virtual function rdma_status qp_sequence(
+    rdma_function_handle owner,
+    int unsigned local_qpn,
+    output bit [7:0] sequence_value
+  );
+    rdma_function_handle trusted_owner;
+    rdma_status status;
+    string key;
+
+    sequence_value = '0;
+    status = project_function_handle_value(owner, "QP sequence owner",
+                                           trusted_owner);
+    if (!status.ok())
+      return status;
+    if (trusted_owner == null ||
+        trusted_owner.kind != RDMA_RESOURCE_FUNCTION ||
+        local_qpn > local_id_limit(RDMA_RESOURCE_QP))
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "QP sequence identity is invalid");
+    status = owner_binding_status(trusted_owner);
+    if (!status.ok())
+      return status;
+    key = qp_sequence_key(trusted_owner, local_qpn);
+    if (!qp_sequences.exists(key))
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "QP sequence identity is unknown");
+    sequence_value = qp_sequences[key];
     return rdma_status::success();
   endfunction
 
@@ -3550,6 +4174,613 @@ class rdma_resource_manager extends uvm_object;
       return status;
     replacement.state = RDMA_RESOURCE_QUIESCING;
     registry[key] = replacement;
+    return rdma_status::success();
+  endfunction
+
+  virtual function rdma_status attach_qp_programming(rdma_qp candidate);
+    rdma_resource authoritative;
+    rdma_resource projected;
+    rdma_qp replacement;
+    rdma_qp authoritative_qp;
+    rdma_status status;
+    string key;
+
+    status = project_public_resource_value(candidate, "attach QP programming",
+                                           projected);
+    if (!status.ok() || !$cast(replacement, projected))
+      return status.ok() ? rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT, "QP programming candidate is incompatible"
+      ) : status;
+    if (replacement.state != RDMA_RESOURCE_ALLOCATED ||
+        replacement.qp_plan == null || replacement.programmed_qpc == null)
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "QP programming requires a complete ALLOCATED replacement"
+      );
+    status = lookup(replacement.handle, authoritative);
+    if (!status.ok() || !$cast(authoritative_qp, authoritative))
+      return status.ok() ? rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT, "QP programming target is not a QP"
+      ) : status;
+    key = resource_key(authoritative.handle);
+    if (registry[key].state != RDMA_RESOURCE_ALLOCATED ||
+        staged_allocations.exists(key) || authoritative_qp.qp_plan != null ||
+        authoritative_qp.programmed_qpc != null)
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE, "QP programming target is not a clean reservation"
+      );
+    status = publication_identity_status(replacement, authoritative);
+    if (!status.ok())
+      return status;
+    replacement.state = RDMA_RESOURCE_PROGRAMMED;
+    status = replacement.validate();
+    if (status == null)
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE, "QP programming validation returned null"
+      );
+    if (!status.ok())
+      return status;
+    registry[key] = replacement;
+    return rdma_status::success();
+  endfunction
+
+  virtual function rdma_status commit_qp_semantic_state(
+    rdma_handle qp_h,
+    rdma_qp_state_e state
+  );
+    rdma_resource authoritative;
+    rdma_resource projected;
+    rdma_qp replacement;
+    rdma_status status;
+    string key;
+
+    status = lookup(qp_h, authoritative);
+    if (!status.ok() || authoritative.handle.kind != RDMA_RESOURCE_QP)
+      return status.ok() ? rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT, "semantic-state target is not a QP"
+      ) : status;
+    key = resource_key(authoritative.handle);
+    if (registry[key].state != RDMA_RESOURCE_ACTIVE ||
+        !$cast(replacement, registry[key]) ||
+        replacement.qp_state != RDMA_QPS_RESET || state != RDMA_QPS_INIT)
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "QP semantic-only commit requires ACTIVE RESET to INIT"
+      );
+    status = project_resource_value(registry[key], "commit QP semantic state",
+                                    projected);
+    if (!status.ok() || !$cast(replacement, projected))
+      return status.ok() ? rdma_status::make(
+        RDMA_SC_INVALID_STATE, "QP semantic-state projection failed"
+      ) : status;
+    replacement.qp_state = state;
+    status = replacement.validate();
+    if (status == null)
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE, "QP semantic-state validation returned null"
+      );
+    if (!status.ok())
+      return status;
+    registry[key] = replacement;
+    return rdma_status::success();
+  endfunction
+
+  virtual function rdma_status commit_qp_programmed(rdma_qp candidate);
+    rdma_resource authoritative;
+    rdma_resource projected;
+    rdma_qp authoritative_qp;
+    rdma_qp replacement;
+    rdma_recovery_record recovery;
+    rdma_status status;
+    string key;
+    bit reconciliation;
+
+    status = project_public_resource_value(candidate, "commit QP programmed",
+                                           projected);
+    if (!status.ok() || !$cast(replacement, projected))
+      return status.ok() ? rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT, "programmed QP candidate is incompatible"
+      ) : status;
+    status = lookup(replacement.handle, authoritative);
+    if (!status.ok() || !$cast(authoritative_qp, authoritative))
+      return status.ok() ? rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT, "programmed target is not a QP"
+      ) : status;
+    key = resource_key(authoritative.handle);
+    status = publication_identity_status(replacement, authoritative);
+    if (!status.ok())
+      return status;
+    if (!same_qp_plan_value(replacement.qp_plan,
+                            authoritative_qp.qp_plan))
+      return rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT, "programmed QP backing authority changed"
+      );
+
+    reconciliation = registry[key].state == RDMA_RESOURCE_ERROR;
+    if (!reconciliation) begin
+      if (registry[key].state != RDMA_RESOURCE_ACTIVE ||
+          replacement.state != RDMA_RESOURCE_ACTIVE)
+        return rdma_status::make(
+          RDMA_SC_INVALID_STATE, "programmed QP commit requires ACTIVE state"
+        );
+    end
+    else begin
+      status = recovery_entry_schema_status(key, "commit QP programmed");
+      if (!status.ok())
+        return status;
+      if (!recovery_records.exists(key))
+        return rdma_status::make(
+          RDMA_SC_INVALID_STATE, "ERROR QP lacks modify recovery"
+        );
+      recovery = recovery_records[key];
+      if (!recovery.qp_recovery_valid || recovery.qp_recovery == null ||
+          recovery.qp_recovery.intent !=
+            RDMA_QP_RECOVER_MODIFY_RECONCILE ||
+          !(same_qpc_value(replacement.programmed_qpc,
+                           recovery.qp_recovery.prior_qpc) ||
+            same_qpc_value(replacement.programmed_qpc,
+                           recovery.qp_recovery.candidate_qpc)))
+        return rdma_status::make(
+          RDMA_SC_INVALID_ARGUMENT,
+          "programmed QP does not match a reconciliation candidate"
+        );
+      replacement.state = RDMA_RESOURCE_ACTIVE;
+    end
+    status = replacement.validate();
+    if (status == null)
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE, "programmed QP validation returned null"
+      );
+    if (!status.ok())
+      return status;
+    registry[key] = replacement;
+    if (reconciliation)
+      recovery_records.delete(key);
+    return rdma_status::success();
+  endfunction
+
+  virtual function rdma_status mark_qp_error(
+    rdma_handle qp_h,
+    rdma_qp_recovery_state recovery
+  );
+    rdma_resource authoritative;
+    rdma_resource projected;
+    rdma_qp authoritative_qp;
+    rdma_qp replacement;
+    rdma_qp_recovery_state recovery_copy;
+    rdma_recovery_record record_copy;
+    rdma_status status;
+    string key;
+
+    status = lookup(qp_h, authoritative);
+    if (!status.ok() || !$cast(authoritative_qp, authoritative))
+      return status.ok() ? rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT, "QP ERROR target is not a QP"
+      ) : status;
+    key = resource_key(authoritative.handle);
+    if (!(registry[key].state inside {RDMA_RESOURCE_PROGRAMMED,
+                                      RDMA_RESOURCE_ACTIVE,
+                                      RDMA_RESOURCE_QUIESCING}) ||
+        recovery_records.exists(key))
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE, "QP cannot enter ERROR from its current state"
+      );
+    status = project_qp_recovery_value(recovery, "mark QP ERROR",
+                                       recovery_copy);
+    if (!status.ok() || recovery_copy == null)
+      return status.ok() ? rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT, "QP recovery projection is empty"
+      ) : status;
+    status = recovery_copy.validate();
+    if (status == null)
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE, "QP recovery validation returned null"
+      );
+    if (!status.ok())
+      return status;
+    if (!same_qp_plan_value(authoritative_qp.qp_plan,
+                            recovery_copy.qp_plan) ||
+        !same_context_value(authoritative_qp.qp_plan.context_ref,
+                            recovery_copy.context_ref))
+      return rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT, "QP recovery authority changed"
+      );
+    status = project_resource_value(registry[key], "mark QP ERROR resource",
+                                    projected);
+    if (!status.ok() || !$cast(replacement, projected))
+      return status.ok() ? rdma_status::make(
+        RDMA_SC_INVALID_STATE, "QP ERROR resource projection failed"
+      ) : status;
+    replacement.state = RDMA_RESOURCE_ERROR;
+    status = replacement.validate();
+    if (status == null)
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE, "QP ERROR resource validation returned null"
+      );
+    if (!status.ok())
+      return status;
+
+    record_copy = new("qp_recovery_record");
+    status = project_handle_value(authoritative.handle, "QP recovery handle",
+                                  record_copy.resource_h);
+    if (!status.ok())
+      return status;
+    record_copy.hardware_presence =
+      recovery_copy.intent == RDMA_QP_RECOVER_CREATE_ROLLBACK &&
+      recovery_copy.ambiguous_operation == RDMA_QP_AMBIG_NONE ?
+        RDMA_HW_PRESENCE_ABSENT : RDMA_HW_PRESENCE_PRESENT;
+    record_copy.primary_status = rdma_status::make(
+      RDMA_SC_RECOVERY_REQUIRED, "QP requires lifecycle recovery"
+    );
+    record_copy.qp_recovery_valid = 1'b1;
+    record_copy.qp_recovery = recovery_copy;
+    status = record_copy.validate();
+    if (status == null)
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE, "QP recovery record validation returned null"
+      );
+    if (!status.ok())
+      return status;
+
+    // Durable recovery authority is published before the resource becomes
+    // externally observable as ERROR.
+    recovery_records[key] = record_copy;
+    registry[key] = replacement;
+    staged_allocations.delete(key);
+    return rdma_status::success();
+  endfunction
+
+  protected function rdma_qp_backing_ref qp_plan_ref(
+    rdma_qp_backing_plan plan,
+    rdma_queue_backing_role_e role
+  );
+    if (plan == null)
+      return null;
+    case (role)
+      RDMA_QUEUE_ROLE_QP_SQ_RING: return plan.sq_ref;
+      RDMA_QUEUE_ROLE_QP_RQ_RING: return plan.rq_ref;
+      RDMA_QUEUE_ROLE_QP_SQ_PD: return plan.sq_pd_ref;
+      RDMA_QUEUE_ROLE_QP_RQ_PD: return plan.rq_pd_ref;
+      default: begin
+        foreach (plan.urc_refs[i])
+          if (plan.urc_refs[i] != null && plan.urc_refs[i].role == role)
+            return plan.urc_refs[i];
+      end
+    endcase
+    return null;
+  endfunction
+
+  protected function rdma_status qp_progress_snapshots(
+    rdma_handle qp_h,
+    string operation,
+    output string key,
+    output rdma_qp resource_copy,
+    output rdma_recovery_record recovery_copy,
+    output bit has_recovery
+  );
+    rdma_resource authoritative;
+    rdma_resource projected;
+    rdma_status status;
+
+    key = "";
+    resource_copy = null;
+    recovery_copy = null;
+    has_recovery = 1'b0;
+    status = lookup(qp_h, authoritative);
+    if (!status.ok() || authoritative.handle.kind != RDMA_RESOURCE_QP)
+      return status.ok() ? rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT, {operation, " target is not a QP"}
+      ) : status;
+    key = resource_key(authoritative.handle);
+    if (!(registry[key].state inside {RDMA_RESOURCE_QUIESCING,
+                                      RDMA_RESOURCE_ERROR}))
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        {operation, " requires QUIESCING or ERROR QP"}
+      );
+    status = project_resource_value(registry[key], {operation, " resource"},
+                                    projected);
+    if (!status.ok() || !$cast(resource_copy, projected) ||
+        resource_copy.qp_plan == null)
+      return status.ok() ? rdma_status::make(
+        RDMA_SC_INVALID_STATE, {operation, " QP plan is missing"}
+      ) : status;
+    if (registry[key].state == RDMA_RESOURCE_ERROR) begin
+      status = recovery_entry_schema_status(key, operation);
+      if (!status.ok())
+        return status;
+      if (!recovery_records.exists(key) ||
+          !recovery_records[key].qp_recovery_valid ||
+          recovery_records[key].qp_recovery == null)
+        return rdma_status::make(
+          RDMA_SC_INVALID_STATE, {operation, " QP recovery is missing"}
+        );
+      status = project_recovery_value(recovery_records[key],
+                                      {operation, " recovery"}, recovery_copy);
+      if (!status.ok())
+        return status;
+      has_recovery = 1'b1;
+      if (!same_qp_plan_value(resource_copy.qp_plan,
+                              recovery_copy.qp_recovery.qp_plan))
+        return rdma_status::make(
+          RDMA_SC_INVALID_STATE, {operation, " recovery plan diverged"}
+        );
+    end
+    return rdma_status::success();
+  endfunction
+
+  protected function rdma_status commit_qp_progress(
+    string key,
+    rdma_qp resource_copy,
+    rdma_recovery_record recovery_copy,
+    bit has_recovery,
+    string operation
+  );
+    rdma_status status;
+
+    status = resource_copy.validate();
+    if (status == null)
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE, {operation, " resource validation returned null"}
+      );
+    if (!status.ok())
+      return status;
+    if (has_recovery) begin
+      status = recovery_copy.validate();
+      if (status == null)
+        return rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          {operation, " recovery validation returned null"}
+        );
+      if (!status.ok())
+        return status;
+    end
+    registry[key] = resource_copy;
+    if (has_recovery)
+      recovery_records[key] = recovery_copy;
+    return rdma_status::success();
+  endfunction
+
+  virtual function rdma_status record_qp_flush_complete(
+    rdma_handle qp_h,
+    rdma_queue_backing_role_e role
+  );
+    rdma_qp resource_copy;
+    rdma_recovery_record recovery_copy;
+    rdma_qp_backing_plan recovery_plan;
+    rdma_status status;
+    bit has_recovery;
+    bit already_complete;
+    string key;
+
+    if (!(role inside {RDMA_QUEUE_ROLE_QP_SQ_RING,
+                       RDMA_QUEUE_ROLE_QP_SQ_PD,
+                       RDMA_QUEUE_ROLE_QP_RQ_PD}))
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "QP flush role is invalid");
+    status = qp_progress_snapshots(qp_h, "QP flush progress", key,
+                                   resource_copy, recovery_copy,
+                                   has_recovery);
+    if (!status.ok())
+      return status;
+    recovery_plan = has_recovery ? recovery_copy.qp_recovery.qp_plan : null;
+    case (role)
+      RDMA_QUEUE_ROLE_QP_SQ_RING: begin
+        already_complete = resource_copy.qp_plan.cleanup_complete;
+        if (!already_complete && has_recovery)
+          already_complete = recovery_plan.cleanup_complete;
+        if (!already_complete) begin
+          resource_copy.qp_plan.cleanup_complete = 1'b1;
+          if (has_recovery)
+            recovery_plan.cleanup_complete = 1'b1;
+        end
+      end
+      RDMA_QUEUE_ROLE_QP_SQ_PD: begin
+        if (!resource_copy.qp_plan.cleanup_complete ||
+            has_recovery && !recovery_plan.cleanup_complete)
+          return rdma_status::make(
+            RDMA_SC_INVALID_STATE, "QP QPN flush predecessor is incomplete"
+          );
+        already_complete = resource_copy.qp_plan.sq_pd_flush_complete;
+        if (!already_complete && has_recovery)
+          already_complete = recovery_plan.sq_pd_flush_complete;
+        if (!already_complete) begin
+          resource_copy.qp_plan.sq_pd_flush_complete = 1'b1;
+          if (has_recovery)
+            recovery_plan.sq_pd_flush_complete = 1'b1;
+        end
+      end
+      RDMA_QUEUE_ROLE_QP_RQ_PD: begin
+        if (resource_copy.qp_plan.rq_source_h != null)
+          return rdma_status::make(
+            RDMA_SC_INVALID_ARGUMENT, "SRQ-backed QP has no private RQ flush"
+          );
+        if (!resource_copy.qp_plan.sq_pd_flush_complete ||
+            has_recovery && !recovery_plan.sq_pd_flush_complete)
+          return rdma_status::make(
+            RDMA_SC_INVALID_STATE, "QP SQ PD flush predecessor is incomplete"
+          );
+        already_complete = resource_copy.qp_plan.rq_pd_flush_complete;
+        if (!already_complete && has_recovery)
+          already_complete = recovery_plan.rq_pd_flush_complete;
+        if (!already_complete) begin
+          resource_copy.qp_plan.rq_pd_flush_complete = 1'b1;
+          if (has_recovery)
+            recovery_plan.rq_pd_flush_complete = 1'b1;
+        end
+      end
+    endcase
+    if (already_complete)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "QP flush progress is already complete");
+    return commit_qp_progress(key, resource_copy, recovery_copy, has_recovery,
+                              "QP flush progress");
+  endfunction
+
+  virtual function rdma_status record_qp_cleanup_complete(
+    rdma_handle qp_h,
+    rdma_queue_backing_role_e role
+  );
+    rdma_qp resource_copy;
+    rdma_recovery_record recovery_copy;
+    rdma_qp_backing_ref resource_ref;
+    rdma_qp_backing_ref recovery_ref;
+    rdma_status status;
+    bit has_recovery;
+    string key;
+
+    if (!rdma_qp_role_is_payload(role) && !rdma_qp_role_is_pd(role))
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "QP cleanup role is invalid");
+    status = qp_progress_snapshots(qp_h, "QP cleanup progress", key,
+                                   resource_copy, recovery_copy,
+                                   has_recovery);
+    if (!status.ok())
+      return status;
+    resource_ref = qp_plan_ref(resource_copy.qp_plan, role);
+    recovery_ref = has_recovery ?
+      qp_plan_ref(recovery_copy.qp_recovery.qp_plan, role) : null;
+    if (resource_ref == null ||
+        resource_ref.ownership != RDMA_OWNERSHIP_CONTROL_PLANE ||
+        resource_ref.cleanup_complete ||
+        has_recovery && (recovery_ref == null ||
+                         recovery_ref.cleanup_complete ||
+                         recovery_copy.qp_recovery.role_complete[role]))
+      return rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT,
+        "QP cleanup role is absent, borrowed, or already complete"
+      );
+    resource_ref.cleanup_complete = 1'b1;
+    if (has_recovery) begin
+      recovery_ref.cleanup_complete = 1'b1;
+      recovery_copy.qp_recovery.role_complete[role] = 1'b1;
+    end
+    return commit_qp_progress(key, resource_copy, recovery_copy, has_recovery,
+                              "QP cleanup progress");
+  endfunction
+
+  virtual function rdma_status record_qp_context_cleanup_complete(
+    rdma_handle qp_h
+  );
+    rdma_qp resource_copy;
+    rdma_recovery_record recovery_copy;
+    rdma_status status;
+    bit has_recovery;
+    string key;
+
+    status = qp_progress_snapshots(qp_h, "QP context cleanup", key,
+                                   resource_copy, recovery_copy,
+                                   has_recovery);
+    if (!status.ok())
+      return status;
+    if (resource_copy.qp_plan.context_ref == null ||
+        resource_copy.qp_plan.context_ref.release_complete ||
+        has_recovery &&
+          (recovery_copy.qp_recovery.context_ref == null ||
+           recovery_copy.qp_recovery.context_ref.release_complete ||
+           recovery_copy.qp_recovery.qp_plan.context_ref == null ||
+           recovery_copy.qp_recovery.qp_plan.context_ref.release_complete))
+      return rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT,
+        "QP context cleanup is absent or already complete"
+      );
+    resource_copy.qp_plan.context_ref.release_complete = 1'b1;
+    if (has_recovery) begin
+      recovery_copy.qp_recovery.context_ref.release_complete = 1'b1;
+      recovery_copy.qp_recovery.qp_plan.context_ref.release_complete = 1'b1;
+    end
+    return commit_qp_progress(key, resource_copy, recovery_copy, has_recovery,
+                              "QP context cleanup");
+  endfunction
+
+  protected function bit qp_plan_cleanup_ready(rdma_qp_backing_plan plan);
+    rdma_qp_backing_ref refs[$];
+
+    if (plan == null || !plan.cleanup_complete ||
+        !plan.sq_pd_flush_complete ||
+        (plan.rq_source_h == null && !plan.rq_pd_flush_complete) ||
+        plan.context_ref == null || !plan.context_ref.release_complete)
+      return 1'b0;
+    refs.push_back(plan.sq_ref);
+    refs.push_back(plan.sq_pd_ref);
+    if (plan.rq_source_h == null) begin
+      refs.push_back(plan.rq_ref);
+      refs.push_back(plan.rq_pd_ref);
+    end
+    foreach (plan.urc_refs[i])
+      refs.push_back(plan.urc_refs[i]);
+    foreach (refs[i]) begin
+      if (refs[i] == null)
+        return 1'b0;
+      if (refs[i].ownership == RDMA_OWNERSHIP_CONTROL_PLANE &&
+          !refs[i].cleanup_complete)
+        return 1'b0;
+      if (refs[i].ownership == RDMA_OWNERSHIP_BORROWED &&
+          refs[i].cleanup_complete)
+        return 1'b0;
+    end
+    return 1'b1;
+  endfunction
+
+  virtual function rdma_status finalize_qp_release(rdma_handle qp_h);
+    rdma_resource authoritative;
+    rdma_qp authoritative_qp;
+    rdma_recovery_record recovery;
+    rdma_status status;
+    string key;
+
+    status = registry_schema_status("finalize QP release");
+    if (!status.ok())
+      return status;
+    status = lookup(qp_h, authoritative);
+    if (!status.ok() || !$cast(authoritative_qp, authoritative))
+      return status.ok() ? rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT, "QP finalization target is not a QP"
+      ) : status;
+    key = resource_key(authoritative.handle);
+    if (registry[key].state == RDMA_RESOURCE_ALLOCATED &&
+        authoritative_qp.qp_plan == null &&
+        authoritative_qp.programmed_qpc == null) begin
+      if (has_dependents(registry[key]) ||
+          registry[key].outstanding_ids.size() != 0)
+        return rdma_status::make(RDMA_SC_RESOURCE_BUSY,
+                                 "QP reservation is still busy");
+      force_release_key(key);
+      return rdma_status::success();
+    end
+    if (!(registry[key].state inside {RDMA_RESOURCE_QUIESCING,
+                                      RDMA_RESOURCE_ERROR}))
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "QP finalization requires QUIESCING, ERROR, or empty reservation"
+      );
+    if (!qp_plan_cleanup_ready(authoritative_qp.qp_plan))
+      return rdma_status::make(
+        RDMA_SC_RECOVERY_REQUIRED, "QP cleanup is not complete"
+      );
+    if (registry[key].state == RDMA_RESOURCE_ERROR) begin
+      status = recovery_entry_schema_status(key, "finalize QP release");
+      if (!status.ok())
+        return status;
+      if (!recovery_records.exists(key))
+        return rdma_status::make(RDMA_SC_RECOVERY_REQUIRED,
+                                 "ERROR QP recovery is missing");
+      recovery = recovery_records[key];
+      if (!recovery.qp_recovery_valid || recovery.qp_recovery == null ||
+          !qp_plan_cleanup_ready(recovery.qp_recovery.qp_plan) ||
+          recovery.qp_recovery.context_ref == null ||
+          !recovery.qp_recovery.context_ref.release_complete)
+        return rdma_status::make(
+          RDMA_SC_RECOVERY_REQUIRED, "QP recovery cleanup is not complete"
+        );
+    end
+    if (has_dependents(registry[key]) ||
+        registry[key].outstanding_ids.size() != 0)
+      return rdma_status::make(
+        RDMA_SC_RESOURCE_BUSY,
+        "QP still has live dependents or outstanding operations"
+      );
+    force_release_key(key);
     return rdma_status::success();
   endfunction
 
@@ -4806,6 +6037,11 @@ class rdma_resource_manager extends uvm_object;
         RDMA_SC_INVALID_STATE,
         "Function resources require privileged Function teardown"
       );
+    if (authoritative.handle.kind == RDMA_RESOURCE_QP)
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "QP resources require QP-specific finalization"
+      );
     if (registry[key].state == RDMA_RESOURCE_ERROR) begin
       if (!recovery_records.exists(key) ||
           !recovery_ready(recovery_records[key]))
@@ -4853,6 +6089,11 @@ class rdma_resource_manager extends uvm_object;
       return rdma_status::make(
         RDMA_SC_INVALID_STATE,
         "Function resources require privileged Function teardown"
+      );
+    if (authoritative.handle.kind == RDMA_RESOURCE_QP)
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "QP reservations require QP-specific finalization"
       );
     if (registry[key].state == RDMA_RESOURCE_ERROR) begin
       if (!recovery_records.exists(key))
@@ -5000,6 +6241,11 @@ class rdma_resource_manager extends uvm_object;
       return rdma_status::make(
         RDMA_SC_INVALID_STATE,
         "Function resources require privileged Function teardown"
+      );
+    if (ignored.handle.kind == RDMA_RESOURCE_QP)
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "QP resources require QP-specific finalization"
       );
     if (registry[key].state == RDMA_RESOURCE_ERROR)
       return rdma_status::make(
