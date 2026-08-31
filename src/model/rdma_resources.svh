@@ -76,9 +76,8 @@ function automatic rdma_status rdma_qp_mapping_authority_status(
       !backing_ref.mapping.function_h.same_instance(owner))
     return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                              {label, " mapping Function does not match"});
-  if (backing_ref.ownership == RDMA_OWNERSHIP_CONTROL_PLANE &&
-      (backing_ref.mapping.owner_h == null ||
-       !backing_ref.mapping.owner_h.same_instance(qp_h)))
+  if (backing_ref.mapping.owner_h == null ||
+      !backing_ref.mapping.owner_h.same_instance(qp_h))
     return rdma_status::make(RDMA_SC_INVALID_STATE,
                                {label, " mapping QP owner does not match"});
   foreach (backing_ref.additional_segments[i]) begin
@@ -86,9 +85,8 @@ function automatic rdma_status rdma_qp_mapping_authority_status(
         backing_ref.additional_segments[i].mapping == null ||
         backing_ref.additional_segments[i].mapping.function_h == null ||
         !backing_ref.additional_segments[i].mapping.function_h.same_instance(owner) ||
-        (backing_ref.additional_segments[i].ownership == RDMA_OWNERSHIP_CONTROL_PLANE &&
-         (backing_ref.additional_segments[i].mapping.owner_h == null ||
-          !backing_ref.additional_segments[i].mapping.owner_h.same_instance(qp_h))))
+        backing_ref.additional_segments[i].mapping.owner_h == null ||
+        !backing_ref.additional_segments[i].mapping.owner_h.same_instance(qp_h))
       return rdma_status::make(RDMA_SC_INVALID_STATE,
                                {label, " segment mapping authority is invalid"});
   end

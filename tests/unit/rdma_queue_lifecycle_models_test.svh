@@ -130,7 +130,9 @@ class rdma_queue_lifecycle_models_test extends uvm_test;
     rdma_qp_backing_plan qp_plan, qp_plan_clone;
     rdma_qp_ring_layout qp_ring;
     rdma_qp_backing_ref qp_ref, qp_pd_ref, qp_rq_ref, qp_rq_pd_ref;
+    rdma_qp_backing_ref qp_coverage_ref;
     rdma_qp_backing_ref urc_rsq_ref, urc_rdsq_ref, urc_dsq_ref;
+    rdma_queue_backing_segment qp_coverage_segment;
     rdma_context_backing_ref ctx, ctx_clone;
     rdma_hmc_ref hmc;
     rdma_queue_completion_authority authority;
@@ -185,6 +187,35 @@ class rdma_queue_lifecycle_models_test extends uvm_test;
     qp_ref.mapping = mapping;
     qp_ref.length = 8192;
     qp_ref.ownership = RDMA_OWNERSHIP_BORROWED;
+    qp_coverage_ref = rdma_qp_backing_ref::type_id::create(
+      "qp_coverage_ref"
+    );
+    qp_coverage_ref.role = RDMA_QUEUE_ROLE_QP_SQ_RING;
+    qp_coverage_ref.mapping = make_mapping("qp_coverage_mapping");
+    qp_coverage_ref.length = 4096;
+    qp_coverage_ref.ownership = RDMA_OWNERSHIP_BORROWED;
+    qp_coverage_segment = rdma_queue_backing_segment::type_id::create(
+      "qp_coverage_segment"
+    );
+    qp_coverage_segment.role = RDMA_QUEUE_ROLE_QP_SQ_RING;
+    qp_coverage_segment.mapping = make_mapping("qp_coverage_segment_mapping");
+    qp_coverage_segment.ownership = RDMA_OWNERSHIP_BORROWED;
+    qp_coverage_segment.mapping_offset = 4096;
+    qp_coverage_segment.length = 4096;
+    qp_coverage_segment.logical_queue_offset = 4096;
+    qp_coverage_ref.additional_segments.push_back(qp_coverage_segment);
+    begin
+      longint unsigned total_length;
+      expect_status("QP_CHECKED_COVERAGE",
+        rdma_qp_backing_total_length(qp_coverage_ref, total_length), RDMA_SC_OK);
+      if (total_length != 8192)
+        `uvm_error("QP_CHECKED_COVERAGE", "QP segment total was not 8192 bytes")
+      qp_coverage_segment.logical_queue_offset = 8192;
+      expect_status("QP_CHECKED_COVERAGE_GAP",
+        rdma_qp_backing_total_length(qp_coverage_ref, total_length),
+        RDMA_SC_INVALID_ARGUMENT);
+      qp_coverage_segment.logical_queue_offset = 4096;
+    end
     qp_pd_ref = rdma_qp_backing_ref::type_id::create("qp_sq_pd_ref");
     qp_pd_ref.role = RDMA_QUEUE_ROLE_QP_SQ_PD;
     qp_pd_ref.mapping = make_mapping("qp_pd_mapping");

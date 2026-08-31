@@ -338,14 +338,26 @@ function automatic rdma_status rdma_qp_recovery_ref_status(
   if (backing_ref == null || backing_ref.mapping == null)
     return rdma_status::make(RDMA_SC_INVALID_STATE,
                              {label, " backing authority is missing"});
-  if (backing_ref.mapping.state == RDMA_MAPPING_ACTIVE)
-    return rdma_status::success();
-  if (role_complete && backing_ref.mapping.state == RDMA_MAPPING_RELEASED) begin
+  if (backing_ref.mapping.state != RDMA_MAPPING_ACTIVE &&
+      role_complete && backing_ref.mapping.state == RDMA_MAPPING_RELEASED)
     backing_ref.mapping.state = RDMA_MAPPING_ACTIVE;
-    return rdma_status::success();
+  if (backing_ref.mapping.state != RDMA_MAPPING_ACTIVE)
+    return rdma_status::make(RDMA_SC_INVALID_STATE,
+                             {label, " pending backing is not active"});
+  foreach (backing_ref.additional_segments[i]) begin
+    if (backing_ref.additional_segments[i] == null ||
+        backing_ref.additional_segments[i].mapping == null)
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               {label, " segment authority is missing"});
+    if (backing_ref.additional_segments[i].mapping.state != RDMA_MAPPING_ACTIVE &&
+        role_complete && backing_ref.additional_segments[i].mapping.state ==
+          RDMA_MAPPING_RELEASED)
+      backing_ref.additional_segments[i].mapping.state = RDMA_MAPPING_ACTIVE;
+    if (backing_ref.additional_segments[i].mapping.state != RDMA_MAPPING_ACTIVE)
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               {label, " pending segment is not active"});
   end
-  return rdma_status::make(RDMA_SC_INVALID_STATE,
-                           {label, " pending backing is not active"});
+  return rdma_status::success();
 endfunction
 
 function automatic bit rdma_qp_recovery_opcode_equivalent(

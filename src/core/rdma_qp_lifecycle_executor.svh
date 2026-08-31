@@ -123,7 +123,10 @@ class rdma_qp_lifecycle_executor extends uvm_object;
     mapping = null;
     status = normalize_status(host_mem.allocate(request_context, int'(length),
       4096, direction, mapping), "QP backing allocation returned null");
-    if (!status.ok()) return status;
+    if (!status.ok()) begin
+      if (mapping != null) void'(host_mem.\release (mapping));
+      return status;
+    end
     if (mapping == null || mapping.size < length ||
         (mapping.iova.value & 64'hfff) != 0 ||
         (mapping.backing_addr.value & 64'hfff) != 0) begin
@@ -163,6 +166,7 @@ class rdma_qp_lifecycle_executor extends uvm_object;
 
   protected function rdma_status clone_borrowed_ref(
     rdma_queue_backing_spec spec,
+    rdma_handle qp_h,
     rdma_queue_backing_role_e role,
     longint unsigned length,
     output rdma_qp_backing_ref backing_ref
@@ -170,7 +174,7 @@ class rdma_qp_lifecycle_executor extends uvm_object;
     uvm_object cloned;
 
     backing_ref = null;
-    if (spec == null || spec.slices.size() == 0)
+    if (spec == null || qp_h == null || spec.slices.size() == 0)
       return invalid_argument("QP borrowed backing is empty");
     backing_ref = rdma_qp_backing_ref::type_id::create("qp_borrowed_ref");
     if (backing_ref == null)
@@ -216,6 +220,28 @@ class rdma_qp_lifecycle_executor extends uvm_object;
         return invalid_argument("QP borrowed backing does not cover ring");
     end
     return backing_ref.validate();
+  endfunction
+
+  protected function rdma_status bind_borrowed_owner(
+    rdma_qp_backing_ref backing_ref,
+    rdma_handle qp_h
+  );
+    if (backing_ref == null || backing_ref.mapping == null || qp_h == null ||
+        backing_ref.ownership != RDMA_OWNERSHIP_BORROWED)
+      return invalid_argument("QP borrowed owner binding is invalid");
+    backing_ref.mapping.owner_h = rdma_clone_handle_value(
+      qp_h, "QP borrowed owner"
+    );
+    foreach (backing_ref.additional_segments[i]) begin
+      if (backing_ref.additional_segments[i] == null ||
+          backing_ref.additional_segments[i].mapping == null)
+        return invalid_state("QP borrowed segment authority is missing");
+      backing_ref.additional_segments[i].mapping.owner_h =
+        rdma_clone_handle_value(qp_h, "QP borrowed segment owner");
+    end
+    return rdma_qp_mapping_authority_status(
+      backing_ref, backing_ref.mapping.function_h, qp_h, "QP borrowed"
+    );
   endfunction
 
   protected function rdma_status make_ring(
@@ -265,11 +291,17 @@ class rdma_qp_lifecycle_executor extends uvm_object;
     // as detached segments. Resolve each 4 KiB logical page through that
     // canonical coverage instead of assuming a single mapping.
 
-    if (payload_ref.ownership == RDMA_OWNERSHIP_CONTROL_PLANE) begin
-      zeros = new[int'(payload_ref.length)];
-      foreach (zeros[i]) zeros[i] = 0;
-      status = normalize_status(host_mem.write(payload_ref.mapping,
-        payload_ref.mapping_offset, zeros), "QP payload zero-write returned null");
+    zeros = new[int'(payload_ref.length)];
+    foreach (zeros[i]) zeros[i] = 0;
+    status = normalize_status(host_mem.write(payload_ref.mapping,
+      payload_ref.mapping_offset, zeros), "QP payload zero-write returned null");
+    if (!status.ok()) return status;
+    foreach (payload_ref.additional_segments[i]) begin
+      zeros = new[int'(payload_ref.additional_segments[i].length)];
+      foreach (zeros[j]) zeros[j] = 0;
+      status = normalize_status(host_mem.write(payload_ref.additional_segments[i].mapping,
+        payload_ref.additional_segments[i].mapping_offset, zeros),
+        "QP borrowed segment zero-write returned null");
       if (!status.ok()) return status;
     end
     for (longint unsigned offset = 0; offset < payload_bytes;
@@ -361,7 +393,7 @@ class rdma_qp_lifecycle_executor extends uvm_object;
         RDMA_QUEUE_ROLE_QP_SQ_RING, plan.sq_ring.storage_bytes,
         RDMA_DMA_DEVICE_READ, plan.sq_ref);
     else
-      status = clone_borrowed_ref(request.sq_backing,
+      status = clone_borrowed_ref(request.sq_backing, qp_snapshot.handle,
         RDMA_QUEUE_ROLE_QP_SQ_RING, plan.sq_ring.storage_bytes, plan.sq_ref);
     if (!status.ok()) return status;
     status = allocate_ref(binding, qp_snapshot.handle, RDMA_QUEUE_ROLE_QP_SQ_PD,
@@ -369,6 +401,10 @@ class rdma_qp_lifecycle_executor extends uvm_object;
     if (!status.ok()) return status;
     status = zero_and_encode_pd(binding, plan.sq_ref, plan.sq_pd_ref);
     if (!status.ok()) return status;
+    if (request.sq_backing.mode == RDMA_QUEUE_BACKING_BORROWED) begin
+      status = bind_borrowed_owner(plan.sq_ref, qp_snapshot.handle);
+      if (!status.ok()) return status;
+    end
     if (request.srq_h != null) begin
       rdma_resource source;
       rdma_srq srq;
@@ -390,7 +426,7 @@ class rdma_qp_lifecycle_executor extends uvm_object;
           RDMA_QUEUE_ROLE_QP_RQ_RING, plan.rq_ring.storage_bytes,
           RDMA_DMA_DEVICE_READ, plan.rq_ref);
       else
-        status = clone_borrowed_ref(request.rq_backing,
+        status = clone_borrowed_ref(request.rq_backing, qp_snapshot.handle,
           RDMA_QUEUE_ROLE_QP_RQ_RING, plan.rq_ring.storage_bytes, plan.rq_ref);
       if (!status.ok()) return status;
       status = allocate_ref(binding, qp_snapshot.handle,
@@ -398,6 +434,10 @@ class rdma_qp_lifecycle_executor extends uvm_object;
       if (!status.ok()) return status;
       status = zero_and_encode_pd(binding, plan.rq_ref, plan.rq_pd_ref);
       if (!status.ok()) return status;
+      if (request.rq_backing.mode == RDMA_QUEUE_BACKING_BORROWED) begin
+        status = bind_borrowed_owner(plan.rq_ref, qp_snapshot.handle);
+        if (!status.ok()) return status;
+      end
     end
     if (request.transport == RDMA_TRANSPORT_URC) begin
       status = allocate_ref(binding, qp_snapshot.handle,
