@@ -416,7 +416,7 @@ class rdma_host_mem_adapter_test extends uvm_test;
     rdma_queue_backing_plan plan;
     rdma_queue_backing_ref ring_ref;
     rdma_queue_backing_ref pd_ref;
-    rdma_xtr_v1_queue_pd_codec pd_codec;
+    rdma_codec_pkg::rdma_xtr_v1_queue_pd_codec pd_codec;
     rdma_status status;
     bit complete;
     bit release_done;
@@ -547,7 +547,7 @@ class rdma_host_mem_adapter_test extends uvm_test;
         pd_ref.mapping.function_h == binding.owner_h)
       `uvm_error("QUEUE_AUTHORITY", "queue mapping authority is not a deep copy")
 
-    pd_codec = rdma_xtr_v1_queue_pd_codec::type_id::create(
+    pd_codec = rdma_codec_pkg::rdma_xtr_v1_queue_pd_codec::type_id::create(
       "queue_fixture_pd_codec"
     );
     expect_status("QUEUE_INITIALIZE",
