@@ -269,8 +269,9 @@ typedef enum bit [1:0] { RDMA_QP_RECOVER_CREATE_ROLLBACK,
                          RDMA_QP_RECOVER_NORMAL_DESTROY }
   rdma_qp_recovery_intent_e;
 
-typedef enum bit [1:0] { RDMA_QP_AMBIG_NONE, RDMA_QP_AMBIG_CREATE,
-                         RDMA_QP_AMBIG_MODIFY, RDMA_QP_AMBIG_DELETE }
+typedef enum bit [2:0] { RDMA_QP_AMBIG_NONE, RDMA_QP_AMBIG_CREATE,
+                         RDMA_QP_AMBIG_MODIFY, RDMA_QP_AMBIG_DELETE,
+                         RDMA_QP_AMBIG_OCC_FLUSH }
   rdma_qp_ambiguous_operation_e;
 
 function automatic rdma_status rdma_qp_recovery_mapping_status(
@@ -373,6 +374,7 @@ class rdma_qp_recovery_state extends uvm_object;
   `uvm_object_utils(rdma_qp_recovery_state)
   rdma_qp_recovery_intent_e intent;
   rdma_qp_ambiguous_operation_e ambiguous_operation;
+  rdma_queue_backing_role_e ambiguous_role;
   rdma_qpc_model prior_qpc;
   rdma_qpc_model candidate_qpc;
   rdma_qp_backing_plan qp_plan;
@@ -383,6 +385,7 @@ class rdma_qp_recovery_state extends uvm_object;
   rdma_cmq_opcode_key modify_opcode;
   rdma_cmq_opcode_key delete_opcode;
   rdma_cmq_opcode_key query_opcode;
+  rdma_cmq_opcode_key occ_opcode;
   rdma_cmq_ticket ambiguous_ticket;
   bit role_complete[20];
 
@@ -390,6 +393,7 @@ class rdma_qp_recovery_state extends uvm_object;
     super.new(name);
     intent = RDMA_QP_RECOVER_CREATE_ROLLBACK;
     ambiguous_operation = RDMA_QP_AMBIG_NONE;
+    ambiguous_role = RDMA_QUEUE_ROLE_QP_SQ_RING;
     prior_qpc = null;
     candidate_qpc = null;
     qp_plan = null;
@@ -400,6 +404,7 @@ class rdma_qp_recovery_state extends uvm_object;
     modify_opcode = null;
     delete_opcode = null;
     query_opcode = null;
+    occ_opcode = null;
     ambiguous_ticket = null;
     foreach (role_complete[i]) role_complete[i] = 0;
   endfunction
@@ -414,9 +419,23 @@ class rdma_qp_recovery_state extends uvm_object;
                          RDMA_QP_RECOVER_MODIFY_RECONCILE,
                          RDMA_QP_RECOVER_NORMAL_DESTROY}) ||
         !(ambiguous_operation inside {RDMA_QP_AMBIG_NONE, RDMA_QP_AMBIG_CREATE,
-                                      RDMA_QP_AMBIG_MODIFY, RDMA_QP_AMBIG_DELETE}))
+                                      RDMA_QP_AMBIG_MODIFY, RDMA_QP_AMBIG_DELETE,
+                                      RDMA_QP_AMBIG_OCC_FLUSH}))
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "QP recovery enum is invalid");
+    if (ambiguous_operation == RDMA_QP_AMBIG_OCC_FLUSH) begin
+      if (!(ambiguous_role inside {RDMA_QUEUE_ROLE_QP_SQ_RING,
+                                   RDMA_QUEUE_ROLE_QP_SQ_PD,
+                                   RDMA_QUEUE_ROLE_QP_RQ_PD}))
+        return rdma_status::make(
+          RDMA_SC_INVALID_ARGUMENT, "QP OCC ambiguity role is invalid"
+        );
+    end
+    else if (ambiguous_role != RDMA_QUEUE_ROLE_QP_SQ_RING)
+      return rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT,
+        "non-OCC QP recovery uses a non-canonical ambiguity role"
+      );
     if (qp_plan == null || context_ref == null)
       return rdma_status::make(RDMA_SC_INVALID_STATE,
                                "QP recovery authority is incomplete");
@@ -540,6 +559,27 @@ class rdma_qp_recovery_state extends uvm_object;
         RDMA_SC_INVALID_STATE,
         "QP recovery intent and ambiguous operation do not match"
       );
+    if (ambiguous_operation == RDMA_QP_AMBIG_OCC_FLUSH) begin
+      if (!(intent inside {RDMA_QP_RECOVER_CREATE_ROLLBACK,
+                           RDMA_QP_RECOVER_NORMAL_DESTROY}))
+        return rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "QP OCC ambiguity is not valid for this recovery intent"
+        );
+      if ((!qp_plan.cleanup_complete &&
+           ambiguous_role != RDMA_QUEUE_ROLE_QP_SQ_RING) ||
+          (qp_plan.cleanup_complete && !qp_plan.sq_pd_flush_complete &&
+           ambiguous_role != RDMA_QUEUE_ROLE_QP_SQ_PD) ||
+          (qp_plan.cleanup_complete && qp_plan.sq_pd_flush_complete &&
+           qp_plan.rq_source_h == null && !qp_plan.rq_pd_flush_complete &&
+           ambiguous_role != RDMA_QUEUE_ROLE_QP_RQ_PD) ||
+          (qp_plan.cleanup_complete && qp_plan.sq_pd_flush_complete &&
+           (qp_plan.rq_source_h != null || qp_plan.rq_pd_flush_complete)))
+        return rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "QP OCC ambiguity is not the first incomplete flush"
+        );
+    end
     if (intent == RDMA_QP_RECOVER_MODIFY_RECONCILE &&
         (prior_qpc == null || candidate_qpc == null))
       return rdma_status::make(
@@ -591,13 +631,14 @@ class rdma_qp_recovery_state extends uvm_object;
         );
     end
     if (create_opcode == null || modify_opcode == null ||
-        delete_opcode == null || query_opcode == null)
+        delete_opcode == null || query_opcode == null || occ_opcode == null)
       return rdma_status::make(RDMA_SC_INVALID_STATE,
                                "QP recovery opcode authority is incomplete");
     status = create_opcode.validate(); if (!status.ok()) return status;
     status = modify_opcode.validate(); if (!status.ok()) return status;
     status = delete_opcode.validate(); if (!status.ok()) return status;
     status = query_opcode.validate(); if (!status.ok()) return status;
+    status = occ_opcode.validate(); if (!status.ok()) return status;
     if (ambiguous_operation != RDMA_QP_AMBIG_NONE &&
         ambiguous_ticket == null)
       return rdma_status::make(RDMA_SC_INVALID_STATE,
@@ -609,14 +650,14 @@ class rdma_qp_recovery_state extends uvm_object;
         "unambiguous QP recovery carries an ambiguous ticket"
       );
     if (ambiguous_ticket != null) begin
-      status = ambiguous_ticket.validate();
-      if (!status.ok()) return status;
       if (ambiguous_ticket.function_h == null ||
           !ambiguous_ticket.function_h.same_instance(context_ref.owner))
         return rdma_status::make(
           RDMA_SC_INVALID_ARGUMENT,
           "ambiguous QP recovery ticket Function does not match"
         );
+      status = ambiguous_ticket.validate();
+      if (!status.ok()) return status;
       case (ambiguous_operation)
         RDMA_QP_AMBIG_CREATE:
           if (!rdma_qp_recovery_opcode_equivalent(
@@ -641,6 +682,14 @@ class rdma_qp_recovery_state extends uvm_object;
             return rdma_status::make(
               RDMA_SC_INVALID_STATE,
               "ambiguous QP delete ticket opcode does not match"
+            );
+        RDMA_QP_AMBIG_OCC_FLUSH:
+          if (!rdma_qp_recovery_opcode_equivalent(
+                ambiguous_ticket.opcode_key, occ_opcode
+              ))
+            return rdma_status::make(
+              RDMA_SC_INVALID_STATE,
+              "ambiguous QP OCC ticket opcode does not match"
             );
         default:;
       endcase
@@ -681,6 +730,7 @@ class rdma_qp_recovery_state extends uvm_object;
     if (!$cast(r, rhs)) `uvm_fatal("RDMA_COPY_TYPE", "QP recovery copy mismatch")
     intent = r.intent;
     ambiguous_operation = r.ambiguous_operation;
+    ambiguous_role = r.ambiguous_role;
     role_complete = r.role_complete;
     prior_qpc = null; candidate_qpc = null; qp_plan = null; context_ref = null;
     staging_mapping = null; query_mapping = null;
@@ -694,6 +744,7 @@ class rdma_qp_recovery_state extends uvm_object;
     modify_opcode = rdma_cmq_clone_opcode_key_value(r.modify_opcode, "QP recovery modify");
     delete_opcode = rdma_cmq_clone_opcode_key_value(r.delete_opcode, "QP recovery delete");
     query_opcode = rdma_cmq_clone_opcode_key_value(r.query_opcode, "QP recovery query");
+    occ_opcode = rdma_cmq_clone_opcode_key_value(r.occ_opcode, "QP recovery OCC");
     ambiguous_ticket = rdma_cmq_clone_ticket_value(r.ambiguous_ticket, "QP recovery");
   endfunction
 endclass

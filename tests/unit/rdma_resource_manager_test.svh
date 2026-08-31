@@ -2830,6 +2830,9 @@ class rdma_resource_manager_test extends uvm_test;
     recovery.query_opcode = make_qp_test_opcode(
       {name, "_query"}, 32'h103, "query"
     );
+    recovery.occ_opcode = make_qp_test_opcode(
+      {name, "_occ"}, 32'h104, "occ_flush"
+    );
     if (intent == RDMA_QP_RECOVER_MODIFY_RECONCILE) begin
       recovery.query_mapping = make_queue_test_mapping(
         {name, "_query_mapping"}, qp.owner, qp.handle,
@@ -9218,6 +9221,97 @@ class rdma_resource_manager_test extends uvm_test;
       ),
       RDMA_SC_INVALID_STATE
     );
+
+    expect_status(
+      "QP_OCC_REPLACEMENT_PRECONDITION",
+      qp_generic_bypass_rm.force_qp_active_precondition(
+        qp_generic_bypass_candidate
+      ),
+      RDMA_SC_OK
+    );
+    qp_qpc_binding_recovery = make_qp_test_recovery(
+      "qp_occ_replacement_initial", qp_generic_bypass_candidate,
+      RDMA_QP_RECOVER_CREATE_ROLLBACK,
+      qp_generic_bypass_candidate.programmed_qpc
+    );
+    expect_status(
+      "QP_OCC_REPLACEMENT_INITIAL_MARK",
+      qp_generic_bypass_rm.mark_qp_error(
+        qp_generic_bypass_candidate.handle, qp_qpc_binding_recovery
+      ),
+      RDMA_SC_OK
+    );
+    expect_status(
+      "QP_OCC_REPLACEMENT_INITIAL_LOOKUP",
+      qp_generic_bypass_rm.lookup_recovery(
+        qp_generic_bypass_candidate.handle, recovery_lookup
+      ),
+      RDMA_SC_OK
+    );
+    qp_cloned_object = recovery_lookup.qp_recovery.clone();
+    if (qp_cloned_object == null ||
+        !$cast(qp_error_replacement, qp_cloned_object))
+      `uvm_fatal("QP_OCC_REPLACEMENT_CLONE",
+                 "stored QP recovery clone failed")
+    qp_error_replacement.ambiguous_operation = RDMA_QP_AMBIG_OCC_FLUSH;
+    qp_error_replacement.ambiguous_role = RDMA_QUEUE_ROLE_QP_SQ_RING;
+    qp_error_replacement.ambiguous_ticket = make_qp_test_ticket(
+      "qp_occ_replacement_ticket", qp_generic_bypass_candidate.owner,
+      qp_generic_bypass_cmq.handle, qp_error_replacement.occ_opcode
+    );
+    expect_status(
+      "QP_OCC_REPLACEMENT_SET_AMBIGUITY",
+      qp_generic_bypass_rm.mark_qp_error(
+        qp_generic_bypass_candidate.handle, qp_error_replacement
+      ),
+      RDMA_SC_OK
+    );
+    qp_error_replacement.ambiguous_role = RDMA_QUEUE_ROLE_QP_RQ_PD;
+    qp_error_replacement.occ_opcode.opcode++;
+    qp_error_replacement.ambiguous_ticket.command_id++;
+    expect_status(
+      "QP_OCC_REPLACEMENT_PROJECTED_LOOKUP",
+      qp_generic_bypass_rm.lookup_recovery(
+        qp_generic_bypass_candidate.handle, recovery_lookup
+      ),
+      RDMA_SC_OK
+    );
+    if (recovery_lookup == null || recovery_lookup.qp_recovery == null ||
+        recovery_lookup.qp_recovery.ambiguous_operation !=
+          RDMA_QP_AMBIG_OCC_FLUSH ||
+        recovery_lookup.qp_recovery.ambiguous_role !=
+          RDMA_QUEUE_ROLE_QP_SQ_RING ||
+        recovery_lookup.qp_recovery.occ_opcode == null ||
+        recovery_lookup.qp_recovery.occ_opcode.opcode != 32'h104 ||
+        recovery_lookup.qp_recovery.ambiguous_ticket == null ||
+        recovery_lookup.qp_recovery.ambiguous_ticket.command_id != 64'h1234)
+      `uvm_error("QP_OCC_REPLACEMENT_PROJECTION",
+                 "manager lost or aliased QP OCC recovery authority")
+    qp_cloned_object = recovery_lookup.qp_recovery.clone();
+    if (qp_cloned_object == null ||
+        !$cast(qp_error_replacement, qp_cloned_object))
+      `uvm_fatal("QP_OCC_REPLACEMENT_INVALID_CLONE",
+                 "stored QP OCC recovery clone failed")
+    qp_error_replacement.ambiguous_role = RDMA_QUEUE_ROLE_QP_SQ_PD;
+    expect_status(
+      "QP_OCC_REPLACEMENT_OUT_OF_ORDER_ATOMIC",
+      qp_generic_bypass_rm.mark_qp_error(
+        qp_generic_bypass_candidate.handle, qp_error_replacement
+      ),
+      RDMA_SC_INVALID_STATE
+    );
+    expect_status(
+      "QP_OCC_REPLACEMENT_ATOMIC_LOOKUP",
+      qp_generic_bypass_rm.lookup_recovery(
+        qp_generic_bypass_candidate.handle, recovery_lookup
+      ),
+      RDMA_SC_OK
+    );
+    if (recovery_lookup == null || recovery_lookup.qp_recovery == null ||
+        recovery_lookup.qp_recovery.ambiguous_role !=
+          RDMA_QUEUE_ROLE_QP_SQ_RING)
+      `uvm_error("QP_OCC_REPLACEMENT_ATOMIC",
+                 "rejected OCC replacement changed stored authority")
 
     expect_status(
       "QP_ERROR_REPLACEMENT_PRECONDITION",

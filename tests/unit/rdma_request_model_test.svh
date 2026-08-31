@@ -475,6 +475,7 @@ class rdma_request_model_test extends uvm_test;
     rdma_qp qp_resource_clone;
     rdma_qp_recovery_state qp_recovery;
     rdma_qp_recovery_state qp_recovery_clone;
+    rdma_qp_recovery_state qp_occ_recovery;
     rdma_qp_recovery_state split_qp_recovery;
     rdma_recovery_record qp_recovery_record;
     rdma_qp_ring_layout saved_qp_rq_ring;
@@ -974,6 +975,9 @@ class rdma_request_model_test extends uvm_test;
     qp_recovery.query_opcode = make_recovery_opcode(
       "qp_recovery_query_opcode", 32'h13, "qp_query"
     );
+    qp_recovery.occ_opcode = make_recovery_opcode(
+      "qp_recovery_occ_opcode", 32'h14, "occ_flush"
+    );
     qp_recovery.role_complete[RDMA_QUEUE_ROLE_QP_SQ_PD] = 1'b1;
     expect_status("QP_RECOVERY", qp_recovery.validate(), RDMA_SC_OK);
     cloned_object = qp_recovery.clone();
@@ -990,6 +994,72 @@ class rdma_request_model_test extends uvm_test;
                  "registry-global QP ID must differ from local QPN")
     expect_status("QP_RECOVERY_SPLIT_GLOBAL_LOCAL_IDENTITY",
                   split_qp_recovery.validate(), RDMA_SC_OK);
+    cloned_object = qp_recovery.clone();
+    if (!$cast(qp_occ_recovery, cloned_object))
+      `uvm_fatal("QP_OCC_RECOVERY_SETUP", "QP OCC recovery clone lost type")
+    qp_occ_recovery.intent = RDMA_QP_RECOVER_CREATE_ROLLBACK;
+    qp_occ_recovery.ambiguous_operation = RDMA_QP_AMBIG_OCC_FLUSH;
+    qp_occ_recovery.ambiguous_role = RDMA_QUEUE_ROLE_QP_SQ_RING;
+    qp_occ_recovery.role_complete[RDMA_QUEUE_ROLE_QP_SQ_PD] = 1'b0;
+    qp_occ_recovery.ambiguous_ticket = make_recovery_ticket(
+      "qp_occ_qpn_ticket", function_h, cmq_h, qp_occ_recovery.occ_opcode
+    );
+    expect_status("QP_OCC_RECOVERY_QPN", qp_occ_recovery.validate(),
+                  RDMA_SC_OK);
+    qp_occ_recovery.ambiguous_role = RDMA_QUEUE_ROLE_QP_RQ_RING;
+    expect_status("QP_OCC_RECOVERY_INVALID_ROLE", qp_occ_recovery.validate(),
+                  RDMA_SC_INVALID_ARGUMENT);
+    qp_occ_recovery.ambiguous_role = RDMA_QUEUE_ROLE_QP_SQ_PD;
+    expect_status("QP_OCC_RECOVERY_OUT_OF_ORDER_SQ_PD",
+                  qp_occ_recovery.validate(), RDMA_SC_INVALID_STATE);
+    qp_occ_recovery.ambiguous_role = RDMA_QUEUE_ROLE_QP_SQ_RING;
+    qp_occ_recovery.ambiguous_ticket.opcode_key =
+      rdma_cmq_clone_opcode_key_value(qp_occ_recovery.delete_opcode,
+                                      "wrong OCC opcode");
+    expect_status("QP_OCC_RECOVERY_WRONG_OPCODE", qp_occ_recovery.validate(),
+                  RDMA_SC_INVALID_STATE);
+    qp_occ_recovery.ambiguous_ticket.opcode_key =
+      rdma_cmq_clone_opcode_key_value(qp_occ_recovery.occ_opcode,
+                                      "restored OCC opcode");
+    qp_occ_recovery.ambiguous_ticket.function_h.generation++;
+    expect_status("QP_OCC_RECOVERY_WRONG_FUNCTION",
+                  qp_occ_recovery.validate(), RDMA_SC_INVALID_ARGUMENT);
+    qp_occ_recovery.ambiguous_ticket.function_h.generation--;
+    qp_occ_recovery.qp_plan.cleanup_complete = 1'b1;
+    qp_occ_recovery.ambiguous_role = RDMA_QUEUE_ROLE_QP_SQ_PD;
+    expect_status("QP_OCC_RECOVERY_SQ_PD", qp_occ_recovery.validate(),
+                  RDMA_SC_OK);
+    qp_occ_recovery.ambiguous_role = RDMA_QUEUE_ROLE_QP_RQ_PD;
+    expect_status("QP_OCC_RECOVERY_OUT_OF_ORDER_RQ_PD",
+                  qp_occ_recovery.validate(), RDMA_SC_INVALID_STATE);
+    qp_occ_recovery.qp_plan.sq_pd_flush_complete = 1'b1;
+    expect_status("QP_OCC_RECOVERY_RQ_PD", qp_occ_recovery.validate(),
+                  RDMA_SC_OK);
+    qp_occ_recovery.intent = RDMA_QP_RECOVER_MODIFY_RECONCILE;
+    expect_status("QP_OCC_RECOVERY_MODIFY_REJECTED",
+                  qp_occ_recovery.validate(), RDMA_SC_INVALID_STATE);
+    qp_occ_recovery.intent = RDMA_QP_RECOVER_CREATE_ROLLBACK;
+    cloned_object = qp_occ_recovery.clone();
+    if (!$cast(qp_recovery_clone, cloned_object) ||
+        qp_recovery_clone.occ_opcode == qp_occ_recovery.occ_opcode ||
+        qp_recovery_clone.ambiguous_ticket ==
+          qp_occ_recovery.ambiguous_ticket ||
+        qp_recovery_clone.ambiguous_role != RDMA_QUEUE_ROLE_QP_RQ_PD)
+      `uvm_error("QP_OCC_RECOVERY_COPY",
+                 "QP OCC recovery clone lost or aliased authority")
+    else begin
+      qp_recovery_clone.ambiguous_role = RDMA_QUEUE_ROLE_QP_SQ_RING;
+      qp_recovery_clone.occ_opcode.opcode++;
+      if (qp_occ_recovery.ambiguous_role != RDMA_QUEUE_ROLE_QP_RQ_PD ||
+          qp_occ_recovery.occ_opcode.opcode != 32'h14)
+        `uvm_error("QP_OCC_RECOVERY_COPY_ISOLATION",
+                   "mutating QP OCC clone changed source authority")
+    end
+    qp_occ_recovery.ambiguous_operation = RDMA_QP_AMBIG_NONE;
+    qp_occ_recovery.ambiguous_ticket = null;
+    qp_occ_recovery.ambiguous_role = RDMA_QUEUE_ROLE_QP_SQ_PD;
+    expect_status("QP_OCC_RECOVERY_NON_OCC_CANONICAL_ROLE",
+                  qp_occ_recovery.validate(), RDMA_SC_INVALID_ARGUMENT);
     qp_recovery.ambiguous_ticket = make_recovery_ticket(
       "qp_unexpected_ticket", function_h, cmq_h, qp_recovery.modify_opcode
     );
@@ -1166,6 +1236,12 @@ class rdma_request_model_test extends uvm_test;
     qp_recovery.query_opcode = make_recovery_opcode(
       "qp_recovery_query_restored", 32'h13, "qp_query"
     );
+    qp_recovery.occ_opcode = null;
+    expect_status("QP_RECOVERY_OCC_OPCODE", qp_recovery.validate(),
+                  RDMA_SC_INVALID_STATE);
+    qp_recovery.occ_opcode = make_recovery_opcode(
+      "qp_recovery_occ_restored", 32'h14, "occ_flush"
+    );
     qp_recovery.query_opcode.variant = "";
     expect_status("QP_RECOVERY_OPCODE_VALIDATE", qp_recovery.validate(),
                   RDMA_SC_INVALID_ARGUMENT);
@@ -1213,6 +1289,7 @@ class rdma_request_model_test extends uvm_test;
         qp_recovery_clone.candidate_qpc == qp_recovery.candidate_qpc ||
         qp_recovery_clone.qp_plan == qp_recovery.qp_plan ||
         qp_recovery_clone.context_ref == qp_recovery.context_ref ||
+        qp_recovery_clone.occ_opcode == qp_recovery.occ_opcode ||
         !qp_recovery_clone.role_complete[RDMA_QUEUE_ROLE_QP_SQ_PD])
       `uvm_error("QP_RECOVERY_COPY",
                  "QP recovery clone lost or aliased authority")

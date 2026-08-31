@@ -2281,6 +2281,7 @@ class rdma_resource_manager extends uvm_object;
     result = new({copy_label, "_qp_recovery"});
     result.intent = source.intent;
     result.ambiguous_operation = source.ambiguous_operation;
+    result.ambiguous_role = source.ambiguous_role;
     result.role_complete = source.role_complete;
     status = project_qpc_value(source.prior_qpc, {copy_label, "_prior"},
                                result.prior_qpc);
@@ -2320,6 +2321,10 @@ class rdma_resource_manager extends uvm_object;
       status = project_opcode_value(source.query_opcode,
                                     {copy_label, "_query_opcode"},
                                     result.query_opcode);
+    if (status.ok())
+      status = project_opcode_value(source.occ_opcode,
+                                    {copy_label, "_occ_opcode"},
+                                    result.occ_opcode);
     if (status.ok())
       status = project_ticket_value(source.ambiguous_ticket,
                                     {copy_label, "_ticket"},
@@ -4509,6 +4514,7 @@ class rdma_resource_manager extends uvm_object;
     rdma_resource authoritative;
     rdma_resource projected;
     rdma_qp authoritative_qp;
+    rdma_qp retained_qp;
     rdma_qp replacement;
     rdma_qp_recovery_state recovery_copy;
     rdma_qp_recovery_state existing_recovery;
@@ -4517,19 +4523,41 @@ class rdma_resource_manager extends uvm_object;
     string key;
     bit error_replacement;
     bit progress_changed;
+    bit setting_ambiguity;
+    bit clearing_ambiguity;
+    bit stale_recovery_allowed;
 
     status = lookup(qp_h, authoritative);
     if (!status.ok() && status.code == RDMA_SC_STALE_GENERATION &&
-        recovery != null &&
-        recovery.ambiguous_operation != RDMA_QP_AMBIG_NONE &&
-        recovery.ambiguous_ticket != null) begin
+        recovery != null) begin
       key = resource_key(qp_h);
+      stale_recovery_allowed = 1'b0;
       if (registry.exists(key) && registry[key] != null &&
           registry[key].handle != null &&
-          same_handle_instance(registry[key].handle, qp_h))
-        status = project_resource_value(
-          registry[key], "mark stale in-flight QP ERROR", authoritative
-        );
+          same_handle_instance(registry[key].handle, qp_h) &&
+          $cast(retained_qp, registry[key])) begin
+        if (recovery.ambiguous_operation != RDMA_QP_AMBIG_NONE &&
+            recovery.ambiguous_ticket != null) begin
+          status = recovery.validate();
+          stale_recovery_allowed = status != null && status.ok();
+        end
+        else if (recovery.intent == RDMA_QP_RECOVER_CREATE_ROLLBACK &&
+                 recovery.ambiguous_operation == RDMA_QP_AMBIG_NONE &&
+                 recovery.ambiguous_ticket == null &&
+                 recovery.candidate_qpc != null &&
+                 same_qpc_value(recovery.candidate_qpc,
+                                retained_qp.programmed_qpc))
+          stale_recovery_allowed = 1'b1;
+        if (stale_recovery_allowed)
+          status = project_resource_value(
+            registry[key], "mark stale in-flight QP ERROR", authoritative
+          );
+        else
+          status = rdma_status::make(
+            RDMA_SC_STALE_GENERATION,
+            "stale QP recovery lacks retained hardware authority"
+          );
+      end
     end
     if (!status.ok() || !$cast(authoritative_qp, authoritative))
       return status.ok() ? rdma_status::make(
@@ -4596,15 +4624,51 @@ class rdma_resource_manager extends uvm_object;
       );
     if (error_replacement) begin
       existing_recovery = recovery_records[key].qp_recovery;
+      setting_ambiguity =
+        existing_recovery.ambiguous_operation == RDMA_QP_AMBIG_NONE &&
+        existing_recovery.ambiguous_ticket == null &&
+        recovery_copy.ambiguous_operation inside {
+          RDMA_QP_AMBIG_OCC_FLUSH, RDMA_QP_AMBIG_DELETE
+        } && recovery_copy.ambiguous_ticket != null;
+      clearing_ambiguity =
+        existing_recovery.ambiguous_operation != RDMA_QP_AMBIG_NONE &&
+        existing_recovery.ambiguous_ticket != null &&
+        recovery_copy.ambiguous_operation == RDMA_QP_AMBIG_NONE &&
+        recovery_copy.ambiguous_ticket == null;
       progress_changed = 1'b0;
-      foreach (existing_recovery.role_complete[i])
+      foreach (existing_recovery.role_complete[i]) begin
         if (existing_recovery.role_complete[i] !=
-            recovery_copy.role_complete[i])
-          progress_changed = 1'b1;
-      if (existing_recovery.ambiguous_operation == RDMA_QP_AMBIG_NONE ||
-          existing_recovery.ambiguous_ticket == null ||
-          recovery_copy.ambiguous_operation != RDMA_QP_AMBIG_NONE ||
-          recovery_copy.ambiguous_ticket != null ||
+            recovery_copy.role_complete[i]) begin
+          if (!setting_ambiguity || existing_recovery.role_complete[i] ||
+              !recovery_copy.role_complete[i] ||
+              (recovery_copy.ambiguous_operation ==
+                 RDMA_QP_AMBIG_OCC_FLUSH &&
+               i == recovery_copy.ambiguous_role))
+            progress_changed = 1'b1;
+          else begin
+            case (i)
+              RDMA_QUEUE_ROLE_QP_SQ_RING:
+                if (!existing_recovery.qp_plan.cleanup_complete)
+                  progress_changed = 1'b1;
+              RDMA_QUEUE_ROLE_QP_SQ_PD:
+                if (!existing_recovery.qp_plan.sq_pd_flush_complete)
+                  progress_changed = 1'b1;
+              RDMA_QUEUE_ROLE_QP_RQ_PD:
+                if (!existing_recovery.qp_plan.rq_pd_flush_complete)
+                  progress_changed = 1'b1;
+              default: progress_changed = 1'b1;
+            endcase
+          end
+        end
+      end
+      if (!setting_ambiguity && !clearing_ambiguity)
+        return rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "QP ERROR ambiguity transition is out of order"
+        );
+      if ((!setting_ambiguity &&
+           recovery_copy.ambiguous_role !=
+             existing_recovery.ambiguous_role) ||
           recovery_copy.intent != existing_recovery.intent ||
           !same_qpc_value(recovery_copy.prior_qpc,
                            existing_recovery.prior_qpc) ||
@@ -4639,6 +4703,9 @@ class rdma_resource_manager extends uvm_object;
           ) ||
           !rdma_qp_recovery_opcode_equivalent(
             recovery_copy.query_opcode, existing_recovery.query_opcode
+          ) ||
+          !rdma_qp_recovery_opcode_equivalent(
+            recovery_copy.occ_opcode, existing_recovery.occ_opcode
           ) || progress_changed)
         return rdma_status::make(
           RDMA_SC_INVALID_ARGUMENT,
@@ -4986,8 +5053,7 @@ class rdma_resource_manager extends uvm_object;
         resource_ref.ownership != RDMA_OWNERSHIP_CONTROL_PLANE ||
         resource_ref.cleanup_complete ||
         has_recovery && (recovery_ref == null ||
-                         recovery_ref.cleanup_complete ||
-                         recovery_copy.qp_recovery.role_complete[role]))
+                         recovery_ref.cleanup_complete))
       return rdma_status::make(
         RDMA_SC_INVALID_ARGUMENT,
         "QP cleanup role is absent, borrowed, or already complete"
