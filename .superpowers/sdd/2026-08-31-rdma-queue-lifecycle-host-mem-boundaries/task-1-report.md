@@ -22,3 +22,7 @@ Helper detection now strips comments; added a comment-forgery negative test and 
 ## Round 3 fixes
 
 Frozen ABI fixture now initializes a temporary git repository, commits baseline files, then modifies one file; the checker invocation executes a real `git diff` (baseline hash translated to temporary HEAD). 13 unittest tests pass; checker and whitespace checks are clean.
+
+## Final review fixes
+
+Core dependency validation now scans all `src/core/*.svh` (including unlisted headers) while preserving explicit required-file checks; an `evil.svh` regression fixture was added. The host-memory queue fixture now asserts ring and PD backing addresses exceed 32-bit range. `python3 -m unittest tests.unit.test_check_queue_lifecycle` passes (14 tests), `python3 tools/check_queue_lifecycle.py` exits 0, and `git diff --check` is clean. VCS host_mem execution remains blocked by the previously reported unavailable pinned checkout path.

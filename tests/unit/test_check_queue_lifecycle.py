@@ -101,6 +101,12 @@ class QueueLifecycleCheckerTest(unittest.TestCase):
             root = copied_repo(Path(d)); (root / "src/core/rdma_control_plane.svh").unlink()
             with self.assertRaisesRegex(CHECKER.ValidationError, "missing core"): CHECKER.validate_core_dependencies(root)
 
+    def test_extra_core_header_forbidden_symbol_is_rejected(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            root = copied_repo(Path(d)); evil = root / "src/core/evil.svh"; evil.write_text("host_mem_manager forbidden;\n")
+            with self.assertRaisesRegex(CHECKER.ValidationError, "host_mem_manager"): CHECKER.validate_core_dependencies(root)
+
     def test_package_order_rejects_swap(self):
         import tempfile
         with tempfile.TemporaryDirectory() as d:

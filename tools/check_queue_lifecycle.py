@@ -70,8 +70,12 @@ def validate_core_dependencies(repo_root: Path) -> None:
     for path in paths:
         if not path.is_file():
             raise ValidationError(f"missing core dependency source: {path.relative_to(repo_root)}")
+    # Scan every core header, including newly added files, in addition to the
+    # explicit required set above so an unlisted header cannot bypass checks.
+    all_core = sorted(repo_root.joinpath("src/core").glob("*.svh"))
+    scan_paths = list(dict.fromkeys(paths + all_core))
     try:
-        text = "\n".join(path.read_text(encoding="utf-8") for path in paths)
+        text = "\n".join(path.read_text(encoding="utf-8") for path in scan_paths)
     except OSError as exc:
         raise ValidationError("missing/unreadable core dependency source") from exc
     for symbol in ("pcie_work", "axis_vip", "net_packet", "host_mem_manager"):

@@ -497,6 +497,9 @@ class rdma_host_mem_adapter_test extends uvm_test;
     if (ring_ref == null || pd_ref == null || ring_ref.mapping == null ||
         pd_ref.mapping == null || plan.rings[0].pages.size() != 1)
       `uvm_fatal("QUEUE_REFS", "queue planner role refs are incomplete")
+    if (ring_ref.mapping.backing_addr.value <= 64'hffff_ffff ||
+        pd_ref.mapping.backing_addr.value <= 64'hffff_ffff)
+      `uvm_error("QUEUE_BACKING_WIDTH", "queue backing address must exercise 64-bit range")
 
     saved_bdf = binding.queue_dma.requester_bdf;
     saved_pasid_valid = binding.queue_dma.pasid_valid;
