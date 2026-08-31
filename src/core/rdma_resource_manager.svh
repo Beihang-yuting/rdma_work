@@ -4519,6 +4519,18 @@ class rdma_resource_manager extends uvm_object;
     bit progress_changed;
 
     status = lookup(qp_h, authoritative);
+    if (!status.ok() && status.code == RDMA_SC_STALE_GENERATION &&
+        recovery != null &&
+        recovery.ambiguous_operation != RDMA_QP_AMBIG_NONE &&
+        recovery.ambiguous_ticket != null) begin
+      key = resource_key(qp_h);
+      if (registry.exists(key) && registry[key] != null &&
+          registry[key].handle != null &&
+          same_handle_instance(registry[key].handle, qp_h))
+        status = project_resource_value(
+          registry[key], "mark stale in-flight QP ERROR", authoritative
+        );
+    end
     if (!status.ok() || !$cast(authoritative_qp, authoritative))
       return status.ok() ? rdma_status::make(
         RDMA_SC_INVALID_ARGUMENT, "QP ERROR target is not a QP"
@@ -4664,7 +4676,8 @@ class rdma_resource_manager extends uvm_object;
         return status;
       record_copy.hardware_presence =
         recovery_copy.intent == RDMA_QP_RECOVER_CREATE_ROLLBACK &&
-        recovery_copy.ambiguous_operation == RDMA_QP_AMBIG_NONE ?
+        recovery_copy.ambiguous_operation == RDMA_QP_AMBIG_NONE &&
+        recovery_copy.candidate_qpc == null ?
           RDMA_HW_PRESENCE_ABSENT : RDMA_HW_PRESENCE_PRESENT;
       record_copy.primary_status = rdma_status::make(
         RDMA_SC_RECOVERY_REQUIRED, "QP requires lifecycle recovery"

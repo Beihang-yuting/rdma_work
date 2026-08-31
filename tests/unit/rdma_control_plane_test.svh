@@ -734,6 +734,48 @@ class rdma_control_plane_test extends uvm_test;
     return request;
   endfunction
 
+  function automatic rdma_create_qp_req make_create_qp_request(
+    string name,
+    rdma_function_binding binding,
+    rdma_pd pd,
+    rdma_cq cq
+  );
+    rdma_create_qp_req request;
+    rdma_qp_context_attributes attrs;
+    rdma_qpc_rc_ext ext;
+
+    request = rdma_create_qp_req::type_id::create(name);
+    request.owner = binding.make_handle();
+    request.transport = RDMA_TRANSPORT_RC;
+    request.sq_depth = 128;
+    request.rq_depth = 64;
+    request.max_send_sge = 4;
+    request.max_recv_sge = 4;
+    request.pd_h = rdma_clone_handle_value(pd.handle, {name, " PD"});
+    request.send_cq_h = rdma_clone_handle_value(cq.handle,
+                                                 {name, " send CQ"});
+    request.recv_cq_h = rdma_clone_handle_value(cq.handle,
+                                                 {name, " receive CQ"});
+    attrs = rdma_qp_context_attributes::type_id::create({name, " attrs"});
+    attrs.path_mtu_bytes = 4096;
+    attrs.pkey = 16'hbeef;
+    attrs.address_vector = rdma_address_vector::type_id::create(
+      {name, " address vector"});
+    attrs.address_vector.destination_mac = 48'h1122_3344_5566;
+    attrs.address_vector.traffic_class = 8'h02;
+    attrs.behavior = rdma_qpc_behavior::type_id::create({name, " behavior"});
+    attrs.behavior.transport_version = 1;
+    ext = rdma_qpc_rc_ext::type_id::create({name, " RC"});
+    ext.remote_qpn = 24'h456789;
+    ext.send_psn = 24'h123456;
+    ext.recv_psn = 24'h654321;
+    ext.retry_count = 2;
+    ext.rnr_retry_count = 2;
+    attrs.transport_ext = ext;
+    request.context_attrs = attrs;
+    return request;
+  endfunction
+
   function automatic rdma_create_ceq_req make_create_ceq_request(
     string name,
     rdma_function_binding binding
@@ -6896,6 +6938,117 @@ class rdma_control_plane_test extends uvm_test;
       `uvm_error("REBIND_NO_BACKING", "stale queue create allocated backing")
   endtask
 
+  task automatic check_typed_qp_facade();
+    rdma_control_plane_probe control;
+    rdma_resource_manager manager;
+    rdma_mock_cmq_port cmq;
+    rdma_mock_stag_key_policy policy;
+    rdma_mock_host_mem mem;
+    rdma_mock_context_backing contexts;
+    rdma_function_binding binding;
+    rdma_function function_resource;
+    rdma_pd pd;
+    rdma_cq cq;
+    rdma_create_qp_req request;
+    rdma_qp qp;
+    rdma_qp authoritative_qp;
+    rdma_resource authoritative;
+    rdma_control_result result;
+    rdma_status status;
+
+    control = rdma_control_plane_probe::type_id::create("typed_qp_control");
+    manager = rdma_resource_manager::type_id::create("typed_qp_manager");
+    cmq = rdma_mock_cmq_port::type_id::create("typed_qp_cmq");
+    policy = rdma_mock_stag_key_policy::type_id::create("typed_qp_policy");
+    mem = rdma_mock_host_mem::type_id::create("typed_qp_mem");
+    contexts = rdma_mock_context_backing::type_id::create("typed_qp_contexts");
+    binding = make_active_binding("typed_qp_binding",
+                                  64'hfc00_0000_0000_0001,
+                                  32'hfc00_0101, 151);
+    expect_status("TYPED_QP_CONFIGURE",
+      control.configure(manager, cmq, policy, mem, null, contexts, 2us),
+      RDMA_SC_OK);
+    expect_status("TYPED_QP_FUNCTION",
+                  manager.create_function(binding, function_resource),
+                  RDMA_SC_OK);
+    expect_status("TYPED_QP_PD", manager.create_pd(binding, pd), RDMA_SC_OK);
+    expect_status("TYPED_QP_CQ", manager.create_cq(binding, null, cq),
+                  RDMA_SC_OK);
+    request = make_create_qp_request("typed_qp_request", binding, pd, cq);
+    control.create_qp(binding, request, qp, result);
+    expect_result("TYPED_QP_RESULT", result, RDMA_SC_OK);
+    if (qp == null || qp.state != RDMA_RESOURCE_ACTIVE ||
+        qp.qp_state != RDMA_QPS_RESET || result.transaction_id == 0 ||
+        cmq.calls.size() != 1 ||
+        cmq.calls[0].opcode != XTR_V1_OP_QPC_CREATE)
+      `uvm_error("TYPED_QP_OUTPUT",
+                 "public create_qp did not return ACTIVE+RESET authority")
+    if (qp != null) begin
+      status = manager.lookup(qp.handle, authoritative);
+      expect_status("TYPED_QP_LOOKUP", status, RDMA_SC_OK);
+      if (!$cast(authoritative_qp, authoritative) || authoritative_qp == null ||
+          authoritative_qp === qp)
+        `uvm_error("TYPED_QP_DETACHED",
+                   "public create_qp returned aliased registry authority")
+    end
+  endtask
+
+  task automatic check_typed_qp_rebind_while_waiting();
+    rdma_control_plane_probe control;
+    rdma_resource_manager manager;
+    rdma_mock_cmq_port cmq;
+    rdma_mock_stag_key_policy policy;
+    rdma_mock_host_mem mem;
+    rdma_mock_context_backing contexts;
+    rdma_function_binding binding;
+    rdma_function function_resource;
+    rdma_pd pd;
+    rdma_cq cq;
+    rdma_create_qp_req request;
+    rdma_qp qp;
+    rdma_control_result result;
+    semaphore held_lock;
+    int unsigned baseline_allocations;
+
+    control = rdma_control_plane_probe::type_id::create("qp_rebind_control");
+    manager = rdma_resource_manager::type_id::create("qp_rebind_manager");
+    cmq = rdma_mock_cmq_port::type_id::create("qp_rebind_cmq");
+    policy = rdma_mock_stag_key_policy::type_id::create("qp_rebind_policy");
+    mem = rdma_mock_host_mem::type_id::create("qp_rebind_mem");
+    contexts = rdma_mock_context_backing::type_id::create("qp_rebind_contexts");
+    binding = make_active_binding("qp_rebind_binding",
+                                  64'hfc00_0000_0000_0002,
+                                  32'hfc00_0102, 153);
+    expect_status("QP_REBIND_CONFIGURE",
+      control.configure(manager, cmq, policy, mem, null, contexts, 2us),
+      RDMA_SC_OK);
+    expect_status("QP_REBIND_FUNCTION",
+                  manager.create_function(binding, function_resource),
+                  RDMA_SC_OK);
+    expect_status("QP_REBIND_PD", manager.create_pd(binding, pd), RDMA_SC_OK);
+    expect_status("QP_REBIND_CQ", manager.create_cq(binding, null, cq),
+                  RDMA_SC_OK);
+    request = make_create_qp_request("qp_rebind_request", binding, pd, cq);
+    baseline_allocations = mem.live_allocations();
+    control.acquire_test_function_lock(binding.make_handle(), held_lock);
+    fork
+      begin
+        control.create_qp(binding, request, qp, result);
+      end
+      begin
+        #1ns;
+        binding.generation++;
+        binding.owner_h = binding.make_handle();
+        control.release_test_function_lock(held_lock);
+      end
+    join
+    expect_result("QP_REBIND_RESULT", result, RDMA_SC_STALE_GENERATION);
+    if (qp != null || result.transaction_id == 0 || cmq.calls.size() != 0 ||
+        mem.live_allocations() != baseline_allocations)
+      `uvm_error("QP_REBIND_NO_SIDE_EFFECT",
+                 "post-lock QP rebind reached executor side effects")
+  endtask
+
   virtual task run_phase(uvm_phase phase);
     phase.raise_objection(this);
     check_configure_contract();
@@ -6942,6 +7095,8 @@ class rdma_control_plane_test extends uvm_test;
     check_typed_queue_lock_serialization();
     check_typed_queue_cross_function_barrier();
     check_typed_queue_rebind_while_waiting();
+    check_typed_qp_facade();
+    check_typed_qp_rebind_while_waiting();
     phase.drop_objection(this);
   endtask
 endclass
