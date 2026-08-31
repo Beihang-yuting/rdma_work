@@ -393,6 +393,8 @@ virtual class rdma_queue_lifecycle_policy extends uvm_object;
     rdma_queue_backing_ref ref_value,
     output rdma_backing_addr_t address
   );
+    rdma_iova_t effective_iova;
+
     address = '0;
     if (ref_value == null || ref_value.mapping == null)
       return invalid_argument("queue backing IOVA source is null");
@@ -400,7 +402,6 @@ virtual class rdma_queue_lifecycle_policy extends uvm_object;
         64'hffff_ffff_ffff_ffff - ref_value.mapping_offset)
       return rdma_status::make(RDMA_SC_DMA_TRANSLATION,
                                "queue backing IOVA projection overflows");
-    rdma_iova_t effective_iova;
     effective_iova.value = ref_value.mapping.iova.value + ref_value.mapping_offset;
     return rdma_queue_base_from_iova(effective_iova, address);
   endfunction
