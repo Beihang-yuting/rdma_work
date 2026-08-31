@@ -475,6 +475,10 @@ class rdma_request_model_test extends uvm_test;
     rdma_qp qp_resource_clone;
     rdma_qp_recovery_state qp_recovery;
     rdma_qp_recovery_state qp_recovery_clone;
+    rdma_recovery_record qp_recovery_record;
+    rdma_qp_ring_layout saved_qp_rq_ring;
+    rdma_qp_backing_ref saved_qp_rq_ref;
+    rdma_qp_backing_ref saved_qp_rq_pd_ref;
     rdma_queue_slot_token_contract recovery_token;
     rdma_queue_completion_authority saved_completion_authority;
     rdma_srq srq_resource;
@@ -969,6 +973,43 @@ class rdma_request_model_test extends uvm_test;
     );
     qp_recovery.role_complete[RDMA_QUEUE_ROLE_QP_SQ_PD] = 1'b1;
     expect_status("QP_RECOVERY", qp_recovery.validate(), RDMA_SC_OK);
+    qp_recovery.ambiguous_ticket = make_recovery_ticket(
+      "qp_unexpected_ticket", function_h, cmq_h, qp_recovery.modify_opcode
+    );
+    expect_status("QP_RECOVERY_NONE_TICKET", qp_recovery.validate(),
+                  RDMA_SC_INVALID_STATE);
+    qp_recovery.ambiguous_ticket = null;
+    qp_recovery.role_complete[RDMA_QUEUE_ROLE_QP_URC_RSQ] = 1'b1;
+    expect_status("QP_RECOVERY_ABSENT_URC_RSQ_PROGRESS",
+                  qp_recovery.validate(), RDMA_SC_INVALID_STATE);
+    qp_recovery.role_complete[RDMA_QUEUE_ROLE_QP_URC_RSQ] = 1'b0;
+    qp_recovery.role_complete[RDMA_QUEUE_ROLE_QP_URC_RDSQ] = 1'b1;
+    expect_status("QP_RECOVERY_ABSENT_URC_RDSQ_PROGRESS",
+                  qp_recovery.validate(), RDMA_SC_INVALID_STATE);
+    qp_recovery.role_complete[RDMA_QUEUE_ROLE_QP_URC_RDSQ] = 1'b0;
+    qp_recovery.role_complete[RDMA_QUEUE_ROLE_QP_URC_DSQ] = 1'b1;
+    expect_status("QP_RECOVERY_ABSENT_URC_DSQ_PROGRESS",
+                  qp_recovery.validate(), RDMA_SC_INVALID_STATE);
+    qp_recovery.role_complete[RDMA_QUEUE_ROLE_QP_URC_DSQ] = 1'b0;
+    saved_qp_rq_ring = qp_recovery.qp_plan.rq_ring;
+    saved_qp_rq_ref = qp_recovery.qp_plan.rq_ref;
+    saved_qp_rq_pd_ref = qp_recovery.qp_plan.rq_pd_ref;
+    qp_recovery.qp_plan.rq_source_h = srq_h;
+    qp_recovery.qp_plan.rq_ring = null;
+    qp_recovery.qp_plan.rq_ref = null;
+    qp_recovery.qp_plan.rq_pd_ref = null;
+    qp_recovery.role_complete[RDMA_QUEUE_ROLE_QP_RQ_RING] = 1'b1;
+    expect_status("QP_RECOVERY_SRQ_PRIVATE_RQ_PROGRESS",
+                  qp_recovery.validate(), RDMA_SC_INVALID_STATE);
+    qp_recovery.role_complete[RDMA_QUEUE_ROLE_QP_RQ_RING] = 1'b0;
+    qp_recovery.role_complete[RDMA_QUEUE_ROLE_QP_RQ_PD] = 1'b1;
+    expect_status("QP_RECOVERY_SRQ_PRIVATE_RQ_PD_PROGRESS",
+                  qp_recovery.validate(), RDMA_SC_INVALID_STATE);
+    qp_recovery.role_complete[RDMA_QUEUE_ROLE_QP_RQ_PD] = 1'b0;
+    qp_recovery.qp_plan.rq_source_h = null;
+    qp_recovery.qp_plan.rq_ring = saved_qp_rq_ring;
+    qp_recovery.qp_plan.rq_ref = saved_qp_rq_ref;
+    qp_recovery.qp_plan.rq_pd_ref = saved_qp_rq_pd_ref;
     qp_recovery.qp_plan.rq_pd_ref.mapping.function_h.function_uid++;
     expect_status("QP_RECOVERY_MIXED_PLAN_FUNCTION", qp_recovery.validate(),
                   RDMA_SC_INVALID_ARGUMENT);
@@ -1079,6 +1120,7 @@ class rdma_request_model_test extends uvm_test;
     qp_recovery.ambiguous_ticket.command_id = 64'h1234;
     qp_recovery.intent = RDMA_QP_RECOVER_MODIFY_RECONCILE;
     qp_recovery.ambiguous_operation = RDMA_QP_AMBIG_NONE;
+    qp_recovery.ambiguous_ticket = null;
     qp_recovery.create_opcode = null;
     expect_status("QP_RECOVERY_CREATE_OPCODE", qp_recovery.validate(),
                   RDMA_SC_INVALID_STATE);
@@ -1153,6 +1195,27 @@ class rdma_request_model_test extends uvm_test;
         !qp_recovery_clone.role_complete[RDMA_QUEUE_ROLE_QP_SQ_PD])
       `uvm_error("QP_RECOVERY_COPY",
                  "QP recovery clone lost or aliased authority")
+    qp_recovery_record = rdma_recovery_record::type_id::create(
+      "qp_recovery_record"
+    );
+    qp_recovery_record.resource_h = rdma_clone_handle_value(
+      qp_h, "QP recovery record resource"
+    );
+    qp_recovery_record.hardware_presence = RDMA_HW_PRESENCE_PRESENT;
+    qp_recovery_record.primary_status = rdma_status::make(
+      RDMA_SC_TIMEOUT, "QP recovery record fixture"
+    );
+    qp_recovery_record.qp_recovery_valid = 1'b1;
+    cloned_object = qp_recovery.clone();
+    if (!$cast(qp_recovery_record.qp_recovery, cloned_object))
+      `uvm_fatal("QP_RECOVERY_RECORD_SETUP",
+                 "QP recovery record state clone lost type")
+    expect_status("QP_RECOVERY_RECORD", qp_recovery_record.validate(),
+                  RDMA_SC_OK);
+    qp_recovery_record.resource_h.object_id++;
+    expect_status("QP_RECOVERY_RECORD_RESOURCE",
+                  qp_recovery_record.validate(), RDMA_SC_INVALID_STATE);
+    qp_recovery_record.resource_h.object_id--;
 
     post_send = rdma_post_send_req::type_id::create("post_send");
     post_send.owner = function_h;
@@ -1653,7 +1716,18 @@ class rdma_request_model_test extends uvm_test;
                   RDMA_SC_INVALID_STATE);
     qp_resource.backing_refs.delete();
     qp_resource.hmc_refs.delete();
+    qp_resource.qp_plan.context_ref.local_id = qp_resource.local_qp_id;
     expect_status("QP_RESOURCE", qp_resource.validate(), RDMA_SC_OK);
+    qp_resource.qp_plan.context_ref.local_id++;
+    expect_status("QP_RESOURCE_CONTEXT_LOCAL_ID", qp_resource.validate(),
+                  RDMA_SC_INVALID_STATE);
+    qp_resource.qp_plan.context_ref.local_id--;
+    qp_resource.qp_state = RDMA_QPS_INIT;
+    qp_resource.programmed_qpc.state = RDMA_QPS_RESET;
+    expect_status("QP_RESOURCE_SOFTWARE_INIT", qp_resource.validate(),
+                  RDMA_SC_OK);
+    qp_resource.qp_state = RDMA_QPS_RTS;
+    qp_resource.programmed_qpc.state = RDMA_QPS_RTS;
     qp_resource.programmed_qpc.qp_h.object_id++;
     expect_status("QP_RESOURCE_QPC_LOCAL_ID", qp_resource.validate(),
                   RDMA_SC_INVALID_STATE);

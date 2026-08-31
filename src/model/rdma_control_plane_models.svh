@@ -424,6 +424,21 @@ class rdma_qp_recovery_state extends uvm_object;
           "QP recovery progress uses a legacy queue role"
         );
     end
+    if (qp_plan.rq_source_h != null &&
+        (role_complete[RDMA_QUEUE_ROLE_QP_RQ_RING] ||
+         role_complete[RDMA_QUEUE_ROLE_QP_RQ_PD]))
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "SRQ-backed QP recovery has private RQ progress"
+      );
+    if (qp_plan.transport != RDMA_TRANSPORT_URC &&
+        (role_complete[RDMA_QUEUE_ROLE_QP_URC_RSQ] ||
+         role_complete[RDMA_QUEUE_ROLE_QP_URC_RDSQ] ||
+         role_complete[RDMA_QUEUE_ROLE_QP_URC_DSQ]))
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "non-URC QP recovery has URC backing progress"
+      );
     cloned_plan_object = qp_plan.clone();
     if (cloned_plan_object == null ||
         !$cast(validation_plan, cloned_plan_object))
@@ -560,6 +575,12 @@ class rdma_qp_recovery_state extends uvm_object;
         ambiguous_ticket == null)
       return rdma_status::make(RDMA_SC_INVALID_STATE,
                                "ambiguous QP recovery lacks ticket");
+    if (ambiguous_operation == RDMA_QP_AMBIG_NONE &&
+        ambiguous_ticket != null)
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "unambiguous QP recovery carries an ambiguous ticket"
+      );
     if (ambiguous_ticket != null) begin
       status = ambiguous_ticket.validate();
       if (!status.ok()) return status;
@@ -772,6 +793,17 @@ class rdma_recovery_record extends uvm_object;
                                  "QP recovery resource/schema mismatch");
       status = qp_recovery.validate();
       if (!status.ok()) return status;
+      if (qp_recovery.qp_plan == null ||
+          qp_recovery.qp_plan.sq_ref == null ||
+          qp_recovery.qp_plan.sq_ref.mapping == null ||
+          qp_recovery.qp_plan.sq_ref.mapping.owner_h == null ||
+          !resource_h.same_instance(
+            qp_recovery.qp_plan.sq_ref.mapping.owner_h
+          ))
+        return rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "QP recovery record resource does not match nested authority"
+        );
     end
     if (queue_recovery_valid) begin
       if (!(resource_h.kind inside {RDMA_RESOURCE_CQ, RDMA_RESOURCE_SRQ,

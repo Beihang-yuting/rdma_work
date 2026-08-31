@@ -673,6 +673,11 @@ class rdma_qp extends rdma_resource;
                                  "QP backing authority is incomplete or split");
       status = qp_plan.validate();
       if (!status.ok()) return status;
+      if (qp_plan.context_ref.local_id != local_qp_id)
+        return rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "QP context local ID does not match the resource local QP ID"
+        );
       status = programmed_qpc.validate();
       if (!status.ok()) return status;
       if (qp_plan.transport != transport || programmed_qpc.transport != transport ||
