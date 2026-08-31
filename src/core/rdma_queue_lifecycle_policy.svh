@@ -400,12 +400,9 @@ virtual class rdma_queue_lifecycle_policy extends uvm_object;
         64'hffff_ffff_ffff_ffff - ref_value.mapping_offset)
       return rdma_status::make(RDMA_SC_DMA_TRANSLATION,
                                "queue backing IOVA projection overflows");
-    address.value = ref_value.mapping.iova.value + ref_value.mapping_offset;
-    if ((address.value & 64'hfff) != 0) begin
-      address = '0;
-      return invalid_argument("queue backing IOVA is not page aligned");
-    end
-    return rdma_status::success();
+    rdma_iova_t effective_iova;
+    effective_iova.value = ref_value.mapping.iova.value + ref_value.mapping_offset;
+    return rdma_queue_base_from_iova(effective_iova, address);
   endfunction
 
   protected function rdma_status context_ref_status(

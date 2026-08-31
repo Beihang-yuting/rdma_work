@@ -34,7 +34,7 @@ def validate_iova_only(repo_root: Path) -> None:
     for relative in IOVA_CONSUMERS:
         reject(read(repo_root, relative), r"\b\.backing_addr\b", f"IOVA-only boundary violated in {relative}")
     policy = read(repo_root, IOVA_CONSUMERS[0])
-    if "rdma_queue_base_from_iova" not in policy:
+    if not re.search(r"\brdma_queue_base_from_iova\s*\(", policy, re.MULTILINE):
         raise ValidationError("IOVA-only boundary requires rdma_queue_base_from_iova in policy")
 
 
@@ -44,17 +44,31 @@ REQUEST_CLASSES = ("rdma_create_cq_req", "rdma_create_srq_req", "rdma_create_ceq
 def validate_public_api_shape(repo_root: Path) -> None:
     text = read(repo_root, "src/model/rdma_semantic_requests.svh")
     for name in REQUEST_CLASSES:
-        match = re.search(rf"\bclass\s+{name}\b.*?\bendclass\b", text, re.MULTILINE | re.DOTALL)
-        if not match:
+        start = re.search(rf"\bclass\s+{name}\b", text)
+        if not start:
             raise ValidationError(f"public API boundary missing class {name}")
-        reject(match.group(0), r"\brdma_(?:iova|backing_addr)_t\b", f"public API boundary violated in {name}")
+        tail = text[start.end():]
+        next_class = re.search(r"\bclass\s+\w+\b", tail)
+        end = re.search(r"\bendclass\b", tail)
+        if end is None or (next_class is not None and next_class.start() < end.start()):
+            raise ValidationError(f"public API boundary malformed class {name}")
+        match = text[start.start(): start.end() + end.end()]
+        reject(match, r"\brdma_(?:iova|backing_addr)_t\b", f"public API boundary violated in {name}")
 
 
 def validate_core_dependencies(repo_root: Path) -> None:
-    paths = sorted(repo_root.joinpath("src/core").glob("*.svh"))
-    paths.append(repo_root / "src/core/rdma_core_pkg.sv")
-    if not paths:
-        raise ValidationError("missing core dependency sources")
+    required = [
+        "src/core/rdma_stag_key_policy.svh", "src/core/rdma_hmc_allocator.svh",
+        "src/core/rdma_resource_manager.svh", "src/core/rdma_queue_lifecycle_policy.svh",
+        "src/core/rdma_queue_backing_planner.svh", "src/core/rdma_doorbell_scheduler.svh",
+        "src/core/rdma_cmq_port.svh", "src/core/rdma_queue_lifecycle_executor.svh",
+        "src/core/rdma_control_plane.svh", "src/core/rdma_cmq_engine.svh",
+        "src/core/rdma_cmq_engine_port_adapter.svh", "src/core/rdma_cmq_port.svh",
+    ]
+    paths = [repo_root / p for p in required] + [repo_root / "src/core/rdma_core_pkg.sv"]
+    for path in paths:
+        if not path.is_file():
+            raise ValidationError(f"missing core dependency source: {path.relative_to(repo_root)}")
     try:
         text = "\n".join(path.read_text(encoding="utf-8") for path in paths)
     except OSError as exc:

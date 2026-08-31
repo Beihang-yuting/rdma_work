@@ -74,12 +74,24 @@ class QueueLifecycleCheckerTest(unittest.TestCase):
             root = copied_repo(Path(d)); p = root / "src/model/rdma_semantic_requests.svh"; p.write_text(p.read_text().replace("class rdma_create_cq_req", "class removed_req"))
             with self.assertRaisesRegex(CHECKER.ValidationError, "rdma_create_cq_req"): CHECKER.validate_public_api_shape(root)
 
+    def test_public_api_unclosed_class_fails_closed(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            root = copied_repo(Path(d)); p = root / "src/model/rdma_semantic_requests.svh"; t = p.read_text(); i = t.index("class rdma_create_cq_req"); j = t.index("endclass", i); p.write_text(t[:j] + t[j+8:])
+            with self.assertRaisesRegex(CHECKER.ValidationError, "malformed|missing"): CHECKER.validate_public_api_shape(root)
+
     def test_core_dependencies_reject_forbidden_symbols(self):
         import tempfile
         for symbol in ("pcie_work", "axis_vip", "net_packet", "host_mem_manager"):
             with tempfile.TemporaryDirectory() as d:
                 root = copied_repo(Path(d)); p = root / "src/core/rdma_core_pkg.sv"; p.write_text(p.read_text() + f"\n{symbol};\n")
                 with self.assertRaisesRegex(CHECKER.ValidationError, symbol): CHECKER.validate_core_dependencies(root)
+
+    def test_missing_core_header_fails_closed(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            root = copied_repo(Path(d)); (root / "src/core/rdma_control_plane.svh").unlink()
+            with self.assertRaisesRegex(CHECKER.ValidationError, "missing core"): CHECKER.validate_core_dependencies(root)
 
     def test_package_order_rejects_swap(self):
         import tempfile
