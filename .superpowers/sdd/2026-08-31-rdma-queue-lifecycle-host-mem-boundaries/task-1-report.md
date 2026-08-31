@@ -18,3 +18,7 @@ Integrated `rdma_queue_base_from_iova` in policy `backing_iova`, hardened explic
 ## Round 2 fixes
 
 Helper detection now strips comments; added a comment-forgery negative test and modified frozen-ABI fixture test. 13 unittest tests pass, real checker exits 0, and `git diff --check` is clean.
+
+## Round 3 fixes
+
+Frozen ABI fixture now initializes a temporary git repository, commits baseline files, then modifies one file; the checker invocation executes a real `git diff` (baseline hash translated to temporary HEAD). 13 unittest tests pass; checker and whitespace checks are clean.

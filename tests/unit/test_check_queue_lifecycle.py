@@ -122,9 +122,22 @@ class QueueLifecycleCheckerTest(unittest.TestCase):
     def test_modified_frozen_abi_fixture_is_rejected(self):
         import tempfile
         with tempfile.TemporaryDirectory() as d:
-            root = copied_repo(Path(d)); p = root / CHECKER.FROZEN_ABI[0]
+            root = copied_repo(Path(d))
+            subprocess.run(["git", "init"], cwd=root, check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=root, check=True)
+            subprocess.run(["git", "add", *[str(p) for p in CHECKER.FROZEN_ABI]], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-m", "baseline"], cwd=root, check=True, capture_output=True)
+            p = root / CHECKER.FROZEN_ABI[0]
             p.write_text(p.read_text() + "\n// unauthorized ABI change\n")
-            with self.assertRaises(CHECKER.ValidationError): CHECKER.validate_frozen_queue_abi(root)
+            real_run = CHECKER.subprocess.run
+            def translated_run(args, **kwargs):
+                args = list(args)
+                if args[:4] == ["git", "diff", "--exit-code", "a0abd95"]:
+                    args[3] = "HEAD"
+                return real_run(args, **kwargs)
+            with patch.object(CHECKER.subprocess, "run", side_effect=translated_run):
+                with self.assertRaises(CHECKER.ValidationError): CHECKER.validate_frozen_queue_abi(root)
 
 
 if __name__ == "__main__":
