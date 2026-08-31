@@ -60,3 +60,17 @@ No UVM summaries were produced because compilation stopped before elaboration/ru
 3. All four core regressions are blocked by the current SystemVerilog declaration syntax error at line 403. Since compilation did not reach simulation, pristine UVM counts cannot be claimed.
 4. The source file changed in Task 15 is production code (`src/core/rdma_queue_lifecycle_policy.svh`); it requires correction and rerunning the four core guards before Task 15 can be considered complete.
 
+## Post-fix rerun addendum (commit 15a6ac4)
+
+The declaration syntax was corrected in commit `15a6ac4`. The first core guard
+(`rdma_queue_lifecycle_test`) was rerun by the parent agent and passed with
+exit 0 and UVM warning/error/fatal counts 0/0/0. The remaining guards were
+rerun here sequentially after that fix:
+
+* `scripts/run_vcs53.sh core rdma_queue_recovery_test` — exit **0**; UVM report summary `UVM_WARNING=0`, `UVM_ERROR=0`, `UVM_FATAL=0`; `check_uvm_summary.sh` reported pristine.
+* `scripts/run_vcs53.sh core rdma_control_plane_test` — exit **0**; UVM report summary `UVM_WARNING=0`, `UVM_ERROR=0`, `UVM_FATAL=0`; `check_uvm_summary.sh` reported pristine.
+* `scripts/run_vcs53.sh core rdma_control_plane_cmq_engine_test` — exit **0**; UVM report summary `UVM_WARNING=0`, `UVM_ERROR=0`, `UVM_FATAL=0`; `check_uvm_summary.sh` reported pristine.
+
+The three successful runs still emitted the expected non-interactive shell
+warnings (`cannot set terminal process group`, `no job control`) during SSH
+startup. These do not affect compile or simulation status.
