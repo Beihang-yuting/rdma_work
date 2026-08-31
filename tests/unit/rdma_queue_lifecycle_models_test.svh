@@ -177,6 +177,9 @@ class rdma_queue_lifecycle_models_test extends uvm_test;
     mapping = make_mapping("mapping");
 
     qp_ring = make_qp_ring("qp_sq_ring", RDMA_QUEUE_ROLE_QP_SQ_RING, 128);
+    if (qp_ring.object_mode.name() != "RDMA_OBJECT_INDIRECT_4K")
+      `uvm_error("QP_RING_TYPED_MODE",
+                 "QP ring object mode lost its typed enum contract")
     qp_ref = rdma_qp_backing_ref::type_id::create("qp_sq_ref");
     qp_ref.role = RDMA_QUEUE_ROLE_QP_SQ_RING;
     qp_ref.mapping = mapping;

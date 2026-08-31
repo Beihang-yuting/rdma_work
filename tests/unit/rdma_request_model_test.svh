@@ -254,7 +254,8 @@ class rdma_request_model_test extends uvm_test;
     string name,
     int unsigned sq_depth,
     int unsigned rq_depth,
-    rdma_function_handle owner
+    rdma_function_handle owner,
+    rdma_handle qp_h
   );
     rdma_qp_backing_plan plan;
     rdma_dma_mapping sq_mapping;
@@ -278,6 +279,26 @@ class rdma_request_model_test extends uvm_test;
                                        64'h5200_0000);
     rq_pd_mapping = make_queue_mapping({name, "_rq_pd_mapping"}, owner,
                                        64'h5300_0000);
+    sq_mapping.function_h = rdma_clone_function_handle_value(
+      owner, {name, " SQ mapping"}
+    );
+    rq_mapping.function_h = rdma_clone_function_handle_value(
+      owner, {name, " RQ mapping"}
+    );
+    sq_pd_mapping.function_h = rdma_clone_function_handle_value(
+      owner, {name, " SQ PD mapping"}
+    );
+    rq_pd_mapping.function_h = rdma_clone_function_handle_value(
+      owner, {name, " RQ PD mapping"}
+    );
+    sq_mapping.owner_h = rdma_clone_handle_value(qp_h, {name, " SQ owner"});
+    rq_mapping.owner_h = rdma_clone_handle_value(qp_h, {name, " RQ owner"});
+    sq_pd_mapping.owner_h = rdma_clone_handle_value(
+      qp_h, {name, " SQ PD owner"}
+    );
+    rq_pd_mapping.owner_h = rdma_clone_handle_value(
+      qp_h, {name, " RQ PD owner"}
+    );
     plan.sq_ref = make_qp_ref({name, "_sq_ref"},
                               RDMA_QUEUE_ROLE_QP_SQ_RING, sq_mapping,
                               plan.sq_ring.storage_bytes,
@@ -294,6 +315,12 @@ class rdma_request_model_test extends uvm_test;
                                  4096, RDMA_OWNERSHIP_CONTROL_PLANE);
     plan.context_ref = make_queue_context({name, "_context"},
                                           RDMA_RESOURCE_QP, owner);
+    plan.context_ref.owner = rdma_clone_function_handle_value(
+      owner, {name, " context owner"}
+    );
+    plan.context_ref.hmc_ref.owner = rdma_clone_function_handle_value(
+      owner, {name, " HMC owner"}
+    );
     plan.context_ref.hmc_ref.size = 512;
     plan.context_ref.slot_length = 512;
     plan.context_ref.shadow_view_length = 512;
@@ -313,10 +340,11 @@ class rdma_request_model_test extends uvm_test;
     rdma_qpc_rc_ext extension;
 
     model = rdma_qpc_model::type_id::create(name);
-    model.qp_h = qp_h;
-    model.pd_h = pd_h;
-    model.send_cq_h = send_cq_h;
-    model.recv_cq_h = recv_cq_h;
+    model.qp_h = rdma_clone_handle_value(qp_h, {name, " QP"});
+    model.pd_h = rdma_clone_handle_value(pd_h, {name, " PD"});
+    model.send_cq_h = rdma_clone_handle_value(send_cq_h, {name, " send CQ"});
+    model.recv_cq_h = rdma_clone_handle_value(recv_cq_h,
+                                              {name, " receive CQ"});
     model.transport = RDMA_TRANSPORT_RC;
     model.state = RDMA_QPS_RTS;
     model.path_mtu_bytes = 4096;
@@ -331,6 +359,59 @@ class rdma_request_model_test extends uvm_test;
     extension.remote_qpn = 24'h123;
     model.transport_ext = extension;
     return model;
+  endfunction
+
+  function automatic rdma_cmq_opcode_key make_recovery_opcode(
+    string name,
+    bit [31:0] opcode,
+    string variant
+  );
+    rdma_cmq_opcode_key key;
+
+    key = rdma_cmq_opcode_key::type_id::create(name);
+    key.profile_name = "xtr_v1";
+    key.opcode = opcode;
+    key.variant = variant;
+    return key;
+  endfunction
+
+  function automatic rdma_dma_mapping make_recovery_mapping(
+    string name,
+    rdma_function_handle owner,
+    rdma_handle qp_h,
+    longint unsigned iova_value
+  );
+    rdma_dma_mapping mapping;
+
+    mapping = make_queue_mapping(name, owner, iova_value);
+    mapping.function_h = rdma_clone_function_handle_value(
+      owner, {name, " Function"}
+    );
+    mapping.owner_h = rdma_clone_handle_value(qp_h, {name, " QP"});
+    mapping.size = 512;
+    return mapping;
+  endfunction
+
+  function automatic rdma_cmq_ticket make_recovery_ticket(
+    string name,
+    rdma_function_handle owner,
+    rdma_handle cmq_h,
+    rdma_cmq_opcode_key opcode_key
+  );
+    rdma_cmq_ticket ticket;
+
+    ticket = rdma_cmq_ticket::type_id::create(name);
+    ticket.command_id = 64'h1234;
+    ticket.function_h = rdma_clone_function_handle_value(
+      owner, {name, " Function"}
+    );
+    ticket.cmq_h = rdma_clone_handle_value(cmq_h, {name, " CMQ"});
+    ticket.slot_sequence = 3;
+    ticket.sq_index = 3;
+    ticket.sq_wrap = 1'b0;
+    ticket.opcode_key = rdma_cmq_clone_opcode_key_value(opcode_key, name);
+    ticket.absolute_deadline = 100;
+    return ticket;
   endfunction
 
   function automatic void expect_status(
@@ -394,13 +475,15 @@ class rdma_request_model_test extends uvm_test;
     rdma_qp qp_resource_clone;
     rdma_qp_recovery_state qp_recovery;
     rdma_qp_recovery_state qp_recovery_clone;
+    rdma_queue_slot_token_contract recovery_token;
+    rdma_queue_completion_authority saved_completion_authority;
     rdma_srq srq_resource;
     rdma_ceq ceq_resource;
     rdma_aeq aeq_resource;
     rdma_cmq cmq_resource;
     rdma_dma_mapping mapping;
     rdma_dma_mapping qp_borrowed_mapping;
-    rdma_queue_backing_slice qp_borrowed_slice;
+    rdma_queue_backing_slice qp_borrowed_slice, qp_borrowed_slice2;
     rdma_backing_ref backing_ref;
     rdma_hmc_ref hmc_ref;
     rdma_qpc_model qpc;
@@ -534,6 +617,32 @@ class rdma_request_model_test extends uvm_test;
           req.sq_backing.slices[0].mapping)
       `uvm_error("CREATE_QP_BORROWED_COPY",
                  "borrowed QP backing clone aliases source graph")
+    qp_borrowed_slice.length = 4096;
+    qp_borrowed_slice2 = rdma_queue_backing_slice::type_id::create(
+      "qp_borrowed_slice2"
+    );
+    qp_borrowed_slice2.role = RDMA_QUEUE_ROLE_QP_SQ_RING;
+    qp_borrowed_slice2.mapping = qp_borrowed_mapping;
+    qp_borrowed_slice2.mapping_offset = 4096;
+    qp_borrowed_slice2.length = 4096;
+    qp_borrowed_slice2.logical_queue_offset = 4096;
+    req.sq_backing.slices.push_back(qp_borrowed_slice2);
+    expect_status("CREATE_QP_BORROWED_SPLIT", req.validate(), RDMA_SC_OK);
+    qp_borrowed_slice2.logical_queue_offset = 8192;
+    expect_status("CREATE_QP_BORROWED_GAP", req.validate(),
+                  RDMA_SC_INVALID_ARGUMENT);
+    qp_borrowed_slice2.logical_queue_offset = 0;
+    expect_status("CREATE_QP_BORROWED_OVERLAP", req.validate(),
+                  RDMA_SC_INVALID_ARGUMENT);
+    qp_borrowed_slice2.logical_queue_offset = 4096;
+    req.sq_backing.slices.delete(1);
+    expect_status("CREATE_QP_BORROWED_UNDER_COVERAGE", req.validate(),
+                  RDMA_SC_INVALID_ARGUMENT);
+    qp_borrowed_slice.length = 8192;
+    qp_borrowed_slice2.logical_queue_offset = 8192;
+    req.sq_backing.slices.push_back(qp_borrowed_slice2);
+    expect_status("CREATE_QP_BORROWED_OVER_COVERAGE", req.validate(),
+                  RDMA_SC_INVALID_ARGUMENT);
     req.sq_backing = rdma_queue_backing_spec::type_id::create(
       "restored_sq_backing"
     );
@@ -836,12 +945,204 @@ class rdma_request_model_test extends uvm_test;
       "qp_candidate_qpc", qp_h, pd_h, cq_h, cq_h, 128, 128
     );
     qp_recovery.qp_plan = make_qp_plan("qp_recovery_plan", 128, 128,
-                                       function_h);
+                                       function_h, qp_h);
     cloned_object = qp_recovery.qp_plan.context_ref.clone();
     if (!$cast(qp_recovery.context_ref, cloned_object))
       `uvm_fatal("QP_RECOVERY_SETUP", "QP context clone lost type")
+    qp_recovery.staging_mapping = make_recovery_mapping(
+      "qp_recovery_staging", function_h, qp_h, 64'h8100_0000
+    );
+    qp_recovery.query_mapping = make_recovery_mapping(
+      "qp_recovery_query", function_h, qp_h, 64'h8200_0000
+    );
+    qp_recovery.create_opcode = make_recovery_opcode(
+      "qp_recovery_create", 32'h10, "qp_create"
+    );
+    qp_recovery.modify_opcode = make_recovery_opcode(
+      "qp_recovery_modify", 32'h11, "qp_modify"
+    );
+    qp_recovery.delete_opcode = make_recovery_opcode(
+      "qp_recovery_delete", 32'h12, "qp_delete"
+    );
+    qp_recovery.query_opcode = make_recovery_opcode(
+      "qp_recovery_query_opcode", 32'h13, "qp_query"
+    );
     qp_recovery.role_complete[RDMA_QUEUE_ROLE_QP_SQ_PD] = 1'b1;
     expect_status("QP_RECOVERY", qp_recovery.validate(), RDMA_SC_OK);
+    qp_recovery.qp_plan.rq_pd_ref.mapping.function_h.function_uid++;
+    expect_status("QP_RECOVERY_MIXED_PLAN_FUNCTION", qp_recovery.validate(),
+                  RDMA_SC_INVALID_ARGUMENT);
+    qp_recovery.qp_plan.rq_pd_ref.mapping.function_h.function_uid--;
+    qp_recovery.qp_plan.rq_pd_ref.mapping.owner_h.object_id++;
+    expect_status("QP_RECOVERY_MIXED_PLAN_QP", qp_recovery.validate(),
+                  RDMA_SC_INVALID_STATE);
+    qp_recovery.qp_plan.rq_pd_ref.mapping.owner_h.object_id--;
+    qp_recovery.prior_qpc.qp_h.object_id++;
+    expect_status("QP_RECOVERY_PRIOR_QP", qp_recovery.validate(),
+                  RDMA_SC_INVALID_STATE);
+    qp_recovery.prior_qpc.qp_h.object_id--;
+    qp_recovery.candidate_qpc.qp_h.function_uid++;
+    expect_status("QP_RECOVERY_CANDIDATE_FUNCTION", qp_recovery.validate(),
+                  RDMA_SC_INVALID_ARGUMENT);
+    qp_recovery.candidate_qpc.qp_h.function_uid--;
+    qp_recovery.ambiguous_operation = RDMA_QP_AMBIG_MODIFY;
+    qp_recovery.ambiguous_ticket = make_recovery_ticket(
+      "qp_modify_ticket", function_h, cmq_h, qp_recovery.modify_opcode
+    );
+    expect_status("QP_RECOVERY_MODIFY_TICKET", qp_recovery.validate(),
+                  RDMA_SC_OK);
+    qp_recovery.ambiguous_ticket.function_h.function_uid++;
+    qp_recovery.ambiguous_ticket.cmq_h.function_uid++;
+    expect_status("QP_RECOVERY_TICKET_FUNCTION", qp_recovery.validate(),
+                  RDMA_SC_INVALID_ARGUMENT);
+    qp_recovery.ambiguous_ticket.function_h.function_uid--;
+    qp_recovery.ambiguous_ticket.cmq_h.function_uid--;
+    qp_recovery.ambiguous_ticket.opcode_key =
+      rdma_cmq_clone_opcode_key_value(qp_recovery.create_opcode,
+                                      "wrong recovery ticket opcode");
+    expect_status("QP_RECOVERY_TICKET_OPCODE", qp_recovery.validate(),
+                  RDMA_SC_INVALID_STATE);
+    qp_recovery.ambiguous_operation = RDMA_QP_AMBIG_NONE;
+    qp_recovery.ambiguous_ticket = null;
+    qp_recovery.ambiguous_operation = RDMA_QP_AMBIG_CREATE;
+    qp_recovery.ambiguous_ticket = make_recovery_ticket(
+      "qp_modify_create_ticket", function_h, cmq_h,
+      qp_recovery.create_opcode
+    );
+    expect_status("QP_RECOVERY_MODIFY_CREATE_MATRIX", qp_recovery.validate(),
+                  RDMA_SC_INVALID_STATE);
+    qp_recovery.ambiguous_operation = RDMA_QP_AMBIG_NONE;
+    qp_recovery.ambiguous_ticket = null;
+    qp_recovery.prior_qpc = null;
+    expect_status("QP_RECOVERY_MODIFY_PRIOR", qp_recovery.validate(),
+                  RDMA_SC_INVALID_STATE);
+    qp_recovery.prior_qpc = make_rc_qpc("qp_prior_qpc_restored", qp_h, pd_h,
+                                        cq_h, cq_h, 128, 128);
+    qp_recovery.candidate_qpc = null;
+    expect_status("QP_RECOVERY_MODIFY_CANDIDATE", qp_recovery.validate(),
+                  RDMA_SC_INVALID_STATE);
+    qp_recovery.candidate_qpc = make_rc_qpc(
+      "qp_candidate_qpc_restored", qp_h, pd_h, cq_h, cq_h, 128, 128
+    );
+    qp_recovery.query_mapping = null;
+    expect_status("QP_RECOVERY_MODIFY_QUERY", qp_recovery.validate(),
+                  RDMA_SC_INVALID_STATE);
+    qp_recovery.query_mapping = make_recovery_mapping(
+      "qp_recovery_query_restored", function_h, qp_h, 64'h8200_0000
+    );
+    qp_recovery.intent = RDMA_QP_RECOVER_NORMAL_DESTROY;
+    qp_recovery.prior_qpc = null;
+    expect_status("QP_RECOVERY_DESTROY_PRIOR", qp_recovery.validate(),
+                  RDMA_SC_INVALID_STATE);
+    qp_recovery.prior_qpc = make_rc_qpc("qp_destroy_prior", qp_h, pd_h,
+                                        cq_h, cq_h, 128, 128);
+    qp_recovery.ambiguous_operation = RDMA_QP_AMBIG_CREATE;
+    qp_recovery.ambiguous_ticket = make_recovery_ticket(
+      "qp_destroy_create_ticket", function_h, cmq_h,
+      qp_recovery.create_opcode
+    );
+    expect_status("QP_RECOVERY_DESTROY_CREATE_MATRIX", qp_recovery.validate(),
+                  RDMA_SC_INVALID_STATE);
+    qp_recovery.intent = RDMA_QP_RECOVER_CREATE_ROLLBACK;
+    qp_recovery.ambiguous_operation = RDMA_QP_AMBIG_MODIFY;
+    qp_recovery.ambiguous_ticket = make_recovery_ticket(
+      "qp_create_modify_ticket", function_h, cmq_h,
+      qp_recovery.modify_opcode
+    );
+    expect_status("QP_RECOVERY_CREATE_MODIFY_MATRIX", qp_recovery.validate(),
+                  RDMA_SC_INVALID_STATE);
+    qp_recovery.ambiguous_operation = RDMA_QP_AMBIG_CREATE;
+    qp_recovery.candidate_qpc = null;
+    qp_recovery.ambiguous_ticket = make_recovery_ticket(
+      "qp_create_ticket", function_h, cmq_h, qp_recovery.create_opcode
+    );
+    expect_status("QP_RECOVERY_CREATE_CANDIDATE", qp_recovery.validate(),
+                  RDMA_SC_INVALID_STATE);
+    qp_recovery.candidate_qpc = make_rc_qpc(
+      "qp_create_candidate", qp_h, pd_h, cq_h, cq_h, 128, 128
+    );
+    qp_recovery.staging_mapping = null;
+    expect_status("QP_RECOVERY_AMBIG_STAGING", qp_recovery.validate(),
+                  RDMA_SC_INVALID_STATE);
+    qp_recovery.staging_mapping = make_recovery_mapping(
+      "qp_recovery_staging_restored", function_h, qp_h, 64'h8100_0000
+    );
+    qp_recovery.ambiguous_ticket = null;
+    expect_status("QP_RECOVERY_AMBIG_TICKET", qp_recovery.validate(),
+                  RDMA_SC_INVALID_STATE);
+    qp_recovery.ambiguous_ticket = make_recovery_ticket(
+      "qp_invalid_ticket", function_h, cmq_h, qp_recovery.create_opcode
+    );
+    qp_recovery.ambiguous_ticket.command_id = 0;
+    expect_status("QP_RECOVERY_TICKET_VALIDATE", qp_recovery.validate(),
+                  RDMA_SC_INVALID_ARGUMENT);
+    qp_recovery.ambiguous_ticket.command_id = 64'h1234;
+    qp_recovery.intent = RDMA_QP_RECOVER_MODIFY_RECONCILE;
+    qp_recovery.ambiguous_operation = RDMA_QP_AMBIG_NONE;
+    qp_recovery.create_opcode = null;
+    expect_status("QP_RECOVERY_CREATE_OPCODE", qp_recovery.validate(),
+                  RDMA_SC_INVALID_STATE);
+    qp_recovery.create_opcode = make_recovery_opcode(
+      "qp_recovery_create_restored", 32'h10, "qp_create"
+    );
+    qp_recovery.modify_opcode = null;
+    expect_status("QP_RECOVERY_MODIFY_OPCODE", qp_recovery.validate(),
+                  RDMA_SC_INVALID_STATE);
+    qp_recovery.modify_opcode = make_recovery_opcode(
+      "qp_recovery_modify_restored", 32'h11, "qp_modify"
+    );
+    qp_recovery.delete_opcode = null;
+    expect_status("QP_RECOVERY_DELETE_OPCODE", qp_recovery.validate(),
+                  RDMA_SC_INVALID_STATE);
+    qp_recovery.delete_opcode = make_recovery_opcode(
+      "qp_recovery_delete_restored", 32'h12, "qp_delete"
+    );
+    qp_recovery.query_opcode = null;
+    expect_status("QP_RECOVERY_QUERY_OPCODE", qp_recovery.validate(),
+                  RDMA_SC_INVALID_STATE);
+    qp_recovery.query_opcode = make_recovery_opcode(
+      "qp_recovery_query_restored", 32'h13, "qp_query"
+    );
+    qp_recovery.query_opcode.variant = "";
+    expect_status("QP_RECOVERY_OPCODE_VALIDATE", qp_recovery.validate(),
+                  RDMA_SC_INVALID_ARGUMENT);
+    qp_recovery.query_opcode.variant = "qp_query";
+    qp_recovery.role_complete[RDMA_QUEUE_ROLE_CQ_RING] = 1'b1;
+    expect_status("QP_RECOVERY_LEGACY_PROGRESS", qp_recovery.validate(),
+                  RDMA_SC_INVALID_STATE);
+    qp_recovery.role_complete[RDMA_QUEUE_ROLE_CQ_RING] = 1'b0;
+    qp_recovery.context_ref.local_id++;
+    expect_status("QP_RECOVERY_CONTEXT_LOCAL_ID", qp_recovery.validate(),
+                  RDMA_SC_INVALID_STATE);
+    qp_recovery.context_ref.local_id--;
+    qp_recovery.context_ref.hmc_ref.address.value += 64'h1000;
+    expect_status("QP_RECOVERY_CONTEXT_HMC", qp_recovery.validate(),
+                  RDMA_SC_INVALID_STATE);
+    qp_recovery.context_ref.hmc_ref.address.value -= 64'h1000;
+    if (!$cast(recovery_token, qp_recovery.context_ref.slot_token))
+      `uvm_fatal("QP_RECOVERY_SETUP", "QP context token lost contract")
+    saved_completion_authority = recovery_token.completion_authority;
+    recovery_token.completion_authority =
+      rdma_queue_completion_authority::type_id::create(
+        "mismatched_completion_authority"
+      );
+    expect_status("QP_RECOVERY_CONTEXT_COMPLETION", qp_recovery.validate(),
+                  RDMA_SC_INVALID_STATE);
+    recovery_token.completion_authority = saved_completion_authority;
+    qp_recovery.query_mapping.state = RDMA_MAPPING_RELEASED;
+    expect_status("QP_RECOVERY_PENDING_QUERY", qp_recovery.validate(),
+                  RDMA_SC_INVALID_STATE);
+    qp_recovery.query_mapping.state = RDMA_MAPPING_ACTIVE;
+    qp_recovery.qp_plan.sq_pd_ref.cleanup_complete = 1'b1;
+    qp_recovery.qp_plan.sq_pd_ref.mapping.state = RDMA_MAPPING_RELEASED;
+    expect_status("QP_RECOVERY_COMPLETED_RELEASE", qp_recovery.validate(),
+                  RDMA_SC_OK);
+    qp_recovery.role_complete[RDMA_QUEUE_ROLE_QP_SQ_PD] = 1'b0;
+    expect_status("QP_RECOVERY_PENDING_RELEASE", qp_recovery.validate(),
+                  RDMA_SC_INVALID_STATE);
+    qp_recovery.role_complete[RDMA_QUEUE_ROLE_QP_SQ_PD] = 1'b1;
+    qp_recovery.qp_plan.sq_pd_ref.cleanup_complete = 1'b0;
+    qp_recovery.qp_plan.sq_pd_ref.mapping.state = RDMA_MAPPING_ACTIVE;
     cloned_object = qp_recovery.clone();
     if (!$cast(qp_recovery_clone, cloned_object) ||
         qp_recovery_clone == qp_recovery ||
@@ -1302,7 +1603,7 @@ class rdma_request_model_test extends uvm_test;
     qp_resource.handle = qp_h;
     qp_resource.owner = function_h;
     qp_resource.state = RDMA_RESOURCE_ACTIVE;
-    qp_resource.local_qp_id = 32'h1111;
+    qp_resource.local_qp_id = 32'h404;
     qp_resource.global_qp_id = 32'h9999_1111;
     qp_resource.transport = RDMA_TRANSPORT_RC;
     qp_resource.qp_state = RDMA_QPS_RTS;
@@ -1344,7 +1645,7 @@ class rdma_request_model_test extends uvm_test;
     hmc_ref.ownership = RDMA_OWNERSHIP_CONTROL_PLANE;
     qp_resource.hmc_refs.push_back(hmc_ref);
     qp_resource.qp_plan = make_qp_plan("qp_resource_plan", 1024, 512,
-                                       function_h);
+                                       function_h, qp_h);
     qp_resource.programmed_qpc = make_rc_qpc(
       "qp_resource_qpc", qp_h, pd_h, cq_h, cq_h, 1024, 512
     );
@@ -1353,6 +1654,74 @@ class rdma_request_model_test extends uvm_test;
     qp_resource.backing_refs.delete();
     qp_resource.hmc_refs.delete();
     expect_status("QP_RESOURCE", qp_resource.validate(), RDMA_SC_OK);
+    qp_resource.programmed_qpc.qp_h.object_id++;
+    expect_status("QP_RESOURCE_QPC_LOCAL_ID", qp_resource.validate(),
+                  RDMA_SC_INVALID_STATE);
+    qp_resource.programmed_qpc.qp_h.object_id--;
+    qp_resource.programmed_qpc.qp_h.function_uid++;
+    qp_resource.programmed_qpc.pd_h.function_uid++;
+    qp_resource.programmed_qpc.send_cq_h.function_uid++;
+    qp_resource.programmed_qpc.recv_cq_h.function_uid++;
+    expect_status("QP_RESOURCE_QPC_FUNCTION", qp_resource.validate(),
+                  RDMA_SC_INVALID_ARGUMENT);
+    qp_resource.programmed_qpc.qp_h.function_uid--;
+    qp_resource.programmed_qpc.pd_h.function_uid--;
+    qp_resource.programmed_qpc.send_cq_h.function_uid--;
+    qp_resource.programmed_qpc.recv_cq_h.function_uid--;
+    qp_resource.programmed_qpc.qp_h.generation++;
+    qp_resource.programmed_qpc.pd_h.generation++;
+    qp_resource.programmed_qpc.send_cq_h.generation++;
+    qp_resource.programmed_qpc.recv_cq_h.generation++;
+    expect_status("QP_RESOURCE_QPC_GENERATION", qp_resource.validate(),
+                  RDMA_SC_STALE_GENERATION);
+    qp_resource.programmed_qpc.qp_h.generation--;
+    qp_resource.programmed_qpc.pd_h.generation--;
+    qp_resource.programmed_qpc.send_cq_h.generation--;
+    qp_resource.programmed_qpc.recv_cq_h.generation--;
+    qp_resource.programmed_qpc.sq_depth *= 2;
+    expect_status("QP_RESOURCE_QPC_SQ_DEPTH", qp_resource.validate(),
+                  RDMA_SC_INVALID_STATE);
+    qp_resource.programmed_qpc.sq_depth /= 2;
+    qp_resource.programmed_qpc.rq_depth *= 2;
+    expect_status("QP_RESOURCE_QPC_RQ_DEPTH", qp_resource.validate(),
+                  RDMA_SC_INVALID_STATE);
+    qp_resource.programmed_qpc.rq_depth /= 2;
+    qp_resource.programmed_qpc.sq_mode = RDMA_OBJECT_DIRECT_4K;
+    expect_status("QP_RESOURCE_QPC_SQ_MODE", qp_resource.validate(),
+                  RDMA_SC_INVALID_STATE);
+    qp_resource.programmed_qpc.sq_mode = RDMA_OBJECT_INDIRECT_4K;
+    qp_resource.programmed_qpc.rq_mode = RDMA_OBJECT_DIRECT_4K;
+    expect_status("QP_RESOURCE_QPC_RQ_MODE", qp_resource.validate(),
+                  RDMA_SC_INVALID_STATE);
+    qp_resource.programmed_qpc.rq_mode = RDMA_OBJECT_INDIRECT_4K;
+    qp_resource.programmed_qpc.sq_backing.value += 64'h1000;
+    expect_status("QP_RESOURCE_QPC_SQ_BACKING", qp_resource.validate(),
+                  RDMA_SC_INVALID_STATE);
+    qp_resource.programmed_qpc.sq_backing.value -= 64'h1000;
+    qp_resource.programmed_qpc.rq_backing.value += 64'h1000;
+    expect_status("QP_RESOURCE_QPC_RQ_BACKING", qp_resource.validate(),
+                  RDMA_SC_INVALID_STATE);
+    qp_resource.programmed_qpc.rq_backing.value -= 64'h1000;
+    qp_resource.programmed_qpc.context_backing.value += 64'h200;
+    expect_status("QP_RESOURCE_QPC_CONTEXT_BACKING", qp_resource.validate(),
+                  RDMA_SC_INVALID_STATE);
+    qp_resource.programmed_qpc.context_backing.value -= 64'h200;
+    qp_resource.qp_plan.sq_ref.mapping.function_h.function_uid++;
+    expect_status("QP_RESOURCE_PLAN_MAPPING_FUNCTION", qp_resource.validate(),
+                  RDMA_SC_INVALID_ARGUMENT);
+    qp_resource.qp_plan.sq_ref.mapping.function_h.function_uid--;
+    qp_resource.qp_plan.sq_ref.mapping.owner_h.object_id++;
+    expect_status("QP_RESOURCE_PLAN_MAPPING_OWNER", qp_resource.validate(),
+                  RDMA_SC_INVALID_STATE);
+    qp_resource.qp_plan.sq_ref.mapping.owner_h.object_id--;
+    qp_resource.qp_plan.context_ref.owner.function_uid++;
+    expect_status("QP_RESOURCE_PLAN_CONTEXT_OWNER", qp_resource.validate(),
+                  RDMA_SC_INVALID_ARGUMENT);
+    qp_resource.qp_plan.context_ref.owner.function_uid--;
+    qp_resource.qp_plan.context_ref.hmc_ref.owner.function_uid++;
+    expect_status("QP_RESOURCE_PLAN_HMC_OWNER", qp_resource.validate(),
+                  RDMA_SC_INVALID_ARGUMENT);
+    qp_resource.qp_plan.context_ref.hmc_ref.owner.function_uid--;
     qp_resource.srq_h = srq_h;
     expect_status("QP_RESOURCE_SRQ_PLAN_MISMATCH", qp_resource.validate(),
                   RDMA_SC_INVALID_STATE);
@@ -1407,7 +1776,7 @@ class rdma_request_model_test extends uvm_test;
              qp_resource_clone.send_cq_h == qp_resource.send_cq_h ||
              qp_resource_clone.recv_cq_h == qp_resource.recv_cq_h ||
              qp_resource_clone.state != RDMA_RESOURCE_ACTIVE ||
-             qp_resource_clone.local_qp_id != 32'h1111 ||
+             qp_resource_clone.local_qp_id != 32'h404 ||
              qp_resource_clone.global_qp_id != 32'h9999_1111 ||
              qp_resource_clone.transport != RDMA_TRANSPORT_RC ||
              qp_resource_clone.qp_state != RDMA_QPS_RTS ||

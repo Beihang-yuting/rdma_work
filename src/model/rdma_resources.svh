@@ -41,6 +41,70 @@ function automatic bit rdma_ring_state_valid(
   return producer_index <= consumer_index;
 endfunction
 
+function automatic rdma_status rdma_qp_projected_handle_status(
+  rdma_handle projected_h,
+  rdma_handle dependency_h,
+  rdma_function_handle owner,
+  rdma_resource_kind_e expected_kind,
+  string label
+);
+  rdma_status status;
+
+  if (projected_h == null || dependency_h == null ||
+      projected_h.kind != expected_kind || dependency_h.kind != expected_kind)
+    return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                             {label, " handle kind is invalid"});
+  status = rdma_handle_owner_status(dependency_h, owner);
+  if (!status.ok())
+    return status;
+  status = rdma_handle_owner_status(projected_h, owner);
+  if (!status.ok())
+    return status;
+  return rdma_status::success();
+endfunction
+
+function automatic rdma_status rdma_qp_mapping_authority_status(
+  rdma_qp_backing_ref backing_ref,
+  rdma_function_handle owner,
+  rdma_handle qp_h,
+  string label
+);
+  if (backing_ref == null || backing_ref.mapping == null)
+    return rdma_status::make(RDMA_SC_INVALID_STATE,
+                             {label, " mapping authority is missing"});
+  if (backing_ref.mapping.function_h == null ||
+      !backing_ref.mapping.function_h.same_instance(owner))
+    return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                             {label, " mapping Function does not match"});
+  if (backing_ref.mapping.owner_h == null ||
+      !backing_ref.mapping.owner_h.same_instance(qp_h))
+    return rdma_status::make(RDMA_SC_INVALID_STATE,
+                             {label, " mapping QP owner does not match"});
+  return rdma_status::success();
+endfunction
+
+function automatic rdma_status rdma_qp_backing_projection_status(
+  rdma_qp_backing_ref backing_ref,
+  rdma_backing_addr_t programmed_backing,
+  string label
+);
+  longint unsigned effective_iova;
+
+  if (backing_ref == null || backing_ref.mapping == null)
+    return rdma_status::make(RDMA_SC_INVALID_STATE,
+                             {label, " backing authority is missing"});
+  if (backing_ref.mapping.iova.value >
+      64'hffff_ffff_ffff_ffff - backing_ref.mapping_offset)
+    return rdma_status::make(RDMA_SC_DMA_TRANSLATION,
+                             {label, " effective IOVA overflows"});
+  effective_iova = backing_ref.mapping.iova.value +
+                   backing_ref.mapping_offset;
+  if (programmed_backing.value != effective_iova)
+    return rdma_status::make(RDMA_SC_INVALID_STATE,
+                             {label, " programmed backing does not match"});
+  return rdma_status::success();
+endfunction
+
 class rdma_resource extends uvm_object;
   `uvm_object_utils(rdma_resource)
 
@@ -612,9 +676,70 @@ class rdma_qp extends rdma_resource;
       status = programmed_qpc.validate();
       if (!status.ok()) return status;
       if (qp_plan.transport != transport || programmed_qpc.transport != transport ||
-          qp_plan.sq_depth != sq_depth || qp_plan.rq_depth != rq_depth)
+          qp_plan.sq_depth != sq_depth || qp_plan.rq_depth != rq_depth ||
+          programmed_qpc.sq_depth != sq_depth ||
+          programmed_qpc.rq_depth != rq_depth)
         return rdma_status::make(RDMA_SC_INVALID_STATE,
                                  "QP programmed authority does not match resource");
+      status = rdma_qp_projected_handle_status(
+        programmed_qpc.qp_h, handle, owner, RDMA_RESOURCE_QP, "QPC QP"
+      );
+      if (!status.ok()) return status;
+      if (programmed_qpc.qp_h.object_id != local_qp_id)
+        return rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "QPC projected QP ID does not match the resource local QP ID"
+        );
+      status = rdma_qp_projected_handle_status(
+        programmed_qpc.pd_h, pd_h, owner, RDMA_RESOURCE_PD, "QPC PD"
+      );
+      if (!status.ok()) return status;
+      status = rdma_qp_projected_handle_status(
+        programmed_qpc.send_cq_h, send_cq_h, owner, RDMA_RESOURCE_CQ,
+        "QPC send CQ"
+      );
+      if (!status.ok()) return status;
+      status = rdma_qp_projected_handle_status(
+        programmed_qpc.recv_cq_h, recv_cq_h, owner, RDMA_RESOURCE_CQ,
+        "QPC receive CQ"
+      );
+      if (!status.ok()) return status;
+      status = rdma_qp_mapping_authority_status(
+        qp_plan.sq_ref, owner, handle, "QP SQ"
+      );
+      if (!status.ok()) return status;
+      status = rdma_qp_mapping_authority_status(
+        qp_plan.sq_pd_ref, owner, handle, "QP SQ PD"
+      );
+      if (!status.ok()) return status;
+      if (qp_plan.context_ref.owner == null ||
+          !qp_plan.context_ref.owner.same_instance(owner) ||
+          qp_plan.context_ref.hmc_ref == null ||
+          qp_plan.context_ref.hmc_ref.owner == null ||
+          !qp_plan.context_ref.hmc_ref.owner.same_instance(owner))
+        return rdma_status::make(
+          RDMA_SC_INVALID_ARGUMENT,
+          "QP context or HMC owner does not match the resource owner"
+        );
+      foreach (qp_plan.urc_refs[i]) begin
+        status = rdma_qp_mapping_authority_status(
+          qp_plan.urc_refs[i], owner, handle, "QP URC"
+        );
+        if (!status.ok()) return status;
+      end
+      if (programmed_qpc.sq_mode != qp_plan.sq_ring.object_mode)
+        return rdma_status::make(RDMA_SC_INVALID_STATE,
+                                 "QPC SQ mode does not match the plan");
+      status = rdma_qp_backing_projection_status(
+        qp_plan.sq_pd_ref, programmed_qpc.sq_backing, "QPC SQ"
+      );
+      if (!status.ok()) return status;
+      if (programmed_qpc.context_backing.value !=
+          qp_plan.context_ref.shadow_pointer_base.value)
+        return rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "QPC context backing does not match the plan shadow base"
+        );
       if (srq_h != null) begin
         status = rdma_handle_owner_status(srq_h, owner);
         if (!status.ok()) return status;
@@ -627,6 +752,34 @@ class rdma_qp extends rdma_resource;
           (srq_h == null && programmed_qpc.srq_h != null))
         return rdma_status::make(RDMA_SC_INVALID_STATE,
                                  "QP SRQ authority does not match resource");
+      if (srq_h != null) begin
+        status = rdma_qp_projected_handle_status(
+          programmed_qpc.srq_h, srq_h, owner, RDMA_RESOURCE_SRQ, "QPC SRQ"
+        );
+        if (!status.ok()) return status;
+        if (programmed_qpc.rq_mode != RDMA_OBJECT_INDIRECT_4K)
+          return rdma_status::make(
+            RDMA_SC_INVALID_STATE,
+            "SRQ-backed QPC RQ mode must be indirect 4 KiB"
+          );
+      end
+      else begin
+        status = rdma_qp_mapping_authority_status(
+          qp_plan.rq_ref, owner, handle, "QP RQ"
+        );
+        if (!status.ok()) return status;
+        status = rdma_qp_mapping_authority_status(
+          qp_plan.rq_pd_ref, owner, handle, "QP RQ PD"
+        );
+        if (!status.ok()) return status;
+        if (programmed_qpc.rq_mode != qp_plan.rq_ring.object_mode)
+          return rdma_status::make(RDMA_SC_INVALID_STATE,
+                                   "QPC RQ mode does not match the plan");
+        status = rdma_qp_backing_projection_status(
+          qp_plan.rq_pd_ref, programmed_qpc.rq_backing, "QPC RQ"
+        );
+        if (!status.ok()) return status;
+      end
     end
     if (state inside {RDMA_RESOURCE_PROGRAMMED, RDMA_RESOURCE_ACTIVE}) begin
       if (pd_h != null && pd_h.kind != RDMA_RESOURCE_PD)

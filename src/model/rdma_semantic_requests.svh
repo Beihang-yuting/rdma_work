@@ -360,12 +360,18 @@ endclass
 
 function automatic rdma_status rdma_qp_backing_spec_status(
   rdma_queue_backing_spec spec,
-  rdma_queue_backing_role_e required_role
+  rdma_queue_backing_role_e required_role,
+  longint unsigned required_storage_bytes
 );
   rdma_status status;
+  longint unsigned next_logical_offset;
 
   if (spec == null)
     return rdma_status::make(RDMA_SC_INVALID_STATE, "QP backing spec is null");
+  if (required_storage_bytes == 0 ||
+      !rdma_queue_aligned(required_storage_bytes, 4096))
+    return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                             "QP backing storage size is invalid");
   if (spec.mode == RDMA_QUEUE_BACKING_OWNED) begin
     if (spec.slices.size() != 0)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
@@ -374,14 +380,26 @@ function automatic rdma_status rdma_qp_backing_spec_status(
   end
   if (spec.mode != RDMA_QUEUE_BACKING_BORROWED || spec.slices.size() == 0)
     return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "QP backing mode invalid");
+  next_logical_offset = 0;
   foreach (spec.slices[i]) begin
     if (spec.slices[i] == null || spec.slices[i].role != required_role)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "QP borrowed backing role invalid");
+    if (!rdma_queue_aligned(spec.slices[i].logical_queue_offset, 4096) ||
+        spec.slices[i].logical_queue_offset != next_logical_offset ||
+        next_logical_offset > required_storage_bytes ||
+        spec.slices[i].length >
+          required_storage_bytes - next_logical_offset)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "QP borrowed backing coverage is not canonical");
     status = rdma_queue_queue_range_status(spec.slices[i].mapping,
       spec.slices[i].mapping_offset, spec.slices[i].length, 4096);
     if (!status.ok()) return status;
+    next_logical_offset += spec.slices[i].length;
   end
+  if (next_logical_offset != required_storage_bytes)
+    return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                             "QP borrowed backing does not cover the ring");
   return rdma_status::success();
 endfunction
 
@@ -478,6 +496,8 @@ class rdma_create_qp_req extends rdma_semantic_request;
 
   virtual function rdma_status validate();
     rdma_status status;
+    longint unsigned sq_storage_bytes;
+    longint unsigned rq_storage_bytes;
 
     status = super.validate();
     if (!status.ok())
@@ -493,11 +513,15 @@ class rdma_create_qp_req extends rdma_semantic_request;
     if (max_send_sge == 0 || max_recv_sge == 0)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "QP maximum SGE count is zero");
+    sq_storage_bytes = ((longint'(sq_depth) * 64 + 4095) / 4096) * 4096;
+    rq_storage_bytes = ((longint'(rq_depth) * 64 + 4095) / 4096) * 4096;
     status = rdma_qp_backing_spec_status(sq_backing,
-                                         RDMA_QUEUE_ROLE_QP_SQ_RING);
+                                         RDMA_QUEUE_ROLE_QP_SQ_RING,
+                                         sq_storage_bytes);
     if (!status.ok()) return status;
     status = rdma_qp_backing_spec_status(rq_backing,
-                                         RDMA_QUEUE_ROLE_QP_RQ_RING);
+                                         RDMA_QUEUE_ROLE_QP_RQ_RING,
+                                         rq_storage_bytes);
     if (!status.ok()) return status;
     if (context_attrs == null)
       return rdma_status::make(RDMA_SC_INVALID_STATE,

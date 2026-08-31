@@ -273,6 +273,90 @@ typedef enum bit [1:0] { RDMA_QP_AMBIG_NONE, RDMA_QP_AMBIG_CREATE,
                          RDMA_QP_AMBIG_MODIFY, RDMA_QP_AMBIG_DELETE }
   rdma_qp_ambiguous_operation_e;
 
+function automatic rdma_status rdma_qp_recovery_mapping_status(
+  rdma_dma_mapping mapping,
+  rdma_function_handle owner,
+  rdma_handle qp_h,
+  string label
+);
+  if (mapping == null)
+    return rdma_status::make(RDMA_SC_INVALID_STATE,
+                             {label, " mapping is missing"});
+  if (mapping.state != RDMA_MAPPING_ACTIVE || mapping.size != 512 ||
+      (mapping.iova.value & 64'h1ff) != 0 ||
+      (mapping.backing_addr.value & 64'h1ff) != 0)
+    return rdma_status::make(RDMA_SC_INVALID_STATE,
+                             {label, " mapping is not active 512-byte authority"});
+  if (mapping.function_h == null ||
+      !mapping.function_h.same_instance(owner))
+    return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                             {label, " mapping Function does not match"});
+  if (mapping.owner_h == null || !mapping.owner_h.same_instance(qp_h))
+    return rdma_status::make(RDMA_SC_INVALID_STATE,
+                             {label, " mapping QP owner does not match"});
+  return rdma_status::success();
+endfunction
+
+function automatic bit rdma_qp_recovery_context_equivalent(
+  rdma_context_backing_ref lhs,
+  rdma_context_backing_ref rhs
+);
+  rdma_queue_slot_token_contract lhs_token;
+  rdma_queue_slot_token_contract rhs_token;
+
+  if (lhs == null || rhs == null || lhs.owner == null || rhs.owner == null ||
+      !lhs.owner.same_instance(rhs.owner) ||
+      lhs.resource_kind != rhs.resource_kind || lhs.local_id != rhs.local_id ||
+      lhs.shadow_pointer_base.value != rhs.shadow_pointer_base.value ||
+      lhs.slot_length != rhs.slot_length ||
+      lhs.shadow_view_offset != rhs.shadow_view_offset ||
+      lhs.shadow_view_length != rhs.shadow_view_length ||
+      lhs.release_complete != rhs.release_complete ||
+      lhs.hmc_ref == null || rhs.hmc_ref == null ||
+      lhs.hmc_ref.owner == null || rhs.hmc_ref.owner == null ||
+      !lhs.hmc_ref.owner.same_instance(rhs.hmc_ref.owner) ||
+      lhs.hmc_ref.object_kind != rhs.hmc_ref.object_kind ||
+      lhs.hmc_ref.address.value != rhs.hmc_ref.address.value ||
+      lhs.hmc_ref.size != rhs.hmc_ref.size ||
+      lhs.hmc_ref.first_pbl_index != rhs.hmc_ref.first_pbl_index ||
+      lhs.hmc_ref.ownership != rhs.hmc_ref.ownership ||
+      lhs.hmc_ref.release_complete != rhs.hmc_ref.release_complete ||
+      !$cast(lhs_token, lhs.slot_token) ||
+      !$cast(rhs_token, rhs.slot_token) ||
+      lhs_token.completion_authority == null ||
+      rhs_token.completion_authority == null ||
+      lhs_token.completion_authority !== rhs_token.completion_authority)
+    return 1'b0;
+  return 1'b1;
+endfunction
+
+function automatic rdma_status rdma_qp_recovery_ref_status(
+  rdma_qp_backing_ref backing_ref,
+  bit role_complete,
+  string label
+);
+  if (backing_ref == null || backing_ref.mapping == null)
+    return rdma_status::make(RDMA_SC_INVALID_STATE,
+                             {label, " backing authority is missing"});
+  if (backing_ref.mapping.state == RDMA_MAPPING_ACTIVE)
+    return rdma_status::success();
+  if (role_complete && backing_ref.mapping.state == RDMA_MAPPING_RELEASED) begin
+    backing_ref.mapping.state = RDMA_MAPPING_ACTIVE;
+    return rdma_status::success();
+  end
+  return rdma_status::make(RDMA_SC_INVALID_STATE,
+                           {label, " pending backing is not active"});
+endfunction
+
+function automatic bit rdma_qp_recovery_opcode_equivalent(
+  rdma_cmq_opcode_key lhs,
+  rdma_cmq_opcode_key rhs
+);
+  return lhs != null && rhs != null &&
+         lhs.profile_name == rhs.profile_name && lhs.opcode == rhs.opcode &&
+         lhs.variant == rhs.variant;
+endfunction
+
 class rdma_qp_recovery_state extends uvm_object;
   `uvm_object_utils(rdma_qp_recovery_state)
   rdma_qp_recovery_intent_e intent;
@@ -310,6 +394,10 @@ class rdma_qp_recovery_state extends uvm_object;
 
   virtual function rdma_status validate();
     rdma_status status;
+    rdma_qp_backing_plan validation_plan;
+    uvm_object cloned_plan_object;
+    rdma_handle recovery_qp_h;
+
     if (!(intent inside {RDMA_QP_RECOVER_CREATE_ROLLBACK,
                          RDMA_QP_RECOVER_MODIFY_RECONCILE,
                          RDMA_QP_RECOVER_NORMAL_DESTROY}) ||
@@ -320,15 +408,221 @@ class rdma_qp_recovery_state extends uvm_object;
     if (qp_plan == null || context_ref == null)
       return rdma_status::make(RDMA_SC_INVALID_STATE,
                                "QP recovery authority is incomplete");
-    status = qp_plan.validate(); if (!status.ok()) return status;
     status = context_ref.validate(); if (!status.ok()) return status;
     if (context_ref.resource_kind != RDMA_RESOURCE_QP)
       return rdma_status::make(RDMA_SC_INVALID_STATE, "QP recovery context invalid");
-    if (prior_qpc != null) begin status = prior_qpc.validate(); if (!status.ok()) return status; end
-    if (candidate_qpc != null) begin status = candidate_qpc.validate(); if (!status.ok()) return status; end
-    if (ambiguous_operation != RDMA_QP_AMBIG_NONE && ambiguous_ticket == null)
+    if (!rdma_qp_recovery_context_equivalent(context_ref,
+                                              qp_plan.context_ref))
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "QP recovery context does not equal the plan context authority"
+      );
+    for (int unsigned i = 0; i < RDMA_QUEUE_ROLE_QP_SQ_RING; i++) begin
+      if (role_complete[i])
+        return rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "QP recovery progress uses a legacy queue role"
+        );
+    end
+    cloned_plan_object = qp_plan.clone();
+    if (cloned_plan_object == null ||
+        !$cast(validation_plan, cloned_plan_object))
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "QP recovery plan clone failed");
+    status = rdma_qp_recovery_ref_status(
+      validation_plan.sq_ref,
+      role_complete[RDMA_QUEUE_ROLE_QP_SQ_RING], "QP recovery SQ"
+    );
+    if (!status.ok()) return status;
+    status = rdma_qp_recovery_ref_status(
+      validation_plan.sq_pd_ref,
+      role_complete[RDMA_QUEUE_ROLE_QP_SQ_PD], "QP recovery SQ PD"
+    );
+    if (!status.ok()) return status;
+    if (validation_plan.rq_source_h == null) begin
+      status = rdma_qp_recovery_ref_status(
+        validation_plan.rq_ref,
+        role_complete[RDMA_QUEUE_ROLE_QP_RQ_RING], "QP recovery RQ"
+      );
+      if (!status.ok()) return status;
+      status = rdma_qp_recovery_ref_status(
+        validation_plan.rq_pd_ref,
+        role_complete[RDMA_QUEUE_ROLE_QP_RQ_PD], "QP recovery RQ PD"
+      );
+      if (!status.ok()) return status;
+    end
+    foreach (validation_plan.urc_refs[i]) begin
+      status = rdma_qp_recovery_ref_status(
+        validation_plan.urc_refs[i],
+        role_complete[validation_plan.urc_refs[i].role], "QP recovery URC"
+      );
+      if (!status.ok()) return status;
+    end
+    status = validation_plan.validate();
+    if (!status.ok()) return status;
+    if (qp_plan.sq_ref == null || qp_plan.sq_ref.mapping == null ||
+        qp_plan.sq_ref.mapping.owner_h == null ||
+        qp_plan.sq_ref.mapping.owner_h.kind != RDMA_RESOURCE_QP)
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "QP recovery registry owner is missing");
+    recovery_qp_h = qp_plan.sq_ref.mapping.owner_h;
+    status = rdma_handle_owner_status(recovery_qp_h, context_ref.owner);
+    if (!status.ok()) return status;
+    status = rdma_qp_mapping_authority_status(
+      validation_plan.sq_ref, context_ref.owner, recovery_qp_h,
+      "QP recovery SQ"
+    );
+    if (!status.ok()) return status;
+    status = rdma_qp_mapping_authority_status(
+      validation_plan.sq_pd_ref, context_ref.owner, recovery_qp_h,
+      "QP recovery SQ PD"
+    );
+    if (!status.ok()) return status;
+    if (validation_plan.rq_source_h == null) begin
+      status = rdma_qp_mapping_authority_status(
+        validation_plan.rq_ref, context_ref.owner, recovery_qp_h,
+        "QP recovery RQ"
+      );
+      if (!status.ok()) return status;
+      status = rdma_qp_mapping_authority_status(
+        validation_plan.rq_pd_ref, context_ref.owner, recovery_qp_h,
+        "QP recovery RQ PD"
+      );
+      if (!status.ok()) return status;
+    end
+    else begin
+      status = rdma_handle_owner_status(validation_plan.rq_source_h,
+                                        context_ref.owner);
+      if (!status.ok()) return status;
+    end
+    foreach (validation_plan.urc_refs[i]) begin
+      status = rdma_qp_mapping_authority_status(
+        validation_plan.urc_refs[i], context_ref.owner, recovery_qp_h,
+        "QP recovery URC"
+      );
+      if (!status.ok()) return status;
+    end
+    if ((intent == RDMA_QP_RECOVER_CREATE_ROLLBACK &&
+         ambiguous_operation == RDMA_QP_AMBIG_MODIFY) ||
+        (intent == RDMA_QP_RECOVER_MODIFY_RECONCILE &&
+         !(ambiguous_operation inside {RDMA_QP_AMBIG_NONE,
+                                        RDMA_QP_AMBIG_MODIFY})) ||
+        (intent == RDMA_QP_RECOVER_NORMAL_DESTROY &&
+         ambiguous_operation == RDMA_QP_AMBIG_CREATE))
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "QP recovery intent and ambiguous operation do not match"
+      );
+    if (intent == RDMA_QP_RECOVER_MODIFY_RECONCILE &&
+        (prior_qpc == null || candidate_qpc == null))
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "modify recovery lacks prior or candidate QPC authority"
+      );
+    if (intent == RDMA_QP_RECOVER_NORMAL_DESTROY && prior_qpc == null)
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "destroy recovery lacks prior QPC authority");
+    if (intent == RDMA_QP_RECOVER_CREATE_ROLLBACK &&
+        ambiguous_operation != RDMA_QP_AMBIG_NONE && candidate_qpc == null)
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "ambiguous create rollback lacks candidate QPC authority"
+      );
+    if (prior_qpc != null) begin
+      status = prior_qpc.validate();
+      if (!status.ok()) return status;
+      if (prior_qpc.qp_h == null ||
+          !prior_qpc.qp_h.same_instance(recovery_qp_h))
+        return rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "prior QPC does not belong to the recovered QP"
+        );
+    end
+    if (candidate_qpc != null) begin
+      status = candidate_qpc.validate();
+      if (!status.ok()) return status;
+      if (candidate_qpc.qp_h == null ||
+          !candidate_qpc.qp_h.same_instance(recovery_qp_h))
+        return rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "candidate QPC does not belong to the recovered QP"
+        );
+    end
+    if (create_opcode == null || modify_opcode == null ||
+        delete_opcode == null || query_opcode == null)
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "QP recovery opcode authority is incomplete");
+    status = create_opcode.validate(); if (!status.ok()) return status;
+    status = modify_opcode.validate(); if (!status.ok()) return status;
+    status = delete_opcode.validate(); if (!status.ok()) return status;
+    status = query_opcode.validate(); if (!status.ok()) return status;
+    if (ambiguous_operation != RDMA_QP_AMBIG_NONE &&
+        ambiguous_ticket == null)
       return rdma_status::make(RDMA_SC_INVALID_STATE,
                                "ambiguous QP recovery lacks ticket");
+    if (ambiguous_ticket != null) begin
+      status = ambiguous_ticket.validate();
+      if (!status.ok()) return status;
+      if (ambiguous_ticket.function_h == null ||
+          !ambiguous_ticket.function_h.same_instance(context_ref.owner))
+        return rdma_status::make(
+          RDMA_SC_INVALID_ARGUMENT,
+          "ambiguous QP recovery ticket Function does not match"
+        );
+      case (ambiguous_operation)
+        RDMA_QP_AMBIG_CREATE:
+          if (!rdma_qp_recovery_opcode_equivalent(
+                ambiguous_ticket.opcode_key, create_opcode
+              ))
+            return rdma_status::make(
+              RDMA_SC_INVALID_STATE,
+              "ambiguous QP create ticket opcode does not match"
+            );
+        RDMA_QP_AMBIG_MODIFY:
+          if (!rdma_qp_recovery_opcode_equivalent(
+                ambiguous_ticket.opcode_key, modify_opcode
+              ))
+            return rdma_status::make(
+              RDMA_SC_INVALID_STATE,
+              "ambiguous QP modify ticket opcode does not match"
+            );
+        RDMA_QP_AMBIG_DELETE:
+          if (!rdma_qp_recovery_opcode_equivalent(
+                ambiguous_ticket.opcode_key, delete_opcode
+              ))
+            return rdma_status::make(
+              RDMA_SC_INVALID_STATE,
+              "ambiguous QP delete ticket opcode does not match"
+            );
+        default:;
+      endcase
+    end
+    if (ambiguous_operation inside {RDMA_QP_AMBIG_CREATE,
+                                    RDMA_QP_AMBIG_MODIFY}) begin
+      status = rdma_qp_recovery_mapping_status(
+        staging_mapping, context_ref.owner, recovery_qp_h,
+        "QP recovery staging"
+      );
+      if (!status.ok()) return status;
+    end
+    else if (staging_mapping != null) begin
+      status = rdma_qp_recovery_mapping_status(
+        staging_mapping, context_ref.owner, recovery_qp_h,
+        "QP recovery staging"
+      );
+      if (!status.ok()) return status;
+    end
+    if (intent == RDMA_QP_RECOVER_MODIFY_RECONCILE &&
+        query_mapping == null)
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "modify recovery lacks query mapping");
+    if (query_mapping != null) begin
+      status = rdma_qp_recovery_mapping_status(
+        query_mapping, context_ref.owner, recovery_qp_h,
+        "QP recovery query"
+      );
+      if (!status.ok()) return status;
+    end
     return rdma_status::success();
   endfunction
 

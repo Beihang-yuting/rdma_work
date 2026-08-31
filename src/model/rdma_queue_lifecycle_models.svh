@@ -928,7 +928,7 @@ class rdma_qp_ring_layout extends uvm_object;
   int unsigned depth;
   longint unsigned logical_bytes;
   longint unsigned storage_bytes;
-  bit [1:0] object_mode;
+  rdma_object_mode_e object_mode;
 
   function new(string name = "rdma_qp_ring_layout");
     super.new(name);
@@ -937,7 +937,7 @@ class rdma_qp_ring_layout extends uvm_object;
     depth = 0;
     logical_bytes = 0;
     storage_bytes = 0;
-    object_mode = 2'd1;
+    object_mode = RDMA_OBJECT_INDIRECT_4K;
   endfunction
 
   virtual function void do_copy(uvm_object rhs);
@@ -970,7 +970,7 @@ class rdma_qp_ring_layout extends uvm_object;
     if (storage_bytes != expected_storage || storage_bytes > 2 * 1024 * 1024)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "QP ring storage geometry is invalid");
-    if (object_mode != 2'd1)
+    if (object_mode != RDMA_OBJECT_INDIRECT_4K)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "QP ring mode must be indirect 4 KiB");
     return rdma_status::success();
