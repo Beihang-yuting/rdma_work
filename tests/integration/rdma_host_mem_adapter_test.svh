@@ -401,6 +401,227 @@ class rdma_host_mem_adapter_test extends uvm_test;
                  $sformatf("failed read returned %0d bytes", data.size()))
   endfunction
 
+  task automatic run_queue_host_mem_fixture();
+    $unit::host_mem_manager queue_hm;
+    rdma_host_mem_adapter queue_adapter;
+    rdma_resource_manager resource_manager;
+    rdma_cq_lifecycle_policy cq_policy;
+    rdma_create_cq_req cq_request;
+    rdma_queue_resource queue_resource;
+    rdma_function_binding binding;
+    rdma_handle resource_h;
+    rdma_queue_backing_planner planner;
+    rdma_queue_preflight preflight;
+    rdma_queue_backing_spec backing_spec;
+    rdma_queue_backing_plan plan;
+    rdma_queue_backing_ref ring_ref;
+    rdma_queue_backing_ref pd_ref;
+    rdma_xtr_v1_queue_pd_codec pd_codec;
+    rdma_status status;
+    bit complete;
+    bit release_done;
+    int unsigned leak_count;
+    byte pd_bytes[];
+    rdma_bdf_t saved_bdf;
+    bit saved_pasid_valid;
+    bit [19:0] saved_pasid;
+    bit saved_domain_valid;
+    bit [31:0] saved_domain_id;
+    rdma_iova_t saved_iova;
+    rdma_backing_addr_t saved_backing;
+    rdma_function_handle saved_function;
+    rdma_handle saved_owner;
+    rdma_iova_t saved_pd_iova;
+    rdma_backing_addr_t saved_pd_backing;
+    rdma_function_handle saved_pd_function;
+    rdma_handle saved_pd_owner;
+    rdma_dma_direction_e saved_pd_direction;
+
+    queue_hm = $unit::host_mem_manager::type_id::create("queue_hm");
+    queue_hm.init_region(64'h0000_0008_0000_0000,
+                         64'h0000_0008_00ff_ffff);
+    queue_adapter = rdma_host_mem_adapter::type_id::create(
+      "queue_host_mem_adapter"
+    );
+    queue_adapter.mem = queue_hm;
+    queue_adapter.iova_base = 64'h0000_0010_0000_0000;
+
+    binding = make_active_binding("queue_fixture_binding");
+    planner = rdma_queue_backing_planner::type_id::create(
+      "queue_fixture_planner"
+    );
+    expect_status("QUEUE_CONFIGURE", planner.configure(queue_adapter),
+                  RDMA_SC_OK);
+    backing_spec = rdma_queue_backing_spec::type_id::create(
+      "queue_fixture_backing_spec"
+    );
+    backing_spec.mode = RDMA_QUEUE_BACKING_OWNED;
+    resource_manager = rdma_resource_manager::type_id::create(
+      "queue_fixture_resource_manager"
+    );
+    cq_policy = rdma_cq_lifecycle_policy::type_id::create(
+      "queue_fixture_cq_policy"
+    );
+    cq_request = rdma_create_cq_req::type_id::create(
+      "queue_fixture_cq_request"
+    );
+    cq_request.owner = binding.make_handle();
+    cq_request.depth = 64;
+    cq_request.cqe_size_bytes = 64;
+    cq_request.ring_backing = backing_spec;
+    expect_status("QUEUE_PREFLIGHT",
+                  cq_policy.preflight(binding, cq_request, resource_manager,
+                                      preflight), RDMA_SC_OK);
+    expect_status("QUEUE_RESERVE",
+                  cq_policy.reserve_resource(resource_manager, binding,
+                                             cq_request, queue_resource),
+                  RDMA_SC_OK);
+    if (queue_resource == null || queue_resource.handle == null)
+      `uvm_fatal("QUEUE_RESERVE", "CQ reservation returned no resource")
+    resource_h = queue_resource.handle;
+    plan = null;
+    expect_status("QUEUE_MATERIALIZE",
+                  planner.materialize(binding, preflight, resource_h, plan),
+                  RDMA_SC_OK);
+    if (plan == null || plan.refs.size() != 2 || plan.rings.size() != 1)
+      `uvm_fatal("QUEUE_PLAN", "queue planner did not produce CQ refs")
+
+    ring_ref = null;
+    pd_ref = null;
+    foreach (plan.refs[i]) begin
+      if (plan.refs[i].role == RDMA_QUEUE_ROLE_CQ_RING)
+        ring_ref = plan.refs[i];
+      if (plan.refs[i].role == RDMA_QUEUE_ROLE_CQ_PD)
+        pd_ref = plan.refs[i];
+    end
+    if (ring_ref == null || pd_ref == null || ring_ref.mapping == null ||
+        pd_ref.mapping == null || plan.rings[0].pages.size() != 1)
+      `uvm_fatal("QUEUE_REFS", "queue planner role refs are incomplete")
+    if (ring_ref.mapping.backing_addr.value <= 64'hffff_ffff ||
+        pd_ref.mapping.backing_addr.value <= 64'hffff_ffff)
+      `uvm_error("QUEUE_BACKING_WIDTH", "queue backing address must exercise 64-bit range")
+
+    saved_bdf = binding.queue_dma.requester_bdf;
+    saved_pasid_valid = binding.queue_dma.pasid_valid;
+    saved_pasid = binding.queue_dma.pasid;
+    saved_domain_valid = binding.queue_dma.dma_domain_valid;
+    saved_domain_id = binding.queue_dma.dma_domain_id;
+    saved_iova = ring_ref.mapping.iova;
+    saved_backing = ring_ref.mapping.backing_addr;
+    saved_function = ring_ref.mapping.function_h;
+    saved_owner = ring_ref.mapping.owner_h;
+    saved_pd_iova = pd_ref.mapping.iova;
+    saved_pd_backing = pd_ref.mapping.backing_addr;
+    saved_pd_function = pd_ref.mapping.function_h;
+    saved_pd_owner = pd_ref.mapping.owner_h;
+    saved_pd_direction = pd_ref.mapping.direction;
+    if (ring_ref.mapping.iova.value == 0 ||
+        ring_ref.mapping.iova.value == ring_ref.mapping.backing_addr.value ||
+        plan.rings[0].pages[0].page_iova.value == 0 ||
+        plan.rings[0].pages[0].page_iova.value ==
+          ring_ref.mapping.backing_addr.value)
+      `uvm_error("QUEUE_IOVA", "queue IOVA must be nonzero and translated")
+    if (ring_ref.mapping.requester_bdf != saved_bdf ||
+        ring_ref.mapping.pasid_valid != saved_pasid_valid ||
+        ring_ref.mapping.pasid != saved_pasid ||
+        ring_ref.mapping.dma_domain_valid != saved_domain_valid ||
+        ring_ref.mapping.dma_domain_id != saved_domain_id ||
+        ring_ref.mapping.direction != RDMA_DMA_DEVICE_WRITE ||
+        ring_ref.mapping.owner_h == null ||
+        !ring_ref.mapping.owner_h.same_instance(resource_h) ||
+        ring_ref.mapping.owner_h == resource_h ||
+        ring_ref.mapping.function_h == null ||
+        !ring_ref.mapping.function_h.same_instance(binding.owner_h) ||
+        ring_ref.mapping.function_h == binding.owner_h ||
+        pd_ref.mapping.requester_bdf != saved_bdf ||
+        pd_ref.mapping.pasid_valid != saved_pasid_valid ||
+        pd_ref.mapping.pasid != saved_pasid ||
+        pd_ref.mapping.dma_domain_valid != saved_domain_valid ||
+        pd_ref.mapping.dma_domain_id != saved_domain_id ||
+        pd_ref.mapping.direction != RDMA_DMA_DEVICE_READ ||
+        pd_ref.mapping.owner_h == null ||
+        !pd_ref.mapping.owner_h.same_instance(resource_h) ||
+        pd_ref.mapping.owner_h == resource_h ||
+        pd_ref.mapping.function_h == null ||
+        !pd_ref.mapping.function_h.same_instance(binding.owner_h) ||
+        pd_ref.mapping.function_h == binding.owner_h)
+      `uvm_error("QUEUE_AUTHORITY", "queue mapping authority is not a deep copy")
+
+    pd_codec = rdma_xtr_v1_queue_pd_codec::type_id::create(
+      "queue_fixture_pd_codec"
+    );
+    expect_status("QUEUE_INITIALIZE",
+                  planner.initialize_payload_and_pd(binding, plan, pd_codec),
+                  RDMA_SC_OK);
+    status = queue_adapter.read(pd_ref.mapping, pd_ref.mapping_offset, 8,
+                                pd_bytes);
+    expect_status("QUEUE_PD_READ", status, RDMA_SC_OK);
+    if (pd_bytes.size() != 8 ||
+        pd_bytes[0] != plan.rings[0].pages[0].page_iova.value[63:56] ||
+        pd_bytes[7][0] != 1'b1)
+      `uvm_error("QUEUE_PD_READ", "PD did not encode the payload IOVA")
+
+    // Mutating the caller's binding after allocation must not alter authority.
+    binding.queue_dma.requester_bdf.bus = binding.queue_dma.requester_bdf.bus + 1'b1;
+    binding.queue_dma.pasid_valid = ~binding.queue_dma.pasid_valid;
+    binding.queue_dma.pasid = binding.queue_dma.pasid ^ 20'h1;
+    binding.queue_dma.dma_domain_valid = ~binding.queue_dma.dma_domain_valid;
+    binding.queue_dma.dma_domain_id = binding.queue_dma.dma_domain_id ^ 32'h1;
+    if (ring_ref.mapping.requester_bdf != saved_bdf ||
+        ring_ref.mapping.pasid_valid != saved_pasid_valid ||
+        ring_ref.mapping.pasid != saved_pasid ||
+        ring_ref.mapping.dma_domain_valid != saved_domain_valid ||
+        ring_ref.mapping.dma_domain_id != saved_domain_id ||
+        ring_ref.mapping.direction != RDMA_DMA_DEVICE_WRITE ||
+        ring_ref.mapping.iova != saved_iova ||
+        ring_ref.mapping.backing_addr != saved_backing ||
+        !ring_ref.mapping.function_h.same_instance(saved_function) ||
+        !ring_ref.mapping.owner_h.same_instance(saved_owner) ||
+        pd_ref.mapping.requester_bdf != saved_bdf ||
+        pd_ref.mapping.pasid_valid != saved_pasid_valid ||
+        pd_ref.mapping.pasid != saved_pasid ||
+        pd_ref.mapping.dma_domain_valid != saved_domain_valid ||
+        pd_ref.mapping.dma_domain_id != saved_domain_id ||
+        pd_ref.mapping.direction != saved_pd_direction ||
+        pd_ref.mapping.iova != saved_pd_iova ||
+        pd_ref.mapping.backing_addr != saved_pd_backing ||
+        !pd_ref.mapping.function_h.same_instance(saved_pd_function) ||
+        !pd_ref.mapping.owner_h.same_instance(saved_pd_owner))
+      `uvm_error("QUEUE_AUTHORITY_MUTATION",
+                 "mapping authority changed with caller context")
+
+    complete = 1'b0;
+    expect_status("QUEUE_PD_CLEANUP",
+                  planner.cleanup_local_role(pd_ref, complete), RDMA_SC_OK);
+    if (!complete)
+      `uvm_error("QUEUE_PD_CLEANUP", "PD cleanup did not complete")
+    release_done = 1'b0;
+    expect_status("QUEUE_PD_RELEASE_COMPLETION",
+                  pd_ref.mapping.release_completion_status(release_done),
+                  RDMA_SC_OK);
+    if (!release_done)
+      `uvm_error("QUEUE_PD_RELEASE_COMPLETION",
+                 "PD release completion was not observed")
+    complete = 1'b0;
+    expect_status("QUEUE_RING_CLEANUP",
+                  planner.cleanup_local_role(ring_ref, complete), RDMA_SC_OK);
+    if (!complete)
+      `uvm_error("QUEUE_RING_CLEANUP", "ring cleanup did not complete")
+    release_done = 1'b0;
+    expect_status("QUEUE_RING_RELEASE_COMPLETION",
+                  ring_ref.mapping.release_completion_status(release_done),
+                  RDMA_SC_OK);
+    if (!release_done)
+      `uvm_error("QUEUE_RING_RELEASE_COMPLETION",
+                 "ring release completion was not observed")
+    status = queue_adapter.check_leaks(leak_count);
+    expect_status("QUEUE_LEAKS", status, RDMA_SC_OK);
+    if (leak_count != 0)
+      `uvm_error("QUEUE_LEAKS", "queue fixture leaked host backing")
+    expect_status("QUEUE_RESERVATION_RELEASE",
+                  resource_manager.release_reserved(resource_h), RDMA_SC_OK);
+  endtask
+
   task run_phase(uvm_phase phase);
     $unit::host_mem_manager hm;
     $unit::host_mem_manager offset_hm;
@@ -457,6 +678,8 @@ class rdma_host_mem_adapter_test extends uvm_test;
     byte external_rd[];
 
     phase.raise_objection(this);
+
+    run_queue_host_mem_fixture();
 
     check_manager_owned_mapping_identity();
 
