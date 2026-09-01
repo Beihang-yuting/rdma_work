@@ -4706,6 +4706,7 @@ class rdma_resource_manager extends uvm_object;
     bit progress_changed;
     bit setting_ambiguity;
     bit clearing_ambiguity;
+    bit refreshing_pending;
     bit normalizing_occ_role;
     bit stale_recovery_allowed;
     bit preprogram_publication;
@@ -4729,8 +4730,10 @@ class rdma_resource_manager extends uvm_object;
           registry[key].handle != null &&
           same_handle_instance(registry[key].handle, qp_h) &&
           $cast(retained_qp, registry[key])) begin
-        if (recovery.ambiguous_operation != RDMA_QP_AMBIG_NONE &&
-            recovery.ambiguous_ticket != null) begin
+        if ((recovery.ambiguous_operation != RDMA_QP_AMBIG_NONE ||
+             recovery.has_pending_hardware_step) &&
+            (recovery.ambiguous_ticket != null ||
+             recovery.has_pending_hardware_step)) begin
           status = recovery.validate();
           stale_recovery_allowed = status != null && status.ok();
         end
@@ -4904,9 +4907,9 @@ class rdma_resource_manager extends uvm_object;
       setting_ambiguity =
         existing_recovery.ambiguous_operation == RDMA_QP_AMBIG_NONE &&
         existing_recovery.ambiguous_ticket == null &&
-        recovery_copy.ambiguous_operation inside {
-          RDMA_QP_AMBIG_OCC_FLUSH, RDMA_QP_AMBIG_DELETE
-        } && recovery_copy.ambiguous_ticket != null;
+        recovery_copy.ambiguous_operation != RDMA_QP_AMBIG_NONE &&
+        (recovery_copy.ambiguous_ticket != null ||
+         recovery_copy.has_pending_hardware_step);
       clearing_ambiguity =
         existing_recovery.ambiguous_operation != RDMA_QP_AMBIG_NONE &&
         (existing_recovery.ambiguous_ticket != null ||
@@ -4920,6 +4923,18 @@ class rdma_resource_manager extends uvm_object;
           RDMA_QUEUE_ROLE_QP_SQ_PD, RDMA_QUEUE_ROLE_QP_RQ_PD
         } &&
         recovery_copy.ambiguous_role == RDMA_QUEUE_ROLE_QP_SQ_RING;
+      // A retry may need to refresh an existing ticketless ambiguity marker
+      // (notably destroy ERROR MODIFY) when the adapter again returns no
+      // ticket.  Preserve the operation/role authority while allowing the
+      // marker to be durably re-persisted; no progress or retained authority
+      // may change in this transition.
+      refreshing_pending =
+        existing_recovery.has_pending_hardware_step &&
+        recovery_copy.ambiguous_operation ==
+          existing_recovery.ambiguous_operation &&
+        recovery_copy.ambiguous_role == existing_recovery.ambiguous_role &&
+        (recovery_copy.has_pending_hardware_step ||
+         recovery_copy.ambiguous_ticket != null);
       progress_changed = 1'b0;
       foreach (existing_recovery.role_complete[i]) begin
         if (existing_recovery.role_complete[i] !=
@@ -4946,7 +4961,7 @@ class rdma_resource_manager extends uvm_object;
           end
         end
       end
-      if (!setting_ambiguity && !clearing_ambiguity)
+      if (!setting_ambiguity && !clearing_ambiguity && !refreshing_pending)
         return rdma_status::make(
           RDMA_SC_INVALID_STATE,
           "QP ERROR ambiguity transition is out of order"
@@ -4980,7 +4995,8 @@ class rdma_resource_manager extends uvm_object;
           recovery_copy.query_mapping_recovery_only !=
             existing_recovery.query_mapping_recovery_only ||
           (recovery_copy.has_pending_hardware_step !=
-            existing_recovery.has_pending_hardware_step && !clearing_ambiguity) ||
+            existing_recovery.has_pending_hardware_step &&
+            !clearing_ambiguity && !refreshing_pending) ||
           recovery_copy.query_mapping != null &&
             (recovery_copy.query_mapping_recovery_only ?
               !same_recovery_mapping_value(

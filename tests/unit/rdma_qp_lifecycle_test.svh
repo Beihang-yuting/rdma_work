@@ -1009,6 +1009,40 @@ class rdma_qp_ticketless_destroy_cmq extends rdma_mock_cmq_port;
   endtask
 endclass
 
+// Inject a generation rebind immediately after the destroy ERROR MODIFY
+// command returns.  The destroy executor must fence this side-effect
+// boundary, stop before issuing OCC/DELETE, and retain ERROR recovery
+// authority for the old generation.
+class rdma_qp_destroy_rebind_cmq extends rdma_mock_cmq_port;
+  `uvm_object_utils(rdma_qp_destroy_rebind_cmq)
+  rdma_function_binding binding_target;
+  bit rebound;
+  bit armed;
+
+  function new(string name = "rdma_qp_destroy_rebind_cmq");
+    super.new(name);
+    binding_target = null;
+    rebound = 1'b0;
+    armed = 1'b0;
+  endfunction
+
+  virtual task execute(
+    rdma_cmq_command_desc command,
+    output rdma_cmq_ticket ticket,
+    output rdma_cmq_completion completion,
+    output rdma_status status
+  );
+    super.execute(command, ticket, completion, status);
+    if (armed && !rebound && binding_target != null && command != null &&
+        command.opcode_key != null &&
+        command.opcode_key.opcode == XTR_V1_OP_QPC_MODIFY) begin
+      binding_target.generation++;
+      binding_target.owner_h = binding_target.make_handle();
+      rebound = 1'b1;
+    end
+  endtask
+endclass
+
 class rdma_qp_lifecycle_test extends uvm_test;
   `uvm_component_utils(rdma_qp_lifecycle_test)
 
@@ -3674,7 +3708,57 @@ class rdma_qp_lifecycle_test extends uvm_test;
     check_modify_query_malformed_pending();
     check_destroy_lifecycle();
     check_destroy_ticketless_ambiguity();
+    check_destroy_stale_generation_boundary();
     phase.drop_objection(this);
+  endtask
+
+  task automatic check_destroy_stale_generation_boundary();
+    rdma_mock_host_mem mem;
+    rdma_function_binding binding;
+    rdma_qp_fault_manager manager;
+    rdma_mock_context_backing contexts;
+    rdma_qp_destroy_rebind_cmq cmq;
+    rdma_qp_lifecycle_executor executor;
+    rdma_pd pd;
+    rdma_cq cq;
+    rdma_create_qp_req create_req;
+    rdma_destroy_resource_req destroy_req;
+    rdma_qp qp;
+    rdma_control_result result;
+    rdma_recovery_record recovery;
+    int unsigned calls_before;
+
+    mem = rdma_mock_host_mem::type_id::create("destroy_stale_mem");
+    manager = rdma_qp_fault_manager::type_id::create("destroy_stale_manager");
+    contexts = rdma_mock_context_backing::type_id::create("destroy_stale_contexts");
+    cmq = rdma_qp_destroy_rebind_cmq::type_id::create("destroy_stale_cmq");
+    executor = rdma_qp_lifecycle_executor::type_id::create("destroy_stale_executor");
+    setup_custom_qp_environment("destroy_stale", mem, manager, contexts,
+                                cmq, executor, binding, pd, cq);
+    cmq.binding_target = binding;
+    create_req = make_request("destroy_stale_create", binding, pd, cq,
+                              RDMA_TRANSPORT_RC);
+    executor.create_locked(binding, binding.make_handle(), create_req, 867,
+                           qp, result);
+    cmq.armed = 1'b1;
+    destroy_req = rdma_destroy_resource_req::type_id::create("destroy_stale_req");
+    destroy_req.owner = binding.make_handle();
+    destroy_req.target_h = rdma_clone_handle_value(qp.handle,
+                                                    "destroy stale target");
+    calls_before = cmq.calls.size();
+    executor.destroy_locked(binding, binding.make_handle(), destroy_req, 868,
+                            result);
+    recovery = null;
+    if (result != null && result.resource_h != null)
+      void'(manager.raw_recovery(result.resource_h, recovery));
+    if (result == null || result.status == null ||
+        result.status.code != RDMA_SC_RECOVERY_REQUIRED ||
+        !result.recovery_required || recovery == null ||
+        recovery.qp_recovery == null ||
+        recovery.qp_recovery.ambiguous_operation != RDMA_QP_AMBIG_MODIFY ||
+        cmq.calls.size() != calls_before + 1)
+      `uvm_error("QP_DESTROY_STALE_BOUNDARY",
+                 "stale generation after destroy side effect was not fenced")
   endtask
 
   task automatic check_destroy_lifecycle();
