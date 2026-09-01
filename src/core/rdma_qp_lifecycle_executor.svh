@@ -1249,7 +1249,7 @@ class rdma_qp_lifecycle_executor extends uvm_object;
     recovery = rdma_qp_recovery_state::type_id::create("qp_modify_recovery");
     if (authoritative == null || authoritative.qp_plan == null ||
         authoritative.qp_plan.context_ref == null || prior_qpc == null ||
-        candidate_qpc == null || ticket == null)
+        candidate_qpc == null)
       return invalid_argument("QP modify recovery authority is incomplete");
     recovery.intent = RDMA_QP_RECOVER_MODIFY_RECONCILE;
     recovery.ambiguous_operation = RDMA_QP_AMBIG_MODIFY;
@@ -1269,6 +1269,8 @@ class rdma_qp_lifecycle_executor extends uvm_object;
     recovery.ambiguous_ticket = rdma_cmq_clone_ticket_value(
       ticket, "QP modify recovery"
     );
+    if (ticket == null)
+      recovery.has_pending_hardware_step = 1'b1;
     return normalize_status(recovery.validate(),
                             "QP modify recovery validation returned null");
   endfunction
@@ -2284,12 +2286,10 @@ class rdma_qp_lifecycle_executor extends uvm_object;
         rdma_status release_status;
         release_status = release_mapping_opaque(staging, "QP failed staging", release_complete);
         if (!release_status.ok() || !release_complete) begin
-          if (ticket != null) begin
-            retain_modify_recovery(authoritative, prior_qpc, candidate_qpc,
-                                   staging, null, 1'b0, ticket, status, result);
-            qp = null;
-            return;
-          end
+          retain_modify_recovery(authoritative, prior_qpc, candidate_qpc,
+                                 staging, null, 1'b0, ticket, status, result);
+          qp = null;
+          if (result.recovery_required) return;
           append_rollback_status(result, release_status);
         end
       end
@@ -2331,7 +2331,7 @@ class rdma_qp_lifecycle_executor extends uvm_object;
       // Hardware has accepted MODIFY at this point; publication failure must
       // therefore become durable ERROR recovery authority rather than a plain
       // definitive error that forgets the candidate image.
-      if (ticket != null) begin
+      begin
         rdma_dma_mapping recovery_query;
         rdma_dma_request_context recovery_ctx;
         recovery_query = null;
@@ -2340,10 +2340,9 @@ class rdma_qp_lifecycle_executor extends uvm_object;
           void'(host_mem.allocate(recovery_ctx, 512, 512,
                                   RDMA_DMA_DEVICE_WRITE, recovery_query));
         end
-        if (recovery_query != null)
-          retain_modify_recovery(authoritative, prior_qpc, candidate_qpc,
-                                 null, recovery_query, 1'b0, ticket, status,
-                                 result);
+        retain_modify_recovery(authoritative, prior_qpc, candidate_qpc,
+                               null, recovery_query, 1'b0, ticket, status,
+                               result);
       end
       qp = null;
       if (!result.recovery_required) publish_primary(result, status);
