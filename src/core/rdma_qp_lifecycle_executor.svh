@@ -2334,15 +2334,36 @@ class rdma_qp_lifecycle_executor extends uvm_object;
       begin
         rdma_dma_mapping recovery_query;
         rdma_dma_request_context recovery_ctx;
+        bit recovery_query_valid;
+        bit recovery_query_only;
+        bit recovery_release_complete;
+        rdma_status publication_status;
+        publication_status = rdma_cmq_clone_status_value(status);
         recovery_query = null;
+        recovery_query_valid = 1'b0;
+        recovery_query_only = 1'b0;
         if (make_dma_context(binding, authoritative.handle,
                              RDMA_QUEUE_ROLE_QP_SQ_PD, recovery_ctx).ok()) begin
-          void'(host_mem.allocate(recovery_ctx, 512, 512,
-                                  RDMA_DMA_DEVICE_WRITE, recovery_query));
+          status = host_mem.allocate(recovery_ctx, 512, 512,
+                                     RDMA_DMA_DEVICE_WRITE, recovery_query);
+          if (status != null && status.ok() && recovery_query != null &&
+              recovery_query.size == 512 &&
+              (recovery_query.iova.value & 64'h1ff) == 0 &&
+              (recovery_query.backing_addr.value & 64'h1ff) == 0)
+            recovery_query_valid = 1'b1;
+        end
+        if (!recovery_query_valid && recovery_query != null) begin
+          status = release_mapping_opaque(recovery_query,
+                                           "QP publication recovery query",
+                                           recovery_release_complete);
+          if (recovery_release_complete)
+            recovery_query = null;
+          else
+            recovery_query_only = 1'b1;
         end
         retain_modify_recovery(authoritative, prior_qpc, candidate_qpc,
-                               null, recovery_query, 1'b0, ticket, status,
-                               result);
+                               null, recovery_query, recovery_query_only, ticket,
+                               publication_status, result);
       end
       qp = null;
       if (!result.recovery_required) publish_primary(result, status);
@@ -3014,10 +3035,20 @@ class rdma_qp_lifecycle_executor extends uvm_object;
           return;
         end
       end
-      terminal_known = 1'b0;
-      completion = null;
-      cmq.reconcile(recovery.ambiguous_ticket, terminal_known, completion,
-                    status);
+      if (recovery.ambiguous_ticket == null) begin
+        // A ticketless record cannot be reconciled through CMQ.  Retained
+        // staging means the candidate was not authoritative; no staging means
+        // hardware accepted the candidate before publication failed.
+        candidate_selected = recovery.staging_mapping == null;
+        resolved_qpc = candidate_selected ? recovery.candidate_qpc :
+                       recovery.prior_qpc;
+        terminal_known = 1'b1;
+      end
+      else begin
+        terminal_known = 1'b0;
+        completion = null;
+        cmq.reconcile(recovery.ambiguous_ticket, terminal_known, completion,
+                      status);
       status = normalize_status(status, "QP modify reconciliation returned null");
       fence_status = live_binding_fence(binding, expected_owner);
       if (!fence_status.ok()) status = fence_status;
@@ -3109,6 +3140,7 @@ class rdma_qp_lifecycle_executor extends uvm_object;
             RDMA_SC_RECOVERY_REQUIRED, "QP query did not prove a terminal image"));
           return;
         end
+      end
       end
     end
     else if (status.ok()) begin

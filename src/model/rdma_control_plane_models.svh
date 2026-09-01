@@ -417,6 +417,11 @@ class rdma_qp_recovery_state extends uvm_object;
   rdma_context_backing_ref context_ref;
   rdma_dma_mapping staging_mapping;
   rdma_dma_mapping query_mapping;
+  // Ticketless modify failures still carry a pending hardware/cleanup step.
+  // This marker permits durable ERROR recovery authority when the adapter did
+  // not return a CMQ ticket (for example after encode/write or staging-release
+  // failure).
+  bit has_pending_hardware_step;
   // A query allocation can fail after returning an adapter-owned mapping with
   // malformed public geometry.  Keep that capability in a recovery-only form
   // until its opaque release completion is proven; it must never be used as a
@@ -446,6 +451,7 @@ class rdma_qp_recovery_state extends uvm_object;
     context_ref = null;
     staging_mapping = null;
     query_mapping = null;
+    has_pending_hardware_step = 1'b0;
     query_mapping_recovery_only = 1'b0;
     error_modify_complete = 1'b0;
     delete_complete = 1'b0;
@@ -767,7 +773,7 @@ class rdma_qp_recovery_state extends uvm_object;
     status = query_opcode.validate(); if (!status.ok()) return status;
     status = occ_opcode.validate(); if (!status.ok()) return status;
     if (ambiguous_operation != RDMA_QP_AMBIG_NONE &&
-        ambiguous_ticket == null)
+        ambiguous_ticket == null && !has_pending_hardware_step)
       return rdma_status::make(RDMA_SC_INVALID_STATE,
                                "ambiguous QP recovery lacks ticket");
     if (ambiguous_operation == RDMA_QP_AMBIG_NONE &&
@@ -826,7 +832,8 @@ class rdma_qp_recovery_state extends uvm_object;
     // staging mapping to retain.
     if (ambiguous_operation == RDMA_QP_AMBIG_CREATE ||
         (ambiguous_operation == RDMA_QP_AMBIG_MODIFY &&
-         intent != RDMA_QP_RECOVER_NORMAL_DESTROY)) begin
+         intent != RDMA_QP_RECOVER_NORMAL_DESTROY &&
+         (staging_mapping != null || ambiguous_ticket != null))) begin
       status = rdma_qp_recovery_mapping_status(
         staging_mapping, context_ref.owner, recovery_qp_h,
         "QP recovery staging"
@@ -845,7 +852,8 @@ class rdma_qp_recovery_state extends uvm_object;
     // allocation may legitimately be unavailable; recovery will provision a
     // fresh buffer before attempting QPC_QUERY.
     if (intent == RDMA_QP_RECOVER_MODIFY_RECONCILE &&
-        ambiguous_operation == RDMA_QP_AMBIG_NONE && query_mapping == null)
+        ambiguous_operation == RDMA_QP_AMBIG_NONE && query_mapping == null &&
+        !has_pending_hardware_step)
       return rdma_status::make(
         RDMA_SC_INVALID_STATE,
         "modify recovery lacks query mapping"
@@ -908,6 +916,7 @@ class rdma_qp_recovery_state extends uvm_object;
     prior_qpc = null; candidate_qpc = null; qp_plan = null; context_ref = null;
     staging_mapping = null; query_mapping = null;
     query_mapping_recovery_only = r.query_mapping_recovery_only;
+    has_pending_hardware_step = r.has_pending_hardware_step;
     error_modify_complete = r.error_modify_complete;
     delete_complete = r.delete_complete;
     if (r.prior_qpc != null) begin c = r.prior_qpc.clone(); if (!$cast(prior_qpc, c)) `uvm_fatal("RDMA_COPY_TYPE", "prior QPC clone failure") end

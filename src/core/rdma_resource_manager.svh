@@ -4908,7 +4908,8 @@ class rdma_resource_manager extends uvm_object;
         } && recovery_copy.ambiguous_ticket != null;
       clearing_ambiguity =
         existing_recovery.ambiguous_operation != RDMA_QP_AMBIG_NONE &&
-        existing_recovery.ambiguous_ticket != null &&
+        (existing_recovery.ambiguous_ticket != null ||
+         existing_recovery.has_pending_hardware_step) &&
         recovery_copy.ambiguous_operation == RDMA_QP_AMBIG_NONE &&
         recovery_copy.ambiguous_ticket == null;
       normalizing_occ_role =
@@ -4977,6 +4978,8 @@ class rdma_resource_manager extends uvm_object;
                               existing_recovery.query_mapping) ||
           recovery_copy.query_mapping_recovery_only !=
             existing_recovery.query_mapping_recovery_only ||
+          (recovery_copy.has_pending_hardware_step !=
+            existing_recovery.has_pending_hardware_step && !clearing_ambiguity) ||
           recovery_copy.query_mapping != null &&
             (recovery_copy.query_mapping_recovery_only ?
               !same_recovery_mapping_value(
