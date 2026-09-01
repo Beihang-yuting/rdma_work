@@ -27,6 +27,132 @@ class rdma_qp_allocate_error_host_mem extends rdma_mock_host_mem;
   endfunction
 endclass
 
+// The CMQ adapter may return the ticket only through the completion payload.
+// This fixture preserves that completion ticket while clearing the task's
+// direct ticket output to exercise the executor's fallback authority path.
+class rdma_qp_completion_ticket_only_cmq extends rdma_mock_cmq_port;
+  `uvm_object_utils(rdma_qp_completion_ticket_only_cmq)
+
+  function new(string name = "rdma_qp_completion_ticket_only_cmq");
+    super.new(name);
+  endfunction
+
+  virtual task execute(
+    rdma_cmq_command_desc command,
+    output rdma_cmq_ticket ticket,
+    output rdma_cmq_completion completion,
+    output rdma_status status
+  );
+    super.execute(command, ticket, completion, status);
+    if (command != null && command.opcode_key != null &&
+        command.opcode_key.opcode[7:0] == XTR_V1_OP_QPC_MODIFY &&
+        completion != null && completion.ticket != null)
+      ticket = null;
+  endtask
+endclass
+
+// Query buffers use DEVICE_WRITE, while QPC staging uses DEVICE_READ.  Fail
+// the first query allocation before creating a mapping so the modify path must
+// publish ERROR recovery authority even without a query buffer.
+class rdma_qp_query_allocate_fail_host_mem extends rdma_mock_host_mem;
+  `uvm_object_utils(rdma_qp_query_allocate_fail_host_mem)
+  bit injected;
+
+  function new(string name = "rdma_qp_query_allocate_fail_host_mem");
+    super.new(name);
+    injected = 1'b0;
+  endfunction
+
+  virtual function rdma_status allocate(
+    rdma_dma_request_context request_context,
+    int unsigned size,
+    int unsigned alignment,
+    rdma_dma_direction_e direction,
+    output rdma_dma_mapping mapping
+  );
+    if (direction == RDMA_DMA_DEVICE_WRITE && !injected) begin
+      injected = 1'b1;
+      mapping = null;
+      return rdma_status::make(
+        RDMA_SC_RESOURCE_EXHAUSTED,
+        "injected QP query allocation failure"
+      );
+    end
+    return super.allocate(request_context, size, alignment, direction, mapping);
+  endfunction
+endclass
+
+// Return a non-null but undersized query mapping and leave its first release
+// incomplete.  The modify path must retain this adapter-owned capability in
+// durable recovery instead of publishing the timeout as a definitive result.
+class rdma_qp_query_malformed_pending_host_mem extends rdma_mock_host_mem;
+  `uvm_object_utils(rdma_qp_query_malformed_pending_host_mem)
+  bit injected;
+  bit pending_release;
+  int unsigned release_calls;
+  byte scripted_query_bytes[];
+
+  function new(string name = "rdma_qp_query_malformed_pending_host_mem");
+    super.new(name);
+    injected = 1'b0;
+    pending_release = 1'b0;
+    release_calls = 0;
+    scripted_query_bytes = new[0];
+  endfunction
+
+  virtual function rdma_status allocate(
+    rdma_dma_request_context request_context,
+    int unsigned size,
+    int unsigned alignment,
+    rdma_dma_direction_e direction,
+    output rdma_dma_mapping mapping
+  );
+    rdma_status status;
+    longint unsigned original_iova;
+    status = super.allocate(request_context, size, alignment, direction,
+                            mapping);
+    if (direction == RDMA_DMA_DEVICE_WRITE && !injected &&
+        status != null && status.ok() && mapping != null) begin
+      injected = 1'b1;
+      pending_release = 1'b1;
+      original_iova = mapping.iova.value;
+      mapping.size = size - 1;
+      foreach (regions[i]) begin
+        if (regions[i] != null && regions[i].mapping != null &&
+            regions[i].mapping.iova.value == original_iova)
+          regions[i].mapping.size = size - 1;
+      end
+      return rdma_status::make(
+        RDMA_SC_RESOURCE_EXHAUSTED,
+        "injected malformed query allocation"
+      );
+    end
+    if (direction == RDMA_DMA_DEVICE_WRITE && injected && mapping != null &&
+        scripted_query_bytes.size() == 512)
+      void'(super.write(mapping, 0, scripted_query_bytes));
+    return status;
+  endfunction
+
+  function void script_query_image(byte bytes[]);
+    scripted_query_bytes = new[bytes.size()];
+    foreach (bytes[i]) scripted_query_bytes[i] = bytes[i];
+  endfunction
+
+  virtual function rdma_status \release (rdma_dma_mapping mapping);
+    rdma_status status;
+    if (mapping != null && mapping.direction == RDMA_DMA_DEVICE_WRITE)
+      release_calls++;
+    if (pending_release) begin
+      pending_release = 1'b0;
+      void'(record_call("release", null, mapping));
+      return rdma_status::make(RDMA_SC_TIMEOUT,
+                               "injected malformed query release pending");
+    end
+    status = super.\release (mapping);
+    return status;
+  endfunction
+endclass
+
 class rdma_qp_pending_allocate_host_mem extends rdma_mock_host_mem;
   `uvm_object_utils(rdma_qp_pending_allocate_host_mem)
   bit injected;
@@ -184,6 +310,38 @@ class rdma_qp_malformed_allocate_host_mem extends rdma_mock_host_mem;
     end
     status = super.\release (mapping);
     return status;
+  endfunction
+endclass
+
+class rdma_qp_urc_malformed_allocate_host_mem extends rdma_mock_host_mem;
+  `uvm_object_utils(rdma_qp_urc_malformed_allocate_host_mem)
+  int unsigned allocate_count;
+  int unsigned release_calls;
+  bit pending_release;
+  function new(string name = "rdma_qp_urc_malformed_allocate_host_mem");
+    super.new(name); allocate_count = 0; release_calls = 0; pending_release = 0;
+  endfunction
+  virtual function rdma_status allocate(
+    rdma_dma_request_context request_context, int unsigned size,
+    int unsigned alignment, rdma_dma_direction_e direction,
+    output rdma_dma_mapping mapping
+  );
+    rdma_status status;
+    status = super.allocate(request_context, size, alignment, direction, mapping);
+    allocate_count++;
+    if (status != null && status.ok() && allocate_count == 5 && mapping != null) begin
+      pending_release = 1'b1;
+      mapping.size = size - 1;
+      return rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED,
+                               "injected URC malformed allocation");
+    end
+    return status;
+  endfunction
+  virtual function rdma_status \release (rdma_dma_mapping mapping);
+    rdma_status status;
+    release_calls++;
+    if (pending_release) begin pending_release = 0; return rdma_status::make(RDMA_SC_TIMEOUT, "pending URC release"); end
+    status = super.\release (mapping); return status;
   endfunction
 endclass
 
@@ -3477,6 +3635,615 @@ class rdma_qp_lifecycle_test extends uvm_test;
     check_contextless_preprogram_progress();
     check_allocate_pending_release_retained();
     check_malformed_allocation_recovery();
+    check_urc_recovery_retention();
+    check_modify_state_machine();
+    check_modify_transport_and_guards();
+    check_modify_completion_ticket_fallback();
+    check_modify_query_allocation_failure();
+    check_modify_query_malformed_pending();
+    check_destroy_lifecycle();
     phase.drop_objection(this);
+  endtask
+
+  task automatic check_destroy_lifecycle();
+    rdma_mock_host_mem mem;
+    rdma_function_binding binding;
+    rdma_resource_manager manager;
+    rdma_mock_context_backing contexts;
+    rdma_mock_cmq_port cmq;
+    rdma_qp_lifecycle_executor executor;
+    rdma_pd pd;
+    rdma_cq cq;
+    rdma_create_qp_req create_req;
+    rdma_destroy_resource_req destroy_req;
+    rdma_qp qp;
+    rdma_control_result result;
+    rdma_status status;
+    rdma_status released_status;
+    bit [7:0] expected[$];
+    bit [7:0] actual[$];
+    rdma_resource resource;
+    int unsigned calls_before;
+
+    // A normal RC destroy emits ERROR transition, QPN/SQ-PD/RQ-PD flushes,
+    // then QPC_DELETE and releases all QP-owned authority.
+    mem = rdma_mock_host_mem::type_id::create("destroy_rc_mem");
+    setup_qp_environment("destroy_rc", mem, binding, manager, contexts,
+                         cmq, executor, pd, cq);
+    create_req = make_request("destroy_rc_create", binding, pd, cq,
+                              RDMA_TRANSPORT_RC);
+    executor.create_locked(binding, binding.make_handle(), create_req, 860,
+                           qp, result);
+    destroy_req = rdma_destroy_resource_req::type_id::create("destroy_rc_req");
+    destroy_req.owner = binding.make_handle();
+    destroy_req.target_h = rdma_clone_handle_value(qp.handle,
+                                                    "destroy rc target");
+    executor.destroy_locked(binding, binding.make_handle(), destroy_req, 861,
+                            result);
+    expected = {XTR_V1_OP_QPC_CREATE, XTR_V1_OP_QPC_MODIFY,
+                XTR_V1_OP_OCC_FLUSH, XTR_V1_OP_OCC_FLUSH,
+                XTR_V1_OP_OCC_FLUSH, XTR_V1_OP_QPC_DELETE};
+    actual.delete();
+    cmq.get_opcodes(actual);
+    released_status = manager.lookup(destroy_req.target_h, resource);
+    if (result == null || result.status == null || !result.status.ok() ||
+        result.final_resource_state != RDMA_RESOURCE_RELEASED ||
+        !result.final_resource_state_known || result.recovery_required ||
+        actual != expected || mem.live_allocations() != 0 ||
+        contexts.slots.size() != 1 || !contexts.slots[0].released ||
+        released_status == null ||
+        released_status.code != RDMA_SC_INVALID_STATE || resource != null)
+      `uvm_error("QP_DESTROY_RC", "normal RC QP destroy did not complete in order")
+
+    // Outstanding work is rejected before begin_quiesce and any CMQ side effect.
+    mem = rdma_mock_host_mem::type_id::create("destroy_busy_mem");
+    setup_qp_environment("destroy_busy", mem, binding, manager, contexts,
+                         cmq, executor, pd, cq);
+    create_req = make_request("destroy_busy_create", binding, pd, cq,
+                              RDMA_TRANSPORT_RC);
+    executor.create_locked(binding, binding.make_handle(), create_req, 862,
+                           qp, result);
+    status = manager.track_outstanding(qp.handle, 64'hd35);
+    calls_before = cmq.calls.size();
+    destroy_req = rdma_destroy_resource_req::type_id::create("destroy_busy_req");
+    destroy_req.owner = binding.make_handle();
+    destroy_req.target_h = rdma_clone_handle_value(qp.handle,
+                                                    "destroy busy target");
+    executor.destroy_locked(binding, binding.make_handle(), destroy_req, 863,
+                            result);
+    status = manager.lookup(qp.handle, resource);
+    if (result == null || result.status == null ||
+        result.status.code != RDMA_SC_RESOURCE_BUSY || status == null ||
+        !status.ok() || resource == null || resource.state != RDMA_RESOURCE_ACTIVE ||
+        cmq.calls.size() != calls_before)
+      `uvm_error("QP_DESTROY_BUSY", "busy QP destroy issued side effects")
+  endtask
+
+  task automatic check_modify_state_machine();
+    rdma_mock_host_mem mem;
+    rdma_function_binding binding;
+    rdma_resource_manager manager;
+    rdma_mock_context_backing contexts;
+    rdma_mock_cmq_port cmq;
+    rdma_qp_lifecycle_executor executor;
+    rdma_pd pd;
+    rdma_cq cq;
+    rdma_create_qp_req create_req;
+    rdma_modify_qp_req modify_req;
+    rdma_qp qp;
+    rdma_control_result result;
+    rdma_xtr_v1_qpc_command_body modify_body;
+    rdma_qpc_rc_ext rc_ext;
+    mem = rdma_mock_host_mem::type_id::create("modify_red_mem");
+    setup_qp_environment("modify_red", mem, binding, manager, contexts, cmq,
+                         executor, pd, cq);
+    create_req = make_request("modify_red_create", binding, pd, cq,
+                              RDMA_TRANSPORT_RC);
+    executor.create_locked(binding, binding.make_handle(), create_req, 700,
+                           qp, result);
+    modify_req = rdma_modify_qp_req::type_id::create("modify_red_req");
+    modify_req.owner = binding.make_handle();
+    modify_req.qp_h = rdma_clone_handle_value(qp.handle, "modify red QP");
+    modify_req.new_state = RDMA_QPS_INIT;
+    executor.modify_locked(binding, binding.make_handle(), modify_req, 701,
+                           qp, result);
+    if (result == null || result.status == null || !result.status.ok() ||
+        qp == null || qp.qp_state != RDMA_QPS_INIT ||
+        qp.programmed_qpc == null || qp.programmed_qpc.state != RDMA_QPS_RESET ||
+        cmq.calls.size() != 1)
+      `uvm_error("MODIFY_RESET_INIT", "RESET to INIT semantic modify is invalid")
+    modify_req.new_state = RDMA_QPS_RTR;
+    modify_req.destination_qpn_valid = 1'b1;
+    modify_req.destination_qpn = 24'h12345;
+    executor.modify_locked(binding, binding.make_handle(), modify_req, 702,
+                           qp, result);
+    if (result == null || result.status == null || !result.status.ok() ||
+        qp == null || qp.qp_state != RDMA_QPS_RTR || cmq.calls.size() != 2 ||
+        cmq.calls[1] == null || cmq.calls[1].command == null ||
+        cmq.calls[1].command.opcode_key == null ||
+        cmq.calls[1].command.opcode_key.variant != "modify" ||
+        !$cast(modify_body, cmq.calls[1].command.body) ||
+        modify_body == null || !modify_body.full_modify ||
+        modify_body.next_state != RDMA_QPS_RTR ||
+        modify_body.wbe_template_count != 0)
+      `uvm_error("MODIFY_INIT_RTR", "INIT to RTR full modify is invalid")
+    if (qp != null && qp.programmed_qpc != null &&
+        $cast(rc_ext, qp.programmed_qpc.transport_ext) &&
+        (rc_ext.remote_qpn != modify_req.destination_qpn ||
+         rc_ext.send_psn != 24'h123456 || rc_ext.recv_psn != 24'h654321))
+      `uvm_error("MODIFY_RC_DEST", "RC destination valid-bit patch changed the wrong fields")
+    modify_req.send_psn_valid = 1'b1;
+    modify_req.send_psn = 24'h0abcde;
+    modify_req.recv_psn_valid = 1'b1;
+    modify_req.recv_psn = 24'h0fedcb;
+    modify_req.new_state = RDMA_QPS_RTS;
+    executor.modify_locked(binding, binding.make_handle(), modify_req, 703,
+                           qp, result);
+    if (result == null || result.status == null || !result.status.ok() ||
+        qp == null || qp.qp_state != RDMA_QPS_RTS || cmq.calls.size() != 3)
+      `uvm_error("MODIFY_RTR_RTS", "RTR to RTS full modify is invalid")
+    if (qp != null && qp.programmed_qpc != null &&
+        $cast(rc_ext, qp.programmed_qpc.transport_ext) &&
+        (rc_ext.send_psn != modify_req.send_psn ||
+         rc_ext.recv_psn != modify_req.recv_psn))
+      `uvm_error("MODIFY_RC_PSN", "RC PSN valid-bit patches were not applied")
+
+    // State-only transitions must submit no staging image and no WBE pairs.
+    modify_req.new_state = RDMA_QPS_ERROR;
+    executor.modify_locked(binding, binding.make_handle(), modify_req, 704,
+                           qp, result);
+    if (result == null || result.status == null || !result.status.ok() ||
+        qp == null || qp.qp_state != RDMA_QPS_ERROR || cmq.calls.size() != 4 ||
+        cmq.calls[3] == null || cmq.calls[3].command == null ||
+        !$cast(modify_body, cmq.calls[3].command.body) ||
+        modify_body == null || modify_body.full_modify ||
+        modify_body.partial_modify || modify_body.qpc_buffer.value != 0 ||
+        modify_body.wbe_template_count != 0)
+      `uvm_error("MODIFY_ERROR_STATE_ONLY", "ERROR state-only modify is invalid")
+
+    modify_req.new_state = RDMA_QPS_RESET;
+    executor.modify_locked(binding, binding.make_handle(), modify_req, 705,
+                           qp, result);
+    if (result == null || result.status == null || !result.status.ok() ||
+        qp == null || qp.qp_state != RDMA_QPS_RESET || cmq.calls.size() != 5 ||
+        cmq.calls[4] == null || cmq.calls[4].command == null ||
+        !$cast(modify_body, cmq.calls[4].command.body) ||
+        modify_body == null || modify_body.full_modify ||
+        modify_body.qpc_buffer.value != 0)
+      `uvm_error("MODIFY_RESET_STATE_ONLY", "ERROR to RESET state-only modify is invalid")
+
+    // Same-state and unsupported SQD/SQE requests are rejected before CMQ.
+    // The QP is RESET after the preceding state-only transition, so use RESET
+    // for the same-state probe and retain the post-transition call count.
+    modify_req.new_state = RDMA_QPS_RESET;
+    executor.modify_locked(binding, binding.make_handle(), modify_req, 706,
+                           qp, result);
+    if (result == null || result.status == null ||
+        result.status.code != RDMA_SC_INVALID_STATE || cmq.calls.size() != 5)
+      `uvm_error("MODIFY_SAME_STATE", "same-state modify was not rejected")
+    modify_req.new_state = RDMA_QPS_SQD;
+    executor.modify_locked(binding, binding.make_handle(), modify_req, 707,
+                           qp, result);
+    if (result == null || result.status == null ||
+        result.status.code != RDMA_SC_UNSUPPORTED_OPCODE || cmq.calls.size() != 5)
+      `uvm_error("MODIFY_SQD", "SQD modify was not rejected as unsupported")
+  endtask
+
+  task automatic check_urc_recovery_retention();
+    rdma_qp_urc_malformed_allocate_host_mem mem;
+    rdma_function_binding binding; rdma_resource_manager manager;
+    rdma_mock_context_backing contexts; rdma_mock_cmq_port cmq;
+    rdma_qp_lifecycle_executor executor; rdma_pd pd; rdma_cq cq;
+    rdma_create_qp_req request; rdma_qp qp; rdma_control_result result;
+    rdma_recovery_record recovery; rdma_status status;
+    rdma_dma_mapping retained_mapping; rdma_qp replacement_qp;
+    mem = rdma_qp_urc_malformed_allocate_host_mem::type_id::create("urc_recovery_mem");
+    manager = rdma_resource_manager::type_id::create("urc_recovery_manager");
+    contexts = rdma_mock_context_backing::type_id::create("urc_recovery_contexts");
+    cmq = rdma_mock_cmq_port::type_id::create("urc_recovery_cmq");
+    executor = rdma_qp_lifecycle_executor::type_id::create("urc_recovery_executor");
+    setup_custom_qp_environment("urc_recovery", mem, manager, contexts, cmq,
+                                executor, binding, pd, cq);
+    request = make_request("urc_recovery_request", binding, pd, cq, RDMA_TRANSPORT_URC);
+    executor.create_locked(binding, binding.make_handle(), request, 790, qp, result);
+    recovery = null;
+    if (result != null && result.resource_h != null) void'(manager.lookup_recovery(result.resource_h, recovery));
+    retained_mapping = (recovery == null || recovery.qp_recovery == null ||
+      recovery.qp_recovery.qp_plan == null || recovery.qp_recovery.qp_plan.urc_refs.size() == 0) ? null :
+      recovery.qp_recovery.qp_plan.urc_refs[0].mapping;
+    if (result != null && result.resource_h != null) begin
+      status = manager.finalize_qp_release(result.resource_h);
+      if (status == null || status.code != RDMA_SC_RECOVERY_REQUIRED)
+        `uvm_error("URC_RECOVERY_FINALIZE", "pending URC recovery finalized early")
+    end
+    replacement_qp = null;
+    status = manager.create_qp(binding, pd.handle, cq.handle, cq.handle, null, replacement_qp);
+    if (status == null || !status.ok() || replacement_qp == null || replacement_qp.local_qp_id == 0)
+      `uvm_error("URC_RECOVERY_QPN", "pending URC recovery reused QPN")
+    if (replacement_qp != null) void'(manager.finalize_qp_release(replacement_qp.handle));
+    if (mem.release_calls != 1)
+      `uvm_error("URC_RECOVERY_RELEASE_ONCE", "retained URC mapping release was duplicated")
+    status = result == null ? null : result.status;
+    if (status == null || status.code != RDMA_SC_RECOVERY_REQUIRED || qp != null ||
+        recovery == null || recovery.qp_recovery == null ||
+        recovery.qp_recovery.qp_plan == null || recovery.qp_recovery.qp_plan.urc_refs.size() == 0 ||
+        retained_mapping == null || retained_mapping.function_h == null ||
+        !retained_mapping.function_h.same_instance(binding.make_handle()) ||
+        retained_mapping.owner_h == null || !retained_mapping.owner_h.same_instance(result.resource_h))
+      `uvm_error("URC_RECOVERY_RED", "URC failed allocation was not retained in recovery plan")
+  endtask
+
+  task automatic check_modify_completion_ticket_fallback();
+    rdma_mock_host_mem mem;
+    rdma_function_binding binding;
+    rdma_resource_manager manager;
+    rdma_mock_context_backing contexts;
+    rdma_qp_completion_ticket_only_cmq cmq;
+    rdma_qp_lifecycle_executor executor;
+    rdma_pd pd;
+    rdma_cq cq;
+    rdma_create_qp_req create_req;
+    rdma_modify_qp_req modify_req;
+    rdma_qp qp;
+    rdma_control_result result;
+    rdma_control_result recovery_result;
+    rdma_recovery_record recovery;
+    rdma_resource resource;
+
+    mem = rdma_mock_host_mem::type_id::create("ticket_fallback_mem");
+    binding = make_binding("ticket_fallback_binding");
+    manager = rdma_resource_manager::type_id::create("ticket_fallback_manager");
+    contexts = rdma_mock_context_backing::type_id::create("ticket_fallback_contexts");
+    cmq = rdma_qp_completion_ticket_only_cmq::type_id::create("ticket_fallback_cmq");
+    executor = rdma_qp_lifecycle_executor::type_id::create("ticket_fallback_executor");
+    expect_ok("ticket_fallback_FUNCTION", manager.create_function(binding, resource));
+    expect_ok("ticket_fallback_PD", manager.create_pd(binding, pd));
+    expect_ok("ticket_fallback_CQ", manager.create_cq(binding, null, cq));
+    expect_ok("ticket_fallback_CONFIGURE", executor.configure(manager, cmq, mem,
+                                                               contexts, 2us));
+    create_req = make_request("ticket_fallback_create", binding, pd, cq,
+                              RDMA_TRANSPORT_RC);
+    executor.create_locked(binding, binding.make_handle(), create_req, 810,
+                           qp, result);
+    modify_req = rdma_modify_qp_req::type_id::create("ticket_fallback_init");
+    modify_req.owner = binding.make_handle();
+    modify_req.qp_h = rdma_clone_handle_value(qp.handle, "ticket fallback QP");
+    modify_req.new_state = RDMA_QPS_INIT;
+    executor.modify_locked(binding, binding.make_handle(), modify_req, 811,
+                           qp, result);
+    modify_req.new_state = RDMA_QPS_RTR;
+    cmq.timeout_opcode(XTR_V1_OP_QPC_MODIFY);
+    executor.modify_locked(binding, binding.make_handle(), modify_req, 812,
+                           qp, result);
+    recovery = null;
+    if (result != null && result.resource_h != null)
+      void'(manager.lookup_recovery(result.resource_h, recovery));
+    if (result == null || result.status == null ||
+        result.status.code != RDMA_SC_RECOVERY_REQUIRED || qp != null ||
+        recovery == null || recovery.qp_recovery == null ||
+        recovery.qp_recovery.ambiguous_ticket == null ||
+        cmq.calls.size() != 2 || cmq.calls[1] == null ||
+        cmq.calls[1].ticket == null)
+      `uvm_error("MODIFY_TICKET_FALLBACK", "completion ticket was not retained")
+    else begin
+      cmq.push_late_completion(cmq.calls[1].ticket, rdma_status::success());
+      recovery_result = null;
+      executor.recover_locked(binding, binding.make_handle(), result.resource_h,
+                              813, recovery_result);
+      if (recovery_result == null || recovery_result.status == null ||
+          !recovery_result.status.ok() ||
+          manager.lookup(result.resource_h, resource) == null ||
+          resource == null || resource.state != RDMA_RESOURCE_ACTIVE)
+        `uvm_error("MODIFY_TICKET_RECOVERY", "completion ticket fallback did not recover")
+    end
+  endtask
+
+  task automatic check_modify_query_allocation_failure();
+    rdma_qp_query_allocate_fail_host_mem mem;
+    rdma_function_binding binding;
+    rdma_resource_manager manager;
+    rdma_mock_context_backing contexts;
+    rdma_mock_cmq_port cmq;
+    rdma_qp_lifecycle_executor executor;
+    rdma_pd pd;
+    rdma_cq cq;
+    rdma_create_qp_req create_req;
+    rdma_modify_qp_req modify_req;
+    rdma_qp qp;
+    rdma_control_result result;
+    rdma_recovery_record recovery;
+    rdma_resource resource;
+    rdma_status status;
+
+    mem = rdma_qp_query_allocate_fail_host_mem::type_id::create("query_fail_mem");
+    setup_qp_environment("query_fail", mem, binding, manager, contexts, cmq,
+                         executor, pd, cq);
+    create_req = make_request("query_fail_create", binding, pd, cq,
+                              RDMA_TRANSPORT_RC);
+    executor.create_locked(binding, binding.make_handle(), create_req, 820,
+                           qp, result);
+    modify_req = rdma_modify_qp_req::type_id::create("query_fail_init");
+    modify_req.owner = binding.make_handle();
+    modify_req.qp_h = rdma_clone_handle_value(qp.handle, "query fail QP");
+    modify_req.new_state = RDMA_QPS_INIT;
+    executor.modify_locked(binding, binding.make_handle(), modify_req, 821,
+                           qp, result);
+    modify_req.new_state = RDMA_QPS_RTR;
+    cmq.timeout_opcode(XTR_V1_OP_QPC_MODIFY);
+    executor.modify_locked(binding, binding.make_handle(), modify_req, 822,
+                           qp, result);
+    recovery = null;
+    if (result != null && result.resource_h != null)
+      void'(manager.lookup_recovery(result.resource_h, recovery));
+    status = result == null ? null : result.status;
+    if (status == null || status.code != RDMA_SC_RECOVERY_REQUIRED ||
+        result.primary_status == null || result.primary_status.code != RDMA_SC_TIMEOUT ||
+        qp != null || manager.lookup(result.resource_h, resource) == null ||
+        resource == null || resource.state != RDMA_RESOURCE_ERROR ||
+        recovery == null || recovery.qp_recovery == null ||
+        recovery.qp_recovery.ambiguous_operation != RDMA_QP_AMBIG_MODIFY ||
+        recovery.qp_recovery.ambiguous_ticket == null ||
+        recovery.qp_recovery.query_mapping != null)
+      `uvm_error("MODIFY_QUERY_ALLOC", "query allocation failure lost ERROR recovery authority")
+  endtask
+
+  task automatic check_modify_query_malformed_pending();
+    rdma_qp_query_malformed_pending_host_mem mem;
+    rdma_function_binding binding;
+    rdma_resource_manager manager;
+    rdma_mock_context_backing contexts;
+    rdma_mock_cmq_port cmq;
+    rdma_qp_lifecycle_executor executor;
+    rdma_pd pd;
+    rdma_cq cq;
+    rdma_create_qp_req create_req;
+    rdma_modify_qp_req modify_req;
+    rdma_qp qp;
+    rdma_control_result result;
+    rdma_control_result recovery_result;
+    rdma_recovery_record recovery;
+    rdma_resource resource;
+    rdma_status status;
+    int unsigned releases_before;
+    rdma_codec_registry query_registry;
+    rdma_codec_key query_key;
+    rdma_codec_base query_codec;
+    rdma_hw_image query_image;
+    byte query_bytes[];
+
+    mem = rdma_qp_query_malformed_pending_host_mem::type_id::create(
+      "query_malformed_mem"
+    );
+    setup_qp_environment("query_malformed", mem, binding, manager,
+                         contexts, cmq, executor, pd, cq);
+    create_req = make_request("query_malformed_create", binding, pd, cq,
+                              RDMA_TRANSPORT_RC);
+    executor.create_locked(binding, binding.make_handle(), create_req, 823,
+                           qp, result);
+    modify_req = rdma_modify_qp_req::type_id::create("query_malformed_init");
+    modify_req.owner = binding.make_handle();
+    modify_req.qp_h = rdma_clone_handle_value(qp.handle,
+                                               "query malformed QP");
+    modify_req.new_state = RDMA_QPS_INIT;
+    executor.modify_locked(binding, binding.make_handle(), modify_req, 824,
+                           qp, result);
+    releases_before = mem.release_calls;
+    modify_req.new_state = RDMA_QPS_RTR;
+    cmq.timeout_opcode(XTR_V1_OP_QPC_MODIFY);
+    executor.modify_locked(binding, binding.make_handle(), modify_req, 825,
+                           qp, result);
+    recovery = null;
+    if (result != null && result.resource_h != null)
+      void'(manager.lookup_recovery(result.resource_h, recovery));
+    status = result == null ? null : result.status;
+    if (status == null || status.code != RDMA_SC_RECOVERY_REQUIRED ||
+        qp != null || recovery == null || recovery.qp_recovery == null ||
+        recovery.qp_recovery.query_mapping == null ||
+        !recovery.qp_recovery.query_mapping_recovery_only ||
+        mem.release_calls != releases_before + 1)
+      `uvm_error("MODIFY_QUERY_MALFORMED",
+                 "malformed pending query authority was not retained")
+    if (recovery != null && recovery.qp_recovery != null &&
+        recovery.qp_recovery.candidate_qpc != null &&
+        result != null && result.resource_h != null) begin
+      query_registry = rdma_codec_registry::type_id::create(
+        "query_malformed_registry");
+      status = rdma_xtr_v1_register_qpc_codecs(query_registry);
+      query_key.hw_version = "xtr_v1";
+      query_key.image_kind = RDMA_IMAGE_QPC;
+      query_key.object_type = "qpc";
+      query_key.variant = "rc";
+      query_key.opcode = XTR_V1_OP_QPC_CREATE;
+      if (status.ok()) status = query_registry.lookup(query_key, query_codec);
+      if (status.ok()) status = query_codec.encode(
+        recovery.qp_recovery.candidate_qpc, query_image);
+      if (status.ok() && query_image != null) begin
+        query_bytes = new[query_image.bytes.size()];
+        foreach (query_image.bytes[i]) query_bytes[i] = query_image.bytes[i];
+        mem.script_query_image(query_bytes);
+      end
+      cmq.script_query_context(XTR_V1_OP_QPC_QUERY,
+                               recovery.qp_recovery.candidate_qpc,
+                               rdma_status::success());
+      recovery_result = null;
+      executor.recover_locked(binding, binding.make_handle(), result.resource_h,
+                              826, recovery_result);
+      status = recovery_result == null ? null : recovery_result.status;
+      void'(manager.lookup(result.resource_h, resource));
+      if (status == null || !status.ok() ||
+          manager.lookup(result.resource_h, resource) == null ||
+          resource == null || resource.state != RDMA_RESOURCE_ACTIVE ||
+          mem.release_calls != releases_before + 3)
+        `uvm_error("MODIFY_QUERY_MALFORMED_RECOVERY",
+                   "recovery-only query release was not reconciled exactly once")
+    end
+  endtask
+
+  task automatic check_modify_transport_and_guards();
+    rdma_mock_host_mem mem;
+    rdma_function_binding binding;
+    rdma_resource_manager manager;
+    rdma_mock_context_backing contexts;
+    rdma_mock_cmq_port cmq;
+    rdma_qp_lifecycle_executor executor;
+    rdma_pd pd;
+    rdma_cq cq;
+    rdma_create_qp_req create_req;
+    rdma_modify_qp_req modify_req;
+    rdma_qp qp;
+    rdma_control_result result;
+    rdma_xtr_v1_qpc_command_body modify_body;
+    rdma_qpc_urc_ext urc_ext;
+    rdma_status status;
+    longint unsigned qp_sequence_value;
+    int unsigned calls_before;
+    int unsigned live_before;
+    rdma_resource live_resource;
+    rdma_qp live_qp;
+
+    // UD rejects transport fields before any QPC_MODIFY CMQ side effect.
+    mem = rdma_mock_host_mem::type_id::create("ud_modify_mem");
+    setup_qp_environment("ud_modify", mem, binding, manager, contexts, cmq,
+                         executor, pd, cq);
+    create_req = make_request("ud_modify_create", binding, pd, cq,
+                              RDMA_TRANSPORT_UD);
+    executor.create_locked(binding, binding.make_handle(), create_req, 830,
+                           qp, result);
+    modify_req = rdma_modify_qp_req::type_id::create("ud_modify_init");
+    modify_req.owner = binding.make_handle();
+    modify_req.qp_h = rdma_clone_handle_value(qp.handle, "UD modify QP");
+    modify_req.new_state = RDMA_QPS_INIT;
+    executor.modify_locked(binding, binding.make_handle(), modify_req, 831,
+                           qp, result);
+    modify_req.new_state = RDMA_QPS_RTR;
+    modify_req.destination_qpn_valid = 1'b1;
+    modify_req.destination_qpn = 24'h10101;
+    calls_before = cmq.calls.size();
+    executor.modify_locked(binding, binding.make_handle(), modify_req, 832,
+                           qp, result);
+    live_resource = null;
+    live_qp = null;
+    status = manager.lookup(modify_req.qp_h, live_resource);
+    if (status != null && status.ok() && live_resource != null)
+      void'($cast(live_qp, live_resource));
+    if (result == null || result.status == null ||
+        result.status.code != RDMA_SC_INVALID_ARGUMENT ||
+        live_qp == null || live_qp.qp_state != RDMA_QPS_INIT ||
+        cmq.calls.size() != calls_before)
+      `uvm_error("MODIFY_UD_VALID", "UD valid-bit transport fields were not rejected")
+
+    // URC full modify uses the one-entry WBE template and preserves sequence.
+    mem = rdma_mock_host_mem::type_id::create("urc_modify_mem");
+    setup_qp_environment("urc_modify", mem, binding, manager, contexts, cmq,
+                         executor, pd, cq);
+    create_req = make_request("urc_modify_create", binding, pd, cq,
+                              RDMA_TRANSPORT_URC);
+    executor.create_locked(binding, binding.make_handle(), create_req, 833,
+                           qp, result);
+    qp_sequence_value = qp == null || qp.programmed_qpc == null ? 0 :
+               qp.programmed_qpc.qp_sequence;
+    modify_req = rdma_modify_qp_req::type_id::create("urc_modify_init");
+    modify_req.owner = binding.make_handle();
+    modify_req.qp_h = rdma_clone_handle_value(qp.handle, "URC modify QP");
+    modify_req.new_state = RDMA_QPS_INIT;
+    executor.modify_locked(binding, binding.make_handle(), modify_req, 834,
+                           qp, result);
+    modify_req.new_state = RDMA_QPS_RTR;
+    modify_req.destination_qpn_valid = 1'b1;
+    modify_req.destination_qpn = 24'h20202;
+    modify_req.send_psn_valid = 1'b1;
+    modify_req.send_psn = 24'h30303;
+    modify_req.recv_psn_valid = 1'b1;
+    modify_req.recv_psn = 24'h40404;
+    executor.modify_locked(binding, binding.make_handle(), modify_req, 835,
+                           qp, result);
+    if (result == null || result.status == null || !result.status.ok() ||
+        qp == null || qp.qp_state != RDMA_QPS_RTR ||
+        qp.programmed_qpc == null || qp.programmed_qpc.qp_sequence != qp_sequence_value ||
+        cmq.calls.size() != 2 || cmq.calls[1] == null ||
+        cmq.calls[1].command == null ||
+        !$cast(modify_body, cmq.calls[1].command.body) ||
+        modify_body == null || !modify_body.full_modify ||
+        modify_body.wbe_template_count != 1 ||
+        !$cast(urc_ext, qp.programmed_qpc.transport_ext) ||
+        urc_ext == null || urc_ext.remote_qpn != modify_req.destination_qpn ||
+        urc_ext.dpsn != modify_req.send_psn ||
+        urc_ext.rpsn != modify_req.recv_psn)
+      `uvm_error("MODIFY_URC_WBE", "URC sequence or WBE projection is invalid")
+
+    // Outstanding work is rejected before staging allocation or CMQ submit.
+    status = manager.track_outstanding(qp.handle, 64'h55aa);
+    if (status == null || !status.ok())
+      `uvm_error("MODIFY_BUSY_SETUP", "could not install outstanding QP work")
+    modify_req.new_state = RDMA_QPS_RTS;
+    calls_before = cmq.calls.size();
+    executor.modify_locked(binding, binding.make_handle(), modify_req, 836,
+                           qp, result);
+    live_resource = null;
+    live_qp = null;
+    status = manager.lookup(modify_req.qp_h, live_resource);
+    if (status != null && status.ok() && live_resource != null)
+      void'($cast(live_qp, live_resource));
+    if (result == null || result.status == null ||
+        result.status.code != RDMA_SC_RESOURCE_BUSY ||
+        live_qp == null || live_qp.qp_state != RDMA_QPS_RTR ||
+        cmq.calls.size() != calls_before)
+      `uvm_error("MODIFY_BUSY", "outstanding QP work was not rejected early")
+
+    // Definitive CMQ failure leaves the prior semantic/programmed image and
+    // releases the temporary staging allocation.
+    mem = rdma_mock_host_mem::type_id::create("definitive_modify_mem");
+    setup_qp_environment("definitive_modify", mem, binding, manager, contexts,
+                         cmq, executor, pd, cq);
+    create_req = make_request("definitive_modify_create", binding, pd, cq,
+                              RDMA_TRANSPORT_RC);
+    executor.create_locked(binding, binding.make_handle(), create_req, 837,
+                           qp, result);
+    modify_req = rdma_modify_qp_req::type_id::create("definitive_modify_init");
+    modify_req.owner = binding.make_handle();
+    modify_req.qp_h = rdma_clone_handle_value(qp.handle, "definitive modify QP");
+    modify_req.new_state = RDMA_QPS_INIT;
+    executor.modify_locked(binding, binding.make_handle(), modify_req, 838,
+                           qp, result);
+    live_before = mem.live_allocations();
+    modify_req.new_state = RDMA_QPS_RTR;
+    cmq.fail_opcode(XTR_V1_OP_QPC_MODIFY,
+                    rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                                      "definitive modify failure"));
+    executor.modify_locked(binding, binding.make_handle(), modify_req, 839,
+                           qp, result);
+    live_resource = null;
+    live_qp = null;
+    status = manager.lookup(modify_req.qp_h, live_resource);
+    if (status != null && status.ok() && live_resource != null)
+      void'($cast(live_qp, live_resource));
+    if (result == null || result.status == null ||
+        result.status.code != RDMA_SC_INVALID_ARGUMENT ||
+        live_qp == null || live_qp.qp_state != RDMA_QPS_INIT ||
+        live_qp.programmed_qpc == null ||
+        live_qp.programmed_qpc.state != RDMA_QPS_RESET ||
+        mem.live_allocations() != live_before)
+      `uvm_error("MODIFY_DEFINITIVE", "definitive modify failure changed state or leaked staging")
+
+    // A generation rebind is rejected by the live binding fence before CMQ.
+    mem = rdma_mock_host_mem::type_id::create("stale_modify_mem");
+    setup_qp_environment("stale_modify", mem, binding, manager, contexts, cmq,
+                         executor, pd, cq);
+    create_req = make_request("stale_modify_create", binding, pd, cq,
+                              RDMA_TRANSPORT_RC);
+    executor.create_locked(binding, binding.make_handle(), create_req, 840,
+                           qp, result);
+    modify_req = rdma_modify_qp_req::type_id::create("stale_modify_req");
+    modify_req.owner = binding.make_handle();
+    modify_req.qp_h = rdma_clone_handle_value(qp.handle, "stale modify QP");
+    modify_req.new_state = RDMA_QPS_INIT;
+    binding.generation++;
+    calls_before = cmq.calls.size();
+    executor.modify_locked(binding, modify_req.owner, modify_req, 841,
+                           qp, result);
+    if (result == null || result.status == null ||
+        result.status.code != RDMA_SC_STALE_GENERATION ||
+        qp != null || cmq.calls.size() != calls_before)
+      `uvm_error("MODIFY_STALE", "stale generation reached QP modify side effects")
   endtask
 endclass

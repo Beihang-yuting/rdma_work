@@ -44,6 +44,11 @@ class rdma_qp_lifecycle_executor extends uvm_object;
     return rdma_status::make(RDMA_SC_INVALID_STATE, message);
   endfunction
 
+  protected function bit same_owner(rdma_function_handle lhs,
+                                    rdma_function_handle rhs);
+    return lhs != null && rhs != null && lhs.same_instance(rhs);
+  endfunction
+
   protected function rdma_status normalize_status(rdma_status status,
                                                    string message);
     return status == null ? invalid_state(message) : status;
@@ -557,15 +562,24 @@ class rdma_qp_lifecycle_executor extends uvm_object;
     if (request.transport == RDMA_TRANSPORT_URC) begin
       status = allocate_ref(binding, expected_owner, qp_snapshot.handle,
         RDMA_QUEUE_ROLE_QP_URC_RSQ, 4096, RDMA_DMA_BIDIRECTIONAL, ref_value);
-      if (!status.ok()) return status;
+      if (!status.ok()) begin
+        if (ref_value != null) plan.urc_refs.push_back(ref_value);
+        return status;
+      end
       plan.urc_refs.push_back(ref_value);
       status = allocate_ref(binding, expected_owner, qp_snapshot.handle,
         RDMA_QUEUE_ROLE_QP_URC_RDSQ, 4096, RDMA_DMA_BIDIRECTIONAL, ref_value);
-      if (!status.ok()) return status;
+      if (!status.ok()) begin
+        if (ref_value != null) plan.urc_refs.push_back(ref_value);
+        return status;
+      end
       plan.urc_refs.push_back(ref_value);
       status = allocate_ref(binding, expected_owner, qp_snapshot.handle,
         RDMA_QUEUE_ROLE_QP_URC_DSQ, 8192, RDMA_DMA_BIDIRECTIONAL, ref_value);
-      if (!status.ok()) return status;
+      if (!status.ok()) begin
+        if (ref_value != null) plan.urc_refs.push_back(ref_value);
+        return status;
+      end
       plan.urc_refs.push_back(ref_value);
     end
     return rdma_status::success();
@@ -851,6 +865,104 @@ class rdma_qp_lifecycle_executor extends uvm_object;
     return 1'b0;
   endfunction
 
+  protected function bit same_qpc_snapshot(rdma_qpc_model lhs,
+                                            rdma_qpc_model rhs);
+    rdma_codec_key key;
+    rdma_codec_base codec;
+    bit equal;
+    string mismatch;
+    rdma_status status;
+    if (lhs == null || rhs == null || lhs.transport != rhs.transport ||
+        qpc_codecs == null)
+      return lhs == rhs;
+    case (lhs.transport)
+      RDMA_TRANSPORT_RC: key.variant = "rc";
+      RDMA_TRANSPORT_UD: key.variant = "ud";
+      RDMA_TRANSPORT_URC: key.variant = "urc";
+      default: return 1'b0;
+    endcase
+    key.hw_version = "xtr_v1";
+    key.image_kind = RDMA_IMAGE_QPC;
+    key.object_type = "qpc";
+    key.opcode = XTR_V1_OP_QPC_CREATE;
+    status = qpc_codecs.lookup(key, codec);
+    if (status == null || !status.ok() || codec == null)
+      return 1'b0;
+    status = codec.serialized_equal(lhs, rhs, equal, mismatch);
+    return status != null && status.ok() && equal;
+  endfunction
+
+  // Read and authenticate the complete 512-byte QPC image returned by the
+  // device.  CMQ completion payloads are transport metadata only; they are
+  // deliberately not accepted as a substitute for the DMA query image.
+  protected function rdma_status read_qpc_query_image(
+    rdma_function_handle expected_owner,
+    rdma_dma_mapping query_mapping,
+    rdma_qpc_model reference_qpc,
+    output rdma_qpc_model queried_qpc
+  );
+    rdma_codec_key key;
+    rdma_codec_base codec;
+    rdma_hw_image image;
+    rdma_hw_model decoded_model;
+    rdma_status status;
+    byte data[];
+    string variant;
+
+    queried_qpc = null;
+    if (expected_owner == null || query_mapping == null ||
+        reference_qpc == null || host_mem == null || qpc_codecs == null)
+      return invalid_argument("QP query image authority is incomplete");
+    if (query_mapping.size < 512 ||
+        (query_mapping.iova.value & 64'h1ff) != 0 ||
+        (query_mapping.backing_addr.value & 64'h1ff) != 0)
+      return invalid_state("QP query mapping is not a 512-byte image");
+    status = normalize_status(host_mem.read(query_mapping, 0, 512, data),
+                              "QP query image read returned null");
+    if (!status.ok())
+      return status;
+    if (data.size() != 512)
+      return invalid_state("QP query image read length is not 512 bytes");
+    case (reference_qpc.transport)
+      RDMA_TRANSPORT_RC: variant = "rc";
+      RDMA_TRANSPORT_UD: variant = "ud";
+      RDMA_TRANSPORT_URC: variant = "urc";
+      default: return invalid_argument("QP query transport is unsupported");
+    endcase
+    key.hw_version = "xtr_v1";
+    key.image_kind = RDMA_IMAGE_QPC;
+    key.object_type = "qpc";
+    key.variant = variant;
+    key.opcode = XTR_V1_OP_QPC_CREATE;
+    status = qpc_codecs.lookup(key, codec);
+    if (!status.ok() || codec == null)
+      return status.ok() ? invalid_state("QP query QPC codec is unavailable") : status;
+    image = rdma_hw_image::type_id::create("qp_query_image");
+    if (image == null)
+      return rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED,
+                               "QP query image allocation failed");
+    foreach (data[i]) image.bytes.push_back(data[i]);
+    image.length = 512;
+    image.alignment = 512;
+    image.endian = RDMA_ENDIAN_BIG;
+    image.image_kind = RDMA_IMAGE_QPC;
+    image.hardware_version = XTR_V1_HW_VERSION;
+    image.function_generation = expected_owner.generation;
+    image.write_target_kind = RDMA_HW_TARGET_NONE;
+    status = normalize_status(codec.validate_image(image),
+                              "QP query image validation returned null");
+    if (!status.ok())
+      return status;
+    status = normalize_status(codec.decode(image, decoded_model),
+                              "QP query image decode returned null");
+    if (!status.ok() || decoded_model == null)
+      return status.ok() ? invalid_state("QP query image decode is empty") : status;
+    if (!$cast(queried_qpc, decoded_model) || queried_qpc == null)
+      return invalid_state("QP query image is not a QPC model");
+    return normalize_status(queried_qpc.validate(),
+                           "QP query decoded QPC validation returned null");
+  endfunction
+
   protected function rdma_cmq_opcode_key make_opcode_key(
     bit [7:0] opcode, string variant
   );
@@ -877,7 +989,8 @@ class rdma_qp_lifecycle_executor extends uvm_object;
       return invalid_argument("QP command authority is incomplete");
     body = rdma_xtr_v1_qpc_command_body::type_id::create("qp_command_body");
     body.qp_h = rdma_clone_handle_value(model.qp_h, "QP command QPN");
-    if (opcode inside {XTR_V1_OP_QPC_CREATE, XTR_V1_OP_QPC_DELETE}) begin
+    if (opcode inside {XTR_V1_OP_QPC_CREATE, XTR_V1_OP_QPC_MODIFY,
+                       XTR_V1_OP_QPC_DELETE}) begin
       body.send_cq_h = rdma_clone_handle_value(model.send_cq_h,
                                                "QP command send CQN");
       body.recv_cq_h = rdma_clone_handle_value(model.recv_cq_h,
@@ -889,14 +1002,30 @@ class rdma_qp_lifecycle_executor extends uvm_object;
       body.qpc_buffer.value = staging.iova.value;
       body.next_state = RDMA_QPS_RESET;
     end
+    else if (opcode == XTR_V1_OP_QPC_MODIFY) begin
+      body.next_state = model.state;
+      if (staging != null) begin
+        body.qpc_buffer.value = staging.iova.value;
+        body.full_modify = 1'b1;
+        case (model.transport)
+          RDMA_TRANSPORT_RC,
+          RDMA_TRANSPORT_UD: body.wbe_template_count = 0;
+          RDMA_TRANSPORT_URC: body.wbe_template_count = 1;
+          default: return invalid_argument("QP modify transport is unsupported");
+        endcase
+      end
+    end
     command = rdma_cmq_command_desc::type_id::create("qp_command");
     command.function_h = rdma_clone_function_handle_value(owner,
                                                            "QP command");
     command.opcode_key = make_opcode_key(
-      opcode, opcode == XTR_V1_OP_QPC_CREATE ? "create" : "delete"
+      opcode, opcode == XTR_V1_OP_QPC_CREATE ? "create" :
+              opcode == XTR_V1_OP_QPC_MODIFY ? "modify" : "delete"
     );
     command.body = body;
-    command.qpc_signature_source = opcode == XTR_V1_OP_QPC_CREATE ? image : null;
+    command.qpc_signature_source =
+      opcode inside {XTR_V1_OP_QPC_CREATE, XTR_V1_OP_QPC_MODIFY} &&
+      staging != null ? image : null;
     command.timeout = command_timeout;
     return normalize_status(command.validate(),
                             "QP command validation returned null");
@@ -1106,6 +1235,89 @@ class rdma_qp_lifecycle_executor extends uvm_object;
     return normalize_status(recovery.validate(),
                             "QP create recovery validation returned null");
   endfunction
+
+  protected function rdma_status make_modify_recovery(
+    rdma_qp authoritative,
+    rdma_qpc_model prior_qpc,
+    rdma_qpc_model candidate_qpc,
+    rdma_dma_mapping staging,
+    rdma_dma_mapping query_mapping,
+    bit query_mapping_recovery_only,
+    rdma_cmq_ticket ticket,
+    output rdma_qp_recovery_state recovery
+  );
+    recovery = rdma_qp_recovery_state::type_id::create("qp_modify_recovery");
+    if (authoritative == null || authoritative.qp_plan == null ||
+        authoritative.qp_plan.context_ref == null || prior_qpc == null ||
+        candidate_qpc == null || ticket == null)
+      return invalid_argument("QP modify recovery authority is incomplete");
+    recovery.intent = RDMA_QP_RECOVER_MODIFY_RECONCILE;
+    recovery.ambiguous_operation = RDMA_QP_AMBIG_MODIFY;
+    recovery.ambiguous_role = RDMA_QUEUE_ROLE_QP_SQ_RING;
+    recovery.prior_qpc = prior_qpc;
+    recovery.candidate_qpc = candidate_qpc;
+    recovery.qp_plan = authoritative.qp_plan;
+    recovery.context_ref = authoritative.qp_plan.context_ref;
+    recovery.staging_mapping = staging;
+    recovery.query_mapping = query_mapping;
+    recovery.query_mapping_recovery_only = query_mapping_recovery_only;
+    recovery.create_opcode = make_opcode_key(XTR_V1_OP_QPC_CREATE, "create");
+    recovery.modify_opcode = make_opcode_key(XTR_V1_OP_QPC_MODIFY, "modify");
+    recovery.delete_opcode = make_opcode_key(XTR_V1_OP_QPC_DELETE, "delete");
+    recovery.query_opcode = make_opcode_key(XTR_V1_OP_QPC_QUERY, "query");
+    recovery.occ_opcode = make_opcode_key(XTR_V1_OP_OCC_FLUSH, "occ_flush");
+    recovery.ambiguous_ticket = rdma_cmq_clone_ticket_value(
+      ticket, "QP modify recovery"
+    );
+    return normalize_status(recovery.validate(),
+                            "QP modify recovery validation returned null");
+  endfunction
+
+  protected task retain_modify_recovery(
+    rdma_qp authoritative,
+    rdma_qpc_model prior_qpc,
+    rdma_qpc_model candidate_qpc,
+    rdma_dma_mapping staging,
+    rdma_dma_mapping query_mapping,
+    bit query_mapping_recovery_only,
+    rdma_cmq_ticket ticket,
+    rdma_status primary,
+    output rdma_control_result result
+  );
+    rdma_qp_recovery_state recovery;
+    rdma_status status;
+    rdma_status primary_copy;
+
+    primary_copy = normalize_status(primary, "QP modify primary status is null");
+    if (result == null)
+      result = rdma_control_result::type_id::create("qp_modify_recovery_result");
+    if (authoritative == null) begin
+      publish_primary(result, invalid_state("QP modify recovery target is null"));
+      return;
+    end
+    status = make_modify_recovery(authoritative, prior_qpc, candidate_qpc,
+                                  staging, query_mapping,
+                                  query_mapping_recovery_only, ticket,
+                                  recovery);
+    if (status.ok())
+      status = normalize_status(manager.mark_qp_error(authoritative.handle,
+                                                       recovery),
+                                "QP modify ERROR publication returned null");
+    result.resource_h = rdma_clone_handle_value(authoritative.handle,
+                                                "QP modify recovery handle");
+    result.final_resource_state = RDMA_RESOURCE_ERROR;
+    result.final_resource_state_known = status.ok();
+    result.recovery_required = status.ok();
+    if (status.ok()) begin
+      result.primary_status = rdma_cmq_clone_status_value(primary_copy);
+      result.status = rdma_status::make(RDMA_SC_RECOVERY_REQUIRED,
+                                        "QP modify outcome is ambiguous");
+    end
+    else begin
+      append_rollback_status(result, status);
+      publish_primary(result, primary_copy);
+    end
+  endtask
 
   protected task execute_terminal_command(
     rdma_function_binding binding,
@@ -1846,11 +2058,266 @@ class rdma_qp_lifecycle_executor extends uvm_object;
                      longint unsigned transaction_id,
                      output rdma_qp qp,
                      output rdma_control_result result);
+    rdma_status status;
+    rdma_status fence_status;
+    rdma_resource resource;
+    rdma_qp authoritative;
+    uvm_object cloned;
+    rdma_qpc_model candidate_qpc;
+    rdma_qpc_model prior_qpc;
+    rdma_dma_mapping staging;
+    rdma_dma_mapping query_mapping;
+    rdma_hw_image image;
+    rdma_cmq_command_desc command;
+    rdma_cmq_ticket ticket;
+    rdma_cmq_completion completion;
+    bit ambiguous;
+    rdma_status ambiguous_primary;
+    bit release_complete;
+    bit full_modify;
+    bit state_only;
+    bit query_mapping_valid;
+    bit query_mapping_recovery_only;
+    rdma_dma_request_context query_context;
     qp = null;
     result = rdma_control_result::type_id::create("qp_modify_result");
     result.transaction_id = transaction_id;
-    result.status = rdma_status::make(RDMA_SC_UNSUPPORTED_OPCODE,
-                                      "QP modify is not implemented yet");
+    result.primary_status = invalid_state("QP modify did not complete");
+    result.status = result.primary_status;
+    if (transaction_id == 0) begin
+      publish_primary(result, invalid_argument("QP transaction ID is zero")); return;
+    end
+    if (binding == null || expected_owner == null || request == null || manager == null) begin
+      publish_primary(result, invalid_state("QP modify executor is not configured")); return;
+    end
+    status = live_binding_fence(binding, expected_owner);
+    if (status.ok()) status = normalize_status(request.validate(),
+                                               "QP modify request validation returned null");
+    if (status.ok()) status = manager.lookup(request.qp_h, resource);
+    if (status.ok() && (resource == null || !$cast(authoritative, resource)))
+      status = invalid_argument("QP modify target is not a QP");
+    if (status.ok() && authoritative.state != RDMA_RESOURCE_ACTIVE)
+      status = invalid_state("QP modify requires ACTIVE QP");
+    if (status.ok() && authoritative.programmed_qpc == null)
+      status = invalid_state("QP programmed QPC is missing");
+    if (status.ok() && authoritative.outstanding_ids.size() != 0)
+      status = rdma_status::make(RDMA_SC_RESOURCE_BUSY, "QP has outstanding operations");
+    if (status.ok() && (request.owner == null || !request.owner.same_instance(expected_owner)))
+      status = invalid_argument("QP modify owner does not match binding");
+    if (status.ok() && (authoritative.qp_state inside {RDMA_QPS_SQD, RDMA_QPS_SQE} ||
+                        request.new_state inside {RDMA_QPS_SQD, RDMA_QPS_SQE}))
+      status = rdma_status::make(RDMA_SC_UNSUPPORTED_OPCODE,
+                                  "QP SQD/SQE modify is unsupported");
+    if (status.ok()) status = request.validate_for_transport(authoritative.transport);
+    if (status.ok() && request.new_state == authoritative.qp_state)
+      status = invalid_state("QP state transition is unchanged");
+    full_modify = 1'b0;
+    state_only = 1'b0;
+    if (status.ok()) begin
+      case (authoritative.qp_state)
+        RDMA_QPS_RESET:
+          if (request.new_state == RDMA_QPS_INIT) state_only = 1'b1;
+          else status = invalid_state("QP RESET transition is invalid");
+        RDMA_QPS_INIT:
+          if (request.new_state == RDMA_QPS_RTR) full_modify = 1'b1;
+          else if (request.new_state inside {RDMA_QPS_ERROR, RDMA_QPS_RESET}) state_only = 1'b1;
+          else status = invalid_state("QP INIT transition is invalid");
+        RDMA_QPS_RTR:
+          if (request.new_state == RDMA_QPS_RTS) full_modify = 1'b1;
+          else if (request.new_state inside {RDMA_QPS_ERROR, RDMA_QPS_RESET}) state_only = 1'b1;
+          else status = invalid_state("QP RTR transition is invalid");
+        RDMA_QPS_RTS:
+          if (request.new_state inside {RDMA_QPS_ERROR, RDMA_QPS_RESET}) state_only = 1'b1;
+          else status = invalid_state("QP RTS transition is invalid");
+        RDMA_QPS_ERROR:
+          if (request.new_state == RDMA_QPS_RESET) state_only = 1'b1;
+          else status = invalid_state("QP ERROR transition is invalid");
+        default: status = invalid_state("QP state transition is invalid");
+      endcase
+    end
+    if (status.ok() && state_only &&
+        authoritative.qp_state == RDMA_QPS_RESET && request.new_state == RDMA_QPS_INIT) begin
+      status = manager.commit_qp_semantic_state(authoritative.handle, RDMA_QPS_INIT);
+      if (status.ok()) begin
+        status = manager.lookup(authoritative.handle, resource);
+        if (status.ok()) begin
+          cloned = resource.clone();
+          if (cloned == null || !$cast(qp, cloned)) status = invalid_state("QP semantic result snapshot is invalid");
+        end
+      end
+      if (!status.ok()) begin qp = null; publish_primary(result, status); return; end
+      result.resource_h = rdma_clone_handle_value(qp.handle, "QP modify result");
+      result.final_resource_state = RDMA_RESOURCE_ACTIVE;
+      result.final_resource_state_known = 1'b1;
+      publish_primary(result, rdma_status::success());
+      return;
+    end
+    if (status.ok()) begin
+      cloned = authoritative.programmed_qpc.clone();
+      if (cloned == null || !$cast(prior_qpc, cloned))
+        status = invalid_state("QP prior QPC clone failed");
+    end
+    if (status.ok()) begin
+      cloned = prior_qpc.clone();
+      if (cloned == null || !$cast(candidate_qpc, cloned))
+        status = invalid_state("QP candidate QPC clone failed");
+      else begin
+        candidate_qpc.state = request.new_state;
+        if (full_modify) begin
+          case (authoritative.transport)
+            RDMA_TRANSPORT_RC: begin
+              rdma_qpc_rc_ext rc;
+              if (!$cast(rc, candidate_qpc.transport_ext)) status = invalid_state("RC QPC extension is invalid");
+              else begin
+                if (request.destination_qpn_valid) rc.remote_qpn = request.destination_qpn;
+                if (request.send_psn_valid) rc.send_psn = request.send_psn;
+                if (request.recv_psn_valid) rc.recv_psn = request.recv_psn;
+              end
+            end
+            RDMA_TRANSPORT_URC: begin
+              rdma_qpc_urc_ext urc;
+              if (!$cast(urc, candidate_qpc.transport_ext)) status = invalid_state("URC QPC extension is invalid");
+              else begin
+                if (request.destination_qpn_valid) urc.remote_qpn = request.destination_qpn;
+                // URC PSN attributes map directly to the extension's
+                // destination/source sequence numbers.
+                if (request.send_psn_valid) urc.dpsn = request.send_psn;
+                if (request.recv_psn_valid) urc.rpsn = request.recv_psn;
+              end
+            end
+            default: ;
+          endcase
+        end
+        if (status.ok()) status = candidate_qpc.validate();
+      end
+    end
+    if (status.ok() && full_modify)
+      status = encode_qpc_staging(binding, candidate_qpc, authoritative.handle,
+                                  expected_owner, staging, image);
+    if (status.ok())
+      status = build_qpc_command(expected_owner, candidate_qpc,
+                                 full_modify ? staging : null,
+                                 full_modify ? image : null,
+                                 XTR_V1_OP_QPC_MODIFY, command);
+    if (status.ok()) begin
+      ticket = null; completion = null; ambiguous = 1'b0; status = null;
+      cmq.execute(command, ticket, completion, status);
+      // Some CMQ adapters expose the authoritative ticket only through the
+      // completion.  Recover it before classifying the outcome so a
+      // definitive completion remains definitive and an ambiguous one keeps
+      // a usable reconciliation ticket.
+      if (ticket == null && completion != null && completion.ticket != null)
+        ticket = rdma_cmq_clone_ticket_value(
+          completion.ticket, "QP modify completion ticket"
+        );
+      ambiguous = cmq_outcome_ambiguous(status, ticket, completion);
+      fence_status = live_binding_fence(binding, expected_owner);
+      if (!fence_status.ok()) begin status = fence_status; ambiguous = 1'b1; end
+      else status = normalize_status(status, "QPC_MODIFY result was lost");
+      ambiguous_primary = rdma_cmq_clone_status_value(status);
+    end
+    if (ambiguous) begin
+      // Recovery owns a separate query buffer.  The mapping is intentionally
+      // allocated before ERROR publication and remains live until recovery
+      // proves the hardware image no longer references it.
+      status = make_dma_context(binding, authoritative.handle,
+                                RDMA_QUEUE_ROLE_QP_SQ_PD, query_context);
+      query_mapping_valid = 1'b0;
+      query_mapping_recovery_only = 1'b0;
+      if (status.ok()) begin
+        query_context.queue_role_valid = 1'b0;
+        status = live_binding_fence(binding, expected_owner);
+      end
+      if (status.ok()) begin
+        status = normalize_status(host_mem.allocate(query_context, 512, 512,
+          RDMA_DMA_DEVICE_WRITE, query_mapping),
+          "QP modify query allocation returned null");
+        fence_status = live_binding_fence(binding, expected_owner);
+        if (!fence_status.ok()) status = fence_status;
+      end
+      if (status.ok() && query_mapping != null && query_mapping.size == 512 &&
+          (query_mapping.iova.value & 64'h1ff) == 0 &&
+          (query_mapping.backing_addr.value & 64'h1ff) == 0)
+        query_mapping_valid = 1'b1;
+      if (query_mapping_valid) begin
+        retain_modify_recovery(authoritative, prior_qpc, candidate_qpc,
+                               staging, query_mapping, 1'b0, ticket,
+                               ambiguous_primary, result);
+        qp = null;
+        return;
+      end
+      if (query_mapping != null) begin
+        void'(release_mapping_opaque(query_mapping, "QP failed query",
+                                     release_complete));
+        if (release_complete)
+          query_mapping = null;
+        else
+          query_mapping_recovery_only = 1'b1;
+      end
+      // A failed query allocation is itself unable to prove hardware state,
+      // but the modify ambiguity must still become durable ERROR authority.
+      // Recovery will report RECOVERY_REQUIRED until a query buffer is
+      // available; it must never guess ACTIVE or discard the ticket/staging.
+      if (query_mapping == null) begin
+        retain_modify_recovery(authoritative, prior_qpc, candidate_qpc,
+                               staging, null, 1'b0, ticket,
+                               ambiguous_primary, result);
+        qp = null;
+        return;
+      end
+      if (query_mapping_recovery_only) begin
+        retain_modify_recovery(authoritative, prior_qpc, candidate_qpc,
+                               staging, query_mapping, 1'b1, ticket,
+                               ambiguous_primary, result);
+        qp = null;
+        return;
+      end
+      qp = null;
+      publish_primary(result, status);
+      return;
+    end
+    if (!status.ok()) begin
+      if (staging != null && !release_complete)
+        void'(release_mapping_opaque(staging, "QP failed staging", release_complete));
+      qp = null;
+      publish_primary(result, status);
+      return;
+    end
+    if (staging != null) begin
+      status = release_mapping_opaque(staging, "QP modify staging", release_complete);
+      if (!status.ok() || !release_complete) begin
+        // The command completed, but temporary authority did not.  Treat it
+        // as an ambiguous modify so recovery can release it exactly once.
+        retain_modify_recovery(authoritative, prior_qpc, candidate_qpc,
+                               staging, null, 1'b0, ticket, status, result);
+        qp = null;
+        return;
+      end
+      staging = null;
+    end
+    begin
+      rdma_qp candidate;
+      cloned = authoritative.clone();
+      if (cloned == null || !$cast(candidate, cloned)) status = invalid_state("QP candidate resource clone failed");
+      else begin
+        candidate.state = RDMA_RESOURCE_ACTIVE;
+        candidate.qp_state = request.new_state;
+        candidate.programmed_qpc = candidate_qpc;
+        status = manager.commit_qp_programmed(candidate);
+      end
+    end
+    if (status.ok()) begin
+      status = manager.lookup(authoritative.handle, resource);
+      if (status.ok()) begin
+        cloned = resource.clone();
+        if (cloned == null || !$cast(qp, cloned)) status = invalid_state("QP modify result snapshot invalid");
+      end
+    end
+    if (!status.ok()) begin qp = null; publish_primary(result, status); return; end
+    result.resource_h = rdma_clone_handle_value(qp.handle, "QP modify result");
+    result.final_resource_state = RDMA_RESOURCE_ACTIVE;
+    result.final_resource_state_known = 1'b1;
+    publish_primary(result, rdma_status::success());
   endtask
 
   task destroy_locked(rdma_function_binding binding,
@@ -1858,10 +2325,559 @@ class rdma_qp_lifecycle_executor extends uvm_object;
                       rdma_destroy_resource_req request,
                       longint unsigned transaction_id,
                       output rdma_control_result result);
+    rdma_status status, step_status, primary;
+    rdma_resource snapshot;
+    rdma_qp qp;
+    rdma_qp_recovery_state recovery;
+    rdma_qpc_model prior_qpc, error_qpc;
+    rdma_cmq_command_desc command;
+    rdma_cmq_ticket ticket;
+    rdma_cmq_completion completion;
+    rdma_qp_backing_ref refs[$];
+    rdma_queue_backing_role_e roles[$];
+    rdma_qp_ambiguous_operation_e ambiguous_operation;
+    rdma_queue_backing_role_e ambiguous_role;
+    bit ambiguous, hardware_absent, release_complete, error_modify_complete;
+
     result = rdma_control_result::type_id::create("qp_destroy_result");
     result.transaction_id = transaction_id;
-    result.status = rdma_status::make(RDMA_SC_UNSUPPORTED_OPCODE,
-                                      "QP destroy is not implemented yet");
+    result.resource_h = request == null ? null :
+      rdma_clone_handle_value(request.target_h, "QP destroy handle");
+    status = (transaction_id == 0 || binding == null || expected_owner == null ||
+              request == null || request.target_h == null || manager == null ||
+              cmq == null) ? invalid_argument("QP destroy input is invalid") :
+             live_binding_fence(binding, expected_owner);
+    if (status.ok()) status = normalize_status(manager.lookup(request.target_h,
+                                                               snapshot),
+                                               "QP destroy lookup returned null");
+    if (status.ok() && (snapshot == null || !$cast(qp, snapshot) ||
+                        qp.resource_kind() != RDMA_RESOURCE_QP))
+      status = invalid_argument("QP destroy target is not a QP");
+    if (status.ok() && (qp.state != RDMA_RESOURCE_ACTIVE ||
+                        !same_owner(qp.owner, expected_owner)))
+      status = qp.state != RDMA_RESOURCE_ACTIVE ?
+        invalid_state("QP destroy requires ACTIVE QP") :
+        invalid_argument("QP destroy owner mismatch");
+    if (status.ok()) status = normalize_status(manager.begin_quiesce(qp.handle),
+                                               "QP begin quiesce returned null");
+    if (!status.ok()) begin
+      publish_primary(result, status);
+      return;
+    end
+    prior_qpc = qp.programmed_qpc;
+    ambiguous_operation = RDMA_QP_AMBIG_NONE;
+    ambiguous_role = RDMA_QUEUE_ROLE_QP_SQ_RING;
+    error_modify_complete = qp.qp_state == RDMA_QPS_ERROR;
+    hardware_absent = 1'b0;
+    // Transition the device to ERROR before flushing queues unless already
+    // in ERROR.  This is a state-only QPC_MODIFY.
+    if (qp.qp_state != RDMA_QPS_ERROR) begin
+      if (prior_qpc == null) status = invalid_state("QP programmed QPC is missing");
+      else begin
+        error_qpc = null;
+        if (!$cast(error_qpc, prior_qpc.clone()) || error_qpc == null)
+          status = invalid_state("QP ERROR QPC clone failed");
+        else begin
+          error_qpc.state = RDMA_QPS_ERROR;
+          status = build_qpc_command(expected_owner, error_qpc, null, null,
+                                     XTR_V1_OP_QPC_MODIFY, command);
+          if (status.ok()) begin
+            ticket = null; completion = null; step_status = null;
+            cmq.execute(command, ticket, completion, step_status);
+            if (ticket == null && completion != null && completion.ticket != null)
+              ticket = rdma_cmq_clone_ticket_value(
+                completion.ticket, "QP ERROR modify completion ticket");
+            ambiguous = cmq_outcome_ambiguous(step_status, ticket, completion);
+            if (ambiguous) begin
+              ambiguous_operation = RDMA_QP_AMBIG_MODIFY;
+              ambiguous_role = RDMA_QUEUE_ROLE_QP_SQ_RING;
+            end
+            status = normalize_status(step_status, "QP ERROR modify returned null");
+            if (status.ok() && (completion == null || completion.status == null))
+              status = invalid_state("QP ERROR modify completion missing");
+          end
+        end
+      end
+      if (status.ok())
+        error_modify_complete = 1'b1;
+    end
+    // Flush QPN EIRQ/ORQ/UAQ, then SQ-PD and private RQ-PD (SRQ-backed QPs
+    // intentionally omit the private RQ-PD operation).
+    if (status.ok()) begin
+      roles.push_back(RDMA_QUEUE_ROLE_QP_SQ_RING);
+      roles.push_back(RDMA_QUEUE_ROLE_QP_SQ_PD);
+      if (qp.qp_plan != null && qp.qp_plan.rq_source_h == null)
+        roles.push_back(RDMA_QUEUE_ROLE_QP_RQ_PD);
+      foreach (roles[i]) begin
+        rdma_qp_backing_ref pd_ref;
+        pd_ref = roles[i] == RDMA_QUEUE_ROLE_QP_SQ_PD ? qp.qp_plan.sq_pd_ref :
+                 roles[i] == RDMA_QUEUE_ROLE_QP_RQ_PD ? qp.qp_plan.rq_pd_ref : null;
+        status = build_occ_command(expected_owner, qp.local_qp_id, pd_ref, command);
+        if (!status.ok()) break;
+        ticket = null; completion = null; step_status = null;
+        cmq.execute(command, ticket, completion, step_status);
+        if (ticket == null && completion != null && completion.ticket != null)
+          ticket = rdma_cmq_clone_ticket_value(
+            completion.ticket, "QP OCC completion ticket");
+        ambiguous = cmq_outcome_ambiguous(step_status, ticket, completion);
+        if (ambiguous) begin
+          ambiguous_operation = RDMA_QP_AMBIG_OCC_FLUSH;
+          ambiguous_role = roles[i];
+        end
+        status = normalize_status(step_status, "QP OCC flush returned null");
+        if (status.ok() && (completion == null || completion.status == null))
+          status = invalid_state("QP OCC completion missing");
+        if (status.ok()) status = normalize_status(
+          manager.record_qp_flush_complete(qp.handle, roles[i]),
+          "QP flush progress returned null");
+        if (!status.ok()) break;
+        result.completed_steps.push_back(RDMA_CTRL_STEP_HW_OCC_FLUSHED);
+      end
+    end
+    if (status.ok()) begin
+      status = build_qpc_command(expected_owner, prior_qpc, null, null,
+                                 XTR_V1_OP_QPC_DELETE, command);
+      if (status.ok()) begin
+        ticket = null; completion = null; step_status = null;
+        cmq.execute(command, ticket, completion, step_status);
+        if (ticket == null && completion != null && completion.ticket != null)
+          ticket = rdma_cmq_clone_ticket_value(
+            completion.ticket, "QP delete completion ticket");
+        ambiguous = cmq_outcome_ambiguous(step_status, ticket, completion);
+        if (ambiguous) begin
+          ambiguous_operation = RDMA_QP_AMBIG_DELETE;
+          ambiguous_role = RDMA_QUEUE_ROLE_QP_SQ_RING;
+        end
+        status = normalize_status(step_status, "QP delete returned null");
+        if (status.ok() && (completion == null || completion.status == null))
+          status = invalid_state("QP delete completion missing");
+        if (status.ok()) begin
+          hardware_absent = 1'b1;
+          result.completed_steps.push_back(RDMA_CTRL_STEP_HW_CONTEXT_DELETED);
+        end
+      end
+    end
+    if (status.ok() && qp.qp_plan != null && qp.qp_plan.context_ref != null) begin
+      status = release_context_opaque(qp.qp_plan.context_ref, "QP destroy context",
+                                      release_complete);
+      if (status.ok()) status = normalize_status(
+        manager.record_qp_context_cleanup_complete(qp.handle),
+        "QP context progress returned null");
+    end
+    if (status.ok() && qp.qp_plan != null) begin
+      if (qp.qp_plan.rq_source_h == null) refs.push_back(qp.qp_plan.rq_pd_ref);
+      refs.push_back(qp.qp_plan.sq_pd_ref);
+      refs.push_back(qp.qp_plan.rq_ref);
+      refs.push_back(qp.qp_plan.sq_ref);
+      foreach (qp.qp_plan.urc_refs[i]) refs.push_back(qp.qp_plan.urc_refs[i]);
+      // URC refs are released in reverse planner order; the compact list
+      // above is corrected by iterating the canonical order explicitly.
+      refs.delete();
+      for (int i = qp.qp_plan.urc_refs.size()-1; i >= 0; i--)
+        refs.push_back(qp.qp_plan.urc_refs[i]);
+      refs.push_back(qp.qp_plan.rq_pd_ref); refs.push_back(qp.qp_plan.sq_pd_ref);
+      refs.push_back(qp.qp_plan.rq_ref); refs.push_back(qp.qp_plan.sq_ref);
+      foreach (refs[i]) begin
+        if (refs[i] == null || refs[i].ownership == RDMA_OWNERSHIP_BORROWED) continue;
+        status = release_mapping_opaque(refs[i].mapping, "QP destroy backing", release_complete);
+        if (status.ok()) status = normalize_status(
+          manager.record_qp_cleanup_complete(qp.handle, refs[i].role),
+          "QP backing progress returned null");
+        if (!status.ok()) break;
+      end
+    end
+    if (status.ok()) status = normalize_status(manager.finalize_qp_release(qp.handle),
+                                               "QP finalization returned null");
+    if (status.ok()) begin
+      result.final_resource_state = RDMA_RESOURCE_RELEASED;
+      result.final_resource_state_known = 1'b1;
+      publish_primary(result, rdma_status::success());
+      return;
+    end
+    // Refresh the manager-authoritative plan after any successfully recorded
+    // flush/context progress; the lookup API deliberately returns a detached
+    // projection, so the original pre-quiesce snapshot is stale here.
+    if (manager.lookup(qp.handle, snapshot).ok() && $cast(qp, snapshot)) begin
+      prior_qpc = qp.programmed_qpc;
+    end
+    primary = rdma_cmq_clone_status_value(status);
+    // Any hardware side effect leaves ERROR recovery authority; never restore
+    // ACTIVE after an ERROR modify, flush, or delete was attempted.
+    recovery = rdma_qp_recovery_state::type_id::create("qp_destroy_recovery");
+    recovery.intent = RDMA_QP_RECOVER_NORMAL_DESTROY;
+    recovery.ambiguous_operation = ambiguous_operation;
+    recovery.ambiguous_role = ambiguous_role;
+    recovery.prior_qpc = prior_qpc;
+    recovery.qp_plan = qp.qp_plan;
+    recovery.context_ref = qp.qp_plan == null ? null : qp.qp_plan.context_ref;
+    recovery.create_opcode = make_opcode_key(XTR_V1_OP_QPC_CREATE, "create");
+    recovery.modify_opcode = make_opcode_key(XTR_V1_OP_QPC_MODIFY, "modify");
+    recovery.delete_opcode = make_opcode_key(XTR_V1_OP_QPC_DELETE, "delete");
+    recovery.query_opcode = make_opcode_key(XTR_V1_OP_QPC_QUERY, "query");
+    recovery.occ_opcode = make_opcode_key(XTR_V1_OP_OCC_FLUSH, "occ_flush");
+    recovery.error_modify_complete = error_modify_complete;
+    recovery.delete_complete = hardware_absent;
+    recovery.ambiguous_ticket = ambiguous_operation != RDMA_QP_AMBIG_NONE ?
+      rdma_cmq_clone_ticket_value(ticket,
+      "QP destroy recovery") : null;
+    begin
+      rdma_status publish_status;
+      publish_status = manager.mark_qp_error(qp.handle, recovery);
+      if (publish_status.ok()) begin
+        result.final_resource_state = RDMA_RESOURCE_ERROR;
+        result.final_resource_state_known = 1'b1;
+        result.recovery_required = 1'b1;
+        result.status = rdma_status::make(RDMA_SC_RECOVERY_REQUIRED,
+                                          "QP destroy requires recovery");
+      end else publish_primary(result, primary);
+    end
+  endtask
+
+  // Resume a destroy that reached ERROR after at least one hardware or
+  // adapter side effect.  Every milestone is persisted through the resource
+  // manager before the next side effect, so a retry can safely continue from
+  // the first incomplete operation.
+  protected task recover_destroy_locked(
+    rdma_function_binding binding,
+    rdma_function_handle expected_owner,
+    rdma_handle resource_h,
+    longint unsigned transaction_id,
+    output rdma_control_result result
+  );
+    rdma_status status;
+    rdma_status fence_status;
+    rdma_resource resource;
+    rdma_qp authoritative;
+    rdma_recovery_record record;
+    rdma_qp_recovery_state recovery;
+    rdma_cmq_ticket ticket;
+    rdma_cmq_completion completion;
+    rdma_cmq_command_desc command;
+    rdma_qpc_model error_qpc;
+    rdma_dma_mapping probe;
+    rdma_qp_backing_ref refs[$];
+    rdma_queue_backing_role_e roles[$];
+    bit terminal_known;
+    bit release_complete;
+    bit cloned_ok;
+    rdma_qp_ambiguous_operation_e reconciled_operation;
+    uvm_object cloned;
+
+    result = rdma_control_result::type_id::create("qp_destroy_recover_result");
+    result.transaction_id = transaction_id;
+    result.resource_h = rdma_clone_handle_value(resource_h,
+                                                "QP destroy recovery handle");
+    result.primary_status = invalid_state("QP destroy recovery did not complete");
+    result.status = result.primary_status;
+    status = live_binding_fence(binding, expected_owner);
+    if (status.ok()) status = manager.lookup(resource_h, resource);
+    if (status.ok() && (resource == null || !$cast(authoritative, resource)))
+      status = invalid_argument("QP destroy recovery target is not a QP");
+    if (status.ok() && authoritative.state != RDMA_RESOURCE_ERROR)
+      status = invalid_state("QP destroy recovery requires an ERROR QP");
+    if (status.ok()) status = manager.lookup_recovery(resource_h, record);
+    if (status.ok() && (record == null || !record.qp_recovery_valid ||
+                        record.qp_recovery == null))
+      status = invalid_state("QP destroy recovery record is missing");
+    if (status.ok()) begin
+      cloned = record.qp_recovery.clone();
+      if (cloned == null || !$cast(recovery, cloned))
+        status = invalid_state("QP destroy recovery snapshot clone failed");
+    end
+    if (status.ok() && recovery.intent != RDMA_QP_RECOVER_NORMAL_DESTROY)
+      status = invalid_state("QP recovery intent is not normal destroy");
+    if (!status.ok()) begin
+      result.recovery_required = 1'b1;
+      result.final_resource_state = RDMA_RESOURCE_ERROR;
+      result.final_resource_state_known = 1'b1;
+      publish_primary(result, status);
+      return;
+    end
+
+    // Reconcile exactly the operation named by the durable ticket.  A reset
+    // cancellation or missing terminal result leaves the ticket untouched.
+    if (recovery.ambiguous_operation != RDMA_QP_AMBIG_NONE) begin
+      reconciled_operation = recovery.ambiguous_operation;
+      terminal_known = 1'b0;
+      completion = null;
+      cmq.reconcile(recovery.ambiguous_ticket, terminal_known, completion,
+                    status);
+      status = normalize_status(status,
+                                 "QP destroy reconciliation returned null");
+      if (status.ok() && !terminal_known) begin
+        publish_primary(result, rdma_status::make(
+          RDMA_SC_RECOVERY_REQUIRED,
+          "QP destroy ambiguity has no terminal result"));
+        return;
+      end
+      if (status.ok() && (completion == null || completion.status == null))
+        status = invalid_state("QP destroy reconciliation completion is incomplete");
+      if (status.ok() && completion.status.code inside {
+            RDMA_SC_TIMEOUT, RDMA_SC_RESET_CANCELLED}) begin
+        publish_primary(result, rdma_status::make(
+          RDMA_SC_RECOVERY_REQUIRED,
+          "QP destroy reconciliation remains ambiguous"));
+        return;
+      end
+      if (status.ok()) begin
+        if (reconciled_operation == RDMA_QP_AMBIG_MODIFY)
+          recovery.error_modify_complete = completion.status.ok();
+        else if (reconciled_operation == RDMA_QP_AMBIG_DELETE)
+          recovery.delete_complete = completion.status.ok();
+        // Clear the operation ticket before recording any operation-specific
+        // progress.  The manager enforces this ambiguity transition order.
+        recovery.ambiguous_operation = RDMA_QP_AMBIG_NONE;
+        recovery.ambiguous_ticket = null;
+        status = manager.mark_qp_error(resource_h, recovery);
+        if (status.ok() && reconciled_operation == RDMA_QP_AMBIG_OCC_FLUSH &&
+            recovery.ambiguous_role inside {
+              RDMA_QUEUE_ROLE_QP_SQ_RING,
+              RDMA_QUEUE_ROLE_QP_SQ_PD,
+              RDMA_QUEUE_ROLE_QP_RQ_PD}) begin
+          if (completion.status.ok() &&
+              recovery.ambiguous_role != RDMA_QUEUE_ROLE_QP_SQ_RING)
+            status = manager.record_qp_flush_complete(
+              resource_h, recovery.ambiguous_role);
+          else if (completion.status.ok())
+            status = manager.record_qp_flush_complete(
+              resource_h, recovery.ambiguous_role);
+        end
+        if (status.ok() && reconciled_operation == RDMA_QP_AMBIG_DELETE &&
+            completion.status.ok())
+          status = manager.update_qp_recovery_progress(resource_h, recovery);
+        if (status.ok()) begin
+          // Re-read the persisted snapshot after manager progress updates.
+          status = manager.lookup_recovery(resource_h, record);
+          if (status.ok() && record != null && record.qp_recovery != null) begin
+            cloned = record.qp_recovery.clone();
+            if (cloned == null || !$cast(recovery, cloned))
+              status = invalid_state("QP destroy recovery refresh failed");
+          end
+        end
+      end
+      if (!status.ok()) begin
+        publish_primary(result, status);
+        result.recovery_required = 1'b1;
+        result.final_resource_state = RDMA_RESOURCE_ERROR;
+        result.final_resource_state_known = 1'b1;
+        return;
+      end
+    end
+
+    // ERROR transition (if it was not completed before the failure).
+    if (!recovery.error_modify_complete) begin
+      status = live_binding_fence(binding, expected_owner);
+      if (status.ok()) begin
+        cloned = recovery.prior_qpc.clone();
+        if (cloned == null || !$cast(error_qpc, cloned))
+          status = invalid_state("QP destroy ERROR QPC clone failed");
+        else begin
+          error_qpc.state = RDMA_QPS_ERROR;
+          status = build_qpc_command(expected_owner, error_qpc, null, null,
+                                     XTR_V1_OP_QPC_MODIFY, command);
+          if (status.ok()) begin
+            ticket = null; completion = null;
+            cmq.execute(command, ticket, completion, status);
+            if (ticket == null && completion != null && completion.ticket != null)
+              ticket = rdma_cmq_clone_ticket_value(
+                completion.ticket, "QP destroy ERROR ticket");
+            status = normalize_status(status,
+                                       "QP destroy ERROR retry returned null");
+            if (cmq_outcome_ambiguous(status, ticket, completion)) begin
+              recovery.ambiguous_operation = RDMA_QP_AMBIG_MODIFY;
+              recovery.ambiguous_role = RDMA_QUEUE_ROLE_QP_SQ_RING;
+              recovery.ambiguous_ticket = rdma_cmq_clone_ticket_value(
+                ticket, "QP destroy ERROR retry");
+              void'(manager.mark_qp_error(resource_h, recovery));
+              publish_primary(result, rdma_status::make(
+                RDMA_SC_RECOVERY_REQUIRED,
+                "QP destroy ERROR transition remains ambiguous"));
+              result.recovery_required = 1'b1;
+              result.final_resource_state = RDMA_RESOURCE_ERROR;
+              result.final_resource_state_known = 1'b1;
+              return;
+            end
+            if (status.ok() && (completion == null || completion.status == null))
+              status = invalid_state("QP destroy ERROR retry completion missing");
+            if (status.ok()) recovery.error_modify_complete = 1'b1;
+          end
+        end
+      end
+      if (status.ok()) status = manager.update_qp_recovery_progress(
+        resource_h, recovery);
+      if (!status.ok()) begin
+        publish_primary(result, status);
+        result.recovery_required = 1'b1;
+        result.final_resource_state = RDMA_RESOURCE_ERROR;
+        result.final_resource_state_known = 1'b1;
+        return;
+      end
+    end
+
+    // Flush roles in canonical order, skipping roles already persisted.
+    roles.push_back(RDMA_QUEUE_ROLE_QP_SQ_RING);
+    roles.push_back(RDMA_QUEUE_ROLE_QP_SQ_PD);
+    if (recovery.qp_plan.rq_source_h == null)
+      roles.push_back(RDMA_QUEUE_ROLE_QP_RQ_PD);
+    foreach (roles[i]) begin
+      bit done;
+      done = (roles[i] == RDMA_QUEUE_ROLE_QP_SQ_RING) ?
+        recovery.qp_plan.cleanup_complete :
+        roles[i] == RDMA_QUEUE_ROLE_QP_SQ_PD ?
+        recovery.qp_plan.sq_pd_flush_complete :
+        recovery.qp_plan.rq_pd_flush_complete;
+      if (done) continue;
+      status = live_binding_fence(binding, expected_owner);
+      if (!status.ok()) break;
+      status = build_occ_command(expected_owner, authoritative.local_qp_id,
+                                 roles[i] == RDMA_QUEUE_ROLE_QP_SQ_PD ?
+                                   recovery.qp_plan.sq_pd_ref :
+                                 roles[i] == RDMA_QUEUE_ROLE_QP_RQ_PD ?
+                                   recovery.qp_plan.rq_pd_ref : null,
+                                 command);
+      if (status.ok()) begin
+        ticket = null; completion = null;
+        cmq.execute(command, ticket, completion, status);
+        if (ticket == null && completion != null && completion.ticket != null)
+          ticket = rdma_cmq_clone_ticket_value(completion.ticket,
+                                                "QP destroy OCC retry");
+        status = normalize_status(status, "QP destroy OCC retry returned null");
+        if (cmq_outcome_ambiguous(status, ticket, completion)) begin
+          recovery.ambiguous_operation = RDMA_QP_AMBIG_OCC_FLUSH;
+          recovery.ambiguous_role = roles[i];
+          recovery.ambiguous_ticket = rdma_cmq_clone_ticket_value(
+            ticket, "QP destroy OCC retry");
+          void'(manager.mark_qp_error(resource_h, recovery));
+          status = rdma_status::make(RDMA_SC_RECOVERY_REQUIRED,
+                                      "QP destroy OCC flush remains ambiguous");
+        end
+        else if (status.ok())
+          status = manager.record_qp_flush_complete(resource_h, roles[i]);
+      end
+      if (!status.ok()) break;
+      void'(manager.lookup_recovery(resource_h, record));
+      if (record != null && record.qp_recovery != null) begin
+        cloned = record.qp_recovery.clone();
+        if (cloned == null || !$cast(recovery, cloned)) begin
+          status = invalid_state("QP destroy recovery flush refresh failed");
+          break;
+        end
+      end
+    end
+    if (!status.ok()) begin
+      publish_primary(result, status);
+      result.recovery_required = 1'b1;
+      result.final_resource_state = RDMA_RESOURCE_ERROR;
+      result.final_resource_state_known = 1'b1;
+      return;
+    end
+
+    if (!recovery.delete_complete) begin
+      status = live_binding_fence(binding, expected_owner);
+      if (status.ok()) begin
+        status = build_qpc_command(expected_owner, recovery.prior_qpc,
+                                   null, null, XTR_V1_OP_QPC_DELETE,
+                                   command);
+        if (status.ok()) begin
+          ticket = null; completion = null;
+          cmq.execute(command, ticket, completion, status);
+          if (ticket == null && completion != null && completion.ticket != null)
+            ticket = rdma_cmq_clone_ticket_value(
+              completion.ticket, "QP destroy delete retry");
+          status = normalize_status(status, "QP destroy delete retry returned null");
+          if (cmq_outcome_ambiguous(status, ticket, completion)) begin
+            recovery.ambiguous_operation = RDMA_QP_AMBIG_DELETE;
+            recovery.ambiguous_role = RDMA_QUEUE_ROLE_QP_SQ_RING;
+            recovery.ambiguous_ticket = rdma_cmq_clone_ticket_value(
+              ticket, "QP destroy delete retry");
+            void'(manager.mark_qp_error(resource_h, recovery));
+            status = rdma_status::make(RDMA_SC_RECOVERY_REQUIRED,
+                                        "QP delete remains ambiguous");
+          end
+          else if (status.ok()) recovery.delete_complete = 1'b1;
+        end
+      end
+      if (status.ok()) status = manager.update_qp_recovery_progress(
+        resource_h, recovery);
+      if (!status.ok()) begin
+        publish_primary(result, status);
+        result.recovery_required = 1'b1;
+        result.final_resource_state = RDMA_RESOURCE_ERROR;
+        result.final_resource_state_known = 1'b1;
+        return;
+      end
+    end
+
+    // Context release precedes all owned backing releases.
+    if (recovery.context_ref != null && !recovery.context_ref.release_complete) begin
+      status = release_context_opaque(recovery.context_ref,
+                                      "QP destroy recovery context",
+                                      release_complete);
+      if (status.ok()) status = manager.record_qp_context_cleanup_complete(
+        resource_h);
+      if (!status.ok() || !release_complete) begin
+        if (status.ok()) status = rdma_status::make(
+          RDMA_SC_RECOVERY_REQUIRED, "QP destroy context release remains incomplete");
+        publish_primary(result, status);
+        result.recovery_required = 1'b1;
+        result.final_resource_state = RDMA_RESOURCE_ERROR;
+        result.final_resource_state_known = 1'b1;
+        return;
+      end
+      void'(manager.lookup_recovery(resource_h, record));
+      if (record != null && record.qp_recovery != null) begin
+        cloned = record.qp_recovery.clone();
+        if (cloned != null) void'($cast(recovery, cloned));
+      end
+    end
+
+    refs.delete();
+    for (int i = recovery.qp_plan.urc_refs.size()-1; i >= 0; i--)
+      refs.push_back(recovery.qp_plan.urc_refs[i]);
+    if (recovery.qp_plan.rq_source_h == null)
+      refs.push_back(recovery.qp_plan.rq_pd_ref);
+    refs.push_back(recovery.qp_plan.sq_pd_ref);
+    if (recovery.qp_plan.rq_source_h == null)
+      refs.push_back(recovery.qp_plan.rq_ref);
+    refs.push_back(recovery.qp_plan.sq_ref);
+    foreach (refs[i]) begin
+      if (refs[i] == null || refs[i].ownership == RDMA_OWNERSHIP_BORROWED ||
+          refs[i].cleanup_complete)
+        continue;
+      status = live_binding_fence(binding, expected_owner);
+      if (status.ok()) begin
+        probe = null;
+        cloned = refs[i].mapping.clone();
+        if (cloned == null || !$cast(probe, cloned))
+          status = invalid_state("QP destroy backing release probe clone failed");
+        else
+          status = release_mapping_opaque(probe, "QP destroy recovery backing",
+                                          release_complete);
+      end
+      if (status.ok() && release_complete)
+        status = manager.record_qp_cleanup_complete(resource_h, refs[i].role);
+      if (!status.ok()) break;
+      void'(manager.lookup_recovery(resource_h, record));
+      if (record != null && record.qp_recovery != null) begin
+        cloned = record.qp_recovery.clone();
+        if (cloned == null || !$cast(recovery, cloned)) begin
+          status = invalid_state("QP destroy recovery backing refresh failed");
+          break;
+        end
+      end
+    end
+    if (status.ok()) status = manager.finalize_qp_release(resource_h);
+    if (!status.ok()) begin
+      publish_primary(result, status);
+      result.recovery_required = 1'b1;
+      result.final_resource_state = RDMA_RESOURCE_ERROR;
+      result.final_resource_state_known = 1'b1;
+      return;
+    end
+    result.final_resource_state = RDMA_RESOURCE_RELEASED;
+    result.final_resource_state_known = 1'b1;
+    result.recovery_required = 1'b0;
+    publish_primary(result, rdma_status::success());
   endtask
 
   task recover_locked(rdma_function_binding binding,
@@ -1869,9 +2885,276 @@ class rdma_qp_lifecycle_executor extends uvm_object;
                       rdma_handle resource_h,
                       longint unsigned transaction_id,
                       output rdma_control_result result);
+    rdma_status status;
+    rdma_status fence_status;
+    rdma_resource resource;
+    rdma_qp authoritative;
+    rdma_recovery_record record;
+    rdma_qp_recovery_state recovery;
+    rdma_cmq_completion completion;
+    rdma_cmq_ticket ticket;
+    rdma_qpc_model resolved_qpc;
+    rdma_xtr_v1_qpc_command_body body;
+    rdma_cmq_command_desc query_command;
+    rdma_dma_mapping staging;
+    rdma_dma_mapping query_mapping;
+    rdma_dma_mapping query_release_probe;
+    rdma_dma_mapping staging_release_probe;
+    bit terminal_known;
+    bit release_complete;
+    bit candidate_selected;
+    bit fresh_query_mapping;
+    uvm_object cloned;
+    fresh_query_mapping = 1'b0;
+
     result = rdma_control_result::type_id::create("qp_recover_result");
     result.transaction_id = transaction_id;
-    result.status = rdma_status::make(RDMA_SC_UNSUPPORTED_OPCODE,
-                                      "QP recovery is not implemented yet");
+    result.resource_h = rdma_clone_handle_value(resource_h,
+                                                "QP recovery handle");
+    result.primary_status = invalid_state("QP recovery did not complete");
+    result.status = result.primary_status;
+    if (transaction_id == 0 || binding == null || expected_owner == null ||
+        resource_h == null || manager == null || cmq == null) begin
+      publish_primary(result, invalid_argument("QP recovery input is invalid"));
+      return;
+    end
+    status = live_binding_fence(binding, expected_owner);
+    if (status.ok()) status = manager.lookup(resource_h, resource);
+    if (status.ok() && (resource == null || !$cast(authoritative, resource)))
+      status = invalid_argument("QP recovery target is not a QP");
+    if (status.ok() && authoritative.state != RDMA_RESOURCE_ERROR)
+      status = invalid_state("QP recovery requires an ERROR QP");
+    if (status.ok()) status = manager.lookup_recovery(resource_h, record);
+    if (status.ok() && (record == null || !record.qp_recovery_valid ||
+                        record.qp_recovery == null))
+      status = invalid_state("QP recovery record is missing");
+    if (status.ok()) begin
+      cloned = record.qp_recovery.clone();
+      if (cloned == null || !$cast(recovery, cloned))
+        status = invalid_state("QP recovery snapshot clone failed");
+    end
+    if (status.ok() && !(recovery.intent inside {
+          RDMA_QP_RECOVER_MODIFY_RECONCILE,
+          RDMA_QP_RECOVER_NORMAL_DESTROY}))
+      status = invalid_state("QP recovery intent is not modify reconciliation");
+    if (status.ok() && recovery.intent == RDMA_QP_RECOVER_NORMAL_DESTROY) begin
+      recover_destroy_locked(binding, expected_owner, resource_h,
+                             transaction_id, result);
+      return;
+    end
+    if (status.ok() && recovery.ambiguous_operation == RDMA_QP_AMBIG_MODIFY) begin
+      // A malformed query allocation is retained only as opaque release
+      // authority.  It cannot safely feed QPC_QUERY, so finish its release
+      // attempt before reconciling the modify ticket.  The mapping remains in
+      // the recovery record (with its recovery-only bit) so the completion
+      // proof and exactly-once release are durable across retries.
+      if (recovery.query_mapping_recovery_only &&
+          recovery.query_mapping != null) begin
+        // Release through a detached probe so the recovery record keeps its
+        // ACTIVE public mapping value for manager authority comparison.  The
+        // probe shares the adapter's opaque completion seal with the retained
+        // mapping, so completion remains durable while no public state is
+        // mutated on the persisted recovery snapshot.
+        query_release_probe = null;
+        cloned = recovery.query_mapping.clone();
+        if (cloned == null || !$cast(query_release_probe, cloned)) begin
+          status = invalid_state(
+            "QP recovery malformed query release probe clone failed"
+          );
+          release_complete = 1'b0;
+        end
+        else begin
+          status = release_mapping_opaque(
+            query_release_probe, "QP recovery malformed query",
+            release_complete
+          );
+        end
+        if (!status.ok() || !release_complete) begin
+          result.recovery_required = 1'b1;
+          result.final_resource_state = RDMA_RESOURCE_ERROR;
+          result.final_resource_state_known = 1'b1;
+          publish_primary(result, rdma_status::make(
+            RDMA_SC_RECOVERY_REQUIRED,
+            "QP recovery query mapping release remains incomplete"
+          ));
+          return;
+        end
+      end
+      terminal_known = 1'b0;
+      completion = null;
+      cmq.reconcile(recovery.ambiguous_ticket, terminal_known, completion,
+                    status);
+      status = normalize_status(status, "QP modify reconciliation returned null");
+      fence_status = live_binding_fence(binding, expected_owner);
+      if (!fence_status.ok()) status = fence_status;
+      if (status.ok() && terminal_known && completion != null &&
+          completion.status != null) begin
+        candidate_selected = completion.status.ok();
+        resolved_qpc = candidate_selected ? recovery.candidate_qpc :
+                       recovery.prior_qpc;
+      end
+      else if (status.ok()) begin
+        // A ticket without a terminal completion is reconciled with a
+        // dedicated QPC_QUERY image.  The query buffer is independent from
+        // the modify staging image and remains part of durable authority.
+        if (recovery.query_mapping == null ||
+            recovery.query_mapping_recovery_only) begin
+          rdma_dma_request_context fresh_query_context;
+          status = make_dma_context(binding, authoritative.handle,
+                                    RDMA_QUEUE_ROLE_QP_SQ_PD,
+                                    fresh_query_context);
+          if (status.ok()) begin
+            fresh_query_context.queue_role_valid = 1'b0;
+            status = normalize_status(host_mem.allocate(fresh_query_context,
+              512, 512, RDMA_DMA_DEVICE_WRITE, query_mapping),
+              "QP recovery fresh query allocation returned null");
+            if (status.ok() && (query_mapping == null || query_mapping.size < 512 ||
+                (query_mapping.iova.value & 64'h1ff) != 0 ||
+                (query_mapping.backing_addr.value & 64'h1ff) != 0))
+              status = invalid_state("QP recovery fresh query mapping is invalid");
+          end
+          if (!status.ok()) begin
+            result.recovery_required = 1'b1;
+            result.final_resource_state = RDMA_RESOURCE_ERROR;
+            result.final_resource_state_known = 1'b1;
+            publish_primary(result, rdma_status::make(
+              RDMA_SC_RECOVERY_REQUIRED, "QP modify completion remains ambiguous"));
+            return;
+          end
+          fresh_query_mapping = 1'b1;
+        end
+        body = rdma_xtr_v1_qpc_command_body::type_id::create("qp_query_body");
+        body.qp_h = rdma_clone_handle_value(recovery.prior_qpc.qp_h,
+                                             "QP query QPN");
+        body.qpc_buffer.value = fresh_query_mapping ? query_mapping.iova.value :
+                                recovery.query_mapping.iova.value;
+        query_command = rdma_cmq_command_desc::type_id::create("qp_query_command");
+        query_command.function_h = rdma_clone_function_handle_value(
+          expected_owner, "QP query command");
+        query_command.opcode_key = make_opcode_key(XTR_V1_OP_QPC_QUERY, "query");
+        query_command.body = body;
+        query_command.timeout = command_timeout;
+        status = normalize_status(query_command.validate(),
+                                  "QP query command validation returned null");
+        if (status.ok()) begin
+          ticket = null; completion = null;
+          cmq.execute(query_command, ticket, completion, status);
+          status = normalize_status(status, "QP query execution returned null");
+          fence_status = live_binding_fence(binding, expected_owner);
+          if (!fence_status.ok()) status = fence_status;
+        end
+        if (status.ok()) begin
+          rdma_qpc_model queried_qpc;
+          status = read_qpc_query_image(expected_owner,
+                                        fresh_query_mapping ? query_mapping :
+                                          recovery.query_mapping,
+                                        recovery.candidate_qpc,
+                                        queried_qpc);
+          if (status.ok() && queried_qpc != null) begin
+            if (same_qpc_snapshot(queried_qpc, recovery.candidate_qpc)) begin
+              resolved_qpc = recovery.candidate_qpc;
+              candidate_selected = 1'b1;
+              terminal_known = 1'b1;
+            end
+            else if (same_qpc_snapshot(queried_qpc, recovery.prior_qpc)) begin
+              resolved_qpc = recovery.prior_qpc;
+              candidate_selected = 1'b0;
+              terminal_known = 1'b1;
+            end
+            else begin
+              status = rdma_status::make(RDMA_SC_RECOVERY_REQUIRED,
+                                         "QP query image matches neither modify candidate");
+            end
+          end
+        end
+        if (status.ok() && !terminal_known) begin
+          result.recovery_required = 1'b1;
+          result.final_resource_state = RDMA_RESOURCE_ERROR;
+          result.final_resource_state_known = 1'b1;
+          publish_primary(result, rdma_status::make(
+            RDMA_SC_RECOVERY_REQUIRED, "QP query did not prove a terminal image"));
+          return;
+        end
+      end
+    end
+    else if (status.ok()) begin
+      // A previous invocation may already have reconciled the ticket.  In
+      // that case the candidate is the only legal active replacement.
+      resolved_qpc = recovery.candidate_qpc;
+      candidate_selected = 1'b1;
+    end
+    if (status.ok() && resolved_qpc == null)
+      status = invalid_state("QP recovery has no resolved QPC");
+
+    if (status.ok()) begin
+      staging = recovery.staging_mapping;
+      if (!fresh_query_mapping)
+        query_mapping = recovery.query_mapping;
+      // Release through detached probes.  The persisted recovery mappings
+      // remain byte-for-byte unchanged (and therefore continue to match the
+      // manager's retained authority comparison), while the adapter's opaque
+      // completion seal is shared by the probes and the retained mappings.
+      if (staging != null) begin
+        staging_release_probe = null;
+        cloned = staging.clone();
+        if (cloned == null || !$cast(staging_release_probe, cloned))
+          status = invalid_state("QP recovery staging release probe clone failed");
+        else
+          status = release_mapping_opaque(staging_release_probe,
+                                           "QP recovery staging",
+                                           release_complete);
+      end
+      if (status.ok() && query_mapping != null) begin
+        if (fresh_query_mapping)
+          status = release_mapping_opaque(query_mapping, "QP recovery query",
+                                          release_complete);
+        else begin
+          query_release_probe = null;
+          cloned = query_mapping.clone();
+          if (cloned == null || !$cast(query_release_probe, cloned))
+            status = invalid_state("QP recovery query release probe clone failed");
+          else
+            status = release_mapping_opaque(query_release_probe,
+                                             "QP recovery query",
+                                             release_complete);
+        end
+      end
+    end
+    if (status.ok() && recovery.ambiguous_operation == RDMA_QP_AMBIG_MODIFY) begin
+      // Clear ambiguity only after all temporary authority releases have
+      // completed.  TIMEOUT/RESET_CANCELLED therefore preserve the ticket.
+      recovery.ambiguous_operation = RDMA_QP_AMBIG_NONE;
+      recovery.ambiguous_ticket = null;
+      status = manager.mark_qp_error(resource_h, recovery);
+    end
+    if (status.ok()) begin
+      rdma_qp replacement;
+      cloned = authoritative.clone();
+      if (cloned == null || !$cast(replacement, cloned))
+        status = invalid_state("QP recovery resource clone failed");
+      else begin
+        replacement.state = RDMA_RESOURCE_ACTIVE;
+        replacement.programmed_qpc = resolved_qpc;
+        replacement.qp_state = resolved_qpc.state;
+        // RESET→INIT is intentionally semantic-only: if the prior hardware
+        // image was RESET, restore the software INIT state when the prior
+        // image wins reconciliation.
+        if (!candidate_selected && resolved_qpc.state == RDMA_QPS_RESET)
+          replacement.qp_state = RDMA_QPS_INIT;
+        status = manager.commit_qp_programmed(replacement);
+      end
+    end
+    if (status.ok()) begin
+      result.final_resource_state = RDMA_RESOURCE_ACTIVE;
+      result.final_resource_state_known = 1'b1;
+      result.recovery_required = 1'b0;
+      publish_primary(result, rdma_status::success());
+    end
+    else begin
+      result.recovery_required = 1'b1;
+      result.final_resource_state = RDMA_RESOURCE_ERROR;
+      result.final_resource_state_known = 1'b1;
+      publish_primary(result, status);
+    end
   endtask
 endclass

@@ -417,6 +417,16 @@ class rdma_qp_recovery_state extends uvm_object;
   rdma_context_backing_ref context_ref;
   rdma_dma_mapping staging_mapping;
   rdma_dma_mapping query_mapping;
+  // A query allocation can fail after returning an adapter-owned mapping with
+  // malformed public geometry.  Keep that capability in a recovery-only form
+  // until its opaque release completion is proven; it must never be used as a
+  // QPC_QUERY buffer.
+  bit query_mapping_recovery_only;
+  // Destroy progress is persisted separately from backing cleanup. These
+  // fences prevent recovery retries from reissuing a definitive ERROR
+  // transition or QPC_DELETE after the device has already accepted it.
+  bit error_modify_complete;
+  bit delete_complete;
   rdma_cmq_opcode_key create_opcode;
   rdma_cmq_opcode_key modify_opcode;
   rdma_cmq_opcode_key delete_opcode;
@@ -436,6 +446,9 @@ class rdma_qp_recovery_state extends uvm_object;
     context_ref = null;
     staging_mapping = null;
     query_mapping = null;
+    query_mapping_recovery_only = 1'b0;
+    error_modify_complete = 1'b0;
+    delete_complete = 1'b0;
     create_opcode = null;
     modify_opcode = null;
     delete_opcode = null;
@@ -543,6 +556,11 @@ class rdma_qp_recovery_state extends uvm_object;
         );
         if (!status.ok()) return status;
       end
+      if (query_mapping_recovery_only)
+        return rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "partial QP recovery cannot retain query-only authority"
+        );
       return rdma_status::success();
     end
     if (qp_plan == null || context_ref == null)
@@ -803,8 +821,12 @@ class rdma_qp_recovery_state extends uvm_object;
         default:;
       endcase
     end
-    if (ambiguous_operation inside {RDMA_QP_AMBIG_CREATE,
-                                    RDMA_QP_AMBIG_MODIFY}) begin
+    // CREATE rollback and MODIFY reconciliation retain a staging allocation;
+    // a destroy-time ERROR transition is a state-only QPC_MODIFY and has no
+    // staging mapping to retain.
+    if (ambiguous_operation == RDMA_QP_AMBIG_CREATE ||
+        (ambiguous_operation == RDMA_QP_AMBIG_MODIFY &&
+         intent != RDMA_QP_RECOVER_NORMAL_DESTROY)) begin
       status = rdma_qp_recovery_mapping_status(
         staging_mapping, context_ref.owner, recovery_qp_h,
         "QP recovery staging"
@@ -818,11 +840,53 @@ class rdma_qp_recovery_state extends uvm_object;
       );
       if (!status.ok()) return status;
     end
+    // An ambiguity-free MODIFY record must retain a query buffer for the
+    // final reconciliation proof.  During an unresolved ticket ambiguity the
+    // allocation may legitimately be unavailable; recovery will provision a
+    // fresh buffer before attempting QPC_QUERY.
     if (intent == RDMA_QP_RECOVER_MODIFY_RECONCILE &&
-        query_mapping == null)
-      return rdma_status::make(RDMA_SC_INVALID_STATE,
-                               "modify recovery lacks query mapping");
-    if (query_mapping != null) begin
+        ambiguous_operation == RDMA_QP_AMBIG_NONE && query_mapping == null)
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "modify recovery lacks query mapping"
+      );
+    // A query mapping is normally retained for ambiguous MODIFY recovery.  If
+    // its allocation itself failed after returning a non-null malformed
+    // mapping, retain it as opaque release-only authority and never let it
+    // reach QPC_QUERY construction.
+    if (query_mapping_recovery_only) begin
+      if (!(ambiguous_operation inside {RDMA_QP_AMBIG_NONE,
+                                        RDMA_QP_AMBIG_MODIFY}) ||
+          query_mapping == null)
+        return rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "QP query-only recovery authority is out of order"
+        );
+      status = rdma_qp_recovery_opaque_mapping_status(
+        query_mapping, context_ref.owner, recovery_qp_h,
+        "QP recovery query-only"
+      );
+      if (!status.ok()) return status;
+      // Once the modify ambiguity has been reconciled, the malformed query
+      // mapping remains in the record only as proof that its opaque release
+      // completed.  It must not be accepted in an ambiguity-free record while
+      // the adapter still reports an incomplete release.
+      if (ambiguous_operation == RDMA_QP_AMBIG_NONE) begin
+        bit query_release_complete;
+        status = query_mapping.release_completion_status(
+          query_release_complete
+        );
+        if (status == null || !status.ok() || !query_release_complete)
+          return status == null ? rdma_status::make(
+            RDMA_SC_INVALID_STATE,
+            "QP query-only release completion query returned null"
+          ) : status.ok() ? rdma_status::make(
+            RDMA_SC_RECOVERY_REQUIRED,
+            "QP query-only release is incomplete"
+          ) : status;
+      end
+    end
+    else if (query_mapping != null) begin
       status = rdma_qp_recovery_mapping_status(
         query_mapping, context_ref.owner, recovery_qp_h,
         "QP recovery query"
@@ -843,6 +907,9 @@ class rdma_qp_recovery_state extends uvm_object;
     role_complete = r.role_complete;
     prior_qpc = null; candidate_qpc = null; qp_plan = null; context_ref = null;
     staging_mapping = null; query_mapping = null;
+    query_mapping_recovery_only = r.query_mapping_recovery_only;
+    error_modify_complete = r.error_modify_complete;
+    delete_complete = r.delete_complete;
     if (r.prior_qpc != null) begin c = r.prior_qpc.clone(); if (!$cast(prior_qpc, c)) `uvm_fatal("RDMA_COPY_TYPE", "prior QPC clone failure") end
     if (r.candidate_qpc != null) begin c = r.candidate_qpc.clone(); if (!$cast(candidate_qpc, c)) `uvm_fatal("RDMA_COPY_TYPE", "candidate QPC clone failure") end
     if (r.qp_plan != null) begin c = r.qp_plan.clone(); if (!$cast(qp_plan, c)) `uvm_fatal("RDMA_COPY_TYPE", "QP plan clone failure") end
