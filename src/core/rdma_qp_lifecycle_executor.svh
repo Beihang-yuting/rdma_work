@@ -2581,6 +2581,8 @@ class rdma_qp_lifecycle_executor extends uvm_object;
     recovery.ambiguous_ticket = ambiguous_operation != RDMA_QP_AMBIG_NONE ?
       rdma_cmq_clone_ticket_value(ticket,
       "QP destroy recovery") : null;
+    if (ambiguous_operation != RDMA_QP_AMBIG_NONE && ticket == null)
+      recovery.has_pending_hardware_step = 1'b1;
     begin
       rdma_status publish_status;
       publish_status = manager.mark_qp_error(qp.handle, recovery);
@@ -2659,6 +2661,14 @@ class rdma_qp_lifecycle_executor extends uvm_object;
     // cancellation or missing terminal result leaves the ticket untouched.
     if (recovery.ambiguous_operation != RDMA_QP_AMBIG_NONE) begin
       reconciled_operation = recovery.ambiguous_operation;
+      if (recovery.ambiguous_ticket == null) begin
+        // Ticketless ambiguity cannot be reconciled; remain fail-closed in
+        // ERROR and let a subsequent recovery attempt obtain fresh proof.
+        publish_primary(result, rdma_status::make(
+          RDMA_SC_RECOVERY_REQUIRED,
+          "QP destroy ambiguity has no reconciliation ticket"));
+        return;
+      end
       terminal_known = 1'b0;
       completion = null;
       cmq.reconcile(recovery.ambiguous_ticket, terminal_known, completion,
