@@ -4537,6 +4537,17 @@ class rdma_resource_manager extends uvm_object;
     bit clearing_ambiguity;
     bit normalizing_occ_role;
     bit stale_recovery_allowed;
+    bit preprogram_publication;
+    bit preprogram_shape;
+    rdma_function_handle recovery_owner;
+    rdma_handle recovery_qp_h;
+
+    preprogram_shape = recovery != null &&
+      recovery.intent == RDMA_QP_RECOVER_CREATE_ROLLBACK &&
+      recovery.ambiguous_operation == RDMA_QP_AMBIG_NONE &&
+      recovery.ambiguous_ticket == null && recovery.prior_qpc == null &&
+      recovery.candidate_qpc == null && recovery.query_mapping == null;
+    preprogram_publication = 1'b0;
 
     status = lookup(qp_h, authoritative);
     if (!status.ok() && status.code == RDMA_SC_STALE_GENERATION &&
@@ -4551,6 +4562,24 @@ class rdma_resource_manager extends uvm_object;
             recovery.ambiguous_ticket != null) begin
           status = recovery.validate();
           stale_recovery_allowed = status != null && status.ok();
+        end
+        else if (preprogram_shape &&
+                 registry[key].state == RDMA_RESOURCE_ALLOCATED &&
+                 !recovery_records.exists(key)) begin
+          status = project_qp_recovery_value(
+            recovery, "mark stale pre-program QP ERROR", recovery_copy
+          );
+          if (status.ok() && recovery_copy != null)
+            status = recovery_copy.validate();
+          if (status != null && status.ok())
+            status = rdma_qp_partial_plan_authority(
+              recovery_copy.qp_plan, recovery_owner, recovery_qp_h
+            );
+          stale_recovery_allowed = status != null && status.ok() &&
+            recovery_qp_h != null && recovery_owner != null &&
+            same_handle_instance(recovery_qp_h, registry[key].handle) &&
+            registry[key].owner != null &&
+            recovery_owner.same_instance(registry[key].owner);
         end
         else if (recovery.intent == RDMA_QP_RECOVER_CREATE_ROLLBACK &&
                  recovery.ambiguous_operation == RDMA_QP_AMBIG_NONE &&
@@ -4581,18 +4610,61 @@ class rdma_resource_manager extends uvm_object;
         RDMA_SC_INVALID_ARGUMENT, "QP ERROR target is not a QP"
       ) : status;
     key = resource_key(authoritative.handle);
+    preprogram_publication = preprogram_shape &&
+      registry[key].state == RDMA_RESOURCE_ALLOCATED;
+    if (preprogram_publication) begin
+      status = project_qp_recovery_value(
+        recovery, "mark pre-program QP ERROR", recovery_copy
+      );
+      if (!status.ok() || recovery_copy == null)
+        return status.ok() ? rdma_status::make(
+          RDMA_SC_INVALID_ARGUMENT,
+          "pre-program QP recovery projection is empty"
+        ) : status;
+      status = recovery_copy.validate();
+      if (status == null)
+        return rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "pre-program QP recovery validation returned null"
+        );
+      if (!status.ok())
+        return status;
+      status = rdma_qp_partial_plan_authority(
+        recovery_copy.qp_plan, recovery_owner, recovery_qp_h
+      );
+      if (!status.ok())
+        return status;
+      if (recovery_copy.qp_plan.cleanup_complete ||
+          recovery_copy.qp_plan.sq_pd_flush_complete ||
+          recovery_copy.qp_plan.rq_pd_flush_complete)
+        return rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "new pre-program QP recovery carries flush progress"
+        );
+      foreach (recovery_copy.role_complete[i]) begin
+        if (recovery_copy.role_complete[i])
+          return rdma_status::make(
+            RDMA_SC_INVALID_STATE,
+            "new pre-program QP recovery carries cleanup progress"
+          );
+      end
+    end
     error_replacement =
       (registry[key].state == RDMA_RESOURCE_ERROR) &&
       recovery_records.exists(key) &&
       (recovery_records[key] != null) &&
       recovery_records[key].qp_recovery_valid &&
       (recovery_records[key].qp_recovery != null);
-    if ((!(registry[key].state inside {RDMA_RESOURCE_PROGRAMMED,
-                                       RDMA_RESOURCE_ACTIVE,
-                                       RDMA_RESOURCE_QUIESCING}) &&
-         !error_replacement) ||
-        ((registry[key].state != RDMA_RESOURCE_ERROR) &&
-         recovery_records.exists(key)))
+    if ((preprogram_publication &&
+         (registry[key].state != RDMA_RESOURCE_ALLOCATED ||
+          recovery_records.exists(key) || staged_allocations.exists(key))) ||
+        (!preprogram_publication &&
+         ((!(registry[key].state inside {RDMA_RESOURCE_PROGRAMMED,
+                                         RDMA_RESOURCE_ACTIVE,
+                                         RDMA_RESOURCE_QUIESCING}) &&
+           !error_replacement) ||
+          ((registry[key].state != RDMA_RESOURCE_ERROR) &&
+           recovery_records.exists(key)))))
       return rdma_status::make(
         RDMA_SC_INVALID_STATE, "QP cannot enter ERROR from its current state"
       );
@@ -4601,23 +4673,40 @@ class rdma_resource_manager extends uvm_object;
       if (!status.ok())
         return status;
     end
-    status = project_qp_recovery_value(recovery, "mark QP ERROR",
-                                       recovery_copy);
-    if (!status.ok() || recovery_copy == null)
-      return status.ok() ? rdma_status::make(
-        RDMA_SC_INVALID_ARGUMENT, "QP recovery projection is empty"
-      ) : status;
-    status = recovery_copy.validate();
-    if (status == null)
-      return rdma_status::make(
-        RDMA_SC_INVALID_STATE, "QP recovery validation returned null"
-      );
-    if (!status.ok())
-      return status;
-    if (!same_qp_plan_value(authoritative_qp.qp_plan,
-                            recovery_copy.qp_plan) ||
-        !same_context_value(authoritative_qp.qp_plan.context_ref,
-                            recovery_copy.context_ref))
+    if (!preprogram_publication) begin
+      status = project_qp_recovery_value(recovery, "mark QP ERROR",
+                                         recovery_copy);
+      if (!status.ok() || recovery_copy == null)
+        return status.ok() ? rdma_status::make(
+          RDMA_SC_INVALID_ARGUMENT, "QP recovery projection is empty"
+        ) : status;
+      status = recovery_copy.validate();
+      if (status == null)
+        return rdma_status::make(
+          RDMA_SC_INVALID_STATE, "QP recovery validation returned null"
+        );
+      if (!status.ok())
+        return status;
+    end
+    if (preprogram_publication) begin
+      if (authoritative_qp.qp_plan != null ||
+          authoritative_qp.programmed_qpc != null ||
+          !same_handle_instance(recovery_qp_h, authoritative_qp.handle) ||
+          !recovery_owner.same_instance(authoritative_qp.owner) ||
+          (authoritative_qp.srq_h == null) !=
+            (recovery_copy.qp_plan.rq_source_h == null) ||
+          (authoritative_qp.srq_h != null &&
+           !same_handle_instance(authoritative_qp.srq_h,
+             recovery_copy.qp_plan.rq_source_h)))
+        return rdma_status::make(
+          RDMA_SC_INVALID_ARGUMENT,
+          "pre-program QP recovery authority changed"
+        );
+    end
+    else if (!same_qp_plan_value(authoritative_qp.qp_plan,
+                                 recovery_copy.qp_plan) ||
+             !same_context_value(authoritative_qp.qp_plan.context_ref,
+                                 recovery_copy.context_ref))
       return rdma_status::make(
         RDMA_SC_INVALID_ARGUMENT, "QP recovery authority changed"
       );
@@ -4743,6 +4832,29 @@ class rdma_resource_manager extends uvm_object;
         RDMA_SC_INVALID_STATE, "QP ERROR resource projection failed"
       ) : status;
     replacement.state = RDMA_RESOURCE_ERROR;
+    if (preprogram_publication) begin
+      status = project_qp_plan_value(
+        recovery_copy.qp_plan, "mark pre-program QP ERROR plan",
+        replacement.qp_plan
+      );
+      if (!status.ok())
+        return status;
+      replacement.programmed_qpc = null;
+      replacement.transport = replacement.qp_plan.transport;
+      replacement.sq_depth = replacement.qp_plan.sq_depth;
+      replacement.rq_depth = replacement.qp_plan.rq_depth;
+      if (replacement.qp_plan.sq_ref != null)
+        replacement.sq_iova.value =
+          replacement.qp_plan.sq_ref.mapping.iova.value +
+          replacement.qp_plan.sq_ref.mapping_offset;
+      if (replacement.qp_plan.rq_source_h == null &&
+          replacement.qp_plan.rq_ref != null)
+        replacement.rq_iova.value =
+          replacement.qp_plan.rq_ref.mapping.iova.value +
+          replacement.qp_plan.rq_ref.mapping_offset;
+      else
+        replacement.rq_iova.value = 0;
+    end
     status = replacement.validate();
     if (status == null)
       return rdma_status::make(

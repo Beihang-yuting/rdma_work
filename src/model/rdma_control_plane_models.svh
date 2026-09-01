@@ -370,6 +370,42 @@ function automatic bit rdma_qp_recovery_opcode_equivalent(
          lhs.variant == rhs.variant;
 endfunction
 
+function automatic rdma_status rdma_qp_partial_plan_authority(
+  rdma_qp_backing_plan plan,
+  output rdma_function_handle owner,
+  output rdma_handle qp_h
+);
+  rdma_qp_backing_ref retained_ref;
+
+  owner = null;
+  qp_h = null;
+  retained_ref = null;
+  if (plan == null)
+    return rdma_status::make(RDMA_SC_INVALID_STATE,
+                             "partial QP recovery plan is missing");
+  if (plan.sq_ref != null)
+    retained_ref = plan.sq_ref;
+  else if (plan.sq_pd_ref != null)
+    retained_ref = plan.sq_pd_ref;
+  else if (plan.rq_ref != null)
+    retained_ref = plan.rq_ref;
+  else if (plan.rq_pd_ref != null)
+    retained_ref = plan.rq_pd_ref;
+  else if (plan.urc_refs.size() != 0)
+    retained_ref = plan.urc_refs[0];
+  if (retained_ref == null || retained_ref.mapping == null ||
+      retained_ref.mapping.function_h == null ||
+      retained_ref.mapping.owner_h == null ||
+      retained_ref.mapping.owner_h.kind != RDMA_RESOURCE_QP)
+    return rdma_status::make(
+      RDMA_SC_INVALID_STATE,
+      "partial QP recovery has no registry mapping authority"
+    );
+  owner = retained_ref.mapping.function_h;
+  qp_h = retained_ref.mapping.owner_h;
+  return rdma_status::success();
+endfunction
+
 class rdma_qp_recovery_state extends uvm_object;
   `uvm_object_utils(rdma_qp_recovery_state)
   rdma_qp_recovery_intent_e intent;
@@ -414,6 +450,8 @@ class rdma_qp_recovery_state extends uvm_object;
     rdma_qp_backing_plan validation_plan;
     uvm_object cloned_plan_object;
     rdma_handle recovery_qp_h;
+    rdma_function_handle recovery_owner;
+    bit preprogram_publication;
 
     if (!(intent inside {RDMA_QP_RECOVER_CREATE_ROLLBACK,
                          RDMA_QP_RECOVER_MODIFY_RECONCILE,
@@ -436,6 +474,77 @@ class rdma_qp_recovery_state extends uvm_object;
         RDMA_SC_INVALID_ARGUMENT,
         "non-OCC QP recovery uses a non-canonical ambiguity role"
       );
+    preprogram_publication =
+      intent == RDMA_QP_RECOVER_CREATE_ROLLBACK &&
+      ambiguous_operation == RDMA_QP_AMBIG_NONE &&
+      ambiguous_ticket == null && prior_qpc == null &&
+      candidate_qpc == null && query_mapping == null;
+    if (preprogram_publication) begin
+      status = rdma_qp_partial_plan_authority(
+        qp_plan, recovery_owner, recovery_qp_h
+      );
+      if (!status.ok()) return status;
+      status = rdma_qp_partial_plan_status(
+        qp_plan, recovery_owner, recovery_qp_h
+      );
+      if (!status.ok()) return status;
+      if ((context_ref == null) != (qp_plan.context_ref == null))
+        return rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "partial QP recovery context authority is split"
+        );
+      if (context_ref != null) begin
+        status = context_ref.validate();
+        if (!status.ok()) return status;
+        if (!rdma_qp_recovery_context_equivalent(context_ref,
+                                                  qp_plan.context_ref))
+          return rdma_status::make(
+            RDMA_SC_INVALID_STATE,
+            "partial QP recovery context does not equal plan authority"
+          );
+      end
+      for (int unsigned i = 0; i < RDMA_QUEUE_ROLE_QP_SQ_RING; i++) begin
+        if (role_complete[i])
+          return rdma_status::make(
+            RDMA_SC_INVALID_STATE,
+            "partial QP recovery progress uses a legacy queue role"
+          );
+      end
+      if (qp_plan.rq_source_h != null &&
+          (role_complete[RDMA_QUEUE_ROLE_QP_RQ_RING] ||
+           role_complete[RDMA_QUEUE_ROLE_QP_RQ_PD]))
+        return rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "partial SRQ-backed QP recovery has private RQ progress"
+        );
+      if (qp_plan.transport != RDMA_TRANSPORT_URC &&
+          (role_complete[RDMA_QUEUE_ROLE_QP_URC_RSQ] ||
+           role_complete[RDMA_QUEUE_ROLE_QP_URC_RDSQ] ||
+           role_complete[RDMA_QUEUE_ROLE_QP_URC_DSQ]))
+        return rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "partial non-URC QP recovery has URC backing progress"
+        );
+      if (create_opcode == null || modify_opcode == null ||
+          delete_opcode == null || query_opcode == null || occ_opcode == null)
+        return rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "partial QP recovery opcode authority is incomplete"
+        );
+      status = create_opcode.validate(); if (!status.ok()) return status;
+      status = modify_opcode.validate(); if (!status.ok()) return status;
+      status = delete_opcode.validate(); if (!status.ok()) return status;
+      status = query_opcode.validate(); if (!status.ok()) return status;
+      status = occ_opcode.validate(); if (!status.ok()) return status;
+      if (staging_mapping != null) begin
+        status = rdma_qp_recovery_mapping_status(
+          staging_mapping, recovery_owner, recovery_qp_h,
+          "partial QP recovery staging"
+        );
+        if (!status.ok()) return status;
+      end
+      return rdma_status::success();
+    end
     if (qp_plan == null || context_ref == null)
       return rdma_status::make(RDMA_SC_INVALID_STATE,
                                "QP recovery authority is incomplete");

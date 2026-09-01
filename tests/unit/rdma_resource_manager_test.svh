@@ -8955,6 +8955,122 @@ class rdma_resource_manager_test extends uvm_test;
       `uvm_error("QP_WIDTH_OVERFLOW_ATOMIC",
                  "rejected QPN overflow changed manager state")
 
+    begin
+      rdma_resource_manager preprogram_rm;
+      rdma_function_binding preprogram_binding;
+      rdma_pd preprogram_pd;
+      rdma_cq preprogram_cq;
+      rdma_qp preprogram_candidate;
+      rdma_qp preprogram_lookup;
+      rdma_qp_recovery_state preprogram_recovery;
+      rdma_qp_recovery_state malformed_recovery;
+      rdma_resource preprogram_resource;
+      rdma_recovery_record preprogram_record;
+      uvm_object preprogram_clone_object;
+      longint unsigned stored_sq_iova;
+
+      preprogram_rm = rdma_resource_manager::type_id::create(
+        "qp_preprogram_rm"
+      );
+      preprogram_binding = make_active_binding(
+        "qp_preprogram_binding", 64'h7170_1000_0000_0001,
+        32'h7170_1101, 32'd72
+      );
+      expect_status("QP_PREPROGRAM_PD_CREATE",
+                    preprogram_rm.create_pd(preprogram_binding,
+                                            preprogram_pd), RDMA_SC_OK);
+      expect_status("QP_PREPROGRAM_CQ_CREATE",
+                    preprogram_rm.create_cq(preprogram_binding, null,
+                                            preprogram_cq), RDMA_SC_OK);
+      expect_status(
+        "QP_PREPROGRAM_CREATE",
+        preprogram_rm.create_qp(
+          preprogram_binding, preprogram_pd.handle, preprogram_cq.handle,
+          preprogram_cq.handle, null, preprogram_candidate
+        ),
+        RDMA_SC_OK
+      );
+      prepare_qp_candidate(
+        preprogram_candidate, preprogram_pd, preprogram_cq, preprogram_cq,
+        "qp_preprogram_candidate"
+      );
+      preprogram_recovery = make_qp_test_recovery(
+        "qp_preprogram_recovery", preprogram_candidate,
+        RDMA_QP_RECOVER_CREATE_ROLLBACK
+      );
+      preprogram_recovery.prior_qpc = null;
+      preprogram_recovery.candidate_qpc = null;
+      preprogram_recovery.context_ref = null;
+      preprogram_recovery.qp_plan.context_ref = null;
+      foreach (preprogram_recovery.role_complete[i])
+        preprogram_recovery.role_complete[i] = 1'b0;
+
+      preprogram_clone_object = preprogram_recovery.clone();
+      if (!$cast(malformed_recovery, preprogram_clone_object))
+        `uvm_fatal("QP_PREPROGRAM_MALFORMED",
+                   "pre-program recovery clone lost type")
+      malformed_recovery.qp_plan.rq_pd_ref.mapping.function_h.function_uid++;
+      expect_status(
+        "QP_PREPROGRAM_REJECT_MIXED_OWNER",
+        preprogram_rm.mark_qp_error(preprogram_candidate.handle,
+                                    malformed_recovery),
+        RDMA_SC_INVALID_ARGUMENT
+      );
+      expect_status(
+        "QP_PREPROGRAM_REJECT_ATOMIC_LOOKUP",
+        preprogram_rm.lookup(preprogram_candidate.handle,
+                             preprogram_resource),
+        RDMA_SC_OK
+      );
+      if (!$cast(preprogram_lookup, preprogram_resource) ||
+          preprogram_lookup.state != RDMA_RESOURCE_ALLOCATED ||
+          preprogram_lookup.qp_plan != null ||
+          preprogram_lookup.programmed_qpc != null)
+        `uvm_error("QP_PREPROGRAM_REJECT_ATOMIC",
+                   "rejected partial recovery changed the reservation")
+      expect_status(
+        "QP_PREPROGRAM_REJECT_NO_RECOVERY",
+        preprogram_rm.lookup_recovery(preprogram_candidate.handle,
+                                      preprogram_record),
+        RDMA_SC_INVALID_STATE
+      );
+
+      expect_status(
+        "QP_PREPROGRAM_MARK_ERROR",
+        preprogram_rm.mark_qp_error(preprogram_candidate.handle,
+                                    preprogram_recovery),
+        RDMA_SC_OK
+      );
+      expect_status(
+        "QP_PREPROGRAM_ERROR_LOOKUP",
+        preprogram_rm.lookup(preprogram_candidate.handle,
+                             preprogram_resource),
+        RDMA_SC_OK
+      );
+      expect_status(
+        "QP_PREPROGRAM_RECOVERY_LOOKUP",
+        preprogram_rm.lookup_recovery(preprogram_candidate.handle,
+                                      preprogram_record),
+        RDMA_SC_OK
+      );
+      stored_sq_iova = preprogram_recovery.qp_plan.sq_ref.mapping.iova.value;
+      preprogram_recovery.qp_plan.sq_ref.mapping.iova.value += 4096;
+      if (!$cast(preprogram_lookup, preprogram_resource) ||
+          preprogram_lookup.state != RDMA_RESOURCE_ERROR ||
+          preprogram_lookup.qp_plan == null ||
+          preprogram_lookup.programmed_qpc != null ||
+          preprogram_record == null ||
+          preprogram_record.hardware_presence != RDMA_HW_PRESENCE_ABSENT ||
+          preprogram_record.qp_recovery == null ||
+          preprogram_record.qp_recovery.context_ref != null ||
+          preprogram_record.qp_recovery.qp_plan == null ||
+          preprogram_record.qp_recovery.qp_plan.context_ref != null ||
+          preprogram_record.qp_recovery.qp_plan.sq_ref.mapping.iova.value !=
+            stored_sq_iova)
+        `uvm_error("QP_PREPROGRAM_ERROR_RESULT",
+                   "partial ERROR publication lost or aliased authority")
+    end
+
     // QP lifecycle authority is exclusive: generic publication and ERROR
     // methods must reject before changing either registry or recovery state.
     qp_generic_bypass_rm = new("qp_generic_bypass_rm");

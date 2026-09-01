@@ -980,6 +980,65 @@ class rdma_request_model_test extends uvm_test;
     );
     qp_recovery.role_complete[RDMA_QUEUE_ROLE_QP_SQ_PD] = 1'b1;
     expect_status("QP_RECOVERY", qp_recovery.validate(), RDMA_SC_OK);
+    begin
+      rdma_qp_recovery_state preprogram_recovery;
+      rdma_qp_recovery_state preprogram_clone;
+      rdma_qp_recovery_state malformed_preprogram;
+      longint unsigned saved_sq_iova;
+
+      cloned_object = qp_recovery.clone();
+      if (!$cast(preprogram_recovery, cloned_object))
+        `uvm_fatal("QP_PREPROGRAM_RECOVERY_SETUP",
+                   "pre-program recovery clone lost type")
+      preprogram_recovery.intent = RDMA_QP_RECOVER_CREATE_ROLLBACK;
+      preprogram_recovery.ambiguous_operation = RDMA_QP_AMBIG_NONE;
+      preprogram_recovery.ambiguous_ticket = null;
+      preprogram_recovery.prior_qpc = null;
+      preprogram_recovery.candidate_qpc = null;
+      preprogram_recovery.staging_mapping = null;
+      preprogram_recovery.query_mapping = null;
+      preprogram_recovery.context_ref = null;
+      preprogram_recovery.qp_plan.context_ref = null;
+      foreach (preprogram_recovery.role_complete[i])
+        preprogram_recovery.role_complete[i] = 1'b0;
+      expect_status("QP_PREPROGRAM_RECOVERY",
+                    preprogram_recovery.validate(), RDMA_SC_OK);
+
+      cloned_object = preprogram_recovery.clone();
+      if (!$cast(preprogram_clone, cloned_object) ||
+          preprogram_clone == preprogram_recovery ||
+          preprogram_clone.qp_plan == preprogram_recovery.qp_plan ||
+          preprogram_clone.context_ref != null ||
+          preprogram_clone.qp_plan.context_ref != null ||
+          preprogram_clone.qp_plan.sq_ref == null ||
+          preprogram_clone.qp_plan.sq_ref ==
+            preprogram_recovery.qp_plan.sq_ref ||
+          preprogram_clone.qp_plan.sq_ref.mapping ==
+            preprogram_recovery.qp_plan.sq_ref.mapping)
+        `uvm_error("QP_PREPROGRAM_RECOVERY_CLONE",
+                   "partial recovery clone aliased or invented authority")
+      else begin
+        saved_sq_iova = preprogram_clone.qp_plan.sq_ref.mapping.iova.value;
+        preprogram_recovery.qp_plan.sq_ref.mapping.iova.value += 4096;
+        if (preprogram_clone.qp_plan.sq_ref.mapping.iova.value != saved_sq_iova)
+          `uvm_error("QP_PREPROGRAM_RECOVERY_CLONE_DETACH",
+                     "partial recovery clone shared mapping value state")
+        preprogram_recovery.qp_plan.sq_ref.mapping.iova.value -= 4096;
+      end
+
+      cloned_object = preprogram_recovery.clone();
+      if (!$cast(malformed_preprogram, cloned_object))
+        `uvm_fatal("QP_PREPROGRAM_RECOVERY_MALFORMED",
+                   "malformed recovery clone lost type")
+      malformed_preprogram.qp_plan.rq_pd_ref.mapping.function_h.function_uid++;
+      expect_status("QP_PREPROGRAM_RECOVERY_MIXED_OWNER",
+                    malformed_preprogram.validate(),
+                    RDMA_SC_INVALID_ARGUMENT);
+      malformed_preprogram.qp_plan = null;
+      expect_status("QP_PREPROGRAM_RECOVERY_NO_PLAN",
+                    malformed_preprogram.validate(),
+                    RDMA_SC_INVALID_STATE);
+    end
     cloned_object = qp_recovery.clone();
     if (!$cast(split_qp_recovery, cloned_object))
       `uvm_fatal("QP_RECOVERY_SPLIT_SETUP",

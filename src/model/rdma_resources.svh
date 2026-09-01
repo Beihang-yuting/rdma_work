@@ -93,6 +93,174 @@ function automatic rdma_status rdma_qp_mapping_authority_status(
   return rdma_status::success();
 endfunction
 
+function automatic rdma_status rdma_qp_partial_ref_status(
+  rdma_qp_backing_ref backing_ref,
+  rdma_queue_backing_role_e expected_role,
+  rdma_function_handle owner,
+  rdma_handle qp_h,
+  string label
+);
+  rdma_qp_backing_ref validation_ref;
+  uvm_object cloned_object;
+  rdma_status status;
+
+  if (backing_ref == null)
+    return rdma_status::success();
+  cloned_object = backing_ref.clone();
+  if (cloned_object == null || !$cast(validation_ref, cloned_object))
+    return rdma_status::make(RDMA_SC_INVALID_STATE,
+                             {label, " clone failed"});
+  if (validation_ref.cleanup_complete) begin
+    if (validation_ref.ownership != RDMA_OWNERSHIP_CONTROL_PLANE)
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               {label, " borrowed cleanup is invalid"});
+    if (validation_ref.mapping != null &&
+        validation_ref.mapping.state == RDMA_MAPPING_RELEASED)
+      validation_ref.mapping.state = RDMA_MAPPING_ACTIVE;
+    foreach (validation_ref.additional_segments[i])
+      if (validation_ref.additional_segments[i] != null &&
+          validation_ref.additional_segments[i].mapping != null &&
+          validation_ref.additional_segments[i].mapping.state ==
+            RDMA_MAPPING_RELEASED)
+        validation_ref.additional_segments[i].mapping.state =
+          RDMA_MAPPING_ACTIVE;
+  end
+  status = validation_ref.validate();
+  if (!status.ok())
+    return status;
+  if (validation_ref.role != expected_role)
+    return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                             {label, " role is invalid"});
+  return rdma_qp_mapping_authority_status(backing_ref, owner, qp_h, label);
+endfunction
+
+function automatic rdma_status rdma_qp_partial_plan_status(
+  rdma_qp_backing_plan plan,
+  rdma_function_handle owner,
+  rdma_handle qp_h
+);
+  rdma_status status;
+  bit seen_urc[3];
+  longint unsigned total_length;
+
+  foreach (seen_urc[i]) seen_urc[i] = 1'b0;
+  if (plan == null || owner == null || qp_h == null)
+    return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                             "partial QP plan authority is null");
+  if (!(plan.transport inside {RDMA_TRANSPORT_RC, RDMA_TRANSPORT_UD,
+                                RDMA_TRANSPORT_URC}) ||
+      !rdma_qp_power_of_two(plan.sq_depth) ||
+      !rdma_qp_power_of_two(plan.rq_depth) ||
+      plan.sq_ring == null ||
+      (plan.sq_pd_flush_complete && !plan.cleanup_complete) ||
+      (plan.rq_pd_flush_complete &&
+       (!plan.sq_pd_flush_complete || plan.rq_source_h != null)))
+    return rdma_status::make(RDMA_SC_INVALID_STATE,
+                             "partial QP plan metadata is invalid");
+  status = plan.sq_ring.validate();
+  if (!status.ok()) return status;
+  if (plan.sq_ring.role != RDMA_QUEUE_ROLE_QP_SQ_RING ||
+      plan.sq_ring.depth != plan.sq_depth)
+    return rdma_status::make(RDMA_SC_INVALID_STATE,
+                             "partial QP SQ ring is invalid");
+  status = rdma_qp_partial_ref_status(
+    plan.sq_ref, RDMA_QUEUE_ROLE_QP_SQ_RING, owner, qp_h, "partial QP SQ"
+  );
+  if (!status.ok()) return status;
+  status = rdma_qp_partial_ref_status(
+    plan.sq_pd_ref, RDMA_QUEUE_ROLE_QP_SQ_PD, owner, qp_h,
+    "partial QP SQ PD"
+  );
+  if (!status.ok()) return status;
+  if (plan.sq_pd_ref != null && plan.sq_ref == null)
+    return rdma_status::make(RDMA_SC_INVALID_STATE,
+                             "partial QP SQ PD lacks payload authority");
+  if (plan.sq_ref != null) begin
+    status = rdma_qp_backing_total_length(plan.sq_ref, total_length);
+    if (!status.ok() || total_length != plan.sq_ring.storage_bytes)
+      return status.ok() ? rdma_status::make(
+        RDMA_SC_INVALID_STATE, "partial QP SQ geometry is invalid"
+      ) : status;
+  end
+  if (plan.rq_source_h != null) begin
+    status = rdma_handle_owner_status(plan.rq_source_h, owner);
+    if (!status.ok()) return status;
+    if (plan.transport != RDMA_TRANSPORT_RC || plan.rq_ring != null ||
+        plan.rq_ref != null || plan.rq_pd_ref != null)
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "partial QP SRQ authority is invalid");
+  end else begin
+    if (plan.rq_ring != null) begin
+      status = plan.rq_ring.validate();
+      if (!status.ok()) return status;
+      if (plan.rq_ring.role != RDMA_QUEUE_ROLE_QP_RQ_RING ||
+          plan.rq_ring.depth != plan.rq_depth)
+        return rdma_status::make(RDMA_SC_INVALID_STATE,
+                                 "partial QP RQ ring is invalid");
+    end
+    status = rdma_qp_partial_ref_status(
+      plan.rq_ref, RDMA_QUEUE_ROLE_QP_RQ_RING, owner, qp_h, "partial QP RQ"
+    );
+    if (!status.ok()) return status;
+    status = rdma_qp_partial_ref_status(
+      plan.rq_pd_ref, RDMA_QUEUE_ROLE_QP_RQ_PD, owner, qp_h,
+      "partial QP RQ PD"
+    );
+    if (!status.ok()) return status;
+    if (((plan.rq_ref != null || plan.rq_pd_ref != null) &&
+         plan.rq_ring == null) ||
+        (plan.rq_pd_ref != null && plan.rq_ref == null))
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "partial QP RQ authority is out of order");
+    if (plan.rq_ref != null) begin
+      status = rdma_qp_backing_total_length(plan.rq_ref, total_length);
+      if (!status.ok() || total_length != plan.rq_ring.storage_bytes)
+        return status.ok() ? rdma_status::make(
+          RDMA_SC_INVALID_STATE, "partial QP RQ geometry is invalid"
+        ) : status;
+    end
+  end
+  foreach (plan.urc_refs[i]) begin
+    if (plan.transport != RDMA_TRANSPORT_URC || plan.urc_refs[i] == null)
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "partial QP URC authority is invalid");
+    case (plan.urc_refs[i].role)
+      RDMA_QUEUE_ROLE_QP_URC_RSQ: seen_urc[0] = 1'b1;
+      RDMA_QUEUE_ROLE_QP_URC_RDSQ: seen_urc[1] = 1'b1;
+      RDMA_QUEUE_ROLE_QP_URC_DSQ: seen_urc[2] = 1'b1;
+      default: return rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT, "partial QP URC role is invalid"
+      );
+    endcase
+    status = rdma_qp_partial_ref_status(
+      plan.urc_refs[i], plan.urc_refs[i].role, owner, qp_h,
+      "partial QP URC"
+    );
+    if (!status.ok()) return status;
+  end
+  if ((plan.transport != RDMA_TRANSPORT_URC &&
+       plan.urc_refs.size() != 0) ||
+      plan.urc_refs.size() > 3 ||
+      (seen_urc[1] && !seen_urc[0]) ||
+      (seen_urc[2] && !seen_urc[1]))
+    return rdma_status::make(RDMA_SC_INVALID_STATE,
+                             "partial QP URC order is invalid");
+  if (plan.context_ref != null) begin
+    status = plan.context_ref.validate();
+    if (!status.ok()) return status;
+    if (plan.context_ref.resource_kind != RDMA_RESOURCE_QP ||
+        !plan.context_ref.owner.same_instance(owner))
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "partial QP context identity is invalid");
+  end
+  if (plan.sq_ref == null && plan.sq_pd_ref == null &&
+      plan.rq_ref == null && plan.rq_pd_ref == null &&
+      plan.urc_refs.size() == 0)
+    return rdma_status::make(RDMA_SC_INVALID_STATE,
+                             "partial QP plan has no retained authority");
+  return rdma_status::success();
+endfunction
+
 function automatic rdma_status rdma_qp_backing_projection_status(
   rdma_qp_backing_ref backing_ref,
   rdma_backing_addr_t programmed_backing,
@@ -675,8 +843,50 @@ class rdma_qp extends rdma_resource;
                            RDMA_QPS_ERROR}))
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "QP state is invalid");
-    if (state inside {RDMA_RESOURCE_PROGRAMMED, RDMA_RESOURCE_ACTIVE,
-                      RDMA_RESOURCE_QUIESCING, RDMA_RESOURCE_ERROR}) begin
+    if (state == RDMA_RESOURCE_ERROR && programmed_qpc == null) begin
+      if (qp_plan == null || backing_refs.size() != 0 || hmc_refs.size() != 0)
+        return rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "pre-program QP ERROR backing authority is incomplete or split"
+        );
+      status = rdma_qp_partial_plan_status(qp_plan, owner, handle);
+      if (!status.ok()) return status;
+      if (qp_plan.context_ref != null &&
+          qp_plan.context_ref.local_id != local_qp_id)
+        return rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "pre-program QP ERROR context local ID does not match resource"
+        );
+      if (qp_plan.transport != transport || qp_plan.sq_depth != sq_depth ||
+          qp_plan.rq_depth != rq_depth)
+        return rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "pre-program QP ERROR plan does not match resource"
+        );
+      if (qp_plan.sq_ref != null &&
+          sq_iova.value != qp_plan.sq_ref.mapping.iova.value +
+                           qp_plan.sq_ref.mapping_offset)
+        return rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "pre-program QP ERROR SQ IOVA does not match retained authority"
+        );
+      if (qp_plan.rq_source_h == null && qp_plan.rq_ref != null &&
+          rq_iova.value != qp_plan.rq_ref.mapping.iova.value +
+                           qp_plan.rq_ref.mapping_offset)
+        return rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "pre-program QP ERROR RQ IOVA does not match retained authority"
+        );
+      if ((srq_h == null) != (qp_plan.rq_source_h == null) ||
+          (srq_h != null && !srq_h.same_instance(qp_plan.rq_source_h)))
+        return rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "pre-program QP ERROR SRQ authority does not match resource"
+        );
+    end
+    else if (state inside {RDMA_RESOURCE_PROGRAMMED, RDMA_RESOURCE_ACTIVE,
+                           RDMA_RESOURCE_QUIESCING,
+                           RDMA_RESOURCE_ERROR}) begin
       if (qp_plan == null || programmed_qpc == null ||
           backing_refs.size() != 0 || hmc_refs.size() != 0)
         return rdma_status::make(RDMA_SC_INVALID_STATE,
