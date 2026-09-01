@@ -417,6 +417,11 @@ class rdma_qp_recovery_state extends uvm_object;
   rdma_context_backing_ref context_ref;
   rdma_dma_mapping staging_mapping;
   rdma_dma_mapping query_mapping;
+  // Presence evidence obtained from a durable QPC_QUERY image.  The mapping
+  // itself may remain retained until its opaque release completion is proven;
+  // these fields let a retry skip a second query side effect.
+  bit query_presence_known;
+  rdma_hw_presence_e query_presence;
   // Ticketless modify failures still carry a pending hardware/cleanup step.
   // This marker permits durable ERROR recovery authority when the adapter did
   // not return a CMQ ticket (for example after encode/write or staging-release
@@ -451,6 +456,8 @@ class rdma_qp_recovery_state extends uvm_object;
     context_ref = null;
     staging_mapping = null;
     query_mapping = null;
+    query_presence_known = 1'b0;
+    query_presence = RDMA_HW_PRESENCE_UNKNOWN;
     has_pending_hardware_step = 1'b0;
     query_mapping_recovery_only = 1'b0;
     error_modify_complete = 1'b0;
@@ -681,9 +688,7 @@ class rdma_qp_recovery_state extends uvm_object;
       );
       if (!status.ok()) return status;
     end
-    if ((intent == RDMA_QP_RECOVER_CREATE_ROLLBACK &&
-         ambiguous_operation == RDMA_QP_AMBIG_MODIFY) ||
-        (intent == RDMA_QP_RECOVER_MODIFY_RECONCILE &&
+    if ((intent == RDMA_QP_RECOVER_MODIFY_RECONCILE &&
          !(ambiguous_operation inside {RDMA_QP_AMBIG_NONE,
                                         RDMA_QP_AMBIG_MODIFY})) ||
         (intent == RDMA_QP_RECOVER_NORMAL_DESTROY &&
@@ -901,6 +906,13 @@ class rdma_qp_recovery_state extends uvm_object;
       );
       if (!status.ok()) return status;
     end
+    if (query_presence_known &&
+        !(query_presence inside {RDMA_HW_PRESENCE_PRESENT,
+                                 RDMA_HW_PRESENCE_ABSENT}))
+      return rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT,
+        "QP recovery query presence is invalid"
+      );
     return rdma_status::success();
   endfunction
 
@@ -915,6 +927,8 @@ class rdma_qp_recovery_state extends uvm_object;
     role_complete = r.role_complete;
     prior_qpc = null; candidate_qpc = null; qp_plan = null; context_ref = null;
     staging_mapping = null; query_mapping = null;
+    query_presence_known = r.query_presence_known;
+    query_presence = r.query_presence;
     query_mapping_recovery_only = r.query_mapping_recovery_only;
     has_pending_hardware_step = r.has_pending_hardware_step;
     error_modify_complete = r.error_modify_complete;
@@ -1039,7 +1053,10 @@ class rdma_recovery_record extends uvm_object;
                                  "recovery rollback status is null");
     end
     if (hardware_presence == RDMA_HW_PRESENCE_UNKNOWN &&
-        ambiguous_ticket == null && !has_pending_hardware_step)
+        ambiguous_ticket == null && !has_pending_hardware_step &&
+        !(qp_recovery_valid && qp_recovery != null &&
+          (qp_recovery.ambiguous_ticket != null ||
+           qp_recovery.has_pending_hardware_step)))
       return rdma_status::make(
         RDMA_SC_INVALID_STATE,
         "unknown hardware presence lacks an ambiguous ticket or hardware step"

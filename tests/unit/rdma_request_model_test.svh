@@ -1240,8 +1240,12 @@ class rdma_request_model_test extends uvm_test;
       "qp_create_modify_ticket", function_h, cmq_h,
       qp_recovery.modify_opcode
     );
-    expect_status("QP_RECOVERY_CREATE_MODIFY_MATRIX", qp_recovery.validate(),
-                  RDMA_SC_INVALID_STATE);
+    // A CREATE rollback may enter the canonical destroy recipe after the
+    // CREATE side effect was proven present.  Its state-only QPC_MODIFY to
+    // ERROR is therefore a valid ambiguous recovery step, even though a
+    // MODIFY_RECONCILE record may only carry AMBIG_MODIFY.
+    expect_status("QP_RECOVERY_CREATE_ROLLBACK_MODIFY",
+                  qp_recovery.validate(), RDMA_SC_OK);
     qp_recovery.ambiguous_operation = RDMA_QP_AMBIG_CREATE;
     qp_recovery.candidate_qpc = null;
     qp_recovery.ambiguous_ticket = make_recovery_ticket(

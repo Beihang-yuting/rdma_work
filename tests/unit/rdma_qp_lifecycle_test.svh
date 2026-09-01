@@ -2278,7 +2278,7 @@ class rdma_qp_lifecycle_test extends uvm_test;
         if (resource == null || resource.state != RDMA_RESOURCE_ERROR ||
             recovery == null || !recovery.qp_recovery_valid ||
             recovery.qp_recovery == null ||
-            recovery.hardware_presence != RDMA_HW_PRESENCE_PRESENT ||
+            recovery.hardware_presence != RDMA_HW_PRESENCE_UNKNOWN ||
             recovery.qp_recovery.ambiguous_operation != RDMA_QP_AMBIG_CREATE ||
             recovery.qp_recovery.ambiguous_ticket == null ||
             recovery.qp_recovery.staging_mapping == null)

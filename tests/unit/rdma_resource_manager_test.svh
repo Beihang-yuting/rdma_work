@@ -9722,7 +9722,7 @@ class rdma_resource_manager_test extends uvm_test;
       RDMA_SC_OK
     );
     if (recovery_lookup == null || recovery_lookup.qp_recovery == null ||
-        recovery_lookup.hardware_presence != RDMA_HW_PRESENCE_PRESENT ||
+        recovery_lookup.hardware_presence != RDMA_HW_PRESENCE_UNKNOWN ||
         recovery_lookup.qp_recovery.context_ref.release_complete ||
         recovery_lookup.qp_recovery.qp_plan.context_ref.release_complete ||
         recovery_lookup.qp_recovery.ambiguous_operation !=
@@ -9737,6 +9737,11 @@ class rdma_resource_manager_test extends uvm_test;
                  "stored QP recovery clone failed")
     qp_error_replacement.ambiguous_operation = RDMA_QP_AMBIG_NONE;
     qp_error_replacement.ambiguous_ticket = null;
+    // Clearing a DELETE ambiguity requires an explicit presence proof.  The
+    // recovery executor obtains this from the authenticated QPC_QUERY image;
+    // model the same evidence here before allowing local cleanup to proceed.
+    qp_error_replacement.query_presence_known = 1'b1;
+    qp_error_replacement.query_presence = RDMA_HW_PRESENCE_PRESENT;
     expect_status(
       "QP_ERROR_REPLACEMENT_RESOLVE",
       qp_generic_bypass_rm.mark_qp_error(
