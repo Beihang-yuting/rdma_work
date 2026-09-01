@@ -9313,6 +9313,179 @@ class rdma_resource_manager_test extends uvm_test;
       `uvm_error("QP_OCC_REPLACEMENT_ATOMIC",
                  "rejected OCC replacement changed stored authority")
 
+    begin
+      rdma_queue_backing_role_e pd_roles[$];
+      pd_roles.push_back(RDMA_QUEUE_ROLE_QP_SQ_PD);
+      pd_roles.push_back(RDMA_QUEUE_ROLE_QP_RQ_PD);
+      foreach (pd_roles[i]) begin
+        string label;
+        bit expected_sq_ring_complete;
+        bit expected_sq_pd_complete;
+
+        label = $sformatf("QP_OCC_PD_CLEAR_%0d", i);
+        qp_generic_bypass_candidate.qp_plan.cleanup_complete = 1'b1;
+        qp_generic_bypass_candidate.qp_plan.sq_pd_flush_complete =
+          pd_roles[i] == RDMA_QUEUE_ROLE_QP_RQ_PD;
+        qp_generic_bypass_candidate.qp_plan.rq_pd_flush_complete = 1'b0;
+        expect_status(
+          {label, "_PRECONDITION"},
+          qp_generic_bypass_rm.force_qp_active_precondition(
+            qp_generic_bypass_candidate
+          ),
+          RDMA_SC_OK
+        );
+        qp_qpc_binding_recovery = make_qp_test_recovery(
+          {label, "_INITIAL"}, qp_generic_bypass_candidate,
+          RDMA_QP_RECOVER_CREATE_ROLLBACK,
+          qp_generic_bypass_candidate.programmed_qpc
+        );
+        qp_qpc_binding_recovery.role_complete[
+          RDMA_QUEUE_ROLE_QP_SQ_RING
+        ] = 1'b1;
+        qp_qpc_binding_recovery.role_complete[
+          RDMA_QUEUE_ROLE_QP_SQ_PD
+        ] = pd_roles[i] == RDMA_QUEUE_ROLE_QP_RQ_PD;
+        expected_sq_ring_complete = 1'b1;
+        expected_sq_pd_complete =
+          pd_roles[i] == RDMA_QUEUE_ROLE_QP_RQ_PD;
+        expect_status(
+          {label, "_INITIAL_MARK"},
+          qp_generic_bypass_rm.mark_qp_error(
+            qp_generic_bypass_candidate.handle, qp_qpc_binding_recovery
+          ),
+          RDMA_SC_OK
+        );
+        expect_status(
+          {label, "_INITIAL_LOOKUP"},
+          qp_generic_bypass_rm.lookup_recovery(
+            qp_generic_bypass_candidate.handle, recovery_lookup
+          ),
+          RDMA_SC_OK
+        );
+        qp_cloned_object = recovery_lookup.qp_recovery.clone();
+        if (qp_cloned_object == null ||
+            !$cast(qp_error_replacement, qp_cloned_object))
+          `uvm_fatal({label, "_AMBIG_CLONE"},
+                     "stored QP recovery clone failed")
+        qp_error_replacement.ambiguous_operation =
+          RDMA_QP_AMBIG_OCC_FLUSH;
+        qp_error_replacement.ambiguous_role = pd_roles[i];
+        qp_error_replacement.ambiguous_ticket = make_qp_test_ticket(
+          {label, "_TICKET"}, qp_generic_bypass_candidate.owner,
+          qp_generic_bypass_cmq.handle, qp_error_replacement.occ_opcode
+        );
+        expect_status(
+          {label, "_SET"},
+          qp_generic_bypass_rm.mark_qp_error(
+            qp_generic_bypass_candidate.handle, qp_error_replacement
+          ),
+          RDMA_SC_OK
+        );
+
+        expect_status(
+          {label, "_AMBIG_LOOKUP"},
+          qp_generic_bypass_rm.lookup_recovery(
+            qp_generic_bypass_candidate.handle, recovery_lookup
+          ),
+          RDMA_SC_OK
+        );
+        qp_cloned_object = recovery_lookup.qp_recovery.clone();
+        if (qp_cloned_object == null ||
+            !$cast(qp_error_replacement, qp_cloned_object))
+          `uvm_fatal({label, "_MALFORMED_CLONE"},
+                     "stored QP OCC recovery clone failed")
+        qp_error_replacement.ambiguous_operation = RDMA_QP_AMBIG_NONE;
+        qp_error_replacement.ambiguous_ticket = null;
+        expect_status(
+          {label, "_NONCANONICAL_REJECT"},
+          qp_generic_bypass_rm.mark_qp_error(
+            qp_generic_bypass_candidate.handle, qp_error_replacement
+          ),
+          RDMA_SC_INVALID_ARGUMENT
+        );
+
+        qp_cloned_object = recovery_lookup.qp_recovery.clone();
+        if (qp_cloned_object == null ||
+            !$cast(qp_error_replacement, qp_cloned_object))
+          `uvm_fatal({label, "_PROGRESS_CLONE"},
+                     "stored QP OCC recovery clone failed")
+        qp_error_replacement.ambiguous_operation = RDMA_QP_AMBIG_NONE;
+        qp_error_replacement.ambiguous_role = RDMA_QUEUE_ROLE_QP_SQ_RING;
+        qp_error_replacement.ambiguous_ticket = null;
+        qp_error_replacement.role_complete[
+          RDMA_QUEUE_ROLE_QP_RQ_RING
+        ] = 1'b1;
+        expect_status(
+          {label, "_PROGRESS_REJECT"},
+          qp_generic_bypass_rm.mark_qp_error(
+            qp_generic_bypass_candidate.handle, qp_error_replacement
+          ),
+          RDMA_SC_INVALID_ARGUMENT
+        );
+        expect_status(
+          {label, "_REJECT_ATOMIC_LOOKUP"},
+          qp_generic_bypass_rm.lookup_recovery(
+            qp_generic_bypass_candidate.handle, recovery_lookup
+          ),
+          RDMA_SC_OK
+        );
+        if (recovery_lookup == null || recovery_lookup.qp_recovery == null ||
+            recovery_lookup.qp_recovery.ambiguous_operation !=
+              RDMA_QP_AMBIG_OCC_FLUSH ||
+            recovery_lookup.qp_recovery.ambiguous_role != pd_roles[i] ||
+            recovery_lookup.qp_recovery.ambiguous_ticket == null ||
+            recovery_lookup.qp_recovery.role_complete[
+              RDMA_QUEUE_ROLE_QP_RQ_RING
+            ])
+          `uvm_error({label, "_REJECT_ATOMIC"},
+                     "rejected OCC clear changed stored recovery")
+
+        qp_cloned_object = recovery_lookup.qp_recovery.clone();
+        if (qp_cloned_object == null ||
+            !$cast(qp_error_replacement, qp_cloned_object))
+          `uvm_fatal({label, "_CLEAR_CLONE"},
+                     "stored QP OCC recovery clone failed")
+        qp_error_replacement.ambiguous_operation = RDMA_QP_AMBIG_NONE;
+        qp_error_replacement.ambiguous_role = RDMA_QUEUE_ROLE_QP_SQ_RING;
+        qp_error_replacement.ambiguous_ticket = null;
+        expect_status(
+          {label, "_CLEAR"},
+          qp_generic_bypass_rm.mark_qp_error(
+            qp_generic_bypass_candidate.handle, qp_error_replacement
+          ),
+          RDMA_SC_OK
+        );
+        expect_status(
+          {label, "_CLEAR_LOOKUP"},
+          qp_generic_bypass_rm.lookup_recovery(
+            qp_generic_bypass_candidate.handle, recovery_lookup
+          ),
+          RDMA_SC_OK
+        );
+        if (recovery_lookup == null || recovery_lookup.qp_recovery == null ||
+            recovery_lookup.qp_recovery.ambiguous_operation !=
+              RDMA_QP_AMBIG_NONE ||
+            recovery_lookup.qp_recovery.ambiguous_role !=
+              RDMA_QUEUE_ROLE_QP_SQ_RING ||
+            recovery_lookup.qp_recovery.ambiguous_ticket != null ||
+            recovery_lookup.qp_recovery.role_complete[
+              RDMA_QUEUE_ROLE_QP_SQ_RING
+            ] != expected_sq_ring_complete ||
+            recovery_lookup.qp_recovery.role_complete[
+              RDMA_QUEUE_ROLE_QP_SQ_PD
+            ] != expected_sq_pd_complete ||
+            recovery_lookup.qp_recovery.qp_plan.cleanup_complete != 1'b1 ||
+            recovery_lookup.qp_recovery.qp_plan.sq_pd_flush_complete !=
+              expected_sq_pd_complete ||
+            recovery_lookup.qp_recovery.qp_plan.rq_pd_flush_complete != 1'b0)
+          `uvm_error({label, "_CLEAR_RESULT"},
+                     "OCC clear lost canonical role or retained progress")
+      end
+      qp_generic_bypass_candidate.qp_plan.cleanup_complete = 1'b0;
+      qp_generic_bypass_candidate.qp_plan.sq_pd_flush_complete = 1'b0;
+      qp_generic_bypass_candidate.qp_plan.rq_pd_flush_complete = 1'b0;
+    end
+
     expect_status(
       "QP_ERROR_REPLACEMENT_PRECONDITION",
       qp_generic_bypass_rm.force_qp_active_precondition(

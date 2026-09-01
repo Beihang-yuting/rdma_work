@@ -4284,6 +4284,16 @@ class rdma_resource_manager extends uvm_object;
         "QP programming requires a complete ALLOCATED replacement"
       );
     status = lookup(replacement.handle, authoritative);
+    if (!status.ok() && status.code == RDMA_SC_STALE_GENERATION) begin
+      key = resource_key(replacement.handle);
+      if (registry.exists(key) && registry[key] != null &&
+          registry[key].handle != null &&
+          same_handle_instance(registry[key].handle, replacement.handle))
+        status = project_resource_value(
+          registry[key], "attach exact-old QP recovery programming",
+          authoritative
+        );
+    end
     if (!status.ok() || !$cast(authoritative_qp, authoritative))
       return status.ok() ? rdma_status::make(
         RDMA_SC_INVALID_ARGUMENT, "QP programming target is not a QP"
@@ -4525,6 +4535,7 @@ class rdma_resource_manager extends uvm_object;
     bit progress_changed;
     bit setting_ambiguity;
     bit clearing_ambiguity;
+    bit normalizing_occ_role;
     bit stale_recovery_allowed;
 
     status = lookup(qp_h, authoritative);
@@ -4544,10 +4555,16 @@ class rdma_resource_manager extends uvm_object;
         else if (recovery.intent == RDMA_QP_RECOVER_CREATE_ROLLBACK &&
                  recovery.ambiguous_operation == RDMA_QP_AMBIG_NONE &&
                  recovery.ambiguous_ticket == null &&
-                 recovery.candidate_qpc != null &&
-                 same_qpc_value(recovery.candidate_qpc,
-                                retained_qp.programmed_qpc))
-          stale_recovery_allowed = 1'b1;
+                 ((recovery.candidate_qpc != null &&
+                   same_qpc_value(recovery.candidate_qpc,
+                                  retained_qp.programmed_qpc)) ||
+                  (recovery.candidate_qpc == null &&
+                   retained_qp.state == RDMA_RESOURCE_PROGRAMMED &&
+                   same_qp_plan_value(recovery.qp_plan,
+                                      retained_qp.qp_plan)))) begin
+          status = recovery.validate();
+          stale_recovery_allowed = status != null && status.ok();
+        end
         if (stale_recovery_allowed)
           status = project_resource_value(
             registry[key], "mark stale in-flight QP ERROR", authoritative
@@ -4635,6 +4652,13 @@ class rdma_resource_manager extends uvm_object;
         existing_recovery.ambiguous_ticket != null &&
         recovery_copy.ambiguous_operation == RDMA_QP_AMBIG_NONE &&
         recovery_copy.ambiguous_ticket == null;
+      normalizing_occ_role =
+        clearing_ambiguity &&
+        existing_recovery.ambiguous_operation == RDMA_QP_AMBIG_OCC_FLUSH &&
+        existing_recovery.ambiguous_role inside {
+          RDMA_QUEUE_ROLE_QP_SQ_PD, RDMA_QUEUE_ROLE_QP_RQ_PD
+        } &&
+        recovery_copy.ambiguous_role == RDMA_QUEUE_ROLE_QP_SQ_RING;
       progress_changed = 1'b0;
       foreach (existing_recovery.role_complete[i]) begin
         if (existing_recovery.role_complete[i] !=
@@ -4666,7 +4690,7 @@ class rdma_resource_manager extends uvm_object;
           RDMA_SC_INVALID_STATE,
           "QP ERROR ambiguity transition is out of order"
         );
-      if ((!setting_ambiguity &&
+      if ((!setting_ambiguity && !normalizing_occ_role &&
            recovery_copy.ambiguous_role !=
              existing_recovery.ambiguous_role) ||
           recovery_copy.intent != existing_recovery.intent ||

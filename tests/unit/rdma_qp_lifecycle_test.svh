@@ -167,21 +167,36 @@ class rdma_qp_fault_manager extends rdma_resource_manager;
   `uvm_object_utils(rdma_qp_fault_manager)
   rdma_status attach_failure;
   rdma_status activate_failure;
+  rdma_function_binding binding_target;
+  bit rebind_after_attach;
+  bit attach_rebound;
 
   function new(string name = "rdma_qp_fault_manager");
     super.new(name);
     attach_failure = null;
     activate_failure = null;
+    binding_target = null;
+    rebind_after_attach = 1'b0;
+    attach_rebound = 1'b0;
   endfunction
 
   virtual function rdma_status attach_qp_programming(rdma_qp candidate);
     rdma_status failure;
+    rdma_status status;
     if (attach_failure != null) begin
       failure = rdma_cmq_clone_status_value(attach_failure);
       attach_failure = null;
       return failure;
     end
-    return super.attach_qp_programming(candidate);
+    status = super.attach_qp_programming(candidate);
+    if (status != null && status.ok() && rebind_after_attach &&
+        binding_target != null) begin
+      rebind_after_attach = 1'b0;
+      binding_target.generation++;
+      binding_target.owner_h = binding_target.make_handle();
+      attach_rebound = 1'b1;
+    end
+    return status;
   endfunction
 
   virtual function rdma_status activate(rdma_handle handle);
@@ -327,6 +342,13 @@ class rdma_qp_boundary_host_mem extends rdma_mock_host_mem;
       return rdma_status::make(RDMA_SC_TIMEOUT,
                                "injected pending staging release");
     end
+    if (!injected && mode == "timeout_plan_release_before" &&
+        mapping != null && mapping.size != 512) begin
+      injected = 1'b1;
+      void'(record_call("release", null, mapping));
+      return rdma_status::make(RDMA_SC_TIMEOUT,
+                               "injected pending plan release");
+    end
     status = super.\release (mapping);
     if (status != null && status.ok() && !injected && mapping != null &&
         mapping.size == 512 && mode == "rebind_staging_release") begin
@@ -340,6 +362,33 @@ class rdma_qp_boundary_host_mem extends rdma_mock_host_mem;
                                "injected completed staging release timeout");
     end
     return status;
+  endfunction
+endclass
+
+class rdma_qp_command_fault_executor extends rdma_qp_lifecycle_executor;
+  `uvm_object_utils(rdma_qp_command_fault_executor)
+  bit fail_create_command;
+
+  function new(string name = "rdma_qp_command_fault_executor");
+    super.new(name);
+    fail_create_command = 1'b0;
+  endfunction
+
+  protected virtual function rdma_status build_qpc_command(
+    rdma_function_handle owner,
+    rdma_qpc_model model,
+    rdma_dma_mapping staging,
+    rdma_hw_image image,
+    bit [7:0] opcode,
+    output rdma_cmq_command_desc command
+  );
+    if (fail_create_command && opcode == XTR_V1_OP_QPC_CREATE) begin
+      command = null;
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "injected QPC_CREATE command-build failure");
+    end
+    return super.build_qpc_command(owner, model, staging, image, opcode,
+                                    command);
   endfunction
 endclass
 
@@ -2389,6 +2438,318 @@ class rdma_qp_lifecycle_test extends uvm_test;
     end
   endtask
 
+  task automatic check_pre_create_execute_generation_fence();
+    string label;
+    rdma_qp_boundary_host_mem mem;
+    rdma_qp_fault_manager manager;
+    rdma_qp_boundary_context_backing contexts;
+    rdma_mock_cmq_port cmq;
+    rdma_qp_lifecycle_executor executor;
+    rdma_function_binding binding;
+    rdma_function_handle old_owner;
+    rdma_pd pd;
+    rdma_cq cq;
+    rdma_create_qp_req request;
+    rdma_qp qp;
+    rdma_control_result result;
+    rdma_recovery_record recovery;
+    rdma_resource_state_e raw_state;
+
+    label = "CREATE_PRE_EXECUTE_REBIND";
+    mem = rdma_qp_boundary_host_mem::type_id::create({label, "_mem"});
+    manager = rdma_qp_fault_manager::type_id::create({label, "_manager"});
+    contexts = rdma_qp_boundary_context_backing::type_id::create(
+      {label, "_contexts"}
+    );
+    cmq = rdma_mock_cmq_port::type_id::create({label, "_cmq"});
+    executor = rdma_qp_lifecycle_executor::type_id::create(
+      {label, "_executor"}
+    );
+    setup_custom_qp_environment(label, mem, manager, contexts, cmq, executor,
+                                binding, pd, cq);
+    old_owner = binding.make_handle();
+    manager.binding_target = binding;
+    manager.rebind_after_attach = 1'b1;
+    request = make_request({label, "_request"}, binding, pd, cq,
+                           RDMA_TRANSPORT_RC);
+    executor.create_locked(binding, old_owner, request, 490, qp, result);
+    expect_code({label, "_STATUS"}, result == null ? null : result.status,
+                RDMA_SC_RECOVERY_REQUIRED);
+    expect_code({label, "_PRIMARY"},
+                result == null ? null : result.primary_status,
+                RDMA_SC_STALE_GENERATION);
+    if (!manager.attach_rebound || qp != null || result == null ||
+        result.resource_h == null || !result.recovery_required ||
+        cmq.calls.size() != 0 || mem.unauthorized_effect ||
+        contexts.unauthorized_effect ||
+        !manager.raw_qp_state(result.resource_h, raw_state) ||
+        raw_state != RDMA_RESOURCE_ERROR ||
+        !manager.raw_recovery(result.resource_h, recovery) ||
+        recovery == null || recovery.hardware_presence !=
+          RDMA_HW_PRESENCE_ABSENT || recovery.qp_recovery == null ||
+        recovery.qp_recovery.ambiguous_operation != RDMA_QP_AMBIG_NONE ||
+        recovery.qp_recovery.ambiguous_ticket != null ||
+        recovery.qp_recovery.candidate_qpc != null ||
+        recovery.qp_recovery.staging_mapping == null ||
+        recovery.qp_recovery.context_ref == null ||
+        recovery.qp_recovery.context_ref.owner == null ||
+        !recovery.qp_recovery.context_ref.owner.same_instance(old_owner) ||
+        binding.make_handle().same_instance(old_owner))
+      `uvm_error(label,
+        "pre-QPC_CREATE fence submitted or lost exact-old recovery authority")
+  endtask
+
+  task automatic check_context_acquire_rebind_authority();
+    string label;
+    rdma_qp_boundary_host_mem mem;
+    rdma_qp_fault_manager manager;
+    rdma_qp_boundary_context_backing contexts;
+    rdma_mock_cmq_port cmq;
+    rdma_qp_lifecycle_executor executor;
+    rdma_function_binding binding;
+    rdma_function_handle old_owner;
+    rdma_pd pd;
+    rdma_cq cq;
+    rdma_create_qp_req request;
+    rdma_qp qp;
+    rdma_control_result result;
+    rdma_recovery_record recovery;
+    rdma_resource_state_e raw_state;
+
+    label = "CREATE_CONTEXT_ACQUIRE_REBIND_AUTHORITY";
+    mem = rdma_qp_boundary_host_mem::type_id::create({label, "_mem"});
+    manager = rdma_qp_fault_manager::type_id::create({label, "_manager"});
+    contexts = rdma_qp_boundary_context_backing::type_id::create(
+      {label, "_contexts"}
+    );
+    cmq = rdma_mock_cmq_port::type_id::create({label, "_cmq"});
+    executor = rdma_qp_lifecycle_executor::type_id::create(
+      {label, "_executor"}
+    );
+    setup_custom_qp_environment(label, mem, manager, contexts, cmq, executor,
+                                binding, pd, cq);
+    old_owner = binding.make_handle();
+    contexts.binding_target = binding;
+    contexts.mode = "rebind_context_acquire";
+    request = make_request({label, "_request"}, binding, pd, cq,
+                           RDMA_TRANSPORT_RC);
+    executor.create_locked(binding, old_owner, request, 491, qp, result);
+    expect_code({label, "_STATUS"}, result == null ? null : result.status,
+                RDMA_SC_RECOVERY_REQUIRED);
+    expect_code({label, "_PRIMARY"},
+                result == null ? null : result.primary_status,
+                RDMA_SC_STALE_GENERATION);
+    if (!contexts.rebound || contexts.unauthorized_effect || qp != null ||
+        result == null || result.resource_h == null ||
+        !result.recovery_required || cmq.calls.size() != 0 ||
+        contexts.slots.size() != 1 || contexts.slots[0] == null ||
+        contexts.slots[0].released || mem.live_allocations() != 4 ||
+        !manager.raw_qp_state(result.resource_h, raw_state) ||
+        raw_state != RDMA_RESOURCE_ERROR ||
+        !manager.raw_recovery(result.resource_h, recovery) ||
+        recovery == null || recovery.hardware_presence !=
+          RDMA_HW_PRESENCE_ABSENT || recovery.qp_recovery == null ||
+        recovery.qp_recovery.ambiguous_operation != RDMA_QP_AMBIG_NONE ||
+        recovery.qp_recovery.ambiguous_ticket != null ||
+        recovery.qp_recovery.candidate_qpc != null ||
+        recovery.qp_recovery.staging_mapping != null ||
+        recovery.qp_recovery.context_ref == null ||
+        recovery.qp_recovery.context_ref.owner == null ||
+        !recovery.qp_recovery.context_ref.owner.same_instance(old_owner) ||
+        recovery.qp_recovery.qp_plan == null ||
+        recovery.qp_recovery.qp_plan.sq_ref == null ||
+        recovery.qp_recovery.qp_plan.sq_ref.mapping == null ||
+        recovery.qp_recovery.qp_plan.sq_ref.mapping.function_h == null ||
+        !recovery.qp_recovery.qp_plan.sq_ref.mapping.function_h.
+          same_instance(old_owner) || binding.make_handle().same_instance(old_owner))
+      `uvm_error(label,
+        "post-acquire rebind left bare stale or lost exact-old authority")
+  endtask
+
+  task automatic check_definitive_failure_staging_release_ambiguity();
+    for (int unsigned failure_kind = 0; failure_kind < 3; failure_kind++) begin
+      string label;
+      rdma_qp_boundary_host_mem mem;
+      rdma_qp_fault_manager manager;
+      rdma_qp_boundary_context_backing contexts;
+      rdma_mock_cmq_port cmq;
+      rdma_qp_output_fault_cmq output_cmq;
+      rdma_qp_lifecycle_executor executor;
+      rdma_qp_command_fault_executor command_executor;
+      rdma_function_binding binding;
+      rdma_pd pd;
+      rdma_cq cq;
+      rdma_create_qp_req request;
+      rdma_qp qp;
+      rdma_control_result result;
+      rdma_recovery_record recovery;
+      rdma_resource_state_e raw_state;
+      bit release_complete;
+      rdma_status query_status;
+
+      label = $sformatf("CREATE_DEFINITIVE_STAGING_AMBIG_%0d", failure_kind);
+      mem = rdma_qp_boundary_host_mem::type_id::create({label, "_mem"});
+      mem.mode = "timeout_staging_release_before";
+      manager = rdma_qp_fault_manager::type_id::create({label, "_manager"});
+      contexts = rdma_qp_boundary_context_backing::type_id::create(
+        {label, "_contexts"}
+      );
+      if (failure_kind == 1) begin
+        output_cmq = rdma_qp_output_fault_cmq::type_id::create(
+          {label, "_cmq"}
+        );
+        output_cmq.definitive_no_submit = 1'b1;
+        cmq = output_cmq;
+      end else
+        cmq = rdma_mock_cmq_port::type_id::create({label, "_cmq"});
+      if (failure_kind == 2) begin
+        command_executor = rdma_qp_command_fault_executor::type_id::create(
+          {label, "_executor"}
+        );
+        command_executor.fail_create_command = 1'b1;
+        executor = command_executor;
+      end else
+        executor = rdma_qp_lifecycle_executor::type_id::create(
+          {label, "_executor"}
+        );
+      setup_custom_qp_environment(label, mem, manager, contexts, cmq, executor,
+                                  binding, pd, cq);
+      if (failure_kind == 0)
+        cmq.fail_opcode(XTR_V1_OP_QPC_CREATE,
+          rdma_status::make(RDMA_SC_DMA_TRANSLATION,
+                            "injected terminal QPC_CREATE failure"));
+      request = make_request({label, "_request"}, binding, pd, cq,
+                             RDMA_TRANSPORT_RC);
+      executor.create_locked(binding, binding.make_handle(), request,
+                             492 + failure_kind, qp, result);
+      expect_code({label, "_STATUS"}, result == null ? null : result.status,
+                  RDMA_SC_RECOVERY_REQUIRED);
+      expect_code({label, "_PRIMARY"},
+                  result == null ? null : result.primary_status,
+                  failure_kind == 0 ? RDMA_SC_DMA_TRANSLATION :
+                                      RDMA_SC_INVALID_ARGUMENT);
+      recovery = null;
+      if (result != null && result.resource_h != null)
+        void'(manager.raw_recovery(result.resource_h, recovery));
+      release_complete = 1'b1;
+      query_status = null;
+      if (recovery != null && recovery.qp_recovery != null &&
+          recovery.qp_recovery.staging_mapping != null)
+        query_status = recovery.qp_recovery.staging_mapping.
+          release_completion_status(release_complete);
+      if (qp != null || result == null || result.resource_h == null ||
+          !result.recovery_required ||
+          !manager.raw_qp_state(result.resource_h, raw_state) ||
+          raw_state != RDMA_RESOURCE_ERROR || recovery == null ||
+          recovery.hardware_presence != RDMA_HW_PRESENCE_ABSENT ||
+          recovery.qp_recovery == null ||
+          recovery.qp_recovery.ambiguous_operation != RDMA_QP_AMBIG_NONE ||
+          recovery.qp_recovery.ambiguous_ticket != null ||
+          recovery.qp_recovery.candidate_qpc != null ||
+          recovery.qp_recovery.staging_mapping == null ||
+          query_status == null || !query_status.ok() || release_complete ||
+          contexts.release_call_count != 0 || mem.live_allocations() != 5 ||
+          cmq.calls.size() != (failure_kind == 0 ? 1 : 0))
+        `uvm_error(label,
+          "definitive failure lost pending staging/plan/context authority")
+    end
+  endtask
+
+  task automatic check_unattached_release_ambiguity();
+    for (int unsigned failure_kind = 0; failure_kind < 2; failure_kind++) begin
+      string label;
+      rdma_qp_boundary_host_mem mem;
+      rdma_qp_fault_manager manager;
+      rdma_qp_boundary_context_backing contexts;
+      rdma_mock_cmq_port cmq;
+      rdma_qp_lifecycle_executor executor;
+      rdma_function_binding binding;
+      rdma_pd pd;
+      rdma_cq cq;
+      rdma_create_qp_req request;
+      rdma_qp qp;
+      rdma_control_result result;
+      rdma_recovery_record recovery;
+      rdma_resource_state_e raw_state;
+      rdma_dma_mapping retained_mapping;
+      bit release_complete;
+      int unsigned retained_release_calls;
+      rdma_status query_status;
+
+      label = $sformatf("CREATE_UNATTACHED_RELEASE_AMBIG_%0d", failure_kind);
+      mem = rdma_qp_boundary_host_mem::type_id::create({label, "_mem"});
+      manager = rdma_qp_fault_manager::type_id::create({label, "_manager"});
+      manager.attach_failure = rdma_status::make(
+        RDMA_SC_DMA_TRANSLATION, "injected programming attach failure"
+      );
+      contexts = rdma_qp_boundary_context_backing::type_id::create(
+        {label, "_contexts"}
+      );
+      if (failure_kind == 0)
+        contexts.mode = "timeout_context_release_before";
+      else
+        mem.mode = "timeout_plan_release_before";
+      cmq = rdma_mock_cmq_port::type_id::create({label, "_cmq"});
+      executor = rdma_qp_lifecycle_executor::type_id::create(
+        {label, "_executor"}
+      );
+      setup_custom_qp_environment(label, mem, manager, contexts, cmq, executor,
+                                  binding, pd, cq);
+      request = make_request({label, "_request"}, binding, pd, cq,
+                             RDMA_TRANSPORT_RC);
+      executor.create_locked(binding, binding.make_handle(), request,
+                             495 + failure_kind, qp, result);
+      expect_code({label, "_STATUS"}, result == null ? null : result.status,
+                  RDMA_SC_RECOVERY_REQUIRED);
+      expect_code({label, "_PRIMARY"},
+                  result == null ? null : result.primary_status,
+                  RDMA_SC_DMA_TRANSLATION);
+      recovery = null;
+      if (result != null && result.resource_h != null)
+        void'(manager.raw_recovery(result.resource_h, recovery));
+      release_complete = 1'b1;
+      query_status = null;
+      retained_mapping = null;
+      if (recovery != null && recovery.qp_recovery != null) begin
+        if (failure_kind == 0)
+          query_status = contexts.query_release_completion(
+            recovery.qp_recovery.context_ref, release_complete
+          );
+        else if (recovery.qp_recovery.qp_plan != null) begin
+          retained_mapping = recovery.qp_recovery.qp_plan.rq_pd_ref.mapping;
+          query_status = retained_mapping.
+            release_completion_status(release_complete);
+        end
+      end
+      retained_release_calls = 0;
+      if (retained_mapping != null) begin
+        foreach (mem.calls[i])
+          if (mem.calls[i] != null && mem.calls[i].method_name == "release" &&
+              mem.calls[i].mapping != null &&
+              mem.calls[i].mapping.iova.value == retained_mapping.iova.value)
+            retained_release_calls++;
+      end
+      if (qp != null || result == null || result.resource_h == null ||
+          !result.recovery_required || cmq.calls.size() != 0 ||
+          !manager.raw_qp_state(result.resource_h, raw_state) ||
+          raw_state != RDMA_RESOURCE_ERROR || recovery == null ||
+          recovery.hardware_presence != RDMA_HW_PRESENCE_ABSENT ||
+          recovery.qp_recovery == null ||
+          recovery.qp_recovery.ambiguous_operation != RDMA_QP_AMBIG_NONE ||
+          recovery.qp_recovery.ambiguous_ticket != null ||
+          recovery.qp_recovery.candidate_qpc != null ||
+          recovery.qp_recovery.staging_mapping != null ||
+          recovery.qp_recovery.qp_plan == null ||
+          recovery.qp_recovery.context_ref == null ||
+          query_status == null || !query_status.ok() || release_complete ||
+          mem.live_allocations() != 4 ||
+          (failure_kind == 0 && contexts.boundary_release_count != 1) ||
+          (failure_kind == 1 && retained_release_calls != 1))
+        `uvm_error(label,
+          "unattached opaque release lost identity/authority or retried")
+    end
+  endtask
+
   task run_phase(uvm_phase phase);
     phase.raise_objection(this);
     check_rc_plan_and_staging_authority();
@@ -2413,6 +2774,10 @@ class rdma_qp_lifecycle_test extends uvm_test;
     check_context_release_completion();
     check_activation_rebind_recovery();
     check_activation_rollback_ambiguity();
+    check_pre_create_execute_generation_fence();
+    check_context_acquire_rebind_authority();
+    check_definitive_failure_staging_release_ambiguity();
+    check_unattached_release_ambiguity();
     phase.drop_objection(this);
   endtask
 endclass
