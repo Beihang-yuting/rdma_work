@@ -118,6 +118,28 @@ class rdma_qp_lifecycle_executor extends uvm_object;
                             "QP DMA context validation returned null");
   endfunction
 
+  protected function rdma_status retain_failed_allocation(
+    rdma_dma_mapping mapping,
+    rdma_queue_backing_role_e role,
+    longint unsigned length,
+    output rdma_qp_backing_ref backing_ref
+  );
+    backing_ref = null;
+    if (mapping == null)
+      return rdma_status::success();
+    backing_ref = rdma_qp_backing_ref::type_id::create(
+      $sformatf("qp_failed_ref_%0d", role));
+    if (backing_ref == null)
+      return rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED,
+                               "QP failed-allocation reference failed");
+    backing_ref.role = role;
+    backing_ref.mapping = mapping;
+    backing_ref.ownership = RDMA_OWNERSHIP_CONTROL_PLANE;
+    backing_ref.mapping_offset = 0;
+    backing_ref.length = length;
+    return backing_ref.validate();
+  endfunction
+
   protected function rdma_status allocate_ref(
     rdma_function_binding binding,
     rdma_function_handle expected_owner,
@@ -145,37 +167,69 @@ class rdma_qp_lifecycle_executor extends uvm_object;
       4096, direction, mapping), "QP backing allocation returned null");
     fence_status = live_binding_fence(binding, expected_owner);
     if (!fence_status.ok()) begin
-      if (mapping != null) void'(host_mem.\release (mapping));
+      if (mapping != null) begin
+        rdma_status retain_status;
+        retain_status = retain_failed_allocation(mapping, role, length,
+                                                  backing_ref);
+        if (!retain_status.ok()) return retain_status;
+      end
       return fence_status;
     end
     if (!status.ok()) begin
-      if (mapping != null) void'(host_mem.\release (mapping));
+      if (mapping != null) begin
+        rdma_status retain_status;
+        retain_status = retain_failed_allocation(mapping, role, length,
+                                                  backing_ref);
+        if (!retain_status.ok()) return retain_status;
+      end
       return status;
     end
     if (mapping == null || mapping.size < length ||
         (mapping.iova.value & 64'hfff) != 0 ||
         (mapping.backing_addr.value & 64'hfff) != 0) begin
-      void'(host_mem.\release (mapping));
+      status = retain_failed_allocation(mapping, role, length, backing_ref);
+      if (!status.ok()) return status;
       return invalid_state("QP backing allocation geometry is invalid");
     end
     status = normalize_status(mapping.snapshot_release_authority(authority),
                               "QP backing authority snapshot returned null");
     if (!status.ok() || authority == null) begin
-      void'(host_mem.\release (mapping));
-      return status.ok() ? invalid_state("QP backing authority snapshot is null") : status;
+      if (!status.ok()) begin
+        rdma_status retain_status;
+        retain_status = retain_failed_allocation(mapping, role, length,
+                                                  backing_ref);
+        if (!retain_status.ok()) return retain_status;
+        return status;
+      end
+      return invalid_state("QP backing authority snapshot is null");
     end
     status = normalize_status(mapping.release_authority_status(authority),
       "QP backing authority equivalence returned null");
-    if (!status.ok()) begin void'(host_mem.\release (mapping)); return status; end
+    if (!status.ok()) begin
+      rdma_status retain_status;
+      retain_status = retain_failed_allocation(mapping, role, length,
+                                                backing_ref);
+      if (!retain_status.ok()) return retain_status;
+      return status;
+    end
     authority.copy(mapping);
     status = normalize_status(mapping.release_authority_status(authority),
       "QP copied backing authority equivalence returned null");
-    if (!status.ok()) begin void'(host_mem.\release (mapping)); return status; end
+    if (!status.ok()) begin
+      rdma_status retain_status;
+      retain_status = retain_failed_allocation(mapping, role, length,
+                                                backing_ref);
+      if (!retain_status.ok()) return retain_status;
+      return status;
+    end
     backing_ref = rdma_qp_backing_ref::type_id::create(
       $sformatf("qp_ref_%0d", role)
     );
     if (backing_ref == null) begin
-      void'(host_mem.\release (mapping));
+      rdma_status retain_status;
+      retain_status = retain_failed_allocation(mapping, role, length,
+                                                backing_ref);
+      if (!retain_status.ok()) return retain_status;
       return rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED,
                                "QP backing reference allocation failed");
     end
@@ -185,7 +239,12 @@ class rdma_qp_lifecycle_executor extends uvm_object;
     backing_ref.mapping_offset = 0;
     backing_ref.length = length;
     status = backing_ref.validate();
-    if (!status.ok()) begin void'(host_mem.\release (mapping)); backing_ref = null; end
+    if (!status.ok()) begin
+      rdma_status retain_status;
+      retain_status = retain_failed_allocation(mapping, role, length,
+                                                backing_ref);
+      if (!retain_status.ok()) return retain_status;
+    end
     return status;
   endfunction
 

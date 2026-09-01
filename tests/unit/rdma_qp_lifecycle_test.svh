@@ -27,6 +27,51 @@ class rdma_qp_allocate_error_host_mem extends rdma_mock_host_mem;
   endfunction
 endclass
 
+class rdma_qp_pending_allocate_host_mem extends rdma_mock_host_mem;
+  `uvm_object_utils(rdma_qp_pending_allocate_host_mem)
+  bit injected;
+  bit pending_release;
+  int unsigned release_calls;
+
+  function new(string name = "rdma_qp_pending_allocate_host_mem");
+    super.new(name);
+    injected = 1'b0;
+    pending_release = 1'b0;
+    release_calls = 0;
+  endfunction
+
+  virtual function rdma_status allocate(
+    rdma_dma_request_context request_context,
+    int unsigned size,
+    int unsigned alignment,
+    rdma_dma_direction_e direction,
+    output rdma_dma_mapping mapping
+  );
+    rdma_status status;
+    status = super.allocate(request_context, size, alignment, direction, mapping);
+    if (status != null && status.ok() && !injected) begin
+      injected = 1'b1;
+      pending_release = 1'b1;
+      return rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED,
+                               "injected allocation failure with pending release");
+    end
+    return status;
+  endfunction
+
+  virtual function rdma_status \release (rdma_dma_mapping mapping);
+    rdma_status status;
+    release_calls++;
+    if (pending_release) begin
+      pending_release = 1'b0;
+      void'(record_call("release", null, mapping));
+      return rdma_status::make(RDMA_SC_TIMEOUT,
+                               "injected pending allocation release");
+    end
+    status = super.\release (mapping);
+    return status;
+  endfunction
+endclass
+
 class rdma_qp_authority_probe_mapping extends rdma_mock_dma_mapping;
   `uvm_object_utils(rdma_qp_authority_probe_mapping)
   bit fail_before_copy;
@@ -2932,6 +2977,138 @@ class rdma_qp_lifecycle_test extends uvm_test;
     end
   endtask
 
+  task automatic check_contextless_preprogram_progress();
+    rdma_qp_boundary_host_mem mem;
+    rdma_qp_fault_manager manager;
+    rdma_mock_context_backing contexts;
+    rdma_mock_cmq_port cmq;
+    rdma_qp_lifecycle_executor executor;
+    rdma_function_binding binding;
+    rdma_pd pd;
+    rdma_cq cq;
+    rdma_create_qp_req request;
+    rdma_qp qp;
+    rdma_control_result result;
+    rdma_recovery_record recovery;
+    rdma_handle qp_h;
+    rdma_status status;
+    rdma_resource_state_e state;
+    rdma_qp_backing_ref refs[$];
+
+    mem = rdma_qp_boundary_host_mem::type_id::create("CTXLESS_PROGRESS_mem");
+    manager = rdma_qp_fault_manager::type_id::create("CTXLESS_PROGRESS_manager");
+    manager.sequence_failure = rdma_status::make(
+      RDMA_SC_DMA_TRANSLATION, "injected pre-program authority failure"
+    );
+    mem.mode = "timeout_plan_release_before";
+    contexts = rdma_mock_context_backing::type_id::create(
+      "CTXLESS_PROGRESS_contexts"
+    );
+    cmq = rdma_mock_cmq_port::type_id::create("CTXLESS_PROGRESS_cmq");
+    executor = rdma_qp_lifecycle_executor::type_id::create(
+      "CTXLESS_PROGRESS_executor"
+    );
+    setup_custom_qp_environment("CTXLESS_PROGRESS", mem, manager, contexts,
+                                cmq, executor, binding, pd, cq);
+    request = make_request("CTXLESS_PROGRESS_request", binding, pd, cq,
+                           RDMA_TRANSPORT_RC);
+    executor.create_locked(binding, binding.make_handle(), request, 701,
+                           qp, result);
+    qp_h = result == null ? null : result.resource_h;
+    recovery = null;
+    if (qp_h != null)
+      void'(manager.raw_recovery(qp_h, recovery));
+    if (qp != null || result == null || result.status == null ||
+        result.status.code != RDMA_SC_RECOVERY_REQUIRED || recovery == null ||
+        recovery.qp_recovery == null ||
+        recovery.qp_recovery.context_ref != null ||
+        recovery.qp_recovery.qp_plan == null)
+      `uvm_error("CTXLESS_PROGRESS_PUBLICATION",
+                 "contextless pre-program recovery was not published")
+    status = qp_h == null ? null : manager.clear_recovery(qp_h);
+    if (status == null || status.code != RDMA_SC_RECOVERY_REQUIRED)
+      `uvm_error("CTXLESS_PROGRESS_CLEAR_GUARD",
+                 "clear_recovery discarded incomplete QP plan authority")
+    status = qp_h == null ? null :
+      manager.record_qp_context_cleanup_complete(qp_h);
+    if (status == null || !status.ok())
+      `uvm_error("CTXLESS_PROGRESS_CONTEXT_SKIP",
+                 "no-context QP incorrectly required context progress")
+    if (recovery != null && recovery.qp_recovery != null &&
+        recovery.qp_recovery.qp_plan != null) begin
+      refs.push_back(recovery.qp_recovery.qp_plan.sq_ref);
+      refs.push_back(recovery.qp_recovery.qp_plan.sq_pd_ref);
+      refs.push_back(recovery.qp_recovery.qp_plan.rq_ref);
+      refs.push_back(recovery.qp_recovery.qp_plan.rq_pd_ref);
+      foreach (refs[i])
+        if (refs[i] != null)
+          void'(mem.\release (refs[i].mapping));
+      status = manager.record_qp_flush_complete(qp_h,
+                                                RDMA_QUEUE_ROLE_QP_SQ_RING);
+      status = manager.record_qp_flush_complete(qp_h,
+                                                RDMA_QUEUE_ROLE_QP_SQ_PD);
+      status = manager.record_qp_flush_complete(qp_h,
+                                                RDMA_QUEUE_ROLE_QP_RQ_PD);
+      status = manager.record_qp_cleanup_complete(qp_h,
+                                                  RDMA_QUEUE_ROLE_QP_RQ_PD);
+      if (status == null || !status.ok())
+        `uvm_error("CTXLESS_PROGRESS_RQPD", "contextless RQ PD progress rejected")
+      status = manager.record_qp_cleanup_complete(qp_h,
+                                                  RDMA_QUEUE_ROLE_QP_SQ_PD);
+      if (status == null || !status.ok())
+        `uvm_error("CTXLESS_PROGRESS_SQPD", "contextless SQ PD progress rejected")
+      status = manager.record_qp_cleanup_complete(qp_h,
+                                                  RDMA_QUEUE_ROLE_QP_RQ_RING);
+      if (status == null || !status.ok())
+        `uvm_error("CTXLESS_PROGRESS_RQ", "contextless RQ progress rejected")
+      status = manager.record_qp_cleanup_complete(qp_h,
+                                                  RDMA_QUEUE_ROLE_QP_SQ_RING);
+      if (status == null || !status.ok())
+        `uvm_error("CTXLESS_PROGRESS_SQ", "contextless SQ progress rejected")
+    end
+    status = qp_h == null ? null : manager.finalize_qp_release(qp_h);
+    if (status == null || !status.ok() ||
+        (qp_h != null && manager.raw_qp_state(qp_h, state)))
+      `uvm_error("CTXLESS_PROGRESS_FINALIZE",
+                 "contextless QP plan did not finalize after opaque cleanup")
+  endtask
+
+  task automatic check_allocate_pending_release_retained();
+    rdma_qp_pending_allocate_host_mem mem;
+    rdma_function_binding binding;
+    rdma_resource_manager manager;
+    rdma_mock_context_backing contexts;
+    rdma_mock_cmq_port cmq;
+    rdma_qp_lifecycle_executor executor;
+    rdma_pd pd;
+    rdma_cq cq;
+    rdma_create_qp_req request;
+    rdma_qp qp;
+    rdma_control_result result;
+    rdma_recovery_record recovery;
+
+    mem = rdma_qp_pending_allocate_host_mem::type_id::create(
+      "ALLOC_PENDING_mem");
+    setup_qp_environment("ALLOC_PENDING", mem, binding, manager, contexts,
+                         cmq, executor, pd, cq);
+    request = make_request("ALLOC_PENDING_request", binding, pd, cq,
+                           RDMA_TRANSPORT_RC);
+    executor.create_locked(binding, binding.make_handle(), request, 702, qp,
+                           result);
+    recovery = null;
+    if (result != null && result.resource_h != null)
+      void'(manager.lookup_recovery(result.resource_h, recovery));
+    if (qp != null || result == null || result.status == null ||
+        result.status.code != RDMA_SC_RECOVERY_REQUIRED || recovery == null ||
+        recovery.qp_recovery == null || recovery.qp_recovery.qp_plan == null ||
+        recovery.qp_recovery.qp_plan.sq_ref == null ||
+        recovery.qp_recovery.qp_plan.sq_ref.mapping == null ||
+        recovery.qp_recovery.qp_plan.sq_ref.mapping.state != RDMA_MAPPING_ACTIVE ||
+        mem.release_calls != 1)
+      `uvm_error("ALLOC_PENDING_RETAINED",
+                 "non-null failed allocation release authority was dropped")
+  endtask
+
   task run_phase(uvm_phase phase);
     phase.raise_objection(this);
     check_rc_plan_and_staging_authority();
@@ -2961,6 +3138,8 @@ class rdma_qp_lifecycle_test extends uvm_test;
     check_definitive_failure_staging_release_ambiguity();
     check_direct_unattached_release_authority();
     check_unattached_release_ambiguity();
+    check_contextless_preprogram_progress();
+    check_allocate_pending_release_retained();
     phase.drop_objection(this);
   endtask
 endclass

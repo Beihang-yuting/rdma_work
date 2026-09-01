@@ -2940,9 +2940,25 @@ class rdma_resource_manager extends uvm_object;
   endfunction
 
   protected function bit recovery_ready(rdma_recovery_record recovery);
-    return recovery != null &&
-           recovery.hardware_presence == RDMA_HW_PRESENCE_ABSENT &&
-           recovery.pending_steps.size() == 0;
+    if (recovery == null ||
+        recovery.hardware_presence != RDMA_HW_PRESENCE_ABSENT ||
+        recovery.pending_steps.size() != 0)
+      return 1'b0;
+    if (recovery.qp_recovery_valid && recovery.qp_recovery != null &&
+        recovery.qp_recovery.intent == RDMA_QP_RECOVER_CREATE_ROLLBACK &&
+        recovery.qp_recovery.candidate_qpc == null &&
+        recovery.qp_recovery.prior_qpc == null &&
+        recovery.qp_recovery.context_ref == null) begin
+      if (recovery.qp_recovery.qp_plan == null ||
+          !qp_plan_cleanup_ready(recovery.qp_recovery.qp_plan))
+        return 1'b0;
+      if (recovery.qp_recovery.staging_mapping != null ||
+          recovery.qp_recovery.query_mapping != null ||
+          recovery.qp_recovery.ambiguous_ticket != null ||
+          recovery.qp_recovery.ambiguous_operation != RDMA_QP_AMBIG_NONE)
+        return 1'b0;
+    end
+    return 1'b1;
   endfunction
   protected function rdma_function_handle binding_handle_value(
     rdma_function_binding binding,
@@ -5202,13 +5218,13 @@ class rdma_resource_manager extends uvm_object;
         RDMA_SC_INVALID_STATE,
         "QP owned backing cleanup predecessor is incomplete"
       );
-    if (resource_copy.qp_plan.context_ref == null ||
-        !resource_copy.qp_plan.context_ref.release_complete ||
+    if ((resource_copy.qp_plan.context_ref != null &&
+         !resource_copy.qp_plan.context_ref.release_complete) ||
         has_recovery &&
-          (recovery_copy.qp_recovery.context_ref == null ||
-           !recovery_copy.qp_recovery.context_ref.release_complete ||
-           recovery_copy.qp_recovery.qp_plan.context_ref == null ||
-           !recovery_copy.qp_recovery.qp_plan.context_ref.release_complete))
+          ((recovery_copy.qp_recovery.context_ref != null &&
+            !recovery_copy.qp_recovery.context_ref.release_complete) ||
+           (recovery_copy.qp_recovery.qp_plan.context_ref != null &&
+            !recovery_copy.qp_recovery.qp_plan.context_ref.release_complete)))
       return rdma_status::make(
         RDMA_SC_INVALID_STATE,
         "QP context cleanup must precede owned backing cleanup"
@@ -5264,13 +5280,16 @@ class rdma_resource_manager extends uvm_object;
                                    has_recovery);
     if (!status.ok())
       return status;
-    if (resource_copy.qp_plan.context_ref == null ||
-        resource_copy.qp_plan.context_ref.release_complete ||
+    if (resource_copy.qp_plan.context_ref == null &&
+        (!has_recovery || recovery_copy.qp_recovery.context_ref == null))
+      return rdma_status::success();
+    if ((resource_copy.qp_plan.context_ref != null &&
+         resource_copy.qp_plan.context_ref.release_complete) ||
         has_recovery &&
-          (recovery_copy.qp_recovery.context_ref == null ||
-           recovery_copy.qp_recovery.context_ref.release_complete ||
-           recovery_copy.qp_recovery.qp_plan.context_ref == null ||
-           recovery_copy.qp_recovery.qp_plan.context_ref.release_complete))
+          ((recovery_copy.qp_recovery.context_ref != null &&
+            recovery_copy.qp_recovery.context_ref.release_complete) ||
+           (recovery_copy.qp_recovery.qp_plan.context_ref != null &&
+            recovery_copy.qp_recovery.qp_plan.context_ref.release_complete)))
       return rdma_status::make(
         RDMA_SC_INVALID_ARGUMENT,
         "QP context cleanup is absent or already complete"
@@ -5296,33 +5315,30 @@ class rdma_resource_manager extends uvm_object;
         RDMA_SC_RECOVERY_REQUIRED,
         "QP recovery ambiguity must be resolved before context cleanup"
       );
-    if (!$cast(resource_token,
-               resource_copy.qp_plan.context_ref.slot_token) ||
-        resource_token.completion_authority == null)
-      return rdma_status::make(
-        RDMA_SC_INVALID_ARGUMENT,
-        "QP context completion authority is invalid"
-      );
-    if (!resource_token.completion_authority.complete)
-      return rdma_status::make(
-        RDMA_SC_RECOVERY_REQUIRED,
-        "QP context release is not opaquely complete"
-      );
+    if (resource_copy.qp_plan.context_ref != null) begin
+      if (!$cast(resource_token,
+                 resource_copy.qp_plan.context_ref.slot_token) ||
+          resource_token.completion_authority == null)
+        return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                                 "QP context completion authority is invalid");
+      if (!resource_token.completion_authority.complete)
+        return rdma_status::make(RDMA_SC_RECOVERY_REQUIRED,
+                                 "QP context release is not opaquely complete");
+    end
     if (has_recovery) begin
-      if (!$cast(recovery_token,
-                 recovery_copy.qp_recovery.context_ref.slot_token) ||
-          recovery_token.completion_authority == null ||
-          recovery_token.completion_authority !==
-            resource_token.completion_authority)
-        return rdma_status::make(
-          RDMA_SC_INVALID_ARGUMENT,
-          "QP recovery context completion authority changed"
-        );
-      if (!recovery_token.completion_authority.complete)
-        return rdma_status::make(
-          RDMA_SC_RECOVERY_REQUIRED,
-          "QP recovery context release is not opaquely complete"
-        );
+      if (recovery_copy.qp_recovery.context_ref != null) begin
+        if (!$cast(recovery_token,
+                   recovery_copy.qp_recovery.context_ref.slot_token) ||
+            recovery_token.completion_authority == null ||
+            resource_token.completion_authority == null ||
+            recovery_token.completion_authority !==
+              resource_token.completion_authority)
+          return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                                   "QP recovery context completion authority changed");
+        if (!recovery_token.completion_authority.complete)
+          return rdma_status::make(RDMA_SC_RECOVERY_REQUIRED,
+                                   "QP recovery context release is not opaquely complete");
+      end
     end
     resource_copy.qp_plan.context_ref.release_complete = 1'b1;
     if (has_recovery) begin
@@ -5342,12 +5358,15 @@ class rdma_resource_manager extends uvm_object;
 
     if (plan == null || !plan.cleanup_complete ||
         !plan.sq_pd_flush_complete ||
-        (plan.rq_source_h == null && !plan.rq_pd_flush_complete) ||
-        plan.context_ref == null || !plan.context_ref.release_complete ||
-        !$cast(token, plan.context_ref.slot_token) ||
-        token.completion_authority == null ||
-        !token.completion_authority.complete)
+        (plan.rq_source_h == null && !plan.rq_pd_flush_complete))
       return 1'b0;
+    if (plan.context_ref != null) begin
+      if (!plan.context_ref.release_complete ||
+          !$cast(token, plan.context_ref.slot_token) ||
+          token.completion_authority == null ||
+          !token.completion_authority.complete)
+        return 1'b0;
+    end
     refs.push_back(plan.sq_ref);
     refs.push_back(plan.sq_pd_ref);
     if (plan.rq_source_h == null) begin
@@ -5429,36 +5448,41 @@ class rdma_resource_manager extends uvm_object;
           "ERROR QP hardware absence is not established"
         );
       if (recovery.qp_recovery == null ||
-          recovery.qp_recovery.context_ref == null ||
-          recovery.qp_recovery.qp_plan == null ||
-          recovery.qp_recovery.qp_plan.context_ref == null ||
-          !$cast(resource_context_token,
-                 authoritative_qp.qp_plan.context_ref.slot_token) ||
-          !$cast(recovery_context_token,
-                 recovery.qp_recovery.context_ref.slot_token) ||
-          !$cast(recovery_plan_context_token,
-                 recovery.qp_recovery.qp_plan.context_ref.slot_token) ||
-          resource_context_token.completion_authority == null ||
-          recovery_context_token.completion_authority == null ||
-          recovery_plan_context_token.completion_authority == null ||
-          recovery_context_token.completion_authority !==
-            resource_context_token.completion_authority ||
-          recovery_plan_context_token.completion_authority !==
-            resource_context_token.completion_authority)
+          recovery.qp_recovery.qp_plan == null)
         return rdma_status::make(
           RDMA_SC_INVALID_ARGUMENT,
-          "QP recovery context completion authority changed"
+          "QP recovery plan authority is missing"
         );
-      if (!recovery_context_token.completion_authority.complete)
-        return rdma_status::make(
-          RDMA_SC_RECOVERY_REQUIRED,
-          "QP recovery context release is not opaquely complete"
-        );
+      if (authoritative_qp.qp_plan.context_ref != null ||
+          recovery.qp_recovery.context_ref != null ||
+          recovery.qp_recovery.qp_plan.context_ref != null) begin
+        if (authoritative_qp.qp_plan.context_ref == null ||
+            recovery.qp_recovery.context_ref == null ||
+            recovery.qp_recovery.qp_plan.context_ref == null ||
+            !$cast(resource_context_token,
+                   authoritative_qp.qp_plan.context_ref.slot_token) ||
+            !$cast(recovery_context_token,
+                   recovery.qp_recovery.context_ref.slot_token) ||
+            !$cast(recovery_plan_context_token,
+                   recovery.qp_recovery.qp_plan.context_ref.slot_token) ||
+            resource_context_token.completion_authority == null ||
+            recovery_context_token.completion_authority == null ||
+            recovery_plan_context_token.completion_authority == null ||
+            recovery_context_token.completion_authority !==
+              resource_context_token.completion_authority ||
+            recovery_plan_context_token.completion_authority !==
+              resource_context_token.completion_authority)
+          return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                                   "QP recovery context completion authority changed");
+        if (!recovery_context_token.completion_authority.complete)
+          return rdma_status::make(RDMA_SC_RECOVERY_REQUIRED,
+                                   "QP recovery context release is not opaquely complete");
+      end
       if (!recovery.qp_recovery_valid || recovery.qp_recovery == null ||
           recovery.qp_recovery.ambiguous_operation != RDMA_QP_AMBIG_NONE ||
           recovery.qp_recovery.ambiguous_ticket != null ||
           !qp_plan_cleanup_ready(recovery.qp_recovery.qp_plan) ||
-          recovery.qp_recovery.context_ref == null ||
+          recovery.qp_recovery.context_ref != null &&
           !recovery.qp_recovery.context_ref.release_complete)
         return rdma_status::make(
           RDMA_SC_RECOVERY_REQUIRED, "QP recovery cleanup is not complete"
