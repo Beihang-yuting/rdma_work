@@ -93,6 +93,40 @@ function automatic rdma_status rdma_qp_mapping_authority_status(
   return rdma_status::success();
 endfunction
 
+// A failed allocation can carry an adapter-owned release capability even when
+// its public ring geometry is malformed.  Recovery-only references validate
+// only the identity needed to route cleanup plus the opaque completion query;
+// normal QP plans continue to use the strict geometry validator below.
+function automatic rdma_status rdma_qp_recovery_opaque_mapping_status(
+  rdma_dma_mapping mapping,
+  rdma_function_handle owner,
+  rdma_handle qp_h,
+  string label
+);
+  rdma_status status;
+  bit release_complete;
+
+  release_complete = 1'b0;
+  if (mapping == null)
+    return rdma_status::make(RDMA_SC_INVALID_STATE,
+                             {label, " mapping authority is missing"});
+  if (mapping.function_h == null ||
+      mapping.function_h.kind != RDMA_RESOURCE_FUNCTION ||
+      owner == null || !mapping.function_h.same_instance(owner))
+    return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                             {label, " mapping Function does not match"});
+  if (mapping.owner_h == null || mapping.owner_h.kind != RDMA_RESOURCE_QP ||
+      qp_h == null || !mapping.owner_h.same_instance(qp_h))
+    return rdma_status::make(RDMA_SC_INVALID_STATE,
+                             {label, " mapping QP owner does not match"});
+  status = mapping.release_completion_status(release_complete);
+  if (status == null || !status.ok())
+    return status == null ? rdma_status::make(
+      RDMA_SC_INVALID_STATE, {label, " completion authority query returned null"}
+    ) : status;
+  return rdma_status::success();
+endfunction
+
 function automatic rdma_status rdma_qp_partial_ref_status(
   rdma_qp_backing_ref backing_ref,
   rdma_queue_backing_role_e expected_role,
@@ -125,9 +159,19 @@ function automatic rdma_status rdma_qp_partial_ref_status(
         validation_ref.additional_segments[i].mapping.state =
           RDMA_MAPPING_ACTIVE;
   end
-  status = validation_ref.validate();
-  if (!status.ok())
-    return status;
+  if (validation_ref.recovery_only) begin
+    if (validation_ref.ownership != RDMA_OWNERSHIP_CONTROL_PLANE ||
+        validation_ref.additional_segments.size() != 0)
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        {label, " recovery-only backing ownership/segments are invalid"}
+      );
+    status = rdma_qp_recovery_opaque_mapping_status(
+      validation_ref.mapping, owner, qp_h, label
+    );
+  end else
+    status = validation_ref.validate();
+  if (!status.ok()) return status;
   if (validation_ref.role != expected_role)
     return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                              {label, " role is invalid"});
@@ -175,7 +219,7 @@ function automatic rdma_status rdma_qp_partial_plan_status(
   if (plan.sq_pd_ref != null && plan.sq_ref == null)
     return rdma_status::make(RDMA_SC_INVALID_STATE,
                              "partial QP SQ PD lacks payload authority");
-  if (plan.sq_ref != null) begin
+  if (plan.sq_ref != null && !plan.sq_ref.recovery_only) begin
     status = rdma_qp_backing_total_length(plan.sq_ref, total_length);
     if (!status.ok() || total_length != plan.sq_ring.storage_bytes)
       return status.ok() ? rdma_status::make(
@@ -212,7 +256,7 @@ function automatic rdma_status rdma_qp_partial_plan_status(
         (plan.rq_pd_ref != null && plan.rq_ref == null))
       return rdma_status::make(RDMA_SC_INVALID_STATE,
                                "partial QP RQ authority is out of order");
-    if (plan.rq_ref != null) begin
+    if (plan.rq_ref != null && !plan.rq_ref.recovery_only) begin
       status = rdma_qp_backing_total_length(plan.rq_ref, total_length);
       if (!status.ok() || total_length != plan.rq_ring.storage_bytes)
         return status.ok() ? rdma_status::make(
@@ -863,7 +907,7 @@ class rdma_qp extends rdma_resource;
           RDMA_SC_INVALID_STATE,
           "pre-program QP ERROR plan does not match resource"
         );
-      if (qp_plan.sq_ref != null &&
+      if (qp_plan.sq_ref != null && !qp_plan.sq_ref.recovery_only &&
           sq_iova.value != qp_plan.sq_ref.mapping.iova.value +
                            qp_plan.sq_ref.mapping_offset)
         return rdma_status::make(
@@ -871,6 +915,7 @@ class rdma_qp extends rdma_resource;
           "pre-program QP ERROR SQ IOVA does not match retained authority"
         );
       if (qp_plan.rq_source_h == null && qp_plan.rq_ref != null &&
+          !qp_plan.rq_ref.recovery_only &&
           rq_iova.value != qp_plan.rq_ref.mapping.iova.value +
                            qp_plan.rq_ref.mapping_offset)
         return rdma_status::make(

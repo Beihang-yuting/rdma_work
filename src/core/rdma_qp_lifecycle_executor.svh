@@ -137,7 +137,13 @@ class rdma_qp_lifecycle_executor extends uvm_object;
     backing_ref.ownership = RDMA_OWNERSHIP_CONTROL_PLANE;
     backing_ref.mapping_offset = 0;
     backing_ref.length = length;
-    return backing_ref.validate();
+    // This capability is intentionally recovery-only.  The adapter's
+    // non-null mapping remains the opaque release/query authority even when
+    // its public geometry or authority snapshot hooks are malformed.  Strict
+    // QP ring validation is deferred to normal plan publication and therefore
+    // cannot be weakened by this path.
+    backing_ref.recovery_only = 1'b1;
+    return rdma_status::success();
   endfunction
 
   protected function rdma_status allocate_ref(
@@ -194,14 +200,15 @@ class rdma_qp_lifecycle_executor extends uvm_object;
     status = normalize_status(mapping.snapshot_release_authority(authority),
                               "QP backing authority snapshot returned null");
     if (!status.ok() || authority == null) begin
-      if (!status.ok()) begin
-        rdma_status retain_status;
-        retain_status = retain_failed_allocation(mapping, role, length,
-                                                  backing_ref);
-        if (!retain_status.ok()) return retain_status;
-        return status;
-      end
-      return invalid_state("QP backing authority snapshot is null");
+      rdma_status retain_status;
+      // An OK status with a null snapshot is itself a malformed authority
+      // hook result.  Keep the original non-null mapping recoverable before
+      // reporting that malformed result, just as for an explicit hook error.
+      retain_status = retain_failed_allocation(mapping, role, length,
+                                                backing_ref);
+      if (!retain_status.ok()) return retain_status;
+      return !status.ok() ? status :
+        invalid_state("QP backing authority snapshot is null");
     end
     status = normalize_status(mapping.release_authority_status(authority),
       "QP backing authority equivalence returned null");

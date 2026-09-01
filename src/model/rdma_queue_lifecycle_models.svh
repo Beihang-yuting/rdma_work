@@ -986,6 +986,11 @@ class rdma_qp_backing_ref extends uvm_object;
   longint unsigned length;
   rdma_queue_backing_segment additional_segments[$];
   bit cleanup_complete;
+  // Set only for a pre-program recovery capability retained after an
+  // allocation/authority failure.  Such a reference is intentionally not a
+  // valid QP ring input; its geometry is inspected by recovery validation
+  // only after the opaque adapter completion authority is checked.
+  bit recovery_only;
 
   function new(string name = "rdma_qp_backing_ref");
     super.new(name);
@@ -995,6 +1000,7 @@ class rdma_qp_backing_ref extends uvm_object;
     mapping_offset = 0;
     length = 0;
     cleanup_complete = 0;
+    recovery_only = 1'b0;
   endfunction
 
   virtual function void do_copy(uvm_object rhs);
@@ -1008,6 +1014,7 @@ class rdma_qp_backing_ref extends uvm_object;
     mapping_offset = r.mapping_offset;
     length = r.length;
     cleanup_complete = r.cleanup_complete;
+    recovery_only = r.recovery_only;
     if (r.mapping == null) mapping = null;
     else begin
       c = r.mapping.clone();
@@ -1026,6 +1033,12 @@ class rdma_qp_backing_ref extends uvm_object;
 
   virtual function rdma_status validate();
     rdma_status status;
+
+    if (recovery_only)
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "recovery-only QP backing is not valid normal-plan geometry"
+      );
 
     if (!rdma_qp_role_is_payload(role) && !rdma_qp_role_is_pd(role))
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "QP backing role invalid");
@@ -1186,6 +1199,11 @@ class rdma_qp_backing_plan extends uvm_object;
       return rdma_status::make(RDMA_SC_INVALID_STATE, "QP SQ ring does not match plan");
     status = sq_ref.validate(); if (!status.ok()) return status;
     status = sq_pd_ref.validate(); if (!status.ok()) return status;
+    if (sq_ref.recovery_only || sq_pd_ref.recovery_only)
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "recovery-only QP backing cannot enter a normal plan"
+      );
     status = rdma_qp_backing_total_length(sq_ref, total_length);
     if (!status.ok()) return status;
     if (sq_ref.role != RDMA_QUEUE_ROLE_QP_SQ_RING ||
@@ -1199,6 +1217,11 @@ class rdma_qp_backing_plan extends uvm_object;
       status = rq_ring.validate(); if (!status.ok()) return status;
       status = rq_ref.validate(); if (!status.ok()) return status;
       status = rq_pd_ref.validate(); if (!status.ok()) return status;
+      if (rq_ref.recovery_only || rq_pd_ref.recovery_only)
+        return rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "recovery-only QP backing cannot enter a normal plan"
+        );
       status = rdma_qp_backing_total_length(rq_ref, total_length);
       if (!status.ok()) return status;
       if (rq_ring.role != RDMA_QUEUE_ROLE_QP_RQ_RING || rq_ring.depth != rq_depth ||
@@ -1220,6 +1243,11 @@ class rdma_qp_backing_plan extends uvm_object;
                                "QP context authority is invalid");
     foreach (urc_refs[i]) begin
       if (urc_refs[i] == null) return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "null URC ref");
+      if (urc_refs[i].recovery_only)
+        return rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "recovery-only QP backing cannot enter a normal plan"
+        );
       status = urc_refs[i].validate(); if (!status.ok()) return status;
       case (urc_refs[i].role)
         RDMA_QUEUE_ROLE_QP_URC_RSQ: seen_urc[0] = 1;

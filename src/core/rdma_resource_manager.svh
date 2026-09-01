@@ -263,6 +263,20 @@ class rdma_resource_manager extends uvm_object;
            lhs.state == rhs.state;
   endfunction
 
+  // Recovery-only mappings expose a public state field that the adapter may
+  // update while sealing the opaque release capability.  The state on the
+  // resource and recovery projections can therefore legitimately differ
+  // (ACTIVE versus RELEASED) even though all authority-bearing values remain
+  // identical.  Completion is checked through the adapter query separately.
+  protected function bit same_recovery_mapping_value(
+    rdma_dma_mapping lhs,
+    rdma_dma_mapping rhs
+  );
+    if (lhs == null || rhs == null)
+      return lhs == rhs;
+    return same_mapping_release_fields(lhs, rhs);
+  endfunction
+
   protected function bit mapping_handles_detached(
     rdma_dma_mapping lhs,
     rdma_dma_mapping rhs
@@ -1015,6 +1029,50 @@ class rdma_resource_manager extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // Recovery-only QP mappings are retained precisely for cases where the
+  // normal snapshot/equivalence hooks are unavailable or have rejected the
+  // allocation.  Query completion on a guarded concrete clone so the opaque
+  // adapter seal remains authoritative without reopening those hooks.
+  protected function rdma_status query_qp_recovery_release_completion(
+    rdma_dma_mapping mapping,
+    output bit release_complete
+  );
+    rdma_dma_mapping completion_query;
+    rdma_status status;
+    bit after_complete;
+
+    release_complete = 1'b0;
+    if (mapping == null)
+      return rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT,
+        "QP recovery completion mapping is null"
+      );
+    status = clone_recovery_mapping_value(
+      mapping, "QP recovery completion query", completion_query
+    );
+    if (status == null || !status.ok() || completion_query == null)
+      return status == null ? rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "QP recovery completion query clone returned null"
+      ) : status;
+    status = completion_query.release_completion_status(after_complete);
+    if (status == null)
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "QP recovery completion query returned null"
+      );
+    if (!status.ok())
+      return status;
+    if (!same_mapping_value(mapping, completion_query) ||
+        !mapping_handles_detached(mapping, completion_query))
+      return rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT,
+        "QP recovery completion query changed mapping value or aliases"
+      );
+    release_complete = after_complete;
+    return rdma_status::success();
+  endfunction
+
   protected function rdma_status project_backing_ref_value(
     rdma_backing_ref source,
     string copy_label,
@@ -1717,6 +1775,73 @@ class rdma_resource_manager extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // Recovery-only QP references deliberately bypass the normal owned-mapping
+  // snapshot/equivalence hooks: those hooks are the operation that failed
+  // while the allocation was being validated.  Preserve the concrete clone
+  // (and therefore its opaque adapter release token) and require only value,
+  // detached-handle, and completion-query authority here.  The reference
+  // validator separately enforces the exact Function/QP owner and role.
+  protected function rdma_status clone_recovery_mapping_value(
+    rdma_dma_mapping source,
+    string copy_label,
+    output rdma_dma_mapping result
+  );
+    uvm_object cloned_object;
+    uvm_object_wrapper source_type;
+    uvm_object_wrapper result_type;
+    rdma_status status;
+    bit source_complete;
+    bit result_complete;
+
+    result = null;
+    if (source == null)
+      return rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT,
+        {copy_label, " recovery mapping is null"}
+      );
+    source_type = source.get_object_type();
+    if (source_type == null)
+      return rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT,
+        {copy_label, " recovery mapping type is not registered"}
+      );
+    status = source.release_completion_status(source_complete);
+    if (status == null || !status.ok())
+      return status == null ? rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        {copy_label, " recovery completion authority query returned null"}
+      ) : status;
+    cloned_object = source.clone();
+    if (cloned_object == null || !$cast(result, cloned_object) ||
+        result == source)
+      return rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT,
+        {copy_label, " recovery mapping clone contract failed"}
+      );
+    result_type = result.get_object_type();
+    if (result_type == null || result_type != source_type ||
+        !same_mapping_value(source, result) ||
+        !mapping_handles_detached(source, result)) begin
+      result = null;
+      return rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT,
+        {copy_label, " recovery mapping clone changed value, type, or aliases"}
+      );
+    end
+    status = result.release_completion_status(result_complete);
+    if (status == null || !status.ok() || source_complete != result_complete) begin
+      result = null;
+      return status == null ? rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        {copy_label, " recovery clone completion authority changed"}
+      ) : status.ok() ? rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT,
+        {copy_label, " recovery clone completion state changed"}
+      ) : status;
+    end
+    return rdma_status::success();
+  endfunction
+
   protected function rdma_status project_qp_backing_ref_value(
     rdma_qp_backing_ref source,
     string copy_label,
@@ -1728,7 +1853,11 @@ class rdma_resource_manager extends uvm_object;
     if (source == null)
       return rdma_status::success();
     result = new({copy_label, "_ref"});
-    if (source.ownership == RDMA_OWNERSHIP_CONTROL_PLANE)
+    if (source.recovery_only)
+      status = clone_recovery_mapping_value(
+        source.mapping, {copy_label, "_recovery_mapping"}, result.mapping
+      );
+    else if (source.ownership == RDMA_OWNERSHIP_CONTROL_PLANE)
       status = clone_owned_mapping_value(
         source.mapping, {copy_label, "_owned_mapping"}, result.mapping
       );
@@ -1745,6 +1874,7 @@ class rdma_resource_manager extends uvm_object;
     result.mapping_offset = source.mapping_offset;
     result.length = source.length;
     result.cleanup_complete = source.cleanup_complete;
+    result.recovery_only = source.recovery_only;
     result.additional_segments.delete();
     foreach (source.additional_segments[i]) begin
       rdma_queue_backing_segment segment;
@@ -2021,6 +2151,7 @@ class rdma_resource_manager extends uvm_object;
     if (lhs == null || rhs == null)
       return lhs == rhs;
     if (lhs.role != rhs.role || lhs.ownership != rhs.ownership ||
+        lhs.recovery_only != rhs.recovery_only ||
         lhs.mapping_offset != rhs.mapping_offset || lhs.length != rhs.length ||
         lhs.cleanup_complete != rhs.cleanup_complete ||
         lhs.additional_segments.size() != rhs.additional_segments.size())
@@ -2035,6 +2166,8 @@ class rdma_resource_manager extends uvm_object;
           !same_mapping_value(lhs.additional_segments[i].mapping,
                               rhs.additional_segments[i].mapping)) return 1'b0;
     end
+    if (lhs.recovery_only)
+      return same_recovery_mapping_value(lhs.mapping, rhs.mapping);
     if (lhs.ownership == RDMA_OWNERSHIP_CONTROL_PLANE)
       return same_mapping_value(lhs.mapping, rhs.mapping) &&
              same_owned_mapping_authority(lhs.mapping, rhs.mapping);
@@ -5229,8 +5362,11 @@ class rdma_resource_manager extends uvm_object;
         RDMA_SC_INVALID_STATE,
         "QP context cleanup must precede owned backing cleanup"
       );
-    status = query_owned_release_completion(resource_ref.mapping,
-                                            release_complete);
+    status = resource_ref.recovery_only ?
+      query_qp_recovery_release_completion(resource_ref.mapping,
+                                           release_complete) :
+      query_owned_release_completion(resource_ref.mapping,
+                                     release_complete);
     if (status == null || !status.ok())
       return status == null ? rdma_status::make(
         RDMA_SC_INVALID_STATE,
@@ -5242,8 +5378,11 @@ class rdma_resource_manager extends uvm_object;
         "QP backing release is not opaquely complete"
       );
     if (has_recovery) begin
-      status = query_owned_release_completion(recovery_ref.mapping,
-                                              release_complete);
+      status = recovery_ref.recovery_only ?
+        query_qp_recovery_release_completion(recovery_ref.mapping,
+                                             release_complete) :
+        query_owned_release_completion(recovery_ref.mapping,
+                                       release_complete);
       if (status == null || !status.ok())
         return status == null ? rdma_status::make(
           RDMA_SC_INVALID_STATE,
@@ -5356,9 +5495,17 @@ class rdma_resource_manager extends uvm_object;
     rdma_status status;
     bit release_complete;
 
-    if (plan == null || !plan.cleanup_complete ||
-        !plan.sq_pd_flush_complete ||
-        (plan.rq_source_h == null && !plan.rq_pd_flush_complete))
+    if (plan == null)
+      return 1'b0;
+    // A partial pre-program plan may stop at any allocation.  Only require
+    // flush/cleanup milestones for roles that actually have retained
+    // authority; absent later roles are vacuously complete.
+    if (plan.sq_ref != null && !plan.cleanup_complete)
+      return 1'b0;
+    if (plan.sq_pd_ref != null && !plan.sq_pd_flush_complete)
+      return 1'b0;
+    if (plan.rq_source_h == null && plan.rq_pd_ref != null &&
+        !plan.rq_pd_flush_complete)
       return 1'b0;
     if (plan.context_ref != null) begin
       if (!plan.context_ref.release_complete ||
@@ -5367,11 +5514,11 @@ class rdma_resource_manager extends uvm_object;
           !token.completion_authority.complete)
         return 1'b0;
     end
-    refs.push_back(plan.sq_ref);
-    refs.push_back(plan.sq_pd_ref);
+    if (plan.sq_ref != null) refs.push_back(plan.sq_ref);
+    if (plan.sq_pd_ref != null) refs.push_back(plan.sq_pd_ref);
     if (plan.rq_source_h == null) begin
-      refs.push_back(plan.rq_ref);
-      refs.push_back(plan.rq_pd_ref);
+      if (plan.rq_ref != null) refs.push_back(plan.rq_ref);
+      if (plan.rq_pd_ref != null) refs.push_back(plan.rq_pd_ref);
     end
     foreach (plan.urc_refs[i])
       refs.push_back(plan.urc_refs[i]);
@@ -5382,8 +5529,11 @@ class rdma_resource_manager extends uvm_object;
           !refs[i].cleanup_complete)
         return 1'b0;
       if (refs[i].ownership == RDMA_OWNERSHIP_CONTROL_PLANE) begin
-        status = query_owned_release_completion(refs[i].mapping,
-                                                release_complete);
+        status = refs[i].recovery_only ?
+          query_qp_recovery_release_completion(refs[i].mapping,
+                                               release_complete) :
+          query_owned_release_completion(refs[i].mapping,
+                                         release_complete);
         if (status == null || !status.ok() || !release_complete)
           return 1'b0;
       end

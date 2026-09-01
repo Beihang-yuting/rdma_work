@@ -76,13 +76,25 @@ class rdma_qp_authority_probe_mapping extends rdma_mock_dma_mapping;
   `uvm_object_utils(rdma_qp_authority_probe_mapping)
   bit fail_before_copy;
   bit fail_after_copy;
+  bit return_null_snapshot;
   int unsigned check_count;
 
   function new(string name = "rdma_qp_authority_probe_mapping");
     super.new(name);
     fail_before_copy = 1'b0;
     fail_after_copy = 1'b0;
+    return_null_snapshot = 1'b0;
     check_count = 0;
+  endfunction
+
+  virtual function rdma_status snapshot_release_authority(
+    output rdma_dma_mapping snapshot
+  );
+    if (return_null_snapshot) begin
+      snapshot = null;
+      return rdma_status::success();
+    end
+    return super.snapshot_release_authority(snapshot);
   endfunction
 
   virtual function rdma_status release_authority_status(
@@ -97,6 +109,142 @@ class rdma_qp_authority_probe_mapping extends rdma_mock_dma_mapping;
         "injected opaque release-authority mismatch"
       );
     return super.release_authority_status(snapshot);
+  endfunction
+endclass
+
+// Round-5 fault adapter: report a non-null allocation whose public geometry
+// is malformed, then leave the release pending on its first release attempt.
+// The backing adapter still owns an opaque completion seal, so a later retry
+// can complete exactly once if recovery retained the original capability.
+class rdma_qp_malformed_allocate_host_mem extends rdma_mock_host_mem;
+  `uvm_object_utils(rdma_qp_malformed_allocate_host_mem)
+  string geometry_mode;
+  bit injected;
+  bit pending_release;
+  int unsigned release_calls;
+
+  function new(string name = "rdma_qp_malformed_allocate_host_mem");
+    super.new(name);
+    geometry_mode = "undersized";
+    injected = 1'b0;
+    pending_release = 1'b0;
+    release_calls = 0;
+  endfunction
+
+  virtual function rdma_status allocate(
+    rdma_dma_request_context request_context,
+    int unsigned size,
+    int unsigned alignment,
+    rdma_dma_direction_e direction,
+    output rdma_dma_mapping mapping
+  );
+    rdma_status status;
+    longint unsigned original_iova;
+
+    status = super.allocate(request_context, size, alignment, direction,
+                            mapping);
+    if (status != null && status.ok() && !injected) begin
+      injected = 1'b1;
+      pending_release = 1'b1;
+      original_iova = mapping == null ? 0 : mapping.iova.value;
+      // Keep the mock region's public fields in sync with the returned value
+      // so a later opaque release can still locate the same allocation.
+      foreach (regions[i]) begin
+        if (regions[i] != null && regions[i].mapping != null &&
+            regions[i].mapping.iova.value == original_iova) begin
+          if (geometry_mode == "unaligned") begin
+            mapping.iova.value += 1;
+            mapping.backing_addr.value += 1;
+            regions[i].mapping.iova.value += 1;
+            regions[i].mapping.backing_addr.value += 1;
+          end else begin
+            mapping.size = size - 1;
+            regions[i].mapping.size = size - 1;
+          end
+        end
+      end
+      return rdma_status::make(
+        RDMA_SC_RESOURCE_EXHAUSTED,
+        "injected malformed non-null allocation"
+      );
+    end
+    return status;
+  endfunction
+
+  virtual function rdma_status \release (rdma_dma_mapping mapping);
+    rdma_status status;
+
+    release_calls++;
+    if (pending_release) begin
+      pending_release = 1'b0;
+      void'(record_call("release", null, mapping));
+      return rdma_status::make(
+        RDMA_SC_TIMEOUT, "injected malformed release pending"
+      );
+    end
+    status = super.\release (mapping);
+    return status;
+  endfunction
+endclass
+
+// Round-5 fault adapter: the allocation is valid, but the adapter's
+// authority hook rejects the initial validation.  Release is also incomplete
+// once, exercising durable recovery projection independently of geometry.
+class rdma_qp_authority_pending_host_mem extends rdma_mock_host_mem;
+  `uvm_object_utils(rdma_qp_authority_pending_host_mem)
+  bit injected;
+  bit null_snapshot;
+  bit pending_release;
+  int unsigned release_calls;
+
+  function new(string name = "rdma_qp_authority_pending_host_mem");
+    super.new(name);
+    injected = 1'b0;
+    null_snapshot = 1'b0;
+    pending_release = 1'b0;
+    release_calls = 0;
+  endfunction
+
+  virtual function rdma_status allocate(
+    rdma_dma_request_context request_context,
+    int unsigned size,
+    int unsigned alignment,
+    rdma_dma_direction_e direction,
+    output rdma_dma_mapping mapping
+  );
+    rdma_status status;
+    rdma_qp_authority_probe_mapping probe;
+
+    status = super.allocate(request_context, size, alignment, direction,
+                            mapping);
+    if (status != null && status.ok() && !injected) begin
+      injected = 1'b1;
+      pending_release = 1'b1;
+      probe = rdma_qp_authority_probe_mapping::type_id::create(
+        "qp_authority_pending_probe"
+      );
+      probe.copy(mapping);
+      probe.fail_before_copy = 1'b1;
+      probe.return_null_snapshot = null_snapshot;
+      mapping = probe;
+      return rdma_status::success();
+    end
+    return status;
+  endfunction
+
+  virtual function rdma_status \release (rdma_dma_mapping mapping);
+    rdma_status status;
+
+    release_calls++;
+    if (pending_release) begin
+      pending_release = 1'b0;
+      void'(record_call("release", null, mapping));
+      return rdma_status::make(
+        RDMA_SC_TIMEOUT, "injected authority release pending"
+      );
+    end
+    status = super.\release (mapping);
+    return status;
   endfunction
 endclass
 
@@ -290,6 +438,24 @@ class rdma_qp_fault_manager extends rdma_resource_manager;
     if (!registry.exists(key) || registry[key] == null)
       return 1'b0;
     state = registry[key].state;
+    return 1'b1;
+  endfunction
+
+  function bit raw_qp_local_id(
+    rdma_handle handle,
+    output int unsigned local_id
+  );
+    string key;
+    rdma_qp qp_value;
+
+    local_id = '0;
+    if (handle == null)
+      return 1'b0;
+    key = resource_key(handle);
+    if (!registry.exists(key) || registry[key] == null ||
+        !$cast(qp_value, registry[key]))
+      return 1'b0;
+    local_id = qp_value.local_qp_id;
     return 1'b1;
   endfunction
 
@@ -3109,6 +3275,176 @@ class rdma_qp_lifecycle_test extends uvm_test;
                  "non-null failed allocation release authority was dropped")
   endtask
 
+  // Round-5 regressions: a failed non-null allocation must retain a durable
+  // opaque capability even when its public geometry is malformed, and an
+  // authority-hook rejection must not make the allocation disappear.  The
+  // first release is deliberately incomplete; the second call seals it and
+  // recovery progress must then be idempotent.
+  task automatic check_malformed_allocation_recovery();
+    string modes[$];
+
+    modes.push_back("undersized");
+    modes.push_back("unaligned");
+    modes.push_back("authority");
+    modes.push_back("authority_null");
+    foreach (modes[i]) begin
+      string label;
+      rdma_mock_host_mem mem;
+      rdma_qp_malformed_allocate_host_mem malformed_mem;
+      rdma_qp_authority_pending_host_mem authority_mem;
+      rdma_qp_fault_manager manager;
+      rdma_mock_context_backing contexts;
+      rdma_mock_cmq_port cmq;
+      rdma_qp_lifecycle_executor executor;
+      rdma_function_binding binding;
+      rdma_function_handle old_owner;
+      rdma_pd pd;
+      rdma_cq cq;
+      rdma_create_qp_req request;
+      rdma_qp qp;
+      rdma_qp replacement_qp;
+      rdma_control_result result;
+      rdma_recovery_record recovery;
+      rdma_dma_mapping retained_mapping;
+      rdma_status status;
+      rdma_resource_state_e raw_state;
+      int unsigned old_local_qpn;
+      int unsigned release_calls_before;
+
+      label = {"CREATE_MALFORMED_", modes[i]};
+      if (modes[i] inside {"authority", "authority_null"}) begin
+        authority_mem = rdma_qp_authority_pending_host_mem::type_id::create(
+          {label, "_mem"});
+        authority_mem.null_snapshot = modes[i] == "authority_null";
+        mem = authority_mem;
+      end else begin
+        malformed_mem = rdma_qp_malformed_allocate_host_mem::type_id::create(
+          {label, "_mem"});
+        malformed_mem.geometry_mode = modes[i];
+        mem = malformed_mem;
+      end
+      manager = rdma_qp_fault_manager::type_id::create({label, "_manager"});
+      contexts = rdma_mock_context_backing::type_id::create({label, "_contexts"});
+      cmq = rdma_mock_cmq_port::type_id::create({label, "_cmq"});
+      executor = rdma_qp_lifecycle_executor::type_id::create({label, "_executor"});
+      setup_custom_qp_environment(label, mem, manager, contexts, cmq,
+                                  executor, binding, pd, cq);
+      old_owner = binding.make_handle();
+      request = make_request({label, "_request"}, binding, pd, cq,
+                             RDMA_TRANSPORT_RC);
+      executor.create_locked(binding, old_owner, request, 710 + i, qp, result);
+
+      recovery = null;
+      if (result != null && result.resource_h != null)
+        void'(manager.raw_recovery(result.resource_h, recovery));
+      retained_mapping = recovery == null || recovery.qp_recovery == null ||
+                         recovery.qp_recovery.qp_plan == null ||
+                         recovery.qp_recovery.qp_plan.sq_ref == null ? null :
+                         recovery.qp_recovery.qp_plan.sq_ref.mapping;
+      old_local_qpn = '0;
+      if (result != null && result.resource_h != null)
+        void'(manager.raw_qp_local_id(result.resource_h, old_local_qpn));
+
+      // Before the adapter seals completion, finalization must remain blocked
+      // and the original QP reservation must continue to own its local QPN.
+      status = result == null || result.resource_h == null ? null :
+               manager.finalize_qp_release(result.resource_h);
+      if (qp != null || result == null || result.status == null ||
+          result.status.code != RDMA_SC_RECOVERY_REQUIRED ||
+          !result.recovery_required || result.resource_h == null ||
+          cmq.calls.size() != 0 || recovery == null ||
+          recovery.hardware_presence != RDMA_HW_PRESENCE_ABSENT ||
+          recovery.qp_recovery == null || retained_mapping == null ||
+          status == null || status.code != RDMA_SC_RECOVERY_REQUIRED ||
+          !manager.raw_qp_state(result.resource_h, raw_state) ||
+          raw_state != RDMA_RESOURCE_ERROR ||
+          retained_mapping.function_h == null ||
+          !retained_mapping.function_h.same_instance(old_owner) ||
+          retained_mapping.owner_h == null ||
+          !retained_mapping.owner_h.same_instance(result.resource_h) ||
+          (modes[i] == "undersized" && retained_mapping.size >= 8192) ||
+          (modes[i] == "unaligned" &&
+           ((retained_mapping.iova.value & 64'hfff) == 0 ||
+            (retained_mapping.backing_addr.value & 64'hfff) == 0)) ||
+          (!(modes[i] inside {"authority", "authority_null"}) &&
+           ((malformed_mem == null) || malformed_mem.release_calls != 1)) ||
+          ((modes[i] inside {"authority", "authority_null"}) &&
+           ((authority_mem == null) || authority_mem.release_calls != 1)))
+        `uvm_error(label,
+          "malformed allocation did not retain exact-old recovery authority")
+
+      // Clearing an incomplete ERROR record must not discard the only
+      // retained mapping authority or create a finalization bypass.
+      status = result == null || result.resource_h == null ? null :
+               manager.clear_recovery(result.resource_h);
+      if (status == null || status.code != RDMA_SC_RECOVERY_REQUIRED)
+        `uvm_error({label, "_CLEAR_GUARD"},
+          "incomplete malformed recovery was cleared prematurely")
+
+      // A new reservation must not recycle the ERROR QPN while cleanup is
+      // pending.  Release the temporary reservation immediately afterwards.
+      replacement_qp = null;
+      status = manager.create_qp(binding, pd.handle, cq.handle, cq.handle,
+                                 null, replacement_qp);
+      if (status == null || !status.ok() || replacement_qp == null ||
+          replacement_qp.local_qp_id == old_local_qpn)
+        `uvm_error(label, "pending malformed recovery reused the old QPN")
+      if (replacement_qp != null)
+        void'(manager.finalize_qp_release(replacement_qp.handle));
+
+      // Complete the one pending physical release through the exact retained
+      // mapping, then advance the canonical cleanup state once.  The second
+      // cleanup attempt must be rejected and finalization must not duplicate
+      // the already-sealed physical release.  Keep the ERROR recovery record
+      // until QP finalization; clear_recovery() intentionally acknowledges a
+      // record without bypassing the QP-specific finalization gate.
+      release_calls_before = (modes[i] inside {"authority", "authority_null"}) ?
+        authority_mem.release_calls : malformed_mem.release_calls;
+      if (retained_mapping != null)
+        status = mem.\release (retained_mapping);
+      else
+        status = null;
+      if (status == null || !status.ok())
+        `uvm_error({label, "_COMPLETE"},
+          "retained malformed mapping could not complete release")
+      status = manager.record_qp_flush_complete(
+        result.resource_h, RDMA_QUEUE_ROLE_QP_SQ_RING);
+      if (status == null || !status.ok())
+        `uvm_error({label, "_SQ_FLUSH"},
+          "malformed recovery SQ flush progress was rejected")
+      status = manager.record_qp_flush_complete(
+        result.resource_h, RDMA_QUEUE_ROLE_QP_SQ_PD);
+      if (status == null || !status.ok())
+        `uvm_error({label, "_SQPD_FLUSH"},
+          "malformed recovery SQ-PD flush progress was rejected")
+      status = manager.record_qp_flush_complete(
+        result.resource_h, RDMA_QUEUE_ROLE_QP_RQ_PD);
+      if (status == null || !status.ok())
+        `uvm_error({label, "_RQPD_FLUSH"},
+          "malformed recovery RQ-PD flush progress was rejected")
+      status = manager.record_qp_cleanup_complete(
+        result.resource_h, RDMA_QUEUE_ROLE_QP_SQ_RING);
+      if (status == null || !status.ok())
+        `uvm_error({label, "_SQ_CLEANUP"},
+          "malformed recovery backing cleanup was rejected")
+      status = manager.record_qp_cleanup_complete(
+        result.resource_h, RDMA_QUEUE_ROLE_QP_SQ_RING);
+      if (status == null || status.code != RDMA_SC_INVALID_ARGUMENT)
+        `uvm_error({label, "_SQ_ONCE"},
+          "malformed recovery cleanup was not exactly-once")
+      status = manager.finalize_qp_release(result.resource_h);
+      if (status == null || !status.ok() ||
+          !((modes[i] inside {"authority", "authority_null"} &&
+             authority_mem.release_calls ==
+             release_calls_before + 1) ||
+            (!(modes[i] inside {"authority", "authority_null"}) &&
+             malformed_mem.release_calls ==
+             release_calls_before + 1)))
+        `uvm_error({label, "_FINALIZE"},
+          "malformed recovery finalization duplicated or lost release")
+    end
+  endtask
+
   task run_phase(uvm_phase phase);
     phase.raise_objection(this);
     check_rc_plan_and_staging_authority();
@@ -3140,6 +3476,7 @@ class rdma_qp_lifecycle_test extends uvm_test;
     check_unattached_release_ambiguity();
     check_contextless_preprogram_progress();
     check_allocate_pending_release_retained();
+    check_malformed_allocation_recovery();
     phase.drop_objection(this);
   endtask
 endclass
