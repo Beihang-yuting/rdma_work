@@ -2277,8 +2277,22 @@ class rdma_qp_lifecycle_executor extends uvm_object;
       return;
     end
     if (!status.ok()) begin
-      if (staging != null && !release_complete)
-        void'(release_mapping_opaque(staging, "QP failed staging", release_complete));
+      // A definitive command failure can still leave a staging mapping whose
+      // opaque release is pending/failed.  Preserve it in durable recovery
+      // authority whenever possible instead of dropping the capability.
+      if (staging != null) begin
+        rdma_status release_status;
+        release_status = release_mapping_opaque(staging, "QP failed staging", release_complete);
+        if (!release_status.ok() || !release_complete) begin
+          if (ticket != null) begin
+            retain_modify_recovery(authoritative, prior_qpc, candidate_qpc,
+                                   staging, null, 1'b0, ticket, status, result);
+            qp = null;
+            return;
+          end
+          append_rollback_status(result, release_status);
+        end
+      end
       qp = null;
       publish_primary(result, status);
       return;
@@ -2313,7 +2327,28 @@ class rdma_qp_lifecycle_executor extends uvm_object;
         if (cloned == null || !$cast(qp, cloned)) status = invalid_state("QP modify result snapshot invalid");
       end
     end
-    if (!status.ok()) begin qp = null; publish_primary(result, status); return; end
+    if (!status.ok()) begin
+      // Hardware has accepted MODIFY at this point; publication failure must
+      // therefore become durable ERROR recovery authority rather than a plain
+      // definitive error that forgets the candidate image.
+      if (ticket != null) begin
+        rdma_dma_mapping recovery_query;
+        rdma_dma_request_context recovery_ctx;
+        recovery_query = null;
+        if (make_dma_context(binding, authoritative.handle,
+                             RDMA_QUEUE_ROLE_QP_SQ_PD, recovery_ctx).ok()) begin
+          void'(host_mem.allocate(recovery_ctx, 512, 512,
+                                  RDMA_DMA_DEVICE_WRITE, recovery_query));
+        end
+        if (recovery_query != null)
+          retain_modify_recovery(authoritative, prior_qpc, candidate_qpc,
+                                 null, recovery_query, 1'b0, ticket, status,
+                                 result);
+      end
+      qp = null;
+      if (!result.recovery_required) publish_primary(result, status);
+      return;
+    end
     result.resource_h = rdma_clone_handle_value(qp.handle, "QP modify result");
     result.final_resource_state = RDMA_RESOURCE_ACTIVE;
     result.final_resource_state_known = 1'b1;
