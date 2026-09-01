@@ -857,6 +857,12 @@ class rdma_qp_lifecycle_executor extends uvm_object;
                                        RDMA_SC_RESET_CANCELLED})
       return 1'b1;
     if (ticket == null || completion == null || completion.status == null) begin
+      // A CMQ adapter may return a terminal success status without exposing
+      // either a ticket or completion object.  The status itself is then the
+      // definitive outcome; only non-OK null outcomes require an explicit
+      // adapter proof that submission never crossed the hardware boundary.
+      if (status.ok() && ticket == null && completion == null)
+        return 1'b0;
       if (!status.ok() && ticket == null && completion == null &&
           cmq != null && cmq.last_execute_definitive_no_submit())
         return 1'b0;

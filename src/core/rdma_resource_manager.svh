@@ -2416,6 +2416,7 @@ class rdma_resource_manager extends uvm_object;
     result.ambiguous_operation = source.ambiguous_operation;
     result.ambiguous_role = source.ambiguous_role;
     result.role_complete = source.role_complete;
+    result.has_pending_hardware_step = source.has_pending_hardware_step;
     result.query_mapping_recovery_only = source.query_mapping_recovery_only;
     result.error_modify_complete = source.error_modify_complete;
     result.delete_complete = source.delete_complete;
