@@ -2664,6 +2664,9 @@ class rdma_qp_lifecycle_executor extends uvm_object;
       if (recovery.ambiguous_ticket == null) begin
         // Ticketless ambiguity cannot be reconciled; remain fail-closed in
         // ERROR and let a subsequent recovery attempt obtain fresh proof.
+        result.recovery_required = 1'b1;
+        result.final_resource_state = RDMA_RESOURCE_ERROR;
+        result.final_resource_state_known = 1'b1;
         publish_primary(result, rdma_status::make(
           RDMA_SC_RECOVERY_REQUIRED,
           "QP destroy ambiguity has no reconciliation ticket"));

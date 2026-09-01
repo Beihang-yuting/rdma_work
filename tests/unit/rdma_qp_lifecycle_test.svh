@@ -978,6 +978,37 @@ class rdma_qp_output_fault_cmq extends rdma_mock_cmq_port;
   endtask
 endclass
 
+// Destroy-path adapter that withholds all CMQ correlation metadata for the
+// ERROR transition while preserving a timeout status.  This models a command
+// that may have crossed the hardware boundary but for which no ticket can be
+// recovered; the executor must retain durable ERROR authority and fail closed
+// on a retry rather than guessing or calling reconcile(null).
+class rdma_qp_ticketless_destroy_cmq extends rdma_mock_cmq_port;
+  `uvm_object_utils(rdma_qp_ticketless_destroy_cmq)
+
+  function new(string name = "rdma_qp_ticketless_destroy_cmq");
+    super.new(name);
+  endfunction
+
+  virtual task execute(
+    rdma_cmq_command_desc command,
+    output rdma_cmq_ticket ticket,
+    output rdma_cmq_completion completion,
+    output rdma_status status
+  );
+    super.execute(command, ticket, completion, status);
+    if (command != null && command.opcode_key != null &&
+        command.opcode_key.opcode == XTR_V1_OP_QPC_MODIFY &&
+        status != null && status.code == RDMA_SC_TIMEOUT) begin
+      ticket = null;
+      completion = null;
+      // This is deliberately not a no-submit proof: timeout remains
+      // ambiguous even though the adapter cannot return a ticket.
+      last_execute_no_submit_proven = 1'b0;
+    end
+  endtask
+endclass
+
 class rdma_qp_lifecycle_test extends uvm_test;
   `uvm_component_utils(rdma_qp_lifecycle_test)
 
@@ -3642,6 +3673,7 @@ class rdma_qp_lifecycle_test extends uvm_test;
     check_modify_query_allocation_failure();
     check_modify_query_malformed_pending();
     check_destroy_lifecycle();
+    check_destroy_ticketless_ambiguity();
     phase.drop_objection(this);
   endtask
 
@@ -3717,6 +3749,67 @@ class rdma_qp_lifecycle_test extends uvm_test;
         !status.ok() || resource == null || resource.state != RDMA_RESOURCE_ACTIVE ||
         cmq.calls.size() != calls_before)
       `uvm_error("QP_DESTROY_BUSY", "busy QP destroy issued side effects")
+  endtask
+
+  task automatic check_destroy_ticketless_ambiguity();
+    rdma_mock_host_mem mem;
+    rdma_function_binding binding;
+    rdma_resource_manager manager;
+    rdma_mock_context_backing contexts;
+    rdma_qp_ticketless_destroy_cmq cmq;
+    rdma_qp_lifecycle_executor executor;
+    rdma_pd pd;
+    rdma_cq cq;
+    rdma_create_qp_req create_req;
+    rdma_destroy_resource_req destroy_req;
+    rdma_qp qp;
+    rdma_control_result result;
+    rdma_control_result retry_result;
+    rdma_recovery_record recovery;
+    int unsigned calls_before;
+
+    mem = rdma_mock_host_mem::type_id::create("destroy_ticketless_mem");
+    manager = rdma_resource_manager::type_id::create("destroy_ticketless_manager");
+    contexts = rdma_mock_context_backing::type_id::create("destroy_ticketless_contexts");
+    cmq = rdma_qp_ticketless_destroy_cmq::type_id::create(
+      "destroy_ticketless_cmq");
+    executor = rdma_qp_lifecycle_executor::type_id::create(
+      "destroy_ticketless_executor");
+    setup_custom_qp_environment("destroy_ticketless", mem, manager,
+                                contexts, cmq, executor, binding, pd, cq);
+    create_req = make_request("destroy_ticketless_create", binding, pd, cq,
+                              RDMA_TRANSPORT_RC);
+    executor.create_locked(binding, binding.make_handle(), create_req, 864,
+                           qp, result);
+    destroy_req = rdma_destroy_resource_req::type_id::create(
+      "destroy_ticketless_req");
+    destroy_req.owner = binding.make_handle();
+    destroy_req.target_h = rdma_clone_handle_value(
+      qp.handle, "destroy ticketless target");
+    cmq.timeout_opcode(XTR_V1_OP_QPC_MODIFY);
+    executor.destroy_locked(binding, binding.make_handle(), destroy_req, 865,
+                            result);
+    recovery = null;
+    if (result != null && result.resource_h != null)
+      void'(manager.lookup_recovery(result.resource_h, recovery));
+    if (result == null || result.status == null ||
+        result.status.code != RDMA_SC_RECOVERY_REQUIRED ||
+        !result.recovery_required || recovery == null ||
+        recovery.qp_recovery == null ||
+        recovery.qp_recovery.ambiguous_operation != RDMA_QP_AMBIG_MODIFY ||
+        recovery.qp_recovery.ambiguous_ticket != null ||
+        !recovery.qp_recovery.has_pending_hardware_step)
+      `uvm_error("QP_DESTROY_TICKETLESS",
+                 "ticketless destroy ambiguity was not durably retained")
+    calls_before = cmq.calls.size();
+    retry_result = null;
+    executor.recover_locked(binding, binding.make_handle(), result.resource_h,
+                            866, retry_result);
+    if (retry_result == null || retry_result.status == null ||
+        retry_result.status.code != RDMA_SC_RECOVERY_REQUIRED ||
+        !retry_result.recovery_required || cmq.calls.size() != calls_before)
+      `uvm_error("QP_DESTROY_TICKETLESS_RETRY",
+                 "ticketless destroy recovery did not fail closed")
   endtask
 
   task automatic check_modify_state_machine();
