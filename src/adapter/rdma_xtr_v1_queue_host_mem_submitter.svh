@@ -359,8 +359,15 @@ class rdma_xtr_v1_queue_host_mem_submitter extends uvm_object;
     mapping = null;
     status = host_mem.allocate(request_context, size, alignment, direction,
                                mapping);
-    status = status_or(status, RDMA_SC_DMA_TRANSLATION,
+    if (status == null || !status.ok()) begin
+      // A defensive adapter may return a live mapping together with a
+      // failure status.  Treat that as a post-allocation failure and make the
+      // single cleanup attempt before returning the allocation error.
+      if (mapping != null)
+        release_status = rdma_xtr_v1_host_mem_release(host_mem, mapping);
+      return status_or(status, RDMA_SC_DMA_TRANSLATION,
                        "host memory allocation returned null status");
+    end
     if (!status.ok())
       return status;
     status = mapping_identity_status(mapping, request_context, size,
