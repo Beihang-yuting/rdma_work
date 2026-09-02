@@ -93,6 +93,7 @@ class rdma_xtr_v1_aeqe_model extends rdma_aeqe_model;
 endclass
 
 virtual class rdma_xtr_v1_queue_codec_base extends rdma_codec_base;
+  function new(string name="rdma_xtr_v1_queue_codec_base"); super.new(name); endfunction
   protected pure virtual function rdma_image_kind_e image_kind_expected();
   protected pure virtual function int unsigned image_bytes();
   protected pure virtual function rdma_status encode_fields(rdma_hw_model model, rdma_xtr_v1_qword_builder b);
@@ -122,6 +123,7 @@ virtual class rdma_xtr_v1_queue_codec_base extends rdma_codec_base;
 endclass
 
 class rdma_xtr_v1_sqe_codec_base extends rdma_xtr_v1_queue_codec_base;
+  function new(string name="rdma_xtr_v1_sqe_codec_base"); super.new(name); endfunction
   protected virtual function rdma_image_kind_e image_kind_expected(); return RDMA_IMAGE_SQE; endfunction
   protected virtual function int unsigned image_bytes(); return XTR_V1_WQE_BYTES; endfunction
   protected function rdma_status put(rdma_xtr_v1_qword_builder b,int unsigned o,int unsigned l,int unsigned w,bit [63:0] v); rdma_status s=b.put_field(o,l,w,v); return s.ok()?s:rdma_status::make(RDMA_SC_CODEC_ERROR,s.message); endfunction
