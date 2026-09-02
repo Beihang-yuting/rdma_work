@@ -24,9 +24,9 @@ def reject(text: str, pattern: str, message: str) -> None:
 
 
 IOVA_CONSUMERS = (
-    "src/core/rdma_queue_lifecycle_policy.svh",
-    "src/core/rdma_queue_lifecycle_executor.svh",
-    "src/codec/xtr_v1/rdma_xtr_v1_queue_page_codec.svh",
+    "src/core/rdma_queue_lifecycle_policy.sv",
+    "src/core/rdma_queue_lifecycle_executor.sv",
+    "src/codec/xtr_v1/rdma_xtr_v1_queue_page_codec.sv",
 )
 
 
@@ -43,7 +43,7 @@ REQUEST_CLASSES = ("rdma_create_cq_req", "rdma_create_srq_req", "rdma_create_ceq
 
 
 def validate_public_api_shape(repo_root: Path) -> None:
-    text = read(repo_root, "src/model/rdma_semantic_requests.svh")
+    text = read(repo_root, "src/model/rdma_semantic_requests.sv")
     for name in REQUEST_CLASSES:
         start = re.search(rf"\bclass\s+{name}\b", text)
         if not start:
@@ -59,20 +59,20 @@ def validate_public_api_shape(repo_root: Path) -> None:
 
 def validate_core_dependencies(repo_root: Path) -> None:
     required = [
-        "src/core/rdma_stag_key_policy.svh", "src/core/rdma_hmc_allocator.svh",
-        "src/core/rdma_resource_manager.svh", "src/core/rdma_queue_lifecycle_policy.svh",
-        "src/core/rdma_queue_backing_planner.svh", "src/core/rdma_doorbell_scheduler.svh",
-        "src/core/rdma_cmq_port.svh", "src/core/rdma_queue_lifecycle_executor.svh",
-        "src/core/rdma_control_plane.svh", "src/core/rdma_cmq_engine.svh",
-        "src/core/rdma_cmq_engine_port_adapter.svh", "src/core/rdma_cmq_port.svh",
+        "src/core/rdma_stag_key_policy.sv", "src/core/rdma_hmc_allocator.sv",
+        "src/core/rdma_resource_manager.sv", "src/core/rdma_queue_lifecycle_policy.sv",
+        "src/core/rdma_queue_backing_planner.sv", "src/core/rdma_doorbell_scheduler.sv",
+        "src/core/rdma_cmq_port.sv", "src/core/rdma_queue_lifecycle_executor.sv",
+        "src/core/rdma_control_plane.sv", "src/core/rdma_cmq_engine.sv",
+        "src/core/rdma_cmq_engine_port_adapter.sv", "src/core/rdma_cmq_port.sv",
     ]
     paths = [repo_root / p for p in required] + [repo_root / "src/core/rdma_core_pkg.sv"]
     for path in paths:
         if not path.is_file():
             raise ValidationError(f"missing core dependency source: {path.relative_to(repo_root)}")
-    # Scan every core header, including newly added files, in addition to the
-    # explicit required set above so an unlisted header cannot bypass checks.
-    all_core = sorted(repo_root.joinpath("src/core").glob("*.svh"))
+    # Scan every core source file, including newly added files, in addition to
+    # the explicit required set above so an unlisted source cannot bypass checks.
+    all_core = sorted(repo_root.joinpath("src/core").glob("*.sv"))
     scan_paths = list(dict.fromkeys(paths + all_core))
     try:
         text = "\n".join(path.read_text(encoding="utf-8") for path in scan_paths)
@@ -96,8 +96,8 @@ def _check_include_order(repo_root: Path, relative: str, expected: tuple[str, ..
 
 
 def validate_package_order(repo_root: Path) -> None:
-    _check_include_order(repo_root, "src/model/rdma_model_pkg.sv", ("rdma_resource_refs.svh", "rdma_queue_lifecycle_models.svh", "rdma_semantic_requests.svh", "rdma_resources.svh"))
-    _check_include_order(repo_root, "src/core/rdma_core_pkg.sv", ("rdma_resource_manager.svh", "rdma_queue_lifecycle_policy.svh", "rdma_queue_backing_planner.svh", "rdma_queue_lifecycle_executor.svh", "rdma_control_plane.svh"))
+    _check_include_order(repo_root, "src/model/rdma_model_pkg.sv", ("rdma_resource_refs.sv", "rdma_queue_lifecycle_models.sv", "rdma_semantic_requests.sv", "rdma_resources.sv"))
+    _check_include_order(repo_root, "src/core/rdma_core_pkg.sv", ("rdma_resource_manager.sv", "rdma_queue_lifecycle_policy.sv", "rdma_queue_backing_planner.sv", "rdma_queue_lifecycle_executor.sv", "rdma_control_plane.sv"))
 
 
 FROZEN_ABI = (
@@ -107,12 +107,36 @@ FROZEN_ABI = (
     "src/codec/xtr_v1/rdma_xtr_v1_cmq_codecs.svh",
 )
 
+# The codec implementations are source files now, but their ABI is frozen
+# against the historical .svh paths.  Keep the baseline path separate from
+# the current path so a pure rename is not reported as an ABI edit.
+FROZEN_ABI_CURRENT = (
+    "src/codec/xtr_v1/rdma_xtr_v1_defs.svh",
+    "src/codec/xtr_v1/rdma_xtr_v1_image_masks.svh",
+    "src/codec/xtr_v1/rdma_xtr_v1_context_body_codecs.sv",
+    "src/codec/xtr_v1/rdma_xtr_v1_cmq_codecs.sv",
+)
+
 
 def validate_frozen_queue_abi(repo_root: Path) -> None:
     try:
-        subprocess.run(["git", "diff", "--exit-code", "a0abd95", "--", *FROZEN_ABI], cwd=repo_root, check=True, capture_output=True, text=True)
+        result = subprocess.run(
+            ["git", "diff", "--name-status", "-M", "a0abd95", "--",
+             *FROZEN_ABI, *FROZEN_ABI_CURRENT],
+            cwd=repo_root, check=True, capture_output=True, text=True,
+        )
     except (OSError, subprocess.CalledProcessError) as exc:
         raise ValidationError("frozen ABI differs from baseline or git unavailable") from exc
+    for line in result.stdout.splitlines():
+        fields = line.split("\t")
+        status = fields[0] if fields else ""
+        # A pure R100 rename preserves the frozen bytes.  Any modification,
+        # lower-similarity rename, addition, or deletion is an ABI violation.
+        if status == "R100" and len(fields) == 3:
+            old_path, new_path = fields[1], fields[2]
+            if (old_path, new_path) in zip(FROZEN_ABI, FROZEN_ABI_CURRENT):
+                continue
+        raise ValidationError("frozen ABI differs from baseline or git unavailable")
 
 
 def main() -> int:

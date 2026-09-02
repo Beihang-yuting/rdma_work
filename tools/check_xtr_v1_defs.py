@@ -18,7 +18,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 MANIFEST_PATH = REPO_ROOT / "hw" / "xtr_v1" / "source_manifest.txt"
 SV_DEFS_PATH = REPO_ROOT / "src" / "codec" / "xtr_v1" / "rdma_xtr_v1_defs.svh"
 ERROR_CODEC_PATH = (
-    REPO_ROOT / "src" / "codec" / "xtr_v1" / "rdma_xtr_v1_error_codec.svh"
+    REPO_ROOT / "src" / "codec" / "xtr_v1" / "rdma_xtr_v1_error_codec.sv"
 )
 SV_MASKS_PATH = REPO_ROOT / "src" / "codec" / "xtr_v1" / "rdma_xtr_v1_image_masks.svh"
 GOLDEN_DIR = REPO_ROOT / "hw" / "xtr_v1" / "golden_vectors"

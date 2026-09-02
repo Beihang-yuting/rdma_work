@@ -737,7 +737,7 @@ string macro_text = "`REVIEW_HC(hardware_,code)";
     def test_error_codec_uvm_test_checks_success_symbols(self) -> None:
         test_text = (
             REPO_ROOT / "tests" / "unit" /
-            "rdma_xtr_v1_error_codec_test.svh"
+            "rdma_xtr_v1_error_codec_test.sv"
         ).read_text()
         start = test_text.index("function automatic void check_error")
         end = test_text.index("endfunction", start)
@@ -799,7 +799,7 @@ string macro_text = "`REVIEW_HC(hardware_,code)";
         self.assertEqual(constants.get(name), 0xF0)
         codec = (
             REPO_ROOT
-            / "src/codec/xtr_v1/rdma_xtr_v1_error_codec.svh"
+            / "src/codec/xtr_v1/rdma_xtr_v1_error_codec.sv"
         ).read_text()
         self.assertRegex(codec, rf"\b{re.escape(name)}\s*:")
         self.assertNotRegex(codec, r"\b8'h[fF]0\s*:")
@@ -899,7 +899,7 @@ localparam bit [63:0] XTR_V1_WINDOW = 64'h2000;
     def test_cmq_composer_does_not_retain_built_artifacts(self) -> None:
         source = (
             REPO_ROOT
-            / "src/codec/xtr_v1/rdma_xtr_v1_cmq_codecs.svh"
+            / "src/codec/xtr_v1/rdma_xtr_v1_cmq_codecs.sv"
         ).read_text()
         self.assertNotRegex(
             source,

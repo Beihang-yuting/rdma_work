@@ -389,4 +389,48 @@ class rdma_queue_backing_access extends uvm_object;
     end
     return rdma_status::success();
   endfunction
+
+  // Host-side verification read for a just-published queue entry.  This is
+  // deliberately distinct from read(): read() models a device-write DMA
+  // transaction and therefore requires DEVICE_WRITE permission (as used for
+  // CQ/CEQ/AEQ consumption).  Posting rings are DEVICE_READ-only mappings,
+  // but the host still needs to verify that its own write reached backing
+  // memory before ringing the producer doorbell.
+  function rdma_status readback(
+      longint unsigned offset,
+      longint unsigned length,
+      output byte data[]);
+    rdma_queue_backing_span spans[$];
+    rdma_status status;
+    longint unsigned position;
+    byte chunk[];
+
+    data = new[0];
+    status = resolve(offset, length, spans);
+    if (!status.ok()) return status;
+    // Validate that the mapping authorizes the device-read direction used by
+    // the posting ring, while intentionally not requiring reverse DMA write
+    // permission merely to inspect host memory.
+    status = preflight_spans(spans, RDMA_DMA_DEVICE_READ);
+    if (!status.ok()) return status;
+    data = new[length];
+    position = 0;
+    foreach (spans[i]) begin
+      chunk = new[0];
+      status = host_mem.read(spans[i].mapping, spans[i].mapping_offset,
+                             int'(spans[i].length), chunk);
+      if (status == null || !status.ok()) begin
+        data = new[0];
+        return status == null ? invalid_state(
+          "host memory readback returned null status") : status;
+      end
+      if (chunk.size() != spans[i].length) begin
+        data = new[0];
+        return dma_error("host memory readback returned short data");
+      end
+      foreach (chunk[j]) data[position + j] = chunk[j];
+      position += spans[i].length;
+    end
+    return rdma_status::success();
+  endfunction
 endclass
