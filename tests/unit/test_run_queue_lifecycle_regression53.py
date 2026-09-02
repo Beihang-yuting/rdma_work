@@ -17,7 +17,7 @@ CLASS_RE = re.compile(r"class\s+(\w+)\s+extends\s+(\w+)\s*;")
 def discover_uvm_tests(unit_root: Path) -> set[str]:
     parents: dict[str, str] = {}
     registered: set[str] = set()
-    for path in unit_root.glob("*.svh"):
+    for path in unit_root.glob("*.sv"):
         text = path.read_text(encoding="utf-8")
         parents.update(CLASS_RE.findall(text))
         registered.update(re.findall(r"`uvm_component_utils\((\w+)\)", text))

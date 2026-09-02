@@ -1098,12 +1098,17 @@ class rdma_post_recv_req extends rdma_semantic_request;
   `uvm_object_utils(rdma_post_recv_req)
 
   rdma_handle target_h;
+  // Private RQs complete on their target QP.  A receive posted to a shared
+  // SRQ needs the associated QP handle so the CQE can be routed back to the
+  // correct receive ledger.
+  rdma_handle completion_qp_h;
   longint unsigned wr_id;
   rdma_sge sges[$];
 
   function new(string name = "rdma_post_recv_req");
     super.new(name);
     target_h = null;
+    completion_qp_h = null;
     wr_id = '0;
   endfunction
 
@@ -1122,6 +1127,15 @@ class rdma_post_recv_req extends rdma_semantic_request;
       cloned_object = rhs_req.target_h.clone();
       if (cloned_object == null || !$cast(target_h, cloned_object))
         `uvm_fatal("RDMA_COPY_TYPE", "receive target clone type mismatch")
+    end
+    if (rhs_req.completion_qp_h == null) begin
+      completion_qp_h = null;
+    end
+    else begin
+      cloned_object = rhs_req.completion_qp_h.clone();
+      if (cloned_object == null || !$cast(completion_qp_h, cloned_object))
+        `uvm_fatal("RDMA_COPY_TYPE",
+                   "receive completion QP clone type mismatch")
     end
     wr_id = rhs_req.wr_id;
     sges.delete();
@@ -1148,6 +1162,21 @@ class rdma_post_recv_req extends rdma_semantic_request;
         !(target_h.kind inside {RDMA_RESOURCE_QP, RDMA_RESOURCE_SRQ}))
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "post-receive target is not a QP or SRQ");
+    if (target_h.kind == RDMA_RESOURCE_QP) begin
+      if (completion_qp_h != null)
+        return rdma_status::make(
+          RDMA_SC_INVALID_ARGUMENT,
+          "private receive cannot specify a completion QP"
+        );
+    end
+    else begin
+      if (completion_qp_h == null ||
+          completion_qp_h.kind != RDMA_RESOURCE_QP)
+        return rdma_status::make(
+          RDMA_SC_INVALID_ARGUMENT,
+          "shared SRQ receive requires a QP completion handle"
+        );
+    end
     if (sges.size() == 0)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "receive has no SGE");

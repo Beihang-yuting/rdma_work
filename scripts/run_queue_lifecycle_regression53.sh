@@ -13,6 +13,13 @@ readonly core_tests=(
   rdma_request_model_test
   rdma_adapter_contract_test
   rdma_resource_manager_test
+  rdma_queue_runtime_test
+  rdma_queue_backing_access_test
+  rdma_queue_data_engine_post_test
+  rdma_queue_data_engine_poll_test
+  rdma_xtr_v1_queue_host_mem_submitter_test
+  rdma_xtr_v1_queue_model_test
+  rdma_xtr_v1_queue_codec_test
   rdma_doorbell_scheduler_test
   rdma_cmq_engine_test
   rdma_cmq_port_test
@@ -34,6 +41,8 @@ readonly core_tests=(
   rdma_xtr_v1_queue_page_codec_test
   rdma_queue_lifecycle_test
   rdma_queue_recovery_test
+  rdma_qp_lifecycle_test
+  rdma_qp_recovery_test
 )
 
 if [[ ${1-} == "--list" ]]; then
