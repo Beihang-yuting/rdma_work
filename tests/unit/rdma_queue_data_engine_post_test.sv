@@ -119,8 +119,10 @@ class rdma_queue_data_engine_fixture extends uvm_object;
     status = null;
     binding = make_binding({get_name(), "_binding"});
     manager = rdma_resource_manager::type_id::create({get_name(), "_manager"});
-    mem = rdma_mock_host_mem::type_id::create({get_name(), "_mem"});
-    pcie = rdma_mock_pcie::type_id::create({get_name(), "_pcie"});
+    if (mem == null)
+      mem = rdma_mock_host_mem::type_id::create({get_name(), "_mem"});
+    if (pcie == null)
+      pcie = rdma_mock_pcie::type_id::create({get_name(), "_pcie"});
     contexts = rdma_mock_context_backing::type_id::create(
       {get_name(), "_contexts"});
     cmq = rdma_mock_cmq_port::type_id::create({get_name(), "_cmq"});

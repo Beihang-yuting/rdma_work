@@ -53,6 +53,7 @@ package rdma_unit_test_pkg;
   `include "unit/rdma_queue_backing_access_test.sv"
   `include "unit/rdma_queue_data_engine_post_test.sv"
   `include "unit/rdma_queue_data_engine_poll_test.sv"
+  `include "unit/rdma_queue_data_engine_recovery_test.sv"
   `include "unit/rdma_xtr_v1_doorbell_codec_test.sv"
   `include "unit/rdma_xtr_v1_qpc_codec_test.sv"
   `include "unit/rdma_xtr_v1_context_body_codec_test.sv"
@@ -74,4 +75,5 @@ endpackage
   import rdma_host_mem_adapter_pkg::*;
   `include "uvm_macros.svh"
   `include "integration/rdma_host_mem_adapter_test.sv"
+  `include "integration/rdma_queue_data_engine_host_mem_test.sv"
 `endif

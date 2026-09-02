@@ -96,6 +96,16 @@ class rdma_queue_data_engine_poll_test extends uvm_test;
     if (fixture.cq.queue_plan == null || fixture.cq.queue_plan.context_ref == null)
       `uvm_error("POLL_CQE_CONTEXT", "CQ fixture lost lifecycle backing")
 
+    // CI commit must advance the CQ runtime.  The backing entry remains in
+    // memory, so a stale CI would consume the same CQE a second time instead
+    // of observing the next (empty) slot.
+    completion = null;
+    fixture.engine.poll_cqe(fixture.cq.handle, 0, completion, status);
+    if (status == null || status.code != RDMA_SC_QUEUE_EMPTY ||
+        completion != null)
+      `uvm_error("POLL_CQE_CI", status == null ? "null status" :
+                 status.convert2string())
+
     phase.drop_objection(this);
   endtask
 endclass

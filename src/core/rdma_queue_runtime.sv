@@ -35,15 +35,58 @@ endclass
 
 class rdma_queue_pending_operation extends uvm_object;
   `uvm_object_utils(rdma_queue_pending_operation)
+  // Detached transaction evidence retained while a queue is in recovery.
+  // These fields deliberately contain value snapshots only; no caller-owned
+  // descriptor or raw host backing address is exposed.
+  rdma_handle queue_h;
+  rdma_queue_runtime_kind_e kind;
+  bit producer;
+  longint unsigned entry_offset;
   rdma_queue_cursor_snapshot cursor;
+  // Cursor after the pending operation.  Keeping this value in the evidence
+  // object prevents recovery from deriving a different ring transition after
+  // a caller mutates queue geometry.
+  rdma_queue_cursor_snapshot next_cursor;
+  rdma_hw_image image;
+  // Producer retries need the semantic request to rebuild the ledger entry;
+  // it is detached here so the caller can safely reuse/mutate its request.
+  rdma_semantic_request request_snapshot;
+  longint unsigned wr_id;
+  bit signaled;
+  // CQ consumer retries need the WQE cursor and route identity to release the
+  // corresponding producer ledger after the consumer doorbell succeeds.
+  int unsigned completion_index;
+  bit completion_wrap;
+  bit completion_target_valid;
+  // CQ recovery may retain evidence after the WQE ledger was released but
+  // before the CQ consumer cursor commit completed.  Replaying such a
+  // transaction must not release the same WQE twice.
+  bit completion_released;
+  rdma_handle routed_qp_h;
   bit mmio_maybe_submitted;
   bit known_no_mmio;
-  function new(string name="rdma_queue_pending_operation"); super.new(name); cursor=null; mmio_maybe_submitted=0; known_no_mmio=0; endfunction
+  function new(string name="rdma_queue_pending_operation");
+    super.new(name);
+    queue_h=null; kind=RDMA_QUEUE_RUNTIME_SQ; producer=0; entry_offset=0;
+    cursor=null; next_cursor=null; image=null; request_snapshot=null;
+    signaled=0; wr_id=0; completion_index=0; completion_wrap=0;
+    completion_target_valid=0; completion_released=0; routed_qp_h=null;
+    mmio_maybe_submitted=0; known_no_mmio=0;
+  endfunction
   virtual function void do_copy(uvm_object rhs);
     rdma_queue_pending_operation source;
     uvm_object cloned;
     super.do_copy(rhs);
     if (!$cast(source, rhs)) `uvm_fatal("RDMA_COPY_TYPE", "pending operation copy mismatch");
+    if (source.queue_h == null) queue_h = null;
+    else begin
+      cloned = source.queue_h.clone();
+      if (cloned == null || !$cast(queue_h, cloned))
+        `uvm_fatal("RDMA_COPY_TYPE", "pending queue handle clone mismatch");
+    end
+    kind = source.kind;
+    producer = source.producer;
+    entry_offset = source.entry_offset;
     mmio_maybe_submitted = source.mmio_maybe_submitted;
     known_no_mmio = source.known_no_mmio;
     if (source.cursor == null) cursor = null;
@@ -51,6 +94,36 @@ class rdma_queue_pending_operation extends uvm_object;
       cloned = source.cursor.clone();
       if (cloned == null || !$cast(cursor, cloned))
         `uvm_fatal("RDMA_COPY_TYPE", "pending cursor clone mismatch");
+    end
+    if (source.next_cursor == null) next_cursor = null;
+    else begin
+      cloned = source.next_cursor.clone();
+      if (cloned == null || !$cast(next_cursor, cloned))
+        `uvm_fatal("RDMA_COPY_TYPE", "pending next cursor clone mismatch");
+    end
+    if (source.image == null) image = null;
+    else begin
+      cloned = source.image.clone();
+      if (cloned == null || !$cast(image, cloned))
+        `uvm_fatal("RDMA_COPY_TYPE", "pending image clone mismatch");
+    end
+    signaled = source.signaled;
+    wr_id = source.wr_id;
+    completion_index = source.completion_index;
+    completion_wrap = source.completion_wrap;
+    completion_target_valid = source.completion_target_valid;
+    completion_released = source.completion_released;
+    if (source.routed_qp_h == null) routed_qp_h = null;
+    else begin
+      cloned = source.routed_qp_h.clone();
+      if (cloned == null || !$cast(routed_qp_h, cloned))
+        `uvm_fatal("RDMA_COPY_TYPE", "pending routed QP clone mismatch");
+    end
+    if (source.request_snapshot == null) request_snapshot = null;
+    else begin
+      cloned = source.request_snapshot.clone();
+      if (cloned == null || !$cast(request_snapshot, cloned))
+        `uvm_fatal("RDMA_COPY_TYPE", "pending request clone mismatch");
     end
   endfunction
 endclass
@@ -84,6 +157,7 @@ class rdma_queue_runtime extends uvm_object;
   rdma_queue_pending_operation pending_operation;
   protected rdma_queue_slot_ledger_entry slots[];
   protected semaphore lock;
+  protected bit recovery_commit_allowed;
 
   protected function rdma_status acquire_lock();
     if (lock == null || !lock.try_get(1))
@@ -94,7 +168,7 @@ class rdma_queue_runtime extends uvm_object;
 
   function new(string name="rdma_queue_runtime");
     super.new(name); queue_h=null; kind=RDMA_QUEUE_RUNTIME_SQ; state=RDMA_QUEUE_RUNTIME_DETACHED;
-    depth=0; producer_index=0; consumer_index=0; producer_wrap=0; consumer_wrap=0; initial_polarity=0; used=0; pending_operation=null; lock=new(1);
+    depth=0; producer_index=0; consumer_index=0; producer_wrap=0; consumer_wrap=0; initial_polarity=0; used=0; pending_operation=null; lock=new(1); recovery_commit_allowed=0;
   endfunction
 
   function rdma_status configure(rdma_handle qh, rdma_queue_runtime_kind_e k,
@@ -102,6 +176,7 @@ class rdma_queue_runtime extends uvm_object;
                                  int unsigned ci, bit cw, bit host_produced,
                                  bit initial_owner_polarity = 1'b0);
     rdma_status lock_status;
+    rdma_handle queue_snapshot;
     lock_status = acquire_lock();
     if (!lock_status.ok()) return lock_status;
     if (qh==null) begin lock.put(1); return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,"queue handle is null"); end
@@ -109,10 +184,19 @@ class rdma_queue_runtime extends uvm_object;
     if (pi>=d || ci>=d) begin lock.put(1); return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,"queue cursor is outside depth"); end
     if (!(k inside {RDMA_QUEUE_RUNTIME_SQ,RDMA_QUEUE_RUNTIME_RQ,RDMA_QUEUE_RUNTIME_SRQ,RDMA_QUEUE_RUNTIME_CQ,RDMA_QUEUE_RUNTIME_CEQ,RDMA_QUEUE_RUNTIME_AEQ}))
       begin lock.put(1); return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,"queue runtime kind is invalid"); end
-    queue_h=qh; kind=k; depth=d; producer_index=pi; producer_wrap=pw; consumer_index=ci; consumer_wrap=cw;
+    // Keep an immutable identity snapshot.  The lifecycle resource remains
+    // authoritative, but callers must not be able to mutate the runtime's
+    // generation fence through the handle passed to configure().
+    queue_snapshot = rdma_clone_handle_value(qh, "queue runtime handle");
+    if (queue_snapshot == null) begin
+      lock.put(1);
+      return rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED,
+                               "queue runtime handle snapshot failed");
+    end
+    queue_h=queue_snapshot; kind=k; depth=d; producer_index=pi; producer_wrap=pw; consumer_index=ci; consumer_wrap=cw;
     initial_polarity=initial_owner_polarity;
     used=0; slots=new[d]; foreach(slots[i]) slots[i]=rdma_queue_slot_ledger_entry::type_id::create($sformatf("slot_%0d",i));
-    pending_operation=null; state=RDMA_QUEUE_RUNTIME_ATTACHED; lock.put(1); return rdma_status::success();
+    pending_operation=null; recovery_commit_allowed=0; state=RDMA_QUEUE_RUNTIME_ATTACHED; lock.put(1); return rdma_status::success();
   endfunction
 
   function rdma_status activate();
@@ -149,7 +233,8 @@ class rdma_queue_runtime extends uvm_object;
                                "consumer reservation is null");
     lock_status = acquire_lock();
     if (!lock_status.ok()) return lock_status;
-    if (state != RDMA_QUEUE_RUNTIME_ACTIVE) begin
+    if (state != RDMA_QUEUE_RUNTIME_ACTIVE &&
+        !(recovery_commit_allowed && state == RDMA_QUEUE_RUNTIME_RECOVERY_REQUIRED)) begin
       lock.put(1);
       return rdma_status::make(RDMA_SC_INVALID_STATE,
                                "queue runtime is not active");
@@ -196,7 +281,8 @@ class rdma_queue_runtime extends uvm_object;
     lock_status = acquire_lock();
     if (!lock_status.ok()) return lock_status;
     if (reservation==null || reservation.index>=depth) begin lock.put(1); return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,"producer reservation is invalid"); end
-    if (state!=RDMA_QUEUE_RUNTIME_ACTIVE) begin lock.put(1); return rdma_status::make(RDMA_SC_INVALID_STATE,"queue runtime is not active"); end
+    if (state!=RDMA_QUEUE_RUNTIME_ACTIVE &&
+        !(recovery_commit_allowed && state == RDMA_QUEUE_RUNTIME_RECOVERY_REQUIRED)) begin lock.put(1); return rdma_status::make(RDMA_SC_INVALID_STATE,"queue runtime is not active"); end
     if (reservation.index!=producer_index || reservation.wrap!=producer_wrap || used>=depth) begin lock.put(1); return rdma_status::make(RDMA_SC_INVALID_STATE,"producer reservation is stale"); end
     slot=slots[reservation.index]; if(slot.posted && !slot.consumed) begin lock.put(1); return rdma_status::make(RDMA_SC_INVALID_STATE,"producer slot is still posted"); end
     if (request != null) begin
@@ -224,7 +310,8 @@ class rdma_queue_runtime extends uvm_object;
     released.delete();
     lock_status = acquire_lock();
     if (!lock_status.ok()) return lock_status;
-    if(state!=RDMA_QUEUE_RUNTIME_ACTIVE) begin lock.put(1); return rdma_status::make(RDMA_SC_INVALID_STATE,"queue runtime is not active"); end
+    if(state!=RDMA_QUEUE_RUNTIME_ACTIVE &&
+       !(recovery_commit_allowed && state == RDMA_QUEUE_RUNTIME_RECOVERY_REQUIRED)) begin lock.put(1); return rdma_status::make(RDMA_SC_INVALID_STATE,"queue runtime is not active"); end
     if(target_index>=depth) begin lock.put(1); return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,"completion index is outside depth"); end
     i=consumer_index; w=consumer_wrap; count=0;
     while (!cursor_equal(i,w,target_index,target_wrap) && count<=depth) begin cursor_advance(i,w); count++; end
@@ -314,7 +401,114 @@ class rdma_queue_runtime extends uvm_object;
     if(state!=RDMA_QUEUE_RUNTIME_ACTIVE || operation==null) begin lock.put(1); return rdma_status::make(RDMA_SC_INVALID_STATE,"queue runtime cannot enter recovery"); end
     cloned = operation.clone();
     if (cloned == null || !$cast(copy, cloned)) begin lock.put(1); return rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED,"pending operation clone failed"); end
+    // Derive and retain the post-operation cursor while the ring geometry is
+    // still protected by this runtime lock.  Recovery therefore does not
+    // depend on a mutable caller-side cursor or on a later geometry lookup.
+    if (copy.next_cursor == null && copy.cursor != null && depth != 0 &&
+        copy.cursor.index < depth) begin
+      copy.next_cursor = rdma_queue_cursor_snapshot::type_id::create(
+        "pending_next_cursor");
+      copy.next_cursor.index = copy.cursor.index;
+      copy.next_cursor.wrap = copy.cursor.wrap;
+      cursor_advance(copy.next_cursor.index, copy.next_cursor.wrap);
+    end
     pending_operation=copy; pending_operation.mmio_maybe_submitted=mmio_maybe_submitted; pending_operation.known_no_mmio=!mmio_maybe_submitted; state=RDMA_QUEUE_RUNTIME_RECOVERY_REQUIRED; lock.put(1); return rdma_status::success();
+  endfunction
+
+  // Recovery execution is owned by rdma_queue_data_engine.  These helpers
+  // only commit the state transition once that engine has completed the
+  // replay, or preserve the evidence when replay itself fails.
+  function rdma_status complete_recovery_retry();
+    rdma_status lock_status;
+    lock_status = acquire_lock();
+    if (!lock_status.ok()) return lock_status;
+    if (state != RDMA_QUEUE_RUNTIME_RECOVERY_REQUIRED ||
+        pending_operation == null) begin
+      lock.put(1);
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "queue runtime has no pending recovery");
+    end
+    pending_operation = null;
+    recovery_commit_allowed = 1'b0;
+    state = RDMA_QUEUE_RUNTIME_ACTIVE;
+    lock.put(1);
+    return rdma_status::success();
+  endfunction
+
+  function rdma_status record_recovery_failure(bit mmio_maybe_submitted);
+    rdma_status lock_status;
+    lock_status = acquire_lock();
+    if (!lock_status.ok()) return lock_status;
+    if (state != RDMA_QUEUE_RUNTIME_RECOVERY_REQUIRED ||
+        pending_operation == null) begin
+      lock.put(1);
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "queue runtime has no pending recovery");
+    end
+    pending_operation.mmio_maybe_submitted = mmio_maybe_submitted;
+    pending_operation.known_no_mmio = !mmio_maybe_submitted;
+    recovery_commit_allowed = 1'b0;
+    lock.put(1);
+    return rdma_status::success();
+  endfunction
+
+  function rdma_status abort_recovery();
+    rdma_status lock_status;
+    lock_status = acquire_lock();
+    if (!lock_status.ok()) return lock_status;
+    if (state != RDMA_QUEUE_RUNTIME_RECOVERY_REQUIRED ||
+        pending_operation == null) begin
+      lock.put(1);
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "queue runtime has no pending recovery");
+    end
+    pending_operation = null;
+    recovery_commit_allowed = 1'b0;
+    state = RDMA_QUEUE_RUNTIME_DETACHED;
+    lock.put(1);
+    return rdma_status::success();
+  endfunction
+
+  function rdma_status enable_recovery_commit();
+    rdma_status lock_status;
+    lock_status = acquire_lock();
+    if (!lock_status.ok()) return lock_status;
+    if (state != RDMA_QUEUE_RUNTIME_RECOVERY_REQUIRED ||
+        pending_operation == null) begin
+      lock.put(1);
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "queue runtime has no pending recovery");
+    end
+    recovery_commit_allowed = 1'b1;
+    lock.put(1);
+    return rdma_status::success();
+  endfunction
+
+  // Return a detached copy of the pending transaction.  Recovery callers use
+  // this to audit the exact cursor/image evidence without obtaining a handle
+  // into mutable runtime state.
+  function rdma_status snapshot_pending(
+    output rdma_queue_pending_operation snapshot
+  );
+    rdma_status lock_status;
+    uvm_object cloned;
+    snapshot = null;
+    lock_status = acquire_lock();
+    if (!lock_status.ok()) return lock_status;
+    if (state != RDMA_QUEUE_RUNTIME_RECOVERY_REQUIRED ||
+        pending_operation == null) begin
+      lock.put(1);
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "queue runtime has no pending recovery");
+    end
+    cloned = pending_operation.clone();
+    if (cloned == null || !$cast(snapshot, cloned)) begin
+      lock.put(1);
+      return rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED,
+                               "pending recovery snapshot clone failed");
+    end
+    lock.put(1);
+    return rdma_status::success();
   endfunction
   function rdma_status recover(rdma_queue_recovery_action_e action, bit caller_confirmed_no_submit=1'b0);
     rdma_status lock_status;

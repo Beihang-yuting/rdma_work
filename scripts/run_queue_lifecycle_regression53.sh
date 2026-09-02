@@ -17,6 +17,7 @@ readonly core_tests=(
   rdma_queue_backing_access_test
   rdma_queue_data_engine_post_test
   rdma_queue_data_engine_poll_test
+  rdma_queue_data_engine_recovery_test
   rdma_xtr_v1_queue_host_mem_submitter_test
   rdma_xtr_v1_queue_model_test
   rdma_xtr_v1_queue_codec_test

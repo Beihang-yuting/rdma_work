@@ -610,12 +610,56 @@ class rdma_queue_data_engine extends uvm_object;
   endfunction
 
   protected function rdma_queue_pending_operation make_pending(
-    rdma_queue_cursor_snapshot cursor
+    rdma_queue_cursor_snapshot cursor,
+    rdma_handle queue_h = null,
+    rdma_queue_runtime_kind_e kind = RDMA_QUEUE_RUNTIME_SQ,
+    bit producer = 1'b0,
+    longint unsigned entry_offset = 0,
+    rdma_hw_image image = null,
+    rdma_semantic_request request_snapshot = null,
+    bit signaled = 1'b0,
+    int unsigned completion_index = 0,
+    bit completion_wrap = 1'b0,
+    bit completion_target_valid = 1'b0,
+    bit completion_released = 1'b0,
+    rdma_handle routed_qp_h = null
   );
     rdma_queue_pending_operation pending;
+    uvm_object cloned;
     pending = rdma_queue_pending_operation::type_id::create("queue_pending");
+    if (queue_h != null) begin
+      pending.queue_h = rdma_clone_handle_value(queue_h, "pending queue");
+    end
+    pending.kind = kind;
+    pending.producer = producer;
+    pending.entry_offset = entry_offset;
+    if (request_snapshot != null) begin
+      rdma_post_send_req pending_send;
+      rdma_post_recv_req pending_recv;
+      if ($cast(pending_send, request_snapshot))
+        pending.wr_id = pending_send.wr_id;
+      else if ($cast(pending_recv, request_snapshot))
+        pending.wr_id = pending_recv.wr_id;
+    end
     pending.cursor = rdma_queue_cursor_snapshot::type_id::create("pending_cursor");
     pending.cursor.index = cursor.index; pending.cursor.wrap = cursor.wrap;
+    pending.signaled = signaled;
+    pending.completion_index = completion_index;
+    pending.completion_wrap = completion_wrap;
+    pending.completion_target_valid = completion_target_valid;
+    pending.completion_released = completion_released;
+    if (routed_qp_h != null)
+      pending.routed_qp_h = rdma_clone_handle_value(routed_qp_h,
+                                                     "pending routed QP");
+    if (request_snapshot != null) begin
+      cloned = request_snapshot.clone();
+      if (cloned != null)
+        void'($cast(pending.request_snapshot, cloned));
+    end
+    if (image != null) begin
+      cloned = image.clone();
+      if (cloned != null) void'($cast(pending.image, cloned));
+    end
     return pending;
   endfunction
 
@@ -1114,7 +1158,10 @@ class rdma_queue_data_engine extends uvm_object;
       // The CQ CI doorbell may have been submitted. Preserve a recovery
       // marker on the CQ runtime; do not advance CI or release the WQE ledger
       // until the caller resolves the pending operation.
-      pending = make_pending(cursor);
+      pending = make_pending(cursor, cq_h, RDMA_QUEUE_RUNTIME_CQ,
+                            1'b0, offset, entry_image, null, 1'b0,
+                            cqe.wqe_index, cqe.wqe_wrap, 1'b1,
+                            1'b0, link.qp_h);
       void'(cq_attachment.runtime.enter_recovery(pending,
                                                   db_mmio_maybe_submitted));
       return;
@@ -1123,7 +1170,10 @@ class rdma_queue_data_engine extends uvm_object;
                                                        cqe.wqe_wrap, released);
     if (!status.ok()) begin
       rdma_queue_pending_operation pending;
-      pending = make_pending(cursor);
+      pending = make_pending(cursor, cq_h, RDMA_QUEUE_RUNTIME_CQ,
+                            1'b0, offset, entry_image, null, 1'b0,
+                            cqe.wqe_index, cqe.wqe_wrap, 1'b1,
+                            1'b0, link.qp_h);
       void'(cq_attachment.runtime.enter_recovery(pending, 1'b1));
       return;
     end
@@ -1135,6 +1185,20 @@ class rdma_queue_data_engine extends uvm_object;
     if (released[released.size()-1] == null) begin
       status = bad("CQE release returned a null WQE ledger entry",
                    RDMA_SC_INVALID_STATE);
+      return;
+    end
+    // The CI doorbell has succeeded and the corresponding producer ledger is
+    // now released. Advance the CQ consumer cursor before publishing the
+    // result; a failed local commit remains recoverable without releasing the
+    // WQE a second time.
+    status = cq_attachment.runtime.commit_consumer(cursor);
+    if (!status.ok()) begin
+      rdma_queue_pending_operation pending;
+      pending = make_pending(cursor, cq_h, RDMA_QUEUE_RUNTIME_CQ,
+                            1'b0, offset, entry_image, null, 1'b0,
+                            cqe.wqe_index, cqe.wqe_wrap, 1'b1, 1'b1,
+                            link.qp_h);
+      void'(cq_attachment.runtime.enter_recovery(pending, 1'b1));
       return;
     end
     // Fill semantic fields from the linked WQE and detach every returned
@@ -1282,7 +1346,8 @@ class rdma_queue_data_engine extends uvm_object;
                              db_mmio_maybe_submitted, no_route);
     if (!status.ok()) begin
       rdma_queue_pending_operation pending;
-      pending = make_pending(cursor);
+      pending = make_pending(cursor, attachment.queue_h,
+                            attachment.kind, 1'b0, offset, entry_image);
       void'(attachment.runtime.enter_recovery(pending,
                                                db_mmio_maybe_submitted));
       return;
@@ -1386,7 +1451,8 @@ class rdma_queue_data_engine extends uvm_object;
                              db_mmio_maybe_submitted, no_route);
     if (!status.ok()) begin
       rdma_queue_pending_operation pending;
-      pending = make_pending(cursor);
+      pending = make_pending(cursor, attachment.queue_h,
+                            attachment.kind, 1'b0, offset, entry_image);
       void'(attachment.runtime.enter_recovery(pending,
                                                db_mmio_maybe_submitted));
       return;
@@ -1468,7 +1534,9 @@ class rdma_queue_data_engine extends uvm_object;
     offset = longint'(cursor.index) * 64;
     status = write_and_verify(attachment, offset, image);
     if (!status.ok()) begin
-      pending = make_pending(cursor);
+      pending = make_pending(cursor, snapshot.qp_h, RDMA_QUEUE_RUNTIME_SQ,
+                            1'b1, offset, image, snapshot,
+                            snapshot.signaled);
       recovery_status = attachment.runtime.enter_recovery(pending, 1'b0);
       return;
     end
@@ -1480,14 +1548,18 @@ class rdma_queue_data_engine extends uvm_object;
     submit_producer_doorbell(snapshot.qp_h, RDMA_QUEUE_RUNTIME_SQ,
       cursor, next, image, link.local_qp_id, doorbell_result, status);
     if (!status.ok()) begin
-      pending = make_pending(cursor);
+      pending = make_pending(cursor, snapshot.qp_h, RDMA_QUEUE_RUNTIME_SQ,
+                            1'b1, offset, image, snapshot,
+                            snapshot.signaled);
       recovery_status = attachment.runtime.enter_recovery(pending, 1'b1);
       return;
     end
     status = attachment.runtime.commit_producer(cursor, snapshot,
       snapshot.wr_id, snapshot.signaled, image);
     if (!status.ok()) begin
-      pending = make_pending(cursor);
+      pending = make_pending(cursor, snapshot.qp_h, RDMA_QUEUE_RUNTIME_SQ,
+                            1'b1, offset, image, snapshot,
+                            snapshot.signaled);
       recovery_status = attachment.runtime.enter_recovery(pending, 1'b1);
       return;
     end
@@ -1552,7 +1624,10 @@ class rdma_queue_data_engine extends uvm_object;
     offset = longint'(cursor.index) * 64;
     status = write_and_verify(attachment, offset, image);
     if (!status.ok()) begin
-      pending = make_pending(cursor);
+      pending = make_pending(cursor, snapshot.target_h,
+                            snapshot.target_h.kind == RDMA_RESOURCE_SRQ ?
+                            RDMA_QUEUE_RUNTIME_SRQ : RDMA_QUEUE_RUNTIME_RQ,
+                            1'b1, offset, image, snapshot, 1'b1);
       recovery_status = attachment.runtime.enter_recovery(pending, 1'b0);
       return;
     end
@@ -1568,14 +1643,20 @@ class rdma_queue_data_engine extends uvm_object;
       snapshot.target_h.kind == RDMA_RESOURCE_SRQ ?
       attachment.local_id : link.local_qp_id, doorbell_result, status);
     if (!status.ok()) begin
-      pending = make_pending(cursor);
+      pending = make_pending(cursor, snapshot.target_h,
+                            snapshot.target_h.kind == RDMA_RESOURCE_SRQ ?
+                            RDMA_QUEUE_RUNTIME_SRQ : RDMA_QUEUE_RUNTIME_RQ,
+                            1'b1, offset, image, snapshot, 1'b1);
       recovery_status = attachment.runtime.enter_recovery(pending, 1'b1);
       return;
     end
     status = attachment.runtime.commit_producer(cursor, snapshot,
       snapshot.wr_id, 1'b1, image);
     if (!status.ok()) begin
-      pending = make_pending(cursor);
+      pending = make_pending(cursor, snapshot.target_h,
+                            snapshot.target_h.kind == RDMA_RESOURCE_SRQ ?
+                            RDMA_QUEUE_RUNTIME_SRQ : RDMA_QUEUE_RUNTIME_RQ,
+                            1'b1, offset, image, snapshot, 1'b1);
       recovery_status = attachment.runtime.enter_recovery(pending, 1'b1);
       return;
     end
@@ -1587,18 +1668,194 @@ class rdma_queue_data_engine extends uvm_object;
     result.status = rdma_status::success(); status = result.status;
   endtask
 
-  function rdma_status recover_queue(
+  protected function rdma_status pending_next_cursor(
+    rdma_queue_data_attachment attachment,
+    rdma_queue_pending_operation pending,
+    output rdma_queue_cursor_snapshot next
+  );
+    next = null;
+    if (attachment == null || attachment.runtime == null || pending == null ||
+        pending.cursor == null || attachment.runtime.depth == 0 ||
+        pending.cursor.index >= attachment.runtime.depth)
+      return bad("pending recovery cursor is invalid", RDMA_SC_INVALID_STATE);
+    next = rdma_queue_cursor_snapshot::type_id::create("recovery_next_cursor");
+    next.index = pending.cursor.index;
+    next.wrap = pending.cursor.wrap;
+    if (next.index + 1 >= attachment.runtime.depth) begin
+      next.index = 0;
+      next.wrap = ~next.wrap;
+    end
+    else
+      next.index++;
+    return rdma_status::success();
+  endfunction
+
+  // Re-execute the detached transaction only when the original operation is
+  // known not to have reached MMIO.  The runtime remains RECOVERY_REQUIRED
+  // until every side effect and ledger transition has completed.
+  protected task replay_pending(
+    rdma_queue_data_attachment attachment,
+    rdma_queue_pending_operation pending,
+    output rdma_status status
+  );
+    rdma_queue_cursor_snapshot next;
+    rdma_doorbell_result db_result;
+    bit db_mmio_maybe_submitted;
+    rdma_queue_data_qp_link link;
+    rdma_queue_data_qp_link no_route;
+    rdma_queue_data_attachment wqe_attachment;
+    rdma_queue_slot_ledger_entry released[$];
+    rdma_xtr_v1_cqe_model cqe;
+    rdma_hw_model decoded_model;
+    rdma_codec_base codec;
+    rdma_codec_key codec_key;
+    rdma_status local_status;
+    byte data[];
+
+    status = null;
+    if (attachment == null || pending == null) begin
+      status = bad("pending recovery attachment/evidence is null",
+                   RDMA_SC_INVALID_STATE);
+      return;
+    end
+    status = pending_next_cursor(attachment, pending, next);
+    if (!status.ok()) return;
+
+    if (pending.producer) begin
+      if (pending.image == null || pending.image.bytes.size() == 0) begin
+        status = bad("producer recovery image is missing", RDMA_SC_INVALID_STATE);
+        return;
+      end
+      // A known-no-MMIO producer failure is normally the queue write itself;
+      // retry the exact detached image before issuing its doorbell.
+      status = write_and_verify(attachment, pending.entry_offset,
+                                pending.image);
+      if (!status.ok()) begin
+        void'(attachment.runtime.record_recovery_failure(1'b0));
+        return;
+      end
+      submit_producer_doorbell(pending.queue_h, pending.kind, pending.cursor,
+                               next,
+                               pending.kind == RDMA_QUEUE_RUNTIME_SQ ?
+                               pending.image : null,
+                               attachment.local_id, db_result, status);
+      if (!status.ok()) begin
+        void'(attachment.runtime.record_recovery_failure(1'b1));
+        return;
+      end
+      status = attachment.runtime.enable_recovery_commit();
+      if (!status.ok()) return;
+      status = attachment.runtime.commit_producer(
+        pending.cursor, pending.request_snapshot, pending.wr_id,
+        pending.signaled, pending.image);
+      if (!status.ok()) begin
+        void'(attachment.runtime.record_recovery_failure(1'b1));
+        return;
+      end
+      status = attachment.runtime.complete_recovery_retry();
+      return;
+    end
+
+    // Consumer recovery does not rewrite an entry.  It replays the consumer
+    // doorbell and commits the corresponding CI (and, for CQ, WQE release)
+    // only after the MMIO transaction succeeds.
+    if (attachment.kind == RDMA_QUEUE_RUNTIME_CQ) begin
+      if (pending.image == null) begin
+        status = bad("CQ recovery image is missing", RDMA_SC_INVALID_STATE);
+        return;
+      end
+      codec_key = '{hw_version:"xtr_v1", image_kind:RDMA_IMAGE_CQE,
+        object_type:"cqe", variant:"default", opcode:8'h00};
+      status = registry.lookup(codec_key, codec);
+      if (!status.ok()) return;
+      status = codec.decode(pending.image, decoded_model);
+      if (!status.ok()) return;
+      if (!$cast(cqe, decoded_model) || cqe == null) begin
+        status = bad("CQ recovery image decoded to the wrong model",
+                     RDMA_SC_CODEC_ERROR);
+        return;
+      end
+      link = null;
+      if (pending.routed_qp_h != null)
+        status = find_qp_link_for_local_id(pending.routed_qp_h.object_id,
+                                           link);
+      if (status == null || !status.ok() || link == null)
+        status = find_qp_link_for_cq(pending.queue_h, cqe.qpn, cqe.rq_cqe,
+                                     link);
+      if (!status.ok()) return;
+      if (cqe.rq_cqe) begin
+        if (link.srq_h != null)
+          status = lookup_attachment(link.srq_h, RDMA_QUEUE_RUNTIME_SRQ,
+                                     wqe_attachment);
+        else
+          status = lookup_attachment(link.qp_h, RDMA_QUEUE_RUNTIME_RQ,
+                                     wqe_attachment);
+      end
+      else
+        status = lookup_attachment(link.qp_h, RDMA_QUEUE_RUNTIME_SQ,
+                                   wqe_attachment);
+      if (!status.ok()) return;
+      if (!pending.completion_released) begin
+        status = wqe_attachment.runtime.validate_release_range(cqe.wqe_index,
+                                                                cqe.wqe_wrap);
+        if (!status.ok()) return;
+      end
+      submit_consumer_doorbell(attachment, next, db_result, status,
+                               db_mmio_maybe_submitted, link);
+      if (!status.ok()) begin
+        void'(attachment.runtime.record_recovery_failure(
+          db_mmio_maybe_submitted));
+        return;
+      end
+      if (!pending.completion_released) begin
+        status = wqe_attachment.runtime.match_and_release(cqe.wqe_index,
+                                                           cqe.wqe_wrap,
+                                                           released);
+        if (!status.ok()) begin
+          void'(attachment.runtime.record_recovery_failure(1'b1));
+          return;
+        end
+      end
+      status = attachment.runtime.enable_recovery_commit();
+      if (!status.ok()) return;
+      status = attachment.runtime.commit_consumer(pending.cursor);
+      if (!status.ok()) begin
+        void'(attachment.runtime.record_recovery_failure(1'b1));
+        return;
+      end
+      status = attachment.runtime.complete_recovery_retry();
+      return;
+    end
+
+    submit_consumer_doorbell(attachment, next, db_result, status,
+                             db_mmio_maybe_submitted, no_route);
+    if (!status.ok()) begin
+      void'(attachment.runtime.record_recovery_failure(
+        db_mmio_maybe_submitted));
+      return;
+    end
+    status = attachment.runtime.enable_recovery_commit();
+    if (!status.ok()) return;
+    status = attachment.runtime.commit_consumer(pending.cursor);
+    if (!status.ok()) begin
+      void'(attachment.runtime.record_recovery_failure(1'b1));
+      return;
+    end
+    status = attachment.runtime.complete_recovery_retry();
+  endtask
+
+  task recover_queue(
     rdma_handle queue_h,
     rdma_queue_recovery_action_e action,
-    bit caller_confirmed_no_submit = 1'b0
+    bit caller_confirmed_no_submit,
+    output rdma_status status
   );
-    rdma_status status;
     rdma_queue_data_attachment candidate;
     rdma_queue_data_attachment found;
     string key;
     status = ensure_handle(queue_h, queue_h == null ? RDMA_RESOURCE_QP :
                            queue_h.kind);
-    if (!status.ok()) return status;
+    if (!status.ok()) return;
     found = null;
     foreach (attachments[key]) begin
       candidate = attachments[key];
@@ -1606,14 +1863,36 @@ class rdma_queue_data_engine extends uvm_object;
           candidate.queue_h.same_instance(queue_h) && candidate.runtime != null &&
           candidate.runtime.state == RDMA_QUEUE_RUNTIME_RECOVERY_REQUIRED) begin
         if (found != null)
-          return bad("queue has multiple pending recovery runtimes",
-                     RDMA_SC_INVALID_STATE);
+          begin status = bad("queue has multiple pending recovery runtimes",
+                             RDMA_SC_INVALID_STATE); return; end
         found = candidate;
       end
     end
     if (found == null)
-      return bad("queue has no pending recovery", RDMA_SC_INVALID_STATE);
-    return found.runtime.recover(action, caller_confirmed_no_submit);
-  endfunction
+      begin status = bad("queue has no pending recovery", RDMA_SC_INVALID_STATE); return; end
+    if (action == RDMA_QUEUE_RECOVERY_ABORT_AND_DETACH) begin
+      status = found.runtime.abort_recovery();
+      if (!status.ok()) return;
+      // Drop all borrowed backing capabilities and QP routing metadata once
+      // the caller chooses abort.  Lifecycle-owned DMA mappings remain owned
+      // by the resource manager; only the data-engine attachment is removed.
+      status = detach(queue_h);
+      return;
+    end
+    if (action != RDMA_QUEUE_RECOVERY_RETRY_PENDING)
+      begin status = bad("recovery action is invalid"); return; end
+    if (!caller_confirmed_no_submit)
+      begin status = bad("retry requires caller confirmation"); return; end
+    begin
+      rdma_queue_pending_operation pending;
+      status = found.runtime.snapshot_pending(pending);
+      if (!status.ok()) return;
+      if (pending.mmio_maybe_submitted)
+        begin status = rdma_status::make(RDMA_SC_RECOVERY_REQUIRED,
+                                          "pending MMIO outcome is ambiguous"); return; end
+      replay_pending(found, pending, status);
+      return;
+    end
+  endtask
 
 endclass
