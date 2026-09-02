@@ -110,10 +110,11 @@ virtual class rdma_xtr_v1_queue_codec_base extends rdma_codec_base;
     if ($cast(aq, model) && aq.target_h != null) return aq.target_h.generation;
     return 0;
   endfunction
-  virtual function rdma_status validate_model(rdma_hw_model model); if (model==null) return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,"queue model is null"); return rdma_status::success(); endfunction
+  virtual function rdma_status validate_model(rdma_hw_model model); if (model==null) return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,"queue model is null"); if (model_handle_generation(model)==0) return rdma_status::make(RDMA_SC_STALE_GENERATION,"queue model handle generation is stale"); return rdma_status::success(); endfunction
   virtual function rdma_status validate_image(rdma_hw_image image);
     rdma_xtr_v1_qword_builder b; byte unsigned p[]; rdma_status s;
     if (image==null) return err("queue image is null");
+    if (image.function_generation==0) return rdma_status::make(RDMA_SC_STALE_GENERATION,"queue image generation is stale");
     if (image.length!=image_bytes() || image.bytes.size()!=image_bytes() || image.alignment!=image_bytes() || image.endian!=RDMA_ENDIAN_BIG || image.image_kind!=image_kind_expected() || image.hardware_version!=XTR_V1_HW_VERSION || image.write_target_kind!=RDMA_HW_TARGET_NONE || image.backing_target.value!=0 || image.hmc_target.value!=0 || image.bar_target.value!=0) return err("queue image metadata is invalid");
     p=new[image_bytes()]; foreach (p[i]) p[i]=image.bytes[i]; b=new("queue_validate"); s=b.deserialize(p); if (!s.ok()) return err(s.message); return check_reserved(b);
   endfunction
