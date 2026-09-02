@@ -100,6 +100,16 @@ virtual class rdma_xtr_v1_queue_codec_base extends rdma_codec_base;
   protected pure virtual function rdma_status decode_fields(rdma_xtr_v1_qword_builder b, output rdma_hw_model model);
   protected pure virtual function rdma_status check_reserved(rdma_xtr_v1_qword_builder b);
   protected function rdma_status err(string m); return rdma_status::make(RDMA_SC_CODEC_ERROR,m); endfunction
+  protected function int unsigned model_handle_generation(rdma_hw_model model);
+    rdma_xtr_v1_sqe_model sq; rdma_xtr_v1_rqe_model rq; rdma_xtr_v1_cqe_model cq;
+    rdma_xtr_v1_ceqe_model eq; rdma_xtr_v1_aeqe_model aq;
+    if ($cast(sq, model) && sq.qp_h != null) return sq.qp_h.generation;
+    if ($cast(rq, model) && rq.target_h != null) return rq.target_h.generation;
+    if ($cast(cq, model) && cq.qp_h != null) return cq.qp_h.generation;
+    if ($cast(eq, model) && eq.cq_h != null) return eq.cq_h.generation;
+    if ($cast(aq, model) && aq.target_h != null) return aq.target_h.generation;
+    return 0;
+  endfunction
   virtual function rdma_status validate_model(rdma_hw_model model); if (model==null) return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,"queue model is null"); return rdma_status::success(); endfunction
   virtual function rdma_status validate_image(rdma_hw_image image);
     rdma_xtr_v1_qword_builder b; byte unsigned p[]; rdma_status s;
@@ -111,7 +121,7 @@ virtual class rdma_xtr_v1_queue_codec_base extends rdma_codec_base;
   virtual function string describe_fields(); return $sformatf("xtr_v1 %0d-byte queue image",image_bytes()); endfunction
   virtual function rdma_status encode(rdma_hw_model model, output rdma_hw_image image);
     rdma_xtr_v1_qword_builder b; byte unsigned p[]; rdma_hw_image c; rdma_status s; image=null;
-    s=validate_model(model); if (!s.ok()) return s; b=new("queue_encode"); s=b.reset(image_bytes()); if (!s.ok()) return err(s.message); s=encode_fields(model,b); if (!s.ok()) return s; s=check_reserved(b); if (!s.ok()) return s; p=new[0]; s=b.serialize(p); if (!s.ok()) return err(s.message); c=rdma_hw_image::type_id::create("queue_image"); foreach(p[i]) c.bytes.push_back(p[i]); c.length=image_bytes(); c.alignment=image_bytes(); c.endian=RDMA_ENDIAN_BIG; c.image_kind=image_kind_expected(); c.hardware_version=XTR_V1_HW_VERSION; c.write_target_kind=RDMA_HW_TARGET_NONE; image=c; return rdma_status::success();
+    s=validate_model(model); if (!s.ok()) return s; b=new("queue_encode"); s=b.reset(image_bytes()); if (!s.ok()) return err(s.message); s=encode_fields(model,b); if (!s.ok()) return s; s=check_reserved(b); if (!s.ok()) return s; p=new[0]; s=b.serialize(p); if (!s.ok()) return err(s.message); c=rdma_hw_image::type_id::create("queue_image"); foreach(p[i]) c.bytes.push_back(p[i]); c.length=image_bytes(); c.alignment=image_bytes(); c.endian=RDMA_ENDIAN_BIG; c.image_kind=image_kind_expected(); c.hardware_version=XTR_V1_HW_VERSION; c.function_generation=model_handle_generation(model); c.write_target_kind=RDMA_HW_TARGET_NONE; image=c; return rdma_status::success();
   endfunction
   virtual function rdma_status decode(rdma_hw_image image, output rdma_hw_model model);
     rdma_xtr_v1_qword_builder b; byte unsigned p[]; rdma_status s; rdma_hw_model candidate; model=null;
@@ -132,10 +142,10 @@ class rdma_xtr_v1_sqe_codec_base extends rdma_xtr_v1_queue_codec_base;
   protected virtual function rdma_status encode_fields(rdma_hw_model model, rdma_xtr_v1_qword_builder b); rdma_xtr_v1_sqe_model x; rdma_status s; if(!$cast(x,model)) return err("SQE model type mismatch"); s=x.validate(); if(!s.ok()) return s;
     `define SQPUT(S,V) s=put(b,S``_WORD_BYTE_OFFSET,S``_LSB,S``_WIDTH,V); if(!s.ok()) return s;
     `SQPUT(XTR_V1_SQ_WQE_QPN,x.qpn) `SQPUT(XTR_V1_SQ_WQE_ICOS,x.icos) `SQPUT(XTR_V1_SQ_WQE_QP_SN,x.qp_sn) `SQPUT(XTR_V1_SQ_WQE_OPCODE,x.hw_opcode) `SQPUT(XTR_V1_SQ_WQE_DST_PORT,x.dst_port) `SQPUT(XTR_V1_SQ_WQE_INDEX,x.index) `SQPUT(XTR_V1_SQ_WQE_WRAP,x.wrap) `SQPUT(XTR_V1_SQ_WQE_SIGN_EN,x.sign_en) `SQPUT(XTR_V1_SQ_WQE_SE,x.se) `SQPUT(XTR_V1_SQ_WQE_FENCE,x.fence) `SQPUT(XTR_V1_SQ_WQE_CE,x.ce) `SQPUT(XTR_V1_SQ_WQE_VALID,x.valid) `SQPUT(XTR_V1_SQ_WQE_SIGNATURE,x.signature) `SQPUT(XTR_V1_SQ_WQE_RC_SGE_NUM,x.sge_num)
-    if (x.transport!=RDMA_TRANSPORT_RC) return err("XTR v1 only defines RC SQE extension fields");
+    if (x.transport!=RDMA_TRANSPORT_RC) return rdma_status::success();
     `SQPUT(XTR_V1_SQ_WQE_RC_REMOTE_KEY,x.rkey) `SQPUT(XTR_V1_SQ_WQE_RC_REMOTE_VA,x.remote_va.value) `undef SQPUT return rdma_status::success();
   endfunction
-  protected virtual function rdma_status decode_fields(rdma_xtr_v1_qword_builder b, output rdma_hw_model model); rdma_xtr_v1_sqe_model x; bit [63:0] v; rdma_status s; x=rdma_xtr_v1_sqe_model::type_id::create("decoded_sqe"); x.transport=RDMA_TRANSPORT_RC; x.qp_h=rdma_xtr_v1_queue_projected_handle("decoded_qp",RDMA_RESOURCE_QP,0); `define SQGET(S,T) v='0; s=get(b,S``_WORD_BYTE_OFFSET,S``_LSB,S``_WIDTH,v); if(!s.ok()) return s; T=v;
+  protected virtual function rdma_status decode_fields(rdma_xtr_v1_qword_builder b, output rdma_hw_model model); rdma_xtr_v1_sqe_model x; rdma_sqe_rc_ext ext; bit [63:0] v; rdma_status s; x=rdma_xtr_v1_sqe_model::type_id::create("decoded_sqe"); x.transport=RDMA_TRANSPORT_RC; x.opcode=RDMA_WR_SEND; x.inline_data=1; x.payload.push_back(0); x.qp_h=rdma_xtr_v1_queue_projected_handle("decoded_qp",RDMA_RESOURCE_QP,0); ext=rdma_sqe_rc_ext::type_id::create("decoded_rc_ext"); x.transport_ext=ext; `define SQGET(S,T) v='0; s=get(b,S``_WORD_BYTE_OFFSET,S``_LSB,S``_WIDTH,v); if(!s.ok()) return s; T=v;
     `SQGET(XTR_V1_SQ_WQE_QPN,x.qpn) `SQGET(XTR_V1_SQ_WQE_ICOS,x.icos) `SQGET(XTR_V1_SQ_WQE_QP_SN,x.qp_sn) `SQGET(XTR_V1_SQ_WQE_OPCODE,x.hw_opcode) `SQGET(XTR_V1_SQ_WQE_DST_PORT,x.dst_port) `SQGET(XTR_V1_SQ_WQE_INDEX,x.index) `SQGET(XTR_V1_SQ_WQE_WRAP,x.wrap) `SQGET(XTR_V1_SQ_WQE_SIGN_EN,x.sign_en) `SQGET(XTR_V1_SQ_WQE_SE,x.se) `SQGET(XTR_V1_SQ_WQE_FENCE,x.fence) `SQGET(XTR_V1_SQ_WQE_CE,x.ce) `SQGET(XTR_V1_SQ_WQE_VALID,x.valid) `SQGET(XTR_V1_SQ_WQE_SIGNATURE,x.signature) `SQGET(XTR_V1_SQ_WQE_RC_SGE_NUM,x.sge_num) `SQGET(XTR_V1_SQ_WQE_RC_REMOTE_KEY,x.rkey) `SQGET(XTR_V1_SQ_WQE_RC_REMOTE_VA,x.remote_va.value) `undef SQGET model=x; return rdma_status::success(); endfunction
 endclass
 class rdma_xtr_v1_sqe_rc_codec extends rdma_xtr_v1_sqe_codec_base; `uvm_object_utils(rdma_xtr_v1_sqe_rc_codec) function new(string name="rdma_xtr_v1_sqe_rc_codec"); super.new(name); endfunction endclass
