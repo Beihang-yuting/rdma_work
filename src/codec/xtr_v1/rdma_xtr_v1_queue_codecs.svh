@@ -130,7 +130,7 @@ class rdma_xtr_v1_sqe_codec_base extends rdma_xtr_v1_queue_codec_base;
   protected virtual function rdma_status encode_fields(rdma_hw_model model, rdma_xtr_v1_qword_builder b); rdma_xtr_v1_sqe_model x; rdma_status s; if(!$cast(x,model)) return err("SQE model type mismatch"); s=x.validate(); if(!s.ok()) return s;
     `define SQPUT(S,V) s=put(b,S``_WORD_BYTE_OFFSET,S``_LSB,S``_WIDTH,V); if(!s.ok()) return s;
     `SQPUT(XTR_V1_SQ_WQE_QPN,x.qpn) `SQPUT(XTR_V1_SQ_WQE_ICOS,x.icos) `SQPUT(XTR_V1_SQ_WQE_QP_SN,x.qp_sn) `SQPUT(XTR_V1_SQ_WQE_OPCODE,x.hw_opcode) `SQPUT(XTR_V1_SQ_WQE_DST_PORT,x.dst_port) `SQPUT(XTR_V1_SQ_WQE_INDEX,x.index) `SQPUT(XTR_V1_SQ_WQE_WRAP,x.wrap) `SQPUT(XTR_V1_SQ_WQE_SIGN_EN,x.sign_en) `SQPUT(XTR_V1_SQ_WQE_SE,x.se) `SQPUT(XTR_V1_SQ_WQE_FENCE,x.fence) `SQPUT(XTR_V1_SQ_WQE_CE,x.ce) `SQPUT(XTR_V1_SQ_WQE_VALID,x.valid) `SQPUT(XTR_V1_SQ_WQE_SIGNATURE,x.signature) `SQPUT(XTR_V1_SQ_WQE_RC_SGE_NUM,x.sge_num)
-    if (x.transport!=RDMA_TRANSPORT_RC) begin `undef SQPUT return err("XTR v1 only defines RC SQE extension fields"); end
+    if (x.transport!=RDMA_TRANSPORT_RC) return err("XTR v1 only defines RC SQE extension fields");
     `SQPUT(XTR_V1_SQ_WQE_RC_REMOTE_KEY,x.rkey) `SQPUT(XTR_V1_SQ_WQE_RC_REMOTE_VA,x.remote_va.value) `undef SQPUT return rdma_status::success();
   endfunction
   protected virtual function rdma_status decode_fields(rdma_xtr_v1_qword_builder b, output rdma_hw_model model); rdma_xtr_v1_sqe_model x; bit [63:0] v; rdma_status s; x=rdma_xtr_v1_sqe_model::type_id::create("decoded_sqe"); x.transport=RDMA_TRANSPORT_RC; x.qp_h=rdma_xtr_v1_queue_projected_handle("decoded_qp",RDMA_RESOURCE_QP,0); `define SQGET(S,T) v='0; s=get(b,S``_WORD_BYTE_OFFSET,S``_LSB,S``_WIDTH,v); if(!s.ok()) return s; T=v;
