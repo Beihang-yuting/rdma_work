@@ -10,6 +10,10 @@ virtual class rdma_context_backing_api extends uvm_object;
     output rdma_context_backing_ref context_ref
   );
 
+  // RDMA_RESOURCE_QP uses the same stable contract: acquire returns an opaque
+  // control-plane-owned 512-byte, 512-byte-aligned QPC slot authority.  The
+  // four method signatures intentionally remain shared with CQ/SRQ backing.
+
   pure virtual function rdma_status write(
     rdma_context_backing_ref context_ref,
     longint unsigned offset,

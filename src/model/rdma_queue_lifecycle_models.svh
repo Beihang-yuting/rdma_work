@@ -1,20 +1,27 @@
 typedef enum bit { RDMA_QUEUE_BACKING_OWNED, RDMA_QUEUE_BACKING_BORROWED }
   rdma_queue_backing_mode_e;
 
-typedef enum bit [3:0] {
-  RDMA_QUEUE_ROLE_CQ_RING = 4'd0,
-  RDMA_QUEUE_ROLE_SRQ_RING = 4'd1,
-  RDMA_QUEUE_ROLE_SRFQ_RING = 4'd2,
-  RDMA_QUEUE_ROLE_SRQ_SGB = 4'd3,
-  RDMA_QUEUE_ROLE_CEQ_RING = 4'd4,
-  RDMA_QUEUE_ROLE_AEQ_RING = 4'd5,
-  RDMA_QUEUE_ROLE_CQ_PD = 4'd6,
-  RDMA_QUEUE_ROLE_SRQ_PD = 4'd7,
-  RDMA_QUEUE_ROLE_SRFQ_PD = 4'd8,
-  RDMA_QUEUE_ROLE_CEQ_PD = 4'd9,
-  RDMA_QUEUE_ROLE_AEQ_PD = 4'd10,
-  RDMA_QUEUE_ROLE_CQC_CONTEXT_SHADOW = 4'd11,
-  RDMA_QUEUE_ROLE_SRFQC_CONTEXT_SHADOW = 4'd12
+typedef enum bit [4:0] {
+  RDMA_QUEUE_ROLE_CQ_RING = 5'd0,
+  RDMA_QUEUE_ROLE_SRQ_RING = 5'd1,
+  RDMA_QUEUE_ROLE_SRFQ_RING = 5'd2,
+  RDMA_QUEUE_ROLE_SRQ_SGB = 5'd3,
+  RDMA_QUEUE_ROLE_CEQ_RING = 5'd4,
+  RDMA_QUEUE_ROLE_AEQ_RING = 5'd5,
+  RDMA_QUEUE_ROLE_CQ_PD = 5'd6,
+  RDMA_QUEUE_ROLE_SRQ_PD = 5'd7,
+  RDMA_QUEUE_ROLE_SRFQ_PD = 5'd8,
+  RDMA_QUEUE_ROLE_CEQ_PD = 5'd9,
+  RDMA_QUEUE_ROLE_AEQ_PD = 5'd10,
+  RDMA_QUEUE_ROLE_CQC_CONTEXT_SHADOW = 5'd11,
+  RDMA_QUEUE_ROLE_SRFQC_CONTEXT_SHADOW = 5'd12,
+  RDMA_QUEUE_ROLE_QP_SQ_RING = 5'd13,
+  RDMA_QUEUE_ROLE_QP_RQ_RING = 5'd14,
+  RDMA_QUEUE_ROLE_QP_SQ_PD = 5'd15,
+  RDMA_QUEUE_ROLE_QP_RQ_PD = 5'd16,
+  RDMA_QUEUE_ROLE_QP_URC_RSQ = 5'd17,
+  RDMA_QUEUE_ROLE_QP_URC_RDSQ = 5'd18,
+  RDMA_QUEUE_ROLE_QP_URC_DSQ = 5'd19
 } rdma_queue_backing_role_e;
 
 typedef enum bit { RDMA_QUEUE_FLUSH_PRE_DELETE, RDMA_QUEUE_FLUSH_POST_DELETE }
@@ -45,6 +52,20 @@ function automatic bit rdma_queue_role_is_pd(rdma_queue_backing_role_e role);
                       RDMA_QUEUE_ROLE_SRFQ_PD, RDMA_QUEUE_ROLE_CEQ_PD,
                       RDMA_QUEUE_ROLE_AEQ_PD};
 endfunction
+// Deliberately distinct from the legacy queue predicates above.  QP backing
+// must never become valid input to a legacy queue plan just by widening the
+// role enum.
+function automatic bit rdma_qp_role_is_payload(rdma_queue_backing_role_e role);
+  return role inside {RDMA_QUEUE_ROLE_QP_SQ_RING,
+                      RDMA_QUEUE_ROLE_QP_RQ_RING,
+                      RDMA_QUEUE_ROLE_QP_URC_RSQ,
+                      RDMA_QUEUE_ROLE_QP_URC_RDSQ,
+                      RDMA_QUEUE_ROLE_QP_URC_DSQ};
+endfunction
+function automatic bit rdma_qp_role_is_pd(rdma_queue_backing_role_e role);
+  return role inside {RDMA_QUEUE_ROLE_QP_SQ_PD,
+                      RDMA_QUEUE_ROLE_QP_RQ_PD};
+endfunction
 function automatic bit rdma_queue_add_ok(longint unsigned offset,
                                           longint unsigned length);
   return length != 0 && offset <= (64'hffff_ffff_ffff_ffff - length);
@@ -52,6 +73,9 @@ endfunction
 function automatic bit rdma_queue_aligned(longint unsigned value,
                                            longint unsigned alignment);
   return (value % alignment) == 0;
+endfunction
+function automatic bit rdma_qp_power_of_two(int unsigned value);
+  return value != 0 && (value & (value - 1'b1)) == 0;
 endfunction
 function automatic rdma_status rdma_queue_queue_range_status(
     rdma_dma_mapping mapping, longint unsigned offset, longint unsigned length,
@@ -175,7 +199,7 @@ class rdma_queue_backing_slice extends uvm_object;
   endfunction
 
   virtual function rdma_status validate();
-    if (!rdma_queue_role_is_payload(role))
+    if (!rdma_queue_role_is_payload(role) && !rdma_qp_role_is_payload(role))
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "slice role is not payload");
     if (!rdma_queue_aligned(logical_queue_offset,
                             role == RDMA_QUEUE_ROLE_SRQ_SGB ? 512 : 4096))
@@ -454,7 +478,7 @@ class rdma_queue_backing_segment extends uvm_object;
   virtual function rdma_status validate();
     longint unsigned alignment;
 
-    if (!rdma_queue_role_is_payload(role))
+    if (!rdma_queue_role_is_payload(role) && !rdma_qp_role_is_payload(role))
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "backing segment role is not payload");
     if (!(ownership inside {RDMA_OWNERSHIP_BORROWED,
@@ -667,7 +691,8 @@ class rdma_context_backing_ref extends uvm_object;
 
     if (owner == null || owner.kind != RDMA_RESOURCE_FUNCTION)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "context owner invalid");
-    if (!(resource_kind inside {RDMA_RESOURCE_CQ, RDMA_RESOURCE_SRQ}))
+    if (!(resource_kind inside {RDMA_RESOURCE_CQ, RDMA_RESOURCE_SRQ,
+                                RDMA_RESOURCE_QP}))
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "context resource invalid");
     if (slot_token == null || hmc_ref == null)
@@ -687,7 +712,13 @@ class rdma_context_backing_ref extends uvm_object;
         shadow_view_offset > slot_length - shadow_view_length)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "context view out of bounds");
-    if (!rdma_queue_aligned(shadow_pointer_base.value, 4096))
+    if (resource_kind == RDMA_RESOURCE_QP &&
+        (slot_length != 512 || shadow_view_offset != 0 ||
+         shadow_view_length != 512 || hmc_ref.size != 512))
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "QP context geometry must be 512 bytes");
+    if (!rdma_queue_aligned(shadow_pointer_base.value,
+                            resource_kind == RDMA_RESOURCE_QP ? 512 : 4096))
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "shadow pointer unaligned");
     return rdma_status::success();
@@ -886,6 +917,349 @@ class rdma_queue_backing_plan extends uvm_object;
       if (!s.ok())
         return s;
     end
+    return rdma_status::success();
+  endfunction
+endclass
+
+class rdma_qp_ring_layout extends uvm_object;
+  `uvm_object_utils(rdma_qp_ring_layout)
+  rdma_queue_backing_role_e role;
+  int unsigned entry_size_bytes;
+  int unsigned depth;
+  longint unsigned logical_bytes;
+  longint unsigned storage_bytes;
+  rdma_object_mode_e object_mode;
+
+  function new(string name = "rdma_qp_ring_layout");
+    super.new(name);
+    role = RDMA_QUEUE_ROLE_QP_SQ_RING;
+    entry_size_bytes = 64;
+    depth = 0;
+    logical_bytes = 0;
+    storage_bytes = 0;
+    object_mode = RDMA_OBJECT_INDIRECT_4K;
+  endfunction
+
+  virtual function void do_copy(uvm_object rhs);
+    rdma_qp_ring_layout r;
+    super.do_copy(rhs);
+    if (!$cast(r, rhs)) `uvm_fatal("RDMA_COPY_TYPE", "QP ring copy mismatch")
+    role = r.role;
+    entry_size_bytes = r.entry_size_bytes;
+    depth = r.depth;
+    logical_bytes = r.logical_bytes;
+    storage_bytes = r.storage_bytes;
+    object_mode = r.object_mode;
+  endfunction
+
+  virtual function rdma_status validate();
+    longint unsigned expected_logical;
+    longint unsigned expected_storage;
+
+    if (!(role inside {RDMA_QUEUE_ROLE_QP_SQ_RING,
+                       RDMA_QUEUE_ROLE_QP_RQ_RING}) ||
+        entry_size_bytes != 64 || !rdma_qp_power_of_two(depth))
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "QP ring role or WQE geometry is invalid");
+    expected_logical = longint'(depth) * 64;
+    if (logical_bytes != expected_logical ||
+        expected_logical > 64'hffff_ffff_ffff_efff)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "QP ring logical bytes are invalid");
+    expected_storage = ((expected_logical + 4095) / 4096) * 4096;
+    if (storage_bytes != expected_storage || storage_bytes > 2 * 1024 * 1024)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "QP ring storage geometry is invalid");
+    if (object_mode != RDMA_OBJECT_INDIRECT_4K)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "QP ring mode must be indirect 4 KiB");
+    return rdma_status::success();
+  endfunction
+endclass
+
+class rdma_qp_backing_ref extends uvm_object;
+  `uvm_object_utils(rdma_qp_backing_ref)
+  rdma_queue_backing_role_e role;
+  rdma_dma_mapping mapping;
+  rdma_resource_ownership_e ownership;
+  longint unsigned mapping_offset;
+  longint unsigned length;
+  rdma_queue_backing_segment additional_segments[$];
+  bit cleanup_complete;
+  // Set only for a pre-program recovery capability retained after an
+  // allocation/authority failure.  Such a reference is intentionally not a
+  // valid QP ring input; its geometry is inspected by recovery validation
+  // only after the opaque adapter completion authority is checked.
+  bit recovery_only;
+
+  function new(string name = "rdma_qp_backing_ref");
+    super.new(name);
+    role = RDMA_QUEUE_ROLE_QP_SQ_RING;
+    mapping = null;
+    ownership = RDMA_OWNERSHIP_BORROWED;
+    mapping_offset = 0;
+    length = 0;
+    cleanup_complete = 0;
+    recovery_only = 1'b0;
+  endfunction
+
+  virtual function void do_copy(uvm_object rhs);
+    rdma_qp_backing_ref r;
+    uvm_object c;
+
+    super.do_copy(rhs);
+    if (!$cast(r, rhs)) `uvm_fatal("RDMA_COPY_TYPE", "QP backing copy mismatch")
+    role = r.role;
+    ownership = r.ownership;
+    mapping_offset = r.mapping_offset;
+    length = r.length;
+    cleanup_complete = r.cleanup_complete;
+    recovery_only = r.recovery_only;
+    if (r.mapping == null) mapping = null;
+    else begin
+      c = r.mapping.clone();
+      if (c == null || !$cast(mapping, c) || mapping == r.mapping)
+        `uvm_fatal("RDMA_COPY_TYPE", "QP backing mapping clone failure")
+    end
+    additional_segments.delete();
+    foreach (r.additional_segments[i]) begin
+      rdma_queue_backing_segment segment;
+      c = r.additional_segments[i].clone();
+      if (c == null || !$cast(segment, c) || segment == r.additional_segments[i])
+        `uvm_fatal("RDMA_COPY_TYPE", "QP additional backing segment clone failure")
+      additional_segments.push_back(segment);
+    end
+  endfunction
+
+  virtual function rdma_status validate();
+    rdma_status status;
+
+    if (recovery_only)
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "recovery-only QP backing is not valid normal-plan geometry"
+      );
+
+    if (!rdma_qp_role_is_payload(role) && !rdma_qp_role_is_pd(role))
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "QP backing role invalid");
+    if (!(ownership inside {RDMA_OWNERSHIP_BORROWED,
+                            RDMA_OWNERSHIP_CONTROL_PLANE}))
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "QP ownership invalid");
+    if ((rdma_qp_role_is_pd(role) ||
+         role inside {RDMA_QUEUE_ROLE_QP_URC_RSQ,
+                      RDMA_QUEUE_ROLE_QP_URC_RDSQ,
+                      RDMA_QUEUE_ROLE_QP_URC_DSQ}) &&
+        ownership != RDMA_OWNERSHIP_CONTROL_PLANE)
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "QP internal backing must be control-plane owned");
+    if (cleanup_complete && ownership == RDMA_OWNERSHIP_BORROWED)
+      return rdma_status::make(RDMA_SC_INVALID_STATE, "borrowed QP backing cleaned");
+    status = rdma_queue_queue_range_status(mapping, mapping_offset, length, 4096);
+    if (!status.ok()) return status;
+    if (rdma_qp_role_is_pd(role) && additional_segments.size() != 0)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "QP PD backing cannot have segments");
+    begin
+      longint unsigned next_logical_offset;
+      next_logical_offset = length;
+      foreach (additional_segments[i]) begin
+        if (additional_segments[i] == null ||
+            additional_segments[i].role != role ||
+            additional_segments[i].ownership != ownership ||
+            additional_segments[i].logical_queue_offset != next_logical_offset)
+          return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                                   "QP backing segments are not contiguous");
+        status = additional_segments[i].validate();
+        if (!status.ok()) return status;
+        next_logical_offset += additional_segments[i].length;
+      end
+    end
+    if ((role inside {RDMA_QUEUE_ROLE_QP_URC_RSQ,
+                      RDMA_QUEUE_ROLE_QP_URC_RDSQ}) && length != 4096 ||
+        role == RDMA_QUEUE_ROLE_QP_URC_DSQ && length != 8192)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "URC internal backing geometry is invalid");
+    return rdma_status::success();
+  endfunction
+endclass
+
+function automatic rdma_status rdma_qp_backing_total_length(
+  rdma_qp_backing_ref backing_ref,
+  output longint unsigned total_length
+);
+  total_length = 0;
+  if (backing_ref == null)
+    return rdma_status::make(RDMA_SC_INVALID_STATE,
+                             "QP backing reference is null");
+  total_length = backing_ref.length;
+  foreach (backing_ref.additional_segments[i]) begin
+    if (backing_ref.additional_segments[i] == null ||
+        backing_ref.additional_segments[i].logical_queue_offset != total_length)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "QP backing coverage is not contiguous");
+    if (backing_ref.additional_segments[i].length >
+        64'hffff_ffff_ffff_ffff - total_length)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "QP backing coverage overflows");
+    total_length += backing_ref.additional_segments[i].length;
+  end
+  return rdma_status::success();
+endfunction
+
+class rdma_qp_backing_plan extends uvm_object;
+  `uvm_object_utils(rdma_qp_backing_plan)
+  rdma_transport_e transport;
+  int unsigned sq_depth;
+  int unsigned rq_depth;
+  rdma_qp_ring_layout sq_ring;
+  rdma_qp_ring_layout rq_ring;
+  rdma_qp_backing_ref sq_ref;
+  rdma_qp_backing_ref rq_ref;
+  rdma_qp_backing_ref sq_pd_ref;
+  rdma_qp_backing_ref rq_pd_ref;
+  rdma_handle rq_source_h;
+  rdma_qp_backing_ref urc_refs[$];
+  rdma_context_backing_ref context_ref;
+  bit sq_pd_flush_complete;
+  bit rq_pd_flush_complete;
+  bit cleanup_complete;
+
+  function new(string name = "rdma_qp_backing_plan");
+    super.new(name);
+    transport = RDMA_TRANSPORT_RC;
+    sq_depth = 0;
+    rq_depth = 0;
+    sq_ring = null;
+    rq_ring = null;
+    sq_ref = null;
+    rq_ref = null;
+    sq_pd_ref = null;
+    rq_pd_ref = null;
+    rq_source_h = null;
+    context_ref = null;
+    sq_pd_flush_complete = 0;
+    rq_pd_flush_complete = 0;
+    cleanup_complete = 0;
+  endfunction
+
+  virtual function void do_copy(uvm_object rhs);
+    rdma_qp_backing_plan r;
+    uvm_object c;
+    rdma_qp_backing_ref cloned_ref;
+
+    super.do_copy(rhs);
+    if (!$cast(r, rhs)) `uvm_fatal("RDMA_COPY_TYPE", "QP plan copy mismatch")
+    transport = r.transport;
+    sq_depth = r.sq_depth;
+    rq_depth = r.rq_depth;
+    sq_pd_flush_complete = r.sq_pd_flush_complete;
+    rq_pd_flush_complete = r.rq_pd_flush_complete;
+    cleanup_complete = r.cleanup_complete;
+    sq_ring = null; rq_ring = null; sq_ref = null; rq_ref = null;
+    sq_pd_ref = null; rq_pd_ref = null; context_ref = null;
+    if (r.sq_ring != null) begin c = r.sq_ring.clone(); if (!$cast(sq_ring, c)) `uvm_fatal("RDMA_COPY_TYPE", "QP SQ ring clone failure") end
+    if (r.rq_ring != null) begin c = r.rq_ring.clone(); if (!$cast(rq_ring, c)) `uvm_fatal("RDMA_COPY_TYPE", "QP RQ ring clone failure") end
+    if (r.sq_ref != null) begin c = r.sq_ref.clone(); if (!$cast(sq_ref, c)) `uvm_fatal("RDMA_COPY_TYPE", "QP SQ ref clone failure") end
+    if (r.rq_ref != null) begin c = r.rq_ref.clone(); if (!$cast(rq_ref, c)) `uvm_fatal("RDMA_COPY_TYPE", "QP RQ ref clone failure") end
+    if (r.sq_pd_ref != null) begin c = r.sq_pd_ref.clone(); if (!$cast(sq_pd_ref, c)) `uvm_fatal("RDMA_COPY_TYPE", "QP SQ PD clone failure") end
+    if (r.rq_pd_ref != null) begin c = r.rq_pd_ref.clone(); if (!$cast(rq_pd_ref, c)) `uvm_fatal("RDMA_COPY_TYPE", "QP RQ PD clone failure") end
+    if (r.rq_source_h == null) rq_source_h = null;
+    else begin
+      c = r.rq_source_h.clone();
+      if (c == null || !$cast(rq_source_h, c) || rq_source_h == r.rq_source_h)
+        `uvm_fatal("RDMA_COPY_TYPE", "QP RQ source clone failure")
+    end
+    urc_refs.delete();
+    foreach (r.urc_refs[i]) begin
+      if (r.urc_refs[i] == null) urc_refs.push_back(null);
+      else begin
+        c = r.urc_refs[i].clone();
+        if (c == null || !$cast(cloned_ref, c) || cloned_ref == r.urc_refs[i])
+          `uvm_fatal("RDMA_COPY_TYPE", "URC ref clone failure")
+        urc_refs.push_back(cloned_ref);
+      end
+    end
+    if (r.context_ref != null) begin c = r.context_ref.clone(); if (!$cast(context_ref, c)) `uvm_fatal("RDMA_COPY_TYPE", "QP context clone failure") end
+  endfunction
+
+  virtual function rdma_status validate();
+    rdma_status status;
+    bit seen_urc[3];
+    longint unsigned total_length;
+
+    foreach (seen_urc[i]) seen_urc[i] = 0;
+    if (!(transport inside {RDMA_TRANSPORT_RC, RDMA_TRANSPORT_UD,
+                            RDMA_TRANSPORT_URC}) ||
+        !rdma_qp_power_of_two(sq_depth) || !rdma_qp_power_of_two(rq_depth))
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "QP plan transport/depth invalid");
+    if (sq_ring == null || sq_ref == null || sq_pd_ref == null)
+      return rdma_status::make(RDMA_SC_INVALID_STATE, "QP SQ authority missing");
+    status = sq_ring.validate(); if (!status.ok()) return status;
+    if (sq_ring.role != RDMA_QUEUE_ROLE_QP_SQ_RING || sq_ring.depth != sq_depth)
+      return rdma_status::make(RDMA_SC_INVALID_STATE, "QP SQ ring does not match plan");
+    status = sq_ref.validate(); if (!status.ok()) return status;
+    status = sq_pd_ref.validate(); if (!status.ok()) return status;
+    if (sq_ref.recovery_only || sq_pd_ref.recovery_only)
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "recovery-only QP backing cannot enter a normal plan"
+      );
+    status = rdma_qp_backing_total_length(sq_ref, total_length);
+    if (!status.ok()) return status;
+    if (sq_ref.role != RDMA_QUEUE_ROLE_QP_SQ_RING ||
+        total_length != sq_ring.storage_bytes ||
+        sq_pd_ref.role != RDMA_QUEUE_ROLE_QP_SQ_PD ||
+        sq_pd_ref.length != 4096)
+      return rdma_status::make(RDMA_SC_INVALID_STATE, "QP SQ references do not match ring");
+    if (rq_source_h == null) begin
+      if (rq_ring == null || rq_ref == null || rq_pd_ref == null)
+        return rdma_status::make(RDMA_SC_INVALID_STATE, "QP private RQ authority missing");
+      status = rq_ring.validate(); if (!status.ok()) return status;
+      status = rq_ref.validate(); if (!status.ok()) return status;
+      status = rq_pd_ref.validate(); if (!status.ok()) return status;
+      if (rq_ref.recovery_only || rq_pd_ref.recovery_only)
+        return rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "recovery-only QP backing cannot enter a normal plan"
+        );
+      status = rdma_qp_backing_total_length(rq_ref, total_length);
+      if (!status.ok()) return status;
+      if (rq_ring.role != RDMA_QUEUE_ROLE_QP_RQ_RING || rq_ring.depth != rq_depth ||
+          rq_ref.role != RDMA_QUEUE_ROLE_QP_RQ_RING ||
+          total_length != rq_ring.storage_bytes ||
+          rq_pd_ref.role != RDMA_QUEUE_ROLE_QP_RQ_PD ||
+          rq_pd_ref.length != 4096)
+        return rdma_status::make(RDMA_SC_INVALID_STATE, "QP private RQ references invalid");
+    end
+    else if (transport != RDMA_TRANSPORT_RC || rq_source_h.kind != RDMA_RESOURCE_SRQ ||
+             rq_ring != null || rq_ref != null || rq_pd_ref != null)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "QP SRQ RQ authority invalid");
+    if (context_ref == null)
+      return rdma_status::make(RDMA_SC_INVALID_STATE, "QP context authority missing");
+    status = context_ref.validate(); if (!status.ok()) return status;
+    if (context_ref.resource_kind != RDMA_RESOURCE_QP ||
+        context_ref.hmc_ref.ownership != RDMA_OWNERSHIP_CONTROL_PLANE)
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "QP context authority is invalid");
+    foreach (urc_refs[i]) begin
+      if (urc_refs[i] == null) return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "null URC ref");
+      if (urc_refs[i].recovery_only)
+        return rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "recovery-only QP backing cannot enter a normal plan"
+        );
+      status = urc_refs[i].validate(); if (!status.ok()) return status;
+      case (urc_refs[i].role)
+        RDMA_QUEUE_ROLE_QP_URC_RSQ: seen_urc[0] = 1;
+        RDMA_QUEUE_ROLE_QP_URC_RDSQ: seen_urc[1] = 1;
+        RDMA_QUEUE_ROLE_QP_URC_DSQ: seen_urc[2] = 1;
+        default: return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "invalid URC role");
+      endcase
+    end
+    if ((transport == RDMA_TRANSPORT_URC &&
+         (urc_refs.size() != 3 || !seen_urc[0] || !seen_urc[1] || !seen_urc[2])) ||
+        (transport != RDMA_TRANSPORT_URC && urc_refs.size() != 0))
+      return rdma_status::make(RDMA_SC_INVALID_STATE, "QP URC backing roles invalid");
     return rdma_status::success();
   endfunction
 endclass

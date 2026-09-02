@@ -27,6 +27,74 @@ class rdma_resource_manager_probe extends rdma_resource_manager;
   endfunction
 endclass
 
+// Generic QP mutation bypass tests need exact staged and ACTIVE registry
+// preconditions without relying on another public transition under test.
+class rdma_qp_generic_bypass_probe_manager extends rdma_resource_manager;
+  function new(string name = "rdma_qp_generic_bypass_probe_manager");
+    super.new(name);
+  endfunction
+
+  function rdma_status force_qp_staged_precondition(rdma_qp candidate);
+    rdma_resource projected;
+    rdma_qp replacement;
+    rdma_status status;
+    string key;
+
+    status = project_public_resource_value(
+      candidate, "force QP staged precondition", projected
+    );
+    if (!status.ok() || !$cast(replacement, projected))
+      return status.ok() ? rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT, "staged precondition is not a QP"
+      ) : status;
+    key = resource_key(replacement.handle);
+    if (!registry.exists(key))
+      return rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT, "staged precondition QP is unknown"
+      );
+    replacement.state = RDMA_RESOURCE_ALLOCATED;
+    status = replacement.validate();
+    if (status == null || !status.ok())
+      return status == null ? rdma_status::make(
+        RDMA_SC_INVALID_STATE, "staged precondition validation returned null"
+      ) : status;
+    registry[key] = replacement;
+    staged_allocations[key] = 1'b1;
+    return rdma_status::success();
+  endfunction
+
+  function rdma_status force_qp_active_precondition(rdma_qp candidate);
+    rdma_resource projected;
+    rdma_qp replacement;
+    rdma_status status;
+    string key;
+
+    status = project_public_resource_value(
+      candidate, "force QP ACTIVE precondition", projected
+    );
+    if (!status.ok() || !$cast(replacement, projected))
+      return status.ok() ? rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT, "ACTIVE precondition is not a QP"
+      ) : status;
+    key = resource_key(replacement.handle);
+    if (!registry.exists(key))
+      return rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT, "ACTIVE precondition QP is unknown"
+      );
+    replacement.state = RDMA_RESOURCE_ACTIVE;
+    status = replacement.validate();
+    if (status == null || !status.ok())
+      return status == null ? rdma_status::make(
+        RDMA_SC_INVALID_STATE, "ACTIVE precondition validation returned null"
+      ) : status;
+    registry[key] = replacement;
+    staged_allocations.delete(key);
+    recovery_records.delete(key);
+    return rdma_status::success();
+  endfunction
+
+endclass
+
 // Boundary injection is intentionally isolated from the behavior tests.  It
 // models corrupted allocator state without exposing registry mutation hooks.
 class rdma_width_probe_manager extends rdma_resource_manager;
@@ -153,6 +221,184 @@ class rdma_rm_independent_release_mapping extends rdma_dma_mapping;
     allocation_token = rhs_mapping.allocation_token;
     allocation_token_initialized = rhs_mapping.allocation_token_initialized;
     release_complete = rhs_mapping.release_complete;
+  endfunction
+endclass
+
+class rdma_qp_lifecycle_probe_manager
+  extends rdma_qp_generic_bypass_probe_manager;
+  function new(string name = "rdma_qp_lifecycle_probe_manager");
+    super.new(name);
+  endfunction
+
+  function rdma_status complete_qp_mapping_release(
+    rdma_handle qp_h,
+    rdma_queue_backing_role_e role
+  );
+    rdma_qp resource_qp;
+    rdma_qp_backing_ref resource_ref;
+    rdma_qp_backing_ref recovery_ref;
+    rdma_rm_independent_release_mapping resource_mapping;
+    rdma_rm_independent_release_mapping recovery_mapping;
+    string key;
+
+    key = resource_key(qp_h);
+    if (!registry.exists(key) || !$cast(resource_qp, registry[key]))
+      return rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT, "QP mapping completion target is unknown"
+      );
+    resource_ref = qp_plan_ref(resource_qp.qp_plan, role);
+    if (resource_ref == null ||
+        !$cast(resource_mapping, resource_ref.mapping))
+      return rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT, "QP mapping completion role is unsupported"
+      );
+    resource_mapping.set_release_complete(1'b1);
+    if (recovery_records.exists(key)) begin
+      recovery_ref = qp_plan_ref(
+        recovery_records[key].qp_recovery.qp_plan, role
+      );
+      if (recovery_ref == null ||
+          !$cast(recovery_mapping, recovery_ref.mapping))
+        return rdma_status::make(
+          RDMA_SC_INVALID_ARGUMENT,
+          "QP recovery mapping completion role is unsupported"
+        );
+      recovery_mapping.set_release_complete(1'b1);
+    end
+    return rdma_status::success();
+  endfunction
+
+  function rdma_status set_qp_recovery_hardware_presence(
+    rdma_handle qp_h,
+    rdma_hw_presence_e hardware_presence
+  );
+    string key;
+
+    key = resource_key(qp_h);
+    if (!recovery_records.exists(key) || recovery_records[key] == null)
+      return rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT,
+        "QP recovery hardware-presence target is invalid"
+      );
+    recovery_records[key].hardware_presence = hardware_presence;
+    return rdma_status::success();
+  endfunction
+
+  function rdma_status complete_qp_context_release(rdma_handle qp_h);
+    rdma_qp resource_qp;
+    rdma_queue_slot_token_contract token;
+    string key;
+
+    key = resource_key(qp_h);
+    if (!registry.exists(key) || !$cast(resource_qp, registry[key]) ||
+        resource_qp.qp_plan == null ||
+        resource_qp.qp_plan.context_ref == null ||
+        !$cast(token, resource_qp.qp_plan.context_ref.slot_token) ||
+        token.completion_authority == null)
+      return rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT, "QP context completion target is invalid"
+      );
+    token.completion_authority.complete = 1'b1;
+    return rdma_status::success();
+  endfunction
+
+  function rdma_status complete_qp_temporary_mapping_release(
+    rdma_handle qp_h,
+    bit staging_mapping
+  );
+    rdma_dma_mapping temporary_mapping;
+    rdma_rm_independent_release_mapping completion_mapping;
+    string key;
+
+    key = resource_key(qp_h);
+    if (!recovery_records.exists(key) ||
+        recovery_records[key] == null ||
+        !recovery_records[key].qp_recovery_valid ||
+        recovery_records[key].qp_recovery == null)
+      return rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT,
+        "QP temporary mapping completion target is invalid"
+      );
+    temporary_mapping = staging_mapping ?
+      recovery_records[key].qp_recovery.staging_mapping :
+      recovery_records[key].qp_recovery.query_mapping;
+    if (!$cast(completion_mapping, temporary_mapping))
+      return rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT,
+        "QP temporary mapping completion authority is unsupported"
+      );
+    completion_mapping.set_release_complete(1'b1);
+    return rdma_status::success();
+  endfunction
+
+  function rdma_status replace_qp_recovery_context_authority(
+    rdma_handle qp_h
+  );
+    rdma_queue_slot_token_contract context_token;
+    rdma_queue_slot_token_contract plan_token;
+    rdma_queue_completion_authority replacement_authority;
+    string key;
+
+    key = resource_key(qp_h);
+    if (!recovery_records.exists(key) ||
+        recovery_records[key] == null ||
+        recovery_records[key].qp_recovery == null ||
+        recovery_records[key].qp_recovery.context_ref == null ||
+        recovery_records[key].qp_recovery.qp_plan == null ||
+        recovery_records[key].qp_recovery.qp_plan.context_ref == null ||
+        !$cast(context_token, recovery_records[key].qp_recovery.
+          context_ref.slot_token) ||
+        !$cast(plan_token, recovery_records[key].qp_recovery.qp_plan.
+          context_ref.slot_token))
+      return rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT,
+        "QP recovery context authority replacement target is invalid"
+      );
+    replacement_authority =
+      rdma_queue_completion_authority::type_id::create(
+        "qp_recovery_replacement_authority"
+      );
+    replacement_authority.complete = 1'b1;
+    context_token.completion_authority = replacement_authority;
+    plan_token.completion_authority = replacement_authority;
+    return rdma_status::success();
+  endfunction
+
+  function rdma_status restore_qp_recovery_context_authority(
+    rdma_handle qp_h
+  );
+    rdma_qp resource_qp;
+    rdma_queue_slot_token_contract resource_token;
+    rdma_queue_slot_token_contract context_token;
+    rdma_queue_slot_token_contract plan_token;
+    string key;
+
+    key = resource_key(qp_h);
+    if (!registry.exists(key) || !$cast(resource_qp, registry[key]) ||
+        resource_qp.qp_plan == null ||
+        resource_qp.qp_plan.context_ref == null ||
+        !recovery_records.exists(key) ||
+        recovery_records[key] == null ||
+        recovery_records[key].qp_recovery == null ||
+        recovery_records[key].qp_recovery.context_ref == null ||
+        recovery_records[key].qp_recovery.qp_plan == null ||
+        recovery_records[key].qp_recovery.qp_plan.context_ref == null ||
+        !$cast(resource_token,
+               resource_qp.qp_plan.context_ref.slot_token) ||
+        !$cast(context_token, recovery_records[key].qp_recovery.
+          context_ref.slot_token) ||
+        !$cast(plan_token, recovery_records[key].qp_recovery.qp_plan.
+          context_ref.slot_token) ||
+        resource_token.completion_authority == null)
+      return rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT,
+        "QP recovery context authority restore target is invalid"
+      );
+    context_token.completion_authority =
+      resource_token.completion_authority;
+    plan_token.completion_authority =
+      resource_token.completion_authority;
+    return rdma_status::success();
   endfunction
 endclass
 
@@ -2250,6 +2496,356 @@ class rdma_resource_manager_test extends uvm_test;
     return plan;
   endfunction
 
+  function automatic rdma_handle make_qp_projected_handle(
+    string name,
+    rdma_resource_kind_e kind,
+    rdma_function_handle owner,
+    int unsigned local_id
+  );
+    rdma_handle handle;
+
+    handle = rdma_handle::type_id::create(name);
+    handle.kind = kind;
+    handle.function_uid = owner.function_uid;
+    handle.object_id = local_id;
+    handle.generation = owner.generation;
+    return handle;
+  endfunction
+
+  function automatic rdma_qp_ring_layout make_qp_test_ring(
+    string name,
+    rdma_queue_backing_role_e role,
+    int unsigned depth
+  );
+    rdma_qp_ring_layout ring;
+
+    ring = rdma_qp_ring_layout::type_id::create(name);
+    ring.role = role;
+    ring.entry_size_bytes = 64;
+    ring.depth = depth;
+    ring.logical_bytes = longint'(depth) * 64;
+    ring.storage_bytes = ((ring.logical_bytes + 4095) / 4096) * 4096;
+    ring.object_mode = RDMA_OBJECT_INDIRECT_4K;
+    return ring;
+  endfunction
+
+  function automatic rdma_qp_backing_ref make_qp_test_ref(
+    string name,
+    rdma_queue_backing_role_e role,
+    rdma_dma_mapping mapping,
+    longint unsigned length,
+    rdma_resource_ownership_e ownership
+  );
+    rdma_qp_backing_ref ref_value;
+
+    ref_value = rdma_qp_backing_ref::type_id::create(name);
+    ref_value.role = role;
+    ref_value.mapping = mapping;
+    ref_value.length = length;
+    ref_value.ownership = ownership;
+    return ref_value;
+  endfunction
+
+  function automatic rdma_qp_backing_plan make_qp_test_plan(
+    string name,
+    rdma_qp qp,
+    int unsigned depth
+  );
+    rdma_qp_backing_plan plan;
+    rdma_dma_mapping sq_mapping;
+    rdma_dma_mapping rq_mapping;
+    rdma_dma_mapping sq_pd_mapping;
+    rdma_dma_mapping rq_pd_mapping;
+    rdma_context_backing_ref context_ref;
+    rdma_queue_opaque_slot_token token;
+    rdma_queue_completion_authority completion_authority;
+
+    plan = rdma_qp_backing_plan::type_id::create(name);
+    plan.transport = RDMA_TRANSPORT_RC;
+    plan.sq_depth = depth;
+    plan.rq_depth = depth;
+    plan.sq_ring = make_qp_test_ring(
+      {name, "_sq_ring"}, RDMA_QUEUE_ROLE_QP_SQ_RING, depth
+    );
+    plan.rq_ring = make_qp_test_ring(
+      {name, "_rq_ring"}, RDMA_QUEUE_ROLE_QP_RQ_RING, depth
+    );
+    sq_mapping = make_queue_test_mapping(
+      {name, "_sq_mapping"}, qp.owner, qp.handle,
+      64'h0000_8100_0000_0000 + longint'(qp.local_qp_id) * 64'h20_0000,
+      1'b0
+    );
+    rq_mapping = make_queue_test_mapping(
+      {name, "_rq_mapping"}, qp.owner, qp.handle,
+      64'h0000_8200_0000_0000 + longint'(qp.local_qp_id) * 64'h20_0000,
+      1'b0
+    );
+    sq_pd_mapping = make_independent_queue_test_mapping(
+      {name, "_sq_pd_mapping"}, qp.owner, qp.handle,
+      64'h0000_8300_0000_0000 + longint'(qp.local_qp_id) * 64'h1000
+    );
+    rq_pd_mapping = make_independent_queue_test_mapping(
+      {name, "_rq_pd_mapping"}, qp.owner, qp.handle,
+      64'h0000_8400_0000_0000 + longint'(qp.local_qp_id) * 64'h1000
+    );
+    plan.sq_ref = make_qp_test_ref(
+      {name, "_sq_ref"}, RDMA_QUEUE_ROLE_QP_SQ_RING, sq_mapping,
+      plan.sq_ring.storage_bytes, RDMA_OWNERSHIP_BORROWED
+    );
+    plan.rq_ref = make_qp_test_ref(
+      {name, "_rq_ref"}, RDMA_QUEUE_ROLE_QP_RQ_RING, rq_mapping,
+      plan.rq_ring.storage_bytes, RDMA_OWNERSHIP_BORROWED
+    );
+    plan.sq_pd_ref = make_qp_test_ref(
+      {name, "_sq_pd_ref"}, RDMA_QUEUE_ROLE_QP_SQ_PD, sq_pd_mapping,
+      4096, RDMA_OWNERSHIP_CONTROL_PLANE
+    );
+    plan.rq_pd_ref = make_qp_test_ref(
+      {name, "_rq_pd_ref"}, RDMA_QUEUE_ROLE_QP_RQ_PD, rq_pd_mapping,
+      4096, RDMA_OWNERSHIP_CONTROL_PLANE
+    );
+
+    context_ref = rdma_context_backing_ref::type_id::create(
+      {name, "_context"}
+    );
+    context_ref.owner = clone_function_handle({name, "_context_owner"},
+                                              qp.owner);
+    context_ref.resource_kind = RDMA_RESOURCE_QP;
+    context_ref.local_id = qp.local_qp_id;
+    token = rdma_queue_opaque_slot_token::type_id::create({name, "_token"});
+    completion_authority = rdma_queue_completion_authority::type_id::create(
+      {name, "_completion_authority"}
+    );
+    token.completion_authority = completion_authority;
+    context_ref.slot_token = token;
+    context_ref.hmc_ref = rdma_hmc_ref::type_id::create({name, "_hmc"});
+    context_ref.hmc_ref.owner = clone_function_handle({name, "_hmc_owner"},
+                                                      qp.owner);
+    context_ref.hmc_ref.object_kind = RDMA_RESOURCE_MR;
+    context_ref.hmc_ref.address.value =
+      64'h0000_8500_0000_0000 + longint'(qp.local_qp_id) * 512;
+    context_ref.hmc_ref.size = 512;
+    context_ref.hmc_ref.first_pbl_index = qp.local_qp_id + 1;
+    context_ref.hmc_ref.ownership = RDMA_OWNERSHIP_CONTROL_PLANE;
+    context_ref.shadow_pointer_base.value =
+      64'h0000_8600_0000_0000 + longint'(qp.local_qp_id) * 512;
+    context_ref.slot_length = 512;
+    context_ref.shadow_view_offset = 0;
+    context_ref.shadow_view_length = 512;
+    plan.context_ref = context_ref;
+    return plan;
+  endfunction
+
+  function automatic rdma_qpc_model make_qp_test_qpc(
+    string name,
+    rdma_qp qp,
+    rdma_pd pd,
+    rdma_cq send_cq,
+    rdma_cq recv_cq,
+    rdma_qp_backing_plan plan,
+    rdma_qp_state_e state
+  );
+    rdma_qpc_model model;
+    rdma_qpc_rc_ext extension;
+
+    model = rdma_qpc_model::type_id::create(name);
+    model.qp_h = make_qp_projected_handle(
+      {name, "_qp"}, RDMA_RESOURCE_QP, qp.owner, qp.local_qp_id
+    );
+    model.pd_h = make_qp_projected_handle(
+      {name, "_pd"}, RDMA_RESOURCE_PD, qp.owner, pd.local_pd_id
+    );
+    model.send_cq_h = make_qp_projected_handle(
+      {name, "_send_cq"}, RDMA_RESOURCE_CQ, qp.owner, send_cq.local_cq_id
+    );
+    model.recv_cq_h = make_qp_projected_handle(
+      {name, "_recv_cq"}, RDMA_RESOURCE_CQ, qp.owner, recv_cq.local_cq_id
+    );
+    model.transport = RDMA_TRANSPORT_RC;
+    model.state = state;
+    model.path_mtu_bytes = 4096;
+    model.sq_depth = plan.sq_depth;
+    model.rq_depth = plan.rq_depth;
+    model.sq_backing.value = plan.sq_pd_ref.mapping.iova.value;
+    model.rq_backing.value = plan.rq_pd_ref.mapping.iova.value;
+    model.context_backing = plan.context_ref.shadow_pointer_base;
+    model.sq_mode = RDMA_OBJECT_INDIRECT_4K;
+    model.rq_mode = RDMA_OBJECT_INDIRECT_4K;
+    extension = rdma_qpc_rc_ext::type_id::create({name, "_rc"});
+    extension.remote_qpn = 24'h12_3456;
+    model.transport_ext = extension;
+    return model;
+  endfunction
+
+  function automatic void prepare_qp_candidate(
+    rdma_qp qp,
+    rdma_pd pd,
+    rdma_cq send_cq,
+    rdma_cq recv_cq,
+    string name
+  );
+    qp.transport = RDMA_TRANSPORT_RC;
+    qp.qp_state = RDMA_QPS_RESET;
+    qp.sq_depth = 128;
+    qp.rq_depth = 128;
+    qp.qp_plan = make_qp_test_plan({name, "_plan"}, qp, 128);
+    qp.programmed_qpc = make_qp_test_qpc(
+      {name, "_qpc"}, qp, pd, send_cq, recv_cq, qp.qp_plan,
+      RDMA_QPS_RESET
+    );
+    qp.sq_iova = qp.qp_plan.sq_ref.mapping.iova;
+    qp.rq_iova = qp.qp_plan.rq_ref.mapping.iova;
+  endfunction
+
+  function automatic void prepare_urc_qp_candidate(
+    rdma_qp qp,
+    rdma_pd pd,
+    rdma_cq send_cq,
+    rdma_cq recv_cq,
+    string name
+  );
+    rdma_dma_mapping urc_mapping;
+    rdma_qp_backing_ref urc_ref;
+    rdma_qpc_urc_ext urc_ext;
+
+    prepare_qp_candidate(qp, pd, send_cq, recv_cq, name);
+    qp.transport = RDMA_TRANSPORT_URC;
+    qp.qp_plan.transport = RDMA_TRANSPORT_URC;
+    urc_mapping = make_independent_queue_test_mapping(
+      {name, "_urc_rsq_mapping"}, qp.owner, qp.handle,
+      64'h0000_9100_0000_0000 + longint'(qp.local_qp_id) * 64'h1_0000
+    );
+    urc_ref = make_qp_test_ref(
+      {name, "_urc_rsq_ref"}, RDMA_QUEUE_ROLE_QP_URC_RSQ,
+      urc_mapping, 4096, RDMA_OWNERSHIP_CONTROL_PLANE
+    );
+    qp.qp_plan.urc_refs.push_back(urc_ref);
+    urc_mapping = make_independent_queue_test_mapping(
+      {name, "_urc_rdsq_mapping"}, qp.owner, qp.handle,
+      64'h0000_9200_0000_0000 + longint'(qp.local_qp_id) * 64'h1_0000
+    );
+    urc_ref = make_qp_test_ref(
+      {name, "_urc_rdsq_ref"}, RDMA_QUEUE_ROLE_QP_URC_RDSQ,
+      urc_mapping, 4096, RDMA_OWNERSHIP_CONTROL_PLANE
+    );
+    qp.qp_plan.urc_refs.push_back(urc_ref);
+    urc_mapping = make_independent_queue_test_mapping(
+      {name, "_urc_dsq_mapping"}, qp.owner, qp.handle,
+      64'h0000_9300_0000_0000 + longint'(qp.local_qp_id) * 64'h1_0000
+    );
+    urc_mapping.size = 8192;
+    urc_ref = make_qp_test_ref(
+      {name, "_urc_dsq_ref"}, RDMA_QUEUE_ROLE_QP_URC_DSQ,
+      urc_mapping, 8192, RDMA_OWNERSHIP_CONTROL_PLANE
+    );
+    qp.qp_plan.urc_refs.push_back(urc_ref);
+
+    qp.programmed_qpc.transport = RDMA_TRANSPORT_URC;
+    urc_ext = rdma_qpc_urc_ext::type_id::create({name, "_urc_ext"});
+    urc_ext.remote_qpn = 24'h65_4321;
+    urc_ext.queues.rsq_backing.value =
+      qp.qp_plan.urc_refs[0].mapping.iova.value;
+    urc_ext.queues.rdsq_backing.value =
+      qp.qp_plan.urc_refs[1].mapping.iova.value;
+    urc_ext.queues.dsq_backing.value =
+      qp.qp_plan.urc_refs[2].mapping.iova.value;
+    urc_ext.queues.rsq_depth = 64;
+    urc_ext.queues.rdsq_depth = 128;
+    urc_ext.queues.rdsq_fetch_count = 8;
+    urc_ext.queues.dsq_fetch_count = 16;
+    urc_ext.queues.rq_sequence_threshold_entries = 64;
+    urc_ext.queues.sq_completion_threshold_entries = 64;
+    qp.programmed_qpc.transport_ext = urc_ext;
+  endfunction
+
+  function automatic rdma_cmq_opcode_key make_qp_test_opcode(
+    string name,
+    bit [31:0] opcode,
+    string variant
+  );
+    rdma_cmq_opcode_key opcode_key;
+
+    opcode_key = rdma_cmq_opcode_key::type_id::create(name);
+    opcode_key.profile_name = "xtr_v1";
+    opcode_key.opcode = opcode;
+    opcode_key.variant = variant;
+    return opcode_key;
+  endfunction
+
+  function automatic rdma_cmq_ticket make_qp_test_ticket(
+    string name,
+    rdma_function_handle owner,
+    rdma_handle cmq_h,
+    rdma_cmq_opcode_key opcode_key
+  );
+    rdma_cmq_ticket ticket;
+
+    ticket = rdma_cmq_ticket::type_id::create(name);
+    ticket.command_id = 64'h1234;
+    ticket.function_h = clone_function_handle({name, "_function"}, owner);
+    ticket.cmq_h = clone_handle({name, "_cmq"}, cmq_h);
+    ticket.slot_sequence = 3;
+    ticket.sq_index = 3;
+    ticket.sq_wrap = 1'b0;
+    ticket.opcode_key = rdma_cmq_clone_opcode_key_value(opcode_key, name);
+    ticket.absolute_deadline = 100;
+    return ticket;
+  endfunction
+
+  function automatic rdma_qp_recovery_state make_qp_test_recovery(
+    string name,
+    rdma_qp qp,
+    rdma_qp_recovery_intent_e intent,
+    rdma_qpc_model candidate_qpc = null
+  );
+    rdma_qp_recovery_state recovery;
+    uvm_object cloned_object;
+
+    recovery = rdma_qp_recovery_state::type_id::create(name);
+    recovery.intent = intent;
+    cloned_object = qp.qp_plan.clone();
+    if (cloned_object == null || !$cast(recovery.qp_plan, cloned_object))
+      `uvm_fatal("QP_RECOVERY_FIXTURE", "QP plan clone failed")
+    cloned_object = recovery.qp_plan.context_ref.clone();
+    if (cloned_object == null || !$cast(recovery.context_ref, cloned_object))
+      `uvm_fatal("QP_RECOVERY_FIXTURE", "QP context clone failed")
+    cloned_object = qp.programmed_qpc.clone();
+    if (cloned_object == null || !$cast(recovery.prior_qpc, cloned_object))
+      `uvm_fatal("QP_RECOVERY_FIXTURE", "prior QPC clone failed")
+    if (candidate_qpc != null) begin
+      cloned_object = candidate_qpc.clone();
+      if (cloned_object == null ||
+          !$cast(recovery.candidate_qpc, cloned_object))
+        `uvm_fatal("QP_RECOVERY_FIXTURE", "candidate QPC clone failed")
+    end
+    recovery.create_opcode = make_qp_test_opcode(
+      {name, "_create"}, 32'h100, "create"
+    );
+    recovery.modify_opcode = make_qp_test_opcode(
+      {name, "_modify"}, 32'h101, "modify"
+    );
+    recovery.delete_opcode = make_qp_test_opcode(
+      {name, "_delete"}, 32'h102, "delete"
+    );
+    recovery.query_opcode = make_qp_test_opcode(
+      {name, "_query"}, 32'h103, "query"
+    );
+    recovery.occ_opcode = make_qp_test_opcode(
+      {name, "_occ"}, 32'h104, "occ_flush"
+    );
+    if (intent == RDMA_QP_RECOVER_MODIFY_RECONCILE) begin
+      recovery.query_mapping = make_queue_test_mapping(
+        {name, "_query_mapping"}, qp.owner, qp.handle,
+        64'h0000_8700_0000_0000 + longint'(qp.local_qp_id) * 512,
+        1'b1
+      );
+      recovery.query_mapping.size = 512;
+      recovery.query_mapping.backing_addr.value =
+        64'h0000_8800_0000_0000 + longint'(qp.local_qp_id) * 512;
+    end
+    return recovery;
+  endfunction
+
   function automatic void prepare_mr(rdma_mr mr,
                                      longint unsigned iova_value);
     mr.iova.value = iova_value;
@@ -3520,6 +4116,9 @@ class rdma_resource_manager_test extends uvm_test;
     rdma_resource_manager_probe privileged_recovery_rm;
     rdma_resource_manager stale_recovery_rm;
     rdma_resource_manager queue_snapshot_rm;
+    rdma_qp_lifecycle_probe_manager qp_rm;
+    rdma_qp_lifecycle_probe_manager qp_generic_bypass_rm;
+    rdma_width_probe_manager qp_width_rm;
     rdma_hmc_allocator hmc;
     rdma_hmc_allocator hmc_exhaustion;
     rdma_hmc_allocator hmc_overflow;
@@ -3562,6 +4161,9 @@ class rdma_resource_manager_test extends uvm_test;
     rdma_function_binding privileged_recovery_binding;
     rdma_function_binding stale_recovery_binding;
     rdma_function_binding queue_snapshot_binding;
+    rdma_function_binding qp_binding;
+    rdma_function_binding qp_generic_bypass_binding;
+    rdma_function_binding qp_width_binding;
     rdma_function_handle owner_h;
     rdma_function_handle owner_b_h;
     rdma_pd pd;
@@ -3599,6 +4201,9 @@ class rdma_resource_manager_test extends uvm_test;
     rdma_pd privileged_recovery_pd;
     rdma_pd privileged_recovery_pd_reused;
     rdma_pd stale_recovery_pd;
+    rdma_pd qp_pd;
+    rdma_pd qp_generic_bypass_pd;
+    rdma_pd qp_width_pd;
     rdma_function all_kind_function;
     rdma_pd all_kind_pd;
     rdma_pd generation_pd;
@@ -3611,6 +4216,7 @@ class rdma_resource_manager_test extends uvm_test;
     rdma_cq all_kind_lookup_cq;
     rdma_queue_resource all_kind_lookup_queue;
     rdma_qp all_kind_qp;
+    rdma_qp all_kind_lookup_qp;
     rdma_srq all_kind_srq;
     rdma_srq all_kind_lookup_srq;
     rdma_cmq all_kind_cmq;
@@ -3638,6 +4244,8 @@ class rdma_resource_manager_test extends uvm_test;
     rdma_function permanent_exhaustion_function;
     rdma_pd permanent_exhaustion_pd;
     rdma_cmq permanent_exhaustion_cmq;
+    rdma_cmq qp_generic_bypass_cmq;
+    rdma_cmq qp_cmq;
     rdma_aeq permanent_exhaustion_aeq;
     rdma_mr dep_mr;
     rdma_mr teardown_mr;
@@ -3687,6 +4295,12 @@ class rdma_resource_manager_test extends uvm_test;
     rdma_rm_fault_cq clone_kind_cq_authoritative;
     rdma_rm_fault_cq clone_kind_cq_candidate;
     rdma_rm_fault_cq clone_kind_cq_lookup;
+    rdma_cq qp_send_cq;
+    rdma_cq qp_recv_cq;
+    rdma_cq qp_generic_bypass_send_cq;
+    rdma_cq qp_generic_bypass_recv_cq;
+    rdma_cq qp_width_send_cq;
+    rdma_cq qp_width_recv_cq;
     rdma_qp dep_qp;
     rdma_qp teardown_qp;
     rdma_qp snapshot_qp;
@@ -3695,6 +4309,19 @@ class rdma_resource_manager_test extends uvm_test;
     rdma_rm_fault_qp clone_kind_qp_authoritative;
     rdma_rm_fault_qp clone_kind_qp_candidate;
     rdma_rm_fault_qp clone_kind_qp_lookup;
+    rdma_qp qp_candidate;
+    rdma_qp qp_nested_candidate;
+    rdma_qp qp_generic_bypass_candidate;
+    rdma_qp qp_generic_bypass_lookup;
+    rdma_qp qp_lookup;
+    rdma_qp qp_failed_lookup;
+    rdma_qp qp_reused;
+    rdma_qp qp_urc;
+    rdma_qp qp_prior_candidate;
+    rdma_qp qp_restore;
+    rdma_qp qp_restore_candidate;
+    rdma_qp qp_width_max;
+    rdma_qp qp_width_overflow;
     rdma_srq dep_srq;
     rdma_srq clone_kind_srq_seed;
     rdma_rm_fault_srq clone_kind_srq_authoritative;
@@ -3741,8 +4368,16 @@ class rdma_resource_manager_test extends uvm_test;
     rdma_recovery_record recovery_record;
     rdma_recovery_record recovery_lookup;
     rdma_recovery_record recovery_lookup_again;
+    rdma_recovery_record qp_generic_bypass_recovery;
     rdma_recovery_record malformed_recovery;
     rdma_recovery_record ready_recovery;
+    rdma_qp_recovery_state qp_recovery_state;
+    rdma_qp_recovery_state qp_modify_recovery_state;
+    rdma_qp_recovery_state qp_prior_recovery_state;
+    rdma_qp_recovery_state qp_urc_recovery_state;
+    rdma_qp_recovery_state qp_nested_recovery_state;
+    rdma_qp_recovery_state qp_qpc_binding_recovery;
+    rdma_qp_recovery_state qp_error_replacement;
     rdma_rm_fault_recovery clone_fault_recovery;
     rdma_rm_schema_recovery schema_recovery;
     rdma_recovery_record schema_nested_recovery;
@@ -3757,7 +4392,9 @@ class rdma_resource_manager_test extends uvm_test;
     rdma_backing_ref schema_exact_backing_ref;
     rdma_backing_ref projection_unregistered_backing_ref;
     rdma_backing_ref projection_lying_backing_ref;
+    rdma_backing_ref qp_generic_backing_ref;
     rdma_dma_mapping clone_mapping;
+    rdma_dma_mapping qp_nested_mapping;
     rdma_dma_mapping schema_mapping;
     rdma_rm_schema_mapping schema_mapping_probe;
     rdma_rm_unregistered_mapping projection_unregistered_mapping;
@@ -3811,6 +4448,9 @@ class rdma_resource_manager_test extends uvm_test;
     rdma_rm_schema_handle composite_handle_leak;
     rdma_rm_schema_function_handle composite_function_handle_leak;
     rdma_handle mutating_clone_pd_ref;
+    rdma_queue_slot_token_contract qp_nested_context_token;
+    rdma_queue_slot_token_contract qp_nested_plan_context_token;
+    rdma_queue_completion_authority qp_nested_context_authority;
     rdma_cmq_ticket mutating_clone_ticket_ref;
     longint unsigned mutating_clone_length;
     rdma_hw_presence_e mutating_clone_presence;
@@ -3851,6 +4491,11 @@ class rdma_resource_manager_test extends uvm_test;
     string iova_type_name;
     rdma_bdf_t snapshot_bdf;
     rdma_pcie_identity schema_saved_pcie;
+    uvm_object qp_cloned_object;
+    rdma_qpc_rc_ext qp_unexpected_ext;
+    rdma_qpc_model qp_qpc_binding_candidate;
+    bit [7:0] qp_sequence_first;
+    bit [7:0] qp_sequence_reused;
 
     phase.raise_objection(this);
     check_owned_mapping_clone_contract_rejections();
@@ -7459,8 +8104,8 @@ class rdma_resource_manager_test extends uvm_test;
                   RDMA_SC_INVALID_STATE);
     expect_status("DEP_RELEASE_CEQ_BUSY", dep_rm.\release (dep_ceq.handle),
                   RDMA_SC_INVALID_STATE);
-    expect_status("DEP_RELEASE_QP", dep_rm.\release (dep_qp.handle),
-                  RDMA_SC_OK);
+    expect_status("DEP_RELEASE_QP",
+                  dep_rm.finalize_qp_release(dep_qp.handle), RDMA_SC_OK);
     expect_status("DEP_RELEASE_MR", dep_rm.\release (dep_mr.handle),
                   RDMA_SC_OK);
     expect_status("DEP_RELEASE_SRQ", dep_rm.\release (dep_srq.handle),
@@ -7874,8 +8519,7 @@ class rdma_resource_manager_test extends uvm_test;
                   all_kind_rm.create_qp(binding_a, all_kind_pd.handle,
                                         all_kind_cq.handle,
                                         all_kind_cq.handle,
-                                        all_kind_srq.handle,
-                                        all_kind_qp), RDMA_SC_OK);
+                                        null, all_kind_qp), RDMA_SC_OK);
     expect_status("ALL_KIND_CMQ",
                   all_kind_rm.create_cmq(binding_a, all_kind_cmq),
                   RDMA_SC_OK);
@@ -7904,8 +8548,8 @@ class rdma_resource_manager_test extends uvm_test;
       "all_kind_srq_plan", RDMA_RESOURCE_SRQ, all_kind_srq.depth,
       all_kind_srq.owner, all_kind_srq.handle, all_kind_srq.local_srq_id
     );
-    all_kind_qp.sq_depth = 8;
-    all_kind_qp.rq_depth = 8;
+    prepare_qp_candidate(all_kind_qp, all_kind_pd, all_kind_cq,
+                         all_kind_cq, "all_kind_qp");
     all_kind_cmq.depth = 8;
     all_kind_aeq.depth = 8;
     all_kind_aeq.function_local_vector = 3;
@@ -7926,17 +8570,25 @@ class rdma_resource_manager_test extends uvm_test;
     all_kind_resources.push_back(all_kind_ceq);
     all_kind_resources.push_back(all_kind_aeq);
     foreach (all_kind_resources[i]) begin
-      expect_status(
-        $sformatf("ALL_KIND_%s_STAGE",
-                  all_kind_resources[i].resource_kind().name()),
-        all_kind_rm.stage_allocated(all_kind_resources[i]), RDMA_SC_OK
-      );
-      if (all_kind_resources[i].resource_kind() != RDMA_RESOURCE_PD)
+      if (all_kind_resources[i].resource_kind() == RDMA_RESOURCE_QP) begin
         expect_status(
-          $sformatf("ALL_KIND_%s_COMMIT",
-                    all_kind_resources[i].resource_kind().name()),
-          all_kind_rm.commit_programmed(all_kind_resources[i]), RDMA_SC_OK
+          "ALL_KIND_RDMA_RESOURCE_QP_ATTACH",
+          all_kind_rm.attach_qp_programming(all_kind_qp), RDMA_SC_OK
         );
+      end
+      else begin
+        expect_status(
+          $sformatf("ALL_KIND_%s_STAGE",
+                    all_kind_resources[i].resource_kind().name()),
+          all_kind_rm.stage_allocated(all_kind_resources[i]), RDMA_SC_OK
+        );
+        if (all_kind_resources[i].resource_kind() != RDMA_RESOURCE_PD)
+          expect_status(
+            $sformatf("ALL_KIND_%s_COMMIT",
+                      all_kind_resources[i].resource_kind().name()),
+            all_kind_rm.commit_programmed(all_kind_resources[i]), RDMA_SC_OK
+          );
+      end
       expect_status(
         $sformatf("ALL_KIND_%s_ACTIVATE",
                   all_kind_resources[i].resource_kind().name()),
@@ -7952,6 +8604,11 @@ class rdma_resource_manager_test extends uvm_test;
         `uvm_error("ALL_KIND_LOOKUP",
                    "exact lifecycle lookup did not return ACTIVE authority")
       case (all_kind_resources[i].resource_kind())
+        RDMA_RESOURCE_QP: begin
+          if (!$cast(all_kind_lookup_qp, resource))
+            `uvm_fatal("ALL_KIND_QP_METADATA",
+                       "QP lookup returned incompatible authority")
+        end
         RDMA_RESOURCE_CQ: begin
           if (!$cast(all_kind_lookup_cq, resource) ||
               all_kind_lookup_cq.cqe_size_bytes != 128)
@@ -7983,58 +8640,72 @@ class rdma_resource_manager_test extends uvm_test;
         default: begin
         end
       endcase
-      recovery_record = new(
-        $sformatf("all_kind_%s_recovery",
-                  all_kind_resources[i].resource_kind().name())
-      );
-      recovery_record.resource_h = clone_handle(
-        "ALL_KIND_RECOVERY_H", all_kind_resources[i].handle
-      );
-      recovery_record.hardware_presence = RDMA_HW_PRESENCE_ABSENT;
-      recovery_record.primary_status = rdma_status::make(
-        RDMA_SC_RESET_CANCELLED, "all-kind exact recovery probe"
-      );
-      if (all_kind_resources[i].resource_kind() inside {
-            RDMA_RESOURCE_CQ, RDMA_RESOURCE_SRQ,
-            RDMA_RESOURCE_CEQ, RDMA_RESOURCE_AEQ
-          }) begin
-        if (!$cast(all_kind_lookup_queue, resource) ||
-            all_kind_lookup_queue.queue_plan == null)
-          `uvm_fatal("ALL_KIND_QUEUE_RECOVERY",
-                     "queue lookup lacks an authoritative recovery plan")
-        recovery_record.queue_recovery_valid = 1'b1;
-        recovery_record.queue_intent = RDMA_QUEUE_RECOVER_NORMAL_DESTROY;
-        recovery_record.ambiguous_queue_operation = RDMA_QUEUE_AMBIG_NONE;
-        case (all_kind_resources[i].resource_kind())
-          RDMA_RESOURCE_CQ:
-            recovery_record.ambiguous_role = RDMA_QUEUE_ROLE_CQ_RING;
-          RDMA_RESOURCE_SRQ:
-            recovery_record.ambiguous_role = RDMA_QUEUE_ROLE_SRQ_RING;
-          RDMA_RESOURCE_CEQ:
-            recovery_record.ambiguous_role = RDMA_QUEUE_ROLE_CEQ_RING;
-          RDMA_RESOURCE_AEQ:
-            recovery_record.ambiguous_role = RDMA_QUEUE_ROLE_AEQ_RING;
-          default: begin
-          end
-        endcase
-        recovery_record.queue_plan = all_kind_lookup_queue.queue_plan;
-        recovery_record.queue_create_opcode = make_queue_test_opcode(
-          $sformatf("all_kind_%0d_create", i), "create"
+      if (all_kind_resources[i].resource_kind() == RDMA_RESOURCE_QP) begin
+        qp_recovery_state = make_qp_test_recovery(
+          "all_kind_qp_recovery", all_kind_lookup_qp,
+          RDMA_QP_RECOVER_CREATE_ROLLBACK
         );
-        recovery_record.queue_delete_opcode = make_queue_test_opcode(
-          $sformatf("all_kind_%0d_delete", i), "delete"
-        );
-        recovery_record.queue_query_opcode = make_queue_test_opcode(
-          $sformatf("all_kind_%0d_query", i), "query"
+        expect_status(
+          "ALL_KIND_RDMA_RESOURCE_QP_MARK_ERROR",
+          all_kind_rm.mark_qp_error(all_kind_qp.handle,
+                                    qp_recovery_state),
+          RDMA_SC_OK
         );
       end
-      expect_status(
-        $sformatf("ALL_KIND_%s_MARK_ERROR",
-                  all_kind_resources[i].resource_kind().name()),
-        all_kind_rm.mark_error(all_kind_resources[i].handle,
-                               recovery_record),
-        RDMA_SC_OK
-      );
+      else begin
+        recovery_record = new(
+          $sformatf("all_kind_%s_recovery",
+                    all_kind_resources[i].resource_kind().name())
+        );
+        recovery_record.resource_h = clone_handle(
+          "ALL_KIND_RECOVERY_H", all_kind_resources[i].handle
+        );
+        recovery_record.hardware_presence = RDMA_HW_PRESENCE_ABSENT;
+        recovery_record.primary_status = rdma_status::make(
+          RDMA_SC_RESET_CANCELLED, "all-kind exact recovery probe"
+        );
+        if (all_kind_resources[i].resource_kind() inside {
+              RDMA_RESOURCE_CQ, RDMA_RESOURCE_SRQ,
+              RDMA_RESOURCE_CEQ, RDMA_RESOURCE_AEQ
+            }) begin
+          if (!$cast(all_kind_lookup_queue, resource) ||
+              all_kind_lookup_queue.queue_plan == null)
+            `uvm_fatal("ALL_KIND_QUEUE_RECOVERY",
+                       "queue lookup lacks an authoritative recovery plan")
+          recovery_record.queue_recovery_valid = 1'b1;
+          recovery_record.queue_intent = RDMA_QUEUE_RECOVER_NORMAL_DESTROY;
+          recovery_record.ambiguous_queue_operation = RDMA_QUEUE_AMBIG_NONE;
+          case (all_kind_resources[i].resource_kind())
+            RDMA_RESOURCE_CQ:
+              recovery_record.ambiguous_role = RDMA_QUEUE_ROLE_CQ_RING;
+            RDMA_RESOURCE_SRQ:
+              recovery_record.ambiguous_role = RDMA_QUEUE_ROLE_SRQ_RING;
+            RDMA_RESOURCE_CEQ:
+              recovery_record.ambiguous_role = RDMA_QUEUE_ROLE_CEQ_RING;
+            RDMA_RESOURCE_AEQ:
+              recovery_record.ambiguous_role = RDMA_QUEUE_ROLE_AEQ_RING;
+            default: begin
+            end
+          endcase
+          recovery_record.queue_plan = all_kind_lookup_queue.queue_plan;
+          recovery_record.queue_create_opcode = make_queue_test_opcode(
+            $sformatf("all_kind_%0d_create", i), "create"
+          );
+          recovery_record.queue_delete_opcode = make_queue_test_opcode(
+            $sformatf("all_kind_%0d_delete", i), "delete"
+          );
+          recovery_record.queue_query_opcode = make_queue_test_opcode(
+            $sformatf("all_kind_%0d_query", i), "query"
+          );
+        end
+        expect_status(
+          $sformatf("ALL_KIND_%s_MARK_ERROR",
+                    all_kind_resources[i].resource_kind().name()),
+          all_kind_rm.mark_error(all_kind_resources[i].handle,
+                                 recovery_record),
+          RDMA_SC_OK
+        );
+      end
       expect_status(
         $sformatf("ALL_KIND_%s_RECOVERY_LOOKUP",
                   all_kind_resources[i].resource_kind().name()),
@@ -8243,6 +8914,1815 @@ class rdma_resource_manager_test extends uvm_test;
                   RDMA_SC_RESOURCE_EXHAUSTED);
     expect_status("HMC_OVERFLOW_NO_LEAKS",
                   hmc_overflow.check_leaks(leak_count), RDMA_SC_OK);
+
+    // QP has the sole 21-bit local-ID extension in this task.  The inclusive
+    // maximum is allocatable; the next fresh identity is rejected atomically.
+    qp_width_rm = new("qp_width_rm");
+    qp_width_binding = make_active_binding(
+      "qp_width_binding", 64'h7170_0000_0000_0001,
+      32'h7170_0101, 32'd71
+    );
+    expect_status("QP_WIDTH_PD_CREATE",
+                  qp_width_rm.create_pd(qp_width_binding, qp_width_pd),
+                  RDMA_SC_OK);
+    expect_status("QP_WIDTH_SEND_CQ_CREATE",
+                  qp_width_rm.create_cq(qp_width_binding, null,
+                                        qp_width_send_cq), RDMA_SC_OK);
+    expect_status("QP_WIDTH_RECV_CQ_CREATE",
+                  qp_width_rm.create_cq(qp_width_binding, null,
+                                        qp_width_recv_cq), RDMA_SC_OK);
+    qp_width_rm.set_next_local_id(RDMA_RESOURCE_QP, 21'h1f_ffff);
+    expect_status(
+      "QP_WIDTH_MAX_ACCEPTED",
+      qp_width_rm.create_qp(qp_width_binding, qp_width_pd.handle,
+                            qp_width_send_cq.handle,
+                            qp_width_recv_cq.handle, null, qp_width_max),
+      RDMA_SC_OK
+    );
+    if (qp_width_max == null || qp_width_max.local_qp_id != 21'h1f_ffff)
+      `uvm_error("QP_WIDTH_MAX_ACCEPTED",
+                 "inclusive 21-bit QPN maximum was not allocated")
+    expect_status(
+      "QP_WIDTH_OVERFLOW_REJECTED",
+      qp_width_rm.create_qp(qp_width_binding, qp_width_pd.handle,
+                            qp_width_send_cq.handle,
+                            qp_width_recv_cq.handle, null,
+                            qp_width_overflow),
+      RDMA_SC_RESOURCE_EXHAUSTED
+    );
+    if (qp_width_overflow != null ||
+        qp_width_rm.observed_registry_count() != 4)
+      `uvm_error("QP_WIDTH_OVERFLOW_ATOMIC",
+                 "rejected QPN overflow changed manager state")
+
+    begin
+      rdma_resource_manager preprogram_rm;
+      rdma_function_binding preprogram_binding;
+      rdma_pd preprogram_pd;
+      rdma_cq preprogram_cq;
+      rdma_qp preprogram_candidate;
+      rdma_qp preprogram_lookup;
+      rdma_qp_recovery_state preprogram_recovery;
+      rdma_qp_recovery_state malformed_recovery;
+      rdma_resource preprogram_resource;
+      rdma_recovery_record preprogram_record;
+      uvm_object preprogram_clone_object;
+      longint unsigned stored_sq_iova;
+
+      preprogram_rm = rdma_resource_manager::type_id::create(
+        "qp_preprogram_rm"
+      );
+      preprogram_binding = make_active_binding(
+        "qp_preprogram_binding", 64'h7170_1000_0000_0001,
+        32'h7170_1101, 32'd72
+      );
+      expect_status("QP_PREPROGRAM_PD_CREATE",
+                    preprogram_rm.create_pd(preprogram_binding,
+                                            preprogram_pd), RDMA_SC_OK);
+      expect_status("QP_PREPROGRAM_CQ_CREATE",
+                    preprogram_rm.create_cq(preprogram_binding, null,
+                                            preprogram_cq), RDMA_SC_OK);
+      expect_status(
+        "QP_PREPROGRAM_CREATE",
+        preprogram_rm.create_qp(
+          preprogram_binding, preprogram_pd.handle, preprogram_cq.handle,
+          preprogram_cq.handle, null, preprogram_candidate
+        ),
+        RDMA_SC_OK
+      );
+      prepare_qp_candidate(
+        preprogram_candidate, preprogram_pd, preprogram_cq, preprogram_cq,
+        "qp_preprogram_candidate"
+      );
+      preprogram_recovery = make_qp_test_recovery(
+        "qp_preprogram_recovery", preprogram_candidate,
+        RDMA_QP_RECOVER_CREATE_ROLLBACK
+      );
+      preprogram_recovery.prior_qpc = null;
+      preprogram_recovery.candidate_qpc = null;
+      preprogram_recovery.context_ref = null;
+      preprogram_recovery.qp_plan.context_ref = null;
+      foreach (preprogram_recovery.role_complete[i])
+        preprogram_recovery.role_complete[i] = 1'b0;
+
+      preprogram_clone_object = preprogram_recovery.clone();
+      if (!$cast(malformed_recovery, preprogram_clone_object))
+        `uvm_fatal("QP_PREPROGRAM_MALFORMED",
+                   "pre-program recovery clone lost type")
+      malformed_recovery.qp_plan.rq_pd_ref.mapping.function_h.function_uid++;
+      expect_status(
+        "QP_PREPROGRAM_REJECT_MIXED_OWNER",
+        preprogram_rm.mark_qp_error(preprogram_candidate.handle,
+                                    malformed_recovery),
+        RDMA_SC_INVALID_ARGUMENT
+      );
+      expect_status(
+        "QP_PREPROGRAM_REJECT_ATOMIC_LOOKUP",
+        preprogram_rm.lookup(preprogram_candidate.handle,
+                             preprogram_resource),
+        RDMA_SC_OK
+      );
+      if (!$cast(preprogram_lookup, preprogram_resource) ||
+          preprogram_lookup.state != RDMA_RESOURCE_ALLOCATED ||
+          preprogram_lookup.qp_plan != null ||
+          preprogram_lookup.programmed_qpc != null)
+        `uvm_error("QP_PREPROGRAM_REJECT_ATOMIC",
+                   "rejected partial recovery changed the reservation")
+      expect_status(
+        "QP_PREPROGRAM_REJECT_NO_RECOVERY",
+        preprogram_rm.lookup_recovery(preprogram_candidate.handle,
+                                      preprogram_record),
+        RDMA_SC_INVALID_STATE
+      );
+
+      expect_status(
+        "QP_PREPROGRAM_MARK_ERROR",
+        preprogram_rm.mark_qp_error(preprogram_candidate.handle,
+                                    preprogram_recovery),
+        RDMA_SC_OK
+      );
+      expect_status(
+        "QP_PREPROGRAM_ERROR_LOOKUP",
+        preprogram_rm.lookup(preprogram_candidate.handle,
+                             preprogram_resource),
+        RDMA_SC_OK
+      );
+      expect_status(
+        "QP_PREPROGRAM_RECOVERY_LOOKUP",
+        preprogram_rm.lookup_recovery(preprogram_candidate.handle,
+                                      preprogram_record),
+        RDMA_SC_OK
+      );
+      stored_sq_iova = preprogram_recovery.qp_plan.sq_ref.mapping.iova.value;
+      preprogram_recovery.qp_plan.sq_ref.mapping.iova.value += 4096;
+      if (!$cast(preprogram_lookup, preprogram_resource) ||
+          preprogram_lookup.state != RDMA_RESOURCE_ERROR ||
+          preprogram_lookup.qp_plan == null ||
+          preprogram_lookup.programmed_qpc != null ||
+          preprogram_record == null ||
+          preprogram_record.hardware_presence != RDMA_HW_PRESENCE_ABSENT ||
+          preprogram_record.qp_recovery == null ||
+          preprogram_record.qp_recovery.context_ref != null ||
+          preprogram_record.qp_recovery.qp_plan == null ||
+          preprogram_record.qp_recovery.qp_plan.context_ref != null ||
+          preprogram_record.qp_recovery.qp_plan.sq_ref.mapping.iova.value !=
+            stored_sq_iova)
+        `uvm_error("QP_PREPROGRAM_ERROR_RESULT",
+                   "partial ERROR publication lost or aliased authority")
+    end
+
+    // QP lifecycle authority is exclusive: generic publication and ERROR
+    // methods must reject before changing either registry or recovery state.
+    qp_generic_bypass_rm = new("qp_generic_bypass_rm");
+    qp_generic_bypass_binding = make_active_binding(
+      "qp_generic_bypass_binding", 64'h7171_0000_0000_0001,
+      32'h7171_0101, 32'd71
+    );
+    expect_status(
+      "QP_GENERIC_BYPASS_PD_CREATE",
+      qp_generic_bypass_rm.create_pd(qp_generic_bypass_binding,
+                                      qp_generic_bypass_pd),
+      RDMA_SC_OK
+    );
+    expect_status(
+      "QP_GENERIC_BYPASS_SEND_CQ_CREATE",
+      qp_generic_bypass_rm.create_cq(qp_generic_bypass_binding, null,
+                                      qp_generic_bypass_send_cq),
+      RDMA_SC_OK
+    );
+    expect_status(
+      "QP_GENERIC_BYPASS_RECV_CQ_CREATE",
+      qp_generic_bypass_rm.create_cq(qp_generic_bypass_binding, null,
+                                      qp_generic_bypass_recv_cq),
+      RDMA_SC_OK
+    );
+    expect_status(
+      "QP_GENERIC_BYPASS_CMQ_CREATE",
+      qp_generic_bypass_rm.create_cmq(qp_generic_bypass_binding,
+                                       qp_generic_bypass_cmq),
+      RDMA_SC_OK
+    );
+    expect_status(
+      "QP_GENERIC_BYPASS_CREATE",
+      qp_generic_bypass_rm.create_qp(
+        qp_generic_bypass_binding, qp_generic_bypass_pd.handle,
+        qp_generic_bypass_send_cq.handle,
+        qp_generic_bypass_recv_cq.handle, null,
+        qp_generic_bypass_candidate
+      ),
+      RDMA_SC_OK
+    );
+    prepare_qp_candidate(
+      qp_generic_bypass_candidate, qp_generic_bypass_pd,
+      qp_generic_bypass_send_cq, qp_generic_bypass_recv_cq,
+      "qp_generic_bypass_candidate"
+    );
+    expect_status(
+      "QP_GENERIC_STAGE_REJECTED",
+      qp_generic_bypass_rm.stage_allocated(qp_generic_bypass_candidate),
+      RDMA_SC_INVALID_STATE
+    );
+    expect_status(
+      "QP_GENERIC_STAGE_ATOMIC_LOOKUP",
+      qp_generic_bypass_rm.lookup(qp_generic_bypass_candidate.handle,
+                                   resource),
+      RDMA_SC_OK
+    );
+    if (resource == null || !$cast(qp_generic_bypass_lookup, resource) ||
+        qp_generic_bypass_lookup.state != RDMA_RESOURCE_ALLOCATED ||
+        qp_generic_bypass_lookup.qp_plan != null ||
+        qp_generic_bypass_lookup.programmed_qpc != null)
+      `uvm_error("QP_GENERIC_STAGE_ATOMIC",
+                 "generic stage rejection changed the QP reservation")
+
+    expect_status(
+      "QP_GENERIC_COMMIT_PRECONDITION",
+      qp_generic_bypass_rm.force_qp_staged_precondition(
+        qp_generic_bypass_candidate
+      ),
+      RDMA_SC_OK
+    );
+    expect_status(
+      "QP_GENERIC_COMMIT_REJECTED",
+      qp_generic_bypass_rm.commit_programmed(qp_generic_bypass_candidate),
+      RDMA_SC_INVALID_STATE
+    );
+    expect_status(
+      "QP_GENERIC_COMMIT_ATOMIC_LOOKUP",
+      qp_generic_bypass_rm.lookup(qp_generic_bypass_candidate.handle,
+                                   resource),
+      RDMA_SC_OK
+    );
+    if (resource == null || !$cast(qp_generic_bypass_lookup, resource) ||
+        qp_generic_bypass_lookup.state != RDMA_RESOURCE_ALLOCATED ||
+        qp_generic_bypass_lookup.qp_plan == null ||
+        qp_generic_bypass_lookup.programmed_qpc == null)
+      `uvm_error("QP_GENERIC_COMMIT_ATOMIC",
+                 "generic commit rejection changed the staged QP")
+
+    expect_status(
+      "QP_GENERIC_ERROR_PRECONDITION",
+      qp_generic_bypass_rm.force_qp_active_precondition(
+        qp_generic_bypass_candidate
+      ),
+      RDMA_SC_OK
+    );
+    qp_generic_bypass_recovery = new("qp_generic_bypass_recovery");
+    qp_generic_bypass_recovery.resource_h = clone_handle(
+      "QP_GENERIC_ERROR_RECOVERY_H", qp_generic_bypass_candidate.handle
+    );
+    qp_generic_bypass_recovery.hardware_presence = RDMA_HW_PRESENCE_PRESENT;
+    qp_generic_bypass_recovery.primary_status = rdma_status::make(
+      RDMA_SC_RECOVERY_REQUIRED, "generic QP ERROR bypass probe"
+    );
+    qp_generic_bypass_recovery.qp_recovery_valid = 1'b1;
+    qp_generic_bypass_recovery.qp_recovery = make_qp_test_recovery(
+      "qp_generic_bypass_state", qp_generic_bypass_candidate,
+      RDMA_QP_RECOVER_NORMAL_DESTROY
+    );
+    expect_status(
+      "QP_GENERIC_MARK_ERROR_REJECTED",
+      qp_generic_bypass_rm.mark_error(
+        qp_generic_bypass_candidate.handle, qp_generic_bypass_recovery
+      ),
+      RDMA_SC_INVALID_STATE
+    );
+    expect_status(
+      "QP_GENERIC_MARK_ERROR_ATOMIC_LOOKUP",
+      qp_generic_bypass_rm.lookup(qp_generic_bypass_candidate.handle,
+                                   resource),
+      RDMA_SC_OK
+    );
+    if (resource == null || resource.state != RDMA_RESOURCE_ACTIVE)
+      `uvm_error("QP_GENERIC_MARK_ERROR_ATOMIC",
+                 "generic ERROR rejection changed the registry QP")
+    expect_status(
+      "QP_GENERIC_MARK_ERROR_NO_RECOVERY",
+      qp_generic_bypass_rm.lookup_recovery(
+        qp_generic_bypass_candidate.handle, recovery_lookup
+      ),
+      RDMA_SC_INVALID_STATE
+    );
+
+    expect_status(
+      "QP_GENERIC_RESERVED_ERROR_PRECONDITION",
+      qp_generic_bypass_rm.force_qp_active_precondition(
+        qp_generic_bypass_candidate
+      ),
+      RDMA_SC_OK
+    );
+    expect_status(
+      "QP_GENERIC_RESERVED_ERROR_REJECTED",
+      qp_generic_bypass_rm.mark_reserved_error(
+        qp_generic_bypass_candidate.handle, null
+      ),
+      RDMA_SC_INVALID_STATE
+    );
+    expect_status(
+      "QP_GENERIC_RESERVED_ERROR_ATOMIC_LOOKUP",
+      qp_generic_bypass_rm.lookup(qp_generic_bypass_candidate.handle,
+                                   resource),
+      RDMA_SC_OK
+    );
+    if (resource == null || resource.state != RDMA_RESOURCE_ACTIVE)
+      `uvm_error("QP_GENERIC_RESERVED_ERROR_ATOMIC",
+                 "generic reserved ERROR rejection changed the registry QP")
+
+    // Structurally valid QPC snapshots are still caller input.  Bind them to
+    // the current programmed authority before publishing ERROR recovery.
+    qp_qpc_binding_recovery = make_qp_test_recovery(
+      "qp_modify_bad_prior", qp_generic_bypass_candidate,
+      RDMA_QP_RECOVER_MODIFY_RECONCILE,
+      qp_generic_bypass_candidate.programmed_qpc
+    );
+    qp_qpc_binding_recovery.prior_qpc.sq_backing.value += 4096;
+    expect_status(
+      "QP_MODIFY_PRIOR_QPC_BINDING",
+      qp_generic_bypass_rm.mark_qp_error(
+        qp_generic_bypass_candidate.handle, qp_qpc_binding_recovery
+      ),
+      RDMA_SC_INVALID_ARGUMENT
+    );
+    expect_status(
+      "QP_MODIFY_PRIOR_QPC_ATOMIC_LOOKUP",
+      qp_generic_bypass_rm.lookup(qp_generic_bypass_candidate.handle,
+                                   resource),
+      RDMA_SC_OK
+    );
+    if (resource == null || resource.state != RDMA_RESOURCE_ACTIVE)
+      `uvm_error("QP_MODIFY_PRIOR_QPC_ATOMIC",
+                 "rejected modify prior QPC changed registry authority")
+    expect_status(
+      "QP_MODIFY_PRIOR_QPC_NO_RECOVERY",
+      qp_generic_bypass_rm.lookup_recovery(
+        qp_generic_bypass_candidate.handle, recovery_lookup
+      ),
+      RDMA_SC_INVALID_STATE
+    );
+
+    expect_status(
+      "QP_DESTROY_PRIOR_QPC_PRECONDITION",
+      qp_generic_bypass_rm.force_qp_active_precondition(
+        qp_generic_bypass_candidate
+      ),
+      RDMA_SC_OK
+    );
+    qp_qpc_binding_recovery = make_qp_test_recovery(
+      "qp_destroy_bad_prior", qp_generic_bypass_candidate,
+      RDMA_QP_RECOVER_NORMAL_DESTROY
+    );
+    qp_qpc_binding_recovery.prior_qpc.rq_backing.value += 4096;
+    expect_status(
+      "QP_DESTROY_PRIOR_QPC_BINDING",
+      qp_generic_bypass_rm.mark_qp_error(
+        qp_generic_bypass_candidate.handle, qp_qpc_binding_recovery
+      ),
+      RDMA_SC_INVALID_ARGUMENT
+    );
+    expect_status(
+      "QP_DESTROY_PRIOR_QPC_ATOMIC_LOOKUP",
+      qp_generic_bypass_rm.lookup(qp_generic_bypass_candidate.handle,
+                                   resource),
+      RDMA_SC_OK
+    );
+    if (resource == null || resource.state != RDMA_RESOURCE_ACTIVE)
+      `uvm_error("QP_DESTROY_PRIOR_QPC_ATOMIC",
+                 "rejected destroy prior QPC changed registry authority")
+    expect_status(
+      "QP_DESTROY_PRIOR_QPC_NO_RECOVERY",
+      qp_generic_bypass_rm.lookup_recovery(
+        qp_generic_bypass_candidate.handle, recovery_lookup
+      ),
+      RDMA_SC_INVALID_STATE
+    );
+
+    expect_status(
+      "QP_CREATE_CANDIDATE_QPC_PRECONDITION",
+      qp_generic_bypass_rm.force_qp_active_precondition(
+        qp_generic_bypass_candidate
+      ),
+      RDMA_SC_OK
+    );
+    qp_cloned_object =
+      qp_generic_bypass_candidate.programmed_qpc.clone();
+    if (qp_cloned_object == null ||
+        !$cast(qp_qpc_binding_candidate, qp_cloned_object))
+      `uvm_fatal("QP_CREATE_CANDIDATE_QPC",
+                 "create candidate QPC clone failed")
+    qp_qpc_binding_candidate.context_backing.value += 512;
+    qp_qpc_binding_recovery = make_qp_test_recovery(
+      "qp_create_bad_candidate", qp_generic_bypass_candidate,
+      RDMA_QP_RECOVER_CREATE_ROLLBACK, qp_qpc_binding_candidate
+    );
+    expect_status(
+      "QP_CREATE_CANDIDATE_QPC_BINDING",
+      qp_generic_bypass_rm.mark_qp_error(
+        qp_generic_bypass_candidate.handle, qp_qpc_binding_recovery
+      ),
+      RDMA_SC_INVALID_ARGUMENT
+    );
+    expect_status(
+      "QP_CREATE_CANDIDATE_QPC_ATOMIC_LOOKUP",
+      qp_generic_bypass_rm.lookup(qp_generic_bypass_candidate.handle,
+                                   resource),
+      RDMA_SC_OK
+    );
+    if (resource == null || resource.state != RDMA_RESOURCE_ACTIVE)
+      `uvm_error("QP_CREATE_CANDIDATE_QPC_ATOMIC",
+                 "rejected create candidate QPC changed registry authority")
+    expect_status(
+      "QP_CREATE_CANDIDATE_QPC_NO_RECOVERY",
+      qp_generic_bypass_rm.lookup_recovery(
+        qp_generic_bypass_candidate.handle, recovery_lookup
+      ),
+      RDMA_SC_INVALID_STATE
+    );
+
+    expect_status(
+      "QP_OCC_REPLACEMENT_PRECONDITION",
+      qp_generic_bypass_rm.force_qp_active_precondition(
+        qp_generic_bypass_candidate
+      ),
+      RDMA_SC_OK
+    );
+    qp_qpc_binding_recovery = make_qp_test_recovery(
+      "qp_occ_replacement_initial", qp_generic_bypass_candidate,
+      RDMA_QP_RECOVER_CREATE_ROLLBACK,
+      qp_generic_bypass_candidate.programmed_qpc
+    );
+    expect_status(
+      "QP_OCC_REPLACEMENT_INITIAL_MARK",
+      qp_generic_bypass_rm.mark_qp_error(
+        qp_generic_bypass_candidate.handle, qp_qpc_binding_recovery
+      ),
+      RDMA_SC_OK
+    );
+    expect_status(
+      "QP_OCC_REPLACEMENT_INITIAL_LOOKUP",
+      qp_generic_bypass_rm.lookup_recovery(
+        qp_generic_bypass_candidate.handle, recovery_lookup
+      ),
+      RDMA_SC_OK
+    );
+    qp_cloned_object = recovery_lookup.qp_recovery.clone();
+    if (qp_cloned_object == null ||
+        !$cast(qp_error_replacement, qp_cloned_object))
+      `uvm_fatal("QP_OCC_REPLACEMENT_CLONE",
+                 "stored QP recovery clone failed")
+    qp_error_replacement.ambiguous_operation = RDMA_QP_AMBIG_OCC_FLUSH;
+    qp_error_replacement.ambiguous_role = RDMA_QUEUE_ROLE_QP_SQ_RING;
+    qp_error_replacement.ambiguous_ticket = make_qp_test_ticket(
+      "qp_occ_replacement_ticket", qp_generic_bypass_candidate.owner,
+      qp_generic_bypass_cmq.handle, qp_error_replacement.occ_opcode
+    );
+    expect_status(
+      "QP_OCC_REPLACEMENT_SET_AMBIGUITY",
+      qp_generic_bypass_rm.mark_qp_error(
+        qp_generic_bypass_candidate.handle, qp_error_replacement
+      ),
+      RDMA_SC_OK
+    );
+    qp_error_replacement.ambiguous_role = RDMA_QUEUE_ROLE_QP_RQ_PD;
+    qp_error_replacement.occ_opcode.opcode++;
+    qp_error_replacement.ambiguous_ticket.command_id++;
+    expect_status(
+      "QP_OCC_REPLACEMENT_PROJECTED_LOOKUP",
+      qp_generic_bypass_rm.lookup_recovery(
+        qp_generic_bypass_candidate.handle, recovery_lookup
+      ),
+      RDMA_SC_OK
+    );
+    if (recovery_lookup == null || recovery_lookup.qp_recovery == null ||
+        recovery_lookup.qp_recovery.ambiguous_operation !=
+          RDMA_QP_AMBIG_OCC_FLUSH ||
+        recovery_lookup.qp_recovery.ambiguous_role !=
+          RDMA_QUEUE_ROLE_QP_SQ_RING ||
+        recovery_lookup.qp_recovery.occ_opcode == null ||
+        recovery_lookup.qp_recovery.occ_opcode.opcode != 32'h104 ||
+        recovery_lookup.qp_recovery.ambiguous_ticket == null ||
+        recovery_lookup.qp_recovery.ambiguous_ticket.command_id != 64'h1234)
+      `uvm_error("QP_OCC_REPLACEMENT_PROJECTION",
+                 "manager lost or aliased QP OCC recovery authority")
+    qp_cloned_object = recovery_lookup.qp_recovery.clone();
+    if (qp_cloned_object == null ||
+        !$cast(qp_error_replacement, qp_cloned_object))
+      `uvm_fatal("QP_OCC_REPLACEMENT_INVALID_CLONE",
+                 "stored QP OCC recovery clone failed")
+    qp_error_replacement.ambiguous_role = RDMA_QUEUE_ROLE_QP_SQ_PD;
+    expect_status(
+      "QP_OCC_REPLACEMENT_OUT_OF_ORDER_ATOMIC",
+      qp_generic_bypass_rm.mark_qp_error(
+        qp_generic_bypass_candidate.handle, qp_error_replacement
+      ),
+      RDMA_SC_INVALID_STATE
+    );
+    expect_status(
+      "QP_OCC_REPLACEMENT_ATOMIC_LOOKUP",
+      qp_generic_bypass_rm.lookup_recovery(
+        qp_generic_bypass_candidate.handle, recovery_lookup
+      ),
+      RDMA_SC_OK
+    );
+    if (recovery_lookup == null || recovery_lookup.qp_recovery == null ||
+        recovery_lookup.qp_recovery.ambiguous_role !=
+          RDMA_QUEUE_ROLE_QP_SQ_RING)
+      `uvm_error("QP_OCC_REPLACEMENT_ATOMIC",
+                 "rejected OCC replacement changed stored authority")
+
+    begin
+      rdma_queue_backing_role_e pd_roles[$];
+      pd_roles.push_back(RDMA_QUEUE_ROLE_QP_SQ_PD);
+      pd_roles.push_back(RDMA_QUEUE_ROLE_QP_RQ_PD);
+      foreach (pd_roles[i]) begin
+        string label;
+        bit expected_sq_ring_complete;
+        bit expected_sq_pd_complete;
+
+        label = $sformatf("QP_OCC_PD_CLEAR_%0d", i);
+        qp_generic_bypass_candidate.qp_plan.cleanup_complete = 1'b1;
+        qp_generic_bypass_candidate.qp_plan.sq_pd_flush_complete =
+          pd_roles[i] == RDMA_QUEUE_ROLE_QP_RQ_PD;
+        qp_generic_bypass_candidate.qp_plan.rq_pd_flush_complete = 1'b0;
+        expect_status(
+          {label, "_PRECONDITION"},
+          qp_generic_bypass_rm.force_qp_active_precondition(
+            qp_generic_bypass_candidate
+          ),
+          RDMA_SC_OK
+        );
+        qp_qpc_binding_recovery = make_qp_test_recovery(
+          {label, "_INITIAL"}, qp_generic_bypass_candidate,
+          RDMA_QP_RECOVER_CREATE_ROLLBACK,
+          qp_generic_bypass_candidate.programmed_qpc
+        );
+        qp_qpc_binding_recovery.role_complete[
+          RDMA_QUEUE_ROLE_QP_SQ_RING
+        ] = 1'b1;
+        qp_qpc_binding_recovery.role_complete[
+          RDMA_QUEUE_ROLE_QP_SQ_PD
+        ] = pd_roles[i] == RDMA_QUEUE_ROLE_QP_RQ_PD;
+        expected_sq_ring_complete = 1'b1;
+        expected_sq_pd_complete =
+          pd_roles[i] == RDMA_QUEUE_ROLE_QP_RQ_PD;
+        expect_status(
+          {label, "_INITIAL_MARK"},
+          qp_generic_bypass_rm.mark_qp_error(
+            qp_generic_bypass_candidate.handle, qp_qpc_binding_recovery
+          ),
+          RDMA_SC_OK
+        );
+        expect_status(
+          {label, "_INITIAL_LOOKUP"},
+          qp_generic_bypass_rm.lookup_recovery(
+            qp_generic_bypass_candidate.handle, recovery_lookup
+          ),
+          RDMA_SC_OK
+        );
+        qp_cloned_object = recovery_lookup.qp_recovery.clone();
+        if (qp_cloned_object == null ||
+            !$cast(qp_error_replacement, qp_cloned_object))
+          `uvm_fatal({label, "_AMBIG_CLONE"},
+                     "stored QP recovery clone failed")
+        qp_error_replacement.ambiguous_operation =
+          RDMA_QP_AMBIG_OCC_FLUSH;
+        qp_error_replacement.ambiguous_role = pd_roles[i];
+        qp_error_replacement.ambiguous_ticket = make_qp_test_ticket(
+          {label, "_TICKET"}, qp_generic_bypass_candidate.owner,
+          qp_generic_bypass_cmq.handle, qp_error_replacement.occ_opcode
+        );
+        expect_status(
+          {label, "_SET"},
+          qp_generic_bypass_rm.mark_qp_error(
+            qp_generic_bypass_candidate.handle, qp_error_replacement
+          ),
+          RDMA_SC_OK
+        );
+
+        expect_status(
+          {label, "_AMBIG_LOOKUP"},
+          qp_generic_bypass_rm.lookup_recovery(
+            qp_generic_bypass_candidate.handle, recovery_lookup
+          ),
+          RDMA_SC_OK
+        );
+        qp_cloned_object = recovery_lookup.qp_recovery.clone();
+        if (qp_cloned_object == null ||
+            !$cast(qp_error_replacement, qp_cloned_object))
+          `uvm_fatal({label, "_MALFORMED_CLONE"},
+                     "stored QP OCC recovery clone failed")
+        qp_error_replacement.ambiguous_operation = RDMA_QP_AMBIG_NONE;
+        qp_error_replacement.ambiguous_ticket = null;
+        expect_status(
+          {label, "_NONCANONICAL_REJECT"},
+          qp_generic_bypass_rm.mark_qp_error(
+            qp_generic_bypass_candidate.handle, qp_error_replacement
+          ),
+          RDMA_SC_INVALID_ARGUMENT
+        );
+
+        qp_cloned_object = recovery_lookup.qp_recovery.clone();
+        if (qp_cloned_object == null ||
+            !$cast(qp_error_replacement, qp_cloned_object))
+          `uvm_fatal({label, "_PROGRESS_CLONE"},
+                     "stored QP OCC recovery clone failed")
+        qp_error_replacement.ambiguous_operation = RDMA_QP_AMBIG_NONE;
+        qp_error_replacement.ambiguous_role = RDMA_QUEUE_ROLE_QP_SQ_RING;
+        qp_error_replacement.ambiguous_ticket = null;
+        qp_error_replacement.role_complete[
+          RDMA_QUEUE_ROLE_QP_RQ_RING
+        ] = 1'b1;
+        expect_status(
+          {label, "_PROGRESS_REJECT"},
+          qp_generic_bypass_rm.mark_qp_error(
+            qp_generic_bypass_candidate.handle, qp_error_replacement
+          ),
+          RDMA_SC_INVALID_ARGUMENT
+        );
+        expect_status(
+          {label, "_REJECT_ATOMIC_LOOKUP"},
+          qp_generic_bypass_rm.lookup_recovery(
+            qp_generic_bypass_candidate.handle, recovery_lookup
+          ),
+          RDMA_SC_OK
+        );
+        if (recovery_lookup == null || recovery_lookup.qp_recovery == null ||
+            recovery_lookup.qp_recovery.ambiguous_operation !=
+              RDMA_QP_AMBIG_OCC_FLUSH ||
+            recovery_lookup.qp_recovery.ambiguous_role != pd_roles[i] ||
+            recovery_lookup.qp_recovery.ambiguous_ticket == null ||
+            recovery_lookup.qp_recovery.role_complete[
+              RDMA_QUEUE_ROLE_QP_RQ_RING
+            ])
+          `uvm_error({label, "_REJECT_ATOMIC"},
+                     "rejected OCC clear changed stored recovery")
+
+        qp_cloned_object = recovery_lookup.qp_recovery.clone();
+        if (qp_cloned_object == null ||
+            !$cast(qp_error_replacement, qp_cloned_object))
+          `uvm_fatal({label, "_CLEAR_CLONE"},
+                     "stored QP OCC recovery clone failed")
+        qp_error_replacement.ambiguous_operation = RDMA_QP_AMBIG_NONE;
+        qp_error_replacement.ambiguous_role = RDMA_QUEUE_ROLE_QP_SQ_RING;
+        qp_error_replacement.ambiguous_ticket = null;
+        expect_status(
+          {label, "_CLEAR"},
+          qp_generic_bypass_rm.mark_qp_error(
+            qp_generic_bypass_candidate.handle, qp_error_replacement
+          ),
+          RDMA_SC_OK
+        );
+        expect_status(
+          {label, "_CLEAR_LOOKUP"},
+          qp_generic_bypass_rm.lookup_recovery(
+            qp_generic_bypass_candidate.handle, recovery_lookup
+          ),
+          RDMA_SC_OK
+        );
+        if (recovery_lookup == null || recovery_lookup.qp_recovery == null ||
+            recovery_lookup.qp_recovery.ambiguous_operation !=
+              RDMA_QP_AMBIG_NONE ||
+            recovery_lookup.qp_recovery.ambiguous_role !=
+              RDMA_QUEUE_ROLE_QP_SQ_RING ||
+            recovery_lookup.qp_recovery.ambiguous_ticket != null ||
+            recovery_lookup.qp_recovery.role_complete[
+              RDMA_QUEUE_ROLE_QP_SQ_RING
+            ] != expected_sq_ring_complete ||
+            recovery_lookup.qp_recovery.role_complete[
+              RDMA_QUEUE_ROLE_QP_SQ_PD
+            ] != expected_sq_pd_complete ||
+            recovery_lookup.qp_recovery.qp_plan.cleanup_complete != 1'b1 ||
+            recovery_lookup.qp_recovery.qp_plan.sq_pd_flush_complete !=
+              expected_sq_pd_complete ||
+            recovery_lookup.qp_recovery.qp_plan.rq_pd_flush_complete != 1'b0)
+          `uvm_error({label, "_CLEAR_RESULT"},
+                     "OCC clear lost canonical role or retained progress")
+      end
+      qp_generic_bypass_candidate.qp_plan.cleanup_complete = 1'b0;
+      qp_generic_bypass_candidate.qp_plan.sq_pd_flush_complete = 1'b0;
+      qp_generic_bypass_candidate.qp_plan.rq_pd_flush_complete = 1'b0;
+    end
+
+    expect_status(
+      "QP_ERROR_REPLACEMENT_PRECONDITION",
+      qp_generic_bypass_rm.force_qp_active_precondition(
+        qp_generic_bypass_candidate
+      ),
+      RDMA_SC_OK
+    );
+    expect_status(
+      "QP_ERROR_REPLACEMENT_QUIESCE",
+      qp_generic_bypass_rm.begin_quiesce(
+        qp_generic_bypass_candidate.handle
+      ),
+      RDMA_SC_OK
+    );
+    expect_status(
+      "QP_ERROR_REPLACEMENT_RETAINED_PROGRESS",
+      qp_generic_bypass_rm.record_qp_flush_complete(
+        qp_generic_bypass_candidate.handle, RDMA_QUEUE_ROLE_QP_SQ_RING
+      ),
+      RDMA_SC_OK
+    );
+    expect_status(
+      "QP_ERROR_REPLACEMENT_QP_LOOKUP",
+      qp_generic_bypass_rm.lookup(qp_generic_bypass_candidate.handle,
+                                   resource),
+      RDMA_SC_OK
+    );
+    if (resource == null || !$cast(qp_generic_bypass_lookup, resource))
+      `uvm_fatal("QP_ERROR_REPLACEMENT_QP_LOOKUP",
+                 "replacement precondition QP lookup failed")
+    qp_qpc_binding_recovery = make_qp_test_recovery(
+      "qp_error_ambiguous_destroy", qp_generic_bypass_lookup,
+      RDMA_QP_RECOVER_NORMAL_DESTROY
+    );
+    qp_qpc_binding_recovery.ambiguous_operation = RDMA_QP_AMBIG_DELETE;
+    qp_qpc_binding_recovery.ambiguous_ticket = make_qp_test_ticket(
+      "qp_error_delete_ticket", qp_generic_bypass_candidate.owner,
+      qp_generic_bypass_cmq.handle,
+      qp_qpc_binding_recovery.delete_opcode
+    );
+    qp_qpc_binding_recovery.staging_mapping =
+      make_independent_queue_test_mapping(
+        "qp_error_retained_staging",
+        qp_generic_bypass_candidate.owner,
+        qp_generic_bypass_candidate.handle,
+        64'h0000_8a00_0000_0000
+      );
+    qp_qpc_binding_recovery.staging_mapping.size = 512;
+    expect_status(
+      "QP_ERROR_REPLACEMENT_INITIAL_MARK",
+      qp_generic_bypass_rm.mark_qp_error(
+        qp_generic_bypass_candidate.handle, qp_qpc_binding_recovery
+      ),
+      RDMA_SC_OK
+    );
+    expect_status(
+      "QP_ERROR_REPLACEMENT_INITIAL_LOOKUP",
+      qp_generic_bypass_rm.lookup_recovery(
+        qp_generic_bypass_candidate.handle, recovery_lookup
+      ),
+      RDMA_SC_OK
+    );
+    qp_cloned_object = recovery_lookup.qp_recovery.clone();
+    if (qp_cloned_object == null ||
+        !$cast(qp_nested_recovery_state, qp_cloned_object))
+      `uvm_fatal("QP_ERROR_STAGING_AUTHORITY_CLONE",
+                 "stored staging recovery clone failed")
+    qp_nested_recovery_state.ambiguous_operation = RDMA_QP_AMBIG_NONE;
+    qp_nested_recovery_state.ambiguous_ticket = null;
+    qp_nested_recovery_state.staging_mapping =
+      make_independent_queue_test_mapping(
+        "qp_error_replacement_wrong_staging_authority",
+        qp_generic_bypass_candidate.owner,
+        qp_generic_bypass_candidate.handle,
+        recovery_lookup.qp_recovery.staging_mapping.iova.value
+      );
+    qp_nested_recovery_state.staging_mapping.size = 512;
+    expect_status(
+      "QP_ERROR_STAGING_AUTHORITY_REJECTED",
+      qp_generic_bypass_rm.mark_qp_error(
+        qp_generic_bypass_candidate.handle, qp_nested_recovery_state
+      ),
+      RDMA_SC_INVALID_ARGUMENT
+    );
+    expect_status(
+      "QP_ERROR_REPLACEMENT_SQ_PD_FLUSH",
+      qp_generic_bypass_rm.record_qp_flush_complete(
+        qp_generic_bypass_candidate.handle, RDMA_QUEUE_ROLE_QP_SQ_PD
+      ),
+      RDMA_SC_OK
+    );
+    expect_status(
+      "QP_ERROR_REPLACEMENT_RQ_PD_FLUSH",
+      qp_generic_bypass_rm.record_qp_flush_complete(
+        qp_generic_bypass_candidate.handle, RDMA_QUEUE_ROLE_QP_RQ_PD
+      ),
+      RDMA_SC_OK
+    );
+    expect_status(
+      "QP_ERROR_REPLACEMENT_CONTEXT_OPAQUE_COMPLETE",
+      qp_generic_bypass_rm.complete_qp_context_release(
+        qp_generic_bypass_candidate.handle
+      ),
+      RDMA_SC_OK
+    );
+    expect_status(
+      "QP_ERROR_REPLACEMENT_CONTEXT_AMBIGUITY_GATE",
+      qp_generic_bypass_rm.record_qp_context_cleanup_complete(
+        qp_generic_bypass_candidate.handle
+      ),
+      RDMA_SC_RECOVERY_REQUIRED
+    );
+    expect_status(
+      "QP_ERROR_REPLACEMENT_CONTEXT_AMBIGUITY_ATOMIC",
+      qp_generic_bypass_rm.lookup_recovery(
+        qp_generic_bypass_candidate.handle, recovery_lookup
+      ),
+      RDMA_SC_OK
+    );
+    if (recovery_lookup == null || recovery_lookup.qp_recovery == null ||
+        recovery_lookup.hardware_presence != RDMA_HW_PRESENCE_UNKNOWN ||
+        recovery_lookup.qp_recovery.context_ref.release_complete ||
+        recovery_lookup.qp_recovery.qp_plan.context_ref.release_complete ||
+        recovery_lookup.qp_recovery.ambiguous_operation !=
+          RDMA_QP_AMBIG_DELETE ||
+        recovery_lookup.qp_recovery.ambiguous_ticket == null)
+      `uvm_error("QP_ERROR_REPLACEMENT_CONTEXT_AMBIGUITY_ATOMIC",
+                 "ambiguity-gated context cleanup changed recovery")
+    qp_cloned_object = recovery_lookup.qp_recovery.clone();
+    if (qp_cloned_object == null ||
+        !$cast(qp_error_replacement, qp_cloned_object))
+      `uvm_fatal("QP_ERROR_REPLACEMENT_CLONE",
+                 "stored QP recovery clone failed")
+    qp_error_replacement.ambiguous_operation = RDMA_QP_AMBIG_NONE;
+    qp_error_replacement.ambiguous_ticket = null;
+    // Clearing a DELETE ambiguity requires an explicit presence proof.  The
+    // recovery executor obtains this from the authenticated QPC_QUERY image;
+    // model the same evidence here before allowing local cleanup to proceed.
+    qp_error_replacement.query_presence_known = 1'b1;
+    qp_error_replacement.query_presence = RDMA_HW_PRESENCE_PRESENT;
+    expect_status(
+      "QP_ERROR_REPLACEMENT_RESOLVE",
+      qp_generic_bypass_rm.mark_qp_error(
+        qp_generic_bypass_candidate.handle, qp_error_replacement
+      ),
+      RDMA_SC_OK
+    );
+    expect_status(
+      "QP_ERROR_REPLACEMENT_CONTEXT_CLEANUP",
+      qp_generic_bypass_rm.record_qp_context_cleanup_complete(
+        qp_generic_bypass_candidate.handle
+      ),
+      RDMA_SC_OK
+    );
+    expect_status(
+      "QP_ERROR_REPLACEMENT_RQ_PD_OPAQUE_COMPLETE",
+      qp_generic_bypass_rm.complete_qp_mapping_release(
+        qp_generic_bypass_candidate.handle, RDMA_QUEUE_ROLE_QP_RQ_PD
+      ),
+      RDMA_SC_OK
+    );
+    expect_status(
+      "QP_ERROR_REPLACEMENT_RQ_PD_CLEANUP",
+      qp_generic_bypass_rm.record_qp_cleanup_complete(
+        qp_generic_bypass_candidate.handle, RDMA_QUEUE_ROLE_QP_RQ_PD
+      ),
+      RDMA_SC_OK
+    );
+    expect_status(
+      "QP_ERROR_REPLACEMENT_SQ_PD_OPAQUE_COMPLETE",
+      qp_generic_bypass_rm.complete_qp_mapping_release(
+        qp_generic_bypass_candidate.handle, RDMA_QUEUE_ROLE_QP_SQ_PD
+      ),
+      RDMA_SC_OK
+    );
+    expect_status(
+      "QP_ERROR_REPLACEMENT_SQ_PD_CLEANUP",
+      qp_generic_bypass_rm.record_qp_cleanup_complete(
+        qp_generic_bypass_candidate.handle, RDMA_QUEUE_ROLE_QP_SQ_PD
+      ),
+      RDMA_SC_OK
+    );
+    expect_status(
+      "QP_ERROR_REPLACEMENT_RESOLVED_LOOKUP",
+      qp_generic_bypass_rm.lookup_recovery(
+        qp_generic_bypass_candidate.handle, recovery_lookup
+      ),
+      RDMA_SC_OK
+    );
+    if (recovery_lookup == null || recovery_lookup.qp_recovery == null ||
+        recovery_lookup.qp_recovery.ambiguous_operation !=
+          RDMA_QP_AMBIG_NONE ||
+        recovery_lookup.qp_recovery.ambiguous_ticket != null ||
+        !recovery_lookup.qp_recovery.qp_plan.cleanup_complete ||
+        recovery_lookup.qp_recovery.prior_qpc == null ||
+        recovery_lookup.qp_recovery.prior_qpc.sq_backing.value !=
+          qp_generic_bypass_candidate.programmed_qpc.sq_backing.value)
+      `uvm_error("QP_ERROR_REPLACEMENT_AUTHORITY",
+                 "ERROR replacement lost immutable authority or progress")
+    s = qp_generic_bypass_rm.finalize_qp_release(
+      qp_generic_bypass_candidate.handle
+    );
+    expect_status(
+      "QP_FINALIZE_RETAINED_STAGING_INCOMPLETE", s,
+      RDMA_SC_RECOVERY_REQUIRED
+    );
+    if (s != null && s.code == RDMA_SC_RECOVERY_REQUIRED) begin
+      expect_status(
+        "QP_FINALIZE_RETAINED_STAGING_COMPLETE",
+        qp_generic_bypass_rm.complete_qp_temporary_mapping_release(
+          qp_generic_bypass_candidate.handle, 1'b1
+        ),
+        RDMA_SC_OK
+      );
+      expect_status(
+        "QP_FINALIZE_AFTER_RETAINED_STAGING",
+        qp_generic_bypass_rm.finalize_qp_release(
+          qp_generic_bypass_candidate.handle
+        ),
+        RDMA_SC_OK
+      );
+    end
+
+    qp_rm = new("qp_rm");
+    qp_binding = make_active_binding(
+      "qp_binding", 64'h7270_0000_0000_0001,
+      32'h7270_0101, 32'd72
+    );
+    expect_status("QP_PD_CREATE", qp_rm.create_pd(qp_binding, qp_pd),
+                  RDMA_SC_OK);
+    expect_status("QP_SEND_CQ_CREATE",
+                  qp_rm.create_cq(qp_binding, null, qp_send_cq), RDMA_SC_OK);
+    expect_status("QP_RECV_CQ_CREATE",
+                  qp_rm.create_cq(qp_binding, null, qp_recv_cq), RDMA_SC_OK);
+    expect_status("QP_CMQ_CREATE",
+                  qp_rm.create_cmq(qp_binding, qp_cmq), RDMA_SC_OK);
+    expect_status(
+      "QP_CREATE",
+      qp_rm.create_qp(qp_binding, qp_pd.handle, qp_send_cq.handle,
+                      qp_recv_cq.handle, null, qp_candidate), RDMA_SC_OK
+    );
+    expect_status(
+      "QP_SEQUENCE_FIRST",
+      qp_rm.qp_sequence(qp_candidate.owner, qp_candidate.local_qp_id,
+                        qp_sequence_first), RDMA_SC_OK
+    );
+    prepare_qp_candidate(qp_candidate, qp_pd, qp_send_cq, qp_recv_cq,
+                         "qp_candidate");
+
+    qp_generic_backing_ref = rdma_backing_ref::type_id::create(
+      "qp_generic_backing_ref"
+    );
+    qp_generic_backing_ref.mapping = make_queue_test_mapping(
+      "qp_generic_backing_mapping", qp_candidate.owner,
+      qp_candidate.handle, 64'h0000_8900_0000_0000, 1'b0
+    );
+    qp_generic_backing_ref.ownership = RDMA_OWNERSHIP_BORROWED;
+    qp_candidate.backing_refs.push_back(qp_generic_backing_ref);
+    expect_status("QP_GENERIC_AUTHORITY_REJECTED",
+                  qp_rm.attach_qp_programming(qp_candidate),
+                  RDMA_SC_INVALID_STATE);
+    expect_status("QP_GENERIC_REJECT_LOOKUP",
+                  qp_rm.lookup(qp_candidate.handle, resource), RDMA_SC_OK);
+    if (resource == null || !$cast(qp_failed_lookup, resource) ||
+        qp_failed_lookup.state != RDMA_RESOURCE_ALLOCATED ||
+        qp_failed_lookup.qp_plan != null ||
+        qp_failed_lookup.programmed_qpc != null ||
+        qp_failed_lookup.backing_refs.size() != 0)
+      `uvm_error("QP_GENERIC_REJECT_ATOMIC",
+                 "rejected split authority changed the registry QP")
+    qp_candidate.backing_refs.delete();
+
+    expect_status("QP_ATTACH_PROGRAMMING",
+                  qp_rm.attach_qp_programming(qp_candidate), RDMA_SC_OK);
+    qp_candidate.qp_plan.context_ref.shadow_pointer_base.value += 512;
+    expect_status("QP_ATTACH_LOOKUP",
+                  qp_rm.lookup(qp_candidate.handle, resource), RDMA_SC_OK);
+    if (resource == null || !$cast(qp_lookup, resource) ||
+        qp_lookup.state != RDMA_RESOURCE_PROGRAMMED ||
+        qp_lookup.qp_plan == null || qp_lookup.programmed_qpc == null ||
+        qp_lookup.qp_plan === qp_candidate.qp_plan ||
+        qp_lookup.programmed_qpc === qp_candidate.programmed_qpc ||
+        qp_lookup.qp_plan.context_ref.shadow_pointer_base.value !=
+          64'h0000_8600_0000_0000)
+      `uvm_error("QP_ATTACH_SNAPSHOT",
+                 "QP programming was not published as a detached snapshot")
+    expect_status("QP_ACTIVATE", qp_rm.activate(qp_lookup.handle),
+                  RDMA_SC_OK);
+
+    expect_status("QP_SEMANTIC_RESET_TO_INIT",
+                  qp_rm.commit_qp_semantic_state(qp_lookup.handle,
+                                                  RDMA_QPS_INIT),
+                  RDMA_SC_OK);
+    expect_status("QP_SEMANTIC_DUPLICATE",
+                  qp_rm.commit_qp_semantic_state(qp_lookup.handle,
+                                                  RDMA_QPS_INIT),
+                  RDMA_SC_INVALID_STATE);
+    expect_status("QP_SEMANTIC_LOOKUP",
+                  qp_rm.lookup(qp_lookup.handle, resource), RDMA_SC_OK);
+    if (resource == null || !$cast(qp_lookup, resource) ||
+        qp_lookup.state != RDMA_RESOURCE_ACTIVE ||
+        qp_lookup.qp_state != RDMA_QPS_INIT ||
+        qp_lookup.programmed_qpc == null ||
+        qp_lookup.programmed_qpc.state != RDMA_QPS_RESET)
+      `uvm_error("QP_SEMANTIC_AUTHORITY",
+                 "software-only INIT changed programmed QPC authority")
+
+    qp_cloned_object = qp_lookup.clone();
+    if (qp_cloned_object == null ||
+        !$cast(qp_nested_candidate, qp_cloned_object) ||
+        qp_nested_candidate.qp_plan == null ||
+        qp_nested_candidate.qp_plan.context_ref == null ||
+        !$cast(qp_nested_context_token,
+               qp_nested_candidate.qp_plan.context_ref.slot_token))
+      `uvm_fatal("QP_NESTED_CONTEXT_CANDIDATE",
+                 "QP context-authority candidate clone failed")
+    qp_nested_context_authority =
+      rdma_queue_completion_authority::type_id::create(
+        "qp_nested_replacement_context_authority"
+      );
+    qp_nested_context_token.completion_authority =
+      qp_nested_context_authority;
+    expect_status("QP_NESTED_CONTEXT_AUTHORITY_REJECTED",
+                  qp_rm.commit_qp_programmed(qp_nested_candidate),
+                  RDMA_SC_INVALID_ARGUMENT);
+
+    qp_cloned_object = qp_lookup.clone();
+    if (qp_cloned_object == null ||
+        !$cast(qp_nested_candidate, qp_cloned_object) ||
+        qp_nested_candidate.qp_plan == null ||
+        qp_nested_candidate.qp_plan.sq_pd_ref == null ||
+        qp_nested_candidate.qp_plan.sq_pd_ref.mapping == null)
+      `uvm_fatal("QP_NESTED_MAPPING_CANDIDATE",
+                 "QP mapping-authority candidate clone failed")
+    qp_nested_mapping = make_independent_queue_test_mapping(
+      "qp_nested_replacement_sq_pd", qp_lookup.owner, qp_lookup.handle,
+      qp_nested_candidate.qp_plan.sq_pd_ref.mapping.iova.value
+    );
+    qp_nested_candidate.qp_plan.sq_pd_ref.mapping = qp_nested_mapping;
+    expect_status("QP_NESTED_MAPPING_AUTHORITY_REJECTED",
+                  qp_rm.commit_qp_programmed(qp_nested_candidate),
+                  RDMA_SC_INVALID_ARGUMENT);
+    expect_status("QP_NESTED_AUTHORITY_ATOMIC_LOOKUP",
+                  qp_rm.lookup(qp_lookup.handle, resource), RDMA_SC_OK);
+    if (resource == null || !$cast(qp_lookup, resource) ||
+        qp_lookup.state != RDMA_RESOURCE_ACTIVE ||
+        qp_lookup.qp_state != RDMA_QPS_INIT ||
+        qp_lookup.programmed_qpc.state != RDMA_QPS_RESET ||
+        !$cast(qp_nested_context_token,
+               qp_lookup.qp_plan.context_ref.slot_token) ||
+        qp_nested_context_token.completion_authority ===
+          qp_nested_context_authority)
+      `uvm_error("QP_NESTED_AUTHORITY_ATOMIC",
+                 "rejected nested authority changed the registry QP")
+
+    qp_cloned_object = qp_lookup.clone();
+    if (qp_cloned_object == null ||
+        !$cast(qp_failed_lookup, qp_cloned_object))
+      `uvm_fatal("QP_FAILED_CANDIDATE", "QP clone failed")
+    qp_failed_lookup.qp_state = RDMA_QPS_RTR;
+    qp_failed_lookup.programmed_qpc.state = RDMA_QPS_RTR;
+    qp_failed_lookup.programmed_qpc.sq_backing.value += 4096;
+    expect_status("QP_PROGRAMMED_BAD_CANDIDATE",
+                  qp_rm.commit_qp_programmed(qp_failed_lookup),
+                  RDMA_SC_INVALID_STATE);
+    expect_status("QP_PROGRAMMED_BAD_LOOKUP",
+                  qp_rm.lookup(qp_lookup.handle, resource), RDMA_SC_OK);
+    if (resource == null || !$cast(qp_lookup, resource) ||
+        qp_lookup.qp_state != RDMA_QPS_INIT ||
+        qp_lookup.programmed_qpc.state != RDMA_QPS_RESET)
+      `uvm_error("QP_PROGRAMMED_BAD_ATOMIC",
+                 "failed programmed candidate partially changed registry")
+
+    qp_cloned_object = qp_lookup.clone();
+    if (qp_cloned_object == null || !$cast(qp_candidate, qp_cloned_object))
+      `uvm_fatal("QP_PROGRAMMED_CANDIDATE", "QP clone failed")
+    qp_candidate.qp_state = RDMA_QPS_RTR;
+    qp_candidate.programmed_qpc.state = RDMA_QPS_RTR;
+    qp_candidate.sq_producer_index = 1;
+    expect_status("QP_PROGRAMMED_COMMIT",
+                  qp_rm.commit_qp_programmed(qp_candidate), RDMA_SC_OK);
+    expect_status("QP_PROGRAMMED_LOOKUP",
+                  qp_rm.lookup(qp_candidate.handle, resource), RDMA_SC_OK);
+    if (resource == null || !$cast(qp_lookup, resource) ||
+        qp_lookup.qp_state != RDMA_QPS_RTR ||
+        qp_lookup.programmed_qpc.state != RDMA_QPS_RTR ||
+        qp_lookup.sq_producer_index != 0)
+      `uvm_error("QP_PROGRAMMED_AUTHORITY",
+                 "programmed commit leaked unrelated caller QP fields")
+
+    qp_recovery_state = make_qp_test_recovery(
+      "qp_destroy_recovery", qp_lookup, RDMA_QP_RECOVER_NORMAL_DESTROY
+    );
+    qp_recovery_state.query_mapping =
+      make_independent_queue_test_mapping(
+        "qp_destroy_retained_query", qp_lookup.owner, qp_lookup.handle,
+        64'h0000_8b00_0000_0000
+      );
+    qp_recovery_state.query_mapping.size = 512;
+    expect_status("QP_MARK_ERROR",
+                  qp_rm.mark_qp_error(qp_lookup.handle, qp_recovery_state),
+                  RDMA_SC_OK);
+    qp_recovery_state.role_complete[RDMA_QUEUE_ROLE_QP_SQ_PD] = 1'b1;
+    expect_status("QP_MARK_ERROR_LOOKUP",
+                  qp_rm.lookup_recovery(qp_lookup.handle, recovery_lookup),
+                  RDMA_SC_OK);
+    if (recovery_lookup == null || !recovery_lookup.qp_recovery_valid ||
+        recovery_lookup.qp_recovery == null ||
+        recovery_lookup.hardware_presence != RDMA_HW_PRESENCE_PRESENT ||
+        recovery_lookup.qp_recovery === qp_recovery_state ||
+        recovery_lookup.qp_recovery.
+          role_complete[RDMA_QUEUE_ROLE_QP_SQ_PD])
+      `uvm_error("QP_MARK_ERROR_SNAPSHOT",
+                 "QP recovery was not cloned before ERROR publication")
+    expect_status("QP_ERROR_RESOURCE_LOOKUP",
+                  qp_rm.lookup(qp_lookup.handle, resource), RDMA_SC_OK);
+    if (resource == null || resource.state != RDMA_RESOURCE_ERROR)
+      `uvm_error("QP_MARK_ERROR_ATOMIC",
+                 "QP recovery and ERROR state were not published together")
+
+    // ERROR authority retains the QPN; another allocation cannot reuse it.
+    expect_status(
+      "QP_CREATE_WHILE_ERROR",
+      qp_rm.create_qp(qp_binding, qp_pd.handle, qp_send_cq.handle,
+                      qp_recv_cq.handle, null, qp_restore), RDMA_SC_OK
+    );
+    if (qp_restore.local_qp_id == qp_lookup.local_qp_id)
+      `uvm_error("QP_ERROR_IDENTITY_RETAINED",
+                 "ERROR QPN was returned before finalization")
+
+    expect_status("QP_FLUSH_PREDECESSOR",
+                  qp_rm.record_qp_flush_complete(
+                    qp_lookup.handle, RDMA_QUEUE_ROLE_QP_SQ_PD
+                  ), RDMA_SC_INVALID_STATE);
+    expect_status("QP_QPN_FLUSH",
+                  qp_rm.record_qp_flush_complete(
+                    qp_lookup.handle, RDMA_QUEUE_ROLE_QP_SQ_RING
+                  ), RDMA_SC_OK);
+    expect_status("QP_QPN_FLUSH_DUPLICATE",
+                  qp_rm.record_qp_flush_complete(
+                    qp_lookup.handle, RDMA_QUEUE_ROLE_QP_SQ_RING
+                  ), RDMA_SC_INVALID_ARGUMENT);
+    expect_status("QP_CONTEXT_BEFORE_REQUIRED_FLUSHES",
+                  qp_rm.record_qp_context_cleanup_complete(qp_lookup.handle),
+                  RDMA_SC_INVALID_STATE);
+    expect_status("QP_CONTEXT_PREDECESSOR_ATOMIC_LOOKUP",
+                  qp_rm.lookup_recovery(qp_lookup.handle, recovery_lookup),
+                  RDMA_SC_OK);
+    if (recovery_lookup == null || recovery_lookup.qp_recovery == null ||
+        recovery_lookup.qp_recovery.context_ref.release_complete ||
+        recovery_lookup.qp_recovery.qp_plan.context_ref.release_complete)
+      `uvm_error("QP_CONTEXT_PREDECESSOR_ATOMIC",
+                 "failed context predecessor changed recovery progress")
+    expect_status("QP_SQ_PD_FLUSH",
+                  qp_rm.record_qp_flush_complete(
+                    qp_lookup.handle, RDMA_QUEUE_ROLE_QP_SQ_PD
+                  ), RDMA_SC_OK);
+    expect_status("QP_RQ_PD_FLUSH",
+                  qp_rm.record_qp_flush_complete(
+                    qp_lookup.handle, RDMA_QUEUE_ROLE_QP_RQ_PD
+                  ), RDMA_SC_OK);
+    expect_status("QP_CONTEXT_OPAQUE_PROOF_REQUIRED",
+                  qp_rm.record_qp_context_cleanup_complete(qp_lookup.handle),
+                  RDMA_SC_RECOVERY_REQUIRED);
+    expect_status("QP_CONTEXT_OPAQUE_ATOMIC_LOOKUP",
+                  qp_rm.lookup_recovery(qp_lookup.handle, recovery_lookup),
+                  RDMA_SC_OK);
+    if (recovery_lookup == null || recovery_lookup.qp_recovery == null ||
+        recovery_lookup.qp_recovery.context_ref.release_complete ||
+        recovery_lookup.qp_recovery.qp_plan.context_ref.release_complete)
+      `uvm_error("QP_CONTEXT_OPAQUE_ATOMIC",
+                 "failed opaque context proof changed recovery progress")
+    expect_status("QP_CONTEXT_OPAQUE_COMPLETE",
+                  qp_rm.complete_qp_context_release(qp_lookup.handle),
+                  RDMA_SC_OK);
+    expect_status("QP_CONTEXT_CLEANUP",
+                  qp_rm.record_qp_context_cleanup_complete(qp_lookup.handle),
+                  RDMA_SC_OK);
+    expect_status("QP_CONTEXT_ABSENCE_LOOKUP",
+                  qp_rm.lookup_recovery(qp_lookup.handle, recovery_lookup),
+                  RDMA_SC_OK);
+    if (recovery_lookup == null ||
+        recovery_lookup.hardware_presence != RDMA_HW_PRESENCE_ABSENT)
+      `uvm_error("QP_CONTEXT_ABSENCE",
+                 "ERROR context completion did not persist hardware absence")
+    expect_status("QP_CONTEXT_CLEANUP_DUPLICATE",
+                  qp_rm.record_qp_context_cleanup_complete(qp_lookup.handle),
+                  RDMA_SC_INVALID_ARGUMENT);
+    expect_status("QP_BORROWED_RQ_RING_CLEANUP_REJECTED",
+                  qp_rm.record_qp_cleanup_complete(
+                    qp_lookup.handle, RDMA_QUEUE_ROLE_QP_RQ_RING
+                  ), RDMA_SC_INVALID_ARGUMENT);
+    expect_status("QP_BORROWED_SQ_RING_CLEANUP_REJECTED",
+                  qp_rm.record_qp_cleanup_complete(
+                    qp_lookup.handle, RDMA_QUEUE_ROLE_QP_SQ_RING
+                  ), RDMA_SC_INVALID_ARGUMENT);
+    expect_status("QP_SQ_PD_REVERSE_PREDECESSOR",
+                  qp_rm.record_qp_cleanup_complete(
+                    qp_lookup.handle, RDMA_QUEUE_ROLE_QP_SQ_PD
+                  ), RDMA_SC_INVALID_STATE);
+    expect_status("QP_SQ_PD_OPAQUE_COMPLETE",
+                  qp_rm.complete_qp_mapping_release(
+                    qp_lookup.handle, RDMA_QUEUE_ROLE_QP_SQ_PD
+                  ), RDMA_SC_OK);
+    expect_status("QP_SQ_PD_REVERSE_PREDECESSOR_AFTER_PROOF",
+                  qp_rm.record_qp_cleanup_complete(
+                    qp_lookup.handle, RDMA_QUEUE_ROLE_QP_SQ_PD
+                  ), RDMA_SC_INVALID_STATE);
+    expect_status("QP_SQ_PD_REVERSE_ATOMIC_LOOKUP",
+                  qp_rm.lookup_recovery(qp_lookup.handle, recovery_lookup),
+                  RDMA_SC_OK);
+    if (recovery_lookup == null || recovery_lookup.qp_recovery == null ||
+        recovery_lookup.qp_recovery.
+          role_complete[RDMA_QUEUE_ROLE_QP_SQ_PD] ||
+        recovery_lookup.qp_recovery.qp_plan.sq_pd_ref.cleanup_complete)
+      `uvm_error("QP_SQ_PD_REVERSE_ATOMIC",
+                 "rejected SQ PD cleanup changed recovery progress")
+    expect_status("QP_RQ_PD_OPAQUE_PROOF_REQUIRED",
+                  qp_rm.record_qp_cleanup_complete(
+                    qp_lookup.handle, RDMA_QUEUE_ROLE_QP_RQ_PD
+                  ), RDMA_SC_RECOVERY_REQUIRED);
+    expect_status("QP_RQ_PD_OPAQUE_COMPLETE",
+                  qp_rm.complete_qp_mapping_release(
+                    qp_lookup.handle, RDMA_QUEUE_ROLE_QP_RQ_PD
+                  ), RDMA_SC_OK);
+    expect_status("QP_RQ_PD_CLEANUP",
+                  qp_rm.record_qp_cleanup_complete(
+                    qp_lookup.handle, RDMA_QUEUE_ROLE_QP_RQ_PD
+                  ), RDMA_SC_OK);
+    expect_status("QP_FINALIZE_BEFORE_ALL_BACKING",
+                  qp_rm.finalize_qp_release(qp_lookup.handle),
+                  RDMA_SC_RECOVERY_REQUIRED);
+    expect_status("QP_SQ_PD_CLEANUP",
+                  qp_rm.record_qp_cleanup_complete(
+                    qp_lookup.handle, RDMA_QUEUE_ROLE_QP_SQ_PD
+                  ), RDMA_SC_OK);
+    expect_status("QP_SQ_PD_CLEANUP_DUPLICATE",
+                  qp_rm.record_qp_cleanup_complete(
+                    qp_lookup.handle, RDMA_QUEUE_ROLE_QP_SQ_PD
+                  ), RDMA_SC_INVALID_ARGUMENT);
+    expect_status(
+      "QP_FINALIZE_CONTEXT_AUTHORITY_REPLACE",
+      qp_rm.replace_qp_recovery_context_authority(qp_lookup.handle),
+      RDMA_SC_OK
+    );
+    expect_status("QP_FINALIZE_CONTEXT_AUTHORITY_REJECTED",
+                  qp_rm.finalize_qp_release(qp_lookup.handle),
+                  RDMA_SC_INVALID_ARGUMENT);
+    expect_status(
+      "QP_FINALIZE_CONTEXT_AUTHORITY_RESTORE",
+      qp_rm.restore_qp_recovery_context_authority(qp_lookup.handle),
+      RDMA_SC_OK
+    );
+    s = qp_rm.finalize_qp_release(qp_lookup.handle);
+    expect_status("QP_FINALIZE_RETAINED_QUERY_INCOMPLETE", s,
+                  RDMA_SC_RECOVERY_REQUIRED);
+    if (s != null && s.code == RDMA_SC_RECOVERY_REQUIRED) begin
+      expect_status(
+        "QP_FINALIZE_RETAINED_QUERY_COMPLETE",
+        qp_rm.complete_qp_temporary_mapping_release(
+          qp_lookup.handle, 1'b0
+        ),
+        RDMA_SC_OK
+      );
+      expect_status(
+        "QP_FINALIZE_FORCE_HARDWARE_PRESENT",
+        qp_rm.set_qp_recovery_hardware_presence(
+          qp_lookup.handle, RDMA_HW_PRESENCE_PRESENT
+        ),
+        RDMA_SC_OK
+      );
+      expect_status("QP_FINALIZE_HARDWARE_ABSENCE_REQUIRED",
+                    qp_rm.finalize_qp_release(qp_lookup.handle),
+                    RDMA_SC_RECOVERY_REQUIRED);
+      expect_status("QP_FINALIZE_HARDWARE_GATE_RESOURCE_ATOMIC",
+                    qp_rm.lookup(qp_lookup.handle, resource), RDMA_SC_OK);
+      expect_status("QP_FINALIZE_HARDWARE_GATE_RECOVERY_ATOMIC",
+                    qp_rm.lookup_recovery(qp_lookup.handle,
+                                          recovery_lookup), RDMA_SC_OK);
+      if (resource == null || resource.state != RDMA_RESOURCE_ERROR ||
+          recovery_lookup == null ||
+          recovery_lookup.hardware_presence != RDMA_HW_PRESENCE_PRESENT)
+        `uvm_error("QP_FINALIZE_HARDWARE_GATE_ATOMIC",
+                   "hardware-presence rejection changed QP authority")
+      expect_status(
+        "QP_FINALIZE_RESTORE_HARDWARE_ABSENT",
+        qp_rm.set_qp_recovery_hardware_presence(
+          qp_lookup.handle, RDMA_HW_PRESENCE_ABSENT
+        ),
+        RDMA_SC_OK
+      );
+      expect_status("QP_FINALIZE_RELEASE",
+                    qp_rm.finalize_qp_release(qp_lookup.handle), RDMA_SC_OK);
+    end
+    expect_status("QP_FINALIZE_RELEASE_DUPLICATE",
+                  qp_rm.finalize_qp_release(qp_lookup.handle),
+                  RDMA_SC_INVALID_STATE);
+
+    expect_status(
+      "QP_REUSE_CREATE",
+      qp_rm.create_qp(qp_binding, qp_pd.handle, qp_send_cq.handle,
+                      qp_recv_cq.handle, null, qp_reused), RDMA_SC_OK
+    );
+    if (qp_reused.local_qp_id != qp_lookup.local_qp_id)
+      `uvm_error("QP_REUSE_LOCAL_ID", "finalized QPN was not reused")
+    expect_status(
+      "QP_SEQUENCE_REUSED",
+      qp_rm.qp_sequence(qp_reused.owner, qp_reused.local_qp_id,
+                        qp_sequence_reused), RDMA_SC_OK
+    );
+    if (qp_sequence_reused != qp_sequence_first + 8'd1)
+      `uvm_error("QP_SEQUENCE_INCREMENT",
+                 $sformatf("expected sequence %0d got %0d",
+                           qp_sequence_first + 1'b1, qp_sequence_reused))
+
+    // URC owned backing retires in exact reverse dependency order before
+    // the ordinary private-RQ and SQ page-directory roles.
+    expect_status(
+      "QP_URC_CREATE",
+      qp_rm.create_qp(qp_binding, qp_pd.handle, qp_send_cq.handle,
+                      qp_recv_cq.handle, null, qp_urc), RDMA_SC_OK
+    );
+    prepare_urc_qp_candidate(qp_urc, qp_pd, qp_send_cq, qp_recv_cq,
+                             "qp_urc");
+    expect_status("QP_URC_ATTACH", qp_rm.attach_qp_programming(qp_urc),
+                  RDMA_SC_OK);
+    expect_status("QP_URC_ACTIVATE", qp_rm.activate(qp_urc.handle),
+                  RDMA_SC_OK);
+    qp_urc_recovery_state = make_qp_test_recovery(
+      "qp_urc_destroy_recovery", qp_urc, RDMA_QP_RECOVER_NORMAL_DESTROY
+    );
+    expect_status("QP_URC_MARK_ERROR",
+                  qp_rm.mark_qp_error(qp_urc.handle,
+                                       qp_urc_recovery_state), RDMA_SC_OK);
+    expect_status("QP_URC_QPN_FLUSH",
+                  qp_rm.record_qp_flush_complete(
+                    qp_urc.handle, RDMA_QUEUE_ROLE_QP_SQ_RING
+                  ), RDMA_SC_OK);
+    expect_status("QP_URC_SQ_PD_FLUSH",
+                  qp_rm.record_qp_flush_complete(
+                    qp_urc.handle, RDMA_QUEUE_ROLE_QP_SQ_PD
+                  ), RDMA_SC_OK);
+    expect_status("QP_URC_RQ_PD_FLUSH",
+                  qp_rm.record_qp_flush_complete(
+                    qp_urc.handle, RDMA_QUEUE_ROLE_QP_RQ_PD
+                  ), RDMA_SC_OK);
+    expect_status("QP_URC_CONTEXT_OPAQUE_COMPLETE",
+                  qp_rm.complete_qp_context_release(qp_urc.handle),
+                  RDMA_SC_OK);
+    expect_status("QP_URC_CONTEXT_CLEANUP",
+                  qp_rm.record_qp_context_cleanup_complete(qp_urc.handle),
+                  RDMA_SC_OK);
+    expect_status("QP_URC_DSQ_OPAQUE_COMPLETE",
+                  qp_rm.complete_qp_mapping_release(
+                    qp_urc.handle, RDMA_QUEUE_ROLE_QP_URC_DSQ
+                  ), RDMA_SC_OK);
+    expect_status("QP_URC_RDSQ_OPAQUE_COMPLETE",
+                  qp_rm.complete_qp_mapping_release(
+                    qp_urc.handle, RDMA_QUEUE_ROLE_QP_URC_RDSQ
+                  ), RDMA_SC_OK);
+    expect_status("QP_URC_RSQ_OPAQUE_COMPLETE",
+                  qp_rm.complete_qp_mapping_release(
+                    qp_urc.handle, RDMA_QUEUE_ROLE_QP_URC_RSQ
+                  ), RDMA_SC_OK);
+    expect_status("QP_URC_RDSQ_BEFORE_DSQ_REJECTED",
+                  qp_rm.record_qp_cleanup_complete(
+                    qp_urc.handle, RDMA_QUEUE_ROLE_QP_URC_RDSQ
+                  ), RDMA_SC_INVALID_STATE);
+    expect_status("QP_URC_RDSQ_REJECTION_ATOMIC_LOOKUP",
+                  qp_rm.lookup_recovery(qp_urc.handle, recovery_lookup),
+                  RDMA_SC_OK);
+    if (recovery_lookup == null || recovery_lookup.qp_recovery == null ||
+        recovery_lookup.qp_recovery.
+          role_complete[RDMA_QUEUE_ROLE_QP_URC_DSQ] ||
+        recovery_lookup.qp_recovery.
+          role_complete[RDMA_QUEUE_ROLE_QP_URC_RDSQ] ||
+        recovery_lookup.qp_recovery.
+          role_complete[RDMA_QUEUE_ROLE_QP_URC_RSQ])
+      `uvm_error("QP_URC_RDSQ_REJECTION_ATOMIC",
+                 "rejected RDSQ cleanup changed URC progress")
+    expect_status("QP_URC_DSQ_CLEANUP",
+                  qp_rm.record_qp_cleanup_complete(
+                    qp_urc.handle, RDMA_QUEUE_ROLE_QP_URC_DSQ
+                  ), RDMA_SC_OK);
+    expect_status("QP_URC_RSQ_BEFORE_RDSQ_REJECTED",
+                  qp_rm.record_qp_cleanup_complete(
+                    qp_urc.handle, RDMA_QUEUE_ROLE_QP_URC_RSQ
+                  ), RDMA_SC_INVALID_STATE);
+    expect_status("QP_URC_RSQ_REJECTION_ATOMIC_LOOKUP",
+                  qp_rm.lookup_recovery(qp_urc.handle, recovery_lookup),
+                  RDMA_SC_OK);
+    if (recovery_lookup == null || recovery_lookup.qp_recovery == null ||
+        !recovery_lookup.qp_recovery.
+          role_complete[RDMA_QUEUE_ROLE_QP_URC_DSQ] ||
+        recovery_lookup.qp_recovery.
+          role_complete[RDMA_QUEUE_ROLE_QP_URC_RDSQ] ||
+        recovery_lookup.qp_recovery.
+          role_complete[RDMA_QUEUE_ROLE_QP_URC_RSQ])
+      `uvm_error("QP_URC_RSQ_REJECTION_ATOMIC",
+                 "rejected RSQ cleanup changed URC progress")
+    expect_status("QP_URC_RDSQ_CLEANUP",
+                  qp_rm.record_qp_cleanup_complete(
+                    qp_urc.handle, RDMA_QUEUE_ROLE_QP_URC_RDSQ
+                  ), RDMA_SC_OK);
+    expect_status("QP_URC_RSQ_CLEANUP",
+                  qp_rm.record_qp_cleanup_complete(
+                    qp_urc.handle, RDMA_QUEUE_ROLE_QP_URC_RSQ
+                  ), RDMA_SC_OK);
+    expect_status("QP_URC_RQ_PD_OPAQUE_COMPLETE",
+                  qp_rm.complete_qp_mapping_release(
+                    qp_urc.handle, RDMA_QUEUE_ROLE_QP_RQ_PD
+                  ), RDMA_SC_OK);
+    expect_status("QP_URC_RQ_PD_CLEANUP",
+                  qp_rm.record_qp_cleanup_complete(
+                    qp_urc.handle, RDMA_QUEUE_ROLE_QP_RQ_PD
+                  ), RDMA_SC_OK);
+    expect_status("QP_URC_SQ_PD_OPAQUE_COMPLETE",
+                  qp_rm.complete_qp_mapping_release(
+                    qp_urc.handle, RDMA_QUEUE_ROLE_QP_SQ_PD
+                  ), RDMA_SC_OK);
+    expect_status("QP_URC_SQ_PD_CLEANUP",
+                  qp_rm.record_qp_cleanup_complete(
+                    qp_urc.handle, RDMA_QUEUE_ROLE_QP_SQ_PD
+                  ), RDMA_SC_OK);
+    expect_status("QP_URC_FINALIZE",
+                  qp_rm.finalize_qp_release(qp_urc.handle), RDMA_SC_OK);
+
+    // Reconciliation accepts only a complete desired ACTIVE replacement.
+    // Selecting the prior QPC therefore requires its retained semantic state
+    // and every unrelated QP field from the authoritative ERROR snapshot.
+    prepare_qp_candidate(qp_reused, qp_pd, qp_send_cq, qp_recv_cq,
+                         "qp_prior_restore");
+    expect_status("QP_PRIOR_ATTACH",
+                  qp_rm.attach_qp_programming(qp_reused), RDMA_SC_OK);
+    expect_status("QP_PRIOR_ACTIVATE", qp_rm.activate(qp_reused.handle),
+                  RDMA_SC_OK);
+    expect_status("QP_PRIOR_SEMANTIC_INIT",
+                  qp_rm.commit_qp_semantic_state(qp_reused.handle,
+                                                  RDMA_QPS_INIT),
+                  RDMA_SC_OK);
+    expect_status("QP_PRIOR_LOOKUP",
+                  qp_rm.lookup(qp_reused.handle, resource), RDMA_SC_OK);
+    if (resource == null || !$cast(qp_reused, resource))
+      `uvm_fatal("QP_PRIOR_LOOKUP", "QP prior lookup cast failed")
+    qp_cloned_object = qp_reused.clone();
+    if (qp_cloned_object == null ||
+        !$cast(qp_prior_candidate, qp_cloned_object))
+      `uvm_fatal("QP_PRIOR_CANDIDATE", "QP prior candidate clone failed")
+    qp_prior_candidate.qp_state = RDMA_QPS_RTR;
+    qp_prior_candidate.programmed_qpc.state = RDMA_QPS_RTR;
+    qp_prior_recovery_state = make_qp_test_recovery(
+      "qp_prior_recovery", qp_reused,
+      RDMA_QP_RECOVER_MODIFY_RECONCILE,
+      qp_prior_candidate.programmed_qpc
+    );
+    qp_prior_recovery_state.query_mapping =
+      make_independent_queue_test_mapping(
+        "qp_prior_retained_query", qp_reused.owner, qp_reused.handle,
+        64'h0000_8d00_0000_0000
+      );
+    qp_prior_recovery_state.query_mapping.size = 512;
+    expect_status("QP_PRIOR_MARK_ERROR",
+                  qp_rm.mark_qp_error(qp_reused.handle,
+                                       qp_prior_recovery_state),
+                  RDMA_SC_OK);
+    qp_cloned_object = qp_prior_recovery_state.prior_qpc.clone();
+    if (qp_cloned_object == null ||
+        !$cast(qp_prior_candidate.programmed_qpc, qp_cloned_object))
+      `uvm_fatal("QP_PRIOR_EXPECTED_QPC", "prior QPC clone failed")
+    expect_status(
+      "QP_PRIOR_QUERY_OPAQUE_COMPLETE",
+      qp_rm.complete_qp_temporary_mapping_release(qp_reused.handle, 1'b0),
+      RDMA_SC_OK
+    );
+    expect_status("QP_PRIOR_SEMANTIC_MISMATCH_REJECTED",
+                  qp_rm.commit_qp_programmed(qp_prior_candidate),
+                  RDMA_SC_INVALID_ARGUMENT);
+    expect_status("QP_PRIOR_SEMANTIC_ATOMIC_RESOURCE",
+                  qp_rm.lookup(qp_reused.handle, resource), RDMA_SC_OK);
+    expect_status("QP_PRIOR_SEMANTIC_ATOMIC_RECOVERY",
+                  qp_rm.lookup_recovery(qp_reused.handle, recovery_lookup),
+                  RDMA_SC_OK);
+    if (resource == null || !$cast(qp_failed_lookup, resource) ||
+        qp_failed_lookup.state != RDMA_RESOURCE_ERROR ||
+        qp_failed_lookup.qp_state != RDMA_QPS_INIT ||
+        qp_failed_lookup.programmed_qpc.state != RDMA_QPS_RESET ||
+        recovery_lookup == null || recovery_lookup.qp_recovery == null ||
+        recovery_lookup.qp_recovery.intent !=
+          RDMA_QP_RECOVER_MODIFY_RECONCILE)
+      `uvm_error("QP_PRIOR_SEMANTIC_ATOMIC",
+                 "semantic mismatch changed registry or recovery")
+    qp_prior_candidate.qp_state = RDMA_QPS_INIT;
+    qp_prior_candidate.sq_producer_index = 1;
+    expect_status("QP_PRIOR_INDEX_MISMATCH_REJECTED",
+                  qp_rm.commit_qp_programmed(qp_prior_candidate),
+                  RDMA_SC_INVALID_ARGUMENT);
+    expect_status("QP_PRIOR_INDEX_ATOMIC_RESOURCE",
+                  qp_rm.lookup(qp_reused.handle, resource), RDMA_SC_OK);
+    expect_status("QP_PRIOR_INDEX_ATOMIC_RECOVERY",
+                  qp_rm.lookup_recovery(qp_reused.handle, recovery_lookup),
+                  RDMA_SC_OK);
+    if (resource == null || !$cast(qp_failed_lookup, resource) ||
+        qp_failed_lookup.state != RDMA_RESOURCE_ERROR ||
+        qp_failed_lookup.sq_producer_index != 0 ||
+        recovery_lookup == null || recovery_lookup.qp_recovery == null)
+      `uvm_error("QP_PRIOR_INDEX_ATOMIC",
+                 "index mismatch changed registry or recovery")
+    qp_prior_candidate.sq_producer_index = 0;
+    qp_prior_candidate.sq_iova.value += 4096;
+    expect_status("QP_PRIOR_IOVA_MISMATCH_REJECTED",
+                  qp_rm.commit_qp_programmed(qp_prior_candidate),
+                  RDMA_SC_INVALID_ARGUMENT);
+    expect_status("QP_PRIOR_IOVA_ATOMIC_RESOURCE",
+                  qp_rm.lookup(qp_reused.handle, resource), RDMA_SC_OK);
+    expect_status("QP_PRIOR_IOVA_ATOMIC_RECOVERY",
+                  qp_rm.lookup_recovery(qp_reused.handle, recovery_lookup),
+                  RDMA_SC_OK);
+    if (resource == null || !$cast(qp_failed_lookup, resource) ||
+        qp_failed_lookup.state != RDMA_RESOURCE_ERROR ||
+        qp_failed_lookup.sq_iova.value != qp_reused.sq_iova.value ||
+        recovery_lookup == null || recovery_lookup.qp_recovery == null)
+      `uvm_error("QP_PRIOR_IOVA_ATOMIC",
+                 "IOVA mismatch changed registry or recovery")
+    qp_prior_candidate.sq_iova = qp_reused.sq_iova;
+    expect_status("QP_PRIOR_COMMIT",
+                  qp_rm.commit_qp_programmed(qp_prior_candidate),
+                  RDMA_SC_OK);
+    expect_status("QP_PRIOR_ACTIVE_LOOKUP",
+                  qp_rm.lookup(qp_reused.handle, resource), RDMA_SC_OK);
+    if (resource == null || !$cast(qp_reused, resource) ||
+        qp_reused.state != RDMA_RESOURCE_ACTIVE ||
+        qp_reused.qp_state != RDMA_QPS_INIT ||
+        qp_reused.programmed_qpc.state != RDMA_QPS_RESET ||
+        qp_reused.sq_producer_index != 0 ||
+        qp_reused.sq_iova.value != qp_prior_candidate.sq_iova.value)
+      `uvm_error("QP_PRIOR_SEMANTIC_RESTORE",
+                 "valid prior reconciliation did not publish exact input")
+    expect_status("QP_PRIOR_RECOVERY_RETIRED",
+                  qp_rm.lookup_recovery(qp_reused.handle, recovery_lookup),
+                  RDMA_SC_INVALID_STATE);
+
+    // The same programmed commit is the atomic prior/candidate restoration
+    // point for modify reconciliation and retires ERROR recovery metadata.
+    prepare_qp_candidate(qp_restore, qp_pd, qp_send_cq, qp_recv_cq,
+                         "qp_restore");
+    expect_status("QP_RESTORE_ATTACH",
+                  qp_rm.attach_qp_programming(qp_restore), RDMA_SC_OK);
+    expect_status("QP_RESTORE_ACTIVATE", qp_rm.activate(qp_restore.handle),
+                  RDMA_SC_OK);
+    expect_status("QP_RESTORE_SEMANTIC_INIT",
+                  qp_rm.commit_qp_semantic_state(qp_restore.handle,
+                                                  RDMA_QPS_INIT),
+                  RDMA_SC_OK);
+    expect_status("QP_RESTORE_LOOKUP",
+                  qp_rm.lookup(qp_restore.handle, resource), RDMA_SC_OK);
+    if (resource == null || !$cast(qp_restore, resource))
+      `uvm_fatal("QP_RESTORE_LOOKUP", "QP lookup cast failed")
+    qp_cloned_object = qp_restore.clone();
+    if (qp_cloned_object == null ||
+        !$cast(qp_restore_candidate, qp_cloned_object))
+      `uvm_fatal("QP_RESTORE_CANDIDATE", "QP candidate clone failed")
+    qp_restore_candidate.qp_state = RDMA_QPS_RTR;
+    qp_restore_candidate.programmed_qpc.state = RDMA_QPS_RTR;
+    qp_modify_recovery_state = make_qp_test_recovery(
+      "qp_modify_recovery", qp_restore,
+      RDMA_QP_RECOVER_MODIFY_RECONCILE,
+      qp_restore_candidate.programmed_qpc
+    );
+    qp_modify_recovery_state.query_mapping =
+      make_independent_queue_test_mapping(
+        "qp_modify_retained_query", qp_restore.owner, qp_restore.handle,
+        64'h0000_8c00_0000_0000
+      );
+    qp_modify_recovery_state.query_mapping.size = 512;
+    qp_modify_recovery_state.staging_mapping =
+      make_independent_queue_test_mapping(
+        "qp_modify_retained_staging", qp_restore.owner,
+        qp_restore.handle, 64'h0000_8c00_0000_1000
+      );
+    qp_modify_recovery_state.staging_mapping.size = 512;
+    qp_modify_recovery_state.ambiguous_operation = RDMA_QP_AMBIG_MODIFY;
+    qp_modify_recovery_state.ambiguous_ticket = make_qp_test_ticket(
+      "qp_modify_ambiguous_ticket", qp_restore.owner, qp_cmq.handle,
+      qp_modify_recovery_state.modify_opcode
+    );
+    qp_cloned_object = qp_modify_recovery_state.clone();
+    if (qp_cloned_object == null ||
+        !$cast(qp_nested_recovery_state, qp_cloned_object) ||
+        qp_nested_recovery_state.context_ref == null ||
+        qp_nested_recovery_state.qp_plan == null ||
+        qp_nested_recovery_state.qp_plan.context_ref == null ||
+        !$cast(qp_nested_context_token,
+               qp_nested_recovery_state.context_ref.slot_token) ||
+        !$cast(qp_nested_plan_context_token,
+               qp_nested_recovery_state.qp_plan.context_ref.slot_token))
+      `uvm_fatal("QP_RECOVERY_CONTEXT_AUTHORITY_CLONE",
+                 "QP recovery context candidate clone failed")
+    qp_nested_context_authority =
+      rdma_queue_completion_authority::type_id::create(
+        "qp_recovery_replacement_context_authority"
+      );
+    qp_nested_context_token.completion_authority =
+      qp_nested_context_authority;
+    qp_nested_plan_context_token.completion_authority =
+      qp_nested_context_authority;
+    expect_status("QP_RECOVERY_CONTEXT_AUTHORITY_REJECTED",
+                  qp_rm.mark_qp_error(qp_restore.handle,
+                                       qp_nested_recovery_state),
+                  RDMA_SC_INVALID_ARGUMENT);
+    expect_status("QP_MODIFY_MARK_ERROR",
+                  qp_rm.mark_qp_error(qp_restore.handle,
+                                       qp_modify_recovery_state),
+                  RDMA_SC_OK);
+    qp_unexpected_ext = rdma_qpc_rc_ext::type_id::create(
+      "qp_unexpected_rc"
+    );
+    qp_unexpected_ext.remote_qpn = 24'h65_4321;
+    qp_restore_candidate.programmed_qpc.transport_ext = qp_unexpected_ext;
+    expect_status("QP_RESTORE_UNEXPECTED_CANDIDATE",
+                  qp_rm.commit_qp_programmed(qp_restore_candidate),
+                  RDMA_SC_INVALID_ARGUMENT);
+    expect_status("QP_RESTORE_UNEXPECTED_ATOMIC_RESOURCE",
+                  qp_rm.lookup(qp_restore.handle, resource), RDMA_SC_OK);
+    expect_status("QP_RESTORE_UNEXPECTED_ATOMIC_RECOVERY",
+                  qp_rm.lookup_recovery(qp_restore.handle, recovery_lookup),
+                  RDMA_SC_OK);
+    if (resource == null || !$cast(qp_failed_lookup, resource) ||
+        qp_failed_lookup.state != RDMA_RESOURCE_ERROR ||
+        qp_failed_lookup.qp_state != RDMA_QPS_INIT ||
+        recovery_lookup == null || recovery_lookup.qp_recovery == null ||
+        recovery_lookup.qp_recovery.ambiguous_operation !=
+          RDMA_QP_AMBIG_MODIFY)
+      `uvm_error("QP_RESTORE_UNEXPECTED_ATOMIC",
+                 "unexpected QPC changed registry or recovery")
+    qp_cloned_object = qp_modify_recovery_state.candidate_qpc.clone();
+    if (qp_cloned_object == null ||
+        !$cast(qp_restore_candidate.programmed_qpc, qp_cloned_object))
+      `uvm_fatal("QP_RESTORE_EXPECTED_CANDIDATE", "QPC clone failed")
+    qp_restore_candidate.qp_state = RDMA_QPS_RTR;
+    s = qp_rm.commit_qp_programmed(qp_restore_candidate);
+    expect_status("QP_RESTORE_QUERY_COMPLETION_REQUIRED", s,
+                  RDMA_SC_RECOVERY_REQUIRED);
+    if (s != null && s.code == RDMA_SC_RECOVERY_REQUIRED) begin
+      expect_status("QP_RESTORE_QUERY_ATOMIC_RESOURCE",
+                    qp_rm.lookup(qp_restore.handle, resource), RDMA_SC_OK);
+      if (resource == null || !$cast(qp_restore, resource) ||
+          qp_restore.state != RDMA_RESOURCE_ERROR ||
+          qp_restore.qp_state != RDMA_QPS_INIT ||
+          qp_restore.programmed_qpc.state != RDMA_QPS_RESET)
+        `uvm_error("QP_RESTORE_QUERY_ATOMIC_RESOURCE",
+                   "query-gated reconciliation changed the registry QP")
+      expect_status("QP_RESTORE_QUERY_ATOMIC_RECOVERY",
+                    qp_rm.lookup_recovery(qp_restore.handle,
+                                          recovery_lookup),
+                    RDMA_SC_OK);
+      if (recovery_lookup == null || recovery_lookup.qp_recovery == null ||
+          recovery_lookup.qp_recovery.query_mapping == null ||
+          recovery_lookup.qp_recovery.ambiguous_operation !=
+            RDMA_QP_AMBIG_MODIFY)
+        `uvm_error("QP_RESTORE_QUERY_ATOMIC_RECOVERY",
+                   "query-gated reconciliation changed recovery")
+      expect_status(
+        "QP_RESTORE_QUERY_OPAQUE_COMPLETE",
+        qp_rm.complete_qp_temporary_mapping_release(
+          qp_restore.handle, 1'b0
+        ),
+        RDMA_SC_OK
+      );
+      s = qp_rm.commit_qp_programmed(qp_restore_candidate);
+      expect_status("QP_RESTORE_STAGING_COMPLETION_REQUIRED", s,
+                    RDMA_SC_RECOVERY_REQUIRED);
+      if (s != null && s.code == RDMA_SC_RECOVERY_REQUIRED) begin
+        expect_status("QP_RESTORE_STAGING_ATOMIC_RESOURCE",
+                      qp_rm.lookup(qp_restore.handle, resource), RDMA_SC_OK);
+        expect_status("QP_RESTORE_STAGING_ATOMIC_RECOVERY",
+                      qp_rm.lookup_recovery(qp_restore.handle,
+                                            recovery_lookup), RDMA_SC_OK);
+        if (resource == null || !$cast(qp_failed_lookup, resource) ||
+            qp_failed_lookup.state != RDMA_RESOURCE_ERROR ||
+            recovery_lookup == null || recovery_lookup.qp_recovery == null ||
+            recovery_lookup.qp_recovery.staging_mapping == null)
+          `uvm_error("QP_RESTORE_STAGING_ATOMIC",
+                     "staging-gated reconciliation changed authority")
+        expect_status(
+          "QP_RESTORE_STAGING_OPAQUE_COMPLETE",
+          qp_rm.complete_qp_temporary_mapping_release(
+            qp_restore.handle, 1'b1
+          ),
+          RDMA_SC_OK
+        );
+        s = qp_rm.commit_qp_programmed(qp_restore_candidate);
+        expect_status("QP_RESTORE_AMBIGUITY_RESOLUTION_REQUIRED", s,
+                      RDMA_SC_RECOVERY_REQUIRED);
+        if (s != null && s.code == RDMA_SC_RECOVERY_REQUIRED) begin
+          expect_status("QP_RESTORE_AMBIGUITY_ATOMIC_RESOURCE",
+                        qp_rm.lookup(qp_restore.handle, resource),
+                        RDMA_SC_OK);
+          if (resource == null || !$cast(qp_restore, resource) ||
+              qp_restore.state != RDMA_RESOURCE_ERROR ||
+              qp_restore.qp_state != RDMA_QPS_INIT ||
+              qp_restore.programmed_qpc.state != RDMA_QPS_RESET)
+            `uvm_error("QP_RESTORE_AMBIGUITY_ATOMIC_RESOURCE",
+                       "ambiguity-gated reconciliation changed the QP")
+          expect_status("QP_RESTORE_AMBIGUITY_ATOMIC_RECOVERY",
+                        qp_rm.lookup_recovery(qp_restore.handle,
+                                              recovery_lookup),
+                        RDMA_SC_OK);
+          if (recovery_lookup == null ||
+              recovery_lookup.qp_recovery == null ||
+              recovery_lookup.qp_recovery.ambiguous_operation !=
+                RDMA_QP_AMBIG_MODIFY ||
+              recovery_lookup.qp_recovery.ambiguous_ticket == null)
+            `uvm_error("QP_RESTORE_AMBIGUITY_ATOMIC_RECOVERY",
+                       "ambiguity-gated reconciliation retired recovery")
+          qp_cloned_object = recovery_lookup.qp_recovery.clone();
+          if (qp_cloned_object == null ||
+              !$cast(qp_nested_recovery_state, qp_cloned_object))
+            `uvm_fatal("QP_RESTORE_QUERY_AUTHORITY_CLONE",
+                       "modify query recovery clone failed")
+          qp_nested_recovery_state.ambiguous_operation =
+            RDMA_QP_AMBIG_NONE;
+          qp_nested_recovery_state.ambiguous_ticket = null;
+          qp_nested_recovery_state.query_mapping =
+            make_independent_queue_test_mapping(
+              "qp_restore_wrong_query_authority", qp_restore.owner,
+              qp_restore.handle,
+              recovery_lookup.qp_recovery.query_mapping.iova.value
+            );
+          qp_nested_recovery_state.query_mapping.size = 512;
+          expect_status("QP_RESTORE_QUERY_AUTHORITY_REJECTED",
+                        qp_rm.mark_qp_error(qp_restore.handle,
+                                             qp_nested_recovery_state),
+                        RDMA_SC_INVALID_ARGUMENT);
+          qp_cloned_object = recovery_lookup.qp_recovery.clone();
+          if (qp_cloned_object == null ||
+              !$cast(qp_error_replacement, qp_cloned_object))
+            `uvm_fatal("QP_RESTORE_AMBIGUITY_CLONE",
+                       "modify recovery clone failed")
+          qp_error_replacement.ambiguous_operation = RDMA_QP_AMBIG_NONE;
+          qp_error_replacement.ambiguous_ticket = null;
+          expect_status("QP_RESTORE_AMBIGUITY_RESOLVE",
+                        qp_rm.mark_qp_error(qp_restore.handle,
+                                             qp_error_replacement),
+                        RDMA_SC_OK);
+          expect_status("QP_RESTORE_CANDIDATE_COMMIT",
+                        qp_rm.commit_qp_programmed(qp_restore_candidate),
+                        RDMA_SC_OK);
+        end
+      end
+    end
+    expect_status("QP_RESTORE_ACTIVE_LOOKUP",
+                  qp_rm.lookup(qp_restore.handle, resource), RDMA_SC_OK);
+    if (resource == null || !$cast(qp_restore, resource) ||
+        qp_restore.state != RDMA_RESOURCE_ACTIVE ||
+        qp_restore.qp_state != RDMA_QPS_RTR ||
+        qp_restore.programmed_qpc.state != RDMA_QPS_RTR)
+      `uvm_error("QP_RESTORE_ACTIVE",
+                 "modify reconciliation did not restore ACTIVE candidate")
+    expect_status("QP_RESTORE_RECOVERY_RETIRED",
+                  qp_rm.lookup_recovery(qp_restore.handle, recovery_lookup),
+                  RDMA_SC_INVALID_STATE);
+
+    // Terminal mutation probe: retained-candidate equality includes nested
+    // address-vector and behavior values before any recovery gates run.
+    qp_cloned_object = qp_restore.clone();
+    if (qp_cloned_object == null ||
+        !$cast(qp_nested_candidate, qp_cloned_object))
+      `uvm_fatal("QP_NESTED_QPC_CANDIDATE",
+                 "nested QPC candidate clone failed")
+    qp_nested_candidate.qp_state = RDMA_QPS_RTS;
+    qp_nested_candidate.programmed_qpc.state = RDMA_QPS_RTS;
+    qp_nested_recovery_state = make_qp_test_recovery(
+      "qp_nested_qpc_recovery", qp_restore,
+      RDMA_QP_RECOVER_MODIFY_RECONCILE,
+      qp_nested_candidate.programmed_qpc
+    );
+    expect_status("QP_NESTED_QPC_MARK_ERROR",
+                  qp_rm.mark_qp_error(qp_restore.handle,
+                                       qp_nested_recovery_state),
+                  RDMA_SC_OK);
+    qp_cloned_object = qp_nested_recovery_state.candidate_qpc.clone();
+    if (qp_cloned_object == null ||
+        !$cast(qp_nested_candidate.programmed_qpc, qp_cloned_object))
+      `uvm_fatal("QP_NESTED_ADDRESS_VECTOR_CANDIDATE",
+                 "address-vector QPC clone failed")
+    qp_nested_candidate.programmed_qpc.address_vector.hop_limit++;
+    expect_status("QP_NESTED_ADDRESS_VECTOR_REJECTED",
+                  qp_rm.commit_qp_programmed(qp_nested_candidate),
+                  RDMA_SC_INVALID_ARGUMENT);
+    expect_status("QP_NESTED_ADDRESS_VECTOR_ATOMIC_RESOURCE",
+                  qp_rm.lookup(qp_restore.handle, resource), RDMA_SC_OK);
+    expect_status("QP_NESTED_ADDRESS_VECTOR_ATOMIC_RECOVERY",
+                  qp_rm.lookup_recovery(qp_restore.handle, recovery_lookup),
+                  RDMA_SC_OK);
+    if (resource == null || !$cast(qp_failed_lookup, resource) ||
+        qp_failed_lookup.state != RDMA_RESOURCE_ERROR ||
+        qp_failed_lookup.programmed_qpc.state != RDMA_QPS_RTR ||
+        recovery_lookup == null || recovery_lookup.qp_recovery == null)
+      `uvm_error("QP_NESTED_ADDRESS_VECTOR_ATOMIC",
+                 "address-vector rejection changed authority")
+    qp_cloned_object = qp_nested_recovery_state.candidate_qpc.clone();
+    if (qp_cloned_object == null ||
+        !$cast(qp_nested_candidate.programmed_qpc, qp_cloned_object))
+      `uvm_fatal("QP_NESTED_BEHAVIOR_CANDIDATE",
+                 "behavior QPC clone failed")
+    qp_nested_candidate.programmed_qpc.behavior.migration_enable =
+      !qp_nested_candidate.programmed_qpc.behavior.migration_enable;
+    expect_status("QP_NESTED_BEHAVIOR_REJECTED",
+                  qp_rm.commit_qp_programmed(qp_nested_candidate),
+                  RDMA_SC_INVALID_ARGUMENT);
+    expect_status("QP_NESTED_BEHAVIOR_ATOMIC_RESOURCE",
+                  qp_rm.lookup(qp_restore.handle, resource), RDMA_SC_OK);
+    expect_status("QP_NESTED_BEHAVIOR_ATOMIC_RECOVERY",
+                  qp_rm.lookup_recovery(qp_restore.handle, recovery_lookup),
+                  RDMA_SC_OK);
+    if (resource == null || !$cast(qp_failed_lookup, resource) ||
+        qp_failed_lookup.state != RDMA_RESOURCE_ERROR ||
+        qp_failed_lookup.programmed_qpc.state != RDMA_QPS_RTR ||
+        recovery_lookup == null || recovery_lookup.qp_recovery == null)
+      `uvm_error("QP_NESTED_BEHAVIOR_ATOMIC",
+                 "behavior rejection changed authority")
 
     phase.drop_objection(this);
   endtask

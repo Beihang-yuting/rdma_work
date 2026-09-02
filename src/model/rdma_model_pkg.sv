@@ -8,6 +8,7 @@ package rdma_model_pkg;
   `include "rdma_dma_request_context.svh"
   `include "rdma_dma_mapping.svh"
   `include "rdma_resource_refs.svh"
+  `include "rdma_context_types.svh"
   `include "rdma_queue_lifecycle_models.svh"
   `include "rdma_hw_image.svh"
   `include "rdma_semantic_requests.svh"

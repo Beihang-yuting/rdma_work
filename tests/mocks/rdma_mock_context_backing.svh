@@ -111,8 +111,13 @@ class rdma_mock_context_backing extends rdma_context_backing_api;
   function automatic rdma_queue_backing_role_e context_role(
     rdma_resource_kind_e resource_kind
   );
-    return (resource_kind == RDMA_RESOURCE_SRQ) ?
-      RDMA_QUEUE_ROLE_SRQ_RING : RDMA_QUEUE_ROLE_CQ_RING;
+    case (resource_kind)
+      RDMA_RESOURCE_SRQ: return RDMA_QUEUE_ROLE_SRQ_RING;
+      // Fault-routing discriminator only: QPC context authority is not SQ
+      // backing, and Task 1 deliberately defines no separate QPC role.
+      RDMA_RESOURCE_QP: return RDMA_QUEUE_ROLE_QP_SQ_RING;
+      default: return RDMA_QUEUE_ROLE_CQ_RING;
+    endcase
   endfunction
 
   function automatic rdma_mock_context_slot find_slot(
@@ -184,7 +189,8 @@ class rdma_mock_context_backing extends rdma_context_backing_api;
     if (forced != null)
       return forced;
     if (binding == null ||
-        !(resource_kind inside {RDMA_RESOURCE_CQ, RDMA_RESOURCE_SRQ}))
+        !(resource_kind inside {RDMA_RESOURCE_CQ, RDMA_RESOURCE_SRQ,
+                                RDMA_RESOURCE_QP}))
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "invalid context acquire");
     owner = binding.make_handle();
     if (owner == null)
@@ -206,13 +212,20 @@ class rdma_mock_context_backing extends rdma_context_backing_api;
       alignment = 64;
       slot.shadow_pointer_base.value = 64'h0000_1000_0000_0000 +
                                        longint'(local_id) * 64;
-    end else begin
+    end else if (resource_kind == RDMA_RESOURCE_SRQ) begin
       slot.slot_length = 32;
       slot.shadow_view_offset = 28;
       slot.shadow_view_length = 4;
       alignment = 4096;
       slot.shadow_pointer_base.value = 64'h0000_2000_0000_0000 +
                                        longint'(local_id) * 4096;
+    end else begin
+      slot.slot_length = 512;
+      slot.shadow_view_offset = 0;
+      slot.shadow_view_length = 512;
+      alignment = 512;
+      slot.shadow_pointer_base.value = 64'h0000_3000_0000_0000 +
+                                       longint'(local_id) * 512;
     end
     slot.shadow_pointer_base.value =
       (slot.shadow_pointer_base.value / alignment) * alignment;
@@ -228,7 +241,8 @@ class rdma_mock_context_backing extends rdma_context_backing_api;
     hmc.owner = owner;
     hmc.object_kind = RDMA_RESOURCE_MR;
     hmc.address.value = 64'h0000_4000_0000_0000 +
-                        longint'(local_id) * 4096;
+                        longint'(local_id) *
+                          (resource_kind == RDMA_RESOURCE_QP ? 512 : 4096);
     hmc.size = slot.slot_length;
     hmc.first_pbl_index = local_id + 1;
     hmc.ownership = RDMA_OWNERSHIP_CONTROL_PLANE;

@@ -1,3 +1,8 @@
+typedef class rdma_address_vector;
+typedef class rdma_qpc_behavior;
+typedef class rdma_qpc_transport_ext;
+typedef class rdma_qpc_urc_ext;
+
 typedef enum bit [3:0] {
   RDMA_QPS_RESET = 4'd0,
   RDMA_QPS_INIT  = 4'd1,
@@ -156,6 +161,69 @@ class rdma_semantic_request extends uvm_object;
                                "selected timeout policy has zero value");
     return rdma_status::success();
   endfunction
+
+endclass
+
+class rdma_qp_context_attributes extends uvm_object;
+  `uvm_object_utils(rdma_qp_context_attributes)
+  int unsigned path_mtu_bytes;
+  bit [15:0] pkey;
+  rdma_rdma_access_t access;
+  rdma_address_vector address_vector;
+  bit signature_enable;
+  bit tx_flow_control;
+  bit rx_flow_control;
+  rdma_qpc_behavior behavior;
+  rdma_qpc_transport_ext transport_ext;
+
+  function new(string name = "rdma_qp_context_attributes");
+    super.new(name);
+    path_mtu_bytes = 0;
+    pkey = 0;
+    access = '0;
+    address_vector = null;
+    signature_enable = 0;
+    tx_flow_control = 0;
+    rx_flow_control = 0;
+    behavior = null;
+    transport_ext = null;
+  endfunction
+
+  virtual function void do_copy(uvm_object rhs);
+    rdma_qp_context_attributes r;
+    uvm_object c;
+
+    super.do_copy(rhs);
+    if (!$cast(r, rhs)) `uvm_fatal("RDMA_COPY_TYPE", "QP attributes copy mismatch")
+    path_mtu_bytes = r.path_mtu_bytes;
+    pkey = r.pkey;
+    access = r.access;
+    signature_enable = r.signature_enable;
+    tx_flow_control = r.tx_flow_control;
+    rx_flow_control = r.rx_flow_control;
+    if (r.address_vector == null) address_vector = null;
+    else begin c = r.address_vector.clone(); if (c == null || !$cast(address_vector, c) || address_vector == r.address_vector) `uvm_fatal("RDMA_COPY_TYPE", "QP AV clone failure") end
+    if (r.behavior == null) behavior = null;
+    else begin c = r.behavior.clone(); if (c == null || !$cast(behavior, c) || behavior == r.behavior) `uvm_fatal("RDMA_COPY_TYPE", "QP behavior clone failure") end
+    if (r.transport_ext == null) transport_ext = null;
+    else begin c = r.transport_ext.clone(); if (c == null || !$cast(transport_ext, c) || transport_ext == r.transport_ext) `uvm_fatal("RDMA_COPY_TYPE", "QP extension clone failure") end
+  endfunction
+
+  virtual function rdma_status validate(rdma_transport_e transport);
+    rdma_status status;
+
+    if (path_mtu_bytes == 0 || address_vector == null || behavior == null ||
+        transport_ext == null)
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "QP context attributes are incomplete");
+    status = address_vector.validate(); if (!status.ok()) return status;
+    status = behavior.validate(); if (!status.ok()) return status;
+    if (transport_ext.transport_kind() != transport)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "QP transport extension does not match");
+    status = transport_ext.validate(); if (!status.ok()) return status;
+    return rdma_status::success();
+  endfunction
 endclass
 
 class rdma_create_pd_req extends rdma_semantic_request;
@@ -290,6 +358,51 @@ class rdma_create_cq_req extends rdma_semantic_request;
   endfunction
 endclass
 
+function automatic rdma_status rdma_qp_backing_spec_status(
+  rdma_queue_backing_spec spec,
+  rdma_queue_backing_role_e required_role,
+  longint unsigned required_storage_bytes
+);
+  rdma_status status;
+  longint unsigned next_logical_offset;
+
+  if (spec == null)
+    return rdma_status::make(RDMA_SC_INVALID_STATE, "QP backing spec is null");
+  if (required_storage_bytes == 0 ||
+      !rdma_queue_aligned(required_storage_bytes, 4096))
+    return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                             "QP backing storage size is invalid");
+  if (spec.mode == RDMA_QUEUE_BACKING_OWNED) begin
+    if (spec.slices.size() != 0)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "owned QP backing contains slices");
+    return rdma_status::success();
+  end
+  if (spec.mode != RDMA_QUEUE_BACKING_BORROWED || spec.slices.size() == 0)
+    return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "QP backing mode invalid");
+  next_logical_offset = 0;
+  foreach (spec.slices[i]) begin
+    if (spec.slices[i] == null || spec.slices[i].role != required_role)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "QP borrowed backing role invalid");
+    if (!rdma_queue_aligned(spec.slices[i].logical_queue_offset, 4096) ||
+        spec.slices[i].logical_queue_offset != next_logical_offset ||
+        next_logical_offset > required_storage_bytes ||
+        spec.slices[i].length >
+          required_storage_bytes - next_logical_offset)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "QP borrowed backing coverage is not canonical");
+    status = rdma_queue_queue_range_status(spec.slices[i].mapping,
+      spec.slices[i].mapping_offset, spec.slices[i].length, 4096);
+    if (!status.ok()) return status;
+    next_logical_offset += spec.slices[i].length;
+  end
+  if (next_logical_offset != required_storage_bytes)
+    return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                             "QP borrowed backing does not cover the ring");
+  return rdma_status::success();
+endfunction
+
 class rdma_create_qp_req extends rdma_semantic_request;
   `uvm_object_utils(rdma_create_qp_req)
 
@@ -302,6 +415,9 @@ class rdma_create_qp_req extends rdma_semantic_request;
   rdma_handle send_cq_h;
   rdma_handle recv_cq_h;
   rdma_handle srq_h;
+  rdma_queue_backing_spec sq_backing;
+  rdma_queue_backing_spec rq_backing;
+  rdma_qp_context_attributes context_attrs;
 
   function new(string name = "rdma_create_qp_req");
     super.new(name);
@@ -314,6 +430,9 @@ class rdma_create_qp_req extends rdma_semantic_request;
     send_cq_h = null;
     recv_cq_h = null;
     srq_h = null;
+    sq_backing = rdma_queue_backing_spec::type_id::create("sq_backing");
+    rq_backing = rdma_queue_backing_spec::type_id::create("rq_backing");
+    context_attrs = null;
   endfunction
 
   virtual function void do_copy(uvm_object rhs);
@@ -352,10 +471,33 @@ class rdma_create_qp_req extends rdma_semantic_request;
       if (cloned_object == null || !$cast(srq_h, cloned_object))
         `uvm_fatal("RDMA_COPY_TYPE", "SRQ handle clone type mismatch")
     end
+    if (rhs_req.sq_backing == null) sq_backing = null;
+    else begin
+      cloned_object = rhs_req.sq_backing.clone();
+      if (cloned_object == null || !$cast(sq_backing, cloned_object) ||
+          sq_backing == rhs_req.sq_backing)
+        `uvm_fatal("RDMA_COPY_TYPE", "SQ backing clone type mismatch")
+    end
+    if (rhs_req.rq_backing == null) rq_backing = null;
+    else begin
+      cloned_object = rhs_req.rq_backing.clone();
+      if (cloned_object == null || !$cast(rq_backing, cloned_object) ||
+          rq_backing == rhs_req.rq_backing)
+        `uvm_fatal("RDMA_COPY_TYPE", "RQ backing clone type mismatch")
+    end
+    if (rhs_req.context_attrs == null) context_attrs = null;
+    else begin
+      cloned_object = rhs_req.context_attrs.clone();
+      if (cloned_object == null || !$cast(context_attrs, cloned_object) ||
+          context_attrs == rhs_req.context_attrs)
+        `uvm_fatal("RDMA_COPY_TYPE", "QP context attributes clone mismatch")
+    end
   endfunction
 
   virtual function rdma_status validate();
     rdma_status status;
+    longint unsigned sq_storage_bytes;
+    longint unsigned rq_storage_bytes;
 
     status = super.validate();
     if (!status.ok())
@@ -371,6 +513,21 @@ class rdma_create_qp_req extends rdma_semantic_request;
     if (max_send_sge == 0 || max_recv_sge == 0)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "QP maximum SGE count is zero");
+    sq_storage_bytes = ((longint'(sq_depth) * 64 + 4095) / 4096) * 4096;
+    rq_storage_bytes = ((longint'(rq_depth) * 64 + 4095) / 4096) * 4096;
+    status = rdma_qp_backing_spec_status(sq_backing,
+                                         RDMA_QUEUE_ROLE_QP_SQ_RING,
+                                         sq_storage_bytes);
+    if (!status.ok()) return status;
+    status = rdma_qp_backing_spec_status(rq_backing,
+                                         RDMA_QUEUE_ROLE_QP_RQ_RING,
+                                         rq_storage_bytes);
+    if (!status.ok()) return status;
+    if (context_attrs == null)
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "QP context attributes are null");
+    status = context_attrs.validate(transport);
+    if (!status.ok()) return status;
     if (pd_h != null && pd_h.kind != RDMA_RESOURCE_PD)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "QP requires a PD handle");
@@ -390,6 +547,11 @@ class rdma_create_qp_req extends rdma_semantic_request;
     if (!status.ok())
       return status;
     if (srq_h != null) begin
+      if (transport != RDMA_TRANSPORT_RC ||
+          rq_backing.mode != RDMA_QUEUE_BACKING_OWNED ||
+          rq_backing.slices.size() != 0)
+        return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                                 "SRQ QP requires canonical empty RQ backing");
       if (srq_h.kind != RDMA_RESOURCE_SRQ)
         return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                  "QP SRQ handle is invalid");
@@ -397,6 +559,63 @@ class rdma_create_qp_req extends rdma_semantic_request;
       if (!status.ok())
         return status;
     end
+    if (transport == RDMA_TRANSPORT_URC) begin
+      rdma_qpc_urc_ext urc_ext;
+      if (!$cast(urc_ext, context_attrs.transport_ext) || urc_ext.queues == null ||
+          urc_ext.queues.rsq_backing.value != 0 ||
+          urc_ext.queues.rdsq_backing.value != 0 ||
+          urc_ext.queues.dsq_backing.value != 0)
+        return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                                 "URC caller internal backing address is nonzero");
+    end
+    return rdma_status::success();
+  endfunction
+
+  virtual function rdma_status validate_srq_depth(
+    int unsigned authoritative_srq_depth
+  );
+    rdma_status status;
+
+    status = validate();
+    if (!status.ok())
+      return status;
+    if (srq_h == null)
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "QP request does not use an SRQ");
+    if (rq_depth != authoritative_srq_depth)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "QP RQ depth does not match SRQ depth");
+    return rdma_status::success();
+  endfunction
+
+  virtual function rdma_status validate_queue_caps(
+    rdma_queue_capabilities queue_caps
+  );
+    rdma_status status;
+    longint unsigned sq_logical_bytes;
+    longint unsigned rq_logical_bytes;
+    longint unsigned sq_storage_bytes;
+    longint unsigned rq_storage_bytes;
+
+    status = validate();
+    if (!status.ok())
+      return status;
+    if (queue_caps.max_wq_sge == 0 ||
+        queue_caps.max_queue_ring_bytes == 0 ||
+        max_send_sge > queue_caps.max_wq_sge ||
+        max_recv_sge > queue_caps.max_wq_sge)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "QP SGE count exceeds Function capability");
+    sq_logical_bytes = longint'(sq_depth) * 64;
+    rq_logical_bytes = longint'(rq_depth) * 64;
+    sq_storage_bytes = ((sq_logical_bytes + 4095) / 4096) * 4096;
+    rq_storage_bytes = ((rq_logical_bytes + 4095) / 4096) * 4096;
+    if (sq_storage_bytes > queue_caps.max_queue_ring_bytes ||
+        rq_storage_bytes > queue_caps.max_queue_ring_bytes ||
+        sq_storage_bytes > 2 * 1024 * 1024 ||
+        rq_storage_bytes > 2 * 1024 * 1024)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "QP ring exceeds Function or PD capability");
     return rdma_status::success();
   endfunction
 endclass
@@ -636,6 +855,9 @@ class rdma_modify_qp_req extends rdma_semantic_request;
   bit [23:0] destination_qpn;
   bit [23:0] send_psn;
   bit [23:0] recv_psn;
+  bit destination_qpn_valid;
+  bit send_psn_valid;
+  bit recv_psn_valid;
 
   function new(string name = "rdma_modify_qp_req");
     super.new(name);
@@ -644,6 +866,9 @@ class rdma_modify_qp_req extends rdma_semantic_request;
     destination_qpn = '0;
     send_psn = '0;
     recv_psn = '0;
+    destination_qpn_valid = 1'b0;
+    send_psn_valid = 1'b0;
+    recv_psn_valid = 1'b0;
   endfunction
 
   virtual function void do_copy(uvm_object rhs);
@@ -665,6 +890,9 @@ class rdma_modify_qp_req extends rdma_semantic_request;
     destination_qpn = rhs_req.destination_qpn;
     send_psn = rhs_req.send_psn;
     recv_psn = rhs_req.recv_psn;
+    destination_qpn_valid = rhs_req.destination_qpn_valid;
+    send_psn_valid = rhs_req.send_psn_valid;
+    recv_psn_valid = rhs_req.recv_psn_valid;
   endfunction
 
   virtual function rdma_status validate();
@@ -681,6 +909,25 @@ class rdma_modify_qp_req extends rdma_semantic_request;
                             RDMA_QPS_ERROR}))
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "requested QP state is invalid");
+    return rdma_status::success();
+  endfunction
+
+  virtual function rdma_status validate_for_transport(
+    rdma_transport_e transport
+  );
+    rdma_status status;
+
+    status = validate();
+    if (!status.ok())
+      return status;
+    if (!(transport inside {RDMA_TRANSPORT_RC, RDMA_TRANSPORT_UD,
+                            RDMA_TRANSPORT_URC}))
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "modify QP transport is invalid");
+    if (transport == RDMA_TRANSPORT_UD &&
+        (destination_qpn_valid || send_psn_valid || recv_psn_valid))
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "UD QP only supports state modification");
     return rdma_status::success();
   endfunction
 endclass

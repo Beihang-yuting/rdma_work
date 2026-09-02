@@ -33,6 +33,8 @@ package rdma_unit_test_pkg;
   `include "unit/rdma_resource_manager_test.svh"
   `include "unit/rdma_queue_lifecycle_models_test.svh"
   `include "unit/rdma_queue_lifecycle_test.svh"
+  `include "unit/rdma_qp_lifecycle_test.svh"
+  `include "unit/rdma_qp_recovery_test.svh"
   `include "unit/rdma_queue_recovery_test.svh"
   `include "unit/rdma_context_backing_contract_test.svh"
   `include "unit/rdma_doorbell_scheduler_test.svh"

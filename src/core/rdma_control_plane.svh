@@ -8,6 +8,7 @@ class rdma_control_plane extends uvm_object;
   protected rdma_hmc_allocator hmc_allocator;
   protected rdma_context_backing_api context_backing;
   protected rdma_queue_lifecycle_executor queue_executor;
+  protected rdma_qp_lifecycle_executor qp_executor;
   protected time default_timeout;
   protected bit configured;
 
@@ -25,6 +26,7 @@ class rdma_control_plane extends uvm_object;
     hmc_allocator = null;
     context_backing = null;
     queue_executor = null;
+    qp_executor = null;
     default_timeout = 0;
     configured = 1'b0;
     next_transaction_id = 1;
@@ -875,6 +877,21 @@ class rdma_control_plane extends uvm_object;
       queue_executor = null;
       return status;
     end
+    qp_executor = rdma_qp_lifecycle_executor::type_id::create(
+      "control_plane_qp_executor"
+    );
+    if (qp_executor == null)
+      return invalid_state("QP lifecycle executor construction failed");
+    if (host_mem != null && context_backing != null) begin
+      status = qp_executor.configure(
+        resource_manager, cmq_port, host_mem, context_backing, command_timeout
+      );
+      status = checked_status(status, "QP executor configure returned null");
+      if (!status.ok()) begin
+        qp_executor = null;
+        return status;
+      end
+    end
     configured = 1'b1;
     return rdma_status::success();
   endfunction
@@ -1162,6 +1179,270 @@ class rdma_control_plane extends uvm_object;
         finish_result(result, invalid_state("typed AEQ projection is invalid"));
       end
     end
+  endtask
+
+  task create_qp(
+    rdma_function_binding binding,
+    rdma_create_qp_req request,
+    output rdma_qp qp,
+    output rdma_control_result result
+  );
+    rdma_function_handle owner;
+    rdma_function_handle locked_owner;
+    rdma_status status;
+    rdma_status qp_validation_status;
+    semaphore function_lock;
+    longint unsigned transaction_id;
+    bit executor_called;
+
+    qp = null;
+    result = make_result();
+    function_lock = null;
+    executor_called = 1'b0;
+    reserve_transaction_id(transaction_id, status);
+    result.transaction_id = transaction_id;
+    do begin
+      if (status == null || !status.ok()) begin
+        status = checked_status(status,
+                                "QP transaction ID allocation returned null");
+        break;
+      end
+      status = configured_status();
+      if (status == null || !status.ok()) begin
+        status = checked_status(status,
+                                "QP control-plane configuration returned null");
+        break;
+      end
+      if (host_mem == null || context_backing == null) begin
+        status = invalid_state(
+          "QP create requires host-memory and context-backing adapters"
+        );
+        break;
+      end
+      if (qp_executor == null) begin
+        status = invalid_state("QP lifecycle executor is unavailable");
+        break;
+      end
+      status = binding_owner_status(binding, owner);
+      if (status == null || !status.ok()) begin
+        status = checked_status(status, "QP Function binding returned null");
+        break;
+      end
+      status = queue_request_status(request, owner, "QP create request");
+      if (status == null || !status.ok()) begin
+        status = checked_status(status, "QP create request returned null");
+        break;
+      end
+
+      acquire_function_lock(owner, function_lock);
+      status = binding_owner_status(binding, locked_owner);
+      if (status == null || !status.ok()) begin
+        status = checked_status(status,
+                                "post-lock QP Function returned null");
+        break;
+      end
+      status = same_owner_status(locked_owner, owner,
+                                 "post-lock QP Function");
+      if (status == null || !status.ok()) begin
+        status = checked_status(status,
+                                "post-lock QP identity returned null");
+        break;
+      end
+      status = queue_request_status(request, locked_owner,
+                                    "post-lock QP create request");
+      if (status == null || !status.ok()) begin
+        status = checked_status(status,
+                                "post-lock QP request returned null");
+        break;
+      end
+
+      executor_called = 1'b1;
+      qp_executor.create_locked(binding, owner, request, transaction_id,
+                                qp, result);
+      if (result == null) begin
+        status = invalid_state("QP executor returned a null result");
+        break;
+      end
+      if (result.transaction_id != transaction_id) begin
+        qp = null;
+        status = invalid_state("QP executor changed the transaction ID");
+        finish_result(result, status);
+        break;
+      end
+      status = checked_status(result.status,
+                              "QP executor result status is null");
+      if (status.ok()) begin
+        qp_validation_status = qp == null ? null : qp.validate();
+        if (qp == null || qp.state != RDMA_RESOURCE_ACTIVE ||
+            qp.qp_state != RDMA_QPS_RESET || qp_validation_status == null ||
+            !qp_validation_status.ok()) begin
+          qp = null;
+          status = invalid_state("typed QP projection is invalid");
+          finish_result(result, status);
+        end
+      end
+      break;
+    end while (1'b0);
+    if (result == null) begin
+      result = make_result();
+      result.transaction_id = transaction_id;
+    end
+    if (status == null || !status.ok()) begin
+      qp = null;
+      if (!executor_called)
+        finish_result(result, status);
+    end
+    if (function_lock != null)
+      function_lock.put(1);
+  endtask
+
+  task modify_qp(
+    rdma_function_binding binding,
+    rdma_modify_qp_req request,
+    output rdma_qp qp,
+    output rdma_control_result result
+  );
+    rdma_function_handle owner;
+    rdma_function_handle locked_owner;
+    rdma_status status;
+    rdma_status qp_validation_status;
+    semaphore function_lock;
+    longint unsigned transaction_id;
+    bit executor_called;
+
+    qp = null;
+    result = make_result();
+    function_lock = null;
+    executor_called = 1'b0;
+    reserve_transaction_id(transaction_id, status);
+    result.transaction_id = transaction_id;
+    do begin
+      if (status == null || !status.ok()) begin
+        status = checked_status(status,
+                                "QP modify transaction ID allocation returned null");
+        break;
+      end
+      status = configured_status();
+      if (status == null || !status.ok()) begin
+        status = checked_status(status,
+                                "QP modify control-plane configuration returned null");
+        break;
+      end
+      if (host_mem == null || context_backing == null || qp_executor == null) begin
+        status = invalid_state("QP modify requires a configured QP executor");
+        break;
+      end
+      status = binding_owner_status(binding, owner);
+      if (status == null || !status.ok()) begin
+        status = checked_status(status, "QP modify Function binding returned null");
+        break;
+      end
+      status = queue_request_status(request, owner, "QP modify request");
+      if (status == null || !status.ok()) begin
+        status = checked_status(status, "QP modify request returned null");
+        break;
+      end
+      status = queue_target_owner_status(request.qp_h, owner,
+                                         "QP modify target");
+      if (status == null || !status.ok()) break;
+
+      acquire_function_lock(owner, function_lock);
+      status = binding_owner_status(binding, locked_owner);
+      if (status == null || !status.ok()) begin
+        status = checked_status(status,
+                                "post-lock QP modify Function returned null");
+        break;
+      end
+      status = same_owner_status(locked_owner, owner,
+                                 "post-lock QP modify Function");
+      if (status == null || !status.ok()) break;
+      status = queue_request_status(request, locked_owner,
+                                    "post-lock QP modify request");
+      if (status == null || !status.ok()) begin
+        status = checked_status(status, "post-lock QP modify request returned null");
+        break;
+      end
+      status = queue_target_owner_status(request.qp_h, locked_owner,
+                                         "post-lock QP modify target");
+      if (status == null || !status.ok()) break;
+
+      executor_called = 1'b1;
+      qp_executor.modify_locked(binding, owner, request, transaction_id,
+                                qp, result);
+      if (result == null) begin
+        status = invalid_state("QP modify executor returned a null result");
+        break;
+      end
+      if (result.transaction_id != transaction_id) begin
+        qp = null;
+        status = invalid_state("QP modify executor changed the transaction ID");
+        finish_result(result, status);
+        break;
+      end
+      status = checked_status(result.status,
+                              "QP modify executor result status is null");
+      if (status.ok()) begin
+        qp_validation_status = qp == null ? null : qp.validate();
+        if (qp == null || qp.state != RDMA_RESOURCE_ACTIVE ||
+            qp_validation_status == null || !qp_validation_status.ok()) begin
+          qp = null;
+          status = invalid_state("typed QP modify projection is invalid");
+          finish_result(result, status);
+        end
+      end
+      break;
+    end while (1'b0);
+    if (result == null) begin
+      result = make_result();
+      result.transaction_id = transaction_id;
+    end
+    if (status == null || !status.ok()) begin
+      qp = null;
+      if (!executor_called)
+        finish_result(result, status);
+    end
+    if (function_lock != null)
+      function_lock.put(1);
+  endtask
+
+  task destroy_qp(
+    rdma_function_binding binding,
+    rdma_destroy_resource_req request,
+    output rdma_control_result result
+  );
+    rdma_function_handle owner, locked_owner;
+    rdma_status status;
+    semaphore function_lock;
+    longint unsigned transaction_id;
+    bit executor_called;
+    result = make_result(); function_lock = null; executor_called = 1'b0;
+    reserve_transaction_id(transaction_id, status);
+    result.transaction_id = transaction_id;
+    do begin
+      if (status == null || !status.ok()) begin status = checked_status(status,
+        "QP destroy transaction ID allocation returned null"); break; end
+      status = configured_status(); if (status == null || !status.ok()) begin
+        status = checked_status(status, "QP destroy control-plane configuration returned null"); break; end
+      status = binding_owner_status(binding, owner); if (status == null || !status.ok()) begin
+        status = checked_status(status, "QP destroy Function binding returned null"); break; end
+      status = queue_request_status(request, owner, "QP destroy request");
+      if (status == null || !status.ok()) begin status = checked_status(status, "QP destroy request returned null"); break; end
+      if (request.target_h.kind != RDMA_RESOURCE_QP) begin status = invalid_argument("QP destroy target kind is invalid"); break; end
+      status = queue_target_owner_status(request.target_h, owner, "QP destroy target"); if (status == null || !status.ok()) break;
+      acquire_function_lock(owner, function_lock);
+      status = binding_owner_status(binding, locked_owner); if (status == null || !status.ok()) break;
+      status = same_owner_status(locked_owner, owner, "post-lock QP destroy Function"); if (status == null || !status.ok()) break;
+      status = queue_target_owner_status(request.target_h, locked_owner, "post-lock QP destroy target"); if (status == null || !status.ok()) break;
+      executor_called = 1'b1;
+      qp_executor.destroy_locked(binding, owner, request, transaction_id, result);
+      if (result == null) status = invalid_state("QP destroy executor returned null result");
+      else if (result.transaction_id != transaction_id) begin status = invalid_state("QP destroy executor changed transaction ID"); finish_result(result, status); end
+      else status = checked_status(result.status, "QP destroy executor result status is null");
+      break;
+    end while (1'b0);
+    if (result == null) begin result = make_result(); result.transaction_id = transaction_id; end
+    if ((status == null || !status.ok()) && !executor_called) finish_result(result, status);
+    if (function_lock != null) function_lock.put(1);
   endtask
 
   task destroy_cq(
@@ -3165,9 +3446,9 @@ class rdma_control_plane extends uvm_object;
         break;
       end
       if (resource_h == null ||
-          !(resource_h.kind inside {RDMA_RESOURCE_MR, RDMA_RESOURCE_CQ,
-                                    RDMA_RESOURCE_SRQ, RDMA_RESOURCE_CEQ,
-                                    RDMA_RESOURCE_AEQ})) begin
+          !(resource_h.kind inside {RDMA_RESOURCE_MR, RDMA_RESOURCE_QP,
+                                    RDMA_RESOURCE_CQ, RDMA_RESOURCE_SRQ,
+                                    RDMA_RESOURCE_CEQ, RDMA_RESOURCE_AEQ})) begin
         status = invalid_argument("recovery handle kind is unsupported");
         break;
       end
@@ -3196,6 +3477,37 @@ class rdma_control_plane extends uvm_object;
       status = checked_status(status, "recovery lookup returned null");
       if (!status.ok())
         break;
+
+      // QP recovery has its own lifecycle executor because QPC images,
+      // query-buffer authority, and ordered backing cleanup differ from the
+      // generic queue/MR recovery protocol.  Dispatch while the per-Function
+      // lock is held, exactly like create/modify/destroy.
+      if (resource_h.kind == RDMA_RESOURCE_QP) begin
+        rdma_qp error_qp;
+        if (qp_executor == null) begin
+          status = invalid_state("QP lifecycle executor is unavailable");
+          break;
+        end
+        if (!$cast(error_qp, resource) || error_qp == null ||
+            error_qp.state != RDMA_RESOURCE_ERROR) begin
+          status = invalid_state("QP recovery requires an ERROR QP");
+          break;
+        end
+        status = same_owner_status(error_qp.owner, locked_owner,
+                                   "recovery QP");
+        if (status == null || !status.ok())
+          break;
+        qp_executor.recover_locked(binding, locked_owner, resource_h,
+                                   transaction_id, result);
+        if (result == null) begin
+          result = make_result();
+          result.transaction_id = transaction_id;
+          status = invalid_state("QP recovery executor returned null result");
+          break;
+        end
+        result_finalized = 1'b1;
+        break;
+      end
 
       // Queue recovery is policy-driven and lives in the queue executor.  Do
       // this dispatch while the same per-Function lock used by create/destroy
