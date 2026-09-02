@@ -38,6 +38,10 @@ class rdma_xtr_v1_queue_host_mem_submitter_test extends uvm_test;
     rdma_sqe_rc_ext rc;
     rdma_sge sge;
     rdma_hw_image image;
+    rdma_xtr_v1_aeqe_model aeqe;
+    byte unsigned aeqe_bytes[16];
+    int unsigned release_calls;
+    int unsigned release_calls_after;
     phase.raise_objection(this);
 
     mem = rdma_mock_host_mem::type_id::create("mem");
@@ -74,14 +78,39 @@ class rdma_xtr_v1_queue_host_mem_submitter_test extends uvm_test;
     if (status == null || !status.ok() || image == null)
       `uvm_error("WRITE", "queue SQE write transaction failed")
 
+    // Seed a device-produced AEQE in the second slot.  Both CEQE and AEQE
+    // are 16 bytes; the submitter must preserve the explicitly selected
+    // image kind rather than inferring it from length.
+    aeqe_bytes = '{8'hd0, 8'h00, 8'h00, 8'h81, 8'hff, 8'h02, 8'haa,
+                   8'haa, 8'h00, 8'he5, 8'h43, 8'h21, 8'h00, 8'h00,
+                   8'h00, 8'h00};
+    foreach (aeqe_bytes[i])
+      mem.regions[0].data[64 + i] = aeqe_bytes[i];
+    aeqe = null;
+    image = null;
+    status = submitter.read_aeqe(target, 64, aeqe, image);
+    if (status == null || !status.ok() || aeqe == null || image == null ||
+        image.image_kind != RDMA_IMAGE_AEQE)
+      `uvm_error("READ_AEQE", "AEQE read selected the wrong 16-byte image kind")
+
     status = submitter.release_target(target);
     if (status == null || !status.ok())
       `uvm_error("RELEASE", "queue target release failed")
+    release_calls = 0;
+    foreach (mem.calls[i])
+      if (mem.calls[i].method_name == "release")
+        release_calls++;
     // Exactly-once release: a duplicate release is rejected without another
     // adapter call.
     status = submitter.release_target(target);
     if (status == null || status.ok())
       `uvm_error("DUP_RELEASE", "duplicate target release was accepted")
+    release_calls_after = 0;
+    foreach (mem.calls[i])
+      if (mem.calls[i].method_name == "release")
+        release_calls_after++;
+    if (release_calls != 1 || release_calls_after != release_calls)
+      `uvm_error("DUP_RELEASE_CALL", "duplicate release invoked adapter")
     phase.drop_objection(this);
   endtask
 endclass

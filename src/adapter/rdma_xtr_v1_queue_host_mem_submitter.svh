@@ -112,7 +112,10 @@ class rdma_xtr_v1_queue_host_mem_submitter extends uvm_object;
 
   protected function rdma_status mapping_identity_status(
     rdma_dma_mapping mapping,
-    rdma_dma_request_context request_ctx
+    rdma_dma_request_context request_ctx,
+    int unsigned requested_size,
+    int unsigned requested_alignment,
+    rdma_dma_direction_e requested_direction
   );
     longint unsigned mapping_last;
 
@@ -136,6 +139,28 @@ class rdma_xtr_v1_queue_host_mem_submitter extends uvm_object;
         mapping.dma_domain_id != request_ctx.dma_domain_id)
       return rdma_status::make(RDMA_SC_DMA_TRANSLATION,
                                 "DMA mapping domain identity mismatch");
+    if (requested_size == 0 || mapping.size != requested_size)
+      return rdma_status::make(RDMA_SC_DMA_TRANSLATION,
+                                "DMA mapping size does not match allocation");
+    if (requested_alignment == 0 ||
+        (mapping.iova.value & (requested_alignment - 1'b1)) != 0)
+      return rdma_status::make(RDMA_SC_DMA_TRANSLATION,
+                                "DMA mapping IOVA does not satisfy alignment");
+    if (mapping.direction != requested_direction)
+      return rdma_status::make(RDMA_SC_DMA_PERMISSION,
+                                "DMA mapping direction does not match allocation");
+    if (requested_direction == RDMA_DMA_DEVICE_READ &&
+        !mapping.permissions.device_read)
+      return rdma_status::make(RDMA_SC_DMA_PERMISSION,
+                                "DMA mapping lacks device-read permission");
+    if (requested_direction == RDMA_DMA_DEVICE_WRITE &&
+        !mapping.permissions.device_write)
+      return rdma_status::make(RDMA_SC_DMA_PERMISSION,
+                                "DMA mapping lacks device-write permission");
+    if (requested_direction == RDMA_DMA_BIDIRECTIONAL &&
+        (!mapping.permissions.device_read || !mapping.permissions.device_write))
+      return rdma_status::make(RDMA_SC_DMA_PERMISSION,
+                                "DMA mapping lacks bidirectional permissions");
     if (mapping.size == 0)
       return state_error("DMA mapping has zero size");
     if (mapping.iova.value >
@@ -246,6 +271,7 @@ class rdma_xtr_v1_queue_host_mem_submitter extends uvm_object;
     rdma_xtr_v1_queue_host_mem_ledger_entry entry,
     longint unsigned offset,
     int unsigned image_length,
+    rdma_image_kind_e image_kind,
     rdma_codec_base codec,
     output rdma_hw_image image
   );
@@ -280,11 +306,10 @@ class rdma_xtr_v1_queue_host_mem_submitter extends uvm_object;
     candidate.length = image_length;
     candidate.alignment = image_length;
     candidate.endian = RDMA_ENDIAN_BIG;
-    candidate.image_kind =
-      (image_length == XTR_V1_CQE_BYTES) ? RDMA_IMAGE_CQE :
-      (image_length == XTR_V1_CEQE_BYTES) ? RDMA_IMAGE_CEQE :
-                                            RDMA_IMAGE_AEQE;
+    candidate.image_kind = image_kind;
     candidate.hardware_version = XTR_V1_HW_VERSION;
+    candidate.function_generation =
+      entry.request_context.function_h.generation;
     candidate.write_target_kind = RDMA_HW_TARGET_NONE;
     candidate.backing_target = '0;
     candidate.hmc_target = '0;
@@ -293,6 +318,8 @@ class rdma_xtr_v1_queue_host_mem_submitter extends uvm_object;
     foreach (image_bytes[i])
       image_bytes[i] = candidate.bytes[i];
     status = codec.validate_image(candidate);
+    status = status_or(status, RDMA_SC_CODEC_ERROR,
+                       "queue completion image validation returned null");
     if (!status.ok())
       return status;
     image = candidate;
@@ -336,7 +363,8 @@ class rdma_xtr_v1_queue_host_mem_submitter extends uvm_object;
                        "host memory allocation returned null status");
     if (!status.ok())
       return status;
-    status = mapping_identity_status(mapping, request_context);
+    status = mapping_identity_status(mapping, request_context, size,
+                                     alignment, direction);
     if (!status.ok()) begin
       // An adapter may have returned a mapping with malformed identity.  It
       // is still released exactly once before the failed allocation exits.
@@ -349,10 +377,10 @@ class rdma_xtr_v1_queue_host_mem_submitter extends uvm_object;
     status = mapping.snapshot_release_authority(authority);
     status = status_or(status, RDMA_SC_INVALID_STATE,
                        "DMA mapping authority snapshot returned null");
-    if (!status.ok() || authority == null) begin
+    if (status.ok() && authority == null)
+      status = state_error("DMA mapping authority snapshot returned null");
+    if (!status.ok()) begin
       release_status = rdma_xtr_v1_host_mem_release(host_mem, mapping);
-      if (status.ok() && release_status != null && !release_status.ok())
-        return release_status;
       return status;
     end
     status = clone_context(request_context, context_snapshot);
@@ -418,8 +446,22 @@ class rdma_xtr_v1_queue_host_mem_submitter extends uvm_object;
     if (!status.ok())
       return status;
     if (candidate == null || candidate.length != expected_length ||
-        candidate.bytes.size() != expected_length)
+        candidate.bytes.size() != expected_length ||
+        candidate.alignment != expected_length ||
+        candidate.endian != RDMA_ENDIAN_BIG ||
+        candidate.image_kind != image_kind ||
+        candidate.hardware_version != XTR_V1_HW_VERSION ||
+        candidate.write_target_kind != RDMA_HW_TARGET_NONE ||
+        candidate.backing_target.value != 0 ||
+        candidate.hmc_target.value != 0 || candidate.bar_target.value != 0 ||
+        candidate.function_generation !=
+          entry.request_context.function_h.generation)
       return codec_error("queue codec returned an image of the wrong size");
+    status = codec.validate_image(candidate);
+    status = status_or(status, RDMA_SC_CODEC_ERROR,
+                       "queue codec image validation returned null");
+    if (!status.ok())
+      return status;
     status = validate_range(entry, offset, expected_length,
                             RDMA_DMA_DEVICE_READ,
                             '{device_read:1'b1, device_write:1'b0,
@@ -459,6 +501,7 @@ class rdma_xtr_v1_queue_host_mem_submitter extends uvm_object;
     readback_image.endian = RDMA_ENDIAN_BIG;
     readback_image.image_kind = image_kind;
     readback_image.hardware_version = XTR_V1_HW_VERSION;
+    readback_image.function_generation = candidate.function_generation;
     status = codec.validate_image(readback_image);
     if (!status.ok())
       return status;
@@ -512,10 +555,13 @@ class rdma_xtr_v1_queue_host_mem_submitter extends uvm_object;
     status = lookup_target(target, entry); if (!status.ok()) return status;
     status = lookup_queue_codec(RDMA_IMAGE_CQE, "cqe", "default", codec);
     if (!status.ok()) return status;
-    status = complete_read_image(entry, offset, XTR_V1_CQE_BYTES, codec,
+    status = complete_read_image(entry, offset, XTR_V1_CQE_BYTES,
+                                 RDMA_IMAGE_CQE, codec,
                                  candidate_image);
     if (!status.ok()) return status;
     status = codec.decode(candidate_image, decoded);
+    status = status_or(status, RDMA_SC_CODEC_ERROR,
+                       "CQE decode returned null status");
     if (!status.ok() || decoded == null || !$cast(model, decoded)) begin
       model = null; image = null;
       return status.ok() ? codec_error("decoded CQE model type mismatch") : status;
@@ -539,10 +585,13 @@ class rdma_xtr_v1_queue_host_mem_submitter extends uvm_object;
     status = lookup_target(target, entry); if (!status.ok()) return status;
     status = lookup_queue_codec(RDMA_IMAGE_CEQE, "ceqe", "default", codec);
     if (!status.ok()) return status;
-    status = complete_read_image(entry, offset, XTR_V1_CEQE_BYTES, codec,
+    status = complete_read_image(entry, offset, XTR_V1_CEQE_BYTES,
+                                 RDMA_IMAGE_CEQE, codec,
                                  candidate_image);
     if (!status.ok()) return status;
     status = codec.decode(candidate_image, decoded);
+    status = status_or(status, RDMA_SC_CODEC_ERROR,
+                       "CEQE decode returned null status");
     if (!status.ok() || decoded == null || !$cast(model, decoded)) begin
       model = null; image = null;
       return status.ok() ? codec_error("decoded CEQE model type mismatch") : status;
@@ -566,10 +615,13 @@ class rdma_xtr_v1_queue_host_mem_submitter extends uvm_object;
     status = lookup_target(target, entry); if (!status.ok()) return status;
     status = lookup_queue_codec(RDMA_IMAGE_AEQE, "aeqe", "default", codec);
     if (!status.ok()) return status;
-    status = complete_read_image(entry, offset, XTR_V1_AEQE_BYTES, codec,
+    status = complete_read_image(entry, offset, XTR_V1_AEQE_BYTES,
+                                 RDMA_IMAGE_AEQE, codec,
                                  candidate_image);
     if (!status.ok()) return status;
     status = codec.decode(candidate_image, decoded);
+    status = status_or(status, RDMA_SC_CODEC_ERROR,
+                       "AEQE decode returned null status");
     if (!status.ok() || decoded == null || !$cast(model, decoded)) begin
       model = null; image = null;
       return status.ok() ? codec_error("decoded AEQE model type mismatch") : status;
