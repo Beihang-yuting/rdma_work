@@ -1552,6 +1552,7 @@ class rdma_request_model_test extends uvm_test;
     recv_sge.length = 512;
     recv_sge.lkey = 32'h5566;
     post_recv.sges.push_back(recv_sge);
+    post_recv.completion_qp_h = qp_h;
     expect_status("POST_RECV", post_recv.validate(), RDMA_SC_OK);
     post_recv.target_h = null;
     expect_status("POST_RECV_NULL", post_recv.validate(),
