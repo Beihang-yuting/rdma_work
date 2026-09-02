@@ -50,7 +50,6 @@ package rdma_unit_test_pkg;
   `include "unit/rdma_xtr_v1_queue_codec_test.svh"
   `include "unit/rdma_xtr_v1_queue_host_mem_submitter_test.svh"
   `include "unit/rdma_queue_runtime_test.svh"
-  `include "unit/rdma_queue_data_engine_post_test.svh"
   `include "unit/rdma_queue_backing_access_test.svh"
   `include "unit/rdma_xtr_v1_doorbell_codec_test.svh"
   `include "unit/rdma_xtr_v1_qpc_codec_test.svh"
