@@ -154,10 +154,10 @@ class rdma_queue_txn_evidence extends uvm_object;
   endfunction
 
   function rdma_status mark_wqe_release(int unsigned index, bit wrap);
+    rdma_queue_cq_release_plan plan;
     if (aborted || phase == RDMA_QUEUE_TXN_COMPLETED ||
         phase < RDMA_QUEUE_TXN_CONSUMER_COMMITTED)
       return rdma_status::make(RDMA_SC_INVALID_STATE, "WQE release requires committed transaction");
-    rdma_queue_cq_release_plan plan;
     foreach (release_plan[i]) begin
       if (release_plan[i].index == index && release_plan[i].wrap == wrap) begin
         release_plan[i].released = 1'b1;
