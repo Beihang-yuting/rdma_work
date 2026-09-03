@@ -17,3 +17,7 @@ Commit `19128d8` adds detached QP capability fields and plan SQ-SGB authority re
 ## Review round 2
 
 Commit `$(git rev-parse --short HEAD)` fixes SQ-SGB plan validation to require 4KiB-rounded storage (including segmented references) and applies 512-byte alignment to SQ-SGB backing refs/segments while preserving 4KiB alignment for other roles.
+
+## Review round 3
+
+Plan validation now computes total SQ-SGB backing length across additional segments and requires exact rounded storage coverage, rejecting oversized/malformed segmented refs while permitting canonical 512+3584 segmentation.
