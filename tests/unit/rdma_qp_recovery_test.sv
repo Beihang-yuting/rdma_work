@@ -165,7 +165,85 @@ class rdma_qp_recovery_test extends rdma_qp_lifecycle_test;
     check_modify_query_matrix();
     check_create_presence_query();
     check_delete_presence_query();
+    check_optional_sgb_recovery_validation();
     phase.drop_objection(this);
+  endtask
+
+  // RC can legally carry an optional SQ-SGB when its SGE capability requires
+  // one.  Recovery must authenticate that retained authority and reject a
+  // forged mapping owner or malformed rounded geometry before any CMQ work.
+  task automatic check_optional_sgb_recovery_validation();
+    rdma_mock_host_mem mem;
+    rdma_function_binding binding;
+    rdma_resource_manager manager;
+    rdma_mock_context_backing contexts;
+    rdma_mock_cmq_port cmq;
+    rdma_qp_lifecycle_executor executor;
+    rdma_pd pd;
+    rdma_cq cq;
+    rdma_create_qp_req create_req;
+    rdma_modify_qp_req modify_req;
+    rdma_qp qp;
+    rdma_control_result result;
+    rdma_recovery_record record;
+    rdma_status status;
+    rdma_handle original_owner;
+    longint unsigned original_length;
+
+    mem = rdma_mock_host_mem::type_id::create("OPTIONAL_SGB_mem");
+    setup_qp_environment("OPTIONAL_SGB", mem, binding, manager, contexts,
+                         cmq, executor, pd, cq);
+    create_req = make_request("OPTIONAL_SGB_create", binding, pd, cq,
+                              RDMA_TRANSPORT_RC);
+    create_req.max_send_sge = 4;
+    create_req.max_recv_sge = 4;
+    create_req.max_inline_data = 512;
+    create_req.sq_sgb_backing.mode = RDMA_QUEUE_BACKING_OWNED;
+    executor.create_locked(binding, binding.make_handle(), create_req, 970,
+                           qp, result);
+    if (result == null || !result.ok() || qp == null) begin
+      `uvm_error("OPTIONAL_SGB_CREATE", "RC optional SGB fixture did not create")
+      return;
+    end
+    modify_req = rdma_modify_qp_req::type_id::create("OPTIONAL_SGB_init");
+    modify_req.owner = binding.make_handle();
+    modify_req.qp_h = rdma_clone_handle_value(qp.handle,
+                                               "OPTIONAL_SGB_qp");
+    modify_req.new_state = RDMA_QPS_INIT;
+    executor.modify_locked(binding, binding.make_handle(), modify_req, 971,
+                           qp, result);
+    modify_req.new_state = RDMA_QPS_RTR;
+    modify_req.destination_qpn_valid = 1'b1;
+    modify_req.destination_qpn = 24'h34567;
+    cmq.timeout_opcode(XTR_V1_OP_QPC_MODIFY);
+    executor.modify_locked(binding, binding.make_handle(), modify_req, 972,
+                           qp, result);
+    record = null;
+    if (result != null && result.resource_h != null)
+      void'(manager.lookup_recovery(result.resource_h, record));
+    if (record == null || record.qp_recovery == null ||
+        record.qp_recovery.qp_plan == null ||
+        record.qp_recovery.qp_plan.sq_sgb_ref == null) begin
+      `uvm_error("OPTIONAL_SGB_RECOVERY_SETUP",
+                 "RC recovery did not retain optional SQ-SGB authority")
+      return;
+    end
+    original_owner = rdma_clone_handle_value(
+      record.qp_recovery.qp_plan.sq_sgb_ref.mapping.owner_h,
+      "OPTIONAL_SGB_original_owner");
+    original_length = record.qp_recovery.qp_plan.sq_sgb_ref.length;
+    record.qp_recovery.qp_plan.sq_sgb_ref.mapping.owner_h =
+      rdma_clone_handle_value(pd.handle, "OPTIONAL_SGB_forged_owner");
+    status = record.qp_recovery.validate();
+    if (status == null || status.code != RDMA_SC_INVALID_STATE)
+      `uvm_error("OPTIONAL_SGB_RECOVERY_OWNER",
+                 "forged optional SGB mapping owner was accepted")
+    record.qp_recovery.qp_plan.sq_sgb_ref.mapping.owner_h = original_owner;
+    record.qp_recovery.qp_plan.sq_sgb_ref.length = original_length - 512;
+    status = record.qp_recovery.validate();
+    if (status == null || status.code != RDMA_SC_INVALID_ARGUMENT)
+      `uvm_error("OPTIONAL_SGB_RECOVERY_GEOMETRY",
+                 "malformed optional SGB geometry was accepted")
   endtask
 
   // A successful task status with an empty QPC_QUERY completion must not

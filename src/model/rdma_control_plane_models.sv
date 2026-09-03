@@ -669,6 +669,13 @@ class rdma_qp_recovery_state extends uvm_object;
       "QP recovery SQ"
     );
     if (!status.ok()) return status;
+    if (validation_plan.sq_sgb_ref != null) begin
+      status = rdma_qp_mapping_authority_status(
+        validation_plan.sq_sgb_ref, context_ref.owner, recovery_qp_h,
+        "QP recovery SQ SGB"
+      );
+      if (!status.ok()) return status;
+    end
     status = rdma_qp_mapping_authority_status(
       validation_plan.sq_pd_ref, context_ref.owner, recovery_qp_h,
       "QP recovery SQ PD"

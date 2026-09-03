@@ -607,6 +607,9 @@ class rdma_qp_lifecycle_executor extends uvm_object;
         if (status.ok())
           status = zero_sq_sgb_ref(sgb_context, plan.sq_sgb_ref,
                                    sgb_storage_bytes);
+        if (status.ok() &&
+            request.sq_sgb_backing.mode == RDMA_QUEUE_BACKING_BORROWED)
+          status = bind_borrowed_owner(plan.sq_sgb_ref, qp_snapshot.handle);
         if (!status.ok()) return status;
       end
     end

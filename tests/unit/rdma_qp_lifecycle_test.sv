@@ -1777,6 +1777,74 @@ class rdma_qp_lifecycle_test extends uvm_test;
         "caller segment mutation reached manager authority")
   endtask
 
+  // A borrowed SQ-SGB is detached from the caller's mapping authority and
+  // rebound to the newly-created QP, while the caller remains the release
+  // authority.  This specifically covers the optional UD SGB path rather
+  // than only the ordinary SQ/RQ borrowed rings above.
+  task automatic check_borrowed_sgb_authority();
+    rdma_mock_host_mem mem;
+    rdma_function_binding binding;
+    rdma_resource_manager manager;
+    rdma_mock_context_backing contexts;
+    rdma_mock_cmq_port cmq;
+    rdma_qp_lifecycle_executor executor;
+    rdma_pd pd;
+    rdma_cq cq;
+    rdma_create_qp_req request;
+    rdma_dma_mapping sgb_mapping;
+    rdma_qp qp;
+    rdma_control_result result;
+    byte fill[];
+    bit released;
+
+    mem = rdma_mock_host_mem::type_id::create("BORROWED_SGB_mem");
+    setup_qp_environment("BORROWED_SGB", mem, binding, manager, contexts,
+                         cmq, executor, pd, cq);
+    allocate_borrowed_mapping("BORROWED_SGB", mem, binding, pd.handle,
+                              RDMA_QUEUE_ROLE_QP_SQ_SGB, sgb_mapping);
+    fill = new[8192];
+    foreach (fill[i]) fill[i] = 8'h5a;
+    expect_ok("BORROWED_SGB_FILL", mem.write(sgb_mapping, 0, fill));
+    mem.calls.delete();
+    mem.method_ordinals.delete();
+
+    request = make_request("BORROWED_SGB_request", binding, pd, cq,
+                           RDMA_TRANSPORT_UD);
+    request.sq_depth = 16; // two 4 KiB slices cover the rounded 8 KiB SGB
+    request.sq_sgb_backing.mode = RDMA_QUEUE_BACKING_BORROWED;
+    request.sq_sgb_backing.slices.push_back(make_borrowed_slice(
+      "BORROWED_SGB_slice0", RDMA_QUEUE_ROLE_QP_SQ_SGB, sgb_mapping, 0, 0));
+    request.sq_sgb_backing.slices.push_back(make_borrowed_slice(
+      "BORROWED_SGB_slice1", RDMA_QUEUE_ROLE_QP_SQ_SGB, sgb_mapping, 4096,
+      4096));
+    executor.create_locked(binding, binding.make_handle(), request, 208, qp,
+                           result);
+    if (result == null || !result.ok() || qp == null || qp.qp_plan == null ||
+        qp.qp_plan.sq_sgb_ref == null ||
+        qp.qp_plan.sq_sgb_ref.ownership != RDMA_OWNERSHIP_BORROWED ||
+        qp.qp_plan.sq_sgb_ref.additional_segments.size() != 1 ||
+        qp.qp_plan.sq_sgb_ref.mapping == sgb_mapping ||
+        qp.qp_plan.sq_sgb_ref.mapping.owner_h == null ||
+        !qp.qp_plan.sq_sgb_ref.mapping.owner_h.same_instance(qp.handle) ||
+        qp.qp_plan.sq_sgb_ref.additional_segments[0].mapping.owner_h == null ||
+        !qp.qp_plan.sq_sgb_ref.additional_segments[0].mapping.owner_h.
+          same_instance(qp.handle))
+      `uvm_error("BORROWED_SGB_OWNER",
+                 "borrowed SQ-SGB was not rebound to the QP authority")
+    if (sgb_mapping.owner_h == null || !sgb_mapping.owner_h.same_instance(
+          pd.handle))
+      `uvm_error("BORROWED_SGB_CALLER_OWNER",
+                 "borrowed SQ-SGB rebinding mutated caller authority")
+    expect_zero_page("BORROWED_SGB_ZERO", mem, sgb_mapping, 0);
+    released = 1'b0;
+    foreach (mem.calls[i])
+      if (mem.calls[i].method_name == "release" && mem.calls[i].mapping != null &&
+          mem.calls[i].mapping.iova.value == sgb_mapping.iova.value)
+        released = 1'b1;
+    if (released || sgb_mapping.state != RDMA_MAPPING_ACTIVE)
+      `uvm_error("BORROWED_SGB_NON_RELEASE", "borrowed SQ-SGB was released")
+  endtask
+
   task automatic check_rc_srq_geometry();
     rdma_function_binding binding;
     rdma_resource_manager manager;
@@ -3693,6 +3761,7 @@ class rdma_qp_lifecycle_test extends uvm_test;
     check_authority_failure_cleanup(2);
     check_stale_rebind_blocks_attach();
     check_borrowed_multislice_authority();
+    check_borrowed_sgb_authority();
     check_allocation_and_host_write_failures();
     check_context_codec_and_attach_failures();
     check_definitive_cmq_and_activation_failures();

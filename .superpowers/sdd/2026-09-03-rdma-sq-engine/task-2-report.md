@@ -43,3 +43,36 @@ allocation baseline is five, accounting for the additional 64 KiB SQ-SGB.
 
 Recovery validation now treats SQ-SGB as optional for RC/URC plans and rejects
 completion progress that claims an absent SQ-SGB authority.
+
+## Fix round 1
+
+Addressed the scoped re-review findings:
+
+- Borrowed `sq_sgb_ref` is rebound to a cloned QP owner for both the primary
+  mapping and every additional segment before the materialized plan is
+  published. The caller's mapping object and ownership remain untouched, and
+  borrowed SGB mappings remain excluded from release.
+- Recovery validation now authenticates an optional SQ-SGB mapping and all
+  segment owners against the recovery Function/QP authority. Present optional
+  SGB references also require the canonical rounded `depth * 512` storage
+  geometry for RC, URC, and UD; absence remains legal for RC/URC.
+- Pre-program/partial recovery validation applies the same optional-SGB
+  geometry check, preventing malformed retained authority from bypassing the
+  full recovery validator.
+
+Verification commands and observed output:
+
+```text
+git diff --check
+PASS (no output, exit 0)
+
+PATH="/tmp/rdma_sshpass_wrapper_codex:$PATH" SSHPASS=123 \
+  scripts/run_vcs53.sh core rdma_qp_lifecycle_test
+VCS host compile reached "Starting vcs inline pass..." with no compile errors;
+the command was stopped before the long-running simulation per review request.
+The harness emitted only the existing no-job-control and keyword warnings.
+```
+
+The dedicated `rdma_qp_recovery_test` simulation was not rerun in this fix
+round because the reviewer requested immediate commit after compile
+verification; the new recovery regression is present in the test source.

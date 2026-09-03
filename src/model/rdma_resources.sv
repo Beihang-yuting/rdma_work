@@ -216,6 +216,20 @@ function automatic rdma_status rdma_qp_partial_plan_status(
     "partial QP SQ SGB"
   );
   if (!status.ok()) return status;
+  // SQ-SGB is optional for RC/URC, but when retained it is still a
+  // published authority. Validate its rounded depth*512 geometry here as
+  // well as in the fully materialized-plan validator so pre-program recovery
+  // cannot carry a forged or truncated optional SGB.
+  if (plan.sq_sgb_ref != null) begin
+    status = rdma_qp_backing_total_length(plan.sq_sgb_ref, total_length);
+    if (!status.ok()) return status;
+    if (plan.sq_sgb_ref.role != RDMA_QUEUE_ROLE_QP_SQ_SGB ||
+        total_length != ((longint'(plan.sq_depth) * 512 + 4095) / 4096) * 4096)
+      return rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT,
+        "partial QP SQ SGB geometry is invalid"
+      );
+  end
   status = rdma_qp_partial_ref_status(
     plan.sq_pd_ref, RDMA_QUEUE_ROLE_QP_SQ_PD, owner, qp_h,
     "partial QP SQ PD"

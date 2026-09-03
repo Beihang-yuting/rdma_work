@@ -1244,7 +1244,9 @@ class rdma_qp_backing_plan extends uvm_object;
       );
     if (transport == RDMA_TRANSPORT_UD && sq_sgb_ref == null)
       return rdma_status::make(RDMA_SC_INVALID_STATE, "QP SQ SGB authority missing");
-    if (transport == RDMA_TRANSPORT_UD && sq_sgb_ref != null) begin
+    // RC/URC normally do not require an SGB, but a present optional SGB is
+    // still part of the published authority and must carry canonical geometry.
+    if (sq_sgb_ref != null) begin
       status = sq_sgb_ref.validate(); if (!status.ok()) return status;
       status = rdma_qp_backing_total_length(sq_sgb_ref, total_length);
       if (!status.ok()) return status;
