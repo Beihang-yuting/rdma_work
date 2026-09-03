@@ -488,7 +488,8 @@ class rdma_queue_backing_segment extends uvm_object;
                             RDMA_OWNERSHIP_CONTROL_PLANE}))
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "backing segment ownership invalid");
-    alignment = (role == RDMA_QUEUE_ROLE_SRQ_SGB) ? 512 : 4096;
+    alignment = (role inside {RDMA_QUEUE_ROLE_SRQ_SGB,
+                              RDMA_QUEUE_ROLE_QP_SQ_SGB}) ? 512 : 4096;
     if (!rdma_queue_aligned(logical_queue_offset, alignment))
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "backing segment logical offset unaligned");
@@ -1085,7 +1086,8 @@ class rdma_qp_backing_ref extends uvm_object;
                                "QP internal backing must be control-plane owned");
     if (cleanup_complete && ownership == RDMA_OWNERSHIP_BORROWED)
       return rdma_status::make(RDMA_SC_INVALID_STATE, "borrowed QP backing cleaned");
-    status = rdma_queue_queue_range_status(mapping, mapping_offset, length, 4096);
+    status = rdma_queue_queue_range_status(mapping, mapping_offset, length,
+      role == RDMA_QUEUE_ROLE_QP_SQ_SGB ? 512 : 4096);
     if (!status.ok()) return status;
     if (rdma_qp_role_is_pd(role) && additional_segments.size() != 0)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
@@ -1242,7 +1244,8 @@ class rdma_qp_backing_plan extends uvm_object;
       return rdma_status::make(RDMA_SC_INVALID_STATE, "QP SQ SGB authority missing");
     if (transport == RDMA_TRANSPORT_UD && sq_sgb_ref != null) begin
       status = sq_sgb_ref.validate(); if (!status.ok()) return status;
-      if (sq_sgb_ref.role != RDMA_QUEUE_ROLE_QP_SQ_SGB || sq_sgb_ref.length != sq_depth*512)
+      if (sq_sgb_ref.role != RDMA_QUEUE_ROLE_QP_SQ_SGB ||
+          sq_sgb_ref.length != ((longint'(sq_depth)*512 + 4095)/4096)*4096)
         return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "QP SQ SGB geometry invalid");
     end
     status = rdma_qp_backing_total_length(sq_ref, total_length);
