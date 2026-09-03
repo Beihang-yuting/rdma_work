@@ -15,9 +15,9 @@ typedef enum bit [2:0] {
 } rdma_queue_txn_phase_e;
 
 typedef enum bit [1:0] {
-  RDMA_QUEUE_RECOVERY_RETRY_NO_SUBMIT = 2'd0,
-  RDMA_QUEUE_RECOVERY_FINALIZE_SUBMITTED = 2'd1,
-  RDMA_QUEUE_RECOVERY_ABORT_AND_DETACH = 2'd2
+  RDMA_MODEL_RECOVERY_RETRY_NO_SUBMIT = 2'd0,
+  RDMA_MODEL_RECOVERY_FINALIZE_SUBMITTED = 2'd1,
+  RDMA_MODEL_RECOVERY_ABORT_AND_DETACH = 2'd2
 } rdma_queue_recovery_action_e;
 
 class rdma_queue_cq_release_plan extends uvm_object;

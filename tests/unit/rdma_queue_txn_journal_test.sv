@@ -19,16 +19,16 @@ class rdma_queue_txn_journal_test extends uvm_test;
     status = evidence.advance(RDMA_QUEUE_TXN_NONE);
     if (status.ok() || status.code != RDMA_SC_INVALID_STATE)
       `uvm_error("TXN", "illegal phase rollback accepted")
-    status = evidence.recover(RDMA_QUEUE_RECOVERY_RETRY_NO_SUBMIT, 1'b0);
+    status = evidence.recover(RDMA_MODEL_RECOVERY_RETRY_NO_SUBMIT, 1'b0);
     if (status.ok() || status.code != RDMA_SC_RECOVERY_REQUIRED)
       `uvm_error("TXN", "retry without no-submit confirmation accepted")
-    status = evidence.recover(RDMA_QUEUE_RECOVERY_RETRY_NO_SUBMIT, 1'b1);
+    status = evidence.recover(RDMA_MODEL_RECOVERY_RETRY_NO_SUBMIT, 1'b1);
     if (!status.ok()) `uvm_error("TXN", $sformatf("known no-submit retry rejected: %s", status.convert2string()))
     evidence.mark_mmio_maybe_submitted();
-    status = evidence.recover(RDMA_QUEUE_RECOVERY_RETRY_NO_SUBMIT, 1'b1);
+    status = evidence.recover(RDMA_MODEL_RECOVERY_RETRY_NO_SUBMIT, 1'b1);
     if (status.ok() || status.code != RDMA_SC_RECOVERY_REQUIRED)
       `uvm_error("TXN", "ambiguous MMIO retry accepted")
-    status = evidence.recover(RDMA_QUEUE_RECOVERY_FINALIZE_SUBMITTED, 1'b0);
+    status = evidence.recover(RDMA_MODEL_RECOVERY_FINALIZE_SUBMITTED, 1'b0);
     if (status.ok() || status.code != RDMA_SC_INVALID_STATE)
       `uvm_error("TXN", "missing image finalize accepted")
 
@@ -40,7 +40,7 @@ class rdma_queue_txn_journal_test extends uvm_test;
     submitted.advance(RDMA_QUEUE_TXN_RESERVED);
     submitted.advance(RDMA_QUEUE_TXN_PAYLOAD_WRITTEN);
     submitted.mark_mmio_maybe_submitted();
-    status = submitted.recover(RDMA_QUEUE_RECOVERY_FINALIZE_SUBMITTED, 1'b0);
+    status = submitted.recover(RDMA_MODEL_RECOVERY_FINALIZE_SUBMITTED, 1'b0);
     if (!status.ok()) `uvm_error("TXN", "submitted image finalize rejected")
     if (!submitted.mmio_maybe_submitted || submitted.image == null ||
         submitted.phase != RDMA_QUEUE_TXN_DOORBELL_MAYBE_SUBMITTED)
@@ -62,7 +62,7 @@ class rdma_queue_txn_journal_test extends uvm_test;
     if (status.ok() || status.code != RDMA_SC_INVALID_STATE)
       `uvm_error("TXN", "advance accepted after terminal completion")
 
-    status = evidence.recover(RDMA_QUEUE_RECOVERY_ABORT_AND_DETACH);
+    status = evidence.recover(RDMA_MODEL_RECOVERY_ABORT_AND_DETACH);
     if (!status.ok() || !evidence.aborted)
       `uvm_error("TXN", "abort-and-detach recovery failed")
     status = evidence.advance(RDMA_QUEUE_TXN_PAYLOAD_WRITTEN);
