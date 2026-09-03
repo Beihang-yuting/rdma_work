@@ -405,6 +405,7 @@ class rdma_mock_host_mem extends rdma_host_mem_api;
   rdma_mock_call_trace call_trace;
   int writes_until_failure;
   rdma_status delayed_write_failure;
+  bit corrupt_next_readback;
   local rdma_mock_release_seal release_seal;
 
   function new(string name = "rdma_mock_host_mem");
@@ -414,6 +415,7 @@ class rdma_mock_host_mem extends rdma_host_mem_api;
     call_trace = null;
     writes_until_failure = -1;
     delayed_write_failure = null;
+    corrupt_next_readback = 1'b0;
     release_seal = new("mock_adapter_release_seal");
   endfunction
 
@@ -730,8 +732,9 @@ class rdma_mock_host_mem extends rdma_host_mem_api;
     if (failure != null) return failure;
     if (writes_until_failure == 0) begin
       failure = rdma_mock_clone_status(delayed_write_failure);
-      writes_until_failure = -1;
-      delayed_write_failure = null;
+    writes_until_failure = -1;
+    delayed_write_failure = null;
+    corrupt_next_readback = 1'b0;
       return failure;
     end
     if (writes_until_failure > 0)
@@ -807,6 +810,10 @@ class rdma_mock_host_mem extends rdma_host_mem_api;
     data = new[size];
     foreach (data[i])
       data[i] = regions[region_index].data[offset + i];
+    if (corrupt_next_readback && size != 0) begin
+      data[0] = data[0] ^ 8'hff;
+      corrupt_next_readback = 1'b0;
+    end
     return rdma_status::success();
   endfunction
 
