@@ -1,28 +1,38 @@
+// 中文说明：rdma_queue_lifecycle_policy.sv 属于核心执行层，负责队列、控制面、资源和恢复流程。
+// 阅读提示：先看公开类型和接口，再看实现细节；失败路径应保持状态与资源所有权可追踪。
+
 virtual class rdma_queue_lifecycle_policy extends uvm_object;
+
   function new(string name = "rdma_queue_lifecycle_policy");
     super.new(name);
   endfunction
 
   pure virtual function rdma_resource_kind_e resource_kind();
+
   pure virtual function rdma_status preflight(
     rdma_function_binding binding, rdma_semantic_request request,
     rdma_resource_manager manager, output rdma_queue_preflight result);
+
   pure virtual function rdma_status reserve_resource(
     rdma_resource_manager manager, rdma_function_binding binding,
     rdma_semantic_request request, output rdma_queue_resource resource);
+
   pure virtual function rdma_status build_create_context(
     rdma_queue_resource resource, rdma_queue_backing_plan plan,
     output rdma_hw_model context_model,
     output byte unsigned context_slot_image[],
     output byte unsigned context_shadow_image[]);
+
   pure virtual function rdma_status build_create_command(
     rdma_function_handle owner, rdma_queue_resource resource,
     rdma_hw_model context_model, time timeout,
     output rdma_cmq_command_desc command);
+
   pure virtual function rdma_status build_object_command(
     bit [7:0] opcode, rdma_function_handle owner,
     rdma_queue_resource resource, time timeout,
     output rdma_cmq_command_desc command);
+
   pure virtual function rdma_status build_flush_command(
     rdma_function_handle owner, rdma_queue_flush_target target,
     time timeout, output rdma_cmq_command_desc command);
@@ -37,10 +47,12 @@ virtual class rdma_queue_lifecycle_policy extends uvm_object;
     rdma_cmq_completion completion,
     output rdma_hw_presence_e presence,
     output bit conclusive);
+
   pure virtual function void hardware_cleanup_roles(
     output rdma_queue_backing_role_e flush_roles[$],
     output rdma_queue_flush_phase_e flush_phases[$],
     output bit delete_before_flush);
+
   pure virtual function void local_cleanup_roles(
     output rdma_queue_backing_role_e roles[$],
     output bit release_context_first);
@@ -1078,6 +1090,7 @@ class rdma_cq_lifecycle_policy extends rdma_queue_lifecycle_policy;
       return invalid_argument("CQ flush target is not CQ_PD/POST_DELETE");
     return build_pd_flush_desc(owner, target, timeout, command);
   endfunction
+
   virtual function rdma_status classify_query_completion(
     rdma_queue_resource resource,
     rdma_cmq_completion completion,
@@ -1088,7 +1101,9 @@ class rdma_cq_lifecycle_policy extends rdma_queue_lifecycle_policy;
       XTR_V1_OP_CQC_CREATE, RDMA_IMAGE_CQC, "cqc", 8, 56,
       XTR_V1_ECODE_EC_RCE_CQC_INVLD, 1'b1, presence, conclusive);
   endfunction
+
   virtual function void hardware_cleanup_roles(output rdma_queue_backing_role_e flush_roles[$], output rdma_queue_flush_phase_e flush_phases[$], output bit delete_before_flush); flush_roles.delete(); flush_phases.delete(); delete_before_flush=1'b1; flush_roles.push_back(RDMA_QUEUE_ROLE_CQ_PD); flush_phases.push_back(RDMA_QUEUE_FLUSH_POST_DELETE); endfunction
+
   virtual function void local_cleanup_roles(output rdma_queue_backing_role_e roles[$], output bit release_context_first); roles.delete(); release_context_first=1'b1; roles.push_back(RDMA_QUEUE_ROLE_CQ_PD); roles.push_back(RDMA_QUEUE_ROLE_CQ_RING); endfunction
 endclass
 
@@ -1324,6 +1339,7 @@ class rdma_srq_lifecycle_policy extends rdma_queue_lifecycle_policy;
       return invalid_argument("SRQ flush target is not a pre-delete PD");
     return build_pd_flush_desc(owner, target, timeout, command);
   endfunction
+
   virtual function rdma_status classify_query_completion(
     rdma_queue_resource resource,
     rdma_cmq_completion completion,
@@ -1334,7 +1350,9 @@ class rdma_srq_lifecycle_policy extends rdma_queue_lifecycle_policy;
       XTR_V1_OP_SRFQC_CREATE, RDMA_IMAGE_SRQC, "srqc", 16, 32,
       8'hff, 1'b0, presence, conclusive);
   endfunction
+
   virtual function void hardware_cleanup_roles(output rdma_queue_backing_role_e flush_roles[$], output rdma_queue_flush_phase_e flush_phases[$], output bit delete_before_flush); flush_roles.delete(); flush_phases.delete(); delete_before_flush=1'b0; flush_roles.push_back(RDMA_QUEUE_ROLE_SRFQ_PD); flush_phases.push_back(RDMA_QUEUE_FLUSH_PRE_DELETE); flush_roles.push_back(RDMA_QUEUE_ROLE_SRQ_PD); flush_phases.push_back(RDMA_QUEUE_FLUSH_PRE_DELETE); endfunction
+
   virtual function void local_cleanup_roles(output rdma_queue_backing_role_e roles[$], output bit release_context_first); roles.delete(); release_context_first=1'b1; roles.push_back(RDMA_QUEUE_ROLE_SRFQ_PD); roles.push_back(RDMA_QUEUE_ROLE_SRQ_PD); roles.push_back(RDMA_QUEUE_ROLE_SRQ_SGB); roles.push_back(RDMA_QUEUE_ROLE_SRFQ_RING); roles.push_back(RDMA_QUEUE_ROLE_SRQ_RING); endfunction
 endclass
 
@@ -1525,6 +1543,7 @@ class rdma_ceq_lifecycle_policy extends rdma_queue_lifecycle_policy;
     command = null;
     return unsupported("CEQ lifecycle has no OCC flush command");
   endfunction
+
   virtual function rdma_status classify_query_completion(
     rdma_queue_resource resource,
     rdma_cmq_completion completion,
@@ -1535,7 +1554,9 @@ class rdma_ceq_lifecycle_policy extends rdma_queue_lifecycle_policy;
       XTR_V1_OP_CEQC_CREATE, RDMA_IMAGE_CEQC, "ceqc", 16, 32,
       XTR_V1_ECODE_EC_RCE_CEQC_INVLD, 1'b1, presence, conclusive);
   endfunction
+
   virtual function void hardware_cleanup_roles(output rdma_queue_backing_role_e flush_roles[$], output rdma_queue_flush_phase_e flush_phases[$], output bit delete_before_flush); flush_roles.delete(); flush_phases.delete(); delete_before_flush=1'b1; endfunction
+
   virtual function void local_cleanup_roles(output rdma_queue_backing_role_e roles[$], output bit release_context_first); roles.delete(); release_context_first=1'b0; roles.push_back(RDMA_QUEUE_ROLE_CEQ_PD); roles.push_back(RDMA_QUEUE_ROLE_CEQ_RING); endfunction
 endclass
 
@@ -1726,6 +1747,7 @@ class rdma_aeq_lifecycle_policy extends rdma_queue_lifecycle_policy;
     command = null;
     return unsupported("AEQ lifecycle has no OCC flush command");
   endfunction
+
   virtual function rdma_status classify_query_completion(
     rdma_queue_resource resource,
     rdma_cmq_completion completion,
@@ -1736,6 +1758,8 @@ class rdma_aeq_lifecycle_policy extends rdma_queue_lifecycle_policy;
       XTR_V1_OP_AEQC_CREATE, RDMA_IMAGE_AEQC, "aeqc", 16, 32,
       XTR_V1_ECODE_EC_RCE_AEQC_INVLD, 1'b1, presence, conclusive);
   endfunction
+
   virtual function void hardware_cleanup_roles(output rdma_queue_backing_role_e flush_roles[$], output rdma_queue_flush_phase_e flush_phases[$], output bit delete_before_flush); flush_roles.delete(); flush_phases.delete(); delete_before_flush=1'b1; endfunction
+
   virtual function void local_cleanup_roles(output rdma_queue_backing_role_e roles[$], output bit release_context_first); roles.delete(); release_context_first=1'b0; roles.push_back(RDMA_QUEUE_ROLE_AEQ_PD); roles.push_back(RDMA_QUEUE_ROLE_AEQ_RING); endfunction
 endclass

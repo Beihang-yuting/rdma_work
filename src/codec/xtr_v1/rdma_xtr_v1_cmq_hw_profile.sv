@@ -1,3 +1,6 @@
+// 中文说明：rdma_xtr_v1_cmq_hw_profile.sv 属于编码层，将模型字段转换为硬件图像并执行反向校验。
+// 阅读提示：先看公开类型和接口，再看实现细节；失败路径应保持状态与资源所有权可追踪。
+
 class rdma_xtr_v1_cmq_hw_profile extends rdma_cmq_hw_profile;
   `uvm_object_utils(rdma_xtr_v1_cmq_hw_profile)
 

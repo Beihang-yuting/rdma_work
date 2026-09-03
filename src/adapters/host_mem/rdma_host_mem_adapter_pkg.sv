@@ -1,3 +1,6 @@
+// 中文说明：rdma_host_mem_adapter_pkg.sv 属于适配器实现层，提供 host-mem 等后端适配实现。
+// 阅读提示：先看公开类型和接口，再看实现细节；失败路径应保持状态与资源所有权可追踪。
+
 package rdma_host_mem_adapter_pkg;
   import uvm_pkg::*;
   import host_mem_pkg::*;
@@ -7,6 +10,7 @@ package rdma_host_mem_adapter_pkg;
   `include "uvm_macros.svh"
 
   class rdma_host_mem_release_seal extends uvm_object;
+
     function new(string name = "rdma_host_mem_release_seal");
       super.new(name);
     endfunction

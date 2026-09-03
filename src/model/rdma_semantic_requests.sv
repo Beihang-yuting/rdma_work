@@ -1,3 +1,6 @@
+// 中文说明：rdma_semantic_requests.sv 属于模型层，描述语义请求、资源快照、DMA 映射及生命周期数据。
+// 阅读提示：先看公开类型和接口，再看实现细节；失败路径应保持状态与资源所有权可追踪。
+
 typedef class rdma_address_vector;
 typedef class rdma_qpc_behavior;
 typedef class rdma_qpc_transport_ext;

@@ -1,3 +1,6 @@
+// 中文说明：rdma_xtr_v1_doorbell_codecs.sv 属于编码层，将模型字段转换为硬件图像并执行反向校验。
+// 阅读提示：先看公开类型和接口，再看实现细节；失败路径应保持状态与资源所有权可追踪。
+
 typedef enum bit {
   XTR_V1_SRQ_DB_PI    = 1'b0,
   XTR_V1_SRQ_DB_LIMIT = 1'b1
@@ -75,6 +78,7 @@ virtual class rdma_xtr_v1_doorbell_model_base extends rdma_hw_model;
   endfunction
 
   pure virtual function rdma_doorbell_kind_e doorbell_kind();
+
   pure virtual function string codec_variant();
 endclass
 

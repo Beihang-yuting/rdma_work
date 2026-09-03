@@ -1,3 +1,6 @@
+// 中文说明：rdma_xtr_v1_golden_reader.sv 属于测试辅助工具，提供 golden、解析和断言支持。
+// 阅读提示：先看公开类型和接口，再看实现细节；失败路径应保持状态与资源所有权可追踪。
+
 class rdma_xtr_v1_golden_case;
   string name;
   string inputs;

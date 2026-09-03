@@ -1,3 +1,6 @@
+// 中文说明：rdma_mock_adapters.sv 属于测试替身，为单元测试提供可控的适配器和控制面行为。
+// 阅读提示：先看公开类型和接口，再看实现细节；失败路径应保持状态与资源所有权可追踪。
+
 function automatic rdma_status rdma_mock_clone_status(rdma_status source);
   rdma_status result;
 
@@ -188,6 +191,7 @@ class rdma_mock_host_mem_call extends uvm_object;
 endclass
 
 class rdma_mock_release_seal extends uvm_object;
+
   function new(string name = "rdma_mock_release_seal");
     super.new(name);
   endfunction

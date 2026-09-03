@@ -1,3 +1,6 @@
+// 中文说明：rdma_control_plane_cmq_engine_test.sv 属于单元测试，覆盖对应模型、编码器或执行器契约。
+// 阅读提示：先看公开类型和接口，再看实现细节；失败路径应保持状态与资源所有权可追踪。
+
 class rdma_control_plane_cmq_engine_responder_pcie extends rdma_mock_pcie;
   `uvm_object_utils(rdma_control_plane_cmq_engine_responder_pcie)
 

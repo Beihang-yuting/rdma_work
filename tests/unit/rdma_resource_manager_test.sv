@@ -1,4 +1,8 @@
+// 中文说明：rdma_resource_manager_test.sv 属于单元测试，覆盖对应模型、编码器或执行器契约。
+// 阅读提示：先看公开类型和接口，再看实现细节；失败路径应保持状态与资源所有权可追踪。
+
 class rdma_resource_manager_probe extends rdma_resource_manager;
+
   function new(string name = "rdma_resource_manager_probe");
     super.new(name);
   endfunction
@@ -30,6 +34,7 @@ endclass
 // Generic QP mutation bypass tests need exact staged and ACTIVE registry
 // preconditions without relying on another public transition under test.
 class rdma_qp_generic_bypass_probe_manager extends rdma_resource_manager;
+
   function new(string name = "rdma_qp_generic_bypass_probe_manager");
     super.new(name);
   endfunction
@@ -98,6 +103,7 @@ endclass
 // Boundary injection is intentionally isolated from the behavior tests.  It
 // models corrupted allocator state without exposing registry mutation hooks.
 class rdma_width_probe_manager extends rdma_resource_manager;
+
   function new(string name = "rdma_width_probe_manager");
     super.new(name);
   endfunction
@@ -226,6 +232,7 @@ endclass
 
 class rdma_qp_lifecycle_probe_manager
   extends rdma_qp_generic_bypass_probe_manager;
+
   function new(string name = "rdma_qp_lifecycle_probe_manager");
     super.new(name);
   endfunction
@@ -916,10 +923,12 @@ endclass
 class rdma_rm_fault_pd extends rdma_pd;
   `uvm_object_utils(rdma_rm_fault_pd)
   rdma_rm_kind_clone_fault_e clone_fault;
+
   function new(string name = "rdma_rm_fault_pd");
     super.new(name);
     clone_fault = RDMA_RM_KIND_CLONE_GOOD;
   endfunction
+
   virtual function uvm_object clone();
     uvm_object cloned_object;
     rdma_rm_fault_pd cloned_pd;
@@ -935,10 +944,12 @@ endclass
 class rdma_rm_fault_cq extends rdma_cq;
   `uvm_object_utils(rdma_rm_fault_cq)
   rdma_rm_kind_clone_fault_e clone_fault;
+
   function new(string name = "rdma_rm_fault_cq");
     super.new(name);
     clone_fault = RDMA_RM_KIND_CLONE_GOOD;
   endfunction
+
   virtual function uvm_object clone();
     uvm_object cloned_object;
     rdma_rm_fault_cq cloned_cq;
@@ -958,10 +969,12 @@ endclass
 class rdma_rm_fault_qp extends rdma_qp;
   `uvm_object_utils(rdma_rm_fault_qp)
   rdma_rm_kind_clone_fault_e clone_fault;
+
   function new(string name = "rdma_rm_fault_qp");
     super.new(name);
     clone_fault = RDMA_RM_KIND_CLONE_GOOD;
   endfunction
+
   virtual function uvm_object clone();
     uvm_object cloned_object;
     rdma_rm_fault_qp cloned_qp;
@@ -986,10 +999,12 @@ endclass
 class rdma_rm_fault_srq extends rdma_srq;
   `uvm_object_utils(rdma_rm_fault_srq)
   rdma_rm_kind_clone_fault_e clone_fault;
+
   function new(string name = "rdma_rm_fault_srq");
     super.new(name);
     clone_fault = RDMA_RM_KIND_CLONE_GOOD;
   endfunction
+
   virtual function uvm_object clone();
     uvm_object cloned_object;
     rdma_rm_fault_srq cloned_srq;
@@ -1009,10 +1024,12 @@ endclass
 class rdma_rm_fault_cmq extends rdma_cmq;
   `uvm_object_utils(rdma_rm_fault_cmq)
   rdma_rm_kind_clone_fault_e clone_fault;
+
   function new(string name = "rdma_rm_fault_cmq");
     super.new(name);
     clone_fault = RDMA_RM_KIND_CLONE_GOOD;
   endfunction
+
   virtual function uvm_object clone();
     uvm_object cloned_object;
     rdma_rm_fault_cmq cloned_cmq;
@@ -1029,10 +1046,12 @@ endclass
 class rdma_rm_fault_ceq extends rdma_ceq;
   `uvm_object_utils(rdma_rm_fault_ceq)
   rdma_rm_kind_clone_fault_e clone_fault;
+
   function new(string name = "rdma_rm_fault_ceq");
     super.new(name);
     clone_fault = RDMA_RM_KIND_CLONE_GOOD;
   endfunction
+
   virtual function uvm_object clone();
     uvm_object cloned_object;
     rdma_rm_fault_ceq cloned_ceq;
@@ -1049,10 +1068,12 @@ endclass
 class rdma_rm_fault_aeq extends rdma_aeq;
   `uvm_object_utils(rdma_rm_fault_aeq)
   rdma_rm_kind_clone_fault_e clone_fault;
+
   function new(string name = "rdma_rm_fault_aeq");
     super.new(name);
     clone_fault = RDMA_RM_KIND_CLONE_GOOD;
   endfunction
+
   virtual function uvm_object clone();
     uvm_object cloned_object;
     rdma_rm_fault_aeq cloned_aeq;
@@ -1927,6 +1948,7 @@ endclass
 // source or public mapping value.  Its clone therefore collapses to the base
 // rdma_dma_mapping type unless the owned-capability boundary rejects it.
 class rdma_rm_stable_unregistered_mapping extends rdma_dma_mapping;
+
   function new(string name = "rdma_rm_stable_unregistered_mapping");
     super.new(name);
   endfunction
@@ -2021,6 +2043,7 @@ class rdma_rm_lying_recovery extends rdma_recovery_record;
 endclass
 
 class rdma_clone_probe_manager extends rdma_resource_manager;
+
   function new(string name = "rdma_clone_probe_manager");
     super.new(name);
   endfunction

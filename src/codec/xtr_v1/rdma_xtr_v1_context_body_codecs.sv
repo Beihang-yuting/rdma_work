@@ -1,3 +1,6 @@
+// 中文说明：rdma_xtr_v1_context_body_codecs.sv 属于编码层，将模型字段转换为硬件图像并执行反向校验。
+// 阅读提示：先看公开类型和接口，再看实现细节；失败路径应保持状态与资源所有权可追踪。
+
 virtual class rdma_xtr_v1_context_body_codec_base extends rdma_codec_base;
   localparam int unsigned BODY_BYTES = 64;
 
@@ -552,6 +555,7 @@ endclass
 
 virtual class rdma_xtr_v1_mrt_body_codec_base
     extends rdma_xtr_v1_context_body_codec_base;
+
   function new(string name = "rdma_xtr_v1_mrt_body_codec_base");
     super.new(name);
   endfunction
@@ -908,6 +912,7 @@ endclass
 class rdma_xtr_v1_mrt_key_alloc_body_codec
     extends rdma_xtr_v1_mrt_body_codec_base;
   `uvm_object_utils(rdma_xtr_v1_mrt_key_alloc_body_codec)
+
   function new(string name = "rdma_xtr_v1_mrt_key_alloc_body_codec");
     super.new(name);
   endfunction
@@ -920,6 +925,7 @@ endclass
 class rdma_xtr_v1_mrt_register_body_codec
     extends rdma_xtr_v1_mrt_body_codec_base;
   `uvm_object_utils(rdma_xtr_v1_mrt_register_body_codec)
+
   function new(string name = "rdma_xtr_v1_mrt_register_body_codec");
     super.new(name);
   endfunction
@@ -932,6 +938,7 @@ endclass
 class rdma_xtr_v1_srqc_create_body_codec
     extends rdma_xtr_v1_context_body_codec_base;
   `uvm_object_utils(rdma_xtr_v1_srqc_create_body_codec)
+
   function new(string name = "rdma_xtr_v1_srqc_create_body_codec");
     super.new(name);
   endfunction
@@ -1065,6 +1072,7 @@ endclass
 
 virtual class rdma_xtr_v1_eq_create_body_codec_base
     extends rdma_xtr_v1_context_body_codec_base;
+
   function new(string name = "rdma_xtr_v1_eq_create_body_codec_base");
     super.new(name);
   endfunction
@@ -1193,6 +1201,7 @@ endclass
 class rdma_xtr_v1_ceqc_create_body_codec
     extends rdma_xtr_v1_eq_create_body_codec_base;
   `uvm_object_utils(rdma_xtr_v1_ceqc_create_body_codec)
+
   function new(string name = "rdma_xtr_v1_ceqc_create_body_codec");
     super.new(name);
   endfunction
@@ -1209,6 +1218,7 @@ class rdma_xtr_v1_ceqc_create_body_codec
     if (!$cast(ceqc, model) || ceqc.ceq_h == null) return 0;
     return ceqc.ceq_h.generation;
   endfunction
+
   virtual function rdma_status validate_model(rdma_hw_model model);
     rdma_ceqc_model ceqc;
     rdma_status status;
@@ -1253,6 +1263,7 @@ endclass
 class rdma_xtr_v1_aeqc_create_body_codec
     extends rdma_xtr_v1_eq_create_body_codec_base;
   `uvm_object_utils(rdma_xtr_v1_aeqc_create_body_codec)
+
   function new(string name = "rdma_xtr_v1_aeqc_create_body_codec");
     super.new(name);
   endfunction
@@ -1269,6 +1280,7 @@ class rdma_xtr_v1_aeqc_create_body_codec
     if (!$cast(aeqc, model) || aeqc.aeq_h == null) return 0;
     return aeqc.aeq_h.generation;
   endfunction
+
   virtual function rdma_status validate_model(rdma_hw_model model);
     rdma_aeqc_model aeqc;
     rdma_status status;

@@ -1,19 +1,27 @@
+// 中文说明：rdma_xtr_v1_queue_codec_test.sv 属于单元测试，覆盖对应模型、编码器或执行器契约。
+// 阅读提示：先看公开类型和接口，再看实现细节；失败路径应保持状态与资源所有权可追踪。
+
 class rdma_xtr_v1_queue_codec_test extends uvm_test;
   `uvm_component_utils(rdma_xtr_v1_queue_codec_test)
+
   function new(string name="rdma_xtr_v1_queue_codec_test", uvm_component parent=null);
     super.new(name,parent);
   endfunction
+
   function automatic rdma_handle h(string n, rdma_resource_kind_e k, int unsigned id);
     rdma_handle x=rdma_handle::type_id::create(n); x.kind=k; x.object_id=id;
     x.function_uid=64'h1122; x.generation=1; return x;
   endfunction
+
   function automatic void ok(string l, rdma_status s);
     if (s==null || !s.ok()) `uvm_error(l, s==null?"null":s.convert2string());
   endfunction
+
   function automatic void eq_bytes(string l, rdma_hw_image a, rdma_hw_image b);
     if (a==null || b==null || a.bytes.size()!=b.bytes.size()) begin `uvm_error(l,"image mismatch"); return; end
     foreach (a.bytes[i]) if (a.bytes[i]!==b.bytes[i]) `uvm_error(l,$sformatf("byte %0d",i));
   endfunction
+
   task run_phase(uvm_phase phase);
     rdma_codec_registry r; rdma_status s; rdma_codec_base c; rdma_hw_image im,im2; rdma_hw_model m;
     rdma_xtr_v1_sqe_model sq, sq2; rdma_xtr_v1_rqe_model rq, rq2; rdma_xtr_v1_cqe_model cq, cq2;

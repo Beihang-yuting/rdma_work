@@ -1,3 +1,6 @@
+// 中文说明：rdma_xtr_v1_cmq_codecs.sv 属于编码层，将模型字段转换为硬件图像并执行反向校验。
+// 阅读提示：先看公开类型和接口，再看实现细节；失败路径应保持状态与资源所有权可追踪。
+
 class rdma_xtr_v1_cmq_envelope extends uvm_object;
   `uvm_object_utils(rdma_xtr_v1_cmq_envelope)
 
@@ -526,6 +529,7 @@ class rdma_xtr_v1_cmq_empty_body extends rdma_hw_model;
 endclass
 
 class rdma_xtr_v1_cmq_body_token extends uvm_object;
+
   function new(string name = "rdma_xtr_v1_cmq_body_token");
     super.new(name);
   endfunction
@@ -717,6 +721,7 @@ endclass
 
 class rdma_xtr_v1_cmq_qpc_layout_codec
     extends rdma_xtr_v1_cmq_light_layout_codec;
+
   function new(string name = "rdma_xtr_v1_cmq_qpc_layout_codec");
     super.new(name);
   endfunction
@@ -1018,6 +1023,7 @@ endclass
 
 class rdma_xtr_v1_cmq_mr_deregister_layout_codec
     extends rdma_xtr_v1_cmq_light_layout_codec;
+
   function new(string name = "rdma_xtr_v1_cmq_mr_deregister_layout_codec");
     super.new(name);
   endfunction
@@ -1074,6 +1080,7 @@ endclass
 
 class rdma_xtr_v1_cmq_occ_flush_layout_codec
     extends rdma_xtr_v1_cmq_light_layout_codec;
+
   function new(string name = "rdma_xtr_v1_cmq_occ_flush_layout_codec");
     super.new(name);
   endfunction
@@ -1135,6 +1142,7 @@ endclass
 
 class rdma_xtr_v1_cmq_empty_layout_codec
     extends rdma_xtr_v1_cmq_light_layout_codec;
+
   function new(string name = "rdma_xtr_v1_cmq_empty_layout_codec");
     super.new(name);
   endfunction

@@ -1,4 +1,8 @@
+// 中文说明：rdma_qp_lifecycle_executor.sv 属于核心执行层，负责队列、控制面、资源和恢复流程。
+// 阅读提示：先看公开类型和接口，再看实现细节；失败路径应保持状态与资源所有权可追踪。
+
 class rdma_qp_occ_flush_body extends rdma_xtr_v1_occ_flush_body;
+  // QP 回滚使用 QPN=0 的精确 OCC flush 图像，避免误刷其他资源。
   `uvm_object_utils(rdma_qp_occ_flush_body)
 
   function new(string name = "rdma_qp_occ_flush_body");
@@ -15,6 +19,7 @@ class rdma_qp_occ_flush_body extends rdma_xtr_v1_occ_flush_body;
 endclass
 
 class rdma_qp_lifecycle_executor extends uvm_object;
+  // 生命周期执行器统一负责 QP backing 的分配、发布、恢复和最终清理。
   `uvm_object_utils(rdma_qp_lifecycle_executor)
 
   protected rdma_resource_manager manager;
@@ -142,6 +147,7 @@ class rdma_qp_lifecycle_executor extends uvm_object;
     backing_ref.ownership = RDMA_OWNERSHIP_CONTROL_PLANE;
     backing_ref.mapping_offset = 0;
     backing_ref.length = length;
+    // 失败分配仍可能携带释放能力，因此转为 recovery-only authority 保存。
     // This capability is intentionally recovery-only.  The adapter's
     // non-null mapping remains the opaque release/query authority even when
     // its public geometry or authority snapshot hooks are malformed.  Strict
@@ -283,6 +289,7 @@ class rdma_qp_lifecycle_executor extends uvm_object;
   );
     uvm_object cloned;
 
+    // 借用 backing 只复制 mapping 快照；caller 原对象的 owner 和 state 不可修改。
     backing_ref = null;
     if (spec == null || qp_h == null || spec.slices.size() == 0)
       return invalid_argument("QP borrowed backing is empty");
@@ -336,6 +343,7 @@ class rdma_qp_lifecycle_executor extends uvm_object;
     rdma_qp_backing_ref backing_ref,
     rdma_handle qp_h
   );
+    // 发布前把 detached mapping 的 owner 绑定到新 QP，且不取得释放所有权。
     if (backing_ref == null || backing_ref.mapping == null || qp_h == null ||
         backing_ref.ownership != RDMA_OWNERSHIP_BORROWED)
       return invalid_argument("QP borrowed owner binding is invalid");
@@ -391,6 +399,7 @@ class rdma_qp_lifecycle_executor extends uvm_object;
     longint unsigned logical_bytes;
     longint unsigned storage_bytes;
     rdma_status status;
+    // SQ-SGB 每个 slot 固定 512B，底层 storage 按 4KiB 向上取整。
     status = rdma_qp_sq_sgb_geometry(depth, logical_bytes, storage_bytes);
     ref_out = null;
     if (!status.ok()) return status;
@@ -411,6 +420,7 @@ class rdma_qp_lifecycle_executor extends uvm_object;
     byte zeros[];
     rdma_status status;
     longint unsigned total;
+    // 逐 slot 清零；若一个 slot 跨 segment，立即拒绝而不是拆分写入。
     if (request_context == null || backing_ref == null || backing_ref.mapping == null || length == 0)
       return invalid_argument("SQ SGB zero input is invalid");
     status = rdma_qp_backing_total_length(backing_ref, total);
@@ -591,6 +601,7 @@ class rdma_qp_lifecycle_executor extends uvm_object;
       status = clone_borrowed_ref(request.sq_backing, qp_snapshot.handle,
         RDMA_QUEUE_ROLE_QP_SQ_RING, plan.sq_ring.storage_bytes, plan.sq_ref);
     if (!status.ok()) return status;
+    // SGB 物化必须先于 PD 编码，保证失败时能按 plan 顺序回滚。
     if (rdma_qp_needs_sq_sgb(request.transport, request.max_send_sge,
                              request.max_recv_sge)) begin
       status = make_sq_sgb_ref(binding, qp_snapshot.handle, request.sq_depth,

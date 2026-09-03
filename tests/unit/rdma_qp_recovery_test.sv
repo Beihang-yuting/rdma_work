@@ -1,3 +1,6 @@
+// 中文说明：rdma_qp_recovery_test.sv 属于单元测试，覆盖对应模型、编码器或执行器契约。
+// 阅读提示：先看公开类型和接口，再看实现细节；失败路径应保持状态与资源所有权可追踪。
+
 class rdma_qp_publication_fault_manager extends rdma_resource_manager;
   `uvm_object_utils(rdma_qp_publication_fault_manager)
   bit fail_commit;
@@ -19,9 +22,11 @@ endclass
 
 class rdma_qp_ticketless_modify_cmq extends rdma_mock_cmq_port;
   `uvm_object_utils(rdma_qp_ticketless_modify_cmq)
+
   function new(string name = "rdma_qp_ticketless_modify_cmq");
     super.new(name);
   endfunction
+
   virtual task execute(
     rdma_cmq_command_desc command,
     output rdma_cmq_ticket ticket,

@@ -1,4 +1,8 @@
+// 中文说明：rdma_cmq_port.sv 属于核心执行层，负责队列、控制面、资源和恢复流程。
+// 阅读提示：先看公开类型和接口，再看实现细节；失败路径应保持状态与资源所有权可追踪。
+
 virtual class rdma_cmq_port extends uvm_object;
+
   function new(string name = "rdma_cmq_port");
     super.new(name);
   endfunction

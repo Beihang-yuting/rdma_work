@@ -1,3 +1,6 @@
+// 中文说明：rdma_resources.sv 属于模型层，描述语义请求、资源快照、DMA 映射及生命周期数据。
+// 阅读提示：先看公开类型和接口，再看实现细节；失败路径应保持状态与资源所有权可追踪。
+
 typedef class rdma_qpc_model;
 
 function automatic rdma_handle rdma_clone_handle_value(
@@ -69,6 +72,7 @@ function automatic rdma_status rdma_qp_mapping_authority_status(
   rdma_handle qp_h,
   string label
 );
+  // 所有 segment 都必须属于同一 Function，并绑定到当前 QP handle。
   if (backing_ref == null || backing_ref.mapping == null)
     return rdma_status::make(RDMA_SC_INVALID_STATE,
                              {label, " mapping authority is missing"});
@@ -207,6 +211,7 @@ function automatic rdma_status rdma_qp_partial_plan_status(
       plan.sq_ring.depth != plan.sq_depth)
     return rdma_status::make(RDMA_SC_INVALID_STATE,
                              "partial QP SQ ring is invalid");
+  // partial recovery 也必须检查可选 SQ-SGB 的 rounded geometry，不能绕过正常 plan 校验。
   status = rdma_qp_partial_ref_status(
     plan.sq_ref, RDMA_QUEUE_ROLE_QP_SQ_RING, owner, qp_h, "partial QP SQ"
   );

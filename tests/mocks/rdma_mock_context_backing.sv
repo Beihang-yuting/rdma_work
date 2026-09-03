@@ -1,3 +1,6 @@
+// 中文说明：rdma_mock_context_backing.sv 属于测试替身，为单元测试提供可控的适配器和控制面行为。
+// 阅读提示：先看公开类型和接口，再看实现细节；失败路径应保持状态与资源所有权可追踪。
+
 class rdma_mock_context_slot_token extends rdma_queue_slot_token_contract;
   `uvm_object_utils(rdma_mock_context_slot_token)
 

@@ -1,10 +1,16 @@
+// 中文说明：rdma_cmq_hw_profile.sv 属于编码层，将模型字段转换为硬件图像并执行反向校验。
+// 阅读提示：先看公开类型和接口，再看实现细节；失败路径应保持状态与资源所有权可追踪。
+
 virtual class rdma_cmq_hw_profile extends uvm_object;
+
   function new(string name = "rdma_cmq_hw_profile");
     super.new(name);
   endfunction
 
   pure virtual function string profile_name();
+
   pure virtual function rdma_status validate_profile();
+
   virtual function rdma_status snapshot_command_body(
     rdma_hw_model source,
     output rdma_hw_model snapshot
@@ -15,18 +21,21 @@ virtual class rdma_cmq_hw_profile extends uvm_object;
       "CMQ profile does not recognize the command body type"
     );
   endfunction
+
   virtual function bit same_command_body_value(
     rdma_hw_model lhs,
     rdma_hw_model rhs
   );
     return 1'b0;
   endfunction
+
   virtual function bit command_body_graph_detached(
     rdma_hw_model source,
     rdma_hw_model snapshot
   );
     return 1'b0;
   endfunction
+
   virtual function rdma_status snapshot_completion_payload(
     uvm_object source,
     output uvm_object snapshot
@@ -37,30 +46,35 @@ virtual class rdma_cmq_hw_profile extends uvm_object;
       "CMQ profile does not recognize the completion payload type"
     );
   endfunction
+
   virtual function bit same_completion_payload_value(
     uvm_object lhs,
     uvm_object rhs
   );
     return 1'b0;
   endfunction
+
   virtual function bit completion_payload_graph_detached(
     uvm_object source,
     uvm_object snapshot
   );
     return 1'b0;
   endfunction
+
   pure virtual function rdma_status compose_sqe(
     rdma_cmq_command_desc command,
     rdma_cmq_slot_context slot,
     output rdma_hw_image sqe,
     output rdma_cmq_expected_response expected
   );
+
   pure virtual function rdma_status inspect_cqe(
     rdma_hw_image raw_cqe,
     bit expected_owner,
     output bit ready,
     output rdma_cmq_decoded_cqe decoded
   );
+
   pure virtual function rdma_status encode_doorbell(
     rdma_handle cmq_h,
     int unsigned final_pi,

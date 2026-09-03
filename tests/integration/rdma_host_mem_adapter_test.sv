@@ -1,3 +1,6 @@
+// 中文说明：rdma_host_mem_adapter_test.sv 属于集成测试，验证真实适配器与队列/控制面之间的联调。
+// 阅读提示：先看公开类型和接口，再看实现细节；失败路径应保持状态与资源所有权可追踪。
+
 class rdma_owner_clone_failure_handle extends rdma_handle;
   `uvm_object_utils(rdma_owner_clone_failure_handle)
 
