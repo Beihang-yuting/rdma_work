@@ -52,6 +52,7 @@ package rdma_unit_test_pkg;
   `include "unit/rdma_xtr_v1_qword_codec_test.sv"
   `include "unit/rdma_xtr_v1_queue_page_codec_test.sv"
   `include "unit/rdma_xtr_v1_queue_codec_test.sv"
+  `include "unit/rdma_xtr_v1_sq_codec_test.sv"
   `include "unit/rdma_xtr_v1_queue_host_mem_submitter_test.sv"
   `include "unit/rdma_queue_runtime_test.sv"
   `include "unit/rdma_queue_backing_access_test.sv"

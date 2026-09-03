@@ -23,6 +23,15 @@ function automatic rdma_status rdma_clone_status_value(rdma_status source);
   return result;
 endfunction
 
+typedef enum bit [2:0] {
+  RDMA_SQ_PAYLOAD_NONE,
+  RDMA_SQ_PAYLOAD_INLINE_WQE,
+  RDMA_SQ_PAYLOAD_INLINE_SGB,
+  RDMA_SQ_PAYLOAD_SGE_WQE,
+  RDMA_SQ_PAYLOAD_SGE_SGB,
+  RDMA_SQ_PAYLOAD_ATOMIC_FIXED
+} rdma_sq_payload_mode_e;
+
 class rdma_cmq_sqe_model extends rdma_hw_model;
   `uvm_object_utils(rdma_cmq_sqe_model)
 
@@ -286,6 +295,7 @@ class rdma_sqe_ud_ext extends rdma_sqe_transport_ext;
   bit [23:0] destination_qpn;
   bit [31:0] qkey;
   int unsigned address_vector_id;
+  rdma_address_vector address_vector;
   bit address_vector_valid;
 
   function new(string name = "rdma_sqe_ud_ext");
@@ -293,6 +303,7 @@ class rdma_sqe_ud_ext extends rdma_sqe_transport_ext;
     destination_qpn = '0;
     qkey = '0;
     address_vector_id = '0;
+    address_vector = null;
     address_vector_valid = 1'b0;
   endfunction
 
@@ -305,6 +316,14 @@ class rdma_sqe_ud_ext extends rdma_sqe_transport_ext;
     destination_qpn = rhs_ext.destination_qpn;
     qkey = rhs_ext.qkey;
     address_vector_id = rhs_ext.address_vector_id;
+    if (rhs_ext.address_vector == null)
+      address_vector = null;
+    else begin
+      uvm_object cloned_object;
+      cloned_object = rhs_ext.address_vector.clone();
+      if (cloned_object == null || !$cast(address_vector, cloned_object))
+        `uvm_fatal("RDMA_COPY_TYPE", "UD SQE address vector clone mismatch")
+    end
     address_vector_valid = rhs_ext.address_vector_valid;
   endfunction
 
@@ -316,7 +335,8 @@ class rdma_sqe_ud_ext extends rdma_sqe_transport_ext;
     if (!(opcode inside {RDMA_WR_SEND, RDMA_WR_SEND_WITH_IMM}))
       return rdma_status::make(RDMA_SC_UNSUPPORTED_OPCODE,
                                "UD SQE opcode is unsupported");
-    if (destination_qpn == 0 || qkey == 0 || !address_vector_valid)
+    if (destination_qpn == 0 || qkey == 0 || !address_vector_valid ||
+        address_vector == null)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "UD SQE lacks destination QPN, qkey, or AV");
     return rdma_status::success();
