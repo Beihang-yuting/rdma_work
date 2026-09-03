@@ -21,3 +21,7 @@ Commit `$(git rev-parse --short HEAD)` fixes SQ-SGB plan validation to require 4
 ## Review round 3
 
 Plan validation now computes total SQ-SGB backing length across additional segments and requires exact rounded storage coverage, rejecting oversized/malformed segmented refs while permitting canonical 512+3584 segmentation.
+
+## Post-review capability correction
+
+Corrected `rdma_qp_needs_sq_sgb()` to implement the full specification: UD always requires SQ-SGB; RC requires it when either send or receive SGE capacity exceeds two; URC never requires it. The focused test now covers UD, RC `(3,1)`, RC `(2,2)`, and URC cases. A controller rerun remains authoritative because the requested remote VCS invocation reached the compile inline pass but did not emit a final UVM summary before handoff.

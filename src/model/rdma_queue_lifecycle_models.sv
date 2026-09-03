@@ -994,7 +994,9 @@ endfunction
 function automatic bit rdma_qp_needs_sq_sgb(
   rdma_transport_e transport, int unsigned max_send_sge,
   int unsigned max_recv_sge);
-  return transport == RDMA_TRANSPORT_UD;
+  return transport == RDMA_TRANSPORT_UD ||
+         (transport == RDMA_TRANSPORT_RC &&
+          (max_send_sge > 2 || max_recv_sge > 2));
 endfunction
 
 function automatic rdma_qp_ring_layout rdma_qp_sgb_layout(int unsigned depth);
