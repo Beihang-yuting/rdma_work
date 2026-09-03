@@ -9,3 +9,7 @@ Decisions: SQ SGB is required for UD transport; geometry is depth*512 logical by
 Tests: `scripts/run_vcs53.sh core rdma_sq_models_test` completed successfully (VCS compile and test invocation exit 0; only pre-existing warning messages, no model errors observed). The brief also requests `rdma_request_model_test`; not rerun after final edits due time.
 
 Concerns: QP backing-plan `sq_sgb_ref` and full canonical backing validation remain lifecycle integration work; this task only adds model primitives and request fields.
+
+## Review fixes
+
+Commit `19128d8` adds detached QP capability fields and plan SQ-SGB authority reference, with clone/validation handling and canonical SQ-SGB backing checks (512-byte slot alignment, rounded storage geometry, role validation). Focused regressions should be rerun by controller.
