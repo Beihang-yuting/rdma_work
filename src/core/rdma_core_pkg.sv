@@ -21,4 +21,5 @@ package rdma_core_pkg;
   `include "rdma_control_plane.sv"
   `include "rdma_cmq_engine.sv"
   `include "rdma_cmq_engine_port_adapter.sv"
+  `include "rdma_sq_payload_writer.sv"
 endpackage

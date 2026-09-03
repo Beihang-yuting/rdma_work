@@ -64,6 +64,7 @@ package rdma_unit_test_pkg;
   `include "unit/rdma_xtr_v1_cmq_profile_test.sv"
   `include "unit/rdma_xtr_v1_context_cmq_regression_test.sv"
   `include "unit/rdma_harness_expected_failure_probe.sv"
+  `include "unit/rdma_sq_payload_writer_test.sv"
 endpackage
 
 `ifdef RDMA_HOST_MEM_TEST
