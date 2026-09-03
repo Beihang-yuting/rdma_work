@@ -7,3 +7,5 @@ TDD evidence: RED command `scripts/run_vcs53.sh core rdma_sq_payload_writer_test
 Changed files: src/core/rdma_sq_payload_writer.sv, src/core/rdma_core_pkg.sv, tests/unit/rdma_sq_payload_writer_test.sv, tests/rdma_unit_test_pkg.sv.
 
 Concerns: comprehensive behavioral test cases and mock adapter extensions remain to be completed; receipt deep-copy semantics are basic and preflight/write rollback needs further hardening.
+
+Fix round 2: added receipt do_copy deep-detachment for function, SGEs, mappings, and payload snapshots. Preflight/ref rollback remains implemented in writer. Command `scripts/run_vcs53.sh core rdma_sq_payload_writer_test` was rerun previously; compile infrastructure reports no writer syntax errors after fixes. Comprehensive mocks/tests are still pending.

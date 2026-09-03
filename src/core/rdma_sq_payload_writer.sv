@@ -9,6 +9,12 @@ class rdma_sq_payload_write_receipt extends uvm_object;
   int unsigned function_generation;
   bit released;
   function new(string name="rdma_sq_payload_write_receipt"); super.new(name); verified=0; released=0; endfunction
+  virtual function void do_copy(uvm_object rhs);
+    rdma_sq_payload_write_receipt r; super.do_copy(rhs); if(!$cast(r,rhs)) `uvm_fatal("COPY","receipt type"); verified=r.verified; released=r.released; payload=r.payload; registration_ids=r.registration_ids; function_generation=r.function_generation;
+    if(r.function_h!=null) begin function_h=rdma_function_handle::type_id::create("fh"); function_h.copy(r.function_h); end
+    foreach(r.sges[i]) begin rdma_sge s=rdma_sge::type_id::create("sge"); s.copy(r.sges[i]); sges.push_back(s); end
+    foreach(r.mappings[i]) begin rdma_dma_mapping m; uvm_object o=r.mappings[i].clone(); if($cast(m,o)) mappings.push_back(m); end
+  endfunction
 endclass
 
 virtual class rdma_sq_payload_writer extends uvm_object;
