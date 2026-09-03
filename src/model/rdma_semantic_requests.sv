@@ -385,7 +385,8 @@ function automatic rdma_status rdma_qp_backing_spec_status(
     if (spec.slices[i] == null || spec.slices[i].role != required_role)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "QP borrowed backing role invalid");
-    if (!rdma_queue_aligned(spec.slices[i].logical_queue_offset, 4096) ||
+    if (!rdma_queue_aligned(spec.slices[i].logical_queue_offset,
+                            required_role == RDMA_QUEUE_ROLE_QP_SQ_SGB ? 512 : 4096) ||
         spec.slices[i].logical_queue_offset != next_logical_offset ||
         next_logical_offset > required_storage_bytes ||
         spec.slices[i].length >
@@ -393,7 +394,8 @@ function automatic rdma_status rdma_qp_backing_spec_status(
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "QP borrowed backing coverage is not canonical");
     status = rdma_queue_queue_range_status(spec.slices[i].mapping,
-      spec.slices[i].mapping_offset, spec.slices[i].length, 4096);
+      spec.slices[i].mapping_offset, spec.slices[i].length,
+      required_role == RDMA_QUEUE_ROLE_QP_SQ_SGB ? 512 : 4096);
     if (!status.ok()) return status;
     next_logical_offset += spec.slices[i].length;
   end
@@ -529,6 +531,9 @@ class rdma_create_qp_req extends rdma_semantic_request;
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "QP capabilities exceed limits");
     if (rdma_qp_needs_sq_sgb(transport,max_send_sge,max_recv_sge)) begin
       if (sq_sgb_backing == null) return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "SQ SGB backing null");
+      status = rdma_qp_backing_spec_status(sq_sgb_backing, RDMA_QUEUE_ROLE_QP_SQ_SGB,
+                                           ((longint'(sq_depth)*512 + 4095)/4096)*4096);
+      if (!status.ok()) return status;
     end
     else if (sq_sgb_backing != null && sq_sgb_backing.slices.size() != 0)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "unexpected SQ SGB backing");

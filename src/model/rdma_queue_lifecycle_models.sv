@@ -1145,6 +1145,7 @@ class rdma_qp_backing_plan extends uvm_object;
   rdma_qp_ring_layout sq_ring;
   rdma_qp_ring_layout rq_ring;
   rdma_qp_backing_ref sq_ref;
+  rdma_qp_backing_ref sq_sgb_ref;
   rdma_qp_backing_ref rq_ref;
   rdma_qp_backing_ref sq_pd_ref;
   rdma_qp_backing_ref rq_pd_ref;
@@ -1163,6 +1164,7 @@ class rdma_qp_backing_plan extends uvm_object;
     sq_ring = null;
     rq_ring = null;
     sq_ref = null;
+    sq_sgb_ref = null;
     rq_ref = null;
     sq_pd_ref = null;
     rq_pd_ref = null;
@@ -1186,11 +1188,12 @@ class rdma_qp_backing_plan extends uvm_object;
     sq_pd_flush_complete = r.sq_pd_flush_complete;
     rq_pd_flush_complete = r.rq_pd_flush_complete;
     cleanup_complete = r.cleanup_complete;
-    sq_ring = null; rq_ring = null; sq_ref = null; rq_ref = null;
+    sq_ring = null; rq_ring = null; sq_ref = null; sq_sgb_ref = null; rq_ref = null;
     sq_pd_ref = null; rq_pd_ref = null; context_ref = null;
     if (r.sq_ring != null) begin c = r.sq_ring.clone(); if (!$cast(sq_ring, c)) `uvm_fatal("RDMA_COPY_TYPE", "QP SQ ring clone failure") end
     if (r.rq_ring != null) begin c = r.rq_ring.clone(); if (!$cast(rq_ring, c)) `uvm_fatal("RDMA_COPY_TYPE", "QP RQ ring clone failure") end
     if (r.sq_ref != null) begin c = r.sq_ref.clone(); if (!$cast(sq_ref, c)) `uvm_fatal("RDMA_COPY_TYPE", "QP SQ ref clone failure") end
+    if (r.sq_sgb_ref != null) begin c = r.sq_sgb_ref.clone(); if (!$cast(sq_sgb_ref, c)) `uvm_fatal("RDMA_COPY_TYPE", "QP SQ SGB ref clone failure") end
     if (r.rq_ref != null) begin c = r.rq_ref.clone(); if (!$cast(rq_ref, c)) `uvm_fatal("RDMA_COPY_TYPE", "QP RQ ref clone failure") end
     if (r.sq_pd_ref != null) begin c = r.sq_pd_ref.clone(); if (!$cast(sq_pd_ref, c)) `uvm_fatal("RDMA_COPY_TYPE", "QP SQ PD clone failure") end
     if (r.rq_pd_ref != null) begin c = r.rq_pd_ref.clone(); if (!$cast(rq_pd_ref, c)) `uvm_fatal("RDMA_COPY_TYPE", "QP RQ PD clone failure") end
@@ -1235,6 +1238,13 @@ class rdma_qp_backing_plan extends uvm_object;
         RDMA_SC_INVALID_STATE,
         "recovery-only QP backing cannot enter a normal plan"
       );
+    if (transport == RDMA_TRANSPORT_UD && sq_sgb_ref == null)
+      return rdma_status::make(RDMA_SC_INVALID_STATE, "QP SQ SGB authority missing");
+    if (transport == RDMA_TRANSPORT_UD && sq_sgb_ref != null) begin
+      status = sq_sgb_ref.validate(); if (!status.ok()) return status;
+      if (sq_sgb_ref.role != RDMA_QUEUE_ROLE_QP_SQ_SGB || sq_sgb_ref.length != sq_depth*512)
+        return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "QP SQ SGB geometry invalid");
+    end
     status = rdma_qp_backing_total_length(sq_ref, total_length);
     if (!status.ok()) return status;
     if (sq_ref.role != RDMA_QUEUE_ROLE_QP_SQ_RING ||
