@@ -1,3 +1,6 @@
+// 中文说明：rdma_doorbell_scheduler.sv 属于核心执行层，负责队列、控制面、资源和恢复流程。
+// 阅读提示：先看公开类型和接口，再看实现细节；失败路径应保持状态与资源所有权可追踪。
+
 typedef enum bit {
   RDMA_DB_DEP_PAYLOAD       = 1'b0,
   RDMA_DB_DEP_QUEUE_CONTEXT = 1'b1

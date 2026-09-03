@@ -1,3 +1,6 @@
+// 中文说明：rdma_queue_lifecycle_models.sv 属于模型层，描述语义请求、资源快照、DMA 映射及生命周期数据。
+// 阅读提示：先看公开类型和接口，再看实现细节；失败路径应保持状态与资源所有权可追踪。
+
 typedef enum bit { RDMA_QUEUE_BACKING_OWNED, RDMA_QUEUE_BACKING_BORROWED }
   rdma_queue_backing_mode_e;
 
@@ -43,11 +46,13 @@ function automatic bit rdma_queue_role_is_payload(rdma_queue_backing_role_e role
                       RDMA_QUEUE_ROLE_SRFQ_RING, RDMA_QUEUE_ROLE_SRQ_SGB,
                       RDMA_QUEUE_ROLE_CEQ_RING, RDMA_QUEUE_ROLE_AEQ_RING};
 endfunction
+
 function automatic bit rdma_queue_role_is_ring(rdma_queue_backing_role_e role);
   return role inside {RDMA_QUEUE_ROLE_CQ_RING, RDMA_QUEUE_ROLE_SRQ_RING,
                       RDMA_QUEUE_ROLE_SRFQ_RING, RDMA_QUEUE_ROLE_SRQ_SGB,
                       RDMA_QUEUE_ROLE_CEQ_RING, RDMA_QUEUE_ROLE_AEQ_RING};
 endfunction
+
 function automatic bit rdma_queue_role_is_pd(rdma_queue_backing_role_e role);
   return role inside {RDMA_QUEUE_ROLE_CQ_PD, RDMA_QUEUE_ROLE_SRQ_PD,
                       RDMA_QUEUE_ROLE_SRFQ_PD, RDMA_QUEUE_ROLE_CEQ_PD,
@@ -64,21 +69,26 @@ function automatic bit rdma_qp_role_is_payload(rdma_queue_backing_role_e role);
                       RDMA_QUEUE_ROLE_QP_URC_RDSQ,
                       RDMA_QUEUE_ROLE_QP_URC_DSQ};
 endfunction
+
 function automatic bit rdma_qp_role_is_pd(rdma_queue_backing_role_e role);
   return role inside {RDMA_QUEUE_ROLE_QP_SQ_PD,
                       RDMA_QUEUE_ROLE_QP_RQ_PD};
 endfunction
+
 function automatic bit rdma_queue_add_ok(longint unsigned offset,
                                           longint unsigned length);
   return length != 0 && offset <= (64'hffff_ffff_ffff_ffff - length);
 endfunction
+
 function automatic bit rdma_queue_aligned(longint unsigned value,
                                            longint unsigned alignment);
   return (value % alignment) == 0;
 endfunction
+
 function automatic bit rdma_qp_power_of_two(int unsigned value);
   return value != 0 && (value & (value - 1'b1)) == 0;
 endfunction
+
 function automatic rdma_status rdma_queue_queue_range_status(
     rdma_dma_mapping mapping, longint unsigned offset, longint unsigned length,
     longint unsigned alignment);
@@ -123,6 +133,7 @@ class rdma_queue_completion_authority extends uvm_object;
     if (!$cast(r, rhs)) `uvm_fatal("RDMA_COPY_TYPE", "completion authority copy mismatch");
     complete = r.complete;
   endfunction
+
   virtual function rdma_status validate();
     if (!(complete inside {1'b0, 1'b1}))
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "completion authority invalid");
@@ -509,6 +520,7 @@ class rdma_queue_backing_ref extends uvm_object;
   longint unsigned mapping_offset, length, logical_queue_offset;
   rdma_queue_backing_segment additional_segments[$];
   bit cleanup_complete;
+
   function new(string name="rdma_queue_backing_ref");
     super.new(name);
     role = RDMA_QUEUE_ROLE_CQ_RING;
@@ -837,6 +849,7 @@ class rdma_queue_backing_plan extends uvm_object;
       context_ref = x;
     end
   endfunction
+
   virtual function rdma_status validate();
     rdma_status s; bit seen[13]; bit ref_seen[13]; int unsigned i;
     foreach (seen[i]) seen[i] = 1'b0;
@@ -984,6 +997,7 @@ endclass
 function automatic rdma_status rdma_qp_sq_sgb_geometry(
   int unsigned depth, output longint unsigned logical_bytes,
   output longint unsigned storage_bytes);
+  // logical bytes 描述有效 slot 总量，storage bytes 额外包含 4KiB 对齐填充。
   logical_bytes = longint'(depth) * 512;
   storage_bytes = ((logical_bytes + 4095) / 4096) * 4096;
   if (!rdma_qp_power_of_two(depth) || depth == 0)
@@ -994,6 +1008,7 @@ endfunction
 function automatic bit rdma_qp_needs_sq_sgb(
   rdma_transport_e transport, int unsigned max_send_sge,
   int unsigned max_recv_sge);
+  // UD 总是需要 SGB；RC 在任一方向超过 2 个 SGE 时也必须启用 SGB。
   return transport == RDMA_TRANSPORT_UD ||
          (transport == RDMA_TRANSPORT_RC &&
           (max_send_sge > 2 || max_recv_sge > 2));
@@ -1012,6 +1027,7 @@ function automatic rdma_qp_ring_layout rdma_qp_sgb_layout(int unsigned depth);
 endfunction
 
 class rdma_qp_backing_ref extends uvm_object;
+  // backing_ref 是 QP 资源持有的 mapping authority；borrowed 只保留 detached 引用。
   `uvm_object_utils(rdma_qp_backing_ref)
   rdma_queue_backing_role_e role;
   rdma_dma_mapping mapping;
@@ -1142,6 +1158,7 @@ function automatic rdma_status rdma_qp_backing_total_length(
 endfunction
 
 class rdma_qp_backing_plan extends uvm_object;
+  // plan 按固定角色顺序保存 SQ、SQ-SGB、PD、RQ 和 URC backing。
   `uvm_object_utils(rdma_qp_backing_plan)
   rdma_transport_e transport;
   int unsigned sq_depth;

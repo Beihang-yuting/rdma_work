@@ -1,4 +1,8 @@
+// 中文说明：rdma_xtr_v1_qpc_codecs.sv 属于编码层，将模型字段转换为硬件图像并执行反向校验。
+// 阅读提示：先看公开类型和接口，再看实现细节；失败路径应保持状态与资源所有权可追踪。
+
 virtual class rdma_xtr_v1_qpc_codec_base extends rdma_codec_base;
+
   function new(string name = "rdma_xtr_v1_qpc_codec_base");
     super.new(name);
   endfunction
@@ -846,6 +850,7 @@ endclass
 
 class rdma_xtr_v1_qpc_rc_codec extends rdma_xtr_v1_qpc_codec_base;
   `uvm_object_utils(rdma_xtr_v1_qpc_rc_codec)
+
   function new(string name = "rdma_xtr_v1_qpc_rc_codec"); super.new(name); endfunction
   protected virtual function rdma_transport_e expected_transport(); return RDMA_TRANSPORT_RC; endfunction
 
@@ -936,6 +941,7 @@ endclass
 
 class rdma_xtr_v1_qpc_ud_codec extends rdma_xtr_v1_qpc_codec_base;
   `uvm_object_utils(rdma_xtr_v1_qpc_ud_codec)
+
   function new(string name = "rdma_xtr_v1_qpc_ud_codec"); super.new(name); endfunction
   protected virtual function rdma_transport_e expected_transport(); return RDMA_TRANSPORT_UD; endfunction
 
@@ -986,6 +992,7 @@ endclass
 
 class rdma_xtr_v1_qpc_urc_codec extends rdma_xtr_v1_qpc_codec_base;
   `uvm_object_utils(rdma_xtr_v1_qpc_urc_codec)
+
   function new(string name = "rdma_xtr_v1_qpc_urc_codec"); super.new(name); endfunction
   protected virtual function rdma_transport_e expected_transport(); return RDMA_TRANSPORT_URC; endfunction
 

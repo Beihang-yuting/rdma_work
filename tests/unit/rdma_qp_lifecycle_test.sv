@@ -1,3 +1,6 @@
+// 中文说明：rdma_qp_lifecycle_test.sv 属于单元测试，覆盖对应模型、编码器或执行器契约。
+// 阅读提示：先看公开类型和接口，再看实现细节；失败路径应保持状态与资源所有权可追踪。
+
 class rdma_qp_allocate_error_host_mem extends rdma_mock_host_mem;
   `uvm_object_utils(rdma_qp_allocate_error_host_mem)
   bit injected;
@@ -318,9 +321,11 @@ class rdma_qp_urc_malformed_allocate_host_mem extends rdma_mock_host_mem;
   int unsigned allocate_count;
   int unsigned release_calls;
   bit pending_release;
+
   function new(string name = "rdma_qp_urc_malformed_allocate_host_mem");
     super.new(name); allocate_count = 0; release_calls = 0; pending_release = 0;
   endfunction
+
   virtual function rdma_status allocate(
     rdma_dma_request_context request_context, int unsigned size,
     int unsigned alignment, rdma_dma_direction_e direction,
@@ -337,6 +342,7 @@ class rdma_qp_urc_malformed_allocate_host_mem extends rdma_mock_host_mem;
     end
     return status;
   endfunction
+
   virtual function rdma_status \release (rdma_dma_mapping mapping);
     rdma_status status;
     release_calls++;
@@ -932,9 +938,11 @@ endclass
 
 class rdma_qp_codec_fault_executor extends rdma_qp_lifecycle_executor;
   `uvm_object_utils(rdma_qp_codec_fault_executor)
+
   function new(string name = "rdma_qp_codec_fault_executor");
     super.new(name);
   endfunction
+
   function void remove_qpc_codecs();
     qpc_codecs.clear();
   endfunction

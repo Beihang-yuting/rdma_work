@@ -1,4 +1,8 @@
+// 中文说明：rdma_codec_base.sv 属于编码层，将模型字段转换为硬件图像并执行反向校验。
+// 阅读提示：先看公开类型和接口，再看实现细节；失败路径应保持状态与资源所有权可追踪。
+
 virtual class rdma_codec_base extends uvm_object;
+
   function new(string name = "rdma_codec_base");
     super.new(name);
   endfunction

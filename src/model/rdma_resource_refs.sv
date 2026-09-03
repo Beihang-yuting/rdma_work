@@ -1,3 +1,6 @@
+// 中文说明：rdma_resource_refs.sv 属于模型层，描述语义请求、资源快照、DMA 映射及生命周期数据。
+// 阅读提示：先看公开类型和接口，再看实现细节；失败路径应保持状态与资源所有权可追踪。
+
 typedef enum bit [2:0] {
   RDMA_RESOURCE_NEW        = 3'd0,
   RDMA_RESOURCE_ALLOCATED  = 3'd1,

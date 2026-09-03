@@ -1,3 +1,6 @@
+// 中文说明：rdma_queue_runtime.sv 属于核心执行层，负责队列、控制面、资源和恢复流程。
+// 阅读提示：先看公开类型和接口，再看实现细节；失败路径应保持状态与资源所有权可追踪。
+
 typedef enum bit [2:0] {
   RDMA_QUEUE_RUNTIME_DETACHED = 3'd0,
   RDMA_QUEUE_RUNTIME_ATTACHED = 3'd1,
@@ -23,7 +26,9 @@ class rdma_queue_cursor_snapshot extends uvm_object;
   `uvm_object_utils(rdma_queue_cursor_snapshot)
   int unsigned index;
   bit wrap;
+
   function new(string name="rdma_queue_cursor_snapshot"); super.new(name); index=0; wrap=0; endfunction
+
   virtual function void do_copy(uvm_object rhs);
     rdma_queue_cursor_snapshot source;
     super.do_copy(rhs);
@@ -65,6 +70,7 @@ class rdma_queue_pending_operation extends uvm_object;
   rdma_handle routed_qp_h;
   bit mmio_maybe_submitted;
   bit known_no_mmio;
+
   function new(string name="rdma_queue_pending_operation");
     super.new(name);
     queue_h=null; kind=RDMA_QUEUE_RUNTIME_SQ; producer=0; entry_offset=0;
@@ -73,6 +79,7 @@ class rdma_queue_pending_operation extends uvm_object;
     completion_target_valid=0; completion_released=0; routed_qp_h=null;
     mmio_maybe_submitted=0; known_no_mmio=0;
   endfunction
+
   virtual function void do_copy(uvm_object rhs);
     rdma_queue_pending_operation source;
     uvm_object cloned;
@@ -139,6 +146,7 @@ class rdma_queue_slot_ledger_entry extends uvm_object;
   rdma_semantic_request request_snapshot;
   rdma_hw_image image;
   rdma_status completion_status;
+
   function new(string name="rdma_queue_slot_ledger_entry"); super.new(name); posted=0; consumed=0; signaled=0; wr_id=0; index=0; wrap=0; request_snapshot=null; image=null; completion_status=null; endfunction
 endclass
 
@@ -206,7 +214,9 @@ class rdma_queue_runtime extends uvm_object;
     if (state!=RDMA_QUEUE_RUNTIME_ATTACHED) begin lock.put(1); return rdma_status::make(RDMA_SC_INVALID_STATE,"queue runtime is not attached"); end
     state=RDMA_QUEUE_RUNTIME_ACTIVE; lock.put(1); return rdma_status::success();
   endfunction
+
   function rdma_status query_available(output int unsigned value); if(depth==0) begin value=0; return rdma_status::make(RDMA_SC_INVALID_STATE,"runtime is unconfigured"); end value=depth-used; return rdma_status::success(); endfunction
+
   function int unsigned available_slots(); return depth-used; endfunction
 
   function rdma_status peek_consumer(output rdma_queue_cursor_snapshot snapshot);
@@ -300,6 +310,7 @@ class rdma_queue_runtime extends uvm_object;
   endfunction
 
   function bit cursor_equal(int unsigned a, bit aw, int unsigned b, bit bw); return a==b && aw==bw; endfunction
+
   function void cursor_advance(inout int unsigned i, inout bit w); if(i+1>=depth) begin i=0; w=~w; end else i++; endfunction
 
   function rdma_status match_and_release(int unsigned target_index, bit target_wrap, output rdma_queue_slot_ledger_entry released[$]);
@@ -510,6 +521,7 @@ class rdma_queue_runtime extends uvm_object;
     lock.put(1);
     return rdma_status::success();
   endfunction
+
   function rdma_status recover(rdma_queue_recovery_action_e action, bit caller_confirmed_no_submit=1'b0);
     rdma_status lock_status;
     lock_status = acquire_lock();

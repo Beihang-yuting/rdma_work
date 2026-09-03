@@ -1,9 +1,14 @@
+// 中文说明：rdma_context_models.sv 属于模型层，描述语义请求、资源快照、DMA 映射及生命周期数据。
+// 阅读提示：先看公开类型和接口，再看实现细节；失败路径应保持状态与资源所有权可追踪。
+
 virtual class rdma_hw_model extends uvm_object;
+
   function new(string name = "rdma_hw_model");
     super.new(name);
   endfunction
 
   pure virtual function rdma_status validate();
+
   pure virtual function string describe();
 endclass
 
@@ -189,12 +194,15 @@ class rdma_qpc_behavior extends uvm_object;
 endclass
 
 virtual class rdma_qpc_transport_ext extends uvm_object;
+
   function new(string name = "rdma_qpc_transport_ext");
     super.new(name);
   endfunction
 
   pure virtual function rdma_transport_e transport_kind();
+
   pure virtual function rdma_status validate();
+
   pure virtual function string describe();
 endclass
 

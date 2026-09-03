@@ -1,3 +1,6 @@
+// 中文说明：rdma_model_pkg.sv 属于模型层，描述语义请求、资源快照、DMA 映射及生命周期数据。
+// 阅读提示：先看公开类型和接口，再看实现细节；失败路径应保持状态与资源所有权可追踪。
+
 package rdma_model_pkg;
   import uvm_pkg::*;
   import rdma_types_pkg::*;

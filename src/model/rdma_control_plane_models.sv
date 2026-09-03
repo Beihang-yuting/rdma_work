@@ -1,3 +1,6 @@
+// 中文说明：rdma_control_plane_models.sv 属于模型层，描述语义请求、资源快照、DMA 映射及生命周期数据。
+// 阅读提示：先看公开类型和接口，再看实现细节；失败路径应保持状态与资源所有权可追踪。
+
 typedef enum bit [3:0] {
   RDMA_CTRL_STEP_RESOURCE_RESERVED,
   RDMA_CTRL_STEP_BACKING_ATTACHED,
@@ -407,6 +410,7 @@ function automatic rdma_status rdma_qp_partial_plan_authority(
 endfunction
 
 class rdma_qp_recovery_state extends uvm_object;
+  // recovery state 保存硬件不确定期间的不可伪造 authority 和逐角色进度。
   `uvm_object_utils(rdma_qp_recovery_state)
   rdma_qp_recovery_intent_e intent;
   rdma_qp_ambiguous_operation_e ambiguous_operation;
@@ -615,6 +619,7 @@ class rdma_qp_recovery_state extends uvm_object;
         !$cast(validation_plan, cloned_plan_object))
       return rdma_status::make(RDMA_SC_INVALID_STATE,
                                "QP recovery plan clone failed");
+    // 进度位只能由对应 ref 授权；缺失的可选 SQ-SGB 不能伪造完成进度。
     status = rdma_qp_recovery_ref_status(
       validation_plan.sq_ref,
       role_complete[RDMA_QUEUE_ROLE_QP_SQ_RING], "QP recovery SQ"
@@ -654,6 +659,7 @@ class rdma_qp_recovery_state extends uvm_object;
       );
       if (!status.ok()) return status;
     end
+    // 先验证 plan 的完整几何，再验证每个 mapping/segment 的 Function/QP owner。
     status = validation_plan.validate();
     if (!status.ok()) return status;
     if (qp_plan.sq_ref == null || qp_plan.sq_ref.mapping == null ||

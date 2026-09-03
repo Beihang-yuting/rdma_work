@@ -1,3 +1,6 @@
+// 中文说明：rdma_xtr_v1_cmq_profile_test.sv 属于单元测试，覆盖对应模型、编码器或执行器契约。
+// 阅读提示：先看公开类型和接口，再看实现细节；失败路径应保持状态与资源所有权可追踪。
+
 typedef enum bit [2:0] {
   RDMA_XTR_SNAPSHOT_CLONE_GOOD,
   RDMA_XTR_SNAPSHOT_CLONE_NULL,

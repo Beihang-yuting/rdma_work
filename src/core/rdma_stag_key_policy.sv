@@ -1,4 +1,8 @@
+// 中文说明：rdma_stag_key_policy.sv 属于核心执行层，负责队列、控制面、资源和恢复流程。
+// 阅读提示：先看公开类型和接口，再看实现细节；失败路径应保持状态与资源所有权可追踪。
+
 virtual class rdma_stag_key_policy extends uvm_object;
+
   function new(string name = "rdma_stag_key_policy");
     super.new(name);
   endfunction

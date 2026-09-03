@@ -1,4 +1,8 @@
+// 中文说明：本文件实现 staged non-inline payload 的注册、写入和逐字节回读校验。
+// 生命周期约束：writer 只借用 caller-owned mapping，不取得 host_mem.release() 权限。
+
 class rdma_sq_payload_write_receipt extends uvm_object;
+  // receipt 保存 detached 的 payload/SGE 快照，供后续 record 生命周期使用。
   `uvm_object_utils(rdma_sq_payload_write_receipt)
   bit verified;
   byte unsigned payload[$];
@@ -8,6 +12,7 @@ class rdma_sq_payload_write_receipt extends uvm_object;
   rdma_function_handle function_h;
   int unsigned function_generation;
   bit released;
+
   function new(string name="rdma_sq_payload_write_receipt"); super.new(name); verified=0; released=0; endfunction
   virtual function void do_copy(uvm_object rhs);
     rdma_sq_payload_write_receipt r; super.do_copy(rhs); if(!$cast(r,rhs)) `uvm_fatal("COPY","receipt type"); verified=r.verified; released=r.released; payload=r.payload; registration_ids=r.registration_ids; function_generation=r.function_generation;
@@ -18,15 +23,23 @@ class rdma_sq_payload_write_receipt extends uvm_object;
 endclass
 
 virtual class rdma_sq_payload_writer extends uvm_object;
+  // 抽象接口把“注册映射”和“写入验证”与队列数据引擎解耦。
+
   function new(string name="rdma_sq_payload_writer"); super.new(name); endfunction
+
   pure virtual function rdma_status configure(rdma_host_mem_api api, rdma_function_binding binding, time timeout);
+
   pure virtual function rdma_status register_mapping(rdma_dma_mapping mapping, output longint unsigned registration_id);
+
   pure virtual function rdma_status unregister_mapping(longint unsigned registration_id);
+
   pure virtual function rdma_status stage_and_verify(rdma_dma_request_context request_context, rdma_sge sges[$], byte unsigned payload[$], output rdma_sq_payload_write_receipt receipt);
+
   pure virtual function rdma_status release_receipt(rdma_sq_payload_write_receipt receipt);
 endclass
 
 class rdma_host_mem_sq_payload_writer extends rdma_sq_payload_writer;
+  // 默认实现使用真实 rdma_host_mem_api；所有写入前检查必须先完成。
   `uvm_object_utils(rdma_host_mem_sq_payload_writer)
   typedef struct { longint unsigned id; rdma_dma_mapping mapping; int unsigned refs; } registration_t;
   rdma_host_mem_api api;
@@ -35,9 +48,12 @@ class rdma_host_mem_sq_payload_writer extends rdma_sq_payload_writer;
   registration_t regs[$];
   longint unsigned next_id;
 
+  // registration_t 的 refs 记录仍被 receipt 引用的注册项数量。
   function new(string name="rdma_host_mem_sq_payload_writer"); super.new(name); next_id=1; endfunction
+
   function rdma_status configure(rdma_host_mem_api a, rdma_function_binding b, time t); api=a; binding=b; timeout=t; return (a==null||b==null) ? rdma_status::make(RDMA_SC_INVALID_ARGUMENT,"null configuration") : rdma_status::success(); endfunction
 
+  // 注册只保存 detached authority；重叠区间和溢出必须在登记阶段拒绝。
   function rdma_status register_mapping(rdma_dma_mapping mapping, output longint unsigned registration_id);
     registration_t r; uvm_object o; rdma_dma_mapping mc;
     registration_id=0;
@@ -52,6 +68,7 @@ class rdma_host_mem_sq_payload_writer extends rdma_sq_payload_writer;
     end
     o=mapping.clone(); if(o==null || !$cast(mc,o)) return rdma_status::make(RDMA_SC_INVALID_STATE,"mapping clone failed"); r.mapping=mc; r.id=next_id++; r.refs=0; regs.push_back(r); registration_id=r.id; return rdma_status::success();
   endfunction
+
   function rdma_status unregister_mapping(longint unsigned registration_id);
     foreach (regs[i]) if (regs[i].id==registration_id) begin
       if (regs[i].refs!=0) return rdma_status::make(RDMA_SC_RESOURCE_BUSY,"registration referenced by receipt");
@@ -60,6 +77,7 @@ class rdma_host_mem_sq_payload_writer extends rdma_sq_payload_writer;
     return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,"unknown registration");
   endfunction
 
+  // 先完成 context、长度、注册项、权限和地址范围检查，再产生任何 host 写入。
   function rdma_status stage_and_verify(rdma_dma_request_context c, rdma_sge sges[$], byte unsigned payload[$], output rdma_sq_payload_write_receipt receipt);
     rdma_status st; registration_t r; int ri; longint unsigned total, off; byte unsigned chunk[$], rb[$]; longint unsigned used_ids[$]; int mapidx[$];
     receipt=null; if (api==null || binding==null) return rdma_status::make(RDMA_SC_INVALID_STATE,"writer not configured");
@@ -86,6 +104,8 @@ class rdma_host_mem_sq_payload_writer extends rdma_sq_payload_writer;
     foreach(used_ids[i]) foreach(regs[j]) if(regs[j].id==used_ids[i]) begin uvm_object mo=regs[j].mapping.clone(); rdma_dma_mapping mm; if($cast(mm,mo)) receipt.mappings.push_back(mm); end
     return rdma_status::success();
   endfunction
+
+  // abort 或 SQ record retire 时调用；released 标志保证引用只递减一次。
   function rdma_status release_receipt(rdma_sq_payload_write_receipt receipt);
     if (receipt==null || receipt.released) return rdma_status::success();
     foreach(receipt.registration_ids[i]) foreach(regs[j]) if(regs[j].id==receipt.registration_ids[i] && regs[j].refs>0) regs[j].refs--;

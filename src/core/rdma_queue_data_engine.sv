@@ -1,3 +1,6 @@
+// 中文说明：rdma_queue_data_engine.sv 属于核心执行层，负责队列、控制面、资源和恢复流程。
+// 阅读提示：先看公开类型和接口，再看实现细节；失败路径应保持状态与资源所有权可追踪。
+
 // Transaction-level host-side queue data facade.  Queue ownership remains in
 // the lifecycle resources; this class only keeps detached runtime cursors and
 // borrowed backing-access capabilities for the lifetime of an attachment.

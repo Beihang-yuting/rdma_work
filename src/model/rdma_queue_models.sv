@@ -1,3 +1,6 @@
+// 中文说明：rdma_queue_models.sv 属于模型层，描述语义请求、资源快照、DMA 映射及生命周期数据。
+// 阅读提示：先看公开类型和接口，再看实现细节；失败路径应保持状态与资源所有权可追踪。
+
 function automatic rdma_status rdma_clone_status_value(rdma_status source);
   rdma_status result;
 
@@ -199,12 +202,15 @@ class rdma_cmq_completion_model extends rdma_hw_model;
 endclass
 
 virtual class rdma_sqe_transport_ext extends uvm_object;
+
   function new(string name = "rdma_sqe_transport_ext");
     super.new(name);
   endfunction
 
   pure virtual function rdma_transport_e transport_kind();
+
   pure virtual function rdma_status validate(rdma_work_opcode_e opcode);
+
   pure virtual function string describe();
 endclass
 
