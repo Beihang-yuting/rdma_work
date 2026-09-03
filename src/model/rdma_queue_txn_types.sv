@@ -97,6 +97,11 @@ class rdma_queue_txn_evidence extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 中文：所有阶段变更统一经过 advance，禁止恢复/释放路径绕过转换表。
+  function rdma_status transition_to(rdma_queue_txn_phase_e next_phase);
+    return advance(next_phase);
+  endfunction
+
   // Capture mutable producer objects as detached value snapshots.
   function rdma_status capture_function_identity(rdma_function_identity source);
     uvm_object cloned;
@@ -125,9 +130,7 @@ class rdma_queue_txn_evidence extends uvm_object;
     if (aborted || phase == RDMA_QUEUE_TXN_COMPLETED)
       return rdma_status::make(RDMA_SC_INVALID_STATE, "transaction is terminal");
     mmio_maybe_submitted = 1'b1;
-    if (phase < RDMA_QUEUE_TXN_DOORBELL_MAYBE_SUBMITTED)
-      phase = RDMA_QUEUE_TXN_DOORBELL_MAYBE_SUBMITTED;
-    return rdma_status::success();
+    return transition_to(RDMA_QUEUE_TXN_DOORBELL_MAYBE_SUBMITTED);
   endfunction
 
   function rdma_status recover(rdma_queue_recovery_action_e action,
@@ -161,15 +164,15 @@ class rdma_queue_txn_evidence extends uvm_object;
     foreach (release_plan[i]) begin
       if (release_plan[i].index == index && release_plan[i].wrap == wrap) begin
         release_plan[i].released = 1'b1;
-        phase = RDMA_QUEUE_TXN_WQE_RELEASE_PARTIAL;
-        return rdma_status::success();
+        if (phase == RDMA_QUEUE_TXN_WQE_RELEASE_PARTIAL)
+          return rdma_status::success();
+        return transition_to(RDMA_QUEUE_TXN_WQE_RELEASE_PARTIAL);
       end
     end
     plan = rdma_queue_cq_release_plan::type_id::create("release_plan");
     plan.index = index; plan.wrap = wrap; plan.released = 1'b1;
     release_plan.push_back(plan);
-    phase = RDMA_QUEUE_TXN_WQE_RELEASE_PARTIAL;
-    return rdma_status::success();
+    return transition_to(RDMA_QUEUE_TXN_WQE_RELEASE_PARTIAL);
   endfunction
 
   function rdma_status complete();
