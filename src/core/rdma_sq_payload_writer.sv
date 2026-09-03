@@ -36,10 +36,11 @@ class rdma_host_mem_sq_payload_writer extends rdma_sq_payload_writer;
     registration_t r; uvm_object o; rdma_dma_mapping mc;
     registration_id=0;
     if (mapping==null) return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,"null mapping");
-    if (mapping.state!=RDMA_MAPPING_ACTIVE) return rdma_status::make(RDMA_SC_INVALID_STATE,"mapping inactive");
+    if (mapping.state!=RDMA_MAPPING_ACTIVE || mapping.size==0) return rdma_status::make(RDMA_SC_INVALID_STATE,"mapping inactive/empty");
+    if (mapping.iova.value > 64'hffff_ffff_ffff_ffff - (mapping.size-1)) return rdma_status::make(RDMA_SC_DMA_TRANSLATION,"mapping range overflow");
     foreach (regs[i]) begin
       longint unsigned a0,a1,b0,b1;
-      a0=regs[i].mapping.iova.value; a1=a0+regs[i].mapping.size-1;
+      a0=regs[i].mapping.iova.value; a1=a0+(regs[i].mapping.size-1);
       b0=mapping.iova.value; b1=b0+mapping.size-1;
       if (!(b0>a1 || a0>b1)) return rdma_status::make(RDMA_SC_RESOURCE_BUSY,"mapping overlaps registration");
     end
@@ -54,7 +55,7 @@ class rdma_host_mem_sq_payload_writer extends rdma_sq_payload_writer;
   endfunction
 
   function rdma_status stage_and_verify(rdma_dma_request_context c, rdma_sge sges[$], byte unsigned payload[$], output rdma_sq_payload_write_receipt receipt);
-    rdma_status st; registration_t r; int ri; longint unsigned total, off; byte unsigned chunk[$], rb[$]; longint unsigned used_ids[$];
+    rdma_status st; registration_t r; int ri; longint unsigned total, off; byte unsigned chunk[$], rb[$]; longint unsigned used_ids[$]; int mapidx[$];
     receipt=null; if (api==null || binding==null) return rdma_status::make(RDMA_SC_INVALID_STATE,"writer not configured");
     st=c==null ? rdma_status::make(RDMA_SC_INVALID_ARGUMENT,"null request context") : c.validate(); if (!st.ok()) return st;
     total=0; foreach(sges[i]) begin
@@ -63,16 +64,15 @@ class rdma_host_mem_sq_payload_writer extends rdma_sq_payload_writer;
       total += sges[i].length;
     end
     if (total != payload.size()) return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,"payload length mismatch");
-    foreach(sges[i]) begin ri=-1; foreach(regs[j]) begin if (regs[j].mapping.check_access(c.function_h,c.requester_bdf,c.pasid_valid,c.pasid,c.dma_domain_valid,c.dma_domain_id,sges[i].iova,sges[i].length,RDMA_DMA_DEVICE_READ,'{device_read:1'b1,device_write:1'b0,atomic:1'b0}).ok()) begin ri=j; break; end end if (ri<0) return rdma_status::make(RDMA_SC_DMA_TRANSLATION,"no registered mapping for SGE"); end
+    foreach(sges[i]) begin ri=-1; foreach(regs[j]) begin if (regs[j].mapping.check_access(c.function_h,c.requester_bdf,c.pasid_valid,c.pasid,c.dma_domain_valid,c.dma_domain_id,sges[i].iova,sges[i].length,RDMA_DMA_DEVICE_READ,'{device_read:1'b1,device_write:1'b0,atomic:1'b0}).ok()) begin ri=j; break; end end if (ri<0) return rdma_status::make(RDMA_SC_DMA_TRANSLATION,"no registered mapping for SGE"); mapidx.push_back(ri); regs[ri].refs++; used_ids.push_back(regs[ri].id); end
     off=0; foreach(sges[i]) begin
-      ri=-1; foreach(regs[j]) begin if (regs[j].mapping.check_access(c.function_h,c.requester_bdf,c.pasid_valid,c.pasid,c.dma_domain_valid,c.dma_domain_id,sges[i].iova,sges[i].length,RDMA_DMA_DEVICE_READ,'{device_read:1'b1,device_write:1'b0,atomic:1'b0}).ok()) begin ri=j; break; end end
+      ri=mapidx[i];
       r=regs[ri]; chunk.delete(); for(int k=0;k<sges[i].length;k++) chunk.push_back(payload[off+k]);
-      st=api.write(r.mapping,sges[i].iova.value-r.mapping.iova.value,chunk); if(!st.ok()) return st;
-      st=api.read(r.mapping,sges[i].iova.value-r.mapping.iova.value,sges[i].length,rb); if(!st.ok()) return st;
-      if (rb.size()!=chunk.size()) return rdma_status::make(RDMA_SC_DMA_TRANSLATION,"staged payload readback mismatch");
-      foreach(chunk[k]) if (rb[k]!==chunk[k]) return rdma_status::make(RDMA_SC_DMA_TRANSLATION,"staged payload readback mismatch");
-      regs[ri].refs++; off += sges[i].length;
-      used_ids.push_back(r.id);
+      st=api.write(r.mapping,sges[i].iova.value-r.mapping.iova.value,chunk); if(!st.ok()) begin foreach(mapidx[q]) regs[mapidx[q]].refs--; return st; end
+      st=api.read(r.mapping,sges[i].iova.value-r.mapping.iova.value,sges[i].length,rb); if(!st.ok()) begin foreach(mapidx[q]) regs[mapidx[q]].refs--; return st; end
+      if (rb.size()!=chunk.size()) begin foreach(mapidx[q]) regs[mapidx[q]].refs--; return rdma_status::make(RDMA_SC_DMA_TRANSLATION,"staged payload readback mismatch"); end
+      foreach(chunk[k]) if (rb[k]!==chunk[k]) begin foreach(mapidx[q]) regs[mapidx[q]].refs--; return rdma_status::make(RDMA_SC_DMA_TRANSLATION,"staged payload readback mismatch"); end
+      off += sges[i].length;
     end
     receipt=rdma_sq_payload_write_receipt::type_id::create("receipt"); receipt.verified=1; receipt.payload=payload; receipt.released=0; receipt.function_h=rdma_function_handle::type_id::create("receipt_function"); receipt.function_h.copy(c.function_h); receipt.function_generation=c.function_h.generation;
     foreach(sges[i]) begin rdma_sge cp=rdma_sge::type_id::create("sge"); cp.copy(sges[i]); receipt.sges.push_back(cp); end
