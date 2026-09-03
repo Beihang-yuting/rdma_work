@@ -127,6 +127,9 @@ class rdma_address_vector extends uvm_object;
   bit [19:0] flow_label;
   bit [7:0] hop_limit;
   bit [15:0] udp_source_port;
+  bit [2:0] \priority ;
+  bit multicast;
+  bit [1:0] forwarding_mode;
 
   function new(string name = "rdma_address_vector");
     super.new(name);
@@ -148,6 +151,9 @@ class rdma_address_vector extends uvm_object;
     flow_label = '0;
     hop_limit = '0;
     udp_source_port = '0;
+    \priority = '0;
+    multicast = 1'b0;
+    forwarding_mode = '0;
   endfunction
 
   virtual function void do_copy(uvm_object rhs);
@@ -174,6 +180,9 @@ class rdma_address_vector extends uvm_object;
     flow_label = rhs_vector.flow_label;
     hop_limit = rhs_vector.hop_limit;
     udp_source_port = rhs_vector.udp_source_port;
+    \priority = rhs_vector.\priority ;
+    multicast = rhs_vector.multicast;
+    forwarding_mode = rhs_vector.forwarding_mode;
   endfunction
 
   virtual function rdma_status validate();

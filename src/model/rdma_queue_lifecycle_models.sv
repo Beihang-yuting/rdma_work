@@ -22,6 +22,7 @@ typedef enum bit [4:0] {
   RDMA_QUEUE_ROLE_QP_URC_RSQ = 5'd17,
   RDMA_QUEUE_ROLE_QP_URC_RDSQ = 5'd18,
   RDMA_QUEUE_ROLE_QP_URC_DSQ = 5'd19
+  ,RDMA_QUEUE_ROLE_QP_SQ_SGB = 5'd20
 } rdma_queue_backing_role_e;
 
 typedef enum bit { RDMA_QUEUE_FLUSH_PRE_DELETE, RDMA_QUEUE_FLUSH_POST_DELETE }
@@ -57,6 +58,7 @@ endfunction
 // role enum.
 function automatic bit rdma_qp_role_is_payload(rdma_queue_backing_role_e role);
   return role inside {RDMA_QUEUE_ROLE_QP_SQ_RING,
+                      RDMA_QUEUE_ROLE_QP_SQ_SGB,
                       RDMA_QUEUE_ROLE_QP_RQ_RING,
                       RDMA_QUEUE_ROLE_QP_URC_RSQ,
                       RDMA_QUEUE_ROLE_QP_URC_RDSQ,
@@ -202,12 +204,13 @@ class rdma_queue_backing_slice extends uvm_object;
     if (!rdma_queue_role_is_payload(role) && !rdma_qp_role_is_payload(role))
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "slice role is not payload");
     if (!rdma_queue_aligned(logical_queue_offset,
-                            role == RDMA_QUEUE_ROLE_SRQ_SGB ? 512 : 4096))
+                            (role inside {RDMA_QUEUE_ROLE_SRQ_SGB,
+                                          RDMA_QUEUE_ROLE_QP_SQ_SGB}) ? 512 : 4096))
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "logical offset is unaligned");
     if (!rdma_queue_add_ok(logical_queue_offset, length))
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "logical range overflows");
     return rdma_queue_queue_range_status(mapping, mapping_offset, length,
-      role == RDMA_QUEUE_ROLE_SRQ_SGB ? 512 : 4096);
+      (role inside {RDMA_QUEUE_ROLE_SRQ_SGB, RDMA_QUEUE_ROLE_QP_SQ_SGB}) ? 512 : 4096);
   endfunction
 endclass
 
@@ -976,6 +979,34 @@ class rdma_qp_ring_layout extends uvm_object;
     return rdma_status::success();
   endfunction
 endclass
+
+function automatic rdma_status rdma_qp_sq_sgb_geometry(
+  int unsigned depth, output longint unsigned logical_bytes,
+  output longint unsigned storage_bytes);
+  logical_bytes = longint'(depth) * 512;
+  storage_bytes = ((logical_bytes + 4095) / 4096) * 4096;
+  if (!rdma_qp_power_of_two(depth) || depth == 0)
+    return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "SQ SGB depth invalid");
+  return rdma_status::success();
+endfunction
+
+function automatic bit rdma_qp_needs_sq_sgb(
+  rdma_transport_e transport, int unsigned max_send_sge,
+  int unsigned max_recv_sge);
+  return transport == RDMA_TRANSPORT_UD;
+endfunction
+
+function automatic rdma_qp_ring_layout rdma_qp_sgb_layout(int unsigned depth);
+  rdma_qp_ring_layout layout;
+  layout = rdma_qp_ring_layout::type_id::create("sq_sgb_layout");
+  layout.role = RDMA_QUEUE_ROLE_QP_SQ_SGB;
+  layout.entry_size_bytes = 512;
+  layout.depth = depth;
+  layout.logical_bytes = longint'(depth) * 512;
+  layout.storage_bytes = ((layout.logical_bytes + 4095) / 4096) * 4096;
+  layout.object_mode = RDMA_OBJECT_INDIRECT_4K;
+  return layout;
+endfunction
 
 class rdma_qp_backing_ref extends uvm_object;
   `uvm_object_utils(rdma_qp_backing_ref)

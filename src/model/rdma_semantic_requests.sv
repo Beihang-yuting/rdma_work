@@ -411,11 +411,13 @@ class rdma_create_qp_req extends rdma_semantic_request;
   int unsigned rq_depth;
   int unsigned max_send_sge;
   int unsigned max_recv_sge;
+  int unsigned max_inline_data;
   rdma_handle pd_h;
   rdma_handle send_cq_h;
   rdma_handle recv_cq_h;
   rdma_handle srq_h;
   rdma_queue_backing_spec sq_backing;
+  rdma_queue_backing_spec sq_sgb_backing;
   rdma_queue_backing_spec rq_backing;
   rdma_qp_context_attributes context_attrs;
 
@@ -426,12 +428,14 @@ class rdma_create_qp_req extends rdma_semantic_request;
     rq_depth = '0;
     max_send_sge = '0;
     max_recv_sge = 1;
+    max_inline_data = 0;
     pd_h = null;
     send_cq_h = null;
     recv_cq_h = null;
     srq_h = null;
     sq_backing = rdma_queue_backing_spec::type_id::create("sq_backing");
     rq_backing = rdma_queue_backing_spec::type_id::create("rq_backing");
+    sq_sgb_backing = rdma_queue_backing_spec::type_id::create("sq_sgb_backing");
     context_attrs = null;
   endfunction
 
@@ -447,6 +451,7 @@ class rdma_create_qp_req extends rdma_semantic_request;
     rq_depth = rhs_req.rq_depth;
     max_send_sge = rhs_req.max_send_sge;
     max_recv_sge = rhs_req.max_recv_sge;
+    max_inline_data = rhs_req.max_inline_data;
     if (rhs_req.pd_h == null) pd_h = null;
     else begin
       cloned_object = rhs_req.pd_h.clone();
@@ -485,6 +490,12 @@ class rdma_create_qp_req extends rdma_semantic_request;
           rq_backing == rhs_req.rq_backing)
         `uvm_fatal("RDMA_COPY_TYPE", "RQ backing clone type mismatch")
     end
+    if (rhs_req.sq_sgb_backing == null) sq_sgb_backing = null;
+    else begin
+      cloned_object = rhs_req.sq_sgb_backing.clone();
+      if (cloned_object == null || !$cast(sq_sgb_backing, cloned_object))
+        `uvm_fatal("RDMA_COPY_TYPE", "SQ SGB backing clone type mismatch")
+    end
     if (rhs_req.context_attrs == null) context_attrs = null;
     else begin
       cloned_object = rhs_req.context_attrs.clone();
@@ -513,6 +524,14 @@ class rdma_create_qp_req extends rdma_semantic_request;
     if (max_send_sge == 0 || max_recv_sge == 0)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "QP maximum SGE count is zero");
+    if (max_send_sge > 32 || max_inline_data > 512 ||
+        (!rdma_qp_needs_sq_sgb(transport,max_send_sge,max_recv_sge) && max_inline_data > 32))
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "QP capabilities exceed limits");
+    if (rdma_qp_needs_sq_sgb(transport,max_send_sge,max_recv_sge)) begin
+      if (sq_sgb_backing == null) return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "SQ SGB backing null");
+    end
+    else if (sq_sgb_backing != null && sq_sgb_backing.slices.size() != 0)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "unexpected SQ SGB backing");
     sq_storage_bytes = ((longint'(sq_depth) * 64 + 4095) / 4096) * 4096;
     rq_storage_bytes = ((longint'(rq_depth) * 64 + 4095) / 4096) * 4096;
     status = rdma_qp_backing_spec_status(sq_backing,
@@ -952,6 +971,8 @@ class rdma_post_send_req extends rdma_semantic_request;
   bit [23:0] destination_qpn;
   bit [31:0] qkey;
   int unsigned address_vector_id;
+  rdma_address_vector address_vector;
+  bit fence;
   bit address_vector_valid;
   longint unsigned compare_value;
   longint unsigned swap_add_value;
@@ -973,6 +994,7 @@ class rdma_post_send_req extends rdma_semantic_request;
     destination_qpn = '0;
     qkey = '0;
     address_vector_id = '0;
+    address_vector = null; fence = 0;
     address_vector_valid = 1'b0;
     compare_value = '0;
     swap_add_value = '0;
@@ -1009,6 +1031,9 @@ class rdma_post_send_req extends rdma_semantic_request;
     destination_qpn = rhs_req.destination_qpn;
     qkey = rhs_req.qkey;
     address_vector_id = rhs_req.address_vector_id;
+    fence = rhs_req.fence;
+    if (rhs_req.address_vector == null) address_vector = null;
+    else begin cloned_object = rhs_req.address_vector.clone(); if (cloned_object == null || !$cast(address_vector, cloned_object)) `uvm_fatal("RDMA_COPY_TYPE", "AV clone failure"); end
     address_vector_valid = rhs_req.address_vector_valid;
     compare_value = rhs_req.compare_value;
     swap_add_value = rhs_req.swap_add_value;
