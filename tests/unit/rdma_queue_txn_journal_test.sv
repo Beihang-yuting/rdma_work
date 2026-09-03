@@ -45,6 +45,7 @@ class rdma_queue_txn_journal_test extends uvm_test;
     if (!submitted.mmio_maybe_submitted || submitted.image == null ||
         submitted.phase != RDMA_QUEUE_TXN_DOORBELL_MAYBE_SUBMITTED)
       `uvm_error("TXN", "finalize recovery lost submitted evidence")
+    submitted.advance(RDMA_QUEUE_TXN_CONSUMER_COMMITTED);
 
     // Release plans are idempotent and completion is only legal after release.
     status = submitted.mark_wqe_release(3, 1'b0);

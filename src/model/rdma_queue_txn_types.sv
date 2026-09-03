@@ -122,6 +122,8 @@ class rdma_queue_txn_evidence extends uvm_object;
   endfunction
 
   function rdma_status mark_mmio_maybe_submitted();
+    if (aborted || phase == RDMA_QUEUE_TXN_COMPLETED)
+      return rdma_status::make(RDMA_SC_INVALID_STATE, "transaction is terminal");
     mmio_maybe_submitted = 1'b1;
     if (phase < RDMA_QUEUE_TXN_DOORBELL_MAYBE_SUBMITTED)
       phase = RDMA_QUEUE_TXN_DOORBELL_MAYBE_SUBMITTED;
@@ -130,6 +132,8 @@ class rdma_queue_txn_evidence extends uvm_object;
 
   function rdma_status recover(rdma_queue_recovery_action_e action,
                                bit caller_confirmed_no_submit = 1'b0);
+    if (aborted || phase == RDMA_QUEUE_TXN_COMPLETED)
+      return rdma_status::make(RDMA_SC_INVALID_STATE, "transaction is terminal");
     case (action)
       RDMA_QUEUE_RECOVERY_RETRY_NO_SUBMIT:
         if (mmio_maybe_submitted || phase >= RDMA_QUEUE_TXN_DOORBELL_MAYBE_SUBMITTED ||
@@ -150,6 +154,9 @@ class rdma_queue_txn_evidence extends uvm_object;
   endfunction
 
   function rdma_status mark_wqe_release(int unsigned index, bit wrap);
+    if (aborted || phase == RDMA_QUEUE_TXN_COMPLETED ||
+        phase < RDMA_QUEUE_TXN_CONSUMER_COMMITTED)
+      return rdma_status::make(RDMA_SC_INVALID_STATE, "WQE release requires committed transaction");
     rdma_queue_cq_release_plan plan;
     foreach (release_plan[i]) begin
       if (release_plan[i].index == index && release_plan[i].wrap == wrap) begin

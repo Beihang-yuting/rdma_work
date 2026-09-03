@@ -66,9 +66,6 @@ class rdma_function_identity extends uvm_object;
     bit bdf_zero;
     bdf_zero = (key.bdf.segment == 0 && key.bdf.bus == 0 &&
                 key.bdf.device == 0 && key.bdf.function_num == 0);
-    if (global_function_id == 0)
-      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                               "global Function ID must be non-zero");
     if (function_uid == 0)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "Function UID must be non-zero");
