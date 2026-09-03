@@ -2289,6 +2289,14 @@ class ReferenceEncodingTest(unittest.TestCase):
         qpc = CHECKER.build_golden_cases()["context"][0].payload
         self.assertEqual(qpc[216:224], bytes.fromhex("123456789abcdb80"))
 
+    def test_sq_fields_and_golden_vectors_are_required(self) -> None:
+        fields = CHECKER.parse_sq_field_mappings(CHECKER.SV_DEFS_PATH.read_text())
+        self.assertIn("XTR_V1_SQ_WQE_QPN", fields)
+        self.assertIn("XTR_V1_SQ_WQE_SIGNATURE", fields)
+        self.assertIn("XTR_V1_SQ_WQE_UD_DST_IP", fields)
+        self.assertTrue((CHECKER.GOLDEN_DIR / "sq.hex").exists())
+        CHECKER.validate_sq_golden_vectors()
+
     def test_golden_summaries_list_every_participating_input(self) -> None:
         cases = CHECKER.build_golden_cases()
         summaries = {

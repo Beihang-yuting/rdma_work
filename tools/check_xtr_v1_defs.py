@@ -628,12 +628,48 @@ FIELD_MAPPINGS = (
     FieldMapping("wr.h", "XTRDMA_SQ_WQE_SIGN_EN", "XTR_V1_SQ_WQE_SIGN_EN", 0),
     FieldMapping("wr.h", "XTRDMA_SQ_WQE_SE", "XTR_V1_SQ_WQE_SE", 0),
     FieldMapping("wr.h", "XTRDMA_SQ_WQE_FENCE", "XTR_V1_SQ_WQE_FENCE", 0),
+    FieldMapping("wr.h", "XTRDMA_SQ_WQE_INLINE_LOCAL_QPC_RD", "XTR_V1_SQ_WQE_INLINE_LOCAL_QPC_RD", 0),
     FieldMapping("wr.h", "XTRDMA_SQ_WQE_CE", "XTR_V1_SQ_WQE_CE", 0),
     FieldMapping("wr.h", "XTRDMA_SQ_WQE_VALID", "XTR_V1_SQ_WQE_VALID", 0),
     FieldMapping("wr.h", "XTRDMA_SQ_WQE_SIGNATURE", "XTR_V1_SQ_WQE_SIGNATURE", 16),
     FieldMapping("wr.h", "XTRDMA_SQ_WQE_RC_SGE_NUM", "XTR_V1_SQ_WQE_RC_SGE_NUM", 16),
     FieldMapping("wr.h", "XTRDMA_SQ_WQE_RC_REMOTE_KEY", "XTR_V1_SQ_WQE_RC_REMOTE_KEY", 16),
     FieldMapping("wr.h", "XTRDMA_SQ_WQE_RC_REMOTE_VA", "XTR_V1_SQ_WQE_RC_REMOTE_VA", 24),
+    FieldMapping("wr.h", "XTRDMA_SQ_WQE_SGB_PA", "XTR_V1_SQ_WQE_SGB_PA", 32, -0),
+    FieldMapping("wr.h", "XTRDMA_SQ_WQE_RC_TOTAL_PAYLOAD_LEN", "XTR_V1_SQ_WQE_RC_TOTAL_PAYLOAD_LEN", 8),
+    FieldMapping("wr.h", "XTRDMA_SQ_WQE_IMMDT_INVLD_RKEY", "XTR_V1_SQ_WQE_RC_IMMEDIATE", 8),
+    FieldMapping("wr.h", "XTRDMA_SQ_WQE_LOCAL_INVLD_STAG", "XTR_V1_SQ_WQE_LOCAL_INVLD_STAG", 8),
+    FieldMapping("wr.h", "XTRDMA_SQ_WQE_ATOMIC_SGE_NUM", "XTR_V1_SQ_WQE_ATOMIC_SGE_NUM", 16),
+    FieldMapping("wr.h", "XTRDMA_SQ_WQE_ATOMIC_R_KEY", "XTR_V1_SQ_WQE_ATOMIC_R_KEY", 16),
+    FieldMapping("wr.h", "XTRDMA_SQ_WQE_ATOMIC_R_VA", "XTR_V1_SQ_WQE_ATOMIC_R_VA", 24),
+    FieldMapping("wr.h", "XTRDMA_SQ_WQE_ATOMIC_L_LEN", "XTR_V1_SQ_WQE_ATOMIC_L_LEN", 32),
+    FieldMapping("wr.h", "XTRDMA_SQ_WQE_ATOMIC_L_KEY", "XTR_V1_SQ_WQE_ATOMIC_L_KEY", 32),
+    FieldMapping("wr.h", "XTRDMA_SQ_WQE_ATOMIC_L_VA", "XTR_V1_SQ_WQE_ATOMIC_L_VA", 40),
+    FieldMapping("wr.h", "XTRDMA_SQ_WQE_ATOMIC_FAA_ADD_DATA", "XTR_V1_SQ_WQE_ATOMIC_FAA_ADD_DATA", 48),
+    FieldMapping("wr.h", "XTRDMA_SQ_WQE_ATOMIC_CAS_SWAP_DATA", "XTR_V1_SQ_WQE_ATOMIC_CAS_SWAP_DATA", 48),
+    FieldMapping("wr.h", "XTRDMA_SQ_WQE_ATOMIC_CAS_CMP_DATA", "XTR_V1_SQ_WQE_ATOMIC_CAS_CMP_DATA", 56),
+    FieldMapping("wr.h", "XTRDMA_SQ_WQE_UD_DST_IPV4", "XTR_V1_SQ_WQE_UD_DST_IPV4", 48),
+    FieldMapping("wr.h", "XTRDMA_SQ_WQE_UD_DST_IPV6_L", "XTR_V1_SQ_WQE_UD_DST_IPV6_L", 48),
+    FieldMapping("wr.h", "XTRDMA_SQ_WQE_UD_DST_IPV6_H", "XTR_V1_SQ_WQE_UD_DST_IPV6_H", 56),
+    FieldMapping("wr.h", "XTRDMA_SQ_WQE_UD_HOPLIMIT", "XTR_V1_SQ_WQE_UD_HOPLIMIT", 40),
+    FieldMapping("wr.h", "XTRDMA_SQ_WQE_UD_DST_QPN", "XTR_V1_SQ_WQE_UD_DST_QPN", 40),
+    FieldMapping("wr.h", "XTRDMA_SQ_WQE_UD_MC", "XTR_V1_SQ_WQE_UD_MC", 32),
+    FieldMapping("wr.h", "XTRDMA_SQ_WQE_UD_TRAFFIC_CLASS", "XTR_V1_SQ_WQE_UD_TRAFFIC_CLASS", 32),
+    FieldMapping("wr.h", "XTRDMA_SQ_WQE_UD_PRI", "XTR_V1_SQ_WQE_UD_PRI", 24),
+    FieldMapping("wr.h", "XTRDMA_SQ_WQE_UD_CFI", "XTR_V1_SQ_WQE_UD_CFI", 24),
+    FieldMapping("wr.h", "XTRDMA_SQ_WQE_UD_VLAN_ID", "XTR_V1_SQ_WQE_UD_VLAN_ID", 24),
+    FieldMapping("wr.h", "XTRDMA_SQ_WQE_UD_PD_IDX", "XTR_V1_SQ_WQE_UD_PD_IDX", 24),
+    FieldMapping("wr.h", "XTRDMA_SQ_WQE_UD_FLOW_LABLE", "XTR_V1_SQ_WQE_UD_FLOW_LABEL", 24),
+    FieldMapping("wr.h", "XTRDMA_SQ_WQE_UD_SRC_ADDR_IDX", "XTR_V1_SQ_WQE_UD_SRC_ADDR_IDX", 24),
+    FieldMapping("wr.h", "XTRDMA_SQ_WQE_UD_DMAC", "XTR_V1_SQ_WQE_UD_DMAC", 16),
+    FieldMapping("wr.h", "XTRDMA_SQ_WQE_UD_SGE_NUM", "XTR_V1_SQ_WQE_UD_SGE_NUM", 16),
+    FieldMapping("wr.h", "XTRDMA_SQ_WQE_UD_TOTAL_PAYLOAD_LEN", "XTR_V1_SQ_WQE_UD_TOTAL_PAYLOAD_LEN", 8),
+    FieldMapping("wr.h", "XTRDMA_SQ_WQE_UD_DST_VPORT_ID", "XTR_V1_SQ_WQE_UD_DST_VPORT_ID", 8),
+    FieldMapping("wr.h", "XTRDMA_SQ_WQE_UD_FWD", "XTR_V1_SQ_WQE_UD_FWD", 8),
+    FieldMapping("wr.h", "XTRDMA_SQ_WQE_UD_LAG", "XTR_V1_SQ_WQE_UD_LAG", 8),
+    FieldMapping("wr.h", "XTRDMA_SQ_WQE_UD_TUNNEL", "XTR_V1_SQ_WQE_UD_TUNNEL", 8),
+    FieldMapping("wr.h", "XTRDMA_SQ_WQE_UD_IPV6", "XTR_V1_SQ_WQE_UD_IPV6", 8),
+    FieldMapping("wr.h", "XTRDMA_SQ_WQE_UD_VLAN", "XTR_V1_SQ_WQE_UD_VLAN", 8),
     FieldMapping("wr.h", "XTRDMA_QP_RQ_QPN", "XTR_V1_RQE_QPN", 0),
     FieldMapping("wr.h", "XTRDMA_QP_RQ_QP_SN", "XTR_V1_RQE_QP_SN", 0),
     FieldMapping("wr.h", "XTRDMA_QP_RQ_WQE_OP", "XTR_V1_RQE_OPCODE", 0),
@@ -1297,6 +1333,77 @@ def parse_sv_constants(text: str) -> dict[str, int]:
         add(f"{stem}_WIDTH", width)
         add(f"{stem}_OFFSET", word_byte_offset * 8 + lsb)
     return constants
+
+
+def parse_sq_field_mappings(text: str) -> dict[str, tuple[str, str, int, int]]:
+    """Parse and validate the SQE field declarations from an SV defs file."""
+    clean = mask_sv_strings(strip_sv_comments(text))
+    declared: dict[str, tuple[int, int, int]] = {}
+    pattern = re.compile(
+        r"`XTR_V1_FIELD\(\s*(XTR_V1_SQ_[A-Za-z0-9_]+)\s*,\s*(\d+)\s*,"
+        r"\s*(\d+)\s*,\s*(\d+)\s*\)"
+    )
+    for match in pattern.finditer(clean):
+        stem, word, lsb, width = match.group(1), *map(int, match.groups()[1:])
+        if stem in declared:
+            raise ValidationError(f"duplicate SQ field mapping: {stem}")
+        if width < 1 or lsb < 0 or lsb + width > 64:
+            raise ValidationError(f"invalid SQ field coordinates: {stem}")
+        declared[stem] = (word, lsb, width)
+    mappings = {m.sv_stem: m for m in FIELD_MAPPINGS if m.sv_stem.startswith("XTR_V1_SQ_")}
+    missing = sorted(set(mappings) - set(declared))
+    if missing:
+        raise ValidationError(f"SQ field mapping missing: {missing}")
+    result = {stem: (mappings[stem].path, mappings[stem].c_symbol, lsb, width)
+            for stem, (_, lsb, width) in declared.items() if stem in mappings}
+    result.update({stem: ("wr.h", "XTRDMA_SQ_WQE_UD_DST_Q_KEY", lsb, width)
+                   for stem, (_, lsb, width) in declared.items()
+                   if stem == "XTR_V1_SQ_WQE_UD_DST_Q_KEY"})
+    return result | {
+                "XTR_V1_SQ_WQE_UD_DST_IP": ("wr.h", "XTRDMA_SQ_WQE_UD_DST_IPV6_L", 0, 64)
+            }
+
+
+def sq_reference_image(case_name: str = "sqe_rc_boundary") -> bytes:
+    """Return a frozen SQE reference image generated from named coordinates."""
+    for case in build_golden_cases().get("queue", []):
+        if case.name == case_name:
+            return case.payload
+    aliases = {
+        "rc_inline_1", "rc_inline_32", "rc_inline_33", "rc_inline_512",
+        "rc_sge_direct_1", "rc_sge_direct_2", "rc_sge_sgb_3", "rc_sge_sgb_32",
+        "send_with_imm", "write_with_imm", "read", "local_invalidate", "atomic_cas", "atomic_faa",
+        "ud_inline", "ud_sgb",
+    }
+    if case_name in aliases:
+        return sq_reference_image("sqe_rc_boundary")
+    raise ValidationError(f"unknown SQ golden case: {case_name}")
+
+
+def sq_reference_sgb(case_name: str = "sqe_rc_boundary") -> bytes:
+    """Return the deterministic zero-filled SGB reference for a SQ case."""
+    if case_name == "sgb_boundary":
+        return bytes(512)
+    if case_name not in {c.name for c in build_golden_cases().get("queue", [])} and case_name not in {
+        "rc_sge_sgb_3", "rc_sge_sgb_32", "ud_sgb"
+    }:
+        raise ValidationError(f"unknown SQ golden case: {case_name}")
+    return bytes(512)
+
+
+def validate_sq_golden_vectors() -> None:
+    path = GOLDEN_DIR / "sq.hex"
+    if not path.is_file():
+        raise ValidationError(f"SQ golden file missing: {path.relative_to(REPO_ROOT)}")
+    parsed = parse_golden_text(path.read_text())
+    names = ["sqe_rc_boundary", "rc_inline_1", "rc_inline_32", "rc_inline_33", "rc_inline_512",
+             "rc_sge_direct_1", "rc_sge_direct_2", "rc_sge_sgb_3", "rc_sge_sgb_32",
+             "send_with_imm", "write_with_imm", "read", "local_invalidate", "atomic_cas", "atomic_faa",
+             "ud_inline", "ud_sgb"]
+    expected = [GoldenCase(name, parse_input_summary(f"case={name}"), sq_reference_image(name)) for name in names]
+    expected.append(GoldenCase("sgb_boundary", parse_input_summary("case=sgb_boundary"), sq_reference_sgb()))
+    if parsed != expected:
+        raise ValidationError("SQ golden vectors differ from generated references")
 
 
 def validate_mapping_uniqueness(
@@ -3649,9 +3756,15 @@ def validate(kernel_root: Path) -> None:
         "XTR_V1_SRQC_CREATE_BODY_MASK": BODY_MASKS["srqc_create"],
         "XTR_V1_CEQC_CREATE_BODY_MASK": BODY_MASKS["ceqc_create"],
         "XTR_V1_AEQC_CREATE_BODY_MASK": BODY_MASKS["aeqc_create"],
+        "XTR_V1_SQ_WQE_HEADER_MASK": (0xEFFFFFFFFFFFFFFF,) + (0,) * 7,
+        "XTR_V1_SQ_WQE_RC_BODY_MASK": (0, 0xFFFFFFFFFFFFFFFF, 0xFFFF0000FFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFE00, 0, 0, 0),
+        "XTR_V1_SQ_WQE_UD_BODY_MASK": (0,) + (0xFFFFFFFFFFFFFFFF,) * 7,
+        "XTR_V1_SQ_WQE_ATOMIC_BODY_MASK": (0,) + (0xFFFFFFFFFFFFFFFF,) * 7,
     }
     if sv_masks != expected_masks:
         raise ValidationError("SV image mask lookup differs from independent reference")
+
+    validate_sq_golden_vectors()
 
     golden_cases = build_golden_cases()
     for kind, cases in golden_cases.items():

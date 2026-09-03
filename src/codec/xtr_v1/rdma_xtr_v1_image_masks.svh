@@ -128,6 +128,27 @@ localparam bit [63:0] XTR_V1_EMPTY_BODY_OWNERSHIP [0:7] = '{
   64'h0, 64'h0, 64'h0, 64'h0, 64'h0, 64'h0, 64'h0, 64'h0
 };
 
+// SQE logical-qword ownership masks. Reserved bits are zero and are rejected
+// by consumers before serialization.
+localparam bit [63:0] XTR_V1_SQ_WQE_HEADER_MASK [0:7] = '{
+  64'hefffffffffffffff, 64'h0, 64'h0, 64'h0,
+  64'h0, 64'h0, 64'h0, 64'h0
+};
+localparam bit [63:0] XTR_V1_SQ_WQE_RC_BODY_MASK [0:7] = '{
+  64'h0, 64'hffffffffffffffff, 64'hffff0000ffffffff,
+  64'hffffffffffffffff, 64'hfffffffffffffe00, 64'h0, 64'h0, 64'h0
+};
+localparam bit [63:0] XTR_V1_SQ_WQE_UD_BODY_MASK [0:7] = '{
+  64'h0, 64'hffffffffffffffff, 64'hffffffffffffffff,
+  64'hffffffffffffffff, 64'hffffffffffffffff, 64'hffffffffffffffff,
+  64'hffffffffffffffff, 64'hffffffffffffffff
+};
+localparam bit [63:0] XTR_V1_SQ_WQE_ATOMIC_BODY_MASK [0:7] = '{
+  64'h0, 64'hffffffffffffffff, 64'hffffffffffffffff,
+  64'hffffffffffffffff, 64'hffffffffffffffff, 64'hffffffffffffffff,
+  64'hffffffffffffffff, 64'hffffffffffffffff
+};
+
 function automatic bit [63:0] request_envelope_mask(
     int unsigned qword_index);
   if (qword_index > 7)

@@ -177,6 +177,24 @@ also freezes the rule that remote-write or remote-atomic implies local-write.
 
 ## Other pinned groups
 
+### SQE (Send Queue Entry)
+
+SQE coordinates are sourced from `wr.h` and serialized as big-endian logical
+qwords. Common header fields occupy byte 0; RC/atomic extensions occupy bytes
+8..56; UD transport fields occupy bytes 8..56; the SGB pointer is qword byte
+32 bits 63:9. Reserved bits are zero according to the named masks
+`XTR_V1_SQ_WQE_HEADER_MASK`, `XTR_V1_SQ_WQE_RC_BODY_MASK`,
+`XTR_V1_SQ_WQE_UD_BODY_MASK`, and `XTR_V1_SQ_WQE_ATOMIC_BODY_MASK`.
+
+| C symbol | SV stem | qword byte | LSB | width |
+|---|---|---:|---:|---:|
+| `XTRDMA_SQ_WQE_QPN` | `XTR_V1_SQ_WQE_QPN` | 0 | 0 | 21 |
+| `XTRDMA_SQ_WQE_OPCODE` | `XTR_V1_SQ_WQE_OPCODE` | 0 | 32 | 4 |
+| `XTRDMA_SQ_WQE_SIGNATURE` | `XTR_V1_SQ_WQE_SIGNATURE` | 16 | 56 | 8 |
+| `XTRDMA_SQ_WQE_RC_TOTAL_PAYLOAD_LEN` | `XTR_V1_SQ_WQE_RC_TOTAL_PAYLOAD_LEN` | 8 | 0 | 32 |
+| `XTRDMA_SQ_WQE_SGB_PA` | `XTR_V1_SQ_WQE_SGB_PA` | 32 | 9 | 55 |
+| `XTRDMA_SQ_WQE_UD_DMAC` | `XTR_V1_SQ_WQE_UD_DMAC` | 16 | 0 | 48 |
+
 - QPC is 512 bytes (`XTRDMA_QP_CONTEXT_SIZE`), CQC is 64 bytes
   (`XTRDMA_CQ_CONTEXT_SIZE`), and CMQE/WQE are 64 bytes.
 - The QPC destination-IP byte range is independently frozen and checked as
