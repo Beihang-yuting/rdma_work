@@ -13,3 +13,7 @@ Concerns: QP backing-plan `sq_sgb_ref` and full canonical backing validation rem
 ## Review fixes
 
 Commit `19128d8` adds detached QP capability fields and plan SQ-SGB authority reference, with clone/validation handling and canonical SQ-SGB backing checks (512-byte slot alignment, rounded storage geometry, role validation). Focused regressions should be rerun by controller.
+
+## Review round 2
+
+Commit `$(git rev-parse --short HEAD)` fixes SQ-SGB plan validation to require 4KiB-rounded storage (including segmented references) and applies 512-byte alignment to SQ-SGB backing refs/segments while preserving 4KiB alignment for other roles.
