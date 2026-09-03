@@ -13,6 +13,10 @@ class rdma_sq_payload_write_receipt extends uvm_object;
   rdma_dma_mapping mappings[$];
   rdma_function_handle function_h;
   int unsigned function_generation;
+  // A receipt copy is a data snapshot only; the release capability remains
+  // bound to the original writer-issued object and is never duplicated by
+  // uvm_object::copy().
+  local uvm_object release_owner;
 
   function new(string name = "rdma_sq_payload_write_receipt");
     super.new(name);
@@ -20,6 +24,18 @@ class rdma_sq_payload_write_receipt extends uvm_object;
     released = 1'b0;
     function_h = null;
     function_generation = '0;
+    release_owner = null;
+  endfunction
+
+  // The writer is the only production caller of these helpers.  The
+  // one-shot bind prevents a receipt copy from acquiring the capability.
+  function void bind_release_owner(uvm_object owner);
+    if (release_owner == null && owner != null)
+      release_owner = owner;
+  endfunction
+
+  function bit release_authority_matches(uvm_object owner);
+    return release_owner != null && owner != null && release_owner == owner;
   endfunction
 
   virtual function void do_copy(uvm_object rhs);
@@ -37,6 +53,7 @@ class rdma_sq_payload_write_receipt extends uvm_object;
     payload = source.payload;
     registration_ids = source.registration_ids;
     function_generation = source.function_generation;
+    release_owner = null;
     sges.delete();
     mappings.delete();
     function_h = null;
@@ -394,6 +411,7 @@ class rdma_host_mem_sq_payload_writer extends rdma_sq_payload_writer;
     candidate.payload = payload;
     candidate.registration_ids = registration_ids;
     candidate.function_generation = request_context.function_h.generation;
+    candidate.bind_release_owner(this);
     candidate.function_h = rdma_function_handle::type_id::create(
       "receipt_function");
     candidate.function_h.copy(request_context.function_h);
@@ -437,6 +455,9 @@ class rdma_host_mem_sq_payload_writer extends rdma_sq_payload_writer;
   function rdma_status release_receipt(rdma_sq_payload_write_receipt receipt);
     if (receipt == null || receipt.released)
       return rdma_status::success();
+    if (!receipt.release_authority_matches(this))
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "receipt release authority is not owned by writer");
     release_ids(receipt.registration_ids);
     receipt.released = 1'b1;
     return rdma_status::success();

@@ -90,7 +90,11 @@ class rdma_sq_payload_writer_test extends uvm_test;
     rdma_status status;
     longint unsigned registration_id;
     longint unsigned second_id;
+    longint unsigned rejected_id;
+    longint unsigned second_iova;
+    int unsigned second_size;
     int writes_before;
+    int reads_before;
 
     phase.raise_objection(this);
     binding = make_binding("binding");
@@ -112,7 +116,7 @@ class rdma_sq_payload_writer_test extends uvm_test;
     if (receipt == null || !receipt.verified || receipt.payload.size() != 5 ||
         receipt.registration_ids.size() != 1)
       `uvm_error("STAGE_SUCCESS", "receipt is incomplete");
-    if (memory.calls.size() != 4 || count_calls(memory, "write") != 2 ||
+    if (memory.calls.size() != 5 || count_calls(memory, "write") != 2 ||
         count_calls(memory, "read") != 2)
       `uvm_error("SCATTER_TRACE", "expected one write/read pair per SGE");
 
@@ -148,6 +152,8 @@ class rdma_sq_payload_writer_test extends uvm_test;
 
     expect_ok("ALLOCATE2", memory.allocate(request_context, 32, 16,
                                             RDMA_DMA_DEVICE_READ, second_mapping));
+    second_iova = second_mapping.iova.value;
+    second_size = second_mapping.size;
     expect_ok("REGISTER2", writer.register_mapping(second_mapping, second_id));
     sges[0].iova.value = second_mapping.iova.value;
     payload = '{1, 2};
@@ -191,18 +197,19 @@ class rdma_sq_payload_writer_test extends uvm_test;
     second_mapping.iova.value = 64'hffff_ffff_ffff_fffe;
     second_mapping.size = 4;
     expect_code("REG_RANGE_OVERFLOW", writer.register_mapping(second_mapping,
-                                                               second_id),
+                                                               rejected_id),
                 RDMA_SC_DMA_TRANSLATION);
     second_mapping.iova.value = mapping.iova.value + 16;
     second_mapping.size = 8;
     expect_code("REG_OVERLAP", writer.register_mapping(second_mapping,
-                                                         second_id),
+                                                         rejected_id),
                 RDMA_SC_RESOURCE_BUSY);
 
     // Write failure and readback mismatch return null receipts and release
     // the temporary registration reference exactly once.
-    second_mapping.iova.value = mapping.iova.value + 128;
-    second_mapping.size = 32;
+    expect_ok("UNREGISTER2", writer.unregister_mapping(second_id));
+    second_mapping.iova.value = second_iova;
+    second_mapping.size = second_size;
     expect_ok("REGISTER3", writer.register_mapping(second_mapping, second_id));
     sges.delete();
     sges.push_back(make_sge("failure_sge", second_mapping.iova.value, 4));
@@ -213,11 +220,13 @@ class rdma_sq_payload_writer_test extends uvm_test;
     if (status == null || status.ok() || receipt != null)
       `uvm_error("WRITE_FAILURE", "write failure was accepted");
     memory.corrupt_next_readback = 1'b1;
+    reads_before = count_calls(memory, "read");
     status = writer.stage_and_verify(request_context, sges, payload, receipt);
     expect_code("READBACK_MISMATCH", status, RDMA_SC_DMA_TRANSLATION);
-    if (receipt != null)
+    if (receipt != null || count_calls(memory, "read") != reads_before + 1)
       `uvm_error("READBACK_MISMATCH", "mismatch published a receipt");
-    expect_ok("RELEASE3", writer.release_receipt(detached));
+    expect_code("RELEASE_DETACHED_COPY", writer.release_receipt(detached),
+                RDMA_SC_INVALID_ARGUMENT);
     expect_ok("UNREGISTER3", writer.unregister_mapping(second_id));
     phase.drop_objection(this);
   endtask
