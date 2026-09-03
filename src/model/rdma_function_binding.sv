@@ -143,6 +143,8 @@ class rdma_function_binding extends uvm_object;
   `uvm_object_utils(rdma_function_binding)
 
   longint unsigned function_uid;
+  // Function identity is the authority; legacy scalar fields below are mirrors.
+  rdma_function_identity identity;
   rdma_pcie_identity pcie;
 
   bit [2:0] notify_bar_id;
@@ -174,6 +176,7 @@ class rdma_function_binding extends uvm_object;
   function new(string name = "rdma_function_binding");
     super.new(name);
     function_uid = '0;
+    identity = rdma_function_identity::type_id::create("identity");
     pcie = rdma_pcie_identity::type_id::create("pcie");
     notify_bar_id = '0;
     notify_base = '0;
@@ -207,6 +210,12 @@ class rdma_function_binding extends uvm_object;
     if (!$cast(rhs_binding, rhs))
       `uvm_fatal("RDMA_COPY_TYPE", "rdma_function_binding copy type mismatch")
     function_uid = rhs_binding.function_uid;
+    if (rhs_binding.identity == null) identity = null;
+    else begin
+      cloned_object = rhs_binding.identity.clone();
+      if (cloned_object == null || !$cast(identity, cloned_object))
+        `uvm_fatal("RDMA_COPY_TYPE", "rdma_function_identity clone type mismatch")
+    end
     if (rhs_binding.pcie == null) begin
       pcie = null;
     end
@@ -251,9 +260,12 @@ class rdma_function_binding extends uvm_object;
 
     handle = rdma_function_handle::type_id::create("function_handle");
     handle.kind = RDMA_RESOURCE_FUNCTION;
-    handle.function_uid = function_uid;
-    handle.object_id = global_function_id;
-    handle.generation = generation;
+    handle.function_uid = identity != null && identity.function_uid != 0 ?
+                         identity.function_uid : function_uid;
+    handle.object_id = identity != null && identity.global_function_id != 0 ?
+                       identity.global_function_id : global_function_id;
+    handle.generation = identity != null && identity.generation != 0 ?
+                        identity.generation : generation;
     return handle;
   endfunction
 
@@ -261,9 +273,24 @@ class rdma_function_binding extends uvm_object;
     if (handle == null)
       return 1'b0;
     return handle.kind == RDMA_RESOURCE_FUNCTION &&
-           handle.function_uid == function_uid &&
-           handle.object_id == global_function_id &&
-           handle.generation == generation;
+           handle.function_uid == (identity != null && identity.function_uid != 0 ? identity.function_uid : function_uid) &&
+           handle.object_id == (identity != null && identity.global_function_id != 0 ? identity.global_function_id : global_function_id) &&
+           handle.generation == (identity != null && identity.generation != 0 ? identity.generation : generation);
+  endfunction
+
+  // 返回 detached snapshot，调用方修改结果不会改变 binding 的 authority。
+  function rdma_function_identity function_identity_snapshot();
+    uvm_object cloned_object;
+    rdma_function_identity snapshot;
+    if (identity == null) return null;
+    cloned_object = identity.clone();
+    if (cloned_object == null || !$cast(snapshot, cloned_object))
+      `uvm_fatal("RDMA_COPY_TYPE", "Function identity snapshot clone mismatch")
+    return snapshot;
+  endfunction
+
+  function rdma_reset_epoch_t function_reset_epoch();
+    return identity == null ? 0 : identity.reset_epoch;
   endfunction
 
   function rdma_status validate();
@@ -274,10 +301,26 @@ class rdma_function_binding extends uvm_object;
     if (pcie == null)
       return rdma_status::make(RDMA_SC_INVALID_STATE,
                                "PCIe identity is not instantiated");
+    if (identity != null && identity.function_uid != 0) begin
+      if (identity.function_uid != function_uid ||
+          identity.global_function_id != global_function_id ||
+          identity.generation != generation ||
+          identity.key.bdf.segment != pcie.bdf.segment ||
+          identity.key.bdf.bus != pcie.bdf.bus ||
+          identity.key.bdf.device != pcie.bdf.device ||
+          identity.key.bdf.function_num != pcie.bdf.function_num)
+        return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                                 "Function identity and compatibility mirrors disagree");
+      if (!identity.validate().ok())
+        return identity.validate();
+    end
     if (!queue_dma.pasid_valid && queue_dma.pasid != 0)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "invalid queue PASID must be zero");
-    if (queue_dma.requester_bdf != pcie.bdf)
+    if (queue_dma.requester_bdf.segment != pcie.bdf.segment ||
+        queue_dma.requester_bdf.bus != pcie.bdf.bus ||
+        queue_dma.requester_bdf.device != pcie.bdf.device ||
+        queue_dma.requester_bdf.function_num != pcie.bdf.function_num)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "queue requester BDF does not match PCIe BDF");
     if (queue_caps.min_cq_depth == 0 ||

@@ -7,6 +7,7 @@ package rdma_model_pkg;
   `include "uvm_macros.svh"
 
   `include "rdma_handle.sv"
+  `include "rdma_function_identity.sv"
   `include "rdma_function_binding.sv"
   `include "rdma_dma_request_context.sv"
   `include "rdma_dma_mapping.sv"
@@ -15,6 +16,7 @@ package rdma_model_pkg;
   `include "rdma_queue_lifecycle_models.sv"
   `include "rdma_hw_image.sv"
   `include "rdma_semantic_requests.sv"
+  `include "rdma_queue_txn_types.sv"
   `include "rdma_resources.sv"
   `include "rdma_context_layouts.sv"
   `include "rdma_context_models.sv"

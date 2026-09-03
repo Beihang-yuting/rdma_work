@@ -20,3 +20,25 @@ typedef struct packed {
   bit [15:0] vf_index;
   rdma_bdf_t bdf;
 } rdma_function_key_t;
+
+// 中文说明：reset epoch 是 Function incarnation 的值快照，用于隔离复位前资源。
+typedef longint unsigned rdma_reset_epoch_t;
+
+// 中文说明：PCIe 路由键必须保留 Host/root/segment，避免相同 BDF 跨 fabric 串线。
+typedef struct packed {
+  bit [31:0] host_topology_key;
+  bit [15:0] root_id;
+  bit [15:0] segment;
+  rdma_bdf_t bdf;
+} rdma_route_key_t;
+
+function automatic rdma_route_key_t rdma_route_key_from_function(
+  rdma_function_key_t key
+);
+  rdma_route_key_t route;
+  route.host_topology_key = key.host_topology_key;
+  route.root_id = key.root_id;
+  route.segment = key.bdf.segment;
+  route.bdf = key.bdf;
+  return route;
+endfunction
