@@ -135,17 +135,17 @@ class rdma_queue_txn_evidence extends uvm_object;
     if (aborted || phase == RDMA_QUEUE_TXN_COMPLETED)
       return rdma_status::make(RDMA_SC_INVALID_STATE, "transaction is terminal");
     case (action)
-      RDMA_QUEUE_RECOVERY_RETRY_NO_SUBMIT:
+      RDMA_MODEL_RECOVERY_RETRY_NO_SUBMIT:
         if (mmio_maybe_submitted || phase >= RDMA_QUEUE_TXN_DOORBELL_MAYBE_SUBMITTED ||
             !caller_confirmed_no_submit)
           return rdma_status::make(RDMA_SC_RECOVERY_REQUIRED,
                                    "retry requires confirmed no-submit evidence");
-      RDMA_QUEUE_RECOVERY_FINALIZE_SUBMITTED:
+      RDMA_MODEL_RECOVERY_FINALIZE_SUBMITTED:
         if (!mmio_maybe_submitted || phase < RDMA_QUEUE_TXN_DOORBELL_MAYBE_SUBMITTED ||
             image == null)
           return rdma_status::make(RDMA_SC_INVALID_STATE,
                                    "finalize requires submitted image evidence");
-      RDMA_QUEUE_RECOVERY_ABORT_AND_DETACH:
+      RDMA_MODEL_RECOVERY_ABORT_AND_DETACH:
         aborted = 1'b1;
       default:
         return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "unknown recovery action");
