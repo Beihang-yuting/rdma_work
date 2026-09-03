@@ -69,14 +69,15 @@ localparam bit [7:0] XTR_V1_OP_SRFQC_QUERY = 8'h38;
 localparam bit [7:0] XTR_V1_OP_NOP = 8'h45;
 
 // SQ transport opcode values from xtrdma_wqe_opcode_map_table.
-localparam bit [3:0] XTR_V1_SQ_OPCODE_SEND = 4'd2;
-localparam bit [3:0] XTR_V1_SQ_OPCODE_SEND_WITH_IMM = 4'd3;
-localparam bit [3:0] XTR_V1_SQ_OPCODE_WRITE = 4'd5;
-localparam bit [3:0] XTR_V1_SQ_OPCODE_WRITE_WITH_IMM = 4'd6;
-localparam bit [3:0] XTR_V1_SQ_OPCODE_READ = 4'd7;
-localparam bit [3:0] XTR_V1_SQ_OPCODE_ATOMIC_CMP_AND_SWP = 4'd8;
-localparam bit [3:0] XTR_V1_SQ_OPCODE_ATOMIC_FETCH_AND_ADD = 4'd9;
-localparam bit [3:0] XTR_V1_SQ_OPCODE_LOCAL_INV = 4'd15;
+localparam bit [3:0] XTR_V1_SQ_OPCODE_SEND = 4'd1;
+localparam bit [3:0] XTR_V1_SQ_OPCODE_SEND_WITH_IMM = 4'd2;
+localparam bit [3:0] XTR_V1_SQ_OPCODE_SEND_WITH_INV = 4'd3;
+localparam bit [3:0] XTR_V1_SQ_OPCODE_WRITE = 4'd4;
+localparam bit [3:0] XTR_V1_SQ_OPCODE_WRITE_WITH_IMM = 4'd5;
+localparam bit [3:0] XTR_V1_SQ_OPCODE_READ = 4'd6;
+localparam bit [3:0] XTR_V1_SQ_OPCODE_ATOMIC_CMP_AND_SWP = 4'd7;
+localparam bit [3:0] XTR_V1_SQ_OPCODE_ATOMIC_FETCH_AND_ADD = 4'd8;
+localparam bit [3:0] XTR_V1_SQ_OPCODE_LOCAL_INV = 4'd14;
 
 localparam int unsigned XTR_V1_QPC_MODIFY_STATE_ONLY = 0;
 localparam int unsigned XTR_V1_QPC_MODIFY_FULL = 1;

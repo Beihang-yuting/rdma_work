@@ -924,6 +924,14 @@ localparam bit [63:0] XTR_V1_WINDOW = 64'h2000;
                 CHECKER.REFERENCE_FIELDS,
             )
 
+    def test_unrelated_identical_source_duplicate_is_fatal(self) -> None:
+        with self.assertRaisesRegex(CHECKER.ValidationError, "duplicated"):
+            CHECKER.require_unique_expression(
+                {"XTRDMA_SQ_WQE_QPN": ["GENMASK(20, 0)", "GENMASK(20, 0)"]},
+                "XTRDMA_SQ_WQE_QPN",
+                "wr.h",
+            )
+
     def test_modify_data_source_exception_requires_exact_quartet(self) -> None:
         validate = CHECKER.validate_mapping_uniqueness
         symbol = "XTRDMA_CMQSQ_WQE_MODIFY_DATA"
@@ -1807,9 +1815,15 @@ class ReferenceEncodingTest(unittest.TestCase):
             CHECKER.put_named = original_put_named
         self.assertGreater(len(used_stems), 95)
         task11_audit_only = set(Task11DefinitionTest.TASK11_FIELDS)
+        sq_audit_only = {
+            reference.sv_stem
+            for reference in references
+            if reference.sv_stem.startswith("XTR_V1_SQ_")
+            and reference.sv_stem not in used_stems
+        }
         self.assertTrue(task11_audit_only <= set(reference_stems))
         self.assertEqual(
-            set(used_stems), set(reference_stems) - task11_audit_only
+            set(used_stems), set(reference_stems) - task11_audit_only - sq_audit_only
         )
 
     def test_reference_cases_have_stable_contract(self) -> None:
@@ -2296,6 +2310,55 @@ class ReferenceEncodingTest(unittest.TestCase):
         self.assertIn("XTR_V1_SQ_WQE_UD_DST_IP", fields)
         self.assertTrue((CHECKER.GOLDEN_DIR / "sq.hex").exists())
         CHECKER.validate_sq_golden_vectors()
+
+    def test_sq_opcodes_are_pinned_to_wr_h_enum(self) -> None:
+        constants = CHECKER.parse_sv_constants(CHECKER.SV_DEFS_PATH.read_text())
+        expected = {
+            "XTR_V1_SQ_OPCODE_SEND": 1,
+            "XTR_V1_SQ_OPCODE_SEND_WITH_IMM": 2,
+            "XTR_V1_SQ_OPCODE_SEND_WITH_INV": 3,
+            "XTR_V1_SQ_OPCODE_WRITE": 4,
+            "XTR_V1_SQ_OPCODE_WRITE_WITH_IMM": 5,
+            "XTR_V1_SQ_OPCODE_READ": 6,
+            "XTR_V1_SQ_OPCODE_ATOMIC_CMP_AND_SWP": 7,
+            "XTR_V1_SQ_OPCODE_ATOMIC_FETCH_AND_ADD": 8,
+            "XTR_V1_SQ_OPCODE_LOCAL_INV": 14,
+        }
+        self.assertEqual({name: constants.get(name) for name in expected}, expected)
+
+    def test_sq_masks_reject_reserved_bits(self) -> None:
+        masks = CHECKER.parse_sv_masks(CHECKER.SV_MASKS_PATH.read_text())
+        self.assertEqual(masks["XTR_V1_SQ_WQE_HEADER_MASK"][0], 0xEFFFFFFFFFFFFFFF)
+        self.assertEqual(
+            masks["XTR_V1_SQ_WQE_RC_BODY_MASK"],
+            (0, 0xFFFFFFFFFFFFFFFF, 0xFF00FFFF00000000, 0xFFFFFFFFFFFFFFFF,
+             0xFFFFFFFFFFFFFE00, 0, 0, 0),
+        )
+        self.assertEqual(
+            masks["XTR_V1_SQ_WQE_UD_BODY_MASK"][1], 0xFFFFFFFFFEFFFFFF,
+        )
+        self.assertEqual(
+            masks["XTR_V1_SQ_WQE_ATOMIC_BODY_MASK"],
+            (0, 0xFFFFFFFF, 0xFF00FFFF00000000, 0xFFFFFFFFFFFFFFFF,
+             0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF,
+             0xFFFFFFFFFFFFFFFF),
+        )
+
+    def test_sq_golden_cases_have_operation_specific_images(self) -> None:
+        cases = CHECKER.parse_golden_text((CHECKER.GOLDEN_DIR / "sq.hex").read_text())
+        by_name = {case.name: case for case in cases}
+        self.assertGreaterEqual(len(cases), 18)
+        self.assertGreater(len({case.payload for case in cases if case.name != "sgb_boundary"}), 10)
+        self.assertNotEqual(by_name["rc_inline_1"].payload, by_name["atomic_cas"].payload)
+        self.assertNotEqual(by_name["ud_inline"].payload, by_name["ud_sgb"].payload)
+        self.assertEqual(
+            int.from_bytes(by_name["send_with_imm"].payload[:8], "big") >> 32 & 0xF,
+            2,
+        )
+        self.assertEqual(
+            int.from_bytes(by_name["atomic_cas"].payload[:8], "big") >> 32 & 0xF,
+            7,
+        )
 
     def test_golden_summaries_list_every_participating_input(self) -> None:
         cases = CHECKER.build_golden_cases()

@@ -195,6 +195,18 @@ qwords. Common header fields occupy byte 0; RC/atomic extensions occupy bytes
 | `XTRDMA_SQ_WQE_SGB_PA` | `XTR_V1_SQ_WQE_SGB_PA` | 32 | 9 | 55 |
 | `XTRDMA_SQ_WQE_UD_DMAC` | `XTR_V1_SQ_WQE_UD_DMAC` | 16 | 0 | 48 |
 
+The SQ opcode values are the implicit ordinal values of
+`enum xtrdma_sq_wqe_opcode` in `wr.h`: `SEND=1`, `SEND_WITH_IMM=2`,
+`SEND_WITH_INV=3`, `WRITE=4`, `WRITE_WITH_IMM=5`, `READ=6`,
+`ATOMIC_CMP_AND_SWP=7`, `ATOMIC_FETCH_AND_ADD=8`, and `LOCAL_INV=14`.
+The checker maps each ordinal to its `XTR_V1_SQ_OPCODE_*` constant and rejects
+value drift. The transport-neutral header mask leaves bit 60 for the
+inline-mode selector; `XTR_V1_SQ_WQE_INLINE_HEADER_MASK` admits that selector.
+RC body masks distinguish the common immediate/remote portion from the
+direct/inline/SGB payload region. Atomic FAA uses
+`XTR_V1_SQ_WQE_ATOMIC_FAA_BODY_MASK`, which reserves qword 7; CAS retains that
+qword for the compare value. UD qword 1 bit 25 remains reserved.
+
 - QPC is 512 bytes (`XTRDMA_QP_CONTEXT_SIZE`), CQC is 64 bytes
   (`XTRDMA_CQ_CONTEXT_SIZE`), and CMQE/WQE are 64 bytes.
 - The QPC destination-IP byte range is independently frozen and checked as

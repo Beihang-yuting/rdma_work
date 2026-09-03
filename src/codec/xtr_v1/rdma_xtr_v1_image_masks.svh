@@ -134,19 +134,40 @@ localparam bit [63:0] XTR_V1_SQ_WQE_HEADER_MASK [0:7] = '{
   64'hefffffffffffffff, 64'h0, 64'h0, 64'h0,
   64'h0, 64'h0, 64'h0, 64'h0
 };
+// Inline mode owns the selector bit (bit 60) that is reserved in the
+// transport-neutral header mask above.
+localparam bit [63:0] XTR_V1_SQ_WQE_INLINE_HEADER_MASK [0:7] = '{
+  64'hffffffffffffffff, 64'h0, 64'h0, 64'h0,
+  64'h0, 64'h0, 64'h0, 64'h0
+};
 localparam bit [63:0] XTR_V1_SQ_WQE_RC_BODY_MASK [0:7] = '{
-  64'h0, 64'hffffffffffffffff, 64'hffff0000ffffffff,
+  64'h0, 64'hffffffffffffffff, 64'hff00ffff00000000,
   64'hffffffffffffffff, 64'hfffffffffffffe00, 64'h0, 64'h0, 64'h0
 };
+localparam bit [63:0] XTR_V1_SQ_WQE_RC_INLINE_BODY_MASK [0:7] = '{
+  64'h0, 64'hffffffffffffffff, 64'hff00ffff00000000,
+  64'hffffffffffffffff, 64'hffffffffffffffff, 64'hffffffffffffffff,
+  64'hffffffffffffffff, 64'hffffffffffffffff
+};
+localparam bit [63:0] XTR_V1_SQ_WQE_RC_DIRECT_SGE_BODY_MASK [0:7] = '{
+  64'h0, 64'hffffffffffffffff, 64'hff00ffff00000000,
+  64'hffffffffffffffff, 64'hffffffffffffffff, 64'hffffffffffffffff,
+  64'hffffffffffffffff, 64'hffffffffffffffff
+};
 localparam bit [63:0] XTR_V1_SQ_WQE_UD_BODY_MASK [0:7] = '{
-  64'h0, 64'hffffffffffffffff, 64'hffffffffffffffff,
+  64'h0, 64'hfffffffffeffffff, 64'hffffffffffffffff,
   64'hffffffffffffffff, 64'hffffffffffffffff, 64'hffffffffffffffff,
   64'hffffffffffffffff, 64'hffffffffffffffff
 };
 localparam bit [63:0] XTR_V1_SQ_WQE_ATOMIC_BODY_MASK [0:7] = '{
-  64'h0, 64'hffffffffffffffff, 64'hffffffffffffffff,
+  64'h0, 64'h00000000ffffffff, 64'hff00ffff00000000,
   64'hffffffffffffffff, 64'hffffffffffffffff, 64'hffffffffffffffff,
   64'hffffffffffffffff, 64'hffffffffffffffff
+};
+localparam bit [63:0] XTR_V1_SQ_WQE_ATOMIC_FAA_BODY_MASK [0:7] = '{
+  64'h0, 64'h00000000ffffffff, 64'hff00ffff00000000,
+  64'hffffffffffffffff, 64'hffffffffffffffff, 64'hffffffffffffffff,
+  64'hffffffffffffffff, 64'h0
 };
 
 function automatic bit [63:0] request_envelope_mask(

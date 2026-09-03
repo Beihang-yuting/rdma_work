@@ -653,6 +653,7 @@ FIELD_MAPPINGS = (
     FieldMapping("wr.h", "XTRDMA_SQ_WQE_UD_DST_IPV6_H", "XTR_V1_SQ_WQE_UD_DST_IPV6_H", 56),
     FieldMapping("wr.h", "XTRDMA_SQ_WQE_UD_HOPLIMIT", "XTR_V1_SQ_WQE_UD_HOPLIMIT", 40),
     FieldMapping("wr.h", "XTRDMA_SQ_WQE_UD_DST_QPN", "XTR_V1_SQ_WQE_UD_DST_QPN", 40),
+    FieldMapping("wr.h", "XTRDMA_SQ_WQE_UD_DST_Q_KEY", "XTR_V1_SQ_WQE_UD_DST_Q_KEY", 40),
     FieldMapping("wr.h", "XTRDMA_SQ_WQE_UD_MC", "XTR_V1_SQ_WQE_UD_MC", 32),
     FieldMapping("wr.h", "XTRDMA_SQ_WQE_UD_TRAFFIC_CLASS", "XTR_V1_SQ_WQE_UD_TRAFFIC_CLASS", 32),
     FieldMapping("wr.h", "XTRDMA_SQ_WQE_UD_PRI", "XTR_V1_SQ_WQE_UD_PRI", 24),
@@ -823,6 +824,16 @@ VALUE_MAPPINGS = (
     ValueMapping("qp.h", "XTRDMA_DB_RTS2SQD", "XTR_V1_DB_TYPE_RTS2SQD"),
     ValueMapping("qp.h", "XTRDMA_DB_SQD2RTS", "XTR_V1_DB_TYPE_SQD2RTS"),
     ValueMapping("eth_header/register.h", "QSCH_G2P_DPORT_NODE_MODE", "XTR_V1_TX_FLUSH_DST_PORT"),
+    # SQ WQE opcodes are implicit values in wr.h's xtrdma_sq_wqe_opcode enum.
+    ValueMapping("wr.h", "XTRDMA_WQE_SEND", "XTR_V1_SQ_OPCODE_SEND"),
+    ValueMapping("wr.h", "XTRDMA_WQE_SEND_WITH_IMM", "XTR_V1_SQ_OPCODE_SEND_WITH_IMM"),
+    ValueMapping("wr.h", "XTRDMA_WQE_SEND_WITH_INV", "XTR_V1_SQ_OPCODE_SEND_WITH_INV"),
+    ValueMapping("wr.h", "XTRDMA_WQE_WRITE", "XTR_V1_SQ_OPCODE_WRITE"),
+    ValueMapping("wr.h", "XTRDMA_WQE_WRITE_WITH_IMM", "XTR_V1_SQ_OPCODE_WRITE_WITH_IMM"),
+    ValueMapping("wr.h", "XTRDMA_WQE_READ", "XTR_V1_SQ_OPCODE_READ"),
+    ValueMapping("wr.h", "XTRDMA_WQE_ATOMIC_CMP_AND_SWP", "XTR_V1_SQ_OPCODE_ATOMIC_CMP_AND_SWP"),
+    ValueMapping("wr.h", "XTRDMA_WQE_ATOMIC_FETCH_AND_ADD", "XTR_V1_SQ_OPCODE_ATOMIC_FETCH_AND_ADD"),
+    ValueMapping("wr.h", "XTRDMA_WQE_LOCAL_INV", "XTR_V1_SQ_OPCODE_LOCAL_INV"),
     # Explicit enum values needed by the next CMQ/error-code codecs.
     ValueMapping("cmq.h", "XTRDMA_OP_QPC_CREATE", "XTR_V1_OP_QPC_CREATE"),
     ValueMapping("cmq.h", "XTRDMA_OP_QPC_MODIFY", "XTR_V1_OP_QPC_MODIFY"),
@@ -1351,44 +1362,216 @@ def parse_sq_field_mappings(text: str) -> dict[str, tuple[str, str, int, int]]:
             raise ValidationError(f"invalid SQ field coordinates: {stem}")
         declared[stem] = (word, lsb, width)
     mappings = {m.sv_stem: m for m in FIELD_MAPPINGS if m.sv_stem.startswith("XTR_V1_SQ_")}
+    references = {r.sv_stem: r for r in REFERENCE_FIELDS if r.sv_stem.startswith("XTR_V1_SQ_")}
     missing = sorted(set(mappings) - set(declared))
     if missing:
         raise ValidationError(f"SQ field mapping missing: {missing}")
-    result = {stem: (mappings[stem].path, mappings[stem].c_symbol, lsb, width)
-            for stem, (_, lsb, width) in declared.items() if stem in mappings}
-    result.update({stem: ("wr.h", "XTRDMA_SQ_WQE_UD_DST_Q_KEY", lsb, width)
-                   for stem, (_, lsb, width) in declared.items()
-                   if stem == "XTR_V1_SQ_WQE_UD_DST_Q_KEY"})
-    return result | {
-                "XTR_V1_SQ_WQE_UD_DST_IP": ("wr.h", "XTRDMA_SQ_WQE_UD_DST_IPV6_L", 0, 64)
-            }
+    extra = sorted(set(declared) - set(mappings))
+    if extra:
+        raise ValidationError(f"unexpected SQ field mapping: {extra}")
+    for stem, (word, lsb, width) in declared.items():
+        mapping = mappings[stem]
+        reference = references.get(stem)
+        if word != mapping.word_byte_offset:
+            raise ValidationError(f"SQ field byte offset drift: {stem}")
+        if reference is None or (lsb, width) != (reference.lsb, reference.width):
+            raise ValidationError(f"SQ field coordinate drift: {stem}")
+    return {
+        stem: (mappings[stem].path, mappings[stem].c_symbol, lsb, width)
+        for stem, (_, lsb, width) in declared.items()
+    } | {
+        # The 16-byte destination-IP memcpy is represented by the two
+        # independently mapped IPv6 qwords; this name is a convenience alias
+        # for callers that treat the raw range as one field.
+        "XTR_V1_SQ_WQE_UD_DST_IP": ("wr.h", "XTRDMA_SQ_WQE_UD_DST_IPV6_L", 0, 64)
+    }
+
+
+def _sq_header(
+    image: ReferenceImage,
+    opcode: int,
+    *,
+    inline: bool = False,
+    se: bool = False,
+    index: int = 0x1234,
+) -> None:
+    """Populate the common SQE header using the pinned logical coordinates."""
+    put_named(image, "XTR_V1_SQ_WQE_QPN", 0x15555)
+    put_named(image, "XTR_V1_SQ_WQE_ICOS", 5)
+    put_named(image, "XTR_V1_SQ_WQE_QP_SN", 0xA6)
+    put_named(image, "XTR_V1_SQ_WQE_OPCODE", opcode)
+    put_named(image, "XTR_V1_SQ_WQE_DST_PORT", 11)
+    put_named(image, "XTR_V1_SQ_WQE_INDEX", index)
+    put_named(image, "XTR_V1_SQ_WQE_WRAP", 0)
+    put_named(image, "XTR_V1_SQ_WQE_SIGN_EN", 1)
+    put_named(image, "XTR_V1_SQ_WQE_SE", int(se))
+    put_named(image, "XTR_V1_SQ_WQE_FENCE", 0)
+    put_named(image, "XTR_V1_SQ_WQE_INLINE_LOCAL_QPC_RD", int(inline))
+    put_named(image, "XTR_V1_SQ_WQE_CE", 1)
+    put_named(image, "XTR_V1_SQ_WQE_VALID", 1)
+
+
+def _sq_sge(sgb: ReferenceImage, slot: int, length: int, lkey: int, iova: int) -> None:
+    """Encode one 16-byte SGE in the driver's two-qword format."""
+    if slot < 0 or slot >= 32:
+        raise ValidationError("SQ SGB slot is outside the 512-byte image")
+    base = slot * 16 * 8
+    put_field(sgb, base + 32, 32, length if length != (1 << 31) else 0)
+    put_field(sgb, base, 32, lkey)
+    put_field(sgb, base + 64, 64, iova)
+
+
+def _build_sq_golden_cases() -> tuple[list[GoldenCase], dict[str, bytes]]:
+    """Build operation-specific SQE/SGB vectors from the pinned coordinates."""
+    cases: list[GoldenCase] = []
+    sgb_images: dict[str, bytes] = {"sgb_boundary": bytes(512)}
+    sgb_iova = 0x20000  # 512-byte aligned address used by the SGB pointer field.
+
+    def add(name: str, summary: str, image: ReferenceImage, sgb: bytes | None = None) -> None:
+        cases.append(GoldenCase(name, parse_input_summary(summary), bytes(image)))
+        if sgb is not None:
+            sgb_images[name] = sgb
+
+    def rc_payload(name: str, length: int, *, opcode: int = 1, inline: bool = True,
+                   immediate: int | None = None, remote: bool = False) -> None:
+        image = ReferenceImage(64)
+        _sq_header(image, opcode, inline=inline, se=opcode in (1, 2, 5), index=length + 0x1200)
+        put_named(image, "XTR_V1_SQ_WQE_RC_TOTAL_PAYLOAD_LEN", length)
+        put_named(image, "XTR_V1_SQ_WQE_SIGNATURE", 0)
+        put_named(image, "XTR_V1_SQ_WQE_RC_SGE_NUM", 0)
+        if immediate is not None:
+            put_named(image, "XTR_V1_SQ_WQE_RC_IMMEDIATE", immediate)
+        if remote:
+            put_named(image, "XTR_V1_SQ_WQE_RC_REMOTE_KEY", 0xDEADBEEF)
+            put_named(image, "XTR_V1_SQ_WQE_RC_REMOTE_VA", 0x0123456789ABCDEF)
+        sgb: bytes | None = None
+        if inline and length <= 32:
+            image[32:32 + length] = bytes((0xA0 + i) & 0xFF for i in range(length))
+        elif inline:
+            put_named(image, "XTR_V1_SQ_WQE_SGB_PA", sgb_iova)
+            sgb = bytes((0xA0 + i) & 0xFF for i in range(length)) + bytes(512 - length)
+        add(name, f"case={name},opcode={opcode},length={length},mode={'inline' if inline else 'direct'}", image, sgb)
+
+    rc_payload("sqe_rc_boundary", 1)
+    rc_payload("rc_inline_1", 1)
+    rc_payload("rc_inline_32", 32)
+    rc_payload("rc_inline_33", 33)
+    rc_payload("rc_inline_512", 512)
+
+    def direct_sge(name: str, count: int) -> None:
+        image = ReferenceImage(64)
+        _sq_header(image, 1, inline=False, se=True, index=0x1300 + count)
+        put_named(image, "XTR_V1_SQ_WQE_RC_TOTAL_PAYLOAD_LEN", count * 8)
+        put_named(image, "XTR_V1_SQ_WQE_SIGNATURE", 0)
+        put_named(image, "XTR_V1_SQ_WQE_RC_SGE_NUM", count)
+        for slot in range(count):
+            base = 32 + slot * 16
+            put_field(image, base * 8 + 32, 32, 8)
+            put_field(image, base * 8, 32, 0x1000 + slot)
+            put_field(image, (base + 8) * 8, 64, 0x100000 + slot * 8)
+        add(name, f"case={name},opcode=1,count={count},mode=direct", image)
+
+    direct_sge("rc_sge_direct_1", 1)
+    direct_sge("rc_sge_direct_2", 2)
+
+    def sgb_sge(name: str, count: int) -> None:
+        image = ReferenceImage(64)
+        _sq_header(image, 1, inline=False, se=True, index=0x1400 + count)
+        put_named(image, "XTR_V1_SQ_WQE_RC_TOTAL_PAYLOAD_LEN", count * 8)
+        put_named(image, "XTR_V1_SQ_WQE_SIGNATURE", 0)
+        put_named(image, "XTR_V1_SQ_WQE_RC_SGE_NUM", count)
+        put_named(image, "XTR_V1_SQ_WQE_SGB_PA", sgb_iova)
+        sgb = ReferenceImage(512)
+        for slot in range(count):
+            _sq_sge(sgb, slot, 8, 0x2000 + slot, 0x200000 + slot * 8)
+        add(name, f"case={name},opcode=1,count={count},mode=sgb", image, bytes(sgb))
+
+    sgb_sge("rc_sge_sgb_3", 3)
+    sgb_sge("rc_sge_sgb_32", 32)
+    rc_payload("send_with_imm", 4, opcode=2, immediate=0x89ABCDEF)
+    rc_payload("write_with_imm", 8, opcode=5, immediate=0x10203040, remote=True)
+    rc_payload("read", 8, opcode=6, inline=False, remote=True)
+
+    image = ReferenceImage(64)
+    _sq_header(image, 14, inline=False, index=0x1500)
+    put_named(image, "XTR_V1_SQ_WQE_LOCAL_INVLD_STAG", 0xCAFEBABE)
+    add("local_invalidate", "case=local_invalidate,opcode=14,mode=none", image)
+
+    def atomic(name: str, opcode: int, cas: bool) -> None:
+        image = ReferenceImage(64)
+        _sq_header(image, opcode, inline=False, index=0x1600 + int(cas))
+        put_named(image, "XTR_V1_SQ_WQE_RC_TOTAL_PAYLOAD_LEN", 8)
+        put_named(image, "XTR_V1_SQ_WQE_SIGNATURE", 0)
+        put_named(image, "XTR_V1_SQ_WQE_ATOMIC_SGE_NUM", 1)
+        put_named(image, "XTR_V1_SQ_WQE_ATOMIC_R_KEY", 0x12345678)
+        put_named(image, "XTR_V1_SQ_WQE_ATOMIC_R_VA", 0x200000)
+        put_named(image, "XTR_V1_SQ_WQE_ATOMIC_L_LEN", 8)
+        put_named(image, "XTR_V1_SQ_WQE_ATOMIC_L_KEY", 0x87654321)
+        put_named(image, "XTR_V1_SQ_WQE_ATOMIC_L_VA", 0x300000)
+        if cas:
+            put_named(image, "XTR_V1_SQ_WQE_ATOMIC_CAS_SWAP_DATA", 0x1111222233334444)
+            put_named(image, "XTR_V1_SQ_WQE_ATOMIC_CAS_CMP_DATA", 0x5555666677778888)
+        else:
+            put_named(image, "XTR_V1_SQ_WQE_ATOMIC_FAA_ADD_DATA", 0x1111222233334444)
+        add(name, f"case={name},opcode={opcode},length=8,mode=atomic", image)
+
+    atomic("atomic_cas", 7, True)
+    atomic("atomic_faa", 8, False)
+
+    def ud(name: str, with_sgb: bool) -> None:
+        image = ReferenceImage(64)
+        _sq_header(image, 1, inline=not with_sgb, se=True, index=0x1700 + int(with_sgb))
+        put_named(image, "XTR_V1_SQ_WQE_UD_TOTAL_PAYLOAD_LEN", 8 if with_sgb else 0)
+        put_named(image, "XTR_V1_SQ_WQE_UD_SGE_NUM", 1 if with_sgb else 0)
+        put_named(image, "XTR_V1_SQ_WQE_UD_DMAC", 0xA1B2C3D4E5F6)
+        put_named(image, "XTR_V1_SQ_WQE_UD_PRI", 5)
+        put_named(image, "XTR_V1_SQ_WQE_UD_CFI", 1)
+        put_named(image, "XTR_V1_SQ_WQE_UD_VLAN_ID", 0x789)
+        put_named(image, "XTR_V1_SQ_WQE_UD_PD_IDX", 0x1234)
+        put_named(image, "XTR_V1_SQ_WQE_UD_FLOW_LABEL", 0x54321)
+        put_named(image, "XTR_V1_SQ_WQE_UD_SRC_ADDR_IDX", 0xABC)
+        put_named(image, "XTR_V1_SQ_WQE_UD_MC", 1)
+        put_named(image, "XTR_V1_SQ_WQE_UD_TRAFFIC_CLASS", 0xAC)
+        put_named(image, "XTR_V1_SQ_WQE_UD_HOPLIMIT", 0x7F)
+        put_named(image, "XTR_V1_SQ_WQE_UD_DST_QPN", 0xABCDEF)
+        put_named(image, "XTR_V1_SQ_WQE_UD_DST_Q_KEY", 0x89ABCDEF)
+        put_named(image, "XTR_V1_SQ_WQE_UD_DST_VPORT_ID", 0x456)
+        put_named(image, "XTR_V1_SQ_WQE_UD_FWD", 2)
+        put_named(image, "XTR_V1_SQ_WQE_UD_LAG", 1)
+        put_named(image, "XTR_V1_SQ_WQE_UD_TUNNEL", 0)
+        put_named(image, "XTR_V1_SQ_WQE_UD_IPV6", 1)
+        put_named(image, "XTR_V1_SQ_WQE_UD_VLAN", 1)
+        put_named(image, "XTR_V1_SQ_WQE_SIGNATURE", 0)
+        if with_sgb:
+            put_named(image, "XTR_V1_SQ_WQE_SGB_PA", sgb_iova)
+            sgb = ReferenceImage(512)
+            _sq_sge(sgb, 0, 8, 0x3333, 0x400000)
+            sgb_bytes = bytes(sgb)
+        else:
+            sgb_bytes = None
+        # wr.c uses memcpy for the destination IP, preserving byte order.
+        image[48:64] = bytes.fromhex("20010db8000000000000000000000001")
+        add(name, f"case={name},opcode=1,length={8 if with_sgb else 0},mode={'sgb' if with_sgb else 'inline'}", image, sgb_bytes)
+
+    ud("ud_inline", False)
+    ud("ud_sgb", True)
+    return cases, sgb_images
 
 
 def sq_reference_image(case_name: str = "sqe_rc_boundary") -> bytes:
-    """Return a frozen SQE reference image generated from named coordinates."""
-    for case in build_golden_cases().get("queue", []):
+    """Return an operation-specific SQE reference image."""
+    for case in _build_sq_golden_cases()[0]:
         if case.name == case_name:
             return case.payload
-    aliases = {
-        "rc_inline_1", "rc_inline_32", "rc_inline_33", "rc_inline_512",
-        "rc_sge_direct_1", "rc_sge_direct_2", "rc_sge_sgb_3", "rc_sge_sgb_32",
-        "send_with_imm", "write_with_imm", "read", "local_invalidate", "atomic_cas", "atomic_faa",
-        "ud_inline", "ud_sgb",
-    }
-    if case_name in aliases:
-        return sq_reference_image("sqe_rc_boundary")
     raise ValidationError(f"unknown SQ golden case: {case_name}")
 
 
-def sq_reference_sgb(case_name: str = "sqe_rc_boundary") -> bytes:
-    """Return the deterministic zero-filled SGB reference for a SQ case."""
-    if case_name == "sgb_boundary":
-        return bytes(512)
-    if case_name not in {c.name for c in build_golden_cases().get("queue", [])} and case_name not in {
-        "rc_sge_sgb_3", "rc_sge_sgb_32", "ud_sgb"
-    }:
-        raise ValidationError(f"unknown SQ golden case: {case_name}")
-    return bytes(512)
+def sq_reference_sgb(case_name: str = "sgb_boundary") -> bytes:
+    """Return the detached 512-byte SGB image for a named SQ case."""
+    sgb = _build_sq_golden_cases()[1]
+    if case_name not in sgb:
+        raise ValidationError(f"unknown SQ SGB case: {case_name}")
+    return sgb[case_name]
 
 
 def validate_sq_golden_vectors() -> None:
@@ -1396,12 +1579,15 @@ def validate_sq_golden_vectors() -> None:
     if not path.is_file():
         raise ValidationError(f"SQ golden file missing: {path.relative_to(REPO_ROOT)}")
     parsed = parse_golden_text(path.read_text())
-    names = ["sqe_rc_boundary", "rc_inline_1", "rc_inline_32", "rc_inline_33", "rc_inline_512",
-             "rc_sge_direct_1", "rc_sge_direct_2", "rc_sge_sgb_3", "rc_sge_sgb_32",
-             "send_with_imm", "write_with_imm", "read", "local_invalidate", "atomic_cas", "atomic_faa",
-             "ud_inline", "ud_sgb"]
-    expected = [GoldenCase(name, parse_input_summary(f"case={name}"), sq_reference_image(name)) for name in names]
-    expected.append(GoldenCase("sgb_boundary", parse_input_summary("case=sgb_boundary"), sq_reference_sgb()))
+    expected, sgb_images = _build_sq_golden_cases()
+    # Keep detached SGB images in the same strict golden grammar so descriptor
+    # placement and inline payload bytes are independently authenticated.
+    for name in ("rc_inline_33", "rc_inline_512", "rc_sge_sgb_3",
+                 "rc_sge_sgb_32", "ud_sgb"):
+        expected.append(
+            GoldenCase(f"{name}_sgb", parse_input_summary(f"case={name}_sgb"), sgb_images[name])
+        )
+    expected.append(GoldenCase("sgb_boundary", parse_input_summary("case=sgb_boundary"), sgb_images["sgb_boundary"]))
     if parsed != expected:
         raise ValidationError("SQ golden vectors differ from generated references")
 
@@ -1686,6 +1872,12 @@ def require_unique_expression(
     if not expressions:
         raise ValidationError(f"mapped symbol {symbol} missing from {source_path}")
     if len(expressions) != 1:
+        # wr.h in the pinned driver repeats UD_DST_Q_KEY verbatim. Keep this
+        # exception scoped to that audited source identity; every other
+        # duplicate remains a fail-closed mapping error.
+        if (source_path == "wr.h" and symbol == "XTRDMA_SQ_WQE_UD_DST_Q_KEY"
+                and len(set(expressions)) == 1):
+            return expressions[0]
         raise ValidationError(f"mapped symbol {symbol} is duplicated in {source_path}")
     return expressions[0]
 
@@ -2131,6 +2323,43 @@ REFERENCE_FIELDS = (
     ReferenceField("wr.h", "XTRDMA_SQ_WQE_SIGNATURE", "XTR_V1_SQ_WQE_SIGNATURE", 16, 56, 8),
     ReferenceField("wr.h", "XTRDMA_SQ_WQE_RC_SGE_NUM", "XTR_V1_SQ_WQE_RC_SGE_NUM", 16, 48, 8),
     ReferenceField("wr.h", "XTRDMA_SQ_WQE_RC_REMOTE_VA", "XTR_V1_SQ_WQE_RC_REMOTE_VA", 24, 0, 64),
+    ReferenceField("wr.h", "XTRDMA_SQ_WQE_INLINE_LOCAL_QPC_RD", "XTR_V1_SQ_WQE_INLINE_LOCAL_QPC_RD", 0, 60, 1),
+    ReferenceField("wr.h", "XTRDMA_SQ_WQE_SGB_PA", "XTR_V1_SQ_WQE_SGB_PA", 32, 9, 55),
+    ReferenceField("wr.h", "XTRDMA_SQ_WQE_RC_TOTAL_PAYLOAD_LEN", "XTR_V1_SQ_WQE_RC_TOTAL_PAYLOAD_LEN", 8, 0, 32),
+    ReferenceField("wr.h", "XTRDMA_SQ_WQE_IMMDT_INVLD_RKEY", "XTR_V1_SQ_WQE_RC_IMMEDIATE", 8, 32, 32),
+    ReferenceField("wr.h", "XTRDMA_SQ_WQE_LOCAL_INVLD_STAG", "XTR_V1_SQ_WQE_LOCAL_INVLD_STAG", 8, 32, 32),
+    ReferenceField("wr.h", "XTRDMA_SQ_WQE_ATOMIC_SGE_NUM", "XTR_V1_SQ_WQE_ATOMIC_SGE_NUM", 16, 48, 8),
+    ReferenceField("wr.h", "XTRDMA_SQ_WQE_ATOMIC_R_KEY", "XTR_V1_SQ_WQE_ATOMIC_R_KEY", 16, 0, 32),
+    ReferenceField("wr.h", "XTRDMA_SQ_WQE_ATOMIC_R_VA", "XTR_V1_SQ_WQE_ATOMIC_R_VA", 24, 0, 64),
+    ReferenceField("wr.h", "XTRDMA_SQ_WQE_ATOMIC_L_LEN", "XTR_V1_SQ_WQE_ATOMIC_L_LEN", 32, 32, 32),
+    ReferenceField("wr.h", "XTRDMA_SQ_WQE_ATOMIC_L_KEY", "XTR_V1_SQ_WQE_ATOMIC_L_KEY", 32, 0, 32),
+    ReferenceField("wr.h", "XTRDMA_SQ_WQE_ATOMIC_L_VA", "XTR_V1_SQ_WQE_ATOMIC_L_VA", 40, 0, 64),
+    ReferenceField("wr.h", "XTRDMA_SQ_WQE_ATOMIC_FAA_ADD_DATA", "XTR_V1_SQ_WQE_ATOMIC_FAA_ADD_DATA", 48, 0, 64),
+    ReferenceField("wr.h", "XTRDMA_SQ_WQE_ATOMIC_CAS_SWAP_DATA", "XTR_V1_SQ_WQE_ATOMIC_CAS_SWAP_DATA", 48, 0, 64),
+    ReferenceField("wr.h", "XTRDMA_SQ_WQE_ATOMIC_CAS_CMP_DATA", "XTR_V1_SQ_WQE_ATOMIC_CAS_CMP_DATA", 56, 0, 64),
+    ReferenceField("wr.h", "XTRDMA_SQ_WQE_UD_DST_IPV4", "XTR_V1_SQ_WQE_UD_DST_IPV4", 48, 0, 32),
+    ReferenceField("wr.h", "XTRDMA_SQ_WQE_UD_DST_IPV6_L", "XTR_V1_SQ_WQE_UD_DST_IPV6_L", 48, 0, 64),
+    ReferenceField("wr.h", "XTRDMA_SQ_WQE_UD_DST_IPV6_H", "XTR_V1_SQ_WQE_UD_DST_IPV6_H", 56, 0, 64),
+    ReferenceField("wr.h", "XTRDMA_SQ_WQE_UD_HOPLIMIT", "XTR_V1_SQ_WQE_UD_HOPLIMIT", 40, 56, 8),
+    ReferenceField("wr.h", "XTRDMA_SQ_WQE_UD_DST_QPN", "XTR_V1_SQ_WQE_UD_DST_QPN", 40, 32, 24),
+    ReferenceField("wr.h", "XTRDMA_SQ_WQE_UD_DST_Q_KEY", "XTR_V1_SQ_WQE_UD_DST_Q_KEY", 40, 0, 32),
+    ReferenceField("wr.h", "XTRDMA_SQ_WQE_UD_MC", "XTR_V1_SQ_WQE_UD_MC", 32, 8, 1),
+    ReferenceField("wr.h", "XTRDMA_SQ_WQE_UD_TRAFFIC_CLASS", "XTR_V1_SQ_WQE_UD_TRAFFIC_CLASS", 32, 0, 8),
+    ReferenceField("wr.h", "XTRDMA_SQ_WQE_UD_PRI", "XTR_V1_SQ_WQE_UD_PRI", 24, 61, 3),
+    ReferenceField("wr.h", "XTRDMA_SQ_WQE_UD_CFI", "XTR_V1_SQ_WQE_UD_CFI", 24, 60, 1),
+    ReferenceField("wr.h", "XTRDMA_SQ_WQE_UD_VLAN_ID", "XTR_V1_SQ_WQE_UD_VLAN_ID", 24, 48, 12),
+    ReferenceField("wr.h", "XTRDMA_SQ_WQE_UD_PD_IDX", "XTR_V1_SQ_WQE_UD_PD_IDX", 24, 32, 16),
+    ReferenceField("wr.h", "XTRDMA_SQ_WQE_UD_FLOW_LABLE", "XTR_V1_SQ_WQE_UD_FLOW_LABEL", 24, 12, 20),
+    ReferenceField("wr.h", "XTRDMA_SQ_WQE_UD_SRC_ADDR_IDX", "XTR_V1_SQ_WQE_UD_SRC_ADDR_IDX", 24, 0, 12),
+    ReferenceField("wr.h", "XTRDMA_SQ_WQE_UD_DMAC", "XTR_V1_SQ_WQE_UD_DMAC", 16, 0, 48),
+    ReferenceField("wr.h", "XTRDMA_SQ_WQE_UD_SGE_NUM", "XTR_V1_SQ_WQE_UD_SGE_NUM", 16, 48, 8),
+    ReferenceField("wr.h", "XTRDMA_SQ_WQE_UD_TOTAL_PAYLOAD_LEN", "XTR_V1_SQ_WQE_UD_TOTAL_PAYLOAD_LEN", 8, 0, 14),
+    ReferenceField("wr.h", "XTRDMA_SQ_WQE_UD_DST_VPORT_ID", "XTR_V1_SQ_WQE_UD_DST_VPORT_ID", 8, 14, 11),
+    ReferenceField("wr.h", "XTRDMA_SQ_WQE_UD_FWD", "XTR_V1_SQ_WQE_UD_FWD", 8, 26, 2),
+    ReferenceField("wr.h", "XTRDMA_SQ_WQE_UD_LAG", "XTR_V1_SQ_WQE_UD_LAG", 8, 28, 1),
+    ReferenceField("wr.h", "XTRDMA_SQ_WQE_UD_TUNNEL", "XTR_V1_SQ_WQE_UD_TUNNEL", 8, 29, 1),
+    ReferenceField("wr.h", "XTRDMA_SQ_WQE_UD_IPV6", "XTR_V1_SQ_WQE_UD_IPV6", 8, 30, 1),
+    ReferenceField("wr.h", "XTRDMA_SQ_WQE_UD_VLAN", "XTR_V1_SQ_WQE_UD_VLAN", 8, 31, 1),
     ReferenceField("wr.h", "XTRDMA_QP_RQ_QPN", "XTR_V1_RQE_QPN", 0, 0, 24),
     ReferenceField("wr.h", "XTRDMA_QP_RQ_WQE_IDX", "XTR_V1_RQE_INDEX", 0, 40, 15),
     ReferenceField("wr.h", "XTRDMA_QP_RQ_TPL", "XTR_V1_RQE_PAYLOAD_LEN", 8, 0, 32),
@@ -3757,9 +3986,13 @@ def validate(kernel_root: Path) -> None:
         "XTR_V1_CEQC_CREATE_BODY_MASK": BODY_MASKS["ceqc_create"],
         "XTR_V1_AEQC_CREATE_BODY_MASK": BODY_MASKS["aeqc_create"],
         "XTR_V1_SQ_WQE_HEADER_MASK": (0xEFFFFFFFFFFFFFFF,) + (0,) * 7,
-        "XTR_V1_SQ_WQE_RC_BODY_MASK": (0, 0xFFFFFFFFFFFFFFFF, 0xFFFF0000FFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFE00, 0, 0, 0),
-        "XTR_V1_SQ_WQE_UD_BODY_MASK": (0,) + (0xFFFFFFFFFFFFFFFF,) * 7,
-        "XTR_V1_SQ_WQE_ATOMIC_BODY_MASK": (0,) + (0xFFFFFFFFFFFFFFFF,) * 7,
+        "XTR_V1_SQ_WQE_INLINE_HEADER_MASK": (0xFFFFFFFFFFFFFFFF,) + (0,) * 7,
+        "XTR_V1_SQ_WQE_RC_BODY_MASK": (0, 0xFFFFFFFFFFFFFFFF, 0xFF00FFFF00000000, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFE00, 0, 0, 0),
+        "XTR_V1_SQ_WQE_RC_INLINE_BODY_MASK": (0, 0xFFFFFFFFFFFFFFFF, 0xFF00FFFF00000000, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF),
+        "XTR_V1_SQ_WQE_RC_DIRECT_SGE_BODY_MASK": (0, 0xFFFFFFFFFFFFFFFF, 0xFF00FFFF00000000, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF),
+        "XTR_V1_SQ_WQE_UD_BODY_MASK": (0, 0xFFFFFFFFFEFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF),
+        "XTR_V1_SQ_WQE_ATOMIC_BODY_MASK": (0, 0xFFFFFFFF, 0xFF00FFFF00000000, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF),
+        "XTR_V1_SQ_WQE_ATOMIC_FAA_BODY_MASK": (0, 0xFFFFFFFF, 0xFF00FFFF00000000, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0),
     }
     if sv_masks != expected_masks:
         raise ValidationError("SV image mask lookup differs from independent reference")
