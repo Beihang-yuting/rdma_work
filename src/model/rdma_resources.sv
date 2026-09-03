@@ -212,6 +212,11 @@ function automatic rdma_status rdma_qp_partial_plan_status(
   );
   if (!status.ok()) return status;
   status = rdma_qp_partial_ref_status(
+    plan.sq_sgb_ref, RDMA_QUEUE_ROLE_QP_SQ_SGB, owner, qp_h,
+    "partial QP SQ SGB"
+  );
+  if (!status.ok()) return status;
+  status = rdma_qp_partial_ref_status(
     plan.sq_pd_ref, RDMA_QUEUE_ROLE_QP_SQ_PD, owner, qp_h,
     "partial QP SQ PD"
   );
@@ -297,7 +302,7 @@ function automatic rdma_status rdma_qp_partial_plan_status(
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "partial QP context identity is invalid");
   end
-  if (plan.sq_ref == null && plan.sq_pd_ref == null &&
+  if (plan.sq_ref == null && plan.sq_sgb_ref == null && plan.sq_pd_ref == null &&
       plan.rq_ref == null && plan.rq_pd_ref == null &&
       plan.urc_refs.size() == 0)
     return rdma_status::make(RDMA_SC_INVALID_STATE,
@@ -982,6 +987,12 @@ class rdma_qp extends rdma_resource;
         qp_plan.sq_ref, owner, handle, "QP SQ"
       );
       if (!status.ok()) return status;
+      if (qp_plan.sq_sgb_ref != null) begin
+        status = rdma_qp_mapping_authority_status(
+          qp_plan.sq_sgb_ref, owner, handle, "QP SQ SGB"
+        );
+        if (!status.ok()) return status;
+      end
       status = rdma_qp_mapping_authority_status(
         qp_plan.sq_pd_ref, owner, handle, "QP SQ PD"
       );

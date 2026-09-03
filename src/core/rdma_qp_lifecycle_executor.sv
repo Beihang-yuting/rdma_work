@@ -151,13 +151,14 @@ class rdma_qp_lifecycle_executor extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  protected function rdma_status allocate_ref(
+  protected function rdma_status allocate_ref_aligned(
     rdma_function_binding binding,
     rdma_function_handle expected_owner,
     rdma_handle qp_h,
     rdma_queue_backing_role_e role,
     longint unsigned length,
     rdma_dma_direction_e direction,
+    int unsigned alignment,
     output rdma_qp_backing_ref backing_ref
   );
     rdma_dma_request_context request_context;
@@ -175,7 +176,7 @@ class rdma_qp_lifecycle_executor extends uvm_object;
     status = live_binding_fence(binding, expected_owner);
     if (!status.ok()) return status;
     status = normalize_status(host_mem.allocate(request_context, int'(length),
-      4096, direction, mapping), "QP backing allocation returned null");
+      alignment, direction, mapping), "QP backing allocation returned null");
     fence_status = live_binding_fence(binding, expected_owner);
     if (!fence_status.ok()) begin
       if (mapping != null) begin
@@ -196,8 +197,8 @@ class rdma_qp_lifecycle_executor extends uvm_object;
       return status;
     end
     if (mapping == null || mapping.size < length ||
-        (mapping.iova.value & 64'hfff) != 0 ||
-        (mapping.backing_addr.value & 64'hfff) != 0) begin
+        (mapping.iova.value % alignment) != 0 ||
+        (mapping.backing_addr.value % alignment) != 0) begin
       status = retain_failed_allocation(mapping, role, length, backing_ref);
       if (!status.ok()) return status;
       return invalid_state("QP backing allocation geometry is invalid");
@@ -258,6 +259,19 @@ class rdma_qp_lifecycle_executor extends uvm_object;
       if (!retain_status.ok()) return retain_status;
     end
     return status;
+  endfunction
+
+  protected function rdma_status allocate_ref(
+    rdma_function_binding binding,
+    rdma_function_handle expected_owner,
+    rdma_handle qp_h,
+    rdma_queue_backing_role_e role,
+    longint unsigned length,
+    rdma_dma_direction_e direction,
+    output rdma_qp_backing_ref backing_ref
+  );
+    return allocate_ref_aligned(binding, expected_owner, qp_h, role, length,
+                                 direction, 4096, backing_ref);
   endfunction
 
   protected function rdma_status clone_borrowed_ref(
@@ -365,6 +379,70 @@ class rdma_qp_lifecycle_executor extends uvm_object;
     ring.storage_bytes = ((logical_bytes + 4095) / 4096) * 4096;
     ring.object_mode = RDMA_OBJECT_INDIRECT_4K;
     return ring.validate();
+  endfunction
+
+  protected function rdma_status make_sq_sgb_ref(
+    rdma_function_binding binding,
+    rdma_handle qp_h,
+    int unsigned depth,
+    rdma_queue_backing_spec spec,
+    output rdma_qp_backing_ref ref_out
+  );
+    longint unsigned logical_bytes;
+    longint unsigned storage_bytes;
+    rdma_status status;
+    status = rdma_qp_sq_sgb_geometry(depth, logical_bytes, storage_bytes);
+    ref_out = null;
+    if (!status.ok()) return status;
+    if (spec == null) return invalid_argument("SQ SGB backing spec is null");
+    if (spec.mode == RDMA_QUEUE_BACKING_OWNED)
+      return allocate_ref_aligned(binding, binding.make_handle(), qp_h,
+        RDMA_QUEUE_ROLE_QP_SQ_SGB, storage_bytes, RDMA_DMA_DEVICE_READ,
+        512, ref_out);
+    return clone_borrowed_ref(spec, qp_h, RDMA_QUEUE_ROLE_QP_SQ_SGB,
+                              storage_bytes, ref_out);
+  endfunction
+
+  protected function rdma_status zero_sq_sgb_ref(
+    rdma_dma_request_context request_context,
+    rdma_qp_backing_ref backing_ref,
+    longint unsigned length
+  );
+    byte zeros[];
+    rdma_status status;
+    longint unsigned total;
+    if (request_context == null || backing_ref == null || backing_ref.mapping == null || length == 0)
+      return invalid_argument("SQ SGB zero input is invalid");
+    status = rdma_qp_backing_total_length(backing_ref, total);
+    if (!status.ok() || total < length)
+      return status.ok() ? invalid_argument("SQ SGB backing is too short") : status;
+    zeros = new[512];
+    foreach (zeros[i]) zeros[i] = 0;
+    for (longint unsigned slot = 0; slot < length; slot += 512) begin
+      rdma_dma_mapping m;
+      longint unsigned off;
+      m = null; off = 0;
+      if (slot + 512 <= backing_ref.length) begin
+        m = backing_ref.mapping; off = backing_ref.mapping_offset + slot;
+      end else begin
+        foreach (backing_ref.additional_segments[i]) begin
+          if (backing_ref.additional_segments[i] != null &&
+              slot >= backing_ref.additional_segments[i].logical_queue_offset &&
+              slot + 512 <= backing_ref.additional_segments[i].logical_queue_offset +
+                             backing_ref.additional_segments[i].length) begin
+            m = backing_ref.additional_segments[i].mapping;
+            off = backing_ref.additional_segments[i].mapping_offset + slot -
+                  backing_ref.additional_segments[i].logical_queue_offset;
+          end
+        end
+      end
+      if (m == null)
+        return invalid_argument("SQ SGB segment boundary splits a slot");
+      status = normalize_status(host_mem.write(m, off, zeros),
+                                "SQ SGB zero write returned null");
+      if (!status.ok()) return status;
+    end
+    return rdma_status::success();
   endfunction
 
   protected function rdma_status zero_and_encode_pd(
@@ -513,6 +591,25 @@ class rdma_qp_lifecycle_executor extends uvm_object;
       status = clone_borrowed_ref(request.sq_backing, qp_snapshot.handle,
         RDMA_QUEUE_ROLE_QP_SQ_RING, plan.sq_ring.storage_bytes, plan.sq_ref);
     if (!status.ok()) return status;
+    if (rdma_qp_needs_sq_sgb(request.transport, request.max_send_sge,
+                             request.max_recv_sge)) begin
+      status = make_sq_sgb_ref(binding, qp_snapshot.handle, request.sq_depth,
+                               request.sq_sgb_backing, plan.sq_sgb_ref);
+      if (!status.ok()) return status;
+      begin
+        rdma_dma_request_context sgb_context;
+        longint unsigned sgb_logical_bytes;
+        longint unsigned sgb_storage_bytes;
+        status = rdma_qp_sq_sgb_geometry(request.sq_depth, sgb_logical_bytes,
+                                         sgb_storage_bytes);
+        status = make_dma_context(binding, qp_snapshot.handle,
+                                  RDMA_QUEUE_ROLE_QP_SQ_SGB, sgb_context);
+        if (status.ok())
+          status = zero_sq_sgb_ref(sgb_context, plan.sq_sgb_ref,
+                                   sgb_storage_bytes);
+        if (!status.ok()) return status;
+      end
+    end
     status = allocate_ref(binding, expected_owner, qp_snapshot.handle,
                           RDMA_QUEUE_ROLE_QP_SQ_PD, 4096,
                           RDMA_DMA_DEVICE_READ, plan.sq_pd_ref);
@@ -1399,6 +1496,9 @@ class rdma_qp_lifecycle_executor extends uvm_object;
     step_status = release_ref_local(plan.rq_ref, result);
     if (status.ok() && !step_status.ok()) status = step_status;
     if (!step_status.ok()) return status;
+    step_status = release_ref_local(plan.sq_sgb_ref, result);
+    if (status.ok() && !step_status.ok()) status = step_status;
+    if (!step_status.ok()) return status;
     step_status = release_ref_local(plan.sq_ref, result);
     if (status.ok() && !step_status.ok()) status = step_status;
     return status;
@@ -1720,6 +1820,7 @@ class rdma_qp_lifecycle_executor extends uvm_object;
     refs.push_back(plan.sq_pd_ref);
     refs.push_back(plan.rq_ref);
     refs.push_back(plan.sq_ref);
+    refs.push_back(plan.sq_sgb_ref);
     foreach (refs[i]) begin
       if (refs[i] == null || refs[i].ownership == RDMA_OWNERSHIP_BORROWED)
         continue;
@@ -2734,6 +2835,7 @@ class rdma_qp_lifecycle_executor extends uvm_object;
         refs.push_back(qp.qp_plan.urc_refs[i]);
       refs.push_back(qp.qp_plan.rq_pd_ref); refs.push_back(qp.qp_plan.sq_pd_ref);
       refs.push_back(qp.qp_plan.rq_ref); refs.push_back(qp.qp_plan.sq_ref);
+      refs.push_back(qp.qp_plan.sq_sgb_ref);
       foreach (refs[i]) begin
         if (refs[i] == null || refs[i].ownership == RDMA_OWNERSHIP_BORROWED) continue;
         status = live_binding_fence(binding, expected_owner);
@@ -3428,6 +3530,7 @@ class rdma_qp_lifecycle_executor extends uvm_object;
     if (recovery.qp_plan.rq_source_h == null)
       refs.push_back(recovery.qp_plan.rq_ref);
     refs.push_back(recovery.qp_plan.sq_ref);
+    refs.push_back(recovery.qp_plan.sq_sgb_ref);
     foreach (refs[i]) begin
       if (refs[i] == null || refs[i].ownership == RDMA_OWNERSHIP_BORROWED ||
           refs[i].cleanup_complete)

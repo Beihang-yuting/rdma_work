@@ -188,6 +188,8 @@ class rdma_queue_data_engine_fixture extends uvm_object;
     qp_request.rq_depth = 16;
     qp_request.max_send_sge = 4;
     qp_request.max_recv_sge = 4;
+    qp_request.max_inline_data = 512;
+    qp_request.sq_sgb_backing.mode = RDMA_QUEUE_BACKING_OWNED;
     qp_request.pd_h = rdma_clone_handle_value(pd.handle, "fixture QP PD");
     qp_request.send_cq_h = rdma_clone_handle_value(cq.handle,
                                                    "fixture QP send CQ");

@@ -1182,8 +1182,11 @@ class rdma_qp_lifecycle_test extends uvm_test;
     request.transport = transport;
     request.sq_depth = 128;
     request.rq_depth = 64;
-    request.max_send_sge = 4;
-    request.max_recv_sge = 4;
+    request.max_send_sge = transport == RDMA_TRANSPORT_UD ? 4 : 2;
+    request.max_recv_sge = transport == RDMA_TRANSPORT_UD ? 4 : 2;
+    request.max_inline_data = transport == RDMA_TRANSPORT_UD ? 512 : 32;
+    if (transport == RDMA_TRANSPORT_UD)
+      request.sq_sgb_backing.mode = RDMA_QUEUE_BACKING_OWNED;
     request.pd_h = rdma_clone_handle_value(pd.handle, "test QP PD");
     request.send_cq_h = rdma_clone_handle_value(cq.handle, "test QP send CQ");
     request.recv_cq_h = rdma_clone_handle_value(cq.handle, "test QP receive CQ");
@@ -1348,7 +1351,8 @@ class rdma_qp_lifecycle_test extends uvm_test;
       rdma_xtr_v1_qpc_command_body body;
       longint unsigned expected_staging_iova;
       expected_staging_iova = transport == RDMA_TRANSPORT_URC ?
-        64'h0000_0001_0000_9000 : 64'h0000_0001_0000_5000;
+        64'h0000_0001_0000_9000 : transport == RDMA_TRANSPORT_UD ?
+        64'h0000_0001_0001_5000 : 64'h0000_0001_0000_5000;
       expect_create_steps({label, "_STEPS"}, result);
       if (qp.state != RDMA_RESOURCE_ACTIVE || qp.qp_state != RDMA_QPS_RESET ||
           !result.final_resource_state_known ||
@@ -1363,7 +1367,8 @@ class rdma_qp_lifecycle_test extends uvm_test;
         `uvm_error({label, "_CREATE_COMMAND"},
           "QPC_CREATE did not use literal local IDs and staging IOVA")
       if (mem.live_allocations() !=
-          (transport == RDMA_TRANSPORT_URC ? 7 : 4))
+          (transport == RDMA_TRANSPORT_URC ? 7 :
+           transport == RDMA_TRANSPORT_UD ? 5 : 4))
         `uvm_error({label, "_STAGING_LIVE"},
           "successful create did not return staging to the live baseline")
     end
@@ -1419,6 +1424,14 @@ class rdma_qp_lifecycle_test extends uvm_test;
         !$cast(ud_ext, qp.programmed_qpc.transport_ext) ||
         ud_ext.qkey != 32'h1111_2222)
       `uvm_error("UD_QPC", "UD QPC was not materialized through its codec")
+    if (qp == null || qp.qp_plan == null || qp.qp_plan.sq_sgb_ref == null)
+      `uvm_error("SQ_SGB", "UD QP did not retain SQ SGB authority")
+    else begin
+      if (qp.qp_plan.sq_sgb_ref.length != qp.sq_depth * 512)
+        `uvm_error("SQ_SGB_SIZE", "SQ SGB logical length is not depth*512")
+      if ((qp.qp_plan.sq_sgb_ref.mapping.iova.value & 64'h1ff) != 0)
+        `uvm_error("SQ_SGB_ALIGN", "SQ SGB IOVA is not 512-byte aligned")
+    end
   endtask
 
   task automatic check_urc_internal_geometry();

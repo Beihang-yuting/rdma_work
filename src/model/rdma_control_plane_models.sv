@@ -443,7 +443,7 @@ class rdma_qp_recovery_state extends uvm_object;
   rdma_cmq_opcode_key query_opcode;
   rdma_cmq_opcode_key occ_opcode;
   rdma_cmq_ticket ambiguous_ticket;
-  bit role_complete[20];
+  bit role_complete[21];
 
   function new(string name = "rdma_qp_recovery_state");
     super.new(name);
@@ -620,6 +620,16 @@ class rdma_qp_recovery_state extends uvm_object;
       role_complete[RDMA_QUEUE_ROLE_QP_SQ_RING], "QP recovery SQ"
     );
     if (!status.ok()) return status;
+    if (validation_plan.sq_sgb_ref != null) begin
+      status = rdma_qp_recovery_ref_status(
+        validation_plan.sq_sgb_ref,
+        role_complete[RDMA_QUEUE_ROLE_QP_SQ_SGB], "QP recovery SQ SGB"
+      );
+      if (!status.ok()) return status;
+    end else if (role_complete[RDMA_QUEUE_ROLE_QP_SQ_SGB]) begin
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "QP recovery SQ SGB progress has no authority");
+    end
     status = rdma_qp_recovery_ref_status(
       validation_plan.sq_pd_ref,
       role_complete[RDMA_QUEUE_ROLE_QP_SQ_PD], "QP recovery SQ PD"
