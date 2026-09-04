@@ -7,6 +7,9 @@ class rdma_function_identity_test extends uvm_test;
 
   task run_phase(uvm_phase phase);
     rdma_function_identity lhs, rhs, copy;
+    rdma_function_binding binding;
+    rdma_function_identity snapshot;
+    rdma_function_handle handle;
     uvm_object cloned;
     rdma_route_key_t lhs_route, rhs_route;
     rdma_function_key_t key;
@@ -56,6 +59,52 @@ class rdma_function_identity_test extends uvm_test;
     status = lhs.configure(key, 7, 64'h1234, 0, 10);
     if (status.ok() || status.code != RDMA_SC_INVALID_ARGUMENT)
       `uvm_error("IDENTITY", "zero generation accepted")
+
+    // Identity is the sole authority: legacy scalar fields cannot create a
+    // usable handle when no valid identity has been configured.
+    binding = rdma_function_binding::type_id::create("binding");
+    binding.function_uid = 64'hfeed;
+    binding.global_function_id = 32'hbeef;
+    binding.generation = 32'h7;
+    handle = binding.make_handle();
+    if (handle != null)
+      `uvm_error("IDENTITY", "legacy scalar fallback created a handle")
+
+    status = binding.configure_identity(rhs);
+    if (!status.ok())
+      `uvm_error("IDENTITY", $sformatf("binding identity configure failed: %s",
+                                        status.convert2string()))
+    handle = binding.make_handle();
+    if (handle == null || handle.function_uid != rhs.function_uid ||
+        handle.object_id != rhs.global_function_id ||
+        handle.generation != rhs.generation)
+      `uvm_error("IDENTITY", "identity authority did not produce expected handle")
+    snapshot = binding.identity_snapshot();
+    snapshot.key.host_topology_key = 32'hdead;
+    snapshot.function_uid = 64'h123;
+    handle = binding.make_handle();
+    if (handle == null || handle.function_uid != rhs.function_uid ||
+        binding.function_identity_snapshot().key.host_topology_key !=
+          rhs.key.host_topology_key)
+      `uvm_error("IDENTITY", "identity accessor leaked mutable authority")
+
+    // Global function ID zero is a legal value; UID and generation remain
+    // the required non-zero incarnation discriminators.
+    key.host_topology_key = 32'h10;
+    status = lhs.configure(key, 0, 64'h4321, 1, 11);
+    if (!status.ok())
+      `uvm_error("IDENTITY", "global function ID zero was rejected")
+
+    // Route validity rejects incomplete host/BDF and malformed VF parent data.
+    key.host_topology_key = 0;
+    status = rhs.configure(key, 1, 64'h7777, 1, 1);
+    if (status.ok() || status.code != RDMA_SC_INVALID_ARGUMENT)
+      `uvm_error("IDENTITY", "invalid host route was accepted")
+    key.host_topology_key = 32'h20;
+    key.bdf = '{segment:0,bus:0,device:0,function_num:0};
+    status = rhs.configure(key, 1, 64'h7777, 1, 1);
+    if (status.ok() || status.code != RDMA_SC_INVALID_ARGUMENT)
+      `uvm_error("IDENTITY", "invalid zero BDF route was accepted")
     phase.drop_objection(this);
   endtask
 endclass

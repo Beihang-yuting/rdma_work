@@ -143,8 +143,10 @@ class rdma_function_binding extends uvm_object;
   `uvm_object_utils(rdma_function_binding)
 
   longint unsigned function_uid;
+  // 中文：identity 由 binding 创建并拥有；外部只能通过 snapshot accessor
+  // 读取 detached 副本，不能替换或就地修改 authority。
+  protected rdma_function_identity identity;
   // Function identity is the authority; legacy scalar fields below are mirrors.
-  rdma_function_identity identity;
   rdma_pcie_identity pcie;
 
   bit [2:0] notify_bar_id;
@@ -200,6 +202,36 @@ class rdma_function_binding extends uvm_object;
     dmi_ready = 1'b0;
     vft_valid = 1'b0;
     vft_ready = 1'b0;
+  endfunction
+
+  // 中文：配置者转移的是值快照，不转移调用方句柄所有权；同时刷新旧标量
+  // 镜像，供尚未迁移的调用方读取。identity 配置失败时 binding 保持不变。
+  function rdma_status configure_identity(rdma_function_identity source);
+    uvm_object cloned_object;
+    rdma_function_identity configured;
+    rdma_status status;
+
+    if (source == null)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "Function identity is null");
+    status = source.validate();
+    if (!status.ok())
+      return status;
+    cloned_object = source.clone();
+    if (cloned_object == null || !$cast(configured, cloned_object))
+      return rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED,
+                               "Function identity clone failed");
+    identity = configured;
+    function_uid = identity.function_uid;
+    global_function_id = identity.global_function_id;
+    generation = identity.generation;
+    // PCIe identity is a compatibility projection of the same owner route.
+    if (pcie == null)
+      pcie = rdma_pcie_identity::type_id::create("pcie");
+    pcie.bdf = identity.key.bdf;
+    pcie.parent_pf_bdf = identity.key.parent_pf_bdf;
+    pcie.vf_index = identity.key.vf_index;
+    return rdma_status::success();
   endfunction
 
   virtual function void do_copy(uvm_object rhs);
@@ -258,24 +290,25 @@ class rdma_function_binding extends uvm_object;
   function rdma_function_handle make_handle();
     rdma_function_handle handle;
 
+    // 中文：identity 缺失或非法时不得退回 legacy scalar（global ID=0 也
+    // 是合法值），否则会把未配置 binding 伪装成可用 Function。
+    if (identity == null || !identity.validate().ok())
+      return null;
     handle = rdma_function_handle::type_id::create("function_handle");
     handle.kind = RDMA_RESOURCE_FUNCTION;
-    handle.function_uid = identity != null && identity.function_uid != 0 ?
-                         identity.function_uid : function_uid;
-    handle.object_id = identity != null && identity.global_function_id != 0 ?
-                       identity.global_function_id : global_function_id;
-    handle.generation = identity != null && identity.generation != 0 ?
-                        identity.generation : generation;
+    handle.function_uid = identity.function_uid;
+    handle.object_id = identity.global_function_id;
+    handle.generation = identity.generation;
     return handle;
   endfunction
 
   function bit accepts(rdma_handle handle);
-    if (handle == null)
+    if (handle == null || identity == null || !identity.validate().ok())
       return 1'b0;
     return handle.kind == RDMA_RESOURCE_FUNCTION &&
-           handle.function_uid == (identity != null && identity.function_uid != 0 ? identity.function_uid : function_uid) &&
-           handle.object_id == (identity != null && identity.global_function_id != 0 ? identity.global_function_id : global_function_id) &&
-           handle.generation == (identity != null && identity.generation != 0 ? identity.generation : generation);
+           handle.function_uid == identity.function_uid &&
+           handle.object_id == identity.global_function_id &&
+           handle.generation == identity.generation;
   endfunction
 
   // 返回 detached snapshot，调用方修改结果不会改变 binding 的 authority。
@@ -287,6 +320,15 @@ class rdma_function_binding extends uvm_object;
     if (cloned_object == null || !$cast(snapshot, cloned_object))
       `uvm_fatal("RDMA_COPY_TYPE", "Function identity snapshot clone mismatch")
     return snapshot;
+  endfunction
+
+  // 中文：别名 accessor，统一强调返回副本而非可变 authority。
+  function rdma_function_identity identity_snapshot();
+    return function_identity_snapshot();
+  endfunction
+
+  function rdma_function_identity get_identity();
+    return function_identity_snapshot();
   endfunction
 
   function rdma_reset_epoch_t function_reset_epoch();
@@ -301,18 +343,20 @@ class rdma_function_binding extends uvm_object;
     if (pcie == null)
       return rdma_status::make(RDMA_SC_INVALID_STATE,
                                "PCIe identity is not instantiated");
-    if (identity != null && identity.function_uid != 0) begin
+    if (identity == null)
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "Function identity is not configured");
+    if (!identity.validate().ok())
+      return identity.validate();
+    begin
       if (identity.function_uid != function_uid ||
           identity.global_function_id != global_function_id ||
           identity.generation != generation ||
-          identity.key.bdf.segment != pcie.bdf.segment ||
-          identity.key.bdf.bus != pcie.bdf.bus ||
-          identity.key.bdf.device != pcie.bdf.device ||
-          identity.key.bdf.function_num != pcie.bdf.function_num)
+          !rdma_bdf_same(identity.key.bdf, pcie.bdf) ||
+          !rdma_bdf_same(identity.key.parent_pf_bdf, pcie.parent_pf_bdf) ||
+          identity.key.vf_index != pcie.vf_index)
         return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                  "Function identity and compatibility mirrors disagree");
-      if (!identity.validate().ok())
-        return identity.validate();
     end
     if (!queue_dma.pasid_valid && queue_dma.pasid != 0)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,

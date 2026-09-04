@@ -66,6 +66,73 @@ class rdma_queue_txn_evidence extends uvm_object;
     release_plan.delete();
   endfunction
 
+  // 中文：evidence 是事务创建者拥有的不可变审计快照；capture_* 均克隆
+  // 调用方对象，释放由本对象生命周期负责，不保留外部可变 alias。
+  virtual function void do_copy(uvm_object rhs);
+    rdma_queue_txn_evidence source;
+    uvm_object cloned;
+    rdma_queue_cq_release_plan plan_copy;
+
+    super.do_copy(rhs);
+    if (!$cast(source, rhs))
+      `uvm_fatal("RDMA_COPY_TYPE", "queue transaction evidence copy mismatch")
+    if (source.function_identity == null) function_identity = null;
+    else begin
+      cloned = source.function_identity.clone();
+      if (cloned == null || !$cast(function_identity, cloned))
+        `uvm_fatal("RDMA_COPY_TYPE", "transaction identity clone mismatch")
+    end
+    if (source.queue_h == null) queue_h = null;
+    else begin
+      cloned = source.queue_h.clone();
+      if (cloned == null || !$cast(queue_h, cloned))
+        `uvm_fatal("RDMA_COPY_TYPE", "transaction queue handle clone mismatch")
+    end
+    cursor = source.cursor;
+    next_cursor = source.next_cursor;
+    if (source.image == null) image = null;
+    else begin
+      cloned = source.image.clone();
+      if (cloned == null || !$cast(image, cloned))
+        `uvm_fatal("RDMA_COPY_TYPE", "transaction image clone mismatch")
+    end
+    if (source.request_snapshot == null) request_snapshot = null;
+    else begin
+      cloned = source.request_snapshot.clone();
+      if (cloned == null || !$cast(request_snapshot, cloned))
+        `uvm_fatal("RDMA_COPY_TYPE", "transaction request clone mismatch")
+    end
+    if (source.cqe_snapshot == null) cqe_snapshot = null;
+    else begin
+      cqe_snapshot = source.cqe_snapshot.clone();
+      if (cqe_snapshot == null)
+        `uvm_fatal("RDMA_COPY_TYPE", "transaction CQE clone mismatch")
+    end
+    route = source.route;
+    if (source.failure_status == null) failure_status = null;
+    else begin
+      cloned = source.failure_status.clone();
+      if (cloned == null || !$cast(failure_status, cloned))
+        `uvm_fatal("RDMA_COPY_TYPE", "transaction failure clone mismatch")
+    end
+    phase = source.phase;
+    mmio_maybe_submitted = source.mmio_maybe_submitted;
+    aborted = source.aborted;
+    created_at = source.created_at;
+    release_plan.delete();
+    foreach (source.release_plan[i]) begin
+      if (source.release_plan[i] == null) begin
+        release_plan.push_back(null);
+      end
+      else begin
+        cloned = source.release_plan[i].clone();
+        if (cloned == null || !$cast(plan_copy, cloned))
+          `uvm_fatal("RDMA_COPY_TYPE", "transaction release plan clone mismatch")
+        release_plan.push_back(plan_copy);
+      end
+    end
+  endfunction
+
   function rdma_status advance(rdma_queue_txn_phase_e next_phase);
     bit valid_transition;
     if (aborted || phase == RDMA_QUEUE_TXN_COMPLETED)
@@ -113,7 +180,91 @@ class rdma_queue_txn_evidence extends uvm_object;
     if (cloned == null || !$cast(function_identity, cloned))
       return rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED, "Function identity snapshot clone failed");
     route = function_identity.route_key();
+    if (!rdma_route_key_valid(route))
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "Function route key is invalid");
     return rdma_status::success();
+  endfunction
+
+  function rdma_status capture_queue_handle(rdma_handle source);
+    uvm_object cloned;
+    if (source == null)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "queue handle is null");
+    cloned = source.clone();
+    if (cloned == null || !$cast(queue_h, cloned))
+      return rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED,
+                               "queue handle snapshot clone failed");
+    if (queue_h == source)
+      return rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED,
+                               "queue handle snapshot aliased source");
+    return rdma_status::success();
+  endfunction
+
+  // 中文：兼容调用方的 queue_h 命名；实现仍统一走 detached capture。
+  function rdma_status capture_queue_h(rdma_handle source);
+    return capture_queue_handle(source);
+  endfunction
+
+  function rdma_status capture_request(rdma_semantic_request source);
+    uvm_object cloned;
+    rdma_status status;
+    if (source == null)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "semantic request is null");
+    status = source.validate();
+    if (!status.ok()) return status;
+    cloned = source.clone();
+    if (cloned == null || !$cast(request_snapshot, cloned))
+      return rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED,
+                               "request snapshot clone failed");
+    if (request_snapshot == source)
+      return rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED,
+                               "request snapshot aliased source");
+    return rdma_status::success();
+  endfunction
+
+  function rdma_status capture_request_snapshot(rdma_semantic_request source);
+    return capture_request(source);
+  endfunction
+
+  function rdma_status capture_cqe(uvm_object source);
+    if (source == null)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "CQE is null");
+    cqe_snapshot = source.clone();
+    if (cqe_snapshot == null)
+      return rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED,
+                               "CQE snapshot clone failed");
+    if (cqe_snapshot == source)
+      return rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED,
+                               "CQE snapshot aliased source");
+    return rdma_status::success();
+  endfunction
+
+  function rdma_status capture_cqe_snapshot(uvm_object source);
+    return capture_cqe(source);
+  endfunction
+
+  function rdma_status set_failure(rdma_status source);
+    uvm_object cloned;
+    if (source == null)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "failure status is null");
+    if (aborted || phase == RDMA_QUEUE_TXN_COMPLETED)
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "transaction is terminal");
+    cloned = source.clone();
+    if (cloned == null || !$cast(failure_status, cloned))
+      return rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED,
+                               "failure status snapshot clone failed");
+    if (failure_status == source)
+      return rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED,
+                               "failure status snapshot aliased source");
+    return rdma_status::success();
+  endfunction
+
+  function rdma_status set_failure_status(rdma_status source);
+    return set_failure(source);
   endfunction
 
   function rdma_status capture_image(rdma_hw_image source);
@@ -129,8 +280,14 @@ class rdma_queue_txn_evidence extends uvm_object;
   function rdma_status mark_mmio_maybe_submitted();
     if (aborted || phase == RDMA_QUEUE_TXN_COMPLETED)
       return rdma_status::make(RDMA_SC_INVALID_STATE, "transaction is terminal");
+    if (phase != RDMA_QUEUE_TXN_PAYLOAD_WRITTEN)
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "MMIO submission requires payload evidence");
+    if (!transition_to(RDMA_QUEUE_TXN_DOORBELL_MAYBE_SUBMITTED).ok())
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "MMIO phase transition failed");
     mmio_maybe_submitted = 1'b1;
-    return transition_to(RDMA_QUEUE_TXN_DOORBELL_MAYBE_SUBMITTED);
+    return rdma_status::success();
   endfunction
 
   function rdma_status recover(rdma_queue_recovery_action_e action,
@@ -162,7 +319,8 @@ class rdma_queue_txn_evidence extends uvm_object;
         phase < RDMA_QUEUE_TXN_CONSUMER_COMMITTED)
       return rdma_status::make(RDMA_SC_INVALID_STATE, "WQE release requires committed transaction");
     foreach (release_plan[i]) begin
-      if (release_plan[i].index == index && release_plan[i].wrap == wrap) begin
+      if (release_plan[i] != null &&
+          release_plan[i].index == index && release_plan[i].wrap == wrap) begin
         release_plan[i].released = 1'b1;
         if (phase == RDMA_QUEUE_TXN_WQE_RELEASE_PARTIAL)
           return rdma_status::success();
@@ -178,11 +336,14 @@ class rdma_queue_txn_evidence extends uvm_object;
   function rdma_status complete();
     if (aborted || phase != RDMA_QUEUE_TXN_WQE_RELEASE_PARTIAL)
       return rdma_status::make(RDMA_SC_INVALID_STATE, "transaction cannot complete");
-    phase = RDMA_QUEUE_TXN_COMPLETED;
-    return rdma_status::success();
+    return transition_to(RDMA_QUEUE_TXN_COMPLETED);
   endfunction
 
+  // 中文：abort 是不可逆终态标记；调用者仍拥有 evidence，释放动作必须
+  // 由上层按资源所有权顺序执行，任何后续阶段修改都会被拒绝。
   function rdma_status abort();
+    if (aborted || phase == RDMA_QUEUE_TXN_COMPLETED)
+      return rdma_status::make(RDMA_SC_INVALID_STATE, "transaction is terminal");
     aborted = 1'b1;
     return rdma_status::success();
   endfunction

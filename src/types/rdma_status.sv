@@ -35,6 +35,28 @@ class rdma_status extends uvm_object;
     message = "";
   endfunction
 
+  // 中文：状态进入事务 evidence 后必须是 detached snapshot，保留错误码、
+  // 硬件上下文与诊断文本，避免 clone 后只剩默认 OK 状态。
+  virtual function void do_copy(uvm_object rhs);
+    rdma_status source;
+    super.do_copy(rhs);
+    if (!$cast(source, rhs))
+      `uvm_fatal("RDMA_COPY_TYPE", "rdma_status copy type mismatch")
+    category = source.category;
+    code = source.code;
+    hardware_code = source.hardware_code;
+    hardware_code_valid = source.hardware_code_valid;
+    source_engine = source.source_engine;
+    function_uid = source.function_uid;
+    generation = source.generation;
+    resource_id = source.resource_id;
+    command_id = source.command_id;
+    wr_id = source.wr_id;
+    severity = source.severity;
+    retryable = source.retryable;
+    message = source.message;
+  endfunction
+
   static function automatic rdma_status make(
     rdma_status_code_e code,
     string message = ""

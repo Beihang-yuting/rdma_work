@@ -33,6 +33,8 @@ class rdma_function_identity extends uvm_object;
   endfunction
 
   function rdma_route_key_t route_key();
+    // 中文：route_key 只是值投影；调用方必须先通过 validate()，无效 key
+    // 投影出来的 route 不得被 router 接受。
     return rdma_route_key_from_function(key);
   endfunction
 
@@ -63,21 +65,15 @@ class rdma_function_identity extends uvm_object;
   endfunction
 
   function rdma_status validate();
-    bit bdf_zero;
-    bdf_zero = (key.bdf.segment == 0 && key.bdf.bus == 0 &&
-                key.bdf.device == 0 && key.bdf.function_num == 0);
     if (function_uid == 0)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "Function UID must be non-zero");
     if (generation == 0)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "Function generation must be non-zero");
-    if (bdf_zero)
+    if (!rdma_function_key_route_valid(key))
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                               "Function BDF is invalid");
-    if (key.function_kind == RDMA_FUNCTION_VF && key.vf_index == 0)
-      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                               "VF index must be non-zero");
+                               "Function route/parent/BDF identity is invalid");
     return rdma_status::success();
   endfunction
 

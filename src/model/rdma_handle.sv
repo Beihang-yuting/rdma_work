@@ -22,6 +22,19 @@ class rdma_handle extends uvm_object;
     generation = '0;
   endfunction
 
+  // 中文：Handle 是可复制的值快照；clone/copy 必须保留完整 owner identity，
+  // 不得退化成仅有默认字段的空句柄。
+  virtual function void do_copy(uvm_object rhs);
+    rdma_handle source;
+    super.do_copy(rhs);
+    if (!$cast(source, rhs))
+      `uvm_fatal("RDMA_COPY_TYPE", "rdma_handle copy type mismatch")
+    kind = source.kind;
+    function_uid = source.function_uid;
+    object_id = source.object_id;
+    generation = source.generation;
+  endfunction
+
   function bit same_instance(rdma_handle rhs);
     if (rhs == null)
       return 1'b0;
