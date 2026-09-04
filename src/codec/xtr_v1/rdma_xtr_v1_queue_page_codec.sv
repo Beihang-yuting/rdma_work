@@ -13,10 +13,10 @@ class rdma_xtr_v1_queue_pd_entry extends uvm_object;
   int unsigned rdma_vf_id;
   bit valid;
 
-  // 功能：初始化对象字段、同步 UVM 名称并建立可用的初始生命周期状态（接口 new）。
-  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
-  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
-  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
+  // 功能：构造当前对象并初始化其字段、集合和 UVM 名称；不接管传入句柄的生命周期。
+  // 输入/输出及副作用：name 仅用于 UVM 对象命名；内部字段被初始化为安全默认值，传入句柄不转移所有权。
+  //   返回新对象实例；构造失败由 UVM 工厂或调用方处理。
+  // 失败/边界：不创建外部资源；name 为空时仍允许构造，但所有字段必须保持可配置的初始值。
   function new(string name = "rdma_xtr_v1_queue_pd_entry");
     super.new(name);
     page_iova = '0;
@@ -32,18 +32,18 @@ class rdma_xtr_v1_queue_pd_codec extends uvm_object;
   localparam int unsigned MAX_PAGES = 512;
   localparam int unsigned TABLE_BYTES = MAX_PAGES * 8;
 
-  // 功能：初始化对象字段、同步 UVM 名称并建立可用的初始生命周期状态（接口 new）。
-  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
-  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
-  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
+  // 功能：构造当前对象并初始化其字段、集合和 UVM 名称；不接管传入句柄的生命周期。
+  // 输入/输出及副作用：name 仅用于 UVM 对象命名；内部字段被初始化为安全默认值，传入句柄不转移所有权。
+  //   返回新对象实例；构造失败由 UVM 工厂或调用方处理。
+  // 失败/边界：不创建外部资源；name 为空时仍允许构造，但所有字段必须保持可配置的初始值。
   function new(string name = "rdma_xtr_v1_queue_pd_codec");
     super.new(name);
   endfunction
 
-  // 功能：将模型或请求按硬件/协议布局编码为可传输的镜像或令牌（接口 encode_entry）。
-  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
-  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
-  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
+  // 功能：把输入模型字段按硬件布局编码到目标 image/缓冲区，并在写入前检查范围、重叠和保留位。
+  // 输入/输出及副作用：参数 entry, bytes 用于执行 encode_entry；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
+  //   调用方不获得内部集合或外部依赖的所有权。
+  // 失败/边界：镜像长度、字段宽度、保留位或写入范围非法时不修改已写入字节。
   virtual function rdma_status encode_entry(
     rdma_xtr_v1_queue_pd_entry entry,
     inout byte unsigned bytes[]
@@ -71,10 +71,10 @@ class rdma_xtr_v1_queue_pd_codec extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：将模型或请求按硬件/协议布局编码为可传输的镜像或令牌（接口 encode_table）。
-  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
-  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
-  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
+  // 功能：把输入模型字段按硬件布局编码到目标 image/缓冲区，并在写入前检查范围、重叠和保留位。
+  // 输入/输出及副作用：参数 pages, rdma_vf_id, bytes 用于执行 encode_table；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
+  //   调用方不获得内部集合或外部依赖的所有权。
+  // 失败/边界：镜像长度、字段宽度、保留位或写入范围非法时不修改已写入字节。
   function rdma_status encode_table(
     rdma_queue_dma_page_ref pages[$],
     int unsigned rdma_vf_id,

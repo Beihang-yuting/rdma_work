@@ -6,10 +6,10 @@
 // 中文说明：rdma_queue_models.sv 属于模型层，描述语义请求、资源快照、DMA 映射及生命周期数据。
 // 阅读提示：先看公开类型和接口，再看实现细节；失败路径应保持状态与资源所有权可追踪。
 
-// 功能：执行接口 rdma_clone_status_value 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 rdma_clone_status_value）。
-// 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
-//   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
-// 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
+  // 功能：处理 rdma_clone_status_value：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
+  // 输入/输出及副作用：参数 result 用于执行 rdma_clone_status_value；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
+  //   调用方不获得内部集合或外部依赖的所有权。
+  // 失败/边界：rdma_clone_status_value 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
 function automatic rdma_status rdma_clone_status_value(rdma_status source);
   rdma_status result;
 
@@ -51,10 +51,10 @@ class rdma_cmq_sqe_model extends rdma_hw_model;
   rdma_hw_model context_model;
   int unsigned flags;
 
-  // 功能：初始化对象字段、同步 UVM 名称并建立可用的初始生命周期状态（接口 new）。
-  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
-  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
-  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
+  // 功能：构造当前对象并初始化其字段、集合和 UVM 名称；不接管传入句柄的生命周期。
+  // 输入/输出及副作用：name 仅用于 UVM 对象命名；内部字段被初始化为安全默认值，传入句柄不转移所有权。
+  //   返回新对象实例；构造失败由 UVM 工厂或调用方处理。
+  // 失败/边界：不创建外部资源；name 为空时仍允许构造，但所有字段必须保持可配置的初始值。
   function new(string name = "rdma_cmq_sqe_model");
     super.new(name);
     opcode = RDMA_CMQ_QUERY;
@@ -65,10 +65,10 @@ class rdma_cmq_sqe_model extends rdma_hw_model;
     flags = '0;
   endfunction
 
-  // 功能：把源对象投影/克隆为当前类型的独立值快照，避免共享可变引用（接口 do_copy）。
-  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
-  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
-  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
+  // 功能：从源对象复制可变字段并生成独立值快照；源对象保持不变，类型不匹配时报告复制错误。
+  // 输入/输出及副作用：source/rhs 是源对象；返回或写入独立副本，不修改源对象。
+  //   source/rhs 为空或类型不匹配时返回空值或触发既定复制错误。
+  // 失败/边界：空源对象不应解引用；类型不匹配必须拒绝复制或按既定 UVM 规则报告 fatal。
   virtual function void do_copy(uvm_object rhs);
     rdma_cmq_sqe_model rhs_sqe;
     uvm_object cloned_object;
@@ -92,10 +92,10 @@ class rdma_cmq_sqe_model extends rdma_hw_model;
     end
   endfunction
 
-  // 功能：检查输入值、身份字段和当前生命周期约束，给出一致性判断或状态结果（接口 validate）。
-  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
-  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
-  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
+  // 功能：检查输入字段、身份和生命周期约束，返回可诊断的校验状态；失败时不提交部分更新。
+  // 输入/输出及副作用：输入为待校验字段或快照；返回 rdma_status，校验过程不提交资源和游标。
+  //   空依赖、非法范围、身份不一致或非活动状态会返回错误。
+  // 失败/边界：任何非法枚举、越界字段、缺失必需依赖或身份/代际不一致都必须返回非成功状态。
   virtual function rdma_status validate();
     rdma_status context_status;
     rdma_qpc_model qpc_context;
@@ -173,10 +173,10 @@ class rdma_cmq_sqe_model extends rdma_hw_model;
     return rdma_status::success();
   endfunction
 
-  // 功能：执行接口 describe 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 describe）。
-  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
-  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
-  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
+  // 功能：将当前对象的类型、状态或关键标识转换为调用方可消费的值，不产生外部副作用。
+  // 输入/输出及副作用：输入为当前对象状态；返回字符串、枚举或只读派生值，不修改对象。
+  //   对象未配置时返回可识别的 UNKNOWN/UNCONFIGURED 表示。
+  // 失败/边界：未配置或字段无效时返回明确的 UNKNOWN 表示，不读取未初始化句柄。
   virtual function string describe();
     return $sformatf("CMQ_SQE(opcode=%s command_id=%0d)",
                      opcode.name(), command_id);
@@ -191,10 +191,10 @@ class rdma_cmq_completion_model extends rdma_hw_model;
   rdma_status status;
   rdma_handle result_h;
 
-  // 功能：初始化对象字段、同步 UVM 名称并建立可用的初始生命周期状态（接口 new）。
-  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
-  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
-  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
+  // 功能：构造当前对象并初始化其字段、集合和 UVM 名称；不接管传入句柄的生命周期。
+  // 输入/输出及副作用：name 仅用于 UVM 对象命名；内部字段被初始化为安全默认值，传入句柄不转移所有权。
+  //   返回新对象实例；构造失败由 UVM 工厂或调用方处理。
+  // 失败/边界：不创建外部资源；name 为空时仍允许构造，但所有字段必须保持可配置的初始值。
   function new(string name = "rdma_cmq_completion_model");
     super.new(name);
     opcode = RDMA_CMQ_QUERY;
@@ -203,10 +203,10 @@ class rdma_cmq_completion_model extends rdma_hw_model;
     result_h = null;
   endfunction
 
-  // 功能：把源对象投影/克隆为当前类型的独立值快照，避免共享可变引用（接口 do_copy）。
-  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
-  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
-  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
+  // 功能：从源对象复制可变字段并生成独立值快照；源对象保持不变，类型不匹配时报告复制错误。
+  // 输入/输出及副作用：source/rhs 是源对象；返回或写入独立副本，不修改源对象。
+  //   source/rhs 为空或类型不匹配时返回空值或触发既定复制错误。
+  // 失败/边界：空源对象不应解引用；类型不匹配必须拒绝复制或按既定 UVM 规则报告 fatal。
   virtual function void do_copy(uvm_object rhs);
     rdma_cmq_completion_model rhs_completion;
 
@@ -220,10 +220,10 @@ class rdma_cmq_completion_model extends rdma_hw_model;
                                        "CMQ completion result");
   endfunction
 
-  // 功能：检查输入值、身份字段和当前生命周期约束，给出一致性判断或状态结果（接口 validate）。
-  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
-  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
-  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
+  // 功能：检查输入字段、身份和生命周期约束，返回可诊断的校验状态；失败时不提交部分更新。
+  // 输入/输出及副作用：输入为待校验字段或快照；返回 rdma_status，校验过程不提交资源和游标。
+  //   空依赖、非法范围、身份不一致或非活动状态会返回错误。
+  // 失败/边界：任何非法枚举、越界字段、缺失必需依赖或身份/代际不一致都必须返回非成功状态。
   virtual function rdma_status validate();
     if (!(opcode inside {RDMA_CMQ_CREATE_PD, RDMA_CMQ_REGISTER_MR,
                          RDMA_CMQ_CREATE_CQ, RDMA_CMQ_CREATE_QP,
@@ -238,10 +238,10 @@ class rdma_cmq_completion_model extends rdma_hw_model;
     return rdma_status::success();
   endfunction
 
-  // 功能：执行接口 describe 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 describe）。
-  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
-  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
-  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
+  // 功能：将当前对象的类型、状态或关键标识转换为调用方可消费的值，不产生外部副作用。
+  // 输入/输出及副作用：输入为当前对象状态；返回字符串、枚举或只读派生值，不修改对象。
+  //   对象未配置时返回可识别的 UNKNOWN/UNCONFIGURED 表示。
+  // 失败/边界：未配置或字段无效时返回明确的 UNKNOWN 表示，不读取未初始化句柄。
   virtual function string describe();
     string status_text;
 
@@ -253,30 +253,30 @@ endclass
 
 virtual class rdma_sqe_transport_ext extends uvm_object;
 
-  // 功能：初始化对象字段、同步 UVM 名称并建立可用的初始生命周期状态（接口 new）。
-  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
-  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
-  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
+  // 功能：构造当前对象并初始化其字段、集合和 UVM 名称；不接管传入句柄的生命周期。
+  // 输入/输出及副作用：name 仅用于 UVM 对象命名；内部字段被初始化为安全默认值，传入句柄不转移所有权。
+  //   返回新对象实例；构造失败由 UVM 工厂或调用方处理。
+  // 失败/边界：不创建外部资源；name 为空时仍允许构造，但所有字段必须保持可配置的初始值。
   function new(string name = "rdma_sqe_transport_ext");
     super.new(name);
   endfunction
 
-  // 功能：执行接口 transport_kind 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 transport_kind）。
-  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
-  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
-  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
+  // 功能：处理 transport_kind：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
+  // 输入/输出及副作用：参数 无显式输入参数 用于执行 transport_kind；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
+  //   调用方不获得内部集合或外部依赖的所有权。
+  // 失败/边界：transport_kind 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
   pure virtual function rdma_transport_e transport_kind();
 
-  // 功能：检查输入值、身份字段和当前生命周期约束，给出一致性判断或状态结果（接口 validate）。
-  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
-  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
-  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
+  // 功能：检查输入字段、身份和生命周期约束，返回可诊断的校验状态；失败时不提交部分更新。
+  // 输入/输出及副作用：输入为待校验字段或快照；返回 rdma_status，校验过程不提交资源和游标。
+  //   空依赖、非法范围、身份不一致或非活动状态会返回错误。
+  // 失败/边界：任何非法枚举、越界字段、缺失必需依赖或身份/代际不一致都必须返回非成功状态。
   pure virtual function rdma_status validate(rdma_work_opcode_e opcode);
 
-  // 功能：执行接口 describe 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 describe）。
-  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
-  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
-  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
+  // 功能：将当前对象的类型、状态或关键标识转换为调用方可消费的值，不产生外部副作用。
+  // 输入/输出及副作用：输入为当前对象状态；返回字符串、枚举或只读派生值，不修改对象。
+  //   对象未配置时返回可识别的 UNKNOWN/UNCONFIGURED 表示。
+  // 失败/边界：未配置或字段无效时返回明确的 UNKNOWN 表示，不读取未初始化句柄。
   pure virtual function string describe();
 endclass
 
@@ -290,10 +290,10 @@ class rdma_sqe_rc_ext extends rdma_sqe_transport_ext;
   longint unsigned compare_value;
   longint unsigned swap_add_value;
 
-  // 功能：初始化对象字段、同步 UVM 名称并建立可用的初始生命周期状态（接口 new）。
-  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
-  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
-  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
+  // 功能：构造当前对象并初始化其字段、集合和 UVM 名称；不接管传入句柄的生命周期。
+  // 输入/输出及副作用：name 仅用于 UVM 对象命名；内部字段被初始化为安全默认值，传入句柄不转移所有权。
+  //   返回新对象实例；构造失败由 UVM 工厂或调用方处理。
+  // 失败/边界：不创建外部资源；name 为空时仍允许构造，但所有字段必须保持可配置的初始值。
   function new(string name = "rdma_sqe_rc_ext");
     super.new(name);
     remote_addr = '0;
@@ -304,10 +304,10 @@ class rdma_sqe_rc_ext extends rdma_sqe_transport_ext;
     swap_add_value = '0;
   endfunction
 
-  // 功能：把源对象投影/克隆为当前类型的独立值快照，避免共享可变引用（接口 do_copy）。
-  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
-  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
-  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
+  // 功能：从源对象复制可变字段并生成独立值快照；源对象保持不变，类型不匹配时报告复制错误。
+  // 输入/输出及副作用：source/rhs 是源对象；返回或写入独立副本，不修改源对象。
+  //   source/rhs 为空或类型不匹配时返回空值或触发既定复制错误。
+  // 失败/边界：空源对象不应解引用；类型不匹配必须拒绝复制或按既定 UVM 规则报告 fatal。
   virtual function void do_copy(uvm_object rhs);
     rdma_sqe_rc_ext rhs_ext;
 
@@ -322,18 +322,18 @@ class rdma_sqe_rc_ext extends rdma_sqe_transport_ext;
     swap_add_value = rhs_ext.swap_add_value;
   endfunction
 
-  // 功能：执行接口 transport_kind 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 transport_kind）。
-  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
-  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
-  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
+  // 功能：处理 transport_kind：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
+  // 输入/输出及副作用：参数 RDMA_TRANSPORT_RC 用于执行 transport_kind；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
+  //   调用方不获得内部集合或外部依赖的所有权。
+  // 失败/边界：transport_kind 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
   virtual function rdma_transport_e transport_kind();
     return RDMA_TRANSPORT_RC;
   endfunction
 
-  // 功能：检查输入值、身份字段和当前生命周期约束，给出一致性判断或状态结果（接口 validate）。
-  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
-  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
-  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
+  // 功能：检查输入字段、身份和生命周期约束，返回可诊断的校验状态；失败时不提交部分更新。
+  // 输入/输出及副作用：输入为待校验字段或快照；返回 rdma_status，校验过程不提交资源和游标。
+  //   空依赖、非法范围、身份不一致或非活动状态会返回错误。
+  // 失败/边界：任何非法枚举、越界字段、缺失必需依赖或身份/代际不一致都必须返回非成功状态。
   virtual function rdma_status validate(rdma_work_opcode_e opcode);
     if (opcode == RDMA_WR_LOCAL_INVALIDATE && !rkey_valid)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
@@ -356,10 +356,10 @@ class rdma_sqe_rc_ext extends rdma_sqe_transport_ext;
     return rdma_status::success();
   endfunction
 
-  // 功能：执行接口 describe 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 describe）。
-  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
-  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
-  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
+  // 功能：将当前对象的类型、状态或关键标识转换为调用方可消费的值，不产生外部副作用。
+  // 输入/输出及副作用：输入为当前对象状态；返回字符串、枚举或只读派生值，不修改对象。
+  //   对象未配置时返回可识别的 UNKNOWN/UNCONFIGURED 表示。
+  // 失败/边界：未配置或字段无效时返回明确的 UNKNOWN 表示，不读取未初始化句柄。
   virtual function string describe();
     return $sformatf("RC_SQE(remote_addr=0x%016x rkey=0x%08x)",
                      remote_addr.value, rkey);
@@ -375,10 +375,10 @@ class rdma_sqe_ud_ext extends rdma_sqe_transport_ext;
   rdma_address_vector address_vector;
   bit address_vector_valid;
 
-  // 功能：初始化对象字段、同步 UVM 名称并建立可用的初始生命周期状态（接口 new）。
-  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
-  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
-  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
+  // 功能：构造当前对象并初始化其字段、集合和 UVM 名称；不接管传入句柄的生命周期。
+  // 输入/输出及副作用：name 仅用于 UVM 对象命名；内部字段被初始化为安全默认值，传入句柄不转移所有权。
+  //   返回新对象实例；构造失败由 UVM 工厂或调用方处理。
+  // 失败/边界：不创建外部资源；name 为空时仍允许构造，但所有字段必须保持可配置的初始值。
   function new(string name = "rdma_sqe_ud_ext");
     super.new(name);
     destination_qpn = '0;
@@ -388,10 +388,10 @@ class rdma_sqe_ud_ext extends rdma_sqe_transport_ext;
     address_vector_valid = 1'b0;
   endfunction
 
-  // 功能：把源对象投影/克隆为当前类型的独立值快照，避免共享可变引用（接口 do_copy）。
-  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
-  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
-  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
+  // 功能：从源对象复制可变字段并生成独立值快照；源对象保持不变，类型不匹配时报告复制错误。
+  // 输入/输出及副作用：source/rhs 是源对象；返回或写入独立副本，不修改源对象。
+  //   source/rhs 为空或类型不匹配时返回空值或触发既定复制错误。
+  // 失败/边界：空源对象不应解引用；类型不匹配必须拒绝复制或按既定 UVM 规则报告 fatal。
   virtual function void do_copy(uvm_object rhs);
     rdma_sqe_ud_ext rhs_ext;
 
@@ -412,18 +412,18 @@ class rdma_sqe_ud_ext extends rdma_sqe_transport_ext;
     address_vector_valid = rhs_ext.address_vector_valid;
   endfunction
 
-  // 功能：执行接口 transport_kind 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 transport_kind）。
-  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
-  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
-  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
+  // 功能：处理 transport_kind：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
+  // 输入/输出及副作用：参数 RDMA_TRANSPORT_UD 用于执行 transport_kind；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
+  //   调用方不获得内部集合或外部依赖的所有权。
+  // 失败/边界：transport_kind 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
   virtual function rdma_transport_e transport_kind();
     return RDMA_TRANSPORT_UD;
   endfunction
 
-  // 功能：检查输入值、身份字段和当前生命周期约束，给出一致性判断或状态结果（接口 validate）。
-  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
-  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
-  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
+  // 功能：检查输入字段、身份和生命周期约束，返回可诊断的校验状态；失败时不提交部分更新。
+  // 输入/输出及副作用：输入为待校验字段或快照；返回 rdma_status，校验过程不提交资源和游标。
+  //   空依赖、非法范围、身份不一致或非活动状态会返回错误。
+  // 失败/边界：任何非法枚举、越界字段、缺失必需依赖或身份/代际不一致都必须返回非成功状态。
   virtual function rdma_status validate(rdma_work_opcode_e opcode);
     if (!(opcode inside {RDMA_WR_SEND, RDMA_WR_SEND_WITH_IMM}))
       return rdma_status::make(RDMA_SC_UNSUPPORTED_OPCODE,
@@ -435,10 +435,10 @@ class rdma_sqe_ud_ext extends rdma_sqe_transport_ext;
     return rdma_status::success();
   endfunction
 
-  // 功能：执行接口 describe 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 describe）。
-  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
-  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
-  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
+  // 功能：将当前对象的类型、状态或关键标识转换为调用方可消费的值，不产生外部副作用。
+  // 输入/输出及副作用：输入为当前对象状态；返回字符串、枚举或只读派生值，不修改对象。
+  //   对象未配置时返回可识别的 UNKNOWN/UNCONFIGURED 表示。
+  // 失败/边界：未配置或字段无效时返回明确的 UNKNOWN 表示，不读取未初始化句柄。
   virtual function string describe();
     return $sformatf("UD_SQE(destination_qpn=%0d qkey=0x%08x)",
                      destination_qpn, qkey);
@@ -454,10 +454,10 @@ class rdma_sqe_urc_ext extends rdma_sqe_transport_ext;
   bit remote_access_valid;
   bit rkey_valid;
 
-  // 功能：初始化对象字段、同步 UVM 名称并建立可用的初始生命周期状态（接口 new）。
-  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
-  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
-  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
+  // 功能：构造当前对象并初始化其字段、集合和 UVM 名称；不接管传入句柄的生命周期。
+  // 输入/输出及副作用：name 仅用于 UVM 对象命名；内部字段被初始化为安全默认值，传入句柄不转移所有权。
+  //   返回新对象实例；构造失败由 UVM 工厂或调用方处理。
+  // 失败/边界：不创建外部资源；name 为空时仍允许构造，但所有字段必须保持可配置的初始值。
   function new(string name = "rdma_sqe_urc_ext");
     super.new(name);
     destination_qpn = '0;
@@ -467,10 +467,10 @@ class rdma_sqe_urc_ext extends rdma_sqe_transport_ext;
     rkey_valid = 1'b0;
   endfunction
 
-  // 功能：把源对象投影/克隆为当前类型的独立值快照，避免共享可变引用（接口 do_copy）。
-  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
-  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
-  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
+  // 功能：从源对象复制可变字段并生成独立值快照；源对象保持不变，类型不匹配时报告复制错误。
+  // 输入/输出及副作用：source/rhs 是源对象；返回或写入独立副本，不修改源对象。
+  //   source/rhs 为空或类型不匹配时返回空值或触发既定复制错误。
+  // 失败/边界：空源对象不应解引用；类型不匹配必须拒绝复制或按既定 UVM 规则报告 fatal。
   virtual function void do_copy(uvm_object rhs);
     rdma_sqe_urc_ext rhs_ext;
 
@@ -484,18 +484,18 @@ class rdma_sqe_urc_ext extends rdma_sqe_transport_ext;
     rkey_valid = rhs_ext.rkey_valid;
   endfunction
 
-  // 功能：执行接口 transport_kind 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 transport_kind）。
-  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
-  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
-  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
+  // 功能：处理 transport_kind：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
+  // 输入/输出及副作用：参数 RDMA_TRANSPORT_URC 用于执行 transport_kind；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
+  //   调用方不获得内部集合或外部依赖的所有权。
+  // 失败/边界：transport_kind 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
   virtual function rdma_transport_e transport_kind();
     return RDMA_TRANSPORT_URC;
   endfunction
 
-  // 功能：检查输入值、身份字段和当前生命周期约束，给出一致性判断或状态结果（接口 validate）。
-  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
-  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
-  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
+  // 功能：检查输入字段、身份和生命周期约束，返回可诊断的校验状态；失败时不提交部分更新。
+  // 输入/输出及副作用：输入为待校验字段或快照；返回 rdma_status，校验过程不提交资源和游标。
+  //   空依赖、非法范围、身份不一致或非活动状态会返回错误。
+  // 失败/边界：任何非法枚举、越界字段、缺失必需依赖或身份/代际不一致都必须返回非成功状态。
   virtual function rdma_status validate(rdma_work_opcode_e opcode);
     if (opcode == RDMA_WR_LOCAL_INVALIDATE) begin
       if (!rkey_valid)
@@ -515,10 +515,10 @@ class rdma_sqe_urc_ext extends rdma_sqe_transport_ext;
     return rdma_status::success();
   endfunction
 
-  // 功能：执行接口 describe 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 describe）。
-  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
-  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
-  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
+  // 功能：将当前对象的类型、状态或关键标识转换为调用方可消费的值，不产生外部副作用。
+  // 输入/输出及副作用：输入为当前对象状态；返回字符串、枚举或只读派生值，不修改对象。
+  //   对象未配置时返回可识别的 UNKNOWN/UNCONFIGURED 表示。
+  // 失败/边界：未配置或字段无效时返回明确的 UNKNOWN 表示，不读取未初始化句柄。
   virtual function string describe();
     return $sformatf("URC_SQE(destination_qpn=%0d remote_addr=0x%016x)",
                      destination_qpn, remote_addr.value);
@@ -541,10 +541,10 @@ class rdma_sqe_model extends rdma_hw_model;
   bit [31:0] immediate_data;
   rdma_sqe_transport_ext transport_ext;
 
-  // 功能：初始化对象字段、同步 UVM 名称并建立可用的初始生命周期状态（接口 new）。
-  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
-  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
-  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
+  // 功能：构造当前对象并初始化其字段、集合和 UVM 名称；不接管传入句柄的生命周期。
+  // 输入/输出及副作用：name 仅用于 UVM 对象命名；内部字段被初始化为安全默认值，传入句柄不转移所有权。
+  //   返回新对象实例；构造失败由 UVM 工厂或调用方处理。
+  // 失败/边界：不创建外部资源；name 为空时仍允许构造，但所有字段必须保持可配置的初始值。
   function new(string name = "rdma_sqe_model");
     super.new(name);
     transport = RDMA_TRANSPORT_RC;
@@ -559,10 +559,10 @@ class rdma_sqe_model extends rdma_hw_model;
     transport_ext = null;
   endfunction
 
-  // 功能：把源对象投影/克隆为当前类型的独立值快照，避免共享可变引用（接口 do_copy）。
-  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
-  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
-  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
+  // 功能：从源对象复制可变字段并生成独立值快照；源对象保持不变，类型不匹配时报告复制错误。
+  // 输入/输出及副作用：source/rhs 是源对象；返回或写入独立副本，不修改源对象。
+  //   source/rhs 为空或类型不匹配时返回空值或触发既定复制错误。
+  // 失败/边界：空源对象不应解引用；类型不匹配必须拒绝复制或按既定 UVM 规则报告 fatal。
   virtual function void do_copy(uvm_object rhs);
     rdma_sqe_model rhs_sqe;
     uvm_object cloned_object;
@@ -603,10 +603,10 @@ class rdma_sqe_model extends rdma_hw_model;
     end
   endfunction
 
-  // 功能：检查输入值、身份字段和当前生命周期约束，给出一致性判断或状态结果（接口 validate）。
-  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
-  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
-  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
+  // 功能：检查输入字段、身份和生命周期约束，返回可诊断的校验状态；失败时不提交部分更新。
+  // 输入/输出及副作用：输入为待校验字段或快照；返回 rdma_status，校验过程不提交资源和游标。
+  //   空依赖、非法范围、身份不一致或非活动状态会返回错误。
+  // 失败/边界：任何非法枚举、越界字段、缺失必需依赖或身份/代际不一致都必须返回非成功状态。
   virtual function rdma_status validate();
     rdma_sqe_rc_ext rc_ext;
     rdma_sqe_ud_ext ud_ext;
@@ -683,10 +683,10 @@ class rdma_sqe_model extends rdma_hw_model;
     return transport_ext.validate(opcode);
   endfunction
 
-  // 功能：执行接口 describe 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 describe）。
-  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
-  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
-  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
+  // 功能：将当前对象的类型、状态或关键标识转换为调用方可消费的值，不产生外部副作用。
+  // 输入/输出及副作用：输入为当前对象状态；返回字符串、枚举或只读派生值，不修改对象。
+  //   对象未配置时返回可识别的 UNKNOWN/UNCONFIGURED 表示。
+  // 失败/边界：未配置或字段无效时返回明确的 UNKNOWN 表示，不读取未初始化句柄。
   virtual function string describe();
     string extension_text;
 
@@ -704,20 +704,20 @@ class rdma_rqe_model extends rdma_hw_model;
   longint unsigned wr_id;
   rdma_sge sges[$];
 
-  // 功能：初始化对象字段、同步 UVM 名称并建立可用的初始生命周期状态（接口 new）。
-  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
-  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
-  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
+  // 功能：构造当前对象并初始化其字段、集合和 UVM 名称；不接管传入句柄的生命周期。
+  // 输入/输出及副作用：name 仅用于 UVM 对象命名；内部字段被初始化为安全默认值，传入句柄不转移所有权。
+  //   返回新对象实例；构造失败由 UVM 工厂或调用方处理。
+  // 失败/边界：不创建外部资源；name 为空时仍允许构造，但所有字段必须保持可配置的初始值。
   function new(string name = "rdma_rqe_model");
     super.new(name);
     target_h = null;
     wr_id = '0;
   endfunction
 
-  // 功能：把源对象投影/克隆为当前类型的独立值快照，避免共享可变引用（接口 do_copy）。
-  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
-  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
-  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
+  // 功能：从源对象复制可变字段并生成独立值快照；源对象保持不变，类型不匹配时报告复制错误。
+  // 输入/输出及副作用：source/rhs 是源对象；返回或写入独立副本，不修改源对象。
+  //   source/rhs 为空或类型不匹配时返回空值或触发既定复制错误。
+  // 失败/边界：空源对象不应解引用；类型不匹配必须拒绝复制或按既定 UVM 规则报告 fatal。
   virtual function void do_copy(uvm_object rhs);
     rdma_rqe_model rhs_rqe;
     uvm_object cloned_object;
@@ -742,10 +742,10 @@ class rdma_rqe_model extends rdma_hw_model;
     end
   endfunction
 
-  // 功能：检查输入值、身份字段和当前生命周期约束，给出一致性判断或状态结果（接口 validate）。
-  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
-  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
-  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
+  // 功能：检查输入字段、身份和生命周期约束，返回可诊断的校验状态；失败时不提交部分更新。
+  // 输入/输出及副作用：输入为待校验字段或快照；返回 rdma_status，校验过程不提交资源和游标。
+  //   空依赖、非法范围、身份不一致或非活动状态会返回错误。
+  // 失败/边界：任何非法枚举、越界字段、缺失必需依赖或身份/代际不一致都必须返回非成功状态。
   virtual function rdma_status validate();
     if (target_h == null ||
         !(target_h.kind inside {RDMA_RESOURCE_QP, RDMA_RESOURCE_SRQ}))
@@ -762,10 +762,10 @@ class rdma_rqe_model extends rdma_hw_model;
     return rdma_status::success();
   endfunction
 
-  // 功能：执行接口 describe 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 describe）。
-  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
-  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
-  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
+  // 功能：将当前对象的类型、状态或关键标识转换为调用方可消费的值，不产生外部副作用。
+  // 输入/输出及副作用：输入为当前对象状态；返回字符串、枚举或只读派生值，不修改对象。
+  //   对象未配置时返回可识别的 UNKNOWN/UNCONFIGURED 表示。
+  // 失败/边界：未配置或字段无效时返回明确的 UNKNOWN 表示，不读取未初始化句柄。
   virtual function string describe();
     return $sformatf("RQE(wr_id=%0d sge_count=%0d)", wr_id, sges.size());
   endfunction
@@ -781,10 +781,10 @@ class rdma_cqe_model extends rdma_hw_model;
   int unsigned byte_len;
   bit [31:0] immediate_data;
 
-  // 功能：初始化对象字段、同步 UVM 名称并建立可用的初始生命周期状态（接口 new）。
-  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
-  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
-  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
+  // 功能：构造当前对象并初始化其字段、集合和 UVM 名称；不接管传入句柄的生命周期。
+  // 输入/输出及副作用：name 仅用于 UVM 对象命名；内部字段被初始化为安全默认值，传入句柄不转移所有权。
+  //   返回新对象实例；构造失败由 UVM 工厂或调用方处理。
+  // 失败/边界：不创建外部资源；name 为空时仍允许构造，但所有字段必须保持可配置的初始值。
   function new(string name = "rdma_cqe_model");
     super.new(name);
     qp_h = null;
@@ -795,10 +795,10 @@ class rdma_cqe_model extends rdma_hw_model;
     immediate_data = '0;
   endfunction
 
-  // 功能：把源对象投影/克隆为当前类型的独立值快照，避免共享可变引用（接口 do_copy）。
-  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
-  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
-  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
+  // 功能：从源对象复制可变字段并生成独立值快照；源对象保持不变，类型不匹配时报告复制错误。
+  // 输入/输出及副作用：source/rhs 是源对象；返回或写入独立副本，不修改源对象。
+  //   source/rhs 为空或类型不匹配时返回空值或触发既定复制错误。
+  // 失败/边界：空源对象不应解引用；类型不匹配必须拒绝复制或按既定 UVM 规则报告 fatal。
   virtual function void do_copy(uvm_object rhs);
     rdma_cqe_model rhs_cqe;
 
@@ -813,10 +813,10 @@ class rdma_cqe_model extends rdma_hw_model;
     immediate_data = rhs_cqe.immediate_data;
   endfunction
 
-  // 功能：检查输入值、身份字段和当前生命周期约束，给出一致性判断或状态结果（接口 validate）。
-  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
-  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
-  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
+  // 功能：检查输入字段、身份和生命周期约束，返回可诊断的校验状态；失败时不提交部分更新。
+  // 输入/输出及副作用：输入为待校验字段或快照；返回 rdma_status，校验过程不提交资源和游标。
+  //   空依赖、非法范围、身份不一致或非活动状态会返回错误。
+  // 失败/边界：任何非法枚举、越界字段、缺失必需依赖或身份/代际不一致都必须返回非成功状态。
   virtual function rdma_status validate();
     if (qp_h == null || qp_h.kind != RDMA_RESOURCE_QP || status == null)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
@@ -831,10 +831,10 @@ class rdma_cqe_model extends rdma_hw_model;
     return rdma_status::success();
   endfunction
 
-  // 功能：执行接口 describe 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 describe）。
-  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
-  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
-  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
+  // 功能：将当前对象的类型、状态或关键标识转换为调用方可消费的值，不产生外部副作用。
+  // 输入/输出及副作用：输入为当前对象状态；返回字符串、枚举或只读派生值，不修改对象。
+  //   对象未配置时返回可识别的 UNKNOWN/UNCONFIGURED 表示。
+  // 失败/边界：未配置或字段无效时返回明确的 UNKNOWN 表示，不读取未初始化句柄。
   virtual function string describe();
     return $sformatf("CQE(wr_id=%0d opcode=%s byte_len=%0d)",
                      wr_id, opcode.name(), byte_len);
@@ -849,10 +849,10 @@ class rdma_ceqe_model extends rdma_hw_model;
   bit wrap;
   bit solicited;
 
-  // 功能：初始化对象字段、同步 UVM 名称并建立可用的初始生命周期状态（接口 new）。
-  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
-  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
-  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
+  // 功能：构造当前对象并初始化其字段、集合和 UVM 名称；不接管传入句柄的生命周期。
+  // 输入/输出及副作用：name 仅用于 UVM 对象命名；内部字段被初始化为安全默认值，传入句柄不转移所有权。
+  //   返回新对象实例；构造失败由 UVM 工厂或调用方处理。
+  // 失败/边界：不创建外部资源；name 为空时仍允许构造，但所有字段必须保持可配置的初始值。
   function new(string name = "rdma_ceqe_model");
     super.new(name);
     cq_h = null;
@@ -861,10 +861,10 @@ class rdma_ceqe_model extends rdma_hw_model;
     solicited = 1'b0;
   endfunction
 
-  // 功能：把源对象投影/克隆为当前类型的独立值快照，避免共享可变引用（接口 do_copy）。
-  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
-  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
-  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
+  // 功能：从源对象复制可变字段并生成独立值快照；源对象保持不变，类型不匹配时报告复制错误。
+  // 输入/输出及副作用：source/rhs 是源对象；返回或写入独立副本，不修改源对象。
+  //   source/rhs 为空或类型不匹配时返回空值或触发既定复制错误。
+  // 失败/边界：空源对象不应解引用；类型不匹配必须拒绝复制或按既定 UVM 规则报告 fatal。
   virtual function void do_copy(uvm_object rhs);
     rdma_ceqe_model rhs_ceqe;
 
@@ -877,10 +877,10 @@ class rdma_ceqe_model extends rdma_hw_model;
     solicited = rhs_ceqe.solicited;
   endfunction
 
-  // 功能：检查输入值、身份字段和当前生命周期约束，给出一致性判断或状态结果（接口 validate）。
-  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
-  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
-  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
+  // 功能：检查输入字段、身份和生命周期约束，返回可诊断的校验状态；失败时不提交部分更新。
+  // 输入/输出及副作用：输入为待校验字段或快照；返回 rdma_status，校验过程不提交资源和游标。
+  //   空依赖、非法范围、身份不一致或非活动状态会返回错误。
+  // 失败/边界：任何非法枚举、越界字段、缺失必需依赖或身份/代际不一致都必须返回非成功状态。
   virtual function rdma_status validate();
     if (cq_h == null || cq_h.kind != RDMA_RESOURCE_CQ)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
@@ -888,10 +888,10 @@ class rdma_ceqe_model extends rdma_hw_model;
     return rdma_status::success();
   endfunction
 
-  // 功能：执行接口 describe 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 describe）。
-  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
-  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
-  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
+  // 功能：将当前对象的类型、状态或关键标识转换为调用方可消费的值，不产生外部副作用。
+  // 输入/输出及副作用：输入为当前对象状态；返回字符串、枚举或只读派生值，不修改对象。
+  //   对象未配置时返回可识别的 UNKNOWN/UNCONFIGURED 表示。
+  // 失败/边界：未配置或字段无效时返回明确的 UNKNOWN 表示，不读取未初始化句柄。
   virtual function string describe();
     return $sformatf("CEQE(producer_index=%0d wrap=%0b)",
                      producer_index, wrap);
@@ -906,10 +906,10 @@ class rdma_aeqe_model extends rdma_hw_model;
   int unsigned syndrome;
   rdma_severity_e severity;
 
-  // 功能：初始化对象字段、同步 UVM 名称并建立可用的初始生命周期状态（接口 new）。
-  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
-  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
-  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
+  // 功能：构造当前对象并初始化其字段、集合和 UVM 名称；不接管传入句柄的生命周期。
+  // 输入/输出及副作用：name 仅用于 UVM 对象命名；内部字段被初始化为安全默认值，传入句柄不转移所有权。
+  //   返回新对象实例；构造失败由 UVM 工厂或调用方处理。
+  // 失败/边界：不创建外部资源；name 为空时仍允许构造，但所有字段必须保持可配置的初始值。
   function new(string name = "rdma_aeqe_model");
     super.new(name);
     target_h = null;
@@ -918,10 +918,10 @@ class rdma_aeqe_model extends rdma_hw_model;
     severity = RDMA_SEVERITY_INFO;
   endfunction
 
-  // 功能：把源对象投影/克隆为当前类型的独立值快照，避免共享可变引用（接口 do_copy）。
-  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
-  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
-  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
+  // 功能：从源对象复制可变字段并生成独立值快照；源对象保持不变，类型不匹配时报告复制错误。
+  // 输入/输出及副作用：source/rhs 是源对象；返回或写入独立副本，不修改源对象。
+  //   source/rhs 为空或类型不匹配时返回空值或触发既定复制错误。
+  // 失败/边界：空源对象不应解引用；类型不匹配必须拒绝复制或按既定 UVM 规则报告 fatal。
   virtual function void do_copy(uvm_object rhs);
     rdma_aeqe_model rhs_aeqe;
 
@@ -934,10 +934,10 @@ class rdma_aeqe_model extends rdma_hw_model;
     severity = rhs_aeqe.severity;
   endfunction
 
-  // 功能：检查输入值、身份字段和当前生命周期约束，给出一致性判断或状态结果（接口 validate）。
-  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
-  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
-  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
+  // 功能：检查输入字段、身份和生命周期约束，返回可诊断的校验状态；失败时不提交部分更新。
+  // 输入/输出及副作用：输入为待校验字段或快照；返回 rdma_status，校验过程不提交资源和游标。
+  //   空依赖、非法范围、身份不一致或非活动状态会返回错误。
+  // 失败/边界：任何非法枚举、越界字段、缺失必需依赖或身份/代际不一致都必须返回非成功状态。
   virtual function rdma_status validate();
     if (target_h == null)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
@@ -949,10 +949,10 @@ class rdma_aeqe_model extends rdma_hw_model;
     return rdma_status::success();
   endfunction
 
-  // 功能：执行接口 describe 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 describe）。
-  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
-  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
-  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
+  // 功能：将当前对象的类型、状态或关键标识转换为调用方可消费的值，不产生外部副作用。
+  // 输入/输出及副作用：输入为当前对象状态；返回字符串、枚举或只读派生值，不修改对象。
+  //   对象未配置时返回可识别的 UNKNOWN/UNCONFIGURED 表示。
+  // 失败/边界：未配置或字段无效时返回明确的 UNKNOWN 表示，不读取未初始化句柄。
   virtual function string describe();
     return $sformatf("AEQE(event_code=%0d syndrome=%0d severity=%s)",
                      event_code, syndrome, severity.name());
@@ -971,10 +971,10 @@ class rdma_doorbell_model extends rdma_hw_model;
   bit arm;
   bit solicited_only;
 
-  // 功能：初始化对象字段、同步 UVM 名称并建立可用的初始生命周期状态（接口 new）。
-  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
-  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
-  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
+  // 功能：构造当前对象并初始化其字段、集合和 UVM 名称；不接管传入句柄的生命周期。
+  // 输入/输出及副作用：name 仅用于 UVM 对象命名；内部字段被初始化为安全默认值，传入句柄不转移所有权。
+  //   返回新对象实例；构造失败由 UVM 工厂或调用方处理。
+  // 失败/边界：不创建外部资源；name 为空时仍允许构造，但所有字段必须保持可配置的初始值。
   function new(string name = "rdma_doorbell_model");
     super.new(name);
     kind = RDMA_DOORBELL_CMQ_SQ;
@@ -987,10 +987,10 @@ class rdma_doorbell_model extends rdma_hw_model;
     solicited_only = 1'b0;
   endfunction
 
-  // 功能：把源对象投影/克隆为当前类型的独立值快照，避免共享可变引用（接口 do_copy）。
-  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
-  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
-  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
+  // 功能：从源对象复制可变字段并生成独立值快照；源对象保持不变，类型不匹配时报告复制错误。
+  // 输入/输出及副作用：source/rhs 是源对象；返回或写入独立副本，不修改源对象。
+  //   source/rhs 为空或类型不匹配时返回空值或触发既定复制错误。
+  // 失败/边界：空源对象不应解引用；类型不匹配必须拒绝复制或按既定 UVM 规则报告 fatal。
   virtual function void do_copy(uvm_object rhs);
     rdma_doorbell_model rhs_doorbell;
 
@@ -1008,10 +1008,10 @@ class rdma_doorbell_model extends rdma_hw_model;
     solicited_only = rhs_doorbell.solicited_only;
   endfunction
 
-  // 功能：检查输入值、身份字段和当前生命周期约束，给出一致性判断或状态结果（接口 validate）。
-  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
-  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
-  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
+  // 功能：检查输入字段、身份和生命周期约束，返回可诊断的校验状态；失败时不提交部分更新。
+  // 输入/输出及副作用：输入为待校验字段或快照；返回 rdma_status，校验过程不提交资源和游标。
+  //   空依赖、非法范围、身份不一致或非活动状态会返回错误。
+  // 失败/边界：任何非法枚举、越界字段、缺失必需依赖或身份/代际不一致都必须返回非成功状态。
   virtual function rdma_status validate();
     if (!(kind inside {RDMA_DOORBELL_CMQ_SQ, RDMA_DOORBELL_SQ,
                        RDMA_DOORBELL_RQ, RDMA_DOORBELL_SRQ,
@@ -1061,10 +1061,10 @@ class rdma_doorbell_model extends rdma_hw_model;
     return rdma_status::success();
   endfunction
 
-  // 功能：执行接口 describe 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 describe）。
-  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
-  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
-  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
+  // 功能：将当前对象的类型、状态或关键标识转换为调用方可消费的值，不产生外部副作用。
+  // 输入/输出及副作用：输入为当前对象状态；返回字符串、枚举或只读派生值，不修改对象。
+  //   对象未配置时返回可识别的 UNKNOWN/UNCONFIGURED 表示。
+  // 失败/边界：未配置或字段无效时返回明确的 UNKNOWN 表示，不读取未初始化句柄。
   virtual function string describe();
     return $sformatf("DOORBELL(kind=%s queue_id=%0d producer=%0d wrap=%0b)",
                      kind.name(), queue_id, producer_index, wrap);

@@ -9,19 +9,19 @@
 class rdma_xtr_v1_qword_codec_test extends uvm_test;
   `uvm_component_utils(rdma_xtr_v1_qword_codec_test)
 
-  // 功能：初始化对象字段、同步 UVM 名称并建立可用的初始生命周期状态（接口 new）。
-  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
-  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
-  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
+  // 功能：构造当前对象并初始化其字段、集合和 UVM 名称；不接管传入句柄的生命周期。
+  // 输入/输出及副作用：name 仅用于 UVM 对象命名；内部字段被初始化为安全默认值，传入句柄不转移所有权。
+  //   返回新对象实例；构造失败由 UVM 工厂或调用方处理。
+  // 失败/边界：不创建外部资源；name 为空时仍允许构造，但所有字段必须保持可配置的初始值。
   function new(string name = "rdma_xtr_v1_qword_codec_test",
                uvm_component parent = null);
     super.new(name, parent);
   endfunction
 
-  // 功能：执行接口 expect_status 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 expect_status）。
-  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
-  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
-  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
+  // 功能：在测试中检查调用结果、状态码和副作用是否符合契约；失败时报告可定位的验证信息。
+  // 输入/输出及副作用：参数 label, status, expected_code 用于执行 expect_status；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
+  //   调用方不获得内部集合或外部依赖的所有权。
+  // 失败/边界：测试前置对象缺失时应报告断言错误并停止依赖该对象的后续检查。
   function automatic void expect_status(
     string label,
     rdma_status status,
@@ -38,18 +38,18 @@ class rdma_xtr_v1_qword_codec_test extends uvm_test;
                            status.convert2string()))
   endfunction
 
-  // 功能：执行接口 expect_ok 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 expect_ok）。
-  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
-  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
-  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
+  // 功能：在测试中检查调用结果、状态码和副作用是否符合契约；失败时报告可定位的验证信息。
+  // 输入/输出及副作用：参数 label, RDMA_SC_OK 用于执行 expect_ok；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
+  //   调用方不获得内部集合或外部依赖的所有权。
+  // 失败/边界：测试前置对象缺失时应报告断言错误并停止依赖该对象的后续检查。
   function automatic void expect_ok(string label, rdma_status status);
     expect_status(label, status, RDMA_SC_OK);
   endfunction
 
-  // 功能：执行接口 qwords_equal 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 qwords_equal）。
-  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
-  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
-  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
+  // 功能：处理 qwords_equal：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
+  // 输入/输出及副作用：参数 lhs, rhs 用于执行 qwords_equal；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
+  //   调用方不获得内部集合或外部依赖的所有权。
+  // 失败/边界：qwords_equal 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
   function automatic bit qwords_equal(
     bit [63:0] lhs[],
     bit [63:0] rhs[]
@@ -63,10 +63,10 @@ class rdma_xtr_v1_qword_codec_test extends uvm_test;
     return 1'b1;
   endfunction
 
-  // 功能：执行接口 bytes_equal 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 bytes_equal）。
-  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
-  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
-  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
+  // 功能：比较两个输入对象的协议字段或身份快照并返回确定的相等性结果，不修改任一输入。
+  // 输入/输出及副作用：输入为待比较的两个值对象；返回 bit/状态结果，不修改任一输入或外部账本。
+  //   任一对象为空、类型不符或字段未初始化时按接口约定返回不相等或错误。
+  // 失败/边界：比较输入为空或类型不符时不得抛出未处理异常；结果必须保持确定且无副作用。
   function automatic bit bytes_equal(
     byte unsigned lhs[],
     byte unsigned rhs[]
@@ -80,10 +80,10 @@ class rdma_xtr_v1_qword_codec_test extends uvm_test;
     return 1'b1;
   endfunction
 
-  // 功能：读取或查询当前对象的权威状态，并以返回值或 output 参数交付快照（接口 snapshot_builder）。
-  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
-  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
-  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
+  // 功能：按输入的完整标识查询当前权威记录并返回独立快照；缺失、歧义或代际过期时返回明确错误。
+  // 输入/输出及副作用：输入为完整 key/handle，output 或返回值为记录快照；查询不改变登记表和外部资源。
+  //   缺失、歧义、空句柄或旧 generation/reset epoch 返回明确错误。
+  // 失败/边界：查询不到唯一记录、输入为空或 authority 已失效时返回错误，不回退到默认 Function/root。
   function automatic void snapshot_builder(
     rdma_xtr_v1_qword_builder builder,
     output bit [63:0] words[],
@@ -93,10 +93,10 @@ class rdma_xtr_v1_qword_codec_test extends uvm_test;
     builder.get_occupancy(occupancy);
   endfunction
 
-  // 功能：执行接口 expect_builder_unchanged 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 expect_builder_unchanged）。
-  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
-  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
-  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
+  // 功能：在测试中检查调用结果、状态码和副作用是否符合契约；失败时报告可定位的验证信息。
+  // 输入/输出及副作用：参数 label, builder, expected_words, expected_occupancy 用于执行 expect_builder_unchanged；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
+  //   调用方不获得内部集合或外部依赖的所有权。
+  // 失败/边界：测试前置对象缺失时应报告断言错误并停止依赖该对象的后续检查。
   function automatic void expect_builder_unchanged(
     string label,
     rdma_xtr_v1_qword_builder builder,
@@ -113,10 +113,10 @@ class rdma_xtr_v1_qword_codec_test extends uvm_test;
       `uvm_error(label, "failure changed qword occupancy")
   endfunction
 
-  // 功能：检查输入值、身份字段和当前生命周期约束，给出一致性判断或状态结果（接口 check_supported_masks）。
-  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
-  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
-  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
+  // 功能：检查输入字段、身份和生命周期约束，返回可诊断的校验状态；失败时不提交部分更新。
+  // 输入/输出及副作用：输入为待校验字段或快照；返回 rdma_status，校验过程不提交资源和游标。
+  //   空依赖、非法范围、身份不一致或非活动状态会返回错误。
+  // 失败/边界：任何非法枚举、越界字段、缺失必需依赖或身份/代际不一致都必须返回非成功状态。
   function automatic void check_supported_masks();
     rdma_image_kind_e image_kinds[8] = '{
       RDMA_IMAGE_CQC,
@@ -174,10 +174,10 @@ class rdma_xtr_v1_qword_codec_test extends uvm_test;
     end
   endfunction
 
-  // 功能：执行 UVM 阶段任务，驱动测试场景并在结束时释放阶段 objection（接口 run_phase）。
-  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
-  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
-  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
+  // 功能：驱动 UVM 阶段中的场景初始化、事务执行和断言收尾，并在退出前释放 objection 或测试资源。
+  // 输入/输出及副作用：phase 控制 UVM 调度；task 驱动事务、断言和 objection，测试 fixture 由本层负责清理。
+  //   阶段提前结束或前置 setup 失败时必须释放 objection 并停止后续访问。
+  // 失败/边界：setup 失败或阶段被终止时停止新增事务，确保 objection、临时对象和外部引用按测试生命周期收尾。
   task run_phase(uvm_phase phase);
     rdma_xtr_v1_qword_builder builder;
     rdma_xtr_v1_qword_builder decoded;

@@ -9,18 +9,18 @@
 class rdma_xtr_v1_error_codec extends uvm_object;
   `uvm_object_utils(rdma_xtr_v1_error_codec)
 
-  // 功能：初始化对象字段、同步 UVM 名称并建立可用的初始生命周期状态（接口 new）。
-  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
-  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
-  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
+  // 功能：构造当前对象并初始化其字段、集合和 UVM 名称；不接管传入句柄的生命周期。
+  // 输入/输出及副作用：name 仅用于 UVM 对象命名；内部字段被初始化为安全默认值，传入句柄不转移所有权。
+  //   返回新对象实例；构造失败由 UVM 工厂或调用方处理。
+  // 失败/边界：不创建外部资源；name 为空时仍允许构造，但所有字段必须保持可配置的初始值。
   function new(string name = "rdma_xtr_v1_error_codec");
     super.new(name);
   endfunction
 
-  // 功能：检查输入值、身份字段和当前生命周期约束，给出一致性判断或状态结果（接口 valid_engine）。
-  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
-  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
-  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
+  // 功能：判断 valid_engine 对应的状态、能力或账本条件，并返回确定的布尔/计数结果，不修改状态。
+  // 输入/输出及副作用：参数 inside 用于执行 valid_engine；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
+  //   调用方不获得内部集合或外部依赖的所有权。
+  // 失败/边界：valid_engine 只读取现有账本；输入未初始化时返回保守结果，不得借助默认 Function/root 猜测。
   local function bit valid_engine(rdma_engine_kind_e engine);
     return engine inside {
       RDMA_ENGINE_NONE, RDMA_ENGINE_RESOURCE, RDMA_ENGINE_CMQ,
@@ -30,10 +30,10 @@ class rdma_xtr_v1_error_codec extends uvm_object;
     };
   endfunction
 
-  // 功能：执行接口 classify 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 classify）。
-  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
-  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
-  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
+  // 功能：处理 classify：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
+  // 输入/输出及副作用：参数 hardware_code 用于执行 classify；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
+  //   调用方不获得内部集合或外部依赖的所有权。
+  // 失败/边界：classify 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
   local function rdma_status_code_e classify(bit [7:0] hardware_code);
     case (hardware_code)
       XTR_V1_CMQ_SUCCESS_ECODE:
@@ -54,10 +54,10 @@ class rdma_xtr_v1_error_codec extends uvm_object;
     endcase
   endfunction
 
-  // 功能：执行接口 inferred_engine 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 inferred_engine）。
-  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
-  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
-  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
+  // 功能：处理 inferred_engine：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
+  // 输入/输出及副作用：参数 hardware_code, code 用于执行 inferred_engine；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
+  //   调用方不获得内部集合或外部依赖的所有权。
+  // 失败/边界：inferred_engine 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
   local function rdma_engine_kind_e inferred_engine(
     bit [7:0] hardware_code,
     rdma_status_code_e code
@@ -82,10 +82,10 @@ class rdma_xtr_v1_error_codec extends uvm_object;
 
   // Names and membership are transcribed from the frozen driver defs.h/wr.h
   // at commit 491faf2ba42627fffd4dd027607299c8bb591ec2.
-  // 功能：执行接口 symbolic_name 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 symbolic_name）。
-  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
-  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
-  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
+  // 功能：处理 symbolic_name：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
+  // 输入/输出及副作用：参数 hardware_code 用于执行 symbolic_name；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
+  //   调用方不获得内部集合或外部依赖的所有权。
+  // 失败/边界：symbolic_name 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
   local function string symbolic_name(bit [7:0] hardware_code);
     case (hardware_code)
       XTR_V1_CMQ_SUCCESS_ECODE: return "XTR_V1_CMQ_SUCCESS";
@@ -232,10 +232,10 @@ class rdma_xtr_v1_error_codec extends uvm_object;
     endcase
   endfunction
 
-  // 功能：解析硬件/协议镜像并恢复受校验约束的模型字段（接口 decode_status）。
-  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
-  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
-  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
+  // 功能：从硬件 image/缓冲区解码请求字段，验证布局和完整性后向调用方返回值或状态。
+  // 输入/输出及副作用：参数 hardware_code, observed_engine, decoded 用于执行 decode_status；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
+  //   调用方不获得内部集合或外部依赖的所有权。
+  // 失败/边界：镜像为空、长度不足或校验失败时不发布部分模型字段。
   function rdma_status decode_status(
     bit [7:0] hardware_code,
     rdma_engine_kind_e observed_engine,

@@ -8,63 +8,63 @@
 
 virtual class rdma_function_table_api extends uvm_object;
 
-  // 功能：初始化对象字段、同步 UVM 名称并建立可用的初始生命周期状态（接口 new）。
-  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
-  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
-  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
+  // 功能：构造当前对象并初始化其字段、集合和 UVM 名称；不接管传入句柄的生命周期。
+  // 输入/输出及副作用：name 仅用于 UVM 对象命名；内部字段被初始化为安全默认值，传入句柄不转移所有权。
+  //   返回新对象实例；构造失败由 UVM 工厂或调用方处理。
+  // 失败/边界：不创建外部资源；name 为空时仍允许构造，但所有字段必须保持可配置的初始值。
   function new(string name = "rdma_function_table_api");
     super.new(name);
   endfunction
 
-  // 功能：执行接口 program_notify 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 program_notify）。
-  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
-  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
-  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
+  // 功能：把 program_notify 的配置或编程请求提交到后端适配器，并返回后端确认状态。
+  // 输入/输出及副作用：参数 binding, status 用于执行 program_notify；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
+  //   调用方不获得内部集合或外部依赖的所有权。
+  // 失败/边界：program_notify 的后端拒绝或超时时不推进本地配置游标，ambiguous 提交必须进入恢复路径。
   pure virtual task program_notify(
     rdma_function_binding binding,
     output rdma_status status
   );
 
-  // 功能：维护内部集合或缓存的一致性，完成指定条目的增删或清空（接口 clear_notify）。
-  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
-  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
-  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
+  // 功能：按资源所有权和幂等规则释放或清理记录；重复释放不会再次扣减 credit，也不触碰已隔离资源。
+  // 输入/输出及副作用：输入为待解除或释放的 handle/key；成功后隔离或删除本对象记录，外部拥有者仍负责真正销毁。
+  //   空值、未知记录或重复调用按接口约定返回错误或幂等成功。
+  // 失败/边界：不得释放非本对象所有资源；重复解除按幂等约定处理，旧 handle 不得重新激活。
   pure virtual task clear_notify(
     rdma_function_binding binding,
     output rdma_status status
   );
 
-  // 功能：执行接口 program_dmi 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 program_dmi）。
-  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
-  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
-  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
+  // 功能：把 program_dmi 的配置或编程请求提交到后端适配器，并返回后端确认状态。
+  // 输入/输出及副作用：参数 binding, status 用于执行 program_dmi；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
+  //   调用方不获得内部集合或外部依赖的所有权。
+  // 失败/边界：program_dmi 的后端拒绝或超时时不推进本地配置游标，ambiguous 提交必须进入恢复路径。
   pure virtual task program_dmi(
     rdma_function_binding binding,
     output rdma_status status
   );
 
-  // 功能：维护内部集合或缓存的一致性，完成指定条目的增删或清空（接口 clear_dmi）。
-  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
-  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
-  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
+  // 功能：按资源所有权和幂等规则释放或清理记录；重复释放不会再次扣减 credit，也不触碰已隔离资源。
+  // 输入/输出及副作用：输入为待解除或释放的 handle/key；成功后隔离或删除本对象记录，外部拥有者仍负责真正销毁。
+  //   空值、未知记录或重复调用按接口约定返回错误或幂等成功。
+  // 失败/边界：不得释放非本对象所有资源；重复解除按幂等约定处理，旧 handle 不得重新激活。
   pure virtual task clear_dmi(
     rdma_function_binding binding,
     output rdma_status status
   );
 
-  // 功能：执行接口 program_vft 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 program_vft）。
-  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
-  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
-  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
+  // 功能：把 program_vft 的配置或编程请求提交到后端适配器，并返回后端确认状态。
+  // 输入/输出及副作用：参数 binding, status 用于执行 program_vft；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
+  //   调用方不获得内部集合或外部依赖的所有权。
+  // 失败/边界：program_vft 的后端拒绝或超时时不推进本地配置游标，ambiguous 提交必须进入恢复路径。
   pure virtual task program_vft(
     rdma_function_binding binding,
     output rdma_status status
   );
 
-  // 功能：维护内部集合或缓存的一致性，完成指定条目的增删或清空（接口 clear_vft）。
-  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
-  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
-  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
+  // 功能：按资源所有权和幂等规则释放或清理记录；重复释放不会再次扣减 credit，也不触碰已隔离资源。
+  // 输入/输出及副作用：输入为待解除或释放的 handle/key；成功后隔离或删除本对象记录，外部拥有者仍负责真正销毁。
+  //   空值、未知记录或重复调用按接口约定返回错误或幂等成功。
+  // 失败/边界：不得释放非本对象所有资源；重复解除按幂等约定处理，旧 handle 不得重新激活。
   pure virtual task clear_vft(
     rdma_function_binding binding,
     output rdma_status status

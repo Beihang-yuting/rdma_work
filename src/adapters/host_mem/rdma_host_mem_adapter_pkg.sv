@@ -16,10 +16,10 @@ package rdma_host_mem_adapter_pkg;
 
   class rdma_host_mem_release_seal extends uvm_object;
 
-    // 功能：初始化对象字段、同步 UVM 名称并建立可用的初始生命周期状态（接口 new）。
-    // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
-    //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
-    // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
+  // 功能：构造当前对象并初始化其字段、集合和 UVM 名称；不接管传入句柄的生命周期。
+  // 输入/输出及副作用：name 仅用于 UVM 对象命名；内部字段被初始化为安全默认值，传入句柄不转移所有权。
+  //   返回新对象实例；构造失败由 UVM 工厂或调用方处理。
+  // 失败/边界：不创建外部资源；name 为空时仍允许构造，但所有字段必须保持可配置的初始值。
     function new(string name = "rdma_host_mem_release_seal");
       super.new(name);
     endfunction
@@ -34,20 +34,20 @@ package rdma_host_mem_adapter_pkg;
     local rdma_host_mem_release_seal release_seal;
     local bit release_complete;
 
-    // 功能：初始化对象字段、同步 UVM 名称并建立可用的初始生命周期状态（接口 new）。
-    // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
-    //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
-    // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
+  // 功能：构造当前对象并初始化其字段、集合和 UVM 名称；不接管传入句柄的生命周期。
+  // 输入/输出及副作用：name 仅用于 UVM 对象命名；内部字段被初始化为安全默认值，传入句柄不转移所有权。
+  //   返回新对象实例；构造失败由 UVM 工厂或调用方处理。
+  // 失败/边界：不创建外部资源；name 为空时仍允许构造，但所有字段必须保持可配置的初始值。
     function new(string name = "rdma_host_mem_allocation_identity");
       super.new(name);
       release_seal = null;
       release_complete = 1'b0;
     endfunction
 
-    // 功能：写入并校验运行所需的配置、身份或资源参数，建立后续操作的边界（接口 initialize）。
-    // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
-    //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
-    // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
+  // 功能：校验依赖并建立该对象的运行边界，成功后保存必要的非拥有引用；拒绝不完整或重复配置。
+  // 输入/输出及副作用：接收 manager、binding、router 或 profile 等依赖；成功后保存非拥有引用并更新配置状态。
+  //   任一依赖为空、重复配置或代际不匹配时保持原状态并返回错误。
+  // 失败/边界：配置失败不得写入半成品引用；已激活对象不得被无条件降级或重复占用资源。
     function rdma_status initialize(rdma_host_mem_release_seal seal);
       if (seal == null)
         return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
@@ -61,10 +61,10 @@ package rdma_host_mem_adapter_pkg;
       return rdma_status::success();
     endfunction
 
-    // 功能：执行接口 mark_release_complete 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 mark_release_complete）。
-    // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
-    //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
-    // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
+  // 功能：执行 mark_release_complete 指定的测试或恢复状态变更，更新受控账本并保留可回滚的故障证据。
+  // 输入/输出及副作用：参数 seal 用于执行 mark_release_complete；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
+  //   调用方不获得内部集合或外部依赖的所有权。
+  // 失败/边界：mark_release_complete 仅允许测试/恢复范围内的状态变更；代际或资源不匹配时拒绝并保留原账本。
     function rdma_status mark_release_complete(
       rdma_host_mem_release_seal seal
     );
@@ -82,10 +82,10 @@ package rdma_host_mem_adapter_pkg;
       return rdma_status::success();
     endfunction
 
-    // 功能：执行接口 completion_status 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 completion_status）。
-    // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
-    //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
-    // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
+  // 功能：处理 completion_status：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
+  // 输入/输出及副作用：参数 complete 用于执行 completion_status；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
+  //   调用方不获得内部集合或外部依赖的所有权。
+  // 失败/边界：completion_status 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
     function rdma_status completion_status(output bit complete);
       complete = 1'b0;
       if (release_seal == null)
@@ -103,19 +103,19 @@ package rdma_host_mem_adapter_pkg;
 
     local rdma_host_mem_allocation_identity allocation_identity;
 
-    // 功能：初始化对象字段、同步 UVM 名称并建立可用的初始生命周期状态（接口 new）。
-    // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
-    //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
-    // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
+  // 功能：构造当前对象并初始化其字段、集合和 UVM 名称；不接管传入句柄的生命周期。
+  // 输入/输出及副作用：name 仅用于 UVM 对象命名；内部字段被初始化为安全默认值，传入句柄不转移所有权。
+  //   返回新对象实例；构造失败由 UVM 工厂或调用方处理。
+  // 失败/边界：不创建外部资源；name 为空时仍允许构造，但所有字段必须保持可配置的初始值。
     function new(string name = "rdma_host_mem_mapping");
       super.new(name);
       allocation_identity = null;
     endfunction
 
-    // 功能：写入并校验运行所需的配置、身份或资源参数，建立后续操作的边界（接口 initialize_allocation_identity）。
-    // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
-    //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
-    // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
+  // 功能：处理 initialize_allocation_identity：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
+  // 输入/输出及副作用：参数 release_seal 用于执行 initialize_allocation_identity；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
+  //   调用方不获得内部集合或外部依赖的所有权。
+  // 失败/边界：initialize_allocation_identity 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
     function rdma_status initialize_allocation_identity(
       rdma_host_mem_release_seal release_seal
     );
@@ -148,10 +148,10 @@ package rdma_host_mem_adapter_pkg;
       return rdma_status::success();
     endfunction
 
-    // 功能：执行接口 mark_release_complete 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 mark_release_complete）。
-    // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
-    //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
-    // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
+  // 功能：执行 mark_release_complete 指定的测试或恢复状态变更，更新受控账本并保留可回滚的故障证据。
+  // 输入/输出及副作用：参数 release_seal 用于执行 mark_release_complete；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
+  //   调用方不获得内部集合或外部依赖的所有权。
+  // 失败/边界：mark_release_complete 仅允许测试/恢复范围内的状态变更；代际或资源不匹配时拒绝并保留原账本。
     function rdma_status mark_release_complete(
       rdma_host_mem_release_seal release_seal
     );
@@ -163,10 +163,10 @@ package rdma_host_mem_adapter_pkg;
       return allocation_identity.mark_release_complete(release_seal);
     endfunction
 
-    // 功能：释放、撤销或回滚当前对象持有的事务/资源，并保持账本与生命周期一致（接口 release_completion_status）。
-    // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
-    //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
-    // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
+  // 功能：按资源所有权和幂等规则释放或清理记录；重复释放不会再次扣减 credit，也不触碰已隔离资源。
+  // 输入/输出及副作用：输入为待解除或释放的 handle/key；成功后隔离或删除本对象记录，外部拥有者仍负责真正销毁。
+  //   空值、未知记录或重复调用按接口约定返回错误或幂等成功。
+  // 失败/边界：不得释放非本对象所有资源；重复解除按幂等约定处理，旧 handle 不得重新激活。
     virtual function rdma_status release_completion_status(
       output bit release_complete
     );
@@ -179,10 +179,10 @@ package rdma_host_mem_adapter_pkg;
       return allocation_identity.completion_status(release_complete);
     endfunction
 
-    // 功能：检查输入值、身份字段和当前生命周期约束，给出一致性判断或状态结果（接口 same_allocation）。
-    // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
-    //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
-    // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
+  // 功能：比较两个输入对象的协议字段或身份快照并返回确定的相等性结果，不修改任一输入。
+  // 输入/输出及副作用：输入为待比较的两个值对象；返回 bit/状态结果，不修改任一输入或外部账本。
+  //   任一对象为空、类型不符或字段未初始化时按接口约定返回不相等或错误。
+  // 失败/边界：比较输入为空或类型不符时不得抛出未处理异常；结果必须保持确定且无副作用。
     function bit same_allocation(rdma_host_mem_mapping rhs);
       if (rhs == null)
         return 1'b0;
@@ -191,10 +191,10 @@ package rdma_host_mem_adapter_pkg;
              allocation_identity == rhs.allocation_identity;
     endfunction
 
-    // 功能：读取或查询当前对象的权威状态，并以返回值或 output 参数交付快照（接口 snapshot_release_authority）。
-    // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
-    //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
-    // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
+  // 功能：按输入的完整标识查询当前权威记录并返回独立快照；缺失、歧义或代际过期时返回明确错误。
+  // 输入/输出及副作用：输入为完整 key/handle，output 或返回值为记录快照；查询不改变登记表和外部资源。
+  //   缺失、歧义、空句柄或旧 generation/reset epoch 返回明确错误。
+  // 失败/边界：查询不到唯一记录、输入为空或 authority 已失效时返回错误，不回退到默认 Function/root。
     virtual function rdma_status snapshot_release_authority(
       output rdma_dma_mapping snapshot
     );
@@ -208,10 +208,10 @@ package rdma_host_mem_adapter_pkg;
       return status;
     endfunction
 
-    // 功能：释放、撤销或回滚当前对象持有的事务/资源，并保持账本与生命周期一致（接口 release_authority_status）。
-    // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
-    //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
-    // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
+  // 功能：按资源所有权和幂等规则释放或清理记录；重复释放不会再次扣减 credit，也不触碰已隔离资源。
+  // 输入/输出及副作用：输入为待解除或释放的 handle/key；成功后隔离或删除本对象记录，外部拥有者仍负责真正销毁。
+  //   空值、未知记录或重复调用按接口约定返回错误或幂等成功。
+  // 失败/边界：不得释放非本对象所有资源；重复解除按幂等约定处理，旧 handle 不得重新激活。
     virtual function rdma_status release_authority_status(
       rdma_dma_mapping snapshot
     );
@@ -226,10 +226,10 @@ package rdma_host_mem_adapter_pkg;
       return rdma_status::success();
     endfunction
 
-    // 功能：依据输入快照构造请求、资源或适配对象，并返回独立的结果载体（接口 make_authority_snapshot）。
-    // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
-    //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
-    // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
+  // 功能：依据输入请求创建对应的值对象或资源计划，并校验依赖、所有权和生命周期后返回结果。
+  // 输入/输出及副作用：输入请求、容量和依赖用于构造/预留资源；返回独立对象或状态，不暴露内部可变集合。
+  //   参数越界、容量不足或构造中途失败时回滚已登记的局部状态。
+  // 失败/边界：依赖为空、参数越界、容量不足或构造步骤失败时清理局部结果并返回明确错误。
     function rdma_status make_authority_snapshot(
       output rdma_host_mem_mapping snapshot
     );
@@ -299,10 +299,10 @@ package rdma_host_mem_adapter_pkg;
       return rdma_status::success();
     endfunction
 
-    // 功能：把源对象投影/克隆为当前类型的独立值快照，避免共享可变引用（接口 do_copy）。
-    // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
-    //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
-    // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
+  // 功能：从源对象复制可变字段并生成独立值快照；源对象保持不变，类型不匹配时报告复制错误。
+  // 输入/输出及副作用：source/rhs 是源对象；返回或写入独立副本，不修改源对象。
+  //   source/rhs 为空或类型不匹配时返回空值或触发既定复制错误。
+  // 失败/边界：空源对象不应解引用；类型不匹配必须拒绝复制或按既定 UVM 规则报告 fatal。
     virtual function void do_copy(uvm_object rhs);
       rdma_host_mem_mapping rhs_mapping;
       rdma_host_mem_allocation_identity destination_identity;
@@ -331,10 +331,10 @@ package rdma_host_mem_adapter_pkg;
     host_mem_pkg::host_mem_api backing_mem;
     bit active;
 
-    // 功能：初始化对象字段、同步 UVM 名称并建立可用的初始生命周期状态（接口 new）。
-    // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
-    //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
-    // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
+  // 功能：构造当前对象并初始化其字段、集合和 UVM 名称；不接管传入句柄的生命周期。
+  // 输入/输出及副作用：name 仅用于 UVM 对象命名；内部字段被初始化为安全默认值，传入句柄不转移所有权。
+  //   返回新对象实例；构造失败由 UVM 工厂或调用方处理。
+  // 失败/边界：不创建外部资源；name 为空时仍允许构造，但所有字段必须保持可配置的初始值。
     function new(string name = "rdma_host_mem_allocation_record");
       super.new(name);
       authority = null;
@@ -362,10 +362,10 @@ package rdma_host_mem_adapter_pkg;
     protected bit iova_cursor_valid;
     protected bit [64:0] next_iova;
 
-    // 功能：初始化对象字段、同步 UVM 名称并建立可用的初始生命周期状态（接口 new）。
-    // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
-    //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
-    // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
+  // 功能：构造当前对象并初始化其字段、集合和 UVM 名称；不接管传入句柄的生命周期。
+  // 输入/输出及副作用：name 仅用于 UVM 对象命名；内部字段被初始化为安全默认值，传入句柄不转移所有权。
+  //   返回新对象实例；构造失败由 UVM 工厂或调用方处理。
+  // 失败/边界：不创建外部资源；name 为空时仍允许构造，但所有字段必须保持可配置的初始值。
     function new(string name = "rdma_host_mem_adapter");
       super.new(name);
       mem = null;
@@ -377,10 +377,10 @@ package rdma_host_mem_adapter_pkg;
       next_iova = '0;
     endfunction
 
-    // 功能：把源对象投影/克隆为当前类型的独立值快照，避免共享可变引用（接口 clone_function_handle）。
-    // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
-    //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
-    // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
+  // 功能：从源对象复制可变字段并生成独立值快照；源对象保持不变，类型不匹配时报告复制错误。
+  // 输入/输出及副作用：source/rhs 是源对象；返回或写入独立副本，不修改源对象。
+  //   source/rhs 为空或类型不匹配时返回空值或触发既定复制错误。
+  // 失败/边界：空源对象不应解引用；类型不匹配必须拒绝复制或按既定 UVM 规则报告 fatal。
     protected function rdma_function_handle clone_function_handle(
       rdma_function_handle source
     );
@@ -395,10 +395,10 @@ package rdma_host_mem_adapter_pkg;
       return result;
     endfunction
 
-    // 功能：把源对象投影/克隆为当前类型的独立值快照，避免共享可变引用（接口 clone_owner_handle）。
-    // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
-    //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
-    // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
+  // 功能：从源对象复制可变字段并生成独立值快照；源对象保持不变，类型不匹配时报告复制错误。
+  // 输入/输出及副作用：source/rhs 是源对象；返回或写入独立副本，不修改源对象。
+  //   source/rhs 为空或类型不匹配时返回空值或触发既定复制错误。
+  // 失败/边界：空源对象不应解引用；类型不匹配必须拒绝复制或按既定 UVM 规则报告 fatal。
     protected function rdma_handle clone_owner_handle(rdma_handle source);
       uvm_object cloned_object;
       rdma_handle result;
@@ -411,20 +411,20 @@ package rdma_host_mem_adapter_pkg;
       return result;
     endfunction
 
-    // 功能：检查输入值、身份字段和当前生命周期约束，给出一致性判断或状态结果（接口 same_handle）。
-    // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
-    //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
-    // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
+  // 功能：比较两个输入对象的协议字段或身份快照并返回确定的相等性结果，不修改任一输入。
+  // 输入/输出及副作用：输入为待比较的两个值对象；返回 bit/状态结果，不修改任一输入或外部账本。
+  //   任一对象为空、类型不符或字段未初始化时按接口约定返回不相等或错误。
+  // 失败/边界：比较输入为空或类型不符时不得抛出未处理异常；结果必须保持确定且无副作用。
     protected function bit same_handle(rdma_handle lhs, rdma_handle rhs);
       if (lhs == null || rhs == null)
         return lhs == null && rhs == null;
       return lhs.same_instance(rhs);
     endfunction
 
-    // 功能：执行接口 mapping_values_match 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 mapping_values_match）。
-    // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
-    //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
-    // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
+  // 功能：处理 mapping_values_match：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
+  // 输入/输出及副作用：参数 candidate, authority 用于执行 mapping_values_match；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
+  //   调用方不获得内部集合或外部依赖的所有权。
+  // 失败/边界：mapping_values_match 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
     protected function bit mapping_values_match(
       rdma_dma_mapping candidate,
       rdma_dma_mapping authority
@@ -446,10 +446,10 @@ package rdma_host_mem_adapter_pkg;
              same_handle(candidate.owner_h, authority.owner_h);
     endfunction
 
-    // 功能：读取或查询当前对象的权威状态，并以返回值或 output 参数交付快照（接口 find_allocation）。
-    // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
-    //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
-    // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
+  // 功能：按输入的完整标识查询当前权威记录并返回独立快照；缺失、歧义或代际过期时返回明确错误。
+  // 输入/输出及副作用：输入为完整 key/handle，output 或返回值为记录快照；查询不改变登记表和外部资源。
+  //   缺失、歧义、空句柄或旧 generation/reset epoch 返回明确错误。
+  // 失败/边界：查询不到唯一记录、输入为空或 authority 已失效时返回错误，不回退到默认 Function/root。
     protected function int find_allocation(rdma_host_mem_mapping mapping);
       if (mapping == null)
         return -1;
@@ -461,10 +461,10 @@ package rdma_host_mem_adapter_pkg;
       return -1;
     endfunction
 
-    // 功能：检查输入值、身份字段和当前生命周期约束，给出一致性判断或状态结果（接口 validate_mapping）。
-    // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
-    //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
-    // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
+  // 功能：检查输入字段、身份和生命周期约束，返回可诊断的校验状态；失败时不提交部分更新。
+  // 输入/输出及副作用：输入为待校验字段或快照；返回 rdma_status，校验过程不提交资源和游标。
+  //   空依赖、非法范围、身份不一致或非活动状态会返回错误。
+  // 失败/边界：任何非法枚举、越界字段、缺失必需依赖或身份/代际不一致都必须返回非成功状态。
     protected function rdma_status validate_mapping(
       rdma_dma_mapping mapping,
       output int allocation_index
@@ -498,10 +498,10 @@ package rdma_host_mem_adapter_pkg;
       return rdma_status::success();
     endfunction
 
-    // 功能：检查输入值、身份字段和当前生命周期约束，给出一致性判断或状态结果（接口 validate_range）。
-    // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
-    //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
-    // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
+  // 功能：检查输入字段、身份和生命周期约束，返回可诊断的校验状态；失败时不提交部分更新。
+  // 输入/输出及副作用：输入为待校验字段或快照；返回 rdma_status，校验过程不提交资源和游标。
+  //   空依赖、非法范围、身份不一致或非活动状态会返回错误。
+  // 失败/边界：任何非法枚举、越界字段、缺失必需依赖或身份/代际不一致都必须返回非成功状态。
     protected function rdma_status validate_range(
       rdma_host_mem_allocation_record allocation,
       longint unsigned offset,
@@ -536,10 +536,10 @@ package rdma_host_mem_adapter_pkg;
       return rdma_status::success();
     endfunction
 
-    // 功能：执行接口 iova_overlaps_active 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 iova_overlaps_active）。
-    // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
-    //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
-    // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
+  // 功能：处理 iova_overlaps_active：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
+  // 输入/输出及副作用：参数 first_iova, end_iova 用于执行 iova_overlaps_active；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
+  //   调用方不获得内部集合或外部依赖的所有权。
+  // 失败/边界：iova_overlaps_active 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
     protected function bit iova_overlaps_active(
       bit [63:0] first_iova,
       bit [64:0] end_iova
@@ -562,10 +562,10 @@ package rdma_host_mem_adapter_pkg;
       return 1'b0;
     endfunction
 
-    // 功能：执行接口 choose_iova 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 choose_iova）。
-    // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
-    //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
-    // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
+  // 功能：处理 choose_iova：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
+  // 输入/输出及副作用：参数 backing_address, size, alignment, selected_iova, committed_cursor 用于执行 choose_iova；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
+  //   调用方不获得内部集合或外部依赖的所有权。
+  // 失败/边界：choose_iova 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
     protected function rdma_status choose_iova(
       bit [63:0] backing_address,
       int unsigned size,
@@ -612,10 +612,10 @@ package rdma_host_mem_adapter_pkg;
       return rdma_status::success();
     endfunction
 
-    // 功能：原子地预留或获取所需资源/游标，并记录后续提交所需的所有权证据（接口 allocate）。
-    // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
-    //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
-    // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
+  // 功能：检查可用容量并预留所需资源，返回带所有权证据的分配结果；容量不足时不留下部分分配。
+  // 输入/输出及副作用：输入请求、容量和依赖用于构造/预留资源；返回独立对象或状态，不暴露内部可变集合。
+  //   参数越界、容量不足或构造中途失败时回滚已登记的局部状态。
+  // 失败/边界：依赖为空、参数越界、容量不足或构造步骤失败时清理局部结果并返回明确错误。
     virtual function rdma_status allocate(
       rdma_dma_request_context request_context,
       int unsigned size,
@@ -762,10 +762,10 @@ package rdma_host_mem_adapter_pkg;
       return rdma_status::success();
     endfunction
 
-    // 功能：向目标后端提交数据/事务并更新本对象的进度或账本状态（接口 write）。
-    // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
-    //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
-    // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
+  // 功能：向指定后端写入请求数据并保留返回状态；写入失败时不推进本地提交游标。
+  // 输入/输出及副作用：参数 mapping, offset, data 用于执行 write；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
+  //   调用方不获得内部集合或外部依赖的所有权。
+  // 失败/边界：后端拒绝或写入范围越界时不推进本地提交游标，也不伪造成功状态。
     virtual function rdma_status write(
       rdma_dma_mapping mapping,
       longint unsigned offset,
@@ -790,10 +790,10 @@ package rdma_host_mem_adapter_pkg;
       return rdma_status::success();
     endfunction
 
-    // 功能：读取或查询当前对象的权威状态，并以返回值或 output 参数交付快照（接口 read）。
-    // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
-    //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
-    // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
+  // 功能：按输入的完整标识查询当前权威记录并返回独立快照；缺失、歧义或代际过期时返回明确错误。
+  // 输入/输出及副作用：输入为完整 key/handle，output 或返回值为记录快照；查询不改变登记表和外部资源。
+  //   缺失、歧义、空句柄或旧 generation/reset epoch 返回明确错误。
+  // 失败/边界：查询不到唯一记录、输入为空或 authority 已失效时返回错误，不回退到默认 Function/root。
     virtual function rdma_status read(
       rdma_dma_mapping mapping,
       longint unsigned offset,
@@ -825,10 +825,10 @@ package rdma_host_mem_adapter_pkg;
       return rdma_status::success();
     endfunction
 
-    // 功能：释放、撤销或回滚当前对象持有的事务/资源，并保持账本与生命周期一致（接口 \release）。
-    // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
-    //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
-    // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
+  // 功能：按资源所有权和幂等规则释放或清理记录；重复释放不会再次扣减 credit，也不触碰已隔离资源。
+  // 输入/输出及副作用：输入为待解除或释放的 handle/key；成功后隔离或删除本对象记录，外部拥有者仍负责真正销毁。
+  //   空值、未知记录或重复调用按接口约定返回错误或幂等成功。
+  // 失败/边界：不得释放非本对象所有资源；重复解除按幂等约定处理，旧 handle 不得重新激活。
     virtual function rdma_status \release (rdma_dma_mapping mapping);
       int allocation_index;
       rdma_host_mem_mapping concrete_mapping;
@@ -867,10 +867,10 @@ package rdma_host_mem_adapter_pkg;
     // host_mem leak_check is manager-global.  leak_count is adapter-owner
     // local; callers should isolate or first release unrelated manager users
     // when they require a pristine global host_mem report.
-    // 功能：检查输入值、身份字段和当前生命周期约束，给出一致性判断或状态结果（接口 check_leaks）。
-    // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
-    //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
-    // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
+  // 功能：检查输入字段、身份和生命周期约束，返回可诊断的校验状态；失败时不提交部分更新。
+  // 输入/输出及副作用：输入为待校验字段或快照；返回 rdma_status，校验过程不提交资源和游标。
+  //   空依赖、非法范围、身份不一致或非活动状态会返回错误。
+  // 失败/边界：任何非法枚举、越界字段、缺失必需依赖或身份/代际不一致都必须返回非成功状态。
     function rdma_status check_leaks(output int unsigned leak_count);
       host_mem_pkg::host_mem_api checked_mem[$];
       bit already_checked;

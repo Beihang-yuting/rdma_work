@@ -175,10 +175,10 @@ localparam bit [63:0] XTR_V1_SQ_WQE_ATOMIC_FAA_BODY_MASK [0:7] = '{
   64'hffffffffffffffff, 64'h0
 };
 
-// 功能：执行接口 request_envelope_mask 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 request_envelope_mask）。
-// 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
-//   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
-// 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
+  // 功能：处理 request_envelope_mask：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
+  // 输入/输出及副作用：参数 qword_index 用于执行 request_envelope_mask；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
+  //   调用方不获得内部集合或外部依赖的所有权。
+  // 失败/边界：request_envelope_mask 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
 function automatic bit [63:0] request_envelope_mask(
     int unsigned qword_index);
   if (qword_index > 7)
@@ -186,10 +186,10 @@ function automatic bit [63:0] request_envelope_mask(
   return XTR_V1_CMQ_ENVELOPE_MASK[qword_index];
 endfunction
 
-// 功能：执行接口 body_mask 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 body_mask）。
-// 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
-//   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
-// 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
+  // 功能：处理 body_mask：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
+  // 输入/输出及副作用：参数 image_kind, opcode, pbl_mode, qword_index, mask 用于执行 body_mask；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
+  //   调用方不获得内部集合或外部依赖的所有权。
+  // 失败/边界：body_mask 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
 function automatic bit body_mask(
     rdma_image_kind_e image_kind,
     bit [7:0] opcode,
