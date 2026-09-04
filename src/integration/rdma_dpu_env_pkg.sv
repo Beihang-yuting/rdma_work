@@ -1,4 +1,9 @@
-// 中文说明：integration package 是 dpu_common 与 RDMA 之间唯一的组合边界。
+// 目录：src/integration/，为 dpu_common→RDMA 集成层提供单一 package 入口。
+// 职责：导入 UVM、RDMA 基础类型/模型/适配器/核心类型和 dpu_common 资源类型，
+//       按依赖顺序包含 identity、Host-memory、PCIe、reset、Function context 与 device env。
+// 依赖：外部 dpu_common/src/dpu_resource_pkg.sv；本 package 不拥有外部环境对象。
+// 所有权与生命周期：package 类型在编译单元生命周期内可见；其中各 env/router 的对象
+//       所有权仍由调用方和外部 PCIe/Host-memory 环境分别承担。
 `ifndef RDMA_DPU_ENV_PKG_SV
 `define RDMA_DPU_ENV_PKG_SV
 package rdma_dpu_env_pkg;

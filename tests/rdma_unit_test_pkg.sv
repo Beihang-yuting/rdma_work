@@ -19,6 +19,9 @@ package rdma_unit_test_pkg;
   import rdma_model_pkg::rdma_queue_recovery_action_e;
 `ifdef RDMA_DPU_INTEGRATION
   import rdma_dpu_env_pkg::*;
+  // 测试夹具需要直接构造 dpu_common snapshot，以验证 integration 边界的
+  // 查询语义；生产代码仍只依赖 rdma_dpu_env_pkg 的适配接口。
+  import dpu_resource_pkg::*;
 `endif
 `ifdef RDMA_HOST_MEM_TEST
   import host_mem_pkg::*;
@@ -80,6 +83,7 @@ package rdma_unit_test_pkg;
   `include "integration/rdma_dpu_integration_test.sv"
   `include "unit/rdma_host_mem_router_test.sv"
   `include "unit/rdma_pcie_router_test.sv"
+  `include "unit/rdma_reset_coordinator_test.sv"
 `endif
 endpackage
 
