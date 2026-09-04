@@ -28,6 +28,14 @@ Commands were run from this worktree with:
 `rdma_qp_lifecycle_test` and `rdma_control_plane_cmq_engine_test` were not
 executed in this pass.
 
+Post-Host0 rerun: queue lifecycle, QP lifecycle, control-plane CMQ, identity,
+and transaction journal all exited 0 with warning=0 error=0 fatal=0. Resource
+manager remains blocked by legacy generation mutation fixtures pending explicit
+synchronization migration.
+
+The transaction journal additionally covers recording a distinct second WQE
+release while already in partial-release phase.
+
 `git diff --check` passed before commit `8d0a2d5`.
 
 ## Host0 correction

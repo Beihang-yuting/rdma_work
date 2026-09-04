@@ -935,6 +935,7 @@ class rdma_qp_activation_rebind_manager extends rdma_qp_fault_manager;
         binding_target != null) begin
       rebind_after_activate = 1'b0;
       binding_target.generation++;
+      binding_target.synchronize_identity_from_legacy_mirrors();
       binding_target.owner_h = binding_target.make_handle();
     end
     return status;
@@ -1050,6 +1051,7 @@ class rdma_qp_destroy_rebind_cmq extends rdma_mock_cmq_port;
         command.opcode_key != null &&
         command.opcode_key.opcode == XTR_V1_OP_QPC_MODIFY) begin
       binding_target.generation++;
+      binding_target.synchronize_identity_from_legacy_mirrors();
       binding_target.owner_h = binding_target.make_handle();
       rebound = 1'b1;
     end
@@ -4523,6 +4525,8 @@ class rdma_qp_lifecycle_test extends uvm_test;
     modify_req.qp_h = rdma_clone_handle_value(qp.handle, "stale modify QP");
     modify_req.new_state = RDMA_QPS_INIT;
     binding.generation++;
+    if (!binding.synchronize_identity_from_legacy_mirrors().ok())
+      `uvm_error("BINDING", "legacy identity synchronization failed")
     calls_before = cmq.calls.size();
     executor.modify_locked(binding, modify_req.owner, modify_req, 841,
                            qp, result);

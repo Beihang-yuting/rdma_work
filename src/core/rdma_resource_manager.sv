@@ -3248,6 +3248,11 @@ class rdma_resource_manager extends uvm_object;
     end
 
     trusted_binding.generation = observed_generation;
+    status = trusted_binding.synchronize_identity_from_legacy_mirrors();
+    if (status == null || !status.ok())
+      return status == null ? rdma_status::make(
+        RDMA_SC_INVALID_STATE, "trusted binding identity synchronization returned null"
+      ) : status;
     trusted_binding.owner_h = binding_handle_value(
       trusted_binding, "trusted_binding_owner"
     );

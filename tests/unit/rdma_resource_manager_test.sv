@@ -4107,6 +4107,7 @@ class rdma_resource_manager_test extends uvm_test;
   endfunction
 
   task run_phase(uvm_phase phase);
+    rdma_status status;
     rdma_resource_manager rm;
     rdma_resource_manager dep_rm;
     rdma_resource_manager teardown_rm;
@@ -6208,8 +6209,11 @@ class rdma_resource_manager_test extends uvm_test;
     composite_function_pcie.bdf =
       '{segment:16'hc0a1, bus:8'h11, device:5'h12, function_num:3'h3};
     composite_function_pcie.parent_pf_bdf =
-      '{segment:16'hc0a2, bus:8'h21, device:5'h13, function_num:3'h4};
+      '{segment:16'hc0a1, bus:8'h21, device:5'h13, function_num:3'h4};
     composite_function_pcie.vf_index = 32'hc0a1_0a0a;
+    status = composite_function_binding.configure_identity_from_legacy_mirrors(
+      16'h0, 32'h1, RDMA_FUNCTION_VF, 16'h0a0a);
+    expect_status("COMPOSITE_FUNCTION_IDENTITY", status, RDMA_SC_OK);
     composite_function_pcie.mse = 1'b1;
     composite_function_pcie.bme = 1'b1;
     composite_function_binding.queue_dma.requester_bdf =
@@ -6299,11 +6303,11 @@ class rdma_resource_manager_test extends uvm_test;
         composite_function_pcie.bdf.bus != 8'h11 ||
         composite_function_pcie.bdf.device != 5'h12 ||
         composite_function_pcie.bdf.function_num != 3'h3 ||
-        composite_function_pcie.parent_pf_bdf.segment != 16'hc0a2 ||
+        composite_function_pcie.parent_pf_bdf.segment != 16'hc0a1 ||
         composite_function_pcie.parent_pf_bdf.bus != 8'h21 ||
         composite_function_pcie.parent_pf_bdf.device != 5'h13 ||
         composite_function_pcie.parent_pf_bdf.function_num != 3'h4 ||
-        composite_function_pcie.vf_index != 32'hc0a1_0a0a ||
+        composite_function_pcie.vf_index != 32'h0000_0a0a ||
         !composite_function_pcie.mse || !composite_function_pcie.bme)
       `uvm_error("COMPOSITE_FUNCTION_SOURCE",
                  "Function carrier hook ran or a source sentinel changed")
@@ -7714,6 +7718,7 @@ class rdma_resource_manager_test extends uvm_test;
                     privileged_recovery_pd.handle, recovery_lookup
                   ), RDMA_SC_STALE_GENERATION);
     privileged_recovery_binding.generation++;
+    privileged_recovery_binding.synchronize_identity_from_legacy_mirrors();
     privileged_recovery_binding.owner_h =
       privileged_recovery_binding.make_handle();
     expect_status("PRIV_RECOVERY_ID_REUSE",
@@ -7760,6 +7765,7 @@ class rdma_resource_manager_test extends uvm_test;
       RDMA_SC_RESET_CANCELLED, "Function generation advanced"
     );
     stale_recovery_binding.generation++;
+    stale_recovery_binding.synchronize_identity_from_legacy_mirrors();
     stale_recovery_binding.owner_h = stale_recovery_binding.make_handle();
     expect_status("STALE_RECOVERY_MARK_EXCEPTION",
                   stale_recovery_rm.mark_error(stale_recovery_h,
@@ -7798,6 +7804,7 @@ class rdma_resource_manager_test extends uvm_test;
     s = rm.\release (pd.handle);
     expect_status("RM_RELEASE_PD", s, RDMA_SC_OK);
     active_binding.generation++;
+    active_binding.synchronize_identity_from_legacy_mirrors();
     s = rm.lookup(old_h, resource);
     expect_status("RM_STALE_GENERATION", s, RDMA_SC_STALE_GENERATION);
 
@@ -8000,11 +8007,13 @@ class rdma_resource_manager_test extends uvm_test;
                   RDMA_SC_OK);
     rollback_h = clone_handle("ROLLBACK_H", rollback_pd.handle);
     rollback_binding.generation = 32'd42;
+    rollback_binding.synchronize_identity_from_legacy_mirrors();
     rollback_binding.owner_h = rollback_binding.make_handle();
     expect_status("ROLLBACK_A_STALE_AT_B",
                   rollback_rm.lookup(rollback_h, resource),
                   RDMA_SC_STALE_GENERATION);
     rollback_binding.generation = 32'd41;
+    rollback_binding.synchronize_identity_from_legacy_mirrors();
     rollback_binding.owner_h = rollback_binding.make_handle();
     expect_status("ROLLBACK_A_STAYS_STALE",
                   rollback_rm.lookup(rollback_h, resource),
@@ -8029,6 +8038,7 @@ class rdma_resource_manager_test extends uvm_test;
     generation_old_h = clone_handle("GENERATION_OLD_H",
                                     generation_pd.handle);
     binding_a.generation++;
+    binding_a.synchronize_identity_from_legacy_mirrors();
     binding_a.owner_h = binding_a.make_handle();
     expect_status("GENERATION_REJECT_OVERLAP",
                   generation_rm.create_pd(binding_a,
@@ -8312,6 +8322,7 @@ class rdma_resource_manager_test extends uvm_test;
     expect_status("FUNCTION_CYCLE_RELEASE_A",
                   function_cycle_rm.release_function(owner_h), RDMA_SC_OK);
     function_cycle_binding.generation = 32'd6;
+    function_cycle_binding.synchronize_identity_from_legacy_mirrors();
     function_cycle_binding.owner_h = function_cycle_binding.make_handle();
     expect_status("FUNCTION_CYCLE_CREATE_B",
                   function_cycle_rm.create_function(function_cycle_binding,

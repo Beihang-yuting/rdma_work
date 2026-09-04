@@ -105,6 +105,12 @@ class rdma_queue_txn_journal_test extends uvm_test;
     if (!status.ok() || submitted.release_plan.size() != 1 ||
         !submitted.release_plan[0].released)
       `uvm_error("TXN", "duplicate WQE release was not idempotent")
+    status = submitted.mark_wqe_release(4, 1'b1);
+    if (!status.ok() || submitted.release_plan.size() != 2 ||
+        !submitted.release_plan[1].released ||
+        submitted.release_plan[1].index != 4 ||
+        !submitted.release_plan[1].wrap)
+      `uvm_error("TXN", "distinct partial WQE release was not recorded")
     status = submitted.complete();
     if (!status.ok() || submitted.phase != RDMA_QUEUE_TXN_COMPLETED)
       `uvm_error("TXN", "transaction completion rejected after release")

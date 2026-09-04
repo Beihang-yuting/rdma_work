@@ -346,6 +346,11 @@ class rdma_queue_txn_evidence extends uvm_object;
     plan = rdma_queue_cq_release_plan::type_id::create("release_plan");
     plan.index = index; plan.wrap = wrap; plan.released = 1'b1;
     release_plan.push_back(plan);
+    // A partial release may accumulate multiple distinct WQE entries; adding
+    // a plan must not attempt a same-phase transition (or leave a mutation
+    // behind on an INVALID_STATE result).
+    if (phase == RDMA_QUEUE_TXN_WQE_RELEASE_PARTIAL)
+      return rdma_status::success();
     return transition_to(RDMA_QUEUE_TXN_WQE_RELEASE_PARTIAL);
   endfunction
 
