@@ -4626,6 +4626,7 @@ class rdma_cmq_engine_test extends uvm_test;
 
     candidate = make_binding("generation_candidate", RDMA_BIND_ACTIVE);
     candidate.generation++;
+    candidate.synchronize_identity_from_legacy_mirrors();
     candidate.owner_h = candidate.make_handle();
     engine.activate(candidate, status);
     expect_status("ACTIVATE_GENERATION", status,
@@ -4809,6 +4810,7 @@ class rdma_cmq_engine_test extends uvm_test;
     second_binding.function_uid++;
     second_binding.global_function_id++;
     second_binding.generation++;
+    second_binding.synchronize_identity_from_legacy_mirrors();
     second_binding.owner_h = second_binding.make_handle();
     second_cmq = make_cmq("prepared_shutdown_second_cmq", second_binding);
     prepare_defaults("PREPARED_SHUTDOWN_REPREPARE", engine, second_mem,
@@ -12376,8 +12378,10 @@ class rdma_cmq_engine_test extends uvm_test;
                                  RDMA_BIND_PREPARED);
     next_active = make_binding("reset_fifo_next_active", RDMA_BIND_ACTIVE);
     next_prepared.generation++;
+    next_prepared.synchronize_identity_from_legacy_mirrors();
     next_prepared.owner_h = next_prepared.make_handle();
     next_active.generation++;
+    next_active.synchronize_identity_from_legacy_mirrors();
     next_active.owner_h = next_active.make_handle();
     next_cmq = make_cmq("reset_fifo_next_cmq", next_prepared);
     scheduler = rdma_doorbell_scheduler::type_id::create(
@@ -12562,8 +12566,10 @@ class rdma_cmq_engine_test extends uvm_test;
                                  RDMA_BIND_PREPARED);
     next_active = make_binding("poison_reset_next_active", RDMA_BIND_ACTIVE);
     next_prepared.generation++;
+    next_prepared.synchronize_identity_from_legacy_mirrors();
     next_prepared.owner_h = next_prepared.make_handle();
     next_active.generation++;
+    next_active.synchronize_identity_from_legacy_mirrors();
     next_active.owner_h = next_active.make_handle();
     next_cmq = make_cmq("poison_reset_next_cmq", next_prepared);
     scheduler = rdma_doorbell_scheduler::type_id::create(
