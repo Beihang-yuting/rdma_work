@@ -5,8 +5,9 @@
 - Queue transaction evidence now captures detached snapshots for function identity,
   queue handle, semantic request, CQE, hardware image, and failure status.
 - Evidence `do_copy` deep-clones all owned objects and release plans. Compatibility
-  aliases (`capture_queue_h`, `capture_request_snapshot`, `capture_cqe_snapshot`,
-  `set_failure_status`) route through the same APIs.
+aliases (`capture_queue_h`, `capture_request_snapshot`, `capture_cqe_snapshot`,
+  `set_failure_status`, plus setter-style queue/request/CQE aliases) route through
+  the same APIs.
 - All transaction phase side effects use the guarded transition helper; terminal and
   bypass attempts are rejected. Chinese comments document ownership, lifecycle and
   recovery semantics.
