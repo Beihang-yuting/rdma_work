@@ -21,6 +21,8 @@ typedef enum bit [1:0] {
 } rdma_queue_recovery_action_e;
 
 class rdma_queue_cq_release_plan extends uvm_object;
+  // 中文说明：单个 CQ WQE 释放计划由事务 evidence 创建并拥有；记录 index/
+  // wrap 及释放状态，随 evidence 生命周期销毁，不转移底层队列资源所有权。
   `uvm_object_utils(rdma_queue_cq_release_plan)
   int unsigned index;
   bit wrap;
@@ -290,6 +292,9 @@ class rdma_queue_txn_evidence extends uvm_object;
     cloned = source.clone();
     if (cloned == null || !$cast(image, cloned))
       return rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED, "hardware image snapshot clone failed");
+    if (image == source)
+      return rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED,
+                               "hardware image snapshot aliased source");
     return rdma_status::success();
   endfunction
 
@@ -357,7 +362,15 @@ class rdma_queue_txn_evidence extends uvm_object;
   function rdma_status complete();
     if (aborted || phase != RDMA_QUEUE_TXN_WQE_RELEASE_PARTIAL)
       return rdma_status::make(RDMA_SC_INVALID_STATE, "transaction cannot complete");
-    return transition_to(RDMA_QUEUE_TXN_COMPLETED);
+    if (release_plan.size() == 0)
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "transaction completion requires WQE release plan");
+    foreach (release_plan[i]) begin
+      if (release_plan[i] != null && release_plan[i].released)
+        return transition_to(RDMA_QUEUE_TXN_COMPLETED);
+    end
+    return rdma_status::make(RDMA_SC_INVALID_STATE,
+                             "transaction completion requires released WQE");
   endfunction
 
   // 中文：abort 是不可逆终态标记；调用者仍拥有 evidence，释放动作必须

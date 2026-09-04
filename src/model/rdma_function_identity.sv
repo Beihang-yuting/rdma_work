@@ -1,4 +1,6 @@
-// 中文说明：rdma_function_identity.sv 定义跨 Host/root 隔离的 Function 值快照。
+// 中文说明：本类是跨 Host/root 隔离的 Function 身份值快照与唯一权威。
+// 创建者通过 configure() 写入；binding 持有其克隆作为 authority，调用方
+// 读取 detached snapshot。对象生命周期随拥有者结束，不单独释放外部资源。
 class rdma_function_identity extends uvm_object;
   `uvm_object_utils(rdma_function_identity)
 
