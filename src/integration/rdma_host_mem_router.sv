@@ -15,6 +15,7 @@ class rdma_host_mem_router extends rdma_host_mem_api;
   protected rdma_reset_epoch_t m_map_epochs[$];
   protected rdma_reset_epoch_t m_map_function_epochs[$];
   protected rdma_route_key_t m_map_routes[$];
+  protected rdma_reset_epoch_t m_map_host_epochs[$], m_map_device_epochs[$];
   protected rdma_reset_coordinator m_reset;
   function new(string name="rdma_host_mem_router"); super.new(name); endfunction
   function void attach_reset_coordinator(rdma_reset_coordinator coordinator); m_reset=coordinator; endfunction
@@ -22,6 +23,7 @@ class rdma_host_mem_router extends rdma_host_mem_api;
   function rdma_status configure(rdma_host_mem_route_entry entries[$]);
     rdma_host_mem_api new_managers[int unsigned];
     rdma_reset_epoch_t new_epochs[int unsigned];
+    if (m_maps.size() != 0) return rdma_status::make(RDMA_SC_RESOURCE_BUSY, "active mappings prevent reconfigure");
     foreach (entries[i]) begin
       if (entries[i] == null || entries[i].manager == null)
         return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "null Host-memory route entry");
@@ -32,7 +34,7 @@ class rdma_host_mem_router extends rdma_host_mem_api;
       new_managers[entries[i].host_topology_key] = entries[i].manager;
       new_epochs[entries[i].host_topology_key] = 0;
     end
-    m_managers = new_managers; m_epochs = new_epochs; m_map_function_epochs.delete(); m_map_routes.delete();
+    m_managers = new_managers; m_epochs = new_epochs; m_map_function_epochs.delete(); m_map_routes.delete(); m_map_host_epochs.delete(); m_map_device_epochs.delete(); m_map_epochs.delete(); m_maps.delete();
     return rdma_status::success();
   endfunction
 
@@ -49,7 +51,8 @@ class rdma_host_mem_router extends rdma_host_mem_api;
     if (!m_managers.exists(h)) return rdma_status::make(RDMA_SC_DMA_TRANSLATION, "Host route not found");
     mgr = m_managers[h];
     s = mgr.allocate(request_context, size, alignment, direction, mapping);
-    if (!s.ok() || mapping == null) return s;
+    if (!s.ok()) return s;
+    if (mapping == null) return rdma_status::make(RDMA_SC_INVALID_STATE, "manager returned null mapping");
     if (mapping.function_h != null && !mapping.function_h.same_instance(request_context.function_h))
       return rdma_status::make(RDMA_SC_DMA_TRANSLATION, "manager returned mismatched Function");
     if (mapping.owner_h != null && !mapping.owner_h.same_instance(request_context.function_h))
@@ -60,9 +63,13 @@ class rdma_host_mem_router extends rdma_host_mem_api;
     mapping.route_valid = 1'b1;
     mapping.reset_epoch = m_epochs[h];
     mapping.epoch_valid = 1'b1;
+    mapping.function_h = request_context.function_h;
+    mapping.owner_h = request_context.owner_h;
+    mapping.requester_bdf = request_context.requester_bdf;
     m_maps.push_back(mapping); m_map_epochs.push_back(mapping.reset_epoch);
     m_map_function_epochs.push_back((m_reset != null) ? m_reset.function_epoch_uid(request_context.function_h.function_uid) : 0);
     m_map_routes.push_back(request_context.route);
+    m_map_host_epochs.push_back(m_epochs[h]); m_map_device_epochs.push_back((m_reset != null) ? m_reset.device_epoch() : 0);
     return s;
   endfunction
 
@@ -72,7 +79,7 @@ class rdma_host_mem_router extends rdma_host_mem_api;
     if (idx < 0) return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "unknown DMA mapping");
     if (!same_route(mapping.route, m_map_routes[idx])) return rdma_status::make(RDMA_SC_DMA_TRANSLATION, "DMA mapping route was modified");
     if (mapping == null || !mapping.route_valid || !rdma_route_key_valid(mapping.route)) return rdma_status::make(RDMA_SC_DMA_TRANSLATION, "DMA mapping route is invalid");
-    if (m_map_epochs[idx] != current_epoch(mapping.route.host_topology_key, idx))
+    if (m_map_epochs[idx] != current_epoch(mapping.route.host_topology_key, idx) || m_map_host_epochs[idx] != current_host_epoch(mapping.route.host_topology_key) || m_map_device_epochs[idx] != current_device_epoch())
       return rdma_status::make(RDMA_SC_STALE_GENERATION, "DMA mapping reset epoch is stale");
     if (!m_managers.exists(mapping.route.host_topology_key)) return rdma_status::make(RDMA_SC_DMA_TRANSLATION, "Host route not found");
     mgr = m_managers[mapping.route.host_topology_key];
@@ -85,7 +92,7 @@ class rdma_host_mem_router extends rdma_host_mem_api;
     if (idx < 0) return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "unknown DMA mapping");
     if (!same_route(mapping.route, m_map_routes[idx])) return rdma_status::make(RDMA_SC_DMA_TRANSLATION, "DMA mapping route was modified");
     if (mapping == null || !mapping.route_valid || !rdma_route_key_valid(mapping.route)) return rdma_status::make(RDMA_SC_DMA_TRANSLATION, "DMA mapping route is invalid");
-    if (m_map_epochs[idx] != current_epoch(mapping.route.host_topology_key, idx)) return rdma_status::make(RDMA_SC_STALE_GENERATION, "DMA mapping reset epoch is stale");
+    if (m_map_epochs[idx] != current_epoch(mapping.route.host_topology_key, idx) || m_map_host_epochs[idx] != current_host_epoch(mapping.route.host_topology_key) || m_map_device_epochs[idx] != current_device_epoch()) return rdma_status::make(RDMA_SC_STALE_GENERATION, "DMA mapping reset epoch is stale");
     if (!m_managers.exists(mapping.route.host_topology_key)) return rdma_status::make(RDMA_SC_DMA_TRANSLATION, "Host route not found");
     mgr = m_managers[mapping.route.host_topology_key];
     return mgr.read(mapping, offset, size, data);
@@ -97,10 +104,10 @@ class rdma_host_mem_router extends rdma_host_mem_api;
     if (idx < 0) return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "unknown DMA mapping");
     if (!same_route(mapping.route, m_map_routes[idx])) return rdma_status::make(RDMA_SC_DMA_TRANSLATION, "DMA mapping route was modified");
     if (mapping == null || !mapping.route_valid || !rdma_route_key_valid(mapping.route)) return rdma_status::make(RDMA_SC_DMA_TRANSLATION, "DMA mapping route is invalid");
-    if (m_map_epochs[idx] != current_epoch(mapping.route.host_topology_key, idx)) return rdma_status::make(RDMA_SC_STALE_GENERATION, "DMA mapping reset epoch is stale");
+    if (m_map_epochs[idx] != current_epoch(mapping.route.host_topology_key, idx) || m_map_host_epochs[idx] != current_host_epoch(mapping.route.host_topology_key) || m_map_device_epochs[idx] != current_device_epoch()) return rdma_status::make(RDMA_SC_STALE_GENERATION, "DMA mapping reset epoch is stale");
     if (!m_managers.exists(mapping.route.host_topology_key)) return rdma_status::make(RDMA_SC_DMA_TRANSLATION, "Host route not found");
     mgr = m_managers[mapping.route.host_topology_key]; s = mgr.\release (mapping);
-    if (s.ok()) begin m_maps.delete(idx); m_map_epochs.delete(idx); m_map_function_epochs.delete(idx); m_map_routes.delete(idx); end
+    if (s.ok()) begin m_maps.delete(idx); m_map_epochs.delete(idx); m_map_function_epochs.delete(idx); m_map_routes.delete(idx); m_map_host_epochs.delete(idx); m_map_device_epochs.delete(idx); end
     return s;
   endfunction
 
@@ -115,6 +122,8 @@ class rdma_host_mem_router extends rdma_host_mem_api;
     if (m_reset != null) begin e = m_reset.host_epoch(host_topology_key); e = (m_reset.device_epoch()>e)?m_reset.device_epoch():e; if(idx>=0 && m_maps[idx].function_h!=null && m_reset.function_epoch_uid(m_maps[idx].function_h.function_uid)>e) e=m_reset.function_epoch_uid(m_maps[idx].function_h.function_uid); return e; end
     return m_epochs.exists(host_topology_key) ? m_epochs[host_topology_key] : 0;
   endfunction
+  protected function rdma_reset_epoch_t current_host_epoch(int unsigned h); return m_reset!=null ? m_reset.host_epoch(h) : (m_epochs.exists(h)?m_epochs[h]:0); endfunction
+  protected function rdma_reset_epoch_t current_device_epoch(); return m_reset!=null ? m_reset.device_epoch() : 0; endfunction
   protected function int find_mapping(rdma_dma_mapping mapping);
     foreach (m_maps[i]) if (m_maps[i] === mapping) return i;
     return -1;

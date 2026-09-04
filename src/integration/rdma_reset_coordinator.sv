@@ -43,6 +43,6 @@ class rdma_reset_coordinator extends uvm_object;
     string n=identity_name(identity); m_function_epochs[n]=m_function_epochs.exists(n)?m_function_epochs[n]+1:1;
   endfunction
   protected function string identity_name(rdma_function_identity i);
-    return $sformatf("%0d:%0d:%0d:%0d:%0d:%0d",i.key.host_topology_key,i.key.root_id,i.key.bdf.segment,i.key.bdf.bus,i.key.bdf.device,i.key.bdf.function_num);
+    return $sformatf("%0d:%0d:%0d:%0d:%0d:%0d:%0d:%0d",i.key.host_topology_key,i.key.root_id,i.key.function_kind,i.key.vf_index,i.key.bdf.segment,i.key.bdf.bus,i.key.bdf.device,i.key.bdf.function_num);
   endfunction
 endclass
