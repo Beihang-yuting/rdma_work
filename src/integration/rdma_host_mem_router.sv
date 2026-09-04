@@ -80,7 +80,7 @@ class rdma_host_mem_router extends rdma_host_mem_api;
     if (mapping == null || !mapping.route_valid || !rdma_route_key_valid(mapping.route)) return rdma_status::make(RDMA_SC_DMA_TRANSLATION, "DMA mapping route is invalid");
     if (m_map_epochs[idx] != m_epochs[mapping.route.host_topology_key]) return rdma_status::make(RDMA_SC_STALE_GENERATION, "DMA mapping reset epoch is stale");
     if (!m_managers.exists(mapping.route.host_topology_key)) return rdma_status::make(RDMA_SC_DMA_TRANSLATION, "Host route not found");
-    mgr = m_managers[mapping.route.host_topology_key]; s = mgr.release(mapping);
+    mgr = m_managers[mapping.route.host_topology_key]; s = mgr.\release(mapping);
     if (s.ok()) begin m_maps.delete(idx); m_map_epochs.delete(idx); end
     return s;
   endfunction
