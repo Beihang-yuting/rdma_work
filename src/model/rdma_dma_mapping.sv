@@ -1,3 +1,8 @@
+// 目录：协议与资源模型层 model/rdma_dma_mapping.sv。
+// 职责：实现 rdma_dma_mapping 在本层的职责和对外接口。
+// 依赖：依赖本层公共 types/model/adapter 契约及其上游快照。
+// 所有权与生命周期：对象只拥有显式创建的值快照；外部资源保存非拥有引用，生命周期由调用方管理。
+
 // 中文说明：rdma_dma_mapping.sv 属于模型层，描述语义请求、资源快照、DMA 映射及生命周期数据。
 // 阅读提示：先看公开类型和接口，再看实现细节；失败路径应保持状态与资源所有权可追踪。
 
@@ -23,6 +28,10 @@ class rdma_dma_mapping extends uvm_object;
   rdma_mapping_state_e state;
   rdma_handle owner_h;
 
+  // 功能：初始化对象字段、同步 UVM 名称并建立可用的初始生命周期状态（接口 new）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function new(string name = "rdma_dma_mapping");
     super.new(name);
     function_h = null;
@@ -47,6 +56,10 @@ class rdma_dma_mapping extends uvm_object;
   // Owned mappings are release capabilities.  Concrete allocation adapters
   // must provide an opaque authority snapshot and prove equivalence without
   // exposing their private identity representation.
+  // 功能：读取或查询当前对象的权威状态，并以返回值或 output 参数交付快照（接口 snapshot_release_authority）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function rdma_status snapshot_release_authority(
     output rdma_dma_mapping snapshot
   );
@@ -57,6 +70,10 @@ class rdma_dma_mapping extends uvm_object;
     );
   endfunction
 
+  // 功能：释放、撤销或回滚当前对象持有的事务/资源，并保持账本与生命周期一致（接口 release_authority_status）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function rdma_status release_authority_status(
     rdma_dma_mapping snapshot
   );
@@ -69,6 +86,10 @@ class rdma_dma_mapping extends uvm_object;
   // Concrete adapters keep the completion fact opaque and shared by all
   // authority-preserving mapping copies.  Public mapping state is not proof
   // that the backing allocation was actually released.
+  // 功能：释放、撤销或回滚当前对象持有的事务/资源，并保持账本与生命周期一致（接口 release_completion_status）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function rdma_status release_completion_status(
     output bit release_complete
   );
@@ -79,6 +100,10 @@ class rdma_dma_mapping extends uvm_object;
     );
   endfunction
 
+  // 功能：把源对象投影/克隆为当前类型的独立值快照，避免共享可变引用（接口 do_copy）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function void do_copy(uvm_object rhs);
     rdma_dma_mapping rhs_mapping;
     uvm_object cloned_object;
@@ -119,6 +144,10 @@ class rdma_dma_mapping extends uvm_object;
     end
   endfunction
 
+  // 功能：检查输入值、身份字段和当前生命周期约束，给出一致性判断或状态结果（接口 check_access）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function rdma_status check_access(
     rdma_function_handle requested_function,
     rdma_bdf_t requested_requester_bdf,

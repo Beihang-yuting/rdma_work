@@ -1,38 +1,75 @@
+// 目录：核心执行层 core/rdma_queue_lifecycle_policy.sv。
+// 职责：实现 rdma_queue_lifecycle_policy 在本层的职责和对外接口。
+// 依赖：依赖本层公共 types/model/adapter 契约及其上游快照。
+// 所有权与生命周期：对象只拥有显式创建的值快照；外部资源保存非拥有引用，生命周期由调用方管理。
+
 // 中文说明：rdma_queue_lifecycle_policy.sv 属于核心执行层，负责队列、控制面、资源和恢复流程。
 // 阅读提示：先看公开类型和接口，再看实现细节；失败路径应保持状态与资源所有权可追踪。
 
 virtual class rdma_queue_lifecycle_policy extends uvm_object;
 
+  // 功能：初始化对象字段、同步 UVM 名称并建立可用的初始生命周期状态（接口 new）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function new(string name = "rdma_queue_lifecycle_policy");
     super.new(name);
   endfunction
 
+  // 功能：执行接口 resource_kind 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 resource_kind）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   pure virtual function rdma_resource_kind_e resource_kind();
 
+  // 功能：执行接口 preflight 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 preflight）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   pure virtual function rdma_status preflight(
     rdma_function_binding binding, rdma_semantic_request request,
     rdma_resource_manager manager, output rdma_queue_preflight result);
 
+  // 功能：原子地预留或获取所需资源/游标，并记录后续提交所需的所有权证据（接口 reserve_resource）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   pure virtual function rdma_status reserve_resource(
     rdma_resource_manager manager, rdma_function_binding binding,
     rdma_semantic_request request, output rdma_queue_resource resource);
 
+  // 功能：依据输入快照构造请求、资源或适配对象，并返回独立的结果载体（接口 build_create_context）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   pure virtual function rdma_status build_create_context(
     rdma_queue_resource resource, rdma_queue_backing_plan plan,
     output rdma_hw_model context_model,
     output byte unsigned context_slot_image[],
     output byte unsigned context_shadow_image[]);
 
+  // 功能：依据输入快照构造请求、资源或适配对象，并返回独立的结果载体（接口 build_create_command）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   pure virtual function rdma_status build_create_command(
     rdma_function_handle owner, rdma_queue_resource resource,
     rdma_hw_model context_model, time timeout,
     output rdma_cmq_command_desc command);
 
+  // 功能：依据输入快照构造请求、资源或适配对象，并返回独立的结果载体（接口 build_object_command）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   pure virtual function rdma_status build_object_command(
     bit [7:0] opcode, rdma_function_handle owner,
     rdma_queue_resource resource, time timeout,
     output rdma_cmq_command_desc command);
 
+  // 功能：依据输入快照构造请求、资源或适配对象，并返回独立的结果载体（接口 build_flush_command）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   pure virtual function rdma_status build_flush_command(
     rdma_function_handle owner, rdma_queue_flush_target target,
     time timeout, output rdma_cmq_command_desc command);
@@ -42,33 +79,61 @@ virtual class rdma_queue_lifecycle_policy extends uvm_object;
   // and identify this queue's local object ID.  Inconclusive responses leave
   // the outputs at UNKNOWN/0 and return a status suitable for continued
   // recovery.
+  // 功能：执行接口 classify_query_completion 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 classify_query_completion）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   pure virtual function rdma_status classify_query_completion(
     rdma_queue_resource resource,
     rdma_cmq_completion completion,
     output rdma_hw_presence_e presence,
     output bit conclusive);
 
+  // 功能：执行接口 hardware_cleanup_roles 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 hardware_cleanup_roles）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   pure virtual function void hardware_cleanup_roles(
     output rdma_queue_backing_role_e flush_roles[$],
     output rdma_queue_flush_phase_e flush_phases[$],
     output bit delete_before_flush);
 
+  // 功能：执行接口 local_cleanup_roles 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 local_cleanup_roles）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   pure virtual function void local_cleanup_roles(
     output rdma_queue_backing_role_e roles[$],
     output bit release_context_first);
 
+  // 功能：执行接口 invalid_argument 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 invalid_argument）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected function rdma_status invalid_argument(string message);
     return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, message);
   endfunction
 
+  // 功能：执行接口 invalid_state 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 invalid_state）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected function rdma_status invalid_state(string message);
     return rdma_status::make(RDMA_SC_INVALID_STATE, message);
   endfunction
 
+  // 功能：执行接口 unsupported 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 unsupported）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected function rdma_status unsupported(string message);
     return rdma_status::make(RDMA_SC_UNSUPPORTED_OPCODE, message);
   endfunction
 
+  // 功能：检查输入值、身份字段和当前生命周期约束，给出一致性判断或状态结果（接口 same_function）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected function bit same_function(
     rdma_function_handle lhs,
     rdma_function_handle rhs
@@ -82,6 +147,10 @@ virtual class rdma_queue_lifecycle_policy extends uvm_object;
            lhs.generation == rhs.generation;
   endfunction
 
+  // 功能：执行接口 queue_resource_owner_status 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 queue_resource_owner_status）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected function rdma_status queue_resource_owner_status(
     rdma_queue_resource resource,
     rdma_resource_kind_e expected_kind
@@ -100,6 +169,10 @@ virtual class rdma_queue_lifecycle_policy extends uvm_object;
     return rdma_handle_owner_status(resource.handle, resource.owner);
   endfunction
 
+  // 功能：执行接口 command_resource_owner_status 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 command_resource_owner_status）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected function rdma_status command_resource_owner_status(
     rdma_function_handle owner,
     rdma_queue_resource resource,
@@ -115,6 +188,10 @@ virtual class rdma_queue_lifecycle_policy extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：执行接口 command_owner_status 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 command_owner_status）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected function rdma_status command_owner_status(
     rdma_function_handle owner,
     rdma_queue_resource resource,
@@ -131,6 +208,10 @@ virtual class rdma_queue_lifecycle_policy extends uvm_object;
     return rdma_handle_owner_status(context_h, owner);
   endfunction
 
+  // 功能：执行接口 backing_owner_status 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 backing_owner_status）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected function rdma_status backing_owner_status(
     rdma_queue_backing_ref ref_value,
     rdma_function_handle owner
@@ -143,6 +224,10 @@ virtual class rdma_queue_lifecycle_policy extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：执行接口 common_preflight_status 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 common_preflight_status）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected function rdma_status common_preflight_status(
     rdma_function_binding binding,
     rdma_semantic_request request,
@@ -171,6 +256,10 @@ virtual class rdma_queue_lifecycle_policy extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：执行接口 dependency_status 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 dependency_status）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected function rdma_status dependency_status(
     rdma_resource_manager manager,
     rdma_function_handle owner,
@@ -201,6 +290,10 @@ virtual class rdma_queue_lifecycle_policy extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：执行接口 backing_role_count 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 backing_role_count）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected function int unsigned backing_role_count(
     rdma_queue_backing_spec spec,
     rdma_queue_backing_role_e role
@@ -216,6 +309,10 @@ virtual class rdma_queue_lifecycle_policy extends uvm_object;
     return count;
   endfunction
 
+  // 功能：把源对象投影/克隆为当前类型的独立值快照，避免共享可变引用（接口 clone_backing_spec）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected function rdma_status clone_backing_spec(
     rdma_queue_backing_spec source,
     output rdma_queue_backing_spec result
@@ -234,6 +331,10 @@ virtual class rdma_queue_lifecycle_policy extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：检查输入值、身份字段和当前生命周期约束，给出一致性判断或状态结果（接口 checked_ring_layout）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected function rdma_status checked_ring_layout(
     string name,
     rdma_queue_backing_role_e role,
@@ -282,6 +383,10 @@ virtual class rdma_queue_lifecycle_policy extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：执行接口 publish_preflight 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 publish_preflight）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected function rdma_status publish_preflight(
     rdma_queue_preflight candidate,
     output rdma_queue_preflight result
@@ -297,6 +402,10 @@ virtual class rdma_queue_lifecycle_policy extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：依据输入快照构造请求、资源或适配对象，并返回独立的结果载体（接口 projected_handle）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected function rdma_status projected_handle(
     string name,
     rdma_handle lifecycle_source,
@@ -323,6 +432,10 @@ virtual class rdma_queue_lifecycle_policy extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：依据输入快照构造请求、资源或适配对象，并返回独立的结果载体（接口 projected_dependency_status）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected function rdma_status projected_dependency_status(
     rdma_handle dependency,
     rdma_handle lifecycle_source,
@@ -349,6 +462,10 @@ virtual class rdma_queue_lifecycle_policy extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：读取或查询当前对象的权威状态，并以返回值或 output 参数交付快照（接口 find_ring）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected function rdma_status find_ring(
     rdma_queue_backing_plan plan,
     rdma_queue_backing_role_e role,
@@ -375,6 +492,10 @@ virtual class rdma_queue_lifecycle_policy extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：读取或查询当前对象的权威状态，并以返回值或 output 参数交付快照（接口 find_backing_ref）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected function rdma_status find_backing_ref(
     rdma_queue_backing_plan plan,
     rdma_queue_backing_role_e role,
@@ -401,6 +522,10 @@ virtual class rdma_queue_lifecycle_policy extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：执行接口 backing_iova 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 backing_iova）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected function rdma_status backing_iova(
     rdma_queue_backing_ref ref_value,
     output rdma_backing_addr_t address
@@ -418,6 +543,10 @@ virtual class rdma_queue_lifecycle_policy extends uvm_object;
     return rdma_queue_base_from_iova(effective_iova, address);
   endfunction
 
+  // 功能：执行接口 context_ref_status 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 context_ref_status）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected function rdma_status context_ref_status(
     rdma_queue_backing_plan plan,
     rdma_function_handle owner,
@@ -447,6 +576,10 @@ virtual class rdma_queue_lifecycle_policy extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：写入并校验运行所需的配置、身份或资源参数，建立后续操作的边界（接口 set_indirect_layout）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected function void set_indirect_layout(
     rdma_page_table_layout layout,
     rdma_backing_addr_t pd_address
@@ -459,6 +592,10 @@ virtual class rdma_queue_lifecycle_policy extends uvm_object;
     layout.next_valid = 1'b1;
   endfunction
 
+  // 功能：将模型或请求按硬件/协议布局编码为可传输的镜像或令牌（接口 encode_context）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected function rdma_status encode_context(
     rdma_hw_model model,
     rdma_image_kind_e image_kind,
@@ -501,6 +638,10 @@ virtual class rdma_queue_lifecycle_policy extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：依据输入快照构造请求、资源或适配对象，并返回独立的结果载体（接口 build_command_desc）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected function rdma_status build_command_desc(
     rdma_function_handle owner,
     bit [7:0] opcode,
@@ -538,6 +679,10 @@ virtual class rdma_queue_lifecycle_policy extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：依据输入快照构造请求、资源或适配对象，并返回独立的结果载体（接口 build_object_desc）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected function rdma_status build_object_desc(
     bit [7:0] opcode,
     bit [7:0] delete_opcode,
@@ -575,6 +720,10 @@ virtual class rdma_queue_lifecycle_policy extends uvm_object;
     return build_command_desc(owner, opcode, variant, body, timeout, command);
   endfunction
 
+  // 功能：依据输入快照构造请求、资源或适配对象，并返回独立的结果载体（接口 build_pd_flush_desc）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected function rdma_status build_pd_flush_desc(
     rdma_function_handle owner,
     rdma_queue_flush_target target,
@@ -613,6 +762,10 @@ virtual class rdma_queue_lifecycle_policy extends uvm_object;
   // SRQ's PD handle).  Use harmless in-range placeholders for those fields;
   // the query payload is overlaid below before decoding, so no placeholder
   // can become presence evidence.
+  // 功能：读取或查询当前对象的权威状态，并以返回值或 output 参数交付快照（接口 query_builder_view）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected function rdma_status query_builder_view(
     rdma_queue_resource resource,
     output rdma_queue_resource builder_resource
@@ -660,6 +813,10 @@ virtual class rdma_queue_lifecycle_policy extends uvm_object;
   // immutable identity checks at this boundary.  In particular, SQ wrap is
   // ticket identity; CQ owner is the phase bit carried by the raw CQE and is
   // intentionally not inferred from SQ wrap.
+  // 功能：读取或查询当前对象的权威状态，并以返回值或 output 参数交付快照（接口 query_completion_identity_matches）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected function bit query_completion_identity_matches(
     rdma_cmq_completion completion,
     rdma_xtr_v1_cmq_completion payload
@@ -718,6 +875,10 @@ virtual class rdma_queue_lifecycle_policy extends uvm_object;
     return 1'b1;
   endfunction
 
+  // 功能：执行接口 classify_query_common 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 classify_query_common）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected function rdma_status classify_query_common(
     rdma_queue_resource resource,
     rdma_cmq_completion completion,
@@ -894,14 +1055,26 @@ endclass
 class rdma_cq_lifecycle_policy extends rdma_queue_lifecycle_policy;
   `uvm_object_utils(rdma_cq_lifecycle_policy)
 
+  // 功能：初始化对象字段、同步 UVM 名称并建立可用的初始生命周期状态（接口 new）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function new(string name = "rdma_cq_lifecycle_policy");
     super.new(name);
   endfunction
 
+  // 功能：执行接口 resource_kind 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 resource_kind）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function rdma_resource_kind_e resource_kind();
     return RDMA_RESOURCE_CQ;
   endfunction
 
+  // 功能：原子地预留或获取所需资源/游标，并记录后续提交所需的所有权证据（接口 reserve_resource）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function rdma_status reserve_resource(
     rdma_resource_manager manager, rdma_function_binding binding,
     rdma_semantic_request request, output rdma_queue_resource resource);
@@ -921,6 +1094,10 @@ class rdma_cq_lifecycle_policy extends rdma_queue_lifecycle_policy;
     end
   endfunction
 
+  // 功能：执行接口 preflight 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 preflight）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function rdma_status preflight(
     rdma_function_binding binding, rdma_semantic_request request,
     rdma_resource_manager manager, output rdma_queue_preflight result);
@@ -971,6 +1148,10 @@ class rdma_cq_lifecycle_policy extends rdma_queue_lifecycle_policy;
     return publish_preflight(candidate, result);
   endfunction
 
+  // 功能：依据输入快照构造请求、资源或适配对象，并返回独立的结果载体（接口 build_create_context）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function rdma_status build_create_context(
     rdma_queue_resource resource, rdma_queue_backing_plan plan,
     output rdma_hw_model context_model,
@@ -1047,6 +1228,10 @@ class rdma_cq_lifecycle_policy extends rdma_queue_lifecycle_policy;
     return rdma_status::success();
   endfunction
 
+  // 功能：依据输入快照构造请求、资源或适配对象，并返回独立的结果载体（接口 build_create_command）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function rdma_status build_create_command(
     rdma_function_handle owner, rdma_queue_resource resource,
     rdma_hw_model context_model, time timeout,
@@ -1065,6 +1250,10 @@ class rdma_cq_lifecycle_policy extends rdma_queue_lifecycle_policy;
                               timeout, command);
   endfunction
 
+  // 功能：依据输入快照构造请求、资源或适配对象，并返回独立的结果载体（接口 build_object_command）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function rdma_status build_object_command(
     bit [7:0] opcode, rdma_function_handle owner,
     rdma_queue_resource resource, time timeout,
@@ -1081,6 +1270,10 @@ class rdma_cq_lifecycle_policy extends rdma_queue_lifecycle_policy;
       cq.local_cq_id, 21, timeout, command);
   endfunction
 
+  // 功能：依据输入快照构造请求、资源或适配对象，并返回独立的结果载体（接口 build_flush_command）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function rdma_status build_flush_command(
     rdma_function_handle owner, rdma_queue_flush_target target,
     time timeout, output rdma_cmq_command_desc command);
@@ -1091,6 +1284,10 @@ class rdma_cq_lifecycle_policy extends rdma_queue_lifecycle_policy;
     return build_pd_flush_desc(owner, target, timeout, command);
   endfunction
 
+  // 功能：执行接口 classify_query_completion 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 classify_query_completion）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function rdma_status classify_query_completion(
     rdma_queue_resource resource,
     rdma_cmq_completion completion,
@@ -1102,22 +1299,42 @@ class rdma_cq_lifecycle_policy extends rdma_queue_lifecycle_policy;
       XTR_V1_ECODE_EC_RCE_CQC_INVLD, 1'b1, presence, conclusive);
   endfunction
 
+  // 功能：执行接口 hardware_cleanup_roles 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 hardware_cleanup_roles）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function void hardware_cleanup_roles(output rdma_queue_backing_role_e flush_roles[$], output rdma_queue_flush_phase_e flush_phases[$], output bit delete_before_flush); flush_roles.delete(); flush_phases.delete(); delete_before_flush=1'b1; flush_roles.push_back(RDMA_QUEUE_ROLE_CQ_PD); flush_phases.push_back(RDMA_QUEUE_FLUSH_POST_DELETE); endfunction
 
+  // 功能：执行接口 local_cleanup_roles 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 local_cleanup_roles）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function void local_cleanup_roles(output rdma_queue_backing_role_e roles[$], output bit release_context_first); roles.delete(); release_context_first=1'b1; roles.push_back(RDMA_QUEUE_ROLE_CQ_PD); roles.push_back(RDMA_QUEUE_ROLE_CQ_RING); endfunction
 endclass
 
 class rdma_srq_lifecycle_policy extends rdma_queue_lifecycle_policy;
   `uvm_object_utils(rdma_srq_lifecycle_policy)
 
+  // 功能：初始化对象字段、同步 UVM 名称并建立可用的初始生命周期状态（接口 new）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function new(string name = "rdma_srq_lifecycle_policy");
     super.new(name);
   endfunction
 
+  // 功能：执行接口 resource_kind 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 resource_kind）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function rdma_resource_kind_e resource_kind();
     return RDMA_RESOURCE_SRQ;
   endfunction
 
+  // 功能：原子地预留或获取所需资源/游标，并记录后续提交所需的所有权证据（接口 reserve_resource）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function rdma_status reserve_resource(
     rdma_resource_manager manager, rdma_function_binding binding,
     rdma_semantic_request request, output rdma_queue_resource resource);
@@ -1137,6 +1354,10 @@ class rdma_srq_lifecycle_policy extends rdma_queue_lifecycle_policy;
     end
   endfunction
 
+  // 功能：执行接口 preflight 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 preflight）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function rdma_status preflight(
     rdma_function_binding binding, rdma_semantic_request request,
     rdma_resource_manager manager, output rdma_queue_preflight result);
@@ -1212,6 +1433,10 @@ class rdma_srq_lifecycle_policy extends rdma_queue_lifecycle_policy;
     return publish_preflight(candidate, result);
   endfunction
 
+  // 功能：依据输入快照构造请求、资源或适配对象，并返回独立的结果载体（接口 build_create_context）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function rdma_status build_create_context(
     rdma_queue_resource resource, rdma_queue_backing_plan plan,
     output rdma_hw_model context_model,
@@ -1293,6 +1518,10 @@ class rdma_srq_lifecycle_policy extends rdma_queue_lifecycle_policy;
     return rdma_status::success();
   endfunction
 
+  // 功能：依据输入快照构造请求、资源或适配对象，并返回独立的结果载体（接口 build_create_command）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function rdma_status build_create_command(
     rdma_function_handle owner, rdma_queue_resource resource,
     rdma_hw_model context_model, time timeout,
@@ -1312,6 +1541,10 @@ class rdma_srq_lifecycle_policy extends rdma_queue_lifecycle_policy;
                               timeout, command);
   endfunction
 
+  // 功能：依据输入快照构造请求、资源或适配对象，并返回独立的结果载体（接口 build_object_command）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function rdma_status build_object_command(
     bit [7:0] opcode, rdma_function_handle owner,
     rdma_queue_resource resource, time timeout,
@@ -1328,6 +1561,10 @@ class rdma_srq_lifecycle_policy extends rdma_queue_lifecycle_policy;
       srq.local_srq_id, 16, timeout, command);
   endfunction
 
+  // 功能：依据输入快照构造请求、资源或适配对象，并返回独立的结果载体（接口 build_flush_command）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function rdma_status build_flush_command(
     rdma_function_handle owner, rdma_queue_flush_target target,
     time timeout, output rdma_cmq_command_desc command);
@@ -1340,6 +1577,10 @@ class rdma_srq_lifecycle_policy extends rdma_queue_lifecycle_policy;
     return build_pd_flush_desc(owner, target, timeout, command);
   endfunction
 
+  // 功能：执行接口 classify_query_completion 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 classify_query_completion）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function rdma_status classify_query_completion(
     rdma_queue_resource resource,
     rdma_cmq_completion completion,
@@ -1351,22 +1592,42 @@ class rdma_srq_lifecycle_policy extends rdma_queue_lifecycle_policy;
       8'hff, 1'b0, presence, conclusive);
   endfunction
 
+  // 功能：执行接口 hardware_cleanup_roles 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 hardware_cleanup_roles）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function void hardware_cleanup_roles(output rdma_queue_backing_role_e flush_roles[$], output rdma_queue_flush_phase_e flush_phases[$], output bit delete_before_flush); flush_roles.delete(); flush_phases.delete(); delete_before_flush=1'b0; flush_roles.push_back(RDMA_QUEUE_ROLE_SRFQ_PD); flush_phases.push_back(RDMA_QUEUE_FLUSH_PRE_DELETE); flush_roles.push_back(RDMA_QUEUE_ROLE_SRQ_PD); flush_phases.push_back(RDMA_QUEUE_FLUSH_PRE_DELETE); endfunction
 
+  // 功能：执行接口 local_cleanup_roles 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 local_cleanup_roles）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function void local_cleanup_roles(output rdma_queue_backing_role_e roles[$], output bit release_context_first); roles.delete(); release_context_first=1'b1; roles.push_back(RDMA_QUEUE_ROLE_SRFQ_PD); roles.push_back(RDMA_QUEUE_ROLE_SRQ_PD); roles.push_back(RDMA_QUEUE_ROLE_SRQ_SGB); roles.push_back(RDMA_QUEUE_ROLE_SRFQ_RING); roles.push_back(RDMA_QUEUE_ROLE_SRQ_RING); endfunction
 endclass
 
 class rdma_ceq_lifecycle_policy extends rdma_queue_lifecycle_policy;
   `uvm_object_utils(rdma_ceq_lifecycle_policy)
 
+  // 功能：初始化对象字段、同步 UVM 名称并建立可用的初始生命周期状态（接口 new）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function new(string name = "rdma_ceq_lifecycle_policy");
     super.new(name);
   endfunction
 
+  // 功能：执行接口 resource_kind 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 resource_kind）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function rdma_resource_kind_e resource_kind();
     return RDMA_RESOURCE_CEQ;
   endfunction
 
+  // 功能：原子地预留或获取所需资源/游标，并记录后续提交所需的所有权证据（接口 reserve_resource）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function rdma_status reserve_resource(
     rdma_resource_manager manager, rdma_function_binding binding,
     rdma_semantic_request request, output rdma_queue_resource resource);
@@ -1386,6 +1647,10 @@ class rdma_ceq_lifecycle_policy extends rdma_queue_lifecycle_policy;
     end
   endfunction
 
+  // 功能：执行接口 preflight 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 preflight）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function rdma_status preflight(
     rdma_function_binding binding, rdma_semantic_request request,
     rdma_resource_manager manager, output rdma_queue_preflight result);
@@ -1446,6 +1711,10 @@ class rdma_ceq_lifecycle_policy extends rdma_queue_lifecycle_policy;
     return publish_preflight(candidate, result);
   endfunction
 
+  // 功能：依据输入快照构造请求、资源或适配对象，并返回独立的结果载体（接口 build_create_context）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function rdma_status build_create_context(
     rdma_queue_resource resource, rdma_queue_backing_plan plan,
     output rdma_hw_model context_model,
@@ -1502,6 +1771,10 @@ class rdma_ceq_lifecycle_policy extends rdma_queue_lifecycle_policy;
     return rdma_status::success();
   endfunction
 
+  // 功能：依据输入快照构造请求、资源或适配对象，并返回独立的结果载体（接口 build_create_command）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function rdma_status build_create_command(
     rdma_function_handle owner, rdma_queue_resource resource,
     rdma_hw_model context_model, time timeout,
@@ -1521,6 +1794,10 @@ class rdma_ceq_lifecycle_policy extends rdma_queue_lifecycle_policy;
                               timeout, command);
   endfunction
 
+  // 功能：依据输入快照构造请求、资源或适配对象，并返回独立的结果载体（接口 build_object_command）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function rdma_status build_object_command(
     bit [7:0] opcode, rdma_function_handle owner,
     rdma_queue_resource resource, time timeout,
@@ -1537,6 +1814,10 @@ class rdma_ceq_lifecycle_policy extends rdma_queue_lifecycle_policy;
       ceq.local_ceq_id, 12, timeout, command);
   endfunction
 
+  // 功能：依据输入快照构造请求、资源或适配对象，并返回独立的结果载体（接口 build_flush_command）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function rdma_status build_flush_command(
     rdma_function_handle owner, rdma_queue_flush_target target,
     time timeout, output rdma_cmq_command_desc command);
@@ -1544,6 +1825,10 @@ class rdma_ceq_lifecycle_policy extends rdma_queue_lifecycle_policy;
     return unsupported("CEQ lifecycle has no OCC flush command");
   endfunction
 
+  // 功能：执行接口 classify_query_completion 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 classify_query_completion）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function rdma_status classify_query_completion(
     rdma_queue_resource resource,
     rdma_cmq_completion completion,
@@ -1555,22 +1840,42 @@ class rdma_ceq_lifecycle_policy extends rdma_queue_lifecycle_policy;
       XTR_V1_ECODE_EC_RCE_CEQC_INVLD, 1'b1, presence, conclusive);
   endfunction
 
+  // 功能：执行接口 hardware_cleanup_roles 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 hardware_cleanup_roles）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function void hardware_cleanup_roles(output rdma_queue_backing_role_e flush_roles[$], output rdma_queue_flush_phase_e flush_phases[$], output bit delete_before_flush); flush_roles.delete(); flush_phases.delete(); delete_before_flush=1'b1; endfunction
 
+  // 功能：执行接口 local_cleanup_roles 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 local_cleanup_roles）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function void local_cleanup_roles(output rdma_queue_backing_role_e roles[$], output bit release_context_first); roles.delete(); release_context_first=1'b0; roles.push_back(RDMA_QUEUE_ROLE_CEQ_PD); roles.push_back(RDMA_QUEUE_ROLE_CEQ_RING); endfunction
 endclass
 
 class rdma_aeq_lifecycle_policy extends rdma_queue_lifecycle_policy;
   `uvm_object_utils(rdma_aeq_lifecycle_policy)
 
+  // 功能：初始化对象字段、同步 UVM 名称并建立可用的初始生命周期状态（接口 new）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function new(string name = "rdma_aeq_lifecycle_policy");
     super.new(name);
   endfunction
 
+  // 功能：执行接口 resource_kind 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 resource_kind）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function rdma_resource_kind_e resource_kind();
     return RDMA_RESOURCE_AEQ;
   endfunction
 
+  // 功能：原子地预留或获取所需资源/游标，并记录后续提交所需的所有权证据（接口 reserve_resource）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function rdma_status reserve_resource(
     rdma_resource_manager manager, rdma_function_binding binding,
     rdma_semantic_request request, output rdma_queue_resource resource);
@@ -1590,6 +1895,10 @@ class rdma_aeq_lifecycle_policy extends rdma_queue_lifecycle_policy;
     end
   endfunction
 
+  // 功能：执行接口 preflight 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 preflight）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function rdma_status preflight(
     rdma_function_binding binding, rdma_semantic_request request,
     rdma_resource_manager manager, output rdma_queue_preflight result);
@@ -1650,6 +1959,10 @@ class rdma_aeq_lifecycle_policy extends rdma_queue_lifecycle_policy;
     return publish_preflight(candidate, result);
   endfunction
 
+  // 功能：依据输入快照构造请求、资源或适配对象，并返回独立的结果载体（接口 build_create_context）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function rdma_status build_create_context(
     rdma_queue_resource resource, rdma_queue_backing_plan plan,
     output rdma_hw_model context_model,
@@ -1706,6 +2019,10 @@ class rdma_aeq_lifecycle_policy extends rdma_queue_lifecycle_policy;
     return rdma_status::success();
   endfunction
 
+  // 功能：依据输入快照构造请求、资源或适配对象，并返回独立的结果载体（接口 build_create_command）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function rdma_status build_create_command(
     rdma_function_handle owner, rdma_queue_resource resource,
     rdma_hw_model context_model, time timeout,
@@ -1725,6 +2042,10 @@ class rdma_aeq_lifecycle_policy extends rdma_queue_lifecycle_policy;
                               timeout, command);
   endfunction
 
+  // 功能：依据输入快照构造请求、资源或适配对象，并返回独立的结果载体（接口 build_object_command）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function rdma_status build_object_command(
     bit [7:0] opcode, rdma_function_handle owner,
     rdma_queue_resource resource, time timeout,
@@ -1741,6 +2062,10 @@ class rdma_aeq_lifecycle_policy extends rdma_queue_lifecycle_policy;
       aeq.local_aeq_id, 12, timeout, command);
   endfunction
 
+  // 功能：依据输入快照构造请求、资源或适配对象，并返回独立的结果载体（接口 build_flush_command）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function rdma_status build_flush_command(
     rdma_function_handle owner, rdma_queue_flush_target target,
     time timeout, output rdma_cmq_command_desc command);
@@ -1748,6 +2073,10 @@ class rdma_aeq_lifecycle_policy extends rdma_queue_lifecycle_policy;
     return unsupported("AEQ lifecycle has no OCC flush command");
   endfunction
 
+  // 功能：执行接口 classify_query_completion 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 classify_query_completion）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function rdma_status classify_query_completion(
     rdma_queue_resource resource,
     rdma_cmq_completion completion,
@@ -1759,7 +2088,15 @@ class rdma_aeq_lifecycle_policy extends rdma_queue_lifecycle_policy;
       XTR_V1_ECODE_EC_RCE_AEQC_INVLD, 1'b1, presence, conclusive);
   endfunction
 
+  // 功能：执行接口 hardware_cleanup_roles 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 hardware_cleanup_roles）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function void hardware_cleanup_roles(output rdma_queue_backing_role_e flush_roles[$], output rdma_queue_flush_phase_e flush_phases[$], output bit delete_before_flush); flush_roles.delete(); flush_phases.delete(); delete_before_flush=1'b1; endfunction
 
+  // 功能：执行接口 local_cleanup_roles 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 local_cleanup_roles）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function void local_cleanup_roles(output rdma_queue_backing_role_e roles[$], output bit release_context_first); roles.delete(); release_context_first=1'b0; roles.push_back(RDMA_QUEUE_ROLE_AEQ_PD); roles.push_back(RDMA_QUEUE_ROLE_AEQ_RING); endfunction
 endclass

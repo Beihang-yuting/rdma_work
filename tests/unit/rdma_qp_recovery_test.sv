@@ -1,3 +1,8 @@
+// 目录：测试层 unit/rdma_qp_recovery_test.sv。
+// 职责：验证 rdma_qp_recovery_test 对应模块的接口、错误路径和边界行为。
+// 依赖：依赖被测 package、UVM 测试基类和必要的 mock/fixture。
+// 所有权与生命周期：测试对象只拥有本地 fixture；外部后端句柄由测试环境提供并在测试结束释放。
+
 // 中文说明：rdma_qp_recovery_test.sv 属于单元测试，覆盖对应模型、编码器或执行器契约。
 // 阅读提示：先看公开类型和接口，再看实现细节；失败路径应保持状态与资源所有权可追踪。
 
@@ -5,11 +10,19 @@ class rdma_qp_publication_fault_manager extends rdma_resource_manager;
   `uvm_object_utils(rdma_qp_publication_fault_manager)
   bit fail_commit;
 
+  // 功能：初始化对象字段、同步 UVM 名称并建立可用的初始生命周期状态（接口 new）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function new(string name = "rdma_qp_publication_fault_manager");
     super.new(name);
     fail_commit = 1'b0;
   endfunction
 
+  // 功能：提交已验证的状态迁移或消费结果，推进游标/账本并保持幂等边界（接口 commit_qp_programmed）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function rdma_status commit_qp_programmed(rdma_qp candidate);
     if (fail_commit) begin
       fail_commit = 1'b0;
@@ -23,10 +36,18 @@ endclass
 class rdma_qp_ticketless_modify_cmq extends rdma_mock_cmq_port;
   `uvm_object_utils(rdma_qp_ticketless_modify_cmq)
 
+  // 功能：初始化对象字段、同步 UVM 名称并建立可用的初始生命周期状态（接口 new）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function new(string name = "rdma_qp_ticketless_modify_cmq");
     super.new(name);
   endfunction
 
+  // 功能：执行接口 execute 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 execute）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual task execute(
     rdma_cmq_command_desc command,
     output rdma_cmq_ticket ticket,
@@ -51,16 +72,28 @@ class rdma_qp_scripted_query_host_mem extends rdma_mock_host_mem;
   `uvm_object_utils(rdma_qp_scripted_query_host_mem)
   byte scripted_query_bytes[];
 
+  // 功能：初始化对象字段、同步 UVM 名称并建立可用的初始生命周期状态（接口 new）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function new(string name = "rdma_qp_scripted_query_host_mem");
     super.new(name);
     scripted_query_bytes = new[0];
   endfunction
 
+  // 功能：执行接口 script_query_image 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 script_query_image）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function void script_query_image(byte bytes[]);
     scripted_query_bytes = new[bytes.size()];
     foreach (bytes[i]) scripted_query_bytes[i] = bytes[i];
   endfunction
 
+  // 功能：原子地预留或获取所需资源/游标，并记录后续提交所需的所有权证据（接口 allocate）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function rdma_status allocate(
     rdma_dma_request_context request_context,
     int unsigned size,
@@ -80,6 +113,10 @@ class rdma_qp_scripted_query_host_mem extends rdma_mock_host_mem;
   endfunction
 endclass
 
+// 功能：执行接口 rdma_qp_encode_query_bytes 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 rdma_qp_encode_query_bytes）。
+// 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+//   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+// 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
 function automatic rdma_status rdma_qp_encode_query_bytes(
   rdma_qpc_model qpc,
   output byte bytes[]
@@ -126,11 +163,19 @@ class rdma_qp_query_completion_fault_cmq extends rdma_mock_cmq_port;
   `uvm_object_utils(rdma_qp_query_completion_fault_cmq)
   bit drop_query_completion;
 
+  // 功能：初始化对象字段、同步 UVM 名称并建立可用的初始生命周期状态（接口 new）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function new(string name = "rdma_qp_query_completion_fault_cmq");
     super.new(name);
     drop_query_completion = 1'b0;
   endfunction
 
+  // 功能：执行接口 execute 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 execute）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual task execute(
     rdma_cmq_command_desc command,
     output rdma_cmq_ticket ticket,
@@ -151,11 +196,19 @@ endclass
 class rdma_qp_recovery_test extends rdma_qp_lifecycle_test;
   `uvm_component_utils(rdma_qp_recovery_test)
 
+  // 功能：初始化对象字段、同步 UVM 名称并建立可用的初始生命周期状态（接口 new）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function new(string name = "rdma_qp_recovery_test",
                uvm_component parent = null);
     super.new(name, parent);
   endfunction
 
+  // 功能：执行 UVM 阶段任务，驱动测试场景并在结束时释放阶段 objection（接口 run_phase）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   task run_phase(uvm_phase phase);
     phase.raise_objection(this);
     check_ticketless_definitive_modify_recovery();
@@ -177,6 +230,10 @@ class rdma_qp_recovery_test extends rdma_qp_lifecycle_test;
   // RC can legally carry an optional SQ-SGB when its SGE capability requires
   // one.  Recovery must authenticate that retained authority and reject a
   // forged mapping owner or malformed rounded geometry before any CMQ work.
+  // 功能：检查输入值、身份字段和当前生命周期约束，给出一致性判断或状态结果（接口 check_optional_sgb_recovery_validation）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   task automatic check_optional_sgb_recovery_validation();
     rdma_mock_host_mem mem;
     rdma_function_binding binding;
@@ -253,6 +310,10 @@ class rdma_qp_recovery_test extends rdma_qp_lifecycle_test;
 
   // A successful task status with an empty QPC_QUERY completion must not
   // authorize stale bytes already present in the query buffer.
+  // 功能：检查输入值、身份字段和当前生命周期约束，给出一致性判断或状态结果（接口 check_modify_query_requires_terminal_completion）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   task automatic check_modify_query_requires_terminal_completion();
     rdma_mock_host_mem mem;
     rdma_function_binding binding;
@@ -330,6 +391,10 @@ class rdma_qp_recovery_test extends rdma_qp_lifecycle_test;
   // A pre-program CREATE rollback may have no candidate QPC at all.  With no
   // hardware context present, recovery must still release local authorities
   // and finalize the reservation.
+  // 功能：检查输入值、身份字段和当前生命周期约束，给出一致性判断或状态结果（接口 check_create_rollback_without_candidate_qpc）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   task automatic check_create_rollback_without_candidate_qpc();
     rdma_qp_boundary_host_mem mem;
     rdma_qp_fault_manager manager;
@@ -386,6 +451,10 @@ class rdma_qp_recovery_test extends rdma_qp_lifecycle_test;
 
   // An ambiguous full MODIFY must authenticate the complete QPC_QUERY image
   // before selecting candidate, restoring prior, or remaining in ERROR.
+  // 功能：检查输入值、身份字段和当前生命周期约束，给出一致性判断或状态结果（接口 check_modify_query_matrix）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   task automatic check_modify_query_matrix();
     for (int unsigned query_case = 0; query_case < 3; query_case++) begin
       string label;
@@ -485,6 +554,10 @@ class rdma_qp_recovery_test extends rdma_qp_lifecycle_test;
   // CREATE ambiguity is resolved by an authenticated presence query.  A
   // present image runs the destroy recipe; a terminal query failure skips all
   // hardware cleanup and releases only local authorities.
+  // 功能：检查输入值、身份字段和当前生命周期约束，给出一致性判断或状态结果（接口 check_create_presence_query）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   task automatic check_create_presence_query();
     for (int unsigned query_case = 0; query_case < 3; query_case++) begin
       string label;
@@ -588,6 +661,10 @@ class rdma_qp_recovery_test extends rdma_qp_lifecycle_test;
 
   // DELETE ambiguity uses the same presence proof, but a present QPC must
   // retry DELETE while an absent QPC must mark DELETE complete and never retry.
+  // 功能：检查输入值、身份字段和当前生命周期约束，给出一致性判断或状态结果（接口 check_delete_presence_query）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   task automatic check_delete_presence_query();
     for (int unsigned query_case = 0; query_case < 2; query_case++) begin
       string label;
@@ -672,6 +749,10 @@ class rdma_qp_recovery_test extends rdma_qp_lifecycle_test;
   // reconciliation produces terminal evidence, recovery remains fail-closed.
   // It may issue one authenticated QPC_QUERY probe, but must not retry the
   // original CREATE side effect.
+  // 功能：检查输入值、身份字段和当前生命周期约束，给出一致性判断或状态结果（接口 check_ambiguous_create_recovery_dispatch）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   task automatic check_ambiguous_create_recovery_dispatch();
     rdma_mock_host_mem mem;
     rdma_function_binding binding;
@@ -726,6 +807,10 @@ class rdma_qp_recovery_test extends rdma_qp_lifecycle_test;
   // A terminal CREATE failure proves that no QP context was installed.  The
   // recovery recipe must therefore skip every hardware destroy command and
   // release the retained staging/context/backing authorities exactly once.
+  // 功能：检查输入值、身份字段和当前生命周期约束，给出一致性判断或状态结果（接口 check_ambiguous_create_terminal_failure_cleanup）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   task automatic check_ambiguous_create_terminal_failure_cleanup();
     rdma_mock_host_mem mem;
     rdma_function_binding binding;
@@ -823,6 +908,10 @@ class rdma_qp_recovery_test extends rdma_qp_lifecycle_test;
   // A terminal CREATE success proves that hardware contains the QP.  Recovery
   // must run the canonical OCC/QPC_DELETE destroy recipe before releasing
   // software authorities and finalizing the ERROR incarnation.
+  // 功能：检查输入值、身份字段和当前生命周期约束，给出一致性判断或状态结果（接口 check_ambiguous_create_terminal_success_destroy）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   task automatic check_ambiguous_create_terminal_success_destroy();
     rdma_mock_host_mem mem;
     rdma_function_binding binding;
@@ -897,6 +986,10 @@ class rdma_qp_recovery_test extends rdma_qp_lifecycle_test;
 
   // A definitive CMQ failure followed by a failed staging release has no
   // ticket, but the staging mapping must remain durable recovery authority.
+  // 功能：检查输入值、身份字段和当前生命周期约束，给出一致性判断或状态结果（接口 check_ticketless_definitive_modify_recovery）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   task automatic check_ticketless_definitive_modify_recovery();
     rdma_qp_boundary_host_mem mem;
     rdma_function_binding binding;
@@ -950,6 +1043,10 @@ class rdma_qp_recovery_test extends rdma_qp_lifecycle_test;
                  "ticketless definitive modify lost recovery authority")
   endtask
 
+  // 功能：检查输入值、身份字段和当前生命周期约束，给出一致性判断或状态结果（接口 check_ticketless_publication_modify_recovery）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   task automatic check_ticketless_publication_modify_recovery();
     rdma_qp_publication_fault_manager manager;
     rdma_mock_host_mem mem;
@@ -1002,6 +1099,10 @@ class rdma_qp_recovery_test extends rdma_qp_lifecycle_test;
                  "ticketless publication failure lost ERROR recovery authority")
   endtask
 
+  // 功能：检查输入值、身份字段和当前生命周期约束，给出一致性判断或状态结果（接口 check_ambiguous_modify_recovery）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   task automatic check_ambiguous_modify_recovery();
     rdma_mock_host_mem mem;
     rdma_function_binding binding;
@@ -1071,6 +1172,10 @@ class rdma_qp_recovery_test extends rdma_qp_lifecycle_test;
     end
   endtask
 
+  // 功能：检查输入值、身份字段和当前生命周期约束，给出一致性判断或状态结果（接口 check_ambiguous_destroy_recovery）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   task automatic check_ambiguous_destroy_recovery();
     rdma_mock_host_mem mem;
     rdma_function_binding binding;

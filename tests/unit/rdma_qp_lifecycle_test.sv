@@ -1,3 +1,8 @@
+// 目录：测试层 unit/rdma_qp_lifecycle_test.sv。
+// 职责：验证 rdma_qp_lifecycle_test 对应模块的接口、错误路径和边界行为。
+// 依赖：依赖被测 package、UVM 测试基类和必要的 mock/fixture。
+// 所有权与生命周期：测试对象只拥有本地 fixture；外部后端句柄由测试环境提供并在测试结束释放。
+
 // 中文说明：rdma_qp_lifecycle_test.sv 属于单元测试，覆盖对应模型、编码器或执行器契约。
 // 阅读提示：先看公开类型和接口，再看实现细节；失败路径应保持状态与资源所有权可追踪。
 
@@ -5,11 +10,19 @@ class rdma_qp_allocate_error_host_mem extends rdma_mock_host_mem;
   `uvm_object_utils(rdma_qp_allocate_error_host_mem)
   bit injected;
 
+  // 功能：初始化对象字段、同步 UVM 名称并建立可用的初始生命周期状态（接口 new）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function new(string name = "rdma_qp_allocate_error_host_mem");
     super.new(name);
     injected = 1'b0;
   endfunction
 
+  // 功能：原子地预留或获取所需资源/游标，并记录后续提交所需的所有权证据（接口 allocate）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function rdma_status allocate(
     rdma_dma_request_context request_context,
     int unsigned size,
@@ -36,10 +49,18 @@ endclass
 class rdma_qp_completion_ticket_only_cmq extends rdma_mock_cmq_port;
   `uvm_object_utils(rdma_qp_completion_ticket_only_cmq)
 
+  // 功能：初始化对象字段、同步 UVM 名称并建立可用的初始生命周期状态（接口 new）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function new(string name = "rdma_qp_completion_ticket_only_cmq");
     super.new(name);
   endfunction
 
+  // 功能：执行接口 execute 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 execute）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual task execute(
     rdma_cmq_command_desc command,
     output rdma_cmq_ticket ticket,
@@ -61,11 +82,19 @@ class rdma_qp_query_allocate_fail_host_mem extends rdma_mock_host_mem;
   `uvm_object_utils(rdma_qp_query_allocate_fail_host_mem)
   bit injected;
 
+  // 功能：初始化对象字段、同步 UVM 名称并建立可用的初始生命周期状态（接口 new）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function new(string name = "rdma_qp_query_allocate_fail_host_mem");
     super.new(name);
     injected = 1'b0;
   endfunction
 
+  // 功能：原子地预留或获取所需资源/游标，并记录后续提交所需的所有权证据（接口 allocate）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function rdma_status allocate(
     rdma_dma_request_context request_context,
     int unsigned size,
@@ -95,6 +124,10 @@ class rdma_qp_query_malformed_pending_host_mem extends rdma_mock_host_mem;
   int unsigned release_calls;
   byte scripted_query_bytes[];
 
+  // 功能：初始化对象字段、同步 UVM 名称并建立可用的初始生命周期状态（接口 new）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function new(string name = "rdma_qp_query_malformed_pending_host_mem");
     super.new(name);
     injected = 1'b0;
@@ -103,6 +136,10 @@ class rdma_qp_query_malformed_pending_host_mem extends rdma_mock_host_mem;
     scripted_query_bytes = new[0];
   endfunction
 
+  // 功能：原子地预留或获取所需资源/游标，并记录后续提交所需的所有权证据（接口 allocate）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function rdma_status allocate(
     rdma_dma_request_context request_context,
     int unsigned size,
@@ -136,11 +173,19 @@ class rdma_qp_query_malformed_pending_host_mem extends rdma_mock_host_mem;
     return status;
   endfunction
 
+  // 功能：执行接口 script_query_image 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 script_query_image）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function void script_query_image(byte bytes[]);
     scripted_query_bytes = new[bytes.size()];
     foreach (bytes[i]) scripted_query_bytes[i] = bytes[i];
   endfunction
 
+  // 功能：释放、撤销或回滚当前对象持有的事务/资源，并保持账本与生命周期一致（接口 \release）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function rdma_status \release (rdma_dma_mapping mapping);
     rdma_status status;
     if (mapping != null && mapping.direction == RDMA_DMA_DEVICE_WRITE)
@@ -162,6 +207,10 @@ class rdma_qp_pending_allocate_host_mem extends rdma_mock_host_mem;
   bit pending_release;
   int unsigned release_calls;
 
+  // 功能：初始化对象字段、同步 UVM 名称并建立可用的初始生命周期状态（接口 new）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function new(string name = "rdma_qp_pending_allocate_host_mem");
     super.new(name);
     injected = 1'b0;
@@ -169,6 +218,10 @@ class rdma_qp_pending_allocate_host_mem extends rdma_mock_host_mem;
     release_calls = 0;
   endfunction
 
+  // 功能：原子地预留或获取所需资源/游标，并记录后续提交所需的所有权证据（接口 allocate）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function rdma_status allocate(
     rdma_dma_request_context request_context,
     int unsigned size,
@@ -187,6 +240,10 @@ class rdma_qp_pending_allocate_host_mem extends rdma_mock_host_mem;
     return status;
   endfunction
 
+  // 功能：释放、撤销或回滚当前对象持有的事务/资源，并保持账本与生命周期一致（接口 \release）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function rdma_status \release (rdma_dma_mapping mapping);
     rdma_status status;
     release_calls++;
@@ -208,6 +265,10 @@ class rdma_qp_authority_probe_mapping extends rdma_mock_dma_mapping;
   bit return_null_snapshot;
   int unsigned check_count;
 
+  // 功能：初始化对象字段、同步 UVM 名称并建立可用的初始生命周期状态（接口 new）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function new(string name = "rdma_qp_authority_probe_mapping");
     super.new(name);
     fail_before_copy = 1'b0;
@@ -216,6 +277,10 @@ class rdma_qp_authority_probe_mapping extends rdma_mock_dma_mapping;
     check_count = 0;
   endfunction
 
+  // 功能：读取或查询当前对象的权威状态，并以返回值或 output 参数交付快照（接口 snapshot_release_authority）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function rdma_status snapshot_release_authority(
     output rdma_dma_mapping snapshot
   );
@@ -226,6 +291,10 @@ class rdma_qp_authority_probe_mapping extends rdma_mock_dma_mapping;
     return super.snapshot_release_authority(snapshot);
   endfunction
 
+  // 功能：释放、撤销或回滚当前对象持有的事务/资源，并保持账本与生命周期一致（接口 release_authority_status）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function rdma_status release_authority_status(
     rdma_dma_mapping snapshot
   );
@@ -252,6 +321,10 @@ class rdma_qp_malformed_allocate_host_mem extends rdma_mock_host_mem;
   bit pending_release;
   int unsigned release_calls;
 
+  // 功能：初始化对象字段、同步 UVM 名称并建立可用的初始生命周期状态（接口 new）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function new(string name = "rdma_qp_malformed_allocate_host_mem");
     super.new(name);
     geometry_mode = "undersized";
@@ -260,6 +333,10 @@ class rdma_qp_malformed_allocate_host_mem extends rdma_mock_host_mem;
     release_calls = 0;
   endfunction
 
+  // 功能：原子地预留或获取所需资源/游标，并记录后续提交所需的所有权证据（接口 allocate）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function rdma_status allocate(
     rdma_dma_request_context request_context,
     int unsigned size,
@@ -300,6 +377,10 @@ class rdma_qp_malformed_allocate_host_mem extends rdma_mock_host_mem;
     return status;
   endfunction
 
+  // 功能：释放、撤销或回滚当前对象持有的事务/资源，并保持账本与生命周期一致（接口 \release）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function rdma_status \release (rdma_dma_mapping mapping);
     rdma_status status;
 
@@ -322,10 +403,18 @@ class rdma_qp_urc_malformed_allocate_host_mem extends rdma_mock_host_mem;
   int unsigned release_calls;
   bit pending_release;
 
+  // 功能：初始化对象字段、同步 UVM 名称并建立可用的初始生命周期状态（接口 new）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function new(string name = "rdma_qp_urc_malformed_allocate_host_mem");
     super.new(name); allocate_count = 0; release_calls = 0; pending_release = 0;
   endfunction
 
+  // 功能：原子地预留或获取所需资源/游标，并记录后续提交所需的所有权证据（接口 allocate）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function rdma_status allocate(
     rdma_dma_request_context request_context, int unsigned size,
     int unsigned alignment, rdma_dma_direction_e direction,
@@ -343,6 +432,10 @@ class rdma_qp_urc_malformed_allocate_host_mem extends rdma_mock_host_mem;
     return status;
   endfunction
 
+  // 功能：释放、撤销或回滚当前对象持有的事务/资源，并保持账本与生命周期一致（接口 \release）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function rdma_status \release (rdma_dma_mapping mapping);
     rdma_status status;
     release_calls++;
@@ -361,6 +454,10 @@ class rdma_qp_authority_pending_host_mem extends rdma_mock_host_mem;
   bit pending_release;
   int unsigned release_calls;
 
+  // 功能：初始化对象字段、同步 UVM 名称并建立可用的初始生命周期状态（接口 new）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function new(string name = "rdma_qp_authority_pending_host_mem");
     super.new(name);
     injected = 1'b0;
@@ -369,6 +466,10 @@ class rdma_qp_authority_pending_host_mem extends rdma_mock_host_mem;
     release_calls = 0;
   endfunction
 
+  // 功能：原子地预留或获取所需资源/游标，并记录后续提交所需的所有权证据（接口 allocate）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function rdma_status allocate(
     rdma_dma_request_context request_context,
     int unsigned size,
@@ -396,6 +497,10 @@ class rdma_qp_authority_pending_host_mem extends rdma_mock_host_mem;
     return status;
   endfunction
 
+  // 功能：释放、撤销或回滚当前对象持有的事务/资源，并保持账本与生命周期一致（接口 \release）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function rdma_status \release (rdma_dma_mapping mapping);
     rdma_status status;
 
@@ -417,12 +522,20 @@ class rdma_qp_authority_failure_host_mem extends rdma_mock_host_mem;
   int unsigned fail_check_ordinal;
   bit decorated;
 
+  // 功能：初始化对象字段、同步 UVM 名称并建立可用的初始生命周期状态（接口 new）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function new(string name = "rdma_qp_authority_failure_host_mem");
     super.new(name);
     fail_check_ordinal = 1;
     decorated = 1'b0;
   endfunction
 
+  // 功能：原子地预留或获取所需资源/游标，并记录后续提交所需的所有权证据（接口 allocate）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function rdma_status allocate(
     rdma_dma_request_context request_context,
     int unsigned size,
@@ -453,12 +566,20 @@ class rdma_qp_rebind_host_mem extends rdma_mock_host_mem;
   rdma_function_binding binding_target;
   bit rebound;
 
+  // 功能：初始化对象字段、同步 UVM 名称并建立可用的初始生命周期状态（接口 new）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function new(string name = "rdma_qp_rebind_host_mem");
     super.new(name);
     binding_target = null;
     rebound = 1'b0;
   endfunction
 
+  // 功能：向目标后端提交数据/事务并更新本对象的进度或账本状态（接口 write）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function rdma_status write(
     rdma_dma_mapping mapping,
     longint unsigned offset,
@@ -484,6 +605,10 @@ class rdma_qp_fault_host_mem extends rdma_mock_host_mem;
   int unsigned allocate_count;
   int unsigned write_count;
 
+  // 功能：初始化对象字段、同步 UVM 名称并建立可用的初始生命周期状态（接口 new）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function new(string name = "rdma_qp_fault_host_mem");
     super.new(name);
     fail_allocate_ordinal = 0;
@@ -492,6 +617,10 @@ class rdma_qp_fault_host_mem extends rdma_mock_host_mem;
     write_count = 0;
   endfunction
 
+  // 功能：原子地预留或获取所需资源/游标，并记录后续提交所需的所有权证据（接口 allocate）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function rdma_status allocate(
     rdma_dma_request_context request_context,
     int unsigned size,
@@ -508,6 +637,10 @@ class rdma_qp_fault_host_mem extends rdma_mock_host_mem;
     return super.allocate(request_context, size, alignment, direction, mapping);
   endfunction
 
+  // 功能：向目标后端提交数据/事务并更新本对象的进度或账本状态（接口 write）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function rdma_status write(
     rdma_dma_mapping mapping,
     longint unsigned offset,
@@ -531,6 +664,10 @@ class rdma_qp_fault_manager extends rdma_resource_manager;
   bit rebind_on_sequence_failure;
   bit attach_rebound;
 
+  // 功能：初始化对象字段、同步 UVM 名称并建立可用的初始生命周期状态（接口 new）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function new(string name = "rdma_qp_fault_manager");
     super.new(name);
     attach_failure = null;
@@ -542,6 +679,10 @@ class rdma_qp_fault_manager extends rdma_resource_manager;
     attach_rebound = 1'b0;
   endfunction
 
+  // 功能：执行接口 qp_sequence 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 qp_sequence）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function rdma_status qp_sequence(
     rdma_function_handle owner,
     int unsigned local_qpn,
@@ -562,6 +703,10 @@ class rdma_qp_fault_manager extends rdma_resource_manager;
     return super.qp_sequence(owner, local_qpn, sequence_value);
   endfunction
 
+  // 功能：执行接口 attach_qp_programming 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 attach_qp_programming）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function rdma_status attach_qp_programming(rdma_qp candidate);
     rdma_status failure;
     rdma_status status;
@@ -582,6 +727,10 @@ class rdma_qp_fault_manager extends rdma_resource_manager;
     return status;
   endfunction
 
+  // 功能：推进对象的运行/复位/恢复状态机，并清晰隔离旧 incarnation 的操作（接口 activate）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function rdma_status activate(rdma_handle handle);
     rdma_status failure;
     if (activate_failure != null && handle != null &&
@@ -593,6 +742,10 @@ class rdma_qp_fault_manager extends rdma_resource_manager;
     return super.activate(handle);
   endfunction
 
+  // 功能：执行接口 raw_qp_state 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 raw_qp_state）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function bit raw_qp_state(
     rdma_handle handle,
     output rdma_resource_state_e state
@@ -608,6 +761,10 @@ class rdma_qp_fault_manager extends rdma_resource_manager;
     return 1'b1;
   endfunction
 
+  // 功能：执行接口 raw_qp_local_id 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 raw_qp_local_id）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function bit raw_qp_local_id(
     rdma_handle handle,
     output int unsigned local_id
@@ -626,6 +783,10 @@ class rdma_qp_fault_manager extends rdma_resource_manager;
     return 1'b1;
   endfunction
 
+  // 功能：执行接口 raw_recovery_exists 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 raw_recovery_exists）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function bit raw_recovery_exists(rdma_handle handle);
     string key;
     if (handle == null)
@@ -634,6 +795,10 @@ class rdma_qp_fault_manager extends rdma_resource_manager;
     return recovery_records.exists(key);
   endfunction
 
+  // 功能：执行接口 raw_recovery 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 raw_recovery）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function bit raw_recovery(
     rdma_handle handle,
     output rdma_recovery_record recovery
@@ -661,6 +826,10 @@ class rdma_qp_boundary_host_mem extends rdma_mock_host_mem;
   bit unauthorized_effect;
   bit injected;
 
+  // 功能：初始化对象字段、同步 UVM 名称并建立可用的初始生命周期状态（接口 new）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function new(string name = "rdma_qp_boundary_host_mem");
     super.new(name);
     binding_target = null;
@@ -673,6 +842,10 @@ class rdma_qp_boundary_host_mem extends rdma_mock_host_mem;
     injected = 1'b0;
   endfunction
 
+  // 功能：执行接口 rebind 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 rebind）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function void rebind();
     if (binding_target != null && !rebound) begin
       binding_target.generation++;
@@ -682,6 +855,10 @@ class rdma_qp_boundary_host_mem extends rdma_mock_host_mem;
     end
   endfunction
 
+  // 功能：原子地预留或获取所需资源/游标，并记录后续提交所需的所有权证据（接口 allocate）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function rdma_status allocate(
     rdma_dma_request_context request_context,
     int unsigned size,
@@ -710,6 +887,10 @@ class rdma_qp_boundary_host_mem extends rdma_mock_host_mem;
     return status;
   endfunction
 
+  // 功能：向目标后端提交数据/事务并更新本对象的进度或账本状态（接口 write）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function rdma_status write(
     rdma_dma_mapping mapping,
     longint unsigned offset,
@@ -741,6 +922,10 @@ class rdma_qp_boundary_host_mem extends rdma_mock_host_mem;
     return status;
   endfunction
 
+  // 功能：释放、撤销或回滚当前对象持有的事务/资源，并保持账本与生命周期一致（接口 \release）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function rdma_status \release (rdma_dma_mapping mapping);
     rdma_status status;
     release_count++;
@@ -786,11 +971,19 @@ class rdma_qp_command_fault_executor extends rdma_qp_lifecycle_executor;
   `uvm_object_utils(rdma_qp_command_fault_executor)
   bit fail_create_command;
 
+  // 功能：初始化对象字段、同步 UVM 名称并建立可用的初始生命周期状态（接口 new）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function new(string name = "rdma_qp_command_fault_executor");
     super.new(name);
     fail_create_command = 1'b0;
   endfunction
 
+  // 功能：依据输入快照构造请求、资源或适配对象，并返回独立的结果载体（接口 build_qpc_command）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected virtual function rdma_status build_qpc_command(
     rdma_function_handle owner,
     rdma_qpc_model model,
@@ -820,6 +1013,10 @@ class rdma_qp_boundary_context_backing extends rdma_mock_context_backing;
   bit unauthorized_effect;
   bit injected;
 
+  // 功能：初始化对象字段、同步 UVM 名称并建立可用的初始生命周期状态（接口 new）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function new(string name = "rdma_qp_boundary_context_backing");
     super.new(name);
     binding_target = null;
@@ -832,6 +1029,10 @@ class rdma_qp_boundary_context_backing extends rdma_mock_context_backing;
     injected = 1'b0;
   endfunction
 
+  // 功能：执行接口 rebind 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 rebind）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function void rebind();
     if (binding_target != null && !rebound) begin
       binding_target.generation++;
@@ -841,6 +1042,10 @@ class rdma_qp_boundary_context_backing extends rdma_mock_context_backing;
     end
   endfunction
 
+  // 功能：原子地预留或获取所需资源/游标，并记录后续提交所需的所有权证据（接口 acquire）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function rdma_status acquire(
     rdma_function_binding binding,
     rdma_resource_kind_e resource_kind,
@@ -866,6 +1071,10 @@ class rdma_qp_boundary_context_backing extends rdma_mock_context_backing;
     return status;
   endfunction
 
+  // 功能：向目标后端提交数据/事务并更新本对象的进度或账本状态（接口 write）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function rdma_status write(
     rdma_context_backing_ref context_ref,
     longint unsigned offset,
@@ -890,6 +1099,10 @@ class rdma_qp_boundary_context_backing extends rdma_mock_context_backing;
     return status;
   endfunction
 
+  // 功能：释放、撤销或回滚当前对象持有的事务/资源，并保持账本与生命周期一致（接口 \release）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function rdma_status \release (
     rdma_context_backing_ref context_ref
   );
@@ -922,12 +1135,20 @@ class rdma_qp_activation_rebind_manager extends rdma_qp_fault_manager;
   rdma_function_binding binding_target;
   bit rebind_after_activate;
 
+  // 功能：初始化对象字段、同步 UVM 名称并建立可用的初始生命周期状态（接口 new）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function new(string name = "rdma_qp_activation_rebind_manager");
     super.new(name);
     binding_target = null;
     rebind_after_activate = 1'b0;
   endfunction
 
+  // 功能：推进对象的运行/复位/恢复状态机，并清晰隔离旧 incarnation 的操作（接口 activate）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function rdma_status activate(rdma_handle handle);
     rdma_status status;
     status = super.activate(handle);
@@ -945,10 +1166,18 @@ endclass
 class rdma_qp_codec_fault_executor extends rdma_qp_lifecycle_executor;
   `uvm_object_utils(rdma_qp_codec_fault_executor)
 
+  // 功能：初始化对象字段、同步 UVM 名称并建立可用的初始生命周期状态（接口 new）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function new(string name = "rdma_qp_codec_fault_executor");
     super.new(name);
   endfunction
 
+  // 功能：维护内部集合或缓存的一致性，完成指定条目的增删或清空（接口 remove_qpc_codecs）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function void remove_qpc_codecs();
     qpc_codecs.clear();
   endfunction
@@ -960,6 +1189,10 @@ class rdma_qp_output_fault_cmq extends rdma_mock_cmq_port;
   bit drop_completion;
   bit definitive_no_submit;
 
+  // 功能：初始化对象字段、同步 UVM 名称并建立可用的初始生命周期状态（接口 new）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function new(string name = "rdma_qp_output_fault_cmq");
     super.new(name);
     drop_ticket = 0;
@@ -967,6 +1200,10 @@ class rdma_qp_output_fault_cmq extends rdma_mock_cmq_port;
     definitive_no_submit = 0;
   endfunction
 
+  // 功能：执行接口 execute 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 execute）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual task execute(
     rdma_cmq_command_desc command,
     output rdma_cmq_ticket ticket,
@@ -1000,10 +1237,18 @@ endclass
 class rdma_qp_ticketless_destroy_cmq extends rdma_mock_cmq_port;
   `uvm_object_utils(rdma_qp_ticketless_destroy_cmq)
 
+  // 功能：初始化对象字段、同步 UVM 名称并建立可用的初始生命周期状态（接口 new）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function new(string name = "rdma_qp_ticketless_destroy_cmq");
     super.new(name);
   endfunction
 
+  // 功能：执行接口 execute 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 execute）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual task execute(
     rdma_cmq_command_desc command,
     output rdma_cmq_ticket ticket,
@@ -1033,6 +1278,10 @@ class rdma_qp_destroy_rebind_cmq extends rdma_mock_cmq_port;
   bit rebound;
   bit armed;
 
+  // 功能：初始化对象字段、同步 UVM 名称并建立可用的初始生命周期状态（接口 new）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function new(string name = "rdma_qp_destroy_rebind_cmq");
     super.new(name);
     binding_target = null;
@@ -1040,6 +1289,10 @@ class rdma_qp_destroy_rebind_cmq extends rdma_mock_cmq_port;
     armed = 1'b0;
   endfunction
 
+  // 功能：执行接口 execute 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 execute）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual task execute(
     rdma_cmq_command_desc command,
     output rdma_cmq_ticket ticket,
@@ -1061,16 +1314,28 @@ endclass
 class rdma_qp_lifecycle_test extends uvm_test;
   `uvm_component_utils(rdma_qp_lifecycle_test)
 
+  // 功能：初始化对象字段、同步 UVM 名称并建立可用的初始生命周期状态（接口 new）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function new(string name = "rdma_qp_lifecycle_test",
                uvm_component parent = null);
     super.new(name, parent);
   endfunction
 
+  // 功能：执行接口 expect_ok 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 expect_ok）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function automatic void expect_ok(string label, rdma_status status);
     if (status == null || !status.ok())
       `uvm_error(label, status == null ? "null status" : status.convert2string())
   endfunction
 
+  // 功能：执行接口 expect_code 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 expect_code）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function automatic void expect_code(
     string label, rdma_status status, rdma_status_code_e expected
   );
@@ -1079,6 +1344,10 @@ class rdma_qp_lifecycle_test extends uvm_test;
         status == null ? "null" : status.convert2string()))
   endfunction
 
+  // 功能：依据输入快照构造请求、资源或适配对象，并返回独立的结果载体（接口 make_binding）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function automatic rdma_function_binding make_binding(string name);
     rdma_function_binding binding;
     rdma_interrupt_vector_binding vector;
@@ -1135,6 +1404,10 @@ class rdma_qp_lifecycle_test extends uvm_test;
     return binding;
   endfunction
 
+  // 功能：依据输入快照构造请求、资源或适配对象，并返回独立的结果载体（接口 make_rc_attrs）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function automatic rdma_qp_context_attributes make_rc_attrs(string name);
     rdma_qp_context_attributes attrs;
     rdma_qpc_rc_ext ext;
@@ -1157,6 +1430,10 @@ class rdma_qp_lifecycle_test extends uvm_test;
     return attrs;
   endfunction
 
+  // 功能：依据输入快照构造请求、资源或适配对象，并返回独立的结果载体（接口 make_urc_attrs）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function automatic rdma_qp_context_attributes make_urc_attrs(string name);
     rdma_qp_context_attributes attrs;
     rdma_qpc_urc_ext ext;
@@ -1178,6 +1455,10 @@ class rdma_qp_lifecycle_test extends uvm_test;
     return attrs;
   endfunction
 
+  // 功能：依据输入快照构造请求、资源或适配对象，并返回独立的结果载体（接口 make_ud_attrs）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function automatic rdma_qp_context_attributes make_ud_attrs(string name);
     rdma_qp_context_attributes attrs;
     rdma_qpc_ud_ext ext;
@@ -1189,6 +1470,10 @@ class rdma_qp_lifecycle_test extends uvm_test;
     return attrs;
   endfunction
 
+  // 功能：依据输入快照构造请求、资源或适配对象，并返回独立的结果载体（接口 make_request）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function automatic rdma_create_qp_req make_request(
     string name, rdma_function_binding binding, rdma_pd pd, rdma_cq cq,
     rdma_transport_e transport
@@ -1214,6 +1499,10 @@ class rdma_qp_lifecycle_test extends uvm_test;
     return request;
   endfunction
 
+  // 功能：写入并校验运行所需的配置、身份或资源参数，建立后续操作的边界（接口 setup_qp_environment）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   task automatic setup_qp_environment(
     string label,
     rdma_mock_host_mem mem,
@@ -1240,6 +1529,10 @@ class rdma_qp_lifecycle_test extends uvm_test;
                                                           contexts, 2us));
   endtask
 
+  // 功能：写入并校验运行所需的配置、身份或资源参数，建立后续操作的边界（接口 setup_custom_qp_environment）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   task automatic setup_custom_qp_environment(
     string label,
     rdma_mock_host_mem mem,
@@ -1262,6 +1555,10 @@ class rdma_qp_lifecycle_test extends uvm_test;
                                                           contexts, 2us));
   endtask
 
+  // 功能：执行接口 expect_create_steps 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 expect_create_steps）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function automatic void expect_create_steps(
     string label, rdma_control_result result
   );
@@ -1277,6 +1574,10 @@ class rdma_qp_lifecycle_test extends uvm_test;
         result == null ? expected : result.completed_steps))
   endfunction
 
+  // 功能：依据输入快照构造请求、资源或适配对象，并返回独立的结果载体（接口 make_borrowed_context）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function automatic rdma_dma_request_context make_borrowed_context(
     string name,
     rdma_function_binding binding,
@@ -1299,6 +1600,10 @@ class rdma_qp_lifecycle_test extends uvm_test;
     return request_context;
   endfunction
 
+  // 功能：原子地预留或获取所需资源/游标，并记录后续提交所需的所有权证据（接口 allocate_borrowed_mapping）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   task automatic allocate_borrowed_mapping(
     string label,
     rdma_mock_host_mem mem,
@@ -1314,6 +1619,10 @@ class rdma_qp_lifecycle_test extends uvm_test;
                                   RDMA_DMA_BIDIRECTIONAL, mapping));
   endtask
 
+  // 功能：依据输入快照构造请求、资源或适配对象，并返回独立的结果载体（接口 make_borrowed_slice）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function automatic rdma_queue_backing_slice make_borrowed_slice(
     string name,
     rdma_queue_backing_role_e role,
@@ -1331,6 +1640,10 @@ class rdma_qp_lifecycle_test extends uvm_test;
     return slice;
   endfunction
 
+  // 功能：依据输入快照构造请求、资源或适配对象，并返回独立的结果载体（接口 create_qp_fixture）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   task automatic create_qp_fixture(
     string label,
     rdma_transport_e transport,
@@ -1392,6 +1705,10 @@ class rdma_qp_lifecycle_test extends uvm_test;
     end
   endtask
 
+  // 功能：检查输入值、身份字段和当前生命周期约束，给出一致性判断或状态结果（接口 check_rc_plan_and_staging_authority）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   task automatic check_rc_plan_and_staging_authority();
     rdma_mock_host_mem mem;
     rdma_qp qp;
@@ -1431,6 +1748,10 @@ class rdma_qp_lifecycle_test extends uvm_test;
         `uvm_error("RC_PLAN", "staging DMA owner was not the global QP handle")
   endtask
 
+  // 功能：检查输入值、身份字段和当前生命周期约束，给出一致性判断或状态结果（接口 check_ud_semantic_round_trip）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   task automatic check_ud_semantic_round_trip();
     rdma_mock_host_mem mem;
     rdma_qp qp;
@@ -1452,6 +1773,10 @@ class rdma_qp_lifecycle_test extends uvm_test;
     end
   endtask
 
+  // 功能：检查输入值、身份字段和当前生命周期约束，给出一致性判断或状态结果（接口 check_urc_internal_geometry）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   task automatic check_urc_internal_geometry();
     rdma_mock_host_mem mem;
     rdma_qp qp;
@@ -1473,6 +1798,10 @@ class rdma_qp_lifecycle_test extends uvm_test;
       `uvm_error("URC_PLAN", "URC RSQ/RDSQ/DSQ owned geometry is wrong")
   endtask
 
+  // 功能：检查输入值、身份字段和当前生命周期约束，给出一致性判断或状态结果（接口 check_allocate_error_cleanup）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   task automatic check_allocate_error_cleanup();
     rdma_qp_allocate_error_host_mem mem;
     rdma_function_binding binding;
@@ -1504,6 +1833,10 @@ class rdma_qp_lifecycle_test extends uvm_test;
         "non-null failed allocation was not released exactly once")
   endtask
 
+  // 功能：检查输入值、身份字段和当前生命周期约束，给出一致性判断或状态结果（接口 check_authority_failure_cleanup）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   task automatic check_authority_failure_cleanup(int unsigned ordinal);
     rdma_qp_authority_failure_host_mem mem;
     rdma_function_binding binding;
@@ -1538,6 +1871,10 @@ class rdma_qp_lifecycle_test extends uvm_test;
         "opaque authority failure did not release its allocation")
   endtask
 
+  // 功能：检查输入值、身份字段和当前生命周期约束，给出一致性判断或状态结果（接口 check_stale_rebind_blocks_attach）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   task automatic check_stale_rebind_blocks_attach();
     rdma_qp_rebind_host_mem mem;
     rdma_function_binding binding;
@@ -1592,6 +1929,10 @@ class rdma_qp_lifecycle_test extends uvm_test;
         "stale binding reached QP attachment or leaked rollback authority")
   endtask
 
+  // 功能：检查输入值、身份字段和当前生命周期约束，给出一致性判断或状态结果（接口 check_urc_nonzero_rejected）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   task automatic check_urc_nonzero_rejected();
     rdma_mock_host_mem mem;
     rdma_function_binding binding;
@@ -1623,6 +1964,10 @@ class rdma_qp_lifecycle_test extends uvm_test;
         "caller URC backing reached allocation side effects")
   endtask
 
+  // 功能：执行接口 expect_zero_page 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 expect_zero_page）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   task automatic expect_zero_page(
     string label, rdma_mock_host_mem mem, rdma_dma_mapping mapping,
     longint unsigned offset
@@ -1636,6 +1981,10 @@ class rdma_qp_lifecycle_test extends uvm_test;
       end
   endtask
 
+  // 功能：执行接口 expect_pd_prefix 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 expect_pd_prefix）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   task automatic expect_pd_prefix(
     string label, rdma_mock_host_mem mem, rdma_dma_mapping mapping,
     byte expected[16]
@@ -1650,6 +1999,10 @@ class rdma_qp_lifecycle_test extends uvm_test;
           "PD byte %0d expected 0x%02x got 0x%02x", i, expected[i], data[i]))
   endtask
 
+  // 功能：检查输入值、身份字段和当前生命周期约束，给出一致性判断或状态结果（接口 check_borrowed_multislice_authority）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   task automatic check_borrowed_multislice_authority();
     rdma_mock_host_mem mem;
     rdma_function_binding binding;
@@ -1801,6 +2154,10 @@ class rdma_qp_lifecycle_test extends uvm_test;
   // rebound to the newly-created QP, while the caller remains the release
   // authority.  This specifically covers the optional UD SGB path rather
   // than only the ordinary SQ/RQ borrowed rings above.
+  // 功能：检查输入值、身份字段和当前生命周期约束，给出一致性判断或状态结果（接口 check_borrowed_sgb_authority）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   task automatic check_borrowed_sgb_authority();
     rdma_mock_host_mem mem;
     rdma_function_binding binding;
@@ -1865,6 +2222,10 @@ class rdma_qp_lifecycle_test extends uvm_test;
       `uvm_error("BORROWED_SGB_NON_RELEASE", "borrowed SQ-SGB was released")
   endtask
 
+  // 功能：检查输入值、身份字段和当前生命周期约束，给出一致性判断或状态结果（接口 check_rc_srq_geometry）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   task automatic check_rc_srq_geometry();
     rdma_function_binding binding;
     rdma_resource_manager manager;
@@ -1988,6 +2349,10 @@ class rdma_qp_lifecycle_test extends uvm_test;
       `uvm_error("RC_SRQ_DEPTH_MISMATCH", "mismatched SRQ depth returned a QP")
   endtask
 
+  // 功能：执行接口 expect_definitive_create_rollback 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 expect_definitive_create_rollback）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   task automatic expect_definitive_create_rollback(
     string label,
     rdma_resource_manager manager,
@@ -2013,6 +2378,10 @@ class rdma_qp_lifecycle_test extends uvm_test;
     end
   endtask
 
+  // 功能：检查输入值、身份字段和当前生命周期约束，给出一致性判断或状态结果（接口 check_allocation_and_host_write_failures）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   task automatic check_allocation_and_host_write_failures();
     for (int unsigned failure_ordinal = 1; failure_ordinal <= 5;
          failure_ordinal++) begin
@@ -2083,6 +2452,10 @@ class rdma_qp_lifecycle_test extends uvm_test;
     end
   endtask
 
+  // 功能：检查输入值、身份字段和当前生命周期约束，给出一致性判断或状态结果（接口 check_context_codec_and_attach_failures）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   task automatic check_context_codec_and_attach_failures();
     for (int unsigned failure_kind = 0; failure_kind < 4; failure_kind++) begin
       string label;
@@ -2139,6 +2512,10 @@ class rdma_qp_lifecycle_test extends uvm_test;
     end
   endtask
 
+  // 功能：检查输入值、身份字段和当前生命周期约束，给出一致性判断或状态结果（接口 check_definitive_cmq_and_activation_failures）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   task automatic check_definitive_cmq_and_activation_failures();
     rdma_xtr_v1_occ_flush_body malformed_zero_qpn;
     malformed_zero_qpn = rdma_xtr_v1_occ_flush_body::type_id::create(
@@ -2220,6 +2597,10 @@ class rdma_qp_lifecycle_test extends uvm_test;
     end
   endtask
 
+  // 功能：检查输入值、身份字段和当前生命周期约束，给出一致性判断或状态结果（接口 check_stale_forged_recovery_rejected）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   task automatic check_stale_forged_recovery_rejected();
     rdma_mock_host_mem mem;
     rdma_qp_fault_manager manager;
@@ -2324,6 +2705,10 @@ class rdma_qp_lifecycle_test extends uvm_test;
         "rejected ordinary stale recovery mutated authoritative QP state")
   endtask
 
+  // 功能：检查输入值、身份字段和当前生命周期约束，给出一致性判断或状态结果（接口 check_ambiguous_create_outcomes）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   task automatic check_ambiguous_create_outcomes();
     for (int unsigned failure_kind = 0; failure_kind < 4; failure_kind++) begin
       string label;
@@ -2391,6 +2776,10 @@ class rdma_qp_lifecycle_test extends uvm_test;
     end
   endtask
 
+  // 功能：检查输入值、身份字段和当前生命周期约束，给出一致性判断或状态结果（接口 check_create_generation_fences）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   task automatic check_create_generation_fences();
     rdma_mock_host_mem mem;
     rdma_resource_manager manager;
@@ -2461,6 +2850,10 @@ class rdma_qp_lifecycle_test extends uvm_test;
                  "held-gate rebind did not retain old create authority")
   endtask
 
+  // 功能：检查输入值、身份字段和当前生命周期约束，给出一致性判断或状态结果（接口 check_immediate_adapter_generation_boundaries）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   task automatic check_immediate_adapter_generation_boundaries();
     string host_modes[$];
     string context_modes[$];
@@ -2575,6 +2968,10 @@ class rdma_qp_lifecycle_test extends uvm_test;
     end
   endtask
 
+  // 功能：检查输入值、身份字段和当前生命周期约束，给出一致性判断或状态结果（接口 check_local_timeout_authority_retained）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   task automatic check_local_timeout_authority_retained();
     string modes[$];
 
@@ -2645,6 +3042,10 @@ class rdma_qp_lifecycle_test extends uvm_test;
     end
   endtask
 
+  // 功能：检查输入值、身份字段和当前生命周期约束，给出一致性判断或状态结果（接口 check_staging_release_completion_and_rebind）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   task automatic check_staging_release_completion_and_rebind();
     string timeout_modes[$];
 
@@ -2778,6 +3179,10 @@ class rdma_qp_lifecycle_test extends uvm_test;
     end
   endtask
 
+  // 功能：检查输入值、身份字段和当前生命周期约束，给出一致性判断或状态结果（接口 check_context_release_completion）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   task automatic check_context_release_completion();
     string modes[$];
 
@@ -2852,6 +3257,10 @@ class rdma_qp_lifecycle_test extends uvm_test;
     end
   endtask
 
+  // 功能：检查输入值、身份字段和当前生命周期约束，给出一致性判断或状态结果（接口 check_activation_rebind_recovery）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   task automatic check_activation_rebind_recovery();
     string label;
     rdma_qp_boundary_host_mem mem;
@@ -2904,6 +3313,10 @@ class rdma_qp_lifecycle_test extends uvm_test;
         "post-activation rebind did not retain exact old-generation authority")
   endtask
 
+  // 功能：检查输入值、身份字段和当前生命周期约束，给出一致性判断或状态结果（接口 check_activation_rollback_ambiguity）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   task automatic check_activation_rollback_ambiguity();
     rdma_queue_backing_role_e roles[$];
 
@@ -3032,6 +3445,10 @@ class rdma_qp_lifecycle_test extends uvm_test;
     end
   endtask
 
+  // 功能：检查输入值、身份字段和当前生命周期约束，给出一致性判断或状态结果（接口 check_pre_create_execute_generation_fence）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   task automatic check_pre_create_execute_generation_fence();
     string label;
     rdma_qp_boundary_host_mem mem;
@@ -3093,6 +3510,10 @@ class rdma_qp_lifecycle_test extends uvm_test;
         "pre-QPC_CREATE fence submitted or lost exact-old recovery authority")
   endtask
 
+  // 功能：检查输入值、身份字段和当前生命周期约束，给出一致性判断或状态结果（接口 check_context_acquire_rebind_authority）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   task automatic check_context_acquire_rebind_authority();
     string label;
     rdma_qp_boundary_host_mem mem;
@@ -3160,6 +3581,10 @@ class rdma_qp_lifecycle_test extends uvm_test;
         "post-acquire rebind left bare stale or lost exact-old authority")
   endtask
 
+  // 功能：检查输入值、身份字段和当前生命周期约束，给出一致性判断或状态结果（接口 check_definitive_failure_staging_release_ambiguity）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   task automatic check_definitive_failure_staging_release_ambiguity();
     for (int unsigned failure_kind = 0; failure_kind < 3; failure_kind++) begin
       string label;
@@ -3249,6 +3674,10 @@ class rdma_qp_lifecycle_test extends uvm_test;
     end
   endtask
 
+  // 功能：检查输入值、身份字段和当前生命周期约束，给出一致性判断或状态结果（接口 check_direct_unattached_release_authority）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   task automatic check_direct_unattached_release_authority();
     for (int unsigned failure_kind = 0; failure_kind < 2; failure_kind++) begin
       string label;
@@ -3380,6 +3809,10 @@ class rdma_qp_lifecycle_test extends uvm_test;
     end
   endtask
 
+  // 功能：检查输入值、身份字段和当前生命周期约束，给出一致性判断或状态结果（接口 check_unattached_release_ambiguity）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   task automatic check_unattached_release_ambiguity();
     for (int unsigned failure_kind = 0; failure_kind < 2; failure_kind++) begin
       string label;
@@ -3475,6 +3908,10 @@ class rdma_qp_lifecycle_test extends uvm_test;
     end
   endtask
 
+  // 功能：检查输入值、身份字段和当前生命周期约束，给出一致性判断或状态结果（接口 check_contextless_preprogram_progress）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   task automatic check_contextless_preprogram_progress();
     rdma_qp_boundary_host_mem mem;
     rdma_qp_fault_manager manager;
@@ -3571,6 +4008,10 @@ class rdma_qp_lifecycle_test extends uvm_test;
                  "contextless QP plan did not finalize after opaque cleanup")
   endtask
 
+  // 功能：检查输入值、身份字段和当前生命周期约束，给出一致性判断或状态结果（接口 check_allocate_pending_release_retained）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   task automatic check_allocate_pending_release_retained();
     rdma_qp_pending_allocate_host_mem mem;
     rdma_function_binding binding;
@@ -3612,6 +4053,10 @@ class rdma_qp_lifecycle_test extends uvm_test;
   // authority-hook rejection must not make the allocation disappear.  The
   // first release is deliberately incomplete; the second call seals it and
   // recovery progress must then be idempotent.
+  // 功能：检查输入值、身份字段和当前生命周期约束，给出一致性判断或状态结果（接口 check_malformed_allocation_recovery）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   task automatic check_malformed_allocation_recovery();
     string modes[$];
 
@@ -3777,6 +4222,10 @@ class rdma_qp_lifecycle_test extends uvm_test;
     end
   endtask
 
+  // 功能：执行 UVM 阶段任务，驱动测试场景并在结束时释放阶段 objection（接口 run_phase）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   task run_phase(uvm_phase phase);
     phase.raise_objection(this);
     check_rc_plan_and_staging_authority();
@@ -3822,6 +4271,10 @@ class rdma_qp_lifecycle_test extends uvm_test;
     phase.drop_objection(this);
   endtask
 
+  // 功能：检查输入值、身份字段和当前生命周期约束，给出一致性判断或状态结果（接口 check_destroy_stale_generation_boundary）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   task automatic check_destroy_stale_generation_boundary();
     rdma_mock_host_mem mem;
     rdma_function_binding binding;
@@ -3871,6 +4324,10 @@ class rdma_qp_lifecycle_test extends uvm_test;
                  "stale generation after destroy side effect was not fenced")
   endtask
 
+  // 功能：检查输入值、身份字段和当前生命周期约束，给出一致性判断或状态结果（接口 check_destroy_lifecycle）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   task automatic check_destroy_lifecycle();
     rdma_mock_host_mem mem;
     rdma_function_binding binding;
@@ -3945,6 +4402,10 @@ class rdma_qp_lifecycle_test extends uvm_test;
       `uvm_error("QP_DESTROY_BUSY", "busy QP destroy issued side effects")
   endtask
 
+  // 功能：检查输入值、身份字段和当前生命周期约束，给出一致性判断或状态结果（接口 check_destroy_ticketless_ambiguity）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   task automatic check_destroy_ticketless_ambiguity();
     rdma_mock_host_mem mem;
     rdma_function_binding binding;
@@ -4006,6 +4467,10 @@ class rdma_qp_lifecycle_test extends uvm_test;
                  "ticketless destroy recovery did not fail closed")
   endtask
 
+  // 功能：检查输入值、身份字段和当前生命周期约束，给出一致性判断或状态结果（接口 check_modify_state_machine）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   task automatic check_modify_state_machine();
     rdma_mock_host_mem mem;
     rdma_function_binding binding;
@@ -4116,6 +4581,10 @@ class rdma_qp_lifecycle_test extends uvm_test;
       `uvm_error("MODIFY_SQD", "SQD modify was not rejected as unsupported")
   endtask
 
+  // 功能：检查输入值、身份字段和当前生命周期约束，给出一致性判断或状态结果（接口 check_urc_recovery_retention）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   task automatic check_urc_recovery_retention();
     rdma_qp_urc_malformed_allocate_host_mem mem;
     rdma_function_binding binding; rdma_resource_manager manager;
@@ -4160,6 +4629,10 @@ class rdma_qp_lifecycle_test extends uvm_test;
       `uvm_error("URC_RECOVERY_RED", "URC failed allocation was not retained in recovery plan")
   endtask
 
+  // 功能：检查输入值、身份字段和当前生命周期约束，给出一致性判断或状态结果（接口 check_modify_completion_ticket_fallback）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   task automatic check_modify_completion_ticket_fallback();
     rdma_mock_host_mem mem;
     rdma_function_binding binding;
@@ -4225,6 +4698,10 @@ class rdma_qp_lifecycle_test extends uvm_test;
     end
   endtask
 
+  // 功能：检查输入值、身份字段和当前生命周期约束，给出一致性判断或状态结果（接口 check_modify_query_allocation_failure）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   task automatic check_modify_query_allocation_failure();
     rdma_qp_query_allocate_fail_host_mem mem;
     rdma_function_binding binding;
@@ -4274,6 +4751,10 @@ class rdma_qp_lifecycle_test extends uvm_test;
       `uvm_error("MODIFY_QUERY_ALLOC", "query allocation failure lost ERROR recovery authority")
   endtask
 
+  // 功能：检查输入值、身份字段和当前生命周期约束，给出一致性判断或状态结果（接口 check_modify_query_malformed_pending）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   task automatic check_modify_query_malformed_pending();
     rdma_qp_query_malformed_pending_host_mem mem;
     rdma_function_binding binding;
@@ -4366,6 +4847,10 @@ class rdma_qp_lifecycle_test extends uvm_test;
     end
   endtask
 
+  // 功能：检查输入值、身份字段和当前生命周期约束，给出一致性判断或状态结果（接口 check_modify_transport_and_guards）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   task automatic check_modify_transport_and_guards();
     rdma_mock_host_mem mem;
     rdma_function_binding binding;

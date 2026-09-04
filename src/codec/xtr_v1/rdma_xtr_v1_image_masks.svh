@@ -1,3 +1,8 @@
+// 目录：硬件编解码层 codec/xtr_v1/rdma_xtr_v1_image_masks.svh。
+// 职责：提供可文本包含的宏、固定字段或掩码定义；不持有运行期对象。
+// 依赖：依赖对应 codec package 的字段约定和编译期常量。
+// 所有权与生命周期：宏/常量由包含它的编译单元拥有，生命周期为编译期。
+
 // Immutable xtr_v1 request ownership masks. Each entry is a logical qword
 // mask before big-endian serialization; Task 10/11 consume this lookup API.
 localparam bit [63:0] XTR_V1_CMQ_ENVELOPE_MASK [0:7] = '{
@@ -170,6 +175,10 @@ localparam bit [63:0] XTR_V1_SQ_WQE_ATOMIC_FAA_BODY_MASK [0:7] = '{
   64'hffffffffffffffff, 64'h0
 };
 
+// 功能：执行接口 request_envelope_mask 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 request_envelope_mask）。
+// 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+//   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+// 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
 function automatic bit [63:0] request_envelope_mask(
     int unsigned qword_index);
   if (qword_index > 7)
@@ -177,6 +186,10 @@ function automatic bit [63:0] request_envelope_mask(
   return XTR_V1_CMQ_ENVELOPE_MASK[qword_index];
 endfunction
 
+// 功能：执行接口 body_mask 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 body_mask）。
+// 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+//   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+// 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
 function automatic bit body_mask(
     rdma_image_kind_e image_kind,
     bit [7:0] opcode,

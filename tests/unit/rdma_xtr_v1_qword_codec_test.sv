@@ -1,14 +1,27 @@
+// 目录：测试层 unit/rdma_xtr_v1_qword_codec_test.sv。
+// 职责：验证 rdma_xtr_v1_qword_codec_test 对应模块的接口、错误路径和边界行为。
+// 依赖：依赖被测 package、UVM 测试基类和必要的 mock/fixture。
+// 所有权与生命周期：测试对象只拥有本地 fixture；外部后端句柄由测试环境提供并在测试结束释放。
+
 // 中文说明：rdma_xtr_v1_qword_codec_test.sv 属于单元测试，覆盖对应模型、编码器或执行器契约。
 // 阅读提示：先看公开类型和接口，再看实现细节；失败路径应保持状态与资源所有权可追踪。
 
 class rdma_xtr_v1_qword_codec_test extends uvm_test;
   `uvm_component_utils(rdma_xtr_v1_qword_codec_test)
 
+  // 功能：初始化对象字段、同步 UVM 名称并建立可用的初始生命周期状态（接口 new）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function new(string name = "rdma_xtr_v1_qword_codec_test",
                uvm_component parent = null);
     super.new(name, parent);
   endfunction
 
+  // 功能：执行接口 expect_status 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 expect_status）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function automatic void expect_status(
     string label,
     rdma_status status,
@@ -25,10 +38,18 @@ class rdma_xtr_v1_qword_codec_test extends uvm_test;
                            status.convert2string()))
   endfunction
 
+  // 功能：执行接口 expect_ok 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 expect_ok）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function automatic void expect_ok(string label, rdma_status status);
     expect_status(label, status, RDMA_SC_OK);
   endfunction
 
+  // 功能：执行接口 qwords_equal 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 qwords_equal）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function automatic bit qwords_equal(
     bit [63:0] lhs[],
     bit [63:0] rhs[]
@@ -42,6 +63,10 @@ class rdma_xtr_v1_qword_codec_test extends uvm_test;
     return 1'b1;
   endfunction
 
+  // 功能：执行接口 bytes_equal 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 bytes_equal）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function automatic bit bytes_equal(
     byte unsigned lhs[],
     byte unsigned rhs[]
@@ -55,6 +80,10 @@ class rdma_xtr_v1_qword_codec_test extends uvm_test;
     return 1'b1;
   endfunction
 
+  // 功能：读取或查询当前对象的权威状态，并以返回值或 output 参数交付快照（接口 snapshot_builder）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function automatic void snapshot_builder(
     rdma_xtr_v1_qword_builder builder,
     output bit [63:0] words[],
@@ -64,6 +93,10 @@ class rdma_xtr_v1_qword_codec_test extends uvm_test;
     builder.get_occupancy(occupancy);
   endfunction
 
+  // 功能：执行接口 expect_builder_unchanged 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 expect_builder_unchanged）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function automatic void expect_builder_unchanged(
     string label,
     rdma_xtr_v1_qword_builder builder,
@@ -80,6 +113,10 @@ class rdma_xtr_v1_qword_codec_test extends uvm_test;
       `uvm_error(label, "failure changed qword occupancy")
   endfunction
 
+  // 功能：检查输入值、身份字段和当前生命周期约束，给出一致性判断或状态结果（接口 check_supported_masks）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function automatic void check_supported_masks();
     rdma_image_kind_e image_kinds[8] = '{
       RDMA_IMAGE_CQC,
@@ -137,6 +174,10 @@ class rdma_xtr_v1_qword_codec_test extends uvm_test;
     end
   endfunction
 
+  // 功能：执行 UVM 阶段任务，驱动测试场景并在结束时释放阶段 objection（接口 run_phase）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   task run_phase(uvm_phase phase);
     rdma_xtr_v1_qword_builder builder;
     rdma_xtr_v1_qword_builder decoded;

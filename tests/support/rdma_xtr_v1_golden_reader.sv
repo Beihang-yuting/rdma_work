@@ -1,3 +1,8 @@
+// 目录：测试层 support/rdma_xtr_v1_golden_reader.sv。
+// 职责：验证 rdma_xtr_v1_golden_reader 对应模块的接口、错误路径和边界行为。
+// 依赖：依赖被测 package、UVM 测试基类和必要的 mock/fixture。
+// 所有权与生命周期：测试对象只拥有本地 fixture；外部后端句柄由测试环境提供并在测试结束释放。
+
 // 中文说明：rdma_xtr_v1_golden_reader.sv 属于测试辅助工具，提供 golden、解析和断言支持。
 // 阅读提示：先看公开类型和接口，再看实现细节；失败路径应保持状态与资源所有权可追踪。
 
@@ -11,6 +16,10 @@ endclass
 class rdma_xtr_v1_golden_reader;
   localparam int unsigned MAX_PAYLOAD_BYTES = 512;
 
+  // 功能：执行接口 strip_canonical_newline 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 strip_canonical_newline）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   static function bit strip_canonical_newline(
       string line,
       output string content,
@@ -31,11 +40,19 @@ class rdma_xtr_v1_golden_reader;
     return 1;
   endfunction
 
+  // 功能：检查输入值、身份字段和当前生命周期约束，给出一致性判断或状态结果（接口 is_lower_name_char）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   static function bit is_lower_name_char(int ch);
     return ((ch >= 8'h61 && ch <= 8'h7a) ||
             (ch >= 8'h30 && ch <= 8'h39) || ch == 8'h5f);
   endfunction
 
+  // 功能：检查输入值、身份字段和当前生命周期约束，给出一致性判断或状态结果（接口 valid_case_name）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   static function bit valid_case_name(string name);
     if (name.len() == 0)
       return 0;
@@ -46,6 +63,10 @@ class rdma_xtr_v1_golden_reader;
     return 1;
   endfunction
 
+  // 功能：解析硬件/协议镜像并恢复受校验约束的模型字段（接口 parse_case_line）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   static function bit parse_case_line(
       string line,
       output string name,
@@ -69,6 +90,10 @@ class rdma_xtr_v1_golden_reader;
     return 1;
   endfunction
 
+  // 功能：解析硬件/协议镜像并恢复受校验约束的模型字段（接口 parse_inputs_line）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   static function bit parse_inputs_line(
       string line,
       output string inputs,
@@ -127,6 +152,10 @@ class rdma_xtr_v1_golden_reader;
     return 1;
   endfunction
 
+  // 功能：解析硬件/协议镜像并恢复受校验约束的模型字段（接口 parse_byte_count_line）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   static function bit parse_byte_count_line(
       string line,
       output int unsigned byte_count,
@@ -163,6 +192,10 @@ class rdma_xtr_v1_golden_reader;
     return 1;
   endfunction
 
+  // 功能：执行接口 lower_hex_nibble 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 lower_hex_nibble）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   static function bit lower_hex_nibble(int ch, output int value);
     value = 0;
     if (ch >= 8'h30 && ch <= 8'h39) begin
@@ -176,6 +209,10 @@ class rdma_xtr_v1_golden_reader;
     return 0;
   endfunction
 
+  // 功能：解析硬件/协议镜像并恢复受校验约束的模型字段（接口 parse_payload_line）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   static function rdma_status_code_e parse_payload_line(
       string line,
       int unsigned expected_bytes,
@@ -227,6 +264,10 @@ class rdma_xtr_v1_golden_reader;
     return RDMA_SC_OK;
   endfunction
 
+  // 功能：读取或查询当前对象的权威状态，并以返回值或 output 参数交付快照（接口 read_all）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   static function bit read_all(
       string path,
       output rdma_xtr_v1_golden_case cases[$],

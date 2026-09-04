@@ -1,3 +1,8 @@
+// 目录：核心执行层 core/rdma_doorbell_scheduler.sv。
+// 职责：实现 rdma_doorbell_scheduler 在本层的职责和对外接口。
+// 依赖：依赖本层公共 types/model/adapter 契约及其上游快照。
+// 所有权与生命周期：对象只拥有显式创建的值快照；外部资源保存非拥有引用，生命周期由调用方管理。
+
 // 中文说明：rdma_doorbell_scheduler.sv 属于核心执行层，负责队列、控制面、资源和恢复流程。
 // 阅读提示：先看公开类型和接口，再看实现细节；失败路径应保持状态与资源所有权可追踪。
 
@@ -33,6 +38,10 @@ class rdma_doorbell_dependency extends uvm_object;
   rdma_hw_image image;
   bit ready;
 
+  // 功能：初始化对象字段、同步 UVM 名称并建立可用的初始生命周期状态（接口 new）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function new(string name = "rdma_doorbell_dependency");
     super.new(name);
     dependency_id = '0;
@@ -43,6 +52,10 @@ class rdma_doorbell_dependency extends uvm_object;
     ready = 1'b0;
   endfunction
 
+  // 功能：把源对象投影/克隆为当前类型的独立值快照，避免共享可变引用（接口 do_copy）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function void do_copy(uvm_object rhs);
     rdma_doorbell_dependency rhs_dependency;
     uvm_object cloned_object;
@@ -100,6 +113,10 @@ class rdma_doorbell_desc extends uvm_object;
   time timeout;
   rdma_doorbell_readback_policy_e readback_policy;
 
+  // 功能：初始化对象字段、同步 UVM 名称并建立可用的初始生命周期状态（接口 new）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function new(string name = "rdma_doorbell_desc");
     super.new(name);
     kind = RDMA_DOORBELL_CMQ_SQ;
@@ -119,6 +136,10 @@ class rdma_doorbell_desc extends uvm_object;
     readback_policy = RDMA_DB_READBACK_NONE;
   endfunction
 
+  // 功能：把源对象投影/克隆为当前类型的独立值快照，避免共享可变引用（接口 do_copy）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function void do_copy(uvm_object rhs);
     rdma_doorbell_desc rhs_desc;
     rdma_doorbell_dependency cloned_dependency;
@@ -220,6 +241,10 @@ class rdma_doorbell_result extends uvm_object;
   int unsigned width;
   int unsigned dependency_count;
 
+  // 功能：初始化对象字段、同步 UVM 名称并建立可用的初始生命周期状态（接口 new）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function new(string name = "rdma_doorbell_result");
     super.new(name);
     kind = RDMA_DOORBELL_CMQ_SQ;
@@ -230,6 +255,10 @@ class rdma_doorbell_result extends uvm_object;
     dependency_count = '0;
   endfunction
 
+  // 功能：把源对象投影/克隆为当前类型的独立值快照，避免共享可变引用（接口 do_copy）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function void do_copy(uvm_object rhs);
     rdma_doorbell_result rhs_result;
     uvm_object cloned_object;
@@ -270,6 +299,10 @@ class rdma_doorbell_scheduler extends uvm_object;
   protected bit configured;
   protected semaphore function_locks[string];
 
+  // 功能：初始化对象字段、同步 UVM 名称并建立可用的初始生命周期状态（接口 new）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function new(string name = "rdma_doorbell_scheduler");
     super.new(name);
     host_mem = null;
@@ -278,6 +311,10 @@ class rdma_doorbell_scheduler extends uvm_object;
     function_locks.delete();
   endfunction
 
+  // 功能：写入并校验运行所需的配置、身份或资源参数，建立后续操作的边界（接口 configure）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function rdma_status configure(
     rdma_host_mem_api host_mem_arg,
     rdma_pcie_api pcie_arg
@@ -297,6 +334,10 @@ class rdma_doorbell_scheduler extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：执行接口 function_key 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 function_key）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected function string function_key(
     longint unsigned function_uid,
     int unsigned object_id
@@ -304,6 +345,10 @@ class rdma_doorbell_scheduler extends uvm_object;
     return $sformatf("%016h:%08h", function_uid, object_id);
   endfunction
 
+  // 功能：执行接口 lock_for 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 lock_for）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected function semaphore lock_for(
     longint unsigned function_uid,
     int unsigned object_id
@@ -316,6 +361,10 @@ class rdma_doorbell_scheduler extends uvm_object;
     return function_locks[key];
   endfunction
 
+  // 功能：执行接口 timeout_status 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 timeout_status）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected function rdma_status timeout_status(string operation);
     return rdma_status::make(
       RDMA_SC_TIMEOUT,
@@ -323,6 +372,10 @@ class rdma_doorbell_scheduler extends uvm_object;
     );
   endfunction
 
+  // 功能：执行接口 deadline_remaining 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 deadline_remaining）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected function bit deadline_remaining(
     time deadline,
     output time remaining
@@ -335,6 +388,10 @@ class rdma_doorbell_scheduler extends uvm_object;
     return 1'b1;
   endfunction
 
+  // 功能：把源对象投影/克隆为当前类型的独立值快照，避免共享可变引用（接口 clone_binding_snapshot）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected function rdma_status clone_binding_snapshot(
     rdma_function_binding source,
     output rdma_function_binding snapshot
@@ -356,6 +413,10 @@ class rdma_doorbell_scheduler extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：把源对象投影/克隆为当前类型的独立值快照，避免共享可变引用（接口 clone_desc_snapshot）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected function rdma_status clone_desc_snapshot(
     rdma_doorbell_desc source,
     output rdma_doorbell_desc snapshot
@@ -377,6 +438,10 @@ class rdma_doorbell_scheduler extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：原子地预留或获取所需资源/游标，并记录后续提交所需的所有权证据（接口 acquire_function_lock_before_deadline）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected task acquire_function_lock_before_deadline(
     semaphore function_lock,
     time deadline,
@@ -424,6 +489,10 @@ class rdma_doorbell_scheduler extends uvm_object;
     status = rdma_status::success();
   endtask
 
+  // 功能：执行接口 dma_barrier_before_deadline 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 dma_barrier_before_deadline）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected task dma_barrier_before_deadline(
     rdma_function_handle function_h,
     time deadline,
@@ -465,6 +534,10 @@ class rdma_doorbell_scheduler extends uvm_object;
     status = worker_status;
   endtask
 
+  // 功能：执行接口 mmio_barrier_before_deadline 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 mmio_barrier_before_deadline）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected task mmio_barrier_before_deadline(
     rdma_function_handle function_h,
     time deadline,
@@ -506,6 +579,10 @@ class rdma_doorbell_scheduler extends uvm_object;
     status = worker_status;
   endtask
 
+  // 功能：执行接口 mmio_write_before_deadline 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 mmio_write_before_deadline）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected task mmio_write_before_deadline(
     rdma_function_handle function_h,
     rdma_bar_addr_t address,
@@ -549,6 +626,10 @@ class rdma_doorbell_scheduler extends uvm_object;
     status = worker_status;
   endtask
 
+  // 功能：执行接口 target_kind_status 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 target_kind_status）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected function rdma_status target_kind_status(
     rdma_doorbell_kind_e kind,
     rdma_handle target_h
@@ -561,6 +642,10 @@ class rdma_doorbell_scheduler extends uvm_object;
     return model.validate();
   endfunction
 
+  // 功能：执行接口 image_shape_status 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 image_shape_status）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected function rdma_status image_shape_status(
     rdma_hw_image image,
     int unsigned function_generation
@@ -587,6 +672,10 @@ class rdma_doorbell_scheduler extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：执行接口 payload_status 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 payload_status）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected function rdma_status payload_status(
     rdma_function_binding binding,
     rdma_doorbell_desc desc,
@@ -645,6 +734,10 @@ class rdma_doorbell_scheduler extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：执行接口 dependency_status 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 dependency_status）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected function rdma_status dependency_status(
     rdma_function_binding binding,
     rdma_doorbell_desc desc,
@@ -706,6 +799,10 @@ class rdma_doorbell_scheduler extends uvm_object;
     return status;
   endfunction
 
+  // 功能：执行接口 preflight 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 preflight）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected function rdma_status preflight(
     rdma_function_binding binding,
     rdma_doorbell_desc desc,
@@ -790,6 +887,10 @@ class rdma_doorbell_scheduler extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：执行接口 copy_image_bytes 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 copy_image_bytes）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected function void copy_image_bytes(
     rdma_hw_image image,
     output byte data[]
@@ -799,6 +900,10 @@ class rdma_doorbell_scheduler extends uvm_object;
       data[i] = image.bytes[i];
   endfunction
 
+  // 功能：向目标后端提交数据/事务并更新本对象的进度或账本状态（接口 write_dependency_stage）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected task write_dependency_stage(
     rdma_doorbell_desc desc,
     rdma_doorbell_dependency_stage_e stage,
@@ -824,6 +929,10 @@ class rdma_doorbell_scheduler extends uvm_object;
     end
   endtask
 
+  // 功能：向目标后端提交数据/事务并更新本对象的进度或账本状态（接口 submit_locked）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected task submit_locked(
     rdma_function_binding binding,
     rdma_doorbell_desc desc,
@@ -881,6 +990,10 @@ class rdma_doorbell_scheduler extends uvm_object;
     status = rdma_status::success();
   endtask
 
+  // 功能：向目标后端提交数据/事务并更新本对象的进度或账本状态（接口 submit）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   task submit(
     rdma_function_binding binding,
     rdma_doorbell_desc desc,

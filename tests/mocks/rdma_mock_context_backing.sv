@@ -1,9 +1,18 @@
+// 目录：测试层 mocks/rdma_mock_context_backing.sv。
+// 职责：验证 rdma_mock_context_backing 对应模块的接口、错误路径和边界行为。
+// 依赖：依赖被测 package、UVM 测试基类和必要的 mock/fixture。
+// 所有权与生命周期：测试对象只拥有本地 fixture；外部后端句柄由测试环境提供并在测试结束释放。
+
 // 中文说明：rdma_mock_context_backing.sv 属于测试替身，为单元测试提供可控的适配器和控制面行为。
 // 阅读提示：先看公开类型和接口，再看实现细节；失败路径应保持状态与资源所有权可追踪。
 
 class rdma_mock_context_slot_token extends rdma_queue_slot_token_contract;
   `uvm_object_utils(rdma_mock_context_slot_token)
 
+  // 功能：初始化对象字段、同步 UVM 名称并建立可用的初始生命周期状态（接口 new）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function new(string name = "rdma_mock_context_slot_token");
     super.new(name);
   endfunction
@@ -24,6 +33,10 @@ class rdma_mock_context_slot extends uvm_object;
   bit released;
   int unsigned release_count;
 
+  // 功能：初始化对象字段、同步 UVM 名称并建立可用的初始生命周期状态（接口 new）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function new(string name = "rdma_mock_context_slot");
     super.new(name);
     owner = null;
@@ -50,6 +63,10 @@ class rdma_mock_context_backing extends rdma_context_backing_api;
   rdma_status role_failures[string];
   int unsigned method_ordinals[string];
 
+  // 功能：初始化对象字段、同步 UVM 名称并建立可用的初始生命周期状态（接口 new）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function new(string name = "rdma_mock_context_backing");
     super.new(name);
     slots.delete();
@@ -58,6 +75,10 @@ class rdma_mock_context_backing extends rdma_context_backing_api;
     failure_queue.delete();
   endfunction
 
+  // 功能：执行接口 fail_next 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 fail_next）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function rdma_status fail_next(string method_name, rdma_status status);
     if (!(method_name inside {"acquire", "write", "release",
                               "query_release_completion"}))
@@ -70,6 +91,10 @@ class rdma_mock_context_backing extends rdma_context_backing_api;
     return rdma_status::success();
   endfunction
 
+  // 功能：执行接口 fail_role_call 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 fail_role_call）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function void fail_role_call(string method_name,
                                rdma_queue_backing_role_e role,
                                int unsigned ordinal,
@@ -79,11 +104,19 @@ class rdma_mock_context_backing extends rdma_context_backing_api;
         rdma_mock_clone_status(status);
   endfunction
 
+  // 功能：推进对象的运行/复位/恢复状态机，并清晰隔离旧 incarnation 的操作（接口 reset）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function void reset();
     slots.delete(); call_trace.delete(); failure_queue.delete();
     role_failures.delete(); method_ordinals.delete(); release_call_count = 0;
   endfunction
 
+  // 功能：提交已验证的状态迁移或消费结果，推进游标/账本并保持幂等边界（接口 consume_failure）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function automatic rdma_status consume_failure(string method_name);
     rdma_status status;
     if (!failure_queue.exists(method_name) ||
@@ -93,6 +126,10 @@ class rdma_mock_context_backing extends rdma_context_backing_api;
     return status;
   endfunction
 
+  // 功能：提交已验证的状态迁移或消费结果，推进游标/账本并保持幂等边界（接口 consume_role_failure）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function automatic rdma_status consume_role_failure(
     string method_name,
     rdma_queue_backing_role_e role
@@ -111,6 +148,10 @@ class rdma_mock_context_backing extends rdma_context_backing_api;
     return null;
   endfunction
 
+  // 功能：执行接口 context_role 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 context_role）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function automatic rdma_queue_backing_role_e context_role(
     rdma_resource_kind_e resource_kind
   );
@@ -123,6 +164,10 @@ class rdma_mock_context_backing extends rdma_context_backing_api;
     endcase
   endfunction
 
+  // 功能：读取或查询当前对象的权威状态，并以返回值或 output 参数交付快照（接口 find_slot）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function automatic rdma_mock_context_slot find_slot(
     rdma_context_backing_ref context_ref
   );
@@ -169,6 +214,10 @@ class rdma_mock_context_backing extends rdma_context_backing_api;
     return null;
   endfunction
 
+  // 功能：原子地预留或获取所需资源/游标，并记录后续提交所需的所有权证据（接口 acquire）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function rdma_status acquire(
     rdma_function_binding binding,
     rdma_resource_kind_e resource_kind,
@@ -265,6 +314,10 @@ class rdma_mock_context_backing extends rdma_context_backing_api;
     return rdma_status::success();
   endfunction
 
+  // 功能：向目标后端提交数据/事务并更新本对象的进度或账本状态（接口 write）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function rdma_status write(
     rdma_context_backing_ref context_ref,
     longint unsigned offset,
@@ -302,6 +355,10 @@ class rdma_mock_context_backing extends rdma_context_backing_api;
     return rdma_status::success();
   endfunction
 
+  // 功能：释放、撤销或回滚当前对象持有的事务/资源，并保持账本与生命周期一致（接口 \release）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function rdma_status \release (
     rdma_context_backing_ref context_ref
   );
@@ -331,6 +388,10 @@ class rdma_mock_context_backing extends rdma_context_backing_api;
     return rdma_status::success();
   endfunction
 
+  // 功能：读取或查询当前对象的权威状态，并以返回值或 output 参数交付快照（接口 query_release_completion）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function rdma_status query_release_completion(
     rdma_context_backing_ref context_ref,
     output bit complete
@@ -355,6 +416,10 @@ class rdma_mock_context_backing extends rdma_context_backing_api;
     return rdma_status::success();
   endfunction
 
+  // 功能：读取或查询当前对象的权威状态，并以返回值或 output 参数交付快照（接口 read_slot_byte）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function rdma_status read_slot_byte(
     rdma_context_backing_ref context_ref,
     longint unsigned offset,

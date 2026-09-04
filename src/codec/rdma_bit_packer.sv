@@ -1,3 +1,8 @@
+// 目录：硬件编解码层 codec/rdma_bit_packer.sv。
+// 职责：实现 rdma_bit_packer 在本层的职责和对外接口。
+// 依赖：依赖本层公共 types/model/adapter 契约及其上游快照。
+// 所有权与生命周期：对象只拥有显式创建的值快照；外部资源保存非拥有引用，生命周期由调用方管理。
+
 // 中文说明：rdma_bit_packer.sv 属于编码层，将模型字段转换为硬件图像并执行反向校验。
 // 阅读提示：先看公开类型和接口，再看实现细节；失败路径应保持状态与资源所有权可追踪。
 
@@ -8,6 +13,10 @@ class rdma_bit_packer extends uvm_object;
   protected int unsigned expected_byte_count;
   protected bit initialized;
 
+  // 功能：初始化对象字段、同步 UVM 名称并建立可用的初始生命周期状态（接口 new）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function new(string name = "rdma_bit_packer");
     super.new(name);
     occupancy = new[0];
@@ -15,6 +24,10 @@ class rdma_bit_packer extends uvm_object;
     initialized = 1'b0;
   endfunction
 
+  // 功能：写入并校验运行所需的配置、身份或资源参数，建立后续操作的边界（接口 initialize）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function rdma_status initialize(int unsigned image_byte_count);
     if (image_byte_count > (32'h7fff_ffff / 8))
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
@@ -27,10 +40,18 @@ class rdma_bit_packer extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：推进对象的运行/复位/恢复状态机，并清晰隔离旧 incarnation 的操作（接口 reset）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function rdma_status reset(int unsigned image_byte_count);
     return initialize(image_byte_count);
   endfunction
 
+  // 功能：检查输入值、身份字段和当前生命周期约束，给出一致性判断或状态结果（接口 validate_access）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected function rdma_status validate_access(
     byte unsigned bytes[],
     longint unsigned bit_offset,
@@ -67,6 +88,10 @@ class rdma_bit_packer extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：执行接口 put_u64 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 put_u64）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function rdma_status put_u64(
     ref byte unsigned bytes[],
     input longint unsigned bit_offset,
@@ -104,6 +129,10 @@ class rdma_bit_packer extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：读取或查询当前对象的权威状态，并以返回值或 output 参数交付快照（接口 get_u64）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function rdma_status get_u64(
     byte unsigned bytes[],
     longint unsigned bit_offset,

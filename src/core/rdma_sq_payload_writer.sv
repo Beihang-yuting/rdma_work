@@ -1,3 +1,8 @@
+// 目录：核心执行层 core/rdma_sq_payload_writer.sv。
+// 职责：实现 rdma_sq_payload_writer 在本层的职责和对外接口。
+// 依赖：依赖本层公共 types/model/adapter 契约及其上游快照。
+// 所有权与生命周期：对象只拥有显式创建的值快照；外部资源保存非拥有引用，生命周期由调用方管理。
+
 // 中文说明：本文件实现 staged non-inline payload 的注册、写入和逐字节回读校验。
 // 生命周期约束：writer 只借用 caller-owned mapping，不取得 host_mem.release() 权限。
 
@@ -18,6 +23,10 @@ class rdma_sq_payload_write_receipt extends uvm_object;
   // uvm_object::copy().
   local uvm_object release_owner;
 
+  // 功能：初始化对象字段、同步 UVM 名称并建立可用的初始生命周期状态（接口 new）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function new(string name = "rdma_sq_payload_write_receipt");
     super.new(name);
     verified = 1'b0;
@@ -29,15 +38,27 @@ class rdma_sq_payload_write_receipt extends uvm_object;
 
   // The writer is the only production caller of these helpers.  The
   // one-shot bind prevents a receipt copy from acquiring the capability.
+  // 功能：执行接口 bind_release_owner 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 bind_release_owner）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function void bind_release_owner(uvm_object owner);
     if (release_owner == null && owner != null)
       release_owner = owner;
   endfunction
 
+  // 功能：释放、撤销或回滚当前对象持有的事务/资源，并保持账本与生命周期一致（接口 release_authority_matches）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function bit release_authority_matches(uvm_object owner);
     return release_owner != null && owner != null && release_owner == owner;
   endfunction
 
+  // 功能：把源对象投影/克隆为当前类型的独立值快照，避免共享可变引用（接口 do_copy）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function void do_copy(uvm_object rhs);
     rdma_sq_payload_write_receipt source;
     uvm_object cloned;
@@ -91,25 +112,45 @@ endclass
 virtual class rdma_sq_payload_writer extends uvm_object;
   // 抽象接口把“注册映射”和“写入验证”与队列数据引擎解耦。
 
+  // 功能：初始化对象字段、同步 UVM 名称并建立可用的初始生命周期状态（接口 new）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function new(string name = "rdma_sq_payload_writer");
     super.new(name);
   endfunction
 
+  // 功能：写入并校验运行所需的配置、身份或资源参数，建立后续操作的边界（接口 configure）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   pure virtual function rdma_status configure(
     rdma_host_mem_api api,
     rdma_function_binding binding,
     time timeout
   );
 
+  // 功能：执行接口 register_mapping 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 register_mapping）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   pure virtual function rdma_status register_mapping(
     rdma_dma_mapping mapping,
     output longint unsigned registration_id
   );
 
+  // 功能：执行接口 unregister_mapping 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 unregister_mapping）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   pure virtual function rdma_status unregister_mapping(
     longint unsigned registration_id
   );
 
+  // 功能：执行接口 stage_and_verify 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 stage_and_verify）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   pure virtual function rdma_status stage_and_verify(
     rdma_dma_request_context request_context,
     rdma_sge sges[$],
@@ -117,6 +158,10 @@ virtual class rdma_sq_payload_writer extends uvm_object;
     output rdma_sq_payload_write_receipt receipt
   );
 
+  // 功能：释放、撤销或回滚当前对象持有的事务/资源，并保持账本与生命周期一致（接口 release_receipt）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   pure virtual function rdma_status release_receipt(
     rdma_sq_payload_write_receipt receipt
   );
@@ -140,6 +185,10 @@ class rdma_host_mem_sq_payload_writer extends rdma_sq_payload_writer;
 
   // registration_t 的 refs 记录仍被 receipt 引用的注册项数量。
 
+  // 功能：初始化对象字段、同步 UVM 名称并建立可用的初始生命周期状态（接口 new）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function new(string name = "rdma_host_mem_sq_payload_writer");
     super.new(name);
     next_id = 1;
@@ -148,6 +197,10 @@ class rdma_host_mem_sq_payload_writer extends rdma_sq_payload_writer;
     timeout = 0;
   endfunction
 
+  // 功能：写入并校验运行所需的配置、身份或资源参数，建立后续操作的边界（接口 configure）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function rdma_status configure(
     rdma_host_mem_api api,
     rdma_function_binding binding,
@@ -163,6 +216,10 @@ class rdma_host_mem_sq_payload_writer extends rdma_sq_payload_writer;
   endfunction
 
   // 注册只保存 detached authority；重叠区间和溢出必须在登记阶段拒绝。
+  // 功能：执行接口 register_mapping 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 register_mapping）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function rdma_status register_mapping(
     rdma_dma_mapping mapping,
     output longint unsigned registration_id
@@ -205,6 +262,10 @@ class rdma_host_mem_sq_payload_writer extends rdma_sq_payload_writer;
     return rdma_status::success();
   endfunction
 
+  // 功能：执行接口 unregister_mapping 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 unregister_mapping）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function rdma_status unregister_mapping(longint unsigned registration_id);
     foreach (regs[i]) begin
       if (regs[i].id != registration_id)
@@ -219,6 +280,10 @@ class rdma_host_mem_sq_payload_writer extends rdma_sq_payload_writer;
                              "unknown registration id");
   endfunction
 
+  // 功能：执行接口 contains_id 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 contains_id）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function automatic bit contains_id(
     longint unsigned ids[$],
     longint unsigned id
@@ -229,6 +294,10 @@ class rdma_host_mem_sq_payload_writer extends rdma_sq_payload_writer;
     return 1'b0;
   endfunction
 
+  // 功能：执行接口 identity_status 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 identity_status）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function automatic rdma_status identity_status(
     rdma_dma_request_context request_context
   );
@@ -261,6 +330,10 @@ class rdma_host_mem_sq_payload_writer extends rdma_sq_payload_writer;
   endfunction
 
   // 先完成 context、长度、注册项、权限和地址范围检查，再产生任何 host 写入。
+  // 功能：执行接口 stage_and_verify 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 stage_and_verify）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function rdma_status stage_and_verify(
     rdma_dma_request_context request_context,
     rdma_sge sges[$],
@@ -440,6 +513,10 @@ class rdma_host_mem_sq_payload_writer extends rdma_sq_payload_writer;
     return rdma_status::success();
   endfunction
 
+  // 功能：释放、撤销或回滚当前对象持有的事务/资源，并保持账本与生命周期一致（接口 release_ids）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function void release_ids(longint unsigned ids[$]);
     foreach (ids[i]) begin
       foreach (regs[j]) begin
@@ -452,6 +529,10 @@ class rdma_host_mem_sq_payload_writer extends rdma_sq_payload_writer;
   endfunction
 
   // abort 或 SQ record retire 时调用；released 标志保证引用只递减一次。
+  // 功能：释放、撤销或回滚当前对象持有的事务/资源，并保持账本与生命周期一致（接口 release_receipt）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function rdma_status release_receipt(rdma_sq_payload_write_receipt receipt);
     if (receipt == null || receipt.released)
       return rdma_status::success();

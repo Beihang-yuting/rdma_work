@@ -1,3 +1,8 @@
+// 目录：测试层 rdma_unit_test_pkg.sv。
+// 职责：验证 rdma_unit_test_pkg 对应模块的接口、错误路径和边界行为。
+// 依赖：依赖被测 package、UVM 测试基类和必要的 mock/fixture。
+// 所有权与生命周期：测试对象只拥有本地 fixture；外部后端句柄由测试环境提供并在测试结束释放。
+
 // 中文说明：rdma_unit_test_pkg.sv 属于仿真入口或测试包，负责注册并组织验证组件。
 // 阅读提示：先看公开类型和接口，再看实现细节；失败路径应保持状态与资源所有权可追踪。
 
@@ -84,6 +89,8 @@ package rdma_unit_test_pkg;
   `include "unit/rdma_host_mem_router_test.sv"
   `include "unit/rdma_pcie_router_test.sv"
   `include "unit/rdma_reset_coordinator_test.sv"
+  `include "integration/rdma_function_context_test.sv"
+  `include "integration/rdma_device_env_test.sv"
 `endif
 endpackage
 

@@ -1,3 +1,8 @@
+// 目录：适配器接口层 adapter/rdma_xtr_v1_queue_host_mem_submitter.sv。
+// 职责：实现 rdma_xtr_v1_queue_host_mem_submitter 在本层的职责和对外接口。
+// 依赖：依赖本层公共 types/model/adapter 契约及其上游快照。
+// 所有权与生命周期：对象只拥有显式创建的值快照；外部资源保存非拥有引用，生命周期由调用方管理。
+
 // 中文说明：rdma_xtr_v1_queue_host_mem_submitter.sv 属于适配器接口层，定义主机内存、PCIe、网络及上下文后端接口。
 // 阅读提示：先看公开类型和接口，再看实现细节；失败路径应保持状态与资源所有权可追踪。
 
@@ -5,6 +10,10 @@
 // own slot selection and doorbells; this adapter deliberately accepts only an
 // opaque allocation capability and a mapping-relative byte offset.
 
+// 功能：执行接口 rdma_xtr_v1_host_mem_release 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 rdma_xtr_v1_host_mem_release）。
+// 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+//   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+// 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
 function automatic rdma_status rdma_xtr_v1_host_mem_release(
     rdma_host_mem_api api,
     rdma_dma_mapping mapping
@@ -23,6 +32,10 @@ class rdma_xtr_v1_queue_host_mem_target extends uvm_object;
   local string capability;
   local static longint unsigned next_capability;
 
+  // 功能：初始化对象字段、同步 UVM 名称并建立可用的初始生命周期状态（接口 new）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function new(string name = "rdma_xtr_v1_queue_host_mem_target");
     super.new(name);
     if (next_capability == 0)
@@ -33,6 +46,10 @@ class rdma_xtr_v1_queue_host_mem_target extends uvm_object;
 
   // Exposes no mapping or address; callers can only present this opaque token
   // back to a submitter instance.
+  // 功能：执行接口 capability_key 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 capability_key）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function string capability_key();
     return capability;
   endfunction
@@ -48,6 +65,10 @@ class rdma_xtr_v1_queue_host_mem_ledger_entry extends uvm_object;
   rdma_dma_permission_t permissions;
   bit released;
 
+  // 功能：初始化对象字段、同步 UVM 名称并建立可用的初始生命周期状态（接口 new）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function new(string name = "rdma_xtr_v1_queue_host_mem_ledger_entry");
     super.new(name);
     mapping = null;
@@ -69,6 +90,10 @@ class rdma_xtr_v1_queue_host_mem_submitter extends uvm_object;
   // target contains no public reference to this ledger or to backing memory.
   protected rdma_xtr_v1_queue_host_mem_ledger_entry ledger[string];
 
+  // 功能：初始化对象字段、同步 UVM 名称并建立可用的初始生命周期状态（接口 new）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function new(string name = "rdma_xtr_v1_queue_host_mem_submitter");
     super.new(name);
     host_mem = null;
@@ -76,18 +101,34 @@ class rdma_xtr_v1_queue_host_mem_submitter extends uvm_object;
     ledger.delete();
   endfunction
 
+  // 功能：执行接口 invalid 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 invalid）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected function rdma_status invalid(string message);
     return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, message);
   endfunction
 
+  // 功能：执行接口 state_error 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 state_error）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected function rdma_status state_error(string message);
     return rdma_status::make(RDMA_SC_INVALID_STATE, message);
   endfunction
 
+  // 功能：执行接口 codec_error 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 codec_error）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected function rdma_status codec_error(string message);
     return rdma_status::make(RDMA_SC_CODEC_ERROR, message);
   endfunction
 
+  // 功能：读取或查询当前对象的权威状态，并以返回值或 output 参数交付快照（接口 status_or）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected function rdma_status status_or(
     rdma_status status,
     rdma_status_code_e fallback_code,
@@ -98,6 +139,10 @@ class rdma_xtr_v1_queue_host_mem_submitter extends uvm_object;
     return rdma_status::make(fallback_code, fallback_message);
   endfunction
 
+  // 功能：把源对象投影/克隆为当前类型的独立值快照，避免共享可变引用（接口 clone_context）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected function rdma_status clone_context(
     rdma_dma_request_context source,
     output rdma_dma_request_context result
@@ -113,6 +158,10 @@ class rdma_xtr_v1_queue_host_mem_submitter extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：执行接口 mapping_identity_status 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 mapping_identity_status）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected function rdma_status mapping_identity_status(
     rdma_dma_mapping mapping,
     rdma_dma_request_context request_ctx,
@@ -177,6 +226,10 @@ class rdma_xtr_v1_queue_host_mem_submitter extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：读取或查询当前对象的权威状态，并以返回值或 output 参数交付快照（接口 lookup_target）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected function rdma_status lookup_target(
     rdma_xtr_v1_queue_host_mem_target target,
     output rdma_xtr_v1_queue_host_mem_ledger_entry entry
@@ -195,6 +248,10 @@ class rdma_xtr_v1_queue_host_mem_submitter extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：检查输入值、身份字段和当前生命周期约束，给出一致性判断或状态结果（接口 validate_range）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected function rdma_status validate_range(
     rdma_xtr_v1_queue_host_mem_ledger_entry entry,
     longint unsigned offset,
@@ -234,6 +291,10 @@ class rdma_xtr_v1_queue_host_mem_submitter extends uvm_object;
                      "DMA mapping access check returned null");
   endfunction
 
+  // 功能：读取或查询当前对象的权威状态，并以返回值或 output 参数交付快照（接口 lookup_queue_codec）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected function rdma_status lookup_queue_codec(
     rdma_image_kind_e image_kind,
     string object_type,
@@ -256,6 +317,10 @@ class rdma_xtr_v1_queue_host_mem_submitter extends uvm_object;
                      "queue codec lookup returned null");
   endfunction
 
+  // 功能：执行接口 image_to_array 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 image_to_array）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected function rdma_status image_to_array(
     rdma_hw_image image,
     output byte write_data[]
@@ -270,6 +335,10 @@ class rdma_xtr_v1_queue_host_mem_submitter extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：提交已验证的状态迁移或消费结果，推进游标/账本并保持幂等边界（接口 complete_read_image）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected function rdma_status complete_read_image(
     rdma_xtr_v1_queue_host_mem_ledger_entry entry,
     longint unsigned offset,
@@ -329,6 +398,10 @@ class rdma_xtr_v1_queue_host_mem_submitter extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：原子地预留或获取所需资源/游标，并记录后续提交所需的所有权证据（接口 allocate_target）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function rdma_status allocate_target(
     rdma_dma_request_context request_context,
     int unsigned size,
@@ -423,6 +496,10 @@ class rdma_xtr_v1_queue_host_mem_submitter extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：向目标后端提交数据/事务并更新本对象的进度或账本状态（接口 write_queue_entry）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected function rdma_status write_queue_entry(
     rdma_xtr_v1_queue_host_mem_target target,
     longint unsigned offset,
@@ -519,6 +596,10 @@ class rdma_xtr_v1_queue_host_mem_submitter extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：向目标后端提交数据/事务并更新本对象的进度或账本状态（接口 write_sqe）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function rdma_status write_sqe(
     rdma_xtr_v1_queue_host_mem_target target,
     longint unsigned offset,
@@ -538,6 +619,10 @@ class rdma_xtr_v1_queue_host_mem_submitter extends uvm_object;
                              XTR_V1_WQE_BYTES, image);
   endfunction
 
+  // 功能：向目标后端提交数据/事务并更新本对象的进度或账本状态（接口 write_rqe）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function rdma_status write_rqe(
     rdma_xtr_v1_queue_host_mem_target target,
     longint unsigned offset,
@@ -550,6 +635,10 @@ class rdma_xtr_v1_queue_host_mem_submitter extends uvm_object;
                              XTR_V1_RQE_BYTES, image);
   endfunction
 
+  // 功能：读取或查询当前对象的权威状态，并以返回值或 output 参数交付快照（接口 read_cqe）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function rdma_status read_cqe(
     rdma_xtr_v1_queue_host_mem_target target,
     longint unsigned offset,
@@ -580,6 +669,10 @@ class rdma_xtr_v1_queue_host_mem_submitter extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：读取或查询当前对象的权威状态，并以返回值或 output 参数交付快照（接口 read_ceqe）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function rdma_status read_ceqe(
     rdma_xtr_v1_queue_host_mem_target target,
     longint unsigned offset,
@@ -610,6 +703,10 @@ class rdma_xtr_v1_queue_host_mem_submitter extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：读取或查询当前对象的权威状态，并以返回值或 output 参数交付快照（接口 read_aeqe）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function rdma_status read_aeqe(
     rdma_xtr_v1_queue_host_mem_target target,
     longint unsigned offset,
@@ -640,6 +737,10 @@ class rdma_xtr_v1_queue_host_mem_submitter extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：释放、撤销或回滚当前对象持有的事务/资源，并保持账本与生命周期一致（接口 release_target）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function rdma_status release_target(
     rdma_xtr_v1_queue_host_mem_target target
   );

@@ -1,3 +1,8 @@
+// 目录：公共类型层 types/rdma_status.sv。
+// 职责：实现 rdma_status 在本层的职责和对外接口。
+// 依赖：依赖本层公共 types/model/adapter 契约及其上游快照。
+// 所有权与生命周期：对象只拥有显式创建的值快照；外部资源保存非拥有引用，生命周期由调用方管理。
+
 // 中文说明：rdma_status.sv 属于基础类型层，集中定义 RDMA 枚举、地址、身份和状态契约。
 // 阅读提示：先看公开类型和接口，再看实现细节；失败路径应保持状态与资源所有权可追踪。
 
@@ -18,6 +23,10 @@ class rdma_status extends uvm_object;
   bit retryable;
   string message;
 
+  // 功能：初始化对象字段、同步 UVM 名称并建立可用的初始生命周期状态（接口 new）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function new(string name = "rdma_status");
     super.new(name);
     category = RDMA_STATUS_STATE;
@@ -37,6 +46,10 @@ class rdma_status extends uvm_object;
 
   // 中文：状态进入事务 evidence 后必须是 detached snapshot，保留错误码、
   // 硬件上下文与诊断文本，避免 clone 后只剩默认 OK 状态。
+  // 功能：把源对象投影/克隆为当前类型的独立值快照，避免共享可变引用（接口 do_copy）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function void do_copy(uvm_object rhs);
     rdma_status source;
     super.do_copy(rhs);
@@ -57,6 +70,10 @@ class rdma_status extends uvm_object;
     message = source.message;
   endfunction
 
+  // 功能：依据输入快照构造请求、资源或适配对象，并返回独立的结果载体（接口 make）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   static function automatic rdma_status make(
     rdma_status_code_e code,
     string message = ""
@@ -81,14 +98,26 @@ class rdma_status extends uvm_object;
     return status;
   endfunction
 
+  // 功能：执行接口 success 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 success）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   static function automatic rdma_status success(string message = "");
     return make(RDMA_SC_OK, message);
   endfunction
 
+  // 功能：执行接口 ok 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 ok）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function bit ok();
     return code == RDMA_SC_OK;
   endfunction
 
+  // 功能：执行接口 category_for 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 category_for）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   static function automatic rdma_status_category_e category_for(
     rdma_status_code_e code
   );
@@ -126,6 +155,10 @@ class rdma_status extends uvm_object;
     endcase
   endfunction
 
+  // 功能：执行接口 convert2string 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 convert2string）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function string convert2string();
     string category_text;
     string code_text;

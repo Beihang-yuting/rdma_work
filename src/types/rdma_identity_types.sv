@@ -1,3 +1,8 @@
+// 目录：公共类型层 types/rdma_identity_types.sv。
+// 职责：实现 rdma_identity_types 在本层的职责和对外接口。
+// 依赖：依赖本层公共 types/model/adapter 契约及其上游快照。
+// 所有权与生命周期：对象只拥有显式创建的值快照；外部资源保存非拥有引用，生命周期由调用方管理。
+
 // 中文说明：rdma_identity_types.sv 属于基础类型层，集中定义 RDMA 枚举、地址、身份和状态契约。
 // 阅读提示：先看公开类型和接口，再看实现细节；失败路径应保持状态与资源所有权可追踪。
 
@@ -8,6 +13,10 @@ typedef struct packed {
   bit [2:0] function_num;
 } rdma_bdf_t;
 
+// 功能：执行接口 rdma_bdf_requester_id 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 rdma_bdf_requester_id）。
+// 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+//   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+// 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
 function automatic bit [15:0] rdma_bdf_requester_id(rdma_bdf_t bdf);
   return {bdf.bus, bdf.device, bdf.function_num};
 endfunction
@@ -32,6 +41,10 @@ typedef struct packed {
   rdma_bdf_t bdf;
 } rdma_route_key_t;
 
+// 功能：执行接口 rdma_route_key_from_function 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 rdma_route_key_from_function）。
+// 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+//   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+// 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
 function automatic rdma_route_key_t rdma_route_key_from_function(
   rdma_function_key_t key
 );
@@ -45,11 +58,19 @@ endfunction
 
 // 中文说明：这些纯值校验函数由 identity、binding 和各 router 共用。
 // BDF 的 segment=0 是合法 PCIe segment；只有完整 BDF 全零才表示缺失。
+// 功能：执行接口 rdma_bdf_is_zero 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 rdma_bdf_is_zero）。
+// 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+//   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+// 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
 function automatic bit rdma_bdf_is_zero(rdma_bdf_t bdf);
   return bdf.segment == 16'h0 && bdf.bus == 8'h0 &&
          bdf.device == 5'h0 && bdf.function_num == 3'h0;
 endfunction
 
+// 功能：执行接口 rdma_bdf_same 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 rdma_bdf_same）。
+// 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+//   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+// 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
 function automatic bit rdma_bdf_same(rdma_bdf_t lhs, rdma_bdf_t rhs);
   return lhs.segment == rhs.segment && lhs.bus == rhs.bus &&
          lhs.device == rhs.device && lhs.function_num == rhs.function_num;
@@ -57,6 +78,10 @@ endfunction
 
 // 中文说明：Host topology key=0 是合法的显式 Host0；BDF 必须非零，且
 // route 中的 segment 必须与 BDF segment 一致；root_id=0 允许作为显式 root0。
+// 功能：执行接口 rdma_route_key_valid 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 rdma_route_key_valid）。
+// 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+//   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+// 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
 function automatic bit rdma_route_key_valid(rdma_route_key_t route);
   if (rdma_bdf_is_zero(route.bdf))
     return 1'b0;
@@ -67,6 +92,10 @@ endfunction
 
 // 中文说明：Function key 的 parent PF 约束在这里集中执行，避免 VF 走错
 // Host/root/segment 或把 parent 当成自身 BDF。
+// 功能：执行接口 rdma_function_key_route_valid 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 rdma_function_key_route_valid）。
+// 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+//   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+// 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
 function automatic bit rdma_function_key_route_valid(rdma_function_key_t key);
   rdma_route_key_t route;
   route = rdma_route_key_from_function(key);

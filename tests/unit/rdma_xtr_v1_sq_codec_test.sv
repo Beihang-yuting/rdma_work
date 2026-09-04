@@ -1,11 +1,23 @@
+// 目录：tests/unit/，验证 XTR v1 SQE 编解码、签名和边界约束。
+// 职责：驱动 SQE 编解码的正常、异常和边界向量，保证镜像布局保持稳定。
+// 依赖：rdma_codec_pkg 及 SQE 模型；测试只创建并持有本地 fixture，不拥有外部后端资源。
+// 所有权与生命周期：UVM build/run 阶段构造本地输入，断言完成后释放 objection；失败通过 UVM 报告上报。
 class rdma_xtr_v1_sq_codec_test extends uvm_test;
   `uvm_component_utils(rdma_xtr_v1_sq_codec_test)
 
+  // 功能：初始化对象字段、同步 UVM 名称并建立可用的初始生命周期状态（接口 new）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function new(string name = "rdma_xtr_v1_sq_codec_test",
                uvm_component parent = null);
     super.new(name, parent);
   endfunction
 
+  // 功能：执行接口 test_qp_handle 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 test_qp_handle）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function automatic rdma_handle test_qp_handle();
     rdma_handle h;
     h = rdma_handle::type_id::create("sq_test_qp");
@@ -16,6 +28,10 @@ class rdma_xtr_v1_sq_codec_test extends uvm_test;
     return h;
   endfunction
 
+  // 功能：将模型或请求按硬件/协议布局编码为可传输的镜像或令牌（接口 encode_rc_sqe）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function automatic rdma_status encode_rc_sqe(
       rdma_xtr_v1_sqe_model sq,
       output rdma_hw_image image);
@@ -36,6 +52,10 @@ class rdma_xtr_v1_sq_codec_test extends uvm_test;
     return codec.encode(sq, image);
   endfunction
 
+  // 功能：执行接口 signature_is_ff 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 signature_is_ff）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function automatic bit signature_is_ff(
       rdma_hw_image image,
       byte unsigned sgb[$]);
@@ -45,6 +65,10 @@ class rdma_xtr_v1_sq_codec_test extends uvm_test;
     return status != null && status.ok() && valid;
   endfunction
 
+  // 功能：依据输入快照构造请求、资源或适配对象，并返回独立的结果载体（接口 make_rc_inline_request）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function automatic rdma_xtr_v1_sqe_model make_rc_inline_request(
       int unsigned n);
     rdma_xtr_v1_sqe_model x;
@@ -65,6 +89,10 @@ class rdma_xtr_v1_sq_codec_test extends uvm_test;
     return x;
   endfunction
 
+  // 功能：依据输入快照构造请求、资源或适配对象，并返回独立的结果载体（接口 make_rc_atomic_request）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function automatic rdma_xtr_v1_sqe_model make_rc_atomic_request(
       rdma_work_opcode_e opcode);
     rdma_xtr_v1_sqe_model x;
@@ -94,6 +122,10 @@ class rdma_xtr_v1_sq_codec_test extends uvm_test;
     return x;
   endfunction
 
+  // 功能：执行 UVM 阶段任务，驱动测试场景并在结束时释放阶段 objection（接口 run_phase）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   task run_phase(uvm_phase phase);
     rdma_xtr_v1_sqe_model sq, decoded;
     rdma_hw_image image, image2;

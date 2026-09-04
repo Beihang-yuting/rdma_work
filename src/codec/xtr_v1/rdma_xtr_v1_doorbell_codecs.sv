@@ -1,3 +1,8 @@
+// 目录：硬件编解码层 codec/xtr_v1/rdma_xtr_v1_doorbell_codecs.sv。
+// 职责：实现 rdma_xtr_v1_doorbell_codecs 在本层的职责和对外接口。
+// 依赖：依赖本层公共 types/model/adapter 契约及其上游快照。
+// 所有权与生命周期：对象只拥有显式创建的值快照；外部资源保存非拥有引用，生命周期由调用方管理。
+
 // 中文说明：rdma_xtr_v1_doorbell_codecs.sv 属于编码层，将模型字段转换为硬件图像并执行反向校验。
 // 阅读提示：先看公开类型和接口，再看实现细节；失败路径应保持状态与资源所有权可追踪。
 
@@ -14,11 +19,19 @@ typedef enum bit {
 virtual class rdma_xtr_v1_doorbell_model_base extends rdma_hw_model;
   rdma_handle target_h;
 
+  // 功能：初始化对象字段、同步 UVM 名称并建立可用的初始生命周期状态（接口 new）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function new(string name = "rdma_xtr_v1_doorbell_model_base");
     super.new(name);
     target_h = null;
   endfunction
 
+  // 功能：把源对象投影/克隆为当前类型的独立值快照，避免共享可变引用（接口 do_copy）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function void do_copy(uvm_object rhs);
     rdma_xtr_v1_doorbell_model_base rhs_model;
     super.do_copy(rhs);
@@ -28,6 +41,10 @@ virtual class rdma_xtr_v1_doorbell_model_base extends rdma_hw_model;
                                        "xtr_v1 doorbell target");
   endfunction
 
+  // 功能：执行接口 target_status 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 target_status）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected function rdma_status target_status(
     rdma_resource_kind_e expected_kind,
     string label
@@ -44,6 +61,10 @@ virtual class rdma_xtr_v1_doorbell_model_base extends rdma_hw_model;
     return rdma_status::success();
   endfunction
 
+  // 功能：执行接口 width_status 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 width_status）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected function rdma_status width_status(
     longint unsigned value,
     int unsigned width,
@@ -57,6 +78,10 @@ virtual class rdma_xtr_v1_doorbell_model_base extends rdma_hw_model;
     return rdma_status::success();
   endfunction
 
+  // 功能：执行接口 target_id_status 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 target_id_status）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected function rdma_status target_id_status(
     int unsigned expected_id,
     string label
@@ -67,6 +92,10 @@ virtual class rdma_xtr_v1_doorbell_model_base extends rdma_hw_model;
     return rdma_status::success();
   endfunction
 
+  // 功能：检查输入值、身份字段和当前生命周期约束，给出一致性判断或状态结果（接口 validate）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function rdma_status validate();
     if (target_h == null)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
@@ -77,8 +106,16 @@ virtual class rdma_xtr_v1_doorbell_model_base extends rdma_hw_model;
     return rdma_status::success();
   endfunction
 
+  // 功能：执行接口 doorbell_kind 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 doorbell_kind）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   pure virtual function rdma_doorbell_kind_e doorbell_kind();
 
+  // 功能：执行接口 codec_variant 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 codec_variant）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   pure virtual function string codec_variant();
 endclass
 
@@ -89,12 +126,20 @@ class rdma_xtr_v1_cmq_sq_doorbell_model
   int unsigned pi;
   bit polarity;
 
+  // 功能：初始化对象字段、同步 UVM 名称并建立可用的初始生命周期状态（接口 new）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function new(string name = "rdma_xtr_v1_cmq_sq_doorbell_model");
     super.new(name);
     pi = 0;
     polarity = 1'b0;
   endfunction
 
+  // 功能：把源对象投影/克隆为当前类型的独立值快照，避免共享可变引用（接口 do_copy）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function void do_copy(uvm_object rhs);
     rdma_xtr_v1_cmq_sq_doorbell_model rhs_model;
     super.do_copy(rhs);
@@ -104,6 +149,10 @@ class rdma_xtr_v1_cmq_sq_doorbell_model
     polarity = rhs_model.polarity;
   endfunction
 
+  // 功能：检查输入值、身份字段和当前生命周期约束，给出一致性判断或状态结果（接口 validate）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function rdma_status validate();
     rdma_status status;
     status = target_status(RDMA_RESOURCE_CMQ, "CMQ doorbell");
@@ -111,14 +160,26 @@ class rdma_xtr_v1_cmq_sq_doorbell_model
     return width_status(pi, XTR_V1_CMQ_DB_PI_WIDTH, "CMQ doorbell PI");
   endfunction
 
+  // 功能：执行接口 doorbell_kind 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 doorbell_kind）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function rdma_doorbell_kind_e doorbell_kind();
     return RDMA_DOORBELL_CMQ_SQ;
   endfunction
 
+  // 功能：执行接口 codec_variant 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 codec_variant）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function string codec_variant();
     return "cmq_sq";
   endfunction
 
+  // 功能：执行接口 describe 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 describe）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function string describe();
     return $sformatf("xtr_v1 CMQ doorbell(pi=%0d polarity=%0b)",
                      pi, polarity);
@@ -131,11 +192,19 @@ class rdma_xtr_v1_sq_doorbell_model
 
   byte unsigned sqe_header[$];
 
+  // 功能：初始化对象字段、同步 UVM 名称并建立可用的初始生命周期状态（接口 new）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function new(string name = "rdma_xtr_v1_sq_doorbell_model");
     super.new(name);
     sqe_header.delete();
   endfunction
 
+  // 功能：把源对象投影/克隆为当前类型的独立值快照，避免共享可变引用（接口 do_copy）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function void do_copy(uvm_object rhs);
     rdma_xtr_v1_sq_doorbell_model rhs_model;
     super.do_copy(rhs);
@@ -144,6 +213,10 @@ class rdma_xtr_v1_sq_doorbell_model
     sqe_header = rhs_model.sqe_header;
   endfunction
 
+  // 功能：检查输入值、身份字段和当前生命周期约束，给出一致性判断或状态结果（接口 validate）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function rdma_status validate();
     rdma_status status;
     status = target_status(RDMA_RESOURCE_QP, "SQ doorbell");
@@ -154,14 +227,26 @@ class rdma_xtr_v1_sq_doorbell_model
     return rdma_status::success();
   endfunction
 
+  // 功能：执行接口 doorbell_kind 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 doorbell_kind）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function rdma_doorbell_kind_e doorbell_kind();
     return RDMA_DOORBELL_SQ;
   endfunction
 
+  // 功能：执行接口 codec_variant 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 codec_variant）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function string codec_variant();
     return "sq";
   endfunction
 
+  // 功能：执行接口 describe 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 describe）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function string describe();
     return "xtr_v1 opaque SQ doorbell header";
   endfunction
@@ -176,6 +261,10 @@ class rdma_xtr_v1_rq_doorbell_model
   int unsigned pi;
   bit wrap;
 
+  // 功能：初始化对象字段、同步 UVM 名称并建立可用的初始生命周期状态（接口 new）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function new(string name = "rdma_xtr_v1_rq_doorbell_model");
     super.new(name);
     qpn = 0;
@@ -184,6 +273,10 @@ class rdma_xtr_v1_rq_doorbell_model
     wrap = 1'b0;
   endfunction
 
+  // 功能：把源对象投影/克隆为当前类型的独立值快照，避免共享可变引用（接口 do_copy）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function void do_copy(uvm_object rhs);
     rdma_xtr_v1_rq_doorbell_model rhs_model;
     super.do_copy(rhs);
@@ -195,6 +288,10 @@ class rdma_xtr_v1_rq_doorbell_model
     wrap = rhs_model.wrap;
   endfunction
 
+  // 功能：检查输入值、身份字段和当前生命周期约束，给出一致性判断或状态结果（接口 validate）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function rdma_status validate();
     rdma_status status;
     status = target_status(RDMA_RESOURCE_QP, "RQ doorbell");
@@ -211,14 +308,26 @@ class rdma_xtr_v1_rq_doorbell_model
     return target_id_status(qpn, "RQ doorbell");
   endfunction
 
+  // 功能：执行接口 doorbell_kind 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 doorbell_kind）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function rdma_doorbell_kind_e doorbell_kind();
     return RDMA_DOORBELL_RQ;
   endfunction
 
+  // 功能：执行接口 codec_variant 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 codec_variant）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function string codec_variant();
     return "rq";
   endfunction
 
+  // 功能：执行接口 describe 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 describe）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function string describe();
     return $sformatf("xtr_v1 RQ doorbell(qpn=%0d pi=%0d wrap=%0b)",
                      qpn, pi, wrap);
@@ -236,6 +345,10 @@ class rdma_xtr_v1_srq_doorbell_model
   int unsigned limit;
   int unsigned arm_sn;
 
+  // 功能：初始化对象字段、同步 UVM 名称并建立可用的初始生命周期状态（接口 new）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function new(string name = "rdma_xtr_v1_srq_doorbell_model");
     super.new(name);
     variant = XTR_V1_SRQ_DB_PI;
@@ -246,6 +359,10 @@ class rdma_xtr_v1_srq_doorbell_model
     arm_sn = 0;
   endfunction
 
+  // 功能：把源对象投影/克隆为当前类型的独立值快照，避免共享可变引用（接口 do_copy）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function void do_copy(uvm_object rhs);
     rdma_xtr_v1_srq_doorbell_model rhs_model;
     super.do_copy(rhs);
@@ -259,6 +376,10 @@ class rdma_xtr_v1_srq_doorbell_model
     arm_sn = rhs_model.arm_sn;
   endfunction
 
+  // 功能：检查输入值、身份字段和当前生命周期约束，给出一致性判断或状态结果（接口 validate）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function rdma_status validate();
     rdma_status status;
     status = target_status(RDMA_RESOURCE_SRQ, "SRQ doorbell");
@@ -285,14 +406,26 @@ class rdma_xtr_v1_srq_doorbell_model
     return target_id_status(srqn, "SRQ doorbell");
   endfunction
 
+  // 功能：执行接口 doorbell_kind 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 doorbell_kind）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function rdma_doorbell_kind_e doorbell_kind();
     return RDMA_DOORBELL_SRQ;
   endfunction
 
+  // 功能：执行接口 codec_variant 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 codec_variant）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function string codec_variant();
     return (variant == XTR_V1_SRQ_DB_PI) ? "srq_pi" : "srq_limit";
   endfunction
 
+  // 功能：执行接口 describe 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 describe）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function string describe();
     return $sformatf("xtr_v1 SRQ doorbell(variant=%s srqn=%0d)",
                      codec_variant(), srqn);
@@ -316,6 +449,10 @@ class rdma_xtr_v1_cq_doorbell_model
   int unsigned arm_state;
   int unsigned arm_sn;
 
+  // 功能：初始化对象字段、同步 UVM 名称并建立可用的初始生命周期状态（接口 new）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function new(string name = "rdma_xtr_v1_cq_doorbell_model");
     super.new(name);
     variant = XTR_V1_CQ_DB_RC_UD;
@@ -332,6 +469,10 @@ class rdma_xtr_v1_cq_doorbell_model
     arm_sn = 0;
   endfunction
 
+  // 功能：把源对象投影/克隆为当前类型的独立值快照，避免共享可变引用（接口 do_copy）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function void do_copy(uvm_object rhs);
     rdma_xtr_v1_cq_doorbell_model rhs_model;
     super.do_copy(rhs);
@@ -351,6 +492,10 @@ class rdma_xtr_v1_cq_doorbell_model
     arm_sn = rhs_model.arm_sn;
   endfunction
 
+  // 功能：检查输入值、身份字段和当前生命周期约束，给出一致性判断或状态结果（接口 validate）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function rdma_status validate();
     rdma_status status;
     status = target_status(RDMA_RESOURCE_CQ, "CQ doorbell");
@@ -386,14 +531,26 @@ class rdma_xtr_v1_cq_doorbell_model
     return target_id_status(cqn, "CQ doorbell");
   endfunction
 
+  // 功能：执行接口 doorbell_kind 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 doorbell_kind）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function rdma_doorbell_kind_e doorbell_kind();
     return RDMA_DOORBELL_CQ;
   endfunction
 
+  // 功能：执行接口 codec_variant 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 codec_variant）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function string codec_variant();
     return (variant == XTR_V1_CQ_DB_RC_UD) ? "cq_rc_ud" : "cq_urc";
   endfunction
 
+  // 功能：执行接口 describe 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 describe）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function string describe();
     return $sformatf("xtr_v1 CQ doorbell(variant=%s cqn=%0d)",
                      codec_variant(), cqn);
@@ -408,6 +565,10 @@ class rdma_xtr_v1_ceq_doorbell_model
   int unsigned ci;
   bit wrap;
 
+  // 功能：初始化对象字段、同步 UVM 名称并建立可用的初始生命周期状态（接口 new）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function new(string name = "rdma_xtr_v1_ceq_doorbell_model");
     super.new(name);
     ceqn = 0;
@@ -415,6 +576,10 @@ class rdma_xtr_v1_ceq_doorbell_model
     wrap = 1'b0;
   endfunction
 
+  // 功能：把源对象投影/克隆为当前类型的独立值快照，避免共享可变引用（接口 do_copy）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function void do_copy(uvm_object rhs);
     rdma_xtr_v1_ceq_doorbell_model rhs_model;
     super.do_copy(rhs);
@@ -425,6 +590,10 @@ class rdma_xtr_v1_ceq_doorbell_model
     wrap = rhs_model.wrap;
   endfunction
 
+  // 功能：检查输入值、身份字段和当前生命周期约束，给出一致性判断或状态结果（接口 validate）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function rdma_status validate();
     rdma_status status;
     status = target_status(RDMA_RESOURCE_CEQ, "CEQ doorbell");
@@ -438,14 +607,26 @@ class rdma_xtr_v1_ceq_doorbell_model
     return target_id_status(ceqn, "CEQ doorbell");
   endfunction
 
+  // 功能：执行接口 doorbell_kind 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 doorbell_kind）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function rdma_doorbell_kind_e doorbell_kind();
     return RDMA_DOORBELL_CEQ;
   endfunction
 
+  // 功能：执行接口 codec_variant 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 codec_variant）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function string codec_variant();
     return "ceq";
   endfunction
 
+  // 功能：执行接口 describe 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 describe）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function string describe();
     return $sformatf("xtr_v1 CEQ doorbell(ceqn=%0d ci=%0d wrap=%0b)",
                      ceqn, ci, wrap);
@@ -460,6 +641,10 @@ class rdma_xtr_v1_aeq_doorbell_model
   int unsigned ci;
   bit wrap;
 
+  // 功能：初始化对象字段、同步 UVM 名称并建立可用的初始生命周期状态（接口 new）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function new(string name = "rdma_xtr_v1_aeq_doorbell_model");
     super.new(name);
     aeqn = 0;
@@ -467,6 +652,10 @@ class rdma_xtr_v1_aeq_doorbell_model
     wrap = 1'b0;
   endfunction
 
+  // 功能：把源对象投影/克隆为当前类型的独立值快照，避免共享可变引用（接口 do_copy）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function void do_copy(uvm_object rhs);
     rdma_xtr_v1_aeq_doorbell_model rhs_model;
     super.do_copy(rhs);
@@ -477,6 +666,10 @@ class rdma_xtr_v1_aeq_doorbell_model
     wrap = rhs_model.wrap;
   endfunction
 
+  // 功能：检查输入值、身份字段和当前生命周期约束，给出一致性判断或状态结果（接口 validate）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function rdma_status validate();
     rdma_status status;
     status = target_status(RDMA_RESOURCE_AEQ, "AEQ doorbell");
@@ -490,14 +683,26 @@ class rdma_xtr_v1_aeq_doorbell_model
     return target_id_status(aeqn, "AEQ doorbell");
   endfunction
 
+  // 功能：执行接口 doorbell_kind 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 doorbell_kind）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function rdma_doorbell_kind_e doorbell_kind();
     return RDMA_DOORBELL_AEQ;
   endfunction
 
+  // 功能：执行接口 codec_variant 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 codec_variant）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function string codec_variant();
     return "aeq";
   endfunction
 
+  // 功能：执行接口 describe 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 describe）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function string describe();
     return $sformatf("xtr_v1 AEQ doorbell(aeqn=%0d ci=%0d wrap=%0b)",
                      aeqn, ci, wrap);
@@ -514,6 +719,10 @@ class rdma_xtr_v1_qp_control_doorbell_model
   int unsigned qp_sn;
   int unsigned icos;
 
+  // 功能：初始化对象字段、同步 UVM 名称并建立可用的初始生命周期状态（接口 new）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function new(string name = "rdma_xtr_v1_qp_control_doorbell_model");
     super.new(name);
     kind = RDMA_DOORBELL_QP_FLUSH;
@@ -523,6 +732,10 @@ class rdma_xtr_v1_qp_control_doorbell_model
     icos = 0;
   endfunction
 
+  // 功能：把源对象投影/克隆为当前类型的独立值快照，避免共享可变引用（接口 do_copy）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function void do_copy(uvm_object rhs);
     rdma_xtr_v1_qp_control_doorbell_model rhs_model;
     super.do_copy(rhs);
@@ -535,6 +748,10 @@ class rdma_xtr_v1_qp_control_doorbell_model
     icos = rhs_model.icos;
   endfunction
 
+  // 功能：检查输入值、身份字段和当前生命周期约束，给出一致性判断或状态结果（接口 validate）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function rdma_status validate();
     rdma_status status;
     status = target_status(RDMA_RESOURCE_QP, "QP-control doorbell");
@@ -567,10 +784,18 @@ class rdma_xtr_v1_qp_control_doorbell_model
     return rdma_status::success();
   endfunction
 
+  // 功能：执行接口 doorbell_kind 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 doorbell_kind）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function rdma_doorbell_kind_e doorbell_kind();
     return kind;
   endfunction
 
+  // 功能：执行接口 codec_variant 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 codec_variant）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function string codec_variant();
     case (kind)
       RDMA_DOORBELL_RTS2SQD:  return "rts2sqd";
@@ -581,6 +806,10 @@ class rdma_xtr_v1_qp_control_doorbell_model
     endcase
   endfunction
 
+  // 功能：执行接口 describe 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 describe）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function string describe();
     return $sformatf("xtr_v1 QP-control doorbell(kind=%s qpn=%0d)",
                      kind.name(), qpn);
@@ -592,20 +821,36 @@ class rdma_xtr_v1_doorbell_codec extends rdma_codec_base;
 
   protected string variant_name;
 
+  // 功能：初始化对象字段、同步 UVM 名称并建立可用的初始生命周期状态（接口 new）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function new(string name = "rdma_xtr_v1_doorbell_codec",
                string variant_name = "rq");
     super.new(name);
     this.variant_name = variant_name;
   endfunction
 
+  // 功能：执行接口 invalid_argument 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 invalid_argument）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected function rdma_status invalid_argument(string message);
     return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, message);
   endfunction
 
+  // 功能：执行接口 codec_error 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 codec_error）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected function rdma_status codec_error(string message);
     return rdma_status::make(RDMA_SC_CODEC_ERROR, message);
   endfunction
 
+  // 功能：执行接口 supported_variant 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 supported_variant）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected function bit supported_variant();
     return variant_name inside {
       "cmq_sq", "sq", "rq", "srq_pi", "srq_limit", "cq_rc_ud",
@@ -614,6 +859,10 @@ class rdma_xtr_v1_doorbell_codec extends rdma_codec_base;
     };
   endfunction
 
+  // 功能：执行接口 expected_relative_offset 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 expected_relative_offset）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected function bit [63:0] expected_relative_offset();
     case (variant_name)
       "cmq_sq":   return XTR_V1_DB_CMQ_OFFSET;
@@ -633,6 +882,10 @@ class rdma_xtr_v1_doorbell_codec extends rdma_codec_base;
     endcase
   endfunction
 
+  // 功能：执行接口 selected_mask 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 selected_mask）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected function bit [63:0] selected_mask();
     case (variant_name)
       "cmq_sq":   return 64'h0000_003f_0000_0000;
@@ -652,6 +905,10 @@ class rdma_xtr_v1_doorbell_codec extends rdma_codec_base;
     endcase
   endfunction
 
+  // 功能：执行接口 expected_target_kind 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 expected_target_kind）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected function rdma_resource_kind_e expected_target_kind();
     case (variant_name)
       "cmq_sq": return RDMA_RESOURCE_CMQ;
@@ -663,6 +920,10 @@ class rdma_xtr_v1_doorbell_codec extends rdma_codec_base;
     endcase
   endfunction
 
+  // 功能：执行接口 expected_doorbell_kind 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 expected_doorbell_kind）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected function rdma_doorbell_kind_e expected_doorbell_kind();
     case (variant_name)
       "cmq_sq": return RDMA_DOORBELL_CMQ_SQ;
@@ -679,6 +940,10 @@ class rdma_xtr_v1_doorbell_codec extends rdma_codec_base;
     endcase
   endfunction
 
+  // 功能：执行接口 expected_db_type 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 expected_db_type）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected function int unsigned expected_db_type();
     case (variant_name)
       "rts2sqd":  return XTR_V1_DB_TYPE_RTS2SQD;
@@ -689,6 +954,10 @@ class rdma_xtr_v1_doorbell_codec extends rdma_codec_base;
     endcase
   endfunction
 
+  // 功能：执行接口 put 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 put）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected function rdma_status put(
     rdma_xtr_v1_qword_builder builder,
     int unsigned word_byte_offset,
@@ -704,6 +973,10 @@ class rdma_xtr_v1_doorbell_codec extends rdma_codec_base;
     return status;
   endfunction
 
+  // 功能：读取或查询当前对象的权威状态，并以返回值或 output 参数交付快照（接口 get）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected function rdma_status get(
     rdma_xtr_v1_qword_builder builder,
     int unsigned word_byte_offset,
@@ -722,6 +995,10 @@ class rdma_xtr_v1_doorbell_codec extends rdma_codec_base;
     return status;
   endfunction
 
+  // 功能：解析硬件/协议镜像并恢复受校验约束的模型字段（接口 decoded_target）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected function rdma_handle decoded_target(
     rdma_resource_kind_e kind,
     int unsigned object_id,
@@ -736,6 +1013,10 @@ class rdma_xtr_v1_doorbell_codec extends rdma_codec_base;
     return handle;
   endfunction
 
+  // 功能：检查输入值、身份字段和当前生命周期约束，给出一致性判断或状态结果（接口 validate_model）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function rdma_status validate_model(rdma_hw_model model);
     rdma_xtr_v1_doorbell_model_base doorbell;
     rdma_xtr_v1_cmq_sq_doorbell_model cmq;
@@ -779,6 +1060,10 @@ class rdma_xtr_v1_doorbell_codec extends rdma_codec_base;
     return rdma_status::success();
   endfunction
 
+  // 功能：将模型或请求按硬件/协议布局编码为可传输的镜像或令牌（接口 encode_fields）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected function rdma_status encode_fields(
     rdma_hw_model model,
     rdma_xtr_v1_qword_builder builder
@@ -880,6 +1165,10 @@ class rdma_xtr_v1_doorbell_codec extends rdma_codec_base;
     return rdma_status::success();
   endfunction
 
+  // 功能：检查输入值、身份字段和当前生命周期约束，给出一致性判断或状态结果（接口 validate_encode_mask）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected function rdma_status validate_encode_mask(
     rdma_xtr_v1_qword_builder builder
   );
@@ -890,6 +1179,10 @@ class rdma_xtr_v1_doorbell_codec extends rdma_codec_base;
     return rdma_status::success();
   endfunction
 
+  // 功能：将模型或请求按硬件/协议布局编码为可传输的镜像或令牌（接口 encode）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function rdma_status encode(
     rdma_hw_model model,
     output rdma_hw_image image
@@ -932,6 +1225,10 @@ class rdma_xtr_v1_doorbell_codec extends rdma_codec_base;
     return rdma_status::success();
   endfunction
 
+  // 功能：检查输入值、身份字段和当前生命周期约束，给出一致性判断或状态结果（接口 validate_image）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function rdma_status validate_image(rdma_hw_image image);
     rdma_xtr_v1_qword_builder builder;
     byte unsigned payload[];
@@ -968,6 +1265,10 @@ class rdma_xtr_v1_doorbell_codec extends rdma_codec_base;
     return rdma_status::success();
   endfunction
 
+  // 功能：解析硬件/协议镜像并恢复受校验约束的模型字段（接口 decode）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function rdma_status decode(
     rdma_hw_image image,
     output rdma_hw_model model
@@ -1127,6 +1428,10 @@ class rdma_xtr_v1_doorbell_codec extends rdma_codec_base;
     return rdma_status::success();
   endfunction
 
+  // 功能：将模型或请求按硬件/协议布局编码为可传输的镜像或令牌（接口 serialized_equal）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function rdma_status serialized_equal(
     rdma_hw_model lhs,
     rdma_hw_model rhs,
@@ -1160,10 +1465,18 @@ class rdma_xtr_v1_doorbell_codec extends rdma_codec_base;
     return rdma_status::success();
   endfunction
 
+  // 功能：执行接口 hardware_endian 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 hardware_endian）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function rdma_byte_endian_e hardware_endian();
     return RDMA_ENDIAN_BIG;
   endfunction
 
+  // 功能：执行接口 describe_fields 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 describe_fields）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function string describe_fields();
     return {"xtr_v1 8-byte doorbell variant ", variant_name};
   endfunction
@@ -1174,11 +1487,19 @@ class rdma_xtr_v1_doorbell_codec_registry extends rdma_codec_registry;
 
   protected bit defaults_registered;
 
+  // 功能：初始化对象字段、同步 UVM 名称并建立可用的初始生命周期状态（接口 new）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function new(string name = "rdma_xtr_v1_doorbell_codec_registry");
     super.new(name);
     defaults_registered = 1'b0;
   endfunction
 
+  // 功能：依据输入快照构造请求、资源或适配对象，并返回独立的结果载体（接口 make_key）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected function rdma_codec_key make_key(string variant);
     rdma_codec_key key;
     key.hw_version = "xtr_v1";
@@ -1189,11 +1510,19 @@ class rdma_xtr_v1_doorbell_codec_registry extends rdma_codec_registry;
     return key;
   endfunction
 
+  // 功能：维护内部集合或缓存的一致性，完成指定条目的增删或清空（接口 clear）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function void clear();
     super.clear();
     defaults_registered = 1'b0;
   endfunction
 
+  // 功能：执行接口 register_defaults 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 register_defaults）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function rdma_status register_defaults();
     string variants[13] = '{
       "cmq_sq", "sq", "rq", "srq_pi", "srq_limit", "cq_rc_ud",
@@ -1228,6 +1557,10 @@ class rdma_xtr_v1_doorbell_codec_registry extends rdma_codec_registry;
     return rdma_status::success();
   endfunction
 
+  // 功能：读取或查询当前对象的权威状态，并以返回值或 output 参数交付快照（接口 find_codec）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected function rdma_status find_codec(
     string variant,
     output rdma_codec_base codec
@@ -1235,6 +1568,10 @@ class rdma_xtr_v1_doorbell_codec_registry extends rdma_codec_registry;
     return lookup(make_key(variant), codec);
   endfunction
 
+  // 功能：将模型或请求按硬件/协议布局编码为可传输的镜像或令牌（接口 encode）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function rdma_status encode(
     rdma_xtr_v1_doorbell_model_base model,
     output rdma_hw_image image
@@ -1250,6 +1587,10 @@ class rdma_xtr_v1_doorbell_codec_registry extends rdma_codec_registry;
     return codec.encode(model, image);
   endfunction
 
+  // 功能：解析硬件/协议镜像并恢复受校验约束的模型字段（接口 decode）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function rdma_status decode(
     string variant,
     rdma_hw_image image,
@@ -1263,6 +1604,10 @@ class rdma_xtr_v1_doorbell_codec_registry extends rdma_codec_registry;
     return codec.decode(image, model);
   endfunction
 
+  // 功能：将模型或请求按硬件/协议布局编码为可传输的镜像或令牌（接口 serialized_equal）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function rdma_status serialized_equal(
     string variant,
     rdma_hw_model lhs,

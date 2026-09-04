@@ -1,3 +1,8 @@
+// 目录：硬件编解码层 codec/xtr_v1/rdma_xtr_v1_cmq_codecs.sv。
+// 职责：实现 rdma_xtr_v1_cmq_codecs 在本层的职责和对外接口。
+// 依赖：依赖本层公共 types/model/adapter 契约及其上游快照。
+// 所有权与生命周期：对象只拥有显式创建的值快照；外部资源保存非拥有引用，生命周期由调用方管理。
+
 // 中文说明：rdma_xtr_v1_cmq_codecs.sv 属于编码层，将模型字段转换为硬件图像并执行反向校验。
 // 阅读提示：先看公开类型和接口，再看实现细节；失败路径应保持状态与资源所有权可追踪。
 
@@ -11,6 +16,10 @@ class rdma_xtr_v1_cmq_envelope extends uvm_object;
   bit [4:0] wqe_index;
   bit [7:0] opcode;
 
+  // 功能：初始化对象字段、同步 UVM 名称并建立可用的初始生命周期状态（接口 new）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function new(string name = "rdma_xtr_v1_cmq_envelope");
     super.new(name);
     valid = 1'b0;
@@ -21,6 +30,10 @@ class rdma_xtr_v1_cmq_envelope extends uvm_object;
     opcode = '0;
   endfunction
 
+  // 功能：把源对象投影/克隆为当前类型的独立值快照，避免共享可变引用（接口 do_copy）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function void do_copy(uvm_object rhs);
     rdma_xtr_v1_cmq_envelope rhs_envelope;
     super.do_copy(rhs);
@@ -34,6 +47,10 @@ class rdma_xtr_v1_cmq_envelope extends uvm_object;
     opcode = rhs_envelope.opcode;
   endfunction
 
+  // 功能：检查输入值、身份字段和当前生命周期约束，给出一致性判断或状态结果（接口 validate）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function rdma_status validate();
     if (!vfid_override && use_vfid != 0)
       return rdma_status::make(
@@ -43,6 +60,10 @@ class rdma_xtr_v1_cmq_envelope extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：执行接口 describe 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 describe）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function string describe();
     return $sformatf(
       "CMQ envelope(valid=%0b override=%0b vfid=%0d wrap=%0b index=%0d opcode=0x%02x)",
@@ -61,6 +82,10 @@ class rdma_xtr_v1_cmq_completion extends uvm_object;
   bit wrap;
   byte unsigned object_payload[];
 
+  // 功能：初始化对象字段、同步 UVM 名称并建立可用的初始生命周期状态（接口 new）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function new(string name = "rdma_xtr_v1_cmq_completion");
     super.new(name);
     owner = 1'b0;
@@ -71,6 +96,10 @@ class rdma_xtr_v1_cmq_completion extends uvm_object;
     object_payload = new[0];
   endfunction
 
+  // 功能：把源对象投影/克隆为当前类型的独立值快照，避免共享可变引用（接口 do_copy）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function void do_copy(uvm_object rhs);
     rdma_xtr_v1_cmq_completion rhs_completion;
     super.do_copy(rhs);
@@ -90,14 +119,26 @@ class rdma_xtr_v1_cmq_completion_codec extends uvm_object;
 
   localparam bit [7:0] COMPLETION_KEY_QUERY_OPCODE = 8'h09;
 
+  // 功能：初始化对象字段、同步 UVM 名称并建立可用的初始生命周期状态（接口 new）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function new(string name = "rdma_xtr_v1_cmq_completion_codec");
     super.new(name);
   endfunction
 
+  // 功能：执行接口 codec_error 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 codec_error）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   local function rdma_status codec_error(string message);
     return rdma_status::make(RDMA_SC_CODEC_ERROR, message);
   endfunction
 
+  // 功能：执行接口 image_qword 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 image_qword）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   local function bit [63:0] image_qword(
     rdma_hw_image image,
     int unsigned qword_index
@@ -113,6 +154,10 @@ class rdma_xtr_v1_cmq_completion_codec extends uvm_object;
 
   // Registered request opcodes plus the driver's response-only KEY_QUERY.
   // Keep completion admission independent of a mutable/injectable registry.
+  // 功能：执行接口 supported_opcode 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 supported_opcode）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   local function bit supported_opcode(bit [7:0] opcode);
     return opcode inside {
       XTR_V1_OP_QPC_CREATE, XTR_V1_OP_QPC_MODIFY,
@@ -130,6 +175,10 @@ class rdma_xtr_v1_cmq_completion_codec extends uvm_object;
     };
   endfunction
 
+  // 功能：执行接口 allowed_qword_mask 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 allowed_qword_mask）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   local function bit [63:0] allowed_qword_mask(
     bit [7:0] opcode,
     int unsigned qword_index
@@ -152,6 +201,10 @@ class rdma_xtr_v1_cmq_completion_codec extends uvm_object;
     return 64'h0000_0000_0000_0000;
   endfunction
 
+  // 功能：执行接口 returned_payload_bounds 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 returned_payload_bounds）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   local function void returned_payload_bounds(
     bit [7:0] opcode,
     output int unsigned first_byte,
@@ -181,6 +234,10 @@ class rdma_xtr_v1_cmq_completion_codec extends uvm_object;
     endcase
   endfunction
 
+  // 功能：执行接口 inspect_completion 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 inspect_completion）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function rdma_status inspect_completion(
     rdma_hw_image image,
     bit expected_owner,
@@ -262,6 +319,10 @@ class rdma_xtr_v1_qpc_command_body extends rdma_hw_model;
   bit [7:0] modify_wbe[4];
   bit [63:0] modify_data[4];
 
+  // 功能：初始化对象字段、同步 UVM 名称并建立可用的初始生命周期状态（接口 new）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function new(string name = "rdma_xtr_v1_qpc_command_body");
     super.new(name);
     qp_h = null;
@@ -279,6 +340,10 @@ class rdma_xtr_v1_qpc_command_body extends rdma_hw_model;
     end
   endfunction
 
+  // 功能：把源对象投影/克隆为当前类型的独立值快照，避免共享可变引用（接口 do_copy）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function void do_copy(uvm_object rhs);
     rdma_xtr_v1_qpc_command_body rhs_body;
     super.do_copy(rhs);
@@ -301,6 +366,10 @@ class rdma_xtr_v1_qpc_command_body extends rdma_hw_model;
     end
   endfunction
 
+  // 功能：检查输入值、身份字段和当前生命周期约束，给出一致性判断或状态结果（接口 validate）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function rdma_status validate();
     rdma_status status;
     status = rdma_context_handle_status(qp_h, RDMA_RESOURCE_QP, 24,
@@ -312,6 +381,10 @@ class rdma_xtr_v1_qpc_command_body extends rdma_hw_model;
     return rdma_status::success();
   endfunction
 
+  // 功能：执行接口 describe 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 describe）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function string describe();
     return $sformatf(
       "QPC command(qpn=%0d full=%0b partial=%0b next=%s buffer=0x%016x)",
@@ -326,11 +399,19 @@ class rdma_xtr_v1_object_id_command_body extends rdma_hw_model;
 
   rdma_handle object_h;
 
+  // 功能：初始化对象字段、同步 UVM 名称并建立可用的初始生命周期状态（接口 new）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function new(string name = "rdma_xtr_v1_object_id_command_body");
     super.new(name);
     object_h = null;
   endfunction
 
+  // 功能：把源对象投影/克隆为当前类型的独立值快照，避免共享可变引用（接口 do_copy）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function void do_copy(uvm_object rhs);
     rdma_xtr_v1_object_id_command_body rhs_body;
     super.do_copy(rhs);
@@ -340,6 +421,10 @@ class rdma_xtr_v1_object_id_command_body extends rdma_hw_model;
                                        "object-ID command");
   endfunction
 
+  // 功能：检查输入值、身份字段和当前生命周期约束，给出一致性判断或状态结果（接口 validate）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function rdma_status validate();
     if (object_h == null)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
@@ -347,6 +432,10 @@ class rdma_xtr_v1_object_id_command_body extends rdma_hw_model;
     return rdma_status::success();
   endfunction
 
+  // 功能：执行接口 describe 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 describe）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function string describe();
     return $sformatf("object-ID command(kind=%s id=%0d)",
                      (object_h == null) ? "null" : object_h.kind.name(),
@@ -361,6 +450,10 @@ class rdma_xtr_v1_mr_deregister_body extends rdma_hw_model;
   bit [7:0] stag_key;
   rdma_context_state_e next_state;
 
+  // 功能：初始化对象字段、同步 UVM 名称并建立可用的初始生命周期状态（接口 new）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function new(string name = "rdma_xtr_v1_mr_deregister_body");
     super.new(name);
     mr_h = null;
@@ -368,6 +461,10 @@ class rdma_xtr_v1_mr_deregister_body extends rdma_hw_model;
     next_state = RDMA_CONTEXT_INVALID;
   endfunction
 
+  // 功能：把源对象投影/克隆为当前类型的独立值快照，避免共享可变引用（接口 do_copy）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function void do_copy(uvm_object rhs);
     rdma_xtr_v1_mr_deregister_body rhs_body;
     super.do_copy(rhs);
@@ -378,6 +475,10 @@ class rdma_xtr_v1_mr_deregister_body extends rdma_hw_model;
     next_state = rhs_body.next_state;
   endfunction
 
+  // 功能：检查输入值、身份字段和当前生命周期约束，给出一致性判断或状态结果（接口 validate）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function rdma_status validate();
     rdma_status status;
     status = rdma_context_handle_status(mr_h, RDMA_RESOURCE_MR, 24,
@@ -389,6 +490,10 @@ class rdma_xtr_v1_mr_deregister_body extends rdma_hw_model;
     return rdma_status::success();
   endfunction
 
+  // 功能：执行接口 describe 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 describe）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function string describe();
     return $sformatf("MR deregister(stag=%0d key=0x%02x next=%s)",
                      (mr_h == null) ? 0 : mr_h.object_id, stag_key,
@@ -415,6 +520,10 @@ class rdma_xtr_v1_occ_flush_body extends rdma_hw_model;
   bit [11:0] mr_serial;
   rdma_backing_addr_t pd_backing;
 
+  // 功能：初始化对象字段、同步 UVM 名称并建立可用的初始生命周期状态（接口 new）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function new(string name = "rdma_xtr_v1_occ_flush_body");
     super.new(name);
     vf_flush = 1'b0;
@@ -434,6 +543,10 @@ class rdma_xtr_v1_occ_flush_body extends rdma_hw_model;
     pd_backing = '0;
   endfunction
 
+  // 功能：把源对象投影/克隆为当前类型的独立值快照，避免共享可变引用（接口 do_copy）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function void do_copy(uvm_object rhs);
     rdma_xtr_v1_occ_flush_body rhs_body;
     super.do_copy(rhs);
@@ -456,6 +569,10 @@ class rdma_xtr_v1_occ_flush_body extends rdma_hw_model;
     pd_backing = rhs_body.pd_backing;
   endfunction
 
+  // 功能：检查输入值、身份字段和当前生命周期约束，给出一致性判断或状态结果（接口 validate）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function rdma_status validate();
     bit vf_pattern;
     bit serial_pattern;
@@ -497,6 +614,10 @@ class rdma_xtr_v1_occ_flush_body extends rdma_hw_model;
     );
   endfunction
 
+  // 功能：执行接口 describe 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 describe）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function string describe();
     return $sformatf(
       "OCC flush(vf=%0b mr_serial=%0b qpn=%0d serial=%0d pd=0x%016x)",
@@ -508,10 +629,18 @@ endclass
 class rdma_xtr_v1_cmq_empty_body extends rdma_hw_model;
   `uvm_object_utils(rdma_xtr_v1_cmq_empty_body)
 
+  // 功能：初始化对象字段、同步 UVM 名称并建立可用的初始生命周期状态（接口 new）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function new(string name = "rdma_xtr_v1_cmq_empty_body");
     super.new(name);
   endfunction
 
+  // 功能：把源对象投影/克隆为当前类型的独立值快照，避免共享可变引用（接口 do_copy）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function void do_copy(uvm_object rhs);
     rdma_xtr_v1_cmq_empty_body rhs_body;
     super.do_copy(rhs);
@@ -519,10 +648,18 @@ class rdma_xtr_v1_cmq_empty_body extends rdma_hw_model;
       `uvm_fatal("RDMA_COPY_TYPE", "empty CMQ body copy type mismatch")
   endfunction
 
+  // 功能：检查输入值、身份字段和当前生命周期约束，给出一致性判断或状态结果（接口 validate）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function rdma_status validate();
     return rdma_status::success();
   endfunction
 
+  // 功能：执行接口 describe 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 describe）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function string describe();
     return "xtr_v1 empty CMQ command body";
   endfunction
@@ -530,6 +667,10 @@ endclass
 
 class rdma_xtr_v1_cmq_body_token extends uvm_object;
 
+  // 功能：初始化对象字段、同步 UVM 名称并建立可用的初始生命周期状态（接口 new）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function new(string name = "rdma_xtr_v1_cmq_body_token");
     super.new(name);
   endfunction
@@ -543,6 +684,10 @@ class rdma_xtr_v1_cmq_body_image extends rdma_hw_image;
   local rdma_hw_image immutable_snapshot;
   local bit initialized;
 
+  // 功能：初始化对象字段、同步 UVM 名称并建立可用的初始生命周期状态（接口 new）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function new(string name = "rdma_xtr_v1_cmq_body_image");
     super.new(name);
     producer_token = null;
@@ -551,10 +696,18 @@ class rdma_xtr_v1_cmq_body_image extends rdma_hw_image;
     initialized = 1'b0;
   endfunction
 
+  // 功能：把源对象投影/克隆为当前类型的独立值快照，避免共享可变引用（接口 do_copy）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function void do_copy(uvm_object rhs);
     super.do_copy(rhs);
   endfunction
 
+  // 功能：检查输入值、身份字段和当前生命周期约束，给出一致性判断或状态结果（接口 matches_snapshot）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   local function bit matches_snapshot();
     if (immutable_snapshot == null ||
         bytes.size() != immutable_snapshot.bytes.size() ||
@@ -579,6 +732,10 @@ class rdma_xtr_v1_cmq_body_image extends rdma_hw_image;
     return 1'b1;
   endfunction
 
+  // 功能：写入并校验运行所需的配置、身份或资源参数，建立后续操作的边界（接口 initialize_once）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function rdma_status initialize_once(
     rdma_xtr_v1_cmq_body_token token,
     bit [7:0] opcode
@@ -601,6 +758,10 @@ class rdma_xtr_v1_cmq_body_image extends rdma_hw_image;
     return rdma_status::success();
   endfunction
 
+  // 功能：执行接口 authenticate 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 authenticate）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function rdma_status authenticate(
     rdma_xtr_v1_cmq_body_token token,
     bit [7:0] opcode
@@ -628,18 +789,34 @@ endclass
 virtual class rdma_xtr_v1_cmq_light_layout_codec extends uvm_object;
   localparam int unsigned BODY_BYTES = 64;
 
+  // 功能：初始化对象字段、同步 UVM 名称并建立可用的初始生命周期状态（接口 new）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function new(string name = "rdma_xtr_v1_cmq_light_layout_codec");
     super.new(name);
   endfunction
 
+  // 功能：执行接口 invalid_argument 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 invalid_argument）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected function rdma_status invalid_argument(string message);
     return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, message);
   endfunction
 
+  // 功能：执行接口 codec_error 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 codec_error）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected function rdma_status codec_error(string message);
     return rdma_status::make(RDMA_SC_CODEC_ERROR, message);
   endfunction
 
+  // 功能：执行接口 put 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 put）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected function rdma_status put(
     rdma_xtr_v1_qword_builder builder,
     int unsigned word_byte_offset,
@@ -655,19 +832,35 @@ virtual class rdma_xtr_v1_cmq_light_layout_codec extends uvm_object;
     return status;
   endfunction
 
+  // 功能：检查输入值、身份字段和当前生命周期约束，给出一致性判断或状态结果（接口 validate_for_opcode）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected pure virtual function rdma_status validate_for_opcode(
     bit [7:0] opcode,
     rdma_hw_model model
   );
+  // 功能：将模型或请求按硬件/协议布局编码为可传输的镜像或令牌（接口 encode_fields）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected pure virtual function rdma_status encode_fields(
     bit [7:0] opcode,
     rdma_hw_model model,
     rdma_xtr_v1_qword_builder builder
   );
+  // 功能：执行接口 owner_generation 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 owner_generation）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected pure virtual function int unsigned owner_generation(
     rdma_hw_model model
   );
 
+  // 功能：将模型或请求按硬件/协议布局编码为可传输的镜像或令牌（接口 encode）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function rdma_status encode(
     bit [7:0] opcode,
     rdma_hw_model model,
@@ -722,10 +915,18 @@ endclass
 class rdma_xtr_v1_cmq_qpc_layout_codec
     extends rdma_xtr_v1_cmq_light_layout_codec;
 
+  // 功能：初始化对象字段、同步 UVM 名称并建立可用的初始生命周期状态（接口 new）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function new(string name = "rdma_xtr_v1_cmq_qpc_layout_codec");
     super.new(name);
   endfunction
 
+  // 功能：将模型或请求按硬件/协议布局编码为可传输的镜像或令牌（接口 encode_state）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected function rdma_status encode_state(
     rdma_qp_state_e state,
     output bit [2:0] code
@@ -742,6 +943,10 @@ class rdma_xtr_v1_cmq_qpc_layout_codec
     return rdma_status::success();
   endfunction
 
+  // 功能：检查输入值、身份字段和当前生命周期约束，给出一致性判断或状态结果（接口 validate_cq_handles）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected function rdma_status validate_cq_handles(
     rdma_xtr_v1_qpc_command_body body
   );
@@ -759,6 +964,10 @@ class rdma_xtr_v1_cmq_qpc_layout_codec
                                          "QPC command receive CQ");
   endfunction
 
+  // 功能：检查输入值、身份字段和当前生命周期约束，给出一致性判断或状态结果（接口 validate_buffer）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected function rdma_status validate_buffer(
     rdma_xtr_v1_qpc_command_body body
   );
@@ -767,6 +976,10 @@ class rdma_xtr_v1_cmq_qpc_layout_codec
     return rdma_status::success();
   endfunction
 
+  // 功能：检查输入值、身份字段和当前生命周期约束，给出一致性判断或状态结果（接口 has_modify_pairs）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected function bit has_modify_pairs(
     rdma_xtr_v1_qpc_command_body body
   );
@@ -777,6 +990,10 @@ class rdma_xtr_v1_cmq_qpc_layout_codec
     return 1'b0;
   endfunction
 
+  // 功能：检查输入值、身份字段和当前生命周期约束，给出一致性判断或状态结果（接口 has_modify_data）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected function bit has_modify_data(
     rdma_xtr_v1_qpc_command_body body
   );
@@ -785,6 +1002,10 @@ class rdma_xtr_v1_cmq_qpc_layout_codec
     return 1'b0;
   endfunction
 
+  // 功能：检查输入值、身份字段和当前生命周期约束，给出一致性判断或状态结果（接口 validate_for_opcode）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected virtual function rdma_status validate_for_opcode(
     bit [7:0] opcode,
     rdma_hw_model model
@@ -873,6 +1094,10 @@ class rdma_xtr_v1_cmq_qpc_layout_codec
     return rdma_status::success();
   endfunction
 
+  // 功能：执行接口 owner_generation 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 owner_generation）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected virtual function int unsigned owner_generation(
     rdma_hw_model model
   );
@@ -881,6 +1106,10 @@ class rdma_xtr_v1_cmq_qpc_layout_codec
     return body.qp_h.generation;
   endfunction
 
+  // 功能：将模型或请求按硬件/协议布局编码为可传输的镜像或令牌（接口 encode_fields）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected virtual function rdma_status encode_fields(
     bit [7:0] opcode,
     rdma_hw_model model,
@@ -970,6 +1199,10 @@ class rdma_xtr_v1_cmq_object_id_layout_codec
   protected rdma_resource_kind_e fixed_kind;
   protected int unsigned fixed_width;
 
+  // 功能：初始化对象字段、同步 UVM 名称并建立可用的初始生命周期状态（接口 new）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function new(
     string name = "rdma_xtr_v1_cmq_object_id_layout_codec",
     bit [7:0] opcode = 0,
@@ -982,6 +1215,10 @@ class rdma_xtr_v1_cmq_object_id_layout_codec
     fixed_width = width;
   endfunction
 
+  // 功能：检查输入值、身份字段和当前生命周期约束，给出一致性判断或状态结果（接口 validate_for_opcode）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected virtual function rdma_status validate_for_opcode(
     bit [7:0] opcode,
     rdma_hw_model model
@@ -1001,6 +1238,10 @@ class rdma_xtr_v1_cmq_object_id_layout_codec
                                       "CMQ object-ID command");
   endfunction
 
+  // 功能：执行接口 owner_generation 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 owner_generation）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected virtual function int unsigned owner_generation(
     rdma_hw_model model
   );
@@ -1009,6 +1250,10 @@ class rdma_xtr_v1_cmq_object_id_layout_codec
     return body.object_h.generation;
   endfunction
 
+  // 功能：将模型或请求按硬件/协议布局编码为可传输的镜像或令牌（接口 encode_fields）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected virtual function rdma_status encode_fields(
     bit [7:0] opcode,
     rdma_hw_model model,
@@ -1024,10 +1269,18 @@ endclass
 class rdma_xtr_v1_cmq_mr_deregister_layout_codec
     extends rdma_xtr_v1_cmq_light_layout_codec;
 
+  // 功能：初始化对象字段、同步 UVM 名称并建立可用的初始生命周期状态（接口 new）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function new(string name = "rdma_xtr_v1_cmq_mr_deregister_layout_codec");
     super.new(name);
   endfunction
 
+  // 功能：检查输入值、身份字段和当前生命周期约束，给出一致性判断或状态结果（接口 validate_for_opcode）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected virtual function rdma_status validate_for_opcode(
     bit [7:0] opcode,
     rdma_hw_model model
@@ -1043,6 +1296,10 @@ class rdma_xtr_v1_cmq_mr_deregister_layout_codec
     return body.validate();
   endfunction
 
+  // 功能：执行接口 owner_generation 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 owner_generation）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected virtual function int unsigned owner_generation(
     rdma_hw_model model
   );
@@ -1051,6 +1308,10 @@ class rdma_xtr_v1_cmq_mr_deregister_layout_codec
     return body.mr_h.generation;
   endfunction
 
+  // 功能：将模型或请求按硬件/协议布局编码为可传输的镜像或令牌（接口 encode_fields）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected virtual function rdma_status encode_fields(
     bit [7:0] opcode,
     rdma_hw_model model,
@@ -1081,10 +1342,18 @@ endclass
 class rdma_xtr_v1_cmq_occ_flush_layout_codec
     extends rdma_xtr_v1_cmq_light_layout_codec;
 
+  // 功能：初始化对象字段、同步 UVM 名称并建立可用的初始生命周期状态（接口 new）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function new(string name = "rdma_xtr_v1_cmq_occ_flush_layout_codec");
     super.new(name);
   endfunction
 
+  // 功能：检查输入值、身份字段和当前生命周期约束，给出一致性判断或状态结果（接口 validate_for_opcode）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected virtual function rdma_status validate_for_opcode(
     bit [7:0] opcode,
     rdma_hw_model model
@@ -1100,12 +1369,20 @@ class rdma_xtr_v1_cmq_occ_flush_layout_codec
     return body.validate();
   endfunction
 
+  // 功能：执行接口 owner_generation 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 owner_generation）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected virtual function int unsigned owner_generation(
     rdma_hw_model model
   );
     return 0;
   endfunction
 
+  // 功能：将模型或请求按硬件/协议布局编码为可传输的镜像或令牌（接口 encode_fields）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected virtual function rdma_status encode_fields(
     bit [7:0] opcode,
     rdma_hw_model model,
@@ -1143,10 +1420,18 @@ endclass
 class rdma_xtr_v1_cmq_empty_layout_codec
     extends rdma_xtr_v1_cmq_light_layout_codec;
 
+  // 功能：初始化对象字段、同步 UVM 名称并建立可用的初始生命周期状态（接口 new）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function new(string name = "rdma_xtr_v1_cmq_empty_layout_codec");
     super.new(name);
   endfunction
 
+  // 功能：检查输入值、身份字段和当前生命周期约束，给出一致性判断或状态结果（接口 validate_for_opcode）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected virtual function rdma_status validate_for_opcode(
     bit [7:0] opcode,
     rdma_hw_model model
@@ -1164,12 +1449,20 @@ class rdma_xtr_v1_cmq_empty_layout_codec
     return body.validate();
   endfunction
 
+  // 功能：执行接口 owner_generation 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 owner_generation）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected virtual function int unsigned owner_generation(
     rdma_hw_model model
   );
     return 0;
   endfunction
 
+  // 功能：将模型或请求按硬件/协议布局编码为可传输的镜像或令牌（接口 encode_fields）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected virtual function rdma_status encode_fields(
     bit [7:0] opcode,
     rdma_hw_model model,
@@ -1184,6 +1477,10 @@ class rdma_xtr_v1_cmq_light_body_codec extends uvm_object;
 
   protected rdma_xtr_v1_cmq_light_layout_codec codecs[256];
 
+  // 功能：初始化对象字段、同步 UVM 名称并建立可用的初始生命周期状态（接口 new）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function new(string name = "rdma_xtr_v1_cmq_light_body_codec");
     rdma_xtr_v1_cmq_qpc_layout_codec qpc_codec;
     rdma_xtr_v1_cmq_mr_deregister_layout_codec mr_deregister_codec;
@@ -1237,6 +1534,10 @@ class rdma_xtr_v1_cmq_light_body_codec extends uvm_object;
     codecs[XTR_V1_OP_SRFQC_QUERY] = object_id_codec;
   endfunction
 
+  // 功能：将模型或请求按硬件/协议布局编码为可传输的镜像或令牌（接口 encode）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function rdma_status encode(
     bit [7:0] opcode,
     rdma_hw_model model,
@@ -1259,6 +1560,10 @@ class rdma_xtr_v1_cmq_body_encoder extends uvm_object;
   protected rdma_xtr_v1_cmq_light_body_codec light_codec;
   protected rdma_codec_registry context_codecs;
 
+  // 功能：初始化对象字段、同步 UVM 名称并建立可用的初始生命周期状态（接口 new）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function new(string name = "rdma_xtr_v1_cmq_body_encoder");
     rdma_status status;
     super.new(name);
@@ -1271,6 +1576,10 @@ class rdma_xtr_v1_cmq_body_encoder extends uvm_object;
       `uvm_fatal("RDMA_CMQ_REGISTRY", status.convert2string())
   endfunction
 
+  // 功能：执行接口 context_key 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 context_key）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected function rdma_codec_key context_key(bit [7:0] opcode);
     rdma_codec_key key;
     key.hw_version = "xtr_v1";
@@ -1315,12 +1624,20 @@ class rdma_xtr_v1_cmq_body_encoder extends uvm_object;
     return key;
   endfunction
 
+  // 功能：检查输入值、身份字段和当前生命周期约束，给出一致性判断或状态结果（接口 is_context_opcode）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected function bit is_context_opcode(bit [7:0] opcode);
     return opcode inside {XTR_V1_OP_KEY_ALLOC, XTR_V1_OP_MR_REGISTER,
                           XTR_V1_OP_CQC_CREATE, XTR_V1_OP_CEQC_CREATE,
                           XTR_V1_OP_AEQC_CREATE, XTR_V1_OP_SRFQC_CREATE};
   endfunction
 
+  // 功能：将模型或请求按硬件/协议布局编码为可传输的镜像或令牌（接口 encode）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function rdma_status encode(
     bit [7:0] opcode,
     rdma_hw_model model,
@@ -1355,6 +1672,10 @@ class rdma_xtr_v1_cmq_body_registry extends uvm_object;
   protected bit [63:0] body_masks[256][8];
   protected bit sealed;
 
+  // 功能：初始化对象字段、同步 UVM 名称并建立可用的初始生命周期状态（接口 new）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function new(string name = "rdma_xtr_v1_cmq_body_registry");
     super.new(name);
     foreach (registered[i]) begin
@@ -1365,6 +1686,10 @@ class rdma_xtr_v1_cmq_body_registry extends uvm_object;
     sealed = 1'b0;
   endfunction
 
+  // 功能：把源对象投影/克隆为当前类型的独立值快照，避免共享可变引用（接口 do_copy）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function void do_copy(uvm_object rhs);
     rdma_xtr_v1_cmq_body_registry rhs_registry;
     if (sealed) return;
@@ -1377,6 +1702,10 @@ class rdma_xtr_v1_cmq_body_registry extends uvm_object;
     sealed = rhs_registry.sealed;
   endfunction
 
+  // 功能：写入并校验运行所需的配置、身份或资源参数，建立后续操作的边界（接口 set_entry_unchecked）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected function void set_entry_unchecked(
     bit [7:0] opcode,
     rdma_image_kind_e input_kind,
@@ -1387,6 +1716,10 @@ class rdma_xtr_v1_cmq_body_registry extends uvm_object;
     foreach (masks[q]) body_masks[opcode][q] = masks[q];
   endfunction
 
+  // 功能：执行接口 register_body 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 register_body）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function rdma_status register_body(
     bit [7:0] opcode,
     rdma_image_kind_e input_kind,
@@ -1419,6 +1752,10 @@ class rdma_xtr_v1_cmq_body_registry extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：读取或查询当前对象的权威状态，并以返回值或 output 参数交付快照（接口 lookup）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function rdma_status lookup(
     bit [7:0] opcode,
     output rdma_image_kind_e input_kind,
@@ -1436,6 +1773,10 @@ class rdma_xtr_v1_cmq_body_registry extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：检查输入值、身份字段和当前生命周期约束，给出一致性判断或状态结果（接口 validated_snapshot）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function rdma_status validated_snapshot(
     output rdma_xtr_v1_cmq_body_registry snapshot
   );
@@ -1456,11 +1797,19 @@ class rdma_xtr_v1_cmq_body_registry extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：将模型或请求按硬件/协议布局编码为可传输的镜像或令牌（接口 seal）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function void seal();
     sealed = 1'b1;
   endfunction
 endclass
 
+// 功能：执行接口 rdma_xtr_v1_register_cmq_request_bodies 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 rdma_xtr_v1_register_cmq_request_bodies）。
+// 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+//   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+// 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
 function automatic rdma_status rdma_xtr_v1_register_cmq_request_bodies(
   rdma_xtr_v1_cmq_body_registry registry
 );
@@ -1523,10 +1872,18 @@ endfunction
 class rdma_xtr_v1_cmq_envelope_codec extends uvm_object;
   `uvm_object_utils(rdma_xtr_v1_cmq_envelope_codec)
 
+  // 功能：初始化对象字段、同步 UVM 名称并建立可用的初始生命周期状态（接口 new）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function new(string name = "rdma_xtr_v1_cmq_envelope_codec");
     super.new(name);
   endfunction
 
+  // 功能：将模型或请求按硬件/协议布局编码为可传输的镜像或令牌（接口 encode）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function rdma_status encode(
     rdma_xtr_v1_cmq_envelope envelope,
     output rdma_hw_image image
@@ -1598,6 +1955,10 @@ class rdma_xtr_v1_cmq_request_composer extends uvm_object;
   local rdma_codec_registry qpc_codecs;
   local rdma_xtr_v1_cmq_body_token body_token;
 
+  // 功能：初始化对象字段、同步 UVM 名称并建立可用的初始生命周期状态（接口 new）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function new(
     string name = "rdma_xtr_v1_cmq_request_composer",
     rdma_xtr_v1_cmq_body_registry ownership = null,
@@ -1638,6 +1999,10 @@ class rdma_xtr_v1_cmq_request_composer extends uvm_object;
       `uvm_fatal("RDMA_CMQ_REGISTRY", status.convert2string())
   endfunction
 
+  // 功能：依据输入快照构造请求、资源或适配对象，并返回独立的结果载体（接口 build_body）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function rdma_status build_body(
     bit [7:0] opcode,
     rdma_hw_model model,
@@ -1646,10 +2011,18 @@ class rdma_xtr_v1_cmq_request_composer extends uvm_object;
     return mint_body(opcode, model, image);
   endfunction
 
+  // 功能：执行接口 codec_error 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 codec_error）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected function rdma_status codec_error(string message);
     return rdma_status::make(RDMA_SC_CODEC_ERROR, message);
   endfunction
 
+  // 功能：执行接口 images_match 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 images_match）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   local function bit images_match(
     rdma_hw_image lhs,
     rdma_hw_image rhs
@@ -1674,6 +2047,10 @@ class rdma_xtr_v1_cmq_request_composer extends uvm_object;
     return 1'b1;
   endfunction
 
+  // 功能：执行接口 envelopes_match 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 envelopes_match）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   local function bit envelopes_match(
     rdma_xtr_v1_cmq_envelope lhs,
     rdma_xtr_v1_cmq_envelope rhs
@@ -1687,6 +2064,10 @@ class rdma_xtr_v1_cmq_request_composer extends uvm_object;
            lhs.opcode == rhs.opcode;
   endfunction
 
+  // 功能：推进对象的运行/复位/恢复状态机，并清晰隔离旧 incarnation 的操作（接口 restore_envelope）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   local function void restore_envelope(
     rdma_xtr_v1_cmq_envelope destination,
     rdma_xtr_v1_cmq_envelope snapshot
@@ -1699,6 +2080,10 @@ class rdma_xtr_v1_cmq_request_composer extends uvm_object;
     destination.opcode = snapshot.opcode;
   endfunction
 
+  // 功能：执行接口 authenticate_body 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 authenticate_body）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   local function rdma_status authenticate_body(
     bit [7:0] opcode,
     rdma_hw_image image
@@ -1709,6 +2094,10 @@ class rdma_xtr_v1_cmq_request_composer extends uvm_object;
     return artifact.authenticate(body_token, opcode);
   endfunction
 
+  // 功能：将模型或请求按硬件/协议布局编码为可传输的镜像或令牌（接口 mint_body）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   local function rdma_status mint_body(
     bit [7:0] opcode,
     rdma_hw_model model,
@@ -1732,6 +2121,10 @@ class rdma_xtr_v1_cmq_request_composer extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：执行接口 image_word 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 image_word）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected function bit [63:0] image_word(
     rdma_hw_image image,
     int unsigned qword_index
@@ -1743,6 +2136,10 @@ class rdma_xtr_v1_cmq_request_composer extends uvm_object;
     return word;
   endfunction
 
+  // 功能：执行接口 context_key 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 context_key）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected function rdma_codec_key context_key(bit [7:0] opcode);
     rdma_codec_key key;
     key.hw_version = "xtr_v1";
@@ -1787,12 +2184,20 @@ class rdma_xtr_v1_cmq_request_composer extends uvm_object;
     return key;
   endfunction
 
+  // 功能：检查输入值、身份字段和当前生命周期约束，给出一致性判断或状态结果（接口 is_context_opcode）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected function bit is_context_opcode(bit [7:0] opcode);
     return opcode inside {XTR_V1_OP_KEY_ALLOC, XTR_V1_OP_MR_REGISTER,
                           XTR_V1_OP_CQC_CREATE, XTR_V1_OP_CEQC_CREATE,
                           XTR_V1_OP_AEQC_CREATE, XTR_V1_OP_SRFQC_CREATE};
   endfunction
 
+  // 功能：检查输入值、身份字段和当前生命周期约束，给出一致性判断或状态结果（接口 validate_context_identity）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected function rdma_status validate_context_identity(
     bit [7:0] opcode,
     rdma_hw_image body
@@ -1811,6 +2216,10 @@ class rdma_xtr_v1_cmq_request_composer extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：检查输入值、身份字段和当前生命周期约束，给出一致性判断或状态结果（接口 validate_image_metadata）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected function rdma_status validate_image_metadata(
     rdma_hw_image image,
     rdma_image_kind_e expected_kind,
@@ -1834,6 +2243,10 @@ class rdma_xtr_v1_cmq_request_composer extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：检查输入值、身份字段和当前生命周期约束，给出一致性判断或状态结果（接口 validate_qpc_mode_image）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected function rdma_status validate_qpc_mode_image(
     bit [7:0] opcode,
     rdma_hw_image body,
@@ -1891,6 +2304,10 @@ class rdma_xtr_v1_cmq_request_composer extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：检查输入值、身份字段和当前生命周期约束，给出一致性判断或状态结果（接口 validate_qpc_signature_source）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected function rdma_status validate_qpc_signature_source(
     rdma_hw_image source,
     rdma_hw_image body
@@ -1958,6 +2375,10 @@ class rdma_xtr_v1_cmq_request_composer extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：依据输入快照构造请求、资源或适配对象，并返回独立的结果载体（接口 compose_request）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function rdma_status compose_request(
     rdma_xtr_v1_cmq_envelope envelope,
     rdma_hw_image body,

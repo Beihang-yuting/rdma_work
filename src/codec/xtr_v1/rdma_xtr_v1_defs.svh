@@ -1,3 +1,8 @@
+// 目录：硬件编解码层 codec/xtr_v1/rdma_xtr_v1_defs.svh。
+// 职责：提供可文本包含的宏、固定字段或掩码定义；不持有运行期对象。
+// 依赖：依赖对应 codec package 的字段约定和编译期常量。
+// 所有权与生命周期：宏/常量由包含它的编译单元拥有，生命周期为编译期。
+
 // xtr_v1 hardware definition baseline, pinned by tools/check_xtr_v1_defs.py.
 // OFFSET is a pre-serialization logical qword bit coordinate:
 //   WORD_BYTE_OFFSET * 8 + LSB.

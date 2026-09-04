@@ -1,3 +1,8 @@
+// 目录：设备集成层 integration/rdma_host_mem_router.sv。
+// 职责：实现 rdma_host_mem_router 在本层的职责和对外接口。
+// 依赖：依赖本层公共 types/model/adapter 契约及其上游快照。
+// 所有权与生命周期：对象只拥有显式创建的值快照；外部资源保存非拥有引用，生命周期由调用方管理。
+
 // 中文说明：本文件位于 integration/，是 dpu_common topology 与外部
 // Host-memory manager 的唯一路由边界。router 不拥有 manager 或 mapping
 // 的底层存储，只按 Host route 选择 manager，并保存 allocation 时的

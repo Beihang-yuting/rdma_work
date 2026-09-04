@@ -16,6 +16,9 @@ class rdma_device_env extends uvm_object;
   // 按 dpu_common 的完整 Function key 保存身份副本，供各 Function
   // context 和 reset coordinator 共享同一份 immutable authority。
   protected rdma_function_identity m_identities[string];
+  // Context 索引与 identity ledger 使用同一完整 Function key；value 由 env
+  // 创建并持有，外部只通过 find_*() 获取非拥有引用，避免调用方绕过 scope 校验。
+  protected rdma_function_context m_contexts[string];
   // 功能：构造空的设备环境对象并初始化 UVM 对象名称；实际依赖绑定由 build() 完成。
   function new(string name="rdma_device_env");
     super.new(name);
@@ -39,6 +42,8 @@ class rdma_device_env extends uvm_object;
   );
     dpu_function_key_t keys[$];
     rdma_function_identity identity;
+    rdma_function_binding binding;
+    rdma_function_context context;
     rdma_reset_coordinator selected_coordinator;
     rdma_device_env candidate_env;
     string key_name;
@@ -70,18 +75,30 @@ class rdma_device_env extends uvm_object;
     candidate_env.pcie = source_pcie;
     candidate_env.reset_coordinator = selected_coordinator;
     candidate_env.m_identities.delete();
+    candidate_env.m_contexts.delete();
 
     source_device_snapshot.list_functions(keys);
     foreach (keys[index]) begin
       identity = null;
-      status = rdma_dpu_identity_adapter::identity_from_snapshot(
-        source_device_snapshot, keys[index], identity);
-      if (!status.ok() || identity == null)
+      binding = null;
+      status = rdma_dpu_identity_adapter::from_snapshot(
+        source_device_snapshot, source_resources, keys[index], identity, binding);
+      if (!status.ok() || identity == null || binding == null)
         return rdma_status::make(RDMA_SC_INVALID_STATE,
-          {"Function identity projection failed: ", status.message});
+          {"Function identity/binding projection failed: ", status.message});
+      // dpu_common key 名称含 PF ID，而 RDMA identity 用 BDF 作为 PF 身份；
+      // 两套字符串不能互相拼接，故分别维护 dpu identity ledger 和 RDMA context index。
       key_name = dpu_function_key_name(keys[index]);
       candidate_env.m_identities[key_name] = identity;
-      selected_coordinator.register_function(identity);
+      key_name = identity_key_name(identity.key);
+      context = null;
+      status = rdma_function_context::build(
+        identity, source_resources, source_host_mem, source_pcie,
+        registry, build_timeout, context, selected_coordinator, binding);
+      if (!status.ok() || context == null)
+        return rdma_status::make(RDMA_SC_INVALID_STATE,
+          {"Function context build failed: ", status.message});
+      candidate_env.m_contexts[key_name] = context;
     end
     // registry/timeout 保留在 API 中用于上层兼容；Device env 只保存已经
     // 校验过的 dpu_common snapshot 和唯一 reset coordinator。
@@ -102,5 +119,85 @@ class rdma_device_env extends uvm_object;
     if (cloned_object == null || !$cast(copy, cloned_object))
       return null;
     return copy;
+  endfunction
+
+  // 功能：将 RDMA identity 的完整 Host/root/VF/BDF 路由编码为内部索引键。
+  // 输入：identity_key 只读访问其值字段；输出键不依赖任何 dpu_common class 句柄。
+  protected static function string identity_key_name(
+    rdma_function_key_t identity_key
+  );
+    return $sformatf("%0d:%0d:%0d:%0d:%0d:%0d:%0d:%0d",
+                     identity_key.host_topology_key,
+                     identity_key.root_id,
+                     identity_key.function_kind,
+                     identity_key.vf_index,
+                     identity_key.bdf.segment,
+                     identity_key.bdf.bus,
+                     identity_key.bdf.device,
+                     identity_key.bdf.function_num);
+  endfunction
+
+  // 功能：按完整 identity 查找已枚举的 Function context，并校验调用方提供的
+  //       identity 与 env 保存的 incarnation 一致。
+  // 输入/输出：identity 为查询 authority，result_context 返回 env 持有的 context 引用。
+  // 边界：identity 为空、key 不存在或 generation/epoch 不一致时返回明确错误状态。
+  function rdma_status find_function(
+    rdma_function_identity identity,
+    output rdma_function_context result_context
+  );
+    string key_name;
+    result_context = null;
+    if (identity == null)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "Function identity is null");
+    key_name = identity_key_name(identity.key);
+    if (!m_contexts.exists(key_name) || m_contexts[key_name] == null)
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "Function context is not enumerated");
+    if (m_contexts[key_name].identity == null ||
+        !m_contexts[key_name].identity.same_incarnation(identity))
+      return rdma_status::make(RDMA_SC_STALE_GENERATION,
+                               "Function identity incarnation is stale");
+    result_context = m_contexts[key_name];
+    return rdma_status::success();
+  endfunction
+
+  // 功能：按 Function handle 反查 context，保证 UID、global ID 和 generation 三元组
+  //       与 env 的 immutable identity 完全匹配，避免同一 Host 上本地编号串线。
+  // 输入/输出：function_handle 为待查找的 Function 句柄，result_context 返回 context 引用。
+  // 边界：句柄为空/类型错误返回 INVALID_ARGUMENT；UID 存在但 generation 过期返回 STALE。
+  function rdma_status find_handle(
+    rdma_handle function_handle,
+    output rdma_function_context result_context
+  );
+    rdma_function_context candidate;
+    string key_name;
+    result_context = null;
+
+    if (function_handle == null ||
+        function_handle.kind != RDMA_RESOURCE_FUNCTION)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "Function handle is invalid");
+    foreach (m_contexts[key_name]) begin
+      candidate = m_contexts[key_name];
+      if (candidate == null || candidate.identity == null)
+        continue;
+      if (candidate.identity.function_uid == function_handle.function_uid &&
+          candidate.identity.global_function_id == function_handle.object_id) begin
+        if (candidate.identity.generation != function_handle.generation)
+          return rdma_status::make(RDMA_SC_STALE_GENERATION,
+                                   "Function handle generation is stale");
+        result_context = candidate;
+        return rdma_status::success();
+      end
+    end
+    return rdma_status::make(RDMA_SC_INVALID_STATE,
+                             "Function handle is not enumerated");
+  endfunction
+
+  // 功能：返回当前 device env 已枚举的 Function context 数量，供上层完成拓扑覆盖检查。
+  // 输出：返回值为 context 索引条目数；函数只读，不改变 env 状态。
+  function int unsigned context_count();
+    return m_contexts.num();
   endfunction
 endclass

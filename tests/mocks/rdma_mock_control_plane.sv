@@ -1,3 +1,8 @@
+// 目录：测试层 mocks/rdma_mock_control_plane.sv。
+// 职责：验证 rdma_mock_control_plane 对应模块的接口、错误路径和边界行为。
+// 依赖：依赖被测 package、UVM 测试基类和必要的 mock/fixture。
+// 所有权与生命周期：测试对象只拥有本地 fixture；外部后端句柄由测试环境提供并在测试结束释放。
+
 // 中文说明：rdma_mock_control_plane.sv 属于测试替身，为单元测试提供可控的适配器和控制面行为。
 // 阅读提示：先看公开类型和接口，再看实现细节；失败路径应保持状态与资源所有权可追踪。
 
@@ -8,6 +13,10 @@ class rdma_mock_stag_key_policy extends rdma_stag_key_policy;
   int unsigned call_count;
   protected rdma_status next_failure;
 
+  // 功能：初始化对象字段、同步 UVM 名称并建立可用的初始生命周期状态（接口 new）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function new(string name = "rdma_mock_stag_key_policy");
     super.new(name);
     fixed_key = '0;
@@ -15,6 +24,10 @@ class rdma_mock_stag_key_policy extends rdma_stag_key_policy;
     next_failure = null;
   endfunction
 
+  // 功能：执行接口 fail_next 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 fail_next）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function rdma_status fail_next(rdma_status failure);
     if (failure == null)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
@@ -23,6 +36,10 @@ class rdma_mock_stag_key_policy extends rdma_stag_key_policy;
     return rdma_status::success();
   endfunction
 
+  // 功能：执行接口 derive 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 derive）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function rdma_status derive(
     rdma_mr mr,
     output bit [7:0] stag_key
@@ -48,6 +65,10 @@ class rdma_fault_inject_resource_manager extends rdma_resource_manager;
   protected rdma_status role_failures[string];
   protected int unsigned transition_ordinals[string];
 
+  // 功能：初始化对象字段、同步 UVM 名称并建立可用的初始生命周期状态（接口 new）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function new(string name = "rdma_fault_inject_resource_manager");
     super.new(name);
     release_reserved_calls = 0;
@@ -55,6 +76,10 @@ class rdma_fault_inject_resource_manager extends rdma_resource_manager;
     role_failures.delete(); transition_ordinals.delete();
   endfunction
 
+  // 功能：执行接口 fail_next_transition 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 fail_next_transition）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function rdma_status fail_next_transition(
     string transition_name,
     rdma_status failure
@@ -74,6 +99,10 @@ class rdma_fault_inject_resource_manager extends rdma_resource_manager;
     return rdma_status::success();
   endfunction
 
+  // 功能：执行接口 fail_role_call 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 fail_role_call）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function void fail_role_call(string method_name,
                                rdma_queue_backing_role_e role,
                                int unsigned ordinal,
@@ -83,11 +112,19 @@ class rdma_fault_inject_resource_manager extends rdma_resource_manager;
         rdma_cmq_clone_status_value(failure);
   endfunction
 
+  // 功能：推进对象的运行/复位/恢复状态机，并清晰隔离旧 incarnation 的操作（接口 reset）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function void reset();
     transition_failures.delete(); role_failures.delete();
     transition_ordinals.delete(); release_reserved_calls = 0;
   endfunction
 
+  // 功能：执行接口 stage_allocated 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 stage_allocated）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function rdma_status stage_allocated(rdma_resource candidate);
     rdma_status failure;
 
@@ -99,6 +136,10 @@ class rdma_fault_inject_resource_manager extends rdma_resource_manager;
     return super.stage_allocated(candidate);
   endfunction
 
+  // 功能：原子地预留或获取所需资源/游标，并记录后续提交所需的所有权证据（接口 take_transition_failure）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected function rdma_status take_transition_failure(
     string transition_name,
     rdma_queue_backing_role_e role
@@ -125,6 +166,10 @@ class rdma_fault_inject_resource_manager extends rdma_resource_manager;
     return failure;
   endfunction
 
+  // 功能：执行接口 queue_role_for_kind 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 queue_role_for_kind）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected function rdma_queue_backing_role_e queue_role_for_kind(
     rdma_resource_kind_e kind
   );
@@ -136,6 +181,10 @@ class rdma_fault_inject_resource_manager extends rdma_resource_manager;
     endcase
   endfunction
 
+  // 功能：提交已验证的状态迁移或消费结果，推进游标/账本并保持幂等边界（接口 commit_programmed）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function rdma_status commit_programmed(rdma_resource candidate);
     rdma_status failure;
 
@@ -147,6 +196,10 @@ class rdma_fault_inject_resource_manager extends rdma_resource_manager;
     return super.commit_programmed(candidate);
   endfunction
 
+  // 功能：推进对象的运行/复位/恢复状态机，并清晰隔离旧 incarnation 的操作（接口 activate）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function rdma_status activate(rdma_handle handle);
     rdma_status failure;
 
@@ -157,6 +210,10 @@ class rdma_fault_inject_resource_manager extends rdma_resource_manager;
     return super.activate(handle);
   endfunction
 
+  // 功能：释放、撤销或回滚当前对象持有的事务/资源，并保持账本与生命周期一致（接口 release_reserved）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function rdma_status release_reserved(rdma_handle handle);
     rdma_status failure;
 
@@ -168,6 +225,10 @@ class rdma_fault_inject_resource_manager extends rdma_resource_manager;
     return super.release_reserved(handle);
   endfunction
 
+  // 功能：执行接口 mark_error 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 mark_error）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function rdma_status mark_error(
     rdma_handle handle,
     rdma_recovery_record recovery
@@ -183,6 +244,10 @@ class rdma_fault_inject_resource_manager extends rdma_resource_manager;
     return super.mark_error(handle, recovery);
   endfunction
 
+  // 功能：提交已验证的状态迁移或消费结果，推进游标/账本并保持幂等边界（接口 complete_reserved_error）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function rdma_status complete_reserved_error(
     rdma_handle handle
   );
@@ -195,6 +260,10 @@ class rdma_fault_inject_resource_manager extends rdma_resource_manager;
     return super.complete_reserved_error(handle);
   endfunction
 
+  // 功能：执行接口 record_queue_context_cleanup_complete 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 record_queue_context_cleanup_complete）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function rdma_status record_queue_context_cleanup_complete(
     rdma_handle handle
   );
@@ -208,6 +277,10 @@ class rdma_fault_inject_resource_manager extends rdma_resource_manager;
     return super.record_queue_context_cleanup_complete(handle);
   endfunction
 
+  // 功能：执行接口 record_queue_cleanup_complete 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 record_queue_cleanup_complete）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function rdma_status record_queue_cleanup_complete(
     rdma_handle handle,
     rdma_queue_backing_role_e role
@@ -229,6 +302,10 @@ class rdma_mock_cmq_call extends uvm_object;
   rdma_cmq_command_desc command;
   rdma_cmq_ticket ticket;
 
+  // 功能：初始化对象字段、同步 UVM 名称并建立可用的初始生命周期状态（接口 new）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function new(string name = "rdma_mock_cmq_call");
     super.new(name);
     \sequence  = 0;
@@ -237,6 +314,10 @@ class rdma_mock_cmq_call extends uvm_object;
     ticket = null;
   endfunction
 
+  // 功能：把源对象投影/克隆为当前类型的独立值快照，避免共享可变引用（接口 do_copy）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function void do_copy(uvm_object rhs);
     rdma_mock_cmq_call rhs_call;
     uvm_object cloned_object;
@@ -264,6 +345,10 @@ typedef enum bit {
 class rdma_mock_cmq_snapshot_engine extends rdma_cmq_engine;
   `uvm_object_utils(rdma_mock_cmq_snapshot_engine)
 
+  // 功能：初始化对象字段、同步 UVM 名称并建立可用的初始生命周期状态（接口 new）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function new(string name = "rdma_mock_cmq_snapshot_engine");
     super.new(name);
     profile = rdma_xtr_v1_cmq_hw_profile::type_id::create(
@@ -271,6 +356,10 @@ class rdma_mock_cmq_snapshot_engine extends rdma_cmq_engine;
     );
   endfunction
 
+  // 功能：读取或查询当前对象的权威状态，并以返回值或 output 参数交付快照（接口 snapshot_command_for_mock）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function rdma_status snapshot_command_for_mock(
     rdma_cmq_command_desc source,
     output rdma_cmq_command_desc snapshot,
@@ -289,6 +378,10 @@ class rdma_mock_cmq_outcome extends uvm_object;
   // Optional decoded payload used by scripted QUERY completions.
   uvm_object decoded_response;
 
+  // 功能：初始化对象字段、同步 UVM 名称并建立可用的初始生命周期状态（接口 new）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function new(string name = "rdma_mock_cmq_outcome");
     super.new(name);
     kind = RDMA_MOCK_CMQ_COMPLETION;
@@ -304,6 +397,10 @@ class rdma_mock_cmq_reconcile_script extends uvm_object;
   rdma_cmq_completion completion;
   rdma_status status;
 
+  // 功能：初始化对象字段、同步 UVM 名称并建立可用的初始生命周期状态（接口 new）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function new(string name = "rdma_mock_cmq_reconcile_script");
     super.new(name);
     terminal_known = 1'b0;
@@ -335,6 +432,10 @@ class rdma_mock_cmq_port extends rdma_cmq_port;
   protected rdma_status role_failures[string];
   protected int unsigned method_ordinals[string];
 
+  // 功能：初始化对象字段、同步 UVM 名称并建立可用的初始生命周期状态（接口 new）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function new(string name = "rdma_mock_cmq_port");
     super.new(name);
     calls.delete();
@@ -357,14 +458,26 @@ class rdma_mock_cmq_port extends rdma_cmq_port;
     );
   endfunction
 
+  // 功能：执行接口 last_execute_definitive_no_submit 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 last_execute_definitive_no_submit）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual function bit last_execute_definitive_no_submit();
     return last_execute_no_submit_proven;
   endfunction
 
+  // 功能：写入并校验运行所需的配置、身份或资源参数，建立后续操作的边界（接口 set_call_trace）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function void set_call_trace(rdma_mock_call_trace trace);
     call_trace = trace;
   endfunction
 
+  // 功能：执行接口 gate_opcode 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 gate_opcode）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function void gate_opcode(bit [7:0] opcode);
     gate_opcode_count(opcode, 1);
   endfunction
@@ -372,10 +485,18 @@ class rdma_mock_cmq_port extends rdma_cmq_port;
   // Lifecycle-test naming for the CMQ pause barrier.  The gate only waits on
   // the selected opcode and does not hold any adapter mutex, so other
   // Functions may continue to enter execute().
+  // 功能：执行接口 pause_cmq_opcode 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 pause_cmq_opcode）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   task pause_cmq_opcode(bit [7:0] opcode);
     gate_opcode(opcode);
   endtask
 
+  // 功能：执行接口 wait_until_paused 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 wait_until_paused）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   task wait_until_paused(bit [7:0] opcode);
     bit observed;
     while (!gate_enabled || gated_opcode != opcode || gate_entered_count == 0)
@@ -383,11 +504,19 @@ class rdma_mock_cmq_port extends rdma_cmq_port;
     observed = 1'b1;
   endtask
 
+  // 功能：释放、撤销或回滚当前对象持有的事务/资源，并保持账本与生命周期一致（接口 release_cmq_opcode）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function void release_cmq_opcode(bit [7:0] opcode);
     if (gate_enabled && gated_opcode == opcode)
       release_one();
   endfunction
 
+  // 功能：执行接口 fail_role_call 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 fail_role_call）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function void fail_role_call(string method_name,
                                rdma_queue_backing_role_e role,
                                int unsigned ordinal,
@@ -398,6 +527,10 @@ class rdma_mock_cmq_port extends rdma_cmq_port;
     end
   endfunction
 
+  // 功能：推进对象的运行/复位/恢复状态机，并清晰隔离旧 incarnation 的操作（接口 reset）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function void reset();
     calls.delete(); outcomes.delete(); late_completions.delete();
     reconcile_scripts.delete(); next_sequence = 1;
@@ -410,6 +543,10 @@ class rdma_mock_cmq_port extends rdma_cmq_port;
 
   // Hold all matching CMQ executions until release_one(), allowing tests to
   // establish a deterministic multi-Function barrier.
+  // 功能：执行接口 gate_opcode_count 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 gate_opcode_count）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function void gate_opcode_count(bit [7:0] opcode, int unsigned count);
     gated_opcode = opcode;
     gate_enabled = 1'b1;
@@ -419,6 +556,10 @@ class rdma_mock_cmq_port extends rdma_cmq_port;
     entered.reset();
   endfunction
 
+  // 功能：执行接口 wait_until_entered 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 wait_until_entered）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   task wait_until_entered(
     int unsigned expected_count,
     time timeout,
@@ -438,19 +579,35 @@ class rdma_mock_cmq_port extends rdma_cmq_port;
     disable wait_for_mock_cmq_gate;
   endtask
 
+  // 功能：释放、撤销或回滚当前对象持有的事务/资源，并保持账本与生命周期一致（接口 release_one）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   task release_one();
     gate_enabled = 1'b0;
     release_gate.trigger();
   endtask
 
+  // 功能：执行接口 invalid_argument 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 invalid_argument）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected function rdma_status invalid_argument(string message);
     return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, message);
   endfunction
 
+  // 功能：执行接口 invalid_state 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 invalid_state）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected function rdma_status invalid_state(string message);
     return rdma_status::make(RDMA_SC_INVALID_STATE, message);
   endfunction
 
+  // 功能：执行接口 execute_role 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 execute_role）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected function rdma_queue_backing_role_e execute_role(
     bit [7:0] opcode,
     int unsigned flush_ordinal
@@ -483,6 +640,10 @@ class rdma_mock_cmq_port extends rdma_cmq_port;
     endcase
   endfunction
 
+  // 功能：原子地预留或获取所需资源/游标，并记录后续提交所需的所有权证据（接口 take_role_failure）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected function rdma_status take_role_failure(
     string method_name,
     rdma_queue_backing_role_e role,
@@ -498,6 +659,10 @@ class rdma_mock_cmq_port extends rdma_cmq_port;
     return failure;
   endfunction
 
+  // 功能：检查输入值、身份字段和当前生命周期约束，给出一致性判断或状态结果（接口 same_ticket）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected function bit same_ticket(
     rdma_cmq_ticket lhs,
     rdma_cmq_ticket rhs
@@ -517,6 +682,10 @@ class rdma_mock_cmq_port extends rdma_cmq_port;
            lhs.absolute_deadline == rhs.absolute_deadline;
   endfunction
 
+  // 功能：执行接口 ticket_key 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 ticket_key）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected function string ticket_key(rdma_cmq_ticket ticket);
     return $sformatf(
       "%016h:%08h:%08h:%016h:%016h:%08h:%0b",
@@ -530,6 +699,10 @@ class rdma_mock_cmq_port extends rdma_cmq_port;
     );
   endfunction
 
+  // 功能：执行接口 ticket_was_recorded 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 ticket_was_recorded）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected function bit ticket_was_recorded(rdma_cmq_ticket ticket);
     foreach (calls[i]) begin
       if (calls[i] != null && same_ticket(calls[i].ticket, ticket))
@@ -538,6 +711,10 @@ class rdma_mock_cmq_port extends rdma_cmq_port;
     return 1'b0;
   endfunction
 
+  // 功能：读取或查询当前对象的权威状态，并以返回值或 output 参数交付快照（接口 snapshot_command）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected function rdma_status snapshot_command(
     rdma_cmq_command_desc source,
     output rdma_cmq_command_desc snapshot
@@ -573,6 +750,10 @@ class rdma_mock_cmq_port extends rdma_cmq_port;
     return rdma_status::success();
   endfunction
 
+  // 功能：依据输入快照构造请求、资源或适配对象，并返回独立的结果载体（接口 make_ticket）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected function rdma_status make_ticket(
     rdma_cmq_command_desc command,
     longint unsigned call_sequence,
@@ -618,6 +799,10 @@ class rdma_mock_cmq_port extends rdma_cmq_port;
     return rdma_status::success();
   endfunction
 
+  // 功能：依据输入快照构造请求、资源或适配对象，并返回独立的结果载体（接口 make_completion）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   protected function rdma_cmq_completion make_completion(
     rdma_cmq_ticket ticket,
     rdma_status result_status,
@@ -663,6 +848,10 @@ class rdma_mock_cmq_port extends rdma_cmq_port;
     return completion;
   endfunction
 
+  // 功能：执行接口 fail_opcode 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 fail_opcode）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function void fail_opcode(bit [7:0] opcode, rdma_status status);
     rdma_mock_cmq_outcome outcome;
 
@@ -672,6 +861,10 @@ class rdma_mock_cmq_port extends rdma_cmq_port;
     outcomes[opcode].push_back(outcome);
   endfunction
 
+  // 功能：执行接口 timeout_opcode 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 timeout_opcode）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function void timeout_opcode(bit [7:0] opcode);
     rdma_mock_cmq_outcome outcome;
 
@@ -684,6 +877,10 @@ class rdma_mock_cmq_port extends rdma_cmq_port;
   // Queue recovery tests can prescribe reconciliation independently of the
   // late-completion FIFO.  The script is keyed by the complete ticket
   // identity, so unrelated commands cannot consume its terminal evidence.
+  // 功能：执行接口 script_reconcile 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 script_reconcile）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function void script_reconcile(
     rdma_cmq_ticket ticket,
     bit terminal_known,
@@ -721,6 +918,10 @@ class rdma_mock_cmq_port extends rdma_cmq_port;
   // Script a terminal QUERY result.  Response payload may be a
   // rdma_xtr_v1_cmq_completion payload or any other uvm_object; the policy
   // classifier decides whether the object is authentic evidence.
+  // 功能：执行接口 script_query_context 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 script_query_context）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function void script_query_context(
     bit [7:0] opcode,
     uvm_object response_context,
@@ -741,6 +942,10 @@ class rdma_mock_cmq_port extends rdma_cmq_port;
     outcomes[opcode].push_back(outcome);
   endfunction
 
+  // 功能：向目标后端提交数据/事务并更新本对象的进度或账本状态（接口 push_late_completion）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function void push_late_completion(
     rdma_cmq_ticket ticket,
     rdma_status status
@@ -761,6 +966,10 @@ class rdma_mock_cmq_port extends rdma_cmq_port;
     late_completions[key].push_back(completion);
   endfunction
 
+  // 功能：读取或查询当前对象的权威状态，并以返回值或 output 参数交付快照（接口 get_opcodes）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   function void get_opcodes(output bit [7:0] values[$]);
     values.delete();
     foreach (calls[i]) begin
@@ -769,6 +978,10 @@ class rdma_mock_cmq_port extends rdma_cmq_port;
     end
   endfunction
 
+  // 功能：执行接口 execute 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 execute）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual task execute(
     rdma_cmq_command_desc command,
     output rdma_cmq_ticket ticket,
@@ -918,6 +1131,10 @@ class rdma_mock_cmq_port extends rdma_cmq_port;
     end
   endtask
 
+  // 功能：执行接口 reconcile 的职责逻辑，完成本对象对输入事务的处理和状态维护（接口 reconcile）。
+  // 输入/输出及副作用：输入参数和 output/inout 参数以签名为准；返回值传递状态或结果，
+  //   void/task 通过对象字段、队列或日志产生副作用，不转移未声明的资源所有权。
+  // 失败/边界：空句柄、非法枚举、越界值或生命周期不满足时拒绝操作并返回错误（若有返回值）。
   virtual task reconcile(
     rdma_cmq_ticket ticket,
     output bit terminal_known,
