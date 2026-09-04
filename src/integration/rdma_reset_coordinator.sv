@@ -10,7 +10,9 @@ class rdma_reset_coordinator extends uvm_object;
   protected rdma_reset_epoch_t m_host_epochs[int unsigned];
   protected rdma_reset_epoch_t m_device_epoch;
   protected rdma_host_mem_router m_host_router;
-  protected rdma_function_identity m_functions[$];
+  // 以稳定 route key 建立关联数组，避免 VCS 在跨 package/static function
+  // 调用中对 class queue 的 copy-on-write 行为造成登记条目丢失。
+  protected rdma_function_identity m_functions[string];
   // 功能：初始化设备级 epoch 为零并建立空的 Function/Host ledger。
   function new(string name="rdma_reset_coordinator");
     super.new(name);
@@ -30,23 +32,28 @@ class rdma_reset_coordinator extends uvm_object;
   function void register_function(rdma_function_identity identity);
     rdma_function_identity snapshot;
     uvm_object cloned_object;
+    string name;
+
     if (identity == null)
       return;
     // coordinator 保存的是注册时的身份快照；调用方后续修改原对象不能
     // 改写 reset 影响范围，否则 PF/VF 级联会出现不可追踪的漂移。
-    foreach (m_functions[i])
-      if (m_functions[i].same_incarnation(identity))
-        return;
+    name = identity_name(identity);
+    if (m_functions.exists(name) &&
+        m_functions[name].same_incarnation(identity))
+      return;
     cloned_object = identity.clone();
     if (cloned_object == null || !$cast(snapshot, cloned_object))
       `uvm_fatal("RDMA_RESET", "Function identity clone failed")
-    m_functions.push_back(snapshot);
+    m_functions[name] = snapshot;
   endfunction
   // 功能：按稳定 Function UID 查询当前 epoch；UID 未登记时返回零，保持查询幂等。
   function rdma_reset_epoch_t function_epoch_uid(longint unsigned uid);
-    foreach (m_functions[i])
-      if (m_functions[i].function_uid == uid)
-        return function_epoch(m_functions[i]);
+    string name;
+
+    foreach (m_functions[name])
+      if (m_functions[name].function_uid == uid)
+        return function_epoch(m_functions[name]);
     return 0;
   endfunction
 
@@ -67,6 +74,7 @@ class rdma_reset_coordinator extends uvm_object;
   // 边界：null 或非 PF identity 返回 INVALID_ARGUMENT；PF 尚未登记时仍推进其 ledger。
   function rdma_status request_pf_reset(rdma_function_identity identity);
     bit found_pf;
+    string name;
 
     if (identity == null)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
@@ -76,16 +84,16 @@ class rdma_reset_coordinator extends uvm_object;
                                "PF reset requires PF identity");
 
     found_pf = 0;
-    foreach (m_functions[i]) begin
-      if (m_functions[i].key.host_topology_key ==
+    foreach (m_functions[name]) begin
+      if (m_functions[name].key.host_topology_key ==
             identity.key.host_topology_key &&
-          ((m_functions[i].key.function_kind == RDMA_FUNCTION_PF &&
-            rdma_bdf_same(m_functions[i].key.bdf, identity.key.bdf)) ||
-           (m_functions[i].key.function_kind == RDMA_FUNCTION_VF &&
-            rdma_bdf_same(m_functions[i].key.parent_pf_bdf,
+          ((m_functions[name].key.function_kind == RDMA_FUNCTION_PF &&
+            rdma_bdf_same(m_functions[name].key.bdf, identity.key.bdf)) ||
+           (m_functions[name].key.function_kind == RDMA_FUNCTION_VF &&
+            rdma_bdf_same(m_functions[name].key.parent_pf_bdf,
                           identity.key.bdf)))) begin
-        bump_function(m_functions[i]);
-        if (m_functions[i].key.function_kind == RDMA_FUNCTION_PF)
+        bump_function(m_functions[name]);
+        if (m_functions[name].key.function_kind == RDMA_FUNCTION_PF)
           found_pf = 1;
       end
     end
@@ -97,21 +105,25 @@ class rdma_reset_coordinator extends uvm_object;
   // 功能：推进指定 Host epoch，并对该 Host 上登记的全部 Function 级联 bump。
   // 副作用：若已连接 Host router，则同步调用 advance_host_epoch() 使本地 mapping 失效。
   function rdma_status request_host_reset(int unsigned host_topology_key);
+    string name;
+
     m_host_epochs[host_topology_key] = m_host_epochs.exists(host_topology_key) ?
                                        m_host_epochs[host_topology_key] + 1 : 1;
     if (m_host_router != null)
       m_host_router.advance_host_epoch(host_topology_key);
-    foreach (m_functions[i]) begin
-      if (m_functions[i].key.host_topology_key == host_topology_key)
-        bump_function(m_functions[i]);
+    foreach (m_functions[name]) begin
+      if (m_functions[name].key.host_topology_key == host_topology_key)
+        bump_function(m_functions[name]);
     end
     return rdma_status::success();
   endfunction
   // 功能：推进全局 Device epoch，并使所有已登记 Function 的 DMA 身份同时失效。
   function rdma_status request_device_reset();
+    string name;
+
     m_device_epoch++;
-    foreach (m_functions[i])
-      bump_function(m_functions[i]);
+    foreach (m_functions[name])
+      bump_function(m_functions[name]);
     return rdma_status::success();
   endfunction
 
@@ -132,6 +144,12 @@ class rdma_reset_coordinator extends uvm_object;
   // 功能：返回当前全局 Device reset epoch，供 mapping 分解校验使用。
   function rdma_reset_epoch_t device_epoch();
     return m_device_epoch;
+  endfunction
+
+  // 功能：返回 reset ledger 中已登记的 Function 数量，供 device env 构建后
+  //       的拓扑覆盖检查和调试诊断使用；函数只读，不改变任何 epoch。
+  function int unsigned function_count();
+    return m_functions.num();
   endfunction
 
   // 功能：将单个 Function 的局部 epoch 加一；仅由 reset 范围判定函数调用。

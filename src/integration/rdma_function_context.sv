@@ -46,6 +46,29 @@ class rdma_function_context extends uvm_object;
     rdma_reset_coordinator coordinator = null,
     rdma_function_binding source_binding = null
   );
+    // 兼容入口保留历史参数顺序；实际构造统一走参数顺序稳定的共享实现。
+    return build_shared(source_identity, source_resources, source_host_mem,
+                        source_pcie, coordinator, source_binding, registry,
+                        build_timeout, result_context);
+  endfunction
+
+  // 功能：使用显式的 coordinator 参数构造 Function context，供 device env
+  //       在多 Function 拓扑中保证所有 context 共享同一 reset ledger。
+  // 输入：coordinator/source_binding 必须位于 output 参数之前，规避部分 VCS
+  //       版本对 output 后可选 class 参数的解析差异；其余约束与 build() 相同。
+  // 输出：result_context 返回绑定 identity、binding、router 和 coordinator 的新对象。
+  // 边界：任一依赖校验或克隆失败时返回错误，result_context 保持 null，不产生半成品。
+  static function rdma_status build_shared(
+    rdma_function_identity source_identity,
+    dpu_resource_snapshot source_resources,
+    rdma_host_mem_router source_host_mem,
+    rdma_pcie_router source_pcie,
+    rdma_reset_coordinator coordinator,
+    rdma_function_binding source_binding,
+    uvm_object registry,
+    time build_timeout,
+    output rdma_function_context result_context
+  );
     rdma_function_identity identity_copy;
     rdma_function_binding binding_copy;
     rdma_resource_manager manager;
@@ -65,8 +88,6 @@ class rdma_function_context extends uvm_object;
       return rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED,
                                "Function identity clone failed");
 
-    // 优先复制上层已完成的 binding；没有 binding 时仍创建一个由 identity
-    // 派生的最小投影，后续由外部资源配置补齐 BAR/capability 后再激活数据面。
     if (source_binding != null) begin
       cloned_object = source_binding.clone();
       if (cloned_object == null || !$cast(binding_copy, cloned_object))
@@ -97,8 +118,7 @@ class rdma_function_context extends uvm_object;
     coordinator.register_function(identity_copy);
     result_context.reset_coordinator = coordinator;
     result_context.state = RDMA_CONTEXT_DISCOVERED;
-    // registry/timeout 由上层 resource manager 使用；context 本身不持有
-    // registry 的可变内部状态，只保留可选的 manager 观察句柄。
+    // build_timeout 保留在兼容签名中；context 构造不引入隐式延迟。
     return rdma_status::success();
   endfunction
 
@@ -136,10 +156,11 @@ class rdma_function_context extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：发布新的 Function generation/reset epoch，并在 quiesce 边界后重新激活。
+  // 功能：发布新的 Function generation/reset epoch，并在 quiesce 边界后重新激活；
+  //       尚未 activate 的 context 也会更新 authority，但保持 DISCOVERED 状态。
   // 输入：new_generation 必须非零；new_epoch 由 reset coordinator 提供。
   // 副作用：替换 identity/binding 的 detached 快照，使旧 handle 在下游校验中失效。
-  // 边界：未 quiesce、generation 为零或参数溢出时拒绝；不自动重放旧 queue 事务。
+  // 边界：QUARANTINED、generation 为零或参数溢出时拒绝；不自动重放旧 queue 事务。
   function rdma_status reset(
     int unsigned new_generation,
     rdma_reset_epoch_t new_epoch
@@ -150,9 +171,9 @@ class rdma_function_context extends uvm_object;
     if (new_generation == 0)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "new Function generation is zero");
-    if (identity == null || state == RDMA_CONTEXT_DISCOVERED)
+    if (identity == null)
       return rdma_status::make(RDMA_SC_INVALID_STATE,
-                               "Function context has not been activated");
+                               "Function context identity is missing");
     if (state == RDMA_CONTEXT_QUARANTINED)
       return rdma_status::make(RDMA_SC_INVALID_STATE,
                                "quarantined Function context cannot reset");
@@ -172,7 +193,8 @@ class rdma_function_context extends uvm_object;
       return status;
     binding.owner_h = binding.make_handle();
     binding.state = RDMA_BIND_ACTIVE;
-    state = RDMA_CONTEXT_ACTIVE;
+    if (state != RDMA_CONTEXT_DISCOVERED)
+      state = RDMA_CONTEXT_ACTIVE;
     return rdma_status::success();
   endfunction
 

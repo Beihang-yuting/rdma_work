@@ -91,6 +91,7 @@ package rdma_unit_test_pkg;
   `include "unit/rdma_reset_coordinator_test.sv"
   `include "integration/rdma_function_context_test.sv"
   `include "integration/rdma_device_env_test.sv"
+  `include "integration/rdma_reset_cascade_test.sv"
 `endif
 endpackage
 

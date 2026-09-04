@@ -5,6 +5,16 @@
 //       以及 dpu_common 的 dpu_device_snapshot/resource_snapshot。
 // 所有权与生命周期：外部快照和 router 由调用方拥有；本对象保存非拥有快照引用，
 //       identity ledger 由本对象创建并在环境生命周期内持有，get_identity() 返回副本。
+
+// 复位范围只在 device env 内部使用，避免把 dpu_common 的 reset 枚举和 RDMA
+// context 状态耦合；coordinator 仍是 epoch 数值的唯一发布者。
+typedef enum bit [1:0] {
+  RDMA_ENV_RESET_VF = 2'd0,
+  RDMA_ENV_RESET_PF = 2'd1,
+  RDMA_ENV_RESET_HOST = 2'd2,
+  RDMA_ENV_RESET_DEVICE = 2'd3
+} rdma_device_reset_scope_e;
+
 class rdma_device_env extends uvm_object;
   `uvm_object_utils(rdma_device_env)
   dpu_device_snapshot device_snapshot;
@@ -92,12 +102,17 @@ class rdma_device_env extends uvm_object;
       candidate_env.m_identities[key_name] = identity;
       key_name = identity_key_name(identity.key);
       context = null;
-      status = rdma_function_context::build(
+      status = rdma_function_context::build_shared(
         identity, source_resources, source_host_mem, source_pcie,
-        registry, build_timeout, context, selected_coordinator, binding);
+        selected_coordinator, binding, registry, build_timeout, context);
       if (!status.ok() || context == null)
         return rdma_status::make(RDMA_SC_INVALID_STATE,
           {"Function context build failed: ", status.message});
+      // Device env 是 reset coordinator 的共享所有者；返回后再次显式绑定并登记，
+      // 使构建契约即使在不同模拟器的 class 参数传递实现下也保持一致。
+      context.reset_coordinator = selected_coordinator;
+      selected_coordinator.attach_host_router(source_host_mem);
+      selected_coordinator.register_function(identity);
       candidate_env.m_contexts[key_name] = context;
     end
     // registry/timeout 保留在 API 中用于上层兼容；Device env 只保存已经
@@ -199,5 +214,223 @@ class rdma_device_env extends uvm_object;
   // 输出：返回值为 context 索引条目数；函数只读，不改变 env 状态。
   function int unsigned context_count();
     return m_contexts.num();
+  endfunction
+
+  // 功能：请求指定 VF 的 Function-level reset，并只重建该 VF context。
+  // 输入：identity 必须是已枚举的 VF 身份；输出为 quiesce、epoch bump 或重建状态。
+  // 副作用：推进 coordinator 的 Function epoch 和 context generation，使旧 handle 失效。
+  // 边界：null、非 VF、未枚举或 reset coordinator 缺失时 fail-closed，不影响其他 Function。
+  function rdma_status request_vf_flr(rdma_function_identity identity);
+    rdma_status status;
+
+    if (identity == null || identity.key.function_kind != RDMA_FUNCTION_VF)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "VF FLR requires a VF identity");
+    if (reset_coordinator == null)
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "device env reset coordinator is missing");
+    status = quiesce_scope(RDMA_ENV_RESET_VF, identity, 0);
+    if (!status.ok())
+      return status;
+    status = reset_coordinator.request_vf_flr(identity);
+    if (!status.ok())
+      return status;
+    return rebuild_scope(RDMA_ENV_RESET_VF, identity, 0);
+  endfunction
+
+  // 功能：请求指定 PF reset，并按同 Host、同 parent BDF 级联重建 PF 及其全部 VF。
+  // 输入：identity 必须是已枚举的 PF 身份；输出为整个级联的状态结果。
+  // 副作用：受影响 context 先 quiesce，再发布新 generation/epoch；其他 PF/Host 不变。
+  // 边界：null、非 PF、未枚举或 coordinator 缺失时拒绝操作，不部分重建。
+  function rdma_status request_pf_reset(rdma_function_identity identity);
+    rdma_status status;
+
+    if (identity == null || identity.key.function_kind != RDMA_FUNCTION_PF)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "PF reset requires a PF identity");
+    if (reset_coordinator == null)
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "device env reset coordinator is missing");
+    status = quiesce_scope(RDMA_ENV_RESET_PF, identity, 0);
+    if (!status.ok())
+      return status;
+    status = reset_coordinator.request_pf_reset(identity);
+    if (!status.ok())
+      return status;
+    return rebuild_scope(RDMA_ENV_RESET_PF, identity, 0);
+  endfunction
+
+  // 功能：请求 Host reset，级联停止并重建该 Host topology 下的全部 Function context。
+  // 输入：host_topology_key 为 dpu_common Host 拓扑键；输出为 Host epoch/重建状态。
+  // 副作用：同步推进 Host router epoch，使该 Host 的旧 mapping、doorbell 和 completion 失效。
+  // 边界：coordinator 缺失时拒绝；没有已枚举 context 的 Host 仍会推进 Host epoch。
+  function rdma_status request_host_reset(int unsigned host_topology_key);
+    rdma_status status;
+
+    if (reset_coordinator == null)
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "device env reset coordinator is missing");
+    status = quiesce_scope(RDMA_ENV_RESET_HOST, null, host_topology_key);
+    if (!status.ok())
+      return status;
+    status = reset_coordinator.request_host_reset(host_topology_key);
+    if (!status.ok())
+      return status;
+    return rebuild_scope(RDMA_ENV_RESET_HOST, null, host_topology_key);
+  endfunction
+
+  // 功能：请求 Device reset，级联停止并重建当前 env 的全部 Function context。
+  // 输出：返回全局 Device epoch 和所有 context 重建的聚合状态。
+  // 副作用：推进 device/function epoch，使所有旧 generation 的资源访问失效。
+  // 边界：coordinator 缺失时拒绝；单个 context 重建失败会被隔离并返回错误。
+  function rdma_status request_device_reset();
+    rdma_status status;
+
+    if (reset_coordinator == null)
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "device env reset coordinator is missing");
+    status = quiesce_scope(RDMA_ENV_RESET_DEVICE, null, 0);
+    if (!status.ok())
+      return status;
+    status = reset_coordinator.request_device_reset();
+    if (!status.ok())
+      return status;
+    return rebuild_scope(RDMA_ENV_RESET_DEVICE, null, 0);
+  endfunction
+
+  // 功能：判断 context 是否属于给定复位范围，集中维护 VF/PF/Host/Device 选择规则。
+  // 输入：scope 指定级联层级，identity/host_key 指定目标；输出为是否选中。
+  // 边界：null context/identity 永不匹配；PF 只通过完整 Host+parent BDF 选择后代 VF。
+  protected function bit scope_matches(
+    rdma_function_context context,
+    rdma_device_reset_scope_e scope,
+    rdma_function_identity identity,
+    int unsigned host_key
+  );
+    if (context == null || context.identity == null)
+      return 1'b0;
+    case (scope)
+      RDMA_ENV_RESET_VF:
+        return identity != null && context.identity.same_function(identity);
+      RDMA_ENV_RESET_PF: begin
+        if (identity == null ||
+            context.identity.key.host_topology_key !=
+              identity.key.host_topology_key)
+          return 1'b0;
+        if (context.identity.key.function_kind == RDMA_FUNCTION_PF)
+          return context.identity.same_function(identity);
+        return context.identity.key.function_kind == RDMA_FUNCTION_VF &&
+               rdma_bdf_same(context.identity.key.parent_pf_bdf,
+                             identity.key.bdf);
+      end
+      RDMA_ENV_RESET_HOST:
+        return context.identity.key.host_topology_key == host_key;
+      RDMA_ENV_RESET_DEVICE:
+        return 1'b1;
+      default:
+        return 1'b0;
+    endcase
+  endfunction
+
+  // 功能：在 epoch 发布前停止选中 context 接收新事务，建立 reset 的 quiesce 屏障。
+  // 输入：scope/identity/host_key 定义受影响集合；输出为首个失败状态或 success。
+  // 副作用：ACTIVE context 进入 QUIESCING；DISCOVERED context 保持未激活状态。
+  // 边界：QUARANTINED 或非法 context 使整个级联 fail-closed，不推进 coordinator epoch。
+  protected function rdma_status quiesce_scope(
+    rdma_device_reset_scope_e scope,
+    rdma_function_identity identity,
+    int unsigned host_key
+  );
+    rdma_status status;
+    string key_name;
+
+    foreach (m_contexts[key_name]) begin
+      if (!scope_matches(m_contexts[key_name], scope, identity, host_key))
+        continue;
+      if (m_contexts[key_name].state == RDMA_CONTEXT_DISCOVERED ||
+          m_contexts[key_name].state == RDMA_CONTEXT_QUIESCING)
+        continue;
+      status = m_contexts[key_name].quiesce();
+      if (!status.ok())
+        return status;
+    end
+    return rdma_status::success();
+  endfunction
+
+  // 功能：读取 coordinator 发布的 epoch，为选中 context 生成下一 incarnation 并提交重建。
+  // 输入：scope/identity/host_key 定义受影响集合；输出为首个重建失败状态或 success。
+  // 副作用：递增 generation、替换 binding authority，并同步更新 env identity ledger。
+  // 边界：generation 溢出、context reset 失败或 ledger 克隆失败会隔离该 context 并停止级联。
+  protected function rdma_status rebuild_scope(
+    rdma_device_reset_scope_e scope,
+    rdma_function_identity identity,
+    int unsigned host_key
+  );
+    rdma_function_identity previous_identity;
+    rdma_status status;
+    string key_name;
+    int unsigned next_generation;
+    rdma_reset_epoch_t next_epoch;
+
+    foreach (m_contexts[key_name]) begin
+      if (!scope_matches(m_contexts[key_name], scope, identity, host_key))
+        continue;
+      if (m_contexts[key_name] == null || m_contexts[key_name].identity == null)
+        return rdma_status::make(RDMA_SC_INVALID_STATE,
+                                 "selected Function context is incomplete");
+      previous_identity = m_contexts[key_name].identity;
+      if (previous_identity.generation == 32'hffff_ffff)
+        return rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED,
+                                 "Function generation is exhausted");
+      next_generation = previous_identity.generation + 1;
+      next_epoch = reset_coordinator.function_epoch(previous_identity);
+      status = m_contexts[key_name].reset(next_generation, next_epoch);
+      if (!status.ok()) begin
+        m_contexts[key_name].state = RDMA_CONTEXT_QUARANTINED;
+        return status;
+      end
+      status = refresh_identity_ledger(previous_identity,
+                                       m_contexts[key_name].identity);
+      if (!status.ok()) begin
+        m_contexts[key_name].state = RDMA_CONTEXT_QUARANTINED;
+        return status;
+      end
+    end
+    return rdma_status::success();
+  endfunction
+
+  // 功能：用 context 发布的新 identity 替换 device env 的 dpu_common identity ledger 副本。
+  // 输入：previous_identity 用于定位旧条目，next_identity 为新的 generation/epoch 快照。
+  // 副作用：只替换 env 自有的 clone，不修改 dpu_common snapshot 或 context 外部引用。
+  // 边界：身份不匹配、克隆失败或 ledger 缺失时返回错误。
+  protected function rdma_status refresh_identity_ledger(
+    rdma_function_identity previous_identity,
+    rdma_function_identity next_identity
+  );
+    rdma_function_identity copy;
+    uvm_object cloned_object;
+    string key_name;
+    bit found;
+
+    if (previous_identity == null || next_identity == null)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "identity ledger refresh received null");
+    found = 1'b0;
+    foreach (m_identities[key_name]) begin
+      if (m_identities[key_name] == null ||
+          !m_identities[key_name].same_function(previous_identity))
+        continue;
+      cloned_object = next_identity.clone();
+      if (cloned_object == null || !$cast(copy, cloned_object))
+        return rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED,
+                                 "identity ledger clone failed");
+      m_identities[key_name] = copy;
+      found = 1'b1;
+      break;
+    end
+    if (!found)
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "identity ledger entry is missing");
+    return rdma_status::success();
   endfunction
 endclass
