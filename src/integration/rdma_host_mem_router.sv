@@ -16,15 +16,19 @@ class rdma_host_mem_router extends rdma_host_mem_api;
   function new(string name="rdma_host_mem_router"); super.new(name); endfunction
 
   function rdma_status configure(rdma_host_mem_route_entry entries[$]);
-    m_managers.delete(); m_epochs.delete(); m_maps.delete(); m_map_epochs.delete();
+    rdma_host_mem_api new_managers[int unsigned];
+    rdma_reset_epoch_t new_epochs[int unsigned];
     foreach (entries[i]) begin
       if (entries[i] == null || entries[i].manager == null)
         return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "null Host-memory route entry");
-      if (m_managers.exists(entries[i].host_topology_key))
+      if (new_managers.exists(entries[i].host_topology_key))
         return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "duplicate Host-memory route");
-      m_managers[entries[i].host_topology_key] = entries[i].manager;
-      m_epochs[entries[i].host_topology_key] = 0;
+      foreach (new_managers[k]) if (new_managers[k] === entries[i].manager && k != entries[i].host_topology_key)
+        return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "manager bound to multiple Host routes");
+      new_managers[entries[i].host_topology_key] = entries[i].manager;
+      new_epochs[entries[i].host_topology_key] = 0;
     end
+    m_managers = new_managers; m_epochs = new_epochs;
     return rdma_status::success();
   endfunction
 
@@ -42,6 +46,12 @@ class rdma_host_mem_router extends rdma_host_mem_api;
     mgr = m_managers[h];
     s = mgr.allocate(request_context, size, alignment, direction, mapping);
     if (!s.ok() || mapping == null) return s;
+    if (mapping.function_h != null && !mapping.function_h.same_instance(request_context.function_h))
+      return rdma_status::make(RDMA_SC_DMA_TRANSLATION, "manager returned mismatched Function");
+    if (mapping.owner_h != null && !mapping.owner_h.same_instance(request_context.function_h))
+      return rdma_status::make(RDMA_SC_DMA_TRANSLATION, "manager returned mismatched owner");
+    if (mapping.requester_bdf != '0 && mapping.requester_bdf != request_context.requester_bdf)
+      return rdma_status::make(RDMA_SC_DMA_TRANSLATION, "manager returned mismatched requester BDF");
     mapping.route = request_context.route;
     mapping.route_valid = 1'b1;
     mapping.reset_epoch = m_epochs[h];

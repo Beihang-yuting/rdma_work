@@ -26,14 +26,23 @@ class rdma_pcie_router extends rdma_pcie_api;
   protected rdma_pcie_route_entry m_entries[$];
   function new(string name="rdma_pcie_router"); super.new(name); endfunction
   function rdma_status configure(rdma_pcie_route_entry entries[$]);
-    m_entries.delete();
+    rdma_pcie_route_entry new_entries[$];
     foreach (entries[i]) begin
       if (entries[i] == null || entries[i].endpoint == null || !rdma_route_key_valid(entries[i].route))
         return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "invalid PCIe route entry");
-      foreach (m_entries[j]) if (same_route(m_entries[j].route, entries[i].route))
+      if (entries[i].function_uid == 0 || entries[i].generation == 0)
+        return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "PCIe route Function authority is required");
+      foreach (new_entries[j]) if (same_route(new_entries[j].route, entries[i].route))
         return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "duplicate PCIe route");
-      m_entries.push_back(entries[i]);
+      begin
+        rdma_pcie_function_info info; rdma_status info_status;
+        info = null; info_status = entries[i].endpoint.get_function_info(entries[i].route.bdf, info);
+        if (!info_status.ok() || info == null)
+          return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "endpoint Function identity unavailable");
+      end
+      new_entries.push_back(entries[i]);
     end
+    m_entries = new_entries;
     return rdma_status::success();
   endfunction
   task cfg_read32(rdma_bdf_t target, rdma_cfg_offset_t offset, output bit [31:0] data, output rdma_status status);
@@ -78,7 +87,7 @@ class rdma_pcie_router extends rdma_pcie_api;
   endfunction
   protected function rdma_pcie_api endpoint_for_handle(rdma_function_handle h, output rdma_status status);
     rdma_pcie_api ep; int match_count; ep=null; match_count=0;
-    if(h==null) begin status=rdma_status::make(RDMA_SC_INVALID_ARGUMENT,"null Function handle"); return null; end
+    if(h==null || h.kind != RDMA_RESOURCE_FUNCTION) begin status=rdma_status::make(RDMA_SC_INVALID_ARGUMENT,"invalid Function handle"); return null; end
     foreach(m_entries[i]) begin
       if (m_entries[i].function_uid != 0 &&
           h.function_uid == m_entries[i].function_uid &&
