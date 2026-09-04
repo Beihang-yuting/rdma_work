@@ -4,7 +4,11 @@ class rdma_pcie_route_entry extends uvm_object;
   `uvm_object_utils(rdma_pcie_route_entry)
   rdma_route_key_t route;
   rdma_pcie_api endpoint;
-  function new(string name="rdma_pcie_route_entry"); super.new(name); route='0; endpoint=null; endfunction
+  // 中文：handle 路由所需的 Function authority；由 identity adapter 填充。
+  longint unsigned function_uid;
+  int unsigned global_function_id;
+  int unsigned generation;
+  function new(string name="rdma_pcie_route_entry"); super.new(name); route='0; endpoint=null; function_uid=0; global_function_id=0; generation=0; endfunction
 endclass
 
 class rdma_pcie_router extends rdma_pcie_api;
@@ -65,7 +69,14 @@ class rdma_pcie_router extends rdma_pcie_api;
   protected function rdma_pcie_api endpoint_for_handle(rdma_function_handle h, output rdma_status status);
     rdma_pcie_api ep; int match_count; ep=null; match_count=0;
     if(h==null) begin status=rdma_status::make(RDMA_SC_INVALID_ARGUMENT,"null Function handle"); return null; end
-    foreach(m_entries[i]) begin rdma_pcie_function_info info; if(m_entries[i].endpoint.get_function_info(m_entries[i].route.bdf,info).ok() && info != null && info.bdf == m_entries[i].route.bdf) begin match_count++; ep=m_entries[i].endpoint; end end
+    foreach(m_entries[i]) begin
+      if (m_entries[i].function_uid != 0 &&
+          h.function_uid == m_entries[i].function_uid &&
+          h.object_id == m_entries[i].global_function_id &&
+          h.generation == m_entries[i].generation) begin
+        match_count++; ep=m_entries[i].endpoint;
+      end
+    end
     if(match_count!=1) begin status=rdma_status::make(RDMA_SC_INVALID_ARGUMENT,"ambiguous Function route; full identity required"); return null; end
     status=rdma_status::success(); return ep;
   endfunction
