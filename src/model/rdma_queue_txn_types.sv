@@ -206,6 +206,10 @@ class rdma_queue_txn_evidence extends uvm_object;
     return capture_queue_handle(source);
   endfunction
 
+  function rdma_status set_queue_handle(rdma_handle source);
+    return capture_queue_handle(source);
+  endfunction
+
   function rdma_status capture_request(rdma_semantic_request source);
     uvm_object cloned;
     rdma_status status;
@@ -228,6 +232,10 @@ class rdma_queue_txn_evidence extends uvm_object;
     return capture_request(source);
   endfunction
 
+  function rdma_status set_request_snapshot(rdma_semantic_request source);
+    return capture_request(source);
+  endfunction
+
   function rdma_status capture_cqe(uvm_object source);
     if (source == null)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "CQE is null");
@@ -242,6 +250,10 @@ class rdma_queue_txn_evidence extends uvm_object;
   endfunction
 
   function rdma_status capture_cqe_snapshot(uvm_object source);
+    return capture_cqe(source);
+  endfunction
+
+  function rdma_status set_cqe_snapshot(uvm_object source);
     return capture_cqe(source);
   endfunction
 
@@ -264,6 +276,10 @@ class rdma_queue_txn_evidence extends uvm_object;
   endfunction
 
   function rdma_status set_failure_status(rdma_status source);
+    return set_failure(source);
+  endfunction
+
+  function rdma_status capture_failure_status(rdma_status source);
     return set_failure(source);
   endfunction
 
