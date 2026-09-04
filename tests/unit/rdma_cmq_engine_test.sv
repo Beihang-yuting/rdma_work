@@ -4635,6 +4635,7 @@ class rdma_cmq_engine_test extends uvm_test;
     candidate = make_binding("bdf_candidate", RDMA_BIND_ACTIVE);
     candidate.pcie.bdf.bus++;
     candidate.queue_dma.requester_bdf = candidate.pcie.bdf;
+    candidate.synchronize_identity_from_legacy_mirrors();
     engine.activate(candidate, status);
     expect_status("ACTIVATE_BDF", status, RDMA_SC_DMA_TRANSLATION);
 
