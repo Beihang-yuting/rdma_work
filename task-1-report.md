@@ -29,3 +29,11 @@ Commands were run from this worktree with:
 executed in this pass.
 
 `git diff --check` passed before commit `8d0a2d5`.
+
+## Host0 correction
+
+Follow-up commit `1fb1d12` makes host topology key 0 (explicit Host0) legal while
+retaining zero-BDF and PF/VF route validation. `rdma_function_identity_test`
+was rerun on VCS53 and exited 0 with warning=0 error=0 fatal=0. The model,
+queue-lifecycle, QP-lifecycle, and control-plane CMQ tests still require a
+post-correction run.
