@@ -13,6 +13,8 @@ class rdma_host_mem_router extends rdma_host_mem_api;
   protected rdma_reset_epoch_t m_epochs[int unsigned];
   protected rdma_dma_mapping m_maps[$];
   protected rdma_reset_epoch_t m_map_epochs[$];
+  protected rdma_reset_epoch_t m_map_function_epochs[$];
+  protected rdma_route_key_t m_map_routes[$];
   protected rdma_reset_coordinator m_reset;
   function new(string name="rdma_host_mem_router"); super.new(name); endfunction
   function void attach_reset_coordinator(rdma_reset_coordinator coordinator); m_reset=coordinator; endfunction
@@ -30,7 +32,7 @@ class rdma_host_mem_router extends rdma_host_mem_api;
       new_managers[entries[i].host_topology_key] = entries[i].manager;
       new_epochs[entries[i].host_topology_key] = 0;
     end
-    m_managers = new_managers; m_epochs = new_epochs;
+    m_managers = new_managers; m_epochs = new_epochs; m_map_function_epochs.delete(); m_map_routes.delete();
     return rdma_status::success();
   endfunction
 
@@ -59,6 +61,8 @@ class rdma_host_mem_router extends rdma_host_mem_api;
     mapping.reset_epoch = m_epochs[h];
     mapping.epoch_valid = 1'b1;
     m_maps.push_back(mapping); m_map_epochs.push_back(mapping.reset_epoch);
+    m_map_function_epochs.push_back((m_reset != null) ? m_reset.function_epoch_uid(request_context.function_h.function_uid) : 0);
+    m_map_routes.push_back(request_context.route);
     return s;
   endfunction
 
@@ -66,8 +70,9 @@ class rdma_host_mem_router extends rdma_host_mem_api;
     int idx; rdma_host_mem_api mgr;
     idx = find_mapping(mapping);
     if (idx < 0) return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "unknown DMA mapping");
+    if (!same_route(mapping.route, m_map_routes[idx])) return rdma_status::make(RDMA_SC_DMA_TRANSLATION, "DMA mapping route was modified");
     if (mapping == null || !mapping.route_valid || !rdma_route_key_valid(mapping.route)) return rdma_status::make(RDMA_SC_DMA_TRANSLATION, "DMA mapping route is invalid");
-    if (m_map_epochs[idx] != current_epoch(mapping.route.host_topology_key))
+    if (m_map_epochs[idx] != current_epoch(mapping.route.host_topology_key, idx))
       return rdma_status::make(RDMA_SC_STALE_GENERATION, "DMA mapping reset epoch is stale");
     if (!m_managers.exists(mapping.route.host_topology_key)) return rdma_status::make(RDMA_SC_DMA_TRANSLATION, "Host route not found");
     mgr = m_managers[mapping.route.host_topology_key];
@@ -78,8 +83,9 @@ class rdma_host_mem_router extends rdma_host_mem_api;
     int idx; rdma_host_mem_api mgr; data.delete();
     idx = find_mapping(mapping);
     if (idx < 0) return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "unknown DMA mapping");
+    if (!same_route(mapping.route, m_map_routes[idx])) return rdma_status::make(RDMA_SC_DMA_TRANSLATION, "DMA mapping route was modified");
     if (mapping == null || !mapping.route_valid || !rdma_route_key_valid(mapping.route)) return rdma_status::make(RDMA_SC_DMA_TRANSLATION, "DMA mapping route is invalid");
-    if (m_map_epochs[idx] != current_epoch(mapping.route.host_topology_key)) return rdma_status::make(RDMA_SC_STALE_GENERATION, "DMA mapping reset epoch is stale");
+    if (m_map_epochs[idx] != current_epoch(mapping.route.host_topology_key, idx)) return rdma_status::make(RDMA_SC_STALE_GENERATION, "DMA mapping reset epoch is stale");
     if (!m_managers.exists(mapping.route.host_topology_key)) return rdma_status::make(RDMA_SC_DMA_TRANSLATION, "Host route not found");
     mgr = m_managers[mapping.route.host_topology_key];
     return mgr.read(mapping, offset, size, data);
@@ -89,11 +95,12 @@ class rdma_host_mem_router extends rdma_host_mem_api;
     int idx; rdma_host_mem_api mgr; rdma_status s;
     idx = find_mapping(mapping);
     if (idx < 0) return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "unknown DMA mapping");
+    if (!same_route(mapping.route, m_map_routes[idx])) return rdma_status::make(RDMA_SC_DMA_TRANSLATION, "DMA mapping route was modified");
     if (mapping == null || !mapping.route_valid || !rdma_route_key_valid(mapping.route)) return rdma_status::make(RDMA_SC_DMA_TRANSLATION, "DMA mapping route is invalid");
-    if (m_map_epochs[idx] != current_epoch(mapping.route.host_topology_key)) return rdma_status::make(RDMA_SC_STALE_GENERATION, "DMA mapping reset epoch is stale");
+    if (m_map_epochs[idx] != current_epoch(mapping.route.host_topology_key, idx)) return rdma_status::make(RDMA_SC_STALE_GENERATION, "DMA mapping reset epoch is stale");
     if (!m_managers.exists(mapping.route.host_topology_key)) return rdma_status::make(RDMA_SC_DMA_TRANSLATION, "Host route not found");
     mgr = m_managers[mapping.route.host_topology_key]; s = mgr.\release (mapping);
-    if (s.ok()) begin m_maps.delete(idx); m_map_epochs.delete(idx); end
+    if (s.ok()) begin m_maps.delete(idx); m_map_epochs.delete(idx); m_map_function_epochs.delete(idx); m_map_routes.delete(idx); end
     return s;
   endfunction
 
@@ -103,12 +110,16 @@ class rdma_host_mem_router extends rdma_host_mem_api;
   function rdma_reset_epoch_t host_epoch(int unsigned host_topology_key);
     return current_epoch(host_topology_key);
   endfunction
-  protected function rdma_reset_epoch_t current_epoch(int unsigned host_topology_key);
-    if (m_reset != null) return m_reset.host_epoch(host_topology_key);
+  protected function rdma_reset_epoch_t current_epoch(int unsigned host_topology_key, int idx=-1);
+    rdma_reset_epoch_t e;
+    if (m_reset != null) begin e = m_reset.host_epoch(host_topology_key); e = (m_reset.device_epoch()>e)?m_reset.device_epoch():e; if(idx>=0 && m_maps[idx].function_h!=null && m_reset.function_epoch_uid(m_maps[idx].function_h.function_uid)>e) e=m_reset.function_epoch_uid(m_maps[idx].function_h.function_uid); return e; end
     return m_epochs.exists(host_topology_key) ? m_epochs[host_topology_key] : 0;
   endfunction
   protected function int find_mapping(rdma_dma_mapping mapping);
     foreach (m_maps[i]) if (m_maps[i] === mapping) return i;
     return -1;
+  endfunction
+  protected function bit same_route(rdma_route_key_t a, rdma_route_key_t b);
+    return a.host_topology_key==b.host_topology_key && a.root_id==b.root_id && a.segment==b.segment && rdma_bdf_same(a.bdf,b.bdf);
   endfunction
 endclass

@@ -8,11 +8,12 @@ class rdma_reset_coordinator extends uvm_object;
   protected rdma_function_identity m_functions[$];
   function new(string name="rdma_reset_coordinator"); super.new(name); m_device_epoch=0; endfunction
   function void attach_host_router(rdma_host_mem_router router); m_host_router=router; router.attach_reset_coordinator(this); endfunction
-  function void register_function(rdma_function_identity identity); if(identity!=null) m_functions.push_back(identity); endfunction
+  function void register_function(rdma_function_identity identity); if(identity!=null) begin foreach(m_functions[i]) if(m_functions[i].function_uid==identity.function_uid) return; m_functions.push_back(identity); end endfunction
+  function rdma_reset_epoch_t function_epoch_uid(longint unsigned uid); foreach(m_functions[i]) if(m_functions[i].function_uid==uid) return function_epoch(m_functions[i]); return 0; endfunction
   function rdma_status request_vf_flr(rdma_function_identity identity);
     if(identity==null) return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,"null Function identity");
     if(identity.key.function_kind != RDMA_FUNCTION_VF) return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,"VF FLR requires VF identity");
-    bump_function(identity); return rdma_status::success();
+    if (identity.key.function_kind == RDMA_FUNCTION_PF) begin foreach(m_functions[i]) if(m_functions[i].key.host_topology_key==identity.key.host_topology_key && ((m_functions[i].key.function_kind==RDMA_FUNCTION_PF && rdma_bdf_same(m_functions[i].key.bdf, identity.key.bdf)) || (m_functions[i].key.function_kind==RDMA_FUNCTION_VF && rdma_bdf_same(m_functions[i].key.parent_pf_bdf, identity.key.bdf)))) bump_function(m_functions[i]); end else bump_function(identity); return rdma_status::success();
   endfunction
   function rdma_status request_pf_reset(rdma_function_identity identity);
     if(identity==null) return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,"null Function identity");

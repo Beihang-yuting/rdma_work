@@ -79,6 +79,14 @@ class rdma_dpu_identity_adapter extends uvm_object;
     binding.queue_dma.requester_bdf = rkey.bdf;
     binding.queue_dma.dma_domain_valid = 1'b1;
     binding.queue_dma.dma_domain_id = rkey.host_topology_key;
+    binding.queue_caps.min_cq_depth = 1; binding.queue_caps.max_cq_depth = 1;
+    binding.queue_caps.min_srq_depth = 1; binding.queue_caps.max_srq_depth = 1;
+    binding.queue_caps.max_ceq_depth = 1; binding.queue_caps.max_aeq_depth = 1;
+    binding.queue_caps.max_wq_sge = 1; binding.queue_caps.max_queue_ring_bytes = 4096; binding.queue_caps.max_sgb_bytes = 4096;
+    binding.pcie.bar[0].base = 0; binding.pcie.bar[0].size = 64'h100000; binding.pcie.bar[0].enabled = 1;
+    binding.notify_bar_id = 0; binding.notify_base = 0; binding.notify_size = 8192;
+    status = binding.validate();
+    if (!status.ok()) begin identity = null; binding = null; return status; end
     return rdma_status::success();
   endfunction
 endclass
