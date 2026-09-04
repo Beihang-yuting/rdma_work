@@ -18,6 +18,7 @@ readonly core_tests=(
   rdma_queue_data_engine_post_test
   rdma_queue_data_engine_poll_test
   rdma_queue_data_engine_recovery_test
+  rdma_sq_models_test
   # SQ/RQ/CQ/EQ engines share the queue lifecycle build and must run in the
   # same VCS 53 regression so PI/CI, credits and doorbell paths are covered.
   rdma_sq_engine_test
@@ -50,6 +51,16 @@ readonly core_tests=(
   rdma_queue_recovery_test
   rdma_qp_lifecycle_test
   rdma_qp_recovery_test
+  # These tests exercise routing, payload serialization, transaction journaling
+  # and reset identity; keeping them in the same manifest prevents a green
+  # regression from silently omitting ordinary unit tests.
+  rdma_sq_codec_test
+  rdma_sq_payload_writer_test
+  rdma_function_identity_test
+  rdma_pcie_router_test
+  rdma_host_mem_router_test
+  rdma_reset_coordinator_test
+  rdma_queue_txn_journal_test
 )
 
 if [[ ${1-} == "--list" ]]; then

@@ -925,6 +925,7 @@ virtual class rdma_hw_qpc_codec_base extends rdma_codec_base;
       RDMA_TRANSPORT_UD: begin
         if (!$cast(lhs_ud, left.transport_ext) || !$cast(rhs_ud, right.transport_ext)) begin mismatch = "UD extension type"; return rdma_status::success(); end
         if (lhs_ud.qkey != rhs_ud.qkey) begin mismatch = "ud.qkey"; return rdma_status::success(); end
+        if (lhs_ud.destination_qpn != rhs_ud.destination_qpn) begin mismatch = "ud.destination_qpn"; return rdma_status::success(); end
       end
       RDMA_TRANSPORT_URC: begin
         if (!$cast(lhs_urc, left.transport_ext) || !$cast(rhs_urc, right.transport_ext)) begin mismatch = "URC extension type"; return rdma_status::success(); end
@@ -1090,7 +1091,7 @@ class rdma_hw_qpc_ud_codec extends rdma_hw_qpc_codec_base;
                  ext.qkey[23:0]); if (!status.ok()) return status;
     status = put(builder, RDMA_QPC_DST_QPN_WORD_BYTE_OFFSET,
                  RDMA_QPC_DST_QPN_LSB, RDMA_QPC_DST_QPN_WIDTH,
-                 ext.qkey[23:0]); if (!status.ok()) return status;
+                 ext.destination_qpn); if (!status.ok()) return status;
     return rdma_status::success();
   endfunction
 
@@ -1115,9 +1116,9 @@ class rdma_hw_qpc_ud_codec extends rdma_hw_qpc_codec_base;
     status = get(builder, RDMA_QPC_DST_QPN_WORD_BYTE_OFFSET,
                  RDMA_QPC_DST_QPN_LSB, RDMA_QPC_DST_QPN_WIDTH, destination);
     if (!status.ok()) return status;
-    if (low != destination) return codec_error("UD destination QPN does not mirror qkey");
     ext = rdma_qpc_ud_ext::type_id::create("decoded_ud_ext");
     ext.qkey = {high[7:0], low[23:0]};
+    ext.destination_qpn = destination[23:0];
     qpc.srq_h = null;
     qpc.transport_ext = ext;
     return rdma_status::success();

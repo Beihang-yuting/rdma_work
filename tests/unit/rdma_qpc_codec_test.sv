@@ -198,6 +198,9 @@ class rdma_qpc_codec_test extends uvm_test;
     foreach (ip[i]) qpc.address_vector.destination_ip[i] = ip[i];
     ext = rdma_qpc_ud_ext::type_id::create({name, "_ext"});
     ext.qkey = 32'h89abcdef;
+    // 驱动把 destination QPN 作为独立字段下发；故意与 qkey 的低 24 位相同，
+    // 便于继续复用现有 golden 向量，同时由独立性测试覆盖不同值的路径。
+    ext.destination_qpn = 24'habcdef;
     qpc.transport_ext = ext;
     return qpc;
   endfunction
@@ -1197,6 +1200,56 @@ class rdma_qpc_codec_test extends uvm_test;
     expect_ok("URC_GENERIC_EXPRESSIVE_MODEL", qpc.validate());
   endfunction
 
+  // 功能：check_ud_destination_qpn_independence 验证 UD QPC 的 destination QPN
+  //   与 qkey 低 24 位相互独立，复现 0.1.34 驱动分别填写两个字段的契约。
+  // 输入/输出及副作用：codec（输入）和 source（输入）提供已通过基础校验的
+  //   QPC；函数临时克隆 source，编码并解码 image，最后通过 UVM 报告发布断言结果，
+  //   不修改 source，也不接管 codec 或 image 的所有权。
+  // 失败/边界：若 transport extension 不是 rdma_qpc_ud_ext、编码失败、目标 QPN
+  //   被错误派生为 qkey，或解码后字段丢失，函数报告错误；合法的非零 24 位目标 QPN
+  //   必须允许与 qkey 低位不同。
+  function automatic void check_ud_destination_qpn_independence(
+    rdma_codec_base codec,
+    rdma_qpc_model source
+  );
+    rdma_qpc_model mutated;
+    rdma_qpc_ud_ext ext;
+    rdma_hw_image encoded;
+    rdma_hw_model decoded_model;
+    rdma_qpc_model decoded;
+    rdma_status status;
+    bit [63:0] destination;
+
+    mutated = clone_qpc(source, "ud_independent_destination");
+    if (!$cast(ext, mutated.transport_ext)) begin
+      `uvm_error("UD_DST_QPN_TYPE", "UD extension type is unavailable")
+      return;
+    end
+    ext.destination_qpn = 24'h123456;
+    status = codec.encode(mutated, encoded);
+    expect_ok("UD_DST_QPN_ENCODE", status);
+    if (!status.ok()) return;
+
+    destination = image_field(encoded, RDMA_QPC_DST_QPN_WORD_BYTE_OFFSET,
+                              RDMA_QPC_DST_QPN_LSB, RDMA_QPC_DST_QPN_WIDTH);
+    if (destination != 24'h123456)
+      `uvm_error("UD_DST_QPN_ENCODE_VALUE",
+                 $sformatf("expected 0x123456, got 0x%06x", destination))
+
+    status = codec.decode(encoded, decoded_model);
+    expect_ok("UD_DST_QPN_DECODE", status);
+    if (!status.ok() || !$cast(decoded, decoded_model) ||
+        !$cast(ext, decoded.transport_ext)) begin
+      `uvm_error("UD_DST_QPN_DECODE_TYPE",
+                 "UD destination QPN decode did not return a UD QPC")
+      return;
+    end
+    if (ext.destination_qpn != 24'h123456)
+      `uvm_error("UD_DST_QPN_DECODE_VALUE",
+                 $sformatf("expected decoded 0x123456, got 0x%06x",
+                           ext.destination_qpn))
+  endfunction
+
   // 功能：在 rdma_qpc_codec_test 中，run_phase 驱动 UVM 阶段中的场景初始化、事务执行和断言收尾，并在退出前释放 objection 或测试资源。
   // 输入/输出及副作用：phase（输入）；phase 由 UVM 提供；task 通过 objection、日志和断言暴露结果，可能调用 DUT 接口但不改变其所有权规则。
   // 失败/边界：run_phase 的 setup/阶段驱动失败时停止新增事务，并按测试生命周期清理 objection 与临时引用。
@@ -1299,6 +1352,7 @@ class rdma_qpc_codec_test extends uvm_test;
                            ud_image, ud_decoded);
     check_golden_roundtrip("URC_GOLDEN", urc_codec, urc_source, urc_golden,
                            urc_image, urc_decoded);
+    check_ud_destination_qpn_independence(ud_codec, ud_source);
 
     if (rc_decoded != null) begin
       check_projected_handles(rc_codec, rc_source, rc_decoded, rc_image);
@@ -1335,14 +1389,13 @@ class rdma_qpc_codec_test extends uvm_test;
         invalid_ud_ext.qkey = 0;
     end
     expect_encode_failure("UD_QKEY_ZERO", ud_codec, invalid_ud);
-    corrupt_image = clone_image(ud_image, "ud_qkey_mirror");
+    corrupt_image = clone_image(ud_image, "ud_destination_qpn_independent");
     set_image_field(corrupt_image, RDMA_QPC_DST_QPN_WORD_BYTE_OFFSET,
                     RDMA_QPC_DST_QPN_LSB, RDMA_QPC_DST_QPN_WIDTH,
-                    image_field(corrupt_image,
-                      RDMA_QPC_DST_QPN_WORD_BYTE_OFFSET,
-                      RDMA_QPC_DST_QPN_LSB,
-                      RDMA_QPC_DST_QPN_WIDTH) ^ 1);
-    expect_decode_failure("UD_QKEY_DST_MIRROR", ud_codec, corrupt_image);
+                    24'h123456);
+    decoded_model = null;
+    status = ud_codec.decode(corrupt_image, decoded_model);
+    expect_ok("UD_DST_QPN_INDEPENDENT_DECODE", status);
     check_urc_owner_routing(urc_codec, urc_source);
     check_urc_mutations(urc_codec, urc_source, urc_image);
     check_urc_encode_bounds(urc_codec, urc_source);

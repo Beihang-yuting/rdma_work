@@ -269,6 +269,9 @@ class rdma_context_cmq_regression_test extends uvm_test;
     foreach (ip[i]) qpc.address_vector.destination_ip[i] = ip[i];
     ext = rdma_qpc_ud_ext::type_id::create({name, "_ext"});
     ext.qkey = 32'h89abcdef;
+    // 0.1.34 驱动将 destination QPN 与 qkey 分开写入；该 golden 场景仍使用
+    // 与 qkey 低 24 位相同的值，以保持既有 512 字节向量稳定。
+    ext.destination_qpn = 24'habcdef;
     qpc.transport_ext = ext;
     return qpc;
   endfunction
@@ -638,7 +641,8 @@ class rdma_context_cmq_regression_test extends uvm_test;
              lhs_rc.retry_count == rhs_rc.retry_count &&
              lhs_rc.rnr_retry_count == rhs_rc.rnr_retry_count;
     if ($cast(lhs_ud, lhs) && $cast(rhs_ud, rhs))
-      return lhs_ud.qkey == rhs_ud.qkey;
+      return lhs_ud.qkey == rhs_ud.qkey &&
+             lhs_ud.destination_qpn == rhs_ud.destination_qpn;
     if ($cast(lhs_urc, lhs) && $cast(rhs_urc, rhs)) begin
       if (lhs_urc.queues == null || rhs_urc.queues == null)
         return lhs_urc.queues == rhs_urc.queues;

@@ -336,13 +336,16 @@ class rdma_qpc_ud_ext extends rdma_qpc_transport_ext;
   `uvm_object_utils(rdma_qpc_ud_ext)
 
   bit [31:0] qkey;
+  // 驱动在 UD QPC 中单独提供目标 QPN；它不能由 qkey 的低 24 位推导。
+  bit [23:0] destination_qpn;
 
-  // 功能：构造 rdma_qpc_ud_ext，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：qkey='0。
+  // 功能：构造 rdma_qpc_ud_ext，调用 super.new 建立 UVM 对象，并把 qkey 与独立目标 QPN 初始化为零。
   // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
   // 失败/边界：rdma_qpc_ud_ext 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_qpc_ud_ext");
     super.new(name);
     qkey = '0;
+    destination_qpn = '0;
   endfunction
 
   // 功能：将 rhs 中 rdma_qpc_ud_ext 的值字段复制到当前对象，建立与源对象隔离的快照。
@@ -355,6 +358,7 @@ class rdma_qpc_ud_ext extends rdma_qpc_transport_ext;
     if (!$cast(rhs_ext, rhs))
       `uvm_fatal("RDMA_COPY_TYPE", "UD QPC extension copy mismatch")
     qkey = rhs_ext.qkey;
+    destination_qpn = rhs_ext.destination_qpn;
   endfunction
 
   // 功能：transport_kind 使用 当前对象字段 计算并返回 rdma_transport_e 结果；不修改对象字段或外部资源。
@@ -364,9 +368,9 @@ class rdma_qpc_ud_ext extends rdma_qpc_transport_ext;
     return RDMA_TRANSPORT_UD;
   endfunction
 
-  // 功能：validate 校验 当前对象字段 与当前对象状态的一致性，并显式处理“UD QPC qkey is zero”等拒绝条件，返回 rdma_status 供上层决定是否提交。
-  // 输入/输出及副作用：无显式参数；validate 读取 对象字段：rdma_status、qkey 并使用字段 rdma_status、qkey；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：validate 返回 RDMA_SC_INVALID_ARGUMENT；典型拒绝条件为“UD QPC qkey is zero”；失败路径不提交部分状态或转移未声明资源。
+  // 功能：validate 校验 UD QPC 的 qkey 是否满足现有抽象模型的基本约束，同时保留独立 destination_qpn。
+  // 输入/输出及副作用：无显式参数；validate 只读 qkey，返回 rdma_status，不修改模型或资源账本。
+  // 失败/边界：qkey 为零时返回 RDMA_SC_INVALID_ARGUMENT；destination_qpn 的零值语义由具体驱动命令决定，不能在通用模型中擅自拒绝。
   virtual function rdma_status validate();
     if (qkey == 0)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
@@ -374,11 +378,12 @@ class rdma_qpc_ud_ext extends rdma_qpc_transport_ext;
     return rdma_status::success();
   endfunction
 
-  // 功能：describe 把 当前对象字段 与当前对象的身份/状态字段编码为稳定文本，供日志、查找或恢复索引使用。
+  // 功能：describe 把 UD QPC 的 qkey 与独立目标 QPN 编码为稳定文本，供日志、查找或恢复索引使用。
   // 输入/输出及副作用：无显式参数；无显式输入；返回 string，只读取对象字段，不修改模型或资源账本。
   // 失败/边界：枚举未定义或对象未配置时返回 UNKNOWN/UNCONFIGURED 表示，同时保留数值上下文。
   virtual function string describe();
-    return $sformatf("UD(qkey=0x%08x)", qkey);
+    return $sformatf("UD(qkey=0x%08x destination_qpn=0x%06x)",
+                     qkey, destination_qpn);
   endfunction
 endclass
 

@@ -2226,6 +2226,7 @@ class rdma_resource_manager extends uvm_object;
     else if ($cast(source_ud, source)) begin
       result_ud = new({copy_label, "_ud"});
       result_ud.qkey = source_ud.qkey;
+      result_ud.destination_qpn = source_ud.destination_qpn;
       result = result_ud;
     end
     else if ($cast(source_urc, source)) begin
@@ -2518,7 +2519,8 @@ class rdma_resource_manager extends uvm_object;
              lhs_rc.retry_count == rhs_rc.retry_count &&
              lhs_rc.rnr_retry_count == rhs_rc.rnr_retry_count;
     if ($cast(lhs_ud, lhs) && $cast(rhs_ud, rhs))
-      return lhs_ud.qkey == rhs_ud.qkey;
+      return lhs_ud.qkey == rhs_ud.qkey &&
+             lhs_ud.destination_qpn == rhs_ud.destination_qpn;
     if ($cast(lhs_urc, lhs) && $cast(rhs_urc, rhs)) begin
       if (lhs_urc.remote_qpn != rhs_urc.remote_qpn ||
           lhs_urc.rbsn != rhs_urc.rbsn || lhs_urc.dbsn != rhs_urc.dbsn ||
