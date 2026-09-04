@@ -580,8 +580,11 @@ class rdma_control_plane_test extends uvm_test;
     binding.pcie.vf_index = 32'h8000_8080;
     binding.pcie.bdf = '{segment:16'h1001, bus:8'h20, device:5'h03,
                          function_num:3'h5};
-    binding.pcie.parent_pf_bdf = '{segment:16'h2002, bus:8'h30,
+    binding.pcie.parent_pf_bdf = '{segment:16'h1001, bus:8'h30,
                                    device:5'h04, function_num:3'h2};
+    if (!binding.configure_identity_from_legacy_mirrors(
+          16'h1, 32'h1, RDMA_FUNCTION_VF, 16'h8080).ok())
+      `uvm_error("BINDING", "legacy binding identity configuration failed")
     binding.pcie.bar[0].base.value = 64'h0000_0000_8000_0000;
     binding.pcie.bar[0].size = 64'h4000;
     binding.pcie.bar[0].enabled = 1'b1;
@@ -3857,6 +3860,8 @@ class rdma_control_plane_test extends uvm_test;
                      "KEY_ALLOC did not enter the blocking CMQ")
         else begin
           binding.generation++;
+          if (!binding.synchronize_identity_from_legacy_mirrors().ok())
+            `uvm_error("BINDING", "legacy identity synchronization failed")
           binding.owner_h = binding.make_handle();
         end
         blocking_cmq.release_one();
@@ -4539,6 +4544,8 @@ class rdma_control_plane_test extends uvm_test;
       begin
         #1ns;
         binding.generation++;
+        if (!binding.synchronize_identity_from_legacy_mirrors().ok())
+          `uvm_error("BINDING", "legacy identity synchronization failed")
         binding.owner_h = binding.make_handle();
         binding_control.release_test_function_lock(held_lock);
       end
@@ -5515,6 +5522,8 @@ class rdma_control_plane_test extends uvm_test;
                      "deregister command did not enter the CMQ gate")
         else begin
           binding.generation++;
+          if (!binding.synchronize_identity_from_legacy_mirrors().ok())
+            `uvm_error("BINDING", "legacy identity synchronization failed")
           binding.owner_h = binding.make_handle();
         end
         mock_cmq.release_one();
@@ -6931,8 +6940,10 @@ class rdma_control_plane_test extends uvm_test;
       end
       begin
         #1ns;
-        binding.generation++;
-        binding.owner_h = binding.make_handle();
+          binding.generation++;
+          if (!binding.synchronize_identity_from_legacy_mirrors().ok())
+            `uvm_error("BINDING", "legacy identity synchronization failed")
+          binding.owner_h = binding.make_handle();
         control.release_test_function_lock(held_lock);
       end
     join
@@ -7041,6 +7052,8 @@ class rdma_control_plane_test extends uvm_test;
       begin
         #1ns;
         binding.generation++;
+        if (!binding.synchronize_identity_from_legacy_mirrors().ok())
+          `uvm_error("BINDING", "legacy identity synchronization failed")
         binding.owner_h = binding.make_handle();
         control.release_test_function_lock(held_lock);
       end

@@ -40,9 +40,12 @@ class rdma_model_test extends uvm_test;
     binding.pfvf_id = 32'h9000_0707;
     binding.pcie.bdf = '{segment:16'h1001, bus:8'h20, device:5'h03,
                          function_num:3'h5};
-    binding.pcie.parent_pf_bdf = '{segment:16'h2002, bus:8'h30,
+    binding.pcie.parent_pf_bdf = '{segment:16'h1001, bus:8'h30,
                                    device:5'h04, function_num:3'h2};
     binding.pcie.vf_index = 32'h8000_8080;
+    if (!binding.configure_identity_from_legacy_mirrors(
+          16'h1, 32'h1, RDMA_FUNCTION_VF, 16'h8080).ok())
+      `uvm_error("BINDING", "legacy binding identity configuration failed")
     binding.pcie.bar[0].base.value = 64'h0000_0000_8000_0000;
     binding.pcie.bar[0].size = 64'h4000;
     binding.pcie.bar[0].enabled = 1'b1;

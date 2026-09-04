@@ -114,6 +114,9 @@ class rdma_doorbell_scheduler_test extends uvm_test;
     binding.generation = generation;
     binding.pcie.bdf = '{segment:16'h0, bus:function_id[7:0],
                          device:5'h1, function_num:3'h0};
+    if (!binding.configure_identity_from_legacy_mirrors(
+          16'h0, 32'h1, RDMA_FUNCTION_PF).ok())
+      `uvm_error("BINDING", "legacy binding identity configuration failed")
     binding.pcie.bar[0].base.value = bar_base;
     binding.pcie.bar[0].size = 64'h4000;
     binding.pcie.bar[0].enabled = 1'b1;

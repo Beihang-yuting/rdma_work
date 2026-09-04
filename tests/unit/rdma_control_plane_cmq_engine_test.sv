@@ -251,6 +251,9 @@ class rdma_control_plane_cmq_engine_test extends uvm_test;
     binding.generation = TEST_GENERATION;
     binding.pcie.bdf = '{segment:16'h0014, bus:8'h2a,
                          device:5'h03, function_num:3'h1};
+    if (!binding.configure_identity_from_legacy_mirrors(
+          16'h0, 32'h1, RDMA_FUNCTION_PF).ok())
+      `uvm_error("BINDING", "legacy binding identity configuration failed")
     binding.pcie.bar[0].base.value = 64'h0000_0000_9000_0000;
     binding.pcie.bar[0].size = 64'h0001_0000;
     binding.pcie.bar[0].enabled = 1'b1;

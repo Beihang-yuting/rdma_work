@@ -35,6 +35,11 @@ class rdma_context_backing_contract_test extends uvm_test;
     binding.function_uid = 64'h1234_5678_9abc_def0;
     binding.global_function_id = 32'h1020_3040;
     binding.generation = 32'd17;
+    binding.pcie.bdf = '{segment:16'h0, bus:8'h20, device:5'h1,
+                         function_num:3'h0};
+    if (!binding.configure_identity_from_legacy_mirrors(
+          16'h0, 32'h1, RDMA_FUNCTION_PF).ok())
+      `uvm_error("BINDING", "legacy binding identity configuration failed")
     binding.owner_h = binding.make_handle();
     return binding;
   endfunction

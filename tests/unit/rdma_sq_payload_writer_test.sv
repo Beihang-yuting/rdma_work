@@ -17,6 +17,9 @@ class rdma_sq_payload_writer_test extends uvm_test;
     result.global_function_id = 32'h9000_0101;
     result.pcie.bdf = '{segment:16'h1001, bus:8'h20, device:5'h03,
                         function_num:3'h5};
+    if (!result.configure_identity_from_legacy_mirrors(
+          16'h0, 32'h1, RDMA_FUNCTION_PF).ok())
+      `uvm_error("BINDING", "legacy binding identity configuration failed")
     result.queue_dma.requester_bdf = result.pcie.bdf;
     result.queue_dma.pasid_valid = 1'b1;
     result.queue_dma.pasid = 20'habcde;

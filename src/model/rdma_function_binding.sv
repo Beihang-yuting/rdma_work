@@ -234,6 +234,50 @@ class rdma_function_binding extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // Compatibility-only migration helper.  Legacy callers may continue to
+  // populate the public scalar mirrors and PCIe projection, but must
+  // explicitly provide the route authority before constructing handles.
+  // host_topology_key and the PCIe BDF are required to avoid ambiguous routes.
+  function rdma_status configure_identity_from_legacy_mirrors(
+    bit [15:0] root_id,
+    bit [31:0] host_topology_key,
+    rdma_function_kind_e function_kind = RDMA_FUNCTION_PF,
+    bit [15:0] vf_index = 16'h0,
+    rdma_reset_epoch_t reset_epoch = 0
+  );
+    rdma_function_identity legacy_identity;
+    rdma_function_key_t key;
+
+    if (pcie == null)
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "PCIe identity is not instantiated");
+    key.root_id = root_id;
+    key.host_topology_key = host_topology_key;
+    key.function_kind = function_kind;
+    key.parent_pf_bdf = pcie.parent_pf_bdf;
+    key.vf_index = vf_index;
+    key.bdf = pcie.bdf;
+    legacy_identity = rdma_function_identity::type_id::create(
+      "legacy_identity");
+    if (legacy_identity.configure(key, global_function_id, function_uid,
+                                  generation, reset_epoch).ok() == 1'b0)
+      return legacy_identity.validate();
+    return configure_identity(legacy_identity);
+  endfunction
+
+  // Explicitly re-project changed legacy mirrors onto the already configured
+  // route.  This is useful during migration for tests that model a generation
+  // update by writing the legacy generation field before make_handle().
+  function rdma_status synchronize_identity_from_legacy_mirrors();
+    if (identity == null || !identity.validate().ok())
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "Function identity route is not configured");
+    return configure_identity_from_legacy_mirrors(
+      identity.key.root_id, identity.key.host_topology_key,
+      identity.key.function_kind, identity.key.vf_index, identity.reset_epoch
+    );
+  endfunction
+
   virtual function void do_copy(uvm_object rhs);
     rdma_function_binding rhs_binding;
     uvm_object cloned_object;
@@ -292,7 +336,13 @@ class rdma_function_binding extends uvm_object;
 
     // 中文：identity 缺失或非法时不得退回 legacy scalar（global ID=0 也
     // 是合法值），否则会把未配置 binding 伪装成可用 Function。
-    if (identity == null || !identity.validate().ok())
+    if (identity == null || !identity.validate().ok() ||
+        function_uid != identity.function_uid ||
+        global_function_id != identity.global_function_id ||
+        generation != identity.generation || pcie == null ||
+        !rdma_bdf_same(identity.key.bdf, pcie.bdf) ||
+        !rdma_bdf_same(identity.key.parent_pf_bdf, pcie.parent_pf_bdf) ||
+        identity.key.vf_index != pcie.vf_index)
       return null;
     handle = rdma_function_handle::type_id::create("function_handle");
     handle.kind = RDMA_RESOURCE_FUNCTION;
@@ -303,7 +353,13 @@ class rdma_function_binding extends uvm_object;
   endfunction
 
   function bit accepts(rdma_handle handle);
-    if (handle == null || identity == null || !identity.validate().ok())
+    if (handle == null || identity == null || !identity.validate().ok() ||
+        function_uid != identity.function_uid ||
+        global_function_id != identity.global_function_id ||
+        generation != identity.generation || pcie == null ||
+        !rdma_bdf_same(identity.key.bdf, pcie.bdf) ||
+        !rdma_bdf_same(identity.key.parent_pf_bdf, pcie.parent_pf_bdf) ||
+        identity.key.vf_index != pcie.vf_index)
       return 1'b0;
     return handle.kind == RDMA_RESOURCE_FUNCTION &&
            handle.function_uid == identity.function_uid &&

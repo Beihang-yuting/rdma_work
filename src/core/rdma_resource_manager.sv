@@ -1217,6 +1217,13 @@ class rdma_resource_manager extends uvm_object;
       result = null;
       return status;
     end
+    // Preserve the protected identity authority across value projection;
+    // copying only legacy mirrors leaves the projected binding unusable.
+    status = result.configure_identity(source.function_identity_snapshot());
+    if (!status.ok()) begin
+      result = null;
+      return status;
+    end
     result.queue_dma = source.queue_dma;
     result.queue_caps = source.queue_caps;
     result.interrupt_vectors = source.interrupt_vectors;

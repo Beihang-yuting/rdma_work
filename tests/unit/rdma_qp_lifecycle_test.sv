@@ -469,6 +469,7 @@ class rdma_qp_rebind_host_mem extends rdma_mock_host_mem;
     if (status != null && status.ok() && data.size() == 512 &&
         binding_target != null && !rebound) begin
       binding_target.generation++;
+      binding_target.synchronize_identity_from_legacy_mirrors();
       binding_target.owner_h = binding_target.make_handle();
       rebound = 1'b1;
     end
@@ -553,6 +554,7 @@ class rdma_qp_fault_manager extends rdma_resource_manager;
       sequence_failure = null;
       if (rebind_on_sequence_failure && binding_target != null) begin
         binding_target.generation++;
+        binding_target.synchronize_identity_from_legacy_mirrors();
         binding_target.owner_h = binding_target.make_handle();
       end
       return failure;
@@ -573,6 +575,7 @@ class rdma_qp_fault_manager extends rdma_resource_manager;
         binding_target != null) begin
       rebind_after_attach = 1'b0;
       binding_target.generation++;
+      binding_target.synchronize_identity_from_legacy_mirrors();
       binding_target.owner_h = binding_target.make_handle();
       attach_rebound = 1'b1;
     end
@@ -673,6 +676,7 @@ class rdma_qp_boundary_host_mem extends rdma_mock_host_mem;
   function void rebind();
     if (binding_target != null && !rebound) begin
       binding_target.generation++;
+      binding_target.synchronize_identity_from_legacy_mirrors();
       binding_target.owner_h = binding_target.make_handle();
       rebound = 1'b1;
     end
@@ -831,6 +835,7 @@ class rdma_qp_boundary_context_backing extends rdma_mock_context_backing;
   function void rebind();
     if (binding_target != null && !rebound) begin
       binding_target.generation++;
+      binding_target.synchronize_identity_from_legacy_mirrors();
       binding_target.owner_h = binding_target.make_handle();
       rebound = 1'b1;
     end
@@ -1085,7 +1090,10 @@ class rdma_qp_lifecycle_test extends uvm_test;
     binding.pfvf_id = 32'h1234_0099;
     binding.pcie.bdf = '{segment:16'h1, bus:8'h20, device:5'h2,
                          function_num:3'h1};
-    binding.pcie.parent_pf_bdf = binding.pcie.bdf;
+    binding.pcie.parent_pf_bdf = '0;
+    if (!binding.configure_identity_from_legacy_mirrors(
+          16'h0, 32'h1, RDMA_FUNCTION_PF).ok())
+      `uvm_error("BINDING", "legacy binding identity configuration failed")
     binding.pcie.mse = 1'b1;
     binding.pcie.bme = 1'b1;
     binding.pcie.bar[0].base.value = 64'h8000_0000;
@@ -1569,6 +1577,8 @@ class rdma_qp_lifecycle_test extends uvm_test;
     // the injected stale-generation outcome.
     if (mem.rebound) begin
       binding.generation--;
+      if (!binding.synchronize_identity_from_legacy_mirrors().ok())
+        `uvm_error("BINDING", "legacy identity synchronization failed")
       binding.owner_h = binding.make_handle();
     end
     expect_code("STALE_REBIND_LOOKUP",
@@ -2279,6 +2289,8 @@ class rdma_qp_lifecycle_test extends uvm_test;
     recovery.ambiguous_ticket.opcode_key.variant = "delete";
 
     binding.generation++;
+    if (!binding.synchronize_identity_from_legacy_mirrors().ok())
+      `uvm_error("BINDING", "legacy identity synchronization failed")
     binding.owner_h = binding.make_handle();
     expect_code("STALE_FORGED_PUBLIC_LOOKUP",
                 manager.lookup(qp.handle, resource),
@@ -2403,6 +2415,8 @@ class rdma_qp_lifecycle_test extends uvm_test;
                            RDMA_TRANSPORT_RC);
     expected_owner = binding.make_handle();
     binding.generation++;
+    if (!binding.synchronize_identity_from_legacy_mirrors().ok())
+      `uvm_error("BINDING", "legacy identity synchronization failed")
     binding.owner_h = binding.make_handle();
     executor.create_locked(binding, expected_owner, request, 400, qp, result);
     expect_code("CREATE_FENCE_PRE_STATUS", result.status,
@@ -2413,6 +2427,8 @@ class rdma_qp_lifecycle_test extends uvm_test;
                  "pre-create stale generation had side effects")
 
     binding.generation--;
+    if (!binding.synchronize_identity_from_legacy_mirrors().ok())
+      `uvm_error("BINDING", "legacy identity synchronization failed")
     binding.owner_h = binding.make_handle();
     request.owner = binding.make_handle();
     cmq.pause_cmq_opcode(XTR_V1_OP_QPC_CREATE);
@@ -2424,6 +2440,8 @@ class rdma_qp_lifecycle_test extends uvm_test;
       begin
         cmq.wait_until_entered(1, 20ns, gate_observed);
         binding.generation++;
+        if (!binding.synchronize_identity_from_legacy_mirrors().ok())
+          `uvm_error("BINDING", "legacy identity synchronization failed")
         binding.owner_h = binding.make_handle();
         cmq.release_cmq_opcode(XTR_V1_OP_QPC_CREATE);
       end

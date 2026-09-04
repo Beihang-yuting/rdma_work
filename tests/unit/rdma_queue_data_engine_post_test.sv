@@ -41,7 +41,10 @@ class rdma_queue_data_engine_fixture extends uvm_object;
     result.pfvf_id = 32'h1234_0099;
     result.pcie.bdf = '{segment:16'h1, bus:8'h20, device:5'h2,
                         function_num:3'h1};
-    result.pcie.parent_pf_bdf = result.pcie.bdf;
+    result.pcie.parent_pf_bdf = '0;
+    if (!result.configure_identity_from_legacy_mirrors(
+          16'h0, 32'h1, RDMA_FUNCTION_PF).ok())
+      `uvm_error("BINDING", "legacy binding identity configuration failed")
     result.pcie.mse = 1'b1;
     result.pcie.bme = 1'b1;
     result.pcie.bar[0].base.value = 64'h8000_0000;

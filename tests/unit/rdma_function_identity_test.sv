@@ -70,6 +70,20 @@ class rdma_function_identity_test extends uvm_test;
     if (handle != null)
       `uvm_error("IDENTITY", "legacy scalar fallback created a handle")
 
+    // Explicit compatibility configuration migrates the legacy mirrors while
+    // still requiring a deterministic host/root/PCIe route.
+    binding.pcie.bdf = '{segment:0, bus:8'h20, device:5'h1,
+                         function_num:3'h0};
+    status = binding.configure_identity_from_legacy_mirrors(
+      16'h0, 32'h1, RDMA_FUNCTION_PF);
+    if (!status.ok())
+      `uvm_error("IDENTITY", $sformatf("legacy identity migration failed: %s",
+                                        status.convert2string()))
+    handle = binding.make_handle();
+    if (handle == null || handle.function_uid != 64'hfeed ||
+        handle.object_id != 32'hbeef || handle.generation != 32'h7)
+      `uvm_error("IDENTITY", "explicit legacy migration did not create handle")
+
     status = binding.configure_identity(rhs);
     if (!status.ok())
       `uvm_error("IDENTITY", $sformatf("binding identity configure failed: %s",

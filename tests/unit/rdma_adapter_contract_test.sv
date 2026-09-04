@@ -74,6 +74,9 @@ class rdma_adapter_contract_test extends uvm_test;
     binding.generation = 32'd17;
     binding.pcie.bdf = '{segment:16'h1, bus:8'h22, device:5'h3,
                          function_num:3'h4};
+    if (!binding.configure_identity_from_legacy_mirrors(
+          16'h0, 32'h1, RDMA_FUNCTION_PF).ok())
+      `uvm_error("BINDING", "legacy binding identity configuration failed")
     binding.pcie.bar[0].base.value = 64'h8000_0000;
     binding.pcie.bar[0].size = 64'h4000;
     binding.pcie.bar[0].enabled = 1'b1;
