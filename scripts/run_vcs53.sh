@@ -57,7 +57,7 @@ trap cleanup EXIT
 rsync -a --exclude .git "$repo_root/" "$REMOTE_HOST:$remote_dir/"
 
 remote_env=()
-for var_name in HOST_MEM_ROOT PCIE_WORK_ROOT NET_PACKET_ROOT AXIS_VIP_ROOT; do
+for var_name in HOST_MEM_ROOT DPU_COMMON_ROOT PCIE_WORK_ROOT NET_PACKET_ROOT AXIS_VIP_ROOT; do
   if [[ -v "$var_name" ]]; then
     printf -v quoted_value '%q' "${!var_name}"
     remote_env+=("$var_name=$quoted_value")
