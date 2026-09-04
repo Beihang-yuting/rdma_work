@@ -8,6 +8,8 @@ class rdma_reset_coordinator_test extends uvm_test;
   `uvm_component_utils(rdma_reset_coordinator_test)
 
   // 功能：构造 UVM reset coordinator 测试组件；测试场景在 run_phase() 中执行。
+  // 输入/输出及副作用：name、parent（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：构造过程不分配 Host-memory、PCIe endpoint 或 manager 资源；空 name 也必须得到可配置对象。
   function new(string name = "rdma_reset_coordinator_test",
                uvm_component parent = null);
     super.new(name, parent);
@@ -15,6 +17,9 @@ class rdma_reset_coordinator_test extends uvm_test;
 
   // 功能：构造一个具有指定 Host/root、PF/VF parent BDF、global ID 和 UID 的 identity
   //       夹具，统一生成 reset 范围测试所需的完整 authority。
+  // 输入/输出及副作用：host_key（输入）、root_id（输入）、kind（输入）、vf_index（输入）、bdf_value（输入）、parent_bdf_value（输入）、uid（输入）；输入字段被复制到返回值或
+  //   output；生成结果与输入隔离，不隐式修改调用方对象。
+  // 失败/边界：输入为空、类型不匹配或字段组合非法时返回空值/错误；不得发布不完整快照。
   function automatic rdma_function_identity make_identity(
     int unsigned host_key,
     int unsigned root_id,
@@ -49,6 +54,8 @@ class rdma_reset_coordinator_test extends uvm_test;
 
   // 功能：依次执行 VF FLR、PF reset、Host reset 和 Device reset，并断言每种操作只
   //       推进规范定义的 Function/Host epoch。
+  // 输入/输出及副作用：phase（输入）；phase 由 UVM 提供；task 通过 objection、日志和断言暴露结果，可能调用 DUT 接口但不改变其所有权规则。
+  // 失败/边界：仿真超时、事务返回错误或断言不满足时报告 UVM_ERROR/UVM_FATAL；空 fixture 不得被当作成功。
   task run_phase(uvm_phase phase);
     rdma_reset_coordinator coordinator;
     rdma_function_identity pf0, vf0, pf1, mutated;

@@ -27,10 +27,9 @@ class rdma_dma_request_context extends uvm_object;
   bit queue_role_valid;
   int unsigned queue_role;
 
-  // 功能：构造当前对象并初始化其字段、集合和 UVM 名称；不接管传入句柄的生命周期。
-  // 输入/输出及副作用：name 仅用于 UVM 对象命名；内部字段被初始化为安全默认值，传入句柄不转移所有权。
-  //   返回新对象实例；构造失败由 UVM 工厂或调用方处理。
-  // 失败/边界：不创建外部资源；name 为空时仍允许构造，但所有字段必须保持可配置的初始值。
+  // 功能：构造 rdma_dma_request_context，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：function_h=null；requester_bdf='0；pasid_valid=1'b0；pasid='0；dma_domain_valid=1'b0；dma_domain_id='0；route='0；reset_epoch=0；其余字段按实现默认值初始化。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_dma_request_context 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_dma_request_context");
     super.new(name);
     function_h = null;
@@ -48,10 +47,10 @@ class rdma_dma_request_context extends uvm_object;
     queue_role = '0;
   endfunction
 
-  // 功能：检查输入字段、身份和生命周期约束，返回可诊断的校验状态；失败时不提交部分更新。
-  // 输入/输出及副作用：输入为待校验字段或快照；返回 rdma_status，校验过程不提交资源和游标。
-  //   空依赖、非法范围、身份不一致或非活动状态会返回错误。
-  // 失败/边界：任何非法枚举、越界字段、缺失必需依赖或身份/代际不一致都必须返回非成功状态。
+  // 功能：validate 校验 当前对象字段 与当前对象状态的一致性，并显式处理“DMA request Function is invalid”等拒绝条件，返回 rdma_status 供上层决定是否提交。
+  // 输入/输出及副作用：无显式参数；validate 读取 对象字段：rdma_status、function_h、function_h.kind、function_h.generation、route_valid、route、pasid_valid、pasid 并使用字段 status；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：validate 返回 RDMA_SC_INVALID_ARGUMENT、RDMA_SC_STALE_GENERATION、RDMA_SC_DMA_TRANSLATION；典型拒绝条件为“DMA request Function is invalid”“DMA request Function generation is zero”；失败路径不提交部分状态或转移未声明资源。
+
   function rdma_status validate();
     rdma_status status;
 
@@ -75,10 +74,9 @@ class rdma_dma_request_context extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：从源对象复制可变字段并生成独立值快照；源对象保持不变，类型不匹配时报告复制错误。
-  // 输入/输出及副作用：source/rhs 是源对象；返回或写入独立副本，不修改源对象。
-  //   source/rhs 为空或类型不匹配时返回空值或触发既定复制错误。
-  // 失败/边界：空源对象不应解引用；类型不匹配必须拒绝复制或按既定 UVM 规则报告 fatal。
+  // 功能：将 rhs 中 rdma_dma_request_context 的值字段复制到当前对象，建立与源对象隔离的快照。
+  // 输入/输出及副作用：rhs（输入）；rhs 是源对象；当前对象字段会被覆盖，嵌套句柄按实现执行 clone 或保持非拥有引用，源对象不被修改。
+  // 失败/边界：do_copy 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（rdma_dma_request_context copy type mismatch），不保留部分有效快照。
   virtual function void do_copy(uvm_object rhs);
     rdma_dma_request_context rhs_context;
     uvm_object cloned_object;

@@ -9,12 +9,16 @@ class rdma_device_env_test extends uvm_test;
   `uvm_component_utils(rdma_device_env_test)
 
   // 功能：构造 device env 枚举测试组件；测试主体在 run_phase() 中执行。
+  // 输入/输出及副作用：name、parent（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：构造过程不分配 Host-memory、PCIe endpoint 或 manager 资源；空 name 也必须得到可配置对象。
   function new(string name = "rdma_device_env_test",
                uvm_component parent = null);
     super.new(name, parent);
   endfunction
 
   // 功能：返回单 PF fixture 使用的 Host/PF key，和 dpu_common snapshot 查询保持一致。
+  // 输入/输出及副作用：无显式参数；make_key 读取局部计算结果，并使用字段 key.host_id、key.pf_id、key.kind、key.vf_id；函数返回 dpu_function_key_t，不取得调用方资源所有权。
+  // 失败/边界：输入为空、类型不匹配或字段组合非法时返回空值/错误；不得发布不完整快照。
   function automatic dpu_function_key_t make_key();
     dpu_function_key_t key;
     key.host_id = 0;
@@ -25,7 +29,8 @@ class rdma_device_env_test extends uvm_test;
   endfunction
 
   // 功能：构造带真实 PCIe ID、三类 BAR、global ID 的冻结 device/resource snapshot。
-  // 输出：通过 output 返回两份相互关联的测试快照；任何夹具错误直接报告 fatal。
+  // 输入/输出及副作用：device_snapshot（输出）、resource_snapshot（输出）；build_snapshots 驱动下游事务，并写入 device_snapshot、resource_snapshot；函数返回 无直接返回值，不取得调用方资源所有权。
+  // 失败/边界：输入为空、类型不匹配或字段组合非法时返回空值/错误；不得发布不完整快照。
   task automatic build_snapshots(
     output rdma_dpu_test_device_snapshot device_snapshot,
     output rdma_dpu_test_resource_snapshot resource_snapshot
@@ -73,7 +78,8 @@ class rdma_device_env_test extends uvm_test;
   endtask
 
   // 功能：验证 device env build 后可按 identity 和 Function handle 找到同一 context。
-  // 副作用：只创建集成层对象并读取索引，不触发 queue allocation 或外部 I/O。
+  // 输入/输出及副作用：phase（输入）；phase 由 UVM 提供；task 通过 objection、日志和断言暴露结果，可能调用 DUT 接口但不改变其所有权规则。
+  // 失败/边界：仿真超时、事务返回错误或断言不满足时报告 UVM_ERROR/UVM_FATAL；空 fixture 不得被当作成功。
   task run_phase(uvm_phase phase);
     rdma_dpu_test_device_snapshot device_snapshot;
     rdma_dpu_test_resource_snapshot resource_snapshot;

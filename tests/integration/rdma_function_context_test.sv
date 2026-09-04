@@ -9,11 +9,15 @@ class rdma_context_test_resource_snapshot extends dpu_resource_snapshot;
   `uvm_object_utils(rdma_context_test_resource_snapshot)
 
   // 功能：构造可被 context build 接受的测试资源快照对象。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：构造过程不分配 Host-memory、PCIe endpoint 或 manager 资源；空 name 也必须得到可配置对象。
   function new(string name = "rdma_context_test_resource_snapshot");
     super.new(name);
   endfunction
 
   // 功能：将测试快照标记为冻结；该夹具不伪造任何 queue/resource binding。
+  // 输入/输出及副作用：无显式参数；force_frozen 读取 对象字段：m_frozen 并使用字段 m_frozen；函数返回 void，不取得调用方资源所有权。
+  // 失败/边界：force_frozen 无返回值，仅执行 m_frozen=1'b1；调用方须保证前置依赖已经绑定，函数不自动重试或接管外部资源。
   function void force_frozen();
     m_frozen = 1'b1;
   endfunction
@@ -23,13 +27,16 @@ class rdma_function_context_test extends uvm_test;
   `uvm_component_utils(rdma_function_context_test)
 
   // 功能：构造 UVM Function context 生命周期测试组件。
+  // 输入/输出及副作用：name、parent（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：构造过程不分配 Host-memory、PCIe endpoint 或 manager 资源；空 name 也必须得到可配置对象。
   function new(string name = "rdma_function_context_test",
                uvm_component parent = null);
     super.new(name, parent);
   endfunction
 
   // 功能：创建一个具有完整 Host/root/PF BDF authority 的 identity 夹具。
-  // 输出：返回由测试独占的 identity；失败通过 UVM fatal 终止当前测试。
+  // 输入/输出及副作用：无显式参数；make_identity 读取局部计算结果，并使用字段 key.root_id、key.host_topology_key、key.function_kind、key.vf_index、key.parent_pf_bdf、key.bdf、identity、status；函数返回 rdma_function_identity，不取得调用方资源所有权。
+  // 失败/边界：输入为空、类型不匹配或字段组合非法时返回空值/错误；不得发布不完整快照。
   function automatic rdma_function_identity make_identity();
     rdma_function_identity identity;
     rdma_function_key_t key;
@@ -50,7 +57,8 @@ class rdma_function_context_test extends uvm_test;
   endfunction
 
   // 功能：验证 context 的 build→activate→quiesce→reset 迁移和 queue 查询边界。
-  // 副作用：只修改测试创建的 context 状态，不访问外部组件或真实内存。
+  // 输入/输出及副作用：phase（输入）；phase 由 UVM 提供；task 通过 objection、日志和断言暴露结果，可能调用 DUT 接口但不改变其所有权规则。
+  // 失败/边界：仿真超时、事务返回错误或断言不满足时报告 UVM_ERROR/UVM_FATAL；空 fixture 不得被当作成功。
   task run_phase(uvm_phase phase);
     rdma_function_identity identity;
     rdma_context_test_resource_snapshot resources;

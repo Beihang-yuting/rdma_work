@@ -19,6 +19,8 @@ class rdma_host_mem_route_entry extends uvm_object;
 
   // 功能：构造一个未绑定 manager 的 Host route entry；调用方随后填写 Host key 和
   //       非拥有 manager 引用，再交给 router.configure() 做完整校验。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：构造过程不分配 Host-memory、PCIe endpoint 或 manager 资源；空 name 也必须得到可配置对象。
   function new(string name = "rdma_host_mem_route_entry");
     super.new(name);
     host_topology_key = 0;
@@ -57,13 +59,18 @@ class rdma_host_mem_router extends rdma_host_mem_api;
 
   // 功能：构造空 Host-memory router，初始化 reset coordinator 引用；路由表由 configure()
   //       发布，mapping ledger 由 allocate() 建立。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：构造过程不分配 Host-memory、PCIe endpoint 或 manager 资源；空 name 也必须得到可配置对象。
   function new(string name = "rdma_host_mem_router");
     super.new(name);
     m_reset = null;
   endfunction
 
-  // 功能：连接共享 reset coordinator，使 router 能读取 Function/Host/Device epoch。
   // 所有权：只保存非拥有引用，不负责 coordinator 的创建或销毁。
+  // 功能：连接共享 reset coordinator，使 router 能读取 Function/Host/Device epoch。
+  // 输入/输出及副作用：coordinator（输入）；仅保存非拥有引用，后续读写/分配会从中读取
+  //   Host、Function 和 Device epoch；函数无返回状态且不触碰现有 mapping。
+  // 失败/边界：传入 null 也会清除引用；调用方必须在使用 router 前重新绑定有效 coordinator。
   function void attach_reset_coordinator(
     rdma_reset_coordinator coordinator
   );
@@ -71,7 +78,8 @@ class rdma_host_mem_router extends rdma_host_mem_api;
   endfunction
 
   // 功能：事务性校验并替换 Host→manager 路由表，同时重置本地 Host epoch ledger。
-  // 边界：存在 active mapping、空 entry、重复 Host 或同一 manager 绑定多个 Host 时拒绝，
+  // 输入/输出及副作用：entries（输入）；调用方必须先完成输入对象的空值、authority 和 generation 校验；成功时更新本对象配置/状态并保存非拥有引用，返回 rdma_status。
+  // 失败/边界：存在 active mapping、空 entry、重复 Host 或同一 manager 绑定多个 Host 时拒绝，
   //       旧配置保持不变以保留 mapping 的释放出口。
   function rdma_status configure(rdma_host_mem_route_entry entries[$]);
     rdma_host_mem_api new_managers[int unsigned];
@@ -107,9 +115,9 @@ class rdma_host_mem_router extends rdma_host_mem_api;
 
   // 功能：依据请求快照选择 Host manager，分配 DMA mapping，并保存完整 Function/owner/
   //       route/requester BDF 及四维 reset epoch ledger。
-  // 输入/输出：request_context 描述完整 route 和 authority；mapping 返回 manager backing
-  //       的受 router 保护视图。副作用是调用外部 manager.allocate()。
-  // 边界：route/epoch 缺失、Host 未配置、manager 返回 authority 不匹配或 epoch 过期时拒绝。
+  // 输入/输出及副作用：request_context（输入）、size（输入）、alignment（输入）、direction（输入）、mapping（输出）；输入请求/句柄定义资源属性；成功时更新账本并通过返回值或
+  //   output 发布新句柄/映射。
+  // 失败/边界：route/epoch 缺失、Host 未配置、manager 返回 authority 不匹配或 epoch 过期时拒绝。
   function rdma_status allocate(
     rdma_dma_request_context request_context,
     int unsigned size,
@@ -234,7 +242,9 @@ class rdma_host_mem_router extends rdma_host_mem_api;
   endfunction
 
   // 功能：验证 mapping 的 route、authority 和 reset ledger 后，将写请求转发到对应 Host manager。
-  // 边界：mapping 被篡改、释放、过期或 Host 路由不存在时不触碰底层 manager。
+  // 输入/输出及副作用：mapping/offset/data（输入）；校验通过后把写请求转发给 mapping 所在
+  //   Host manager，底层 manager 自行维护其 backing 状态。
+  // 失败/边界：mapping 被篡改、释放、过期或 Host 路由不存在时不触碰底层 manager。
   function rdma_status write(
     rdma_dma_mapping mapping,
     longint unsigned offset,
@@ -253,7 +263,9 @@ class rdma_host_mem_router extends rdma_host_mem_api;
   endfunction
 
   // 功能：验证 mapping 后从对应 Host manager 读取指定范围，并通过 data 返回字节数组。
-  // 边界：校验失败时先清空 data 并返回错误，避免调用方误用旧读数据。
+  // 输入/输出及副作用：mapping/offset/size（输入）、data（输出）；函数入口先清空 data，校验
+  //   通过后由对应 Host manager 填充读取字节，不取得 mapping 或 manager 所有权。
+  // 失败/边界：校验失败时先清空 data 并返回错误，避免调用方误用旧读数据。
   function rdma_status read(
     rdma_dma_mapping mapping,
     longint unsigned offset,
@@ -275,7 +287,9 @@ class rdma_host_mem_router extends rdma_host_mem_api;
 
   // 功能：验证 mapping 后把释放操作交给原 Host manager；底层成功时同步删除所有 parallel
   //       authority ledger，防止同一对象再次被路由访问。
-  // 边界：校验失败或 manager 释放失败时保留 ledger，便于调用方重试或诊断。
+  // 输入/输出及副作用：mapping（输入）；先校验本地 ledger，再调用原 Host manager 释放；底层
+  //   成功后同步删除 parallel authority/epoch 数组，失败时保留 ledger 供重试。
+  // 失败/边界：校验失败或 manager 释放失败时保留 ledger，便于调用方重试或诊断。
   function rdma_status \release (rdma_dma_mapping mapping);
     int index;
     rdma_host_mem_api manager;
@@ -293,7 +307,9 @@ class rdma_host_mem_router extends rdma_host_mem_api;
   endfunction
 
   // 功能：推进指定 Host 的 router-local epoch，使该 Host 上已有 mapping 在下一次访问时失效。
-  // 边界：未配置的 Host 不创建隐式路由或 epoch，保持配置错误可见。
+  // 输入/输出及副作用：host_topology_key（输入）；仅当该 Host 已配置时递增 router-local epoch，
+  //   不创建路由、不直接释放 mapping。
+  // 失败/边界：未配置的 Host 不创建隐式路由或 epoch，保持配置错误可见。
   function void advance_host_epoch(int unsigned host_topology_key);
     if (m_epochs.exists(host_topology_key))
       m_epochs[host_topology_key]++;
@@ -301,6 +317,9 @@ class rdma_host_mem_router extends rdma_host_mem_api;
 
   // 功能：返回指定 Host 的 local、coordinator 和 Device epoch 之和，供兼容调用方读取
   //       当前聚合 reset 代数；mapping 内部仍按四个维度分别比较。
+  // 输入/输出及副作用：host_topology_key（输入）；返回 router-local、coordinator Host 和 Device
+  //   epoch 的兼容聚合值；未配置 Host 返回其可见的 coordinator/Device 部分或零。
+  // 失败/边界：host_topology_key 未登记时 local epoch 为 0；函数只读 ledger，不创建隐式 Host 路由。
   function rdma_reset_epoch_t host_epoch(int unsigned host_topology_key);
     rdma_reset_epoch_t local_host_epoch;
     rdma_reset_epoch_t coordinator_host_epoch;
@@ -314,6 +333,9 @@ class rdma_host_mem_router extends rdma_host_mem_api;
 
   // 功能：对 mapping 做边界完整性检查，包括 route、Function/owner authority、requester
   //       BDF、四维 reset epoch 和 manager 存在性；返回错误时禁止任何外部访问。
+  // 输入/输出及副作用：mapping（输入）、index（输入）；validate_mapping 读取 mapping、index 并使用字段 local_host_epoch、coordinator_host_epoch、function_epoch_value、device_epoch_value；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：validate_mapping 返回 RDMA_SC_INVALID_ARGUMENT、RDMA_SC_DMA_TRANSLATION、RDMA_SC_STALE_GENERATION；典型拒绝条件为“unknown DMA mapping”“DMA mapping route was modified”；失败路径不提交部分状态或转移未声明资源。
+
   protected function rdma_status validate_mapping(
     rdma_dma_mapping mapping,
     int index
@@ -375,6 +397,9 @@ class rdma_host_mem_router extends rdma_host_mem_api;
   endfunction
 
   // 功能：计算四维 epoch 的兼容聚合值，仅用于 mapping 对外字段和旧接口；不会替代逐维校验。
+  // 输入/输出及副作用：四个 epoch（输入）；只读返回它们的算术和，供兼容 mapping 字段使用；不执行
+  //   溢出检查，也不修改 ledger。
+  // 失败/边界：输入 epoch 相加发生定宽回绕时按 SystemVerilog 定宽算术返回；函数不修改任何 ledger。
   protected function rdma_reset_epoch_t epoch_sum(
     rdma_reset_epoch_t local_host_epoch,
     rdma_reset_epoch_t coordinator_host_epoch,
@@ -386,6 +411,9 @@ class rdma_host_mem_router extends rdma_host_mem_api;
   endfunction
 
   // 功能：按对象身份在 router 自有 mapping 列表中定位 ledger 下标；未找到返回 -1。
+  // 输入/输出及副作用：mapping（输入）；按对象句柄身份在 m_maps 中查找并返回并行 ledger 下标；不
+  //   比较或校验 mapping 字段，也不修改数组。
+  // 失败/边界：mapping 为 null 或不在 m_maps 中时返回 -1；仅返回索引，不释放底层 mapping。
   protected function int find_mapping(rdma_dma_mapping mapping);
     foreach (m_maps[index])
       if (m_maps[index] === mapping)
@@ -394,6 +422,9 @@ class rdma_host_mem_router extends rdma_host_mem_api;
   endfunction
 
   // 功能：比较 Host/root/segment/BDF 完整 route key，用于 mapping ledger 一致性校验。
+  // 输入/输出及副作用：lhs/rhs（输入值）；只读比较 Host/root/segment/BDF 标量字段，不更新
+  //   mapping 或 ledger；该值类型比较没有失败返回路径。
+  // 失败/边界：任一路由字段不相等时返回 0；packed route 比较不抛出异常。
   protected function bit same_route(rdma_route_key_t lhs,
                                     rdma_route_key_t rhs);
     return lhs.host_topology_key == rhs.host_topology_key &&
@@ -403,6 +434,9 @@ class rdma_host_mem_router extends rdma_host_mem_api;
 
   // 功能：清空所有 mapping 与 parallel authority ledger；仅在确认没有 active mapping
   //       的 configure() 提交阶段调用。
+  // 输入/输出及副作用：无参数；清空 router 自有 mapping 及所有 parallel authority/epoch ledger。
+  //   仅由 configure() 在确认无 active mapping 后调用，不负责释放底层 manager backing。
+  // 失败/边界：调用方若未先确认无 active mapping，清空会丢失本地索引；函数本身不检查或释放 manager backing。
   protected function void clear_mapping_ledgers();
     m_maps.delete();
     m_map_epochs.delete();
@@ -424,6 +458,9 @@ class rdma_host_mem_router extends rdma_host_mem_api;
   endfunction
 
   // 功能：按同一 index 同步删除 mapping 的全部 authority/epoch ledger，保持数组对齐。
+  // 输入/输出及副作用：index（输入）；从所有 parallel 数组删除同一下标，保持 ledger 对齐。
+  //   调用前必须已完成 manager 释放和 index 查找；本函数不校验对象，也不执行底层释放。
+  // 失败/边界：index 不存在时各 associative array 的 delete 保持幂等；函数不触发底层 Host-memory release。
   protected function void delete_mapping_ledgers(int index);
     m_maps.delete(index);
     m_map_epochs.delete(index);

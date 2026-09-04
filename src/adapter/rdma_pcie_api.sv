@@ -8,18 +8,16 @@
 
 virtual class rdma_pcie_api extends uvm_object;
 
-  // 功能：构造当前对象并初始化其字段、集合和 UVM 名称；不接管传入句柄的生命周期。
-  // 输入/输出及副作用：name 仅用于 UVM 对象命名；内部字段被初始化为安全默认值，传入句柄不转移所有权。
-  //   返回新对象实例；构造失败由 UVM 工厂或调用方处理。
-  // 失败/边界：不创建外部资源；name 为空时仍允许构造，但所有字段必须保持可配置的初始值。
+  // 功能：构造 rdma_pcie_api，调用 super.new 建立 UVM 层级对象；外部依赖字段保持未绑定，后续由 configure/build/activate 明确注入。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_pcie_api 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_pcie_api");
     super.new(name);
   endfunction
 
-  // 功能：把 cfg_read32 的配置或编程请求提交到后端适配器，并返回后端确认状态。
-  // 输入/输出及副作用：参数 target, offset, data, status 用于执行 cfg_read32；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：cfg_read32 的后端拒绝或超时时不推进本地配置游标，ambiguous 提交必须进入恢复路径。
+  // 功能：在 rdma_pcie_api 中，cfg_read32 把 cfg_read32 的配置/编程请求提交到后端适配器，并返回后端确认状态。
+  // 输入/输出及副作用：target（输入）、offset（输入）、data（输出）、status（输出）；cfg_read32 驱动下游事务，并写入 data、status；函数返回 无直接返回值，不取得调用方资源所有权。
+  // 失败/边界：cfg_read32 遇到后端拒绝、范围溢出或 DMA 权限不足时保留失败证据，不推进本地游标。
   pure virtual task cfg_read32(
     rdma_bdf_t target,
     rdma_cfg_offset_t offset,
@@ -27,10 +25,10 @@ virtual class rdma_pcie_api extends uvm_object;
     output rdma_status status
   );
 
-  // 功能：把 cfg_write32 的配置或编程请求提交到后端适配器，并返回后端确认状态。
-  // 输入/输出及副作用：参数 target, offset, data, byte_enable, status 用于执行 cfg_write32；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：cfg_write32 的后端拒绝或超时时不推进本地配置游标，ambiguous 提交必须进入恢复路径。
+  // 功能：在 rdma_pcie_api 中，cfg_write32 把 cfg_write32 的配置/编程请求提交到后端适配器，并返回后端确认状态。
+  // 输入/输出及副作用：target（输入）、offset（输入）、data（输入）、byte_enable（输入）、status（输出）；cfg_write32 驱动下游事务，并写入 status；函数返回 无直接返回值，不取得调用方资源所有权。
+
+  // 失败/边界：cfg_write32 遇到后端拒绝、范围溢出或 DMA 权限不足时保留失败证据，不推进本地游标。
   pure virtual task cfg_write32(
     rdma_bdf_t target,
     rdma_cfg_offset_t offset,
@@ -39,10 +37,9 @@ virtual class rdma_pcie_api extends uvm_object;
     output rdma_status status
   );
 
-  // 功能：向指定后端写入请求数据并保留返回状态；写入失败时不推进本地提交游标。
-  // 输入/输出及副作用：参数 function_h, address, data, status 用于执行 mmio_write；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：后端拒绝或写入范围越界时不推进本地提交游标，也不伪造成功状态。
+  // 功能：在 rdma_pcie_api 中，mmio_write 把请求数据写入指定后端并保留返回状态；只有写入成功才允许本地游标继续推进。
+  // 输入/输出及副作用：function_h（输入）、address（输入）、data（输入）、status（输出）；mmio_write 驱动下游事务，并写入 status；函数返回 无直接返回值，不取得调用方资源所有权。
+  // 失败/边界：mmio_write 遇到后端拒绝、范围溢出或 DMA 权限不足时保留失败证据，不推进本地游标。
   pure virtual task mmio_write(
     rdma_function_handle function_h,
     rdma_bar_addr_t address,
@@ -50,37 +47,33 @@ virtual class rdma_pcie_api extends uvm_object;
     output rdma_status status
   );
 
-  // 功能：处理 dma_visibility_barrier：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 function_h, status 用于执行 dma_visibility_barrier；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：dma_visibility_barrier 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：在 rdma_pcie_api 中，dma_visibility_barrier 在截止时间内执行 DMA 可见性或 MMIO 顺序屏障，确保 doorbell 之前的数据写入已按序可见。
+  // 输入/输出及副作用：function_h（输入）、status（输出）；dma_visibility_barrier 驱动下游事务，并写入 status；函数返回 无直接返回值，不取得调用方资源所有权。
+  // 失败/边界：dma_visibility_barrier 失败或超时通过 status 明确发布；该路径不隐式重试，也不转移未声明资源。
   pure virtual task dma_visibility_barrier(
     rdma_function_handle function_h,
     output rdma_status status
   );
 
-  // 功能：处理 mmio_ordering_barrier：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 function_h, status 用于执行 mmio_ordering_barrier；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：mmio_ordering_barrier 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：在 rdma_pcie_api 中，mmio_ordering_barrier 在截止时间内执行 DMA 可见性或 MMIO 顺序屏障，确保 doorbell 之前的数据写入已按序可见。
+  // 输入/输出及副作用：function_h（输入）、status（输出）；mmio_ordering_barrier 驱动下游事务，并写入 status；函数返回 无直接返回值，不取得调用方资源所有权。
+  // 失败/边界：mmio_ordering_barrier 失败或超时通过 status 明确发布；该路径不隐式重试，也不转移未声明资源。
   pure virtual task mmio_ordering_barrier(
     rdma_function_handle function_h,
     output rdma_status status
   );
 
-  // 功能：按输入的完整标识查询当前权威记录并返回独立快照；缺失、歧义或代际过期时返回明确错误。
-  // 输入/输出及副作用：输入为完整 key/handle，output 或返回值为记录快照；查询不改变登记表和外部资源。
-  //   缺失、歧义、空句柄或旧 generation/reset epoch 返回明确错误。
-  // 失败/边界：查询不到唯一记录、输入为空或 authority 已失效时返回错误，不回退到默认 Function/root。
+  // 功能：在 rdma_pcie_api 中，get_function_info 按完整 key/handle 查找唯一权威记录并返回 detached 快照，避免把内部可变引用泄露给调用方。
+  // 输入/输出及副作用：bdf（输入）、info（输出）；get_function_info 以 bdf.segment、bdf.bus、bdf.device、bdf.function 查询冻结 PCIe Function 信息，并写入 info；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：get_function_info 在 key/handle 缺失、记录不唯一或 generation/reset epoch 过期时返回明确错误，不回退到默认 authority。
   pure virtual function rdma_status get_function_info(
     rdma_bdf_t bdf,
     output rdma_pcie_function_info info
   );
 
-  // 功能：从硬件 image/缓冲区解码请求字段，验证布局和完整性后向调用方返回值或状态。
-  // 输入/输出及副作用：参数 address, result 用于执行 decode_bar；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：镜像为空、长度不足或校验失败时不发布部分模型字段。
+  // 功能：在 rdma_pcie_api 中，decode_bar 从硬件 image/缓冲区解码字段，验证长度、布局和完整性后返回模型或状态。
+  // 输入/输出及副作用：address（输入）、result（输出）；输入 image/bytes 只读；成功时通过返回值或 output 发布 detached 解码快照，不接管调用方缓冲区。
+  // 失败/边界：decode_bar 遇到 image/model 为空、长度/对齐/保留位非法或 codec 校验失败时不发布部分字段。
   pure virtual function rdma_status decode_bar(
     rdma_bar_addr_t address,
     output rdma_bar_decode result

@@ -18,17 +18,16 @@ class rdma_queue_data_engine_fixture extends uvm_object;
   rdma_queue_lifecycle_executor queue_executor;
   rdma_qp_lifecycle_executor qp_executor;
   rdma_doorbell_scheduler scheduler;
-  rdma_xtr_v1_doorbell_codec_registry registry;
+  rdma_hw_doorbell_codec_registry registry;
   rdma_queue_data_engine engine;
   rdma_pd pd;
   rdma_ceq ceq;
   rdma_cq cq;
   rdma_qp qp;
 
-  // 功能：构造当前对象并初始化其字段、集合和 UVM 名称；不接管传入句柄的生命周期。
-  // 输入/输出及副作用：name 仅用于 UVM 对象命名；内部字段被初始化为安全默认值，传入句柄不转移所有权。
-  //   返回新对象实例；构造失败由 UVM 工厂或调用方处理。
-  // 失败/边界：不创建外部资源；name 为空时仍允许构造，但所有字段必须保持可配置的初始值。
+  // 功能：构造 rdma_queue_data_engine_fixture，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：binding=null；manager=null；mem=null；pcie=null；contexts=null；cmq=null；queue_executor=null；qp_executor=null；其余字段按实现默认值初始化。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_queue_data_engine_fixture 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_queue_data_engine_fixture");
     super.new(name);
     binding = null; manager = null; mem = null; pcie = null;
@@ -37,10 +36,9 @@ class rdma_queue_data_engine_fixture extends uvm_object;
     pd = null; ceq = null; cq = null; qp = null;
   endfunction
 
-  // 功能：依据输入请求创建对应的值对象或资源计划，并校验依赖、所有权和生命周期后返回结果。
-  // 输入/输出及副作用：输入请求、容量和依赖用于构造/预留资源；返回独立对象或状态，不暴露内部可变集合。
-  //   参数越界、容量不足或构造中途失败时回滚已登记的局部状态。
-  // 失败/边界：依赖为空、参数越界、容量不足或构造步骤失败时清理局部结果并返回明确错误。
+  // 功能：make_binding 创建独立的 rdma_function_binding；根据 name 设置字段 result、result.function_uid、result.generation、result.global_function_id、result.host_id、result.rdma_vf_id、result.pfvf_id、pcie.bdf、pcie.parent_pf_bdf、pcie.mse，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：name（输入）；make_binding 读取 name 并使用字段 result、result.function_uid、result.generation、result.global_function_id、result.host_id、result.rdma_vf_id、result.pfvf_id、pcie.bdf；函数返回 rdma_function_binding，不取得调用方资源所有权。
+  // 失败/边界：make_binding 下游操作失败时原样传播其 status/result，不伪造成功；该路径不隐式重试，也不转移未声明资源。
   protected function rdma_function_binding make_binding(string name);
     rdma_function_binding result;
     rdma_interrupt_vector_binding vector;
@@ -97,10 +95,9 @@ class rdma_queue_data_engine_fixture extends uvm_object;
     return result;
   endfunction
 
-  // 功能：依据输入请求创建对应的值对象或资源计划，并校验依赖、所有权和生命周期后返回结果。
-  // 输入/输出及副作用：输入请求、容量和依赖用于构造/预留资源；返回独立对象或状态，不暴露内部可变集合。
-  //   参数越界、容量不足或构造中途失败时回滚已登记的局部状态。
-  // 失败/边界：依赖为空、参数越界、容量不足或构造步骤失败时清理局部结果并返回明确错误。
+  // 功能：make_rc_attrs 创建独立的 rdma_qp_context_attributes；根据 name 设置字段 attrs、attrs.path_mtu_bytes、attrs.pkey、attrs.address_vector、address_vector.destination_mac、address_vector.traffic_class、attrs.behavior、behavior.transport_version、ext、ext.remote_qpn，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：name（输入）；make_rc_attrs 读取 name 并使用字段 attrs、attrs.path_mtu_bytes、attrs.pkey、attrs.address_vector、address_vector.destination_mac、address_vector.traffic_class、attrs.behavior、behavior.transport_version；函数返回 rdma_qp_context_attributes，不取得调用方资源所有权。
+  // 失败/边界：make_rc_attrs 的结果直接由 return attrs 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   protected function rdma_qp_context_attributes make_rc_attrs(string name);
     rdma_qp_context_attributes attrs;
     rdma_qpc_rc_ext ext;
@@ -123,10 +120,9 @@ class rdma_queue_data_engine_fixture extends uvm_object;
     return attrs;
   endfunction
 
-  // 功能：处理 setup_status：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 stage, value 用于执行 setup_status；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：setup_status 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：setup_status 校验 stage、value 与当前对象状态的一致性，并显式处理“returned null status”等拒绝条件，返回 rdma_status 供上层决定是否提交。
+  // 输入/输出及副作用：stage（输入）、value（输入）；setup_status 可能更新本对象明确拥有的状态；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：setup_status 返回 RDMA_SC_INVALID_STATE；失败路径不提交部分状态或转移未声明资源。
   protected function rdma_status setup_status(string stage, rdma_status value);
     if (value == null)
       return rdma_status::make(RDMA_SC_INVALID_STATE,
@@ -136,10 +132,9 @@ class rdma_queue_data_engine_fixture extends uvm_object;
     return rdma_status::make(value.code, {stage, ": ", value.message});
   endfunction
 
-  // 功能：处理 setup：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 function_resource 用于执行 setup；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：setup 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：setup 更新字段 status、binding、manager、mem、pcie、contexts、cmq、queue_executor、qp_executor、scheduler，并在提交前保持 Function authority、generation 和资源所有权约束。
+  // 输入/输出及副作用：status（输出）；setup 驱动下游事务，并写入 status；函数返回 无直接返回值，不取得调用方资源所有权。
+  // 失败/边界：setup 返回 RDMA_SC_INVALID_STATE；典型拒绝条件为“CQ fixture creation returned no status”“QP fixture creation returned no status”；失败路径不提交部分状态或转移未声明资源。
   task setup(output rdma_status status);
     rdma_function function_resource;
     rdma_create_cq_req cq_request;
@@ -163,7 +158,7 @@ class rdma_queue_data_engine_fixture extends uvm_object;
       {get_name(), "_qp_executor"});
     scheduler = rdma_doorbell_scheduler::type_id::create(
       {get_name(), "_scheduler"});
-    registry = rdma_xtr_v1_doorbell_codec_registry::type_id::create(
+    registry = rdma_hw_doorbell_codec_registry::type_id::create(
       {get_name(), "_registry"});
     engine = rdma_queue_data_engine::type_id::create({get_name(), "_engine"});
 
@@ -187,7 +182,7 @@ class rdma_queue_data_engine_fixture extends uvm_object;
       {get_name(), "_cq_request"});
     cq_request.owner = binding.make_handle();
     cq_request.depth = 16;
-    cq_request.cqe_size_bytes = XTR_V1_CQE_BYTES;
+    cq_request.cqe_size_bytes = RDMA_CQE_BYTES;
     cq_request.ceq_h = rdma_clone_handle_value(ceq.handle,
                                                 "fixture CQ CEQ");
     queue_executor.create_locked(binding, binding.make_handle(), cq_request,
@@ -250,7 +245,7 @@ class rdma_queue_data_engine_fixture extends uvm_object;
                           registry.register_defaults());
     if (!status.ok()) return;
     status = setup_status("register_queue_codecs",
-                          rdma_xtr_v1_register_queue_codecs(registry));
+                          rdma_register_queue_codecs(registry));
     if (!status.ok()) return;
     status = setup_status("engine.configure",
                           engine.configure(manager, binding, mem, scheduler,
@@ -262,10 +257,9 @@ class rdma_queue_data_engine_fixture extends uvm_object;
     status = setup_status("engine.attach_qp", engine.attach_qp(qp.handle));
   endtask
 
-  // 功能：依据输入请求创建对应的值对象或资源计划，并校验依赖、所有权和生命周期后返回结果。
-  // 输入/输出及副作用：输入请求、容量和依赖用于构造/预留资源；返回独立对象或状态，不暴露内部可变集合。
-  //   参数越界、容量不足或构造中途失败时回滚已登记的局部状态。
-  // 失败/边界：依赖为空、参数越界、容量不足或构造步骤失败时清理局部结果并返回明确错误。
+  // 功能：make_send 创建独立的 rdma_post_send_req；根据 wr_id 设置字段 request、request.owner、request.qp_h、request.wr_id、request.transport、request.opcode、request.signaled、sge、iova.value、sge.length，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：wr_id（输入）；make_send 读取 wr_id 并使用字段 request、request.owner、request.qp_h、request.wr_id、request.transport、request.opcode、request.signaled、sge；函数返回 rdma_post_send_req，不取得调用方资源所有权。
+  // 失败/边界：make_send 的结果直接由 return request 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function rdma_post_send_req make_send(longint unsigned wr_id);
     rdma_post_send_req request;
     rdma_sge sge;
@@ -284,10 +278,9 @@ class rdma_queue_data_engine_fixture extends uvm_object;
     return request;
   endfunction
 
-  // 功能：依据输入请求创建对应的值对象或资源计划，并校验依赖、所有权和生命周期后返回结果。
-  // 输入/输出及副作用：输入请求、容量和依赖用于构造/预留资源；返回独立对象或状态，不暴露内部可变集合。
-  //   参数越界、容量不足或构造中途失败时回滚已登记的局部状态。
-  // 失败/边界：依赖为空、参数越界、容量不足或构造步骤失败时清理局部结果并返回明确错误。
+  // 功能：make_recv 创建独立的 rdma_post_recv_req；根据 wr_id 设置字段 request、request.owner、request.target_h、request.wr_id、sge、iova.value、sge.length、sge.lkey，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：wr_id（输入）；make_recv 读取 wr_id 并使用字段 request、request.owner、request.target_h、request.wr_id、sge、iova.value、sge.length、sge.lkey；函数返回 rdma_post_recv_req，不取得调用方资源所有权。
+  // 失败/边界：make_recv 的结果直接由 return request 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function rdma_post_recv_req make_recv(longint unsigned wr_id);
     rdma_post_recv_req request;
     rdma_sge sge;
@@ -304,10 +297,9 @@ class rdma_queue_data_engine_fixture extends uvm_object;
     return request;
   endfunction
 
-  // 功能：按输入的完整标识查询当前权威记录并返回独立快照；缺失、歧义或代际过期时返回明确错误。
-  // 输入/输出及副作用：输入为完整 key/handle，output 或返回值为记录快照；查询不改变登记表和外部资源。
-  //   缺失、歧义、空句柄或旧 generation/reset epoch 返回明确错误。
-  // 失败/边界：查询不到唯一记录、输入为空或 authority 已失效时返回错误，不回退到默认 Function/root。
+  // 功能：在 rdma_queue_data_engine_fixture 中，read_qp_entry 按完整 key/handle 查找唯一权威记录并返回 detached 快照，避免把内部可变引用泄露给调用方。
+  // 输入/输出及副作用：send_ring（输入）、index（输入）、data（输出）；read_qp_entry 读取 send_ring、index、data 并使用字段 backing、data，并写入 data；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：read_qp_entry 在 key/handle 缺失、记录不唯一或 generation/reset epoch 过期时返回明确错误，不回退到默认 authority。
   function rdma_status read_qp_entry(
     bit send_ring, int unsigned index, output byte data[]
   );
@@ -322,12 +314,12 @@ class rdma_queue_data_engine_fixture extends uvm_object;
                     64, data);
   endfunction
 
-  // 功能：向指定后端写入请求数据并保留返回状态；写入失败时不推进本地提交游标。
-  // 输入/输出及副作用：参数 index, model 用于执行 write_cq_entry；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：后端拒绝或写入范围越界时不推进本地提交游标，也不伪造成功状态。
+  // 功能：在 rdma_queue_data_engine_fixture 中，write_cq_entry 把请求数据写入指定后端并保留返回状态；只有写入成功才允许本地游标继续推进。
+  // 输入/输出及副作用：index（输入）、model（输入）；输入 request/image/cursor 决定写入内容；成功时更新 PI/CI、slot ledger 或 pending journal，并通过 output
+  //   返回结果。
+  // 失败/边界：write_cq_entry 遇到后端拒绝、范围溢出或 DMA 权限不足时保留失败证据，不推进本地游标。
   function rdma_status write_cq_entry(
-    int unsigned index, rdma_xtr_v1_cqe_model model
+    int unsigned index, rdma_hw_cqe_model model
   );
     rdma_codec_key key;
     rdma_codec_base codec;
@@ -336,7 +328,7 @@ class rdma_queue_data_engine_fixture extends uvm_object;
     byte data[];
     rdma_status status;
 
-    key = '{hw_version:"xtr_v1", image_kind:RDMA_IMAGE_CQE,
+    key = '{hw_version:"rdma", image_kind:RDMA_IMAGE_CQE,
             object_type:"cqe", variant:"default", opcode:8'h00};
     status = registry.lookup(key, codec);
     if (status == null || !status.ok()) return status;
@@ -361,19 +353,17 @@ endclass
 class rdma_queue_data_engine_post_test extends uvm_test;
   `uvm_component_utils(rdma_queue_data_engine_post_test)
 
-  // 功能：构造当前对象并初始化其字段、集合和 UVM 名称；不接管传入句柄的生命周期。
-  // 输入/输出及副作用：name 仅用于 UVM 对象命名；内部字段被初始化为安全默认值，传入句柄不转移所有权。
-  //   返回新对象实例；构造失败由 UVM 工厂或调用方处理。
-  // 失败/边界：不创建外部资源；name 为空时仍允许构造，但所有字段必须保持可配置的初始值。
+  // 功能：构造 rdma_queue_data_engine_post_test，调用 super.new 建立 UVM 层级对象；外部依赖字段保持未绑定，后续由 configure/build/activate 明确注入。
+  // 输入/输出及副作用：name、parent（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_queue_data_engine_post_test 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_queue_data_engine_post_test",
                uvm_component parent = null);
     super.new(name, parent);
   endfunction
 
-  // 功能：驱动 UVM 阶段中的场景初始化、事务执行和断言收尾，并在退出前释放 objection 或测试资源。
-  // 输入/输出及副作用：phase 控制 UVM 调度；task 驱动事务、断言和 objection，测试 fixture 由本层负责清理。
-  //   阶段提前结束或前置 setup 失败时必须释放 objection 并停止后续访问。
-  // 失败/边界：setup 失败或阶段被终止时停止新增事务，确保 objection、临时对象和外部引用按测试生命周期收尾。
+  // 功能：在 rdma_queue_data_engine_post_test 中，run_phase 驱动 UVM 阶段中的场景初始化、事务执行和断言收尾，并在退出前释放 objection 或测试资源。
+  // 输入/输出及副作用：phase（输入）；phase 由 UVM 提供；task 通过 objection、日志和断言暴露结果，可能调用 DUT 接口但不改变其所有权规则。
+  // 失败/边界：run_phase 的 setup/阶段驱动失败时停止新增事务，并按测试生命周期清理 objection 与临时引用。
   task run_phase(uvm_phase phase);
     rdma_queue_data_engine engine;
     rdma_queue_data_engine_fixture fixture;

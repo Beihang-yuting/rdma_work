@@ -19,10 +19,9 @@ class rdma_queue_post_result extends uvm_object;
   rdma_hw_image image;
   rdma_status status;
 
-  // 功能：构造当前对象并初始化其字段、集合和 UVM 名称；不接管传入句柄的生命周期。
-  // 输入/输出及副作用：name 仅用于 UVM 对象命名；内部字段被初始化为安全默认值，传入句柄不转移所有权。
-  //   返回新对象实例；构造失败由 UVM 工厂或调用方处理。
-  // 失败/边界：不创建外部资源；name 为空时仍允许构造，但所有字段必须保持可配置的初始值。
+  // 功能：构造 rdma_queue_post_result，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：queue_h=null；wr_id=0；index=0；wrap=0；image=null；status=null。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_queue_post_result 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_queue_post_result");
     super.new(name);
     queue_h = null; wr_id = 0; index = 0; wrap = 0;
@@ -33,14 +32,13 @@ endclass
 class rdma_queue_completion_result extends uvm_object;
   `uvm_object_utils(rdma_queue_completion_result)
   rdma_handle queue_h;
-  rdma_xtr_v1_cqe_model cqe;
+  rdma_hw_cqe_model cqe;
   rdma_status completion_status;
   rdma_queue_slot_ledger_entry released_slots[$];
 
-  // 功能：构造当前对象并初始化其字段、集合和 UVM 名称；不接管传入句柄的生命周期。
-  // 输入/输出及副作用：name 仅用于 UVM 对象命名；内部字段被初始化为安全默认值，传入句柄不转移所有权。
-  //   返回新对象实例；构造失败由 UVM 工厂或调用方处理。
-  // 失败/边界：不创建外部资源；name 为空时仍允许构造，但所有字段必须保持可配置的初始值。
+  // 功能：构造 rdma_queue_completion_result，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：queue_h=null；cqe=null；completion_status=null。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_queue_completion_result 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_queue_completion_result");
     super.new(name);
     queue_h = null; cqe = null; completion_status = null;
@@ -54,10 +52,9 @@ class rdma_queue_event_result extends uvm_object;
   rdma_hw_model event_model;
   rdma_status event_status;
 
-  // 功能：构造当前对象并初始化其字段、集合和 UVM 名称；不接管传入句柄的生命周期。
-  // 输入/输出及副作用：name 仅用于 UVM 对象命名；内部字段被初始化为安全默认值，传入句柄不转移所有权。
-  //   返回新对象实例；构造失败由 UVM 工厂或调用方处理。
-  // 失败/边界：不创建外部资源；name 为空时仍允许构造，但所有字段必须保持可配置的初始值。
+  // 功能：构造 rdma_queue_event_result，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：queue_h=null；event_model=null；event_status=null。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_queue_event_result 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_queue_event_result");
     super.new(name);
     queue_h = null; event_model = null; event_status = null;
@@ -78,10 +75,9 @@ class rdma_queue_data_attachment extends uvm_object;
   int unsigned local_id;
   rdma_transport_e transport;
 
-  // 功能：构造当前对象并初始化其字段、集合和 UVM 名称；不接管传入句柄的生命周期。
-  // 输入/输出及副作用：name 仅用于 UVM 对象命名；内部字段被初始化为安全默认值，传入句柄不转移所有权。
-  //   返回新对象实例；构造失败由 UVM 工厂或调用方处理。
-  // 失败/边界：不创建外部资源；name 为空时仍允许构造，但所有字段必须保持可配置的初始值。
+  // 功能：构造 rdma_queue_data_attachment，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：queue_h=null；kind=RDMA_QUEUE_RUNTIME_SQ；runtime=null；access=null；role=RDMA_QUEUE_ROLE_CQ_RING；entry_size=64；local_id=0；transport=RDMA_TRANSPORT_RC。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_queue_data_attachment 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_queue_data_attachment");
     super.new(name);
     queue_h = null; kind = RDMA_QUEUE_RUNTIME_SQ; runtime = null;
@@ -99,10 +95,9 @@ class rdma_queue_data_qp_link extends uvm_object;
   int unsigned local_qp_id;
   rdma_transport_e transport;
 
-  // 功能：构造当前对象并初始化其字段、集合和 UVM 名称；不接管传入句柄的生命周期。
-  // 输入/输出及副作用：name 仅用于 UVM 对象命名；内部字段被初始化为安全默认值，传入句柄不转移所有权。
-  //   返回新对象实例；构造失败由 UVM 工厂或调用方处理。
-  // 失败/边界：不创建外部资源；name 为空时仍允许构造，但所有字段必须保持可配置的初始值。
+  // 功能：构造 rdma_queue_data_qp_link，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：qp_h=null；srq_h=null；send_cq_h=null；recv_cq_h=null；local_qp_id=0；transport=RDMA_TRANSPORT_RC。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_queue_data_qp_link 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_queue_data_qp_link");
     super.new(name);
     qp_h = null; srq_h = null; send_cq_h = null; recv_cq_h = null;
@@ -124,10 +119,9 @@ class rdma_queue_data_engine extends uvm_object;
   protected rdma_queue_data_qp_link qp_links[string];
   protected bit configured;
 
-  // 功能：构造当前对象并初始化其字段、集合和 UVM 名称；不接管传入句柄的生命周期。
-  // 输入/输出及副作用：name 仅用于 UVM 对象命名；内部字段被初始化为安全默认值，传入句柄不转移所有权。
-  //   返回新对象实例；构造失败由 UVM 工厂或调用方处理。
-  // 失败/边界：不创建外部资源；name 为空时仍允许构造，但所有字段必须保持可配置的初始值。
+  // 功能：构造 rdma_queue_data_engine，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：manager=null；binding=null；host_mem=null；doorbells=null；registry=null；operation_timeout=0；configured=1'b0。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_queue_data_engine 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_queue_data_engine");
     super.new(name);
     manager = null; binding = null; host_mem = null; doorbells = null;
@@ -135,10 +129,9 @@ class rdma_queue_data_engine extends uvm_object;
     attachments.delete(); qp_links.delete(); configured = 1'b0;
   endfunction
 
-  // 功能：把输入错误或注入故障转换成统一的 rdma_status，供上层沿原事务路径处理。
-  // 输入/输出及副作用：输入为错误消息、错误码或故障证据；返回统一 rdma_status，不推进事务游标。
-  //   空消息仍需保留错误类别；未知错误码不得被静默转换为成功。
-  // 失败/边界：错误路径不能返回成功状态；消息和错误码缺失时仍须保留可诊断类别。
+  // 功能：在 rdma_queue_data_engine 中，bad 把错误消息、硬件码或注入故障封装为统一 rdma_status，保留原事务的诊断证据。
+  // 输入/输出及副作用：message（输入）、RDMA_SC_INVALID_ARGUMENT（输入）；bad 读取 message、code 并使用字段 rdma_status；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：bad 的结果直接由 return rdma_status::make(code, message) 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   protected function rdma_status bad(
     string message,
     rdma_status_code_e code = RDMA_SC_INVALID_ARGUMENT
@@ -146,10 +139,9 @@ class rdma_queue_data_engine extends uvm_object;
     return rdma_status::make(code, message);
   endfunction
 
-  // 功能：处理 identity_key：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 handle 用于执行 identity_key；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：identity_key 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：在 rdma_queue_data_engine 中，identity_key 把 Function/对象身份、代际和游标字段拼成稳定的查找键，供登记表去重和恢复路由使用。
+  // 输入/输出及副作用：handle（输入）；identity_key 读取 handle 并使用输入参数和固定枚举/常量；函数返回 string，不取得调用方资源所有权。
+// 失败/边界：identity_key 只按函数体列出的身份、generation、kind、object_id 或 cursor 字段拼接键；调用方须先完成空句柄校验，函数本身不分配资源、不自动回退到 root0。
   protected function string identity_key(rdma_handle handle);
     if (handle == null) return "";
     return $sformatf("%0d:%016h:%08h:%08h", handle.kind,
@@ -157,9 +149,8 @@ class rdma_queue_data_engine extends uvm_object;
                      handle.generation);
   endfunction
 
-  // 功能：把指定资源或后端能力绑定到当前对象的唯一索引，并校验 Function、generation 和队列类型一致。
-  // 输入/输出及副作用：输入为待绑定资源/后端引用；成功后新增一条受 identity 保护的关联记录。
-  //   重复绑定、资源类型错误或依赖缺失时不留下部分关联。
+  // 功能：在 rdma_queue_data_engine 中，attachment_key 把 attachment_key 指定的资源或后端能力绑定到当前对象索引，并校验 Function、generation 和队列类型一致。
+  // 输入/输出及副作用：handle（输入）、kind（输入）；attachment_key 先依据 handle == null 校验 handle、kind；成功时更新本对象配置/状态并保存非拥有引用，返回 string。
   // 失败/边界：资源不存在、类型不符、重复登记或跨 Function 串线时拒绝绑定并保持索引不变。
   protected function string attachment_key(
     rdma_handle handle, rdma_queue_runtime_kind_e kind
@@ -168,10 +159,9 @@ class rdma_queue_data_engine extends uvm_object;
     return {identity_key(handle), $sformatf(":%0d", kind)};
   endfunction
 
-  // 功能：处理 ensure_handle：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 handle, expected_kind 用于执行 ensure_handle；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：ensure_handle 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：在 rdma_queue_data_engine 中，ensure_handle 构造或投影带完整 kind、Function UID、object ID 和 generation 的资源句柄。
+  // 输入/输出及副作用：handle（输入）、expected_kind（输入）；ensure_handle 读取 handle、expected_kind 并使用字段 binding.generation、rdma_status、configured、binding、binding.function_uid；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：ensure_handle 返回 RDMA_SC_INVALID_ARGUMENT；典型拒绝条件为“queue data engine is not configured”“queue handle kind is invalid”；失败路径不提交部分状态或转移未声明资源。
   protected function rdma_status ensure_handle(
     rdma_handle handle, rdma_resource_kind_e expected_kind
   );
@@ -190,10 +180,10 @@ class rdma_queue_data_engine extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：按输入的完整标识查询当前权威记录并返回独立快照；缺失、歧义或代际过期时返回明确错误。
-  // 输入/输出及副作用：输入为完整 key/handle，output 或返回值为记录快照；查询不改变登记表和外部资源。
-  //   缺失、歧义、空句柄或旧 generation/reset epoch 返回明确错误。
-  // 失败/边界：查询不到唯一记录、输入为空或 authority 已失效时返回错误，不回退到默认 Function/root。
+  // 功能：在 rdma_queue_data_engine 中，lookup_attachment 按完整 key/handle 查找唯一权威记录并返回 detached 快照，避免把内部可变引用泄露给调用方。
+  // 输入/输出及副作用：handle（输入）、kind（输入）、attachment（输出）；输入 handle/key/cursor 用于选择读取范围；返回值或 output 为 detached
+  //   快照，读取不取得外部资源所有权。
+  // 失败/边界：lookup_attachment 在 key/handle 缺失、记录不唯一或 generation/reset epoch 过期时返回明确错误，不回退到默认 authority。
   protected function rdma_status lookup_attachment(
     rdma_handle handle, rdma_queue_runtime_kind_e kind,
     output rdma_queue_data_attachment attachment
@@ -212,10 +202,10 @@ class rdma_queue_data_engine extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：校验依赖并建立该对象的运行边界，成功后保存必要的非拥有引用；拒绝不完整或重复配置。
-  // 输入/输出及副作用：接收 manager、binding、router 或 profile 等依赖；成功后保存非拥有引用并更新配置状态。
-  //   任一依赖为空、重复配置或代际不匹配时保持原状态并返回错误。
-  // 失败/边界：配置失败不得写入半成品引用；已激活对象不得被无条件降级或重复占用资源。
+  // 功能：在 rdma_queue_data_engine 中，configure 校验依赖和 binding 后建立运行边界，只保存非拥有引用并拒绝重复配置。
+  // 输入/输出及副作用：resource_manager（输入）、function_binding（输入）、memory（输入）、scheduler（输入）、codecs（输入）、timeout（输入）；configure 先依据 resource_manager == null || function_binding == null || memory == null || scheduler == null || codecs == null || timeout == 0；status == null || !status.ok(；function_binding.state != RDMA_BIND_ACTIVE || function_binding.generation == 0 校验 resource_manager、function_binding、memory、scheduler、codecs、timeout；成功时更新本对象配置/状态并保存非拥有引用，返回
+  //   rdma_status。
+  // 失败/边界：实现中的空依赖、重复登记、状态或 generation/authority 校验失败时返回错误；失败时保留旧配置。
   function rdma_status configure(
     rdma_resource_manager resource_manager,
     rdma_function_binding function_binding,
@@ -241,10 +231,9 @@ class rdma_queue_data_engine extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：按输入的完整标识查询当前权威记录并返回独立快照；缺失、歧义或代际过期时返回明确错误。
-  // 输入/输出及副作用：输入为完整 key/handle，output 或返回值为记录快照；查询不改变登记表和外部资源。
-  //   缺失、歧义、空句柄或旧 generation/reset epoch 返回明确错误。
-  // 失败/边界：查询不到唯一记录、输入为空或 authority 已失效时返回错误，不回退到默认 Function/root。
+  // 功能：在 rdma_queue_data_engine 中，find_queue_ref 按完整 key/handle 查找唯一权威记录并返回 detached 快照，避免把内部可变引用泄露给调用方。
+  // 输入/输出及副作用：plan（输入）、role（输入）、result（输出）；find_queue_ref 读取 plan、role、result 并使用字段 result，并写入 result；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：find_queue_ref 在 key/handle 缺失、记录不唯一或 generation/reset epoch 过期时返回明确错误，不回退到默认 authority。
   protected function rdma_status find_queue_ref(
     rdma_queue_backing_plan plan,
     rdma_queue_backing_role_e role,
@@ -262,10 +251,10 @@ class rdma_queue_data_engine extends uvm_object;
     return bad("queue backing role is missing", RDMA_SC_INVALID_STATE);
   endfunction
 
-  // 功能：依据输入请求创建对应的值对象或资源计划，并校验依赖、所有权和生命周期后返回结果。
-  // 输入/输出及副作用：输入请求、容量和依赖用于构造/预留资源；返回独立对象或状态，不暴露内部可变集合。
-  //   参数越界、容量不足或构造中途失败时回滚已登记的局部状态。
-  // 失败/边界：依赖为空、参数越界、容量不足或构造步骤失败时清理局部结果并返回明确错误。
+  // 功能：create_attachment 创建独立的 rdma_status；根据 queue_h、kind、role、queue_ref、qp_ref、depth、producer_index、producer_wrap、consumer_index、consumer_wrap、host_produced、local_id、transport、entry_size、initial_polarity 设置字段 key、access、status、runtime、attachment、attachment.queue_h、attachment.kind、attachment.runtime、attachment.access、attachment.role，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：queue_h（输入）、kind（输入）、role（输入）、queue_ref（输入）、qp_ref（输入）、depth（输入）、producer_index（输入）、producer_wrap（输入）、consumer_index（输入）、consumer_wrap（输入）、host_produced（输入）、local_id（输入）、transport（输入）、entry_size（输入）、initial_polarity（输入）；输入请求/句柄定义资源属性；成功时更新账本并通过返回值或
+  //   output 发布新句柄/映射。
+  // 失败/边界：create_attachment 下游操作失败时原样传播其 status/result，不伪造成功；该路径不隐式重试，也不转移未声明资源。
   protected function rdma_status create_attachment(
     rdma_handle queue_h,
     rdma_queue_runtime_kind_e kind,
@@ -324,10 +313,9 @@ class rdma_queue_data_engine extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：解除指定资源绑定并隔离其 runtime/映射，避免旧句柄在删除后继续访问后端。
-  // 输入/输出及副作用：输入为待解除或释放的 handle/key；成功后隔离或删除本对象记录，外部拥有者仍负责真正销毁。
-  //   空值、未知记录或重复调用按接口约定返回错误或幂等成功。
-  // 失败/边界：不得释放非本对象所有资源；重复解除按幂等约定处理，旧 handle 不得重新激活。
+  // 功能：在 rdma_queue_data_engine 中，delete_attachment delete_attachment 解除指定资源绑定并隔离 runtime/映射，避免旧句柄在删除后访问后端。
+  // 输入/输出及副作用：queue_h（输入）、kind（输入）；输入 handle/mapping/token 指定释放目标；成功时更新账本和生命周期，外部资源只按 adapter 契约释放。
+  // 失败/边界：delete_attachment 发现 owner/generation 不匹配、记录未知或重复释放时返回错误或幂等结果，不重新激活旧句柄。
   protected function void delete_attachment(
     rdma_handle queue_h, rdma_queue_runtime_kind_e kind
   );
@@ -340,9 +328,8 @@ class rdma_queue_data_engine extends uvm_object;
     end
   endfunction
 
-  // 功能：把指定资源或后端能力绑定到当前对象的唯一索引，并校验 Function、generation 和队列类型一致。
-  // 输入/输出及副作用：输入为待绑定资源/后端引用；成功后新增一条受 identity 保护的关联记录。
-  //   重复绑定、资源类型错误或依赖缺失时不留下部分关联。
+  // 功能：在 rdma_queue_data_engine 中，attach_srq_for_qp 把 attach_srq_for_qp 指定的资源或后端能力绑定到当前对象索引，并校验 Function、generation 和队列类型一致。
+  // 输入/输出及副作用：srq_h（输入）；attach_srq_for_qp 先依据 !status.ok(；attachments.exists(attachment_key(srq_h, RDMA_QUEUE_RUNTIME_SRQ；!$cast(srq, resource 校验 srq_h；成功时更新本对象配置/状态并保存非拥有引用，返回 rdma_status。
   // 失败/边界：资源不存在、类型不符、重复登记或跨 Function 串线时拒绝绑定并保持索引不变。
   protected function rdma_status attach_srq_for_qp(
     rdma_handle srq_h
@@ -377,9 +364,8 @@ class rdma_queue_data_engine extends uvm_object;
       64, initial_polarity);
   endfunction
 
-  // 功能：把指定资源或后端能力绑定到当前对象的唯一索引，并校验 Function、generation 和队列类型一致。
-  // 输入/输出及副作用：输入为待绑定资源/后端引用；成功后新增一条受 identity 保护的关联记录。
-  //   重复绑定、资源类型错误或依赖缺失时不留下部分关联。
+  // 功能：在 rdma_queue_data_engine 中，attach_qp 把 attach_qp 指定的资源或后端能力绑定到当前对象索引，并校验 Function、generation 和队列类型一致。
+  // 输入/输出及副作用：qp_h（输入）；attach_qp 先依据 !status.ok(；!$cast(qp, resource；attachments.exists(attachment_key(qp_h, RDMA_QUEUE_RUNTIME_SQ 校验 qp_h；成功时更新本对象配置/状态并保存非拥有引用，返回 rdma_status。
   // 失败/边界：资源不存在、类型不符、重复登记或跨 Function 串线时拒绝绑定并保持索引不变。
   function rdma_status attach_qp(rdma_handle qp_h);
     rdma_resource resource;
@@ -436,9 +422,8 @@ class rdma_queue_data_engine extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：把指定资源或后端能力绑定到当前对象的唯一索引，并校验 Function、generation 和队列类型一致。
-  // 输入/输出及副作用：输入为待绑定资源/后端引用；成功后新增一条受 identity 保护的关联记录。
-  //   重复绑定、资源类型错误或依赖缺失时不留下部分关联。
+  // 功能：在 rdma_queue_data_engine 中，attach_cq 把 attach_cq 指定的资源或后端能力绑定到当前对象索引，并校验 Function、generation 和队列类型一致。
+  // 输入/输出及副作用：cq_h（输入）、transport_variant（输入）；attach_cq 先依据 !status.ok(；!(transport_variant inside {RDMA_TRANSPORT_RC, RDMA_TRANSPORT_UD, RDMA_TRANSPORT_URC}；!$cast(cq, resource 校验 cq_h、transport_variant；成功时更新本对象配置/状态并保存非拥有引用，返回 rdma_status。
   // 失败/边界：资源不存在、类型不符、重复登记或跨 Function 串线时拒绝绑定并保持索引不变。
   function rdma_status attach_cq(
     rdma_handle cq_h, rdma_transport_e transport_variant
@@ -462,7 +447,7 @@ class rdma_queue_data_engine extends uvm_object;
     // XTR v1 exposes a single fixed 64-byte CQE image.  The lifecycle model
     // accepts other sizes for forward compatibility, but this engine cannot
     // safely decode them and must reject the attachment up front.
-    if (cq.cqe_size_bytes != XTR_V1_CQE_BYTES)
+    if (cq.cqe_size_bytes != RDMA_CQE_BYTES)
       return bad("XTR v1 CQE size is unsupported",
                  RDMA_SC_UNSUPPORTED_OPCODE);
     status = find_queue_ref(cq.queue_plan, RDMA_QUEUE_ROLE_CQ_RING, queue_backing);
@@ -480,9 +465,8 @@ class rdma_queue_data_engine extends uvm_object;
       cq.cqe_size_bytes, initial_polarity);
   endfunction
 
-  // 功能：把指定资源或后端能力绑定到当前对象的唯一索引，并校验 Function、generation 和队列类型一致。
-  // 输入/输出及副作用：输入为待绑定资源/后端引用；成功后新增一条受 identity 保护的关联记录。
-  //   重复绑定、资源类型错误或依赖缺失时不留下部分关联。
+  // 功能：在 rdma_queue_data_engine 中，attach_event_queue 把 attach_event_queue 指定的资源或后端能力绑定到当前对象索引，并校验 Function、generation 和队列类型一致。
+  // 输入/输出及副作用：queue_h（输入）、expected（输入）、kind（输入）、role（输入）；attach_event_queue 先依据 !status.ok(；!$cast(queue, resource；queue.queue_plan.rings[i] != null && queue.queue_plan.rings[i].role == role 校验 queue_h、expected、kind、role；成功时更新本对象配置/状态并保存非拥有引用，返回 rdma_status。
   // 失败/边界：资源不存在、类型不符、重复登记或跨 Function 串线时拒绝绑定并保持索引不变。
   protected function rdma_status attach_event_queue(
     rdma_handle queue_h, rdma_resource_kind_e expected,
@@ -527,9 +511,8 @@ class rdma_queue_data_engine extends uvm_object;
       initial_polarity);
   endfunction
 
-  // 功能：把指定资源或后端能力绑定到当前对象的唯一索引，并校验 Function、generation 和队列类型一致。
-  // 输入/输出及副作用：输入为待绑定资源/后端引用；成功后新增一条受 identity 保护的关联记录。
-  //   重复绑定、资源类型错误或依赖缺失时不留下部分关联。
+  // 功能：在 rdma_queue_data_engine 中，attach_ceq 把 attach_ceq 指定的资源或后端能力绑定到当前对象索引，并校验 Function、generation 和队列类型一致。
+  // 输入/输出及副作用：ceq_h（输入）；attach_ceq 先依据 依赖存在性、authority 和 generation 条件 校验 ceq_h；成功时更新本对象配置/状态并保存非拥有引用，返回 rdma_status。
   // 失败/边界：资源不存在、类型不符、重复登记或跨 Function 串线时拒绝绑定并保持索引不变。
   function rdma_status attach_ceq(rdma_handle ceq_h);
     return attach_event_queue(ceq_h, RDMA_RESOURCE_CEQ,
@@ -537,9 +520,8 @@ class rdma_queue_data_engine extends uvm_object;
                               RDMA_QUEUE_ROLE_CEQ_RING);
   endfunction
 
-  // 功能：把指定资源或后端能力绑定到当前对象的唯一索引，并校验 Function、generation 和队列类型一致。
-  // 输入/输出及副作用：输入为待绑定资源/后端引用；成功后新增一条受 identity 保护的关联记录。
-  //   重复绑定、资源类型错误或依赖缺失时不留下部分关联。
+  // 功能：在 rdma_queue_data_engine 中，attach_aeq 把 attach_aeq 指定的资源或后端能力绑定到当前对象索引，并校验 Function、generation 和队列类型一致。
+  // 输入/输出及副作用：aeq_h（输入）；attach_aeq 先依据 依赖存在性、authority 和 generation 条件 校验 aeq_h；成功时更新本对象配置/状态并保存非拥有引用，返回 rdma_status。
   // 失败/边界：资源不存在、类型不符、重复登记或跨 Function 串线时拒绝绑定并保持索引不变。
   function rdma_status attach_aeq(rdma_handle aeq_h);
     return attach_event_queue(aeq_h, RDMA_RESOURCE_AEQ,
@@ -547,10 +529,9 @@ class rdma_queue_data_engine extends uvm_object;
                               RDMA_QUEUE_ROLE_AEQ_RING);
   endfunction
 
-  // 功能：解除指定资源绑定并隔离其 runtime/映射，避免旧句柄在删除后继续访问后端。
-  // 输入/输出及副作用：输入为待解除或释放的 handle/key；成功后隔离或删除本对象记录，外部拥有者仍负责真正销毁。
-  //   空值、未知记录或重复调用按接口约定返回错误或幂等成功。
-  // 失败/边界：不得释放非本对象所有资源；重复解除按幂等约定处理，旧 handle 不得重新激活。
+  // 功能：在 rdma_queue_data_engine 中，detach detach 解除指定资源绑定并隔离 runtime/映射，避免旧句柄在删除后访问后端。
+  // 输入/输出及副作用：queue_h（输入）；detach 读取 queue_h 并使用字段 found、status、runtime.state；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：detach 发现 owner/generation 不匹配、记录未知或重复释放时返回错误或幂等结果，不重新激活旧句柄。
   function rdma_status detach(rdma_handle queue_h);
     rdma_status status;
     string key;
@@ -574,15 +555,14 @@ class rdma_queue_data_engine extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：完成发送队列预检、槽位预留、WQE 写入和 producer doorbell 提交，并返回提交结果与失败证据。
-  // 输入/输出及副作用：request/queue handle 提供事务身份，output result/status 返回 detached 结果和阶段状态；成功时推进唯一 runtime。
-  //   空句柄、队列为空、owner 不匹配或 doorbell 失败时不发布半成品结果。
+  // 功能：在 rdma_queue_data_engine 中，make_sqe 完成发送队列预检、槽位预留、WQE 写入和 producer doorbell 提交，并返回提交结果与失败证据。
+  // 输入/输出及副作用：request（输入）、link（输入）、cursor（输入）、model（输出）；make_sqe 读取 request、link、cursor、model 并使用字段 model、model.transport、model.qp_h、model.wr_id、model.opcode、model.signaled、model.solicited、model.fence，并写入 model；函数返回 rdma_status，不取得调用方资源所有权。
   // 失败/边界：未配置、空队列、stale generation/reset epoch 和 ambiguous MMIO 均禁止发布成功结果或自动重试。
   protected function rdma_status make_sqe(
     rdma_post_send_req request,
     rdma_queue_data_qp_link link,
     rdma_queue_cursor_snapshot cursor,
-    output rdma_xtr_v1_sqe_model model
+    output rdma_hw_sqe_model model
   );
     rdma_sqe_rc_ext rc;
     rdma_sqe_ud_ext ud;
@@ -592,7 +572,7 @@ class rdma_queue_data_engine extends uvm_object;
     model = null;
     if (request == null || link == null || cursor == null)
       return bad("SQE request, QP link, or reservation is null");
-    model = rdma_xtr_v1_sqe_model::type_id::create("queue_sqe");
+    model = rdma_hw_sqe_model::type_id::create("queue_sqe");
     model.transport = request.transport; model.qp_h = request.qp_h;
     model.wr_id = request.wr_id; model.opcode = request.opcode;
     model.signaled = request.signaled; model.solicited = request.solicited;
@@ -638,22 +618,21 @@ class rdma_queue_data_engine extends uvm_object;
     return status;
   endfunction
 
-  // 功能：完成接收队列预检、槽位预留、RQE 写入和 producer doorbell 提交，并返回提交结果与失败证据。
-  // 输入/输出及副作用：request/queue handle 提供事务身份，output result/status 返回 detached 结果和阶段状态；成功时推进唯一 runtime。
-  //   空句柄、队列为空、owner 不匹配或 doorbell 失败时不发布半成品结果。
+  // 功能：在 rdma_queue_data_engine 中，make_rqe 完成接收队列预检、槽位预留、RQE 写入和 producer doorbell 提交，并返回提交结果与失败证据。
+  // 输入/输出及副作用：request（输入）、link（输入）、cursor（输入）、model（输出）；make_rqe 读取 request、link、cursor、model 并使用字段 model、model.target_h、model.wr_id、model.qpn、model.qp_sn、model.hw_opcode、model.index、model.wrap，并写入 model；函数返回 rdma_status，不取得调用方资源所有权。
   // 失败/边界：未配置、空队列、stale generation/reset epoch 和 ambiguous MMIO 均禁止发布成功结果或自动重试。
   protected function rdma_status make_rqe(
     rdma_post_recv_req request,
     rdma_queue_data_qp_link link,
     rdma_queue_cursor_snapshot cursor,
-    output rdma_xtr_v1_rqe_model model
+    output rdma_hw_rqe_model model
   );
     rdma_sge cloned_sge;
     longint unsigned payload_len;
     model = null;
     if (request == null || link == null || cursor == null)
       return bad("RQE request, QP link, or reservation is null");
-    model = rdma_xtr_v1_rqe_model::type_id::create("queue_rqe");
+    model = rdma_hw_rqe_model::type_id::create("queue_rqe");
     model.target_h = request.target_h; model.wr_id = request.wr_id;
     model.qpn = link.local_qp_id; model.qp_sn = 0;
     model.hw_opcode = 4'd8; model.index = cursor.index;
@@ -672,10 +651,10 @@ class rdma_queue_data_engine extends uvm_object;
     return model.validate();
   endfunction
 
-  // 功能：把输入模型字段按硬件布局编码到目标 image/缓冲区，并在写入前检查范围、重叠和保留位。
-  // 输入/输出及副作用：参数 model, image_kind, object_type, variant, image 用于执行 encode_queue_model；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：镜像长度、字段宽度、保留位或写入范围非法时不修改已写入字节。
+  // 功能：在 rdma_queue_data_engine 中，encode_queue_model 按硬件布局把输入模型编码到 image/缓冲区，并在写入前检查范围、重叠、端序和保留位。
+  // 输入/输出及副作用：model（输入）、image_kind（输入）、object_type（输入）、variant（输入）、image（输出）；输入模型只读；成功时通过返回值或 output 发布完整
+  //   image/bytes，不修改源模型。
+  // 失败/边界：encode_queue_model 遇到 image/model 为空、长度/对齐/保留位非法或 codec 校验失败时不发布部分字段。
   protected function rdma_status encode_queue_model(
     rdma_hw_model model, rdma_image_kind_e image_kind, string object_type,
     string variant, output rdma_hw_image image
@@ -684,17 +663,17 @@ class rdma_queue_data_engine extends uvm_object;
     rdma_codec_base codec;
     rdma_status status;
     image = null;
-    codec_key = '{hw_version:"xtr_v1", image_kind:image_kind,
+    codec_key = '{hw_version:"rdma", image_kind:image_kind,
       object_type:object_type, variant:variant, opcode:8'h00};
     status = registry.lookup(codec_key, codec);
     if (!status.ok()) return status;
     return codec.encode(model, image);
   endfunction
 
-  // 功能：向指定后端写入请求数据并保留返回状态；写入失败时不推进本地提交游标。
-  // 输入/输出及副作用：参数 attachment, offset, image 用于执行 write_and_verify；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：后端拒绝或写入范围越界时不推进本地提交游标，也不伪造成功状态。
+  // 功能：在 rdma_queue_data_engine 中，write_and_verify 把请求数据写入指定后端并保留返回状态；只有写入成功才允许本地游标继续推进。
+  // 输入/输出及副作用：attachment（输入）、offset（输入）、image（输入）；输入 request/image/cursor 决定写入内容；成功时更新 PI/CI、slot ledger 或 pending
+  //   journal，并通过 output 返回结果。
+  // 失败/边界：write_and_verify 遇到后端拒绝、范围溢出或 DMA 权限不足时保留失败证据，不推进本地游标。
   protected function rdma_status write_and_verify(
       rdma_queue_data_attachment attachment,
       longint unsigned offset,
@@ -721,10 +700,10 @@ class rdma_queue_data_engine extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：依据输入请求创建对应的值对象或资源计划，并校验依赖、所有权和生命周期后返回结果。
-  // 输入/输出及副作用：输入请求、容量和依赖用于构造/预留资源；返回独立对象或状态，不暴露内部可变集合。
-  //   参数越界、容量不足或构造中途失败时回滚已登记的局部状态。
-  // 失败/边界：依赖为空、参数越界、容量不足或构造步骤失败时清理局部结果并返回明确错误。
+  // 功能：make_pending 创建独立的 rdma_queue_pending_operation；根据 cursor、queue_h、kind、producer、entry_offset、image、request_snapshot、signaled、completion_index、completion_wrap、completion_target_valid、completion_released、routed_qp_h 设置字段 pending、pending.queue_h、pending.kind、pending.producer、pending.entry_offset、pending.wr_id、pending.cursor、cursor.index、cursor.wrap、pending.signaled，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：cursor（输入）、queue_h（输入）、kind（输入）、producer（输入）、entry_offset（输入）、image（输入）、request_snapshot（输入）、signaled（输入）、completion_index（输入）、completion_wrap（输入）、completion_target_valid（输入）、completion_released（输入）、routed_qp_h（输入）；输入字段被复制到返回值或
+  //   output；生成结果与输入隔离，不隐式修改调用方对象。
+  // 失败/边界：make_pending 先检查 queue_h != null；request_snapshot != null；$cast(pending_send, request_snapshot，再返回 pending；拒绝分支不提交部分状态，也不隐式重试。
   protected function rdma_queue_pending_operation make_pending(
     rdma_queue_cursor_snapshot cursor,
     rdma_handle queue_h = null,
@@ -779,10 +758,9 @@ class rdma_queue_data_engine extends uvm_object;
     return pending;
   endfunction
 
-  // 功能：处理 projected_id_handle：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 source, local_id 用于执行 projected_id_handle；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：projected_id_handle 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：在 rdma_queue_data_engine 中，projected_id_handle 构造或投影带完整 kind、Function UID、object ID 和 generation 的资源句柄。
+  // 输入/输出及副作用：source（输入）、local_id（输入）；projected_id_handle 读取 source、local_id 并使用字段 result、result.kind、result.function_uid、result.generation、result.object_id；函数返回 rdma_handle，不取得调用方资源所有权。
+  // 失败/边界：projected_id_handle 输入对象为空或查找未命中时返回 null；该路径不隐式重试，也不转移未声明资源。
   protected function rdma_handle projected_id_handle(
     rdma_handle source, int unsigned local_id
   );
@@ -799,9 +777,9 @@ class rdma_queue_data_engine extends uvm_object;
     return result;
   endfunction
 
-  // 功能：完成发送队列预检、槽位预留、WQE 写入和 producer doorbell 提交，并返回提交结果与失败证据。
-  // 输入/输出及副作用：request/queue handle 提供事务身份，output result/status 返回 detached 结果和阶段状态；成功时推进唯一 runtime。
-  //   空句柄、队列为空、owner 不匹配或 doorbell 失败时不发布半成品结果。
+  // 功能：在 rdma_queue_data_engine 中，submit_producer_doorbell 完成发送队列预检、槽位预留、WQE 写入和 producer doorbell 提交，并返回提交结果与失败证据。
+  // 输入/输出及副作用：target_h（输入）、kind（输入）、reservation（输入）、next（输入）、sqe_image（输入）、local_id（输入）、result（输出）、status（输出）；输入
+  //   request/image/cursor 决定写入内容；成功时更新 PI/CI、slot ledger 或 pending journal，并通过 output 返回结果。
   // 失败/边界：未配置、空队列、stale generation/reset epoch 和 ambiguous MMIO 均禁止发布成功结果或自动重试。
   protected task submit_producer_doorbell(
     rdma_handle target_h, rdma_queue_runtime_kind_e kind,
@@ -810,9 +788,9 @@ class rdma_queue_data_engine extends uvm_object;
     output rdma_doorbell_result result,
     output rdma_status status
   );
-    rdma_xtr_v1_sq_doorbell_model sq;
-    rdma_xtr_v1_rq_doorbell_model rq;
-    rdma_xtr_v1_srq_doorbell_model srq;
+    rdma_hw_sq_doorbell_model sq;
+    rdma_hw_rq_doorbell_model rq;
+    rdma_hw_srq_doorbell_model srq;
     rdma_hw_model model;
     rdma_hw_image image;
     rdma_codec_key codec_key;
@@ -828,31 +806,31 @@ class rdma_queue_data_engine extends uvm_object;
     end
     case (kind)
       RDMA_QUEUE_RUNTIME_SQ: begin
-        variant = "sq"; relative_offset = XTR_V1_DB_SQ_OFFSET;
-        sq = rdma_xtr_v1_sq_doorbell_model::type_id::create("sq_db_model");
+        variant = "sq"; relative_offset = RDMA_DB_SQ_OFFSET;
+        sq = rdma_hw_sq_doorbell_model::type_id::create("sq_db_model");
         sq.target_h = rdma_clone_handle_value(target_h, "SQ DB target");
-        if (sqe_image == null || sqe_image.bytes.size() < XTR_V1_DB_BYTES) begin
+        if (sqe_image == null || sqe_image.bytes.size() < RDMA_DB_BYTES) begin
           status = bad("SQ doorbell lacks the encoded SQE header");
           return;
         end
         foreach (sqe_image.bytes[i]) begin
-          if (i >= XTR_V1_DB_BYTES) break;
+          if (i >= RDMA_DB_BYTES) break;
           sq.sqe_header.push_back(sqe_image.bytes[i]);
         end
         model = sq;
       end
       RDMA_QUEUE_RUNTIME_RQ: begin
-        variant = "rq"; relative_offset = XTR_V1_DB_RQ_OFFSET;
-        rq = rdma_xtr_v1_rq_doorbell_model::type_id::create("rq_db_model");
+        variant = "rq"; relative_offset = RDMA_DB_RQ_OFFSET;
+        rq = rdma_hw_rq_doorbell_model::type_id::create("rq_db_model");
         rq.target_h = projected_id_handle(target_h, local_id);
         rq.qpn = local_id; rq.icos = 0; rq.pi = next.index; rq.wrap = next.wrap;
         model = rq;
       end
       RDMA_QUEUE_RUNTIME_SRQ: begin
-        variant = "srq_pi"; relative_offset = XTR_V1_DB_SRFQ_OFFSET;
-        srq = rdma_xtr_v1_srq_doorbell_model::type_id::create("srq_db_model");
+        variant = "srq_pi"; relative_offset = RDMA_DB_SRFQ_OFFSET;
+        srq = rdma_hw_srq_doorbell_model::type_id::create("srq_db_model");
         srq.target_h = projected_id_handle(target_h, local_id);
-        srq.variant = XTR_V1_SRQ_DB_PI; srq.srqn = local_id;
+        srq.variant = RDMA_SRQ_DB_PI; srq.srqn = local_id;
         srq.pi = next.index; srq.wrap = next.wrap; model = srq;
       end
       default: begin
@@ -860,7 +838,7 @@ class rdma_queue_data_engine extends uvm_object;
         return;
       end
     endcase
-    codec_key = '{hw_version:"xtr_v1", image_kind:RDMA_IMAGE_DOORBELL,
+    codec_key = '{hw_version:"rdma", image_kind:RDMA_IMAGE_DOORBELL,
       object_type:"doorbell", variant:variant, opcode:8'h00};
     status = registry.lookup(codec_key, codec);
     if (!status.ok()) return;
@@ -873,7 +851,7 @@ class rdma_queue_data_engine extends uvm_object;
     desc.function_h = binding.make_handle();
     desc.target_h = rdma_clone_handle_value(target_h, "producer DB target");
     desc.notify_bar_id = binding.notify_bar_id; desc.relative_offset = relative_offset;
-    desc.width = XTR_V1_DB_BYTES; desc.endian = RDMA_ENDIAN_BIG;
+    desc.width = RDMA_DB_BYTES; desc.endian = RDMA_ENDIAN_BIG;
     desc.payload_image = image; desc.barrier_policy = RDMA_DB_BARRIER_DMA_MMIO;
     desc.write_combining_policy = RDMA_DB_WRITE_NON_COMBINING;
     desc.allow_merge = 1'b0; desc.merge_requested = 1'b0;
@@ -881,10 +859,9 @@ class rdma_queue_data_engine extends uvm_object;
     doorbells.submit(binding, desc, result, status);
   endtask
 
-  // 功能：依据输入请求创建对应的值对象或资源计划，并校验依赖、所有权和生命周期后返回结果。
-  // 输入/输出及副作用：输入请求、容量和依赖用于构造/预留资源；返回独立对象或状态，不暴露内部可变集合。
-  //   参数越界、容量不足或构造中途失败时回滚已登记的局部状态。
-  // 失败/边界：依赖为空、参数越界、容量不足或构造步骤失败时清理局部结果并返回明确错误。
+  // 功能：make_entry_image 根据 data、kind、entry_size、image 生成或检查硬件镜像字段，保持布局、端序和保留位约束一致。
+  // 输入/输出及副作用：data（输入）、kind（输入）、entry_size（输入）、image（输出）；make_entry_image 读取 data、kind、entry_size、image 并使用字段 image、image.length、image.alignment、image.endian、image.image_kind、image.hardware_version、image.function_generation、image.write_target_kind，并写入 image；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：make_entry_image 返回 RDMA_SC_DMA_TRANSLATION；具体拒绝条件包括 “queue entry byte count does not match attachment geometry”；失败路径不提交部分状态、不隐式重试，也不转移未声明资源。
   protected function rdma_status make_entry_image(
     byte data[], rdma_image_kind_e kind, int unsigned entry_size,
     output rdma_hw_image image
@@ -899,7 +876,7 @@ class rdma_queue_data_engine extends uvm_object;
     image.alignment = entry_size;
     image.endian = RDMA_ENDIAN_BIG;
     image.image_kind = kind;
-    image.hardware_version = XTR_V1_HW_VERSION;
+    image.hardware_version = RDMA_HW_VERSION;
     image.function_generation = binding.generation;
     image.write_target_kind = RDMA_HW_TARGET_NONE;
     image.backing_target = '0;
@@ -908,10 +885,10 @@ class rdma_queue_data_engine extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：按输入的完整标识查询当前权威记录并返回独立快照；缺失、歧义或代际过期时返回明确错误。
-  // 输入/输出及副作用：输入为完整 key/handle，output 或返回值为记录快照；查询不改变登记表和外部资源。
-  //   缺失、歧义、空句柄或旧 generation/reset epoch 返回明确错误。
-  // 失败/边界：查询不到唯一记录、输入为空或 authority 已失效时返回错误，不回退到默认 Function/root。
+  // 功能：在 rdma_queue_data_engine 中，find_qp_link_for_cq 按完整 key/handle 查找唯一权威记录并返回 detached 快照，避免把内部可变引用泄露给调用方。
+  // 输入/输出及副作用：cq_h（输入）、qpn（输入）、rq_cqe（输入）、link（输出）；输入 handle/key/cursor 用于选择读取范围；返回值或 output 为 detached
+  //   快照，读取不取得外部资源所有权。
+  // 失败/边界：find_qp_link_for_cq 在 key/handle 缺失、记录不唯一或 generation/reset epoch 过期时返回明确错误，不回退到默认 authority。
   protected function rdma_status find_qp_link_for_cq(
     rdma_handle cq_h, int unsigned qpn, bit rq_cqe,
     output rdma_queue_data_qp_link link
@@ -940,10 +917,9 @@ class rdma_queue_data_engine extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：按输入的完整标识查询当前权威记录并返回独立快照；缺失、歧义或代际过期时返回明确错误。
-  // 输入/输出及副作用：输入为完整 key/handle，output 或返回值为记录快照；查询不改变登记表和外部资源。
-  //   缺失、歧义、空句柄或旧 generation/reset epoch 返回明确错误。
-  // 失败/边界：查询不到唯一记录、输入为空或 authority 已失效时返回错误，不回退到默认 Function/root。
+  // 功能：在 rdma_queue_data_engine 中，find_qp_link_for_local_id 按完整 key/handle 查找唯一权威记录并返回 detached 快照，避免把内部可变引用泄露给调用方。
+  // 输入/输出及副作用：qpn（输入）、link（输出）；find_qp_link_for_local_id 读取 qpn、link 并使用字段 link、candidate，并写入 link；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：find_qp_link_for_local_id 在 key/handle 缺失、记录不唯一或 generation/reset epoch 过期时返回明确错误，不回退到默认 authority。
   protected function rdma_status find_qp_link_for_local_id(
     int unsigned qpn, output rdma_queue_data_qp_link link
   );
@@ -963,10 +939,9 @@ class rdma_queue_data_engine extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：按输入的完整标识查询当前权威记录并返回独立快照；缺失、歧义或代际过期时返回明确错误。
-  // 输入/输出及副作用：输入为完整 key/handle，output 或返回值为记录快照；查询不改变登记表和外部资源。
-  //   缺失、歧义、空句柄或旧 generation/reset epoch 返回明确错误。
-  // 失败/边界：查询不到唯一记录、输入为空或 authority 已失效时返回错误，不回退到默认 Function/root。
+  // 功能：在 rdma_queue_data_engine 中，find_cq_handle_for_local_id 按完整 key/handle 查找唯一权威记录并返回 detached 快照，避免把内部可变引用泄露给调用方。
+  // 输入/输出及副作用：cqn（输入）、cq_h（输出）；find_cq_handle_for_local_id 读取 cqn、cq_h 并使用字段 cq_h、candidate，并写入 cq_h；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：find_cq_handle_for_local_id 在 key/handle 缺失、记录不唯一或 generation/reset epoch 过期时返回明确错误，不回退到默认 authority。
   protected function rdma_status find_cq_handle_for_local_id(
     int unsigned cqn, output rdma_handle cq_h
   );
@@ -990,10 +965,9 @@ class rdma_queue_data_engine extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：从源对象复制可变字段并生成独立值快照；源对象保持不变，类型不匹配时报告复制错误。
-  // 输入/输出及副作用：source/rhs 是源对象；返回或写入独立副本，不修改源对象。
-  //   source/rhs 为空或类型不匹配时返回空值或触发既定复制错误。
-  // 失败/边界：空源对象不应解引用；类型不匹配必须拒绝复制或按既定 UVM 规则报告 fatal。
+  // 功能：将 rhs 中 rdma_queue_data_engine 的值字段复制到当前对象，建立与源对象隔离的快照。
+  // 输入/输出及副作用：source（输入）、result（输出）；clone_slot_result 读取 source、result 并使用字段 result、result.posted、result.consumed、result.signaled、result.wr_id、result.index、result.wrap、cloned，并写入 result；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：clone_slot_result 返回 RDMA_SC_INVALID_ARGUMENT；典型拒绝条件为“released slot ledger entry is null”“released request snapshot clone failed”；失败路径不提交部分状态或转移未声明资源。
   protected function rdma_status clone_slot_result(
     rdma_queue_slot_ledger_entry source,
     output rdma_queue_slot_ledger_entry result
@@ -1029,25 +1003,25 @@ class rdma_queue_data_engine extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：处理 completion_status_from_ecode：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 ecode, observed_engine, completion_status 用于执行 completion_status_from_ecode；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：completion_status_from_ecode 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：completion_status_from_ecode 校验 ecode、observed_engine、completion_status 与当前对象状态的一致性，并显式处理“queue_error_codec”等拒绝条件，返回 rdma_status 供上层决定是否提交。
+  // 输入/输出及副作用：ecode（输入）、observed_engine（输入）、completion_status（输出）；completion_status_from_ecode 读取 ecode、observed_engine、completion_status 并使用字段 completion_status、error_codec，并写入 completion_status；函数返回 rdma_status，不取得调用方资源所有权。
+
+  // 失败/边界：completion_status_from_ecode 无返回值，仅执行 completion_status=null、error_codec=rdma_hw_error_codec::type_id::create("queue_error_codec")；调用方须保证前置依赖已经绑定，函数不自动重试或接管外部资源。
   protected function rdma_status completion_status_from_ecode(
       bit [7:0] ecode, rdma_engine_kind_e observed_engine,
       output rdma_status completion_status
   );
-    rdma_xtr_v1_error_codec error_codec;
+    rdma_hw_error_codec error_codec;
     completion_status = null;
-    error_codec = rdma_xtr_v1_error_codec::type_id::create("queue_error_codec");
+    error_codec = rdma_hw_error_codec::type_id::create("queue_error_codec");
     return error_codec.decode_status(ecode, observed_engine,
                                      completion_status);
   endfunction
 
-  // 功能：执行一次受控事务并推进所属状态机；返回结果时保留失败阶段、代际和后端提交证据。
-  // 输入/输出及副作用：参数 attachment, next, result, status, mmio_maybe_submitted, routed_link 用于执行 submit_consumer_doorbell；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：事务超时、代际变化或提交证据不完整时不得推进下一阶段。
+  // 功能：在 rdma_queue_data_engine 中，submit_consumer_doorbell 执行受控事务并按后端提交证据推进状态机，同时保留失败阶段和 generation 证据。
+  // 输入/输出及副作用：attachment（输入）、next（输入）、result（输出）、status（输出）、mmio_maybe_submitted（输出）、routed_link（输入）；输入
+  //   request/image/cursor 决定写入内容；成功时更新 PI/CI、slot ledger 或 pending journal，并通过 output 返回结果。
+  // 失败/边界：submit_consumer_doorbell 遇到锁、超时、generation 变化或提交证据不完整时保持原状态，不推进游标。
   protected task submit_consumer_doorbell(
     rdma_queue_data_attachment attachment,
     rdma_queue_cursor_snapshot next,
@@ -1056,9 +1030,9 @@ class rdma_queue_data_engine extends uvm_object;
     output bit mmio_maybe_submitted,
     rdma_queue_data_qp_link routed_link
   );
-    rdma_xtr_v1_cq_doorbell_model cq;
-    rdma_xtr_v1_ceq_doorbell_model ceq;
-    rdma_xtr_v1_aeq_doorbell_model aeq;
+    rdma_hw_cq_doorbell_model cq;
+    rdma_hw_ceq_doorbell_model ceq;
+    rdma_hw_aeq_doorbell_model aeq;
     rdma_hw_model model;
     rdma_hw_image image;
     rdma_codec_key codec_key;
@@ -1083,12 +1057,12 @@ class rdma_queue_data_engine extends uvm_object;
       RDMA_QUEUE_RUNTIME_CQ: begin
         variant = (attachment.transport == RDMA_TRANSPORT_URC) ?
                   "cq_urc" : "cq_rc_ud";
-        relative_offset = XTR_V1_DB_CQ_OFFSET;
-        cq = rdma_xtr_v1_cq_doorbell_model::type_id::create("cq_ci_db_model");
+        relative_offset = RDMA_DB_CQ_OFFSET;
+        cq = rdma_hw_cq_doorbell_model::type_id::create("cq_ci_db_model");
         cq.target_h = projected_id_handle(attachment.queue_h,
                                           attachment.local_id);
-        cq.variant = (variant == "cq_urc") ? XTR_V1_CQ_DB_URC :
-                                               XTR_V1_CQ_DB_RC_UD;
+        cq.variant = (variant == "cq_urc") ? RDMA_CQ_DB_URC :
+                                               RDMA_CQ_DB_RC_UD;
         cq.cqn = attachment.local_id;
         cq.host_id = binding.host_id;
         cq.arm = 1'b0;
@@ -1139,8 +1113,8 @@ class rdma_queue_data_engine extends uvm_object;
       end
       RDMA_QUEUE_RUNTIME_CEQ: begin
         variant = "ceq";
-        relative_offset = XTR_V1_DB_CEQ_OFFSET;
-        ceq = rdma_xtr_v1_ceq_doorbell_model::type_id::create("ceq_ci_db_model");
+        relative_offset = RDMA_DB_CEQ_OFFSET;
+        ceq = rdma_hw_ceq_doorbell_model::type_id::create("ceq_ci_db_model");
         ceq.target_h = projected_id_handle(attachment.queue_h,
                                            attachment.local_id);
         ceq.ceqn = attachment.local_id;
@@ -1150,8 +1124,8 @@ class rdma_queue_data_engine extends uvm_object;
       end
       RDMA_QUEUE_RUNTIME_AEQ: begin
         variant = "aeq";
-        relative_offset = XTR_V1_DB_AEQ_OFFSET;
-        aeq = rdma_xtr_v1_aeq_doorbell_model::type_id::create("aeq_ci_db_model");
+        relative_offset = RDMA_DB_AEQ_OFFSET;
+        aeq = rdma_hw_aeq_doorbell_model::type_id::create("aeq_ci_db_model");
         aeq.target_h = projected_id_handle(attachment.queue_h,
                                            attachment.local_id);
         aeq.aeqn = attachment.local_id;
@@ -1164,7 +1138,7 @@ class rdma_queue_data_engine extends uvm_object;
         return;
       end
     endcase
-    codec_key = '{hw_version:"xtr_v1", image_kind:RDMA_IMAGE_DOORBELL,
+    codec_key = '{hw_version:"rdma", image_kind:RDMA_IMAGE_DOORBELL,
       object_type:"doorbell", variant:variant, opcode:8'h00};
     status = registry.lookup(codec_key, codec);
     if (!status.ok()) return;
@@ -1179,7 +1153,7 @@ class rdma_queue_data_engine extends uvm_object;
                                              "consumer DB target");
     desc.notify_bar_id = binding.notify_bar_id;
     desc.relative_offset = relative_offset;
-    desc.width = XTR_V1_DB_BYTES;
+    desc.width = RDMA_DB_BYTES;
     desc.endian = RDMA_ENDIAN_BIG;
     desc.payload_image = image;
     desc.barrier_policy = RDMA_DB_BARRIER_MMIO;
@@ -1196,10 +1170,10 @@ class rdma_queue_data_engine extends uvm_object;
     doorbells.submit(binding, desc, result, status);
   endtask
 
-  // 功能：读取并解码队列条目，校验 owner/identity 后提交 consumer index；仅在提交成功后发布 completion 或 event。
-  // 输入/输出及副作用：request/queue handle 提供事务身份，output result/status 返回 detached 结果和阶段状态；成功时推进唯一 runtime。
+  // 功能：在 rdma_queue_data_engine 中，poll_cqe_once 读取并解码队列条目，校验 owner/identity 后提交 consumer index，成功提交后才发布 completion/event。
+  // 输入/输出及副作用：cq_h（输入）、result（输出）、status（输出）；poll_cqe_once 驱动下游事务，并写入 result、status；函数返回 无直接返回值，不取得调用方资源所有权。
+  // 失败/边界：poll_cqe_once 遇到队列为空、owner/identity 失配或 CI/MMIO 提交失败时不发布 completion/event。
   //   空句柄、队列为空、owner 不匹配或 doorbell 失败时不发布半成品结果。
-  // 失败/边界：未配置、空队列、stale generation/reset epoch 和 ambiguous MMIO 均禁止发布成功结果或自动重试。
   protected task poll_cqe_once(
     rdma_handle cq_h,
     output rdma_queue_completion_result result,
@@ -1214,7 +1188,7 @@ class rdma_queue_data_engine extends uvm_object;
     rdma_codec_base codec;
     rdma_hw_image entry_image;
     rdma_hw_model decoded_model;
-    rdma_xtr_v1_cqe_model cqe;
+    rdma_hw_cqe_model cqe;
     rdma_queue_slot_ledger_entry released[$];
     rdma_queue_slot_ledger_entry released_copy;
     rdma_queue_pending_operation pending;
@@ -1240,7 +1214,7 @@ class rdma_queue_data_engine extends uvm_object;
     status = make_entry_image(data, RDMA_IMAGE_CQE,
                               cq_attachment.entry_size, entry_image);
     if (!status.ok()) return;
-    codec_key = '{hw_version:"xtr_v1", image_kind:RDMA_IMAGE_CQE,
+    codec_key = '{hw_version:"rdma", image_kind:RDMA_IMAGE_CQE,
       object_type:"cqe", variant:"default", opcode:8'h00};
     status = registry.lookup(codec_key, codec);
     if (!status.ok()) return;
@@ -1405,10 +1379,11 @@ class rdma_queue_data_engine extends uvm_object;
     status = rdma_status::success();
   endtask
 
-  // 功能：读取并解码队列条目，校验 owner/identity 后提交 consumer index；仅在提交成功后发布 completion 或 event。
-  // 输入/输出及副作用：request/queue handle 提供事务身份，output result/status 返回 detached 结果和阶段状态；成功时推进唯一 runtime。
+  // 功能：在 rdma_queue_data_engine 中，poll_cqe 读取并解码队列条目，校验 owner/identity 后提交 consumer index，成功提交后才发布 completion/event。
+  // 输入/输出及副作用：cq_h（输入）、timeout（输入）、result（输出）、status（输出）；输入 handle/key/cursor 用于选择读取范围；返回值或 output 为 detached
+  //   快照，读取不取得外部资源所有权。
+  // 失败/边界：poll_cqe 遇到队列为空、owner/identity 失配或 CI/MMIO 提交失败时不发布 completion/event。
   //   空句柄、队列为空、owner 不匹配或 doorbell 失败时不发布半成品结果。
-  // 失败/边界：未配置、空队列、stale generation/reset epoch 和 ambiguous MMIO 均禁止发布成功结果或自动重试。
   task poll_cqe(
     rdma_handle cq_h, time timeout,
     output rdma_queue_completion_result result,
@@ -1448,10 +1423,10 @@ class rdma_queue_data_engine extends uvm_object;
     end while (1);
   endtask
 
-  // 功能：读取并解码队列条目，校验 owner/identity 后提交 consumer index；仅在提交成功后发布 completion 或 event。
-  // 输入/输出及副作用：request/queue handle 提供事务身份，output result/status 返回 detached 结果和阶段状态；成功时推进唯一 runtime。
+  // 功能：在 rdma_queue_data_engine 中，poll_ceqe_once 读取并解码队列条目，校验 owner/identity 后提交 consumer index，成功提交后才发布 completion/event。
+  // 输入/输出及副作用：ceq_h（输入）、result（输出）、status（输出）；poll_ceqe_once 驱动下游事务，并写入 result、status；函数返回 无直接返回值，不取得调用方资源所有权。
+  // 失败/边界：poll_ceqe_once 遇到队列为空、owner/identity 失配或 CI/MMIO 提交失败时不发布 completion/event。
   //   空句柄、队列为空、owner 不匹配或 doorbell 失败时不发布半成品结果。
-  // 失败/边界：未配置、空队列、stale generation/reset epoch 和 ambiguous MMIO 均禁止发布成功结果或自动重试。
   protected task poll_ceqe_once(
     rdma_handle ceq_h,
     output rdma_queue_event_result result,
@@ -1464,7 +1439,7 @@ class rdma_queue_data_engine extends uvm_object;
     rdma_codec_base codec;
     rdma_hw_image entry_image;
     rdma_hw_model decoded_model;
-    rdma_xtr_v1_ceqe_model ceqe;
+    rdma_hw_ceqe_model ceqe;
     rdma_handle routed_cq_h;
     rdma_doorbell_result db_result;
     bit db_mmio_maybe_submitted;
@@ -1483,7 +1458,7 @@ class rdma_queue_data_engine extends uvm_object;
     status = make_entry_image(data, RDMA_IMAGE_CEQE, attachment.entry_size,
                               entry_image);
     if (!status.ok()) return;
-    codec_key = '{hw_version:"xtr_v1", image_kind:RDMA_IMAGE_CEQE,
+    codec_key = '{hw_version:"rdma", image_kind:RDMA_IMAGE_CEQE,
       object_type:"ceqe", variant:"default", opcode:8'h00};
     status = registry.lookup(codec_key, codec);
     if (!status.ok()) return;
@@ -1529,10 +1504,11 @@ class rdma_queue_data_engine extends uvm_object;
     status = rdma_status::success();
   endtask
 
-  // 功能：读取并解码队列条目，校验 owner/identity 后提交 consumer index；仅在提交成功后发布 completion 或 event。
-  // 输入/输出及副作用：request/queue handle 提供事务身份，output result/status 返回 detached 结果和阶段状态；成功时推进唯一 runtime。
+  // 功能：在 rdma_queue_data_engine 中，poll_ceqe 读取并解码队列条目，校验 owner/identity 后提交 consumer index，成功提交后才发布 completion/event。
+  // 输入/输出及副作用：ceq_h（输入）、timeout（输入）、result（输出）、status（输出）；输入 handle/key/cursor 用于选择读取范围；返回值或 output 为 detached
+  //   快照，读取不取得外部资源所有权。
+  // 失败/边界：poll_ceqe 遇到队列为空、owner/identity 失配或 CI/MMIO 提交失败时不发布 completion/event。
   //   空句柄、队列为空、owner 不匹配或 doorbell 失败时不发布半成品结果。
-  // 失败/边界：未配置、空队列、stale generation/reset epoch 和 ambiguous MMIO 均禁止发布成功结果或自动重试。
   task poll_ceqe(
     rdma_handle ceq_h, time timeout,
     output rdma_queue_event_result result,
@@ -1558,10 +1534,10 @@ class rdma_queue_data_engine extends uvm_object;
     end while (1);
   endtask
 
-  // 功能：读取并解码队列条目，校验 owner/identity 后提交 consumer index；仅在提交成功后发布 completion 或 event。
-  // 输入/输出及副作用：request/queue handle 提供事务身份，output result/status 返回 detached 结果和阶段状态；成功时推进唯一 runtime。
+  // 功能：在 rdma_queue_data_engine 中，poll_aeqe_once 读取并解码队列条目，校验 owner/identity 后提交 consumer index，成功提交后才发布 completion/event。
+  // 输入/输出及副作用：aeq_h（输入）、result（输出）、status（输出）；poll_aeqe_once 驱动下游事务，并写入 result、status；函数返回 无直接返回值，不取得调用方资源所有权。
+  // 失败/边界：poll_aeqe_once 遇到队列为空、owner/identity 失配或 CI/MMIO 提交失败时不发布 completion/event。
   //   空句柄、队列为空、owner 不匹配或 doorbell 失败时不发布半成品结果。
-  // 失败/边界：未配置、空队列、stale generation/reset epoch 和 ambiguous MMIO 均禁止发布成功结果或自动重试。
   protected task poll_aeqe_once(
     rdma_handle aeq_h,
     output rdma_queue_event_result result,
@@ -1575,7 +1551,7 @@ class rdma_queue_data_engine extends uvm_object;
     rdma_codec_base codec;
     rdma_hw_image entry_image;
     rdma_hw_model decoded_model;
-    rdma_xtr_v1_aeqe_model aeqe;
+    rdma_hw_aeqe_model aeqe;
     rdma_doorbell_result db_result;
     bit db_mmio_maybe_submitted;
     rdma_queue_data_qp_link no_route;
@@ -1593,7 +1569,7 @@ class rdma_queue_data_engine extends uvm_object;
     status = make_entry_image(data, RDMA_IMAGE_AEQE, attachment.entry_size,
                               entry_image);
     if (!status.ok()) return;
-    codec_key = '{hw_version:"xtr_v1", image_kind:RDMA_IMAGE_AEQE,
+    codec_key = '{hw_version:"rdma", image_kind:RDMA_IMAGE_AEQE,
       object_type:"aeqe", variant:"default", opcode:8'h00};
     status = registry.lookup(codec_key, codec);
     if (!status.ok()) return;
@@ -1641,10 +1617,11 @@ class rdma_queue_data_engine extends uvm_object;
     status = rdma_status::success();
   endtask
 
-  // 功能：读取并解码队列条目，校验 owner/identity 后提交 consumer index；仅在提交成功后发布 completion 或 event。
-  // 输入/输出及副作用：request/queue handle 提供事务身份，output result/status 返回 detached 结果和阶段状态；成功时推进唯一 runtime。
+  // 功能：在 rdma_queue_data_engine 中，poll_aeqe 读取并解码队列条目，校验 owner/identity 后提交 consumer index，成功提交后才发布 completion/event。
+  // 输入/输出及副作用：aeq_h（输入）、timeout（输入）、result（输出）、status（输出）；输入 handle/key/cursor 用于选择读取范围；返回值或 output 为 detached
+  //   快照，读取不取得外部资源所有权。
+  // 失败/边界：poll_aeqe 遇到队列为空、owner/identity 失配或 CI/MMIO 提交失败时不发布 completion/event。
   //   空句柄、队列为空、owner 不匹配或 doorbell 失败时不发布半成品结果。
-  // 失败/边界：未配置、空队列、stale generation/reset epoch 和 ambiguous MMIO 均禁止发布成功结果或自动重试。
   task poll_aeqe(
     rdma_handle aeq_h, time timeout,
     output rdma_queue_event_result result,
@@ -1670,9 +1647,9 @@ class rdma_queue_data_engine extends uvm_object;
     end while (1);
   endtask
 
-  // 功能：完成发送队列预检、槽位预留、WQE 写入和 producer doorbell 提交，并返回提交结果与失败证据。
-  // 输入/输出及副作用：request/queue handle 提供事务身份，output result/status 返回 detached 结果和阶段状态；成功时推进唯一 runtime。
-  //   空句柄、队列为空、owner 不匹配或 doorbell 失败时不发布半成品结果。
+  // 功能：在 rdma_queue_data_engine 中，post_send 完成发送队列预检、槽位预留、WQE 写入和 producer doorbell 提交，并返回提交结果与失败证据。
+  // 输入/输出及副作用：request（输入）、result（输出）、status（输出）；输入 request/image/cursor 决定写入内容；成功时更新 PI/CI、slot ledger 或 pending
+  //   journal，并通过 output 返回结果。
   // 失败/边界：未配置、空队列、stale generation/reset epoch 和 ambiguous MMIO 均禁止发布成功结果或自动重试。
   task post_send(
     rdma_post_send_req request,
@@ -1684,7 +1661,7 @@ class rdma_queue_data_engine extends uvm_object;
     rdma_queue_data_qp_link link;
     rdma_queue_cursor_snapshot cursor;
     rdma_queue_cursor_snapshot next;
-    rdma_xtr_v1_sqe_model model;
+    rdma_hw_sqe_model model;
     rdma_hw_image image;
     rdma_doorbell_result doorbell_result;
     rdma_queue_pending_operation pending;
@@ -1750,9 +1727,9 @@ class rdma_queue_data_engine extends uvm_object;
     result.status = rdma_status::success(); status = result.status;
   endtask
 
-  // 功能：完成接收队列预检、槽位预留、RQE 写入和 producer doorbell 提交，并返回提交结果与失败证据。
-  // 输入/输出及副作用：request/queue handle 提供事务身份，output result/status 返回 detached 结果和阶段状态；成功时推进唯一 runtime。
-  //   空句柄、队列为空、owner 不匹配或 doorbell 失败时不发布半成品结果。
+  // 功能：在 rdma_queue_data_engine 中，post_recv 完成接收队列预检、槽位预留、RQE 写入和 producer doorbell 提交，并返回提交结果与失败证据。
+  // 输入/输出及副作用：request（输入）、result（输出）、status（输出）；输入 request/image/cursor 决定写入内容；成功时更新 PI/CI、slot ledger 或 pending
+  //   journal，并通过 output 返回结果。
   // 失败/边界：未配置、空队列、stale generation/reset epoch 和 ambiguous MMIO 均禁止发布成功结果或自动重试。
   task post_recv(
     rdma_post_recv_req request,
@@ -1764,7 +1741,7 @@ class rdma_queue_data_engine extends uvm_object;
     rdma_queue_data_qp_link link;
     rdma_queue_cursor_snapshot cursor;
     rdma_queue_cursor_snapshot next;
-    rdma_xtr_v1_rqe_model model;
+    rdma_hw_rqe_model model;
     rdma_hw_image image;
     rdma_doorbell_result doorbell_result;
     rdma_queue_pending_operation pending;
@@ -1852,10 +1829,9 @@ class rdma_queue_data_engine extends uvm_object;
     result.status = rdma_status::success(); status = result.status;
   endtask
 
-  // 功能：处理 pending_next_cursor：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 attachment, pending, next 用于执行 pending_next_cursor；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：pending_next_cursor 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：在 rdma_queue_data_engine 中，pending_next_cursor 从 pending reservation 计算提交后的 index/wrap，遇到 ring 末尾时回卷并翻转 wrap。
+  // 输入/输出及副作用：attachment（输入）、pending（输入）、next（输出）；pending_next_cursor 读取 attachment、pending、next 并使用字段 next、next.index、next.wrap，并写入 next；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：pending_next_cursor 返回 RDMA_SC_INVALID_ARGUMENT；典型拒绝条件为“pending recovery cursor is invalid”；失败路径不提交部分状态或转移未声明资源。
   protected function rdma_status pending_next_cursor(
     rdma_queue_data_attachment attachment,
     rdma_queue_pending_operation pending,
@@ -1881,10 +1857,9 @@ class rdma_queue_data_engine extends uvm_object;
   // Re-execute the detached transaction only when the original operation is
   // known not to have reached MMIO.  The runtime remains RECOVERY_REQUIRED
   // until every side effect and ledger transition has completed.
-  // 功能：处理 replay_pending：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 attachment, pending, status 用于执行 replay_pending；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：replay_pending 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：在 rdma_queue_data_engine 中，replay_pending 记录或执行队列恢复步骤，依据提交证据选择重试、提交或回滚并保持操作幂等。
+  // 输入/输出及副作用：attachment（输入）、pending（输入）、status（输出）；replay_pending 驱动下游事务，并写入 status；函数返回 无直接返回值，不取得调用方资源所有权。
+  // 失败/边界：replay_pending 失败或超时通过 status 明确发布；该路径不隐式重试，也不转移未声明资源。
   protected task replay_pending(
     rdma_queue_data_attachment attachment,
     rdma_queue_pending_operation pending,
@@ -1897,7 +1872,7 @@ class rdma_queue_data_engine extends uvm_object;
     rdma_queue_data_qp_link no_route;
     rdma_queue_data_attachment wqe_attachment;
     rdma_queue_slot_ledger_entry released[$];
-    rdma_xtr_v1_cqe_model cqe;
+    rdma_hw_cqe_model cqe;
     rdma_hw_model decoded_model;
     rdma_codec_base codec;
     rdma_codec_key codec_key;
@@ -1956,7 +1931,7 @@ class rdma_queue_data_engine extends uvm_object;
         status = bad("CQ recovery image is missing", RDMA_SC_INVALID_STATE);
         return;
       end
-      codec_key = '{hw_version:"xtr_v1", image_kind:RDMA_IMAGE_CQE,
+      codec_key = '{hw_version:"rdma", image_kind:RDMA_IMAGE_CQE,
         object_type:"cqe", variant:"default", opcode:8'h00};
       status = registry.lookup(codec_key, codec);
       if (!status.ok()) return;
@@ -2036,10 +2011,10 @@ class rdma_queue_data_engine extends uvm_object;
     status = attachment.runtime.complete_recovery_retry();
   endtask
 
-  // 功能：执行一次受控事务并推进所属状态机；返回结果时保留失败阶段、代际和后端提交证据。
-  // 输入/输出及副作用：参数 queue_h, action, caller_confirmed_no_submit, status 用于执行 recover_queue；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：事务超时、代际变化或提交证据不完整时不得推进下一阶段。
+  // 功能：在 rdma_queue_data_engine 中，recover_queue 执行受控事务并按后端提交证据推进状态机，同时保留失败阶段和 generation 证据。
+  // 输入/输出及副作用：queue_h（输入）、action（输入）、caller_confirmed_no_submit（输入）、status（输出）；输入 action/epoch/handle
+  //   决定迁移目标；成功时更新状态或恢复证据，外部资源仍由其拥有者管理。
+  // 失败/边界：recover_queue 遇到锁、超时、generation 变化或提交证据不完整时保持原状态，不推进游标。
   task recover_queue(
     rdma_handle queue_h,
     rdma_queue_recovery_action_e action,

@@ -12,20 +12,19 @@ class rdma_queue_planner_nth_fail_mem extends rdma_mock_host_mem;
   int unsigned allocate_attempt;
   int unsigned fail_on_allocate;
 
-  // 功能：构造当前对象并初始化其字段、集合和 UVM 名称；不接管传入句柄的生命周期。
-  // 输入/输出及副作用：name 仅用于 UVM 对象命名；内部字段被初始化为安全默认值，传入句柄不转移所有权。
-  //   返回新对象实例；构造失败由 UVM 工厂或调用方处理。
-  // 失败/边界：不创建外部资源；name 为空时仍允许构造，但所有字段必须保持可配置的初始值。
+  // 功能：构造 rdma_queue_planner_nth_fail_mem，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：allocate_attempt=0；fail_on_allocate=0。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_queue_planner_nth_fail_mem 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_queue_planner_nth_fail_mem");
     super.new(name);
     allocate_attempt = 0;
     fail_on_allocate = 0;
   endfunction
 
-  // 功能：检查可用容量并预留所需资源，返回带所有权证据的分配结果；容量不足时不留下部分分配。
-  // 输入/输出及副作用：输入请求、容量和依赖用于构造/预留资源；返回独立对象或状态，不暴露内部可变集合。
-  //   参数越界、容量不足或构造中途失败时回滚已登记的局部状态。
-  // 失败/边界：依赖为空、参数越界、容量不足或构造步骤失败时清理局部结果并返回明确错误。
+  // 功能：在 rdma_queue_planner_nth_fail_mem 中，allocate 检查容量后预留资源并返回带 owner 证据的句柄/计划；失败时回滚已登记的局部状态。
+  // 输入/输出及副作用：request_context（输入）、size（输入）、alignment（输入）、direction（输入）、mapping（输出）；输入请求/句柄定义资源属性；成功时更新账本并通过返回值或
+  //   output 发布新句柄/映射。
+  // 失败/边界：容量不足、范围非法、重复占用或身份过期时返回错误；失败不得泄漏半分配资源。
   virtual function rdma_status allocate(
     rdma_dma_request_context request_context,
     int unsigned size,
@@ -46,18 +45,16 @@ endclass
 class rdma_queue_planner_snapshot_fail_mapping extends rdma_mock_dma_mapping;
   `uvm_object_utils(rdma_queue_planner_snapshot_fail_mapping)
 
-  // 功能：构造当前对象并初始化其字段、集合和 UVM 名称；不接管传入句柄的生命周期。
-  // 输入/输出及副作用：name 仅用于 UVM 对象命名；内部字段被初始化为安全默认值，传入句柄不转移所有权。
-  //   返回新对象实例；构造失败由 UVM 工厂或调用方处理。
-  // 失败/边界：不创建外部资源；name 为空时仍允许构造，但所有字段必须保持可配置的初始值。
+  // 功能：构造 rdma_queue_planner_snapshot_fail_mapping，调用 super.new 建立 UVM 层级对象；外部依赖字段保持未绑定，后续由 configure/build/activate 明确注入。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_queue_planner_snapshot_fail_mapping 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_queue_planner_snapshot_fail_mapping");
     super.new(name);
   endfunction
 
-  // 功能：按输入的完整标识查询当前权威记录并返回独立快照；缺失、歧义或代际过期时返回明确错误。
-  // 输入/输出及副作用：输入为完整 key/handle，output 或返回值为记录快照；查询不改变登记表和外部资源。
-  //   缺失、歧义、空句柄或旧 generation/reset epoch 返回明确错误。
-  // 失败/边界：查询不到唯一记录、输入为空或 authority 已失效时返回错误，不回退到默认 Function/root。
+  // 功能：在 rdma_queue_planner_snapshot_fail_mapping 中，snapshot_release_authority 按完整 key/handle 查找唯一权威记录并返回 detached 快照，避免把内部可变引用泄露给调用方。
+  // 输入/输出及副作用：snapshot（输出）；snapshot_release_authority 读取 snapshot 并使用字段 snapshot，并写入 snapshot；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：snapshot_release_authority 在 key/handle 缺失、记录不唯一或 generation/reset epoch 过期时返回明确错误，不回退到默认 authority。
   virtual function rdma_status snapshot_release_authority(
     output rdma_dma_mapping snapshot
   );
@@ -70,18 +67,17 @@ endclass
 class rdma_queue_planner_snapshot_fail_mem extends rdma_mock_host_mem;
   `uvm_object_utils(rdma_queue_planner_snapshot_fail_mem)
 
-  // 功能：构造当前对象并初始化其字段、集合和 UVM 名称；不接管传入句柄的生命周期。
-  // 输入/输出及副作用：name 仅用于 UVM 对象命名；内部字段被初始化为安全默认值，传入句柄不转移所有权。
-  //   返回新对象实例；构造失败由 UVM 工厂或调用方处理。
-  // 失败/边界：不创建外部资源；name 为空时仍允许构造，但所有字段必须保持可配置的初始值。
+  // 功能：构造 rdma_queue_planner_snapshot_fail_mem，调用 super.new 建立 UVM 层级对象；外部依赖字段保持未绑定，后续由 configure/build/activate 明确注入。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_queue_planner_snapshot_fail_mem 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_queue_planner_snapshot_fail_mem");
     super.new(name);
   endfunction
 
-  // 功能：检查可用容量并预留所需资源，返回带所有权证据的分配结果；容量不足时不留下部分分配。
-  // 输入/输出及副作用：输入请求、容量和依赖用于构造/预留资源；返回独立对象或状态，不暴露内部可变集合。
-  //   参数越界、容量不足或构造中途失败时回滚已登记的局部状态。
-  // 失败/边界：依赖为空、参数越界、容量不足或构造步骤失败时清理局部结果并返回明确错误。
+  // 功能：在 rdma_queue_planner_snapshot_fail_mem 中，allocate 检查容量后预留资源并返回带 owner 证据的句柄/计划；失败时回滚已登记的局部状态。
+  // 输入/输出及副作用：request_context（输入）、size（输入）、alignment（输入）、direction（输入）、mapping（输出）；输入请求/句柄定义资源属性；成功时更新账本并通过返回值或
+  //   output 发布新句柄/映射。
+  // 失败/边界：容量不足、范围非法、重复占用或身份过期时返回错误；失败不得泄漏半分配资源。
   virtual function rdma_status allocate(
     rdma_dma_request_context request_context,
     int unsigned size,
@@ -114,19 +110,18 @@ class rdma_queue_planner_observing_mem extends rdma_mock_host_mem;
   rdma_dma_mapping last_allocated_mapping;
   rdma_dma_mapping allocated_mappings[$];
 
-  // 功能：构造当前对象并初始化其字段、集合和 UVM 名称；不接管传入句柄的生命周期。
-  // 输入/输出及副作用：name 仅用于 UVM 对象命名；内部字段被初始化为安全默认值，传入句柄不转移所有权。
-  //   返回新对象实例；构造失败由 UVM 工厂或调用方处理。
-  // 失败/边界：不创建外部资源；name 为空时仍允许构造，但所有字段必须保持可配置的初始值。
+  // 功能：构造 rdma_queue_planner_observing_mem，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：last_allocated_mapping=null。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_queue_planner_observing_mem 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_queue_planner_observing_mem");
     super.new(name);
     last_allocated_mapping = null;
   endfunction
 
-  // 功能：检查可用容量并预留所需资源，返回带所有权证据的分配结果；容量不足时不留下部分分配。
-  // 输入/输出及副作用：输入请求、容量和依赖用于构造/预留资源；返回独立对象或状态，不暴露内部可变集合。
-  //   参数越界、容量不足或构造中途失败时回滚已登记的局部状态。
-  // 失败/边界：依赖为空、参数越界、容量不足或构造步骤失败时清理局部结果并返回明确错误。
+  // 功能：在 rdma_queue_planner_observing_mem 中，allocate 检查容量后预留资源并返回带 owner 证据的句柄/计划；失败时回滚已登记的局部状态。
+  // 输入/输出及副作用：request_context（输入）、size（输入）、alignment（输入）、direction（输入）、mapping（输出）；输入请求/句柄定义资源属性；成功时更新账本并通过返回值或
+  //   output 发布新句柄/映射。
+  // 失败/边界：容量不足、范围非法、重复占用或身份过期时返回错误；失败不得泄漏半分配资源。
   virtual function rdma_status allocate(
     rdma_dma_request_context request_context,
     int unsigned size,
@@ -151,19 +146,17 @@ class rdma_queue_planner_second_release_fail_mem extends rdma_mock_host_mem;
 
   int unsigned release_attempt;
 
-  // 功能：构造当前对象并初始化其字段、集合和 UVM 名称；不接管传入句柄的生命周期。
-  // 输入/输出及副作用：name 仅用于 UVM 对象命名；内部字段被初始化为安全默认值，传入句柄不转移所有权。
-  //   返回新对象实例；构造失败由 UVM 工厂或调用方处理。
-  // 失败/边界：不创建外部资源；name 为空时仍允许构造，但所有字段必须保持可配置的初始值。
+  // 功能：构造 rdma_queue_planner_second_release_fail_mem，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：release_attempt=0。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_queue_planner_second_release_fail_mem 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_queue_planner_second_release_fail_mem");
     super.new(name);
     release_attempt = 0;
   endfunction
 
-  // 功能：按资源所有权和幂等规则释放或清理记录；重复释放不会再次扣减 credit，也不触碰已隔离资源。
-  // 输入/输出及副作用：输入为待解除或释放的 handle/key；成功后隔离或删除本对象记录，外部拥有者仍负责真正销毁。
-  //   空值、未知记录或重复调用按接口约定返回错误或幂等成功。
-  // 失败/边界：不得释放非本对象所有资源；重复解除按幂等约定处理，旧 handle 不得重新激活。
+  // 功能：在 rdma_queue_planner_second_release_fail_mem 中，release 按 owner、generation 和幂等规则释放/隔离记录，并同步删除其账本引用。
+  // 输入/输出及副作用：mapping（输入）；输入 handle/mapping/token 指定释放目标；成功时更新账本和生命周期，外部资源只按 adapter 契约释放。
+  // 失败/边界：release 发现 owner/generation 不匹配、记录未知或重复释放时返回错误或幂等结果，不重新激活旧句柄。
   virtual function rdma_status \release (rdma_dma_mapping mapping);
     release_attempt++;
     if (release_attempt == 2)
@@ -177,18 +170,17 @@ endclass
 class rdma_queue_planner_write_observer_mem extends rdma_mock_host_mem;
   `uvm_object_utils(rdma_queue_planner_write_observer_mem)
 
-  // 功能：构造当前对象并初始化其字段、集合和 UVM 名称；不接管传入句柄的生命周期。
-  // 输入/输出及副作用：name 仅用于 UVM 对象命名；内部字段被初始化为安全默认值，传入句柄不转移所有权。
-  //   返回新对象实例；构造失败由 UVM 工厂或调用方处理。
-  // 失败/边界：不创建外部资源；name 为空时仍允许构造，但所有字段必须保持可配置的初始值。
+  // 功能：构造 rdma_queue_planner_write_observer_mem，调用 super.new 建立 UVM 层级对象；外部依赖字段保持未绑定，后续由 configure/build/activate 明确注入。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_queue_planner_write_observer_mem 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_queue_planner_write_observer_mem");
     super.new(name);
   endfunction
 
-  // 功能：向指定后端写入请求数据并保留返回状态；写入失败时不推进本地提交游标。
-  // 输入/输出及副作用：参数 mapping, offset, data 用于执行 write；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：后端拒绝或写入范围越界时不推进本地提交游标，也不伪造成功状态。
+  // 功能：在 rdma_queue_planner_write_observer_mem 中，write 把请求数据写入指定后端并保留返回状态；只有写入成功才允许本地游标继续推进。
+  // 输入/输出及副作用：mapping（输入）、offset（输入）、data（输入）；输入 request/image/cursor 决定写入内容；成功时更新 PI/CI、slot ledger 或 pending
+  //   journal，并通过 output 返回结果。
+  // 失败/边界：write 遇到后端拒绝、范围溢出或 DMA 权限不足时保留失败证据，不推进本地游标。
   virtual function rdma_status write(
     rdma_dma_mapping mapping,
     longint unsigned offset,
@@ -210,10 +202,9 @@ class rdma_queue_executor_trace_mem extends rdma_queue_planner_nth_fail_mem;
   int unsigned write_ordinal;
   rdma_mock_call_trace shared_trace;
 
-  // 功能：构造当前对象并初始化其字段、集合和 UVM 名称；不接管传入句柄的生命周期。
-  // 输入/输出及副作用：name 仅用于 UVM 对象命名；内部字段被初始化为安全默认值，传入句柄不转移所有权。
-  //   返回新对象实例；构造失败由 UVM 工厂或调用方处理。
-  // 失败/边界：不创建外部资源；name 为空时仍允许构造，但所有字段必须保持可配置的初始值。
+  // 功能：构造 rdma_queue_executor_trace_mem，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：queue_kind=RDMA_RESOURCE_CQ；write_ordinal=0；shared_trace=null。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_queue_executor_trace_mem 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_queue_executor_trace_mem");
     super.new(name);
     queue_kind = RDMA_RESOURCE_CQ;
@@ -222,17 +213,16 @@ class rdma_queue_executor_trace_mem extends rdma_queue_planner_nth_fail_mem;
   endfunction
 
   // 功能：执行 set_shared_trace 指定的测试或恢复状态变更，更新受控账本并保留可回滚的故障证据。
-  // 输入/输出及副作用：参数 shared_trace 用于执行 set_shared_trace；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
+  // 输入/输出及副作用：trace（输入）；调用方必须先完成输入对象的空值、authority 和 generation 校验；成功时更新本对象配置/状态并保存非拥有引用，返回 void。
   // 失败/边界：set_shared_trace 仅允许测试/恢复范围内的状态变更；代际或资源不匹配时拒绝并保留原账本。
   function void set_shared_trace(rdma_mock_call_trace trace);
     shared_trace = trace;
   endfunction
 
-  // 功能：向指定后端写入请求数据并保留返回状态；写入失败时不推进本地提交游标。
-  // 输入/输出及副作用：参数 mapping, offset, data 用于执行 write；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：后端拒绝或写入范围越界时不推进本地提交游标，也不伪造成功状态。
+  // 功能：在 rdma_queue_executor_trace_mem 中，write 把请求数据写入指定后端并保留返回状态；只有写入成功才允许本地游标继续推进。
+  // 输入/输出及副作用：mapping（输入）、offset（输入）、data（输入）；输入 request/image/cursor 决定写入内容；成功时更新 PI/CI、slot ledger 或 pending
+  //   journal，并通过 output 返回结果。
+  // 失败/边界：write 遇到后端拒绝、范围溢出或 DMA 权限不足时保留失败证据，不推进本地游标。
   virtual function rdma_status write(
     rdma_dma_mapping mapping, longint unsigned offset, byte data[]
   );
@@ -273,27 +263,25 @@ class rdma_queue_executor_trace_context extends rdma_mock_context_backing;
 
   rdma_mock_call_trace shared_trace;
 
-  // 功能：构造当前对象并初始化其字段、集合和 UVM 名称；不接管传入句柄的生命周期。
-  // 输入/输出及副作用：name 仅用于 UVM 对象命名；内部字段被初始化为安全默认值，传入句柄不转移所有权。
-  //   返回新对象实例；构造失败由 UVM 工厂或调用方处理。
-  // 失败/边界：不创建外部资源；name 为空时仍允许构造，但所有字段必须保持可配置的初始值。
+  // 功能：构造 rdma_queue_executor_trace_context，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：shared_trace=null。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_queue_executor_trace_context 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_queue_executor_trace_context");
     super.new(name);
     shared_trace = null;
   endfunction
 
-  // 功能：记录本次调用的名称和顺序，供测试断言转发路径；不改变被测事务的业务结果。
-  // 输入/输出及副作用：输入为调用名称、事件或 trace 数据；成功后追加测试可见记录，不改变业务资源。
-  //   空名称或记录容量边界按测试替身约定处理，不影响被测对象。
+  // 功能：在 rdma_queue_executor_trace_context 中，set_call_trace 记录 set_call_trace 的调用名称和顺序，供测试断言转发路径；不改变被测事务业务结果。
+  // 输入/输出及副作用：trace（输入）；set_call_trace 先依据 依赖存在性、authority 和 generation 条件 校验 trace；成功时更新本对象配置/状态并保存非拥有引用，返回 void。
   // 失败/边界：记录操作仅影响测试 trace；不得因注入记录故障改变生产状态或吞掉真实错误。
   function void set_call_trace(rdma_mock_call_trace trace);
     shared_trace = trace;
   endfunction
 
-  // 功能：向指定后端写入请求数据并保留返回状态；写入失败时不推进本地提交游标。
-  // 输入/输出及副作用：参数 context_ref, offset, data 用于执行 write；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：后端拒绝或写入范围越界时不推进本地提交游标，也不伪造成功状态。
+  // 功能：在 rdma_queue_executor_trace_context 中，write 把请求数据写入指定后端并保留返回状态；只有写入成功才允许本地游标继续推进。
+  // 输入/输出及副作用：context_ref（输入）、offset（输入）、data（输入）；输入 request/image/cursor 决定写入内容；成功时更新 PI/CI、slot ledger 或 pending
+  //   journal，并通过 output 返回结果。
+  // 失败/边界：write 遇到后端拒绝、范围溢出或 DMA 权限不足时保留失败证据，不推进本地游标。
   virtual function rdma_status write(
     rdma_context_backing_ref context_ref,
     longint unsigned offset,
@@ -321,28 +309,25 @@ class rdma_queue_destroy_trace_mem extends rdma_queue_executor_trace_mem;
   bit include_sgb;
   int unsigned release_ordinal;
 
-  // 功能：构造当前对象并初始化其字段、集合和 UVM 名称；不接管传入句柄的生命周期。
-  // 输入/输出及副作用：name 仅用于 UVM 对象命名；内部字段被初始化为安全默认值，传入句柄不转移所有权。
-  //   返回新对象实例；构造失败由 UVM 工厂或调用方处理。
-  // 失败/边界：不创建外部资源；name 为空时仍允许构造，但所有字段必须保持可配置的初始值。
+  // 功能：构造 rdma_queue_destroy_trace_mem，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：include_sgb=1'b0；release_ordinal=0。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_queue_destroy_trace_mem 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_queue_destroy_trace_mem");
     super.new(name);
     include_sgb = 1'b0;
     release_ordinal = 0;
   endfunction
 
-  // 功能：清理当前运行状态并建立新的复位/代际边界，使旧句柄或旧事务不能继续生效。
-  // 输入/输出及副作用：参数 release_ordinal 用于执行 reset_destroy_trace；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
+  // 功能：在 rdma_queue_destroy_trace_mem 中，reset_destroy_trace reset_destroy_trace 清理当前运行状态并建立新的复位/代际边界，使旧句柄或旧事务不能继续生效。
+  // 输入/输出及副作用：无显式参数；输入 action/epoch/handle 决定迁移目标；成功时更新状态或恢复证据，外部资源仍由其拥有者管理。
   // 失败/边界：复位参数为零、代际回退或存在未处理 pending 事务时拒绝更新 authority。
   function void reset_destroy_trace();
     release_ordinal = 0;
   endfunction
 
-  // 功能：按资源所有权和幂等规则释放或清理记录；重复释放不会再次扣减 credit，也不触碰已隔离资源。
-  // 输入/输出及副作用：输入为待解除或释放的 handle/key；成功后隔离或删除本对象记录，外部拥有者仍负责真正销毁。
-  //   空值、未知记录或重复调用按接口约定返回错误或幂等成功。
-  // 失败/边界：不得释放非本对象所有资源；重复解除按幂等约定处理，旧 handle 不得重新激活。
+  // 功能：在 rdma_queue_destroy_trace_mem 中，release_role 按 owner、generation 和幂等规则释放/隔离记录，并同步删除其账本引用。
+  // 输入/输出及副作用：ordinal（输入）；输入 handle/mapping/token 指定释放目标；成功时更新账本和生命周期，外部资源只按 adapter 契约释放。
+  // 失败/边界：release_role 发现 owner/generation 不匹配、记录未知或重复释放时返回错误或幂等结果，不重新激活旧句柄。
   protected function string release_role(int unsigned ordinal);
     case (queue_kind)
       RDMA_RESOURCE_CQ: begin
@@ -374,10 +359,9 @@ class rdma_queue_destroy_trace_mem extends rdma_queue_executor_trace_mem;
     endcase
   endfunction
 
-  // 功能：按资源所有权和幂等规则释放或清理记录；重复释放不会再次扣减 credit，也不触碰已隔离资源。
-  // 输入/输出及副作用：输入为待解除或释放的 handle/key；成功后隔离或删除本对象记录，外部拥有者仍负责真正销毁。
-  //   空值、未知记录或重复调用按接口约定返回错误或幂等成功。
-  // 失败/边界：不得释放非本对象所有资源；重复解除按幂等约定处理，旧 handle 不得重新激活。
+  // 功能：在 rdma_queue_destroy_trace_mem 中，release 按 owner、generation 和幂等规则释放/隔离记录，并同步删除其账本引用。
+  // 输入/输出及副作用：mapping（输入）；输入 handle/mapping/token 指定释放目标；成功时更新账本和生命周期，外部资源只按 adapter 契约释放。
+  // 失败/边界：release 发现 owner/generation 不匹配、记录未知或重复释放时返回错误或幂等结果，不重新激活旧句柄。
   virtual function rdma_status \release (rdma_dma_mapping mapping);
     rdma_status status;
     string role;
@@ -403,18 +387,16 @@ endclass
 class rdma_queue_destroy_trace_context extends rdma_queue_executor_trace_context;
   `uvm_object_utils(rdma_queue_destroy_trace_context)
 
-  // 功能：构造当前对象并初始化其字段、集合和 UVM 名称；不接管传入句柄的生命周期。
-  // 输入/输出及副作用：name 仅用于 UVM 对象命名；内部字段被初始化为安全默认值，传入句柄不转移所有权。
-  //   返回新对象实例；构造失败由 UVM 工厂或调用方处理。
-  // 失败/边界：不创建外部资源；name 为空时仍允许构造，但所有字段必须保持可配置的初始值。
+  // 功能：构造 rdma_queue_destroy_trace_context，调用 super.new 建立 UVM 层级对象；外部依赖字段保持未绑定，后续由 configure/build/activate 明确注入。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_queue_destroy_trace_context 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_queue_destroy_trace_context");
     super.new(name);
   endfunction
 
-  // 功能：按资源所有权和幂等规则释放或清理记录；重复释放不会再次扣减 credit，也不触碰已隔离资源。
-  // 输入/输出及副作用：输入为待解除或释放的 handle/key；成功后隔离或删除本对象记录，外部拥有者仍负责真正销毁。
-  //   空值、未知记录或重复调用按接口约定返回错误或幂等成功。
-  // 失败/边界：不得释放非本对象所有资源；重复解除按幂等约定处理，旧 handle 不得重新激活。
+  // 功能：在 rdma_queue_destroy_trace_context 中，release 按 owner、generation 和幂等规则释放/隔离记录，并同步删除其账本引用。
+  // 输入/输出及副作用：context_ref（输入）；输入 handle/mapping/token 指定释放目标；成功时更新账本和生命周期，外部资源只按 adapter 契约释放。
+  // 失败/边界：release 发现 owner/generation 不匹配、记录未知或重复释放时返回错误或幂等结果，不重新激活旧句柄。
   virtual function rdma_status \release (
     rdma_context_backing_ref context_ref
   );
@@ -445,10 +427,9 @@ class rdma_queue_destroy_trace_cmq extends rdma_mock_cmq_port;
   bit nonok_null_without_proof;
   rdma_status nonok_null_status;
 
-  // 功能：构造当前对象并初始化其字段、集合和 UVM 名称；不接管传入句柄的生命周期。
-  // 输入/输出及副作用：name 仅用于 UVM 对象命名；内部字段被初始化为安全默认值，传入句柄不转移所有权。
-  //   返回新对象实例；构造失败由 UVM 工厂或调用方处理。
-  // 失败/边界：不创建外部资源；name 为空时仍允许构造，但所有字段必须保持可配置的初始值。
+  // 功能：构造 rdma_queue_destroy_trace_cmq，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：semantic_trace=null；destroy_kind=RDMA_RESOURCE_CQ；destroy_call_ordinal=0；trace_destroy=1'b0；reject_next_flush=1'b0；reject_flush_ordinal=1；flush_attempt_ordinal=0；reject_flush_status=null；其余字段按实现默认值初始化。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_queue_destroy_trace_cmq 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_queue_destroy_trace_cmq");
     super.new(name);
     semantic_trace = null;
@@ -464,10 +445,9 @@ class rdma_queue_destroy_trace_cmq extends rdma_mock_cmq_port;
     nonok_null_status = null;
   endfunction
 
-  // 功能：处理 begin_destroy_trace：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 trace, kind 用于执行 begin_destroy_trace；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：begin_destroy_trace 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：在 rdma_queue_destroy_trace_cmq 中，begin_destroy_trace 清空旧 trace 并记录本次销毁对象类型，使测试能核对后续硬件清理顺序。
+  // 输入/输出及副作用：trace（输入）、kind（输入）；begin_destroy_trace 读取 trace、kind 并使用字段 semantic_trace、destroy_kind、destroy_call_ordinal、flush_attempt_ordinal、trace_destroy；函数返回 void，不取得调用方资源所有权。
+  // 失败/边界：begin_destroy_trace 无返回值，仅执行 semantic_trace=trace、destroy_kind=kind、destroy_call_ordinal=0、flush_attempt_ordinal=0；调用方须保证前置依赖已经绑定，函数不自动重试或接管外部资源。
   function void begin_destroy_trace(
     rdma_mock_call_trace trace,
     rdma_resource_kind_e kind
@@ -479,20 +459,19 @@ class rdma_queue_destroy_trace_cmq extends rdma_mock_cmq_port;
     trace_destroy = 1'b1;
   endfunction
 
-  // 功能：处理 flush_role：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 destroy_kind 用于执行 flush_role；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：flush_role 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：flush_role 把 ordinal 与当前对象的身份/状态字段编码为稳定文本，供日志、查找或恢复索引使用。
+  // 输入/输出及副作用：ordinal（输入）；flush_role 读取 ordinal 并使用字段 destroy_kind；函数返回 string，不取得调用方资源所有权。
+  // 失败/边界：flush_role 先检查 destroy_kind == RDMA_RESOURCE_SRQ，再返回 ordinal == 1 ? "SRFQ_PD" : "SRQ_PD"；"CQ_PD"；拒绝分支不提交部分状态，也不隐式重试。
   protected function string flush_role(int unsigned ordinal);
     if (destroy_kind == RDMA_RESOURCE_SRQ)
       return ordinal == 1 ? "SRFQ_PD" : "SRQ_PD";
     return "CQ_PD";
   endfunction
 
-  // 功能：执行一次受控事务并推进所属状态机；返回结果时保留失败阶段、代际和后端提交证据。
-  // 输入/输出及副作用：参数 command, ticket, completion, status 用于执行 execute；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：事务超时、代际变化或提交证据不完整时不得推进下一阶段。
+  // 功能：在 rdma_queue_destroy_trace_cmq 中，execute 执行受控事务并按后端提交证据推进状态机，同时保留失败阶段和 generation 证据。
+  // 输入/输出及副作用：command（输入）、ticket（输出）、completion（输出）、status（输出）；execute 驱动下游事务，并写入 ticket、completion、status；函数返回 无直接返回值，不取得调用方资源所有权。
+
+  // 失败/边界：execute 遇到锁、超时、generation 变化或提交证据不完整时保持原状态，不推进游标。
   virtual task execute(
     rdma_cmq_command_desc command,
     output rdma_cmq_ticket ticket,
@@ -508,7 +487,7 @@ class rdma_queue_destroy_trace_cmq extends rdma_mock_cmq_port;
     last_execute_no_submit_proven = 1'b0;
     prior_calls = calls.size();
     is_flush = command != null && command.opcode_key != null &&
-               command.opcode_key.opcode[7:0] == XTR_V1_OP_OCC_FLUSH;
+               command.opcode_key.opcode[7:0] == RDMA_OP_OCC_FLUSH;
     if (is_flush)
       flush_attempt_ordinal++;
     if (reject_next_flush && is_flush &&
@@ -566,19 +545,17 @@ class rdma_queue_executor_generation_fail extends
 
   int unsigned generation_checks;
 
-  // 功能：构造当前对象并初始化其字段、集合和 UVM 名称；不接管传入句柄的生命周期。
-  // 输入/输出及副作用：name 仅用于 UVM 对象命名；内部字段被初始化为安全默认值，传入句柄不转移所有权。
-  //   返回新对象实例；构造失败由 UVM 工厂或调用方处理。
-  // 失败/边界：不创建外部资源；name 为空时仍允许构造，但所有字段必须保持可配置的初始值。
+  // 功能：构造 rdma_queue_executor_generation_fail，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：generation_checks=0。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_queue_executor_generation_fail 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_queue_executor_generation_fail");
     super.new(name);
     generation_checks = 0;
   endfunction
 
-  // 功能：处理 generation_status：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 binding, expected_owner 用于执行 generation_status；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：generation_status 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：generation_status 校验 binding、expected_owner 与当前对象状态的一致性，并显式处理“injected post-create generation change”等拒绝条件，返回 rdma_status 供上层决定是否提交。
+  // 输入/输出及副作用：binding（输入）、expected_owner（输入）；generation_status 读取 binding、expected_owner 并使用字段 rdma_status、generation_checks；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：generation_status 返回 RDMA_SC_STALE_GENERATION；典型拒绝条件为“injected post-create generation change”；失败路径不提交部分状态或转移未声明资源。
   protected virtual function rdma_status generation_status(
     rdma_function_binding binding,
     rdma_function_handle expected_owner
@@ -594,19 +571,17 @@ endclass
 class rdma_queue_lifecycle_test extends uvm_test;
   `uvm_component_utils(rdma_queue_lifecycle_test)
 
-  // 功能：构造当前对象并初始化其字段、集合和 UVM 名称；不接管传入句柄的生命周期。
-  // 输入/输出及副作用：name 仅用于 UVM 对象命名；内部字段被初始化为安全默认值，传入句柄不转移所有权。
-  //   返回新对象实例；构造失败由 UVM 工厂或调用方处理。
-  // 失败/边界：不创建外部资源；name 为空时仍允许构造，但所有字段必须保持可配置的初始值。
+  // 功能：构造 rdma_queue_lifecycle_test，调用 super.new 建立 UVM 层级对象；外部依赖字段保持未绑定，后续由 configure/build/activate 明确注入。
+  // 输入/输出及副作用：name、parent（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_queue_lifecycle_test 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_queue_lifecycle_test",
                uvm_component parent = null);
     super.new(name, parent);
   endfunction
 
-  // 功能：在测试中检查调用结果、状态码和副作用是否符合契约；失败时报告可定位的验证信息。
-  // 输入/输出及副作用：参数 label, status, expected 用于执行 expect_status；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：测试前置对象缺失时应报告断言错误并停止依赖该对象的后续检查。
+  // 功能：在 rdma_queue_lifecycle_test 中，expect_status 在测试中执行 expect_status 断言，比较输入结果与期望状态并报告可定位的失败信息。
+  // 输入/输出及副作用：label（输入）、status（输入）、expected（输入）；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：测试函数 expect_status 缺少前置对象时报告断言错误，并停止依赖该对象的后续检查。
   function automatic void expect_status(
     string label,
     rdma_status status,
@@ -620,10 +595,9 @@ class rdma_queue_lifecycle_test extends uvm_test;
                            status.code.name(), status.convert2string()))
   endfunction
 
-  // 功能：依据输入请求创建对应的值对象或资源计划，并校验依赖、所有权和生命周期后返回结果。
-  // 输入/输出及副作用：输入请求、容量和依赖用于构造/预留资源；返回独立对象或状态，不暴露内部可变集合。
-  //   参数越界、容量不足或构造中途失败时回滚已登记的局部状态。
-  // 失败/边界：依赖为空、参数越界、容量不足或构造步骤失败时清理局部结果并返回明确错误。
+  // 功能：make_handle 创建独立的 rdma_handle；根据 name、owner、kind、object_id 设置字段 handle、handle.kind、handle.function_uid、handle.generation、handle.object_id，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：name（输入）、owner（输入）、kind（输入）、object_id（输入）；make_handle 读取 name、owner、kind、object_id 并使用字段 handle、handle.kind、handle.function_uid、handle.generation、handle.object_id；函数返回 rdma_handle，不取得调用方资源所有权。
+  // 失败/边界：make_handle 的结果直接由 return handle 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function automatic rdma_handle make_handle(
     string name,
     rdma_function_handle owner,
@@ -639,10 +613,9 @@ class rdma_queue_lifecycle_test extends uvm_test;
     return handle;
   endfunction
 
-  // 功能：依据输入请求创建对应的值对象或资源计划，并校验依赖、所有权和生命周期后返回结果。
-  // 输入/输出及副作用：输入请求、容量和依赖用于构造/预留资源；返回独立对象或状态，不暴露内部可变集合。
-  //   参数越界、容量不足或构造中途失败时回滚已登记的局部状态。
-  // 失败/边界：依赖为空、参数越界、容量不足或构造步骤失败时清理局部结果并返回明确错误。
+  // 功能：make_binding 创建独立的 rdma_function_binding；根据 name、function_uid、function_id、generation 设置字段 binding、binding.function_uid、binding.global_function_id、binding.generation、binding.rdma_vf_id、pcie.bdf、base.value、size、enabled、binding.notify_bar_id，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：name（输入）、h1122_3344_5566_7788（输入）、h9000_0101（输入）、generation（输入）；make_binding 读取 name、function_uid、function_id、generation 并使用字段 binding、binding.function_uid、binding.global_function_id、binding.generation、binding.rdma_vf_id、pcie.bdf、base.value、size；函数返回 rdma_function_binding，不取得调用方资源所有权。
+  // 失败/边界：make_binding 的结果直接由 return binding 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function automatic rdma_function_binding make_binding(
     string name,
     longint unsigned function_uid = 64'h1122_3344_5566_7788,
@@ -699,10 +672,9 @@ class rdma_queue_lifecycle_test extends uvm_test;
     return binding;
   endfunction
 
-  // 功能：依据输入请求创建对应的值对象或资源计划，并校验依赖、所有权和生命周期后返回结果。
-  // 输入/输出及副作用：输入请求、容量和依赖用于构造/预留资源；返回独立对象或状态，不暴露内部可变集合。
-  //   参数越界、容量不足或构造中途失败时回滚已登记的局部状态。
-  // 失败/边界：依赖为空、参数越界、容量不足或构造步骤失败时清理局部结果并返回明确错误。
+  // 功能：make_mapping 创建独立的 rdma_dma_mapping；根据 name、binding、iova、backing、size 设置字段 mapping、mapping.function_h、mapping.requester_bdf、mapping.pasid_valid、mapping.pasid、mapping.dma_domain_valid、mapping.dma_domain_id、iova.value、backing_addr.value、mapping.size，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：name（输入）、binding（输入）、iova（输入）、backing（输入）、size（输入）；make_mapping 读取 name、binding、iova、backing、size 并使用字段 mapping、mapping.function_h、mapping.requester_bdf、mapping.pasid_valid、mapping.pasid、mapping.dma_domain_valid、mapping.dma_domain_id、iova.value；函数返回 rdma_dma_mapping，不取得调用方资源所有权。
+  // 失败/边界：make_mapping 的结果直接由 return mapping 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function automatic rdma_dma_mapping make_mapping(
     string name,
     rdma_function_binding binding,
@@ -728,10 +700,9 @@ class rdma_queue_lifecycle_test extends uvm_test;
     return mapping;
   endfunction
 
-  // 功能：依据输入请求创建对应的值对象或资源计划，并校验依赖、所有权和生命周期后返回结果。
-  // 输入/输出及副作用：输入请求、容量和依赖用于构造/预留资源；返回独立对象或状态，不暴露内部可变集合。
-  //   参数越界、容量不足或构造中途失败时回滚已登记的局部状态。
-  // 失败/边界：依赖为空、参数越界、容量不足或构造步骤失败时清理局部结果并返回明确错误。
+  // 功能：make_slice 创建独立的 rdma_queue_backing_slice；根据 name、role、mapping、offset、length 设置字段 slice、slice.role、slice.mapping、slice.mapping_offset、slice.length、slice.logical_queue_offset，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：name（输入）、role（输入）、mapping（输入）、offset（输入）、length（输入）；make_slice 读取 name、role、mapping、offset、length 并使用字段 slice、slice.role、slice.mapping、slice.mapping_offset、slice.length、slice.logical_queue_offset；函数返回 rdma_queue_backing_slice，不取得调用方资源所有权。
+  // 失败/边界：make_slice 的结果直接由 return slice 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function automatic rdma_queue_backing_slice make_slice(
     string name,
     rdma_queue_backing_role_e role,
@@ -749,10 +720,9 @@ class rdma_queue_lifecycle_test extends uvm_test;
     return slice;
   endfunction
 
-  // 功能：依据输入请求创建对应的值对象或资源计划，并校验依赖、所有权和生命周期后返回结果。
-  // 输入/输出及副作用：输入请求、容量和依赖用于构造/预留资源；返回独立对象或状态，不暴露内部可变集合。
-  //   参数越界、容量不足或构造中途失败时回滚已登记的局部状态。
-  // 失败/边界：依赖为空、参数越界、容量不足或构造步骤失败时清理局部结果并返回明确错误。
+  // 功能：make_ring 创建独立的 rdma_queue_ring_layout；根据 name、role、depth、entry_size、polarity 设置字段 logical_bytes、storage_bytes、ring、ring.role、ring.entry_size_bytes、ring.depth、ring.logical_bytes、ring.storage_bytes、ring.page_count、ring.initial_polarity，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：name（输入）、role（输入）、depth（输入）、entry_size（输入）、polarity（输入）；make_ring 读取 name、role、depth、entry_size、polarity 并使用字段 logical_bytes、storage_bytes、ring、ring.role、ring.entry_size_bytes、ring.depth、ring.logical_bytes、ring.storage_bytes；函数返回 rdma_queue_ring_layout，不取得调用方资源所有权。
+  // 失败/边界：make_ring 的结果直接由 return ring 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function automatic rdma_queue_ring_layout make_ring(
     string name,
     rdma_queue_backing_role_e role,
@@ -777,10 +747,9 @@ class rdma_queue_lifecycle_test extends uvm_test;
     return ring;
   endfunction
 
-  // 功能：依据输入请求创建对应的值对象或资源计划，并校验依赖、所有权和生命周期后返回结果。
-  // 输入/输出及副作用：输入请求、容量和依赖用于构造/预留资源；返回独立对象或状态，不暴露内部可变集合。
-  //   参数越界、容量不足或构造中途失败时回滚已登记的局部状态。
-  // 失败/边界：依赖为空、参数越界、容量不足或构造步骤失败时清理局部结果并返回明确错误。
+  // 功能：make_ref 创建独立的 rdma_queue_backing_ref；根据 name、role、mapping、offset、length 设置字段 ref_value、ref_value.role、ref_value.mapping、ref_value.ownership、ref_value.mapping_offset、ref_value.length，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：name（输入）、role（输入）、mapping（输入）、offset（输入）、length（输入）；make_ref 读取 name、role、mapping、offset、length 并使用字段 ref_value、ref_value.role、ref_value.mapping、ref_value.ownership、ref_value.mapping_offset、ref_value.length；函数返回 rdma_queue_backing_ref，不取得调用方资源所有权。
+  // 失败/边界：make_ref 的结果直接由 return ref_value 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function automatic rdma_queue_backing_ref make_ref(
     string name,
     rdma_queue_backing_role_e role,
@@ -799,8 +768,7 @@ class rdma_queue_lifecycle_test extends uvm_test;
   endfunction
 
   // 功能：判断 count_planner_host_calls 对应的状态、能力或账本条件，并返回确定的布尔/计数结果，不修改状态。
-  // 输入/输出及副作用：参数 mem, method_name 用于执行 count_planner_host_calls；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
+  // 输入/输出及副作用：mem（输入）、method_name（输入）；count_planner_host_calls 读取 mem、method_name 并使用字段 count；函数返回 int unsigned，不取得调用方资源所有权。
   // 失败/边界：count_planner_host_calls 只读取现有账本；输入未初始化时返回保守结果，不得借助默认 Function/root 猜测。
   function automatic int unsigned count_planner_host_calls(
     rdma_mock_host_mem mem,
@@ -816,10 +784,9 @@ class rdma_queue_lifecycle_test extends uvm_test;
     return count;
   endfunction
 
-  // 功能：依据输入请求创建对应的值对象或资源计划，并校验依赖、所有权和生命周期后返回结果。
-  // 输入/输出及副作用：输入请求、容量和依赖用于构造/预留资源；返回独立对象或状态，不暴露内部可变集合。
-  //   参数越界、容量不足或构造中途失败时回滚已登记的局部状态。
-  // 失败/边界：依赖为空、参数越界、容量不足或构造步骤失败时清理局部结果并返回明确错误。
+  // 功能：make_planner_preflight 创建独立的 rdma_queue_preflight；根据 name、kind、mode、include_sgb、depth 设置字段 preflight、preflight.resource_kind、preflight.depth、preflight.cqe_size_bytes、preflight.max_sge、preflight.limit_threshold、preflight.backing_spec、backing_spec.mode，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：name（输入）、kind（输入）、mode（输入）、b0（输入）、depth（输入）；make_planner_preflight 读取 name、kind、mode、include_sgb、depth 并使用字段 preflight、preflight.resource_kind、preflight.depth、preflight.cqe_size_bytes、preflight.max_sge、preflight.limit_threshold、preflight.backing_spec、backing_spec.mode；函数返回 rdma_queue_preflight，不取得调用方资源所有权。
+  // 失败/边界：make_planner_preflight 先检查 include_sgb，再返回 preflight；拒绝分支不提交部分状态，也不隐式重试。
   function automatic rdma_queue_preflight make_planner_preflight(
     string name,
     rdma_resource_kind_e kind,
@@ -873,10 +840,10 @@ class rdma_queue_lifecycle_test extends uvm_test;
     return preflight;
   endfunction
 
-  // 功能：处理 add_borrowed_slice：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 preflight, name, role, mapping, mapping_offset, length, logical_offset 用于执行 add_borrowed_slice；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：add_borrowed_slice 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：在 rdma_queue_lifecycle_test 中，add_borrowed_slice 将输入对象登记或挂接到当前集合/依赖图，并同步维护对应账本和生命周期引用。
+  // 输入/输出及副作用：preflight（输入）、name（输入）、role（输入）、mapping（输入）、mapping_offset（输入）、length（输入）、logical_offset（输入）；add_borrowed_slice 可能更新本对象明确拥有的状态；函数返回 void，不取得调用方资源所有权。
+
+  // 失败/边界：add_borrowed_slice 无返回值，仅执行 slice=make_slice(name, role, mapping, mapping_offset, length)、slice.logical_queue_offset=logical_offset；调用方须保证前置依赖已经绑定，函数不自动重试或接管外部资源。
   function automatic void add_borrowed_slice(
     rdma_queue_preflight preflight,
     string name,
@@ -893,10 +860,9 @@ class rdma_queue_lifecycle_test extends uvm_test;
     preflight.backing_spec.slices.push_back(slice);
   endfunction
 
-  // 功能：在测试中检查调用结果、状态码和副作用是否符合契约；失败时报告可定位的验证信息。
-  // 输入/输出及副作用：参数 label, mem 用于执行 expect_planner_no_host_calls；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：测试前置对象缺失时应报告断言错误并停止依赖该对象的后续检查。
+  // 功能：在 rdma_queue_lifecycle_test 中，expect_planner_no_host_calls 在测试中执行 expect_planner_no_host_calls 断言，比较输入结果与期望状态并报告可定位的失败信息。
+  // 输入/输出及副作用：label（输入）、mem（输入）；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：测试函数 expect_planner_no_host_calls 缺少前置对象时报告断言错误，并停止依赖该对象的后续检查。
   function automatic void expect_planner_no_host_calls(
     string label,
     rdma_mock_host_mem mem
@@ -905,10 +871,10 @@ class rdma_queue_lifecycle_test extends uvm_test;
       `uvm_error(label, "borrowed validation performed a host-memory call")
   endfunction
 
-  // 功能：依据输入请求创建对应的值对象或资源计划，并校验依赖、所有权和生命周期后返回结果。
-  // 输入/输出及副作用：输入请求、容量和依赖用于构造/预留资源；返回独立对象或状态，不暴露内部可变集合。
-  //   参数越界、容量不足或构造中途失败时回滚已登记的局部状态。
-  // 失败/边界：依赖为空、参数越界、容量不足或构造步骤失败时清理局部结果并返回明确错误。
+  // 功能：make_context_ref 创建独立的 rdma_context_backing_ref；根据 name、binding、kind、local_id、shadow_base、view_offset、view_length 设置字段 context_ref、context_ref.owner、context_ref.resource_kind、context_ref.local_id、shadow_pointer_base.value、context_ref.slot_length、context_ref.shadow_view_offset、context_ref.shadow_view_length，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：name（输入）、binding（输入）、kind（输入）、local_id（输入）、shadow_base（输入）、view_offset（输入）、view_length（输入）；输入字段被复制到返回值或
+  //   output；生成结果与输入隔离，不隐式修改调用方对象。
+  // 失败/边界：make_context_ref 的结果直接由 return context_ref 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function automatic rdma_context_backing_ref make_context_ref(
     string name,
     rdma_function_binding binding,
@@ -930,10 +896,9 @@ class rdma_queue_lifecycle_test extends uvm_test;
     return context_ref;
   endfunction
 
-  // 功能：依据输入请求创建对应的值对象或资源计划，并校验依赖、所有权和生命周期后返回结果。
-  // 输入/输出及副作用：输入请求、容量和依赖用于构造/预留资源；返回独立对象或状态，不暴露内部可变集合。
-  //   参数越界、容量不足或构造中途失败时回滚已登记的局部状态。
-  // 失败/边界：依赖为空、参数越界、容量不足或构造步骤失败时清理局部结果并返回明确错误。
+  // 功能：make_cq_plan 创建独立的 rdma_queue_backing_plan；根据 binding 设置字段 plan、plan.resource_kind、ring_mapping、pd_mapping、plan.context_ref，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：binding（输入）；make_cq_plan 读取 binding 并使用字段 plan、plan.resource_kind、ring_mapping、pd_mapping、plan.context_ref；函数返回 rdma_queue_backing_plan，不取得调用方资源所有权。
+  // 失败/边界：make_cq_plan 的结果直接由 return plan 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function automatic rdma_queue_backing_plan make_cq_plan(
     rdma_function_binding binding
   );
@@ -959,10 +924,9 @@ class rdma_queue_lifecycle_test extends uvm_test;
     return plan;
   endfunction
 
-  // 功能：依据输入请求创建对应的值对象或资源计划，并校验依赖、所有权和生命周期后返回结果。
-  // 输入/输出及副作用：输入请求、容量和依赖用于构造/预留资源；返回独立对象或状态，不暴露内部可变集合。
-  //   参数越界、容量不足或构造中途失败时回滚已登记的局部状态。
-  // 失败/边界：依赖为空、参数越界、容量不足或构造步骤失败时清理局部结果并返回明确错误。
+  // 功能：make_srq_plan 创建独立的 rdma_queue_backing_plan；根据 binding 设置字段 plan、plan.resource_kind、ring_mapping、srfq_mapping、srq_pd_mapping、srfq_pd_mapping、plan.context_ref、context_ref.slot_length，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：binding（输入）；make_srq_plan 读取 binding 并使用字段 plan、plan.resource_kind、ring_mapping、srfq_mapping、srq_pd_mapping、srfq_pd_mapping、plan.context_ref、context_ref.slot_length；函数返回 rdma_queue_backing_plan，不取得调用方资源所有权。
+  // 失败/边界：make_srq_plan 的结果直接由 return plan 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function automatic rdma_queue_backing_plan make_srq_plan(
     rdma_function_binding binding
   );
@@ -1003,10 +967,9 @@ class rdma_queue_lifecycle_test extends uvm_test;
     return plan;
   endfunction
 
-  // 功能：依据输入请求创建对应的值对象或资源计划，并校验依赖、所有权和生命周期后返回结果。
-  // 输入/输出及副作用：输入请求、容量和依赖用于构造/预留资源；返回独立对象或状态，不暴露内部可变集合。
-  //   参数越界、容量不足或构造中途失败时回滚已登记的局部状态。
-  // 失败/边界：依赖为空、参数越界、容量不足或构造步骤失败时清理局部结果并返回明确错误。
+  // 功能：make_eq_plan 创建独立的 rdma_queue_backing_plan；根据 name、binding、kind 设置字段 plan、plan.resource_kind、ring_role、pd_role、ring_mapping、pd_mapping，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：name（输入）、binding（输入）、kind（输入）；make_eq_plan 读取 name、binding、kind 并使用字段 plan、plan.resource_kind、ring_role、pd_role、ring_mapping、pd_mapping；函数返回 rdma_queue_backing_plan，不取得调用方资源所有权。
+  // 失败/边界：make_eq_plan 的结果直接由 return plan 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function automatic rdma_queue_backing_plan make_eq_plan(
     string name,
     rdma_function_binding binding,
@@ -1039,10 +1002,10 @@ class rdma_queue_lifecycle_test extends uvm_test;
     return plan;
   endfunction
 
-  // 功能：在测试中检查调用结果、状态码和副作用是否符合契约；失败时报告可定位的验证信息。
-  // 输入/输出及副作用：参数 label, model, kind, object_type, opcode, actual 用于执行 expect_canonical_image；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：测试前置对象缺失时应报告断言错误并停止依赖该对象的后续检查。
+  // 功能：在 rdma_queue_lifecycle_test 中，expect_canonical_image 在测试中执行 expect_canonical_image 断言，比较输入结果与期望状态并报告可定位的失败信息。
+  // 输入/输出及副作用：label（输入）、model（输入）、kind（输入）、object_type（输入）、opcode（输入）、actual（输入）；fixture/输入由测试调用方提供；执行时会产生 UVM
+  //   assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：测试函数 expect_canonical_image 缺少前置对象时报告断言错误，并停止依赖该对象的后续检查。
   function automatic void expect_canonical_image(
     string label,
     rdma_hw_model model,
@@ -1058,9 +1021,9 @@ class rdma_queue_lifecycle_test extends uvm_test;
     rdma_status status;
 
     registry = rdma_codec_registry::type_id::create({label, "_registry"});
-    status = rdma_xtr_v1_register_context_body_codecs(registry);
+    status = rdma_register_context_body_codecs(registry);
     expect_status({label, "_REGISTER"}, status, RDMA_SC_OK);
-    key.hw_version = "xtr_v1";
+    key.hw_version = "rdma";
     key.image_kind = kind;
     key.object_type = object_type;
     key.variant = "create";
@@ -1085,10 +1048,9 @@ class rdma_queue_lifecycle_test extends uvm_test;
     end
   endfunction
 
-  // 功能：检查输入字段、身份和生命周期约束，返回可诊断的校验状态；失败时不提交部分更新。
-  // 输入/输出及副作用：输入为待校验字段或快照；返回 rdma_status，校验过程不提交资源和游标。
-  //   空依赖、非法范围、身份不一致或非活动状态会返回错误。
-  // 失败/边界：任何非法枚举、越界字段、缺失必需依赖或身份/代际不一致都必须返回非成功状态。
+  // 功能：在测试辅助 rdma_queue_lifecycle_test.check_preflight 中构造或驱动“preflight”场景，并断言 DUT 的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   function automatic void check_preflight();
     rdma_cq_lifecycle_policy cq_policy;
     rdma_srq_lifecycle_policy srq_policy;
@@ -1266,10 +1228,10 @@ class rdma_queue_lifecycle_test extends uvm_test;
       RDMA_SC_INVALID_ARGUMENT);
   endfunction
 
-  // 功能：检查输入字段、身份和生命周期约束，返回可诊断的校验状态；失败时不提交部分更新。
-  // 输入/输出及副作用：输入为待校验字段或快照；返回 rdma_status，校验过程不提交资源和游标。
-  //   空依赖、非法范围、身份不一致或非活动状态会返回错误。
-  // 失败/边界：任何非法枚举、越界字段、缺失必需依赖或身份/代际不一致都必须返回非成功状态。
+  // 功能：在测试辅助 rdma_queue_lifecycle_test.check_backing_planner_positive 中构造或驱动“backing planner positive”场景，并断言 DUT
+  //   的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   function automatic void check_backing_planner_positive();
     rdma_function_binding binding;
     rdma_function_handle owner;
@@ -1282,14 +1244,14 @@ class rdma_queue_lifecycle_test extends uvm_test;
     rdma_dma_mapping mapping;
     rdma_dma_mapping second_mapping;
     rdma_queue_planner_write_observer_mem fragmented_mem;
-    rdma_xtr_v1_queue_pd_codec pd_codec;
+    rdma_hw_queue_pd_codec pd_codec;
     rdma_status status;
     byte data[];
     bit complete;
 
     binding = make_binding("planner_binding");
     owner = binding.make_handle();
-    pd_codec = rdma_xtr_v1_queue_pd_codec::type_id::create(
+    pd_codec = rdma_hw_queue_pd_codec::type_id::create(
       "planner_pd_codec"
     );
 
@@ -1688,10 +1650,10 @@ class rdma_queue_lifecycle_test extends uvm_test;
     end
   endfunction
 
-  // 功能：检查输入字段、身份和生命周期约束，返回可诊断的校验状态；失败时不提交部分更新。
-  // 输入/输出及副作用：输入为待校验字段或快照；返回 rdma_status，校验过程不提交资源和游标。
-  //   空依赖、非法范围、身份不一致或非活动状态会返回错误。
-  // 失败/边界：任何非法枚举、越界字段、缺失必需依赖或身份/代际不一致都必须返回非成功状态。
+  // 功能：在测试辅助 rdma_queue_lifecycle_test.check_backing_planner_negative 中构造或驱动“backing planner negative”场景，并断言 DUT
+  //   的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   function automatic void check_backing_planner_negative();
     rdma_function_binding binding;
     rdma_function_handle owner;
@@ -1967,10 +1929,10 @@ class rdma_queue_lifecycle_test extends uvm_test;
     expect_planner_no_host_calls("PLANNER_OUTPUT_ATOMIC", mem);
   endfunction
 
-  // 功能：检查输入字段、身份和生命周期约束，返回可诊断的校验状态；失败时不提交部分更新。
-  // 输入/输出及副作用：输入为待校验字段或快照；返回 rdma_status，校验过程不提交资源和游标。
-  //   空依赖、非法范围、身份不一致或非活动状态会返回错误。
-  // 失败/边界：任何非法枚举、越界字段、缺失必需依赖或身份/代际不一致都必须返回非成功状态。
+  // 功能：在测试辅助 rdma_queue_lifecycle_test.check_backing_planner_rollback_and_cleanup 中构造或驱动“backing planner rollback and
+  //   cleanup”场景，并断言 DUT 的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   function automatic void check_backing_planner_rollback_and_cleanup();
     rdma_function_binding binding;
     rdma_function_handle owner;
@@ -2218,10 +2180,10 @@ class rdma_queue_lifecycle_test extends uvm_test;
       planner.cleanup_local_role(plan.refs[1], complete), RDMA_SC_OK);
   endfunction
 
-  // 功能：检查输入字段、身份和生命周期约束，返回可诊断的校验状态；失败时不提交部分更新。
-  // 输入/输出及副作用：输入为待校验字段或快照；返回 rdma_status，校验过程不提交资源和游标。
-  //   空依赖、非法范围、身份不一致或非活动状态会返回错误。
-  // 失败/边界：任何非法枚举、越界字段、缺失必需依赖或身份/代际不一致都必须返回非成功状态。
+  // 功能：在测试辅助 rdma_queue_lifecycle_test.check_contexts_and_commands 中构造或驱动“contexts and commands”场景，并断言 DUT
+  //   的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   function automatic void check_contexts_and_commands();
     rdma_function_binding binding;
     rdma_function_binding foreign_binding;
@@ -2248,8 +2210,8 @@ class rdma_queue_lifecycle_test extends uvm_test;
     byte unsigned slot_image[];
     byte unsigned shadow_image[];
     rdma_cmq_command_desc command;
-    rdma_xtr_v1_object_id_command_body object_body;
-    rdma_xtr_v1_occ_flush_body occ_body;
+    rdma_hw_object_id_command_body object_body;
+    rdma_hw_occ_flush_body occ_body;
     rdma_queue_flush_target target;
     rdma_queue_resource wrong_resource;
 
@@ -2338,7 +2300,7 @@ class rdma_queue_lifecycle_test extends uvm_test;
       cq_policy.build_create_command(owner, cq, cqc, 100ns, command),
       RDMA_SC_OK);
     if (command == null || command.opcode_key.opcode != 8'h0c ||
-        command.opcode_key.profile_name != "xtr_v1" ||
+        command.opcode_key.profile_name != "rdma" ||
         command.opcode_key.variant != "create")
       `uvm_error("CQC_CREATE_COMMAND", "CQC create descriptor is incorrect")
     command = rdma_cmq_command_desc::type_id::create("stale_foreign_command");
@@ -2578,10 +2540,9 @@ class rdma_queue_lifecycle_test extends uvm_test;
                  "failed flush command leaked caller output")
   endfunction
 
-  // 功能：依据输入请求创建对应的值对象或资源计划，并校验依赖、所有权和生命周期后返回结果。
-  // 输入/输出及副作用：输入请求、容量和依赖用于构造/预留资源；返回独立对象或状态，不暴露内部可变集合。
-  //   参数越界、容量不足或构造中途失败时回滚已登记的局部状态。
-  // 失败/边界：依赖为空、参数越界、容量不足或构造步骤失败时清理局部结果并返回明确错误。
+  // 功能：make_executor_request 创建独立的 rdma_semantic_request；根据 name、kind、binding、dependency、borrowed 设置字段 cq_req、cq_req.owner、cq_req.depth、cq_req.cqe_size_bytes、cq_req.ceq_h、ring_backing.mode、role、mapping、slice、ceq_req，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：name（输入）、kind（输入）、binding（输入）、dependency（输入）、borrowed（输入）；make_executor_request 读取 name、kind、binding、dependency、borrowed 并使用字段 cq_req、cq_req.owner、cq_req.depth、cq_req.cqe_size_bytes、cq_req.ceq_h、ring_backing.mode、role、mapping；函数返回 rdma_semantic_request，不取得调用方资源所有权。
+  // 失败/边界：make_executor_request 先检查 borrowed，再返回 cq_req；ceq_req；aeq_req；拒绝分支不提交部分状态，也不隐式重试。
   function automatic rdma_semantic_request make_executor_request(
     string name,
     rdma_resource_kind_e kind,
@@ -2646,10 +2607,9 @@ class rdma_queue_lifecycle_test extends uvm_test;
     endcase
   endfunction
 
-  // 功能：依据输入请求创建对应的值对象或资源计划，并校验依赖、所有权和生命周期后返回结果。
-  // 输入/输出及副作用：输入请求、容量和依赖用于构造/预留资源；返回独立对象或状态，不暴露内部可变集合。
-  //   参数越界、容量不足或构造中途失败时回滚已登记的局部状态。
-  // 失败/边界：依赖为空、参数越界、容量不足或构造步骤失败时清理局部结果并返回明确错误。
+  // 功能：make_executor_srq_request 创建独立的 rdma_create_srq_req；根据 name、binding、dependency、max_sge 设置字段 request、request.owner、request.depth、request.max_sge、request.limit_threshold、request.pd_h、payload_backing.mode，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：name（输入）、binding（输入）、dependency（输入）、max_sge（输入）；make_executor_srq_request 读取 name、binding、dependency、max_sge 并使用字段 request、request.owner、request.depth、request.max_sge、request.limit_threshold、request.pd_h、payload_backing.mode；函数返回 rdma_create_srq_req，不取得调用方资源所有权。
+  // 失败/边界：make_executor_srq_request 的结果直接由 return request 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function automatic rdma_create_srq_req make_executor_srq_request(
     string name,
     rdma_function_binding binding,
@@ -2672,10 +2632,10 @@ class rdma_queue_lifecycle_test extends uvm_test;
   // adapters needed by a subsequent destroy/failure assertion.  Keeping each
   // case isolated ensures that release authority from one scenario cannot
   // accidentally satisfy another scenario.
-  // 功能：依据输入请求创建对应的值对象或资源计划，并校验依赖、所有权和生命周期后返回结果。
-  // 输入/输出及副作用：输入请求、容量和依赖用于构造/预留资源；返回独立对象或状态，不暴露内部可变集合。
-  //   参数越界、容量不足或构造中途失败时回滚已登记的局部状态。
-  // 失败/边界：依赖为空、参数越界、容量不足或构造步骤失败时清理局部结果并返回明确错误。
+  // 功能：create_destroy_fixture 创建独立的 无直接返回值；根据 label、kind、binding、manager、mem、context_backing、cmq、trace、executor、queue、create_result、ceq_dependency、pd_dependency、borrowed 设置字段 binding、manager、ceq_dependency、pd_dependency、mem、mem.queue_kind、mem.include_sgb、context_backing、cmq、trace，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：label（输入）、kind（输入）、binding（输出）、manager（输出）、mem（输出）、context_backing（输出）、cmq（输出）、trace（输出）、executor（输出）、queue（输出）、create_result（输出）、ceq_dependency（输出）、pd_dependency（输出）、borrowed（输入）；输入请求/句柄定义资源属性；成功时更新账本并通过返回值或
+  //   output 发布新句柄/映射。
+  // 失败/边界：create_destroy_fixture 失败或超时通过 binding、manager、mem、context_backing、cmq、trace、executor、queue、create_result、ceq_dependency、pd_dependency 明确发布；该路径不隐式重试，也不转移未声明资源。
   task automatic create_destroy_fixture(
     string label,
     rdma_resource_kind_e kind,
@@ -2752,10 +2712,9 @@ class rdma_queue_lifecycle_test extends uvm_test;
     mem.reset_destroy_trace();
   endtask
 
-  // 功能：依据输入请求创建对应的值对象或资源计划，并校验依赖、所有权和生命周期后返回结果。
-  // 输入/输出及副作用：输入请求、容量和依赖用于构造/预留资源；返回独立对象或状态，不暴露内部可变集合。
-  //   参数越界、容量不足或构造中途失败时回滚已登记的局部状态。
-  // 失败/边界：依赖为空、参数越界、容量不足或构造步骤失败时清理局部结果并返回明确错误。
+  // 功能：make_destroy_request 创建独立的 rdma_destroy_resource_req；根据 name、binding、target 设置字段 request、request.owner、request.target_h，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：name（输入）、binding（输入）、target（输入）；make_destroy_request 读取 name、binding、target 并使用字段 request、request.owner、request.target_h；函数返回 rdma_destroy_resource_req，不取得调用方资源所有权。
+  // 失败/边界：make_destroy_request 的结果直接由 return request 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function automatic rdma_destroy_resource_req make_destroy_request(
     string name,
     rdma_function_binding binding,
@@ -2769,10 +2728,9 @@ class rdma_queue_lifecycle_test extends uvm_test;
     return request;
   endfunction
 
-  // 功能：在测试中检查调用结果、状态码和副作用是否符合契约；失败时报告可定位的验证信息。
-  // 输入/输出及副作用：参数 label, trace, expected 用于执行 expect_destroy_trace；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：测试前置对象缺失时应报告断言错误并停止依赖该对象的后续检查。
+  // 功能：在 rdma_queue_lifecycle_test 中，expect_destroy_trace 在测试中执行 expect_destroy_trace 断言，比较输入结果与期望状态并报告可定位的失败信息。
+  // 输入/输出及副作用：label（输入）、trace（输入）、expected（输入）；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：测试函数 expect_destroy_trace 缺少前置对象时报告断言错误，并停止依赖该对象的后续检查。
   function automatic void expect_destroy_trace(
     string label,
     rdma_mock_call_trace trace,
@@ -2797,8 +2755,7 @@ class rdma_queue_lifecycle_test extends uvm_test;
   endfunction
 
   // 功能：判断 count_executor_host_calls 对应的状态、能力或账本条件，并返回确定的布尔/计数结果，不修改状态。
-  // 输入/输出及副作用：参数 mem, method_name 用于执行 count_executor_host_calls；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
+  // 输入/输出及副作用：mem（输入）、method_name（输入）；count_executor_host_calls 读取 mem、method_name 并使用字段 count；函数返回 int unsigned，不取得调用方资源所有权。
   // 失败/边界：count_executor_host_calls 只读取现有账本；输入未初始化时返回保守结果，不得借助默认 Function/root 猜测。
   function automatic int unsigned count_executor_host_calls(
     rdma_mock_host_mem mem, string method_name
@@ -2812,8 +2769,7 @@ class rdma_queue_lifecycle_test extends uvm_test;
   endfunction
 
   // 功能：判断 count_executor_host_releases_for_backing 对应的状态、能力或账本条件，并返回确定的布尔/计数结果，不修改状态。
-  // 输入/输出及副作用：参数 mem, backing_address 用于执行 count_executor_host_releases_for_backing；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
+  // 输入/输出及副作用：mem（输入）、backing_address（输入）；count_executor_host_releases_for_backing 读取 mem、backing_address 并使用字段 count；函数返回 int unsigned，不取得调用方资源所有权。
   // 失败/边界：count_executor_host_releases_for_backing 只读取现有账本；输入未初始化时返回保守结果，不得借助默认 Function/root 猜测。
   function automatic int unsigned count_executor_host_releases_for_backing(
     rdma_mock_host_mem mem, longint unsigned backing_address
@@ -2830,8 +2786,7 @@ class rdma_queue_lifecycle_test extends uvm_test;
   endfunction
 
   // 功能：判断 count_executor_recovery_step 对应的状态、能力或账本条件，并返回确定的布尔/计数结果，不修改状态。
-  // 输入/输出及副作用：参数 steps, expected 用于执行 count_executor_recovery_step；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
+  // 输入/输出及副作用：steps（输入）、expected（输入）；count_executor_recovery_step 读取 steps、expected 并使用字段 count；函数返回 int unsigned，不取得调用方资源所有权。
   // 失败/边界：count_executor_recovery_step 只读取现有账本；输入未初始化时返回保守结果，不得借助默认 Function/root 猜测。
   function automatic int unsigned count_executor_recovery_step(
     rdma_control_step_e steps[$], rdma_control_step_e expected
@@ -2846,8 +2801,7 @@ class rdma_queue_lifecycle_test extends uvm_test;
   endfunction
 
   // 功能：判断 count_executor_rollback_code 对应的状态、能力或账本条件，并返回确定的布尔/计数结果，不修改状态。
-  // 输入/输出及副作用：参数 statuses, expected 用于执行 count_executor_rollback_code；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
+  // 输入/输出及副作用：statuses（输入）、expected（输入）；count_executor_rollback_code 读取 statuses、expected 并使用字段 count；函数返回 int unsigned，不取得调用方资源所有权。
   // 失败/边界：count_executor_rollback_code 只读取现有账本；输入未初始化时返回保守结果，不得借助默认 Function/root 猜测。
   function automatic int unsigned count_executor_rollback_code(
     rdma_status statuses[$], rdma_status_code_e expected
@@ -2861,10 +2815,10 @@ class rdma_queue_lifecycle_test extends uvm_test;
     return count;
   endfunction
 
-  // 功能：处理 retry_executor_local_cleanup：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 label, manager, mem, context_backing, resource_h 用于执行 retry_executor_local_cleanup；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：retry_executor_local_cleanup 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：在 rdma_queue_lifecycle_test 中，retry_executor_local_cleanup 根据当前证据转换事务或恢复状态，并保持重试、复位和所有权边界一致。
+  // 输入/输出及副作用：label（输入）、manager（输入）、mem（输入）、context_backing（输入）、resource_h（输入）；retry_executor_local_cleanup 驱动下游事务；函数返回 无直接返回值，不取得调用方资源所有权。
+
+  // 失败/边界：retry_executor_local_cleanup 异常完成由下游接口或 UVM 报告机制发布；该路径不隐式重试，也不转移未声明资源。
   task automatic retry_executor_local_cleanup(
     string label,
     rdma_resource_manager manager,
@@ -2948,10 +2902,10 @@ class rdma_queue_lifecycle_test extends uvm_test;
                   RDMA_SC_INVALID_STATE);
   endtask
 
-  // 功能：检查输入字段、身份和生命周期约束，返回可诊断的校验状态；失败时不提交部分更新。
-  // 输入/输出及副作用：输入为待校验字段或快照；返回 rdma_status，校验过程不提交资源和游标。
-  //   空依赖、非法范围、身份不一致或非活动状态会返回错误。
-  // 失败/边界：任何非法枚举、越界字段、缺失必需依赖或身份/代际不一致都必须返回非成功状态。
+  // 功能：在测试辅助 rdma_queue_lifecycle_test.check_executor_positive_case 中构造或驱动“executor positive case”场景，并断言 DUT
+  //   的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：kind（输入）、borrowed（输入）；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_executor_positive_case(
     rdma_resource_kind_e kind, bit borrowed
   );
@@ -3054,10 +3008,10 @@ class rdma_queue_lifecycle_test extends uvm_test;
       `uvm_error(label, "EQ create touched context backing")
   endtask
 
-  // 功能：检查输入字段、身份和生命周期约束，返回可诊断的校验状态；失败时不提交部分更新。
-  // 输入/输出及副作用：输入为待校验字段或快照；返回 rdma_status，校验过程不提交资源和游标。
-  //   空依赖、非法范围、身份不一致或非活动状态会返回错误。
-  // 失败/边界：任何非法枚举、越界字段、缺失必需依赖或身份/代际不一致都必须返回非成功状态。
+  // 功能：在测试辅助 rdma_queue_lifecycle_test.check_executor_failure_case 中构造或驱动“executor failure case”场景，并断言 DUT
+  //   的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：mode（输入）；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_executor_failure_case(int unsigned mode);
     string label;
     rdma_function_binding binding;
@@ -3187,10 +3141,10 @@ class rdma_queue_lifecycle_test extends uvm_test;
     end
   endtask
 
-  // 功能：检查输入字段、身份和生命周期约束，返回可诊断的校验状态；失败时不提交部分更新。
-  // 输入/输出及副作用：输入为待校验字段或快照；返回 rdma_status，校验过程不提交资源和游标。
-  //   空依赖、非法范围、身份不一致或非活动状态会返回错误。
-  // 失败/边界：任何非法枚举、越界字段、缺失必需依赖或身份/代际不一致都必须返回非成功状态。
+  // 功能：在测试辅助 rdma_queue_lifecycle_test.check_executor_cq_reset_cancelled 中构造或驱动“executor cq reset cancelled”场景，并断言
+  //   DUT 的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_executor_cq_reset_cancelled();
     for (int unsigned mode = 0; mode < 3; mode++) begin
       string label;
@@ -3295,10 +3249,10 @@ class rdma_queue_lifecycle_test extends uvm_test;
     end
   endtask
 
-  // 功能：检查输入字段、身份和生命周期约束，返回可诊断的校验状态；失败时不提交部分更新。
-  // 输入/输出及副作用：输入为待校验字段或快照；返回 rdma_status，校验过程不提交资源和游标。
-  //   空依赖、非法范围、身份不一致或非活动状态会返回错误。
-  // 失败/边界：任何非法枚举、越界字段、缺失必需依赖或身份/代际不一致都必须返回非成功状态。
+  // 功能：在测试辅助 rdma_queue_lifecycle_test.check_executor_local_cleanup_recovery 中构造或驱动“executor local cleanup
+  //   recovery”场景，并断言 DUT 的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_executor_local_cleanup_recovery();
     string label;
     rdma_function_binding binding;
@@ -3379,10 +3333,10 @@ class rdma_queue_lifecycle_test extends uvm_test;
     expect_status({label, "_DEPENDENCY_RELEASED"}, status, RDMA_SC_OK);
   endtask
 
-  // 功能：检查输入字段、身份和生命周期约束，返回可诊断的校验状态；失败时不提交部分更新。
-  // 输入/输出及副作用：输入为待校验字段或快照；返回 rdma_status，校验过程不提交资源和游标。
-  //   空依赖、非法范围、身份不一致或非活动状态会返回错误。
-  // 失败/边界：任何非法枚举、越界字段、缺失必需依赖或身份/代际不一致都必须返回非成功状态。
+  // 功能：在测试辅助 rdma_queue_lifecycle_test.check_executor_prestage_cleanup_recovery 中构造或驱动“executor prestage cleanup
+  //   recovery”场景，并断言 DUT 的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_executor_prestage_cleanup_recovery();
     for (int unsigned mode = 0; mode < 3; mode++) begin
       string label;
@@ -3476,10 +3430,10 @@ class rdma_queue_lifecycle_test extends uvm_test;
     end
   endtask
 
-  // 功能：检查输入字段、身份和生命周期约束，返回可诊断的校验状态；失败时不提交部分更新。
-  // 输入/输出及副作用：输入为待校验字段或快照；返回 rdma_status，校验过程不提交资源和游标。
-  //   空依赖、非法范围、身份不一致或非活动状态会返回错误。
-  // 失败/边界：任何非法枚举、越界字段、缺失必需依赖或身份/代际不一致都必须返回非成功状态。
+  // 功能：在测试辅助 rdma_queue_lifecycle_test.check_executor_reservation_release_recovery 中构造或驱动“executor reservation
+  //   release recovery”场景，并断言 DUT 的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_executor_reservation_release_recovery();
     rdma_resource_kind_e kinds[$];
 
@@ -3764,10 +3718,10 @@ class rdma_queue_lifecycle_test extends uvm_test;
     end
   endtask
 
-  // 功能：检查输入字段、身份和生命周期约束，返回可诊断的校验状态；失败时不提交部分更新。
-  // 输入/输出及副作用：输入为待校验字段或快照；返回 rdma_status，校验过程不提交资源和游标。
-  //   空依赖、非法范围、身份不一致或非活动状态会返回错误。
-  // 失败/边界：任何非法枚举、越界字段、缺失必需依赖或身份/代际不一致都必须返回非成功状态。
+  // 功能：在测试辅助 rdma_queue_lifecycle_test.check_executor_eq_rollback_recovery 中构造或驱动“executor eq rollback
+  //   recovery”场景，并断言 DUT 的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_executor_eq_rollback_recovery();
     rdma_resource_kind_e kinds[$];
 
@@ -3919,10 +3873,10 @@ class rdma_queue_lifecycle_test extends uvm_test;
     end
   endtask
 
-  // 功能：检查输入字段、身份和生命周期约束，返回可诊断的校验状态；失败时不提交部分更新。
-  // 输入/输出及副作用：输入为待校验字段或快照；返回 rdma_status，校验过程不提交资源和游标。
-  //   空依赖、非法范围、身份不一致或非活动状态会返回错误。
-  // 失败/边界：任何非法枚举、越界字段、缺失必需依赖或身份/代际不一致都必须返回非成功状态。
+  // 功能：在测试辅助 rdma_queue_lifecycle_test.check_executor_srq_compound_create 中构造或驱动“executor srq compound create”场景，并断言
+  //   DUT 的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_executor_srq_compound_create();
     rdma_function_binding binding;
     rdma_fault_inject_resource_manager manager;
@@ -4030,10 +3984,10 @@ class rdma_queue_lifecycle_test extends uvm_test;
       `uvm_error("EXEC_SRQ_NO_SGB", "max_sge=2 unexpectedly allocated SGB")
   endtask
 
-  // 功能：检查输入字段、身份和生命周期约束，返回可诊断的校验状态；失败时不提交部分更新。
-  // 输入/输出及副作用：输入为待校验字段或快照；返回 rdma_status，校验过程不提交资源和游标。
-  //   空依赖、非法范围、身份不一致或非活动状态会返回错误。
-  // 失败/边界：任何非法枚举、越界字段、缺失必需依赖或身份/代际不一致都必须返回非成功状态。
+  // 功能：在测试辅助 rdma_queue_lifecycle_test.check_executor_srq_rollback_order 中构造或驱动“executor srq rollback order”场景，并断言
+  //   DUT 的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_executor_srq_rollback_order();
     rdma_function_binding binding;
     rdma_fault_inject_resource_manager manager;
@@ -4088,10 +4042,9 @@ class rdma_queue_lifecycle_test extends uvm_test;
                  "SRQ rollback was not SRFQ_PD, SRQ_PD, then SRQC delete")
   endtask
 
-  // 功能：检查输入字段、身份和生命周期约束，返回可诊断的校验状态；失败时不提交部分更新。
-  // 输入/输出及副作用：输入为待校验字段或快照；返回 rdma_status，校验过程不提交资源和游标。
-  //   空依赖、非法范围、身份不一致或非活动状态会返回错误。
-  // 失败/边界：任何非法枚举、越界字段、缺失必需依赖或身份/代际不一致都必须返回非成功状态。
+  // 功能：在测试辅助 rdma_queue_lifecycle_test.check_create_executor 中构造或驱动“create executor”场景，并断言 DUT 的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_create_executor();
     check_executor_positive_case(RDMA_RESOURCE_CQ, 1'b0);
     check_executor_positive_case(RDMA_RESOURCE_CQ, 1'b1);
@@ -4110,10 +4063,10 @@ class rdma_queue_lifecycle_test extends uvm_test;
     check_executor_srq_rollback_order();
   endtask
 
-  // 功能：检查输入字段、身份和生命周期约束，返回可诊断的校验状态；失败时不提交部分更新。
-  // 输入/输出及副作用：输入为待校验字段或快照；返回 rdma_status，校验过程不提交资源和游标。
-  //   空依赖、非法范围、身份不一致或非活动状态会返回错误。
-  // 失败/边界：任何非法枚举、越界字段、缺失必需依赖或身份/代际不一致都必须返回非成功状态。
+  // 功能：在测试辅助 rdma_queue_lifecycle_test.check_executor_context_optional_for_eq 中构造或驱动“executor context optional for
+  //   eq”场景，并断言 DUT 的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_executor_context_optional_for_eq();
     rdma_function_binding binding;
     rdma_fault_inject_resource_manager manager;
@@ -4149,10 +4102,10 @@ class rdma_queue_lifecycle_test extends uvm_test;
       `uvm_error("OPTIONAL_CONTEXT_CEQ", "EQ create did not allow null context")
   endtask
 
-  // 功能：检查输入字段、身份和生命周期约束，返回可诊断的校验状态；失败时不提交部分更新。
-  // 输入/输出及副作用：输入为待校验字段或快照；返回 rdma_status，校验过程不提交资源和游标。
-  //   空依赖、非法范围、身份不一致或非活动状态会返回错误。
-  // 失败/边界：任何非法枚举、越界字段、缺失必需依赖或身份/代际不一致都必须返回非成功状态。
+  // 功能：在测试辅助 rdma_queue_lifecycle_test.check_destroy_success_traces 中构造或驱动“destroy success traces”场景，并断言 DUT
+  //   的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_destroy_success_traces();
     rdma_resource_kind_e kinds[$];
 
@@ -4244,10 +4197,10 @@ class rdma_queue_lifecycle_test extends uvm_test;
     end
   endtask
 
-  // 功能：检查输入字段、身份和生命周期约束，返回可诊断的校验状态；失败时不提交部分更新。
-  // 输入/输出及副作用：输入为待校验字段或快照；返回 rdma_status，校验过程不提交资源和游标。
-  //   空依赖、非法范围、身份不一致或非活动状态会返回错误。
-  // 失败/边界：任何非法枚举、越界字段、缺失必需依赖或身份/代际不一致都必须返回非成功状态。
+  // 功能：在测试辅助 rdma_queue_lifecycle_test.check_destroy_borrowed_eq_detach 中构造或驱动“destroy borrowed eq detach”场景，并断言 DUT
+  //   的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_destroy_borrowed_eq_detach();
     string label;
     string expected[$];
@@ -4299,10 +4252,10 @@ class rdma_queue_lifecycle_test extends uvm_test;
     expect_status({label, "_RELEASED_LOOKUP"}, status, RDMA_SC_INVALID_STATE);
   endtask
 
-  // 功能：检查输入字段、身份和生命周期约束，返回可诊断的校验状态；失败时不提交部分更新。
-  // 输入/输出及副作用：输入为待校验字段或快照；返回 rdma_status，校验过程不提交资源和游标。
-  //   空依赖、非法范围、身份不一致或非活动状态会返回错误。
-  // 失败/边界：任何非法枚举、越界字段、缺失必需依赖或身份/代际不一致都必须返回非成功状态。
+  // 功能：在测试辅助 rdma_queue_lifecycle_test.check_destroy_busy_guards 中构造或驱动“destroy busy guards”场景，并断言 DUT
+  //   的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_destroy_busy_guards();
     string label;
     rdma_function_binding binding;
@@ -4424,10 +4377,10 @@ class rdma_queue_lifecycle_test extends uvm_test;
       `uvm_error(label, "outstanding busy resource did not destroy after retire")
   endtask
 
-  // 功能：检查输入字段、身份和生命周期约束，返回可诊断的校验状态；失败时不提交部分更新。
-  // 输入/输出及副作用：输入为待校验字段或快照；返回 rdma_status，校验过程不提交资源和游标。
-  //   空依赖、非法范围、身份不一致或非活动状态会返回错误。
-  // 失败/边界：任何非法枚举、越界字段、缺失必需依赖或身份/代际不一致都必须返回非成功状态。
+  // 功能：在测试辅助 rdma_queue_lifecycle_test.check_destroy_srq_restore_retry 中构造或驱动“destroy srq restore retry”场景，并断言 DUT
+  //   的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_destroy_srq_restore_retry();
     string label;
     string expected[$];
@@ -4486,7 +4439,7 @@ class rdma_queue_lifecycle_test extends uvm_test;
           `uvm_error(label, "restored SRQ retained stale flush progress")
     end
     foreach (cmq.calls[i]) begin
-      if (i > cmq_before && cmq.calls[i].opcode == XTR_V1_OP_SRFQC_DELETE)
+      if (i > cmq_before && cmq.calls[i].opcode == RDMA_OP_SRFQC_DELETE)
         `uvm_error(label, "failed second flush issued SRQ delete")
     end
 
@@ -4506,10 +4459,10 @@ class rdma_queue_lifecycle_test extends uvm_test;
                   manager.release_reserved(pd_dependency.handle), RDMA_SC_OK);
   endtask
 
-  // 功能：检查输入字段、身份和生命周期约束，返回可诊断的校验状态；失败时不提交部分更新。
-  // 输入/输出及副作用：输入为待校验字段或快照；返回 rdma_status，校验过程不提交资源和游标。
-  //   空依赖、非法范围、身份不一致或非活动状态会返回错误。
-  // 失败/边界：任何非法枚举、越界字段、缺失必需依赖或身份/代际不一致都必须返回非成功状态。
+  // 功能：在测试辅助 rdma_queue_lifecycle_test.check_destroy_failure_matrix 中构造或驱动“destroy failure matrix”场景，并断言 DUT
+  //   的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_destroy_failure_matrix();
     for (int unsigned scenario = 0; scenario < 4; scenario++) begin
       string label;
@@ -4545,10 +4498,10 @@ class rdma_queue_lifecycle_test extends uvm_test;
                                        "ticketed nonzero hardware ecode");
           injected.hardware_code_valid = 1'b1;
           injected.hardware_code = 16'h5a5a;
-          cmq.fail_opcode(XTR_V1_OP_CQC_DELETE, injected);
+          cmq.fail_opcode(RDMA_OP_CQC_DELETE, injected);
         end
-        1: cmq.timeout_opcode(XTR_V1_OP_CQC_DELETE);
-        2: cmq.fail_opcode(XTR_V1_OP_CQC_DELETE,
+        1: cmq.timeout_opcode(RDMA_OP_CQC_DELETE);
+        2: cmq.fail_opcode(RDMA_OP_CQC_DELETE,
                            rdma_status::make(RDMA_SC_RESET_CANCELLED,
                                               "destroy reset cancelled"));
         default: cmq.lose_next_completion = 1'b1;
@@ -4600,10 +4553,10 @@ class rdma_queue_lifecycle_test extends uvm_test;
     end
   endtask
 
-  // 功能：检查输入字段、身份和生命周期约束，返回可诊断的校验状态；失败时不提交部分更新。
-  // 输入/输出及副作用：输入为待校验字段或快照；返回 rdma_status，校验过程不提交资源和游标。
-  //   空依赖、非法范围、身份不一致或非活动状态会返回错误。
-  // 失败/边界：任何非法枚举、越界字段、缺失必需依赖或身份/代际不一致都必须返回非成功状态。
+  // 功能：在测试辅助 rdma_queue_lifecycle_test.check_destroy_srq_flush_failure 中构造或驱动“destroy srq flush failure”场景，并断言 DUT
+  //   的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_destroy_srq_flush_failure();
     string label;
     string expected[$];
@@ -4628,7 +4581,7 @@ class rdma_queue_lifecycle_test extends uvm_test;
     create_destroy_fixture(label, RDMA_RESOURCE_SRQ, binding, manager, mem,
                            context_backing, cmq, trace, executor, queue,
                            create_result, ceq_dependency, pd_dependency);
-    cmq.fail_opcode(XTR_V1_OP_OCC_FLUSH,
+    cmq.fail_opcode(RDMA_OP_OCC_FLUSH,
                     rdma_status::make(RDMA_SC_RESET_CANCELLED,
                                       "SRQ flush reset cancelled"));
     request = make_destroy_request({label, "_request"}, binding, queue.handle);
@@ -4657,10 +4610,10 @@ class rdma_queue_lifecycle_test extends uvm_test;
   // A non-OK CMQ status with no ticket/completion does not, by itself, prove
   // that a destructive command was rejected before submission.  The executor
   // must retain ERROR recovery until an adapter supplies explicit proof.
-  // 功能：检查输入字段、身份和生命周期约束，返回可诊断的校验状态；失败时不提交部分更新。
-  // 输入/输出及副作用：输入为待校验字段或快照；返回 rdma_status，校验过程不提交资源和游标。
-  //   空依赖、非法范围、身份不一致或非活动状态会返回错误。
-  // 失败/边界：任何非法枚举、越界字段、缺失必需依赖或身份/代际不一致都必须返回非成功状态。
+  // 功能：在测试辅助 rdma_queue_lifecycle_test.check_destroy_nonok_null_outcome_fail_closed 中构造或驱动“destroy nonok null outcome
+  //   fail closed”场景，并断言 DUT 的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_destroy_nonok_null_outcome_fail_closed();
     string label;
     string expected[$];
@@ -4719,10 +4672,10 @@ class rdma_queue_lifecycle_test extends uvm_test;
       `uvm_error(label, "null outcome recovery lost delete authority")
   endtask
 
-  // 功能：检查输入字段、身份和生命周期约束，返回可诊断的校验状态；失败时不提交部分更新。
-  // 输入/输出及副作用：输入为待校验字段或快照；返回 rdma_status，校验过程不提交资源和游标。
-  //   空依赖、非法范围、身份不一致或非活动状态会返回错误。
-  // 失败/边界：任何非法枚举、越界字段、缺失必需依赖或身份/代际不一致都必须返回非成功状态。
+  // 功能：在测试辅助 rdma_queue_lifecycle_test.check_destroy_cq_post_delete_flush_failure 中构造或驱动“destroy cq post delete flush
+  //   failure”场景，并断言 DUT 的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_destroy_cq_post_delete_flush_failure();
     string label;
     string expected[$];
@@ -4784,10 +4737,10 @@ class rdma_queue_lifecycle_test extends uvm_test;
                  "CQ post-delete failure lost ABSENT hardware recovery state")
   endtask
 
-  // 功能：检查输入字段、身份和生命周期约束，返回可诊断的校验状态；失败时不提交部分更新。
-  // 输入/输出及副作用：输入为待校验字段或快照；返回 rdma_status，校验过程不提交资源和游标。
-  //   空依赖、非法范围、身份不一致或非活动状态会返回错误。
-  // 失败/边界：任何非法枚举、越界字段、缺失必需依赖或身份/代际不一致都必须返回非成功状态。
+  // 功能：在测试辅助 rdma_queue_lifecycle_test.check_public_destroy_success 中构造或驱动“public destroy success”场景，并断言 DUT
+  //   的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_public_destroy_success();
     rdma_control_plane control;
     rdma_resource_manager manager;
@@ -4831,7 +4784,7 @@ class rdma_queue_lifecycle_test extends uvm_test;
     if (result == null || result.status == null || !result.ok() ||
         result.final_resource_state != RDMA_RESOURCE_RELEASED ||
         cmq.calls.size() != cmq_before + 1 ||
-        cmq.calls[cmq.calls.size()-1].opcode != XTR_V1_OP_CEQC_DELETE ||
+        cmq.calls[cmq.calls.size()-1].opcode != RDMA_OP_CEQC_DELETE ||
         count_executor_host_calls(host_mem, "release") != release_before + 2)
       `uvm_error("PUBLIC_DESTROY_SUCCESS",
                  "public CEQ destroy did not complete in order")
@@ -4840,10 +4793,10 @@ class rdma_queue_lifecycle_test extends uvm_test;
                   RDMA_SC_INVALID_STATE);
   endtask
 
-  // 功能：检查输入字段、身份和生命周期约束，返回可诊断的校验状态；失败时不提交部分更新。
-  // 输入/输出及副作用：输入为待校验字段或快照；返回 rdma_status，校验过程不提交资源和游标。
-  //   空依赖、非法范围、身份不一致或非活动状态会返回错误。
-  // 失败/边界：任何非法枚举、越界字段、缺失必需依赖或身份/代际不一致都必须返回非成功状态。
+  // 功能：在测试辅助 rdma_queue_lifecycle_test.check_destroy_recipe_contract 中构造或驱动“destroy recipe contract”场景，并断言 DUT
+  //   的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_destroy_recipe_contract();
     rdma_queue_lifecycle_policy policy;
     rdma_queue_backing_role_e fr[$], lr[$];
@@ -4870,10 +4823,10 @@ class rdma_queue_lifecycle_test extends uvm_test;
       `uvm_error("DESTROY_RECIPE_AEQ", "AEQ recipe mismatch")
   endtask
 
-  // 功能：检查输入字段、身份和生命周期约束，返回可诊断的校验状态；失败时不提交部分更新。
-  // 输入/输出及副作用：输入为待校验字段或快照；返回 rdma_status，校验过程不提交资源和游标。
-  //   空依赖、非法范围、身份不一致或非活动状态会返回错误。
-  // 失败/边界：任何非法枚举、越界字段、缺失必需依赖或身份/代际不一致都必须返回非成功状态。
+  // 功能：在测试辅助 rdma_queue_lifecycle_test.check_destroy_invalid_matrix 中构造或驱动“destroy invalid matrix”场景，并断言 DUT
+  //   的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_destroy_invalid_matrix();
     rdma_queue_lifecycle_executor ex;
     rdma_function_binding b;
@@ -4889,10 +4842,9 @@ class rdma_queue_lifecycle_test extends uvm_test;
   endtask
 
 
-  // 功能：驱动 UVM 阶段中的场景初始化、事务执行和断言收尾，并在退出前释放 objection 或测试资源。
-  // 输入/输出及副作用：phase 控制 UVM 调度；task 驱动事务、断言和 objection，测试 fixture 由本层负责清理。
-  //   阶段提前结束或前置 setup 失败时必须释放 objection 并停止后续访问。
-  // 失败/边界：setup 失败或阶段被终止时停止新增事务，确保 objection、临时对象和外部引用按测试生命周期收尾。
+  // 功能：在 rdma_queue_lifecycle_test 中，run_phase 驱动 UVM 阶段中的场景初始化、事务执行和断言收尾，并在退出前释放 objection 或测试资源。
+  // 输入/输出及副作用：phase（输入）；phase 由 UVM 提供；task 通过 objection、日志和断言暴露结果，可能调用 DUT 接口但不改变其所有权规则。
+  // 失败/边界：run_phase 的 setup/阶段驱动失败时停止新增事务，并按测试生命周期清理 objection 与临时引用。
   task run_phase(uvm_phase phase);
     phase.raise_objection(this);
     check_preflight();

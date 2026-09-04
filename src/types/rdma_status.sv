@@ -23,10 +23,9 @@ class rdma_status extends uvm_object;
   bit retryable;
   string message;
 
-  // 功能：构造当前对象并初始化其字段、集合和 UVM 名称；不接管传入句柄的生命周期。
-  // 输入/输出及副作用：name 仅用于 UVM 对象命名；内部字段被初始化为安全默认值，传入句柄不转移所有权。
-  //   返回新对象实例；构造失败由 UVM 工厂或调用方处理。
-  // 失败/边界：不创建外部资源；name 为空时仍允许构造，但所有字段必须保持可配置的初始值。
+  // 功能：构造 rdma_status，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：category=RDMA_STATUS_STATE；code=RDMA_SC_OK；hardware_code='0；hardware_code_valid=1'b0；source_engine=RDMA_ENGINE_NONE；function_uid='0；generation='0；resource_id='0；其余字段按实现默认值初始化。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_status 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_status");
     super.new(name);
     category = RDMA_STATUS_STATE;
@@ -46,10 +45,9 @@ class rdma_status extends uvm_object;
 
   // 中文：状态进入事务 evidence 后必须是 detached snapshot，保留错误码、
   // 硬件上下文与诊断文本，避免 clone 后只剩默认 OK 状态。
-  // 功能：从源对象复制可变字段并生成独立值快照；源对象保持不变，类型不匹配时报告复制错误。
-  // 输入/输出及副作用：source/rhs 是源对象；返回或写入独立副本，不修改源对象。
-  //   source/rhs 为空或类型不匹配时返回空值或触发既定复制错误。
-  // 失败/边界：空源对象不应解引用；类型不匹配必须拒绝复制或按既定 UVM 规则报告 fatal。
+  // 功能：将 rhs 中 rdma_status 的值字段复制到当前对象，建立与源对象隔离的快照。
+  // 输入/输出及副作用：rhs（输入）；rhs 是源对象；当前对象字段会被覆盖，嵌套句柄按实现执行 clone 或保持非拥有引用，源对象不被修改。
+  // 失败/边界：do_copy 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（rdma_status copy type mismatch），不保留部分有效快照。
   virtual function void do_copy(uvm_object rhs);
     rdma_status source;
     super.do_copy(rhs);
@@ -70,10 +68,9 @@ class rdma_status extends uvm_object;
     message = source.message;
   endfunction
 
-  // 功能：处理 make：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 code, message 用于执行 make；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：make 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：在 rdma_status 中，make 创建新的 rdma_status 值并填充 category、code、severity 和诊断消息，不修改调用方对象。
+  // 输入/输出及副作用：code（输入）、message（输入）；make 读取 code、message 并使用字段 status、status.category、status.code、status.hardware_code、status.hardware_code_valid、status.source_engine、status.function_uid、status.generation；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：make 下游操作失败时原样传播其 status/result，不伪造成功；该路径不隐式重试，也不转移未声明资源。
   static function automatic rdma_status make(
     rdma_status_code_e code,
     string message = ""
@@ -98,26 +95,23 @@ class rdma_status extends uvm_object;
     return status;
   endfunction
 
-  // 功能：把输入错误或注入故障转换成统一的 rdma_status，供上层沿原事务路径处理。
-  // 输入/输出及副作用：输入为错误消息、错误码或故障证据；返回统一 rdma_status，不推进事务游标。
-  //   空消息仍需保留错误类别；未知错误码不得被静默转换为成功。
-  // 失败/边界：错误路径不能返回成功状态；消息和错误码缺失时仍须保留可诊断类别。
+  // 功能：在 rdma_status 中，success 把错误消息、硬件码或注入故障封装为统一 rdma_status，保留原事务的诊断证据。
+  // 输入/输出及副作用：message（输入）；success 读取 message 并使用输入参数和固定枚举/常量；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：success 的结果直接由 return make(RDMA_SC_OK, message) 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   static function automatic rdma_status success(string message = "");
     return make(RDMA_SC_OK, message);
   endfunction
 
-  // 功能：将当前对象的类型、状态或关键标识转换为调用方可消费的值，不产生外部副作用。
-  // 输入/输出及副作用：输入为当前对象状态；返回字符串、枚举或只读派生值，不修改对象。
-  //   对象未配置时返回可识别的 UNKNOWN/UNCONFIGURED 表示。
-  // 失败/边界：未配置或字段无效时返回明确的 UNKNOWN 表示，不读取未初始化句柄。
+  // 功能：ok 按函数体读取当前字段并生成 bit 结果，供调用方进行诊断或分支决策；不修改外部资源。
+  // 输入/输出及副作用：无显式参数；ok 读取固定返回值或局部计算结果，不使用对象成员字段；函数返回 bit，不取得调用方资源所有权。
+  // 失败/边界：枚举未定义或对象未配置时返回 UNKNOWN/UNCONFIGURED 表示，同时保留数值上下文。
   function bit ok();
     return code == RDMA_SC_OK;
   endfunction
 
-  // 功能：处理 category_for：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 code 用于执行 category_for；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：category_for 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：在 rdma_status 中，category_for 把输入枚举或资源类型映射成对应的状态类别、执行引擎、opcode 或生命周期策略。
+  // 输入/输出及副作用：code（输入）；category_for 读取 code 并使用输入参数和固定枚举/常量；函数返回 rdma_status_category_e，不取得调用方资源所有权。
+  // 失败/边界：category_for 的结果直接由 return RDMA_STATUS_STATE 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   static function automatic rdma_status_category_e category_for(
     rdma_status_code_e code
   );
@@ -155,10 +149,9 @@ class rdma_status extends uvm_object;
     endcase
   endfunction
 
-  // 功能：将当前对象的类型、状态或关键标识转换为调用方可消费的值，不产生外部副作用。
-  // 输入/输出及副作用：输入为当前对象状态；返回字符串、枚举或只读派生值，不修改对象。
-  //   对象未配置时返回可识别的 UNKNOWN/UNCONFIGURED 表示。
-  // 失败/边界：未配置或字段无效时返回明确的 UNKNOWN 表示，不读取未初始化句柄。
+  // 功能：convert2string 把 当前对象字段 与当前对象的身份/状态字段编码为稳定文本，供日志、查找或恢复索引使用。
+  // 输入/输出及副作用：无显式参数；无显式输入；返回 string，只读取对象字段，不修改模型或资源账本。
+  // 失败/边界：枚举未定义或对象未配置时返回 UNKNOWN/UNCONFIGURED 表示，同时保留数值上下文。
   virtual function string convert2string();
     string category_text;
     string code_text;

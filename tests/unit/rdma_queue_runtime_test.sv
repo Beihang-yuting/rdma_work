@@ -9,19 +9,17 @@
 class rdma_queue_runtime_test extends uvm_test;
   `uvm_component_utils(rdma_queue_runtime_test)
 
-  // 功能：构造当前对象并初始化其字段、集合和 UVM 名称；不接管传入句柄的生命周期。
-  // 输入/输出及副作用：name 仅用于 UVM 对象命名；内部字段被初始化为安全默认值，传入句柄不转移所有权。
-  //   返回新对象实例；构造失败由 UVM 工厂或调用方处理。
-  // 失败/边界：不创建外部资源；name 为空时仍允许构造，但所有字段必须保持可配置的初始值。
+  // 功能：构造 rdma_queue_runtime_test，调用 super.new 建立 UVM 层级对象；外部依赖字段保持未绑定，后续由 configure/build/activate 明确注入。
+  // 输入/输出及副作用：name、parent（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_queue_runtime_test 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_queue_runtime_test",
                uvm_component parent = null);
     super.new(name, parent);
   endfunction
 
-  // 功能：处理 queue_handle：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 name, kind, object_id 用于执行 queue_handle；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：queue_handle 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：在 rdma_queue_runtime_test 中，queue_handle 构造或投影带完整 kind、Function UID、object ID 和 generation 的资源句柄。
+  // 输入/输出及副作用：name（输入）、kind（输入）、object_id（输入）；queue_handle 读取 name、kind、object_id 并使用字段 result、result.kind、result.function_uid、result.object_id、result.generation；函数返回 rdma_handle，不取得调用方资源所有权。
+  // 失败/边界：queue_handle 下游操作失败时原样传播其 status/result，不伪造成功；该路径不隐式重试，也不转移未声明资源。
   function automatic rdma_handle queue_handle(
     string name,
     rdma_resource_kind_e kind,
@@ -36,20 +34,18 @@ class rdma_queue_runtime_test extends uvm_test;
     return result;
   endfunction
 
-  // 功能：在测试中检查调用结果、状态码和副作用是否符合契约；失败时报告可定位的验证信息。
-  // 输入/输出及副作用：参数 label, status 用于执行 expect_ok；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：测试前置对象缺失时应报告断言错误并停止依赖该对象的后续检查。
+  // 功能：在 rdma_queue_runtime_test 中，expect_ok 在测试中执行 expect_ok 断言，比较输入结果与期望状态并报告可定位的失败信息。
+  // 输入/输出及副作用：label（输入）、status（输入）；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：测试函数 expect_ok 缺少前置对象时报告断言错误，并停止依赖该对象的后续检查。
   function automatic void expect_ok(string label, rdma_status status);
     if (status == null || !status.ok())
       `uvm_error(label, status == null ? "null status" :
                  status.convert2string())
   endfunction
 
-  // 功能：在测试中检查调用结果、状态码和副作用是否符合契约；失败时报告可定位的验证信息。
-  // 输入/输出及副作用：参数 label, status, code 用于执行 expect_code；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：测试前置对象缺失时应报告断言错误并停止依赖该对象的后续检查。
+  // 功能：在 rdma_queue_runtime_test 中，expect_code 在测试中执行 expect_code 断言，比较输入结果与期望状态并报告可定位的失败信息。
+  // 输入/输出及副作用：label（输入）、status（输入）、code（输入）；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：测试函数 expect_code 缺少前置对象时报告断言错误，并停止依赖该对象的后续检查。
   function automatic void expect_code(
     string label,
     rdma_status status,
@@ -60,10 +56,9 @@ class rdma_queue_runtime_test extends uvm_test;
                  status.convert2string())
   endfunction
 
-  // 功能：驱动 UVM 阶段中的场景初始化、事务执行和断言收尾，并在退出前释放 objection 或测试资源。
-  // 输入/输出及副作用：phase 控制 UVM 调度；task 驱动事务、断言和 objection，测试 fixture 由本层负责清理。
-  //   阶段提前结束或前置 setup 失败时必须释放 objection 并停止后续访问。
-  // 失败/边界：setup 失败或阶段被终止时停止新增事务，确保 objection、临时对象和外部引用按测试生命周期收尾。
+  // 功能：在 rdma_queue_runtime_test 中，run_phase 驱动 UVM 阶段中的场景初始化、事务执行和断言收尾，并在退出前释放 objection 或测试资源。
+  // 输入/输出及副作用：phase（输入）；phase 由 UVM 提供；task 通过 objection、日志和断言暴露结果，可能调用 DUT 接口但不改变其所有权规则。
+  // 失败/边界：run_phase 的 setup/阶段驱动失败时停止新增事务，并按测试生命周期清理 objection 与临时引用。
   task run_phase(uvm_phase phase);
     rdma_queue_runtime runtime;
     rdma_queue_cursor_snapshot reservation;

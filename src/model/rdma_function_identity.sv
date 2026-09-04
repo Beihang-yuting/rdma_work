@@ -15,10 +15,9 @@ class rdma_function_identity extends uvm_object;
   int unsigned generation;
   rdma_reset_epoch_t reset_epoch;
 
-  // 功能：构造当前对象并初始化其字段、集合和 UVM 名称；不接管传入句柄的生命周期。
-  // 输入/输出及副作用：name 仅用于 UVM 对象命名；内部字段被初始化为安全默认值，传入句柄不转移所有权。
-  //   返回新对象实例；构造失败由 UVM 工厂或调用方处理。
-  // 失败/边界：不创建外部资源；name 为空时仍允许构造，但所有字段必须保持可配置的初始值。
+  // 功能：构造 rdma_function_identity，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：key='0；global_function_id=0；function_uid=0；generation=0；reset_epoch=0。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_function_identity 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_function_identity");
     super.new(name);
     key = '0;
@@ -28,10 +27,10 @@ class rdma_function_identity extends uvm_object;
     reset_epoch = 0;
   endfunction
 
-  // 功能：校验依赖并建立该对象的运行边界，成功后保存必要的非拥有引用；拒绝不完整或重复配置。
-  // 输入/输出及副作用：接收 manager、binding、router 或 profile 等依赖；成功后保存非拥有引用并更新配置状态。
-  //   任一依赖为空、重复配置或代际不匹配时保持原状态并返回错误。
-  // 失败/边界：配置失败不得写入半成品引用；已激活对象不得被无条件降级或重复占用资源。
+  // 功能：在 rdma_function_identity 中，configure 校验依赖和 binding 后建立运行边界，只保存非拥有引用并拒绝重复配置。
+  // 输入/输出及副作用：new_key（输入）、new_global_id（输入）、new_uid（输入）、new_generation（输入）、new_reset_epoch（输入）；configure 先依据 依赖存在性、authority 和 generation 条件 校验 new_key、new_global_id、new_uid、new_generation、new_reset_epoch；成功时更新本对象配置/状态并保存非拥有引用，返回
+  //   rdma_status。
+  // 失败/边界：实现中的空依赖、重复登记、状态或 generation/authority 校验失败时返回错误；失败时保留旧配置。
   function rdma_status configure(
     rdma_function_key_t new_key,
     int unsigned new_global_id,
@@ -47,20 +46,18 @@ class rdma_function_identity extends uvm_object;
     return validate();
   endfunction
 
-  // 功能：处理 route_key：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 无显式输入参数 用于执行 route_key；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：route_key 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：在 rdma_function_identity 中，route_key 把 Function/对象身份、代际和游标字段拼成稳定的查找键，供登记表去重和恢复路由使用。
+  // 输入/输出及副作用：无显式参数；返回 detached route key，不修改 identity 或外部路由表。
+  // 失败/边界：目标不存在、route/authority 不匹配或快照代际失效时返回错误/空值；不得返回陈旧或歧义条目。
   function rdma_route_key_t route_key();
     // 中文：route_key 只是值投影；调用方必须先通过 validate()，无效 key
     // 投影出来的 route 不得被 router 接受。
     return rdma_route_key_from_function(key);
   endfunction
 
-  // 功能：比较两个输入对象的协议字段或身份快照并返回确定的相等性结果，不修改任一输入。
-  // 输入/输出及副作用：输入为待比较的两个值对象；返回 bit/状态结果，不修改任一输入或外部账本。
-  //   任一对象为空、类型不符或字段未初始化时按接口约定返回不相等或错误。
-  // 失败/边界：比较输入为空或类型不符时不得抛出未处理异常；结果必须保持确定且无副作用。
+  // 功能：在 rdma_function_identity 中由 same_function 逐字段比较输入值，返回结构、身份或序列化内容是否一致。
+  // 输入/输出及副作用：rhs（输入）；lhs/rhs 只读，返回 bit，不更新 authority 或资源账本。
+  // 失败/边界：same_function 的任一比较对象为空或类型不符时返回确定的 false/不等结果，不抛出未处理异常。
   function bit same_function(rdma_function_identity rhs);
     if (rhs == null) return 1'b0;
     // Compare packed key members explicitly; some simulators reject packed
@@ -81,20 +78,18 @@ class rdma_function_identity extends uvm_object;
            global_function_id == rhs.global_function_id;
   endfunction
 
-  // 功能：比较两个输入对象的协议字段或身份快照并返回确定的相等性结果，不修改任一输入。
-  // 输入/输出及副作用：输入为待比较的两个值对象；返回 bit/状态结果，不修改任一输入或外部账本。
-  //   任一对象为空、类型不符或字段未初始化时按接口约定返回不相等或错误。
-  // 失败/边界：比较输入为空或类型不符时不得抛出未处理异常；结果必须保持确定且无副作用。
+  // 功能：在 rdma_function_identity 中由 same_incarnation 逐字段比较输入值，返回结构、身份或序列化内容是否一致。
+  // 输入/输出及副作用：rhs（输入）；两份 identity 只读，返回 bit，不修改 reset ledger。
+  // 失败/边界：same_incarnation 的任一比较对象为空或类型不符时返回确定的 false/不等结果，不抛出未处理异常。
   function bit same_incarnation(rdma_function_identity rhs);
     if (!same_function(rhs)) return 1'b0;
     return function_uid == rhs.function_uid &&
            generation == rhs.generation && reset_epoch == rhs.reset_epoch;
   endfunction
 
-  // 功能：检查输入字段、身份和生命周期约束，返回可诊断的校验状态；失败时不提交部分更新。
-  // 输入/输出及副作用：输入为待校验字段或快照；返回 rdma_status，校验过程不提交资源和游标。
-  //   空依赖、非法范围、身份不一致或非活动状态会返回错误。
-  // 失败/边界：任何非法枚举、越界字段、缺失必需依赖或身份/代际不一致都必须返回非成功状态。
+  // 功能：validate 校验 当前对象字段 与当前对象状态的一致性，并显式处理“Function UID must be non-zero”等拒绝条件，返回 rdma_status 供上层决定是否提交。
+  // 输入/输出及副作用：无显式参数；validate 读取 对象字段：rdma_status、function_uid、generation、key 并使用字段 rdma_status、function_uid、generation、key；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：validate 返回 RDMA_SC_INVALID_ARGUMENT；典型拒绝条件为“Function UID must be non-zero”“Function generation must be non-zero”；失败路径不提交部分状态或转移未声明资源。
   function rdma_status validate();
     if (function_uid == 0)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
@@ -108,10 +103,9 @@ class rdma_function_identity extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：从源对象复制可变字段并生成独立值快照；源对象保持不变，类型不匹配时报告复制错误。
-  // 输入/输出及副作用：source/rhs 是源对象；返回或写入独立副本，不修改源对象。
-  //   source/rhs 为空或类型不匹配时返回空值或触发既定复制错误。
-  // 失败/边界：空源对象不应解引用；类型不匹配必须拒绝复制或按既定 UVM 规则报告 fatal。
+  // 功能：将 rhs 中 rdma_function_identity 的值字段复制到当前对象，建立与源对象隔离的快照。
+  // 输入/输出及副作用：rhs（输入）；rhs 是源对象；当前对象字段会被覆盖，嵌套句柄按实现执行 clone 或保持非拥有引用，源对象不被修改。
+  // 失败/边界：do_copy 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（Function identity copy type mismatch），不保留部分有效快照。
   virtual function void do_copy(uvm_object rhs);
     rdma_function_identity source;
     super.do_copy(rhs);

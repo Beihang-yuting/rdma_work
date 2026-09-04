@@ -16,10 +16,9 @@ class rdma_doorbell_blocking_pcie extends rdma_mock_pcie;
   bit release_barrier;
   int unsigned blocked_call_count;
 
-  // 功能：构造当前对象并初始化其字段、集合和 UVM 名称；不接管传入句柄的生命周期。
-  // 输入/输出及副作用：name 仅用于 UVM 对象命名；内部字段被初始化为安全默认值，传入句柄不转移所有权。
-  //   返回新对象实例；构造失败由 UVM 工厂或调用方处理。
-  // 失败/边界：不创建外部资源；name 为空时仍允许构造，但所有字段必须保持可配置的初始值。
+  // 功能：构造 rdma_doorbell_blocking_pcie，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：blocked_function_uid=0；blocked_method="dma_visibility_barrier"；block_enabled=1'b0；barrier_entered=1'b0；release_barrier=1'b0；blocked_call_count=0。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_doorbell_blocking_pcie 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_doorbell_blocking_pcie");
     super.new(name);
     blocked_function_uid = 0;
@@ -30,10 +29,9 @@ class rdma_doorbell_blocking_pcie extends rdma_mock_pcie;
     blocked_call_count = 0;
   endfunction
 
-  // 功能：处理 block_selected_call：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 method_name, function_h 用于执行 block_selected_call；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：block_selected_call 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：在 rdma_doorbell_blocking_pcie 中，block_selected_call 在测试指定的 PCIe 调用点阻塞，直到 release 事件到达，以验证并发截止时间和顺序保证。
+  // 输入/输出及副作用：method_name（输入）、function_h（输入）；block_selected_call 驱动下游事务；函数返回 无直接返回值，不取得调用方资源所有权。
+  // 失败/边界：block_selected_call 异常完成由下游接口或 UVM 报告机制发布；该路径不隐式重试，也不转移未声明资源。
   protected task block_selected_call(
     string method_name,
     rdma_function_handle function_h
@@ -47,10 +45,9 @@ class rdma_doorbell_blocking_pcie extends rdma_mock_pcie;
     end
   endtask
 
-  // 功能：处理 dma_visibility_barrier：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 function_h, status 用于执行 dma_visibility_barrier；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：dma_visibility_barrier 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：在 rdma_doorbell_blocking_pcie 中，dma_visibility_barrier 在截止时间内执行 DMA 可见性或 MMIO 顺序屏障，确保 doorbell 之前的数据写入已按序可见。
+  // 输入/输出及副作用：function_h（输入）、status（输出）；dma_visibility_barrier 驱动下游事务，并写入 status；函数返回 无直接返回值，不取得调用方资源所有权。
+  // 失败/边界：dma_visibility_barrier 失败或超时通过 status 明确发布；该路径不隐式重试，也不转移未声明资源。
   virtual task dma_visibility_barrier(
     rdma_function_handle function_h,
     output rdma_status status
@@ -64,10 +61,9 @@ class rdma_doorbell_blocking_pcie extends rdma_mock_pcie;
     status = rdma_status::success();
   endtask
 
-  // 功能：处理 mmio_ordering_barrier：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 function_h, status 用于执行 mmio_ordering_barrier；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：mmio_ordering_barrier 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：在 rdma_doorbell_blocking_pcie 中，mmio_ordering_barrier 在截止时间内执行 DMA 可见性或 MMIO 顺序屏障，确保 doorbell 之前的数据写入已按序可见。
+  // 输入/输出及副作用：function_h（输入）、status（输出）；mmio_ordering_barrier 驱动下游事务，并写入 status；函数返回 无直接返回值，不取得调用方资源所有权。
+  // 失败/边界：mmio_ordering_barrier 失败或超时通过 status 明确发布；该路径不隐式重试，也不转移未声明资源。
   virtual task mmio_ordering_barrier(
     rdma_function_handle function_h,
     output rdma_status status
@@ -81,10 +77,9 @@ class rdma_doorbell_blocking_pcie extends rdma_mock_pcie;
     status = rdma_status::success();
   endtask
 
-  // 功能：向指定后端写入请求数据并保留返回状态；写入失败时不推进本地提交游标。
-  // 输入/输出及副作用：参数 function_h, address, data, status 用于执行 mmio_write；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：后端拒绝或写入范围越界时不推进本地提交游标，也不伪造成功状态。
+  // 功能：在 rdma_doorbell_blocking_pcie 中，mmio_write 把请求数据写入指定后端并保留返回状态；只有写入成功才允许本地游标继续推进。
+  // 输入/输出及副作用：function_h（输入）、address（输入）、data（输入）、status（输出）；mmio_write 驱动下游事务，并写入 status；函数返回 无直接返回值，不取得调用方资源所有权。
+  // 失败/边界：mmio_write 遇到后端拒绝、范围溢出或 DMA 权限不足时保留失败证据，不推进本地游标。
   virtual task mmio_write(
     rdma_function_handle function_h,
     rdma_bar_addr_t address,
@@ -104,19 +99,17 @@ endclass
 class rdma_doorbell_scheduler_test extends uvm_test;
   `uvm_component_utils(rdma_doorbell_scheduler_test)
 
-  // 功能：构造当前对象并初始化其字段、集合和 UVM 名称；不接管传入句柄的生命周期。
-  // 输入/输出及副作用：name 仅用于 UVM 对象命名；内部字段被初始化为安全默认值，传入句柄不转移所有权。
-  //   返回新对象实例；构造失败由 UVM 工厂或调用方处理。
-  // 失败/边界：不创建外部资源；name 为空时仍允许构造，但所有字段必须保持可配置的初始值。
+  // 功能：构造 rdma_doorbell_scheduler_test，调用 super.new 建立 UVM 层级对象；外部依赖字段保持未绑定，后续由 configure/build/activate 明确注入。
+  // 输入/输出及副作用：name、parent（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_doorbell_scheduler_test 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_doorbell_scheduler_test",
                uvm_component parent = null);
     super.new(name, parent);
   endfunction
 
-  // 功能：在测试中检查调用结果、状态码和副作用是否符合契约；失败时报告可定位的验证信息。
-  // 输入/输出及副作用：参数 label, status, expected 用于执行 expect_status；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：测试前置对象缺失时应报告断言错误并停止依赖该对象的后续检查。
+  // 功能：在 rdma_doorbell_scheduler_test 中，expect_status 在测试中执行 expect_status 断言，比较输入结果与期望状态并报告可定位的失败信息。
+  // 输入/输出及副作用：label（输入）、status（输入）、expected（输入）；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：测试函数 expect_status 缺少前置对象时报告断言错误，并停止依赖该对象的后续检查。
   function automatic void expect_status(
     string label,
     rdma_status status,
@@ -132,10 +125,10 @@ class rdma_doorbell_scheduler_test extends uvm_test;
                            status.code.name(), status.convert2string()))
   endfunction
 
-  // 功能：依据输入请求创建对应的值对象或资源计划，并校验依赖、所有权和生命周期后返回结果。
-  // 输入/输出及副作用：输入请求、容量和依赖用于构造/预留资源；返回独立对象或状态，不暴露内部可变集合。
-  //   参数越界、容量不足或构造中途失败时回滚已登记的局部状态。
-  // 失败/边界：依赖为空、参数越界、容量不足或构造步骤失败时清理局部结果并返回明确错误。
+  // 功能：make_binding 创建独立的 rdma_function_binding；根据 name、function_uid、function_id、generation、bar_base 设置字段 binding、binding.function_uid、binding.global_function_id、binding.generation、pcie.bdf、base.value、size、enabled、binding.notify_bar_id、notify_base.value，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：name（输入）、function_uid（输入）、function_id（输入）、generation（输入）、bar_base（输入）；输入字段被复制到返回值或
+  //   output；生成结果与输入隔离，不隐式修改调用方对象。
+  // 失败/边界：make_binding 的结果直接由 return binding 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function automatic rdma_function_binding make_binding(
     string name,
     longint unsigned function_uid,
@@ -193,10 +186,9 @@ class rdma_doorbell_scheduler_test extends uvm_test;
     return binding;
   endfunction
 
-  // 功能：依据输入请求创建对应的值对象或资源计划，并校验依赖、所有权和生命周期后返回结果。
-  // 输入/输出及副作用：输入请求、容量和依赖用于构造/预留资源；返回独立对象或状态，不暴露内部可变集合。
-  //   参数越界、容量不足或构造中途失败时回滚已登记的局部状态。
-  // 失败/边界：依赖为空、参数越界、容量不足或构造步骤失败时清理局部结果并返回明确错误。
+  // 功能：make_target 创建独立的 rdma_handle；根据 name、function_h、kind、object_id 设置字段 target、target.kind、target.function_uid、target.object_id、target.generation，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：name（输入）、function_h（输入）、kind（输入）、object_id（输入）；make_target 读取 name、function_h、kind、object_id 并使用字段 target、target.kind、target.function_uid、target.object_id、target.generation；函数返回 rdma_handle，不取得调用方资源所有权。
+  // 失败/边界：make_target 的结果直接由 return target 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function automatic rdma_handle make_target(
     string name,
     rdma_function_handle function_h,
@@ -212,10 +204,10 @@ class rdma_doorbell_scheduler_test extends uvm_test;
     return target;
   endfunction
 
-  // 功能：依据输入请求创建对应的值对象或资源计划，并校验依赖、所有权和生命周期后返回结果。
-  // 输入/输出及副作用：输入请求、容量和依赖用于构造/预留资源；返回独立对象或状态，不暴露内部可变集合。
-  //   参数越界、容量不足或构造中途失败时回滚已登记的局部状态。
-  // 失败/边界：依赖为空、参数越界、容量不足或构造步骤失败时清理局部结果并返回明确错误。
+  // 功能：make_image 根据 name、function_h、relative_offset、payload、target_kind 生成或检查硬件镜像字段，保持布局、端序和保留位约束一致。
+  // 输入/输出及副作用：name（输入）、function_h（输入）、relative_offset（输入）、payload（输入）、target_kind（输入）；输入字段被复制到返回值或
+  //   output；生成结果与输入隔离，不隐式修改调用方对象。
+  // 失败/边界：make_image 先检查 target_kind == RDMA_HW_TARGET_BAR，再返回 image；拒绝分支不提交部分状态，也不隐式重试。
   function automatic rdma_hw_image make_image(
     string name,
     rdma_function_handle function_h,
@@ -238,10 +230,9 @@ class rdma_doorbell_scheduler_test extends uvm_test;
     return image;
   endfunction
 
-  // 功能：依据输入请求创建对应的值对象或资源计划，并校验依赖、所有权和生命周期后返回结果。
-  // 输入/输出及副作用：输入请求、容量和依赖用于构造/预留资源；返回独立对象或状态，不暴露内部可变集合。
-  //   参数越界、容量不足或构造中途失败时回滚已登记的局部状态。
-  // 失败/边界：依赖为空、参数越界、容量不足或构造步骤失败时清理局部结果并返回明确错误。
+  // 功能：make_desc 创建独立的 rdma_doorbell_desc；根据 name、binding 设置字段 desc、function_h、desc.kind、desc.function_h、desc.target_h、desc.notify_bar_id、desc.relative_offset、desc.width、desc.endian、desc.payload_image，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：name（输入）、binding（输入）；make_desc 读取 name、binding 并使用字段 desc、function_h、desc.kind、desc.function_h、desc.target_h、desc.notify_bar_id、desc.relative_offset、desc.width；函数返回 rdma_doorbell_desc，不取得调用方资源所有权。
+  // 失败/边界：make_desc 的结果直接由 return desc 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function automatic rdma_doorbell_desc make_desc(
     string name,
     rdma_function_binding binding
@@ -272,10 +263,10 @@ class rdma_doorbell_scheduler_test extends uvm_test;
     return desc;
   endfunction
 
-  // 功能：依据输入请求创建对应的值对象或资源计划，并校验依赖、所有权和生命周期后返回结果。
-  // 输入/输出及副作用：输入请求、容量和依赖用于构造/预留资源；返回独立对象或状态，不暴露内部可变集合。
-  //   参数越界、容量不足或构造中途失败时回滚已登记的局部状态。
-  // 失败/边界：依赖为空、参数越界、容量不足或构造步骤失败时清理局部结果并返回明确错误。
+  // 功能：make_dependency 创建独立的 rdma_doorbell_dependency；根据 name、dependency_id、stage、mapping、relative_offset、function_h、value 设置字段 payload、dependency、dependency.dependency_id、dependency.stage、dependency.mapping、dependency.relative_offset、dependency.image、dependency.ready，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：name（输入）、dependency_id（输入）、stage（输入）、mapping（输入）、relative_offset（输入）、function_h（输入）、value（输入）；输入字段被复制到返回值或
+  //   output；生成结果与输入隔离，不隐式修改调用方对象。
+  // 失败/边界：make_dependency 的结果直接由 return dependency 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function automatic rdma_doorbell_dependency make_dependency(
     string name,
     longint unsigned dependency_id,
@@ -300,10 +291,9 @@ class rdma_doorbell_scheduler_test extends uvm_test;
     return dependency;
   endfunction
 
-  // 功能：处理 add_two_dependencies：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 desc, mapping, function_h 用于执行 add_two_dependencies；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：add_two_dependencies 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：在 rdma_doorbell_scheduler_test 中，add_two_dependencies 将输入对象登记或挂接到当前集合/依赖图，并同步维护对应账本和生命周期引用。
+  // 输入/输出及副作用：desc（输入）、mapping（输入）、function_h（输入）；add_two_dependencies 可能更新本对象明确拥有的状态；函数返回 void，不取得调用方资源所有权。
+  // 失败/边界：add_two_dependencies 无返回值，仅执行 queue_dependency=make_dependency(、payload_dependency=make_dependency(；调用方须保证前置依赖已经绑定，函数不自动重试或接管外部资源。
   function automatic void add_two_dependencies(
     rdma_doorbell_desc desc,
     rdma_dma_mapping mapping,
@@ -325,10 +315,9 @@ class rdma_doorbell_scheduler_test extends uvm_test;
     desc.dependencies.push_back(payload_dependency);
   endfunction
 
-  // 功能：按资源所有权和幂等规则释放或清理记录；重复释放不会再次扣减 credit，也不触碰已隔离资源。
-  // 输入/输出及副作用：输入为待解除或释放的 handle/key；成功后隔离或删除本对象记录，外部拥有者仍负责真正销毁。
-  //   空值、未知记录或重复调用按接口约定返回错误或幂等成功。
-  // 失败/边界：不得释放非本对象所有资源；重复解除按幂等约定处理，旧 handle 不得重新激活。
+  // 功能：在 rdma_doorbell_scheduler_test 中，clear_observation 按 owner、generation 和幂等规则释放/隔离记录，并同步删除其账本引用。
+  // 输入/输出及副作用：mem（输入）、pcie（输入）、trace（输入）；输入 action/epoch/handle 决定迁移目标；成功时更新状态或恢复证据，外部资源仍由其拥有者管理。
+  // 失败/边界：clear_observation 发现 owner/generation 不匹配、记录未知或重复释放时返回错误或幂等结果，不重新激活旧句柄。
   function automatic void clear_observation(
     rdma_mock_host_mem mem,
     rdma_mock_pcie pcie,
@@ -339,10 +328,9 @@ class rdma_doorbell_scheduler_test extends uvm_test;
     trace.clear();
   endfunction
 
-  // 功能：在测试中检查调用结果、状态码和副作用是否符合契约；失败时报告可定位的验证信息。
-  // 输入/输出及副作用：参数 label, mem, pcie, trace 用于执行 expect_no_side_effects；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：测试前置对象缺失时应报告断言错误并停止依赖该对象的后续检查。
+  // 功能：在 rdma_doorbell_scheduler_test 中，expect_no_side_effects 在测试中执行 expect_no_side_effects 断言，比较输入结果与期望状态并报告可定位的失败信息。
+  // 输入/输出及副作用：label（输入）、mem（输入）、pcie（输入）、trace（输入）；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：测试函数 expect_no_side_effects 缺少前置对象时报告断言错误，并停止依赖该对象的后续检查。
   function automatic void expect_no_side_effects(
     string label,
     rdma_mock_host_mem mem,
@@ -354,10 +342,10 @@ class rdma_doorbell_scheduler_test extends uvm_test;
       `uvm_error(label, "preflight failure caused adapter side effects")
   endfunction
 
-  // 功能：在测试中检查调用结果、状态码和副作用是否符合契约；失败时报告可定位的验证信息。
-  // 输入/输出及副作用：参数 label, scheduler, binding, desc, expected, mem, pcie, trace 用于执行 expect_rejected；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：测试前置对象缺失时应报告断言错误并停止依赖该对象的后续检查。
+  // 功能：在 rdma_doorbell_scheduler_test 中，expect_rejected 在测试中执行 expect_rejected 断言，比较输入结果与期望状态并报告可定位的失败信息。
+  // 输入/输出及副作用：label（输入）、scheduler（输入）、binding（输入）、desc（输入）、expected（输入）、mem（输入）、pcie（输入）、trace（输入）；fixture/输入由测试调用方提供；执行时会产生
+  //   UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：测试函数 expect_rejected 缺少前置对象时报告断言错误，并停止依赖该对象的后续检查。
   task automatic expect_rejected(
     string label,
     rdma_doorbell_scheduler scheduler,
@@ -379,10 +367,9 @@ class rdma_doorbell_scheduler_test extends uvm_test;
     expect_no_side_effects(label, mem, pcie, trace);
   endtask
 
-  // 功能：在测试中检查调用结果、状态码和副作用是否符合契约；失败时报告可定位的验证信息。
-  // 输入/输出及副作用：参数 label, trace, expected 用于执行 expect_trace；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：测试前置对象缺失时应报告断言错误并停止依赖该对象的后续检查。
+  // 功能：在 rdma_doorbell_scheduler_test 中，expect_trace 在测试中执行 expect_trace 断言，比较输入结果与期望状态并报告可定位的失败信息。
+  // 输入/输出及副作用：label（输入）、trace（输入）、expected（输入）；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：测试函数 expect_trace 缺少前置对象时报告断言错误，并停止依赖该对象的后续检查。
   function automatic void expect_trace(
     string label,
     rdma_mock_call_trace trace,
@@ -402,10 +389,9 @@ class rdma_doorbell_scheduler_test extends uvm_test;
     end
   endfunction
 
-  // 功能：在测试中检查调用结果、状态码和副作用是否符合契约；失败时报告可定位的验证信息。
-  // 输入/输出及副作用：参数 label, scheduler, binding 用于执行 expect_recovery_submit；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：测试前置对象缺失时应报告断言错误并停止依赖该对象的后续检查。
+  // 功能：在 rdma_doorbell_scheduler_test 中，expect_recovery_submit 在测试中执行 expect_recovery_submit 断言，比较输入结果与期望状态并报告可定位的失败信息。
+  // 输入/输出及副作用：label（输入）、scheduler（输入）、binding（输入）；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：测试函数 expect_recovery_submit 缺少前置对象时报告断言错误，并停止依赖该对象的后续检查。
   task automatic expect_recovery_submit(
     string label,
     rdma_doorbell_scheduler scheduler,
@@ -422,10 +408,10 @@ class rdma_doorbell_scheduler_test extends uvm_test;
       `uvm_error(label, "same-Function recovery did not publish a result")
   endtask
 
-  // 功能：检查输入字段、身份和生命周期约束，返回可诊断的校验状态；失败时不提交部分更新。
-  // 输入/输出及副作用：输入为待校验字段或快照；返回 rdma_status，校验过程不提交资源和游标。
-  //   空依赖、非法范围、身份不一致或非活动状态会返回错误。
-  // 失败/边界：任何非法枚举、越界字段、缺失必需依赖或身份/代际不一致都必须返回非成功状态。
+  // 功能：在测试辅助 rdma_doorbell_scheduler_test.check_value_clone_contracts 中构造或驱动“value clone contracts”场景，并断言 DUT
+  //   的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：binding（输入）、allocated_mapping（输入）；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：必需对象/句柄/快照为空，或身份、范围、generation 和生命周期检查失败时返回非成功状态。
   task automatic check_value_clone_contracts(
     rdma_function_binding binding,
     rdma_dma_mapping allocated_mapping
@@ -608,10 +594,9 @@ class rdma_doorbell_scheduler_test extends uvm_test;
     end
   endtask
 
-  // 功能：驱动 UVM 阶段中的场景初始化、事务执行和断言收尾，并在退出前释放 objection 或测试资源。
-  // 输入/输出及副作用：phase 控制 UVM 调度；task 驱动事务、断言和 objection，测试 fixture 由本层负责清理。
-  //   阶段提前结束或前置 setup 失败时必须释放 objection 并停止后续访问。
-  // 失败/边界：setup 失败或阶段被终止时停止新增事务，确保 objection、临时对象和外部引用按测试生命周期收尾。
+  // 功能：在 rdma_doorbell_scheduler_test 中，run_phase 驱动 UVM 阶段中的场景初始化、事务执行和断言收尾，并在退出前释放 objection 或测试资源。
+  // 输入/输出及副作用：phase（输入）；phase 由 UVM 提供；task 通过 objection、日志和断言暴露结果，可能调用 DUT 接口但不改变其所有权规则。
+  // 失败/边界：run_phase 的 setup/阶段驱动失败时停止新增事务，并按测试生命周期清理 objection 与临时引用。
   task run_phase(uvm_phase phase);
     rdma_mock_call_trace trace;
     rdma_mock_host_mem mem;

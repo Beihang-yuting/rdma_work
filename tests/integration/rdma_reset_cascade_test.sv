@@ -9,11 +9,15 @@ class rdma_reset_test_device_snapshot extends dpu_device_snapshot;
   `uvm_object_utils(rdma_reset_test_device_snapshot)
 
   // 功能：构造 reset cascade 使用的 dpu_common device snapshot 夹具。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：构造过程不分配 Host-memory、PCIe endpoint 或 manager 资源；空 name 也必须得到可配置对象。
   function new(string name = "rdma_reset_test_device_snapshot");
     super.new(name);
   endfunction
 
   // 功能：为夹具补齐稳定的 global Function ID 并发布冻结状态，使适配器能够读取。
+  // 输入/输出及副作用：无显式参数；force_queryable 读取 对象字段：next_global_id、m_frozen 并使用字段 next_global_id、m_frozen；函数返回 void，不取得调用方资源所有权。
+  // 失败/边界：force_queryable 无返回值，仅执行 next_global_id=1、m_frozen=1'b1；调用方须保证前置依赖已经绑定，函数不自动重试或接管外部资源。
   function void force_queryable();
     int unsigned next_global_id;
     next_global_id = 1;
@@ -29,11 +33,15 @@ class rdma_reset_test_resource_snapshot extends dpu_resource_snapshot;
   `uvm_object_utils(rdma_reset_test_resource_snapshot)
 
   // 功能：构造 reset cascade 使用的 dpu_common resource snapshot 夹具。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：构造过程不分配 Host-memory、PCIe endpoint 或 manager 资源；空 name 也必须得到可配置对象。
   function new(string name = "rdma_reset_test_resource_snapshot");
     super.new(name);
   endfunction
 
   // 功能：绑定 device snapshot 引用并标记资源夹具冻结，供 env coherence 校验使用。
+  // 输入/输出及副作用：device_snapshot（输入）；force_coherent 读取 device_snapshot 并使用字段 m_device_snapshot、m_frozen；函数返回 void，不取得调用方资源所有权。
+  // 失败/边界：force_coherent 无返回值，仅执行 m_device_snapshot=device_snapshot、m_frozen=1'b1；调用方须保证前置依赖已经绑定，函数不自动重试或接管外部资源。
   function void force_coherent(dpu_device_snapshot device_snapshot);
     m_device_snapshot = device_snapshot;
     m_frozen = 1'b1;
@@ -44,12 +52,16 @@ class rdma_reset_cascade_test extends uvm_test;
   `uvm_component_utils(rdma_reset_cascade_test)
 
   // 功能：构造 reset cascade UVM 测试组件；具体拓扑和级联断言在 run_phase() 执行。
+  // 输入/输出及副作用：name、parent（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：构造过程不分配 Host-memory、PCIe endpoint 或 manager 资源；空 name 也必须得到可配置对象。
   function new(string name = "rdma_reset_cascade_test",
                uvm_component parent = null);
     super.new(name, parent);
   endfunction
 
   // 功能：返回指定 Host/PF/VF 的 dpu_common Function key，集中构造拓扑索引。
+  // 输入/输出及副作用：host_id（输入）、pf_id（输入）、kind（输入）、vf_id（输入）；make_key 读取 host_id、pf_id、kind、vf_id 并使用字段 key.host_id、key.pf_id、key.kind、key.vf_id；函数返回 dpu_function_key_t，不取得调用方资源所有权。
+  // 失败/边界：输入为空、类型不匹配或字段组合非法时返回空值/错误；不得发布不完整快照。
   function automatic dpu_function_key_t make_key(
     int unsigned host_id,
     int unsigned pf_id,
@@ -65,7 +77,8 @@ class rdma_reset_cascade_test extends uvm_test;
   endfunction
 
   // 功能：为每个 Function 添加真实 PCIe ID 和三类 BAR，使 reset 测试走完整投影路径。
-  // 边界：夹具构造失败直接报告 fatal，避免在级联断言中掩盖拓扑错误。
+  // 输入/输出及副作用：snapshot（输入）、key（输入）、segment（输入）、bdf（输入）；add_function 驱动下游事务；函数返回 无直接返回值，不取得调用方资源所有权。
+  // 失败/边界：夹具构造失败直接报告 fatal，避免在级联断言中掩盖拓扑错误。
   task automatic add_function(
     rdma_reset_test_device_snapshot snapshot,
     dpu_function_key_t key,
@@ -105,7 +118,8 @@ class rdma_reset_cascade_test extends uvm_test;
   endtask
 
   // 功能：创建 Host0 的 PF0、稀疏 VF2、PF1 和 Host1 的 PF0 拓扑及关联资源快照。
-  // 输出：通过 output 返回冻结且相互引用一致的 device/resource snapshot。
+  // 输入/输出及副作用：device_snapshot（输出）、resource_snapshot（输出）；build_snapshots 驱动下游事务，并写入 device_snapshot、resource_snapshot；函数返回 无直接返回值，不取得调用方资源所有权。
+  // 失败/边界：输入为空、类型不匹配或字段组合非法时返回空值/错误；不得发布不完整快照。
   task automatic build_snapshots(
     output rdma_reset_test_device_snapshot device_snapshot,
     output rdma_reset_test_resource_snapshot resource_snapshot
@@ -130,8 +144,9 @@ class rdma_reset_cascade_test extends uvm_test;
     resource_snapshot.force_coherent(device_snapshot);
   endtask
 
-  // 功能：按 key 读取 env identity 并查询对应 context，统一处理测试查找失败。
-  // 输出：返回 env 持有的 context 引用；失败通过 UVM_ERROR 上报并返回 null。
+  // 功能：在 rdma_reset_cascade_test 中，find_context 按测试 key 查找 env identity 和对应 context，统一把缺失记录转换成可定位的测试失败。
+  // 输入/输出及副作用：env（输入）、key（输入）、identity（输出）；find_context 读取 env、key、identity 并使用字段 identity、status，并写入 identity；函数返回 rdma_function_context，不取得调用方资源所有权。
+  // 失败/边界：find_context 在 key/handle 缺失、记录不唯一或 generation/reset epoch 过期时返回明确错误，不回退到默认 authority。
   function automatic rdma_function_context find_context(
     rdma_device_env env,
     dpu_function_key_t key,
@@ -154,8 +169,9 @@ class rdma_reset_cascade_test extends uvm_test;
   endfunction
 
   // 功能：验证指定 reset 操作后每个 context 的 generation/epoch 是否按范围变化。
-  // 输入：before_gen/before_epoch 是操作前的值；expected_changed 指示是否应递增。
-  // 副作用：只产生 UVM 断言报告，不修改 context。
+  // 输入/输出及副作用：label（输入）、string（输入）、string（输入）、string（输入）、string（输入）；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向
+  //   DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_generation_scope(
     string label,
     rdma_function_context contexts[string],
@@ -189,7 +205,8 @@ class rdma_reset_cascade_test extends uvm_test;
   endtask
 
   // 功能：执行 VF/PF/Host/Device 四级 reset cascade 回归，覆盖多 Host/多 PF/VF 隔离。
-  // 副作用：推进测试对象的 generation/epoch；不发起真实 MMIO、DMA 或 Host-memory 操作。
+  // 输入/输出及副作用：phase（输入）；phase 由 UVM 提供；task 通过 objection、日志和断言暴露结果，可能调用 DUT 接口但不改变其所有权规则。
+  // 失败/边界：仿真超时、事务返回错误或断言不满足时报告 UVM_ERROR/UVM_FATAL；空 fixture 不得被当作成功。
   task run_phase(uvm_phase phase);
     rdma_reset_test_device_snapshot device_snapshot;
     rdma_reset_test_resource_snapshot resource_snapshot;

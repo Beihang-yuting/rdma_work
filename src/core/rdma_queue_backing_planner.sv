@@ -11,35 +11,31 @@ class rdma_queue_backing_planner extends uvm_object;
 
   protected rdma_host_mem_api host_mem;
 
-  // 功能：构造当前对象并初始化其字段、集合和 UVM 名称；不接管传入句柄的生命周期。
-  // 输入/输出及副作用：name 仅用于 UVM 对象命名；内部字段被初始化为安全默认值，传入句柄不转移所有权。
-  //   返回新对象实例；构造失败由 UVM 工厂或调用方处理。
-  // 失败/边界：不创建外部资源；name 为空时仍允许构造，但所有字段必须保持可配置的初始值。
+  // 功能：构造 rdma_queue_backing_planner，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：host_mem=null。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_queue_backing_planner 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_queue_backing_planner");
     super.new(name);
     host_mem = null;
   endfunction
 
-  // 功能：把输入错误或注入故障转换成统一的 rdma_status，供上层沿原事务路径处理。
-  // 输入/输出及副作用：输入为错误消息、错误码或故障证据；返回统一 rdma_status，不推进事务游标。
-  //   空消息仍需保留错误类别；未知错误码不得被静默转换为成功。
-  // 失败/边界：错误路径不能返回成功状态；消息和错误码缺失时仍须保留可诊断类别。
+  // 功能：在 rdma_queue_backing_planner 中，invalid_argument 把错误消息、硬件码或注入故障封装为统一 rdma_status，保留原事务的诊断证据。
+  // 输入/输出及副作用：message（输入）；invalid_argument 读取 message 并使用字段 rdma_status；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：invalid_argument 返回 RDMA_SC_INVALID_ARGUMENT；失败路径不提交部分状态或转移未声明资源。
   protected function rdma_status invalid_argument(string message);
     return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, message);
   endfunction
 
-  // 功能：把输入错误或注入故障转换成统一的 rdma_status，供上层沿原事务路径处理。
-  // 输入/输出及副作用：输入为错误消息、错误码或故障证据；返回统一 rdma_status，不推进事务游标。
-  //   空消息仍需保留错误类别；未知错误码不得被静默转换为成功。
-  // 失败/边界：错误路径不能返回成功状态；消息和错误码缺失时仍须保留可诊断类别。
+  // 功能：在 rdma_queue_backing_planner 中，invalid_state 把错误消息、硬件码或注入故障封装为统一 rdma_status，保留原事务的诊断证据。
+  // 输入/输出及副作用：message（输入）；invalid_state 读取 message 并使用字段 rdma_status；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：invalid_state 返回 RDMA_SC_INVALID_STATE；失败路径不提交部分状态或转移未声明资源。
   protected function rdma_status invalid_state(string message);
     return rdma_status::make(RDMA_SC_INVALID_STATE, message);
   endfunction
 
-  // 功能：把输入错误或注入故障转换成统一的 rdma_status，供上层沿原事务路径处理。
-  // 输入/输出及副作用：输入为错误消息、错误码或故障证据；返回统一 rdma_status，不推进事务游标。
-  //   空消息仍需保留错误类别；未知错误码不得被静默转换为成功。
-  // 失败/边界：错误路径不能返回成功状态；消息和错误码缺失时仍须保留可诊断类别。
+  // 功能：在 rdma_queue_backing_planner 中，normalize_status 把错误消息、硬件码或注入故障封装为统一 rdma_status，保留原事务的诊断证据。
+  // 输入/输出及副作用：status（输入）、message（输入）；normalize_status 读取 status、message 并使用输入参数和固定枚举/常量；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：normalize_status 返回 RDMA_SC_INVALID_STATE；失败路径不提交部分状态或转移未声明资源。
   protected function rdma_status normalize_status(
     rdma_status status,
     string message
@@ -49,20 +45,18 @@ class rdma_queue_backing_planner extends uvm_object;
     return status;
   endfunction
 
-  // 功能：比较两个输入对象的协议字段或身份快照并返回确定的相等性结果，不修改任一输入。
-  // 输入/输出及副作用：输入为待比较的两个值对象；返回 bit/状态结果，不修改任一输入或外部账本。
-  //   任一对象为空、类型不符或字段未初始化时按接口约定返回不相等或错误。
-  // 失败/边界：比较输入为空或类型不符时不得抛出未处理异常；结果必须保持确定且无副作用。
+  // 功能：在 rdma_queue_backing_planner 中由 same_handle 逐字段比较输入值，返回结构、身份或序列化内容是否一致。
+  // 输入/输出及副作用：lhs（输入）、rhs（输入）；比较对象/数组只读；返回 bit 或状态结果，不更新 runtime、账本或外部 adapter。
+  // 失败/边界：same_handle 的任一比较对象为空或类型不符时返回确定的 false/不等结果，不抛出未处理异常。
   protected function bit same_handle(rdma_handle lhs, rdma_handle rhs);
     if (lhs == null || rhs == null)
       return 1'b0;
     return lhs.same_instance(rhs);
   endfunction
 
-  // 功能：处理 payload_direction：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 role 用于执行 payload_direction；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：payload_direction 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：payload_direction 使用 role 计算并返回 rdma_dma_direction_e 结果；不修改对象字段或外部资源。
+  // 输入/输出及副作用：role（输入）；payload_direction 读取 role 并使用输入参数和固定枚举/常量；函数返回 rdma_dma_direction_e，不取得调用方资源所有权。
+  // 失败/边界：payload_direction 的结果直接由 return RDMA_DMA_DEVICE_WRITE 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   protected function rdma_dma_direction_e payload_direction(
     rdma_queue_backing_role_e role
   );
@@ -73,10 +67,9 @@ class rdma_queue_backing_planner extends uvm_object;
     return RDMA_DMA_DEVICE_READ;
   endfunction
 
-  // 功能：处理 direction_permissions：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 direction 用于执行 direction_permissions；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：direction_permissions 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：在 rdma_queue_backing_planner 中，direction_permissions 把访问方向或请求权限规范化为 Host-memory/DMA 校验使用的权限位集合。
+  // 输入/输出及副作用：direction（输入）；direction_permissions 读取 direction 并使用字段 permissions、permissions.device_read、permissions.device_write；函数返回 rdma_dma_permission_t，不取得调用方资源所有权。
+  // 失败/边界：direction_permissions 的结果直接由 return permissions 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   protected function rdma_dma_permission_t direction_permissions(
     rdma_dma_direction_e direction
   );
@@ -92,10 +85,9 @@ class rdma_queue_backing_planner extends uvm_object;
     return permissions;
   endfunction
 
-  // 功能：在测试中检查调用结果、状态码和副作用是否符合契约；失败时报告可定位的验证信息。
-  // 输入/输出及副作用：参数 binding, preflight, ring 用于执行 expected_layout_status；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：测试前置对象缺失时应报告断言错误并停止依赖该对象的后续检查。
+  // 功能：在 rdma_queue_backing_planner 中，expected_layout_status 在测试中检查调用结果、状态码和副作用是否符合契约；失败时报告可定位的验证信息。
+  // 输入/输出及副作用：binding（输入）、preflight（输入）、ring（输入）；expected_layout_status 读取 binding、preflight、ring 并使用字段 expected_entry_size、logical_bytes、storage_bytes、capability_limit；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：测试函数 expected_layout_status 缺少前置对象时报告断言错误，并停止依赖该对象的后续检查。
   protected function rdma_status expected_layout_status(
     rdma_function_binding binding,
     rdma_queue_preflight preflight,
@@ -151,10 +143,9 @@ class rdma_queue_backing_planner extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：处理 required_roles_status：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 binding, preflight 用于执行 required_roles_status；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：required_roles_status 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：required_roles_status 校验 binding、preflight 与当前对象状态的一致性，并显式处理“CQ preflight payload roles are invalid”等拒绝条件，返回 rdma_status 供上层决定是否提交。
+  // 输入/输出及副作用：binding（输入）、preflight（输入）；required_roles_status 读取 binding、preflight 并使用字段 need_sgb、status；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：required_roles_status 返回 RDMA_SC_INVALID_ARGUMENT；典型拒绝条件为“CQ preflight payload roles are invalid”“SRQ preflight payload roles are invalid”；失败路径不提交部分状态或转移未声明资源。
   protected function rdma_status required_roles_status(
     rdma_function_binding binding,
     rdma_queue_preflight preflight
@@ -204,10 +195,9 @@ class rdma_queue_backing_planner extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：按输入的完整标识查询当前权威记录并返回独立快照；缺失、歧义或代际过期时返回明确错误。
-  // 输入/输出及副作用：输入为完整 key/handle，output 或返回值为记录快照；查询不改变登记表和外部资源。
-  //   缺失、歧义、空句柄或旧 generation/reset epoch 返回明确错误。
-  // 失败/边界：查询不到唯一记录、输入为空或 authority 已失效时返回错误，不回退到默认 Function/root。
+  // 功能：在 rdma_queue_backing_planner 中，find_required_ring 按完整 key/handle 查找唯一权威记录并返回 detached 快照，避免把内部可变引用泄露给调用方。
+  // 输入/输出及副作用：preflight（输入）、role（输入）；find_required_ring 读取 preflight、role 并使用字段 i；函数返回 rdma_queue_ring_layout，不取得调用方资源所有权。
+  // 失败/边界：find_required_ring 在 key/handle 缺失、记录不唯一或 generation/reset epoch 过期时返回明确错误，不回退到默认 authority。
   protected function rdma_queue_ring_layout find_required_ring(
     rdma_queue_preflight preflight,
     rdma_queue_backing_role_e role
@@ -220,10 +210,9 @@ class rdma_queue_backing_planner extends uvm_object;
     return null;
   endfunction
 
-  // 功能：处理 borrowed_coverage_status：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 preflight, ring 用于执行 borrowed_coverage_status；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：borrowed_coverage_status 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：borrowed_coverage_status 校验 preflight、ring 与当前对象状态的一致性，并显式处理“borrowed queue layout has a hole or overlap”；“borrowed queue slice exceeds role length”；“borrowed queue role length is incorrect”；“borrowed logical range overflows”；“borrowed logical range exceeds role”等拒绝条件，返回 rdma_status 供上层决定是否提交。
+  // 输入/输出及副作用：preflight（输入）、ring（输入）；borrowed_coverage_status 读取 preflight、ring 并使用字段 expected_offset、match_count、selected_index、range_end、j；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：borrowed_coverage_status 返回 函数体规定的失败状态；具体拒绝条件包括 “borrowed queue layout has a hole or overlap”；“borrowed queue slice exceeds role length”；“borrowed queue role length is incorrect”；“borrowed logical range overflows”；“borrowed logical range exceeds role”；失败路径不提交部分状态、不隐式重试，也不转移未声明资源。
   protected function rdma_status borrowed_coverage_status(
     rdma_queue_preflight preflight,
     rdma_queue_ring_layout ring
@@ -284,10 +273,9 @@ class rdma_queue_backing_planner extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：处理 borrowed_access_status：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 binding, slice 用于执行 borrowed_access_status；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：borrowed_access_status 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：borrowed_access_status 校验 binding、slice 与当前对象状态的一致性，并显式处理“borrowed queue slice is null”等拒绝条件，返回 rdma_status 供上层决定是否提交。
+  // 输入/输出及副作用：binding（输入）、slice（输入）；borrowed_access_status 读取 binding、slice 并使用字段 status、first_iova.value、direction、permissions；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：borrowed_access_status 返回 RDMA_SC_DMA_TRANSLATION、RDMA_SC_INVALID_ARGUMENT；典型拒绝条件为“borrowed queue slice is null”“borrowed queue IOVA offset overflows”；失败路径不提交部分状态或转移未声明资源。
   protected function rdma_status borrowed_access_status(
     rdma_function_binding binding,
     rdma_queue_backing_slice slice
@@ -325,10 +313,9 @@ class rdma_queue_backing_planner extends uvm_object;
     return status;
   endfunction
 
-  // 功能：处理 borrowed_overlap_status：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 spec 用于执行 borrowed_overlap_status；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：borrowed_overlap_status 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：borrowed_overlap_status 校验 spec 与当前对象状态的一致性，并显式处理“borrowed queue slice is null”等拒绝条件，返回 rdma_status 供上层决定是否提交。
+  // 输入/输出及副作用：spec（输入）；borrowed_overlap_status 读取 spec 并使用字段 first_iova、first_backing、first_iova_last、first_backing_last、j、second_iova、second_backing、second_iova_last；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：borrowed_overlap_status 返回 函数体规定的失败状态；具体拒绝条件包括 “borrowed queue slice is null”；失败路径不提交部分状态、不隐式重试，也不转移未声明资源。
   protected function rdma_status borrowed_overlap_status(
     rdma_queue_backing_spec spec
   );
@@ -371,10 +358,9 @@ class rdma_queue_backing_planner extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：校验依赖并建立该对象的运行边界，成功后保存必要的非拥有引用；拒绝不完整或重复配置。
-  // 输入/输出及副作用：接收 manager、binding、router 或 profile 等依赖；成功后保存非拥有引用并更新配置状态。
-  //   任一依赖为空、重复配置或代际不匹配时保持原状态并返回错误。
-  // 失败/边界：配置失败不得写入半成品引用；已激活对象不得被无条件降级或重复占用资源。
+  // 功能：在 rdma_queue_backing_planner 中，configure 校验依赖和 binding 后建立运行边界，只保存非拥有引用并拒绝重复配置。
+  // 输入/输出及副作用：host_mem（输入）；configure 先依据 host_mem == null；this.host_mem != null 校验 host_mem；成功时更新本对象配置/状态并保存非拥有引用，返回 rdma_status。
+  // 失败/边界：实现中的空依赖、重复登记、状态或 generation/authority 校验失败时返回错误；失败时保留旧配置。
   function rdma_status configure(rdma_host_mem_api host_mem);
     if (host_mem == null)
       return invalid_argument("queue backing planner host memory is null");
@@ -384,10 +370,9 @@ class rdma_queue_backing_planner extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：检查输入字段、身份和生命周期约束，返回可诊断的校验状态；失败时不提交部分更新。
-  // 输入/输出及副作用：输入为待校验字段或快照；返回 rdma_status，校验过程不提交资源和游标。
-  //   空依赖、非法范围、身份不一致或非活动状态会返回错误。
-  // 失败/边界：任何非法枚举、越界字段、缺失必需依赖或身份/代际不一致都必须返回非成功状态。
+  // 功能：validate_spec 校验 binding、preflight 与当前对象状态的一致性，并显式处理“queue backing validation input is null”等拒绝条件，返回 rdma_status 供上层决定是否提交。
+  // 输入/输出及副作用：binding（输入）、preflight（输入）；validate_spec 读取 binding、preflight 并使用字段 status、ring；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：必需对象/句柄/快照为空，或身份、范围、generation 和生命周期检查失败时返回非成功状态。
   function rdma_status validate_spec(
     rdma_function_binding binding,
     rdma_queue_preflight preflight
@@ -436,10 +421,9 @@ class rdma_queue_backing_planner extends uvm_object;
     return borrowed_overlap_status(preflight.backing_spec);
   endfunction
 
-  // 功能：依据输入请求创建对应的值对象或资源计划，并校验依赖、所有权和生命周期后返回结果。
-  // 输入/输出及副作用：输入请求、容量和依赖用于构造/预留资源；返回独立对象或状态，不暴露内部可变集合。
-  //   参数越界、容量不足或构造中途失败时回滚已登记的局部状态。
-  // 失败/边界：依赖为空、参数越界、容量不足或构造步骤失败时清理局部结果并返回明确错误。
+  // 功能：make_request_context 创建独立的 rdma_status；根据 binding、resource_h、request_context 设置字段 request_context、request_context.function_h、request_context.requester_bdf、request_context.pasid_valid、request_context.pasid、request_context.dma_domain_valid、request_context.dma_domain_id、request_context.owner_h，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：binding（输入）、resource_h（输入）、request_context（输出）；make_request_context 读取 binding、resource_h、request_context 并使用字段 request_context、request_context.function_h、request_context.requester_bdf、request_context.pasid_valid、request_context.pasid、request_context.dma_domain_valid、request_context.dma_domain_id、request_context.owner_h，并写入 request_context；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：make_request_context 返回 RDMA_SC_RESOURCE_EXHAUSTED；典型拒绝条件为“queue DMA request context creation failed”；失败路径不提交部分状态或转移未声明资源。
   protected function rdma_status make_request_context(
     rdma_function_binding binding,
     rdma_handle resource_h,
@@ -464,10 +448,10 @@ class rdma_queue_backing_planner extends uvm_object;
                             "queue DMA request validation returned null");
   endfunction
 
-  // 功能：检查可用容量并预留所需资源，返回带所有权证据的分配结果；容量不足时不留下部分分配。
-  // 输入/输出及副作用：输入请求、容量和依赖用于构造/预留资源；返回独立对象或状态，不暴露内部可变集合。
-  //   参数越界、容量不足或构造中途失败时回滚已登记的局部状态。
-  // 失败/边界：依赖为空、参数越界、容量不足或构造步骤失败时清理局部结果并返回明确错误。
+  // 功能：在 rdma_queue_backing_planner 中，allocated_mapping_status 检查容量后预留资源并返回带 owner 证据的句柄/计划；失败时回滚已登记的局部状态。
+  // 输入/输出及副作用：binding（输入）、resource_h（输入）、mapping（输入）、length（输入）、alignment（输入）、direction（输入）；allocated_mapping_status 可能更新本对象明确拥有的状态；函数返回 rdma_status，不取得调用方资源所有权。
+
+  // 失败/边界：allocated_mapping_status 返回 RDMA_SC_DMA_TRANSLATION、RDMA_SC_INVALID_ARGUMENT、RDMA_SC_INVALID_STATE；典型拒绝条件为“host allocation returned a null mapping”“allocated queue mapping is too short”；失败路径不提交部分状态或转移未声明资源。
   protected function rdma_status allocated_mapping_status(
     rdma_function_binding binding,
     rdma_handle resource_h,
@@ -502,10 +486,9 @@ class rdma_queue_backing_planner extends uvm_object;
     return status;
   endfunction
 
-  // 功能：按资源所有权和幂等规则释放或清理记录；重复释放不会再次扣减 credit，也不触碰已隔离资源。
-  // 输入/输出及副作用：输入为待解除或释放的 handle/key；成功后隔离或删除本对象记录，外部拥有者仍负责真正销毁。
-  //   空值、未知记录或重复调用按接口约定返回错误或幂等成功。
-  // 失败/边界：不得释放非本对象所有资源；重复解除按幂等约定处理，旧 handle 不得重新激活。
+  // 功能：在 rdma_queue_backing_planner 中，release_acquired_mapping 按 owner、generation 和幂等规则释放/隔离记录，并同步删除其账本引用。
+  // 输入/输出及副作用：mapping（输入）、original_status（输入）；输入 handle/mapping/token 指定释放目标；成功时更新账本和生命周期，外部资源只按 adapter 契约释放。
+  // 失败/边界：release_acquired_mapping 发现 owner/generation 不匹配、记录未知或重复释放时返回错误或幂等结果，不重新激活旧句柄。
   protected function rdma_status release_acquired_mapping(
     rdma_dma_mapping mapping,
     rdma_status original_status
@@ -523,10 +506,10 @@ class rdma_queue_backing_planner extends uvm_object;
        "; original failure: ", original_status.message});
   endfunction
 
-  // 功能：检查可用容量并预留所需资源，返回带所有权证据的分配结果；容量不足时不留下部分分配。
-  // 输入/输出及副作用：输入请求、容量和依赖用于构造/预留资源；返回独立对象或状态，不暴露内部可变集合。
-  //   参数越界、容量不足或构造中途失败时回滚已登记的局部状态。
-  // 失败/边界：依赖为空、参数越界、容量不足或构造步骤失败时清理局部结果并返回明确错误。
+  // 功能：在 rdma_queue_backing_planner 中，allocate_owned_ref 检查容量后预留资源并返回带 owner 证据的句柄/计划；失败时回滚已登记的局部状态。
+  // 输入/输出及副作用：binding（输入）、request_context（输入）、resource_h（输入）、role（输入）、length（输入）、alignment（输入）、direction（输入）、ref_value（输出）；输入请求/句柄定义资源属性；成功时更新账本并通过返回值或
+  //   output 发布新句柄/映射。
+  // 失败/边界：容量不足、范围非法、重复占用或身份过期时返回错误；失败不得泄漏半分配资源。
   protected function rdma_status allocate_owned_ref(
     rdma_function_binding binding,
     rdma_dma_request_context request_context,
@@ -595,10 +578,9 @@ class rdma_queue_backing_planner extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：从源对象复制可变字段并生成独立值快照；源对象保持不变，类型不匹配时报告复制错误。
-  // 输入/输出及副作用：source/rhs 是源对象；返回或写入独立副本，不修改源对象。
-  //   source/rhs 为空或类型不匹配时返回空值或触发既定复制错误。
-  // 失败/边界：空源对象不应解引用；类型不匹配必须拒绝复制或按既定 UVM 规则报告 fatal。
+  // 功能：将 rhs 中 rdma_queue_backing_planner 的值字段复制到当前对象，建立与源对象隔离的快照。
+  // 输入/输出及副作用：source（输入）、ring（输出）；clone_ring_metadata 读取 source、ring 并使用字段 ring、cloned_object，并写入 ring；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：clone_ring_metadata 返回 RDMA_SC_INVALID_ARGUMENT、RDMA_SC_INVALID_STATE；典型拒绝条件为“queue ring metadata is null”“queue ring metadata clone failed”；失败路径不提交部分状态或转移未声明资源。
   protected function rdma_status clone_ring_metadata(
     rdma_queue_ring_layout source,
     output rdma_queue_ring_layout ring
@@ -616,10 +598,10 @@ class rdma_queue_backing_planner extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：处理 add_page：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 ring, mapping, mapping_offset, logical_offset 用于执行 add_page；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：add_page 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：在 rdma_queue_backing_planner 中，add_page 将输入对象登记或挂接到当前集合/依赖图，并同步维护对应账本和生命周期引用。
+  // 输入/输出及副作用：ring（输入）、mapping（输入）、mapping_offset（输入）、logical_offset（输入）；add_page 可能更新本对象明确拥有的状态；函数返回 rdma_status，不取得调用方资源所有权。
+
+  // 失败/边界：add_page 返回 RDMA_SC_DMA_TRANSLATION、RDMA_SC_RESOURCE_EXHAUSTED；典型拒绝条件为“queue page IOVA projection overflows”“queue page reference creation failed”；失败路径不提交部分状态或转移未声明资源。
   protected function rdma_status add_page(
     rdma_queue_ring_layout ring,
     rdma_dma_mapping mapping,
@@ -648,10 +630,9 @@ class rdma_queue_backing_planner extends uvm_object;
                             "queue page validation returned null");
   endfunction
 
-  // 功能：处理 populate_owned_ring：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 ring, ref_value 用于执行 populate_owned_ring；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：populate_owned_ring 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：在 rdma_queue_backing_planner 中，populate_owned_ring 把已验证的 backing 规格落实为 Host-memory 映射/队列计划，并登记释放责任。
+  // 输入/输出及副作用：ring（输入）、ref_value（输入）；populate_owned_ring 读取 ring、ref_value 并使用字段 offset、status；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：populate_owned_ring 下游操作失败时原样传播其 status/result，不伪造成功；该路径不隐式重试，也不转移未声明资源。
   protected function rdma_status populate_owned_ring(
     rdma_queue_ring_layout ring,
     rdma_queue_backing_ref ref_value
@@ -670,10 +651,9 @@ class rdma_queue_backing_planner extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：处理 populate_borrowed_ring：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 preflight, ring, ref_value 用于执行 populate_borrowed_ring；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：populate_borrowed_ring 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：在 rdma_queue_backing_planner 中，populate_borrowed_ring 把已验证的 backing 规格落实为 Host-memory 映射/队列计划，并登记释放责任。
+  // 输入/输出及副作用：preflight（输入）、ring（输入）、ref_value（输出）；populate_borrowed_ring 读取 preflight、ring、ref_value 并使用字段 ref_value、first_slice、ref_value.role、ref_value.mapping、ref_value.ownership、ref_value.mapping_offset、ref_value.length、ref_value.logical_queue_offset，并写入 ref_value；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：populate_borrowed_ring 返回 RDMA_SC_RESOURCE_EXHAUSTED、RDMA_SC_INVALID_ARGUMENT、RDMA_SC_INVALID_STATE；典型拒绝条件为“borrowed queue role has no first slice”“borrowed queue ref creation failed”；失败路径不提交部分状态或转移未声明资源。
   protected function rdma_status populate_borrowed_ring(
     rdma_queue_preflight preflight,
     rdma_queue_ring_layout ring,
@@ -783,10 +763,9 @@ class rdma_queue_backing_planner extends uvm_object;
                             "borrowed queue ref validation returned null");
   endfunction
 
-  // 功能：按输入的完整标识查询当前权威记录并返回独立快照；缺失、歧义或代际过期时返回明确错误。
-  // 输入/输出及副作用：输入为完整 key/handle，output 或返回值为记录快照；查询不改变登记表和外部资源。
-  //   缺失、歧义、空句柄或旧 generation/reset epoch 返回明确错误。
-  // 失败/边界：查询不到唯一记录、输入为空或 authority 已失效时返回错误，不回退到默认 Function/root。
+  // 功能：在 rdma_queue_backing_planner 中，find_ref 按完整 key/handle 查找唯一权威记录并返回 detached 快照，避免把内部可变引用泄露给调用方。
+  // 输入/输出及副作用：plan（输入）、role（输入）；find_ref 读取 plan、role 并使用字段 i；函数返回 rdma_queue_backing_ref，不取得调用方资源所有权。
+  // 失败/边界：find_ref 在 key/handle 缺失、记录不唯一或 generation/reset epoch 过期时返回明确错误，不回退到默认 authority。
   protected function rdma_queue_backing_ref find_ref(
     rdma_queue_backing_plan plan,
     rdma_queue_backing_role_e role
@@ -798,10 +777,9 @@ class rdma_queue_backing_planner extends uvm_object;
     return null;
   endfunction
 
-  // 功能：处理 add_flush_target：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 plan, role, phase 用于执行 add_flush_target；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：add_flush_target 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：在 rdma_queue_backing_planner 中，add_flush_target 将输入对象登记或挂接到当前集合/依赖图，并同步维护对应账本和生命周期引用。
+  // 输入/输出及副作用：plan（输入）、role（输入）、phase（输入）；add_flush_target 可能更新本对象明确拥有的状态；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：add_flush_target 返回 RDMA_SC_RESOURCE_EXHAUSTED、RDMA_SC_INVALID_STATE；典型拒绝条件为“queue flush target creation failed”“queue flush target has no PD reference”；失败路径不提交部分状态或转移未声明资源。
   protected function rdma_status add_flush_target(
     rdma_queue_backing_plan plan,
     rdma_queue_backing_role_e role,
@@ -825,10 +803,9 @@ class rdma_queue_backing_planner extends uvm_object;
                             "queue flush target validation returned null");
   endfunction
 
-  // 功能：处理 local_plan_status：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 plan 用于执行 local_plan_status；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：local_plan_status 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：local_plan_status 校验 plan 与当前对象状态的一致性，并显式处理“planner-local plan context must be absent”等拒绝条件，返回 rdma_status 供上层决定是否提交。
+  // 输入/输出及副作用：plan（输入）；local_plan_status 读取 plan 并使用字段 status；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：local_plan_status 返回 RDMA_SC_INVALID_ARGUMENT、RDMA_SC_INVALID_STATE；典型拒绝条件为“planner-local plan context must be absent”“planner-local plan has a null ring”；失败路径不提交部分状态或转移未声明资源。
   protected function rdma_status local_plan_status(
     rdma_queue_backing_plan plan
   );
@@ -904,10 +881,9 @@ class rdma_queue_backing_planner extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：按资源所有权和幂等规则释放或清理记录；重复释放不会再次扣减 credit，也不触碰已隔离资源。
-  // 输入/输出及副作用：输入为待解除或释放的 handle/key；成功后隔离或删除本对象记录，外部拥有者仍负责真正销毁。
-  //   空值、未知记录或重复调用按接口约定返回错误或幂等成功。
-  // 失败/边界：不得释放非本对象所有资源；重复解除按幂等约定处理，旧 handle 不得重新激活。
+  // 功能：在 rdma_queue_backing_planner 中，rollback_plan 按 owner、generation 和幂等规则释放/隔离记录，并同步删除其账本引用。
+  // 输入/输出及副作用：candidate（输入）、original_status（输入）；输入 handle/mapping/token 指定释放目标；成功时更新账本和生命周期，外部资源只按 adapter 契约释放。
+  // 失败/边界：rollback_plan 发现 owner/generation 不匹配、记录未知或重复释放时返回错误或幂等结果，不重新激活旧句柄。
   protected function rdma_status rollback_plan(
     rdma_queue_backing_plan candidate,
     rdma_status original_status
@@ -938,10 +914,10 @@ class rdma_queue_backing_planner extends uvm_object;
     return original_status;
   endfunction
 
-  // 功能：处理 materialize：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 binding, preflight, resource_h, plan 用于执行 materialize；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：materialize 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：在 rdma_queue_backing_planner 中，materialize 把已验证的 backing 规格落实为 Host-memory 映射/队列计划，并登记释放责任。
+  // 输入/输出及副作用：binding（输入）、preflight（输入）、resource_h（输入）、plan（输出）；materialize 读取 binding、preflight、resource_h、plan 并使用字段 plan、status、owner、candidate、candidate.resource_kind、candidate.context_ref，并写入 plan；函数返回 rdma_status，不取得调用方资源所有权。
+
+  // 失败/边界：materialize 返回 RDMA_SC_RESOURCE_EXHAUSTED、RDMA_SC_INVALID_ARGUMENT、RDMA_SC_INVALID_STATE；典型拒绝条件为“queue backing planner is not configured”“queue resource handle is invalid”；失败路径不提交部分状态或转移未声明资源。
   function rdma_status materialize(
     rdma_function_binding binding,
     rdma_queue_preflight preflight,
@@ -1060,10 +1036,9 @@ class rdma_queue_backing_planner extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：处理 pd_role_for：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 payload_role 用于执行 pd_role_for；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：pd_role_for 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：在 rdma_queue_backing_planner 中，pd_role_for 把输入枚举或资源类型映射成对应的状态类别、执行引擎、opcode 或生命周期策略。
+  // 输入/输出及副作用：payload_role（输入）；pd_role_for 读取 payload_role 并使用输入参数和固定枚举/常量；函数返回 rdma_queue_backing_role_e，不取得调用方资源所有权。
+  // 失败/边界：pd_role_for 按 case(payload_role) 的固定映射计算 rdma_queue_backing_role_e（RDMA_QUEUE_ROLE_CQ_RING→RDMA_QUEUE_ROLE_CQ_PD；RDMA_QUEUE_ROLE_SRQ_RING→RDMA_QUEUE_ROLE_SRQ_PD；RDMA_QUEUE_ROLE_SRFQ_RING→RDMA_QUEUE_ROLE_SRFQ_PD；RDMA_QUEUE_ROLE_CEQ_RING→RDMA_QUEUE_ROLE_CEQ_PD；其余 case 分支按源码继续映射；default→RDMA_QUEUE_ROLE_CQC_CONTEXT_SHADOW）；未列出的输入走 default，不修改运行时账本。
   protected function rdma_queue_backing_role_e pd_role_for(
     rdma_queue_backing_role_e payload_role
   );
@@ -1077,14 +1052,13 @@ class rdma_queue_backing_planner extends uvm_object;
     endcase
   endfunction
 
-  // 功能：处理 initialize_payload_and_pd：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 binding, plan, pd_codec 用于执行 initialize_payload_and_pd；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：initialize_payload_and_pd 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：initialize_payload_and_pd 更新字段 status、zeros、pd_ref、encoded_pd、pd_bytes，并在提交前保持 Function authority、generation 和资源所有权约束。
+  // 输入/输出及副作用：binding（输入）、plan（输入）、pd_codec（输入）；initialize_payload_and_pd 先依据 host_mem == null；binding == null || plan == null || pd_codec == null；!status.ok( 校验 binding、plan、pd_codec；成功时更新本对象配置/状态并保存非拥有引用，返回 rdma_status。
+  // 失败/边界：实现中的空依赖、重复登记、状态或 generation/authority 校验失败时返回错误；失败时保留旧配置。
   function rdma_status initialize_payload_and_pd(
     rdma_function_binding binding,
     rdma_queue_backing_plan plan,
-    rdma_xtr_v1_queue_pd_codec pd_codec
+    rdma_hw_queue_pd_codec pd_codec
   );
     byte zeros[];
     byte pd_bytes[];
@@ -1154,10 +1128,9 @@ class rdma_queue_backing_planner extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：按资源所有权和幂等规则释放或清理记录；重复释放不会再次扣减 credit，也不触碰已隔离资源。
-  // 输入/输出及副作用：输入为待解除或释放的 handle/key；成功后隔离或删除本对象记录，外部拥有者仍负责真正销毁。
-  //   空值、未知记录或重复调用按接口约定返回错误或幂等成功。
-  // 失败/边界：不得释放非本对象所有资源；重复解除按幂等约定处理，旧 handle 不得重新激活。
+  // 功能：在 rdma_queue_backing_planner 中，release_local_mapping 按 owner、generation 和幂等规则释放/隔离记录，并同步删除其账本引用。
+  // 输入/输出及副作用：mapping（输入）；输入 handle/mapping/token 指定释放目标；成功时更新账本和生命周期，外部资源只按 adapter 契约释放。
+  // 失败/边界：release_local_mapping 发现 owner/generation 不匹配、记录未知或重复释放时返回错误或幂等结果，不重新激活旧句柄。
   protected function rdma_status release_local_mapping(
     rdma_dma_mapping mapping
   );
@@ -1187,10 +1160,9 @@ class rdma_queue_backing_planner extends uvm_object;
                             "queue host release returned null");
   endfunction
 
-  // 功能：处理 cleanup_local_role：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 ref_value, complete 用于执行 cleanup_local_role；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：cleanup_local_role 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：cleanup_local_role 根据 ref_value、complete 执行 rdma_status 结果转换，具体更新字段 complete、ref_value.cleanup_complete、release_complete、status；失败时返回 RDMA_SC_INVALID_ARGUMENT、RDMA_SC_INVALID_STATE，保持已登记资源和输出不变。
+  // 输入/输出及副作用：ref_value（输入）、complete（输出）；cleanup_local_role 读取 ref_value、complete 并使用字段 complete、ref_value.cleanup_complete、release_complete、status，并写入 complete；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：cleanup_local_role 返回 RDMA_SC_INVALID_ARGUMENT、RDMA_SC_INVALID_STATE；典型拒绝条件为“queue backing planner is not configured”“queue cleanup ref is null”；失败路径不提交部分状态或转移未声明资源。
   function rdma_status cleanup_local_role(
     rdma_queue_backing_ref ref_value,
     output bit complete

@@ -13,10 +13,9 @@ class rdma_mock_stag_key_policy extends rdma_stag_key_policy;
   int unsigned call_count;
   protected rdma_status next_failure;
 
-  // 功能：构造当前对象并初始化其字段、集合和 UVM 名称；不接管传入句柄的生命周期。
-  // 输入/输出及副作用：name 仅用于 UVM 对象命名；内部字段被初始化为安全默认值，传入句柄不转移所有权。
-  //   返回新对象实例；构造失败由 UVM 工厂或调用方处理。
-  // 失败/边界：不创建外部资源；name 为空时仍允许构造，但所有字段必须保持可配置的初始值。
+  // 功能：构造 rdma_mock_stag_key_policy，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：fixed_key='0；call_count=0；next_failure=null。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_mock_stag_key_policy 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_mock_stag_key_policy");
     super.new(name);
     fixed_key = '0;
@@ -24,10 +23,9 @@ class rdma_mock_stag_key_policy extends rdma_stag_key_policy;
     next_failure = null;
   endfunction
 
-  // 功能：把输入错误或注入故障转换成统一的 rdma_status，供上层沿原事务路径处理。
-  // 输入/输出及副作用：输入为错误消息、错误码或故障证据；返回统一 rdma_status，不推进事务游标。
-  //   空消息仍需保留错误类别；未知错误码不得被静默转换为成功。
-  // 失败/边界：错误路径不能返回成功状态；消息和错误码缺失时仍须保留可诊断类别。
+  // 功能：在 rdma_mock_stag_key_policy 中，fail_next 把错误消息、硬件码或注入故障封装为统一 rdma_status，保留原事务的诊断证据。
+  // 输入/输出及副作用：failure（输入）；fail_next 读取 failure 并使用字段 next_failure；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：fail_next 返回 RDMA_SC_INVALID_ARGUMENT；典型拒绝条件为“STAG key failure status is null”；失败路径不提交部分状态或转移未声明资源。
   function rdma_status fail_next(rdma_status failure);
     if (failure == null)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
@@ -36,10 +34,9 @@ class rdma_mock_stag_key_policy extends rdma_stag_key_policy;
     return rdma_status::success();
   endfunction
 
-  // 功能：处理 derive：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 mr, stag_key 用于执行 derive；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：derive 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：在 rdma_mock_stag_key_policy 中，derive 根据 STAG index、incarnation 和策略参数派生硬件 key，避免释放后旧 key 再次有效。
+  // 输入/输出及副作用：mr（输入）、stag_key（输出）；derive 读取 mr、stag_key 并使用字段 stag_key、failure、next_failure，并写入 stag_key；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：derive 下游操作失败时原样传播其 status/result，不伪造成功；该路径不隐式重试，也不转移未声明资源。
   virtual function rdma_status derive(
     rdma_mr mr,
     output bit [7:0] stag_key
@@ -65,10 +62,9 @@ class rdma_fault_inject_resource_manager extends rdma_resource_manager;
   protected rdma_status role_failures[string];
   protected int unsigned transition_ordinals[string];
 
-  // 功能：构造当前对象并初始化其字段、集合和 UVM 名称；不接管传入句柄的生命周期。
-  // 输入/输出及副作用：name 仅用于 UVM 对象命名；内部字段被初始化为安全默认值，传入句柄不转移所有权。
-  //   返回新对象实例；构造失败由 UVM 工厂或调用方处理。
-  // 失败/边界：不创建外部资源；name 为空时仍允许构造，但所有字段必须保持可配置的初始值。
+  // 功能：构造 rdma_fault_inject_resource_manager，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：release_reserved_calls=0。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_fault_inject_resource_manager 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_fault_inject_resource_manager");
     super.new(name);
     release_reserved_calls = 0;
@@ -76,10 +72,9 @@ class rdma_fault_inject_resource_manager extends rdma_resource_manager;
     role_failures.delete(); transition_ordinals.delete();
   endfunction
 
-  // 功能：把输入错误或注入故障转换成统一的 rdma_status，供上层沿原事务路径处理。
-  // 输入/输出及副作用：输入为错误消息、错误码或故障证据；返回统一 rdma_status，不推进事务游标。
-  //   空消息仍需保留错误类别；未知错误码不得被静默转换为成功。
-  // 失败/边界：错误路径不能返回成功状态；消息和错误码缺失时仍须保留可诊断类别。
+  // 功能：在 rdma_fault_inject_resource_manager 中，fail_next_transition 把错误消息、硬件码或注入故障封装为统一 rdma_status，保留原事务的诊断证据。
+  // 输入/输出及副作用：transition_name（输入）、failure（输入）；fail_next_transition 可能更新本对象明确拥有的状态；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：fail_next_transition 返回 RDMA_SC_INVALID_ARGUMENT；典型拒绝条件为“unknown resource transition”“transition failure status is null”；失败路径不提交部分状态或转移未声明资源。
   function rdma_status fail_next_transition(
     string transition_name,
     rdma_status failure
@@ -99,10 +94,9 @@ class rdma_fault_inject_resource_manager extends rdma_resource_manager;
     return rdma_status::success();
   endfunction
 
-  // 功能：把输入错误或注入故障转换成统一的 rdma_status，供上层沿原事务路径处理。
-  // 输入/输出及副作用：输入为错误消息、错误码或故障证据；返回统一 rdma_status，不推进事务游标。
-  //   空消息仍需保留错误类别；未知错误码不得被静默转换为成功。
-  // 失败/边界：错误路径不能返回成功状态；消息和错误码缺失时仍须保留可诊断类别。
+  // 功能：在 rdma_fault_inject_resource_manager 中，fail_role_call 把错误消息、硬件码或注入故障封装为统一 rdma_status，保留原事务的诊断证据。
+  // 输入/输出及副作用：method_name（输入）、role（输入）、ordinal（输入）、failure（输入）；fail_role_call 读取 method_name、role、ordinal、failure 并使用输入参数和固定枚举/常量；函数返回 void，不取得调用方资源所有权。
+  // 失败/边界：fail_role_call 无返回值，仅执行 函数体中的顺序操作；调用方须保证前置依赖已经绑定，函数不自动重试或接管外部资源。
   function void fail_role_call(string method_name,
                                rdma_queue_backing_role_e role,
                                int unsigned ordinal,
@@ -112,19 +106,17 @@ class rdma_fault_inject_resource_manager extends rdma_resource_manager;
         rdma_cmq_clone_status_value(failure);
   endfunction
 
-  // 功能：清理当前运行状态并建立新的复位/代际边界，使旧句柄或旧事务不能继续生效。
-  // 输入/输出及副作用：参数 delete 用于执行 reset；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
+  // 功能：在 rdma_fault_inject_resource_manager 中，reset reset 清理当前运行状态并建立新的复位/代际边界，使旧句柄或旧事务不能继续生效。
+  // 输入/输出及副作用：无显式参数；输入 action/epoch/handle 决定迁移目标；成功时更新状态或恢复证据，外部资源仍由其拥有者管理。
   // 失败/边界：复位参数为零、代际回退或存在未处理 pending 事务时拒绝更新 authority。
   function void reset();
     transition_failures.delete(); role_failures.delete();
     transition_ordinals.delete(); release_reserved_calls = 0;
   endfunction
 
-  // 功能：处理 stage_allocated：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 failure 用于执行 stage_allocated；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：stage_allocated 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：在 rdma_fault_inject_resource_manager 中，stage_allocated 预检输入并预留事务所需的槽位、映射或中间状态，失败时保留可恢复证据。
+  // 输入/输出及副作用：candidate（输入）；stage_allocated 读取 candidate 并使用字段 failure；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：stage_allocated 下游操作失败时原样传播其 status/result，不伪造成功；该路径不隐式重试，也不转移未声明资源。
   virtual function rdma_status stage_allocated(rdma_resource candidate);
     rdma_status failure;
 
@@ -137,8 +129,7 @@ class rdma_fault_inject_resource_manager extends rdma_resource_manager;
   endfunction
 
   // 功能：执行 take_transition_failure 指定的测试或恢复状态变更，更新受控账本并保留可回滚的故障证据。
-  // 输入/输出及副作用：参数 transition_name, role 用于执行 take_transition_failure；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
+  // 输入/输出及副作用：transition_name（输入）、role（输入）；take_transition_failure 可能更新本对象明确拥有的状态；函数返回 rdma_status，不取得调用方资源所有权。
   // 失败/边界：take_transition_failure 仅允许测试/恢复范围内的状态变更；代际或资源不匹配时拒绝并保留原账本。
   protected function rdma_status take_transition_failure(
     string transition_name,
@@ -166,10 +157,9 @@ class rdma_fault_inject_resource_manager extends rdma_resource_manager;
     return failure;
   endfunction
 
-  // 功能：处理 queue_role_for_kind：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 kind 用于执行 queue_role_for_kind；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：queue_role_for_kind 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：queue_role_for_kind 使用 kind 计算并返回 rdma_queue_backing_role_e 结果；不修改对象字段或外部资源。
+  // 输入/输出及副作用：kind（输入）；queue_role_for_kind 读取 kind 并使用输入参数和固定枚举/常量；函数返回 rdma_queue_backing_role_e，不取得调用方资源所有权。
+  // 失败/边界：queue_role_for_kind 按 case(kind) 的固定映射计算 rdma_queue_backing_role_e（RDMA_RESOURCE_SRQ→RDMA_QUEUE_ROLE_SRQ_RING；RDMA_RESOURCE_CEQ→RDMA_QUEUE_ROLE_CEQ_RING；RDMA_RESOURCE_AEQ→RDMA_QUEUE_ROLE_AEQ_RING；default→RDMA_QUEUE_ROLE_CQ_RING）；未列出的输入走 default，不修改运行时账本。
   protected function rdma_queue_backing_role_e queue_role_for_kind(
     rdma_resource_kind_e kind
   );
@@ -181,10 +171,9 @@ class rdma_fault_inject_resource_manager extends rdma_resource_manager;
     endcase
   endfunction
 
-  // 功能：执行一次受控事务并推进所属状态机；返回结果时保留失败阶段、代际和后端提交证据。
-  // 输入/输出及副作用：参数 failure 用于执行 commit_programmed；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：事务超时、代际变化或提交证据不完整时不得推进下一阶段。
+  // 功能：在 rdma_fault_inject_resource_manager 中，commit_programmed 执行受控事务并按后端提交证据推进状态机，同时保留失败阶段和 generation 证据。
+  // 输入/输出及副作用：candidate（输入）；输入 request/image/cursor 决定写入内容；成功时更新 PI/CI、slot ledger 或 pending journal，并通过 output 返回结果。
+  // 失败/边界：commit_programmed 遇到锁、超时、generation 变化或提交证据不完整时保持原状态，不推进游标。
   virtual function rdma_status commit_programmed(rdma_resource candidate);
     rdma_status failure;
 
@@ -196,10 +185,9 @@ class rdma_fault_inject_resource_manager extends rdma_resource_manager;
     return super.commit_programmed(candidate);
   endfunction
 
-  // 功能：校验依赖并建立该对象的运行边界，成功后保存必要的非拥有引用；拒绝不完整或重复配置。
-  // 输入/输出及副作用：接收 manager、binding、router 或 profile 等依赖；成功后保存非拥有引用并更新配置状态。
-  //   任一依赖为空、重复配置或代际不匹配时保持原状态并返回错误。
-  // 失败/边界：配置失败不得写入半成品引用；已激活对象不得被无条件降级或重复占用资源。
+  // 功能：在 rdma_fault_inject_resource_manager 中，activate 校验依赖和 binding 后建立运行边界，只保存非拥有引用并拒绝重复配置。
+  // 输入/输出及副作用：handle（输入）；activate 先依据 failure != null 校验 handle；成功时更新本对象配置/状态并保存非拥有引用，返回 rdma_status。
+  // 失败/边界：实现中的空依赖、重复登记、状态或 generation/authority 校验失败时返回错误；失败时保留旧配置。
   virtual function rdma_status activate(rdma_handle handle);
     rdma_status failure;
 
@@ -210,10 +198,9 @@ class rdma_fault_inject_resource_manager extends rdma_resource_manager;
     return super.activate(handle);
   endfunction
 
-  // 功能：按资源所有权和幂等规则释放或清理记录；重复释放不会再次扣减 credit，也不触碰已隔离资源。
-  // 输入/输出及副作用：输入为待解除或释放的 handle/key；成功后隔离或删除本对象记录，外部拥有者仍负责真正销毁。
-  //   空值、未知记录或重复调用按接口约定返回错误或幂等成功。
-  // 失败/边界：不得释放非本对象所有资源；重复解除按幂等约定处理，旧 handle 不得重新激活。
+  // 功能：在 rdma_fault_inject_resource_manager 中，release_reserved 按 owner、generation 和幂等规则释放/隔离记录，并同步删除其账本引用。
+  // 输入/输出及副作用：handle（输入）；输入 handle/mapping/token 指定释放目标；成功时更新账本和生命周期，外部资源只按 adapter 契约释放。
+  // 失败/边界：release_reserved 发现 owner/generation 不匹配、记录未知或重复释放时返回错误或幂等结果，不重新激活旧句柄。
   virtual function rdma_status release_reserved(rdma_handle handle);
     rdma_status failure;
 
@@ -225,9 +212,9 @@ class rdma_fault_inject_resource_manager extends rdma_resource_manager;
     return super.release_reserved(handle);
   endfunction
 
-  // 功能：执行 mark_error 指定的测试或恢复状态变更，更新受控账本并保留可回滚的故障证据。
-  // 输入/输出及副作用：参数 handle, recovery 用于执行 mark_error；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
+  // 功能：在 rdma_fault_inject_resource_manager 中，mark_error 执行 mark_error 的mark_error 指定的测试或恢复状态变更，更新受控账本并保留可回滚的故障证据。
+  // 输入/输出及副作用：handle（输入）、recovery（输入）；输入 request/image/cursor 决定写入内容；成功时更新 PI/CI、slot ledger 或 pending journal，并通过
+  //   output 返回结果。
   // 失败/边界：mark_error 仅允许测试/恢复范围内的状态变更；代际或资源不匹配时拒绝并保留原账本。
   virtual function rdma_status mark_error(
     rdma_handle handle,
@@ -244,10 +231,9 @@ class rdma_fault_inject_resource_manager extends rdma_resource_manager;
     return super.mark_error(handle, recovery);
   endfunction
 
-  // 功能：处理 complete_reserved_error：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 handle 用于执行 complete_reserved_error；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：complete_reserved_error 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：在 rdma_fault_inject_resource_manager 中，complete_reserved_error 提交当前事务阶段并发布 detached 结果，只有成功路径才推进游标或状态。
+  // 输入/输出及副作用：handle（输入）；complete_reserved_error 读取 handle 并使用字段 failure；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：complete_reserved_error 下游操作失败时原样传播其 status/result，不伪造成功；该路径不隐式重试，也不转移未声明资源。
   virtual function rdma_status complete_reserved_error(
     rdma_handle handle
   );
@@ -260,9 +246,8 @@ class rdma_fault_inject_resource_manager extends rdma_resource_manager;
     return super.complete_reserved_error(handle);
   endfunction
 
-  // 功能：记录本次调用的名称和顺序，供测试断言转发路径；不改变被测事务的业务结果。
-  // 输入/输出及副作用：输入为调用名称、事件或 trace 数据；成功后追加测试可见记录，不改变业务资源。
-  //   空名称或记录容量边界按测试替身约定处理，不影响被测对象。
+  // 功能：在 rdma_fault_inject_resource_manager 中，record_queue_context_cleanup_complete 记录 record_queue_context_cleanup_complete 的调用名称和顺序，供测试断言转发路径；不改变被测事务业务结果。
+  // 输入/输出及副作用：handle（输入）；输入 request/image/cursor 决定写入内容；成功时更新 PI/CI、slot ledger 或 pending journal，并通过 output 返回结果。
   // 失败/边界：记录操作仅影响测试 trace；不得因注入记录故障改变生产状态或吞掉真实错误。
   virtual function rdma_status record_queue_context_cleanup_complete(
     rdma_handle handle
@@ -277,9 +262,9 @@ class rdma_fault_inject_resource_manager extends rdma_resource_manager;
     return super.record_queue_context_cleanup_complete(handle);
   endfunction
 
-  // 功能：记录本次调用的名称和顺序，供测试断言转发路径；不改变被测事务的业务结果。
-  // 输入/输出及副作用：输入为调用名称、事件或 trace 数据；成功后追加测试可见记录，不改变业务资源。
-  //   空名称或记录容量边界按测试替身约定处理，不影响被测对象。
+  // 功能：在 rdma_fault_inject_resource_manager 中，record_queue_cleanup_complete 记录 record_queue_cleanup_complete 的调用名称和顺序，供测试断言转发路径；不改变被测事务业务结果。
+  // 输入/输出及副作用：handle（输入）、role（输入）；输入 request/image/cursor 决定写入内容；成功时更新 PI/CI、slot ledger 或 pending journal，并通过 output
+  //   返回结果。
   // 失败/边界：记录操作仅影响测试 trace；不得因注入记录故障改变生产状态或吞掉真实错误。
   virtual function rdma_status record_queue_cleanup_complete(
     rdma_handle handle,
@@ -302,10 +287,9 @@ class rdma_mock_cmq_call extends uvm_object;
   rdma_cmq_command_desc command;
   rdma_cmq_ticket ticket;
 
-  // 功能：构造当前对象并初始化其字段、集合和 UVM 名称；不接管传入句柄的生命周期。
-  // 输入/输出及副作用：name 仅用于 UVM 对象命名；内部字段被初始化为安全默认值，传入句柄不转移所有权。
-  //   返回新对象实例；构造失败由 UVM 工厂或调用方处理。
-  // 失败/边界：不创建外部资源；name 为空时仍允许构造，但所有字段必须保持可配置的初始值。
+  // 功能：构造 rdma_mock_cmq_call，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：sequence=0；opcode='0；command=null；ticket=null。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_mock_cmq_call 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_mock_cmq_call");
     super.new(name);
     \sequence  = 0;
@@ -314,10 +298,9 @@ class rdma_mock_cmq_call extends uvm_object;
     ticket = null;
   endfunction
 
-  // 功能：从源对象复制可变字段并生成独立值快照；源对象保持不变，类型不匹配时报告复制错误。
-  // 输入/输出及副作用：source/rhs 是源对象；返回或写入独立副本，不修改源对象。
-  //   source/rhs 为空或类型不匹配时返回空值或触发既定复制错误。
-  // 失败/边界：空源对象不应解引用；类型不匹配必须拒绝复制或按既定 UVM 规则报告 fatal。
+  // 功能：将 rhs 中 rdma_mock_cmq_call 的值字段复制到当前对象，建立与源对象隔离的快照。
+  // 输入/输出及副作用：rhs（输入）；rhs 是源对象；当前对象字段会被覆盖，嵌套句柄按实现执行 clone 或保持非拥有引用，源对象不被修改。
+  // 失败/边界：do_copy 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（mock CMQ call copy mismatch），不保留部分有效快照。
   virtual function void do_copy(uvm_object rhs);
     rdma_mock_cmq_call rhs_call;
     uvm_object cloned_object;
@@ -345,21 +328,20 @@ typedef enum bit {
 class rdma_mock_cmq_snapshot_engine extends rdma_cmq_engine;
   `uvm_object_utils(rdma_mock_cmq_snapshot_engine)
 
-  // 功能：构造当前对象并初始化其字段、集合和 UVM 名称；不接管传入句柄的生命周期。
-  // 输入/输出及副作用：name 仅用于 UVM 对象命名；内部字段被初始化为安全默认值，传入句柄不转移所有权。
-  //   返回新对象实例；构造失败由 UVM 工厂或调用方处理。
-  // 失败/边界：不创建外部资源；name 为空时仍允许构造，但所有字段必须保持可配置的初始值。
+  // 功能：构造 rdma_mock_cmq_snapshot_engine，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：profile=rdma_hw_cmq_hw_profile::type_id::create(。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_mock_cmq_snapshot_engine 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_mock_cmq_snapshot_engine");
     super.new(name);
-    profile = rdma_xtr_v1_cmq_hw_profile::type_id::create(
+    profile = rdma_hw_cmq_hw_profile::type_id::create(
       {name, "_profile"}
     );
   endfunction
 
-  // 功能：按输入的完整标识查询当前权威记录并返回独立快照；缺失、歧义或代际过期时返回明确错误。
-  // 输入/输出及副作用：输入为完整 key/handle，output 或返回值为记录快照；查询不改变登记表和外部资源。
-  //   缺失、歧义、空句柄或旧 generation/reset epoch 返回明确错误。
-  // 失败/边界：查询不到唯一记录、输入为空或 authority 已失效时返回错误，不回退到默认 Function/root。
+  // 功能：在 rdma_mock_cmq_snapshot_engine 中，snapshot_command_for_mock 按完整 key/handle 查找唯一权威记录并返回 detached 快照，避免把内部可变引用泄露给调用方。
+  // 输入/输出及副作用：source（输入）、snapshot（输出）、staging_invariant_failed（输出）；输入 handle/key/cursor 用于选择读取范围；返回值或 output 为
+  //   detached 快照，读取不取得外部资源所有权。
+  // 失败/边界：snapshot_command_for_mock 在 key/handle 缺失、记录不唯一或 generation/reset epoch 过期时返回明确错误，不回退到默认 authority。
   function rdma_status snapshot_command_for_mock(
     rdma_cmq_command_desc source,
     output rdma_cmq_command_desc snapshot,
@@ -378,10 +360,9 @@ class rdma_mock_cmq_outcome extends uvm_object;
   // Optional decoded payload used by scripted QUERY completions.
   uvm_object decoded_response;
 
-  // 功能：构造当前对象并初始化其字段、集合和 UVM 名称；不接管传入句柄的生命周期。
-  // 输入/输出及副作用：name 仅用于 UVM 对象命名；内部字段被初始化为安全默认值，传入句柄不转移所有权。
-  //   返回新对象实例；构造失败由 UVM 工厂或调用方处理。
-  // 失败/边界：不创建外部资源；name 为空时仍允许构造，但所有字段必须保持可配置的初始值。
+  // 功能：构造 rdma_mock_cmq_outcome，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：kind=RDMA_MOCK_CMQ_COMPLETION；status=null；decoded_response=null。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_mock_cmq_outcome 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_mock_cmq_outcome");
     super.new(name);
     kind = RDMA_MOCK_CMQ_COMPLETION;
@@ -397,10 +378,9 @@ class rdma_mock_cmq_reconcile_script extends uvm_object;
   rdma_cmq_completion completion;
   rdma_status status;
 
-  // 功能：构造当前对象并初始化其字段、集合和 UVM 名称；不接管传入句柄的生命周期。
-  // 输入/输出及副作用：name 仅用于 UVM 对象命名；内部字段被初始化为安全默认值，传入句柄不转移所有权。
-  //   返回新对象实例；构造失败由 UVM 工厂或调用方处理。
-  // 失败/边界：不创建外部资源；name 为空时仍允许构造，但所有字段必须保持可配置的初始值。
+  // 功能：构造 rdma_mock_cmq_reconcile_script，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：terminal_known=1'b0；completion=null；status=null。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_mock_cmq_reconcile_script 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_mock_cmq_reconcile_script");
     super.new(name);
     terminal_known = 1'b0;
@@ -432,10 +412,9 @@ class rdma_mock_cmq_port extends rdma_cmq_port;
   protected rdma_status role_failures[string];
   protected int unsigned method_ordinals[string];
 
-  // 功能：构造当前对象并初始化其字段、集合和 UVM 名称；不接管传入句柄的生命周期。
-  // 输入/输出及副作用：name 仅用于 UVM 对象命名；内部字段被初始化为安全默认值，传入句柄不转移所有权。
-  //   返回新对象实例；构造失败由 UVM 工厂或调用方处理。
-  // 失败/边界：不创建外部资源；name 为空时仍允许构造，但所有字段必须保持可配置的初始值。
+  // 功能：构造 rdma_mock_cmq_port，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：next_sequence=1；entered=new({name, "_entered"})；release_gate=new({name, "_release_gate"})；call_trace=null；gate_enabled=1'b0；gated_opcode='0；gate_target_count=1；gate_entered_count=0；其余字段按实现默认值初始化。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_mock_cmq_port 构造只建立本地初始状态；本地 semaphore/ledger 等按构造体显式分配，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_mock_cmq_port");
     super.new(name);
     calls.delete();
@@ -458,26 +437,23 @@ class rdma_mock_cmq_port extends rdma_cmq_port;
     );
   endfunction
 
-  // 功能：处理 last_execute_definitive_no_submit：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 last_execute_no_submit_proven 用于执行 last_execute_definitive_no_submit；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：last_execute_definitive_no_submit 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：在 rdma_mock_cmq_port 中，last_execute_definitive_no_submit 只读查询当前运行时/测试账本，返回槽位、对象或恢复记录的快照而不推进事务。
+  // 输入/输出及副作用：无显式参数；last_execute_definitive_no_submit 读取固定返回值或局部计算结果，不使用对象成员字段；函数返回 bit，不取得调用方资源所有权。
+  // 失败/边界：last_execute_definitive_no_submit 的结果直接由 return last_execute_no_submit_proven 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   virtual function bit last_execute_definitive_no_submit();
     return last_execute_no_submit_proven;
   endfunction
 
-  // 功能：记录本次调用的名称和顺序，供测试断言转发路径；不改变被测事务的业务结果。
-  // 输入/输出及副作用：输入为调用名称、事件或 trace 数据；成功后追加测试可见记录，不改变业务资源。
-  //   空名称或记录容量边界按测试替身约定处理，不影响被测对象。
+  // 功能：在 rdma_mock_cmq_port 中，set_call_trace 记录 set_call_trace 的调用名称和顺序，供测试断言转发路径；不改变被测事务业务结果。
+  // 输入/输出及副作用：trace（输入）；set_call_trace 先依据 依赖存在性、authority 和 generation 条件 校验 trace；成功时更新本对象配置/状态并保存非拥有引用，返回 void。
   // 失败/边界：记录操作仅影响测试 trace；不得因注入记录故障改变生产状态或吞掉真实错误。
   function void set_call_trace(rdma_mock_call_trace trace);
     call_trace = trace;
   endfunction
 
-  // 功能：处理 gate_opcode：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 opcode 用于执行 gate_opcode；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：gate_opcode 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：在 rdma_mock_cmq_port 中，gate_opcode 配置测试 fixture 的定向故障或替代依赖，使下一次调用覆盖指定边界路径。
+  // 输入/输出及副作用：opcode（输入）；gate_opcode 读取 opcode 并使用输入参数和固定枚举/常量；函数返回 void，不取得调用方资源所有权。
+  // 失败/边界：gate_opcode 无返回值，仅执行 函数体中的顺序操作；调用方须保证前置依赖已经绑定，函数不自动重试或接管外部资源。
   function void gate_opcode(bit [7:0] opcode);
     gate_opcode_count(opcode, 1);
   endfunction
@@ -485,17 +461,15 @@ class rdma_mock_cmq_port extends rdma_cmq_port;
   // Lifecycle-test naming for the CMQ pause barrier.  The gate only waits on
   // the selected opcode and does not hold any adapter mutex, so other
   // Functions may continue to enter execute().
-  // 功能：处理 pause_cmq_opcode：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 opcode 用于执行 pause_cmq_opcode；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：pause_cmq_opcode 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：在 rdma_mock_cmq_port 中，pause_cmq_opcode 配置测试 fixture 的定向故障或替代依赖，使下一次调用覆盖指定边界路径。
+  // 输入/输出及副作用：opcode（输入）；pause_cmq_opcode 驱动下游事务；函数返回 无直接返回值，不取得调用方资源所有权。
+  // 失败/边界：pause_cmq_opcode 异常完成由下游接口或 UVM 报告机制发布；该路径不隐式重试，也不转移未声明资源。
   task pause_cmq_opcode(bit [7:0] opcode);
     gate_opcode(opcode);
   endtask
 
   // 功能：控制 wait_until_paused 对应的等待、异常或同步边界，按超时/捕获结果返回状态，不吞掉原始错误。
-  // 输入/输出及副作用：参数 observed 用于执行 wait_until_paused；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
+  // 输入/输出及副作用：opcode（输入）；wait_until_paused 驱动下游事务；函数返回 无直接返回值，不取得调用方资源所有权。
   // 失败/边界：wait_until_paused 超时或异常必须返回原始错误证据；不得无限等待或跳过同步边界。
   task wait_until_paused(bit [7:0] opcode);
     bit observed;
@@ -504,19 +478,17 @@ class rdma_mock_cmq_port extends rdma_cmq_port;
     observed = 1'b1;
   endtask
 
-  // 功能：按资源所有权和幂等规则释放或清理记录；重复释放不会再次扣减 credit，也不触碰已隔离资源。
-  // 输入/输出及副作用：输入为待解除或释放的 handle/key；成功后隔离或删除本对象记录，外部拥有者仍负责真正销毁。
-  //   空值、未知记录或重复调用按接口约定返回错误或幂等成功。
-  // 失败/边界：不得释放非本对象所有资源；重复解除按幂等约定处理，旧 handle 不得重新激活。
+  // 功能：在 rdma_mock_cmq_port 中，release_cmq_opcode 按 owner、generation 和幂等规则释放/隔离记录，并同步删除其账本引用。
+  // 输入/输出及副作用：opcode（输入）；输入 handle/mapping/token 指定释放目标；成功时更新账本和生命周期，外部资源只按 adapter 契约释放。
+  // 失败/边界：release_cmq_opcode 发现 owner/generation 不匹配、记录未知或重复释放时返回错误或幂等结果，不重新激活旧句柄。
   function void release_cmq_opcode(bit [7:0] opcode);
     if (gate_enabled && gated_opcode == opcode)
       release_one();
   endfunction
 
-  // 功能：把输入错误或注入故障转换成统一的 rdma_status，供上层沿原事务路径处理。
-  // 输入/输出及副作用：输入为错误消息、错误码或故障证据；返回统一 rdma_status，不推进事务游标。
-  //   空消息仍需保留错误类别；未知错误码不得被静默转换为成功。
-  // 失败/边界：错误路径不能返回成功状态；消息和错误码缺失时仍须保留可诊断类别。
+  // 功能：在 rdma_mock_cmq_port 中，fail_role_call 把错误消息、硬件码或注入故障封装为统一 rdma_status，保留原事务的诊断证据。
+  // 输入/输出及副作用：method_name（输入）、role（输入）、ordinal（输入）、status（输入）；fail_role_call 读取 method_name、role、ordinal、status 并使用输入参数和固定枚举/常量；函数返回 void，不取得调用方资源所有权。
+  // 失败/边界：fail_role_call 无返回值，仅执行 函数体中的顺序操作；调用方须保证前置依赖已经绑定，函数不自动重试或接管外部资源。
   function void fail_role_call(string method_name,
                                rdma_queue_backing_role_e role,
                                int unsigned ordinal,
@@ -527,9 +499,8 @@ class rdma_mock_cmq_port extends rdma_cmq_port;
     end
   endfunction
 
-  // 功能：清理当前运行状态并建立新的复位/代际边界，使旧句柄或旧事务不能继续生效。
-  // 输入/输出及副作用：参数 delete 用于执行 reset；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
+  // 功能：在 rdma_mock_cmq_port 中，reset reset 清理当前运行状态并建立新的复位/代际边界，使旧句柄或旧事务不能继续生效。
+  // 输入/输出及副作用：无显式参数；输入 action/epoch/handle 决定迁移目标；成功时更新状态或恢复证据，外部资源仍由其拥有者管理。
   // 失败/边界：复位参数为零、代际回退或存在未处理 pending 事务时拒绝更新 authority。
   function void reset();
     calls.delete(); outcomes.delete(); late_completions.delete();
@@ -543,10 +514,9 @@ class rdma_mock_cmq_port extends rdma_cmq_port;
 
   // Hold all matching CMQ executions until release_one(), allowing tests to
   // establish a deterministic multi-Function barrier.
-  // 功能：处理 gate_opcode_count：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 opcode, gated_opcode 用于执行 gate_opcode_count；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：gate_opcode_count 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：在 rdma_mock_cmq_port 中，gate_opcode_count 配置测试 fixture 的定向故障或替代依赖，使下一次调用覆盖指定边界路径。
+  // 输入/输出及副作用：opcode（输入）、count（输入）；gate_opcode_count 读取 opcode、count 并使用字段 gated_opcode、gate_enabled、gate_target_count、gate_entered_count；函数返回 void，不取得调用方资源所有权。
+  // 失败/边界：gate_opcode_count 无返回值，仅执行 gated_opcode=opcode、gate_enabled=1'b1、gate_target_count=(count == 0) ? 1 : count、gate_entered_count=0；调用方须保证前置依赖已经绑定，函数不自动重试或接管外部资源。
   function void gate_opcode_count(bit [7:0] opcode, int unsigned count);
     gated_opcode = opcode;
     gate_enabled = 1'b1;
@@ -557,8 +527,7 @@ class rdma_mock_cmq_port extends rdma_cmq_port;
   endfunction
 
   // 功能：控制 wait_until_entered 对应的等待、异常或同步边界，按超时/捕获结果返回状态，不吞掉原始错误。
-  // 输入/输出及副作用：参数 expected_count, timeout, observed 用于执行 wait_until_entered；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
+  // 输入/输出及副作用：expected_count（输入）、timeout（输入）、observed（输出）；wait_until_entered 驱动下游事务，并写入 observed；函数返回 无直接返回值，不取得调用方资源所有权。
   // 失败/边界：wait_until_entered 超时或异常必须返回原始错误证据；不得无限等待或跳过同步边界。
   task wait_until_entered(
     int unsigned expected_count,
@@ -579,35 +548,31 @@ class rdma_mock_cmq_port extends rdma_cmq_port;
     disable wait_for_mock_cmq_gate;
   endtask
 
-  // 功能：按资源所有权和幂等规则释放或清理记录；重复释放不会再次扣减 credit，也不触碰已隔离资源。
-  // 输入/输出及副作用：输入为待解除或释放的 handle/key；成功后隔离或删除本对象记录，外部拥有者仍负责真正销毁。
-  //   空值、未知记录或重复调用按接口约定返回错误或幂等成功。
-  // 失败/边界：不得释放非本对象所有资源；重复解除按幂等约定处理，旧 handle 不得重新激活。
+  // 功能：在 rdma_mock_cmq_port 中，release_one 按 owner、generation 和幂等规则释放/隔离记录，并同步删除其账本引用。
+  // 输入/输出及副作用：无显式参数；输入 handle/mapping/token 指定释放目标；成功时更新账本和生命周期，外部资源只按 adapter 契约释放。
+  // 失败/边界：release_one 发现 owner/generation 不匹配、记录未知或重复释放时返回错误或幂等结果，不重新激活旧句柄。
   task release_one();
     gate_enabled = 1'b0;
     release_gate.trigger();
   endtask
 
-  // 功能：把输入错误或注入故障转换成统一的 rdma_status，供上层沿原事务路径处理。
-  // 输入/输出及副作用：输入为错误消息、错误码或故障证据；返回统一 rdma_status，不推进事务游标。
-  //   空消息仍需保留错误类别；未知错误码不得被静默转换为成功。
-  // 失败/边界：错误路径不能返回成功状态；消息和错误码缺失时仍须保留可诊断类别。
+  // 功能：在 rdma_mock_cmq_port 中，invalid_argument 把错误消息、硬件码或注入故障封装为统一 rdma_status，保留原事务的诊断证据。
+  // 输入/输出及副作用：message（输入）；invalid_argument 读取 message 并使用字段 rdma_status；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：invalid_argument 返回 RDMA_SC_INVALID_ARGUMENT；失败路径不提交部分状态或转移未声明资源。
   protected function rdma_status invalid_argument(string message);
     return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, message);
   endfunction
 
-  // 功能：把输入错误或注入故障转换成统一的 rdma_status，供上层沿原事务路径处理。
-  // 输入/输出及副作用：输入为错误消息、错误码或故障证据；返回统一 rdma_status，不推进事务游标。
-  //   空消息仍需保留错误类别；未知错误码不得被静默转换为成功。
-  // 失败/边界：错误路径不能返回成功状态；消息和错误码缺失时仍须保留可诊断类别。
+  // 功能：在 rdma_mock_cmq_port 中，invalid_state 把错误消息、硬件码或注入故障封装为统一 rdma_status，保留原事务的诊断证据。
+  // 输入/输出及副作用：message（输入）；invalid_state 读取 message 并使用字段 rdma_status；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：invalid_state 返回 RDMA_SC_INVALID_STATE；失败路径不提交部分状态或转移未声明资源。
   protected function rdma_status invalid_state(string message);
     return rdma_status::make(RDMA_SC_INVALID_STATE, message);
   endfunction
 
-  // 功能：执行一次受控事务并推进所属状态机；返回结果时保留失败阶段、代际和后端提交证据。
-  // 输入/输出及副作用：参数 opcode, flush_ordinal 用于执行 execute_role；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：事务超时、代际变化或提交证据不完整时不得推进下一阶段。
+  // 功能：在 rdma_mock_cmq_port 中，execute_role 执行受控事务并按后端提交证据推进状态机，同时保留失败阶段和 generation 证据。
+  // 输入/输出及副作用：opcode（输入）、flush_ordinal（输入）；execute_role 可能更新本对象明确拥有的状态；函数返回 rdma_queue_backing_role_e，不取得调用方资源所有权。
+  // 失败/边界：execute_role 遇到锁、超时、generation 变化或提交证据不完整时保持原状态，不推进游标。
   protected function rdma_queue_backing_role_e execute_role(
     bit [7:0] opcode,
     int unsigned flush_ordinal
@@ -615,15 +580,15 @@ class rdma_mock_cmq_port extends rdma_cmq_port;
     string key;
 
     case (opcode)
-      XTR_V1_OP_CQC_CREATE, XTR_V1_OP_CQC_DELETE,
-      XTR_V1_OP_CQC_QUERY: return RDMA_QUEUE_ROLE_CQ_RING;
-      XTR_V1_OP_SRFQC_CREATE, XTR_V1_OP_SRFQC_DELETE,
-      XTR_V1_OP_SRFQC_QUERY: return RDMA_QUEUE_ROLE_SRQ_RING;
-      XTR_V1_OP_CEQC_CREATE, XTR_V1_OP_CEQC_DELETE,
-      XTR_V1_OP_CEQC_QUERY: return RDMA_QUEUE_ROLE_CEQ_RING;
-      XTR_V1_OP_AEQC_CREATE, XTR_V1_OP_AEQC_DELETE,
-      XTR_V1_OP_AEQC_QUERY: return RDMA_QUEUE_ROLE_AEQ_RING;
-      XTR_V1_OP_OCC_FLUSH: begin
+      RDMA_OP_CQC_CREATE, RDMA_OP_CQC_DELETE,
+      RDMA_OP_CQC_QUERY: return RDMA_QUEUE_ROLE_CQ_RING;
+      RDMA_OP_SRFQC_CREATE, RDMA_OP_SRFQC_DELETE,
+      RDMA_OP_SRFQC_QUERY: return RDMA_QUEUE_ROLE_SRQ_RING;
+      RDMA_OP_CEQC_CREATE, RDMA_OP_CEQC_DELETE,
+      RDMA_OP_CEQC_QUERY: return RDMA_QUEUE_ROLE_CEQ_RING;
+      RDMA_OP_AEQC_CREATE, RDMA_OP_AEQC_DELETE,
+      RDMA_OP_AEQC_QUERY: return RDMA_QUEUE_ROLE_AEQ_RING;
+      RDMA_OP_OCC_FLUSH: begin
         // SRQ has two ordered PD flushes.  CQ has one post-delete PD flush;
         // prefer an explicitly scripted CQ role when present, otherwise use
         // the canonical SRQ ordinal mapping.
@@ -640,9 +605,8 @@ class rdma_mock_cmq_port extends rdma_cmq_port;
     endcase
   endfunction
 
-  // 功能：执行 take_role_failure 指定的测试或恢复状态变更，更新受控账本并保留可回滚的故障证据。
-  // 输入/输出及副作用：参数 method_name, role, ordinal 用于执行 take_role_failure；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
+  // 功能：在 rdma_mock_cmq_port 中，take_role_failure 执行 take_role_failure 的take_role_failure 指定的测试或恢复状态变更，更新受控账本并保留可回滚的故障证据。
+  // 输入/输出及副作用：method_name（输入）、role（输入）、ordinal（输入）；take_role_failure 读取 method_name、role、ordinal 并使用字段 key、failure；函数返回 rdma_status，不取得调用方资源所有权。
   // 失败/边界：take_role_failure 仅允许测试/恢复范围内的状态变更；代际或资源不匹配时拒绝并保留原账本。
   protected function rdma_status take_role_failure(
     string method_name,
@@ -659,10 +623,9 @@ class rdma_mock_cmq_port extends rdma_cmq_port;
     return failure;
   endfunction
 
-  // 功能：比较两个输入对象的协议字段或身份快照并返回确定的相等性结果，不修改任一输入。
-  // 输入/输出及副作用：输入为待比较的两个值对象；返回 bit/状态结果，不修改任一输入或外部账本。
-  //   任一对象为空、类型不符或字段未初始化时按接口约定返回不相等或错误。
-  // 失败/边界：比较输入为空或类型不符时不得抛出未处理异常；结果必须保持确定且无副作用。
+  // 功能：在 rdma_mock_cmq_port 中由 same_ticket 逐字段比较输入值，返回结构、身份或序列化内容是否一致。
+  // 输入/输出及副作用：lhs（输入）、rhs（输入）；比较对象/数组只读；返回 bit 或状态结果，不更新 runtime、账本或外部 adapter。
+  // 失败/边界：same_ticket 的任一比较对象为空或类型不符时返回确定的 false/不等结果，不抛出未处理异常。
   protected function bit same_ticket(
     rdma_cmq_ticket lhs,
     rdma_cmq_ticket rhs
@@ -682,10 +645,9 @@ class rdma_mock_cmq_port extends rdma_cmq_port;
            lhs.absolute_deadline == rhs.absolute_deadline;
   endfunction
 
-  // 功能：处理 ticket_key：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 sq_wrap 用于执行 ticket_key；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：ticket_key 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：在 rdma_mock_cmq_port 中，ticket_key 把 Function/对象身份、代际和游标字段拼成稳定的查找键，供登记表去重和恢复路由使用。
+  // 输入/输出及副作用：ticket（输入）；ticket_key 读取 ticket 并使用字段 function_uid、object_id、generation；函数返回 string，不取得调用方资源所有权。
+// 失败/边界：ticket_key 只按函数体列出的身份、generation、kind、object_id 或 cursor 字段拼接键；调用方须先完成空句柄校验，函数本身不分配资源、不自动回退到 root0。
   protected function string ticket_key(rdma_cmq_ticket ticket);
     return $sformatf(
       "%016h:%08h:%08h:%016h:%016h:%08h:%0b",
@@ -699,10 +661,9 @@ class rdma_mock_cmq_port extends rdma_cmq_port;
     );
   endfunction
 
-  // 功能：处理 ticket_was_recorded：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 begi 用于执行 ticket_was_recorded；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：ticket_was_recorded 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：在 rdma_mock_cmq_port 中，ticket_was_recorded 检查当前事务或测试证据是否满足指定布尔条件，供恢复分类和断言选择后续路径。
+  // 输入/输出及副作用：ticket（输入）；ticket_was_recorded 读取 ticket 并使用字段 calls；函数返回 bit，不取得调用方资源所有权。
+  // 失败/边界：ticket_was_recorded 比较或前置条件不满足时返回 0/false；该路径不隐式重试，也不转移未声明资源。
   protected function bit ticket_was_recorded(rdma_cmq_ticket ticket);
     foreach (calls[i]) begin
       if (calls[i] != null && same_ticket(calls[i].ticket, ticket))
@@ -711,10 +672,9 @@ class rdma_mock_cmq_port extends rdma_cmq_port;
     return 1'b0;
   endfunction
 
-  // 功能：按输入的完整标识查询当前权威记录并返回独立快照；缺失、歧义或代际过期时返回明确错误。
-  // 输入/输出及副作用：输入为完整 key/handle，output 或返回值为记录快照；查询不改变登记表和外部资源。
-  //   缺失、歧义、空句柄或旧 generation/reset epoch 返回明确错误。
-  // 失败/边界：查询不到唯一记录、输入为空或 authority 已失效时返回错误，不回退到默认 Function/root。
+  // 功能：在 rdma_mock_cmq_port 中，snapshot_command 按完整 key/handle 查找唯一权威记录并返回 detached 快照，避免把内部可变引用泄露给调用方。
+  // 输入/输出及副作用：source（输入）、snapshot（输出）；snapshot_command 读取 source、snapshot 并使用字段 snapshot、staging_invariant_failed、snapshot_status、status_copy，并写入 snapshot；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：snapshot_command 在 key/handle 缺失、记录不唯一或 generation/reset epoch 过期时返回明确错误，不回退到默认 authority。
   protected function rdma_status snapshot_command(
     rdma_cmq_command_desc source,
     output rdma_cmq_command_desc snapshot
@@ -750,10 +710,9 @@ class rdma_mock_cmq_port extends rdma_cmq_port;
     return rdma_status::success();
   endfunction
 
-  // 功能：依据输入请求创建对应的值对象或资源计划，并校验依赖、所有权和生命周期后返回结果。
-  // 输入/输出及副作用：输入请求、容量和依赖用于构造/预留资源；返回独立对象或状态，不暴露内部可变集合。
-  //   参数越界、容量不足或构造中途失败时回滚已登记的局部状态。
-  // 失败/边界：依赖为空、参数越界、容量不足或构造步骤失败时清理局部结果并返回明确错误。
+  // 功能：make_ticket 创建独立的 rdma_status；根据 command、call_sequence、ticket 设置字段 ticket、ticket.command_id、ticket.function_h、function_h.kind、function_h.function_uid、function_h.object_id、function_h.generation、ticket.cmq_h、cmq_h.kind、cmq_h.function_uid，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：command（输入）、call_sequence（输入）、ticket（输出）；make_ticket 读取 command、call_sequence、ticket 并使用字段 ticket、ticket.command_id、ticket.function_h、function_h.kind、function_h.function_uid、function_h.object_id、function_h.generation、ticket.cmq_h，并写入 ticket；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：make_ticket 返回 RDMA_SC_INVALID_STATE；典型拒绝条件为“mock CMQ ticket source is incomplete”；失败路径不提交部分状态或转移未声明资源。
   protected function rdma_status make_ticket(
     rdma_cmq_command_desc command,
     longint unsigned call_sequence,
@@ -799,10 +758,9 @@ class rdma_mock_cmq_port extends rdma_cmq_port;
     return rdma_status::success();
   endfunction
 
-  // 功能：依据输入请求创建对应的值对象或资源计划，并校验依赖、所有权和生命周期后返回结果。
-  // 输入/输出及副作用：输入请求、容量和依赖用于构造/预留资源；返回独立对象或状态，不暴露内部可变集合。
-  //   参数越界、容量不足或构造中途失败时回滚已登记的局部状态。
-  // 失败/边界：依赖为空、参数越界、容量不足或构造步骤失败时清理局部结果并返回明确错误。
+  // 功能：make_completion 创建独立的 rdma_cmq_completion；根据 ticket、result_status、with_raw_cqe 设置字段 completion、completion.ticket、completion.status、status.source_engine、status.function_uid、status.generation、status.resource_id、status.command_id、completion.raw_cqe、i，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：ticket（输入）、result_status（输入）、with_raw_cqe（输入）；make_completion 读取 ticket、result_status、with_raw_cqe 并使用字段 completion、completion.ticket、completion.status、status.source_engine、status.function_uid、status.generation、status.resource_id、status.command_id；函数返回 rdma_cmq_completion，不取得调用方资源所有权。
+  // 失败/边界：make_completion 输入对象为空或查找未命中时返回 null；该路径不隐式重试，也不转移未声明资源。
   protected function rdma_cmq_completion make_completion(
     rdma_cmq_ticket ticket,
     rdma_status result_status,
@@ -848,10 +806,9 @@ class rdma_mock_cmq_port extends rdma_cmq_port;
     return completion;
   endfunction
 
-  // 功能：把输入错误或注入故障转换成统一的 rdma_status，供上层沿原事务路径处理。
-  // 输入/输出及副作用：输入为错误消息、错误码或故障证据；返回统一 rdma_status，不推进事务游标。
-  //   空消息仍需保留错误类别；未知错误码不得被静默转换为成功。
-  // 失败/边界：错误路径不能返回成功状态；消息和错误码缺失时仍须保留可诊断类别。
+  // 功能：在 rdma_mock_cmq_port 中，fail_opcode 把错误消息、硬件码或注入故障封装为统一 rdma_status，保留原事务的诊断证据。
+  // 输入/输出及副作用：opcode（输入）、status（输入）；fail_opcode 读取 opcode、status 并使用字段 outcome、outcome.kind、outcome.status；函数返回 void，不取得调用方资源所有权。
+  // 失败/边界：fail_opcode 无返回值，仅执行 outcome=new("mock_cmq_failure_outcome")、outcome.kind=RDMA_MOCK_CMQ_COMPLETION、outcome.status=rdma_cmq_clone_status_value(status)；调用方须保证前置依赖已经绑定，函数不自动重试或接管外部资源。
   function void fail_opcode(bit [7:0] opcode, rdma_status status);
     rdma_mock_cmq_outcome outcome;
 
@@ -861,10 +818,9 @@ class rdma_mock_cmq_port extends rdma_cmq_port;
     outcomes[opcode].push_back(outcome);
   endfunction
 
-  // 功能：处理 timeout_opcode：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 outcome 用于执行 timeout_opcode；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：timeout_opcode 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：在 rdma_mock_cmq_port 中，timeout_opcode 配置测试 fixture 的定向故障或替代依赖，使下一次调用覆盖指定边界路径。
+  // 输入/输出及副作用：opcode（输入）；timeout_opcode 读取 opcode 并使用字段 outcome、outcome.kind、outcome.status；函数返回 void，不取得调用方资源所有权。
+  // 失败/边界：timeout_opcode 无返回值，仅执行 outcome=new("mock_cmq_timeout_outcome")、outcome.kind=RDMA_MOCK_CMQ_TIMEOUT、outcome.status=null；调用方须保证前置依赖已经绑定，函数不自动重试或接管外部资源。
   function void timeout_opcode(bit [7:0] opcode);
     rdma_mock_cmq_outcome outcome;
 
@@ -878,8 +834,8 @@ class rdma_mock_cmq_port extends rdma_cmq_port;
   // late-completion FIFO.  The script is keyed by the complete ticket
   // identity, so unrelated commands cannot consume its terminal evidence.
   // 功能：执行 script_reconcile 指定的测试或恢复状态变更，更新受控账本并保留可回滚的故障证据。
-  // 输入/输出及副作用：参数 ticket, terminal_known, completion, status 用于执行 script_reconcile；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
+  // 输入/输出及副作用：ticket（输入）、terminal_known（输入）、completion（输入）、status（输入）；script_reconcile 读取 ticket、terminal_known、completion、status 并使用字段 key、script、script.terminal_known、script.status、cloned_object、completion_copy.ticket、script.completion；函数返回 void，不取得调用方资源所有权。
+
   // 失败/边界：script_reconcile 仅允许测试/恢复范围内的状态变更；代际或资源不匹配时拒绝并保留原账本。
   function void script_reconcile(
     rdma_cmq_ticket ticket,
@@ -916,11 +872,10 @@ class rdma_mock_cmq_port extends rdma_cmq_port;
   endfunction
 
   // Script a terminal QUERY result.  Response payload may be a
-  // rdma_xtr_v1_cmq_completion payload or any other uvm_object; the policy
+  // rdma_hw_cmq_completion payload or any other uvm_object; the policy
   // classifier decides whether the object is authentic evidence.
   // 功能：执行 script_query_context 指定的测试或恢复状态变更，更新受控账本并保留可回滚的故障证据。
-  // 输入/输出及副作用：参数 opcode, response_context, status 用于执行 script_query_context；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
+  // 输入/输出及副作用：opcode（输入）、response_context（输入）、status（输入）；script_query_context 读取 opcode、response_context、status 并使用字段 outcome、outcome.kind、outcome.status、outcome.decoded_response；函数返回 void，不取得调用方资源所有权。
   // 失败/边界：script_query_context 仅允许测试/恢复范围内的状态变更；代际或资源不匹配时拒绝并保留原账本。
   function void script_query_context(
     bit [7:0] opcode,
@@ -942,10 +897,9 @@ class rdma_mock_cmq_port extends rdma_cmq_port;
     outcomes[opcode].push_back(outcome);
   endfunction
 
-  // 功能：处理 push_late_completion：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 ticket, status 用于执行 push_late_completion；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：push_late_completion 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：在 rdma_mock_cmq_port 中，push_late_completion 将输入对象登记或挂接到当前集合/依赖图，并同步维护对应账本和生命周期引用。
+  // 输入/输出及副作用：ticket（输入）、status（输入）；push_late_completion 可能更新本对象明确拥有的状态；函数返回 void，不取得调用方资源所有权。
+  // 失败/边界：push_late_completion 无返回值，仅执行 validation_status=ticket.validate()、completion=make_completion(ticket, status, 1'b1)、key=ticket_key(ticket)；调用方须保证前置依赖已经绑定，函数不自动重试或接管外部资源。
   function void push_late_completion(
     rdma_cmq_ticket ticket,
     rdma_status status
@@ -966,10 +920,9 @@ class rdma_mock_cmq_port extends rdma_cmq_port;
     late_completions[key].push_back(completion);
   endfunction
 
-  // 功能：按输入的完整标识查询当前权威记录并返回独立快照；缺失、歧义或代际过期时返回明确错误。
-  // 输入/输出及副作用：输入为完整 key/handle，output 或返回值为记录快照；查询不改变登记表和外部资源。
-  //   缺失、歧义、空句柄或旧 generation/reset epoch 返回明确错误。
-  // 失败/边界：查询不到唯一记录、输入为空或 authority 已失效时返回错误，不回退到默认 Function/root。
+  // 功能：在 rdma_mock_cmq_port 中，get_opcodes 按完整 key/handle 查找唯一权威记录并返回 detached 快照，避免把内部可变引用泄露给调用方。
+  // 输入/输出及副作用：values（输出）；get_opcodes 读取 values 并使用字段 calls、i，并写入 values；函数返回 void，不取得调用方资源所有权。
+  // 失败/边界：get_opcodes 在 key/handle 缺失、记录不唯一或 generation/reset epoch 过期时返回明确错误，不回退到默认 authority。
   function void get_opcodes(output bit [7:0] values[$]);
     values.delete();
     foreach (calls[i]) begin
@@ -978,10 +931,10 @@ class rdma_mock_cmq_port extends rdma_cmq_port;
     end
   endfunction
 
-  // 功能：执行一次受控事务并推进所属状态机；返回结果时保留失败阶段、代际和后端提交证据。
-  // 输入/输出及副作用：参数 command, ticket, completion, status 用于执行 execute；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：事务超时、代际变化或提交证据不完整时不得推进下一阶段。
+  // 功能：在 rdma_mock_cmq_port 中，execute 执行受控事务并按后端提交证据推进状态机，同时保留失败阶段和 generation 证据。
+  // 输入/输出及副作用：command（输入）、ticket（输出）、completion（输出）、status（输出）；execute 驱动下游事务，并写入 ticket、completion、status；函数返回 无直接返回值，不取得调用方资源所有权。
+
+  // 失败/边界：execute 遇到锁、超时、generation 变化或提交证据不完整时保持原状态，不推进游标。
   virtual task execute(
     rdma_cmq_command_desc command,
     output rdma_cmq_ticket ticket,
@@ -1052,8 +1005,8 @@ class rdma_mock_cmq_port extends rdma_cmq_port;
     method_name = "";
     method_ordinal = 0;
     flush_ordinal = 0;
-    if (opcode inside {XTR_V1_OP_CQC_CREATE, XTR_V1_OP_SRFQC_CREATE,
-                       XTR_V1_OP_CEQC_CREATE, XTR_V1_OP_AEQC_CREATE}) begin
+    if (opcode inside {RDMA_OP_CQC_CREATE, RDMA_OP_SRFQC_CREATE,
+                       RDMA_OP_CEQC_CREATE, RDMA_OP_AEQC_CREATE}) begin
       method_name = "create_terminal";
       method_ordinals[method_name]++;
       method_ordinal = method_ordinals[method_name];
@@ -1063,23 +1016,23 @@ class rdma_mock_cmq_port extends rdma_cmq_port;
         scripted_failure = take_role_failure("create_submit", role,
                                              method_ordinal);
     end
-    else if (opcode inside {XTR_V1_OP_CQC_DELETE, XTR_V1_OP_SRFQC_DELETE,
-                            XTR_V1_OP_CEQC_DELETE, XTR_V1_OP_AEQC_DELETE}) begin
+    else if (opcode inside {RDMA_OP_CQC_DELETE, RDMA_OP_SRFQC_DELETE,
+                            RDMA_OP_CEQC_DELETE, RDMA_OP_AEQC_DELETE}) begin
       method_name = "delete";
       method_ordinals[method_name]++;
       method_ordinal = method_ordinals[method_name];
       role = execute_role(opcode, 0);
       scripted_failure = take_role_failure(method_name, role, method_ordinal);
     end
-    else if (opcode inside {XTR_V1_OP_CQC_QUERY, XTR_V1_OP_SRFQC_QUERY,
-                            XTR_V1_OP_CEQC_QUERY, XTR_V1_OP_AEQC_QUERY}) begin
+    else if (opcode inside {RDMA_OP_CQC_QUERY, RDMA_OP_SRFQC_QUERY,
+                            RDMA_OP_CEQC_QUERY, RDMA_OP_AEQC_QUERY}) begin
       method_name = "query";
       method_ordinals[method_name]++;
       method_ordinal = method_ordinals[method_name];
       role = execute_role(opcode, 0);
       scripted_failure = take_role_failure(method_name, role, method_ordinal);
     end
-    else if (opcode == XTR_V1_OP_OCC_FLUSH) begin
+    else if (opcode == RDMA_OP_OCC_FLUSH) begin
       method_name = "flush";
       method_ordinals[method_name]++;
       flush_ordinal = method_ordinals[method_name];
@@ -1131,10 +1084,10 @@ class rdma_mock_cmq_port extends rdma_cmq_port;
     end
   endtask
 
-  // 功能：执行一次受控事务并推进所属状态机；返回结果时保留失败阶段、代际和后端提交证据。
-  // 输入/输出及副作用：参数 ticket, terminal_known, completion, status 用于执行 reconcile；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：事务超时、代际变化或提交证据不完整时不得推进下一阶段。
+  // 功能：在 rdma_mock_cmq_port 中，reconcile 执行受控事务并按后端提交证据推进状态机，同时保留失败阶段和 generation 证据。
+  // 输入/输出及副作用：ticket（输入）、terminal_known（输出）、completion（输出）、status（输出）；输入 action/epoch/handle
+  //   决定迁移目标；成功时更新状态或恢复证据，外部资源仍由其拥有者管理。
+  // 失败/边界：reconcile 遇到锁、超时、generation 变化或提交证据不完整时保持原状态，不推进游标。
   virtual task reconcile(
     rdma_cmq_ticket ticket,
     output bit terminal_known,

@@ -6,10 +6,9 @@
 // 中文说明：rdma_mock_adapters.sv 属于测试替身，为单元测试提供可控的适配器和控制面行为。
 // 阅读提示：先看公开类型和接口，再看实现细节；失败路径应保持状态与资源所有权可追踪。
 
-  // 功能：处理 rdma_mock_clone_status：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 result 用于执行 rdma_mock_clone_status；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：rdma_mock_clone_status 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+// 功能：在 rdma_mock_adapters 中，rdma_mock_clone_status 为 mock trace 深拷贝输入对象，防止被测代码后续修改影响已记录的调用证据。
+// 输入/输出及副作用：source（输入）；rdma_mock_clone_status 读取 source 并使用字段 result、result.category、result.code、result.hardware_code、result.hardware_code_valid、result.source_engine、result.function_uid、result.generation；函数返回 rdma_status，不取得调用方资源所有权。
+// 失败/边界：rdma_mock_clone_status 输入对象为空或查找未命中时返回 null；该路径不隐式重试，也不转移未声明资源。
 function automatic rdma_status rdma_mock_clone_status(rdma_status source);
   rdma_status result;
 
@@ -37,36 +36,33 @@ class rdma_mock_call_trace extends uvm_object;
 
   string calls[$];
 
-  // 功能：构造当前对象并初始化其字段、集合和 UVM 名称；不接管传入句柄的生命周期。
-  // 输入/输出及副作用：name 仅用于 UVM 对象命名；内部字段被初始化为安全默认值，传入句柄不转移所有权。
-  //   返回新对象实例；构造失败由 UVM 工厂或调用方处理。
-  // 失败/边界：不创建外部资源；name 为空时仍允许构造，但所有字段必须保持可配置的初始值。
+  // 功能：构造 rdma_mock_call_trace，调用 super.new 建立 UVM 层级对象；外部依赖字段保持未绑定，后续由 configure/build/activate 明确注入。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_mock_call_trace 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_mock_call_trace");
     super.new(name);
     calls.delete();
   endfunction
 
-  // 功能：记录本次调用的名称和顺序，供测试断言转发路径；不改变被测事务的业务结果。
-  // 输入/输出及副作用：输入为调用名称、事件或 trace 数据；成功后追加测试可见记录，不改变业务资源。
-  //   空名称或记录容量边界按测试替身约定处理，不影响被测对象。
+  // 功能：在 rdma_mock_call_trace 中，record 记录 record 的调用名称和顺序，供测试断言转发路径；不改变被测事务业务结果。
+  // 输入/输出及副作用：method_name（输入）；输入 request/image/cursor 决定写入内容；成功时更新 PI/CI、slot ledger 或 pending journal，并通过 output
+  //   返回结果。
   // 失败/边界：记录操作仅影响测试 trace；不得因注入记录故障改变生产状态或吞掉真实错误。
   function void record(string method_name);
     calls.push_back(method_name);
   endfunction
 
-  // 功能：按资源所有权和幂等规则释放或清理记录；重复释放不会再次扣减 credit，也不触碰已隔离资源。
-  // 输入/输出及副作用：输入为待解除或释放的 handle/key；成功后隔离或删除本对象记录，外部拥有者仍负责真正销毁。
-  //   空值、未知记录或重复调用按接口约定返回错误或幂等成功。
-  // 失败/边界：不得释放非本对象所有资源；重复解除按幂等约定处理，旧 handle 不得重新激活。
+  // 功能：在 rdma_mock_call_trace 中，clear 按 owner、generation 和幂等规则释放/隔离记录，并同步删除其账本引用。
+  // 输入/输出及副作用：无显式参数；输入 action/epoch/handle 决定迁移目标；成功时更新状态或恢复证据，外部资源仍由其拥有者管理。
+  // 失败/边界：clear 发现 owner/generation 不匹配、记录未知或重复释放时返回错误或幂等结果，不重新激活旧句柄。
   function void clear();
     calls.delete();
   endfunction
 endclass
 
-  // 功能：处理 rdma_mock_clone_function_handle：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 source 用于执行 rdma_mock_clone_function_handle；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：rdma_mock_clone_function_handle 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+// 功能：在 rdma_mock_call_trace 中，rdma_mock_clone_function_handle 为 mock trace 深拷贝输入对象，防止被测代码后续修改影响已记录的调用证据。
+// 输入/输出及副作用：source（输入）；rdma_mock_clone_function_handle 读取 source 并使用字段 cloned_object；函数返回 rdma_function_handle，不取得调用方资源所有权。
+// 失败/边界：rdma_mock_clone_function_handle 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（function handle clone type mismatch），不保留部分有效快照。
 function automatic rdma_function_handle rdma_mock_clone_function_handle(
   rdma_function_handle source
 );
@@ -81,10 +77,9 @@ function automatic rdma_function_handle rdma_mock_clone_function_handle(
   return result;
 endfunction
 
-  // 功能：处理 rdma_mock_clone_dma_context：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 source 用于执行 rdma_mock_clone_dma_context；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：rdma_mock_clone_dma_context 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+// 功能：在 rdma_mock_call_trace 中，rdma_mock_clone_dma_context 为 mock trace 深拷贝输入对象，防止被测代码后续修改影响已记录的调用证据。
+// 输入/输出及副作用：source（输入）；rdma_mock_clone_dma_context 读取 source 并使用字段 cloned_object；函数返回 rdma_dma_request_context，不取得调用方资源所有权。
+// 失败/边界：rdma_mock_clone_dma_context 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（DMA request context clone type mismatch），不保留部分有效快照。
 function automatic rdma_dma_request_context rdma_mock_clone_dma_context(
   rdma_dma_request_context source
 );
@@ -99,10 +94,9 @@ function automatic rdma_dma_request_context rdma_mock_clone_dma_context(
   return result;
 endfunction
 
-  // 功能：处理 rdma_mock_clone_mapping：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 source 用于执行 rdma_mock_clone_mapping；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：rdma_mock_clone_mapping 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+// 功能：在 rdma_mock_call_trace 中，rdma_mock_clone_mapping 为 mock trace 深拷贝输入对象，防止被测代码后续修改影响已记录的调用证据。
+// 输入/输出及副作用：source（输入）；rdma_mock_clone_mapping 读取 source 并使用字段 cloned_object；函数返回 rdma_dma_mapping，不取得调用方资源所有权。
+// 失败/边界：rdma_mock_clone_mapping 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（DMA mapping clone type mismatch），不保留部分有效快照。
 function automatic rdma_dma_mapping rdma_mock_clone_mapping(
   rdma_dma_mapping source
 );
@@ -117,10 +111,9 @@ function automatic rdma_dma_mapping rdma_mock_clone_mapping(
   return result;
 endfunction
 
-  // 功能：处理 rdma_mock_clone_binding：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 source 用于执行 rdma_mock_clone_binding；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：rdma_mock_clone_binding 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+// 功能：在 rdma_mock_call_trace 中，rdma_mock_clone_binding 为 mock trace 深拷贝输入对象，防止被测代码后续修改影响已记录的调用证据。
+// 输入/输出及副作用：source（输入）；rdma_mock_clone_binding 读取 source 并使用字段 cloned_object；函数返回 rdma_function_binding，不取得调用方资源所有权。
+// 失败/边界：rdma_mock_clone_binding 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（function binding clone type mismatch），不保留部分有效快照。
 function automatic rdma_function_binding rdma_mock_clone_binding(
   rdma_function_binding source
 );
@@ -135,10 +128,9 @@ function automatic rdma_function_binding rdma_mock_clone_binding(
   return result;
 endfunction
 
-  // 功能：处理 rdma_mock_clone_packet：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 cloned_object 用于执行 rdma_mock_clone_packet；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：rdma_mock_clone_packet 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+// 功能：在 rdma_mock_call_trace 中，rdma_mock_clone_packet 为 mock trace 深拷贝输入对象，防止被测代码后续修改影响已记录的调用证据。
+// 输入/输出及副作用：source（输入）；rdma_mock_clone_packet 读取 source 并使用字段 cloned_object；函数返回 rdma_packet，不取得调用方资源所有权。
+// 失败/边界：rdma_mock_clone_packet 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（packet clone type mismatch），不保留部分有效快照。
 function automatic rdma_packet rdma_mock_clone_packet(rdma_packet source);
   uvm_object cloned_object;
   rdma_packet result;
@@ -151,10 +143,9 @@ function automatic rdma_packet rdma_mock_clone_packet(rdma_packet source);
   return result;
 endfunction
 
-  // 功能：处理 rdma_mock_clone_policy：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 source 用于执行 rdma_mock_clone_policy；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：rdma_mock_clone_policy 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+// 功能：在 rdma_mock_call_trace 中，rdma_mock_clone_policy 为 mock trace 深拷贝输入对象，防止被测代码后续修改影响已记录的调用证据。
+// 输入/输出及副作用：source（输入）；rdma_mock_clone_policy 读取 source 并使用字段 cloned_object；函数返回 rdma_net_response_policy，不取得调用方资源所有权。
+// 失败/边界：rdma_mock_clone_policy 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（response policy clone type mismatch），不保留部分有效快照。
 function automatic rdma_net_response_policy rdma_mock_clone_policy(
   rdma_net_response_policy source
 );
@@ -169,10 +160,9 @@ function automatic rdma_net_response_policy rdma_mock_clone_policy(
   return result;
 endfunction
 
-  // 功能：处理 rdma_mock_clone_fault：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 cloned_object 用于执行 rdma_mock_clone_fault；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：rdma_mock_clone_fault 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+// 功能：在 rdma_mock_call_trace 中，rdma_mock_clone_fault 为 mock trace 深拷贝输入对象，防止被测代码后续修改影响已记录的调用证据。
+// 输入/输出及副作用：source（输入）；rdma_mock_clone_fault 读取 source 并使用字段 cloned_object；函数返回 rdma_net_fault，不取得调用方资源所有权。
+// 失败/边界：rdma_mock_clone_fault 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（network fault clone type mismatch），不保留部分有效快照。
 function automatic rdma_net_fault rdma_mock_clone_fault(rdma_net_fault source);
   uvm_object cloned_object;
   rdma_net_fault result;
@@ -185,10 +175,9 @@ function automatic rdma_net_fault rdma_mock_clone_fault(rdma_net_fault source);
   return result;
 endfunction
 
-  // 功能：处理 rdma_mock_clone_function_info：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 source 用于执行 rdma_mock_clone_function_info；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：rdma_mock_clone_function_info 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+// 功能：在 rdma_mock_call_trace 中，rdma_mock_clone_function_info 为 mock trace 深拷贝输入对象，防止被测代码后续修改影响已记录的调用证据。
+// 输入/输出及副作用：source（输入）；rdma_mock_clone_function_info 读取 source 并使用字段 cloned_object；函数返回 rdma_pcie_function_info，不取得调用方资源所有权。
+// 失败/边界：rdma_mock_clone_function_info 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（PCIe function info clone type mismatch），不保留部分有效快照。
 function automatic rdma_pcie_function_info rdma_mock_clone_function_info(
   rdma_pcie_function_info source
 );
@@ -203,10 +192,9 @@ function automatic rdma_pcie_function_info rdma_mock_clone_function_info(
   return result;
 endfunction
 
-  // 功能：处理 rdma_mock_clone_bar_decode：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 source 用于执行 rdma_mock_clone_bar_decode；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：rdma_mock_clone_bar_decode 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+// 功能：在 rdma_mock_call_trace 中，rdma_mock_clone_bar_decode 为 mock trace 深拷贝输入对象，防止被测代码后续修改影响已记录的调用证据。
+// 输入/输出及副作用：source（输入）；rdma_mock_clone_bar_decode 读取 source 并使用字段 cloned_object；函数返回 rdma_bar_decode，不取得调用方资源所有权。
+// 失败/边界：rdma_mock_clone_bar_decode 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（BAR decode clone type mismatch），不保留部分有效快照。
 function automatic rdma_bar_decode rdma_mock_clone_bar_decode(
   rdma_bar_decode source
 );
@@ -234,10 +222,9 @@ class rdma_mock_host_mem_call extends uvm_object;
   longint unsigned offset;
   byte data[];
 
-  // 功能：构造当前对象并初始化其字段、集合和 UVM 名称；不接管传入句柄的生命周期。
-  // 输入/输出及副作用：name 仅用于 UVM 对象命名；内部字段被初始化为安全默认值，传入句柄不转移所有权。
-  //   返回新对象实例；构造失败由 UVM 工厂或调用方处理。
-  // 失败/边界：不创建外部资源；name 为空时仍允许构造，但所有字段必须保持可配置的初始值。
+  // 功能：构造 rdma_mock_host_mem_call，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：call_sequence=0；method_name=""；request_context=null；mapping=null；size=0；alignment=0；direction=RDMA_DMA_DEVICE_READ；offset=0。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_mock_host_mem_call 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_mock_host_mem_call");
     super.new(name);
     call_sequence = 0;
@@ -253,10 +240,9 @@ endclass
 
 class rdma_mock_release_seal extends uvm_object;
 
-  // 功能：构造当前对象并初始化其字段、集合和 UVM 名称；不接管传入句柄的生命周期。
-  // 输入/输出及副作用：name 仅用于 UVM 对象命名；内部字段被初始化为安全默认值，传入句柄不转移所有权。
-  //   返回新对象实例；构造失败由 UVM 工厂或调用方处理。
-  // 失败/边界：不创建外部资源；name 为空时仍允许构造，但所有字段必须保持可配置的初始值。
+  // 功能：构造 rdma_mock_release_seal，调用 super.new 建立 UVM 层级对象；外部依赖字段保持未绑定，后续由 configure/build/activate 明确注入。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_mock_release_seal 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_mock_release_seal");
     super.new(name);
   endfunction
@@ -266,20 +252,18 @@ class rdma_mock_release_completion extends uvm_object;
   local rdma_mock_release_seal release_seal;
   local bit release_complete;
 
-  // 功能：构造当前对象并初始化其字段、集合和 UVM 名称；不接管传入句柄的生命周期。
-  // 输入/输出及副作用：name 仅用于 UVM 对象命名；内部字段被初始化为安全默认值，传入句柄不转移所有权。
-  //   返回新对象实例；构造失败由 UVM 工厂或调用方处理。
-  // 失败/边界：不创建外部资源；name 为空时仍允许构造，但所有字段必须保持可配置的初始值。
+  // 功能：构造 rdma_mock_release_completion，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：release_seal=null；release_complete=1'b0。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_mock_release_completion 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_mock_release_completion");
     super.new(name);
     release_seal = null;
     release_complete = 1'b0;
   endfunction
 
-  // 功能：校验依赖并建立该对象的运行边界，成功后保存必要的非拥有引用；拒绝不完整或重复配置。
-  // 输入/输出及副作用：接收 manager、binding、router 或 profile 等依赖；成功后保存非拥有引用并更新配置状态。
-  //   任一依赖为空、重复配置或代际不匹配时保持原状态并返回错误。
-  // 失败/边界：配置失败不得写入半成品引用；已激活对象不得被无条件降级或重复占用资源。
+  // 功能：在 rdma_mock_release_completion 中，initialize 校验依赖和 binding 后建立运行边界，只保存非拥有引用并拒绝重复配置。
+  // 输入/输出及副作用：seal（输入）；initialize 先依据 seal == null；release_seal != null 校验 seal；成功时更新本对象配置/状态并保存非拥有引用，返回 rdma_status。
+  // 失败/边界：实现中的空依赖、重复登记、状态或 generation/authority 校验失败时返回错误；失败时保留旧配置。
   function rdma_status initialize(rdma_mock_release_seal seal);
     if (seal == null)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
@@ -292,8 +276,7 @@ class rdma_mock_release_completion extends uvm_object;
   endfunction
 
   // 功能：执行 mark_complete 指定的测试或恢复状态变更，更新受控账本并保留可回滚的故障证据。
-  // 输入/输出及副作用：参数 seal 用于执行 mark_complete；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
+  // 输入/输出及副作用：seal（输入）；输入 request/image/cursor 决定写入内容；成功时更新 PI/CI、slot ledger 或 pending journal，并通过 output 返回结果。
   // 失败/边界：mark_complete 仅允许测试/恢复范围内的状态变更；代际或资源不匹配时拒绝并保留原账本。
   function rdma_status mark_complete(rdma_mock_release_seal seal);
     if (seal == null || release_seal == null || seal != release_seal)
@@ -306,10 +289,9 @@ class rdma_mock_release_completion extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：处理 completion_status：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 complete 用于执行 completion_status；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：completion_status 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：completion_status 校验 complete 与当前对象状态的一致性，并显式处理“mock release completion is not sealed”等拒绝条件，返回 rdma_status 供上层决定是否提交。
+  // 输入/输出及副作用：complete（输出）；completion_status 读取 complete 并使用字段 complete，并写入 complete；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：completion_status 返回 RDMA_SC_INVALID_STATE；典型拒绝条件为“mock release completion is not sealed”；失败路径不提交部分状态或转移未声明资源。
   function rdma_status completion_status(output bit complete);
     complete = 1'b0;
     if (release_seal == null)
@@ -328,10 +310,9 @@ class rdma_mock_dma_mapping extends rdma_dma_mapping;
   local rdma_mock_release_completion release_completion;
   local static longint unsigned next_token = 1;
 
-  // 功能：构造当前对象并初始化其字段、集合和 UVM 名称；不接管传入句柄的生命周期。
-  // 输入/输出及副作用：name 仅用于 UVM 对象命名；内部字段被初始化为安全默认值，传入句柄不转移所有权。
-  //   返回新对象实例；构造失败由 UVM 工厂或调用方处理。
-  // 失败/边界：不创建外部资源；name 为空时仍允许构造，但所有字段必须保持可配置的初始值。
+  // 功能：构造 rdma_mock_dma_mapping，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：allocation_token=0；allocation_token_initialized=1'b0；release_completion=null。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_mock_dma_mapping 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_mock_dma_mapping");
     super.new(name);
     allocation_token = 0;
@@ -339,10 +320,9 @@ class rdma_mock_dma_mapping extends rdma_dma_mapping;
     release_completion = null;
   endfunction
 
-  // 功能：处理 initialize_allocation_token：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 release_seal 用于执行 initialize_allocation_token；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：initialize_allocation_token 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：initialize_allocation_token 更新字段 allocation_token、allocation_token_initialized、release_completion、status，并在提交前保持 Function authority、generation 和资源所有权约束。
+  // 输入/输出及副作用：release_seal（输入）；initialize_allocation_token 先依据 allocation_token_initialized；next_token == 0；status == null || !status.ok( 校验 release_seal；成功时更新本对象配置/状态并保存非拥有引用，返回 rdma_status。
+  // 失败/边界：initialize_allocation_token 返回 RDMA_SC_INVALID_STATE、RDMA_SC_RESOURCE_EXHAUSTED；典型拒绝条件为“allocation token is already initialized”“allocation tokens are exhausted”；失败路径不提交部分状态或转移未声明资源。
   function rdma_status initialize_allocation_token(
     rdma_mock_release_seal release_seal
   );
@@ -373,10 +353,9 @@ class rdma_mock_dma_mapping extends rdma_dma_mapping;
     return rdma_status::success();
   endfunction
 
-  // 功能：比较两个输入对象的协议字段或身份快照并返回确定的相等性结果，不修改任一输入。
-  // 输入/输出及副作用：输入为待比较的两个值对象；返回 bit/状态结果，不修改任一输入或外部账本。
-  //   任一对象为空、类型不符或字段未初始化时按接口约定返回不相等或错误。
-  // 失败/边界：比较输入为空或类型不符时不得抛出未处理异常；结果必须保持确定且无副作用。
+  // 功能：在 rdma_mock_dma_mapping 中由 same_allocation 逐字段比较输入值，返回结构、身份或序列化内容是否一致。
+  // 输入/输出及副作用：rhs（输入）；比较对象/数组只读；返回 bit 或状态结果，不更新 runtime、账本或外部 adapter。
+  // 失败/边界：same_allocation 的任一比较对象为空或类型不符时返回确定的 false/不等结果，不抛出未处理异常。
   function bit same_allocation(rdma_mock_dma_mapping rhs);
     if (rhs == null)
       return 1'b0;
@@ -386,9 +365,9 @@ class rdma_mock_dma_mapping extends rdma_dma_mapping;
            release_completion == rhs.release_completion;
   endfunction
 
-  // 功能：执行 mark_release_complete 指定的测试或恢复状态变更，更新受控账本并保留可回滚的故障证据。
-  // 输入/输出及副作用：参数 release_seal 用于执行 mark_release_complete；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
+  // 功能：在 rdma_mock_dma_mapping 中，mark_release_complete 执行 mark_release_complete 的mark_release_complete 指定的测试或恢复状态变更，更新受控账本并保留可回滚的故障证据。
+  // 输入/输出及副作用：release_seal（输入）；输入 request/image/cursor 决定写入内容；成功时更新 PI/CI、slot ledger 或 pending journal，并通过 output
+  //   返回结果。
   // 失败/边界：mark_release_complete 仅允许测试/恢复范围内的状态变更；代际或资源不匹配时拒绝并保留原账本。
   function rdma_status mark_release_complete(
     rdma_mock_release_seal release_seal
@@ -399,10 +378,9 @@ class rdma_mock_dma_mapping extends rdma_dma_mapping;
     return release_completion.mark_complete(release_seal);
   endfunction
 
-  // 功能：按资源所有权和幂等规则释放或清理记录；重复释放不会再次扣减 credit，也不触碰已隔离资源。
-  // 输入/输出及副作用：输入为待解除或释放的 handle/key；成功后隔离或删除本对象记录，外部拥有者仍负责真正销毁。
-  //   空值、未知记录或重复调用按接口约定返回错误或幂等成功。
-  // 失败/边界：不得释放非本对象所有资源；重复解除按幂等约定处理，旧 handle 不得重新激活。
+  // 功能：在 rdma_mock_dma_mapping 中，release_completion_status 按 owner、generation 和幂等规则释放/隔离记录，并同步删除其账本引用。
+  // 输入/输出及副作用：release_complete（输出）；release_completion_status 可能更新本对象明确拥有的状态，并写入 release_complete；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：release_completion_status 发现 owner/generation 不匹配、记录未知或重复释放时返回错误或幂等结果，不重新激活旧句柄。
   virtual function rdma_status release_completion_status(
     output bit release_complete
   );
@@ -413,10 +391,9 @@ class rdma_mock_dma_mapping extends rdma_dma_mapping;
     return release_completion.completion_status(release_complete);
   endfunction
 
-  // 功能：按输入的完整标识查询当前权威记录并返回独立快照；缺失、歧义或代际过期时返回明确错误。
-  // 输入/输出及副作用：输入为完整 key/handle，output 或返回值为记录快照；查询不改变登记表和外部资源。
-  //   缺失、歧义、空句柄或旧 generation/reset epoch 返回明确错误。
-  // 失败/边界：查询不到唯一记录、输入为空或 authority 已失效时返回错误，不回退到默认 Function/root。
+  // 功能：在 rdma_mock_dma_mapping 中，snapshot_release_authority 按完整 key/handle 查找唯一权威记录并返回 detached 快照，避免把内部可变引用泄露给调用方。
+  // 输入/输出及副作用：snapshot（输出）；snapshot_release_authority 读取 snapshot 并使用字段 snapshot、candidate、candidate.allocation_token、candidate.allocation_token_initialized、candidate.release_completion，并写入 snapshot；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：snapshot_release_authority 在 key/handle 缺失、记录不唯一或 generation/reset epoch 过期时返回明确错误，不回退到默认 authority。
   virtual function rdma_status snapshot_release_authority(
     output rdma_dma_mapping snapshot
   );
@@ -442,10 +419,9 @@ class rdma_mock_dma_mapping extends rdma_dma_mapping;
     return rdma_status::success();
   endfunction
 
-  // 功能：按资源所有权和幂等规则释放或清理记录；重复释放不会再次扣减 credit，也不触碰已隔离资源。
-  // 输入/输出及副作用：输入为待解除或释放的 handle/key；成功后隔离或删除本对象记录，外部拥有者仍负责真正销毁。
-  //   空值、未知记录或重复调用按接口约定返回错误或幂等成功。
-  // 失败/边界：不得释放非本对象所有资源；重复解除按幂等约定处理，旧 handle 不得重新激活。
+  // 功能：在 rdma_mock_dma_mapping 中，release_authority_status 按 owner、generation 和幂等规则释放/隔离记录，并同步删除其账本引用。
+  // 输入/输出及副作用：snapshot（输入）；release_authority_status 可能更新本对象明确拥有的状态；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：release_authority_status 发现 owner/generation 不匹配、记录未知或重复释放时返回错误或幂等结果，不重新激活旧句柄。
   virtual function rdma_status release_authority_status(
     rdma_dma_mapping snapshot
   );
@@ -459,10 +435,9 @@ class rdma_mock_dma_mapping extends rdma_dma_mapping;
     return rdma_status::success();
   endfunction
 
-  // 功能：从源对象复制可变字段并生成独立值快照；源对象保持不变，类型不匹配时报告复制错误。
-  // 输入/输出及副作用：source/rhs 是源对象；返回或写入独立副本，不修改源对象。
-  //   source/rhs 为空或类型不匹配时返回空值或触发既定复制错误。
-  // 失败/边界：空源对象不应解引用；类型不匹配必须拒绝复制或按既定 UVM 规则报告 fatal。
+  // 功能：将 rhs 中 rdma_mock_dma_mapping 的值字段复制到当前对象，建立与源对象隔离的快照。
+  // 输入/输出及副作用：rhs（输入）；rhs 是源对象；当前对象字段会被覆盖，嵌套句柄按实现执行 clone 或保持非拥有引用，源对象不被修改。
+  // 失败/边界：do_copy 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（mock DMA mapping copy type mismatch），不保留部分有效快照。
   virtual function void do_copy(uvm_object rhs);
     rdma_mock_dma_mapping rhs_mapping;
     bit destination_was_initialized;
@@ -495,10 +470,9 @@ class rdma_mock_memory_region extends uvm_object;
   rdma_dma_mapping mapping;
   byte data[];
 
-  // 功能：构造当前对象并初始化其字段、集合和 UVM 名称；不接管传入句柄的生命周期。
-  // 输入/输出及副作用：name 仅用于 UVM 对象命名；内部字段被初始化为安全默认值，传入句柄不转移所有权。
-  //   返回新对象实例；构造失败由 UVM 工厂或调用方处理。
-  // 失败/边界：不创建外部资源；name 为空时仍允许构造，但所有字段必须保持可配置的初始值。
+  // 功能：构造 rdma_mock_memory_region，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：mapping=null。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_mock_memory_region 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_mock_memory_region");
     super.new(name);
     mapping = null;
@@ -525,10 +499,9 @@ class rdma_mock_host_mem extends rdma_host_mem_api;
   bit corrupt_next_readback;
   local rdma_mock_release_seal release_seal;
 
-  // 功能：构造当前对象并初始化其字段、集合和 UVM 名称；不接管传入句柄的生命周期。
-  // 输入/输出及副作用：name 仅用于 UVM 对象命名；内部字段被初始化为安全默认值，传入句柄不转移所有权。
-  //   返回新对象实例；构造失败由 UVM 工厂或调用方处理。
-  // 失败/边界：不创建外部资源；name 为空时仍允许构造，但所有字段必须保持可配置的初始值。
+  // 功能：构造 rdma_mock_host_mem，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：next_sequence=0；next_address=64'h0000_0001_0000_0000；call_trace=null；writes_until_failure=-1；delayed_write_failure=null；corrupt_next_readback=1'b0；release_seal=new("mock_adapter_release_seal")。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_mock_host_mem 构造只建立本地初始状态；本地 semaphore/ledger 等按构造体显式分配，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_mock_host_mem");
     super.new(name);
     next_sequence = 0;
@@ -540,18 +513,16 @@ class rdma_mock_host_mem extends rdma_host_mem_api;
     release_seal = new("mock_adapter_release_seal");
   endfunction
 
-  // 功能：记录本次调用的名称和顺序，供测试断言转发路径；不改变被测事务的业务结果。
-  // 输入/输出及副作用：输入为调用名称、事件或 trace 数据；成功后追加测试可见记录，不改变业务资源。
-  //   空名称或记录容量边界按测试替身约定处理，不影响被测对象。
+  // 功能：在 rdma_mock_host_mem 中，set_call_trace 记录 set_call_trace 的调用名称和顺序，供测试断言转发路径；不改变被测事务业务结果。
+  // 输入/输出及副作用：trace（输入）；set_call_trace 先依据 依赖存在性、authority 和 generation 条件 校验 trace；成功时更新本对象配置/状态并保存非拥有引用，返回 void。
   // 失败/边界：记录操作仅影响测试 trace；不得因注入记录故障改变生产状态或吞掉真实错误。
   function void set_call_trace(rdma_mock_call_trace trace);
     call_trace = trace;
   endfunction
 
-  // 功能：处理 live_allocations：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 count 用于执行 live_allocations；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：live_allocations 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：在 rdma_mock_host_mem 中，live_allocations 只读查询当前运行时/测试账本，返回槽位、对象或恢复记录的快照而不推进事务。
+  // 输入/输出及副作用：无显式参数；live_allocations 读取 对象字段：regions、mapping、mapping.state 并使用字段 count；函数返回 int unsigned，不取得调用方资源所有权。
+  // 失败/边界：live_allocations 的结果直接由 return count 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function int unsigned live_allocations();
     int unsigned count;
 
@@ -563,10 +534,9 @@ class rdma_mock_host_mem extends rdma_host_mem_api;
     return count;
   endfunction
 
-  // 功能：把输入错误或注入故障转换成统一的 rdma_status，供上层沿原事务路径处理。
-  // 输入/输出及副作用：输入为错误消息、错误码或故障证据；返回统一 rdma_status，不推进事务游标。
-  //   空消息仍需保留错误类别；未知错误码不得被静默转换为成功。
-  // 失败/边界：错误路径不能返回成功状态；消息和错误码缺失时仍须保留可诊断类别。
+  // 功能：在 rdma_mock_host_mem 中，fail_write_at 把错误消息、硬件码或注入故障封装为统一 rdma_status，保留原事务的诊断证据。
+  // 输入/输出及副作用：ordinal（输入）、status（输入）；fail_write_at 读取 ordinal、status 并使用字段 writes_until_failure、delayed_write_failure；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：fail_write_at 返回 RDMA_SC_INVALID_ARGUMENT；典型拒绝条件为“write failure ordinal/status is invalid”；失败路径不提交部分状态或转移未声明资源。
   function rdma_status fail_write_at(
     int unsigned ordinal,
     rdma_status status
@@ -579,10 +549,9 @@ class rdma_mock_host_mem extends rdma_host_mem_api;
     return rdma_status::success();
   endfunction
 
-  // 功能：把输入错误或注入故障转换成统一的 rdma_status，供上层沿原事务路径处理。
-  // 输入/输出及副作用：输入为错误消息、错误码或故障证据；返回统一 rdma_status，不推进事务游标。
-  //   空消息仍需保留错误类别；未知错误码不得被静默转换为成功。
-  // 失败/边界：错误路径不能返回成功状态；消息和错误码缺失时仍须保留可诊断类别。
+  // 功能：在 rdma_mock_host_mem 中，fail_next 把错误消息、硬件码或注入故障封装为统一 rdma_status，保留原事务的诊断证据。
+  // 输入/输出及副作用：method_name（输入）、status（输入）；fail_next 读取 method_name、status 并使用字段 rdma_status；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：fail_next 返回 RDMA_SC_INVALID_ARGUMENT；典型拒绝条件为“unknown host memory method”“failure status is null”；失败路径不提交部分状态或转移未声明资源。
   function rdma_status fail_next(string method_name, rdma_status status);
     if (!(method_name inside {"allocate", "write", "read", "release"}))
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
@@ -594,10 +563,9 @@ class rdma_mock_host_mem extends rdma_host_mem_api;
     return rdma_status::success();
   endfunction
 
-  // 功能：把输入错误或注入故障转换成统一的 rdma_status，供上层沿原事务路径处理。
-  // 输入/输出及副作用：输入为错误消息、错误码或故障证据；返回统一 rdma_status，不推进事务游标。
-  //   空消息仍需保留错误类别；未知错误码不得被静默转换为成功。
-  // 失败/边界：错误路径不能返回成功状态；消息和错误码缺失时仍须保留可诊断类别。
+  // 功能：在 rdma_mock_host_mem 中，fail_role_call 把错误消息、硬件码或注入故障封装为统一 rdma_status，保留原事务的诊断证据。
+  // 输入/输出及副作用：method_name（输入）、role（输入）、ordinal（输入）、status（输入）；fail_role_call 读取 method_name、role、ordinal、status 并使用字段 key；函数返回 void，不取得调用方资源所有权。
+  // 失败/边界：fail_role_call 无返回值，仅执行 key=$sformatf("%s:%0d:%0d", method_name, role, ordinal)；调用方须保证前置依赖已经绑定，函数不自动重试或接管外部资源。
   function void fail_role_call(string method_name,
                                rdma_queue_backing_role_e role,
                                int unsigned ordinal,
@@ -609,9 +577,8 @@ class rdma_mock_host_mem extends rdma_host_mem_api;
     role_failures[key] = rdma_mock_clone_status(status);
   endfunction
 
-  // 功能：清理当前运行状态并建立新的复位/代际边界，使旧句柄或旧事务不能继续生效。
-  // 输入/输出及副作用：参数 delete 用于执行 reset；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
+  // 功能：在 rdma_mock_host_mem 中，reset reset 清理当前运行状态并建立新的复位/代际边界，使旧句柄或旧事务不能继续生效。
+  // 输入/输出及副作用：无显式参数；输入 action/epoch/handle 决定迁移目标；成功时更新状态或恢复证据，外部资源仍由其拥有者管理。
   // 失败/边界：复位参数为零、代际回退或存在未处理 pending 事务时拒绝更新 authority。
   function void reset();
     calls.delete(); regions.delete(); failures.delete();
@@ -622,10 +589,9 @@ class rdma_mock_host_mem extends rdma_host_mem_api;
     writes_until_failure = -1; delayed_write_failure = null;
   endfunction
 
-  // 功能：把输入错误或注入故障转换成统一的 rdma_status，供上层沿原事务路径处理。
-  // 输入/输出及副作用：输入为错误消息、错误码或故障证据；返回统一 rdma_status，不推进事务游标。
-  //   空消息仍需保留错误类别；未知错误码不得被静默转换为成功。
-  // 失败/边界：错误路径不能返回成功状态；消息和错误码缺失时仍须保留可诊断类别。
+  // 功能：在 rdma_mock_host_mem 中，take_failure 把错误消息、硬件码或注入故障封装为统一 rdma_status，保留原事务的诊断证据。
+  // 输入/输出及副作用：method_name（输入）；take_failure 读取 method_name 并使用字段 result；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：take_failure 输入对象为空或查找未命中时返回 null；该路径不隐式重试，也不转移未声明资源。
   function automatic rdma_status take_failure(string method_name);
     rdma_status result;
 
@@ -636,9 +602,8 @@ class rdma_mock_host_mem extends rdma_host_mem_api;
     return result;
   endfunction
 
-  // 功能：执行 take_role_failure 指定的测试或恢复状态变更，更新受控账本并保留可回滚的故障证据。
-  // 输入/输出及副作用：参数 method_name, role 用于执行 take_role_failure；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
+  // 功能：在 rdma_mock_host_mem 中，take_role_failure 执行 take_role_failure 的take_role_failure 指定的测试或恢复状态变更，更新受控账本并保留可回滚的故障证据。
+  // 输入/输出及副作用：method_name（输入）、role（输入）；take_role_failure 读取 method_name、role 并使用字段 ordinal、key、result；函数返回 rdma_status，不取得调用方资源所有权。
   // 失败/边界：take_role_failure 仅允许测试/恢复范围内的状态变更；代际或资源不匹配时拒绝并保留原账本。
   function automatic rdma_status take_role_failure(
     string method_name,
@@ -658,10 +623,9 @@ class rdma_mock_host_mem extends rdma_host_mem_api;
     return null;
   endfunction
 
-  // 功能：处理 mapping_role：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 mapping, role 用于执行 mapping_role；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：mapping_role 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：mapping_role 比较 mapping、role 与当前 authority/状态字段，返回布尔结果供上层执行精确分支。
+  // 输入/输出及副作用：mapping（输入）、role（输出）；mapping_role 读取 mapping、role 并使用字段 role，并写入 role；函数返回 bit，不取得调用方资源所有权。
+  // 失败/边界：mapping_role 比较或前置条件不满足时返回 0/false；该路径不隐式重试，也不转移未声明资源。
   function automatic bit mapping_role(
     rdma_dma_mapping mapping,
     output rdma_queue_backing_role_e role
@@ -673,10 +637,10 @@ class rdma_mock_host_mem extends rdma_host_mem_api;
     return 1'b1;
   endfunction
 
-  // 功能：处理 request_role：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 request_context, size, alignment 用于执行 request_role；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：request_role 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：request_role 使用 request_context、size、alignment 计算并返回 rdma_queue_backing_role_e 结果；不修改对象字段或外部资源。
+  // 输入/输出及副作用：request_context（输入）、size（输入）、alignment（输入）；request_role 读取 request_context、size、alignment 并使用字段 kind、ordinal；函数返回 rdma_queue_backing_role_e，不取得调用方资源所有权。
+
+  // 失败/边界：request_role 是只读访问器，返回 rdma_queue_backing_role_e'(request_context.queue_role)；未覆盖枚举沿 default/类型默认分支返回，不改变对象和外部资源。
   function automatic rdma_queue_backing_role_e request_role(
     rdma_dma_request_context request_context,
     int unsigned size,
@@ -717,9 +681,9 @@ class rdma_mock_host_mem extends rdma_host_mem_api;
     endcase
   endfunction
 
-  // 功能：记录本次调用的名称和顺序，供测试断言转发路径；不改变被测事务的业务结果。
-  // 输入/输出及副作用：输入为调用名称、事件或 trace 数据；成功后追加测试可见记录，不改变业务资源。
-  //   空名称或记录容量边界按测试替身约定处理，不影响被测对象。
+  // 功能：在 rdma_mock_host_mem 中，record_call 记录 record_call 的调用名称和顺序，供测试断言转发路径；不改变被测事务业务结果。
+  // 输入/输出及副作用：method_name（输入）、request_context（输入）、mapping（输入）、size（输入）、alignment（输入）、direction（输入）、offset（输入）、data（输入）；输入
+  //   request/image/cursor 决定写入内容；成功时更新 PI/CI、slot ledger 或 pending journal，并通过 output 返回结果。
   // 失败/边界：记录操作仅影响测试 trace；不得因注入记录故障改变生产状态或吞掉真实错误。
   function automatic rdma_mock_host_mem_call record_call(
     string method_name,
@@ -754,20 +718,18 @@ class rdma_mock_host_mem extends rdma_host_mem_api;
     return call_record;
   endfunction
 
-  // 功能：比较两个输入对象的协议字段或身份快照并返回确定的相等性结果，不修改任一输入。
-  // 输入/输出及副作用：输入为待比较的两个值对象；返回 bit/状态结果，不修改任一输入或外部账本。
-  //   任一对象为空、类型不符或字段未初始化时按接口约定返回不相等或错误。
-  // 失败/边界：比较输入为空或类型不符时不得抛出未处理异常；结果必须保持确定且无副作用。
+  // 功能：在 rdma_mock_host_mem 中由 same_handle 逐字段比较输入值，返回结构、身份或序列化内容是否一致。
+  // 输入/输出及副作用：lhs（输入）、rhs（输入）；比较对象/数组只读；返回 bit 或状态结果，不更新 runtime、账本或外部 adapter。
+  // 失败/边界：same_handle 的任一比较对象为空或类型不符时返回确定的 false/不等结果，不抛出未处理异常。
   function automatic bit same_handle(rdma_handle lhs, rdma_handle rhs);
     if (lhs == null || rhs == null)
       return lhs == null && rhs == null;
     return lhs.same_instance(rhs);
   endfunction
 
-  // 功能：处理 mapping_authority_matches：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 candidate, authority 用于执行 mapping_authority_matches；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：mapping_authority_matches 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：在 rdma_mock_host_mem 中，mapping_authority_matches 逐字段比较输入快照或镜像，确认其身份、布局和 payload 完全一致后返回布尔结果。
+  // 输入/输出及副作用：candidate（输入）、authority（输入）；mapping_authority_matches 读取 candidate、authority 并使用输入参数和固定枚举/常量；函数返回 bit，不取得调用方资源所有权。
+  // 失败/边界：mapping_authority_matches 比较或前置条件不满足时返回 0/false；该路径不隐式重试，也不转移未声明资源。
   function automatic bit mapping_authority_matches(
     rdma_dma_mapping candidate,
     rdma_dma_mapping authority
@@ -783,10 +745,9 @@ class rdma_mock_host_mem extends rdma_host_mem_api;
            same_handle(candidate.owner_h, authority.owner_h);
   endfunction
 
-  // 功能：按输入的完整标识查询当前权威记录并返回独立快照；缺失、歧义或代际过期时返回明确错误。
-  // 输入/输出及副作用：输入为完整 key/handle，output 或返回值为记录快照；查询不改变登记表和外部资源。
-  //   缺失、歧义、空句柄或旧 generation/reset epoch 返回明确错误。
-  // 失败/边界：查询不到唯一记录、输入为空或 authority 已失效时返回错误，不回退到默认 Function/root。
+  // 功能：在 rdma_mock_host_mem 中，find_region 按完整 key/handle 查找唯一权威记录并返回 detached 快照，避免把内部可变引用泄露给调用方。
+  // 输入/输出及副作用：mapping（输入）；find_region 读取 mapping 并使用字段 regions；函数返回 int，不取得调用方资源所有权。
+  // 失败/边界：find_region 在 key/handle 缺失、记录不唯一或 generation/reset epoch 过期时返回明确错误，不回退到默认 authority。
   function automatic int find_region(rdma_dma_mapping mapping);
     rdma_mock_dma_mapping requested_mapping;
     rdma_mock_dma_mapping region_mapping;
@@ -805,10 +766,10 @@ class rdma_mock_host_mem extends rdma_host_mem_api;
     return -1;
   endfunction
 
-  // 功能：检查可用容量并预留所需资源，返回带所有权证据的分配结果；容量不足时不留下部分分配。
-  // 输入/输出及副作用：输入请求、容量和依赖用于构造/预留资源；返回独立对象或状态，不暴露内部可变集合。
-  //   参数越界、容量不足或构造中途失败时回滚已登记的局部状态。
-  // 失败/边界：依赖为空、参数越界、容量不足或构造步骤失败时清理局部结果并返回明确错误。
+  // 功能：在 rdma_mock_host_mem 中，allocate 检查容量后预留资源并返回带 owner 证据的句柄/计划；失败时回滚已登记的局部状态。
+  // 输入/输出及副作用：request_context（输入）、size（输入）、alignment（输入）、direction（输入）、mapping（输出）；输入请求/句柄定义资源属性；成功时更新账本并通过返回值或
+  //   output 发布新句柄/映射。
+  // 失败/边界：容量不足、范围非法、重复占用或身份过期时返回错误；失败不得泄漏半分配资源。
   virtual function rdma_status allocate(
     rdma_dma_request_context request_context,
     int unsigned size,
@@ -896,10 +857,10 @@ class rdma_mock_host_mem extends rdma_host_mem_api;
     return rdma_status::success();
   endfunction
 
-  // 功能：向指定后端写入请求数据并保留返回状态；写入失败时不推进本地提交游标。
-  // 输入/输出及副作用：参数 mapping, offset, data 用于执行 write；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：后端拒绝或写入范围越界时不推进本地提交游标，也不伪造成功状态。
+  // 功能：在 rdma_mock_host_mem 中，write 把请求数据写入指定后端并保留返回状态；只有写入成功才允许本地游标继续推进。
+  // 输入/输出及副作用：mapping（输入）、offset（输入）、data（输入）；输入 request/image/cursor 决定写入内容；成功时更新 PI/CI、slot ledger 或 pending
+  //   journal，并通过 output 返回结果。
+  // 失败/边界：write 遇到后端拒绝、范围溢出或 DMA 权限不足时保留失败证据，不推进本地游标。
   virtual function rdma_status write(
     rdma_dma_mapping mapping,
     longint unsigned offset,
@@ -952,10 +913,10 @@ class rdma_mock_host_mem extends rdma_host_mem_api;
     return rdma_status::success();
   endfunction
 
-  // 功能：按输入的完整标识查询当前权威记录并返回独立快照；缺失、歧义或代际过期时返回明确错误。
-  // 输入/输出及副作用：输入为完整 key/handle，output 或返回值为记录快照；查询不改变登记表和外部资源。
-  //   缺失、歧义、空句柄或旧 generation/reset epoch 返回明确错误。
-  // 失败/边界：查询不到唯一记录、输入为空或 authority 已失效时返回错误，不回退到默认 Function/root。
+  // 功能：在 rdma_mock_host_mem 中，read 按完整 key/handle 查找唯一权威记录并返回 detached 快照，避免把内部可变引用泄露给调用方。
+  // 输入/输出及副作用：mapping（输入）、offset（输入）、size（输入）、data（输出）；输入 handle/key/cursor 用于选择读取范围；返回值或 output 为 detached
+  //   快照，读取不取得外部资源所有权。
+  // 失败/边界：read 在 key/handle 缺失、记录不唯一或 generation/reset epoch 过期时返回明确错误，不回退到默认 authority。
   virtual function rdma_status read(
     rdma_dma_mapping mapping,
     longint unsigned offset,
@@ -1006,10 +967,9 @@ class rdma_mock_host_mem extends rdma_host_mem_api;
     return rdma_status::success();
   endfunction
 
-  // 功能：按资源所有权和幂等规则释放或清理记录；重复释放不会再次扣减 credit，也不触碰已隔离资源。
-  // 输入/输出及副作用：输入为待解除或释放的 handle/key；成功后隔离或删除本对象记录，外部拥有者仍负责真正销毁。
-  //   空值、未知记录或重复调用按接口约定返回错误或幂等成功。
-  // 失败/边界：不得释放非本对象所有资源；重复解除按幂等约定处理，旧 handle 不得重新激活。
+  // 功能：在 rdma_mock_host_mem 中，release 按 owner、generation 和幂等规则释放/隔离记录，并同步删除其账本引用。
+  // 输入/输出及副作用：mapping（输入）；输入 handle/mapping/token 指定释放目标；成功时更新账本和生命周期，外部资源只按 adapter 契约释放。
+  // 失败/边界：release 发现 owner/generation 不匹配、记录未知或重复释放时返回错误或幂等结果，不重新激活旧句柄。
   virtual function rdma_status \release (rdma_dma_mapping mapping);
     rdma_status failure;
     rdma_status status;
@@ -1067,10 +1027,9 @@ class rdma_mock_pcie_call extends uvm_object;
   rdma_bar_addr_t address;
   byte data[];
 
-  // 功能：构造当前对象并初始化其字段、集合和 UVM 名称；不接管传入句柄的生命周期。
-  // 输入/输出及副作用：name 仅用于 UVM 对象命名；内部字段被初始化为安全默认值，传入句柄不转移所有权。
-  //   返回新对象实例；构造失败由 UVM 工厂或调用方处理。
-  // 失败/边界：不创建外部资源；name 为空时仍允许构造，但所有字段必须保持可配置的初始值。
+  // 功能：构造 rdma_mock_pcie_call，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：call_sequence=0；method_name=""；target='0；offset='0；cfg_data='0；byte_enable='0；function_h=null；address='0。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_mock_pcie_call 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_mock_pcie_call");
     super.new(name);
     call_sequence = 0;
@@ -1097,10 +1056,9 @@ class rdma_mock_pcie extends rdma_pcie_api;
   rdma_status role_failures[string];
   int unsigned method_ordinals[string];
 
-  // 功能：构造当前对象并初始化其字段、集合和 UVM 名称；不接管传入句柄的生命周期。
-  // 输入/输出及副作用：name 仅用于 UVM 对象命名；内部字段被初始化为安全默认值，传入句柄不转移所有权。
-  //   返回新对象实例；构造失败由 UVM 工厂或调用方处理。
-  // 失败/边界：不创建外部资源；name 为空时仍允许构造，但所有字段必须保持可配置的初始值。
+  // 功能：构造 rdma_mock_pcie，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：next_sequence=0；cfg_read_value='0；function_info_response=null；decode_response=null；call_trace=null。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_mock_pcie 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_mock_pcie");
     super.new(name);
     next_sequence = 0;
@@ -1110,18 +1068,16 @@ class rdma_mock_pcie extends rdma_pcie_api;
     call_trace = null;
   endfunction
 
-  // 功能：记录本次调用的名称和顺序，供测试断言转发路径；不改变被测事务的业务结果。
-  // 输入/输出及副作用：输入为调用名称、事件或 trace 数据；成功后追加测试可见记录，不改变业务资源。
-  //   空名称或记录容量边界按测试替身约定处理，不影响被测对象。
+  // 功能：在 rdma_mock_pcie 中，set_call_trace 记录 set_call_trace 的调用名称和顺序，供测试断言转发路径；不改变被测事务业务结果。
+  // 输入/输出及副作用：trace（输入）；set_call_trace 先依据 依赖存在性、authority 和 generation 条件 校验 trace；成功时更新本对象配置/状态并保存非拥有引用，返回 void。
   // 失败/边界：记录操作仅影响测试 trace；不得因注入记录故障改变生产状态或吞掉真实错误。
   function void set_call_trace(rdma_mock_call_trace trace);
     call_trace = trace;
   endfunction
 
-  // 功能：把输入错误或注入故障转换成统一的 rdma_status，供上层沿原事务路径处理。
-  // 输入/输出及副作用：输入为错误消息、错误码或故障证据；返回统一 rdma_status，不推进事务游标。
-  //   空消息仍需保留错误类别；未知错误码不得被静默转换为成功。
-  // 失败/边界：错误路径不能返回成功状态；消息和错误码缺失时仍须保留可诊断类别。
+  // 功能：在 rdma_mock_pcie 中，fail_next 把错误消息、硬件码或注入故障封装为统一 rdma_status，保留原事务的诊断证据。
+  // 输入/输出及副作用：method_name（输入）、status（输入）；fail_next 读取 method_name、status 并使用字段 rdma_status；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：fail_next 返回 RDMA_SC_INVALID_ARGUMENT；典型拒绝条件为“unknown PCIe method”“failure status is null”；失败路径不提交部分状态或转移未声明资源。
   function rdma_status fail_next(string method_name, rdma_status status);
     if (!(method_name inside {
           "cfg_read32", "cfg_write32", "mmio_write",
@@ -1137,10 +1093,9 @@ class rdma_mock_pcie extends rdma_pcie_api;
     return rdma_status::success();
   endfunction
 
-  // 功能：把输入错误或注入故障转换成统一的 rdma_status，供上层沿原事务路径处理。
-  // 输入/输出及副作用：输入为错误消息、错误码或故障证据；返回统一 rdma_status，不推进事务游标。
-  //   空消息仍需保留错误类别；未知错误码不得被静默转换为成功。
-  // 失败/边界：错误路径不能返回成功状态；消息和错误码缺失时仍须保留可诊断类别。
+  // 功能：在 rdma_mock_pcie 中，fail_role_call 把错误消息、硬件码或注入故障封装为统一 rdma_status，保留原事务的诊断证据。
+  // 输入/输出及副作用：method_name（输入）、role（输入）、ordinal（输入）、status（输入）；fail_role_call 读取 method_name、role、ordinal、status 并使用输入参数和固定枚举/常量；函数返回 void，不取得调用方资源所有权。
+  // 失败/边界：fail_role_call 无返回值，仅执行 函数体中的顺序操作；调用方须保证前置依赖已经绑定，函数不自动重试或接管外部资源。
   function void fail_role_call(string method_name,
                                rdma_queue_backing_role_e role,
                                int unsigned ordinal,
@@ -1150,9 +1105,8 @@ class rdma_mock_pcie extends rdma_pcie_api;
         rdma_mock_clone_status(status);
   endfunction
 
-  // 功能：清理当前运行状态并建立新的复位/代际边界，使旧句柄或旧事务不能继续生效。
-  // 输入/输出及副作用：参数 delete 用于执行 reset；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
+  // 功能：在 rdma_mock_pcie 中，reset reset 清理当前运行状态并建立新的复位/代际边界，使旧句柄或旧事务不能继续生效。
+  // 输入/输出及副作用：无显式参数；输入 action/epoch/handle 决定迁移目标；成功时更新状态或恢复证据，外部资源仍由其拥有者管理。
   // 失败/边界：复位参数为零、代际回退或存在未处理 pending 事务时拒绝更新 authority。
   function void reset();
     calls.delete(); failures.delete(); role_failures.delete();
@@ -1160,9 +1114,8 @@ class rdma_mock_pcie extends rdma_pcie_api;
     next_sequence = 0;
   endfunction
 
-  // 功能：执行 take_role_failure 指定的测试或恢复状态变更，更新受控账本并保留可回滚的故障证据。
-  // 输入/输出及副作用：参数 method_name, role 用于执行 take_role_failure；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
+  // 功能：在 rdma_mock_pcie 中，take_role_failure 执行 take_role_failure 的take_role_failure 指定的测试或恢复状态变更，更新受控账本并保留可回滚的故障证据。
+  // 输入/输出及副作用：method_name（输入）、role（输入）；take_role_failure 读取 method_name、role 并使用字段 ordinal、key、result；函数返回 rdma_status，不取得调用方资源所有权。
   // 失败/边界：take_role_failure 仅允许测试/恢复范围内的状态变更；代际或资源不匹配时拒绝并保留原账本。
   function automatic rdma_status take_role_failure(
     string method_name,
@@ -1180,10 +1133,9 @@ class rdma_mock_pcie extends rdma_pcie_api;
     return result;
   endfunction
 
-  // 功能：把输入错误或注入故障转换成统一的 rdma_status，供上层沿原事务路径处理。
-  // 输入/输出及副作用：输入为错误消息、错误码或故障证据；返回统一 rdma_status，不推进事务游标。
-  //   空消息仍需保留错误类别；未知错误码不得被静默转换为成功。
-  // 失败/边界：错误路径不能返回成功状态；消息和错误码缺失时仍须保留可诊断类别。
+  // 功能：在 rdma_mock_pcie 中，take_failure 把错误消息、硬件码或注入故障封装为统一 rdma_status，保留原事务的诊断证据。
+  // 输入/输出及副作用：method_name（输入）；take_failure 读取 method_name 并使用字段 result；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：take_failure 输入对象为空或查找未命中时返回 null；该路径不隐式重试，也不转移未声明资源。
   function automatic rdma_status take_failure(string method_name);
     rdma_status result;
 
@@ -1194,9 +1146,9 @@ class rdma_mock_pcie extends rdma_pcie_api;
     return result;
   endfunction
 
-  // 功能：记录本次调用的名称和顺序，供测试断言转发路径；不改变被测事务的业务结果。
-  // 输入/输出及副作用：输入为调用名称、事件或 trace 数据；成功后追加测试可见记录，不改变业务资源。
-  //   空名称或记录容量边界按测试替身约定处理，不影响被测对象。
+  // 功能：在 rdma_mock_pcie 中，record_call 记录 record_call 的调用名称和顺序，供测试断言转发路径；不改变被测事务业务结果。
+  // 输入/输出及副作用：method_name（输入）、target（输入）、offset（输入）、cfg_data（输入）、byte_enable（输入）、function_h（输入）、address（输入）、data（输入）；输入
+  //   request/image/cursor 决定写入内容；成功时更新 PI/CI、slot ledger 或 pending journal，并通过 output 返回结果。
   // 失败/边界：记录操作仅影响测试 trace；不得因注入记录故障改变生产状态或吞掉真实错误。
   function automatic rdma_mock_pcie_call record_call(
     string method_name,
@@ -1230,10 +1182,9 @@ class rdma_mock_pcie extends rdma_pcie_api;
     return call_record;
   endfunction
 
-  // 功能：把 cfg_read32 的配置或编程请求提交到后端适配器，并返回后端确认状态。
-  // 输入/输出及副作用：参数 target, offset, data, status 用于执行 cfg_read32；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：cfg_read32 的后端拒绝或超时时不推进本地配置游标，ambiguous 提交必须进入恢复路径。
+  // 功能：在 rdma_mock_pcie 中，cfg_read32 把 cfg_read32 的配置/编程请求提交到后端适配器，并返回后端确认状态。
+  // 输入/输出及副作用：target（输入）、offset（输入）、data（输出）、status（输出）；cfg_read32 驱动下游事务，并写入 data、status；函数返回 无直接返回值，不取得调用方资源所有权。
+  // 失败/边界：cfg_read32 遇到后端拒绝、范围溢出或 DMA 权限不足时保留失败证据，不推进本地游标。
   virtual task cfg_read32(
     rdma_bdf_t target,
     rdma_cfg_offset_t offset,
@@ -1250,10 +1201,10 @@ class rdma_mock_pcie extends rdma_pcie_api;
     status = rdma_status::success();
   endtask
 
-  // 功能：把 cfg_write32 的配置或编程请求提交到后端适配器，并返回后端确认状态。
-  // 输入/输出及副作用：参数 target, offset, data, byte_enable, status 用于执行 cfg_write32；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：cfg_write32 的后端拒绝或超时时不推进本地配置游标，ambiguous 提交必须进入恢复路径。
+  // 功能：在 rdma_mock_pcie 中，cfg_write32 把 cfg_write32 的配置/编程请求提交到后端适配器，并返回后端确认状态。
+  // 输入/输出及副作用：target（输入）、offset（输入）、data（输入）、byte_enable（输入）、status（输出）；cfg_write32 驱动下游事务，并写入 status；函数返回 无直接返回值，不取得调用方资源所有权。
+
+  // 失败/边界：cfg_write32 遇到后端拒绝、范围溢出或 DMA 权限不足时保留失败证据，不推进本地游标。
   virtual task cfg_write32(
     rdma_bdf_t target,
     rdma_cfg_offset_t offset,
@@ -1268,10 +1219,9 @@ class rdma_mock_pcie extends rdma_pcie_api;
       status = rdma_status::success();
   endtask
 
-  // 功能：向指定后端写入请求数据并保留返回状态；写入失败时不推进本地提交游标。
-  // 输入/输出及副作用：参数 function_h, address, data, status 用于执行 mmio_write；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：后端拒绝或写入范围越界时不推进本地提交游标，也不伪造成功状态。
+  // 功能：在 rdma_mock_pcie 中，mmio_write 把请求数据写入指定后端并保留返回状态；只有写入成功才允许本地游标继续推进。
+  // 输入/输出及副作用：function_h（输入）、address（输入）、data（输入）、status（输出）；mmio_write 驱动下游事务，并写入 status；函数返回 无直接返回值，不取得调用方资源所有权。
+  // 失败/边界：mmio_write 遇到后端拒绝、范围溢出或 DMA 权限不足时保留失败证据，不推进本地游标。
   virtual task mmio_write(
     rdma_function_handle function_h,
     rdma_bar_addr_t address,
@@ -1285,10 +1235,9 @@ class rdma_mock_pcie extends rdma_pcie_api;
       status = rdma_status::success();
   endtask
 
-  // 功能：处理 dma_visibility_barrier：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 function_h, status 用于执行 dma_visibility_barrier；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：dma_visibility_barrier 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：在 rdma_mock_pcie 中，dma_visibility_barrier 在截止时间内执行 DMA 可见性或 MMIO 顺序屏障，确保 doorbell 之前的数据写入已按序可见。
+  // 输入/输出及副作用：function_h（输入）、status（输出）；dma_visibility_barrier 驱动下游事务，并写入 status；函数返回 无直接返回值，不取得调用方资源所有权。
+  // 失败/边界：dma_visibility_barrier 失败或超时通过 status 明确发布；该路径不隐式重试，也不转移未声明资源。
   virtual task dma_visibility_barrier(
     rdma_function_handle function_h,
     output rdma_status status
@@ -1300,10 +1249,9 @@ class rdma_mock_pcie extends rdma_pcie_api;
       status = rdma_status::success();
   endtask
 
-  // 功能：处理 mmio_ordering_barrier：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 function_h, status 用于执行 mmio_ordering_barrier；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：mmio_ordering_barrier 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：在 rdma_mock_pcie 中，mmio_ordering_barrier 在截止时间内执行 DMA 可见性或 MMIO 顺序屏障，确保 doorbell 之前的数据写入已按序可见。
+  // 输入/输出及副作用：function_h（输入）、status（输出）；mmio_ordering_barrier 驱动下游事务，并写入 status；函数返回 无直接返回值，不取得调用方资源所有权。
+  // 失败/边界：mmio_ordering_barrier 失败或超时通过 status 明确发布；该路径不隐式重试，也不转移未声明资源。
   virtual task mmio_ordering_barrier(
     rdma_function_handle function_h,
     output rdma_status status
@@ -1315,10 +1263,9 @@ class rdma_mock_pcie extends rdma_pcie_api;
       status = rdma_status::success();
   endtask
 
-  // 功能：按输入的完整标识查询当前权威记录并返回独立快照；缺失、歧义或代际过期时返回明确错误。
-  // 输入/输出及副作用：输入为完整 key/handle，output 或返回值为记录快照；查询不改变登记表和外部资源。
-  //   缺失、歧义、空句柄或旧 generation/reset epoch 返回明确错误。
-  // 失败/边界：查询不到唯一记录、输入为空或 authority 已失效时返回错误，不回退到默认 Function/root。
+  // 功能：在 rdma_mock_pcie 中，get_function_info 按完整 key/handle 查找唯一权威记录并返回 detached 快照，避免把内部可变引用泄露给调用方。
+  // 输入/输出及副作用：bdf（输入）、info（输出）；get_function_info 读取 bdf、info 并使用字段 info、failure，并写入 info；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：get_function_info 在 key/handle 缺失、记录不唯一或 generation/reset epoch 过期时返回明确错误，不回退到默认 authority。
   virtual function rdma_status get_function_info(
     rdma_bdf_t bdf,
     output rdma_pcie_function_info info
@@ -1338,10 +1285,9 @@ class rdma_mock_pcie extends rdma_pcie_api;
     return rdma_status::success();
   endfunction
 
-  // 功能：从硬件 image/缓冲区解码请求字段，验证布局和完整性后向调用方返回值或状态。
-  // 输入/输出及副作用：参数 address, result 用于执行 decode_bar；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：镜像为空、长度不足或校验失败时不发布部分模型字段。
+  // 功能：在 rdma_mock_pcie 中，decode_bar 从硬件 image/缓冲区解码字段，验证长度、布局和完整性后返回模型或状态。
+  // 输入/输出及副作用：address（输入）、result（输出）；输入 image/bytes 只读；成功时通过返回值或 output 发布 detached 解码快照，不接管调用方缓冲区。
+  // 失败/边界：decode_bar 遇到 image/model 为空、长度/对齐/保留位非法或 codec 校验失败时不发布部分字段。
   virtual function rdma_status decode_bar(
     rdma_bar_addr_t address,
     output rdma_bar_decode result
@@ -1369,10 +1315,9 @@ class rdma_mock_function_table_call extends uvm_object;
   string method_name;
   rdma_function_binding binding;
 
-  // 功能：构造当前对象并初始化其字段、集合和 UVM 名称；不接管传入句柄的生命周期。
-  // 输入/输出及副作用：name 仅用于 UVM 对象命名；内部字段被初始化为安全默认值，传入句柄不转移所有权。
-  //   返回新对象实例；构造失败由 UVM 工厂或调用方处理。
-  // 失败/边界：不创建外部资源；name 为空时仍允许构造，但所有字段必须保持可配置的初始值。
+  // 功能：构造 rdma_mock_function_table_call，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：call_sequence=0；method_name=""；binding=null。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_mock_function_table_call 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_mock_function_table_call");
     super.new(name);
     call_sequence = 0;
@@ -1390,19 +1335,17 @@ class rdma_mock_function_table extends rdma_function_table_api;
   int unsigned method_ordinals[string];
   longint unsigned next_sequence;
 
-  // 功能：构造当前对象并初始化其字段、集合和 UVM 名称；不接管传入句柄的生命周期。
-  // 输入/输出及副作用：name 仅用于 UVM 对象命名；内部字段被初始化为安全默认值，传入句柄不转移所有权。
-  //   返回新对象实例；构造失败由 UVM 工厂或调用方处理。
-  // 失败/边界：不创建外部资源；name 为空时仍允许构造，但所有字段必须保持可配置的初始值。
+  // 功能：构造 rdma_mock_function_table，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：next_sequence=0。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_mock_function_table 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_mock_function_table");
     super.new(name);
     next_sequence = 0;
   endfunction
 
-  // 功能：把输入错误或注入故障转换成统一的 rdma_status，供上层沿原事务路径处理。
-  // 输入/输出及副作用：输入为错误消息、错误码或故障证据；返回统一 rdma_status，不推进事务游标。
-  //   空消息仍需保留错误类别；未知错误码不得被静默转换为成功。
-  // 失败/边界：错误路径不能返回成功状态；消息和错误码缺失时仍须保留可诊断类别。
+  // 功能：在 rdma_mock_function_table 中，fail_next 把错误消息、硬件码或注入故障封装为统一 rdma_status，保留原事务的诊断证据。
+  // 输入/输出及副作用：method_name（输入）、status（输入）；fail_next 读取 method_name、status 并使用字段 rdma_status；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：fail_next 返回 RDMA_SC_INVALID_ARGUMENT；典型拒绝条件为“unknown function table method”“failure status is null”；失败路径不提交部分状态或转移未声明资源。
   function rdma_status fail_next(string method_name, rdma_status status);
     if (!(method_name inside {
           "program_notify", "clear_notify", "program_dmi", "clear_dmi",
@@ -1417,10 +1360,9 @@ class rdma_mock_function_table extends rdma_function_table_api;
     return rdma_status::success();
   endfunction
 
-  // 功能：把输入错误或注入故障转换成统一的 rdma_status，供上层沿原事务路径处理。
-  // 输入/输出及副作用：输入为错误消息、错误码或故障证据；返回统一 rdma_status，不推进事务游标。
-  //   空消息仍需保留错误类别；未知错误码不得被静默转换为成功。
-  // 失败/边界：错误路径不能返回成功状态；消息和错误码缺失时仍须保留可诊断类别。
+  // 功能：在 rdma_mock_function_table 中，fail_role_call 把错误消息、硬件码或注入故障封装为统一 rdma_status，保留原事务的诊断证据。
+  // 输入/输出及副作用：method_name（输入）、role（输入）、ordinal（输入）、status（输入）；fail_role_call 读取 method_name、role、ordinal、status 并使用输入参数和固定枚举/常量；函数返回 void，不取得调用方资源所有权。
+  // 失败/边界：fail_role_call 无返回值，仅执行 函数体中的顺序操作；调用方须保证前置依赖已经绑定，函数不自动重试或接管外部资源。
   function void fail_role_call(string method_name,
                                rdma_queue_backing_role_e role,
                                int unsigned ordinal,
@@ -1430,9 +1372,8 @@ class rdma_mock_function_table extends rdma_function_table_api;
         rdma_mock_clone_status(status);
   endfunction
 
-  // 功能：清理当前运行状态并建立新的复位/代际边界，使旧句柄或旧事务不能继续生效。
-  // 输入/输出及副作用：参数 delete 用于执行 reset；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
+  // 功能：在 rdma_mock_function_table 中，reset reset 清理当前运行状态并建立新的复位/代际边界，使旧句柄或旧事务不能继续生效。
+  // 输入/输出及副作用：无显式参数；输入 action/epoch/handle 决定迁移目标；成功时更新状态或恢复证据，外部资源仍由其拥有者管理。
   // 失败/边界：复位参数为零、代际回退或存在未处理 pending 事务时拒绝更新 authority。
   function void reset();
     calls.delete(); failures.delete(); role_failures.delete();
@@ -1440,9 +1381,8 @@ class rdma_mock_function_table extends rdma_function_table_api;
     next_sequence = 0;
   endfunction
 
-  // 功能：执行 take_role_failure 指定的测试或恢复状态变更，更新受控账本并保留可回滚的故障证据。
-  // 输入/输出及副作用：参数 method_name, role 用于执行 take_role_failure；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
+  // 功能：在 rdma_mock_function_table 中，take_role_failure 执行 take_role_failure 的take_role_failure 指定的测试或恢复状态变更，更新受控账本并保留可回滚的故障证据。
+  // 输入/输出及副作用：method_name（输入）、role（输入）；take_role_failure 读取 method_name、role 并使用字段 ordinal、key、result；函数返回 rdma_status，不取得调用方资源所有权。
   // 失败/边界：take_role_failure 仅允许测试/恢复范围内的状态变更；代际或资源不匹配时拒绝并保留原账本。
   function automatic rdma_status take_role_failure(
     string method_name,
@@ -1460,10 +1400,9 @@ class rdma_mock_function_table extends rdma_function_table_api;
     return result;
   endfunction
 
-  // 功能：把输入错误或注入故障转换成统一的 rdma_status，供上层沿原事务路径处理。
-  // 输入/输出及副作用：输入为错误消息、错误码或故障证据；返回统一 rdma_status，不推进事务游标。
-  //   空消息仍需保留错误类别；未知错误码不得被静默转换为成功。
-  // 失败/边界：错误路径不能返回成功状态；消息和错误码缺失时仍须保留可诊断类别。
+  // 功能：在 rdma_mock_function_table 中，take_failure 把错误消息、硬件码或注入故障封装为统一 rdma_status，保留原事务的诊断证据。
+  // 输入/输出及副作用：method_name（输入）；take_failure 读取 method_name 并使用字段 result；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：take_failure 输入对象为空或查找未命中时返回 null；该路径不隐式重试，也不转移未声明资源。
   function automatic rdma_status take_failure(string method_name);
     rdma_status result;
 
@@ -1474,9 +1413,9 @@ class rdma_mock_function_table extends rdma_function_table_api;
     return result;
   endfunction
 
-  // 功能：记录本次调用的名称和顺序，供测试断言转发路径；不改变被测事务的业务结果。
-  // 输入/输出及副作用：输入为调用名称、事件或 trace 数据；成功后追加测试可见记录，不改变业务资源。
-  //   空名称或记录容量边界按测试替身约定处理，不影响被测对象。
+  // 功能：在 rdma_mock_function_table 中，record_call 记录 record_call 的调用名称和顺序，供测试断言转发路径；不改变被测事务业务结果。
+  // 输入/输出及副作用：method_name（输入）、binding（输入）；输入 request/image/cursor 决定写入内容；成功时更新 PI/CI、slot ledger 或 pending
+  //   journal，并通过 output 返回结果。
   // 失败/边界：记录操作仅影响测试 trace；不得因注入记录故障改变生产状态或吞掉真实错误。
   function void record_call(string method_name,
                             rdma_function_binding binding);
@@ -1493,10 +1432,9 @@ class rdma_mock_function_table extends rdma_function_table_api;
     calls.push_back(call_record);
   endfunction
 
-  // 功能：处理 complete_call：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 method_name, binding, status 用于执行 complete_call；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：complete_call 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：在 rdma_mock_function_table 中，complete_call 提交当前事务阶段并发布 detached 结果，只有成功路径才推进游标或状态。
+  // 输入/输出及副作用：method_name（输入）、binding（输入）、status（输出）；complete_call 驱动下游事务，并写入 status；函数返回 无直接返回值，不取得调用方资源所有权。
+  // 失败/边界：complete_call 失败或超时通过 status 明确发布；该路径不隐式重试，也不转移未声明资源。
   task automatic complete_call(string method_name,
                                rdma_function_binding binding,
                                output rdma_status status);
@@ -1507,55 +1445,49 @@ class rdma_mock_function_table extends rdma_function_table_api;
       status = rdma_status::success();
   endtask
 
-  // 功能：把 program_notify 的配置或编程请求提交到后端适配器，并返回后端确认状态。
-  // 输入/输出及副作用：参数 binding, status 用于执行 program_notify；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：program_notify 的后端拒绝或超时时不推进本地配置游标，ambiguous 提交必须进入恢复路径。
+  // 功能：在 rdma_mock_function_table 中，program_notify 把 program_notify 的配置/编程请求提交到后端适配器，并返回后端确认状态。
+  // 输入/输出及副作用：binding（输入）、status（输出）；program_notify 驱动下游事务，并写入 status；函数返回 无直接返回值，不取得调用方资源所有权。
+  // 失败/边界：program_notify 遇到后端拒绝、范围溢出或 DMA 权限不足时保留失败证据，不推进本地游标。
   virtual task program_notify(rdma_function_binding binding,
                               output rdma_status status);
     complete_call("program_notify", binding, status);
   endtask
 
-  // 功能：按资源所有权和幂等规则释放或清理记录；重复释放不会再次扣减 credit，也不触碰已隔离资源。
-  // 输入/输出及副作用：输入为待解除或释放的 handle/key；成功后隔离或删除本对象记录，外部拥有者仍负责真正销毁。
-  //   空值、未知记录或重复调用按接口约定返回错误或幂等成功。
-  // 失败/边界：不得释放非本对象所有资源；重复解除按幂等约定处理，旧 handle 不得重新激活。
+  // 功能：在 rdma_mock_function_table 中，clear_notify 按 owner、generation 和幂等规则释放/隔离记录，并同步删除其账本引用。
+  // 输入/输出及副作用：binding（输入）、status（输出）；输入 action/epoch/handle 决定迁移目标；成功时更新状态或恢复证据，外部资源仍由其拥有者管理。
+  // 失败/边界：clear_notify 发现 owner/generation 不匹配、记录未知或重复释放时返回错误或幂等结果，不重新激活旧句柄。
   virtual task clear_notify(rdma_function_binding binding,
                             output rdma_status status);
     complete_call("clear_notify", binding, status);
   endtask
 
-  // 功能：把 program_dmi 的配置或编程请求提交到后端适配器，并返回后端确认状态。
-  // 输入/输出及副作用：参数 binding, status 用于执行 program_dmi；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：program_dmi 的后端拒绝或超时时不推进本地配置游标，ambiguous 提交必须进入恢复路径。
+  // 功能：在 rdma_mock_function_table 中，program_dmi 把 program_dmi 的配置/编程请求提交到后端适配器，并返回后端确认状态。
+  // 输入/输出及副作用：binding（输入）、status（输出）；program_dmi 驱动下游事务，并写入 status；函数返回 无直接返回值，不取得调用方资源所有权。
+  // 失败/边界：program_dmi 遇到后端拒绝、范围溢出或 DMA 权限不足时保留失败证据，不推进本地游标。
   virtual task program_dmi(rdma_function_binding binding,
                            output rdma_status status);
     complete_call("program_dmi", binding, status);
   endtask
 
-  // 功能：按资源所有权和幂等规则释放或清理记录；重复释放不会再次扣减 credit，也不触碰已隔离资源。
-  // 输入/输出及副作用：输入为待解除或释放的 handle/key；成功后隔离或删除本对象记录，外部拥有者仍负责真正销毁。
-  //   空值、未知记录或重复调用按接口约定返回错误或幂等成功。
-  // 失败/边界：不得释放非本对象所有资源；重复解除按幂等约定处理，旧 handle 不得重新激活。
+  // 功能：在 rdma_mock_function_table 中，clear_dmi 按 owner、generation 和幂等规则释放/隔离记录，并同步删除其账本引用。
+  // 输入/输出及副作用：binding（输入）、status（输出）；输入 action/epoch/handle 决定迁移目标；成功时更新状态或恢复证据，外部资源仍由其拥有者管理。
+  // 失败/边界：clear_dmi 发现 owner/generation 不匹配、记录未知或重复释放时返回错误或幂等结果，不重新激活旧句柄。
   virtual task clear_dmi(rdma_function_binding binding,
                          output rdma_status status);
     complete_call("clear_dmi", binding, status);
   endtask
 
-  // 功能：把 program_vft 的配置或编程请求提交到后端适配器，并返回后端确认状态。
-  // 输入/输出及副作用：参数 binding, status 用于执行 program_vft；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：program_vft 的后端拒绝或超时时不推进本地配置游标，ambiguous 提交必须进入恢复路径。
+  // 功能：在 rdma_mock_function_table 中，program_vft 把 program_vft 的配置/编程请求提交到后端适配器，并返回后端确认状态。
+  // 输入/输出及副作用：binding（输入）、status（输出）；program_vft 驱动下游事务，并写入 status；函数返回 无直接返回值，不取得调用方资源所有权。
+  // 失败/边界：program_vft 遇到后端拒绝、范围溢出或 DMA 权限不足时保留失败证据，不推进本地游标。
   virtual task program_vft(rdma_function_binding binding,
                            output rdma_status status);
     complete_call("program_vft", binding, status);
   endtask
 
-  // 功能：按资源所有权和幂等规则释放或清理记录；重复释放不会再次扣减 credit，也不触碰已隔离资源。
-  // 输入/输出及副作用：输入为待解除或释放的 handle/key；成功后隔离或删除本对象记录，外部拥有者仍负责真正销毁。
-  //   空值、未知记录或重复调用按接口约定返回错误或幂等成功。
-  // 失败/边界：不得释放非本对象所有资源；重复解除按幂等约定处理，旧 handle 不得重新激活。
+  // 功能：在 rdma_mock_function_table 中，clear_vft 按 owner、generation 和幂等规则释放/隔离记录，并同步删除其账本引用。
+  // 输入/输出及副作用：binding（输入）、status（输出）；输入 action/epoch/handle 决定迁移目标；成功时更新状态或恢复证据，外部资源仍由其拥有者管理。
+  // 失败/边界：clear_vft 发现 owner/generation 不匹配、记录未知或重复释放时返回错误或幂等结果，不重新激活旧句柄。
   virtual task clear_vft(rdma_function_binding binding,
                          output rdma_status status);
     complete_call("clear_vft", binding, status);
@@ -1574,10 +1506,9 @@ class rdma_mock_net_call extends uvm_object;
   rdma_net_response_policy policy;
   rdma_net_fault fault;
 
-  // 功能：构造当前对象并初始化其字段、集合和 UVM 名称；不接管传入句柄的生命周期。
-  // 输入/输出及副作用：name 仅用于 UVM 对象命名；内部字段被初始化为安全默认值，传入句柄不转移所有权。
-  //   返回新对象实例；构造失败由 UVM 工厂或调用方处理。
-  // 失败/边界：不创建外部资源；name 为空时仍允许构造，但所有字段必须保持可配置的初始值。
+  // 功能：构造 rdma_mock_net_call，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：call_sequence=0；method_name=""；packet=null；observer_present=1'b0；observer_type_name=""；observer_instance_name=""；policy=null；fault=null。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_mock_net_call 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_mock_net_call");
     super.new(name);
     call_sequence = 0;
@@ -1600,19 +1531,17 @@ class rdma_mock_net extends rdma_net_api;
   rdma_packet receive_queue[$];
   longint unsigned next_sequence;
 
-  // 功能：构造当前对象并初始化其字段、集合和 UVM 名称；不接管传入句柄的生命周期。
-  // 输入/输出及副作用：name 仅用于 UVM 对象命名；内部字段被初始化为安全默认值，传入句柄不转移所有权。
-  //   返回新对象实例；构造失败由 UVM 工厂或调用方处理。
-  // 失败/边界：不创建外部资源；name 为空时仍允许构造，但所有字段必须保持可配置的初始值。
+  // 功能：构造 rdma_mock_net，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：next_sequence=0。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_mock_net 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_mock_net");
     super.new(name);
     next_sequence = 0;
   endfunction
 
-  // 功能：把输入错误或注入故障转换成统一的 rdma_status，供上层沿原事务路径处理。
-  // 输入/输出及副作用：输入为错误消息、错误码或故障证据；返回统一 rdma_status，不推进事务游标。
-  //   空消息仍需保留错误类别；未知错误码不得被静默转换为成功。
-  // 失败/边界：错误路径不能返回成功状态；消息和错误码缺失时仍须保留可诊断类别。
+  // 功能：在 rdma_mock_net 中，fail_next 把错误消息、硬件码或注入故障封装为统一 rdma_status，保留原事务的诊断证据。
+  // 输入/输出及副作用：method_name（输入）、status（输入）；fail_next 读取 method_name、status 并使用字段 rdma_status；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：fail_next 返回 RDMA_SC_INVALID_ARGUMENT；典型拒绝条件为“unknown network method”“failure status is null”；失败路径不提交部分状态或转移未声明资源。
   function rdma_status fail_next(string method_name, rdma_status status);
     if (!(method_name inside {
           "send_packet", "receive_packet", "configure_response_policy",
@@ -1627,10 +1556,9 @@ class rdma_mock_net extends rdma_net_api;
     return rdma_status::success();
   endfunction
 
-  // 功能：把输入错误或注入故障转换成统一的 rdma_status，供上层沿原事务路径处理。
-  // 输入/输出及副作用：输入为错误消息、错误码或故障证据；返回统一 rdma_status，不推进事务游标。
-  //   空消息仍需保留错误类别；未知错误码不得被静默转换为成功。
-  // 失败/边界：错误路径不能返回成功状态；消息和错误码缺失时仍须保留可诊断类别。
+  // 功能：在 rdma_mock_net 中，take_failure 把错误消息、硬件码或注入故障封装为统一 rdma_status，保留原事务的诊断证据。
+  // 输入/输出及副作用：method_name（输入）；take_failure 读取 method_name 并使用字段 result；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：take_failure 输入对象为空或查找未命中时返回 null；该路径不隐式重试，也不转移未声明资源。
   function automatic rdma_status take_failure(string method_name);
     rdma_status result;
 
@@ -1641,9 +1569,9 @@ class rdma_mock_net extends rdma_net_api;
     return result;
   endfunction
 
-  // 功能：记录本次调用的名称和顺序，供测试断言转发路径；不改变被测事务的业务结果。
-  // 输入/输出及副作用：输入为调用名称、事件或 trace 数据；成功后追加测试可见记录，不改变业务资源。
-  //   空名称或记录容量边界按测试替身约定处理，不影响被测对象。
+  // 功能：在 rdma_mock_net 中，record_call 记录 record_call 的调用名称和顺序，供测试断言转发路径；不改变被测事务业务结果。
+  // 输入/输出及副作用：method_name（输入）、packet（输入）、observer（输入）、policy（输入）、fault（输入）；输入 request/image/cursor 决定写入内容；成功时更新
+  //   PI/CI、slot ledger 或 pending journal，并通过 output 返回结果。
   // 失败/边界：记录操作仅影响测试 trace；不得因注入记录故障改变生产状态或吞掉真实错误。
   function automatic rdma_mock_net_call record_call(
     string method_name,
@@ -1672,18 +1600,17 @@ class rdma_mock_net extends rdma_net_api;
     return call_record;
   endfunction
 
-  // 功能：处理 enqueue_receive：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 packet 用于执行 enqueue_receive；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：enqueue_receive 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：在 rdma_mock_net 中，enqueue_receive 推进队列/事务游标或执行对应 I/O，并把结果写回声明的输出参数。
+  // 输入/输出及副作用：packet（输入）；输入 request/image/cursor 决定写入内容；成功时更新 PI/CI、slot ledger 或 pending journal，并通过 output 返回结果。
+  // 失败/边界：队列未激活、credit 不足、请求身份过期或后端写入失败时返回错误；不得提前推进游标或重复提交。
   function void enqueue_receive(rdma_packet packet);
     receive_queue.push_back(rdma_mock_clone_packet(packet));
   endfunction
 
-  // 功能：处理 send_packet：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 packet, observer_packet 用于执行 send_packet；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：send_packet 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：在 rdma_mock_net 中，send_packet 推进队列/事务游标或执行对应 I/O，并把结果写回声明的输出参数。
+  // 输入/输出及副作用：packet（输入）、status（输出）；输入 request/image/cursor 决定写入内容；成功时更新 PI/CI、slot ledger 或 pending journal，并通过
+  //   output 返回结果。
+  // 失败/边界：队列未激活、credit 不足、请求身份过期或后端写入失败时返回错误；不得提前推进游标或重复提交。
   virtual task send_packet(rdma_packet packet, output rdma_status status);
     rdma_packet observer_packet;
 
@@ -1705,10 +1632,9 @@ class rdma_mock_net extends rdma_net_api;
     status = rdma_status::success();
   endtask
 
-  // 功能：处理 receive_packet：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 packet, status 用于执行 receive_packet；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：receive_packet 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：在 rdma_mock_net 中，receive_packet 推进队列/事务游标或执行对应 I/O，并把结果写回声明的输出参数。
+  // 输入/输出及副作用：packet（输出）、status（输出）；receive_packet 驱动下游事务，并写入 packet、status；函数返回 无直接返回值，不取得调用方资源所有权。
+  // 失败/边界：receive_packet 返回 RDMA_SC_QUEUE_EMPTY；典型拒绝条件为“receive queue is empty”；失败路径不提交部分状态或转移未声明资源。
   virtual task receive_packet(output rdma_packet packet,
                               output rdma_status status);
     rdma_mock_net_call call_record;
@@ -1728,9 +1654,8 @@ class rdma_mock_net extends rdma_net_api;
     status = rdma_status::success();
   endtask
 
-  // 功能：把指定资源或后端能力绑定到当前对象的唯一索引，并校验 Function、generation 和队列类型一致。
-  // 输入/输出及副作用：输入为待绑定资源/后端引用；成功后新增一条受 identity 保护的关联记录。
-  //   重复绑定、资源类型错误或依赖缺失时不留下部分关联。
+  // 功能：在 rdma_mock_net 中，register_observer 把 register_observer 指定的资源或后端能力绑定到当前对象索引，并校验 Function、generation 和队列类型一致。
+  // 输入/输出及副作用：observer（输入）；register_observer 先依据 observer != null 校验 observer；成功时更新本对象配置/状态并保存非拥有引用，返回 void。
   // 失败/边界：资源不存在、类型不符、重复登记或跨 Function 串线时拒绝绑定并保持索引不变。
   virtual function void register_observer(rdma_net_observer observer);
     record_call("register_observer", null, observer);
@@ -1738,10 +1663,9 @@ class rdma_mock_net extends rdma_net_api;
       observers.push_back(observer);
   endfunction
 
-  // 功能：校验依赖并建立该对象的运行边界，成功后保存必要的非拥有引用；拒绝不完整或重复配置。
-  // 输入/输出及副作用：接收 manager、binding、router 或 profile 等依赖；成功后保存非拥有引用并更新配置状态。
-  //   任一依赖为空、重复配置或代际不匹配时保持原状态并返回错误。
-  // 失败/边界：配置失败不得写入半成品引用；已激活对象不得被无条件降级或重复占用资源。
+  // 功能：在 rdma_mock_net 中，configure_response_policy 校验依赖和 binding 后建立运行边界，只保存非拥有引用并拒绝重复配置。
+  // 输入/输出及副作用：policy（输入）；configure_response_policy 先依据 failure != null；policy == null 校验 policy；成功时更新本对象配置/状态并保存非拥有引用，返回 rdma_status。
+  // 失败/边界：实现中的空依赖、重复登记、状态或 generation/authority 校验失败时返回错误；失败时保留旧配置。
   virtual function rdma_status configure_response_policy(
     rdma_net_response_policy policy
   );
@@ -1757,9 +1681,8 @@ class rdma_mock_net extends rdma_net_api;
     return rdma_status::success();
   endfunction
 
-  // 功能：执行 inject_fault 指定的测试或恢复状态变更，更新受控账本并保留可回滚的故障证据。
-  // 输入/输出及副作用：参数 failure 用于执行 inject_fault；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
+  // 功能：在 rdma_mock_net 中，inject_fault 执行 inject_fault 的inject_fault 指定的测试或恢复状态变更，更新受控账本并保留可回滚的故障证据。
+  // 输入/输出及副作用：fault（输入）；inject_fault 读取 fault 并使用字段 failure；函数返回 rdma_status，不取得调用方资源所有权。
   // 失败/边界：inject_fault 仅允许测试/恢复范围内的状态变更；代际或资源不匹配时拒绝并保留原账本。
   virtual function rdma_status inject_fault(rdma_net_fault fault);
     rdma_status failure;

@@ -11,7 +11,7 @@ package rdma_codec_pkg;
   import rdma_types_pkg::*;
   import rdma_model_pkg::*;
   `include "uvm_macros.svh"
-  `include "xtr_v1/rdma_xtr_v1_defs.svh"
+  `include "rdma/rdma_defs.svh"
 
   typedef struct {
     string hw_version;
@@ -25,13 +25,13 @@ package rdma_codec_pkg;
   `include "rdma_codec_registry.sv"
   `include "rdma_bit_packer.sv"
   `include "rdma_cmq_hw_profile.sv"
-  `include "xtr_v1/rdma_xtr_v1_qword_codec.sv"
-  `include "xtr_v1/rdma_xtr_v1_queue_page_codec.sv"
-  `include "xtr_v1/rdma_xtr_v1_queue_codecs.sv"
-  `include "xtr_v1/rdma_xtr_v1_doorbell_codecs.sv"
-  `include "xtr_v1/rdma_xtr_v1_qpc_codecs.sv"
-  `include "xtr_v1/rdma_xtr_v1_context_body_codecs.sv"
-  `include "xtr_v1/rdma_xtr_v1_cmq_codecs.sv"
-  `include "xtr_v1/rdma_xtr_v1_error_codec.sv"
-  `include "xtr_v1/rdma_xtr_v1_cmq_hw_profile.sv"
+  `include "rdma/rdma_qword_codec.sv"
+  `include "rdma/rdma_queue_page_codec.sv"
+  `include "rdma/rdma_queue_codecs.sv"
+  `include "rdma/rdma_doorbell_codecs.sv"
+  `include "rdma/rdma_qpc_codecs.sv"
+  `include "rdma/rdma_context_body_codecs.sv"
+  `include "rdma/rdma_cmq_codecs.sv"
+  `include "rdma/rdma_error_codec.sv"
+  `include "rdma/rdma_cmq_hw_profile.sv"
 endpackage

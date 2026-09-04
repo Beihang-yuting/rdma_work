@@ -30,15 +30,19 @@ class rdma_device_env extends uvm_object;
   // 创建并持有，外部只通过 find_*() 获取非拥有引用，避免调用方绕过 scope 校验。
   protected rdma_function_context m_contexts[string];
   // 功能：构造空的设备环境对象并初始化 UVM 对象名称；实际依赖绑定由 build() 完成。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：构造过程不分配 Host-memory、PCIe endpoint 或 manager 资源；空 name 也必须得到可配置对象。
   function new(string name="rdma_device_env");
     super.new(name);
   endfunction
 
   // 功能：以冻结 dpu_common 快照为权威，原子地组装 device env、identity ledger
   //       和 reset coordinator；失败时返回错误状态且不返回半初始化环境。
-  // 输入/输出：source_* 是外部依赖，registry/build_timeout 为兼容参数；result_env
-  //       返回新环境。副作用是向 coordinator 注册每个 Function 并绑定 Host router。
-  // 边界：任一依赖为空、快照未冻结/不一致或 Function 身份投影失败都会拒绝构建。
+  // 输入/输出及副作用：冻结快照和 manager/router 以非拥有引用写入候选 env；每个 Function
+  //   由 adapter 投影 identity/binding、由 context 克隆 identity 并登记共享 coordinator；
+  //   result_env 仅在全部 Function 成功后发布，registry/build_timeout 仅为兼容参数。
+  // 失败/边界：依赖为空、快照未冻结/不一致或任一 Function 投影/构造失败时返回错误且
+  //   result_env 保持 null；候选对象不会对外发布。
   static function rdma_status build(
     dpu_device_snapshot source_device_snapshot,
     dpu_resource_snapshot source_resources,
@@ -122,7 +126,9 @@ class rdma_device_env extends uvm_object;
   endfunction
 
   // 功能：按 dpu_common 完整 Function key 查询身份，并返回与内部 ledger 解耦的克隆。
-  // 输入/输出：key 指定 Host/PF/VF；找不到 key 或克隆失败时返回 null，不修改环境状态。
+  // 输入/输出及副作用：key（输入）；按 dpu_function_key_name 查找 ledger，并返回 identity 的
+  //   clone；读取不修改 ledger，也不转移快照所有权。
+  // 失败/边界：key 未枚举或 clone/cast 失败时返回 null；调用方不得把 null 当作有效身份。
   function rdma_function_identity get_identity(dpu_function_key_t key);
     rdma_function_identity copy;
     uvm_object cloned_object;
@@ -137,7 +143,9 @@ class rdma_device_env extends uvm_object;
   endfunction
 
   // 功能：将 RDMA identity 的完整 Host/root/VF/BDF 路由编码为内部索引键。
-  // 输入：identity_key 只读访问其值字段；输出键不依赖任何 dpu_common class 句柄。
+  // 输入/输出及副作用：identity_key（输入）；只读编码 Host/root/function-kind/VF/BDF 为稳定
+  //   字符串键，不包含 generation 或对象句柄。
+  // 失败/边界：identity_key 的字段始终是 packed 值；函数不分配资源，缺省字段按 0 编码。
   protected static function string identity_key_name(
     rdma_function_key_t identity_key
   );
@@ -154,8 +162,9 @@ class rdma_device_env extends uvm_object;
 
   // 功能：按完整 identity 查找已枚举的 Function context，并校验调用方提供的
   //       identity 与 env 保存的 incarnation 一致。
-  // 输入/输出：identity 为查询 authority，result_context 返回 env 持有的 context 引用。
-  // 边界：identity 为空、key 不存在或 generation/epoch 不一致时返回明确错误状态。
+  // 输入/输出及副作用：identity（输入）、result_context（输出）；按完整 identity key 查找并
+  //   发布 env 持有的 context 非拥有引用，不克隆 context 或修改 ledger。
+  // 失败/边界：identity 为空、key 不存在或 generation/epoch 不一致时返回明确错误状态。
   function rdma_status find_function(
     rdma_function_identity identity,
     output rdma_function_context result_context
@@ -179,8 +188,9 @@ class rdma_device_env extends uvm_object;
 
   // 功能：按 Function handle 反查 context，保证 UID、global ID 和 generation 三元组
   //       与 env 的 immutable identity 完全匹配，避免同一 Host 上本地编号串线。
-  // 输入/输出：function_handle 为待查找的 Function 句柄，result_context 返回 context 引用。
-  // 边界：句柄为空/类型错误返回 INVALID_ARGUMENT；UID 存在但 generation 过期返回 STALE。
+  // 输入/输出及副作用：function_handle（输入）、result_context（输出）；按 function_uid、global ID
+  //   和 generation 三元组扫描 context，发布匹配的非拥有引用。
+  // 失败/边界：句柄为空/类型错误返回 INVALID_ARGUMENT；UID 存在但 generation 过期返回 STALE。
   function rdma_status find_handle(
     rdma_handle function_handle,
     output rdma_function_context result_context
@@ -211,15 +221,17 @@ class rdma_device_env extends uvm_object;
   endfunction
 
   // 功能：返回当前 device env 已枚举的 Function context 数量，供上层完成拓扑覆盖检查。
-  // 输出：返回值为 context 索引条目数；函数只读，不改变 env 状态。
+  // 输入/输出及副作用：无参数；只读返回 m_contexts 中已枚举的 context 数量。
+  // 失败/边界：尚未枚举任何 Function 时返回 0；函数不创建或删除 context。
   function int unsigned context_count();
     return m_contexts.num();
   endfunction
 
   // 功能：请求指定 VF 的 Function-level reset，并只重建该 VF context。
-  // 输入：identity 必须是已枚举的 VF 身份；输出为 quiesce、epoch bump 或重建状态。
-  // 副作用：推进 coordinator 的 Function epoch 和 context generation，使旧 handle 失效。
-  // 边界：null、非 VF、未枚举或 reset coordinator 缺失时 fail-closed，不影响其他 Function。
+  // 输入/输出及副作用：identity（输入）；先 quiesce 目标 VF、推进 coordinator Function epoch，
+  //   再重建该 context；其他 Function 不受影响。
+  // 失败/边界：null、非 VF 或 reset coordinator 缺失时拒绝；若 identity 未枚举，coordinator 仍可能
+  //   建立其 epoch ledger，但因无匹配 context 而不会重建任何 Function。
   function rdma_status request_vf_flr(rdma_function_identity identity);
     rdma_status status;
 
@@ -239,9 +251,10 @@ class rdma_device_env extends uvm_object;
   endfunction
 
   // 功能：请求指定 PF reset，并按同 Host、同 parent BDF 级联重建 PF 及其全部 VF。
-  // 输入：identity 必须是已枚举的 PF 身份；输出为整个级联的状态结果。
-  // 副作用：受影响 context 先 quiesce，再发布新 generation/epoch；其他 PF/Host 不变。
-  // 边界：null、非 PF、未枚举或 coordinator 缺失时拒绝操作，不部分重建。
+  // 输入/输出及副作用：identity（输入）；先 quiesce 目标 PF 及其同 Host/parent BDF 的 VF，推进
+  //   PF reset epoch，再逐个重建选中 context。
+  // 失败/边界：null、非 PF 或 coordinator 缺失时拒绝；未枚举 PF 仍可推进 coordinator ledger，
+  //   但不会产生 context 重建。
   function rdma_status request_pf_reset(rdma_function_identity identity);
     rdma_status status;
 
@@ -261,9 +274,9 @@ class rdma_device_env extends uvm_object;
   endfunction
 
   // 功能：请求 Host reset，级联停止并重建该 Host topology 下的全部 Function context。
-  // 输入：host_topology_key 为 dpu_common Host 拓扑键；输出为 Host epoch/重建状态。
-  // 副作用：同步推进 Host router epoch，使该 Host 的旧 mapping、doorbell 和 completion 失效。
-  // 边界：coordinator 缺失时拒绝；没有已枚举 context 的 Host 仍会推进 Host epoch。
+  // 输入/输出及副作用：host_topology_key（输入）；quiesce 该 Host 全部 context，推进 Host epoch，
+  //   再重建选中 context；即使无 context，coordinator 仍会推进 epoch。
+  // 失败/边界：coordinator 缺失时拒绝；没有已枚举 context 的 Host 仍会推进 Host epoch。
   function rdma_status request_host_reset(int unsigned host_topology_key);
     rdma_status status;
 
@@ -280,9 +293,8 @@ class rdma_device_env extends uvm_object;
   endfunction
 
   // 功能：请求 Device reset，级联停止并重建当前 env 的全部 Function context。
-  // 输出：返回全局 Device epoch 和所有 context 重建的聚合状态。
-  // 副作用：推进 device/function epoch，使所有旧 generation 的资源访问失效。
-  // 边界：coordinator 缺失时拒绝；单个 context 重建失败会被隔离并返回错误。
+  // 输入/输出及副作用：无参数；quiesce 并推进全局 Device epoch，然后重建 env 中全部 context。
+  // 失败/边界：coordinator 缺失时拒绝；单个 context 重建失败会被隔离并返回错误。
   function rdma_status request_device_reset();
     rdma_status status;
 
@@ -299,8 +311,9 @@ class rdma_device_env extends uvm_object;
   endfunction
 
   // 功能：判断 context 是否属于给定复位范围，集中维护 VF/PF/Host/Device 选择规则。
-  // 输入：scope 指定级联层级，identity/host_key 指定目标；输出为是否选中。
-  // 边界：null context/identity 永不匹配；PF 只通过完整 Host+parent BDF 选择后代 VF。
+  // 输入/输出及副作用：context/scope/identity/host_key（输入）；只读判断 context 是否落在 VF、PF、
+  //   Host 或 Device 复位选择范围内，不修改任何状态。
+  // 失败/边界：null context/identity 永不匹配；PF 只通过完整 Host+parent BDF 选择后代 VF。
   protected function bit scope_matches(
     rdma_function_context context,
     rdma_device_reset_scope_e scope,
@@ -333,9 +346,9 @@ class rdma_device_env extends uvm_object;
   endfunction
 
   // 功能：在 epoch 发布前停止选中 context 接收新事务，建立 reset 的 quiesce 屏障。
-  // 输入：scope/identity/host_key 定义受影响集合；输出为首个失败状态或 success。
-  // 副作用：ACTIVE context 进入 QUIESCING；DISCOVERED context 保持未激活状态。
-  // 边界：QUARANTINED 或非法 context 使整个级联 fail-closed，不推进 coordinator epoch。
+  // 输入/输出及副作用：scope/identity/host_key（输入）；遍历匹配 context 并调用 quiesce，成功时
+  //   仅改变 context 状态，不推进 coordinator epoch。
+  // 失败/边界：QUARANTINED 或非法 context 使整个级联 fail-closed，不推进 coordinator epoch。
   protected function rdma_status quiesce_scope(
     rdma_device_reset_scope_e scope,
     rdma_function_identity identity,
@@ -358,9 +371,9 @@ class rdma_device_env extends uvm_object;
   endfunction
 
   // 功能：读取 coordinator 发布的 epoch，为选中 context 生成下一 incarnation 并提交重建。
-  // 输入：scope/identity/host_key 定义受影响集合；输出为首个重建失败状态或 success。
-  // 副作用：递增 generation、替换 binding authority，并同步更新 env identity ledger。
-  // 边界：generation 溢出、context reset 失败或 ledger 克隆失败会隔离该 context 并停止级联。
+  // 输入/输出及副作用：scope/identity/host_key（输入）；读取 coordinator epoch，为匹配 context
+  //   生成下一 generation 并调用 reset；失败 context 被置为 QUARANTINED，后续 ledger 刷新停止。
+  // 失败/边界：generation 溢出、context reset 失败或 ledger 克隆失败会隔离该 context 并停止级联。
   protected function rdma_status rebuild_scope(
     rdma_device_reset_scope_e scope,
     rdma_function_identity identity,
@@ -400,9 +413,9 @@ class rdma_device_env extends uvm_object;
   endfunction
 
   // 功能：用 context 发布的新 identity 替换 device env 的 dpu_common identity ledger 副本。
-  // 输入：previous_identity 用于定位旧条目，next_identity 为新的 generation/epoch 快照。
-  // 副作用：只替换 env 自有的 clone，不修改 dpu_common snapshot 或 context 外部引用。
-  // 边界：身份不匹配、克隆失败或 ledger 缺失时返回错误。
+  // 输入/输出及副作用：previous_identity/next_identity（输入）；定位同一 Function 的 ledger 条目，
+  //   克隆 next_identity 后替换 env 持有的副本；不修改 context identity。
+  // 失败/边界：身份不匹配、克隆失败或 ledger 缺失时返回错误。
   protected function rdma_status refresh_identity_ledger(
     rdma_function_identity previous_identity,
     rdma_function_identity next_identity

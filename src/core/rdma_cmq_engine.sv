@@ -26,10 +26,9 @@ class rdma_cmq_slot_record extends uvm_object;
   rdma_cmq_expected_response expected;
   bit [4:0] command_token;
 
-  // 功能：构造当前对象并初始化其字段、集合和 UVM 名称；不接管传入句柄的生命周期。
-  // 输入/输出及副作用：name 仅用于 UVM 对象命名；内部字段被初始化为安全默认值，传入句柄不转移所有权。
-  //   返回新对象实例；构造失败由 UVM 工厂或调用方处理。
-  // 失败/边界：不创建外部资源；name 为空时仍允许构造，但所有字段必须保持可配置的初始值。
+  // 功能：构造 rdma_cmq_slot_record，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：slot_sequence=0；sq_index=0；sq_wrap=1'b0；state=CMQ_SLOT_FREE；ticket=null；expected=null；command_token='0。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_cmq_slot_record 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_cmq_slot_record");
     super.new(name);
     slot_sequence = 0;
@@ -41,10 +40,9 @@ class rdma_cmq_slot_record extends uvm_object;
     command_token = '0;
   endfunction
 
-  // 功能：从源对象复制可变字段并生成独立值快照；源对象保持不变，类型不匹配时报告复制错误。
-  // 输入/输出及副作用：source/rhs 是源对象；返回或写入独立副本，不修改源对象。
-  //   source/rhs 为空或类型不匹配时返回空值或触发既定复制错误。
-  // 失败/边界：空源对象不应解引用；类型不匹配必须拒绝复制或按既定 UVM 规则报告 fatal。
+  // 功能：将 rhs 中 rdma_cmq_slot_record 的值字段复制到当前对象，建立与源对象隔离的快照。
+  // 输入/输出及副作用：rhs（输入）；rhs 是源对象；当前对象字段会被覆盖，嵌套句柄按实现执行 clone 或保持非拥有引用，源对象不被修改。
+  // 失败/边界：do_copy 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（CMQ slot record copy mismatch），不保留部分有效快照。
   virtual function void do_copy(uvm_object rhs);
     rdma_cmq_slot_record rhs_record;
 
@@ -108,10 +106,9 @@ class rdma_cmq_engine extends uvm_object;
   protected rdma_byte_endian_e profile_image_endian;
   protected int unsigned profile_hardware_version;
 
-  // 功能：构造当前对象并初始化其字段、集合和 UVM 名称；不接管传入句柄的生命周期。
-  // 输入/输出及副作用：name 仅用于 UVM 对象命名；内部字段被初始化为安全默认值，传入句柄不转移所有权。
-  //   返回新对象实例；构造失败由 UVM 工厂或调用方处理。
-  // 失败/边界：不创建外部资源；name 为空时仍允许构造，但所有字段必须保持可配置的初始值。
+  // 功能：构造 rdma_cmq_engine，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：engine_lock=new(1)；engine_state=RDMA_CMQ_ENGINE_UNCONFIGURED；prepared_binding=null；dma_context=null；cmq_snapshot=null；backing_mapping=null；host_mem=null；scheduler=null；其余字段按实现默认值初始化。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_cmq_engine 构造只建立本地初始状态；本地 semaphore/ledger 等按构造体显式分配，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_cmq_engine");
     super.new(name);
     engine_lock = new(1);
@@ -137,36 +134,32 @@ class rdma_cmq_engine extends uvm_object;
     end
   endfunction
 
-  // 功能：把输入错误或注入故障转换成统一的 rdma_status，供上层沿原事务路径处理。
-  // 输入/输出及副作用：输入为错误消息、错误码或故障证据；返回统一 rdma_status，不推进事务游标。
-  //   空消息仍需保留错误类别；未知错误码不得被静默转换为成功。
-  // 失败/边界：错误路径不能返回成功状态；消息和错误码缺失时仍须保留可诊断类别。
+  // 功能：在 rdma_cmq_engine 中，invalid_argument 把错误消息、硬件码或注入故障封装为统一 rdma_status，保留原事务的诊断证据。
+  // 输入/输出及副作用：message（输入）；invalid_argument 读取 message 并使用字段 rdma_status；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：invalid_argument 返回 RDMA_SC_INVALID_ARGUMENT；失败路径不提交部分状态或转移未声明资源。
   protected function rdma_status invalid_argument(string message);
     return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, message);
   endfunction
 
-  // 功能：把输入错误或注入故障转换成统一的 rdma_status，供上层沿原事务路径处理。
-  // 输入/输出及副作用：输入为错误消息、错误码或故障证据；返回统一 rdma_status，不推进事务游标。
-  //   空消息仍需保留错误类别；未知错误码不得被静默转换为成功。
-  // 失败/边界：错误路径不能返回成功状态；消息和错误码缺失时仍须保留可诊断类别。
+  // 功能：在 rdma_cmq_engine 中，invalid_state 把错误消息、硬件码或注入故障封装为统一 rdma_status，保留原事务的诊断证据。
+  // 输入/输出及副作用：message（输入）；invalid_state 读取 message 并使用字段 rdma_status；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：invalid_state 返回 RDMA_SC_INVALID_STATE；失败路径不提交部分状态或转移未声明资源。
   protected function rdma_status invalid_state(string message);
     return rdma_status::make(RDMA_SC_INVALID_STATE, message);
   endfunction
 
-  // 功能：处理 poison_status：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 delete 用于执行 poison_status；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：poison_status 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：poison_status 校验 message 与当前对象状态的一致性，返回 rdma_status 供上层决定是否提交。
+  // 输入/输出及副作用：message（输入）；poison_status 可能更新本对象明确拥有的状态；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：poison_status 返回 RDMA_SC_INVALID_STATE；失败路径不提交部分状态或转移未声明资源。
   protected function rdma_status poison_status(string message);
     late_final_fifo.delete();
     engine_state = RDMA_CMQ_ENGINE_POISONED;
     return invalid_state(message);
   endfunction
 
-  // 功能：处理 ring_used：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 used 用于执行 ring_used；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：ring_used 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：在 rdma_cmq_engine 中，ring_used 只读查询当前运行时/测试账本，返回槽位、对象或恢复记录的快照而不推进事务。
+  // 输入/输出及副作用：used（输出）；ring_used 读取 used 并使用字段 used，并写入 used；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：ring_used 返回 函数体规定的失败状态；具体拒绝条件包括 “CMQ publish counter precedes retire counter”；“CMQ ring occupancy exceeds depth”；失败路径不提交部分状态、不隐式重试，也不转移未声明资源。
   protected function rdma_status ring_used(output longint unsigned used);
     used = 0;
     if (publish_seq < retire_seq)
@@ -177,10 +170,9 @@ class rdma_cmq_engine extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：从硬件 image/缓冲区解码请求字段，验证布局和完整性后向调用方返回值或状态。
-  // 输入/输出及副作用：参数 decoded 用于执行 decoded_status_contract；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：镜像为空、长度不足或校验失败时不发布部分模型字段。
+  // 功能：在 rdma_cmq_engine 中，decoded_status_contract 从硬件 image/缓冲区解码字段，验证长度、布局和完整性后返回模型或状态。
+  // 输入/输出及副作用：decoded（输入）；输入 image/bytes 只读；成功时通过返回值或 output 发布 detached 解码快照，不接管调用方缓冲区。
+  // 失败/边界：decoded_status_contract 遇到 image/model 为空、长度/对齐/保留位非法或 codec 校验失败时不发布部分字段。
   protected function rdma_status decoded_status_contract(
     rdma_cmq_decoded_cqe decoded
   );
@@ -217,10 +209,10 @@ class rdma_cmq_engine extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：读取并解码队列条目，校验 owner/identity 后提交 consumer index；仅在提交成功后发布 completion 或 event。
-  // 输入/输出及副作用：request/queue handle 提供事务身份，output result/status 返回 detached 结果和阶段状态；成功时推进唯一 runtime。
+  // 功能：在 rdma_cmq_engine 中，poll_ledger_status 读取并解码队列条目，校验 owner/identity 后提交 consumer index，成功提交后才发布 completion/event。
+  // 输入/输出及副作用：used（输出）；poll_ledger_status 读取 used 并使用字段 used、status、slot_count、token_count，并写入 used；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：poll_ledger_status 遇到队列为空、owner/identity 失配或 CI/MMIO 提交失败时不发布 completion/event。
   //   空句柄、队列为空、owner 不匹配或 doorbell 失败时不发布半成品结果。
-  // 失败/边界：未配置、空队列、stale generation/reset epoch 和 ambiguous MMIO 均禁止发布成功结果或自动重试。
   protected function rdma_status poll_ledger_status(
     output longint unsigned used
   );
@@ -249,10 +241,9 @@ class rdma_cmq_engine extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：处理 ticket_trust_status：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 ticket 用于执行 ticket_trust_status；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：ticket_trust_status 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：ticket_trust_status 校验 ticket 与当前对象状态的一致性，并显式处理“CMQ ticket trust authority is incomplete”等拒绝条件，返回 rdma_status 供上层决定是否提交。
+  // 输入/输出及副作用：ticket（输入）；ticket_trust_status 读取 ticket 并使用字段 status；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：ticket_trust_status 返回 RDMA_SC_INVALID_ARGUMENT；典型拒绝条件为“CMQ ticket trust authority is incomplete”“CMQ ticket identity contains unknown bits”；失败路径不提交部分状态或转移未声明资源。
   protected function rdma_status ticket_trust_status(
     rdma_cmq_ticket ticket
   );
@@ -282,10 +273,9 @@ class rdma_cmq_engine extends uvm_object;
     return status;
   endfunction
 
-  // 功能：处理 command_key：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 command_id 用于执行 command_key；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：command_key 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：在 rdma_cmq_engine 中，command_key 把 Function/对象身份、代际和游标字段拼成稳定的查找键，供登记表去重和恢复路由使用。
+  // 输入/输出及副作用：ticket（输入）；command_key 读取 ticket 并使用字段 function_uid、object_id、generation；函数返回 string，不取得调用方资源所有权。
+// 失败/边界：command_key 只按函数体列出的身份、generation、kind、object_id 或 cursor 字段拼接键；调用方须先完成空句柄校验，函数本身不分配资源、不自动回退到 root0。
   protected function string command_key(rdma_cmq_ticket ticket);
     return $sformatf(
       "%016h:%08h:%08h:%016h",
@@ -296,10 +286,9 @@ class rdma_cmq_engine extends uvm_object;
     );
   endfunction
 
-  // 功能：处理 entry_key：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 index, wrap 用于执行 entry_key；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：entry_key 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：在 rdma_cmq_engine 中，entry_key 把 Function/对象身份、代际和游标字段拼成稳定的查找键，供登记表去重和恢复路由使用。
+  // 输入/输出及副作用：index（输入）、wrap（输入）；entry_key 读取 index、wrap 并使用字段 prepared_binding.function_uid、prepared_binding.generation；函数返回 string，不取得调用方资源所有权。
+// 失败/边界：entry_key 只按函数体列出的身份、generation、kind、object_id 或 cursor 字段拼接键；调用方须先完成空句柄校验，函数本身不分配资源、不自动回退到 root0。
   protected function string entry_key(int unsigned index, bit wrap);
     return $sformatf(
       "%016h:%08h:%0d:%0b",
@@ -310,10 +299,9 @@ class rdma_cmq_engine extends uvm_object;
     );
   endfunction
 
-  // 功能：依据输入请求创建对应的值对象或资源计划，并校验依赖、所有权和生命周期后返回结果。
-  // 输入/输出及副作用：输入请求、容量和依赖用于构造/预留资源；返回独立对象或状态，不暴露内部可变集合。
-  //   参数越界、容量不足或构造中途失败时回滚已登记的局部状态。
-  // 失败/边界：依赖为空、参数越界、容量不足或构造步骤失败时清理局部结果并返回明确错误。
+  // 功能：make_raw_cqe_image 根据 data、raw_cqe 生成或检查硬件镜像字段，保持布局、端序和保留位约束一致。
+  // 输入/输出及副作用：data（输入）、raw_cqe（输出）；make_raw_cqe_image 读取 data、raw_cqe 并使用字段 raw_cqe、raw_cqe.length、raw_cqe.alignment、raw_cqe.endian、raw_cqe.image_kind、raw_cqe.hardware_version、raw_cqe.function_generation、raw_cqe.write_target_kind，并写入 raw_cqe；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：make_raw_cqe_image 返回 RDMA_SC_INVALID_STATE；典型拒绝条件为“CMQ host read did not return one full CQE”“CMQ CQE Function authority is missing”；失败路径不提交部分状态或转移未声明资源。
   protected function rdma_status make_raw_cqe_image(
     byte data[],
     output rdma_hw_image raw_cqe
@@ -348,10 +336,9 @@ class rdma_cmq_engine extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：依据输入请求创建对应的值对象或资源计划，并校验依赖、所有权和生命周期后返回结果。
-  // 输入/输出及副作用：输入请求、容量和依赖用于构造/预留资源；返回独立对象或状态，不暴露内部可变集合。
-  //   参数越界、容量不足或构造中途失败时回滚已登记的局部状态。
-  // 失败/边界：依赖为空、参数越界、容量不足或构造步骤失败时清理局部结果并返回明确错误。
+  // 功能：make_polled_completion 创建独立的 rdma_status；根据 record、raw_cqe、decoded、completion 设置字段 completion、snapshot_status、completion.ticket、completion.status、completion.raw_cqe、completion.decoded_response、status.source_engine、status.function_uid、status.generation、status.resource_id，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：record（输入）、raw_cqe（输入）、decoded（输入）、completion（输出）；make_polled_completion 读取 record、raw_cqe、decoded、completion 并使用字段 completion、snapshot_status、completion.ticket、completion.status、completion.raw_cqe、completion.decoded_response、status.source_engine、status.function_uid，并写入 completion；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：make_polled_completion 返回 RDMA_SC_INVALID_STATE；典型拒绝条件为“CMQ completion ticket authority is missing”“CMQ completion decode authority is missing”；失败路径不提交部分状态或转移未声明资源。
   protected function rdma_status make_polled_completion(
     rdma_cmq_slot_record record,
     rdma_hw_image raw_cqe,
@@ -419,10 +406,10 @@ class rdma_cmq_engine extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：依据输入请求创建对应的值对象或资源计划，并校验依赖、所有权和生命周期后返回结果。
-  // 输入/输出及副作用：输入请求、容量和依赖用于构造/预留资源；返回独立对象或状态，不暴露内部可变集合。
-  //   参数越界、容量不足或构造中途失败时回滚已登记的局部状态。
-  // 失败/边界：依赖为空、参数越界、容量不足或构造步骤失败时清理局部结果并返回明确错误。
+  // 功能：make_timeout_status 校验 ticket、message、timeout_status 与当前对象状态的一致性，并显式处理“CMQ timeout status ticket authority is missing”；“CMQ timeout status construction failed”等拒绝条件，返回 rdma_status 供上层决定是否提交。
+  // 输入/输出及副作用：ticket（输入）、message（输入）、timeout_status（输出）；make_timeout_status 读取 ticket、message、timeout_status 并使用字段 timeout_status、timeout_status.source_engine、timeout_status.function_uid、timeout_status.generation、timeout_status.resource_id、timeout_status.command_id，并写入 timeout_status；函数返回 rdma_status，不取得调用方资源所有权。
+
+  // 失败/边界：make_timeout_status 返回 RDMA_SC_TIMEOUT；具体拒绝条件包括 “CMQ timeout status ticket authority is missing”；“CMQ timeout status construction failed”；失败路径不提交部分状态、不隐式重试，也不转移未声明资源。
   protected function rdma_status make_timeout_status(
     rdma_cmq_ticket ticket,
     string message,
@@ -442,10 +429,9 @@ class rdma_cmq_engine extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：依据输入请求创建对应的值对象或资源计划，并校验依赖、所有权和生命周期后返回结果。
-  // 输入/输出及副作用：输入请求、容量和依赖用于构造/预留资源；返回独立对象或状态，不暴露内部可变集合。
-  //   参数越界、容量不足或构造中途失败时回滚已登记的局部状态。
-  // 失败/边界：依赖为空、参数越界、容量不足或构造步骤失败时清理局部结果并返回明确错误。
+  // 功能：make_timeout_completion 创建独立的 rdma_status；根据 record、completion 设置字段 completion、status、completion.ticket、completion.raw_cqe、completion.decoded_response，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：record（输入）、completion（输出）；make_timeout_completion 读取 record、completion 并使用字段 completion、status、completion.ticket、completion.raw_cqe、completion.decoded_response，并写入 completion；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：make_timeout_completion 返回 函数体规定的失败状态；具体拒绝条件包括 “CMQ timeout completion authority is missing”；“CMQ timeout completion construction failed”；“CMQ timeout ticket snapshot returned null status”；“CMQ timeout status helper returned null”；“CMQ timeout completion validation failed”；失败路径不提交部分状态、不隐式重试，也不转移未声明资源。
   protected function rdma_status make_timeout_completion(
     rdma_cmq_slot_record record,
     output rdma_cmq_completion completion
@@ -488,10 +474,9 @@ class rdma_cmq_engine extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：依据输入请求创建对应的值对象或资源计划，并校验依赖、所有权和生命周期后返回结果。
-  // 输入/输出及副作用：输入请求、容量和依赖用于构造/预留资源；返回独立对象或状态，不暴露内部可变集合。
-  //   参数越界、容量不足或构造中途失败时回滚已登记的局部状态。
-  // 失败/边界：依赖为空、参数越界、容量不足或构造步骤失败时清理局部结果并返回明确错误。
+  // 功能：make_cancel_completion 创建独立的 rdma_status；根据 record、completion 设置字段 completion、status、completion.ticket、completion.status、status.source_engine、status.function_uid、status.generation、status.resource_id、status.command_id、completion.raw_cqe，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：record（输入）、completion（输出）；make_cancel_completion 读取 record、completion 并使用字段 completion、status、completion.ticket、completion.status、status.source_engine、status.function_uid、status.generation、status.resource_id，并写入 completion；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：make_cancel_completion 返回 RDMA_SC_RESET_CANCELLED、RDMA_SC_INVALID_STATE；典型拒绝条件为“CMQ cancel completion authority is missing”“CMQ cancel completion construction failed”；失败路径不提交部分状态或转移未声明资源。
   protected function rdma_status make_cancel_completion(
     rdma_cmq_slot_record record,
     output rdma_cmq_completion completion
@@ -539,10 +524,9 @@ class rdma_cmq_engine extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：处理 terminal_index：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 ticket 用于执行 terminal_index；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：terminal_index 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：terminal_index 使用 ticket 在对应表、队列或账本中查找唯一条目，并返回下标、对象或查找状态。
+  // 输入/输出及副作用：ticket（输入）；terminal_index 读取 ticket 并使用字段 terminal_fifo；函数返回 int，不取得调用方资源所有权。
+  // 失败/边界：terminal_index 查找未命中时返回 -1；该路径不隐式重试，也不转移未声明资源。
   protected function int terminal_index(rdma_cmq_ticket ticket);
     if (ticket == null)
       return -1;
@@ -554,10 +538,9 @@ class rdma_cmq_engine extends uvm_object;
     return -1;
   endfunction
 
-  // 功能：处理 late_diagnostic_index：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 ticket 用于执行 late_diagnostic_index；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：late_diagnostic_index 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：late_diagnostic_index 使用 ticket 在对应表、队列或账本中查找唯一条目，并返回下标、对象或查找状态。
+  // 输入/输出及副作用：ticket（输入）；late_diagnostic_index 读取 ticket 并使用字段 diagnostic_fifo、kind；函数返回 int，不取得调用方资源所有权。
+  // 失败/边界：late_diagnostic_index 查找未命中时返回 -1；该路径不隐式重试，也不转移未声明资源。
   protected function int late_diagnostic_index(rdma_cmq_ticket ticket);
     if (ticket == null)
       return -1;
@@ -571,10 +554,9 @@ class rdma_cmq_engine extends uvm_object;
     return -1;
   endfunction
 
-  // 功能：处理 late_final_index：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 ticket 用于执行 late_final_index；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：late_final_index 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：late_final_index 使用 ticket 在对应表、队列或账本中查找唯一条目，并返回下标、对象或查找状态。
+  // 输入/输出及副作用：ticket（输入）；late_final_index 读取 ticket 并使用字段 late_final_fifo；函数返回 int，不取得调用方资源所有权。
+  // 失败/边界：late_final_index 查找未命中时返回 -1；该路径不隐式重试，也不转移未声明资源。
   protected function int late_final_index(rdma_cmq_ticket ticket);
     if (ticket == null)
       return -1;
@@ -587,10 +569,9 @@ class rdma_cmq_engine extends uvm_object;
     return -1;
   endfunction
 
-  // 功能：处理 ticket_has_engine_authority：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 ticket 用于执行 ticket_has_engine_authority；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：ticket_has_engine_authority 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：ticket_has_engine_authority 比较 ticket 与当前 authority/状态字段，返回布尔结果供上层执行精确分支。
+  // 输入/输出及副作用：ticket（输入）；ticket_has_engine_authority 读取 ticket 并使用字段 prepared_binding、cmq_snapshot、cmq_snapshot.handle、kind、function_uid、prepared_binding.function_uid、object_id、prepared_binding.global_function_id；函数返回 bit，不取得调用方资源所有权。
+  // 失败/边界：ticket_has_engine_authority 比较或前置条件不满足时返回 0/false；该路径不隐式重试，也不转移未声明资源。
   protected function bit ticket_has_engine_authority(
     rdma_cmq_ticket ticket
   );
@@ -616,8 +597,7 @@ class rdma_cmq_engine extends uvm_object;
   endfunction
 
   // 功能：判断 ticket_is_outstanding 对应的状态、能力或账本条件，并返回确定的布尔/计数结果，不修改状态。
-  // 输入/输出及副作用：参数 software_key 用于执行 ticket_is_outstanding；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
+  // 输入/输出及副作用：ticket（输入）；ticket_is_outstanding 读取 ticket 并使用字段 software_key；函数返回 bit，不取得调用方资源所有权。
   // 失败/边界：ticket_is_outstanding 只读取现有账本；输入未初始化时返回保守结果，不得借助默认 Function/root 猜测。
   protected function bit ticket_is_outstanding(rdma_cmq_ticket ticket);
     string software_key;
@@ -631,10 +611,9 @@ class rdma_cmq_engine extends uvm_object;
            same_ticket_value(command_registry[software_key].ticket, ticket);
   endfunction
 
-  // 功能：依据输入请求创建对应的值对象或资源计划，并校验依赖、所有权和生命周期后返回结果。
-  // 输入/输出及副作用：输入请求、容量和依赖用于构造/预留资源；返回独立对象或状态，不暴露内部可变集合。
-  //   参数越界、容量不足或构造中途失败时回滚已登记的局部状态。
-  // 失败/边界：依赖为空、参数越界、容量不足或构造步骤失败时清理局部结果并返回明确错误。
+  // 功能：make_late_diagnostic 创建独立的 rdma_status；根据 record、raw_cqe、diagnostic 设置字段 diagnostic、status、diagnostic.kind、diagnostic.ticket、diagnostic.raw_cqe，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：record（输入）、raw_cqe（输入）、diagnostic（输出）；make_late_diagnostic 读取 record、raw_cqe、diagnostic 并使用字段 diagnostic、status、diagnostic.kind、diagnostic.ticket、diagnostic.raw_cqe，并写入 diagnostic；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：make_late_diagnostic 返回 RDMA_SC_INVALID_STATE；典型拒绝条件为“CMQ late diagnostic authority is missing”“CMQ late diagnostic construction failed”；失败路径不提交部分状态或转移未声明资源。
   protected function rdma_status make_late_diagnostic(
     rdma_cmq_slot_record record,
     rdma_hw_image raw_cqe,
@@ -680,10 +659,10 @@ class rdma_cmq_engine extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：依据输入请求创建对应的值对象或资源计划，并校验依赖、所有权和生命周期后返回结果。
-  // 输入/输出及副作用：输入请求、容量和依赖用于构造/预留资源；返回独立对象或状态，不暴露内部可变集合。
-  //   参数越界、容量不足或构造中途失败时回滚已登记的局部状态。
-  // 失败/边界：依赖为空、参数越界、容量不足或构造步骤失败时清理局部结果并返回明确错误。
+  // 功能：make_diagnostic 创建独立的 rdma_status；根据 kind、trusted_ticket、failure、raw_cqe、diagnostic 设置字段 diagnostic、ticket_snapshot、function_snapshot、function_snapshot.kind、function_snapshot.function_uid、function_snapshot.object_id、function_snapshot.generation、cmq_snapshot_value、cmq_snapshot_value.kind、cmq_snapshot_value.function_uid，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：kind（输入）、trusted_ticket（输入）、failure（输入）、raw_cqe（输入）、diagnostic（输出）；输入字段被复制到返回值或
+  //   output；生成结果与输入隔离，不隐式修改调用方对象。
+  // 失败/边界：make_diagnostic 返回 RDMA_SC_INVALID_STATE；典型拒绝条件为“CMQ poison diagnostic authority is missing”“CMQ trusted poison ticket is incomplete”；失败路径不提交部分状态或转移未声明资源。
   protected function rdma_status make_diagnostic(
     rdma_cmq_diagnostic_kind_e kind,
     rdma_cmq_ticket trusted_ticket,
@@ -781,10 +760,9 @@ class rdma_cmq_engine extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：从源对象复制可变字段并生成独立值快照；源对象保持不变，类型不匹配时报告复制错误。
-  // 输入/输出及副作用：source/rhs 是源对象；返回或写入独立副本，不修改源对象。
-  //   source/rhs 为空或类型不匹配时返回空值或触发既定复制错误。
-  // 失败/边界：空源对象不应解引用；类型不匹配必须拒绝复制或按既定 UVM 规则报告 fatal。
+  // 功能：在 rdma_cmq_engine 中，clone_diagnostic 将 rhs 中 rdma_cmq_engine 的值字段复制到当前对象，建立与源对象隔离的快照。
+  // 输入/输出及副作用：source（输入）、snapshot（输出）；clone_diagnostic 读取 source、snapshot 并使用字段 snapshot，并写入 snapshot；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：clone_diagnostic 返回 RDMA_SC_INVALID_STATE；典型拒绝条件为“CMQ poison diagnostic source is null”；失败路径不提交部分状态或转移未声明资源。
   protected function rdma_status clone_diagnostic(
     rdma_cmq_diagnostic source,
     output rdma_cmq_diagnostic snapshot
@@ -797,10 +775,10 @@ class rdma_cmq_engine extends uvm_object;
     );
   endfunction
 
-  // 功能：处理 poison：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 kind, message, raw_cqe, trusted_ticket 用于执行 poison；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：poison 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：在 rdma_cmq_engine 中，poison 构造并发布 detached 诊断证据，清空 late-final 队列后把 engine 原子切换为 POISONED。
+  // 输入/输出及副作用：kind（输入）、message（输入）、raw_cqe（输入）、null（输入）；poison 可能更新本对象明确拥有的状态；函数返回 rdma_status，不取得调用方资源所有权。
+
+  // 失败/边界：poison 返回 RDMA_SC_CODEC_ERROR；失败路径不提交部分状态或转移未声明资源。
   protected function rdma_status poison(
     rdma_cmq_diagnostic_kind_e kind,
     string message,
@@ -857,10 +835,9 @@ class rdma_cmq_engine extends uvm_object;
     return failure;
   endfunction
 
-  // 功能：处理 expire_locked：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 status 用于执行 expire_locked；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：expire_locked 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：在 rdma_cmq_engine 中，expire_locked 根据当前证据转换事务或恢复状态，并保持重试、复位和所有权边界一致。
+  // 输入/输出及副作用：无显式参数；expire_locked 可能更新本对象明确拥有的状态；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：expire_locked 返回 RDMA_SC_INVALID_STATE；典型拒绝条件为“CMQ expiry slot authority is incomplete”“CMQ expiry slot ledger is inconsistent”；失败路径不提交部分状态或转移未声明资源。
   protected function rdma_status expire_locked();
     rdma_status status;
     longint unsigned ledger_used;
@@ -927,10 +904,9 @@ class rdma_cmq_engine extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：处理 strict_cancel_ledger_status：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 generation 用于执行 strict_cancel_ledger_status；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：strict_cancel_ledger_status 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：strict_cancel_ledger_status 校验 generation 与当前对象状态的一致性，并显式处理“CMQ cancel ledger audit returned null status”；“CMQ cancel ticket authority is untrusted”；“CMQ cancel slot authority is inconsistent”；“CMQ cancel entry registry is inconsistent”等拒绝条件，返回 rdma_status 供上层决定是否提交。
+  // 输入/输出及副作用：generation（输入）；strict_cancel_ledger_status 读取 generation 并使用字段 status、published_slot_count、token_count、record、hardware_key、software_key；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：strict_cancel_ledger_status 返回 函数体规定的失败状态；具体拒绝条件包括 “CMQ cancel ledger audit returned null status”；“CMQ cancel ticket authority is untrusted”；“CMQ cancel slot authority is inconsistent”；“CMQ cancel entry registry is inconsistent”；失败路径不提交部分状态、不隐式重试，也不转移未声明资源。
   protected function rdma_status strict_cancel_ledger_status(
     int unsigned generation
   );
@@ -1016,10 +992,9 @@ class rdma_cmq_engine extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：处理 recovery_record_is_trusted：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 record, slot_index, generation 用于执行 recovery_record_is_trusted；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：recovery_record_is_trusted 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：在 rdma_cmq_engine 中，recovery_record_is_trusted 根据当前证据转换事务或恢复状态，并保持重试、复位和所有权边界一致。
+  // 输入/输出及副作用：record（输入）、slot_index（输入）、generation（输入）；输入 action/epoch/handle 决定迁移目标；成功时更新状态或恢复证据，外部资源仍由其拥有者管理。
+  // 失败/边界：当前状态不允许、epoch/generation 过期或恢复证据不完整时返回错误；不得跳过隔离步骤。
   protected function bit recovery_record_is_trusted(
     rdma_cmq_slot_record record,
     int unsigned slot_index,
@@ -1054,10 +1029,9 @@ class rdma_cmq_engine extends uvm_object;
     return 1'b1;
   endfunction
 
-  // 功能：处理 cancel_generation_locked：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 generation, recover_poisoned_ledger 用于执行 cancel_generation_locked；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：cancel_generation_locked 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：在 rdma_cmq_engine 中，cancel_generation_locked 根据当前证据转换事务或恢复状态，并保持重试、复位和所有权边界一致。
+  // 输入/输出及副作用：generation（输入）、recover_poisoned_ledger（输入）；cancel_generation_locked 可能更新本对象明确拥有的状态；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：cancel_generation_locked 返回 RDMA_SC_STALE_GENERATION；具体拒绝条件包括 “CMQ generation authority is missing”；“CMQ cancel ledger audit returned null status”；“CMQ cancel slot authority is inconsistent”；“CMQ cancel token authority is inconsistent”；“CMQ cancel completion helper returned null”；失败路径不提交部分状态、不隐式重试，也不转移未声明资源。
   protected function rdma_status cancel_generation_locked(
     int unsigned generation,
     bit recover_poisoned_ledger
@@ -1169,10 +1143,10 @@ class rdma_cmq_engine extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：处理 prospective_retirement_status：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 prospective_record, prospective_retire_seq 用于执行 prospective_retirement_status；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：prospective_retirement_status 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：prospective_retirement_status 校验 prospective_record、prospective_retire_seq 与当前对象状态的一致性，并显式处理“CMQ prospective retirement record is null”等拒绝条件，返回 rdma_status 供上层决定是否提交。
+  // 输入/输出及副作用：prospective_record（输入）、prospective_retire_seq（输出）；prospective_retirement_status 读取 prospective_record、prospective_retire_seq 并使用字段 prospective_retire_seq、index、record，并写入 prospective_retire_seq；函数返回 rdma_status，不取得调用方资源所有权。
+
+  // 失败/边界：prospective_retirement_status 返回 函数体规定的失败状态；具体拒绝条件包括 “CMQ prospective retirement record is null”；“CMQ retirement slot ledger is inconsistent”；失败路径不提交部分状态、不隐式重试，也不转移未声明资源。
   protected function rdma_status prospective_retirement_status(
     rdma_cmq_slot_record prospective_record,
     output longint unsigned prospective_retire_seq
@@ -1213,10 +1187,10 @@ class rdma_cmq_engine extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：执行一次受控事务并推进所属状态机；返回结果时保留失败阶段、代际和后端提交证据。
-  // 输入/输出及副作用：参数 prospective_retire_seq 用于执行 commit_retired_prefix；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：事务超时、代际变化或提交证据不完整时不得推进下一阶段。
+  // 功能：在 rdma_cmq_engine 中，commit_retired_prefix 执行受控事务并按后端提交证据推进状态机，同时保留失败阶段和 generation 证据。
+  // 输入/输出及副作用：prospective_retire_seq（输入）；输入 request/image/cursor 决定写入内容；成功时更新 PI/CI、slot ledger 或 pending journal，并通过
+  //   output 返回结果。
+  // 失败/边界：commit_retired_prefix 遇到锁、超时、generation 变化或提交证据不完整时保持原状态，不推进游标。
   protected function void commit_retired_prefix(
     longint unsigned prospective_retire_seq
   );
@@ -1230,28 +1204,25 @@ class rdma_cmq_engine extends uvm_object;
     end
   endfunction
 
-  // 功能：比较两个输入对象的协议字段或身份快照并返回确定的相等性结果，不修改任一输入。
-  // 输入/输出及副作用：输入为待比较的两个值对象；返回 bit/状态结果，不修改任一输入或外部账本。
-  //   任一对象为空、类型不符或字段未初始化时按接口约定返回不相等或错误。
-  // 失败/边界：比较输入为空或类型不符时不得抛出未处理异常；结果必须保持确定且无副作用。
+  // 功能：在 rdma_cmq_engine 中由 same_handle 逐字段比较输入值，返回结构、身份或序列化内容是否一致。
+  // 输入/输出及副作用：lhs（输入）、rhs（输入）；比较对象/数组只读；返回 bit 或状态结果，不更新 runtime、账本或外部 adapter。
+  // 失败/边界：same_handle 的任一比较对象为空或类型不符时返回确定的 false/不等结果，不抛出未处理异常。
   protected function bit same_handle(rdma_handle lhs, rdma_handle rhs);
     if (lhs == null || rhs == null)
       return 1'b0;
     return lhs.same_instance(rhs);
   endfunction
 
-  // 功能：比较两个输入对象的协议字段或身份快照并返回确定的相等性结果，不修改任一输入。
-  // 输入/输出及副作用：输入为待比较的两个值对象；返回 bit/状态结果，不修改任一输入或外部账本。
-  //   任一对象为空、类型不符或字段未初始化时按接口约定返回不相等或错误。
-  // 失败/边界：比较输入为空或类型不符时不得抛出未处理异常；结果必须保持确定且无副作用。
+  // 功能：在 rdma_cmq_engine 中由 same_bdf 逐字段比较输入值，返回结构、身份或序列化内容是否一致。
+  // 输入/输出及副作用：lhs（输入）、rhs（输入）；比较对象/数组只读；返回 bit 或状态结果，不更新 runtime、账本或外部 adapter。
+  // 失败/边界：same_bdf 的任一比较对象为空或类型不符时返回确定的 false/不等结果，不抛出未处理异常。
   protected function bit same_bdf(rdma_bdf_t lhs, rdma_bdf_t rhs);
     return lhs == rhs;
   endfunction
 
-  // 功能：从源对象复制可变字段并生成独立值快照；源对象保持不变，类型不匹配时报告复制错误。
-  // 输入/输出及副作用：source/rhs 是源对象；返回或写入独立副本，不修改源对象。
-  //   source/rhs 为空或类型不匹配时返回空值或触发既定复制错误。
-  // 失败/边界：空源对象不应解引用；类型不匹配必须拒绝复制或按既定 UVM 规则报告 fatal。
+  // 功能：在 rdma_cmq_engine 中，clone_binding_snapshot 将 rhs 中 rdma_cmq_engine 的值字段复制到当前对象，建立与源对象隔离的快照。
+  // 输入/输出及副作用：source（输入）、snapshot（输出）；clone_binding_snapshot 读取 source、snapshot 并使用字段 snapshot、cloned_object，并写入 snapshot；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：clone_binding_snapshot 返回 RDMA_SC_INVALID_ARGUMENT、RDMA_SC_INVALID_STATE；典型拒绝条件为“CMQ Function binding is null”“CMQ Function binding snapshot clone failed”；失败路径不提交部分状态或转移未声明资源。
   protected function rdma_status clone_binding_snapshot(
     rdma_function_binding source,
     output rdma_function_binding snapshot
@@ -1269,10 +1240,9 @@ class rdma_cmq_engine extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：检查输入字段、身份和生命周期约束，返回可诊断的校验状态；失败时不提交部分更新。
-  // 输入/输出及副作用：输入为待校验字段或快照；返回 rdma_status，校验过程不提交资源和游标。
-  //   空依赖、非法范围、身份不一致或非活动状态会返回错误。
-  // 失败/边界：任何非法枚举、越界字段、缺失必需依赖或身份/代际不一致都必须返回非成功状态。
+  // 功能：validate_binding_owner 校验 binding、lifecycle_name 与当前对象状态的一致性，并显式处理“CMQ Function binding is null”等拒绝条件，返回 rdma_status 供上层决定是否提交。
+  // 输入/输出及副作用：binding（输入）、lifecycle_name（输入）；validate_binding_owner 读取 binding、lifecycle_name 并使用字段 expected_owner；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：必需对象/句柄/快照为空，或身份、范围、generation 和生命周期检查失败时返回非成功状态。
   protected function rdma_status validate_binding_owner(
     rdma_function_binding binding,
     string lifecycle_name
@@ -1289,10 +1259,9 @@ class rdma_cmq_engine extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：处理 prepared_binding_status：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 binding 用于执行 prepared_binding_status；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：prepared_binding_status 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：prepared_binding_status 校验 binding 与当前对象状态的一致性，并显式处理“CMQ Function binding is null”等拒绝条件，返回 rdma_status 供上层决定是否提交。
+  // 输入/输出及副作用：binding（输入）；prepared_binding_status 可能更新本对象明确拥有的状态；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：prepared_binding_status 返回 RDMA_SC_INVALID_ARGUMENT、RDMA_SC_INVALID_STATE；典型拒绝条件为“CMQ Function binding is null”“CMQ prepare requires a PREPARED binding”；失败路径不提交部分状态或转移未声明资源。
   protected function rdma_status prepared_binding_status(
     rdma_function_binding binding
   );
@@ -1310,10 +1279,9 @@ class rdma_cmq_engine extends uvm_object;
     return validate_binding_owner(binding, "PREPARED");
   endfunction
 
-  // 功能：处理 active_binding_status：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 binding 用于执行 active_binding_status；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：active_binding_status 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：active_binding_status 校验 binding 与当前对象状态的一致性，并显式处理“CMQ active Function binding is null”等拒绝条件，返回 rdma_status 供上层决定是否提交。
+  // 输入/输出及副作用：binding（输入）；active_binding_status 读取 binding 并使用字段 status；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：active_binding_status 返回 RDMA_SC_INVALID_ARGUMENT、RDMA_SC_INVALID_STATE；典型拒绝条件为“CMQ active Function binding is null”“CMQ activate requires an ACTIVE binding”；失败路径不提交部分状态或转移未声明资源。
   protected function rdma_status active_binding_status(
     rdma_function_binding binding
   );
@@ -1331,10 +1299,9 @@ class rdma_cmq_engine extends uvm_object;
     return validate_binding_owner(binding, "ACTIVE");
   endfunction
 
-  // 功能：从源对象复制可变字段并生成独立值快照；源对象保持不变，类型不匹配时报告复制错误。
-  // 输入/输出及副作用：source/rhs 是源对象；返回或写入独立副本，不修改源对象。
-  //   source/rhs 为空或类型不匹配时返回空值或触发既定复制错误。
-  // 失败/边界：空源对象不应解引用；类型不匹配必须拒绝复制或按既定 UVM 规则报告 fatal。
+  // 功能：在 rdma_cmq_engine 中，clone_cmq_snapshot 将 rhs 中 rdma_cmq_engine 的值字段复制到当前对象，建立与源对象隔离的快照。
+  // 输入/输出及副作用：source（输入）、snapshot（输出）；clone_cmq_snapshot 读取 source、snapshot 并使用字段 snapshot、cloned_object，并写入 snapshot；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：clone_cmq_snapshot 返回 RDMA_SC_INVALID_ARGUMENT、RDMA_SC_INVALID_STATE；典型拒绝条件为“CMQ resource is null”“CMQ resource snapshot clone failed”；失败路径不提交部分状态或转移未声明资源。
   protected function rdma_status clone_cmq_snapshot(
     rdma_cmq source,
     output rdma_cmq snapshot
@@ -1352,10 +1319,9 @@ class rdma_cmq_engine extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：处理 cmq_resource_status：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 cmq, binding 用于执行 cmq_resource_status；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：cmq_resource_status 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：cmq_resource_status 校验 cmq、binding 与当前对象状态的一致性，并显式处理“CMQ resource is null”等拒绝条件，返回 rdma_status 供上层决定是否提交。
+  // 输入/输出及副作用：cmq（输入）、binding（输入）；cmq_resource_status 读取 cmq、binding 并使用字段 status、expected_owner；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：cmq_resource_status 返回 RDMA_SC_STALE_GENERATION、RDMA_SC_INVALID_ARGUMENT、RDMA_SC_INVALID_STATE；典型拒绝条件为“CMQ resource is null”“CMQ resource returned null status”；失败路径不提交部分状态或转移未声明资源。
   protected function rdma_status cmq_resource_status(
     rdma_cmq cmq,
     rdma_function_binding binding
@@ -1389,10 +1355,10 @@ class rdma_cmq_engine extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：依据输入请求创建对应的值对象或资源计划，并校验依赖、所有权和生命周期后返回结果。
-  // 输入/输出及副作用：输入请求、容量和依赖用于构造/预留资源；返回独立对象或状态，不暴露内部可变集合。
-  //   参数越界、容量不足或构造中途失败时回滚已登记的局部状态。
-  // 失败/边界：依赖为空、参数越界、容量不足或构造步骤失败时清理局部结果并返回明确错误。
+  // 功能：make_request_context 创建独立的 rdma_status；根据 binding、cmq、pasid_valid、pasid、request_context 设置字段 request_context、request_context.function_h、request_context.requester_bdf、request_context.pasid_valid、request_context.pasid、request_context.dma_domain_valid、request_context.dma_domain_id、request_context.owner_h、status，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：binding（输入）、cmq（输入）、pasid_valid（输入）、pasid（输入）、request_context（输出）；输入字段被复制到返回值或
+  //   output；生成结果与输入隔离，不隐式修改调用方对象。
+  // 失败/边界：make_request_context 返回 RDMA_SC_DMA_TRANSLATION；具体拒绝条件包括 “CMQ DMA request context construction failed”；“CMQ DMA Function handle construction failed”；“CMQ DMA request context returned null status”；“CMQ PASID does not match Function queue DMA authority”；失败路径不提交部分状态、不隐式重试，也不转移未声明资源。
   protected function rdma_status make_request_context(
     rdma_function_binding binding,
     rdma_cmq cmq,
@@ -1429,10 +1395,10 @@ class rdma_cmq_engine extends uvm_object;
     return status;
   endfunction
 
-  // 功能：处理 mapping_authority_status：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 mapping, request_context 用于执行 mapping_authority_status；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：mapping_authority_status 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：mapping_authority_status 校验 mapping、request_context 与当前对象状态的一致性，并显式处理“CMQ host memory returned a null mapping”等拒绝条件，返回 rdma_status 供上层决定是否提交。
+  // 输入/输出及副作用：mapping（输入）、request_context（输入）；mapping_authority_status 读取 mapping、request_context 并使用字段 expected_permissions；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：mapping_authority_status 返回 RDMA_SC_DMA_TRANSLATION、RDMA_SC_STALE_GENERATION、RDMA_SC_DMA_PERMISSION、RDMA_SC_INVALID_STATE；典型拒绝条件为“CMQ host memory returned a null mapping”“CMQ DMA authority context is missing”；失败路径不提交部分状态或转移未声明资源。
+
   protected function rdma_status mapping_authority_status(
     rdma_dma_mapping mapping,
     rdma_dma_request_context request_context
@@ -1530,10 +1496,9 @@ class rdma_cmq_engine extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：从源对象复制可变字段并生成独立值快照；源对象保持不变，类型不匹配时报告复制错误。
-  // 输入/输出及副作用：source/rhs 是源对象；返回或写入独立副本，不修改源对象。
-  //   source/rhs 为空或类型不匹配时返回空值或触发既定复制错误。
-  // 失败/边界：空源对象不应解引用；类型不匹配必须拒绝复制或按既定 UVM 规则报告 fatal。
+  // 功能：在 rdma_cmq_engine 中，clone_function_handle_fields 将 rhs 中 rdma_cmq_engine 的值字段复制到当前对象，建立与源对象隔离的快照。
+  // 输入/输出及副作用：source（输入）、name（输入）、result（输出）；clone_function_handle_fields 读取 source、name、result 并使用字段 result、result.kind、result.function_uid、result.object_id、result.generation，并写入 result；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：clone_function_handle_fields 返回 RDMA_SC_INVALID_STATE；典型拒绝条件为“CMQ runtime Function source is null”“CMQ runtime Function construction failed”；失败路径不提交部分状态或转移未声明资源。
   protected function rdma_status clone_function_handle_fields(
     rdma_function_handle source,
     string name,
@@ -1552,10 +1517,9 @@ class rdma_cmq_engine extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：从源对象复制可变字段并生成独立值快照；源对象保持不变，类型不匹配时报告复制错误。
-  // 输入/输出及副作用：source/rhs 是源对象；返回或写入独立副本，不修改源对象。
-  //   source/rhs 为空或类型不匹配时返回空值或触发既定复制错误。
-  // 失败/边界：空源对象不应解引用；类型不匹配必须拒绝复制或按既定 UVM 规则报告 fatal。
+  // 功能：在 rdma_cmq_engine 中，clone_handle_fields 将 rhs 中 rdma_cmq_engine 的值字段复制到当前对象，建立与源对象隔离的快照。
+  // 输入/输出及副作用：source（输入）、name（输入）、result（输出）；clone_handle_fields 读取 source、name、result 并使用字段 result、result.kind、result.function_uid、result.object_id、result.generation，并写入 result；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：clone_handle_fields 返回 RDMA_SC_INVALID_STATE；典型拒绝条件为“CMQ runtime handle source is null”“CMQ runtime handle construction failed”；失败路径不提交部分状态或转移未声明资源。
   protected function rdma_status clone_handle_fields(
     rdma_handle source,
     string name,
@@ -1574,10 +1538,9 @@ class rdma_cmq_engine extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：按输入的完整标识查询当前权威记录并返回独立快照；缺失、歧义或代际过期时返回明确错误。
-  // 输入/输出及副作用：输入为完整 key/handle，output 或返回值为记录快照；查询不改变登记表和外部资源。
-  //   缺失、歧义、空句柄或旧 generation/reset epoch 返回明确错误。
-  // 失败/边界：查询不到唯一记录、输入为空或 authority 已失效时返回错误，不回退到默认 Function/root。
+  // 功能：在 rdma_cmq_engine 中，snapshot_failure 按完整 key/handle 查找唯一权威记录并返回 detached 快照，避免把内部可变引用泄露给调用方。
+  // 输入/输出及副作用：failure_code（输入）、message（输入）；snapshot_failure 读取 failure_code、message 并使用字段 rdma_status；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：snapshot_failure 在 key/handle 缺失、记录不唯一或 generation/reset epoch 过期时返回明确错误，不回退到默认 authority。
   protected function rdma_status snapshot_failure(
     rdma_status_code_e failure_code,
     string message
@@ -1585,10 +1548,9 @@ class rdma_cmq_engine extends uvm_object;
     return rdma_status::make(failure_code, message);
   endfunction
 
-  // 功能：比较两个输入对象的协议字段或身份快照并返回确定的相等性结果，不修改任一输入。
-  // 输入/输出及副作用：输入为待比较的两个值对象；返回 bit/状态结果，不修改任一输入或外部账本。
-  //   任一对象为空、类型不符或字段未初始化时按接口约定返回不相等或错误。
-  // 失败/边界：比较输入为空或类型不符时不得抛出未处理异常；结果必须保持确定且无副作用。
+  // 功能：在 rdma_cmq_engine 中由 same_byte_queue 逐字段比较输入值，返回结构、身份或序列化内容是否一致。
+  // 输入/输出及副作用：lhs（输入）、rhs（输入）；比较对象/数组只读；返回 bit 或状态结果，不更新 runtime、账本或外部 adapter。
+  // 失败/边界：same_byte_queue 的任一比较对象为空或类型不符时返回确定的 false/不等结果，不抛出未处理异常。
   protected function bit same_byte_queue(
     byte unsigned lhs[$],
     byte unsigned rhs[$]
@@ -1601,10 +1563,9 @@ class rdma_cmq_engine extends uvm_object;
     return 1'b1;
   endfunction
 
-  // 功能：比较两个输入对象的协议字段或身份快照并返回确定的相等性结果，不修改任一输入。
-  // 输入/输出及副作用：输入为待比较的两个值对象；返回 bit/状态结果，不修改任一输入或外部账本。
-  //   任一对象为空、类型不符或字段未初始化时按接口约定返回不相等或错误。
-  // 失败/边界：比较输入为空或类型不符时不得抛出未处理异常；结果必须保持确定且无副作用。
+  // 功能：在 rdma_cmq_engine 中由 same_string_queue 逐字段比较输入值，返回结构、身份或序列化内容是否一致。
+  // 输入/输出及副作用：lhs（输入）、rhs（输入）；比较对象/数组只读；返回 bit 或状态结果，不更新 runtime、账本或外部 adapter。
+  // 失败/边界：same_string_queue 的任一比较对象为空或类型不符时返回确定的 false/不等结果，不抛出未处理异常。
   protected function bit same_string_queue(
     string lhs[$],
     string rhs[$]
@@ -1617,10 +1578,9 @@ class rdma_cmq_engine extends uvm_object;
     return 1'b1;
   endfunction
 
-  // 功能：比较两个输入对象的协议字段或身份快照并返回确定的相等性结果，不修改任一输入。
-  // 输入/输出及副作用：输入为待比较的两个值对象；返回 bit/状态结果，不修改任一输入或外部账本。
-  //   任一对象为空、类型不符或字段未初始化时按接口约定返回不相等或错误。
-  // 失败/边界：比较输入为空或类型不符时不得抛出未处理异常；结果必须保持确定且无副作用。
+  // 功能：在 rdma_cmq_engine 中由 same_image_value 逐字段比较输入值，返回结构、身份或序列化内容是否一致。
+  // 输入/输出及副作用：lhs（输入）、rhs（输入）；比较对象/数组只读；返回 bit 或状态结果，不更新 runtime、账本或外部 adapter。
+  // 失败/边界：same_image_value 的任一比较对象为空或类型不符时返回确定的 false/不等结果，不抛出未处理异常。
   protected function bit same_image_value(
     rdma_hw_image lhs,
     rdma_hw_image rhs
@@ -1641,10 +1601,9 @@ class rdma_cmq_engine extends uvm_object;
            same_string_queue(lhs.field_summary, rhs.field_summary);
   endfunction
 
-  // 功能：比较两个输入对象的协议字段或身份快照并返回确定的相等性结果，不修改任一输入。
-  // 输入/输出及副作用：输入为待比较的两个值对象；返回 bit/状态结果，不修改任一输入或外部账本。
-  //   任一对象为空、类型不符或字段未初始化时按接口约定返回不相等或错误。
-  // 失败/边界：比较输入为空或类型不符时不得抛出未处理异常；结果必须保持确定且无副作用。
+  // 功能：在 rdma_cmq_engine 中由 same_expected_value 逐字段比较输入值，返回结构、身份或序列化内容是否一致。
+  // 输入/输出及副作用：lhs（输入）、rhs（输入）；比较对象/数组只读；返回 bit 或状态结果，不更新 runtime、账本或外部 adapter。
+  // 失败/边界：same_expected_value 的任一比较对象为空或类型不符时返回确定的 false/不等结果，不抛出未处理异常。
   protected function bit same_expected_value(
     rdma_cmq_expected_response lhs,
     rdma_cmq_expected_response rhs
@@ -1655,10 +1614,9 @@ class rdma_cmq_engine extends uvm_object;
            lhs.variant == rhs.variant;
   endfunction
 
-  // 功能：比较两个输入对象的协议字段或身份快照并返回确定的相等性结果，不修改任一输入。
-  // 输入/输出及副作用：输入为待比较的两个值对象；返回 bit/状态结果，不修改任一输入或外部账本。
-  //   任一对象为空、类型不符或字段未初始化时按接口约定返回不相等或错误。
-  // 失败/边界：比较输入为空或类型不符时不得抛出未处理异常；结果必须保持确定且无副作用。
+  // 功能：在 rdma_cmq_engine 中由 same_opcode_value 逐字段比较输入值，返回结构、身份或序列化内容是否一致。
+  // 输入/输出及副作用：lhs（输入）、rhs（输入）；比较对象/数组只读；返回 bit 或状态结果，不更新 runtime、账本或外部 adapter。
+  // 失败/边界：same_opcode_value 的任一比较对象为空或类型不符时返回确定的 false/不等结果，不抛出未处理异常。
   protected function bit same_opcode_value(
     rdma_cmq_opcode_key lhs,
     rdma_cmq_opcode_key rhs
@@ -1669,10 +1627,9 @@ class rdma_cmq_engine extends uvm_object;
            lhs.opcode == rhs.opcode && lhs.variant == rhs.variant;
   endfunction
 
-  // 功能：比较两个输入对象的协议字段或身份快照并返回确定的相等性结果，不修改任一输入。
-  // 输入/输出及副作用：输入为待比较的两个值对象；返回 bit/状态结果，不修改任一输入或外部账本。
-  //   任一对象为空、类型不符或字段未初始化时按接口约定返回不相等或错误。
-  // 失败/边界：比较输入为空或类型不符时不得抛出未处理异常；结果必须保持确定且无副作用。
+  // 功能：在 rdma_cmq_engine 中由 same_mapping_value 逐字段比较输入值，返回结构、身份或序列化内容是否一致。
+  // 输入/输出及副作用：lhs（输入）、rhs（输入）；比较对象/数组只读；返回 bit 或状态结果，不更新 runtime、账本或外部 adapter。
+  // 失败/边界：same_mapping_value 的任一比较对象为空或类型不符时返回确定的 false/不等结果，不抛出未处理异常。
   protected function bit same_mapping_value(
     rdma_dma_mapping lhs,
     rdma_dma_mapping rhs
@@ -1696,10 +1653,9 @@ class rdma_cmq_engine extends uvm_object;
            lhs.owner_h.same_instance(rhs.owner_h);
   endfunction
 
-  // 功能：比较两个输入对象的协议字段或身份快照并返回确定的相等性结果，不修改任一输入。
-  // 输入/输出及副作用：输入为待比较的两个值对象；返回 bit/状态结果，不修改任一输入或外部账本。
-  //   任一对象为空、类型不符或字段未初始化时按接口约定返回不相等或错误。
-  // 失败/边界：比较输入为空或类型不符时不得抛出未处理异常；结果必须保持确定且无副作用。
+  // 功能：在 rdma_cmq_engine 中由 same_ticket_value 逐字段比较输入值，返回结构、身份或序列化内容是否一致。
+  // 输入/输出及副作用：lhs（输入）、rhs（输入）；比较对象/数组只读；返回 bit 或状态结果，不更新 runtime、账本或外部 adapter。
+  // 失败/边界：same_ticket_value 的任一比较对象为空或类型不符时返回确定的 false/不等结果，不抛出未处理异常。
   protected function bit same_ticket_value(
     rdma_cmq_ticket lhs,
     rdma_cmq_ticket rhs
@@ -1718,10 +1674,9 @@ class rdma_cmq_engine extends uvm_object;
            lhs.absolute_deadline == rhs.absolute_deadline;
   endfunction
 
-  // 功能：比较两个输入对象的协议字段或身份快照并返回确定的相等性结果，不修改任一输入。
-  // 输入/输出及副作用：输入为待比较的两个值对象；返回 bit/状态结果，不修改任一输入或外部账本。
-  //   任一对象为空、类型不符或字段未初始化时按接口约定返回不相等或错误。
-  // 失败/边界：比较输入为空或类型不符时不得抛出未处理异常；结果必须保持确定且无副作用。
+  // 功能：在 rdma_cmq_engine 中由 same_dependency_value 逐字段比较输入值，返回结构、身份或序列化内容是否一致。
+  // 输入/输出及副作用：lhs（输入）、rhs（输入）；比较对象/数组只读；返回 bit 或状态结果，不更新 runtime、账本或外部 adapter。
+  // 失败/边界：same_dependency_value 的任一比较对象为空或类型不符时返回确定的 false/不等结果，不抛出未处理异常。
   protected function bit same_dependency_value(
     rdma_doorbell_dependency lhs,
     rdma_doorbell_dependency rhs
@@ -1736,10 +1691,9 @@ class rdma_cmq_engine extends uvm_object;
            lhs.ready == rhs.ready;
   endfunction
 
-  // 功能：处理 handle_value_key：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 handle 用于执行 handle_value_key；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：handle_value_key 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：在 rdma_cmq_engine 中，handle_value_key 把 Function/对象身份、代际和游标字段拼成稳定的查找键，供登记表去重和恢复路由使用。
+  // 输入/输出及副作用：handle（输入）；handle_value_key 可能更新本对象明确拥有的状态；函数返回 string，不取得调用方资源所有权。
+// 失败/边界：handle_value_key 只按函数体列出的身份、generation、kind、object_id 或 cursor 字段拼接键；调用方须先完成空句柄校验，函数本身不分配资源、不自动回退到 root0。
   protected function automatic string handle_value_key(rdma_handle handle);
     if (handle == null)
       return "<null-handle>";
@@ -1749,8 +1703,7 @@ class rdma_cmq_engine extends uvm_object;
   endfunction
 
   // 功能：判断 has_exact_object_type 对应的状态、能力或账本条件，并返回确定的布尔/计数结果，不修改状态。
-  // 输入/输出及副作用：参数 value, expected_type 用于执行 has_exact_object_type；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
+  // 输入/输出及副作用：value（输入）、expected_type（输入）；has_exact_object_type 读取 value、expected_type 并使用字段 actual_type；函数返回 bit，不取得调用方资源所有权。
   // 失败/边界：has_exact_object_type 只读取现有账本；输入未初始化时返回保守结果，不得借助默认 Function/root 猜测。
   protected function automatic bit has_exact_object_type(
     uvm_object value,
@@ -1765,8 +1718,7 @@ class rdma_cmq_engine extends uvm_object;
   endfunction
 
   // 功能：判断 has_optional_exact_object_type 对应的状态、能力或账本条件，并返回确定的布尔/计数结果，不修改状态。
-  // 输入/输出及副作用：参数 value, expected_type 用于执行 has_optional_exact_object_type；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
+  // 输入/输出及副作用：value（输入）、expected_type（输入）；has_optional_exact_object_type 读取 value、expected_type 并使用输入参数和固定枚举/常量；函数返回 bit，不取得调用方资源所有权。
   // 失败/边界：has_optional_exact_object_type 只读取现有账本；输入未初始化时返回保守结果，不得借助默认 Function/root 猜测。
   protected function automatic bit has_optional_exact_object_type(
     uvm_object value,
@@ -1775,10 +1727,9 @@ class rdma_cmq_engine extends uvm_object;
     return value == null || has_exact_object_type(value, expected_type);
   endfunction
 
-  // 功能：处理 core_body_shell_is_exact：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 body 用于执行 core_body_shell_is_exact；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：core_body_shell_is_exact 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：在 rdma_cmq_engine 中，core_body_shell_is_exact 逐字段核对快照、嵌套引用和 authority 值，确认复制结果既等值又无可变别名。
+  // 输入/输出及副作用：body（输入）；core_body_shell_is_exact 读取 body 并使用字段 rdma_function_handle、rdma_handle、rdma_urc_queue_config、rdma_page_table_layout、rdma_ring_position、rdma_mr_page_layout、rdma_cmq_sqe_model、rdma_qpc_model；函数返回 bit，不取得调用方资源所有权。
+  // 失败/边界：core_body_shell_is_exact 比较或前置条件不满足时返回 0/false；该路径不隐式重试，也不转移未声明资源。
   protected function automatic bit core_body_shell_is_exact(
     rdma_hw_model body
   );
@@ -1892,10 +1843,9 @@ class rdma_cmq_engine extends uvm_object;
     return 1'b0;
   endfunction
 
-  // 功能：处理 nested_value_key：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 handle 用于执行 nested_value_key；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：nested_value_key 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：在 rdma_cmq_engine 中，nested_value_key 把 Function/对象身份、代际和游标字段拼成稳定的查找键，供登记表去重和恢复路由使用。
+  // 输入/输出及副作用：value（输入）；nested_value_key 读取 value 并使用字段 result；函数返回 string，不取得调用方资源所有权。
+  // 失败/边界：nested_value_key 下游操作失败时原样传播其 status/result，不伪造成功；该路径不隐式重试，也不转移未声明资源。
   protected function automatic string nested_value_key(uvm_object value);
     rdma_handle handle;
     rdma_ring_position ring;
@@ -1992,10 +1942,9 @@ class rdma_cmq_engine extends uvm_object;
     return "";
   endfunction
 
-  // 功能：处理 body_value_key：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 sqe 用于执行 body_value_key；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：body_value_key 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：在 rdma_cmq_engine 中，body_value_key 把 Function/对象身份、代际和游标字段拼成稳定的查找键，供登记表去重和恢复路由使用。
+  // 输入/输出及副作用：body（输入）；body_value_key 读取 body 并使用字段 value、rdma_cmq_sqe_model、rdma_qpc_model、rdma_cqc_model、rdma_mrt_model、rdma_srqc_model、rdma_ceqc_model、rdma_aeqc_model；函数返回 string，不取得调用方资源所有权。
+// 失败/边界：body_value_key 只按函数体列出的身份、generation、kind、object_id 或 cursor 字段拼接键；调用方须先完成空句柄校验，函数本身不分配资源、不自动回退到 root0。
   protected function automatic string body_value_key(rdma_hw_model body);
     rdma_cmq_sqe_model sqe;
     rdma_qpc_model qpc;
@@ -2080,10 +2029,9 @@ class rdma_cmq_engine extends uvm_object;
     return "";
   endfunction
 
-  // 功能：比较两个输入对象的协议字段或身份快照并返回确定的相等性结果，不修改任一输入。
-  // 输入/输出及副作用：输入为待比较的两个值对象；返回 bit/状态结果，不修改任一输入或外部账本。
-  //   任一对象为空、类型不符或字段未初始化时按接口约定返回不相等或错误。
-  // 失败/边界：比较输入为空或类型不符时不得抛出未处理异常；结果必须保持确定且无副作用。
+  // 功能：在 rdma_cmq_engine 中由 same_body_value 逐字段比较输入值，返回结构、身份或序列化内容是否一致。
+  // 输入/输出及副作用：lhs（输入）、rhs（输入）；比较对象/数组只读；返回 bit 或状态结果，不更新 runtime、账本或外部 adapter。
+  // 失败/边界：same_body_value 的任一比较对象为空或类型不符时返回确定的 false/不等结果，不抛出未处理异常。
   protected function automatic bit same_body_value(
     rdma_hw_model lhs,
     rdma_hw_model rhs
@@ -2131,10 +2079,9 @@ class rdma_cmq_engine extends uvm_object;
     return 1'b0;
   endfunction
 
-  // 功能：处理 append_body_graph_nodes：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 body, nodes 用于执行 append_body_graph_nodes；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：append_body_graph_nodes 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：在 rdma_cmq_engine 中，append_body_graph_nodes 将输入对象登记或挂接到当前集合/依赖图，并同步维护对应账本和生命周期引用。
+  // 输入/输出及副作用：body（输入）、nodes（引用）；append_body_graph_nodes 可能更新本对象明确拥有的状态，并写入 nodes；函数返回 void，不取得调用方资源所有权。
+  // 失败/边界：append_body_graph_nodes 无返回值，仅执行 函数体中的顺序操作；调用方须保证前置依赖已经绑定，函数不自动重试或接管外部资源。
   protected function automatic void append_body_graph_nodes(
     rdma_hw_model body,
     ref uvm_object nodes[$]
@@ -2205,10 +2152,9 @@ class rdma_cmq_engine extends uvm_object;
     end
   endfunction
 
-  // 功能：处理 body_graph_detached：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 source, snapshot 用于执行 body_graph_detached；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：body_graph_detached 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：在 rdma_cmq_engine 中，body_graph_detached 检查嵌套 body/graph 引用是否已经 detached，防止编码或恢复阶段残留可变别名。
+  // 输入/输出及副作用：source（输入）、snapshot（输入）；body_graph_detached 读取 source、snapshot 并使用字段 source_type、snapshot_type；函数返回 bit，不取得调用方资源所有权。
+  // 失败/边界：body_graph_detached 比较或前置条件不满足时返回 0/false；该路径不隐式重试，也不转移未声明资源。
   protected function automatic bit body_graph_detached(
     rdma_hw_model source,
     rdma_hw_model snapshot
@@ -2258,10 +2204,10 @@ class rdma_cmq_engine extends uvm_object;
     return 1'b1;
   endfunction
 
-  // 功能：处理 checked_function_snapshot：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 source, label, failure_code, snapshot 用于执行 checked_function_snapshot；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：checked_function_snapshot 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：checked_function_snapshot 复制 source、label、failure_code、snapshot 的受控字段并生成独立快照，供查询、编码或恢复使用；源对象保持不变。
+  // 输入/输出及副作用：source（输入）、label（输入）、failure_code（输入）、snapshot（输出）；checked_function_snapshot 读取 source、label、failure_code、snapshot 并使用字段 snapshot、saved_kind、source_type_name、saved_function_uid、saved_object_id、saved_generation、cloned_object、source.kind，并写入 snapshot；函数返回 rdma_status，不取得调用方资源所有权。
+
+  // 失败/边界：checked_function_snapshot 先检查 source == null；cloned_object == null || !$cast(snapshot, cloned_object，再返回 snapshot_failure(failure_code, {label, " Function is null"})；rdma_status::success()；拒绝分支不提交部分状态，也不隐式重试。
   protected function rdma_status checked_function_snapshot(
     rdma_function_handle source,
     string label,
@@ -2311,10 +2257,10 @@ class rdma_cmq_engine extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：处理 checked_handle_snapshot：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 source, label, failure_code, snapshot 用于执行 checked_handle_snapshot；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：checked_handle_snapshot 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：checked_handle_snapshot 复制 source、label、failure_code、snapshot 的受控字段并生成独立快照，供查询、编码或恢复使用；源对象保持不变。
+  // 输入/输出及副作用：source（输入）、label（输入）、failure_code（输入）、snapshot（输出）；checked_handle_snapshot 读取 source、label、failure_code、snapshot 并使用字段 snapshot、saved_kind、source_type_name、saved_function_uid、saved_object_id、saved_generation、cloned_object、source.kind，并写入 snapshot；函数返回 rdma_status，不取得调用方资源所有权。
+
+  // 失败/边界：checked_handle_snapshot 先检查 source == null；cloned_object == null || !$cast(snapshot, cloned_object，再返回 snapshot_failure(failure_code, {label, " handle is null"})；rdma_status::success()；拒绝分支不提交部分状态，也不隐式重试。
   protected function rdma_status checked_handle_snapshot(
     rdma_handle source,
     string label,
@@ -2364,10 +2310,10 @@ class rdma_cmq_engine extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：处理 nested_object_status：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 source, label, failure_code 用于执行 nested_object_status；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：nested_object_status 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：nested_object_status 校验 source、label、failure_code 与当前对象状态的一致性，并显式处理“is null”等拒绝条件，返回 rdma_status 供上层决定是否提交。
+  // 输入/输出及副作用：source（输入）、label（输入）、failure_code（输入）；nested_object_status 读取 source、label、failure_code 并使用字段 status；函数返回 rdma_status，不取得调用方资源所有权。
+
+  // 失败/边界：nested_object_status 下游操作失败时原样传播其 status/result，不伪造成功；该路径不隐式重试，也不转移未声明资源。
   protected function rdma_status nested_object_status(
     uvm_object source,
     string label,
@@ -2412,10 +2358,10 @@ class rdma_cmq_engine extends uvm_object;
     return status;
   endfunction
 
-  // 功能：处理 checked_nested_snapshot：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 source, label, failure_code, snapshot 用于执行 checked_nested_snapshot；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：checked_nested_snapshot 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：checked_nested_snapshot 复制 source、label、failure_code、snapshot 的受控字段并生成独立快照，供查询、编码或恢复使用；源对象保持不变。
+  // 输入/输出及副作用：source（输入）、label（输入）、failure_code（输入）、snapshot（输出）；checked_nested_snapshot 读取 source、label、failure_code、snapshot 并使用字段 snapshot、status、source_type_name、saved_value、source_wrapper、saved_source、cloned_object，并写入 snapshot；函数返回 rdma_status，不取得调用方资源所有权。
+
+  // 失败/边界：checked_nested_snapshot 下游操作失败时原样传播其 status/result，不伪造成功；该路径不隐式重试，也不转移未声明资源。
   protected function rdma_status checked_nested_snapshot(
     uvm_object source,
     string label,
@@ -2468,10 +2414,10 @@ class rdma_cmq_engine extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：处理 checked_transport_snapshot：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 source, label, failure_code, snapshot 用于执行 checked_transport_snapshot；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：checked_transport_snapshot 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：checked_transport_snapshot 复制 source、label、failure_code、snapshot 的受控字段并生成独立快照，供查询、编码或恢复使用；源对象保持不变。
+  // 输入/输出及副作用：source（输入）、label（输入）、failure_code（输入）、snapshot（输出）；checked_transport_snapshot 读取 source、label、failure_code、snapshot 并使用字段 snapshot、status、source_type_name、saved_value、saved_queues、source_urc.queues、source_wrapper、saved_object，并写入 snapshot；函数返回 rdma_status，不取得调用方资源所有权。
+
+  // 失败/边界：checked_transport_snapshot 下游操作失败时原样传播其 status/result，不伪造成功；该路径不隐式重试，也不转移未声明资源。
   protected function rdma_status checked_transport_snapshot(
     rdma_qpc_transport_ext source,
     string label,
@@ -2579,10 +2525,9 @@ class rdma_cmq_engine extends uvm_object;
     return status;
   endfunction
 
-  // 功能：按资源所有权和幂等规则释放或清理记录；重复释放不会再次扣减 credit，也不触碰已隔离资源。
-  // 输入/输出及副作用：输入为待解除或释放的 handle/key；成功后隔离或删除本对象记录，外部拥有者仍负责真正销毁。
-  //   空值、未知记录或重复调用按接口约定返回错误或幂等成功。
-  // 失败/边界：不得释放非本对象所有资源；重复解除按幂等约定处理，旧 handle 不得重新激活。
+  // 功能：在 rdma_cmq_engine 中，clear_body_references 按 owner、generation 和幂等规则释放/隔离记录，并同步删除其账本引用。
+  // 输入/输出及副作用：body（输入）、references（输入）；输入 action/epoch/handle 决定迁移目标；成功时更新状态或恢复证据，外部资源仍由其拥有者管理。
+  // 失败/边界：clear_body_references 发现 owner/generation 不匹配、记录未知或重复释放时返回错误或幂等结果，不重新激活旧句柄。
   protected function automatic bit clear_body_references(
     rdma_hw_model body,
     ref uvm_object references[$]
@@ -2681,8 +2626,7 @@ class rdma_cmq_engine extends uvm_object;
   endfunction
 
   // 功能：执行 restore_body_references 指定的测试或恢复状态变更，更新受控账本并保留可回滚的故障证据。
-  // 输入/输出及副作用：参数 body, references 用于执行 restore_body_references；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
+  // 输入/输出及副作用：body（输入）、references（输入）；输入 action/epoch/handle 决定迁移目标；成功时更新状态或恢复证据，外部资源仍由其拥有者管理。
   // 失败/边界：restore_body_references 仅允许测试/恢复范围内的状态变更；代际或资源不匹配时拒绝并保留原账本。
   protected function automatic bit restore_body_references(
     rdma_hw_model body,
@@ -2783,10 +2727,9 @@ class rdma_cmq_engine extends uvm_object;
     return 1'b0;
   endfunction
 
-  // 功能：处理 body_references_are_null：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 body 用于执行 body_references_are_null；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：body_references_are_null 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：在 rdma_cmq_engine 中，body_references_are_null 检查嵌套 body/graph 引用是否已经 detached，防止编码或恢复阶段残留可变别名。
+  // 输入/输出及副作用：body（输入）；body_references_are_null 读取 body 并使用输入参数和固定枚举/常量；函数返回 bit，不取得调用方资源所有权。
+  // 失败/边界：body_references_are_null 比较或前置条件不满足时返回 0/false；该路径不隐式重试，也不转移未声明资源。
   protected function automatic bit body_references_are_null(
     rdma_hw_model body
   );
@@ -2825,10 +2768,10 @@ class rdma_cmq_engine extends uvm_object;
     return 1'b0;
   endfunction
 
-  // 功能：处理 checked_outer_body_clone：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 source, saved_value, label, failure_code, snapshot 用于执行 checked_outer_body_clone；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：checked_outer_body_clone 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：checked_outer_body_clone 复制 source、saved_value、label、failure_code、snapshot 的受控字段并生成独立快照，供查询、编码或恢复使用；源对象保持不变。
+  // 输入/输出及副作用：source（输入）、saved_value（输入）、label（输入）、failure_code（输入）、snapshot（输出）；checked_outer_body_clone 读取 source、saved_value、label、failure_code、snapshot 并使用字段 snapshot、source_type_name、source_wrapper、saved_object、saved_shell_value、cloned_object，并写入 snapshot；函数返回 rdma_status，不取得调用方资源所有权。
+
+  // 失败/边界：checked_outer_body_clone 先检查 !clear_body_references(source, saved_references；saved_object == null || !$cast(saved_body, saved_object；!restore_body_references(source, saved_references，再返回 rdma_status::success()；拒绝分支不提交部分状态，也不隐式重试。
   protected function rdma_status checked_outer_body_clone(
     rdma_hw_model source,
     string saved_value,
@@ -2888,10 +2831,10 @@ class rdma_cmq_engine extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：处理 checked_qpc_snapshot：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 source, label, failure_code, snapshot 用于执行 checked_qpc_snapshot；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：checked_qpc_snapshot 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：checked_qpc_snapshot 复制 source、label、failure_code、snapshot 的受控字段并生成独立快照，供查询、编码或恢复使用；源对象保持不变。
+  // 输入/输出及副作用：source（输入）、label（输入）、failure_code（输入）、snapshot（输出）；checked_qpc_snapshot 读取 source、label、failure_code、snapshot 并使用字段 snapshot、saved_value、status、srq_snapshot、cloned_qpc.qp_h、cloned_qpc.pd_h、cloned_qpc.send_cq_h、cloned_qpc.recv_cq_h，并写入 snapshot；函数返回 rdma_status，不取得调用方资源所有权。
+
+  // 失败/边界：checked_qpc_snapshot 下游操作失败时原样传播其 status/result，不伪造成功；该路径不隐式重试，也不转移未声明资源。
   protected function rdma_status checked_qpc_snapshot(
     rdma_qpc_model source,
     string label,
@@ -2987,10 +2930,10 @@ class rdma_cmq_engine extends uvm_object;
     return status;
   endfunction
 
-  // 功能：处理 checked_context_snapshot：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 source, label, failure_code, snapshot 用于执行 checked_context_snapshot；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：checked_context_snapshot 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：checked_context_snapshot 复制 source、label、failure_code、snapshot 的受控字段并生成独立快照，供查询、编码或恢复使用；源对象保持不变。
+  // 输入/输出及副作用：source（输入）、label（输入）、failure_code（输入）、snapshot（输出）；checked_context_snapshot 读取 source、label、failure_code、snapshot 并使用字段 snapshot、handle0_snapshot、handle1_snapshot、nested0_snapshot、nested1_snapshot、nested2_snapshot、saved_value、status，并写入 snapshot；函数返回 rdma_status，不取得调用方资源所有权。
+
+  // 失败/边界：checked_context_snapshot 下游操作失败时原样传播其 status/result，不伪造成功；该路径不隐式重试，也不转移未声明资源。
   protected function rdma_status checked_context_snapshot(
     rdma_hw_model source,
     string label,
@@ -3193,10 +3136,10 @@ class rdma_cmq_engine extends uvm_object;
     return status;
   endfunction
 
-  // 功能：处理 checked_opcode_snapshot：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 source, label, failure_code, snapshot 用于执行 checked_opcode_snapshot；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：checked_opcode_snapshot 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：checked_opcode_snapshot 复制 source、label、failure_code、snapshot 的受控字段并生成独立快照，供查询、编码或恢复使用；源对象保持不变。
+  // 输入/输出及副作用：source（输入）、label（输入）、failure_code（输入）、snapshot（输出）；checked_opcode_snapshot 读取 source、label、failure_code、snapshot 并使用字段 snapshot、status、saved_profile_name、saved_opcode、saved_variant、cloned_object、source.profile_name、source.opcode，并写入 snapshot；函数返回 rdma_status，不取得调用方资源所有权。
+
+  // 失败/边界：checked_opcode_snapshot 下游操作失败时原样传播其 status/result，不伪造成功；该路径不隐式重试，也不转移未声明资源。
   protected function rdma_status checked_opcode_snapshot(
     rdma_cmq_opcode_key source,
     string label,
@@ -3255,10 +3198,10 @@ class rdma_cmq_engine extends uvm_object;
     return status;
   endfunction
 
-  // 功能：处理 checked_profile_body_snapshot：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 source, label, snapshot, staging_invariant_failed 用于执行 checked_profile_body_snapshot；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：checked_profile_body_snapshot 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：checked_profile_body_snapshot 复制 source、label、snapshot、staging_invariant_failed 的受控字段并生成独立快照，供查询、编码或恢复使用；源对象保持不变。
+  // 输入/输出及副作用：source（输入）、label（输入）、snapshot（输出）、staging_invariant_failed（输出）；checked_profile_body_snapshot 读取 source、label、snapshot、staging_invariant_failed 并使用字段 snapshot、source_type、status、staging_invariant_failed、snapshot_type，并写入 snapshot、staging_invariant_failed；函数返回 rdma_status，不取得调用方资源所有权。
+
+  // 失败/边界：checked_profile_body_snapshot 返回 RDMA_SC_INVALID_STATE、RDMA_SC_INVALID_ARGUMENT；失败路径不提交部分状态或转移未声明资源。
   protected function rdma_status checked_profile_body_snapshot(
     rdma_hw_model source,
     string label,
@@ -3312,10 +3255,10 @@ class rdma_cmq_engine extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：处理 checked_body_snapshot：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 source, label, failure_code, snapshot, staging_invariant_failed 用于执行 checked_body_snapshot；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：checked_body_snapshot 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：checked_body_snapshot 复制 source、label、failure_code、snapshot、staging_invariant_failed 的受控字段并生成独立快照，供查询、编码或恢复使用；源对象保持不变。
+  // 输入/输出及副作用：source（输入）、label（输入）、failure_code（输入）、snapshot（输出）、staging_invariant_failed（输出）；checked_body_snapshot 读取 source、label、failure_code、snapshot、staging_invariant_failed 并使用字段 snapshot、staging_invariant_failed、status、saved_body_value、saved_opcode、saved_command_id、saved_flags、target_snapshot，并写入 snapshot、staging_invariant_failed；函数返回 rdma_status，不取得调用方资源所有权。
+
+  // 失败/边界：checked_body_snapshot 返回 RDMA_SC_INVALID_ARGUMENT；失败路径不提交部分状态或转移未声明资源。
   protected function rdma_status checked_body_snapshot(
     rdma_hw_model source,
     string label,
@@ -3448,10 +3391,10 @@ class rdma_cmq_engine extends uvm_object;
     return status;
   endfunction
 
-  // 功能：处理 checked_image_snapshot：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 source, label, failure_code, snapshot 用于执行 checked_image_snapshot；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：checked_image_snapshot 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：checked_image_snapshot 复制 source、label、failure_code、snapshot 的受控字段并生成独立快照，供查询、编码或恢复使用；源对象保持不变。
+  // 输入/输出及副作用：source（输入）、label（输入）、failure_code（输入）、snapshot（输出）；checked_image_snapshot 读取 source、label、failure_code、snapshot 并使用字段 snapshot、saved_value、saved_value.bytes、saved_value.length、saved_value.alignment、saved_value.endian、saved_value.image_kind、saved_value.hardware_version，并写入 snapshot；函数返回 rdma_status，不取得调用方资源所有权。
+
+  // 失败/边界：checked_image_snapshot 先检查 source == null；saved_value == null；cloned_object == null || !$cast(snapshot, cloned_object，再返回 snapshot_failure(failure_code, {label, " image is null"})；rdma_status::success()；拒绝分支不提交部分状态，也不隐式重试。
   protected function rdma_status checked_image_snapshot(
     rdma_hw_image source,
     string label,
@@ -3511,10 +3454,9 @@ class rdma_cmq_engine extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：处理 checked_completion_payload_snapshot：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 source, snapshot 用于执行 checked_completion_payload_snapshot；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：checked_completion_payload_snapshot 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：checked_completion_payload_snapshot 复制 source、snapshot 的受控字段并生成独立快照，供查询、编码或恢复使用；源对象保持不变。
+  // 输入/输出及副作用：source（输入）、snapshot（输出）；checked_completion_payload_snapshot 读取 source、snapshot 并使用字段 snapshot、source_type、status、snapshot_type，并写入 snapshot；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：checked_completion_payload_snapshot 返回 函数体规定的失败状态；具体拒绝条件包括 “CMQ completion payload profile is unavailable”；“CMQ completion payload is null”；“CMQ completion payload snapshot contract failed”；失败路径不提交部分状态、不隐式重试，也不转移未声明资源。
   protected function rdma_status checked_completion_payload_snapshot(
     uvm_object source,
     output uvm_object snapshot
@@ -3562,10 +3504,9 @@ class rdma_cmq_engine extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：处理 checked_completion_ticket_snapshot：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 source, snapshot 用于执行 checked_completion_ticket_snapshot；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：checked_completion_ticket_snapshot 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：checked_completion_ticket_snapshot 复制 source、snapshot 的受控字段并生成独立快照，供查询、编码或恢复使用；源对象保持不变。
+  // 输入/输出及副作用：source（输入）、snapshot（输出）；checked_completion_ticket_snapshot 读取 source、snapshot 并使用字段 snapshot、saved_command_id、saved_slot_sequence、saved_sq_index、saved_sq_wrap、saved_absolute_deadline、snapshot.command_id、status，并写入 snapshot；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：checked_completion_ticket_snapshot 返回 RDMA_SC_INVALID_STATE；具体拒绝条件包括 “CMQ completion ticket authority is incomplete”；“CMQ completion ticket construction failed”；“CMQ completion ticket snapshot validation failed”；失败路径不提交部分状态、不隐式重试，也不转移未声明资源。
   protected function rdma_status checked_completion_ticket_snapshot(
     rdma_cmq_ticket source,
     output rdma_cmq_ticket snapshot
@@ -3637,10 +3578,10 @@ class rdma_cmq_engine extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：处理 checked_expected_snapshot：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 source, label, failure_code, snapshot 用于执行 checked_expected_snapshot；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：checked_expected_snapshot 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：checked_expected_snapshot 复制 source、label、failure_code、snapshot 的受控字段并生成独立快照，供查询、编码或恢复使用；源对象保持不变。
+  // 输入/输出及副作用：source（输入）、label（输入）、failure_code（输入）、snapshot（输出）；checked_expected_snapshot 读取 source、label、failure_code、snapshot 并使用字段 snapshot、status、saved_hardware_opcode、saved_variant、cloned_object，并写入 snapshot；函数返回 rdma_status，不取得调用方资源所有权。
+
+  // 失败/边界：checked_expected_snapshot 下游操作失败时原样传播其 status/result，不伪造成功；该路径不隐式重试，也不转移未声明资源。
   protected function rdma_status checked_expected_snapshot(
     rdma_cmq_expected_response source,
     string label,
@@ -3695,10 +3636,10 @@ class rdma_cmq_engine extends uvm_object;
     return status;
   endfunction
 
-  // 功能：按输入的完整标识查询当前权威记录并返回独立快照；缺失、歧义或代际过期时返回明确错误。
-  // 输入/输出及副作用：输入为完整 key/handle，output 或返回值为记录快照；查询不改变登记表和外部资源。
-  //   缺失、歧义、空句柄或旧 generation/reset epoch 返回明确错误。
-  // 失败/边界：查询不到唯一记录、输入为空或 authority 已失效时返回错误，不回退到默认 Function/root。
+  // 功能：在 rdma_cmq_engine 中，snapshot_command_value 按完整 key/handle 查找唯一权威记录并返回 detached 快照，避免把内部可变引用泄露给调用方。
+  // 输入/输出及副作用：source（输入）、snapshot（输出）、staging_invariant_failed（输出）；输入 handle/key/cursor 用于选择读取范围；返回值或 output 为
+  //   detached 快照，读取不取得外部资源所有权。
+  // 失败/边界：snapshot_command_value 在 key/handle 缺失、记录不唯一或 generation/reset epoch 过期时返回明确错误，不回退到默认 authority。
   protected function rdma_status snapshot_command_value(
     rdma_cmq_command_desc source,
     output rdma_cmq_command_desc snapshot,
@@ -3824,10 +3765,9 @@ class rdma_cmq_engine extends uvm_object;
     return status;
   endfunction
 
-  // 功能：依据输入请求创建对应的值对象或资源计划，并校验依赖、所有权和生命周期后返回结果。
-  // 输入/输出及副作用：输入请求、容量和依赖用于构造/预留资源；返回独立对象或状态，不暴露内部可变集合。
-  //   参数越界、容量不足或构造中途失败时回滚已登记的局部状态。
-  // 失败/边界：依赖为空、参数越界、容量不足或构造步骤失败时清理局部结果并返回明确错误。
+  // 功能：make_mapping_snapshot 复制 source、name、snapshot 的受控字段并生成独立快照，供查询、编码或恢复使用；源对象保持不变。
+  // 输入/输出及副作用：source（输入）、name（输入）、snapshot（输出）；make_mapping_snapshot 读取 source、name、snapshot 并使用字段 snapshot、saved_value、status、saved_value.requester_bdf、saved_value.pasid_valid、saved_value.pasid、saved_value.dma_domain_valid、saved_value.dma_domain_id，并写入 snapshot；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：make_mapping_snapshot 返回 RDMA_SC_INVALID_STATE；具体拒绝条件包括 “CMQ dependency mapping source is null”；“CMQ dependency mapping value capture failed”；“CMQ dependency mapping clone contract failed”；“CMQ dependency mapping snapshot changed value”；失败路径不提交部分状态、不隐式重试，也不转移未声明资源。
   protected function rdma_status make_mapping_snapshot(
     rdma_dma_mapping source,
     string name,
@@ -3884,10 +3824,10 @@ class rdma_cmq_engine extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：依据输入请求创建对应的值对象或资源计划，并校验依赖、所有权和生命周期后返回结果。
-  // 输入/输出及副作用：输入请求、容量和依赖用于构造/预留资源；返回独立对象或状态，不暴露内部可变集合。
-  //   参数越界、容量不足或构造中途失败时回滚已登记的局部状态。
-  // 失败/边界：依赖为空、参数越界、容量不足或构造步骤失败时清理局部结果并返回明确错误。
+  // 功能：make_ticket_value 创建独立的 rdma_status；根据 name、command_id、function_h、cmq_h、slot_sequence、sq_index、sq_wrap、opcode_key、absolute_deadline、ticket 设置字段 ticket、ticket.command_id、status、ticket.slot_sequence、ticket.sq_index、ticket.sq_wrap、ticket.absolute_deadline、cloned_object，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：name（输入）、command_id（输入）、function_h（输入）、cmq_h（输入）、slot_sequence（输入）、sq_index（输入）、sq_wrap（输入）、opcode_key（输入）、absolute_deadline（输入）、ticket（输出）；输入字段被复制到返回值或
+  //   output；生成结果与输入隔离，不隐式修改调用方对象。
+  // 失败/边界：make_ticket_value 返回 RDMA_SC_INVALID_STATE；典型拒绝条件为“CMQ ticket construction failed”“CMQ ticket validation failed”；失败路径不提交部分状态或转移未声明资源。
   protected function rdma_status make_ticket_value(
     string name,
     longint unsigned command_id,
@@ -3953,10 +3893,9 @@ class rdma_cmq_engine extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：处理 checked_slot_context_snapshot：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 source, snapshot 用于执行 checked_slot_context_snapshot；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：checked_slot_context_snapshot 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：checked_slot_context_snapshot 复制 source、snapshot 的受控字段并生成独立快照，供查询、编码或恢复使用；源对象保持不变。
+  // 输入/输出及副作用：source（输入）、snapshot（输出）；checked_slot_context_snapshot 读取 source、snapshot 并使用字段 snapshot、cloned_object，并写入 snapshot；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：checked_slot_context_snapshot 返回 函数体规定的失败状态；具体拒绝条件包括 “CMQ slot context source is null”；“CMQ slot context snapshot clone contract failed”；“CMQ slot context snapshot changed value”；失败路径不提交部分状态、不隐式重试，也不转移未声明资源。
   protected function rdma_status checked_slot_context_snapshot(
     rdma_cmq_slot_context source,
     output rdma_cmq_slot_context snapshot
@@ -3989,10 +3928,9 @@ class rdma_cmq_engine extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：处理 checked_record_snapshot：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 source, snapshot 用于执行 checked_record_snapshot；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：checked_record_snapshot 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：checked_record_snapshot 复制 source、snapshot 的受控字段并生成独立快照，供查询、编码或恢复使用；源对象保持不变。
+  // 输入/输出及副作用：source（输入）、snapshot（输出）；checked_record_snapshot 读取 source、snapshot 并使用字段 snapshot、cloned_object，并写入 snapshot；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：checked_record_snapshot 返回 函数体规定的失败状态；具体拒绝条件包括 “CMQ slot record source is null”；“CMQ slot record snapshot clone contract failed”；“CMQ slot record snapshot changed value”；失败路径不提交部分状态、不隐式重试，也不转移未声明资源。
   protected function rdma_status checked_record_snapshot(
     rdma_cmq_slot_record source,
     output rdma_cmq_slot_record snapshot
@@ -4023,10 +3961,9 @@ class rdma_cmq_engine extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：处理 checked_dependency_snapshot：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 source, snapshot 用于执行 checked_dependency_snapshot；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：checked_dependency_snapshot 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：checked_dependency_snapshot 复制 source、snapshot 的受控字段并生成独立快照，供查询、编码或恢复使用；源对象保持不变。
+  // 输入/输出及副作用：source（输入）、snapshot（输出）；checked_dependency_snapshot 读取 source、snapshot 并使用字段 snapshot、cloned_object，并写入 snapshot；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：checked_dependency_snapshot 返回 函数体规定的失败状态；具体拒绝条件包括 “CMQ dependency source is null”；“CMQ dependency snapshot clone contract failed”；“CMQ dependency snapshot changed value”；失败路径不提交部分状态、不隐式重试，也不转移未声明资源。
   protected function rdma_status checked_dependency_snapshot(
     rdma_doorbell_dependency source,
     output rdma_doorbell_dependency snapshot
@@ -4050,10 +3987,9 @@ class rdma_cmq_engine extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：处理 checked_doorbell_desc_snapshot：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 source, snapshot 用于执行 checked_doorbell_desc_snapshot；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：checked_doorbell_desc_snapshot 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：checked_doorbell_desc_snapshot 复制 source、snapshot 的受控字段并生成独立快照，供查询、编码或恢复使用；源对象保持不变。
+  // 输入/输出及副作用：source（输入）、snapshot（输出）；checked_doorbell_desc_snapshot 读取 source、snapshot 并使用字段 snapshot、cloned_object，并写入 snapshot；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：checked_doorbell_desc_snapshot 返回 函数体规定的失败状态；具体拒绝条件包括 “CMQ doorbell descriptor source is null”；“CMQ doorbell descriptor snapshot changed value”；失败路径不提交部分状态、不隐式重试，也不转移未声明资源。
   protected function rdma_status checked_doorbell_desc_snapshot(
     rdma_doorbell_desc source,
     output rdma_doorbell_desc snapshot
@@ -4106,10 +4042,10 @@ class rdma_cmq_engine extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：处理 sqe_metadata_status：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 image, expected_backing_target 用于执行 sqe_metadata_status；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：sqe_metadata_status 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：sqe_metadata_status 校验 image、expected_backing_target 与当前对象状态的一致性，并显式处理“CMQ profile returned a null SQE”等拒绝条件，返回 rdma_status 供上层决定是否提交。
+  // 输入/输出及副作用：image（输入）、expected_backing_target（输入）；sqe_metadata_status 读取 image、expected_backing_target 并使用字段 rdma_status、prepared_binding.generation、value；函数返回 rdma_status，不取得调用方资源所有权。
+
+  // 失败/边界：sqe_metadata_status 返回 RDMA_SC_STALE_GENERATION、RDMA_SC_INVALID_ARGUMENT、RDMA_SC_INVALID_STATE；典型拒绝条件为“CMQ profile returned a null SQE”“CMQ SQE is not exactly 64 bytes”；失败路径不提交部分状态或转移未声明资源。
   protected function rdma_status sqe_metadata_status(
     rdma_hw_image image,
     longint unsigned expected_backing_target
@@ -4140,10 +4076,9 @@ class rdma_cmq_engine extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：处理 doorbell_metadata_status：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 image 用于执行 doorbell_metadata_status；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：doorbell_metadata_status 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：doorbell_metadata_status 校验 image 与当前对象状态的一致性，并显式处理“CMQ profile returned a null doorbell image”等拒绝条件，返回 rdma_status 供上层决定是否提交。
+  // 输入/输出及副作用：image（输入）；doorbell_metadata_status 读取 image 并使用字段 rdma_status、prepared_binding.generation、value、prepared_binding.notify_size；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：doorbell_metadata_status 返回 RDMA_SC_STALE_GENERATION、RDMA_SC_INVALID_ARGUMENT、RDMA_SC_INVALID_STATE；典型拒绝条件为“CMQ profile returned a null doorbell image”“CMQ doorbell image length is invalid”；失败路径不提交部分状态或转移未声明资源。
   protected function rdma_status doorbell_metadata_status(
     rdma_hw_image image
   );
@@ -4179,10 +4114,9 @@ class rdma_cmq_engine extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：依据输入请求创建对应的值对象或资源计划，并校验依赖、所有权和生命周期后返回结果。
-  // 输入/输出及副作用：输入请求、容量和依赖用于构造/预留资源；返回独立对象或状态，不暴露内部可变集合。
-  //   参数越界、容量不足或构造中途失败时回滚已登记的局部状态。
-  // 失败/边界：依赖为空、参数越界、容量不足或构造步骤失败时清理局部结果并返回明确错误。
+  // 功能：build_runtime_desc 创建独立的 rdma_status；根据 request_context、cmq、mapping、runtime 设置字段 runtime、status、runtime.function_h、runtime.cmq_h、runtime.sq_iova、cq_iova.value、runtime.sq_depth、runtime.cq_depth、runtime.entry_bytes、runtime.initial_sq_valid，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：request_context（输入）、cmq（输入）、mapping（输入）、runtime（输出）；build_runtime_desc 读取 request_context、cmq、mapping、runtime 并使用字段 runtime、status、runtime.function_h、runtime.cmq_h、runtime.sq_iova、cq_iova.value、runtime.sq_depth、runtime.cq_depth，并写入 runtime；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：build_runtime_desc 返回 RDMA_SC_DMA_TRANSLATION、RDMA_SC_INVALID_STATE；典型拒绝条件为“CMQ SQ-to-CQ IOVA addition overflows”“CMQ runtime descriptor construction failed”；失败路径不提交部分状态或转移未声明资源。
   protected virtual function rdma_status build_runtime_desc(
     rdma_dma_request_context request_context,
     rdma_cmq cmq,
@@ -4238,10 +4172,10 @@ class rdma_cmq_engine extends uvm_object;
     return status;
   endfunction
 
-  // 功能：处理 publish_runtime_snapshot：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 source, snapshot 用于执行 publish_runtime_snapshot；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：publish_runtime_snapshot 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：在 rdma_cmq_engine 中，publish_runtime_snapshot 提交当前事务阶段并发布 detached 结果，只有成功路径才推进游标或状态。
+  // 输入/输出及副作用：source（输入）、snapshot（输出）；输入 request/image/cursor 决定写入内容；成功时更新 PI/CI、slot ledger 或 pending journal，并通过
+  //   output 返回结果。
+  // 失败/边界：队列未激活、credit 不足、请求身份过期或后端写入失败时返回错误；不得提前推进游标或重复提交。
   protected virtual function rdma_status publish_runtime_snapshot(
     rdma_cmq_runtime_desc source,
     output rdma_cmq_runtime_desc snapshot
@@ -4292,10 +4226,9 @@ class rdma_cmq_engine extends uvm_object;
     return status;
   endfunction
 
-  // 功能：按资源所有权和幂等规则释放或清理记录；重复释放不会再次扣减 credit，也不触碰已隔离资源。
-  // 输入/输出及副作用：输入为待解除或释放的 handle/key；成功后隔离或删除本对象记录，外部拥有者仍负责真正销毁。
-  //   空值、未知记录或重复调用按接口约定返回错误或幂等成功。
-  // 失败/边界：不得释放非本对象所有资源；重复解除按幂等约定处理，旧 handle 不得重新激活。
+  // 功能：在 rdma_cmq_engine 中，clear_configuration 按 owner、generation 和幂等规则释放/隔离记录，并同步删除其账本引用。
+  // 输入/输出及副作用：无显式参数；输入 action/epoch/handle 决定迁移目标；成功时更新状态或恢复证据，外部资源仍由其拥有者管理。
+  // 失败/边界：clear_configuration 发现 owner/generation 不匹配、记录未知或重复释放时返回错误或幂等结果，不重新激活旧句柄。
   protected function void clear_configuration();
     prepared_binding = null;
     dma_context = null;
@@ -4323,8 +4256,7 @@ class rdma_cmq_engine extends uvm_object;
   endfunction
 
   // 功能：执行 retain_release_authority 指定的测试或恢复状态变更，更新受控账本并保留可回滚的故障证据。
-  // 输入/输出及副作用：参数 retained_mapping, retained_host_mem 用于执行 retain_release_authority；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
+  // 输入/输出及副作用：retained_mapping（输入）、retained_host_mem（输入）；retain_release_authority 读取 retained_mapping、retained_host_mem 并使用字段 retained_last_poison、last_poison、backing_mapping、host_mem、engine_state；函数返回 void，不取得调用方资源所有权。
   // 失败/边界：retain_release_authority 仅允许测试/恢复范围内的状态变更；代际或资源不匹配时拒绝并保留原账本。
   protected function void retain_release_authority(
     rdma_dma_mapping retained_mapping,
@@ -4342,10 +4274,10 @@ class rdma_cmq_engine extends uvm_object;
     engine_state = RDMA_CMQ_ENGINE_POISONED;
   endfunction
 
-  // 功能：按资源所有权和幂等规则释放或清理记录；重复释放不会再次扣减 credit，也不触碰已隔离资源。
-  // 输入/输出及副作用：输入为待解除或释放的 handle/key；成功后隔离或删除本对象记录，外部拥有者仍负责真正销毁。
-  //   空值、未知记录或重复调用按接口约定返回错误或幂等成功。
-  // 失败/边界：不得释放非本对象所有资源；重复解除按幂等约定处理，旧 handle 不得重新激活。
+  // 功能：在 rdma_cmq_engine 中，rollback_candidate 按 owner、generation 和幂等规则释放/隔离记录，并同步删除其账本引用。
+  // 输入/输出及副作用：candidate_host_mem（输入）、candidate_mapping（输入）、original_failure（输入）；输入 handle/mapping/token
+  //   指定释放目标；成功时更新账本和生命周期，外部资源只按 adapter 契约释放。
+  // 失败/边界：rollback_candidate 发现 owner/generation 不匹配、记录未知或重复释放时返回错误或幂等结果，不重新激活旧句柄。
   protected function rdma_status rollback_candidate(
     rdma_host_mem_api candidate_host_mem,
     rdma_dma_mapping candidate_mapping,
@@ -4381,10 +4313,10 @@ class rdma_cmq_engine extends uvm_object;
     return cleanup_failure;
   endfunction
 
-  // 功能：校验依赖并建立该对象的运行边界，成功后保存必要的非拥有引用；拒绝不完整或重复配置。
-  // 输入/输出及副作用：接收 manager、binding、router 或 profile 等依赖；成功后保存非拥有引用并更新配置状态。
-  //   任一依赖为空、重复配置或代际不匹配时保持原状态并返回错误。
-  // 失败/边界：配置失败不得写入半成品引用；已激活对象不得被无条件降级或重复占用资源。
+  // 功能：在 rdma_cmq_engine 中，prepare 校验依赖和 binding 后建立运行边界，只保存非拥有引用并拒绝重复配置。
+  // 输入/输出及副作用：binding（输入）、cmq（输入）、pasid_valid（输入）、pasid（输入）、host_mem（输入）、scheduler（输入）、profile（输入）、runtime_desc（输出）、status（输出）；prepare 驱动下游事务，并写入 runtime_desc、status；函数返回 无直接返回值，不取得调用方资源所有权。
+
+  // 失败/边界：prepare 失败或超时通过 runtime_desc、status 明确发布；该路径不隐式重试，也不转移未声明资源。
   task prepare(
     rdma_function_binding binding,
     rdma_cmq cmq,
@@ -4544,10 +4476,9 @@ class rdma_cmq_engine extends uvm_object;
     engine_lock.put(1);
   endtask
 
-  // 功能：校验依赖并建立该对象的运行边界，成功后保存必要的非拥有引用；拒绝不完整或重复配置。
-  // 输入/输出及副作用：接收 manager、binding、router 或 profile 等依赖；成功后保存非拥有引用并更新配置状态。
-  //   任一依赖为空、重复配置或代际不匹配时保持原状态并返回错误。
-  // 失败/边界：配置失败不得写入半成品引用；已激活对象不得被无条件降级或重复占用资源。
+  // 功能：在 rdma_cmq_engine 中，activate 校验依赖和 binding 后建立运行边界，只保存非拥有引用并拒绝重复配置。
+  // 输入/输出及副作用：active_binding（输入）、status（输出）；activate 先依据 engine_state != RDMA_CMQ_ENGINE_PREPARED；!status.ok(；prepared_binding == null 校验 active_binding、status；成功时更新本对象配置/状态并保存非拥有引用，返回 无直接返回值。
+  // 失败/边界：实现中的空依赖、重复登记、状态或 generation/authority 校验失败时返回错误；失败时保留旧配置。
   task activate(
     rdma_function_binding active_binding,
     output rdma_status status
@@ -4635,10 +4566,10 @@ class rdma_cmq_engine extends uvm_object;
     engine_lock.put(1);
   endtask
 
-  // 功能：执行一次受控事务并推进所属状态机；返回结果时保留失败阶段、代际和后端提交证据。
-  // 输入/输出及副作用：参数 request, ticket, status 用于执行 submit；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：事务超时、代际变化或提交证据不完整时不得推进下一阶段。
+  // 功能：在 rdma_cmq_engine 中，submit 执行受控事务并按后端提交证据推进状态机，同时保留失败阶段和 generation 证据。
+  // 输入/输出及副作用：request（输入）、ticket（输出）、status（输出）；输入 request/image/cursor 决定写入内容；成功时更新 PI/CI、slot ledger 或 pending
+  //   journal，并通过 output 返回结果。
+  // 失败/边界：submit 遇到锁、超时、generation 变化或提交证据不完整时保持原状态，不推进游标。
   task submit(
     rdma_cmq_command_desc request,
     output rdma_cmq_ticket ticket,
@@ -4682,10 +4613,10 @@ class rdma_cmq_engine extends uvm_object;
     status = rdma_status::success();
   endtask
 
-  // 功能：执行一次受控事务并推进所属状态机；返回结果时保留失败阶段、代际和后端提交证据。
-  // 输入/输出及副作用：参数 requests, tickets, item_statuses, batch_status 用于执行 submit_batch；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：事务超时、代际变化或提交证据不完整时不得推进下一阶段。
+  // 功能：在 rdma_cmq_engine 中，submit_batch 执行受控事务并按后端提交证据推进状态机，同时保留失败阶段和 generation 证据。
+  // 输入/输出及副作用：requests（输入）、tickets（输出）、item_statuses（输出）、batch_status（输出）；输入 request/image/cursor 决定写入内容；成功时更新
+  //   PI/CI、slot ledger 或 pending journal，并通过 output 返回结果。
+  // 失败/边界：submit_batch 遇到锁、超时、generation 变化或提交证据不完整时保持原状态，不推进游标。
   task submit_batch(
     input rdma_cmq_command_desc requests[],
     output rdma_cmq_ticket tickets[],
@@ -5375,10 +5306,9 @@ class rdma_cmq_engine extends uvm_object;
     engine_lock.put(1);
   endtask
 
-  // 功能：处理 expire：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 completions, status 用于执行 expire；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：expire 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：在 rdma_cmq_engine 中，expire 根据当前证据转换事务或恢复状态，并保持重试、复位和所有权边界一致。
+  // 输入/输出及副作用：completions（输出）、status（输出）；expire 驱动下游事务，并写入 completions、status；函数返回 无直接返回值，不取得调用方资源所有权。
+  // 失败/边界：expire 失败或超时通过 completions、status 明确发布；该路径不隐式重试，也不转移未声明资源。
   task expire(
     output rdma_cmq_completion completions[$],
     output rdma_status status
@@ -5397,10 +5327,10 @@ class rdma_cmq_engine extends uvm_object;
     engine_lock.put(1);
   endtask
 
-  // 功能：读取并解码队列条目，校验 owner/identity 后提交 consumer index；仅在提交成功后发布 completion 或 event。
-  // 输入/输出及副作用：request/queue handle 提供事务身份，output result/status 返回 detached 结果和阶段状态；成功时推进唯一 runtime。
+  // 功能：在 rdma_cmq_engine 中，poll_locked 读取并解码队列条目，校验 owner/identity 后提交 consumer index，成功提交后才发布 completion/event。
+  // 输入/输出及副作用：status（输出）；poll_locked 驱动下游事务，并写入 status；函数返回 无直接返回值，不取得调用方资源所有权。
+  // 失败/边界：poll_locked 遇到队列为空、owner/identity 失配或 CI/MMIO 提交失败时不发布 completion/event。
   //   空句柄、队列为空、owner 不匹配或 doorbell 失败时不发布半成品结果。
-  // 失败/边界：未配置、空队列、stale generation/reset epoch 和 ambiguous MMIO 均禁止发布成功结果或自动重试。
   protected task poll_locked(output rdma_status status);
     byte data[];
     rdma_status read_status;
@@ -5677,10 +5607,10 @@ class rdma_cmq_engine extends uvm_object;
 
   endtask
 
-  // 功能：执行一次受控事务并推进所属状态机；返回结果时保留失败阶段、代际和后端提交证据。
-  // 输入/输出及副作用：参数 completions, diagnostics, status 用于执行 poll；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：事务超时、代际变化或提交证据不完整时不得推进下一阶段。
+  // 功能：在 rdma_cmq_engine 中，poll 执行受控事务并按后端提交证据推进状态机，同时保留失败阶段和 generation 证据。
+  // 输入/输出及副作用：completions（输出）、diagnostics（输出）、status（输出）；输入 handle/key/cursor 用于选择读取范围；返回值或 output 为 detached
+  //   快照，读取不取得外部资源所有权。
+  // 失败/边界：poll 遇到锁、超时、generation 变化或提交证据不完整时保持原状态，不推进游标。
   task poll(
     output rdma_cmq_completion completions[$],
     output rdma_cmq_diagnostic diagnostics[$],
@@ -5717,8 +5647,7 @@ class rdma_cmq_engine extends uvm_object;
   endtask
 
   // 功能：控制 wait_for 对应的等待、异常或同步边界，按超时/捕获结果返回状态，不吞掉原始错误。
-  // 输入/输出及副作用：参数 ticket, completion, status 用于执行 wait_for；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
+  // 输入/输出及副作用：ticket（输入）、completion（输出）、status（输出）；wait_for 驱动下游事务，并写入 completion、status；函数返回 无直接返回值，不取得调用方资源所有权。
   // 失败/边界：wait_for 超时或异常必须返回原始错误证据；不得无限等待或跳过同步边界。
   task wait_for(
     rdma_cmq_ticket ticket,
@@ -5822,10 +5751,10 @@ class rdma_cmq_engine extends uvm_object;
     end
   endtask
 
-  // 功能：处理 reconcile_ticket：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 ticket, terminal_known, completion, status 用于执行 reconcile_ticket；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：reconcile_ticket 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：在 rdma_cmq_engine 中，reconcile_ticket 根据当前证据转换事务或恢复状态，并保持重试、复位和所有权边界一致。
+  // 输入/输出及副作用：ticket（输入）、terminal_known（输出）、completion（输出）、status（输出）；输入 action/epoch/handle
+  //   决定迁移目标；成功时更新状态或恢复证据，外部资源仍由其拥有者管理。
+  // 失败/边界：当前状态不允许、epoch/generation 过期或恢复证据不完整时返回错误；不得跳过隔离步骤。
   task reconcile_ticket(
     rdma_cmq_ticket ticket,
     output bit terminal_known,
@@ -5959,10 +5888,9 @@ class rdma_cmq_engine extends uvm_object;
     engine_lock.put(1);
   endtask
 
-  // 功能：处理 cancel_generation：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 generation, completions, status 用于执行 cancel_generation；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：cancel_generation 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：在 rdma_cmq_engine 中，cancel_generation 根据当前证据转换事务或恢复状态，并保持重试、复位和所有权边界一致。
+  // 输入/输出及副作用：generation（输入）、completions（输出）、status（输出）；cancel_generation 驱动下游事务，并写入 completions、status；函数返回 无直接返回值，不取得调用方资源所有权。
+  // 失败/边界：cancel_generation 失败或超时通过 completions、status 明确发布；该路径不隐式重试，也不转移未声明资源。
   task cancel_generation(
     int unsigned generation,
     output rdma_cmq_completion completions[$],
@@ -5990,9 +5918,8 @@ class rdma_cmq_engine extends uvm_object;
     engine_lock.put(1);
   endtask
 
-  // 功能：清理当前运行状态并建立新的复位/代际边界，使旧句柄或旧事务不能继续生效。
-  // 输入/输出及副作用：参数 completions, status 用于执行 reset；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
+  // 功能：在 rdma_cmq_engine 中，reset reset 清理当前运行状态并建立新的复位/代际边界，使旧句柄或旧事务不能继续生效。
+  // 输入/输出及副作用：completions（输出）、status（输出）；输入 action/epoch/handle 决定迁移目标；成功时更新状态或恢复证据，外部资源仍由其拥有者管理。
   // 失败/边界：复位参数为零、代际回退或存在未处理 pending 事务时拒绝更新 authority。
   task reset(
     output rdma_cmq_completion completions[$],
@@ -6060,18 +5987,16 @@ class rdma_cmq_engine extends uvm_object;
     engine_lock.put(1);
   endtask
 
-  // 功能：处理 state：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 engine_state 用于执行 state；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：state 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：在 rdma_cmq_engine 中，state 在锁保护下返回当前 engine/runtime 状态，不改变队列或恢复账本。
+  // 输入/输出及副作用：无显式参数；state 读取固定返回值或局部计算结果，不使用对象成员字段；函数返回 rdma_cmq_engine_state_e，不取得调用方资源所有权。
+  // 失败/边界：state 是只读访问器，返回 engine_state；未覆盖枚举沿 default/类型默认分支返回，不改变对象和外部资源。
   function rdma_cmq_engine_state_e state();
     return engine_state;
   endfunction
 
-  // 功能：处理 mapping_snapshot：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 cloned_object 用于执行 mapping_snapshot；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：mapping_snapshot 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：在 rdma_cmq_engine 中，mapping_snapshot 从输入对象提取受控字段并返回 detached 投影，阻断调用方通过别名修改 authority。
+  // 输入/输出及副作用：无显式参数；mapping_snapshot 读取 对象字段：backing_mapping 并使用字段 cloned_object；函数返回 rdma_dma_mapping，不取得调用方资源所有权。
+  // 失败/边界：mapping_snapshot 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（CMQ mapping snapshot clone mismatch），不保留部分有效快照。
   function rdma_dma_mapping mapping_snapshot();
     uvm_object cloned_object;
     rdma_dma_mapping snapshot;
@@ -6084,42 +6009,37 @@ class rdma_cmq_engine extends uvm_object;
     return snapshot;
   endfunction
 
-  // 功能：处理 published_count：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 publish_seq 用于执行 published_count；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：published_count 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：published_count 只读当前账本/队列状态并计算 longint unsigned 计数或可用容量，不推进任何事务游标。
+  // 输入/输出及副作用：无显式参数；输入 request/image/cursor 决定写入内容；成功时更新 PI/CI、slot ledger 或 pending journal，并通过 output 返回结果。
+  // 失败/边界：队列未激活、credit 不足、请求身份过期或后端写入失败时返回错误；不得提前推进游标或重复提交。
   function longint unsigned published_count();
     return publish_seq;
   endfunction
 
-  // 功能：按资源所有权和幂等规则释放或清理记录；重复释放不会再次扣减 credit，也不触碰已隔离资源。
-  // 输入/输出及副作用：输入为待解除或释放的 handle/key；成功后隔离或删除本对象记录，外部拥有者仍负责真正销毁。
-  //   空值、未知记录或重复调用按接口约定返回错误或幂等成功。
-  // 失败/边界：不得释放非本对象所有资源；重复解除按幂等约定处理，旧 handle 不得重新激活。
+  // 功能：在 rdma_cmq_engine 中，retired_count 按 owner、generation 和幂等规则释放/隔离记录，并同步删除其账本引用。
+  // 输入/输出及副作用：无显式参数；retired_count 可能更新本对象明确拥有的状态；函数返回 longint unsigned，不取得调用方资源所有权。
+  // 失败/边界：retired_count 发现 owner/generation 不匹配、记录未知或重复释放时返回错误或幂等结果，不重新激活旧句柄。
   function longint unsigned retired_count();
     return retire_seq;
   endfunction
 
-  // 功能：处理 cq_consumed_count：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 cq_consume_seq 用于执行 cq_consumed_count；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：cq_consumed_count 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：cq_consumed_count 只读当前账本/队列状态并计算 longint unsigned 计数或可用容量，不推进任何事务游标。
+  // 输入/输出及副作用：无显式参数；cq_consumed_count 读取固定返回值或局部计算结果，不使用对象成员字段；函数返回 longint unsigned，不取得调用方资源所有权。
+  // 失败/边界：cq_consumed_count 是只读访问器，返回 cq_consume_seq；未覆盖枚举沿 default/类型默认分支返回，不改变对象和外部资源。
   function longint unsigned cq_consumed_count();
     return cq_consume_seq;
   endfunction
 
-  // 功能：处理 outstanding_count：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 num 用于执行 outstanding_count；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：outstanding_count 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：outstanding_count 只读当前账本/队列状态并计算 int unsigned 计数或可用容量，不推进任何事务游标。
+  // 输入/输出及副作用：无显式参数；outstanding_count 读取固定返回值或局部计算结果，不使用对象成员字段；函数返回 int unsigned，不取得调用方资源所有权。
+  // 失败/边界：outstanding_count 是只读访问器，返回 command_registry.num()；未覆盖枚举沿 default/类型默认分支返回，不改变对象和外部资源。
   function int unsigned outstanding_count();
     return command_registry.num();
   endfunction
 
-  // 功能：处理 quarantine_count：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 count 用于执行 quarantine_count；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：quarantine_count 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：quarantine_count 只读当前账本/队列状态并计算 int unsigned 计数或可用容量，不推进任何事务游标。
+  // 输入/输出及副作用：无显式参数；quarantine_count 读取 对象字段：slots、state 并使用字段 count；函数返回 int unsigned，不取得调用方资源所有权。
+  // 失败/边界：quarantine_count 是只读访问器，返回 count；未覆盖枚举沿 default/类型默认分支返回，不改变对象和外部资源。
   function int unsigned quarantine_count();
     int unsigned count;
 
@@ -6132,10 +6052,9 @@ class rdma_cmq_engine extends uvm_object;
     return count;
   endfunction
 
-  // 功能：处理 last_poison_snapshot：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 status 用于执行 last_poison_snapshot；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：last_poison_snapshot 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：在 rdma_cmq_engine 中，last_poison_snapshot 只读查询当前运行时/测试账本，返回槽位、对象或恢复记录的快照而不推进事务。
+  // 输入/输出及副作用：无显式参数；last_poison_snapshot 可能更新本对象明确拥有的状态；函数返回 rdma_cmq_diagnostic，不取得调用方资源所有权。
+  // 失败/边界：last_poison_snapshot 输入对象为空或查找未命中时返回 null；该路径不隐式重试，也不转移未声明资源。
   function rdma_cmq_diagnostic last_poison_snapshot();
     rdma_status status;
     rdma_cmq_diagnostic snapshot;
@@ -6148,10 +6067,9 @@ class rdma_cmq_engine extends uvm_object;
     return snapshot;
   endfunction
 
-  // 功能：处理 shutdown：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 cancel_status 用于执行 shutdown；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：shutdown 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：在 rdma_cmq_engine 中，shutdown 停止接收新 CMQ 事务，清理本地队列和非拥有引用，并把 engine 切换到关闭状态。
+  // 输入/输出及副作用：status（输出）；shutdown 驱动下游事务，并写入 status；函数返回 无直接返回值，不取得调用方资源所有权。
+  // 失败/边界：shutdown 失败或超时通过 status 明确发布；该路径不隐式重试，也不转移未声明资源。
   task shutdown(output rdma_status status);
     rdma_status cancel_status;
     rdma_status release_status;

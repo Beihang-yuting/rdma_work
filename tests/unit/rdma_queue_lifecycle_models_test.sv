@@ -9,10 +9,9 @@
 class rdma_test_slot_token extends rdma_queue_slot_token_contract;
   `uvm_object_utils(rdma_test_slot_token)
 
-  // 功能：构造当前对象并初始化其字段、集合和 UVM 名称；不接管传入句柄的生命周期。
-  // 输入/输出及副作用：name 仅用于 UVM 对象命名；内部字段被初始化为安全默认值，传入句柄不转移所有权。
-  //   返回新对象实例；构造失败由 UVM 工厂或调用方处理。
-  // 失败/边界：不创建外部资源；name 为空时仍允许构造，但所有字段必须保持可配置的初始值。
+  // 功能：构造 rdma_test_slot_token，调用 super.new 建立 UVM 层级对象；外部依赖字段保持未绑定，后续由 configure/build/activate 明确注入。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_test_slot_token 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_test_slot_token");
     super.new(name);
   endfunction
@@ -21,10 +20,9 @@ endclass
 class rdma_queue_lifecycle_models_test extends uvm_test;
   `uvm_component_utils(rdma_queue_lifecycle_models_test)
 
-  // 功能：构造当前对象并初始化其字段、集合和 UVM 名称；不接管传入句柄的生命周期。
-  // 输入/输出及副作用：name 仅用于 UVM 对象命名；内部字段被初始化为安全默认值，传入句柄不转移所有权。
-  //   返回新对象实例；构造失败由 UVM 工厂或调用方处理。
-  // 失败/边界：不创建外部资源；name 为空时仍允许构造，但所有字段必须保持可配置的初始值。
+  // 功能：构造 rdma_queue_lifecycle_models_test，调用 super.new 建立 UVM 层级对象；外部依赖字段保持未绑定，后续由 configure/build/activate 明确注入。
+  // 输入/输出及副作用：name、parent（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_queue_lifecycle_models_test 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(
     string name = "rdma_queue_lifecycle_models_test",
     uvm_component parent = null
@@ -32,10 +30,9 @@ class rdma_queue_lifecycle_models_test extends uvm_test;
     super.new(name, parent);
   endfunction
 
-  // 功能：在测试中检查调用结果、状态码和副作用是否符合契约；失败时报告可定位的验证信息。
-  // 输入/输出及副作用：参数 name, status, expected 用于执行 expect_status；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：测试前置对象缺失时应报告断言错误并停止依赖该对象的后续检查。
+  // 功能：在 rdma_queue_lifecycle_models_test 中，expect_status 在测试中执行 expect_status 断言，比较输入结果与期望状态并报告可定位的失败信息。
+  // 输入/输出及副作用：name（输入）、status（输入）、expected（输入）；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：测试函数 expect_status 缺少前置对象时报告断言错误，并停止依赖该对象的后续检查。
   function automatic void expect_status(
     string name,
     rdma_status status,
@@ -54,10 +51,9 @@ class rdma_queue_lifecycle_models_test extends uvm_test;
     end
   endfunction
 
-  // 功能：依据输入请求创建对应的值对象或资源计划，并校验依赖、所有权和生命周期后返回结果。
-  // 输入/输出及副作用：输入请求、容量和依赖用于构造/预留资源；返回独立对象或状态，不暴露内部可变集合。
-  //   参数越界、容量不足或构造中途失败时回滚已登记的局部状态。
-  // 失败/边界：依赖为空、参数越界、容量不足或构造步骤失败时清理局部结果并返回明确错误。
+  // 功能：make_mapping 创建独立的 rdma_dma_mapping；根据 name 设置字段 mapping、function_h、function_h.function_uid、function_h.object_id、function_h.generation、mapping.function_h、iova.value、backing_addr.value、mapping.size、mapping.state，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：name（输入）；make_mapping 读取 name 并使用字段 mapping、function_h、function_h.function_uid、function_h.object_id、function_h.generation、mapping.function_h、iova.value、backing_addr.value；函数返回 rdma_dma_mapping，不取得调用方资源所有权。
+  // 失败/边界：make_mapping 的结果直接由 return mapping 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function automatic rdma_dma_mapping make_mapping(string name);
     rdma_dma_mapping mapping;
     rdma_function_handle function_h;
@@ -75,10 +71,9 @@ class rdma_queue_lifecycle_models_test extends uvm_test;
     return mapping;
   endfunction
 
-  // 功能：依据输入请求创建对应的值对象或资源计划，并校验依赖、所有权和生命周期后返回结果。
-  // 输入/输出及副作用：输入请求、容量和依赖用于构造/预留资源；返回独立对象或状态，不暴露内部可变集合。
-  //   参数越界、容量不足或构造中途失败时回滚已登记的局部状态。
-  // 失败/边界：依赖为空、参数越界、容量不足或构造步骤失败时清理局部结果并返回明确错误。
+  // 功能：make_resource_handle 创建独立的 rdma_handle；根据 name、kind、owner 设置字段 handle、handle.kind、handle.function_uid、handle.object_id、handle.generation，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：name（输入）、kind（输入）、owner（输入）；make_resource_handle 读取 name、kind、owner 并使用字段 handle、handle.kind、handle.function_uid、handle.object_id、handle.generation；函数返回 rdma_handle，不取得调用方资源所有权。
+  // 失败/边界：make_resource_handle 的结果直接由 return handle 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function automatic rdma_handle make_resource_handle(
     string name,
     rdma_resource_kind_e kind,
@@ -95,10 +90,9 @@ class rdma_queue_lifecycle_models_test extends uvm_test;
   endfunction
 
   // Catches accidental acceptance of QP roles by legacy queue predicates.
-  // 功能：依据输入请求创建对应的值对象或资源计划，并校验依赖、所有权和生命周期后返回结果。
-  // 输入/输出及副作用：输入请求、容量和依赖用于构造/预留资源；返回独立对象或状态，不暴露内部可变集合。
-  //   参数越界、容量不足或构造中途失败时回滚已登记的局部状态。
-  // 失败/边界：依赖为空、参数越界、容量不足或构造步骤失败时清理局部结果并返回明确错误。
+  // 功能：make_qp_ring 创建独立的 rdma_qp_ring_layout；根据 name、role、depth 设置字段 ring、ring.role、ring.entry_size_bytes、ring.depth、ring.logical_bytes、ring.storage_bytes、ring.object_mode，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：name（输入）、role（输入）、depth（输入）；make_qp_ring 读取 name、role、depth 并使用字段 ring、ring.role、ring.entry_size_bytes、ring.depth、ring.logical_bytes、ring.storage_bytes、ring.object_mode；函数返回 rdma_qp_ring_layout，不取得调用方资源所有权。
+  // 失败/边界：make_qp_ring 的结果直接由 return ring 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function automatic rdma_qp_ring_layout make_qp_ring(
     string name,
     rdma_queue_backing_role_e role,
@@ -116,10 +110,9 @@ class rdma_queue_lifecycle_models_test extends uvm_test;
     return ring;
   endfunction
 
-  // 功能：依据输入请求创建对应的值对象或资源计划，并校验依赖、所有权和生命周期后返回结果。
-  // 输入/输出及副作用：输入请求、容量和依赖用于构造/预留资源；返回独立对象或状态，不暴露内部可变集合。
-  //   参数越界、容量不足或构造中途失败时回滚已登记的局部状态。
-  // 失败/边界：依赖为空、参数越界、容量不足或构造步骤失败时清理局部结果并返回明确错误。
+  // 功能：make_qp_context 创建独立的 rdma_context_backing_ref；根据 name、owner 设置字段 context_ref、context_ref.owner、context_ref.resource_kind、token、authority、token.completion_authority、context_ref.slot_token、context_ref.hmc_ref、hmc_ref.owner、hmc_ref.object_kind，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：name（输入）、owner（输入）；make_qp_context 读取 name、owner 并使用字段 context_ref、context_ref.owner、context_ref.resource_kind、token、authority、token.completion_authority、context_ref.slot_token、context_ref.hmc_ref；函数返回 rdma_context_backing_ref，不取得调用方资源所有权。
+  // 失败/边界：make_qp_context 的结果直接由 return context_ref 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function automatic rdma_context_backing_ref make_qp_context(
     string name,
     rdma_function_handle owner
@@ -149,10 +142,9 @@ class rdma_queue_lifecycle_models_test extends uvm_test;
     return context_ref;
   endfunction
 
-  // 功能：驱动 UVM 阶段中的场景初始化、事务执行和断言收尾，并在退出前释放 objection 或测试资源。
-  // 输入/输出及副作用：phase 控制 UVM 调度；task 驱动事务、断言和 objection，测试 fixture 由本层负责清理。
-  //   阶段提前结束或前置 setup 失败时必须释放 objection 并停止后续访问。
-  // 失败/边界：setup 失败或阶段被终止时停止新增事务，确保 objection、临时对象和外部引用按测试生命周期收尾。
+  // 功能：在 rdma_queue_lifecycle_models_test 中，run_phase 驱动 UVM 阶段中的场景初始化、事务执行和断言收尾，并在退出前释放 objection 或测试资源。
+  // 输入/输出及副作用：phase（输入）；phase 由 UVM 提供；task 通过 objection、日志和断言暴露结果，可能调用 DUT 接口但不改变其所有权规则。
+  // 失败/边界：run_phase 的 setup/阶段驱动失败时停止新增事务，并按测试生命周期清理 objection 与临时引用。
   task run_phase(uvm_phase phase);
     rdma_queue_backing_slice slice, slice_clone, metadata_slice;
     rdma_queue_backing_spec spec, metadata_spec;

@@ -25,6 +25,8 @@ class rdma_function_context extends uvm_object;
   rdma_reset_coordinator reset_coordinator;
   rdma_function_context_state_e state;
   // 功能：构造尚未绑定依赖的 Function context；所有校验和引用绑定集中在 build()。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：构造过程不分配 Host-memory、PCIe endpoint 或 manager 资源；空 name 也必须得到可配置对象。
   function new(string name="rdma_function_context");
     super.new(name);
     state = RDMA_CONTEXT_DISCOVERED;
@@ -32,9 +34,11 @@ class rdma_function_context extends uvm_object;
 
   // 功能：校验 identity/资源快照并构造单 Function context，同时创建或复用 reset
   //       coordinator、连接 Host router、登记 identity。返回错误时 result_context 为 null。
-  // 输入/输出：source_* 是依赖，registry/build_timeout 保留兼容接口，result_context 返回结果。
-  // 边界：依赖为空、identity 无效、资源未冻结或 identity 克隆失败时拒绝构建；不会复制
-  //       registry 的可变内部状态，也不会取得外部 router 的所有权。
+  // 输入/输出及副作用：source_identity/source_binding 被克隆到 result_context；resources、
+  //   host_mem、pcie 和 registry 仅保存非拥有引用；coordinator 为空时创建新的 coordinator，
+  //   并将 Host router/identity 登记其中。build_timeout 仅为兼容参数，不产生延迟。
+  // 失败/边界：依赖为空、identity 无效、资源未冻结或克隆失败时返回错误且 result_context 为 null；
+  //   不复制 registry 可变状态，也不取得外部 router/快照所有权。
   static function rdma_status build(
     rdma_function_identity source_identity,
     dpu_resource_snapshot source_resources,
@@ -54,10 +58,10 @@ class rdma_function_context extends uvm_object;
 
   // 功能：使用显式的 coordinator 参数构造 Function context，供 device env
   //       在多 Function 拓扑中保证所有 context 共享同一 reset ledger。
-  // 输入：coordinator/source_binding 必须位于 output 参数之前，规避部分 VCS
-  //       版本对 output 后可选 class 参数的解析差异；其余约束与 build() 相同。
-  // 输出：result_context 返回绑定 identity、binding、router 和 coordinator 的新对象。
-  // 边界：任一依赖校验或克隆失败时返回错误，result_context 保持 null，不产生半成品。
+  // 输入/输出及副作用：source_identity/source_binding 被克隆，resources、router、registry 仅
+  //   以非拥有引用写入 result_context；coordinator 被连接 Host router 并登记 identity。
+  //   build_timeout 保留在 API 中但不会阻塞或调度事务。
+  // 失败/边界：任一依赖校验或克隆失败时返回错误，result_context 保持 null，不产生半成品。
   static function rdma_status build_shared(
     rdma_function_identity source_identity,
     dpu_resource_snapshot source_resources,
@@ -123,8 +127,9 @@ class rdma_function_context extends uvm_object;
   endfunction
 
   // 功能：允许已构造的 Function context 接收新的控制面/数据面事务。
-  // 输入/输出：无显式输入；返回状态表示 context 是否已进入 ACTIVE。
-  // 边界：QUARANTINED 或未完成 identity 绑定时拒绝激活；重复激活保持幂等成功。
+  // 输入/输出及副作用：无参数；成功时仅把 DISCOVERED context 标记为 ACTIVE、创建新的 owner handle
+  //   并更新 binding 状态，不分配队列或 DMA 资源。
+  // 失败/边界：QUARANTINED 或未完成 identity 绑定时拒绝激活；重复激活保持幂等成功。
   function rdma_status activate();
     if (identity == null || !identity.validate().ok())
       return rdma_status::make(RDMA_SC_INVALID_STATE,
@@ -144,8 +149,8 @@ class rdma_function_context extends uvm_object;
   endfunction
 
   // 功能：停止该 Function 接收新事务，为 reset 或资源回收建立 quiesce 边界。
-  // 副作用：只改变 context 状态，不销毁外部 router、快照或已登记 identity。
-  // 边界：DISCOVERED/QUARANTINED context 不能 quiesce；重复 quiesce 幂等成功。
+  // 输入/输出及副作用：无参数；ACTIVE context 转为 QUIESCING，重复调用幂等；不释放或修改外部资源。
+  // 失败/边界：DISCOVERED/QUARANTINED context 不能 quiesce；重复 quiesce 幂等成功。
   function rdma_status quiesce();
     if (state == RDMA_CONTEXT_QUIESCING)
       return rdma_status::success();
@@ -158,9 +163,9 @@ class rdma_function_context extends uvm_object;
 
   // 功能：发布新的 Function generation/reset epoch，并在 quiesce 边界后重新激活；
   //       尚未 activate 的 context 也会更新 authority，但保持 DISCOVERED 状态。
-  // 输入：new_generation 必须非零；new_epoch 由 reset coordinator 提供。
-  // 副作用：替换 identity/binding 的 detached 快照，使旧 handle 在下游校验中失效。
-  // 边界：QUARANTINED、generation 为零或参数溢出时拒绝；不自动重放旧 queue 事务。
+  // 输入/输出及副作用：new_generation/new_epoch 写入克隆 identity，并重建 binding owner handle；
+  //   DISCOVERED 保持原状态，其他可恢复状态转为 ACTIVE，不重放旧事务。
+  // 失败/边界：QUARANTINED、generation 为零或参数溢出时拒绝；不自动重放旧 queue 事务。
   function rdma_status reset(
     int unsigned new_generation,
     rdma_reset_epoch_t new_epoch
@@ -199,9 +204,9 @@ class rdma_function_context extends uvm_object;
   endfunction
 
   // 功能：在当前 Function scope 内查询队列句柄；此阶段仅提供统一 authority 校验。
-  // 输入：queue_handle 为待查找队列；返回值仅表示查询/校验状态，实际 queue object
-  //       由后续 queue engine attachment registry 提供。
-  // 边界：context 非 ACTIVE、句柄为空、Function UID/generation 不匹配或队列未登记时拒绝。
+  // 输入/输出及副作用：queue_handle（输入）；只读校验 context ACTIVE 状态及 Function UID/generation，
+  //   当前实现不维护队列表，因此不会发布 queue 对象或取得外部资源所有权。
+  // 失败/边界：context 非 ACTIVE、句柄为空、Function UID/generation 不匹配或队列未登记时拒绝。
   function rdma_status lookup_queue(rdma_handle queue_handle);
     if (state != RDMA_CONTEXT_ACTIVE)
       return rdma_status::make(RDMA_SC_INVALID_STATE,

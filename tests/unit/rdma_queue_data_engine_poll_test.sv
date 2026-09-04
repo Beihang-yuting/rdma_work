@@ -9,19 +9,17 @@
 class rdma_queue_data_engine_poll_test extends uvm_test;
   `uvm_component_utils(rdma_queue_data_engine_poll_test)
 
-  // 功能：构造当前对象并初始化其字段、集合和 UVM 名称；不接管传入句柄的生命周期。
-  // 输入/输出及副作用：name 仅用于 UVM 对象命名；内部字段被初始化为安全默认值，传入句柄不转移所有权。
-  //   返回新对象实例；构造失败由 UVM 工厂或调用方处理。
-  // 失败/边界：不创建外部资源；name 为空时仍允许构造，但所有字段必须保持可配置的初始值。
+  // 功能：构造 rdma_queue_data_engine_poll_test，调用 super.new 建立 UVM 层级对象；外部依赖字段保持未绑定，后续由 configure/build/activate 明确注入。
+  // 输入/输出及副作用：name、parent（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_queue_data_engine_poll_test 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_queue_data_engine_poll_test",
                uvm_component parent = null);
     super.new(name, parent);
   endfunction
 
-  // 功能：驱动 UVM 阶段中的场景初始化、事务执行和断言收尾，并在退出前释放 objection 或测试资源。
-  // 输入/输出及副作用：phase 控制 UVM 调度；task 驱动事务、断言和 objection，测试 fixture 由本层负责清理。
-  //   阶段提前结束或前置 setup 失败时必须释放 objection 并停止后续访问。
-  // 失败/边界：setup 失败或阶段被终止时停止新增事务，确保 objection、临时对象和外部引用按测试生命周期收尾。
+  // 功能：在 rdma_queue_data_engine_poll_test 中，run_phase 驱动 UVM 阶段中的场景初始化、事务执行和断言收尾，并在退出前释放 objection 或测试资源。
+  // 输入/输出及副作用：phase（输入）；phase 由 UVM 提供；task 通过 objection、日志和断言暴露结果，可能调用 DUT 接口但不改变其所有权规则。
+  // 失败/边界：run_phase 的 setup/阶段驱动失败时停止新增事务，并按测试生命周期清理 objection 与临时引用。
   task run_phase(uvm_phase phase);
     rdma_queue_data_engine engine;
     rdma_queue_data_engine_fixture fixture;
@@ -30,7 +28,7 @@ class rdma_queue_data_engine_poll_test extends uvm_test;
     rdma_queue_event_result event_result;
     rdma_status status;
     rdma_post_send_req send_request;
-    rdma_xtr_v1_cqe_model cqe;
+    rdma_hw_cqe_model cqe;
     rdma_status cqe_status;
 
     phase.raise_objection(this);
@@ -77,7 +75,7 @@ class rdma_queue_data_engine_poll_test extends uvm_test;
     // Device-side CQE production is modeled by writing a canonical 64-byte
     // entry into the lifecycle-owned CQ backing.  The polarity is the
     // literal initial owner bit from the XTR ring contract.
-    cqe = rdma_xtr_v1_cqe_model::type_id::create("device_cqe");
+    cqe = rdma_hw_cqe_model::type_id::create("device_cqe");
     cqe.qp_h = rdma_clone_handle_value(fixture.qp.handle, "device CQE QP");
     cqe.qpn = fixture.qp.local_qp_id;
     cqe.wqe_index = posted.index;
@@ -85,7 +83,7 @@ class rdma_queue_data_engine_poll_test extends uvm_test;
     cqe.rq_cqe = 1'b0;
     cqe.polarity = 1'b1;
     cqe.packet_opcode = 8'h01;
-    cqe.ecode = XTR_V1_CMQ_SUCCESS_ECODE;
+    cqe.ecode = RDMA_CMQ_SUCCESS_ECODE;
     cqe.payload_len = 32;
     cqe_status = rdma_status::success();
     cqe.status = cqe_status;

@@ -17,10 +17,9 @@ class rdma_queue_backing_span extends uvm_object;
   longint unsigned logical_offset;
   longint unsigned length;
 
-  // 功能：构造当前对象并初始化其字段、集合和 UVM 名称；不接管传入句柄的生命周期。
-  // 输入/输出及副作用：name 仅用于 UVM 对象命名；内部字段被初始化为安全默认值，传入句柄不转移所有权。
-  //   返回新对象实例；构造失败由 UVM 工厂或调用方处理。
-  // 失败/边界：不创建外部资源；name 为空时仍允许构造，但所有字段必须保持可配置的初始值。
+  // 功能：构造 rdma_queue_backing_span，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：mapping=null；mapping_offset=0；logical_offset=0；length=0。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_queue_backing_span 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_queue_backing_span");
     super.new(name);
     mapping = null;
@@ -38,10 +37,9 @@ class rdma_queue_backing_access extends uvm_object;
   protected rdma_queue_backing_ref queue_ref;
   protected rdma_qp_backing_ref qp_ref;
 
-  // 功能：构造当前对象并初始化其字段、集合和 UVM 名称；不接管传入句柄的生命周期。
-  // 输入/输出及副作用：name 仅用于 UVM 对象命名；内部字段被初始化为安全默认值，传入句柄不转移所有权。
-  //   返回新对象实例；构造失败由 UVM 工厂或调用方处理。
-  // 失败/边界：不创建外部资源；name 为空时仍允许构造，但所有字段必须保持可配置的初始值。
+  // 功能：构造 rdma_queue_backing_access，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：owner=null；host_mem=null；queue_ref=null；qp_ref=null。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_queue_backing_access 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_queue_backing_access");
     super.new(name);
     owner = null;
@@ -50,52 +48,46 @@ class rdma_queue_backing_access extends uvm_object;
     qp_ref = null;
   endfunction
 
-  // 功能：处理 invalid：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 message 用于执行 invalid；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：invalid 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：在 rdma_queue_backing_access 中，invalid 根据输入错误信息构造带正确 category/code 的 rdma_status，供上层保留失败证据。
+  // 输入/输出及副作用：message（输入）；invalid 读取 message 并使用字段 rdma_status；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：invalid 返回 RDMA_SC_INVALID_ARGUMENT；失败路径不提交部分状态或转移未声明资源。
   protected function rdma_status invalid(string message);
     return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, message);
   endfunction
 
-  // 功能：把输入错误或注入故障转换成统一的 rdma_status，供上层沿原事务路径处理。
-  // 输入/输出及副作用：输入为错误消息、错误码或故障证据；返回统一 rdma_status，不推进事务游标。
-  //   空消息仍需保留错误类别；未知错误码不得被静默转换为成功。
-  // 失败/边界：错误路径不能返回成功状态；消息和错误码缺失时仍须保留可诊断类别。
+  // 功能：在 rdma_queue_backing_access 中，invalid_state 把错误消息、硬件码或注入故障封装为统一 rdma_status，保留原事务的诊断证据。
+  // 输入/输出及副作用：message（输入）；invalid_state 读取 message 并使用字段 rdma_status；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：invalid_state 返回 RDMA_SC_INVALID_STATE；失败路径不提交部分状态或转移未声明资源。
   protected function rdma_status invalid_state(string message);
     return rdma_status::make(RDMA_SC_INVALID_STATE, message);
   endfunction
 
-  // 功能：处理 dma_error：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 message 用于执行 dma_error；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：dma_error 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：在 rdma_queue_backing_access 中，dma_error 根据输入错误信息构造带正确 category/code 的 rdma_status，供上层保留失败证据。
+  // 输入/输出及副作用：message（输入）；dma_error 读取 message 并使用字段 rdma_status；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：dma_error 返回 RDMA_SC_DMA_TRANSLATION；失败路径不提交部分状态或转移未声明资源。
   protected function rdma_status dma_error(string message);
     return rdma_status::make(RDMA_SC_DMA_TRANSLATION, message);
   endfunction
 
-  // 功能：处理 add_ok：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 first, length 用于执行 add_ok；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：add_ok 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：在 rdma_queue_backing_access 中，add_ok 将输入对象登记或挂接到当前集合/依赖图，并同步维护对应账本和生命周期引用。
+  // 输入/输出及副作用：first（输入）、length（输入）；add_ok 可能更新本对象明确拥有的状态；函数返回 bit，不取得调用方资源所有权。
+  // 失败/边界：add_ok 的结果直接由 return length != 0 && first <= 64'hffff_ffff_ffff_ffff - length 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   protected function bit add_ok(longint unsigned first,
                                 longint unsigned length);
     return length != 0 && first <= 64'hffff_ffff_ffff_ffff - length;
   endfunction
 
-  // 功能：处理 add_no_overflow：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 first, length 用于执行 add_no_overflow；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：add_no_overflow 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：在 rdma_queue_backing_access 中，add_no_overflow 将输入对象登记或挂接到当前集合/依赖图，并同步维护对应账本和生命周期引用。
+  // 输入/输出及副作用：first（输入）、length（输入）；add_no_overflow 可能更新本对象明确拥有的状态；函数返回 bit，不取得调用方资源所有权。
+  // 失败/边界：add_no_overflow 的结果直接由 return first <= 64'hffff_ffff_ffff_ffff - length 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   protected function bit add_no_overflow(longint unsigned first,
                                          longint unsigned length);
     return first <= 64'hffff_ffff_ffff_ffff - length;
   endfunction
 
-  // 功能：处理 range_shape：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 offset, length 用于执行 range_shape；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：range_shape 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：在 rdma_queue_backing_access 中，range_shape 校验逻辑访问长度非零、offset+length 不溢出且二者都按 qword 对齐。
+  // 输入/输出及副作用：offset（输入）、length（输入）；range_shape 读取 offset、length 并使用字段 rdma_status；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：range_shape 返回 RDMA_SC_DMA_TRANSLATION；典型拒绝条件为“logical backing access range overflows”；失败路径不提交部分状态或转移未声明资源。
   protected function rdma_status range_shape(longint unsigned offset,
                                               longint unsigned length);
     if (length == 0)
@@ -110,10 +102,9 @@ class rdma_queue_backing_access extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：校验依赖并建立该对象的运行边界，成功后保存必要的非拥有引用；拒绝不完整或重复配置。
-  // 输入/输出及副作用：接收 manager、binding、router 或 profile 等依赖；成功后保存非拥有引用并更新配置状态。
-  //   任一依赖为空、重复配置或代际不匹配时保持原状态并返回错误。
-  // 失败/边界：配置失败不得写入半成品引用；已激活对象不得被无条件降级或重复占用资源。
+  // 功能：在 rdma_queue_backing_access 中，configure 校验依赖和 binding 后建立运行边界，只保存非拥有引用并拒绝重复配置。
+  // 输入/输出及副作用：function_h（输入）、api（输入）；configure 先依据 function_h == null || function_h.kind != RDMA_RESOURCE_FUNCTION；function_h.generation == 0；api == null 校验 function_h、api；成功时更新本对象配置/状态并保存非拥有引用，返回 rdma_status。
+  // 失败/边界：实现中的空依赖、重复登记、状态或 generation/authority 校验失败时返回错误；失败时保留旧配置。
   function rdma_status configure(rdma_function_handle function_h,
                                  rdma_host_mem_api api);
     rdma_function_handle snapshot;
@@ -135,9 +126,8 @@ class rdma_queue_backing_access extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：把指定资源或后端能力绑定到当前对象的唯一索引，并校验 Function、generation 和队列类型一致。
-  // 输入/输出及副作用：输入为待绑定资源/后端引用；成功后新增一条受 identity 保护的关联记录。
-  //   重复绑定、资源类型错误或依赖缺失时不留下部分关联。
+  // 功能：在 rdma_queue_backing_access 中，attach_queue 把 attach_queue 指定的资源或后端能力绑定到当前对象索引，并校验 Function、generation 和队列类型一致。
+  // 输入/输出及副作用：backing（输入）；attach_queue 先依据 owner == null || host_mem == null；queue_ref != null || qp_ref != null；backing == null 校验 backing；成功时更新本对象配置/状态并保存非拥有引用，返回 rdma_status。
   // 失败/边界：资源不存在、类型不符、重复登记或跨 Function 串线时拒绝绑定并保持索引不变。
   function rdma_status attach_queue(rdma_queue_backing_ref backing);
     rdma_status status;
@@ -159,9 +149,8 @@ class rdma_queue_backing_access extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：把指定资源或后端能力绑定到当前对象的唯一索引，并校验 Function、generation 和队列类型一致。
-  // 输入/输出及副作用：输入为待绑定资源/后端引用；成功后新增一条受 identity 保护的关联记录。
-  //   重复绑定、资源类型错误或依赖缺失时不留下部分关联。
+  // 功能：在 rdma_queue_backing_access 中，attach_qp 把 attach_qp 指定的资源或后端能力绑定到当前对象索引，并校验 Function、generation 和队列类型一致。
+  // 输入/输出及副作用：backing（输入）；attach_qp 先依据 owner == null || host_mem == null；queue_ref != null || qp_ref != null；backing == null 校验 backing；成功时更新本对象配置/状态并保存非拥有引用，返回 rdma_status。
   // 失败/边界：资源不存在、类型不符、重复登记或跨 Function 串线时拒绝绑定并保持索引不变。
   function rdma_status attach_qp(rdma_qp_backing_ref backing);
     rdma_status status;
@@ -183,19 +172,17 @@ class rdma_queue_backing_access extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：按资源所有权和幂等规则释放或清理记录；重复释放不会再次扣减 credit，也不触碰已隔离资源。
-  // 输入/输出及副作用：输入为待解除或释放的 handle/key；成功后隔离或删除本对象记录，外部拥有者仍负责真正销毁。
-  //   空值、未知记录或重复调用按接口约定返回错误或幂等成功。
-  // 失败/边界：不得释放非本对象所有资源；重复解除按幂等约定处理，旧 handle 不得重新激活。
+  // 功能：在 rdma_queue_backing_access 中，clear 按 owner、generation 和幂等规则释放/隔离记录，并同步删除其账本引用。
+  // 输入/输出及副作用：无显式参数；输入 action/epoch/handle 决定迁移目标；成功时更新状态或恢复证据，外部资源仍由其拥有者管理。
+  // 失败/边界：clear 发现 owner/generation 不匹配、记录未知或重复释放时返回错误或幂等结果，不重新激活旧句柄。
   function void clear();
     queue_ref = null;
     qp_ref = null;
   endfunction
 
-  // 功能：处理 reference_total：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 backing_ref, total 用于执行 reference_total；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：reference_total 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：在 rdma_queue_backing_access 中，reference_total 只读查询当前运行时/测试账本，返回槽位、对象或恢复记录的快照而不推进事务。
+  // 输入/输出及副作用：backing_ref（输入）、total（输出）；reference_total 读取 backing_ref、total 并使用字段 total，并写入 total；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：reference_total 返回 RDMA_SC_INVALID_STATE、RDMA_SC_DMA_TRANSLATION；典型拒绝条件为“queue backing reference is incomplete”“queue backing segment coverage overflows”；失败路径不提交部分状态或转移未声明资源。
   protected function rdma_status reference_total(
       rdma_queue_backing_ref backing_ref,
       output longint unsigned total);
@@ -217,10 +204,9 @@ class rdma_queue_backing_access extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：处理 qp_reference_as_queue：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 backing_ref, projected 用于执行 qp_reference_as_queue；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：qp_reference_as_queue 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：在 rdma_queue_backing_access 中，qp_reference_as_queue 将 QP backing 及其附加 segment 投影成统一的 queue backing 视图，供公共 span 解析器使用。
+  // 输入/输出及副作用：backing_ref（输入）、projected（输出）；qp_reference_as_queue 读取 backing_ref、projected 并使用字段 projected、projected.role、projected.mapping、projected.ownership、projected.mapping_offset、projected.length、projected.logical_queue_offset、segment，并写入 projected；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：qp_reference_as_queue 返回 RDMA_SC_RESOURCE_EXHAUSTED、RDMA_SC_INVALID_STATE；典型拒绝条件为“QP backing reference is incomplete”“QP backing projection allocation failed”；失败路径不提交部分状态或转移未声明资源。
   protected function rdma_status qp_reference_as_queue(
       rdma_qp_backing_ref backing_ref,
       output rdma_queue_backing_ref projected);
@@ -247,10 +233,10 @@ class rdma_queue_backing_access extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：处理 resolve_ref：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 backing_ref, offset, length, spans 用于执行 resolve_ref；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：resolve_ref 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：在 rdma_queue_backing_access 中，resolve_ref 把队列逻辑 offset/length 解析为一个或多个 backing DMA span，并拒绝越界或不连续覆盖。
+  // 输入/输出及副作用：backing_ref（输入）、offset（输入）、length（输入）、spans（输出）；输入 handle/key/cursor 用于选择读取范围；返回值或 output 为 detached
+  //   快照，读取不取得外部资源所有权。
+  // 失败/边界：目标不存在、route/authority 不匹配或快照代际失效时返回错误/空值；不得返回陈旧或歧义条目。
   protected function rdma_status resolve_ref(
       rdma_queue_backing_ref backing_ref,
       longint unsigned offset,
@@ -318,10 +304,9 @@ class rdma_queue_backing_access extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：处理 resolve：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 offset, length, spans 用于执行 resolve；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：resolve 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：在 rdma_queue_backing_access 中，resolve 把队列逻辑 offset/length 解析为一个或多个 backing DMA span，并拒绝越界或不连续覆盖。
+  // 输入/输出及副作用：offset（输入）、length（输入）、spans（输出）；resolve 读取 offset、length、spans 并使用字段 status，并写入 spans；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：resolve 返回 RDMA_SC_INVALID_STATE；典型拒绝条件为“backing access is not configured”“backing access has no attached backing”；失败路径不提交部分状态或转移未声明资源。
   function rdma_status resolve(
       longint unsigned offset,
       longint unsigned length,
@@ -341,10 +326,9 @@ class rdma_queue_backing_access extends uvm_object;
     return resolve_ref(projected, offset, length, spans);
   endfunction
 
-  // 功能：检查输入字段、身份和生命周期约束，返回可诊断的校验状态；失败时不提交部分更新。
-  // 输入/输出及副作用：输入为待校验字段或快照；返回 rdma_status，校验过程不提交资源和游标。
-  //   空依赖、非法范围、身份不一致或非活动状态会返回错误。
-  // 失败/边界：任何非法枚举、越界字段、缺失必需依赖或身份/代际不一致都必须返回非成功状态。
+  // 功能：check_span 校验 span、direction 与当前对象状态的一致性，并显式处理“backing span is invalid”等拒绝条件，返回 rdma_status 供上层决定是否提交。
+  // 输入/输出及副作用：span（输入）、direction（输入）；check_span 读取 span、direction 并使用字段 first_iova.value、permissions、permissions.device_read、permissions.device_write、status；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：check_span 返回 RDMA_SC_INVALID_STATE、RDMA_SC_DMA_TRANSLATION；典型拒绝条件为“backing span exceeds mapping”“backing span IOVA overflows”；失败路径不提交部分状态或转移未声明资源。
   protected function rdma_status check_span(
       rdma_queue_backing_span span,
       rdma_dma_direction_e direction);
@@ -381,10 +365,9 @@ class rdma_queue_backing_access extends uvm_object;
     return status;
   endfunction
 
-  // 功能：处理 preflight_spans：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 spans, direction 用于执行 preflight_spans；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：preflight_spans 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：在 rdma_queue_backing_access 中，preflight_spans 预检输入并预留事务所需的槽位、映射或中间状态，失败时保留可恢复证据。
+  // 输入/输出及副作用：spans（输入）、direction（输入）；preflight_spans 读取 spans、direction 并使用字段 covered、status；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：preflight_spans 返回 RDMA_SC_DMA_TRANSLATION；典型拒绝条件为“backing span coverage overflows”“backing span coverage is empty”；失败路径不提交部分状态或转移未声明资源。
   protected function rdma_status preflight_spans(
       rdma_queue_backing_span spans[$],
       rdma_dma_direction_e direction);
@@ -404,10 +387,10 @@ class rdma_queue_backing_access extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：向指定后端写入请求数据并保留返回状态；写入失败时不推进本地提交游标。
-  // 输入/输出及副作用：参数 offset, spans 用于执行 write；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：后端拒绝或写入范围越界时不推进本地提交游标，也不伪造成功状态。
+  // 功能：在 rdma_queue_backing_access 中，write 把请求数据写入指定后端并保留返回状态；只有写入成功才允许本地游标继续推进。
+  // 输入/输出及副作用：offset（输入）、data（输入）；输入 request/image/cursor 决定写入内容；成功时更新 PI/CI、slot ledger 或 pending journal，并通过 output
+  //   返回结果。
+  // 失败/边界：write 遇到后端拒绝、范围溢出或 DMA 权限不足时保留失败证据，不推进本地游标。
   function rdma_status write(longint unsigned offset, byte data[]);
     rdma_queue_backing_span spans[$];
     rdma_status status;
@@ -436,10 +419,9 @@ class rdma_queue_backing_access extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：按输入的完整标识查询当前权威记录并返回独立快照；缺失、歧义或代际过期时返回明确错误。
-  // 输入/输出及副作用：输入为完整 key/handle，output 或返回值为记录快照；查询不改变登记表和外部资源。
-  //   缺失、歧义、空句柄或旧 generation/reset epoch 返回明确错误。
-  // 失败/边界：查询不到唯一记录、输入为空或 authority 已失效时返回错误，不回退到默认 Function/root。
+  // 功能：在 rdma_queue_backing_access 中，read 按完整 key/handle 查找唯一权威记录并返回 detached 快照，避免把内部可变引用泄露给调用方。
+  // 输入/输出及副作用：offset（输入）、length（输入）、data（输出）；read 读取 offset、length、data 并使用字段 data、status、position、chunk，并写入 data；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：read 在 key/handle 缺失、记录不唯一或 generation/reset epoch 过期时返回明确错误，不回退到默认 authority。
   function rdma_status read(
       longint unsigned offset,
       longint unsigned length,
@@ -484,10 +466,9 @@ class rdma_queue_backing_access extends uvm_object;
   // CQ/CEQ/AEQ consumption).  Posting rings are DEVICE_READ-only mappings,
   // but the host still needs to verify that its own write reached backing
   // memory before ringing the producer doorbell.
-  // 功能：按输入的完整标识查询当前权威记录并返回独立快照；缺失、歧义或代际过期时返回明确错误。
-  // 输入/输出及副作用：输入为完整 key/handle，output 或返回值为记录快照；查询不改变登记表和外部资源。
-  //   缺失、歧义、空句柄或旧 generation/reset epoch 返回明确错误。
-  // 失败/边界：查询不到唯一记录、输入为空或 authority 已失效时返回错误，不回退到默认 Function/root。
+  // 功能：在 rdma_queue_backing_access 中，readback 按完整 key/handle 查找唯一权威记录并返回 detached 快照，避免把内部可变引用泄露给调用方。
+  // 输入/输出及副作用：offset（输入）、length（输入）、data（输出）；readback 读取 offset、length、data 并使用字段 data、status、position、chunk，并写入 data；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：readback 在 key/handle 缺失、记录不唯一或 generation/reset epoch 过期时返回明确错误，不回退到默认 authority。
   function rdma_status readback(
       longint unsigned offset,
       longint unsigned length,

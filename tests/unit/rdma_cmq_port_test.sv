@@ -9,18 +9,16 @@
 class rdma_cmq_late_pair_probe extends rdma_cmq_engine_probe;
   `uvm_object_utils(rdma_cmq_late_pair_probe)
 
-  // 功能：构造当前对象并初始化其字段、集合和 UVM 名称；不接管传入句柄的生命周期。
-  // 输入/输出及副作用：name 仅用于 UVM 对象命名；内部字段被初始化为安全默认值，传入句柄不转移所有权。
-  //   返回新对象实例；构造失败由 UVM 工厂或调用方处理。
-  // 失败/边界：不创建外部资源；name 为空时仍允许构造，但所有字段必须保持可配置的初始值。
+  // 功能：构造 rdma_cmq_late_pair_probe，调用 super.new 建立 UVM 层级对象；外部依赖字段保持未绑定，后续由 configure/build/activate 明确注入。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_cmq_late_pair_probe 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_cmq_late_pair_probe");
     super.new(name);
   endfunction
 
-  // 功能：处理 late_final_count：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 size 用于执行 late_final_count；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：late_final_count 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：late_final_count 只读当前账本/队列状态并计算 int unsigned 计数或可用容量，不推进任何事务游标。
+  // 输入/输出及副作用：无显式参数；late_final_count 读取固定返回值或局部计算结果，不使用对象成员字段；函数返回 int unsigned，不取得调用方资源所有权。
+  // 失败/边界：late_final_count 的结果直接由 return late_final_fifo.size() 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function int unsigned late_final_count();
     return late_final_fifo.size();
   endfunction
@@ -29,19 +27,18 @@ endclass
 class rdma_cmq_port_test extends rdma_cmq_engine_test;
   `uvm_component_utils(rdma_cmq_port_test)
 
-  // 功能：构造当前对象并初始化其字段、集合和 UVM 名称；不接管传入句柄的生命周期。
-  // 输入/输出及副作用：name 仅用于 UVM 对象命名；内部字段被初始化为安全默认值，传入句柄不转移所有权。
-  //   返回新对象实例；构造失败由 UVM 工厂或调用方处理。
-  // 失败/边界：不创建外部资源；name 为空时仍允许构造，但所有字段必须保持可配置的初始值。
+  // 功能：构造 rdma_cmq_port_test，调用 super.new 建立 UVM 层级对象；外部依赖字段保持未绑定，后续由 configure/build/activate 明确注入。
+  // 输入/输出及副作用：name、parent（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_cmq_port_test 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_cmq_port_test",
                uvm_component parent = null);
     super.new(name, parent);
   endfunction
 
-  // 功能：处理 next_generation_binding：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 name, binding_state, generation_delta 用于执行 next_generation_binding；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：next_generation_binding 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：在 rdma_cmq_port_test 中，next_generation_binding 配置测试 fixture 的定向故障或替代依赖，使下一次调用覆盖指定边界路径。
+  // 输入/输出及副作用：name（输入）、binding_state（输入）、generation_delta（输入）；next_generation_binding 读取 name、binding_state、generation_delta 并使用字段 binding、binding.owner_h；函数返回 rdma_function_binding，不取得调用方资源所有权。
+
+  // 失败/边界：next_generation_binding 的结果直接由 return binding 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function automatic rdma_function_binding next_generation_binding(
     string name,
     rdma_binding_state_e binding_state,
@@ -55,10 +52,10 @@ class rdma_cmq_port_test extends rdma_cmq_engine_test;
     return binding;
   endfunction
 
-  // 功能：检查输入字段、身份和生命周期约束，返回可诊断的校验状态；失败时不提交部分更新。
-  // 输入/输出及副作用：输入为待校验字段或快照；返回 rdma_status，校验过程不提交资源和游标。
-  //   空依赖、非法范围、身份不一致或非活动状态会返回错误。
-  // 失败/边界：任何非法枚举、越界字段、缺失必需依赖或身份/代际不一致都必须返回非成功状态。
+  // 功能：在测试辅助 rdma_cmq_port_test.check_mock_rejects_hostile_command_snapshots 中构造或驱动“mock rejects hostile command
+  //   snapshots”场景，并断言 DUT 的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_mock_rejects_hostile_command_snapshots();
     rdma_function_binding binding;
     rdma_mock_cmq_port mock_cmq;
@@ -90,10 +87,10 @@ class rdma_cmq_port_test extends rdma_cmq_engine_test;
     retained_outcome = rdma_status::make(
       RDMA_SC_DMA_PERMISSION, "retained hostile snapshot outcome"
     );
-    mock_cmq.fail_opcode(XTR_V1_OP_KEY_ALLOC, retained_outcome);
+    mock_cmq.fail_opcode(RDMA_OP_KEY_ALLOC, retained_outcome);
 
     mutating_command = make_command(
-      "mock_mutating_command", binding, XTR_V1_OP_KEY_ALLOC, 8'h21, 1us
+      "mock_mutating_command", binding, RDMA_OP_KEY_ALLOC, 8'h21, 1us
     );
     if (!$cast(mutating_body, mutating_command.body))
       `uvm_fatal("MOCK_HOSTILE_SETUP", "mutating body type is invalid")
@@ -129,7 +126,7 @@ class rdma_cmq_port_test extends rdma_cmq_engine_test;
                  "mutating clone changed the caller-owned command graph")
 
     alias_command = make_command(
-      "mock_alias_command", binding, XTR_V1_OP_KEY_ALLOC, 8'h22, 1us
+      "mock_alias_command", binding, RDMA_OP_KEY_ALLOC, 8'h22, 1us
     );
     if (!$cast(alias_body, alias_command.body))
       `uvm_fatal("MOCK_HOSTILE_SETUP", "alias body type is invalid")
@@ -180,7 +177,7 @@ class rdma_cmq_port_test extends rdma_cmq_engine_test;
                  "alias-laundered clone changed its caller-owned source")
 
     recovery_command = make_command(
-      "mock_hostile_recovery", binding, XTR_V1_OP_KEY_ALLOC, 8'h23, 1us
+      "mock_hostile_recovery", binding, RDMA_OP_KEY_ALLOC, 8'h23, 1us
     );
     port.execute(recovery_command, ticket, completion, status);
     expect_status("MOCK_HOSTILE_RECOVERY", status, RDMA_SC_DMA_PERMISSION);
@@ -194,10 +191,10 @@ class rdma_cmq_port_test extends rdma_cmq_engine_test;
                  "rejected snapshots advanced sequence or consumed outcome")
   endtask
 
-  // 功能：检查输入字段、身份和生命周期约束，返回可诊断的校验状态；失败时不提交部分更新。
-  // 输入/输出及副作用：输入为待校验字段或快照；返回 rdma_status，校验过程不提交资源和游标。
-  //   空依赖、非法范围、身份不一致或非活动状态会返回错误。
-  // 失败/边界：任何非法枚举、越界字段、缺失必需依赖或身份/代际不一致都必须返回非成功状态。
+  // 功能：在测试辅助 rdma_cmq_port_test.check_mock_fifo_status_and_reconcile 中构造或驱动“mock fifo status and reconcile”场景，并断言 DUT
+  //   的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_mock_fifo_status_and_reconcile();
     rdma_function_binding binding;
     rdma_mock_cmq_port mock_cmq;
@@ -222,16 +219,16 @@ class rdma_cmq_port_test extends rdma_cmq_engine_test;
     mock_cmq = rdma_mock_cmq_port::type_id::create("mock_cmq");
     port = mock_cmq;
     command = make_command("mock_fail_command", binding,
-                           XTR_V1_OP_KEY_ALLOC, 8'h31, 1us);
+                           RDMA_OP_KEY_ALLOC, 8'h31, 1us);
     timeout_command = make_command("mock_timeout_command", binding,
-                                   XTR_V1_OP_KEY_ALLOC, 8'h32, 1us);
+                                   RDMA_OP_KEY_ALLOC, 8'h32, 1us);
     success_command = make_command("mock_success_command", binding,
-                                   XTR_V1_OP_KEY_ALLOC, 8'h33, 1us);
+                                   RDMA_OP_KEY_ALLOC, 8'h33, 1us);
     injected_status = rdma_status::make(
       RDMA_SC_DMA_PERMISSION, "injected key failure"
     );
-    mock_cmq.fail_opcode(XTR_V1_OP_KEY_ALLOC, injected_status);
-    mock_cmq.timeout_opcode(XTR_V1_OP_KEY_ALLOC);
+    mock_cmq.fail_opcode(RDMA_OP_KEY_ALLOC, injected_status);
+    mock_cmq.timeout_opcode(RDMA_OP_KEY_ALLOC);
     injected_status.message = "caller mutation";
 
     saved_generation = command.function_h.generation;
@@ -323,17 +320,16 @@ class rdma_cmq_port_test extends rdma_cmq_engine_test;
                  "default success did not produce a complete result")
     mock_cmq.get_opcodes(opcodes);
     if (opcodes.size() != 3 ||
-        opcodes[0] != XTR_V1_OP_KEY_ALLOC ||
-        opcodes[1] != XTR_V1_OP_KEY_ALLOC ||
-        opcodes[2] != XTR_V1_OP_KEY_ALLOC)
+        opcodes[0] != RDMA_OP_KEY_ALLOC ||
+        opcodes[1] != RDMA_OP_KEY_ALLOC ||
+        opcodes[2] != RDMA_OP_KEY_ALLOC)
       `uvm_error("MOCK_PORT_OPCODE_ORDER",
                  "mock call opcode order does not match execute order")
   endtask
 
-  // 功能：检查输入字段、身份和生命周期约束，返回可诊断的校验状态；失败时不提交部分更新。
-  // 输入/输出及副作用：输入为待校验字段或快照；返回 rdma_status，校验过程不提交资源和游标。
-  //   空依赖、非法范围、身份不一致或非活动状态会返回错误。
-  // 失败/边界：任何非法枚举、越界字段、缺失必需依赖或身份/代际不一致都必须返回非成功状态。
+  // 功能：在测试辅助 rdma_cmq_port_test.check_mock_gate_prerelease 中构造或驱动“mock gate prerelease”场景，并断言 DUT 的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_mock_gate_prerelease();
     rdma_function_binding binding;
     rdma_mock_cmq_port mock_cmq;
@@ -350,10 +346,10 @@ class rdma_cmq_port_test extends rdma_cmq_engine_test;
     );
     port = mock_cmq;
     command = make_command(
-      "mock_gate_prerelease_command", binding, XTR_V1_OP_KEY_ALLOC,
+      "mock_gate_prerelease_command", binding, RDMA_OP_KEY_ALLOC,
       8'h34, 1us
     );
-    mock_cmq.gate_opcode(XTR_V1_OP_KEY_ALLOC);
+    mock_cmq.gate_opcode(RDMA_OP_KEY_ALLOC);
     mock_cmq.release_one();
     execute_completed = 1'b0;
     fork : wait_for_mock_gate_prerelease
@@ -379,10 +375,10 @@ class rdma_cmq_port_test extends rdma_cmq_engine_test;
     end
   endtask
 
-  // 功能：检查输入字段、身份和生命周期约束，返回可诊断的校验状态；失败时不提交部分更新。
-  // 输入/输出及副作用：输入为待校验字段或快照；返回 rdma_status，校验过程不提交资源和游标。
-  //   空依赖、非法范围、身份不一致或非活动状态会返回错误。
-  // 失败/边界：任何非法枚举、越界字段、缺失必需依赖或身份/代际不一致都必须返回非成功状态。
+  // 功能：在测试辅助 rdma_cmq_port_test.check_adapter_routes_real_engines_by_function 中构造或驱动“adapter routes real engines by
+  //   function”场景，并断言 DUT 的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_adapter_routes_real_engines_by_function();
     rdma_cmq_engine_port_adapter adapter;
     rdma_cmq_engine_probe engine_a;
@@ -447,12 +443,24 @@ class rdma_cmq_port_test extends rdma_cmq_engine_test;
     prepared_b.global_function_id = prepared_a.global_function_id + 1'b1;
     prepared_b.pcie.bdf.function_num = 3'h2;
     prepared_b.queue_dma.requester_bdf = prepared_b.pcie.bdf;
+    // 中文：B 夹具改写兼容镜像后，必须重建同一条 Function identity authority；
+    // 否则 prepare 会按设计拒绝镜像与权威快照不一致的 binding。
+    status = prepared_b.configure_identity_from_legacy_mirrors(
+      16'h0, 32'h1, RDMA_FUNCTION_PF
+    );
+    expect_status("ADAPTER_B_PREPARED_IDENTITY", status, RDMA_SC_OK);
     prepared_b.owner_h = prepared_b.make_handle();
     active_b = make_binding("adapter_active_b", RDMA_BIND_ACTIVE);
     active_b.function_uid = active_a.function_uid + 1'b1;
     active_b.global_function_id = active_a.global_function_id + 1'b1;
     active_b.pcie.bdf.function_num = 3'h2;
     active_b.queue_dma.requester_bdf = active_b.pcie.bdf;
+    // 中文：active B 与 prepared B 共用新的 Function 路由身份，但各自保持
+    // 独立 generation/state fixture，供 activate 和 engine adapter 分别校验。
+    status = active_b.configure_identity_from_legacy_mirrors(
+      16'h0, 32'h1, RDMA_FUNCTION_PF
+    );
+    expect_status("ADAPTER_B_ACTIVE_IDENTITY", status, RDMA_SC_OK);
     active_b.owner_h = active_b.make_handle();
     if (prepared_a.function_uid == prepared_b.function_uid ||
         prepared_a.global_function_id == prepared_b.global_function_id)
@@ -612,10 +620,10 @@ class rdma_cmq_port_test extends rdma_cmq_engine_test;
     expect_status("ADAPTER_SHUTDOWN_B", status, RDMA_SC_OK);
   endtask
 
-  // 功能：检查输入字段、身份和生命周期约束，返回可诊断的校验状态；失败时不提交部分更新。
-  // 输入/输出及副作用：输入为待校验字段或快照；返回 rdma_status，校验过程不提交资源和游标。
-  //   空依赖、非法范围、身份不一致或非活动状态会返回错误。
-  // 失败/边界：任何非法枚举、越界字段、缺失必需依赖或身份/代际不一致都必须返回非成功状态。
+  // 功能：在测试辅助 rdma_cmq_port_test.check_real_engine_ticket_specific_reconcile 中构造或驱动“real engine ticket specific
+  //   reconcile”场景，并断言 DUT 的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_real_engine_ticket_specific_reconcile();
     rdma_cmq_engine_probe engine;
     rdma_mock_host_mem mem;
@@ -807,7 +815,7 @@ class rdma_cmq_port_test extends rdma_cmq_engine_test;
                  "late-failure setup did not consume its timeout")
     write_profile_cqe(
       "RECONCILE_LATE_FAILURE", mem, mapping, profile, 3, 1'b1,
-      failure_ticket, XTR_V1_ECODE_EC_RCE_CQ_FULL, failure_raw
+      failure_ticket, RDMA_ECODE_EC_RCE_CQ_FULL, failure_raw
     );
     engine.reconcile_ticket(failure_ticket, terminal_known, completion,
                             status);
@@ -822,17 +830,17 @@ class rdma_cmq_port_test extends rdma_cmq_engine_test;
         completion.decoded_response != null)
       expect_polled_completion(
         "RECONCILE_LATE_FAILURE_FINAL", engine, completion, failure_ticket,
-        failure_raw, 1'b1, XTR_V1_ECODE_EC_RCE_CQ_FULL, RDMA_SC_QUEUE_FULL
+        failure_raw, 1'b1, RDMA_ECODE_EC_RCE_CQ_FULL, RDMA_SC_QUEUE_FULL
       );
 
     engine.shutdown(status);
     expect_status("RECONCILE_SHUTDOWN", status, RDMA_SC_OK);
   endtask
 
-  // 功能：检查输入字段、身份和生命周期约束，返回可诊断的校验状态；失败时不提交部分更新。
-  // 输入/输出及副作用：输入为待校验字段或快照；返回 rdma_status，校验过程不提交资源和游标。
-  //   空依赖、非法范围、身份不一致或非活动状态会返回错误。
-  // 失败/边界：任何非法枚举、越界字段、缺失必需依赖或身份/代际不一致都必须返回非成功状态。
+  // 功能：在测试辅助 rdma_cmq_port_test.check_real_engine_late_pair_cleanup 中构造或驱动“real engine late pair cleanup”场景，并断言 DUT
+  //   的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_real_engine_late_pair_cleanup();
     rdma_cmq_late_pair_probe engine;
     rdma_mock_host_mem mem;
@@ -988,10 +996,9 @@ class rdma_cmq_port_test extends rdma_cmq_engine_test;
     end
   endtask
 
-  // 功能：驱动 UVM 阶段中的场景初始化、事务执行和断言收尾，并在退出前释放 objection 或测试资源。
-  // 输入/输出及副作用：phase 控制 UVM 调度；task 驱动事务、断言和 objection，测试 fixture 由本层负责清理。
-  //   阶段提前结束或前置 setup 失败时必须释放 objection 并停止后续访问。
-  // 失败/边界：setup 失败或阶段被终止时停止新增事务，确保 objection、临时对象和外部引用按测试生命周期收尾。
+  // 功能：在 rdma_cmq_port_test 中，run_phase 驱动 UVM 阶段中的场景初始化、事务执行和断言收尾，并在退出前释放 objection 或测试资源。
+  // 输入/输出及副作用：phase（输入）；phase 由 UVM 提供；task 通过 objection、日志和断言暴露结果，可能调用 DUT 接口但不改变其所有权规则。
+  // 失败/边界：run_phase 的 setup/阶段驱动失败时停止新增事务，并按测试生命周期清理 objection 与临时引用。
   virtual task run_phase(uvm_phase phase);
     phase.raise_objection(this);
     check_mock_rejects_hostile_command_snapshots();

@@ -10,19 +10,17 @@ class rdma_qp_publication_fault_manager extends rdma_resource_manager;
   `uvm_object_utils(rdma_qp_publication_fault_manager)
   bit fail_commit;
 
-  // 功能：构造当前对象并初始化其字段、集合和 UVM 名称；不接管传入句柄的生命周期。
-  // 输入/输出及副作用：name 仅用于 UVM 对象命名；内部字段被初始化为安全默认值，传入句柄不转移所有权。
-  //   返回新对象实例；构造失败由 UVM 工厂或调用方处理。
-  // 失败/边界：不创建外部资源；name 为空时仍允许构造，但所有字段必须保持可配置的初始值。
+  // 功能：构造 rdma_qp_publication_fault_manager，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：fail_commit=1'b0。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_qp_publication_fault_manager 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_qp_publication_fault_manager");
     super.new(name);
     fail_commit = 1'b0;
   endfunction
 
-  // 功能：执行一次受控事务并推进所属状态机；返回结果时保留失败阶段、代际和后端提交证据。
-  // 输入/输出及副作用：参数 begi 用于执行 commit_qp_programmed；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：事务超时、代际变化或提交证据不完整时不得推进下一阶段。
+  // 功能：在 rdma_qp_publication_fault_manager 中，commit_qp_programmed 执行受控事务并按后端提交证据推进状态机，同时保留失败阶段和 generation 证据。
+  // 输入/输出及副作用：candidate（输入）；输入 request/image/cursor 决定写入内容；成功时更新 PI/CI、slot ledger 或 pending journal，并通过 output 返回结果。
+  // 失败/边界：commit_qp_programmed 遇到锁、超时、generation 变化或提交证据不完整时保持原状态，不推进游标。
   virtual function rdma_status commit_qp_programmed(rdma_qp candidate);
     if (fail_commit) begin
       fail_commit = 1'b0;
@@ -36,18 +34,17 @@ endclass
 class rdma_qp_ticketless_modify_cmq extends rdma_mock_cmq_port;
   `uvm_object_utils(rdma_qp_ticketless_modify_cmq)
 
-  // 功能：构造当前对象并初始化其字段、集合和 UVM 名称；不接管传入句柄的生命周期。
-  // 输入/输出及副作用：name 仅用于 UVM 对象命名；内部字段被初始化为安全默认值，传入句柄不转移所有权。
-  //   返回新对象实例；构造失败由 UVM 工厂或调用方处理。
-  // 失败/边界：不创建外部资源；name 为空时仍允许构造，但所有字段必须保持可配置的初始值。
+  // 功能：构造 rdma_qp_ticketless_modify_cmq，调用 super.new 建立 UVM 层级对象；外部依赖字段保持未绑定，后续由 configure/build/activate 明确注入。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_qp_ticketless_modify_cmq 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_qp_ticketless_modify_cmq");
     super.new(name);
   endfunction
 
-  // 功能：执行一次受控事务并推进所属状态机；返回结果时保留失败阶段、代际和后端提交证据。
-  // 输入/输出及副作用：参数 command, ticket, completion, status 用于执行 execute；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：事务超时、代际变化或提交证据不完整时不得推进下一阶段。
+  // 功能：在 rdma_qp_ticketless_modify_cmq 中，execute 执行受控事务并按后端提交证据推进状态机，同时保留失败阶段和 generation 证据。
+  // 输入/输出及副作用：command（输入）、ticket（输出）、completion（输出）、status（输出）；execute 驱动下游事务，并写入 ticket、completion、status；函数返回 无直接返回值，不取得调用方资源所有权。
+
+  // 失败/边界：execute 遇到锁、超时、generation 变化或提交证据不完整时保持原状态，不推进游标。
   virtual task execute(
     rdma_cmq_command_desc command,
     output rdma_cmq_ticket ticket,
@@ -56,7 +53,7 @@ class rdma_qp_ticketless_modify_cmq extends rdma_mock_cmq_port;
   );
     super.execute(command, ticket, completion, status);
     if (command != null && command.opcode_key != null &&
-        command.opcode_key.opcode == XTR_V1_OP_QPC_MODIFY) begin
+        command.opcode_key.opcode == RDMA_OP_QPC_MODIFY) begin
       ticket = null;
       completion = null;
       if (status != null && !status.ok())
@@ -72,28 +69,26 @@ class rdma_qp_scripted_query_host_mem extends rdma_mock_host_mem;
   `uvm_object_utils(rdma_qp_scripted_query_host_mem)
   byte scripted_query_bytes[];
 
-  // 功能：构造当前对象并初始化其字段、集合和 UVM 名称；不接管传入句柄的生命周期。
-  // 输入/输出及副作用：name 仅用于 UVM 对象命名；内部字段被初始化为安全默认值，传入句柄不转移所有权。
-  //   返回新对象实例；构造失败由 UVM 工厂或调用方处理。
-  // 失败/边界：不创建外部资源；name 为空时仍允许构造，但所有字段必须保持可配置的初始值。
+  // 功能：构造 rdma_qp_scripted_query_host_mem，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：scripted_query_bytes=new[0]。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_qp_scripted_query_host_mem 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_qp_scripted_query_host_mem");
     super.new(name);
     scripted_query_bytes = new[0];
   endfunction
 
-  // 功能：执行 script_query_image 指定的测试或恢复状态变更，更新受控账本并保留可回滚的故障证据。
-  // 输入/输出及副作用：参数 scripted_query_bytes 用于执行 script_query_image；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
+  // 功能：在 rdma_qp_scripted_query_host_mem 中，script_query_image 执行 script_query_image 的script_query_image 指定的测试或恢复状态变更，更新受控账本并保留可回滚的故障证据。
+  // 输入/输出及副作用：bytes（输入）；script_query_image 读取 bytes 并使用字段 scripted_query_bytes；函数返回 void，不取得调用方资源所有权。
   // 失败/边界：script_query_image 仅允许测试/恢复范围内的状态变更；代际或资源不匹配时拒绝并保留原账本。
   function void script_query_image(byte bytes[]);
     scripted_query_bytes = new[bytes.size()];
     foreach (bytes[i]) scripted_query_bytes[i] = bytes[i];
   endfunction
 
-  // 功能：检查可用容量并预留所需资源，返回带所有权证据的分配结果；容量不足时不留下部分分配。
-  // 输入/输出及副作用：输入请求、容量和依赖用于构造/预留资源；返回独立对象或状态，不暴露内部可变集合。
-  //   参数越界、容量不足或构造中途失败时回滚已登记的局部状态。
-  // 失败/边界：依赖为空、参数越界、容量不足或构造步骤失败时清理局部结果并返回明确错误。
+  // 功能：在 rdma_qp_scripted_query_host_mem 中，allocate 检查容量后预留资源并返回带 owner 证据的句柄/计划；失败时回滚已登记的局部状态。
+  // 输入/输出及副作用：request_context（输入）、size（输入）、alignment（输入）、direction（输入）、mapping（输出）；输入请求/句柄定义资源属性；成功时更新账本并通过返回值或
+  //   output 发布新句柄/映射。
+  // 失败/边界：容量不足、范围非法、重复占用或身份过期时返回错误；失败不得泄漏半分配资源。
   virtual function rdma_status allocate(
     rdma_dma_request_context request_context,
     int unsigned size,
@@ -113,10 +108,9 @@ class rdma_qp_scripted_query_host_mem extends rdma_mock_host_mem;
   endfunction
 endclass
 
-  // 功能：处理 rdma_qp_encode_query_bytes：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 qpc, bytes 用于执行 rdma_qp_encode_query_bytes；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：rdma_qp_encode_query_bytes 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+// 功能：在 rdma_qp_scripted_query_host_mem 中，rdma_qp_encode_query_bytes 按 profile 的字段布局和端序把语义模型编码为硬件镜像，并在发布前检查长度与对齐。
+// 输入/输出及副作用：qpc（输入）、bytes（输出）；rdma_qp_encode_query_bytes 读取 qpc、bytes 并使用字段 bytes、variant、registry、status、key.hw_version、key.image_kind、key.object_type、key.variant，并写入 bytes；函数返回 rdma_status，不取得调用方资源所有权。
+// 失败/边界：rdma_qp_encode_query_bytes 返回 RDMA_SC_INVALID_ARGUMENT、RDMA_SC_INVALID_STATE；典型拒绝条件为“QP query test QPC is null”“QP query test transport is invalid”；失败路径不提交部分状态或转移未声明资源。
 function automatic rdma_status rdma_qp_encode_query_bytes(
   rdma_qpc_model qpc,
   output byte bytes[]
@@ -140,12 +134,12 @@ function automatic rdma_status rdma_qp_encode_query_bytes(
                                       "QP query test transport is invalid");
   endcase
   registry = rdma_codec_registry::type_id::create("qp_query_test_registry");
-  status = rdma_xtr_v1_register_qpc_codecs(registry);
-  key.hw_version = "xtr_v1";
+  status = rdma_register_qpc_codecs(registry);
+  key.hw_version = "rdma";
   key.image_kind = RDMA_IMAGE_QPC;
   key.object_type = "qpc";
   key.variant = variant;
-  key.opcode = XTR_V1_OP_QPC_CREATE;
+  key.opcode = RDMA_OP_QPC_CREATE;
   if (status.ok()) status = registry.lookup(key, codec);
   if (status.ok()) status = codec.encode(qpc, image);
   if (!status.ok() || image == null)
@@ -163,19 +157,18 @@ class rdma_qp_query_completion_fault_cmq extends rdma_mock_cmq_port;
   `uvm_object_utils(rdma_qp_query_completion_fault_cmq)
   bit drop_query_completion;
 
-  // 功能：构造当前对象并初始化其字段、集合和 UVM 名称；不接管传入句柄的生命周期。
-  // 输入/输出及副作用：name 仅用于 UVM 对象命名；内部字段被初始化为安全默认值，传入句柄不转移所有权。
-  //   返回新对象实例；构造失败由 UVM 工厂或调用方处理。
-  // 失败/边界：不创建外部资源；name 为空时仍允许构造，但所有字段必须保持可配置的初始值。
+  // 功能：构造 rdma_qp_query_completion_fault_cmq，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：drop_query_completion=1'b0。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_qp_query_completion_fault_cmq 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_qp_query_completion_fault_cmq");
     super.new(name);
     drop_query_completion = 1'b0;
   endfunction
 
-  // 功能：执行一次受控事务并推进所属状态机；返回结果时保留失败阶段、代际和后端提交证据。
-  // 输入/输出及副作用：参数 command, ticket, completion, status 用于执行 execute；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：事务超时、代际变化或提交证据不完整时不得推进下一阶段。
+  // 功能：在 rdma_qp_query_completion_fault_cmq 中，execute 执行受控事务并按后端提交证据推进状态机，同时保留失败阶段和 generation 证据。
+  // 输入/输出及副作用：command（输入）、ticket（输出）、completion（输出）、status（输出）；execute 驱动下游事务，并写入 ticket、completion、status；函数返回 无直接返回值，不取得调用方资源所有权。
+
+  // 失败/边界：execute 遇到锁、超时、generation 变化或提交证据不完整时保持原状态，不推进游标。
   virtual task execute(
     rdma_cmq_command_desc command,
     output rdma_cmq_ticket ticket,
@@ -185,7 +178,7 @@ class rdma_qp_query_completion_fault_cmq extends rdma_mock_cmq_port;
     super.execute(command, ticket, completion, status);
     if (drop_query_completion && command != null &&
         command.opcode_key != null &&
-        command.opcode_key.opcode[7:0] == XTR_V1_OP_QPC_QUERY)
+        command.opcode_key.opcode[7:0] == RDMA_OP_QPC_QUERY)
       completion = null;
   endtask
 endclass
@@ -196,19 +189,17 @@ endclass
 class rdma_qp_recovery_test extends rdma_qp_lifecycle_test;
   `uvm_component_utils(rdma_qp_recovery_test)
 
-  // 功能：构造当前对象并初始化其字段、集合和 UVM 名称；不接管传入句柄的生命周期。
-  // 输入/输出及副作用：name 仅用于 UVM 对象命名；内部字段被初始化为安全默认值，传入句柄不转移所有权。
-  //   返回新对象实例；构造失败由 UVM 工厂或调用方处理。
-  // 失败/边界：不创建外部资源；name 为空时仍允许构造，但所有字段必须保持可配置的初始值。
+  // 功能：构造 rdma_qp_recovery_test，调用 super.new 建立 UVM 层级对象；外部依赖字段保持未绑定，后续由 configure/build/activate 明确注入。
+  // 输入/输出及副作用：name、parent（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_qp_recovery_test 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_qp_recovery_test",
                uvm_component parent = null);
     super.new(name, parent);
   endfunction
 
-  // 功能：驱动 UVM 阶段中的场景初始化、事务执行和断言收尾，并在退出前释放 objection 或测试资源。
-  // 输入/输出及副作用：phase 控制 UVM 调度；task 驱动事务、断言和 objection，测试 fixture 由本层负责清理。
-  //   阶段提前结束或前置 setup 失败时必须释放 objection 并停止后续访问。
-  // 失败/边界：setup 失败或阶段被终止时停止新增事务，确保 objection、临时对象和外部引用按测试生命周期收尾。
+  // 功能：在 rdma_qp_recovery_test 中，run_phase 驱动 UVM 阶段中的场景初始化、事务执行和断言收尾，并在退出前释放 objection 或测试资源。
+  // 输入/输出及副作用：phase（输入）；phase 由 UVM 提供；task 通过 objection、日志和断言暴露结果，可能调用 DUT 接口但不改变其所有权规则。
+  // 失败/边界：run_phase 的 setup/阶段驱动失败时停止新增事务，并按测试生命周期清理 objection 与临时引用。
   task run_phase(uvm_phase phase);
     phase.raise_objection(this);
     check_ticketless_definitive_modify_recovery();
@@ -230,10 +221,10 @@ class rdma_qp_recovery_test extends rdma_qp_lifecycle_test;
   // RC can legally carry an optional SQ-SGB when its SGE capability requires
   // one.  Recovery must authenticate that retained authority and reject a
   // forged mapping owner or malformed rounded geometry before any CMQ work.
-  // 功能：检查输入字段、身份和生命周期约束，返回可诊断的校验状态；失败时不提交部分更新。
-  // 输入/输出及副作用：输入为待校验字段或快照；返回 rdma_status，校验过程不提交资源和游标。
-  //   空依赖、非法范围、身份不一致或非活动状态会返回错误。
-  // 失败/边界：任何非法枚举、越界字段、缺失必需依赖或身份/代际不一致都必须返回非成功状态。
+  // 功能：在测试辅助 rdma_qp_recovery_test.check_optional_sgb_recovery_validation 中构造或驱动“optional sgb recovery
+  //   validation”场景，并断言 DUT 的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_optional_sgb_recovery_validation();
     rdma_mock_host_mem mem;
     rdma_function_binding binding;
@@ -277,7 +268,7 @@ class rdma_qp_recovery_test extends rdma_qp_lifecycle_test;
     modify_req.new_state = RDMA_QPS_RTR;
     modify_req.destination_qpn_valid = 1'b1;
     modify_req.destination_qpn = 24'h34567;
-    cmq.timeout_opcode(XTR_V1_OP_QPC_MODIFY);
+    cmq.timeout_opcode(RDMA_OP_QPC_MODIFY);
     executor.modify_locked(binding, binding.make_handle(), modify_req, 972,
                            qp, result);
     record = null;
@@ -310,10 +301,10 @@ class rdma_qp_recovery_test extends rdma_qp_lifecycle_test;
 
   // A successful task status with an empty QPC_QUERY completion must not
   // authorize stale bytes already present in the query buffer.
-  // 功能：检查输入字段、身份和生命周期约束，返回可诊断的校验状态；失败时不提交部分更新。
-  // 输入/输出及副作用：输入为待校验字段或快照；返回 rdma_status，校验过程不提交资源和游标。
-  //   空依赖、非法范围、身份不一致或非活动状态会返回错误。
-  // 失败/边界：任何非法枚举、越界字段、缺失必需依赖或身份/代际不一致都必须返回非成功状态。
+  // 功能：在测试辅助 rdma_qp_recovery_test.check_modify_query_requires_terminal_completion 中构造或驱动“modify query requires
+  //   terminal completion”场景，并断言 DUT 的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_modify_query_requires_terminal_completion();
     rdma_mock_host_mem mem;
     rdma_function_binding binding;
@@ -358,7 +349,7 @@ class rdma_qp_recovery_test extends rdma_qp_lifecycle_test;
     modify_req.new_state = RDMA_QPS_RTR;
     modify_req.destination_qpn_valid = 1'b1;
     modify_req.destination_qpn = 24'h23456;
-    cmq.timeout_opcode(XTR_V1_OP_QPC_MODIFY);
+    cmq.timeout_opcode(RDMA_OP_QPC_MODIFY);
     executor.modify_locked(binding, binding.make_handle(), modify_req, 962,
                            qp, result);
     recovery = null;
@@ -391,10 +382,10 @@ class rdma_qp_recovery_test extends rdma_qp_lifecycle_test;
   // A pre-program CREATE rollback may have no candidate QPC at all.  With no
   // hardware context present, recovery must still release local authorities
   // and finalize the reservation.
-  // 功能：检查输入字段、身份和生命周期约束，返回可诊断的校验状态；失败时不提交部分更新。
-  // 输入/输出及副作用：输入为待校验字段或快照；返回 rdma_status，校验过程不提交资源和游标。
-  //   空依赖、非法范围、身份不一致或非活动状态会返回错误。
-  // 失败/边界：任何非法枚举、越界字段、缺失必需依赖或身份/代际不一致都必须返回非成功状态。
+  // 功能：在测试辅助 rdma_qp_recovery_test.check_create_rollback_without_candidate_qpc 中构造或驱动“create rollback without
+  //   candidate qpc”场景，并断言 DUT 的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_create_rollback_without_candidate_qpc();
     rdma_qp_boundary_host_mem mem;
     rdma_qp_fault_manager manager;
@@ -451,10 +442,9 @@ class rdma_qp_recovery_test extends rdma_qp_lifecycle_test;
 
   // An ambiguous full MODIFY must authenticate the complete QPC_QUERY image
   // before selecting candidate, restoring prior, or remaining in ERROR.
-  // 功能：检查输入字段、身份和生命周期约束，返回可诊断的校验状态；失败时不提交部分更新。
-  // 输入/输出及副作用：输入为待校验字段或快照；返回 rdma_status，校验过程不提交资源和游标。
-  //   空依赖、非法范围、身份不一致或非活动状态会返回错误。
-  // 失败/边界：任何非法枚举、越界字段、缺失必需依赖或身份/代际不一致都必须返回非成功状态。
+  // 功能：在测试辅助 rdma_qp_recovery_test.check_modify_query_matrix 中构造或驱动“modify query matrix”场景，并断言 DUT 的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_modify_query_matrix();
     for (int unsigned query_case = 0; query_case < 3; query_case++) begin
       string label;
@@ -499,7 +489,7 @@ class rdma_qp_recovery_test extends rdma_qp_lifecycle_test;
       modify_req.new_state = RDMA_QPS_RTR;
       modify_req.destination_qpn_valid = 1'b1;
       modify_req.destination_qpn = 24'h23456;
-      cmq.timeout_opcode(XTR_V1_OP_QPC_MODIFY);
+      cmq.timeout_opcode(RDMA_OP_QPC_MODIFY);
       executor.modify_locked(binding, binding.make_handle(), modify_req,
                              902 + query_case * 10, qp, result);
       recovery = null;
@@ -554,10 +544,10 @@ class rdma_qp_recovery_test extends rdma_qp_lifecycle_test;
   // CREATE ambiguity is resolved by an authenticated presence query.  A
   // present image runs the destroy recipe; a terminal query failure skips all
   // hardware cleanup and releases only local authorities.
-  // 功能：检查输入字段、身份和生命周期约束，返回可诊断的校验状态；失败时不提交部分更新。
-  // 输入/输出及副作用：输入为待校验字段或快照；返回 rdma_status，校验过程不提交资源和游标。
-  //   空依赖、非法范围、身份不一致或非活动状态会返回错误。
-  // 失败/边界：任何非法枚举、越界字段、缺失必需依赖或身份/代际不一致都必须返回非成功状态。
+  // 功能：在测试辅助 rdma_qp_recovery_test.check_create_presence_query 中构造或驱动“create presence query”场景，并断言 DUT
+  //   的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_create_presence_query();
     for (int unsigned query_case = 0; query_case < 3; query_case++) begin
       string label;
@@ -589,7 +579,7 @@ class rdma_qp_recovery_test extends rdma_qp_lifecycle_test;
       executor = rdma_qp_lifecycle_executor::type_id::create({label, "_executor"});
       setup_custom_qp_environment(label, mem, manager, contexts, cmq,
                                   executor, binding, pd, cq);
-      cmq.timeout_opcode(XTR_V1_OP_QPC_CREATE);
+      cmq.timeout_opcode(RDMA_OP_QPC_CREATE);
       create_req = make_request({label, "_create"}, binding, pd, cq,
                                 RDMA_TRANSPORT_RC);
       executor.create_locked(binding, binding.make_handle(), create_req,
@@ -612,7 +602,7 @@ class rdma_qp_recovery_test extends rdma_qp_lifecycle_test;
         mem.script_query_image(query_bytes);
       end
       else if (query_case == 1)
-        cmq.fail_opcode(XTR_V1_OP_QPC_QUERY,
+        cmq.fail_opcode(RDMA_OP_QPC_QUERY,
           rdma_status::make(RDMA_SC_DMA_TRANSLATION,
                             "QP context is absent"));
       else begin
@@ -636,22 +626,22 @@ class rdma_qp_recovery_test extends rdma_qp_lifecycle_test;
       cmq.get_opcodes(opcodes);
       status = recovery_result == null ? null : recovery_result.status;
       if (query_case == 0) begin
-        expected = '{XTR_V1_OP_QPC_CREATE, XTR_V1_OP_QPC_QUERY,
-                     XTR_V1_OP_QPC_MODIFY, XTR_V1_OP_OCC_FLUSH,
-                     XTR_V1_OP_OCC_FLUSH, XTR_V1_OP_OCC_FLUSH,
-                     XTR_V1_OP_QPC_DELETE};
+        expected = '{RDMA_OP_QPC_CREATE, RDMA_OP_QPC_QUERY,
+                     RDMA_OP_QPC_MODIFY, RDMA_OP_OCC_FLUSH,
+                     RDMA_OP_OCC_FLUSH, RDMA_OP_OCC_FLUSH,
+                     RDMA_OP_QPC_DELETE};
         if (status == null || !status.ok() || opcodes != expected ||
             mem.live_allocations() != 0 || contexts.release_call_count != 1)
           `uvm_error(label, "present CREATE query did not run destroy recipe")
       end
       else if (query_case == 1) begin
-        expected = '{XTR_V1_OP_QPC_CREATE, XTR_V1_OP_QPC_QUERY};
+        expected = '{RDMA_OP_QPC_CREATE, RDMA_OP_QPC_QUERY};
         if (status == null || !status.ok() || opcodes != expected ||
             mem.live_allocations() != 0 || contexts.release_call_count != 1)
           `uvm_error(label, "absent CREATE query did not run local cleanup")
       end
       else begin
-        expected = '{XTR_V1_OP_QPC_CREATE, XTR_V1_OP_QPC_QUERY};
+        expected = '{RDMA_OP_QPC_CREATE, RDMA_OP_QPC_QUERY};
         if (status == null || status.code != RDMA_SC_RECOVERY_REQUIRED ||
             opcodes != expected || mem.live_allocations() == 0)
           `uvm_error(label, "wrong-QPN CREATE query was accepted")
@@ -661,10 +651,10 @@ class rdma_qp_recovery_test extends rdma_qp_lifecycle_test;
 
   // DELETE ambiguity uses the same presence proof, but a present QPC must
   // retry DELETE while an absent QPC must mark DELETE complete and never retry.
-  // 功能：检查输入字段、身份和生命周期约束，返回可诊断的校验状态；失败时不提交部分更新。
-  // 输入/输出及副作用：输入为待校验字段或快照；返回 rdma_status，校验过程不提交资源和游标。
-  //   空依赖、非法范围、身份不一致或非活动状态会返回错误。
-  // 失败/边界：任何非法枚举、越界字段、缺失必需依赖或身份/代际不一致都必须返回非成功状态。
+  // 功能：在测试辅助 rdma_qp_recovery_test.check_delete_presence_query 中构造或驱动“delete presence query”场景，并断言 DUT
+  //   的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_delete_presence_query();
     for (int unsigned query_case = 0; query_case < 2; query_case++) begin
       string label;
@@ -704,7 +694,7 @@ class rdma_qp_recovery_test extends rdma_qp_lifecycle_test;
       destroy_req = rdma_destroy_resource_req::type_id::create({label, "_destroy"});
       destroy_req.owner = binding.make_handle();
       destroy_req.target_h = rdma_clone_handle_value(qp.handle, {label, "_target"});
-      cmq.timeout_opcode(XTR_V1_OP_QPC_DELETE);
+      cmq.timeout_opcode(RDMA_OP_QPC_DELETE);
       executor.destroy_locked(binding, binding.make_handle(), destroy_req,
                               932 + query_case, result);
       recovery = null;
@@ -725,7 +715,7 @@ class rdma_qp_recovery_test extends rdma_qp_lifecycle_test;
         mem.script_query_image(query_bytes);
       end
       else
-        cmq.fail_opcode(XTR_V1_OP_QPC_QUERY,
+        cmq.fail_opcode(RDMA_OP_QPC_QUERY,
           rdma_status::make(RDMA_SC_DMA_TRANSLATION,
                             "QP context is absent"));
       recovery_result = null;
@@ -733,11 +723,11 @@ class rdma_qp_recovery_test extends rdma_qp_lifecycle_test;
                               934 + query_case, recovery_result);
       cmq.get_opcodes(opcodes);
       status = recovery_result == null ? null : recovery_result.status;
-      expected = '{XTR_V1_OP_QPC_CREATE, XTR_V1_OP_QPC_MODIFY,
-                   XTR_V1_OP_OCC_FLUSH, XTR_V1_OP_OCC_FLUSH,
-                   XTR_V1_OP_OCC_FLUSH, XTR_V1_OP_QPC_DELETE,
-                   XTR_V1_OP_QPC_QUERY};
-      if (query_case == 0) expected.push_back(XTR_V1_OP_QPC_DELETE);
+      expected = '{RDMA_OP_QPC_CREATE, RDMA_OP_QPC_MODIFY,
+                   RDMA_OP_OCC_FLUSH, RDMA_OP_OCC_FLUSH,
+                   RDMA_OP_OCC_FLUSH, RDMA_OP_QPC_DELETE,
+                   RDMA_OP_QPC_QUERY};
+      if (query_case == 0) expected.push_back(RDMA_OP_QPC_DELETE);
       if (status == null || !status.ok() || opcodes != expected ||
           mem.live_allocations() != 0 || contexts.release_call_count != 1 ||
           manager.lookup(result.resource_h, resource) == null || resource != null)
@@ -749,10 +739,10 @@ class rdma_qp_recovery_test extends rdma_qp_lifecycle_test;
   // reconciliation produces terminal evidence, recovery remains fail-closed.
   // It may issue one authenticated QPC_QUERY probe, but must not retry the
   // original CREATE side effect.
-  // 功能：检查输入字段、身份和生命周期约束，返回可诊断的校验状态；失败时不提交部分更新。
-  // 输入/输出及副作用：输入为待校验字段或快照；返回 rdma_status，校验过程不提交资源和游标。
-  //   空依赖、非法范围、身份不一致或非活动状态会返回错误。
-  // 失败/边界：任何非法枚举、越界字段、缺失必需依赖或身份/代际不一致都必须返回非成功状态。
+  // 功能：在测试辅助 rdma_qp_recovery_test.check_ambiguous_create_recovery_dispatch 中构造或驱动“ambiguous create recovery
+  //   dispatch”场景，并断言 DUT 的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_ambiguous_create_recovery_dispatch();
     rdma_mock_host_mem mem;
     rdma_function_binding binding;
@@ -776,7 +766,7 @@ class rdma_qp_recovery_test extends rdma_qp_lifecycle_test;
     executor = rdma_qp_lifecycle_executor::type_id::create("create_recovery_executor");
     setup_custom_qp_environment("create_recovery", mem, manager, contexts,
                                 cmq, executor, binding, pd, cq);
-    cmq.timeout_opcode(XTR_V1_OP_QPC_CREATE);
+    cmq.timeout_opcode(RDMA_OP_QPC_CREATE);
     create_req = make_request("create_recovery_req", binding, pd, cq,
                               RDMA_TRANSPORT_RC);
     executor.create_locked(binding, binding.make_handle(), create_req, 880,
@@ -796,7 +786,7 @@ class rdma_qp_recovery_test extends rdma_qp_lifecycle_test;
         !recovery_result.recovery_required ||
         cmq.calls.size() != calls_before + 1 ||
         cmq.calls[calls_before] == null ||
-        cmq.calls[calls_before].opcode != XTR_V1_OP_QPC_QUERY)
+        cmq.calls[calls_before].opcode != RDMA_OP_QPC_QUERY)
       `uvm_error("QP_CREATE_RECOVERY_DISPATCH",
                  $sformatf("ambiguous create was not dispatched fail-closed result=%p status=%s resource=%p recovery=%p calls=%0d",
                            result, result == null || result.status == null ? "null" : result.status.convert2string(),
@@ -807,10 +797,10 @@ class rdma_qp_recovery_test extends rdma_qp_lifecycle_test;
   // A terminal CREATE failure proves that no QP context was installed.  The
   // recovery recipe must therefore skip every hardware destroy command and
   // release the retained staging/context/backing authorities exactly once.
-  // 功能：检查输入字段、身份和生命周期约束，返回可诊断的校验状态；失败时不提交部分更新。
-  // 输入/输出及副作用：输入为待校验字段或快照；返回 rdma_status，校验过程不提交资源和游标。
-  //   空依赖、非法范围、身份不一致或非活动状态会返回错误。
-  // 失败/边界：任何非法枚举、越界字段、缺失必需依赖或身份/代际不一致都必须返回非成功状态。
+  // 功能：在测试辅助 rdma_qp_recovery_test.check_ambiguous_create_terminal_failure_cleanup 中构造或驱动“ambiguous create terminal
+  //   failure cleanup”场景，并断言 DUT 的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_ambiguous_create_terminal_failure_cleanup();
     rdma_mock_host_mem mem;
     rdma_function_binding binding;
@@ -838,7 +828,7 @@ class rdma_qp_recovery_test extends rdma_qp_lifecycle_test;
     executor = rdma_qp_lifecycle_executor::type_id::create("create_failure_executor");
     setup_custom_qp_environment("create_failure", mem, manager, contexts,
                                 cmq, executor, binding, pd, cq);
-    cmq.timeout_opcode(XTR_V1_OP_QPC_CREATE);
+    cmq.timeout_opcode(RDMA_OP_QPC_CREATE);
     create_req = make_request("create_failure_req", binding, pd, cq,
                               RDMA_TRANSPORT_RC);
     executor.create_locked(binding, binding.make_handle(), create_req, 882,
@@ -908,10 +898,10 @@ class rdma_qp_recovery_test extends rdma_qp_lifecycle_test;
   // A terminal CREATE success proves that hardware contains the QP.  Recovery
   // must run the canonical OCC/QPC_DELETE destroy recipe before releasing
   // software authorities and finalizing the ERROR incarnation.
-  // 功能：检查输入字段、身份和生命周期约束，返回可诊断的校验状态；失败时不提交部分更新。
-  // 输入/输出及副作用：输入为待校验字段或快照；返回 rdma_status，校验过程不提交资源和游标。
-  //   空依赖、非法范围、身份不一致或非活动状态会返回错误。
-  // 失败/边界：任何非法枚举、越界字段、缺失必需依赖或身份/代际不一致都必须返回非成功状态。
+  // 功能：在测试辅助 rdma_qp_recovery_test.check_ambiguous_create_terminal_success_destroy 中构造或驱动“ambiguous create terminal
+  //   success destroy”场景，并断言 DUT 的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_ambiguous_create_terminal_success_destroy();
     rdma_mock_host_mem mem;
     rdma_function_binding binding;
@@ -938,7 +928,7 @@ class rdma_qp_recovery_test extends rdma_qp_lifecycle_test;
     executor = rdma_qp_lifecycle_executor::type_id::create("create_success_executor");
     setup_custom_qp_environment("create_success", mem, manager, contexts,
                                 cmq, executor, binding, pd, cq);
-    cmq.timeout_opcode(XTR_V1_OP_QPC_CREATE);
+    cmq.timeout_opcode(RDMA_OP_QPC_CREATE);
     create_req = make_request("create_success_req", binding, pd, cq,
                               RDMA_TRANSPORT_RC);
     executor.create_locked(binding, binding.make_handle(), create_req, 885,
@@ -961,12 +951,12 @@ class rdma_qp_recovery_test extends rdma_qp_lifecycle_test;
     executor.recover_locked(binding, binding.make_handle(), result.resource_h,
                             886, recovery_result);
     cmq.get_opcodes(opcodes);
-    expected.push_back(XTR_V1_OP_QPC_CREATE);
-    expected.push_back(XTR_V1_OP_QPC_MODIFY);
-    expected.push_back(XTR_V1_OP_OCC_FLUSH);
-    expected.push_back(XTR_V1_OP_OCC_FLUSH);
-    expected.push_back(XTR_V1_OP_OCC_FLUSH);
-    expected.push_back(XTR_V1_OP_QPC_DELETE);
+    expected.push_back(RDMA_OP_QPC_CREATE);
+    expected.push_back(RDMA_OP_QPC_MODIFY);
+    expected.push_back(RDMA_OP_OCC_FLUSH);
+    expected.push_back(RDMA_OP_OCC_FLUSH);
+    expected.push_back(RDMA_OP_OCC_FLUSH);
+    expected.push_back(RDMA_OP_QPC_DELETE);
     status = recovery_result == null ? null : recovery_result.status;
     if (status == null || !status.ok() ||
         recovery_result.final_resource_state != RDMA_RESOURCE_RELEASED ||
@@ -986,10 +976,10 @@ class rdma_qp_recovery_test extends rdma_qp_lifecycle_test;
 
   // A definitive CMQ failure followed by a failed staging release has no
   // ticket, but the staging mapping must remain durable recovery authority.
-  // 功能：检查输入字段、身份和生命周期约束，返回可诊断的校验状态；失败时不提交部分更新。
-  // 输入/输出及副作用：输入为待校验字段或快照；返回 rdma_status，校验过程不提交资源和游标。
-  //   空依赖、非法范围、身份不一致或非活动状态会返回错误。
-  // 失败/边界：任何非法枚举、越界字段、缺失必需依赖或身份/代际不一致都必须返回非成功状态。
+  // 功能：在测试辅助 rdma_qp_recovery_test.check_ticketless_definitive_modify_recovery 中构造或驱动“ticketless definitive modify
+  //   recovery”场景，并断言 DUT 的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_ticketless_definitive_modify_recovery();
     rdma_qp_boundary_host_mem mem;
     rdma_function_binding binding;
@@ -1023,7 +1013,7 @@ class rdma_qp_recovery_test extends rdma_qp_lifecycle_test;
     executor.modify_locked(binding, binding.make_handle(), modify_req, 871,
                            qp, result);
     mem.mode = "timeout_staging_release_before";
-    cmq.fail_opcode(XTR_V1_OP_QPC_MODIFY,
+    cmq.fail_opcode(RDMA_OP_QPC_MODIFY,
                     rdma_status::make(RDMA_SC_DMA_TRANSLATION,
                                       "ticketless definitive modify failure"));
     modify_req.new_state = RDMA_QPS_RTR;
@@ -1043,10 +1033,10 @@ class rdma_qp_recovery_test extends rdma_qp_lifecycle_test;
                  "ticketless definitive modify lost recovery authority")
   endtask
 
-  // 功能：检查输入字段、身份和生命周期约束，返回可诊断的校验状态；失败时不提交部分更新。
-  // 输入/输出及副作用：输入为待校验字段或快照；返回 rdma_status，校验过程不提交资源和游标。
-  //   空依赖、非法范围、身份不一致或非活动状态会返回错误。
-  // 失败/边界：任何非法枚举、越界字段、缺失必需依赖或身份/代际不一致都必须返回非成功状态。
+  // 功能：在测试辅助 rdma_qp_recovery_test.check_ticketless_publication_modify_recovery 中构造或驱动“ticketless publication modify
+  //   recovery”场景，并断言 DUT 的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_ticketless_publication_modify_recovery();
     rdma_qp_publication_fault_manager manager;
     rdma_mock_host_mem mem;
@@ -1099,10 +1089,10 @@ class rdma_qp_recovery_test extends rdma_qp_lifecycle_test;
                  "ticketless publication failure lost ERROR recovery authority")
   endtask
 
-  // 功能：检查输入字段、身份和生命周期约束，返回可诊断的校验状态；失败时不提交部分更新。
-  // 输入/输出及副作用：输入为待校验字段或快照；返回 rdma_status，校验过程不提交资源和游标。
-  //   空依赖、非法范围、身份不一致或非活动状态会返回错误。
-  // 失败/边界：任何非法枚举、越界字段、缺失必需依赖或身份/代际不一致都必须返回非成功状态。
+  // 功能：在测试辅助 rdma_qp_recovery_test.check_ambiguous_modify_recovery 中构造或驱动“ambiguous modify recovery”场景，并断言 DUT
+  //   的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_ambiguous_modify_recovery();
     rdma_mock_host_mem mem;
     rdma_function_binding binding;
@@ -1138,7 +1128,7 @@ class rdma_qp_recovery_test extends rdma_qp_lifecycle_test;
     modify_req.new_state = RDMA_QPS_RTR;
     modify_req.destination_qpn_valid = 1'b1;
     modify_req.destination_qpn = 24'h23456;
-    cmq.timeout_opcode(XTR_V1_OP_QPC_MODIFY);
+    cmq.timeout_opcode(RDMA_OP_QPC_MODIFY);
     executor.modify_locked(binding, binding.make_handle(), modify_req, 802,
                            qp, result);
     recovery = null;
@@ -1172,10 +1162,10 @@ class rdma_qp_recovery_test extends rdma_qp_lifecycle_test;
     end
   endtask
 
-  // 功能：检查输入字段、身份和生命周期约束，返回可诊断的校验状态；失败时不提交部分更新。
-  // 输入/输出及副作用：输入为待校验字段或快照；返回 rdma_status，校验过程不提交资源和游标。
-  //   空依赖、非法范围、身份不一致或非活动状态会返回错误。
-  // 失败/边界：任何非法枚举、越界字段、缺失必需依赖或身份/代际不一致都必须返回非成功状态。
+  // 功能：在测试辅助 rdma_qp_recovery_test.check_ambiguous_destroy_recovery 中构造或驱动“ambiguous destroy recovery”场景，并断言 DUT
+  //   的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_ambiguous_destroy_recovery();
     rdma_mock_host_mem mem;
     rdma_function_binding binding;
@@ -1206,7 +1196,7 @@ class rdma_qp_recovery_test extends rdma_qp_lifecycle_test;
     destroy_req.owner = binding.make_handle();
     destroy_req.target_h = rdma_clone_handle_value(
       qp.handle, "destroy recovery target");
-    cmq.timeout_opcode(XTR_V1_OP_QPC_MODIFY);
+    cmq.timeout_opcode(RDMA_OP_QPC_MODIFY);
     executor.destroy_locked(binding, binding.make_handle(), destroy_req, 851,
                             result);
     recovery = null;

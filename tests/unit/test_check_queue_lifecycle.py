@@ -15,15 +15,15 @@ SPEC.loader.exec_module(CHECKER)
 REQUIRED_SOURCE_FILES = [
     Path("src/core/rdma_queue_lifecycle_policy.sv"),
     Path("src/core/rdma_queue_lifecycle_executor.sv"),
-    Path("src/codec/xtr_v1/rdma_xtr_v1_queue_page_codec.sv"),
+    Path("src/codec/rdma/rdma_queue_page_codec.sv"),
     Path("src/model/rdma_semantic_requests.sv"),
     Path("src/model/rdma_model_pkg.sv"),
     Path("src/core/rdma_core_pkg.sv"),
     *sorted(Path("src/core").glob("*.sv")),
-    Path("src/codec/xtr_v1/rdma_xtr_v1_defs.svh"),
-    Path("src/codec/xtr_v1/rdma_xtr_v1_image_masks.svh"),
-    Path("src/codec/xtr_v1/rdma_xtr_v1_context_body_codecs.sv"),
-    Path("src/codec/xtr_v1/rdma_xtr_v1_cmq_codecs.sv"),
+    Path("src/codec/rdma/rdma_defs.svh"),
+    Path("src/codec/rdma/rdma_image_masks.svh"),
+    Path("src/codec/rdma/rdma_context_body_codecs.sv"),
+    Path("src/codec/rdma/rdma_cmq_codecs.sv"),
 ]
 
 

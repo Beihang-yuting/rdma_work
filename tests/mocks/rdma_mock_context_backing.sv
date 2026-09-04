@@ -9,10 +9,9 @@
 class rdma_mock_context_slot_token extends rdma_queue_slot_token_contract;
   `uvm_object_utils(rdma_mock_context_slot_token)
 
-  // 功能：构造当前对象并初始化其字段、集合和 UVM 名称；不接管传入句柄的生命周期。
-  // 输入/输出及副作用：name 仅用于 UVM 对象命名；内部字段被初始化为安全默认值，传入句柄不转移所有权。
-  //   返回新对象实例；构造失败由 UVM 工厂或调用方处理。
-  // 失败/边界：不创建外部资源；name 为空时仍允许构造，但所有字段必须保持可配置的初始值。
+  // 功能：构造 rdma_mock_context_slot_token，调用 super.new 建立 UVM 层级对象；外部依赖字段保持未绑定，后续由 configure/build/activate 明确注入。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_mock_context_slot_token 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_mock_context_slot_token");
     super.new(name);
   endfunction
@@ -33,10 +32,9 @@ class rdma_mock_context_slot extends uvm_object;
   bit released;
   int unsigned release_count;
 
-  // 功能：构造当前对象并初始化其字段、集合和 UVM 名称；不接管传入句柄的生命周期。
-  // 输入/输出及副作用：name 仅用于 UVM 对象命名；内部字段被初始化为安全默认值，传入句柄不转移所有权。
-  //   返回新对象实例；构造失败由 UVM 工厂或调用方处理。
-  // 失败/边界：不创建外部资源；name 为空时仍允许构造，但所有字段必须保持可配置的初始值。
+  // 功能：构造 rdma_mock_context_slot，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：owner=null；resource_kind=RDMA_RESOURCE_CQ；local_id=0；completion_authority=null；slot_length=0；shadow_view_offset=0；shadow_view_length=0；shadow_pointer_base='0；其余字段按实现默认值初始化。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_mock_context_slot 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_mock_context_slot");
     super.new(name);
     owner = null;
@@ -63,10 +61,9 @@ class rdma_mock_context_backing extends rdma_context_backing_api;
   rdma_status role_failures[string];
   int unsigned method_ordinals[string];
 
-  // 功能：构造当前对象并初始化其字段、集合和 UVM 名称；不接管传入句柄的生命周期。
-  // 输入/输出及副作用：name 仅用于 UVM 对象命名；内部字段被初始化为安全默认值，传入句柄不转移所有权。
-  //   返回新对象实例；构造失败由 UVM 工厂或调用方处理。
-  // 失败/边界：不创建外部资源；name 为空时仍允许构造，但所有字段必须保持可配置的初始值。
+  // 功能：构造 rdma_mock_context_backing，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：release_call_count=0。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_mock_context_backing 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_mock_context_backing");
     super.new(name);
     slots.delete();
@@ -75,10 +72,9 @@ class rdma_mock_context_backing extends rdma_context_backing_api;
     failure_queue.delete();
   endfunction
 
-  // 功能：把输入错误或注入故障转换成统一的 rdma_status，供上层沿原事务路径处理。
-  // 输入/输出及副作用：输入为错误消息、错误码或故障证据；返回统一 rdma_status，不推进事务游标。
-  //   空消息仍需保留错误类别；未知错误码不得被静默转换为成功。
-  // 失败/边界：错误路径不能返回成功状态；消息和错误码缺失时仍须保留可诊断类别。
+  // 功能：在 rdma_mock_context_backing 中，fail_next 把错误消息、硬件码或注入故障封装为统一 rdma_status，保留原事务的诊断证据。
+  // 输入/输出及副作用：method_name（输入）、status（输入）；fail_next 读取 method_name、status 并使用字段 rdma_status；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：fail_next 返回 RDMA_SC_INVALID_ARGUMENT；典型拒绝条件为“unknown context backing method”“failure status is null”；失败路径不提交部分状态或转移未声明资源。
   function rdma_status fail_next(string method_name, rdma_status status);
     if (!(method_name inside {"acquire", "write", "release",
                               "query_release_completion"}))
@@ -91,10 +87,9 @@ class rdma_mock_context_backing extends rdma_context_backing_api;
     return rdma_status::success();
   endfunction
 
-  // 功能：把输入错误或注入故障转换成统一的 rdma_status，供上层沿原事务路径处理。
-  // 输入/输出及副作用：输入为错误消息、错误码或故障证据；返回统一 rdma_status，不推进事务游标。
-  //   空消息仍需保留错误类别；未知错误码不得被静默转换为成功。
-  // 失败/边界：错误路径不能返回成功状态；消息和错误码缺失时仍须保留可诊断类别。
+  // 功能：在 rdma_mock_context_backing 中，fail_role_call 把错误消息、硬件码或注入故障封装为统一 rdma_status，保留原事务的诊断证据。
+  // 输入/输出及副作用：method_name（输入）、role（输入）、ordinal（输入）、status（输入）；fail_role_call 读取 method_name、role、ordinal、status 并使用输入参数和固定枚举/常量；函数返回 void，不取得调用方资源所有权。
+  // 失败/边界：fail_role_call 无返回值，仅执行 函数体中的顺序操作；调用方须保证前置依赖已经绑定，函数不自动重试或接管外部资源。
   function void fail_role_call(string method_name,
                                rdma_queue_backing_role_e role,
                                int unsigned ordinal,
@@ -104,19 +99,17 @@ class rdma_mock_context_backing extends rdma_context_backing_api;
         rdma_mock_clone_status(status);
   endfunction
 
-  // 功能：清理当前运行状态并建立新的复位/代际边界，使旧句柄或旧事务不能继续生效。
-  // 输入/输出及副作用：参数 delete 用于执行 reset；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
+  // 功能：在 rdma_mock_context_backing 中，reset reset 清理当前运行状态并建立新的复位/代际边界，使旧句柄或旧事务不能继续生效。
+  // 输入/输出及副作用：无显式参数；输入 action/epoch/handle 决定迁移目标；成功时更新状态或恢复证据，外部资源仍由其拥有者管理。
   // 失败/边界：复位参数为零、代际回退或存在未处理 pending 事务时拒绝更新 authority。
   function void reset();
     slots.delete(); call_trace.delete(); failure_queue.delete();
     role_failures.delete(); method_ordinals.delete(); release_call_count = 0;
   endfunction
 
-  // 功能：处理 consume_failure：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 status 用于执行 consume_failure；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：consume_failure 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：在 rdma_mock_context_backing 中，consume_failure 推进队列/事务游标或执行对应 I/O，并把结果写回声明的输出参数。
+  // 输入/输出及副作用：method_name（输入）；consume_failure 读取 method_name 并使用字段 status；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：consume_failure 输入对象为空或查找未命中时返回 null；该路径不隐式重试，也不转移未声明资源。
   function automatic rdma_status consume_failure(string method_name);
     rdma_status status;
     if (!failure_queue.exists(method_name) ||
@@ -126,10 +119,9 @@ class rdma_mock_context_backing extends rdma_context_backing_api;
     return status;
   endfunction
 
-  // 功能：处理 consume_role_failure：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 method_name, role 用于执行 consume_role_failure；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：consume_role_failure 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：在 rdma_mock_context_backing 中，consume_role_failure 推进队列/事务游标或执行对应 I/O，并把结果写回声明的输出参数。
+  // 输入/输出及副作用：method_name（输入）、role（输入）；consume_role_failure 读取 method_name、role 并使用字段 ordinal、key、status；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：consume_role_failure 输入对象为空或查找未命中时返回 null；该路径不隐式重试，也不转移未声明资源。
   function automatic rdma_status consume_role_failure(
     string method_name,
     rdma_queue_backing_role_e role
@@ -148,10 +140,9 @@ class rdma_mock_context_backing extends rdma_context_backing_api;
     return null;
   endfunction
 
-  // 功能：处理 context_role：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 resource_kind 用于执行 context_role；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：context_role 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：context_role 使用 resource_kind 计算并返回 rdma_queue_backing_role_e 结果；不修改对象字段或外部资源。
+  // 输入/输出及副作用：resource_kind（输入）；context_role 读取 resource_kind 并使用输入参数和固定枚举/常量；函数返回 rdma_queue_backing_role_e，不取得调用方资源所有权。
+  // 失败/边界：context_role 按 case(resource_kind) 的固定映射计算 rdma_queue_backing_role_e（RDMA_RESOURCE_SRQ→RDMA_QUEUE_ROLE_SRQ_RING；RDMA_RESOURCE_QP→RDMA_QUEUE_ROLE_QP_SQ_RING；default→RDMA_QUEUE_ROLE_CQ_RING）；未列出的输入走 default，不修改运行时账本。
   function automatic rdma_queue_backing_role_e context_role(
     rdma_resource_kind_e resource_kind
   );
@@ -164,10 +155,9 @@ class rdma_mock_context_backing extends rdma_context_backing_api;
     endcase
   endfunction
 
-  // 功能：按输入的完整标识查询当前权威记录并返回独立快照；缺失、歧义或代际过期时返回明确错误。
-  // 输入/输出及副作用：输入为完整 key/handle，output 或返回值为记录快照；查询不改变登记表和外部资源。
-  //   缺失、歧义、空句柄或旧 generation/reset epoch 返回明确错误。
-  // 失败/边界：查询不到唯一记录、输入为空或 authority 已失效时返回错误，不回退到默认 Function/root。
+  // 功能：在 rdma_mock_context_backing 中，find_slot 按完整 key/handle 查找唯一权威记录并返回 detached 快照，避免把内部可变引用泄露给调用方。
+  // 输入/输出及副作用：context_ref（输入）；find_slot 读取 context_ref 并使用字段 status；函数返回 rdma_mock_context_slot，不取得调用方资源所有权。
+  // 失败/边界：find_slot 在 key/handle 缺失、记录不唯一或 generation/reset epoch 过期时返回明确错误，不回退到默认 authority。
   function automatic rdma_mock_context_slot find_slot(
     rdma_context_backing_ref context_ref
   );
@@ -214,10 +204,10 @@ class rdma_mock_context_backing extends rdma_context_backing_api;
     return null;
   endfunction
 
-  // 功能：检查可用容量并预留所需资源，返回带所有权证据的分配结果；容量不足时不留下部分分配。
-  // 输入/输出及副作用：输入请求、容量和依赖用于构造/预留资源；返回独立对象或状态，不暴露内部可变集合。
-  //   参数越界、容量不足或构造中途失败时回滚已登记的局部状态。
-  // 失败/边界：依赖为空、参数越界、容量不足或构造步骤失败时清理局部结果并返回明确错误。
+  // 功能：在 rdma_mock_context_backing 中，acquire 检查容量后预留资源并返回带 owner 证据的句柄/计划；失败时回滚已登记的局部状态。
+  // 输入/输出及副作用：binding（输入）、resource_kind（输入）、local_id（输入）、context_ref（输出）；输入请求/句柄定义资源属性；成功时更新账本并通过返回值或 output
+  //   发布新句柄/映射。
+  // 失败/边界：容量不足、范围非法、重复占用或身份过期时返回错误；失败不得泄漏半分配资源。
   virtual function rdma_status acquire(
     rdma_function_binding binding,
     rdma_resource_kind_e resource_kind,
@@ -314,10 +304,10 @@ class rdma_mock_context_backing extends rdma_context_backing_api;
     return rdma_status::success();
   endfunction
 
-  // 功能：向指定后端写入请求数据并保留返回状态；写入失败时不推进本地提交游标。
-  // 输入/输出及副作用：参数 context_ref, offset, data 用于执行 write；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：后端拒绝或写入范围越界时不推进本地提交游标，也不伪造成功状态。
+  // 功能：在 rdma_mock_context_backing 中，write 把请求数据写入指定后端并保留返回状态；只有写入成功才允许本地游标继续推进。
+  // 输入/输出及副作用：context_ref（输入）、offset（输入）、data（输入）；输入 request/image/cursor 决定写入内容；成功时更新 PI/CI、slot ledger 或 pending
+  //   journal，并通过 output 返回结果。
+  // 失败/边界：write 遇到后端拒绝、范围溢出或 DMA 权限不足时保留失败证据，不推进本地游标。
   virtual function rdma_status write(
     rdma_context_backing_ref context_ref,
     longint unsigned offset,
@@ -355,10 +345,9 @@ class rdma_mock_context_backing extends rdma_context_backing_api;
     return rdma_status::success();
   endfunction
 
-  // 功能：按资源所有权和幂等规则释放或清理记录；重复释放不会再次扣减 credit，也不触碰已隔离资源。
-  // 输入/输出及副作用：输入为待解除或释放的 handle/key；成功后隔离或删除本对象记录，外部拥有者仍负责真正销毁。
-  //   空值、未知记录或重复调用按接口约定返回错误或幂等成功。
-  // 失败/边界：不得释放非本对象所有资源；重复解除按幂等约定处理，旧 handle 不得重新激活。
+  // 功能：在 rdma_mock_context_backing 中，release 按 owner、generation 和幂等规则释放/隔离记录，并同步删除其账本引用。
+  // 输入/输出及副作用：context_ref（输入）；输入 handle/mapping/token 指定释放目标；成功时更新账本和生命周期，外部资源只按 adapter 契约释放。
+  // 失败/边界：release 发现 owner/generation 不匹配、记录未知或重复释放时返回错误或幂等结果，不重新激活旧句柄。
   virtual function rdma_status \release (
     rdma_context_backing_ref context_ref
   );
@@ -388,10 +377,9 @@ class rdma_mock_context_backing extends rdma_context_backing_api;
     return rdma_status::success();
   endfunction
 
-  // 功能：按输入的完整标识查询当前权威记录并返回独立快照；缺失、歧义或代际过期时返回明确错误。
-  // 输入/输出及副作用：输入为完整 key/handle，output 或返回值为记录快照；查询不改变登记表和外部资源。
-  //   缺失、歧义、空句柄或旧 generation/reset epoch 返回明确错误。
-  // 失败/边界：查询不到唯一记录、输入为空或 authority 已失效时返回错误，不回退到默认 Function/root。
+  // 功能：在 rdma_mock_context_backing 中，query_release_completion 按完整 key/handle 查找唯一权威记录并返回 detached 快照，避免把内部可变引用泄露给调用方。
+  // 输入/输出及副作用：context_ref（输入）、complete（输出）；query_release_completion 读取 context_ref、complete 并使用字段 complete、forced、slot，并写入 complete；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：query_release_completion 在 key/handle 缺失、记录不唯一或 generation/reset epoch 过期时返回明确错误，不回退到默认 authority。
   virtual function rdma_status query_release_completion(
     rdma_context_backing_ref context_ref,
     output bit complete
@@ -416,10 +404,10 @@ class rdma_mock_context_backing extends rdma_context_backing_api;
     return rdma_status::success();
   endfunction
 
-  // 功能：按输入的完整标识查询当前权威记录并返回独立快照；缺失、歧义或代际过期时返回明确错误。
-  // 输入/输出及副作用：输入为完整 key/handle，output 或返回值为记录快照；查询不改变登记表和外部资源。
-  //   缺失、歧义、空句柄或旧 generation/reset epoch 返回明确错误。
-  // 失败/边界：查询不到唯一记录、输入为空或 authority 已失效时返回错误，不回退到默认 Function/root。
+  // 功能：在 rdma_mock_context_backing 中，read_slot_byte 按完整 key/handle 查找唯一权威记录并返回 detached 快照，避免把内部可变引用泄露给调用方。
+  // 输入/输出及副作用：context_ref（输入）、offset（输入）、value（输出）；输入 handle/key/cursor 用于选择读取范围；返回值或 output 为 detached
+  //   快照，读取不取得外部资源所有权。
+  // 失败/边界：read_slot_byte 在 key/handle 缺失、记录不唯一或 generation/reset epoch 过期时返回明确错误，不回退到默认 authority。
   function rdma_status read_slot_byte(
     rdma_context_backing_ref context_ref,
     longint unsigned offset,

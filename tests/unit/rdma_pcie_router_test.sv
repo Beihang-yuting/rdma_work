@@ -7,12 +7,16 @@ class rdma_pcie_router_test extends uvm_test;
   `uvm_component_utils(rdma_pcie_router_test)
 
   // 功能：构造 UVM PCIe router 测试组件。
+  // 输入/输出及副作用：name、parent（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：构造过程不分配 Host-memory、PCIe endpoint 或 manager 资源；空 name 也必须得到可配置对象。
   function new(string name="rdma_pcie_router_test", uvm_component parent=null);
     super.new(name,parent);
   endfunction
 
   // 功能：搭建两个 Host 的相同 BDF 场景，验证 route identity 必须来自 set_identity()，
   //       裸 BDF 歧义被拒绝，完整 Function handle 可正确选择 endpoint。
+  // 输入/输出及副作用：phase（输入）；phase 由 UVM 提供；task 通过 objection、日志和断言暴露结果，可能调用 DUT 接口但不改变其所有权规则。
+  // 失败/边界：仿真超时、事务返回错误或断言不满足时报告 UVM_ERROR/UVM_FATAL；空 fixture 不得被当作成功。
   task run_phase(uvm_phase phase);
     rdma_pcie_router router;
     rdma_pcie_route_entry entries[$];

@@ -8,6 +8,8 @@ class rdma_dpu_identity_adapter extends uvm_object;
   `uvm_object_utils(rdma_dpu_identity_adapter)
 
   // 功能：构造无状态适配器对象；所有实际工作由以下两个静态投影函数完成。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：构造过程不分配 Host-memory、PCIe endpoint 或 manager 资源；空 name 也必须得到可配置对象。
   function new(string name = "rdma_dpu_identity_adapter");
     super.new(name);
   endfunction
@@ -17,8 +19,10 @@ class rdma_dpu_identity_adapter extends uvm_object;
   // from_snapshot()，由该入口之外的资源投影路径执行完整校验。
   // 功能：从冻结 device snapshot 读取一个 PF/VF 的 PCIe ID 和 global Function ID，
   //       生成可供 reset/route ledger 使用的 RDMA identity。
-  // 输入/输出：key 指定 dpu_common Function，identity 返回新克隆；函数不修改 snapshot。
-  // 边界：快照未冻结、key 不存在、VF parent 域不一致或 identity 配置失败时返回错误。
+  // 输入/输出及副作用：读取 snapshot 中 key 对应的 PCIe BDF、Host/segment 域和
+  //   global ID，在 identity 输出中发布 generation=1、epoch=0 的新对象；不修改快照。
+  // 失败/边界：快照未冻结、key/BDF/Global ID 不存在、VF parent 域不一致或配置失败时
+  //   返回错误并保持 identity 为 null；调用方只能在 status.ok() 时使用输出。
   static function rdma_status identity_from_snapshot(
     dpu_device_snapshot snapshot,
     input dpu_function_key_t key,
@@ -95,8 +99,10 @@ class rdma_dpu_identity_adapter extends uvm_object;
 
   // 功能：从冻结 device/resource snapshot 完整投影 Function identity 与 PCIe binding，
   //       包括真实 BAR、mailbox notify aperture、MSI-X、DMA segment 和队列能力上限。
-  // 输入/输出：snapshot/resources 必须相互引用一致；identity、binding 返回由调用方拥有的对象。
-  // 边界：缺失/重复/零长度 BAR、能力为零、VF parent 域不一致或最终 binding 校验失败时拒绝。
+  // 输入/输出及副作用：snapshot/resources/key（输入），identity/binding（输出）；从快照复制
+  //   BDF、BAR、DMA domain 和能力上限，构造新的 identity/binding，不修改输入快照。
+  // 失败/边界：缺失/重复/零长度 BAR、能力为零、VF parent 域不一致或最终 binding 校验失败时
+  //   返回错误；入口会清空输出，但晚期能力校验失败时调用方仍必须忽略非成功状态下的对象。
   static function rdma_status from_snapshot(
     dpu_device_snapshot snapshot,
     dpu_resource_snapshot resources,

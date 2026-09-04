@@ -8,10 +8,9 @@
 
 typedef class rdma_qpc_model;
 
-  // 功能：处理 rdma_clone_handle_value：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 source, copy_label 用于执行 rdma_clone_handle_value；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：rdma_clone_handle_value 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+// 功能：rdma_clone_handle_value 复制 source、copy_label 的受控字段并生成独立快照，供查询、编码或恢复使用；源对象保持不变。
+// 输入/输出及副作用：source（输入）、copy_label（输入）；rdma_clone_handle_value 读取 source、copy_label 并使用字段 cloned_object；函数返回 rdma_handle，不取得调用方资源所有权。
+// 失败/边界：rdma_clone_handle_value 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal，不保留部分有效快照。
 function automatic rdma_handle rdma_clone_handle_value(
   rdma_handle source,
   string copy_label
@@ -27,10 +26,9 @@ function automatic rdma_handle rdma_clone_handle_value(
   return cloned_handle;
 endfunction
 
-  // 功能：处理 rdma_clone_function_handle_value：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 source, copy_label 用于执行 rdma_clone_function_handle_value；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：rdma_clone_function_handle_value 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+// 功能：rdma_clone_function_handle_value 复制 source、copy_label 的受控字段并生成独立快照，供查询、编码或恢复使用；源对象保持不变。
+// 输入/输出及副作用：source（输入）、copy_label（输入）；rdma_clone_function_handle_value 读取 source、copy_label 并使用字段 cloned_object；函数返回 rdma_function_handle，不取得调用方资源所有权。
+// 失败/边界：rdma_clone_function_handle_value 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal，不保留部分有效快照。
 function automatic rdma_function_handle rdma_clone_function_handle_value(
   rdma_function_handle source,
   string copy_label
@@ -46,10 +44,10 @@ function automatic rdma_function_handle rdma_clone_function_handle_value(
   return cloned_handle;
 endfunction
 
-  // 功能：处理 rdma_ring_state_valid：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 producer_index, producer_wrap, consumer_index, consumer_wrap 用于执行 rdma_ring_state_valid；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：rdma_ring_state_valid 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+// 功能：rdma_ring_state_valid 比较 producer_index、producer_wrap、consumer_index、consumer_wrap 与当前 authority/状态字段，返回布尔结果供上层执行精确分支。
+// 输入/输出及副作用：producer_index（输入）、producer_wrap（输入）、consumer_index（输入）、consumer_wrap（输入）；rdma_ring_state_valid 读取 producer_index、producer_wrap、consumer_index、consumer_wrap 并使用输入参数和固定枚举/常量；函数返回 bit，不取得调用方资源所有权。
+
+// 失败/边界：rdma_ring_state_valid 先检查 producer_wrap == consumer_wrap，再返回 producer_index >= consumer_index；producer_index <= consumer_index；拒绝分支不提交部分状态，也不隐式重试。
 function automatic bit rdma_ring_state_valid(
   int unsigned producer_index,
   bit producer_wrap,
@@ -61,10 +59,10 @@ function automatic bit rdma_ring_state_valid(
   return producer_index <= consumer_index;
 endfunction
 
-  // 功能：处理 rdma_qp_projected_handle_status：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 projected_h, dependency_h, owner, expected_kind, label 用于执行 rdma_qp_projected_handle_status；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：rdma_qp_projected_handle_status 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+// 功能：rdma_qp_projected_handle_status 校验 projected_h、dependency_h、owner、expected_kind、label 与当前对象状态的一致性，并显式处理“handle kind is invalid”等拒绝条件，返回 rdma_status 供上层决定是否提交。
+// 输入/输出及副作用：projected_h（输入）、dependency_h（输入）、owner（输入）、expected_kind（输入）、label（输入）；rdma_qp_projected_handle_status 读取 projected_h、dependency_h、owner、expected_kind、label 并使用字段 status；函数返回 rdma_status，不取得调用方资源所有权。
+
+// 失败/边界：rdma_qp_projected_handle_status 返回 RDMA_SC_INVALID_ARGUMENT；失败路径不提交部分状态或转移未声明资源。
 function automatic rdma_status rdma_qp_projected_handle_status(
   rdma_handle projected_h,
   rdma_handle dependency_h,
@@ -87,10 +85,10 @@ function automatic rdma_status rdma_qp_projected_handle_status(
   return rdma_status::success();
 endfunction
 
-  // 功能：处理 rdma_qp_mapping_authority_status：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 backing_ref, owner, qp_h, label 用于执行 rdma_qp_mapping_authority_status；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：rdma_qp_mapping_authority_status 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+// 功能：rdma_qp_mapping_authority_status 校验 backing_ref、owner、qp_h、label 与当前对象状态的一致性，并显式处理“mapping authority is missing”等拒绝条件，返回 rdma_status 供上层决定是否提交。
+// 输入/输出及副作用：backing_ref（输入）、owner（输入）、qp_h（输入）、label（输入）；rdma_qp_mapping_authority_status 读取 backing_ref、owner、qp_h、label 并使用字段 rdma_status、function_h、owner_h、mapping、mapping.function_h；函数返回 rdma_status，不取得调用方资源所有权。
+
+// 失败/边界：rdma_qp_mapping_authority_status 返回 RDMA_SC_INVALID_STATE、RDMA_SC_INVALID_ARGUMENT；失败路径不提交部分状态或转移未声明资源。
 function automatic rdma_status rdma_qp_mapping_authority_status(
   rdma_qp_backing_ref backing_ref,
   rdma_function_handle owner,
@@ -126,10 +124,10 @@ endfunction
 // its public ring geometry is malformed.  Recovery-only references validate
 // only the identity needed to route cleanup plus the opaque completion query;
 // normal QP plans continue to use the strict geometry validator below.
-  // 功能：处理 rdma_qp_recovery_opaque_mapping_status：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 mapping, owner, qp_h, label 用于执行 rdma_qp_recovery_opaque_mapping_status；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：rdma_qp_recovery_opaque_mapping_status 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+// 功能：rdma_qp_recovery_opaque_mapping_status 校验 mapping、owner、qp_h、label 与当前对象状态的一致性，并显式处理“mapping authority is missing”等拒绝条件，返回 rdma_status 供上层决定是否提交。
+// 输入/输出及副作用：mapping（输入）、owner（输入）、qp_h（输入）、label（输入）；rdma_qp_recovery_opaque_mapping_status 读取 mapping、owner、qp_h、label 并使用字段 release_complete、status；函数返回 rdma_status，不取得调用方资源所有权。
+
+// 失败/边界：rdma_qp_recovery_opaque_mapping_status 返回 RDMA_SC_INVALID_STATE、RDMA_SC_INVALID_ARGUMENT；失败路径不提交部分状态或转移未声明资源。
 function automatic rdma_status rdma_qp_recovery_opaque_mapping_status(
   rdma_dma_mapping mapping,
   rdma_function_handle owner,
@@ -160,10 +158,10 @@ function automatic rdma_status rdma_qp_recovery_opaque_mapping_status(
   return rdma_status::success();
 endfunction
 
-  // 功能：处理 rdma_qp_partial_ref_status：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 backing_ref, expected_role, owner, qp_h, label 用于执行 rdma_qp_partial_ref_status；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：rdma_qp_partial_ref_status 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+// 功能：rdma_qp_partial_ref_status 校验 backing_ref、expected_role、owner、qp_h、label 与当前对象状态的一致性，并显式处理“clone failed”等拒绝条件，返回 rdma_status 供上层决定是否提交。
+// 输入/输出及副作用：backing_ref（输入）、expected_role（输入）、owner（输入）、qp_h（输入）、label（输入）；rdma_qp_partial_ref_status 读取 backing_ref、expected_role、owner、qp_h、label 并使用字段 cloned_object、mapping.state、status；函数返回 rdma_status，不取得调用方资源所有权。
+
+// 失败/边界：rdma_qp_partial_ref_status 返回 RDMA_SC_INVALID_STATE、RDMA_SC_INVALID_ARGUMENT；失败路径不提交部分状态或转移未声明资源。
 function automatic rdma_status rdma_qp_partial_ref_status(
   rdma_qp_backing_ref backing_ref,
   rdma_queue_backing_role_e expected_role,
@@ -215,10 +213,9 @@ function automatic rdma_status rdma_qp_partial_ref_status(
   return rdma_qp_mapping_authority_status(backing_ref, owner, qp_h, label);
 endfunction
 
-  // 功能：处理 rdma_qp_partial_plan_status：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 plan, owner, qp_h 用于执行 rdma_qp_partial_plan_status；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：rdma_qp_partial_plan_status 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+// 功能：rdma_qp_partial_plan_status 校验 plan、owner、qp_h 与当前对象状态的一致性，并显式处理“partial QP plan authority is null”等拒绝条件，返回 rdma_status 供上层决定是否提交。
+// 输入/输出及副作用：plan（输入）、owner（输入）、qp_h（输入）；rdma_qp_partial_plan_status 读取 plan、owner、qp_h 并使用字段 status；函数返回 rdma_status，不取得调用方资源所有权。
+// 失败/边界：rdma_qp_partial_plan_status 返回 RDMA_SC_INVALID_ARGUMENT、RDMA_SC_INVALID_STATE；典型拒绝条件为“partial QP plan authority is null”“partial QP plan metadata is invalid”；失败路径不提交部分状态或转移未声明资源。
 function automatic rdma_status rdma_qp_partial_plan_status(
   rdma_qp_backing_plan plan,
   rdma_function_handle owner,
@@ -366,10 +363,10 @@ function automatic rdma_status rdma_qp_partial_plan_status(
   return rdma_status::success();
 endfunction
 
-  // 功能：处理 rdma_qp_backing_projection_status：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 backing_ref, programmed_backing, label 用于执行 rdma_qp_backing_projection_status；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：rdma_qp_backing_projection_status 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+// 功能：rdma_qp_backing_projection_status 校验 backing_ref、programmed_backing、label 与当前对象状态的一致性，并显式处理“backing authority is missing”等拒绝条件，返回 rdma_status 供上层决定是否提交。
+// 输入/输出及副作用：backing_ref（输入）、programmed_backing（输入）、label（输入）；rdma_qp_backing_projection_status 读取 backing_ref、programmed_backing、label 并使用字段 effective_iova；函数返回 rdma_status，不取得调用方资源所有权。
+
+// 失败/边界：rdma_qp_backing_projection_status 返回 RDMA_SC_INVALID_STATE、RDMA_SC_DMA_TRANSLATION；失败路径不提交部分状态或转移未声明资源。
 function automatic rdma_status rdma_qp_backing_projection_status(
   rdma_qp_backing_ref backing_ref,
   rdma_backing_addr_t programmed_backing,
@@ -405,10 +402,9 @@ class rdma_resource extends uvm_object;
   rdma_hmc_fvm_addr_t hmc_fvm_addr;
   bit hmc_fvm_addr_valid;
 
-  // 功能：构造当前对象并初始化其字段、集合和 UVM 名称；不接管传入句柄的生命周期。
-  // 输入/输出及副作用：name 仅用于 UVM 对象命名；内部字段被初始化为安全默认值，传入句柄不转移所有权。
-  //   返回新对象实例；构造失败由 UVM 工厂或调用方处理。
-  // 失败/边界：不创建外部资源；name 为空时仍允许构造，但所有字段必须保持可配置的初始值。
+  // 功能：构造 rdma_resource，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：handle=null；owner=null；state=RDMA_RESOURCE_NEW；hmc_fvm_addr='0；hmc_fvm_addr_valid=1'b0。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_resource 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_resource");
     super.new(name);
     handle = null;
@@ -418,18 +414,16 @@ class rdma_resource extends uvm_object;
     hmc_fvm_addr_valid = 1'b0;
   endfunction
 
-  // 功能：处理 resource_kind：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 RDMA_RESOURCE_FUNCTION 用于执行 resource_kind；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：resource_kind 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：resource_kind 使用 当前对象字段 计算并返回 rdma_resource_kind_e 结果；不修改对象字段或外部资源。
+  // 输入/输出及副作用：无显式参数；resource_kind 读取固定返回值或局部计算结果，不使用对象成员字段；函数返回 rdma_resource_kind_e，不取得调用方资源所有权。
+  // 失败/边界：resource_kind 的结果直接由 return RDMA_RESOURCE_FUNCTION 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   virtual function rdma_resource_kind_e resource_kind();
     return RDMA_RESOURCE_FUNCTION;
   endfunction
 
-  // 功能：从源对象复制可变字段并生成独立值快照；源对象保持不变，类型不匹配时报告复制错误。
-  // 输入/输出及副作用：source/rhs 是源对象；返回或写入独立副本，不修改源对象。
-  //   source/rhs 为空或类型不匹配时返回空值或触发既定复制错误。
-  // 失败/边界：空源对象不应解引用；类型不匹配必须拒绝复制或按既定 UVM 规则报告 fatal。
+  // 功能：将 rhs 中 rdma_resource 的值字段复制到当前对象，建立与源对象隔离的快照。
+  // 输入/输出及副作用：rhs（输入）；rhs 是源对象；当前对象字段会被覆盖，嵌套句柄按实现执行 clone 或保持非拥有引用，源对象不被修改。
+  // 失败/边界：do_copy 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（resource copy type mismatch），不保留部分有效快照。
   virtual function void do_copy(uvm_object rhs);
     rdma_resource rhs_resource;
     uvm_object cloned_object;
@@ -479,10 +473,9 @@ class rdma_resource extends uvm_object;
     outstanding_ids = rhs_resource.outstanding_ids;
   endfunction
 
-  // 功能：检查输入字段、身份和生命周期约束，返回可诊断的校验状态；失败时不提交部分更新。
-  // 输入/输出及副作用：输入为待校验字段或快照；返回 rdma_status，校验过程不提交资源和游标。
-  //   空依赖、非法范围、身份不一致或非活动状态会返回错误。
-  // 失败/边界：任何非法枚举、越界字段、缺失必需依赖或身份/代际不一致都必须返回非成功状态。
+  // 功能：validate 校验 当前对象字段 与当前对象状态的一致性，并显式处理“resource state is invalid”等拒绝条件，返回 rdma_status 供上层决定是否提交。
+  // 输入/输出及副作用：无显式参数；validate 读取 对象字段：rdma_status、state、handle、handle.kind 并使用字段 status；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：validate 返回 RDMA_SC_INVALID_ARGUMENT；典型拒绝条件为“resource state is invalid”“resource handle kind is invalid”；失败路径不提交部分状态或转移未声明资源。
   virtual function rdma_status validate();
     rdma_status status;
 
@@ -520,10 +513,9 @@ class rdma_queue_resource extends rdma_resource;
   rdma_iova_t queue_iova;
   rdma_queue_backing_plan queue_plan;
 
-  // 功能：构造当前对象并初始化其字段、集合和 UVM 名称；不接管传入句柄的生命周期。
-  // 输入/输出及副作用：name 仅用于 UVM 对象命名；内部字段被初始化为安全默认值，传入句柄不转移所有权。
-  //   返回新对象实例；构造失败由 UVM 工厂或调用方处理。
-  // 失败/边界：不创建外部资源；name 为空时仍允许构造，但所有字段必须保持可配置的初始值。
+  // 功能：构造 rdma_queue_resource，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：depth='0；producer_index='0；consumer_index='0；producer_wrap=1'b0；consumer_wrap=1'b0；queue_iova='0；queue_plan=null。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_queue_resource 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_queue_resource");
     super.new(name);
     depth = '0;
@@ -535,10 +527,9 @@ class rdma_queue_resource extends rdma_resource;
     queue_plan = null;
   endfunction
 
-  // 功能：从源对象复制可变字段并生成独立值快照；源对象保持不变，类型不匹配时报告复制错误。
-  // 输入/输出及副作用：source/rhs 是源对象；返回或写入独立副本，不修改源对象。
-  //   source/rhs 为空或类型不匹配时返回空值或触发既定复制错误。
-  // 失败/边界：空源对象不应解引用；类型不匹配必须拒绝复制或按既定 UVM 规则报告 fatal。
+  // 功能：将 rhs 中 rdma_queue_resource 的值字段复制到当前对象，建立与源对象隔离的快照。
+  // 输入/输出及副作用：rhs（输入）；rhs 是源对象；当前对象字段会被覆盖，嵌套句柄按实现执行 clone 或保持非拥有引用，源对象不被修改。
+  // 失败/边界：do_copy 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（queue resource copy type mismatch），不保留部分有效快照。
   virtual function void do_copy(uvm_object rhs);
     rdma_queue_resource rhs_queue;
     uvm_object cloned_object;
@@ -565,10 +556,9 @@ class rdma_queue_resource extends rdma_resource;
     end
   endfunction
 
-  // 功能：检查输入字段、身份和生命周期约束，返回可诊断的校验状态；失败时不提交部分更新。
-  // 输入/输出及副作用：输入为待校验字段或快照；返回 rdma_status，校验过程不提交资源和游标。
-  //   空依赖、非法范围、身份不一致或非活动状态会返回错误。
-  // 失败/边界：任何非法枚举、越界字段、缺失必需依赖或身份/代际不一致都必须返回非成功状态。
+  // 功能：validate 校验 当前对象字段 与当前对象状态的一致性，并显式处理“queue authority must be represented only by the queue plan”；“queue depth is not a nonzero power of two”；“queue index is outside the queue depth”；“queue producer and consumer state is invalid”；“programmed queue plan is null”等拒绝条件，返回 rdma_status 供上层决定是否提交。
+  // 输入/输出及副作用：无显式参数；validate 读取 对象字段：rdma_status、state、depth、queue_plan、producer_index、consumer_index、producer_wrap、consumer_wrap 并使用字段 status、lifecycle_queue、plan_required；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：validate 返回 RDMA_SC_INVALID_STATE、RDMA_SC_INVALID_ARGUMENT；具体拒绝条件包括 “queue authority must be represented only by the queue plan”；“queue depth is not a nonzero power of two”；“queue index is outside the queue depth”；“queue producer and consumer state is invalid”；“programmed queue plan is null”；失败路径不提交部分状态、不隐式重试，也不转移未声明资源。
   virtual function rdma_status validate();
     rdma_status status;
     bit lifecycle_queue;
@@ -638,10 +628,9 @@ class rdma_function extends rdma_resource;
   int unsigned pfvf_id;
   rdma_function_binding binding;
 
-  // 功能：构造当前对象并初始化其字段、集合和 UVM 名称；不接管传入句柄的生命周期。
-  // 输入/输出及副作用：name 仅用于 UVM 对象命名；内部字段被初始化为安全默认值，传入句柄不转移所有权。
-  //   返回新对象实例；构造失败由 UVM 工厂或调用方处理。
-  // 失败/边界：不创建外部资源；name 为空时仍允许构造，但所有字段必须保持可配置的初始值。
+  // 功能：构造 rdma_function，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：local_function_id='0；global_function_id='0；rdma_vf_id='0；vsi_id='0；pfvf_id='0；binding=rdma_function_binding::type_id::create("binding")。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_function 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_function");
     super.new(name);
     local_function_id = '0;
@@ -652,18 +641,16 @@ class rdma_function extends rdma_resource;
     binding = rdma_function_binding::type_id::create("binding");
   endfunction
 
-  // 功能：处理 resource_kind：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 RDMA_RESOURCE_FUNCTION 用于执行 resource_kind；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：resource_kind 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：resource_kind 使用 当前对象字段 计算并返回 rdma_resource_kind_e 结果；不修改对象字段或外部资源。
+  // 输入/输出及副作用：无显式参数；resource_kind 读取固定返回值或局部计算结果，不使用对象成员字段；函数返回 rdma_resource_kind_e，不取得调用方资源所有权。
+  // 失败/边界：resource_kind 的结果直接由 return RDMA_RESOURCE_FUNCTION 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   virtual function rdma_resource_kind_e resource_kind();
     return RDMA_RESOURCE_FUNCTION;
   endfunction
 
-  // 功能：从源对象复制可变字段并生成独立值快照；源对象保持不变，类型不匹配时报告复制错误。
-  // 输入/输出及副作用：source/rhs 是源对象；返回或写入独立副本，不修改源对象。
-  //   source/rhs 为空或类型不匹配时返回空值或触发既定复制错误。
-  // 失败/边界：空源对象不应解引用；类型不匹配必须拒绝复制或按既定 UVM 规则报告 fatal。
+  // 功能：将 rhs 中 rdma_function 的值字段复制到当前对象，建立与源对象隔离的快照。
+  // 输入/输出及副作用：rhs（输入）；rhs 是源对象；当前对象字段会被覆盖，嵌套句柄按实现执行 clone 或保持非拥有引用，源对象不被修改。
+  // 失败/边界：do_copy 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（function resource copy type mismatch），不保留部分有效快照。
   virtual function void do_copy(uvm_object rhs);
     rdma_function rhs_function;
     uvm_object cloned_object;
@@ -686,10 +673,9 @@ class rdma_function extends rdma_resource;
     end
   endfunction
 
-  // 功能：检查输入字段、身份和生命周期约束，返回可诊断的校验状态；失败时不提交部分更新。
-  // 输入/输出及副作用：输入为待校验字段或快照；返回 rdma_status，校验过程不提交资源和游标。
-  //   空依赖、非法范围、身份不一致或非活动状态会返回错误。
-  // 失败/边界：任何非法枚举、越界字段、缺失必需依赖或身份/代际不一致都必须返回非成功状态。
+  // 功能：validate 校验 当前对象字段 与当前对象状态的一致性，并显式处理“function handle does not match its owner”等拒绝条件，返回 rdma_status 供上层决定是否提交。
+  // 输入/输出及副作用：无显式参数；validate 读取 对象字段：rdma_status、state、owner 并使用字段 status；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：validate 返回 RDMA_SC_INVALID_ARGUMENT；典型拒绝条件为“function handle does not match its owner”；失败路径不提交部分状态或转移未声明资源。
   virtual function rdma_status validate();
     rdma_status status;
 
@@ -709,28 +695,25 @@ class rdma_pd extends rdma_resource;
   int unsigned local_pd_id;
   int unsigned global_pd_id;
 
-  // 功能：构造当前对象并初始化其字段、集合和 UVM 名称；不接管传入句柄的生命周期。
-  // 输入/输出及副作用：name 仅用于 UVM 对象命名；内部字段被初始化为安全默认值，传入句柄不转移所有权。
-  //   返回新对象实例；构造失败由 UVM 工厂或调用方处理。
-  // 失败/边界：不创建外部资源；name 为空时仍允许构造，但所有字段必须保持可配置的初始值。
+  // 功能：构造 rdma_pd，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：local_pd_id='0；global_pd_id='0。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_pd 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_pd");
     super.new(name);
     local_pd_id = '0;
     global_pd_id = '0;
   endfunction
 
-  // 功能：处理 resource_kind：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 RDMA_RESOURCE_PD 用于执行 resource_kind；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：resource_kind 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：resource_kind 使用 当前对象字段 计算并返回 rdma_resource_kind_e 结果；不修改对象字段或外部资源。
+  // 输入/输出及副作用：无显式参数；resource_kind 读取固定返回值或局部计算结果，不使用对象成员字段；函数返回 rdma_resource_kind_e，不取得调用方资源所有权。
+  // 失败/边界：resource_kind 的结果直接由 return RDMA_RESOURCE_PD 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   virtual function rdma_resource_kind_e resource_kind();
     return RDMA_RESOURCE_PD;
   endfunction
 
-  // 功能：从源对象复制可变字段并生成独立值快照；源对象保持不变，类型不匹配时报告复制错误。
-  // 输入/输出及副作用：source/rhs 是源对象；返回或写入独立副本，不修改源对象。
-  //   source/rhs 为空或类型不匹配时返回空值或触发既定复制错误。
-  // 失败/边界：空源对象不应解引用；类型不匹配必须拒绝复制或按既定 UVM 规则报告 fatal。
+  // 功能：将 rhs 中 rdma_pd 的值字段复制到当前对象，建立与源对象隔离的快照。
+  // 输入/输出及副作用：rhs（输入）；rhs 是源对象；当前对象字段会被覆盖，嵌套句柄按实现执行 clone 或保持非拥有引用，源对象不被修改。
+  // 失败/边界：do_copy 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（PD resource copy type mismatch），不保留部分有效快照。
   virtual function void do_copy(uvm_object rhs);
     rdma_pd rhs_pd;
 
@@ -755,10 +738,9 @@ class rdma_mr extends rdma_resource;
   rdma_rdma_access_t access;
   bit [11:0] mr_serial;
 
-  // 功能：构造当前对象并初始化其字段、集合和 UVM 名称；不接管传入句柄的生命周期。
-  // 输入/输出及副作用：name 仅用于 UVM 对象命名；内部字段被初始化为安全默认值，传入句柄不转移所有权。
-  //   返回新对象实例；构造失败由 UVM 工厂或调用方处理。
-  // 失败/边界：不创建外部资源；name 为空时仍允许构造，但所有字段必须保持可配置的初始值。
+  // 功能：构造 rdma_mr，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：local_mr_id='0；global_mr_id='0；pd_h=null；iova='0；length='0；lkey='0；rkey='0；access='0；其余字段按实现默认值初始化。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_mr 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_mr");
     super.new(name);
     local_mr_id = '0;
@@ -772,18 +754,16 @@ class rdma_mr extends rdma_resource;
     mr_serial = '0;
   endfunction
 
-  // 功能：处理 resource_kind：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 RDMA_RESOURCE_MR 用于执行 resource_kind；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：resource_kind 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：resource_kind 使用 当前对象字段 计算并返回 rdma_resource_kind_e 结果；不修改对象字段或外部资源。
+  // 输入/输出及副作用：无显式参数；resource_kind 读取固定返回值或局部计算结果，不使用对象成员字段；函数返回 rdma_resource_kind_e，不取得调用方资源所有权。
+  // 失败/边界：resource_kind 的结果直接由 return RDMA_RESOURCE_MR 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   virtual function rdma_resource_kind_e resource_kind();
     return RDMA_RESOURCE_MR;
   endfunction
 
-  // 功能：从源对象复制可变字段并生成独立值快照；源对象保持不变，类型不匹配时报告复制错误。
-  // 输入/输出及副作用：source/rhs 是源对象；返回或写入独立副本，不修改源对象。
-  //   source/rhs 为空或类型不匹配时返回空值或触发既定复制错误。
-  // 失败/边界：空源对象不应解引用；类型不匹配必须拒绝复制或按既定 UVM 规则报告 fatal。
+  // 功能：将 rhs 中 rdma_mr 的值字段复制到当前对象，建立与源对象隔离的快照。
+  // 输入/输出及副作用：rhs（输入）；rhs 是源对象；当前对象字段会被覆盖，嵌套句柄按实现执行 clone 或保持非拥有引用，源对象不被修改。
+  // 失败/边界：do_copy 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（MR resource copy type mismatch），不保留部分有效快照。
   virtual function void do_copy(uvm_object rhs);
     rdma_mr rhs_mr;
 
@@ -801,10 +781,9 @@ class rdma_mr extends rdma_resource;
     mr_serial = rhs_mr.mr_serial;
   endfunction
 
-  // 功能：检查输入字段、身份和生命周期约束，返回可诊断的校验状态；失败时不提交部分更新。
-  // 输入/输出及副作用：输入为待校验字段或快照；返回 rdma_status，校验过程不提交资源和游标。
-  //   空依赖、非法范围、身份不一致或非活动状态会返回错误。
-  // 失败/边界：任何非法枚举、越界字段、缺失必需依赖或身份/代际不一致都必须返回非成功状态。
+  // 功能：validate 校验 当前对象字段 与当前对象状态的一致性，并显式处理“MR PD handle is invalid”等拒绝条件，返回 rdma_status 供上层决定是否提交。
+  // 输入/输出及副作用：无显式参数；validate 读取 对象字段：rdma_status、state、pd_h、pd_h.kind、length、local_mr_id、lkey、rkey 并使用字段 status、has_remote_access；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：validate 返回 RDMA_SC_INVALID_ARGUMENT；典型拒绝条件为“MR PD handle is invalid”“MR length is zero”；失败路径不提交部分状态或转移未声明资源。
   virtual function rdma_status validate();
     rdma_status status;
     bit has_remote_access;
@@ -847,10 +826,9 @@ class rdma_cq extends rdma_queue_resource;
   int unsigned cqe_size_bytes;
   rdma_handle ceq_h;
 
-  // 功能：构造当前对象并初始化其字段、集合和 UVM 名称；不接管传入句柄的生命周期。
-  // 输入/输出及副作用：name 仅用于 UVM 对象命名；内部字段被初始化为安全默认值，传入句柄不转移所有权。
-  //   返回新对象实例；构造失败由 UVM 工厂或调用方处理。
-  // 失败/边界：不创建外部资源；name 为空时仍允许构造，但所有字段必须保持可配置的初始值。
+  // 功能：构造 rdma_cq，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：local_cq_id='0；global_cq_id='0；cqe_size_bytes=64；ceq_h=null。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_cq 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_cq");
     super.new(name);
     local_cq_id = '0;
@@ -859,18 +837,16 @@ class rdma_cq extends rdma_queue_resource;
     ceq_h = null;
   endfunction
 
-  // 功能：处理 resource_kind：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 RDMA_RESOURCE_CQ 用于执行 resource_kind；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：resource_kind 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：resource_kind 使用 当前对象字段 计算并返回 rdma_resource_kind_e 结果；不修改对象字段或外部资源。
+  // 输入/输出及副作用：无显式参数；resource_kind 读取固定返回值或局部计算结果，不使用对象成员字段；函数返回 rdma_resource_kind_e，不取得调用方资源所有权。
+  // 失败/边界：resource_kind 的结果直接由 return RDMA_RESOURCE_CQ 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   virtual function rdma_resource_kind_e resource_kind();
     return RDMA_RESOURCE_CQ;
   endfunction
 
-  // 功能：从源对象复制可变字段并生成独立值快照；源对象保持不变，类型不匹配时报告复制错误。
-  // 输入/输出及副作用：source/rhs 是源对象；返回或写入独立副本，不修改源对象。
-  //   source/rhs 为空或类型不匹配时返回空值或触发既定复制错误。
-  // 失败/边界：空源对象不应解引用；类型不匹配必须拒绝复制或按既定 UVM 规则报告 fatal。
+  // 功能：将 rhs 中 rdma_cq 的值字段复制到当前对象，建立与源对象隔离的快照。
+  // 输入/输出及副作用：rhs（输入）；rhs 是源对象；当前对象字段会被覆盖，嵌套句柄按实现执行 clone 或保持非拥有引用，源对象不被修改。
+  // 失败/边界：do_copy 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（CQ resource copy type mismatch），不保留部分有效快照。
   virtual function void do_copy(uvm_object rhs);
     rdma_cq rhs_cq;
 
@@ -883,10 +859,9 @@ class rdma_cq extends rdma_queue_resource;
     ceq_h = rdma_clone_handle_value(rhs_cq.ceq_h, "CQ CEQ");
   endfunction
 
-  // 功能：检查输入字段、身份和生命周期约束，返回可诊断的校验状态；失败时不提交部分更新。
-  // 输入/输出及副作用：输入为待校验字段或快照；返回 rdma_status，校验过程不提交资源和游标。
-  //   空依赖、非法范围、身份不一致或非活动状态会返回错误。
-  // 失败/边界：任何非法枚举、越界字段、缺失必需依赖或身份/代际不一致都必须返回非成功状态。
+  // 功能：validate 校验 当前对象字段 与当前对象状态的一致性，并显式处理“CQ entry size is invalid”等拒绝条件，返回 rdma_status 供上层决定是否提交。
+  // 输入/输出及副作用：无显式参数；validate 读取 对象字段：rdma_status、state、cqe_size_bytes、ceq_h、ceq_h.kind 并使用字段 status；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：validate 返回 RDMA_SC_INVALID_ARGUMENT；典型拒绝条件为“CQ entry size is invalid”“CQ CEQ handle is invalid”；失败路径不提交部分状态或转移未声明资源。
   virtual function rdma_status validate();
     rdma_status status;
 
@@ -938,10 +913,9 @@ class rdma_qp extends rdma_resource;
   rdma_qp_backing_plan qp_plan;
   rdma_qpc_model programmed_qpc;
 
-  // 功能：构造当前对象并初始化其字段、集合和 UVM 名称；不接管传入句柄的生命周期。
-  // 输入/输出及副作用：name 仅用于 UVM 对象命名；内部字段被初始化为安全默认值，传入句柄不转移所有权。
-  //   返回新对象实例；构造失败由 UVM 工厂或调用方处理。
-  // 失败/边界：不创建外部资源；name 为空时仍允许构造，但所有字段必须保持可配置的初始值。
+  // 功能：构造 rdma_qp，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：local_qp_id='0；global_qp_id='0；transport=RDMA_TRANSPORT_RC；qp_state=RDMA_QPS_RESET；sq_depth='0；rq_depth='0；max_send_sge=0；max_recv_sge=0；其余字段按实现默认值初始化。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_qp 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_qp");
     super.new(name);
     local_qp_id = '0;
@@ -969,18 +943,16 @@ class rdma_qp extends rdma_resource;
     programmed_qpc = null;
   endfunction
 
-  // 功能：处理 resource_kind：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 RDMA_RESOURCE_QP 用于执行 resource_kind；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：resource_kind 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：resource_kind 使用 当前对象字段 计算并返回 rdma_resource_kind_e 结果；不修改对象字段或外部资源。
+  // 输入/输出及副作用：无显式参数；resource_kind 读取固定返回值或局部计算结果，不使用对象成员字段；函数返回 rdma_resource_kind_e，不取得调用方资源所有权。
+  // 失败/边界：resource_kind 的结果直接由 return RDMA_RESOURCE_QP 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   virtual function rdma_resource_kind_e resource_kind();
     return RDMA_RESOURCE_QP;
   endfunction
 
-  // 功能：从源对象复制可变字段并生成独立值快照；源对象保持不变，类型不匹配时报告复制错误。
-  // 输入/输出及副作用：source/rhs 是源对象；返回或写入独立副本，不修改源对象。
-  //   source/rhs 为空或类型不匹配时返回空值或触发既定复制错误。
-  // 失败/边界：空源对象不应解引用；类型不匹配必须拒绝复制或按既定 UVM 规则报告 fatal。
+  // 功能：将 rhs 中 rdma_qp 的值字段复制到当前对象，建立与源对象隔离的快照。
+  // 输入/输出及副作用：rhs（输入）；rhs 是源对象；当前对象字段会被覆盖，嵌套句柄按实现执行 clone 或保持非拥有引用，源对象不被修改。
+  // 失败/边界：do_copy 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（QP resource copy type mismatch），不保留部分有效快照。
   virtual function void do_copy(uvm_object rhs);
     rdma_qp rhs_qp;
 
@@ -1027,10 +999,9 @@ class rdma_qp extends rdma_resource;
     end
   endfunction
 
-  // 功能：检查输入字段、身份和生命周期约束，返回可诊断的校验状态；失败时不提交部分更新。
-  // 输入/输出及副作用：输入为待校验字段或快照；返回 rdma_status，校验过程不提交资源和游标。
-  //   空依赖、非法范围、身份不一致或非活动状态会返回错误。
-  // 失败/边界：任何非法枚举、越界字段、缺失必需依赖或身份/代际不一致都必须返回非成功状态。
+  // 功能：validate 校验 当前对象字段 与当前对象状态的一致性，并显式处理“QP depth is not a nonzero power of two”等拒绝条件，返回 rdma_status 供上层决定是否提交。
+  // 输入/输出及副作用：无显式参数；validate 读取 对象字段：rdma_status、sq_depth、sq_producer_index、sq_consumer_index、rq_producer_index、rq_depth、rq_consumer_index、sq_wrap 并使用字段 status；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：validate 返回 RDMA_SC_INVALID_ARGUMENT、RDMA_SC_INVALID_STATE；典型拒绝条件为“QP depth is not a nonzero power of two”“QP queue index is outside the queue depth”；失败路径不提交部分状态或转移未声明资源。
   virtual function rdma_status validate();
     rdma_status status;
 
@@ -1270,10 +1241,9 @@ class rdma_srq extends rdma_queue_resource;
   int unsigned limit_threshold;
   rdma_handle pd_h;
 
-  // 功能：构造当前对象并初始化其字段、集合和 UVM 名称；不接管传入句柄的生命周期。
-  // 输入/输出及副作用：name 仅用于 UVM 对象命名；内部字段被初始化为安全默认值，传入句柄不转移所有权。
-  //   返回新对象实例；构造失败由 UVM 工厂或调用方处理。
-  // 失败/边界：不创建外部资源；name 为空时仍允许构造，但所有字段必须保持可配置的初始值。
+  // 功能：构造 rdma_srq，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：local_srq_id='0；global_srq_id='0；max_sge='0；limit_threshold=16；pd_h=null。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_srq 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_srq");
     super.new(name);
     local_srq_id = '0;
@@ -1283,18 +1253,16 @@ class rdma_srq extends rdma_queue_resource;
     pd_h = null;
   endfunction
 
-  // 功能：处理 resource_kind：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 RDMA_RESOURCE_SRQ 用于执行 resource_kind；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：resource_kind 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：resource_kind 使用 当前对象字段 计算并返回 rdma_resource_kind_e 结果；不修改对象字段或外部资源。
+  // 输入/输出及副作用：无显式参数；resource_kind 读取固定返回值或局部计算结果，不使用对象成员字段；函数返回 rdma_resource_kind_e，不取得调用方资源所有权。
+  // 失败/边界：resource_kind 的结果直接由 return RDMA_RESOURCE_SRQ 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   virtual function rdma_resource_kind_e resource_kind();
     return RDMA_RESOURCE_SRQ;
   endfunction
 
-  // 功能：从源对象复制可变字段并生成独立值快照；源对象保持不变，类型不匹配时报告复制错误。
-  // 输入/输出及副作用：source/rhs 是源对象；返回或写入独立副本，不修改源对象。
-  //   source/rhs 为空或类型不匹配时返回空值或触发既定复制错误。
-  // 失败/边界：空源对象不应解引用；类型不匹配必须拒绝复制或按既定 UVM 规则报告 fatal。
+  // 功能：将 rhs 中 rdma_srq 的值字段复制到当前对象，建立与源对象隔离的快照。
+  // 输入/输出及副作用：rhs（输入）；rhs 是源对象；当前对象字段会被覆盖，嵌套句柄按实现执行 clone 或保持非拥有引用，源对象不被修改。
+  // 失败/边界：do_copy 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（SRQ resource copy type mismatch），不保留部分有效快照。
   virtual function void do_copy(uvm_object rhs);
     rdma_srq rhs_srq;
 
@@ -1308,10 +1276,9 @@ class rdma_srq extends rdma_queue_resource;
     pd_h = rdma_clone_handle_value(rhs_srq.pd_h, "SRQ PD");
   endfunction
 
-  // 功能：检查输入字段、身份和生命周期约束，返回可诊断的校验状态；失败时不提交部分更新。
-  // 输入/输出及副作用：输入为待校验字段或快照；返回 rdma_status，校验过程不提交资源和游标。
-  //   空依赖、非法范围、身份不一致或非活动状态会返回错误。
-  // 失败/边界：任何非法枚举、越界字段、缺失必需依赖或身份/代际不一致都必须返回非成功状态。
+  // 功能：validate 校验 当前对象字段 与当前对象状态的一致性，并显式处理“SRQ PD handle is invalid”等拒绝条件，返回 rdma_status 供上层决定是否提交。
+  // 输入/输出及副作用：无显式参数；validate 读取 对象字段：rdma_status、state、pd_h、pd_h.kind、max_sge、limit_threshold、depth 并使用字段 status；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：validate 返回 RDMA_SC_INVALID_ARGUMENT；典型拒绝条件为“SRQ PD handle is invalid”“SRQ maximum SGE count is zero”；失败路径不提交部分状态或转移未声明资源。
   virtual function rdma_status validate();
     rdma_status status;
 
@@ -1349,10 +1316,9 @@ class rdma_ceq extends rdma_queue_resource;
   int unsigned hardware_vector;
   int unsigned msix_table_index;
 
-  // 功能：构造当前对象并初始化其字段、集合和 UVM 名称；不接管传入句柄的生命周期。
-  // 输入/输出及副作用：name 仅用于 UVM 对象命名；内部字段被初始化为安全默认值，传入句柄不转移所有权。
-  //   返回新对象实例；构造失败由 UVM 工厂或调用方处理。
-  // 失败/边界：不创建外部资源；name 为空时仍允许构造，但所有字段必须保持可配置的初始值。
+  // 功能：构造 rdma_ceq，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：local_ceq_id='0；global_ceq_id='0；function_local_vector='0；hardware_vector='0；msix_table_index='0。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_ceq 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_ceq");
     super.new(name);
     local_ceq_id = '0;
@@ -1362,18 +1328,16 @@ class rdma_ceq extends rdma_queue_resource;
     msix_table_index = '0;
   endfunction
 
-  // 功能：处理 resource_kind：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 RDMA_RESOURCE_CEQ 用于执行 resource_kind；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：resource_kind 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：resource_kind 使用 当前对象字段 计算并返回 rdma_resource_kind_e 结果；不修改对象字段或外部资源。
+  // 输入/输出及副作用：无显式参数；resource_kind 读取固定返回值或局部计算结果，不使用对象成员字段；函数返回 rdma_resource_kind_e，不取得调用方资源所有权。
+  // 失败/边界：resource_kind 的结果直接由 return RDMA_RESOURCE_CEQ 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   virtual function rdma_resource_kind_e resource_kind();
     return RDMA_RESOURCE_CEQ;
   endfunction
 
-  // 功能：从源对象复制可变字段并生成独立值快照；源对象保持不变，类型不匹配时报告复制错误。
-  // 输入/输出及副作用：source/rhs 是源对象；返回或写入独立副本，不修改源对象。
-  //   source/rhs 为空或类型不匹配时返回空值或触发既定复制错误。
-  // 失败/边界：空源对象不应解引用；类型不匹配必须拒绝复制或按既定 UVM 规则报告 fatal。
+  // 功能：将 rhs 中 rdma_ceq 的值字段复制到当前对象，建立与源对象隔离的快照。
+  // 输入/输出及副作用：rhs（输入）；rhs 是源对象；当前对象字段会被覆盖，嵌套句柄按实现执行 clone 或保持非拥有引用，源对象不被修改。
+  // 失败/边界：do_copy 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（CEQ resource copy type mismatch），不保留部分有效快照。
   virtual function void do_copy(uvm_object rhs);
     rdma_ceq rhs_ceq;
 
@@ -1397,10 +1361,9 @@ class rdma_aeq extends rdma_queue_resource;
   int unsigned hardware_vector;
   int unsigned msix_table_index;
 
-  // 功能：构造当前对象并初始化其字段、集合和 UVM 名称；不接管传入句柄的生命周期。
-  // 输入/输出及副作用：name 仅用于 UVM 对象命名；内部字段被初始化为安全默认值，传入句柄不转移所有权。
-  //   返回新对象实例；构造失败由 UVM 工厂或调用方处理。
-  // 失败/边界：不创建外部资源；name 为空时仍允许构造，但所有字段必须保持可配置的初始值。
+  // 功能：构造 rdma_aeq，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：local_aeq_id='0；global_aeq_id='0；function_local_vector='0；hardware_vector='0；msix_table_index='0。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_aeq 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_aeq");
     super.new(name);
     local_aeq_id = '0;
@@ -1410,18 +1373,16 @@ class rdma_aeq extends rdma_queue_resource;
     msix_table_index = '0;
   endfunction
 
-  // 功能：处理 resource_kind：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 RDMA_RESOURCE_AEQ 用于执行 resource_kind；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：resource_kind 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：resource_kind 使用 当前对象字段 计算并返回 rdma_resource_kind_e 结果；不修改对象字段或外部资源。
+  // 输入/输出及副作用：无显式参数；resource_kind 读取固定返回值或局部计算结果，不使用对象成员字段；函数返回 rdma_resource_kind_e，不取得调用方资源所有权。
+  // 失败/边界：resource_kind 的结果直接由 return RDMA_RESOURCE_AEQ 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   virtual function rdma_resource_kind_e resource_kind();
     return RDMA_RESOURCE_AEQ;
   endfunction
 
-  // 功能：从源对象复制可变字段并生成独立值快照；源对象保持不变，类型不匹配时报告复制错误。
-  // 输入/输出及副作用：source/rhs 是源对象；返回或写入独立副本，不修改源对象。
-  //   source/rhs 为空或类型不匹配时返回空值或触发既定复制错误。
-  // 失败/边界：空源对象不应解引用；类型不匹配必须拒绝复制或按既定 UVM 规则报告 fatal。
+  // 功能：将 rhs 中 rdma_aeq 的值字段复制到当前对象，建立与源对象隔离的快照。
+  // 输入/输出及副作用：rhs（输入）；rhs 是源对象；当前对象字段会被覆盖，嵌套句柄按实现执行 clone 或保持非拥有引用，源对象不被修改。
+  // 失败/边界：do_copy 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（AEQ resource copy type mismatch），不保留部分有效快照。
   virtual function void do_copy(uvm_object rhs);
     rdma_aeq rhs_aeq;
 
@@ -1447,10 +1408,9 @@ class rdma_cmq extends rdma_queue_resource;
   bit completion_consumer_wrap;
   rdma_iova_t completion_iova;
 
-  // 功能：构造当前对象并初始化其字段、集合和 UVM 名称；不接管传入句柄的生命周期。
-  // 输入/输出及副作用：name 仅用于 UVM 对象命名；内部字段被初始化为安全默认值，传入句柄不转移所有权。
-  //   返回新对象实例；构造失败由 UVM 工厂或调用方处理。
-  // 失败/边界：不创建外部资源；name 为空时仍允许构造，但所有字段必须保持可配置的初始值。
+  // 功能：构造 rdma_cmq，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：local_cmq_id='0；global_cmq_id='0；completion_producer_index='0；completion_consumer_index='0；completion_wrap=1'b0；completion_consumer_wrap=1'b0；completion_iova='0。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_cmq 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_cmq");
     super.new(name);
     local_cmq_id = '0;
@@ -1462,18 +1422,16 @@ class rdma_cmq extends rdma_queue_resource;
     completion_iova = '0;
   endfunction
 
-  // 功能：处理 resource_kind：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 RDMA_RESOURCE_CMQ 用于执行 resource_kind；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：resource_kind 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：resource_kind 使用 当前对象字段 计算并返回 rdma_resource_kind_e 结果；不修改对象字段或外部资源。
+  // 输入/输出及副作用：无显式参数；resource_kind 读取固定返回值或局部计算结果，不使用对象成员字段；函数返回 rdma_resource_kind_e，不取得调用方资源所有权。
+  // 失败/边界：resource_kind 的结果直接由 return RDMA_RESOURCE_CMQ 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   virtual function rdma_resource_kind_e resource_kind();
     return RDMA_RESOURCE_CMQ;
   endfunction
 
-  // 功能：从源对象复制可变字段并生成独立值快照；源对象保持不变，类型不匹配时报告复制错误。
-  // 输入/输出及副作用：source/rhs 是源对象；返回或写入独立副本，不修改源对象。
-  //   source/rhs 为空或类型不匹配时返回空值或触发既定复制错误。
-  // 失败/边界：空源对象不应解引用；类型不匹配必须拒绝复制或按既定 UVM 规则报告 fatal。
+  // 功能：将 rhs 中 rdma_cmq 的值字段复制到当前对象，建立与源对象隔离的快照。
+  // 输入/输出及副作用：rhs（输入）；rhs 是源对象；当前对象字段会被覆盖，嵌套句柄按实现执行 clone 或保持非拥有引用，源对象不被修改。
+  // 失败/边界：do_copy 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（CMQ resource copy type mismatch），不保留部分有效快照。
   virtual function void do_copy(uvm_object rhs);
     rdma_cmq rhs_cmq;
 
@@ -1489,10 +1447,9 @@ class rdma_cmq extends rdma_queue_resource;
     completion_iova = rhs_cmq.completion_iova;
   endfunction
 
-  // 功能：检查输入字段、身份和生命周期约束，返回可诊断的校验状态；失败时不提交部分更新。
-  // 输入/输出及副作用：输入为待校验字段或快照；返回 rdma_status，校验过程不提交资源和游标。
-  //   空依赖、非法范围、身份不一致或非活动状态会返回错误。
-  // 失败/边界：任何非法枚举、越界字段、缺失必需依赖或身份/代际不一致都必须返回非成功状态。
+  // 功能：validate 校验 当前对象字段 与当前对象状态的一致性，并显式处理“CMQ completion index is outside the queue depth”；“CMQ completion producer and consumer state is invalid”等拒绝条件，返回 rdma_status 供上层决定是否提交。
+  // 输入/输出及副作用：无显式参数；validate 读取 对象字段：rdma_status、completion_producer_index、depth、completion_consumer_index、completion_wrap、completion_consumer_wrap 并使用字段 status；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：validate 返回 RDMA_SC_INVALID_ARGUMENT；具体拒绝条件包括 “CMQ completion index is outside the queue depth”；“CMQ completion producer and consumer state is invalid”；失败路径不提交部分状态、不隐式重试，也不转移未声明资源。
   virtual function rdma_status validate();
     rdma_status status;
 

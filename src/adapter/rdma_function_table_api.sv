@@ -8,63 +8,56 @@
 
 virtual class rdma_function_table_api extends uvm_object;
 
-  // 功能：构造当前对象并初始化其字段、集合和 UVM 名称；不接管传入句柄的生命周期。
-  // 输入/输出及副作用：name 仅用于 UVM 对象命名；内部字段被初始化为安全默认值，传入句柄不转移所有权。
-  //   返回新对象实例；构造失败由 UVM 工厂或调用方处理。
-  // 失败/边界：不创建外部资源；name 为空时仍允许构造，但所有字段必须保持可配置的初始值。
+  // 功能：构造 rdma_function_table_api，调用 super.new 建立 UVM 层级对象；外部依赖字段保持未绑定，后续由 configure/build/activate 明确注入。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_function_table_api 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_function_table_api");
     super.new(name);
   endfunction
 
-  // 功能：把 program_notify 的配置或编程请求提交到后端适配器，并返回后端确认状态。
-  // 输入/输出及副作用：参数 binding, status 用于执行 program_notify；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：program_notify 的后端拒绝或超时时不推进本地配置游标，ambiguous 提交必须进入恢复路径。
+  // 功能：在 rdma_function_table_api 中，program_notify 把 program_notify 的配置/编程请求提交到后端适配器，并返回后端确认状态。
+  // 输入/输出及副作用：binding（输入）、status（输出）；program_notify 驱动下游事务，并写入 status；函数返回 无直接返回值，不取得调用方资源所有权。
+  // 失败/边界：program_notify 遇到后端拒绝、范围溢出或 DMA 权限不足时保留失败证据，不推进本地游标。
   pure virtual task program_notify(
     rdma_function_binding binding,
     output rdma_status status
   );
 
-  // 功能：按资源所有权和幂等规则释放或清理记录；重复释放不会再次扣减 credit，也不触碰已隔离资源。
-  // 输入/输出及副作用：输入为待解除或释放的 handle/key；成功后隔离或删除本对象记录，外部拥有者仍负责真正销毁。
-  //   空值、未知记录或重复调用按接口约定返回错误或幂等成功。
-  // 失败/边界：不得释放非本对象所有资源；重复解除按幂等约定处理，旧 handle 不得重新激活。
+  // 功能：在 rdma_function_table_api 中，clear_notify 按 owner、generation 和幂等规则释放/隔离记录，并同步删除其账本引用。
+  // 输入/输出及副作用：binding（输入）、status（输出）；输入 action/epoch/handle 决定迁移目标；成功时更新状态或恢复证据，外部资源仍由其拥有者管理。
+  // 失败/边界：clear_notify 发现 owner/generation 不匹配、记录未知或重复释放时返回错误或幂等结果，不重新激活旧句柄。
   pure virtual task clear_notify(
     rdma_function_binding binding,
     output rdma_status status
   );
 
-  // 功能：把 program_dmi 的配置或编程请求提交到后端适配器，并返回后端确认状态。
-  // 输入/输出及副作用：参数 binding, status 用于执行 program_dmi；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：program_dmi 的后端拒绝或超时时不推进本地配置游标，ambiguous 提交必须进入恢复路径。
+  // 功能：在 rdma_function_table_api 中，program_dmi 把 program_dmi 的配置/编程请求提交到后端适配器，并返回后端确认状态。
+  // 输入/输出及副作用：binding（输入）、status（输出）；program_dmi 驱动下游事务，并写入 status；函数返回 无直接返回值，不取得调用方资源所有权。
+  // 失败/边界：program_dmi 遇到后端拒绝、范围溢出或 DMA 权限不足时保留失败证据，不推进本地游标。
   pure virtual task program_dmi(
     rdma_function_binding binding,
     output rdma_status status
   );
 
-  // 功能：按资源所有权和幂等规则释放或清理记录；重复释放不会再次扣减 credit，也不触碰已隔离资源。
-  // 输入/输出及副作用：输入为待解除或释放的 handle/key；成功后隔离或删除本对象记录，外部拥有者仍负责真正销毁。
-  //   空值、未知记录或重复调用按接口约定返回错误或幂等成功。
-  // 失败/边界：不得释放非本对象所有资源；重复解除按幂等约定处理，旧 handle 不得重新激活。
+  // 功能：在 rdma_function_table_api 中，clear_dmi 按 owner、generation 和幂等规则释放/隔离记录，并同步删除其账本引用。
+  // 输入/输出及副作用：binding（输入）、status（输出）；输入 action/epoch/handle 决定迁移目标；成功时更新状态或恢复证据，外部资源仍由其拥有者管理。
+  // 失败/边界：clear_dmi 发现 owner/generation 不匹配、记录未知或重复释放时返回错误或幂等结果，不重新激活旧句柄。
   pure virtual task clear_dmi(
     rdma_function_binding binding,
     output rdma_status status
   );
 
-  // 功能：把 program_vft 的配置或编程请求提交到后端适配器，并返回后端确认状态。
-  // 输入/输出及副作用：参数 binding, status 用于执行 program_vft；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：program_vft 的后端拒绝或超时时不推进本地配置游标，ambiguous 提交必须进入恢复路径。
+  // 功能：在 rdma_function_table_api 中，program_vft 把 program_vft 的配置/编程请求提交到后端适配器，并返回后端确认状态。
+  // 输入/输出及副作用：binding（输入）、status（输出）；program_vft 驱动下游事务，并写入 status；函数返回 无直接返回值，不取得调用方资源所有权。
+  // 失败/边界：program_vft 遇到后端拒绝、范围溢出或 DMA 权限不足时保留失败证据，不推进本地游标。
   pure virtual task program_vft(
     rdma_function_binding binding,
     output rdma_status status
   );
 
-  // 功能：按资源所有权和幂等规则释放或清理记录；重复释放不会再次扣减 credit，也不触碰已隔离资源。
-  // 输入/输出及副作用：输入为待解除或释放的 handle/key；成功后隔离或删除本对象记录，外部拥有者仍负责真正销毁。
-  //   空值、未知记录或重复调用按接口约定返回错误或幂等成功。
-  // 失败/边界：不得释放非本对象所有资源；重复解除按幂等约定处理，旧 handle 不得重新激活。
+  // 功能：在 rdma_function_table_api 中，clear_vft 按 owner、generation 和幂等规则释放/隔离记录，并同步删除其账本引用。
+  // 输入/输出及副作用：binding（输入）、status（输出）；输入 action/epoch/handle 决定迁移目标；成功时更新状态或恢复证据，外部资源仍由其拥有者管理。
+  // 失败/边界：clear_vft 发现 owner/generation 不匹配、记录未知或重复释放时返回错误或幂等结果，不重新激活旧句柄。
   pure virtual task clear_vft(
     rdma_function_binding binding,
     output rdma_status status

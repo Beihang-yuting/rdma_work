@@ -27,10 +27,9 @@ class rdma_control_plane_cmq_engine_responder_pcie extends rdma_mock_pcie;
   int unsigned observed_doorbell_pis[$];
   bit observed_doorbell_polarities[$];
 
-  // 功能：构造当前对象并初始化其字段、集合和 UVM 名称；不接管传入句柄的生命周期。
-  // 输入/输出及副作用：name 仅用于 UVM 对象命名；内部字段被初始化为安全默认值，传入句柄不转移所有权。
-  //   返回新对象实例；构造失败由 UVM 工厂或调用方处理。
-  // 失败/边界：不创建外部资源；name 为空时仍允许构造，但所有字段必须保持可配置的初始值。
+  // 功能：构造 rdma_control_plane_cmq_engine_responder_pcie，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：host_mem=null；cmq_mapping=null；expected_function=null；expected_doorbell_address='0；sq_sequence=0；cq_sequence=0。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_control_plane_cmq_engine_responder_pcie 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(
     string name = "rdma_control_plane_cmq_engine_responder_pcie"
   );
@@ -43,10 +42,10 @@ class rdma_control_plane_cmq_engine_responder_pcie extends rdma_mock_pcie;
     cq_sequence = 0;
   endfunction
 
-  // 功能：校验依赖并建立该对象的运行边界，成功后保存必要的非拥有引用；拒绝不完整或重复配置。
-  // 输入/输出及副作用：接收 manager、binding、router 或 profile 等依赖；成功后保存非拥有引用并更新配置状态。
-  //   任一依赖为空、重复配置或代际不匹配时保持原状态并返回错误。
-  // 失败/边界：配置失败不得写入半成品引用；已激活对象不得被无条件降级或重复占用资源。
+  // 功能：在 rdma_control_plane_cmq_engine_responder_pcie 中，configure_responder 校验依赖和 binding 后建立运行边界，只保存非拥有引用并拒绝重复配置。
+  // 输入/输出及副作用：host_mem_arg（输入）、cmq_mapping_arg（输入）、binding（输入）；configure_responder 先依据 host_mem_arg == null || cmq_mapping_arg == null || binding == null；cmq_mapping_arg.state != RDMA_MAPPING_ACTIVE || cmq_mapping_arg.size != 4096 校验 host_mem_arg、cmq_mapping_arg、binding；成功时更新本对象配置/状态并保存非拥有引用，返回
+  //   rdma_status。
+  // 失败/边界：实现中的空依赖、重复登记、状态或 generation/authority 校验失败时返回错误；失败时保留旧配置。
   function rdma_status configure_responder(
     rdma_mock_host_mem host_mem_arg,
     rdma_dma_mapping cmq_mapping_arg,
@@ -68,7 +67,7 @@ class rdma_control_plane_cmq_engine_responder_pcie extends rdma_mock_pcie;
     cmq_mapping = cmq_mapping_arg;
     expected_function = binding.make_handle();
     expected_doorbell_address.value =
-      binding.notify_base.value + XTR_V1_DB_CMQ_OFFSET;
+      binding.notify_base.value + RDMA_DB_CMQ_OFFSET;
     observed_opcodes.delete();
     observed_wqe_indices.delete();
     observed_wqe_wraps.delete();
@@ -80,10 +79,9 @@ class rdma_control_plane_cmq_engine_responder_pcie extends rdma_mock_pcie;
     return rdma_status::success();
   endfunction
 
-  // 功能：处理 big_endian_qword0：依据其参数完成所属层的具体协议动作，并保持返回状态、游标和资源所有权一致。
-  // 输入/输出及副作用：参数 value 用于执行 big_endian_qword0；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：big_endian_qword0 只接受其签名声明的输入；缺少必要字段时返回错误，成功路径不得隐式修改无关资源。
+  // 功能：在 rdma_control_plane_cmq_engine_responder_pcie 中，big_endian_qword0 按 golden 文件格式解析/规范化字节或文本，得到稳定的比较输入。
+  // 输入/输出及副作用：data（输入）；big_endian_qword0 读取 data 并使用字段 value；函数返回 bit [63:0]，不取得调用方资源所有权。
+  // 失败/边界：big_endian_qword0 先检查 data.size(，再返回 value；拒绝分支不提交部分状态，也不隐式重试。
   function automatic bit [63:0] big_endian_qword0(byte data[]);
     bit [63:0] value;
 
@@ -95,10 +93,9 @@ class rdma_control_plane_cmq_engine_responder_pcie extends rdma_mock_pcie;
     return value;
   endfunction
 
-  // 功能：依据输入请求创建对应的值对象或资源计划，并校验依赖、所有权和生命周期后返回结果。
-  // 输入/输出及副作用：输入请求、容量和依赖用于构造/预留资源；返回独立对象或状态，不暴露内部可变集合。
-  //   参数越界、容量不足或构造中途失败时回滚已登记的局部状态。
-  // 失败/边界：依赖为空、参数越界、容量不足或构造步骤失败时清理局部结果并返回明确错误。
+  // 功能：make_xtr_success_cqe 创建独立的 rdma_hw_image；根据 opcode、wqe_index、wrap、owner、generation 设置字段 image、image.length、image.alignment、image.endian、image.image_kind、image.hardware_version、image.function_generation、image.write_target_kind、qword0、i，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：opcode（输入）、wqe_index（输入）、wrap（输入）、owner（输入）、generation（输入）；make_xtr_success_cqe 读取 opcode、wqe_index、wrap、owner、generation 并使用字段 image、image.length、image.alignment、image.endian、image.image_kind、image.hardware_version、image.function_generation、image.write_target_kind；函数返回 rdma_hw_image，不取得调用方资源所有权。
+  // 失败/边界：make_xtr_success_cqe 的结果直接由 return image 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function automatic rdma_hw_image make_xtr_success_cqe(
     bit [7:0] opcode,
     bit [4:0] wqe_index,
@@ -128,10 +125,9 @@ class rdma_control_plane_cmq_engine_responder_pcie extends rdma_mock_pcie;
     return image;
   endfunction
 
-  // 功能：向指定后端写入请求数据并保留返回状态；写入失败时不推进本地提交游标。
-  // 输入/输出及副作用：参数 function_h, address, data, status 用于执行 mmio_write；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：后端拒绝或写入范围越界时不推进本地提交游标，也不伪造成功状态。
+  // 功能：在 rdma_control_plane_cmq_engine_responder_pcie 中，mmio_write 把请求数据写入指定后端并保留返回状态；只有写入成功才允许本地游标继续推进。
+  // 输入/输出及副作用：function_h（输入）、address（输入）、data（输入）、status（输出）；mmio_write 驱动下游事务，并写入 status；函数返回 无直接返回值，不取得调用方资源所有权。
+  // 失败/边界：mmio_write 遇到后端拒绝、范围溢出或 DMA 权限不足时保留失败证据，不推进本地游标。
   virtual task mmio_write(
     rdma_function_handle function_h,
     rdma_bar_addr_t address,
@@ -198,9 +194,9 @@ class rdma_control_plane_cmq_engine_responder_pcie extends rdma_mock_pcie;
     if (sqe_qword0[63] != !wqe_wrap ||
         wqe_index != (sq_sequence % CMQ_DEPTH) ||
         wqe_wrap != ((sq_sequence / CMQ_DEPTH) & 1'b1) ||
-        !(opcode inside {XTR_V1_OP_KEY_ALLOC,
-                         XTR_V1_OP_MR_DEREGISTER,
-                         XTR_V1_OP_TQ_FLUSH})) begin
+        !(opcode inside {RDMA_OP_KEY_ALLOC,
+                         RDMA_OP_MR_DEREGISTER,
+                         RDMA_OP_TQ_FLUSH})) begin
       status = rdma_status::make(
         RDMA_SC_CODEC_ERROR, "CMQ responder decoded an invalid SQE envelope"
       );
@@ -241,10 +237,9 @@ class rdma_control_plane_cmq_engine_test extends uvm_test;
   localparam int unsigned TEST_GENERATION = 32'd12;
   localparam int unsigned TEST_CMQ_ID = 32'h0000_0012;
 
-  // 功能：构造当前对象并初始化其字段、集合和 UVM 名称；不接管传入句柄的生命周期。
-  // 输入/输出及副作用：name 仅用于 UVM 对象命名；内部字段被初始化为安全默认值，传入句柄不转移所有权。
-  //   返回新对象实例；构造失败由 UVM 工厂或调用方处理。
-  // 失败/边界：不创建外部资源；name 为空时仍允许构造，但所有字段必须保持可配置的初始值。
+  // 功能：构造 rdma_control_plane_cmq_engine_test，调用 super.new 建立 UVM 层级对象；外部依赖字段保持未绑定，后续由 configure/build/activate 明确注入。
+  // 输入/输出及副作用：name、parent（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_control_plane_cmq_engine_test 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(
     string name = "rdma_control_plane_cmq_engine_test",
     uvm_component parent = null
@@ -252,10 +247,9 @@ class rdma_control_plane_cmq_engine_test extends uvm_test;
     super.new(name, parent);
   endfunction
 
-  // 功能：在测试中检查调用结果、状态码和副作用是否符合契约；失败时报告可定位的验证信息。
-  // 输入/输出及副作用：参数 label, status, expected 用于执行 expect_status；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：测试前置对象缺失时应报告断言错误并停止依赖该对象的后续检查。
+  // 功能：在 rdma_control_plane_cmq_engine_test 中，expect_status 在测试中执行 expect_status 断言，比较输入结果与期望状态并报告可定位的失败信息。
+  // 输入/输出及副作用：label（输入）、status（输入）、expected（输入）；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：测试函数 expect_status 缺少前置对象时报告断言错误，并停止依赖该对象的后续检查。
   function automatic void expect_status(
     string label,
     rdma_status status,
@@ -271,10 +265,9 @@ class rdma_control_plane_cmq_engine_test extends uvm_test;
                            status.code.name(), status.convert2string()))
   endfunction
 
-  // 功能：依据输入请求创建对应的值对象或资源计划，并校验依赖、所有权和生命周期后返回结果。
-  // 输入/输出及副作用：输入请求、容量和依赖用于构造/预留资源；返回独立对象或状态，不暴露内部可变集合。
-  //   参数越界、容量不足或构造中途失败时回滚已登记的局部状态。
-  // 失败/边界：依赖为空、参数越界、容量不足或构造步骤失败时清理局部结果并返回明确错误。
+  // 功能：make_binding 创建独立的 rdma_function_binding；根据 name、binding_state 设置字段 binding、binding.function_uid、binding.global_function_id、binding.generation、pcie.bdf、base.value、size、enabled、binding.notify_bar_id、notify_base.value，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：name（输入）、binding_state（输入）；make_binding 读取 name、binding_state 并使用字段 binding、binding.function_uid、binding.global_function_id、binding.generation、pcie.bdf、base.value、size、enabled；函数返回 rdma_function_binding，不取得调用方资源所有权。
+  // 失败/边界：make_binding 的结果直接由 return binding 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function automatic rdma_function_binding make_binding(
     string name,
     rdma_binding_state_e binding_state
@@ -330,10 +323,9 @@ class rdma_control_plane_cmq_engine_test extends uvm_test;
     return binding;
   endfunction
 
-  // 功能：依据输入请求创建对应的值对象或资源计划，并校验依赖、所有权和生命周期后返回结果。
-  // 输入/输出及副作用：输入请求、容量和依赖用于构造/预留资源；返回独立对象或状态，不暴露内部可变集合。
-  //   参数越界、容量不足或构造中途失败时回滚已登记的局部状态。
-  // 失败/边界：依赖为空、参数越界、容量不足或构造步骤失败时清理局部结果并返回明确错误。
+  // 功能：make_cmq 创建独立的 rdma_cmq；根据 name、binding 设置字段 cmq、cmq.handle、handle.kind、handle.function_uid、handle.object_id、handle.generation、cmq.owner、cmq.state、cmq.depth，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：name（输入）、binding（输入）；make_cmq 读取 name、binding 并使用字段 cmq、cmq.handle、handle.kind、handle.function_uid、handle.object_id、handle.generation、cmq.owner、cmq.state；函数返回 rdma_cmq，不取得调用方资源所有权。
+  // 失败/边界：make_cmq 的结果直接由 return cmq 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function automatic rdma_cmq make_cmq(
     string name,
     rdma_function_binding binding
@@ -352,10 +344,9 @@ class rdma_control_plane_cmq_engine_test extends uvm_test;
     return cmq;
   endfunction
 
-  // 功能：依据输入请求创建对应的值对象或资源计划，并校验依赖、所有权和生命周期后返回结果。
-  // 输入/输出及副作用：输入请求、容量和依赖用于构造/预留资源；返回独立对象或状态，不暴露内部可变集合。
-  //   参数越界、容量不足或构造中途失败时回滚已登记的局部状态。
-  // 失败/边界：依赖为空、参数越界、容量不足或构造步骤失败时清理局部结果并返回明确错误。
+  // 功能：make_pd_request 创建独立的 rdma_create_pd_req；根据 binding 设置字段 request、request.request_id、request.correlation_id、request.owner，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：binding（输入）；make_pd_request 读取 binding 并使用字段 request、request.request_id、request.correlation_id、request.owner；函数返回 rdma_create_pd_req，不取得调用方资源所有权。
+  // 失败/边界：make_pd_request 的结果直接由 return request 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function automatic rdma_create_pd_req make_pd_request(
     rdma_function_binding binding
   );
@@ -368,10 +359,9 @@ class rdma_control_plane_cmq_engine_test extends uvm_test;
     return request;
   endfunction
 
-  // 功能：依据输入请求创建对应的值对象或资源计划，并校验依赖、所有权和生命周期后返回结果。
-  // 输入/输出及副作用：输入请求、容量和依赖用于构造/预留资源；返回独立对象或状态，不暴露内部可变集合。
-  //   参数越界、容量不足或构造中途失败时回滚已登记的局部状态。
-  // 失败/边界：依赖为空、参数越界、容量不足或构造步骤失败时清理局部结果并返回明确错误。
+  // 功能：make_mr_request 创建独立的 rdma_register_mr_req；根据 binding、pd、iova 设置字段 request、request.request_id、request.correlation_id、request.owner、request.pd_h、iova.value、request.length、request.access，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：binding（输入）、pd（输入）、iova（输入）；make_mr_request 读取 binding、pd、iova 并使用字段 request、request.request_id、request.correlation_id、request.owner、request.pd_h、iova.value、request.length、request.access；函数返回 rdma_register_mr_req，不取得调用方资源所有权。
+  // 失败/边界：make_mr_request 的结果直接由 return request 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function automatic rdma_register_mr_req make_mr_request(
     rdma_function_binding binding,
     rdma_pd pd,
@@ -392,10 +382,9 @@ class rdma_control_plane_cmq_engine_test extends uvm_test;
     return request;
   endfunction
 
-  // 功能：依据输入请求创建对应的值对象或资源计划，并校验依赖、所有权和生命周期后返回结果。
-  // 输入/输出及副作用：输入请求、容量和依赖用于构造/预留资源；返回独立对象或状态，不暴露内部可变集合。
-  //   参数越界、容量不足或构造中途失败时回滚已登记的局部状态。
-  // 失败/边界：依赖为空、参数越界、容量不足或构造步骤失败时清理局部结果并返回明确错误。
+  // 功能：make_dma_context 创建独立的 rdma_dma_request_context；根据 binding 设置字段 dma_ctx、dma_ctx.function_h、dma_ctx.requester_bdf、dma_ctx.pasid_valid、dma_ctx.pasid、dma_ctx.dma_domain_valid、dma_ctx.dma_domain_id、dma_ctx.owner_h，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：binding（输入）；make_dma_context 读取 binding 并使用字段 dma_ctx、dma_ctx.function_h、dma_ctx.requester_bdf、dma_ctx.pasid_valid、dma_ctx.pasid、dma_ctx.dma_domain_valid、dma_ctx.dma_domain_id、dma_ctx.owner_h；函数返回 rdma_dma_request_context，不取得调用方资源所有权。
+  // 失败/边界：make_dma_context 的结果直接由 return dma_ctx 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function automatic rdma_dma_request_context make_dma_context(
     rdma_function_binding binding
   );
@@ -413,8 +402,7 @@ class rdma_control_plane_cmq_engine_test extends uvm_test;
   endfunction
 
   // 功能：判断 count_mapping_releases 对应的状态、能力或账本条件，并返回确定的布尔/计数结果，不修改状态。
-  // 输入/输出及副作用：参数 mock_mem, mapping 用于执行 count_mapping_releases；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
+  // 输入/输出及副作用：mock_mem（输入）、mapping（输入）；count_mapping_releases 读取 mock_mem、mapping 并使用字段 count、released_mapping；函数返回 int unsigned，不取得调用方资源所有权。
   // 失败/边界：count_mapping_releases 只读取现有账本；输入未初始化时返回保守结果，不得借助默认 Function/root 猜测。
   function automatic int unsigned count_mapping_releases(
     rdma_mock_host_mem mock_mem,
@@ -439,10 +427,9 @@ class rdma_control_plane_cmq_engine_test extends uvm_test;
     return count;
   endfunction
 
-  // 功能：在测试中检查调用结果、状态码和副作用是否符合契约；失败时报告可定位的验证信息。
-  // 输入/输出及副作用：参数 trace 用于执行 expect_lifecycle_trace；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：测试前置对象缺失时应报告断言错误并停止依赖该对象的后续检查。
+  // 功能：在 rdma_control_plane_cmq_engine_test 中，expect_lifecycle_trace 在测试中执行 expect_lifecycle_trace 断言，比较输入结果与期望状态并报告可定位的失败信息。
+  // 输入/输出及副作用：trace（输入）；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：测试函数 expect_lifecycle_trace 缺少前置对象时报告断言错误，并停止依赖该对象的后续检查。
   function automatic void expect_lifecycle_trace(
     rdma_mock_call_trace trace
   );
@@ -473,16 +460,15 @@ class rdma_control_plane_cmq_engine_test extends uvm_test;
     end
   endfunction
 
-  // 功能：驱动 UVM 阶段中的场景初始化、事务执行和断言收尾，并在退出前释放 objection 或测试资源。
-  // 输入/输出及副作用：phase 控制 UVM 调度；task 驱动事务、断言和 objection，测试 fixture 由本层负责清理。
-  //   阶段提前结束或前置 setup 失败时必须释放 objection 并停止后续访问。
-  // 失败/边界：setup 失败或阶段被终止时停止新增事务，确保 objection、临时对象和外部引用按测试生命周期收尾。
+  // 功能：在 rdma_control_plane_cmq_engine_test 中，run_phase 驱动 UVM 阶段中的场景初始化、事务执行和断言收尾，并在退出前释放 objection 或测试资源。
+  // 输入/输出及副作用：phase（输入）；phase 由 UVM 提供；task 通过 objection、日志和断言暴露结果，可能调用 DUT 接口但不改变其所有权规则。
+  // 失败/边界：run_phase 的 setup/阶段驱动失败时停止新增事务，并按测试生命周期清理 objection 与临时引用。
   task run_phase(uvm_phase phase);
     rdma_mock_host_mem mock_mem;
     rdma_control_plane_cmq_engine_responder_pcie mock_pcie;
     rdma_mock_call_trace call_trace;
     rdma_doorbell_scheduler scheduler;
-    rdma_xtr_v1_cmq_hw_profile profile;
+    rdma_hw_cmq_hw_profile profile;
     rdma_cmq_engine engine;
     rdma_cmq_engine_port_adapter adapter;
     rdma_resource_manager manager;
@@ -519,7 +505,7 @@ class rdma_control_plane_cmq_engine_test extends uvm_test;
     mock_mem.set_call_trace(call_trace);
     mock_pcie.set_call_trace(call_trace);
     scheduler = rdma_doorbell_scheduler::type_id::create("scheduler");
-    profile = rdma_xtr_v1_cmq_hw_profile::type_id::create("profile");
+    profile = rdma_hw_cmq_hw_profile::type_id::create("profile");
     engine = rdma_cmq_engine::type_id::create("engine");
     adapter = rdma_cmq_engine_port_adapter::type_id::create("adapter");
     manager = rdma_resource_manager::type_id::create("manager");
@@ -599,9 +585,9 @@ class rdma_control_plane_cmq_engine_test extends uvm_test;
                  $sformatf("owned MR mapping release count is %0d",
                            release_count))
 
-    expected_opcodes.push_back(XTR_V1_OP_KEY_ALLOC);
-    expected_opcodes.push_back(XTR_V1_OP_MR_DEREGISTER);
-    expected_opcodes.push_back(XTR_V1_OP_TQ_FLUSH);
+    expected_opcodes.push_back(RDMA_OP_KEY_ALLOC);
+    expected_opcodes.push_back(RDMA_OP_MR_DEREGISTER);
+    expected_opcodes.push_back(RDMA_OP_TQ_FLUSH);
     if (mock_pcie.observed_opcodes.size() != expected_opcodes.size()) begin
       `uvm_error("REAL_ENGINE_OPCODE",
                  $sformatf("observed %0d CMQ opcodes, expected %0d",

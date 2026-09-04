@@ -9,18 +9,17 @@
 class rdma_types_test extends uvm_test;
   `uvm_component_utils(rdma_types_test)
 
-  // 功能：构造当前对象并初始化其字段、集合和 UVM 名称；不接管传入句柄的生命周期。
-  // 输入/输出及副作用：name 仅用于 UVM 对象命名；内部字段被初始化为安全默认值，传入句柄不转移所有权。
-  //   返回新对象实例；构造失败由 UVM 工厂或调用方处理。
-  // 失败/边界：不创建外部资源；name 为空时仍允许构造，但所有字段必须保持可配置的初始值。
+  // 功能：构造 rdma_types_test，调用 super.new 建立 UVM 层级对象；外部依赖字段保持未绑定，后续由 configure/build/activate 明确注入。
+  // 输入/输出及副作用：name、parent（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_types_test 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_types_test", uvm_component parent = null);
     super.new(name, parent);
   endfunction
 
-  // 功能：将当前对象的类型、状态或关键标识转换为调用方可消费的值，不产生外部副作用。
-  // 输入/输出及副作用：输入为当前对象状态；返回字符串、枚举或只读派生值，不修改对象。
-  //   对象未配置时返回可识别的 UNKNOWN/UNCONFIGURED 表示。
-  // 失败/边界：未配置或字段无效时返回明确的 UNKNOWN 表示，不读取未初始化句柄。
+  // 功能：status_has_defaults 按函数体读取当前字段并生成 bit 结果，供调用方进行诊断或分支决策；不修改外部资源。
+  // 输入/输出及副作用：status（输入）、expected_category（输入）、expected_code（输入）、expected_severity（输入）、expected_message（输入）；status_has_defaults 读取 status、expected_category、expected_code、expected_severity、expected_message 并使用输入参数和固定枚举/常量；函数返回 bit，不取得调用方资源所有权。
+
+  // 失败/边界：枚举未定义或对象未配置时返回 UNKNOWN/UNCONFIGURED 表示，同时保留数值上下文。
   function automatic bit status_has_defaults(
     rdma_status status,
     rdma_status_category_e expected_category,
@@ -43,10 +42,10 @@ class rdma_types_test extends uvm_test;
            status.message == expected_message;
   endfunction
 
-  // 功能：检查输入字段、身份和生命周期约束，返回可诊断的校验状态；失败时不提交部分更新。
-  // 输入/输出及副作用：输入为待校验字段或快照；返回 rdma_status，校验过程不提交资源和游标。
-  //   空依赖、非法范围、身份不一致或非活动状态会返回错误。
-  // 失败/边界：任何非法枚举、越界字段、缺失必需依赖或身份/代际不一致都必须返回非成功状态。
+  // 功能：在测试辅助 rdma_types_test.check_enum_code 中构造或驱动“enum code”场景，并断言 DUT 的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：enum_name（输入）、actual（输入）、expected（输入）；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT
+  //   转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   function automatic void check_enum_code(
     string enum_name,
     bit [31:0] actual,
@@ -58,10 +57,10 @@ class rdma_types_test extends uvm_test;
                            enum_name, actual, expected))
   endfunction
 
-  // 功能：在测试中检查调用结果、状态码和副作用是否符合契约；失败时报告可定位的验证信息。
-  // 输入/输出及副作用：参数 check_name, code, expected_category 用于执行 expect_status_category；返回值或 output/inout 交付处理结果，必要时更新本对象状态。
-  //   调用方不获得内部集合或外部依赖的所有权。
-  // 失败/边界：测试前置对象缺失时应报告断言错误并停止依赖该对象的后续检查。
+  // 功能：在 rdma_types_test 中，expect_status_category 在测试中执行 expect_status_category 断言，比较输入结果与期望状态并报告可定位的失败信息。
+  // 输入/输出及副作用：check_name（输入）、code（输入）、expected_category（输入）；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT
+  //   转移未声明的资源所有权。
+  // 失败/边界：测试函数 expect_status_category 缺少前置对象时报告断言错误，并停止依赖该对象的后续检查。
   function automatic void expect_status_category(
     string check_name,
     rdma_status_code_e code,
@@ -76,10 +75,9 @@ class rdma_types_test extends uvm_test;
                            expected_category.name(), actual_category.name()))
   endfunction
 
-  // 功能：驱动 UVM 阶段中的场景初始化、事务执行和断言收尾，并在退出前释放 objection 或测试资源。
-  // 输入/输出及副作用：phase 控制 UVM 调度；task 驱动事务、断言和 objection，测试 fixture 由本层负责清理。
-  //   阶段提前结束或前置 setup 失败时必须释放 objection 并停止后续访问。
-  // 失败/边界：setup 失败或阶段被终止时停止新增事务，确保 objection、临时对象和外部引用按测试生命周期收尾。
+  // 功能：在 rdma_types_test 中，run_phase 驱动 UVM 阶段中的场景初始化、事务执行和断言收尾，并在退出前释放 objection 或测试资源。
+  // 输入/输出及副作用：phase（输入）；phase 由 UVM 提供；task 通过 objection、日志和断言暴露结果，可能调用 DUT 接口但不改变其所有权规则。
+  // 失败/边界：run_phase 的 setup/阶段驱动失败时停止新增事务，并按测试生命周期清理 objection 与临时引用。
   task run_phase(uvm_phase phase);
     rdma_bdf_t bdf = '{segment:16'h0, bus:8'h42, device:5'h03,
                        function_num:3'h5};
