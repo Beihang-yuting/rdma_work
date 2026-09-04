@@ -1,6 +1,28 @@
-// 中文说明：PCIe router 基础未配置拒绝测试。
+// 中文说明：验证多 Host 相同 BDF 的 PCIe 路由与 Function authority 隔离。
 class rdma_pcie_router_test extends uvm_test;
   `uvm_component_utils(rdma_pcie_router_test)
   function new(string name="rdma_pcie_router_test", uvm_component parent=null); super.new(name,parent); endfunction
-  task run_phase(uvm_phase phase); rdma_pcie_router r; rdma_pcie_route_entry e[$]; rdma_mock_pcie p0,p1; rdma_pcie_function_info i; rdma_bdf_t b; rdma_status s; rdma_function_handle h0,h1,bad; byte d[]; rdma_route_key_t k; phase.raise_objection(this); r=rdma_pcie_router::type_id::create("router"); p0=rdma_mock_pcie::type_id::create("p0"); p1=rdma_mock_pcie::type_id::create("p1"); e.push_back(rdma_pcie_route_entry::type_id::create("e0")); e[0].route.host_topology_key=0; e[0].route.root_id=0; e[0].route.segment=0; e[0].route.bdf='{segment:0,bus:1,device:0,function_num:0}; e[0].endpoint=p0; e.push_back(rdma_pcie_route_entry::type_id::create("e1")); e[1].route.host_topology_key=1; e[1].route.root_id=1; e[1].route.segment=0; e[1].route.bdf=e[0].route.bdf; e[1].endpoint=p1; s=r.configure(e); if(!s.ok()) `uvm_fatal("PCIE_ROUTE","configure failed"); b=e[0].route.bdf; s=r.get_function_info(b,i); if(s.code!=RDMA_SC_INVALID_ARGUMENT) `uvm_error("PCIE_ROUTE","ambiguous BDF accepted"); e[0].function_uid=11; e[0].global_function_id=2; e[0].generation=1; e[1].function_uid=22; e[1].global_function_id=3; e[1].generation=1; h0=rdma_function_handle::type_id::create("h0"); h0.function_uid=11; h0.object_id=2; h0.generation=1; h1=rdma_function_handle::type_id::create("h1"); h1.function_uid=22; h1.object_id=3; h1.generation=1; bad=rdma_function_handle::type_id::create("bad"); bad.function_uid=99; bad.object_id=9; bad.generation=1; s=rdma_status::success(); r.mmio_write(h0,'0,d,s); if(!s.ok()) `uvm_error("PCIE_ROUTE","Host0 handle rejected"); r.mmio_write(h1,'0,d,s); if(!s.ok()) `uvm_error("PCIE_ROUTE","Host1 handle rejected"); r.mmio_write(bad,'0,d,s); if(s.ok()) `uvm_error("PCIE_ROUTE","bad handle accepted"); phase.drop_objection(this); endtask
+  task run_phase(uvm_phase phase);
+    rdma_pcie_router r; rdma_pcie_route_entry e[$]; rdma_mock_pcie p0,p1;
+    rdma_pcie_function_info i; rdma_bdf_t b; rdma_status s;
+    rdma_function_handle h0,h1,bad; byte d[];
+    phase.raise_objection(this);
+    r=rdma_pcie_router::type_id::create("router");
+    p0=rdma_mock_pcie::type_id::create("p0"); p1=rdma_mock_pcie::type_id::create("p1");
+    p0.function_info_response=rdma_pcie_function_info::type_id::create("i0");
+    p1.function_info_response=rdma_pcie_function_info::type_id::create("i1");
+    b='{segment:0,bus:1,device:0,function_num:0};
+    p0.function_info_response.bdf=b; p1.function_info_response.bdf=b;
+    e.push_back(rdma_pcie_route_entry::type_id::create("e0")); e[0].route='{host_topology_key:0,root_id:0,segment:0,bdf:b}; e[0].endpoint=p0; e[0].function_uid=11; e[0].global_function_id=2; e[0].generation=1;
+    e.push_back(rdma_pcie_route_entry::type_id::create("e1")); e[1].route='{host_topology_key:1,root_id:1,segment:0,bdf:b}; e[1].endpoint=p1; e[1].function_uid=22; e[1].global_function_id=3; e[1].generation=1;
+    s=r.configure(e); if(!s.ok()) `uvm_fatal("PCIE_ROUTE","configure failed");
+    s=r.get_function_info(b,i); if(s.code!=RDMA_SC_INVALID_ARGUMENT) `uvm_error("PCIE_ROUTE","ambiguous BDF accepted");
+    h0=rdma_function_handle::type_id::create("h0"); h0.function_uid=11; h0.object_id=2; h0.generation=1;
+    h1=rdma_function_handle::type_id::create("h1"); h1.function_uid=22; h1.object_id=3; h1.generation=1;
+    bad=rdma_function_handle::type_id::create("bad"); bad.function_uid=99; bad.object_id=9; bad.generation=1;
+    r.mmio_write(h0,'0,d,s); if(!s.ok()) `uvm_error("PCIE_ROUTE","Host0 handle rejected");
+    r.mmio_write(h1,'0,d,s); if(!s.ok()) `uvm_error("PCIE_ROUTE","Host1 handle rejected");
+    r.mmio_write(bad,'0,d,s); if(s.ok()) `uvm_error("PCIE_ROUTE","bad handle accepted");
+    phase.drop_objection(this);
+  endtask
 endclass
