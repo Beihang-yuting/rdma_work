@@ -63,10 +63,10 @@ class rdma_pcie_router extends rdma_pcie_api;
     if(!found) status=rdma_status::make(RDMA_SC_DMA_TRANSLATION,"PCIe BDF route not found"); else status=rdma_status::success(); return ep;
   endfunction
   protected function rdma_pcie_api endpoint_for_handle(rdma_function_handle h, output rdma_status status);
-    rdma_pcie_api ep; int matches; ep=null; matches=0;
+    rdma_pcie_api ep; int match_count; ep=null; match_count=0;
     if(h==null) begin status=rdma_status::make(RDMA_SC_INVALID_ARGUMENT,"null Function handle"); return null; end
-    foreach(m_entries[i]) begin rdma_pcie_function_info info; if(m_entries[i].endpoint.get_function_info(m_entries[i].route.bdf,info).ok() && info != null && info.bdf == m_entries[i].route.bdf) begin matches++; ep=m_entries[i].endpoint; end end
-    if(matches!=1) begin status=rdma_status::make(RDMA_SC_INVALID_ARGUMENT,"ambiguous Function route; full identity required"); return null; end
+    foreach(m_entries[i]) begin rdma_pcie_function_info info; if(m_entries[i].endpoint.get_function_info(m_entries[i].route.bdf,info).ok() && info != null && info.bdf == m_entries[i].route.bdf) begin match_count++; ep=m_entries[i].endpoint; end end
+    if(match_count!=1) begin status=rdma_status::make(RDMA_SC_INVALID_ARGUMENT,"ambiguous Function route; full identity required"); return null; end
     status=rdma_status::success(); return ep;
   endfunction
 endclass
