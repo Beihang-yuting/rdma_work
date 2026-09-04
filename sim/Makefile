@@ -119,6 +119,6 @@ host_mem: host_mem_preflight
 integration:
 	@if [[ -z "$(DPU_COMMON_ROOT)" ]]; then echo "DPU_COMMON_ROOT is required for integration" >&2; exit 2; fi
 	mkdir -p build/integration
-	$(VCS) $(VCS_FLAGS) +define+RDMA_DPU_INTEGRATION +incdir+$(DPU_COMMON_ROOT)/src -f filelists/integration.f $(DPU_COMMON_ROOT)/src/dpu_resource_pkg.sv -top tb_top -o build/integration/simv
+	$(VCS) $(VCS_FLAGS) +define+RDMA_DPU_INTEGRATION +incdir+$(DPU_COMMON_ROOT)/src $(DPU_COMMON_ROOT)/src/dpu_resource_pkg.sv -f filelists/integration.f -top tb_top -o build/integration/simv
 	build/integration/simv +UVM_TESTNAME=$(TEST) | tee build/integration/$(TEST).log
 	../scripts/check_uvm_summary.sh build/integration/$(TEST).log
