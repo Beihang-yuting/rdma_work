@@ -10,6 +10,11 @@ class rdma_dma_request_context extends uvm_object;
   bit [19:0] pasid;
   bit dma_domain_valid;
   int unsigned dma_domain_id;
+  // 中文：DMA 请求携带完整 fabric route 与 reset epoch，防止跨 Host/root 重用。
+  rdma_route_key_t route;
+  rdma_reset_epoch_t reset_epoch;
+  bit route_valid;
+  bit epoch_valid;
   rdma_handle owner_h;
   // Optional queue-backing role hint used by deterministic lifecycle mocks.
   // The production DMA contract does not depend on this metadata; callers
@@ -25,6 +30,10 @@ class rdma_dma_request_context extends uvm_object;
     pasid = '0;
     dma_domain_valid = 1'b0;
     dma_domain_id = '0;
+    route = '0;
+    reset_epoch = 0;
+    route_valid = 1'b0;
+    epoch_valid = 1'b0;
     owner_h = null;
     queue_role_valid = 1'b0;
     queue_role = '0;
@@ -39,6 +48,9 @@ class rdma_dma_request_context extends uvm_object;
     if (function_h.generation == 0)
       return rdma_status::make(RDMA_SC_STALE_GENERATION,
                                "DMA request Function generation is zero");
+    if (route_valid && !rdma_route_key_valid(route))
+      return rdma_status::make(RDMA_SC_DMA_TRANSLATION,
+                               "DMA request route is invalid");
     if (!pasid_valid && pasid != 0)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "invalid PASID must be zero");
@@ -72,6 +84,10 @@ class rdma_dma_request_context extends uvm_object;
     pasid = rhs_context.pasid;
     dma_domain_valid = rhs_context.dma_domain_valid;
     dma_domain_id = rhs_context.dma_domain_id;
+    route = rhs_context.route;
+    reset_epoch = rhs_context.reset_epoch;
+    route_valid = rhs_context.route_valid;
+    epoch_valid = rhs_context.epoch_valid;
     queue_role_valid = rhs_context.queue_role_valid;
     queue_role = rhs_context.queue_role;
     if (rhs_context.owner_h == null) begin

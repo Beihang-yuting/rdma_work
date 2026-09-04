@@ -17,6 +17,9 @@ package rdma_unit_test_pkg;
   import rdma_adapter_pkg::*;
   // Disambiguate the shared recovery enum from the legacy core compatibility type.
   import rdma_model_pkg::rdma_queue_recovery_action_e;
+`ifdef RDMA_DPU_INTEGRATION
+  import rdma_dpu_env_pkg::*;
+`endif
 `ifdef RDMA_HOST_MEM_TEST
   import host_mem_pkg::*;
   import rdma_host_mem_adapter_pkg::*;
@@ -73,6 +76,11 @@ package rdma_unit_test_pkg;
   `include "unit/rdma_sq_payload_writer_test.sv"
   `include "unit/rdma_function_identity_test.sv"
   `include "unit/rdma_queue_txn_journal_test.sv"
+`ifdef RDMA_DPU_INTEGRATION
+  `include "integration/rdma_dpu_integration_test.sv"
+  `include "unit/rdma_host_mem_router_test.sv"
+  `include "unit/rdma_pcie_router_test.sv"
+`endif
 endpackage
 
 `ifdef RDMA_HOST_MEM_TEST

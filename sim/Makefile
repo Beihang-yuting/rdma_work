@@ -12,7 +12,7 @@ VCS_FLAGS := -full64 -sverilog -ntb_opts uvm-1.2 -timescale=1ns/1ps -debug_acces
 SHELL := /bin/bash
 .SHELLFLAGS := -o pipefail -c
 
-.PHONY: core host_mem_preflight host_mem xtr_defs
+.PHONY: core host_mem_preflight host_mem xtr_defs integration
 
 core:
 	mkdir -p $(BUILD)
@@ -115,3 +115,10 @@ host_mem: host_mem_preflight
 	$(HOST_MEM_BUILD)/simv +UVM_TESTNAME=$(TEST) | \
 		tee $(HOST_MEM_BUILD)/$(TEST).log
 	../scripts/check_uvm_summary.sh $(HOST_MEM_BUILD)/$(TEST).log
+
+integration:
+	@if [[ -z "$(DPU_COMMON_ROOT)" ]]; then echo "DPU_COMMON_ROOT is required for integration" >&2; exit 2; fi
+	mkdir -p build/integration
+	$(VCS) $(VCS_FLAGS) +define+RDMA_DPU_INTEGRATION +incdir+$(DPU_COMMON_ROOT)/src -f filelists/integration.f $(DPU_COMMON_ROOT)/src/dpu_resource_pkg.sv -top tb_top -o build/integration/simv
+	build/integration/simv +UVM_TESTNAME=$(TEST) | tee build/integration/$(TEST).log
+	../scripts/check_uvm_summary.sh build/integration/$(TEST).log

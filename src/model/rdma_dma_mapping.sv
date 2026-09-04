@@ -10,6 +10,11 @@ class rdma_dma_mapping extends uvm_object;
   bit [19:0] pasid;
   bit dma_domain_valid;
   int unsigned dma_domain_id;
+  // 中文：映射保留完整路由与 reset epoch；epoch 变化后映射不可再访问。
+  rdma_route_key_t route;
+  rdma_reset_epoch_t reset_epoch;
+  bit route_valid;
+  bit epoch_valid;
   rdma_backing_addr_t backing_addr;
   rdma_iova_t iova;
   longint unsigned size;
@@ -26,6 +31,10 @@ class rdma_dma_mapping extends uvm_object;
     pasid = '0;
     dma_domain_valid = 1'b0;
     dma_domain_id = '0;
+    route = '0;
+    reset_epoch = 0;
+    route_valid = 1'b0;
+    epoch_valid = 1'b0;
     backing_addr = '0;
     iova = '0;
     size = '0;
@@ -90,6 +99,10 @@ class rdma_dma_mapping extends uvm_object;
     pasid = rhs_mapping.pasid;
     dma_domain_valid = rhs_mapping.dma_domain_valid;
     dma_domain_id = rhs_mapping.dma_domain_id;
+    route = rhs_mapping.route;
+    reset_epoch = rhs_mapping.reset_epoch;
+    route_valid = rhs_mapping.route_valid;
+    epoch_valid = rhs_mapping.epoch_valid;
     backing_addr = rhs_mapping.backing_addr;
     iova = rhs_mapping.iova;
     size = rhs_mapping.size;
@@ -124,6 +137,9 @@ class rdma_dma_mapping extends uvm_object;
     if (state != RDMA_MAPPING_ACTIVE)
       return rdma_status::make(RDMA_SC_INVALID_STATE,
                                "DMA mapping is not ACTIVE");
+    if (route_valid && !rdma_route_key_valid(route))
+      return rdma_status::make(RDMA_SC_DMA_TRANSLATION,
+                               "DMA mapping route is invalid");
     if (requested_function == null)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "requested function handle is null");
