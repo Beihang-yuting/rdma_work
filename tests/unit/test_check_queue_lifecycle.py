@@ -1,3 +1,7 @@
+# 目录：tests/unit/，Python 静态检查测试。
+# 职责：验证 queue lifecycle 规则及回归分层契约，覆盖拒绝分支与文件清单边界。
+# 依赖与所有权：依赖 tools/check_queue_lifecycle.py 和仓库源码；测试临时目录由 unittest 管理并在用例结束释放。
+
 import importlib.util
 from pathlib import Path
 import subprocess

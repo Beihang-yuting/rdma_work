@@ -5,7 +5,6 @@
 +incdir+../src/core
 +incdir+../src/adapter
 +incdir+../src/adapters/net_packet
-+incdir+../src/integration
 +incdir+$(NET_PACKET_ROOT)/src
 +incdir+$(NET_PACKET_ROOT)/src/core
 ../src/types/rdma_types_pkg.sv
@@ -16,6 +15,5 @@
 $(NET_PACKET_ROOT)/src/core/packet.sv
 ../src/adapters/net_packet/rdma_net_packet_adapter_pkg.sv
 ../src/adapters/net_packet/rdma_net_packet_bridge.sv
-../src/integration/rdma_dpu_env_pkg.sv
 ../tests/rdma_unit_test_pkg.sv
 ../tests/tb_top.sv

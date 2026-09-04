@@ -1,3 +1,7 @@
+# 目录：sim/Makefile，仿真构建层入口。
+# 职责：定义 core、integration、host_mem 与可选 net_packet 的编译、预检和 UVM 运行流程。
+# 依赖与所有权：依赖 VCS、仓库 filelist 及外部只读源码树；本文件仅管理 build 输出目录，不拥有外部依赖生命周期。
+
 BUILD ?= build/core
 HOST_MEM_BUILD ?= build/host_mem
 override HOST_MEM_PINNED_COMMIT := 3b9e000d5df4d10efbb3029f43605e0362e0caca
@@ -126,10 +130,20 @@ integration:
 
 net_packet_preflight:
 	@if [[ -z "$(NET_PACKET_ROOT)" ]]; then echo "NET_PACKET_ROOT is required for net_packet" >&2; exit 2; fi
-	@if [[ ! -r "$(NET_PACKET_ROOT)/src/core/packet.sv" ]]; then echo "Required net_packet dependency is not readable: $(NET_PACKET_ROOT)/src/core/packet.sv" >&2; exit 2; fi
+	@preflight_failed=0; \
+	for dependency in \
+		"$(NET_PACKET_ROOT)/src/core/packet.sv" \
+		"../src/adapters/net_packet/rdma_net_packet_adapter_pkg.sv" \
+		"../src/adapters/net_packet/rdma_net_packet_bridge.sv" \
+		"../tests/integration/rdma_net_packet_adapter_test.sv"; do \
+		if [[ ! -r "$$dependency" ]]; then echo "Required net_packet dependency is not readable: $$dependency" >&2; preflight_failed=1; fi; \
+	done; \
+	if [[ "$$preflight_failed" != 0 ]]; then exit 2; fi
 	@if git -C "$(NET_PACKET_ROOT)" rev-parse --is-inside-work-tree >/dev/null 2>&1; then \
 		actual_head=$$(git -C "$(NET_PACKET_ROOT)" rev-parse HEAD); \
 		if [[ "$$actual_head" != "$(NET_PACKET_PINNED_COMMIT)" ]]; then echo "net_packet preflight failed: HEAD $$actual_head does not match pinned commit $(NET_PACKET_PINNED_COMMIT)" >&2; exit 1; fi; \
+		if ! git -C "$(NET_PACKET_ROOT)" diff --cached --no-ext-diff --quiet "$(NET_PACKET_PINNED_COMMIT)" -- src/core/packet.sv; then echo "net_packet preflight failed: staged source diff detected" >&2; exit 1; fi; \
+		if ! git -C "$(NET_PACKET_ROOT)" diff --no-ext-diff --quiet -- src/core/packet.sv; then echo "net_packet preflight failed: unstaged source diff detected" >&2; exit 1; fi; \
 	else echo "net_packet preflight failed: NET_PACKET_ROOT is not a git checkout" >&2; exit 1; fi
 
 net_packet: net_packet_preflight

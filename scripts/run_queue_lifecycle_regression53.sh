@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# 目录：scripts/，VCS 53 回归驱动脚本。
+# 职责：分别调度 core 与 dpu_common integration 测试，避免 core 编译层引入外部依赖。
+# 依赖与所有权：依赖 scripts/run_vcs53.sh；仅消费测试与环境变量，不拥有仿真产物生命周期。
 set -euo pipefail
 
 readonly script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
