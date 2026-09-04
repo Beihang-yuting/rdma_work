@@ -1,3 +1,8 @@
+// 目录：外部适配器实现层 adapters/host_mem/rdma_host_mem_adapter_pkg.sv。
+// 职责：实现 rdma_host_mem_adapter_pkg 在本层的职责和对外接口。
+// 依赖：依赖本层公共 types/model/adapter 契约及其上游快照。
+// 所有权与生命周期：对象只拥有显式创建的值快照；外部资源保存非拥有引用，生命周期由调用方管理。
+
 // 中文说明：rdma_host_mem_adapter_pkg.sv 属于适配器实现层，提供 host-mem 等后端适配实现。
 // 阅读提示：先看公开类型和接口，再看实现细节；失败路径应保持状态与资源所有权可追踪。
 
@@ -11,6 +16,9 @@ package rdma_host_mem_adapter_pkg;
 
   class rdma_host_mem_release_seal extends uvm_object;
 
+    // 功能：构造 rdma_host_mem_release_seal，调用 super.new 建立 UVM 层级对象；外部依赖字段保持未绑定，后续由 configure/build/activate 明确注入。
+    // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+    // 失败/边界：rdma_host_mem_release_seal 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
     function new(string name = "rdma_host_mem_release_seal");
       super.new(name);
     endfunction
@@ -25,12 +33,18 @@ package rdma_host_mem_adapter_pkg;
     local rdma_host_mem_release_seal release_seal;
     local bit release_complete;
 
+    // 功能：构造 rdma_host_mem_allocation_identity，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：release_seal=null；release_complete=1'b0。
+    // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+    // 失败/边界：rdma_host_mem_allocation_identity 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
     function new(string name = "rdma_host_mem_allocation_identity");
       super.new(name);
       release_seal = null;
       release_complete = 1'b0;
     endfunction
 
+    // 功能：在 rdma_host_mem_allocation_identity 中，initialize 校验依赖和 binding 后建立运行边界，只保存非拥有引用并拒绝重复配置。
+    // 输入/输出及副作用：seal（输入）；initialize 先依据 seal == null；release_seal != null 校验 seal；成功时更新本对象配置/状态并保存非拥有引用，返回 rdma_status。
+    // 失败/边界：实现中的空依赖、重复登记、状态或 generation/authority 校验失败时返回错误；失败时保留旧配置。
     function rdma_status initialize(rdma_host_mem_release_seal seal);
       if (seal == null)
         return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
@@ -44,6 +58,9 @@ package rdma_host_mem_adapter_pkg;
       return rdma_status::success();
     endfunction
 
+    // 功能：在 rdma_host_mem_allocation_identity 中，mark_release_complete 执行 mark_release_complete 的mark_release_complete 指定的测试或恢复状态变更，更新受控账本并保留可回滚的故障证据。
+    // 输入/输出及副作用：seal（输入）；输入 request/image/cursor 决定写入内容；成功时更新 PI/CI、slot ledger 或 pending journal，并通过 output 返回结果。
+    // 失败/边界：mark_release_complete 仅允许测试/恢复范围内的状态变更；代际或资源不匹配时拒绝并保留原账本。
     function rdma_status mark_release_complete(
       rdma_host_mem_release_seal seal
     );
@@ -61,6 +78,9 @@ package rdma_host_mem_adapter_pkg;
       return rdma_status::success();
     endfunction
 
+    // 功能：    // 功能：completion_status 校验 complete 与当前对象状态的一致性，并显式处理“host memory allocation identity is not sealed”等拒绝条件，返回 rdma_status 供上层决定是否提交。
+    // 输入/输出及副作用：complete（输出）；completion_status 读取 complete 并使用字段 complete，并写入 complete；函数返回 rdma_status，不取得调用方资源所有权。
+    // 失败/边界：completion_status 返回 RDMA_SC_INVALID_STATE；具体拒绝条件包括 “host memory allocation identity is not sealed”；失败路径不提交部分状态、不隐式重试，也不转移未声明资源。
     function rdma_status completion_status(output bit complete);
       complete = 1'b0;
       if (release_seal == null)
@@ -78,11 +98,17 @@ package rdma_host_mem_adapter_pkg;
 
     local rdma_host_mem_allocation_identity allocation_identity;
 
+    // 功能：构造 rdma_host_mem_mapping，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：allocation_identity=null。
+    // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+    // 失败/边界：rdma_host_mem_mapping 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
     function new(string name = "rdma_host_mem_mapping");
       super.new(name);
       allocation_identity = null;
     endfunction
 
+    // 功能：initialize_allocation_identity 更新字段 allocation_identity、status，并在提交前保持 Function authority、generation 和资源所有权约束。
+    // 输入/输出及副作用：release_seal（输入）；initialize_allocation_identity 先依据 allocation_identity != null；allocation_identity == null；status == null || !status.ok( 校验 release_seal；成功时更新本对象配置/状态并保存非拥有引用，返回 rdma_status。
+    // 失败/边界：initialize_allocation_identity 返回 RDMA_SC_INVALID_STATE、RDMA_SC_RESOURCE_EXHAUSTED；具体拒绝条件包括 “host memory allocation identity is already initialized”；“host memory allocation identity creation failed”；“host memory allocation identity sealing returned null”；失败路径不提交部分状态、不隐式重试，也不转移未声明资源。
     function rdma_status initialize_allocation_identity(
       rdma_host_mem_release_seal release_seal
     );
@@ -115,6 +141,10 @@ package rdma_host_mem_adapter_pkg;
       return rdma_status::success();
     endfunction
 
+    // 功能：在 rdma_host_mem_mapping 中，mark_release_complete 执行 mark_release_complete 的mark_release_complete 指定的测试或恢复状态变更，更新受控账本并保留可回滚的故障证据。
+    // 输入/输出及副作用：release_seal（输入）；输入 request/image/cursor 决定写入内容；成功时更新 PI/CI、slot ledger 或 pending journal，并通过 output
+    //   返回结果。
+    // 失败/边界：mark_release_complete 仅允许测试/恢复范围内的状态变更；代际或资源不匹配时拒绝并保留原账本。
     function rdma_status mark_release_complete(
       rdma_host_mem_release_seal release_seal
     );
@@ -126,6 +156,9 @@ package rdma_host_mem_adapter_pkg;
       return allocation_identity.mark_release_complete(release_seal);
     endfunction
 
+    // 功能：在 rdma_host_mem_mapping 中，release_completion_status 按 owner、generation 和幂等规则释放/隔离记录，并同步删除其账本引用。
+    // 输入/输出及副作用：release_complete（输出）；release_completion_status 可能更新本对象明确拥有的状态，并写入 release_complete；函数返回 rdma_status，不取得调用方资源所有权。
+    // 失败/边界：release_completion_status 发现 owner/generation 不匹配、记录未知或重复释放时返回错误或幂等结果，不重新激活旧句柄。
     virtual function rdma_status release_completion_status(
       output bit release_complete
     );
@@ -138,6 +171,9 @@ package rdma_host_mem_adapter_pkg;
       return allocation_identity.completion_status(release_complete);
     endfunction
 
+    // 功能：在 rdma_host_mem_mapping 中由 same_allocation 逐字段比较输入值，返回结构、身份或序列化内容是否一致。
+    // 输入/输出及副作用：rhs（输入）；比较对象/数组只读；返回 bit 或状态结果，不更新 runtime、账本或外部 adapter。
+    // 失败/边界：same_allocation 的任一比较对象为空或类型不符时返回确定的 false/不等结果，不抛出未处理异常。
     function bit same_allocation(rdma_host_mem_mapping rhs);
       if (rhs == null)
         return 1'b0;
@@ -146,6 +182,9 @@ package rdma_host_mem_adapter_pkg;
              allocation_identity == rhs.allocation_identity;
     endfunction
 
+    // 功能：在 rdma_host_mem_mapping 中，snapshot_release_authority 按完整 key/handle 查找唯一权威记录并返回 detached 快照，避免把内部可变引用泄露给调用方。
+    // 输入/输出及副作用：snapshot（输出）；snapshot_release_authority 读取 snapshot 并使用字段 snapshot、status，并写入 snapshot；函数返回 rdma_status，不取得调用方资源所有权。
+    // 失败/边界：snapshot_release_authority 在 key/handle 缺失、记录不唯一或 generation/reset epoch 过期时返回明确错误，不回退到默认 authority。
     virtual function rdma_status snapshot_release_authority(
       output rdma_dma_mapping snapshot
     );
@@ -159,6 +198,9 @@ package rdma_host_mem_adapter_pkg;
       return status;
     endfunction
 
+    // 功能：在 rdma_host_mem_mapping 中，release_authority_status 按 owner、generation 和幂等规则释放/隔离记录，并同步删除其账本引用。
+    // 输入/输出及副作用：snapshot（输入）；release_authority_status 可能更新本对象明确拥有的状态；函数返回 rdma_status，不取得调用方资源所有权。
+    // 失败/边界：release_authority_status 发现 owner/generation 不匹配、记录未知或重复释放时返回错误或幂等结果，不重新激活旧句柄。
     virtual function rdma_status release_authority_status(
       rdma_dma_mapping snapshot
     );
@@ -173,6 +215,9 @@ package rdma_host_mem_adapter_pkg;
       return rdma_status::success();
     endfunction
 
+    // 功能：make_authority_snapshot 复制 snapshot 的受控字段并生成独立快照，供查询、编码或恢复使用；源对象保持不变。
+    // 输入/输出及副作用：snapshot（输出）；make_authority_snapshot 读取 snapshot 并使用字段 snapshot、candidate、cloned_object、owner_copy、candidate.function_h、candidate.requester_bdf、candidate.pasid_valid、candidate.pasid，并写入 snapshot；函数返回 rdma_status，不取得调用方资源所有权。
+    // 失败/边界：make_authority_snapshot 返回 RDMA_SC_INVALID_STATE、RDMA_SC_RESOURCE_EXHAUSTED；具体拒绝条件包括 “host memory allocation identity is not initialized”；“DMA mapping Function is null”；“DMA mapping authority creation failed”；“DMA mapping Function clone failed”；“DMA mapping Function clone changed identity”；失败路径不提交部分状态、不隐式重试，也不转移未声明资源。
     function rdma_status make_authority_snapshot(
       output rdma_host_mem_mapping snapshot
     );
@@ -242,6 +287,9 @@ package rdma_host_mem_adapter_pkg;
       return rdma_status::success();
     endfunction
 
+    // 功能：将 rhs 中 rdma_host_mem_mapping 的值字段复制到当前对象，建立与源对象隔离的快照。
+    // 输入/输出及副作用：rhs（输入）；rhs 是源对象；当前对象字段会被覆盖，嵌套句柄按实现执行 clone 或保持非拥有引用，源对象不被修改。
+    // 失败/边界：do_copy 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（host memory DMA mapping copy type mismatch），不保留部分有效快照。
     virtual function void do_copy(uvm_object rhs);
       rdma_host_mem_mapping rhs_mapping;
       rdma_host_mem_allocation_identity destination_identity;
@@ -270,6 +318,9 @@ package rdma_host_mem_adapter_pkg;
     host_mem_pkg::host_mem_api backing_mem;
     bit active;
 
+    // 功能：构造 rdma_host_mem_allocation_record，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：authority=null；backing_mem=null；active=1'b0。
+    // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+    // 失败/边界：rdma_host_mem_allocation_record 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
     function new(string name = "rdma_host_mem_allocation_record");
       super.new(name);
       authority = null;
@@ -297,6 +348,9 @@ package rdma_host_mem_adapter_pkg;
     protected bit iova_cursor_valid;
     protected bit [64:0] next_iova;
 
+    // 功能：构造 rdma_host_mem_adapter，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：mem=null；iova_base='0；release_seal=new("adapter_release_seal")；iova_config_locked=1'b0；locked_iova_base='0；iova_cursor_valid=1'b0；next_iova='0。
+    // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+    // 失败/边界：rdma_host_mem_adapter 构造只建立本地初始状态；本地 semaphore/ledger 等按构造体显式分配，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
     function new(string name = "rdma_host_mem_adapter");
       super.new(name);
       mem = null;
@@ -308,6 +362,9 @@ package rdma_host_mem_adapter_pkg;
       next_iova = '0;
     endfunction
 
+    // 功能：在 rdma_host_mem_adapter 中，clone_function_handle 将 rhs 中 rdma_host_mem_adapter 的值字段复制到当前对象，建立与源对象隔离的快照。
+    // 输入/输出及副作用：source（输入）；clone_function_handle 读取 source 并使用字段 cloned_object；函数返回 rdma_function_handle，不取得调用方资源所有权。
+    // 失败/边界：clone_function_handle 输入对象为空或查找未命中时返回 null；该路径不隐式重试，也不转移未声明资源。
     protected function rdma_function_handle clone_function_handle(
       rdma_function_handle source
     );
@@ -322,6 +379,9 @@ package rdma_host_mem_adapter_pkg;
       return result;
     endfunction
 
+    // 功能：在 rdma_host_mem_adapter 中，clone_owner_handle 将 rhs 中 rdma_host_mem_adapter 的值字段复制到当前对象，建立与源对象隔离的快照。
+    // 输入/输出及副作用：source（输入）；clone_owner_handle 读取 source 并使用字段 cloned_object；函数返回 rdma_handle，不取得调用方资源所有权。
+    // 失败/边界：clone_owner_handle 输入对象为空或查找未命中时返回 null；该路径不隐式重试，也不转移未声明资源。
     protected function rdma_handle clone_owner_handle(rdma_handle source);
       uvm_object cloned_object;
       rdma_handle result;
@@ -334,12 +394,18 @@ package rdma_host_mem_adapter_pkg;
       return result;
     endfunction
 
+    // 功能：在 rdma_host_mem_adapter 中由 same_handle 逐字段比较输入值，返回结构、身份或序列化内容是否一致。
+    // 输入/输出及副作用：lhs（输入）、rhs（输入）；比较对象/数组只读；返回 bit 或状态结果，不更新 runtime、账本或外部 adapter。
+    // 失败/边界：same_handle 的任一比较对象为空或类型不符时返回确定的 false/不等结果，不抛出未处理异常。
     protected function bit same_handle(rdma_handle lhs, rdma_handle rhs);
       if (lhs == null || rhs == null)
         return lhs == null && rhs == null;
       return lhs.same_instance(rhs);
     endfunction
 
+    // 功能：在 rdma_host_mem_adapter 中，mapping_values_match 逐字段比较输入快照或镜像，确认其身份、布局和 payload 完全一致后返回布尔结果。
+    // 输入/输出及副作用：candidate（输入）、authority（输入）；mapping_values_match 读取 candidate、authority 并使用输入参数和固定枚举/常量；函数返回 bit，不取得调用方资源所有权。
+    // 失败/边界：mapping_values_match 比较或前置条件不满足时返回 0/false；该路径不隐式重试，也不转移未声明资源。
     protected function bit mapping_values_match(
       rdma_dma_mapping candidate,
       rdma_dma_mapping authority
@@ -361,6 +427,9 @@ package rdma_host_mem_adapter_pkg;
              same_handle(candidate.owner_h, authority.owner_h);
     endfunction
 
+    // 功能：在 rdma_host_mem_adapter 中，find_allocation 按完整 key/handle 查找唯一权威记录并返回 detached 快照，避免把内部可变引用泄露给调用方。
+    // 输入/输出及副作用：mapping（输入）；find_allocation 读取 mapping 并使用字段 allocations、authority；函数返回 int，不取得调用方资源所有权。
+    // 失败/边界：find_allocation 在 key/handle 缺失、记录不唯一或 generation/reset epoch 过期时返回明确错误，不回退到默认 authority。
     protected function int find_allocation(rdma_host_mem_mapping mapping);
       if (mapping == null)
         return -1;
@@ -372,6 +441,9 @@ package rdma_host_mem_adapter_pkg;
       return -1;
     endfunction
 
+    // 功能：validate_mapping 校验 mapping、allocation_index 与当前对象状态的一致性，并显式处理“DMA mapping is null”等拒绝条件，返回 rdma_status 供上层决定是否提交。
+    // 输入/输出及副作用：mapping（输入）、allocation_index（输出）；validate_mapping 读取 mapping、allocation_index 并使用字段 allocation_index，并写入 allocation_index；函数返回 rdma_status，不取得调用方资源所有权。
+    // 失败/边界：必需对象/句柄/快照为空，或身份、范围、generation 和生命周期检查失败时返回非成功状态。
     protected function rdma_status validate_mapping(
       rdma_dma_mapping mapping,
       output int allocation_index
@@ -405,6 +477,10 @@ package rdma_host_mem_adapter_pkg;
       return rdma_status::success();
     endfunction
 
+    // 功能：validate_range 校验 allocation、offset、length、backing_address 与当前对象状态的一致性，并显式处理“allocation ledger entry is invalid”等拒绝条件，返回 rdma_status 供上层决定是否提交。
+    // 输入/输出及副作用：allocation（输入）、offset（输入）、length（输入）、backing_address（输出）；validate_range 读取 allocation、offset、length、backing_address 并使用字段 backing_address、offset_end、address_sum、address_end，并写入 backing_address；函数返回 rdma_status，不取得调用方资源所有权。
+
+    // 失败/边界：必需对象/句柄/快照为空，或身份、范围、generation 和生命周期检查失败时返回非成功状态。
     protected function rdma_status validate_range(
       rdma_host_mem_allocation_record allocation,
       longint unsigned offset,
@@ -439,6 +515,9 @@ package rdma_host_mem_adapter_pkg;
       return rdma_status::success();
     endfunction
 
+    // 功能：iova_overlaps_active 比较 first_iova、end_iova 与当前 authority/状态字段，返回布尔结果供上层执行精确分支。
+    // 输入/输出及副作用：first_iova（输入）、end_iova（输入）；iova_overlaps_active 读取 first_iova、end_iova 并使用字段 existing_first、existing_end；函数返回 bit，不取得调用方资源所有权。
+    // 失败/边界：iova_overlaps_active 比较或前置条件不满足时返回 0/false；该路径不隐式重试，也不转移未声明资源。
     protected function bit iova_overlaps_active(
       bit [63:0] first_iova,
       bit [64:0] end_iova
@@ -461,6 +540,10 @@ package rdma_host_mem_adapter_pkg;
       return 1'b0;
     endfunction
 
+    // 功能：choose_iova 根据 backing_address、size、alignment、selected_iova、committed_cursor 执行 rdma_status 结果转换，具体更新字段 selected_iova、committed_cursor、range_end、cursor、alignment_mask、aligned_cursor；失败时返回 RDMA_SC_RESOURCE_EXHAUSTED，保持已登记资源和输出不变。
+    // 输入/输出及副作用：backing_address（输入）、size（输入）、alignment（输入）、selected_iova（输出）、committed_cursor（输出）；choose_iova 读取 backing_address、size、alignment、selected_iova、committed_cursor 并使用字段 selected_iova、committed_cursor、range_end、cursor、alignment_mask、aligned_cursor，并写入 selected_iova、committed_cursor；函数返回 rdma_status，不取得调用方资源所有权。
+
+    // 失败/边界：choose_iova 返回 RDMA_SC_RESOURCE_EXHAUSTED；典型拒绝条件为“identity IOVA range overflows 64 bits”“IOVA cursor is exhausted”；失败路径不提交部分状态或转移未声明资源。
     protected function rdma_status choose_iova(
       bit [63:0] backing_address,
       int unsigned size,
@@ -507,6 +590,10 @@ package rdma_host_mem_adapter_pkg;
       return rdma_status::success();
     endfunction
 
+    // 功能：在 rdma_host_mem_adapter 中，allocate 检查容量后预留资源并返回带 owner 证据的句柄/计划；失败时回滚已登记的局部状态。
+    // 输入/输出及副作用：request_context（输入）、size（输入）、alignment（输入）、direction（输入）、mapping（输出）；输入请求/句柄定义资源属性；成功时更新账本并通过返回值或
+    //   output 发布新句柄/映射。
+    // 失败/边界：容量不足、范围非法、重复占用或身份过期时返回错误；失败不得泄漏半分配资源。
     virtual function rdma_status allocate(
       rdma_dma_request_context request_context,
       int unsigned size,
@@ -653,6 +740,10 @@ package rdma_host_mem_adapter_pkg;
       return rdma_status::success();
     endfunction
 
+    // 功能：在 rdma_host_mem_adapter 中，write 把请求数据写入指定后端并保留返回状态；只有写入成功才允许本地游标继续推进。
+    // 输入/输出及副作用：mapping（输入）、offset（输入）、data（输入）；输入 request/image/cursor 决定写入内容；成功时更新 PI/CI、slot ledger 或 pending
+    //   journal，并通过 output 返回结果。
+    // 失败/边界：write 遇到后端拒绝、范围溢出或 DMA 权限不足时保留失败证据，不推进本地游标。
     virtual function rdma_status write(
       rdma_dma_mapping mapping,
       longint unsigned offset,
@@ -677,6 +768,10 @@ package rdma_host_mem_adapter_pkg;
       return rdma_status::success();
     endfunction
 
+    // 功能：在 rdma_host_mem_adapter 中，read 按完整 key/handle 查找唯一权威记录并返回 detached 快照，避免把内部可变引用泄露给调用方。
+    // 输入/输出及副作用：mapping（输入）、offset（输入）、size（输入）、data（输出）；输入 handle/key/cursor 用于选择读取范围；返回值或 output 为 detached
+    //   快照，读取不取得外部资源所有权。
+    // 失败/边界：read 在 key/handle 缺失、记录不唯一或 generation/reset epoch 过期时返回明确错误，不回退到默认 authority。
     virtual function rdma_status read(
       rdma_dma_mapping mapping,
       longint unsigned offset,
@@ -708,6 +803,9 @@ package rdma_host_mem_adapter_pkg;
       return rdma_status::success();
     endfunction
 
+    // 功能：在 rdma_host_mem_adapter 中，release 按 owner、generation 和幂等规则释放/隔离记录，并同步删除其账本引用。
+    // 输入/输出及副作用：mapping（输入）；输入 handle/mapping/token 指定释放目标；成功时更新账本和生命周期，外部资源只按 adapter 契约释放。
+    // 失败/边界：release 发现 owner/generation 不匹配、记录未知或重复释放时返回错误或幂等结果，不重新激活旧句柄。
     virtual function rdma_status \release (rdma_dma_mapping mapping);
       int allocation_index;
       rdma_host_mem_mapping concrete_mapping;
@@ -746,6 +844,9 @@ package rdma_host_mem_adapter_pkg;
     // host_mem leak_check is manager-global.  leak_count is adapter-owner
     // local; callers should isolate or first release unrelated manager users
     // when they require a pristine global host_mem report.
+    // 功能：check_leaks 校验 leak_count 与当前对象状态的一致性，并显式处理“host_mem API is not configured”等拒绝条件，返回 rdma_status 供上层决定是否提交。
+    // 输入/输出及副作用：leak_count（输出）；check_leaks 读取 leak_count 并使用字段 leak_count、already_checked，并写入 leak_count；函数返回 rdma_status，不取得调用方资源所有权。
+    // 失败/边界：check_leaks 返回 RDMA_SC_INVALID_STATE；典型拒绝条件为“host_mem API is not configured”；失败路径不提交部分状态或转移未声明资源。
     function rdma_status check_leaks(output int unsigned leak_count);
       host_mem_pkg::host_mem_api checked_mem[$];
       bit already_checked;

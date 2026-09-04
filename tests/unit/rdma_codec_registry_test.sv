@@ -1,9 +1,17 @@
+// 目录：测试层 unit/rdma_codec_registry_test.sv。
+// 职责：验证 rdma_codec_registry_test 对应模块的接口、错误路径和边界行为。
+// 依赖：依赖被测 package、UVM 测试基类和必要的 mock/fixture。
+// 所有权与生命周期：测试对象只拥有本地 fixture；外部后端句柄由测试环境提供并在测试结束释放。
+
 // 中文说明：rdma_codec_registry_test.sv 属于单元测试，覆盖对应模型、编码器或执行器契约。
 // 阅读提示：先看公开类型和接口，再看实现细节；失败路径应保持状态与资源所有权可追踪。
 
 class rdma_codec_registry_test_codec extends rdma_codec_base;
   rdma_byte_endian_e endian_value;
 
+  // 功能：构造 rdma_codec_registry_test_codec，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：this.endian_value=endian_value。
+  // 输入/输出及副作用：name、endian_value（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_codec_registry_test_codec 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(
     string name = "rdma_codec_registry_test_codec",
     rdma_byte_endian_e endian_value = RDMA_ENDIAN_LITTLE
@@ -12,6 +20,9 @@ class rdma_codec_registry_test_codec extends rdma_codec_base;
     this.endian_value = endian_value;
   endfunction
 
+  // 功能：在 rdma_codec_registry_test_codec 中，encode 按硬件布局把输入模型编码到 image/缓冲区，并在写入前检查范围、重叠、端序和保留位。
+  // 输入/输出及副作用：model（输入）、image（输出）；输入模型只读；成功时通过返回值或 output 发布完整 image/bytes，不修改源模型。
+  // 失败/边界：encode 遇到 image/model 为空、长度/对齐/保留位非法或 codec 校验失败时不发布部分字段。
   virtual function rdma_status encode(
     rdma_hw_model model,
     output rdma_hw_image image
@@ -20,6 +31,9 @@ class rdma_codec_registry_test_codec extends rdma_codec_base;
     return rdma_status::success();
   endfunction
 
+  // 功能：在 rdma_codec_registry_test_codec 中，decode 从硬件 image/缓冲区解码字段，验证长度、布局和完整性后返回模型或状态。
+  // 输入/输出及副作用：image（输入）、model（输出）；输入 image/bytes 只读；成功时通过返回值或 output 发布 detached 解码快照，不接管调用方缓冲区。
+  // 失败/边界：decode 遇到 image/model 为空、长度/对齐/保留位非法或 codec 校验失败时不发布部分字段。
   virtual function rdma_status decode(
     rdma_hw_image image,
     output rdma_hw_model model
@@ -28,6 +42,9 @@ class rdma_codec_registry_test_codec extends rdma_codec_base;
     return rdma_status::success();
   endfunction
 
+  // 功能：validate_model 校验 model 与当前对象状态的一致性，并显式处理“test model is null”等拒绝条件，返回 rdma_status 供上层决定是否提交。
+  // 输入/输出及副作用：model（输入）；validate_model 读取 model 并使用字段 rdma_status；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：必需对象/句柄/快照为空，或身份、范围、generation 和生命周期检查失败时返回非成功状态。
   virtual function rdma_status validate_model(rdma_hw_model model);
     if (model == null)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
@@ -35,6 +52,9 @@ class rdma_codec_registry_test_codec extends rdma_codec_base;
     return rdma_status::success();
   endfunction
 
+  // 功能：validate_image 校验 image 与当前对象状态的一致性，并显式处理“test image is null”等拒绝条件，返回 rdma_status 供上层决定是否提交。
+  // 输入/输出及副作用：image（输入）；validate_image 读取 image 并使用字段 rdma_status；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：必需对象/句柄/快照为空，或身份、范围、generation 和生命周期检查失败时返回非成功状态。
   virtual function rdma_status validate_image(rdma_hw_image image);
     if (image == null)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
@@ -42,10 +62,16 @@ class rdma_codec_registry_test_codec extends rdma_codec_base;
     return rdma_status::success();
   endfunction
 
+  // 功能：hardware_endian 使用 当前对象字段 计算并返回 rdma_byte_endian_e 结果；不修改对象字段或外部资源。
+  // 输入/输出及副作用：无显式参数；hardware_endian 读取固定返回值或局部计算结果，不使用对象成员字段；函数返回 rdma_byte_endian_e，不取得调用方资源所有权。
+  // 失败/边界：hardware_endian 是只读访问器，返回 endian_value；未覆盖枚举沿 default/类型默认分支返回，不改变对象和外部资源。
   virtual function rdma_byte_endian_e hardware_endian();
     return endian_value;
   endfunction
 
+  // 功能：describe_fields 把 当前对象字段 与当前对象的身份/状态字段编码为稳定文本，供日志、查找或恢复索引使用。
+  // 输入/输出及副作用：无显式参数；describe_fields 读取固定返回值或局部计算结果，不使用对象成员字段；函数返回 string，不取得调用方资源所有权。
+  // 失败/边界：枚举未定义或对象未配置时返回 UNKNOWN/UNCONFIGURED 表示，同时保留数值上下文。
   virtual function string describe_fields();
     return "test-only codec";
   endfunction
@@ -54,11 +80,17 @@ endclass
 class rdma_codec_duplicate_catcher extends uvm_report_catcher;
   bit duplicate_fatal_caught;
 
+  // 功能：构造 rdma_codec_duplicate_catcher，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：duplicate_fatal_caught=1'b0。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_codec_duplicate_catcher 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_codec_duplicate_catcher");
     super.new(name);
     duplicate_fatal_caught = 1'b0;
   endfunction
 
+  // 功能：在 rdma_codec_duplicate_catcher 中，catch 控制 catch 对应的等待、异常或同步边界，按超时/捕获结果返回状态，不吞掉原始错误。
+  // 输入/输出及副作用：无显式参数；catch 读取 对象字段：duplicate_fatal_caught 并使用字段 duplicate_fatal_caught；函数返回 action_e，不取得调用方资源所有权。
+  // 失败/边界：catch 超时或异常必须返回原始错误证据；不得无限等待或跳过同步边界。
   virtual function action_e catch();
     if (get_severity() == UVM_FATAL &&
         get_id() == "RDMA_CODEC_DUPLICATE") begin
@@ -72,11 +104,18 @@ endclass
 class rdma_codec_registry_test extends uvm_test;
   `uvm_component_utils(rdma_codec_registry_test)
 
+  // 功能：构造 rdma_codec_registry_test，调用 super.new 建立 UVM 层级对象；外部依赖字段保持未绑定，后续由 configure/build/activate 明确注入。
+  // 输入/输出及副作用：name、parent（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_codec_registry_test 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_codec_registry_test",
                uvm_component parent = null);
     super.new(name, parent);
   endfunction
 
+  // 功能：在 rdma_codec_registry_test 中，expect_status 在测试中执行 expect_status 断言，比较输入结果与期望状态并报告可定位的失败信息。
+  // 输入/输出及副作用：check_name（输入）、status（输入）、expected_code（输入）；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT
+  //   转移未声明的资源所有权。
+  // 失败/边界：测试函数 expect_status 缺少前置对象时报告断言错误，并停止依赖该对象的后续检查。
   function automatic void expect_status(
     string check_name,
     rdma_status status,
@@ -93,6 +132,9 @@ class rdma_codec_registry_test extends uvm_test;
                            status.convert2string()))
   endfunction
 
+  // 功能：在 rdma_codec_registry_test 中由 bytes_equal 逐字段比较输入值，返回结构、身份或序列化内容是否一致。
+  // 输入/输出及副作用：lhs（输入）、rhs（输入）；比较对象/数组只读；返回 bit 或状态结果，不更新 runtime、账本或外部 adapter。
+  // 失败/边界：bytes_equal 的任一比较对象为空或类型不符时返回确定的 false/不等结果，不抛出未处理异常。
   function automatic bit bytes_equal(
     byte unsigned lhs[],
     byte unsigned rhs[]
@@ -106,6 +148,9 @@ class rdma_codec_registry_test extends uvm_test;
     return 1'b1;
   endfunction
 
+  // 功能：在 rdma_codec_registry_test 中，run_phase 驱动 UVM 阶段中的场景初始化、事务执行和断言收尾，并在退出前释放 objection 或测试资源。
+  // 输入/输出及副作用：phase（输入）；phase 由 UVM 提供；task 通过 objection、日志和断言暴露结果，可能调用 DUT 接口但不改变其所有权规则。
+  // 失败/边界：run_phase 的 setup/阶段驱动失败时停止新增事务，并按测试生命周期清理 objection 与临时引用。
   task run_phase(uvm_phase phase);
     rdma_codec_registry registry;
     rdma_codec_registry_test_codec rc_codec;
@@ -130,9 +175,9 @@ class rdma_codec_registry_test extends uvm_test;
     registry = new("registry");
     rc_codec = new("rc_codec", RDMA_ENDIAN_LITTLE);
     second_codec = new("second_codec", RDMA_ENDIAN_BIG);
-    k_rc = '{hw_version:"xtr_v1", image_kind:RDMA_IMAGE_QPC,
+    k_rc = '{hw_version:"rdma", image_kind:RDMA_IMAGE_QPC,
              object_type:"qpc", variant:"rc", opcode:8'h00};
-    k_ud = '{hw_version:"xtr_v1", image_kind:RDMA_IMAGE_QPC,
+    k_ud = '{hw_version:"rdma", image_kind:RDMA_IMAGE_QPC,
              object_type:"qpc", variant:"ud", opcode:8'h00};
 
     if (rc_codec.hardware_endian() != RDMA_ENDIAN_LITTLE ||
@@ -183,8 +228,8 @@ class rdma_codec_registry_test extends uvm_test;
     expect_status("REG_REGISTER_UD", status, RDMA_SC_OK);
     registry.list_keys(keys);
     if (keys.size() != 2 ||
-        keys[0] != "xtr_v1|1|qpc|rc|00" ||
-        keys[1] != "xtr_v1|1|qpc|ud|00")
+        keys[0] != "rdma|1|qpc|rc|00" ||
+        keys[1] != "rdma|1|qpc|ud|00")
       `uvm_error("REG_KEYS",
                  $sformatf("unexpected canonical key list size=%0d", keys.size()))
 

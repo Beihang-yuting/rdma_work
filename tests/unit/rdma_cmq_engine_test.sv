@@ -1,3 +1,8 @@
+// 目录：测试层 unit/rdma_cmq_engine_test.sv。
+// 职责：验证 rdma_cmq_engine_test 对应模块的接口、错误路径和边界行为。
+// 依赖：依赖被测 package、UVM 测试基类和必要的 mock/fixture。
+// 所有权与生命周期：测试对象只拥有本地 fixture；外部后端句柄由测试环境提供并在测试结束释放。
+
 // 中文说明：rdma_cmq_engine_test.sv 属于单元测试，覆盖对应模型、编码器或执行器契约。
 // 阅读提示：先看公开类型和接口，再看实现细节；失败路径应保持状态与资源所有权可追踪。
 
@@ -146,6 +151,9 @@ class rdma_cmq_clone_fault_function_handle extends rdma_function_handle;
   rdma_function_handle alias_target;
   bit alias_once;
 
+  // 功能：构造 rdma_cmq_clone_fault_function_handle，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：clone_fault=RDMA_CMQ_TEST_CLONE_GOOD；alias_target=null；alias_once=1'b0。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_cmq_clone_fault_function_handle 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_cmq_clone_fault_function_handle");
     super.new(name);
     clone_fault = RDMA_CMQ_TEST_CLONE_GOOD;
@@ -153,14 +161,23 @@ class rdma_cmq_clone_fault_function_handle extends rdma_function_handle;
     alias_once = 1'b0;
   endfunction
 
+  // 功能：在 rdma_cmq_clone_fault_function_handle 中，clear_fault_clone_calls 按 owner、generation 和幂等规则释放/隔离记录，并同步删除其账本引用。
+  // 输入/输出及副作用：无显式参数；输入 action/epoch/handle 决定迁移目标；成功时更新状态或恢复证据，外部资源仍由其拥有者管理。
+  // 失败/边界：clear_fault_clone_calls 发现 owner/generation 不匹配、记录未知或重复释放时返回错误或幂等结果，不重新激活旧句柄。
   static function void clear_fault_clone_calls();
     fault_clone_calls = 0;
   endfunction
 
+  // 功能：fault_clone_call_count 复制 当前对象字段 的受控字段并生成独立快照，供查询、编码或恢复使用；源对象保持不变。
+  // 输入/输出及副作用：无显式参数；fault_clone_call_count 读取固定返回值或局部计算结果，不使用对象成员字段；函数返回 int unsigned，不取得调用方资源所有权。
+  // 失败/边界：fault_clone_call_count 的结果直接由 return fault_clone_calls 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   static function int unsigned fault_clone_call_count();
     return fault_clone_calls;
   endfunction
 
+  // 功能：将 rhs 中 rdma_cmq_clone_fault_function_handle 的值字段复制到当前对象，建立与源对象隔离的快照。
+  // 输入/输出及副作用：无显式参数；clone 读取 对象字段：rdma_status、clone_fault、alias_once 并使用字段 alias_once；函数返回 uvm_object，不取得调用方资源所有权。
+  // 失败/边界：clone 输入对象为空或查找未命中时返回 null；该路径不隐式重试，也不转移未声明资源。
   virtual function uvm_object clone();
     if (clone_fault != RDMA_CMQ_TEST_CLONE_GOOD)
       fault_clone_calls++;
@@ -191,12 +208,18 @@ class rdma_cmq_clone_fault_handle extends rdma_handle;
   rdma_cmq_test_clone_fault_e clone_fault;
   rdma_handle alias_target;
 
+  // 功能：构造 rdma_cmq_clone_fault_handle，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：clone_fault=RDMA_CMQ_TEST_CLONE_GOOD；alias_target=null。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_cmq_clone_fault_handle 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_cmq_clone_fault_handle");
     super.new(name);
     clone_fault = RDMA_CMQ_TEST_CLONE_GOOD;
     alias_target = null;
   endfunction
 
+  // 功能：将 rhs 中 rdma_cmq_clone_fault_handle 的值字段复制到当前对象，建立与源对象隔离的快照。
+  // 输入/输出及副作用：无显式参数；clone 读取 对象字段：rdma_status、alias_target 并使用字段 rdma_status、alias_target；函数返回 uvm_object，不取得调用方资源所有权。
+  // 失败/边界：clone 输入对象为空或查找未命中时返回 null；该路径不隐式重试，也不转移未声明资源。
   virtual function uvm_object clone();
     case (clone_fault)
       RDMA_CMQ_TEST_CLONE_NULL: return null;
@@ -218,11 +241,17 @@ class rdma_cmq_clone_fault_qpc extends rdma_qpc_model;
 
   rdma_cmq_test_clone_fault_e clone_fault;
 
+  // 功能：构造 rdma_cmq_clone_fault_qpc，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：clone_fault=RDMA_CMQ_TEST_CLONE_GOOD。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_cmq_clone_fault_qpc 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_cmq_clone_fault_qpc");
     super.new(name);
     clone_fault = RDMA_CMQ_TEST_CLONE_GOOD;
   endfunction
 
+  // 功能：将 rhs 中 rdma_cmq_clone_fault_qpc 的值字段复制到当前对象，建立与源对象隔离的快照。
+  // 输入/输出及副作用：无显式参数；clone 读取 对象字段：rdma_status 并使用字段 rdma_status；函数返回 uvm_object，不取得调用方资源所有权。
+  // 失败/边界：clone 输入对象为空或查找未命中时返回 null；该路径不隐式重试，也不转移未声明资源。
   virtual function uvm_object clone();
     case (clone_fault)
       RDMA_CMQ_TEST_CLONE_NULL: return null;
@@ -245,19 +274,31 @@ class rdma_cmq_scalar_extension_qpc extends rdma_qpc_model;
 
   int unsigned extension_value;
 
+  // 功能：构造 rdma_cmq_scalar_extension_qpc，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：extension_value=0。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_cmq_scalar_extension_qpc 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_cmq_scalar_extension_qpc");
     super.new(name);
     extension_value = 0;
   endfunction
 
+  // 功能：在 rdma_cmq_scalar_extension_qpc 中，clear_hostile_clone_calls 按 owner、generation 和幂等规则释放/隔离记录，并同步删除其账本引用。
+  // 输入/输出及副作用：无显式参数；输入 action/epoch/handle 决定迁移目标；成功时更新状态或恢复证据，外部资源仍由其拥有者管理。
+  // 失败/边界：clear_hostile_clone_calls 发现 owner/generation 不匹配、记录未知或重复释放时返回错误或幂等结果，不重新激活旧句柄。
   static function void clear_hostile_clone_calls();
     hostile_clone_calls = 0;
   endfunction
 
+  // 功能：在 rdma_cmq_scalar_extension_qpc 中，clone_call_count 将 rhs 中 rdma_cmq_scalar_extension_qpc 的值字段复制到当前对象，建立与源对象隔离的快照。
+  // 输入/输出及副作用：无显式参数；clone_call_count 读取固定返回值或局部计算结果，不使用对象成员字段；函数返回 int unsigned，不取得调用方资源所有权。
+  // 失败/边界：clone_call_count 的结果直接由 return hostile_clone_calls 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   static function int unsigned clone_call_count();
     return hostile_clone_calls;
   endfunction
 
+  // 功能：在 rdma_cmq_scalar_extension_qpc 中，clone 将 rhs 中 rdma_cmq_scalar_extension_qpc 的值字段复制到当前对象，建立与源对象隔离的快照。
+  // 输入/输出及副作用：无显式参数；clone 读取局部计算结果，并使用字段 result；函数返回 uvm_object，不取得调用方资源所有权。
+  // 失败/边界：clone 下游操作失败时原样传播其 status/result，不伪造成功；该路径不隐式重试，也不转移未声明资源。
   virtual function uvm_object clone();
     rdma_cmq_scalar_extension_qpc result;
 
@@ -277,19 +318,31 @@ class rdma_cmq_edge_extension_qpc extends rdma_qpc_model;
 
   rdma_handle extension_h;
 
+  // 功能：构造 rdma_cmq_edge_extension_qpc，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：extension_h=null。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_cmq_edge_extension_qpc 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_cmq_edge_extension_qpc");
     super.new(name);
     extension_h = null;
   endfunction
 
+  // 功能：在 rdma_cmq_edge_extension_qpc 中，clear_hostile_clone_calls 按 owner、generation 和幂等规则释放/隔离记录，并同步删除其账本引用。
+  // 输入/输出及副作用：无显式参数；输入 action/epoch/handle 决定迁移目标；成功时更新状态或恢复证据，外部资源仍由其拥有者管理。
+  // 失败/边界：clear_hostile_clone_calls 发现 owner/generation 不匹配、记录未知或重复释放时返回错误或幂等结果，不重新激活旧句柄。
   static function void clear_hostile_clone_calls();
     hostile_clone_calls = 0;
   endfunction
 
+  // 功能：在 rdma_cmq_edge_extension_qpc 中，clone_call_count 将 rhs 中 rdma_cmq_edge_extension_qpc 的值字段复制到当前对象，建立与源对象隔离的快照。
+  // 输入/输出及副作用：无显式参数；clone_call_count 读取固定返回值或局部计算结果，不使用对象成员字段；函数返回 int unsigned，不取得调用方资源所有权。
+  // 失败/边界：clone_call_count 的结果直接由 return hostile_clone_calls 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   static function int unsigned clone_call_count();
     return hostile_clone_calls;
   endfunction
 
+  // 功能：在 rdma_cmq_edge_extension_qpc 中，clone 将 rhs 中 rdma_cmq_edge_extension_qpc 的值字段复制到当前对象，建立与源对象隔离的快照。
+  // 输入/输出及副作用：无显式参数；clone 读取局部计算结果，并使用字段 result、result.extension_h；函数返回 uvm_object，不取得调用方资源所有权。
+  // 失败/边界：clone 下游操作失败时原样传播其 status/result，不伪造成功；该路径不隐式重试，也不转移未声明资源。
   virtual function uvm_object clone();
     rdma_cmq_edge_extension_qpc result;
 
@@ -309,6 +362,9 @@ class rdma_cmq_scalar_extension_function_handle
 
   int unsigned extension_value;
 
+  // 功能：构造 rdma_cmq_scalar_extension_function_handle，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：extension_value=0。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_cmq_scalar_extension_function_handle 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(
     string name = "rdma_cmq_scalar_extension_function_handle"
   );
@@ -322,6 +378,9 @@ class rdma_cmq_edge_extension_handle extends rdma_handle;
 
   rdma_handle extension_h;
 
+  // 功能：构造 rdma_cmq_edge_extension_handle，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：extension_h=null。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_cmq_edge_extension_handle 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_cmq_edge_extension_handle");
     super.new(name);
     extension_h = null;
@@ -333,11 +392,17 @@ class rdma_cmq_clone_fault_page_layout extends rdma_page_table_layout;
 
   rdma_cmq_test_clone_fault_e clone_fault;
 
+  // 功能：构造 rdma_cmq_clone_fault_page_layout，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：clone_fault=RDMA_CMQ_TEST_CLONE_GOOD。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_cmq_clone_fault_page_layout 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_cmq_clone_fault_page_layout");
     super.new(name);
     clone_fault = RDMA_CMQ_TEST_CLONE_GOOD;
   endfunction
 
+  // 功能：将 rhs 中 rdma_cmq_clone_fault_page_layout 的值字段复制到当前对象，建立与源对象隔离的快照。
+  // 输入/输出及副作用：无显式参数；clone 读取 对象字段：rdma_status 并使用字段 rdma_status；函数返回 uvm_object，不取得调用方资源所有权。
+  // 失败/边界：clone 输入对象为空或查找未命中时返回 null；该路径不隐式重试，也不转移未声明资源。
   virtual function uvm_object clone();
     case (clone_fault)
       RDMA_CMQ_TEST_CLONE_NULL: return null;
@@ -354,11 +419,17 @@ class rdma_cmq_clone_fault_mr_page_layout extends rdma_mr_page_layout;
 
   rdma_cmq_test_clone_fault_e clone_fault;
 
+  // 功能：构造 rdma_cmq_clone_fault_mr_page_layout，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：clone_fault=RDMA_CMQ_TEST_CLONE_GOOD。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_cmq_clone_fault_mr_page_layout 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_cmq_clone_fault_mr_page_layout");
     super.new(name);
     clone_fault = RDMA_CMQ_TEST_CLONE_GOOD;
   endfunction
 
+  // 功能：将 rhs 中 rdma_cmq_clone_fault_mr_page_layout 的值字段复制到当前对象，建立与源对象隔离的快照。
+  // 输入/输出及副作用：无显式参数；clone 读取 对象字段：rdma_status 并使用字段 rdma_status；函数返回 uvm_object，不取得调用方资源所有权。
+  // 失败/边界：clone 输入对象为空或查找未命中时返回 null；该路径不隐式重试，也不转移未声明资源。
   virtual function uvm_object clone();
     case (clone_fault)
       RDMA_CMQ_TEST_CLONE_NULL: return null;
@@ -376,12 +447,18 @@ class rdma_cmq_clone_fault_ring extends rdma_ring_position;
   rdma_cmq_test_clone_fault_e clone_fault;
   rdma_ring_position alias_target;
 
+  // 功能：构造 rdma_cmq_clone_fault_ring，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：clone_fault=RDMA_CMQ_TEST_CLONE_GOOD；alias_target=null。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_cmq_clone_fault_ring 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_cmq_clone_fault_ring");
     super.new(name);
     clone_fault = RDMA_CMQ_TEST_CLONE_GOOD;
     alias_target = null;
   endfunction
 
+  // 功能：将 rhs 中 rdma_cmq_clone_fault_ring 的值字段复制到当前对象，建立与源对象隔离的快照。
+  // 输入/输出及副作用：无显式参数；clone 读取 对象字段：rdma_status、alias_target 并使用字段 rdma_status、alias_target；函数返回 uvm_object，不取得调用方资源所有权。
+  // 失败/边界：clone 输入对象为空或查找未命中时返回 null；该路径不隐式重试，也不转移未声明资源。
   virtual function uvm_object clone();
     case (clone_fault)
       RDMA_CMQ_TEST_CLONE_NULL: return null;
@@ -403,11 +480,17 @@ class rdma_cmq_clone_fault_aeqc extends rdma_aeqc_model;
 
   rdma_cmq_test_clone_fault_e clone_fault;
 
+  // 功能：构造 rdma_cmq_clone_fault_aeqc，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：clone_fault=RDMA_CMQ_TEST_CLONE_GOOD。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_cmq_clone_fault_aeqc 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_cmq_clone_fault_aeqc");
     super.new(name);
     clone_fault = RDMA_CMQ_TEST_CLONE_GOOD;
   endfunction
 
+  // 功能：将 rhs 中 rdma_cmq_clone_fault_aeqc 的值字段复制到当前对象，建立与源对象隔离的快照。
+  // 输入/输出及副作用：无显式参数；clone 读取 对象字段：clone_fault 并使用字段 clone_fault；函数返回 uvm_object，不取得调用方资源所有权。
+  // 失败/边界：clone 先检查 clone_fault == RDMA_CMQ_TEST_CLONE_MUTATE，再返回 super.clone()；拒绝分支不提交部分状态，也不隐式重试。
   virtual function uvm_object clone();
     if (clone_fault == RDMA_CMQ_TEST_CLONE_MUTATE) begin
       vector_id++;
@@ -420,14 +503,23 @@ endclass
 class rdma_cmq_unknown_body extends rdma_hw_model;
   `uvm_object_utils(rdma_cmq_unknown_body)
 
+  // 功能：构造 rdma_cmq_unknown_body，调用 super.new 建立 UVM 层级对象；外部依赖字段保持未绑定，后续由 configure/build/activate 明确注入。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_cmq_unknown_body 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_cmq_unknown_body");
     super.new(name);
   endfunction
 
+  // 功能：validate 校验 当前对象字段 与当前对象状态的一致性，返回 rdma_status 供上层决定是否提交。
+  // 输入/输出及副作用：无显式参数；validate 读取 对象字段：rdma_status 并使用字段 rdma_status；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：validate 的结果直接由 return rdma_status::success() 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   virtual function rdma_status validate();
     return rdma_status::success();
   endfunction
 
+  // 功能：describe 把 当前对象字段 与当前对象的身份/状态字段编码为稳定文本，供日志、查找或恢复索引使用。
+  // 输入/输出及副作用：无显式参数；无显式输入；返回 string，只读取对象字段，不修改模型或资源账本。
+  // 失败/边界：枚举未定义或对象未配置时返回 UNKNOWN/UNCONFIGURED 表示，同时保留数值上下文。
   virtual function string describe();
     return "unknown CMQ body";
   endfunction
@@ -445,6 +537,9 @@ class rdma_cmq_profile_hook_body extends rdma_hw_model;
   bit first_clone_succeeds;
   int unsigned clone_calls;
 
+  // 功能：构造 rdma_cmq_profile_hook_body，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：value=0；nested_h=null；validation_returns_null=1'b0；validation_fails=1'b0；first_clone_succeeds=1'b0；clone_calls=0。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_cmq_profile_hook_body 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_cmq_profile_hook_body");
     super.new(name);
     value = 0;
@@ -455,14 +550,23 @@ class rdma_cmq_profile_hook_body extends rdma_hw_model;
     clone_calls = 0;
   endfunction
 
+  // 功能：在 rdma_cmq_profile_hook_body 中，clear_hostile_clone_calls 按 owner、generation 和幂等规则释放/隔离记录，并同步删除其账本引用。
+  // 输入/输出及副作用：无显式参数；输入 action/epoch/handle 决定迁移目标；成功时更新状态或恢复证据，外部资源仍由其拥有者管理。
+  // 失败/边界：clear_hostile_clone_calls 发现 owner/generation 不匹配、记录未知或重复释放时返回错误或幂等结果，不重新激活旧句柄。
   static function void clear_hostile_clone_calls();
     hostile_clone_calls = 0;
   endfunction
 
+  // 功能：在 rdma_cmq_profile_hook_body 中，clone_call_count 将 rhs 中 rdma_cmq_profile_hook_body 的值字段复制到当前对象，建立与源对象隔离的快照。
+  // 输入/输出及副作用：无显式参数；clone_call_count 读取固定返回值或局部计算结果，不使用对象成员字段；函数返回 int unsigned，不取得调用方资源所有权。
+  // 失败/边界：clone_call_count 的结果直接由 return hostile_clone_calls 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   static function int unsigned clone_call_count();
     return hostile_clone_calls;
   endfunction
 
+  // 功能：在 rdma_cmq_profile_hook_body 中，clone 将 rhs 中 rdma_cmq_profile_hook_body 的值字段复制到当前对象，建立与源对象隔离的快照。
+  // 输入/输出及副作用：无显式参数；clone 读取 对象字段：first_clone_succeeds、clone_calls、nested_h 并使用字段 result、result.value、result.nested_h、nested_h.kind、nested_h.function_uid、nested_h.object_id、nested_h.generation；函数返回 uvm_object，不取得调用方资源所有权。
+  // 失败/边界：clone 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（hostile custom CMQ body clone must not be called），不保留部分有效快照。
   virtual function uvm_object clone();
     rdma_cmq_profile_hook_body result;
 
@@ -489,6 +593,9 @@ class rdma_cmq_profile_hook_body extends rdma_hw_model;
     return null;
   endfunction
 
+  // 功能：validate 校验 当前对象字段 与当前对象状态的一致性，并显式处理“injected custom CMQ body snapshot validation failure”；“custom CMQ body handle is null”等拒绝条件，返回 rdma_status 供上层决定是否提交。
+  // 输入/输出及副作用：无显式参数；validate 读取 对象字段：rdma_status、validation_returns_null、validation_fails、nested_h 并使用字段 rdma_status、validation_returns_null、validation_fails、nested_h；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：validate 返回 RDMA_SC_INVALID_ARGUMENT；具体拒绝条件包括 “injected custom CMQ body snapshot validation failure”；“custom CMQ body handle is null”；失败路径不提交部分状态、不隐式重试，也不转移未声明资源。
   virtual function rdma_status validate();
     if (validation_returns_null)
       return null;
@@ -503,6 +610,9 @@ class rdma_cmq_profile_hook_body extends rdma_hw_model;
     return rdma_status::success();
   endfunction
 
+  // 功能：describe 把 当前对象字段 与当前对象的身份/状态字段编码为稳定文本，供日志、查找或恢复索引使用。
+  // 输入/输出及副作用：无显式参数；无显式输入；返回 string，只读取对象字段，不修改模型或资源账本。
+  // 失败/边界：枚举未定义或对象未配置时返回 UNKNOWN/UNCONFIGURED 表示，同时保留数值上下文。
   virtual function string describe();
     return $sformatf("custom hook body value=%0d", value);
   endfunction
@@ -511,11 +621,17 @@ endclass
 class rdma_cmq_copy_fatal_catcher extends uvm_report_catcher;
   int unsigned caught_count;
 
+  // 功能：构造 rdma_cmq_copy_fatal_catcher，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：caught_count=0。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_cmq_copy_fatal_catcher 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_cmq_copy_fatal_catcher");
     super.new(name);
     caught_count = 0;
   endfunction
 
+  // 功能：在 rdma_cmq_copy_fatal_catcher 中，catch 控制 catch 对应的等待、异常或同步边界，按超时/捕获结果返回状态，不吞掉原始错误。
+  // 输入/输出及副作用：无显式参数；catch 读取固定返回值或局部计算结果，不使用对象成员字段；函数返回 action_e，不取得调用方资源所有权。
+  // 失败/边界：catch 超时或异常必须返回原始错误证据；不得无限等待或跳过同步边界。
   virtual function action_e catch();
     if (get_severity() == UVM_FATAL && get_id() == "RDMA_COPY_TYPE") begin
       caught_count++;
@@ -530,11 +646,17 @@ class rdma_cmq_clone_fault_opcode_key extends rdma_cmq_opcode_key;
 
   rdma_cmq_test_clone_fault_e clone_fault;
 
+  // 功能：构造 rdma_cmq_clone_fault_opcode_key，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：clone_fault=RDMA_CMQ_TEST_CLONE_GOOD。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_cmq_clone_fault_opcode_key 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_cmq_clone_fault_opcode_key");
     super.new(name);
     clone_fault = RDMA_CMQ_TEST_CLONE_GOOD;
   endfunction
 
+  // 功能：将 rhs 中 rdma_cmq_clone_fault_opcode_key 的值字段复制到当前对象，建立与源对象隔离的快照。
+  // 输入/输出及副作用：无显式参数；clone 读取 对象字段：rdma_status、variant 并使用字段 variant；函数返回 uvm_object，不取得调用方资源所有权。
+  // 失败/边界：clone 输入对象为空或查找未命中时返回 null；该路径不隐式重试，也不转移未声明资源。
   virtual function uvm_object clone();
     case (clone_fault)
       RDMA_CMQ_TEST_CLONE_NULL: return null;
@@ -555,11 +677,17 @@ class rdma_cmq_clone_fault_body extends rdma_cmq_sqe_model;
 
   rdma_cmq_test_clone_fault_e clone_fault;
 
+  // 功能：构造 rdma_cmq_clone_fault_body，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：clone_fault=RDMA_CMQ_TEST_CLONE_GOOD。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_cmq_clone_fault_body 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_cmq_clone_fault_body");
     super.new(name);
     clone_fault = RDMA_CMQ_TEST_CLONE_GOOD;
   endfunction
 
+  // 功能：将 rhs 中 rdma_cmq_clone_fault_body 的值字段复制到当前对象，建立与源对象隔离的快照。
+  // 输入/输出及副作用：无显式参数；clone 读取 对象字段：rdma_status 并使用字段 rdma_status；函数返回 uvm_object，不取得调用方资源所有权。
+  // 失败/边界：clone 输入对象为空或查找未命中时返回 null；该路径不隐式重试，也不转移未声明资源。
   virtual function uvm_object clone();
     case (clone_fault)
       RDMA_CMQ_TEST_CLONE_NULL: return null;
@@ -580,11 +708,17 @@ class rdma_cmq_clone_fault_image extends rdma_hw_image;
 
   rdma_cmq_test_clone_fault_e clone_fault;
 
+  // 功能：构造 rdma_cmq_clone_fault_image，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：clone_fault=RDMA_CMQ_TEST_CLONE_GOOD。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_cmq_clone_fault_image 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_cmq_clone_fault_image");
     super.new(name);
     clone_fault = RDMA_CMQ_TEST_CLONE_GOOD;
   endfunction
 
+  // 功能：将 rhs 中 rdma_cmq_clone_fault_image 的值字段复制到当前对象，建立与源对象隔离的快照。
+  // 输入/输出及副作用：无显式参数；clone 读取固定返回值或局部计算结果，不使用对象成员字段；函数返回 uvm_object，不取得调用方资源所有权。
+  // 失败/边界：clone 输入对象为空或查找未命中时返回 null；该路径不隐式重试，也不转移未声明资源。
   virtual function uvm_object clone();
     case (clone_fault)
       RDMA_CMQ_TEST_CLONE_NULL: return null;
@@ -611,6 +745,9 @@ class rdma_cmq_poll_raw_self_image extends rdma_hw_image;
   bit stateful_clone;
   int unsigned stateful_clone_calls;
 
+  // 功能：构造 rdma_cmq_poll_raw_self_image，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：self_clone=1'b0；stateful_clone=1'b0；stateful_clone_calls=0；self_clone=1'b1；arm_next_raw_self_clone=1'b0；stateful_clone=1'b1；arm_next_raw_stateful_clone=1'b0。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_cmq_poll_raw_self_image 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_cmq_poll_raw_self_image");
     super.new(name);
     self_clone = 1'b0;
@@ -626,27 +763,45 @@ class rdma_cmq_poll_raw_self_image extends rdma_hw_image;
     end
   endfunction
 
+  // 功能：在 rdma_cmq_poll_raw_self_image 中，arm_next_raw 推进队列/事务游标或执行对应 I/O，并把结果写回声明的输出参数。
+  // 输入/输出及副作用：无显式参数；arm_next_raw 读取 对象字段：arm_next_raw_self_clone 并使用字段 arm_next_raw_self_clone；函数返回 void，不取得调用方资源所有权。
+  // 失败/边界：arm_next_raw 无返回值，仅执行 arm_next_raw_self_clone=1'b1；调用方须保证前置依赖已经绑定，函数不自动重试或接管外部资源。
   static function void arm_next_raw();
     arm_next_raw_self_clone = 1'b1;
   endfunction
 
+  // 功能：在 rdma_cmq_poll_raw_self_image 中，arm_next_raw_stateful 推进队列/事务游标或执行对应 I/O，并把结果写回声明的输出参数。
+  // 输入/输出及副作用：无显式参数；arm_next_raw_stateful 读取 对象字段：arm_next_raw_stateful_clone 并使用字段 arm_next_raw_stateful_clone；函数返回 void，不取得调用方资源所有权。
+  // 失败/边界：arm_next_raw_stateful 无返回值，仅执行 arm_next_raw_stateful_clone=1'b1；调用方须保证前置依赖已经绑定，函数不自动重试或接管外部资源。
   static function void arm_next_raw_stateful();
     arm_next_raw_stateful_clone = 1'b1;
   endfunction
 
+  // 功能：在 rdma_cmq_poll_raw_self_image 中，clear_clone_calls 按 owner、generation 和幂等规则释放/隔离记录，并同步删除其账本引用。
+  // 输入/输出及副作用：无显式参数；输入 action/epoch/handle 决定迁移目标；成功时更新状态或恢复证据，外部资源仍由其拥有者管理。
+  // 失败/边界：clear_clone_calls 发现 owner/generation 不匹配、记录未知或重复释放时返回错误或幂等结果，不重新激活旧句柄。
   static function void clear_clone_calls();
     total_clone_calls = 0;
   endfunction
 
+  // 功能：在 rdma_cmq_poll_raw_self_image 中，clone_call_count 将 rhs 中 rdma_cmq_poll_raw_self_image 的值字段复制到当前对象，建立与源对象隔离的快照。
+  // 输入/输出及副作用：无显式参数；clone_call_count 读取固定返回值或局部计算结果，不使用对象成员字段；函数返回 int unsigned，不取得调用方资源所有权。
+  // 失败/边界：clone_call_count 的结果直接由 return total_clone_calls 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   static function int unsigned clone_call_count();
     return total_clone_calls;
   endfunction
 
+  // 功能：在 rdma_cmq_poll_raw_self_image 中，disarm 按 owner、generation 和幂等规则释放/隔离记录，并同步删除其账本引用。
+  // 输入/输出及副作用：无显式参数；disarm 读取 对象字段：arm_next_raw_self_clone、arm_next_raw_stateful_clone 并使用字段 arm_next_raw_self_clone、arm_next_raw_stateful_clone；函数返回 void，不取得调用方资源所有权。
+  // 失败/边界：disarm 发现 owner/generation 不匹配、记录未知或重复释放时返回错误或幂等结果，不重新激活旧句柄。
   static function void disarm();
     arm_next_raw_self_clone = 1'b0;
     arm_next_raw_stateful_clone = 1'b0;
   endfunction
 
+  // 功能：在 rdma_cmq_poll_raw_self_image 中，do_copy 将 rhs 中 rdma_cmq_poll_raw_self_image 的字段复制到当前对象，建立与源对象隔离的值快照。
+  // 输入/输出及副作用：rhs（输入）；rhs 是源对象；当前对象字段会被覆盖，嵌套句柄按实现执行 clone 或保持非拥有引用，源对象不被修改。
+  // 失败/边界：do_copy 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（poll raw image copy type mismatch），不保留部分有效快照。
   virtual function void do_copy(uvm_object rhs);
     rdma_cmq_poll_raw_self_image rhs_image;
 
@@ -659,6 +814,9 @@ class rdma_cmq_poll_raw_self_image extends rdma_hw_image;
     stateful_clone_calls = rhs_image.stateful_clone_calls;
   endfunction
 
+  // 功能：在 rdma_cmq_poll_raw_self_image 中，clone 将 rhs 中 rdma_cmq_poll_raw_self_image 的值字段复制到当前对象，建立与源对象隔离的快照。
+  // 输入/输出及副作用：无显式参数；clone 读取 对象字段：self_clone、stateful_clone、stateful_clone_calls 并使用字段 cloned_object、stateful_clone；函数返回 uvm_object，不取得调用方资源所有权。
+  // 失败/边界：clone 先检查 self_clone；stateful_clone；stateful_clone_calls == 2 && bytes.size(，再返回 this；cloned_object；super.clone()；拒绝分支不提交部分状态，也不隐式重试。
   virtual function uvm_object clone();
     uvm_object cloned_object;
 
@@ -684,12 +842,18 @@ class rdma_cmq_self_clone_completion_payload extends uvm_object;
   int unsigned value;
   rdma_handle nested_h;
 
+  // 功能：构造 rdma_cmq_self_clone_completion_payload，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：value=0；nested_h=null。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_cmq_self_clone_completion_payload 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_cmq_self_clone_completion_payload");
     super.new(name);
     value = 0;
     nested_h = null;
   endfunction
 
+  // 功能：将 rhs 中 rdma_cmq_self_clone_completion_payload 的值字段复制到当前对象，建立与源对象隔离的快照。
+  // 输入/输出及副作用：无显式参数；clone 读取固定返回值或局部计算结果，不使用对象成员字段；函数返回 uvm_object，不取得调用方资源所有权。
+  // 失败/边界：clone 的结果直接由 return this 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   virtual function uvm_object clone();
     return this;
   endfunction
@@ -700,11 +864,17 @@ class rdma_cmq_clone_fault_expected extends rdma_cmq_expected_response;
 
   rdma_cmq_test_clone_fault_e clone_fault;
 
+  // 功能：构造 rdma_cmq_clone_fault_expected，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：clone_fault=RDMA_CMQ_TEST_CLONE_GOOD。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_cmq_clone_fault_expected 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_cmq_clone_fault_expected");
     super.new(name);
     clone_fault = RDMA_CMQ_TEST_CLONE_GOOD;
   endfunction
 
+  // 功能：将 rhs 中 rdma_cmq_clone_fault_expected 的值字段复制到当前对象，建立与源对象隔离的快照。
+  // 输入/输出及副作用：无显式参数；clone 读取 对象字段：variant 并使用字段 variant；函数返回 uvm_object，不取得调用方资源所有权。
+  // 失败/边界：clone 输入对象为空或查找未命中时返回 null；该路径不隐式重试，也不转移未声明资源。
   virtual function uvm_object clone();
     case (clone_fault)
       RDMA_CMQ_TEST_CLONE_NULL: return null;
@@ -723,22 +893,37 @@ class rdma_cmq_failing_slot_context extends rdma_cmq_slot_context;
 
   local static bit arm_failure;
 
+  // 功能：构造 rdma_cmq_failing_slot_context，调用 super.new 建立 UVM 层级对象；外部依赖字段保持未绑定，后续由 configure/build/activate 明确注入。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_cmq_failing_slot_context 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_cmq_failing_slot_context");
     super.new(name);
   endfunction
 
+  // 功能：在 rdma_cmq_failing_slot_context 中，arm 校验依赖和 binding 后建立运行边界，只保存非拥有引用并拒绝重复配置。
+  // 输入/输出及副作用：无显式参数；arm 读取 对象字段：arm_failure 并使用字段 arm_failure；函数返回 void，不取得调用方资源所有权。
+  // 失败/边界：arm 无返回值，仅执行 arm_failure=1'b1；调用方须保证前置依赖已经绑定，函数不自动重试或接管外部资源。
   static function void arm();
     arm_failure = 1'b1;
   endfunction
 
+  // 功能：在 rdma_cmq_failing_slot_context 中，disarm 按 owner、generation 和幂等规则释放/隔离记录，并同步删除其账本引用。
+  // 输入/输出及副作用：无显式参数；disarm 读取 对象字段：arm_failure 并使用字段 arm_failure；函数返回 void，不取得调用方资源所有权。
+  // 失败/边界：disarm 发现 owner/generation 不匹配、记录未知或重复释放时返回错误或幂等结果，不重新激活旧句柄。
   static function void disarm();
     arm_failure = 1'b0;
   endfunction
 
+  // 功能：在 rdma_cmq_failing_slot_context 中，armed 判断 armed 对应的状态、能力或账本条件，并返回确定的布尔/计数结果，不修改状态。
+  // 输入/输出及副作用：无显式参数；armed 读取固定返回值或局部计算结果，不使用对象成员字段；函数返回 bit，不取得调用方资源所有权。
+  // 失败/边界：armed 只读取现有账本；输入未初始化时返回保守结果，不得借助默认 Function/root 猜测。
   static function bit armed();
     return arm_failure;
   endfunction
 
+  // 功能：将 rhs 中 rdma_cmq_failing_slot_context 的值字段复制到当前对象，建立与源对象隔离的快照。
+  // 输入/输出及副作用：无显式参数；clone 读取 对象字段：arm_failure、sq_index 并使用字段 arm_failure；函数返回 uvm_object，不取得调用方资源所有权。
+  // 失败/边界：clone 先检查 arm_failure && sq_index == 1，再返回 this；super.clone()；拒绝分支不提交部分状态，也不隐式重试。
   virtual function uvm_object clone();
     if (arm_failure && sq_index == 1) begin
       arm_failure = 1'b0;
@@ -753,22 +938,37 @@ class rdma_cmq_failing_ticket extends rdma_cmq_ticket;
 
   local static bit arm_failure;
 
+  // 功能：构造 rdma_cmq_failing_ticket，调用 super.new 建立 UVM 层级对象；外部依赖字段保持未绑定，后续由 configure/build/activate 明确注入。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_cmq_failing_ticket 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_cmq_failing_ticket");
     super.new(name);
   endfunction
 
+  // 功能：在 rdma_cmq_failing_ticket 中，arm 校验依赖和 binding 后建立运行边界，只保存非拥有引用并拒绝重复配置。
+  // 输入/输出及副作用：无显式参数；arm 读取 对象字段：arm_failure 并使用字段 arm_failure；函数返回 void，不取得调用方资源所有权。
+  // 失败/边界：arm 无返回值，仅执行 arm_failure=1'b1；调用方须保证前置依赖已经绑定，函数不自动重试或接管外部资源。
   static function void arm();
     arm_failure = 1'b1;
   endfunction
 
+  // 功能：在 rdma_cmq_failing_ticket 中，disarm 按 owner、generation 和幂等规则释放/隔离记录，并同步删除其账本引用。
+  // 输入/输出及副作用：无显式参数；disarm 读取 对象字段：arm_failure 并使用字段 arm_failure；函数返回 void，不取得调用方资源所有权。
+  // 失败/边界：disarm 发现 owner/generation 不匹配、记录未知或重复释放时返回错误或幂等结果，不重新激活旧句柄。
   static function void disarm();
     arm_failure = 1'b0;
   endfunction
 
+  // 功能：在 rdma_cmq_failing_ticket 中，armed 判断 armed 对应的状态、能力或账本条件，并返回确定的布尔/计数结果，不修改状态。
+  // 输入/输出及副作用：无显式参数；armed 读取固定返回值或局部计算结果，不使用对象成员字段；函数返回 bit，不取得调用方资源所有权。
+  // 失败/边界：armed 只读取现有账本；输入未初始化时返回保守结果，不得借助默认 Function/root 猜测。
   static function bit armed();
     return arm_failure;
   endfunction
 
+  // 功能：将 rhs 中 rdma_cmq_failing_ticket 的值字段复制到当前对象，建立与源对象隔离的快照。
+  // 输入/输出及副作用：无显式参数；clone 读取 对象字段：arm_failure、sq_index 并使用字段 arm_failure；函数返回 uvm_object，不取得调用方资源所有权。
+  // 失败/边界：clone 先检查 arm_failure && sq_index == 1，再返回 this；super.clone()；拒绝分支不提交部分状态，也不隐式重试。
   virtual function uvm_object clone();
     if (arm_failure && sq_index == 1) begin
       arm_failure = 1'b0;
@@ -783,22 +983,37 @@ class rdma_cmq_failing_slot_record extends rdma_cmq_slot_record;
 
   local static bit arm_failure;
 
+  // 功能：构造 rdma_cmq_failing_slot_record，调用 super.new 建立 UVM 层级对象；外部依赖字段保持未绑定，后续由 configure/build/activate 明确注入。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_cmq_failing_slot_record 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_cmq_failing_slot_record");
     super.new(name);
   endfunction
 
+  // 功能：在 rdma_cmq_failing_slot_record 中，arm 校验依赖和 binding 后建立运行边界，只保存非拥有引用并拒绝重复配置。
+  // 输入/输出及副作用：无显式参数；arm 读取 对象字段：arm_failure 并使用字段 arm_failure；函数返回 void，不取得调用方资源所有权。
+  // 失败/边界：arm 无返回值，仅执行 arm_failure=1'b1；调用方须保证前置依赖已经绑定，函数不自动重试或接管外部资源。
   static function void arm();
     arm_failure = 1'b1;
   endfunction
 
+  // 功能：在 rdma_cmq_failing_slot_record 中，disarm 按 owner、generation 和幂等规则释放/隔离记录，并同步删除其账本引用。
+  // 输入/输出及副作用：无显式参数；disarm 读取 对象字段：arm_failure 并使用字段 arm_failure；函数返回 void，不取得调用方资源所有权。
+  // 失败/边界：disarm 发现 owner/generation 不匹配、记录未知或重复释放时返回错误或幂等结果，不重新激活旧句柄。
   static function void disarm();
     arm_failure = 1'b0;
   endfunction
 
+  // 功能：在 rdma_cmq_failing_slot_record 中，armed 判断 armed 对应的状态、能力或账本条件，并返回确定的布尔/计数结果，不修改状态。
+  // 输入/输出及副作用：无显式参数；armed 读取固定返回值或局部计算结果，不使用对象成员字段；函数返回 bit，不取得调用方资源所有权。
+  // 失败/边界：armed 只读取现有账本；输入未初始化时返回保守结果，不得借助默认 Function/root 猜测。
   static function bit armed();
     return arm_failure;
   endfunction
 
+  // 功能：将 rhs 中 rdma_cmq_failing_slot_record 的值字段复制到当前对象，建立与源对象隔离的快照。
+  // 输入/输出及副作用：无显式参数；clone 读取 对象字段：arm_failure、sq_index 并使用字段 arm_failure；函数返回 uvm_object，不取得调用方资源所有权。
+  // 失败/边界：clone 先检查 arm_failure && sq_index == 1，再返回 this；super.clone()；拒绝分支不提交部分状态，也不隐式重试。
   virtual function uvm_object clone();
     if (arm_failure && sq_index == 1) begin
       arm_failure = 1'b0;
@@ -815,32 +1030,53 @@ class rdma_cmq_failing_dependency extends rdma_doorbell_dependency;
   local static bit capture_armed;
   local static longint unsigned captured_dependency_id;
 
+  // 功能：构造 rdma_cmq_failing_dependency，调用 super.new 建立 UVM 层级对象；外部依赖字段保持未绑定，后续由 configure/build/activate 明确注入。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_cmq_failing_dependency 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_cmq_failing_dependency");
     super.new(name);
   endfunction
 
+  // 功能：在 rdma_cmq_failing_dependency 中，arm 校验依赖和 binding 后建立运行边界，只保存非拥有引用并拒绝重复配置。
+  // 输入/输出及副作用：无显式参数；arm 读取 对象字段：arm_failure 并使用字段 arm_failure；函数返回 void，不取得调用方资源所有权。
+  // 失败/边界：arm 无返回值，仅执行 arm_failure=1'b1；调用方须保证前置依赖已经绑定，函数不自动重试或接管外部资源。
   static function void arm();
     arm_failure = 1'b1;
   endfunction
 
+  // 功能：在 rdma_cmq_failing_dependency 中，disarm 按 owner、generation 和幂等规则释放/隔离记录，并同步删除其账本引用。
+  // 输入/输出及副作用：无显式参数；disarm 读取 对象字段：arm_failure 并使用字段 arm_failure；函数返回 void，不取得调用方资源所有权。
+  // 失败/边界：disarm 发现 owner/generation 不匹配、记录未知或重复释放时返回错误或幂等结果，不重新激活旧句柄。
   static function void disarm();
     arm_failure = 1'b0;
   endfunction
 
+  // 功能：在 rdma_cmq_failing_dependency 中，armed 判断 armed 对应的状态、能力或账本条件，并返回确定的布尔/计数结果，不修改状态。
+  // 输入/输出及副作用：无显式参数；armed 读取固定返回值或局部计算结果，不使用对象成员字段；函数返回 bit，不取得调用方资源所有权。
+  // 失败/边界：armed 只读取现有账本；输入未初始化时返回保守结果，不得借助默认 Function/root 猜测。
   static function bit armed();
     return arm_failure;
   endfunction
 
+  // 功能：在 rdma_cmq_failing_dependency 中，arm_capture 推进队列/事务游标或执行对应 I/O，并把结果写回声明的输出参数。
+  // 输入/输出及副作用：无显式参数；arm_capture 读取 对象字段：capture_armed、captured_dependency_id 并使用字段 capture_armed、captured_dependency_id；函数返回 void，不取得调用方资源所有权。
+  // 失败/边界：arm_capture 无返回值，仅执行 capture_armed=1'b1、captured_dependency_id='0；调用方须保证前置依赖已经绑定，函数不自动重试或接管外部资源。
   static function void arm_capture();
     capture_armed = 1'b1;
     captured_dependency_id = '0;
   endfunction
 
+  // 功能：在 rdma_cmq_failing_dependency 中，disarm_capture 按 owner、generation 和幂等规则释放/隔离记录，并同步删除其账本引用。
+  // 输入/输出及副作用：无显式参数；disarm_capture 读取 对象字段：capture_armed、captured_dependency_id 并使用字段 capture_armed、captured_dependency_id；函数返回 void，不取得调用方资源所有权。
+  // 失败/边界：disarm_capture 发现 owner/generation 不匹配、记录未知或重复释放时返回错误或幂等结果，不重新激活旧句柄。
   static function void disarm_capture();
     capture_armed = 1'b0;
     captured_dependency_id = '0;
   endfunction
 
+  // 功能：执行 take_captured_dependency_id 指定的测试或恢复状态变更，更新受控账本并保留可回滚的故障证据。
+  // 输入/输出及副作用：dependency_id（输出）；take_captured_dependency_id 读取 dependency_id 并使用字段 dependency_id，并写入 dependency_id；函数返回 bit，不取得调用方资源所有权。
+  // 失败/边界：take_captured_dependency_id 仅允许测试/恢复范围内的状态变更；代际或资源不匹配时拒绝并保留原账本。
   static function bit take_captured_dependency_id(
     output longint unsigned dependency_id
   );
@@ -848,6 +1084,9 @@ class rdma_cmq_failing_dependency extends rdma_doorbell_dependency;
     return !capture_armed;
   endfunction
 
+  // 功能：将 rhs 中 rdma_cmq_failing_dependency 的值字段复制到当前对象，建立与源对象隔离的快照。
+  // 输入/输出及副作用：无显式参数；clone 读取 对象字段：capture_armed、arm_failure、relative_offset、captured_dependency_id 并使用字段 capture_armed、captured_dependency_id、arm_failure；函数返回 uvm_object，不取得调用方资源所有权。
+  // 失败/边界：clone 先检查 capture_armed；arm_failure && relative_offset == 64，再返回 this；super.clone()；拒绝分支不提交部分状态，也不隐式重试。
   virtual function uvm_object clone();
     if (capture_armed) begin
       capture_armed = 1'b0;
@@ -866,22 +1105,37 @@ class rdma_cmq_failing_doorbell_desc extends rdma_doorbell_desc;
 
   local static bit arm_failure;
 
+  // 功能：构造 rdma_cmq_failing_doorbell_desc，调用 super.new 建立 UVM 层级对象；外部依赖字段保持未绑定，后续由 configure/build/activate 明确注入。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_cmq_failing_doorbell_desc 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_cmq_failing_doorbell_desc");
     super.new(name);
   endfunction
 
+  // 功能：在 rdma_cmq_failing_doorbell_desc 中，arm 校验依赖和 binding 后建立运行边界，只保存非拥有引用并拒绝重复配置。
+  // 输入/输出及副作用：无显式参数；arm 读取 对象字段：arm_failure 并使用字段 arm_failure；函数返回 void，不取得调用方资源所有权。
+  // 失败/边界：arm 无返回值，仅执行 arm_failure=1'b1；调用方须保证前置依赖已经绑定，函数不自动重试或接管外部资源。
   static function void arm();
     arm_failure = 1'b1;
   endfunction
 
+  // 功能：在 rdma_cmq_failing_doorbell_desc 中，disarm 按 owner、generation 和幂等规则释放/隔离记录，并同步删除其账本引用。
+  // 输入/输出及副作用：无显式参数；disarm 读取 对象字段：arm_failure 并使用字段 arm_failure；函数返回 void，不取得调用方资源所有权。
+  // 失败/边界：disarm 发现 owner/generation 不匹配、记录未知或重复释放时返回错误或幂等结果，不重新激活旧句柄。
   static function void disarm();
     arm_failure = 1'b0;
   endfunction
 
+  // 功能：在 rdma_cmq_failing_doorbell_desc 中，armed 判断 armed 对应的状态、能力或账本条件，并返回确定的布尔/计数结果，不修改状态。
+  // 输入/输出及副作用：无显式参数；armed 读取固定返回值或局部计算结果，不使用对象成员字段；函数返回 bit，不取得调用方资源所有权。
+  // 失败/边界：armed 只读取现有账本；输入未初始化时返回保守结果，不得借助默认 Function/root 猜测。
   static function bit armed();
     return arm_failure;
   endfunction
 
+  // 功能：将 rhs 中 rdma_cmq_failing_doorbell_desc 的值字段复制到当前对象，建立与源对象隔离的快照。
+  // 输入/输出及副作用：无显式参数；clone 读取 对象字段：arm_failure 并使用字段 arm_failure；函数返回 uvm_object，不取得调用方资源所有权。
+  // 失败/边界：clone 先检查 arm_failure，再返回 this；super.clone()；拒绝分支不提交部分状态，也不隐式重试。
   virtual function uvm_object clone();
     if (arm_failure) begin
       arm_failure = 1'b0;
@@ -936,9 +1190,12 @@ class rdma_cmq_test_profile extends rdma_cmq_hw_profile;
   int unsigned inspect_calls;
   int unsigned inspect_failure_call;
   rdma_status_code_e inspect_failure_code;
-  rdma_xtr_v1_cmq_completion_codec completion_codec;
-  rdma_xtr_v1_error_codec error_codec;
+  rdma_hw_cmq_completion_codec completion_codec;
+  rdma_hw_error_codec error_codec;
 
+  // 功能：构造 rdma_cmq_test_profile，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：fail_validation=1'b0；return_null_status=1'b0；validation_calls=0；sqe_fault=RDMA_CMQ_TEST_SQE_GOOD；sqe_fault_compose_call=0；doorbell_fault=RDMA_CMQ_TEST_DB_GOOD；doorbell_input_fault=RDMA_CMQ_TEST_DB_INPUT_GOOD；fail_compose_opcode='0；其余字段按实现默认值初始化。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_cmq_test_profile 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_cmq_test_profile");
     super.new(name);
     fail_validation = 1'b0;
@@ -977,18 +1234,24 @@ class rdma_cmq_test_profile extends rdma_cmq_hw_profile;
     inspect_calls = 0;
     inspect_failure_call = 0;
     inspect_failure_code = RDMA_SC_CODEC_ERROR;
-    completion_codec = rdma_xtr_v1_cmq_completion_codec::type_id::create(
+    completion_codec = rdma_hw_cmq_completion_codec::type_id::create(
       "engine_test_completion_codec"
     );
-    error_codec = rdma_xtr_v1_error_codec::type_id::create(
+    error_codec = rdma_hw_error_codec::type_id::create(
       "engine_test_error_codec"
     );
   endfunction
 
+  // 功能：在 rdma_cmq_test_profile 中，profile_name 返回该实现声明的固定 profile/资源属性，供注册表和上层选择正确的 codec 或生命周期策略。
+  // 输入/输出及副作用：无显式参数；profile_name 读取固定返回值或局部计算结果，不使用对象成员字段；函数返回 string，不取得调用方资源所有权。
+  // 失败/边界：profile_name 是只读访问器，返回 "cmq_engine_test"；未覆盖枚举沿 default/类型默认分支返回，不改变对象和外部资源。
   virtual function string profile_name();
     return "cmq_engine_test";
   endfunction
 
+  // 功能：validate_profile 校验 当前对象字段 与当前对象状态的一致性，并显式处理“test CMQ profile validation failed”等拒绝条件，返回 rdma_status 供上层决定是否提交。
+  // 输入/输出及副作用：无显式参数；validate_profile 读取 对象字段：rdma_status、return_null_status、fail_validation 并使用字段 rdma_status、return_null_status、fail_validation；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：validate_profile 返回 RDMA_SC_INVALID_STATE；典型拒绝条件为“test CMQ profile validation failed”；失败路径不提交部分状态或转移未声明资源。
   virtual function rdma_status validate_profile();
     validation_calls++;
     if (return_null_status)
@@ -999,6 +1262,9 @@ class rdma_cmq_test_profile extends rdma_cmq_hw_profile;
     return rdma_status::success();
   endfunction
 
+  // 功能：在 rdma_cmq_test_profile 中，set_cqe_qword 按硬件布局把输入模型编码到 image/缓冲区，并在写入前检查范围、重叠、端序和保留位。
+  // 输入/输出及副作用：image（输入）、qword_index（输入）、value（输入）；set_cqe_qword 先依据 依赖存在性、authority 和 generation 条件 校验 image、qword_index、value；成功时更新本对象配置/状态并保存非拥有引用，返回 void。
+  // 失败/边界：set_cqe_qword 遇到 image/model 为空、长度/对齐/保留位非法或 codec 校验失败时不发布部分字段。
   protected function void set_cqe_qword(
     rdma_hw_image image,
     int unsigned qword_index,
@@ -1011,6 +1277,10 @@ class rdma_cmq_test_profile extends rdma_cmq_hw_profile;
       image.bytes[base + i] = value[63 - (i * 8) -: 8];
   endfunction
 
+  // 功能：make_cqe 创建独立的 rdma_hw_image；根据 name、owner、hardware_opcode、hardware_ecode、wqe_index、wqe_wrap、function_generation 设置字段 image、image.length、image.alignment、image.endian、image.image_kind、image.hardware_version、image.function_generation、image.write_target_kind、image.backing_target、image.hmc_target，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：name（输入）、owner（输入）、hardware_opcode（输入）、hardware_ecode（输入）、wqe_index（输入）、wqe_wrap（输入）、function_generation（输入）；输入字段被复制到返回值或
+  //   output；生成结果与输入隔离，不隐式修改调用方对象。
+  // 失败/边界：make_cqe 的结果直接由 return image 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function rdma_hw_image make_cqe(
     string name,
     bit owner,
@@ -1046,6 +1316,9 @@ class rdma_cmq_test_profile extends rdma_cmq_hw_profile;
     return image;
   endfunction
 
+  // 功能：在 rdma_cmq_test_profile 中，compose_sqe 按 profile 的字段布局和端序把语义模型编码为硬件镜像，并在发布前检查长度与对齐。
+  // 输入/输出及副作用：command（输入）、slot（输入）、sqe（输出）、expected（输出）；输入模型只读；成功时通过返回值或 output 发布完整 image/bytes，不修改源模型。
+  // 失败/边界：模型为空、字段越界、保留位非零或输出长度不足时返回编码错误，不发布部分图像。
   virtual function rdma_status compose_sqe(
     rdma_cmq_command_desc command,
     rdma_cmq_slot_context slot,
@@ -1170,6 +1443,10 @@ class rdma_cmq_test_profile extends rdma_cmq_hw_profile;
     return rdma_status::success();
   endfunction
 
+  // 功能：在 rdma_cmq_test_profile 中，inspect_cqe 从输入 image/bytes 按固定 offset 提取字段，交付解码所需的值。
+  // 输入/输出及副作用：raw_cqe（输入）、expected_owner（输入）、ready（输出）、decoded（输出）；inspect_cqe 读取 raw_cqe、expected_owner、ready、decoded 并使用字段 ready、decoded、codec_raw_cqe、codec_raw_cqe.endian、codec_raw_cqe.hardware_version、status、cloned_object、decoded.hardware_opcode，并写入 ready、decoded；函数返回 rdma_status，不取得调用方资源所有权。
+
+  // 失败/边界：inspect_cqe 返回 RDMA_SC_INVALID_STATE、RDMA_SC_OK；具体拒绝条件包括 “injected test profile inspection failure”；“test profile completion codecs are unavailable”；“test profile could not snapshot its raw CQE input”；“test completion codec returned null decoded data”；“test error codec returned null status”；失败路径不提交部分状态、不隐式重试，也不转移未声明资源。
   virtual function rdma_status inspect_cqe(
     rdma_hw_image raw_cqe,
     bit expected_owner,
@@ -1179,8 +1456,8 @@ class rdma_cmq_test_profile extends rdma_cmq_hw_profile;
     rdma_status status;
     rdma_status command_status;
     rdma_hw_image codec_raw_cqe;
-    rdma_xtr_v1_cmq_completion completion;
-    rdma_xtr_v1_cmq_completion payload;
+    rdma_hw_cmq_completion completion;
+    rdma_hw_cmq_completion payload;
     rdma_cmq_self_clone_completion_payload hostile_payload;
     uvm_object cloned_object;
 
@@ -1209,7 +1486,7 @@ class rdma_cmq_test_profile extends rdma_cmq_hw_profile;
     // exercise engine neutrality.  Only its private test codec adapter owns
     // the XTR v1 metadata required to decode the borrowed wire layout.
     codec_raw_cqe.endian = RDMA_ENDIAN_BIG;
-    codec_raw_cqe.hardware_version = XTR_V1_HW_VERSION;
+    codec_raw_cqe.hardware_version = RDMA_HW_VERSION;
     status = completion_codec.inspect_completion(
       codec_raw_cqe, expected_owner, ready, completion
     );
@@ -1353,14 +1630,17 @@ class rdma_cmq_test_profile extends rdma_cmq_hw_profile;
     return rdma_status::success();
   endfunction
 
+  // 功能：在 rdma_cmq_test_profile 中，snapshot_completion_payload 按完整 key/handle 查找唯一权威记录并返回 detached 快照，避免把内部可变引用泄露给调用方。
+  // 输入/输出及副作用：source（输入）、snapshot（输出）；snapshot_completion_payload 读取 source、snapshot 并使用字段 snapshot、snapshot_hostile、snapshot_hostile.value、snapshot_hostile.nested_h、nested_h.kind、nested_h.function_uid、nested_h.object_id、nested_h.generation，并写入 snapshot；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：snapshot_completion_payload 在 key/handle 缺失、记录不唯一或 generation/reset epoch 过期时返回明确错误，不回退到默认 authority。
   virtual function rdma_status snapshot_completion_payload(
     uvm_object source,
     output uvm_object snapshot
   );
     rdma_cmq_self_clone_completion_payload source_hostile;
     rdma_cmq_self_clone_completion_payload snapshot_hostile;
-    rdma_xtr_v1_cmq_completion source_xtr;
-    rdma_xtr_v1_cmq_completion snapshot_xtr;
+    rdma_hw_cmq_completion source_xtr;
+    rdma_hw_cmq_completion snapshot_xtr;
 
     snapshot = null;
     case (completion_payload_hook_fault)
@@ -1411,7 +1691,7 @@ class rdma_cmq_test_profile extends rdma_cmq_hw_profile;
       return rdma_status::success();
     end
     if ($cast(source_xtr, source)) begin
-      snapshot_xtr = rdma_xtr_v1_cmq_completion::type_id::create(
+      snapshot_xtr = rdma_hw_cmq_completion::type_id::create(
         "explicit_xtr_completion_payload_snapshot"
       );
       snapshot_xtr.owner = source_xtr.owner;
@@ -1435,14 +1715,17 @@ class rdma_cmq_test_profile extends rdma_cmq_hw_profile;
     );
   endfunction
 
+  // 功能：在 rdma_cmq_test_profile 中由 same_completion_payload_value 逐字段比较输入值，返回结构、身份或序列化内容是否一致。
+  // 输入/输出及副作用：lhs（输入）、rhs（输入）；比较对象/数组只读；返回 bit 或状态结果，不更新 runtime、账本或外部 adapter。
+  // 失败/边界：same_completion_payload_value 的任一比较对象为空或类型不符时返回确定的 false/不等结果，不抛出未处理异常。
   virtual function bit same_completion_payload_value(
     uvm_object lhs,
     uvm_object rhs
   );
     rdma_cmq_self_clone_completion_payload lhs_hostile;
     rdma_cmq_self_clone_completion_payload rhs_hostile;
-    rdma_xtr_v1_cmq_completion lhs_xtr;
-    rdma_xtr_v1_cmq_completion rhs_xtr;
+    rdma_hw_cmq_completion lhs_xtr;
+    rdma_hw_cmq_completion rhs_xtr;
 
     completion_payload_same_calls++;
     if (completion_payload_hook_fault ==
@@ -1470,14 +1753,17 @@ class rdma_cmq_test_profile extends rdma_cmq_hw_profile;
     return 1'b0;
   endfunction
 
+  // 功能：在 rdma_cmq_test_profile 中，completion_payload_graph_detached 检查嵌套 body/graph 引用是否已经 detached，防止编码或恢复阶段残留可变别名。
+  // 输入/输出及副作用：source（输入）、snapshot（输入）；completion_payload_graph_detached 读取 source、snapshot 并使用字段 completion_payload_hook_fault、completion_payload_detach_calls；函数返回 bit，不取得调用方资源所有权。
+  // 失败/边界：completion_payload_graph_detached 比较或前置条件不满足时返回 0/false；该路径不隐式重试，也不转移未声明资源。
   virtual function bit completion_payload_graph_detached(
     uvm_object source,
     uvm_object snapshot
   );
     rdma_cmq_self_clone_completion_payload source_hostile;
     rdma_cmq_self_clone_completion_payload snapshot_hostile;
-    rdma_xtr_v1_cmq_completion source_xtr;
-    rdma_xtr_v1_cmq_completion snapshot_xtr;
+    rdma_hw_cmq_completion source_xtr;
+    rdma_hw_cmq_completion snapshot_xtr;
 
     completion_payload_detach_calls++;
     if (completion_payload_hook_fault ==
@@ -1495,6 +1781,9 @@ class rdma_cmq_test_profile extends rdma_cmq_hw_profile;
     return 1'b0;
   endfunction
 
+  // 功能：在 rdma_cmq_test_profile 中，encode_doorbell 按硬件布局把输入模型编码到 image/缓冲区，并在写入前检查范围、重叠、端序和保留位。
+  // 输入/输出及副作用：cmq_h（输入）、final_pi（输入）、polarity（输入）、image（输出）；输入模型只读；成功时通过返回值或 output 发布完整 image/bytes，不修改源模型。
+  // 失败/边界：encode_doorbell 遇到 image/model 为空、长度/对齐/保留位非法或 codec 校验失败时不发布部分字段。
   virtual function rdma_status encode_doorbell(
     rdma_handle cmq_h,
     int unsigned final_pi,
@@ -1583,6 +1872,9 @@ class rdma_cmq_profile_hook_fault_profile extends rdma_cmq_test_profile;
   int unsigned same_calls;
   int unsigned detach_calls;
 
+  // 功能：构造 rdma_cmq_profile_hook_fault_profile，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：snapshot_fault=RDMA_CMQ_TEST_HOOK_GOOD；extension_fault=RDMA_CMQ_TEST_EXTENSION_GOOD；direct_handle_fault=RDMA_CMQ_TEST_DIRECT_HANDLE_GOOD；snapshot_calls=0；same_calls=0；detach_calls=0。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_cmq_profile_hook_fault_profile 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_cmq_profile_hook_fault_profile");
     super.new(name);
     snapshot_fault = RDMA_CMQ_TEST_HOOK_GOOD;
@@ -1593,6 +1885,9 @@ class rdma_cmq_profile_hook_fault_profile extends rdma_cmq_test_profile;
     detach_calls = 0;
   endfunction
 
+  // 功能：copy_nested_handle 复制 source 的受控字段并生成独立快照，供查询、编码或恢复使用；源对象保持不变。
+  // 输入/输出及副作用：source（输入）；copy_nested_handle 读取 source 并使用字段 result、result.kind、result.function_uid、result.object_id、result.generation；函数返回 rdma_handle，不取得调用方资源所有权。
+  // 失败/边界：输入为空、类型不匹配或字段组合非法时返回空值/错误；不得发布不完整快照。
   protected function rdma_handle copy_nested_handle(rdma_handle source);
     rdma_handle result;
 
@@ -1606,6 +1901,9 @@ class rdma_cmq_profile_hook_fault_profile extends rdma_cmq_test_profile;
     return result;
   endfunction
 
+  // 功能：copy_function_handle 复制 source 的受控字段并生成独立快照，供查询、编码或恢复使用；源对象保持不变。
+  // 输入/输出及副作用：source（输入）；copy_function_handle 读取 source 并使用字段 result、result.kind、result.function_uid、result.object_id、result.generation；函数返回 rdma_function_handle，不取得调用方资源所有权。
+  // 失败/边界：输入为空、类型不匹配或字段组合非法时返回空值/错误；不得发布不完整快照。
   protected function rdma_function_handle copy_function_handle(
     rdma_function_handle source
   );
@@ -1623,6 +1921,9 @@ class rdma_cmq_profile_hook_fault_profile extends rdma_cmq_test_profile;
     return result;
   endfunction
 
+  // 功能：在 rdma_cmq_profile_hook_fault_profile 中由 same_nested_handle_value 逐字段比较输入值，返回结构、身份或序列化内容是否一致。
+  // 输入/输出及副作用：lhs（输入）、rhs（输入）；比较对象/数组只读；返回 bit 或状态结果，不更新 runtime、账本或外部 adapter。
+  // 失败/边界：same_nested_handle_value 的任一比较对象为空或类型不符时返回确定的 false/不等结果，不抛出未处理异常。
   protected function bit same_nested_handle_value(
     rdma_handle lhs,
     rdma_handle rhs
@@ -1635,6 +1936,9 @@ class rdma_cmq_profile_hook_fault_profile extends rdma_cmq_test_profile;
            lhs.generation == rhs.generation;
   endfunction
 
+  // 功能：在 rdma_cmq_profile_hook_fault_profile 中由 same_sqe_base_value 逐字段比较输入值，返回结构、身份或序列化内容是否一致。
+  // 输入/输出及副作用：lhs（输入）、rhs（输入）；比较对象/数组只读；返回 bit 或状态结果，不更新 runtime、账本或外部 adapter。
+  // 失败/边界：same_sqe_base_value 的任一比较对象为空或类型不符时返回确定的 false/不等结果，不抛出未处理异常。
   protected function bit same_sqe_base_value(
     rdma_cmq_sqe_model lhs,
     rdma_cmq_sqe_model rhs
@@ -1649,6 +1953,9 @@ class rdma_cmq_profile_hook_fault_profile extends rdma_cmq_test_profile;
            lhs.context_model == null && rhs.context_model == null;
   endfunction
 
+  // 功能：在 rdma_cmq_profile_hook_fault_profile 中，append_sqe_graph_nodes 将输入对象登记或挂接到当前集合/依赖图，并同步维护对应账本和生命周期引用。
+  // 输入/输出及副作用：sqe（输入）、extension_edge（输入）、nodes（引用）；append_sqe_graph_nodes 可能更新本对象明确拥有的状态，并写入 nodes；函数返回 void，不取得调用方资源所有权。
+  // 失败/边界：append_sqe_graph_nodes 无返回值，仅执行 函数体中的顺序操作；调用方须保证前置依赖已经绑定，函数不自动重试或接管外部资源。
   protected function void append_sqe_graph_nodes(
     rdma_cmq_sqe_model sqe,
     uvm_object extension_edge,
@@ -1663,6 +1970,10 @@ class rdma_cmq_profile_hook_fault_profile extends rdma_cmq_test_profile;
     if (extension_edge != null) nodes.push_back(extension_edge);
   endfunction
 
+  // 功能：在 rdma_cmq_profile_hook_fault_profile 中，sqe_graphs_are_detached 检查嵌套 body/graph 引用是否已经 detached，防止编码或恢复阶段残留可变别名。
+  // 输入/输出及副作用：source（输入）、source_extension_edge（输入）、snapshot（输入）、snapshot_extension_edge（输入）；sqe_graphs_are_detached 读取 source、source_extension_edge、snapshot、snapshot_extension_edge 并使用字段 source_nodes、snapshot_nodes、j；函数返回 bit，不取得调用方资源所有权。
+
+  // 失败/边界：sqe_graphs_are_detached 比较或前置条件不满足时返回 0/false；该路径不隐式重试，也不转移未声明资源。
   protected function bit sqe_graphs_are_detached(
     rdma_cmq_sqe_model source,
     uvm_object source_extension_edge,
@@ -1682,6 +1993,9 @@ class rdma_cmq_profile_hook_fault_profile extends rdma_cmq_test_profile;
     return source_nodes.size() != 0 && snapshot_nodes.size() != 0;
   endfunction
 
+  // 功能：在 rdma_cmq_profile_hook_fault_profile 中由 same_qpc_base_value 逐字段比较输入值，返回结构、身份或序列化内容是否一致。
+  // 输入/输出及副作用：lhs（输入）、rhs（输入）；比较对象/数组只读；返回 bit 或状态结果，不更新 runtime、账本或外部 adapter。
+  // 失败/边界：same_qpc_base_value 的任一比较对象为空或类型不符时返回确定的 false/不等结果，不抛出未处理异常。
   protected function bit same_qpc_base_value(
     rdma_qpc_model lhs,
     rdma_qpc_model rhs
@@ -1717,6 +2031,9 @@ class rdma_cmq_profile_hook_fault_profile extends rdma_cmq_test_profile;
            lhs.transport_ext.describe() == rhs.transport_ext.describe();
   endfunction
 
+  // 功能：在 rdma_cmq_profile_hook_fault_profile 中，append_qpc_graph_nodes 将输入对象登记或挂接到当前集合/依赖图，并同步维护对应账本和生命周期引用。
+  // 输入/输出及副作用：qpc（输入）、extension_edge（输入）、nodes（引用）；append_qpc_graph_nodes 可能更新本对象明确拥有的状态，并写入 nodes；函数返回 void，不取得调用方资源所有权。
+  // 失败/边界：append_qpc_graph_nodes 无返回值，仅执行 函数体中的顺序操作；调用方须保证前置依赖已经绑定，函数不自动重试或接管外部资源。
   protected function void append_qpc_graph_nodes(
     rdma_qpc_model qpc,
     uvm_object extension_edge,
@@ -1740,6 +2057,10 @@ class rdma_cmq_profile_hook_fault_profile extends rdma_cmq_test_profile;
     if (extension_edge != null) nodes.push_back(extension_edge);
   endfunction
 
+  // 功能：在 rdma_cmq_profile_hook_fault_profile 中，qpc_graphs_are_detached 检查嵌套 body/graph 引用是否已经 detached，防止编码或恢复阶段残留可变别名。
+  // 输入/输出及副作用：source（输入）、source_extension_edge（输入）、snapshot（输入）、snapshot_extension_edge（输入）；qpc_graphs_are_detached 读取 source、source_extension_edge、snapshot、snapshot_extension_edge 并使用字段 source_nodes、snapshot_nodes、j；函数返回 bit，不取得调用方资源所有权。
+
+  // 失败/边界：qpc_graphs_are_detached 比较或前置条件不满足时返回 0/false；该路径不隐式重试，也不转移未声明资源。
   protected function bit qpc_graphs_are_detached(
     rdma_qpc_model source,
     uvm_object source_extension_edge,
@@ -1758,6 +2079,9 @@ class rdma_cmq_profile_hook_fault_profile extends rdma_cmq_test_profile;
     return source_nodes.size() != 0 && snapshot_nodes.size() != 0;
   endfunction
 
+  // 功能：在 rdma_cmq_profile_hook_fault_profile 中，snapshot_command_body 按完整 key/handle 查找唯一权威记录并返回 detached 快照，避免把内部可变引用泄露给调用方。
+  // 输入/输出及副作用：source（输入）、snapshot（输出）；snapshot_command_body 读取 source、snapshot 并使用字段 snapshot、snapshot_sqe、snapshot_sqe.opcode、snapshot_sqe.command_id、snapshot_sqe.flags、snapshot_scalar_handle、snapshot_scalar_handle.kind、snapshot_scalar_handle.function_uid，并写入 snapshot；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：snapshot_command_body 在 key/handle 缺失、记录不唯一或 generation/reset epoch 过期时返回明确错误，不回退到默认 authority。
   virtual function rdma_status snapshot_command_body(
     rdma_hw_model source,
     output rdma_hw_model snapshot
@@ -1928,6 +2252,9 @@ class rdma_cmq_profile_hook_fault_profile extends rdma_cmq_test_profile;
     endcase
   endfunction
 
+  // 功能：在 rdma_cmq_profile_hook_fault_profile 中由 same_command_body_value 逐字段比较输入值，返回结构、身份或序列化内容是否一致。
+  // 输入/输出及副作用：lhs（输入）、rhs（输入）；比较对象/数组只读；返回 bit 或状态结果，不更新 runtime、账本或外部 adapter。
+  // 失败/边界：same_command_body_value 的任一比较对象为空或类型不符时返回确定的 false/不等结果，不抛出未处理异常。
   virtual function bit same_command_body_value(
     rdma_hw_model lhs,
     rdma_hw_model rhs
@@ -2001,6 +2328,9 @@ class rdma_cmq_profile_hook_fault_profile extends rdma_cmq_test_profile;
     return same_value;
   endfunction
 
+  // 功能：在 rdma_cmq_profile_hook_fault_profile 中，command_body_graph_detached 检查嵌套 body/graph 引用是否已经 detached，防止编码或恢复阶段残留可变别名。
+  // 输入/输出及副作用：source（输入）、snapshot（输入）；command_body_graph_detached 读取 source、snapshot 并使用字段 detac；函数返回 bit，不取得调用方资源所有权。
+  // 失败/边界：command_body_graph_detached 比较或前置条件不满足时返回 0/false；该路径不隐式重试，也不转移未声明资源。
   virtual function bit command_body_graph_detached(
     rdma_hw_model source,
     rdma_hw_model snapshot
@@ -2078,10 +2408,16 @@ endclass
 class rdma_cmq_test_pcie extends rdma_mock_pcie;
   `uvm_object_utils(rdma_cmq_test_pcie)
 
+  // 功能：构造 rdma_cmq_test_pcie，调用 super.new 建立 UVM 层级对象；外部依赖字段保持未绑定，后续由 configure/build/activate 明确注入。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_cmq_test_pcie 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_cmq_test_pcie");
     super.new(name);
   endfunction
 
+  // 功能：在 rdma_cmq_test_pcie 中，dma_visibility_barrier 在截止时间内执行 DMA 可见性或 MMIO 顺序屏障，确保 doorbell 之前的数据写入已按序可见。
+  // 输入/输出及副作用：function_h（输入）、status（输出）；dma_visibility_barrier 驱动下游事务，并写入 status；函数返回 无直接返回值，不取得调用方资源所有权。
+  // 失败/边界：dma_visibility_barrier 失败或超时通过 status 明确发布；该路径不隐式重试，也不转移未声明资源。
   virtual task dma_visibility_barrier(
     rdma_function_handle function_h,
     output rdma_status status
@@ -2100,6 +2436,9 @@ class rdma_cmq_test_pcie extends rdma_mock_pcie;
       status = rdma_status::success();
   endtask
 
+  // 功能：在 rdma_cmq_test_pcie 中，mmio_ordering_barrier 在截止时间内执行 DMA 可见性或 MMIO 顺序屏障，确保 doorbell 之前的数据写入已按序可见。
+  // 输入/输出及副作用：function_h（输入）、status（输出）；mmio_ordering_barrier 驱动下游事务，并写入 status；函数返回 无直接返回值，不取得调用方资源所有权。
+  // 失败/边界：mmio_ordering_barrier 失败或超时通过 status 明确发布；该路径不隐式重试，也不转移未声明资源。
   virtual task mmio_ordering_barrier(
     rdma_function_handle function_h,
     output rdma_status status
@@ -2126,6 +2465,9 @@ class rdma_cmq_test_blocking_pcie extends rdma_cmq_test_pcie;
   bit dma_barrier_entered;
   bit release_dma_barrier;
 
+  // 功能：构造 rdma_cmq_test_blocking_pcie，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：block_dma_barrier=1'b0；dma_barrier_entered=1'b0；release_dma_barrier=1'b0。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_cmq_test_blocking_pcie 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_cmq_test_blocking_pcie");
     super.new(name);
     block_dma_barrier = 1'b0;
@@ -2133,6 +2475,9 @@ class rdma_cmq_test_blocking_pcie extends rdma_cmq_test_pcie;
     release_dma_barrier = 1'b0;
   endfunction
 
+  // 功能：在 rdma_cmq_test_blocking_pcie 中，dma_visibility_barrier 在截止时间内执行 DMA 可见性或 MMIO 顺序屏障，确保 doorbell 之前的数据写入已按序可见。
+  // 输入/输出及副作用：function_h（输入）、status（输出）；dma_visibility_barrier 驱动下游事务，并写入 status；函数返回 无直接返回值，不取得调用方资源所有权。
+  // 失败/边界：dma_visibility_barrier 失败或超时通过 status 明确发布；该路径不隐式重试，也不转移未声明资源。
   virtual task dma_visibility_barrier(
     rdma_function_handle function_h,
     output rdma_status status
@@ -2163,12 +2508,18 @@ class rdma_cmq_bad_clone_command extends rdma_cmq_command_desc;
   bit return_wrong_type;
   bit return_self;
 
+  // 功能：构造 rdma_cmq_bad_clone_command，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：return_wrong_type=1'b0；return_self=1'b0。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_cmq_bad_clone_command 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_cmq_bad_clone_command");
     super.new(name);
     return_wrong_type = 1'b0;
     return_self = 1'b0;
   endfunction
 
+  // 功能：将 rhs 中 rdma_cmq_bad_clone_command 的值字段复制到当前对象，建立与源对象隔离的快照。
+  // 输入/输出及副作用：无显式参数；clone 读取 对象字段：rdma_status、return_wrong_type、return_self 并使用字段 rdma_status、return_wrong_type、return_self；函数返回 uvm_object，不取得调用方资源所有权。
+  // 失败/边界：clone 输入对象为空或查找未命中时返回 null；该路径不隐式重试，也不转移未声明资源。
   virtual function uvm_object clone();
     if (return_wrong_type)
       return rdma_status::success("wrong command clone type");
@@ -2181,10 +2532,17 @@ endclass
 class rdma_cmq_runtime_clone_failure_engine extends rdma_cmq_engine;
   `uvm_object_utils(rdma_cmq_runtime_clone_failure_engine)
 
+  // 功能：构造 rdma_cmq_runtime_clone_failure_engine，调用 super.new 建立 UVM 层级对象；外部依赖字段保持未绑定，后续由 configure/build/activate 明确注入。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_cmq_runtime_clone_failure_engine 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_cmq_runtime_clone_failure_engine");
     super.new(name);
   endfunction
 
+  // 功能：在 rdma_cmq_runtime_clone_failure_engine 中，publish_runtime_snapshot 提交当前事务阶段并发布 detached 结果，只有成功路径才推进游标或状态。
+  // 输入/输出及副作用：source（输入）、snapshot（输出）；输入 request/image/cursor 决定写入内容；成功时更新 PI/CI、slot ledger 或 pending journal，并通过
+  //   output 返回结果。
+  // 失败/边界：队列未激活、credit 不足、请求身份过期或后端写入失败时返回错误；不得提前推进游标或重复提交。
   virtual function rdma_status publish_runtime_snapshot(
     rdma_cmq_runtime_desc source,
     output rdma_cmq_runtime_desc snapshot
@@ -2200,11 +2558,17 @@ class rdma_cmq_runtime_build_failure_engine extends rdma_cmq_engine;
 
   bit return_null_status;
 
+  // 功能：构造 rdma_cmq_runtime_build_failure_engine，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：return_null_status=1'b0。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_cmq_runtime_build_failure_engine 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_cmq_runtime_build_failure_engine");
     super.new(name);
     return_null_status = 1'b0;
   endfunction
 
+  // 功能：build_runtime_desc 创建独立的 rdma_status；根据 request_context、cmq、mapping、runtime 设置字段 runtime，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：request_context（输入）、cmq（输入）、mapping（输入）、runtime（输出）；build_runtime_desc 读取 request_context、cmq、mapping、runtime 并使用字段 runtime，并写入 runtime；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：build_runtime_desc 返回 RDMA_SC_CODEC_ERROR；典型拒绝条件为“injected runtime construction failure”；失败路径不提交部分状态或转移未声明资源。
   virtual function rdma_status build_runtime_desc(
     rdma_dma_request_context request_context,
     rdma_cmq cmq,
@@ -2250,21 +2614,33 @@ typedef enum int unsigned {
 class rdma_cmq_engine_probe extends rdma_cmq_engine;
   `uvm_object_utils(rdma_cmq_engine_probe)
 
+  // 功能：构造 rdma_cmq_engine_probe，调用 super.new 建立 UVM 层级对象；外部依赖字段保持未绑定，后续由 configure/build/activate 明确注入。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_cmq_engine_probe 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_cmq_engine_probe");
     super.new(name);
   endfunction
 
+  // 功能：执行 restore_mapping 指定的测试或恢复状态变更，更新受控账本并保留可回滚的故障证据。
+  // 输入/输出及副作用：source（输入）；输入 action/epoch/handle 决定迁移目标；成功时更新状态或恢复证据，外部资源仍由其拥有者管理。
+  // 失败/边界：restore_mapping 仅允许测试/恢复范围内的状态变更；代际或资源不匹配时拒绝并保留原账本。
   function void restore_mapping(rdma_dma_mapping source);
     if (backing_mapping != null && source != null)
       backing_mapping.copy(source);
   endfunction
 
+  // 功能：执行 seed_runtime_counters 指定的测试或恢复状态变更，更新受控账本并保留可回滚的故障证据。
+  // 输入/输出及副作用：无显式参数；seed_runtime_counters 读取 对象字段：publish_seq、retire_seq、cq_consume_seq 并使用字段 publish_seq、retire_seq、cq_consume_seq；函数返回 void，不取得调用方资源所有权。
+  // 失败/边界：seed_runtime_counters 仅允许测试/恢复范围内的状态变更；代际或资源不匹配时拒绝并保留原账本。
   function void seed_runtime_counters();
     publish_seq = 11;
     retire_seq = 7;
     cq_consume_seq = 5;
   endfunction
 
+  // 功能：执行 seed_ring_counters 指定的测试或恢复状态变更，更新受控账本并保留可回滚的故障证据。
+  // 输入/输出及副作用：seeded_publish_seq（输入）、seeded_retire_seq（输入）；seed_ring_counters 读取 seeded_publish_seq、seeded_retire_seq 并使用字段 publish_seq、retire_seq；函数返回 void，不取得调用方资源所有权。
+  // 失败/边界：seed_ring_counters 仅允许测试/恢复范围内的状态变更；代际或资源不匹配时拒绝并保留原账本。
   function void seed_ring_counters(
     longint unsigned seeded_publish_seq,
     longint unsigned seeded_retire_seq
@@ -2273,6 +2649,9 @@ class rdma_cmq_engine_probe extends rdma_cmq_engine;
     retire_seq = seeded_retire_seq;
   endfunction
 
+  // 功能：判断 tokens_in_use_count 对应的状态、能力或账本条件，并返回确定的布尔/计数结果，不修改状态。
+  // 输入/输出及副作用：无显式参数；tokens_in_use_count 读取 对象字段：token_in_use、i 并使用字段 count；函数返回 int unsigned，不取得调用方资源所有权。
+  // 失败/边界：tokens_in_use_count 只读取现有账本；输入未初始化时返回保守结果，不得借助默认 Function/root 猜测。
   function int unsigned tokens_in_use_count();
     int unsigned count;
 
@@ -2283,6 +2662,9 @@ class rdma_cmq_engine_probe extends rdma_cmq_engine;
     return count;
   endfunction
 
+  // 功能：slot_record_count 只读当前账本/队列状态并计算 int unsigned 计数或可用容量，不推进任何事务游标。
+  // 输入/输出及副作用：无显式参数；slot_record_count 读取 对象字段：slots、i 并使用字段 count；函数返回 int unsigned，不取得调用方资源所有权。
+  // 失败/边界：slot_record_count 先检查 slots[i] != null，再返回 count；拒绝分支不提交部分状态，也不隐式重试。
   function int unsigned slot_record_count();
     int unsigned count;
 
@@ -2293,28 +2675,46 @@ class rdma_cmq_engine_probe extends rdma_cmq_engine;
     return count;
   endfunction
 
+  // 功能：command_registry_count 只读当前账本/队列状态并计算 int unsigned 计数或可用容量，不推进任何事务游标。
+  // 输入/输出及副作用：无显式参数；command_registry_count 读取固定返回值或局部计算结果，不使用对象成员字段；函数返回 int unsigned，不取得调用方资源所有权。
+  // 失败/边界：command_registry_count 的结果直接由 return command_registry.num() 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function int unsigned command_registry_count();
     return command_registry.num();
   endfunction
 
+  // 功能：entry_registry_count 只读当前账本/队列状态并计算 int unsigned 计数或可用容量，不推进任何事务游标。
+  // 输入/输出及副作用：无显式参数；entry_registry_count 读取固定返回值或局部计算结果，不使用对象成员字段；函数返回 int unsigned，不取得调用方资源所有权。
+  // 失败/边界：entry_registry_count 的结果直接由 return entry_registry.num() 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function int unsigned entry_registry_count();
     return entry_registry.num();
   endfunction
 
+  // 功能：terminal_fifo_count 只读当前账本/队列状态并计算 int unsigned 计数或可用容量，不推进任何事务游标。
+  // 输入/输出及副作用：无显式参数；terminal_fifo_count 读取固定返回值或局部计算结果，不使用对象成员字段；函数返回 int unsigned，不取得调用方资源所有权。
+  // 失败/边界：terminal_fifo_count 的结果直接由 return terminal_fifo.size() 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function int unsigned terminal_fifo_count();
     return terminal_fifo.size();
   endfunction
 
+  // 功能：diagnostic_fifo_count 只读当前账本/队列状态并计算 int unsigned 计数或可用容量，不推进任何事务游标。
+  // 输入/输出及副作用：无显式参数；diagnostic_fifo_count 读取固定返回值或局部计算结果，不使用对象成员字段；函数返回 int unsigned，不取得调用方资源所有权。
+  // 失败/边界：diagnostic_fifo_count 的结果直接由 return diagnostic_fifo.size() 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function int unsigned diagnostic_fifo_count();
     return diagnostic_fifo.size();
   endfunction
 
+  // 功能：在 rdma_cmq_engine_probe 中，slot_state_at 只读查询当前运行时/测试账本，返回槽位、对象或恢复记录的快照而不推进事务。
+  // 输入/输出及副作用：sq_index（输入）；slot_state_at 读取 sq_index 并使用字段 slots、state；函数返回 rdma_cmq_slot_state_e，不取得调用方资源所有权。
+  // 失败/边界：slot_state_at 先检查 sq_index >= 32 || slots[sq_index] == null，再返回 CMQ_SLOT_FREE；slots[sq_index].state；拒绝分支不提交部分状态，也不隐式重试。
   function rdma_cmq_slot_state_e slot_state_at(int unsigned sq_index);
     if (sq_index >= 32 || slots[sq_index] == null)
       return CMQ_SLOT_FREE;
     return slots[sq_index].state;
   endfunction
 
+  // 功能：在 rdma_cmq_engine_probe 中，install_slot_ticket_function_clone_fault 将输入对象登记或挂接到当前集合/依赖图，并同步维护对应账本和生命周期引用。
+  // 输入/输出及副作用：sq_index（输入）、clone_fault（输入）；install_slot_ticket_function_clone_fault 读取 sq_index、clone_fault 并使用字段 source、fault_function、fault_function.kind、fault_function.function_uid、fault_function.object_id、fault_function.generation、fault_function.clone_fault、ticket.function_h；函数返回 bit，不取得调用方资源所有权。
+  // 失败/边界：install_slot_ticket_function_clone_fault 比较或前置条件不满足时返回 0/false；该路径不隐式重试，也不转移未声明资源。
   function bit install_slot_ticket_function_clone_fault(
     int unsigned sq_index,
     rdma_cmq_test_clone_fault_e clone_fault
@@ -2341,6 +2741,9 @@ class rdma_cmq_engine_probe extends rdma_cmq_engine;
     return 1'b1;
   endfunction
 
+  // 功能：执行 set_slot_ticket_function_clone_fault 指定的测试或恢复状态变更，更新受控账本并保留可回滚的故障证据。
+  // 输入/输出及副作用：sq_index（输入）、clone_fault（输入）；调用方必须先完成输入对象的空值、authority 和 generation 校验；成功时更新本对象配置/状态并保存非拥有引用，返回 bit。
+  // 失败/边界：set_slot_ticket_function_clone_fault 仅允许测试/恢复范围内的状态变更；代际或资源不匹配时拒绝并保留原账本。
   function bit set_slot_ticket_function_clone_fault(
     int unsigned sq_index,
     rdma_cmq_test_clone_fault_e clone_fault
@@ -2355,18 +2758,27 @@ class rdma_cmq_engine_probe extends rdma_cmq_engine;
     return 1'b1;
   endfunction
 
+  // 功能：在 rdma_cmq_engine_probe 中，token_in_use_at 只读查询当前运行时/测试账本，返回槽位、对象或恢复记录的快照而不推进事务。
+  // 输入/输出及副作用：token_index（输入）；token_in_use_at 读取 token_index 并使用字段 token_in_use；函数返回 bit，不取得调用方资源所有权。
+  // 失败/边界：token_in_use_at 比较或前置条件不满足时返回 0/false；该路径不隐式重试，也不转移未声明资源。
   function bit token_in_use_at(int unsigned token_index);
     if (token_index >= 32)
       return 1'b0;
     return token_in_use[token_index];
   endfunction
 
+  // 功能：在 rdma_cmq_engine_probe 中，token_incarnation_at 只读查询当前运行时/测试账本，返回槽位、对象或恢复记录的快照而不推进事务。
+  // 输入/输出及副作用：token_index（输入）；token_incarnation_at 读取 token_index 并使用字段 token_incarnation；函数返回 bit [58:0]，不取得调用方资源所有权。
+  // 失败/边界：token_incarnation_at 先检查 token_index >= 32，再返回 '0；token_incarnation[token_index]；拒绝分支不提交部分状态，也不隐式重试。
   function bit [58:0] token_incarnation_at(int unsigned token_index);
     if (token_index >= 32)
       return '0;
     return token_incarnation[token_index];
   endfunction
 
+  // 功能：执行 seed_token_incarnation 指定的测试或恢复状态变更，更新受控账本并保留可回滚的故障证据。
+  // 输入/输出及副作用：token_index（输入）、incarnation（输入）；seed_token_incarnation 读取 token_index、incarnation 并使用输入参数和固定枚举/常量；函数返回 void，不取得调用方资源所有权。
+  // 失败/边界：seed_token_incarnation 仅允许测试/恢复范围内的状态变更；代际或资源不匹配时拒绝并保留原账本。
   function void seed_token_incarnation(
     int unsigned token_index,
     bit [58:0] incarnation
@@ -2375,15 +2787,24 @@ class rdma_cmq_engine_probe extends rdma_cmq_engine;
       token_incarnation[token_index] = incarnation;
   endfunction
 
+  // 功能：执行 seed_all_token_incarnations 指定的测试或恢复状态变更，更新受控账本并保留可回滚的故障证据。
+  // 输入/输出及副作用：incarnation（输入）；seed_all_token_incarnations 读取 incarnation 并使用输入参数和固定枚举/常量；函数返回 void，不取得调用方资源所有权。
+  // 失败/边界：seed_all_token_incarnations 仅允许测试/恢复范围内的状态变更；代际或资源不匹配时拒绝并保留原账本。
   function void seed_all_token_incarnations(bit [58:0] incarnation);
     foreach (token_incarnation[i])
       token_incarnation[i] = incarnation;
   endfunction
 
+  // 功能：执行 seed_terminal_completion 指定的测试或恢复状态变更，更新受控账本并保留可回滚的故障证据。
+  // 输入/输出及副作用：completion（输入）；seed_terminal_completion 读取 completion 并使用输入参数和固定枚举/常量；函数返回 void，不取得调用方资源所有权。
+  // 失败/边界：seed_terminal_completion 仅允许测试/恢复范围内的状态变更；代际或资源不匹配时拒绝并保留原账本。
   function void seed_terminal_completion(rdma_cmq_completion completion);
     terminal_fifo.push_back(completion);
   endfunction
 
+  // 功能：执行 tamper_empty_ledger 指定的测试或恢复状态变更，更新受控账本并保留可回滚的故障证据。
+  // 输入/输出及副作用：fault（输入）；tamper_empty_ledger 读取 fault 并使用字段 stray_record；函数返回 void，不取得调用方资源所有权。
+  // 失败/边界：tamper_empty_ledger 仅允许测试/恢复范围内的状态变更；代际或资源不匹配时拒绝并保留原账本。
   function void tamper_empty_ledger(
     rdma_cmq_test_empty_ledger_fault_e fault
   );
@@ -2410,6 +2831,9 @@ class rdma_cmq_engine_probe extends rdma_cmq_engine;
     endcase
   endfunction
 
+  // 功能：执行 tamper_published_ledger 指定的测试或恢复状态变更，更新受控账本并保留可回滚的故障证据。
+  // 输入/输出及副作用：ticket（输入）、fault（输入）；tamper_published_ledger 读取 ticket、fault 并使用字段 slots；函数返回 bit，不取得调用方资源所有权。
+  // 失败/边界：tamper_published_ledger 仅允许测试/恢复范围内的状态变更；代际或资源不匹配时拒绝并保留原账本。
   function bit tamper_published_ledger(
     rdma_cmq_ticket ticket,
     rdma_cmq_test_published_ledger_fault_e fault
@@ -2429,6 +2853,9 @@ class rdma_cmq_engine_probe extends rdma_cmq_engine;
     return 1'b1;
   endfunction
 
+  // 功能：执行 tamper_cancel_ledger 指定的测试或恢复状态变更，更新受控账本并保留可回滚的故障证据。
+  // 输入/输出及副作用：tickets（输入）、fault（输入）；tamper_cancel_ledger 读取 tickets、fault 并使用字段 record、target_index、software_key；函数返回 bit，不取得调用方资源所有权。
+  // 失败/边界：tamper_cancel_ledger 仅允许测试/恢复范围内的状态变更；代际或资源不匹配时拒绝并保留原账本。
   function bit tamper_cancel_ledger(
     rdma_cmq_ticket tickets[],
     rdma_cmq_test_cancel_ledger_fault_e fault
@@ -2483,6 +2910,9 @@ class rdma_cmq_engine_probe extends rdma_cmq_engine;
     return 1'b1;
   endfunction
 
+  // 功能：执行 tamper_balanced_cancel_membership 指定的测试或恢复状态变更，更新受控账本并保留可回滚的故障证据。
+  // 输入/输出及副作用：quarantined_ticket（输入）、published_ticket（输入）；tamper_balanced_cancel_membership 读取 quarantined_ticket、published_ticket 并使用字段 stray_token、quarantined_record；函数返回 bit，不取得调用方资源所有权。
+  // 失败/边界：tamper_balanced_cancel_membership 仅允许测试/恢复范围内的状态变更；代际或资源不匹配时拒绝并保留原账本。
   function bit tamper_balanced_cancel_membership(
     rdma_cmq_ticket quarantined_ticket,
     rdma_cmq_ticket published_ticket
@@ -2512,6 +2942,9 @@ class rdma_cmq_engine_probe extends rdma_cmq_engine;
     return 1'b1;
   endfunction
 
+  // 功能：执行 tamper_recovery_ticket_x 指定的测试或恢复状态变更，更新受控账本并保留可回滚的故障证据。
+  // 输入/输出及副作用：ticket（输入）、fault（输入）；tamper_recovery_ticket_x 读取 ticket、fault 并使用字段 stray_token、record、ticket.command_id、ticket.absolute_deadline；函数返回 bit，不取得调用方资源所有权。
+  // 失败/边界：tamper_recovery_ticket_x 仅允许测试/恢复范围内的状态变更；代际或资源不匹配时拒绝并保留原账本。
   function bit tamper_recovery_ticket_x(
     rdma_cmq_ticket ticket,
     rdma_cmq_test_recovery_x_fault_e fault
@@ -2542,6 +2975,9 @@ class rdma_cmq_engine_probe extends rdma_cmq_engine;
     return 1'b1;
   endfunction
 
+  // 功能：执行 tamper_slot_incarnation 指定的测试或恢复状态变更，更新受控账本并保留可回滚的故障证据。
+  // 输入/输出及副作用：sq_index（输入）；tamper_slot_incarnation 读取 sq_index 并使用字段 slots；函数返回 bit，不取得调用方资源所有权。
+  // 失败/边界：tamper_slot_incarnation 仅允许测试/恢复范围内的状态变更；代际或资源不匹配时拒绝并保留原账本。
   function bit tamper_slot_incarnation(int unsigned sq_index);
     if (sq_index >= 32 || slots[sq_index] == null)
       return 1'b0;
@@ -2549,6 +2985,9 @@ class rdma_cmq_engine_probe extends rdma_cmq_engine;
     return 1'b1;
   endfunction
 
+  // 功能：执行 tamper_slot_retirement_incarnation 指定的测试或恢复状态变更，更新受控账本并保留可回滚的故障证据。
+  // 输入/输出及副作用：sq_index（输入）；tamper_slot_retirement_incarnation 读取 sq_index 并使用字段 record、old_entry_key、record.sq_wrap、ticket.sq_wrap；函数返回 bit，不取得调用方资源所有权。
+  // 失败/边界：tamper_slot_retirement_incarnation 仅允许测试/恢复范围内的状态变更；代际或资源不匹配时拒绝并保留原账本。
   function bit tamper_slot_retirement_incarnation(int unsigned sq_index);
     rdma_cmq_slot_record record;
     string old_entry_key;
@@ -2570,6 +3009,9 @@ class rdma_cmq_engine_probe extends rdma_cmq_engine;
     return 1'b1;
   endfunction
 
+  // 功能：在 rdma_cmq_engine_probe 中，slot_expected_variant 读取指定 SQ slot 的 expected-response variant，供测试核对 ticket 与解码 profile 的绑定。
+  // 输入/输出及副作用：sq_index（输入）；slot_expected_variant 读取 sq_index 并使用字段 slots；函数返回 string，不取得调用方资源所有权。
+  // 失败/边界：slot_expected_variant 的结果直接由 return "" 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function string slot_expected_variant(int unsigned sq_index);
     if (sq_index >= 32 || slots[sq_index] == null ||
         slots[sq_index].expected == null)
@@ -2577,10 +3019,16 @@ class rdma_cmq_engine_probe extends rdma_cmq_engine;
     return slots[sq_index].expected.variant;
   endfunction
 
+  // 功能：probe_same_handle 比较 lhs、rhs 与当前 authority/状态字段，返回布尔结果供上层执行精确分支。
+  // 输入/输出及副作用：lhs（输入）、rhs（输入）；probe_same_handle 读取 lhs、rhs 并使用输入参数和固定枚举/常量；函数返回 bit，不取得调用方资源所有权。
+  // 失败/边界：probe_same_handle 的结果直接由 return same_handle(lhs, rhs) 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function bit probe_same_handle(rdma_handle lhs, rdma_handle rhs);
     return same_handle(lhs, rhs);
   endfunction
 
+  // 功能：probe_same_opcode 比较 lhs、rhs 与当前 authority/状态字段，返回布尔结果供上层执行精确分支。
+  // 输入/输出及副作用：lhs（输入）、rhs（输入）；probe_same_opcode 读取 lhs、rhs 并使用输入参数和固定枚举/常量；函数返回 bit，不取得调用方资源所有权。
+  // 失败/边界：probe_same_opcode 的结果直接由 return same_opcode_value(lhs, rhs) 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function bit probe_same_opcode(
     rdma_cmq_opcode_key lhs,
     rdma_cmq_opcode_key rhs
@@ -2588,24 +3036,39 @@ class rdma_cmq_engine_probe extends rdma_cmq_engine;
     return same_opcode_value(lhs, rhs);
   endfunction
 
+  // 功能：probe_same_image 比较 lhs、rhs 与当前 authority/状态字段，返回布尔结果供上层执行精确分支。
+  // 输入/输出及副作用：lhs（输入）、rhs（输入）；probe_same_image 读取 lhs、rhs 并使用输入参数和固定枚举/常量；函数返回 bit，不取得调用方资源所有权。
+  // 失败/边界：probe_same_image 的结果直接由 return same_image_value(lhs, rhs) 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function bit probe_same_image(rdma_hw_image lhs, rdma_hw_image rhs);
     return same_image_value(lhs, rhs);
   endfunction
 
+  // 功能：在 rdma_cmq_engine_probe 中，probe_body_value_key 把 Function/对象身份、代际和游标字段拼成稳定的查找键，供登记表去重和恢复路由使用。
+  // 输入/输出及副作用：body（输入）；probe_body_value_key 读取 body 并使用输入参数和固定枚举/常量；函数返回 string，不取得调用方资源所有权。
+// 失败/边界：probe_body_value_key 只按函数体列出的身份、generation、kind、object_id 或 cursor 字段拼接键；调用方须先完成空句柄校验，函数本身不分配资源、不自动回退到 root0。
   function string probe_body_value_key(rdma_hw_model body);
     return body_value_key(body);
   endfunction
 
+  // 功能：在 rdma_cmq_engine_probe 中，probe_authority_handle_matches 逐字段比较输入快照或镜像，确认其身份、布局和 payload 完全一致后返回布尔结果。
+  // 输入/输出及副作用：expected（输入）；probe_authority_handle_matches 读取 expected 并使用字段 cmq_snapshot、cmq_snapshot.handle；函数返回 bit，不取得调用方资源所有权。
+  // 失败/边界：probe_authority_handle_matches 只读输入并返回 bit；边界由函数体现有分支决定，不修改状态或转移资源。
   function bit probe_authority_handle_matches(rdma_handle expected);
     return cmq_snapshot != null && cmq_snapshot.handle != null &&
            same_handle(cmq_snapshot.handle, expected);
   endfunction
 
+  // 功能：probe_is_authority_handle 比较 candidate 与当前 authority/状态字段，返回布尔结果供上层执行精确分支。
+  // 输入/输出及副作用：candidate（输入）；probe_is_authority_handle 读取 candidate 并使用字段 cmq_snapshot、cmq_snapshot.handle；函数返回 bit，不取得调用方资源所有权。
+  // 失败/边界：probe_is_authority_handle 只读输入并返回 bit；边界由函数体现有分支决定，不修改状态或转移资源。
   function bit probe_is_authority_handle(rdma_handle candidate);
     return candidate != null && cmq_snapshot != null &&
            candidate == cmq_snapshot.handle;
   endfunction
 
+  // 功能：slot_ticket_command_id 按 SQ 索引读取 slots[sq_index] 的 ticket.command_id，供测试定位对应 CMQ 命令。
+  // 输入/输出及副作用：sq_index（输入）；slot_ticket_command_id 读取 sq_index 并使用字段 slots、ticket.command_id、ticket；函数返回 longint unsigned，不取得调用方资源所有权。
+  // 失败/边界：slot_ticket_command_id 比较或前置条件不满足时返回 0/false；该路径不隐式重试，也不转移未声明资源。
   function longint unsigned slot_ticket_command_id(int unsigned sq_index);
     if (sq_index >= 32 || slots[sq_index] == null ||
         slots[sq_index].ticket == null)
@@ -2613,6 +3076,9 @@ class rdma_cmq_engine_probe extends rdma_cmq_engine;
     return slots[sq_index].ticket.command_id;
   endfunction
 
+  // 功能：在 rdma_cmq_engine_probe 中，retry_only_poisoned 根据当前证据转换事务或恢复状态，并保持重试、复位和所有权边界一致。
+  // 输入/输出及副作用：无显式参数；retry_only_poisoned 可能更新本对象明确拥有的状态；函数返回 bit，不取得调用方资源所有权。
+  // 失败/边界：retry_only_poisoned 只读输入并返回 bit；边界由函数体现有分支决定，不修改状态或转移资源。
   function bit retry_only_poisoned();
     return engine_state == RDMA_CMQ_ENGINE_POISONED &&
            host_mem != null && backing_mapping != null &&
@@ -2621,14 +3087,23 @@ class rdma_cmq_engine_probe extends rdma_cmq_engine;
            publish_seq == 0 && retire_seq == 0 && cq_consume_seq == 0;
   endfunction
 
+  // 功能：drop_host_mem_authority 使用 当前对象字段 执行函数体规定的状态更新；不修改未列出的对象字段或外部资源。
+  // 输入/输出及副作用：无显式参数；drop_host_mem_authority 读取 对象字段：host_mem 并使用字段 host_mem；函数返回 void，不取得调用方资源所有权。
+  // 失败/边界：drop_host_mem_authority 无返回值，仅执行 host_mem=null；调用方须保证前置依赖已经绑定，函数不自动重试或接管外部资源。
   function void drop_host_mem_authority();
     host_mem = null;
   endfunction
 
+  // 功能：执行 restore_host_mem_authority 指定的测试或恢复状态变更，更新受控账本并保留可回滚的故障证据。
+  // 输入/输出及副作用：source（输入）；输入 action/epoch/handle 决定迁移目标；成功时更新状态或恢复证据，外部资源仍由其拥有者管理。
+  // 失败/边界：restore_host_mem_authority 仅允许测试/恢复范围内的状态变更；代际或资源不匹配时拒绝并保留原账本。
   function void restore_host_mem_authority(rdma_host_mem_api source);
     host_mem = source;
   endfunction
 
+  // 功能：在 rdma_cmq_engine_probe 中，missing_host_mem_poisoned 检查当前事务或测试证据是否满足指定布尔条件，供恢复分类和断言选择后续路径。
+  // 输入/输出及副作用：无显式参数；missing_host_mem_poisoned 可能更新本对象明确拥有的状态；函数返回 bit，不取得调用方资源所有权。
+  // 失败/边界：missing_host_mem_poisoned 只读输入并返回 bit；边界由函数体现有分支决定，不修改状态或转移资源。
   function bit missing_host_mem_poisoned();
     return engine_state == RDMA_CMQ_ENGINE_POISONED &&
            host_mem == null && backing_mapping != null &&
@@ -2637,6 +3112,9 @@ class rdma_cmq_engine_probe extends rdma_cmq_engine;
            publish_seq == 0 && retire_seq == 0 && cq_consume_seq == 0;
   endfunction
 
+  // 功能：执行 tamper_mapping 指定的测试或恢复状态变更，更新受控账本并保留可回滚的故障证据。
+  // 输入/输出及副作用：kind（输入）；tamper_mapping 读取 kind 并使用字段 function_h.kind、backing_mapping.pasid_valid、backing_mapping.dma_domain_valid、backing_mapping.owner_h、owner_h.kind、backing_mapping.direction、backing_mapping.state、permissions.device_read；函数返回 void，不取得调用方资源所有权。
+  // 失败/边界：tamper_mapping 仅允许测试/恢复范围内的状态变更；代际或资源不匹配时拒绝并保留原账本。
   function void tamper_mapping(rdma_cmq_mapping_tamper_e kind);
     if (backing_mapping == null)
       return;
@@ -2708,11 +3186,18 @@ class rdma_cmq_bad_mapping_mem extends rdma_mock_host_mem;
 
   rdma_cmq_bad_mapping_kind_e bad_kind;
 
+  // 功能：构造 rdma_cmq_bad_mapping_mem，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：bad_kind=RDMA_CMQ_BAD_MAPPING_ATOMIC。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_cmq_bad_mapping_mem 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_cmq_bad_mapping_mem");
     super.new(name);
     bad_kind = RDMA_CMQ_BAD_MAPPING_ATOMIC;
   endfunction
 
+  // 功能：在 rdma_cmq_bad_mapping_mem 中，allocate 检查容量后预留资源并返回带 owner 证据的句柄/计划；失败时回滚已登记的局部状态。
+  // 输入/输出及副作用：request_context（输入）、size（输入）、alignment（输入）、direction（输入）、mapping（输出）；输入请求/句柄定义资源属性；成功时更新账本并通过返回值或
+  //   output 发布新句柄/映射。
+  // 失败/边界：容量不足、范围非法、重复占用或身份过期时返回错误；失败不得泄漏半分配资源。
   virtual function rdma_status allocate(
     rdma_dma_request_context request_context,
     int unsigned size,
@@ -2758,10 +3243,17 @@ endclass
 class rdma_cmq_upper_boundary_mem extends rdma_mock_host_mem;
   `uvm_object_utils(rdma_cmq_upper_boundary_mem)
 
+  // 功能：构造 rdma_cmq_upper_boundary_mem，调用 super.new 建立 UVM 层级对象；外部依赖字段保持未绑定，后续由 configure/build/activate 明确注入。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_cmq_upper_boundary_mem 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_cmq_upper_boundary_mem");
     super.new(name);
   endfunction
 
+  // 功能：在 rdma_cmq_upper_boundary_mem 中，allocate 检查容量后预留资源并返回带 owner 证据的句柄/计划；失败时回滚已登记的局部状态。
+  // 输入/输出及副作用：request_context（输入）、size（输入）、alignment（输入）、direction（输入）、mapping（输出）；输入请求/句柄定义资源属性；成功时更新账本并通过返回值或
+  //   output 发布新句柄/映射。
+  // 失败/边界：容量不足、范围非法、重复占用或身份过期时返回错误；失败不得泄漏半分配资源。
   virtual function rdma_status allocate(
     rdma_dma_request_context request_context,
     int unsigned size,
@@ -2796,11 +3288,18 @@ class rdma_cmq_allocate_result_mem extends rdma_mock_host_mem;
 
   rdma_cmq_allocate_result_e result_kind;
 
+  // 功能：构造 rdma_cmq_allocate_result_mem，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：result_kind=RDMA_CMQ_ALLOCATE_NULL_NO_CANDIDATE。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_cmq_allocate_result_mem 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_cmq_allocate_result_mem");
     super.new(name);
     result_kind = RDMA_CMQ_ALLOCATE_NULL_NO_CANDIDATE;
   endfunction
 
+  // 功能：在 rdma_cmq_allocate_result_mem 中，allocate 检查容量后预留资源并返回带 owner 证据的句柄/计划；失败时回滚已登记的局部状态。
+  // 输入/输出及副作用：request_context（输入）、size（输入）、alignment（输入）、direction（输入）、mapping（输出）；输入请求/句柄定义资源属性；成功时更新账本并通过返回值或
+  //   output 发布新句柄/映射。
+  // 失败/边界：容量不足、范围非法、重复占用或身份过期时返回错误；失败不得泄漏半分配资源。
   virtual function rdma_status allocate(
     rdma_dma_request_context request_context,
     int unsigned size,
@@ -2832,10 +3331,17 @@ endclass
 class rdma_cmq_null_write_mem extends rdma_mock_host_mem;
   `uvm_object_utils(rdma_cmq_null_write_mem)
 
+  // 功能：构造 rdma_cmq_null_write_mem，调用 super.new 建立 UVM 层级对象；外部依赖字段保持未绑定，后续由 configure/build/activate 明确注入。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_cmq_null_write_mem 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_cmq_null_write_mem");
     super.new(name);
   endfunction
 
+  // 功能：在 rdma_cmq_null_write_mem 中，write 把请求数据写入指定后端并保留返回状态；只有写入成功才允许本地游标继续推进。
+  // 输入/输出及副作用：mapping（输入）、offset（输入）、data（输入）；输入 request/image/cursor 决定写入内容；成功时更新 PI/CI、slot ledger 或 pending
+  //   journal，并通过 output 返回结果。
+  // 失败/边界：write 遇到后端拒绝、范围溢出或 DMA 权限不足时保留失败证据，不推进本地游标。
   virtual function rdma_status write(
     rdma_dma_mapping mapping,
     longint unsigned offset,
@@ -2855,11 +3361,17 @@ class rdma_cmq_null_release_once_mem extends rdma_mock_host_mem;
 
   bit return_null_once;
 
+  // 功能：构造 rdma_cmq_null_release_once_mem，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：return_null_once=1'b1。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_cmq_null_release_once_mem 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_cmq_null_release_once_mem");
     super.new(name);
     return_null_once = 1'b1;
   endfunction
 
+  // 功能：在 rdma_cmq_null_release_once_mem 中，release 按 owner、generation 和幂等规则释放/隔离记录，并同步删除其账本引用。
+  // 输入/输出及副作用：mapping（输入）；输入 handle/mapping/token 指定释放目标；成功时更新账本和生命周期，外部资源只按 adapter 契约释放。
+  // 失败/边界：release 发现 owner/generation 不匹配、记录未知或重复释放时返回错误或幂等结果，不重新激活旧句柄。
   virtual function rdma_status \release (rdma_dma_mapping mapping);
     if (return_null_once) begin
       return_null_once = 1'b0;
@@ -2873,10 +3385,17 @@ endclass
 class rdma_cmq_short_mapping_mem extends rdma_mock_host_mem;
   `uvm_object_utils(rdma_cmq_short_mapping_mem)
 
+  // 功能：构造 rdma_cmq_short_mapping_mem，调用 super.new 建立 UVM 层级对象；外部依赖字段保持未绑定，后续由 configure/build/activate 明确注入。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_cmq_short_mapping_mem 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_cmq_short_mapping_mem");
     super.new(name);
   endfunction
 
+  // 功能：在 rdma_cmq_short_mapping_mem 中，allocate 检查容量后预留资源并返回带 owner 证据的句柄/计划；失败时回滚已登记的局部状态。
+  // 输入/输出及副作用：request_context（输入）、size（输入）、alignment（输入）、direction（输入）、mapping（输出）；输入请求/句柄定义资源属性；成功时更新账本并通过返回值或
+  //   output 发布新句柄/映射。
+  // 失败/边界：容量不足、范围非法、重复占用或身份过期时返回错误；失败不得泄漏半分配资源。
   virtual function rdma_status allocate(
     rdma_dma_request_context request_context,
     int unsigned size,
@@ -2906,11 +3425,17 @@ class rdma_cmq_engine_test extends uvm_test;
   localparam int unsigned TEST_CMQ_ID = 32'h5566_7788;
   localparam longint unsigned TEST_CQ_OFFSET = 64'd2048;
 
+  // 功能：构造 rdma_cmq_engine_test，调用 super.new 建立 UVM 层级对象；外部依赖字段保持未绑定，后续由 configure/build/activate 明确注入。
+  // 输入/输出及副作用：name、parent（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_cmq_engine_test 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_cmq_engine_test",
                uvm_component parent = null);
     super.new(name, parent);
   endfunction
 
+  // 功能：在 rdma_cmq_engine_test 中，configure_submission_factory_faults 校验依赖和 binding 后建立运行边界，只保存非拥有引用并拒绝重复配置。
+  // 输入/输出及副作用：无显式参数；configure_submission_factory_faults 先依据 依赖存在性、authority 和 generation 条件 校验 函数体读取的依赖；成功时更新本对象配置/状态并保存非拥有引用，返回 void。
+  // 失败/边界：实现中的空依赖、重复登记、状态或 generation/authority 校验失败时返回错误；失败时保留旧配置。
   function automatic void configure_submission_factory_faults();
     uvm_factory factory;
 
@@ -2936,6 +3461,9 @@ class rdma_cmq_engine_test extends uvm_test;
     );
   endfunction
 
+  // 功能：在 rdma_cmq_engine_test 中，disarm_submission_factory_faults 按 owner、generation 和幂等规则释放/隔离记录，并同步删除其账本引用。
+  // 输入/输出及副作用：无显式参数；disarm_submission_factory_faults 读取固定返回值或局部计算结果，不使用对象成员字段；函数返回 void，不取得调用方资源所有权。
+  // 失败/边界：disarm_submission_factory_faults 发现 owner/generation 不匹配、记录未知或重复释放时返回错误或幂等结果，不重新激活旧句柄。
   function automatic void disarm_submission_factory_faults();
     rdma_cmq_failing_slot_context::disarm();
     rdma_cmq_failing_ticket::disarm();
@@ -2945,6 +3473,9 @@ class rdma_cmq_engine_test extends uvm_test;
     rdma_cmq_failing_doorbell_desc::disarm();
   endfunction
 
+  // 功能：在 rdma_cmq_engine_test 中，submission_factory_fault_armed 检查当前事务或测试证据是否满足指定布尔条件，供恢复分类和断言选择后续路径。
+  // 输入/输出及副作用：无显式参数；submission_factory_fault_armed 读取 对象字段：rdma_cmq_failing_slot_context、rdma_cmq_failing_ticket、rdma_cmq_failing_slot_record、rdma_cmq_failing_dependency、rdma_cmq_failing_doorbell_desc 并使用字段 rdma_cmq_failing_slot_context、rdma_cmq_failing_ticket、rdma_cmq_failing_slot_record、rdma_cmq_failing_dependency、rdma_cmq_failing_doorbell_desc；函数返回 bit，不取得调用方资源所有权。
+  // 失败/边界：submission_factory_fault_armed 只读输入并返回 bit；边界由函数体现有分支决定，不修改状态或转移资源。
   function automatic bit submission_factory_fault_armed();
     return rdma_cmq_failing_slot_context::armed() ||
            rdma_cmq_failing_ticket::armed() ||
@@ -2953,6 +3484,9 @@ class rdma_cmq_engine_test extends uvm_test;
            rdma_cmq_failing_doorbell_desc::armed();
   endfunction
 
+  // 功能：在 rdma_cmq_engine_test 中，expect_status 在测试中执行 expect_status 断言，比较输入结果与期望状态并报告可定位的失败信息。
+  // 输入/输出及副作用：label（输入）、status（输入）、expected（输入）；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：测试函数 expect_status 缺少前置对象时报告断言错误，并停止依赖该对象的后续检查。
   function automatic void expect_status(
     string label,
     rdma_status status,
@@ -2968,6 +3502,9 @@ class rdma_cmq_engine_test extends uvm_test;
                            status.code.name(), status.convert2string()))
   endfunction
 
+  // 功能：make_binding 创建独立的 rdma_function_binding；根据 name、binding_state 设置字段 binding、binding.function_uid、binding.global_function_id、binding.generation、pcie.bdf、base.value、size、enabled、binding.notify_bar_id、notify_base.value，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：name（输入）、binding_state（输入）；make_binding 读取 name、binding_state 并使用字段 binding、binding.function_uid、binding.global_function_id、binding.generation、pcie.bdf、base.value、size、enabled；函数返回 rdma_function_binding，不取得调用方资源所有权。
+  // 失败/边界：make_binding 的结果直接由 return binding 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function automatic rdma_function_binding make_binding(
     string name,
     rdma_binding_state_e binding_state
@@ -2981,6 +3518,9 @@ class rdma_cmq_engine_test extends uvm_test;
     binding.generation = TEST_GENERATION;
     binding.pcie.bdf = '{segment:16'h0001, bus:8'h42,
                          device:5'h03, function_num:3'h1};
+    if (!binding.configure_identity_from_legacy_mirrors(
+          16'h0, 32'h1, RDMA_FUNCTION_PF).ok())
+      `uvm_error("BINDING", "legacy binding identity configuration failed")
     binding.pcie.bar[0].base.value = 64'h0000_0000_8000_0000;
     binding.pcie.bar[0].size = 64'h0001_0000;
     binding.pcie.bar[0].enabled = 1'b1;
@@ -3020,6 +3560,9 @@ class rdma_cmq_engine_test extends uvm_test;
     return binding;
   endfunction
 
+  // 功能：make_cmq 创建独立的 rdma_cmq；根据 name、binding、depth 设置字段 cmq、cmq.handle、handle.kind、handle.function_uid、handle.object_id、handle.generation、cmq.owner、cmq.state、cmq.depth，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：name（输入）、binding（输入）、depth（输入）；make_cmq 读取 name、binding、depth 并使用字段 cmq、cmq.handle、handle.kind、handle.function_uid、handle.object_id、handle.generation、cmq.owner、cmq.state；函数返回 rdma_cmq，不取得调用方资源所有权。
+  // 失败/边界：make_cmq 的结果直接由 return cmq 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function automatic rdma_cmq make_cmq(
     string name,
     rdma_function_binding binding,
@@ -3039,6 +3582,9 @@ class rdma_cmq_engine_test extends uvm_test;
     return cmq;
   endfunction
 
+  // 功能：make_command 创建独立的 rdma_cmq_command_desc；根据 name、binding、opcode、marker、timeout_value 设置字段 command、command.function_h、command.opcode_key、opcode_key.profile_name、opcode_key.opcode、opcode_key.variant、target_h、target_h.kind、target_h.function_uid、target_h.object_id，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：name（输入）、binding（输入）、opcode（输入）、marker（输入）、us（输入）；make_command 读取 name、binding、opcode、marker、timeout_value 并使用字段 command、command.function_h、command.opcode_key、opcode_key.profile_name、opcode_key.opcode、opcode_key.variant、target_h、target_h.kind；函数返回 rdma_cmq_command_desc，不取得调用方资源所有权。
+  // 失败/边界：make_command 的结果直接由 return command 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function automatic rdma_cmq_command_desc make_command(
     string name,
     rdma_function_binding binding,
@@ -3084,6 +3630,9 @@ class rdma_cmq_engine_test extends uvm_test;
     return command;
   endfunction
 
+  // 功能：make_profile_hook_body 创建独立的 rdma_cmq_profile_hook_body；根据 name、binding、value 设置字段 body、body.value、body.nested_h、nested_h.kind、nested_h.function_uid、nested_h.object_id、nested_h.generation，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：name（输入）、binding（输入）、value（输入）；make_profile_hook_body 读取 name、binding、value 并使用字段 body、body.value、body.nested_h、nested_h.kind、nested_h.function_uid、nested_h.object_id、nested_h.generation；函数返回 rdma_cmq_profile_hook_body，不取得调用方资源所有权。
+  // 失败/边界：make_profile_hook_body 的结果直接由 return body 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function automatic rdma_cmq_profile_hook_body make_profile_hook_body(
     string name,
     rdma_function_binding binding,
@@ -3101,6 +3650,9 @@ class rdma_cmq_engine_test extends uvm_test;
     return body;
   endfunction
 
+  // 功能：make_context_handle 创建独立的 rdma_handle；根据 name、binding、kind、object_id 设置字段 handle、handle.kind、handle.function_uid、handle.object_id、handle.generation，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：name（输入）、binding（输入）、kind（输入）、object_id（输入）；make_context_handle 读取 name、binding、kind、object_id 并使用字段 handle、handle.kind、handle.function_uid、handle.object_id、handle.generation；函数返回 rdma_handle，不取得调用方资源所有权。
+  // 失败/边界：make_context_handle 的结果直接由 return handle 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function automatic rdma_handle make_context_handle(
     string name,
     rdma_function_binding binding,
@@ -3117,6 +3669,9 @@ class rdma_cmq_engine_test extends uvm_test;
     return handle;
   endfunction
 
+  // 功能：make_qpc_context 创建独立的 rdma_qpc_model；根据 name、binding 设置字段 qpc、qpc.qp_h、qpc.pd_h、qpc.send_cq_h、qpc.recv_cq_h、qpc.transport、qpc.state、qpc.path_mtu_bytes、qpc.sq_depth、qpc.rq_depth，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：name（输入）、binding（输入）；make_qpc_context 读取 name、binding 并使用字段 qpc、qpc.qp_h、qpc.pd_h、qpc.send_cq_h、qpc.recv_cq_h、qpc.transport、qpc.state、qpc.path_mtu_bytes；函数返回 rdma_qpc_model，不取得调用方资源所有权。
+  // 失败/边界：make_qpc_context 的结果直接由 return qpc 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function automatic rdma_qpc_model make_qpc_context(
     string name,
     rdma_function_binding binding
@@ -3147,6 +3702,9 @@ class rdma_cmq_engine_test extends uvm_test;
     return qpc;
   endfunction
 
+  // 功能：make_scalar_extension_qpc 创建独立的 rdma_cmq_scalar_extension_qpc；根据 name、binding、extension_value 设置字段 base_qpc、qpc、qpc.extension_value，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：name（输入）、binding（输入）、extension_value（输入）；make_scalar_extension_qpc 读取 name、binding、extension_value 并使用字段 base_qpc、qpc、qpc.extension_value；函数返回 rdma_cmq_scalar_extension_qpc，不取得调用方资源所有权。
+  // 失败/边界：make_scalar_extension_qpc 的结果直接由 return qpc 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function automatic rdma_cmq_scalar_extension_qpc
       make_scalar_extension_qpc(
         string name,
@@ -3163,6 +3721,9 @@ class rdma_cmq_engine_test extends uvm_test;
     return qpc;
   endfunction
 
+  // 功能：make_edge_extension_qpc 创建独立的 rdma_cmq_edge_extension_qpc；根据 name、binding 设置字段 base_qpc、qpc、qpc.extension_h，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：name（输入）、binding（输入）；make_edge_extension_qpc 读取 name、binding 并使用字段 base_qpc、qpc、qpc.extension_h；函数返回 rdma_cmq_edge_extension_qpc，不取得调用方资源所有权。
+  // 失败/边界：make_edge_extension_qpc 的结果直接由 return qpc 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function automatic rdma_cmq_edge_extension_qpc make_edge_extension_qpc(
     string name,
     rdma_function_binding binding
@@ -3179,6 +3740,9 @@ class rdma_cmq_engine_test extends uvm_test;
     return qpc;
   endfunction
 
+  // 功能：make_context_page_layout 创建独立的 rdma_page_table_layout；根据 name 设置字段 layout、layout.mode、sd_base.value、current_base.value、layout.current_valid、next_base.value、layout.next_valid，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：name（输入）；make_context_page_layout 读取 name 并使用字段 layout、layout.mode、sd_base.value、current_base.value、layout.current_valid、next_base.value、layout.next_valid；函数返回 rdma_page_table_layout，不取得调用方资源所有权。
+  // 失败/边界：make_context_page_layout 的结果直接由 return layout 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function automatic rdma_page_table_layout make_context_page_layout(
     string name
   );
@@ -3194,6 +3758,9 @@ class rdma_cmq_engine_test extends uvm_test;
     return layout;
   endfunction
 
+  // 功能：make_context_ring 创建独立的 rdma_ring_position；根据 name、index 设置字段 ring、ring.index，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：name（输入）、index（输入）；make_context_ring 读取 name、index 并使用字段 ring、ring.index；函数返回 rdma_ring_position，不取得调用方资源所有权。
+  // 失败/边界：make_context_ring 的结果直接由 return ring 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function automatic rdma_ring_position make_context_ring(
     string name,
     int unsigned index
@@ -3205,6 +3772,9 @@ class rdma_cmq_engine_test extends uvm_test;
     return ring;
   endfunction
 
+  // 功能：make_cqc_context 创建独立的 rdma_cqc_model；根据 name、binding 设置字段 cqc、cqc.cq_h、cqc.ceq_h、cqc.state、cqc.depth、cqc.cqe_size_bytes、cqc.threshold、cqc.page_layout、cqc.producer、cqc.consumer，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：name（输入）、binding（输入）；make_cqc_context 读取 name、binding 并使用字段 cqc、cqc.cq_h、cqc.ceq_h、cqc.state、cqc.depth、cqc.cqe_size_bytes、cqc.threshold、cqc.page_layout；函数返回 rdma_cqc_model，不取得调用方资源所有权。
+  // 失败/边界：make_cqc_context 的结果直接由 return cqc 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function automatic rdma_cqc_model make_cqc_context(
     string name,
     rdma_function_binding binding
@@ -3227,6 +3797,9 @@ class rdma_cmq_engine_test extends uvm_test;
     return cqc;
   endfunction
 
+  // 功能：make_mrt_context 创建独立的 rdma_mrt_model；根据 name、binding 设置字段 mrt、mrt.mr_h、mrt.pd_h、mrt.state、iova.value、mrt.length、mrt.lkey、mrt.rkey、mrt.access、mrt.object_type，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：name（输入）、binding（输入）；make_mrt_context 读取 name、binding 并使用字段 mrt、mrt.mr_h、mrt.pd_h、mrt.state、iova.value、mrt.length、mrt.lkey、mrt.rkey；函数返回 rdma_mrt_model，不取得调用方资源所有权。
+  // 失败/边界：make_mrt_context 的结果直接由 return mrt 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function automatic rdma_mrt_model make_mrt_context(
     string name,
     rdma_function_binding binding
@@ -3251,6 +3824,9 @@ class rdma_cmq_engine_test extends uvm_test;
     return mrt;
   endfunction
 
+  // 功能：make_srqc_context 创建独立的 rdma_srqc_model；根据 name、binding 设置字段 srqc、srqc.srq_h、srqc.pd_h、srqc.state、srqc.depth、srqc.load_pi_threshold、srqc.limit_threshold、srfq_backing.value、shadow_backing.value、srqc.producer，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：name（输入）、binding（输入）；make_srqc_context 读取 name、binding 并使用字段 srqc、srqc.srq_h、srqc.pd_h、srqc.state、srqc.depth、srqc.load_pi_threshold、srqc.limit_threshold、srfq_backing.value；函数返回 rdma_srqc_model，不取得调用方资源所有权。
+  // 失败/边界：make_srqc_context 的结果直接由 return srqc 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function automatic rdma_srqc_model make_srqc_context(
     string name,
     rdma_function_binding binding
@@ -3272,6 +3848,9 @@ class rdma_cmq_engine_test extends uvm_test;
     return srqc;
   endfunction
 
+  // 功能：make_ceqc_context 创建独立的 rdma_ceqc_model；根据 name、binding 设置字段 ceqc、ceqc.ceq_h、ceqc.state、ceqc.depth、ceqc.vector_id、ceqc.page_layout、ceqc.producer、ceqc.consumer，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：name（输入）、binding（输入）；make_ceqc_context 读取 name、binding 并使用字段 ceqc、ceqc.ceq_h、ceqc.state、ceqc.depth、ceqc.vector_id、ceqc.page_layout、ceqc.producer、ceqc.consumer；函数返回 rdma_ceqc_model，不取得调用方资源所有权。
+  // 失败/边界：make_ceqc_context 的结果直接由 return ceqc 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function automatic rdma_ceqc_model make_ceqc_context(
     string name,
     rdma_function_binding binding
@@ -3290,6 +3869,9 @@ class rdma_cmq_engine_test extends uvm_test;
     return ceqc;
   endfunction
 
+  // 功能：make_aeqc_context 创建独立的 rdma_aeqc_model；根据 name、binding 设置字段 aeqc、aeqc.aeq_h、aeqc.state、aeqc.depth、aeqc.vector_id、aeqc.page_layout、aeqc.producer、aeqc.consumer，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：name（输入）、binding（输入）；make_aeqc_context 读取 name、binding 并使用字段 aeqc、aeqc.aeq_h、aeqc.state、aeqc.depth、aeqc.vector_id、aeqc.page_layout、aeqc.producer、aeqc.consumer；函数返回 rdma_aeqc_model，不取得调用方资源所有权。
+  // 失败/边界：make_aeqc_context 的结果直接由 return aeqc 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function automatic rdma_aeqc_model make_aeqc_context(
     string name,
     rdma_function_binding binding
@@ -3308,6 +3890,9 @@ class rdma_cmq_engine_test extends uvm_test;
     return aeqc;
   endfunction
 
+  // 功能：在 rdma_cmq_engine_test 中，clear_submit_observation 按 owner、generation 和幂等规则释放/隔离记录，并同步删除其账本引用。
+  // 输入/输出及副作用：mem（输入）、pcie（输入）、trace（输入）；输入 action/epoch/handle 决定迁移目标；成功时更新状态或恢复证据，外部资源仍由其拥有者管理。
+  // 失败/边界：clear_submit_observation 发现 owner/generation 不匹配、记录未知或重复释放时返回错误或幂等结果，不重新激活旧句柄。
   function automatic void clear_submit_observation(
     rdma_mock_host_mem mem,
     rdma_mock_pcie pcie,
@@ -3318,6 +3903,9 @@ class rdma_cmq_engine_test extends uvm_test;
     trace.clear();
   endfunction
 
+  // 功能：在 rdma_cmq_engine_test 中，expect_submit_trace 在测试中执行 expect_submit_trace 断言，比较输入结果与期望状态并报告可定位的失败信息。
+  // 输入/输出及副作用：label（输入）、trace（输入）、expected（输入）；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：测试函数 expect_submit_trace 缺少前置对象时报告断言错误，并停止依赖该对象的后续检查。
   function automatic void expect_submit_trace(
     string label,
     rdma_mock_call_trace trace,
@@ -3337,6 +3925,9 @@ class rdma_cmq_engine_test extends uvm_test;
     end
   endfunction
 
+  // 功能：在 rdma_cmq_engine_test 中，expect_no_submit_side_effects 在测试中执行 expect_no_submit_side_effects 断言，比较输入结果与期望状态并报告可定位的失败信息。
+  // 输入/输出及副作用：label（输入）、mem（输入）、pcie（输入）、trace（输入）；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：测试函数 expect_no_submit_side_effects 缺少前置对象时报告断言错误，并停止依赖该对象的后续检查。
   function automatic void expect_no_submit_side_effects(
     string label,
     rdma_mock_host_mem mem,
@@ -3348,6 +3939,10 @@ class rdma_cmq_engine_test extends uvm_test;
       `uvm_error(label, "submission rejection caused adapter side effects")
   endfunction
 
+  // 功能：在 rdma_cmq_engine_test 中，prepare_active 校验依赖和 binding 后建立运行边界，只保存非拥有引用并拒绝重复配置。
+  // 输入/输出及副作用：label（输入）、engine（输入）、mem（输入）、pcie（输入）、scheduler（输入）、profile（输入）、prepared_binding（输入）、active_binding（输入）、cmq（输入）、runtime_desc（输出）；prepare_active 驱动下游事务，并写入 runtime_desc；函数返回 无直接返回值，不取得调用方资源所有权。
+
+  // 失败/边界：prepare_active 失败或超时通过 runtime_desc 明确发布；该路径不隐式重试，也不转移未声明资源。
   task automatic prepare_active(
     string label,
     rdma_cmq_engine engine,
@@ -3371,6 +3966,9 @@ class rdma_cmq_engine_test extends uvm_test;
     expect_status({label, "_ACTIVATE"}, status, RDMA_SC_OK);
   endtask
 
+  // 功能：判断 count_host_calls 对应的状态、能力或账本条件，并返回确定的布尔/计数结果，不修改状态。
+  // 输入/输出及副作用：mem（输入）、method_name（输入）；count_host_calls 读取 mem、method_name 并使用字段 result；函数返回 int unsigned，不取得调用方资源所有权。
+  // 失败/边界：count_host_calls 只读取现有账本；输入未初始化时返回保守结果，不得借助默认 Function/root 猜测。
   function automatic int unsigned count_host_calls(
     rdma_mock_host_mem mem,
     string method_name
@@ -3385,6 +3983,9 @@ class rdma_cmq_engine_test extends uvm_test;
     return result;
   endfunction
 
+  // 功能：host_call_index 使用 mem、method_name、ordinal 在对应表、队列或账本中查找唯一条目，并返回下标、对象或查找状态。
+  // 输入/输出及副作用：mem（输入）、method_name（输入）、ordinal（输入）；host_call_index 读取 mem、method_name、ordinal 并使用字段 match_count；函数返回 int，不取得调用方资源所有权。
+  // 失败/边界：host_call_index 查找未命中时返回 -1；该路径不隐式重试，也不转移未声明资源。
   function automatic int host_call_index(
     rdma_mock_host_mem mem,
     string method_name,
@@ -3403,6 +4004,10 @@ class rdma_cmq_engine_test extends uvm_test;
     return -1;
   endfunction
 
+  // 功能：在 rdma_cmq_engine_test 中，write_profile_cqe 把请求数据写入指定后端并保留返回状态；只有写入成功才允许本地游标继续推进。
+  // 输入/输出及副作用：label（输入）、mem（输入）、mapping（输入）、profile（输入）、cq_sequence（输入）、owner（输入）、ticket（输入）、hardware_ecode（输入）、raw_cqe（输出）；输入
+  //   request/image/cursor 决定写入内容；成功时更新 PI/CI、slot ledger 或 pending journal，并通过 output 返回结果。
+  // 失败/边界：write_profile_cqe 遇到后端拒绝、范围溢出或 DMA 权限不足时保留失败证据，不推进本地游标。
   task automatic write_profile_cqe(
     string label,
     rdma_mock_host_mem mem,
@@ -3445,6 +4050,10 @@ class rdma_cmq_engine_test extends uvm_test;
     expect_status({label, "_WRITE"}, status, RDMA_SC_OK);
   endtask
 
+  // 功能：在 rdma_cmq_engine_test 中，overwrite_profile_cqe 配置测试 fixture 的定向故障或替代依赖，使下一次调用覆盖指定边界路径。
+  // 输入/输出及副作用：label（输入）、mem（输入）、mapping（输入）、cq_sequence（输入）、raw_cqe（输入）；overwrite_profile_cqe 驱动下游事务；函数返回 无直接返回值，不取得调用方资源所有权。
+
+  // 失败/边界：overwrite_profile_cqe 异常完成由下游接口或 UVM 报告机制发布；该路径不隐式重试，也不转移未声明资源。
   task automatic overwrite_profile_cqe(
     string label,
     rdma_mock_host_mem mem,
@@ -3471,6 +4080,10 @@ class rdma_cmq_engine_test extends uvm_test;
     expect_status({label, "_WRITE"}, status, RDMA_SC_OK);
   endtask
 
+  // 功能：在 rdma_cmq_engine_test 中，expect_poll_read_geometry 在测试中执行 expect_poll_read_geometry 断言，比较输入结果与期望状态并报告可定位的失败信息。
+  // 输入/输出及副作用：label（输入）、mem（输入）、first_cq_sequence（输入）、expected_count（输入）；fixture/输入由测试调用方提供；执行时会产生 UVM
+  //   assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：测试函数 expect_poll_read_geometry 缺少前置对象时报告断言错误，并停止依赖该对象的后续检查。
   function automatic void expect_poll_read_geometry(
     string label,
     rdma_mock_host_mem mem,
@@ -3499,6 +4112,9 @@ class rdma_cmq_engine_test extends uvm_test;
     end
   endfunction
 
+  // 功能：在 rdma_cmq_engine_test 中，expect_empty_poll_without_read 在测试中执行 expect_empty_poll_without_read 断言，比较输入结果与期望状态并报告可定位的失败信息。
+  // 输入/输出及副作用：label（输入）、engine（输入）、mem（输入）；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：测试函数 expect_empty_poll_without_read 缺少前置对象时报告断言错误，并停止依赖该对象的后续检查。
   task automatic expect_empty_poll_without_read(
     string label,
     rdma_cmq_engine_probe engine,
@@ -3531,6 +4147,9 @@ class rdma_cmq_engine_test extends uvm_test;
       `uvm_error(label, "empty poll changed authority or read host memory")
   endtask
 
+  // 功能：在 rdma_cmq_engine_test 中，expect_empty_poll_with_read 在测试中执行 expect_empty_poll_with_read 断言，比较输入结果与期望状态并报告可定位的失败信息。
+  // 输入/输出及副作用：label（输入）、engine（输入）、mem（输入）；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：测试函数 expect_empty_poll_with_read 缺少前置对象时报告断言错误，并停止依赖该对象的后续检查。
   task automatic expect_empty_poll_with_read(
     string label,
     rdma_cmq_engine_probe engine,
@@ -3565,6 +4184,9 @@ class rdma_cmq_engine_test extends uvm_test;
     expect_poll_read_geometry({label, "_READ"}, mem, before_consume, 1);
   endtask
 
+  // 功能：在 rdma_cmq_engine_test 中，expect_inconsistent_empty_poll_without_read 在测试中执行 expect_inconsistent_empty_poll_without_read 断言，比较输入结果与期望状态并报告可定位的失败信息。
+  // 输入/输出及副作用：label（输入）、engine（输入）、mem（输入）；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：测试函数 expect_inconsistent_empty_poll_without_read 缺少前置对象时报告断言错误，并停止依赖该对象的后续检查。
   task automatic expect_inconsistent_empty_poll_without_read(
     string label,
     rdma_cmq_engine_probe engine,
@@ -3587,6 +4209,10 @@ class rdma_cmq_engine_test extends uvm_test;
       )
   endtask
 
+  // 功能：在 rdma_cmq_engine_test 中，expect_polled_completion 在测试中执行 expect_polled_completion 断言，比较输入结果与期望状态并报告可定位的失败信息。
+  // 输入/输出及副作用：label（输入）、engine（输入）、completion（输入）、expected_ticket（输入）、expected_raw（输入）、expected_owner（输入）、expected_hardware_ecode（输入）、expected_code（输入）；fixture/输入由测试调用方提供；执行时会产生
+  //   UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：测试函数 expect_polled_completion 缺少前置对象时报告断言错误，并停止依赖该对象的后续检查。
   function automatic void expect_polled_completion(
     string label,
     rdma_cmq_engine_probe engine,
@@ -3597,7 +4223,7 @@ class rdma_cmq_engine_test extends uvm_test;
     bit [31:0] expected_hardware_ecode,
     rdma_status_code_e expected_code
   );
-    rdma_xtr_v1_cmq_completion payload;
+    rdma_hw_cmq_completion payload;
     rdma_status validation_status;
 
     if (completion == null || expected_ticket == null ||
@@ -3659,6 +4285,10 @@ class rdma_cmq_engine_test extends uvm_test;
       `uvm_error(label, "decoded CQE payload fields are mismatched")
   endfunction
 
+  // 功能：在 rdma_cmq_engine_test 中，expect_timeout_completion 在测试中执行 expect_timeout_completion 断言，比较输入结果与期望状态并报告可定位的失败信息。
+  // 输入/输出及副作用：label（输入）、completion（输入）、expected_ticket（输入）；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT
+  //   转移未声明的资源所有权。
+  // 失败/边界：测试函数 expect_timeout_completion 缺少前置对象时报告断言错误，并停止依赖该对象的后续检查。
   function automatic void expect_timeout_completion(
     string label,
     rdma_cmq_completion completion,
@@ -3700,6 +4330,10 @@ class rdma_cmq_engine_test extends uvm_test;
       `uvm_error(label, "timeout completion identity or payload is invalid")
   endfunction
 
+  // 功能：在 rdma_cmq_engine_test 中，expect_late_diagnostic 在测试中执行 expect_late_diagnostic 断言，比较输入结果与期望状态并报告可定位的失败信息。
+  // 输入/输出及副作用：label（输入）、engine（输入）、diagnostic（输入）、expected_ticket（输入）、expected_raw（输入）；fixture/输入由测试调用方提供；执行时会产生 UVM
+  //   assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：测试函数 expect_late_diagnostic 缺少前置对象时报告断言错误，并停止依赖该对象的后续检查。
   function automatic void expect_late_diagnostic(
     string label,
     rdma_cmq_engine_probe engine,
@@ -3744,6 +4378,10 @@ class rdma_cmq_engine_test extends uvm_test;
       `uvm_error(label, "late diagnostic identity or raw CQE is invalid")
   endfunction
 
+  // 功能：在 rdma_cmq_engine_test 中，expect_poison_diagnostic 在测试中执行 expect_poison_diagnostic 断言，比较输入结果与期望状态并报告可定位的失败信息。
+  // 输入/输出及副作用：label（输入）、engine（输入）、diagnostic（输入）、expected_kind（输入）、expected_ticket（输入）、expected_raw（输入）、expected_binding（输入）、expected_cmq（输入）；fixture/输入由测试调用方提供；执行时会产生
+  //   UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：测试函数 expect_poison_diagnostic 缺少前置对象时报告断言错误，并停止依赖该对象的后续检查。
   function automatic void expect_poison_diagnostic(
     string label,
     rdma_cmq_engine_probe engine,
@@ -3801,6 +4439,10 @@ class rdma_cmq_engine_test extends uvm_test;
       `uvm_error(label, "poison diagnostic lost detached 64-byte evidence")
   endfunction
 
+  // 功能：在 rdma_cmq_engine_test 中，expect_release_retry_identity 在测试中执行 expect_release_retry_identity 断言，比较输入结果与期望状态并报告可定位的失败信息。
+  // 输入/输出及副作用：label（输入）、mem（输入）、retained_mapping（输入）；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT
+  //   转移未声明的资源所有权。
+  // 失败/边界：测试函数 expect_release_retry_identity 缺少前置对象时报告断言错误，并停止依赖该对象的后续检查。
   function automatic void expect_release_retry_identity(
     string label,
     rdma_mock_host_mem mem,
@@ -3828,6 +4470,9 @@ class rdma_cmq_engine_test extends uvm_test;
       `uvm_error(label, "release retry changed mapping allocation identity")
   endfunction
 
+  // 功能：在 rdma_cmq_engine_test 中由 same_nullable_handle 逐字段比较输入值，返回结构、身份或序列化内容是否一致。
+  // 输入/输出及副作用：lhs（输入）、rhs（输入）；比较对象/数组只读；返回 bit 或状态结果，不更新 runtime、账本或外部 adapter。
+  // 失败/边界：same_nullable_handle 的任一比较对象为空或类型不符时返回确定的 false/不等结果，不抛出未处理异常。
   function automatic bit same_nullable_handle(
     rdma_handle lhs,
     rdma_handle rhs
@@ -3837,6 +4482,9 @@ class rdma_cmq_engine_test extends uvm_test;
     return lhs.same_instance(rhs);
   endfunction
 
+  // 功能：在 rdma_cmq_engine_test 中由 same_mapping_fields 逐字段比较输入值，返回结构、身份或序列化内容是否一致。
+  // 输入/输出及副作用：lhs（输入）、rhs（输入）；比较对象/数组只读；返回 bit 或状态结果，不更新 runtime、账本或外部 adapter。
+  // 失败/边界：same_mapping_fields 的任一比较对象为空或类型不符时返回确定的 false/不等结果，不抛出未处理异常。
   function automatic bit same_mapping_fields(
     rdma_dma_mapping lhs,
     rdma_dma_mapping rhs
@@ -3854,6 +4502,10 @@ class rdma_cmq_engine_test extends uvm_test;
            same_nullable_handle(lhs.owner_h, rhs.owner_h);
   endfunction
 
+  // 功能：在 rdma_cmq_engine_test 中，expect_post_allocate_rollback 在测试中执行 expect_post_allocate_rollback 断言，比较输入结果与期望状态并报告可定位的失败信息。
+  // 输入/输出及副作用：label（输入）、engine（输入）、mem（输入）、runtime_desc（输入）、expected_write_count（输入）；fixture/输入由测试调用方提供；执行时会产生 UVM
+  //   assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：测试函数 expect_post_allocate_rollback 缺少前置对象时报告断言错误，并停止依赖该对象的后续检查。
   function automatic void expect_post_allocate_rollback(
     string label,
     rdma_cmq_engine engine,
@@ -3874,6 +4526,9 @@ class rdma_cmq_engine_test extends uvm_test;
     expect_unconfigured({label, "_STATE"}, engine);
   endfunction
 
+  // 功能：在 rdma_cmq_engine_test 中，expect_unconfigured 在测试中执行 expect_unconfigured 断言，比较输入结果与期望状态并报告可定位的失败信息。
+  // 输入/输出及副作用：label（输入）、engine（输入）；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：测试函数 expect_unconfigured 缺少前置对象时报告断言错误，并停止依赖该对象的后续检查。
   function automatic void expect_unconfigured(
     string label,
     rdma_cmq_engine engine
@@ -3884,6 +4539,10 @@ class rdma_cmq_engine_test extends uvm_test;
       `uvm_error(label, "unconfigured engine retained a mapping")
   endfunction
 
+  // 功能：在 rdma_cmq_engine_test 中，prepare_defaults 校验依赖和 binding 后建立运行边界，只保存非拥有引用并拒绝重复配置。
+  // 输入/输出及副作用：label（输入）、engine（输入）、mem（输入）、binding（输入）、cmq（输入）、scheduler（输入）、profile（输入）、runtime_desc（输出）；prepare_defaults 驱动下游事务，并写入 runtime_desc；函数返回 无直接返回值，不取得调用方资源所有权。
+
+  // 失败/边界：prepare_defaults 失败或超时通过 runtime_desc 明确发布；该路径不隐式重试，也不转移未声明资源。
   task automatic prepare_defaults(
     string label,
     rdma_cmq_engine engine,
@@ -3901,6 +4560,10 @@ class rdma_cmq_engine_test extends uvm_test;
     expect_status(label, status, RDMA_SC_OK);
   endtask
 
+  // 功能：在测试辅助 rdma_cmq_engine_test.check_success_and_detachment 中构造或驱动“success and detachment”场景，并断言 DUT
+  //   的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_success_and_detachment();
     rdma_cmq_engine engine;
     rdma_mock_host_mem mem;
@@ -4038,6 +4701,10 @@ class rdma_cmq_engine_test extends uvm_test;
                  "idempotent shutdown released backing again")
   endtask
 
+  // 功能：在测试辅助 rdma_cmq_engine_test.check_preallocation_rejections 中构造或驱动“preallocation rejections”场景，并断言 DUT
+  //   的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_preallocation_rejections();
     rdma_cmq_engine engine;
     rdma_mock_host_mem mem;
@@ -4169,6 +4836,10 @@ class rdma_cmq_engine_test extends uvm_test;
     expect_unconfigured("PROFILE_FAILURE_STATE", engine);
   endtask
 
+  // 功能：在测试辅助 rdma_cmq_engine_test.check_pasid_normalization_and_busy_prepare 中构造或驱动“pasid normalization and busy
+  //   prepare”场景，并断言 DUT 的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_pasid_normalization_and_busy_prepare();
     rdma_cmq_engine engine;
     rdma_mock_host_mem mem;
@@ -4210,6 +4881,10 @@ class rdma_cmq_engine_test extends uvm_test;
     expect_status("PASID_SHUTDOWN", status, RDMA_SC_OK);
   endtask
 
+  // 功能：在测试辅助 rdma_cmq_engine_test.check_allocation_and_rollback_failures 中构造或驱动“allocation and rollback
+  //   failures”场景，并断言 DUT 的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_allocation_and_rollback_failures();
     rdma_cmq_engine engine;
     rdma_cmq_engine_probe release_failure_engine;
@@ -4428,6 +5103,9 @@ class rdma_cmq_engine_test extends uvm_test;
                                   retained_mock);
   endtask
 
+  // 功能：在测试辅助 rdma_cmq_engine_test.check_null_status_guards 中构造或驱动“null status guards”场景，并断言 DUT 的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_null_status_guards();
     rdma_cmq_engine engine;
     rdma_mock_host_mem mem;
@@ -4538,6 +5216,9 @@ class rdma_cmq_engine_test extends uvm_test;
                                   null_write_mem, runtime_desc, 1);
   endtask
 
+  // 功能：在测试辅助 rdma_cmq_engine_test.check_activation_guards 中构造或驱动“activation guards”场景，并断言 DUT 的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_activation_guards();
     rdma_cmq_engine_probe engine;
     rdma_mock_host_mem mem;
@@ -4623,6 +5304,7 @@ class rdma_cmq_engine_test extends uvm_test;
 
     candidate = make_binding("generation_candidate", RDMA_BIND_ACTIVE);
     candidate.generation++;
+    candidate.synchronize_identity_from_legacy_mirrors();
     candidate.owner_h = candidate.make_handle();
     engine.activate(candidate, status);
     expect_status("ACTIVATE_GENERATION", status,
@@ -4631,6 +5313,7 @@ class rdma_cmq_engine_test extends uvm_test;
     candidate = make_binding("bdf_candidate", RDMA_BIND_ACTIVE);
     candidate.pcie.bdf.bus++;
     candidate.queue_dma.requester_bdf = candidate.pcie.bdf;
+    candidate.synchronize_identity_from_legacy_mirrors();
     engine.activate(candidate, status);
     expect_status("ACTIVATE_BDF", status, RDMA_SC_DMA_TRANSLATION);
 
@@ -4731,6 +5414,10 @@ class rdma_cmq_engine_test extends uvm_test;
     end
   endtask
 
+  // 功能：在测试辅助 rdma_cmq_engine_test.check_prepared_shutdown_lifecycle 中构造或驱动“prepared shutdown lifecycle”场景，并断言 DUT
+  //   的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_prepared_shutdown_lifecycle();
     rdma_cmq_engine engine;
     rdma_mock_host_mem first_mem;
@@ -4806,6 +5493,7 @@ class rdma_cmq_engine_test extends uvm_test;
     second_binding.function_uid++;
     second_binding.global_function_id++;
     second_binding.generation++;
+    second_binding.synchronize_identity_from_legacy_mirrors();
     second_binding.owner_h = second_binding.make_handle();
     second_cmq = make_cmq("prepared_shutdown_second_cmq", second_binding);
     prepare_defaults("PREPARED_SHUTDOWN_REPREPARE", engine, second_mem,
@@ -4827,6 +5515,10 @@ class rdma_cmq_engine_test extends uvm_test;
                  "reprepare released through the wrong collaborator")
   endtask
 
+  // 功能：在测试辅助 rdma_cmq_engine_test.check_shutdown_release_retry 中构造或驱动“shutdown release retry”场景，并断言 DUT
+  //   的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_shutdown_release_retry();
     rdma_cmq_engine_probe engine;
     rdma_mock_host_mem mem;
@@ -4896,6 +5588,10 @@ class rdma_cmq_engine_test extends uvm_test;
                  "third shutdown released retired backing again")
   endtask
 
+  // 功能：在测试辅助 rdma_cmq_engine_test.check_active_shutdown_release_retry 中构造或驱动“active shutdown release retry”场景，并断言 DUT
+  //   的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_active_shutdown_release_retry();
     rdma_cmq_engine_probe engine;
     rdma_mock_host_mem mem;
@@ -4966,6 +5662,10 @@ class rdma_cmq_engine_test extends uvm_test;
     );
   endtask
 
+  // 功能：在测试辅助 rdma_cmq_engine_test.check_null_shutdown_release_retry 中构造或驱动“null shutdown release retry”场景，并断言 DUT
+  //   的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_null_shutdown_release_retry();
     rdma_cmq_engine_probe engine;
     rdma_cmq_null_release_once_mem mem;
@@ -5029,6 +5729,10 @@ class rdma_cmq_engine_test extends uvm_test;
                  "idempotent shutdown retried a released mapping")
   endtask
 
+  // 功能：在测试辅助 rdma_cmq_engine_test.check_missing_host_mem_shutdown 中构造或驱动“missing host mem shutdown”场景，并断言 DUT
+  //   的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_missing_host_mem_shutdown();
     rdma_cmq_engine_probe engine;
     rdma_mock_host_mem mem;
@@ -5099,6 +5803,10 @@ class rdma_cmq_engine_test extends uvm_test;
                  "restored adapter did not release retained mapping")
   endtask
 
+  // 功能：在测试辅助 rdma_cmq_engine_test.check_batch_compaction_and_doorbell 中构造或驱动“batch compaction and doorbell”场景，并断言 DUT
+  //   的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_batch_compaction_and_doorbell();
     rdma_cmq_engine_probe engine;
     rdma_mock_host_mem mem;
@@ -5222,6 +5930,10 @@ class rdma_cmq_engine_test extends uvm_test;
     expect_status("BATCH_SHUTDOWN", status, RDMA_SC_OK);
   endtask
 
+  // 功能：在测试辅助 rdma_cmq_engine_test.check_empty_invalid_and_state_rejections 中构造或驱动“empty invalid and state
+  //   rejections”场景，并断言 DUT 的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_empty_invalid_and_state_rejections();
     rdma_cmq_engine_probe engine;
     rdma_cmq_engine unconfigured_engine;
@@ -5335,6 +6047,10 @@ class rdma_cmq_engine_test extends uvm_test;
   endtask
 
 
+  // 功能：在测试辅助 rdma_cmq_engine_test.check_poll_empty_ledger_and_partial_drain 中构造或驱动“poll empty ledger and partial
+  //   drain”场景，并断言 DUT 的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_poll_empty_ledger_and_partial_drain();
     rdma_cmq_engine_probe engine;
     rdma_mock_host_mem mem;
@@ -5598,6 +6314,10 @@ class rdma_cmq_engine_test extends uvm_test;
     expect_status("INVALID_SHUTDOWN", status, RDMA_SC_OK);
   endtask
 
+  // 功能：在测试辅助 rdma_cmq_engine_test.check_pre_read_poll_ledger_fail_closed 中构造或驱动“pre read poll ledger fail
+  //   closed”场景，并断言 DUT 的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_pre_read_poll_ledger_fail_closed();
     string fault_labels[4];
 
@@ -5682,6 +6402,10 @@ class rdma_cmq_engine_test extends uvm_test;
     end
   endtask
 
+  // 功能：在测试辅助 rdma_cmq_engine_test.check_submit_wrapper_and_snapshot_detachment 中构造或驱动“submit wrapper and snapshot
+  //   detachment”场景，并断言 DUT 的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_submit_wrapper_and_snapshot_detachment();
     rdma_cmq_engine_probe engine;
     rdma_mock_host_mem mem;
@@ -5811,6 +6535,10 @@ class rdma_cmq_engine_test extends uvm_test;
     expect_status("WRAPPER_SHUTDOWN", status, RDMA_SC_OK);
   endtask
 
+  // 功能：在测试辅助 rdma_cmq_engine_test.check_nested_command_snapshot_failures 中构造或驱动“nested command snapshot
+  //   failures”场景，并断言 DUT 的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_nested_command_snapshot_failures();
     rdma_cmq_engine_probe engine;
     rdma_mock_host_mem mem;
@@ -6044,6 +6772,10 @@ class rdma_cmq_engine_test extends uvm_test;
     expect_status("NESTED_CLONE_SHUTDOWN", status, RDMA_SC_OK);
   endtask
 
+  // 功能：在测试辅助 rdma_cmq_engine_test.check_mutating_clone_source_restoration 中构造或驱动“mutating clone source
+  //   restoration”场景，并断言 DUT 的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_mutating_clone_source_restoration();
     rdma_cmq_engine_probe engine;
     rdma_mock_host_mem mem;
@@ -6360,6 +7092,10 @@ class rdma_cmq_engine_test extends uvm_test;
     expect_status("MUTATING_SOURCE_SHUTDOWN", status, RDMA_SC_OK);
   endtask
 
+  // 功能：在测试辅助 rdma_cmq_engine_test.check_qpc_context_snapshot_failures 中构造或驱动“qpc context snapshot failures”场景，并断言 DUT
+  //   的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_qpc_context_snapshot_failures();
     rdma_cmq_engine_probe engine;
     rdma_mock_host_mem mem;
@@ -6616,6 +7352,10 @@ class rdma_cmq_engine_test extends uvm_test;
     expect_status("QPC_GRAPH_SHUTDOWN", status, RDMA_SC_OK);
   endtask
 
+  // 功能：在测试辅助 rdma_cmq_engine_test.check_null_compose_transaction_abort 中构造或驱动“null compose transaction abort”场景，并断言
+  //   DUT 的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_null_compose_transaction_abort();
     rdma_cmq_engine_probe engine;
     rdma_mock_host_mem mem;
@@ -6737,6 +7477,10 @@ class rdma_cmq_engine_test extends uvm_test;
     expect_status("NULL_COMPOSE_SHUTDOWN", status, RDMA_SC_OK);
   endtask
 
+  // 功能：在测试辅助 rdma_cmq_engine_test.check_transaction_failure_atomicity 中构造或驱动“transaction failure atomicity”场景，并断言 DUT
+  //   的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_transaction_failure_atomicity();
     rdma_cmq_engine_probe engine;
     rdma_mock_host_mem mem;
@@ -6889,6 +7633,10 @@ class rdma_cmq_engine_test extends uvm_test;
     expect_status("ATOMIC_SHUTDOWN", status, RDMA_SC_OK);
   endtask
 
+  // 功能：在测试辅助 rdma_cmq_engine_test.check_profile_wide_cqe_format_authority 中构造或驱动“profile wide cqe format
+  //   authority”场景，并断言 DUT 的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_profile_wide_cqe_format_authority();
     rdma_cmq_engine_probe engine;
     rdma_mock_host_mem mem;
@@ -7002,6 +7750,10 @@ class rdma_cmq_engine_test extends uvm_test;
     expect_status("FORMAT_SHUTDOWN", status, RDMA_SC_OK);
   endtask
 
+  // 功能：在测试辅助 rdma_cmq_engine_test.check_all_transport_failure_rollbacks 中构造或驱动“all transport failure rollbacks”场景，并断言
+  //   DUT 的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_all_transport_failure_rollbacks();
     rdma_cmq_engine_probe engine;
     rdma_mock_host_mem mem;
@@ -7208,6 +7960,10 @@ class rdma_cmq_engine_test extends uvm_test;
     end
   endtask
 
+  // 功能：在测试辅助 rdma_cmq_engine_test.check_doorbell_authority_isolation 中构造或驱动“doorbell authority isolation”场景，并断言 DUT
+  //   的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_doorbell_authority_isolation();
     rdma_cmq_engine_probe engine;
     rdma_mock_host_mem mem;
@@ -7322,6 +8078,10 @@ class rdma_cmq_engine_test extends uvm_test;
     end
   endtask
 
+  // 功能：在测试辅助 rdma_cmq_engine_test.check_submission_validation_and_profile_metadata 中构造或驱动“submission validation and
+  //   profile metadata”场景，并断言 DUT 的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_submission_validation_and_profile_metadata();
     rdma_cmq_engine_probe engine;
     rdma_mock_host_mem mem;
@@ -7568,6 +8328,10 @@ class rdma_cmq_engine_test extends uvm_test;
     expect_status("VALIDATION_SHUTDOWN", status, RDMA_SC_OK);
   endtask
 
+  // 功能：在测试辅助 rdma_cmq_engine_test.check_profile_hook_snapshot_contract 中构造或驱动“profile hook snapshot contract”场景，并断言
+  //   DUT 的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_profile_hook_snapshot_contract();
     rdma_cmq_engine_probe engine;
     rdma_mock_host_mem mem;
@@ -7753,6 +8517,10 @@ class rdma_cmq_engine_test extends uvm_test;
     expect_status("HOOK_NONOK_SHUTDOWN", status, RDMA_SC_OK);
   endtask
 
+  // 功能：在测试辅助 rdma_cmq_engine_test.check_stateful_profile_snapshot_rechecks 中构造或驱动“stateful profile snapshot
+  //   rechecks”场景，并断言 DUT 的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_stateful_profile_snapshot_rechecks();
     rdma_cmq_engine_probe engine;
     rdma_mock_host_mem mem;
@@ -7914,6 +8682,10 @@ class rdma_cmq_engine_test extends uvm_test;
     end
   endtask
 
+  // 功能：在测试辅助 rdma_cmq_engine_test.check_exact_type_profile_delegation 中构造或驱动“exact type profile delegation”场景，并断言 DUT
+  //   的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_exact_type_profile_delegation();
     rdma_cmq_engine_probe engine;
     rdma_mock_host_mem mem;
@@ -8284,6 +9056,10 @@ class rdma_cmq_engine_test extends uvm_test;
     end
   endtask
 
+  // 功能：在测试辅助 rdma_cmq_engine_test.check_internal_invariant_batch_abort 中构造或驱动“internal invariant batch abort”场景，并断言
+  //   DUT 的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_internal_invariant_batch_abort();
     rdma_cmq_engine_probe engine;
     rdma_mock_host_mem mem;
@@ -8434,6 +9210,10 @@ class rdma_cmq_engine_test extends uvm_test;
     disarm_submission_factory_faults();
   endtask
 
+  // 功能：在测试辅助 rdma_cmq_engine_test.check_timeout_quarantine_and_late_diagnostic 中构造或驱动“timeout quarantine and late
+  //   diagnostic”场景，并断言 DUT 的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_timeout_quarantine_and_late_diagnostic();
     rdma_cmq_engine_probe engine;
     rdma_mock_host_mem mem;
@@ -8625,6 +9405,10 @@ class rdma_cmq_engine_test extends uvm_test;
     expect_status("TIMEOUT_SHUTDOWN", status, RDMA_SC_OK);
   endtask
 
+  // 功能：在测试辅助 rdma_cmq_engine_test.check_expire_snapshot_failure_is_atomic_and_retryable 中构造或驱动“expire snapshot
+  //   failure is atomic and retryable”场景，并断言 DUT 的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_expire_snapshot_failure_is_atomic_and_retryable();
     rdma_cmq_engine_probe engine;
     rdma_mock_host_mem mem;
@@ -8765,6 +9549,10 @@ class rdma_cmq_engine_test extends uvm_test;
     expect_status("EXPIRE_SNAPSHOT_FAILURE_SHUTDOWN", status, RDMA_SC_OK);
   endtask
 
+  // 功能：在测试辅助 rdma_cmq_engine_test.check_late_diagnostic_snapshot_failure_is_retryable 中构造或驱动“late diagnostic snapshot
+  //   failure is retryable”场景，并断言 DUT 的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_late_diagnostic_snapshot_failure_is_retryable();
     rdma_cmq_engine_probe engine;
     rdma_mock_host_mem mem;
@@ -8916,6 +9704,10 @@ class rdma_cmq_engine_test extends uvm_test;
     expect_status("LATE_SNAPSHOT_FAILURE_SHUTDOWN", status, RDMA_SC_OK);
   endtask
 
+  // 功能：在测试辅助 rdma_cmq_engine_test.check_command_incarnation_exhaustion 中构造或驱动“command incarnation exhaustion”场景，并断言
+  //   DUT 的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_command_incarnation_exhaustion();
     rdma_cmq_engine_probe engine;
     rdma_mock_host_mem mem;
@@ -9015,6 +9807,10 @@ class rdma_cmq_engine_test extends uvm_test;
     expect_status("EXHAUSTION_SHUTDOWN", status, RDMA_SC_OK);
   endtask
 
+  // 功能：在测试辅助 rdma_cmq_engine_test.check_incarnation_survives_reprepare 中构造或驱动“incarnation survives reprepare”场景，并断言
+  //   DUT 的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_incarnation_survives_reprepare();
     rdma_cmq_engine_probe engine;
     rdma_mock_host_mem mem;
@@ -9090,6 +9886,10 @@ class rdma_cmq_engine_test extends uvm_test;
     expect_status("INCARNATION_FINAL_SHUTDOWN", status, RDMA_SC_OK);
   endtask
 
+  // 功能：在测试辅助 rdma_cmq_engine_test.check_max_dependency_id_boundary 中构造或驱动“max dependency id boundary”场景，并断言 DUT
+  //   的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_max_dependency_id_boundary();
     rdma_cmq_engine_probe engine;
     rdma_mock_host_mem mem;
@@ -9174,6 +9974,10 @@ class rdma_cmq_engine_test extends uvm_test;
     expect_status("MAX_DEPENDENCY_SHUTDOWN", status, RDMA_SC_OK);
   endtask
 
+  // 功能：在测试辅助 rdma_cmq_engine_test.check_counter_invariants_poison_before_transport 中构造或驱动“counter invariants poison
+  //   before transport”场景，并断言 DUT 的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_counter_invariants_poison_before_transport();
     rdma_cmq_engine_probe engine;
     rdma_mock_host_mem mem;
@@ -9301,6 +10105,10 @@ class rdma_cmq_engine_test extends uvm_test;
     end
   endtask
 
+  // 功能：在测试辅助 rdma_cmq_engine_test.check_poll_raw_snapshot_rejects_self_clone_mutation 中构造或驱动“poll raw snapshot
+  //   rejects self clone mutation”场景，并断言 DUT 的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_poll_raw_snapshot_rejects_self_clone_mutation();
     rdma_cmq_engine_probe engine;
     rdma_mock_host_mem mem;
@@ -9408,6 +10216,10 @@ class rdma_cmq_engine_test extends uvm_test;
     expect_status("POLL_RAW_SNAPSHOT_SHUTDOWN", status, RDMA_SC_OK);
   endtask
 
+  // 功能：在测试辅助 rdma_cmq_engine_test.check_poll_payload_retained_self_clone_is_detached 中构造或驱动“poll payload retained
+  //   self clone is detached”场景，并断言 DUT 的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_poll_payload_retained_self_clone_is_detached();
     rdma_cmq_engine_probe engine;
     rdma_mock_host_mem mem;
@@ -9497,6 +10309,10 @@ class rdma_cmq_engine_test extends uvm_test;
     expect_status("POLL_PAYLOAD_DETACHMENT_SHUTDOWN", status, RDMA_SC_OK);
   endtask
 
+  // 功能：在测试辅助 rdma_cmq_engine_test.check_poll_payload_hook_contract_failures 中构造或驱动“poll payload hook contract
+  //   failures”场景，并断言 DUT 的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_poll_payload_hook_contract_failures();
     rdma_cmq_test_hook_fault_e faults[8];
     string labels[8];
@@ -9608,6 +10424,10 @@ class rdma_cmq_engine_test extends uvm_test;
     expect_status("POLL_PAYLOAD_HOOK_SHUTDOWN", status, RDMA_SC_OK);
   endtask
 
+  // 功能：在测试辅助 rdma_cmq_engine_test.check_poll_decoded_status_contract_failures 中构造或驱动“poll decoded status contract
+  //   failures”场景，并断言 DUT 的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_poll_decoded_status_contract_failures();
     rdma_cmq_test_decoded_contract_fault_e faults[7];
     rdma_cmq_test_decoded_contract_fault_e legal_faults[2];
@@ -9846,6 +10666,10 @@ class rdma_cmq_engine_test extends uvm_test;
     end
   endtask
 
+  // 功能：在测试辅助 rdma_cmq_engine_test.check_poll_ticket_root_is_explicitly_constructed 中构造或驱动“poll ticket root is
+  //   explicitly constructed”场景，并断言 DUT 的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_poll_ticket_root_is_explicitly_constructed();
     rdma_cmq_engine_probe engine;
     rdma_mock_host_mem mem;
@@ -9919,6 +10743,10 @@ class rdma_cmq_engine_test extends uvm_test;
     expect_status("POLL_EXPLICIT_TICKET_SHUTDOWN", status, RDMA_SC_OK);
   endtask
 
+  // 功能：在测试辅助 rdma_cmq_engine_test.check_poll_backing_out_of_order_and_owner_wrap 中构造或驱动“poll backing out of order and
+  //   owner wrap”场景，并断言 DUT 的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_poll_backing_out_of_order_and_owner_wrap();
     rdma_cmq_engine_probe engine;
     rdma_mock_host_mem mem;
@@ -10042,7 +10870,7 @@ class rdma_cmq_engine_test extends uvm_test;
     mem.calls.delete();
     write_profile_cqe(
       "POLL_ARRIVAL_0", mem, mapping, profile, 1, 1'b1, tickets[0],
-      XTR_V1_ECODE_EC_RCE_CQ_FULL, arrival_raw[1]
+      RDMA_ECODE_EC_RCE_CQ_FULL, arrival_raw[1]
     );
     engine.poll(completions, diagnostics, status);
     expect_status("POLL_ARRIVAL_0_STATUS", status, RDMA_SC_OK);
@@ -10051,7 +10879,7 @@ class rdma_cmq_engine_test extends uvm_test;
     else begin
       expect_polled_completion(
         "POLL_ARRIVAL_0_COMPLETION", engine, completions[0], tickets[0],
-        arrival_raw[1], 1'b1, XTR_V1_ECODE_EC_RCE_CQ_FULL,
+        arrival_raw[1], 1'b1, RDMA_ECODE_EC_RCE_CQ_FULL,
         RDMA_SC_QUEUE_FULL
       );
       arrival_ids.push_back(completions[0].ticket.command_id);
@@ -10207,6 +11035,10 @@ class rdma_cmq_engine_test extends uvm_test;
     expect_status("POLL_SHUTDOWN", status, RDMA_SC_OK);
   endtask
 
+  // 功能：在测试辅助 rdma_cmq_engine_test.check_retire_then_wrap_publication 中构造或驱动“retire then wrap publication”场景，并断言 DUT
+  //   的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_retire_then_wrap_publication();
     rdma_cmq_engine_probe engine;
     rdma_mock_host_mem mem;
@@ -10325,6 +11157,10 @@ class rdma_cmq_engine_test extends uvm_test;
     expect_status("WRAP_SHUTDOWN", status, RDMA_SC_OK);
   endtask
 
+  // 功能：在测试辅助 rdma_cmq_engine_test.check_full_initial_capacity_and_shutdown_reset 中构造或驱动“full initial capacity and
+  //   shutdown reset”场景，并断言 DUT 的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_full_initial_capacity_and_shutdown_reset();
     rdma_cmq_engine_probe engine;
     rdma_mock_host_mem mem;
@@ -10455,6 +11291,10 @@ class rdma_cmq_engine_test extends uvm_test;
     expect_status("CAPACITY_FINAL_SHUTDOWN", status, RDMA_SC_OK);
   endtask
 
+  // 功能：在测试辅助 rdma_cmq_engine_test.check_retirement_preflight_poison_atomicity 中构造或驱动“retirement preflight poison
+  //   atomicity”场景，并断言 DUT 的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_retirement_preflight_poison_atomicity();
     rdma_cmq_engine_probe engine;
     rdma_mock_host_mem mem;
@@ -10561,6 +11401,10 @@ class rdma_cmq_engine_test extends uvm_test;
     expect_status("RETIREMENT_PREFLIGHT_SHUTDOWN", status, RDMA_SC_OK);
   endtask
 
+  // 功能：在测试辅助 rdma_cmq_engine_test.check_cqe_poison_isolation_and_snapshot_detachment 中构造或驱动“cqe poison isolation and
+  //   snapshot detachment”场景，并断言 DUT 的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_cqe_poison_isolation_and_snapshot_detachment();
     rdma_cmq_test_poison_fault_e faults[7];
     rdma_cmq_diagnostic_kind_e kinds[7];
@@ -10868,6 +11712,10 @@ class rdma_cmq_engine_test extends uvm_test;
     end
   endtask
 
+  // 功能：在测试辅助 rdma_cmq_engine_test.check_poison_shutdown_release_retry_preserves_snapshot 中构造或驱动“poison shutdown
+  //   release retry preserves snapshot”场景，并断言 DUT 的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_poison_shutdown_release_retry_preserves_snapshot();
     string labels[2];
 
@@ -11026,6 +11874,10 @@ class rdma_cmq_engine_test extends uvm_test;
     end
   endtask
 
+  // 功能：在测试辅助 rdma_cmq_engine_test.check_wait_rejects_x_deadline_without_side_effects 中构造或驱动“wait rejects x deadline
+  //   without side effects”场景，并断言 DUT 的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_wait_rejects_x_deadline_without_side_effects();
     rdma_cmq_engine_probe engine;
     rdma_mock_host_mem mem;
@@ -11124,6 +11976,10 @@ class rdma_cmq_engine_test extends uvm_test;
     expect_status("WAIT_X_DEADLINE_SHUTDOWN", status, RDMA_SC_OK);
   endtask
 
+  // 功能：在测试辅助 rdma_cmq_engine_test.check_wait_poison_lifecycle_boundaries 中构造或驱动“wait poison lifecycle
+  //   boundaries”场景，并断言 DUT 的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_wait_poison_lifecycle_boundaries();
     rdma_cmq_engine_probe engine;
     rdma_mock_host_mem mem;
@@ -11294,6 +12150,10 @@ class rdma_cmq_engine_test extends uvm_test;
     expect_unconfigured("WAIT_POISON_RESET_STATE", engine);
   endtask
 
+  // 功能：在测试辅助 rdma_cmq_engine_test.check_wait_for_caller_ticket_detachment 中构造或驱动“wait for caller ticket
+  //   detachment”场景，并断言 DUT 的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_wait_for_caller_ticket_detachment();
     rdma_cmq_engine_probe engine;
     rdma_mock_host_mem mem;
@@ -11473,6 +12333,10 @@ class rdma_cmq_engine_test extends uvm_test;
     expect_status("WAIT_DETACHED_TICKET_SHUTDOWN", status, RDMA_SC_OK);
   endtask
 
+  // 功能：在测试辅助 rdma_cmq_engine_test.check_wait_for_fifo_and_deadline 中构造或驱动“wait for fifo and deadline”场景，并断言 DUT
+  //   的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_wait_for_fifo_and_deadline();
     rdma_cmq_engine_probe engine;
     rdma_mock_host_mem mem;
@@ -11630,6 +12494,10 @@ class rdma_cmq_engine_test extends uvm_test;
     expect_status("WAIT_TIMEOUT_SHUTDOWN", status, RDMA_SC_OK);
   endtask
 
+  // 功能：在测试辅助 rdma_cmq_engine_test.check_cancel_reset_and_shutdown_lifecycle 中构造或驱动“cancel reset and shutdown
+  //   lifecycle”场景，并断言 DUT 的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_cancel_reset_and_shutdown_lifecycle();
     rdma_cmq_engine_probe engine;
     rdma_mock_host_mem mem;
@@ -11759,6 +12627,10 @@ class rdma_cmq_engine_test extends uvm_test;
                  "idempotent shutdown released twice")
   endtask
 
+  // 功能：在测试辅助 rdma_cmq_engine_test.check_strict_cancel_audits_complete_ledger 中构造或驱动“strict cancel audits complete
+  //   ledger”场景，并断言 DUT 的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_strict_cancel_audits_complete_ledger();
     string fault_labels[4];
     int unsigned request_counts[4];
@@ -11889,6 +12761,10 @@ class rdma_cmq_engine_test extends uvm_test;
     end
   endtask
 
+  // 功能：在测试辅助 rdma_cmq_engine_test.check_strict_cancel_audits_exact_membership 中构造或驱动“strict cancel audits exact
+  //   membership”场景，并断言 DUT 的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_strict_cancel_audits_exact_membership();
     rdma_cmq_engine_probe engine;
     rdma_mock_host_mem mem;
@@ -12020,6 +12896,10 @@ class rdma_cmq_engine_test extends uvm_test;
     expect_unconfigured("STRICT_CANCEL_BALANCED_MEMBERSHIP_STATE", engine);
   endtask
 
+  // 功能：在测试辅助 rdma_cmq_engine_test.check_poison_recovery_rejects_x_tickets 中构造或驱动“poison recovery rejects x
+  //   tickets”场景，并断言 DUT 的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_poison_recovery_rejects_x_tickets();
     string fault_labels[2];
 
@@ -12105,6 +12985,10 @@ class rdma_cmq_engine_test extends uvm_test;
     end
   endtask
 
+  // 功能：在测试辅助 rdma_cmq_engine_test.check_poisoned_ledger_reset_recovery 中构造或驱动“poisoned ledger reset recovery”场景，并断言
+  //   DUT 的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_poisoned_ledger_reset_recovery();
     string fault_labels[3];
     bit expect_cancel[3];
@@ -12271,6 +13155,10 @@ class rdma_cmq_engine_test extends uvm_test;
     end
   endtask
 
+  // 功能：在测试辅助 rdma_cmq_engine_test.check_reset_fifo_retry_and_reprepare 中构造或驱动“reset fifo retry and reprepare”场景，并断言
+  //   DUT 的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_reset_fifo_retry_and_reprepare();
     rdma_cmq_engine_probe engine;
     rdma_mock_host_mem mem;
@@ -12373,8 +13261,10 @@ class rdma_cmq_engine_test extends uvm_test;
                                  RDMA_BIND_PREPARED);
     next_active = make_binding("reset_fifo_next_active", RDMA_BIND_ACTIVE);
     next_prepared.generation++;
+    next_prepared.synchronize_identity_from_legacy_mirrors();
     next_prepared.owner_h = next_prepared.make_handle();
     next_active.generation++;
+    next_active.synchronize_identity_from_legacy_mirrors();
     next_active.owner_h = next_active.make_handle();
     next_cmq = make_cmq("reset_fifo_next_cmq", next_prepared);
     scheduler = rdma_doorbell_scheduler::type_id::create(
@@ -12559,8 +13449,10 @@ class rdma_cmq_engine_test extends uvm_test;
                                  RDMA_BIND_PREPARED);
     next_active = make_binding("poison_reset_next_active", RDMA_BIND_ACTIVE);
     next_prepared.generation++;
+    next_prepared.synchronize_identity_from_legacy_mirrors();
     next_prepared.owner_h = next_prepared.make_handle();
     next_active.generation++;
+    next_active.synchronize_identity_from_legacy_mirrors();
     next_active.owner_h = next_active.make_handle();
     next_cmq = make_cmq("poison_reset_next_cmq", next_prepared);
     scheduler = rdma_doorbell_scheduler::type_id::create(
@@ -12604,6 +13496,9 @@ class rdma_cmq_engine_test extends uvm_test;
     expect_status("POISON_RESET_NEXT_SHUTDOWN", status, RDMA_SC_OK);
   endtask
 
+  // 功能：在 rdma_cmq_engine_test 中，run_phase 驱动 UVM 阶段中的场景初始化、事务执行和断言收尾，并在退出前释放 objection 或测试资源。
+  // 输入/输出及副作用：phase（输入）；phase 由 UVM 提供；task 通过 objection、日志和断言暴露结果，可能调用 DUT 接口但不改变其所有权规则。
+  // 失败/边界：run_phase 的 setup/阶段驱动失败时停止新增事务，并按测试生命周期清理 objection 与临时引用。
   virtual task run_phase(uvm_phase phase);
     phase.raise_objection(this);
     check_success_and_detachment();

@@ -3,8 +3,8 @@ HOST_MEM_BUILD ?= build/host_mem
 override HOST_MEM_PINNED_COMMIT := 3b9e000d5df4d10efbb3029f43605e0362e0caca
 override HOST_MEM_PKG_SHA256 := d2ba57918a3b605525274433008142c80921b6205b0848c76bef8f1fc0d0bba5
 override HOST_MEM_MANAGER_SHA256 := 8dd5ca3ba3abcfae4808c8ea10c34ced279316bebdc04f6f8e0ae5e55e337a9d
-override XTR_V1_ARCHIVE := /home/ubuntu/workspace/Desktop.zip
-override XTR_V1_ARCHIVE_PREFIX := dpu_kernel_rdma-version_0.1.32
+override RDMA_ARCHIVE := /home/ubuntu/workspace/Desktop.zip
+override RDMA_ARCHIVE_PREFIX := dpu_kernel_rdma-version_0.1.32
 TEST ?= rdma_smoke_test
 VCS ?= vcs
 # Work around a VCS W-2024.09-SP1 class-codegen miscompile; not an RTL requirement.
@@ -12,7 +12,7 @@ VCS_FLAGS := -full64 -sverilog -ntb_opts uvm-1.2 -timescale=1ns/1ps -debug_acces
 SHELL := /bin/bash
 .SHELLFLAGS := -o pipefail -c
 
-.PHONY: core host_mem_preflight host_mem xtr_defs
+.PHONY: core host_mem_preflight host_mem rdma_defs integration
 
 core:
 	mkdir -p $(BUILD)
@@ -20,23 +20,23 @@ core:
 	$(BUILD)/simv +UVM_TESTNAME=$(TEST) | tee $(BUILD)/$(TEST).log
 	../scripts/check_uvm_summary.sh $(BUILD)/$(TEST).log
 
-xtr_defs:
-	@ref_dir=$$(mktemp -d /tmp/rdma_xtr_v1_ref.XXXXXX); \
-	if [[ ! "$$ref_dir" =~ ^/tmp/rdma_xtr_v1_ref\.[A-Za-z0-9]{6}$$ ]]; then \
-		echo "Refusing unexpected xtr_v1 reference directory: $$ref_dir" >&2; \
+rdma_defs:
+	@ref_dir=$$(mktemp -d /tmp/rdma_profile_ref.XXXXXX); \
+	if [[ ! "$$ref_dir" =~ ^/tmp/rdma_profile_ref\.[A-Za-z0-9]{6}$$ ]]; then \
+		echo "Refusing unexpected RDMA reference directory: $$ref_dir" >&2; \
 		exit 2; \
 	fi; \
 	cleanup() { \
 		command_status=$$?; \
 		cleanup_status=0; \
 		trap - EXIT; \
-		if [[ "$$ref_dir" =~ ^/tmp/rdma_xtr_v1_ref\.[A-Za-z0-9]{6}$$ && -d "$$ref_dir" ]]; then \
+		if [[ "$$ref_dir" =~ ^/tmp/rdma_profile_ref\.[A-Za-z0-9]{6}$$ && -d "$$ref_dir" ]]; then \
 			if ! rm -rf -- "$$ref_dir"; then \
-				echo "Failed to remove xtr_v1 reference directory: $$ref_dir" >&2; \
+				echo "Failed to remove RDMA reference directory: $$ref_dir" >&2; \
 				cleanup_status=1; \
 			fi; \
 		else \
-			echo "Refusing to remove unexpected xtr_v1 reference directory: $$ref_dir" >&2; \
+			echo "Refusing to remove unexpected RDMA reference directory: $$ref_dir" >&2; \
 			cleanup_status=1; \
 		fi; \
 		if [[ "$$command_status" != 0 ]]; then \
@@ -45,9 +45,9 @@ xtr_defs:
 		exit $$cleanup_status; \
 	}; \
 	trap cleanup EXIT; \
-	unzip -q "$(XTR_V1_ARCHIVE)" "$(XTR_V1_ARCHIVE_PREFIX)/*" -d "$$ref_dir"; \
-	python3 ../tools/check_xtr_v1_defs.py \
-		--kernel-root "$$ref_dir/$(XTR_V1_ARCHIVE_PREFIX)"
+	unzip -q "$(RDMA_ARCHIVE)" "$(RDMA_ARCHIVE_PREFIX)/*" -d "$$ref_dir"; \
+	python3 ../tools/check_rdma_profile_names.py \
+		--kernel-root "$$ref_dir/$(RDMA_ARCHIVE_PREFIX)"
 
 host_mem_preflight:
 	@if [[ -z "$(HOST_MEM_ROOT)" ]]; then \
@@ -115,3 +115,10 @@ host_mem: host_mem_preflight
 	$(HOST_MEM_BUILD)/simv +UVM_TESTNAME=$(TEST) | \
 		tee $(HOST_MEM_BUILD)/$(TEST).log
 	../scripts/check_uvm_summary.sh $(HOST_MEM_BUILD)/$(TEST).log
+
+integration:
+	@if [[ -z "$(DPU_COMMON_ROOT)" ]]; then echo "DPU_COMMON_ROOT is required for integration" >&2; exit 2; fi
+	mkdir -p build/integration
+	$(VCS) $(VCS_FLAGS) +define+RDMA_DPU_INTEGRATION +incdir+$(DPU_COMMON_ROOT)/src $(DPU_COMMON_ROOT)/src/dpu_resource_pkg.sv -f filelists/integration.f -top tb_top -o build/integration/simv
+	build/integration/simv +UVM_TESTNAME=$(TEST) | tee build/integration/$(TEST).log
+	../scripts/check_uvm_summary.sh build/integration/$(TEST).log

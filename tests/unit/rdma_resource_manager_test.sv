@@ -1,12 +1,23 @@
+// 目录：测试层 unit/rdma_resource_manager_test.sv。
+// 职责：验证 rdma_resource_manager_test 对应模块的接口、错误路径和边界行为。
+// 依赖：依赖被测 package、UVM 测试基类和必要的 mock/fixture。
+// 所有权与生命周期：测试对象只拥有本地 fixture；外部后端句柄由测试环境提供并在测试结束释放。
+
 // 中文说明：rdma_resource_manager_test.sv 属于单元测试，覆盖对应模型、编码器或执行器契约。
 // 阅读提示：先看公开类型和接口，再看实现细节；失败路径应保持状态与资源所有权可追踪。
 
 class rdma_resource_manager_probe extends rdma_resource_manager;
 
+  // 功能：构造 rdma_resource_manager_probe，调用 super.new 建立 UVM 层级对象；外部依赖字段保持未绑定，后续由 configure/build/activate 明确注入。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_resource_manager_probe 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_resource_manager_probe");
     super.new(name);
   endfunction
 
+  // 功能：在 rdma_resource_manager_probe 中，force_next_object_serial 配置测试 fixture 的定向故障或替代依赖，使下一次调用覆盖指定边界路径。
+  // 输入/输出及副作用：kind（输入）、next_serial（输入）；force_next_object_serial 读取 kind、next_serial 并使用输入参数和固定枚举/常量；函数返回 void，不取得调用方资源所有权。
+  // 失败/边界：force_next_object_serial 无返回值，仅执行 函数体中的顺序操作；调用方须保证前置依赖已经绑定，函数不自动重试或接管外部资源。
   function void force_next_object_serial(
     rdma_resource_kind_e kind,
     int unsigned next_serial
@@ -14,18 +25,27 @@ class rdma_resource_manager_probe extends rdma_resource_manager;
     next_object_serial[kind] = next_serial;
   endfunction
 
+  // 功能：在 rdma_resource_manager_probe 中，observed_next_local_id 只读查询当前运行时/测试账本，返回槽位、对象或恢复记录的快照而不推进事务。
+  // 输入/输出及副作用：kind（输入）；observed_next_local_id 读取 kind 并使用字段 next_local_id；函数返回 int unsigned，不取得调用方资源所有权。
+  // 失败/边界：observed_next_local_id 的结果直接由 return next_local_id[kind] 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function int unsigned observed_next_local_id(
     rdma_resource_kind_e kind
   );
     return next_local_id[kind];
   endfunction
 
+  // 功能：在 rdma_resource_manager_probe 中，observed_next_object_serial 只读查询当前运行时/测试账本，返回槽位、对象或恢复记录的快照而不推进事务。
+  // 输入/输出及副作用：kind（输入）；observed_next_object_serial 读取 kind 并使用字段 next_object_serial；函数返回 int unsigned，不取得调用方资源所有权。
+  // 失败/边界：observed_next_object_serial 的结果直接由 return next_object_serial[kind] 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function int unsigned observed_next_object_serial(
     rdma_resource_kind_e kind
   );
     return next_object_serial[kind];
   endfunction
 
+  // 功能：在 rdma_resource_manager_probe 中，observed_recovery_count 只读查询当前运行时/测试账本，返回槽位、对象或恢复记录的快照而不推进事务。
+  // 输入/输出及副作用：无显式参数；observed_recovery_count 读取固定返回值或局部计算结果，不使用对象成员字段；函数返回 int unsigned，不取得调用方资源所有权。
+  // 失败/边界：observed_recovery_count 的结果直接由 return recovery_records.num() 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function int unsigned observed_recovery_count();
     return recovery_records.num();
   endfunction
@@ -35,10 +55,16 @@ endclass
 // preconditions without relying on another public transition under test.
 class rdma_qp_generic_bypass_probe_manager extends rdma_resource_manager;
 
+  // 功能：构造 rdma_qp_generic_bypass_probe_manager，调用 super.new 建立 UVM 层级对象；外部依赖字段保持未绑定，后续由 configure/build/activate 明确注入。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_qp_generic_bypass_probe_manager 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_qp_generic_bypass_probe_manager");
     super.new(name);
   endfunction
 
+  // 功能：在 rdma_qp_generic_bypass_probe_manager 中，force_qp_staged_precondition 配置测试 fixture 的定向故障或替代依赖，使下一次调用覆盖指定边界路径。
+  // 输入/输出及副作用：candidate（输入）；force_qp_staged_precondition 读取 candidate 并使用字段 status、key、replacement.state；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：force_qp_staged_precondition 返回 RDMA_SC_INVALID_ARGUMENT、RDMA_SC_INVALID_STATE；典型拒绝条件为“staged precondition is not a QP”“staged precondition QP is unknown”；失败路径不提交部分状态或转移未声明资源。
   function rdma_status force_qp_staged_precondition(rdma_qp candidate);
     rdma_resource projected;
     rdma_qp replacement;
@@ -68,6 +94,9 @@ class rdma_qp_generic_bypass_probe_manager extends rdma_resource_manager;
     return rdma_status::success();
   endfunction
 
+  // 功能：在 rdma_qp_generic_bypass_probe_manager 中，force_qp_active_precondition 配置测试 fixture 的定向故障或替代依赖，使下一次调用覆盖指定边界路径。
+  // 输入/输出及副作用：candidate（输入）；force_qp_active_precondition 读取 candidate 并使用字段 status、key、replacement.state；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：force_qp_active_precondition 返回 RDMA_SC_INVALID_ARGUMENT、RDMA_SC_INVALID_STATE；典型拒绝条件为“ACTIVE precondition is not a QP”“ACTIVE precondition QP is unknown”；失败路径不提交部分状态或转移未声明资源。
   function rdma_status force_qp_active_precondition(rdma_qp candidate);
     rdma_resource projected;
     rdma_qp replacement;
@@ -104,37 +133,58 @@ endclass
 // models corrupted allocator state without exposing registry mutation hooks.
 class rdma_width_probe_manager extends rdma_resource_manager;
 
+  // 功能：构造 rdma_width_probe_manager，调用 super.new 建立 UVM 层级对象；外部依赖字段保持未绑定，后续由 configure/build/activate 明确注入。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_width_probe_manager 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_width_probe_manager");
     super.new(name);
   endfunction
 
+  // 功能：执行 set_next_local_id 指定的测试或恢复状态变更，更新受控账本并保留可回滚的故障证据。
+  // 输入/输出及副作用：kind（输入）、value（输入）；调用方必须先完成输入对象的空值、authority 和 generation 校验；成功时更新本对象配置/状态并保存非拥有引用，返回 void。
+  // 失败/边界：set_next_local_id 仅允许测试/恢复范围内的状态变更；代际或资源不匹配时拒绝并保留原账本。
   function void set_next_local_id(rdma_resource_kind_e kind,
                                   int unsigned value);
     next_local_id[kind] = value;
   endfunction
 
+  // 功能：执行 seed_next_local_id 指定的测试或恢复状态变更，更新受控账本并保留可回滚的故障证据。
+  // 输入/输出及副作用：kind（输入）、value（输入）；seed_next_local_id 读取 kind、value 并使用输入参数和固定枚举/常量；函数返回 void，不取得调用方资源所有权。
+  // 失败/边界：seed_next_local_id 仅允许测试/恢复范围内的状态变更；代际或资源不匹配时拒绝并保留原账本。
   function void seed_next_local_id(rdma_resource_kind_e kind,
                                    int unsigned value);
     next_local_id[kind] = value;
   endfunction
 
+  // 功能：执行 inject_free_local_id 指定的测试或恢复状态变更，更新受控账本并保留可回滚的故障证据。
+  // 输入/输出及副作用：kind（输入）、value（输入）；inject_free_local_id 读取 kind、value 并使用输入参数和固定枚举/常量；函数返回 void，不取得调用方资源所有权。
+  // 失败/边界：inject_free_local_id 仅允许测试/恢复范围内的状态变更；代际或资源不匹配时拒绝并保留原账本。
   function void inject_free_local_id(rdma_resource_kind_e kind,
                                      int unsigned value);
     free_local_ids[kind].push_back(value);
   endfunction
 
+  // 功能：在 rdma_width_probe_manager 中，observed_next_object_serial 只读查询当前运行时/测试账本，返回槽位、对象或恢复记录的快照而不推进事务。
+  // 输入/输出及副作用：kind（输入）；observed_next_object_serial 读取 kind 并使用字段 next_object_serial；函数返回 int unsigned，不取得调用方资源所有权。
+  // 失败/边界：observed_next_object_serial 的结果直接由 return next_object_serial[kind] 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function int unsigned observed_next_object_serial(
     rdma_resource_kind_e kind
   );
     return next_object_serial[kind];
   endfunction
 
+  // 功能：在 rdma_width_probe_manager 中，observed_next_local_id 只读查询当前运行时/测试账本，返回槽位、对象或恢复记录的快照而不推进事务。
+  // 输入/输出及副作用：kind（输入）；observed_next_local_id 读取 kind 并使用字段 next_local_id；函数返回 int unsigned，不取得调用方资源所有权。
+  // 失败/边界：observed_next_local_id 的结果直接由 return next_local_id[kind] 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function int unsigned observed_next_local_id(
     rdma_resource_kind_e kind
   );
     return next_local_id[kind];
   endfunction
 
+  // 功能：在 rdma_width_probe_manager 中，observed_free_local_id_count 只读查询当前运行时/测试账本，返回槽位、对象或恢复记录的快照而不推进事务。
+  // 输入/输出及副作用：kind（输入）；observed_free_local_id_count 读取 kind 并使用字段 free_local_ids；函数返回 int unsigned，不取得调用方资源所有权。
+  // 失败/边界：observed_free_local_id_count 比较或前置条件不满足时返回 0/false；该路径不隐式重试，也不转移未声明资源。
   function int unsigned observed_free_local_id_count(
     rdma_resource_kind_e kind
   );
@@ -143,6 +193,9 @@ class rdma_width_probe_manager extends rdma_resource_manager;
     return free_local_ids[kind].size();
   endfunction
 
+  // 功能：在 rdma_width_probe_manager 中，observed_registry_count 只读查询当前运行时/测试账本，返回槽位、对象或恢复记录的快照而不推进事务。
+  // 输入/输出及副作用：无显式参数；observed_registry_count 读取固定返回值或局部计算结果，不使用对象成员字段；函数返回 int unsigned，不取得调用方资源所有权。
+  // 失败/边界：observed_registry_count 的结果直接由 return registry.num() 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function int unsigned observed_registry_count();
     return registry.num();
   endfunction
@@ -160,6 +213,9 @@ class rdma_rm_independent_release_mapping extends rdma_dma_mapping;
   local bit release_complete;
   local static longint unsigned next_allocation_token = 1;
 
+  // 功能：构造 rdma_rm_independent_release_mapping，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：allocation_token=0；allocation_token_initialized=1'b0；release_complete=1'b0。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_rm_independent_release_mapping 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_rm_independent_release_mapping");
     super.new(name);
     allocation_token = 0;
@@ -167,16 +223,25 @@ class rdma_rm_independent_release_mapping extends rdma_dma_mapping;
     release_complete = 1'b0;
   endfunction
 
+  // 功能：initialize_release_authority 使用 当前对象字段 执行函数体规定的状态更新；不修改未列出的对象字段或外部资源。
+  // 输入/输出及副作用：无显式参数；initialize_release_authority 先依据 依赖存在性、authority 和 generation 条件 校验 函数体读取的依赖；成功时更新本对象配置/状态并保存非拥有引用，返回 void。
+  // 失败/边界：实现中的空依赖、重复登记、状态或 generation/authority 校验失败时返回错误；失败时保留旧配置。
   function void initialize_release_authority();
     allocation_token = next_allocation_token;
     allocation_token_initialized = 1'b1;
     next_allocation_token++;
   endfunction
 
+  // 功能：执行 set_release_complete 指定的测试或恢复状态变更，更新受控账本并保留可回滚的故障证据。
+  // 输入/输出及副作用：value（输入）；调用方必须先完成输入对象的空值、authority 和 generation 校验；成功时更新本对象配置/状态并保存非拥有引用，返回 void。
+  // 失败/边界：set_release_complete 仅允许测试/恢复范围内的状态变更；代际或资源不匹配时拒绝并保留原账本。
   function void set_release_complete(bit value);
     release_complete = value;
   endfunction
 
+  // 功能：在 rdma_rm_independent_release_mapping 中，snapshot_release_authority 按完整 key/handle 查找唯一权威记录并返回 detached 快照，避免把内部可变引用泄露给调用方。
+  // 输入/输出及副作用：snapshot（输出）；snapshot_release_authority 读取 snapshot 并使用字段 snapshot、candidate、candidate.allocation_token、candidate.allocation_token_initialized，并写入 snapshot；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：snapshot_release_authority 在 key/handle 缺失、记录不唯一或 generation/reset epoch 过期时返回明确错误，不回退到默认 authority。
   virtual function rdma_status snapshot_release_authority(
     output rdma_dma_mapping snapshot
   );
@@ -196,6 +261,9 @@ class rdma_rm_independent_release_mapping extends rdma_dma_mapping;
     return rdma_status::success();
   endfunction
 
+  // 功能：在 rdma_rm_independent_release_mapping 中，release_authority_status 按 owner、generation 和幂等规则释放/隔离记录，并同步删除其账本引用。
+  // 输入/输出及副作用：snapshot（输入）；release_authority_status 可能更新本对象明确拥有的状态；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：release_authority_status 发现 owner/generation 不匹配、记录未知或重复释放时返回错误或幂等结果，不重新激活旧句柄。
   virtual function rdma_status release_authority_status(
     rdma_dma_mapping snapshot
   );
@@ -211,6 +279,9 @@ class rdma_rm_independent_release_mapping extends rdma_dma_mapping;
     return rdma_status::success();
   endfunction
 
+  // 功能：在 rdma_rm_independent_release_mapping 中，release_completion_status 按 owner、generation 和幂等规则释放/隔离记录，并同步删除其账本引用。
+  // 输入/输出及副作用：release_complete（输出）；release_completion_status 可能更新本对象明确拥有的状态，并写入 release_complete；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：release_completion_status 发现 owner/generation 不匹配、记录未知或重复释放时返回错误或幂等结果，不重新激活旧句柄。
   virtual function rdma_status release_completion_status(
     output bit release_complete
   );
@@ -218,6 +289,9 @@ class rdma_rm_independent_release_mapping extends rdma_dma_mapping;
     return rdma_status::success();
   endfunction
 
+  // 功能：将 rhs 中 rdma_rm_independent_release_mapping 的值字段复制到当前对象，建立与源对象隔离的快照。
+  // 输入/输出及副作用：rhs（输入）；rhs 是源对象；当前对象字段会被覆盖，嵌套句柄按实现执行 clone 或保持非拥有引用，源对象不被修改。
+  // 失败/边界：do_copy 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（mapping copy cast failed），不保留部分有效快照。
   virtual function void do_copy(uvm_object rhs);
     rdma_rm_independent_release_mapping rhs_mapping;
 
@@ -233,10 +307,16 @@ endclass
 class rdma_qp_lifecycle_probe_manager
   extends rdma_qp_generic_bypass_probe_manager;
 
+  // 功能：构造 rdma_qp_lifecycle_probe_manager，调用 super.new 建立 UVM 层级对象；外部依赖字段保持未绑定，后续由 configure/build/activate 明确注入。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_qp_lifecycle_probe_manager 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_qp_lifecycle_probe_manager");
     super.new(name);
   endfunction
 
+  // 功能：在 rdma_qp_lifecycle_probe_manager 中，complete_qp_mapping_release 按 owner、generation 和幂等规则释放或清理资源，同时删除相关账本记录。
+  // 输入/输出及副作用：qp_h（输入）、role（输入）；complete_qp_mapping_release 读取 qp_h、role 并使用字段 key、resource_ref、recovery_ref；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：complete_qp_mapping_release 返回 RDMA_SC_INVALID_ARGUMENT；典型拒绝条件为“QP mapping completion target is unknown”“QP mapping completion role is unsupported”；失败路径不提交部分状态或转移未声明资源。
   function rdma_status complete_qp_mapping_release(
     rdma_handle qp_h,
     rdma_queue_backing_role_e role
@@ -275,6 +355,9 @@ class rdma_qp_lifecycle_probe_manager
     return rdma_status::success();
   endfunction
 
+  // 功能：执行 set_qp_recovery_hardware_presence 指定的测试或恢复状态变更，更新受控账本并保留可回滚的故障证据。
+  // 输入/输出及副作用：qp_h（输入）、hardware_presence（输入）；调用方必须先完成输入对象的空值、authority 和 generation 校验；成功时更新本对象配置/状态并保存非拥有引用，返回 rdma_status。
+  // 失败/边界：set_qp_recovery_hardware_presence 仅允许测试/恢复范围内的状态变更；代际或资源不匹配时拒绝并保留原账本。
   function rdma_status set_qp_recovery_hardware_presence(
     rdma_handle qp_h,
     rdma_hw_presence_e hardware_presence
@@ -291,6 +374,9 @@ class rdma_qp_lifecycle_probe_manager
     return rdma_status::success();
   endfunction
 
+  // 功能：在 rdma_qp_lifecycle_probe_manager 中，complete_qp_context_release 按 owner、generation 和幂等规则释放或清理资源，同时删除相关账本记录。
+  // 输入/输出及副作用：qp_h（输入）；complete_qp_context_release 读取 qp_h 并使用字段 key、completion_authority.complete；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：complete_qp_context_release 返回 RDMA_SC_INVALID_ARGUMENT；典型拒绝条件为“QP context completion target is invalid”；失败路径不提交部分状态或转移未声明资源。
   function rdma_status complete_qp_context_release(rdma_handle qp_h);
     rdma_qp resource_qp;
     rdma_queue_slot_token_contract token;
@@ -309,6 +395,9 @@ class rdma_qp_lifecycle_probe_manager
     return rdma_status::success();
   endfunction
 
+  // 功能：在 rdma_qp_lifecycle_probe_manager 中，complete_qp_temporary_mapping_release 按 owner、generation 和幂等规则释放或清理资源，同时删除相关账本记录。
+  // 输入/输出及副作用：qp_h（输入）、staging_mapping（输入）；complete_qp_temporary_mapping_release 读取 qp_h、staging_mapping 并使用字段 key、temporary_mapping；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：complete_qp_temporary_mapping_release 返回 RDMA_SC_INVALID_ARGUMENT；具体拒绝条件包括 “QP temporary mapping completion target is invalid”；“QP temporary mapping completion authority is unsupported”；失败路径不提交部分状态、不隐式重试，也不转移未声明资源。
   function rdma_status complete_qp_temporary_mapping_release(
     rdma_handle qp_h,
     bit staging_mapping
@@ -338,6 +427,9 @@ class rdma_qp_lifecycle_probe_manager
     return rdma_status::success();
   endfunction
 
+  // 功能：replace_qp_recovery_context_authority 根据 qp_h 执行 rdma_status 结果转换，具体更新字段 key、replacement_authority、replacement_authority.complete、context_token.completion_authority、plan_token.completion_authority；失败时返回 RDMA_SC_INVALID_ARGUMENT，保持已登记资源和输出不变。
+  // 输入/输出及副作用：qp_h（输入）；replace_qp_recovery_context_authority 读取 qp_h 并使用字段 key、replacement_authority、replacement_authority.complete、context_token.completion_authority、plan_token.completion_authority；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：replace_qp_recovery_context_authority 返回 RDMA_SC_INVALID_ARGUMENT；具体拒绝条件包括 “QP recovery context authority replacement target is invalid”；失败路径不提交部分状态、不隐式重试，也不转移未声明资源。
   function rdma_status replace_qp_recovery_context_authority(
     rdma_handle qp_h
   );
@@ -371,6 +463,9 @@ class rdma_qp_lifecycle_probe_manager
     return rdma_status::success();
   endfunction
 
+  // 功能：执行 restore_qp_recovery_context_authority 指定的测试或恢复状态变更，更新受控账本并保留可回滚的故障证据。
+  // 输入/输出及副作用：qp_h（输入）；输入 action/epoch/handle 决定迁移目标；成功时更新状态或恢复证据，外部资源仍由其拥有者管理。
+  // 失败/边界：restore_qp_recovery_context_authority 仅允许测试/恢复范围内的状态变更；代际或资源不匹配时拒绝并保留原账本。
   function rdma_status restore_qp_recovery_context_authority(
     rdma_handle qp_h
   );
@@ -413,12 +508,18 @@ class rdma_queue_recovery_probe_manager extends rdma_resource_manager;
   rdma_recovery_record observed_pre_retire_recovery;
   bit force_queue_restore_late_failure;
 
+  // 功能：构造 rdma_queue_recovery_probe_manager，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：observed_pre_retire_recovery=null；force_queue_restore_late_failure=1'b0。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_queue_recovery_probe_manager 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_queue_recovery_probe_manager");
     super.new(name);
     observed_pre_retire_recovery = null;
     force_queue_restore_late_failure = 1'b0;
   endfunction
 
+  // 功能：执行 swap_recovery_refs 指定的测试或恢复状态变更，更新受控账本并保留可回滚的故障证据。
+  // 输入/输出及副作用：handle（输入）、lhs（输入）、rhs（输入）；swap_recovery_refs 读取 handle、lhs、rhs 并使用字段 key、saved；函数返回 void，不取得调用方资源所有权。
+  // 失败/边界：swap_recovery_refs 仅允许测试/恢复范围内的状态变更；代际或资源不匹配时拒绝并保留原账本。
   function void swap_recovery_refs(rdma_handle handle, int unsigned lhs,
                                    int unsigned rhs);
     rdma_queue_backing_ref saved;
@@ -430,6 +531,9 @@ class rdma_queue_recovery_probe_manager extends rdma_resource_manager;
     recovery_records[key].queue_plan.refs[rhs] = saved;
   endfunction
 
+  // 功能：执行 set_queue_cleanup 指定的测试或恢复状态变更，更新受控账本并保留可回滚的故障证据。
+  // 输入/输出及副作用：handle（输入）、recovery_side（输入）、role（输入）、value（输入）；调用方必须先完成输入对象的空值、authority 和 generation 校验；成功时更新本对象配置/状态并保存非拥有引用，返回 void。
+  // 失败/边界：set_queue_cleanup 仅允许测试/恢复范围内的状态变更；代际或资源不匹配时拒绝并保留原账本。
   function void set_queue_cleanup(rdma_handle handle, bit recovery_side,
                                   rdma_queue_backing_role_e role, bit value);
     string key;
@@ -453,6 +557,9 @@ class rdma_queue_recovery_probe_manager extends rdma_resource_manager;
     end
   endfunction
 
+  // 功能：在 rdma_queue_recovery_probe_manager 中，clear_queue_ambiguity 按 owner、generation 和幂等规则释放/隔离记录，并同步删除其账本引用。
+  // 输入/输出及副作用：handle（输入）；输入 action/epoch/handle 决定迁移目标；成功时更新状态或恢复证据，外部资源仍由其拥有者管理。
+  // 失败/边界：clear_queue_ambiguity 发现 owner/generation 不匹配、记录未知或重复释放时返回错误或幂等结果，不重新激活旧句柄。
   function void clear_queue_ambiguity(rdma_handle handle);
     string key;
     key = resource_key(handle);
@@ -461,6 +568,9 @@ class rdma_queue_recovery_probe_manager extends rdma_resource_manager;
     recovery_records[key].ambiguous_ticket = null;
   endfunction
 
+  // 功能：执行 set_queue_ambiguity 指定的测试或恢复状态变更，更新受控账本并保留可回滚的故障证据。
+  // 输入/输出及副作用：handle（输入）、operation（输入）、role（输入）；调用方必须先完成输入对象的空值、authority 和 generation 校验；成功时更新本对象配置/状态并保存非拥有引用，返回 void。
+  // 失败/边界：set_queue_ambiguity 仅允许测试/恢复范围内的状态变更；代际或资源不匹配时拒绝并保留原账本。
   function void set_queue_ambiguity(
     rdma_handle handle,
     rdma_queue_ambiguous_operation_e operation,
@@ -474,6 +584,9 @@ class rdma_queue_recovery_probe_manager extends rdma_resource_manager;
     recovery_records[key].ambiguous_ticket = null;
   endfunction
 
+  // 功能：执行 set_queue_flush_complete 指定的测试或恢复状态变更，更新受控账本并保留可回滚的故障证据。
+  // 输入/输出及副作用：handle（输入）、recovery_side（输入）、role（输入）、value（输入）；调用方必须先完成输入对象的空值、authority 和 generation 校验；成功时更新本对象配置/状态并保存非拥有引用，返回 void。
+  // 失败/边界：set_queue_flush_complete 仅允许测试/恢复范围内的状态变更；代际或资源不匹配时拒绝并保留原账本。
   function void set_queue_flush_complete(
     rdma_handle handle,
     bit recovery_side,
@@ -501,6 +614,9 @@ class rdma_queue_recovery_probe_manager extends rdma_resource_manager;
     `uvm_fatal("QUEUE_FLUSH_PROGRESS", "queue flush role is unavailable")
   endfunction
 
+  // 功能：在 rdma_queue_recovery_probe_manager 中，observed_queue_flush_complete 只读查询当前运行时/测试账本，返回槽位、对象或恢复记录的快照而不推进事务。
+  // 输入/输出及副作用：handle（输入）、recovery_side（输入）、role（输入）；observed_queue_flush_complete 读取 handle、recovery_side、role 并使用字段 key、plan；函数返回 bit，不取得调用方资源所有权。
+  // 失败/边界：observed_queue_flush_complete 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（queue plan is unavailable），不保留部分有效快照。
   function bit observed_queue_flush_complete(
     rdma_handle handle,
     bit recovery_side,
@@ -526,6 +642,9 @@ class rdma_queue_recovery_probe_manager extends rdma_resource_manager;
     return 1'b0;
   endfunction
 
+  // 功能：执行 set_queue_release_evidence 指定的测试或恢复状态变更，更新受控账本并保留可回滚的故障证据。
+  // 输入/输出及副作用：handle（输入）、recovery_side（输入）、role（输入）、value（输入）；调用方必须先完成输入对象的空值、authority 和 generation 校验；成功时更新本对象配置/状态并保存非拥有引用，返回 void。
+  // 失败/边界：set_queue_release_evidence 仅允许测试/恢复范围内的状态变更；代际或资源不匹配时拒绝并保留原账本。
   function void set_queue_release_evidence(
     rdma_handle handle,
     bit recovery_side,
@@ -556,6 +675,10 @@ class rdma_queue_recovery_probe_manager extends rdma_resource_manager;
     `uvm_fatal("QUEUE_RELEASE_EVIDENCE", "queue role is unavailable")
   endfunction
 
+  // 功能：执行 set_queue_segment_iova 指定的测试或恢复状态变更，更新受控账本并保留可回滚的故障证据。
+  // 输入/输出及副作用：handle（输入）、recovery_side（输入）、role（输入）、segment_index（输入）、iova_value（输入）；调用方必须先完成输入对象的空值、authority 和 generation 校验；成功时更新本对象配置/状态并保存非拥有引用，返回
+  //   void。
+  // 失败/边界：set_queue_segment_iova 仅允许测试/恢复范围内的状态变更；代际或资源不匹配时拒绝并保留原账本。
   function void set_queue_segment_iova(
     rdma_handle handle,
     bit recovery_side,
@@ -590,6 +713,10 @@ class rdma_queue_recovery_probe_manager extends rdma_resource_manager;
     `uvm_fatal("QUEUE_SEGMENT_IOVA", "queue role is unavailable")
   endfunction
 
+  // 功能：执行 set_queue_segment_release_evidence 指定的测试或恢复状态变更，更新受控账本并保留可回滚的故障证据。
+  // 输入/输出及副作用：handle（输入）、recovery_side（输入）、role（输入）、segment_index（输入）、value（输入）；调用方必须先完成输入对象的空值、authority 和 generation 校验；成功时更新本对象配置/状态并保存非拥有引用，返回
+  //   void。
+  // 失败/边界：set_queue_segment_release_evidence 仅允许测试/恢复范围内的状态变更；代际或资源不匹配时拒绝并保留原账本。
   function void set_queue_segment_release_evidence(
     rdma_handle handle,
     bit recovery_side,
@@ -626,6 +753,9 @@ class rdma_queue_recovery_probe_manager extends rdma_resource_manager;
     `uvm_fatal("QUEUE_SEGMENT_RELEASE", "queue role is unavailable")
   endfunction
 
+  // 功能：在 rdma_queue_recovery_probe_manager 中，queue_restore_pre_publish_observer 读取或发布队列/QP 恢复进度快照，使恢复步骤可重复执行且不会重复释放资源。
+  // 输入/输出及副作用：prepared_recovery（输入）；queue_restore_pre_publish_observer 读取 prepared_recovery 并使用字段 observed_pre_retire_recovery、cloned_object；函数返回 void，不取得调用方资源所有权。
+  // 失败/边界：queue_restore_pre_publish_observer 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（recovery snapshot clone failed），不保留部分有效快照。
   virtual function void queue_restore_pre_publish_observer(
     rdma_recovery_record prepared_recovery
   );
@@ -640,6 +770,9 @@ class rdma_queue_recovery_probe_manager extends rdma_resource_manager;
       `uvm_fatal("QUEUE_RESTORE_OBSERVER", "recovery snapshot clone failed")
   endfunction
 
+  // 功能：queue_restore_pre_validate_observer 校验 prepared_resource 与当前对象状态的一致性，返回 void 供上层决定是否提交。
+  // 输入/输出及副作用：prepared_resource（输入）；queue_restore_pre_validate_observer 读取 prepared_resource 并使用字段 pd_ref；函数返回 void，不取得调用方资源所有权。
+  // 失败/边界：queue_restore_pre_validate_observer 无返回值，仅执行 pd_ref=null；调用方须保证前置依赖已经绑定，函数不自动重试或接管外部资源。
   virtual function void queue_restore_pre_validate_observer(
     rdma_resource prepared_resource
   );
@@ -714,11 +847,17 @@ class rdma_rm_fault_mr extends rdma_mr;
 
   rdma_rm_clone_fault_e clone_fault;
 
+  // 功能：构造 rdma_rm_fault_mr，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：clone_fault=RDMA_RM_CLONE_GOOD。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_rm_fault_mr 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_rm_fault_mr");
     super.new(name);
     clone_fault = RDMA_RM_CLONE_GOOD;
   endfunction
 
+  // 功能：将 rhs 中 rdma_rm_fault_mr 的值字段复制到当前对象，建立与源对象隔离的快照。
+  // 输入/输出及副作用：无显式参数；clone 读取 对象字段：pd_h 并使用字段 wrong_pd、wrong_pd.handle、wrong_pd.owner、wrong_pd.state、cloned_object、cloned_mr.rkey、access.local_write、cloned_mr.handle；函数返回 uvm_object，不取得调用方资源所有权。
+  // 失败/边界：clone 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（fault MR clone cast failed），不保留部分有效快照。
   virtual function uvm_object clone();
     uvm_object cloned_object;
     rdma_rm_fault_mr cloned_mr;
@@ -896,11 +1035,17 @@ class rdma_rm_fault_function extends rdma_function;
 
   rdma_rm_function_clone_fault_e clone_fault;
 
+  // 功能：构造 rdma_rm_fault_function，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：clone_fault=RDMA_RM_FUNCTION_CLONE_GOOD。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_rm_fault_function 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_rm_fault_function");
     super.new(name);
     clone_fault = RDMA_RM_FUNCTION_CLONE_GOOD;
   endfunction
 
+  // 功能：将 rhs 中 rdma_rm_fault_function 的值字段复制到当前对象，建立与源对象隔离的快照。
+  // 输入/输出及副作用：无显式参数；clone 读取局部计算结果，并使用字段 cloned_object、cloned_function.binding、binding.pcie；函数返回 uvm_object，不取得调用方资源所有权。
+  // 失败/边界：clone 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（fault Function clone cast failed），不保留部分有效快照。
   virtual function uvm_object clone();
     uvm_object cloned_object;
     rdma_rm_fault_function cloned_function;
@@ -924,11 +1069,17 @@ class rdma_rm_fault_pd extends rdma_pd;
   `uvm_object_utils(rdma_rm_fault_pd)
   rdma_rm_kind_clone_fault_e clone_fault;
 
+  // 功能：构造 rdma_rm_fault_pd，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：clone_fault=RDMA_RM_KIND_CLONE_GOOD。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_rm_fault_pd 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_rm_fault_pd");
     super.new(name);
     clone_fault = RDMA_RM_KIND_CLONE_GOOD;
   endfunction
 
+  // 功能：将 rhs 中 rdma_rm_fault_pd 的值字段复制到当前对象，建立与源对象隔离的快照。
+  // 输入/输出及副作用：无显式参数；clone 读取 对象字段：clone_fault 并使用字段 cloned_object；函数返回 uvm_object，不取得调用方资源所有权。
+  // 失败/边界：clone 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（fault PD clone cast failed），不保留部分有效快照。
   virtual function uvm_object clone();
     uvm_object cloned_object;
     rdma_rm_fault_pd cloned_pd;
@@ -945,11 +1096,17 @@ class rdma_rm_fault_cq extends rdma_cq;
   `uvm_object_utils(rdma_rm_fault_cq)
   rdma_rm_kind_clone_fault_e clone_fault;
 
+  // 功能：构造 rdma_rm_fault_cq，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：clone_fault=RDMA_RM_KIND_CLONE_GOOD。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_rm_fault_cq 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_rm_fault_cq");
     super.new(name);
     clone_fault = RDMA_RM_KIND_CLONE_GOOD;
   endfunction
 
+  // 功能：将 rhs 中 rdma_rm_fault_cq 的值字段复制到当前对象，建立与源对象隔离的快照。
+  // 输入/输出及副作用：无显式参数；clone 读取局部计算结果，并使用字段 cloned_object、cloned_cq.ceq_h；函数返回 uvm_object，不取得调用方资源所有权。
+  // 失败/边界：clone 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（fault CQ clone cast failed），不保留部分有效快照。
   virtual function uvm_object clone();
     uvm_object cloned_object;
     rdma_rm_fault_cq cloned_cq;
@@ -970,11 +1127,17 @@ class rdma_rm_fault_qp extends rdma_qp;
   `uvm_object_utils(rdma_rm_fault_qp)
   rdma_rm_kind_clone_fault_e clone_fault;
 
+  // 功能：构造 rdma_rm_fault_qp，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：clone_fault=RDMA_RM_KIND_CLONE_GOOD。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_rm_fault_qp 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_rm_fault_qp");
     super.new(name);
     clone_fault = RDMA_RM_KIND_CLONE_GOOD;
   endfunction
 
+  // 功能：将 rhs 中 rdma_rm_fault_qp 的值字段复制到当前对象，建立与源对象隔离的快照。
+  // 输入/输出及副作用：无显式参数；clone 读取局部计算结果，并使用字段 cloned_object、cloned_qp.pd_h、cloned_qp.send_cq_h、cloned_qp.recv_cq_h、cloned_qp.srq_h；函数返回 uvm_object，不取得调用方资源所有权。
+  // 失败/边界：clone 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（fault QP clone cast failed），不保留部分有效快照。
   virtual function uvm_object clone();
     uvm_object cloned_object;
     rdma_rm_fault_qp cloned_qp;
@@ -1000,11 +1163,17 @@ class rdma_rm_fault_srq extends rdma_srq;
   `uvm_object_utils(rdma_rm_fault_srq)
   rdma_rm_kind_clone_fault_e clone_fault;
 
+  // 功能：构造 rdma_rm_fault_srq，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：clone_fault=RDMA_RM_KIND_CLONE_GOOD。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_rm_fault_srq 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_rm_fault_srq");
     super.new(name);
     clone_fault = RDMA_RM_KIND_CLONE_GOOD;
   endfunction
 
+  // 功能：将 rhs 中 rdma_rm_fault_srq 的值字段复制到当前对象，建立与源对象隔离的快照。
+  // 输入/输出及副作用：无显式参数；clone 读取局部计算结果，并使用字段 cloned_object、cloned_srq.pd_h；函数返回 uvm_object，不取得调用方资源所有权。
+  // 失败/边界：clone 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（fault SRQ clone cast failed），不保留部分有效快照。
   virtual function uvm_object clone();
     uvm_object cloned_object;
     rdma_rm_fault_srq cloned_srq;
@@ -1025,11 +1194,17 @@ class rdma_rm_fault_cmq extends rdma_cmq;
   `uvm_object_utils(rdma_rm_fault_cmq)
   rdma_rm_kind_clone_fault_e clone_fault;
 
+  // 功能：构造 rdma_rm_fault_cmq，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：clone_fault=RDMA_RM_KIND_CLONE_GOOD。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_rm_fault_cmq 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_rm_fault_cmq");
     super.new(name);
     clone_fault = RDMA_RM_KIND_CLONE_GOOD;
   endfunction
 
+  // 功能：将 rhs 中 rdma_rm_fault_cmq 的值字段复制到当前对象，建立与源对象隔离的快照。
+  // 输入/输出及副作用：无显式参数；clone 读取 对象字段：clone_fault 并使用字段 cloned_object；函数返回 uvm_object，不取得调用方资源所有权。
+  // 失败/边界：clone 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（fault CMQ clone cast failed），不保留部分有效快照。
   virtual function uvm_object clone();
     uvm_object cloned_object;
     rdma_rm_fault_cmq cloned_cmq;
@@ -1047,11 +1222,17 @@ class rdma_rm_fault_ceq extends rdma_ceq;
   `uvm_object_utils(rdma_rm_fault_ceq)
   rdma_rm_kind_clone_fault_e clone_fault;
 
+  // 功能：构造 rdma_rm_fault_ceq，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：clone_fault=RDMA_RM_KIND_CLONE_GOOD。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_rm_fault_ceq 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_rm_fault_ceq");
     super.new(name);
     clone_fault = RDMA_RM_KIND_CLONE_GOOD;
   endfunction
 
+  // 功能：将 rhs 中 rdma_rm_fault_ceq 的值字段复制到当前对象，建立与源对象隔离的快照。
+  // 输入/输出及副作用：无显式参数；clone 读取 对象字段：clone_fault 并使用字段 cloned_object；函数返回 uvm_object，不取得调用方资源所有权。
+  // 失败/边界：clone 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（fault CEQ clone cast failed），不保留部分有效快照。
   virtual function uvm_object clone();
     uvm_object cloned_object;
     rdma_rm_fault_ceq cloned_ceq;
@@ -1069,11 +1250,17 @@ class rdma_rm_fault_aeq extends rdma_aeq;
   `uvm_object_utils(rdma_rm_fault_aeq)
   rdma_rm_kind_clone_fault_e clone_fault;
 
+  // 功能：构造 rdma_rm_fault_aeq，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：clone_fault=RDMA_RM_KIND_CLONE_GOOD。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_rm_fault_aeq 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_rm_fault_aeq");
     super.new(name);
     clone_fault = RDMA_RM_KIND_CLONE_GOOD;
   endfunction
 
+  // 功能：将 rhs 中 rdma_rm_fault_aeq 的值字段复制到当前对象，建立与源对象隔离的快照。
+  // 输入/输出及副作用：无显式参数；clone 读取 对象字段：clone_fault 并使用字段 cloned_object；函数返回 uvm_object，不取得调用方资源所有权。
+  // 失败/边界：clone 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（fault AEQ clone cast failed），不保留部分有效快照。
   virtual function uvm_object clone();
     uvm_object cloned_object;
     rdma_rm_fault_aeq cloned_aeq;
@@ -1092,11 +1279,17 @@ class rdma_rm_fault_recovery extends rdma_recovery_record;
 
   rdma_rm_clone_fault_e clone_fault;
 
+  // 功能：构造 rdma_rm_fault_recovery，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：clone_fault=RDMA_RM_CLONE_GOOD。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_rm_fault_recovery 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_rm_fault_recovery");
     super.new(name);
     clone_fault = RDMA_RM_CLONE_GOOD;
   endfunction
 
+  // 功能：将 rhs 中 rdma_rm_fault_recovery 的值字段复制到当前对象，建立与源对象隔离的快照。
+  // 输入/输出及副作用：无显式参数；clone 读取 对象字段：ambiguous_ticket、hardware_presence 并使用字段 cloned_object、cloned_recovery.resource_h、mapping、mapping.function_h、mapping.owner_h、owner、cloned_recovery.ambiguous_ticket、ambiguous_ticket.function_h；函数返回 uvm_object，不取得调用方资源所有权。
+  // 失败/边界：clone 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（fault recovery clone cast failed），不保留部分有效快照。
   virtual function uvm_object clone();
     uvm_object cloned_object;
     rdma_rm_fault_recovery cloned_recovery;
@@ -1315,6 +1508,9 @@ class rdma_rm_schema_mr extends rdma_mr;
   int unsigned extra_scalar;
   rdma_handle extra_child;
 
+  // 功能：构造 rdma_rm_schema_mr，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：clone_calls=0；extra_scalar=32'h51a7_e001；extra_child=null。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_rm_schema_mr 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_rm_schema_mr");
     super.new(name);
     clone_calls = 0;
@@ -1322,6 +1518,9 @@ class rdma_rm_schema_mr extends rdma_mr;
     extra_child = null;
   endfunction
 
+  // 功能：将 rhs 中 rdma_rm_schema_mr 的值字段复制到当前对象，建立与源对象隔离的快照。
+  // 输入/输出及副作用：无显式参数；clone 读取固定返回值或局部计算结果，不使用对象成员字段；函数返回 uvm_object，不取得调用方资源所有权。
+  // 失败/边界：clone 的结果直接由 return super.clone() 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   virtual function uvm_object clone();
     clone_calls++;
     return super.clone();
@@ -1335,6 +1534,9 @@ class rdma_rm_schema_recovery extends rdma_recovery_record;
   int unsigned extra_scalar;
   rdma_handle extra_child;
 
+  // 功能：构造 rdma_rm_schema_recovery，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：clone_calls=0；extra_scalar=32'h51a7_e002；extra_child=null。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_rm_schema_recovery 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_rm_schema_recovery");
     super.new(name);
     clone_calls = 0;
@@ -1342,6 +1544,9 @@ class rdma_rm_schema_recovery extends rdma_recovery_record;
     extra_child = null;
   endfunction
 
+  // 功能：将 rhs 中 rdma_rm_schema_recovery 的值字段复制到当前对象，建立与源对象隔离的快照。
+  // 输入/输出及副作用：无显式参数；clone 读取固定返回值或局部计算结果，不使用对象成员字段；函数返回 uvm_object，不取得调用方资源所有权。
+  // 失败/边界：clone 的结果直接由 return super.clone() 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   virtual function uvm_object clone();
     clone_calls++;
     return super.clone();
@@ -1353,11 +1558,17 @@ class rdma_rm_schema_handle extends rdma_handle;
 
   int unsigned clone_calls;
 
+  // 功能：构造 rdma_rm_schema_handle，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：clone_calls=0。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_rm_schema_handle 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_rm_schema_handle");
     super.new(name);
     clone_calls = 0;
   endfunction
 
+  // 功能：将 rhs 中 rdma_rm_schema_handle 的值字段复制到当前对象，建立与源对象隔离的快照。
+  // 输入/输出及副作用：无显式参数；clone 读取固定返回值或局部计算结果，不使用对象成员字段；函数返回 uvm_object，不取得调用方资源所有权。
+  // 失败/边界：clone 的结果直接由 return super.clone() 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   virtual function uvm_object clone();
     clone_calls++;
     return super.clone();
@@ -1369,11 +1580,17 @@ class rdma_rm_schema_function_handle extends rdma_function_handle;
 
   int unsigned clone_calls;
 
+  // 功能：构造 rdma_rm_schema_function_handle，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：clone_calls=0。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_rm_schema_function_handle 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_rm_schema_function_handle");
     super.new(name);
     clone_calls = 0;
   endfunction
 
+  // 功能：将 rhs 中 rdma_rm_schema_function_handle 的值字段复制到当前对象，建立与源对象隔离的快照。
+  // 输入/输出及副作用：无显式参数；clone 读取固定返回值或局部计算结果，不使用对象成员字段；函数返回 uvm_object，不取得调用方资源所有权。
+  // 失败/边界：clone 的结果直接由 return super.clone() 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   virtual function uvm_object clone();
     clone_calls++;
     return super.clone();
@@ -1385,11 +1602,17 @@ class rdma_rm_schema_backing_ref extends rdma_backing_ref;
 
   int unsigned clone_calls;
 
+  // 功能：构造 rdma_rm_schema_backing_ref，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：clone_calls=0。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_rm_schema_backing_ref 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_rm_schema_backing_ref");
     super.new(name);
     clone_calls = 0;
   endfunction
 
+  // 功能：将 rhs 中 rdma_rm_schema_backing_ref 的值字段复制到当前对象，建立与源对象隔离的快照。
+  // 输入/输出及副作用：无显式参数；clone 读取固定返回值或局部计算结果，不使用对象成员字段；函数返回 uvm_object，不取得调用方资源所有权。
+  // 失败/边界：clone 的结果直接由 return super.clone() 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   virtual function uvm_object clone();
     clone_calls++;
     return super.clone();
@@ -1401,11 +1624,17 @@ class rdma_rm_schema_mapping extends rdma_dma_mapping;
 
   int unsigned clone_calls;
 
+  // 功能：构造 rdma_rm_schema_mapping，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：clone_calls=0。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_rm_schema_mapping 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_rm_schema_mapping");
     super.new(name);
     clone_calls = 0;
   endfunction
 
+  // 功能：将 rhs 中 rdma_rm_schema_mapping 的值字段复制到当前对象，建立与源对象隔离的快照。
+  // 输入/输出及副作用：无显式参数；clone 读取固定返回值或局部计算结果，不使用对象成员字段；函数返回 uvm_object，不取得调用方资源所有权。
+  // 失败/边界：clone 的结果直接由 return super.clone() 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   virtual function uvm_object clone();
     clone_calls++;
     return super.clone();
@@ -1419,6 +1648,9 @@ class rdma_rm_owned_alias_mapping extends rdma_dma_mapping;
   local longint unsigned allocation_token;
   local static longint unsigned next_allocation_token = 1;
 
+  // 功能：构造 rdma_rm_owned_alias_mapping，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：clone_calls=0；allocation_token=next_allocation_token。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_rm_owned_alias_mapping 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_rm_owned_alias_mapping");
     super.new(name);
     clone_calls = 0;
@@ -1426,6 +1658,9 @@ class rdma_rm_owned_alias_mapping extends rdma_dma_mapping;
     next_allocation_token++;
   endfunction
 
+  // 功能：在 rdma_rm_owned_alias_mapping 中，snapshot_release_authority 按完整 key/handle 查找唯一权威记录并返回 detached 快照，避免把内部可变引用泄露给调用方。
+  // 输入/输出及副作用：snapshot（输出）；snapshot_release_authority 读取 snapshot 并使用字段 candidate、candidate.allocation_token、snapshot，并写入 snapshot；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：snapshot_release_authority 在 key/handle 缺失、记录不唯一或 generation/reset epoch 过期时返回明确错误，不回退到默认 authority。
   virtual function rdma_status snapshot_release_authority(
     output rdma_dma_mapping snapshot
   );
@@ -1439,6 +1674,9 @@ class rdma_rm_owned_alias_mapping extends rdma_dma_mapping;
     return rdma_status::success();
   endfunction
 
+  // 功能：在 rdma_rm_owned_alias_mapping 中，release_authority_status 按 owner、generation 和幂等规则释放/隔离记录，并同步删除其账本引用。
+  // 输入/输出及副作用：snapshot（输入）；release_authority_status 可能更新本对象明确拥有的状态；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：release_authority_status 发现 owner/generation 不匹配、记录未知或重复释放时返回错误或幂等结果，不重新激活旧句柄。
   virtual function rdma_status release_authority_status(
     rdma_dma_mapping snapshot
   );
@@ -1452,6 +1690,9 @@ class rdma_rm_owned_alias_mapping extends rdma_dma_mapping;
     return rdma_status::success();
   endfunction
 
+  // 功能：将 rhs 中 rdma_rm_owned_alias_mapping 的值字段复制到当前对象，建立与源对象隔离的快照。
+  // 输入/输出及副作用：无显式参数；clone 读取固定返回值或局部计算结果，不使用对象成员字段；函数返回 uvm_object，不取得调用方资源所有权。
+  // 失败/边界：clone 的结果直接由 return this 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   virtual function uvm_object clone();
     clone_calls++;
     return this;
@@ -1465,6 +1706,9 @@ class rdma_rm_owned_drift_mapping extends rdma_dma_mapping;
   local longint unsigned allocation_token;
   local static longint unsigned next_allocation_token = 1;
 
+  // 功能：构造 rdma_rm_owned_drift_mapping，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：clone_calls=0；allocation_token=next_allocation_token。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_rm_owned_drift_mapping 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_rm_owned_drift_mapping");
     super.new(name);
     clone_calls = 0;
@@ -1472,6 +1716,9 @@ class rdma_rm_owned_drift_mapping extends rdma_dma_mapping;
     next_allocation_token++;
   endfunction
 
+  // 功能：在 rdma_rm_owned_drift_mapping 中，snapshot_release_authority 按完整 key/handle 查找唯一权威记录并返回 detached 快照，避免把内部可变引用泄露给调用方。
+  // 输入/输出及副作用：snapshot（输出）；snapshot_release_authority 读取 snapshot 并使用字段 candidate、candidate.allocation_token、snapshot，并写入 snapshot；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：snapshot_release_authority 在 key/handle 缺失、记录不唯一或 generation/reset epoch 过期时返回明确错误，不回退到默认 authority。
   virtual function rdma_status snapshot_release_authority(
     output rdma_dma_mapping snapshot
   );
@@ -1485,6 +1732,9 @@ class rdma_rm_owned_drift_mapping extends rdma_dma_mapping;
     return rdma_status::success();
   endfunction
 
+  // 功能：在 rdma_rm_owned_drift_mapping 中，release_authority_status 按 owner、generation 和幂等规则释放/隔离记录，并同步删除其账本引用。
+  // 输入/输出及副作用：snapshot（输入）；release_authority_status 可能更新本对象明确拥有的状态；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：release_authority_status 发现 owner/generation 不匹配、记录未知或重复释放时返回错误或幂等结果，不重新激活旧句柄。
   virtual function rdma_status release_authority_status(
     rdma_dma_mapping snapshot
   );
@@ -1498,6 +1748,9 @@ class rdma_rm_owned_drift_mapping extends rdma_dma_mapping;
     return rdma_status::success();
   endfunction
 
+  // 功能：在 rdma_rm_owned_drift_mapping 中，do_copy 将 rhs 中 rdma_rm_owned_drift_mapping 的字段复制到当前对象，建立与源对象隔离的值快照。
+  // 输入/输出及副作用：rhs（输入）；rhs 是源对象；当前对象字段会被覆盖，嵌套句柄按实现执行 clone 或保持非拥有引用，源对象不被修改。
+  // 失败/边界：do_copy 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（drift mapping copy cast failed），不保留部分有效快照。
   virtual function void do_copy(uvm_object rhs);
     rdma_rm_owned_drift_mapping rhs_mapping;
 
@@ -1507,6 +1760,9 @@ class rdma_rm_owned_drift_mapping extends rdma_dma_mapping;
     allocation_token = rhs_mapping.allocation_token;
   endfunction
 
+  // 功能：在 rdma_rm_owned_drift_mapping 中，clone 将 rhs 中 rdma_rm_owned_drift_mapping 的值字段复制到当前对象，建立与源对象隔离的快照。
+  // 输入/输出及副作用：无显式参数；clone 读取局部计算结果，并使用字段 cloned_object；函数返回 uvm_object，不取得调用方资源所有权。
+  // 失败/边界：clone 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（drift mapping clone cast failed），不保留部分有效快照。
   virtual function uvm_object clone();
     uvm_object cloned_object;
     rdma_rm_owned_drift_mapping result;
@@ -1529,6 +1785,9 @@ class rdma_rm_owned_authority_loss_mapping extends rdma_dma_mapping;
   local bit allocation_token_initialized;
   local bit drop_allocation_token_on_copy;
 
+  // 功能：构造 rdma_rm_owned_authority_loss_mapping，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：allocation_token=0；allocation_token_initialized=1'b0；drop_allocation_token_on_copy=1'b1。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_rm_owned_authority_loss_mapping 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_rm_owned_authority_loss_mapping");
     super.new(name);
     allocation_token = 0;
@@ -1536,15 +1795,24 @@ class rdma_rm_owned_authority_loss_mapping extends rdma_dma_mapping;
     drop_allocation_token_on_copy = 1'b1;
   endfunction
 
+  // 功能：initialize_allocation_token 更新字段 allocation_token、allocation_token_initialized，并在提交前保持 Function authority、generation 和资源所有权约束。
+  // 输入/输出及副作用：token（输入）；initialize_allocation_token 先依据 依赖存在性、authority 和 generation 条件 校验 token；成功时更新本对象配置/状态并保存非拥有引用，返回 void。
+  // 失败/边界：initialize_allocation_token 无返回值，仅执行 allocation_token=token、allocation_token_initialized=1'b1；调用方须保证前置依赖已经绑定，函数不自动重试或接管外部资源。
   function void initialize_allocation_token(longint unsigned token);
     allocation_token = token;
     allocation_token_initialized = 1'b1;
   endfunction
 
+  // 功能：执行 set_drop_allocation_token_on_copy 指定的测试或恢复状态变更，更新受控账本并保留可回滚的故障证据。
+  // 输入/输出及副作用：drop_token（输入）；调用方必须先完成输入对象的空值、authority 和 generation 校验；成功时更新本对象配置/状态并保存非拥有引用，返回 void。
+  // 失败/边界：set_drop_allocation_token_on_copy 仅允许测试/恢复范围内的状态变更；代际或资源不匹配时拒绝并保留原账本。
   function void set_drop_allocation_token_on_copy(bit drop_token);
     drop_allocation_token_on_copy = drop_token;
   endfunction
 
+  // 功能：将 rhs 中 rdma_rm_owned_authority_loss_mapping 的值字段复制到当前对象，建立与源对象隔离的快照。
+  // 输入/输出及副作用：rhs（输入）；rhs 是源对象；当前对象字段会被覆盖，嵌套句柄按实现执行 clone 或保持非拥有引用，源对象不被修改。
+  // 失败/边界：do_copy 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（authority-loss mapping copy cast failed），不保留部分有效快照。
   virtual function void do_copy(uvm_object rhs);
     rdma_rm_owned_authority_loss_mapping rhs_mapping;
 
@@ -1559,6 +1827,9 @@ class rdma_rm_owned_authority_loss_mapping extends rdma_dma_mapping;
     end
   endfunction
 
+  // 功能：在 rdma_rm_owned_authority_loss_mapping 中，snapshot_release_authority 按完整 key/handle 查找唯一权威记录并返回 detached 快照，避免把内部可变引用泄露给调用方。
+  // 输入/输出及副作用：snapshot（输出）；snapshot_release_authority 读取 snapshot 并使用字段 snapshot、candidate、candidate.allocation_token、candidate.allocation_token_initialized，并写入 snapshot；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：snapshot_release_authority 在 key/handle 缺失、记录不唯一或 generation/reset epoch 过期时返回明确错误，不回退到默认 authority。
   virtual function rdma_status snapshot_release_authority(
     output rdma_dma_mapping snapshot
   );
@@ -1578,6 +1849,9 @@ class rdma_rm_owned_authority_loss_mapping extends rdma_dma_mapping;
     return rdma_status::success();
   endfunction
 
+  // 功能：在 rdma_rm_owned_authority_loss_mapping 中，release_authority_status 按 owner、generation 和幂等规则释放/隔离记录，并同步删除其账本引用。
+  // 输入/输出及副作用：snapshot（输入）；release_authority_status 可能更新本对象明确拥有的状态；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：release_authority_status 发现 owner/generation 不匹配、记录未知或重复释放时返回错误或幂等结果，不重新激活旧句柄。
   virtual function rdma_status release_authority_status(
     rdma_dma_mapping snapshot
   );
@@ -1606,6 +1880,9 @@ class rdma_rm_authority_hook_controller extends uvm_object;
   rdma_dma_mapping original;
   rdma_dma_mapping clone_result;
 
+  // 功能：构造 rdma_rm_authority_hook_controller，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：fault=RDMA_RM_AUTHORITY_HOOK_STABLE；original=null；clone_result=null。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_rm_authority_hook_controller 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_rm_authority_hook_controller");
     super.new(name);
     fault = RDMA_RM_AUTHORITY_HOOK_STABLE;
@@ -1623,6 +1900,9 @@ class rdma_rm_owned_authority_hook_mapping extends rdma_dma_mapping;
   local bit allocation_token_initialized;
   local rdma_rm_authority_hook_controller controller;
 
+  // 功能：构造 rdma_rm_owned_authority_hook_mapping，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：allocation_token=0；allocation_token_initialized=1'b0；controller=null。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_rm_owned_authority_hook_mapping 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_rm_owned_authority_hook_mapping");
     super.new(name);
     allocation_token = 0;
@@ -1630,6 +1910,9 @@ class rdma_rm_owned_authority_hook_mapping extends rdma_dma_mapping;
     controller = null;
   endfunction
 
+  // 功能：initialize_allocation_token 更新字段 allocation_token、allocation_token_initialized、controller、controller.original，并在提交前保持 Function authority、generation 和资源所有权约束。
+  // 输入/输出及副作用：token（输入）；initialize_allocation_token 先依据 依赖存在性、authority 和 generation 条件 校验 token；成功时更新本对象配置/状态并保存非拥有引用，返回 void。
+  // 失败/边界：initialize_allocation_token 无返回值，仅执行 allocation_token=token、allocation_token_initialized=1'b1、controller=new({get_name(), "_controller"})、controller.original=this；调用方须保证前置依赖已经绑定，函数不自动重试或接管外部资源。
   function void initialize_allocation_token(longint unsigned token);
     allocation_token = token;
     allocation_token_initialized = 1'b1;
@@ -1637,6 +1920,9 @@ class rdma_rm_owned_authority_hook_mapping extends rdma_dma_mapping;
     controller.original = this;
   endfunction
 
+  // 功能：执行 set_authority_hook_fault 指定的测试或恢复状态变更，更新受控账本并保留可回滚的故障证据。
+  // 输入/输出及副作用：fault（输入）；调用方必须先完成输入对象的空值、authority 和 generation 校验；成功时更新本对象配置/状态并保存非拥有引用，返回 void。
+  // 失败/边界：set_authority_hook_fault 仅允许测试/恢复范围内的状态变更；代际或资源不匹配时拒绝并保留原账本。
   function void set_authority_hook_fault(
     rdma_rm_authority_hook_fault_e fault
   );
@@ -1645,6 +1931,9 @@ class rdma_rm_owned_authority_hook_mapping extends rdma_dma_mapping;
     controller.fault = fault;
   endfunction
 
+  // 功能：在 rdma_rm_owned_authority_hook_mapping 中，snapshot_release_authority 按完整 key/handle 查找唯一权威记录并返回 detached 快照，避免把内部可变引用泄露给调用方。
+  // 输入/输出及副作用：snapshot（输出）；snapshot_release_authority 读取 snapshot 并使用字段 snapshot、candidate、candidate.allocation_token、candidate.allocation_token_initialized，并写入 snapshot；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：snapshot_release_authority 在 key/handle 缺失、记录不唯一或 generation/reset epoch 过期时返回明确错误，不回退到默认 authority。
   virtual function rdma_status snapshot_release_authority(
     output rdma_dma_mapping snapshot
   );
@@ -1664,6 +1953,9 @@ class rdma_rm_owned_authority_hook_mapping extends rdma_dma_mapping;
     return rdma_status::success();
   endfunction
 
+  // 功能：在 rdma_rm_owned_authority_hook_mapping 中，release_authority_status 按 owner、generation 和幂等规则释放/隔离记录，并同步删除其账本引用。
+  // 输入/输出及副作用：snapshot（输入）；release_authority_status 可能更新本对象明确拥有的状态；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：release_authority_status 发现 owner/generation 不匹配、记录未知或重复释放时返回错误或幂等结果，不重新激活旧句柄。
   virtual function rdma_status release_authority_status(
     rdma_dma_mapping snapshot
   );
@@ -1687,6 +1979,9 @@ class rdma_rm_owned_authority_hook_mapping extends rdma_dma_mapping;
     return rdma_status::success();
   endfunction
 
+  // 功能：在 rdma_rm_owned_authority_hook_mapping 中，release_completion_status 按 owner、generation 和幂等规则释放/隔离记录，并同步删除其账本引用。
+  // 输入/输出及副作用：release_complete（输出）；release_completion_status 可能更新本对象明确拥有的状态，并写入 release_complete；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：release_completion_status 发现 owner/generation 不匹配、记录未知或重复释放时返回错误或幂等结果，不重新激活旧句柄。
   virtual function rdma_status release_completion_status(
     output bit release_complete
   );
@@ -1702,6 +1997,9 @@ class rdma_rm_owned_authority_hook_mapping extends rdma_dma_mapping;
     return rdma_status::success();
   endfunction
 
+  // 功能：在 rdma_rm_owned_authority_hook_mapping 中，clone 将 rhs 中 rdma_rm_owned_authority_hook_mapping 的值字段复制到当前对象，建立与源对象隔离的快照。
+  // 输入/输出及副作用：无显式参数；clone 读取 对象字段：controller、controller.clone_result 并使用字段 cloned_object、controller.clone_result；函数返回 uvm_object，不取得调用方资源所有权。
+  // 失败/边界：clone 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（hook mapping clone cast failed），不保留部分有效快照。
   virtual function uvm_object clone();
     uvm_object cloned_object;
     rdma_rm_owned_authority_hook_mapping result;
@@ -1714,6 +2012,9 @@ class rdma_rm_owned_authority_hook_mapping extends rdma_dma_mapping;
     return result;
   endfunction
 
+  // 功能：在 rdma_rm_owned_authority_hook_mapping 中，do_copy 将 rhs 中 rdma_rm_owned_authority_hook_mapping 的字段复制到当前对象，建立与源对象隔离的值快照。
+  // 输入/输出及副作用：rhs（输入）；rhs 是源对象；当前对象字段会被覆盖，嵌套句柄按实现执行 clone 或保持非拥有引用，源对象不被修改。
+  // 失败/边界：do_copy 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（hook mapping copy cast failed），不保留部分有效快照。
   virtual function void do_copy(uvm_object rhs);
     rdma_rm_owned_authority_hook_mapping rhs_mapping;
 
@@ -1731,11 +2032,17 @@ class rdma_rm_schema_hmc_ref extends rdma_hmc_ref;
 
   int unsigned clone_calls;
 
+  // 功能：构造 rdma_rm_schema_hmc_ref，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：clone_calls=0。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_rm_schema_hmc_ref 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_rm_schema_hmc_ref");
     super.new(name);
     clone_calls = 0;
   endfunction
 
+  // 功能：将 rhs 中 rdma_rm_schema_hmc_ref 的值字段复制到当前对象，建立与源对象隔离的快照。
+  // 输入/输出及副作用：无显式参数；clone 读取固定返回值或局部计算结果，不使用对象成员字段；函数返回 uvm_object，不取得调用方资源所有权。
+  // 失败/边界：clone 的结果直接由 return super.clone() 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   virtual function uvm_object clone();
     clone_calls++;
     return super.clone();
@@ -1747,11 +2054,17 @@ class rdma_rm_schema_binding extends rdma_function_binding;
 
   int unsigned clone_calls;
 
+  // 功能：构造 rdma_rm_schema_binding，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：clone_calls=0。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_rm_schema_binding 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_rm_schema_binding");
     super.new(name);
     clone_calls = 0;
   endfunction
 
+  // 功能：将 rhs 中 rdma_rm_schema_binding 的值字段复制到当前对象，建立与源对象隔离的快照。
+  // 输入/输出及副作用：无显式参数；clone 读取固定返回值或局部计算结果，不使用对象成员字段；函数返回 uvm_object，不取得调用方资源所有权。
+  // 失败/边界：clone 的结果直接由 return super.clone() 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   virtual function uvm_object clone();
     clone_calls++;
     return super.clone();
@@ -1763,11 +2076,17 @@ class rdma_rm_schema_pcie extends rdma_pcie_identity;
 
   int unsigned clone_calls;
 
+  // 功能：构造 rdma_rm_schema_pcie，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：clone_calls=0。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_rm_schema_pcie 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_rm_schema_pcie");
     super.new(name);
     clone_calls = 0;
   endfunction
 
+  // 功能：将 rhs 中 rdma_rm_schema_pcie 的值字段复制到当前对象，建立与源对象隔离的快照。
+  // 输入/输出及副作用：无显式参数；clone 读取固定返回值或局部计算结果，不使用对象成员字段；函数返回 uvm_object，不取得调用方资源所有权。
+  // 失败/边界：clone 的结果直接由 return super.clone() 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   virtual function uvm_object clone();
     clone_calls++;
     return super.clone();
@@ -1779,11 +2098,17 @@ class rdma_rm_schema_bar extends rdma_bar_info;
 
   int unsigned clone_calls;
 
+  // 功能：构造 rdma_rm_schema_bar，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：clone_calls=0。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_rm_schema_bar 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_rm_schema_bar");
     super.new(name);
     clone_calls = 0;
   endfunction
 
+  // 功能：将 rhs 中 rdma_rm_schema_bar 的值字段复制到当前对象，建立与源对象隔离的快照。
+  // 输入/输出及副作用：无显式参数；clone 读取固定返回值或局部计算结果，不使用对象成员字段；函数返回 uvm_object，不取得调用方资源所有权。
+  // 失败/边界：clone 的结果直接由 return super.clone() 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   virtual function uvm_object clone();
     clone_calls++;
     return super.clone();
@@ -1795,11 +2120,17 @@ class rdma_rm_schema_ticket extends rdma_cmq_ticket;
 
   int unsigned clone_calls;
 
+  // 功能：构造 rdma_rm_schema_ticket，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：clone_calls=0。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_rm_schema_ticket 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_rm_schema_ticket");
     super.new(name);
     clone_calls = 0;
   endfunction
 
+  // 功能：将 rhs 中 rdma_rm_schema_ticket 的值字段复制到当前对象，建立与源对象隔离的快照。
+  // 输入/输出及副作用：无显式参数；clone 读取固定返回值或局部计算结果，不使用对象成员字段；函数返回 uvm_object，不取得调用方资源所有权。
+  // 失败/边界：clone 的结果直接由 return super.clone() 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   virtual function uvm_object clone();
     clone_calls++;
     return super.clone();
@@ -1811,11 +2142,17 @@ class rdma_rm_schema_opcode extends rdma_cmq_opcode_key;
 
   int unsigned clone_calls;
 
+  // 功能：构造 rdma_rm_schema_opcode，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：clone_calls=0。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_rm_schema_opcode 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_rm_schema_opcode");
     super.new(name);
     clone_calls = 0;
   endfunction
 
+  // 功能：将 rhs 中 rdma_rm_schema_opcode 的值字段复制到当前对象，建立与源对象隔离的快照。
+  // 输入/输出及副作用：无显式参数；clone 读取固定返回值或局部计算结果，不使用对象成员字段；函数返回 uvm_object，不取得调用方资源所有权。
+  // 失败/边界：clone 的结果直接由 return super.clone() 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   virtual function uvm_object clone();
     clone_calls++;
     return super.clone();
@@ -1827,11 +2164,17 @@ class rdma_rm_schema_status extends rdma_status;
 
   int unsigned clone_calls;
 
+  // 功能：构造 rdma_rm_schema_status，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：clone_calls=0。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_rm_schema_status 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_rm_schema_status");
     super.new(name);
     clone_calls = 0;
   endfunction
 
+  // 功能：将 rhs 中 rdma_rm_schema_status 的值字段复制到当前对象，建立与源对象隔离的快照。
+  // 输入/输出及副作用：无显式参数；clone 读取固定返回值或局部计算结果，不使用对象成员字段；函数返回 uvm_object，不取得调用方资源所有权。
+  // 失败/边界：clone 的结果直接由 return super.clone() 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   virtual function uvm_object clone();
     clone_calls++;
     return super.clone();
@@ -1843,11 +2186,17 @@ class rdma_rm_stateful_mr extends rdma_mr;
 
   int unsigned clone_calls;
 
+  // 功能：构造 rdma_rm_stateful_mr，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：clone_calls=0。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_rm_stateful_mr 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_rm_stateful_mr");
     super.new(name);
     clone_calls = 0;
   endfunction
 
+  // 功能：将 rhs 中 rdma_rm_stateful_mr 的值字段复制到当前对象，建立与源对象隔离的快照。
+  // 输入/输出及副作用：无显式参数；clone 读取 对象字段：clone_calls 并使用字段 cloned_object；函数返回 uvm_object，不取得调用方资源所有权。
+  // 失败/边界：clone 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（stateful MR clone cast failed），不保留部分有效快照。
   virtual function uvm_object clone();
     uvm_object cloned_object;
     rdma_rm_stateful_mr cloned_mr;
@@ -1872,6 +2221,9 @@ class rdma_rm_unregistered_mr extends rdma_mr;
   int unsigned extra_scalar;
   rdma_handle extra_child;
 
+  // 功能：构造 rdma_rm_unregistered_mr，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：clone_calls=0；extra_scalar=32'hc011_a001；extra_child=null。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_rm_unregistered_mr 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_rm_unregistered_mr");
     super.new(name);
     clone_calls = 0;
@@ -1879,6 +2231,9 @@ class rdma_rm_unregistered_mr extends rdma_mr;
     extra_child = null;
   endfunction
 
+  // 功能：将 rhs 中 rdma_rm_unregistered_mr 的值字段复制到当前对象，建立与源对象隔离的快照。
+  // 输入/输出及副作用：无显式参数；clone 读取局部计算结果，并使用字段 result；函数返回 uvm_object，不取得调用方资源所有权。
+  // 失败/边界：clone 下游操作失败时原样传播其 status/result，不伪造成功；该路径不隐式重试，也不转移未声明资源。
   virtual function uvm_object clone();
     uvm_object result;
 
@@ -1893,6 +2248,9 @@ class rdma_rm_lying_mr extends rdma_mr;
   typedef uvm_object_registry#(rdma_rm_lying_mr,
                                "rdma_rm_lying_mr") type_id;
 
+  // 功能：在 rdma_rm_lying_mr 中，get_type 按完整 key/handle 查找唯一权威记录并返回 detached 快照，避免把内部可变引用泄露给调用方。
+  // 输入/输出及副作用：无显式参数；get_type 读取固定返回值或局部计算结果，不使用对象成员字段；函数返回 type_id，不取得调用方资源所有权。
+  // 失败/边界：get_type 在 key/handle 缺失、记录不唯一或 generation/reset epoch 过期时返回明确错误，不回退到默认 authority。
   static function type_id get_type();
     return type_id::get();
   endfunction
@@ -1901,6 +2259,9 @@ class rdma_rm_lying_mr extends rdma_mr;
   int unsigned extra_scalar;
   rdma_handle extra_child;
 
+  // 功能：构造 rdma_rm_lying_mr，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：clone_calls=0；extra_scalar=32'hc011_a002；extra_child=null。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_rm_lying_mr 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_rm_lying_mr");
     super.new(name);
     clone_calls = 0;
@@ -1908,10 +2269,16 @@ class rdma_rm_lying_mr extends rdma_mr;
     extra_child = null;
   endfunction
 
+  // 功能：在 rdma_rm_lying_mr 中，get_object_type 按完整 key/handle 查找唯一权威记录并返回 detached 快照，避免把内部可变引用泄露给调用方。
+  // 输入/输出及副作用：无显式参数；get_object_type 读取 对象字段：rdma_mr 并使用字段 rdma_mr；函数返回 uvm_object_wrapper，不取得调用方资源所有权。
+  // 失败/边界：get_object_type 在 key/handle 缺失、记录不唯一或 generation/reset epoch 过期时返回明确错误，不回退到默认 authority。
   virtual function uvm_object_wrapper get_object_type();
     return rdma_mr::get_type();
   endfunction
 
+  // 功能：将 rhs 中 rdma_rm_lying_mr 的值字段复制到当前对象，建立与源对象隔离的快照。
+  // 输入/输出及副作用：无显式参数；clone 读取局部计算结果，并使用字段 result；函数返回 uvm_object，不取得调用方资源所有权。
+  // 失败/边界：clone 下游操作失败时原样传播其 status/result，不伪造成功；该路径不隐式重试，也不转移未声明资源。
   virtual function uvm_object clone();
     uvm_object result;
 
@@ -1927,6 +2294,9 @@ class rdma_rm_unregistered_mapping extends rdma_dma_mapping;
   int unsigned extra_scalar;
   rdma_handle extra_child;
 
+  // 功能：构造 rdma_rm_unregistered_mapping，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：clone_calls=0；extra_scalar=32'hc011_b001；extra_child=null。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_rm_unregistered_mapping 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_rm_unregistered_mapping");
     super.new(name);
     clone_calls = 0;
@@ -1934,6 +2304,9 @@ class rdma_rm_unregistered_mapping extends rdma_dma_mapping;
     extra_child = null;
   endfunction
 
+  // 功能：将 rhs 中 rdma_rm_unregistered_mapping 的值字段复制到当前对象，建立与源对象隔离的快照。
+  // 输入/输出及副作用：无显式参数；clone 读取局部计算结果，并使用字段 result；函数返回 uvm_object，不取得调用方资源所有权。
+  // 失败/边界：clone 下游操作失败时原样传播其 status/result，不伪造成功；该路径不隐式重试，也不转移未声明资源。
   virtual function uvm_object clone();
     uvm_object result;
 
@@ -1949,6 +2322,9 @@ endclass
 // rdma_dma_mapping type unless the owned-capability boundary rejects it.
 class rdma_rm_stable_unregistered_mapping extends rdma_dma_mapping;
 
+  // 功能：构造 rdma_rm_stable_unregistered_mapping，调用 super.new 建立 UVM 层级对象；外部依赖字段保持未绑定，后续由 configure/build/activate 明确注入。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_rm_stable_unregistered_mapping 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_rm_stable_unregistered_mapping");
     super.new(name);
   endfunction
@@ -1958,6 +2334,9 @@ class rdma_rm_lying_mapping extends rdma_dma_mapping;
   typedef uvm_object_registry#(rdma_rm_lying_mapping,
                                "rdma_rm_lying_mapping") type_id;
 
+  // 功能：在 rdma_rm_lying_mapping 中，get_type 按完整 key/handle 查找唯一权威记录并返回 detached 快照，避免把内部可变引用泄露给调用方。
+  // 输入/输出及副作用：无显式参数；get_type 读取固定返回值或局部计算结果，不使用对象成员字段；函数返回 type_id，不取得调用方资源所有权。
+  // 失败/边界：get_type 在 key/handle 缺失、记录不唯一或 generation/reset epoch 过期时返回明确错误，不回退到默认 authority。
   static function type_id get_type();
     return type_id::get();
   endfunction
@@ -1966,6 +2345,9 @@ class rdma_rm_lying_mapping extends rdma_dma_mapping;
   int unsigned extra_scalar;
   rdma_handle extra_child;
 
+  // 功能：构造 rdma_rm_lying_mapping，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：clone_calls=0；extra_scalar=32'hc011_b002；extra_child=null。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_rm_lying_mapping 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_rm_lying_mapping");
     super.new(name);
     clone_calls = 0;
@@ -1973,10 +2355,16 @@ class rdma_rm_lying_mapping extends rdma_dma_mapping;
     extra_child = null;
   endfunction
 
+  // 功能：在 rdma_rm_lying_mapping 中，get_object_type 按完整 key/handle 查找唯一权威记录并返回 detached 快照，避免把内部可变引用泄露给调用方。
+  // 输入/输出及副作用：无显式参数；get_object_type 读取 对象字段：rdma_dma_mapping 并使用字段 rdma_dma_mapping；函数返回 uvm_object_wrapper，不取得调用方资源所有权。
+  // 失败/边界：get_object_type 在 key/handle 缺失、记录不唯一或 generation/reset epoch 过期时返回明确错误，不回退到默认 authority。
   virtual function uvm_object_wrapper get_object_type();
     return rdma_dma_mapping::get_type();
   endfunction
 
+  // 功能：将 rhs 中 rdma_rm_lying_mapping 的值字段复制到当前对象，建立与源对象隔离的快照。
+  // 输入/输出及副作用：无显式参数；clone 读取局部计算结果，并使用字段 result；函数返回 uvm_object，不取得调用方资源所有权。
+  // 失败/边界：clone 下游操作失败时原样传播其 status/result，不伪造成功；该路径不隐式重试，也不转移未声明资源。
   virtual function uvm_object clone();
     uvm_object result;
 
@@ -1992,6 +2380,9 @@ class rdma_rm_unregistered_recovery extends rdma_recovery_record;
   int unsigned extra_scalar;
   rdma_handle extra_child;
 
+  // 功能：构造 rdma_rm_unregistered_recovery，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：clone_calls=0；extra_scalar=32'hc011_c001；extra_child=null。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_rm_unregistered_recovery 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_rm_unregistered_recovery");
     super.new(name);
     clone_calls = 0;
@@ -1999,6 +2390,9 @@ class rdma_rm_unregistered_recovery extends rdma_recovery_record;
     extra_child = null;
   endfunction
 
+  // 功能：将 rhs 中 rdma_rm_unregistered_recovery 的值字段复制到当前对象，建立与源对象隔离的快照。
+  // 输入/输出及副作用：无显式参数；clone 读取 对象字段：hardware_presence 并使用字段 result、hardware_presence；函数返回 uvm_object，不取得调用方资源所有权。
+  // 失败/边界：clone 下游操作失败时原样传播其 status/result，不伪造成功；该路径不隐式重试，也不转移未声明资源。
   virtual function uvm_object clone();
     uvm_object result;
 
@@ -2013,6 +2407,9 @@ class rdma_rm_lying_recovery extends rdma_recovery_record;
   typedef uvm_object_registry#(rdma_rm_lying_recovery,
                                "rdma_rm_lying_recovery") type_id;
 
+  // 功能：在 rdma_rm_lying_recovery 中，get_type 按完整 key/handle 查找唯一权威记录并返回 detached 快照，避免把内部可变引用泄露给调用方。
+  // 输入/输出及副作用：无显式参数；get_type 读取固定返回值或局部计算结果，不使用对象成员字段；函数返回 type_id，不取得调用方资源所有权。
+  // 失败/边界：get_type 在 key/handle 缺失、记录不唯一或 generation/reset epoch 过期时返回明确错误，不回退到默认 authority。
   static function type_id get_type();
     return type_id::get();
   endfunction
@@ -2021,6 +2418,9 @@ class rdma_rm_lying_recovery extends rdma_recovery_record;
   int unsigned extra_scalar;
   rdma_handle extra_child;
 
+  // 功能：构造 rdma_rm_lying_recovery，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：clone_calls=0；extra_scalar=32'hc011_c002；extra_child=null。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_rm_lying_recovery 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_rm_lying_recovery");
     super.new(name);
     clone_calls = 0;
@@ -2028,10 +2428,16 @@ class rdma_rm_lying_recovery extends rdma_recovery_record;
     extra_child = null;
   endfunction
 
+  // 功能：在 rdma_rm_lying_recovery 中，get_object_type 按完整 key/handle 查找唯一权威记录并返回 detached 快照，避免把内部可变引用泄露给调用方。
+  // 输入/输出及副作用：无显式参数；get_object_type 读取 对象字段：rdma_recovery_record 并使用字段 rdma_recovery_record；函数返回 uvm_object_wrapper，不取得调用方资源所有权。
+  // 失败/边界：get_object_type 在 key/handle 缺失、记录不唯一或 generation/reset epoch 过期时返回明确错误，不回退到默认 authority。
   virtual function uvm_object_wrapper get_object_type();
     return rdma_recovery_record::get_type();
   endfunction
 
+  // 功能：将 rhs 中 rdma_rm_lying_recovery 的值字段复制到当前对象，建立与源对象隔离的快照。
+  // 输入/输出及副作用：无显式参数；clone 读取 对象字段：hardware_presence 并使用字段 result、hardware_presence；函数返回 uvm_object，不取得调用方资源所有权。
+  // 失败/边界：clone 下游操作失败时原样传播其 status/result，不伪造成功；该路径不隐式重试，也不转移未声明资源。
   virtual function uvm_object clone();
     uvm_object result;
 
@@ -2044,14 +2450,23 @@ endclass
 
 class rdma_clone_probe_manager extends rdma_resource_manager;
 
+  // 功能：构造 rdma_clone_probe_manager，调用 super.new 建立 UVM 层级对象；外部依赖字段保持未绑定，后续由 configure/build/activate 明确注入。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_clone_probe_manager 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_clone_probe_manager");
     super.new(name);
   endfunction
 
+  // 功能：replace_authoritative 更新字段 函数体列出的状态字段，并在提交前保持 Function authority、generation 和资源所有权约束。
+  // 输入/输出及副作用：replacement（输入）；replace_authoritative 读取 replacement 并使用输入参数和固定枚举/常量；函数返回 void，不取得调用方资源所有权。
+  // 失败/边界：replace_authoritative 无返回值，仅执行 函数体中的顺序操作；调用方须保证前置依赖已经绑定，函数不自动重试或接管外部资源。
   function void replace_authoritative(rdma_resource replacement);
     registry[resource_key(replacement.handle)] = replacement;
   endfunction
 
+  // 功能：在 rdma_clone_probe_manager 中，observed_resource_probe 只读查询当前运行时/测试账本，返回槽位、对象或恢复记录的快照而不推进事务。
+  // 输入/输出及副作用：handle（输入）；observed_resource_probe 读取 handle 并使用字段 key；函数返回 rdma_resource，不取得调用方资源所有权。
+  // 失败/边界：observed_resource_probe 输入对象为空或查找未命中时返回 null；该路径不隐式重试，也不转移未声明资源。
   function rdma_resource observed_resource_probe(rdma_handle handle);
     string key;
 
@@ -2061,6 +2476,9 @@ class rdma_clone_probe_manager extends rdma_resource_manager;
     return registry[key];
   endfunction
 
+  // 功能：在 rdma_clone_probe_manager 中，observed_generation_high_water 只读查询当前运行时/测试账本，返回槽位、对象或恢复记录的快照而不推进事务。
+  // 输入/输出及副作用：owner（输入）；observed_generation_high_water 读取 owner 并使用字段 key；函数返回 int unsigned，不取得调用方资源所有权。
+  // 失败/边界：observed_generation_high_water 比较或前置条件不满足时返回 0/false；该路径不隐式重试，也不转移未声明资源。
   function int unsigned observed_generation_high_water(
     rdma_function_handle owner
   );
@@ -2072,6 +2490,9 @@ class rdma_clone_probe_manager extends rdma_resource_manager;
     return generation_high_water[key];
   endfunction
 
+  // 功能：在 rdma_clone_probe_manager 中，reset_publication_probe reset_publication_probe 清理当前运行状态并建立新的复位/代际边界，使旧句柄或旧事务不能继续生效。
+  // 输入/输出及副作用：replacement（输入）、staged（输入）；输入 action/epoch/handle 决定迁移目标；成功时更新状态或恢复证据，外部资源仍由其拥有者管理。
+  // 失败/边界：复位参数为零、代际回退或存在未处理 pending 事务时拒绝更新 authority。
   function void reset_publication_probe(rdma_resource replacement,
                                         bit staged);
     string key;
@@ -2084,6 +2505,9 @@ class rdma_clone_probe_manager extends rdma_resource_manager;
       staged_allocations.delete(key);
   endfunction
 
+  // 功能：在 rdma_clone_probe_manager 中，probe_public_resource_projection 逐字段核对快照、嵌套引用和 authority 值，确认复制结果既等值又无可变别名。
+  // 输入/输出及副作用：source（输入）、result（输出）；probe_public_resource_projection 读取 source、result 并使用输入参数和固定枚举/常量，并写入 result；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：probe_public_resource_projection 只读输入并返回 rdma_status；边界由函数体现有分支决定，不修改状态或转移资源。
   function rdma_status probe_public_resource_projection(
     rdma_resource source,
     output rdma_resource result
@@ -2092,6 +2516,9 @@ class rdma_clone_probe_manager extends rdma_resource_manager;
                                          result);
   endfunction
 
+  // 功能：在 rdma_clone_probe_manager 中，reset_error_probe reset_error_probe 清理当前运行状态并建立新的复位/代际边界，使旧句柄或旧事务不能继续生效。
+  // 输入/输出及副作用：replacement（输入）；输入 action/epoch/handle 决定迁移目标；成功时更新状态或恢复证据，外部资源仍由其拥有者管理。
+  // 失败/边界：复位参数为零、代际回退或存在未处理 pending 事务时拒绝更新 authority。
   function void reset_error_probe(rdma_resource replacement);
     string key;
     rdma_resource replacement_copy;
@@ -2106,6 +2533,9 @@ class rdma_clone_probe_manager extends rdma_resource_manager;
     recovery_records.delete(key);
   endfunction
 
+  // 功能：执行 inject_recovery_probe 指定的测试或恢复状态变更，更新受控账本并保留可回滚的故障证据。
+  // 输入/输出及副作用：handle（输入）、recovery（输入）；inject_recovery_probe 读取 handle、recovery 并使用输入参数和固定枚举/常量；函数返回 void，不取得调用方资源所有权。
+  // 失败/边界：inject_recovery_probe 仅允许测试/恢复范围内的状态变更；代际或资源不匹配时拒绝并保留原账本。
   function void inject_recovery_probe(
     rdma_handle handle,
     rdma_recovery_record recovery
@@ -2113,6 +2543,9 @@ class rdma_clone_probe_manager extends rdma_resource_manager;
     recovery_records[resource_key(handle)] = recovery;
   endfunction
 
+  // 功能：在 rdma_clone_probe_manager 中，observed_recovery_probe 只读查询当前运行时/测试账本，返回槽位、对象或恢复记录的快照而不推进事务。
+  // 输入/输出及副作用：handle（输入）；observed_recovery_probe 读取 handle 并使用字段 key；函数返回 rdma_recovery_record，不取得调用方资源所有权。
+  // 失败/边界：observed_recovery_probe 输入对象为空或查找未命中时返回 null；该路径不隐式重试，也不转移未声明资源。
   function rdma_recovery_record observed_recovery_probe(rdma_handle handle);
     string key;
 
@@ -2126,11 +2559,18 @@ endclass
 class rdma_resource_manager_test extends uvm_test;
   `uvm_component_utils(rdma_resource_manager_test)
 
+  // 功能：构造 rdma_resource_manager_test，调用 super.new 建立 UVM 层级对象；外部依赖字段保持未绑定，后续由 configure/build/activate 明确注入。
+  // 输入/输出及副作用：name、parent（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_resource_manager_test 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_resource_manager_test",
                uvm_component parent = null);
     super.new(name, parent);
   endfunction
 
+  // 功能：在 rdma_resource_manager_test 中，expect_status 在测试中执行 expect_status 断言，比较输入结果与期望状态并报告可定位的失败信息。
+  // 输入/输出及副作用：check_name（输入）、status（输入）、expected_code（输入）；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT
+  //   转移未声明的资源所有权。
+  // 失败/边界：测试函数 expect_status 缺少前置对象时报告断言错误，并停止依赖该对象的后续检查。
   function automatic void expect_status(
     string check_name,
     rdma_status status,
@@ -2147,6 +2587,9 @@ class rdma_resource_manager_test extends uvm_test;
                            status.convert2string()))
   endfunction
 
+  // 功能：在 rdma_resource_manager_test 中，clone_handle 将 rhs 中 rdma_resource_manager_test 的值字段复制到当前对象，建立与源对象隔离的快照。
+  // 输入/输出及副作用：check_name（输入）、source（输入）；clone_handle 读取 check_name、source 并使用字段 cloned_object；函数返回 rdma_handle，不取得调用方资源所有权。
+  // 失败/边界：clone_handle 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（cannot clone a null handle），不保留部分有效快照。
   function automatic rdma_handle clone_handle(
     string check_name,
     rdma_handle source
@@ -2162,6 +2605,9 @@ class rdma_resource_manager_test extends uvm_test;
     return cloned_handle;
   endfunction
 
+  // 功能：在 rdma_resource_manager_test 中，clone_function_handle 将 rhs 中 rdma_resource_manager_test 的值字段复制到当前对象，建立与源对象隔离的快照。
+  // 输入/输出及副作用：check_name（输入）、source（输入）；clone_function_handle 读取 check_name、source 并使用字段 cloned_object；函数返回 rdma_function_handle，不取得调用方资源所有权。
+  // 失败/边界：clone_function_handle 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（cannot clone a null function handle），不保留部分有效快照。
   function automatic rdma_function_handle clone_function_handle(
     string check_name,
     rdma_function_handle source
@@ -2177,6 +2623,10 @@ class rdma_resource_manager_test extends uvm_test;
     return cloned_handle;
   endfunction
 
+  // 功能：make_active_binding 创建独立的 rdma_function_binding；根据 name、function_uid、global_function_id、generation 设置字段 binding、binding.function_uid、binding.generation、binding.global_function_id、binding.rdma_vf_id、binding.pfvf_id、pcie.vf_index、pcie.bdf、pcie.parent_pf_bdf、base.value，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：name（输入）、function_uid（输入）、global_function_id（输入）、generation（输入）；输入字段被复制到返回值或
+  //   output；生成结果与输入隔离，不隐式修改调用方对象。
+  // 失败/边界：make_active_binding 的结果直接由 return binding 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function automatic rdma_function_binding make_active_binding(
     string name,
     longint unsigned function_uid = 64'h0123_4567_89ab_cdef,
@@ -2195,8 +2645,11 @@ class rdma_resource_manager_test extends uvm_test;
     binding.pcie.vf_index = 32'h8000_8080;
     binding.pcie.bdf = '{segment:16'h1001, bus:8'h20, device:5'h03,
                          function_num:3'h5};
-    binding.pcie.parent_pf_bdf = '{segment:16'h2002, bus:8'h30,
+    binding.pcie.parent_pf_bdf = '{segment:16'h1001, bus:8'h30,
                                    device:5'h04, function_num:3'h2};
+    if (!binding.configure_identity_from_legacy_mirrors(
+          16'h1, 32'h1, RDMA_FUNCTION_VF, 16'h8080).ok())
+      `uvm_error("BINDING", "legacy binding identity configuration failed")
     binding.pcie.bar[0].base.value = 64'h0000_0000_8000_0000;
     binding.pcie.bar[0].size = 64'h4000;
     binding.pcie.bar[0].enabled = 1'b1;
@@ -2236,6 +2689,10 @@ class rdma_resource_manager_test extends uvm_test;
     return binding;
   endfunction
 
+  // 功能：make_queue_test_mapping 创建独立的 rdma_dma_mapping；根据 name、owner、owner_h、iova_value、control_plane_owned 设置字段 owned_mapping、mapping、mapping.function_h、mapping.owner_h、iova.value、backing_addr.value、mapping.size、mapping.direction、mapping.permissions、mapping.state，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：name（输入）、owner（输入）、owner_h（输入）、iova_value（输入）、control_plane_owned（输入）；输入字段被复制到返回值或
+  //   output；生成结果与输入隔离，不隐式修改调用方对象。
+  // 失败/边界：make_queue_test_mapping 先检查 control_plane_owned，再返回 mapping；拒绝分支不提交部分状态，也不隐式重试。
   function automatic rdma_dma_mapping make_queue_test_mapping(
     string name,
     rdma_function_handle owner,
@@ -2267,6 +2724,9 @@ class rdma_resource_manager_test extends uvm_test;
     return mapping;
   endfunction
 
+  // 功能：make_independent_queue_test_mapping 创建独立的 rdma_dma_mapping；根据 name、owner、owner_h、iova_value 设置字段 mapping、mapping.function_h、mapping.owner_h、iova.value、backing_addr.value、mapping.size、mapping.direction、mapping.permissions、mapping.state，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：name（输入）、owner（输入）、owner_h（输入）、iova_value（输入）；make_independent_queue_test_mapping 读取 name、owner、owner_h、iova_value 并使用字段 mapping、mapping.function_h、mapping.owner_h、iova.value、backing_addr.value、mapping.size、mapping.direction、mapping.permissions；函数返回 rdma_dma_mapping，不取得调用方资源所有权。
+  // 失败/边界：make_independent_queue_test_mapping 的结果直接由 return mapping 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function automatic rdma_dma_mapping make_independent_queue_test_mapping(
     string name,
     rdma_function_handle owner,
@@ -2289,6 +2749,9 @@ class rdma_resource_manager_test extends uvm_test;
     return mapping;
   endfunction
 
+  // 功能：make_queue_test_ring 创建独立的 rdma_queue_ring_layout；根据 name、role、depth、entry_size_bytes、mapping 设置字段 logical_bytes、storage_bytes、ring、ring.role、ring.entry_size_bytes、ring.depth、ring.logical_bytes、ring.storage_bytes、ring.page_count、ring.initial_polarity，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：name（输入）、role（输入）、depth（输入）、entry_size_bytes（输入）、mapping（输入）；make_queue_test_ring 读取 name、role、depth、entry_size_bytes、mapping 并使用字段 logical_bytes、storage_bytes、ring、ring.role、ring.entry_size_bytes、ring.depth、ring.logical_bytes、ring.storage_bytes；函数返回 rdma_queue_ring_layout，不取得调用方资源所有权。
+  // 失败/边界：make_queue_test_ring 的结果直接由 return ring 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function automatic rdma_queue_ring_layout make_queue_test_ring(
     string name,
     rdma_queue_backing_role_e role,
@@ -2325,6 +2788,9 @@ class rdma_resource_manager_test extends uvm_test;
     return ring;
   endfunction
 
+  // 功能：make_queue_test_ref 创建独立的 rdma_queue_backing_ref；根据 name、role、mapping、length、ownership 设置字段 ref_value、ref_value.role、ref_value.mapping、ref_value.length、ref_value.ownership，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：name（输入）、role（输入）、mapping（输入）、length（输入）、ownership（输入）；make_queue_test_ref 读取 name、role、mapping、length、ownership 并使用字段 ref_value、ref_value.role、ref_value.mapping、ref_value.length、ref_value.ownership；函数返回 rdma_queue_backing_ref，不取得调用方资源所有权。
+  // 失败/边界：make_queue_test_ref 的结果直接由 return ref_value 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function automatic rdma_queue_backing_ref make_queue_test_ref(
     string name,
     rdma_queue_backing_role_e role,
@@ -2342,6 +2808,9 @@ class rdma_resource_manager_test extends uvm_test;
     return ref_value;
   endfunction
 
+  // 功能：make_queue_test_opcode 创建独立的 rdma_cmq_opcode_key；根据 name、variant 设置字段 opcode_key、opcode_key.profile_name、opcode_key.variant，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：name（输入）、variant（输入）；make_queue_test_opcode 读取 name、variant 并使用字段 opcode_key、opcode_key.profile_name、opcode_key.variant；函数返回 rdma_cmq_opcode_key，不取得调用方资源所有权。
+  // 失败/边界：make_queue_test_opcode 的结果直接由 return opcode_key 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function automatic rdma_cmq_opcode_key make_queue_test_opcode(
     string name,
     string variant
@@ -2354,6 +2823,10 @@ class rdma_resource_manager_test extends uvm_test;
     return opcode_key;
   endfunction
 
+  // 功能：make_queue_test_plan 创建独立的 rdma_queue_backing_plan；根据 name、kind、depth、owner、owner_h、local_id 设置字段 plan、plan.resource_kind、ring_role、pd_role、entry_size、ring_mapping、ring、ring_ref、pd_mapping、pd_ref，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：name（输入）、kind（输入）、depth（输入）、owner（输入）、owner_h（输入）、local_id（输入）；输入字段被复制到返回值或
+  //   output；生成结果与输入隔离，不隐式修改调用方对象。
+  // 失败/边界：make_queue_test_plan 先检查 kind == RDMA_RESOURCE_CQ || kind == RDMA_RESOURCE_SRQ；kind == RDMA_RESOURCE_CQ；kind == RDMA_RESOURCE_SRQ，再返回 plan；拒绝分支不提交部分状态，也不隐式重试。
   function automatic rdma_queue_backing_plan make_queue_test_plan(
     string name,
     rdma_resource_kind_e kind,
@@ -2519,6 +2992,9 @@ class rdma_resource_manager_test extends uvm_test;
     return plan;
   endfunction
 
+  // 功能：make_qp_projected_handle 创建独立的 rdma_handle；根据 name、kind、owner、local_id 设置字段 handle、handle.kind、handle.function_uid、handle.object_id、handle.generation，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：name（输入）、kind（输入）、owner（输入）、local_id（输入）；make_qp_projected_handle 读取 name、kind、owner、local_id 并使用字段 handle、handle.kind、handle.function_uid、handle.object_id、handle.generation；函数返回 rdma_handle，不取得调用方资源所有权。
+  // 失败/边界：make_qp_projected_handle 的结果直接由 return handle 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function automatic rdma_handle make_qp_projected_handle(
     string name,
     rdma_resource_kind_e kind,
@@ -2535,6 +3011,9 @@ class rdma_resource_manager_test extends uvm_test;
     return handle;
   endfunction
 
+  // 功能：make_qp_test_ring 创建独立的 rdma_qp_ring_layout；根据 name、role、depth 设置字段 ring、ring.role、ring.entry_size_bytes、ring.depth、ring.logical_bytes、ring.storage_bytes、ring.object_mode，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：name（输入）、role（输入）、depth（输入）；make_qp_test_ring 读取 name、role、depth 并使用字段 ring、ring.role、ring.entry_size_bytes、ring.depth、ring.logical_bytes、ring.storage_bytes、ring.object_mode；函数返回 rdma_qp_ring_layout，不取得调用方资源所有权。
+  // 失败/边界：make_qp_test_ring 的结果直接由 return ring 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function automatic rdma_qp_ring_layout make_qp_test_ring(
     string name,
     rdma_queue_backing_role_e role,
@@ -2552,6 +3031,9 @@ class rdma_resource_manager_test extends uvm_test;
     return ring;
   endfunction
 
+  // 功能：make_qp_test_ref 创建独立的 rdma_qp_backing_ref；根据 name、role、mapping、length、ownership 设置字段 ref_value、ref_value.role、ref_value.mapping、ref_value.length、ref_value.ownership，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：name（输入）、role（输入）、mapping（输入）、length（输入）、ownership（输入）；make_qp_test_ref 读取 name、role、mapping、length、ownership 并使用字段 ref_value、ref_value.role、ref_value.mapping、ref_value.length、ref_value.ownership；函数返回 rdma_qp_backing_ref，不取得调用方资源所有权。
+  // 失败/边界：make_qp_test_ref 的结果直接由 return ref_value 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function automatic rdma_qp_backing_ref make_qp_test_ref(
     string name,
     rdma_queue_backing_role_e role,
@@ -2569,6 +3051,9 @@ class rdma_resource_manager_test extends uvm_test;
     return ref_value;
   endfunction
 
+  // 功能：make_qp_test_plan 创建独立的 rdma_qp_backing_plan；根据 name、qp、depth 设置字段 plan、plan.transport、plan.sq_depth、plan.rq_depth、plan.sq_ring、plan.rq_ring、sq_mapping、rq_mapping、sq_pd_mapping、rq_pd_mapping，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：name（输入）、qp（输入）、depth（输入）；make_qp_test_plan 读取 name、qp、depth 并使用字段 plan、plan.transport、plan.sq_depth、plan.rq_depth、plan.sq_ring、plan.rq_ring、sq_mapping、rq_mapping；函数返回 rdma_qp_backing_plan，不取得调用方资源所有权。
+  // 失败/边界：make_qp_test_plan 的结果直接由 return plan 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function automatic rdma_qp_backing_plan make_qp_test_plan(
     string name,
     rdma_qp qp,
@@ -2659,6 +3144,10 @@ class rdma_resource_manager_test extends uvm_test;
     return plan;
   endfunction
 
+  // 功能：make_qp_test_qpc 创建独立的 rdma_qpc_model；根据 name、qp、pd、send_cq、recv_cq、plan、state 设置字段 model、model.qp_h、model.pd_h、model.send_cq_h、model.recv_cq_h、model.transport、model.state、model.path_mtu_bytes、model.sq_depth、model.rq_depth，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：name（输入）、qp（输入）、pd（输入）、send_cq（输入）、recv_cq（输入）、plan（输入）、state（输入）；输入字段被复制到返回值或
+  //   output；生成结果与输入隔离，不隐式修改调用方对象。
+  // 失败/边界：make_qp_test_qpc 的结果直接由 return model 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function automatic rdma_qpc_model make_qp_test_qpc(
     string name,
     rdma_qp qp,
@@ -2700,6 +3189,9 @@ class rdma_resource_manager_test extends uvm_test;
     return model;
   endfunction
 
+  // 功能：在 rdma_resource_manager_test 中，prepare_qp_candidate 校验依赖和 binding 后建立运行边界，只保存非拥有引用并拒绝重复配置。
+  // 输入/输出及副作用：qp（输入）、pd（输入）、send_cq（输入）、recv_cq（输入）、name（输入）；prepare_qp_candidate 可能更新本对象明确拥有的状态；函数返回 void，不取得调用方资源所有权。
+  // 失败/边界：prepare_qp_candidate 无返回值，仅执行 qp.transport=RDMA_TRANSPORT_RC、qp.qp_state=RDMA_QPS_RESET、qp.sq_depth=128、qp.rq_depth=128；调用方须保证前置依赖已经绑定，函数不自动重试或接管外部资源。
   function automatic void prepare_qp_candidate(
     rdma_qp qp,
     rdma_pd pd,
@@ -2720,6 +3212,9 @@ class rdma_resource_manager_test extends uvm_test;
     qp.rq_iova = qp.qp_plan.rq_ref.mapping.iova;
   endfunction
 
+  // 功能：在 rdma_resource_manager_test 中，prepare_urc_qp_candidate 校验依赖和 binding 后建立运行边界，只保存非拥有引用并拒绝重复配置。
+  // 输入/输出及副作用：qp（输入）、pd（输入）、send_cq（输入）、recv_cq（输入）、name（输入）；prepare_urc_qp_candidate 可能更新本对象明确拥有的状态；函数返回 void，不取得调用方资源所有权。
+  // 失败/边界：prepare_urc_qp_candidate 无返回值，仅执行 qp.transport=RDMA_TRANSPORT_URC、qp_plan.transport=RDMA_TRANSPORT_URC、urc_mapping=make_independent_queue_test_mapping(、urc_ref=make_qp_test_ref(；调用方须保证前置依赖已经绑定，函数不自动重试或接管外部资源。
   function automatic void prepare_urc_qp_candidate(
     rdma_qp qp,
     rdma_pd pd,
@@ -2781,6 +3276,9 @@ class rdma_resource_manager_test extends uvm_test;
     qp.programmed_qpc.transport_ext = urc_ext;
   endfunction
 
+  // 功能：make_qp_test_opcode 创建独立的 rdma_cmq_opcode_key；根据 name、opcode、variant 设置字段 opcode_key、opcode_key.profile_name、opcode_key.opcode、opcode_key.variant，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：name（输入）、opcode（输入）、variant（输入）；make_qp_test_opcode 读取 name、opcode、variant 并使用字段 opcode_key、opcode_key.profile_name、opcode_key.opcode、opcode_key.variant；函数返回 rdma_cmq_opcode_key，不取得调用方资源所有权。
+  // 失败/边界：make_qp_test_opcode 的结果直接由 return opcode_key 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function automatic rdma_cmq_opcode_key make_qp_test_opcode(
     string name,
     bit [31:0] opcode,
@@ -2789,12 +3287,15 @@ class rdma_resource_manager_test extends uvm_test;
     rdma_cmq_opcode_key opcode_key;
 
     opcode_key = rdma_cmq_opcode_key::type_id::create(name);
-    opcode_key.profile_name = "xtr_v1";
+    opcode_key.profile_name = "rdma";
     opcode_key.opcode = opcode;
     opcode_key.variant = variant;
     return opcode_key;
   endfunction
 
+  // 功能：make_qp_test_ticket 创建独立的 rdma_cmq_ticket；根据 name、owner、cmq_h、opcode_key 设置字段 ticket、ticket.command_id、ticket.function_h、ticket.cmq_h、ticket.slot_sequence、ticket.sq_index、ticket.sq_wrap、ticket.opcode_key、ticket.absolute_deadline，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：name（输入）、owner（输入）、cmq_h（输入）、opcode_key（输入）；make_qp_test_ticket 读取 name、owner、cmq_h、opcode_key 并使用字段 ticket、ticket.command_id、ticket.function_h、ticket.cmq_h、ticket.slot_sequence、ticket.sq_index、ticket.sq_wrap、ticket.opcode_key；函数返回 rdma_cmq_ticket，不取得调用方资源所有权。
+  // 失败/边界：make_qp_test_ticket 的结果直接由 return ticket 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function automatic rdma_cmq_ticket make_qp_test_ticket(
     string name,
     rdma_function_handle owner,
@@ -2815,6 +3316,9 @@ class rdma_resource_manager_test extends uvm_test;
     return ticket;
   endfunction
 
+  // 功能：make_qp_test_recovery 创建独立的 rdma_qp_recovery_state；根据 name、qp、intent、candidate_qpc 设置字段 recovery、recovery.intent、cloned_object、recovery.create_opcode、recovery.modify_opcode、recovery.delete_opcode、recovery.query_opcode、recovery.occ_opcode、recovery.query_mapping、query_mapping.size，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：name（输入）、qp（输入）、intent（输入）、null（输入）；make_qp_test_recovery 读取 name、qp、intent、candidate_qpc 并使用字段 recovery、recovery.intent、cloned_object、recovery.create_opcode、recovery.modify_opcode、recovery.delete_opcode、recovery.query_opcode、recovery.occ_opcode；函数返回 rdma_qp_recovery_state，不取得调用方资源所有权。
+  // 失败/边界：make_qp_test_recovery 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（QP plan clone failed），不保留部分有效快照。
   function automatic rdma_qp_recovery_state make_qp_test_recovery(
     string name,
     rdma_qp qp,
@@ -2869,6 +3373,9 @@ class rdma_resource_manager_test extends uvm_test;
     return recovery;
   endfunction
 
+  // 功能：在 rdma_resource_manager_test 中，prepare_mr 校验依赖和 binding 后建立运行边界，只保存非拥有引用并拒绝重复配置。
+  // 输入/输出及副作用：mr（输入）、iova_value（输入）；prepare_mr 可能更新本对象明确拥有的状态；函数返回 void，不取得调用方资源所有权。
+  // 失败/边界：prepare_mr 无返回值，仅执行 iova.value=iova_value、mr.length=64'h2000、mr.lkey={mr.local_mr_id[23:0], 8'h5a}、mr.rkey=mr.lkey；调用方须保证前置依赖已经绑定，函数不自动重试或接管外部资源。
   function automatic void prepare_mr(rdma_mr mr,
                                      longint unsigned iova_value);
     mr.iova.value = iova_value;
@@ -2880,6 +3387,10 @@ class rdma_resource_manager_test extends uvm_test;
                   remote_atomic:1'b0};
   endfunction
 
+  // 功能：在测试辅助 rdma_resource_manager_test.check_owned_mapping_clone_contract_rejections 中构造或驱动“owned mapping clone
+  //   contract rejections”场景，并断言 DUT 的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_owned_mapping_clone_contract_rejections();
     rdma_resource_manager contract_rm;
     rdma_function_binding contract_binding;
@@ -3148,6 +3659,10 @@ class rdma_resource_manager_test extends uvm_test;
                  "result hook mutation entered caller or canonical MR")
   endtask
 
+  // 功能：在测试辅助 rdma_resource_manager_test.check_owned_mapping_capability_snapshots 中构造或驱动“owned mapping capability
+  //   snapshots”场景，并断言 DUT 的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_owned_mapping_capability_snapshots();
     rdma_resource_manager capability_rm;
     rdma_mock_host_mem capability_mem;
@@ -3301,6 +3816,10 @@ class rdma_resource_manager_test extends uvm_test;
                  "canonical snapshots did not release each allocation once")
   endtask
 
+  // 功能：在测试辅助 rdma_resource_manager_test.check_reserved_error_completion_proof 中构造或驱动“reserved error completion
+  //   proof”场景，并断言 DUT 的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_reserved_error_completion_proof();
     rdma_resource_manager proof_rm;
     rdma_mock_host_mem proof_mem;
@@ -3486,6 +4005,10 @@ class rdma_resource_manager_test extends uvm_test;
                  "completion query mutation changed canonical recovery")
   endtask
 
+  // 功能：create_restore_gate_mr 创建 MR 并依次推进 allocated、programmed、active、quiescing 状态，构造恢复门控测试所需的 mr。
+  // 输入/输出及副作用：check_name（输入）、manager（输入）、binding（输入）、pd（输入）、iova_value（输入）、mr（输出）；输入请求/句柄定义资源属性；成功时更新账本并通过返回值或 output
+  //   发布新句柄/映射。
+  // 失败/边界：create_restore_gate_mr 失败或超时通过 mr 明确发布；该路径不隐式重试，也不转移未声明资源。
   task automatic create_restore_gate_mr(
     string check_name,
     rdma_resource_manager manager,
@@ -3509,6 +4032,10 @@ class rdma_resource_manager_test extends uvm_test;
                   manager.begin_quiesce(mr.handle), RDMA_SC_OK);
   endtask
 
+  // 功能：create_prepared_restore_gate_mr 创建 MR 并推进到 programmed 状态，保留可恢复的 backing 证据供测试注入故障。
+  // 输入/输出及副作用：check_name（输入）、manager（输入）、binding（输入）、pd（输入）、iova_value（输入）、mr（输出）；输入请求/句柄定义资源属性；成功时更新账本并通过返回值或 output
+  //   发布新句柄/映射。
+  // 失败/边界：create_prepared_restore_gate_mr 失败或超时通过 mr 明确发布；该路径不隐式重试，也不转移未声明资源。
   task automatic create_prepared_restore_gate_mr(
     string check_name,
     rdma_resource_manager manager,
@@ -3523,6 +4050,9 @@ class rdma_resource_manager_test extends uvm_test;
       prepare_mr(mr, iova_value);
   endtask
 
+  // 功能：在 rdma_resource_manager_test 中，activate_restore_gate_mr 校验依赖和 binding 后建立运行边界，只保存非拥有引用并拒绝重复配置。
+  // 输入/输出及副作用：check_name（输入）、manager（输入）、mr（输入）；activate_restore_gate_mr 先依据 mr == null 校验 check_name、manager、mr；成功时更新本对象配置/状态并保存非拥有引用，返回 无直接返回值。
+  // 失败/边界：实现中的空依赖、重复登记、状态或 generation/authority 校验失败时返回错误；失败时保留旧配置。
   task automatic activate_restore_gate_mr(
     string check_name,
     rdma_resource_manager manager,
@@ -3540,6 +4070,9 @@ class rdma_resource_manager_test extends uvm_test;
                   manager.begin_quiesce(mr.handle), RDMA_SC_OK);
   endtask
 
+  // 功能：initialize_restore_gate_mapping 更新字段 mapping.function_h、mapping.requester_bdf、mapping.pasid_valid、mapping.pasid、backing_addr.value、iova.value、mapping.size、mapping.direction、mapping.permissions、mapping.state，并在提交前保持 Function authority、generation 和资源所有权约束。
+  // 输入/输出及副作用：mapping（输入）、binding（输入）、iova_value（输入）；initialize_restore_gate_mapping 先依据 mapping == null || binding == null 校验 mapping、binding、iova_value；成功时更新本对象配置/状态并保存非拥有引用，返回 void。
+  // 失败/边界：实现中的空依赖、重复登记、状态或 generation/authority 校验失败时返回错误；失败时保留旧配置。
   function automatic void initialize_restore_gate_mapping(
     rdma_dma_mapping mapping,
     rdma_function_binding binding,
@@ -3561,6 +4094,9 @@ class rdma_resource_manager_test extends uvm_test;
     mapping.owner_h = null;
   endfunction
 
+  // 功能：make_restore_gate_backing_ref 创建独立的 rdma_backing_ref；根据 name、mapping、ownership 设置字段 backing_ref、backing_ref.mapping、backing_ref.ownership、backing_ref.release_complete，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：name（输入）、mapping（输入）、ownership（输入）；make_restore_gate_backing_ref 读取 name、mapping、ownership 并使用字段 backing_ref、backing_ref.mapping、backing_ref.ownership、backing_ref.release_complete；函数返回 rdma_backing_ref，不取得调用方资源所有权。
+  // 失败/边界：make_restore_gate_backing_ref 的结果直接由 return backing_ref 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function automatic rdma_backing_ref make_restore_gate_backing_ref(
     string name,
     rdma_dma_mapping mapping,
@@ -3575,6 +4111,9 @@ class rdma_resource_manager_test extends uvm_test;
     return backing_ref;
   endfunction
 
+  // 功能：make_restore_gate_hmc_ref 创建独立的 rdma_hmc_ref；根据 name、owner、address_value 设置字段 hmc_ref、hmc_ref.owner、hmc_ref.object_kind、address.value、hmc_ref.size、hmc_ref.first_pbl_index、hmc_ref.ownership、hmc_ref.release_complete，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：name（输入）、owner（输入）、address_value（输入）；make_restore_gate_hmc_ref 读取 name、owner、address_value 并使用字段 hmc_ref、hmc_ref.owner、hmc_ref.object_kind、address.value、hmc_ref.size、hmc_ref.first_pbl_index、hmc_ref.ownership、hmc_ref.release_complete；函数返回 rdma_hmc_ref，不取得调用方资源所有权。
+  // 失败/边界：make_restore_gate_hmc_ref 的结果直接由 return hmc_ref 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function automatic rdma_hmc_ref make_restore_gate_hmc_ref(
     string name,
     rdma_function_handle owner,
@@ -3593,6 +4132,9 @@ class rdma_resource_manager_test extends uvm_test;
     return hmc_ref;
   endfunction
 
+  // 功能：make_restore_gate_recovery 创建独立的 rdma_recovery_record；根据 name、mr 设置字段 recovery、recovery.resource_h、recovery.hardware_presence、recovery.primary_status，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：name（输入）、mr（输入）；make_restore_gate_recovery 读取 name、mr 并使用字段 recovery、recovery.resource_h、recovery.hardware_presence、recovery.primary_status；函数返回 rdma_recovery_record，不取得调用方资源所有权。
+  // 失败/边界：make_restore_gate_recovery 返回 RDMA_SC_TIMEOUT；典型拒绝条件为“late destroy failure is terminal”；失败路径不提交部分状态或转移未声明资源。
   function automatic rdma_recovery_record make_restore_gate_recovery(
     string name,
     rdma_mr mr
@@ -3608,6 +4150,10 @@ class rdma_resource_manager_test extends uvm_test;
     return recovery;
   endfunction
 
+  // 功能：在测试辅助 rdma_resource_manager_test.check_error_restore_active_gate 中构造或驱动“error restore active gate”场景，并断言 DUT
+  //   的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_error_restore_active_gate();
     rdma_resource_manager manager;
     rdma_function_binding binding;
@@ -3744,6 +4290,10 @@ class rdma_resource_manager_test extends uvm_test;
                   manager.restore_active(pd.handle), RDMA_SC_INVALID_STATE);
   endtask
 
+  // 功能：在测试辅助 rdma_resource_manager_test.check_error_restore_ref_authority_gate 中构造或驱动“error restore ref authority
+  //   gate”场景，并断言 DUT 的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_error_restore_ref_authority_gate();
     rdma_resource_manager manager;
     rdma_function_binding binding;
@@ -4074,6 +4624,9 @@ class rdma_resource_manager_test extends uvm_test;
                   manager.restore_active(mr.handle), RDMA_SC_OK);
   endtask
 
+  // 功能：在 rdma_resource_manager_test 中由 same_handle_fields 逐字段比较输入值，返回结构、身份或序列化内容是否一致。
+  // 输入/输出及副作用：lhs（输入）、rhs（输入）；比较对象/数组只读；返回 bit 或状态结果，不更新 runtime、账本或外部 adapter。
+  // 失败/边界：same_handle_fields 的任一比较对象为空或类型不符时返回确定的 false/不等结果，不抛出未处理异常。
   function automatic bit same_handle_fields(rdma_handle lhs,
                                              rdma_handle rhs);
     if (lhs == null || rhs == null)
@@ -4084,6 +4637,9 @@ class rdma_resource_manager_test extends uvm_test;
            lhs.generation == rhs.generation;
   endfunction
 
+  // 功能：在 rdma_resource_manager_test 中由 same_status_fields 逐字段比较输入值，返回结构、身份或序列化内容是否一致。
+  // 输入/输出及副作用：lhs（输入）、rhs（输入）；比较对象/数组只读；返回 bit 或状态结果，不更新 runtime、账本或外部 adapter。
+  // 失败/边界：same_status_fields 的任一比较对象为空或类型不符时返回确定的 false/不等结果，不抛出未处理异常。
   function automatic bit same_status_fields(rdma_status lhs,
                                              rdma_status rhs);
     if (lhs == null || rhs == null)
@@ -4103,7 +4659,11 @@ class rdma_resource_manager_test extends uvm_test;
            lhs.message == rhs.message;
   endfunction
 
+  // 功能：在 rdma_resource_manager_test 中，run_phase 驱动 UVM 阶段中的场景初始化、事务执行和断言收尾，并在退出前释放 objection 或测试资源。
+  // 输入/输出及副作用：phase（输入）；phase 由 UVM 提供；task 通过 objection、日志和断言暴露结果，可能调用 DUT 接口但不改变其所有权规则。
+  // 失败/边界：run_phase 的 setup/阶段驱动失败时停止新增事务，并按测试生命周期清理 objection 与临时引用。
   task run_phase(uvm_phase phase);
+    rdma_status status;
     rdma_resource_manager rm;
     rdma_resource_manager dep_rm;
     rdma_resource_manager teardown_rm;
@@ -6205,8 +6765,11 @@ class rdma_resource_manager_test extends uvm_test;
     composite_function_pcie.bdf =
       '{segment:16'hc0a1, bus:8'h11, device:5'h12, function_num:3'h3};
     composite_function_pcie.parent_pf_bdf =
-      '{segment:16'hc0a2, bus:8'h21, device:5'h13, function_num:3'h4};
+      '{segment:16'hc0a1, bus:8'h21, device:5'h13, function_num:3'h4};
     composite_function_pcie.vf_index = 32'hc0a1_0a0a;
+    status = composite_function_binding.configure_identity_from_legacy_mirrors(
+      16'h0, 32'h1, RDMA_FUNCTION_VF, 16'h0a0a);
+    expect_status("COMPOSITE_FUNCTION_IDENTITY", status, RDMA_SC_OK);
     composite_function_pcie.mse = 1'b1;
     composite_function_pcie.bme = 1'b1;
     composite_function_binding.queue_dma.requester_bdf =
@@ -6296,11 +6859,11 @@ class rdma_resource_manager_test extends uvm_test;
         composite_function_pcie.bdf.bus != 8'h11 ||
         composite_function_pcie.bdf.device != 5'h12 ||
         composite_function_pcie.bdf.function_num != 3'h3 ||
-        composite_function_pcie.parent_pf_bdf.segment != 16'hc0a2 ||
+        composite_function_pcie.parent_pf_bdf.segment != 16'hc0a1 ||
         composite_function_pcie.parent_pf_bdf.bus != 8'h21 ||
         composite_function_pcie.parent_pf_bdf.device != 5'h13 ||
         composite_function_pcie.parent_pf_bdf.function_num != 3'h4 ||
-        composite_function_pcie.vf_index != 32'hc0a1_0a0a ||
+        composite_function_pcie.vf_index != 32'h0000_0a0a ||
         !composite_function_pcie.mse || !composite_function_pcie.bme)
       `uvm_error("COMPOSITE_FUNCTION_SOURCE",
                  "Function carrier hook ran or a source sentinel changed")
@@ -7711,6 +8274,7 @@ class rdma_resource_manager_test extends uvm_test;
                     privileged_recovery_pd.handle, recovery_lookup
                   ), RDMA_SC_STALE_GENERATION);
     privileged_recovery_binding.generation++;
+    privileged_recovery_binding.synchronize_identity_from_legacy_mirrors();
     privileged_recovery_binding.owner_h =
       privileged_recovery_binding.make_handle();
     expect_status("PRIV_RECOVERY_ID_REUSE",
@@ -7757,6 +8321,7 @@ class rdma_resource_manager_test extends uvm_test;
       RDMA_SC_RESET_CANCELLED, "Function generation advanced"
     );
     stale_recovery_binding.generation++;
+    stale_recovery_binding.synchronize_identity_from_legacy_mirrors();
     stale_recovery_binding.owner_h = stale_recovery_binding.make_handle();
     expect_status("STALE_RECOVERY_MARK_EXCEPTION",
                   stale_recovery_rm.mark_error(stale_recovery_h,
@@ -7795,6 +8360,7 @@ class rdma_resource_manager_test extends uvm_test;
     s = rm.\release (pd.handle);
     expect_status("RM_RELEASE_PD", s, RDMA_SC_OK);
     active_binding.generation++;
+    active_binding.synchronize_identity_from_legacy_mirrors();
     s = rm.lookup(old_h, resource);
     expect_status("RM_STALE_GENERATION", s, RDMA_SC_STALE_GENERATION);
 
@@ -7997,11 +8563,13 @@ class rdma_resource_manager_test extends uvm_test;
                   RDMA_SC_OK);
     rollback_h = clone_handle("ROLLBACK_H", rollback_pd.handle);
     rollback_binding.generation = 32'd42;
+    rollback_binding.synchronize_identity_from_legacy_mirrors();
     rollback_binding.owner_h = rollback_binding.make_handle();
     expect_status("ROLLBACK_A_STALE_AT_B",
                   rollback_rm.lookup(rollback_h, resource),
                   RDMA_SC_STALE_GENERATION);
     rollback_binding.generation = 32'd41;
+    rollback_binding.synchronize_identity_from_legacy_mirrors();
     rollback_binding.owner_h = rollback_binding.make_handle();
     expect_status("ROLLBACK_A_STAYS_STALE",
                   rollback_rm.lookup(rollback_h, resource),
@@ -8026,6 +8594,7 @@ class rdma_resource_manager_test extends uvm_test;
     generation_old_h = clone_handle("GENERATION_OLD_H",
                                     generation_pd.handle);
     binding_a.generation++;
+    binding_a.synchronize_identity_from_legacy_mirrors();
     binding_a.owner_h = binding_a.make_handle();
     expect_status("GENERATION_REJECT_OVERLAP",
                   generation_rm.create_pd(binding_a,
@@ -8309,6 +8878,7 @@ class rdma_resource_manager_test extends uvm_test;
     expect_status("FUNCTION_CYCLE_RELEASE_A",
                   function_cycle_rm.release_function(owner_h), RDMA_SC_OK);
     function_cycle_binding.generation = 32'd6;
+    function_cycle_binding.synchronize_identity_from_legacy_mirrors();
     function_cycle_binding.owner_h = function_cycle_binding.make_handle();
     expect_status("FUNCTION_CYCLE_CREATE_B",
                   function_cycle_rm.create_function(function_cycle_binding,

@@ -1,13 +1,25 @@
+// 目录：测试层 unit/rdma_model_test.sv。
+// 职责：验证 rdma_model_test 对应模块的接口、错误路径和边界行为。
+// 依赖：依赖被测 package、UVM 测试基类和必要的 mock/fixture。
+// 所有权与生命周期：测试对象只拥有本地 fixture；外部后端句柄由测试环境提供并在测试结束释放。
+
 // 中文说明：rdma_model_test.sv 属于单元测试，覆盖对应模型、编码器或执行器契约。
 // 阅读提示：先看公开类型和接口，再看实现细节；失败路径应保持状态与资源所有权可追踪。
 
 class rdma_model_test extends uvm_test;
   `uvm_component_utils(rdma_model_test)
 
+  // 功能：构造 rdma_model_test，调用 super.new 建立 UVM 层级对象；外部依赖字段保持未绑定，后续由 configure/build/activate 明确注入。
+  // 输入/输出及副作用：name、parent（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_model_test 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_model_test", uvm_component parent = null);
     super.new(name, parent);
   endfunction
 
+  // 功能：在 rdma_model_test 中，expect_status 在测试中执行 expect_status 断言，比较输入结果与期望状态并报告可定位的失败信息。
+  // 输入/输出及副作用：check_name（输入）、status（输入）、expected_code（输入）；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT
+  //   转移未声明的资源所有权。
+  // 失败/边界：测试函数 expect_status 缺少前置对象时报告断言错误，并停止依赖该对象的后续检查。
   function automatic void expect_status(
     string check_name,
     rdma_status status,
@@ -24,6 +36,9 @@ class rdma_model_test extends uvm_test;
                            status.convert2string()))
   endfunction
 
+  // 功能：make_valid_binding 创建独立的 rdma_function_binding；根据 name 设置字段 binding、binding.function_uid、binding.generation、binding.global_function_id、binding.rdma_vf_id、binding.vsi_id、binding.notify_table_sel、binding.notify_table_index、binding.host_id、binding.pfvf_id，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：name（输入）；make_valid_binding 读取 name 并使用字段 binding、binding.function_uid、binding.generation、binding.global_function_id、binding.rdma_vf_id、binding.vsi_id、binding.notify_table_sel、binding.notify_table_index；函数返回 rdma_function_binding，不取得调用方资源所有权。
+  // 失败/边界：make_valid_binding 的结果直接由 return binding 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function automatic rdma_function_binding make_valid_binding(string name);
     rdma_function_binding binding;
     rdma_interrupt_vector_binding vector;
@@ -40,9 +55,12 @@ class rdma_model_test extends uvm_test;
     binding.pfvf_id = 32'h9000_0707;
     binding.pcie.bdf = '{segment:16'h1001, bus:8'h20, device:5'h03,
                          function_num:3'h5};
-    binding.pcie.parent_pf_bdf = '{segment:16'h2002, bus:8'h30,
+    binding.pcie.parent_pf_bdf = '{segment:16'h1001, bus:8'h30,
                                    device:5'h04, function_num:3'h2};
     binding.pcie.vf_index = 32'h8000_8080;
+    if (!binding.configure_identity_from_legacy_mirrors(
+          16'h1, 32'h1, RDMA_FUNCTION_VF, 16'h8080).ok())
+      `uvm_error("BINDING", "legacy binding identity configuration failed")
     binding.pcie.bar[0].base.value = 64'h0000_0000_8000_0000;
     binding.pcie.bar[0].size = 64'h4000;
     binding.pcie.bar[0].enabled = 1'b1;
@@ -73,6 +91,9 @@ class rdma_model_test extends uvm_test;
     return binding;
   endfunction
 
+  // 功能：enable_active_binding 更新字段 binding.state、queue_dma.dma_domain_valid、pcie.mse、pcie.bme、binding.notify_valid、binding.notify_ready、binding.dmi_valid、binding.dmi_ready、binding.vft_valid、binding.vft_ready，并在提交前保持 Function authority、generation 和资源所有权约束。
+  // 输入/输出及副作用：binding（输入）；输入 action/epoch/handle 决定迁移目标；成功时更新状态或恢复证据，外部资源仍由其拥有者管理。
+  // 失败/边界：当前状态不允许、epoch/generation 过期或恢复证据不完整时返回错误；不得跳过隔离步骤。
   function automatic void enable_active_binding(rdma_function_binding binding);
     binding.state = RDMA_BIND_ACTIVE;
     binding.queue_dma.dma_domain_valid = 1'b1;
@@ -86,6 +107,9 @@ class rdma_model_test extends uvm_test;
     binding.vft_ready = 1'b1;
   endfunction
 
+  // 功能：make_valid_mapping 创建独立的 rdma_dma_mapping；根据 name、function_h、requester_bdf 设置字段 mapping、mapping.function_h、mapping.requester_bdf、mapping.pasid_valid、mapping.pasid、mapping.dma_domain_valid、mapping.dma_domain_id、backing_addr.value、iova.value、mapping.size，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：name（输入）、function_h（输入）、requester_bdf（输入）；make_valid_mapping 读取 name、function_h、requester_bdf 并使用字段 mapping、mapping.function_h、mapping.requester_bdf、mapping.pasid_valid、mapping.pasid、mapping.dma_domain_valid、mapping.dma_domain_id、backing_addr.value；函数返回 rdma_dma_mapping，不取得调用方资源所有权。
+  // 失败/边界：make_valid_mapping 的结果直接由 return mapping 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function automatic rdma_dma_mapping make_valid_mapping(
     string name,
     rdma_function_handle function_h,
@@ -110,6 +134,10 @@ class rdma_model_test extends uvm_test;
     return mapping;
   endfunction
 
+  // 功能：在测试辅助 rdma_model_test.check_mapping_access 中构造或驱动“mapping access”场景，并断言 DUT 的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：mapping（输入）、requested_function（输入）、requested_requester_bdf（输入）、first_iova（输入）、length（输入）、requested_direction（输入）、requested_permissions（输入）；fixture/输入由测试调用方提供；执行时会产生
+  //   UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：必需对象/句柄/快照为空，或身份、范围、generation 和生命周期检查失败时返回非成功状态。
   function automatic rdma_status check_mapping_access(
     rdma_dma_mapping mapping,
     rdma_function_handle requested_function,
@@ -127,6 +155,10 @@ class rdma_model_test extends uvm_test;
     );
   endfunction
 
+  // 功能：在测试辅助 rdma_model_test.check_binding_snapshot_value_semantics 中构造或驱动“binding snapshot value semantics”场景，并断言
+  //   DUT 的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   function automatic void check_binding_snapshot_value_semantics();
     rdma_function_binding source;
     rdma_function_binding destination;
@@ -159,6 +191,9 @@ class rdma_model_test extends uvm_test;
                  "assigned binding snapshots alias the source")
   endfunction
 
+  // 功能：在 rdma_model_test 中，run_phase 驱动 UVM 阶段中的场景初始化、事务执行和断言收尾，并在退出前释放 objection 或测试资源。
+  // 输入/输出及副作用：phase（输入）；phase 由 UVM 提供；task 通过 objection、日志和断言暴露结果，可能调用 DUT 接口但不改变其所有权规则。
+  // 失败/边界：run_phase 的 setup/阶段驱动失败时停止新增事务，并按测试生命周期清理 objection 与临时引用。
   task run_phase(uvm_phase phase);
     rdma_function_binding binding;
     rdma_function_binding binding_for_copy;

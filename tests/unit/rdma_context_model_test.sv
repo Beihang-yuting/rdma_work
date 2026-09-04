@@ -1,3 +1,8 @@
+// 目录：测试层 unit/rdma_context_model_test.sv。
+// 职责：验证 rdma_context_model_test 对应模块的接口、错误路径和边界行为。
+// 依赖：依赖被测 package、UVM 测试基类和必要的 mock/fixture。
+// 所有权与生命周期：测试对象只拥有本地 fixture；外部后端句柄由测试环境提供并在测试结束释放。
+
 // 中文说明：rdma_context_model_test.sv 属于单元测试，覆盖对应模型、编码器或执行器契约。
 // 阅读提示：先看公开类型和接口，再看实现细节；失败路径应保持状态与资源所有权可追踪。
 
@@ -7,11 +12,18 @@ class rdma_context_model_test extends uvm_test;
   localparam longint unsigned TEST_FUNCTION_UID = 64'h1122_3344_5566_7788;
   localparam int unsigned TEST_GENERATION = 32'd7;
 
+  // 功能：构造 rdma_context_model_test，调用 super.new 建立 UVM 层级对象；外部依赖字段保持未绑定，后续由 configure/build/activate 明确注入。
+  // 输入/输出及副作用：name、parent（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_context_model_test 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_context_model_test",
                uvm_component parent = null);
     super.new(name, parent);
   endfunction
 
+  // 功能：make_handle 创建独立的 rdma_handle；根据 name、kind、object_id、function_uid、generation 设置字段 handle、handle.kind、handle.function_uid、handle.object_id、handle.generation，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：name（输入）、kind（输入）、object_id（输入）、function_uid（输入）、generation（输入）；输入字段被复制到返回值或
+  //   output；生成结果与输入隔离，不隐式修改调用方对象。
+  // 失败/边界：make_handle 的结果直接由 return handle 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function rdma_handle make_handle(
     string name,
     rdma_resource_kind_e kind,
@@ -29,16 +41,25 @@ class rdma_context_model_test extends uvm_test;
     return handle;
   endfunction
 
+  // 功能：在 rdma_context_model_test 中，expect_ok 在测试中执行 expect_ok 断言，比较输入结果与期望状态并报告可定位的失败信息。
+  // 输入/输出及副作用：label（输入）、status（输入）；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：测试函数 expect_ok 缺少前置对象时报告断言错误，并停止依赖该对象的后续检查。
   function void expect_ok(string label, rdma_status status);
     if (status == null || !status.ok())
       `uvm_error(label, (status == null) ? "status is null" : status.message)
   endfunction
 
+  // 功能：在 rdma_context_model_test 中，expect_invalid 在测试中执行 expect_invalid 断言，比较输入结果与期望状态并报告可定位的失败信息。
+  // 输入/输出及副作用：label（输入）、status（输入）；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：测试函数 expect_invalid 缺少前置对象时报告断言错误，并停止依赖该对象的后续检查。
   function void expect_invalid(string label, rdma_status status);
     if (status == null || status.ok())
       `uvm_error(label, "invalid context topology was accepted")
   endfunction
 
+  // 功能：在 rdma_context_model_test 中，expect_invalid_argument 在测试中执行 expect_invalid_argument 断言，比较输入结果与期望状态并报告可定位的失败信息。
+  // 输入/输出及副作用：label（输入）、status（输入）；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：测试函数 expect_invalid_argument 缺少前置对象时报告断言错误，并停止依赖该对象的后续检查。
   function void expect_invalid_argument(string label, rdma_status status);
     if (status == null)
       `uvm_error(label, "invalid context topology returned null status")
@@ -48,6 +69,9 @@ class rdma_context_model_test extends uvm_test;
                            status.code.name(), status.convert2string()))
   endfunction
 
+  // 功能：make_page_layout 创建独立的 rdma_page_table_layout；根据 name 设置字段 layout、layout.mode、sd_base.value、current_base.value、layout.current_valid、next_base.value、layout.next_valid，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：name（输入）；make_page_layout 读取 name 并使用字段 layout、layout.mode、sd_base.value、current_base.value、layout.current_valid、next_base.value、layout.next_valid；函数返回 rdma_page_table_layout，不取得调用方资源所有权。
+  // 失败/边界：make_page_layout 的结果直接由 return layout 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function rdma_page_table_layout make_page_layout(string name);
     rdma_page_table_layout layout;
 
@@ -61,6 +85,9 @@ class rdma_context_model_test extends uvm_test;
     return layout;
   endfunction
 
+  // 功能：make_ring 创建独立的 rdma_ring_position；根据 name、index、wrap 设置字段 position、position.index、position.wrap，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：name（输入）、index（输入）、wrap（输入）；make_ring 读取 name、index、wrap 并使用字段 position、position.index、position.wrap；函数返回 rdma_ring_position，不取得调用方资源所有权。
+  // 失败/边界：make_ring 的结果直接由 return position 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function rdma_ring_position make_ring(
     string name,
     int unsigned index,
@@ -74,6 +101,9 @@ class rdma_context_model_test extends uvm_test;
     return position;
   endfunction
 
+  // 功能：make_address_vector 创建独立的 rdma_address_vector；根据 name 设置字段 vector、vector.source_address_index、vector.source_vport、vector.destination_vport、vector.destination_port、vector.destination_mac、vector.ipv6、vector.vlan_enable、vector.cfi、vector.lag_enable，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：name（输入）；make_address_vector 读取 name 并使用字段 vector、vector.source_address_index、vector.source_vport、vector.destination_vport、vector.destination_port、vector.destination_mac、vector.ipv6、vector.vlan_enable；函数返回 rdma_address_vector，不取得调用方资源所有权。
+  // 失败/边界：make_address_vector 的结果直接由 return vector 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function rdma_address_vector make_address_vector(string name);
     rdma_address_vector vector;
 
@@ -99,6 +129,9 @@ class rdma_context_model_test extends uvm_test;
     return vector;
   endfunction
 
+  // 功能：make_mr_page_layout 创建独立的 rdma_mr_page_layout；根据 name 设置字段 layout、layout.pbl_mode、layout.host_page_size、pba0.value、layout.pba1、layout.first_pbl_index、layout.address_mode、layout.odp、layout.invalidate_enable、layout.payload_vf_enable，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：name（输入）；make_mr_page_layout 读取 name 并使用字段 layout、layout.pbl_mode、layout.host_page_size、pba0.value、layout.pba1、layout.first_pbl_index、layout.address_mode、layout.odp；函数返回 rdma_mr_page_layout，不取得调用方资源所有权。
+  // 失败/边界：make_mr_page_layout 的结果直接由 return layout 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function rdma_mr_page_layout make_mr_page_layout(string name);
     rdma_mr_page_layout layout;
 
@@ -117,6 +150,9 @@ class rdma_context_model_test extends uvm_test;
     return layout;
   endfunction
 
+  // 功能：make_qpc 创建独立的 rdma_qpc_model；根据 name 设置字段 qpc、qpc.qp_h、qpc.pd_h、qpc.send_cq_h、qpc.recv_cq_h、qpc.srq_h、qpc.transport、qpc.state、qpc.host_id、qpc.vf_id，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：name（输入）；make_qpc 读取 name 并使用字段 qpc、qpc.qp_h、qpc.pd_h、qpc.send_cq_h、qpc.recv_cq_h、qpc.srq_h、qpc.transport、qpc.state；函数返回 rdma_qpc_model，不取得调用方资源所有权。
+  // 失败/边界：make_qpc 的结果直接由 return qpc 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function rdma_qpc_model make_qpc(string name);
     rdma_qpc_model qpc;
     rdma_qpc_rc_ext rc_ext;
@@ -168,6 +204,9 @@ class rdma_context_model_test extends uvm_test;
     return qpc;
   endfunction
 
+  // 功能：make_cqc 创建独立的 rdma_cqc_model；根据 name 设置字段 cqc、cqc.cq_h、cqc.ceq_h、cqc.state、cqc.depth、cqc.cqe_size_bytes、cqc.threshold、cqc.page_layout、cqc.producer、cqc.consumer，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：name（输入）；make_cqc 读取 name 并使用字段 cqc、cqc.cq_h、cqc.ceq_h、cqc.state、cqc.depth、cqc.cqe_size_bytes、cqc.threshold、cqc.page_layout；函数返回 rdma_cqc_model，不取得调用方资源所有权。
+  // 失败/边界：make_cqc 的结果直接由 return cqc 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function rdma_cqc_model make_cqc(string name);
     rdma_cqc_model cqc;
 
@@ -190,6 +229,9 @@ class rdma_context_model_test extends uvm_test;
     return cqc;
   endfunction
 
+  // 功能：make_mrt 创建独立的 rdma_mrt_model；根据 name 设置字段 mrt、mrt.mr_h、mrt.pd_h、mrt.state、iova.value、mrt.length、mrt.lkey、mrt.rkey、mrt.access、mrt.object_type，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：name（输入）；make_mrt 读取 name 并使用字段 mrt、mrt.mr_h、mrt.pd_h、mrt.state、iova.value、mrt.length、mrt.lkey、mrt.rkey；函数返回 rdma_mrt_model，不取得调用方资源所有权。
+  // 失败/边界：make_mrt 的结果直接由 return mrt 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function rdma_mrt_model make_mrt(string name);
     rdma_mrt_model mrt;
 
@@ -209,6 +251,9 @@ class rdma_context_model_test extends uvm_test;
     return mrt;
   endfunction
 
+  // 功能：make_srqc 创建独立的 rdma_srqc_model；根据 name 设置字段 srqc、srqc.srq_h、srqc.pd_h、srqc.state、srqc.depth、srqc.load_pi_threshold、srqc.limit_threshold、srqc.object_mode、srfq_backing.value、shadow_backing.value，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：name（输入）；make_srqc 读取 name 并使用字段 srqc、srqc.srq_h、srqc.pd_h、srqc.state、srqc.depth、srqc.load_pi_threshold、srqc.limit_threshold、srqc.object_mode；函数返回 rdma_srqc_model，不取得调用方资源所有权。
+  // 失败/边界：make_srqc 的结果直接由 return srqc 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function rdma_srqc_model make_srqc(string name);
     rdma_srqc_model srqc;
 
@@ -227,6 +272,9 @@ class rdma_context_model_test extends uvm_test;
     return srqc;
   endfunction
 
+  // 功能：make_ceqc 创建独立的 rdma_ceqc_model；根据 name 设置字段 ceqc、ceqc.ceq_h、ceqc.state、ceqc.depth、ceqc.vector_id、ceqc.page_layout、ceqc.producer、ceqc.consumer，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：name（输入）；make_ceqc 读取 name 并使用字段 ceqc、ceqc.ceq_h、ceqc.state、ceqc.depth、ceqc.vector_id、ceqc.page_layout、ceqc.producer、ceqc.consumer；函数返回 rdma_ceqc_model，不取得调用方资源所有权。
+  // 失败/边界：make_ceqc 的结果直接由 return ceqc 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function rdma_ceqc_model make_ceqc(string name);
     rdma_ceqc_model ceqc;
 
@@ -241,6 +289,9 @@ class rdma_context_model_test extends uvm_test;
     return ceqc;
   endfunction
 
+  // 功能：make_aeqc 创建独立的 rdma_aeqc_model；根据 name 设置字段 aeqc、aeqc.aeq_h、aeqc.state、aeqc.depth、aeqc.vector_id、aeqc.page_layout、aeqc.producer、aeqc.consumer，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：name（输入）；make_aeqc 读取 name 并使用字段 aeqc、aeqc.aeq_h、aeqc.state、aeqc.depth、aeqc.vector_id、aeqc.page_layout、aeqc.producer、aeqc.consumer；函数返回 rdma_aeqc_model，不取得调用方资源所有权。
+  // 失败/边界：make_aeqc 的结果直接由 return aeqc 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function rdma_aeqc_model make_aeqc(string name);
     rdma_aeqc_model aeqc;
 
@@ -255,6 +306,9 @@ class rdma_context_model_test extends uvm_test;
     return aeqc;
   endfunction
 
+  // 功能：在 rdma_context_model_test 中，run_phase 驱动 UVM 阶段中的场景初始化、事务执行和断言收尾，并在退出前释放 objection 或测试资源。
+  // 输入/输出及副作用：phase（输入）；phase 由 UVM 提供；task 通过 objection、日志和断言暴露结果，可能调用 DUT 接口但不改变其所有权规则。
+  // 失败/边界：run_phase 的 setup/阶段驱动失败时停止新增事务，并按测试生命周期清理 objection 与临时引用。
   task run_phase(uvm_phase phase);
     rdma_rdma_access_t access;
     rdma_dma_permission_t dma_permission;

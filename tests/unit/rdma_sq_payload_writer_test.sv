@@ -1,14 +1,25 @@
+// 目录：测试层 unit/rdma_sq_payload_writer_test.sv。
+// 职责：验证 rdma_sq_payload_writer_test 对应模块的接口、错误路径和边界行为。
+// 依赖：依赖被测 package、UVM 测试基类和必要的 mock/fixture。
+// 所有权与生命周期：测试对象只拥有本地 fixture；外部后端句柄由测试环境提供并在测试结束释放。
+
 // 中文说明：rdma_sq_payload_writer_test.sv 属于单元测试，覆盖对应模型、编码器或执行器契约。
 // 阅读提示：先看公开类型和接口，再看实现细节；失败路径应保持状态与资源所有权可追踪。
 
 class rdma_sq_payload_writer_test extends uvm_test;
   `uvm_component_utils(rdma_sq_payload_writer_test)
 
+  // 功能：构造 rdma_sq_payload_writer_test，调用 super.new 建立 UVM 层级对象；外部依赖字段保持未绑定，后续由 configure/build/activate 明确注入。
+  // 输入/输出及副作用：name、parent（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_sq_payload_writer_test 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_sq_payload_writer_test",
                uvm_component parent = null);
     super.new(name, parent);
   endfunction
 
+  // 功能：make_binding 创建独立的 rdma_function_binding；根据 name 设置字段 result、result.function_uid、result.generation、result.global_function_id、pcie.bdf、queue_dma.requester_bdf、queue_dma.pasid_valid、queue_dma.pasid、queue_dma.dma_domain_valid、queue_dma.dma_domain_id，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：name（输入）；make_binding 读取 name 并使用字段 result、result.function_uid、result.generation、result.global_function_id、pcie.bdf、queue_dma.requester_bdf、queue_dma.pasid_valid、queue_dma.pasid；函数返回 rdma_function_binding，不取得调用方资源所有权。
+  // 失败/边界：make_binding 下游操作失败时原样传播其 status/result，不伪造成功；该路径不隐式重试，也不转移未声明资源。
   function automatic rdma_function_binding make_binding(string name);
     rdma_function_binding result;
     result = rdma_function_binding::type_id::create(name);
@@ -17,6 +28,9 @@ class rdma_sq_payload_writer_test extends uvm_test;
     result.global_function_id = 32'h9000_0101;
     result.pcie.bdf = '{segment:16'h1001, bus:8'h20, device:5'h03,
                         function_num:3'h5};
+    if (!result.configure_identity_from_legacy_mirrors(
+          16'h0, 32'h1, RDMA_FUNCTION_PF).ok())
+      `uvm_error("BINDING", "legacy binding identity configuration failed")
     result.queue_dma.requester_bdf = result.pcie.bdf;
     result.queue_dma.pasid_valid = 1'b1;
     result.queue_dma.pasid = 20'habcde;
@@ -26,6 +40,9 @@ class rdma_sq_payload_writer_test extends uvm_test;
     return result;
   endfunction
 
+  // 功能：make_context 创建独立的 rdma_dma_request_context；根据 binding、name 设置字段 result、result.function_h、result.requester_bdf、result.pasid_valid、result.pasid、result.dma_domain_valid、result.dma_domain_id，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：binding（输入）、writer_context（输入）；make_context 读取 binding、name 并使用字段 result、result.function_h、result.requester_bdf、result.pasid_valid、result.pasid、result.dma_domain_valid、result.dma_domain_id；函数返回 rdma_dma_request_context，不取得调用方资源所有权。
+  // 失败/边界：make_context 下游操作失败时原样传播其 status/result，不伪造成功；该路径不隐式重试，也不转移未声明资源。
   function automatic rdma_dma_request_context make_context(
     rdma_function_binding binding,
     string name = "writer_context"
@@ -41,6 +58,9 @@ class rdma_sq_payload_writer_test extends uvm_test;
     return result;
   endfunction
 
+  // 功能：make_sge 创建独立的 rdma_sge；根据 name、iova、length 设置字段 result、iova.value、result.length，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：name（输入）、iova（输入）、length（输入）；make_sge 读取 name、iova、length 并使用字段 result、iova.value、result.length；函数返回 rdma_sge，不取得调用方资源所有权。
+  // 失败/边界：make_sge 下游操作失败时原样传播其 status/result，不伪造成功；该路径不隐式重试，也不转移未声明资源。
   function automatic rdma_sge make_sge(string name,
                                         longint unsigned iova,
                                         longint unsigned length);
@@ -51,6 +71,9 @@ class rdma_sq_payload_writer_test extends uvm_test;
     return result;
   endfunction
 
+  // 功能：判断 count_calls 对应的状态、能力或账本条件，并返回确定的布尔/计数结果，不修改状态。
+  // 输入/输出及副作用：memory（输入）、method_name（输入）；count_calls 读取 memory、method_name 并使用字段 result；函数返回 int，不取得调用方资源所有权。
+  // 失败/边界：count_calls 只读取现有账本；输入未初始化时返回保守结果，不得借助默认 Function/root 猜测。
   function automatic int count_calls(rdma_mock_host_mem memory,
                                       string method_name);
     int result;
@@ -61,6 +84,9 @@ class rdma_sq_payload_writer_test extends uvm_test;
     return result;
   endfunction
 
+  // 功能：在 rdma_sq_payload_writer_test 中，expect_code 在测试中执行 expect_code 断言，比较输入结果与期望状态并报告可定位的失败信息。
+  // 输入/输出及副作用：label（输入）、status（输入）、expected（输入）；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：测试函数 expect_code 缺少前置对象时报告断言错误，并停止依赖该对象的后续检查。
   function automatic void expect_code(string label, rdma_status status,
                                        rdma_status_code_e expected);
     if (status == null || status.code != expected)
@@ -69,12 +95,18 @@ class rdma_sq_payload_writer_test extends uvm_test;
                                   status.convert2string()))
   endfunction
 
+  // 功能：在 rdma_sq_payload_writer_test 中，expect_ok 在测试中执行 expect_ok 断言，比较输入结果与期望状态并报告可定位的失败信息。
+  // 输入/输出及副作用：label（输入）、status（输入）；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：测试函数 expect_ok 缺少前置对象时报告断言错误，并停止依赖该对象的后续检查。
   function automatic void expect_ok(string label, rdma_status status);
     if (status == null || !status.ok())
       `uvm_error(label, status == null ? "null status" :
                  status.convert2string())
   endfunction
 
+  // 功能：在 rdma_sq_payload_writer_test 中，run_phase 驱动 UVM 阶段中的场景初始化、事务执行和断言收尾，并在退出前释放 objection 或测试资源。
+  // 输入/输出及副作用：phase（输入）；phase 由 UVM 提供；task 通过 objection、日志和断言暴露结果，可能调用 DUT 接口但不改变其所有权规则。
+  // 失败/边界：run_phase 的 setup/阶段驱动失败时停止新增事务，并按测试生命周期清理 objection 与临时引用。
   task run_phase(uvm_phase phase);
     rdma_function_binding binding;
     rdma_dma_request_context request_context;

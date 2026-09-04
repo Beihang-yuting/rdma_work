@@ -1,3 +1,8 @@
+// 目录：核心执行层 core/rdma_resource_manager.sv。
+// 职责：实现 rdma_resource_manager 在本层的职责和对外接口。
+// 依赖：依赖本层公共 types/model/adapter 契约及其上游快照。
+// 所有权与生命周期：对象只拥有显式创建的值快照；外部资源保存非拥有引用，生命周期由调用方管理。
+
 // 中文说明：rdma_resource_manager.sv 属于核心执行层，负责队列、控制面、资源和恢复流程。
 // 阅读提示：先看公开类型和接口，再看实现细节；失败路径应保持状态与资源所有权可追踪。
 
@@ -35,10 +40,16 @@ class rdma_resource_manager extends uvm_object;
   // reused QPN receives the next sequence value.
   protected bit [7:0] qp_sequences[string];
 
+  // 功能：构造 rdma_resource_manager，调用 super.new 建立 UVM 层级对象；外部依赖字段保持未绑定，后续由 configure/build/activate 明确注入。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_resource_manager 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_resource_manager");
     super.new(name);
   endfunction
 
+  // 功能：判断 valid_kind 对应的状态、能力或账本条件，并返回确定的布尔/计数结果，不修改状态。
+  // 输入/输出及副作用：kind（输入）；valid_kind 读取 kind 并使用输入参数和固定枚举/常量；函数返回 bit，不取得调用方资源所有权。
+  // 失败/边界：valid_kind 只读取现有账本；输入未初始化时返回保守结果，不得借助默认 Function/root 猜测。
   protected function bit valid_kind(rdma_resource_kind_e kind);
     return kind inside {RDMA_RESOURCE_FUNCTION, RDMA_RESOURCE_PD,
                         RDMA_RESOURCE_MR, RDMA_RESOURCE_CQ,
@@ -47,6 +58,9 @@ class rdma_resource_manager extends uvm_object;
                         RDMA_RESOURCE_AEQ};
   endfunction
 
+  // 功能：在 rdma_resource_manager 中，local_id_limit 根据资源 kind 返回 Function 内可分配 local ID 的上限，供容量和越界检查使用。
+  // 输入/输出及副作用：kind（输入）；local_id_limit 读取 kind 并使用字段 ；函数返回 int unsigned，不取得调用方资源所有权。
+  // 失败/边界：local_id_limit 按 case(kind) 的固定映射计算 int unsigned（RDMA_RESOURCE_PD→16'hffff；RDMA_RESOURCE_MR→24'hff_ffff；RDMA_RESOURCE_CQ→21'h1f_ffff；RDMA_RESOURCE_QP→21'h1f_ffff；其余 case 分支按源码继续映射；default→32'hffff_ffff）；未列出的输入走 default，不修改运行时账本。
   protected function int unsigned local_id_limit(
     rdma_resource_kind_e kind
   );
@@ -62,6 +76,9 @@ class rdma_resource_manager extends uvm_object;
     endcase
   endfunction
 
+  // 功能：local_id_status 校验 kind、has_free_id 与当前对象状态的一致性，并显式处理“resource free-list local ID exceeds the hardware width”；“resource local ID pool is exhausted”等拒绝条件，返回 rdma_status 供上层决定是否提交。
+  // 输入/输出及副作用：kind（输入）、has_free_id（输出）；local_id_status 读取 kind、has_free_id 并使用字段 limit、has_free_id，并写入 has_free_id；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：local_id_status 返回 RDMA_SC_RESOURCE_EXHAUSTED；具体拒绝条件包括 “resource free-list local ID exceeds the hardware width”；“resource local ID pool is exhausted”；失败路径不提交部分状态、不隐式重试，也不转移未声明资源。
   protected function rdma_status local_id_status(
     rdma_resource_kind_e kind,
     output bit has_free_id
@@ -86,6 +103,10 @@ class rdma_resource_manager extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：consume_local_id 使用 kind、has_free_id、local_id 执行函数体规定的状态更新；不修改未列出的对象字段或外部资源。
+  // 输入/输出及副作用：kind（输入）、has_free_id（输入）、local_id（输出）；输入 handle/key/cursor 用于选择读取范围；返回值或 output 为 detached
+  //   快照，读取不取得外部资源所有权。
+  // 失败/边界：consume_local_id 无返回值，仅执行 local_id=free_local_ids[kind].pop_front()、limit=local_id_limit(kind)、local_id=next_local_id[kind]；调用方须保证前置依赖已经绑定，函数不自动重试或接管外部资源。
   protected function void consume_local_id(
     rdma_resource_kind_e kind,
     bit has_free_id,
@@ -105,19 +126,31 @@ class rdma_resource_manager extends uvm_object;
       next_local_id[kind]++;
   endfunction
 
+  // 功能：在 rdma_resource_manager 中，resource_key 把 Function/对象身份、代际和游标字段拼成稳定的查找键，供登记表去重和恢复路由使用。
+  // 输入/输出及副作用：handle（输入）；resource_key 读取 handle 并使用输入参数和固定枚举/常量；函数返回 string，不取得调用方资源所有权。
+// 失败/边界：resource_key 只按函数体列出的身份、generation、kind、object_id 或 cursor 字段拼接键；调用方须先完成空句柄校验，函数本身不分配资源、不自动回退到 root0。
   protected function string resource_key(rdma_handle handle);
     return $sformatf("%016h:%08h:%01h:%08h", handle.function_uid,
                      handle.generation, handle.kind, handle.object_id);
   endfunction
 
+  // 功能：在 rdma_resource_manager 中，incarnation_key 把 Function/对象身份、代际和游标字段拼成稳定的查找键，供登记表去重和恢复路由使用。
+  // 输入/输出及副作用：handle（输入）；incarnation_key 读取 handle 并使用输入参数和固定枚举/常量；函数返回 string，不取得调用方资源所有权。
+// 失败/边界：incarnation_key 只按函数体列出的身份、generation、kind、object_id 或 cursor 字段拼接键；调用方须先完成空句柄校验，函数本身不分配资源、不自动回退到 root0。
   protected function string incarnation_key(rdma_handle handle);
     return resource_key(handle);
   endfunction
 
+  // 功能：在 rdma_resource_manager 中，function_key 把 Function/对象身份、代际和游标字段拼成稳定的查找键，供登记表去重和恢复路由使用。
+  // 输入/输出及副作用：owner（输入）；function_key 读取 owner 并使用输入参数和固定枚举/常量；函数返回 string，不取得调用方资源所有权。
+// 失败/边界：function_key 只按函数体列出的身份、generation、kind、object_id 或 cursor 字段拼接键；调用方须先完成空句柄校验，函数本身不分配资源、不自动回退到 root0。
   protected function string function_key(rdma_function_handle owner);
     return $sformatf("%016h:%08h", owner.function_uid, owner.object_id);
   endfunction
 
+  // 功能：在 rdma_resource_manager 中，function_generation_key 把 Function/对象身份、代际和游标字段拼成稳定的查找键，供登记表去重和恢复路由使用。
+  // 输入/输出及副作用：owner（输入）；function_generation_key 读取 owner 并使用输入参数和固定枚举/常量；函数返回 string，不取得调用方资源所有权。
+// 失败/边界：function_generation_key 只按函数体列出的身份、generation、kind、object_id 或 cursor 字段拼接键；调用方须先完成空句柄校验，函数本身不分配资源、不自动回退到 root0。
   protected function string function_generation_key(
     rdma_function_handle owner
   );
@@ -125,6 +158,9 @@ class rdma_resource_manager extends uvm_object;
                      owner.object_id, owner.generation);
   endfunction
 
+  // 功能：在 rdma_resource_manager 中，qp_sequence_key 把 Function/对象身份、代际和游标字段拼成稳定的查找键，供登记表去重和恢复路由使用。
+  // 输入/输出及副作用：owner（输入）、local_qpn（输入）；qp_sequence_key 读取 owner、local_qpn 并使用输入参数和固定枚举/常量；函数返回 string，不取得调用方资源所有权。
+// 失败/边界：qp_sequence_key 只按函数体列出的身份、generation、kind、object_id 或 cursor 字段拼接键；调用方须先完成空句柄校验，函数本身不分配资源、不自动回退到 root0。
   protected function string qp_sequence_key(
     rdma_function_handle owner,
     int unsigned local_qpn
@@ -140,6 +176,9 @@ class rdma_resource_manager extends uvm_object;
   // exception: its concrete clone carries opaque adapter release authority and
   // is accepted only through the checked contract below.  Future extension
   // support requires another explicit trusted adapter here.
+  // 功能：在 rdma_resource_manager 中，project_handle_value 从输入对象提取受控字段并返回 detached 投影，阻断调用方通过别名修改 authority。
+  // 输入/输出及副作用：source（输入）、copy_label（输入）、result（输出）；project_handle_value 读取 source、copy_label、result 并使用字段 result、result_function、result.kind、result.function_uid、result.object_id、result.generation，并写入 result；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：project_handle_value 返回 RDMA_SC_INVALID_ARGUMENT；失败路径不提交部分状态或转移未声明资源。
   protected function rdma_status project_handle_value(
     rdma_handle source,
     string copy_label,
@@ -170,6 +209,9 @@ class rdma_resource_manager extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：在 rdma_resource_manager 中，project_function_handle_value 从输入对象提取受控字段并返回 detached 投影，阻断调用方通过别名修改 authority。
+  // 输入/输出及副作用：source（输入）、copy_label（输入）、result（输出）；project_function_handle_value 读取 source、copy_label、result 并使用字段 result、result.kind、result.function_uid、result.object_id、result.generation，并写入 result；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：project_function_handle_value 先检查 source == null，再返回 rdma_status::success()；拒绝分支不提交部分状态，也不隐式重试。
   protected function rdma_status project_function_handle_value(
     rdma_function_handle source,
     string copy_label,
@@ -186,6 +228,9 @@ class rdma_resource_manager extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：在 rdma_resource_manager 中，project_mapping_value 从输入对象提取受控字段并返回 detached 投影，阻断调用方通过别名修改 authority。
+  // 输入/输出及副作用：source（输入）、copy_label（输入）、result（输出）；project_mapping_value 读取 source、copy_label、result 并使用字段 result、status、result.requester_bdf、result.pasid_valid、result.pasid、result.dma_domain_valid、result.dma_domain_id、result.backing_addr，并写入 result；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：project_mapping_value 下游操作失败时原样传播其 status/result，不伪造成功；该路径不隐式重试，也不转移未声明资源。
   protected function rdma_status project_mapping_value(
     rdma_dma_mapping source,
     string copy_label,
@@ -224,6 +269,9 @@ class rdma_resource_manager extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：在 rdma_resource_manager 中由 same_mapping_handle_value 逐字段比较输入值，返回结构、身份或序列化内容是否一致。
+  // 输入/输出及副作用：lhs（输入）、rhs（输入）；比较对象/数组只读；返回 bit 或状态结果，不更新 runtime、账本或外部 adapter。
+  // 失败/边界：same_mapping_handle_value 的任一比较对象为空或类型不符时返回确定的 false/不等结果，不抛出未处理异常。
   protected function bit same_mapping_handle_value(
     rdma_handle lhs,
     rdma_handle rhs
@@ -236,6 +284,9 @@ class rdma_resource_manager extends uvm_object;
            lhs.generation == rhs.generation;
   endfunction
 
+  // 功能：在 rdma_resource_manager 中由 same_mapping_release_fields 逐字段比较输入值，返回结构、身份或序列化内容是否一致。
+  // 输入/输出及副作用：lhs（输入）、rhs（输入）；比较对象/数组只读；返回 bit 或状态结果，不更新 runtime、账本或外部 adapter。
+  // 失败/边界：same_mapping_release_fields 的任一比较对象为空或类型不符时返回确定的 false/不等结果，不抛出未处理异常。
   protected function bit same_mapping_release_fields(
     rdma_dma_mapping lhs,
     rdma_dma_mapping rhs
@@ -256,6 +307,9 @@ class rdma_resource_manager extends uvm_object;
            same_mapping_handle_value(lhs.owner_h, rhs.owner_h);
   endfunction
 
+  // 功能：在 rdma_resource_manager 中由 same_mapping_value 逐字段比较输入值，返回结构、身份或序列化内容是否一致。
+  // 输入/输出及副作用：lhs（输入）、rhs（输入）；比较对象/数组只读；返回 bit 或状态结果，不更新 runtime、账本或外部 adapter。
+  // 失败/边界：same_mapping_value 的任一比较对象为空或类型不符时返回确定的 false/不等结果，不抛出未处理异常。
   protected function bit same_mapping_value(
     rdma_dma_mapping lhs,
     rdma_dma_mapping rhs
@@ -271,6 +325,9 @@ class rdma_resource_manager extends uvm_object;
   // resource and recovery projections can therefore legitimately differ
   // (ACTIVE versus RELEASED) even though all authority-bearing values remain
   // identical.  Completion is checked through the adapter query separately.
+  // 功能：在 rdma_resource_manager 中由 same_recovery_mapping_value 逐字段比较输入值，返回结构、身份或序列化内容是否一致。
+  // 输入/输出及副作用：lhs（输入）、rhs（输入）；比较对象/数组只读；返回 bit 或状态结果，不更新 runtime、账本或外部 adapter。
+  // 失败/边界：same_recovery_mapping_value 的任一比较对象为空或类型不符时返回确定的 false/不等结果，不抛出未处理异常。
   protected function bit same_recovery_mapping_value(
     rdma_dma_mapping lhs,
     rdma_dma_mapping rhs
@@ -280,6 +337,9 @@ class rdma_resource_manager extends uvm_object;
     return same_mapping_release_fields(lhs, rhs);
   endfunction
 
+  // 功能：在 rdma_resource_manager 中，mapping_handles_detached 逐字段核对快照、嵌套引用和 authority 值，确认复制结果既等值又无可变别名。
+  // 输入/输出及副作用：lhs（输入）、rhs（输入）；mapping_handles_detached 读取 lhs、rhs 并使用输入参数和固定枚举/常量；函数返回 bit，不取得调用方资源所有权。
+  // 失败/边界：mapping_handles_detached 比较或前置条件不满足时返回 0/false；该路径不隐式重试，也不转移未声明资源。
   protected function bit mapping_handles_detached(
     rdma_dma_mapping lhs,
     rdma_dma_mapping rhs
@@ -292,6 +352,9 @@ class rdma_resource_manager extends uvm_object;
             lhs.owner_h != rhs.owner_h);
   endfunction
 
+  // 功能：在 rdma_resource_manager 中，mapping_hook_value_intact 逐字段核对快照、嵌套引用和 authority 值，确认复制结果既等值又无可变别名。
+  // 输入/输出及副作用：current（输入）、saved（输入）、expected_type（输入）；mapping_hook_value_intact 读取 current、saved、expected_type 并使用字段 current_type；函数返回 bit，不取得调用方资源所有权。
+  // 失败/边界：mapping_hook_value_intact 比较或前置条件不满足时返回 0/false；该路径不隐式重试，也不转移未声明资源。
   protected function bit mapping_hook_value_intact(
     rdma_dma_mapping current,
     rdma_dma_mapping saved,
@@ -308,6 +371,10 @@ class rdma_resource_manager extends uvm_object;
            mapping_handles_detached(current, saved);
   endfunction
 
+  // 功能：在 rdma_resource_manager 中，owned_mapping_hook_graph_intact 逐字段核对快照、嵌套引用和 authority 值，确认复制结果既等值又无可变别名。
+  // 输入/输出及副作用：source（输入）、result（输入）、saved_value（输入）、source_type（输入）、authority_snapshot（输入）、saved_authority（输入）、authority_type（输入）；owned_mapping_hook_graph_intact 读取 source、result、saved_value、source_type、authority_snapshot、saved_authority、authority_type 并使用输入参数和固定枚举/常量；函数返回 bit，不取得调用方资源所有权。
+
+  // 失败/边界：owned_mapping_hook_graph_intact 只读输入并返回 bit；边界由函数体现有分支决定，不修改状态或转移资源。
   protected function bit owned_mapping_hook_graph_intact(
     rdma_dma_mapping source,
     rdma_dma_mapping result,
@@ -331,6 +398,9 @@ class rdma_resource_manager extends uvm_object;
   // An owned mapping is also the adapter's release capability.  Preserve its
   // concrete value type while treating clone() as an untrusted boundary: the
   // clone must be registered, exact-type, detached, and value preserving.
+  // 功能：在 rdma_resource_manager 中，clone_owned_mapping_value 将 rhs 中 rdma_resource_manager 的值字段复制到当前对象，建立与源对象隔离的快照。
+  // 输入/输出及副作用：source（输入）、copy_label（输入）、result（输出）；clone_owned_mapping_value 读取 source、copy_label、result 并使用字段 result、status、source_type、authority_type、cloned_object、result_type，并写入 result；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：clone_owned_mapping_value 返回 RDMA_SC_INVALID_ARGUMENT；失败路径不提交部分状态或转移未声明资源。
   protected function rdma_status clone_owned_mapping_value(
     rdma_dma_mapping source,
     string copy_label,
@@ -440,6 +510,9 @@ class rdma_resource_manager extends uvm_object;
   // opaque authority snapshot from the authoritative mapping and require the
   // recovery mapping to accept it, while retaining the same type, value, and
   // alias guards used by the owned clone boundary.
+  // 功能：在 rdma_resource_manager 中由 same_owned_mapping_authority 逐字段比较输入值，返回结构、身份或序列化内容是否一致。
+  // 输入/输出及副作用：authoritative（输入）、recovery（输入）；比较对象/数组只读；返回 bit 或状态结果，不更新 runtime、账本或外部 adapter。
+  // 失败/边界：same_owned_mapping_authority 的任一比较对象为空或类型不符时返回确定的 false/不等结果，不抛出未处理异常。
   protected function bit same_owned_mapping_authority(
     rdma_dma_mapping authoritative,
     rdma_dma_mapping recovery
@@ -489,6 +562,9 @@ class rdma_resource_manager extends uvm_object;
            );
   endfunction
 
+  // 功能：在 rdma_resource_manager 中由 same_queue_backing_ref_value 逐字段比较输入值，返回结构、身份或序列化内容是否一致。
+  // 输入/输出及副作用：lhs（输入）、rhs（输入）；比较对象/数组只读；返回 bit 或状态结果，不更新 runtime、账本或外部 adapter。
+  // 失败/边界：same_queue_backing_ref_value 的任一比较对象为空或类型不符时返回确定的 false/不等结果，不抛出未处理异常。
   protected function bit same_queue_backing_ref_value(
     rdma_queue_backing_ref lhs,
     rdma_queue_backing_ref rhs
@@ -521,6 +597,9 @@ class rdma_resource_manager extends uvm_object;
     return 1'b1;
   endfunction
 
+  // 功能：在 rdma_resource_manager 中由 same_owned_queue_backing_ref_authority 逐字段比较输入值，返回结构、身份或序列化内容是否一致。
+  // 输入/输出及副作用：authoritative（输入）、recovery（输入）；比较对象/数组只读；返回 bit 或状态结果，不更新 runtime、账本或外部 adapter。
+  // 失败/边界：same_owned_queue_backing_ref_authority 的任一比较对象为空或类型不符时返回确定的 false/不等结果，不抛出未处理异常。
   protected function bit same_owned_queue_backing_ref_authority(
     rdma_queue_backing_ref authoritative,
     rdma_queue_backing_ref recovery
@@ -549,6 +628,9 @@ class rdma_resource_manager extends uvm_object;
     return 1'b1;
   endfunction
 
+  // 功能：在 rdma_resource_manager 中由 same_queue_ring_value 逐字段比较输入值，返回结构、身份或序列化内容是否一致。
+  // 输入/输出及副作用：lhs（输入）、rhs（输入）；比较对象/数组只读；返回 bit 或状态结果，不更新 runtime、账本或外部 adapter。
+  // 失败/边界：same_queue_ring_value 的任一比较对象为空或类型不符时返回确定的 false/不等结果，不抛出未处理异常。
   protected function bit same_queue_ring_value(
     rdma_queue_ring_layout lhs,
     rdma_queue_ring_layout rhs
@@ -576,6 +658,9 @@ class rdma_resource_manager extends uvm_object;
     return 1'b1;
   endfunction
 
+  // 功能：在 rdma_resource_manager 中由 same_released_queue_context_value 逐字段比较输入值，返回结构、身份或序列化内容是否一致。
+  // 输入/输出及副作用：authoritative（输入）、candidate（输入）；比较对象/数组只读；返回 bit 或状态结果，不更新 runtime、账本或外部 adapter。
+  // 失败/边界：same_released_queue_context_value 的任一比较对象为空或类型不符时返回确定的 false/不等结果，不抛出未处理异常。
   protected function bit same_released_queue_context_value(
     rdma_context_backing_ref authoritative,
     rdma_context_backing_ref candidate
@@ -616,6 +701,9 @@ class rdma_resource_manager extends uvm_object;
     return 1'b1;
   endfunction
 
+  // 功能：在 rdma_resource_manager 中，canonical_queue_reservation_release_recovery 规范化输入 key/恢复记录并检查必需字段，使同一语义对象只产生一种登记表示。
+  // 输入/输出及副作用：recovery（输入）；canonical_queue_reservation_release_recovery 读取 recovery 并使用字段 backing_completed；函数返回 bit，不取得调用方资源所有权。
+  // 失败/边界：canonical_queue_reservation_release_recovery 比较或前置条件不满足时返回 0/false；该路径不隐式重试，也不转移未声明资源。
   protected function bit canonical_queue_reservation_release_recovery(
     rdma_recovery_record recovery
   );
@@ -636,6 +724,9 @@ class rdma_resource_manager extends uvm_object;
     return backing_completed == 1;
   endfunction
 
+  // 功能：queue_reservation_release_plan_status 校验 authoritative、candidate 与当前对象状态的一致性，并显式处理“queue reservation recovery plan shape changed”；“queue reservation recovery ring authority changed”；“queue reservation recovery backing authority changed”；“queue reservation recovery owned backing is not released”；“queue reservation recovery backing lacks completion proof”等拒绝条件，返回 rdma_status 供上层决定是否提交。
+  // 输入/输出及副作用：authoritative（输入）、candidate（输入）；queue_reservation_release_plan_status 读取 authoritative、candidate 并使用字段 status；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：queue_reservation_release_plan_status 返回 RDMA_SC_INVALID_ARGUMENT；具体拒绝条件包括 “queue reservation recovery plan shape changed”；“queue reservation recovery ring authority changed”；“queue reservation recovery backing authority changed”；“queue reservation recovery owned backing is not released”；“queue reservation recovery backing lacks completion proof”；失败路径不提交部分状态、不隐式重试，也不转移未声明资源。
   protected function rdma_status queue_reservation_release_plan_status(
     rdma_queue_backing_plan authoritative,
     rdma_queue_backing_plan candidate
@@ -817,6 +908,9 @@ class rdma_resource_manager extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：queue_local_release_plan_status 校验 candidate 与当前对象状态的一致性，并显式处理“queue local release plan is missing”等拒绝条件，返回 rdma_status 供上层决定是否提交。
+  // 输入/输出及副作用：candidate（输入）；queue_local_release_plan_status 读取 candidate 并使用字段 status；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：queue_local_release_plan_status 返回 RDMA_SC_INVALID_ARGUMENT；典型拒绝条件为“queue local release plan is missing”“queue local release backing is missing”；失败路径不提交部分状态或转移未声明资源。
   protected function rdma_status queue_local_release_plan_status(
     rdma_queue_backing_plan candidate
   );
@@ -966,6 +1060,9 @@ class rdma_resource_manager extends uvm_object;
   // Completion is an adapter-defined opaque fact.  Invoke its virtual query
   // only on an authority-preserving clone, and reject any public value, type,
   // or handle-alias mutation at the hook boundary.
+  // 功能：在 rdma_resource_manager 中，query_owned_release_completion 按完整 key/handle 查找唯一权威记录并返回 detached 快照，避免把内部可变引用泄露给调用方。
+  // 输入/输出及副作用：mapping（输入）、release_complete（输出）；query_owned_release_completion 读取 mapping、release_complete 并使用字段 release_complete、mapping_type、status、query_type，并写入 release_complete；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：query_owned_release_completion 在 key/handle 缺失、记录不唯一或 generation/reset epoch 过期时返回明确错误，不回退到默认 authority。
   function rdma_status query_owned_release_completion(
     rdma_dma_mapping mapping,
     output bit release_complete
@@ -1036,6 +1133,9 @@ class rdma_resource_manager extends uvm_object;
   // normal snapshot/equivalence hooks are unavailable or have rejected the
   // allocation.  Query completion on a guarded concrete clone so the opaque
   // adapter seal remains authoritative without reopening those hooks.
+  // 功能：在 rdma_resource_manager 中，query_qp_recovery_release_completion 按完整 key/handle 查找唯一权威记录并返回 detached 快照，避免把内部可变引用泄露给调用方。
+  // 输入/输出及副作用：mapping（输入）、release_complete（输出）；query_qp_recovery_release_completion 读取 mapping、release_complete 并使用字段 release_complete、status，并写入 release_complete；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：query_qp_recovery_release_completion 在 key/handle 缺失、记录不唯一或 generation/reset epoch 过期时返回明确错误，不回退到默认 authority。
   protected function rdma_status query_qp_recovery_release_completion(
     rdma_dma_mapping mapping,
     output bit release_complete
@@ -1076,6 +1176,9 @@ class rdma_resource_manager extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：在 rdma_resource_manager 中，project_backing_ref_value 从输入对象提取受控字段并返回 detached 投影，阻断调用方通过别名修改 authority。
+  // 输入/输出及副作用：source（输入）、copy_label（输入）、result（输出）；project_backing_ref_value 读取 source、copy_label、result 并使用字段 result、result.mapping、status、result.ownership、result.release_complete，并写入 result；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：project_backing_ref_value 返回 RDMA_SC_INVALID_STATE；失败路径不提交部分状态或转移未声明资源。
   protected function rdma_status project_backing_ref_value(
     rdma_backing_ref source,
     string copy_label,
@@ -1115,6 +1218,9 @@ class rdma_resource_manager extends uvm_object;
     return status;
   endfunction
 
+  // 功能：在 rdma_resource_manager 中，project_hmc_ref_value 从输入对象提取受控字段并返回 detached 投影，阻断调用方通过别名修改 authority。
+  // 输入/输出及副作用：source（输入）、copy_label（输入）、result（输出）；project_hmc_ref_value 读取 source、copy_label、result 并使用字段 result、status、result.object_kind、result.address、result.size、result.first_pbl_index、result.ownership、result.release_complete，并写入 result；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：project_hmc_ref_value 下游操作失败时原样传播其 status/result，不伪造成功；该路径不隐式重试，也不转移未声明资源。
   protected function rdma_status project_hmc_ref_value(
     rdma_hmc_ref source,
     string copy_label,
@@ -1142,6 +1248,9 @@ class rdma_resource_manager extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：在 rdma_resource_manager 中，project_bar_value 从输入对象提取受控字段并返回 detached 投影，阻断调用方通过别名修改 authority。
+  // 输入/输出及副作用：source（输入）、copy_label（输入）、result（输出）；project_bar_value 读取 source、copy_label、result 并使用字段 result、result.bar_id、result.base、result.size、result.enabled，并写入 result；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：project_bar_value 返回 RDMA_SC_INVALID_ARGUMENT；失败路径不提交部分状态或转移未声明资源。
   protected function rdma_status project_bar_value(
     rdma_bar_info source,
     string copy_label,
@@ -1161,6 +1270,9 @@ class rdma_resource_manager extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：在 rdma_resource_manager 中，project_pcie_value 从输入对象提取受控字段并返回 detached 投影，阻断调用方通过别名修改 authority。
+  // 输入/输出及副作用：source（输入）、copy_label（输入）、result（输出）；project_pcie_value 读取 source、copy_label、result 并使用字段 result、result.bdf、result.parent_pf_bdf、result.vf_index、result.mse、result.bme、status，并写入 result；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：project_pcie_value 返回 RDMA_SC_INVALID_ARGUMENT；失败路径不提交部分状态或转移未声明资源。
   protected function rdma_status project_pcie_value(
     rdma_pcie_identity source,
     string copy_label,
@@ -1195,6 +1307,9 @@ class rdma_resource_manager extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：在 rdma_resource_manager 中，project_binding_value 从输入对象提取受控字段并返回 detached 投影，阻断调用方通过别名修改 authority。
+  // 输入/输出及副作用：source（输入）、copy_label（输入）、result（输出）；project_binding_value 读取 source、copy_label、result 并使用字段 result、result.pcie、result.owner_h、status、result.queue_dma、result.queue_caps、result.interrupt_vectors、result.function_uid，并写入 result；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：project_binding_value 返回 RDMA_SC_INVALID_ARGUMENT；失败路径不提交部分状态或转移未声明资源。
   protected function rdma_status project_binding_value(
     rdma_function_binding source,
     string copy_label,
@@ -1213,6 +1328,13 @@ class rdma_resource_manager extends uvm_object;
     result.owner_h = null;
     status = project_pcie_value(source.pcie, {copy_label, "_pcie"},
                                 result.pcie);
+    if (!status.ok()) begin
+      result = null;
+      return status;
+    end
+    // Preserve the protected identity authority across value projection;
+    // copying only legacy mirrors leaves the projected binding unusable.
+    status = result.configure_identity(source.function_identity_snapshot());
     if (!status.ok()) begin
       result = null;
       return status;
@@ -1248,6 +1370,9 @@ class rdma_resource_manager extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：在 rdma_resource_manager 中，project_opcode_value 从输入对象提取受控字段并返回 detached 投影，阻断调用方通过别名修改 authority。
+  // 输入/输出及副作用：source（输入）、copy_label（输入）、result（输出）；project_opcode_value 读取 source、copy_label、result 并使用字段 result、result.profile_name、result.opcode、result.variant，并写入 result；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：project_opcode_value 先检查 source == null，再返回 rdma_status::success()；拒绝分支不提交部分状态，也不隐式重试。
   protected function rdma_status project_opcode_value(
     rdma_cmq_opcode_key source,
     string copy_label,
@@ -1263,6 +1388,9 @@ class rdma_resource_manager extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：在 rdma_resource_manager 中，project_status_value 从输入对象提取受控字段并返回 detached 投影，阻断调用方通过别名修改 authority。
+  // 输入/输出及副作用：source（输入）、copy_label（输入）、result（输出）；project_status_value 读取 source、copy_label、result 并使用字段 result、result.category、result.code、result.hardware_code、result.hardware_code_valid、result.source_engine、result.function_uid、result.generation，并写入 result；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：project_status_value 先检查 source == null，再返回 rdma_status::success()；拒绝分支不提交部分状态，也不隐式重试。
   protected function rdma_status project_status_value(
     rdma_status source,
     string copy_label,
@@ -1288,6 +1416,9 @@ class rdma_resource_manager extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：在 rdma_resource_manager 中，project_ticket_value 从输入对象提取受控字段并返回 detached 投影，阻断调用方通过别名修改 authority。
+  // 输入/输出及副作用：source（输入）、copy_label（输入）、result（输出）；project_ticket_value 读取 source、copy_label、result 并使用字段 result、status、result.command_id、result.slot_sequence、result.sq_index、result.sq_wrap、result.absolute_deadline，并写入 result；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：project_ticket_value 下游操作失败时原样传播其 status/result，不伪造成功；该路径不隐式重试，也不转移未声明资源。
   protected function rdma_status project_ticket_value(
     rdma_cmq_ticket source,
     string copy_label,
@@ -1326,6 +1457,9 @@ class rdma_resource_manager extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：在 rdma_resource_manager 中，project_recovery_value 从输入对象提取受控字段并返回 detached 投影，阻断调用方通过别名修改 authority。
+  // 输入/输出及副作用：source（输入）、copy_label（输入）、result（输出）；project_recovery_value 读取 source、copy_label、result 并使用字段 result、status、result.hardware_presence、result.completed_steps、result.pending_steps、result.queue_recovery_valid、result.queue_intent、result.ambiguous_queue_operation，并写入 result；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：project_recovery_value 返回 RDMA_SC_INVALID_ARGUMENT；失败路径不提交部分状态或转移未声明资源。
   protected function rdma_status project_recovery_value(
     rdma_recovery_record source,
     string copy_label,
@@ -1437,6 +1571,9 @@ class rdma_resource_manager extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：在 rdma_resource_manager 中，project_resource_base_fields 从输入对象提取受控字段并返回 detached 投影，阻断调用方通过别名修改 authority。
+  // 输入/输出及副作用：source（输入）、copy_label（输入）、result（输入）；project_resource_base_fields 读取 source、copy_label、result 并使用字段 status、result.state、result.hmc_fvm_addr、result.hmc_fvm_addr_valid、result.outstanding_ids；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：project_resource_base_fields 下游操作失败时原样传播其 status/result，不伪造成功；该路径不隐式重试，也不转移未声明资源。
   protected function rdma_status project_resource_base_fields(
     rdma_resource source,
     string copy_label,
@@ -1492,6 +1629,9 @@ class rdma_resource_manager extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：在 rdma_resource_manager 中，project_queue_page_value 从输入对象提取受控字段并返回 detached 投影，阻断调用方通过别名修改 authority。
+  // 输入/输出及副作用：source（输入）、copy_label（输入）、result（输出）；project_queue_page_value 读取 source、copy_label、result 并使用字段 result、result.role、result.mapping_offset、result.logical_page_offset、result.page_iova、status，并写入 result；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：project_queue_page_value 下游操作失败时原样传播其 status/result，不伪造成功；该路径不隐式重试，也不转移未声明资源。
   protected function rdma_status project_queue_page_value(
     rdma_queue_dma_page_ref source,
     string copy_label,
@@ -1515,6 +1655,9 @@ class rdma_resource_manager extends uvm_object;
     return status;
   endfunction
 
+  // 功能：在 rdma_resource_manager 中，project_queue_ring_value 从输入对象提取受控字段并返回 detached 投影，阻断调用方通过别名修改 authority。
+  // 输入/输出及副作用：source（输入）、copy_label（输入）、result（输出）；project_queue_ring_value 读取 source、copy_label、result 并使用字段 result、result.role、result.entry_size_bytes、result.depth、result.logical_bytes、result.storage_bytes、result.page_count、result.initial_polarity，并写入 result；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：project_queue_ring_value 下游操作失败时原样传播其 status/result，不伪造成功；该路径不隐式重试，也不转移未声明资源。
   protected function rdma_status project_queue_ring_value(
     rdma_queue_ring_layout source,
     string copy_label,
@@ -1547,6 +1690,9 @@ class rdma_resource_manager extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：在 rdma_resource_manager 中，project_queue_backing_ref_value 从输入对象提取受控字段并返回 detached 投影，阻断调用方通过别名修改 authority。
+  // 输入/输出及副作用：source（输入）、copy_label（输入）、result（输出）；project_queue_backing_ref_value 读取 source、copy_label、result 并使用字段 result、result.role、result.ownership、result.mapping_offset、result.length、result.logical_queue_offset、result.cleanup_complete、status，并写入 result；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：project_queue_backing_ref_value 返回 RDMA_SC_INVALID_ARGUMENT；失败路径不提交部分状态或转移未声明资源。
   protected function rdma_status project_queue_backing_ref_value(
     rdma_queue_backing_ref source,
     string copy_label,
@@ -1614,6 +1760,9 @@ class rdma_resource_manager extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：在 rdma_resource_manager 中，project_queue_slot_token_value 从输入对象提取受控字段并返回 detached 投影，阻断调用方通过别名修改 authority。
+  // 输入/输出及副作用：source（输入）、copy_label（输入）、result（输出）；project_queue_slot_token_value 读取 source、copy_label、result 并使用字段 result、cloned_object，并写入 result；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：project_queue_slot_token_value 返回 RDMA_SC_INVALID_ARGUMENT；失败路径不提交部分状态或转移未声明资源。
   protected function rdma_status project_queue_slot_token_value(
     uvm_object source,
     string copy_label,
@@ -1646,6 +1795,9 @@ class rdma_resource_manager extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：在 rdma_resource_manager 中，project_queue_context_value 从输入对象提取受控字段并返回 detached 投影，阻断调用方通过别名修改 authority。
+  // 输入/输出及副作用：source（输入）、copy_label（输入）、result（输出）；project_queue_context_value 读取 source、copy_label、result 并使用字段 result、status、result.resource_kind、result.local_id、result.shadow_pointer_base、result.slot_length、result.shadow_view_offset、result.shadow_view_length，并写入 result；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：project_queue_context_value 下游操作失败时原样传播其 status/result，不伪造成功；该路径不隐式重试，也不转移未声明资源。
   protected function rdma_status project_queue_context_value(
     rdma_context_backing_ref source,
     string copy_label,
@@ -1682,6 +1834,9 @@ class rdma_resource_manager extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：在 rdma_resource_manager 中，project_queue_flush_target_value 从输入对象提取受控字段并返回 detached 投影，阻断调用方通过别名修改 authority。
+  // 输入/输出及副作用：source（输入）、copy_label（输入）、result（输出）；project_queue_flush_target_value 读取 source、copy_label、result 并使用字段 result、result.role、result.phase、result.flush_complete、status，并写入 result；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：project_queue_flush_target_value 下游操作失败时原样传播其 status/result，不伪造成功；该路径不隐式重试，也不转移未声明资源。
   protected function rdma_status project_queue_flush_target_value(
     rdma_queue_flush_target source,
     string copy_label,
@@ -1704,6 +1859,9 @@ class rdma_resource_manager extends uvm_object;
     return status;
   endfunction
 
+  // 功能：在 rdma_resource_manager 中，project_queue_plan_value 从输入对象提取受控字段并返回 detached 投影，阻断调用方通过别名修改 authority。
+  // 输入/输出及副作用：source（输入）、copy_label（输入）、result（输出）；project_queue_plan_value 读取 source、copy_label、result 并使用字段 result、result.resource_kind、status，并写入 result；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：project_queue_plan_value 下游操作失败时原样传播其 status/result，不伪造成功；该路径不隐式重试，也不转移未声明资源。
   protected function rdma_status project_queue_plan_value(
     rdma_queue_backing_plan source,
     string copy_label,
@@ -1760,6 +1918,9 @@ class rdma_resource_manager extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：在 rdma_resource_manager 中，project_qp_ring_value 从输入对象提取受控字段并返回 detached 投影，阻断调用方通过别名修改 authority。
+  // 输入/输出及副作用：source（输入）、copy_label（输入）、result（输出）；project_qp_ring_value 读取 source、copy_label、result 并使用字段 result、result.role、result.entry_size_bytes、result.depth、result.logical_bytes、result.storage_bytes、result.object_mode，并写入 result；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：project_qp_ring_value 先检查 source == null，再返回 rdma_status::success()；拒绝分支不提交部分状态，也不隐式重试。
   protected function rdma_status project_qp_ring_value(
     rdma_qp_ring_layout source,
     string copy_label,
@@ -1784,6 +1945,9 @@ class rdma_resource_manager extends uvm_object;
   // (and therefore its opaque adapter release token) and require only value,
   // detached-handle, and completion-query authority here.  The reference
   // validator separately enforces the exact Function/QP owner and role.
+  // 功能：在 rdma_resource_manager 中，clone_recovery_mapping_value 将 rhs 中 rdma_resource_manager 的值字段复制到当前对象，建立与源对象隔离的快照。
+  // 输入/输出及副作用：source（输入）、copy_label（输入）、result（输出）；clone_recovery_mapping_value 读取 source、copy_label、result 并使用字段 result、source_type、status、cloned_object、result_type，并写入 result；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：clone_recovery_mapping_value 返回 RDMA_SC_INVALID_ARGUMENT、RDMA_SC_INVALID_STATE；失败路径不提交部分状态或转移未声明资源。
   protected function rdma_status clone_recovery_mapping_value(
     rdma_dma_mapping source,
     string copy_label,
@@ -1845,6 +2009,9 @@ class rdma_resource_manager extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：在 rdma_resource_manager 中，project_qp_backing_ref_value 从输入对象提取受控字段并返回 detached 投影，阻断调用方通过别名修改 authority。
+  // 输入/输出及副作用：source（输入）、copy_label（输入）、result（输出）；project_qp_backing_ref_value 读取 source、copy_label、result 并使用字段 result、status、result.role、result.ownership、result.mapping_offset、result.length、result.cleanup_complete、result.recovery_only，并写入 result；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：project_qp_backing_ref_value 返回 RDMA_SC_INVALID_ARGUMENT；典型拒绝条件为“QP backing segment is null”；失败路径不提交部分状态或转移未声明资源。
   protected function rdma_status project_qp_backing_ref_value(
     rdma_qp_backing_ref source,
     string copy_label,
@@ -1904,6 +2071,9 @@ class rdma_resource_manager extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：在 rdma_resource_manager 中，project_qp_plan_value 从输入对象提取受控字段并返回 detached 投影，阻断调用方通过别名修改 authority。
+  // 输入/输出及副作用：source（输入）、copy_label（输入）、result（输出）；project_qp_plan_value 读取 source、copy_label、result 并使用字段 result、result.transport、result.sq_depth、result.rq_depth、result.sq_pd_flush_complete、result.rq_pd_flush_complete、result.cleanup_complete、status，并写入 result；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：project_qp_plan_value 下游操作失败时原样传播其 status/result，不伪造成功；该路径不隐式重试，也不转移未声明资源。
   protected function rdma_status project_qp_plan_value(
     rdma_qp_backing_plan source,
     string copy_label,
@@ -1971,6 +2141,9 @@ class rdma_resource_manager extends uvm_object;
     return status;
   endfunction
 
+  // 功能：在 rdma_resource_manager 中，project_address_vector_value 从输入对象提取受控字段并返回 detached 投影，阻断调用方通过别名修改 authority。
+  // 输入/输出及副作用：source（输入）、copy_label（输入）、result（输出）；project_address_vector_value 读取 source、copy_label、result 并使用字段 result、result.source_address_index、result.source_vport、result.destination_vport、result.destination_port、result.destination_mac、result.ipv6、result.vlan_enable，并写入 result；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：project_address_vector_value 先检查 source == null，再返回 rdma_status::success()；拒绝分支不提交部分状态，也不隐式重试。
   protected function rdma_status project_address_vector_value(
     rdma_address_vector source,
     string copy_label,
@@ -2001,6 +2174,9 @@ class rdma_resource_manager extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：在 rdma_resource_manager 中，project_qpc_behavior_value 从输入对象提取受控字段并返回 detached 投影，阻断调用方通过别名修改 authority。
+  // 输入/输出及副作用：source（输入）、copy_label（输入）、result（输出）；project_qpc_behavior_value 读取 source、copy_label、result 并使用字段 result、result.transport_version、result.migration_enable、result.tx_endian_swap、result.rx_endian_swap、result.read_after_write_fence、result.atomic_after_atomic_fence、priority，并写入 result；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：project_qpc_behavior_value 先检查 source == null，再返回 rdma_status::success()；拒绝分支不提交部分状态，也不隐式重试。
   protected function rdma_status project_qpc_behavior_value(
     rdma_qpc_behavior source,
     string copy_label,
@@ -2020,6 +2196,9 @@ class rdma_resource_manager extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：在 rdma_resource_manager 中，project_qpc_extension_value 从输入对象提取受控字段并返回 detached 投影，阻断调用方通过别名修改 authority。
+  // 输入/输出及副作用：source（输入）、copy_label（输入）、result（输出）；project_qpc_extension_value 读取 source、copy_label、result 并使用字段 result、result_rc、result_rc.remote_qpn、result_rc.send_psn、result_rc.recv_psn、result_rc.retry_count、result_rc.rnr_retry_count、result_ud，并写入 result；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：project_qpc_extension_value 返回 RDMA_SC_INVALID_ARGUMENT；失败路径不提交部分状态或转移未声明资源。
   protected function rdma_status project_qpc_extension_value(
     rdma_qpc_transport_ext source,
     string copy_label,
@@ -2084,6 +2263,9 @@ class rdma_resource_manager extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：在 rdma_resource_manager 中，project_qpc_value 从输入对象提取受控字段并返回 detached 投影，阻断调用方通过别名修改 authority。
+  // 输入/输出及副作用：source（输入）、copy_label（输入）、result（输出）；project_qpc_value 读取 source、copy_label、result 并使用字段 result、status、result.transport、result.state、result.host_id、result.vf_id、result.stat_index、result.pkey，并写入 result；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：project_qpc_value 下游操作失败时原样传播其 status/result，不伪造成功；该路径不隐式重试，也不转移未声明资源。
   protected function rdma_status project_qpc_value(
     rdma_qpc_model source,
     string copy_label,
@@ -2151,6 +2333,9 @@ class rdma_resource_manager extends uvm_object;
     return status;
   endfunction
 
+  // 功能：在 rdma_resource_manager 中由 same_qp_backing_ref_value 逐字段比较输入值，返回结构、身份或序列化内容是否一致。
+  // 输入/输出及副作用：lhs（输入）、rhs（输入）；比较对象/数组只读；返回 bit 或状态结果，不更新 runtime、账本或外部 adapter。
+  // 失败/边界：same_qp_backing_ref_value 的任一比较对象为空或类型不符时返回确定的 false/不等结果，不抛出未处理异常。
   protected function bit same_qp_backing_ref_value(
     rdma_qp_backing_ref lhs,
     rdma_qp_backing_ref rhs
@@ -2181,6 +2366,9 @@ class rdma_resource_manager extends uvm_object;
     return same_mapping_value(lhs.mapping, rhs.mapping);
   endfunction
 
+  // 功能：在 rdma_resource_manager 中由 same_qp_ring_value 逐字段比较输入值，返回结构、身份或序列化内容是否一致。
+  // 输入/输出及副作用：lhs（输入）、rhs（输入）；比较对象/数组只读；返回 bit 或状态结果，不更新 runtime、账本或外部 adapter。
+  // 失败/边界：same_qp_ring_value 的任一比较对象为空或类型不符时返回确定的 false/不等结果，不抛出未处理异常。
   protected function bit same_qp_ring_value(
     rdma_qp_ring_layout lhs,
     rdma_qp_ring_layout rhs
@@ -2194,6 +2382,9 @@ class rdma_resource_manager extends uvm_object;
            lhs.object_mode == rhs.object_mode;
   endfunction
 
+  // 功能：在 rdma_resource_manager 中由 same_context_value 逐字段比较输入值，返回结构、身份或序列化内容是否一致。
+  // 输入/输出及副作用：lhs（输入）、rhs（输入）；比较对象/数组只读；返回 bit 或状态结果，不更新 runtime、账本或外部 adapter。
+  // 失败/边界：same_context_value 的任一比较对象为空或类型不符时返回确定的 false/不等结果，不抛出未处理异常。
   protected function bit same_context_value(
     rdma_context_backing_ref lhs,
     rdma_context_backing_ref rhs
@@ -2226,6 +2417,9 @@ class rdma_resource_manager extends uvm_object;
            lhs.hmc_ref.release_complete == rhs.hmc_ref.release_complete;
   endfunction
 
+  // 功能：在 rdma_resource_manager 中由 same_qp_plan_value 逐字段比较输入值，返回结构、身份或序列化内容是否一致。
+  // 输入/输出及副作用：lhs（输入）、rhs（输入）；比较对象/数组只读；返回 bit 或状态结果，不更新 runtime、账本或外部 adapter。
+  // 失败/边界：same_qp_plan_value 的任一比较对象为空或类型不符时返回确定的 false/不等结果，不抛出未处理异常。
   protected function bit same_qp_plan_value(
     rdma_qp_backing_plan lhs,
     rdma_qp_backing_plan rhs
@@ -2254,6 +2448,9 @@ class rdma_resource_manager extends uvm_object;
     return 1'b1;
   endfunction
 
+  // 功能：在 rdma_resource_manager 中由 same_address_vector_value 逐字段比较输入值，返回结构、身份或序列化内容是否一致。
+  // 输入/输出及副作用：lhs（输入）、rhs（输入）；比较对象/数组只读；返回 bit 或状态结果，不更新 runtime、账本或外部 adapter。
+  // 失败/边界：same_address_vector_value 的任一比较对象为空或类型不符时返回确定的 false/不等结果，不抛出未处理异常。
   protected function bit same_address_vector_value(
     rdma_address_vector lhs,
     rdma_address_vector rhs
@@ -2280,6 +2477,9 @@ class rdma_resource_manager extends uvm_object;
     return 1'b1;
   endfunction
 
+  // 功能：在 rdma_resource_manager 中由 same_qpc_behavior_value 逐字段比较输入值，返回结构、身份或序列化内容是否一致。
+  // 输入/输出及副作用：lhs（输入）、rhs（输入）；比较对象/数组只读；返回 bit 或状态结果，不更新 runtime、账本或外部 adapter。
+  // 失败/边界：same_qpc_behavior_value 的任一比较对象为空或类型不符时返回确定的 false/不等结果，不抛出未处理异常。
   protected function bit same_qpc_behavior_value(
     rdma_qpc_behavior lhs,
     rdma_qpc_behavior rhs
@@ -2295,6 +2495,9 @@ class rdma_resource_manager extends uvm_object;
            lhs.\priority == rhs.\priority ;
   endfunction
 
+  // 功能：在 rdma_resource_manager 中由 same_qpc_extension_value 逐字段比较输入值，返回结构、身份或序列化内容是否一致。
+  // 输入/输出及副作用：lhs（输入）、rhs（输入）；比较对象/数组只读；返回 bit 或状态结果，不更新 runtime、账本或外部 adapter。
+  // 失败/边界：same_qpc_extension_value 的任一比较对象为空或类型不符时返回确定的 false/不等结果，不抛出未处理异常。
   protected function bit same_qpc_extension_value(
     rdma_qpc_transport_ext lhs,
     rdma_qpc_transport_ext rhs
@@ -2342,6 +2545,9 @@ class rdma_resource_manager extends uvm_object;
     return 1'b0;
   endfunction
 
+  // 功能：在 rdma_resource_manager 中由 same_qpc_value 逐字段比较输入值，返回结构、身份或序列化内容是否一致。
+  // 输入/输出及副作用：lhs（输入）、rhs（输入）；比较对象/数组只读；返回 bit 或状态结果，不更新 runtime、账本或外部 adapter。
+  // 失败/边界：same_qpc_value 的任一比较对象为空或类型不符时返回确定的 false/不等结果，不抛出未处理异常。
   protected function bit same_qpc_value(
     rdma_qpc_model lhs,
     rdma_qpc_model rhs
@@ -2372,6 +2578,9 @@ class rdma_resource_manager extends uvm_object;
            same_qpc_extension_value(lhs.transport_ext, rhs.transport_ext);
   endfunction
 
+  // 功能：在 rdma_resource_manager 中由 same_qp_reconciliation_value 逐字段比较输入值，返回结构、身份或序列化内容是否一致。
+  // 输入/输出及副作用：lhs（输入）、rhs（输入）；比较对象/数组只读；返回 bit 或状态结果，不更新 runtime、账本或外部 adapter。
+  // 失败/边界：same_qp_reconciliation_value 的任一比较对象为空或类型不符时返回确定的 false/不等结果，不抛出未处理异常。
   protected function bit same_qp_reconciliation_value(
     rdma_qp lhs,
     rdma_qp rhs
@@ -2409,6 +2618,9 @@ class rdma_resource_manager extends uvm_object;
            same_qpc_value(lhs.programmed_qpc, rhs.programmed_qpc);
   endfunction
 
+  // 功能：在 rdma_resource_manager 中，project_qp_recovery_value 从输入对象提取受控字段并返回 detached 投影，阻断调用方通过别名修改 authority。
+  // 输入/输出及副作用：source（输入）、copy_label（输入）、result（输出）；project_qp_recovery_value 读取 source、copy_label、result 并使用字段 result、result.intent、result.ambiguous_operation、result.ambiguous_role、result.role_complete、result.has_pending_hardware_step、result.query_mapping_recovery_only、result.query_presence_known，并写入 result；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：project_qp_recovery_value 下游操作失败时原样传播其 status/result，不伪造成功；该路径不隐式重试，也不转移未声明资源。
   protected function rdma_status project_qp_recovery_value(
     rdma_qp_recovery_state source,
     string copy_label,
@@ -2486,6 +2698,9 @@ class rdma_resource_manager extends uvm_object;
     return status;
   endfunction
 
+  // 功能：在 rdma_resource_manager 中，project_queue_fields 从输入对象提取受控字段并返回 detached 投影，阻断调用方通过别名修改 authority。
+  // 输入/输出及副作用：source（输入）、result（输入）、copy_label（输入）；project_queue_fields 读取 source、result、copy_label 并使用字段 result.depth、result.producer_index、result.consumer_index、result.producer_wrap、result.consumer_wrap、result.queue_iova、status；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：project_queue_fields 下游操作失败时原样传播其 status/result，不伪造成功；该路径不隐式重试，也不转移未声明资源。
   protected function rdma_status project_queue_fields(
     rdma_queue_resource source,
     rdma_queue_resource result,
@@ -2505,6 +2720,9 @@ class rdma_resource_manager extends uvm_object;
     return status;
   endfunction
 
+  // 功能：在 rdma_resource_manager 中，project_resource_value 从输入对象提取受控字段并返回 detached 投影，阻断调用方通过别名修改 authority。
+  // 输入/输出及副作用：source（输入）、copy_label（输入）、result（输出）；project_resource_value 读取 source、copy_label、result 并使用字段 result、result_function、result_function.binding、result_pd、result_mr、result_cq、result_qp、result_srq，并写入 result；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：project_resource_value 返回 RDMA_SC_INVALID_ARGUMENT、RDMA_SC_INVALID_STATE；失败路径不提交部分状态或转移未声明资源。
   protected function rdma_status project_resource_value(
     rdma_resource source,
     string copy_label,
@@ -2772,6 +2990,9 @@ class rdma_resource_manager extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：registry_schema_status 校验 operation 与当前对象状态的一致性，并显式处理“_registry_entry”等拒绝条件，返回 rdma_status 供上层决定是否提交。
+  // 输入/输出及副作用：operation（输入）；registry_schema_status 读取 operation 并使用字段 status；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：registry_schema_status 下游操作失败时原样传播其 status/result，不伪造成功；该路径不隐式重试，也不转移未声明资源。
   protected function rdma_status registry_schema_status(string operation);
     rdma_resource projected;
     rdma_status status;
@@ -2787,6 +3008,9 @@ class rdma_resource_manager extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：recovery_schema_status 校验 operation 与当前对象状态的一致性，并显式处理“_recovery_entry”等拒绝条件，返回 rdma_status 供上层决定是否提交。
+  // 输入/输出及副作用：operation（输入）；recovery_schema_status 可能更新本对象明确拥有的状态；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：recovery_schema_status 下游操作失败时原样传播其 status/result，不伪造成功；该路径不隐式重试，也不转移未声明资源。
   protected function rdma_status recovery_schema_status(string operation);
     rdma_recovery_record projected;
     rdma_status status;
@@ -2802,6 +3026,9 @@ class rdma_resource_manager extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：recovery_entry_schema_status 校验 key、operation 与当前对象状态的一致性，并显式处理“_recovery_entry”等拒绝条件，返回 rdma_status 供上层决定是否提交。
+  // 输入/输出及副作用：key（输入）、operation（输入）；recovery_entry_schema_status 可能更新本对象明确拥有的状态；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：recovery_entry_schema_status 下游操作失败时原样传播其 status/result，不伪造成功；该路径不隐式重试，也不转移未声明资源。
   protected function rdma_status recovery_entry_schema_status(
     string key,
     string operation
@@ -2820,6 +3047,9 @@ class rdma_resource_manager extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：在 rdma_resource_manager 中由 same_outstanding_ids 逐字段比较输入值，返回结构、身份或序列化内容是否一致。
+  // 输入/输出及副作用：lhs（输入）、rhs（输入）；比较对象/数组只读；返回 bit 或状态结果，不更新 runtime、账本或外部 adapter。
+  // 失败/边界：same_outstanding_ids 的任一比较对象为空或类型不符时返回确定的 false/不等结果，不抛出未处理异常。
   protected function bit same_outstanding_ids(
     rdma_resource lhs,
     rdma_resource rhs
@@ -2834,6 +3064,9 @@ class rdma_resource_manager extends uvm_object;
     return 1'b1;
   endfunction
 
+  // 功能：在 rdma_resource_manager 中由 same_handle_instance 逐字段比较输入值，返回结构、身份或序列化内容是否一致。
+  // 输入/输出及副作用：lhs（输入）、rhs（输入）；比较对象/数组只读；返回 bit 或状态结果，不更新 runtime、账本或外部 adapter。
+  // 失败/边界：same_handle_instance 的任一比较对象为空或类型不符时返回确定的 false/不等结果，不抛出未处理异常。
   protected function bit same_handle_instance(rdma_handle lhs,
                                                rdma_handle rhs);
     if (lhs == null || rhs == null)
@@ -2844,11 +3077,17 @@ class rdma_resource_manager extends uvm_object;
            lhs.generation == rhs.generation;
   endfunction
 
+  // 功能：在 rdma_resource_manager 中由 same_handle_value 逐字段比较输入值，返回结构、身份或序列化内容是否一致。
+  // 输入/输出及副作用：lhs（输入）、rhs（输入）；比较对象/数组只读；返回 bit 或状态结果，不更新 runtime、账本或外部 adapter。
+  // 失败/边界：same_handle_value 的任一比较对象为空或类型不符时返回确定的 false/不等结果，不抛出未处理异常。
   protected function bit same_handle_value(rdma_handle lhs,
                                             rdma_handle rhs);
     return same_handle_instance(lhs, rhs);
   endfunction
 
+  // 功能：在 rdma_resource_manager 中由 same_dependency_topology 逐字段比较输入值，返回结构、身份或序列化内容是否一致。
+  // 输入/输出及副作用：lhs（输入）、rhs（输入）；比较对象/数组只读；返回 bit 或状态结果，不更新 runtime、账本或外部 adapter。
+  // 失败/边界：same_dependency_topology 的任一比较对象为空或类型不符时返回确定的 false/不等结果，不抛出未处理异常。
   protected function bit same_dependency_topology(rdma_resource lhs,
                                                   rdma_resource rhs);
     if (lhs == null || rhs == null ||
@@ -2861,6 +3100,9 @@ class rdma_resource_manager extends uvm_object;
     return 1'b1;
   endfunction
 
+  // 功能：在 rdma_resource_manager 中由 same_binding_identity 逐字段比较输入值，返回结构、身份或序列化内容是否一致。
+  // 输入/输出及副作用：lhs（输入）、rhs（输入）；比较对象/数组只读；返回 bit 或状态结果，不更新 runtime、账本或外部 adapter。
+  // 失败/边界：same_binding_identity 的任一比较对象为空或类型不符时返回确定的 false/不等结果，不抛出未处理异常。
   protected function bit same_binding_identity(rdma_function_binding lhs,
                                                rdma_function_binding rhs);
     if (lhs == null || rhs == null)
@@ -2933,6 +3175,9 @@ class rdma_resource_manager extends uvm_object;
     return 1'b1;
   endfunction
 
+  // 功能：publication_identity_status 校验 candidate、authoritative 与当前对象状态的一致性，并显式处理“published resource identity or topology changed”；“published resource manager-owned fields changed”等拒绝条件，返回 rdma_status 供上层决定是否提交。
+  // 输入/输出及副作用：candidate（输入）、authoritative（输入）；publication_identity_status 读取 candidate、authoritative 并使用字段 fields_match；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：publication_identity_status 返回 RDMA_SC_INVALID_ARGUMENT；具体拒绝条件包括 “published resource identity or topology changed”；“published resource manager-owned fields changed”；失败路径不提交部分状态、不隐式重试，也不转移未声明资源。
   protected function rdma_status publication_identity_status(
     rdma_resource candidate,
     rdma_resource authoritative
@@ -3065,6 +3310,9 @@ class rdma_resource_manager extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：在 rdma_resource_manager 中，project_public_resource_value 从输入对象提取受控字段并返回 detached 投影，阻断调用方通过别名修改 authority。
+  // 输入/输出及副作用：source（输入）、copy_label（输入）、result（输出）；project_public_resource_value 读取 source、copy_label、result 并使用字段 status、result，并写入 result；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：project_public_resource_value 下游操作失败时原样传播其 status/result，不伪造成功；该路径不隐式重试，也不转移未声明资源。
   protected function rdma_status project_public_resource_value(
     rdma_resource source,
     string copy_label,
@@ -3083,6 +3331,9 @@ class rdma_resource_manager extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：在 rdma_resource_manager 中，project_public_recovery_value 从输入对象提取受控字段并返回 detached 投影，阻断调用方通过别名修改 authority。
+  // 输入/输出及副作用：source（输入）、copy_label（输入）、result（输出）；project_public_recovery_value 读取 source、copy_label、result 并使用输入参数和固定枚举/常量，并写入 result；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：project_public_recovery_value 的结果直接由 return project_recovery_value(source, copy_label, result) 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   protected function rdma_status project_public_recovery_value(
     rdma_recovery_record source,
     string copy_label,
@@ -3091,6 +3342,9 @@ class rdma_resource_manager extends uvm_object;
     return project_recovery_value(source, copy_label, result);
   endfunction
 
+  // 功能：recovery_ready 比较 recovery 与当前 authority/状态字段，返回布尔结果供上层执行精确分支。
+  // 输入/输出及副作用：recovery（输入）；输入 action/epoch/handle 决定迁移目标；成功时更新状态或恢复证据，外部资源仍由其拥有者管理。
+  // 失败/边界：当前状态不允许、epoch/generation 过期或恢复证据不完整时返回错误；不得跳过隔离步骤。
   protected function bit recovery_ready(rdma_recovery_record recovery);
     if (recovery == null ||
         recovery.hardware_presence != RDMA_HW_PRESENCE_ABSENT ||
@@ -3112,6 +3366,9 @@ class rdma_resource_manager extends uvm_object;
     end
     return 1'b1;
   endfunction
+  // 功能：在 rdma_resource_manager 中，binding_handle_value 把 binding_handle_value 指定的资源或后端能力绑定到当前对象索引，并校验 Function、generation 和队列类型一致。
+  // 输入/输出及副作用：binding（输入）、handle_name（输入）；binding_handle_value 先依据 依赖存在性、authority 和 generation 条件 校验 binding、handle_name；成功时更新本对象配置/状态并保存非拥有引用，返回 rdma_function_handle。
+  // 失败/边界：资源不存在、类型不符、重复登记或跨 Function 串线时拒绝绑定并保持索引不变。
   protected function rdma_function_handle binding_handle_value(
     rdma_function_binding binding,
     string handle_name
@@ -3126,6 +3383,9 @@ class rdma_resource_manager extends uvm_object;
     return result;
   endfunction
 
+  // 功能：在 rdma_resource_manager 中，source_key 把 Function/对象身份、代际和游标字段拼成稳定的查找键，供登记表去重和恢复路由使用。
+  // 输入/输出及副作用：binding（输入）、key（输出）；source_key 读取 binding、key 并使用字段 key，并写入 key；函数返回 bit，不取得调用方资源所有权。
+  // 失败/边界：source_key 比较或前置条件不满足时返回 0/false；该路径不隐式重试，也不转移未声明资源。
   protected function bit source_key(
     rdma_function_binding binding,
     output string key
@@ -3140,6 +3400,9 @@ class rdma_resource_manager extends uvm_object;
     return 1'b0;
   endfunction
 
+  // 功能：refresh_generation 更新字段 observed_generation，并在提交前保持 Function authority、generation 和资源所有权约束。
+  // 输入/输出及副作用：key（输入）；refresh_generation 读取 key 并使用字段 observed_generation；函数返回 void，不取得调用方资源所有权。
+  // 失败/边界：refresh_generation 无返回值，仅执行 observed_generation=generation_sources[key].generation；调用方须保证前置依赖已经绑定，函数不自动重试或接管外部资源。
   protected function void refresh_generation(string key);
     int unsigned observed_generation;
 
@@ -3156,6 +3419,10 @@ class rdma_resource_manager extends uvm_object;
       generation_high_water[key] = observed_generation;
   endfunction
 
+  // 功能：在 rdma_resource_manager 中，binding_context_status 把 binding_context_status 指定的资源或后端能力绑定到当前对象索引，并校验 Function、generation 和队列类型一致。
+  // 输入/输出及副作用：binding（输入）、trusted_binding（输出）、owner（输出）、key（输出）、registration_needed（输出）；binding_context_status 读取 binding、trusted_binding、owner、key、registration_needed 并使用字段 trusted_binding、owner、key、registration_needed、status、source_is_known、observed_generation、trusted_binding.generation，并写入 trusted_binding、owner、key、registration_needed；函数返回 rdma_status，不取得调用方资源所有权。
+
+  // 失败/边界：资源不存在、类型不符、重复登记或跨 Function 串线时拒绝绑定并保持索引不变。
   protected function rdma_status binding_context_status(
     rdma_function_binding binding,
     output rdma_function_binding trusted_binding,
@@ -3241,6 +3508,11 @@ class rdma_resource_manager extends uvm_object;
     end
 
     trusted_binding.generation = observed_generation;
+    status = trusted_binding.synchronize_identity_from_legacy_mirrors();
+    if (status == null || !status.ok())
+      return status == null ? rdma_status::make(
+        RDMA_SC_INVALID_STATE, "trusted binding identity synchronization returned null"
+      ) : status;
     trusted_binding.owner_h = binding_handle_value(
       trusted_binding, "trusted_binding_owner"
     );
@@ -3262,6 +3534,10 @@ class rdma_resource_manager extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：在 rdma_resource_manager 中，register_binding_context 将输入对象登记或挂接到当前集合/依赖图，并同步维护对应账本和生命周期引用。
+  // 输入/输出及副作用：source（输入）、trusted_binding（输入）、owner（输入）、key（输入）；register_binding_context 先依据 !status.ok( 校验 source、trusted_binding、owner、key；成功时更新本对象配置/状态并保存非拥有引用，返回
+  //   rdma_status。
+  // 失败/边界：实现中的空依赖、重复登记、状态或 generation/authority 校验失败时返回错误；失败时保留旧配置。
   protected function rdma_status register_binding_context(
     rdma_function_binding source,
     rdma_function_binding trusted_binding,
@@ -3281,6 +3557,9 @@ class rdma_resource_manager extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：active_binding_status 校验 binding、owner 与当前对象状态的一致性，返回 rdma_status 供上层决定是否提交。
+  // 输入/输出及副作用：binding（输入）、owner（输出）；active_binding_status 读取 binding、owner 并使用输入参数和固定枚举/常量，并写入 owner；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：active_binding_status 只读输入并返回 rdma_status；边界由函数体现有分支决定，不修改状态或转移资源。
   protected function rdma_status active_binding_status(
     rdma_function_binding binding,
     output rdma_function_handle owner
@@ -3293,6 +3572,9 @@ class rdma_resource_manager extends uvm_object;
                                   registration_needed);
   endfunction
 
+  // 功能：owner_binding_status 校验 owner 与当前对象状态的一致性，并显式处理“registry owner is not a Function handle”等拒绝条件，返回 rdma_status 供上层决定是否提交。
+  // 输入/输出及副作用：owner（输入）；owner_binding_status 读取 owner 并使用字段 key、generation_key；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：owner_binding_status 返回 RDMA_SC_INVALID_STATE、RDMA_SC_STALE_GENERATION；典型拒绝条件为“registry owner is not a Function handle”“Function binding is not registered”；失败路径不提交部分状态或转移未声明资源。
   protected function rdma_status owner_binding_status(
     rdma_function_handle owner
   );
@@ -3321,6 +3603,9 @@ class rdma_resource_manager extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：判断 has_conflicting_generation 对应的状态、能力或账本条件，并返回确定的布尔/计数结果，不修改状态。
+  // 输入/输出及副作用：owner（输入）；has_conflicting_generation 读取 owner 并使用字段 registry、key；函数返回 bit，不取得调用方资源所有权。
+  // 失败/边界：has_conflicting_generation 只读取现有账本；输入未初始化时返回保守结果，不得借助默认 Function/root 猜测。
   protected function bit has_conflicting_generation(
     rdma_function_handle owner
   );
@@ -3335,6 +3620,10 @@ class rdma_resource_manager extends uvm_object;
     return 1'b0;
   endfunction
 
+  // 功能：在 rdma_resource_manager 中，reserve_identity 检查容量后预留资源并返回带 owner 证据的句柄/计划；失败时回滚已登记的局部状态。
+  // 输入/输出及副作用：binding（输入）、kind（输入）、owner（输出）、handle（输出）、local_id（输出）、used_free_id（输出）、registered_binding（输出）、prior_serial（输出）；输入请求/句柄定义资源属性；成功时更新账本并通过返回值或
+  //   output 发布新句柄/映射。
+  // 失败/边界：容量不足、范围非法、重复占用或身份过期时返回错误；失败不得泄漏半分配资源。
   protected function rdma_status reserve_identity(
     rdma_function_binding binding,
     rdma_resource_kind_e kind,
@@ -3401,6 +3690,9 @@ class rdma_resource_manager extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：在 rdma_resource_manager 中，rollback_local_id_reservation 按 owner、generation 和幂等规则释放/隔离记录，并同步删除其账本引用。
+  // 输入/输出及副作用：kind（输入）、local_id（输入）、used_free_id（输入）；输入 handle/mapping/token 指定释放目标；成功时更新账本和生命周期，外部资源只按 adapter 契约释放。
+  // 失败/边界：rollback_local_id_reservation 发现 owner/generation 不匹配、记录未知或重复释放时返回错误或幂等结果，不重新激活旧句柄。
   protected function void rollback_local_id_reservation(
     rdma_resource_kind_e kind,
     int unsigned local_id,
@@ -3416,6 +3708,9 @@ class rdma_resource_manager extends uvm_object;
       next_local_id[kind]--;
   endfunction
 
+  // 功能：在 rdma_resource_manager 中，rollback_binding_registration 按 owner、generation 和幂等规则释放/隔离记录，并同步删除其账本引用。
+  // 输入/输出及副作用：owner（输入）、registered_binding（输入）；输入 handle/mapping/token 指定释放目标；成功时更新账本和生命周期，外部资源只按 adapter 契约释放。
+  // 失败/边界：rollback_binding_registration 发现 owner/generation 不匹配、记录未知或重复释放时返回错误或幂等结果，不重新激活旧句柄。
   protected function void rollback_binding_registration(
     rdma_function_handle owner,
     bit registered_binding
@@ -3431,6 +3726,10 @@ class rdma_resource_manager extends uvm_object;
     generation_exhausted.delete(owner_key);
   endfunction
 
+  // 功能：在 rdma_resource_manager 中，rollback_identity_reservation 按 owner、generation 和幂等规则释放/隔离记录，并同步删除其账本引用。
+  // 输入/输出及副作用：kind（输入）、owner（输入）、local_id（输入）、used_free_id（输入）、registered_binding（输入）、prior_serial（输入）；输入
+  //   handle/mapping/token 指定释放目标；成功时更新账本和生命周期，外部资源只按 adapter 契约释放。
+  // 失败/边界：rollback_identity_reservation 发现 owner/generation 不匹配、记录未知或重复释放时返回错误或幂等结果，不重新激活旧句柄。
   protected function void rollback_identity_reservation(
     rdma_resource_kind_e kind,
     rdma_function_handle owner,
@@ -3444,6 +3743,9 @@ class rdma_resource_manager extends uvm_object;
     rollback_binding_registration(owner, registered_binding);
   endfunction
 
+  // 功能：在 rdma_resource_manager 中，register_resource 将输入对象登记或挂接到当前集合/依赖图，并同步维护对应账本和生命周期引用。
+  // 输入/输出及副作用：resource（输入）、copy_label（输入）、published（输出）；register_resource 先依据 !status.ok( 校验 resource、copy_label、publis；成功时更新本对象配置/状态并保存非拥有引用，返回 rdma_status。
+  // 失败/边界：实现中的空依赖、重复登记、状态或 generation/authority 校验失败时返回错误；失败时保留旧配置。
   protected function rdma_status register_resource(
     rdma_resource resource,
     string copy_label,
@@ -3485,6 +3787,9 @@ class rdma_resource_manager extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：在 rdma_resource_manager 中，related_incarnation_owner 按 Function UID、kind 和 object ID 查找任一已知 incarnation，并返回其 owner 快照。
+  // 输入/输出及副作用：handle（输入）、owner（输出）；related_incarnation_owner 读取 handle、owner 并使用字段 owner，并写入 owner；函数返回 bit，不取得调用方资源所有权。
+  // 失败/边界：related_incarnation_owner 比较或前置条件不满足时返回 0/false；该路径不隐式重试，也不转移未声明资源。
   protected function bit related_incarnation_owner(
     rdma_handle handle,
     output rdma_function_handle owner
@@ -3505,6 +3810,10 @@ class rdma_resource_manager extends uvm_object;
     return 1'b0;
   endfunction
 
+  // 功能：dependency_status 校验 owner、dependency、expected_kind、allow_null 与当前对象状态的一致性，并显式处理“required resource dependency is null”等拒绝条件，返回 rdma_status 供上层决定是否提交。
+  // 输入/输出及副作用：owner（输入）、dependency（输入）、expected_kind（输入）、allow_null（输入）；dependency_status 读取 owner、dependency、expected_kind、allow_null 并使用字段 status；函数返回 rdma_status，不取得调用方资源所有权。
+
+  // 失败/边界：dependency_status 返回 RDMA_SC_INVALID_ARGUMENT、RDMA_SC_INVALID_STATE；典型拒绝条件为“required resource dependency is null”“resource dependency kind is invalid”；失败路径不提交部分状态或转移未声明资源。
   protected function rdma_status dependency_status(
     rdma_function_handle owner,
     rdma_handle dependency,
@@ -3539,6 +3848,9 @@ class rdma_resource_manager extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：resource_local_id 按 resource.kind 转换到对应资源对象，并返回该对象的 local_*_id；类型不匹配时由 UVM fatal 中止。
+  // 输入/输出及副作用：resource（输入）；resource_local_id 读取 resource 并使用输入参数和固定枚举/常量；函数返回 int unsigned，不取得调用方资源所有权。
+  // 失败/边界：resource_local_id 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（Function resource type mismatch），不保留部分有效快照。
   protected function int unsigned resource_local_id(rdma_resource resource);
     rdma_pd pd;
     rdma_mr mr;
@@ -3601,6 +3913,9 @@ class rdma_resource_manager extends uvm_object;
     return '0;
   endfunction
 
+// 功能：resource_depends_on 遍历 candidate.dependencies，按 handle 身份匹配 dependency，判断资源是否存在直接依赖；不修改运行时账本。
+  // 输入/输出及副作用：candidate（输入）、dependency（输入）；resource_depends_on 读取 candidate、dependency 并使用字段 i；函数返回 bit，不取得调用方资源所有权。
+  // 失败/边界：resource_depends_on 比较或前置条件不满足时返回 0/false；该路径不隐式重试，也不转移未声明资源。
   protected function bit resource_depends_on(
     rdma_resource candidate,
     rdma_handle dependency
@@ -3615,6 +3930,9 @@ class rdma_resource_manager extends uvm_object;
     return 1'b0;
   endfunction
 
+  // 功能：判断 has_dependents 对应的状态、能力或账本条件，并返回确定的布尔/计数结果，不修改状态。
+  // 输入/输出及副作用：resource（输入）；has_dependents 读取 resource 并使用字段 registry、key、kind、owner；函数返回 bit，不取得调用方资源所有权。
+  // 失败/边界：has_dependents 只读取现有账本；输入未初始化时返回保守结果，不得借助默认 Function/root 猜测。
   protected function bit has_dependents(rdma_resource resource);
     foreach (registry[key]) begin
       if (registry[key] == resource)
@@ -3629,6 +3947,9 @@ class rdma_resource_manager extends uvm_object;
     return 1'b0;
   endfunction
 
+  // 功能：在 rdma_resource_manager 中，force_release_key 配置测试 fixture 的定向故障或替代依赖，使下一次调用覆盖指定边界路径。
+  // 输入/输出及副作用：key（输入）；force_release_key 读取 key 并使用字段 resource、kind、local_id、resource.state；函数返回 void，不取得调用方资源所有权。
+  // 失败/边界：force_release_key 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（authoritative local ID exceeds its hardware width），不保留部分有效快照。
   protected function void force_release_key(string key);
     rdma_resource resource;
     rdma_resource_kind_e kind;
@@ -3652,6 +3973,9 @@ class rdma_resource_manager extends uvm_object;
     registry.delete(key);
   endfunction
 
+  // 功能：create_function 创建独立的 rdma_status；根据 binding、function_resource 设置字段 function_resource、status、key、registered_binding、authoritative、authoritative.handle、authoritative.state、authoritative.local_function_id、authoritative.global_function_id、authoritative.rdma_vf_id，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：binding（输入）、function_resource（输出）；输入请求/句柄定义资源属性；成功时更新账本并通过返回值或 output 发布新句柄/映射。
+  // 失败/边界：create_function 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（published Function type mismatch），不保留部分有效快照。
   function rdma_status create_function(
     rdma_function_binding binding,
     output rdma_function function_resource
@@ -3736,6 +4060,9 @@ class rdma_resource_manager extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：create_pd 创建独立的 rdma_status；根据 binding、pd 设置字段 pd、status、authoritative、authoritative.handle、authoritative.owner、authoritative.state、authoritative.local_pd_id、authoritative.global_pd_id，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：binding（输入）、pd（输出）；输入请求/句柄定义资源属性；成功时更新账本并通过返回值或 output 发布新句柄/映射。
+  // 失败/边界：create_pd 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（published PD type mismatch），不保留部分有效快照。
   function rdma_status create_pd(
     rdma_function_binding binding,
     output rdma_pd pd
@@ -3774,6 +4101,9 @@ class rdma_resource_manager extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：create_mr 创建独立的 rdma_status；根据 binding、pd_h、mr 设置字段 mr、status、authoritative、authoritative.handle、authoritative.owner、authoritative.state、authoritative.local_mr_id、authoritative.global_mr_id，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：binding（输入）、pd_h（输入）、mr（输出）；输入请求/句柄定义资源属性；成功时更新账本并通过返回值或 output 发布新句柄/映射。
+  // 失败/边界：create_mr 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（published MR type mismatch），不保留部分有效快照。
   function rdma_status create_mr(
     rdma_function_binding binding,
     rdma_handle pd_h,
@@ -3830,6 +4160,9 @@ class rdma_resource_manager extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：create_cq 创建独立的 rdma_status；根据 binding、ceq_h、cq 设置字段 cq、status、authoritative、authoritative.handle、authoritative.owner、authoritative.state、authoritative.local_cq_id、authoritative.global_cq_id，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：binding（输入）、ceq_h（输入）、cq（输出）；输入请求/句柄定义资源属性；成功时更新账本并通过返回值或 output 发布新句柄/映射。
+  // 失败/边界：create_cq 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（published CQ type mismatch），不保留部分有效快照。
   function rdma_status create_cq(
     rdma_function_binding binding,
     rdma_handle ceq_h,
@@ -3889,6 +4222,10 @@ class rdma_resource_manager extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：create_qp 创建独立的 rdma_status；根据 binding、pd_h、send_cq_h、recv_cq_h、srq_h、qp 设置字段 qp、status、authoritative、authoritative.handle、authoritative.owner、authoritative.state、authoritative.local_qp_id、authoritative.global_qp_id、sequence_key，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：binding（输入）、pd_h（输入）、send_cq_h（输入）、recv_cq_h（输入）、srq_h（输入）、qp（输出）；输入请求/句柄定义资源属性；成功时更新账本并通过返回值或 output
+  //   发布新句柄/映射。
+  // 失败/边界：create_qp 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（published QP type mismatch），不保留部分有效快照。
   function rdma_status create_qp(
     rdma_function_binding binding,
     rdma_handle pd_h,
@@ -3993,6 +4330,9 @@ class rdma_resource_manager extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：在 rdma_resource_manager 中，qp_sequence 查询或更新指定 QP 的 incarnation sequence，保证 object ID 复用时 generation 单调推进。
+  // 输入/输出及副作用：owner（输入）、local_qpn（输入）、sequence_value（输出）；qp_sequence 读取 owner、local_qpn、sequence_value 并使用字段 sequence_value、status、key，并写入 sequence_value；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：qp_sequence 返回 RDMA_SC_INVALID_ARGUMENT；典型拒绝条件为“QP sequence identity is invalid”“QP sequence identity is unknown”；失败路径不提交部分状态或转移未声明资源。
   virtual function rdma_status qp_sequence(
     rdma_function_handle owner,
     int unsigned local_qpn,
@@ -4023,6 +4363,9 @@ class rdma_resource_manager extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：create_srq 创建独立的 rdma_status；根据 binding、pd_h、srq 设置字段 srq、status、authoritative、authoritative.handle、authoritative.owner、authoritative.state、authoritative.local_srq_id、authoritative.global_srq_id，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：binding（输入）、pd_h（输入）、srq（输出）；输入请求/句柄定义资源属性；成功时更新账本并通过返回值或 output 发布新句柄/映射。
+  // 失败/边界：create_srq 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（published SRQ type mismatch），不保留部分有效快照。
   function rdma_status create_srq(
     rdma_function_binding binding,
     rdma_handle pd_h,
@@ -4079,6 +4422,9 @@ class rdma_resource_manager extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：create_cmq 创建独立的 rdma_status；根据 binding、cmq 设置字段 cmq、status、authoritative、authoritative.handle、authoritative.owner、authoritative.state、authoritative.local_cmq_id、authoritative.global_cmq_id，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：binding（输入）、cmq（输出）；输入请求/句柄定义资源属性；成功时更新账本并通过返回值或 output 发布新句柄/映射。
+  // 失败/边界：create_cmq 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（published CMQ type mismatch），不保留部分有效快照。
   function rdma_status create_cmq(
     rdma_function_binding binding,
     output rdma_cmq cmq
@@ -4117,6 +4463,9 @@ class rdma_resource_manager extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：create_ceq 创建独立的 rdma_status；根据 binding、ceq 设置字段 ceq、status、authoritative、authoritative.handle、authoritative.owner、authoritative.state、authoritative.local_ceq_id、authoritative.global_ceq_id，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：binding（输入）、ceq（输出）；输入请求/句柄定义资源属性；成功时更新账本并通过返回值或 output 发布新句柄/映射。
+  // 失败/边界：create_ceq 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（published CEQ type mismatch），不保留部分有效快照。
   function rdma_status create_ceq(
     rdma_function_binding binding,
     output rdma_ceq ceq
@@ -4155,6 +4504,9 @@ class rdma_resource_manager extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：create_aeq 创建独立的 rdma_status；根据 binding、aeq 设置字段 aeq、status、authoritative、authoritative.handle、authoritative.owner、authoritative.state、authoritative.local_aeq_id、authoritative.global_aeq_id，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：binding（输入）、aeq（输出）；输入请求/句柄定义资源属性；成功时更新账本并通过返回值或 output 发布新句柄/映射。
+  // 失败/边界：create_aeq 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（published AEQ type mismatch），不保留部分有效快照。
   function rdma_status create_aeq(
     rdma_function_binding binding,
     output rdma_aeq aeq
@@ -4193,6 +4545,9 @@ class rdma_resource_manager extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：在 rdma_resource_manager 中，lookup 按完整 key/handle 查找唯一权威记录并返回 detached 快照，避免把内部可变引用泄露给调用方。
+  // 输入/输出及副作用：handle（输入）、resource（输出）；lookup 读取 handle、resource 并使用字段 resource、status、key、incarnation、owner，并写入 resource；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：lookup 在 key/handle 缺失、记录不唯一或 generation/reset epoch 过期时返回明确错误，不回退到默认 authority。
   function rdma_status lookup(
     rdma_handle handle,
     output rdma_resource resource
@@ -4254,6 +4609,9 @@ class rdma_resource_manager extends uvm_object;
                              "resource handle has been released");
   endfunction
 
+  // 功能：在 rdma_resource_manager 中，stage_allocated 预检输入并预留事务所需的槽位、映射或中间状态，失败时保留可恢复证据。
+  // 输入/输出及副作用：candidate（输入）；stage_allocated 读取 candidate 并使用字段 status、key、prepared.state、replacement.state；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：stage_allocated 返回 RDMA_SC_INVALID_STATE；具体拒绝条件包括 “QP resources require QP-specific programming attachment”；“staged candidate must be ALLOCATED”；“registry resource is not ALLOCATED”；“prepared staged candidate validation returned null”；“staged candidate validation returned null”；失败路径不提交部分状态、不隐式重试，也不转移未声明资源。
   virtual function rdma_status stage_allocated(rdma_resource candidate);
     rdma_resource authoritative;
     rdma_resource prepared;
@@ -4310,6 +4668,9 @@ class rdma_resource_manager extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：在 rdma_resource_manager 中，commit_programmed 执行受控事务并按后端提交证据推进状态机，同时保留失败阶段和 generation 证据。
+  // 输入/输出及副作用：candidate（输入）；输入 request/image/cursor 决定写入内容；成功时更新 PI/CI、slot ledger 或 pending journal，并通过 output 返回结果。
+  // 失败/边界：commit_programmed 遇到锁、超时、generation 变化或提交证据不完整时保持原状态，不推进游标。
   virtual function rdma_status commit_programmed(rdma_resource candidate);
     rdma_resource authoritative;
     rdma_resource replacement;
@@ -4360,6 +4721,9 @@ class rdma_resource_manager extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：在 rdma_resource_manager 中，activate 校验依赖和 binding 后建立运行边界，只保存非拥有引用并拒绝重复配置。
+  // 输入/输出及副作用：handle（输入）；activate 先依据 !status.ok(；authoritative.handle.kind == RDMA_RESOURCE_PD；registry[key].state != RDMA_RESOURCE_ALLOCATED 校验 handle；成功时更新本对象配置/状态并保存非拥有引用，返回 rdma_status。
+  // 失败/边界：实现中的空依赖、重复登记、状态或 generation/authority 校验失败时返回错误；失败时保留旧配置。
   virtual function rdma_status activate(rdma_handle handle);
     rdma_resource authoritative;
     rdma_resource replacement;
@@ -4398,6 +4762,9 @@ class rdma_resource_manager extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：在 rdma_resource_manager 中，begin_quiesce 校验资源代际后把活动对象切换到 quiescing，阻止新的提交并为销毁/复位建立屏障。
+  // 输入/输出及副作用：handle（输入）；begin_quiesce 读取 handle 并使用字段 status、key、replacement.state；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：begin_quiesce 返回 RDMA_SC_INVALID_STATE、RDMA_SC_RESOURCE_BUSY；典型拒绝条件为“only ACTIVE resource can begin quiesce”“resource still has live dependents”；失败路径不提交部分状态或转移未声明资源。
   virtual function rdma_status begin_quiesce(rdma_handle handle);
     rdma_resource authoritative;
     rdma_resource replacement;
@@ -4431,6 +4798,9 @@ class rdma_resource_manager extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：在 rdma_resource_manager 中，attach_qp_programming 把 attach_qp_programming 指定的资源或后端能力绑定到当前对象索引，并校验 Function、generation 和队列类型一致。
+  // 输入/输出及副作用：candidate（输入）；attach_qp_programming 先依据 !status.ok(；replacement.state != RDMA_RESOURCE_ALLOCATED || replacement.qp_plan == null || replacement.programmed_qpc == null；registry.exists(key 校验 candidate；成功时更新本对象配置/状态并保存非拥有引用，返回 rdma_status。
+  // 失败/边界：资源不存在、类型不符、重复登记或跨 Function 串线时拒绝绑定并保持索引不变。
   virtual function rdma_status attach_qp_programming(rdma_qp candidate);
     rdma_resource authoritative;
     rdma_resource projected;
@@ -4488,6 +4858,10 @@ class rdma_resource_manager extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：在 rdma_resource_manager 中，commit_qp_semantic_state 执行受控事务并按后端提交证据推进状态机，同时保留失败阶段和 generation 证据。
+  // 输入/输出及副作用：qp_h（输入）、state（输入）；输入 request/image/cursor 决定写入内容；成功时更新 PI/CI、slot ledger 或 pending journal，并通过 output
+  //   返回结果。
+  // 失败/边界：commit_qp_semantic_state 遇到锁、超时、generation 变化或提交证据不完整时保持原状态，不推进游标。
   virtual function rdma_status commit_qp_semantic_state(
     rdma_handle qp_h,
     rdma_qp_state_e state
@@ -4529,6 +4903,9 @@ class rdma_resource_manager extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：在 rdma_resource_manager 中，commit_qp_programmed 执行受控事务并按后端提交证据推进状态机，同时保留失败阶段和 generation 证据。
+  // 输入/输出及副作用：candidate（输入）；输入 request/image/cursor 决定写入内容；成功时更新 PI/CI、slot ledger 或 pending journal，并通过 output 返回结果。
+  // 失败/边界：commit_qp_programmed 遇到锁、超时、generation 变化或提交证据不完整时保持原状态，不推进游标。
   virtual function rdma_status commit_qp_programmed(rdma_qp candidate);
     rdma_resource authoritative;
     rdma_resource projected;
@@ -4698,6 +5075,10 @@ class rdma_resource_manager extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：执行 mark_qp_error 指定的测试或恢复状态变更，更新受控账本并保留可回滚的故障证据。
+  // 输入/输出及副作用：qp_h（输入）、recovery（输入）；输入 request/image/cursor 决定写入内容；成功时更新 PI/CI、slot ledger 或 pending journal，并通过
+  //   output 返回结果。
+  // 失败/边界：mark_qp_error 仅允许测试/恢复范围内的状态变更；代际或资源不匹配时拒绝并保留原账本。
   virtual function rdma_status mark_qp_error(
     rdma_handle qp_h,
     rdma_qp_recovery_state recovery
@@ -5139,6 +5520,9 @@ class rdma_resource_manager extends uvm_object;
   // cleanup role bits (the ERROR transition and QPC_DELETE).  This operation
   // never changes the resource state or any authority-bearing identity; it
   // only replaces the detached recovery snapshot after full validation.
+  // 功能：update_qp_recovery_progress 更新字段 status、key、existing_record、existing_recovery、replacement_record.qp_recovery、replacement_record.hardware_presence，并在提交前保持 Function authority、generation 和资源所有权约束。
+  // 输入/输出及副作用：qp_h（输入）、recovery（输入）；update_qp_recovery_progress 读取 qp_h、recovery 并使用字段 status、key、existing_record、existing_recovery、replacement_record.qp_recovery、replacement_record.hardware_presence；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：update_qp_recovery_progress 返回 RDMA_SC_INVALID_ARGUMENT、RDMA_SC_INVALID_STATE；具体拒绝条件包括 “QP recovery progress target is not a QP”；“QP recovery progress requires an ERROR recovery record”；“QP recovery progress record is incomplete”；“QP recovery progress projection is empty”；“QP recovery progress changed retained authority”；失败路径不提交部分状态、不隐式重试，也不转移未声明资源。
   virtual function rdma_status update_qp_recovery_progress(
     rdma_handle qp_h,
     rdma_qp_recovery_state recovery
@@ -5232,6 +5616,10 @@ class rdma_resource_manager extends uvm_object;
   // existing recovery record has no query authority.  This narrow mutation
   // keeps query allocation failures recoverable without permitting callers to
   // replace an established mapping identity.
+  // 功能：执行 retain_qp_query_mapping 指定的测试或恢复状态变更，更新受控账本并保留可回滚的故障证据。
+  // 输入/输出及副作用：qp_h（输入）、query_mapping（输入）、b0（输入）；retain_qp_query_mapping 读取 qp_h、query_mapping、query_mapping_recovery_only 并使用字段 status、key、existing_record、recovery、qp_recovery.query_mapping、qp_recovery.query_mapping_recovery_only；函数返回 rdma_status，不取得调用方资源所有权。
+
+  // 失败/边界：retain_qp_query_mapping 仅允许测试/恢复范围内的状态变更；代际或资源不匹配时拒绝并保留原账本。
   virtual function rdma_status retain_qp_query_mapping(
     rdma_handle qp_h,
     rdma_dma_mapping query_mapping,
@@ -5295,6 +5683,9 @@ class rdma_resource_manager extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：在 rdma_resource_manager 中，qp_plan_ref 读取或发布队列/QP 恢复进度快照，使恢复步骤可重复执行且不会重复释放资源。
+  // 输入/输出及副作用：plan（输入）、role（输入）；qp_plan_ref 读取 plan、role 并使用字段 i；函数返回 rdma_qp_backing_ref，不取得调用方资源所有权。
+  // 失败/边界：qp_plan_ref 输入对象为空或查找未命中时返回 null；该路径不隐式重试，也不转移未声明资源。
   protected function rdma_qp_backing_ref qp_plan_ref(
     rdma_qp_backing_plan plan,
     rdma_queue_backing_role_e role
@@ -5316,6 +5707,9 @@ class rdma_resource_manager extends uvm_object;
     return null;
   endfunction
 
+  // 功能：qp_owned_cleanup_role_complete 比较 plan、role 与当前 authority/状态字段，返回布尔结果供上层执行精确分支。
+  // 输入/输出及副作用：plan（输入）、role（输入）；qp_owned_cleanup_role_complete 读取 plan、role 并使用字段 backing_ref；函数返回 bit，不取得调用方资源所有权。
+  // 失败/边界：qp_owned_cleanup_role_complete 比较或前置条件不满足时返回 0/false；该路径不隐式重试，也不转移未声明资源。
   protected function bit qp_owned_cleanup_role_complete(
     rdma_qp_backing_plan plan,
     rdma_queue_backing_role_e role
@@ -5334,6 +5728,9 @@ class rdma_resource_manager extends uvm_object;
            backing_ref.cleanup_complete;
   endfunction
 
+  // 功能：qp_cleanup_predecessors_complete 比较 plan、role 与当前 authority/状态字段，返回布尔结果供上层执行精确分支。
+  // 输入/输出及副作用：plan（输入）、role（输入）；qp_cleanup_predecessors_complete 读取 plan、role 并使用字段 urc_dsq_complete、urc_rdsq_complete、urc_rsq_complete、rq_pd_complete、sq_pd_complete、rq_ring_complete；函数返回 bit，不取得调用方资源所有权。
+  // 失败/边界：qp_cleanup_predecessors_complete 比较或前置条件不满足时返回 0/false；该路径不隐式重试，也不转移未声明资源。
   protected function bit qp_cleanup_predecessors_complete(
     rdma_qp_backing_plan plan,
     rdma_queue_backing_role_e role
@@ -5389,6 +5786,10 @@ class rdma_resource_manager extends uvm_object;
     endcase
   endfunction
 
+  // 功能：在 rdma_resource_manager 中，qp_progress_snapshots 读取或发布队列/QP 恢复进度快照，使恢复步骤可重复执行且不会重复释放资源。
+  // 输入/输出及副作用：qp_h（输入）、operation（输入）、key（输出）、resource_copy（输出）、recovery_copy（输出）、has_recovery（输出）；qp_progress_snapshots 读取 qp_h、operation、key、resource_copy、recovery_copy、has_recovery 并使用字段 key、resource_copy、recovery_copy、has_recovery、status，并写入 key、resource_copy、recovery_copy、has_recovery；函数返回 rdma_status，不取得调用方资源所有权。
+
+  // 失败/边界：qp_progress_snapshots 返回 RDMA_SC_INVALID_ARGUMENT、RDMA_SC_INVALID_STATE；失败路径不提交部分状态或转移未声明资源。
   protected function rdma_status qp_progress_snapshots(
     rdma_handle qp_h,
     string operation,
@@ -5448,6 +5849,10 @@ class rdma_resource_manager extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：在 rdma_resource_manager 中，commit_qp_progress 执行受控事务并按后端提交证据推进状态机，同时保留失败阶段和 generation 证据。
+  // 输入/输出及副作用：key（输入）、resource_copy（输入）、recovery_copy（输入）、has_recovery（输入）、operation（输入）；输入 request/image/cursor
+  //   决定写入内容；成功时更新 PI/CI、slot ledger 或 pending journal，并通过 output 返回结果。
+  // 失败/边界：commit_qp_progress 遇到锁、超时、generation 变化或提交证据不完整时保持原状态，不推进游标。
   protected function rdma_status commit_qp_progress(
     string key,
     rdma_qp resource_copy,
@@ -5480,6 +5885,10 @@ class rdma_resource_manager extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：在 rdma_resource_manager 中，record_qp_flush_complete 记录 record_qp_flush_complete 的调用名称和顺序，供测试断言转发路径；不改变被测事务业务结果。
+  // 输入/输出及副作用：qp_h（输入）、role（输入）；输入 request/image/cursor 决定写入内容；成功时更新 PI/CI、slot ledger 或 pending journal，并通过 output
+  //   返回结果。
+  // 失败/边界：记录操作仅影响测试 trace；不得因注入记录故障改变生产状态或吞掉真实错误。
   virtual function rdma_status record_qp_flush_complete(
     rdma_handle qp_h,
     rdma_queue_backing_role_e role
@@ -5556,6 +5965,10 @@ class rdma_resource_manager extends uvm_object;
                               "QP flush progress");
   endfunction
 
+  // 功能：在 rdma_resource_manager 中，record_qp_cleanup_complete 记录 record_qp_cleanup_complete 的调用名称和顺序，供测试断言转发路径；不改变被测事务业务结果。
+  // 输入/输出及副作用：qp_h（输入）、role（输入）；输入 request/image/cursor 决定写入内容；成功时更新 PI/CI、slot ledger 或 pending journal，并通过 output
+  //   返回结果。
+  // 失败/边界：记录操作仅影响测试 trace；不得因注入记录故障改变生产状态或吞掉真实错误。
   virtual function rdma_status record_qp_cleanup_complete(
     rdma_handle qp_h,
     rdma_queue_backing_role_e role
@@ -5649,6 +6062,9 @@ class rdma_resource_manager extends uvm_object;
                               "QP cleanup progress");
   endfunction
 
+  // 功能：在 rdma_resource_manager 中，record_qp_context_cleanup_complete 记录 record_qp_context_cleanup_complete 的调用名称和顺序，供测试断言转发路径；不改变被测事务业务结果。
+  // 输入/输出及副作用：qp_h（输入）；输入 request/image/cursor 决定写入内容；成功时更新 PI/CI、slot ledger 或 pending journal，并通过 output 返回结果。
+  // 失败/边界：记录操作仅影响测试 trace；不得因注入记录故障改变生产状态或吞掉真实错误。
   virtual function rdma_status record_qp_context_cleanup_complete(
     rdma_handle qp_h
   );
@@ -5735,6 +6151,9 @@ class rdma_resource_manager extends uvm_object;
                               "QP context cleanup");
   endfunction
 
+  // 功能：qp_plan_cleanup_ready 比较 plan 与当前 authority/状态字段，返回布尔结果供上层执行精确分支。
+  // 输入/输出及副作用：plan（输入）；qp_plan_cleanup_ready 读取 plan 并使用字段 status；函数返回 bit，不取得调用方资源所有权。
+  // 失败/边界：qp_plan_cleanup_ready 比较或前置条件不满足时返回 0/false；该路径不隐式重试，也不转移未声明资源。
   protected function bit qp_plan_cleanup_ready(rdma_qp_backing_plan plan);
     rdma_qp_backing_ref refs[$];
     rdma_queue_slot_token_contract token;
@@ -5791,6 +6210,9 @@ class rdma_resource_manager extends uvm_object;
     return 1'b1;
   endfunction
 
+  // 功能：在 rdma_resource_manager 中，finalize_qp_release 按 owner、generation 和幂等规则释放或清理资源，同时删除相关账本记录。
+  // 输入/输出及副作用：qp_h（输入）；finalize_qp_release 读取 qp_h 并使用字段 status、key、recovery；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：finalize_qp_release 返回 RDMA_SC_INVALID_ARGUMENT、RDMA_SC_RESOURCE_BUSY、RDMA_SC_INVALID_STATE、RDMA_SC_RECOVERY_REQUIRED；典型拒绝条件为“QP finalization target is not a QP”“QP reservation is still busy”；失败路径不提交部分状态或转移未声明资源。
   virtual function rdma_status finalize_qp_release(rdma_handle qp_h);
     rdma_resource authoritative;
     rdma_qp authoritative_qp;
@@ -5919,6 +6341,10 @@ class rdma_resource_manager extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：在 rdma_resource_manager 中，queue_progress_snapshots 读取或发布队列/QP 恢复进度快照，使恢复步骤可重复执行且不会重复释放资源。
+  // 输入/输出及副作用：handle（输入）、operation（输入）、key（输出）、resource_copy（输出）、recovery_copy（输出）、has_recovery（输出）；queue_progress_snapshots 读取 handle、operation、key、resource_copy、recovery_copy、has_recovery 并使用字段 key、resource_copy、recovery_copy、has_recovery、status，并写入 key、resource_copy、recovery_copy、has_recovery；函数返回 rdma_status，不取得调用方资源所有权。
+
+  // 失败/边界：queue_progress_snapshots 返回 RDMA_SC_INVALID_STATE；具体拒绝条件包括 “queue progress requires QUIESCING or ERROR queue”；“queue progress resource plan is missing”；“queue progress plan validation returned null”；“ERROR queue has no recovery record”；“ERROR queue recovery schema is incomplete”；失败路径不提交部分状态、不隐式重试，也不转移未声明资源。
   protected function rdma_status queue_progress_snapshots(
     rdma_handle handle,
     string operation,
@@ -5978,6 +6404,10 @@ class rdma_resource_manager extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：在 rdma_resource_manager 中，commit_queue_progress 执行受控事务并按后端提交证据推进状态机，同时保留失败阶段和 generation 证据。
+  // 输入/输出及副作用：key（输入）、resource_copy（输入）、recovery_copy（输入）、has_recovery（输入）、operation（输入）；输入 request/image/cursor
+  //   决定写入内容；成功时更新 PI/CI、slot ledger 或 pending journal，并通过 output 返回结果。
+  // 失败/边界：commit_queue_progress 遇到锁、超时、generation 变化或提交证据不完整时保持原状态，不推进游标。
   protected function rdma_status commit_queue_progress(
     string key,
     rdma_resource resource_copy,
@@ -6007,6 +6437,10 @@ class rdma_resource_manager extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：在 rdma_resource_manager 中，record_queue_flush_complete 记录 record_queue_flush_complete 的调用名称和顺序，供测试断言转发路径；不改变被测事务业务结果。
+  // 输入/输出及副作用：handle（输入）、role（输入）；输入 request/image/cursor 决定写入内容；成功时更新 PI/CI、slot ledger 或 pending journal，并通过 output
+  //   返回结果。
+  // 失败/边界：记录操作仅影响测试 trace；不得因注入记录故障改变生产状态或吞掉真实错误。
   virtual function rdma_status record_queue_flush_complete(
     rdma_handle handle,
     rdma_queue_backing_role_e role
@@ -6094,6 +6528,10 @@ class rdma_resource_manager extends uvm_object;
                                  "queue flush progress");
   endfunction
 
+  // 功能：在 rdma_resource_manager 中，record_queue_cleanup_complete 记录 record_queue_cleanup_complete 的调用名称和顺序，供测试断言转发路径；不改变被测事务业务结果。
+  // 输入/输出及副作用：handle（输入）、role（输入）；输入 request/image/cursor 决定写入内容；成功时更新 PI/CI、slot ledger 或 pending journal，并通过 output
+  //   返回结果。
+  // 失败/边界：记录操作仅影响测试 trace；不得因注入记录故障改变生产状态或吞掉真实错误。
   virtual function rdma_status record_queue_cleanup_complete(
     rdma_handle handle,
     rdma_queue_backing_role_e role
@@ -6199,6 +6637,9 @@ class rdma_resource_manager extends uvm_object;
                                  "queue cleanup progress");
   endfunction
 
+  // 功能：在 rdma_resource_manager 中，record_queue_context_cleanup_complete 记录 record_queue_context_cleanup_complete 的调用名称和顺序，供测试断言转发路径；不改变被测事务业务结果。
+  // 输入/输出及副作用：handle（输入）；输入 request/image/cursor 决定写入内容；成功时更新 PI/CI、slot ledger 或 pending journal，并通过 output 返回结果。
+  // 失败/边界：记录操作仅影响测试 trace；不得因注入记录故障改变生产状态或吞掉真实错误。
   virtual function rdma_status record_queue_context_cleanup_complete(
     rdma_handle handle
   );
@@ -6233,6 +6674,9 @@ class rdma_resource_manager extends uvm_object;
   // replacement is published.  Keep a protected observation point at the
   // atomic boundary so derived managers can audit the prepared metadata
   // without extending its lifetime or changing publication ordering.
+  // 功能：在 rdma_resource_manager 中，queue_restore_pre_publish_observer 读取或发布队列/QP 恢复进度快照，使恢复步骤可重复执行且不会重复释放资源。
+  // 输入/输出及副作用：prepared_recovery（输入）；queue_restore_pre_publish_observer 读取 prepared_recovery 并使用输入参数和固定枚举/常量；函数返回 void，不取得调用方资源所有权。
+  // 失败/边界：queue_restore_pre_publish_observer 是抽象接口，完成、失败和资源回滚语义由实现类按本契约提供。
   protected virtual function void queue_restore_pre_publish_observer(
     rdma_recovery_record prepared_recovery
   );
@@ -6241,11 +6685,17 @@ class rdma_resource_manager extends uvm_object;
   // This protected boundary observes detached queue replacements only.  It is
   // intentionally before their final validation and never exposes a live
   // registry or recovery-record object to the caller.
+  // 功能：queue_restore_pre_validate_observer 校验 prepared_resource 与当前对象状态的一致性，返回 void 供上层决定是否提交。
+  // 输入/输出及副作用：prepared_resource（输入）；queue_restore_pre_validate_observer 读取 prepared_resource 并使用输入参数和固定枚举/常量；函数返回 void，不取得调用方资源所有权。
+  // 失败/边界：queue_restore_pre_validate_observer 是抽象接口，完成、失败和资源回滚语义由实现类按本契约提供。
   protected virtual function void queue_restore_pre_validate_observer(
     rdma_resource prepared_resource
   );
   endfunction
 
+  // 功能：在 rdma_resource_manager 中，restore_active 执行 restore_active 的restore_active 指定的测试或恢复状态变更，更新受控账本并保留可回滚的故障证据。
+  // 输入/输出及副作用：handle（输入）；输入 action/epoch/handle 决定迁移目标；成功时更新状态或恢复证据，外部资源仍由其拥有者管理。
+  // 失败/边界：restore_active 仅允许测试/恢复范围内的状态变更；代际或资源不匹配时拒绝并保留原账本。
   virtual function rdma_status restore_active(rdma_handle handle);
     rdma_resource authoritative;
     rdma_resource replacement;
@@ -6610,6 +7060,9 @@ class rdma_resource_manager extends uvm_object;
   // Compare the durable progress portion of two recovery snapshots.  Calls
   // that merely re-publish an identical ERROR snapshot are rejected, while a
   // changed pending/completed bit or cleanup proof is accepted atomically.
+  // 功能：在 rdma_resource_manager 中由 same_queue_recovery_progress 逐字段比较输入值，返回结构、身份或序列化内容是否一致。
+  // 输入/输出及副作用：lhs（输入）、rhs（输入）；比较对象/数组只读；返回 bit 或状态结果，不更新 runtime、账本或外部 adapter。
+  // 失败/边界：same_queue_recovery_progress 的任一比较对象为空或类型不符时返回确定的 false/不等结果，不抛出未处理异常。
   protected function bit same_queue_recovery_progress(
     rdma_recovery_record lhs,
     rdma_recovery_record rhs
@@ -6650,6 +7103,10 @@ class rdma_resource_manager extends uvm_object;
     return 1'b1;
   endfunction
 
+  // 功能：执行 mark_error_transition 指定的测试或恢复状态变更，更新受控账本并保留可回滚的故障证据。
+  // 输入/输出及副作用：handle（输入）、recovery（输入）、reserved_only（输入）；输入 request/image/cursor 决定写入内容；成功时更新 PI/CI、slot ledger 或
+  //   pending journal，并通过 output 返回结果。
+  // 失败/边界：mark_error_transition 仅允许测试/恢复范围内的状态变更；代际或资源不匹配时拒绝并保留原账本。
   protected function rdma_status mark_error_transition(
     rdma_handle handle,
     rdma_recovery_record recovery,
@@ -6998,6 +7455,10 @@ class rdma_resource_manager extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：在 rdma_resource_manager 中，mark_error 执行 mark_error 的mark_error 指定的测试或恢复状态变更，更新受控账本并保留可回滚的故障证据。
+  // 输入/输出及副作用：handle（输入）、recovery（输入）；输入 request/image/cursor 决定写入内容；成功时更新 PI/CI、slot ledger 或 pending journal，并通过
+  //   output 返回结果。
+  // 失败/边界：mark_error 仅允许测试/恢复范围内的状态变更；代际或资源不匹配时拒绝并保留原账本。
   virtual function rdma_status mark_error(
     rdma_handle handle,
     rdma_recovery_record recovery
@@ -7005,6 +7466,10 @@ class rdma_resource_manager extends uvm_object;
     return mark_error_transition(handle, recovery, 1'b0);
   endfunction
 
+  // 功能：执行 mark_reserved_error 指定的测试或恢复状态变更，更新受控账本并保留可回滚的故障证据。
+  // 输入/输出及副作用：handle（输入）、recovery（输入）；输入 request/image/cursor 决定写入内容；成功时更新 PI/CI、slot ledger 或 pending journal，并通过
+  //   output 返回结果。
+  // 失败/边界：mark_reserved_error 仅允许测试/恢复范围内的状态变更；代际或资源不匹配时拒绝并保留原账本。
   virtual function rdma_status mark_reserved_error(
     rdma_handle handle,
     rdma_recovery_record recovery
@@ -7015,6 +7480,9 @@ class rdma_resource_manager extends uvm_object;
   // Completes only the no-hardware recovery shape created by
   // mark_reserved_error().  The control plane must release the retained
   // backing authority before invoking this atomic local transition.
+  // 功能：在 rdma_resource_manager 中，complete_reserved_error 提交当前事务阶段并发布 detached 结果，只有成功路径才推进游标或状态。
+  // 输入/输出及副作用：handle（输入）；complete_reserved_error 读取 handle 并使用字段 status、key、recovery、backing_release_pending、canonical_mapping；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：complete_reserved_error 返回 RDMA_SC_INVALID_STATE、RDMA_SC_RECOVERY_REQUIRED、RDMA_SC_INVALID_ARGUMENT、RDMA_SC_RESOURCE_BUSY；具体拒绝条件包括 “resource is not a reserved ERROR MR”；“reserved ERROR completion rejects hardware history”；“reserved ERROR MR still requires non-local recovery”；“reserved ERROR backing cleanup schema is invalid”；“reserved ERROR resource cleanup schema is invalid”；失败路径不提交部分状态、不隐式重试，也不转移未声明资源。
   virtual function rdma_status complete_reserved_error(
     rdma_handle handle
   );
@@ -7108,6 +7576,9 @@ class rdma_resource_manager extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：在 rdma_resource_manager 中，lookup_recovery 按完整 key/handle 查找唯一权威记录并返回 detached 快照，避免把内部可变引用泄露给调用方。
+  // 输入/输出及副作用：handle（输入）、recovery（输出）；lookup_recovery 读取 handle、recovery 并使用字段 recovery、status、key，并写入 recovery；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：lookup_recovery 在 key/handle 缺失、记录不唯一或 generation/reset epoch 过期时返回明确错误，不回退到默认 authority。
   virtual function rdma_status lookup_recovery(
     rdma_handle handle,
     output rdma_recovery_record recovery
@@ -7131,6 +7602,9 @@ class rdma_resource_manager extends uvm_object;
                                 recovery);
   endfunction
 
+  // 功能：在 rdma_resource_manager 中，clear_recovery 按 owner、generation 和幂等规则释放/隔离记录，并同步删除其账本引用。
+  // 输入/输出及副作用：handle（输入）；输入 action/epoch/handle 决定迁移目标；成功时更新状态或恢复证据，外部资源仍由其拥有者管理。
+  // 失败/边界：clear_recovery 发现 owner/generation 不匹配、记录未知或重复释放时返回错误或幂等结果，不重新激活旧句柄。
   virtual function rdma_status clear_recovery(rdma_handle handle);
     rdma_resource authoritative;
     rdma_status status;
@@ -7158,6 +7632,9 @@ class rdma_resource_manager extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：在 rdma_resource_manager 中，finalize_release 按 owner、generation 和幂等规则释放或清理资源，同时删除相关账本记录。
+  // 输入/输出及副作用：handle（输入）；finalize_release 读取 handle 并使用字段 status、key；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：finalize_release 返回 RDMA_SC_INVALID_STATE、RDMA_SC_RECOVERY_REQUIRED、RDMA_SC_RESOURCE_BUSY；具体拒绝条件包括 “Function resources require privileged Function teardown”；“QP resources require QP-specific finalization”；“ERROR resource still requires recovery”；“only QUIESCING or recovered ERROR resource can be finalized”；“resource still has live dependents”；失败路径不提交部分状态、不隐式重试，也不转移未声明资源。
   virtual function rdma_status finalize_release(rdma_handle handle);
     rdma_resource authoritative;
     rdma_status status;
@@ -7209,6 +7686,9 @@ class rdma_resource_manager extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：在 rdma_resource_manager 中，release_reserved 按 owner、generation 和幂等规则释放/隔离记录，并同步删除其账本引用。
+  // 输入/输出及副作用：handle（输入）；输入 handle/mapping/token 指定释放目标；成功时更新账本和生命周期，外部资源只按 adapter 契约释放。
+  // 失败/边界：release_reserved 发现 owner/generation 不匹配、记录未知或重复释放时返回错误或幂等结果，不重新激活旧句柄。
   virtual function rdma_status release_reserved(rdma_handle handle);
     rdma_resource authoritative;
     rdma_qp authoritative_qp;
@@ -7285,6 +7765,9 @@ class rdma_resource_manager extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：执行 track_outstanding 指定的测试或恢复状态变更，更新受控账本并保留可回滚的故障证据。
+  // 输入/输出及副作用：handle（输入）、outstanding_id（输入）；track_outstanding 读取 handle、outstanding_id 并使用字段 status、key；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：track_outstanding 仅允许测试/恢复范围内的状态变更；代际或资源不匹配时拒绝并保留原账本。
   virtual function rdma_status track_outstanding(
     rdma_handle handle,
     longint unsigned outstanding_id
@@ -7322,6 +7805,9 @@ class rdma_resource_manager extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：在 rdma_resource_manager 中，retire_outstanding 按 owner、generation 和幂等规则释放/隔离记录，并同步删除其账本引用。
+  // 输入/输出及副作用：handle（输入）、outstanding_id（输入）；retire_outstanding 可能更新本对象明确拥有的状态；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：retire_outstanding 发现 owner/generation 不匹配、记录未知或重复释放时返回错误或幂等结果，不重新激活旧句柄。
   virtual function rdma_status retire_outstanding(
     rdma_handle handle,
     longint unsigned outstanding_id
@@ -7357,6 +7843,9 @@ class rdma_resource_manager extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：在 rdma_resource_manager 中，freeze 按 owner、generation 和幂等规则释放/隔离记录，并同步删除其账本引用。
+  // 输入/输出及副作用：handle（输入）；输入 handle/mapping/token 指定释放目标；成功时更新账本和生命周期，外部资源只按 adapter 契约释放。
+  // 失败/边界：freeze 发现 owner/generation 不匹配、记录未知或重复释放时返回错误或幂等结果，不重新激活旧句柄。
   function rdma_status freeze(rdma_handle handle);
     rdma_resource candidate;
     rdma_status status;
@@ -7367,6 +7856,9 @@ class rdma_resource_manager extends uvm_object;
     return commit_programmed(candidate);
   endfunction
 
+  // 功能：在 rdma_resource_manager 中，release 按 owner、generation 和幂等规则释放/隔离记录，并同步删除其账本引用。
+  // 输入/输出及副作用：handle（输入）；输入 handle/mapping/token 指定释放目标；成功时更新账本和生命周期，外部资源只按 adapter 契约释放。
+  // 失败/边界：release 发现 owner/generation 不匹配、记录未知或重复释放时返回错误或幂等结果，不重新激活旧句柄。
   function rdma_status \release (rdma_handle handle);
     rdma_resource ignored;
     rdma_status status;
@@ -7407,6 +7899,9 @@ class rdma_resource_manager extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：在 rdma_resource_manager 中，release_function 按 owner、generation 和幂等规则释放/隔离记录，并同步删除其账本引用。
+  // 输入/输出及副作用：owner（输入）；输入 handle/mapping/token 指定释放目标；成功时更新账本和生命周期，外部资源只按 adapter 契约释放。
+  // 失败/边界：release_function 发现 owner/generation 不匹配、记录未知或重复释放时返回错误或幂等结果，不重新激活旧句柄。
   function rdma_status release_function(rdma_function_handle owner);
     bit selected[string];
     string release_order[$];
@@ -7490,6 +7985,9 @@ class rdma_resource_manager extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：check_leaks 校验 leak_count、null 与当前对象状态的一致性，并显式处理“leak filter”等拒绝条件，返回 rdma_status 供上层决定是否提交。
+  // 输入/输出及副作用：leak_count（输出）、null（输入）；check_leaks 读取 leak_count、owner 并使用字段 leak_count、trusted_owner、status，并写入 leak_count；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：必需对象/句柄/快照为空，或身份、范围、generation 和生命周期检查失败时返回非成功状态。
   function rdma_status check_leaks(
     output int unsigned leak_count,
     input rdma_function_handle owner = null

@@ -1,13 +1,24 @@
+// 目录：测试层 unit/rdma_control_plane_test.sv。
+// 职责：验证 rdma_control_plane_test 对应模块的接口、错误路径和边界行为。
+// 依赖：依赖被测 package、UVM 测试基类和必要的 mock/fixture。
+// 所有权与生命周期：测试对象只拥有本地 fixture；外部后端句柄由测试环境提供并在测试结束释放。
+
 // 中文说明：rdma_control_plane_test.sv 属于单元测试，覆盖对应模型、编码器或执行器契约。
 // 阅读提示：先看公开类型和接口，再看实现细节；失败路径应保持状态与资源所有权可追踪。
 
 class rdma_control_plane_probe extends rdma_control_plane;
   `uvm_object_utils(rdma_control_plane_probe)
 
+  // 功能：构造 rdma_control_plane_probe，调用 super.new 建立 UVM 层级对象；外部依赖字段保持未绑定，后续由 configure/build/activate 明确注入。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_control_plane_probe 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_control_plane_probe");
     super.new(name);
   endfunction
 
+  // 功能：在 rdma_control_plane_probe 中，force_transaction_allocator 配置测试 fixture 的定向故障或替代依赖，使下一次调用覆盖指定边界路径。
+  // 输入/输出及副作用：next_id（输入）、exhausted（输入）；force_transaction_allocator 读取 next_id、exhausted 并使用字段 next_transaction_id、transaction_ids_exhausted；函数返回 void，不取得调用方资源所有权。
+  // 失败/边界：force_transaction_allocator 无返回值，仅执行 next_transaction_id=next_id、transaction_ids_exhausted=exhausted；调用方须保证前置依赖已经绑定，函数不自动重试或接管外部资源。
   function void force_transaction_allocator(
     longint unsigned next_id,
     bit exhausted
@@ -16,6 +27,9 @@ class rdma_control_plane_probe extends rdma_control_plane;
     transaction_ids_exhausted = exhausted;
   endfunction
 
+  // 功能：在 rdma_control_plane_probe 中，acquire_test_function_lock 检查容量后预留资源并返回带 owner 证据的句柄/计划；失败时回滚已登记的局部状态。
+  // 输入/输出及副作用：owner（输入）、function_lock（输出）；输入请求/句柄定义资源属性；成功时更新账本并通过返回值或 output 发布新句柄/映射。
+  // 失败/边界：容量不足、范围非法、重复占用或身份过期时返回错误；失败不得泄漏半分配资源。
   task acquire_test_function_lock(
     rdma_function_handle owner,
     output semaphore function_lock
@@ -23,21 +37,34 @@ class rdma_control_plane_probe extends rdma_control_plane;
     acquire_function_lock(owner, function_lock);
   endtask
 
+  // 功能：在 rdma_control_plane_probe 中，release_test_function_lock 按 owner、generation 和幂等规则释放/隔离记录，并同步删除其账本引用。
+  // 输入/输出及副作用：function_lock（输入）；输入 handle/mapping/token 指定释放目标；成功时更新账本和生命周期，外部资源只按 adapter 契约释放。
+  // 失败/边界：release_test_function_lock 发现 owner/generation 不匹配、记录未知或重复释放时返回错误或幂等结果，不重新激活旧句柄。
   task release_test_function_lock(semaphore function_lock);
     if (function_lock != null)
       function_lock.put(1);
   endtask
 
+  // 功能：在 rdma_control_plane_probe 中，acquire_test_lock_table_guard 检查容量后预留资源并返回带 owner 证据的句柄/计划；失败时回滚已登记的局部状态。
+  // 输入/输出及副作用：guard（输出）；输入请求/句柄定义资源属性；成功时更新账本并通过返回值或 output 发布新句柄/映射。
+  // 失败/边界：容量不足、范围非法、重复占用或身份过期时返回错误；失败不得泄漏半分配资源。
   task acquire_test_lock_table_guard(output semaphore guard);
     guard = lock_table_guard;
     guard.get(1);
   endtask
 
+  // 功能：在 rdma_control_plane_probe 中，release_test_lock_table_guard 按 owner、generation 和幂等规则释放/隔离记录，并同步删除其账本引用。
+  // 输入/输出及副作用：guard（输入）；输入 handle/mapping/token 指定释放目标；成功时更新账本和生命周期，外部资源只按 adapter 契约释放。
+  // 失败/边界：release_test_lock_table_guard 发现 owner/generation 不匹配、记录未知或重复释放时返回错误或幂等结果，不重新激活旧句柄。
   task release_test_lock_table_guard(semaphore guard);
     if (guard != null)
       guard.put(1);
   endtask
 
+  // 功能：在 rdma_control_plane_probe 中，register_mr_with_test_lock 将输入对象登记或挂接到当前集合/依赖图，并同步维护对应账本和生命周期引用。
+  // 输入/输出及副作用：binding（输入）、request（输入）、backing（输入）、function_lock（输入）、mr（输出）、result（输出）；register_mr_with_test_lock 先依据 依赖存在性、authority 和 generation 条件 校验 binding、request、backing、function_lock、mr、result；成功时更新本对象配置/状态并保存非拥有引用，返回
+  //   无直接返回值。
+  // 失败/边界：实现中的空依赖、重复登记、状态或 generation/authority 校验失败时返回错误；失败时保留旧配置。
   task register_mr_with_test_lock(
     rdma_function_binding binding,
     rdma_register_mr_req request,
@@ -52,6 +79,10 @@ class rdma_control_plane_probe extends rdma_control_plane;
     );
   endtask
 
+  // 功能：在 rdma_control_plane_probe 中，register_owned_mr_for_test 将输入对象登记或挂接到当前集合/依赖图，并同步维护对应账本和生命周期引用。
+  // 输入/输出及副作用：binding（输入）、request（输入）、backing（输入）、mr（输出）、result（输出）；register_owned_mr_for_test 先依据 依赖存在性、authority 和 generation 条件 校验 binding、request、backing、mr、result；成功时更新本对象配置/状态并保存非拥有引用，返回
+  //   无直接返回值。
+  // 失败/边界：实现中的空依赖、重复登记、状态或 generation/authority 校验失败时返回错误；失败时保留旧配置。
   task register_owned_mr_for_test(
     rdma_function_binding binding,
     rdma_register_mr_req request,
@@ -65,12 +96,18 @@ class rdma_control_plane_probe extends rdma_control_plane;
     );
   endtask
 
+  // 功能：在 rdma_control_plane_probe 中，use_hmc_allocator_for_test 配置测试 fixture 的定向故障或替代依赖，使下一次调用覆盖指定边界路径。
+  // 输入/输出及副作用：replacement（输入）；use_hmc_allocator_for_test 读取 replacement 并使用字段 hmc_allocator；函数返回 void，不取得调用方资源所有权。
+  // 失败/边界：use_hmc_allocator_for_test 无返回值，仅执行 hmc_allocator=replacement；调用方须保证前置依赖已经绑定，函数不自动重试或接管外部资源。
   function void use_hmc_allocator_for_test(
     rdma_hmc_allocator replacement
   );
     hmc_allocator = replacement;
   endfunction
 
+  // 功能：在 rdma_control_plane_probe 中，use_host_mem_for_test 配置测试 fixture 的定向故障或替代依赖，使下一次调用覆盖指定边界路径。
+  // 输入/输出及副作用：replacement（输入）；use_host_mem_for_test 读取 replacement 并使用字段 host_mem；函数返回 void，不取得调用方资源所有权。
+  // 失败/边界：use_host_mem_for_test 无返回值，仅执行 host_mem=replacement；调用方须保证前置依赖已经绑定，函数不自动重试或接管外部资源。
   function void use_host_mem_for_test(rdma_host_mem_api replacement);
     host_mem = replacement;
   endfunction
@@ -83,12 +120,18 @@ class rdma_generation_mutating_host_mem extends rdma_mock_host_mem;
   protected rdma_mock_host_mem delegate;
   protected rdma_function_binding mutation_target;
 
+  // 功能：构造 rdma_generation_mutating_host_mem，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：delegate=null；mutation_target=null。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_generation_mutating_host_mem 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_generation_mutating_host_mem");
     super.new(name);
     delegate = null;
     mutation_target = null;
   endfunction
 
+  // 功能：在 rdma_generation_mutating_host_mem 中，configure_mutation 校验依赖和 binding 后建立运行边界，只保存非拥有引用并拒绝重复配置。
+  // 输入/输出及副作用：release_delegate（输入）、binding（输入）；configure_mutation 先依据 依赖存在性、authority 和 generation 条件 校验 release_delegate、binding；成功时更新本对象配置/状态并保存非拥有引用，返回 void。
+  // 失败/边界：实现中的空依赖、重复登记、状态或 generation/authority 校验失败时返回错误；失败时保留旧配置。
   function void configure_mutation(
     rdma_mock_host_mem release_delegate,
     rdma_function_binding binding
@@ -97,6 +140,9 @@ class rdma_generation_mutating_host_mem extends rdma_mock_host_mem;
     mutation_target = binding;
   endfunction
 
+  // 功能：在 rdma_generation_mutating_host_mem 中，release 按 owner、generation 和幂等规则释放/隔离记录，并同步删除其账本引用。
+  // 输入/输出及副作用：mapping（输入）；输入 handle/mapping/token 指定释放目标；成功时更新账本和生命周期，外部资源只按 adapter 契约释放。
+  // 失败/边界：release 发现 owner/generation 不匹配、记录未知或重复释放时返回错误或幂等结果，不重新激活旧句柄。
   virtual function rdma_status \release (rdma_dma_mapping mapping);
     rdma_status status;
 
@@ -120,18 +166,30 @@ class rdma_cp_mutating_completion_mapping extends rdma_mock_dma_mapping;
 
   local static bit mutation_armed = 1'b0;
 
+  // 功能：构造 rdma_cp_mutating_completion_mapping，调用 super.new 建立 UVM 层级对象；外部依赖字段保持未绑定，后续由 configure/build/activate 明确注入。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_cp_mutating_completion_mapping 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_cp_mutating_completion_mapping");
     super.new(name);
   endfunction
 
+  // 功能：在 rdma_cp_mutating_completion_mapping 中，arm_completion_mutation 推进队列/事务游标或执行对应 I/O，并把结果写回声明的输出参数。
+  // 输入/输出及副作用：无显式参数；arm_completion_mutation 读取 对象字段：mutation_armed 并使用字段 mutation_armed；函数返回 void，不取得调用方资源所有权。
+  // 失败/边界：arm_completion_mutation 无返回值，仅执行 mutation_armed=1'b1；调用方须保证前置依赖已经绑定，函数不自动重试或接管外部资源。
   static function void arm_completion_mutation();
     mutation_armed = 1'b1;
   endfunction
 
+  // 功能：在 rdma_cp_mutating_completion_mapping 中，disarm_completion_mutation 按 owner、generation 和幂等规则释放/隔离记录，并同步删除其账本引用。
+  // 输入/输出及副作用：无显式参数；disarm_completion_mutation 读取 对象字段：mutation_armed 并使用字段 mutation_armed；函数返回 void，不取得调用方资源所有权。
+  // 失败/边界：disarm_completion_mutation 发现 owner/generation 不匹配、记录未知或重复释放时返回错误或幂等结果，不重新激活旧句柄。
   static function void disarm_completion_mutation();
     mutation_armed = 1'b0;
   endfunction
 
+  // 功能：在 rdma_cp_mutating_completion_mapping 中，release_completion_status 按 owner、generation 和幂等规则释放/隔离记录，并同步删除其账本引用。
+  // 输入/输出及副作用：release_complete（输出）；release_completion_status 可能更新本对象明确拥有的状态，并写入 release_complete；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：release_completion_status 发现 owner/generation 不匹配、记录未知或重复释放时返回错误或幂等结果，不重新激活旧句柄。
   virtual function rdma_status release_completion_status(
     output bit release_complete
   );
@@ -149,15 +207,25 @@ class rdma_reconcile_fault_mock_cmq_port extends rdma_mock_cmq_port;
 
   protected rdma_status next_reconcile_failure;
 
+  // 功能：构造 rdma_reconcile_fault_mock_cmq_port，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：next_reconcile_failure=null。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_reconcile_fault_mock_cmq_port 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_reconcile_fault_mock_cmq_port");
     super.new(name);
     next_reconcile_failure = null;
   endfunction
 
+  // 功能：在 rdma_reconcile_fault_mock_cmq_port 中，fail_next_reconcile 把错误消息、硬件码或注入故障封装为统一 rdma_status，保留原事务的诊断证据。
+  // 输入/输出及副作用：failure（输入）；fail_next_reconcile 读取 failure 并使用字段 next_reconcile_failure；函数返回 void，不取得调用方资源所有权。
+  // 失败/边界：fail_next_reconcile 无返回值，仅执行 next_reconcile_failure=rdma_cmq_clone_status_value(failure)；调用方须保证前置依赖已经绑定，函数不自动重试或接管外部资源。
   function void fail_next_reconcile(rdma_status failure);
     next_reconcile_failure = rdma_cmq_clone_status_value(failure);
   endfunction
 
+  // 功能：在 rdma_reconcile_fault_mock_cmq_port 中，reconcile 执行受控事务并按后端提交证据推进状态机，同时保留失败阶段和 generation 证据。
+  // 输入/输出及副作用：ticket（输入）、terminal_known（输出）、completion（输出）、status（输出）；输入 action/epoch/handle
+  //   决定迁移目标；成功时更新状态或恢复证据，外部资源仍由其拥有者管理。
+  // 失败/边界：reconcile 遇到锁、超时、generation 变化或提交证据不完整时保持原状态，不推进游标。
   virtual task reconcile(
     rdma_cmq_ticket ticket,
     output bit terminal_known,
@@ -178,10 +246,16 @@ endclass
 class rdma_recovery_probe_manager extends rdma_resource_manager;
   `uvm_object_utils(rdma_recovery_probe_manager)
 
+  // 功能：构造 rdma_recovery_probe_manager，调用 super.new 建立 UVM 层级对象；外部依赖字段保持未绑定，后续由 configure/build/activate 明确注入。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_recovery_probe_manager 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_recovery_probe_manager");
     super.new(name);
   endfunction
 
+  // 功能：在 rdma_recovery_probe_manager 中，peek_resource 只读查询当前运行时/测试账本，返回槽位、对象或恢复记录的快照而不推进事务。
+  // 输入/输出及副作用：handle（输入）、resource（输出）；peek_resource 读取 handle、resource 并使用字段 resource、key，并写入 resource；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：目标不存在、route/authority 不匹配或快照代际失效时返回错误/空值；不得返回陈旧或歧义条目。
   function rdma_status peek_resource(
     rdma_handle handle,
     output rdma_resource resource
@@ -199,6 +273,9 @@ class rdma_recovery_probe_manager extends rdma_resource_manager;
     return project_resource_value(registry[key], "probe resource", resource);
   endfunction
 
+  // 功能：在 rdma_recovery_probe_manager 中，peek_recovery 只读查询当前运行时/测试账本，返回槽位、对象或恢复记录的快照而不推进事务。
+  // 输入/输出及副作用：handle（输入）、recovery（输出）；peek_recovery 读取 handle、recovery 并使用字段 recovery、key，并写入 recovery；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：目标不存在、route/authority 不匹配或快照代际失效时返回错误/空值；不得返回陈旧或歧义条目。
   function rdma_status peek_recovery(
     rdma_handle handle,
     output rdma_recovery_record recovery
@@ -233,6 +310,9 @@ class rdma_fault_resource_manager extends rdma_recovery_probe_manager;
   protected rdma_status next_finalize_failure;
   protected rdma_status next_restore_active_failure;
 
+  // 功能：构造 rdma_fault_resource_manager，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：release_reserved_calls=0；mark_error_calls=0；finalize_release_calls=0；begin_quiesce_calls=0；restore_active_calls=0；next_release_failure=null；next_mark_error_failure=null；next_activate_failure=null；其余字段按实现默认值初始化。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_fault_resource_manager 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_fault_resource_manager");
     super.new(name);
     release_reserved_calls = 0;
@@ -247,26 +327,44 @@ class rdma_fault_resource_manager extends rdma_recovery_probe_manager;
     next_restore_active_failure = null;
   endfunction
 
+  // 功能：在 rdma_fault_resource_manager 中，fail_next_release_reserved 把错误消息、硬件码或注入故障封装为统一 rdma_status，保留原事务的诊断证据。
+  // 输入/输出及副作用：failure（输入）；fail_next_release_reserved 读取 failure 并使用字段 next_release_failure；函数返回 void，不取得调用方资源所有权。
+  // 失败/边界：fail_next_release_reserved 无返回值，仅执行 next_release_failure=rdma_cmq_clone_status_value(failure)；调用方须保证前置依赖已经绑定，函数不自动重试或接管外部资源。
   function void fail_next_release_reserved(rdma_status failure);
     next_release_failure = rdma_cmq_clone_status_value(failure);
   endfunction
 
+  // 功能：在 rdma_fault_resource_manager 中，fail_next_mark_error 把错误消息、硬件码或注入故障封装为统一 rdma_status，保留原事务的诊断证据。
+  // 输入/输出及副作用：failure（输入）；fail_next_mark_error 读取 failure 并使用字段 next_mark_error_failure；函数返回 void，不取得调用方资源所有权。
+  // 失败/边界：fail_next_mark_error 无返回值，仅执行 next_mark_error_failure=rdma_cmq_clone_status_value(failure)；调用方须保证前置依赖已经绑定，函数不自动重试或接管外部资源。
   function void fail_next_mark_error(rdma_status failure);
     next_mark_error_failure = rdma_cmq_clone_status_value(failure);
   endfunction
 
+  // 功能：在 rdma_fault_resource_manager 中，fail_next_activate 把错误消息、硬件码或注入故障封装为统一 rdma_status，保留原事务的诊断证据。
+  // 输入/输出及副作用：failure（输入）；fail_next_activate 读取 failure 并使用字段 next_activate_failure；函数返回 void，不取得调用方资源所有权。
+  // 失败/边界：fail_next_activate 无返回值，仅执行 next_activate_failure=rdma_cmq_clone_status_value(failure)；调用方须保证前置依赖已经绑定，函数不自动重试或接管外部资源。
   function void fail_next_activate(rdma_status failure);
     next_activate_failure = rdma_cmq_clone_status_value(failure);
   endfunction
 
+  // 功能：在 rdma_fault_resource_manager 中，fail_next_finalize_release 把错误消息、硬件码或注入故障封装为统一 rdma_status，保留原事务的诊断证据。
+  // 输入/输出及副作用：failure（输入）；fail_next_finalize_release 读取 failure 并使用字段 next_finalize_failure；函数返回 void，不取得调用方资源所有权。
+  // 失败/边界：fail_next_finalize_release 无返回值，仅执行 next_finalize_failure=rdma_cmq_clone_status_value(failure)；调用方须保证前置依赖已经绑定，函数不自动重试或接管外部资源。
   function void fail_next_finalize_release(rdma_status failure);
     next_finalize_failure = rdma_cmq_clone_status_value(failure);
   endfunction
 
+  // 功能：在 rdma_fault_resource_manager 中，fail_next_restore_active 把错误消息、硬件码或注入故障封装为统一 rdma_status，保留原事务的诊断证据。
+  // 输入/输出及副作用：failure（输入）；fail_next_restore_active 读取 failure 并使用字段 next_restore_active_failure；函数返回 void，不取得调用方资源所有权。
+  // 失败/边界：fail_next_restore_active 无返回值，仅执行 next_restore_active_failure=rdma_cmq_clone_status_value(failure)；调用方须保证前置依赖已经绑定，函数不自动重试或接管外部资源。
   function void fail_next_restore_active(rdma_status failure);
     next_restore_active_failure = rdma_cmq_clone_status_value(failure);
   endfunction
 
+  // 功能：在 rdma_fault_resource_manager 中，activate 校验依赖和 binding 后建立运行边界，只保存非拥有引用并拒绝重复配置。
+  // 输入/输出及副作用：handle（输入）；activate 先依据 next_activate_failure != null 校验 handle；成功时更新本对象配置/状态并保存非拥有引用，返回 rdma_status。
+  // 失败/边界：实现中的空依赖、重复登记、状态或 generation/authority 校验失败时返回错误；失败时保留旧配置。
   virtual function rdma_status activate(rdma_handle handle);
     rdma_status failure;
 
@@ -278,6 +376,9 @@ class rdma_fault_resource_manager extends rdma_recovery_probe_manager;
     return super.activate(handle);
   endfunction
 
+  // 功能：在 rdma_fault_resource_manager 中，release_reserved 按 owner、generation 和幂等规则释放/隔离记录，并同步删除其账本引用。
+  // 输入/输出及副作用：handle（输入）；输入 handle/mapping/token 指定释放目标；成功时更新账本和生命周期，外部资源只按 adapter 契约释放。
+  // 失败/边界：release_reserved 发现 owner/generation 不匹配、记录未知或重复释放时返回错误或幂等结果，不重新激活旧句柄。
   virtual function rdma_status release_reserved(rdma_handle handle);
     rdma_status failure;
 
@@ -290,6 +391,10 @@ class rdma_fault_resource_manager extends rdma_recovery_probe_manager;
     return super.release_reserved(handle);
   endfunction
 
+  // 功能：在 rdma_fault_resource_manager 中，mark_error 执行 mark_error 的mark_error 指定的测试或恢复状态变更，更新受控账本并保留可回滚的故障证据。
+  // 输入/输出及副作用：handle（输入）、recovery（输入）；输入 request/image/cursor 决定写入内容；成功时更新 PI/CI、slot ledger 或 pending journal，并通过
+  //   output 返回结果。
+  // 失败/边界：mark_error 仅允许测试/恢复范围内的状态变更；代际或资源不匹配时拒绝并保留原账本。
   virtual function rdma_status mark_error(
     rdma_handle handle,
     rdma_recovery_record recovery
@@ -305,6 +410,9 @@ class rdma_fault_resource_manager extends rdma_recovery_probe_manager;
     return super.mark_error(handle, recovery);
   endfunction
 
+  // 功能：在 rdma_fault_resource_manager 中，finalize_release 按 owner、generation 和幂等规则释放或清理资源，同时删除相关账本记录。
+  // 输入/输出及副作用：handle（输入）；finalize_release 读取 handle 并使用字段 failure、next_finalize_failure；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：finalize_release 下游操作失败时原样传播其 status/result，不伪造成功；该路径不隐式重试，也不转移未声明资源。
   virtual function rdma_status finalize_release(rdma_handle handle);
     rdma_status failure;
 
@@ -317,11 +425,17 @@ class rdma_fault_resource_manager extends rdma_recovery_probe_manager;
     return super.finalize_release(handle);
   endfunction
 
+  // 功能：在 rdma_fault_resource_manager 中，begin_quiesce 校验资源代际后把活动对象切换到 quiescing，阻止新的提交并为销毁/复位建立屏障。
+  // 输入/输出及副作用：handle（输入）；begin_quiesce 读取 handle 并使用输入参数和固定枚举/常量；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：begin_quiesce 的结果直接由 return super.begin_quiesce(handle) 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   virtual function rdma_status begin_quiesce(rdma_handle handle);
     begin_quiesce_calls++;
     return super.begin_quiesce(handle);
   endfunction
 
+  // 功能：在 rdma_fault_resource_manager 中，restore_active 执行 restore_active 的restore_active 指定的测试或恢复状态变更，更新受控账本并保留可回滚的故障证据。
+  // 输入/输出及副作用：handle（输入）；输入 action/epoch/handle 决定迁移目标；成功时更新状态或恢复证据，外部资源仍由其拥有者管理。
+  // 失败/边界：restore_active 仅允许测试/恢复范围内的状态变更；代际或资源不匹配时拒绝并保留原账本。
   virtual function rdma_status restore_active(rdma_handle handle);
     rdma_status failure;
 
@@ -344,6 +458,9 @@ class rdma_generation_mutating_resource_manager extends
   protected bit mutate_after_commit;
   int unsigned activate_calls;
 
+  // 功能：构造 rdma_generation_mutating_resource_manager，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：mutation_target=null；mutate_after_commit=1'b0；activate_calls=0。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_generation_mutating_resource_manager 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_generation_mutating_resource_manager");
     super.new(name);
     mutation_target = null;
@@ -351,6 +468,9 @@ class rdma_generation_mutating_resource_manager extends
     activate_calls = 0;
   endfunction
 
+  // 功能：在 rdma_generation_mutating_resource_manager 中，mutate_generation_on_next_commit 配置测试 fixture 的定向故障或替代依赖，使下一次调用覆盖指定边界路径。
+  // 输入/输出及副作用：binding（输入）；mutate_generation_on_next_commit 读取 binding 并使用字段 mutation_target、mutate_after_commit；函数返回 void，不取得调用方资源所有权。
+  // 失败/边界：mutate_generation_on_next_commit 无返回值，仅执行 mutation_target=binding、mutate_after_commit=1'b1；调用方须保证前置依赖已经绑定，函数不自动重试或接管外部资源。
   function void mutate_generation_on_next_commit(
     rdma_function_binding binding
   );
@@ -358,6 +478,9 @@ class rdma_generation_mutating_resource_manager extends
     mutate_after_commit = 1'b1;
   endfunction
 
+  // 功能：在 rdma_generation_mutating_resource_manager 中，commit_programmed 执行受控事务并按后端提交证据推进状态机，同时保留失败阶段和 generation 证据。
+  // 输入/输出及副作用：candidate（输入）；输入 request/image/cursor 决定写入内容；成功时更新 PI/CI、slot ledger 或 pending journal，并通过 output 返回结果。
+  // 失败/边界：commit_programmed 遇到锁、超时、generation 变化或提交证据不完整时保持原状态，不推进游标。
   virtual function rdma_status commit_programmed(rdma_resource candidate);
     rdma_status status;
 
@@ -371,6 +494,9 @@ class rdma_generation_mutating_resource_manager extends
     return status;
   endfunction
 
+  // 功能：在 rdma_generation_mutating_resource_manager 中，activate 校验依赖和 binding 后建立运行边界，只保存非拥有引用并拒绝重复配置。
+  // 输入/输出及副作用：handle（输入）；activate 先依据 依赖存在性、authority 和 generation 条件 校验 handle；成功时更新本对象配置/状态并保存非拥有引用，返回 rdma_status。
+  // 失败/边界：实现中的空依赖、重复登记、状态或 generation/authority 校验失败时返回错误；失败时保留旧配置。
   virtual function rdma_status activate(rdma_handle handle);
     activate_calls++;
     return super.activate(handle);
@@ -387,6 +513,9 @@ class rdma_post_activate_snapshot_failure_manager extends
   protected bit hostile_snapshot_pending;
   protected string hostile_key;
 
+  // 功能：构造 rdma_post_activate_snapshot_failure_manager，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：begin_quiesce_calls=0；finalize_release_calls=0；hostile_snapshot_pending=1'b0。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_post_activate_snapshot_failure_manager 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_post_activate_snapshot_failure_manager");
     super.new(name);
     begin_quiesce_calls = 0;
@@ -394,6 +523,9 @@ class rdma_post_activate_snapshot_failure_manager extends
     hostile_snapshot_pending = 1'b0;
   endfunction
 
+  // 功能：在 rdma_post_activate_snapshot_failure_manager 中，activate 校验依赖和 binding 后建立运行边界，只保存非拥有引用并拒绝重复配置。
+  // 输入/输出及副作用：handle（输入）；activate 先依据 status != null && status.ok( 校验 handle；成功时更新本对象配置/状态并保存非拥有引用，返回 rdma_status。
+  // 失败/边界：实现中的空依赖、重复登记、状态或 generation/authority 校验失败时返回错误；失败时保留旧配置。
   virtual function rdma_status activate(rdma_handle handle);
     rdma_status status;
 
@@ -406,6 +538,9 @@ class rdma_post_activate_snapshot_failure_manager extends
     return status;
   endfunction
 
+  // 功能：在 rdma_post_activate_snapshot_failure_manager 中，begin_quiesce 校验资源代际后把活动对象切换到 quiescing，阻止新的提交并为销毁/复位建立屏障。
+  // 输入/输出及副作用：handle（输入）；begin_quiesce 读取 handle 并使用字段 state、hostile_snapshot_pending；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：begin_quiesce 先检查 hostile_snapshot_pending && registry.exists(hostile_key，再返回 super.begin_quiesce(handle)；拒绝分支不提交部分状态，也不隐式重试。
   virtual function rdma_status begin_quiesce(rdma_handle handle);
     begin_quiesce_calls++;
     if (hostile_snapshot_pending && registry.exists(hostile_key)) begin
@@ -415,6 +550,9 @@ class rdma_post_activate_snapshot_failure_manager extends
     return super.begin_quiesce(handle);
   endfunction
 
+  // 功能：在 rdma_post_activate_snapshot_failure_manager 中，finalize_release 按 owner、generation 和幂等规则释放或清理资源，同时删除相关账本记录。
+  // 输入/输出及副作用：handle（输入）；finalize_release 读取 handle 并使用输入参数和固定枚举/常量；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：finalize_release 的结果直接由 return super.finalize_release(handle) 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   virtual function rdma_status finalize_release(rdma_handle handle);
     finalize_release_calls++;
     return super.finalize_release(handle);
@@ -425,11 +563,18 @@ endclass
 class rdma_control_plane_test extends uvm_test;
   `uvm_component_utils(rdma_control_plane_test)
 
+  // 功能：构造 rdma_control_plane_test，调用 super.new 建立 UVM 层级对象；外部依赖字段保持未绑定，后续由 configure/build/activate 明确注入。
+  // 输入/输出及副作用：name、parent（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_control_plane_test 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_control_plane_test",
                uvm_component parent = null);
     super.new(name, parent);
   endfunction
 
+  // 功能：在 rdma_control_plane_test 中，expect_status 在测试中执行 expect_status 断言，比较输入结果与期望状态并报告可定位的失败信息。
+  // 输入/输出及副作用：check_name（输入）、status（输入）、expected_code（输入）；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT
+  //   转移未声明的资源所有权。
+  // 失败/边界：测试函数 expect_status 缺少前置对象时报告断言错误，并停止依赖该对象的后续检查。
   function automatic void expect_status(
     string check_name,
     rdma_status status,
@@ -446,6 +591,10 @@ class rdma_control_plane_test extends uvm_test;
                            status.convert2string()))
   endfunction
 
+  // 功能：在 rdma_control_plane_test 中，expect_result 在测试中执行 expect_result 断言，比较输入结果与期望状态并报告可定位的失败信息。
+  // 输入/输出及副作用：check_name（输入）、result（输入）、expected_code（输入）、require_transaction_id（输入）；fixture/输入由测试调用方提供；执行时会产生 UVM
+  //   assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：测试函数 expect_result 缺少前置对象时报告断言错误，并停止依赖该对象的后续检查。
   function automatic void expect_result(
     string check_name,
     rdma_control_result result,
@@ -470,6 +619,10 @@ class rdma_control_plane_test extends uvm_test;
     expect_status({check_name, "_VALIDATE"}, validation_status, RDMA_SC_OK);
   endfunction
 
+  // 功能：在 rdma_control_plane_test 中，expect_recovery_result 在测试中执行 expect_recovery_result 断言，比较输入结果与期望状态并报告可定位的失败信息。
+  // 输入/输出及副作用：check_name（输入）、result（输入）、expected_primary_code（输入）；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向
+  //   DUT 转移未声明的资源所有权。
+  // 失败/边界：测试函数 expect_recovery_result 缺少前置对象时报告断言错误，并停止依赖该对象的后续检查。
   function automatic void expect_recovery_result(
     string check_name,
     rdma_control_result result,
@@ -493,6 +646,10 @@ class rdma_control_plane_test extends uvm_test;
     expect_status({check_name, "_VALIDATE"}, validation_status, RDMA_SC_OK);
   endfunction
 
+  // 功能：在 rdma_control_plane_test 中，expect_recovery_fallback 在测试中执行 expect_recovery_fallback 断言，比较输入结果与期望状态并报告可定位的失败信息。
+  // 输入/输出及副作用：check_name（输入）、result（输入）、expected_primary_code（输入）；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向
+  //   DUT 转移未声明的资源所有权。
+  // 失败/边界：测试函数 expect_recovery_fallback 缺少前置对象时报告断言错误，并停止依赖该对象的后续检查。
   function automatic void expect_recovery_fallback(
     string check_name,
     rdma_control_result result,
@@ -516,6 +673,10 @@ class rdma_control_plane_test extends uvm_test;
     expect_status({check_name, "_VALIDATE"}, validation_status, RDMA_SC_OK);
   endfunction
 
+  // 功能：在 rdma_control_plane_test 中，expect_completed_recovery 在测试中执行 expect_completed_recovery 断言，比较输入结果与期望状态并报告可定位的失败信息。
+  // 输入/输出及副作用：check_name（输入）、result（输入）、expected_primary_code（输入）；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向
+  //   DUT 转移未声明的资源所有权。
+  // 失败/边界：测试函数 expect_completed_recovery 缺少前置对象时报告断言错误，并停止依赖该对象的后续检查。
   function automatic void expect_completed_recovery(
     string check_name,
     rdma_control_result result,
@@ -539,6 +700,10 @@ class rdma_control_plane_test extends uvm_test;
     expect_status({check_name, "_VALIDATE"}, validation_status, RDMA_SC_OK);
   endfunction
 
+  // 功能：在 rdma_control_plane_test 中，expect_restored_recovery 在测试中执行 expect_restored_recovery 断言，比较输入结果与期望状态并报告可定位的失败信息。
+  // 输入/输出及副作用：check_name（输入）、result（输入）、expected_primary_code（输入）；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向
+  //   DUT 转移未声明的资源所有权。
+  // 失败/边界：测试函数 expect_restored_recovery 缺少前置对象时报告断言错误，并停止依赖该对象的后续检查。
   function automatic void expect_restored_recovery(
     string check_name,
     rdma_control_result result,
@@ -562,6 +727,10 @@ class rdma_control_plane_test extends uvm_test;
     expect_status({check_name, "_VALIDATE"}, validation_status, RDMA_SC_OK);
   endfunction
 
+  // 功能：make_active_binding 创建独立的 rdma_function_binding；根据 name、function_uid、global_function_id、generation 设置字段 binding、binding.function_uid、binding.generation、binding.global_function_id、binding.rdma_vf_id、binding.pfvf_id、pcie.vf_index、pcie.bdf、pcie.parent_pf_bdf、base.value，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：name（输入）、function_uid（输入）、global_function_id（输入）、generation（输入）；输入字段被复制到返回值或
+  //   output；生成结果与输入隔离，不隐式修改调用方对象。
+  // 失败/边界：make_active_binding 的结果直接由 return binding 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function automatic rdma_function_binding make_active_binding(
     string name,
     longint unsigned function_uid = 64'h0123_4567_89ab_cdef,
@@ -580,8 +749,11 @@ class rdma_control_plane_test extends uvm_test;
     binding.pcie.vf_index = 32'h8000_8080;
     binding.pcie.bdf = '{segment:16'h1001, bus:8'h20, device:5'h03,
                          function_num:3'h5};
-    binding.pcie.parent_pf_bdf = '{segment:16'h2002, bus:8'h30,
+    binding.pcie.parent_pf_bdf = '{segment:16'h1001, bus:8'h30,
                                    device:5'h04, function_num:3'h2};
+    if (!binding.configure_identity_from_legacy_mirrors(
+          16'h1, 32'h1, RDMA_FUNCTION_VF, 16'h8080).ok())
+      `uvm_error("BINDING", "legacy binding identity configuration failed")
     binding.pcie.bar[0].base.value = 64'h0000_0000_8000_0000;
     binding.pcie.bar[0].size = 64'h4000;
     binding.pcie.bar[0].enabled = 1'b1;
@@ -621,6 +793,9 @@ class rdma_control_plane_test extends uvm_test;
     return binding;
   endfunction
 
+  // 功能：make_create_pd_request 创建独立的 rdma_create_pd_req；根据 name、binding 设置字段 request、request.request_id、request.correlation_id、request.owner，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：name（输入）、binding（输入）；make_create_pd_request 读取 name、binding 并使用字段 request、request.request_id、request.correlation_id、request.owner；函数返回 rdma_create_pd_req，不取得调用方资源所有权。
+  // 失败/边界：make_create_pd_request 的结果直接由 return request 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function automatic rdma_create_pd_req make_create_pd_request(
     string name,
     rdma_function_binding binding
@@ -634,6 +809,9 @@ class rdma_control_plane_test extends uvm_test;
     return request;
   endfunction
 
+  // 功能：make_register_mr_request 创建独立的 rdma_register_mr_req；根据 name、binding、pd 设置字段 request、request.request_id、request.correlation_id、request.owner、request.pd_h、iova.value、request.length、request.access，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：name（输入）、binding（输入）、pd（输入）；make_register_mr_request 读取 name、binding、pd 并使用字段 request、request.request_id、request.correlation_id、request.owner、request.pd_h、iova.value、request.length、request.access；函数返回 rdma_register_mr_req，不取得调用方资源所有权。
+  // 失败/边界：make_register_mr_request 的结果直接由 return request 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function automatic rdma_register_mr_req make_register_mr_request(
     string name,
     rdma_function_binding binding,
@@ -654,6 +832,9 @@ class rdma_control_plane_test extends uvm_test;
     return request;
   endfunction
 
+  // 功能：make_dma_context 创建独立的 rdma_dma_request_context；根据 name、binding 设置字段 dma_context、dma_context.function_h、dma_context.requester_bdf、dma_context.pasid_valid、dma_context.pasid、dma_context.dma_domain_valid、dma_context.dma_domain_id、dma_context.owner_h，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：name（输入）、binding（输入）；make_dma_context 读取 name、binding 并使用字段 dma_context、dma_context.function_h、dma_context.requester_bdf、dma_context.pasid_valid、dma_context.pasid、dma_context.dma_domain_valid、dma_context.dma_domain_id、dma_context.owner_h；函数返回 rdma_dma_request_context，不取得调用方资源所有权。
+  // 失败/边界：make_dma_context 的结果直接由 return dma_context 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function automatic rdma_dma_request_context make_dma_context(
     string name,
     rdma_function_binding binding
@@ -671,6 +852,9 @@ class rdma_control_plane_test extends uvm_test;
     return dma_context;
   endfunction
 
+  // 功能：make_queue_borrowed_slice 创建独立的 rdma_queue_backing_slice；根据 name、binding、role、iova、backing 设置字段 mapping、mapping.function_h、mapping.requester_bdf、mapping.pasid_valid、mapping.pasid、mapping.dma_domain_valid、mapping.dma_domain_id、iova.value、backing_addr.value、mapping.size，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：name（输入）、binding（输入）、role（输入）、iova（输入）、backing（输入）；make_queue_borrowed_slice 读取 name、binding、role、iova、backing 并使用字段 mapping、mapping.function_h、mapping.requester_bdf、mapping.pasid_valid、mapping.pasid、mapping.dma_domain_valid、mapping.dma_domain_id、iova.value；函数返回 rdma_queue_backing_slice，不取得调用方资源所有权。
+  // 失败/边界：make_queue_borrowed_slice 的结果直接由 return slice 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function automatic rdma_queue_backing_slice make_queue_borrowed_slice(
     string name,
     rdma_function_binding binding,
@@ -704,6 +888,9 @@ class rdma_control_plane_test extends uvm_test;
     return slice;
   endfunction
 
+  // 功能：make_create_cq_request 创建独立的 rdma_create_cq_req；根据 name、binding、dependency 设置字段 request、request.owner、request.depth、request.cqe_size_bytes、request.ceq_h、ring_backing.mode，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：name（输入）、binding（输入）、dependency（输入）；make_create_cq_request 读取 name、binding、dependency 并使用字段 request、request.owner、request.depth、request.cqe_size_bytes、request.ceq_h、ring_backing.mode；函数返回 rdma_create_cq_req，不取得调用方资源所有权。
+  // 失败/边界：make_create_cq_request 的结果直接由 return request 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function automatic rdma_create_cq_req make_create_cq_request(
     string name,
     rdma_function_binding binding,
@@ -720,6 +907,9 @@ class rdma_control_plane_test extends uvm_test;
     return request;
   endfunction
 
+  // 功能：make_create_srq_request 创建独立的 rdma_create_srq_req；根据 name、binding、dependency 设置字段 request、request.owner、request.depth、request.max_sge、request.limit_threshold、request.pd_h、payload_backing.mode，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：name（输入）、binding（输入）、dependency（输入）；make_create_srq_request 读取 name、binding、dependency 并使用字段 request、request.owner、request.depth、request.max_sge、request.limit_threshold、request.pd_h、payload_backing.mode；函数返回 rdma_create_srq_req，不取得调用方资源所有权。
+  // 失败/边界：make_create_srq_request 的结果直接由 return request 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function automatic rdma_create_srq_req make_create_srq_request(
     string name,
     rdma_function_binding binding,
@@ -737,6 +927,9 @@ class rdma_control_plane_test extends uvm_test;
     return request;
   endfunction
 
+  // 功能：make_create_qp_request 创建独立的 rdma_create_qp_req；根据 name、binding、pd、cq 设置字段 request、request.owner、request.transport、request.sq_depth、request.rq_depth、request.max_send_sge、request.max_recv_sge、request.pd_h、request.send_cq_h、request.recv_cq_h，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：name（输入）、binding（输入）、pd（输入）、cq（输入）；make_create_qp_request 读取 name、binding、pd、cq 并使用字段 request、request.owner、request.transport、request.sq_depth、request.rq_depth、request.max_send_sge、request.max_recv_sge、request.pd_h；函数返回 rdma_create_qp_req，不取得调用方资源所有权。
+  // 失败/边界：make_create_qp_request 的结果直接由 return request 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function automatic rdma_create_qp_req make_create_qp_request(
     string name,
     rdma_function_binding binding,
@@ -779,6 +972,9 @@ class rdma_control_plane_test extends uvm_test;
     return request;
   endfunction
 
+  // 功能：make_create_ceq_request 创建独立的 rdma_create_ceq_req；根据 name、binding 设置字段 request、request.owner、request.depth、request.vector_id、ring_backing.mode，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：name（输入）、binding（输入）；make_create_ceq_request 读取 name、binding 并使用字段 request、request.owner、request.depth、request.vector_id、ring_backing.mode；函数返回 rdma_create_ceq_req，不取得调用方资源所有权。
+  // 失败/边界：make_create_ceq_request 的结果直接由 return request 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function automatic rdma_create_ceq_req make_create_ceq_request(
     string name,
     rdma_function_binding binding
@@ -793,6 +989,9 @@ class rdma_control_plane_test extends uvm_test;
     return request;
   endfunction
 
+  // 功能：make_create_aeq_request 创建独立的 rdma_create_aeq_req；根据 name、binding 设置字段 request、request.owner、request.depth、request.vector_id、ring_backing.mode，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：name（输入）、binding（输入）；make_create_aeq_request 读取 name、binding 并使用字段 request、request.owner、request.depth、request.vector_id、ring_backing.mode；函数返回 rdma_create_aeq_req，不取得调用方资源所有权。
+  // 失败/边界：make_create_aeq_request 的结果直接由 return request 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function automatic rdma_create_aeq_req make_create_aeq_request(
     string name,
     rdma_function_binding binding
@@ -807,6 +1006,9 @@ class rdma_control_plane_test extends uvm_test;
     return request;
   endfunction
 
+  // 功能：make_borrowed_pbl0_backing 创建独立的 rdma_mr_backing_desc；根据 name、binding、request、pbl_mode 设置字段 backing、backing.function_h、backing.requester_bdf、backing.pasid_valid、backing.pasid、ref_count、i、mapping、mapping.function_h、mapping.requester_bdf，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：name（输入）、binding（输入）、request（输入）、RDMA_MR_PBL0（输入）；make_borrowed_pbl0_backing 读取 name、binding、request、pbl_mode 并使用字段 backing、backing.function_h、backing.requester_bdf、backing.pasid_valid、backing.pasid、ref_count、mapping；函数返回 rdma_mr_backing_desc，不取得调用方资源所有权。
+  // 失败/边界：make_borrowed_pbl0_backing 的结果直接由 return backing 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function automatic rdma_mr_backing_desc make_borrowed_pbl0_backing(
     string name,
     rdma_function_binding binding,
@@ -877,6 +1079,9 @@ class rdma_control_plane_test extends uvm_test;
     return backing;
   endfunction
 
+  // 功能：在 rdma_control_plane_test 中由 same_handle_fields 逐字段比较输入值，返回结构、身份或序列化内容是否一致。
+  // 输入/输出及副作用：lhs（输入）、rhs（输入）；比较对象/数组只读；返回 bit 或状态结果，不更新 runtime、账本或外部 adapter。
+  // 失败/边界：same_handle_fields 的任一比较对象为空或类型不符时返回确定的 false/不等结果，不抛出未处理异常。
   function automatic bit same_handle_fields(
     rdma_handle lhs,
     rdma_handle rhs
@@ -889,6 +1094,9 @@ class rdma_control_plane_test extends uvm_test;
            lhs.generation == rhs.generation;
   endfunction
 
+  // 功能：在 rdma_control_plane_test 中由 same_status_fields 逐字段比较输入值，返回结构、身份或序列化内容是否一致。
+  // 输入/输出及副作用：lhs（输入）、rhs（输入）；比较对象/数组只读；返回 bit 或状态结果，不更新 runtime、账本或外部 adapter。
+  // 失败/边界：same_status_fields 的任一比较对象为空或类型不符时返回确定的 false/不等结果，不抛出未处理异常。
   function automatic bit same_status_fields(
     rdma_status lhs,
     rdma_status rhs
@@ -907,6 +1115,9 @@ class rdma_control_plane_test extends uvm_test;
            lhs.message == rhs.message;
   endfunction
 
+  // 功能：在 rdma_control_plane_test 中由 same_ticket_fields 逐字段比较输入值，返回结构、身份或序列化内容是否一致。
+  // 输入/输出及副作用：lhs（输入）、rhs（输入）；比较对象/数组只读；返回 bit 或状态结果，不更新 runtime、账本或外部 adapter。
+  // 失败/边界：same_ticket_fields 的任一比较对象为空或类型不符时返回确定的 false/不等结果，不抛出未处理异常。
   function automatic bit same_ticket_fields(
     rdma_cmq_ticket lhs,
     rdma_cmq_ticket rhs
@@ -926,6 +1137,9 @@ class rdma_control_plane_test extends uvm_test;
            lhs.absolute_deadline == rhs.absolute_deadline;
   endfunction
 
+  // 功能：在 rdma_control_plane_test 中由 same_mapping_fields 逐字段比较输入值，返回结构、身份或序列化内容是否一致。
+  // 输入/输出及副作用：lhs（输入）、rhs（输入）；比较对象/数组只读；返回 bit 或状态结果，不更新 runtime、账本或外部 adapter。
+  // 失败/边界：same_mapping_fields 的任一比较对象为空或类型不符时返回确定的 false/不等结果，不抛出未处理异常。
   function automatic bit same_mapping_fields(
     rdma_dma_mapping lhs,
     rdma_dma_mapping rhs
@@ -943,6 +1157,9 @@ class rdma_control_plane_test extends uvm_test;
            same_handle_fields(lhs.owner_h, rhs.owner_h);
   endfunction
 
+  // 功能：在 rdma_control_plane_test 中由 same_recovery_fields 逐字段比较输入值，返回结构、身份或序列化内容是否一致。
+  // 输入/输出及副作用：lhs（输入）、rhs（输入）；比较对象/数组只读；返回 bit 或状态结果，不更新 runtime、账本或外部 adapter。
+  // 失败/边界：same_recovery_fields 的任一比较对象为空或类型不符时返回确定的 false/不等结果，不抛出未处理异常。
   function automatic bit same_recovery_fields(
     rdma_recovery_record lhs,
     rdma_recovery_record rhs
@@ -999,6 +1216,9 @@ class rdma_control_plane_test extends uvm_test;
     return 1'b1;
   endfunction
 
+  // 功能：make_borrowed_hmc_ref 创建独立的 rdma_hmc_ref；根据 name、binding、address、size、first_pbl_index 设置字段 hmc_ref、hmc_ref.owner、hmc_ref.object_kind、hmc_ref.address、hmc_ref.size、hmc_ref.first_pbl_index、hmc_ref.ownership、hmc_ref.release_complete，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：name（输入）、binding（输入）、address（输入）、size（输入）、first_pbl_index（输入）；make_borrowed_hmc_ref 读取 name、binding、address、size、first_pbl_index 并使用字段 hmc_ref、hmc_ref.owner、hmc_ref.object_kind、hmc_ref.address、hmc_ref.size、hmc_ref.first_pbl_index、hmc_ref.ownership、hmc_ref.release_complete；函数返回 rdma_hmc_ref，不取得调用方资源所有权。
+  // 失败/边界：make_borrowed_hmc_ref 的结果直接由 return hmc_ref 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function automatic rdma_hmc_ref make_borrowed_hmc_ref(
     string name,
     rdma_function_binding binding,
@@ -1019,6 +1239,10 @@ class rdma_control_plane_test extends uvm_test;
     return hmc_ref;
   endfunction
 
+  // 功能：在 rdma_control_plane_test 中，expect_pre_cmq_reject 在测试中执行 expect_pre_cmq_reject 断言，比较输入结果与期望状态并报告可定位的失败信息。
+  // 输入/输出及副作用：check_name（输入）、control（输入）、mock_cmq（输入）、binding（输入）、request（输入）、backing（输入）、expected_code（输入）；fixture/输入由测试调用方提供；执行时会产生
+  //   UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：测试函数 expect_pre_cmq_reject 缺少前置对象时报告断言错误，并停止依赖该对象的后续检查。
   task automatic expect_pre_cmq_reject(
     string check_name,
     rdma_control_plane control,
@@ -1057,6 +1281,10 @@ class rdma_control_plane_test extends uvm_test;
     end
   endtask
 
+  // 功能：在 rdma_control_plane_test 中，expect_cmq_opcodes 在测试中执行 expect_cmq_opcodes 断言，比较输入结果与期望状态并报告可定位的失败信息。
+  // 输入/输出及副作用：check_name（输入）、mock_cmq（输入）、expected（输入）；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT
+  //   转移未声明的资源所有权。
+  // 失败/边界：测试函数 expect_cmq_opcodes 缺少前置对象时报告断言错误，并停止依赖该对象的后续检查。
   function automatic void expect_cmq_opcodes(
     string check_name,
     rdma_mock_cmq_port mock_cmq,
@@ -1074,6 +1302,10 @@ class rdma_control_plane_test extends uvm_test;
                  $sformatf("unexpected CMQ opcode sequence: %p", actual))
   endfunction
 
+  // 功能：setup_owned_mr_case 更新字段 control、manager、mock_cmq、key_policy、key_policy.fixed_key、host_mem、binding、status、pd_request、request，并在提交前保持 Function authority、generation 和资源所有权约束。
+  // 输入/输出及副作用：prefix（输入）、inject_host_mem（输入）、control（输出）、manager（输出）、mock_cmq（输出）、key_policy（输出）、host_mem（输出）、binding（输出）、request（输出）、dma_context（输出）、pd（输出）、baseline_allocations（输出）、baseline_leaks（输出）；setup_owned_mr_case 驱动下游事务，并写入 control、manager、mock_cmq、key_policy、host_mem、binding、request、dma_context、pd、baseline_allocations、baseline_leaks；函数返回 无直接返回值，不取得调用方资源所有权。
+
+  // 失败/边界：setup_owned_mr_case 失败或超时通过 control、manager、mock_cmq、key_policy、host_mem、binding、request、dma_context、pd、baseline_allocations、baseline_leaks 明确发布；该路径不隐式重试，也不转移未声明资源。
   task automatic setup_owned_mr_case(
     string prefix,
     bit inject_host_mem,
@@ -1125,6 +1357,10 @@ class rdma_control_plane_test extends uvm_test;
     void'(manager.check_leaks(baseline_leaks, binding.make_handle()));
   endtask
 
+  // 功能：在 rdma_control_plane_test 中，expect_owned_preallocate_reject 在测试中执行 expect_owned_preallocate_reject 断言，比较输入结果与期望状态并报告可定位的失败信息。
+  // 输入/输出及副作用：check_name（输入）、control（输入）、manager（输入）、mock_cmq（输入）、host_mem（输入）、binding（输入）、request（输入）、dma_context（输入）、alignment（输入）、expected_code（输入）、baseline_allocations（输入）、baseline_leaks（输入）、expected_message（输入）；fixture/输入由测试调用方提供；执行时会产生
+  //   UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：测试函数 expect_owned_preallocate_reject 缺少前置对象时报告断言错误，并停止依赖该对象的后续检查。
   task automatic expect_owned_preallocate_reject(
     string check_name,
     rdma_control_plane control,
@@ -1167,6 +1403,10 @@ class rdma_control_plane_test extends uvm_test;
                  "pre-allocation rejection changed owned resource state")
   endtask
 
+  // 功能：setup_deregister_mr_case 更新字段 control、manager、mock_cmq、key_policy、key_policy.fixed_key、host_mem、hmc、hmc_base.value、status、binding，并在提交前保持 Function authority、generation 和资源所有权约束。
+  // 输入/输出及副作用：prefix（输入）、pbl_mode（输入）、ownership（输入）、control（输出）、manager（输出）、mock_cmq（输出）、host_mem（输出）、hmc（输出）、binding（输出）、pd（输出）、mr（输出）、mapping（输出）、hmc_address（输出）、baseline_allocations（输出）；setup_deregister_mr_case 驱动下游事务，并写入 control、manager、mock_cmq、host_mem、hmc、binding、pd、mr、mapping、hmc_address、baseline_allocations；函数返回 无直接返回值，不取得调用方资源所有权。
+
+  // 失败/边界：setup_deregister_mr_case 失败或超时通过 control、manager、mock_cmq、host_mem、hmc、binding、pd、mr、mapping、hmc_address、baseline_allocations 明确发布；该路径不隐式重试，也不转移未声明资源。
   task automatic setup_deregister_mr_case(
     string prefix,
     rdma_mr_pbl_mode_e pbl_mode,
@@ -1298,6 +1538,9 @@ class rdma_control_plane_test extends uvm_test;
     mock_cmq.calls.delete();
   endtask
 
+  // 功能：在测试辅助 rdma_control_plane_test.check_configure_contract 中构造或驱动“configure contract”场景，并断言 DUT 的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_configure_contract();
     rdma_control_plane controls[8];
     rdma_resource_manager managers[8];
@@ -1365,13 +1608,17 @@ class rdma_control_plane_test extends uvm_test;
                  "configure invoked the optional host-memory adapter")
   endtask
 
+  // 功能：在测试辅助 rdma_control_plane_test.check_mock_typed_body_snapshot 中构造或驱动“mock typed body snapshot”场景，并断言 DUT
+  //   的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_mock_typed_body_snapshot();
     rdma_mock_cmq_port mock_cmq;
     rdma_function_binding binding;
     rdma_cmq_command_desc command;
     rdma_cmq_opcode_key opcode_key;
-    rdma_xtr_v1_mr_deregister_body body;
-    rdma_xtr_v1_mr_deregister_body snapshot_body;
+    rdma_hw_mr_deregister_body body;
+    rdma_hw_mr_deregister_body snapshot_body;
     rdma_cmq_ticket ticket;
     rdma_cmq_completion completion;
     rdma_status status;
@@ -1381,7 +1628,7 @@ class rdma_control_plane_test extends uvm_test;
       "typed_snapshot_binding", 64'ha050_0000_0000_0001,
       32'ha050_0101, 37
     );
-    body = rdma_xtr_v1_mr_deregister_body::type_id::create(
+    body = rdma_hw_mr_deregister_body::type_id::create(
       "typed_snapshot_body"
     );
     body.mr_h = new("typed_snapshot_mr");
@@ -1394,8 +1641,8 @@ class rdma_control_plane_test extends uvm_test;
     opcode_key = rdma_cmq_opcode_key::type_id::create(
       "typed_snapshot_opcode"
     );
-    opcode_key.profile_name = "xtr_v1";
-    opcode_key.opcode = XTR_V1_OP_MR_DEREGISTER;
+    opcode_key.profile_name = "rdma";
+    opcode_key.opcode = RDMA_OP_MR_DEREGISTER;
     opcode_key.variant = "deregister";
     command = rdma_cmq_command_desc::type_id::create(
       "typed_snapshot_command"
@@ -1420,6 +1667,10 @@ class rdma_control_plane_test extends uvm_test;
                  "mock CMQ did not retain a detached typed-body snapshot")
   endtask
 
+  // 功能：在测试辅助 rdma_control_plane_test.check_owned_mr_validation 中构造或驱动“owned mr validation”场景，并断言 DUT
+  //   的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_owned_mr_validation();
     rdma_control_plane control;
     rdma_fault_inject_resource_manager manager;
@@ -1536,6 +1787,9 @@ class rdma_control_plane_test extends uvm_test;
     );
   endtask
 
+  // 功能：在 rdma_control_plane_test 中，run_owned_mr_failure 驱动 UVM 阶段中的场景初始化、事务执行和断言收尾，并在退出前释放 objection 或测试资源。
+  // 输入/输出及副作用：failure_kind（输入）；run_owned_mr_failure 驱动下游事务；函数返回 无直接返回值，不取得调用方资源所有权。
+  // 失败/边界：run_owned_mr_failure 的 setup/阶段驱动失败时停止新增事务，并按测试生命周期清理 objection 与临时引用。
   task automatic run_owned_mr_failure(string failure_kind);
     rdma_control_plane control;
     rdma_fault_inject_resource_manager manager;
@@ -1550,7 +1804,7 @@ class rdma_control_plane_test extends uvm_test;
     rdma_mr mr;
     rdma_control_result result;
     rdma_mrt_model key_alloc_body;
-    rdma_xtr_v1_mr_deregister_body dereg_body;
+    rdma_hw_mr_deregister_body dereg_body;
     rdma_recovery_record recovery;
     rdma_status injected_status;
     rdma_status status;
@@ -1593,9 +1847,9 @@ class rdma_control_plane_test extends uvm_test;
         injected_status = rdma_status::make(
           RDMA_SC_UNKNOWN_HW_ERROR, "injected owned KEY_ALLOC failure"
         );
-        mock_cmq.fail_opcode(XTR_V1_OP_KEY_ALLOC, injected_status);
+        mock_cmq.fail_opcode(RDMA_OP_KEY_ALLOC, injected_status);
         expected_primary = RDMA_SC_UNKNOWN_HW_ERROR;
-        expected_opcodes.push_back(XTR_V1_OP_KEY_ALLOC);
+        expected_opcodes.push_back(RDMA_OP_KEY_ALLOC);
       end
       "commit_programmed": begin
         injected_status = rdma_status::make(
@@ -1605,8 +1859,8 @@ class rdma_control_plane_test extends uvm_test;
           "commit_programmed", injected_status
         );
         expect_status("OWNED_COMMIT_INJECT", status, RDMA_SC_OK);
-        expected_opcodes.push_back(XTR_V1_OP_KEY_ALLOC);
-        expected_opcodes.push_back(XTR_V1_OP_MR_DEREGISTER);
+        expected_opcodes.push_back(RDMA_OP_KEY_ALLOC);
+        expected_opcodes.push_back(RDMA_OP_MR_DEREGISTER);
       end
       "activate": begin
         injected_status = rdma_status::make(
@@ -1614,8 +1868,8 @@ class rdma_control_plane_test extends uvm_test;
         );
         status = manager.fail_next_transition("activate", injected_status);
         expect_status("OWNED_ACTIVATE_INJECT", status, RDMA_SC_OK);
-        expected_opcodes.push_back(XTR_V1_OP_KEY_ALLOC);
-        expected_opcodes.push_back(XTR_V1_OP_MR_DEREGISTER);
+        expected_opcodes.push_back(RDMA_OP_KEY_ALLOC);
+        expected_opcodes.push_back(RDMA_OP_MR_DEREGISTER);
       end
       "deregister": begin
         injected_status = rdma_status::make(
@@ -1629,9 +1883,9 @@ class rdma_control_plane_test extends uvm_test;
         injected_status = rdma_status::make(
           RDMA_SC_UNKNOWN_HW_ERROR, "injected owned deregister failure"
         );
-        mock_cmq.fail_opcode(XTR_V1_OP_MR_DEREGISTER, injected_status);
-        expected_opcodes.push_back(XTR_V1_OP_KEY_ALLOC);
-        expected_opcodes.push_back(XTR_V1_OP_MR_DEREGISTER);
+        mock_cmq.fail_opcode(RDMA_OP_MR_DEREGISTER, injected_status);
+        expected_opcodes.push_back(RDMA_OP_KEY_ALLOC);
+        expected_opcodes.push_back(RDMA_OP_MR_DEREGISTER);
         rollback_failure = 1'b1;
         expected_rollback = RDMA_SC_UNKNOWN_HW_ERROR;
         expected_presence = RDMA_HW_PRESENCE_PRESENT;
@@ -1647,9 +1901,9 @@ class rdma_control_plane_test extends uvm_test;
         );
         expect_status("OWNED_DEREG_TIMEOUT_COMMIT_INJECT", status,
                       RDMA_SC_OK);
-        mock_cmq.timeout_opcode(XTR_V1_OP_MR_DEREGISTER);
-        expected_opcodes.push_back(XTR_V1_OP_KEY_ALLOC);
-        expected_opcodes.push_back(XTR_V1_OP_MR_DEREGISTER);
+        mock_cmq.timeout_opcode(RDMA_OP_MR_DEREGISTER);
+        expected_opcodes.push_back(RDMA_OP_KEY_ALLOC);
+        expected_opcodes.push_back(RDMA_OP_MR_DEREGISTER);
         rollback_failure = 1'b1;
         expected_rollback = RDMA_SC_TIMEOUT;
         expected_presence = RDMA_HW_PRESENCE_UNKNOWN;
@@ -1740,7 +1994,7 @@ class rdma_control_plane_test extends uvm_test;
           mock_cmq.calls[1] == null ||
           mock_cmq.calls[1].command == null ||
           mock_cmq.calls[1].command.opcode_key == null ||
-          mock_cmq.calls[1].command.opcode_key.profile_name != "xtr_v1" ||
+          mock_cmq.calls[1].command.opcode_key.profile_name != "rdma" ||
           mock_cmq.calls[1].command.opcode_key.variant != "deregister" ||
           !$cast(dereg_body, mock_cmq.calls[1].command.body) ||
           dereg_body == null || dereg_body.mr_h == null ||
@@ -1755,6 +2009,10 @@ class rdma_control_plane_test extends uvm_test;
     end
   endtask
 
+  // 功能：在测试辅助 rdma_control_plane_test.check_creation_deregister_late_failure_deferred_retry 中构造或驱动“creation deregister
+  //   late failure deferred retry”场景，并断言 DUT 的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_creation_deregister_late_failure_deferred_retry();
     rdma_control_plane control;
     rdma_fault_inject_resource_manager manager;
@@ -1797,7 +2055,7 @@ class rdma_control_plane_test extends uvm_test;
     );
     expect_status("CREATION_DEREG_LATE_COMMIT_INJECT", status,
                   RDMA_SC_OK);
-    mock_cmq.timeout_opcode(XTR_V1_OP_MR_DEREGISTER);
+    mock_cmq.timeout_opcode(RDMA_OP_MR_DEREGISTER);
     control.alloc_and_register_mr(binding, request, dma_context, 4096,
                                   mapping, mr, result);
     expect_recovery_result("CREATION_DEREG_LATE_TIMEOUT", result,
@@ -1807,8 +2065,8 @@ class rdma_control_plane_test extends uvm_test;
     status = manager.lookup_recovery(result.resource_h, recovery);
     expect_status("CREATION_DEREG_LATE_TIMEOUT_RECOVERY", status,
                   RDMA_SC_OK);
-    expected_opcodes.push_back(XTR_V1_OP_KEY_ALLOC);
-    expected_opcodes.push_back(XTR_V1_OP_MR_DEREGISTER);
+    expected_opcodes.push_back(RDMA_OP_KEY_ALLOC);
+    expected_opcodes.push_back(RDMA_OP_MR_DEREGISTER);
     expect_cmq_opcodes("CREATION_DEREG_LATE_TIMEOUT_ORDER", mock_cmq,
                        expected_opcodes);
     if (recovery == null || recovery.ambiguous_ticket == null ||
@@ -1868,7 +2126,7 @@ class rdma_control_plane_test extends uvm_test;
     expect_completed_recovery("CREATION_DEREG_LATE_SECOND",
                               second_recovery_result,
                               RDMA_SC_INVALID_STATE);
-    expected_opcodes.push_back(XTR_V1_OP_MR_DEREGISTER);
+    expected_opcodes.push_back(RDMA_OP_MR_DEREGISTER);
     expect_cmq_opcodes("CREATION_DEREG_LATE_SECOND_ORDER", mock_cmq,
                        expected_opcodes);
     status = manager.lookup(result.resource_h, resource);
@@ -1892,6 +2150,10 @@ class rdma_control_plane_test extends uvm_test;
                  "completed creation recovery repeated a side effect")
   endtask
 
+  // 功能：在测试辅助 rdma_control_plane_test.check_owned_mr_unattached_release_failure 中构造或驱动“owned mr unattached release
+  //   failure”场景，并断言 DUT 的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_owned_mr_unattached_release_failure();
     rdma_control_plane control;
     rdma_fault_inject_resource_manager manager;
@@ -1968,6 +2230,10 @@ class rdma_control_plane_test extends uvm_test;
     end
   endtask
 
+  // 功能：在测试辅助 rdma_control_plane_test.check_owned_mr_prestage_release_failure 中构造或驱动“owned mr prestage release
+  //   failure”场景，并断言 DUT 的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_owned_mr_prestage_release_failure();
     rdma_control_plane control;
     rdma_fault_inject_resource_manager manager;
@@ -2091,6 +2357,10 @@ class rdma_control_plane_test extends uvm_test;
                  "durable pre-stage recovery did not finish exactly once")
   endtask
 
+  // 功能：在测试辅助 rdma_control_plane_test.check_owned_mr_prestage_double_cleanup_failure 中构造或驱动“owned mr prestage double
+  //   cleanup failure”场景，并断言 DUT 的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_owned_mr_prestage_double_cleanup_failure();
     rdma_control_plane control;
     rdma_fault_inject_resource_manager manager;
@@ -2294,6 +2564,10 @@ class rdma_control_plane_test extends uvm_test;
                  "reserved ERROR recovery did not finish exactly once")
   endtask
 
+  // 功能：在测试辅助 rdma_control_plane_test.check_owned_recovery_status_accumulation 中构造或驱动“owned recovery status
+  //   accumulation”场景，并断言 DUT 的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_owned_recovery_status_accumulation();
     rdma_control_plane control;
     rdma_fault_inject_resource_manager manager;
@@ -2410,6 +2684,10 @@ class rdma_control_plane_test extends uvm_test;
                  "released resource repeated a recovery side effect")
   endtask
 
+  // 功能：在测试辅助 rdma_control_plane_test.check_owned_recovery_completion_hook_guard 中构造或驱动“owned recovery completion hook
+  //   guard”场景，并断言 DUT 的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_owned_recovery_completion_hook_guard();
     rdma_control_plane control;
     rdma_fault_inject_resource_manager manager;
@@ -2538,6 +2816,10 @@ class rdma_control_plane_test extends uvm_test;
                  "guarded-query rejection was not retryable")
   endtask
 
+  // 功能：在测试辅助 rdma_control_plane_test.check_owned_mr_timeout_freeze_failure_no_mapping 中构造或驱动“owned mr timeout freeze
+  //   failure no mapping”场景，并断言 DUT 的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_owned_mr_timeout_freeze_failure_no_mapping();
     rdma_control_plane control;
     rdma_fault_inject_resource_manager manager;
@@ -2575,8 +2857,8 @@ class rdma_control_plane_test extends uvm_test;
     );
     status = manager.fail_next_transition("mark_error", injected_status);
     expect_status("OWNED_TIMEOUT_FREEZE_INJECT", status, RDMA_SC_OK);
-    mock_cmq.timeout_opcode(XTR_V1_OP_KEY_ALLOC);
-    expected_opcodes.push_back(XTR_V1_OP_KEY_ALLOC);
+    mock_cmq.timeout_opcode(RDMA_OP_KEY_ALLOC);
+    expected_opcodes.push_back(RDMA_OP_KEY_ALLOC);
 
     control.alloc_and_register_mr(binding, request, dma_context, 4096,
                                   mapping, mr, result);
@@ -2618,6 +2900,10 @@ class rdma_control_plane_test extends uvm_test;
       )
   endtask
 
+  // 功能：在测试辅助 rdma_control_plane_test.check_owned_mr_released_mapping_not_returned 中构造或驱动“owned mr released mapping
+  //   not returned”场景，并断言 DUT 的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_owned_mr_released_mapping_not_returned();
     rdma_control_plane control;
     rdma_fault_inject_resource_manager manager;
@@ -2789,6 +3075,9 @@ class rdma_control_plane_test extends uvm_test;
                  "resource-only recovery released backing more than once")
   endtask
 
+  // 功能：在测试辅助 rdma_control_plane_test.check_owned_mr_success 中构造或驱动“owned mr success”场景，并断言 DUT 的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_owned_mr_success();
     rdma_control_plane control;
     rdma_fault_inject_resource_manager manager;
@@ -2835,7 +3124,7 @@ class rdma_control_plane_test extends uvm_test;
       return;
     end
     expect_result("OWNED_SUCCESS", result, RDMA_SC_OK);
-    expected_opcodes.push_back(XTR_V1_OP_KEY_ALLOC);
+    expected_opcodes.push_back(RDMA_OP_KEY_ALLOC);
     expect_cmq_opcodes("OWNED_SUCCESS_OPCODES", mock_cmq,
                        expected_opcodes);
     void'(manager.check_leaks(final_leaks, binding.make_handle()));
@@ -2870,6 +3159,9 @@ class rdma_control_plane_test extends uvm_test;
                  "owned PBL0 registration lost mapping authority or layout")
   endtask
 
+  // 功能：在测试辅助 rdma_control_plane_test.check_pd_lifecycle 中构造或驱动“pd lifecycle”场景，并断言 DUT 的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_pd_lifecycle();
     rdma_control_plane_probe control;
     rdma_resource_manager manager;
@@ -3048,6 +3340,10 @@ class rdma_control_plane_test extends uvm_test;
     expect_status("PD_HMC_TEST_CLEANUP", status, RDMA_SC_OK);
   endtask
 
+  // 功能：在测试辅助 rdma_control_plane_test.check_post_activate_snapshot_cleanup 中构造或驱动“post activate snapshot
+  //   cleanup”场景，并断言 DUT 的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_post_activate_snapshot_cleanup();
     rdma_control_plane control;
     rdma_post_activate_snapshot_failure_manager manager;
@@ -3100,6 +3396,10 @@ class rdma_control_plane_test extends uvm_test;
     end
   endtask
 
+  // 功能：在测试辅助 rdma_control_plane_test.check_borrowed_pbl0_registration 中构造或驱动“borrowed pbl0 registration”场景，并断言 DUT
+  //   的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_borrowed_pbl0_registration();
     rdma_control_plane control;
     rdma_resource_manager manager;
@@ -3144,7 +3444,7 @@ class rdma_control_plane_test extends uvm_test;
       `uvm_error("PBL0_REGISTER",
                  "borrowed PBL0 registration did not publish the ACTIVE MR")
     if (mock_cmq.calls.size() != 1 || mock_cmq.calls[0] == null ||
-        mock_cmq.calls[0].opcode != XTR_V1_OP_KEY_ALLOC ||
+        mock_cmq.calls[0].opcode != RDMA_OP_KEY_ALLOC ||
         !$cast(mrt, mock_cmq.calls[0].command.body) || mrt == null ||
         mrt.mr_h == null || mrt.pd_h == null ||
         mrt.mr_h.object_id != mr.local_mr_id[23:0] ||
@@ -3155,6 +3455,10 @@ class rdma_control_plane_test extends uvm_test;
                  "KEY_ALLOC did not separate local hardware IDs from registry handles")
   endtask
 
+  // 功能：在测试辅助 rdma_control_plane_test.check_key_alloc_explicit_failure 中构造或驱动“key alloc explicit failure”场景，并断言 DUT
+  //   的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_key_alloc_explicit_failure();
     rdma_control_plane control;
     rdma_resource_manager manager;
@@ -3217,7 +3521,7 @@ class rdma_control_plane_test extends uvm_test;
     injected_status = rdma_status::make(
       RDMA_SC_UNKNOWN_HW_ERROR, "injected KEY_ALLOC failure"
     );
-    mock_cmq.fail_opcode(XTR_V1_OP_KEY_ALLOC, injected_status);
+    mock_cmq.fail_opcode(RDMA_OP_KEY_ALLOC, injected_status);
 
     control.register_mr(binding, request, backing, mr, result);
     expect_result("KEY_ALLOC_FAILURE", result, RDMA_SC_UNKNOWN_HW_ERROR);
@@ -3233,7 +3537,7 @@ class rdma_control_plane_test extends uvm_test;
       `uvm_error("KEY_ALLOC_FAILURE_RESULT",
                  "explicit KEY_ALLOC failure did not release local state")
     if (mock_cmq.calls.size() != 1 || mock_cmq.calls[0] == null ||
-        mock_cmq.calls[0].opcode != XTR_V1_OP_KEY_ALLOC)
+        mock_cmq.calls[0].opcode != RDMA_OP_KEY_ALLOC)
       `uvm_error("KEY_ALLOC_FAILURE_COMMANDS",
                  "explicit KEY_ALLOC failure issued an unexpected command")
     if (result != null && result.resource_h != null) begin
@@ -3260,6 +3564,10 @@ class rdma_control_plane_test extends uvm_test;
     expect_status("KEY_ALLOC_FAILURE_HMC_LOOKUP", status, RDMA_SC_OK);
   endtask
 
+  // 功能：在测试辅助 rdma_control_plane_test.check_key_alloc_timeout_recovery 中构造或驱动“key alloc timeout recovery”场景，并断言 DUT
+  //   的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_key_alloc_timeout_recovery();
     rdma_control_plane control;
     rdma_resource_manager manager;
@@ -3330,7 +3638,7 @@ class rdma_control_plane_test extends uvm_test;
     );
     backing.hmc_refs.push_back(hmc_ref);
     backing.page_layout.first_pbl_index = hmc_ref.first_pbl_index;
-    mock_cmq.timeout_opcode(XTR_V1_OP_KEY_ALLOC);
+    mock_cmq.timeout_opcode(RDMA_OP_KEY_ALLOC);
 
     control.register_mr(binding, request, backing, mr, result);
     expect_recovery_result("KEY_ALLOC_TIMEOUT", result, RDMA_SC_TIMEOUT);
@@ -3346,7 +3654,7 @@ class rdma_control_plane_test extends uvm_test;
       `uvm_error("KEY_ALLOC_TIMEOUT_RESULT",
                  "timeout did not preserve an ERROR MR for recovery")
     if (mock_cmq.calls.size() != 1 || mock_cmq.calls[0] == null ||
-        mock_cmq.calls[0].opcode != XTR_V1_OP_KEY_ALLOC ||
+        mock_cmq.calls[0].opcode != RDMA_OP_KEY_ALLOC ||
         mock_cmq.calls[0].ticket == null)
       `uvm_error("KEY_ALLOC_TIMEOUT_COMMANDS",
                  "timeout lost its sole ambiguous KEY_ALLOC ticket")
@@ -3384,7 +3692,7 @@ class rdma_control_plane_test extends uvm_test;
                                   mock_cmq.calls[0].ticket.function_h) ||
               recovery.ambiguous_ticket.opcode_key == null ||
               recovery.ambiguous_ticket.opcode_key.opcode !=
-                XTR_V1_OP_KEY_ALLOC))
+                RDMA_OP_KEY_ALLOC))
       `uvm_error("KEY_ALLOC_TIMEOUT_TICKET",
                  "timeout recovery ticket is aliased or corrupted")
     void'(manager.check_leaks(final_leak_count, binding.make_handle()));
@@ -3464,7 +3772,7 @@ class rdma_control_plane_test extends uvm_test;
       expect_completed_recovery("KEY_ALLOC_LATE_SUCCESS", recovery_result,
                                 RDMA_SC_TIMEOUT);
       if (mock_cmq.calls.size() != 2 || mock_cmq.calls[1] == null ||
-          mock_cmq.calls[1].opcode != XTR_V1_OP_MR_DEREGISTER ||
+          mock_cmq.calls[1].opcode != RDMA_OP_MR_DEREGISTER ||
           !recovery_result.final_resource_state_known ||
           recovery_result.final_resource_state != RDMA_RESOURCE_RELEASED)
         `uvm_error("KEY_ALLOC_LATE_SUCCESS_STATE",
@@ -3482,6 +3790,10 @@ class rdma_control_plane_test extends uvm_test;
     end
   endtask
 
+  // 功能：在测试辅助 rdma_control_plane_test.check_key_alloc_late_failure_recovery 中构造或驱动“key alloc late failure
+  //   recovery”场景，并断言 DUT 的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_key_alloc_late_failure_recovery();
     rdma_control_plane control;
     rdma_fault_resource_manager manager;
@@ -3532,7 +3844,7 @@ class rdma_control_plane_test extends uvm_test;
     backing = make_borrowed_pbl0_backing(
       "late_failure_backing", binding, request
     );
-    mock_cmq.timeout_opcode(XTR_V1_OP_KEY_ALLOC);
+    mock_cmq.timeout_opcode(RDMA_OP_KEY_ALLOC);
     control.register_mr(binding, request, backing, mr, result);
     expect_recovery_result("KEY_ALLOC_LATE_FAILURE_TIMEOUT", result,
                            RDMA_SC_TIMEOUT);
@@ -3552,7 +3864,7 @@ class rdma_control_plane_test extends uvm_test;
     expect_completed_recovery("KEY_ALLOC_LATE_FAILURE", recovery_result,
                               RDMA_SC_TIMEOUT);
     if (mock_cmq.calls.size() != 1 || mock_cmq.calls[0] == null ||
-        mock_cmq.calls[0].opcode != XTR_V1_OP_KEY_ALLOC ||
+        mock_cmq.calls[0].opcode != RDMA_OP_KEY_ALLOC ||
         manager.finalize_release_calls != 1 ||
         backing.backing_refs[0] == null ||
         backing.backing_refs[0].release_complete ||
@@ -3572,6 +3884,10 @@ class rdma_control_plane_test extends uvm_test;
                  "second recovery repeated a side effect")
   endtask
 
+  // 功能：在测试辅助 rdma_control_plane_test.check_register_mr_caller_snapshot 中构造或驱动“register mr caller snapshot”场景，并断言 DUT
+  //   的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_register_mr_caller_snapshot();
     rdma_control_plane control;
     rdma_resource_manager manager;
@@ -3649,7 +3965,7 @@ class rdma_control_plane_test extends uvm_test;
       backing.backing_refs[0].mapping.backing_addr.value;
     original_hmc_size = backing.hmc_refs[0].size;
     original_first_pbl_index = backing.hmc_refs[0].first_pbl_index;
-    blocking_cmq.gate_opcode(XTR_V1_OP_KEY_ALLOC);
+    blocking_cmq.gate_opcode(RDMA_OP_KEY_ALLOC);
     fork
       begin
         control.register_mr(binding, request, backing, mr, result);
@@ -3730,8 +4046,8 @@ class rdma_control_plane_test extends uvm_test;
       backing.backing_refs[0].mapping.backing_addr.value;
     original_hmc_size = backing.hmc_refs[0].size;
     original_first_pbl_index = backing.hmc_refs[0].first_pbl_index;
-    blocking_cmq.timeout_opcode(XTR_V1_OP_KEY_ALLOC);
-    blocking_cmq.gate_opcode(XTR_V1_OP_KEY_ALLOC);
+    blocking_cmq.timeout_opcode(RDMA_OP_KEY_ALLOC);
+    blocking_cmq.gate_opcode(RDMA_OP_KEY_ALLOC);
     fork
       begin
         control.register_mr(binding, request, backing, mr, result);
@@ -3777,6 +4093,10 @@ class rdma_control_plane_test extends uvm_test;
                  "snapshot regressions issued unexpected CMQ commands")
   endtask
 
+  // 功能：在测试辅助 rdma_control_plane_test.check_register_mr_post_cmq_fence 中构造或驱动“register mr post cmq fence”场景，并断言 DUT
+  //   的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_register_mr_post_cmq_fence();
     rdma_control_plane control;
     rdma_resource_manager manager;
@@ -3845,7 +4165,7 @@ class rdma_control_plane_test extends uvm_test;
     );
     backing.hmc_refs.push_back(hmc_ref);
     backing.page_layout.first_pbl_index = hmc_ref.first_pbl_index;
-    blocking_cmq.gate_opcode(XTR_V1_OP_KEY_ALLOC);
+    blocking_cmq.gate_opcode(RDMA_OP_KEY_ALLOC);
     fork
       begin
         control.register_mr(binding, request, backing, mr, result);
@@ -3857,6 +4177,8 @@ class rdma_control_plane_test extends uvm_test;
                      "KEY_ALLOC did not enter the blocking CMQ")
         else begin
           binding.generation++;
+          if (!binding.synchronize_identity_from_legacy_mirrors().ok())
+            `uvm_error("BINDING", "legacy identity synchronization failed")
           binding.owner_h = binding.make_handle();
         end
         blocking_cmq.release_one();
@@ -3906,7 +4228,7 @@ class rdma_control_plane_test extends uvm_test;
                  "binding fence recovery aliases caller backing")
     if (blocking_cmq.calls.size() != 1 ||
         blocking_cmq.calls[0] == null ||
-        blocking_cmq.calls[0].opcode != XTR_V1_OP_KEY_ALLOC)
+        blocking_cmq.calls[0].opcode != RDMA_OP_KEY_ALLOC)
       `uvm_error("POST_CMQ_BINDING_COMMANDS",
                  "binding fence issued unexpected hardware commands")
 
@@ -3951,7 +4273,7 @@ class rdma_control_plane_test extends uvm_test;
     );
     backing.hmc_refs.push_back(hmc_ref);
     backing.page_layout.first_pbl_index = hmc_ref.first_pbl_index;
-    blocking_cmq.gate_opcode(XTR_V1_OP_KEY_ALLOC);
+    blocking_cmq.gate_opcode(RDMA_OP_KEY_ALLOC);
     fork
       begin
         control.register_mr(binding, request, backing, mr, result);
@@ -4006,11 +4328,15 @@ class rdma_control_plane_test extends uvm_test;
                  "HMC fence recovery aliases caller backing")
     if (blocking_cmq.calls.size() != 1 ||
         blocking_cmq.calls[0] == null ||
-        blocking_cmq.calls[0].opcode != XTR_V1_OP_KEY_ALLOC)
+        blocking_cmq.calls[0].opcode != RDMA_OP_KEY_ALLOC)
       `uvm_error("POST_CMQ_COMMANDS",
                  "post-CMQ fences issued unexpected hardware commands")
   endtask
 
+  // 功能：在测试辅助 rdma_control_plane_test.check_function_concurrency 中构造或驱动“function concurrency”场景，并断言 DUT
+  //   的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_function_concurrency();
     rdma_control_plane_probe control;
     rdma_resource_manager manager;
@@ -4086,7 +4412,7 @@ class rdma_control_plane_test extends uvm_test;
     cleanup_gate_observed = 1'b0;
     held_b_released = 1'b0;
     control.acquire_test_function_lock(owner_b, held_b);
-    mock_cmq.gate_opcode(XTR_V1_OP_KEY_ALLOC);
+    mock_cmq.gate_opcode(RDMA_OP_KEY_ALLOC);
     // VCS W-2024.09-SP1 faults while reclaiming concurrent class-output
     // handles from multiple public calls, so keep one public registration.
     fork
@@ -4136,11 +4462,15 @@ class rdma_control_plane_test extends uvm_test;
     expect_result("FUNCTION_CONCURRENCY_RESULT", result, RDMA_SC_OK);
     if (mr == null || mock_cmq.calls.size() != 1 ||
         mock_cmq.calls[0] == null ||
-        mock_cmq.calls[0].opcode != XTR_V1_OP_KEY_ALLOC)
+        mock_cmq.calls[0].opcode != RDMA_OP_KEY_ALLOC)
       `uvm_error("FUNCTION_CONCURRENCY_COMMAND",
                  "public registration result or CMQ command is incomplete")
   endtask
 
+  // 功能：在测试辅助 rdma_control_plane_test.check_register_mr_pre_activate_generation_fence 中构造或驱动“register mr pre activate
+  //   generation fence”场景，并断言 DUT 的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_register_mr_pre_activate_generation_fence();
     rdma_control_plane control;
     rdma_generation_mutating_resource_manager manager;
@@ -4213,13 +4543,17 @@ class rdma_control_plane_test extends uvm_test;
         recovery.pending_steps[0] != RDMA_CTRL_STEP_RESOURCE_RELEASED ||
         manager.activate_calls != 0 ||
         mock_cmq.calls.size() != 2 || mock_cmq.calls[0] == null ||
-        mock_cmq.calls[0].opcode != XTR_V1_OP_KEY_ALLOC ||
+        mock_cmq.calls[0].opcode != RDMA_OP_KEY_ALLOC ||
         mock_cmq.calls[1] == null ||
-        mock_cmq.calls[1].opcode != XTR_V1_OP_MR_DEREGISTER)
+        mock_cmq.calls[1].opcode != RDMA_OP_MR_DEREGISTER)
       `uvm_error("PRE_ACTIVATE_FENCE_STATE",
                  "stale programmed MR reached activate or lost recovery")
   endtask
 
+  // 功能：在测试辅助 rdma_control_plane_test.check_register_mr_recovery_freeze_failures 中构造或驱动“register mr recovery freeze
+  //   failures”场景，并断言 DUT 的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_register_mr_recovery_freeze_failures();
     rdma_control_plane control;
     rdma_fault_resource_manager manager;
@@ -4299,7 +4633,7 @@ class rdma_control_plane_test extends uvm_test;
     backing.hmc_refs.push_back(hmc_ref);
     backing.page_layout.first_pbl_index = hmc_ref.first_pbl_index;
     manager.fail_next_release_reserved(release_failure);
-    mock_cmq.fail_opcode(XTR_V1_OP_KEY_ALLOC, hardware_failure);
+    mock_cmq.fail_opcode(RDMA_OP_KEY_ALLOC, hardware_failure);
     control.register_mr(binding, request, backing, mr, result);
     expect_recovery_result("FREEZE_RELEASE", result,
                            RDMA_SC_UNKNOWN_HW_ERROR);
@@ -4366,7 +4700,7 @@ class rdma_control_plane_test extends uvm_test;
     backing.page_layout.first_pbl_index = hmc_ref.first_pbl_index;
     manager.fail_next_release_reserved(release_failure);
     manager.fail_next_mark_error(mark_error_failure);
-    mock_cmq.fail_opcode(XTR_V1_OP_KEY_ALLOC, hardware_failure);
+    mock_cmq.fail_opcode(RDMA_OP_KEY_ALLOC, hardware_failure);
     control.register_mr(binding, request, backing, mr, result);
     expect_recovery_fallback("FREEZE_DOUBLE", result,
                              RDMA_SC_UNKNOWN_HW_ERROR);
@@ -4416,7 +4750,7 @@ class rdma_control_plane_test extends uvm_test;
     backing.hmc_refs.push_back(hmc_ref);
     backing.page_layout.first_pbl_index = hmc_ref.first_pbl_index;
     manager.fail_next_mark_error(mark_error_failure);
-    mock_cmq.timeout_opcode(XTR_V1_OP_KEY_ALLOC);
+    mock_cmq.timeout_opcode(RDMA_OP_KEY_ALLOC);
     control.register_mr(binding, request, backing, mr, result);
     expect_recovery_fallback("FREEZE_TIMEOUT", result, RDMA_SC_TIMEOUT);
     if (mr != null || result == null || result.resource_h == null ||
@@ -4491,13 +4825,17 @@ class rdma_control_plane_test extends uvm_test;
         manager.finalize_release_calls != 1 ||
         mock_cmq.calls.size() != 5 ||
         mock_cmq.calls[3] == null ||
-        mock_cmq.calls[3].opcode != XTR_V1_OP_KEY_ALLOC ||
+        mock_cmq.calls[3].opcode != RDMA_OP_KEY_ALLOC ||
         mock_cmq.calls[4] == null ||
-        mock_cmq.calls[4].opcode != XTR_V1_OP_MR_DEREGISTER)
+        mock_cmq.calls[4].opcode != RDMA_OP_MR_DEREGISTER)
       `uvm_error("FREEZE_FINALIZE_CALLS",
                  "finalize failure command or recovery calls are incomplete")
   endtask
 
+  // 功能：在测试辅助 rdma_control_plane_test.check_post_lock_revalidation 中构造或驱动“post lock revalidation”场景，并断言 DUT
+  //   的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_post_lock_revalidation();
     rdma_control_plane_probe binding_control;
     rdma_control_plane_probe request_control;
@@ -4539,6 +4877,8 @@ class rdma_control_plane_test extends uvm_test;
       begin
         #1ns;
         binding.generation++;
+        if (!binding.synchronize_identity_from_legacy_mirrors().ok())
+          `uvm_error("BINDING", "legacy identity synchronization failed")
         binding.owner_h = binding.make_handle();
         binding_control.release_test_function_lock(held_lock);
       end
@@ -4597,6 +4937,10 @@ class rdma_control_plane_test extends uvm_test;
     end
   endtask
 
+  // 功能：在测试辅助 rdma_control_plane_test.check_register_mr_post_lock_revalidation 中构造或驱动“register mr post lock
+  //   revalidation”场景，并断言 DUT 的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_register_mr_post_lock_revalidation();
     rdma_control_plane_probe control;
     rdma_resource_manager manager;
@@ -4691,6 +5035,10 @@ class rdma_control_plane_test extends uvm_test;
                  "post-lock backing mutation reached MR side effects")
   endtask
 
+  // 功能：在测试辅助 rdma_control_plane_test.check_supplied_lock_ownership 中构造或驱动“supplied lock ownership”场景，并断言 DUT
+  //   的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_supplied_lock_ownership();
     rdma_control_plane_probe control;
     rdma_resource_manager manager;
@@ -4775,6 +5123,10 @@ class rdma_control_plane_test extends uvm_test;
                  "failing supplied-lock registration returned an MR")
   endtask
 
+  // 功能：在测试辅助 rdma_control_plane_test.check_owned_post_lock_snapshot 中构造或驱动“owned post lock snapshot”场景，并断言 DUT
+  //   的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_owned_post_lock_snapshot();
     rdma_control_plane_probe control;
     rdma_resource_manager manager;
@@ -4834,7 +5186,7 @@ class rdma_control_plane_test extends uvm_test;
     first_access = '{local_write:1'b1, remote_read:1'b1,
                      remote_write:1'b0, memory_window_bind:1'b0,
                      remote_atomic:1'b0};
-    blocking_cmq.gate_opcode(XTR_V1_OP_KEY_ALLOC);
+    blocking_cmq.gate_opcode(RDMA_OP_KEY_ALLOC);
     fork
       begin
         control.alloc_and_register_mr(
@@ -4888,6 +5240,10 @@ class rdma_control_plane_test extends uvm_test;
                  "owned registration mixed pre-lock or later caller values")
   endtask
 
+  // 功能：在测试辅助 rdma_control_plane_test.check_register_mr_pre_cmq_rejections 中构造或驱动“register mr pre cmq
+  //   rejections”场景，并断言 DUT 的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_register_mr_pre_cmq_rejections();
     rdma_control_plane control;
     rdma_resource_manager manager;
@@ -5114,6 +5470,10 @@ class rdma_control_plane_test extends uvm_test;
                  "pre-CMQ rejection reached key derivation or hardware")
   endtask
 
+  // 功能：在测试辅助 rdma_control_plane_test.check_borrowed_pbl1_pbl2_registration 中构造或驱动“borrowed pbl1 pbl2
+  //   registration”场景，并断言 DUT 的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_borrowed_pbl1_pbl2_registration();
     rdma_control_plane control;
     rdma_resource_manager manager;
@@ -5180,9 +5540,9 @@ class rdma_control_plane_test extends uvm_test;
     if (mock_cmq.calls.size() != 1 || mock_cmq.calls[0] == null ||
         mock_cmq.calls[0].command == null ||
         mock_cmq.calls[0].command.opcode_key == null ||
-        mock_cmq.calls[0].command.opcode_key.profile_name != "xtr_v1" ||
+        mock_cmq.calls[0].command.opcode_key.profile_name != "rdma" ||
         mock_cmq.calls[0].command.opcode_key.opcode !=
-          XTR_V1_OP_KEY_ALLOC ||
+          RDMA_OP_KEY_ALLOC ||
         mock_cmq.calls[0].command.opcode_key.variant != "key_alloc" ||
         mock_cmq.calls[0].command.timeout != 3us ||
         !$cast(mrt, mock_cmq.calls[0].command.body) || mrt == null ||
@@ -5243,7 +5603,7 @@ class rdma_control_plane_test extends uvm_test;
       `uvm_error("PBL2_RESULT",
                  "PBL2 registration lost key, backing, HMC, or steps")
     if (mock_cmq.calls.size() != 2 || mock_cmq.calls[1] == null ||
-        mock_cmq.calls[1].opcode != XTR_V1_OP_KEY_ALLOC ||
+        mock_cmq.calls[1].opcode != RDMA_OP_KEY_ALLOC ||
         !$cast(mrt, mock_cmq.calls[1].command.body) || mrt == null ||
         mrt.page_layout == null ||
         mrt.page_layout.pbl_mode != RDMA_MR_PBL2 ||
@@ -5259,6 +5619,10 @@ class rdma_control_plane_test extends uvm_test;
     expect_status("PBL2_HMC_POST_LOOKUP", status, RDMA_SC_OK);
   endtask
 
+  // 功能：在测试辅助 rdma_control_plane_test.check_mr_deregister_success_and_busy 中构造或驱动“mr deregister success and
+  //   busy”场景，并断言 DUT 的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_mr_deregister_success_and_busy();
     rdma_control_plane_probe control;
     rdma_fault_resource_manager manager;
@@ -5273,9 +5637,9 @@ class rdma_control_plane_test extends uvm_test;
     rdma_dma_mapping mapping;
     rdma_dma_mapping mapping2;
     rdma_hmc_fvm_addr_t hmc_address;
-    rdma_xtr_v1_occ_flush_body occ_body;
-    rdma_xtr_v1_mr_deregister_body dereg_body;
-    rdma_xtr_v1_cmq_empty_body drain_body;
+    rdma_hw_occ_flush_body occ_body;
+    rdma_hw_mr_deregister_body dereg_body;
+    rdma_hw_cmq_empty_body drain_body;
     rdma_control_result result;
     rdma_status status;
     bit [7:0] expected_opcodes[$];
@@ -5308,8 +5672,8 @@ class rdma_control_plane_test extends uvm_test;
     expect_status("MR_DEREG_BUSY_RETIRE", status, RDMA_SC_OK);
     control.deregister_mr(binding, mr.handle, result);
     expect_result("MR_DEREG_BORROWED_PBL0", result, RDMA_SC_OK);
-    expected_opcodes.push_back(XTR_V1_OP_MR_DEREGISTER);
-    expected_opcodes.push_back(XTR_V1_OP_TQ_FLUSH);
+    expected_opcodes.push_back(RDMA_OP_MR_DEREGISTER);
+    expected_opcodes.push_back(RDMA_OP_TQ_FLUSH);
     expect_cmq_opcodes("MR_DEREG_BORROWED_PBL0_ORDER", mock_cmq,
                        expected_opcodes);
     dereg_body = null;
@@ -5366,8 +5730,8 @@ class rdma_control_plane_test extends uvm_test;
     control.deregister_mr(binding, mr.handle, result);
     expect_result("MR_DEREG_BORROWED_PBL1", result, RDMA_SC_OK);
     expected_opcodes.delete();
-    expected_opcodes.push_back(XTR_V1_OP_MR_DEREGISTER);
-    expected_opcodes.push_back(XTR_V1_OP_TQ_FLUSH);
+    expected_opcodes.push_back(RDMA_OP_MR_DEREGISTER);
+    expected_opcodes.push_back(RDMA_OP_TQ_FLUSH);
     expect_cmq_opcodes("MR_DEREG_BORROWED_PBL1_ORDER", mock_cmq,
                        expected_opcodes);
     if (mapping == null || mapping.state != RDMA_MAPPING_ACTIVE ||
@@ -5397,9 +5761,9 @@ class rdma_control_plane_test extends uvm_test;
     control.deregister_mr(binding, mr.handle, result);
     expect_result("MR_DEREG_BORROWED_PBL2", result, RDMA_SC_OK);
     expected_opcodes.delete();
-    expected_opcodes.push_back(XTR_V1_OP_OCC_FLUSH);
-    expected_opcodes.push_back(XTR_V1_OP_MR_DEREGISTER);
-    expected_opcodes.push_back(XTR_V1_OP_TQ_FLUSH);
+    expected_opcodes.push_back(RDMA_OP_OCC_FLUSH);
+    expected_opcodes.push_back(RDMA_OP_MR_DEREGISTER);
+    expected_opcodes.push_back(RDMA_OP_TQ_FLUSH);
     expect_cmq_opcodes("MR_DEREG_BORROWED_PBL2_ORDER", mock_cmq,
                        expected_opcodes);
     occ_body = null;
@@ -5453,9 +5817,9 @@ class rdma_control_plane_test extends uvm_test;
     control.deregister_mr(binding, mr.handle, result);
     expect_result("MR_DEREG_OWNED_PBL2", result, RDMA_SC_OK);
     expected_opcodes.delete();
-    expected_opcodes.push_back(XTR_V1_OP_OCC_FLUSH);
-    expected_opcodes.push_back(XTR_V1_OP_MR_DEREGISTER);
-    expected_opcodes.push_back(XTR_V1_OP_TQ_FLUSH);
+    expected_opcodes.push_back(RDMA_OP_OCC_FLUSH);
+    expected_opcodes.push_back(RDMA_OP_MR_DEREGISTER);
+    expected_opcodes.push_back(RDMA_OP_TQ_FLUSH);
     expect_cmq_opcodes("MR_DEREG_OWNED_PBL2_ORDER", mock_cmq,
                        expected_opcodes);
     status = hmc.check_leaks(hmc_leaks, binding.make_handle());
@@ -5470,6 +5834,10 @@ class rdma_control_plane_test extends uvm_test;
                  "owned PBL2 backing was not released exactly once")
   endtask
 
+  // 功能：在 rdma_control_plane_test 中，run_deregister_generation_fence 驱动 UVM 阶段中的场景初始化、事务执行和断言收尾，并在退出前释放 objection 或测试资源。
+  // 输入/输出及副作用：prefix（输入）、pbl_mode（输入）、gated_opcode（输入）、expected_presence（输入）、expected_pending_step（输入）、expected_command_count（输入）；run_deregister_generation_fence 驱动下游事务；函数返回 无直接返回值，不取得调用方资源所有权。
+
+  // 失败/边界：run_deregister_generation_fence 的 setup/阶段驱动失败时停止新增事务，并按测试生命周期清理 objection 与临时引用。
   task automatic run_deregister_generation_fence(
     string prefix,
     rdma_mr_pbl_mode_e pbl_mode,
@@ -5515,6 +5883,8 @@ class rdma_control_plane_test extends uvm_test;
                      "deregister command did not enter the CMQ gate")
         else begin
           binding.generation++;
+          if (!binding.synchronize_identity_from_legacy_mirrors().ok())
+            `uvm_error("BINDING", "legacy identity synchronization failed")
           binding.owner_h = binding.make_handle();
         end
         mock_cmq.release_one();
@@ -5544,25 +5914,32 @@ class rdma_control_plane_test extends uvm_test;
                  "stale deregistration continued or lost old authority")
   endtask
 
+  // 功能：在测试辅助 rdma_control_plane_test.check_deregister_generation_fences 中构造或驱动“deregister generation fences”场景，并断言
+  //   DUT 的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_deregister_generation_fences();
     run_deregister_generation_fence(
       "DEREG_OCC_GENERATION_FENCE", RDMA_MR_PBL2,
-      XTR_V1_OP_OCC_FLUSH, RDMA_HW_PRESENCE_PRESENT,
+      RDMA_OP_OCC_FLUSH, RDMA_HW_PRESENCE_PRESENT,
       RDMA_CTRL_STEP_HW_MR_DEREGISTERED, 1
     );
     run_deregister_generation_fence(
       "DEREG_MR_GENERATION_FENCE", RDMA_MR_PBL0,
-      XTR_V1_OP_MR_DEREGISTER, RDMA_HW_PRESENCE_ABSENT,
+      RDMA_OP_MR_DEREGISTER, RDMA_HW_PRESENCE_ABSENT,
       RDMA_CTRL_STEP_HW_DRAINED, 1
     );
     run_deregister_generation_fence(
       "DEREG_TQ_GENERATION_FENCE", RDMA_MR_PBL0,
-      XTR_V1_OP_TQ_FLUSH, RDMA_HW_PRESENCE_ABSENT,
+      RDMA_OP_TQ_FLUSH, RDMA_HW_PRESENCE_ABSENT,
       RDMA_CTRL_STEP_BACKING_RELEASED, 2
     );
     run_deregister_local_release_generation_fence();
   endtask
 
+  // 功能：在 rdma_control_plane_test 中，run_deregister_local_release_generation_fence 驱动 UVM 阶段中的场景初始化、事务执行和断言收尾，并在退出前释放 objection 或测试资源。
+  // 输入/输出及副作用：无显式参数；run_deregister_local_release_generation_fence 驱动下游事务；函数返回 无直接返回值，不取得调用方资源所有权。
+  // 失败/边界：run_deregister_local_release_generation_fence 的 setup/阶段驱动失败时停止新增事务，并按测试生命周期清理 objection 与临时引用。
   task automatic run_deregister_local_release_generation_fence();
     string prefix;
     rdma_control_plane_probe control;
@@ -5621,6 +5998,10 @@ class rdma_control_plane_test extends uvm_test;
                  "stale local release finalized or lost old authority")
   endtask
 
+  // 功能：在测试辅助 rdma_control_plane_test.check_mr_deregister_failure_table 中构造或驱动“mr deregister failure table”场景，并断言 DUT
+  //   的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_mr_deregister_failure_table();
     rdma_control_plane_probe control;
     rdma_fault_resource_manager manager;
@@ -5655,7 +6036,7 @@ class rdma_control_plane_test extends uvm_test;
     injected_status = rdma_status::make(
       RDMA_SC_UNKNOWN_HW_ERROR, "injected OCC failure"
     );
-    mock_cmq.fail_opcode(XTR_V1_OP_OCC_FLUSH, injected_status);
+    mock_cmq.fail_opcode(RDMA_OP_OCC_FLUSH, injected_status);
     control.deregister_mr(binding, mr.handle, result);
     expect_result("MR_DEREG_OCC_FAILURE", result,
                   RDMA_SC_UNKNOWN_HW_ERROR);
@@ -5663,7 +6044,7 @@ class rdma_control_plane_test extends uvm_test;
     expect_status("MR_DEREG_OCC_FAILURE_LOOKUP", status, RDMA_SC_OK);
     live_mr = null;
     void'($cast(live_mr, resource));
-    expected_opcodes.push_back(XTR_V1_OP_OCC_FLUSH);
+    expected_opcodes.push_back(RDMA_OP_OCC_FLUSH);
     expect_cmq_opcodes("MR_DEREG_OCC_FAILURE_ORDER", mock_cmq,
                        expected_opcodes);
     if (live_mr == null || live_mr.state != RDMA_RESOURCE_ACTIVE ||
@@ -5694,7 +6075,7 @@ class rdma_control_plane_test extends uvm_test;
     injected_status = rdma_status::make(
       RDMA_SC_UNKNOWN_HW_ERROR, "injected OCC explicit failure"
     );
-    mock_cmq.fail_opcode(XTR_V1_OP_OCC_FLUSH, injected_status);
+    mock_cmq.fail_opcode(RDMA_OP_OCC_FLUSH, injected_status);
     injected_status = rdma_status::make(
       RDMA_SC_RESOURCE_BUSY, "injected OCC restore ACTIVE failure"
     );
@@ -5709,7 +6090,7 @@ class rdma_control_plane_test extends uvm_test;
     status = manager.lookup_recovery(mr.handle, recovery);
     expect_status("MR_DEREG_OCC_RESTORE_RECOVERY", status, RDMA_SC_OK);
     expected_opcodes.delete();
-    expected_opcodes.push_back(XTR_V1_OP_OCC_FLUSH);
+    expected_opcodes.push_back(RDMA_OP_OCC_FLUSH);
     expect_cmq_opcodes("MR_DEREG_OCC_RESTORE_ORDER", mock_cmq,
                        expected_opcodes);
     if (live_mr == null || live_mr.state != RDMA_RESOURCE_ERROR ||
@@ -5745,7 +6126,7 @@ class rdma_control_plane_test extends uvm_test;
       control, manager, mock_cmq, host_mem, hmc, binding, pd, mr,
       mapping, hmc_address, baseline_allocations
     );
-    mock_cmq.timeout_opcode(XTR_V1_OP_OCC_FLUSH);
+    mock_cmq.timeout_opcode(RDMA_OP_OCC_FLUSH);
     control.deregister_mr(binding, mr.handle, result);
     expect_recovery_result("MR_DEREG_OCC_TIMEOUT", result, RDMA_SC_TIMEOUT);
     status = manager.lookup(mr.handle, resource);
@@ -5787,7 +6168,7 @@ class rdma_control_plane_test extends uvm_test;
     expect_status("MR_DEREG_OCC_LATE_FAILURE_CLEARED", status,
                   RDMA_SC_INVALID_STATE);
     expected_opcodes.delete();
-    expected_opcodes.push_back(XTR_V1_OP_OCC_FLUSH);
+    expected_opcodes.push_back(RDMA_OP_OCC_FLUSH);
     expect_cmq_opcodes("MR_DEREG_OCC_LATE_FAILURE_ORDER", mock_cmq,
                        expected_opcodes);
     if (live_mr == null || live_mr.state != RDMA_RESOURCE_ACTIVE ||
@@ -5825,7 +6206,7 @@ class rdma_control_plane_test extends uvm_test;
     injected_status = rdma_status::make(
       RDMA_SC_UNKNOWN_HW_ERROR, "injected MR deregister failure"
     );
-    mock_cmq.fail_opcode(XTR_V1_OP_MR_DEREGISTER, injected_status);
+    mock_cmq.fail_opcode(RDMA_OP_MR_DEREGISTER, injected_status);
     control.deregister_mr(binding, mr.handle, result);
     expect_result("MR_DEREG_COMMAND_FAILURE", result,
                   RDMA_SC_UNKNOWN_HW_ERROR);
@@ -5834,7 +6215,7 @@ class rdma_control_plane_test extends uvm_test;
     live_mr = null;
     void'($cast(live_mr, resource));
     expected_opcodes.delete();
-    expected_opcodes.push_back(XTR_V1_OP_MR_DEREGISTER);
+    expected_opcodes.push_back(RDMA_OP_MR_DEREGISTER);
     expect_cmq_opcodes("MR_DEREG_COMMAND_FAILURE_ORDER", mock_cmq,
                        expected_opcodes);
     if (live_mr == null || live_mr.state != RDMA_RESOURCE_ACTIVE ||
@@ -5855,7 +6236,7 @@ class rdma_control_plane_test extends uvm_test;
     injected_status = rdma_status::make(
       RDMA_SC_UNKNOWN_HW_ERROR, "injected MR deregister explicit failure"
     );
-    mock_cmq.fail_opcode(XTR_V1_OP_MR_DEREGISTER, injected_status);
+    mock_cmq.fail_opcode(RDMA_OP_MR_DEREGISTER, injected_status);
     injected_status = rdma_status::make(
       RDMA_SC_RESOURCE_BUSY, "injected MR restore ACTIVE failure"
     );
@@ -5870,8 +6251,8 @@ class rdma_control_plane_test extends uvm_test;
     status = manager.lookup_recovery(mr.handle, recovery);
     expect_status("MR_DEREG_COMMAND_RESTORE_RECOVERY", status, RDMA_SC_OK);
     expected_opcodes.delete();
-    expected_opcodes.push_back(XTR_V1_OP_OCC_FLUSH);
-    expected_opcodes.push_back(XTR_V1_OP_MR_DEREGISTER);
+    expected_opcodes.push_back(RDMA_OP_OCC_FLUSH);
+    expected_opcodes.push_back(RDMA_OP_MR_DEREGISTER);
     expect_cmq_opcodes("MR_DEREG_COMMAND_RESTORE_ORDER", mock_cmq,
                        expected_opcodes);
     if (live_mr == null || live_mr.state != RDMA_RESOURCE_ERROR ||
@@ -5911,7 +6292,7 @@ class rdma_control_plane_test extends uvm_test;
       control, manager, mock_cmq, host_mem, hmc, binding, pd, mr,
       mapping, hmc_address, baseline_allocations
     );
-    mock_cmq.timeout_opcode(XTR_V1_OP_MR_DEREGISTER);
+    mock_cmq.timeout_opcode(RDMA_OP_MR_DEREGISTER);
     control.deregister_mr(binding, mr.handle, result);
     expect_recovery_result("MR_DEREG_COMMAND_TIMEOUT", result,
                            RDMA_SC_TIMEOUT);
@@ -5947,7 +6328,7 @@ class rdma_control_plane_test extends uvm_test;
     expect_status("MR_DEREG_COMMAND_LATE_FAILURE_CLEARED", status,
                   RDMA_SC_INVALID_STATE);
     expected_opcodes.delete();
-    expected_opcodes.push_back(XTR_V1_OP_MR_DEREGISTER);
+    expected_opcodes.push_back(RDMA_OP_MR_DEREGISTER);
     expect_cmq_opcodes("MR_DEREG_COMMAND_LATE_FAILURE_ORDER", mock_cmq,
                        expected_opcodes);
     if (live_mr == null || live_mr.state != RDMA_RESOURCE_ACTIVE ||
@@ -5978,7 +6359,7 @@ class rdma_control_plane_test extends uvm_test;
       RDMA_OWNERSHIP_BORROWED, control, manager, mock_cmq, host_mem, hmc,
       binding, pd, mr, mapping, hmc_address, baseline_allocations
     );
-    mock_cmq.timeout_opcode(XTR_V1_OP_MR_DEREGISTER);
+    mock_cmq.timeout_opcode(RDMA_OP_MR_DEREGISTER);
     control.deregister_mr(binding, mr.handle, result);
     expect_recovery_result("MR_DEREG_LATE_RESTORE_RETRY_TIMEOUT", result,
                            RDMA_SC_TIMEOUT);
@@ -6003,7 +6384,7 @@ class rdma_control_plane_test extends uvm_test;
     expect_status("MR_DEREG_LATE_RESTORE_RETRY_FIRST_RECOVERY", status,
                   RDMA_SC_OK);
     expected_opcodes.delete();
-    expected_opcodes.push_back(XTR_V1_OP_MR_DEREGISTER);
+    expected_opcodes.push_back(RDMA_OP_MR_DEREGISTER);
     expect_cmq_opcodes("MR_DEREG_LATE_RESTORE_RETRY_FIRST_ORDER", mock_cmq,
                        expected_opcodes);
     if (recovery == null ||
@@ -6053,15 +6434,15 @@ class rdma_control_plane_test extends uvm_test;
     injected_status = rdma_status::make(
       RDMA_SC_UNKNOWN_HW_ERROR, "injected TQ flush failure"
     );
-    mock_cmq.fail_opcode(XTR_V1_OP_TQ_FLUSH, injected_status);
+    mock_cmq.fail_opcode(RDMA_OP_TQ_FLUSH, injected_status);
     control.deregister_mr(binding, mr.handle, result);
     expect_recovery_result("MR_DEREG_DRAIN_FAILURE", result,
                            RDMA_SC_UNKNOWN_HW_ERROR);
     status = manager.lookup_recovery(mr.handle, recovery);
     expect_status("MR_DEREG_DRAIN_FAILURE_RECOVERY", status, RDMA_SC_OK);
     expected_opcodes.delete();
-    expected_opcodes.push_back(XTR_V1_OP_MR_DEREGISTER);
-    expected_opcodes.push_back(XTR_V1_OP_TQ_FLUSH);
+    expected_opcodes.push_back(RDMA_OP_MR_DEREGISTER);
+    expected_opcodes.push_back(RDMA_OP_TQ_FLUSH);
     expect_cmq_opcodes("MR_DEREG_DRAIN_FAILURE_ORDER", mock_cmq,
                        expected_opcodes);
     if (recovery == null ||
@@ -6091,7 +6472,7 @@ class rdma_control_plane_test extends uvm_test;
     status = manager.lookup_recovery(mr.handle, recovery);
     expect_status("MR_DEREG_DRAIN_PERSIST_FIRST_RECOVERY", status,
                   RDMA_SC_OK);
-    expected_opcodes.push_back(XTR_V1_OP_TQ_FLUSH);
+    expected_opcodes.push_back(RDMA_OP_TQ_FLUSH);
     expect_cmq_opcodes("MR_DEREG_DRAIN_PERSIST_FIRST_ORDER", mock_cmq,
                        expected_opcodes);
     if (recovery == null ||
@@ -6146,7 +6527,7 @@ class rdma_control_plane_test extends uvm_test;
       control, manager, mock_cmq, host_mem, hmc, binding, pd, mr,
       mapping, hmc_address, baseline_allocations
     );
-    mock_cmq.timeout_opcode(XTR_V1_OP_TQ_FLUSH);
+    mock_cmq.timeout_opcode(RDMA_OP_TQ_FLUSH);
     control.deregister_mr(binding, mr.handle, result);
     expect_recovery_result("MR_DEREG_DRAIN_TIMEOUT", result,
                            RDMA_SC_TIMEOUT);
@@ -6157,8 +6538,8 @@ class rdma_control_plane_test extends uvm_test;
     status = manager.lookup_recovery(mr.handle, recovery);
     expect_status("MR_DEREG_DRAIN_TIMEOUT_RECOVERY", status, RDMA_SC_OK);
     expected_opcodes.delete();
-    expected_opcodes.push_back(XTR_V1_OP_MR_DEREGISTER);
-    expected_opcodes.push_back(XTR_V1_OP_TQ_FLUSH);
+    expected_opcodes.push_back(RDMA_OP_MR_DEREGISTER);
+    expected_opcodes.push_back(RDMA_OP_TQ_FLUSH);
     expect_cmq_opcodes("MR_DEREG_DRAIN_TIMEOUT_ORDER", mock_cmq,
                        expected_opcodes);
     if (live_mr == null || live_mr.state != RDMA_RESOURCE_ERROR ||
@@ -6224,7 +6605,7 @@ class rdma_control_plane_test extends uvm_test;
     control.recover_resource(binding, mr.handle, second_recovery_result);
     expect_completed_recovery("MR_DEREG_DRAIN_LATE_FAILURE_SECOND",
                               second_recovery_result, RDMA_SC_TIMEOUT);
-    expected_opcodes.push_back(XTR_V1_OP_TQ_FLUSH);
+    expected_opcodes.push_back(RDMA_OP_TQ_FLUSH);
     expect_cmq_opcodes("MR_DEREG_DRAIN_LATE_FAILURE_SECOND_ORDER",
                        mock_cmq, expected_opcodes);
     status = manager.lookup(mr.handle, resource);
@@ -6278,8 +6659,8 @@ class rdma_control_plane_test extends uvm_test;
       `uvm_error("MR_DEREG_OWNED_RELEASE_GATE",
                  "failed owned release reached finalize or lost recovery")
     expected_opcodes.delete();
-    expected_opcodes.push_back(XTR_V1_OP_MR_DEREGISTER);
-    expected_opcodes.push_back(XTR_V1_OP_TQ_FLUSH);
+    expected_opcodes.push_back(RDMA_OP_MR_DEREGISTER);
+    expected_opcodes.push_back(RDMA_OP_TQ_FLUSH);
     expect_cmq_opcodes("MR_DEREG_OWNED_RECOVERY_BOUNDARY_ORDER", mock_cmq,
                        expected_opcodes);
     injected_status = rdma_status::make(
@@ -6366,9 +6747,9 @@ class rdma_control_plane_test extends uvm_test;
     expect_status("MR_DEREG_OWNED_HMC_RELEASE_RECOVERY", status,
                   RDMA_SC_OK);
     expected_opcodes.delete();
-    expected_opcodes.push_back(XTR_V1_OP_OCC_FLUSH);
-    expected_opcodes.push_back(XTR_V1_OP_MR_DEREGISTER);
-    expected_opcodes.push_back(XTR_V1_OP_TQ_FLUSH);
+    expected_opcodes.push_back(RDMA_OP_OCC_FLUSH);
+    expected_opcodes.push_back(RDMA_OP_MR_DEREGISTER);
+    expected_opcodes.push_back(RDMA_OP_TQ_FLUSH);
     expect_cmq_opcodes("MR_DEREG_OWNED_HMC_RELEASE_ORDER", mock_cmq,
                        expected_opcodes);
     status = hmc.lookup(binding.make_handle(), RDMA_RESOURCE_MR,
@@ -6471,8 +6852,8 @@ class rdma_control_plane_test extends uvm_test;
       `uvm_error("MR_DEREG_FINALIZE_FAILURE_STATE",
                  "finalize failure did not retain ABSENT ERROR recovery")
     expected_opcodes.delete();
-    expected_opcodes.push_back(XTR_V1_OP_MR_DEREGISTER);
-    expected_opcodes.push_back(XTR_V1_OP_TQ_FLUSH);
+    expected_opcodes.push_back(RDMA_OP_MR_DEREGISTER);
+    expected_opcodes.push_back(RDMA_OP_TQ_FLUSH);
     expect_cmq_opcodes("MR_DEREG_FINALIZE_BOUNDARY_ORDER", mock_cmq,
                        expected_opcodes);
     status = manager.complete_reserved_error(mr.handle);
@@ -6531,6 +6912,10 @@ class rdma_control_plane_test extends uvm_test;
 
   endtask
 
+  // 功能：在测试辅助 rdma_control_plane_test.check_transaction_id_exhaustion 中构造或驱动“transaction id exhaustion”场景，并断言 DUT
+  //   的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_transaction_id_exhaustion();
     rdma_control_plane_probe control;
     rdma_resource_manager manager;
@@ -6585,6 +6970,10 @@ class rdma_control_plane_test extends uvm_test;
     expect_status("TXN_EXHAUSTED_CLEANUP_RELEASE", status, RDMA_SC_OK);
   endtask
 
+  // 功能：在测试辅助 rdma_control_plane_test.check_lock_table_guard_contention 中构造或驱动“lock table guard contention”场景，并断言 DUT
+  //   的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_lock_table_guard_contention();
     rdma_control_plane_probe control;
     rdma_resource_manager manager;
@@ -6650,6 +7039,9 @@ class rdma_control_plane_test extends uvm_test;
 
   // Catches a missing typed facade, wrong resource projection, or a facade
   // that lets a mismatched destroy handle reach the queue executor.
+  // 功能：在测试辅助 rdma_control_plane_test.check_typed_queue_facade 中构造或驱动“typed queue facade”场景，并断言 DUT 的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_typed_queue_facade();
     rdma_control_plane control;
     rdma_resource_manager manager;
@@ -6745,6 +7137,10 @@ class rdma_control_plane_test extends uvm_test;
       `uvm_error("CP_KIND_GUARD", "CEQ API accepted a CQ handle")
   endtask
 
+  // 功能：在测试辅助 rdma_control_plane_test.check_typed_queue_lock_serialization 中构造或驱动“typed queue lock
+  //   serialization”场景，并断言 DUT 的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_typed_queue_lock_serialization();
     rdma_control_plane_probe control;
     rdma_resource_manager manager;
@@ -6791,7 +7187,7 @@ class rdma_control_plane_test extends uvm_test;
                                           mr_request);
     cq_request = make_create_cq_request("serial_cq_request", binding,
                                         dependency);
-    cmq.gate_opcode(XTR_V1_OP_KEY_ALLOC);
+    cmq.gate_opcode(RDMA_OP_KEY_ALLOC);
     mr_entered = 1'b0;
     cq_done = 1'b0;
     fork
@@ -6823,6 +7219,10 @@ class rdma_control_plane_test extends uvm_test;
     expect_result("SERIAL_CQ_RESULT", cq_result, RDMA_SC_OK);
   endtask
 
+  // 功能：在测试辅助 rdma_control_plane_test.check_typed_queue_cross_function_barrier 中构造或驱动“typed queue cross function
+  //   barrier”场景，并断言 DUT 的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_typed_queue_cross_function_barrier();
     rdma_control_plane controls[2];
     rdma_resource_manager managers[2];
@@ -6870,7 +7270,7 @@ class rdma_control_plane_test extends uvm_test;
       done[i] = 1'b0;
     end
 
-    cmq.gate_opcode_count(XTR_V1_OP_CEQC_CREATE, 2);
+    cmq.gate_opcode_count(RDMA_OP_CEQC_CREATE, 2);
     fork
       begin
         controls[0].create_ceq(bindings[0], requests[0], ceqs[0], results[0]);
@@ -6892,6 +7292,10 @@ class rdma_control_plane_test extends uvm_test;
     expect_result("CROSS_FUNCTION_RESULT_B", results[1], RDMA_SC_OK);
   endtask
 
+  // 功能：在测试辅助 rdma_control_plane_test.check_typed_queue_rebind_while_waiting 中构造或驱动“typed queue rebind while
+  //   waiting”场景，并断言 DUT 的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_typed_queue_rebind_while_waiting();
     rdma_control_plane_probe control;
     rdma_resource_manager manager;
@@ -6931,8 +7335,10 @@ class rdma_control_plane_test extends uvm_test;
       end
       begin
         #1ns;
-        binding.generation++;
-        binding.owner_h = binding.make_handle();
+          binding.generation++;
+          if (!binding.synchronize_identity_from_legacy_mirrors().ok())
+            `uvm_error("BINDING", "legacy identity synchronization failed")
+          binding.owner_h = binding.make_handle();
         control.release_test_function_lock(held_lock);
       end
     join
@@ -6941,6 +7347,9 @@ class rdma_control_plane_test extends uvm_test;
       `uvm_error("REBIND_NO_BACKING", "stale queue create allocated backing")
   endtask
 
+  // 功能：在测试辅助 rdma_control_plane_test.check_typed_qp_facade 中构造或驱动“typed qp facade”场景，并断言 DUT 的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_typed_qp_facade();
     rdma_control_plane_probe control;
     rdma_resource_manager manager;
@@ -6983,7 +7392,7 @@ class rdma_control_plane_test extends uvm_test;
     if (qp == null || qp.state != RDMA_RESOURCE_ACTIVE ||
         qp.qp_state != RDMA_QPS_RESET || result.transaction_id == 0 ||
         cmq.calls.size() != 1 ||
-        cmq.calls[0].opcode != XTR_V1_OP_QPC_CREATE)
+        cmq.calls[0].opcode != RDMA_OP_QPC_CREATE)
       `uvm_error("TYPED_QP_OUTPUT",
                  "public create_qp did not return ACTIVE+RESET authority")
     if (qp != null) begin
@@ -6996,6 +7405,10 @@ class rdma_control_plane_test extends uvm_test;
     end
   endtask
 
+  // 功能：在测试辅助 rdma_control_plane_test.check_typed_qp_rebind_while_waiting 中构造或驱动“typed qp rebind while waiting”场景，并断言
+  //   DUT 的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_typed_qp_rebind_while_waiting();
     rdma_control_plane_probe control;
     rdma_resource_manager manager;
@@ -7041,6 +7454,8 @@ class rdma_control_plane_test extends uvm_test;
       begin
         #1ns;
         binding.generation++;
+        if (!binding.synchronize_identity_from_legacy_mirrors().ok())
+          `uvm_error("BINDING", "legacy identity synchronization failed")
         binding.owner_h = binding.make_handle();
         control.release_test_function_lock(held_lock);
       end
@@ -7052,6 +7467,9 @@ class rdma_control_plane_test extends uvm_test;
                  "post-lock QP rebind reached executor side effects")
   endtask
 
+  // 功能：在 rdma_control_plane_test 中，run_phase 驱动 UVM 阶段中的场景初始化、事务执行和断言收尾，并在退出前释放 objection 或测试资源。
+  // 输入/输出及副作用：phase（输入）；phase 由 UVM 提供；task 通过 objection、日志和断言暴露结果，可能调用 DUT 接口但不改变其所有权规则。
+  // 失败/边界：run_phase 的 setup/阶段驱动失败时停止新增事务，并按测试生命周期清理 objection 与临时引用。
   virtual task run_phase(uvm_phase phase);
     phase.raise_objection(this);
     check_configure_contract();

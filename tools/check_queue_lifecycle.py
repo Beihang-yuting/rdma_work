@@ -26,7 +26,7 @@ def reject(text: str, pattern: str, message: str) -> None:
 IOVA_CONSUMERS = (
     "src/core/rdma_queue_lifecycle_policy.sv",
     "src/core/rdma_queue_lifecycle_executor.sv",
-    "src/codec/xtr_v1/rdma_xtr_v1_queue_page_codec.sv",
+    "src/codec/rdma/rdma_queue_page_codec.sv",
 )
 
 
@@ -101,20 +101,20 @@ def validate_package_order(repo_root: Path) -> None:
 
 
 FROZEN_ABI = (
-    "src/codec/xtr_v1/rdma_xtr_v1_defs.svh",
-    "src/codec/xtr_v1/rdma_xtr_v1_image_masks.svh",
-    "src/codec/xtr_v1/rdma_xtr_v1_context_body_codecs.svh",
-    "src/codec/xtr_v1/rdma_xtr_v1_cmq_codecs.svh",
+    "src/codec/rdma/rdma_defs.svh",
+    "src/codec/rdma/rdma_image_masks.svh",
+    "src/codec/rdma/rdma_context_body_codecs.svh",
+    "src/codec/rdma/rdma_cmq_codecs.svh",
 )
 
 # The codec implementations are source files now, but their ABI is frozen
 # against the historical .svh paths.  Keep the baseline path separate from
 # the current path so a pure rename is not reported as an ABI edit.
 FROZEN_ABI_CURRENT = (
-    "src/codec/xtr_v1/rdma_xtr_v1_defs.svh",
-    "src/codec/xtr_v1/rdma_xtr_v1_image_masks.svh",
-    "src/codec/xtr_v1/rdma_xtr_v1_context_body_codecs.sv",
-    "src/codec/xtr_v1/rdma_xtr_v1_cmq_codecs.sv",
+    "src/codec/rdma/rdma_defs.svh",
+    "src/codec/rdma/rdma_image_masks.svh",
+    "src/codec/rdma/rdma_context_body_codecs.sv",
+    "src/codec/rdma/rdma_cmq_codecs.sv",
 )
 
 

@@ -18,28 +18,34 @@ readonly core_tests=(
   rdma_queue_data_engine_post_test
   rdma_queue_data_engine_poll_test
   rdma_queue_data_engine_recovery_test
-  rdma_xtr_v1_queue_host_mem_submitter_test
-  rdma_xtr_v1_queue_model_test
-  rdma_xtr_v1_queue_codec_test
+  # SQ/RQ/CQ/EQ engines share the queue lifecycle build and must run in the
+  # same VCS 53 regression so PI/CI, credits and doorbell paths are covered.
+  rdma_sq_engine_test
+  rdma_rq_engine_test
+  rdma_cq_engine_test
+  rdma_eq_engine_test
+  rdma_queue_host_mem_submitter_test
+  rdma_queue_model_test
+  rdma_queue_codec_test
   rdma_doorbell_scheduler_test
   rdma_cmq_engine_test
   rdma_cmq_port_test
   rdma_control_plane_test
   rdma_control_plane_cmq_engine_test
   rdma_codec_registry_test
-  rdma_xtr_v1_defs_test
-  rdma_xtr_v1_qword_codec_test
-  rdma_xtr_v1_doorbell_codec_test
-  rdma_xtr_v1_qpc_codec_test
-  rdma_xtr_v1_context_body_codec_test
-  rdma_xtr_v1_cmq_codec_test
-  rdma_xtr_v1_error_codec_test
-  rdma_xtr_v1_cmq_completion_test
-  rdma_xtr_v1_cmq_profile_test
-  rdma_xtr_v1_context_cmq_regression_test
+  rdma_defs_test
+  rdma_qword_codec_test
+  rdma_doorbell_codec_test
+  rdma_qpc_codec_test
+  rdma_context_body_codec_test
+  rdma_cmq_codec_test
+  rdma_error_codec_test
+  rdma_cmq_completion_test
+  rdma_cmq_profile_test
+  rdma_context_cmq_regression_test
   rdma_queue_lifecycle_models_test
   rdma_context_backing_contract_test
-  rdma_xtr_v1_queue_page_codec_test
+  rdma_queue_page_codec_test
   rdma_queue_lifecycle_test
   rdma_queue_recovery_test
   rdma_qp_lifecycle_test

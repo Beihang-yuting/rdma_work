@@ -1,3 +1,8 @@
+// 目录：测试层 unit/rdma_queue_recovery_test.sv。
+// 职责：验证 rdma_queue_recovery_test 对应模块的接口、错误路径和边界行为。
+// 依赖：依赖被测 package、UVM 测试基类和必要的 mock/fixture。
+// 所有权与生命周期：测试对象只拥有本地 fixture；外部后端句柄由测试环境提供并在测试结束释放。
+
 // 中文说明：rdma_queue_recovery_test.sv 属于单元测试，覆盖对应模型、编码器或执行器契约。
 // 阅读提示：先看公开类型和接口，再看实现细节；失败路径应保持状态与资源所有权可追踪。
 
@@ -11,6 +16,10 @@ class rdma_queue_recovery_test extends rdma_queue_lifecycle_test;
   // Build a status with the same identity envelope that the real CMQ engine
   // attaches to a completion.  Recovery must not trust a status whose
   // command/function identity differs from the ticket being reconciled.
+  // 功能：在 rdma_queue_recovery_test 中，query_status 按完整 key/handle 查找唯一权威记录并返回 detached 快照，避免把内部可变引用泄露给调用方。
+  // 输入/输出及副作用：ticket（输入）、code（输入）、hardware_ecode（输入）；query_status 读取 ticket、code、hardware_ecode 并使用字段 status、status.source_engine、status.function_uid、status.generation、status.resource_id、status.command_id、status.hardware_code_valid、status.hardware_code；函数返回 rdma_status，不取得调用方资源所有权。
+
+  // 失败/边界：query_status 在 key/handle 缺失、记录不唯一或 generation/reset epoch 过期时返回明确错误，不回退到默认 authority。
   function automatic rdma_status query_status(
     rdma_cmq_ticket ticket,
     rdma_status_code_e code,
@@ -33,10 +42,13 @@ class rdma_queue_recovery_test extends rdma_queue_lifecycle_test;
     return status;
   endfunction
 
+  // 功能：make_query_raw 创建独立的 rdma_hw_image；根据 name、ticket、payload 设置字段 image、i、qword0、image.length、image.alignment、image.endian、image.image_kind、image.hardware_version、image.function_generation、image.write_target_kind，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：name（输入）、ticket（输入）、payload（输入）；make_query_raw 读取 name、ticket、payload 并使用字段 image、qword0、image.length、image.alignment、image.endian、image.image_kind、image.hardware_version；函数返回 rdma_hw_image，不取得调用方资源所有权。
+  // 失败/边界：make_query_raw 的结果直接由 return image 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function automatic rdma_hw_image make_query_raw(
     string name,
     rdma_cmq_ticket ticket,
-    rdma_xtr_v1_cmq_completion payload
+    rdma_hw_cmq_completion payload
   );
     rdma_hw_image image;
     bit [63:0] qword0;
@@ -56,7 +68,7 @@ class rdma_queue_recovery_test extends rdma_queue_lifecycle_test;
     image.alignment = 64;
     image.endian = RDMA_ENDIAN_BIG;
     image.image_kind = RDMA_IMAGE_CMQ_CQE;
-    image.hardware_version = XTR_V1_HW_VERSION;
+    image.hardware_version = RDMA_HW_VERSION;
     image.function_generation = ticket == null || ticket.function_h == null ?
       1 : ticket.function_h.generation;
     image.write_target_kind = RDMA_HW_TARGET_NONE;
@@ -66,6 +78,10 @@ class rdma_queue_recovery_test extends rdma_queue_lifecycle_test;
     return image;
   endfunction
 
+  // 功能：make_query_completion 创建独立的 rdma_cmq_completion；根据 name、policy、queue、ticket、status、query_opcode、ecode、owner、wqe_index、wrap、use_canonical_payload 设置字段 completion、offset、length、payload、payload.owner、payload.opcode、payload.command_ecode、payload.wqe_index、payload.wrap、build_status，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：name（输入）、policy（输入）、queue（输入）、ticket（输入）、status（输入）、query_opcode（输入）、ecode（输入）、owner（输入）、wqe_index（输入）、wrap（输入）、use_canonical_payload（输入）；输入字段被复制到返回值或
+  //   output；生成结果与输入隔离，不隐式修改调用方对象。
+  // 失败/边界：make_query_completion 输入对象为空或查找未命中时返回 null；该路径不隐式重试，也不转移未声明资源。
   function automatic rdma_cmq_completion make_query_completion(
     string name,
     rdma_queue_lifecycle_policy policy,
@@ -80,7 +96,7 @@ class rdma_queue_recovery_test extends rdma_queue_lifecycle_test;
     bit use_canonical_payload = 1'b1
   );
     rdma_cmq_completion completion;
-    rdma_xtr_v1_cmq_completion payload;
+    rdma_hw_cmq_completion payload;
     rdma_hw_model model;
     byte unsigned slot_image[];
     byte unsigned shadow_image[];
@@ -95,7 +111,7 @@ class rdma_queue_recovery_test extends rdma_queue_lifecycle_test;
       RDMA_RESOURCE_CQ: begin offset = 8;  length = 56; end
       default:           begin offset = 16; length = 32; end
     endcase
-    payload = rdma_xtr_v1_cmq_completion::type_id::create(
+    payload = rdma_hw_cmq_completion::type_id::create(
       {name, "_payload"});
     payload.owner = owner;
     payload.opcode = query_opcode;
@@ -127,6 +143,9 @@ class rdma_queue_recovery_test extends rdma_queue_lifecycle_test;
     return completion;
   endfunction
 
+  // 功能：将 rhs 中 rdma_queue_recovery_test 的值字段复制到当前对象，建立与源对象隔离的快照。
+  // 输入/输出及副作用：source（输入）、name（输入）；clone_query_completion 读取 source、name 并使用字段 copy、cloned；函数返回 rdma_cmq_completion，不取得调用方资源所有权。
+  // 失败/边界：clone_query_completion 输入对象为空或查找未命中时返回 null；该路径不隐式重试，也不转移未声明资源。
   function automatic rdma_cmq_completion clone_query_completion(
     rdma_cmq_completion source,
     string name
@@ -143,6 +162,10 @@ class rdma_queue_recovery_test extends rdma_queue_lifecycle_test;
     return copy;
   endfunction
 
+  // 功能：在 rdma_queue_recovery_test 中，query_result_is 按完整 key/handle 查找唯一权威记录并返回 detached 快照，避免把内部可变引用泄露给调用方。
+  // 输入/输出及副作用：label（输入）、policy（输入）、queue（输入）、completion（输入）、expected_presence（输入）、expected_conclusive（输入）；输入
+  //   handle/key/cursor 用于选择读取范围；返回值或 output 为 detached 快照，读取不取得外部资源所有权。
+  // 失败/边界：query_result_is 在 key/handle 缺失、记录不唯一或 generation/reset epoch 过期时返回明确错误，不回退到默认 authority。
   function automatic bit query_result_is(
     string label,
     rdma_queue_lifecycle_policy policy,
@@ -173,6 +196,10 @@ class rdma_queue_recovery_test extends rdma_queue_lifecycle_test;
   // A compact real-resource fixture used by the classifier tests.  The
   // inherited fixture allocates an authoritative queue plan, so typed QUERY
   // decoding exercises the same context codecs used by recovery.
+  // 功能：make_query_fixture 按 label 和 kind 组装完整的 Query/recovery fixture，创建 binding、manager、Host-memory、上下文 backing、CMQ、trace、executor、queue 及依赖对象。
+  // 输入/输出及副作用：label（输入）、kind（输入）、binding（输出）、manager（输出）、mem（输出）、context_backing（输出）、cmq（输出）、trace（输出）、executor（输出）、queue（输出）、create_result（输出）、ceq_dependency（输出）、pd_dependency（输出）；输入字段被复制到返回值或
+  //   output；生成结果与输入隔离，不隐式修改调用方对象。
+  // 失败/边界：make_query_fixture 失败或超时通过 binding、manager、mem、context_backing、cmq、trace、executor、queue、create_result、ceq_dependency、pd_dependency 明确发布；该路径不隐式重试，也不转移未声明资源。
   task automatic make_query_fixture(
     string label,
     rdma_resource_kind_e kind,
@@ -193,6 +220,10 @@ class rdma_queue_recovery_test extends rdma_queue_lifecycle_test;
                            create_result, ceq_dependency, pd_dependency);
   endtask
 
+  // 功能：在测试辅助 rdma_queue_recovery_test.check_query_classifier_matrix 中构造或驱动“query classifier matrix”场景，并断言 DUT
+  //   的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_query_classifier_matrix();
     string label;
     rdma_function_binding binding;
@@ -213,7 +244,7 @@ class rdma_queue_recovery_test extends rdma_queue_lifecycle_test;
     rdma_cmq_completion ignored_completion;
     rdma_cmq_completion completion;
     rdma_cmq_completion copy;
-    rdma_xtr_v1_cmq_completion payload;
+    rdma_hw_cmq_completion payload;
     rdma_status status;
 
     label = "QUERY_CLASSIFIER";
@@ -226,7 +257,7 @@ class rdma_queue_recovery_test extends rdma_queue_lifecycle_test;
     end
     policy = rdma_ceq_lifecycle_policy::type_id::create(
       {label, "_policy"});
-    status = policy.build_object_command(XTR_V1_OP_CEQC_QUERY,
+    status = policy.build_object_command(RDMA_OP_CEQC_QUERY,
                                          binding.make_handle(), ceq, 100ns,
                                          command);
     expect_status({label, "_BUILD"}, status, RDMA_SC_OK);
@@ -239,7 +270,7 @@ class rdma_queue_recovery_test extends rdma_queue_lifecycle_test;
 
     completion = make_query_completion(
       {label, "_VALID"}, policy, ceq, ticket,
-      query_status(ticket, RDMA_SC_OK, 8'h00), XTR_V1_OP_CEQC_QUERY,
+      query_status(ticket, RDMA_SC_OK, 8'h00), RDMA_OP_CEQC_QUERY,
       8'h00, !((ticket.slot_sequence / 32) & 1'b1), ticket.sq_index,
       ticket.sq_wrap
     );
@@ -255,8 +286,8 @@ class rdma_queue_recovery_test extends rdma_queue_lifecycle_test;
     // must not be accepted as either PRESENT or ABSENT.
     copy = make_query_completion(
       {label, "_OK_WHITELIST"}, policy, ceq, ticket,
-      query_status(ticket, RDMA_SC_OK, XTR_V1_ECODE_EC_RCE_CEQC_INVLD),
-      XTR_V1_OP_CEQC_QUERY, XTR_V1_ECODE_EC_RCE_CEQC_INVLD,
+      query_status(ticket, RDMA_SC_OK, RDMA_ECODE_EC_RCE_CEQC_INVLD),
+      RDMA_OP_CEQC_QUERY, RDMA_ECODE_EC_RCE_CEQC_INVLD,
       payload.owner, ticket.sq_index, ticket.sq_wrap
     );
     query_result_is({label, "_OK_WHITELIST"}, policy, ceq, copy,
@@ -264,8 +295,8 @@ class rdma_queue_recovery_test extends rdma_queue_lifecycle_test;
     copy = make_query_completion(
       {label, "_ABSENT_WHITELIST"}, policy, ceq, ticket,
       query_status(ticket, RDMA_SC_UNKNOWN_HW_ERROR,
-                   XTR_V1_ECODE_EC_RCE_CEQC_INVLD),
-      XTR_V1_OP_CEQC_QUERY, XTR_V1_ECODE_EC_RCE_CEQC_INVLD,
+                   RDMA_ECODE_EC_RCE_CEQC_INVLD),
+      RDMA_OP_CEQC_QUERY, RDMA_ECODE_EC_RCE_CEQC_INVLD,
       payload.owner, ticket.sq_index, ticket.sq_wrap
     );
     query_result_is({label, "_ABSENT_WHITELIST"}, policy, ceq, copy,
@@ -276,7 +307,7 @@ class rdma_queue_recovery_test extends rdma_queue_lifecycle_test;
     copy = make_query_completion(
       {label, "_SRFQ_ECODE"}, policy, ceq, ticket,
       query_status(ticket, RDMA_SC_UNKNOWN_HW_ERROR, 8'h7b),
-      XTR_V1_OP_CEQC_QUERY, 8'h7b, payload.owner, ticket.sq_index,
+      RDMA_OP_CEQC_QUERY, 8'h7b, payload.owner, ticket.sq_index,
       ticket.sq_wrap
     );
     query_result_is({label, "_SRFQ_ECODE"}, policy, ceq, copy,
@@ -284,7 +315,7 @@ class rdma_queue_recovery_test extends rdma_queue_lifecycle_test;
     copy = make_query_completion(
       {label, "_ARBITRARY_ECODE"}, policy, ceq, ticket,
       query_status(ticket, RDMA_SC_UNKNOWN_HW_ERROR, 8'h55),
-      XTR_V1_OP_CEQC_QUERY, 8'h55, payload.owner, ticket.sq_index,
+      RDMA_OP_CEQC_QUERY, 8'h55, payload.owner, ticket.sq_index,
       ticket.sq_wrap
     );
     query_result_is({label, "_ARBITRARY_ECODE"}, policy, ceq, copy,
@@ -326,7 +357,7 @@ class rdma_queue_recovery_test extends rdma_queue_lifecycle_test;
 
     // Mutating raw and decoded owner together must still fail: the CQ owner
     // phase is independently authenticated from the ticket's SQ wrap (the
-    // xtr_v1 CMQ starts with CQ owner=1 and toggles once per 32-slot cycle).
+    // rdma CMQ starts with CQ owner=1 and toggles once per 32-slot cycle).
     copy = clone_query_completion(completion, {label, "_BAD_RAW_OWNER"});
     if ($cast(payload, copy.decoded_response)) begin
       payload.owner = ~payload.owner;
@@ -340,6 +371,10 @@ class rdma_queue_recovery_test extends rdma_queue_lifecycle_test;
   // These completions carry no context bytes, as real invalid-context QUERY
   // responses do; the classifier must rely on the authenticated ecode/status
   // pair and must keep SRFQ's 0x7b (and arbitrary nonzero ecodes) inconclusive.
+  // 功能：在测试辅助 rdma_queue_recovery_test.check_query_absent_case 中构造或驱动“query absent case”场景，并断言 DUT 的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：label（输入）、kind（输入）、absent_ecode（输入）、unknown_ecode（输入）、expect_absent（输入）；fixture/输入由测试调用方提供；执行时会产生 UVM
+  //   assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_query_absent_case(
     string label,
     rdma_resource_kind_e kind,
@@ -371,22 +406,22 @@ class rdma_queue_recovery_test extends rdma_queue_lifecycle_test;
       RDMA_RESOURCE_CQ: begin
         policy = rdma_cq_lifecycle_policy::type_id::create(
           {label, "_policy"});
-        query_opcode_value = XTR_V1_OP_CQC_QUERY;
+        query_opcode_value = RDMA_OP_CQC_QUERY;
       end
       RDMA_RESOURCE_SRQ: begin
         policy = rdma_srq_lifecycle_policy::type_id::create(
           {label, "_policy"});
-        query_opcode_value = XTR_V1_OP_SRFQC_QUERY;
+        query_opcode_value = RDMA_OP_SRFQC_QUERY;
       end
       RDMA_RESOURCE_CEQ: begin
         policy = rdma_ceq_lifecycle_policy::type_id::create(
           {label, "_policy"});
-        query_opcode_value = XTR_V1_OP_CEQC_QUERY;
+        query_opcode_value = RDMA_OP_CEQC_QUERY;
       end
       RDMA_RESOURCE_AEQ: begin
         policy = rdma_aeq_lifecycle_policy::type_id::create(
           {label, "_policy"});
-        query_opcode_value = XTR_V1_OP_AEQC_QUERY;
+        query_opcode_value = RDMA_OP_AEQC_QUERY;
       end
       default: begin
         `uvm_error(label, "unsupported queue kind in QUERY absence case")
@@ -427,13 +462,17 @@ class rdma_queue_recovery_test extends rdma_queue_lifecycle_test;
                     RDMA_HW_PRESENCE_UNKNOWN, 1'b0);
   endtask
 
+  // 功能：在测试辅助 rdma_queue_recovery_test.check_query_profile_absence_matrix 中构造或驱动“query profile absence matrix”场景，并断言
+  //   DUT 的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_query_profile_absence_matrix();
     check_query_absent_case("QUERY_CQC_F3", RDMA_RESOURCE_CQ,
-                            XTR_V1_ECODE_EC_RCE_CQC_INVLD, 8'h7b, 1'b1);
+                            RDMA_ECODE_EC_RCE_CQC_INVLD, 8'h7b, 1'b1);
     check_query_absent_case("QUERY_CEQC_F7", RDMA_RESOURCE_CEQ,
-                            XTR_V1_ECODE_EC_RCE_CEQC_INVLD, 8'h7b, 1'b1);
+                            RDMA_ECODE_EC_RCE_CEQC_INVLD, 8'h7b, 1'b1);
     check_query_absent_case("QUERY_AEQC_FA", RDMA_RESOURCE_AEQ,
-                            XTR_V1_ECODE_EC_RCE_AEQC_INVLD, 8'h7b, 1'b1);
+                            RDMA_ECODE_EC_RCE_AEQC_INVLD, 8'h7b, 1'b1);
     check_query_absent_case("QUERY_SRFQC_7B", RDMA_RESOURCE_SRQ,
                             8'hff, 8'h7b, 1'b0);
     check_query_absent_case("QUERY_SRFQC_ARBITRARY", RDMA_RESOURCE_SRQ,
@@ -444,6 +483,10 @@ class rdma_queue_recovery_test extends rdma_queue_lifecycle_test;
   // remaining CQ post-delete OCC barrier has completed.  Absence is not a
   // license to release local authority: recovery must retain ERROR and leave
   // every backing/context release pending until the barrier is terminal.
+  // 功能：在测试辅助 rdma_queue_recovery_test.check_query_absent_before_cq_occ_barrier 中构造或驱动“query absent before cq occ
+  //   barrier”场景，并断言 DUT 的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_query_absent_before_cq_occ_barrier();
     string label;
     rdma_function_binding binding;
@@ -506,7 +549,7 @@ class rdma_queue_recovery_test extends rdma_queue_lifecycle_test;
 
     // Force QUERY itself through the ticket reconciliation path, where this
     // test can provide an authenticated invalid-context (ABSENT) completion.
-    cmq.timeout_opcode(XTR_V1_OP_CQC_QUERY);
+    cmq.timeout_opcode(RDMA_OP_CQC_QUERY);
     executor.recover_locked(binding, binding.make_handle(), queue.handle,
                             64'd2301, recovery_result);
     status = manager.lookup_recovery(queue.handle, recovery);
@@ -514,7 +557,7 @@ class rdma_queue_recovery_test extends rdma_queue_lifecycle_test;
                   RDMA_SC_OK);
     if (recovery == null || recovery.ambiguous_ticket == null ||
         recovery.ambiguous_ticket.opcode_key == null ||
-        recovery.ambiguous_ticket.opcode_key.opcode != XTR_V1_OP_CQC_QUERY ||
+        recovery.ambiguous_ticket.opcode_key.opcode != RDMA_OP_CQC_QUERY ||
         recovery.hardware_presence != RDMA_HW_PRESENCE_UNKNOWN ||
         mem.release_ordinal != 0 || context_backing.release_call_count != 0)
       `uvm_error(label, "ambiguous CQ QUERY lost durable no-release state")
@@ -525,8 +568,8 @@ class rdma_queue_recovery_test extends rdma_queue_lifecycle_test;
     absent_completion = make_query_completion(
       {label, "_absent"}, policy, cq, query_ticket,
       query_status(query_ticket, RDMA_SC_UNKNOWN_HW_ERROR,
-                   XTR_V1_ECODE_EC_RCE_CQC_INVLD),
-      XTR_V1_OP_CQC_QUERY, XTR_V1_ECODE_EC_RCE_CQC_INVLD,
+                   RDMA_ECODE_EC_RCE_CQC_INVLD),
+      RDMA_OP_CQC_QUERY, RDMA_ECODE_EC_RCE_CQC_INVLD,
       !query_ticket.sq_wrap,
       query_ticket.sq_index, query_ticket.sq_wrap, 1'b0);
     if (absent_completion == null ||
@@ -541,7 +584,7 @@ class rdma_queue_recovery_test extends rdma_queue_lifecycle_test;
     // any local mapping, context, dependency, or reservation.
     flush_failure = rdma_status::make(RDMA_SC_UNKNOWN_HW_ERROR,
                                       "CQ post-delete flush still failed");
-    cmq.fail_opcode(XTR_V1_OP_OCC_FLUSH, flush_failure);
+    cmq.fail_opcode(RDMA_OP_OCC_FLUSH, flush_failure);
     executor.recover_locked(binding, binding.make_handle(), queue.handle,
                             64'd2302, recovery_result);
     status = manager.lookup_recovery(queue.handle, recovery);
@@ -574,6 +617,10 @@ class rdma_queue_recovery_test extends rdma_queue_lifecycle_test;
   // fails.  Recovery must persist the progress gap, query the opaque release
   // authority on retry, and avoid invoking the external release a second
   // time before finalizing the queue.
+  // 功能：在测试辅助 rdma_queue_recovery_test.check_context_progress_failure_exactly_once 中构造或驱动“context progress failure
+  //   exactly once”场景，并断言 DUT 的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_context_progress_failure_exactly_once();
     string label;
     rdma_function_binding binding;
@@ -604,7 +651,7 @@ class rdma_queue_recovery_test extends rdma_queue_lifecycle_test;
                            create_result, ceq_dependency, pd_dependency);
     flush_failure = rdma_status::make(RDMA_SC_UNKNOWN_HW_ERROR,
                                       "initial CQ post-delete flush failure");
-    cmq.fail_opcode(XTR_V1_OP_OCC_FLUSH, flush_failure);
+    cmq.fail_opcode(RDMA_OP_OCC_FLUSH, flush_failure);
     executor.destroy_locked(binding, binding.make_handle(),
                             make_destroy_request({label, "_destroy"},
                                                   binding, queue.handle),
@@ -658,6 +705,10 @@ class rdma_queue_recovery_test extends rdma_queue_lifecycle_test;
                  "context progress retry duplicated a physical release")
   endtask
 
+  // 功能：在测试辅助 rdma_queue_recovery_test.check_create_timeout_matrix 中构造或驱动“create timeout matrix”场景，并断言 DUT
+  //   的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_create_timeout_matrix();
     for (int unsigned scenario = 0; scenario < 3; scenario++) begin
       string label;
@@ -701,7 +752,7 @@ class rdma_queue_recovery_test extends rdma_queue_lifecycle_test;
       request = make_executor_request({label, "_request"},
                                       RDMA_RESOURCE_CEQ, binding,
                                       ceq_dependency, 1'b0);
-      cmq.timeout_opcode(XTR_V1_OP_CEQC_CREATE);
+      cmq.timeout_opcode(RDMA_OP_CEQC_CREATE);
       queue = null;
       result = null;
       executor.create_locked(binding, binding.make_handle(), request,
@@ -738,6 +789,10 @@ class rdma_queue_recovery_test extends rdma_queue_lifecycle_test;
     end
   endtask
 
+  // 功能：在测试辅助 rdma_queue_recovery_test.check_delete_timeout_failure_restore 中构造或驱动“delete timeout failure
+  //   restore”场景，并断言 DUT 的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_delete_timeout_failure_restore();
     string label;
     string expected[$];
@@ -766,7 +821,7 @@ class rdma_queue_recovery_test extends rdma_queue_lifecycle_test;
                        context_backing, cmq, trace, executor, queue,
                        create_result, ceq_dependency, pd_dependency);
     request = make_destroy_request({label, "_request"}, binding, queue.handle);
-    cmq.timeout_opcode(XTR_V1_OP_CEQC_DELETE);
+    cmq.timeout_opcode(RDMA_OP_CEQC_DELETE);
     cmq_before = cmq.calls.size();
     executor.destroy_locked(binding, binding.make_handle(), request, 64'd2200,
                             result);
@@ -795,11 +850,18 @@ class rdma_queue_recovery_test extends rdma_queue_lifecycle_test;
       `uvm_error(label, "restore path issued destructive/local cleanup")
   endtask
 
+  // 功能：构造 rdma_queue_recovery_test，调用 super.new 建立 UVM 层级对象；外部依赖字段保持未绑定，后续由 configure/build/activate 明确注入。
+  // 输入/输出及副作用：name、parent（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_queue_recovery_test 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_queue_recovery_test",
                uvm_component parent = null);
     super.new(name, parent);
   endfunction
 
+  // 功能：在测试辅助 rdma_queue_recovery_test.check_late_delete_success_recovery 中构造或驱动“late delete success recovery”场景，并断言
+  //   DUT 的状态、错误码和资源账本符合契约。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
+  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_late_delete_success_recovery();
     rdma_control_plane control;
     rdma_resource_manager manager;
@@ -840,7 +902,7 @@ class rdma_queue_recovery_test extends rdma_queue_lifecycle_test;
       return;
     end
 
-    cmq.timeout_opcode(XTR_V1_OP_CEQC_DELETE);
+    cmq.timeout_opcode(RDMA_OP_CEQC_DELETE);
     destroy_request = make_destroy_request("QUEUE_RECOVERY_destroy", binding,
                                            ceq.handle);
     control.destroy_ceq(binding, destroy_request, result);
@@ -871,6 +933,9 @@ class rdma_queue_recovery_test extends rdma_queue_lifecycle_test;
     end
   endtask
 
+  // 功能：在 rdma_queue_recovery_test 中，run_phase 驱动 UVM 阶段中的场景初始化、事务执行和断言收尾，并在退出前释放 objection 或测试资源。
+  // 输入/输出及副作用：phase（输入）；phase 由 UVM 提供；task 通过 objection、日志和断言暴露结果，可能调用 DUT 接口但不改变其所有权规则。
+  // 失败/边界：run_phase 的 setup/阶段驱动失败时停止新增事务，并按测试生命周期清理 objection 与临时引用。
   task run_phase(uvm_phase phase);
     phase.raise_objection(this);
     check_query_classifier_matrix();

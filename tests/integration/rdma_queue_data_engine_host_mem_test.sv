@@ -1,3 +1,8 @@
+// 目录：测试层 integration/rdma_queue_data_engine_host_mem_test.sv。
+// 职责：验证 rdma_queue_data_engine_host_mem_test 对应模块的接口、错误路径和边界行为。
+// 依赖：依赖被测 package、UVM 测试基类和必要的 mock/fixture。
+// 所有权与生命周期：测试对象只拥有本地 fixture；外部后端句柄由测试环境提供并在测试结束释放。
+
 // 中文说明：rdma_queue_data_engine_host_mem_test.sv 属于集成测试，验证真实适配器与队列/控制面之间的联调。
 // 阅读提示：先看公开类型和接口，再看实现细节；失败路径应保持状态与资源所有权可追踪。
 
@@ -13,11 +18,18 @@ class rdma_real_host_mem_proxy extends rdma_mock_host_mem;
 
   rdma_host_mem_adapter delegate;
 
+  // 功能：构造 rdma_real_host_mem_proxy，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：delegate=null。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_real_host_mem_proxy 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_real_host_mem_proxy");
     super.new(name);
     delegate = null;
   endfunction
 
+  // 功能：在 rdma_real_host_mem_proxy 中，allocate 检查容量后预留资源并返回带 owner 证据的句柄/计划；失败时回滚已登记的局部状态。
+  // 输入/输出及副作用：request_context（输入）、size（输入）、alignment（输入）、direction（输入）、mapping（输出）；输入请求/句柄定义资源属性；成功时更新账本并通过返回值或
+  //   output 发布新句柄/映射。
+  // 失败/边界：容量不足、范围非法、重复占用或身份过期时返回错误；失败不得泄漏半分配资源。
   virtual function rdma_status allocate(
     rdma_dma_request_context request_context,
     int unsigned size,
@@ -34,6 +46,10 @@ class rdma_real_host_mem_proxy extends rdma_mock_host_mem;
                               mapping);
   endfunction
 
+  // 功能：在 rdma_real_host_mem_proxy 中，write 把请求数据写入指定后端并保留返回状态；只有写入成功才允许本地游标继续推进。
+  // 输入/输出及副作用：mapping（输入）、offset（输入）、data（输入）；输入 request/image/cursor 决定写入内容；成功时更新 PI/CI、slot ledger 或 pending
+  //   journal，并通过 output 返回结果。
+  // 失败/边界：write 遇到后端拒绝、范围溢出或 DMA 权限不足时保留失败证据，不推进本地游标。
   virtual function rdma_status write(
     rdma_dma_mapping mapping,
     longint unsigned offset,
@@ -45,6 +61,10 @@ class rdma_real_host_mem_proxy extends rdma_mock_host_mem;
     return delegate.write(mapping, offset, data);
   endfunction
 
+  // 功能：在 rdma_real_host_mem_proxy 中，read 按完整 key/handle 查找唯一权威记录并返回 detached 快照，避免把内部可变引用泄露给调用方。
+  // 输入/输出及副作用：mapping（输入）、offset（输入）、size（输入）、data（输出）；输入 handle/key/cursor 用于选择读取范围；返回值或 output 为 detached
+  //   快照，读取不取得外部资源所有权。
+  // 失败/边界：read 在 key/handle 缺失、记录不唯一或 generation/reset epoch 过期时返回明确错误，不回退到默认 authority。
   virtual function rdma_status read(
     rdma_dma_mapping mapping,
     longint unsigned offset,
@@ -59,6 +79,9 @@ class rdma_real_host_mem_proxy extends rdma_mock_host_mem;
     return delegate.read(mapping, offset, size, data);
   endfunction
 
+  // 功能：在 rdma_real_host_mem_proxy 中，release 按 owner、generation 和幂等规则释放/隔离记录，并同步删除其账本引用。
+  // 输入/输出及副作用：mapping（输入）；输入 handle/mapping/token 指定释放目标；成功时更新账本和生命周期，外部资源只按 adapter 契约释放。
+  // 失败/边界：release 发现 owner/generation 不匹配、记录未知或重复释放时返回错误或幂等结果，不重新激活旧句柄。
   virtual function rdma_status \release (rdma_dma_mapping mapping);
     if (delegate == null)
       return rdma_status::make(RDMA_SC_INVALID_STATE,
@@ -70,11 +93,17 @@ endclass
 class rdma_queue_data_engine_host_mem_test extends uvm_test;
   `uvm_component_utils(rdma_queue_data_engine_host_mem_test)
 
+  // 功能：构造 rdma_queue_data_engine_host_mem_test，调用 super.new 建立 UVM 层级对象；外部依赖字段保持未绑定，后续由 configure/build/activate 明确注入。
+  // 输入/输出及副作用：name、parent（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_queue_data_engine_host_mem_test 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_queue_data_engine_host_mem_test",
                uvm_component parent = null);
     super.new(name, parent);
   endfunction
 
+  // 功能：在 rdma_queue_data_engine_host_mem_test 中，run_phase 驱动 UVM 阶段中的场景初始化、事务执行和断言收尾，并在退出前释放 objection 或测试资源。
+  // 输入/输出及副作用：phase（输入）；phase 由 UVM 提供；task 通过 objection、日志和断言暴露结果，可能调用 DUT 接口但不改变其所有权规则。
+  // 失败/边界：run_phase 的 setup/阶段驱动失败时停止新增事务，并按测试生命周期清理 objection 与临时引用。
   task run_phase(uvm_phase phase);
     $unit::host_mem_manager host_manager;
     rdma_host_mem_adapter real_adapter;
@@ -84,7 +113,7 @@ class rdma_queue_data_engine_host_mem_test extends uvm_test;
     rdma_queue_post_result posted;
     rdma_queue_completion_result completion;
     rdma_post_send_req send_request;
-    rdma_xtr_v1_cqe_model cqe;
+    rdma_hw_cqe_model cqe;
     rdma_destroy_resource_req destroy_request;
     rdma_control_result destroy_result;
     int unsigned leak_count;
@@ -130,7 +159,7 @@ class rdma_queue_data_engine_host_mem_test extends uvm_test;
                      $sformatf("SQ byte %0d differs from returned image", i))
     end
 
-    cqe = rdma_xtr_v1_cqe_model::type_id::create("real_device_cqe");
+    cqe = rdma_hw_cqe_model::type_id::create("real_device_cqe");
     cqe.qp_h = rdma_clone_handle_value(fixture.qp.handle, "real CQE QP");
     cqe.qpn = fixture.qp.local_qp_id;
     cqe.wqe_index = posted == null ? 0 : posted.index;
@@ -138,7 +167,7 @@ class rdma_queue_data_engine_host_mem_test extends uvm_test;
     cqe.rq_cqe = 1'b0;
     cqe.polarity = 1'b1;
     cqe.packet_opcode = 8'h01;
-    cqe.ecode = XTR_V1_CMQ_SUCCESS_ECODE;
+    cqe.ecode = RDMA_CMQ_SUCCESS_ECODE;
     cqe.payload_len = 32;
     cqe.status = rdma_status::success();
     status = fixture.write_cq_entry(0, cqe);

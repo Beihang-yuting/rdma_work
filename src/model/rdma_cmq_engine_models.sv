@@ -1,3 +1,8 @@
+// 目录：协议与资源模型层 model/rdma_cmq_engine_models.sv。
+// 职责：实现 rdma_cmq_engine_models 在本层的职责和对外接口。
+// 依赖：依赖本层公共 types/model/adapter 契约及其上游快照。
+// 所有权与生命周期：对象只拥有显式创建的值快照；外部资源保存非拥有引用，生命周期由调用方管理。
+
 // 中文说明：rdma_cmq_engine_models.sv 属于模型层，描述语义请求、资源快照、DMA 映射及生命周期数据。
 // 阅读提示：先看公开类型和接口，再看实现细节；失败路径应保持状态与资源所有权可追踪。
 
@@ -16,6 +21,9 @@ typedef enum bit [1:0] {
   RDMA_CMQ_DIAG_POISON
 } rdma_cmq_diagnostic_kind_e;
 
+// 功能：rdma_cmq_string_has_separator 扫描 value 的每个字符，检测是否包含竖线分隔符 8'h7c，供 CMQ profile 名称解析使用；不修改运行时账本。
+// 输入/输出及副作用：value（输入）；rdma_cmq_string_has_separator 读取 value 并使用字段 i；函数返回 bit，不取得调用方资源所有权。
+// 失败/边界：rdma_cmq_string_has_separator 比较或前置条件不满足时返回 0/false；该路径不隐式重试，也不转移未声明资源。
 function automatic bit rdma_cmq_string_has_separator(string value);
   for (int unsigned i = 0; i < value.len(); i++) begin
     if (value.getc(i) == 8'h7c)
@@ -24,6 +32,9 @@ function automatic bit rdma_cmq_string_has_separator(string value);
   return 1'b0;
 endfunction
 
+// 功能：rdma_cmq_function_status 校验 function_h、label 与当前对象状态的一致性，并显式处理“Function handle is invalid”等拒绝条件，返回 rdma_status 供上层决定是否提交。
+// 输入/输出及副作用：function_h（输入）、label（输入）；rdma_cmq_function_status 读取 function_h、label 并使用字段 rdma_status；函数返回 rdma_status，不取得调用方资源所有权。
+// 失败/边界：rdma_cmq_function_status 返回 RDMA_SC_INVALID_ARGUMENT、RDMA_SC_STALE_GENERATION；失败路径不提交部分状态或转移未声明资源。
 function automatic rdma_status rdma_cmq_function_status(
   rdma_function_handle function_h,
   string label
@@ -37,6 +48,9 @@ function automatic rdma_status rdma_cmq_function_status(
   return rdma_status::success();
 endfunction
 
+// 功能：rdma_cmq_handle_status 校验 cmq_h、function_h、label 与当前对象状态的一致性，并显式处理“CMQ handle is invalid”等拒绝条件，返回 rdma_status 供上层决定是否提交。
+// 输入/输出及副作用：cmq_h（输入）、function_h（输入）、label（输入）；rdma_cmq_handle_status 读取 cmq_h、function_h、label 并使用字段 status；函数返回 rdma_status，不取得调用方资源所有权。
+// 失败/边界：rdma_cmq_handle_status 返回 RDMA_SC_INVALID_ARGUMENT；失败路径不提交部分状态或转移未声明资源。
 function automatic rdma_status rdma_cmq_handle_status(
   rdma_handle cmq_h,
   rdma_function_handle function_h,
@@ -53,6 +67,9 @@ function automatic rdma_status rdma_cmq_handle_status(
   return rdma_status::success();
 endfunction
 
+// 功能：rdma_cmq_clone_image_value 复制 source、label 的受控字段并生成独立快照，供查询、编码或恢复使用；源对象保持不变。
+// 输入/输出及副作用：source（输入）、label（输入）；rdma_cmq_clone_image_value 读取 source、label 并使用字段 cloned_object；函数返回 rdma_hw_image，不取得调用方资源所有权。
+// 失败/边界：rdma_cmq_clone_image_value 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal，不保留部分有效快照。
 function automatic rdma_hw_image rdma_cmq_clone_image_value(
   rdma_hw_image source,
   string label
@@ -68,6 +85,9 @@ function automatic rdma_hw_image rdma_cmq_clone_image_value(
   return result;
 endfunction
 
+// 功能：rdma_cmq_clone_hw_model_value 复制 source、label 的受控字段并生成独立快照，供查询、编码或恢复使用；源对象保持不变。
+// 输入/输出及副作用：source（输入）、label（输入）；rdma_cmq_clone_hw_model_value 读取 source、label 并使用字段 cloned_object；函数返回 rdma_hw_model，不取得调用方资源所有权。
+// 失败/边界：rdma_cmq_clone_hw_model_value 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal，不保留部分有效快照。
 function automatic rdma_hw_model rdma_cmq_clone_hw_model_value(
   rdma_hw_model source,
   string label
@@ -83,6 +103,9 @@ function automatic rdma_hw_model rdma_cmq_clone_hw_model_value(
   return result;
 endfunction
 
+// 功能：rdma_cmq_clone_object_value 复制 source、label 的受控字段并生成独立快照，供查询、编码或恢复使用；源对象保持不变。
+// 输入/输出及副作用：source（输入）、label（输入）；rdma_cmq_clone_object_value 读取 source、label 并使用字段 result；函数返回 uvm_object，不取得调用方资源所有权。
+// 失败/边界：rdma_cmq_clone_object_value 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal，不保留部分有效快照。
 function automatic uvm_object rdma_cmq_clone_object_value(
   uvm_object source,
   string label
@@ -97,6 +120,9 @@ function automatic uvm_object rdma_cmq_clone_object_value(
   return result;
 endfunction
 
+// 功能：rdma_cmq_clone_status_value 复制 source 的受控字段并生成独立快照，供查询、编码或恢复使用；源对象保持不变。
+// 输入/输出及副作用：source（输入）；rdma_cmq_clone_status_value 读取 source 并使用字段 result、result.category、result.code、result.hardware_code、result.hardware_code_valid、result.source_engine、result.function_uid、result.generation；函数返回 rdma_status，不取得调用方资源所有权。
+// 失败/边界：rdma_cmq_clone_status_value 输入对象为空或查找未命中时返回 null；该路径不隐式重试，也不转移未声明资源。
 function automatic rdma_status rdma_cmq_clone_status_value(
   rdma_status source
 );
@@ -128,6 +154,9 @@ class rdma_cmq_opcode_key extends uvm_object;
   bit [31:0] opcode;
   string variant;
 
+  // 功能：构造 rdma_cmq_opcode_key，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：profile_name=""；opcode='0；variant=""。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_cmq_opcode_key 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_cmq_opcode_key");
     super.new(name);
     profile_name = "";
@@ -135,6 +164,9 @@ class rdma_cmq_opcode_key extends uvm_object;
     variant = "";
   endfunction
 
+  // 功能：将 rhs 中 rdma_cmq_opcode_key 的值字段复制到当前对象，建立与源对象隔离的快照。
+  // 输入/输出及副作用：rhs（输入）；rhs 是源对象；当前对象字段会被覆盖，嵌套句柄按实现执行 clone 或保持非拥有引用，源对象不被修改。
+  // 失败/边界：do_copy 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（CMQ opcode key copy mismatch），不保留部分有效快照。
   virtual function void do_copy(uvm_object rhs);
     rdma_cmq_opcode_key rhs_key;
 
@@ -146,6 +178,9 @@ class rdma_cmq_opcode_key extends uvm_object;
     variant = rhs_key.variant;
   endfunction
 
+  // 功能：validate 校验 当前对象字段 与当前对象状态的一致性，并显式处理“CMQ profile name is empty”等拒绝条件，返回 rdma_status 供上层决定是否提交。
+  // 输入/输出及副作用：无显式参数；validate 读取 对象字段：rdma_status、profile_name、variant 并使用字段 rdma_status、profile_name、variant；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：validate 返回 RDMA_SC_INVALID_ARGUMENT；典型拒绝条件为“CMQ profile name is empty”“CMQ opcode variant is empty”；失败路径不提交部分状态或转移未声明资源。
   function rdma_status validate();
     if (profile_name.len() == 0)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
@@ -163,6 +198,9 @@ class rdma_cmq_opcode_key extends uvm_object;
   endfunction
 endclass
 
+// 功能：rdma_cmq_clone_opcode_key_value 复制 source、label 的受控字段并生成独立快照，供查询、编码或恢复使用；源对象保持不变。
+// 输入/输出及副作用：source（输入）、label（输入）；rdma_cmq_clone_opcode_key_value 读取 source、label 并使用字段 cloned_object；函数返回 rdma_cmq_opcode_key，不取得调用方资源所有权。
+// 失败/边界：rdma_cmq_clone_opcode_key_value 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal，不保留部分有效快照。
 function automatic rdma_cmq_opcode_key rdma_cmq_clone_opcode_key_value(
   rdma_cmq_opcode_key source,
   string label
@@ -189,6 +227,9 @@ class rdma_cmq_command_desc extends uvm_object;
   bit [10:0] use_vfid;
   time timeout;
 
+  // 功能：构造 rdma_cmq_command_desc，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：function_h=null；opcode_key=null；body=null；qpc_signature_source=null；vfid_override=1'b0；use_vfid='0；timeout=0。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_cmq_command_desc 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_cmq_command_desc");
     super.new(name);
     function_h = null;
@@ -200,6 +241,9 @@ class rdma_cmq_command_desc extends uvm_object;
     timeout = 0;
   endfunction
 
+  // 功能：将 rhs 中 rdma_cmq_command_desc 的值字段复制到当前对象，建立与源对象隔离的快照。
+  // 输入/输出及副作用：rhs（输入）；rhs 是源对象；当前对象字段会被覆盖，嵌套句柄按实现执行 clone 或保持非拥有引用，源对象不被修改。
+  // 失败/边界：do_copy 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（CMQ command descriptor copy mismatch），不保留部分有效快照。
   virtual function void do_copy(uvm_object rhs);
     rdma_cmq_command_desc rhs_command;
 
@@ -218,6 +262,10 @@ class rdma_cmq_command_desc extends uvm_object;
     use_vfid = rhs_command.use_vfid;
     timeout = rhs_command.timeout;
   endfunction
+
+  // 功能：validate 校验 当前对象字段 与当前对象状态的一致性，并显式处理“CMQ command”等拒绝条件，返回 rdma_status 供上层决定是否提交。
+  // 输入/输出及副作用：无显式参数；validate 读取 对象字段：rdma_status、opcode_key、body、timeout、qpc_signature_source、qpc_signature_source.function_generation、function_h.generation 并使用字段 status；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：validate 返回 RDMA_SC_INVALID_ARGUMENT、RDMA_SC_INVALID_STATE、RDMA_SC_STALE_GENERATION；典型拒绝条件为“CMQ command opcode key is null”“CMQ command body is null”；失败路径不提交部分状态或转移未声明资源。
 
   function rdma_status validate();
     rdma_status status;
@@ -264,6 +312,9 @@ class rdma_cmq_slot_context extends uvm_object;
   int unsigned sq_index;
   bit sq_wrap;
 
+  // 功能：构造 rdma_cmq_slot_context，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：function_h=null；cmq_h=null；backing_addr='0；relative_offset='0；slot_sequence='0；sq_index='0；sq_wrap=1'b0。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_cmq_slot_context 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_cmq_slot_context");
     super.new(name);
     function_h = null;
@@ -275,6 +326,9 @@ class rdma_cmq_slot_context extends uvm_object;
     sq_wrap = 1'b0;
   endfunction
 
+  // 功能：将 rhs 中 rdma_cmq_slot_context 的值字段复制到当前对象，建立与源对象隔离的快照。
+  // 输入/输出及副作用：rhs（输入）；rhs 是源对象；当前对象字段会被覆盖，嵌套句柄按实现执行 clone 或保持非拥有引用，源对象不被修改。
+  // 失败/边界：do_copy 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（CMQ slot context copy mismatch），不保留部分有效快照。
   virtual function void do_copy(uvm_object rhs);
     rdma_cmq_slot_context rhs_slot;
 
@@ -291,6 +345,9 @@ class rdma_cmq_slot_context extends uvm_object;
     sq_wrap = rhs_slot.sq_wrap;
   endfunction
 
+  // 功能：validate 校验 当前对象字段 与当前对象状态的一致性，并显式处理“CMQ slot”等拒绝条件，返回 rdma_status 供上层决定是否提交。
+  // 输入/输出及副作用：无显式参数；validate 读取 对象字段：rdma_status、sq_index、relative_offset、backing_addr.value、slot_sequence、hffff_ffff_ffff_ffff 并使用字段 status；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：validate 返回 RDMA_SC_INVALID_ARGUMENT、RDMA_SC_DMA_TRANSLATION；典型拒绝条件为“CMQ SQ slot index is outside depth 32”“CMQ SQ slot offset is invalid”；失败路径不提交部分状态或转移未声明资源。
   function rdma_status validate();
     rdma_status status;
 
@@ -328,12 +385,18 @@ class rdma_cmq_expected_response extends uvm_object;
   bit [31:0] hardware_opcode;
   string variant;
 
+  // 功能：构造 rdma_cmq_expected_response，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：hardware_opcode='0；variant=""。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_cmq_expected_response 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_cmq_expected_response");
     super.new(name);
     hardware_opcode = '0;
     variant = "";
   endfunction
 
+  // 功能：将 rhs 中 rdma_cmq_expected_response 的值字段复制到当前对象，建立与源对象隔离的快照。
+  // 输入/输出及副作用：rhs（输入）；rhs 是源对象；当前对象字段会被覆盖，嵌套句柄按实现执行 clone 或保持非拥有引用，源对象不被修改。
+  // 失败/边界：do_copy 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（CMQ expected response copy mismatch），不保留部分有效快照。
   virtual function void do_copy(uvm_object rhs);
     rdma_cmq_expected_response rhs_expected;
 
@@ -344,6 +407,9 @@ class rdma_cmq_expected_response extends uvm_object;
     variant = rhs_expected.variant;
   endfunction
 
+  // 功能：validate 校验 当前对象字段 与当前对象状态的一致性，并显式处理“CMQ expected response variant is empty”等拒绝条件，返回 rdma_status 供上层决定是否提交。
+  // 输入/输出及副作用：无显式参数；validate 读取 对象字段：rdma_status、variant 并使用字段 rdma_status、variant；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：validate 返回 RDMA_SC_INVALID_ARGUMENT；典型拒绝条件为“CMQ expected response variant is empty”“CMQ expected response variant contains '|'”；失败路径不提交部分状态或转移未声明资源。
   function rdma_status validate();
     if (variant.len() == 0)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
@@ -367,6 +433,9 @@ class rdma_cmq_decoded_cqe extends uvm_object;
   rdma_status command_status;
   uvm_object response_payload;
 
+  // 功能：构造 rdma_cmq_decoded_cqe，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：hardware_opcode='0；wqe_index='0；wqe_wrap=1'b0；hardware_ecode='0；command_status=null；response_payload=null。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_cmq_decoded_cqe 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_cmq_decoded_cqe");
     super.new(name);
     hardware_opcode = '0;
@@ -377,6 +446,9 @@ class rdma_cmq_decoded_cqe extends uvm_object;
     response_payload = null;
   endfunction
 
+  // 功能：将 rhs 中 rdma_cmq_decoded_cqe 的值字段复制到当前对象，建立与源对象隔离的快照。
+  // 输入/输出及副作用：rhs（输入）；rhs 是源对象；当前对象字段会被覆盖，嵌套句柄按实现执行 clone 或保持非拥有引用，源对象不被修改。
+  // 失败/边界：do_copy 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（CMQ decoded CQE copy mismatch），不保留部分有效快照。
   virtual function void do_copy(uvm_object rhs);
     rdma_cmq_decoded_cqe rhs_decoded;
 
@@ -393,6 +465,9 @@ class rdma_cmq_decoded_cqe extends uvm_object;
     );
   endfunction
 
+  // 功能：validate 校验 当前对象字段 与当前对象状态的一致性，并显式处理“CMQ decoded CQE status is null”等拒绝条件，返回 rdma_status 供上层决定是否提交。
+  // 输入/输出及副作用：无显式参数；validate 读取 对象字段：rdma_status、command_status、wqe_index 并使用字段 rdma_status、command_status、wqe_index；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：validate 返回 RDMA_SC_INVALID_ARGUMENT；典型拒绝条件为“CMQ decoded CQE status is null”“CMQ decoded CQE WQE index exceeds 5 bits”；失败路径不提交部分状态或转移未声明资源。
   function rdma_status validate();
     if (command_status == null)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
@@ -416,6 +491,9 @@ class rdma_cmq_ticket extends uvm_object;
   rdma_cmq_opcode_key opcode_key;
   time absolute_deadline;
 
+  // 功能：构造 rdma_cmq_ticket，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：command_id='0；function_h=null；cmq_h=null；slot_sequence='0；sq_index='0；sq_wrap=1'b0；opcode_key=null；absolute_deadline=0。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_cmq_ticket 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_cmq_ticket");
     super.new(name);
     command_id = '0;
@@ -428,6 +506,9 @@ class rdma_cmq_ticket extends uvm_object;
     absolute_deadline = 0;
   endfunction
 
+  // 功能：将 rhs 中 rdma_cmq_ticket 的值字段复制到当前对象，建立与源对象隔离的快照。
+  // 输入/输出及副作用：rhs（输入）；rhs 是源对象；当前对象字段会被覆盖，嵌套句柄按实现执行 clone 或保持非拥有引用，源对象不被修改。
+  // 失败/边界：do_copy 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（CMQ ticket copy mismatch），不保留部分有效快照。
   virtual function void do_copy(uvm_object rhs);
     rdma_cmq_ticket rhs_ticket;
 
@@ -446,6 +527,9 @@ class rdma_cmq_ticket extends uvm_object;
     absolute_deadline = rhs_ticket.absolute_deadline;
   endfunction
 
+  // 功能：validate 校验 当前对象字段 与当前对象状态的一致性，并显式处理“CMQ ticket command ID is zero”等拒绝条件，返回 rdma_status 供上层决定是否提交。
+  // 输入/输出及副作用：无显式参数；validate 读取 对象字段：rdma_status、command_id、absolute_deadline、opcode_key、sq_index、slot_sequence 并使用字段 status；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：validate 返回 RDMA_SC_INVALID_ARGUMENT；典型拒绝条件为“CMQ ticket command ID is zero”“CMQ ticket absolute deadline is zero”；失败路径不提交部分状态或转移未声明资源。
   function rdma_status validate();
     rdma_status status;
 
@@ -478,6 +562,9 @@ class rdma_cmq_ticket extends uvm_object;
   endfunction
 endclass
 
+// 功能：rdma_cmq_clone_ticket_value 复制 source、label 的受控字段并生成独立快照，供查询、编码或恢复使用；源对象保持不变。
+// 输入/输出及副作用：source（输入）、label（输入）；rdma_cmq_clone_ticket_value 读取 source、label 并使用字段 cloned_object；函数返回 rdma_cmq_ticket，不取得调用方资源所有权。
+// 失败/边界：rdma_cmq_clone_ticket_value 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal，不保留部分有效快照。
 function automatic rdma_cmq_ticket rdma_cmq_clone_ticket_value(
   rdma_cmq_ticket source,
   string label
@@ -493,6 +580,9 @@ function automatic rdma_cmq_ticket rdma_cmq_clone_ticket_value(
   return result;
 endfunction
 
+// 功能：rdma_cmq_raw_cqe_status 校验 raw_cqe、ticket、label 与当前对象状态的一致性，并显式处理“raw CQE is null”等拒绝条件，返回 rdma_status 供上层决定是否提交。
+// 输入/输出及副作用：raw_cqe（输入）、ticket（输入）、label（输入）；rdma_cmq_raw_cqe_status 读取 raw_cqe、ticket、label 并使用字段 rdma_status、value、generation；函数返回 rdma_status，不取得调用方资源所有权。
+// 失败/边界：rdma_cmq_raw_cqe_status 返回 RDMA_SC_INVALID_ARGUMENT、RDMA_SC_STALE_GENERATION；失败路径不提交部分状态或转移未声明资源。
 function automatic rdma_status rdma_cmq_raw_cqe_status(
   rdma_hw_image raw_cqe,
   rdma_cmq_ticket ticket,
@@ -533,6 +623,9 @@ class rdma_cmq_completion extends uvm_object;
   rdma_hw_image raw_cqe;
   uvm_object decoded_response;
 
+  // 功能：构造 rdma_cmq_completion，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：ticket=null；status=null；raw_cqe=null；decoded_response=null。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_cmq_completion 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_cmq_completion");
     super.new(name);
     ticket = null;
@@ -541,6 +634,9 @@ class rdma_cmq_completion extends uvm_object;
     decoded_response = null;
   endfunction
 
+  // 功能：将 rhs 中 rdma_cmq_completion 的值字段复制到当前对象，建立与源对象隔离的快照。
+  // 输入/输出及副作用：rhs（输入）；rhs 是源对象；当前对象字段会被覆盖，嵌套句柄按实现执行 clone 或保持非拥有引用，源对象不被修改。
+  // 失败/边界：do_copy 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（CMQ completion copy mismatch），不保留部分有效快照。
   virtual function void do_copy(uvm_object rhs);
     rdma_cmq_completion rhs_completion;
 
@@ -556,6 +652,10 @@ class rdma_cmq_completion extends uvm_object;
       rhs_completion.decoded_response, "CMQ completion decoded response"
     );
   endfunction
+
+  // 功能：validate 校验 当前对象字段 与当前对象状态的一致性，并显式处理“CMQ completion ticket is null”等拒绝条件，返回 rdma_status 供上层决定是否提交。
+  // 输入/输出及副作用：无显式参数；validate 读取 对象字段：rdma_status、raw_cqe、ticket 并使用字段 validation_status；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：validate 返回 RDMA_SC_INVALID_ARGUMENT；典型拒绝条件为“CMQ completion ticket is null”“CMQ completion status is null”；失败路径不提交部分状态或转移未声明资源。
 
   function rdma_status validate();
     rdma_status validation_status;
@@ -590,6 +690,9 @@ class rdma_cmq_diagnostic extends uvm_object;
   rdma_status status;
   rdma_hw_image raw_cqe;
 
+  // 功能：构造 rdma_cmq_diagnostic，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：kind=RDMA_CMQ_DIAG_LATE_COMPLETION；ticket=null；status=null；raw_cqe=null。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_cmq_diagnostic 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_cmq_diagnostic");
     super.new(name);
     kind = RDMA_CMQ_DIAG_LATE_COMPLETION;
@@ -598,6 +701,9 @@ class rdma_cmq_diagnostic extends uvm_object;
     raw_cqe = null;
   endfunction
 
+  // 功能：将 rhs 中 rdma_cmq_diagnostic 的值字段复制到当前对象，建立与源对象隔离的快照。
+  // 输入/输出及副作用：rhs（输入）；rhs 是源对象；当前对象字段会被覆盖，嵌套句柄按实现执行 clone 或保持非拥有引用，源对象不被修改。
+  // 失败/边界：do_copy 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（CMQ diagnostic copy mismatch），不保留部分有效快照。
   virtual function void do_copy(uvm_object rhs);
     rdma_cmq_diagnostic rhs_diagnostic;
 
@@ -612,6 +718,9 @@ class rdma_cmq_diagnostic extends uvm_object;
                                          "CMQ diagnostic raw CQE");
   endfunction
 
+  // 功能：validate 校验 当前对象字段 与当前对象状态的一致性，并显式处理“CMQ diagnostic status is null”等拒绝条件，返回 rdma_status 供上层决定是否提交。
+  // 输入/输出及副作用：无显式参数；validate 读取 对象字段：rdma_status、raw_cqe、ticket、kind 并使用字段 validation_status；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：validate 返回 RDMA_SC_INVALID_ARGUMENT；典型拒绝条件为“CMQ diagnostic status is null”“late CMQ completion has no ticket”；失败路径不提交部分状态或转移未声明资源。
   function rdma_status validate();
     rdma_status validation_status;
 
@@ -644,6 +753,9 @@ class rdma_cmq_runtime_desc extends uvm_object;
   bit initial_cq_owner;
   bit initial_doorbell_polarity;
 
+  // 功能：构造 rdma_cmq_runtime_desc，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：function_h=null；cmq_h=null；sq_iova='0；cq_iova='0；sq_depth='0；cq_depth='0；entry_bytes='0；initial_sq_valid=1'b0；其余字段按实现默认值初始化。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_cmq_runtime_desc 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_cmq_runtime_desc");
     super.new(name);
     function_h = null;
@@ -658,6 +770,9 @@ class rdma_cmq_runtime_desc extends uvm_object;
     initial_doorbell_polarity = 1'b0;
   endfunction
 
+  // 功能：将 rhs 中 rdma_cmq_runtime_desc 的值字段复制到当前对象，建立与源对象隔离的快照。
+  // 输入/输出及副作用：rhs（输入）；rhs 是源对象；当前对象字段会被覆盖，嵌套句柄按实现执行 clone 或保持非拥有引用，源对象不被修改。
+  // 失败/边界：do_copy 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（CMQ runtime descriptor copy mismatch），不保留部分有效快照。
   virtual function void do_copy(uvm_object rhs);
     rdma_cmq_runtime_desc rhs_runtime;
 
@@ -677,6 +792,9 @@ class rdma_cmq_runtime_desc extends uvm_object;
     initial_doorbell_polarity = rhs_runtime.initial_doorbell_polarity;
   endfunction
 
+  // 功能：validate 校验 当前对象字段 与当前对象状态的一致性，并显式处理“CMQ runtime”等拒绝条件，返回 rdma_status 供上层决定是否提交。
+  // 输入/输出及副作用：无显式参数；validate 读取 对象字段：rdma_status、sq_depth、cq_depth、entry_bytes、sq_iova.value、cq_iova.value、hfff 并使用字段 status；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：validate 返回 RDMA_SC_INVALID_ARGUMENT、RDMA_SC_DMA_TRANSLATION；具体拒绝条件包括 “CMQ runtime geometry must be 32 entries by 64 bytes”；“CMQ SQ-to-CQ IOVA addition overflows”；“CMQ CQ IOVA range overflows”；“CMQ runtime IOVA alignment is invalid”；“CMQ CQ IOVA is not SQ IOVA plus 2048”；失败路径不提交部分状态、不隐式重试，也不转移未声明资源。
   function rdma_status validate();
     rdma_status status;
 

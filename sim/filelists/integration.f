@@ -1,0 +1,16 @@
++incdir+../tests
++incdir+../src/types
++incdir+../src/model
++incdir+../src/codec
++incdir+../src/core
++incdir+../src/adapter
++incdir+../src/integration
++incdir+../tests/mocks
+../src/types/rdma_types_pkg.sv
+../src/model/rdma_model_pkg.sv
+../src/codec/rdma_codec_pkg.sv
+../src/adapter/rdma_adapter_pkg.sv
+../src/core/rdma_core_pkg.sv
+../src/integration/rdma_dpu_env_pkg.sv
+../tests/rdma_unit_test_pkg.sv
+../tests/tb_top.sv

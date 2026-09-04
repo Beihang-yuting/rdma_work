@@ -8,7 +8,7 @@ readonly core_tests=(
   rdma_request_model_test
   rdma_context_backing_contract_test
   rdma_resource_manager_test
-  rdma_xtr_v1_qpc_codec_test
+  rdma_qpc_codec_test
   rdma_qp_lifecycle_test
   rdma_qp_recovery_test
   rdma_control_plane_test

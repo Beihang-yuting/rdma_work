@@ -1,3 +1,8 @@
+// 目录：测试层 unit/rdma_adapter_contract_test.sv。
+// 职责：验证 rdma_adapter_contract_test 对应模块的接口、错误路径和边界行为。
+// 依赖：依赖被测 package、UVM 测试基类和必要的 mock/fixture。
+// 所有权与生命周期：测试对象只拥有本地 fixture；外部后端句柄由测试环境提供并在测试结束释放。
+
 // 中文说明：rdma_adapter_contract_test.sv 属于单元测试，覆盖对应模型、编码器或执行器契约。
 // 阅读提示：先看公开类型和接口，再看实现细节；失败路径应保持状态与资源所有权可追踪。
 
@@ -7,12 +12,18 @@ class rdma_adapter_test_observer extends rdma_net_observer;
   int unsigned notification_count;
   rdma_packet last_packet;
 
+  // 功能：构造 rdma_adapter_test_observer，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：notification_count=0；last_packet=null。
+  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_adapter_test_observer 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_adapter_test_observer");
     super.new(name);
     notification_count = 0;
     last_packet = null;
   endfunction
 
+  // 功能：在 rdma_adapter_test_observer 中，write 把请求数据写入指定后端并保留返回状态；只有写入成功才允许本地游标继续推进。
+  // 输入/输出及副作用：packet（输入）；输入 request/image/cursor 决定写入内容；成功时更新 PI/CI、slot ledger 或 pending journal，并通过 output 返回结果。
+  // 失败/边界：write 遇到后端拒绝、范围溢出或 DMA 权限不足时保留失败证据，不推进本地游标。
   virtual function void write(rdma_packet packet);
     uvm_object cloned_object;
 
@@ -30,11 +41,17 @@ endclass
 class rdma_adapter_contract_test extends uvm_test;
   `uvm_component_utils(rdma_adapter_contract_test)
 
+  // 功能：构造 rdma_adapter_contract_test，调用 super.new 建立 UVM 层级对象；外部依赖字段保持未绑定，后续由 configure/build/activate 明确注入。
+  // 输入/输出及副作用：name、parent（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_adapter_contract_test 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_adapter_contract_test",
                uvm_component parent = null);
     super.new(name, parent);
   endfunction
 
+  // 功能：make_function_handle 创建独立的 rdma_function_handle；根据 name 设置字段 function_h、function_h.function_uid、function_h.object_id、function_h.generation，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：name（输入）；make_function_handle 读取 name 并使用字段 function_h、function_h.function_uid、function_h.object_id、function_h.generation；函数返回 rdma_function_handle，不取得调用方资源所有权。
+  // 失败/边界：make_function_handle 的结果直接由 return function_h 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function automatic rdma_function_handle make_function_handle(string name);
     rdma_function_handle function_h;
 
@@ -45,6 +62,10 @@ class rdma_adapter_contract_test extends uvm_test;
     return function_h;
   endfunction
 
+  // 功能：make_dma_context 创建独立的 rdma_dma_request_context；根据 name、function_h、requester_bdf、pasid_valid、pasid、owner_h 设置字段 result、result.function_h、result.requester_bdf、result.pasid_valid、result.pasid、result.owner_h，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：name（输入）、function_h（输入）、requester_bdf（输入）、pasid_valid（输入）、pasid（输入）、owner_h（输入）；输入字段被复制到返回值或
+  //   output；生成结果与输入隔离，不隐式修改调用方对象。
+  // 失败/边界：make_dma_context 下游操作失败时原样传播其 status/result，不伪造成功；该路径不隐式重试，也不转移未声明资源。
   function automatic rdma_dma_request_context make_dma_context(
     string name,
     rdma_function_handle function_h,
@@ -64,6 +85,9 @@ class rdma_adapter_contract_test extends uvm_test;
     return result;
   endfunction
 
+  // 功能：make_binding 创建独立的 rdma_function_binding；根据 name 设置字段 binding、binding.function_uid、binding.global_function_id、binding.generation、pcie.bdf、base.value、size、enabled、binding.notify_bar_id、notify_base.value，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：name（输入）；make_binding 读取 name 并使用字段 binding、binding.function_uid、binding.global_function_id、binding.generation、pcie.bdf、base.value、size、enabled；函数返回 rdma_function_binding，不取得调用方资源所有权。
+  // 失败/边界：make_binding 的结果直接由 return binding 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function automatic rdma_function_binding make_binding(string name);
     rdma_function_binding binding;
     rdma_interrupt_vector_binding vector;
@@ -74,6 +98,9 @@ class rdma_adapter_contract_test extends uvm_test;
     binding.generation = 32'd17;
     binding.pcie.bdf = '{segment:16'h1, bus:8'h22, device:5'h3,
                          function_num:3'h4};
+    if (!binding.configure_identity_from_legacy_mirrors(
+          16'h0, 32'h1, RDMA_FUNCTION_PF).ok())
+      `uvm_error("BINDING", "legacy binding identity configuration failed")
     binding.pcie.bar[0].base.value = 64'h8000_0000;
     binding.pcie.bar[0].size = 64'h4000;
     binding.pcie.bar[0].enabled = 1'b1;
@@ -103,6 +130,9 @@ class rdma_adapter_contract_test extends uvm_test;
     return binding;
   endfunction
 
+  // 功能：make_packet 根据 name、value 生成或检查硬件镜像字段，保持布局、端序和保留位约束一致。
+  // 输入/输出及副作用：name（输入）、value（输入）；make_packet 读取 name、value 并使用字段 packet、packet.transport、packet.opcode、packet.destination_qpn、packet.source_qpn、packet.psn；函数返回 rdma_packet，不取得调用方资源所有权。
+  // 失败/边界：make_packet 的结果直接由 return packet 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function automatic rdma_packet make_packet(string name, byte value);
     rdma_packet packet;
 
@@ -117,6 +147,10 @@ class rdma_adapter_contract_test extends uvm_test;
     return packet;
   endfunction
 
+  // 功能：在 rdma_adapter_contract_test 中，expect_status 在测试中执行 expect_status 断言，比较输入结果与期望状态并报告可定位的失败信息。
+  // 输入/输出及副作用：check_name（输入）、status（输入）、expected_code（输入）；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT
+  //   转移未声明的资源所有权。
+  // 失败/边界：测试函数 expect_status 缺少前置对象时报告断言错误，并停止依赖该对象的后续检查。
   function automatic void expect_status(
     string check_name,
     rdma_status status,
@@ -132,6 +166,9 @@ class rdma_adapter_contract_test extends uvm_test;
                            status.code.name()))
   endfunction
 
+  // 功能：在 rdma_adapter_contract_test 中，run_phase 驱动 UVM 阶段中的场景初始化、事务执行和断言收尾，并在退出前释放 objection 或测试资源。
+  // 输入/输出及副作用：phase（输入）；phase 由 UVM 提供；task 通过 objection、日志和断言暴露结果，可能调用 DUT 接口但不改变其所有权规则。
+  // 失败/边界：run_phase 的 setup/阶段驱动失败时停止新增事务，并按测试生命周期清理 objection 与临时引用。
   task run_phase(uvm_phase phase);
     rdma_mock_host_mem mem;
     rdma_host_mem_api mem_api;

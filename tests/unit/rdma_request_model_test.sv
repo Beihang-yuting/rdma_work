@@ -1,14 +1,25 @@
+// 目录：测试层 unit/rdma_request_model_test.sv。
+// 职责：验证 rdma_request_model_test 对应模块的接口、错误路径和边界行为。
+// 依赖：依赖被测 package、UVM 测试基类和必要的 mock/fixture。
+// 所有权与生命周期：测试对象只拥有本地 fixture；外部后端句柄由测试环境提供并在测试结束释放。
+
 // 中文说明：rdma_request_model_test.sv 属于单元测试，覆盖对应模型、编码器或执行器契约。
 // 阅读提示：先看公开类型和接口，再看实现细节；失败路径应保持状态与资源所有权可追踪。
 
 class rdma_request_model_test extends uvm_test;
   `uvm_component_utils(rdma_request_model_test)
 
+  // 功能：构造 rdma_request_model_test，调用 super.new 建立 UVM 层级对象；外部依赖字段保持未绑定，后续由 configure/build/activate 明确注入。
+  // 输入/输出及副作用：name、parent（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
+  // 失败/边界：rdma_request_model_test 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_request_model_test",
                uvm_component parent = null);
     super.new(name, parent);
   endfunction
 
+  // 功能：make_handle 创建独立的 rdma_handle；根据 name、kind、object_id 设置字段 handle、handle.kind、handle.function_uid、handle.object_id、handle.generation，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：name（输入）、kind（输入）、object_id（输入）；make_handle 读取 name、kind、object_id 并使用字段 handle、handle.kind、handle.function_uid、handle.object_id、handle.generation；函数返回 rdma_handle，不取得调用方资源所有权。
+  // 失败/边界：make_handle 的结果直接由 return handle 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function automatic rdma_handle make_handle(
     string name,
     rdma_resource_kind_e kind,
@@ -24,6 +35,9 @@ class rdma_request_model_test extends uvm_test;
     return handle;
   endfunction
 
+  // 功能：make_function_handle 创建独立的 rdma_function_handle；根据 name 设置字段 handle、handle.function_uid、handle.object_id、handle.generation，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：name（输入）；make_function_handle 读取 name 并使用字段 handle、handle.function_uid、handle.object_id、handle.generation；函数返回 rdma_function_handle，不取得调用方资源所有权。
+  // 失败/边界：make_function_handle 的结果直接由 return handle 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function automatic rdma_function_handle make_function_handle(string name);
     rdma_function_handle handle;
 
@@ -34,6 +48,9 @@ class rdma_request_model_test extends uvm_test;
     return handle;
   endfunction
 
+  // 功能：make_queue_mapping 创建独立的 rdma_dma_mapping；根据 name、owner、iova_value 设置字段 mapping、mapping.function_h、iova.value、backing_addr.value、mapping.size、mapping.state，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：name（输入）、owner（输入）、iova_value（输入）；make_queue_mapping 读取 name、owner、iova_value 并使用字段 mapping、mapping.function_h、iova.value、backing_addr.value、mapping.size、mapping.state；函数返回 rdma_dma_mapping，不取得调用方资源所有权。
+  // 失败/边界：make_queue_mapping 的结果直接由 return mapping 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function automatic rdma_dma_mapping make_queue_mapping(
     string name,
     rdma_function_handle owner,
@@ -50,6 +67,9 @@ class rdma_request_model_test extends uvm_test;
     return mapping;
   endfunction
 
+  // 功能：make_queue_ring 创建独立的 rdma_queue_ring_layout；根据 name、role、depth、mapping 设置字段 ring、ring.role、ring.entry_size_bytes、ring.depth、ring.logical_bytes、storage_bytes、ring.storage_bytes、ring.page_count、ring.initial_polarity、i，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：name（输入）、role（输入）、depth（输入）、mapping（输入）；make_queue_ring 读取 name、role、depth、mapping 并使用字段 ring、ring.role、ring.entry_size_bytes、ring.depth、ring.logical_bytes、storage_bytes、ring.storage_bytes、ring.page_count；函数返回 rdma_queue_ring_layout，不取得调用方资源所有权。
+  // 失败/边界：make_queue_ring 的结果直接由 return ring 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function automatic rdma_queue_ring_layout make_queue_ring(
     string name,
     rdma_queue_backing_role_e role,
@@ -83,6 +103,9 @@ class rdma_request_model_test extends uvm_test;
     return ring;
   endfunction
 
+  // 功能：make_queue_ref 创建独立的 rdma_queue_backing_ref；根据 name、role、mapping、length、ownership 设置字段 ref_value、ref_value.role、ref_value.mapping、ref_value.length、ref_value.ownership，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：name（输入）、role（输入）、mapping（输入）、length（输入）、ownership（输入）；make_queue_ref 读取 name、role、mapping、length、ownership 并使用字段 ref_value、ref_value.role、ref_value.mapping、ref_value.length、ref_value.ownership；函数返回 rdma_queue_backing_ref，不取得调用方资源所有权。
+  // 失败/边界：make_queue_ref 的结果直接由 return ref_value 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function automatic rdma_queue_backing_ref make_queue_ref(
     string name,
     rdma_queue_backing_role_e role,
@@ -100,6 +123,9 @@ class rdma_request_model_test extends uvm_test;
     return ref_value;
   endfunction
 
+  // 功能：make_queue_context 创建独立的 rdma_context_backing_ref；根据 name、kind、owner 设置字段 context_ref、context_ref.owner、context_ref.resource_kind、token、authority、token.completion_authority、context_ref.slot_token、context_ref.hmc_ref、hmc_ref.owner、hmc_ref.object_kind，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：name（输入）、kind（输入）、owner（输入）；make_queue_context 读取 name、kind、owner 并使用字段 context_ref、context_ref.owner、context_ref.resource_kind、token、authority、token.completion_authority、context_ref.slot_token、context_ref.hmc_ref；函数返回 rdma_context_backing_ref，不取得调用方资源所有权。
+  // 失败/边界：make_queue_context 的结果直接由 return context_ref 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function automatic rdma_context_backing_ref make_queue_context(
     string name,
     rdma_resource_kind_e kind,
@@ -130,6 +156,9 @@ class rdma_request_model_test extends uvm_test;
     return context_ref;
   endfunction
 
+  // 功能：make_queue_plan 创建独立的 rdma_queue_backing_plan；根据 name、kind、depth、owner 设置字段 plan、plan.resource_kind、mapping、ring、ring_ref、pd_ref、plan.context_ref、flush_target、flush_target.role、flush_target.phase，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：name（输入）、kind（输入）、depth（输入）、owner（输入）；make_queue_plan 读取 name、kind、depth、owner 并使用字段 plan、plan.resource_kind、mapping、ring、ring_ref、pd_ref、plan.context_ref、flush_target；函数返回 rdma_queue_backing_plan，不取得调用方资源所有权。
+  // 失败/边界：make_queue_plan 先检查 kind == RDMA_RESOURCE_CQ，再返回 plan；拒绝分支不提交部分状态，也不隐式重试。
   function automatic rdma_queue_backing_plan make_queue_plan(
     string name,
     rdma_resource_kind_e kind,
@@ -219,6 +248,9 @@ class rdma_request_model_test extends uvm_test;
     return plan;
   endfunction
 
+  // 功能：make_qp_ring 创建独立的 rdma_qp_ring_layout；根据 name、role、depth 设置字段 ring、ring.role、ring.entry_size_bytes、ring.depth、ring.logical_bytes、ring.storage_bytes、ring.object_mode，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：name（输入）、role（输入）、depth（输入）；make_qp_ring 读取 name、role、depth 并使用字段 ring、ring.role、ring.entry_size_bytes、ring.depth、ring.logical_bytes、ring.storage_bytes、ring.object_mode；函数返回 rdma_qp_ring_layout，不取得调用方资源所有权。
+  // 失败/边界：make_qp_ring 的结果直接由 return ring 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function automatic rdma_qp_ring_layout make_qp_ring(
     string name,
     rdma_queue_backing_role_e role,
@@ -236,6 +268,9 @@ class rdma_request_model_test extends uvm_test;
     return ring;
   endfunction
 
+  // 功能：make_qp_ref 创建独立的 rdma_qp_backing_ref；根据 name、role、mapping、length、ownership 设置字段 ref_value、ref_value.role、ref_value.mapping、ref_value.length、ref_value.ownership，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：name（输入）、role（输入）、mapping（输入）、length（输入）、ownership（输入）；make_qp_ref 读取 name、role、mapping、length、ownership 并使用字段 ref_value、ref_value.role、ref_value.mapping、ref_value.length、ref_value.ownership；函数返回 rdma_qp_backing_ref，不取得调用方资源所有权。
+  // 失败/边界：make_qp_ref 的结果直接由 return ref_value 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function automatic rdma_qp_backing_ref make_qp_ref(
     string name,
     rdma_queue_backing_role_e role,
@@ -253,6 +288,9 @@ class rdma_request_model_test extends uvm_test;
     return ref_value;
   endfunction
 
+  // 功能：make_qp_plan 创建独立的 rdma_qp_backing_plan；根据 name、sq_depth、rq_depth、owner、qp_h 设置字段 plan、plan.transport、plan.sq_depth、plan.rq_depth、plan.sq_ring、plan.rq_ring、sq_mapping、rq_mapping、sq_pd_mapping、rq_pd_mapping，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：name（输入）、sq_depth（输入）、rq_depth（输入）、owner（输入）、qp_h（输入）；make_qp_plan 读取 name、sq_depth、rq_depth、owner、qp_h 并使用字段 plan、plan.transport、plan.sq_depth、plan.rq_depth、plan.sq_ring、plan.rq_ring、sq_mapping、rq_mapping；函数返回 rdma_qp_backing_plan，不取得调用方资源所有权。
+  // 失败/边界：make_qp_plan 的结果直接由 return plan 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function automatic rdma_qp_backing_plan make_qp_plan(
     string name,
     int unsigned sq_depth,
@@ -330,6 +368,10 @@ class rdma_request_model_test extends uvm_test;
     return plan;
   endfunction
 
+  // 功能：make_rc_qpc 创建独立的 rdma_qpc_model；根据 name、qp_h、pd_h、send_cq_h、recv_cq_h、sq_depth、rq_depth 设置字段 model、model.qp_h、model.pd_h、model.send_cq_h、model.recv_cq_h、model.transport、model.state、model.path_mtu_bytes、model.sq_depth、model.rq_depth，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：name（输入）、qp_h（输入）、pd_h（输入）、send_cq_h（输入）、recv_cq_h（输入）、sq_depth（输入）、rq_depth（输入）；输入字段被复制到返回值或
+  //   output；生成结果与输入隔离，不隐式修改调用方对象。
+  // 失败/边界：make_rc_qpc 的结果直接由 return model 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function automatic rdma_qpc_model make_rc_qpc(
     string name,
     rdma_handle qp_h,
@@ -364,6 +406,9 @@ class rdma_request_model_test extends uvm_test;
     return model;
   endfunction
 
+  // 功能：make_recovery_opcode 创建独立的 rdma_cmq_opcode_key；根据 name、opcode、variant 设置字段 key、key.profile_name、key.opcode、key.variant，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：name（输入）、opcode（输入）、variant（输入）；make_recovery_opcode 读取 name、opcode、variant 并使用字段 key、key.profile_name、key.opcode、key.variant；函数返回 rdma_cmq_opcode_key，不取得调用方资源所有权。
+  // 失败/边界：make_recovery_opcode 的结果直接由 return key 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function automatic rdma_cmq_opcode_key make_recovery_opcode(
     string name,
     bit [31:0] opcode,
@@ -372,12 +417,15 @@ class rdma_request_model_test extends uvm_test;
     rdma_cmq_opcode_key key;
 
     key = rdma_cmq_opcode_key::type_id::create(name);
-    key.profile_name = "xtr_v1";
+    key.profile_name = "rdma";
     key.opcode = opcode;
     key.variant = variant;
     return key;
   endfunction
 
+  // 功能：make_recovery_mapping 创建独立的 rdma_dma_mapping；根据 name、owner、qp_h、iova_value 设置字段 mapping、mapping.function_h、mapping.owner_h、mapping.size，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：name（输入）、owner（输入）、qp_h（输入）、iova_value（输入）；make_recovery_mapping 读取 name、owner、qp_h、iova_value 并使用字段 mapping、mapping.function_h、mapping.owner_h、mapping.size；函数返回 rdma_dma_mapping，不取得调用方资源所有权。
+  // 失败/边界：make_recovery_mapping 的结果直接由 return mapping 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function automatic rdma_dma_mapping make_recovery_mapping(
     string name,
     rdma_function_handle owner,
@@ -395,6 +443,9 @@ class rdma_request_model_test extends uvm_test;
     return mapping;
   endfunction
 
+  // 功能：make_recovery_ticket 创建独立的 rdma_cmq_ticket；根据 name、owner、cmq_h、opcode_key 设置字段 ticket、ticket.command_id、ticket.function_h、ticket.cmq_h、ticket.slot_sequence、ticket.sq_index、ticket.sq_wrap、ticket.opcode_key、ticket.absolute_deadline，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 输入/输出及副作用：name（输入）、owner（输入）、cmq_h（输入）、opcode_key（输入）；make_recovery_ticket 读取 name、owner、cmq_h、opcode_key 并使用字段 ticket、ticket.command_id、ticket.function_h、ticket.cmq_h、ticket.slot_sequence、ticket.sq_index、ticket.sq_wrap、ticket.opcode_key；函数返回 rdma_cmq_ticket，不取得调用方资源所有权。
+  // 失败/边界：make_recovery_ticket 的结果直接由 return ticket 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function automatic rdma_cmq_ticket make_recovery_ticket(
     string name,
     rdma_function_handle owner,
@@ -417,6 +468,10 @@ class rdma_request_model_test extends uvm_test;
     return ticket;
   endfunction
 
+  // 功能：在 rdma_request_model_test 中，expect_status 在测试中执行 expect_status 断言，比较输入结果与期望状态并报告可定位的失败信息。
+  // 输入/输出及副作用：check_name（输入）、status（输入）、expected_code（输入）；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT
+  //   转移未声明的资源所有权。
+  // 失败/边界：测试函数 expect_status 缺少前置对象时报告断言错误，并停止依赖该对象的后续检查。
   function automatic void expect_status(
     string check_name,
     rdma_status status,
@@ -433,6 +488,9 @@ class rdma_request_model_test extends uvm_test;
                            status.convert2string()))
   endfunction
 
+  // 功能：在 rdma_request_model_test 中，run_phase 驱动 UVM 阶段中的场景初始化、事务执行和断言收尾，并在退出前释放 objection 或测试资源。
+  // 输入/输出及副作用：phase（输入）；phase 由 UVM 提供；task 通过 objection、日志和断言暴露结果，可能调用 DUT 接口但不改变其所有权规则。
+  // 失败/边界：run_phase 的 setup/阶段驱动失败时停止新增事务，并按测试生命周期清理 objection 与临时引用。
   task run_phase(uvm_phase phase);
     rdma_create_qp_req req;
     rdma_create_qp_req req_clone;
@@ -2565,6 +2623,9 @@ class rdma_request_model_test extends uvm_test;
     sqe_ud_ext.destination_qpn = 24'h010203;
     sqe_ud_ext.qkey = 32'h1111_2222;
     sqe_ud_ext.address_vector_id = 32'h89ab_cdef;
+    // UD 数据面不仅携带 AV 标识，还必须绑定可校验的地址向量内容；先保持 valid=0 验证缺失标志，再复用该 fixture 验证有效路径。
+    sqe_ud_ext.address_vector = rdma_address_vector::type_id::create("sqe_ud_av");
+    sqe_ud_ext.address_vector.destination_mac = 48'h02_11_22_33_44_55;
     ud_sqe.transport_ext = sqe_ud_ext;
     expect_status("UD_SQE_AV_MISSING", ud_sqe.validate(),
                   RDMA_SC_INVALID_ARGUMENT);

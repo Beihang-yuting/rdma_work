@@ -18,7 +18,7 @@ suite=$1
 test_name=$2
 
 case "$suite" in
-  core|host_mem|pcie_work|net_packet|axis_vip|xtr_defs) ;;
+  core|integration|host_mem|pcie_work|net_packet|axis_vip|rdma_defs) ;;
   *)
     echo "Unsupported suite: $suite" >&2
     usage
@@ -57,7 +57,7 @@ trap cleanup EXIT
 rsync -a --exclude .git "$repo_root/" "$REMOTE_HOST:$remote_dir/"
 
 remote_env=()
-for var_name in HOST_MEM_ROOT PCIE_WORK_ROOT NET_PACKET_ROOT AXIS_VIP_ROOT; do
+for var_name in HOST_MEM_ROOT DPU_COMMON_ROOT PCIE_WORK_ROOT NET_PACKET_ROOT AXIS_VIP_ROOT; do
   if [[ -v "$var_name" ]]; then
     printf -v quoted_value '%q' "${!var_name}"
     remote_env+=("$var_name=$quoted_value")
