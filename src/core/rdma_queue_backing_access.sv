@@ -180,6 +180,21 @@ class rdma_queue_backing_access extends uvm_object;
     qp_ref = null;
   endfunction
 
+  // 功能：为 CQ resize 建立独立 backing-access 视图，复用同一生命周期授权但不共享访问对象状态。
+  // 输入输出及副作用：无显式输入；返回新的 access 值对象，保留 owner、host_mem 和 backing 非拥有引用。
+  // 失败边界：未配置或未附着 queue backing 时返回 null，调用方必须保留旧 access。
+  function rdma_queue_backing_access clone_for_resize();
+    rdma_queue_backing_access copy;
+    if (owner == null || host_mem == null || queue_ref == null)
+      return null;
+    copy = rdma_queue_backing_access::type_id::create("resize_backing_access");
+    copy.owner = rdma_clone_function_handle_value(owner, "resize backing owner");
+    copy.host_mem = host_mem;
+    copy.queue_ref = queue_ref;
+    copy.qp_ref = qp_ref;
+    return copy;
+  endfunction
+
   // 功能：在 rdma_queue_backing_access 中，reference_total 只读查询当前运行时/测试账本，返回槽位、对象或恢复记录的快照而不推进事务。
   // 输入/输出及副作用：backing_ref（输入）、total（输出）；reference_total 读取 backing_ref、total 并使用字段 total，并写入 total；函数返回 rdma_status，不取得调用方资源所有权。
   // 失败/边界：reference_total 返回 RDMA_SC_INVALID_STATE、RDMA_SC_DMA_TRANSLATION；典型拒绝条件为“queue backing reference is incomplete”“queue backing segment coverage overflows”；失败路径不提交部分状态或转移未声明资源。

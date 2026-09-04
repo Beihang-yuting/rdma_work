@@ -444,12 +444,8 @@ class rdma_queue_data_engine extends uvm_object;
     if (!$cast(cq, resource) || cq == null ||
         cq.state != RDMA_RESOURCE_ACTIVE || cq.queue_plan == null)
       return bad("CQ lookup/backing plan is invalid", RDMA_SC_INVALID_STATE);
-    // XTR v1 exposes a single fixed 64-byte CQE image.  The lifecycle model
-    // accepts other sizes for forward compatibility, but this engine cannot
-    // safely decode them and must reject the attachment up front.
-    if (cq.cqe_size_bytes != RDMA_CQE_BYTES)
-      return bad("XTR v1 CQE size is unsupported",
-                 RDMA_SC_UNSUPPORTED_OPCODE);
+    if (!(cq.cqe_size_bytes inside {32, 64, 128}))
+      return bad("CQE size profile is unsupported", RDMA_SC_UNSUPPORTED_OPCODE);
     status = find_queue_ref(cq.queue_plan, RDMA_QUEUE_ROLE_CQ_RING, queue_backing);
     if (!status.ok()) return status;
     initial_polarity = 1'b0;
@@ -1218,6 +1214,16 @@ class rdma_queue_data_engine extends uvm_object;
       object_type:"cqe", variant:"default", opcode:8'h00};
     status = registry.lookup(codec_key, codec);
     if (!status.ok()) return;
+    begin
+      rdma_hw_cqe_codec variable_cqe_codec;
+      if (!$cast(variable_cqe_codec, codec)) begin
+        status = bad("CQ registry codec cannot select a variable profile",
+                     RDMA_SC_CODEC_ERROR);
+        return;
+      end
+      status = variable_cqe_codec.set_entry_bytes(cq_attachment.entry_size);
+      if (!status.ok()) return;
+    end
     status = codec.decode(entry_image, decoded_model);
     if (!status.ok()) return;
     if (!$cast(cqe, decoded_model) || cqe == null)
@@ -1422,6 +1428,71 @@ class rdma_queue_data_engine extends uvm_object;
       #1ns;
     end while (1);
   endtask
+
+  // 功能：调整已附着 CQ 的 runtime ring，先确认 quiesce 条件，再分配新 runtime、复制 owner/CI 游标并原子替换 attachment。
+  // 输入输出及副作用：cq_h/new_depth/new_cqe_bytes 为输入；成功时更新 CQ attachment 的 runtime 与 entry geometry。
+  // 失败边界：未配置、CQ 不存在、存在 pending 操作、深度/size 非法或新 runtime 激活失败时保留旧 ring 不变。
+  function rdma_status resize_cq(rdma_handle cq_h, int unsigned new_depth,
+                                 int unsigned new_cqe_bytes);
+    rdma_queue_data_attachment old_attachment;
+    rdma_queue_data_attachment replacement;
+    rdma_queue_runtime candidate_runtime;
+    rdma_status status;
+    string key;
+    if (!configured)
+      return bad("queue data engine is not configured", RDMA_SC_INVALID_STATE);
+    if (!(new_cqe_bytes inside {32,64,128}) || new_depth == 0 ||
+        (new_depth & (new_depth-1)) != 0)
+      return bad("CQ resize geometry is invalid");
+    status = lookup_attachment(cq_h, RDMA_QUEUE_RUNTIME_CQ, old_attachment);
+    if (!status.ok()) return status;
+    if (old_attachment.runtime == null || old_attachment.access == null)
+      return bad("CQ attachment runtime/access is missing", RDMA_SC_INVALID_STATE);
+    if (old_attachment.runtime.pending_operation != null)
+      return bad("CQ resize requires quiesced runtime", RDMA_SC_RESOURCE_BUSY);
+    if (old_attachment.runtime.consumer_index >= new_depth ||
+        old_attachment.runtime.producer_index >= new_depth)
+      return bad("CQ resize cannot preserve cursor state");
+
+    candidate_runtime = rdma_queue_runtime::type_id::create("cq_resize_runtime");
+    status = candidate_runtime.configure(old_attachment.queue_h,
+      RDMA_QUEUE_RUNTIME_CQ, new_depth,
+      old_attachment.runtime.producer_index, old_attachment.runtime.producer_wrap,
+      old_attachment.runtime.consumer_index, old_attachment.runtime.consumer_wrap,
+      1'b0, old_attachment.runtime.initial_polarity);
+    if (!status.ok()) return status;
+    status = candidate_runtime.activate();
+    if (!status.ok()) return status;
+    status = candidate_runtime.copy_ring_state(old_attachment.runtime);
+    if (!status.ok()) return status;
+    replacement = rdma_queue_data_attachment::type_id::create("cq_resize_attachment");
+    replacement.queue_h = old_attachment.queue_h;
+    replacement.kind = old_attachment.kind;
+    replacement.runtime = candidate_runtime;
+    replacement.access = old_attachment.access.clone_for_resize();
+    if (replacement.access == null)
+      return bad("CQ resize backing allocation failed", RDMA_SC_RESOURCE_EXHAUSTED);
+    replacement.role = old_attachment.role;
+    replacement.entry_size = new_cqe_bytes;
+    replacement.local_id = old_attachment.local_id;
+    replacement.transport = old_attachment.transport;
+    begin
+      rdma_resource resource;
+      rdma_cq authoritative_cq;
+      status = manager.lookup(cq_h, resource);
+      if (!status.ok() || !$cast(authoritative_cq, resource) || authoritative_cq == null)
+        return bad("CQ resize authority lookup failed", RDMA_SC_INVALID_STATE);
+      authoritative_cq.depth = new_depth;
+      authoritative_cq.cqe_size_bytes = new_cqe_bytes;
+      authoritative_cq.producer_index = replacement.runtime.producer_index;
+      authoritative_cq.consumer_index = replacement.runtime.consumer_index;
+      authoritative_cq.producer_wrap = replacement.runtime.producer_wrap;
+      authoritative_cq.consumer_wrap = replacement.runtime.consumer_wrap;
+    end
+    key = attachment_key(cq_h, RDMA_QUEUE_RUNTIME_CQ);
+    attachments[key] = replacement;
+    return rdma_status::success();
+  endfunction
 
   // 功能：在 rdma_queue_data_engine 中，poll_ceqe_once 读取并解码队列条目，校验 owner/identity 后提交 consumer index，成功提交后才发布 completion/event。
   // 输入/输出及副作用：ceq_h（输入）、result（输出）、status（输出）；poll_ceqe_once 驱动下游事务，并写入 result、status；函数返回 无直接返回值，不取得调用方资源所有权。

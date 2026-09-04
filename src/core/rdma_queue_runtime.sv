@@ -248,6 +248,49 @@ class rdma_queue_runtime extends uvm_object;
     state=RDMA_QUEUE_RUNTIME_ACTIVE; lock.put(1); return rdma_status::success();
   endfunction
 
+  // 功能：将旧 ring 的 owner/CI 游标及槽位账本复制到已 configure 的新 ring。
+  // 输入输出及副作用：source 为输入；更新当前 runtime 的 cursor、used 和 slot 快照。
+  // 失败边界：source 为空、深度不足或槽位 clone 失败时返回错误且不发布部分复制状态。
+  function rdma_status copy_ring_state(rdma_queue_runtime source);
+    int unsigned i, limit;
+    uvm_object cloned;
+    if (source == null || source.slots == null)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "source runtime is null");
+    if (source.consumer_index >= depth || source.producer_index >= depth)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "source cursor exceeds resized depth");
+    limit = (source.depth < depth) ? source.depth : depth;
+    producer_index = source.producer_index; producer_wrap = source.producer_wrap;
+    consumer_index = source.consumer_index; consumer_wrap = source.consumer_wrap;
+    used = (source.used < depth) ? source.used : depth;
+    for (i = 0; i < limit; i++) begin
+      slots[i].posted = source.slots[i].posted;
+      slots[i].consumed = source.slots[i].consumed;
+      slots[i].signaled = source.slots[i].signaled;
+      slots[i].wr_id = source.slots[i].wr_id;
+      slots[i].index = source.slots[i].index;
+      slots[i].wrap = source.slots[i].wrap;
+      slots[i].request_snapshot = null;
+      slots[i].image = null;
+      slots[i].completion_status = null;
+      if (source.slots[i].request_snapshot != null) begin
+        cloned = source.slots[i].request_snapshot.clone();
+        if (cloned == null || !$cast(slots[i].request_snapshot, cloned))
+          return rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED, "slot request clone failed");
+      end
+      if (source.slots[i].image != null) begin
+        cloned = source.slots[i].image.clone();
+        if (cloned == null || !$cast(slots[i].image, cloned))
+          return rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED, "slot image clone failed");
+      end
+      if (source.slots[i].completion_status != null) begin
+        slots[i].completion_status = rdma_clone_status_value(source.slots[i].completion_status);
+        if (slots[i].completion_status == null)
+          return rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED, "slot status clone failed");
+      end
+    end
+    return rdma_status::success();
+  endfunction
+
   // 功能：在 rdma_queue_runtime 中，query_available 按完整 key/handle 查找唯一权威记录并返回 detached 快照，避免把内部可变引用泄露给调用方。
   // 输入/输出及副作用：value（输出）；query_available 读取 value 并使用字段 value，并写入 value；函数返回 rdma_status，不取得调用方资源所有权。
   // 失败/边界：query_available 在 key/handle 缺失、记录不唯一或 generation/reset epoch 过期时返回明确错误，不回退到默认 authority。

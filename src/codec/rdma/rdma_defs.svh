@@ -21,6 +21,11 @@ localparam int unsigned RDMA_CMQE_BYTES = 64;
 localparam int unsigned RDMA_WQE_BYTES = 64;
 localparam int unsigned RDMA_RQE_BYTES = 64;
 localparam int unsigned RDMA_CQE_BYTES = 64;
+// Variable CQE profiles accepted by the software codec facade.  Hardware
+// images remain byte-addressed and must be aligned to the profile size.
+localparam int unsigned RDMA_CQE_32B_BYTES = 32;
+localparam int unsigned RDMA_CQE_64B_BYTES = 64;
+localparam int unsigned RDMA_CQE_128B_BYTES = 128;
 localparam int unsigned RDMA_CEQE_BYTES = 16;
 localparam int unsigned RDMA_AEQE_BYTES = 16;
 localparam int unsigned RDMA_DB_BYTES = 8;

@@ -21,6 +21,63 @@ function automatic rdma_handle rdma_hw_queue_projected_handle(
   return h;
 endfunction
 
+class rdma_queue_codec;
+  // 功能：按 CQE layout 编码公共字段，生成零填充的大端字节镜像。
+  // 输入输出及副作用：fields/layout 为输入，image 为输出；成功时 image 长度等于 layout.bytes。
+  // 失败边界：layout 无效、header 未按 16B 对齐或输出空间不足时返回 CODEC_ERROR 且 image 为空。
+  static function rdma_status encode_cqe(input rdma_cqe_fields fields,
+                                          input rdma_cqe_layout layout,
+                                          output byte unsigned image[]);
+    image = new[0];
+    if (layout == null || !layout.valid())
+      return rdma_status::make(RDMA_SC_CODEC_ERROR, "CQE layout is invalid");
+    image = new[layout.bytes];
+    foreach (image[i]) image[i] = 8'h00;
+    image[layout.header_offset+0] = fields.qpn[31:24];
+    image[layout.header_offset+1] = fields.qpn[23:16];
+    image[layout.header_offset+2] = fields.qpn[15:8];
+    image[layout.header_offset+3] = fields.qpn[7:0];
+    image[layout.header_offset+4] = fields.wr_id[63:56];
+    image[layout.header_offset+5] = fields.wr_id[55:48];
+    image[layout.header_offset+6] = fields.wr_id[47:40];
+    image[layout.header_offset+7] = fields.wr_id[39:32];
+    image[layout.header_offset+8] = fields.wr_id[31:24];
+    image[layout.header_offset+9] = fields.wr_id[23:16];
+    image[layout.header_offset+10] = fields.wr_id[15:8];
+    image[layout.header_offset+11] = fields.wr_id[7:0];
+    image[layout.header_offset+12] = {7'h0, fields.valid};
+    return rdma_status::success();
+  endfunction
+
+  // 功能：从 CQE 大端字节镜像解码公共字段并校验布局元数据。
+  // 输入输出及副作用：image/layout 为输入，fields 为输出；不修改输入数组。
+  // 失败边界：镜像长度、header 对齐或保留字节不满足 profile 时返回 CODEC_ERROR。
+  static function rdma_status decode_cqe(input byte unsigned image[],
+                                          input rdma_cqe_layout layout,
+                                          output rdma_cqe_fields fields);
+    fields = '{default:'0};
+    if (layout == null || !layout.valid() || image.size() != layout.bytes)
+      return rdma_status::make(RDMA_SC_CODEC_ERROR, "CQE image/layout mismatch");
+    fields.qpn = {image[layout.header_offset], image[layout.header_offset+1],
+                  image[layout.header_offset+2], image[layout.header_offset+3]};
+    fields.wr_id = {image[layout.header_offset+4], image[layout.header_offset+5],
+                    image[layout.header_offset+6], image[layout.header_offset+7],
+                    image[layout.header_offset+8], image[layout.header_offset+9],
+                    image[layout.header_offset+10], image[layout.header_offset+11]};
+    fields.valid = image[layout.header_offset+12][0];
+    if (image[layout.header_offset+12][7:1] != 0)
+      return rdma_status::make(RDMA_SC_CODEC_ERROR, "CQE reserved bits are nonzero");
+    foreach (image[i]) begin
+      if (i < layout.header_offset || i > layout.header_offset + 12) begin
+        if (image[i] != 0)
+          return rdma_status::make(RDMA_SC_CODEC_ERROR,
+                                   "CQE reserved bytes are nonzero");
+      end
+    end
+    return rdma_status::success();
+  endfunction
+endclass
+
 class rdma_hw_sqe_model extends rdma_sqe_model;
   `uvm_object_utils(rdma_hw_sqe_model)
   bit [20:0] qpn; bit [2:0] icos; bit [7:0] qp_sn; bit [3:0] dst_port;
@@ -1109,19 +1166,57 @@ endclass
 
 class rdma_hw_cqe_codec extends rdma_hw_queue_codec_base;
   `uvm_object_utils(rdma_hw_cqe_codec)
+  protected int unsigned active_bytes;
 
   // 功能：构造 rdma_hw_cqe_codec，调用 super.new 建立 UVM 层级对象；外部依赖字段保持未绑定，后续由 configure/build/activate 明确注入。
   // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
   // 失败/边界：rdma_hw_cqe_codec 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
-  function new(string name="rdma_hw_cqe_codec"); super.new(name); endfunction
+  // 功能：构造 CQE codec 并默认保持历史 64B profile。
+  // 输入输出及副作用：name 为输入；初始化本地 profile 状态，不拥有 ring 或 image。
+  // 失败边界：profile 仅可由 set_entry_bytes 切换，构造不接管外部资源。
+  function new(string name="rdma_hw_cqe_codec"); super.new(name); active_bytes=RDMA_CQE_BYTES; endfunction
+  // 功能：选择本次编解码使用的 CQE profile 大小。
+  // 输入输出及副作用：bytes 为输入；成功时更新 codec 本地 profile，返回状态。
+  // 失败边界：32/64/128 以外的大小被拒绝且保留原 profile。
+  function rdma_status set_entry_bytes(int unsigned bytes);
+    if (!(bytes inside {32,64,128}))
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,"CQE profile size is invalid");
+    active_bytes=bytes; return rdma_status::success();
+  endfunction
+
+  // 功能：依据 image 长度执行一次 CQE 解码，并在返回前恢复共享 codec 的 profile。
+  // 输入输出及副作用：image 为输入、model 为输出；active_bytes 仅在本次调用期间临时改变。
+  // 失败边界：image 为空或长度不是 32/64/128 时返回 codec 错误，旧 profile 始终恢复。
+  virtual function rdma_status decode(rdma_hw_image image, output rdma_hw_model model);
+    int unsigned saved_bytes;
+    rdma_status status;
+    saved_bytes = active_bytes;
+    if (image == null || !(image.length inside {32,64,128})) begin
+      model = null;
+      return rdma_status::make(RDMA_SC_CODEC_ERROR, "CQE image size is invalid");
+    end
+    active_bytes = image.length;
+    status = super.decode(image, model);
+    active_bytes = saved_bytes;
+    return status;
+  endfunction
   // 功能：在 rdma_hw_cqe_codec 中，image_kind_expected 返回 profile 固定的镜像字段或长度常量，供编码和断言使用。
   // 输入/输出及副作用：无显式参数；image_kind_expected 返回 CQE codec 固定的 RDMA_IMAGE_CQE 类型，不读取可变对象字段；函数返回 rdma_image_kind_e，不取得调用方资源所有权。
   // 失败/边界：image_kind_expected 是只读访问器，返回 RDMA_IMAGE_CQE；未覆盖枚举沿 default/类型默认分支返回，不改变对象和外部资源。
-  protected virtual function rdma_image_kind_e image_kind_expected(); return RDMA_IMAGE_CQE; endfunction protected virtual function int unsigned image_bytes(); return RDMA_CQE_BYTES; endfunction
+  protected virtual function rdma_image_kind_e image_kind_expected(); return RDMA_IMAGE_CQE; endfunction
+  protected virtual function int unsigned image_bytes(); return active_bytes; endfunction
   // 功能：check_reserved 校验 b 与当前对象状态的一致性，并显式处理“CQE reserved bits are nonzero”等拒绝条件，返回 rdma_status 供上层决定是否提交。
   // 输入/输出及副作用：b（输入）；check_reserved 读取 b 并使用字段 s、s.message、x、model；函数返回 rdma_status，不取得调用方资源所有权。
   // 失败/边界：check_reserved 是只读访问器，返回 err("CQE reserved bits are nonzero")；未覆盖枚举沿 default/类型默认分支返回，不改变对象和外部资源。
-  protected virtual function rdma_status check_reserved(rdma_hw_qword_builder b); bit [63:0] w[]; b.get_words(w); if ((w[0]&~64'h88ff_ffff_ff03_ffff)!=0 || w[3]!==0 || w[4]!==0 || w[5]!==0 || w[6]!==0 || w[7]!==0) return err("CQE reserved bits are nonzero"); return rdma_status::success(); endfunction
+  protected virtual function rdma_status check_reserved(rdma_hw_qword_builder b);
+    bit [63:0] w[];
+    b.get_words(w);
+    if (w.size() < 3 || (w[0]&~64'h88ff_ffff_ff03_ffff)!=0)
+      return err("CQE reserved bits are nonzero");
+    foreach (w[i]) if (i >= 3 && w[i] !== 0)
+      return err("CQE reserved words are nonzero");
+    return rdma_status::success();
+  endfunction
   // 功能：在 rdma_hw_cqe_codec 中，encode_fields 按硬件布局把输入模型编码到 image/缓冲区，并在写入前检查范围、重叠、端序和保留位。
   // 输入/输出及副作用：model（输入）、b（输入）；输入模型只读；成功时通过返回值或 output 发布完整 image/bytes，不修改源模型。
   // 失败/边界：encode_fields 遇到 image/model 为空、长度/对齐/保留位非法或 codec 校验失败时不发布部分字段。

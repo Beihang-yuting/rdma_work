@@ -634,16 +634,38 @@ class rdma_queue_host_mem_submitter extends uvm_object;
     output rdma_hw_cqe_model model,
     output rdma_hw_image image
   );
+    return read_cqe_sized(target, offset, RDMA_CQE_BYTES, model, image);
+  endfunction
+
+  // 功能：按运行时 CQE entry 大小读取并解码 CQE，供 32/64/128B CQ ring 共用。
+  // 输入输出及副作用：target/offset/entry_size 为输入，model/image 为输出；仅读取 host memory ledger。
+  // 失败边界：entry_size 不是 32/64/128、映像长度不匹配或 codec 解码失败时不发布 model/image。
+  function rdma_status read_cqe_sized(
+    rdma_queue_host_mem_target target,
+    longint unsigned offset,
+    int unsigned entry_size,
+    output rdma_hw_cqe_model model,
+    output rdma_hw_image image
+  );
     rdma_queue_host_mem_ledger_entry entry;
     rdma_codec_base codec;
     rdma_hw_model decoded;
     rdma_status status;
     rdma_hw_image candidate_image;
     model = null; image = null;
+    if (!(entry_size inside {32,64,128}))
+      return invalid("CQE profile size is invalid");
     status = lookup_target(target, entry); if (!status.ok()) return status;
     status = lookup_queue_codec(RDMA_IMAGE_CQE, "cqe", "default", codec);
     if (!status.ok()) return status;
-    status = complete_read_image(entry, offset, RDMA_CQE_BYTES,
+    begin
+      rdma_hw_cqe_codec cqe_codec;
+      if ($cast(cqe_codec, codec)) begin
+        status = cqe_codec.set_entry_bytes(entry_size);
+        if (!status.ok()) return status;
+      end
+    end
+    status = complete_read_image(entry, offset, entry_size,
                                  RDMA_IMAGE_CQE, codec,
                                  candidate_image);
     if (!status.ok()) return status;

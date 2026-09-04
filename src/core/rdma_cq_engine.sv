@@ -73,4 +73,14 @@ class rdma_cq_engine extends uvm_object;
     end
     delegate.poll_cqe(cq_h, operation_timeout, result, status);
   endtask
+
+  // 功能：请求共享 queue-data engine 对 CQ ring 做 quiesce、重建和原子切换。
+  // 输入输出及副作用：cq_h/new_depth/new_cqe_bytes 为输入；成功时更新共享 attachment geometry。
+  // 失败边界：facade 未配置或 delegate 拒绝 quiesce/分配/激活时返回错误且旧 ring 保持有效。
+  function rdma_status resize(rdma_handle cq_h, int unsigned new_depth,
+                              int unsigned new_cqe_bytes);
+    if (!configured || delegate == null)
+      return rdma_status::make(RDMA_SC_INVALID_STATE, "CQ facade is not configured");
+    return delegate.resize_cq(cq_h, new_depth, new_cqe_bytes);
+  endfunction
 endclass
