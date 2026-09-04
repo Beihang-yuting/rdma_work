@@ -9,6 +9,7 @@ package rdma_dpu_env_pkg;
   import rdma_core_pkg::*;
   import dpu_resource_pkg::*;
   `include "uvm_macros.svh"
+  typedef class rdma_reset_coordinator;
   `include "rdma_dpu_identity_adapter.sv"
   `include "rdma_host_mem_router.sv"
   `include "rdma_pcie_router.sv"

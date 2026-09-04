@@ -20,6 +20,7 @@ class rdma_dpu_identity_adapter extends uvm_object;
     rdma_function_key_t rkey;
     longint unsigned uid;
     rdma_status status;
+    bit parent_found;
 
     identity = null; binding = null;
     if (snapshot == null || resources == null)
@@ -40,6 +41,7 @@ class rdma_dpu_identity_adapter extends uvm_object;
     rkey.bdf.device = pcie_id.bdf[7:3];
     rkey.bdf.function_num = pcie_id.bdf[2:0];
     rkey.parent_pf_bdf = '0;
+    parent_found = 1'b0;
     if (key.kind == DPU_FUNCTION_VF) begin
       snapshot.list_functions(funcs);
       foreach (funcs[i]) begin
@@ -51,10 +53,15 @@ class rdma_dpu_identity_adapter extends uvm_object;
           rkey.parent_pf_bdf.bus = parent_pcie_id.bdf[15:8];
           rkey.parent_pf_bdf.device = parent_pcie_id.bdf[7:3];
           rkey.parent_pf_bdf.function_num = parent_pcie_id.bdf[2:0];
+          if (parent_pcie_id.domain.host_id != pcie_id.domain.host_id || parent_pcie_id.domain.segment_id != pcie_id.domain.segment_id)
+            return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "VF parent domain mismatch");
+          parent_found = 1'b1;
           break;
         end
       end
     end
+    if (key.kind == DPU_FUNCTION_VF && !parent_found)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "VF parent PF not found");
     uid = (longint'(rkey.host_topology_key) << 32) |
           (longint'(rkey.root_id) << 16) | longint'(rkey.bdf);
     if (uid == 0) uid = longint'(gid) + 1;
@@ -69,6 +76,9 @@ class rdma_dpu_identity_adapter extends uvm_object;
     binding.pcie.vf_index = rkey.vf_index;
     binding.host_id = rkey.host_topology_key;
     binding.pfvf_id = gid;
+    binding.queue_dma.requester_bdf = rkey.bdf;
+    binding.queue_dma.dma_domain_valid = 1'b1;
+    binding.queue_dma.dma_domain_id = rkey.host_topology_key;
     return rdma_status::success();
   endfunction
 endclass
