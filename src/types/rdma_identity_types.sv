@@ -55,11 +55,9 @@ function automatic bit rdma_bdf_same(rdma_bdf_t lhs, rdma_bdf_t rhs);
          lhs.device == rhs.device && lhs.function_num == rhs.function_num;
 endfunction
 
-// 中文说明：Host topology key 必须明确指定，BDF 必须非零，且 route 中的
-// segment 必须与 BDF segment 一致；root_id=0 允许作为显式 root0。
+// 中文说明：Host topology key=0 是合法的显式 Host0；BDF 必须非零，且
+// route 中的 segment 必须与 BDF segment 一致；root_id=0 允许作为显式 root0。
 function automatic bit rdma_route_key_valid(rdma_route_key_t route);
-  if (route.host_topology_key == 32'h0)
-    return 1'b0;
   if (rdma_bdf_is_zero(route.bdf))
     return 1'b0;
   if (route.segment != route.bdf.segment)

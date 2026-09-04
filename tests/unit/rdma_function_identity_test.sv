@@ -109,11 +109,12 @@ class rdma_function_identity_test extends uvm_test;
     if (!status.ok())
       `uvm_error("IDENTITY", "global function ID zero was rejected")
 
-    // Route validity rejects incomplete host/BDF and malformed VF parent data.
+    // Host0 is a valid explicit route; incomplete BDF and malformed VF parent
+    // data remain rejected.
     key.host_topology_key = 0;
     status = rhs.configure(key, 1, 64'h7777, 1, 1);
-    if (status.ok() || status.code != RDMA_SC_INVALID_ARGUMENT)
-      `uvm_error("IDENTITY", "invalid host route was accepted")
+    if (!status.ok())
+      `uvm_error("IDENTITY", "explicit Host0 route was rejected")
     key.host_topology_key = 32'h20;
     key.bdf = '{segment:0,bus:0,device:0,function_num:0};
     status = rhs.configure(key, 1, 64'h7777, 1, 1);
