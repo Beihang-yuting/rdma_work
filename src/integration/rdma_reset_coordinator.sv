@@ -16,11 +16,14 @@ class rdma_reset_coordinator extends uvm_object;
     if (identity.key.function_kind == RDMA_FUNCTION_PF) begin foreach(m_functions[i]) if(m_functions[i].key.host_topology_key==identity.key.host_topology_key && ((m_functions[i].key.function_kind==RDMA_FUNCTION_PF && rdma_bdf_same(m_functions[i].key.bdf, identity.key.bdf)) || (m_functions[i].key.function_kind==RDMA_FUNCTION_VF && rdma_bdf_same(m_functions[i].key.parent_pf_bdf, identity.key.bdf)))) bump_function(m_functions[i]); end else bump_function(identity); return rdma_status::success();
   endfunction
   function rdma_status request_pf_reset(rdma_function_identity identity);
+    bit found;
     if(identity==null) return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,"null Function identity");
+    if(identity.key.function_kind != RDMA_FUNCTION_PF) return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,"PF reset requires PF identity");
+    found = 0;
     foreach(m_functions[i]) if(m_functions[i].key.host_topology_key==identity.key.host_topology_key &&
       ((m_functions[i].key.function_kind==RDMA_FUNCTION_PF && rdma_bdf_same(m_functions[i].key.bdf, identity.key.bdf)) ||
-       (m_functions[i].key.function_kind==RDMA_FUNCTION_VF && rdma_bdf_same(m_functions[i].key.parent_pf_bdf, identity.key.bdf)))) bump_function(m_functions[i]);
-    bump_function(identity); return rdma_status::success();
+       (m_functions[i].key.function_kind==RDMA_FUNCTION_VF && rdma_bdf_same(m_functions[i].key.parent_pf_bdf, identity.key.bdf)))) begin bump_function(m_functions[i]); found=1; end
+    if(!found) bump_function(identity); return rdma_status::success();
   endfunction
   function rdma_status request_host_reset(int unsigned host_topology_key);
     m_host_epochs[host_topology_key] = m_host_epochs.exists(host_topology_key) ? m_host_epochs[host_topology_key]+1 : 1;

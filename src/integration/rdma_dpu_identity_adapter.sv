@@ -27,6 +27,8 @@ class rdma_dpu_identity_adapter extends uvm_object;
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "DPU snapshots are null");
     if (!snapshot.is_frozen() || !resources.is_frozen())
       return rdma_status::make(RDMA_SC_INVALID_STATE, "DPU snapshots must be frozen");
+    if (!resources.references_device_snapshot(snapshot))
+      return rdma_status::make(RDMA_SC_INVALID_STATE, "DPU resource/device snapshots are incoherent");
     if (!snapshot.get_pcie_id(key, pcie_id, why))
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, why);
     if (!snapshot.get_global_function_id(key, gid, why))
