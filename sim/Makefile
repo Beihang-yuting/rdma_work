@@ -4,7 +4,8 @@ override HOST_MEM_PINNED_COMMIT := 3b9e000d5df4d10efbb3029f43605e0362e0caca
 override HOST_MEM_PKG_SHA256 := d2ba57918a3b605525274433008142c80921b6205b0848c76bef8f1fc0d0bba5
 override HOST_MEM_MANAGER_SHA256 := 8dd5ca3ba3abcfae4808c8ea10c34ced279316bebdc04f6f8e0ae5e55e337a9d
 override RDMA_ARCHIVE := /home/ubuntu/workspace/Desktop.zip
-override RDMA_ARCHIVE_PREFIX := dpu_kernel_rdma-version_0.1.32
+override RDMA_ARCHIVE_PREFIX := dpu_kernel_rdma-version_0.1.34
+override NET_PACKET_PINNED_COMMIT := e2af70204f53ede65e366c7a65f695c59acdbbc5
 TEST ?= rdma_smoke_test
 VCS ?= vcs
 # Work around a VCS W-2024.09-SP1 class-codegen miscompile; not an RTL requirement.
@@ -12,7 +13,7 @@ VCS_FLAGS := -full64 -sverilog -ntb_opts uvm-1.2 -timescale=1ns/1ps -debug_acces
 SHELL := /bin/bash
 .SHELLFLAGS := -o pipefail -c
 
-.PHONY: core host_mem_preflight host_mem rdma_defs integration
+.PHONY: core host_mem_preflight host_mem rdma_defs integration net_packet net_packet_preflight
 
 core:
 	mkdir -p $(BUILD)
@@ -122,3 +123,17 @@ integration:
 	$(VCS) $(VCS_FLAGS) +define+RDMA_DPU_INTEGRATION +incdir+$(DPU_COMMON_ROOT)/src $(DPU_COMMON_ROOT)/src/dpu_resource_pkg.sv -f filelists/integration.f -top tb_top -o build/integration/simv
 	build/integration/simv +UVM_TESTNAME=$(TEST) | tee build/integration/$(TEST).log
 	../scripts/check_uvm_summary.sh build/integration/$(TEST).log
+
+net_packet_preflight:
+	@if [[ -z "$(NET_PACKET_ROOT)" ]]; then echo "NET_PACKET_ROOT is required for net_packet" >&2; exit 2; fi
+	@if [[ ! -r "$(NET_PACKET_ROOT)/src/core/packet.sv" ]]; then echo "Required net_packet dependency is not readable: $(NET_PACKET_ROOT)/src/core/packet.sv" >&2; exit 2; fi
+	@if git -C "$(NET_PACKET_ROOT)" rev-parse --is-inside-work-tree >/dev/null 2>&1; then \
+		actual_head=$$(git -C "$(NET_PACKET_ROOT)" rev-parse HEAD); \
+		if [[ "$$actual_head" != "$(NET_PACKET_PINNED_COMMIT)" ]]; then echo "net_packet preflight failed: HEAD $$actual_head does not match pinned commit $(NET_PACKET_PINNED_COMMIT)" >&2; exit 1; fi; \
+	else echo "net_packet preflight failed: NET_PACKET_ROOT is not a git checkout" >&2; exit 1; fi
+
+net_packet: net_packet_preflight
+	mkdir -p build/net_packet
+	$(VCS) $(VCS_FLAGS) +define+RDMA_NET_PACKET +incdir+$(NET_PACKET_ROOT)/src -f filelists/net_packet.f -top tb_top -o build/net_packet/simv
+	build/net_packet/simv +UVM_TESTNAME=$(TEST) | tee build/net_packet/$(TEST).log
+	../scripts/check_uvm_summary.sh build/net_packet/$(TEST).log

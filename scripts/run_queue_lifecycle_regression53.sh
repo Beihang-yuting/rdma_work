@@ -3,7 +3,7 @@ set -euo pipefail
 
 readonly script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 readonly repo_root="$(git -C "$script_dir/.." rev-parse --show-toplevel)"
-readonly core_tests=(
+readonly CORE_TESTS=(
   rdma_smoke_test
   rdma_types_test
   rdma_model_test
@@ -51,16 +51,23 @@ readonly core_tests=(
   rdma_queue_recovery_test
   rdma_qp_lifecycle_test
   rdma_qp_recovery_test
-  # These tests exercise routing, payload serialization, transaction journaling
-  # and reset identity; keeping them in the same manifest prevents a green
-  # regression from silently omitting ordinary unit tests.
   rdma_sq_codec_test
   rdma_sq_payload_writer_test
   rdma_function_identity_test
+  rdma_queue_txn_journal_test
+)
+
+# 功能：列出必须在 dpu_common integration 编译定义下运行的测试。
+# 输入输出及副作用：测试名由调用方传给 run_vcs53.sh integration，不修改 core 编译输入。
+# 失败边界：缺少 DPU_COMMON_ROOT 或 integration 测试注册时由仿真入口返回失败。
+readonly INTEGRATION_TESTS=(
+  rdma_dpu_integration_test
+  rdma_function_context_test
+  rdma_device_env_test
+  rdma_reset_cascade_test
   rdma_pcie_router_test
   rdma_host_mem_router_test
   rdma_reset_coordinator_test
-  rdma_queue_txn_journal_test
 )
 
 if [[ ${1-} == "--list" ]]; then
@@ -68,7 +75,7 @@ if [[ ${1-} == "--list" ]]; then
     echo "Usage: $0 [--list]" >&2
     exit 2
   fi
-  printf '%s\n' "${core_tests[@]}"
+  printf '%s\n' "${CORE_TESTS[@]}"
   exit 0
 fi
 
@@ -78,6 +85,10 @@ if [[ $# -ne 0 ]]; then
 fi
 
 cd "$repo_root"
-for test_name in "${core_tests[@]}"; do
+for test_name in "${CORE_TESTS[@]}"; do
   scripts/run_vcs53.sh core "$test_name"
+done
+
+for test_name in "${INTEGRATION_TESTS[@]}"; do
+  scripts/run_vcs53.sh integration "$test_name"
 done

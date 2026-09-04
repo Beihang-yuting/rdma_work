@@ -27,6 +27,17 @@ REQUIRED_SOURCE_FILES = [
 ]
 
 
+def test_core_regression_does_not_include_integration_only_tests():
+    """功能：确认 queue lifecycle 回归脚本的 core 清单不误运行 integration 测试。
+    输入输出及副作用：读取 scripts/run_queue_lifecycle_regression53.sh，断言 core 清单包含生命周期测试且不含 dpu_common 集成测试；不修改文件。
+    失败边界：脚本缺少 CORE_TESTS 标记、误把 rdma_dpu_integration_test 放入 core 或移除 rdma_queue_lifecycle_test 时断言失败。
+    """
+    text = (REPO_ROOT / "scripts/run_queue_lifecycle_regression53.sh").read_text()
+    core_tests = text.split("CORE_TESTS=(", 1)[1].split(")", 1)[0]
+    assert "rdma_dpu_integration_test" not in core_tests
+    assert "rdma_queue_lifecycle_test" in core_tests
+
+
 def copied_repo(tmp_path: Path) -> Path:
     for relative in REQUIRED_SOURCE_FILES:
         destination = tmp_path / relative
