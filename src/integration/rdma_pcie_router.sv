@@ -9,6 +9,16 @@ class rdma_pcie_route_entry extends uvm_object;
   int unsigned global_function_id;
   int unsigned generation;
   function new(string name="rdma_pcie_route_entry"); super.new(name); route='0; endpoint=null; function_uid=0; global_function_id=0; generation=0; endfunction
+  function rdma_status set_identity(rdma_function_identity identity);
+    rdma_status s;
+    if (identity == null)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "invalid Function identity");
+    s = identity.validate();
+    if (!s.ok()) return s;
+    route = identity.route_key(); function_uid = identity.function_uid;
+    global_function_id = identity.global_function_id; generation = identity.generation;
+    return rdma_status::success();
+  endfunction
 endclass
 
 class rdma_pcie_router extends rdma_pcie_api;
