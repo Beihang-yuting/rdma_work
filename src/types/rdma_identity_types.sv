@@ -78,7 +78,7 @@ function automatic bit rdma_function_key_route_valid(rdma_function_key_t key);
     RDMA_FUNCTION_PF:
       return key.vf_index == 16'h0 && rdma_bdf_is_zero(key.parent_pf_bdf);
     RDMA_FUNCTION_VF:
-    return key.vf_index != 16'h0 &&
+      return key.vf_index != 16'h0 &&
              !rdma_bdf_is_zero(key.parent_pf_bdf) &&
              key.parent_pf_bdf.segment == key.bdf.segment &&
              !rdma_bdf_same(key.parent_pf_bdf, key.bdf);

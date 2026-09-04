@@ -43,3 +43,13 @@ UVM summary: warning=0, error=0, fatal=0.
 The compile emits the pre-existing TEIF warning in
 `tests/mocks/rdma_mock_control_plane.sv:388` (task enabled inside a function);
 the runtime UVM reports remain pristine.
+
+## Round2 follow-up
+
+Commit `282430d` intentionally permits any valid PCIe function number for a VF's
+parent PF (multi-function PFs are legal); validation still requires a non-zero,
+same-segment parent BDF distinct from the VF BDF. Formatting was corrected in the
+follow-up commit. `git diff --check` was rerun, and
+`rdma_function_identity_test` was rerun on 10.11.10.53 after this adjustment with
+exit 0 and UVM warning=0/error=0/fatal=0. The transaction test had already passed
+with the same evidence implementation and is unaffected by this route relaxation.
