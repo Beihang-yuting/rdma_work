@@ -1587,61 +1587,224 @@ class rdma_queue_data_engine extends uvm_object;
     rdma_queue_data_attachment old_attachment;
     rdma_queue_data_attachment replacement;
     rdma_queue_runtime candidate_runtime;
+    rdma_queue_backing_access candidate_access;
+    rdma_queue_ring_layout candidate_ring;
+    rdma_queue_backing_ref candidate_ref;
+    rdma_queue_backing_ref old_ref;
+    rdma_cq authoritative_cq;
+    rdma_cq candidate_cq;
+    rdma_resource authoritative_resource;
+    rdma_queue_backing_plan candidate_plan;
     rdma_status status;
+    rdma_queue_runtime dependents[$];
     string key;
-    if (!configured)
-      return bad("queue data engine is not configured", RDMA_SC_INVALID_STATE);
+    bit manager_quiesced;
+    bit cq_quiesced;
+    bit cleanup_complete;
+
+    // 设计：geometry 校验不产生副作用，因此先于信号量获取执行；其余
+    // 所有会改变状态的步骤均由 resize_lock 串行化，避免并发调用观察到半事务。
     if (!(new_cqe_bytes inside {32,64,128}) || new_depth == 0 ||
         (new_depth & (new_depth-1)) != 0)
       return bad("CQ resize geometry is invalid");
+    if (!configured)
+      return bad("queue data engine is not configured", RDMA_SC_INVALID_STATE);
+    if (resize_lock == null || !resize_lock.try_get(1))
+      return bad("CQ resize is busy", RDMA_SC_RESOURCE_BUSY);
+
     status = lookup_attachment(cq_h, RDMA_QUEUE_RUNTIME_CQ, old_attachment);
-    if (!status.ok()) return status;
+    if (!status.ok()) return finish_resize(status);
     if (old_attachment.runtime == null || old_attachment.access == null)
-      return bad("CQ attachment runtime/access is missing", RDMA_SC_INVALID_STATE);
-    if (old_attachment.runtime.pending_operation != null)
-      return bad("CQ resize requires quiesced runtime", RDMA_SC_RESOURCE_BUSY);
+      return finish_resize(bad("CQ attachment runtime/access is missing",
+                               RDMA_SC_INVALID_STATE));
+    status = manager.begin_cq_resize(cq_h);
+    if (!status.ok()) return finish_resize(status);
+    manager_quiesced = 1'b1;
+    status = old_attachment.runtime.begin_quiesce();
+    if (!status.ok()) begin
+      status = abort_cq_resize(cq_h, old_attachment.runtime, dependents,
+                               candidate_ref, manager_quiesced, cq_quiesced,
+                               status);
+      return finish_resize(status);
+    end
+    cq_quiesced = 1'b1;
+    status = quiesce_cq_dependents(cq_h, dependents);
+    if (!status.ok()) begin
+      status = abort_cq_resize(cq_h, old_attachment.runtime, dependents,
+                               candidate_ref, manager_quiesced, cq_quiesced,
+                               status);
+      return finish_resize(status);
+    end
+
+    // 设计：manager 屏障建立后再读取 QUIESCING authority；该 detached CQ
+    // 快照提供 ring 替换必须保留的 PD/CEQ/context 不可变依赖拓扑。
+    status = manager.lookup(cq_h, authoritative_resource);
+    if (!status.ok() || !$cast(authoritative_cq, authoritative_resource) ||
+        authoritative_cq == null || authoritative_cq.queue_plan == null) begin
+      if (status.ok()) status = bad("CQ resize authority lookup failed",
+                                   RDMA_SC_INVALID_STATE);
+      status = abort_cq_resize(cq_h, old_attachment.runtime, dependents,
+                               candidate_ref, manager_quiesced, cq_quiesced,
+                               status);
+      return finish_resize(status);
+    end
     if (old_attachment.runtime.consumer_index >= new_depth ||
-        old_attachment.runtime.producer_index >= new_depth)
-      return bad("CQ resize cannot preserve cursor state");
+        old_attachment.runtime.producer_index >= new_depth) begin
+      status = bad("CQ resize cannot preserve cursor state");
+      status = abort_cq_resize(cq_h, old_attachment.runtime, dependents,
+                               candidate_ref, manager_quiesced, cq_quiesced,
+                               status);
+      return finish_resize(status);
+    end
+
+    status = backing_planner.allocate_owned_cq_resize_ring(
+      binding, cq_h, new_depth, new_cqe_bytes, candidate_ring, candidate_ref,
+      old_attachment.runtime.initial_polarity);
+    if (!status.ok()) begin
+      status = abort_cq_resize(cq_h, old_attachment.runtime, dependents,
+                               candidate_ref, manager_quiesced, cq_quiesced,
+                               status);
+      return finish_resize(status);
+    end
 
     candidate_runtime = rdma_queue_runtime::type_id::create("cq_resize_runtime");
+    if (candidate_runtime == null) begin
+      status = bad("CQ resize runtime allocation failed",
+                   RDMA_SC_RESOURCE_EXHAUSTED);
+      status = abort_cq_resize(cq_h, old_attachment.runtime, dependents,
+                               candidate_ref, manager_quiesced, cq_quiesced,
+                               status);
+      return finish_resize(status);
+    end
     status = candidate_runtime.configure(old_attachment.queue_h,
       RDMA_QUEUE_RUNTIME_CQ, new_depth,
       old_attachment.runtime.producer_index, old_attachment.runtime.producer_wrap,
       old_attachment.runtime.consumer_index, old_attachment.runtime.consumer_wrap,
       1'b0, old_attachment.runtime.initial_polarity);
-    if (!status.ok()) return status;
-    status = candidate_runtime.activate();
-    if (!status.ok()) return status;
     status = candidate_runtime.copy_ring_state(old_attachment.runtime);
-    if (!status.ok()) return status;
-    replacement = rdma_queue_data_attachment::type_id::create("cq_resize_attachment");
+    if (status.ok()) status = candidate_runtime.activate();
+    if (!status.ok()) begin
+      status = abort_cq_resize(cq_h, old_attachment.runtime, dependents,
+                               candidate_ref, manager_quiesced, cq_quiesced,
+                               status);
+      return finish_resize(status);
+    end
+
+    candidate_access = rdma_queue_backing_access::type_id::create(
+      "cq_resize_backing_access");
+    if (candidate_access == null) begin
+      status = bad("CQ resize backing access allocation failed",
+                   RDMA_SC_RESOURCE_EXHAUSTED);
+      status = abort_cq_resize(cq_h, old_attachment.runtime, dependents,
+                               candidate_ref, manager_quiesced, cq_quiesced,
+                               status);
+      return finish_resize(status);
+    end
+    status = candidate_access.configure(binding.make_handle(), host_mem);
+    if (status.ok()) status = candidate_access.attach_queue(candidate_ref);
+    if (!status.ok()) begin
+      status = abort_cq_resize(cq_h, old_attachment.runtime, dependents,
+                               candidate_ref, manager_quiesced, cq_quiesced,
+                               status);
+      return finish_resize(status);
+    end
+
+    candidate_plan = rdma_queue_backing_plan::type_id::create(
+      "cq_resize_plan");
+    if (candidate_plan == null) begin
+      status = bad("CQ resize queue plan allocation failed",
+                   RDMA_SC_RESOURCE_EXHAUSTED);
+      status = abort_cq_resize(cq_h, old_attachment.runtime, dependents,
+                               candidate_ref, manager_quiesced, cq_quiesced,
+                               status);
+      return finish_resize(status);
+    end
+    candidate_plan.copy(authoritative_cq.queue_plan);
+    foreach (candidate_plan.rings[i]) begin
+      if (candidate_plan.rings[i] != null &&
+          candidate_plan.rings[i].role == RDMA_QUEUE_ROLE_CQ_RING)
+        candidate_plan.rings[i] = candidate_ring;
+    end
+    foreach (candidate_plan.refs[i]) begin
+      if (candidate_plan.refs[i] != null &&
+          candidate_plan.refs[i].role == RDMA_QUEUE_ROLE_CQ_RING)
+        candidate_plan.refs[i] = candidate_ref;
+    end
+
+    candidate_cq = rdma_cq::type_id::create("cq_resize_candidate");
+    if (candidate_cq == null) begin
+      status = bad("CQ resize candidate allocation failed",
+                   RDMA_SC_RESOURCE_EXHAUSTED);
+      status = abort_cq_resize(cq_h, old_attachment.runtime, dependents,
+                               candidate_ref, manager_quiesced, cq_quiesced,
+                               status);
+      return finish_resize(status);
+    end
+    candidate_cq.copy(authoritative_cq);
+    candidate_cq.state = RDMA_RESOURCE_ACTIVE;
+    candidate_cq.depth = new_depth;
+    candidate_cq.cqe_size_bytes = new_cqe_bytes;
+    candidate_cq.producer_index = candidate_runtime.producer_index;
+    candidate_cq.consumer_index = candidate_runtime.consumer_index;
+    candidate_cq.producer_wrap = candidate_runtime.producer_wrap;
+    candidate_cq.consumer_wrap = candidate_runtime.consumer_wrap;
+    candidate_cq.queue_iova = candidate_ref.mapping.iova;
+    candidate_cq.queue_plan = candidate_plan;
+
+    // 设计：旧 authority 仍可读时预先解析发布后所需字段，并完成
+    // replacement attachment 构造，使原子 manager swap 之后不再发生分配/类型失败。
+    status = find_queue_ref(authoritative_cq.queue_plan,
+                            RDMA_QUEUE_ROLE_CQ_RING, old_ref);
+    if (!status.ok()) begin
+      status = abort_cq_resize(cq_h, old_attachment.runtime, dependents,
+                               candidate_ref, manager_quiesced, cq_quiesced,
+                               status);
+      return finish_resize(status);
+    end
+    replacement = rdma_queue_data_attachment::type_id::create(
+      "cq_resize_attachment");
+    if (replacement == null) begin
+      status = bad("CQ resize attachment allocation failed",
+                   RDMA_SC_RESOURCE_EXHAUSTED);
+      status = abort_cq_resize(cq_h, old_attachment.runtime, dependents,
+                               candidate_ref, manager_quiesced, cq_quiesced,
+                               status);
+      return finish_resize(status);
+    end
     replacement.queue_h = old_attachment.queue_h;
     replacement.kind = old_attachment.kind;
     replacement.runtime = candidate_runtime;
-    replacement.access = old_attachment.access.clone_for_resize();
-    if (replacement.access == null)
-      return bad("CQ resize backing allocation failed", RDMA_SC_RESOURCE_EXHAUSTED);
+    replacement.access = candidate_access;
     replacement.role = old_attachment.role;
     replacement.entry_size = new_cqe_bytes;
     replacement.local_id = old_attachment.local_id;
     replacement.transport = old_attachment.transport;
-    begin
-      rdma_resource resource;
-      rdma_cq authoritative_cq;
-      status = manager.lookup(cq_h, resource);
-      if (!status.ok() || !$cast(authoritative_cq, resource) || authoritative_cq == null)
-        return bad("CQ resize authority lookup failed", RDMA_SC_INVALID_STATE);
-      authoritative_cq.depth = new_depth;
-      authoritative_cq.cqe_size_bytes = new_cqe_bytes;
-      authoritative_cq.producer_index = replacement.runtime.producer_index;
-      authoritative_cq.consumer_index = replacement.runtime.consumer_index;
-      authoritative_cq.producer_wrap = replacement.runtime.producer_wrap;
-      authoritative_cq.consumer_wrap = replacement.runtime.consumer_wrap;
+
+    status = manager.replace_active_cq(candidate_cq);
+    if (!status.ok()) begin
+      status = abort_cq_resize(cq_h, old_attachment.runtime, dependents,
+                               candidate_ref, manager_quiesced, cq_quiesced,
+                               status);
+      return finish_resize(status);
     end
+
+    // 设计：发布成功后立即切换 attachment，使后续恢复报告指向新 authority；
+    // 随后 detach 旧 runtime 并释放 control-plane-owned 的旧 mapping。
     key = attachment_key(cq_h, RDMA_QUEUE_RUNTIME_CQ);
     attachments[key] = replacement;
-    return rdma_status::success();
+    status = old_attachment.runtime.detach_quiesced();
+    if (!status.ok())
+      return finish_resize(rdma_status::make(
+        RDMA_SC_RECOVERY_REQUIRED,
+        {"CQ resize published but old runtime detach failed: ",
+         status.message}));
+    status = backing_planner.cleanup_local_role(old_ref, cleanup_complete);
+    if (!status.ok() || !cleanup_complete)
+      return finish_resize(rdma_status::make(
+        RDMA_SC_RECOVERY_REQUIRED,
+        {"CQ resize published but old backing cleanup failed: ",
+         status == null ? "null status" : status.message}));
+    return finish_resize(rdma_status::success());
   endfunction
 
   // 功能：在 rdma_queue_data_engine 中，poll_ceqe_once 读取并解码队列条目，校验 owner/identity 后提交 consumer index，成功提交后才发布 completion/event。
