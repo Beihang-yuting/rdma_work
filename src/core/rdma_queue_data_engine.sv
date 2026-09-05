@@ -114,6 +114,10 @@ class rdma_queue_data_engine extends uvm_object;
   rdma_doorbell_scheduler doorbells;
   rdma_codec_registry registry;
   time operation_timeout;
+  // The planner owns only temporary allocation bookkeeping; mappings remain
+  // owned by the lifecycle queue plan after a successful replacement.
+  protected rdma_queue_backing_planner backing_planner;
+  protected semaphore resize_lock;
 
   protected rdma_queue_data_attachment attachments[string];
   protected rdma_queue_data_qp_link qp_links[string];
@@ -126,6 +130,9 @@ class rdma_queue_data_engine extends uvm_object;
     super.new(name);
     manager = null; binding = null; host_mem = null; doorbells = null;
     registry = null; operation_timeout = 0;
+    backing_planner = rdma_queue_backing_planner::type_id::create(
+      {name, "_backing_planner"});
+    resize_lock = new(1);
     attachments.delete(); qp_links.delete(); configured = 1'b0;
   endfunction
 
@@ -225,6 +232,13 @@ class rdma_queue_data_engine extends uvm_object;
     if (function_binding.state != RDMA_BIND_ACTIVE ||
         function_binding.generation == 0)
       return bad("Function binding is not active", RDMA_SC_INVALID_STATE);
+    if (backing_planner == null)
+      backing_planner = rdma_queue_backing_planner::type_id::create(
+        "queue_data_backing_planner");
+    status = backing_planner.configure(memory);
+    if (status == null || !status.ok())
+      return status == null ? bad("queue backing planner configuration returned null",
+                                  RDMA_SC_INVALID_STATE) : status;
     manager = resource_manager; binding = function_binding; host_mem = memory;
     doorbells = scheduler; registry = codecs; operation_timeout = timeout;
     attachments.delete(); qp_links.delete(); configured = 1'b1;
@@ -1429,6 +1443,141 @@ class rdma_queue_data_engine extends uvm_object;
       #1ns;
     end while (1);
   endtask
+
+  // 功能：finish_resize 统一释放 engine 级 resize semaphore 并返回事务结果，确保所有退出分支都不会遗留锁。
+  // 输入输出及副作用：status 为输入；finish_resize 释放本对象持有的 resize_lock token，不修改 CQ authority。
+  // 失败边界：status 为空时仍返回 INVALID_STATE；未持有 lock 的调用方不得调用本函数，否则会破坏并发屏障。
+  protected function rdma_status finish_resize(rdma_status status);
+    if (status == null)
+      status = bad("CQ resize returned null status", RDMA_SC_INVALID_STATE);
+    if (resize_lock != null)
+      resize_lock.put(1);
+    return status;
+  endfunction
+
+  // 功能：quiesce_cq_dependents 找出引用 CQ 的 QP/SRQ runtime，并在 resize 前逐一切到 QUIESCING，阻止依赖队列产生新事务。
+  // 输入输出及副作用：cq_h 为输入；runtimes 为输出；成功时更新相关 runtime 状态并返回其快照列表。
+  // 失败边界：关联 runtime 非 ACTIVE、存在 pending/used、句柄拓扑不完整或任一 begin_quiesce 失败时回滚已切换 runtime 并返回错误。
+  protected function rdma_status quiesce_cq_dependents(
+    rdma_handle cq_h,
+    output rdma_queue_runtime runtimes[$]
+  );
+    rdma_queue_data_qp_link link;
+    rdma_queue_data_attachment attachment;
+    rdma_status status;
+    string link_key;
+    string attachment_key_value;
+    rdma_queue_runtime candidate_runtime;
+    rdma_queue_runtime_kind_e kinds[$];
+    bit already_seen;
+
+    runtimes.delete();
+    if (cq_h == null)
+      return bad("CQ dependent quiesce handle is null");
+    kinds.push_back(RDMA_QUEUE_RUNTIME_SQ);
+    kinds.push_back(RDMA_QUEUE_RUNTIME_RQ);
+    kinds.push_back(RDMA_QUEUE_RUNTIME_SRQ);
+    foreach (qp_links[link_key]) begin
+      link = qp_links[link_key];
+      if (link == null)
+        continue;
+      if ((link.send_cq_h == null || !link.send_cq_h.same_instance(cq_h)) &&
+          (link.recv_cq_h == null || !link.recv_cq_h.same_instance(cq_h)))
+        continue;
+      foreach (kinds[i]) begin
+        attachment_key_value = attachment_key(
+          kinds[i] == RDMA_QUEUE_RUNTIME_SRQ ? link.srq_h : link.qp_h,
+          kinds[i]);
+        if (attachment_key_value == "" ||
+            !attachments.exists(attachment_key_value))
+          continue;
+        attachment = attachments[attachment_key_value];
+        if (attachment == null || attachment.runtime == null)
+          return bad("CQ dependent attachment is incomplete",
+                     RDMA_SC_INVALID_STATE);
+        candidate_runtime = attachment.runtime;
+        // A shared SRQ can be reached through more than one QP link; only
+        // transition a runtime once per resize transaction.
+        already_seen = 1'b0;
+        foreach (runtimes[j])
+          if (runtimes[j] === candidate_runtime) already_seen = 1'b1;
+        if (already_seen)
+          continue;
+        status = candidate_runtime.begin_quiesce();
+        if (!status.ok()) begin
+          foreach (runtimes[j]) void'(runtimes[j].restore_active());
+          runtimes.delete();
+          return status;
+        end
+        runtimes.push_back(candidate_runtime);
+      end
+    end
+    return rdma_status::success();
+  endfunction
+
+  // 功能：restore_cq_dependents 把 resize 事务中暂时 QUIESCING 的依赖 runtime 恢复为 ACTIVE。
+  // 输入输出及副作用：runtimes 为输入；成功时更新每个 runtime.state，不触碰 manager registry。
+  // 失败边界：任一 runtime 恢复失败时返回该错误；调用方必须保留诊断并进入恢复路径。
+  protected function rdma_status restore_cq_dependents(
+    rdma_queue_runtime runtimes[$]
+  );
+    rdma_status status;
+    foreach (runtimes[i]) begin
+      if (runtimes[i] == null)
+        continue;
+      status = runtimes[i].restore_active();
+      if (!status.ok()) return status;
+    end
+    return rdma_status::success();
+  endfunction
+
+  // 功能：abort_cq_resize 撤销尚未发布的 CQ resize 阶段，按“新 backing cleanup、runtime restore、manager restore”顺序恢复旧 authority。
+  // 输入输出及副作用：cq_h/old_runtime/dependents/new_ref/manager_quiesced/cq_quiesced/original_status 为输入；函数可能释放候选 mapping、恢复 runtime 和 manager 状态。
+  // 失败边界：任一回滚动作失败时返回 RECOVERY_REQUIRED 或底层错误，并把原始失败消息附加到结果；已提交的新 authority 不应调用本函数。
+  protected function rdma_status abort_cq_resize(
+    rdma_handle cq_h,
+    rdma_queue_runtime old_runtime,
+    rdma_queue_runtime dependents[$],
+    rdma_queue_backing_ref new_ref,
+    bit manager_quiesced,
+    bit cq_quiesced,
+    rdma_status original_status
+  );
+    rdma_status rollback_status;
+    rdma_status first_failure;
+    bit complete;
+
+    first_failure = null;
+    if (new_ref != null) begin
+      rollback_status = backing_planner.cleanup_local_role(new_ref,
+                                                            complete);
+      if (rollback_status == null || !rollback_status.ok() || !complete) begin
+        if (rollback_status == null)
+          rollback_status = bad("CQ resize candidate cleanup returned null",
+                                RDMA_SC_RECOVERY_REQUIRED);
+        first_failure = rollback_status;
+      end
+    end
+    if (cq_quiesced && old_runtime != null) begin
+      rollback_status = old_runtime.restore_active();
+      if (rollback_status == null || !rollback_status.ok())
+        if (first_failure == null) first_failure = rollback_status;
+    end
+    rollback_status = restore_cq_dependents(dependents);
+    if (rollback_status == null || !rollback_status.ok())
+      if (first_failure == null) first_failure = rollback_status;
+    if (manager_quiesced) begin
+      rollback_status = manager.restore_active(cq_h);
+      if (rollback_status == null || !rollback_status.ok())
+        if (first_failure == null) first_failure = rollback_status;
+    end
+    if (first_failure != null)
+      return rdma_status::make(RDMA_SC_RECOVERY_REQUIRED,
+        {"CQ resize rollback failed: ", first_failure.message,
+         "; original failure: ", original_status == null ? "" :
+         original_status.message});
+    return original_status;
+  endfunction
 
   // 功能：调整已附着 CQ 的 runtime ring，先确认 quiesce 条件，再分配新 runtime、复制 owner/CI 游标并原子替换 attachment。
   // 输入输出及副作用：cq_h/new_depth/new_cqe_bytes 为输入；成功时更新 CQ attachment 的 runtime 与 entry geometry。

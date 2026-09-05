@@ -578,6 +578,141 @@ class rdma_queue_backing_planner extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：为 CQ resize 分配一份全新的 control-plane-owned ring backing，并生成带页表几何的 ring/ref 快照。
+  // 输入/输出及副作用：binding/resource_h/depth/entry_size/initial_polarity 为输入；ring/ref_value 为输出；函数调用 Host-memory allocate 并在失败时释放候选映射。
+  // 失败/边界：planner 未配置、Function/owner/handle 不一致、depth 非法、CQE profile 不支持、容量/乘法溢出、分配/页引用构造失败时返回错误；任何失败都不得泄漏候选 mapping 或修改调用方已有 plan。
+  function rdma_status allocate_owned_cq_resize_ring(
+    rdma_function_binding binding,
+    rdma_handle resource_h,
+    int unsigned depth,
+    int unsigned entry_size,
+    output rdma_queue_ring_layout ring,
+    output rdma_queue_backing_ref ref_value,
+    bit initial_polarity = 1'b0
+  );
+    rdma_dma_request_context request_context;
+    rdma_function_handle owner;
+    rdma_status status;
+    longint unsigned logical_bytes;
+    longint unsigned storage_bytes;
+    int unsigned page_count;
+
+    ring = null;
+    ref_value = null;
+    if (host_mem == null)
+      return invalid_state("queue backing planner is not configured");
+    if (binding == null || resource_h == null)
+      return invalid_argument("CQ resize allocation input is null");
+    status = normalize_status(binding.validate(),
+                              "CQ resize Function validation returned null");
+    if (!status.ok()) return status;
+    if (binding.state != RDMA_BIND_ACTIVE || binding.generation == 0)
+      return invalid_state("CQ resize requires an ACTIVE Function");
+    owner = binding.make_handle();
+    if (owner == null || resource_h.kind != RDMA_RESOURCE_CQ ||
+        !same_handle(owner, binding.owner_h))
+      return invalid_argument("CQ resize resource handle is invalid");
+    status = normalize_status(rdma_handle_owner_status(resource_h, owner),
+                              "CQ resize resource ownership returned null");
+    if (!status.ok()) return status;
+    if (!(entry_size inside {32, 64, 128}))
+      return invalid_argument("CQ resize CQE size profile is unsupported");
+    if (!rdma_is_power_of_two(depth) ||
+        depth < binding.queue_caps.min_cq_depth ||
+        depth > binding.queue_caps.max_cq_depth)
+      return invalid_argument("CQ resize depth is outside Function capability");
+    if (depth > 64'hffff_ffff_ffff_ffff / entry_size)
+      return invalid_argument("CQ resize ring multiplication overflows");
+    logical_bytes = longint'(depth) * entry_size;
+    if (logical_bytes > 64'hffff_ffff_ffff_f000)
+      return invalid_argument("CQ resize ring alignment overflows");
+    storage_bytes = (logical_bytes + 4095) & 64'hffff_ffff_ffff_f000;
+    if (storage_bytes == 0 || storage_bytes > 32'hffff_ffff ||
+        storage_bytes > binding.queue_caps.max_queue_ring_bytes)
+      return invalid_argument("CQ resize ring exceeds Function capability");
+    if (storage_bytes > 64'h0020_0000)
+      return invalid_argument("CQ resize ring exceeds page-directory ceiling");
+    page_count = int'(storage_bytes / 4096);
+    if (page_count == 0 || page_count > 512)
+      return invalid_argument("CQ resize ring page count is invalid");
+
+    ring = rdma_queue_ring_layout::type_id::create("cq_resize_ring");
+    if (ring == null)
+      return rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED,
+                               "CQ resize ring creation failed");
+    ring.role = RDMA_QUEUE_ROLE_CQ_RING;
+    ring.entry_size_bytes = entry_size;
+    ring.depth = depth;
+    ring.logical_bytes = logical_bytes;
+    ring.storage_bytes = storage_bytes;
+    ring.page_count = page_count;
+    ring.initial_polarity = initial_polarity;
+    status = normalize_status(ring.validate_metadata(),
+                              "CQ resize ring metadata validation returned null");
+    if (!status.ok()) begin
+      ring = null;
+      return status;
+    end
+    status = make_request_context(binding, resource_h, request_context);
+    if (!status.ok()) begin
+      ring = null;
+      return status;
+    end
+    status = allocate_owned_ref(binding, request_context, resource_h,
+                                RDMA_QUEUE_ROLE_CQ_RING, storage_bytes,
+                                4096, RDMA_DMA_DEVICE_WRITE, ref_value);
+    if (!status.ok()) begin
+      ring = null;
+      return status;
+    end
+    status = populate_owned_ring(ring, ref_value);
+    if (!status.ok()) begin
+      status = rollback_owned_ref(ref_value, status);
+      ref_value = null;
+      ring = null;
+      return status;
+    end
+    status = normalize_status(ref_value.validate(),
+                              "CQ resize backing reference validation returned null");
+    if (!status.ok()) begin
+      status = rollback_owned_ref(ref_value, status);
+      ref_value = null;
+      ring = null;
+      return status;
+    end
+    status = normalize_status(ring.validate(),
+                              "CQ resize ring validation returned null");
+    if (!status.ok()) begin
+      status = rollback_owned_ref(ref_value, status);
+      ref_value = null;
+      ring = null;
+      return status;
+    end
+    return rdma_status::success();
+  endfunction
+
+  // 功能：rollback_owned_ref 回滚 CQ resize 的候选 owned ref，并在释放失败时合并原始失败原因与 cleanup 证据。
+  // 输入/输出及副作用：ref_value/original_status 为输入；函数通过 Host-memory release 改变候选 mapping 的生命周期，不修改旧 authority。
+  // 失败/边界：ref 为空时原样返回 original_status；cleanup 未完成或 adapter 返回错误时返回 cleanup 错误，调用方必须进入可诊断恢复路径。
+  protected function rdma_status rollback_owned_ref(
+    rdma_queue_backing_ref ref_value,
+    rdma_status original_status
+  );
+    rdma_status cleanup_status;
+    bit complete;
+    if (ref_value == null)
+      return original_status;
+    cleanup_status = cleanup_local_role(ref_value, complete);
+    if (cleanup_status == null || !cleanup_status.ok() || !complete) begin
+      if (cleanup_status == null)
+        cleanup_status = invalid_state("CQ resize candidate cleanup returned null");
+      return rdma_status::make(cleanup_status.code,
+        {"CQ resize candidate cleanup failed: ", cleanup_status.message,
+         "; original failure: ", original_status.message});
+    end
+    return original_status;
+  endfunction
+
   // 功能：将 rhs 中 rdma_queue_backing_planner 的值字段复制到当前对象，建立与源对象隔离的快照。
   // 输入/输出及副作用：source（输入）、ring（输出）；clone_ring_metadata 读取 source、ring 并使用字段 ring、cloned_object，并写入 ring；函数返回 rdma_status，不取得调用方资源所有权。
   // 失败/边界：clone_ring_metadata 返回 RDMA_SC_INVALID_ARGUMENT、RDMA_SC_INVALID_STATE；典型拒绝条件为“queue ring metadata is null”“queue ring metadata clone failed”；失败路径不提交部分状态或转移未声明资源。

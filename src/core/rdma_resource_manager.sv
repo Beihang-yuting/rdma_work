@@ -4800,6 +4800,148 @@ class rdma_resource_manager extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：begin_cq_resize 为 CQ backing replacement 建立专用 quiesce 屏障；允许仍被空闲 QP 引用的 CQ 进入 QUIESCING，同时保留完整依赖拓扑。
+  // 输入/输出及副作用：handle（输入）；begin_cq_resize 读取 CQ authority、依赖资源和 outstanding_ids，并原子更新 registry 中 CQ 的 state；函数返回 rdma_status，不接管外部资源。
+  // 失败/边界：handle 非 CQ、CQ 非 ACTIVE、CQ 有 outstanding ID、或依赖 QP/其它资源仍有活动事务时返回错误；失败路径不写入 registry，原 CQ 快照保持 ACTIVE。
+  virtual function rdma_status begin_cq_resize(rdma_handle handle);
+    rdma_resource authoritative;
+    rdma_resource replacement;
+    rdma_status status;
+    string key;
+    string dependent_key;
+
+    status = registry_schema_status("begin CQ resize");
+    if (!status.ok()) return status;
+    status = lookup(handle, authoritative);
+    if (!status.ok()) return status;
+    if (authoritative == null || authoritative.handle == null ||
+        authoritative.handle.kind != RDMA_RESOURCE_CQ)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "CQ resize handle is not a CQ");
+    key = resource_key(authoritative.handle);
+    if (!registry.exists(key) || registry[key] == null)
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "CQ resize authority is missing");
+    if (registry[key].state != RDMA_RESOURCE_ACTIVE)
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "only ACTIVE CQ can begin resize");
+    if (registry[key].outstanding_ids.size() != 0)
+      return rdma_status::make(RDMA_SC_RESOURCE_BUSY,
+                               "CQ has outstanding manager operations");
+    foreach (registry[dependent_key]) begin
+      if (registry[dependent_key] == null ||
+          registry[dependent_key] == registry[key])
+        continue;
+      if (!resource_depends_on(registry[dependent_key], authoritative.handle))
+        continue;
+      // A CQ may remain referenced by an idle QP while its ring is replaced.
+      // Any non-QP dependent (or a QP carrying manager-visible work) still
+      // makes the replacement unsafe and is rejected atomically.
+      if (registry[dependent_key].handle == null ||
+          registry[dependent_key].handle.kind != RDMA_RESOURCE_QP ||
+          registry[dependent_key].outstanding_ids.size() != 0)
+        return rdma_status::make(RDMA_SC_RESOURCE_BUSY,
+                                 "CQ has an active dependent resource");
+    end
+    status = project_resource_value(registry[key], "begin CQ resize",
+                                    replacement);
+    if (!status.ok()) return status;
+    replacement.state = RDMA_RESOURCE_QUIESCING;
+    status = replacement.validate();
+    if (status == null || !status.ok())
+      return status == null ? rdma_status::make(
+        RDMA_SC_INVALID_STATE, "CQ quiesce validation returned null") : status;
+    registry[key] = replacement;
+    return rdma_status::success();
+  endfunction
+
+  // 功能：replace_active_cq 对已 QUIESCING 的 CQ 原子发布新的 ACTIVE geometry/backing，同时验证 manager-owned identity、依赖、queue plan 和 release authority 不变。
+  // 输入/输出及副作用：candidate（输入）；replace_active_cq 读取 candidate 并在所有检查通过后单次替换 registry CQ；函数返回 rdma_status，不直接释放旧 backing。
+  // 失败/边界：candidate 为空/类型或状态错误、registry 非 QUIESCING、ring/ref geometry 不匹配、queue plan/身份/依赖/outstanding 改变或 validation 失败时拒绝，registry 保持原值。
+  virtual function rdma_status replace_active_cq(rdma_cq candidate);
+    rdma_resource authoritative;
+    rdma_resource replacement_resource;
+    rdma_cq authoritative_cq;
+    rdma_cq replacement_cq;
+    rdma_queue_ring_layout ring;
+    rdma_queue_backing_ref ring_ref;
+    rdma_status status;
+    string key;
+    int ring_count;
+    int ref_count;
+
+    if (candidate == null || candidate.handle == null ||
+        candidate.handle.kind != RDMA_RESOURCE_CQ)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "CQ replacement candidate is invalid");
+    if (candidate.state != RDMA_RESOURCE_ACTIVE)
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "CQ replacement candidate is not ACTIVE");
+    status = lookup(candidate.handle, authoritative);
+    if (!status.ok()) return status;
+    if (authoritative == null || authoritative.handle == null ||
+        authoritative.handle.kind != RDMA_RESOURCE_CQ ||
+        !$cast(authoritative_cq, authoritative))
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "CQ replacement authority is incompatible");
+    key = resource_key(authoritative.handle);
+    if (!registry.exists(key) || registry[key] == null ||
+        registry[key].state != RDMA_RESOURCE_QUIESCING)
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "CQ replacement requires QUIESCING authority");
+    if (candidate.queue_plan == null ||
+        candidate.queue_plan.resource_kind != RDMA_RESOURCE_CQ)
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "CQ replacement queue plan is missing");
+    ring_count = 0;
+    ring = null;
+    foreach (candidate.queue_plan.rings[i]) begin
+      if (candidate.queue_plan.rings[i] != null &&
+          candidate.queue_plan.rings[i].role == RDMA_QUEUE_ROLE_CQ_RING) begin
+        ring_count++;
+        ring = candidate.queue_plan.rings[i];
+      end
+    end
+    ref_count = 0;
+    ring_ref = null;
+    foreach (candidate.queue_plan.refs[i]) begin
+      if (candidate.queue_plan.refs[i] != null &&
+          candidate.queue_plan.refs[i].role == RDMA_QUEUE_ROLE_CQ_RING) begin
+        ref_count++;
+        ring_ref = candidate.queue_plan.refs[i];
+      end
+    end
+    if (ring_count != 1 || ref_count != 1 || ring == null ||
+        ring_ref == null || ring.depth != candidate.depth ||
+        ring.entry_size_bytes != candidate.cqe_size_bytes ||
+        ring_ref.mapping == null || ring_ref.mapping.state != RDMA_MAPPING_ACTIVE ||
+        ring_ref.length != ring.storage_bytes ||
+        candidate.queue_iova.value != ring_ref.mapping.iova.value)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "CQ replacement ring geometry is inconsistent");
+    status = candidate.validate();
+    if (status == null || !status.ok())
+      return status == null ? rdma_status::make(
+        RDMA_SC_INVALID_STATE, "CQ replacement validation returned null") : status;
+    status = publication_identity_status(candidate, authoritative);
+    if (!status.ok()) return status;
+    status = project_public_resource_value(candidate, "replace active CQ",
+                                           replacement_resource);
+    if (!status.ok()) return status;
+    if (!$cast(replacement_cq, replacement_resource))
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "CQ replacement projection type mismatch");
+    replacement_cq.state = RDMA_RESOURCE_ACTIVE;
+    status = replacement_cq.validate();
+    if (status == null || !status.ok())
+      return status == null ? rdma_status::make(
+        RDMA_SC_INVALID_STATE, "projected CQ replacement validation returned null") : status;
+    // The assignment below is the sole publication point.  All detached
+    // projections and geometry checks above are deliberately completed first.
+    registry[key] = replacement_cq;
+    return rdma_status::success();
+  endfunction
+
   // 功能：在 rdma_resource_manager 中，attach_qp_programming 把 attach_qp_programming 指定的资源或后端能力绑定到当前对象索引，并校验 Function、generation 和队列类型一致。
   // 输入/输出及副作用：candidate（输入）；attach_qp_programming 先依据 !status.ok(；replacement.state != RDMA_RESOURCE_ALLOCATED || replacement.qp_plan == null || replacement.programmed_qpc == null；registry.exists(key 校验 candidate；成功时更新本对象配置/状态并保存非拥有引用，返回 rdma_status。
   // 失败/边界：资源不存在、类型不符、重复登记或跨 Function 串线时拒绝绑定并保持索引不变。

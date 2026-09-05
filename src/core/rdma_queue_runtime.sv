@@ -10,7 +10,12 @@ typedef enum bit [2:0] {
   RDMA_QUEUE_RUNTIME_DETACHED = 3'd0,
   RDMA_QUEUE_RUNTIME_ATTACHED = 3'd1,
   RDMA_QUEUE_RUNTIME_ACTIVE = 3'd2,
-  RDMA_QUEUE_RUNTIME_RECOVERY_REQUIRED = 3'd3
+  RDMA_QUEUE_RUNTIME_RECOVERY_REQUIRED = 3'd3,
+  // Resize owns a short quiesce window in which no producer/consumer
+  // reservation may be created.  Keeping this distinct from DETACHED lets
+  // the engine restore the old attachment when a replacement transaction
+  // fails without losing its cursor ledger.
+  RDMA_QUEUE_RUNTIME_QUIESCING = 3'd4
 } rdma_queue_runtime_state_e;
 
 typedef enum bit [2:0] {
@@ -248,12 +253,82 @@ class rdma_queue_runtime extends uvm_object;
     state=RDMA_QUEUE_RUNTIME_ACTIVE; lock.put(1); return rdma_status::success();
   endfunction
 
+  // 功能：在 rdma_queue_runtime 中，begin_quiesce 建立 resize/删除屏障，把 ACTIVE runtime 切到 QUIESCING，并阻止新的 post/poll reservation。
+  // 输入/输出及副作用：无显式参数；begin_quiesce 读取当前 state、pending_operation、used 并更新 state；函数返回 rdma_status，不接管外部资源。
+  // 失败/边界：runtime 未 ACTIVE、已有 pending operation 或仍有 used 槽位时返回 RESOURCE_BUSY/INVALID_STATE；失败不改变 state 或账本。
+  function rdma_status begin_quiesce();
+    rdma_status lock_status;
+    lock_status = acquire_lock();
+    if (!lock_status.ok()) return lock_status;
+    if (state != RDMA_QUEUE_RUNTIME_ACTIVE) begin
+      lock.put(1);
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "queue runtime is not active");
+    end
+    if (pending_operation != null || used != 0) begin
+      lock.put(1);
+      return rdma_status::make(RDMA_SC_RESOURCE_BUSY,
+                               pending_operation != null ?
+                               "queue runtime has a pending operation" :
+                               "queue runtime has outstanding slots");
+    end
+    state = RDMA_QUEUE_RUNTIME_QUIESCING;
+    lock.put(1);
+    return rdma_status::success();
+  endfunction
+
+  // 功能：在 rdma_queue_runtime 中，restore_active 撤销未提交的 quiesce 屏障，恢复旧 runtime 的 ACTIVE 状态。
+  // 输入/输出及副作用：无显式参数；restore_active 读取 state、pending_operation、used 并更新 state；函数返回 rdma_status，不接管外部资源。
+  // 失败/边界：仅 QUIESCING 且无 pending/used 的 runtime 可恢复；其它状态返回 INVALID_STATE/RESOURCE_BUSY 且保持原状态。
+  function rdma_status restore_active();
+    rdma_status lock_status;
+    lock_status = acquire_lock();
+    if (!lock_status.ok()) return lock_status;
+    if (state != RDMA_QUEUE_RUNTIME_QUIESCING) begin
+      lock.put(1);
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "queue runtime is not quiescing");
+    end
+    if (pending_operation != null || used != 0) begin
+      lock.put(1);
+      return rdma_status::make(RDMA_SC_RESOURCE_BUSY,
+                               "quiesced runtime has mutable work");
+    end
+    state = RDMA_QUEUE_RUNTIME_ACTIVE;
+    lock.put(1);
+    return rdma_status::success();
+  endfunction
+
+  // 功能：在 rdma_queue_runtime 中，detach_quiesced 在 backing replacement 已提交后使旧 runtime 失效，防止旧 cursor 再访问 Host-memory。
+  // 输入/输出及副作用：无显式参数；detach_quiesced 读取 state、pending_operation、used 并更新 state；函数返回 rdma_status，不接管外部资源。
+  // 失败/边界：仅 QUIESCING 且无 pending/used 的 runtime 可 detach；重复 detach 或残留工作返回错误并保留原状态。
+  function rdma_status detach_quiesced();
+    rdma_status lock_status;
+    lock_status = acquire_lock();
+    if (!lock_status.ok()) return lock_status;
+    if (state != RDMA_QUEUE_RUNTIME_QUIESCING) begin
+      lock.put(1);
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "queue runtime is not quiescing");
+    end
+    if (pending_operation != null || used != 0) begin
+      lock.put(1);
+      return rdma_status::make(RDMA_SC_RESOURCE_BUSY,
+                               "quiesced runtime has mutable work");
+    end
+    state = RDMA_QUEUE_RUNTIME_DETACHED;
+    lock.put(1);
+    return rdma_status::success();
+  endfunction
+
   // 功能：将旧 ring 的 owner/CI 游标及槽位账本复制到已 configure 的新 ring。
   // 输入输出及副作用：source 为输入；更新当前 runtime 的 cursor、used 和 slot 快照。
   // 失败边界：source 为空、深度不足或槽位 clone 失败时返回错误且不发布部分复制状态。
   function rdma_status copy_ring_state(rdma_queue_runtime source);
     int unsigned i, limit;
     uvm_object cloned;
+    rdma_queue_slot_ledger_entry staged_slots[];
+    rdma_queue_slot_ledger_entry staged_slot;
     // 动态数组不能用 null aggregate 比较；以 source.depth 和实际 size
     // 同时作为“已配置且有槽位账本”的判据，避免在复制阶段触发越界。
     if (source == null || source.depth == 0 || source.slots.size() == 0 ||
@@ -261,35 +336,72 @@ class rdma_queue_runtime extends uvm_object;
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "source runtime is null");
     if (source.consumer_index >= depth || source.producer_index >= depth)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "source cursor exceeds resized depth");
+    if (source.used > depth)
+      return rdma_status::make(RDMA_SC_RESOURCE_BUSY,
+                               "source runtime occupancy exceeds resized depth");
     limit = (source.depth < depth) ? source.depth : depth;
-    producer_index = source.producer_index; producer_wrap = source.producer_wrap;
-    consumer_index = source.consumer_index; consumer_wrap = source.consumer_wrap;
-    used = (source.used < depth) ? source.used : depth;
+    // A shrink may only discard slots that are truly empty.  Validate the
+    // entire source ledger before touching this runtime so a failed clone
+    // cannot publish half of a new cursor/slot state.
+    if (source.depth > depth) begin
+      for (i = depth; i < source.depth; i++) begin
+        if (source.slots[i] != null && source.slots[i].posted &&
+            !source.slots[i].consumed)
+          return rdma_status::make(RDMA_SC_RESOURCE_BUSY,
+                                   "source runtime has slots outside resized depth");
+      end
+    end
+    staged_slots = new[depth];
+    foreach (staged_slots[i]) begin
+      staged_slots[i] = rdma_queue_slot_ledger_entry::type_id::create(
+        $sformatf("staged_slot_%0d", i));
+      if (staged_slots[i] == null)
+        return rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED,
+                                 "slot staging allocation failed");
+    end
     for (i = 0; i < limit; i++) begin
-      slots[i].posted = source.slots[i].posted;
-      slots[i].consumed = source.slots[i].consumed;
-      slots[i].signaled = source.slots[i].signaled;
-      slots[i].wr_id = source.slots[i].wr_id;
-      slots[i].index = source.slots[i].index;
-      slots[i].wrap = source.slots[i].wrap;
-      slots[i].request_snapshot = null;
-      slots[i].image = null;
-      slots[i].completion_status = null;
+      if (source.slots[i] == null)
+        return rdma_status::make(RDMA_SC_INVALID_STATE,
+                                 "source runtime has a null slot");
+      staged_slot = staged_slots[i];
+      staged_slot.posted = source.slots[i].posted;
+      staged_slot.consumed = source.slots[i].consumed;
+      staged_slot.signaled = source.slots[i].signaled;
+      staged_slot.wr_id = source.slots[i].wr_id;
+      staged_slot.index = source.slots[i].index;
+      staged_slot.wrap = source.slots[i].wrap;
+      staged_slot.request_snapshot = null;
+      staged_slot.image = null;
+      staged_slot.completion_status = null;
       if (source.slots[i].request_snapshot != null) begin
         cloned = source.slots[i].request_snapshot.clone();
-        if (cloned == null || !$cast(slots[i].request_snapshot, cloned))
+        if (cloned == null || !$cast(staged_slot.request_snapshot, cloned))
           return rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED, "slot request clone failed");
       end
       if (source.slots[i].image != null) begin
         cloned = source.slots[i].image.clone();
-        if (cloned == null || !$cast(slots[i].image, cloned))
+        if (cloned == null || !$cast(staged_slot.image, cloned))
           return rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED, "slot image clone failed");
       end
       if (source.slots[i].completion_status != null) begin
-        slots[i].completion_status = rdma_clone_status_value(source.slots[i].completion_status);
-        if (slots[i].completion_status == null)
+        staged_slot.completion_status = rdma_clone_status_value(source.slots[i].completion_status);
+        if (staged_slot.completion_status == null)
           return rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED, "slot status clone failed");
       end
+    end
+    producer_index = source.producer_index; producer_wrap = source.producer_wrap;
+    consumer_index = source.consumer_index; consumer_wrap = source.consumer_wrap;
+    used = source.used;
+    foreach (staged_slots[i]) begin
+      slots[i].posted = staged_slots[i].posted;
+      slots[i].consumed = staged_slots[i].consumed;
+      slots[i].signaled = staged_slots[i].signaled;
+      slots[i].wr_id = staged_slots[i].wr_id;
+      slots[i].index = staged_slots[i].index;
+      slots[i].wrap = staged_slots[i].wrap;
+      slots[i].request_snapshot = staged_slots[i].request_snapshot;
+      slots[i].image = staged_slots[i].image;
+      slots[i].completion_status = staged_slots[i].completion_status;
     end
     return rdma_status::success();
   endfunction
