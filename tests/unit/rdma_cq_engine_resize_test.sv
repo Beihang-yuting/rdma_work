@@ -27,6 +27,8 @@ class rdma_cq_engine_resize_test extends uvm_test;
     rdma_cq after_cq;
     rdma_dma_mapping before_mapping;
     rdma_dma_mapping after_mapping;
+    rdma_queue_runtime_state_e sq_state;
+    rdma_queue_runtime_state_e rq_state;
     int unsigned allocate_calls_before;
     int unsigned allocate_calls_after;
     int unsigned release_calls_before;
@@ -121,6 +123,14 @@ class rdma_cq_engine_resize_test extends uvm_test;
         after_mapping.size < 32 * 128 ||
         after_mapping.iova.value == before_mapping.iova.value)
       `uvm_error("CQ_RESIZE_MAPPING", "successful resize did not replace mapping identity/size")
+    status = fixture.engine.query_runtime_state(
+      fixture.qp.handle, RDMA_QUEUE_RUNTIME_SQ, sq_state);
+    if (status == null || !status.ok() || sq_state != RDMA_QUEUE_RUNTIME_ACTIVE)
+      `uvm_error("CQ_RESIZE_DEPENDENT_SQ", "SQ dependent runtime was not restored ACTIVE")
+    status = fixture.engine.query_runtime_state(
+      fixture.qp.handle, RDMA_QUEUE_RUNTIME_RQ, rq_state);
+    if (status == null || !status.ok() || rq_state != RDMA_QUEUE_RUNTIME_ACTIVE)
+      `uvm_error("CQ_RESIZE_DEPENDENT_RQ", "RQ dependent runtime was not restored ACTIVE")
 
     // Invalid geometry is rejected before allocation and leaves the newly
     // published mapping/authority unchanged.

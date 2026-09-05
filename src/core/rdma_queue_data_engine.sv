@@ -209,6 +209,27 @@ class rdma_queue_data_engine extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：query_runtime_state 返回指定队列 attachment 的只读运行状态，供
+  // 复位/resize 回归检查依赖 runtime 是否已恢复 ACTIVE。
+  // 输入输出及副作用：handle、kind 为输入，state 为输出；函数只读取
+  // attachment 索引，不修改 runtime、authority 或 backing 所有权。
+  // 失败边界：队列未配置、句柄代际失效或 attachment 缺失时返回错误，state
+  // 置为 DETACHED，调用方不得把失败结果当作活动状态。
+  function rdma_status query_runtime_state(
+    rdma_handle handle, rdma_queue_runtime_kind_e kind,
+    output rdma_queue_runtime_state_e state
+  );
+    rdma_queue_data_attachment attachment;
+    rdma_status status;
+    state = RDMA_QUEUE_RUNTIME_DETACHED;
+    status = lookup_attachment(handle, kind, attachment);
+    if (!status.ok()) return status;
+    if (attachment.runtime == null)
+      return bad("queue runtime is missing", RDMA_SC_INVALID_STATE);
+    state = attachment.runtime.state;
+    return rdma_status::success();
+  endfunction
+
   // 功能：在 rdma_queue_data_engine 中，configure 校验依赖和 binding 后建立运行边界，只保存非拥有引用并拒绝重复配置。
   // 输入/输出及副作用：resource_manager（输入）、function_binding（输入）、memory（输入）、scheduler（输入）、codecs（输入）、timeout（输入）；configure 先依据 resource_manager == null || function_binding == null || memory == null || scheduler == null || codecs == null || timeout == 0；status == null || !status.ok(；function_binding.state != RDMA_BIND_ACTIVE || function_binding.generation == 0 校验 resource_manager、function_binding、memory、scheduler、codecs、timeout；成功时更新本对象配置/状态并保存非拥有引用，返回
   //   rdma_status。
