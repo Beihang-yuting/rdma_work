@@ -94,6 +94,8 @@ class rdma_queue_data_qp_link extends uvm_object;
   rdma_handle recv_cq_h;
   int unsigned local_qp_id;
   rdma_transport_e transport;
+  rdma_queue_backing_access sq_sgb_access;
+  rdma_qp_backing_ref sq_sgb_ref;
 
   // 功能：构造 rdma_queue_data_qp_link，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：qp_h=null；srq_h=null；send_cq_h=null；recv_cq_h=null；local_qp_id=0；transport=RDMA_TRANSPORT_RC。
   // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
@@ -101,7 +103,7 @@ class rdma_queue_data_qp_link extends uvm_object;
   function new(string name = "rdma_queue_data_qp_link");
     super.new(name);
     qp_h = null; srq_h = null; send_cq_h = null; recv_cq_h = null;
-    local_qp_id = 0; transport = RDMA_TRANSPORT_RC;
+    local_qp_id = 0; transport = RDMA_TRANSPORT_RC; sq_sgb_access = null; sq_sgb_ref = null;
   endfunction
 endclass
 
@@ -1075,6 +1077,14 @@ class rdma_queue_data_engine extends uvm_object;
     if (link.recv_cq_h == null && qp.recv_cq_h != null)
       link.recv_cq_h = qp.recv_cq_h;
     link.local_qp_id = qp.local_qp_id; link.transport = qp.transport;
+    if (qp.qp_plan.sq_sgb_ref != null) begin
+      link.sq_sgb_access = rdma_queue_backing_access::type_id::create("sq_sgb_access");
+      link.sq_sgb_ref = qp.qp_plan.sq_sgb_ref;
+      status = link.sq_sgb_access.configure(binding.make_handle(), host_mem);
+      if (!status.ok()) return status;
+      status = link.sq_sgb_access.attach_qp(qp.qp_plan.sq_sgb_ref);
+      if (!status.ok()) return status;
+    end
     qp_links[identity_key(qp_h)] = link;
     return rdma_status::success();
   endfunction
@@ -1374,6 +1384,44 @@ class rdma_queue_data_engine extends uvm_object;
       if (readback[i] !== data[i])
         return bad("queue write readback mismatch", RDMA_SC_DMA_TRANSLATION);
     end
+    return rdma_status::success();
+  endfunction
+
+  // 功能：write_sgb_and_verify 为 SQE 的外置 SGB 构造 512-byte 大端槽位并完成 host-memory 写入/回读校验。
+  // 输入/输出及副作用：link/model 为输入；link.sq_sgb_access 指向借用的 QP SGB backing，函数只写入该 backing 并返回状态。
+  // 失败/边界：缺少 SGB authority、IOVA 未按 512 对齐或超出 mapping 范围、后端写入/回读失败时返回 DMA/INVALID_STATE，调用方不得推进 PI。
+  protected function rdma_status write_sgb_and_verify(
+      rdma_queue_data_qp_link link, rdma_hw_sqe_model model,
+      rdma_queue_cursor_snapshot cursor);
+    byte data[]; byte readback[]; rdma_status status; bit [31:0] len; bit [31:0] key; bit [63:0] va; longint unsigned sgb_offset;
+    if (link == null || model == null || cursor == null || link.sq_sgb_access == null)
+      return bad("SQE SGB backing authority is unavailable", RDMA_SC_INVALID_STATE);
+    if (model.sgb_iova.value == 0 || (model.sgb_iova.value & 64'h1ff) != 0)
+      return bad("SQE SGB IOVA is not 512-byte aligned", RDMA_SC_DMA_TRANSLATION);
+    if (link.sq_sgb_ref == null || link.sq_sgb_ref.mapping == null ||
+        model.sgb_iova.value != link.sq_sgb_ref.mapping.iova.value +
+          link.sq_sgb_ref.mapping_offset + cursor.index * 512 ||
+        link.sq_sgb_ref.length < (cursor.index + 1) * 512)
+      return bad("SQE SGB IOVA is outside backing authority", RDMA_SC_DMA_TRANSLATION);
+    data = new[512]; foreach (data[i]) data[i] = 0;
+    if (model.inline_data) begin
+      if (model.payload.size() > 512) return bad("SQE inline SGB exceeds 512 bytes");
+      foreach (model.payload[i]) data[i] = model.payload[i];
+    end else begin
+      if (model.sges.size() > 32) return bad("SQE SGB descriptor count exceeds 32");
+      foreach (model.sges[i]) begin
+        if (model.sges[i] == null || model.sges[i].length == 0) return bad("SQE SGB descriptor is invalid");
+        len = model.sges[i].length; key = model.sges[i].lkey; va = model.sges[i].iova.value;
+        for (int j=0;j<4;j++) data[i*16+j] = len[31-j*8 -: 8];
+        for (int j=0;j<4;j++) data[i*16+4+j] = key[31-j*8 -: 8];
+        for (int j=0;j<8;j++) data[i*16+8+j] = va[63-j*8 -: 8];
+      end
+    end
+    sgb_offset = model.sgb_iova.value - link.sq_sgb_ref.mapping.iova.value;
+    status = link.sq_sgb_access.write(sgb_offset, data); if (!status.ok()) return status;
+    status = link.sq_sgb_access.readback(sgb_offset, 512, readback); if (!status.ok()) return status;
+    if (readback.size() != 512) return bad("SQE SGB readback is short", RDMA_SC_DMA_TRANSLATION);
+    foreach (data[i]) if (readback[i] !== data[i]) return bad("SQE SGB readback mismatch", RDMA_SC_DMA_TRANSLATION);
     return rdma_status::success();
   endfunction
 
@@ -2921,6 +2969,16 @@ class rdma_queue_data_engine extends uvm_object;
       snapshot.transport == RDMA_TRANSPORT_RC ? "rc" :
       snapshot.transport == RDMA_TRANSPORT_UD ? "ud" : "urc", image);
     if (!status.ok()) return;
+    if (snapshot.sgb_iova.value != 0) begin
+      status = write_sgb_and_verify(link, model, cursor);
+      if (!status.ok()) begin
+        pending = make_pending(cursor, snapshot.qp_h, RDMA_QUEUE_RUNTIME_SQ,
+                              1'b1, longint'(cursor.index) * 64, image,
+                              snapshot, snapshot.signaled);
+        recovery_status = attachment.runtime.enter_recovery(pending, 1'b0);
+        return;
+      end
+    end
     offset = longint'(cursor.index) * 64;
     status = write_and_verify(attachment, offset, image);
     if (!status.ok()) begin

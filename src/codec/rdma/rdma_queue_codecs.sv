@@ -1166,7 +1166,7 @@ class rdma_hw_sqe_ud_codec extends rdma_hw_sqe_rc_codec;
     s=put(b,RDMA_SQ_WQE_UD_SRC_ADDR_IDX_WORD_BYTE_OFFSET,RDMA_SQ_WQE_UD_SRC_ADDR_IDX_LSB,RDMA_SQ_WQE_UD_SRC_ADDR_IDX_WIDTH,ext.address_vector_id); if(!s.ok()) return s;
     s=put(b,RDMA_SQ_WQE_UD_TOTAL_PAYLOAD_LEN_WORD_BYTE_OFFSET,RDMA_SQ_WQE_UD_TOTAL_PAYLOAD_LEN_LSB,RDMA_SQ_WQE_UD_TOTAL_PAYLOAD_LEN_WIDTH,payload_length(x,mode)); if(!s.ok()) return s;
     if (x.opcode==RDMA_WR_SEND_WITH_INV) begin s=put(b,RDMA_SQ_WQE_LOCAL_INVLD_STAG_WORD_BYTE_OFFSET,RDMA_SQ_WQE_LOCAL_INVLD_STAG_LSB,RDMA_SQ_WQE_LOCAL_INVLD_STAG_WIDTH,x.invalidate_key); if(!s.ok()) return s; end
-    s=b.serialize(raw); if(!s.ok()) return err(s.message); sig=8'h00; foreach(raw[i]) if(i!=16) sig^=raw[i]; foreach(sgb[i]) sig^=sgb[i]; return put(b,RDMA_SQ_WQE_SIGNATURE_WORD_BYTE_OFFSET,RDMA_SQ_WQE_SIGNATURE_LSB,RDMA_SQ_WQE_SIGNATURE_WIDTH,sig);
+    s=b.serialize(raw); if(!s.ok()) return err(s.message); sig=~8'h00; foreach(raw[i]) if(i!=16) sig^=raw[i]; foreach(sgb[i]) sig^=sgb[i]; return put(b,RDMA_SQ_WQE_SIGNATURE_WORD_BYTE_OFFSET,RDMA_SQ_WQE_SIGNATURE_LSB,RDMA_SQ_WQE_SIGNATURE_WIDTH,sig);
   endfunction
 endclass
 
@@ -1186,6 +1186,15 @@ class rdma_hw_sqe_urc_codec extends rdma_hw_sqe_rc_codec;
     s=put(b,RDMA_SQ_WQE_OPCODE_WORD_BYTE_OFFSET,RDMA_SQ_WQE_OPCODE_LSB,RDMA_SQ_WQE_OPCODE_WIDTH,op); if(!s.ok()) return s;
     s=put(b,RDMA_SQ_WQE_UD_DST_QPN_WORD_BYTE_OFFSET,RDMA_SQ_WQE_UD_DST_QPN_LSB,RDMA_SQ_WQE_UD_DST_QPN_WIDTH,ext.destination_qpn); if(!s.ok()) return s;
     if (x.opcode inside {RDMA_WR_RDMA_WRITE,RDMA_WR_WRITE_WITH_IMM,RDMA_WR_RDMA_READ}) begin s=put(b,RDMA_SQ_WQE_RC_REMOTE_KEY_WORD_BYTE_OFFSET,RDMA_SQ_WQE_RC_REMOTE_KEY_LSB,RDMA_SQ_WQE_RC_REMOTE_KEY_WIDTH,ext.rkey); if(!s.ok()) return s; s=put(b,RDMA_SQ_WQE_RC_REMOTE_VA_WORD_BYTE_OFFSET,RDMA_SQ_WQE_RC_REMOTE_VA_LSB,RDMA_SQ_WQE_RC_REMOTE_VA_WIDTH,ext.remote_addr.value); if(!s.ok()) return s; end
+    begin
+      byte unsigned raw[]; bit [7:0] sig;
+      s = b.serialize(raw); if (!s.ok()) return err(s.message);
+      sig = ~8'h00; foreach (raw[i]) if (i != 16) sig ^= raw[i];
+      foreach (sgb[i]) sig ^= sgb[i];
+      s = put(b, RDMA_SQ_WQE_SIGNATURE_WORD_BYTE_OFFSET,
+              RDMA_SQ_WQE_SIGNATURE_LSB, RDMA_SQ_WQE_SIGNATURE_WIDTH, sig);
+      if (!s.ok()) return s;
+    end
     return rdma_status::success();
   endfunction
 endclass
