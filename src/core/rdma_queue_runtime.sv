@@ -254,7 +254,10 @@ class rdma_queue_runtime extends uvm_object;
   function rdma_status copy_ring_state(rdma_queue_runtime source);
     int unsigned i, limit;
     uvm_object cloned;
-    if (source == null || source.slots == null)
+    // 动态数组不能用 null aggregate 比较；以 source.depth 和实际 size
+    // 同时作为“已配置且有槽位账本”的判据，避免在复制阶段触发越界。
+    if (source == null || source.depth == 0 || source.slots.size() == 0 ||
+        source.slots.size() < source.depth)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "source runtime is null");
     if (source.consumer_index >= depth || source.producer_index >= depth)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "source cursor exceeds resized depth");

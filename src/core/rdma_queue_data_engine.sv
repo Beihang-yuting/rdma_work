@@ -1221,10 +1221,11 @@ class rdma_queue_data_engine extends uvm_object;
                      RDMA_SC_CODEC_ERROR);
         return;
       end
-      status = variable_cqe_codec.set_entry_bytes(cq_attachment.entry_size);
-      if (!status.ok()) return;
+      // The entry size belongs to this attachment/read, so pass it directly
+      // instead of mutating the shared registry codec's active profile.
+      status = variable_cqe_codec.decode_with_entry_bytes(
+        entry_image, cq_attachment.entry_size, decoded_model);
     end
-    status = codec.decode(entry_image, decoded_model);
     if (!status.ok()) return;
     if (!$cast(cqe, decoded_model) || cqe == null)
       begin status = bad("CQE codec returned the wrong model type", RDMA_SC_CODEC_ERROR); return; end

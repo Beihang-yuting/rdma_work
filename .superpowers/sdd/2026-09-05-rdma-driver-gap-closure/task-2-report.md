@@ -31,3 +31,10 @@ Final fix commit: `3c8441f35434ed9a5065085d6cc82ef48529d818` (supersedes `ab1e7d
 - Runtime slot state copy now deep-clones request/image/completion status snapshots.
 - VCS 53 compile completed and simulation entered inline pass but produced no final PASS/FAIL summary before timeout; rerun recommended.
 - Concern/blocker: the existing `rdma_host_mem_api` has allocation but queue backing plans are lifecycle-owned and no safe engine-level API exists to allocate/construct/atomically replace a new CQ backing plan. Current resize creates an independent access wrapper over the lifecycle backing; it does not claim a new mapping allocation. This limitation is intentionally reported rather than misrepresented as fresh backing allocation.
+
+## Round4 补充
+
+- `rdma_hw_cqe_codec` 新增 `decode_with_entry_bytes(image, entry_size, model)` 无状态入口；32/64/128B 解码使用调用方 profile 和独立 qword builder，不读写共享 `active_bytes`。原 `decode()` 仅依据 image 长度转发到该入口。
+- Host-memory submitter 和 CQ poll 路径改为显式传入 attachment 的 entry size，避免共享 registry codec 在交错读请求之间串 profile。
+- `rdma_queue_runtime::copy_ring_state` 增加 source depth/slot ledger 边界检查；resize 测试覆盖 allocation failure 的一次 allocate 调用、authority/mapping 回滚、成功 geometry/mapping 断言以及非法 geometry 不分配。
+- `scripts/run_vcs53.sh core rdma_cqe_size_codec_test`：VCS 编译阶段通过；远端仿真进入 `Starting vcs inline pass...` 后在等待窗口内没有最终 PASS/FAIL 摘要，保留为 concern。

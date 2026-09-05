@@ -658,18 +658,22 @@ class rdma_queue_host_mem_submitter extends uvm_object;
     status = lookup_target(target, entry); if (!status.ok()) return status;
     status = lookup_queue_codec(RDMA_IMAGE_CQE, "cqe", "default", codec);
     if (!status.ok()) return status;
-    begin
-      rdma_hw_cqe_codec cqe_codec;
-      if ($cast(cqe_codec, codec)) begin
-        status = cqe_codec.set_entry_bytes(entry_size);
-        if (!status.ok()) return status;
-      end
-    end
+    // CQE profile is a property of this read transaction, not mutable state
+    // on the shared registry codec.  Decode through the explicit profile API
+    // so interleaved 32/64/128-byte reads cannot observe one another's size.
     status = complete_read_image(entry, offset, entry_size,
                                  RDMA_IMAGE_CQE, codec,
                                  candidate_image);
     if (!status.ok()) return status;
-    status = codec.decode(candidate_image, decoded);
+    begin
+      rdma_hw_cqe_codec cqe_codec;
+      if (!$cast(cqe_codec, codec)) begin
+        model = null; image = null;
+        return codec_error("CQ registry codec cannot select a variable profile");
+      end
+      status = cqe_codec.decode_with_entry_bytes(candidate_image, entry_size,
+                                                 decoded);
+    end
     status = status_or(status, RDMA_SC_CODEC_ERROR,
                        "CQE decode returned null status");
     if (!status.ok() || decoded == null || !$cast(model, decoded)) begin

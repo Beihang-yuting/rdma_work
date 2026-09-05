@@ -1184,21 +1184,68 @@ class rdma_hw_cqe_codec extends rdma_hw_queue_codec_base;
     active_bytes=bytes; return rdma_status::success();
   endfunction
 
-  // 功能：依据 image 长度执行一次 CQE 解码，并在返回前恢复共享 codec 的 profile。
-  // 输入输出及副作用：image 为输入、model 为输出；active_bytes 仅在本次调用期间临时改变。
-  // 失败边界：image 为空或长度不是 32/64/128 时返回 codec 错误，旧 profile 始终恢复。
-  virtual function rdma_status decode(rdma_hw_image image, output rdma_hw_model model);
-    int unsigned saved_bytes;
+  // 功能：按调用方显式提供的 CQE entry profile 解码一份 image，构造独立的
+  // qword builder 并返回 detached CQE model；该路径不读取或写入 active_bytes，
+  // 因而可被共享 registry codec 并发/交错调用而不会串 profile。
+  // 输入输出及副作用：image、entry_size 为输入，model 为输出；函数只读取 image
+  // 字节和 metadata，成功时发布新建 model，不接管 image 或其 backing 所有权。
+  // 失败边界：entry_size 不是 32/64/128、image metadata/代际不匹配、保留位非零、
+  // builder 反序列化失败或字段模型创建失败时返回 CODEC_ERROR，并保持 model=null。
+  virtual function rdma_status decode_with_entry_bytes(
+    rdma_hw_image image,
+    int unsigned entry_size,
+    output rdma_hw_model model
+  );
+    rdma_hw_qword_builder b;
+    byte unsigned p[];
+    rdma_hw_model candidate;
     rdma_status status;
-    saved_bytes = active_bytes;
-    if (image == null || !(image.length inside {32,64,128})) begin
-      model = null;
+
+    model = null;
+    if (!(entry_size inside {32, 64, 128}))
+      return err("CQE profile size is invalid");
+    if (image == null)
+      return err("queue image is null");
+    if (image.function_generation == 0)
+      return rdma_status::make(RDMA_SC_STALE_GENERATION,
+                               "queue image generation is stale");
+    if (image.length != entry_size || image.bytes.size() != entry_size ||
+        image.alignment != entry_size || image.endian != RDMA_ENDIAN_BIG ||
+        image.image_kind != image_kind_expected() ||
+        image.hardware_version != RDMA_HW_VERSION ||
+        image.write_target_kind != RDMA_HW_TARGET_NONE ||
+        image.backing_target.value != 0 || image.hmc_target.value != 0 ||
+        image.bar_target.value != 0)
+      return err("queue image metadata is invalid");
+
+    p = new[entry_size];
+    foreach (p[i]) p[i] = image.bytes[i];
+    b = new("cqe_decode_profile");
+    status = b.deserialize(p);
+    if (!status.ok())
+      return err(status.message);
+    status = check_reserved(b);
+    if (!status.ok())
+      return status;
+    status = decode_fields(b, candidate);
+    if (!status.ok())
+      return status;
+    if (candidate == null)
+      return err("CQE decode returned null model");
+    model = candidate;
+    return rdma_status::success();
+  endfunction
+
+  // 功能：依据 image 自带长度选择本次 CQE profile 并调用无状态解码入口。
+  // 输入输出及副作用：image 为输入、model 为输出；不会改变 active_bytes 或 image，
+  // 成功时发布 detached model。
+  // 失败边界：image 为空或长度不是 32/64/128 时返回 CODEC_ERROR；下游 profile
+  // 校验/字段解码失败时原样传播错误，model 保持为空。
+  virtual function rdma_status decode(rdma_hw_image image, output rdma_hw_model model);
+    model = null;
+    if (image == null || !(image.length inside {32, 64, 128}))
       return rdma_status::make(RDMA_SC_CODEC_ERROR, "CQE image size is invalid");
-    end
-    active_bytes = image.length;
-    status = super.decode(image, model);
-    active_bytes = saved_bytes;
-    return status;
+    return decode_with_entry_bytes(image, int'(image.length), model);
   endfunction
   // 功能：在 rdma_hw_cqe_codec 中，image_kind_expected 返回 profile 固定的镜像字段或长度常量，供编码和断言使用。
   // 输入/输出及副作用：无显式参数；image_kind_expected 返回 CQE codec 固定的 RDMA_IMAGE_CQE 类型，不读取可变对象字段；函数返回 rdma_image_kind_e，不取得调用方资源所有权。
