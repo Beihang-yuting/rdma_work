@@ -1184,25 +1184,6 @@ class rdma_hw_cqe_codec extends rdma_hw_queue_codec_base;
     active_bytes=bytes; return rdma_status::success();
   endfunction
 
-  // 功能：按调用方指定 entry 大小执行无状态 CQE 解码，避免共享 codec profile 串扰。
-  // 输入输出及副作用：image/entry_bytes 为输入，model 为输出；调用结束后恢复原 profile。
-  // 失败边界：entry_bytes 非法、image 长度不符或 decode 失败时返回错误且 model 为空。
-  virtual function rdma_status decode_with_entry_bytes(
-    rdma_hw_image image, int unsigned entry_bytes,
-    output rdma_hw_model model);
-    int unsigned saved_bytes;
-    rdma_status status;
-    model = null;
-    if (image == null || image.length != entry_bytes ||
-        !(entry_bytes inside {32,64,128}))
-      return rdma_status::make(RDMA_SC_CODEC_ERROR, "CQE entry profile mismatch");
-    saved_bytes = active_bytes;
-    active_bytes = entry_bytes;
-    status = super.decode(image, model);
-    active_bytes = saved_bytes;
-    return status;
-  endfunction
-
   // 功能：按调用方显式提供的 CQE entry profile 解码一份 image，构造独立的
   // qword builder 并返回 detached CQE model；该路径不读取或写入 active_bytes，
   // 因而可被共享 registry codec 并发/交错调用而不会串 profile。
@@ -1255,6 +1236,45 @@ class rdma_hw_cqe_codec extends rdma_hw_queue_codec_base;
     return rdma_status::success();
   endfunction
 
+  // 功能：validate_image_with_entry_bytes 按调用方指定的 CQE profile 校验
+  //       image metadata 和保留位，避免共享 codec 的 active_bytes 串扰。
+  // 输入/输出及副作用：image、entry_size 为输入；函数只读取 image 字节并
+  //       构造临时 qword builder，不修改 active_bytes 或外部资源。
+  // 失败/边界：entry_size 非 32/64/128、image metadata 不匹配、反序列化失败
+  //       或保留位非零时返回 CODEC_ERROR；不会发布部分模型。
+  virtual function rdma_status validate_image_with_entry_bytes(
+    rdma_hw_image image,
+    int unsigned entry_size
+  );
+    rdma_hw_qword_builder b;
+    byte unsigned p[];
+    rdma_status status;
+
+    if (!(entry_size inside {32, 64, 128}))
+      return err("CQE profile size is invalid");
+    if (image == null)
+      return err("queue image is null");
+    if (image.function_generation == 0)
+      return rdma_status::make(RDMA_SC_STALE_GENERATION,
+                               "queue image generation is stale");
+    if (image.length != entry_size || image.bytes.size() != entry_size ||
+        image.alignment != entry_size || image.endian != RDMA_ENDIAN_BIG ||
+        image.image_kind != image_kind_expected() ||
+        image.hardware_version != RDMA_HW_VERSION ||
+        image.write_target_kind != RDMA_HW_TARGET_NONE ||
+        image.backing_target.value != 0 || image.hmc_target.value != 0 ||
+        image.bar_target.value != 0)
+      return err("queue image metadata is invalid");
+    p = new[entry_size];
+    foreach (p[i]) p[i] = image.bytes[i];
+    b = new("cqe_validate_profile");
+    status = b.deserialize(p);
+    if (status == null || !status.ok())
+      return err(status == null ? "CQE image deserialize returned null" :
+                 status.message);
+    return check_reserved(b);
+  endfunction
+
   // 功能：依据 image 自带长度选择本次 CQE profile 并调用无状态解码入口。
   // 输入输出及副作用：image 为输入、model 为输出；不会改变 active_bytes 或 image，
   // 成功时发布 detached model。
@@ -1271,13 +1291,17 @@ class rdma_hw_cqe_codec extends rdma_hw_queue_codec_base;
   // 失败/边界：image_kind_expected 是只读访问器，返回 RDMA_IMAGE_CQE；未覆盖枚举沿 default/类型默认分支返回，不改变对象和外部资源。
   protected virtual function rdma_image_kind_e image_kind_expected(); return RDMA_IMAGE_CQE; endfunction
   protected virtual function int unsigned image_bytes(); return active_bytes; endfunction
-  // 功能：check_reserved 校验 b 与当前对象状态的一致性，并显式处理“CQE reserved bits are nonzero”等拒绝条件，返回 rdma_status 供上层决定是否提交。
-  // 输入/输出及副作用：b（输入）；check_reserved 读取 b 并使用字段 s、s.message、x、model；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：check_reserved 是只读访问器，返回 err("CQE reserved bits are nonzero")；未覆盖枚举沿 default/类型默认分支返回，不改变对象和外部资源。
+  // 功能：check_reserved 校验 CQE 三个有效 qword 中的保留位，允许 qword0/1
+  //       已定义字段和 qword2[63:56] signature，其余位必须为零。
+  // 输入/输出及副作用：b 为输入；函数读取序列化 qword 并返回校验状态，不修改
+  //       builder、active_bytes 或任何外部资源。
+  // 失败/边界：builder 少于三个 qword、qword0/1 未定义位非零、qword2[55:0]
+  //       非零或扩展 qword 非零时返回 CODEC_ERROR，调用方不得发布该 CQE。
   protected virtual function rdma_status check_reserved(rdma_hw_qword_builder b);
     bit [63:0] w[];
     b.get_words(w);
-    if (w.size() < 3 || (w[0]&~64'h88ff_ffff_ff03_ffff)!=0)
+    if (w.size() < 3 || (w[0]&~64'h88ff_ffff_ff03_ffff)!=0 ||
+        (w[2]&~64'hff00_0000_0000_0000)!=0)
       return err("CQE reserved bits are nonzero");
     foreach (w[i]) if (i >= 3 && w[i] !== 0)
       return err("CQE reserved words are nonzero");

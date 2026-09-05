@@ -59,6 +59,13 @@ class rdma_queue_host_mem_submitter_test extends uvm_test;
     rdma_sge sge;
     rdma_hw_image image;
     rdma_hw_aeqe_model aeqe;
+    rdma_hw_cqe_model cqe_source;
+    rdma_hw_cqe_model cqe_decoded;
+    rdma_hw_model decoded_model;
+    rdma_hw_cqe_codec cqe_codec;
+    rdma_codec_base cqe_codec_base;
+    int unsigned cqe_sizes[3] = '{32, 64, 128};
+    longint unsigned cqe_offsets[3] = '{0, 64, 128};
     byte unsigned aeqe_bytes[16];
     int unsigned release_calls;
     int unsigned release_calls_after;
@@ -75,7 +82,7 @@ class rdma_queue_host_mem_submitter_test extends uvm_test;
 
     // The submitter must return an opaque target after validating the
     // injected request context and retaining the allocation privately.
-    status = submitter.allocate_target(context, 128, 64,
+    status = submitter.allocate_target(context, 256, 64,
                                        RDMA_DMA_BIDIRECTIONAL, target);
     if (status == null || !status.ok() || target == null)
       `uvm_error("ALLOCATE", "queue host-memory target allocation failed")
@@ -112,6 +119,52 @@ class rdma_queue_host_mem_submitter_test extends uvm_test;
     if (status == null || !status.ok() || aeqe == null || image == null ||
         image.image_kind != RDMA_IMAGE_AEQE)
       `uvm_error("READ_AEQE", "AEQE read selected the wrong 16-byte image kind")
+
+    // CQE reads select the profile per transaction.  Leave the shared
+    // registry codec at 64B after producing all three images, then verify
+    // 32/64/128B reads still validate and decode without shared-state leaks.
+    status = registry.lookup(
+      '{hw_version:"rdma", image_kind:RDMA_IMAGE_CQE,
+        object_type:"cqe", variant:"default", opcode:8'h00},
+      cqe_codec_base);
+    if (status == null || !status.ok() || cqe_codec_base == null ||
+        !$cast(cqe_codec, cqe_codec_base))
+      `uvm_error("CQE_SIZED_CODEC", "CQE codec lookup failed")
+    cqe_source = rdma_hw_cqe_model::type_id::create("sized_cqe_source");
+    cqe_source.qp_h = sqe.qp_h;
+    cqe_source.qpn = 18'h12345;
+    cqe_source.wqe_index = 15'h3456;
+    cqe_source.wqe_wrap = 1'b1;
+    cqe_source.polarity = 1'b1;
+    cqe_source.packet_opcode = 8'h04;
+    cqe_source.payload_len = 32'h40;
+    cqe_source.immediate_data = 32'habcdef01;
+    cqe_source.signature = 16'h1234;
+    foreach (cqe_sizes[i]) begin
+      status = cqe_codec.set_entry_bytes(cqe_sizes[i]);
+      if (status == null || !status.ok()) begin
+        `uvm_error("CQE_SIZED_ENCODE", $sformatf(
+          "CQE profile %0dB setup failed", cqe_sizes[i]))
+        continue;
+      end
+      status = cqe_codec.encode(cqe_source, image);
+      if (status == null || !status.ok() || image == null)
+        `uvm_error("CQE_SIZED_ENCODE", $sformatf(
+          "CQE profile %0dB encode failed", cqe_sizes[i]))
+      else foreach (image.bytes[j])
+        mem.regions[0].data[cqe_offsets[i] + j] = image.bytes[j];
+    end
+    void'(cqe_codec.set_entry_bytes(64));
+    foreach (cqe_sizes[i]) begin
+      decoded_model = null;
+      image = null;
+      status = submitter.read_cqe_sized(target, cqe_offsets[i], cqe_sizes[i],
+                                        cqe_decoded, image);
+      if (status == null || !status.ok() || cqe_decoded == null ||
+          !$cast(decoded_model, cqe_decoded) || cqe_decoded.qpn != 18'h12345)
+        `uvm_error("CQE_SIZED_READ", $sformatf(
+          "CQE profile %0dB read/decode failed", cqe_sizes[i]))
+    end
 
     status = submitter.release_target(target);
     if (status == null || !status.ok())

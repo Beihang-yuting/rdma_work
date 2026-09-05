@@ -44,7 +44,8 @@ package rdma_codec_pkg;
         RDMA_CQE_128B: bytes=RDMA_CQE_128B_BYTES;
         default: bytes=0;
       endcase
-      if ((offset % 16) != 0 || offset + 16 > bytes) bytes=0;
+      if ((offset % 16) != 0 || offset > bytes ||
+          (bytes - offset) < 16) bytes=0;
     endfunction
 
     // 功能：验证 layout 的 profile、字节数和 header 偏移共同描述受支持的 CQE entry。
@@ -58,8 +59,10 @@ package rdma_codec_pkg;
         RDMA_CQE_128B: expected = RDMA_CQE_128B_BYTES;
         default: expected = 0;
       endcase
-      return expected != 0 && bytes == expected &&
-             (header_offset % 16) == 0 && header_offset + 16 <= bytes;
+      if (expected == 0 || bytes != expected ||
+          (header_offset % 16) != 0 || header_offset > bytes)
+        return 1'b0;
+      return (bytes - header_offset) >= 16;
     endfunction
 
     // 功能：按字节数和 header 偏移创建 CQE layout。
@@ -90,7 +93,9 @@ package rdma_codec_pkg;
         RDMA_CQE_128B: result.bytes = RDMA_CQE_128B_BYTES;
         default: result.bytes = 0;
       endcase
-      if ((header % 16) != 0 || header + 16 > result.bytes) result.bytes = 0;
+      if ((header % 16) != 0 || header > result.bytes ||
+          (result.bytes - header) < 16)
+        result.bytes = 0;
       return result;
     endfunction
   endclass

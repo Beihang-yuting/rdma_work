@@ -54,6 +54,17 @@ class rdma_queue_backing_planner extends uvm_object;
     return lhs.same_instance(rhs);
   endfunction
 
+  // 功能：比较两个 DMA route key 的 Host/root/segment/BDF 字段，确认映射仍
+  //       属于同一条 PCIe fabric 路由。
+  // 输入/输出及副作用：lhs/rhs（输入值）；只读比较路由字段，不修改对象或账本。
+  // 失败/边界：任一路由字段不相等时返回 0；该值比较不产生额外状态。
+  protected function bit same_route(rdma_route_key_t lhs,
+                                    rdma_route_key_t rhs);
+    return lhs.host_topology_key == rhs.host_topology_key &&
+           lhs.root_id == rhs.root_id && lhs.segment == rhs.segment &&
+           rdma_bdf_same(lhs.bdf, rhs.bdf);
+  endfunction
+
   // 功能：payload_direction 使用 role 计算并返回 rdma_dma_direction_e 结果；不修改对象字段或外部资源。
   // 输入/输出及副作用：role（输入）；payload_direction 读取 role 并使用输入参数和固定枚举/常量；函数返回 rdma_dma_direction_e，不取得调用方资源所有权。
   // 失败/边界：payload_direction 的结果直接由 return RDMA_DMA_DEVICE_WRITE 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
@@ -364,8 +375,12 @@ class rdma_queue_backing_planner extends uvm_object;
   function rdma_status configure(rdma_host_mem_api host_mem);
     if (host_mem == null)
       return invalid_argument("queue backing planner host memory is null");
+    // engine.configure() may be replayed after a completed recovery.  Reusing
+    // the exact same non-owning Host-memory adapter is idempotent; switching to
+    // another adapter would invalidate outstanding release authority.
     if (this.host_mem != null)
-      return invalid_state("queue backing planner is already configured");
+      return this.host_mem === host_mem ? rdma_status::success() :
+        invalid_state("queue backing planner is already configured");
     this.host_mem = host_mem;
     return rdma_status::success();
   endfunction
@@ -421,14 +436,29 @@ class rdma_queue_backing_planner extends uvm_object;
     return borrowed_overlap_status(preflight.backing_spec);
   endfunction
 
-  // 功能：make_request_context 创建独立的 rdma_status；根据 binding、resource_h、request_context 设置字段 request_context、request_context.function_h、request_context.requester_bdf、request_context.pasid_valid、request_context.pasid、request_context.dma_domain_valid、request_context.dma_domain_id、request_context.owner_h，返回对象仅由调用方持有，不转移外部资源所有权。
-  // 输入/输出及副作用：binding（输入）、resource_h（输入）、request_context（输出）；make_request_context 读取 binding、resource_h、request_context 并使用字段 request_context、request_context.function_h、request_context.requester_bdf、request_context.pasid_valid、request_context.pasid、request_context.dma_domain_valid、request_context.dma_domain_id、request_context.owner_h，并写入 request_context；函数返回 rdma_status，不取得调用方资源所有权。
+  // 功能：make_request_context 创建独立的 DMA 请求快照，并把 Function 的完整
+  //       route/reset epoch authority 一并传给 Host-memory 路由层。
+  // 输入/输出及副作用：binding/resource_h（输入）、request_context（输出）；函数只
+  //       写入新建 context，不转移 Function 或 owner 句柄所有权。
   // 失败/边界：make_request_context 返回 RDMA_SC_RESOURCE_EXHAUSTED；典型拒绝条件为“queue DMA request context creation failed”；失败路径不提交部分状态或转移未声明资源。
   protected function rdma_status make_request_context(
     rdma_function_binding binding,
     rdma_handle resource_h,
     output rdma_dma_request_context request_context
   );
+    rdma_function_identity identity;
+    rdma_status status;
+
+    request_context = null;
+    if (binding == null || resource_h == null)
+      return invalid_argument("queue DMA request input is null");
+    status = normalize_status(binding.validate(),
+                              "queue DMA Function validation returned null");
+    if (!status.ok())
+      return status;
+    identity = binding.function_identity_snapshot();
+    if (identity == null)
+      return invalid_state("queue DMA Function identity snapshot is null");
     request_context = rdma_dma_request_context::type_id::create(
       "queue_backing_request_context"
     );
@@ -441,6 +471,10 @@ class rdma_queue_backing_planner extends uvm_object;
     request_context.pasid = binding.queue_dma.pasid;
     request_context.dma_domain_valid = binding.queue_dma.dma_domain_valid;
     request_context.dma_domain_id = binding.queue_dma.dma_domain_id;
+    request_context.route = identity.route_key();
+    request_context.route_valid = 1'b1;
+    request_context.reset_epoch = identity.reset_epoch;
+    request_context.epoch_valid = 1'b1;
     request_context.owner_h = rdma_clone_handle_value(
       resource_h, "queue DMA resource owner"
     );
@@ -454,6 +488,7 @@ class rdma_queue_backing_planner extends uvm_object;
   // 失败/边界：allocated_mapping_status 返回 RDMA_SC_DMA_TRANSLATION、RDMA_SC_INVALID_ARGUMENT、RDMA_SC_INVALID_STATE；典型拒绝条件为“host allocation returned a null mapping”“allocated queue mapping is too short”；失败路径不提交部分状态或转移未声明资源。
   protected function rdma_status allocated_mapping_status(
     rdma_function_binding binding,
+    rdma_dma_request_context request_context,
     rdma_handle resource_h,
     rdma_dma_mapping mapping,
     longint unsigned length,
@@ -463,7 +498,7 @@ class rdma_queue_backing_planner extends uvm_object;
     rdma_dma_permission_t permissions;
     rdma_status status;
 
-    if (mapping == null)
+    if (mapping == null || request_context == null)
       return invalid_state("host allocation returned a null mapping");
     if (mapping.size < length || mapping.size == 0 ||
         mapping.iova.value > 64'hffff_ffff_ffff_ffff - (length - 1'b1) ||
@@ -476,6 +511,16 @@ class rdma_queue_backing_planner extends uvm_object;
       return invalid_argument("allocated queue mapping is unaligned");
     if (mapping.owner_h == null || !same_handle(mapping.owner_h, resource_h))
       return invalid_state("allocated queue mapping owner is incorrect");
+    if (!request_context.route_valid ||
+        !rdma_route_key_valid(request_context.route) ||
+        !mapping.route_valid || !rdma_route_key_valid(mapping.route) ||
+        !same_route(mapping.route, request_context.route))
+      return rdma_status::make(RDMA_SC_DMA_TRANSLATION,
+                               "allocated queue mapping route is incorrect");
+    if (!request_context.epoch_valid || !mapping.epoch_valid ||
+        mapping.reset_epoch != request_context.reset_epoch)
+      return rdma_status::make(RDMA_SC_STALE_GENERATION,
+                               "allocated queue mapping reset epoch is stale");
     permissions = direction_permissions(direction);
     status = normalize_status(mapping.check_access(
       binding.make_handle(), binding.queue_dma.requester_bdf,
@@ -487,18 +532,23 @@ class rdma_queue_backing_planner extends uvm_object;
   endfunction
 
   // 功能：在 rdma_queue_backing_planner 中，release_acquired_mapping 按 owner、generation 和幂等规则释放/隔离记录，并同步删除其账本引用。
-  // 输入/输出及副作用：mapping（输入）、original_status（输入）；输入 handle/mapping/token 指定释放目标；成功时更新账本和生命周期，外部资源只按 adapter 契约释放。
-  // 失败/边界：release_acquired_mapping 发现 owner/generation 不匹配、记录未知或重复释放时返回错误或幂等结果，不重新激活旧句柄。
+  // 输入/输出及副作用：mapping（输入）、original_status（输入）、opaque（输入）；输入 handle/mapping/token 指定释放目标；成功时更新账本和生命周期，外部资源只按 adapter 契约释放。
+  // 失败/边界：当 mapping 的 public authority 尚未通过校验时必须走 opaque rollback，避免篡改的 route/geometry 令严格 release 找不到底层 allocation；已验证 mapping 仍走严格 release 以保留既有错误注入和审计语义。
   protected function rdma_status release_acquired_mapping(
     rdma_dma_mapping mapping,
-    rdma_status original_status
+    rdma_status original_status,
+    bit opaque = 1'b0
   );
     rdma_status release_status;
 
     if (mapping == null)
       return original_status;
-    release_status = normalize_status(host_mem.\release (mapping),
-                                      "host rollback release returned null");
+    if (opaque)
+      release_status = normalize_status(host_mem.release_opaque(mapping),
+                                        "opaque host rollback release returned null");
+    else
+      release_status = normalize_status(host_mem.\release (mapping),
+                                        "host rollback release returned null");
     if (release_status.ok())
       return original_status;
     return rdma_status::make(release_status.code,
@@ -538,11 +588,16 @@ class rdma_queue_backing_planner extends uvm_object;
       acquired_mapping
     ), "host queue allocation returned null status");
     if (!status.ok())
-      return release_acquired_mapping(acquired_mapping, status);
-    status = allocated_mapping_status(binding, resource_h, acquired_mapping,
+      // A defensive adapter may report failure together with a live mapping;
+      // no public authority was validated, so rollback by opaque identity.
+      return release_acquired_mapping(acquired_mapping, status, 1'b1);
+    status = allocated_mapping_status(binding, request_context, resource_h,
+                                      acquired_mapping,
                                       length, alignment, direction);
     if (!status.ok())
-      return release_acquired_mapping(acquired_mapping, status);
+      // allocated_mapping_status rejected at least one public authority
+      // field; only the adapter's opaque identity is trustworthy now.
+      return release_acquired_mapping(acquired_mapping, status, 1'b1);
 
     // Publish a detached authority snapshot carrying the acquired mapping's
     // checked public geometry.  The snapshot's opaque allocation identity is
@@ -668,7 +723,8 @@ class rdma_queue_backing_planner extends uvm_object;
     status = populate_owned_ring(ring, ref_value);
     if (!status.ok()) begin
       status = rollback_owned_ref(ref_value, status);
-      ref_value = null;
+      if (ref_value.cleanup_complete)
+        ref_value = null;
       ring = null;
       return status;
     end
@@ -676,7 +732,8 @@ class rdma_queue_backing_planner extends uvm_object;
                               "CQ resize backing reference validation returned null");
     if (!status.ok()) begin
       status = rollback_owned_ref(ref_value, status);
-      ref_value = null;
+      if (ref_value.cleanup_complete)
+        ref_value = null;
       ring = null;
       return status;
     end
@@ -684,7 +741,8 @@ class rdma_queue_backing_planner extends uvm_object;
                               "CQ resize ring validation returned null");
     if (!status.ok()) begin
       status = rollback_owned_ref(ref_value, status);
-      ref_value = null;
+      if (ref_value.cleanup_complete)
+        ref_value = null;
       ring = null;
       return status;
     end
@@ -706,9 +764,10 @@ class rdma_queue_backing_planner extends uvm_object;
     if (cleanup_status == null || !cleanup_status.ok() || !complete) begin
       if (cleanup_status == null)
         cleanup_status = invalid_state("CQ resize candidate cleanup returned null");
-      return rdma_status::make(cleanup_status.code,
+      return rdma_status::make(RDMA_SC_RECOVERY_REQUIRED,
         {"CQ resize candidate cleanup failed: ", cleanup_status.message,
-         "; original failure: ", original_status.message});
+         "; original failure: ",
+         original_status == null ? "" : original_status.message});
     end
     return original_status;
   endfunction

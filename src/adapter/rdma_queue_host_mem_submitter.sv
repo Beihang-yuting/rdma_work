@@ -10,9 +10,9 @@
 // own slot selection and doorbells; this adapter deliberately accepts only an
 // opaque allocation capability and a mapping-relative byte offset.
 
-// 功能：在 rdma_queue_host_mem_submitter 中，rdma_hw_host_mem_release 按 owner、generation 和幂等规则释放或清理资源，同时删除相关账本记录。
+// 功能：在 rdma_queue_host_mem_submitter 中，rdma_hw_host_mem_release 按 owner、generation 和幂等规则释放或清理已验证资源，同时删除相关账本记录。
 // 输入/输出及副作用：api（输入）、mapping（输入）；rdma_hw_host_mem_release 读取 api、mapping 并使用字段 rdma_status；函数返回 rdma_status，不取得调用方资源所有权。
-// 失败/边界：rdma_hw_host_mem_release 返回 RDMA_SC_INVALID_STATE；典型拒绝条件为“host memory adapter is null”；失败路径不提交部分状态或转移未声明资源。
+// 失败/边界：rdma_hw_host_mem_release 返回 RDMA_SC_INVALID_STATE；典型拒绝条件为“host memory adapter is null”；调用方必须先完成 release-authority 校验，失败路径不提交部分状态或转移未声明资源。
 function automatic rdma_status rdma_hw_host_mem_release(
     rdma_host_mem_api api,
     rdma_dma_mapping mapping
@@ -21,6 +21,19 @@ function automatic rdma_status rdma_hw_host_mem_release(
       return rdma_status::make(RDMA_SC_INVALID_STATE,
                                "host memory adapter is null");
     return api.\release (mapping);
+  endfunction
+
+// 功能：在 allocate_target 的 immediate-failure 路径中，使用 adapter 内部 opaque allocation identity 回滚尚未登记到 submitter ledger 的 mapping。
+// 输入/输出及副作用：api（输入）、mapping（输入）；rdma_hw_host_mem_rollback 只释放本次 allocate 产生的候选 backing，不修改 submitter ledger。
+// 失败/边界：mapping 的 public route/geometry/owner 可能正是校验失败原因，因此不能依赖严格 release()；api 为空或 opaque token 无效时返回明确错误，由调用方保留原始失败证据。
+function automatic rdma_status rdma_hw_host_mem_rollback(
+    rdma_host_mem_api api,
+    rdma_dma_mapping mapping
+  );
+    if (api == null)
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "host memory adapter is null");
+    return api.release_opaque(mapping);
   endfunction
 
 class rdma_queue_host_mem_target extends uvm_object;
@@ -182,6 +195,25 @@ class rdma_queue_host_mem_submitter extends uvm_object;
         mapping.dma_domain_id != request_ctx.dma_domain_id)
       return rdma_status::make(RDMA_SC_DMA_TRANSLATION,
                                 "DMA mapping domain identity mismatch");
+    // Legacy direct Host-memory callers may omit route/epoch metadata.  Once
+    // either side supplies an authority, however, both copies must be valid
+    // and identical; production planner/router paths always supply both.
+    if (request_ctx.route_valid || mapping.route_valid) begin
+      if (!request_ctx.route_valid || !rdma_route_key_valid(request_ctx.route) ||
+          !mapping.route_valid || !rdma_route_key_valid(mapping.route) ||
+          mapping.route.host_topology_key != request_ctx.route.host_topology_key ||
+          mapping.route.root_id != request_ctx.route.root_id ||
+          mapping.route.segment != request_ctx.route.segment ||
+          !rdma_bdf_same(mapping.route.bdf, request_ctx.route.bdf))
+        return rdma_status::make(RDMA_SC_DMA_TRANSLATION,
+                                  "DMA mapping route identity mismatch");
+    end
+    if (request_ctx.epoch_valid || mapping.epoch_valid) begin
+      if (!request_ctx.epoch_valid || !mapping.epoch_valid ||
+          mapping.reset_epoch != request_ctx.reset_epoch)
+        return rdma_status::make(RDMA_SC_STALE_GENERATION,
+                                  "DMA mapping reset epoch identity mismatch");
+    end
     if (requested_size == 0 || mapping.size != requested_size)
       return rdma_status::make(RDMA_SC_DMA_TRANSLATION,
                                 "DMA mapping size does not match allocation");
@@ -340,6 +372,7 @@ class rdma_queue_host_mem_submitter extends uvm_object;
     byte unsigned image_bytes[];
     rdma_status status;
     rdma_hw_image candidate;
+    rdma_hw_cqe_codec cqe_codec;
 
     image = null;
     status = validate_range(entry, offset, image_length,
@@ -378,7 +411,17 @@ class rdma_queue_host_mem_submitter extends uvm_object;
     image_bytes = new[image_length];
     foreach (image_bytes[i])
       image_bytes[i] = candidate.bytes[i];
-    status = codec.validate_image(candidate);
+    // CQE size is a transaction property.  The registry intentionally shares
+    // one codec object, so validate through its explicit profile API instead
+    // of reading the mutable 64B/32B/128B active profile.
+    if (image_kind == RDMA_IMAGE_CQE) begin
+      if (!$cast(cqe_codec, codec))
+        return codec_error("CQ registry codec cannot validate a variable profile");
+      status = cqe_codec.validate_image_with_entry_bytes(candidate,
+                                                          image_length);
+    end
+    else
+      status = codec.validate_image(candidate);
     status = status_or(status, RDMA_SC_CODEC_ERROR,
                        "queue completion image validation returned null");
     if (!status.ok())
@@ -429,7 +472,7 @@ class rdma_queue_host_mem_submitter extends uvm_object;
       // failure status.  Treat that as a post-allocation failure and make the
       // single cleanup attempt before returning the allocation error.
       if (mapping != null)
-        release_status = rdma_hw_host_mem_release(host_mem, mapping);
+        release_status = rdma_hw_host_mem_rollback(host_mem, mapping);
       return status_or(status, RDMA_SC_DMA_TRANSLATION,
                        "host memory allocation returned null status");
     end
@@ -440,7 +483,7 @@ class rdma_queue_host_mem_submitter extends uvm_object;
     if (!status.ok()) begin
       // An adapter may have returned a mapping with malformed identity.  It
       // is still released exactly once before the failed allocation exits.
-      release_status = rdma_hw_host_mem_release(host_mem, mapping);
+      release_status = rdma_hw_host_mem_rollback(host_mem, mapping);
       if (release_status == null || !release_status.ok())
         return status;
       return status;
@@ -452,12 +495,12 @@ class rdma_queue_host_mem_submitter extends uvm_object;
     if (status.ok() && authority == null)
       status = state_error("DMA mapping authority snapshot returned null");
     if (!status.ok()) begin
-      release_status = rdma_hw_host_mem_release(host_mem, mapping);
+      release_status = rdma_hw_host_mem_rollback(host_mem, mapping);
       return status;
     end
     status = clone_context(request_context, context_snapshot);
     if (!status.ok()) begin
-      release_status = rdma_hw_host_mem_release(host_mem, mapping);
+      release_status = rdma_hw_host_mem_rollback(host_mem, mapping);
       return status;
     end
 
@@ -466,7 +509,7 @@ class rdma_queue_host_mem_submitter extends uvm_object;
     entry = rdma_queue_host_mem_ledger_entry::type_id::create(
       "queue_host_mem_ledger_entry");
     if (candidate == null || entry == null) begin
-      release_status = rdma_hw_host_mem_release(host_mem, mapping);
+      release_status = rdma_hw_host_mem_rollback(host_mem, mapping);
       return rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED,
                                "queue host-memory target creation failed");
     end

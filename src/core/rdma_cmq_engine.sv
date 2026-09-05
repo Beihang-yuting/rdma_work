@@ -98,6 +98,10 @@ class rdma_cmq_engine extends uvm_object;
   protected rdma_cmq_diagnostic diagnostic_fifo[$];
   protected rdma_cmq_completion late_final_fifo[$];
   protected rdma_cmq_diagnostic last_poison;
+  // A candidate mapping whose public authority failed validation must be
+  // retried through the adapter's opaque allocation identity.  This bit is
+  // retained only while the engine is POISONED with unreleased backing.
+  protected bit backing_release_opaque;
   // The fixed CMQ profile API has no separate raw-CQE metadata hook.  A
   // profile therefore owns one endian/hardware-version format across its
   // SQE and CQE images.  Only a scheduler-successful batch may establish
@@ -127,6 +131,7 @@ class rdma_cmq_engine extends uvm_object;
     profile_image_endian = RDMA_ENDIAN_LITTLE;
     profile_hardware_version = 0;
     last_poison = null;
+    backing_release_opaque = 1'b0;
     foreach (slots[i]) begin
       slots[i] = null;
       token_in_use[i] = 1'b0;
@@ -1355,7 +1360,7 @@ class rdma_cmq_engine extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：make_request_context 创建独立的 rdma_status；根据 binding、cmq、pasid_valid、pasid、request_context 设置字段 request_context、request_context.function_h、request_context.requester_bdf、request_context.pasid_valid、request_context.pasid、request_context.dma_domain_valid、request_context.dma_domain_id、request_context.owner_h、status，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 功能：make_request_context 创建独立的 rdma_status；根据 binding、cmq、pasid_valid、pasid、request_context 设置字段 request_context、request_context.function_h、request_context.requester_bdf、request_context.pasid_valid、request_context.pasid、request_context.dma_domain_valid、request_context.dma_domain_id、request_context.route、request_context.reset_epoch、request_context.owner_h、status，返回对象仅由调用方持有，不转移外部资源所有权。
   // 输入/输出及副作用：binding（输入）、cmq（输入）、pasid_valid（输入）、pasid（输入）、request_context（输出）；输入字段被复制到返回值或
   //   output；生成结果与输入隔离，不隐式修改调用方对象。
   // 失败/边界：make_request_context 返回 RDMA_SC_DMA_TRANSLATION；具体拒绝条件包括 “CMQ DMA request context construction failed”；“CMQ DMA Function handle construction failed”；“CMQ DMA request context returned null status”；“CMQ PASID does not match Function queue DMA authority”；失败路径不提交部分状态、不隐式重试，也不转移未声明资源。
@@ -1367,6 +1372,7 @@ class rdma_cmq_engine extends uvm_object;
     output rdma_dma_request_context request_context
   );
     rdma_status status;
+    rdma_function_identity identity;
     request_context = rdma_dma_request_context::type_id::create(
       "cmq_dma_request_context"
     );
@@ -1375,6 +1381,9 @@ class rdma_cmq_engine extends uvm_object;
     request_context.function_h = binding.make_handle();
     if (request_context.function_h == null)
       return invalid_state("CMQ DMA Function handle construction failed");
+    identity = binding.function_identity_snapshot();
+    if (identity == null)
+      return invalid_state("CMQ DMA Function identity snapshot failed");
     if (pasid_valid != binding.queue_dma.pasid_valid ||
         (pasid_valid ? pasid : '0) != binding.queue_dma.pasid)
       return rdma_status::make(
@@ -1386,6 +1395,13 @@ class rdma_cmq_engine extends uvm_object;
     request_context.pasid = binding.queue_dma.pasid;
     request_context.dma_domain_valid = binding.queue_dma.dma_domain_valid;
     request_context.dma_domain_id = binding.queue_dma.dma_domain_id;
+    // Host-memory router 需要完整 fabric route 和 Function reset epoch；
+    // 将 identity 快照投影到 request context，避免 CMQ 走 router 时被当作
+    // 缺少路由/代际证据的请求拒绝。
+    request_context.route = identity.route_key();
+    request_context.route_valid = 1'b1;
+    request_context.reset_epoch = identity.reset_epoch;
+    request_context.epoch_valid = 1'b1;
     request_context.owner_h = rdma_clone_handle_value(
       cmq.handle, "CMQ DMA owner"
     );
@@ -4249,6 +4265,7 @@ class rdma_cmq_engine extends uvm_object;
     diagnostic_fifo.delete();
     late_final_fifo.delete();
     last_poison = null;
+    backing_release_opaque = 1'b0;
     foreach (slots[i]) begin
       slots[i] = null;
       token_in_use[i] = 1'b0;
@@ -4260,28 +4277,38 @@ class rdma_cmq_engine extends uvm_object;
   // 失败/边界：retain_release_authority 仅允许测试/恢复范围内的状态变更；代际或资源不匹配时拒绝并保留原账本。
   protected function void retain_release_authority(
     rdma_dma_mapping retained_mapping,
-    rdma_host_mem_api retained_host_mem
+    rdma_host_mem_api retained_host_mem,
+    bit use_opaque = 1'b0
   );
     rdma_cmq_diagnostic retained_last_poison;
+    rdma_cmq_completion retained_terminal_fifo[$];
 
     retained_last_poison = last_poison;
+    // reset() 可能已经把已发布事务转换为 RESET_CANCELLED，并暂存到
+    // terminal_fifo；此时 backing release 失败，重试仍必须能够交付这些
+    // completion。先保留 FIFO，再清掉其余运行账本，避免清理失败丢失交付权。
+    foreach (terminal_fifo[i])
+      retained_terminal_fifo.push_back(terminal_fifo[i]);
     clear_configuration();
     last_poison = retained_last_poison;
+    foreach (retained_terminal_fifo[i])
+      terminal_fifo.push_back(retained_terminal_fifo[i]);
     if (retained_mapping != null) begin
       backing_mapping = retained_mapping;
       host_mem = retained_host_mem;
+      backing_release_opaque = use_opaque;
     end
     engine_state = RDMA_CMQ_ENGINE_POISONED;
   endfunction
 
   // 功能：在 rdma_cmq_engine 中，rollback_candidate 按 owner、generation 和幂等规则释放/隔离记录，并同步删除其账本引用。
-  // 输入/输出及副作用：candidate_host_mem（输入）、candidate_mapping（输入）、original_failure（输入）；输入 handle/mapping/token
-  //   指定释放目标；成功时更新账本和生命周期，外部资源只按 adapter 契约释放。
-  // 失败/边界：rollback_candidate 发现 owner/generation 不匹配、记录未知或重复释放时返回错误或幂等结果，不重新激活旧句柄。
+  // 输入/输出及副作用：candidate_host_mem（输入）、candidate_mapping（输入）、original_failure（输入）、mapping_validated（输入）；输入 handle/mapping/token 指定释放目标；成功时更新账本和生命周期，外部资源只按 adapter 契约释放。
+  // 失败/边界：mapping_validated 为 0 时只能依赖 opaque allocation identity；验证过 public authority 后才使用严格 release。释放失败会保留相同模式的恢复 authority。
   protected function rdma_status rollback_candidate(
     rdma_host_mem_api candidate_host_mem,
     rdma_dma_mapping candidate_mapping,
-    rdma_status original_failure
+    rdma_status original_failure,
+    bit mapping_validated = 1'b0
   );
     rdma_status release_status;
     rdma_status cleanup_failure;
@@ -4291,14 +4318,18 @@ class rdma_cmq_engine extends uvm_object;
       original_failure = invalid_state("CMQ prepare failed with null status");
     if (candidate_mapping == null)
       return original_failure;
-    release_status = candidate_host_mem.\release (candidate_mapping);
+    if (mapping_validated)
+      release_status = candidate_host_mem.\release (candidate_mapping);
+    else
+      release_status = candidate_host_mem.release_opaque(candidate_mapping);
     if (release_status != null && release_status.ok()) begin
       clear_configuration();
       engine_state = RDMA_CMQ_ENGINE_UNCONFIGURED;
       return original_failure;
     end
     original_message = original_failure.message;
-    retain_release_authority(candidate_mapping, candidate_host_mem);
+    retain_release_authority(candidate_mapping, candidate_host_mem,
+                             !mapping_validated);
     if (release_status == null)
       cleanup_failure = invalid_state(
         {"CMQ prepare rollback release returned null; original failure: ",
@@ -4421,7 +4452,8 @@ class rdma_cmq_engine extends uvm_object;
     if (status == null)
       status = invalid_state("CMQ backing zero-write returned null status");
     if (!status.ok()) begin
-      status = rollback_candidate(host_mem, mapping_candidate, status);
+      status = rollback_candidate(host_mem, mapping_candidate, status,
+                                  1'b1);
       engine_lock.put(1);
       return;
     end
@@ -4430,7 +4462,8 @@ class rdma_cmq_engine extends uvm_object;
     if (status == null)
       status = invalid_state("CMQ runtime construction returned null status");
     if (!status.ok()) begin
-      status = rollback_candidate(host_mem, mapping_candidate, status);
+      status = rollback_candidate(host_mem, mapping_candidate, status,
+                                  1'b1);
       engine_lock.put(1);
       return;
     end
@@ -4441,7 +4474,8 @@ class rdma_cmq_engine extends uvm_object;
     if (!status.ok() || published_runtime == null) begin
       if (status.ok())
         status = invalid_state("CMQ runtime publication returned null");
-      status = rollback_candidate(host_mem, mapping_candidate, status);
+      status = rollback_candidate(host_mem, mapping_candidate, status,
+                                  1'b1);
       engine_lock.put(1);
       return;
     end
@@ -5966,15 +6000,20 @@ class rdma_cmq_engine extends uvm_object;
       engine_lock.put(1);
       return;
     end
-    release_status = host_mem.\release (backing_mapping);
+    if (backing_release_opaque)
+      release_status = host_mem.release_opaque(backing_mapping);
+    else
+      release_status = host_mem.\release (backing_mapping);
     if (release_status == null) begin
-      engine_state = RDMA_CMQ_ENGINE_POISONED;
+      retain_release_authority(backing_mapping, host_mem,
+                               backing_release_opaque);
       status = invalid_state("CMQ reset release returned null status");
       engine_lock.put(1);
       return;
     end
     if (!release_status.ok()) begin
-      engine_state = RDMA_CMQ_ENGINE_POISONED;
+      retain_release_authority(backing_mapping, host_mem,
+                               backing_release_opaque);
       status = release_status;
       engine_lock.put(1);
       return;
@@ -6117,15 +6156,20 @@ class rdma_cmq_engine extends uvm_object;
       engine_lock.put(1);
       return;
     end
-    release_status = host_mem.\release (backing_mapping);
+    if (backing_release_opaque)
+      release_status = host_mem.release_opaque(backing_mapping);
+    else
+      release_status = host_mem.\release (backing_mapping);
     if (release_status == null) begin
-      retain_release_authority(backing_mapping, host_mem);
+      retain_release_authority(backing_mapping, host_mem,
+                               backing_release_opaque);
       status = invalid_state("CMQ shutdown release returned null status");
       engine_lock.put(1);
       return;
     end
     if (!release_status.ok()) begin
-      retain_release_authority(backing_mapping, host_mem);
+      retain_release_authority(backing_mapping, host_mem,
+                               backing_release_opaque);
       status = release_status;
       engine_lock.put(1);
       return;

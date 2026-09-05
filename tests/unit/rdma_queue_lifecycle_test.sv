@@ -42,6 +42,45 @@ class rdma_queue_planner_nth_fail_mem extends rdma_mock_host_mem;
   endfunction
 endclass
 
+// 功能：模拟 Host-memory manager 返回 public route 被篡改、但内部 allocation
+//       token 仍然有效的故障，验证 planner 必须使用 opaque rollback。
+// 输入/输出及副作用：allocate（输入/输出 mapping）；成功分配后只篡改返回
+//       mapping 的 route，不修改 manager 私有 region；release_opaque_calls 记录
+//       planner 选择的回滚入口。
+// 失败/边界：opaque token 无效或重复释放时沿父类返回明确错误；测试不把该
+//       malformed mapping 发布为可用 queue backing。
+class rdma_queue_planner_malformed_mapping_mem extends rdma_mock_host_mem;
+  `uvm_object_utils(rdma_queue_planner_malformed_mapping_mem)
+
+  int unsigned opaque_release_calls;
+
+  function new(string name = "rdma_queue_planner_malformed_mapping_mem");
+    super.new(name);
+    opaque_release_calls = 0;
+  endfunction
+
+  virtual function rdma_status allocate(
+    rdma_dma_request_context request_context,
+    int unsigned size,
+    int unsigned alignment,
+    rdma_dma_direction_e direction,
+    output rdma_dma_mapping mapping
+  );
+    rdma_status status;
+
+    status = super.allocate(request_context, size, alignment, direction,
+                            mapping);
+    if (status != null && status.ok() && mapping != null)
+      mapping.route.root_id++;
+    return status;
+  endfunction
+
+  virtual function rdma_status release_opaque(rdma_dma_mapping mapping);
+    opaque_release_calls++;
+    return super.release_opaque(mapping);
+  endfunction
+endclass
+
 class rdma_queue_planner_snapshot_fail_mapping extends rdma_mock_dma_mapping;
   `uvm_object_utils(rdma_queue_planner_snapshot_fail_mapping)
 
@@ -1940,6 +1979,7 @@ class rdma_queue_lifecycle_test extends uvm_test;
     rdma_queue_backing_planner planner;
     rdma_queue_planner_nth_fail_mem fail_mem;
     rdma_queue_planner_snapshot_fail_mem snapshot_mem;
+    rdma_queue_planner_malformed_mapping_mem malformed_mem;
     rdma_mock_host_mem cleanup_mem;
     rdma_queue_planner_second_release_fail_mem grouped_cleanup_mem;
     rdma_queue_preflight preflight;
@@ -2078,6 +2118,35 @@ class rdma_queue_lifecycle_test extends uvm_test;
         snapshot_mem.live_allocations() != 0)
       `uvm_error("SNAPSHOT_FAILURE",
                  "snapshot failure lost allocation rollback authority")
+
+    // A malformed public route must not make the newly allocated backing
+    // unreachable.  The planner rejects the mapping before publishing a ref,
+    // then asks the adapter to release by opaque allocation identity.
+    malformed_mem =
+      rdma_queue_planner_malformed_mapping_mem::type_id::create(
+        "malformed_mapping_mem"
+      );
+    planner = rdma_queue_backing_planner::type_id::create(
+      "malformed_mapping_planner"
+    );
+    expect_status("MALFORMED_MAPPING_CONFIGURE", planner.configure(
+      malformed_mem), RDMA_SC_OK);
+    preflight = make_planner_preflight(
+      "malformed_mapping_preflight", RDMA_RESOURCE_CEQ,
+      RDMA_QUEUE_BACKING_OWNED
+    );
+    resource_h = make_handle("malformed_mapping_resource", owner,
+                             RDMA_RESOURCE_CEQ, 32'h6007);
+    plan = null;
+    expect_status("MALFORMED_MAPPING_REJECT", planner.materialize(
+      binding, preflight, resource_h, plan), RDMA_SC_DMA_TRANSLATION);
+    if (plan != null ||
+        count_planner_host_calls(malformed_mem, "allocate") != 1 ||
+        count_planner_host_calls(malformed_mem, "release") != 0 ||
+        malformed_mem.opaque_release_calls != 1 ||
+        malformed_mem.live_allocations() != 0)
+      `uvm_error("MALFORMED_MAPPING_ROLLBACK",
+                 "malformed mapping was not released through opaque identity")
 
     // Release failures are retryable.  Once the mapping completion authority
     // reports complete, later cleanup calls do not invoke release again.

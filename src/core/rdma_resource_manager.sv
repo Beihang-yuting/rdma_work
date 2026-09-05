@@ -260,6 +260,13 @@ class rdma_resource_manager extends uvm_object;
     result.pasid = source.pasid;
     result.dma_domain_valid = source.dma_domain_valid;
     result.dma_domain_id = source.dma_domain_id;
+    // Route 与 reset epoch 是 mapping authority 的一部分。若 detached
+    // projection 丢失这两个字段，CQ resize recovery 无法证明旧 backing
+    // 仍属于原 Host/Function，也不能安全执行 opaque cleanup。
+    result.route = source.route;
+    result.route_valid = source.route_valid;
+    result.reset_epoch = source.reset_epoch;
+    result.epoch_valid = source.epoch_valid;
     result.backing_addr = source.backing_addr;
     result.iova = source.iova;
     result.size = source.size;
@@ -284,9 +291,12 @@ class rdma_resource_manager extends uvm_object;
            lhs.generation == rhs.generation;
   endfunction
 
-  // 功能：在 rdma_resource_manager 中由 same_mapping_release_fields 逐字段比较输入值，返回结构、身份或序列化内容是否一致。
-  // 输入/输出及副作用：lhs（输入）、rhs（输入）；比较对象/数组只读；返回 bit 或状态结果，不更新 runtime、账本或外部 adapter。
-  // 失败/边界：same_mapping_release_fields 的任一比较对象为空或类型不符时返回确定的 false/不等结果，不抛出未处理异常。
+  // 功能：在 rdma_resource_manager 中比较释放 authority 的全部值字段，包括
+  //       Function/owner、DMA 参数、完整 Host/root/segment/BDF route 和 reset epoch。
+  // 输入/输出及副作用：lhs/rhs（输入 mapping）；只读比较对象并返回 bit，不更新
+  //       runtime、账本或外部 adapter。
+  // 失败/边界：任一对象为空、route/epoch 有缺失或任一 authority 字段不一致时返回
+  //       0；即使 mapping.state 不同也由调用方决定是否使用该值比较。
   protected function bit same_mapping_release_fields(
     rdma_dma_mapping lhs,
     rdma_dma_mapping rhs
@@ -299,6 +309,13 @@ class rdma_resource_manager extends uvm_object;
            lhs.pasid == rhs.pasid &&
            lhs.dma_domain_valid == rhs.dma_domain_valid &&
            lhs.dma_domain_id == rhs.dma_domain_id &&
+           lhs.route_valid == rhs.route_valid &&
+           lhs.route.host_topology_key == rhs.route.host_topology_key &&
+           lhs.route.root_id == rhs.route.root_id &&
+           lhs.route.segment == rhs.route.segment &&
+           rdma_bdf_same(lhs.route.bdf, rhs.route.bdf) &&
+           lhs.epoch_valid == rhs.epoch_valid &&
+           lhs.reset_epoch == rhs.reset_epoch &&
            lhs.backing_addr.value == rhs.backing_addr.value &&
            lhs.iova.value == rhs.iova.value &&
            lhs.size == rhs.size &&

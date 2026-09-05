@@ -553,7 +553,8 @@ class rdma_mock_host_mem extends rdma_host_mem_api;
   // 输入/输出及副作用：method_name（输入）、status（输入）；fail_next 读取 method_name、status 并使用字段 rdma_status；函数返回 rdma_status，不取得调用方资源所有权。
   // 失败/边界：fail_next 返回 RDMA_SC_INVALID_ARGUMENT；典型拒绝条件为“unknown host memory method”“failure status is null”；失败路径不提交部分状态或转移未声明资源。
   function rdma_status fail_next(string method_name, rdma_status status);
-    if (!(method_name inside {"allocate", "write", "read", "release"}))
+    if (!(method_name inside {"allocate", "write", "read", "release",
+                              "release_opaque"}))
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "unknown host memory method");
     if (status == null)
@@ -742,6 +743,14 @@ class rdma_mock_host_mem extends rdma_host_mem_api;
            candidate.pasid == authority.pasid &&
            candidate.dma_domain_valid == authority.dma_domain_valid &&
            candidate.dma_domain_id == authority.dma_domain_id &&
+           candidate.route_valid == authority.route_valid &&
+           candidate.route.host_topology_key ==
+             authority.route.host_topology_key &&
+           candidate.route.root_id == authority.route.root_id &&
+           candidate.route.segment == authority.route.segment &&
+           rdma_bdf_same(candidate.route.bdf, authority.route.bdf) &&
+           candidate.epoch_valid == authority.epoch_valid &&
+           candidate.reset_epoch == authority.reset_epoch &&
            same_handle(candidate.owner_h, authority.owner_h);
   endfunction
 
@@ -831,6 +840,10 @@ class rdma_mock_host_mem extends rdma_host_mem_api;
     allocated_mapping.pasid = request_context.pasid;
     allocated_mapping.dma_domain_valid = request_context.dma_domain_valid;
     allocated_mapping.dma_domain_id = request_context.dma_domain_id;
+    allocated_mapping.route = request_context.route;
+    allocated_mapping.route_valid = request_context.route_valid;
+    allocated_mapping.reset_epoch = request_context.reset_epoch;
+    allocated_mapping.epoch_valid = request_context.epoch_valid;
     allocated_mapping.backing_addr.value = aligned_address;
     allocated_mapping.iova.value = aligned_address;
     allocated_mapping.size = size;
@@ -1009,6 +1022,65 @@ class rdma_mock_host_mem extends rdma_host_mem_api;
     if (!status.ok())
       return status;
     mapping.state = RDMA_MAPPING_RELEASED;
+    regions[region_index].mapping.state = RDMA_MAPPING_RELEASED;
+    return rdma_status::success();
+  endfunction
+
+  // 功能：release_opaque 仅依据 mock mapping 的不透明 allocation token 查找
+  //       region，模拟真实 adapter 在畸形 public 字段回滚时仍可释放 backing。
+  // 输入/输出及副作用：mapping（输入）；成功时更新 region 和 mapping 的释放状态；
+  //       不使用可篡改的 route、IOVA 或 size 字段定位 allocation。
+  // 失败/边界：mapping 类型错误、token 未登记、region 已释放或 completion seal
+  //       无效时返回错误；不会修改其他 region。
+  virtual function rdma_status release_opaque(rdma_dma_mapping mapping);
+    rdma_mock_dma_mapping concrete_mapping;
+    rdma_mock_dma_mapping region_mapping;
+    rdma_status failure;
+    rdma_status status;
+    int region_index;
+    rdma_queue_backing_role_e role;
+
+    record_call("release_opaque", null, mapping);
+    void'(mapping_role(mapping, role));
+    failure = take_role_failure("release_opaque", role);
+    if (failure != null)
+      return failure;
+    failure = take_failure("release_opaque");
+    if (failure != null)
+      return failure;
+    if (!$cast(concrete_mapping, mapping) || concrete_mapping == null)
+      return rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT,
+        "opaque mock mapping has no allocation token"
+      );
+    region_index = -1;
+    foreach (regions[i]) begin
+      if (!$cast(region_mapping, regions[i].mapping))
+        continue;
+      if (region_mapping.same_allocation(concrete_mapping)) begin
+        region_index = i;
+        break;
+      end
+    end
+    if (region_index < 0)
+      return rdma_status::make(
+        RDMA_SC_DMA_TRANSLATION,
+        "opaque mock mapping is unknown"
+      );
+    if (regions[region_index].mapping.state != RDMA_MAPPING_ACTIVE)
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "opaque mock mapping has already been released"
+      );
+    status = concrete_mapping.mark_release_complete(release_seal);
+    if (status == null)
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "opaque mock release completion returned null"
+      );
+    if (!status.ok())
+      return status;
+    concrete_mapping.state = RDMA_MAPPING_RELEASED;
     regions[region_index].mapping.state = RDMA_MAPPING_RELEASED;
     return rdma_status::success();
   endfunction

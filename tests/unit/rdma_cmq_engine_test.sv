@@ -4513,11 +4513,15 @@ class rdma_cmq_engine_test extends uvm_test;
     rdma_cmq_runtime_desc runtime_desc,
     int unsigned expected_write_count
   );
+    int unsigned release_count;
+
+    release_count = count_host_calls(mem, "release") +
+                    count_host_calls(mem, "release_opaque");
     if (runtime_desc != null)
       `uvm_error(label, "failed prepare published a runtime descriptor")
     if (count_host_calls(mem, "allocate") != 1 ||
         count_host_calls(mem, "write") != expected_write_count ||
-        count_host_calls(mem, "release") != 1)
+        release_count != 1)
       `uvm_error(label,
                  "post-allocation failure did not release exactly once")
     if (mem.regions.size() != 1 || mem.regions[0].mapping == null ||
@@ -4933,7 +4937,8 @@ class rdma_cmq_engine_test extends uvm_test;
     expect_status("SHORT_MAPPING", status, RDMA_SC_INVALID_STATE);
     if (count_host_calls(short_mem, "allocate") != 1 ||
         count_host_calls(short_mem, "write") != 0 ||
-        count_host_calls(short_mem, "release") != 1)
+        count_host_calls(short_mem, "release") +
+          count_host_calls(short_mem, "release_opaque") != 1)
       `uvm_error("SHORT_MAPPING_ROLLBACK",
                  "invalid mapping was not released exactly once")
     expect_unconfigured("SHORT_MAPPING_STATE", engine);

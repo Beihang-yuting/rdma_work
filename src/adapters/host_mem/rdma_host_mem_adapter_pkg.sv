@@ -275,6 +275,10 @@ package rdma_host_mem_adapter_pkg;
       candidate.pasid = pasid;
       candidate.dma_domain_valid = dma_domain_valid;
       candidate.dma_domain_id = dma_domain_id;
+      candidate.route = route;
+      candidate.route_valid = route_valid;
+      candidate.reset_epoch = reset_epoch;
+      candidate.epoch_valid = epoch_valid;
       candidate.backing_addr = backing_addr;
       candidate.iova = iova;
       candidate.size = size;
@@ -418,6 +422,14 @@ package rdma_host_mem_adapter_pkg;
              candidate.pasid == authority.pasid &&
              candidate.dma_domain_valid == authority.dma_domain_valid &&
              candidate.dma_domain_id == authority.dma_domain_id &&
+             candidate.route_valid == authority.route_valid &&
+             candidate.route.host_topology_key ==
+               authority.route.host_topology_key &&
+             candidate.route.root_id == authority.route.root_id &&
+             candidate.route.segment == authority.route.segment &&
+             rdma_bdf_same(candidate.route.bdf, authority.route.bdf) &&
+             candidate.epoch_valid == authority.epoch_valid &&
+             candidate.reset_epoch == authority.reset_epoch &&
              candidate.backing_addr == authority.backing_addr &&
              candidate.iova == authority.iova &&
              candidate.size == authority.size &&
@@ -682,6 +694,10 @@ package rdma_host_mem_adapter_pkg;
       allocated_mapping.pasid = request_context.pasid;
       allocated_mapping.dma_domain_valid = request_context.dma_domain_valid;
       allocated_mapping.dma_domain_id = request_context.dma_domain_id;
+      allocated_mapping.route = request_context.route;
+      allocated_mapping.route_valid = request_context.route_valid;
+      allocated_mapping.reset_epoch = request_context.reset_epoch;
+      allocated_mapping.epoch_valid = request_context.epoch_valid;
       allocated_mapping.backing_addr.value = backing_address;
       allocated_mapping.iova.value = selected_iova;
       allocated_mapping.size = size;
@@ -838,6 +854,58 @@ package rdma_host_mem_adapter_pkg;
       allocations[allocation_index].active = 1'b0;
       allocations[allocation_index].authority.state = RDMA_MAPPING_RELEASED;
       mapping.state = RDMA_MAPPING_RELEASED;
+      return rdma_status::success();
+    endfunction
+
+    // 功能：release_opaque 仅依据 mapping 内部 allocation identity 查找并
+    //       释放 backing，供 router 在 manager 返回畸形 public 字段时回滚。
+    // 输入/输出及副作用：mapping（输入）；成功时更新 adapter allocation ledger、
+    //       backing memory 和 mapping 生命周期；不依赖可变 route/geometry 字段。
+    // 失败/边界：mapping 非本 adapter 类型、token 未登记、已释放或 completion seal
+    //       无效时返回错误；不会按不可信的 backing_addr 再次 free。
+    virtual function rdma_status release_opaque(rdma_dma_mapping mapping);
+      rdma_host_mem_mapping concrete_mapping;
+      rdma_status status;
+      int allocation_index;
+
+      if (!$cast(concrete_mapping, mapping) || concrete_mapping == null)
+        return rdma_status::make(
+          RDMA_SC_INVALID_ARGUMENT,
+          "opaque host mapping has no allocation identity"
+        );
+      allocation_index = -1;
+      foreach (allocations[i]) begin
+        if (allocations[i] != null && allocations[i].authority != null &&
+            allocations[i].authority.same_allocation(concrete_mapping)) begin
+          allocation_index = i;
+          break;
+        end
+      end
+      if (allocation_index < 0)
+        return rdma_status::make(
+          RDMA_SC_DMA_TRANSLATION,
+          "opaque host mapping is not owned by this adapter"
+        );
+      if (!allocations[allocation_index].active)
+        return rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "opaque host mapping has already been released"
+        );
+      status = concrete_mapping.mark_release_complete(release_seal);
+      if (status == null)
+        return rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "opaque host release completion marking returned null"
+        );
+      if (!status.ok())
+        return status;
+      allocations[allocation_index].backing_mem.free(
+        allocations[allocation_index].authority.backing_addr.value,
+        `__FILE__, `__LINE__
+      );
+      allocations[allocation_index].active = 1'b0;
+      allocations[allocation_index].authority.state = RDMA_MAPPING_RELEASED;
+      concrete_mapping.state = RDMA_MAPPING_RELEASED;
       return rdma_status::success();
     endfunction
 

@@ -47,6 +47,10 @@ class rdma_test_host_mgr extends rdma_host_mem_api;
                                  "test owner clone failed");
     end
     mapping.requester_bdf = request_context.requester_bdf;
+    mapping.route = request_context.route;
+    mapping.route_valid = request_context.route_valid;
+    mapping.reset_epoch = request_context.reset_epoch;
+    mapping.epoch_valid = request_context.epoch_valid;
     return rdma_status::success();
   endfunction
 
@@ -81,6 +85,61 @@ class rdma_test_host_mgr extends rdma_host_mem_api;
   // 失败/边界：目标为空、owner/generation 不匹配、仍有未完成引用或已释放时返回错误；不得二次释放。
   function rdma_status \release (rdma_dma_mapping mapping);
     return rdma_status::success();
+  endfunction
+endclass
+
+// 功能：构造一个“分配成功但返回 mapping 路由被篡改”的 Host-memory manager，
+//       用于验证 router 在 public geometry/route 校验失败时仍能通过 opaque
+//       allocation identity 回滚真实 backing。
+// 输入/输出及副作用：继承 mock manager 的真实 allocation ledger；allocate() 只
+//       修改返回给 router 的可变 route，release_opaque() 统计回滚调用次数。
+// 失败/边界：内部 region 保留未篡改的 allocation token；任何依赖 route/size 查找
+//       的普通 release 都不应被用于该故障路径。
+class rdma_malformed_host_mgr extends rdma_mock_host_mem;
+  `uvm_object_utils(rdma_malformed_host_mgr)
+
+  bit corrupt_route;
+  int unsigned opaque_release_calls;
+
+  // 功能：构造可注入 route 畸形返回值的 manager，并清零 opaque release 计数。
+  // 输入/输出及副作用：name（输入）；建立本地故障注入状态，不分配 Host backing。
+  // 失败/边界：默认开启 route 篡改，测试可显式关闭以复用该 fixture。
+  function new(string name = "rdma_malformed_host_mgr");
+    super.new(name);
+    corrupt_route = 1'b1;
+    opaque_release_calls = 0;
+  endfunction
+
+  // 功能：先执行真实 mock allocation，再仅篡改返回 alias 的 route，模拟后端
+  //       发布不可信 public geometry 的错误实现。
+  // 输入/输出及副作用：参数完全转发给父类；成功时更新父类 region ledger，
+  //       并可能修改 output mapping 的 route；返回父类状态。
+  // 失败/边界：父类分配失败或 mapping 为空时不篡改；route key 溢出时按定宽
+  //       算术回绕，router 必须仍以完整 route 比较拒绝。
+  virtual function rdma_status allocate(
+    rdma_dma_request_context request_context,
+    int unsigned size,
+    int unsigned alignment,
+    rdma_dma_direction_e direction,
+    output rdma_dma_mapping mapping
+  );
+    rdma_status status;
+
+    status = super.allocate(request_context, size, alignment, direction,
+                            mapping);
+    if (status != null && status.ok() && mapping != null && corrupt_route)
+      mapping.route.host_topology_key++;
+    return status;
+  endfunction
+
+  // 功能：记录 router 的 opaque rollback 调用，再交由父类按 allocation token
+  //       释放 backing；该计数用于确认异常 mapping 没有泄漏。
+  // 输入/输出及副作用：mapping（输入）；递增 opaque_release_calls，并可能将
+  //       对应 region 标记为 RELEASED；返回父类释放状态。
+  // 失败/边界：mapping/token 无效时仍记录调用，父类返回明确错误且不修改其他 region。
+  virtual function rdma_status release_opaque(rdma_dma_mapping mapping);
+    opaque_release_calls++;
+    return super.release_opaque(mapping);
   endfunction
 endclass
 
@@ -133,6 +192,15 @@ class rdma_host_mem_router_test extends uvm_test;
     rdma_function_handle function_h;
     rdma_handle owner_h;
     rdma_dma_mapping mapping0, mapping1;
+    rdma_host_mem_router detached_router;
+    rdma_mock_host_mem opaque_manager;
+    rdma_malformed_host_mgr malformed_manager;
+    rdma_host_mem_route_entry detached_entry;
+    rdma_host_mem_route_entry malformed_entry;
+    rdma_dma_mapping detached_mapping, detached_authority;
+    rdma_dma_mapping malformed_mapping;
+    rdma_status authority_status;
+    rdma_host_mem_route_entry detached_entries[$];
     byte data[];
     rdma_status status;
 
@@ -193,6 +261,11 @@ class rdma_host_mem_router_test extends uvm_test;
     status = router.read(mapping1, 0, 1, data);
     if (status.code != RDMA_SC_STALE_GENERATION)
       `uvm_error("HOST_ROUTE", "stale Host epoch was not rejected")
+    // Reset cleanup is allowed to drain an otherwise valid old mapping, while
+    // normal read/write access remains blocked by the stale epoch above.
+    status = router.\release (mapping1);
+    if (status == null || !status.ok())
+      `uvm_error("HOST_ROUTE", "stale mapping release was not allowed")
 
     missing_epoch = make_context(0, function_h, owner_h);
     missing_epoch.epoch_valid = 1'b0;
@@ -200,6 +273,66 @@ class rdma_host_mem_router_test extends uvm_test;
                              mapping1);
     if (status.ok())
       `uvm_error("HOST_ROUTE", "DMA request without epoch was accepted")
+
+    // The queue planner stores a detached release-authority snapshot rather
+    // than the manager's original object.  Router lookup must resolve that
+    // opaque capability and release exactly the original allocation.
+    detached_router = rdma_host_mem_router::type_id::create(
+      "detached_router");
+    opaque_manager = rdma_mock_host_mem::type_id::create("opaque_manager");
+    detached_entry = rdma_host_mem_route_entry::type_id::create(
+      "detached_entry");
+    detached_entry.host_topology_key = 0;
+    detached_entry.manager = opaque_manager;
+    detached_entries.push_back(detached_entry);
+    status = detached_router.configure(detached_entries);
+    if (status == null || !status.ok())
+      `uvm_fatal("HOST_ROUTE", "detached router configure failed")
+    status = detached_router.allocate(context0, 16, 4,
+                                      RDMA_DMA_DEVICE_READ,
+                                      detached_mapping);
+    if (status == null || !status.ok() || detached_mapping == null)
+      `uvm_fatal("HOST_ROUTE", "detached router allocation failed")
+    detached_authority = null;
+    authority_status = detached_mapping.snapshot_release_authority(
+      detached_authority);
+    if (authority_status == null || !authority_status.ok() ||
+        detached_authority == null)
+      `uvm_fatal("HOST_ROUTE", "detached release authority snapshot failed")
+    // The planner copies checked public geometry onto the opaque authority;
+    // reproduce that step here before handing it back to the router.
+    detached_authority.copy(detached_mapping);
+    status = detached_router.\release (detached_authority);
+    if (status == null || !status.ok())
+      `uvm_error("HOST_ROUTE", "detached release authority was rejected")
+
+    // manager 返回的 route 畸形时，router 必须先拒绝该 mapping，再通过
+    // opaque allocation identity 回滚底层真实 backing；否则异常路径会泄漏。
+    malformed_manager = rdma_malformed_host_mgr::type_id::create(
+      "malformed_manager");
+    malformed_entry = rdma_host_mem_route_entry::type_id::create(
+      "malformed_entry");
+    malformed_entry.host_topology_key = 0;
+    malformed_entry.manager = malformed_manager;
+    detached_router = rdma_host_mem_router::type_id::create(
+      "malformed_router");
+    detached_entries.delete();
+    detached_entries.push_back(malformed_entry);
+    status = detached_router.configure(detached_entries);
+    if (status == null || !status.ok())
+      `uvm_fatal("HOST_ROUTE", "malformed router configure failed")
+    malformed_mapping = null;
+    status = detached_router.allocate(context0, 64, 8,
+                                      RDMA_DMA_DEVICE_READ,
+                                      malformed_mapping);
+    if (status == null || status.code != RDMA_SC_DMA_TRANSLATION)
+      `uvm_error("HOST_ROUTE", "malformed manager route was accepted")
+    if (malformed_manager.opaque_release_calls != 1)
+      `uvm_error("HOST_ROUTE", $sformatf(
+        "opaque rollback count is %0d, expected one",
+        malformed_manager.opaque_release_calls))
+    if (malformed_manager.live_allocations() != 0)
+      `uvm_error("HOST_ROUTE", "malformed mapping rollback leaked backing")
     phase.drop_objection(this);
   endtask
 endclass

@@ -256,7 +256,7 @@ class rdma_queue_runtime extends uvm_object;
   // 功能：在 rdma_queue_runtime 中，begin_quiesce 建立 resize/删除屏障，把 ACTIVE runtime 切到 QUIESCING，并阻止新的 post/poll reservation。
   // 输入/输出及副作用：无显式参数；begin_quiesce 读取当前 state、pending_operation、used 并更新 state；函数返回 rdma_status，不接管外部资源。
   // 失败/边界：runtime 未 ACTIVE、已有 pending operation 或仍有 used 槽位时返回 RESOURCE_BUSY/INVALID_STATE；失败不改变 state 或账本。
-  function rdma_status begin_quiesce();
+  virtual function rdma_status begin_quiesce();
     rdma_status lock_status;
     lock_status = acquire_lock();
     if (!lock_status.ok()) return lock_status;
@@ -280,7 +280,7 @@ class rdma_queue_runtime extends uvm_object;
   // 功能：在 rdma_queue_runtime 中，restore_active 撤销未提交的 quiesce 屏障，恢复旧 runtime 的 ACTIVE 状态。
   // 输入/输出及副作用：无显式参数；restore_active 读取 state、pending_operation、used 并更新 state；函数返回 rdma_status，不接管外部资源。
   // 失败/边界：仅 QUIESCING 且无 pending/used 的 runtime 可恢复；其它状态返回 INVALID_STATE/RESOURCE_BUSY 且保持原状态。
-  function rdma_status restore_active();
+  virtual function rdma_status restore_active();
     rdma_status lock_status;
     lock_status = acquire_lock();
     if (!lock_status.ok()) return lock_status;
@@ -302,7 +302,7 @@ class rdma_queue_runtime extends uvm_object;
   // 功能：在 rdma_queue_runtime 中，detach_quiesced 在 backing replacement 已提交后使旧 runtime 失效，防止旧 cursor 再访问 Host-memory。
   // 输入/输出及副作用：无显式参数；detach_quiesced 读取 state、pending_operation、used 并更新 state；函数返回 rdma_status，不接管外部资源。
   // 失败/边界：仅 QUIESCING 且无 pending/used 的 runtime 可 detach；重复 detach 或残留工作返回错误并保留原状态。
-  function rdma_status detach_quiesced();
+  virtual function rdma_status detach_quiesced();
     rdma_status lock_status;
     lock_status = acquire_lock();
     if (!lock_status.ok()) return lock_status;

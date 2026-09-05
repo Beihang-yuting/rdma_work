@@ -21,6 +21,8 @@ readonly CORE_TESTS=(
   rdma_queue_data_engine_post_test
   rdma_queue_data_engine_poll_test
   rdma_queue_data_engine_recovery_test
+  rdma_cq_engine_resize_test
+  rdma_cqe_size_codec_test
   rdma_sq_models_test
   # SQ/RQ/CQ/EQ engines share the queue lifecycle build and must run in the
   # same VCS 53 regression so PI/CI, credits and doorbell paths are covered.
@@ -73,12 +75,22 @@ readonly INTEGRATION_TESTS=(
   rdma_reset_coordinator_test
 )
 
+# 这些文件位于 tests/unit/，但只有 RDMA_DPU_INTEGRATION 定义下才会被
+# rdma_unit_test_pkg 注册；单独列出，便于 --list 与 unit 测试发现结果一致，
+# 实际执行仍沿用下面的 integration 循环和 dpu_common 环境。
+readonly UNIT_INTEGRATION_TESTS=(
+  rdma_host_mem_router_test
+  rdma_pcie_router_test
+  rdma_reset_coordinator_test
+)
+
 if [[ ${1-} == "--list" ]]; then
   if [[ $# -ne 1 ]]; then
     echo "Usage: $0 [--list]" >&2
     exit 2
   fi
   printf '%s\n' "${CORE_TESTS[@]}"
+  printf '%s\n' "${UNIT_INTEGRATION_TESTS[@]}"
   exit 0
 fi
 

@@ -41,6 +41,7 @@ class rdma_cqe_size_codec_test extends uvm_test;
     rdma_hw_cqe_codec codec;
     rdma_hw_image images[3];
     rdma_hw_model decoded;
+    rdma_hw_cqe_model decoded_cqe;
     rdma_hw_cqe_model source;
     rdma_function_handle qp_h;
     rdma_status st;
@@ -54,8 +55,8 @@ class rdma_cqe_size_codec_test extends uvm_test;
     qp_h.generation = 7;
     source = rdma_hw_cqe_model::type_id::create("stateless_source");
     source.qp_h = qp_h;
-    source.qpn = 21'h12345;
-    source.wqe_index = 23'h23456;
+    source.qpn = 18'h12345;
+    source.wqe_index = 15'h3456;
     source.wqe_wrap = 1'b1;
     source.rq_cqe = 1'b0;
     source.polarity = 1'b1;
@@ -88,10 +89,74 @@ class rdma_cqe_size_codec_test extends uvm_test;
       st = codec.decode_with_entry_bytes(images[i], sizes[i], decoded);
       if (st == null || !st.ok() || decoded == null)
         `uvm_error("CQE_PROFILE_DECODE", $sformatf("stateless decode failed for %0dB", sizes[i]))
-      else if (!$cast(source, decoded) || source.qpn != 21'h12345 ||
-               source.wqe_index != 23'h23456)
+      else if (!$cast(decoded_cqe, decoded) || decoded_cqe.qpn != 18'h12345 ||
+               decoded_cqe.wqe_index != 15'h3456)
         `uvm_error("CQE_PROFILE_FIELDS", $sformatf("decoded fields changed for %0dB", sizes[i]))
     end
+  endtask
+
+  // 功能：构造含 qword2 保留位的 32B CQE image，确认 codec 不会把签名字段之外的位误当作有效数据。
+  // 输入输出及副作用：仅创建本地 codec、模型和 image，并通过 decode_with_entry_bytes 返回校验状态；不修改共享 registry 或外部资源。
+  // 失败边界：若 qword2[55:0] 任一保留位被接受，或 image/模型准备失败导致无法执行断言，则报告 UVM error。
+  task automatic test_cqe_qword2_reserved_bits_rejected();
+    rdma_hw_cqe_codec codec;
+    rdma_hw_cqe_model source;
+    rdma_hw_image image;
+    rdma_hw_model decoded;
+    rdma_function_handle qp_h;
+    rdma_status st;
+
+    codec = rdma_hw_cqe_codec::type_id::create("qword2_reserved_codec");
+    qp_h = rdma_function_handle::type_id::create("qword2_reserved_qp");
+    qp_h.kind = RDMA_RESOURCE_QP;
+    qp_h.function_uid = 64'h8877_6655_4433_2211;
+    qp_h.object_id = 32'h2000_0002;
+    qp_h.generation = 9;
+    source = rdma_hw_cqe_model::type_id::create("qword2_reserved_source");
+    source.qp_h = qp_h;
+    source.qpn = 18'h12345;
+    source.polarity = 1'b1;
+    st = codec.set_entry_bytes(32);
+    if (st == null || !st.ok()) begin
+      `uvm_error("CQE_RESERVED_SETUP", "failed to select 32B CQE profile")
+      return;
+    end
+    st = codec.encode(source, image);
+    if (st == null || !st.ok() || image == null || image.bytes.size() != 32) begin
+      `uvm_error("CQE_RESERVED_SETUP", "failed to encode baseline CQE image")
+      return;
+    end
+    // qword2[63:56] is the signature; qword2[55:0] is reserved.  Set the
+    // least-significant reserved bit without changing any defined field.
+    image.bytes[23] = image.bytes[23] | 8'h01;
+    decoded = null;
+    st = codec.decode_with_entry_bytes(image, 32, decoded);
+    if (st == null || st.ok())
+      `uvm_error("CQE_RESERVED_QWORD2", "qword2 reserved bit was accepted")
+  endtask
+
+  // 功能：验证极大 header offset 不会因 32 位无符号加法回绕而被误判为合法。
+  // 输入输出及副作用：仅创建本地 layout/image 并检查返回状态，不修改生产资源。
+  // 失败边界：构造函数、for_bytes() 或 encode_cqe() 任一路径接受回绕 offset
+  //       都报告 UVM error，防止后续数组索引越界。
+  task automatic test_cqe_layout_rejects_offset_overflow();
+    rdma_cqe_fields source;
+    rdma_cqe_layout direct_layout;
+    rdma_cqe_layout factory_layout;
+    byte unsigned image[];
+    rdma_status st;
+
+    source = '{qpn:32'h1, wr_id:64'h2, valid:1'b1};
+    direct_layout = new("overflow_layout", RDMA_CQE_32B, 32'hffff_fff0);
+    factory_layout = rdma_cqe_layout::for_bytes(32, 32'hffff_fff0);
+    if (direct_layout == null || direct_layout.valid() ||
+        factory_layout == null || factory_layout.valid())
+      `uvm_error("CQE_OFFSET_OVERFLOW",
+                 "overflowing CQE header offset was accepted")
+    st = rdma_queue_codec::encode_cqe(source, factory_layout, image);
+    if (st == null || st.ok() || image.size() != 0)
+      `uvm_error("CQE_OFFSET_OVERFLOW",
+                 "encode accepted an invalid overflowing layout")
   endtask
 
   // 功能：在 run_phase 中启动 CQE 往返测试并完成 UVM objection 生命周期。
@@ -101,6 +166,8 @@ class rdma_cqe_size_codec_test extends uvm_test;
     phase.raise_objection(this);
     test_cqe_sizes_round_trip();
     test_cqe_decode_profiles_are_stateless();
+    test_cqe_qword2_reserved_bits_rejected();
+    test_cqe_layout_rejects_offset_overflow();
     phase.drop_objection(this);
   endtask
 endclass

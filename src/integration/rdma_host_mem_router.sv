@@ -160,27 +160,68 @@ class rdma_host_mem_router extends rdma_host_mem_api;
     manager_mapping = null;
     status = manager.allocate(request_snapshot, size, alignment, direction,
                               manager_mapping);
-    if (!status.ok())
-      return status;
-    if (manager_mapping == null)
-      return rdma_status::make(RDMA_SC_INVALID_STATE,
-                               "manager returned null mapping");
+    if (status == null || !status.ok()) begin
+      if (status == null)
+        status = rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "Host manager allocation returned null status"
+        );
+      return rollback_manager_mapping(manager, manager_mapping, status);
+    end
+    if (manager_mapping == null) begin
+      // allocate() 的 success 契约要求 output mapping 携带 opaque identity；
+      // 没有 identity 就不存在安全的回滚目标，不能猜测“最近一次 allocation”。
+      // 因此把 success+null 明确报告为 adapter contract violation，并要求
+      // 具体 manager 遵守“success+null 不得遗留 allocation”的接口约束。
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "manager allocation violated success mapping contract"
+      );
+    end
     if (manager_mapping.function_h == null ||
         !manager_mapping.function_h.same_instance(
           request_snapshot.function_h))
-      return rdma_status::make(RDMA_SC_DMA_TRANSLATION,
-                               "manager returned mismatched Function");
+      return rollback_manager_mapping(
+        manager, manager_mapping,
+        rdma_status::make(RDMA_SC_DMA_TRANSLATION,
+                          "manager returned mismatched Function"));
     if ((request_snapshot.owner_h == null) !=
         (manager_mapping.owner_h == null))
-      return rdma_status::make(RDMA_SC_DMA_TRANSLATION,
-                               "manager returned mismatched owner presence");
+      return rollback_manager_mapping(
+        manager, manager_mapping,
+        rdma_status::make(RDMA_SC_DMA_TRANSLATION,
+                          "manager returned mismatched owner presence"));
     if (request_snapshot.owner_h != null &&
         !manager_mapping.owner_h.same_instance(request_snapshot.owner_h))
-      return rdma_status::make(RDMA_SC_DMA_TRANSLATION,
-                               "manager returned mismatched owner");
+      return rollback_manager_mapping(
+        manager, manager_mapping,
+        rdma_status::make(RDMA_SC_DMA_TRANSLATION,
+                          "manager returned mismatched owner"));
     if (manager_mapping.requester_bdf != request_snapshot.requester_bdf)
-      return rdma_status::make(RDMA_SC_DMA_TRANSLATION,
-                               "manager returned mismatched requester BDF");
+      return rollback_manager_mapping(
+        manager, manager_mapping,
+        rdma_status::make(RDMA_SC_DMA_TRANSLATION,
+                          "manager returned mismatched requester BDF"));
+    if (manager_mapping.state != RDMA_MAPPING_ACTIVE ||
+        manager_mapping.size != size ||
+        manager_mapping.direction != direction)
+      return rollback_manager_mapping(
+        manager, manager_mapping,
+        rdma_status::make(RDMA_SC_DMA_TRANSLATION,
+                          "manager returned invalid mapping geometry"));
+    if (!manager_mapping.route_valid ||
+        !rdma_route_key_valid(manager_mapping.route) ||
+        !same_route(manager_mapping.route, request_snapshot.route))
+      return rollback_manager_mapping(
+        manager, manager_mapping,
+        rdma_status::make(RDMA_SC_DMA_TRANSLATION,
+                          "manager returned mismatched route"));
+    if (!manager_mapping.epoch_valid ||
+        manager_mapping.reset_epoch != request_snapshot.reset_epoch)
+      return rollback_manager_mapping(
+        manager, manager_mapping,
+        rdma_status::make(RDMA_SC_STALE_GENERATION,
+                          "manager returned mismatched reset epoch"));
 
     local_host_epoch = m_epochs.exists(host_key) ? m_epochs[host_key] : 0;
     coordinator_host_epoch = (m_reset != null) ?
@@ -191,8 +232,10 @@ class rdma_host_mem_router extends rdma_host_mem_api;
     if (request_snapshot.reset_epoch !=
         epoch_sum(local_host_epoch, coordinator_host_epoch,
                   function_epoch_value, device_epoch_value))
-      return rdma_status::make(RDMA_SC_STALE_GENERATION,
-                               "DMA request reset epoch is stale");
+      return rollback_manager_mapping(
+        manager, manager_mapping,
+        rdma_status::make(RDMA_SC_STALE_GENERATION,
+                          "DMA request reset epoch is stale"));
 
     mapping = manager_mapping;
     // 替换 manager 返回的可变 alias，mapping 的 authority 由 router 自己
@@ -278,6 +321,8 @@ class rdma_host_mem_router extends rdma_host_mem_api;
 
     data.delete();
     index = find_mapping(mapping);
+    // 正常读取仍必须观察当前四维 reset epoch；旧 mapping 的 drain 例外
+    // 只适用于下面的 release()，不能让失效 backing 继续暴露数据。
     status = validate_mapping(mapping, index);
     if (!status.ok())
       return status;
@@ -296,7 +341,9 @@ class rdma_host_mem_router extends rdma_host_mem_api;
     rdma_status status;
 
     index = find_mapping(mapping);
-    status = validate_mapping(mapping, index);
+    // 释放是 reset recovery 的 drain 操作：仍要求 mapping 与旧 ledger
+    // 的 route/identity/epoch 完全一致，但允许当前 reset epoch 已前进。
+    status = validate_mapping(mapping, index, 1'b1);
     if (!status.ok())
       return status;
     manager = m_managers[mapping.route.host_topology_key];
@@ -338,7 +385,8 @@ class rdma_host_mem_router extends rdma_host_mem_api;
 
   protected function rdma_status validate_mapping(
     rdma_dma_mapping mapping,
-    int index
+    int index,
+    bit allow_stale_epoch = 1'b0
   );
     rdma_reset_epoch_t local_host_epoch;
     rdma_reset_epoch_t coordinator_host_epoch;
@@ -387,13 +435,50 @@ class rdma_host_mem_router extends rdma_host_mem_api;
     function_epoch_value = (m_reset != null) ?
       m_reset.function_epoch_uid(m_map_uids[index]) : 0;
     device_epoch_value = (m_reset != null) ? m_reset.device_epoch() : 0;
-    if (local_host_epoch != m_map_local_host_epochs[index] ||
-        coordinator_host_epoch != m_map_host_epochs[index] ||
-        function_epoch_value != m_map_function_epochs[index] ||
-        device_epoch_value != m_map_device_epochs[index])
+    if (!allow_stale_epoch &&
+        (local_host_epoch != m_map_local_host_epochs[index] ||
+         coordinator_host_epoch != m_map_host_epochs[index] ||
+         function_epoch_value != m_map_function_epochs[index] ||
+         device_epoch_value != m_map_device_epochs[index]))
       return rdma_status::make(RDMA_SC_STALE_GENERATION,
                                "DMA mapping reset epoch is stale");
     return rdma_status::success();
+  endfunction
+
+  // 功能：回滚 manager.allocate 已成功但尚未登记到 router ledger 的 mapping，
+  //       避免 authority 校验失败时遗留 Host-memory backing。
+  // 输入/输出及副作用：manager/mapping/original_status 为输入；函数最多调用一次
+  //       manager.release，不修改 router ledger。
+  // 失败/边界：底层释放失败时返回 cleanup 错误并保留原始诊断；mapping 为空时原样返回。
+  protected function rdma_status rollback_manager_mapping(
+    rdma_host_mem_api manager,
+    rdma_dma_mapping mapping,
+    rdma_status original_status
+  );
+    rdma_status cleanup_status;
+
+    if (mapping == null)
+      return original_status;
+    if (manager == null)
+      cleanup_status = null;
+    else
+      // 回滚入口使用 manager 的 opaque identity；mapping 的 public route/geometry
+      // 可能正是导致本次校验失败的篡改字段，不能再依赖严格 release()。
+      cleanup_status = manager.release_opaque(mapping);
+    if (cleanup_status == null || !cleanup_status.ok()) begin
+      if (cleanup_status == null)
+        cleanup_status = rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "Host manager rollback release returned null"
+        );
+      return rdma_status::make(
+        cleanup_status.code,
+        {"Host manager allocation rollback failed: ",
+         cleanup_status.message, "; original failure: ",
+         original_status == null ? "" : original_status.message}
+      );
+    end
+    return original_status;
   endfunction
 
   // 功能：计算四维 epoch 的兼容聚合值，仅用于 mapping 对外字段和旧接口；不会替代逐维校验。
@@ -410,15 +495,32 @@ class rdma_host_mem_router extends rdma_host_mem_api;
            function_epoch_value + device_epoch_value;
   endfunction
 
-  // 功能：按对象身份在 router 自有 mapping 列表中定位 ledger 下标；未找到返回 -1。
-  // 输入/输出及副作用：mapping（输入）；按对象句柄身份在 m_maps 中查找并返回并行 ledger 下标；不
-  //   比较或校验 mapping 字段，也不修改数组。
-  // 失败/边界：mapping 为 null 或不在 m_maps 中时返回 -1；仅返回索引，不释放底层 mapping。
+  // 功能：按对象或 opaque release authority 在 router 自有 mapping 列表中定位 ledger 下标。
+  // 输入/输出及副作用：mapping（输入）；优先按原对象身份查找，随后调用各 manager mapping
+  //       的 authority 等价校验以支持 planner 产生的 detached 快照；不修改数组。
+  // 失败/边界：mapping 为空、未知或匹配多个 allocation 时返回 -1，避免释放歧义资源。
   protected function int find_mapping(rdma_dma_mapping mapping);
-    foreach (m_maps[index])
-      if (m_maps[index] === mapping)
-        return index;
-    return -1;
+    int matched_index;
+    rdma_status authority_status;
+
+    matched_index = -1;
+    if (mapping == null)
+      return matched_index;
+    foreach (m_maps[index]) begin
+      if (m_maps[index] === mapping) begin
+        if (matched_index >= 0)
+          return -1;
+        matched_index = index;
+        continue;
+      end
+      authority_status = m_maps[index].release_authority_status(mapping);
+      if (authority_status != null && authority_status.ok()) begin
+        if (matched_index >= 0)
+          return -1;
+        matched_index = index;
+      end
+    end
+    return matched_index;
   endfunction
 
   // 功能：比较 Host/root/segment/BDF 完整 route key，用于 mapping ledger 一致性校验。

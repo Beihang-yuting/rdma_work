@@ -17,8 +17,10 @@ virtual class rdma_host_mem_api extends uvm_object;
 
   // 功能：在 rdma_host_mem_api 中，allocate 检查容量后预留资源并返回带 owner 证据的句柄/计划；失败时回滚已登记的局部状态。
   // 输入/输出及副作用：request_context（输入）、size（输入）、alignment（输入）、direction（输入）、mapping（输出）；输入请求/句柄定义资源属性；成功时更新账本并通过返回值或
-  //   output 发布新句柄/映射。
+  //   output 发布新句柄/映射，且成功返回时 mapping 必须为非空的 opaque allocation identity。
   // 失败/边界：容量不足、范围非法、重复占用或身份过期时返回错误；失败不得泄漏半分配资源。
+  //   实现若返回 success，则不得保留一个未通过 mapping 暴露的 allocation；success+null
+  //   属于 adapter contract violation，调用方必须拒绝该结果并报告 INVALID_STATE。
   pure virtual function rdma_status allocate(
     rdma_dma_request_context request_context,
     int unsigned size,
@@ -52,4 +54,14 @@ virtual class rdma_host_mem_api extends uvm_object;
   // 输入/输出及副作用：mapping（输入）；输入 handle/mapping/token 指定释放目标；成功时更新账本和生命周期，外部资源只按 adapter 契约释放。
   // 失败/边界：release 发现 owner/generation 不匹配、记录未知或重复释放时返回错误或幂等结果，不重新激活旧句柄。
   pure virtual function rdma_status \release (rdma_dma_mapping mapping);
+
+  // 功能：release_opaque 在调用方发现 public mapping 字段异常时，仍使用
+  //       manager 内部的不透明 allocation identity 完成一次回滚释放。
+  // 输入/输出及副作用：mapping（输入）；成功时释放 manager 所拥有的 backing，
+  //       不依赖调用方可修改的 route/geometry 字段；不改变 router 自身账本。
+  // 失败/边界：默认实现回退到普通 release()，具体 manager 若维护独立 token/identity
+  //       应覆盖本函数；mapping 为空、token 不存在或释放失败时返回明确错误。
+  virtual function rdma_status release_opaque(rdma_dma_mapping mapping);
+    return \release (mapping);
+  endfunction
 endclass

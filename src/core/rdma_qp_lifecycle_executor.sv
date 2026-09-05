@@ -133,7 +133,7 @@ class rdma_qp_lifecycle_executor extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：make_dma_context 创建独立的 rdma_status；根据 binding、qp_h、role、request_context 设置字段 request_context、request_context.function_h、request_context.requester_bdf、request_context.pasid_valid、request_context.pasid、request_context.dma_domain_valid、request_context.dma_domain_id、request_context.owner_h、request_context.queue_role_valid、request_context.queue_role，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 功能：make_dma_context 创建独立的 rdma_status；根据 binding、qp_h、role、request_context 设置字段 request_context、request_context.function_h、request_context.requester_bdf、request_context.pasid_valid、request_context.pasid、request_context.dma_domain_valid、request_context.dma_domain_id、request_context.route、request_context.reset_epoch、request_context.owner_h、request_context.queue_role_valid、request_context.queue_role，返回对象仅由调用方持有，不转移外部资源所有权。
   // 输入/输出及副作用：binding（输入）、qp_h（输入）、role（输入）、request_context（输出）；make_dma_context 读取 binding、qp_h、role、request_context 并使用字段 request_context、request_context.function_h、request_context.requester_bdf、request_context.pasid_valid、request_context.pasid、request_context.dma_domain_valid、request_context.dma_domain_id、request_context.owner_h，并写入 request_context；函数返回 rdma_status，不取得调用方资源所有权。
   // 失败/边界：make_dma_context 返回 RDMA_SC_RESOURCE_EXHAUSTED、RDMA_SC_INVALID_ARGUMENT；典型拒绝条件为“QP DMA context input is null”“QP DMA context allocation failed”；失败路径不提交部分状态或转移未声明资源。
   protected function rdma_status make_dma_context(
@@ -142,6 +142,8 @@ class rdma_qp_lifecycle_executor extends uvm_object;
     rdma_queue_backing_role_e role,
     output rdma_dma_request_context request_context
   );
+    rdma_function_identity identity;
+
     request_context = null;
     if (binding == null || qp_h == null)
       return invalid_argument("QP DMA context input is null");
@@ -152,11 +154,22 @@ class rdma_qp_lifecycle_executor extends uvm_object;
       return rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED,
                                "QP DMA context allocation failed");
     request_context.function_h = binding.make_handle();
+    if (request_context.function_h == null)
+      return invalid_state("QP DMA Function handle construction failed");
+    identity = binding.function_identity_snapshot();
+    if (identity == null)
+      return invalid_state("QP DMA Function identity snapshot failed");
     request_context.requester_bdf = binding.queue_dma.requester_bdf;
     request_context.pasid_valid = binding.queue_dma.pasid_valid;
     request_context.pasid = binding.queue_dma.pasid;
     request_context.dma_domain_valid = binding.queue_dma.dma_domain_valid;
     request_context.dma_domain_id = binding.queue_dma.dma_domain_id;
+    // Host-memory router 校验 route/epoch；这些字段必须来自同一份
+    // Function identity 快照，不能使用默认 route 或隐式 root0。
+    request_context.route = identity.route_key();
+    request_context.route_valid = 1'b1;
+    request_context.reset_epoch = identity.reset_epoch;
+    request_context.epoch_valid = 1'b1;
     request_context.owner_h = rdma_clone_handle_value(qp_h, "QP DMA owner");
     request_context.queue_role_valid = 1'b1;
     request_context.queue_role = int'(role);
