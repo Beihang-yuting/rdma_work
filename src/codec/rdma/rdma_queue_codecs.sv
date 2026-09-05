@@ -1148,10 +1148,19 @@ endclass
 
 class rdma_hw_sqe_ud_codec extends rdma_hw_sqe_rc_codec;
   `uvm_object_utils(rdma_hw_sqe_ud_codec)
+  // 功能：构造 UD SQE codec，复用 RC 基础 builder 与签名状态。
+  // 输入/输出及副作用：name 为输入；仅初始化本地 codec 状态，不取得队列或 DMA 所有权。
+  // 失败/边界：构造不验证请求；调用 encode 时仍会执行完整 UD authority 与 payload 校验。
   function new(string name="rdma_hw_sqe_ud_codec"); super.new(name); endfunction
+  // 功能：校验 UD SQE header 保留位和固定 64B 几何。
+  // 输入/输出及副作用：b 为输入；仅读取 qword，不修改 builder。
+  // 失败/边界：qword 数量非 8 或保留位非零时返回 CODEC_ERROR。
   protected virtual function rdma_status check_reserved(rdma_hw_qword_builder b);
     bit [63:0] w[]; b.get_words(w); if (w.size()!=8 || (w[0] & ~64'hefff_ffff_ffff_ffff)!=0) return err("UD SQE reserved bits are nonzero"); return rdma_status::success();
   endfunction
+    // 功能：编码 UD opcode、目的 QPN/Q_Key、AV 索引、payload 与签名。
+    // 输入/输出及副作用：model 为输入、b 为输出 builder；不拥有外部 AV 或 backing。
+    // 失败/边界：传输扩展、payload 形状、字段范围或 builder overlap 失败时拒绝且不发布镜像。
   protected virtual function rdma_status encode_fields(rdma_hw_model model, rdma_hw_qword_builder b);
     rdma_hw_sqe_model x; rdma_sqe_ud_ext ext; rdma_status s; rdma_sq_payload_mode_e mode; byte unsigned sgb[$]; byte unsigned raw[]; bit [3:0] op; bit [7:0] sig;
     if (!$cast(x,model)) return err("UD SQE model type mismatch");
@@ -1159,8 +1168,8 @@ class rdma_hw_sqe_ud_codec extends rdma_hw_sqe_rc_codec;
     if (!$cast(ext,x.transport_ext)) return err("UD extension type mismatch");
     s=ext.validate(x.opcode); if(!s.ok()) return s;
     s=map_opcode(x.opcode,op); if(!s.ok()) return s;
+    last_hw_opcode = op;
     s=body_and_header(x,b,mode,sgb); if(!s.ok()) return s;
-    s=put(b,RDMA_SQ_WQE_OPCODE_WORD_BYTE_OFFSET,RDMA_SQ_WQE_OPCODE_LSB,RDMA_SQ_WQE_OPCODE_WIDTH,op); if(!s.ok()) return s;
     s=put(b,RDMA_SQ_WQE_UD_DST_QPN_WORD_BYTE_OFFSET,RDMA_SQ_WQE_UD_DST_QPN_LSB,RDMA_SQ_WQE_UD_DST_QPN_WIDTH,ext.destination_qpn); if(!s.ok()) return s;
     s=put(b,RDMA_SQ_WQE_UD_DST_Q_KEY_WORD_BYTE_OFFSET,RDMA_SQ_WQE_UD_DST_Q_KEY_LSB,RDMA_SQ_WQE_UD_DST_Q_KEY_WIDTH,ext.qkey); if(!s.ok()) return s;
     s=put(b,RDMA_SQ_WQE_UD_SRC_ADDR_IDX_WORD_BYTE_OFFSET,RDMA_SQ_WQE_UD_SRC_ADDR_IDX_LSB,RDMA_SQ_WQE_UD_SRC_ADDR_IDX_WIDTH,ext.address_vector_id); if(!s.ok()) return s;
@@ -1172,18 +1181,27 @@ endclass
 
 class rdma_hw_sqe_urc_codec extends rdma_hw_sqe_rc_codec;
   `uvm_object_utils(rdma_hw_sqe_urc_codec)
+  // 功能：构造 URC SQE codec，保留 completion-QP authority 校验状态。
+  // 输入/输出及副作用：name 为输入；仅初始化本地 codec 状态，不接管 completion QP 生命周期。
+  // 失败/边界：无 profile 时由 facade 返回 UNSUPPORTED，codec 仍拒绝缺失 authority。
   function new(string name="rdma_hw_sqe_urc_codec"); super.new(name); endfunction
+  // 功能：校验 URC SQE header 保留位和固定 64B 几何。
+  // 输入/输出及副作用：b 为输入；仅读取 qword，不修改 builder。
+  // 失败/边界：qword 数量非 8 或保留位非零时返回 CODEC_ERROR。
   protected virtual function rdma_status check_reserved(rdma_hw_qword_builder b);
     bit [63:0] w[]; b.get_words(w); if (w.size()!=8 || (w[0] & ~64'hefff_ffff_ffff_ffff)!=0) return err("URC SQE reserved bits are nonzero"); return rdma_status::success();
   endfunction
+    // 功能：编码 URC 目的 QPN、可用远端字段和 complement-XOR signature。
+    // 输入/输出及副作用：model 为输入、b 为输出 builder；completion-QP 仅做 authority 校验。
+    // 失败/边界：缺 completion authority、payload/字段非法或 builder overlap 时返回错误。
   protected virtual function rdma_status encode_fields(rdma_hw_model model, rdma_hw_qword_builder b);
     rdma_hw_sqe_model x; rdma_sqe_urc_ext ext; rdma_status s; rdma_sq_payload_mode_e mode; byte unsigned sgb[$]; bit [3:0] op;
     if (!$cast(x,model)) return err("URC SQE model type mismatch");
     if (x.transport != RDMA_TRANSPORT_URC) return err("URC codec received non-URC SQE");
     if (!$cast(ext,x.transport_ext)) return err("URC extension type mismatch");
     s=ext.validate(x.opcode); if(!s.ok()) return s; s=map_opcode(x.opcode,op); if(!s.ok()) return s;
+    last_hw_opcode = op;
     s=body_and_header(x,b,mode,sgb); if(!s.ok()) return s;
-    s=put(b,RDMA_SQ_WQE_OPCODE_WORD_BYTE_OFFSET,RDMA_SQ_WQE_OPCODE_LSB,RDMA_SQ_WQE_OPCODE_WIDTH,op); if(!s.ok()) return s;
     s=put(b,RDMA_SQ_WQE_UD_DST_QPN_WORD_BYTE_OFFSET,RDMA_SQ_WQE_UD_DST_QPN_LSB,RDMA_SQ_WQE_UD_DST_QPN_WIDTH,ext.destination_qpn); if(!s.ok()) return s;
     if (x.opcode inside {RDMA_WR_RDMA_WRITE,RDMA_WR_WRITE_WITH_IMM,RDMA_WR_RDMA_READ}) begin s=put(b,RDMA_SQ_WQE_RC_REMOTE_KEY_WORD_BYTE_OFFSET,RDMA_SQ_WQE_RC_REMOTE_KEY_LSB,RDMA_SQ_WQE_RC_REMOTE_KEY_WIDTH,ext.rkey); if(!s.ok()) return s; s=put(b,RDMA_SQ_WQE_RC_REMOTE_VA_WORD_BYTE_OFFSET,RDMA_SQ_WQE_RC_REMOTE_VA_LSB,RDMA_SQ_WQE_RC_REMOTE_VA_WIDTH,ext.remote_addr.value); if(!s.ok()) return s; end
     begin

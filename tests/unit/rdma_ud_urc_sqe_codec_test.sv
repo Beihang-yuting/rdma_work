@@ -3,8 +3,17 @@
 // 依赖：rdma_model_pkg、rdma_codec_pkg 与 UVM；不拥有外部 DMA/PCIe 资源。
 class rdma_ud_urc_sqe_codec_test extends uvm_test;
   `uvm_component_utils(rdma_ud_urc_sqe_codec_test)
+  // 功能：构造 focused UD/URC codec 测试组件。
+  // 输入/输出及副作用：name、parent 为输入；建立 UVM 测试节点，不拥有 DUT 资源。
+  // 失败/边界：构造不执行仿真；依赖缺失在 run_phase 中报告。
   function new(string name="rdma_ud_urc_sqe_codec_test", uvm_component parent=null); super.new(name,parent); endfunction
+  // 功能：创建带 Function authority 的 QP 测试句柄。
+  // 输入/输出及副作用：无参数；返回本地句柄快照，不接管资源管理器。
+  // 失败/边界：句柄仅用于 codec 字段校验，不能代表已 attach 的运行时 QP。
   function automatic rdma_handle qp_handle(); rdma_handle h=rdma_handle::type_id::create("qp"); h.kind=RDMA_RESOURCE_QP; h.object_id=1; h.function_uid=64'h1122; h.generation=1; return h; endfunction
+  // 功能：运行 UD SEND_WITH_INV 编解码及关键字段断言。
+  // 输入/输出及副作用：phase 为 UVM 阶段输入；产生错误报告，不修改外部资源。
+  // 失败/边界：编码失败、opcode/QPN/Q_Key/IETH 不匹配时报告 UVM error。
   task run_phase(uvm_phase phase);
     rdma_post_send_req req; byte unsigned image[]; rdma_status s;
     phase.raise_objection(this);
