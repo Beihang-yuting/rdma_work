@@ -12,6 +12,10 @@ class rdma_ud_urc_sqe_codec_test extends uvm_test;
     s=rdma_queue_codec::encode_sqe(req,image);
     if (s==null || !s.ok() || image.size()!=RDMA_WQE_BYTES) `uvm_error("SQE_RED","UD SEND_WITH_INV codec did not encode")
     if (image.size()>3 && image[3] != RDMA_SQ_OPCODE_SEND_WITH_INV) `uvm_error("SQE_OPCODE","UD opcode mismatch")
+    if (image.size() < 12 || {image[8],image[9],image[10],image[11]} != req.invalidate_rkey)
+      `uvm_error("SQE_IETH","invalidate_rkey was not encoded")
+    if (image.size() < 44 || {image[40],image[41],image[42]} != req.destination_qpn[23:0])
+      `uvm_error("SQE_DQPN","destination QPN was not encoded")
     phase.drop_objection(this);
   endtask
 endclass

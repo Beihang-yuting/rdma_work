@@ -12,6 +12,11 @@ class rdma_wqe_extended_opcode_test extends uvm_test;
     s=req.validate(); if (s==null || s.ok()) `uvm_error("EXT_REJECT","UD accepted RC-only fields")
     req.opcode=RDMA_WR_SEND_WITH_INV; req.destination_qpn=1; req.qkey=1; req.address_vector_valid=1; req.address_vector=rdma_address_vector::type_id::create("av"); req.invalidate_rkey=32'h1234; req.payload.delete(); req.payload.push_back(8'h2);
     s=rdma_queue_codec::encode_sqe(req,image); if (s==null || !s.ok()) `uvm_error("EXT_ENCODE","typed SEND_WITH_INV rejected")
+    req.transport=RDMA_TRANSPORT_URC; req.completion_qp_h=h(RDMA_RESOURCE_QP); req.destination_qpn=7;
+    s=rdma_queue_codec::encode_sqe(req,image);
+    if (s==null || s.ok() || s.code != RDMA_SC_UNSUPPORTED_OPCODE)
+      `uvm_error("URC_PROFILE","URC missing completion-QP profile was not explicit")
+    req.completion_qp_h=null; s=req.validate(); if (s==null || s.ok()) `uvm_error("URC_AUTH","URC accepted missing completion QP")
     phase.drop_objection(this);
   endtask
 endclass

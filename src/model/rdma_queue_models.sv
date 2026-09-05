@@ -403,7 +403,7 @@ class rdma_sqe_ud_ext extends rdma_sqe_transport_ext;
   // 输入/输出及副作用：opcode（输入）；validate 读取 opcode 并使用字段 rdma_status、destination_qpn、qkey、address_vector_valid、address_vector；函数返回 rdma_status，不取得调用方资源所有权。
   // 失败/边界：validate 返回 RDMA_SC_UNSUPPORTED_OPCODE、RDMA_SC_INVALID_ARGUMENT；典型拒绝条件为“UD SQE opcode is unsupported”“UD SQE lacks destination QPN, qkey, or AV”；失败路径不提交部分状态或转移未声明资源。
   virtual function rdma_status validate(rdma_work_opcode_e opcode);
-    if (!(opcode inside {RDMA_WR_SEND, RDMA_WR_SEND_WITH_IMM}))
+    if (!(opcode inside {RDMA_WR_SEND, RDMA_WR_SEND_WITH_IMM, RDMA_WR_SEND_WITH_INV}))
       return rdma_status::make(RDMA_SC_UNSUPPORTED_OPCODE,
                                "UD SQE opcode is unsupported");
     if (destination_qpn == 0 || qkey == 0 || !address_vector_valid ||
@@ -426,6 +426,7 @@ class rdma_sqe_urc_ext extends rdma_sqe_transport_ext;
   `uvm_object_utils(rdma_sqe_urc_ext)
 
   bit [23:0] destination_qpn;
+  rdma_handle completion_qp_h;
   rdma_iova_t remote_addr;
   bit [31:0] rkey;
   bit remote_access_valid;
@@ -437,6 +438,7 @@ class rdma_sqe_urc_ext extends rdma_sqe_transport_ext;
   function new(string name = "rdma_sqe_urc_ext");
     super.new(name);
     destination_qpn = '0;
+    completion_qp_h = null;
     remote_addr = '0;
     rkey = '0;
     remote_access_valid = 1'b0;
@@ -453,6 +455,13 @@ class rdma_sqe_urc_ext extends rdma_sqe_transport_ext;
     if (!$cast(rhs_ext, rhs))
       `uvm_fatal("RDMA_COPY_TYPE", "URC SQE extension copy mismatch")
     destination_qpn = rhs_ext.destination_qpn;
+    if (rhs_ext.completion_qp_h == null) completion_qp_h = null;
+    else begin
+      uvm_object cloned_object;
+      cloned_object = rhs_ext.completion_qp_h.clone();
+      if (cloned_object == null || !$cast(completion_qp_h, cloned_object))
+        `uvm_fatal("RDMA_COPY_TYPE", "URC completion QP clone mismatch")
+    end
     remote_addr = rhs_ext.remote_addr;
     rkey = rhs_ext.rkey;
     remote_access_valid = rhs_ext.remote_access_valid;
@@ -470,6 +479,9 @@ class rdma_sqe_urc_ext extends rdma_sqe_transport_ext;
   // 输入/输出及副作用：opcode（输入）；validate 读取 opcode 并使用字段 rdma_status、rkey_valid、destination_qpn、remote_access_valid；函数返回 rdma_status，不取得调用方资源所有权。
   // 失败/边界：validate 返回 RDMA_SC_INVALID_ARGUMENT；典型拒绝条件为“URC local invalidate rkey is absent”“URC SQE destination QPN is zero”；失败路径不提交部分状态或转移未声明资源。
   virtual function rdma_status validate(rdma_work_opcode_e opcode);
+    if (completion_qp_h == null || completion_qp_h.kind != RDMA_RESOURCE_QP)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "URC SQE requires completion QP authority");
     if (opcode == RDMA_WR_LOCAL_INVALIDATE) begin
       if (!rkey_valid)
         return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,

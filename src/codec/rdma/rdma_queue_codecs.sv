@@ -27,45 +27,6 @@ class rdma_queue_codec;
   // 失败/边界：空请求、请求校验失败、未知 transport、authority 不完整或 codec 拒绝 payload 时返回对应 status，image 保持为空。
   extern static function rdma_status encode_sqe(input rdma_post_send_req request,
                                           output byte unsigned image[]);
-/*
-    rdma_hw_sqe_model model;
-    rdma_hw_image encoded;
-    rdma_status status;
-    rdma_sqe_rc_ext rc;
-    rdma_sqe_ud_ext ud;
-    rdma_sqe_urc_ext urc;
-    rdma_hw_queue_codec_base codec;
-    image = new[0];
-    if (request == null)
-      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "SQE request is null");
-    status = request.validate();
-    if (!status.ok()) return status;
-    model = rdma_hw_sqe_model::type_id::create("sqe_request_model");
-    model.transport = request.transport; model.opcode = request.opcode;
-    model.qp_h = request.qp_h; model.wr_id = request.wr_id;
-    model.inline_data = request.inline_data; model.payload = request.payload;
-    model.signaled = request.signaled; model.solicited = request.solicited;
-    model.immediate_data = request.immediate_data; model.remote_va = request.remote_addr;
-    model.rkey = request.rkey; model.invalidate_key = request.invalidate_rkey;
-    model.destination_qpn = request.destination_qpn; model.qkey = request.qkey;
-    model.valid = 1'b1; model.sign_en = 1'b1; model.ce = request.signaled ? 1 : 0;
-    model.se = request.solicited; model.sge_num = request.sges.size();
-    foreach (request.sges[i]) begin
-      rdma_sge sg;
-      if (request.sges[i] == null) return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "SQE SGE is null");
-      sg = rdma_sge::type_id::create($sformatf("sqe_sge_%0d", i)); sg.copy(request.sges[i]); model.sges.push_back(sg);
-    end
-    case (request.transport)
-      RDMA_TRANSPORT_RC: begin rc=rdma_sqe_rc_ext::type_id::create("sqe_rc_ext"); rc.remote_addr=request.remote_addr; rc.rkey=request.rkey; rc.remote_access_valid=request.remote_access_valid; rc.rkey_valid=request.rkey_valid; model.transport_ext=rc; codec=rdma_hw_sqe_rc_codec::type_id::create("sqe_rc_codec"); end
-      RDMA_TRANSPORT_UD: begin ud=rdma_sqe_ud_ext::type_id::create("sqe_ud_ext"); ud.destination_qpn=request.destination_qpn; ud.qkey=request.qkey; ud.address_vector_id=request.address_vector_id; ud.address_vector_valid=request.address_vector_valid; ud.address_vector=request.address_vector; model.transport_ext=ud; codec=rdma_hw_sqe_ud_codec::type_id::create("sqe_ud_codec"); end
-      RDMA_TRANSPORT_URC: begin urc=rdma_sqe_urc_ext::type_id::create("sqe_urc_ext"); urc.destination_qpn=request.destination_qpn; urc.remote_addr=request.remote_addr; urc.rkey=request.rkey; urc.remote_access_valid=request.remote_access_valid; urc.rkey_valid=request.rkey_valid; model.transport_ext=urc; codec=rdma_hw_sqe_urc_codec::type_id::create("sqe_urc_codec"); end
-      default: return rdma_status::make(RDMA_SC_UNSUPPORTED_OPCODE, "SQE transport is unsupported");
-    endcase
-    status = codec.encode(model, encoded);
-    if (!status.ok()) return status;
-    image = new[encoded.bytes.size()]; foreach (image[i]) image[i] = encoded.bytes[i];
-    return rdma_status::success();
-  endfunction */
   // 功能：按 CQE layout 编码公共字段，生成零填充的大端字节镜像。
   // 输入输出及副作用：fields/layout 为输入，image 为输出；成功时 image 长度等于 layout.bytes。
   // 失败边界：layout 无效、header 未按 16B 对齐或输出空间不足时返回 CODEC_ERROR 且 image 为空。
@@ -1485,9 +1446,12 @@ function rdma_status rdma_queue_codec::encode_sqe(
   case(request.transport)
     RDMA_TRANSPORT_RC: begin rc=rdma_sqe_rc_ext::type_id::create("sqe_rc_ext"); rc.remote_addr=request.remote_addr; rc.rkey=request.rkey; rc.remote_access_valid=request.remote_access_valid; rc.rkey_valid=request.rkey_valid; model.transport_ext=rc; codec=rdma_hw_sqe_rc_codec::type_id::create("sqe_rc_codec"); end
     RDMA_TRANSPORT_UD: begin ud=rdma_sqe_ud_ext::type_id::create("sqe_ud_ext"); ud.destination_qpn=request.destination_qpn; ud.qkey=request.qkey; ud.address_vector_id=request.address_vector_id; ud.address_vector_valid=request.address_vector_valid; ud.address_vector=request.address_vector; model.transport_ext=ud; codec=rdma_hw_sqe_ud_codec::type_id::create("sqe_ud_codec"); end
-    RDMA_TRANSPORT_URC: begin urc=rdma_sqe_urc_ext::type_id::create("sqe_urc_ext"); urc.destination_qpn=request.destination_qpn; urc.remote_addr=request.remote_addr; urc.rkey=request.rkey; urc.remote_access_valid=request.remote_access_valid; urc.rkey_valid=request.rkey_valid; model.transport_ext=urc; codec=rdma_hw_sqe_urc_codec::type_id::create("sqe_urc_codec"); end
+    RDMA_TRANSPORT_URC: begin urc=rdma_sqe_urc_ext::type_id::create("sqe_urc_ext"); urc.destination_qpn=request.destination_qpn; urc.remote_addr=request.remote_addr; urc.rkey=request.rkey; urc.remote_access_valid=request.remote_access_valid; urc.rkey_valid=request.rkey_valid; urc.completion_qp_h=request.completion_qp_h; model.transport_ext=urc; codec=rdma_hw_sqe_urc_codec::type_id::create("sqe_urc_codec"); end
     default: return rdma_status::make(RDMA_SC_UNSUPPORTED_OPCODE,"SQE transport is unsupported");
   endcase
+  if (request.transport == RDMA_TRANSPORT_URC)
+    return rdma_status::make(RDMA_SC_UNSUPPORTED_OPCODE,
+                             "URC completion QP has no XTR v1 SQE profile");
   status=codec.encode(model,encoded); if(!status.ok()) return status;
   image=new[encoded.bytes.size()]; foreach(image[i]) image[i]=encoded.bytes[i]; return rdma_status::success();
 endfunction

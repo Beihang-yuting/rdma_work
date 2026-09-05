@@ -1240,6 +1240,11 @@ class rdma_queue_data_engine extends uvm_object;
     model = rdma_hw_sqe_model::type_id::create("queue_sqe");
     model.transport = request.transport; model.qp_h = request.qp_h;
     model.wr_id = request.wr_id; model.opcode = request.opcode;
+    model.inline_data = request.inline_data;
+    model.payload = request.payload;
+    model.immediate_data = request.immediate_data;
+    model.remote_va = request.remote_addr;
+    model.rkey = request.rkey;
     model.signaled = request.signaled; model.solicited = request.solicited;
     model.fence = '0; model.qpn = link.local_qp_id;
     model.qp_sn = 0; model.icos = 0; model.dst_port = 0;
@@ -1279,6 +1284,9 @@ class rdma_queue_data_engine extends uvm_object;
         urc.remote_addr = request.remote_addr; urc.rkey = request.rkey;
         urc.remote_access_valid = request.remote_access_valid;
         urc.rkey_valid = request.rkey_valid; model.transport_ext = urc;
+        if (request.completion_qp_h == null || request.completion_qp_h.kind != RDMA_RESOURCE_QP)
+          return bad("URC completion QP authority is missing");
+        urc.completion_qp_h = request.completion_qp_h;
       end
       default: return bad("SQE transport is unsupported",
                           RDMA_SC_UNSUPPORTED_OPCODE);

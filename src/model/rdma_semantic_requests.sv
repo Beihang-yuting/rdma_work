@@ -88,7 +88,8 @@ function automatic bit rdma_send_opcode_valid_for_transport(
                             RDMA_WR_RDMA_WRITE, RDMA_WR_WRITE_WITH_IMM,
                             RDMA_WR_RDMA_READ, RDMA_WR_ATOMIC_CMP_SWAP,
                             RDMA_WR_ATOMIC_FETCH_ADD,
-                            RDMA_WR_LOCAL_INVALIDATE};
+                            RDMA_WR_LOCAL_INVALIDATE,
+                            RDMA_WR_REG_MR, RDMA_WR_BIND_MW, RDMA_WR_FLUSH};
     RDMA_TRANSPORT_UD:
       return opcode inside {RDMA_WR_SEND, RDMA_WR_SEND_WITH_IMM,
                             RDMA_WR_SEND_WITH_INV};
