@@ -38,3 +38,12 @@ Final fix commit: `3c8441f35434ed9a5065085d6cc82ef48529d818` (supersedes `ab1e7d
 - Host-memory submitter 和 CQ poll 路径改为显式传入 attachment 的 entry size，避免共享 registry codec 在交错读请求之间串 profile。
 - `rdma_queue_runtime::copy_ring_state` 增加 source depth/slot ledger 边界检查；resize 测试覆盖 allocation failure 的一次 allocate 调用、authority/mapping 回滚、成功 geometry/mapping 断言以及非法 geometry 不分配。
 - `scripts/run_vcs53.sh core rdma_cqe_size_codec_test`：VCS 编译阶段通过；远端仿真进入 `Starting vcs inline pass...` 后在等待窗口内没有最终 PASS/FAIL 摘要，保留为 concern。
+
+## Round4b 补充（commit `0adf192`）
+
+- 新增 `src/core/rdma_queue_backing_planner.sv` 的 `allocate_owned_cq_resize_ring`，负责按 CQ depth/CQE profile 计算页对齐 backing、校验 Function capability，并在候选失败时通过 opaque release authority 回滚 mapping。
+- 新增 `src/core/rdma_queue_runtime.sv` 的 `QUIESCING` 状态及 `begin_quiesce`、`restore_active`、`detach_quiesced`；`copy_ring_state` 现在拒绝 occupancy 超过目标深度，并在所有 slot 快照成功后一次性发布游标/账本。
+- 新增 `src/core/rdma_resource_manager.sv` 的 `begin_cq_resize` 与 `replace_active_cq`，对 CQ identity、依赖拓扑、queue-plan 几何和 ACTIVE/QUIESCING 状态执行原子权威校验。
+- `src/core/rdma_queue_data_engine.sv` 增加 planner、resize semaphore 及 dependent-runtime 回滚辅助函数。
+- `git diff --cached --check` 通过；远端 `scripts/run_vcs53.sh core rdma_cq_engine_resize_test` 已解析并重编译全部 11 个 module（显示 `All of 11 modules done`），随后在链接/仿真阶段主动中止，未取得 PASS/FAIL；远端临时目录清理因 `csrc` 非空告警。
+- 未决项：现有 `rdma_queue_data_engine::resize_cq()` 尚未接入上述新分配和 authoritative replacement primitives，仍调用 `clone_for_resize()` 复用旧 mapping。因此本 commit 提供可评审的基础 API，但端到端 fresh-backing resize 尚未完成，不应宣称 resize 已闭环。
