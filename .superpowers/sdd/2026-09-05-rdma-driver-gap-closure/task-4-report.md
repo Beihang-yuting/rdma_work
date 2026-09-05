@@ -26,3 +26,7 @@ Verification rerun on `ubuntu@10.11.10.53` login bash:
 `scripts/run_vcs53.sh core rdma_wqe_extended_opcode_test` — exit 0.
 
 `git diff --check` — passed.
+
+## Reviewer fix round 2
+
+Commit `7477bf3` adds a real 512-byte FWQE-SGB write/readback gate. QP links retain the SQ SGB backing reference and backing-access object; each post uses `cursor.index*512` logical offset, validates 512-byte alignment/range, writes big-endian 16-byte descriptors (or inline bytes, zero padded), and uses `readback()` before any PI/doorbell commit. UD signature now uses complement-XOR polarity matching RC validation; URC emits the same signature logic but returns explicit unsupported status when no profile is available.
