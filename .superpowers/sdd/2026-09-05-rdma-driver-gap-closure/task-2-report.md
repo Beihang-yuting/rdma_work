@@ -22,6 +22,7 @@
 ## Commit
 
 Final fix commit: `3c8441f35434ed9a5065085d6cc82ef48529d818` (supersedes `ab1e7d99498d9d2a04aff3f5c8fe3485638fa7fb`).
+Follow-up profile API fix commit is recorded below.
 
 ## Concerns
 
@@ -29,6 +30,7 @@ Final fix commit: `3c8441f35434ed9a5065085d6cc82ef48529d818` (supersedes `ab1e7d
 - Added sized CQE codec selection through poll and host-memory submitter `read_cqe_sized`.
 - Resize now clones backing access, copies ring cursor/slot state, and updates authoritative CQ resource geometry only after candidate validation succeeds.
 - Runtime slot state copy now deep-clones request/image/completion status snapshots.
+- Added stateless `decode_with_entry_bytes` to prevent shared codec profile contamination across sequential 32/64/128B decodes.
 - VCS 53 compile completed and simulation entered inline pass but produced no final PASS/FAIL summary before timeout; rerun recommended.
 - Concern/blocker: the existing `rdma_host_mem_api` has allocation but queue backing plans are lifecycle-owned and no safe engine-level API exists to allocate/construct/atomically replace a new CQ backing plan. Current resize creates an independent access wrapper over the lifecycle backing; it does not claim a new mapping allocation. This limitation is intentionally reported rather than misrepresented as fresh backing allocation.
 
@@ -56,3 +58,10 @@ Final fix commit: `3c8441f35434ed9a5065085d6cc82ef48529d818` (supersedes `ab1e7d
 - `scripts/run_vcs53.sh core rdma_cq_engine_resize_test`：VCS 53 编译及仿真通过，UVM summary `warning=0 error=0 fatal=0`。
 - `scripts/run_vcs53.sh core rdma_cqe_size_codec_test`：编译通过但既有 CQE profile field 测试产生 `UVM_ERROR=3`（`CQE_PROFILE_FIELDS`）；该失败不涉及本轮 resize 代码，需后续 codec 轮次处理。
 - 未决项：发布后旧 backing cleanup 若底层 adapter 报错，manager/attachment 已切换到新 authority，函数返回 `RDMA_SC_RECOVERY_REQUIRED` 供上层恢复；正常 adapter 路径已验证无泄漏/回滚。
+
+## 后续修复（实现 commits `366a3b19656c4e8e80c4ef1636d8100b18a5239f`、`f8fc517b966b6da3f9b04e1ae6b1399e4e1a4b8c`；最终实现 HEAD `f8fc517`）
+
+- 成功发布后在 detach/cleanup 前立即调用 `restore_cq_dependents`，避免旧 CQ runtime detach 或旧 backing cleanup 失败时依赖 QP/SRQ 永久停留 `QUIESCING`；cleanup 失败仍返回 `RDMA_SC_RECOVERY_REQUIRED`。
+- `rdma_queue_data_engine::query_runtime_state` 提供只读 runtime 状态快照；resize 测试新增对 fixture QP 的 SQ/RQ 依赖 runtime 在成功 resize 后均为 `RDMA_QUEUE_RUNTIME_ACTIVE` 的断言。
+- `git diff --check`：通过。
+- `scripts/run_vcs53.sh core rdma_cq_engine_resize_test`：通过，UVM summary `warning=0 error=0 fatal=0`。

@@ -1184,6 +1184,25 @@ class rdma_hw_cqe_codec extends rdma_hw_queue_codec_base;
     active_bytes=bytes; return rdma_status::success();
   endfunction
 
+  // 功能：按调用方指定 entry 大小执行无状态 CQE 解码，避免共享 codec profile 串扰。
+  // 输入输出及副作用：image/entry_bytes 为输入，model 为输出；调用结束后恢复原 profile。
+  // 失败边界：entry_bytes 非法、image 长度不符或 decode 失败时返回错误且 model 为空。
+  virtual function rdma_status decode_with_entry_bytes(
+    rdma_hw_image image, int unsigned entry_bytes,
+    output rdma_hw_model model);
+    int unsigned saved_bytes;
+    rdma_status status;
+    model = null;
+    if (image == null || image.length != entry_bytes ||
+        !(entry_bytes inside {32,64,128}))
+      return rdma_status::make(RDMA_SC_CODEC_ERROR, "CQE entry profile mismatch");
+    saved_bytes = active_bytes;
+    active_bytes = entry_bytes;
+    status = super.decode(image, model);
+    active_bytes = saved_bytes;
+    return status;
+  endfunction
+
   // 功能：按调用方显式提供的 CQE entry profile 解码一份 image，构造独立的
   // qword builder 并返回 detached CQE model；该路径不读取或写入 active_bytes，
   // 因而可被共享 registry codec 并发/交错调用而不会串 profile。
