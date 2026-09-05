@@ -34,3 +34,5 @@ Commit `7477bf3` adds a real 512-byte FWQE-SGB write/readback gate. QP links ret
 Final review fix `f1bbe20` resolves SGB logical slots across primary and additional backing segments, checks total logical coverage and effective IOVA, and normalizes the `0x80000000` length sentinel to zero in descriptor bytes before writeback/signature coverage.
 
 VCS failure fix `9dfab5a` initializes `last_hw_opcode` before UD/URC payload encoding and removes duplicate opcode writes that caused builder overlap; UD/URC codec and test helpers now have adjacent Chinese three-part comments. Both focused VCS53 tests were rerun and exited 0; `git diff --check` passed.
+
+Follow-up `266a7cc` removes the remaining duplicate UD payload-length write (UD field aliases the RC payload-length qword and builder rejected overlap). Focused VCS53 reruns after this change both exited 0; `git diff --check` passed.
