@@ -1596,6 +1596,7 @@ class rdma_queue_data_engine extends uvm_object;
     rdma_resource authoritative_resource;
     rdma_queue_backing_plan candidate_plan;
     rdma_status status;
+    rdma_status dependent_restore_status;
     rdma_queue_runtime dependents[$];
     string key;
     bit manager_quiesced;
@@ -1792,12 +1793,6 @@ class rdma_queue_data_engine extends uvm_object;
     // 随后 detach 旧 runtime 并释放 control-plane-owned 的旧 mapping。
     key = attachment_key(cq_h, RDMA_QUEUE_RUNTIME_CQ);
     attachments[key] = replacement;
-    status = restore_cq_dependents(dependents);
-    if (!status.ok())
-      return finish_resize(rdma_status::make(
-        RDMA_SC_RECOVERY_REQUIRED,
-        {"CQ resize published but dependent runtime restore failed: ",
-         status.message}));
     status = old_attachment.runtime.detach_quiesced();
     if (!status.ok())
       return finish_resize(rdma_status::make(
@@ -1805,11 +1800,22 @@ class rdma_queue_data_engine extends uvm_object;
         {"CQ resize published but old runtime detach failed: ",
          status.message}));
     status = backing_planner.cleanup_local_role(old_ref, cleanup_complete);
-    if (!status.ok() || !cleanup_complete)
+    if (!status.ok() || !cleanup_complete) begin
+      dependent_restore_status = restore_cq_dependents(dependents);
       return finish_resize(rdma_status::make(
         RDMA_SC_RECOVERY_REQUIRED,
         {"CQ resize published but old backing cleanup failed: ",
-         status == null ? "null status" : status.message}));
+         status == null ? "null status" : status.message,
+         "; dependent restore: ",
+         dependent_restore_status == null ? "null status" :
+         dependent_restore_status.message}));
+    end
+    status = restore_cq_dependents(dependents);
+    if (!status.ok())
+      return finish_resize(rdma_status::make(
+        RDMA_SC_RECOVERY_REQUIRED,
+        {"CQ resize published but dependent runtime restore failed: ",
+         status.message}));
     return finish_resize(rdma_status::success());
   endfunction
 
