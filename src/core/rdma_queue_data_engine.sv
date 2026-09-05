@@ -1398,11 +1398,31 @@ class rdma_queue_data_engine extends uvm_object;
       return bad("SQE SGB backing authority is unavailable", RDMA_SC_INVALID_STATE);
     if (model.sgb_iova.value == 0 || (model.sgb_iova.value & 64'h1ff) != 0)
       return bad("SQE SGB IOVA is not 512-byte aligned", RDMA_SC_DMA_TRANSLATION);
-    if (link.sq_sgb_ref == null || link.sq_sgb_ref.mapping == null ||
-        model.sgb_iova.value != link.sq_sgb_ref.mapping.iova.value +
-          link.sq_sgb_ref.mapping_offset + cursor.index * 512)
+    if (link.sq_sgb_ref == null || link.sq_sgb_ref.mapping == null)
       return bad("SQE SGB IOVA is outside backing authority", RDMA_SC_DMA_TRANSLATION);
     data = new[512]; foreach (data[i]) data[i] = 0;
+    begin
+      longint unsigned logical_offset, covered, effective_iova;
+      bit resolved;
+      logical_offset = cursor.index * 512; covered = link.sq_sgb_ref.length; resolved = 1'b0;
+      if (logical_offset + 512 > covered) begin
+        foreach (link.sq_sgb_ref.additional_segments[k]) covered += link.sq_sgb_ref.additional_segments[k].length;
+      end
+      if (logical_offset + 512 > covered) return bad("SQE SGB slot exceeds logical coverage", RDMA_SC_DMA_TRANSLATION);
+      if (logical_offset < link.sq_sgb_ref.length) effective_iova = link.sq_sgb_ref.mapping.iova.value + link.sq_sgb_ref.mapping_offset + logical_offset;
+      else begin
+        longint unsigned base;
+        base = link.sq_sgb_ref.length;
+        foreach (link.sq_sgb_ref.additional_segments[k]) begin
+          if (!resolved && logical_offset >= base && logical_offset < base + link.sq_sgb_ref.additional_segments[k].length) begin
+            effective_iova = link.sq_sgb_ref.additional_segments[k].mapping.iova.value + link.sq_sgb_ref.additional_segments[k].mapping_offset + (logical_offset-base); resolved = 1'b1;
+          end
+          base += link.sq_sgb_ref.additional_segments[k].length;
+        end
+      end
+      if (!resolved && logical_offset < link.sq_sgb_ref.length) resolved = 1'b1;
+      if (!resolved || model.sgb_iova.value != effective_iova) return bad("SQE SGB IOVA does not resolve to backing slot", RDMA_SC_DMA_TRANSLATION);
+    end
     if (model.inline_data) begin
       if (model.payload.size() > 512) return bad("SQE inline SGB exceeds 512 bytes");
       foreach (model.payload[i]) data[i] = model.payload[i];
@@ -1410,7 +1430,7 @@ class rdma_queue_data_engine extends uvm_object;
       if (model.sges.size() > 32) return bad("SQE SGB descriptor count exceeds 32");
       foreach (model.sges[i]) begin
         if (model.sges[i] == null || model.sges[i].length == 0) return bad("SQE SGB descriptor is invalid");
-        len = model.sges[i].length; key = model.sges[i].lkey; va = model.sges[i].iova.value;
+        len = model.sges[i].length == 32'h8000_0000 ? 0 : model.sges[i].length; key = model.sges[i].lkey; va = model.sges[i].iova.value;
         for (int j=0;j<4;j++) data[i*16+j] = len[31-j*8 -: 8];
         for (int j=0;j<4;j++) data[i*16+4+j] = key[31-j*8 -: 8];
         for (int j=0;j<8;j++) data[i*16+8+j] = va[63-j*8 -: 8];
