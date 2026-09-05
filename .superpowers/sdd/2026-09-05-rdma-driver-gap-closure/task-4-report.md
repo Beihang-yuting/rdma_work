@@ -30,3 +30,5 @@ Verification rerun on `ubuntu@10.11.10.53` login bash:
 ## Reviewer fix round 2
 
 Commit `7477bf3` adds a real 512-byte FWQE-SGB write/readback gate. QP links retain the SQ SGB backing reference and backing-access object; each post uses `cursor.index*512` logical offset, validates 512-byte alignment/range, writes big-endian 16-byte descriptors (or inline bytes, zero padded), and uses `readback()` before any PI/doorbell commit. UD signature now uses complement-XOR polarity matching RC validation; URC emits the same signature logic but returns explicit unsupported status when no profile is available.
+
+Final review fix `f1bbe20` resolves SGB logical slots across primary and additional backing segments, checks total logical coverage and effective IOVA, and normalizes the `0x80000000` length sentinel to zero in descriptor bytes before writeback/signature coverage.
