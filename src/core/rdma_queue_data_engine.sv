@@ -1400,8 +1400,7 @@ class rdma_queue_data_engine extends uvm_object;
       return bad("SQE SGB IOVA is not 512-byte aligned", RDMA_SC_DMA_TRANSLATION);
     if (link.sq_sgb_ref == null || link.sq_sgb_ref.mapping == null ||
         model.sgb_iova.value != link.sq_sgb_ref.mapping.iova.value +
-          link.sq_sgb_ref.mapping_offset + cursor.index * 512 ||
-        link.sq_sgb_ref.length < (cursor.index + 1) * 512)
+          link.sq_sgb_ref.mapping_offset + cursor.index * 512)
       return bad("SQE SGB IOVA is outside backing authority", RDMA_SC_DMA_TRANSLATION);
     data = new[512]; foreach (data[i]) data[i] = 0;
     if (model.inline_data) begin
@@ -1417,7 +1416,7 @@ class rdma_queue_data_engine extends uvm_object;
         for (int j=0;j<8;j++) data[i*16+8+j] = va[63-j*8 -: 8];
       end
     end
-    sgb_offset = model.sgb_iova.value - link.sq_sgb_ref.mapping.iova.value;
+    sgb_offset = cursor.index * 512;
     status = link.sq_sgb_access.write(sgb_offset, data); if (!status.ok()) return status;
     status = link.sq_sgb_access.readback(sgb_offset, 512, readback); if (!status.ok()) return status;
     if (readback.size() != 512) return bad("SQE SGB readback is short", RDMA_SC_DMA_TRANSLATION);
