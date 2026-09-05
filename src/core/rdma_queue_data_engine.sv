@@ -183,6 +183,8 @@ class rdma_queue_data_engine extends uvm_object;
   // 清理记录，使 Function reset 后仍能找到旧代际的 release authority。
   protected rdma_cq_resize_recovery cq_resize_recoveries[string];
   protected bit configured;
+  // Latest detached URC shadow evidence retained for recovery inspection.
+  rdma_queue_txn_evidence last_urc_evidence;
 
   // 功能：构造 rdma_queue_data_engine，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：manager=null；binding=null；host_mem=null；doorbells=null；registry=null；operation_timeout=0；configured=1'b0。
   // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
@@ -195,7 +197,27 @@ class rdma_queue_data_engine extends uvm_object;
       {name, "_backing_planner"});
     resize_lock = new(1);
     attachments.delete(); qp_links.delete(); cq_resize_recoveries.delete();
+    last_urc_evidence = null;
     configured = 1'b0;
+  endfunction
+
+  // 功能：把 CQ flush 产生的 URC shadow 捕获为 queue-data engine 的可恢复事务证据。
+  // 输入/输出及副作用：shadow 为输入；成功时新建并保存 last_urc_evidence 的 detached 快照，不释放或修改外部 runtime。
+  // 失败边界：shadow 为空、authority 无效或 evidence 分配失败时返回错误，既有 evidence 保持不变。
+  function rdma_status capture_urc_shadow_evidence(rdma_cq_shadow_snapshot shadow);
+    rdma_queue_txn_evidence candidate;
+    rdma_status status;
+    if (shadow == null)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "URC CQ shadow evidence is null");
+    candidate = rdma_queue_txn_evidence::type_id::create("urc_shadow_evidence");
+    if (candidate == null)
+      return rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED,
+                               "URC CQ shadow evidence allocation failed");
+    status = candidate.capture_urc_shadow(shadow);
+    if (!status.ok()) return status;
+    last_urc_evidence = candidate;
+    return rdma_status::success();
   endfunction
 
   // 功能：在 rdma_queue_data_engine 中，bad 把错误消息、硬件码或注入故障封装为统一 rdma_status，保留原事务的诊断证据。

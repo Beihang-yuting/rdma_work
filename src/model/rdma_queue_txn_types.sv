@@ -4,6 +4,7 @@
 // 所有权与生命周期：对象只拥有显式创建的值快照；外部资源保存非拥有引用，生命周期由调用方管理。
 
 // 中文说明：rdma_queue_txn_types.sv 定义队列事务的值模型、阶段转换和恢复契约。
+typedef class rdma_cq_shadow_snapshot;
 typedef struct packed {
   int unsigned index;
   bit wrap;
@@ -71,6 +72,11 @@ class rdma_queue_txn_evidence extends uvm_object;
   bit mmio_maybe_submitted;
   bit aborted;
   time created_at;
+  // URC shared-CQ recovery evidence is detached from queue runtime state.
+  int unsigned urc_sq_ci;
+  int unsigned urc_rq_ci;
+  bit [1:0] urc_arm_state;
+  longint unsigned urc_sequence;
   rdma_queue_cq_release_plan release_plan[$];
 
   // 功能：构造 rdma_queue_txn_evidence，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：function_identity=null；queue_h=null；cursor='{default:'0}；next_cursor='{default:'0}；image=null；request_snapshot=null；cqe_snapshot=null；route='0；其余字段按实现默认值初始化。
@@ -82,6 +88,7 @@ class rdma_queue_txn_evidence extends uvm_object;
     request_snapshot = null; cqe_snapshot = null; route = '0;
     failure_status = null; phase = RDMA_QUEUE_TXN_NONE;
     mmio_maybe_submitted = 0; aborted = 0; created_at = 0;
+    urc_sq_ci = 0; urc_rq_ci = 0; urc_arm_state = '0; urc_sequence = 0;
     release_plan.delete();
   endfunction
 
@@ -141,6 +148,10 @@ class rdma_queue_txn_evidence extends uvm_object;
     mmio_maybe_submitted = source.mmio_maybe_submitted;
     aborted = source.aborted;
     created_at = source.created_at;
+    urc_sq_ci = source.urc_sq_ci;
+    urc_rq_ci = source.urc_rq_ci;
+    urc_arm_state = source.urc_arm_state;
+    urc_sequence = source.urc_sequence;
     release_plan.delete();
     foreach (source.release_plan[i]) begin
       if (source.release_plan[i] == null) begin
@@ -153,6 +164,23 @@ class rdma_queue_txn_evidence extends uvm_object;
         release_plan.push_back(plan_copy);
       end
     end
+  endfunction
+
+  // 功能：记录共享 URC CQ 的 SQ/RQ consumer CI、arm state 和 sequence，形成可重放事务证据。
+  // 输入/输出及副作用：shadow 为输入值快照；成功时复制其 authority 游标字段到本 evidence，不修改 shadow 或 queue runtime。
+  // 失败边界：shadow 为空或 validate 失败时返回对应错误，既有 evidence 字段保持不变。
+  function rdma_status capture_urc_shadow(rdma_cq_shadow_snapshot shadow);
+    rdma_status status;
+    if (shadow == null)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "URC CQ shadow is null");
+    status = shadow.validate();
+    if (!status.ok()) return status;
+    urc_sq_ci = shadow.sq_ci;
+    urc_rq_ci = shadow.rq_ci;
+    urc_arm_state = shadow.arm_state;
+    urc_sequence = shadow.\sequence ;
+    return rdma_status::success();
   endfunction
 
   // 功能：在 rdma_queue_txn_evidence 中，advance 推进队列/事务游标或执行对应 I/O，并把结果写回声明的输出参数。

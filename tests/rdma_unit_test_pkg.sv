@@ -77,6 +77,7 @@ package rdma_unit_test_pkg;
   `include "unit/rdma_sq_engine_test.sv"
   `include "unit/rdma_rq_engine_test.sv"
   `include "unit/rdma_cq_engine_test.sv"
+  `include "unit/rdma_cq_shadow_flush_test.sv"
   `include "unit/rdma_eq_engine_test.sv"
   `include "unit/rdma_doorbell_codec_test.sv"
   `include "unit/rdma_qpc_codec_test.sv"
