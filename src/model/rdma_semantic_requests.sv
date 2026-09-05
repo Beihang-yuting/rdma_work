@@ -30,7 +30,11 @@ typedef enum bit [4:0] {
   RDMA_WR_ATOMIC_CMP_SWAP = 5'd5,
   RDMA_WR_ATOMIC_FETCH_ADD= 5'd6,
   RDMA_WR_LOCAL_INVALIDATE= 5'd7,
-  RDMA_WR_RECV            = 5'd8
+  RDMA_WR_RECV            = 5'd8,
+  RDMA_WR_SEND_WITH_INV   = 5'd9,
+  RDMA_WR_REG_MR          = 5'd10,
+  RDMA_WR_BIND_MW         = 5'd11,
+  RDMA_WR_FLUSH           = 5'd12
 } rdma_work_opcode_e;
 
 typedef enum bit [1:0] {
@@ -80,14 +84,17 @@ function automatic bit rdma_send_opcode_valid_for_transport(
   case (transport)
     RDMA_TRANSPORT_RC:
       return opcode inside {RDMA_WR_SEND, RDMA_WR_SEND_WITH_IMM,
+                            RDMA_WR_SEND_WITH_INV,
                             RDMA_WR_RDMA_WRITE, RDMA_WR_WRITE_WITH_IMM,
                             RDMA_WR_RDMA_READ, RDMA_WR_ATOMIC_CMP_SWAP,
                             RDMA_WR_ATOMIC_FETCH_ADD,
                             RDMA_WR_LOCAL_INVALIDATE};
     RDMA_TRANSPORT_UD:
-      return opcode inside {RDMA_WR_SEND, RDMA_WR_SEND_WITH_IMM};
+      return opcode inside {RDMA_WR_SEND, RDMA_WR_SEND_WITH_IMM,
+                            RDMA_WR_SEND_WITH_INV};
     RDMA_TRANSPORT_URC:
       return opcode inside {RDMA_WR_SEND, RDMA_WR_SEND_WITH_IMM,
+                            RDMA_WR_SEND_WITH_INV,
                             RDMA_WR_RDMA_WRITE, RDMA_WR_WRITE_WITH_IMM,
                             RDMA_WR_RDMA_READ,
                             RDMA_WR_LOCAL_INVALIDATE};
@@ -1101,10 +1108,16 @@ class rdma_post_send_req extends rdma_semantic_request;
   bit rkey_valid;
   bit [23:0] destination_qpn;
   bit [31:0] qkey;
+  bit [31:0] invalidate_rkey;
+  rdma_handle completion_qp_h;
+  rdma_handle mr_h;
+  rdma_handle mw_h;
+  rdma_handle authority_h;
   int unsigned address_vector_id;
   rdma_address_vector address_vector;
   bit fence;
   bit address_vector_valid;
+  rdma_iova_t sgb_iova;
   longint unsigned compare_value;
   longint unsigned swap_add_value;
 
@@ -1127,9 +1140,15 @@ class rdma_post_send_req extends rdma_semantic_request;
     rkey_valid = 1'b0;
     destination_qpn = '0;
     qkey = '0;
+    invalidate_rkey = '0;
+    completion_qp_h = null;
+    mr_h = null;
+    mw_h = null;
+    authority_h = null;
     address_vector_id = '0;
     address_vector = null; fence = 0;
     address_vector_valid = 1'b0;
+    sgb_iova = '0;
     compare_value = '0;
     swap_add_value = '0;
   endfunction
@@ -1167,11 +1186,21 @@ class rdma_post_send_req extends rdma_semantic_request;
     rkey_valid = rhs_req.rkey_valid;
     destination_qpn = rhs_req.destination_qpn;
     qkey = rhs_req.qkey;
+    invalidate_rkey = rhs_req.invalidate_rkey;
+    if (rhs_req.completion_qp_h == null) completion_qp_h = null;
+    else begin cloned_object = rhs_req.completion_qp_h.clone(); if (cloned_object == null || !$cast(completion_qp_h, cloned_object)) `uvm_fatal("RDMA_COPY_TYPE", "completion QP clone failure"); end
+    if (rhs_req.mr_h == null) mr_h = null;
+    else begin cloned_object = rhs_req.mr_h.clone(); if (cloned_object == null || !$cast(mr_h, cloned_object)) `uvm_fatal("RDMA_COPY_TYPE", "MR clone failure"); end
+    if (rhs_req.mw_h == null) mw_h = null;
+    else begin cloned_object = rhs_req.mw_h.clone(); if (cloned_object == null || !$cast(mw_h, cloned_object)) `uvm_fatal("RDMA_COPY_TYPE", "MW clone failure"); end
+    if (rhs_req.authority_h == null) authority_h = null;
+    else begin cloned_object = rhs_req.authority_h.clone(); if (cloned_object == null || !$cast(authority_h, cloned_object)) `uvm_fatal("RDMA_COPY_TYPE", "authority clone failure"); end
     address_vector_id = rhs_req.address_vector_id;
     fence = rhs_req.fence;
     if (rhs_req.address_vector == null) address_vector = null;
     else begin cloned_object = rhs_req.address_vector.clone(); if (cloned_object == null || !$cast(address_vector, cloned_object)) `uvm_fatal("RDMA_COPY_TYPE", "AV clone failure"); end
     address_vector_valid = rhs_req.address_vector_valid;
+    sgb_iova = rhs_req.sgb_iova;
     compare_value = rhs_req.compare_value;
     swap_add_value = rhs_req.swap_add_value;
     sges.delete();
@@ -1231,6 +1260,16 @@ class rdma_post_send_req extends rdma_semantic_request;
                                    "read SGE is null or has zero length");
       end
     end
+    else if (opcode inside {RDMA_WR_REG_MR, RDMA_WR_BIND_MW, RDMA_WR_FLUSH}) begin
+      if (sges.size() != 0 || payload.size() != 0 || inline_data)
+        return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "control WQE carries payload");
+      if (opcode == RDMA_WR_REG_MR && (mr_h == null || mr_h.kind != RDMA_RESOURCE_MR))
+        return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "REG_MR requires MR authority");
+      if (opcode == RDMA_WR_BIND_MW && (mw_h == null || mw_h.kind != RDMA_RESOURCE_MW || mr_h == null || mr_h.kind != RDMA_RESOURCE_MR))
+        return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "BIND_MW requires MR/MW authority");
+      if (opcode == RDMA_WR_FLUSH && authority_h == null)
+        return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "FLUSH requires authority");
+    end
     else begin
       if (!inline_data && sges.size() == 0)
         return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
@@ -1255,6 +1294,14 @@ class rdma_post_send_req extends rdma_semantic_request;
         (destination_qpn == 0 || qkey == 0 || !address_vector_valid))
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "UD send lacks destination QPN, qkey, or AV");
+    if (transport == RDMA_TRANSPORT_UD &&
+        (remote_access_valid || rkey_valid || remote_addr.value != 0))
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "UD send carries RC-only remote fields");
+    if (transport == RDMA_TRANSPORT_URC &&
+        (completion_qp_h == null || completion_qp_h.kind != RDMA_RESOURCE_QP))
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "URC send requires completion QP");
     return rdma_status::success();
   endfunction
 endclass

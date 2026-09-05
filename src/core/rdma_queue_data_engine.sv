@@ -1247,6 +1247,10 @@ class rdma_queue_data_engine extends uvm_object;
     model.sign_en = request.signaled; model.se = request.solicited;
     model.ce = request.signaled ? 2'b01 : 2'b00; model.valid = 1'b1;
     model.hw_opcode = request.opcode;
+    model.invalidate_key = request.invalidate_rkey;
+    model.destination_qpn = request.destination_qpn;
+    model.qkey = request.qkey;
+    model.sgb_iova = request.sgb_iova;
     model.sge_num = request.sges.size();
     foreach (request.sges[i]) begin
       if (request.sges[i] == null)

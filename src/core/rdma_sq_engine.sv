@@ -59,6 +59,21 @@ class rdma_sq_engine extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：validate_transport 在发送入口验证请求 transport/opcode 与 facade 当前绑定状态，阻断 RC-only 字段串入 UD/URC。
+  // 输入/输出及副作用：request（输入）；返回校验状态，不修改 request、队列游标或外部资源。
+  // 失败/边界：未配置、空请求、unsupported transport 或请求自身字段不一致时返回明确错误；成功不代表已提交 WQE。
+  function rdma_status validate_transport(rdma_post_send_req request);
+    rdma_status status;
+    if (!configured || delegate == null)
+      return rdma_status::make(RDMA_SC_INVALID_STATE, "SQ facade is not configured");
+    if (request == null)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "SQ transport request is null");
+    if (!(request.transport inside {RDMA_TRANSPORT_RC, RDMA_TRANSPORT_UD, RDMA_TRANSPORT_URC}))
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "SQ transport is unsupported");
+    status = request.validate();
+    return status;
+  endfunction
+
   // 功能：将发送请求交给共享 engine 执行完整的预检、WQE 写入、doorbell 和提交流程。
   // 输入/输出及副作用：request（输入）、result（输出）、status（输出）；输入 request/image/cursor 决定写入内容；成功时更新 PI/CI、slot ledger 或 pending
   //   journal，并通过 output 返回结果。
@@ -75,6 +90,8 @@ class rdma_sq_engine extends uvm_object;
                                  "SQ facade is not configured");
       return;
     end
+    status = validate_transport(request);
+    if (!status.ok()) return;
     delegate.post_send(request, result, status);
   endtask
 endclass

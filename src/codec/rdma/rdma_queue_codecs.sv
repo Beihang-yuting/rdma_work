@@ -22,6 +22,50 @@ function automatic rdma_handle rdma_hw_queue_projected_handle(
 endfunction
 
 class rdma_queue_codec;
+  // 功能：encode_sqe 将语义发送请求投影为 XTR v1 64B SQE 镜像，统一选择 RC/UD/URC codec。
+  // 输入/输出及副作用：request 为只读请求，image 为输出镜像；函数仅复制请求快照，不取得 QP、AV 或 DMA 所有权。
+  // 失败/边界：空请求、请求校验失败、未知 transport、authority 不完整或 codec 拒绝 payload 时返回对应 status，image 保持为空。
+  extern static function rdma_status encode_sqe(input rdma_post_send_req request,
+                                          output byte unsigned image[]);
+/*
+    rdma_hw_sqe_model model;
+    rdma_hw_image encoded;
+    rdma_status status;
+    rdma_sqe_rc_ext rc;
+    rdma_sqe_ud_ext ud;
+    rdma_sqe_urc_ext urc;
+    rdma_hw_queue_codec_base codec;
+    image = new[0];
+    if (request == null)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "SQE request is null");
+    status = request.validate();
+    if (!status.ok()) return status;
+    model = rdma_hw_sqe_model::type_id::create("sqe_request_model");
+    model.transport = request.transport; model.opcode = request.opcode;
+    model.qp_h = request.qp_h; model.wr_id = request.wr_id;
+    model.inline_data = request.inline_data; model.payload = request.payload;
+    model.signaled = request.signaled; model.solicited = request.solicited;
+    model.immediate_data = request.immediate_data; model.remote_va = request.remote_addr;
+    model.rkey = request.rkey; model.invalidate_key = request.invalidate_rkey;
+    model.destination_qpn = request.destination_qpn; model.qkey = request.qkey;
+    model.valid = 1'b1; model.sign_en = 1'b1; model.ce = request.signaled ? 1 : 0;
+    model.se = request.solicited; model.sge_num = request.sges.size();
+    foreach (request.sges[i]) begin
+      rdma_sge sg;
+      if (request.sges[i] == null) return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "SQE SGE is null");
+      sg = rdma_sge::type_id::create($sformatf("sqe_sge_%0d", i)); sg.copy(request.sges[i]); model.sges.push_back(sg);
+    end
+    case (request.transport)
+      RDMA_TRANSPORT_RC: begin rc=rdma_sqe_rc_ext::type_id::create("sqe_rc_ext"); rc.remote_addr=request.remote_addr; rc.rkey=request.rkey; rc.remote_access_valid=request.remote_access_valid; rc.rkey_valid=request.rkey_valid; model.transport_ext=rc; codec=rdma_hw_sqe_rc_codec::type_id::create("sqe_rc_codec"); end
+      RDMA_TRANSPORT_UD: begin ud=rdma_sqe_ud_ext::type_id::create("sqe_ud_ext"); ud.destination_qpn=request.destination_qpn; ud.qkey=request.qkey; ud.address_vector_id=request.address_vector_id; ud.address_vector_valid=request.address_vector_valid; ud.address_vector=request.address_vector; model.transport_ext=ud; codec=rdma_hw_sqe_ud_codec::type_id::create("sqe_ud_codec"); end
+      RDMA_TRANSPORT_URC: begin urc=rdma_sqe_urc_ext::type_id::create("sqe_urc_ext"); urc.destination_qpn=request.destination_qpn; urc.remote_addr=request.remote_addr; urc.rkey=request.rkey; urc.remote_access_valid=request.remote_access_valid; urc.rkey_valid=request.rkey_valid; model.transport_ext=urc; codec=rdma_hw_sqe_urc_codec::type_id::create("sqe_urc_codec"); end
+      default: return rdma_status::make(RDMA_SC_UNSUPPORTED_OPCODE, "SQE transport is unsupported");
+    endcase
+    status = codec.encode(model, encoded);
+    if (!status.ok()) return status;
+    image = new[encoded.bytes.size()]; foreach (image[i]) image[i] = encoded.bytes[i];
+    return rdma_status::success();
+  endfunction */
   // 功能：按 CQE layout 编码公共字段，生成零填充的大端字节镜像。
   // 输入输出及副作用：fields/layout 为输入，image 为输出；成功时 image 长度等于 layout.bytes。
   // 失败边界：layout 无效、header 未按 16B 对齐或输出空间不足时返回 CODEC_ERROR 且 image 为空。
@@ -89,6 +133,10 @@ class rdma_hw_sqe_model extends rdma_sqe_model;
   byte unsigned inline_bytes[];
   rdma_iova_t sgb_iova;
   bit [31:0] invalidate_key;
+  bit [23:0] destination_qpn;
+  bit [31:0] qkey;
+  bit [31:0] mr_handle_id;
+  bit [31:0] mw_handle_id;
   rdma_iova_t atomic_local_iova;
   bit [31:0] atomic_local_lkey;
   longint unsigned atomic_value;
@@ -103,6 +151,7 @@ class rdma_hw_sqe_model extends rdma_sqe_model;
     payload_mode = RDMA_SQ_PAYLOAD_NONE;
     total_payload_len = 0; inline_bytes = new[0];
     invalidate_key = 0; atomic_local_lkey = 0;
+    destination_qpn = 0; qkey = 0; mr_handle_id = 0; mw_handle_id = 0;
     atomic_value = 0; atomic_compare = 0;
   endfunction
 
@@ -115,6 +164,8 @@ class rdma_hw_sqe_model extends rdma_sqe_model;
     payload_mode=x.payload_mode; total_payload_len=x.total_payload_len;
     inline_bytes=x.inline_bytes; sgb_iova=x.sgb_iova;
     invalidate_key=x.invalidate_key; atomic_local_iova=x.atomic_local_iova;
+    destination_qpn=x.destination_qpn; qkey=x.qkey;
+    mr_handle_id=x.mr_handle_id; mw_handle_id=x.mw_handle_id;
     atomic_local_lkey=x.atomic_local_lkey; atomic_value=x.atomic_value;
     atomic_compare=x.atomic_compare;
   endfunction
@@ -466,6 +517,7 @@ class rdma_hw_sqe_rc_codec extends rdma_hw_sqe_codec_base;
     case (opcode)
       RDMA_WR_SEND:             hw_opcode = RDMA_SQ_OPCODE_SEND;
       RDMA_WR_SEND_WITH_IMM:    hw_opcode = RDMA_SQ_OPCODE_SEND_WITH_IMM;
+      RDMA_WR_SEND_WITH_INV:    hw_opcode = RDMA_SQ_OPCODE_SEND_WITH_INV;
       RDMA_WR_RDMA_WRITE:       hw_opcode = RDMA_SQ_OPCODE_WRITE;
       RDMA_WR_WRITE_WITH_IMM:   hw_opcode = RDMA_SQ_OPCODE_WRITE_WITH_IMM;
       RDMA_WR_RDMA_READ:        hw_opcode = RDMA_SQ_OPCODE_READ;
@@ -1133,9 +1185,49 @@ class rdma_hw_sqe_rc_codec extends rdma_hw_sqe_codec_base;
   endfunction
 endclass
 
-class rdma_hw_sqe_ud_codec extends rdma_hw_sqe_codec_base; `uvm_object_utils(rdma_hw_sqe_ud_codec) function new(string name="rdma_hw_sqe_ud_codec"); super.new(name); endfunction endclass
+class rdma_hw_sqe_ud_codec extends rdma_hw_sqe_rc_codec;
+  `uvm_object_utils(rdma_hw_sqe_ud_codec)
+  function new(string name="rdma_hw_sqe_ud_codec"); super.new(name); endfunction
+  protected virtual function rdma_status check_reserved(rdma_hw_qword_builder b);
+    bit [63:0] w[]; b.get_words(w); if (w.size()!=8 || (w[0] & ~64'hefff_ffff_ffff_ffff)!=0) return err("UD SQE reserved bits are nonzero"); return rdma_status::success();
+  endfunction
+  protected virtual function rdma_status encode_fields(rdma_hw_model model, rdma_hw_qword_builder b);
+    rdma_hw_sqe_model x; rdma_sqe_ud_ext ext; rdma_status s; rdma_sq_payload_mode_e mode; byte unsigned sgb[$]; byte unsigned raw[]; bit [3:0] op; bit [7:0] sig;
+    if (!$cast(x,model)) return err("UD SQE model type mismatch");
+    if (x.transport != RDMA_TRANSPORT_UD) return err("UD codec received non-UD SQE");
+    if (!$cast(ext,x.transport_ext)) return err("UD extension type mismatch");
+    s=ext.validate(x.opcode); if(!s.ok()) return s;
+    s=map_opcode(x.opcode,op); if(!s.ok()) return s;
+    s=body_and_header(x,b,mode,sgb); if(!s.ok()) return s;
+    s=put(b,RDMA_SQ_WQE_OPCODE_WORD_BYTE_OFFSET,RDMA_SQ_WQE_OPCODE_LSB,RDMA_SQ_WQE_OPCODE_WIDTH,op); if(!s.ok()) return s;
+    s=put(b,RDMA_SQ_WQE_UD_DST_QPN_WORD_BYTE_OFFSET,RDMA_SQ_WQE_UD_DST_QPN_LSB,RDMA_SQ_WQE_UD_DST_QPN_WIDTH,ext.destination_qpn); if(!s.ok()) return s;
+    s=put(b,RDMA_SQ_WQE_UD_DST_Q_KEY_WORD_BYTE_OFFSET,RDMA_SQ_WQE_UD_DST_Q_KEY_LSB,RDMA_SQ_WQE_UD_DST_Q_KEY_WIDTH,ext.qkey); if(!s.ok()) return s;
+    s=put(b,RDMA_SQ_WQE_UD_SRC_ADDR_IDX_WORD_BYTE_OFFSET,RDMA_SQ_WQE_UD_SRC_ADDR_IDX_LSB,RDMA_SQ_WQE_UD_SRC_ADDR_IDX_WIDTH,ext.address_vector_id); if(!s.ok()) return s;
+    s=put(b,RDMA_SQ_WQE_UD_TOTAL_PAYLOAD_LEN_WORD_BYTE_OFFSET,RDMA_SQ_WQE_UD_TOTAL_PAYLOAD_LEN_LSB,RDMA_SQ_WQE_UD_TOTAL_PAYLOAD_LEN_WIDTH,payload_length(x,mode)); if(!s.ok()) return s;
+    if (x.opcode==RDMA_WR_SEND_WITH_INV) begin s=put(b,RDMA_SQ_WQE_LOCAL_INVLD_STAG_WORD_BYTE_OFFSET,RDMA_SQ_WQE_LOCAL_INVLD_STAG_LSB,RDMA_SQ_WQE_LOCAL_INVLD_STAG_WIDTH,x.invalidate_key); if(!s.ok()) return s; end
+    s=b.serialize(raw); if(!s.ok()) return err(s.message); sig=8'h00; foreach(raw[i]) if(i!=16) sig^=raw[i]; foreach(sgb[i]) sig^=sgb[i]; return put(b,RDMA_SQ_WQE_SIGNATURE_WORD_BYTE_OFFSET,RDMA_SQ_WQE_SIGNATURE_LSB,RDMA_SQ_WQE_SIGNATURE_WIDTH,sig);
+  endfunction
+endclass
 
-class rdma_hw_sqe_urc_codec extends rdma_hw_sqe_codec_base; `uvm_object_utils(rdma_hw_sqe_urc_codec) function new(string name="rdma_hw_sqe_urc_codec"); super.new(name); endfunction endclass
+class rdma_hw_sqe_urc_codec extends rdma_hw_sqe_rc_codec;
+  `uvm_object_utils(rdma_hw_sqe_urc_codec)
+  function new(string name="rdma_hw_sqe_urc_codec"); super.new(name); endfunction
+  protected virtual function rdma_status check_reserved(rdma_hw_qword_builder b);
+    bit [63:0] w[]; b.get_words(w); if (w.size()!=8 || (w[0] & ~64'hefff_ffff_ffff_ffff)!=0) return err("URC SQE reserved bits are nonzero"); return rdma_status::success();
+  endfunction
+  protected virtual function rdma_status encode_fields(rdma_hw_model model, rdma_hw_qword_builder b);
+    rdma_hw_sqe_model x; rdma_sqe_urc_ext ext; rdma_status s; rdma_sq_payload_mode_e mode; byte unsigned sgb[$]; bit [3:0] op;
+    if (!$cast(x,model)) return err("URC SQE model type mismatch");
+    if (x.transport != RDMA_TRANSPORT_URC) return err("URC codec received non-URC SQE");
+    if (!$cast(ext,x.transport_ext)) return err("URC extension type mismatch");
+    s=ext.validate(x.opcode); if(!s.ok()) return s; s=map_opcode(x.opcode,op); if(!s.ok()) return s;
+    s=body_and_header(x,b,mode,sgb); if(!s.ok()) return s;
+    s=put(b,RDMA_SQ_WQE_OPCODE_WORD_BYTE_OFFSET,RDMA_SQ_WQE_OPCODE_LSB,RDMA_SQ_WQE_OPCODE_WIDTH,op); if(!s.ok()) return s;
+    s=put(b,RDMA_SQ_WQE_UD_DST_QPN_WORD_BYTE_OFFSET,RDMA_SQ_WQE_UD_DST_QPN_LSB,RDMA_SQ_WQE_UD_DST_QPN_WIDTH,ext.destination_qpn); if(!s.ok()) return s;
+    if (x.opcode inside {RDMA_WR_RDMA_WRITE,RDMA_WR_WRITE_WITH_IMM,RDMA_WR_RDMA_READ}) begin s=put(b,RDMA_SQ_WQE_RC_REMOTE_KEY_WORD_BYTE_OFFSET,RDMA_SQ_WQE_RC_REMOTE_KEY_LSB,RDMA_SQ_WQE_RC_REMOTE_KEY_WIDTH,ext.rkey); if(!s.ok()) return s; s=put(b,RDMA_SQ_WQE_RC_REMOTE_VA_WORD_BYTE_OFFSET,RDMA_SQ_WQE_RC_REMOTE_VA_LSB,RDMA_SQ_WQE_RC_REMOTE_VA_WIDTH,ext.remote_addr.value); if(!s.ok()) return s; end
+    return rdma_status::success();
+  endfunction
+endclass
 
 class rdma_hw_rqe_codec extends rdma_hw_queue_codec_base;
   `uvm_object_utils(rdma_hw_rqe_codec)
@@ -1372,6 +1464,33 @@ class rdma_hw_aeqe_codec extends rdma_hw_queue_codec_base;
   protected virtual function rdma_status decode_fields(rdma_hw_qword_builder b, output rdma_hw_model model); rdma_hw_aeqe_model x; bit [63:0] v; rdma_status s; x=rdma_hw_aeqe_model::type_id::create("decoded_aeqe"); x.target_h=rdma_hw_queue_projected_handle("decoded_qp",RDMA_RESOURCE_QP,0); `define EQGET2(S,T) v='0; s=b.get_field(S``_WORD_BYTE_OFFSET,S``_LSB,S``_WIDTH,v); if(!s.ok()) return err(s.message); T=v;
     `EQGET2(RDMA_AEQE_VALID,x.valid) `EQGET2(RDMA_AEQE_QP_ST,x.qp_state) `EQGET2(RDMA_AEQE_PKT_OPCODE,x.packet_opcode) `EQGET2(RDMA_AEQE_ECODE,x.ecode) `EQGET2(RDMA_AEQE_QPN,x.qpn) `EQGET2(RDMA_AEQE_WQE_WRAP,x.wqe_wrap) `EQGET2(RDMA_AEQE_WQE_INDEX,x.wqe_index) `undef EQGET2 model=x; return rdma_status::success(); endfunction
 endclass
+
+function rdma_status rdma_queue_codec::encode_sqe(
+    input rdma_post_send_req request, output byte unsigned image[]);
+  rdma_hw_sqe_model model; rdma_hw_image encoded; rdma_status status;
+  rdma_sqe_rc_ext rc; rdma_sqe_ud_ext ud; rdma_sqe_urc_ext urc;
+  rdma_hw_queue_codec_base codec;
+  image = new[0];
+  if (request == null) return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,"SQE request is null");
+  status = request.validate(); if (!status.ok()) return status;
+  model = rdma_hw_sqe_model::type_id::create("sqe_request_model");
+  model.transport=request.transport; model.opcode=request.opcode; model.qp_h=request.qp_h;
+  model.wr_id=request.wr_id; model.inline_data=request.inline_data; model.payload=request.payload;
+  model.signaled=request.signaled; model.solicited=request.solicited; model.immediate_data=request.immediate_data;
+  model.remote_va=request.remote_addr; model.rkey=request.rkey; model.invalidate_key=request.invalidate_rkey;
+  model.destination_qpn=request.destination_qpn; model.qkey=request.qkey; model.valid=1'b1; model.sign_en=1'b1;
+  model.sgb_iova=request.sgb_iova;
+  model.ce=request.signaled ? 1 : 0; model.se=request.solicited; model.sge_num=request.sges.size();
+  foreach(request.sges[i]) begin rdma_sge sg; if(request.sges[i]==null) return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,"SQE SGE is null"); sg=rdma_sge::type_id::create("sqe_sge"); sg.copy(request.sges[i]); model.sges.push_back(sg); end
+  case(request.transport)
+    RDMA_TRANSPORT_RC: begin rc=rdma_sqe_rc_ext::type_id::create("sqe_rc_ext"); rc.remote_addr=request.remote_addr; rc.rkey=request.rkey; rc.remote_access_valid=request.remote_access_valid; rc.rkey_valid=request.rkey_valid; model.transport_ext=rc; codec=rdma_hw_sqe_rc_codec::type_id::create("sqe_rc_codec"); end
+    RDMA_TRANSPORT_UD: begin ud=rdma_sqe_ud_ext::type_id::create("sqe_ud_ext"); ud.destination_qpn=request.destination_qpn; ud.qkey=request.qkey; ud.address_vector_id=request.address_vector_id; ud.address_vector_valid=request.address_vector_valid; ud.address_vector=request.address_vector; model.transport_ext=ud; codec=rdma_hw_sqe_ud_codec::type_id::create("sqe_ud_codec"); end
+    RDMA_TRANSPORT_URC: begin urc=rdma_sqe_urc_ext::type_id::create("sqe_urc_ext"); urc.destination_qpn=request.destination_qpn; urc.remote_addr=request.remote_addr; urc.rkey=request.rkey; urc.remote_access_valid=request.remote_access_valid; urc.rkey_valid=request.rkey_valid; model.transport_ext=urc; codec=rdma_hw_sqe_urc_codec::type_id::create("sqe_urc_codec"); end
+    default: return rdma_status::make(RDMA_SC_UNSUPPORTED_OPCODE,"SQE transport is unsupported");
+  endcase
+  status=codec.encode(model,encoded); if(!status.ok()) return status;
+  image=new[encoded.bytes.size()]; foreach(image[i]) image[i]=encoded.bytes[i]; return rdma_status::success();
+endfunction
 
 // 功能：在 rdma_hw_aeqe_codec 中，rdma_register_queue_codecs 把 XTR v1 对应对象类型、opcode 和 variant 的 codec 注册到 profile registry，并拒绝重复键。
 // 输入/输出及副作用：registry（输入）；rdma_register_queue_codecs 读取 registry 并使用字段 k.hw_version、k.opcode、k.image_kind、k.object_type、k.variant、s；函数返回 rdma_status，不取得调用方资源所有权。
