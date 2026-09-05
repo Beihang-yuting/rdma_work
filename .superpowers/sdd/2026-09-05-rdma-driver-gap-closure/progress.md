@@ -79,3 +79,24 @@ Task 2: follow-up recovery/SRQ round (engine-owned published-cleanup recovery, r
   契约和 owned-ref 几何校验问题均已修复；host-mem adapter 的宏转义也已在真实
   host_mem filelist 下重新编译验证。
 - 最终提交前删除 `tools/__pycache__/` 生成物；本 Task 只创建本地 commit，不 merge、不 push。
+
+## Task 3 execution
+
+- Worktree: `.worktrees/rdma-cq-shadow` on `feature/rdma-cq-shadow`.
+- BASE: `bb9cf2bcacca6895dc1800257a2c3e67e352abaf` (`fix: close rdma queue resize recovery gaps`).
+- Task 3: started; implementer must preserve Task 2 CQE layout/codec contracts and first obtain a VCS53 RED result before changing production code.
+- Registration note: add the new UVM test to `tests/rdma_unit_test_pkg.sv`; this is required for the named VCS test to compile and does not broaden production scope.
+
+- Task 3 implementation commit: `0149a75` (`feat: add shared cq and urc shadow lifecycle`).
+- TDD evidence recorded by implementer: RED compile failure before production symbols; GREEN `rdma_cq_shadow_flush_test` on VCS53 with `warning=0 error=0 fatal=0`.
+- Task 3 review package: `review-bb9cf2b..0149a75.diff`; task review pending.
+- Task 3 review verdict: Needs fixes. Important findings: complete CQ identity check; real URC evidence transaction-path integration; detached cached/output shadow; same-epoch reconfigure semantics; full shared/resource/authority/reset-epoch and completion-QP-kind validation. Minor findings: broaden focused negative/field assertions and align snapshot cursor-range comment.
+- Task 3 fix round 1/5 started from `0149a75`; original implementer resumed.
+- Task 3 fix round 1 implementation amended to `35b486a`; scoped re-review package `review-f9e76a8..35b486a.diff` is pending. Implementer reports VCS53 focused test UVM 0/0/0.
+- Task 3 fix round 1/5 review: 2 findings addressed (cache clone, same-epoch reset); 3 Important remain (flush CQ kind/full identity, mandatory evidence path/error handling, null-output replay alias). Commit `35b486a`.
+- Task 3 fix round 2/5 started; original implementer resumed with the three open findings.
+- Task 3 fix round 2 implementation finalized as `1b3ba90`; final scoped review package `review-35b486a..1b3ba90.diff` pending. Implementer reports focused VCS53 UVM 0/0/0 and expanded production-path evidence/negative coverage.
+- Task 3 fix round 2/5: 3 findings addressed, 0 open; scoped re-review APPROVE, no new Critical/Important breakage. Commits `35b486a..1b3ba90`.
+- Task 3: complete (commits `bb9cf2b..1b3ba90`, review clean).
+- Task 3 post-review verification: controller reran `scripts/run_vcs53.sh core rdma_cq_shadow_flush_test` on host 53; UVM `info=3 warning=0 error=0 fatal=0`, summary pristine. `git diff --check` passed.
+- Ruling: defer adding `rdma_cq_shadow_flush_test` to `scripts/run_queue_lifecycle_regression53.sh` until Task 9, which explicitly owns final regression lists; current Python manifest check is 108/109 with only that expected missing entry. Cost if wrong: the branch carries one known static manifest failure through Tasks 4–8 and requires Task 9 to close it before final completion.
