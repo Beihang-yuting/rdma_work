@@ -1792,6 +1792,12 @@ class rdma_queue_data_engine extends uvm_object;
     // 随后 detach 旧 runtime 并释放 control-plane-owned 的旧 mapping。
     key = attachment_key(cq_h, RDMA_QUEUE_RUNTIME_CQ);
     attachments[key] = replacement;
+    status = restore_cq_dependents(dependents);
+    if (!status.ok())
+      return finish_resize(rdma_status::make(
+        RDMA_SC_RECOVERY_REQUIRED,
+        {"CQ resize published but dependent runtime restore failed: ",
+         status.message}));
     status = old_attachment.runtime.detach_quiesced();
     if (!status.ok())
       return finish_resize(rdma_status::make(
