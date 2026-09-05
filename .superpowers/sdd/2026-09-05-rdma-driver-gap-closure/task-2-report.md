@@ -47,3 +47,12 @@ Final fix commit: `3c8441f35434ed9a5065085d6cc82ef48529d818` (supersedes `ab1e7d
 - `src/core/rdma_queue_data_engine.sv` 增加 planner、resize semaphore 及 dependent-runtime 回滚辅助函数。
 - `git diff --cached --check` 通过；远端 `scripts/run_vcs53.sh core rdma_cq_engine_resize_test` 已解析并重编译全部 11 个 module（显示 `All of 11 modules done`），随后在链接/仿真阶段主动中止，未取得 PASS/FAIL；远端临时目录清理因 `csrc` 非空告警。
 - 未决项：现有 `rdma_queue_data_engine::resize_cq()` 尚未接入上述新分配和 authoritative replacement primitives，仍调用 `clone_for_resize()` 复用旧 mapping。因此本 commit 提供可评审的基础 API，但端到端 fresh-backing resize 尚未完成，不应宣称 resize 已闭环。
+
+## Round5 最终补充（实现 commit `43eb51c6ac3c1eca87ba4911212ae200cefce81e`）
+
+- `src/core/rdma_queue_data_engine.sv`：重写 `resize_cq()` 为完整事务：`resize_lock` 串行化；调用 `manager.begin_cq_resize`、CQ/runtime 与依赖 quiesce；通过 `allocate_owned_cq_resize_ring` 分配新 control-plane backing；复制旧 cursor/slot 状态；构造新 access、queue plan、detached CQ candidate 并调用 `manager.replace_active_cq` 原子发布。失败路径清理候选 mapping、恢复 runtime/dependents/manager ACTIVE 并释放锁。发布成功后切换 attachment、detach 旧 runtime、释放旧 CQ ring backing；清理失败返回 `RDMA_SC_RECOVERY_REQUIRED`。
+- `tests/unit/rdma_cq_engine_resize_test.sv`：修正 detached `manager.lookup()` 快照不可用指针相等比较，改为按 CQ ring role 的 mapping `iova/size/state` 值比较；覆盖 allocation failure 回滚、成功新 geometry/mapping、非法 geometry 不分配。
+- `git diff --check`：通过。
+- `scripts/run_vcs53.sh core rdma_cq_engine_resize_test`：VCS 53 编译及仿真通过，UVM summary `warning=0 error=0 fatal=0`。
+- `scripts/run_vcs53.sh core rdma_cqe_size_codec_test`：编译通过但既有 CQE profile field 测试产生 `UVM_ERROR=3`（`CQE_PROFILE_FIELDS`）；该失败不涉及本轮 resize 代码，需后续 codec 轮次处理。
+- 未决项：发布后旧 backing cleanup 若底层 adapter 报错，manager/attachment 已切换到新 authority，函数返回 `RDMA_SC_RECOVERY_REQUIRED` 供上层恢复；正常 adapter 路径已验证无泄漏/回滚。
