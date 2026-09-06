@@ -2253,6 +2253,114 @@ class rdma_cmq_codec_test extends uvm_test;
                  "invalid source published a snapshot")
   endfunction
 
+  // 功能：check_driver_034_opcode_registry 校验 0.1.34 驱动新增 CMQ opcode
+  //   已被统一 registry 收录，并验证描述符长度、掩码和错误映射可查询。
+  // 输入/输出及副作用：无显式输入；函数只读取静态 registry 并在发现漂移时
+  //   报告 UVM_ERROR，不修改 CMQ ring 或任何运行期资源。
+  // 失败/边界：任一 opcode 缺失、描述符非法、请求/响应长度不是 64 字节，或
+  //   未知 opcode 被错误接受，都会报告错误；失败路径不提交部分状态。
+  function automatic void check_driver_034_opcode_registry();
+    bit [7:0] new_opcodes[] = '{
+      8'h07, 8'h08, 8'h09, 8'h0b, 8'h0d, 8'h11,
+      8'h15, 8'h18, 8'h19, 8'h1b, 8'h1c, 8'h1d,
+      8'h1e, 8'h1f, 8'h21, 8'h22, 8'h23, 8'h24,
+      8'h25, 8'h26, 8'h27, 8'h28, 8'h29, 8'h2a,
+      8'h2b, 8'h2c, 8'h2d, 8'h2e, 8'h2f, 8'h30,
+      8'h31, 8'h32, 8'h33, 8'h34, 8'h36, 8'h39,
+      8'h3a, 8'h3b, 8'h3c, 8'h3d, 8'h3e, 8'h3f,
+      8'h40, 8'h41, 8'h42, 8'h43, 8'h44, 8'h46,
+      8'h47, 8'h48
+    };
+    rdma_cmq_opcode_descriptor descriptor;
+    rdma_status status;
+
+    foreach (new_opcodes[i]) begin
+      if (!rdma_cmq_codec_registry::is_supported(new_opcodes[i]))
+        `uvm_error("CMQ_REGISTRY_034",
+                   $sformatf("missing driver 0.1.34 opcode 0x%02x",
+                             new_opcodes[i]))
+      status = rdma_cmq_codec_registry::lookup(new_opcodes[i], descriptor);
+      expect_ok($sformatf("CMQ_DESC_034_%02x", new_opcodes[i]), status);
+      if (descriptor == null)
+        continue;
+      if (descriptor.request_bytes != RDMA_CMQE_BYTES ||
+          descriptor.response_bytes != RDMA_CMQE_BYTES ||
+          !descriptor.request_allowed || !descriptor.response_allowed ||
+          !descriptor.valid())
+        `uvm_error("CMQ_REGISTRY_034",
+                   $sformatf("invalid descriptor for opcode 0x%02x",
+                             new_opcodes[i]))
+    end
+    if (rdma_cmq_codec_registry::is_supported(8'hff))
+      `uvm_error("CMQ_REGISTRY_UNKNOWN", "unknown opcode 0xff was accepted")
+    status = rdma_cmq_codec_registry::lookup(8'hff, descriptor);
+    expect_status("CMQ_REGISTRY_UNKNOWN_STATUS", status,
+                  RDMA_SC_UNSUPPORTED_OPCODE);
+    if (descriptor != null)
+      `uvm_error("CMQ_REGISTRY_UNKNOWN_STATUS",
+                 "unknown opcode returned a descriptor")
+  endfunction
+
+  // 功能：check_driver_034_golden_vectors 读取 0.1.34 CMQ 请求向量，并用
+  //   descriptor 的 request mask 独立检查 opcode 与字段所有权。
+  // 输入/输出及副作用：只读取 tests/data 下的不可变文本，不修改 codec、
+  //   body registry 或 ring；解析失败通过 UVM_ERROR 报告。
+  // 失败/边界：每个新增 opcode 必须恰好一条 64B 向量，byte3 必须等于
+  //   literal opcode，且 payload 不得写入 envelope/body 未声明的位。
+  function automatic void check_driver_034_golden_vectors();
+    bit [7:0] expected_opcodes[] = '{
+      8'h07, 8'h08, 8'h09, 8'h0b, 8'h0d, 8'h11, 8'h15, 8'h18,
+      8'h19, 8'h1b, 8'h1c, 8'h1d, 8'h1e, 8'h1f, 8'h21, 8'h22,
+      8'h23, 8'h24, 8'h25, 8'h26, 8'h27, 8'h28, 8'h29, 8'h2a,
+      8'h2b, 8'h2c, 8'h2d, 8'h2e, 8'h2f, 8'h30, 8'h31, 8'h32,
+      8'h33, 8'h34, 8'h36, 8'h39, 8'h3a, 8'h3b, 8'h3c, 8'h3d,
+      8'h3e, 8'h3f, 8'h40, 8'h41, 8'h42, 8'h43, 8'h44, 8'h46,
+      8'h47, 8'h48
+    };
+    rdma_golden_case cases[$];
+    string error;
+    if (!rdma_golden_reader::read_all(
+          "../tests/data/rdma_0_1_34_cmq_vectors.hex", cases, error)) begin
+      `uvm_error("CMQ034_GOLDEN_READ", error)
+      return;
+    end
+    if (cases.size() != expected_opcodes.size()) begin
+      `uvm_error("CMQ034_GOLDEN_COUNT",
+                 $sformatf("expected %0d vectors, got %0d",
+                           expected_opcodes.size(), cases.size()))
+      return;
+    end
+    foreach (cases[i]) begin
+      rdma_cmq_opcode_descriptor descriptor;
+      bit [63:0] word;
+      rdma_status status;
+      if (cases[i].byte_count != RDMA_CMQE_BYTES ||
+          cases[i].payload.size() != RDMA_CMQE_BYTES)
+        `uvm_error("CMQ034_GOLDEN_SIZE", $sformatf(
+          "%s is not a 64B vector", cases[i].name))
+      if (cases[i].payload.size() > 3 &&
+          cases[i].payload[3] != expected_opcodes[i])
+        `uvm_error("CMQ034_GOLDEN_OPCODE", $sformatf(
+          "%s byte3=0x%02x expected=0x%02x", cases[i].name,
+          cases[i].payload[3], expected_opcodes[i]))
+      status = rdma_cmq_codec_registry::lookup(expected_opcodes[i],
+                                                descriptor);
+      expect_ok($sformatf("CMQ034_GOLDEN_DESC_%02x", expected_opcodes[i]),
+                status);
+      if (descriptor == null) continue;
+      for (int unsigned q = 0; q < 8; q++) begin
+        word = '0;
+        for (int unsigned b = 0; b < 8; b++)
+          word[63 - b * 8 -: 8] = cases[i].payload[q * 8 + b];
+        if ((word & ~(request_envelope_mask(q) |
+                      descriptor.request_qword_masks[q])) != 0)
+          `uvm_error("CMQ034_GOLDEN_MASK", $sformatf(
+            "%s writes outside descriptor mask at qword %0d",
+            cases[i].name, q))
+      end
+    end
+  endfunction
+
   // 功能：在测试辅助 rdma_cmq_codec_test.check_injected_registry_snapshot 中构造或驱动“injected registry snapshot”场景，并断言 DUT
   //   的状态、错误码和资源账本符合契约。
   // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
@@ -2319,6 +2427,8 @@ class rdma_cmq_codec_test extends uvm_test;
     expect_ok("QPC_REGISTER", status);
 
     check_registry_contract();
+    check_driver_034_opcode_registry();
+    check_driver_034_golden_vectors();
     check_injected_registry_snapshot();
     check_envelope_oracle();
     check_ownership_oracles();

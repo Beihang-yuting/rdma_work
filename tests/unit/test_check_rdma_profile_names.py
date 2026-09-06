@@ -1591,6 +1591,7 @@ class MakefileCleanupTest(unittest.TestCase):
 
         with tempfile.TemporaryDirectory(prefix="rdma_profile_cleanup_test.") as temp:
             bin_dir = Path(temp)
+            (bin_dir / "tar").write_text("#!/bin/bash\nexit 0\n")
             (bin_dir / "unzip").write_text("#!/bin/bash\nexit 0\n")
             (bin_dir / "python3").write_text(
                 "#!/bin/bash\nexit \"${XTR_TEST_COMMAND_STATUS:?}\"\n"
@@ -1600,7 +1601,10 @@ class MakefileCleanupTest(unittest.TestCase):
             (bin_dir / "rm").write_text(
                 "#!/bin/bash\n/bin/rmdir \"$3\" || exit 99\nexit 1\n"
             )
-            for command in ("unzip", "python3", "rm"):
+            # The pinned 0.1.34 source is a tar.gz archive.  Keep an unzip
+            # stub as well so this fixture remains valid if a local override
+            # selects the legacy zip distribution.
+            for command in ("tar", "unzip", "python3", "rm"):
                 (bin_dir / command).chmod(0o755)
 
             for command_status, expected in ((0, 1), (7, 7)):

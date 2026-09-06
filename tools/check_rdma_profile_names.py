@@ -18,7 +18,8 @@ import sys
 from typing import NamedTuple
 
 
-FIXED_COMMIT = "491faf2ba42627fffd4dd027607299c8bb591ec2"
+# 0.1.34 is distributed as a source archive without Git metadata.
+FIXED_COMMIT = "rdma-driver-0.1.34"
 REPO_ROOT = Path(__file__).resolve().parents[1]
 MANIFEST_PATH = REPO_ROOT / "hw" / "rdma" / "source_manifest.txt"
 SV_DEFS_PATH = REPO_ROOT / "src" / "codec" / "rdma" / "rdma_defs.svh"
@@ -41,26 +42,26 @@ PROFILE_FORBIDDEN_PATTERNS = (
 
 SOURCE_HASHES = {
     "cmq.h": "67f685b23af4f1be64322e56e270546d993db95494ecba253d38afd0780b6e06",
-    "qp.h": "c009d546acbd99eb818223fb5cfb348c5423b554c12638d0690aca4a7a35f35d",
-    "cq.h": "7d2e2b41e254b9be2f70214bf31cb67bfa5dadbc6eb47124394429ef1d134ee7",
+    "qp.h": "6202ca6df10cca9bebdcdf5f766c145cd319e0c765edcfbd8677e6d4afa267bd",
+    "cq.h": "36b6cca236607fd269347ee9bc6e7cfc4410e7ddb920c178931ce11d385e0208",
     "wr.h": "c75fb5770ef0ea1af404efbaf95cf79356d1096d331d7cdfcc46ea9ad9b3225b",
-    "defs.h": "79e26543d2b9c0942be2819cd505f50118b6cd005a2c8d237dbf8a690963b9ae",
+    "defs.h": "2715ad7e265c692f34e5decdd34d23ed0cde3b19c8a3de8d89bc60cf71824862",
     "eth_header/rdma_register.h": "af957673ba0b561cd27d4bd22394cc0bc56a0173bff66c59176a5a829e0acc13",
     "eth_header/register.h": "061071cab4008cee1fa837b9aa71c068215c98cb5665ef5f4b038a24da09c734",
-    "xtrdma_hw.h": "a917b3080d601bcf62d595383ab6c663c19c2a05c7a1854f481800c97dddc9cb",
+    "xtrdma_hw.h": "70aa98a0db8e0c753f11d7bf0347cee774cee01daf7c9593ea1999a2c1ffad68",
     "map.h": "9b532a140458c3f9592b8a1d7531500e820f8f7b1650bf6fd7f41aa1d214c75d",
-    "qp.c": "90e91142fbfbd009feda08b1137ef2c584e8da1054f83d6250c1f67cce1a165a",
-    "cq.c": "a9db3e9ea40741dbb12735d55820d18c5ade3eea7cd4125d670557972f336cee",
-    "wr.c": "df855a9c560fced5dae7e188a540fb1b333fb8746395f88522a185eb265e8230",
+    "qp.c": "c2832eee56ce17128a4c548ed96298912ba0ce6f4ce61401f433c257396f7c3c",
+    "cq.c": "60c502b5d2de6370c6162e9e827439e76003553a913b22cae5979b79e9b7921b",
+    "wr.c": "f9267765b49faff2b5772c28dde862bec7079413b2278540cba3c6f2ea64f7fe",
     "cmq.c": "0976654707f3ee68a96589121aae22db7a6cefb1eec3454e756ba16e411ab383",
-    "alloc.h": "6723ae4bdfdc283e6c4821d2ce59f5ca300629665527cf316e4c49c6dad53922",
-    "mr.h": "de683e3e941e31ba07162ea2b4712a5ed2224d26362fd567916c0abfbfef58c8",
-    "mr.c": "ac507832fb7f595ad168735946499c4612baf1eaebac7ede301f1f29621d8aed",
-    "rdma_main.h": "19f16fc6f4e0b2a8e3f9e14ec4ac9d2bde1e34472313866abe430be1f9258c7e",
+    "alloc.h": "1e91bb9e92c253c985f2f65684ebbd61d48b512d13aff2b73a8cbae3b25265e9",
+    "mr.h": "db51447212e687556247a19edc76ad13a39e3f4e59e0b68f1cb08c0969eb9dba",
+    "mr.c": "19775d0b99785ab4a372dcebb79aa1560b4158fc04c916a0c144c1f2aa107e5d",
+    "rdma_main.h": "48fd532c4b5987696412f987bbb2e42111d08d9da298745bd91c39effa1128ed",
     "srq.h": "c0f7edd9bc65a4a574c082167221bdb7644c28e6f4387c1bd2a5db157b2341ae",
-    "srq.c": "c511b0d669e9501ece1c3f02ac7079b6d900b34cf87a33b1dc800857b47fd766",
+    "srq.c": "c4bfe2cc974b8458e45c7552412e11fad8014acc1da6f0e5c578eb9fd4e8a5d0",
     "event.h": "9c1185a2279854c95ed00a949c2a8aa3f4a1588386de65bf7fa7662d08dfb99a",
-    "event.c": "efdba325776236f3715c4e847d5bae90369263bd29b14192dd6234b498df189b",
+    "event.c": "6b196af6a6bcdffae099a63df647ed1f565a80fbd9aa0accbb69400ff7fe4c00",
 }
 
 REQUIRED_MANIFEST_ROWS = {

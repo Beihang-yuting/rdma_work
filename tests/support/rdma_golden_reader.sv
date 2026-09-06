@@ -291,9 +291,24 @@ class rdma_golden_reader;
             return 0;
           end
           current = new();
+          // 格式 marker 只出现在文件首行；其后的 case 由状态 1
+          // 直接解析，避免多 case golden 在分隔空行后重复要求 marker。
           state = 1;
         end
         1: begin
+          // 兼容历史 golden：旧文件在每个 case 前重复写 marker；新文件
+          // 只在首行写一次。两种格式都在 state5 的空行分隔后到达这里，
+          // 因而 marker 只需被跳过，不应被误判为 case 行。
+          if (strip_canonical_newline(line, content, error) &&
+              content == "# xtr_v1-golden-v1") begin
+            current = new();
+            state = 1;
+            continue;
+          end
+          if (error != "") begin
+            $fclose(fd);
+            return 0;
+          end
           if (!parse_case_line(line, current.name, error)) begin
             $fclose(fd);
             return 0;
@@ -337,7 +352,9 @@ class rdma_golden_reader;
             $fclose(fd);
             return 0;
           end
-          state = 0;
+          // 空行仅分隔 case，不重新进入 marker 状态。
+          current = new();
+          state = 1;
         end
       endcase
     end

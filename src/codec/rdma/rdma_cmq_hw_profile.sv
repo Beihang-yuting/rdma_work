@@ -584,6 +584,9 @@ class rdma_hw_cmq_hw_profile extends rdma_cmq_hw_profile;
       return invalid_state("rdma doorbell default registration failed");
     if (!doorbell_registration_status.ok())
       return doorbell_registration_status;
+    status = rdma_cmq_codec_registry::validate();
+    if (!status.ok())
+      return status;
     foreach (variants[i]) begin
       codec = null;
       status = doorbell_codecs.lookup(doorbell_key(variants[i]), codec);
@@ -613,7 +616,8 @@ class rdma_hw_cmq_hw_profile extends rdma_cmq_hw_profile;
   // 输入/输出及副作用：opcode（输入）；generationless_opcode 读取 opcode 并使用输入参数和固定枚举/常量；函数返回 bit，不取得调用方资源所有权。
   // 失败/边界：generationless_opcode 的结果直接由 return opcode inside {RDMA_OP_OCC_FLUSH, RDMA_OP_TQ_FLUSH} 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   protected function bit generationless_opcode(bit [7:0] opcode);
-    return opcode inside {RDMA_OP_OCC_FLUSH, RDMA_OP_TQ_FLUSH};
+    return opcode inside {RDMA_OP_OCC_FLUSH, RDMA_OP_TQ_FLUSH} ||
+           rdma_cmq_codec_registry::is_generationless(opcode);
   endfunction
 
   // 功能：validate_composed_sqe 校验 image、opcode、function_generation 与当前对象状态的一致性，并显式处理“rdma CMQ request composer published null”等拒绝条件，返回 rdma_status 供上层决定是否提交。

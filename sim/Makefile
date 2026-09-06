@@ -7,7 +7,7 @@ HOST_MEM_BUILD ?= build/host_mem
 override HOST_MEM_PINNED_COMMIT := 3b9e000d5df4d10efbb3029f43605e0362e0caca
 override HOST_MEM_PKG_SHA256 := d2ba57918a3b605525274433008142c80921b6205b0848c76bef8f1fc0d0bba5
 override HOST_MEM_MANAGER_SHA256 := 8dd5ca3ba3abcfae4808c8ea10c34ced279316bebdc04f6f8e0ae5e55e337a9d
-override RDMA_ARCHIVE := /home/ubuntu/workspace/Desktop.zip
+override RDMA_ARCHIVE := /home/ubuntu/Downloads/dpu_kernel_rdma-version_0.1.34.tar(1).gz
 override RDMA_ARCHIVE_PREFIX := dpu_kernel_rdma-version_0.1.34
 # 6766c4f is the net_packet master snapshot that contains packet.sv and the
 # RoCEv2/iWARP protocol headers consumed by this adapter.
@@ -52,7 +52,11 @@ rdma_defs:
 		exit $$cleanup_status; \
 	}; \
 	trap cleanup EXIT; \
-	unzip -q "$(RDMA_ARCHIVE)" "$(RDMA_ARCHIVE_PREFIX)/*" -d "$$ref_dir"; \
+	case "$(RDMA_ARCHIVE)" in \
+		*.tar.gz|*.tar*.gz|*.tgz) tar -xzf "$(RDMA_ARCHIVE)" -C "$$ref_dir" "$(RDMA_ARCHIVE_PREFIX)" ;; \
+		*.zip) unzip -q "$(RDMA_ARCHIVE)" "$(RDMA_ARCHIVE_PREFIX)/*" -d "$$ref_dir" ;; \
+		*) echo "Unsupported RDMA archive format: $(RDMA_ARCHIVE)" >&2; exit 2 ;; \
+	esac; \
 	python3 ../tools/check_rdma_profile_names.py \
 		--kernel-root "$$ref_dir/$(RDMA_ARCHIVE_PREFIX)"
 

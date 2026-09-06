@@ -57,9 +57,15 @@ readonly CORE_TESTS=(
   rdma_qp_lifecycle_test
   rdma_qp_recovery_test
   rdma_sq_codec_test
+  rdma_ud_urc_sqe_codec_test
+  rdma_wqe_extended_opcode_test
+  rdma_sqe_authority_test
   rdma_sq_payload_writer_test
   rdma_function_identity_test
   rdma_queue_txn_journal_test
+  rdma_abi_v5_adapter_test
+  rdma_umem_pbl_mw_test
+  rdma_cq_shadow_flush_test
 )
 
 # 功能：列出必须在 dpu_common integration 编译定义下运行的测试。

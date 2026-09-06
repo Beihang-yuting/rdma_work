@@ -503,6 +503,33 @@ class rdma_cmq_profile_test extends uvm_test;
                   profile.validate_profile(), RDMA_SC_OK);
   endfunction
 
+  // 功能：check_driver_034_registry_contract 验证 0.1.34 的完整 opcode
+  //   连续表、描述符自洽性以及未知 opcode 的拒绝行为。
+  // 输入/输出及副作用：只读取静态 registry，使用 UVM_ERROR 暴露漂移，
+  //   不修改 profile、CMQ ring 或任何外部资源。
+  // 失败/边界：缺少任一 0x00..0x48 项、lookup 返回空快照或 0xff 被接受时失败。
+  function automatic void check_driver_034_registry_contract();
+    bit [7:0] supported[$];
+    rdma_cmq_opcode_descriptor descriptor;
+    rdma_status status;
+
+    status = rdma_cmq_codec_registry::validate();
+    expect_status("CMQ034_REGISTRY_VALIDATE", status, RDMA_SC_OK);
+    rdma_cmq_codec_registry::list_supported(supported);
+    if (supported.size() != 73)
+      `uvm_error("CMQ034_REGISTRY_COUNT",
+                 $sformatf("expected 73 opcodes, got %0d", supported.size()))
+    foreach (supported[i])
+      if (supported[i] != i[7:0])
+        `uvm_error("CMQ034_REGISTRY_ORDER",
+                   $sformatf("opcode[%0d] is 0x%02x", i, supported[i]))
+    status = rdma_cmq_codec_registry::lookup(8'hff, descriptor);
+    expect_status("CMQ034_UNKNOWN_LOOKUP", status,
+                  RDMA_SC_UNSUPPORTED_OPCODE);
+    if (descriptor != null)
+      `uvm_error("CMQ034_UNKNOWN_LOOKUP", "unknown opcode returned a descriptor")
+  endfunction
+
   // 功能：在测试辅助 rdma_cmq_profile_test.check_compose_sqe 中构造或驱动“compose sqe”场景，并断言 DUT 的状态、错误码和资源账本符合契约。
   // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
   // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
@@ -644,6 +671,21 @@ class rdma_cmq_profile_test extends uvm_test;
                   RDMA_SC_INVALID_ARGUMENT);
     if (sqe != null || expected != null)
       `uvm_error("COMPOSE_INCOMPATIBLE_BODY", "failure published outputs")
+    command.opcode_key.opcode = RDMA_OP_CQC_DELETE;
+    command.opcode_key.variant = "delete";
+
+    // 已在 driver 中定义但尚无精确 body codec 的命令，必须在 compose
+    //   阶段返回 UNSUPPORTED_OPCODE，禁止生成全零假 body。
+    command.opcode_key.opcode = RDMA_OP_CEQC_MODIFY;
+    command.opcode_key.variant = "modify";
+    sqe = null;
+    expected = null;
+    status = profile.compose_sqe(command, slot, sqe, expected);
+    expect_status("COMPOSE_UNIMPLEMENTED_034_OPCODE", status,
+                  RDMA_SC_UNSUPPORTED_OPCODE);
+    if (sqe != null || expected != null)
+      `uvm_error("COMPOSE_UNIMPLEMENTED_034_OPCODE",
+                 "unsupported body codec published an image")
     command.opcode_key.opcode = RDMA_OP_CQC_DELETE;
     command.opcode_key.variant = "delete";
 
@@ -1283,6 +1325,7 @@ class rdma_cmq_profile_test extends uvm_test;
   virtual task run_phase(uvm_phase phase);
     phase.raise_objection(this);
     check_profile_validation();
+    check_driver_034_registry_contract();
     check_body_snapshot_contract();
     check_compose_sqe();
     check_compose_generation_policy();
