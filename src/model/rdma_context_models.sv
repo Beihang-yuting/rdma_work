@@ -1291,3 +1291,555 @@ class rdma_aeqc_model extends rdma_hw_model;
     return $sformatf("AEQC(depth=%0d vector=%0d)", depth, vector_id);
   endfunction
 endclass
+
+// 功能：rdma_umem_page 描述一个被 pin 的用户页及其 DMA 地址映射。
+// 输入/输出及副作用：对象字段由 rdma_umem.pin_pages() 填充；对象不拥有外部 host-mem 页。
+// 失败/边界：host_va/iova 必须按 page_size 对齐，length 不得跨越一个配置页；pinned=0 表示不可提交 DMA。
+class rdma_umem_page extends uvm_object;
+  `uvm_object_utils(rdma_umem_page)
+
+  longint unsigned host_va;
+  rdma_iova_t iova;
+  rdma_backing_addr_t backing_addr;
+  longint unsigned length;
+  rdma_dma_permission_t permissions;
+  int unsigned generation;
+  int unsigned refcount;
+  bit pinned;
+  bit borrowed;
+
+  // 功能：构造空页描述符，建立未 pin 的安全默认值。
+  // 输入/输出及副作用：name 为 UVM 对象名；只初始化本地字段，不访问外部资源。
+  // 失败/边界：未填充 host_va/iova/length 的描述符不能通过 validate_page()。
+  function new(string name = "rdma_umem_page");
+    super.new(name);
+    host_va = 0;
+    iova = '0;
+    backing_addr = '0;
+    length = 0;
+    permissions = '0;
+    generation = 0;
+    refcount = 0;
+    pinned = 1'b0;
+    borrowed = 1'b0;
+  endfunction
+
+  // 功能：校验页地址、长度、权限和 pin 状态是否满足 UMEM 访问约束。
+  // 输入/输出及副作用：page_size、expected_generation 为输入；只读字段并返回状态，不修改页状态。
+  // 失败/边界：未 pin、零长度、跨页、未对齐或代际不匹配返回明确错误。
+  function rdma_status validate_page(int unsigned page_size,
+                                     int unsigned expected_generation);
+    if (!pinned || refcount == 0)
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "UMEM page is not pinned");
+    if (page_size == 0 || (page_size & (page_size - 1'b1)) != 0)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "UMEM page size is not a power of two");
+    if (length == 0 || length > page_size)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "UMEM page length is invalid");
+    if ((host_va % page_size) != 0 || (iova.value % page_size) != 0)
+      return rdma_status::make(RDMA_SC_DMA_TRANSLATION,
+                               "UMEM page address is not aligned");
+    if (generation != expected_generation)
+      return rdma_status::make(RDMA_SC_STALE_GENERATION,
+                               "UMEM page generation is stale");
+    return rdma_status::success();
+  endfunction
+endclass
+
+// 功能：rdma_umem 管理一段用户虚拟地址范围的页 pin、引用计数和 exactly-once unpin。
+// 输入/输出及副作用：调用方设置 Function、VA、length、page_size 和权限；pin/unpin 只更新本地页账本。
+// 失败/边界：零长度、非页对齐、非法页大小或 stale Function 被拒绝；重复 pin/unpin 幂等且不重复计数。
+class rdma_umem extends uvm_object;
+  `uvm_object_utils(rdma_umem)
+
+  rdma_function_handle function_h;
+  longint unsigned user_va;
+  longint unsigned length;
+  int unsigned page_size;
+  rdma_dma_permission_t permissions;
+  int unsigned generation;
+  rdma_resource_ownership_e ownership;
+  rdma_umem_page pages[$];
+  int unsigned pin_count;
+  int unsigned unpin_count;
+  int unsigned refcount;
+  bit pinned;
+  bit detached;
+
+  // 功能：构造 UMEM 并初始化空页账本与生命周期计数器。
+  // 输入/输出及副作用：name 为 UVM 对象名；不分配 host-mem 或改变外部页表。
+  // 失败/边界：构造出的对象必须经过字段配置和 pin_pages() 后才能使用。
+  function new(string name = "rdma_umem");
+    super.new(name);
+    function_h = null;
+    user_va = 0;
+    length = 0;
+    page_size = 4096;
+    permissions = '0;
+    generation = 0;
+    ownership = RDMA_OWNERSHIP_CONTROL_PLANE;
+    pages.delete();
+    pin_count = 0;
+    unpin_count = 0;
+    refcount = 0;
+    pinned = 1'b0;
+    detached = 1'b0;
+  endfunction
+
+  // 功能：校验 UMEM 的 Function authority、地址范围、页粒度和权限。
+  // 输入/输出及副作用：只读本地字段并返回状态，不 pin/unpin 或修改引用计数。
+  // 失败/边界：Function 为空/类型错误、长度未覆盖整数页、VA 未对齐或权限为空返回错误。
+  function rdma_status validate();
+    if (function_h == null || function_h.kind != RDMA_RESOURCE_FUNCTION)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "UMEM Function authority is invalid");
+    if (length == 0 || page_size == 0 ||
+        (page_size & (page_size - 1'b1)) != 0)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "UMEM length or page size is invalid");
+    if ((user_va % page_size) != 0 || (length % page_size) != 0)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "UMEM address range is not page aligned");
+    if (!(permissions.device_read || permissions.device_write))
+      return rdma_status::make(RDMA_SC_DMA_PERMISSION,
+                               "UMEM has no device DMA permission");
+    if (generation != function_h.generation)
+      return rdma_status::make(RDMA_SC_STALE_GENERATION,
+                               "UMEM Function generation is stale");
+    return rdma_status::success();
+  endfunction
+
+  // 功能：pin_pages 创建每个 page_size 粒度的页描述符并建立一次 pin 引用。
+  // 输入/输出及副作用：成功时填充 pages、pinned、refcount 和 pin_count；不拥有外部 host-mem 页。
+  // 失败/边界：已 pin 调用直接成功；校验或页对象创建失败时清空部分页并保持未 pin。
+  function rdma_status pin_pages();
+    rdma_status status;
+    longint unsigned page_count;
+    rdma_umem_page page;
+
+    if (pinned)
+      return rdma_status::success("UMEM pages were already pinned");
+    status = validate();
+    if (!status.ok()) return status;
+    page_count = length / page_size;
+    if (page_count == 0 || page_count > 64'hffff_ffff)
+      return rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED,
+                               "UMEM page count is out of range");
+    pages.delete();
+    for (int unsigned index = 0; index < page_count; index++) begin
+      page = rdma_umem_page::type_id::create(
+        $sformatf("%s_page_%0d", get_name(), index));
+      if (page == null) begin
+        pages.delete();
+        return rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED,
+                                 "UMEM page descriptor allocation failed");
+      end
+      page.host_va = user_va + index * page_size;
+      page.iova.value = page.host_va;
+      page.backing_addr.value = page.host_va;
+      page.length = page_size;
+      page.permissions = permissions;
+      page.generation = generation;
+      page.refcount = 1;
+      page.pinned = 1'b1;
+      page.borrowed = (ownership == RDMA_OWNERSHIP_BORROWED);
+      pages.push_back(page);
+    end
+    pinned = 1'b1;
+    detached = 1'b0;
+    refcount = 1;
+    pin_count++;
+    return rdma_status::success();
+  endfunction
+
+  // 功能：增加 UMEM 的共享引用，供 PBL/MW 绑定在异步生命周期中保持页有效。
+  // 输入/输出及副作用：成功时 refcount 加一；不改变 pin_count 或外部资源。
+  // 失败/边界：未 pin、已 detached 或 refcount 溢出返回 INVALID_STATE/RESOURCE_EXHAUSTED。
+  function rdma_status retain();
+    if (!pinned || detached)
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "cannot retain an unpinned UMEM");
+    if (refcount == 32'hffff_ffff)
+      return rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED,
+                               "UMEM reference count exhausted");
+    refcount++;
+    return rdma_status::success();
+  endfunction
+
+  // 功能：释放一个 UMEM 引用，并在引用归零时 exactly-once unpin 所有页。
+  // 输入/输出及副作用：成功归零时更新 pinned/unpin_count 和页状态；不释放 borrowed backing。
+  // 失败/边界：已 unpin 调用幂等返回成功；引用计数异常返回 INVALID_STATE。
+  function rdma_status release_ref();
+    if (!pinned)
+      return rdma_status::success("UMEM pages were already unpinned");
+    if (refcount == 0)
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "UMEM reference count is zero while pinned");
+    refcount--;
+    if (refcount != 0)
+      return rdma_status::success();
+    return unpin_pages();
+  endfunction
+
+  // 功能：撤销页 pin 并将 UMEM 置为终态，保证 unpin_count 只增加一次。
+  // 输入/输出及副作用：成功时清除 pages 的 pinned/refcount 并更新 pinned/unpin_count；borrowed 由调用方决定是否调用此函数。
+  // 失败/边界：重复调用幂等；detached borrowed UMEM 保持外部页不变。
+  function rdma_status unpin_pages();
+    if (!pinned)
+      return rdma_status::success("UMEM pages were already unpinned");
+    if (ownership == RDMA_OWNERSHIP_BORROWED) begin
+      detached = 1'b1;
+      return rdma_status::success("borrowed UMEM was detached");
+    end
+    foreach (pages[index]) begin
+      pages[index].pinned = 1'b0;
+      pages[index].refcount = 0;
+    end
+    pinned = 1'b0;
+    detached = 1'b0;
+    refcount = 0;
+    unpin_count++;
+    return rdma_status::success();
+  endfunction
+
+  // 功能：检查给定 IOVA/长度是否完全落在一个已 pin 的 UMEM 页序列中。
+  // 输入/输出及副作用：first_iova、access_length 为输入；只读页账本并返回状态。
+  // 失败/边界：范围溢出、越界、跨越无效页或代际不符均返回 DMA_TRANSLATION/STALE_GENERATION。
+  function rdma_status check_range(rdma_iova_t first_iova,
+                                   longint unsigned access_length);
+    longint unsigned end_iova;
+    longint unsigned mapping_end;
+    if (!pinned || pages.size() == 0)
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "UMEM has no pinned pages");
+    if (access_length == 0 ||
+        first_iova.value > 64'hffff_ffff_ffff_ffff - (access_length - 1))
+      return rdma_status::make(RDMA_SC_DMA_TRANSLATION,
+                               "UMEM range is empty or overflows");
+    end_iova = first_iova.value + access_length - 1;
+    mapping_end = pages[$].iova.value + pages[$].length - 1;
+    if (first_iova.value < pages[0].iova.value || end_iova > mapping_end)
+      return rdma_status::make(RDMA_SC_DMA_TRANSLATION,
+                               "UMEM range is outside pinned pages");
+    foreach (pages[index]) begin
+      if (pages[index].generation != generation || !pages[index].pinned)
+        return rdma_status::make(RDMA_SC_STALE_GENERATION,
+                                 "UMEM page is stale or unpinned");
+    end
+    return rdma_status::success();
+  endfunction
+endclass
+
+// 功能：rdma_pbl 保存多级页表目录、叶子页引用及其 MR authority 快照。
+// 输入/输出及副作用：由 rdma_pbl_builder 创建并填充；对象不复制或释放 UMEM 页。
+// 失败/边界：active=0 的 PBL 不得用于 DMA；directory_iovas 与 page_entries 数量必须一致且页不跨界。
+class rdma_pbl extends uvm_object;
+  `uvm_object_utils(rdma_pbl)
+
+  rdma_umem umem_ref;
+  rdma_function_handle function_h;
+  rdma_mr_page_layout page_layout;
+  rdma_mr_pbl_mode_e mode;
+  int unsigned level_count;
+  int unsigned page_count;
+  int unsigned page_size;
+  longint unsigned total_length;
+  rdma_iova_t first_iova;
+  rdma_iova_t directory_iova;
+  rdma_iova_t directory_iovas[$];
+  rdma_iova_t page_iovas[$];
+  rdma_umem_page page_entries[$];
+  rdma_resource_ownership_e ownership;
+  int unsigned generation;
+  bit active;
+  bit released;
+  int unsigned release_count;
+
+  // 功能：构造空 PBL 记录，默认处于 inactive/released 前状态。
+  // 输入/输出及副作用：name 为 UVM 对象名；只初始化本地字段，不接触 UMEM。
+  // 失败/边界：未由 builder 填充的 PBL 不能发布到 MR 或 MW。
+  function new(string name = "rdma_pbl");
+    super.new(name);
+    umem_ref = null;
+    function_h = null;
+    page_layout = rdma_mr_page_layout::type_id::create("pbl_page_layout");
+    mode = RDMA_MR_PBL0;
+    level_count = 0;
+    page_count = 0;
+    page_size = 0;
+    total_length = 0;
+    first_iova = '0;
+    directory_iova = '0;
+    directory_iovas.delete();
+    page_iovas.delete();
+    page_entries.delete();
+    ownership = RDMA_OWNERSHIP_CONTROL_PLANE;
+    generation = 0;
+    active = 1'b0;
+    released = 1'b0;
+    release_count = 0;
+  endfunction
+
+  // 功能：校验 PBL 的 Function、目录、叶子页和 UMEM 生命周期证据。
+  // 输入/输出及副作用：只读本地字段并返回状态，不修改 active/released。
+  // 失败/边界：目录为空、层级不足、页数不符、页跨界或代际不匹配返回错误。
+  function rdma_status validate();
+    if (!active || released)
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "PBL is not active");
+    if (umem_ref == null || function_h == null ||
+        function_h.kind != RDMA_RESOURCE_FUNCTION)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "PBL authority is incomplete");
+    if (!umem_ref.pinned || page_count == 0 ||
+        page_count != page_entries.size() || page_iovas.size() != page_count)
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "PBL page directory is incomplete");
+    if (level_count < 2 || directory_iovas.size() == 0)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "PBL is not multilevel");
+    if (generation != function_h.generation ||
+        generation != umem_ref.generation)
+      return rdma_status::make(RDMA_SC_STALE_GENERATION,
+                               "PBL generation is stale");
+    foreach (page_entries[index]) begin
+      if (page_entries[index] == null)
+        return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                                 "PBL contains a null page");
+      if ((page_entries[index].iova.value % page_size) != 0 ||
+          page_entries[index].length == 0 ||
+          page_entries[index].length > page_size)
+        return rdma_status::make(RDMA_SC_DMA_TRANSLATION,
+                                 "PBL page crosses its configured page size");
+      if (page_entries[index].generation != generation ||
+          !page_entries[index].pinned)
+        return rdma_status::make(RDMA_SC_STALE_GENERATION,
+                                 "PBL page authority is stale");
+    end
+    return rdma_status::success();
+  endfunction
+
+  // 功能：释放 PBL 目录引用并保证重复释放不再次修改资源账本。
+  // 输入/输出及副作用：成功首次调用将 active 清零并递增 release_count；不 unpin UMEM。
+  // 失败/边界：重复 release 幂等成功；borrowed PBL 只解除本地引用。
+  function rdma_status release_pbl();
+    if (released)
+      return rdma_status::success("PBL was already released");
+    active = 1'b0;
+    released = 1'b1;
+    release_count++;
+    return rdma_status::success();
+  endfunction
+endclass
+
+// 功能：rdma_pbl_builder::build_multilevel 将 UMEM 页序列组织为受检查的二级/三级目录。
+// 输入/输出及副作用：umem 为输入、pbl 为输出；成功时创建目录 IOVA 快照，不改变 UMEM pin/refcount。
+// 失败/边界：未 pin、页地址不齐、页跨界、目录溢出或 Function stale 时在提交前返回错误。
+class rdma_pbl_builder;
+  // 功能：根据页数构建每级最多 512 项的 PBL 目录并验证所有叶子页。
+  // 输入/输出及副作用：umem 只读；pbl 输出新对象，失败时保持 null，不释放调用方资源。
+  // 失败/边界：页数大于 512 使用三级目录；目录 IOVA 从 UMEM 首地址之后的 4 KiB 对齐空间合成。
+  static function rdma_status build_multilevel(rdma_umem umem,
+                                                output rdma_pbl pbl);
+    rdma_status status;
+    rdma_pbl candidate;
+    longint unsigned directory_count;
+    longint unsigned directory_base;
+    longint unsigned page_count;
+
+    pbl = null;
+    if (umem == null)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "PBL build UMEM is null");
+    status = umem.validate();
+    if (!status.ok()) return status;
+    if (!umem.pinned || umem.pages.size() == 0)
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "PBL build requires pinned UMEM");
+    page_count = umem.pages.size();
+    candidate = rdma_pbl::type_id::create("multilevel_pbl");
+    if (candidate == null)
+      return rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED,
+                               "PBL descriptor allocation failed");
+    candidate.umem_ref = umem;
+    candidate.function_h = umem.function_h;
+    candidate.generation = umem.generation;
+    candidate.page_size = umem.page_size;
+    candidate.total_length = umem.length;
+    candidate.first_iova.value = umem.pages[0].iova.value;
+    candidate.page_count = page_count;
+    candidate.level_count = (page_count <= 512) ? 2 : 3;
+    candidate.mode = (page_count <= 512) ? RDMA_MR_PBL1 : RDMA_MR_PBL2;
+    directory_count = (page_count + 511) / 512;
+    directory_base = (umem.pages[$].iova.value + umem.page_size + 4095) &
+                     ~64'hfff;
+    for (int unsigned index = 0; index < directory_count; index++) begin
+      candidate.directory_iovas.push_back('{value:
+        directory_base + index * 4096});
+    end
+    candidate.directory_iova = candidate.directory_iovas[0];
+    foreach (umem.pages[index]) begin
+      status = umem.pages[index].validate_page(umem.page_size,
+                                                umem.generation);
+      if (!status.ok()) return status;
+      candidate.page_entries.push_back(umem.pages[index]);
+      candidate.page_iovas.push_back(umem.pages[index].iova);
+    end
+    candidate.active = 1'b1;
+    candidate.released = 1'b0;
+    status = candidate.validate();
+    if (!status.ok()) return status;
+    pbl = candidate;
+    return rdma_status::success();
+  endfunction
+endclass
+
+typedef enum bit [1:0] {
+  RDMA_MW_UNBOUND = 2'd0,
+  RDMA_MW_BOUND = 2'd1,
+  RDMA_MW_INVALIDATED = 2'd2
+} rdma_mw_state_e;
+
+// 功能：rdma_mw_binding 管理 Memory Window 与 UMEM/PBL 的绑定、权限校验和失效。
+// 输入/输出及副作用：bind 保存非拥有 UMEM/PBL 引用；invalidate 按 MW→PBL→UMEM 顺序释放 owned backing。
+// 失败/边界：跨 Function/stale generation、无 bind 权限或 PBL 不匹配时拒绝；invalidate 重复调用幂等。
+class rdma_mw_binding extends uvm_object;
+  `uvm_object_utils(rdma_mw_binding)
+
+  rdma_function_handle function_h;
+  rdma_handle mw_h;
+  rdma_handle mr_h;
+  rdma_rdma_access_t access;
+  rdma_resource_ownership_e ownership;
+  rdma_mw_state_e state;
+  rdma_umem umem_ref;
+  rdma_pbl pbl_ref;
+  int unsigned generation;
+  bit invalidated;
+  int unsigned bind_count;
+  int unsigned invalidate_count;
+
+  // 功能：构造未绑定 MW 并清空 authority/backing 引用。
+  // 输入/输出及副作用：name 为 UVM 对象名；只初始化本地状态，不分配资源。
+  // 失败/边界：未设置 Function 或 MW handle 的对象只能用于显式错误测试。
+  function new(string name = "rdma_mw_binding");
+    super.new(name);
+    function_h = null;
+    mw_h = null;
+    mr_h = null;
+    access = '0;
+    ownership = RDMA_OWNERSHIP_CONTROL_PLANE;
+    state = RDMA_MW_UNBOUND;
+    umem_ref = null;
+    pbl_ref = null;
+    generation = 0;
+    invalidated = 1'b0;
+    bind_count = 0;
+    invalidate_count = 0;
+  endfunction
+
+  // 功能：绑定 MW 到已 pin UMEM 和 active PBL，并验证 Function/generation/权限 authority。
+  // 输入/输出及副作用：umem、pbl 为输入；成功时保存非拥有引用并进入 BOUND，不修改页内容。
+  // 失败/边界：空对象、PBL/UMEM 不一致、foreign Function、stale generation 或 bind 权限缺失均拒绝且不提交引用。
+  function rdma_status \bind (rdma_umem umem, rdma_pbl pbl);
+    rdma_status status;
+    rdma_function_handle expected_function;
+
+    if (state != RDMA_MW_UNBOUND || invalidated)
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "MW is already bound or invalidated");
+    if (umem == null || pbl == null)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "MW bind backing is null");
+    status = umem.validate();
+    if (!status.ok()) return status;
+    status = pbl.validate();
+    if (!status.ok()) return status;
+    if (pbl.umem_ref != umem)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "MW PBL does not reference UMEM");
+    expected_function = function_h == null ? umem.function_h : function_h;
+    if (expected_function == null ||
+        expected_function.function_uid != umem.function_h.function_uid ||
+        expected_function.object_id != umem.function_h.object_id)
+      return rdma_status::make(RDMA_SC_DMA_PERMISSION,
+                               "MW Function does not own UMEM");
+    if (expected_function.generation != umem.generation ||
+        expected_function.generation != pbl.generation)
+      return rdma_status::make(RDMA_SC_STALE_GENERATION,
+                               "MW Function generation is stale");
+    if (mw_h != null && mw_h.kind != RDMA_RESOURCE_MW)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "MW handle kind is invalid");
+    if (mr_h != null && mr_h.kind != RDMA_RESOURCE_MR)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "MR handle kind is invalid");
+    if ((access.local_write || access.remote_read || access.remote_write ||
+         access.remote_atomic) && !access.memory_window_bind)
+      return rdma_status::make(RDMA_SC_DMA_PERMISSION,
+                               "MW bind access omits bind permission");
+    function_h = expected_function;
+    generation = umem.generation;
+    umem_ref = umem;
+    pbl_ref = pbl;
+    state = RDMA_MW_BOUND;
+    invalidated = 1'b0;
+    bind_count++;
+    return rdma_status::success();
+  endfunction
+
+  // 功能：检查 MW 是否仍可访问给定范围和请求权限。
+  // 输入/输出及副作用：requested_function、first_iova、length、requested_access 为输入；只读绑定状态。
+  // 失败/边界：未绑定/已失效、authority 过期、范围越界或权限超集均返回错误。
+  function rdma_status check_access(rdma_function_handle requested_function,
+                                     rdma_iova_t first_iova,
+                                     longint unsigned length,
+                                     rdma_rdma_access_t requested_access);
+    if (state != RDMA_MW_BOUND || invalidated || umem_ref == null ||
+        pbl_ref == null)
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "MW is not active");
+    if (requested_function == null ||
+        requested_function.function_uid != function_h.function_uid ||
+        requested_function.object_id != function_h.object_id)
+      return rdma_status::make(RDMA_SC_DMA_PERMISSION,
+                               "MW access Function is foreign");
+    if (requested_function.generation != generation)
+      return rdma_status::make(RDMA_SC_STALE_GENERATION,
+                               "MW access Function is stale");
+    if ((requested_access & ~access) != '0)
+      return rdma_status::make(RDMA_SC_DMA_PERMISSION,
+                               "MW access exceeds bound rights");
+    return umem_ref.check_range(first_iova, length);
+  endfunction
+
+  // 功能：按 MW→PBL→UMEM 顺序失效绑定并释放 owned backing。
+  // 输入/输出及副作用：成功首次调用更新 state、invalidated 和 invalidate_count；borrowed 不 unpin 外部 UMEM。
+  // 失败/边界：重复调用幂等；任一步释放失败都保留未完成状态供安全重试。
+  function rdma_status invalidate();
+    rdma_status status;
+    if (invalidated || state == RDMA_MW_INVALIDATED)
+      return rdma_status::success("MW was already invalidated");
+    if (state != RDMA_MW_BOUND || umem_ref == null || pbl_ref == null)
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "MW has no active binding");
+    if (ownership == RDMA_OWNERSHIP_BORROWED) begin
+      umem_ref = null;
+      pbl_ref = null;
+      state = RDMA_MW_INVALIDATED;
+      invalidated = 1'b1;
+      invalidate_count++;
+      return rdma_status::success("borrowed MW was detached");
+    end
+    status = pbl_ref.release_pbl();
+    if (!status.ok()) return status;
+    status = umem_ref.unpin_pages();
+    if (!status.ok()) return status;
+    state = RDMA_MW_INVALIDATED;
+    invalidated = 1'b1;
+    invalidate_count++;
+    return rdma_status::success();
+  endfunction
+endclass
