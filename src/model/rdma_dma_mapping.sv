@@ -6,6 +6,12 @@
 // 中文说明：rdma_dma_mapping.sv 属于模型层，描述语义请求、资源快照、DMA 映射及生命周期数据。
 // 阅读提示：先看公开类型和接口，再看实现细节；失败路径应保持状态与资源所有权可追踪。
 
+// 前置声明：UMEM/PBL/MW 类型在 context_models.sv 中定义；DMA mapping 仅保存
+// 非拥有引用，避免把 page pin 或窗口释放责任隐式转移给映射对象。
+typedef class rdma_umem;
+typedef class rdma_pbl;
+typedef class rdma_mw_binding;
+
 class rdma_dma_mapping extends uvm_object;
   `uvm_object_utils(rdma_dma_mapping)
 
@@ -27,6 +33,12 @@ class rdma_dma_mapping extends uvm_object;
   rdma_dma_permission_t permissions;
   rdma_mapping_state_e state;
   rdma_handle owner_h;
+  // 中文：用户 buffer 关联对象均为非拥有引用；生命周期由 host-mem/MW 管理。
+  rdma_umem umem_ref;
+  rdma_pbl pbl_ref;
+  rdma_mw_binding mw_ref;
+  bit umem_backed;
+  int unsigned umem_page_count;
 
   // 功能：构造 rdma_dma_mapping，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：function_h=null；requester_bdf='0；pasid_valid=1'b0；pasid='0；dma_domain_valid=1'b0；dma_domain_id='0；route='0；reset_epoch=0；其余字段按实现默认值初始化。
   // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
@@ -50,6 +62,11 @@ class rdma_dma_mapping extends uvm_object;
     permissions = '0;
     state = RDMA_MAPPING_INVALID;
     owner_h = null;
+    umem_ref = null;
+    pbl_ref = null;
+    mw_ref = null;
+    umem_backed = 1'b0;
+    umem_page_count = 0;
   endfunction
 
   // Owned mappings are release capabilities.  Concrete allocation adapters
@@ -129,6 +146,11 @@ class rdma_dma_mapping extends uvm_object;
     direction = rhs_mapping.direction;
     permissions = rhs_mapping.permissions;
     state = rhs_mapping.state;
+    umem_ref = rhs_mapping.umem_ref;
+    pbl_ref = rhs_mapping.pbl_ref;
+    mw_ref = rhs_mapping.mw_ref;
+    umem_backed = rhs_mapping.umem_backed;
+    umem_page_count = rhs_mapping.umem_page_count;
     if (rhs_mapping.owner_h == null) begin
       owner_h = null;
     end

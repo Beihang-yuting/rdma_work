@@ -333,6 +333,29 @@ package rdma_host_mem_adapter_pkg;
     endfunction
   endclass
 
+  // 功能：记录真实 host_mem 后端为 UMEM 每页分配的地址，供 unpin 时逆序回收。
+  // 输入/输出及副作用：由 rdma_host_mem_adapter 创建并更新；只保存外部 manager 非拥有引用和地址快照。
+  // 失败/边界：active=0 表示页 backing 已回收；重复回收不得再次调用 host_mem.free。
+  class rdma_host_mem_umem_record extends uvm_object;
+    `uvm_object_utils(rdma_host_mem_umem_record)
+
+    rdma_umem umem;
+    host_mem_pkg::host_mem_api backing_mem;
+    bit [63:0] backing_addresses[$];
+    bit active;
+
+    // 功能：构造空 UMEM allocation record。
+    // 输入/输出及副作用：name 为 UVM 对象名；只初始化本地账本，不访问 host_mem。
+    // 失败/边界：未填充 umem/backing_mem 的记录不能提交到 adapter ledger。
+    function new(string name = "rdma_host_mem_umem_record");
+      super.new(name);
+      umem = null;
+      backing_mem = null;
+      backing_addresses.delete();
+      active = 1'b0;
+    endfunction
+  endclass
+
   class rdma_host_mem_adapter extends rdma_host_mem_api;
     `uvm_object_utils(rdma_host_mem_adapter)
 
@@ -351,6 +374,7 @@ package rdma_host_mem_adapter_pkg;
     protected bit [63:0] locked_iova_base;
     protected bit iova_cursor_valid;
     protected bit [64:0] next_iova;
+    protected rdma_host_mem_umem_record umem_allocations[$];
 
     // 功能：构造 rdma_host_mem_adapter，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：mem=null；iova_base='0；release_seal=new("adapter_release_seal")；iova_config_locked=1'b0；locked_iova_base='0；iova_cursor_valid=1'b0；next_iova='0。
     // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
@@ -364,6 +388,7 @@ package rdma_host_mem_adapter_pkg;
       locked_iova_base = '0;
       iova_cursor_valid = 1'b0;
       next_iova = '0;
+      umem_allocations.delete();
     endfunction
 
     // 功能：在 rdma_host_mem_adapter 中，clone_function_handle 将 rhs 中 rdma_host_mem_adapter 的值字段复制到当前对象，建立与源对象隔离的快照。
@@ -756,6 +781,84 @@ package rdma_host_mem_adapter_pkg;
       return rdma_status::success();
     endfunction
 
+    // 功能：pin_umem 将用户 VA 范围拆成 4 KiB 页，并为每页从真实 host_mem 后端申请 DMA backing。
+    // 输入/输出及副作用：function_h、user_va、length 为输入，umem 为输出；成功时写入真实页 IOVA 并登记回收地址。
+    // 失败/边界：任一页分配失败按逆序 free 已分配页，UMEM 保持未发布且不泄漏 host_mem。
+    virtual function rdma_status pin_umem(
+      rdma_function_handle function_h,
+      longint unsigned user_va,
+      longint unsigned length,
+      output rdma_umem umem
+    );
+      rdma_status status;
+      rdma_host_mem_umem_record record;
+      bit [63:0] backing_address;
+
+      umem = null;
+      if (mem == null)
+        return rdma_status::make(RDMA_SC_INVALID_STATE,
+                                 "host_mem API is not configured");
+      status = super.pin_umem(function_h, user_va, length, umem);
+      if (!status.ok()) return status;
+      record = rdma_host_mem_umem_record::type_id::create(
+        $sformatf("umem_allocation_%0d", umem_allocations.size()));
+      if (record == null) begin
+        umem.unpin_pages();
+        umem = null;
+        return rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED,
+                                 "UMEM allocation record creation failed");
+      end
+      record.umem = umem;
+      record.backing_mem = mem;
+      foreach (umem.pages[index]) begin
+        backing_address = mem.alloc(umem.page_size, umem.page_size,
+                                    `__FILE__, `__LINE__);
+        if (backing_address == 64'hffff_ffff_ffff_ffff) begin
+          for (int rollback = record.backing_addresses.size() - 1;
+               rollback >= 0; rollback--)
+            mem.free(record.backing_addresses[rollback],
+                     `__FILE__, `__LINE__);
+          umem.unpin_pages();
+          umem = null;
+          return rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED,
+                                   "host_mem UMEM page allocation failed");
+        end
+        record.backing_addresses.push_back(backing_address);
+        umem.pages[index].iova.value = backing_address;
+        umem.pages[index].backing_addr.value = backing_address;
+      end
+      record.active = 1'b1;
+      umem_allocations.push_back(record);
+      return rdma_status::success();
+    endfunction
+
+    // 功能：unpin_umem 回收真实 host_mem 页 backing，再执行 UMEM exactly-once unpin。
+    // 输入/输出及副作用：umem 为输入；成功首次调用逆序 free 页并将 ledger 置 inactive。
+    // 失败/边界：未知 UMEM 返回 DMA_TRANSLATION；重复调用保持幂等，不重复 free。
+    virtual function rdma_status unpin_umem(rdma_umem umem);
+      rdma_status status;
+      if (umem == null)
+        return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                                 "UMEM to unpin is null");
+      foreach (umem_allocations[index]) begin
+        if (umem_allocations[index] == null ||
+            umem_allocations[index].umem != umem)
+          continue;
+        if (!umem_allocations[index].active)
+          return rdma_status::success("UMEM backing was already released");
+        for (int rollback = umem_allocations[index].backing_addresses.size() - 1;
+             rollback >= 0; rollback--)
+          umem_allocations[index].backing_mem.free(
+            umem_allocations[index].backing_addresses[rollback],
+            `__FILE__, `__LINE__);
+        status = umem.unpin_pages();
+        if (!status.ok()) return status;
+        umem_allocations[index].active = 1'b0;
+        return rdma_status::success();
+      end
+      return super.unpin_umem(umem);
+    endfunction
+
     // 功能：在 rdma_host_mem_adapter 中，write 把请求数据写入指定后端并保留返回状态；只有写入成功才允许本地游标继续推进。
     // 输入/输出及副作用：mapping（输入）、offset（输入）、data（输入）；输入 request/image/cursor 决定写入内容；成功时更新 PI/CI、slot ledger 或 pending
     //   journal，并通过 output 返回结果。
@@ -924,6 +1027,10 @@ package rdma_host_mem_adapter_pkg;
         if (allocations[i] != null && allocations[i].active)
           leak_count++;
       end
+      foreach (umem_allocations[i]) begin
+        if (umem_allocations[i] != null && umem_allocations[i].active)
+          leak_count++;
+      end
       if (mem == null)
         return rdma_status::make(RDMA_SC_INVALID_STATE,
                                  "host_mem API is not configured");
@@ -943,6 +1050,21 @@ package rdma_host_mem_adapter_pkg;
         if (!already_checked) begin
           allocations[i].backing_mem.leak_check(`__FILE__, `__LINE__);
           checked_mem.push_back(allocations[i].backing_mem);
+        end
+      end
+      foreach (umem_allocations[i]) begin
+        if (umem_allocations[i] == null || umem_allocations[i].backing_mem == null)
+          continue;
+        already_checked = 1'b0;
+        foreach (checked_mem[j]) begin
+          if (checked_mem[j] == umem_allocations[i].backing_mem) begin
+            already_checked = 1'b1;
+            break;
+          end
+        end
+        if (!already_checked) begin
+          umem_allocations[i].backing_mem.leak_check(`__FILE__, `__LINE__);
+          checked_mem.push_back(umem_allocations[i].backing_mem);
         end
       end
       if (leak_count != 0)

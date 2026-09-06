@@ -65,6 +65,78 @@ virtual class rdma_host_mem_api extends uvm_object;
     return \release (mapping);
   endfunction
 
+  // 功能：pin_umem 为用户态 VA 范围建立 UMEM 页描述和 pin 引用。
+  // 输入/输出及副作用：function_h、user_va、length 为输入，umem 为输出；默认实现只建立模型页，不触碰外部 host-mem。
+  // 失败/边界：空 Function、零/非页对齐范围和 generation 不匹配返回错误；成功返回的 UMEM 必须已 pin。
+  virtual function rdma_status pin_umem(
+    rdma_function_handle function_h,
+    longint unsigned user_va,
+    longint unsigned length,
+    output rdma_umem umem
+  );
+    rdma_status status;
+
+    umem = null;
+    if (function_h == null || function_h.kind != RDMA_RESOURCE_FUNCTION)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "UMEM Function authority is invalid");
+    umem = rdma_umem::type_id::create("host_mem_umem");
+    if (umem == null)
+      return rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED,
+                               "UMEM descriptor allocation failed");
+    umem.function_h = function_h;
+    umem.user_va = user_va;
+    umem.length = length;
+    umem.page_size = 4096;
+    umem.generation = function_h.generation;
+    umem.permissions = '{device_read:1'b1, device_write:1'b1, atomic:1'b0};
+    status = umem.pin_pages();
+    if (!status.ok()) umem = null;
+    return status;
+  endfunction
+
+  // 功能：unpin_umem 释放由 pin_umem 返回的 UMEM pin 引用。
+  // 输入/输出及副作用：umem 为输入；默认实现调用 UMEM exactly-once unpin，不释放 borrowed 外部页。
+  // 失败/边界：空 UMEM 返回 INVALID_ARGUMENT；重复调用保持幂等成功。
+  virtual function rdma_status unpin_umem(rdma_umem umem);
+    if (umem == null)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "UMEM to unpin is null");
+    return umem.unpin_pages();
+  endfunction
+
+  // 功能：build_umem_pbl 组合 PBL 构建并把非拥有引用写入 DMA mapping。
+  // 输入/输出及副作用：umem 为输入，mapping 为输出；成功时 mapping 仅保存 UMEM/PBL 引用，不改变其所有权。
+  // 失败/边界：PBL 构建失败时不返回半成品 mapping，且不会隐式释放调用方已有 UMEM。
+  virtual function rdma_status build_umem_pbl(
+    rdma_umem umem,
+    output rdma_dma_mapping mapping
+  );
+    rdma_pbl pbl;
+    rdma_status status;
+
+    mapping = null;
+    if (umem == null)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "UMEM mapping source is null");
+    status = rdma_pbl_builder::build_multilevel(umem, pbl);
+    if (!status.ok()) return status;
+    mapping = rdma_dma_mapping::type_id::create("umem_dma_mapping");
+    if (mapping == null)
+      return rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED,
+                               "UMEM DMA mapping allocation failed");
+    mapping.function_h = umem.function_h;
+    mapping.iova = umem.pages[0].iova;
+    mapping.backing_addr = umem.pages[0].backing_addr;
+    mapping.size = umem.length;
+    mapping.state = RDMA_MAPPING_ACTIVE;
+    mapping.umem_ref = umem;
+    mapping.pbl_ref = pbl;
+    mapping.umem_backed = 1'b1;
+    mapping.umem_page_count = umem.pages.size();
+    return rdma_status::success();
+  endfunction
+
   // ABI v5 生命周期约束：host-mem mapping 的 release 只能由 owned record
   // 触发一次；borrowed mapping 的所有权仍留在外部 host-mem manager。
 endclass

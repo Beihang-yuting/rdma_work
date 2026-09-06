@@ -99,6 +99,7 @@ package rdma_unit_test_pkg;
   `include "unit/rdma_function_identity_test.sv"
   `include "unit/rdma_queue_txn_journal_test.sv"
   `include "unit/rdma_abi_v5_adapter_test.sv"
+  `include "unit/rdma_umem_pbl_mw_test.sv"
 `ifdef RDMA_NET_PACKET
   `include "integration/rdma_net_packet_adapter_test.sv"
 `endif
@@ -124,4 +125,5 @@ endpackage
   `include "uvm_macros.svh"
   `include "integration/rdma_host_mem_adapter_test.sv"
   `include "integration/rdma_queue_data_engine_host_mem_test.sv"
+  `include "integration/rdma_host_mem_umem_test.sv"
 `endif
