@@ -110,6 +110,7 @@ package rdma_unit_test_pkg;
 `endif
 `ifdef RDMA_PCIE_WORK_TEST
   `include "integration/rdma_pcie_work_adapter_test.sv"
+  `include "integration/rdma_sriov_enumeration_test.sv"
 `endif
 `ifdef RDMA_DPU_INTEGRATION
   `include "integration/rdma_dpu_integration_test.sv"
@@ -136,4 +137,11 @@ endpackage
   `include "integration/rdma_host_mem_adapter_test.sv"
   `include "integration/rdma_queue_data_engine_host_mem_test.sv"
   `include "integration/rdma_host_mem_umem_test.sv"
+`ifdef RDMA_NET_PACKET
+  // 双 env 端到端测试必须在 host_mem 的 $unit 类型和 net_packet 适配器
+  // 都完成编译后再展开，避免把外部依赖复制进本仓库或形成循环 typedef。
+  import rdma_net_packet_adapter_pkg::*;
+  import rdma_net_packet_bridge_pkg::*;
+  `include "integration/rdma_end_to_end_dual_env_test.sv"
+`endif
 `endif

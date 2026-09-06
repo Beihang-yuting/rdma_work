@@ -14,24 +14,6 @@ package rdma_pcie_work_adapter_pkg;
   import rdma_adapter_pkg::*;
   `include "uvm_macros.svh"
 
-  // 功能：保存从 pcie_tl_sriov_cap 读取的 SR-IOV 静态/动态字段及 VF BAR
-  //   描述，供 RDMA 层以值快照形式消费，避免暴露外部 capability 对象。
-  // 输入/输出及副作用：字段由 discover_sriov() 填充；数组是 detached copy，
-  //   调用方修改快照不会改变 pcie_work manager。
-  // 失败/边界：未发现 capability 时返回全零快照并由调用方检查 status；
-  //   first_vf_offset/vf_stride/total_vfs 为零表示后端未提供可用拓扑。
-  typedef struct {
-    bit [15:0] first_vf_offset;
-    bit [15:0] vf_stride;
-    bit [15:0] total_vfs;
-    bit [15:0] num_vfs;
-    bit        vf_enable;
-    bit        vf_mse;
-    bit [15:0] vf_device_id;
-    bit [63:0] vf_bar_base[6];
-    bit [63:0] vf_bar_size[6];
-  } rdma_pcie_sriov_info;
-
   class rdma_pcie_work_adapter extends rdma_pcie_api;
     `uvm_object_utils(rdma_pcie_work_adapter)
 
@@ -269,7 +251,7 @@ package rdma_pcie_work_adapter_pkg;
     //   输出数组由值复制生成。
     // 失败/边界：VF BDF、unknown/disabled PF、缺失 capability 或非法 PF index 返回
     //   INVALID_ARGUMENT/PCIE_COMPLETION/INVALID_STATE；不根据 vf_index 猜测 capability。
-    function rdma_status discover_sriov(
+    virtual function rdma_status discover_sriov(
       rdma_bdf_t pf_bdf,
       output rdma_pcie_sriov_info info
     );
@@ -292,16 +274,21 @@ package rdma_pcie_work_adapter_pkg;
       if (sc == null)
         return status_for(RDMA_SC_INVALID_STATE,
                           "PF has no SR-IOV capability");
+      info.cap_offset = sc.offset;
       info.first_vf_offset = sc.first_vf_offset;
       info.vf_stride = sc.vf_stride;
       info.total_vfs = sc.total_vfs;
       info.num_vfs = sc.num_vfs;
+      info.ari_capable_hierarchy = sc.ari_capable_hierarchy;
+      info.ari_capable = sc.ari_capable;
       info.vf_enable = sc.vf_enable;
       info.vf_mse = sc.vf_mse;
       info.vf_device_id = sc.vf_device_id;
       foreach (info.vf_bar_base[i]) begin
         info.vf_bar_base[i] = sc.vf_bar[i];
         info.vf_bar_size[i] = sc.vf_bar_size[i];
+        info.vf_bar_flags[i] = sc.vf_bar_flags[i];
+        info.vf_bar_owner[i] = sc.vf_bar_owner[i];
       end
       return status_for(RDMA_SC_OK, "SR-IOV capability discovered",
                         0, int'(func_mgr.config_generation));

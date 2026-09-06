@@ -16,6 +16,8 @@ package rdma_core_pkg;
 
   `include "rdma_stag_key_policy.sv"
   `include "rdma_hmc_allocator.sv"
+  `include "rdma_pcie_bar_allocator.sv"
+  `include "rdma_sriov_enumerator.sv"
   `include "rdma_resource_manager.sv"
   `include "rdma_queue_lifecycle_policy.sv"
   `include "rdma_queue_backing_planner.sv"

@@ -6,6 +6,29 @@
 // 中文说明：rdma_pcie_api.sv 属于适配器接口层，定义主机内存、PCIe、网络及上下文后端接口。
 // 阅读提示：先看公开类型和接口，再看实现细节；失败路径应保持状态与资源所有权可追踪。
 
+// 功能：保存 PCIe SR-IOV capability 的值快照，供枚举 sequence 在不依赖外部
+//   pcie_work 类型的前提下读取 PF/VF 拓扑和 VF BAR 描述。
+// 输入/输出及副作用：所有字段由 discover_sriov() 填充；数组是 detached value copy，
+//   调用方修改快照不会改变外部 PCIe manager。
+// 失败/边界：cap_offset、first_vf_offset、vf_stride 或 total_vfs 为零时，调用方必须
+//   将其视为不可枚举；该结构本身不产生错误码，也不拥有外部 capability 对象。
+typedef struct {
+  bit [11:0] cap_offset;
+  bit [15:0] first_vf_offset;
+  bit [15:0] vf_stride;
+  bit [15:0] total_vfs;
+  bit [15:0] num_vfs;
+  bit        ari_capable_hierarchy;
+  bit        ari_capable;
+  bit        vf_enable;
+  bit        vf_mse;
+  bit [15:0] vf_device_id;
+  bit [63:0] vf_bar_base[6];
+  bit [63:0] vf_bar_size[6];
+  bit [31:0] vf_bar_flags[6];
+  bit [2:0]  vf_bar_owner[6];
+} rdma_pcie_sriov_info;
+
 virtual class rdma_pcie_api extends uvm_object;
 
   // 功能：构造 rdma_pcie_api，调用 super.new 建立 UVM 层级对象；外部依赖字段保持未绑定，后续由 configure/build/activate 明确注入。
@@ -13,6 +36,21 @@ virtual class rdma_pcie_api extends uvm_object;
   // 失败/边界：rdma_pcie_api 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_pcie_api");
     super.new(name);
+  endfunction
+
+  // 功能：从 PF 的 canonical 配置空间发现 SR-IOV capability，向上层提供 value
+  //   snapshot；具体 PCIe backend 可覆盖该默认实现。
+  // 输入/输出及副作用：pf_bdf（输入）、info（输出）；成功实现只写入 info，不修改
+  //   PF/VF 启用状态；默认实现返回 UNSUPPORTED_OPCODE。
+  // 失败/边界：未实现 capability discovery 的 endpoint 必须显式返回 UNSUPPORTED_OPCODE，
+  //   不允许返回全零快照并被枚举器误认为有效拓扑。
+  virtual function rdma_status discover_sriov(
+    rdma_bdf_t pf_bdf,
+    output rdma_pcie_sriov_info info
+  );
+    info = '{default:'0};
+    return rdma_status::make(RDMA_SC_UNSUPPORTED_OPCODE,
+                             "PCIe backend does not expose SR-IOV discovery");
   endfunction
 
   // 功能：在 rdma_pcie_api 中，cfg_read32 把 cfg_read32 的配置/编程请求提交到后端适配器，并返回后端确认状态。
