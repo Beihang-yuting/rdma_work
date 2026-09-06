@@ -1,4 +1,5 @@
 +incdir+../tests
++incdir+../tests/mocks
 +incdir+../src/types
 +incdir+../src/model
 +incdir+../src/codec
@@ -7,12 +8,13 @@
 +incdir+../src/adapters/net_packet
 +incdir+$(NET_PACKET_ROOT)/src
 +incdir+$(NET_PACKET_ROOT)/src/core
++incdir+$(NET_PACKET_ROOT)/src/common
++incdir+$(NET_PACKET_ROOT)/src/protocols
 ../src/types/rdma_types_pkg.sv
 ../src/model/rdma_model_pkg.sv
 ../src/codec/rdma_codec_pkg.sv
 ../src/adapter/rdma_adapter_pkg.sv
 ../src/core/rdma_core_pkg.sv
-$(NET_PACKET_ROOT)/src/core/packet.sv
 ../src/adapters/net_packet/rdma_net_packet_adapter_pkg.sv
 ../src/adapters/net_packet/rdma_net_packet_bridge.sv
 ../tests/rdma_unit_test_pkg.sv

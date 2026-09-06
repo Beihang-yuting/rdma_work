@@ -6,7 +6,7 @@
 
 **Architecture:** RDMA core 继续只依赖抽象 adapter 和 `dpu_common` snapshot；CQE、SQE/WQE、ABI/host-mem、CMQ 和 net_packet 分成边界清晰、可单独验证的任务。`rdma_net_packet_adapter` 位于 adapter 层，将 `rdma_packet` 值快照转换为外部 `packet`，通过注入 sink 连接 AXIS/PCIe/DUT，不在 core 创建外部环境。
 
-**Tech Stack:** SystemVerilog、UVM 1.2、Synopsys VCS、GNU Make、Bash、Python checker；外部 `net_packet` 固定提交 `e2af70204f53ede65e366c7a65f695c59acdbbc5`。
+**Tech Stack:** SystemVerilog、UVM 1.2、Synopsys VCS、GNU Make、Bash、Python checker；外部 `net_packet` 固定提交 `6766c4f042484814548481065328ffbcffab590f`（该提交实际包含 `src/core/packet.sv` 及 RDMA 协议头）。
 
 **Spec:** `docs/superpowers/specs/2026-09-05-rdma-driver-gap-closure-design.md`
 
@@ -237,7 +237,7 @@ git commit -m "feat: implement ud urc and extended wqe semantics"
 - Consumes: `rdma_net_api`、`rdma_packet`、`rdma_net_response_policy`、`rdma_net_fault`、dpu_common Function snapshot，以及外部 `packet`/`rocev2_bth`/`iwarp_header` 类。
 - Produces: `rdma_net_packet_adapter`（`send_packet`、`receive_packet`、`register_observer`、`configure_response_policy`、`inject_fault`）；`rdma_net_packet_sink` 的 `send(packet pkt, output rdma_status status)` 和 `receive(output packet pkt, output rdma_status status)`；`make net_packet TEST=rdma_net_packet_adapter_test`。
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```systemverilog
 task automatic test_rocev2_rc_send_round_trip();
@@ -251,25 +251,25 @@ task automatic test_rocev2_rc_send_round_trip();
 endtask
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
-Run: `NET_PACKET_ROOT=/home/ubuntu/workspace/rdma_deps/net_packet-e2af702 \
+Run: `NET_PACKET_ROOT=/home/ubuntu/workspace/rdma_deps/net_packet-6766c4f \
   scripts/run_vcs53.sh net_packet rdma_net_packet_adapter_test`
 
 Expected: FAIL because the adapter package, filelist and Makefile target do not exist.
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 Compile the external `net_packet` filelist before the adapter bridge. Build Ethernet + IPv4/IPv6 + UDP + RoCEv2 layers for RC/UD; fill BTH/RETH/AETH/DETH/IETH from `rdma_packet` metadata and payload, call `do_pack()`, then publish a value snapshot to the sink. For iWARP use the iWARP layer and preserve raw bytes. Apply drop/corrupt/delay only in the adapter after Function/generation/epoch validation. Receive parses `raw_data`, validates checksum/ICRC and converts to `rdma_packet`; no PI/CI or CQE state is changed here.
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
-Run: `NET_PACKET_ROOT=/home/ubuntu/workspace/rdma_deps/net_packet-e2af702 \
+Run: `NET_PACKET_ROOT=/home/ubuntu/workspace/rdma_deps/net_packet-6766c4f \
   scripts/run_vcs53.sh net_packet rdma_net_packet_adapter_test`
 
 Expected: PASS for RC SEND, RC WRITE, UD SEND, iWARP and drop/corrupt/delay cases with zero UVM warnings/errors/fatals.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/adapters/net_packet src/adapter/rdma_adapter_pkg.sv sim/filelists/net_packet.f sim/Makefile tests/integration/rdma_net_packet_adapter_test.sv
@@ -469,7 +469,7 @@ Run on 53:
 scripts/run_vcs53.sh core regression
 scripts/run_vcs53.sh integration regression
 HOST_MEM_ROOT=/home/ubuntu/workspace/rdma_deps/host_mem-3b9e000 scripts/run_vcs53.sh host_mem regression
-NET_PACKET_ROOT=/home/ubuntu/workspace/rdma_deps/net_packet-e2af702 scripts/run_vcs53.sh net_packet regression
+NET_PACKET_ROOT=/home/ubuntu/workspace/rdma_deps/net_packet-6766c4f scripts/run_vcs53.sh net_packet regression
 ```
 
 Expected: all suites compile and finish with zero UVM warnings/errors/fatals; static checker and `git diff --check` are clean.

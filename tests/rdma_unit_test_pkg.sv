@@ -32,6 +32,10 @@ package rdma_unit_test_pkg;
   import host_mem_pkg::*;
   import rdma_host_mem_adapter_pkg::*;
 `endif
+`ifdef RDMA_NET_PACKET
+  import rdma_net_packet_adapter_pkg::*;
+  import rdma_net_packet_bridge_pkg::*;
+`endif
   `include "uvm_macros.svh"
 
   `include "rdma_mock_adapters.sv"
@@ -94,6 +98,9 @@ package rdma_unit_test_pkg;
   `include "unit/rdma_sq_payload_writer_test.sv"
   `include "unit/rdma_function_identity_test.sv"
   `include "unit/rdma_queue_txn_journal_test.sv"
+`ifdef RDMA_NET_PACKET
+  `include "integration/rdma_net_packet_adapter_test.sv"
+`endif
 `ifdef RDMA_DPU_INTEGRATION
   `include "integration/rdma_dpu_integration_test.sv"
   `include "unit/rdma_host_mem_router_test.sv"

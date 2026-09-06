@@ -9,7 +9,9 @@ override HOST_MEM_PKG_SHA256 := d2ba57918a3b605525274433008142c80921b6205b0848c7
 override HOST_MEM_MANAGER_SHA256 := 8dd5ca3ba3abcfae4808c8ea10c34ced279316bebdc04f6f8e0ae5e55e337a9d
 override RDMA_ARCHIVE := /home/ubuntu/workspace/Desktop.zip
 override RDMA_ARCHIVE_PREFIX := dpu_kernel_rdma-version_0.1.34
-override NET_PACKET_PINNED_COMMIT := e2af70204f53ede65e366c7a65f695c59acdbbc5
+# 6766c4f is the net_packet master snapshot that contains packet.sv and the
+# RoCEv2/iWARP protocol headers consumed by this adapter.
+override NET_PACKET_PINNED_COMMIT := 6766c4f042484814548481065328ffbcffab590f
 TEST ?= rdma_smoke_test
 VCS ?= vcs
 # Work around a VCS W-2024.09-SP1 class-codegen miscompile; not an RTL requirement.
@@ -148,6 +150,8 @@ net_packet_preflight:
 
 net_packet: net_packet_preflight
 	mkdir -p build/net_packet
-	$(VCS) $(VCS_FLAGS) +define+RDMA_NET_PACKET +incdir+$(NET_PACKET_ROOT)/src -f filelists/net_packet.f -top tb_top -o build/net_packet/simv
+	# VCS 不会替换 filelist 中的 GNU make 变量；先生成只读依赖路径展开后的临时 filelist。
+	sed 's|\$$(NET_PACKET_ROOT)|$(NET_PACKET_ROOT)|g' filelists/net_packet.f > build/net_packet/net_packet.expanded.f
+	$(VCS) $(VCS_FLAGS) +define+RDMA_NET_PACKET +incdir+$(NET_PACKET_ROOT)/src +incdir+$(NET_PACKET_ROOT)/src/common +incdir+$(NET_PACKET_ROOT)/src/protocols -f build/net_packet/net_packet.expanded.f -top tb_top -o build/net_packet/simv
 	build/net_packet/simv +UVM_TESTNAME=$(TEST) | tee build/net_packet/$(TEST).log
 	../scripts/check_uvm_summary.sh build/net_packet/$(TEST).log

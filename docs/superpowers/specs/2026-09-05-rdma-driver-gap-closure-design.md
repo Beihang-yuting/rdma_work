@@ -11,8 +11,9 @@ Function/authority/generation 隔离，同时不把外部组件耦合进 RDMA co
 
 - `dpu_common` 继续作为 Host、PF/VF、BDF、BAR、global Function ID 和 topology
   的唯一权威；RDMA 只消费其不可变 snapshot。
-- `net_packet` 使用 GitHub `main` 当前固定提交
-  `e2af70204f53ede65e366c7a65f695c59acdbbc5`。依赖目录由仿真环境提供，不能把
+- `net_packet` 使用 GitHub `master` 固定提交
+  `6766c4f042484814548481065328ffbcffab590f`。该提交包含 `src/core/packet.sv`、
+  RoCEv2 与 iWARP 协议头；依赖目录由仿真环境提供，不能把
   外部源码复制进本仓库或在 core package 中直接 import 外部 package。
 - 外部 PCIe、host-mem、AXIS VIP 和 net_packet 的对象生命周期仍由各自环境管理。
   RDMA adapter 只保存非拥有引用，并在每次发送/接收前验证 function UID、generation
