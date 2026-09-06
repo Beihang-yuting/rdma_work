@@ -19,13 +19,41 @@ class rdma_wqe_extended_opcode_test extends uvm_test;
     phase.raise_objection(this);
     req=rdma_post_send_req::type_id::create("bad_ud_rc"); req.qp_h=h(RDMA_RESOURCE_QP); req.transport=RDMA_TRANSPORT_UD; req.opcode=RDMA_WR_RDMA_WRITE; req.remote_access_valid=1; req.rkey_valid=1; req.inline_data=1; req.payload.push_back(8'h1);
     s=req.validate(); if (s==null || s.ok()) `uvm_error("EXT_REJECT","UD accepted RC-only fields")
-    req.opcode=RDMA_WR_SEND_WITH_INV; req.destination_qpn=1; req.qkey=1; req.address_vector_valid=1; req.address_vector=rdma_address_vector::type_id::create("av"); req.invalidate_rkey=32'h1234; req.payload.delete(); req.payload.push_back(8'h2);
-    s=rdma_queue_codec::encode_sqe(req,image); if (s==null || !s.ok()) `uvm_error("EXT_ENCODE","typed SEND_WITH_INV rejected")
+    // 复用请求对象切换到 UD 时清除上一个 RC 操作遗留的远端 authority。
+    req.opcode=RDMA_WR_SEND_WITH_INV; req.destination_qpn=1; req.qkey=1; req.address_vector_valid=1; req.address_vector=rdma_address_vector::type_id::create("av"); req.invalidate_rkey=32'h1234; req.remote_access_valid=0; req.rkey_valid=0; req.sgb_iova.value=64'h2000; req.payload.delete(); req.payload.push_back(8'h2);
+    s=rdma_queue_codec::encode_sqe(req,image); if (s==null || !s.ok()) `uvm_error("EXT_ENCODE",$sformatf("typed SEND_WITH_INV rejected: %s", s == null ? "null status" : s.message))
     req.transport=RDMA_TRANSPORT_URC; req.completion_qp_h=h(RDMA_RESOURCE_QP); req.destination_qpn=7;
+    req.opcode=RDMA_WR_SEND; req.inline_data=0; req.payload.delete(); req.sges.delete();
+    begin
+      rdma_sge sg; sg=rdma_sge::type_id::create("urc_sge"); sg.length=8; sg.lkey=32'h77; sg.iova.value=64'h4000; req.sges.push_back(sg);
+    end
     s=rdma_queue_codec::encode_sqe(req,image);
-    if (s==null || s.ok() || s.code != RDMA_SC_UNSUPPORTED_OPCODE)
-      `uvm_error("URC_PROFILE","URC missing completion-QP profile was not explicit")
+    if (s==null || !s.ok())
+      `uvm_error("URC_PROFILE",$sformatf("URC SEND codec rejected valid completion-QP profile: %s", s == null ? "null status" : s.message))
     req.completion_qp_h=null; s=req.validate(); if (s==null || s.ok()) `uvm_error("URC_AUTH","URC accepted missing completion QP")
+    // 当前 64B SQE profile 没有驱动 REG_MR/BIND_MW/FLUSH 的固定 body；
+    // 语义层仍校验 authority，codec 必须显式返回 UNSUPPORTED，而不能
+    // 静默生成一个可能被硬件误解释的普通 SEND WQE。
+    req=rdma_post_send_req::type_id::create("reg_mr_boundary");
+    req.qp_h=h(RDMA_RESOURCE_QP); req.transport=RDMA_TRANSPORT_RC;
+    req.opcode=RDMA_WR_REG_MR; req.mr_h=h(RDMA_RESOURCE_MR);
+    s=rdma_queue_codec::encode_sqe(req,image);
+    if (s==null || s.code != RDMA_SC_UNSUPPORTED_OPCODE)
+      `uvm_error("REG_MR_PROFILE","REG_MR unsupported boundary was not explicit")
+    req=rdma_post_send_req::type_id::create("bind_mw_boundary");
+    req.qp_h=h(RDMA_RESOURCE_QP); req.transport=RDMA_TRANSPORT_RC;
+    req.opcode=RDMA_WR_BIND_MW; req.mr_h=h(RDMA_RESOURCE_MR);
+    req.mw_h=h(RDMA_RESOURCE_MW);
+    s=rdma_queue_codec::encode_sqe(req,image);
+    if (s==null || s.code != RDMA_SC_UNSUPPORTED_OPCODE)
+      `uvm_error("BIND_MW_PROFILE","BIND_MW unsupported boundary was not explicit")
+    req=rdma_post_send_req::type_id::create("flush_boundary");
+    req.qp_h=h(RDMA_RESOURCE_QP); req.transport=RDMA_TRANSPORT_RC;
+    req.opcode=RDMA_WR_FLUSH; req.authority_h=h(RDMA_RESOURCE_QP);
+    req.authority_h.object_id=req.qp_h.object_id;
+    s=rdma_queue_codec::encode_sqe(req,image);
+    if (s==null || s.code != RDMA_SC_UNSUPPORTED_OPCODE)
+      `uvm_error("FLUSH_PROFILE","FLUSH unsupported boundary was not explicit")
     phase.drop_objection(this);
   endtask
 endclass

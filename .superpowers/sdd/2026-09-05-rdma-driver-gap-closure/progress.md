@@ -100,3 +100,55 @@ Task 2: follow-up recovery/SRQ round (engine-owned published-cleanup recovery, r
 - Task 3: complete (commits `bb9cf2b..1b3ba90`, review clean).
 - Task 3 post-review verification: controller reran `scripts/run_vcs53.sh core rdma_cq_shadow_flush_test` on host 53; UVM `info=3 warning=0 error=0 fatal=0`, summary pristine. `git diff --check` passed.
 - Ruling: defer adding `rdma_cq_shadow_flush_test` to `scripts/run_queue_lifecycle_regression53.sh` until Task 9, which explicitly owns final regression lists; current Python manifest check is 108/109 with only that expected missing entry. Cost if wrong: the branch carries one known static manifest failure through Tasks 4–8 and requires Task 9 to close it before final completion.
+
+## Task 4 execution
+
+- Worktree remains `.worktrees/rdma-cq-shadow` on `feature/rdma-cq-shadow`.
+- BASE: `ce9110343d67ee134496b835c3fdc47feb54a71f` (`docs: record cq shadow task completion`).
+- Task 4: started; implementer must preserve Task 2 CQE layout and Task 3 shared-shadow authority/evidence contracts, and obtain VCS53 RED before production edits.
+- Task 4 implementation commits: `f2d299b`, `e645b1f`, `8308083`; implementer reports RED for missing `encode_sqe`, focused VCS compile/simulation complete, and `git diff --check` passed. Concern recorded: no control-WQE hardware profile exists for posting REG_MR/BIND_MW/FLUSH.
+- Task 4 review package: `review-ce91103..8308083.diff`; task review pending.
+- Task 4 review verdict: Needs fixes. Important findings: UD SEND_WITH_INV contradicted by extension validation; queue_data drops inline/payload; URC completion QP not represented/encoded; REG_MR/BIND_MW/FLUSH policy branch unreachable; tests/comments insufficient. Fix round 1 started with original implementer resumed.
+
+- Task 4 fix round 1/5: completed in the same worktree. UD SQE now uses the driver-specific
+  8-qword layout (AH, destination QPN/Q_Key, SGB PA, payload length and signature) without
+  overlapping RC remote fields; nonzero payload requires a nonzero 512-byte-aligned SGB IOVA
+  and the 14-bit payload limit is enforced. UD qword1 reserved-bit checking is opcode-aware:
+  ordinary SEND rejects the immediate/key half, SEND_WITH_IMM/SEND_WITH_INV allow it, and
+  bit25 remains reserved. The focused red test caught the old mask accepting ordinary SEND
+  high bits before the dynamic mask was restored.
+- URC SEND now requires and validates a completion-QP authority, preserves URC mode, applies
+  SEND_WITH_INV fence semantics, and shares only the RC data-plane body fields that are
+  actually present. UD/URC image decode remains an explicit `RDMA_SC_UNSUPPORTED_OPCODE`
+  boundary because a detached 64-byte image cannot authenticate external SGB/AH or completion
+  QP evidence.
+- Atomic requests now project local IOVA/LKey and compare/swap-add operands through the SQE
+  facade. Runtime posting checks QP route identity, Function UID/generation, completion-QP
+  attachment, MR/MW authority and FLUSH object identity before producer cursor advancement.
+- Recovery replay rewrites and verifies the complete 512-byte SQ-SGB before rewriting the 64-byte
+  SQE, ringing the producer doorbell, and committing the producer ledger. REG_MR/BIND_MW/FLUSH
+  semantic authority is covered, while the codec intentionally returns an explicit unsupported
+  status because this repository has no verified fixed 64-byte hardware profile for those
+  control WQEs; no synthetic body is generated.
+- Added `rdma_sqe_authority_test.sv`, expanded UD/URC and extended-opcode tests, and added
+  post-test SGB replay assertions. All modified test/helper functions include Chinese
+  功能、输入输出及副作用、失败边界 comments; no `.svh` files were added.
+
+## Task 4 focused VCS53 verification
+
+All commands were executed through `scripts/run_vcs53.sh` in a login bash on
+`ubuntu@10.11.10.53`. The non-interactive shell's `cannot set terminal process group` and
+`no job control` lines are expected SSH diagnostics, not simulation failures.
+
+| Test | Result |
+| --- | --- |
+| `rdma_ud_urc_sqe_codec_test` | pass, UVM warning=0/error=0/fatal=0 |
+| `rdma_wqe_extended_opcode_test` | pass, UVM warning=0/error=0/fatal=0 |
+| `rdma_queue_data_engine_post_test` | pass, UVM warning=0/error=0/fatal=0 |
+| `rdma_queue_data_engine_recovery_test` | pass, UVM warning=0/error=0/fatal=0 |
+| `rdma_sq_codec_test` | pass, UVM warning=0/error=0/fatal=0 |
+| `rdma_sqe_authority_test` | pass, UVM warning=0/error=0/fatal=0 |
+
+The only compiler diagnostic in these runs is the pre-existing `context` keyword warning in
+`rdma_queue_host_mem_submitter_test.sv` and the pre-existing task-in-function warning in the
+mock CMQ port; neither is introduced by Task 4.

@@ -69,6 +69,7 @@ package rdma_unit_test_pkg;
   `include "unit/rdma_sq_codec_test.sv"
   `include "unit/rdma_ud_urc_sqe_codec_test.sv"
   `include "unit/rdma_wqe_extended_opcode_test.sv"
+  `include "unit/rdma_sqe_authority_test.sv"
   `include "unit/rdma_queue_host_mem_submitter_test.sv"
   `include "unit/rdma_queue_runtime_test.sv"
   `include "unit/rdma_queue_backing_access_test.sv"

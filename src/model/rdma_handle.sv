@@ -92,3 +92,38 @@ function automatic rdma_status rdma_handle_owner_status(
                              "handle generation does not match owner");
   return rdma_status::success();
 endfunction
+
+// 功能：rdma_handle_authority_status 校验资源句柄的 kind，并将其 Function UID/generation 与显式 owner 或参考句柄对齐，供 SQE 等入口复用。
+// 输入/输出及副作用：handle（输入）、expected_kind（输入）、reference（输入）、label（输入）；函数只读取句柄字段并返回 rdma_status，不取得资源所有权或修改任何对象。
+// 失败/边界：handle/reference 为空或 kind 不符返回 INVALID_ARGUMENT；UID 不一致返回 INVALID_ARGUMENT；generation 不一致返回 STALE_GENERATION；reference 为 Function 时还复用 rdma_handle_owner_status 检查 owner kind。
+function automatic rdma_status rdma_handle_authority_status(
+  rdma_handle handle,
+  rdma_resource_kind_e expected_kind,
+  rdma_handle reference,
+  string label
+);
+  rdma_function_handle function_reference;
+
+  if (handle == null)
+    return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                             {label, " handle is null"});
+  if (handle.kind != expected_kind)
+    return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                             {label, " handle kind is invalid"});
+  if (reference == null)
+    return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                             {label, " authority reference is null"});
+  if (reference.kind == RDMA_RESOURCE_FUNCTION) begin
+    if (!$cast(function_reference, reference))
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               {label, " Function reference is invalid"});
+    return rdma_handle_owner_status(handle, function_reference);
+  end
+  if (handle.function_uid != reference.function_uid)
+    return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                             {label, " Function UID does not match"});
+  if (handle.generation != reference.generation)
+    return rdma_status::make(RDMA_SC_STALE_GENERATION,
+                             {label, " Function generation is stale"});
+  return rdma_status::success();
+endfunction

@@ -1219,8 +1219,8 @@ class rdma_post_send_req extends rdma_semantic_request;
   endfunction
 
   // 功能：validate 校验 当前对象字段 与当前对象状态的一致性，并显式处理“post-send target is not a QP handle”等拒绝条件，返回 rdma_status 供上层决定是否提交。
-  // 输入/输出及副作用：无显式参数；validate 读取 对象字段：rdma_status、qp_h、qp_h.kind、transport、opcode、inline_data、sges、length 并使用字段 status；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：validate 返回 RDMA_SC_INVALID_ARGUMENT；典型拒绝条件为“post-send target is not a QP handle”“work opcode is invalid for transport”；失败路径不提交部分状态或转移未声明资源。
+  // 输入/输出及副作用：无显式参数；validate 读取对象字段 qp_h、owner、completion_qp_h、mr_h、mw_h、authority_h、transport、opcode、inline_data、sges、length，并返回 rdma_status；函数只读请求快照，不取得句柄或队列所有权。
+  // 失败/边界：validate 返回 RDMA_SC_INVALID_ARGUMENT、RDMA_SC_STALE_GENERATION、RDMA_SC_INVALID_STATE；会拒绝引用句柄 kind 错误、UID/generation 不一致、URC completion QP 缺失、control WQE payload 非空以及 FLUSH authority 不再指向本 QP 的请求，失败时不提交部分状态。
   virtual function rdma_status validate();
     rdma_status status;
 
@@ -1230,6 +1230,13 @@ class rdma_post_send_req extends rdma_semantic_request;
     if (qp_h == null || qp_h.kind != RDMA_RESOURCE_QP)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "post-send target is not a QP handle");
+    // 请求 owner 是可选的 codec 元数据；一旦提供，发送 QP 必须属于同一
+    // Function incarnation，避免调用方把完整但跨代的句柄混入 SQE。
+    if (owner != null) begin
+      status = rdma_handle_authority_status(qp_h, RDMA_RESOURCE_QP, owner,
+                                            "post-send QP");
+      if (!status.ok()) return status;
+    end
     if (!rdma_send_opcode_valid_for_transport(transport, opcode))
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "work opcode is invalid for transport");
@@ -1264,12 +1271,33 @@ class rdma_post_send_req extends rdma_semantic_request;
     else if (opcode inside {RDMA_WR_REG_MR, RDMA_WR_BIND_MW, RDMA_WR_FLUSH}) begin
       if (sges.size() != 0 || payload.size() != 0 || inline_data)
         return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "control WQE carries payload");
-      if (opcode == RDMA_WR_REG_MR && (mr_h == null || mr_h.kind != RDMA_RESOURCE_MR))
-        return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "REG_MR requires MR authority");
-      if (opcode == RDMA_WR_BIND_MW && (mw_h == null || mw_h.kind != RDMA_RESOURCE_MW || mr_h == null || mr_h.kind != RDMA_RESOURCE_MR))
-        return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "BIND_MW requires MR/MW authority");
-      if (opcode == RDMA_WR_FLUSH && authority_h == null)
-        return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "FLUSH requires authority");
+      if (opcode == RDMA_WR_REG_MR) begin
+        status = rdma_handle_authority_status(
+          mr_h, RDMA_RESOURCE_MR, owner == null ? qp_h : owner,
+          "REG_MR authority");
+        if (!status.ok()) return status;
+      end
+      if (opcode == RDMA_WR_BIND_MW) begin
+        status = rdma_handle_authority_status(
+          mr_h, RDMA_RESOURCE_MR, owner == null ? qp_h : owner,
+          "BIND_MW MR authority");
+        if (!status.ok()) return status;
+        status = rdma_handle_authority_status(
+          mw_h, RDMA_RESOURCE_MW, owner == null ? qp_h : owner,
+          "BIND_MW MW authority");
+        if (!status.ok()) return status;
+      end
+      if (opcode == RDMA_WR_FLUSH) begin
+        status = rdma_handle_authority_status(
+          authority_h, RDMA_RESOURCE_QP, owner == null ? qp_h : owner,
+          "FLUSH authority");
+        if (!status.ok()) return status;
+        if (!authority_h.same_instance(qp_h))
+          return rdma_status::make(
+            RDMA_SC_INVALID_STATE,
+            "FLUSH authority is detached from the posting QP"
+          );
+      end
     end
     else begin
       if (!inline_data && sges.size() == 0)
@@ -1299,10 +1327,17 @@ class rdma_post_send_req extends rdma_semantic_request;
         (remote_access_valid || rkey_valid || remote_addr.value != 0))
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "UD send carries RC-only remote fields");
-    if (transport == RDMA_TRANSPORT_URC &&
-        (completion_qp_h == null || completion_qp_h.kind != RDMA_RESOURCE_QP))
-      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                               "URC send requires completion QP");
+    if (transport == RDMA_TRANSPORT_URC) begin
+      status = rdma_handle_authority_status(
+        completion_qp_h, RDMA_RESOURCE_QP, owner == null ? qp_h : owner,
+        "URC completion QP");
+      if (!status.ok()) return status;
+    end
+    else if (completion_qp_h != null)
+      return rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT,
+        "completion QP is only valid for URC send"
+      );
     return rdma_status::success();
   endfunction
 endclass

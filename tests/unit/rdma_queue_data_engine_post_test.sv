@@ -361,6 +361,152 @@ class rdma_queue_data_engine_post_test extends uvm_test;
     super.new(name, parent);
   endfunction
 
+  // 功能：check_atomic_model_projection 驱动带 compare/swap、local IOVA 和 lkey 的 RC 原子请求，验证 queue-data engine 生成的 SQE 镜像保留全部原子字段。
+  // 输入/输出及副作用：无显式参数；任务创建并配置本地 fixture、发送一次原子请求、解码返回 image，并通过 UVM 报告暴露状态，不转移 fixture 资源所有权。
+  // 失败/边界：fixture 初始化失败、请求校验/编码失败、返回 image 缺失、codec 解码失败或任一 atomic_local_iova/atomic_local_lkey/atomic_value/atomic_compare 不一致时报告 UVM_ERROR；失败请求不得发布成功 result。
+  task automatic check_atomic_model_projection();
+    rdma_queue_data_engine_fixture fixture;
+    rdma_post_send_req request;
+    rdma_sge local_sge;
+    rdma_queue_post_result result;
+    rdma_hw_model decoded_model;
+    rdma_hw_sqe_model decoded_sqe;
+    rdma_codec_base codec;
+    rdma_codec_key key;
+    rdma_status status;
+    longint unsigned expected_local_iova;
+    bit [31:0] expected_local_lkey;
+    longint unsigned expected_compare;
+    longint unsigned expected_swap;
+
+    fixture = rdma_queue_data_engine_fixture::type_id::create(
+      "atomic_projection_fixture");
+    fixture.setup(status);
+    if (status == null || !status.ok()) begin
+      `uvm_error("ATOMIC_FIXTURE", status == null ? "null setup status" :
+                 status.convert2string())
+      return;
+    end
+    request = fixture.make_send(64'h1234_5678_9abc_def0);
+    request.opcode = RDMA_WR_ATOMIC_CMP_SWAP;
+    request.remote_addr.value = 64'h0000_0000_0000_2000;
+    request.rkey = 32'hcafebabe;
+    request.remote_access_valid = 1'b1;
+    request.rkey_valid = 1'b1;
+    request.sges.delete();
+    local_sge = rdma_sge::type_id::create("atomic_projection_local_sge");
+    local_sge.iova.value = 64'h0000_0000_0000_8000;
+    local_sge.length = 8;
+    local_sge.lkey = 32'h8765_4321;
+    request.sges.push_back(local_sge);
+    request.compare_value = 64'h0123_4567_89ab_cdef;
+    request.swap_add_value = 64'hfedc_ba98_7654_3210;
+    expected_local_iova = local_sge.iova.value;
+    expected_local_lkey = local_sge.lkey;
+    expected_compare = request.compare_value;
+    expected_swap = request.swap_add_value;
+
+    result = null;
+    fixture.engine.post_send(request, result, status);
+    if (status == null || !status.ok() || result == null ||
+        result.image == null) begin
+      `uvm_error("ATOMIC_POST", status == null ? "null status" :
+                 status.convert2string())
+      return;
+    end
+    key = '{hw_version:"rdma", image_kind:RDMA_IMAGE_SQE,
+            object_type:"sqe", variant:"rc", opcode:8'h00};
+    status = fixture.registry.lookup(key, codec);
+    if (status == null || !status.ok() || codec == null) begin
+      `uvm_error("ATOMIC_CODEC", status == null ? "null codec status" :
+                 status.convert2string())
+      return;
+    end
+    status = codec.decode(result.image, decoded_model);
+    if (status == null || !status.ok() ||
+        !$cast(decoded_sqe, decoded_model) || decoded_sqe == null ||
+        decoded_sqe.atomic_local_iova.value != expected_local_iova ||
+        decoded_sqe.atomic_local_lkey != expected_local_lkey ||
+        decoded_sqe.atomic_compare != expected_compare ||
+        decoded_sqe.atomic_value != expected_swap)
+      `uvm_error("ATOMIC_FIELDS", status == null ? "atomic image decode failed" :
+                 status.convert2string())
+  endtask
+
+  // 功能：check_sgb_recovery_replays_slot 在首次 512-byte SQ SGB 写入失败后恢复 pending producer，验证恢复流程重新写入完整 SGB descriptor slot 再提交 64-byte WQE。
+  // 输入/输出及副作用：无显式参数；任务创建本地 fixture、注入一次 host-memory 写故障、调用 recover_queue，并读取 SGB backing 与调用轨迹，不转移外部 backing 所有权。
+  // 失败/边界：fixture/请求初始化失败、首次写入未进入 recovery、恢复未成功、恢复期间没有额外 512-byte write，或 SGB descriptor 未恢复时报告 UVM_ERROR；ambiguous MMIO 不得被该任务重试。
+  task automatic check_sgb_recovery_replays_slot();
+    rdma_queue_data_engine_fixture fixture;
+    rdma_post_send_req request;
+    rdma_queue_post_result result;
+    rdma_sge sge;
+    rdma_status status;
+    rdma_status injected;
+    byte sgb_data[];
+    longint unsigned sgb_base;
+    int unsigned trace_start;
+    int unsigned sgb_write_count;
+
+    fixture = rdma_queue_data_engine_fixture::type_id::create(
+      "sgb_recovery_fixture");
+    fixture.setup(status);
+    if (status == null || !status.ok()) begin
+      `uvm_error("SGB_FIXTURE", status == null ? "null setup status" :
+                 status.convert2string())
+      return;
+    end
+    request = fixture.make_send(64'h0bad_f00d_0000_0001);
+    request.sges.delete();
+    for (int unsigned i = 0; i < 3; i++) begin
+      sge = rdma_sge::type_id::create($sformatf("sgb_recovery_sge%0d", i));
+      sge.iova.value = 64'h0000_1000_0000_1000 + i * 64;
+      sge.length = 8;
+      sge.lkey = 32'ha0a0_a000 + i;
+      request.sges.push_back(sge);
+    end
+    sgb_base = fixture.qp.qp_plan.sq_sgb_ref.mapping.iova.value +
+               fixture.qp.qp_plan.sq_sgb_ref.mapping_offset;
+    request.sgb_iova.value = sgb_base;
+    trace_start = fixture.mem.calls.size();
+    injected = rdma_status::make(RDMA_SC_DMA_TRANSLATION,
+                                  "injected initial SGB write failure");
+    fixture.mem.fail_next("write", injected);
+    result = null;
+    fixture.engine.post_send(request, result, status);
+    if (status == null || status.ok() || result != null) begin
+      `uvm_error("SGB_INITIAL_FAIL", status == null ? "null status" :
+                 status.convert2string())
+      return;
+    end
+    fixture.engine.recover_queue(fixture.qp.handle,
+      RDMA_QUEUE_RECOVERY_RETRY_PENDING, 1'b1, status);
+    if (status == null || !status.ok()) begin
+      `uvm_error("SGB_RECOVERY", status == null ? "null status" :
+                 status.convert2string())
+      return;
+    end
+    sgb_write_count = 0;
+    for (int unsigned i = trace_start; i < fixture.mem.calls.size(); i++)
+      if (fixture.mem.calls[i] != null &&
+          fixture.mem.calls[i].method_name == "write" &&
+          fixture.mem.calls[i].data.size() == 512)
+        sgb_write_count++;
+    if (sgb_write_count < 2)
+      `uvm_error("SGB_RECOVERY_WRITE", "recovery did not rewrite 512-byte SGB slot")
+    status = fixture.mem.read(fixture.qp.qp_plan.sq_sgb_ref.mapping,
+                              fixture.qp.qp_plan.sq_sgb_ref.mapping_offset,
+                              512, sgb_data);
+    if (status == null || !status.ok() || sgb_data.size() != 512 ||
+        sgb_data[3] != 8'h08 || sgb_data[4] != 8'ha0 ||
+        sgb_data[7] != 8'h00 || sgb_data[19] != 8'h08 ||
+        sgb_data[20] != 8'ha0 || sgb_data[23] != 8'h01 ||
+        sgb_data[35] != 8'h08 || sgb_data[36] != 8'ha0 ||
+        sgb_data[39] != 8'h02)
+      `uvm_error("SGB_RECOVERY_DATA", status == null ? "SGB readback failed" :
+                 status.convert2string())
+  endtask
+
   // 功能：在 rdma_queue_data_engine_post_test 中，run_phase 驱动 UVM 阶段中的场景初始化、事务执行和断言收尾，并在退出前释放 objection 或测试资源。
   // 输入/输出及副作用：phase（输入）；phase 由 UVM 提供；task 通过 objection、日志和断言暴露结果，可能调用 DUT 接口但不改变其所有权规则。
   // 失败/边界：run_phase 的 setup/阶段驱动失败时停止新增事务，并按测试生命周期清理 objection 与临时引用。
@@ -444,6 +590,9 @@ class rdma_queue_data_engine_post_test extends uvm_test;
                      $sformatf("RQ byte %0d was not persisted", i))
       end
     end
+
+    check_atomic_model_projection();
+    check_sgb_recovery_replays_slot();
 
     phase.drop_objection(this);
   endtask
