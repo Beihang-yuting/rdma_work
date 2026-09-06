@@ -79,3 +79,76 @@ Task 2: follow-up recovery/SRQ round (engine-owned published-cleanup recovery, r
   契约和 owned-ref 几何校验问题均已修复；host-mem adapter 的宏转义也已在真实
   host_mem filelist 下重新编译验证。
 - 最终提交前删除 `tools/__pycache__/` 生成物；本 Task 只创建本地 commit，不 merge、不 push。
+
+## Task 3 execution
+
+- Worktree: `.worktrees/rdma-cq-shadow` on `feature/rdma-cq-shadow`.
+- BASE: `bb9cf2bcacca6895dc1800257a2c3e67e352abaf` (`fix: close rdma queue resize recovery gaps`).
+- Task 3: started; implementer must preserve Task 2 CQE layout/codec contracts and first obtain a VCS53 RED result before changing production code.
+- Registration note: add the new UVM test to `tests/rdma_unit_test_pkg.sv`; this is required for the named VCS test to compile and does not broaden production scope.
+
+- Task 3 implementation commit: `0149a75` (`feat: add shared cq and urc shadow lifecycle`).
+- TDD evidence recorded by implementer: RED compile failure before production symbols; GREEN `rdma_cq_shadow_flush_test` on VCS53 with `warning=0 error=0 fatal=0`.
+- Task 3 review package: `review-bb9cf2b..0149a75.diff`; task review pending.
+- Task 3 review verdict: Needs fixes. Important findings: complete CQ identity check; real URC evidence transaction-path integration; detached cached/output shadow; same-epoch reconfigure semantics; full shared/resource/authority/reset-epoch and completion-QP-kind validation. Minor findings: broaden focused negative/field assertions and align snapshot cursor-range comment.
+- Task 3 fix round 1/5 started from `0149a75`; original implementer resumed.
+- Task 3 fix round 1 implementation amended to `35b486a`; scoped re-review package `review-f9e76a8..35b486a.diff` is pending. Implementer reports VCS53 focused test UVM 0/0/0.
+- Task 3 fix round 1/5 review: 2 findings addressed (cache clone, same-epoch reset); 3 Important remain (flush CQ kind/full identity, mandatory evidence path/error handling, null-output replay alias). Commit `35b486a`.
+- Task 3 fix round 2/5 started; original implementer resumed with the three open findings.
+- Task 3 fix round 2 implementation finalized as `1b3ba90`; final scoped review package `review-35b486a..1b3ba90.diff` pending. Implementer reports focused VCS53 UVM 0/0/0 and expanded production-path evidence/negative coverage.
+- Task 3 fix round 2/5: 3 findings addressed, 0 open; scoped re-review APPROVE, no new Critical/Important breakage. Commits `35b486a..1b3ba90`.
+- Task 3: complete (commits `bb9cf2b..1b3ba90`, review clean).
+- Task 3 post-review verification: controller reran `scripts/run_vcs53.sh core rdma_cq_shadow_flush_test` on host 53; UVM `info=3 warning=0 error=0 fatal=0`, summary pristine. `git diff --check` passed.
+- Ruling: defer adding `rdma_cq_shadow_flush_test` to `scripts/run_queue_lifecycle_regression53.sh` until Task 9, which explicitly owns final regression lists; current Python manifest check is 108/109 with only that expected missing entry. Cost if wrong: the branch carries one known static manifest failure through Tasks 4–8 and requires Task 9 to close it before final completion.
+
+## Task 4 execution
+
+- Worktree remains `.worktrees/rdma-cq-shadow` on `feature/rdma-cq-shadow`.
+- BASE: `ce9110343d67ee134496b835c3fdc47feb54a71f` (`docs: record cq shadow task completion`).
+- Task 4: started; implementer must preserve Task 2 CQE layout and Task 3 shared-shadow authority/evidence contracts, and obtain VCS53 RED before production edits.
+- Task 4 implementation commits: `f2d299b`, `e645b1f`, `8308083`; implementer reports RED for missing `encode_sqe`, focused VCS compile/simulation complete, and `git diff --check` passed. Concern recorded: no control-WQE hardware profile exists for posting REG_MR/BIND_MW/FLUSH.
+- Task 4 review package: `review-ce91103..8308083.diff`; task review pending.
+- Task 4 review verdict: Needs fixes. Important findings: UD SEND_WITH_INV contradicted by extension validation; queue_data drops inline/payload; URC completion QP not represented/encoded; REG_MR/BIND_MW/FLUSH policy branch unreachable; tests/comments insufficient. Fix round 1 started with original implementer resumed.
+
+- Task 4 fix round 1/5: completed in the same worktree. UD SQE now uses the driver-specific
+  8-qword layout (AH, destination QPN/Q_Key, SGB PA, payload length and signature) without
+  overlapping RC remote fields; nonzero payload requires a nonzero 512-byte-aligned SGB IOVA
+  and the 14-bit payload limit is enforced. UD qword1 reserved-bit checking is opcode-aware:
+  ordinary SEND rejects the immediate/key half, SEND_WITH_IMM/SEND_WITH_INV allow it, and
+  bit25 remains reserved. The focused red test caught the old mask accepting ordinary SEND
+  high bits before the dynamic mask was restored.
+- URC SEND now requires and validates a completion-QP authority, preserves URC mode, applies
+  SEND_WITH_INV fence semantics, and shares only the RC data-plane body fields that are
+  actually present. UD/URC image decode remains an explicit `RDMA_SC_UNSUPPORTED_OPCODE`
+  boundary because a detached 64-byte image cannot authenticate external SGB/AH or completion
+  QP evidence.
+- Atomic requests now project local IOVA/LKey and compare/swap-add operands through the SQE
+  facade. Runtime posting checks QP route identity, Function UID/generation, completion-QP
+  attachment, MR/MW authority and FLUSH object identity before producer cursor advancement.
+- Recovery replay rewrites and verifies the complete 512-byte SQ-SGB before rewriting the 64-byte
+  SQE, ringing the producer doorbell, and committing the producer ledger. REG_MR/BIND_MW/FLUSH
+  semantic authority is covered, while the codec intentionally returns an explicit unsupported
+  status because this repository has no verified fixed 64-byte hardware profile for those
+  control WQEs; no synthetic body is generated.
+- Added `rdma_sqe_authority_test.sv`, expanded UD/URC and extended-opcode tests, and added
+  post-test SGB replay assertions. All modified test/helper functions include Chinese
+  功能、输入输出及副作用、失败边界 comments; no `.svh` files were added.
+
+## Task 4 focused VCS53 verification
+
+All commands were executed through `scripts/run_vcs53.sh` in a login bash on
+`ubuntu@10.11.10.53`. The non-interactive shell's `cannot set terminal process group` and
+`no job control` lines are expected SSH diagnostics, not simulation failures.
+
+| Test | Result |
+| --- | --- |
+| `rdma_ud_urc_sqe_codec_test` | pass, UVM warning=0/error=0/fatal=0 |
+| `rdma_wqe_extended_opcode_test` | pass, UVM warning=0/error=0/fatal=0 |
+| `rdma_queue_data_engine_post_test` | pass, UVM warning=0/error=0/fatal=0 |
+| `rdma_queue_data_engine_recovery_test` | pass, UVM warning=0/error=0/fatal=0 |
+| `rdma_sq_codec_test` | pass, UVM warning=0/error=0/fatal=0 |
+| `rdma_sqe_authority_test` | pass, UVM warning=0/error=0/fatal=0 |
+
+The only compiler diagnostic in these runs is the pre-existing `context` keyword warning in
+`rdma_queue_host_mem_submitter_test.sv` and the pre-existing task-in-function warning in the
+mock CMQ port; neither is introduced by Task 4.

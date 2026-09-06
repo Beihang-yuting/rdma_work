@@ -94,6 +94,8 @@ class rdma_queue_data_qp_link extends uvm_object;
   rdma_handle recv_cq_h;
   int unsigned local_qp_id;
   rdma_transport_e transport;
+  rdma_queue_backing_access sq_sgb_access;
+  rdma_qp_backing_ref sq_sgb_ref;
 
   // 功能：构造 rdma_queue_data_qp_link，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：qp_h=null；srq_h=null；send_cq_h=null；recv_cq_h=null；local_qp_id=0；transport=RDMA_TRANSPORT_RC。
   // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
@@ -101,7 +103,7 @@ class rdma_queue_data_qp_link extends uvm_object;
   function new(string name = "rdma_queue_data_qp_link");
     super.new(name);
     qp_h = null; srq_h = null; send_cq_h = null; recv_cq_h = null;
-    local_qp_id = 0; transport = RDMA_TRANSPORT_RC;
+    local_qp_id = 0; transport = RDMA_TRANSPORT_RC; sq_sgb_access = null; sq_sgb_ref = null;
   endfunction
 endclass
 
@@ -183,6 +185,8 @@ class rdma_queue_data_engine extends uvm_object;
   // 清理记录，使 Function reset 后仍能找到旧代际的 release authority。
   protected rdma_cq_resize_recovery cq_resize_recoveries[string];
   protected bit configured;
+  // Latest detached URC shadow evidence retained for recovery inspection.
+  rdma_queue_txn_evidence last_urc_evidence;
 
   // 功能：构造 rdma_queue_data_engine，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：manager=null；binding=null；host_mem=null；doorbells=null；registry=null；operation_timeout=0；configured=1'b0。
   // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
@@ -195,7 +199,27 @@ class rdma_queue_data_engine extends uvm_object;
       {name, "_backing_planner"});
     resize_lock = new(1);
     attachments.delete(); qp_links.delete(); cq_resize_recoveries.delete();
+    last_urc_evidence = null;
     configured = 1'b0;
+  endfunction
+
+  // 功能：把 CQ flush 产生的 URC shadow 捕获为 queue-data engine 的可恢复事务证据。
+  // 输入/输出及副作用：shadow 为输入；成功时新建并保存 last_urc_evidence 的 detached 快照，不释放或修改外部 runtime。
+  // 失败边界：shadow 为空、authority 无效或 evidence 分配失败时返回错误，既有 evidence 保持不变。
+  function rdma_status capture_urc_shadow_evidence(rdma_cq_shadow_snapshot shadow);
+    rdma_queue_txn_evidence candidate;
+    rdma_status status;
+    if (shadow == null)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "URC CQ shadow evidence is null");
+    candidate = rdma_queue_txn_evidence::type_id::create("urc_shadow_evidence");
+    if (candidate == null)
+      return rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED,
+                               "URC CQ shadow evidence allocation failed");
+    status = candidate.capture_urc_shadow(shadow);
+    if (!status.ok()) return status;
+    last_urc_evidence = candidate;
+    return rdma_status::success();
   endfunction
 
   // 功能：在 rdma_queue_data_engine 中，bad 把错误消息、硬件码或注入故障封装为统一 rdma_status，保留原事务的诊断证据。
@@ -1053,6 +1077,14 @@ class rdma_queue_data_engine extends uvm_object;
     if (link.recv_cq_h == null && qp.recv_cq_h != null)
       link.recv_cq_h = qp.recv_cq_h;
     link.local_qp_id = qp.local_qp_id; link.transport = qp.transport;
+    if (qp.qp_plan.sq_sgb_ref != null) begin
+      link.sq_sgb_access = rdma_queue_backing_access::type_id::create("sq_sgb_access");
+      link.sq_sgb_ref = qp.qp_plan.sq_sgb_ref;
+      status = link.sq_sgb_access.configure(binding.make_handle(), host_mem);
+      if (!status.ok()) return status;
+      status = link.sq_sgb_access.attach_qp(qp.qp_plan.sq_sgb_ref);
+      if (!status.ok()) return status;
+    end
     qp_links[identity_key(qp_h)] = link;
     return rdma_status::success();
   endfunction
@@ -1198,9 +1230,90 @@ class rdma_queue_data_engine extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：在 rdma_queue_data_engine 中，make_sqe 完成发送队列预检、槽位预留、WQE 写入和 producer doorbell 提交，并返回提交结果与失败证据。
-  // 输入/输出及副作用：request（输入）、link（输入）、cursor（输入）、model（输出）；make_sqe 读取 request、link、cursor、model 并使用字段 model、model.transport、model.qp_h、model.wr_id、model.opcode、model.signaled、model.solicited、model.fence，并写入 model；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：未配置、空队列、stale generation/reset epoch 和 ambiguous MMIO 均禁止发布成功结果或自动重试。
+  // 功能：在 rdma_queue_data_engine 中，sqe_authority_status 对发送请求的
+  // QP、URC completion QP、MR/MW 和 FLUSH authority 做运行时身份及 attach
+  // 校验，确保已通过语义模型的请求仍绑定到当前 queue-data route。
+  // 输入/输出及副作用：request、link 为输入；函数只读取 request 快照、QP
+  // link 和 qp_links 索引，返回 rdma_status，不预留槽位、不修改账本或外部资源。
+  // 失败/边界：request/link/快照为空、QP route 不一致、owner/UID/generation
+  // 失配、URC completion QP 未 attach、control authority kind 错误或 FLUSH
+  // authority 非 posting QP 时返回对应错误码；失败路径保持 producer 游标不变。
+  protected function rdma_status sqe_authority_status(
+    rdma_post_send_req request,
+    rdma_queue_data_qp_link link
+  );
+    rdma_status status;
+    rdma_handle reference;
+    rdma_queue_data_qp_link completion_link;
+    string completion_key;
+
+    if (request == null || link == null || link.qp_h == null)
+      return bad("SQE authority request or QP link is null",
+                 RDMA_SC_INVALID_STATE);
+    status = ensure_handle(request.qp_h, RDMA_RESOURCE_QP);
+    if (!status.ok()) return status;
+    if (!link.qp_h.same_instance(request.qp_h))
+      return bad("SQE posting QP route identity does not match request",
+                 RDMA_SC_INVALID_STATE);
+
+    reference = request.owner == null ? request.qp_h : request.owner;
+    if (request.owner != null) begin
+      status = rdma_handle_owner_status(request.qp_h, request.owner);
+      if (!status.ok()) return status;
+    end
+
+    case (request.opcode)
+      RDMA_WR_REG_MR: begin
+        status = rdma_handle_authority_status(
+          request.mr_h, RDMA_RESOURCE_MR, reference, "REG_MR authority");
+        if (!status.ok()) return status;
+      end
+      RDMA_WR_BIND_MW: begin
+        status = rdma_handle_authority_status(
+          request.mr_h, RDMA_RESOURCE_MR, reference,
+          "BIND_MW MR authority");
+        if (!status.ok()) return status;
+        status = rdma_handle_authority_status(
+          request.mw_h, RDMA_RESOURCE_MW, reference,
+          "BIND_MW MW authority");
+        if (!status.ok()) return status;
+      end
+      RDMA_WR_FLUSH: begin
+        status = rdma_handle_authority_status(
+          request.authority_h, RDMA_RESOURCE_QP, reference,
+          "FLUSH authority");
+        if (!status.ok()) return status;
+        if (!request.authority_h.same_instance(link.qp_h))
+          return bad("FLUSH authority is detached from the posting QP",
+                     RDMA_SC_INVALID_STATE);
+      end
+      default: begin end
+    endcase
+
+    if (request.transport == RDMA_TRANSPORT_URC) begin
+      status = rdma_handle_authority_status(
+        request.completion_qp_h, RDMA_RESOURCE_QP, reference,
+        "URC completion QP");
+      if (!status.ok()) return status;
+      completion_key = identity_key(request.completion_qp_h);
+      if (!qp_links.exists(completion_key) ||
+          qp_links[completion_key] == null)
+        return bad("URC completion QP is not attached", RDMA_SC_INVALID_STATE);
+      completion_link = qp_links[completion_key];
+      if (completion_link.qp_h == null ||
+          !completion_link.qp_h.same_instance(request.completion_qp_h))
+        return bad("URC completion QP route identity is stale",
+                   RDMA_SC_INVALID_STATE);
+    end
+    else if (request.completion_qp_h != null) begin
+      return bad("completion QP is only valid for URC send");
+    end
+    return rdma_status::success();
+  endfunction
+
+  // 功能：在 rdma_queue_data_engine 中，make_sqe 将发送请求投影为待编码的硬件 SQE 模型，复制传输、authority、原子操作和 SGB 相关字段，并绑定 reservation 的 index/wrap。
+  // 输入/输出及副作用：request（输入）提供 qp_h、mr_h、mw_h、authority_h、SGE、compare_value、swap_add_value、sgb_iova 等语义快照；link/cursor（输入）提供 QP route 与槽位；model（输出）发布 detached SQE 模型，不取得调用方资源所有权。
+  // 失败/边界：request、link 或 cursor 为空、SGE 含 null、URC 缺少 completion_qp_h、authority kind 不满足请求语义或模型校验失败时返回错误；失败路径不发布可提交模型，也不自动推进 PI。
   protected function rdma_status make_sqe(
     rdma_post_send_req request,
     rdma_queue_data_qp_link link,
@@ -1215,9 +1328,16 @@ class rdma_queue_data_engine extends uvm_object;
     model = null;
     if (request == null || link == null || cursor == null)
       return bad("SQE request, QP link, or reservation is null");
+    status = sqe_authority_status(request, link);
+    if (!status.ok()) return status;
     model = rdma_hw_sqe_model::type_id::create("queue_sqe");
     model.transport = request.transport; model.qp_h = request.qp_h;
     model.wr_id = request.wr_id; model.opcode = request.opcode;
+    model.inline_data = request.inline_data;
+    model.payload = request.payload;
+    model.immediate_data = request.immediate_data;
+    model.remote_va = request.remote_addr;
+    model.rkey = request.rkey;
     model.signaled = request.signaled; model.solicited = request.solicited;
     model.fence = '0; model.qpn = link.local_qp_id;
     model.qp_sn = 0; model.icos = 0; model.dst_port = 0;
@@ -1225,6 +1345,15 @@ class rdma_queue_data_engine extends uvm_object;
     model.sign_en = request.signaled; model.se = request.solicited;
     model.ce = request.signaled ? 2'b01 : 2'b00; model.valid = 1'b1;
     model.hw_opcode = request.opcode;
+    model.invalidate_key = request.invalidate_rkey;
+    model.destination_qpn = request.destination_qpn;
+    model.qkey = request.qkey;
+    model.sgb_iova = request.sgb_iova;
+    // 硬件模型只保存 MR/MW 的 profile object-ID；完整句柄（含 kind、
+    // Function UID 和 generation）仍由 request snapshot 保留，供 ledger/
+    // recovery 做 authority 校验，不能用截断 ID 代替生命周期证据。
+    model.mr_handle_id = request.mr_h == null ? 0 : request.mr_h.object_id;
+    model.mw_handle_id = request.mw_h == null ? 0 : request.mw_h.object_id;
     model.sge_num = request.sges.size();
     foreach (request.sges[i]) begin
       if (request.sges[i] == null)
@@ -1232,12 +1361,25 @@ class rdma_queue_data_engine extends uvm_object;
       cloned_sge = rdma_sge::type_id::create("sqe_sge");
       cloned_sge.copy(request.sges[i]); model.sges.push_back(cloned_sge);
     end
+    if (request.opcode inside {RDMA_WR_ATOMIC_CMP_SWAP,
+                               RDMA_WR_ATOMIC_FETCH_ADD}) begin
+      // 原子 fixed body 的 local IOVA/lkey 来自唯一 local SGE，而
+      // compare/swap 值来自请求语义；四个字段必须一起投影，避免 codec
+      // 看到默认零值后误编码一个可提交但语义错误的 WQE。
+      model.atomic_local_iova = model.sges[0].iova;
+      model.atomic_local_lkey = model.sges[0].lkey;
+      model.atomic_compare = request.compare_value;
+      model.atomic_value = request.swap_add_value;
+    end
     case (request.transport)
       RDMA_TRANSPORT_RC: begin
         rc = rdma_sqe_rc_ext::type_id::create("sqe_rc");
         rc.remote_addr = request.remote_addr; rc.rkey = request.rkey;
         rc.remote_access_valid = request.remote_access_valid;
-        rc.rkey_valid = request.rkey_valid; model.transport_ext = rc;
+        rc.rkey_valid = request.rkey_valid;
+        rc.compare_value = request.compare_value;
+        rc.swap_add_value = request.swap_add_value;
+        model.transport_ext = rc;
         model.rkey = request.rkey; model.remote_va = request.remote_addr;
       end
       RDMA_TRANSPORT_UD: begin
@@ -1253,6 +1395,9 @@ class rdma_queue_data_engine extends uvm_object;
         urc.remote_addr = request.remote_addr; urc.rkey = request.rkey;
         urc.remote_access_valid = request.remote_access_valid;
         urc.rkey_valid = request.rkey_valid; model.transport_ext = urc;
+        if (request.completion_qp_h == null || request.completion_qp_h.kind != RDMA_RESOURCE_QP)
+          return bad("URC completion QP authority is missing");
+        urc.completion_qp_h = request.completion_qp_h;
       end
       default: return bad("SQE transport is unsupported",
                           RDMA_SC_UNSUPPORTED_OPCODE);
@@ -1340,6 +1485,63 @@ class rdma_queue_data_engine extends uvm_object;
       if (readback[i] !== data[i])
         return bad("queue write readback mismatch", RDMA_SC_DMA_TRANSLATION);
     end
+    return rdma_status::success();
+  endfunction
+
+  // 功能：write_sgb_and_verify 为 SQE 的外置 SGB 构造 512-byte 大端槽位并完成 host-memory 写入/回读校验。
+  // 输入/输出及副作用：link/model 为输入；link.sq_sgb_access 指向借用的 QP SGB backing，函数只写入该 backing 并返回状态。
+  // 失败/边界：缺少 SGB authority、IOVA 未按 512 对齐或超出 mapping 范围、后端写入/回读失败时返回 DMA/INVALID_STATE，调用方不得推进 PI。
+  protected function rdma_status write_sgb_and_verify(
+      rdma_queue_data_qp_link link, rdma_hw_sqe_model model,
+      rdma_queue_cursor_snapshot cursor);
+    byte data[]; byte readback[]; rdma_status status; bit [31:0] len; bit [31:0] key; bit [63:0] va; longint unsigned sgb_offset;
+    if (link == null || model == null || cursor == null || link.sq_sgb_access == null)
+      return bad("SQE SGB backing authority is unavailable", RDMA_SC_INVALID_STATE);
+    if (model.sgb_iova.value == 0 || (model.sgb_iova.value & 64'h1ff) != 0)
+      return bad("SQE SGB IOVA is not 512-byte aligned", RDMA_SC_DMA_TRANSLATION);
+    if (link.sq_sgb_ref == null || link.sq_sgb_ref.mapping == null)
+      return bad("SQE SGB IOVA is outside backing authority", RDMA_SC_DMA_TRANSLATION);
+    data = new[512]; foreach (data[i]) data[i] = 0;
+    begin
+      longint unsigned logical_offset, covered, effective_iova;
+      bit resolved;
+      logical_offset = cursor.index * 512; covered = link.sq_sgb_ref.length; resolved = 1'b0;
+      if (logical_offset + 512 > covered) begin
+        foreach (link.sq_sgb_ref.additional_segments[k]) covered += link.sq_sgb_ref.additional_segments[k].length;
+      end
+      if (logical_offset + 512 > covered) return bad("SQE SGB slot exceeds logical coverage", RDMA_SC_DMA_TRANSLATION);
+      if (logical_offset < link.sq_sgb_ref.length) effective_iova = link.sq_sgb_ref.mapping.iova.value + link.sq_sgb_ref.mapping_offset + logical_offset;
+      else begin
+        longint unsigned base;
+        base = link.sq_sgb_ref.length;
+        foreach (link.sq_sgb_ref.additional_segments[k]) begin
+          if (!resolved && logical_offset >= base && logical_offset < base + link.sq_sgb_ref.additional_segments[k].length) begin
+            effective_iova = link.sq_sgb_ref.additional_segments[k].mapping.iova.value + link.sq_sgb_ref.additional_segments[k].mapping_offset + (logical_offset-base); resolved = 1'b1;
+          end
+          base += link.sq_sgb_ref.additional_segments[k].length;
+        end
+      end
+      if (!resolved && logical_offset < link.sq_sgb_ref.length) resolved = 1'b1;
+      if (!resolved || model.sgb_iova.value != effective_iova) return bad("SQE SGB IOVA does not resolve to backing slot", RDMA_SC_DMA_TRANSLATION);
+    end
+    if (model.inline_data) begin
+      if (model.payload.size() > 512) return bad("SQE inline SGB exceeds 512 bytes");
+      foreach (model.payload[i]) data[i] = model.payload[i];
+    end else begin
+      if (model.sges.size() > 32) return bad("SQE SGB descriptor count exceeds 32");
+      foreach (model.sges[i]) begin
+        if (model.sges[i] == null || model.sges[i].length == 0) return bad("SQE SGB descriptor is invalid");
+        len = model.sges[i].length == 32'h8000_0000 ? 0 : model.sges[i].length; key = model.sges[i].lkey; va = model.sges[i].iova.value;
+        for (int j=0;j<4;j++) data[i*16+j] = len[31-j*8 -: 8];
+        for (int j=0;j<4;j++) data[i*16+4+j] = key[31-j*8 -: 8];
+        for (int j=0;j<8;j++) data[i*16+8+j] = va[63-j*8 -: 8];
+      end
+    end
+    sgb_offset = cursor.index * 512;
+    status = link.sq_sgb_access.write(sgb_offset, data); if (!status.ok()) return status;
+    status = link.sq_sgb_access.readback(sgb_offset, 512, readback); if (!status.ok()) return status;
+    if (readback.size() != 512) return bad("SQE SGB readback is short", RDMA_SC_DMA_TRANSLATION);
+    foreach (data[i]) if (readback[i] !== data[i]) return bad("SQE SGB readback mismatch", RDMA_SC_DMA_TRANSLATION);
     return rdma_status::success();
   endfunction
 
@@ -2879,6 +3081,8 @@ class rdma_queue_data_engine extends uvm_object;
         qp_links[identity_key(snapshot.qp_h)] == null)
       begin status = bad("QP is not attached", RDMA_SC_INVALID_STATE); return; end
     link = qp_links[identity_key(snapshot.qp_h)];
+    status = sqe_authority_status(snapshot, link);
+    if (!status.ok()) return;
     status = attachment.runtime.reserve_producer(cursor);
     if (!status.ok()) return;
     status = make_sqe(snapshot, link, cursor, model);
@@ -2887,6 +3091,16 @@ class rdma_queue_data_engine extends uvm_object;
       snapshot.transport == RDMA_TRANSPORT_RC ? "rc" :
       snapshot.transport == RDMA_TRANSPORT_UD ? "ud" : "urc", image);
     if (!status.ok()) return;
+    if (snapshot.sgb_iova.value != 0) begin
+      status = write_sgb_and_verify(link, model, cursor);
+      if (!status.ok()) begin
+        pending = make_pending(cursor, snapshot.qp_h, RDMA_QUEUE_RUNTIME_SQ,
+                              1'b1, longint'(cursor.index) * 64, image,
+                              snapshot, snapshot.signaled);
+        recovery_status = attachment.runtime.enter_recovery(pending, 1'b0);
+        return;
+      end
+    end
     offset = longint'(cursor.index) * 64;
     status = write_and_verify(attachment, offset, image);
     if (!status.ok()) begin
@@ -3072,6 +3286,8 @@ class rdma_queue_data_engine extends uvm_object;
     rdma_queue_data_attachment wqe_attachment;
     rdma_queue_slot_ledger_entry released[$];
     rdma_hw_cqe_model cqe;
+    rdma_hw_sqe_model sgb_model;
+    rdma_post_send_req pending_send;
     rdma_hw_model decoded_model;
     rdma_codec_base codec;
     rdma_codec_key codec_key;
@@ -3093,7 +3309,31 @@ class rdma_queue_data_engine extends uvm_object;
         return;
       end
       // A known-no-MMIO producer failure is normally the queue write itself;
-      // retry the exact detached image before issuing its doorbell.
+      // retry the detached SGB slot first (when present), then the exact
+      // detached 64-byte WQE image before issuing its doorbell.  SGB bytes are
+      // not part of pending.image, so silently omitting this write would make
+      // a recovered SGE-SGB WQE reference stale/zero payload data.
+      if (pending.kind == RDMA_QUEUE_RUNTIME_SQ &&
+          pending.request_snapshot != null &&
+          $cast(pending_send, pending.request_snapshot) &&
+          pending_send.sgb_iova.value != 0) begin
+        link = null;
+        if (pending.queue_h != null &&
+            qp_links.exists(identity_key(pending.queue_h)))
+          link = qp_links[identity_key(pending.queue_h)];
+        if (link == null) begin
+          status = bad("SQ SGB recovery QP route is unavailable",
+                       RDMA_SC_INVALID_STATE);
+          return;
+        end
+        status = make_sqe(pending_send, link, pending.cursor, sgb_model);
+        if (!status.ok()) return;
+        status = write_sgb_and_verify(link, sgb_model, pending.cursor);
+        if (!status.ok()) begin
+          void'(attachment.runtime.record_recovery_failure(1'b0));
+          return;
+        end
+      end
       status = write_and_verify(attachment, pending.entry_offset,
                                 pending.image);
       if (!status.ok()) begin

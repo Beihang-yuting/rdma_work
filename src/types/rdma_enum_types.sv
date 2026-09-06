@@ -61,7 +61,8 @@ typedef enum bit [3:0] {
   RDMA_RESOURCE_SRQ      = 4'd5,
   RDMA_RESOURCE_CMQ      = 4'd6,
   RDMA_RESOURCE_CEQ      = 4'd7,
-  RDMA_RESOURCE_AEQ      = 4'd8
+  RDMA_RESOURCE_AEQ      = 4'd8,
+  RDMA_RESOURCE_MW       = 4'd9
 } rdma_resource_kind_e;
 
 typedef enum bit [2:0] {

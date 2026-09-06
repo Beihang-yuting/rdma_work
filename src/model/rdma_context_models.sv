@@ -714,6 +714,72 @@ class rdma_qpc_model extends rdma_hw_model;
   endfunction
 endclass
 
+// 中文设计：共享 CQ 的 URC shadow 是跨 reset/flush 边界传递的值快照。
+// 它只携带 CQ/Function authority 与可恢复游标，不持有 queue runtime、DMA
+// mapping 或 doorbell；因此 stale 检查可以在不触碰外部资源的情况下完成。
+class rdma_cq_shadow_snapshot extends uvm_object;
+  `uvm_object_utils(rdma_cq_shadow_snapshot)
+
+  rdma_handle cq_h;
+  longint unsigned function_uid;
+  int unsigned generation;
+  rdma_reset_epoch_t reset_epoch;
+  int unsigned sq_ci;
+  int unsigned rq_ci;
+  bit [1:0] arm_state;
+  longint unsigned \sequence ;
+
+  // 功能：构造空 CQ shadow 快照，建立确定的零游标和未绑定 authority 默认状态。
+  // 输入/输出及副作用：name 为 UVM 对象名；仅初始化本地字段，不访问或接管外部资源。
+  // 失败边界：空快照不能作为 flush authority；调用方必须先填充 cq_h、Function UID/generation/reset epoch。
+  function new(string name = "rdma_cq_shadow_snapshot");
+    super.new(name);
+    cq_h = null;
+    function_uid = 0;
+    generation = 0;
+    reset_epoch = 0;
+    sq_ci = 0;
+    rq_ci = 0;
+    arm_state = '0;
+    \sequence = 0;
+  endfunction
+
+  // 功能：复制 source 的 CQ shadow 值字段，生成与 source 隔离的 authority/游标快照。
+  // 输入/输出及副作用：rhs 为输入源对象；当前对象字段被覆盖，cq_h 通过 clone 脱离源对象。
+  // 失败边界：rhs 为空或类型不符触发 UVM fatal；句柄 clone 失败时不保留部分可信快照。
+  virtual function void do_copy(uvm_object rhs);
+    rdma_cq_shadow_snapshot source;
+    super.do_copy(rhs);
+    if (!$cast(source, rhs))
+      `uvm_fatal("RDMA_COPY_TYPE", "CQ shadow snapshot copy mismatch")
+    cq_h = rdma_clone_handle_value(source.cq_h, "CQ shadow CQ");
+    function_uid = source.function_uid;
+    generation = source.generation;
+    reset_epoch = source.reset_epoch;
+    sq_ci = source.sq_ci;
+    rq_ci = source.rq_ci;
+    arm_state = source.arm_state;
+    \sequence = source.\sequence ;
+  endfunction
+
+  // 功能：校验 CQ shadow 的 CQ handle 与 Function authority，供 flush 前置检查使用。
+  // 输入/输出及副作用：无显式参数；只读取本地字段并返回 rdma_status，不修改快照或外部账本。
+  // 失败边界：cq_h 为空/类型错误、UID 或 generation 为零、CQ 与快照 authority 不一致时返回 INVALID_ARGUMENT 或 STALE_GENERATION；游标值由拥有 CQ runtime 的调用方按 ring 深度约束。
+  function rdma_status validate();
+    rdma_status status;
+    status = rdma_context_handle_status(cq_h, RDMA_RESOURCE_CQ, 21,
+                                         "CQ shadow CQ");
+    if (!status.ok()) return status;
+    if (function_uid == 0 || generation == 0)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "CQ shadow Function authority is incomplete");
+    if (cq_h.function_uid != function_uid || cq_h.generation != generation)
+      return rdma_status::make(RDMA_SC_STALE_GENERATION,
+                               "CQ shadow Function authority does not match CQ");
+    return rdma_status::success();
+  endfunction
+endclass
+
 class rdma_cqc_model extends rdma_hw_model;
   `uvm_object_utils(rdma_cqc_model)
 
