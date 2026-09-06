@@ -243,7 +243,7 @@ class rdma_responder_registry extends uvm_object;
 
   // 功能：释放 registry 返回的 region 租约，逐项验证句柄和身份后移除内部账本项。
   // 输入输出及副作用：region 为调用方持有的句柄输入；成功时 active 清零并从 m_regions 删除，失败不修改任何条目。
-  // 失败边界：空句柄、非本 registry 对象、lease/owner/domain/route/base/size 任一字段不匹配或 inactive 均返回 INVALID_ARGUMENT；sealed 不阻止 release。
+  // 失败边界：空句柄、非本 registry 对象、lease/owner/domain/mode/route/base/size 任一字段不匹配或 inactive 均返回 INVALID_ARGUMENT；sealed 不阻止 release。
   function rdma_status \release (rdma_responder_region region);
     rdma_responder_region current;
     string lease_key;

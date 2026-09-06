@@ -96,6 +96,10 @@ class rdma_responder_registry_test extends uvm_test;
     if (registry.active_count() != 4)
       `uvm_error("REG_RELEASE", "tampered lease removed an entry")
     registry.region_at(1).lease_id = second_lease_id;
+    registry.region_at(1).mode = RDMA_RESPONDER_VIP;
+    status = registry.\release (registry.region_at(1));
+    expect_resource_error(status, RDMA_SC_INVALID_ARGUMENT);
+    registry.region_at(1).mode = RDMA_RESPONDER_DUT;
 
     status = registry.claim(RDMA_RESPONDER_CONFIG, RDMA_RESPONDER_DUT,
                             route, make_base(64'h1000), 64, "overlap", duplicate_region);
