@@ -120,10 +120,29 @@ class rdma_env_composition_test extends uvm_test;
       `uvm_error("RDMA_ENV_PENDING", "新建环境 pending_count 必须为零")
     begin
       rdma_env_event_route event_route;
+      rdma_function_identity event_identity;
+      rdma_function_key_t event_key;
+      event_identity = rdma_function_identity::type_id::create("event_identity");
+      event_key = '{root_id:0, host_topology_key:1, function_kind:RDMA_FUNCTION_PF,
+                   parent_pf_bdf:'0, vf_index:0,
+                   bdf:'{segment:0,bus:8'h1,device:0,function_num:0}};
+      void'(event_identity.configure(event_key, 1, 64'h1, 1, 1));
       event_route = rdma_env_event_route::type_id::create("bare_event");
       status = envs[0].route_event(event_route);
       if (status.ok() || envs[0].pending_count() != 0)
         `uvm_error("RDMA_ENV_EVENT", "bare event route must be rejected")
+      event_route.target_function = event_identity;
+      event_route.vector = 2;
+      event_route.generation = 1;
+      status = envs[0].route_event(event_route);
+      if (!status.ok() || envs[0].pending_count() != 1)
+        `uvm_error("RDMA_ENV_EVENT", "valid Function-qualified event must increment pending")
+      event_route.generation = 2;
+      status = envs[0].route_event(event_route);
+      if (status.ok() || envs[0].pending_count() != 1)
+        `uvm_error("RDMA_ENV_EVENT", "stale event must be rejected without pending change")
+      event_route.target_function = null;
+      envs[0].end_pending();
       envs[0].begin_pending();
       if (envs[0].pending_count() != 1) `uvm_error("RDMA_ENV_PENDING", "begin_pending failed")
       envs[0].end_pending();

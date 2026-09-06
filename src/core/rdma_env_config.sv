@@ -97,6 +97,10 @@ class rdma_env_config extends uvm_object;
            function_binding.global_function_id != function_identity.global_function_id))
         return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                  "Function identity and binding snapshots disagree");
+      if (function_identity != null &&
+          !function_identity.same_incarnation(function_binding.identity_snapshot()))
+        return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                                 "Function binding incarnation disagrees with identity");
     end
     return rdma_status::success();
   endfunction

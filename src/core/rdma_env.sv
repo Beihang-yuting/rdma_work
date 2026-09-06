@@ -145,16 +145,25 @@ class rdma_env extends uvm_env;
   // 输入输出及副作用：cfg 为输入配置；更新 env 内部 owned 对象和 config snapshot，adapter 仍保持 borrowed 引用。
   // 失败边界：cfg 为空/validate 失败、claim 冲突/溢出或 seal 失败时返回错误，旧 responder registry 不被部分替换。
   function rdma_status configure(rdma_env_config cfg);
+    rdma_env_config candidate_cfg;
     rdma_responder_registry candidate_registry;
     rdma_codec_registry candidate_codecs;
     rdma_resource_manager candidate_resources;
     rdma_responder_region source_region;
     rdma_responder_region claimed_region;
     rdma_status status;
+    rdma_queue_data_engine candidate_queue_data;
+    rdma_sq_engine candidate_sq;
+    rdma_rq_engine candidate_rq;
+    rdma_cq_engine candidate_cq;
+    rdma_eq_engine candidate_eq;
     if (cfg == null)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "rdma_env_config is null");
     status = cfg.validate();
     if (!status.ok()) return status;
+    candidate_cfg = rdma_env_config::type_id::create("config_candidate");
+    if (candidate_cfg == null) return rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED, "config snapshot allocation failed");
+    candidate_cfg.copy(cfg);
     candidate_registry = rdma_responder_registry::type_id::create("responders");
     candidate_codecs = rdma_codec_registry::type_id::create("codecs");
     candidate_resources = rdma_resource_manager::type_id::create("resources");
@@ -170,17 +179,31 @@ class rdma_env extends uvm_env;
     end
     status = candidate_registry.seal();
     if (!status.ok()) return status;
+    candidate_queue_data = rdma_queue_data_engine::type_id::create("queue_data");
+    candidate_sq = rdma_sq_engine::type_id::create("sq");
+    candidate_rq = rdma_rq_engine::type_id::create("rq");
+    candidate_cq = rdma_cq_engine::type_id::create("cq");
+    candidate_eq = rdma_eq_engine::type_id::create("eq");
+    if (candidate_queue_data == null || candidate_sq == null || candidate_rq == null || candidate_cq == null || candidate_eq == null)
+      return rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED,
+                               "queue engine anchor allocation failed");
     responders = candidate_registry;
     codecs = candidate_codecs;
     resources = candidate_resources;
-    queue_data = rdma_queue_data_engine::type_id::create("queue_data");
-    sq = rdma_sq_engine::type_id::create("sq");
-    rq = rdma_rq_engine::type_id::create("rq");
-    cq = rdma_cq_engine::type_id::create("cq");
-    eq = rdma_eq_engine::type_id::create("eq");
-    if (queue_data == null || sq == null || rq == null || cq == null || eq == null)
-      return rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED,
-                               "queue engine anchor allocation failed");
+    queue_data = candidate_queue_data;
+    sq = candidate_sq;
+    rq = candidate_rq;
+    cq = candidate_cq;
+    eq = candidate_eq;
+    config_snapshot = candidate_cfg;
+    if (config_snapshot.function_identity != null) begin
+      function_identity_snapshot = rdma_function_identity::type_id::create("function_identity_snapshot");
+      function_identity_snapshot.copy(config_snapshot.function_identity);
+    end
+    if (config_snapshot.function_binding != null) begin
+      function_binding_snapshot = rdma_function_binding::type_id::create("function_binding_snapshot");
+      function_binding_snapshot.copy(config_snapshot.function_binding);
+    end
     return rdma_status::success();
   endfunction
 
