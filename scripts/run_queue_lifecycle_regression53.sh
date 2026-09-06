@@ -9,6 +9,7 @@ readonly repo_root="$(git -C "$script_dir/.." rev-parse --show-toplevel)"
 readonly CORE_TESTS=(
   rdma_smoke_test
   rdma_responder_registry_test
+  rdma_env_composition_test
   rdma_types_test
   rdma_model_test
   rdma_cmq_engine_models_test
