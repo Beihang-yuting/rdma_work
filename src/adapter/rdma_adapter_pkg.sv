@@ -19,4 +19,5 @@ package rdma_adapter_pkg;
   `include "rdma_pcie_api.sv"
   `include "rdma_function_table_api.sv"
   `include "rdma_net_api.sv"
+  `include "rdma_abi_v5_api.sv"
 endpackage

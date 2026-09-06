@@ -52,4 +52,7 @@ virtual class rdma_context_backing_api extends uvm_object;
     rdma_context_backing_ref context_ref,
     output bit complete
   );
+
+  // ABI v5 生命周期约束：context backing 的 acquire/release 由 ABI adapter
+  // 以完整 Function snapshot 调用；borrowed context 只登记引用，不调用 release。
 endclass

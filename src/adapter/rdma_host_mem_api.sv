@@ -64,4 +64,7 @@ virtual class rdma_host_mem_api extends uvm_object;
   virtual function rdma_status release_opaque(rdma_dma_mapping mapping);
     return \release (mapping);
   endfunction
+
+  // ABI v5 生命周期约束：host-mem mapping 的 release 只能由 owned record
+  // 触发一次；borrowed mapping 的所有权仍留在外部 host-mem manager。
 endclass
