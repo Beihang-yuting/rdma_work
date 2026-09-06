@@ -19,7 +19,7 @@ VCS_FLAGS := -full64 -sverilog -ntb_opts uvm-1.2 -timescale=1ns/1ps -debug_acces
 SHELL := /bin/bash
 .SHELLFLAGS := -o pipefail -c
 
-.PHONY: core host_mem_preflight host_mem rdma_defs integration net_packet net_packet_preflight
+.PHONY: core host_mem_preflight host_mem rdma_defs integration net_packet net_packet_preflight pcie_work pcie_work_preflight
 
 core:
 	set -euo pipefail; \
@@ -191,3 +191,28 @@ net_packet: net_packet_preflight
 	if [[ "$$test_name" == regression ]]; then test_name=rdma_net_packet_adapter_test; fi; \
 	build/net_packet/simv +UVM_TESTNAME=$$test_name | tee build/net_packet/$$test_name.log; \
 	../scripts/check_uvm_summary.sh build/net_packet/$$test_name.log
+
+pcie_work_preflight:
+	@if [[ -z "$(PCIE_WORK_ROOT)" ]]; then echo "PCIE_WORK_ROOT is required for pcie_work" >&2; exit 2; fi
+	@if [[ -z "$(HOST_MEM_ROOT)" ]]; then echo "HOST_MEM_ROOT is required for pcie_work" >&2; exit 2; fi
+	@for dependency in \
+		"$(PCIE_WORK_ROOT)/pcie_tl_vip/src/pcie_tl_pkg.sv" \
+		"$(PCIE_WORK_ROOT)/pcie_tl_vip/src/shared/pcie_tl_func_manager.sv" \
+		"$(PCIE_WORK_ROOT)/pcie_tl_vip/src/shared/pcie_tl_bar_decoder.sv" \
+		"$(HOST_MEM_ROOT)/src/host_mem_pkg.sv"; do \
+		if [[ ! -r "$$dependency" ]]; then echo "Required pcie_work dependency is not readable: $$dependency" >&2; exit 2; fi; \
+	done
+
+pcie_work: pcie_work_preflight
+	set -euo pipefail; \
+	mkdir -p build/pcie_work; \
+	: "VCS 不会替换 filelist 中的 GNU make 变量，先生成只读依赖路径展开后的临时 filelist"; \
+	sed -e 's|@HOST_MEM_ROOT@|$(HOST_MEM_ROOT)|g' \
+	    -e 's|@PCIE_WORK_ROOT@|$(PCIE_WORK_ROOT)|g' \
+	    filelists/pcie_work.f > build/pcie_work/pcie_work.expanded.f; \
+	$(VCS) $(VCS_FLAGS) +define+RDMA_PCIE_WORK_TEST \
+		-f build/pcie_work/pcie_work.expanded.f -top tb_top -o build/pcie_work/simv; \
+	test_name=$(TEST); \
+	if [[ "$$test_name" == regression ]]; then test_name=rdma_pcie_work_adapter_test; fi; \
+	build/pcie_work/simv +UVM_TESTNAME=$$test_name | tee build/pcie_work/$$test_name.log; \
+	../scripts/check_uvm_summary.sh build/pcie_work/$$test_name.log
