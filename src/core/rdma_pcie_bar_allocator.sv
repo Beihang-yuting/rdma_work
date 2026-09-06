@@ -1,7 +1,7 @@
 // 目录：核心执行层 src/core/。
 // 职责：提供 PCIe 端独立的 64-bit MMIO 区间分配和可回滚 lease，供 SR-IOV
 //   枚举 sequence 为多个 PF/VF 分配不重叠、按 BAR 大小对齐的地址窗口。
-// 依赖：rdma_types_pkg 中的地址/BDF 类型和 rdma_status；不依赖外部 pcie_work、
+// 依赖：rdma_types_pkg 中的地址/BDF 类型和 rdma_status；不依赖外部 PCIe 组件、
 //   host_mem 或 dpu_common，避免把 PCIe 配置状态和 HMC 生命周期混在一起。
 // 所有权与生命周期：allocator 拥有 active lease 对象；调用方只持有 lease 引用，
 //   release() 成功后 lease 标记为 inactive，allocator 可以复用其地址区间。

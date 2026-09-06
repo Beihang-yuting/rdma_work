@@ -8,6 +8,7 @@ readonly script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 readonly repo_root="$(git -C "$script_dir/.." rev-parse --show-toplevel)"
 readonly CORE_TESTS=(
   rdma_smoke_test
+  rdma_responder_registry_test
   rdma_types_test
   rdma_model_test
   rdma_cmq_engine_models_test

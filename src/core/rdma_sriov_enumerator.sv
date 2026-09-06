@@ -2,7 +2,7 @@
 // 职责：实现 PCIe SR-IOV PF 前门枚举 sequence，串联 capability 读取、BAR sizing/
 //   分配、NumVFs/VF BAR/Control 编程、VF BDF 验证和 BAR decoder 检查。
 // 依赖：rdma_pcie_api、rdma_pcie_bar_allocator、rdma_model_pkg 中的 Function 快照；
-//   不依赖具体 pcie_work 类型，所有配置访问都经过统一 rdma_pcie_api。
+//   不依赖具体 PCIe 实现类型，所有配置访问都经过统一 rdma_pcie_api。
 // 所有权与生命周期：enumerator 不拥有 PCIe adapter 或 allocator；本地 lease 数组只
 //   保存本次 sequence 的非拥有引用，失败时负责调用 allocator.release()，成功后由调用方管理。
 

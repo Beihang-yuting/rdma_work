@@ -48,6 +48,7 @@ package rdma_unit_test_pkg;
   `include "mocks/rdma_mock_context_backing.sv"
   `include "support/rdma_golden_reader.sv"
   `include "unit/rdma_smoke_test.sv"
+  `include "unit/rdma_responder_registry_test.sv"
   `include "unit/rdma_types_test.sv"
   `include "unit/rdma_model_test.sv"
   `include "unit/rdma_cmq_engine_models_test.sv"
