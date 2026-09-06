@@ -1467,6 +1467,12 @@ class rdma_request_model_test extends uvm_test;
     post_send.remote_addr.value = 64'h1234_0000;
     post_send.rkey = 32'h1357_2468;
     expect_status("POST_SEND_RDMA_WRITE", post_send.validate(), RDMA_SC_OK);
+    // UD 只携带目的 QPN、QKey 和 AV；切换 transport 前清掉上一条 RC
+    // RDMA_WRITE 仍在请求对象中的远端地址/rkey，避免跨 transport 泄漏。
+    post_send.remote_access_valid = 1'b0;
+    post_send.rkey_valid = 1'b0;
+    post_send.remote_addr.value = '0;
+    post_send.rkey = '0;
     post_send.transport = RDMA_TRANSPORT_UD;
     expect_status("POST_SEND_UD_OPCODE", post_send.validate(),
                   RDMA_SC_INVALID_ARGUMENT);
@@ -1481,8 +1487,14 @@ class rdma_request_model_test extends uvm_test;
     expect_status("POST_SEND_UD_ZERO_AV_ID", post_send.validate(), RDMA_SC_OK);
     post_send.address_vector_id = 32'h5566_7788;
     expect_status("POST_SEND_UD", post_send.validate(), RDMA_SC_OK);
+    // 后续 clone 断言重新验证 RC 远端字段，因此在恢复 RC transport 时
+    // 明确重建这组字段，而不是依赖前一个 UD fixture 的残留状态。
     post_send.transport = RDMA_TRANSPORT_RC;
     post_send.opcode = RDMA_WR_RDMA_WRITE;
+    post_send.remote_access_valid = 1'b1;
+    post_send.rkey_valid = 1'b1;
+    post_send.remote_addr.value = 64'h1234_0000;
+    post_send.rkey = 32'h1357_2468;
     post_send.compare_value = 64'h0123_4567_89ab_cdef;
     post_send.swap_add_value = 64'hfedc_ba98_7654_3210;
     post_send.payload.push_back(8'ha5);
@@ -2693,6 +2705,9 @@ class rdma_request_model_test extends uvm_test;
     urc_sqe.sges.push_back(sge);
     sqe_urc_ext = rdma_sqe_urc_ext::type_id::create("sqe_urc_ext");
     sqe_urc_ext.destination_qpn = 24'h506070;
+    // URC completion 由显式 completion QP 归属；该 fixture 使用与 SQE
+    // 相同 Function 的 qp_h，覆盖 authority 校验的合法路径。
+    sqe_urc_ext.completion_qp_h = qp_h;
     urc_sqe.transport_ext = sqe_urc_ext;
     expect_status("URC_SQE_REMOTE_PRESENCE", urc_sqe.validate(),
                   RDMA_SC_INVALID_ARGUMENT);

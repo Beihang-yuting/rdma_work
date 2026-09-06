@@ -111,10 +111,6 @@ endclass
 class rdma_hw_cmq_completion_codec extends uvm_object;
   `uvm_object_utils(rdma_hw_cmq_completion_codec)
 
-  // 0.1.34 驱动的 opcode 从 0x00 连续定义到 0x48；完成队列可识别完整
-  //   范围，但请求 body 仍由 light codec 的精确模型单独决定。
-  localparam bit [7:0] COMPLETION_MAX_OPCODE = 8'h48;
-
   // 功能：构造 rdma_hw_cmq_completion_codec，调用 super.new 建立 UVM 层级对象；外部依赖字段保持未绑定，后续由 configure/build/activate 明确注入。
   // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
   // 失败/边界：rdma_hw_cmq_completion_codec 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
@@ -145,13 +141,31 @@ class rdma_hw_cmq_completion_codec extends uvm_object;
     return value;
   endfunction
 
-  // 完成接收必须独立于可注入的 request registry；因此这里按归档驱动的
-  // 连续 opcode 范围做 admission，未知值（例如 0xff）始终拒绝。
+  // 完成接收必须独立于可注入的 request registry；这里只接收完成解码器
+  // 已声明公共头/返回 payload 语义的 opcode。请求 registry 中存在但尚未
+  // 建立 CQE payload 契约的命令（例如 MW_ALLOC、QP_FLUSH）仍必须拒绝。
   // 功能：判断 supported_opcode 对应的状态、能力或账本条件，并返回确定的布尔/计数结果，不修改状态。
   // 输入/输出及副作用：opcode（输入）；supported_opcode 读取 opcode 并使用输入参数和固定枚举/常量；函数返回 bit，不取得调用方资源所有权。
   // 失败/边界：supported_opcode 只读取现有账本；输入未初始化时返回保守结果，不得借助默认 Function/root 猜测。
   local function bit supported_opcode(bit [7:0] opcode);
-    return opcode <= COMPLETION_MAX_OPCODE;
+    return opcode inside {
+      RDMA_OP_QPC_CREATE, RDMA_OP_QPC_MODIFY,
+      RDMA_OP_QPC_DELETE, RDMA_OP_QPC_QUERY,
+      RDMA_OP_KEY_ALLOC, RDMA_OP_MR_REGISTER,
+      RDMA_OP_MR_DEREGISTER, RDMA_OP_KEY_QUERY,
+      RDMA_OP_OCC_FLUSH,
+      RDMA_OP_CQC_CREATE, RDMA_OP_CQC_DELETE,
+      RDMA_OP_CQC_QUERY, RDMA_OP_CEQC_CREATE,
+      RDMA_OP_CEQC_DELETE, RDMA_OP_CEQC_QUERY,
+      RDMA_OP_AEQC_CREATE, RDMA_OP_AEQC_DELETE,
+      RDMA_OP_AEQC_QUERY, RDMA_OP_TQ_FLUSH,
+      RDMA_OP_SRFQC_CREATE, RDMA_OP_SRFQC_DELETE,
+      RDMA_OP_SRFQC_QUERY,
+      RDMA_OP_SRC_ADDR_QUERY,
+      RDMA_OP_IFA_QUERY,
+      RDMA_OP_OCC_PD_SEARCH,
+      RDMA_OP_OCC_PD_IDX_SEARCH
+    };
   endfunction
 
   // 功能：在 rdma_hw_cmq_completion_codec 中，allowed_qword_mask 根据 opcode、对象类型或 profile 选择允许位掩码/有效 payload 范围，供保留位检查使用。

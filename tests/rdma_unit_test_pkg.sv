@@ -115,6 +115,8 @@ package rdma_unit_test_pkg;
 endpackage
 
 `ifdef RDMA_HOST_MEM_TEST
+  // 真实 host_mem suite 在 package 外编译 host_mem_manager；下面三个测试
+  // 共享同一外部 manager 类型，但仍由各自的 run_phase 负责申请和释放资源。
   import uvm_pkg::*;
   import host_mem_pkg::*;
   import rdma_types_pkg::*;

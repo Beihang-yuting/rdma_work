@@ -22,10 +22,20 @@ SHELL := /bin/bash
 .PHONY: core host_mem_preflight host_mem rdma_defs integration net_packet net_packet_preflight
 
 core:
-	mkdir -p $(BUILD)
-	$(VCS) $(VCS_FLAGS) -f filelists/core.f -top tb_top -o $(BUILD)/simv
-	$(BUILD)/simv +UVM_TESTNAME=$(TEST) | tee $(BUILD)/$(TEST).log
-	../scripts/check_uvm_summary.sh $(BUILD)/$(TEST).log
+	set -euo pipefail; \
+	mkdir -p $(BUILD); \
+	$(VCS) $(VCS_FLAGS) -f filelists/core.f -top tb_top -o $(BUILD)/simv; \
+	if [[ "$(TEST)" == regression ]]; then \
+		mapfile -t suite_tests < <(sed -n '/^readonly CORE_TESTS=(/,/^)/p' ../scripts/run_queue_lifecycle_regression53.sh | sed -n 's/^[[:space:]]*\([A-Za-z_][A-Za-z0-9_]*\)[[:space:]]*$$/\1/p'); \
+		if (( $${#suite_tests[@]} == 0 )); then echo "core regression manifest is empty" >&2; exit 2; fi; \
+		for test_name in "$${suite_tests[@]}"; do \
+			$(BUILD)/simv +UVM_TESTNAME=$$test_name | tee $(BUILD)/$$test_name.log; \
+			../scripts/check_uvm_summary.sh $(BUILD)/$$test_name.log; \
+		done; \
+	else \
+		$(BUILD)/simv +UVM_TESTNAME=$(TEST) | tee $(BUILD)/$(TEST).log; \
+		../scripts/check_uvm_summary.sh $(BUILD)/$(TEST).log; \
+	fi
 
 rdma_defs:
 	@ref_dir=$$(mktemp -d /tmp/rdma_profile_ref.XXXXXX); \
@@ -118,21 +128,40 @@ host_mem_preflight:
 	fi
 
 host_mem: host_mem_preflight
-	mkdir -p $(HOST_MEM_BUILD)
+	set -euo pipefail; \
+	mkdir -p $(HOST_MEM_BUILD); \
 	$(VCS) $(VCS_FLAGS) +define+RDMA_HOST_MEM_TEST \
 		+incdir+$(HOST_MEM_ROOT)/src \
 		$(HOST_MEM_ROOT)/src/host_mem_pkg.sv \
-		-f filelists/host_mem.f -top tb_top -o $(HOST_MEM_BUILD)/simv
-	$(HOST_MEM_BUILD)/simv +UVM_TESTNAME=$(TEST) | \
-		tee $(HOST_MEM_BUILD)/$(TEST).log
-	../scripts/check_uvm_summary.sh $(HOST_MEM_BUILD)/$(TEST).log
+		-f filelists/host_mem.f -top tb_top -o $(HOST_MEM_BUILD)/simv; \
+	if [[ "$(TEST)" == regression ]]; then \
+		mapfile -t suite_tests < <(sed -n '/^readonly host_mem_tests=(/,/^)/p' ../scripts/run_host_mem_regression53.sh | sed -n 's/^[[:space:]]*\([A-Za-z_][A-Za-z0-9_]*\)[[:space:]]*$$/\1/p'); \
+		if (( $${#suite_tests[@]} == 0 )); then echo "host_mem regression manifest is empty" >&2; exit 2; fi; \
+		for test_name in "$${suite_tests[@]}"; do \
+			$(HOST_MEM_BUILD)/simv +UVM_TESTNAME=$$test_name | tee $(HOST_MEM_BUILD)/$$test_name.log; \
+			../scripts/check_uvm_summary.sh $(HOST_MEM_BUILD)/$$test_name.log; \
+		done; \
+	else \
+		$(HOST_MEM_BUILD)/simv +UVM_TESTNAME=$(TEST) | tee $(HOST_MEM_BUILD)/$(TEST).log; \
+		../scripts/check_uvm_summary.sh $(HOST_MEM_BUILD)/$(TEST).log; \
+	fi
 
 integration:
 	@if [[ -z "$(DPU_COMMON_ROOT)" ]]; then echo "DPU_COMMON_ROOT is required for integration" >&2; exit 2; fi
-	mkdir -p build/integration
-	$(VCS) $(VCS_FLAGS) +define+RDMA_DPU_INTEGRATION +incdir+$(DPU_COMMON_ROOT)/src $(DPU_COMMON_ROOT)/src/dpu_resource_pkg.sv -f filelists/integration.f -top tb_top -o build/integration/simv
-	build/integration/simv +UVM_TESTNAME=$(TEST) | tee build/integration/$(TEST).log
-	../scripts/check_uvm_summary.sh build/integration/$(TEST).log
+	set -euo pipefail; \
+	mkdir -p build/integration; \
+	$(VCS) $(VCS_FLAGS) +define+RDMA_DPU_INTEGRATION +incdir+$(DPU_COMMON_ROOT)/src $(DPU_COMMON_ROOT)/src/dpu_resource_pkg.sv -f filelists/integration.f -top tb_top -o build/integration/simv; \
+	if [[ "$(TEST)" == regression ]]; then \
+		mapfile -t suite_tests < <(sed -n '/^readonly INTEGRATION_TESTS=(/,/^)/p' ../scripts/run_queue_lifecycle_regression53.sh | sed -n 's/^[[:space:]]*\([A-Za-z_][A-Za-z0-9_]*\)[[:space:]]*$$/\1/p'); \
+		if (( $${#suite_tests[@]} == 0 )); then echo "integration regression manifest is empty" >&2; exit 2; fi; \
+		for test_name in "$${suite_tests[@]}"; do \
+			build/integration/simv +UVM_TESTNAME=$$test_name | tee build/integration/$$test_name.log; \
+			../scripts/check_uvm_summary.sh build/integration/$$test_name.log; \
+		done; \
+	else \
+		build/integration/simv +UVM_TESTNAME=$(TEST) | tee build/integration/$(TEST).log; \
+		../scripts/check_uvm_summary.sh build/integration/$(TEST).log; \
+	fi
 
 net_packet_preflight:
 	@if [[ -z "$(NET_PACKET_ROOT)" ]]; then echo "NET_PACKET_ROOT is required for net_packet" >&2; exit 2; fi
@@ -153,9 +182,12 @@ net_packet_preflight:
 	else echo "net_packet preflight failed: NET_PACKET_ROOT is not a git checkout" >&2; exit 1; fi
 
 net_packet: net_packet_preflight
-	mkdir -p build/net_packet
-	# VCS 不会替换 filelist 中的 GNU make 变量；先生成只读依赖路径展开后的临时 filelist。
-	sed 's|\$$(NET_PACKET_ROOT)|$(NET_PACKET_ROOT)|g' filelists/net_packet.f > build/net_packet/net_packet.expanded.f
-	$(VCS) $(VCS_FLAGS) +define+RDMA_NET_PACKET +incdir+$(NET_PACKET_ROOT)/src +incdir+$(NET_PACKET_ROOT)/src/common +incdir+$(NET_PACKET_ROOT)/src/protocols -f build/net_packet/net_packet.expanded.f -top tb_top -o build/net_packet/simv
-	build/net_packet/simv +UVM_TESTNAME=$(TEST) | tee build/net_packet/$(TEST).log
-	../scripts/check_uvm_summary.sh build/net_packet/$(TEST).log
+	set -euo pipefail; \
+	mkdir -p build/net_packet; \
+	: "VCS 不会替换 filelist 中的 GNU make 变量，先生成只读依赖路径展开后的临时 filelist"; \
+	sed 's|\$$(NET_PACKET_ROOT)|$(NET_PACKET_ROOT)|g' filelists/net_packet.f > build/net_packet/net_packet.expanded.f; \
+	$(VCS) $(VCS_FLAGS) +define+RDMA_NET_PACKET +incdir+$(NET_PACKET_ROOT)/src +incdir+$(NET_PACKET_ROOT)/src/common +incdir+$(NET_PACKET_ROOT)/src/protocols -f build/net_packet/net_packet.expanded.f -top tb_top -o build/net_packet/simv; \
+	test_name=$(TEST); \
+	if [[ "$$test_name" == regression ]]; then test_name=rdma_net_packet_adapter_test; fi; \
+	build/net_packet/simv +UVM_TESTNAME=$$test_name | tee build/net_packet/$$test_name.log; \
+	../scripts/check_uvm_summary.sh build/net_packet/$$test_name.log

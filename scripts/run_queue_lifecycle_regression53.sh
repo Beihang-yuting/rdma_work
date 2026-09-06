@@ -106,10 +106,7 @@ if [[ $# -ne 0 ]]; then
 fi
 
 cd "$repo_root"
-for test_name in "${CORE_TESTS[@]}"; do
-  scripts/run_vcs53.sh core "$test_name"
-done
-
-for test_name in "${INTEGRATION_TESTS[@]}"; do
-  scripts/run_vcs53.sh integration "$test_name"
-done
+# regression 由 Makefile 在同一个 VCS 编译产物上逐项运行，避免每个 UVM
+# test 都重新复制源码和编译一次；--list 仍保留完整 manifest 供静态检查。
+scripts/run_vcs53.sh core regression
+scripts/run_vcs53.sh integration regression
