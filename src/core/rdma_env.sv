@@ -136,6 +136,17 @@ class rdma_env extends uvm_env;
       if (function_identity_snapshot == null)
         function_identity_snapshot = function_binding_snapshot.identity_snapshot();
     end
+    if (function_identity_snapshot != null && function_binding_snapshot != null &&
+        !function_identity_snapshot.same_incarnation(
+          function_binding_snapshot.identity_snapshot()))
+      begin
+        `uvm_fatal("RDMA_ENV_CONFIG", "injected Function identity and binding disagree")
+        return;
+      end
+    if (function_identity_snapshot != null)
+      config_snapshot.function_identity = function_identity_snapshot;
+    if (function_binding_snapshot != null)
+      config_snapshot.function_binding = function_binding_snapshot;
     status = configure(config_snapshot);
     if (!status.ok())
       begin `uvm_fatal("RDMA_ENV_CONFIG", status.message); return; end
