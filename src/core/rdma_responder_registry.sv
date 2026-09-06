@@ -44,6 +44,8 @@ class rdma_responder_registry extends uvm_object;
   `uvm_object_utils(rdma_responder_registry)
 
   protected rdma_responder_region m_regions[$];
+  // m_region_lease_ids 与 m_regions 同步，记录句柄首次登记时的不可变 lease 绑定。
+  protected longint unsigned m_region_lease_ids[$];
   // 账本字段按 lease_id 独立保存，防止调用方通过返回句柄篡改冲突和释放校验依据。
   protected string m_owner_ledger[string];
   protected rdma_responder_domain_e m_domain_ledger[string];
@@ -204,7 +206,7 @@ class rdma_responder_registry extends uvm_object;
 
     foreach (m_regions[index]) begin
       existing = m_regions[index];
-      existing_key = $sformatf("%0d", existing.lease_id);
+      existing_key = $sformatf("%0d", m_region_lease_ids[index]);
       if (!m_active_ledger.exists(existing_key) || !m_active_ledger[existing_key] ||
           m_domain_ledger[existing_key] != domain ||
           m_mode_ledger[existing_key] == RDMA_RESPONDER_MONITOR_ONLY ||
@@ -227,6 +229,7 @@ class rdma_responder_registry extends uvm_object;
     region.active = 1'b1;
     m_next_lease_id++;
     m_regions.push_back(region);
+    m_region_lease_ids.push_back(region.lease_id);
     lease_key = $sformatf("%0d", region.lease_id);
     m_owner_ledger[lease_key] = owner;
     m_domain_ledger[lease_key] = domain;
@@ -250,10 +253,12 @@ class rdma_responder_registry extends uvm_object;
       current = m_regions[index];
       if (current != region)
         continue;
-      lease_key = $sformatf("%0d", region.lease_id);
+      lease_key = $sformatf("%0d", m_region_lease_ids[index]);
       if (!m_active_ledger.exists(lease_key) || !m_active_ledger[lease_key] ||
+          region.lease_id != m_region_lease_ids[index] ||
           region.owner != m_owner_ledger[lease_key] ||
           region.domain != m_domain_ledger[lease_key] ||
+          region.mode != m_mode_ledger[lease_key] ||
           !same_route(region.route, m_route_ledger[lease_key]) ||
           !same_base(region.base, m_base_ledger[lease_key]) ||
           region.size != m_size_ledger[lease_key])
@@ -261,6 +266,7 @@ class rdma_responder_registry extends uvm_object;
       current.active = 1'b0;
       m_active_ledger[lease_key] = 1'b0;
       m_regions.delete(index);
+      m_region_lease_ids.delete(index);
       m_owner_ledger.delete(lease_key);
       m_domain_ledger.delete(lease_key);
       m_mode_ledger.delete(lease_key);
@@ -294,8 +300,9 @@ class rdma_responder_registry extends uvm_object;
   function int unsigned active_count();
     int unsigned count;
     count = 0;
-    foreach (m_regions[index])
-      if (m_regions[index] != null && m_regions[index].active)
+    foreach (m_region_lease_ids[index])
+      if (m_active_ledger.exists($sformatf("%0d", m_region_lease_ids[index])) &&
+          m_active_ledger[$sformatf("%0d", m_region_lease_ids[index])])
         count++;
     return count;
   endfunction

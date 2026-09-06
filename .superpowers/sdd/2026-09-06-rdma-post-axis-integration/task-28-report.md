@@ -18,3 +18,9 @@
 ## 注意事项
 
 SystemVerilog 将 `release` 视为保留关键字，因此接口以 escaped identifier `\\release` 声明和调用；其语义名称仍为 release，调用形式为 `registry.\\release(region)`。
+
+## Review fix round 1
+
+- 增加与 `m_regions` 同步的不可变 lease 绑定队列，release 不再使用可变句柄字段选择账本；同时校验 lease、mode 及其余身份字段。
+- `active_count()` 改为读取内部 active ledger，外部篡改 `region.active` 不影响计数。
+- 测试新增句柄 lease 重定向、active 篡改和成功 claim 全量清理场景。

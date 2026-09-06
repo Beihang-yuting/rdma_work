@@ -59,6 +59,7 @@ class rdma_responder_registry_test extends uvm_test;
     rdma_responder_region region;
     rdma_responder_region monitor_region;
     rdma_responder_region duplicate_region;
+    rdma_responder_region first_region;
     rdma_responder_registry reuse_registry;
     rdma_responder_region reuse_region;
     rdma_status status;
@@ -67,6 +68,7 @@ class rdma_responder_registry_test extends uvm_test;
     int unsigned index;
     rdma_responder_domain_e domain;
     longint unsigned monitor_lease_id;
+    longint unsigned second_lease_id;
 
     phase.raise_objection(this);
     registry = rdma_responder_registry::type_id::create("registry");
@@ -82,6 +84,18 @@ class rdma_responder_registry_test extends uvm_test;
     end
     if (registry.active_count() != 4)
       `uvm_error("REG_COUNT", "four domain claims were not retained")
+    first_region = registry.region_at(0);
+    second_lease_id = registry.region_at(1).lease_id;
+    registry.region_at(0).active = 1'b0;
+    if (registry.active_count() != 4)
+      `uvm_error("REG_COUNT", "active count trusted mutable region.active")
+    registry.region_at(0).active = 1'b1;
+    registry.region_at(1).lease_id = first_region.lease_id;
+    status = registry.\release (registry.region_at(1));
+    expect_resource_error(status, RDMA_SC_INVALID_ARGUMENT);
+    if (registry.active_count() != 4)
+      `uvm_error("REG_RELEASE", "tampered lease removed an entry")
+    registry.region_at(1).lease_id = second_lease_id;
 
     status = registry.claim(RDMA_RESPONDER_CONFIG, RDMA_RESPONDER_DUT,
                             route, make_base(64'h1000), 64, "overlap", duplicate_region);
@@ -149,6 +163,18 @@ class rdma_responder_registry_test extends uvm_test;
     end
     if (registry.region_at(99) != null)
       `uvm_error("REG_LOOKUP", "out-of-range region_at returned an entry")
+    while (registry.active_count() != 0) begin
+      region = registry.region_at(0);
+      status = registry.\release (region);
+      if (status == null || !status.ok())
+        `uvm_error("REG_CLEANUP", "failed to release active region during cleanup")
+    end
+    while (reuse_registry.active_count() != 0) begin
+      reuse_region = reuse_registry.region_at(0);
+      status = reuse_registry.\release (reuse_region);
+      if (status == null || !status.ok())
+        `uvm_error("REG_CLEANUP", "failed to release reusable region")
+    end
     phase.drop_objection(this);
   endtask
 endclass
