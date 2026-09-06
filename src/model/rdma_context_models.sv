@@ -75,6 +75,33 @@ function automatic rdma_status rdma_context_lifecycle_status(
   return rdma_status::success();
 endfunction
 
+// 功能：rdma_function_incarnation_status 统一校验 Function UID、object ID、generation 和 reset epoch。
+// 输入/输出及副作用：candidate、expected_uid、expected_object_id、expected_generation、expected_epoch 为输入；函数只返回状态，不修改句柄或资源账本。
+// 失败/边界：空句柄/错误 kind 或 UID/object 不匹配返回 INVALID_ARGUMENT；generation/epoch 不匹配返回 STALE_GENERATION。
+function automatic rdma_status rdma_function_incarnation_status(
+  rdma_function_handle candidate,
+  longint unsigned expected_uid,
+  int unsigned expected_object_id,
+  int unsigned expected_generation,
+  rdma_reset_epoch_t expected_epoch,
+  rdma_reset_epoch_t candidate_epoch = 0
+);
+  if (candidate == null || candidate.kind != RDMA_RESOURCE_FUNCTION)
+    return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                             "Function incarnation handle is invalid");
+  if (candidate.function_uid != expected_uid ||
+      candidate.object_id != expected_object_id)
+    return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                             "Function incarnation UID/object does not match");
+  if (candidate.generation != expected_generation)
+    return rdma_status::make(RDMA_SC_STALE_GENERATION,
+                             "Function incarnation generation is stale");
+  if (candidate_epoch != 0 && candidate_epoch != expected_epoch)
+    return rdma_status::make(RDMA_SC_STALE_GENERATION,
+                             "Function incarnation reset epoch is stale");
+  return rdma_status::success();
+endfunction
+
 // 功能：rdma_context_state_status 校验 state、label 与当前对象状态的一致性，并显式处理“context state is invalid”等拒绝条件，返回 rdma_status 供上层决定是否提交。
 // 输入/输出及副作用：state（输入）、label（输入）；rdma_context_state_status 读取 state、label 并使用字段 rdma_status；函数返回 rdma_status，不取得调用方资源所有权。
 // 失败/边界：rdma_context_state_status 返回 RDMA_SC_INVALID_ARGUMENT；失败路径不提交部分状态或转移未声明资源。
