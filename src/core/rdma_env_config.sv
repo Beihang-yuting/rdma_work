@@ -87,6 +87,17 @@ class rdma_env_config extends uvm_object;
         return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                  "Function identity snapshot is invalid");
     end
+    if (function_binding != null) begin
+      if (!function_binding.validate().ok())
+        return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                                 "Function binding snapshot is invalid");
+      if (function_identity != null &&
+          (function_binding.function_uid != function_identity.function_uid ||
+           function_binding.generation != function_identity.generation ||
+           function_binding.global_function_id != function_identity.global_function_id))
+        return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                                 "Function identity and binding snapshots disagree");
+    end
     return rdma_status::success();
   endfunction
 

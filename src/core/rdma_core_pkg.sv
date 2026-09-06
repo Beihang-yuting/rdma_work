@@ -20,8 +20,6 @@ package rdma_core_pkg;
   `include "rdma_sriov_enumerator.sv"
   `include "rdma_resource_manager.sv"
   `include "rdma_responder_registry.sv"
-  `include "rdma_env_config.sv"
-  `include "rdma_env.sv"
   `include "rdma_queue_lifecycle_policy.sv"
   `include "rdma_queue_backing_planner.sv"
   `include "rdma_queue_runtime.sv"
@@ -39,4 +37,6 @@ package rdma_core_pkg;
   `include "rdma_cmq_engine.sv"
   `include "rdma_cmq_engine_port_adapter.sv"
   `include "rdma_sq_payload_writer.sv"
+  `include "rdma_env_config.sv"
+  `include "rdma_env.sv"
 endpackage

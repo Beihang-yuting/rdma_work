@@ -45,6 +45,11 @@ class rdma_env extends uvm_env;
   rdma_responder_registry responders;
   rdma_codec_registry codecs;
   rdma_resource_manager resources;
+  rdma_queue_data_engine queue_data;
+  rdma_sq_engine sq;
+  rdma_rq_engine rq;
+  rdma_cq_engine cq;
+  rdma_eq_engine eq;
   rdma_env_config config_snapshot;
   rdma_function_identity function_identity_snapshot;
   rdma_function_binding function_binding_snapshot;
@@ -62,6 +67,11 @@ class rdma_env extends uvm_env;
     responders = null;
     codecs = null;
     resources = null;
+    queue_data = null;
+    sq = null;
+    rq = null;
+    cq = null;
+    eq = null;
     config_snapshot = null;
     function_identity_snapshot = null;
     function_binding_snapshot = null;
@@ -83,23 +93,29 @@ class rdma_env extends uvm_env;
     super.build_phase(phase);
     if (!uvm_config_db#(rdma_env_config)::get(this, "", "cfg", supplied_cfg) &&
         !uvm_config_db#(rdma_env_config)::get(this, "", "rdma_env_config", supplied_cfg))
-      `uvm_fatal("RDMA_ENV_CFG", "rdma_env_config is missing from uvm_config_db")
+      begin `uvm_fatal("RDMA_ENV_CFG", "rdma_env_config is missing from uvm_config_db"); return; end
     if (supplied_cfg == null)
-      `uvm_fatal("RDMA_ENV_CFG", "rdma_env_config handle is null")
+      begin `uvm_fatal("RDMA_ENV_CFG", "rdma_env_config handle is null"); return; end
     config_snapshot = rdma_env_config::type_id::create("config_snapshot");
     config_snapshot.copy(supplied_cfg);
 
     found = uvm_config_db#(rdma_pcie_api)::get(this, "", "pcie", pcie);
+    found = found && (pcie != null);
+    if (!found) found = uvm_config_db#(rdma_pcie_api)::get(this, "", "pcie_api", pcie) && (pcie != null);
     if (config_snapshot.pcie_required && !found)
-      `uvm_fatal("RDMA_ENV_PCIE", "required PCIe adapter is missing")
+      begin `uvm_fatal("RDMA_ENV_PCIE", "required PCIe adapter is missing"); return; end
     m_capability["pcie"] = config_snapshot.pcie_enabled ? (found ? "enabled" : "passive") : "disabled";
     found = uvm_config_db#(rdma_host_mem_api)::get(this, "", "host_mem", host_mem);
+    found = found && (host_mem != null);
+    if (!found) found = uvm_config_db#(rdma_host_mem_api)::get(this, "", "host_mem_api", host_mem) && (host_mem != null);
     if (config_snapshot.host_mem_required && !found)
-      `uvm_fatal("RDMA_ENV_HOST", "required host-memory adapter is missing")
+      begin `uvm_fatal("RDMA_ENV_HOST", "required host-memory adapter is missing"); return; end
     m_capability["host_mem"] = config_snapshot.host_mem_enabled ? (found ? "enabled" : "passive") : "disabled";
     found = uvm_config_db#(rdma_net_api)::get(this, "", "net", net);
+    found = found && (net != null);
+    if (!found) found = uvm_config_db#(rdma_net_api)::get(this, "", "net_api", net) && (net != null);
     if (config_snapshot.net_required && !found)
-      `uvm_fatal("RDMA_ENV_NET", "required network adapter is missing")
+      begin `uvm_fatal("RDMA_ENV_NET", "required network adapter is missing"); return; end
     m_capability["net"] = config_snapshot.net_enabled ? (found ? "enabled" : "passive") : "disabled";
 
     if (uvm_config_db#(rdma_function_identity)::get(this, "", "function_identity", supplied_identity)) begin
@@ -122,7 +138,7 @@ class rdma_env extends uvm_env;
     end
     status = configure(config_snapshot);
     if (!status.ok())
-      `uvm_fatal("RDMA_ENV_CONFIG", status.message)
+      begin `uvm_fatal("RDMA_ENV_CONFIG", status.message); return; end
   endfunction
 
   // 功能：按 cfg 快照创建内部 registry/codec/resource 对象，逐项 claim region 后 seal，提交完整一致的组合结果。
@@ -157,6 +173,14 @@ class rdma_env extends uvm_env;
     responders = candidate_registry;
     codecs = candidate_codecs;
     resources = candidate_resources;
+    queue_data = rdma_queue_data_engine::type_id::create("queue_data");
+    sq = rdma_sq_engine::type_id::create("sq");
+    rq = rdma_rq_engine::type_id::create("rq");
+    cq = rdma_cq_engine::type_id::create("cq");
+    eq = rdma_eq_engine::type_id::create("eq");
+    if (queue_data == null || sq == null || rq == null || cq == null || eq == null)
+      return rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED,
+                               "queue engine anchor allocation failed");
     return rdma_status::success();
   endfunction
 
