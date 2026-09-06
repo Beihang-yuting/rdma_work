@@ -10,6 +10,10 @@
 
 **Spec:** `docs/superpowers/specs/2026-09-06-rdma-post-axis-integration-design.md`
 
+**当前进度：** Task 28、Task 29 和 Task 30 已实现；Task 31 尚未开始。本计划中的
+Task 30 矩阵以外部 RoCEv2 UC wire profile 为准，URC READ 只作为负向能力边界，
+不作为成功事务。
+
 ## Global Constraints
 
 - 所有新增普通 SystemVerilog 源码、package 和测试使用 `.sv`；`.svh` 只保留宏或固定 mask 头文件。
@@ -215,7 +219,11 @@ endclass
 
 **Files:**
 - Create: `tests/integration/rdma_end_to_end_transport_test.sv`
+- Modify: `src/core/rdma_queue_data_engine.sv`
+- Modify: `src/model/rdma_semantic_requests.sv`
 - Modify: `tests/rdma_unit_test_pkg.sv`
+- Modify: `tests/unit/rdma_wqe_extended_opcode_test.sv`
+- Modify: `tests/integration/rdma_net_packet_adapter_test.sv`
 - Modify: `sim/Makefile` (only if a dedicated transport target is needed)
 - Create: `sim/filelists/e2e_transport.f` (only if the existing `e2e.f` cannot express the transport matrix)
 
@@ -227,23 +235,28 @@ endclass
 ```systemverilog
 task automatic run_transport_case(
   rdma_transport_e transport,
-  rdma_wr_opcode_e opcode,
+  rdma_work_opcode_e opcode,
   output rdma_status status
 );
 task automatic wait_transport_completion(
   rdma_transport_e transport,
   longint unsigned wr_id,
+  int unsigned expected_index,
+  bit expected_wrap,
   time timeout,
   output rdma_queue_completion_result completion,
   output rdma_status status
 );
 ```
 
-- [ ] **Step 1: Write failing transport matrix tests**
+- [x] **Step 1: Write failing transport matrix tests**
 
-  先扩展测试 fixture，列出 RC SEND/WRITE/READ/ATOMIC、UD SEND、URC SEND/WRITE/READ；每个 case 断言 payload、transport、QPN、PSN、opcode、CQE、pending_count 和 host-memory leak。保留 TX/RX 独立 Host ID、物理地址和 IOVA。测试先引用尚未实现的 `run_transport_case()`，确保红灯是接口缺失而不是运行时假失败。
+  已扩展测试 fixture，覆盖 RC SEND/WRITE/READ/ATOMIC、UD SEND、URC SEND/WRITE，
+  并将 UD RDMA_WRITE、URC RDMA_READ 作为负向 case。每个 case 断言 payload、
+  transport、QPN、PSN、opcode、CQE、pending_count、PI/CI/wrap 和 host-memory leak；
+  TX/RX 使用独立 Host ID、物理地址和 IOVA。
 
-- [ ] **Step 2: Run the focused transport test to verify it fails**
+- [x] **Step 2: Run the focused transport test to verify it fails**
 
   ```bash
   PCIE_WORK_ROOT=/home/ubuntu/pcie_work_unified \
@@ -253,17 +266,21 @@ task automatic wait_transport_completion(
     scripts/run_vcs53.sh e2e rdma_end_to_end_transport_test
   ```
 
-  Expected: 新测试或 transport helper 未定义。
+  初始红灯由 transport helper/API 尚未定义触发，随后进入实现阶段。
 
-- [ ] **Step 3: Implement reusable transport sequence**
+- [x] **Step 3: Implement reusable transport sequence**
 
   1. 把当前 dual-env 的 payload/mapping/queue setup 抽成可复用 helper；每个 case 使用独立 WR ID 和 packet index，禁止复用已消费的 CQ slot。
-  2. 按 transport/opcode 选择 semantic request 和 `net_packet` opcode；RC/URC 的 remote read/write 使用显式 responder policy，UD 只要求 SEND。
+  2. 按 transport/opcode 选择 semantic request 和 `net_packet` opcode；RC 的 remote
+     read/write 使用显式 responder policy，UD 只要求 SEND，URC 按 UC wire profile
+     只允许 SEND/WRITE。
   3. 统一执行 post RQ → post SQ → packet encode/send/decode → host-memory write/readback → TX/RX CQE poll；CQ owner polarity、PI/CI、wrap、credit 和 outstanding key 必须逐 case 校验。
   4. timeout/packet fault 立即停止当前 case，保存首个 status；无论成功失败都按 mapping → QP/CQ/CEQ → host_mem 的顺序 cleanup。
-  5. 对 unsupported transport/opcode 返回 `RDMA_SC_UNSUPPORTED_OPCODE`，不写 host-memory、不推进 ring、不发布 CQE。
+  5. 核心能力表和 `post_send()` 对 unsupported transport/opcode 返回
+     `RDMA_SC_UNSUPPORTED_OPCODE`，不写 host-memory、不推进 ring、不发布 CQE；
+     net_packet adapter 对 URC READ 同样拒绝编码。
 
-- [ ] **Step 4: Run transport E2E and existing regressions**
+- [x] **Step 4: Run transport E2E and existing regressions**
 
   ```bash
   PCIE_WORK_ROOT=/home/ubuntu/pcie_work_unified \
@@ -278,9 +295,10 @@ task automatic wait_transport_completion(
     scripts/run_vcs53.sh e2e rdma_end_to_end_dual_env_test
   ```
 
-  Expected: transport matrix 和原有 128 包双 env E2E 均退出码 0，两个 manager leak check 为 0。
+  Expected: transport matrix 和原有双 env E2E 均退出码 0，两个 manager leak check 为 0；
+  URC READ/UD WRITE 负向 case 返回预期 unsupported status。
 
-- [ ] **Step 5: Commit Task 30**
+- [x] **Step 5: Commit Task 30**
 
   ```bash
   git add tests/integration/rdma_end_to_end_transport_test.sv \
@@ -289,6 +307,9 @@ task automatic wait_transport_completion(
   ```
 
   若 `sim/Makefile`/filelist 未发生改动，只 stage 实际存在的文件，不创建空文件提交。
+
+  说明：Task 30 的本地 commit 在最终静态审计后创建；远程推送仍由用户另行
+  授权，本轮不自动 push。
 
 ---
 

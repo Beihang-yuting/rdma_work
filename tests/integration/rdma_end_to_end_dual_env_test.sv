@@ -497,6 +497,26 @@ class rdma_end_to_end_dual_env_test extends uvm_test;
     end
     if (env == null || env.binding == null)
       return;
+    // 附加 UD/URC QP 与基础 RC QP 共用同一 Function/CQ，但各自拥有独立
+    // transport context 和 backing；必须按 QP 逐一销毁，不能只销毁 RC。
+    if (env.ud_qp != null) begin
+      destroy_request = rdma_destroy_resource_req::type_id::create(
+        {tag, "_destroy_ud_qp"});
+      destroy_request.owner = env.binding.make_handle();
+      destroy_request.target_h = env.ud_qp.handle;
+      env.qp_executor.destroy_locked(env.binding, env.binding.make_handle(),
+                                     destroy_request, 64'h3010,
+                                     destroy_result);
+    end
+    if (env.urc_qp != null) begin
+      destroy_request = rdma_destroy_resource_req::type_id::create(
+        {tag, "_destroy_urc_qp"});
+      destroy_request.owner = env.binding.make_handle();
+      destroy_request.target_h = env.urc_qp.handle;
+      env.qp_executor.destroy_locked(env.binding, env.binding.make_handle(),
+                                     destroy_request, 64'h3011,
+                                     destroy_result);
+    end
     if (env.qp != null) begin
       destroy_request = rdma_destroy_resource_req::type_id::create(
         {tag, "_destroy_qp"});

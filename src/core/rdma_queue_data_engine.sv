@@ -570,6 +570,71 @@ class rdma_queue_data_engine extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：query_runtime_occupancy 返回指定 SQ/RQ/CQ 等 runtime 的当前
+  //   credit 使用量以及是否存在待恢复事务，供端到端 scoreboard 验证
+  //   completion 后的 outstanding 账本已经清零。
+  // 输入/输出及副作用：handle、kind（输入）；used、pending（输出）；函数
+  //   只读取 attachment/runtime 快照，不推进 PI/CI，不提交 doorbell，也不
+  //   转移队列或 Host-memory 所有权。
+  // 失败/边界：句柄代际失效、attachment 缺失或 runtime 未配置时返回明确
+  //   错误，并把 used/pending 保持为安全默认值 0/0，调用方不得把失败当作
+  //   “队列为空”的证据。
+  function rdma_status query_runtime_occupancy(
+    rdma_handle handle, rdma_queue_runtime_kind_e kind,
+    output int unsigned used, output bit pending
+  );
+    rdma_queue_data_attachment attachment;
+    rdma_status status;
+
+    used = 0;
+    pending = 1'b0;
+    status = lookup_attachment(handle, kind, attachment);
+    if (status == null || !status.ok())
+      return status == null ?
+        bad("runtime occupancy lookup returned null status",
+            RDMA_SC_INVALID_STATE) : status;
+    if (attachment == null || attachment.runtime == null)
+      return bad("runtime occupancy attachment is incomplete",
+                 RDMA_SC_INVALID_STATE);
+    used = attachment.runtime.used;
+    pending = attachment.runtime.pending_operation != null;
+    return rdma_status::success();
+  endfunction
+
+  // 功能：query_runtime_cursors 返回指定 runtime 的 producer/consumer
+  //   index 与 wrap 快照，用于验证 PI/CI doorbell 及 ring 回卷语义。
+  // 输入/输出及副作用：handle、kind（输入）；producer_index、producer_wrap、
+  //   consumer_index、consumer_wrap（输出）；函数只读 runtime，不提交任何
+  //   MMIO 或修改队列状态。
+  // 失败/边界：句柄、代际或 attachment 无效时返回错误，所有输出置零；
+  //   调用方必须先检查返回状态，不能使用失败路径的默认游标作有效证据。
+  function rdma_status query_runtime_cursors(
+    rdma_handle handle, rdma_queue_runtime_kind_e kind,
+    output int unsigned producer_index, output bit producer_wrap,
+    output int unsigned consumer_index, output bit consumer_wrap
+  );
+    rdma_queue_data_attachment attachment;
+    rdma_status status;
+
+    producer_index = 0;
+    producer_wrap = 1'b0;
+    consumer_index = 0;
+    consumer_wrap = 1'b0;
+    status = lookup_attachment(handle, kind, attachment);
+    if (status == null || !status.ok())
+      return status == null ?
+        bad("runtime cursor lookup returned null status",
+            RDMA_SC_INVALID_STATE) : status;
+    if (attachment == null || attachment.runtime == null)
+      return bad("runtime cursor attachment is incomplete",
+                 RDMA_SC_INVALID_STATE);
+    producer_index = attachment.runtime.producer_index;
+    producer_wrap = attachment.runtime.producer_wrap;
+    consumer_index = attachment.runtime.consumer_index;
+    consumer_wrap = attachment.runtime.consumer_wrap;
+    return rdma_status::success();
+  endfunction
+
   // 功能：has_pending_cq_resize 查询指定 CQ 是否存在已发布但尚未完成的旧 backing 清理。
   // 输入输出及副作用：cq_h 为输入；函数只读取 engine recovery 表，不改变 runtime、manager 或 Host-memory。
   // 失败边界：空句柄、未配置或不存在记录均返回 0；调用方不得把 0 当作“CQ 一定可 resize”之外的证据。
@@ -1255,6 +1320,13 @@ class rdma_queue_data_engine extends uvm_object;
     if (!link.qp_h.same_instance(request.qp_h))
       return bad("SQE posting QP route identity does not match request",
                  RDMA_SC_INVALID_STATE);
+    // QP 的 transport 是 CMQ 创建阶段冻结的 wire/profile authority；请求
+    // 中的 transport 只能复述该值，不能借同一 SQ 句柄切换到另一协议。若
+    // 允许继续，会在 codec 阶段把 RC ring 误编码成 UD/URC，造成网络头和
+    // QP context 不一致，因此必须在 reservation 之前 fail-closed。
+    if (request.transport != link.transport)
+      return bad("SQE request transport does not match bound QP",
+                 RDMA_SC_INVALID_STATE);
 
     reference = request.owner == null ? request.qp_h : request.owner;
     if (request.owner != null) begin
@@ -1303,6 +1375,9 @@ class rdma_queue_data_engine extends uvm_object;
       if (completion_link.qp_h == null ||
           !completion_link.qp_h.same_instance(request.completion_qp_h))
         return bad("URC completion QP route identity is stale",
+                   RDMA_SC_INVALID_STATE);
+      if (completion_link.transport != RDMA_TRANSPORT_URC)
+        return bad("URC completion QP transport does not match request",
                    RDMA_SC_INVALID_STATE);
     end
     else if (request.completion_qp_h != null) begin
@@ -1386,6 +1461,9 @@ class rdma_queue_data_engine extends uvm_object;
         ud = rdma_sqe_ud_ext::type_id::create("sqe_ud");
         ud.destination_qpn = request.destination_qpn; ud.qkey = request.qkey;
         ud.address_vector_id = request.address_vector_id;
+        // AV 是 UD SQE 校验所需的完整 authority 对象；仅复制 ID 会让
+        // request.validate() 通过但在硬件模型校验阶段丢失 AV 证据。
+        ud.address_vector = request.address_vector;
         ud.address_vector_valid = request.address_vector_valid;
         model.transport_ext = ud;
       end
@@ -3074,6 +3152,18 @@ class rdma_queue_data_engine extends uvm_object;
     if (request == null) begin status = bad("send request is null"); return; end
     snapshot = rdma_post_send_req::type_id::create("send_snapshot");
     snapshot.copy(request);
+    // 功能：在进入通用 request.validate() 前把 transport/opcode 能力拒绝归类为
+    //   UNSUPPORTED_OPCODE，确保调用方可以区分“组合不支持”和“字段形状错误”。
+    // 输入/输出及副作用：snapshot.transport、snapshot.opcode（输入）；返回新的
+    //   rdma_status，不修改队列 runtime、Host-memory、doorbell 或 pending ledger。
+    // 失败/边界：未知 transport 或该 transport 不允许的 work opcode 均在此返回；
+    //   合法组合继续执行后续 authority/SGE/资源校验。
+    if (!rdma_send_opcode_valid_for_transport(snapshot.transport,
+                                              snapshot.opcode)) begin
+      status = rdma_status::make(RDMA_SC_UNSUPPORTED_OPCODE,
+                                 "work opcode is unsupported for transport");
+      return;
+    end
     status = snapshot.validate(); if (!status.ok()) return;
     status = lookup_attachment(snapshot.qp_h, RDMA_QUEUE_RUNTIME_SQ,
                                attachment); if (!status.ok()) return;

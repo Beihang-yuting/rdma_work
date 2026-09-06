@@ -3,7 +3,7 @@
 ## 状态
 
 - 日期：2026-09-06
-- 状态：待实施计划确认
+- 状态：Task 28～30 已实现并完成验证；Task 31 待实施
 - 适用仓库：`rdma_work`
 - 前置结果：Task 26 `net_packet` 适配、SR-IOV 枚举、双 env RC SEND E2E 已验证
 - 明确跳过：Task 27 AXIS VIP adapter，本阶段不接入 AXIS 外部源码
@@ -127,13 +127,20 @@ post send/read/write/atomic、等待 completion 和销毁资源。sequence 不�
 | --- | --- |
 | RC | SEND、WRITE、READ、ATOMIC |
 | UD | SEND |
-| URC | SEND、WRITE、READ |
+| URC | SEND、WRITE |
+
+URC 在本项目中采用外部 `net_packet` 的 RoCEv2 UC wire profile。该 profile 没有
+RDMA READ request opcode，因此 URC READ 是明确的负向能力测试：语义入口和网络
+adapter 都必须返回 `RDMA_SC_UNSUPPORTED_OPCODE`，不得映射为 RC READ 或产生任何
+queue/network side effect。
 
 每个场景都必须检查：
 
 - 发送和接收 host-memory payload 逐字节一致；
 - `net_packet` 编码/解码后的 transport、QPN、PSN、opcode 和 payload 一致；
 - SQ/RQ/CQ 的 PI、CI、wrap、credit 和 CQE status 正确；
+- 不支持的 transport/opcode 在 post/encode 入口 fail-closed，游标、doorbell、
+  network 统计和 host-memory 内容保持不变；
 - scoreboard pending、outstanding ticket、mapping、context、QP/CQ/CEQ 资源均为零。
 
 真实 host-memory 场景继续使用不同 Host ID、物理地址和 IOVA；model-only 场景可使用

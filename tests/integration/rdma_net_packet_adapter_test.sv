@@ -92,6 +92,34 @@ class rdma_net_packet_adapter_test extends uvm_test;
                                status.message))
   endfunction
 
+  // 功能：test_transport_capability_matrix 校验 net_packet 适配器对每种
+  //   transport 的实际 wire opcode 白名单，防止 queue-data 先接受而编码阶段
+  //   才发现外部 profile 不支持。
+  // 输入/输出及副作用：无显式参数；只读取 capability 函数结果，不创建
+  //   packet 或访问 sink/host-memory。
+  // 失败/边界：UD SEND_WITH_INV、URC READ/LOCAL_INVALIDATE 以及 CUSTOM
+  //   均必须返回 0；RC SEND/WRITE/READ/ATOMIC 和 UD/URC 支持项必须返回 1。
+  task automatic test_transport_capability_matrix();
+    if (!rdma_net_packet_work_opcode_supported_for_transport(
+          RDMA_TRANSPORT_RC, RDMA_WR_RDMA_READ) ||
+        !rdma_net_packet_work_opcode_supported_for_transport(
+          RDMA_TRANSPORT_RC, RDMA_WR_ATOMIC_FETCH_ADD) ||
+        !rdma_net_packet_work_opcode_supported_for_transport(
+          RDMA_TRANSPORT_UD, RDMA_WR_SEND) ||
+        !rdma_net_packet_work_opcode_supported_for_transport(
+          RDMA_TRANSPORT_URC, RDMA_WR_RDMA_WRITE))
+      `uvm_error("CAP_MATRIX_POSITIVE", "supported wire opcode was rejected")
+    if (rdma_net_packet_work_opcode_supported_for_transport(
+          RDMA_TRANSPORT_UD, RDMA_WR_SEND_WITH_INV) ||
+        rdma_net_packet_work_opcode_supported_for_transport(
+          RDMA_TRANSPORT_URC, RDMA_WR_RDMA_READ) ||
+        rdma_net_packet_work_opcode_supported_for_transport(
+          RDMA_TRANSPORT_URC, RDMA_WR_LOCAL_INVALIDATE) ||
+        rdma_net_packet_work_opcode_supported_for_transport(
+          RDMA_TRANSPORT_CUSTOM, RDMA_WR_SEND))
+      `uvm_error("CAP_MATRIX_NEGATIVE", "unsupported wire opcode was accepted")
+  endtask
+
   // 功能：验证 RC SEND 生成 RoCEv2 BTH、调用 net_packet do_pack 并可由 parser 解回语义字段。
   // 输入/输出及副作用：adapter、identity、frame_bytes（局部输出）；只更新测试快照，不修改队列 PI/CI。
   // 失败/边界：缺少外层 Ethernet/IP/UDP/RoCE layer、QPN/PSN 或 payload 不一致均报告错误。
@@ -141,6 +169,117 @@ class rdma_net_packet_adapter_test extends uvm_test;
     if (roce == null || roce.opcode != RC_RDMA_WRITE_ONLY ||
         roce.reth_dma_len != source.payload.size())
       `uvm_error("RC_WRITE_RETH", "RC WRITE RETH projection mismatch")
+  endtask
+
+  // 功能：验证 URC/UC wire profile 不接受 RDMA READ request，避免把非法
+  //   语义映射成 RC READ opcode 后发送到网络。
+  // 输入/输出及副作用：adapter（输入）；frame_bytes、status（局部输出）；
+  //   只执行纯编码，不触碰 sink、队列游标或 host-memory。
+  // 失败/边界：encode_packet 必须返回 RDMA_SC_UNSUPPORTED_OPCODE，并保持
+  //   输出 frame 为空；任何成功编码或残留半包都属于协议边界错误。
+  task automatic test_urc_read_rejected(
+    rdma_net_packet_adapter adapter
+  );
+    rdma_packet source;
+    byte unsigned frame_bytes[$];
+    rdma_status status;
+
+    source = make_rdma_packet("urc_read", RDMA_TRANSPORT_URC,
+                              RDMA_NET_RDMA_READ_REQUEST);
+    status = adapter.encode_packet(source, frame_bytes);
+    expect_status("URC_READ_ENCODE", status, RDMA_SC_UNSUPPORTED_OPCODE);
+    if (frame_bytes.size() != 0)
+      `uvm_error("URC_READ_FRAME", "unsupported URC READ left encoded bytes")
+  endtask
+
+  // 功能：验证 RC compare-and-swap 使用 RoCEv2 AtomicETH 和对应 opcode，
+  //   防止端到端测试把原子请求降级为普通 SEND。
+  // 输入/输出及副作用：adapter（输入）；只编码/解码本地 packet 快照，
+  //   不提交 sink、queue 或 host-memory 事务。
+  // 失败/边界：必须观察 RC_CMP_SWAP 及完整 VA/r_key/swap/compare 字段，
+  //   解码后的语义 opcode 也必须保持 ATOMIC_CMP_SWAP。
+  task automatic test_rc_atomic_round_trip(
+    rdma_net_packet_adapter adapter
+  );
+    rdma_packet source;
+    rdma_packet decoded;
+    packet wire_packet;
+    byte unsigned frame_bytes[$];
+    rdma_status status;
+    rocev2_bth roce;
+
+    source = make_rdma_packet("rc_atomic", RDMA_TRANSPORT_RC,
+                              RDMA_NET_ATOMIC_CMP_SWAP);
+    source.header_bytes = '{8'h11, 8'h11, 8'h22, 8'h22,
+                            8'h33, 8'h33, 8'h44, 8'h44,
+                            8'haa, 8'hbb, 8'hcc, 8'hdd,
+                            8'h55, 8'h55, 8'h66, 8'h66,
+                            8'h77, 8'h77, 8'h88, 8'h88,
+                            8'h99, 8'h99, 8'haa, 8'haa,
+                            8'hbb, 8'hbb, 8'hcc, 8'hcc};
+    status = adapter.encode_packet(source, frame_bytes);
+    expect_status("RC_ATOMIC_ENCODE", status, RDMA_SC_OK);
+    wire_packet = new();
+    wire_packet.unpack(frame_bytes);
+    roce = wire_packet.get_rocev2();
+    if (roce == null || roce.opcode != RC_CMP_SWAP ||
+        roce.atomic_va != 64'h1111_2222_3333_4444 ||
+        roce.atomic_r_key != 32'haabb_ccdd ||
+        roce.atomic_swap_add != 64'h5555_6666_7777_8888 ||
+        roce.atomic_compare != 64'h9999_aaaa_bbbb_cccc)
+      `uvm_error("RC_ATOMIC_HEADER", "RC atomic header projection mismatch")
+    status = adapter.decode_packet(frame_bytes, decoded);
+    expect_status("RC_ATOMIC_DECODE", status, RDMA_SC_OK);
+    if (decoded == null || decoded.transport != RDMA_TRANSPORT_RC ||
+        decoded.opcode != RDMA_NET_ATOMIC_CMP_SWAP ||
+        decoded.destination_qpn != source.destination_qpn ||
+        decoded.psn != source.psn)
+      `uvm_error("RC_ATOMIC_FIELDS", "RC atomic semantic round-trip mismatch")
+  endtask
+
+  // 功能：验证 RC fetch-add 使用独立的 RoCEv2 AtomicETH opcode，并按协议
+  //   将 compare 字段归零，防止把 compare-swap 的字段布局误用于加法原子。
+  // 输入/输出及副作用：adapter（输入）；只编码/解码本地 packet 快照，不提交
+  //   sink、queue 或 host-memory 事务。
+  // 失败/边界：必须观察 RC_FETCH_ADD、VA/r_key/swap_add 和 compare=0，且
+  //   解码后的语义 opcode 保持 ATOMIC_FETCH_ADD。
+  task automatic test_rc_atomic_fetch_add_round_trip(
+    rdma_net_packet_adapter adapter
+  );
+    rdma_packet source;
+    rdma_packet decoded;
+    packet wire_packet;
+    byte unsigned frame_bytes[$];
+    rdma_status status;
+    rocev2_bth roce;
+
+    source = make_rdma_packet("rc_fetch_add", RDMA_TRANSPORT_RC,
+                              RDMA_NET_ATOMIC_FETCH_ADD);
+    source.header_bytes = '{8'h21, 8'h21, 8'h32, 8'h32,
+                            8'h43, 8'h43, 8'h54, 8'h54,
+                            8'hba, 8'had, 8'hf0, 8'h0d,
+                            8'h65, 8'h65, 8'h76, 8'h76,
+                            8'h87, 8'h87, 8'h98, 8'h98,
+                            8'ha9, 8'ha9, 8'hba, 8'hba,
+                            8'hcb, 8'hcb, 8'hdc, 8'hdc};
+    status = adapter.encode_packet(source, frame_bytes);
+    expect_status("RC_FETCH_ADD_ENCODE", status, RDMA_SC_OK);
+    wire_packet = new();
+    wire_packet.unpack(frame_bytes);
+    roce = wire_packet.get_rocev2();
+    if (roce == null || roce.opcode != RC_FETCH_ADD ||
+        roce.atomic_va != 64'h2121_3232_4343_5454 ||
+        roce.atomic_r_key != 32'hbaad_f00d ||
+        roce.atomic_swap_add != 64'h6565_7676_8787_9898 ||
+        roce.atomic_compare != 64'h0)
+      `uvm_error("RC_FETCH_ADD_HEADER", "RC fetch-add AtomicETH mismatch")
+    status = adapter.decode_packet(frame_bytes, decoded);
+    expect_status("RC_FETCH_ADD_DECODE", status, RDMA_SC_OK);
+    if (decoded == null || decoded.transport != RDMA_TRANSPORT_RC ||
+        decoded.opcode != RDMA_NET_ATOMIC_FETCH_ADD ||
+        decoded.destination_qpn != source.destination_qpn ||
+        decoded.psn != source.psn)
+      `uvm_error("RC_FETCH_ADD_FIELDS", "RC fetch-add semantic round-trip mismatch")
   endtask
 
   // 功能：验证 UD SEND 使用 DETH，并保留源 QP/Q_Key 所需的 UD 结构。
@@ -257,7 +396,11 @@ class rdma_net_packet_adapter_test extends uvm_test;
     adapter = new("net_packet_adapter", sink);
     expect_status("FUNCTION_BIND", adapter.configure_function(identity), RDMA_SC_OK);
     test_rc_send_round_trip(adapter, identity);
+    test_transport_capability_matrix();
     test_rc_write_reth(adapter);
+    test_rc_atomic_round_trip(adapter);
+    test_rc_atomic_fetch_add_round_trip(adapter);
+    test_urc_read_rejected(adapter);
     test_ud_send_deth(adapter);
     test_iwarp_round_trip(adapter);
     test_sink_and_fault_policy(adapter, sink);

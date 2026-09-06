@@ -218,6 +218,105 @@ class rdma_env extends uvm_env;
     return rdma_status::success();
   endfunction
 
+  // 功能：bind_data_path 把已由上层 fixture 创建的资源管理器、Function
+  // binding、host-memory、doorbell 和 codec 注入 env 自有 queue-data engine。
+  // 输入/输出及副作用：依赖对象为输入；成功时 queue_data 保存借用引用，随后
+  // 可通过 env 的 post/poll 语义接口驱动真实 SQ/RQ/CQ；不会转移外部资源所有权。
+  // 失败边界：env 未 configure、依赖为空、Function 快照不一致或 engine 已有
+  // attachment 时返回错误，既有组合对象保持不变。
+  function rdma_status bind_data_path(
+    rdma_resource_manager resource_manager,
+    rdma_function_binding function_binding,
+    rdma_host_mem_api memory,
+    rdma_doorbell_scheduler scheduler,
+    rdma_codec_registry codec_registry,
+    time timeout
+  );
+    rdma_status status;
+    rdma_function_identity identity;
+
+    if (queue_data == null || config_snapshot == null)
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "rdma_env is not configured");
+    if (resource_manager == null || function_binding == null || memory == null ||
+        scheduler == null || codec_registry == null || timeout == 0)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "rdma_env data-path dependency is missing");
+    identity = function_binding.identity_snapshot();
+    if (identity == null || !identity.validate().ok())
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "rdma_env data-path Function identity is invalid");
+    if (function_identity_snapshot != null &&
+        !function_identity_snapshot.same_incarnation(identity))
+      return rdma_status::make(RDMA_SC_STALE_GENERATION,
+                               "rdma_env data-path Function identity is stale");
+    status = queue_data.configure(resource_manager, function_binding, memory,
+                                  scheduler, codec_registry, timeout);
+    return status == null ?
+      rdma_status::make(RDMA_SC_INVALID_STATE,
+                        "rdma_env data-path configure returned null status") : status;
+  endfunction
+
+  // 功能：post_send 将发送语义请求转发到 env 已绑定的 queue-data engine，
+  // 作为 transport sequence 的统一提交入口。
+  // 输入/输出及副作用：request 为输入；result/status 为输出；成功时推进 SQ
+  // producer 并写入真实 queue backing，资源生命周期仍由 queue-data 管理。
+  // 失败边界：未绑定 data path、请求 authority 失配或队列无 credit 时返回错误，
+  // 不发布半成品 result。
+  task automatic post_send(
+    rdma_post_send_req request,
+    output rdma_queue_post_result result,
+    output rdma_status status
+  );
+    result = null;
+    if (queue_data == null) begin
+      status = rdma_status::make(RDMA_SC_INVALID_STATE,
+                                 "rdma_env data path is not bound");
+      return;
+    end
+    queue_data.post_send(request, result, status);
+  endtask
+
+  // 功能：post_recv 将接收语义请求转发到 env 已绑定的 queue-data engine，
+  // 作为 transport sequence 的统一 RQ 提交入口。
+  // 输入/输出及副作用：request 为输入；result/status 为输出；成功时推进 RQ
+  // producer 并写入真实 queue backing，不复制外部 host-memory 所有权。
+  // 失败边界：未绑定 data path、目标 QP/SGE authority 失配或队列无 credit 时
+  // 返回错误且不推进 producer。
+  task automatic post_recv(
+    rdma_post_recv_req request,
+    output rdma_queue_post_result result,
+    output rdma_status status
+  );
+    result = null;
+    if (queue_data == null) begin
+      status = rdma_status::make(RDMA_SC_INVALID_STATE,
+                                 "rdma_env data path is not bound");
+      return;
+    end
+    queue_data.post_recv(request, result, status);
+  endtask
+
+  // 功能：poll_completion 从 env 已绑定的 queue-data engine 消费 CQE，
+  // 作为 transport sequence 的统一 CQ completion 入口。
+  // 输入/输出及副作用：cq_h、timeout 为输入；completion/status 为输出；成功时
+  // 推进 CQ consumer、释放对应 SQ/RQ slot 和 credit，不修改外部 adapter 账本。
+  // 失败边界：未绑定 data path、CQ authority 失配或超时返回错误，completion 置空。
+  task automatic poll_completion(
+    rdma_handle cq_h,
+    time timeout,
+    output rdma_queue_completion_result completion,
+    output rdma_status status
+  );
+    completion = null;
+    if (queue_data == null) begin
+      status = rdma_status::make(RDMA_SC_INVALID_STATE,
+                                 "rdma_env data path is not bound");
+      return;
+    end
+    queue_data.poll_cqe(cq_h, timeout, completion, status);
+  endtask
+
   // 功能：查询指定 adapter capability 的 enabled/disabled/passive 状态并封装为 rdma_status.message。
   // 输入输出及副作用：capability 为字符串输入；返回独立状态对象，不修改 env。
   // 失败边界：未知 capability 返回 INVALID_ARGUMENT；已知 capability 始终返回其当前状态文本。

@@ -145,5 +145,6 @@ endpackage
   import rdma_net_packet_adapter_pkg::*;
   import rdma_net_packet_bridge_pkg::*;
   `include "integration/rdma_end_to_end_dual_env_test.sv"
+  `include "integration/rdma_end_to_end_transport_test.sv"
 `endif
 `endif

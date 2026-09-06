@@ -51,7 +51,12 @@ typedef enum bit [4:0] {
   RDMA_NET_RDMA_READ_REQUEST= 5'd4,
   RDMA_NET_RDMA_READ_RESP   = 5'd5,
   RDMA_NET_ACK              = 5'd6,
-  RDMA_NET_NAK              = 5'd7
+  RDMA_NET_NAK              = 5'd7,
+  // RC 原子请求使用 RoCEv2 AtomicETH；保留独立语义值，禁止降级为 SEND。
+  RDMA_NET_ATOMIC_CMP_SWAP  = 5'd8,
+  RDMA_NET_ATOMIC_FETCH_ADD = 5'd9,
+  // RC 原子响应携带 Atomic ACK ETH 的原始值，供 responder 完成语义闭环。
+  RDMA_NET_ATOMIC_ACK       = 5'd10
 } rdma_network_opcode_e;
 
 typedef enum bit [5:0] {
@@ -97,7 +102,6 @@ function automatic bit rdma_send_opcode_valid_for_transport(
       return opcode inside {RDMA_WR_SEND, RDMA_WR_SEND_WITH_IMM,
                             RDMA_WR_SEND_WITH_INV,
                             RDMA_WR_RDMA_WRITE, RDMA_WR_WRITE_WITH_IMM,
-                            RDMA_WR_RDMA_READ,
                             RDMA_WR_LOCAL_INVALIDATE};
     default:
       return 1'b0;

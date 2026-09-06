@@ -15,6 +15,36 @@ package rdma_net_packet_adapter_pkg;
   import rdma_adapter_pkg::*;
   `include "uvm_macros.svh"
 
+  // 功能：rdma_net_packet_work_opcode_supported_for_transport 描述本适配器
+  //   实际拥有的 RoCEv2 wire capability，供 queue-data 上层在提交前区分
+  //   “语义模型支持”与“外部网络 profile 支持”。
+  // 输入/输出及副作用：transport、opcode 为输入；返回 bit，不修改任何
+  //   packet、sink 或队列账本。
+  // 失败/边界：UD 仅开放 SEND/SEND_WITH_IMM，URC 仅开放 UC wire 的
+  //   SEND/SEND_WITH_IMM/WRITE/WRITE_WITH_IMM；RC 开放本适配器已有的
+  //   READ/ATOMIC request/response。控制 WQE 和 SEND_WITH_INV 没有网络头
+  //   映射时返回 0，调用方必须在 encode 前 fail-closed。
+  function automatic bit rdma_net_packet_work_opcode_supported_for_transport(
+    rdma_transport_e transport,
+    rdma_work_opcode_e opcode
+  );
+    case (transport)
+      RDMA_TRANSPORT_RC:
+        return opcode inside {RDMA_WR_SEND, RDMA_WR_SEND_WITH_IMM,
+                              RDMA_WR_RDMA_WRITE, RDMA_WR_WRITE_WITH_IMM,
+                              RDMA_WR_RDMA_READ,
+                              RDMA_WR_ATOMIC_CMP_SWAP,
+                              RDMA_WR_ATOMIC_FETCH_ADD};
+      RDMA_TRANSPORT_UD:
+        return opcode inside {RDMA_WR_SEND, RDMA_WR_SEND_WITH_IMM};
+      RDMA_TRANSPORT_URC:
+        return opcode inside {RDMA_WR_SEND, RDMA_WR_SEND_WITH_IMM,
+                              RDMA_WR_RDMA_WRITE, RDMA_WR_WRITE_WITH_IMM};
+      default:
+        return 1'b0;
+    endcase
+  endfunction
+
   // 功能：定义 net_packet 适配器与外部发送/接收环境之间的最小边界。
   // 输入/输出及副作用：send/receive 只传递 packet 值快照和状态，不改变 RDMA 队列游标。
   // 失败/边界：实现必须在 packet 为空、后端拒绝或外部资源未配置时返回明确错误。
@@ -248,6 +278,9 @@ package rdma_net_packet_adapter_pkg;
             RDMA_NET_RDMA_READ_REQUEST: opcode = 8'h0c;
             RDMA_NET_RDMA_READ_RESP:    opcode = 8'h10;
             RDMA_NET_ACK:               opcode = 8'h11;
+            RDMA_NET_ATOMIC_ACK:        opcode = 8'h12;
+            RDMA_NET_ATOMIC_CMP_SWAP:  opcode = 8'h13;
+            RDMA_NET_ATOMIC_FETCH_ADD: opcode = 8'h14;
             default:
               return rdma_status::make(RDMA_SC_UNSUPPORTED_OPCODE,
                                        "unsupported RC network opcode");
@@ -290,6 +323,7 @@ package rdma_net_packet_adapter_pkg;
       rdma_status status;
       bit [7:0] opcode;
       int unsigned extension_offset;
+      bit [31:0] aeth_word;
 
       roce = null;
       status = map_roce_opcode(value, opcode);
@@ -314,6 +348,33 @@ package rdma_net_packet_adapter_pkg;
         if (roce.reth_dma_len == 0)
           roce.reth_dma_len = value.payload.size();
         extension_offset += 16;
+      end
+      // AETH 位于 RETH 之后、AtomicETH/AtomicAckETH 之前。响应类 opcode
+      // 即使使用默认 syndrome/MSN，也必须消费这 4 个字节，保证后续扩展
+      // 字段按 wire layout 对齐；否则 Atomic ACK 会把 AETH 前四字节误当作
+      // 原值高半部。
+      if (roce.has_aeth()) begin
+        aeth_word = read_be32(value.header_bytes, extension_offset);
+        roce.aeth_syndrome = aeth_word[31:24];
+        roce.aeth_msn = aeth_word[23:0];
+        extension_offset += 4;
+      end
+      // AtomicETH 顺序严格遵循 IB/RoCEv2：VA(8B)、r_key(4B)、
+      // swap/add(8B)、compare(8B)。FetchAdd 的 compare 字段按协议置零，
+      // 但仍消费完整 28B 扩展以保持后续 ICRC/payload 偏移正确。
+      if (roce.has_atomic_eth()) begin
+        roce.atomic_va = read_be64(value.header_bytes, extension_offset);
+        roce.atomic_r_key = read_be32(value.header_bytes, extension_offset + 8);
+        roce.atomic_swap_add = read_be64(value.header_bytes, extension_offset + 12);
+        roce.atomic_compare = read_be64(value.header_bytes, extension_offset + 20);
+        if (roce.opcode == RC_FETCH_ADD)
+          roce.atomic_compare = 64'h0;
+        extension_offset += 28;
+      end
+      // Atomic ACK ETH 只返回 responder 看到的原始 64-bit 数据。
+      if (roce.has_atomic_ack_eth()) begin
+        roce.atomic_orig_data = read_be64(value.header_bytes, extension_offset);
+        extension_offset += 8;
       end
       if (roce.has_immdt()) begin
         roce.imm_data = read_be32(value.header_bytes, extension_offset);
@@ -497,6 +558,9 @@ package rdma_net_packet_adapter_pkg;
         RC_RDMA_READ_REQ:      value.transport = RDMA_TRANSPORT_RC;
         RC_RDMA_READ_RESP_ONLY:value.transport = RDMA_TRANSPORT_RC;
         RC_ACK:                value.transport = RDMA_TRANSPORT_RC;
+        RC_ATOMIC_ACK:         value.transport = RDMA_TRANSPORT_RC;
+        RC_CMP_SWAP:           value.transport = RDMA_TRANSPORT_RC;
+        RC_FETCH_ADD:          value.transport = RDMA_TRANSPORT_RC;
         UC_SEND_ONLY:          value.transport = RDMA_TRANSPORT_URC;
         UC_SEND_ONLY_IMM:      value.transport = RDMA_TRANSPORT_URC;
         UC_RDMA_WRITE_ONLY:    value.transport = RDMA_TRANSPORT_URC;
@@ -522,6 +586,12 @@ package rdma_net_packet_adapter_pkg;
           value.opcode = RDMA_NET_RDMA_READ_RESP;
         RC_ACK:
           value.opcode = RDMA_NET_ACK;
+        RC_ATOMIC_ACK:
+          value.opcode = RDMA_NET_ATOMIC_ACK;
+        RC_CMP_SWAP:
+          value.opcode = RDMA_NET_ATOMIC_CMP_SWAP;
+        RC_FETCH_ADD:
+          value.opcode = RDMA_NET_ATOMIC_FETCH_ADD;
         default:
           return rdma_status::make(RDMA_SC_UNSUPPORTED_OPCODE,
                                    "RoCEv2 opcode projection is unsupported");
@@ -612,8 +682,15 @@ package rdma_net_packet_adapter_pkg;
         status = decode_roce_header(roce, value);
         if (status == null || !status.ok())
           return status;
+        // 对外暴露的 header_bytes 与 encode_packet 的输入契约保持一致：
+        // 只保存 BTH 之后的扩展字段，不重复携带 BTH 和尾部 ICRC。这样
+        // decode→encode 可以直接复用 RETH/AETH/AtomicETH/DETH 等字段。
         value.header_bytes.delete();
-        for (index = rdma_offset; index < payload_offset; index++)
+        index = rdma_offset + 12;
+        frame_end = payload_offset;
+        if (roce.icrc_enable && frame_end >= 4)
+          frame_end -= 4;
+        for (; index < frame_end; index++)
           value.header_bytes.push_back(frame_bytes[index]);
         value.payload.delete();
         for (index = payload_offset; index < payload_end; index++)
@@ -645,7 +722,8 @@ package rdma_net_packet_adapter_pkg;
                                    "unknown iWARP RDMAP opcode");
       endcase
       value.header_bytes.delete();
-      for (index = iwarp_offset; index < payload_offset; index++)
+      index = iwarp_offset + iwarp.get_header_length();
+      for (; index < payload_offset; index++)
         value.header_bytes.push_back(frame_bytes[index]);
       value.payload.delete();
       for (index = payload_offset; index < payload_end; index++)

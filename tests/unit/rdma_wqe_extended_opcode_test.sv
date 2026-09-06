@@ -30,6 +30,14 @@ class rdma_wqe_extended_opcode_test extends uvm_test;
     s=rdma_queue_codec::encode_sqe(req,image);
     if (s==null || !s.ok())
       `uvm_error("URC_PROFILE",$sformatf("URC SEND codec rejected valid completion-QP profile: %s", s == null ? "null status" : s.message))
+    // RoCEv2 的 UC/URC wire profile 没有 RDMA READ opcode；语义入口必须
+    // 在队列写入前 fail-closed，不能把请求伪装成 RC READ。
+    req.opcode=RDMA_WR_RDMA_READ; req.remote_access_valid=1; req.rkey_valid=1;
+    req.remote_addr.value=64'h5000; req.rkey=32'h99;
+    s=req.validate();
+    if (s==null || s.code != RDMA_SC_INVALID_ARGUMENT)
+      `uvm_error("URC_READ_PROFILE",$sformatf("URC READ was not rejected explicitly: %s", s == null ? "null status" : s.convert2string()))
+    req.opcode=RDMA_WR_SEND;
     req.completion_qp_h=null; s=req.validate(); if (s==null || s.ok()) `uvm_error("URC_AUTH","URC accepted missing completion QP")
     // 当前 64B SQE profile 没有驱动 REG_MR/BIND_MW/FLUSH 的固定 body；
     // 语义层仍校验 authority，codec 必须显式返回 UNSUPPORTED，而不能

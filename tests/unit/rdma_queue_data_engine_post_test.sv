@@ -24,6 +24,10 @@ class rdma_queue_data_engine_fixture extends uvm_object;
   rdma_ceq ceq;
   rdma_cq cq;
   rdma_qp qp;
+  // 基础 RC QP 之外，集成传输矩阵按需创建同一 Function 下的 UD/URC
+  // QP。它们共享 CQ 依赖但拥有各自的 SQ/RQ backing 与 transport context。
+  rdma_qp ud_qp;
+  rdma_qp urc_qp;
 
   // 功能：构造 rdma_queue_data_engine_fixture，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：binding=null；manager=null；mem=null；pcie=null；contexts=null；cmq=null；queue_executor=null；qp_executor=null；其余字段按实现默认值初始化。
   // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
@@ -34,6 +38,7 @@ class rdma_queue_data_engine_fixture extends uvm_object;
     contexts = null; cmq = null; queue_executor = null; qp_executor = null;
     scheduler = null; registry = null; engine = null;
     pd = null; ceq = null; cq = null; qp = null;
+    ud_qp = null; urc_qp = null;
   endfunction
 
   // 功能：make_binding 创建独立的 rdma_function_binding；根据 name 设置字段 result、result.function_uid、result.generation、result.global_function_id、result.host_id、result.rdma_vf_id、result.pfvf_id、pcie.bdf、pcie.parent_pf_bdf、pcie.mse，返回对象仅由调用方持有，不转移外部资源所有权。
@@ -117,6 +122,48 @@ class rdma_queue_data_engine_fixture extends uvm_object;
     ext.retry_count = 2;
     ext.rnr_retry_count = 2;
     attrs.transport_ext = ext;
+    return attrs;
+  endfunction
+
+  // 功能：make_transport_attrs 为附加 transport QP 生成与基础 RC QP
+  //   相同的通用路径属性，并替换对应的 UD/URC 专用扩展。
+  // 输入/输出及副作用：name、transport 为输入；返回新的 context 快照，
+  //   不修改 binding、CQ 或已有 QP。
+  // 失败/边界：RC 使用基础 RC 扩展；UD/URC 使用专用扩展；CUSTOM 或未知
+  //   transport 返回 null，调用方必须在创建 QP 前拒绝该结果。
+  function automatic rdma_qp_context_attributes make_transport_attrs(
+    string name, rdma_transport_e transport
+  );
+    rdma_qp_context_attributes attrs;
+    rdma_qpc_ud_ext ud_ext;
+    rdma_qpc_urc_ext urc_ext;
+
+    attrs = make_rc_attrs(name);
+    case (transport)
+      RDMA_TRANSPORT_RC: begin end
+      RDMA_TRANSPORT_UD: begin
+        attrs.address_vector.traffic_class = 8'hac;
+        ud_ext = rdma_qpc_ud_ext::type_id::create({name, "_ud"});
+        ud_ext.qkey = 32'h8001_0000;
+        attrs.transport_ext = ud_ext;
+      end
+      RDMA_TRANSPORT_URC: begin
+        urc_ext = rdma_qpc_urc_ext::type_id::create({name, "_urc"});
+        urc_ext.remote_qpn = 24'h765432;
+        urc_ext.rbsn = 24'h010203;
+        urc_ext.dbsn = 24'h040506;
+        urc_ext.rpsn = 24'h070809;
+        urc_ext.dpsn = 24'h0a0b0c;
+        urc_ext.queues.rsq_depth = 16;
+        urc_ext.queues.rdsq_depth = 16;
+        urc_ext.queues.rdsq_fetch_count = 8;
+        urc_ext.queues.dsq_fetch_count = 8;
+        urc_ext.queues.rq_sequence_threshold_entries = 16;
+        urc_ext.queues.sq_completion_threshold_entries = 16;
+        attrs.transport_ext = urc_ext;
+      end
+      default: attrs = null;
+    endcase
     return attrs;
   endfunction
 
@@ -256,6 +303,102 @@ class rdma_queue_data_engine_fixture extends uvm_object;
     if (!status.ok()) return;
     status = setup_status("engine.attach_qp", engine.attach_qp(qp.handle));
   endtask
+
+  // 功能：create_transport_qp 在已建立的 Function/PD/CQ 生命周期上创建一个
+  //   指定 wire transport 的附加 QP，供集成测试真实提交对应 profile 的 SQE/RQE。
+  // 输入/输出及副作用：label、transport 为输入；qp、status 为输出；成功时
+  //   manager/CMQ/host-memory 新增一个 ACTIVE QP，资源所有权仍由 fixture 清理。
+  // 失败/边界：依赖未 setup、transport 不受支持、context 构造失败或 CMQ
+  //   create 失败时返回原始错误，不发布半成品 QP。
+  task automatic create_transport_qp(
+    string label,
+    rdma_transport_e transport,
+    output rdma_qp qp,
+    output rdma_status status
+  );
+    rdma_create_qp_req request;
+    rdma_control_result control_result;
+
+    qp = null;
+    status = rdma_status::success();
+    if (binding == null || manager == null || qp_executor == null ||
+        pd == null || cq == null)
+      begin
+        status = rdma_status::make(RDMA_SC_INVALID_STATE,
+                                   "transport QP fixture is not initialized");
+        return;
+      end
+    if (!(transport inside {RDMA_TRANSPORT_UD, RDMA_TRANSPORT_URC})) begin
+      status = rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                                 "additional QP transport is not UD/URC");
+      return;
+    end
+    request = rdma_create_qp_req::type_id::create({label, "_request"});
+    request.owner = binding.make_handle();
+    request.transport = transport;
+    request.sq_depth = 16;
+    request.rq_depth = 16;
+    request.max_send_sge = 4;
+    request.max_recv_sge = 4;
+    // UD 使用每 slot 的 512B SGB；传输矩阵不依赖大于 32B 的 inline
+    // payload，因此统一使用基础 inline 上限，避免 profile capability
+    // 检查把测试重点从 transport 路由本身移开。
+    request.max_inline_data = 32;
+    if (transport == RDMA_TRANSPORT_UD)
+      request.sq_sgb_backing.mode = RDMA_QUEUE_BACKING_OWNED;
+    request.pd_h = rdma_clone_handle_value(pd.handle, {label, "_pd"});
+    request.send_cq_h = rdma_clone_handle_value(cq.handle, {label, "_send_cq"});
+    request.recv_cq_h = rdma_clone_handle_value(cq.handle, {label, "_recv_cq"});
+    request.context_attrs = make_transport_attrs({label, "_attrs"}, transport);
+    if (request.context_attrs == null) begin
+      status = rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                                 "transport QP context attributes are missing");
+      return;
+    end
+    qp_executor.create_locked(binding, binding.make_handle(), request,
+                              transport == RDMA_TRANSPORT_UD ? 64'h1010 : 64'h1011,
+                              qp, control_result);
+    if (control_result == null || control_result.status == null ||
+        !control_result.status.ok() || qp == null) begin
+      status = control_result == null || control_result.status == null ?
+        rdma_status::make(RDMA_SC_INVALID_STATE,
+                          "transport QP creation returned no status") :
+        control_result.status;
+      qp = null;
+      return;
+    end
+    status = rdma_status::success();
+  endtask
+
+  // 功能：setup_transport_qps 为集成测试创建 UD 与 URC 两个独立 QP，确保
+  //   每种 RoCE wire profile 都由匹配的 CMQ transport context 驱动。
+  // 输入/输出及副作用：status 为输出；新增 QP 及其 backing，成功后可由
+  //   get_qp_for_transport 查询；失败时保留已成功创建的 QP 供 cleanup。
+  // 失败/边界：基础 setup 未成功、任一 create 失败时返回错误，不把 RC QP
+  //   伪装成 UD/URC；调用方必须仍执行完整 fixture cleanup。
+  task automatic setup_transport_qps(output rdma_status status);
+    status = rdma_status::success();
+    create_transport_qp("ud", RDMA_TRANSPORT_UD, ud_qp, status);
+    if (status == null || !status.ok()) return;
+    create_transport_qp("urc", RDMA_TRANSPORT_URC, urc_qp, status);
+  endtask
+
+  // 功能：get_qp_for_transport 返回当前 fixture 中与指定 transport 匹配的
+  //   QP 对象，使测试请求、RQE 和 CQE 使用同一份 QP authority。
+  // 输入/输出及副作用：transport 为输入；返回 fixture 持有的非拥有 QP 引用，
+  //   不修改任何资源。
+  // 失败/边界：RC/UD/URC 返回对应 QP；未知 transport 或附加 QP 尚未创建时
+  //   返回 null，调用方必须在提交前报告 setup 错误。
+  function automatic rdma_qp get_qp_for_transport(
+    rdma_transport_e transport
+  );
+    case (transport)
+      RDMA_TRANSPORT_RC: return qp;
+      RDMA_TRANSPORT_UD: return ud_qp;
+      RDMA_TRANSPORT_URC: return urc_qp;
+      default: return null;
+    endcase
+  endfunction
 
   // 功能：make_send 创建独立的 rdma_post_send_req；根据 wr_id 设置字段 request、request.owner、request.qp_h、request.wr_id、request.transport、request.opcode、request.signaled、sge、iova.value、sge.length，返回对象仅由调用方持有，不转移外部资源所有权。
   // 输入/输出及副作用：wr_id（输入）；make_send 读取 wr_id 并使用字段 request、request.owner、request.qp_h、request.wr_id、request.transport、request.opcode、request.signaled、sge；函数返回 rdma_post_send_req，不取得调用方资源所有权。
@@ -507,6 +650,68 @@ class rdma_queue_data_engine_post_test extends uvm_test;
                  status.convert2string())
   endtask
 
+  // 功能：check_transport_link_mismatch 拦截“请求声明 transport 与已绑定
+  // QP transport 不一致”的合法语义请求，验证 route authority 在写 SQE
+  // 之前就 fail-closed。
+  // 输入/输出及副作用：无显式参数；任务创建 RC fixture、构造字段完整的
+  // UD SEND 请求并读取 SQ cursor，成功时只产生拒绝状态，不写入 host-memory
+  // 或 doorbell 账本。
+  // 失败/边界：若 mismatch 被错误放行、返回错误码不是 RDMA_SC_INVALID_STATE、
+  // 发布 result 或推进 producer，任务报告 UVM_ERROR；fixture setup 失败时
+  // 不继续访问未配置 engine。
+  task automatic check_transport_link_mismatch();
+    rdma_queue_data_engine_fixture fixture;
+    rdma_post_send_req request;
+    rdma_queue_post_result result;
+    rdma_address_vector av;
+    rdma_status status;
+    int unsigned before_index;
+    int unsigned after_index;
+    int unsigned before_consumer;
+    int unsigned after_consumer;
+    bit before_wrap;
+    bit after_wrap;
+    bit before_consumer_wrap;
+    bit after_consumer_wrap;
+
+    fixture = rdma_queue_data_engine_fixture::type_id::create(
+      "transport_mismatch_fixture");
+    fixture.setup(status);
+    if (status == null || !status.ok()) begin
+      `uvm_error("TRANSPORT_MISMATCH_FIXTURE",
+                 status == null ? "null setup status" : status.convert2string())
+      return;
+    end
+    status = fixture.engine.query_runtime_cursors(
+      fixture.qp.handle, RDMA_QUEUE_RUNTIME_SQ, before_index, before_wrap,
+      before_consumer, before_consumer_wrap);
+    if (status == null || !status.ok()) begin
+      `uvm_error("TRANSPORT_MISMATCH_CURSOR",
+                 status == null ? "null cursor status" : status.convert2string())
+      return;
+    end
+    request = fixture.make_send(64'hdead_beef_0000_0001);
+    request.transport = RDMA_TRANSPORT_UD;
+    request.destination_qpn = 24'h000002;
+    request.qkey = 32'h8001_0000;
+    request.address_vector_valid = 1'b1;
+    av = rdma_address_vector::type_id::create("transport_mismatch_av");
+    av.destination_mac = 48'h0002_0000_0002;
+    request.address_vector = av;
+    request.completion_qp_h = null;
+    result = null;
+    fixture.engine.post_send(request, result, status);
+    fixture.engine.query_runtime_cursors(
+      fixture.qp.handle, RDMA_QUEUE_RUNTIME_SQ, after_index, after_wrap,
+      after_consumer, after_consumer_wrap);
+    if (status == null || status.code != RDMA_SC_INVALID_STATE ||
+        result != null || after_index != before_index ||
+        after_wrap != before_wrap || after_consumer != before_consumer ||
+        after_consumer_wrap != before_consumer_wrap)
+      `uvm_error("TRANSPORT_MISMATCH",
+                 status == null ? "null mismatch status" : status.convert2string())
+  endtask
+
   // 功能：在 rdma_queue_data_engine_post_test 中，run_phase 驱动 UVM 阶段中的场景初始化、事务执行和断言收尾，并在退出前释放 objection 或测试资源。
   // 输入/输出及副作用：phase（输入）；phase 由 UVM 提供；task 通过 objection、日志和断言暴露结果，可能调用 DUT 接口但不改变其所有权规则。
   // 失败/边界：run_phase 的 setup/阶段驱动失败时停止新增事务，并按测试生命周期清理 objection 与临时引用。
@@ -592,6 +797,7 @@ class rdma_queue_data_engine_post_test extends uvm_test;
     end
 
     check_atomic_model_projection();
+    check_transport_link_mismatch();
     check_sgb_recovery_replays_slot();
 
     phase.drop_objection(this);
