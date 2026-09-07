@@ -125,14 +125,17 @@ class rdma_coverage extends uvm_object;
         !(resource_kind inside {RDMA_RESOURCE_QP, RDMA_RESOURCE_CQ,
                                 RDMA_RESOURCE_MR, RDMA_RESOURCE_CMQ}) ||
         function_count == 0 ||
-        !(status_code inside {RDMA_SC_OK, RDMA_SC_STALE_GENERATION,
+        !(status_code inside {RDMA_SC_OK, RDMA_SC_INVALID_ARGUMENT,
+                              RDMA_SC_STALE_GENERATION,
                               RDMA_SC_TIMEOUT, RDMA_SC_DMA_PERMISSION,
                               RDMA_SC_DMA_TRANSLATION, RDMA_SC_CODEC_ERROR,
-                              RDMA_SC_RECOVERY_REQUIRED}) ||
+                              RDMA_SC_RECOVERY_REQUIRED,
+                              RDMA_SC_UNKNOWN_HW_ERROR}) ||
         !(source_engine inside {RDMA_ENGINE_NONE, RDMA_ENGINE_CMQ,
                                 RDMA_ENGINE_SQ, RDMA_ENGINE_RQ,
                                 RDMA_ENGINE_CQ, RDMA_ENGINE_DMA,
-                                RDMA_ENGINE_NETWORK, RDMA_ENGINE_RESET}) ||
+                                RDMA_ENGINE_NETWORK, RDMA_ENGINE_RESET,
+                                RDMA_ENGINE_PCIE}) ||
         !(reset_stage inside {RDMA_COVER_RESET_NONE, RDMA_COVER_RESET_VF,
                               RDMA_COVER_RESET_PF, RDMA_COVER_RESET_HOST,
                               RDMA_COVER_RESET_DEVICE}) ||

@@ -55,11 +55,28 @@ class rdma_coverage_test extends uvm_test;
     if (!coverage.has_fault_coverage())
       `uvm_error("COVERAGE_FAULT", "fault coverage flag was not set")
 
+    // WRONG_REQUESTER 和 CQE_ERROR 也必须被 coverage 接受；这两个状态码
+    // 分别来自 adapter 边界拒绝和硬件 CQE 错误，不能在 valid_sample() 中丢弃。
+    coverage.sample_event(RDMA_TRANSPORT_RC, RDMA_WR_SEND,
+                          RDMA_DOORBELL_SQ, RDMA_RESOURCE_QP, 4, 7,
+                          1'b0, 1'b1, RDMA_SC_INVALID_ARGUMENT,
+                          RDMA_ENGINE_PCIE, RDMA_COVER_RESET_NONE,
+                          RDMA_COVER_FN_ACTIVE);
+    coverage.sample_event(RDMA_TRANSPORT_RC, RDMA_WR_SEND,
+                          RDMA_DOORBELL_CQ, RDMA_RESOURCE_CQ, 4, 7,
+                          1'b0, 1'b1, RDMA_SC_UNKNOWN_HW_ERROR,
+                          RDMA_ENGINE_CQ, RDMA_COVER_RESET_NONE,
+                          RDMA_COVER_FN_QUARANTINED);
+    if (coverage.sample_count() != 6)
+      `uvm_error("COVERAGE_FAULT_CODES",
+                 $sformatf("invalid/cqe error samples were dropped count=%0d",
+                           coverage.sample_count()))
+
     coverage.sample_event(RDMA_TRANSPORT_CUSTOM, RDMA_WR_SEND,
                           RDMA_DOORBELL_SQ, RDMA_RESOURCE_QP, 0, 0,
                           1'b0, 1'b0, RDMA_SC_OK, RDMA_ENGINE_NONE,
                           RDMA_COVER_RESET_NONE, RDMA_COVER_FN_DISCOVERED);
-    if (coverage.sample_count() != 4)
+    if (coverage.sample_count() != 6)
       `uvm_error("COVERAGE_INVALID", "invalid sample changed coverage count")
 
     status = rdma_status::success();
