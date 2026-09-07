@@ -30,7 +30,7 @@
 - Modify: `tests/rdma_unit_test_pkg.sv`
 
 **Interfaces:**
-- Consumes: `rdma_transport_e`、`rdma_work_opcode_e`、`rdma_doorbell_kind_e`、`rdma_resource_kind_e`、`rdma_engine_e`、`rdma_status_code_e`。
+- Consumes: `rdma_transport_e`、`rdma_work_opcode_e`、`rdma_doorbell_kind_e`、`rdma_resource_kind_e`、`rdma_engine_kind_e`、`rdma_status_code_e`。
 - Produces:
 
 ```systemverilog
@@ -61,7 +61,7 @@ class rdma_coverage extends uvm_object;
     bit queue_wrap,
     bit dma_high_nonzero,
     rdma_status_code_e status_code,
-    rdma_engine_e source_engine,
+    rdma_engine_kind_e source_engine,
     rdma_coverage_reset_stage_e reset_stage,
     rdma_coverage_function_state_e function_state
   );
