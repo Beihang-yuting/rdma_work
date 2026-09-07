@@ -22,7 +22,35 @@ VCS_FLAGS := -full64 -sverilog -ntb_opts uvm-1.2 -timescale=1ns/1ps -debug_acces
 SHELL := /bin/bash
 .SHELLFLAGS := -o pipefail -c
 
-.PHONY: core host_mem_preflight host_mem rdma_defs integration net_packet net_packet_preflight pcie_work pcie_work_preflight e2e
+.PHONY: core host_mem_preflight host_mem rdma_defs integration net_packet net_packet_preflight pcie_work pcie_work_preflight e2e regression
+
+# 通过统一 run_vcs53.sh 入口逐项执行回归清单；每行必须是 suite/test/tags 三字段。
+regression:
+	set -euo pipefail; \
+	manifest=regression.list; \
+	[[ -r "$$manifest" ]] || { echo "regression manifest is missing: $$manifest" >&2; exit 2; }; \
+	pass=0; fail=0; total=0; \
+	while read -r suite test tags extra; do \
+		[[ -z "$$suite" || "$${suite:0:1}" == "#" ]] && continue; \
+		if [[ -z "$$suite" || -z "$$test" || -z "$$tags" || -n "$$extra" || \
+		      "$$suite" == axis_vip || "$$test" == *axis* ]]; then \
+			echo "invalid regression manifest row" >&2; exit 2; \
+		fi; \
+		if [[ ! "$$suite" =~ ^(core|integration|host_mem|pcie_work|net_packet|e2e|rdma_defs)$$ || \
+		      ! "$$test" =~ ^[A-Za-z_][A-Za-z0-9_]*$$ ]]; then \
+			echo "invalid suite/test in regression manifest: $$suite $$test" >&2; exit 2; \
+		fi; \
+		total=$$((total + 1)); \
+		echo "REGRESSION test=$$test suite=$$suite seed=$${SEED:-default} tags=$$tags"; \
+		if ../scripts/run_vcs53.sh "$$suite" "$$test"; then \
+			pass=$$((pass + 1)); echo "REGRESSION PASS test=$$test"; \
+		else \
+			fail=$$((fail + 1)); echo "REGRESSION FAIL test=$$test" >&2; \
+		fi; \
+	done < "$$manifest"; \
+	if (( total == 0 )); then echo "regression manifest is empty" >&2; exit 2; fi; \
+	echo "REGRESSION SUMMARY total=$$total pass=$$pass fail=$$fail"; \
+	(( fail == 0 ))
 
 core:
 	set -euo pipefail; \

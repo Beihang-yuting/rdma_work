@@ -123,6 +123,7 @@ package rdma_unit_test_pkg;
   `include "integration/rdma_function_context_test.sv"
   `include "integration/rdma_device_env_test.sv"
   `include "integration/rdma_reset_cascade_test.sv"
+  `include "integration/rdma_multivf_recovery_test.sv"
 `endif
 endpackage
 
