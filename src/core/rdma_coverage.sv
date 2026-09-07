@@ -2,7 +2,7 @@
 // 职责：收集 RDMA transport、Function/domain、错误来源、doorbell/状态以及
 //       reset/wrap/DMA 地址属性的值覆盖，并提供轻量 cross 命中查询。
 // 依赖：rdma_types_pkg、rdma_model_pkg 中的枚举和 rdma_status；不依赖外部
-//       PCIe、host-mem、net_packet 或 AXIS 实现。
+//       外部 PCIe、内存、网络或总线 VIP 实现。
 // 所有权与生命周期：coverage 只拥有最后一次事件的值快照和本地 covergroup；
 //       传入对象只读取枚举/标量字段，不保存外部对象句柄。
 
