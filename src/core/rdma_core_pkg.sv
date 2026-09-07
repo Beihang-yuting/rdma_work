@@ -24,6 +24,7 @@ package rdma_core_pkg;
   `include "rdma_queue_backing_planner.sv"
   `include "rdma_queue_runtime.sv"
   `include "rdma_queue_backing_access.sv"
+  `include "rdma_coverage.sv"
   `include "rdma_doorbell_scheduler.sv"
   `include "rdma_queue_data_engine.sv"
   `include "rdma_sq_engine.sv"

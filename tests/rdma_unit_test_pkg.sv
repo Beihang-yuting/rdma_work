@@ -107,6 +107,7 @@ package rdma_unit_test_pkg;
   `include "unit/rdma_queue_txn_journal_test.sv"
   `include "unit/rdma_abi_v5_adapter_test.sv"
   `include "unit/rdma_umem_pbl_mw_test.sv"
+  `include "unit/rdma_coverage_test.sv"
 `ifdef RDMA_NET_PACKET
   `include "integration/rdma_net_packet_adapter_test.sv"
 `endif
