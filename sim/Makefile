@@ -22,7 +22,7 @@ VCS_FLAGS := -full64 -sverilog -ntb_opts uvm-1.2 -timescale=1ns/1ps -debug_acces
 SHELL := /bin/bash
 .SHELLFLAGS := -o pipefail -c
 
-.PHONY: core host_mem_preflight host_mem rdma_defs integration net_packet net_packet_preflight pcie_work pcie_work_preflight e2e regression
+.PHONY: core host_mem_preflight host_mem rdma_defs integration net_packet net_packet_preflight pcie_work pcie_work_preflight dpu_common_preflight e2e regression
 
 # 通过统一 run_vcs53.sh 入口逐项执行回归清单；每行必须是 suite/test/tags 三字段。
 regression:
@@ -248,14 +248,21 @@ pcie_work: pcie_work_preflight
 	build/pcie_work/simv +UVM_TESTNAME=$$test_name | tee build/pcie_work/$$test_name.log; \
 	../scripts/check_uvm_summary.sh build/pcie_work/$$test_name.log
 
-e2e: host_mem_preflight net_packet_preflight
+# dpu_common 只以外部只读 package 参与 e2e；预检不复制源码，也不把该依赖
+# 引入 core filelist，保证 core 层仍可独立编译。
+dpu_common_preflight:
+	@if [[ -z "$(DPU_COMMON_ROOT)" ]]; then echo "DPU_COMMON_ROOT is required for dpu_common integration" >&2; exit 2; fi
+	@if [[ ! -r "$(DPU_COMMON_ROOT)/src/dpu_resource_pkg.sv" ]]; then echo "Required dpu_common dependency is not readable: $(DPU_COMMON_ROOT)/src/dpu_resource_pkg.sv" >&2; exit 2; fi
+
+e2e: host_mem_preflight net_packet_preflight dpu_common_preflight
 	set -euo pipefail; \
 	mkdir -p $(E2E_BUILD); \
 	: "VCS 不会替换 filelist 中的 Make 变量，先生成只读依赖路径展开后的临时 filelist"; \
 	sed -e 's|@HOST_MEM_ROOT@|$(HOST_MEM_ROOT)|g' \
 	    -e 's|@NET_PACKET_ROOT@|$(NET_PACKET_ROOT)|g' \
+	    -e 's|@DPU_COMMON_ROOT@|$(DPU_COMMON_ROOT)|g' \
 	    filelists/e2e.f > $(E2E_BUILD)/e2e.expanded.f; \
-	$(VCS) $(VCS_FLAGS) +define+RDMA_HOST_MEM_TEST +define+RDMA_NET_PACKET \
+	$(VCS) $(VCS_FLAGS) +define+RDMA_HOST_MEM_TEST +define+RDMA_NET_PACKET +define+RDMA_DPU_INTEGRATION \
 		$(HOST_MEM_ROOT)/src/host_mem_pkg.sv \
 		-f $(E2E_BUILD)/e2e.expanded.f -top tb_top -o $(E2E_BUILD)/simv; \
 	test_name=$(TEST); \

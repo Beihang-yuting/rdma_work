@@ -34,8 +34,8 @@ class rdma_end_to_end_dual_env_test extends uvm_test;
 
   rdma_queue_data_engine_fixture tx_env;
   rdma_queue_data_engine_fixture rx_env;
-  $unit::host_mem_manager tx_host_mem;
-  $unit::host_mem_manager rx_host_mem;
+  rdma_host_mem_external_pkg::host_mem_manager tx_host_mem;
+  rdma_host_mem_external_pkg::host_mem_manager rx_host_mem;
   rdma_host_mem_adapter tx_host_adapter;
   rdma_host_mem_adapter rx_host_adapter;
   rdma_real_host_mem_proxy tx_mem_proxy;
@@ -146,8 +146,8 @@ class rdma_end_to_end_dual_env_test extends uvm_test;
     rdma_function_identity rx_identity;
 
     status = rdma_status::success();
-    tx_host_mem = $unit::host_mem_manager::type_id::create("tx_host_mem");
-    rx_host_mem = $unit::host_mem_manager::type_id::create("rx_host_mem");
+    tx_host_mem = rdma_host_mem_external_pkg::host_mem_manager::type_id::create("tx_host_mem");
+    rx_host_mem = rdma_host_mem_external_pkg::host_mem_manager::type_id::create("rx_host_mem");
     // 物理 backing 区间不相交，且分别设置不同 host_id，模拟多 Host fabric。
     tx_host_mem.init_region(64'h0000_0008_0000_0000,
                             64'h0000_0008_00ff_ffff,

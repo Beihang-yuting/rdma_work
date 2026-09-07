@@ -1,4 +1,4 @@
 # suite test dependency-tags
 core rdma_coverage_test core
 integration rdma_reset_cascade_test dpu_common
-integration rdma_multivf_recovery_test dpu_common,host_mem,net_packet
+e2e rdma_multivf_recovery_test dpu_common,host_mem,net_packet

@@ -7,10 +7,14 @@
 // 阅读提示：先看公开类型和接口，再看实现细节；失败路径应保持状态与资源所有权可追踪。
 
 `ifdef RDMA_HOST_MEM_TEST
-  // host_mem_manager is intentionally a $unit-scope class upstream.  Include
-  // the pinned implementation at compilation-unit scope to preserve its
-  // original type identity without changing or copying the dependency.
-  `include "host_mem_manager.sv"
+  // 外部 host_mem_manager 原始文件以 compilation-unit 形式提供。把它包在
+  // 本地命名 package 中只改变 SystemVerilog 可见域，不复制或修改外部源码，
+  // 这样 package 内的测试可以通过显式 qualified name 使用同一个 concrete type。
+  package rdma_host_mem_external_pkg;
+    import uvm_pkg::*;
+    import host_mem_pkg::*;
+    `include "host_mem_manager.sv"
+  endpackage
 `endif
 
 package rdma_unit_test_pkg;
@@ -29,6 +33,7 @@ package rdma_unit_test_pkg;
   import dpu_resource_pkg::*;
 `endif
 `ifdef RDMA_HOST_MEM_TEST
+  import rdma_host_mem_external_pkg::*;
   import host_mem_pkg::*;
   import rdma_host_mem_adapter_pkg::*;
 `endif
@@ -128,8 +133,8 @@ package rdma_unit_test_pkg;
 endpackage
 
 `ifdef RDMA_HOST_MEM_TEST
-  // 真实 host_mem suite 在 package 外编译 host_mem_manager；下面三个测试
-  // 共享同一外部 manager 类型，但仍由各自的 run_phase 负责申请和释放资源。
+  // 真实 host_mem suite 复用上方命名 package 中的外部 manager 类型；下面三个测试
+  // 共享同一 concrete type，但仍由各自的 run_phase 负责申请和释放资源。
   import uvm_pkg::*;
   import host_mem_pkg::*;
   import rdma_types_pkg::*;
@@ -142,7 +147,7 @@ endpackage
   `include "integration/rdma_queue_data_engine_host_mem_test.sv"
   `include "integration/rdma_host_mem_umem_test.sv"
 `ifdef RDMA_NET_PACKET
-  // 双 env 端到端测试必须在 host_mem 的 $unit 类型和 net_packet 适配器
+  // 双 env 端到端测试必须在命名 host_mem manager 和 net_packet 适配器
   // 都完成编译后再展开，避免把外部依赖复制进本仓库或形成循环 typedef。
   import rdma_net_packet_adapter_pkg::*;
   import rdma_net_packet_bridge_pkg::*;

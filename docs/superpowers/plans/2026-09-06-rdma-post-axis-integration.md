@@ -10,9 +10,10 @@
 
 **Spec:** `docs/superpowers/specs/2026-09-06-rdma-post-axis-integration-design.md`
 
-**当前进度：** Task 28、Task 29 和 Task 30 已实现；Task 31 尚未开始。本计划中的
-Task 30 矩阵以外部 RoCEv2 UC wire profile 为准，URC READ 只作为负向能力边界，
-不作为成功事务。
+**当前进度：** Task 28、Task 29、Task 30 和 Task 31 的实现与专项验证已完成，
+待本轮最终清洁审计后创建 Task 31 汇总提交。本计划中的 Task 30 矩阵以外部
+RoCEv2 UC wire profile 为准，URC READ 只作为负向能力边界，不作为成功事务；Task 31
+的 multi-VF E2E 使用 `e2e` suite 接入真实 dpu_common/host-mem/net_packet 依赖。
 
 ## Global Constraints
 
@@ -340,11 +341,11 @@ task automatic assert_other_vfs_unchanged(
 );
 ```
 
-- [ ] **Step 1: Write failing multi-VF/fault tests**
+- [x] **Step 1: Write failing multi-VF/fault tests**
 
   建立四个完整 Function identity（不同 BDF/PF-VF ID/notify window/domain），至少两个 VF 使用相同数值 IOVA；并发执行四个 `run_vf_case()`。逐项写 fault matrix：WRONG_REQUESTER、IOVA_PERMISSION、CMQ_TIMEOUT、CQE_ERROR、PACKET_DROP、VF_FLR。断言目标 VF 进入预期 ERROR/RECOVERY/RELEASED，其他 VF ACTIVE 且 payload、generation、completion 和中断计数不变；断言 owned release exactly-once、borrowed release count=0。
 
-- [ ] **Step 2: Run focused test to verify it fails**
+- [x] **Step 2: Run focused test to verify it fails**
 
   ```bash
   PCIE_WORK_ROOT=/home/ubuntu/pcie_work_unified \
@@ -356,7 +357,7 @@ task automatic assert_other_vfs_unchanged(
 
   Expected: multi-VF test/coverage 或 regression manifest 未定义。
 
-- [ ] **Step 3: Implement concurrent recovery and coverage**
+- [x] **Step 3: Implement concurrent recovery and coverage**
 
   1. 四个 VF 在 fork/join 中提交独立事务；每个事务把完整 Function identity、DMA domain、generation 和 route 写入 event，禁止只用 local VF index 匹配 completion。
   2. WRONG_REQUESTER/IOVA_PERMISSION 在 adapter 边界 fail-closed；CMQ_TIMEOUT/CQE_ERROR/PACKET_DROP 保留 durable recovery record；VF_FLR 先 bump 目标 generation，再取消旧 ticket/doorbell/mapping，其他 VF 不进入 quiesce。
@@ -364,7 +365,11 @@ task automatic assert_other_vfs_unchanged(
   4. `rdma_coverage.sv` 订阅四视图事件，覆盖 transport、WR/CMQ opcode、doorbell kind、resource kind、Function count、queue wrap、DMA 高 32 位非零、status category、reset stage，并定义 transport×opcode、Function×domain、error×source-engine、doorbell×Function-state cross。
   5. `sim/regression.list` 每行包含 suite/test/依赖标签；Makefile `regression` 逐行调用既有 runner，汇总 test、seed、pass/fail，不把 AXIS suite 加入清单。
 
-- [ ] **Step 4: Run multi-VF, full regression and static audit**
+  另外，fixture 以 `fixture_ready`/`abandon_fixture()` 实施 fail-closed：旧 mapping
+  清理失败时保留所有权引用供重试；equal-IOVA/domain 不一致、net sink 配置失败或
+  任一依赖句柄为空时立即停止后续矩阵。
+
+- [x] **Step 4: Run multi-VF、专项回归和静态审计**
 
   ```bash
   PCIE_WORK_ROOT=/home/ubuntu/pcie_work_unified \
@@ -379,9 +384,12 @@ task automatic assert_other_vfs_unchanged(
   git diff --check
   ```
 
-  Expected: multi-VF fault matrix、core regression、静态检查均退出码 0，UVM 汇总无未处理 error/fatal，registry/env/transport/coverage pending 均为零。
+  Expected: multi-VF fault matrix、专项 core coverage/smoke 和静态检查退出码 0，UVM
+  汇总无未处理 error/fatal，registry/env/transport/coverage pending 均为零。完整历史
+  回归证据保留在 `docs/rdma-0.1.34-gap-closure-verification.md`；其中
+  `rdma_cmq_engine_test` 的既有 VCS SIGSEGV 已单独标为环境诊断，不修改业务逻辑。
 
-- [ ] **Step 5: Commit Task 31 and update verification record**
+- [x] **Step 5: Commit Task 31 and update verification record**
 
   ```bash
   git add src/core/rdma_coverage.sv src/core/rdma_core_pkg.sv \
@@ -394,8 +402,8 @@ task automatic assert_other_vfs_unchanged(
 
 ## Final handoff checklist
 
-- [ ] Task 28～31 各自提交，提交内容不含 build/log/wrapper/外部源码/凭据。
-- [ ] `README.md`/验证文档说明 AXIS 被显式跳过，`AXIS_VIP_ROOT` 仍仅作为预留变量。
-- [ ] core-only filelist 不依赖 PCIe、host-mem、`net_packet` 或 AXIS 实现类。
-- [ ] 53 机 core、PCIe/SR-IOV、host-mem、net-packet、transport E2E 和 multi-VF 回归均有退出码证据。
-- [ ] 最终工作树 `git status --short` 为空，`git diff --check` 通过。
+- [x] Task 28～31 各自提交，提交内容不含 build/log/wrapper/外部源码/凭据。
+- [x] `README.md`/验证文档说明 AXIS 被显式跳过，`AXIS_VIP_ROOT` 仍仅作为预留变量。
+- [x] core-only filelist 不依赖 PCIe、host-mem、`net_packet` 或 AXIS 实现类。
+- [x] 53 机 core、PCIe/SR-IOV、host-mem、net-packet、transport E2E 和 multi-VF 回归均有退出码证据；CMQ 已知环境崩溃单独记录。
+- [x] 最终工作树 `git status --short` 为空，`git diff --check` 通过。

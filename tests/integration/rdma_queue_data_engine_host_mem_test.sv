@@ -105,7 +105,7 @@ class rdma_queue_data_engine_host_mem_test extends uvm_test;
   // 输入/输出及副作用：phase（输入）；phase 由 UVM 提供；task 通过 objection、日志和断言暴露结果，可能调用 DUT 接口但不改变其所有权规则。
   // 失败/边界：run_phase 的 setup/阶段驱动失败时停止新增事务，并按测试生命周期清理 objection 与临时引用。
   task run_phase(uvm_phase phase);
-    $unit::host_mem_manager host_manager;
+    rdma_host_mem_external_pkg::host_mem_manager host_manager;
     rdma_host_mem_adapter real_adapter;
     rdma_real_host_mem_proxy proxy;
     rdma_queue_data_engine_fixture fixture;
@@ -121,7 +121,7 @@ class rdma_queue_data_engine_host_mem_test extends uvm_test;
 
     phase.raise_objection(this);
 
-    host_manager = $unit::host_mem_manager::type_id::create("queue_hm_real");
+    host_manager = rdma_host_mem_external_pkg::host_mem_manager::type_id::create("queue_hm_real");
     host_manager.init_region(64'h0000_0008_0000_0000,
                              64'h0000_0008_00ff_ffff);
     real_adapter = rdma_host_mem_adapter::type_id::create(

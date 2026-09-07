@@ -71,14 +71,14 @@ class rdma_coverage extends uvm_object;
 endclass
 ```
 
-- [ ] **Step 1: Write the failing coverage test**
+- [x] **Step 1: Write the failing coverage test**
 
   在 `rdma_coverage_test.sv` 生成 RC/UD/URC、SEND/WRITE/READ/ATOMIC、SQ/RQ/CQ
   doorbell、QP/CQ/MR resource、四个 Function/domain、wrap、DMA 高 32 位非零、
   OK/STALE/timeout 状态和 VF/Device reset 样本；断言 `sample_count()`、
   `cross_hit_count()`、`has_fault_coverage()` 的结果。测试只依赖 core package。
 
-- [ ] **Step 2: Run the focused test to verify it fails**
+- [x] **Step 2: Run the focused test to verify it fails**
 
   ```bash
   PATH="/tmp/rdma_sshpass_wrapper_codex:$PATH" SSHPASS=123 \
@@ -87,7 +87,7 @@ endclass
 
   Expected: `rdma_coverage` 或采样接口未定义，必须是编译失败而不是测试内部绕过。
 
-- [ ] **Step 3: Implement the minimal coverage collector**
+- [x] **Step 3: Implement the minimal coverage collector**
 
   `rdma_coverage.sv` 保存采样计数和 last-value 快照；covergroup 至少包含
   `transport×work_opcode`、`function_count×dma_domain_id`、
@@ -95,7 +95,7 @@ endclass
   将 `queue_wrap`、`dma_high_nonzero`、`reset_stage` 作为独立 coverpoint。空/非法
   样本不递增计数，所有字段保持 detached value snapshot。
 
-- [ ] **Step 4: Run coverage unit test and core smoke**
+- [x] **Step 4: Run coverage unit test and core smoke**
 
   ```bash
   PATH="/tmp/rdma_sshpass_wrapper_codex:$PATH" SSHPASS=123 \
@@ -104,7 +104,7 @@ endclass
     scripts/run_vcs53.sh core rdma_smoke_test
   ```
 
-- [ ] **Step 5: Commit coverage**
+- [x] **Step 5: Commit coverage**
 
   ```bash
   git add src/core/rdma_coverage.sv src/core/rdma_core_pkg.sv \
@@ -138,7 +138,7 @@ task automatic assert_other_vfs_unchanged(
 );
 ```
 
-- [ ] **Step 1: Write the failing four-VF/fault matrix test**
+- [x] **Step 1: Write the failing four-VF/fault matrix test**
 
   用 dpu_common snapshot 创建 4 个 VF identity（至少两个不同 PF 或不同 Host），
   为每个 VF 建立独立 DMA domain/route/Host ID，并让 VF0/VF1 使用相同数值 IOVA。
@@ -148,7 +148,7 @@ task automatic assert_other_vfs_unchanged(
   `RDMA_FAULT_PACKET_DROP`、`RDMA_FAULT_VF_FLR`；先写断言预期状态/码和非目标
   VF 不变性。
 
-- [ ] **Step 2: Run focused test to verify it fails**
+- [x] **Step 2: Run focused test to verify it fails**
 
   ```bash
   PCIE_WORK_ROOT=/home/ubuntu/pcie_work_unified \
@@ -156,13 +156,13 @@ task automatic assert_other_vfs_unchanged(
   NET_PACKET_ROOT=/home/ubuntu/netpacket_np.GalEXM \
   DPU_COMMON_ROOT=/home/ubuntu/dpu-common-external \
   PATH="/tmp/rdma_sshpass_wrapper_codex:$PATH" SSHPASS=123 \
-    scripts/run_vcs53.sh integration rdma_multivf_recovery_test
+    scripts/run_vcs53.sh e2e rdma_multivf_recovery_test
   ```
 
   Expected: 测试/coverage 未注册或 helper 未定义导致失败；不得把 fault 逻辑写进
   测试临时变量绕过缺失实现。
 
-- [ ] **Step 3: Implement VF harness and generation-safe recovery**
+- [x] **Step 3: Implement VF harness and generation-safe recovery**
 
   每个 VF 保存完整 identity、binding、generation、DMA domain、payload 快照、
   `rdma_status` 和 network/CQ 计数；所有 event/completion 同时记录
@@ -171,17 +171,20 @@ task automatic assert_other_vfs_unchanged(
   PACKET_DROP 保存 durable recovery record；VF_FLR 先 quiesce 目标 context，再
   调用 `request_vf_flr()`，旧 handle 的 late completion 必须返回
   `RDMA_SC_STALE_GENERATION`，恢复后的新 handle 才能提交。owned mapping 只
-  release 一次，borrowed payload release count 必须为零。
+  release 一次，borrowed payload release count 必须为零。fixture 还以
+  `fixture_ready`/`abandon_fixture()` 实施 fail-closed：旧 mapping 清理失败时保留
+  所有权引用供重试；equal-IOVA/domain 不一致、net sink 配置失败或任一依赖句柄为空时
+  立即停止后续矩阵。
 
-- [ ] **Step 4: Add regression manifest target**
+- [x] **Step 4: Add regression manifest target**
 
   `sim/regression.list` 每行使用三个字段 `suite test dependency-tags`，至少包含
   `core rdma_coverage_test core`、`integration rdma_reset_cascade_test dpu_common`
-  和 `integration rdma_multivf_recovery_test dpu_common,host_mem,net_packet`。
+  和 `e2e rdma_multivf_recovery_test dpu_common,host_mem,net_packet`。
   Makefile 的 `regression` 目标逐行读取清单、校验 suite/test 字段、调用已有
   `run_vcs53.sh` 入口并汇总 test/seed/pass/fail；清单中不得出现 AXIS。
 
-- [ ] **Step 5: Run VF matrix and non-regression checks**
+- [x] **Step 5: Run VF matrix and non-regression checks**
 
   ```bash
   PCIE_WORK_ROOT=/home/ubuntu/pcie_work_unified \
@@ -189,7 +192,7 @@ task automatic assert_other_vfs_unchanged(
   NET_PACKET_ROOT=/home/ubuntu/netpacket_np.GalEXM \
   DPU_COMMON_ROOT=/home/ubuntu/dpu-common-external \
   PATH="/tmp/rdma_sshpass_wrapper_codex:$PATH" SSHPASS=123 \
-    scripts/run_vcs53.sh integration rdma_multivf_recovery_test
+    scripts/run_vcs53.sh e2e rdma_multivf_recovery_test
   PATH="/tmp/rdma_sshpass_wrapper_codex:$PATH" SSHPASS=123 \
     scripts/run_vcs53.sh core rdma_coverage_test
   python3 tools/check_rdma_profile_names.py
@@ -197,7 +200,7 @@ task automatic assert_other_vfs_unchanged(
   git diff --check
   ```
 
-- [ ] **Step 6: Commit Task 31**
+- [x] **Step 6: Commit Task 31**
 
   ```bash
   git add tests/integration/rdma_multivf_recovery_test.sv tests/rdma_unit_test_pkg.sv \
@@ -215,3 +218,17 @@ task automatic assert_other_vfs_unchanged(
   no external source is copied into the repository.
 - No placeholders or undefined helper signatures remain; Task 31A defines the coverage
   API consumed by Task 31B.
+
+## 当前验证证据（2026-09-07）
+
+- `e2e rdma_multivf_recovery_test` 在 53 机完成编译、elaboration、link 和仿真；UVM
+  `warning=0 error=0 fatal=0`，两个真实 Host-memory manager 的 leak check 均为
+  `0 blocks outstanding`。
+- `e2e rdma_end_to_end_transport_test`、`e2e rdma_end_to_end_dual_env_test` 和
+  `host_mem regression` 均在 53 机取得退出码 `0`；三项 host-mem 回归每项均为
+  UVM `0/0/0`，manager leak check 为 `0 blocks outstanding`。
+- `core rdma_coverage_test`、`core rdma_smoke_test` 均为 UVM `0/0/0`。
+- Python 静态/guard/全量单元检查分别为 `PASS`、`8 tests OK`、`121 tests OK`；
+  `git diff --check` 通过。
+- `rdma_cmq_engine_test` 的既有 VCS `SIGSEGV` 已在 HEAD、当前工作树和 `-no_save`
+  运行中复现，发生在测试 UVM 输出前；该环境诊断不改变本 task 的业务代码。

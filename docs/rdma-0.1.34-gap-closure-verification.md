@@ -1,6 +1,6 @@
 # RDMA 0.1.34 缺口收尾验证记录
 
-本文档记录 Task 1–9 的验证入口和证据边界。命令中的外部路径是示例，必须替换为
+本文档记录 RDMA 0.1.34 缺口收尾及 Task 28–31B 的验证入口和证据边界。命令中的外部路径必须替换为
 53 主机上实际存在、且通过 Makefile preflight 的 checkout；本仓库不复制或修改这些
 外部源码。所有 VCS 命令由 `scripts/run_vcs53.sh` 转发到 `ubuntu@10.11.10.53`
 登录 bash 执行。
@@ -14,8 +14,9 @@
 | 定义基线 | `scripts/run_vcs53.sh rdma_defs rdma_defs_test` | VCS53 | `rdma definitions: PASS` |
 | core | `scripts/run_vcs53.sh core regression` | VCS53 | 编译并运行所有 core tests，UVM `warning=0 error=0 fatal=0` |
 | dpu_common integration | `DPU_COMMON_ROOT=/path/to/dpu_common scripts/run_vcs53.sh integration regression` | dpu_common snapshot | route、PF/VF、reset 和 context tests 全通过 |
-| host-mem | `HOST_MEM_ROOT=/path/to/host_mem scripts/run_vcs53.sh host_mem regression` | host_mem commit `3b9e000d5df4d10efbb3029f43605e0362e0caca` | UMEM/PBL/MW、queue backing 和 release 无泄漏 |
+| host-mem | `HOST_MEM_ROOT=/path/to/host_mem scripts/run_vcs53.sh host_mem regression` | host_mem commit `365b7553fc7dac6b4ad55886a8e4869153607c28`，并通过源码 SHA-256 preflight | UMEM/PBL/MW、queue backing 和 release 无泄漏 |
 | net_packet | `NET_PACKET_ROOT=/path/to/net_packet scripts/run_vcs53.sh net_packet regression` | net_packet commit `6766c4f042484814548481065328ffbcffab590f` | RoCEv2/iWARP pack/unpack 和故障策略全通过 |
+| multi-VF E2E | `PCIE_WORK_ROOT=... HOST_MEM_ROOT=... NET_PACKET_ROOT=... DPU_COMMON_ROOT=... scripts/run_vcs53.sh e2e rdma_multivf_recovery_test` | dpu_common、pinned host_mem、pinned net_packet | 双 Host/双 PF/四 VF 并发 fault matrix、FLR/generation recovery、CQE/CMQ、真实 mapping release 和 leak seal 全通过 |
 
 `AXIS_VIP_ROOT` 目前只保留在 `run_vcs53.sh` 的环境传递接口中；仓库尚无 AXIS VIP
 adapter/filelist，因此不将它伪装成可通过的 suite。待外部 AXIS adapter 明确接口后，
@@ -35,20 +36,38 @@ adapter/filelist，因此不将它伪装成可通过的 suite。待外部 AXIS a
 
 ## 执行记录
 
-本轮（2026-09-06，VCS W-2024.09-SP1，`ubuntu@10.11.10.53`）已重新执行以下命令，均以退出码 `0` 完成：
+本轮（2026-09-07，VCS W-2024.09-SP1，`ubuntu@10.11.10.53`）重新执行了以下命令，均以退出码 `0` 完成：
 
 | 命令 | 结果摘要 |
 | --- | --- |
 | `python3 tools/check_rdma_profile_names.py` | `rdma profile naming: PASS` |
-| `python3 -m unittest discover -s tests/unit -p 'test_*.py'` | `Ran 113 tests`，`OK` |
+| `python3 -m unittest discover -s tests/unit -p 'test_*.py'` | `Ran 121 tests`，`OK` |
 | `git diff --check` | 无输出，退出码 `0` |
-| `scripts/run_vcs53.sh core regression` | 全部 core 用例完成，UVM `warning=0 error=0 fatal=0` |
-| `DPU_COMMON_ROOT=/home/ubuntu/dpu-common-external scripts/run_vcs53.sh integration regression` | PF/VF、reset、context 用例完成，UVM `warning=0 error=0 fatal=0` |
-| `HOST_MEM_ROOT=/home/ubuntu/workspace/host_mem scripts/run_vcs53.sh host_mem regression` | adapter、queue、UMEM/PBL/MW 完成，host_mem leak check 为 `0 blocks outstanding`，UVM `warning=0 error=0 fatal=0` |
-| `NET_PACKET_ROOT=/home/ubuntu/netpacket_np.GalEXM scripts/run_vcs53.sh net_packet regression` | adapter 用例完成，UVM `warning=0 error=0 fatal=0` |
+| `python3 -m unittest tests.unit.test_e2e_multivf_manifest tests.unit.test_multivf_recovery_guards` | `Ran 8 tests`，`OK` |
+| `scripts/run_vcs53.sh core rdma_coverage_test` | coverage collector 编译/仿真完成，UVM `warning=0 error=0 fatal=0` |
+| `scripts/run_vcs53.sh core rdma_smoke_test` | core smoke 编译/仿真完成，UVM `warning=0 error=0 fatal=0` |
+| `PCIE_WORK_ROOT=/home/ubuntu/pcie_work_unified HOST_MEM_ROOT=/home/ubuntu/host_mem_latest NET_PACKET_ROOT=/home/ubuntu/netpacket_np.GalEXM DPU_COMMON_ROOT=/home/ubuntu/dpu-common-external scripts/run_vcs53.sh e2e rdma_end_to_end_transport_test` | RC/UD/URC transport matrix 编译、elaboration、link 和仿真退出码 `0`；UVM `warning=0 error=0 fatal=0`，Host-memory leak check 为零 |
+| `PCIE_WORK_ROOT=/home/ubuntu/pcie_work_unified HOST_MEM_ROOT=/home/ubuntu/host_mem_latest NET_PACKET_ROOT=/home/ubuntu/netpacket_np.GalEXM DPU_COMMON_ROOT=/home/ubuntu/dpu-common-external scripts/run_vcs53.sh e2e rdma_end_to_end_dual_env_test` | 双 env 传输场景编译、elaboration、link 和仿真退出码 `0`；UVM `warning=0 error=0 fatal=0`，Host-memory leak check 为零 |
+| `PCIE_WORK_ROOT=/home/ubuntu/pcie_work_unified HOST_MEM_ROOT=/home/ubuntu/host_mem_latest NET_PACKET_ROOT=/home/ubuntu/netpacket_np.GalEXM DPU_COMMON_ROOT=/home/ubuntu/dpu-common-external scripts/run_vcs53.sh e2e rdma_multivf_recovery_test` | 双 Host/双 PF/四 VF fault matrix 完成；两路 Host-memory leak check 均为 `0 blocks outstanding`，UVM `warning=0 error=0 fatal=0` |
+| `HOST_MEM_ROOT=/home/ubuntu/host_mem_latest scripts/run_vcs53.sh host_mem regression` | adapter、queue data-engine 和 UMEM 三项均退出码 `0`；每项 UVM `warning=0 error=0 fatal=0`，真实 manager leak check 为 `0 blocks outstanding` |
+| `scripts/run_vcs53.sh core regression`、integration/net_packet 全量回归 | 这些全量回归的最近一次基线证据保留在上一轮记录；本轮针对 fail-closed 改动重新执行了上面列出的 coverage、smoke、host-mem、transport、dual-env 和 multi-VF 入口，不将未重跑的全量结果冒充本轮证据 |
+
+本轮 host-mem preflight 使用 `365b7553fc7dac6b4ad55886a8e4869153607c28`，并校验：
+
+- `src/host_mem_pkg.sv` SHA-256：`e874491da16334b12d9299355a3148275309a0c5a2c3303cda2fc7c3382ed74f`；
+- `src/host_mem_manager.sv` SHA-256：`6b5eb9bbd94d410b1382a665ddb60347132558fc7882cbed1115f69fa0c1d410`。
 
 VCS 日志中的 `cannot set terminal process group`/`no job control` 是远端非交互登录 shell
 的 bash 提示，不是仿真失败；实际判定以每个用例的 UVM summary 和脚本退出码为准。
 构建目录、日志、SSH wrapper、外部源码和访问令牌均未加入 Git。若后续某个外部 suite
 因依赖路径或 license 缺失无法运行，应记录为环境阻塞，不得把 core 或静态检查结果
 冒充该 suite 的通过证据。
+
+## CMQ 仿真诊断边界
+
+在 53 机上，`rdma_cmq_engine_test` 的 VCS 进程会在打印 `Running test ...` 后、任何
+测试 UVM 输出前收到 `SIGSEGV`；相同现象可在当前工作树、`HEAD` 基线和 `-no_save`
+运行中复现，且发生时进程峰值约 0.5 GB。该现象属于既有 VCS/主机资源或 class-codegen
+问题，而不是本轮 multi-VF fixture 引入的业务失败；因此没有修改 CMQ 业务逻辑来掩盖
+它。后续若要重新定位，应在资源充足的 53 机上保留独立的最小化诊断，不把该崩溃写成
+multi-VF E2E 的通过/失败判据。

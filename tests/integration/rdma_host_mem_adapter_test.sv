@@ -118,7 +118,7 @@ class rdma_owner_two_stage_alias_handle extends rdma_handle;
   endfunction
 endclass
 
-class rdma_owner_clone_counting_host_mem extends $unit::host_mem_manager;
+class rdma_owner_clone_counting_host_mem extends rdma_host_mem_external_pkg::host_mem_manager;
   `uvm_object_utils(rdma_owner_clone_counting_host_mem)
 
   int unsigned free_call_count;
@@ -250,7 +250,7 @@ class rdma_host_mem_adapter_test extends uvm_test;
   // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
   // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_manager_owned_mapping_identity();
-    $unit::host_mem_manager identity_hm;
+    rdma_host_mem_external_pkg::host_mem_manager identity_hm;
     rdma_host_mem_adapter identity_adapter;
     rdma_resource_manager identity_rm;
     rdma_function_binding identity_binding;
@@ -269,7 +269,7 @@ class rdma_host_mem_adapter_test extends uvm_test;
     rdma_status status;
     int unsigned leak_count;
 
-    identity_hm = $unit::host_mem_manager::type_id::create(
+    identity_hm = rdma_host_mem_external_pkg::host_mem_manager::type_id::create(
       "manager_identity_hm"
     );
     identity_hm.init_region(64'h0000_0007_0000_0000,
@@ -482,7 +482,7 @@ class rdma_host_mem_adapter_test extends uvm_test;
   // 输入/输出及副作用：无显式参数；run_queue_host_mem_fixture 驱动下游事务；函数返回 无直接返回值，不取得调用方资源所有权。
   // 失败/边界：run_queue_host_mem_fixture 的 setup/阶段驱动失败时停止新增事务，并按测试生命周期清理 objection 与临时引用。
   task automatic run_queue_host_mem_fixture();
-    $unit::host_mem_manager queue_hm;
+    rdma_host_mem_external_pkg::host_mem_manager queue_hm;
     rdma_host_mem_adapter queue_adapter;
     rdma_resource_manager resource_manager;
     rdma_cq_lifecycle_policy cq_policy;
@@ -517,7 +517,7 @@ class rdma_host_mem_adapter_test extends uvm_test;
     rdma_handle saved_pd_owner;
     rdma_dma_direction_e saved_pd_direction;
 
-    queue_hm = $unit::host_mem_manager::type_id::create("queue_hm");
+    queue_hm = rdma_host_mem_external_pkg::host_mem_manager::type_id::create("queue_hm");
     queue_hm.init_region(64'h0000_0008_0000_0000,
                          64'h0000_0008_00ff_ffff);
     queue_adapter = rdma_host_mem_adapter::type_id::create(
@@ -706,11 +706,11 @@ class rdma_host_mem_adapter_test extends uvm_test;
   // 输入/输出及副作用：phase（输入）；phase 由 UVM 提供；task 通过 objection、日志和断言暴露结果，可能调用 DUT 接口但不改变其所有权规则。
   // 失败/边界：run_phase 的 setup/阶段驱动失败时停止新增事务，并按测试生命周期清理 objection 与临时引用。
   task run_phase(uvm_phase phase);
-    $unit::host_mem_manager hm;
-    $unit::host_mem_manager offset_hm;
-    $unit::host_mem_manager overflow_hm;
-    $unit::host_mem_manager equal_hm_a;
-    $unit::host_mem_manager equal_hm_b;
+    rdma_host_mem_external_pkg::host_mem_manager hm;
+    rdma_host_mem_external_pkg::host_mem_manager offset_hm;
+    rdma_host_mem_external_pkg::host_mem_manager overflow_hm;
+    rdma_host_mem_external_pkg::host_mem_manager equal_hm_a;
+    rdma_host_mem_external_pkg::host_mem_manager equal_hm_b;
     rdma_owner_clone_counting_host_mem owner_clone_hm;
     rdma_owner_clone_counting_host_mem authority_clone_hm;
     rdma_host_mem_adapter adapter;
@@ -790,7 +790,10 @@ class rdma_host_mem_adapter_test extends uvm_test;
     );
     request_context_snapshot.copy(request_context);
 
-    hm = $unit::host_mem_manager::type_id::create("hm");
+    hm = rdma_host_mem_external_pkg::host_mem_manager::type_id::create("hm");
+    // 新版 host_mem 默认采用随机 placement；本段验证的是“拒绝请求不推进
+    // allocator 状态”的精确回滚契约，因此显式切换到可复现的 first-fit。
+    hm.set_alloc_policy(host_mem_pkg::HOST_MEM_FIRST_FIT);
     hm.init_region(64'h0000_0001_0000_0000,
                    64'h0000_0001_00ff_ffff);
     adapter = rdma_host_mem_adapter::type_id::create("adapter");
@@ -1298,7 +1301,10 @@ class rdma_host_mem_adapter_test extends uvm_test;
 
     // A non-zero iova_base is the first end-exclusive IOVA cursor.  Each
     // successful mapping aligns that cursor and advances it by mapping size.
-    offset_hm = $unit::host_mem_manager::type_id::create("offset_hm");
+    offset_hm = rdma_host_mem_external_pkg::host_mem_manager::type_id::create("offset_hm");
+    // 下面的 backing 地址比较用于确认 rejected rebase 没有消耗一个块；
+    // 使用 deterministic policy，避免把随机 placement 误报成 cursor 破坏。
+    offset_hm.set_alloc_policy(host_mem_pkg::HOST_MEM_FIRST_FIT);
     offset_hm.init_region(64'h0000_0002_0000_0000,
                           64'h0000_0002_00ff_ffff);
     offset_adapter = rdma_host_mem_adapter::type_id::create("offset_adapter");
@@ -1382,7 +1388,9 @@ class rdma_host_mem_adapter_test extends uvm_test;
 
     // IOVA arithmetic failure rolls back the real backing allocation and
     // does not advance the cursor.  The same base is reusable immediately.
-    overflow_hm = $unit::host_mem_manager::type_id::create("overflow_hm");
+    overflow_hm = rdma_host_mem_external_pkg::host_mem_manager::type_id::create("overflow_hm");
+    // 溢出回滚断言需要观察同一块 backing 是否可重用，故固定为 first-fit。
+    overflow_hm.set_alloc_policy(host_mem_pkg::HOST_MEM_FIRST_FIT);
     overflow_hm.init_region(64'h0000_0003_0000_0000,
                             64'h0000_0003_00ff_ffff);
     overflow_adapter = rdma_host_mem_adapter::type_id::create(
@@ -1414,8 +1422,12 @@ class rdma_host_mem_adapter_test extends uvm_test;
 
     // Equal numeric addresses from independent managers/adapters remain
     // distinct because allocation identity and adapter ownership are opaque.
-    equal_hm_a = $unit::host_mem_manager::type_id::create("equal_hm_a");
-    equal_hm_b = $unit::host_mem_manager::type_id::create("equal_hm_b");
+    equal_hm_a = rdma_host_mem_external_pkg::host_mem_manager::type_id::create("equal_hm_a");
+    equal_hm_b = rdma_host_mem_external_pkg::host_mem_manager::type_id::create("equal_hm_b");
+    // 两个独立 manager 的数值 alias 是本测试要验证的边界；显式使用
+    // first-fit 后仍由 adapter 的 opaque identity 检验跨 manager 隔离。
+    equal_hm_a.set_alloc_policy(host_mem_pkg::HOST_MEM_FIRST_FIT);
+    equal_hm_b.set_alloc_policy(host_mem_pkg::HOST_MEM_FIRST_FIT);
     equal_hm_a.init_region(64'h0000_0005_0000_0000,
                            64'h0000_0005_000f_ffff);
     equal_hm_b.init_region(64'h0000_0005_0000_0000,

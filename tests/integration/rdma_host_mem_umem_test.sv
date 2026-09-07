@@ -45,7 +45,7 @@ class rdma_host_mem_umem_test extends uvm_test;
   // 输入/输出及副作用：从 manager 申请两个 4 KiB 页并在结束时逆序释放；不修改外部 host_mem 源码。
   // 失败/边界：任一阶段失败均报告错误；最终 adapter.check_leaks 必须为零。
   task run_phase(uvm_phase phase);
-    $unit::host_mem_manager host_mem;
+    rdma_host_mem_external_pkg::host_mem_manager host_mem;
     rdma_host_mem_adapter adapter;
     rdma_function_handle function_h;
     rdma_umem umem;
@@ -55,7 +55,7 @@ class rdma_host_mem_umem_test extends uvm_test;
     int unsigned leak_count;
 
     phase.raise_objection(this);
-    host_mem = $unit::host_mem_manager::type_id::create("umem_host_mem");
+    host_mem = rdma_host_mem_external_pkg::host_mem_manager::type_id::create("umem_host_mem");
     host_mem.init_region(64'h0000_0010_0000_0000,
                          64'h0000_0010_00ff_ffff);
     adapter = rdma_host_mem_adapter::type_id::create("umem_adapter");
