@@ -17,10 +17,19 @@
 | host-mem | `HOST_MEM_ROOT=/path/to/host_mem scripts/run_vcs53.sh host_mem regression` | host_mem commit `365b7553fc7dac6b4ad55886a8e4869153607c28`，并通过源码 SHA-256 preflight | UMEM/PBL/MW、queue backing 和 release 无泄漏 |
 | net_packet | `NET_PACKET_ROOT=/path/to/net_packet scripts/run_vcs53.sh net_packet regression` | net_packet commit `6766c4f042484814548481065328ffbcffab590f` | RoCEv2/iWARP pack/unpack 和故障策略全通过 |
 | multi-VF E2E | `PCIE_WORK_ROOT=... HOST_MEM_ROOT=... NET_PACKET_ROOT=... DPU_COMMON_ROOT=... scripts/run_vcs53.sh e2e rdma_multivf_recovery_test` | dpu_common、pinned host_mem、pinned net_packet | 双 Host/双 PF/四 VF 并发 fault matrix、FLR/generation recovery、CQE/CMQ、真实 mapping release 和 leak seal 全通过 |
+| high-traffic E2E | `PCIE_WORK_ROOT=... HOST_MEM_ROOT=... NET_PACKET_ROOT=... DPU_COMMON_ROOT=... scripts/run_vcs53.sh e2e rdma_end_to_end_high_traffic_test` | dpu_common、pinned host_mem、pinned net_packet | 4096×256B、SQ/RQ/CQ window=16、completion batch=4；queue-full、PI/CI、CQE owner/released-slot、真实 mapping 和 Function-qualified event pending 全通过 |
 
 `AXIS_VIP_ROOT` 目前只保留在 `run_vcs53.sh` 的环境传递接口中；仓库尚无 AXIS VIP
 adapter/filelist，因此不将它伪装成可通过的 suite。待外部 AXIS adapter 明确接口后，
 应新增独立 filelist、preflight 和测试，再加入本矩阵。
+
+高流量 E2E 使用 fixture 中已创建的 CQ 作为 completion 依赖，并验证带完整 Function
+身份的 `route_event()`/`end_pending()` 账本；本轮不额外创建 lifecycle-owned CEQ，
+因此该用例不宣称真实硬件 CEQ 中断环路已经验证。`write_cq_entry()` 只写入真实
+CQ backing，不推进 queue-data runtime 的硬件 producer/used 账本；所以本轮也不把
+CQ producer 满载、硬件 CQ backpressure 或 CEQ 中断环路写成已覆盖项。真实 CQE
+publish/CEQ 注入点稳定后，应另设独立测试和回归行，避免把组合层事件账本与硬件
+中断行为混为一谈。
 
 ## 固定来源与清洁边界
 
@@ -41,13 +50,14 @@ adapter/filelist，因此不将它伪装成可通过的 suite。待外部 AXIS a
 | 命令 | 结果摘要 |
 | --- | --- |
 | `python3 tools/check_rdma_profile_names.py` | `rdma profile naming: PASS` |
-| `python3 -m unittest discover -s tests/unit -p 'test_*.py'` | `Ran 121 tests`，`OK` |
+| `python3 -m unittest discover -s tests/unit -p 'test_*.py'` | `Ran 122 tests`，`OK` |
 | `git diff --check` | 无输出，退出码 `0` |
-| `python3 -m unittest tests.unit.test_e2e_multivf_manifest tests.unit.test_multivf_recovery_guards` | `Ran 8 tests`，`OK` |
+| `python3 -m unittest tests.unit.test_e2e_multivf_manifest tests.unit.test_multivf_recovery_guards` | `Ran 9 tests`，`OK` |
 | `scripts/run_vcs53.sh core rdma_coverage_test` | coverage collector 编译/仿真完成，UVM `warning=0 error=0 fatal=0` |
 | `scripts/run_vcs53.sh core rdma_smoke_test` | core smoke 编译/仿真完成，UVM `warning=0 error=0 fatal=0` |
 | `PCIE_WORK_ROOT=/home/ubuntu/pcie_work_unified HOST_MEM_ROOT=/home/ubuntu/host_mem_latest NET_PACKET_ROOT=/home/ubuntu/netpacket_np.GalEXM DPU_COMMON_ROOT=/home/ubuntu/dpu-common-external scripts/run_vcs53.sh e2e rdma_end_to_end_transport_test` | RC/UD/URC transport matrix 编译、elaboration、link 和仿真退出码 `0`；UVM `warning=0 error=0 fatal=0`，Host-memory leak check 为零 |
 | `PCIE_WORK_ROOT=/home/ubuntu/pcie_work_unified HOST_MEM_ROOT=/home/ubuntu/host_mem_latest NET_PACKET_ROOT=/home/ubuntu/netpacket_np.GalEXM DPU_COMMON_ROOT=/home/ubuntu/dpu-common-external scripts/run_vcs53.sh e2e rdma_end_to_end_dual_env_test` | 双 env 传输场景编译、elaboration、link 和仿真退出码 `0`；UVM `warning=0 error=0 fatal=0`，Host-memory leak check 为零 |
+| `PCIE_WORK_ROOT=/home/ubuntu/pcie_work_unified HOST_MEM_ROOT=/home/ubuntu/host_mem_latest NET_PACKET_ROOT=/home/ubuntu/netpacket_np.GalEXM DPU_COMMON_ROOT=/home/ubuntu/dpu-common-external scripts/run_vcs53.sh e2e rdma_end_to_end_high_traffic_test` | 4096×256B、16-entry SQ/RQ/CQ window、每 4 个 completion drain；编译、elaboration、link 和仿真退出码 `0`；UVM `INFO=7/WARNING=0/ERROR=0/FATAL=0`，4 次 Host-memory leak check 均为 `0 blocks outstanding` |
 | `PCIE_WORK_ROOT=/home/ubuntu/pcie_work_unified HOST_MEM_ROOT=/home/ubuntu/host_mem_latest NET_PACKET_ROOT=/home/ubuntu/netpacket_np.GalEXM DPU_COMMON_ROOT=/home/ubuntu/dpu-common-external scripts/run_vcs53.sh e2e rdma_multivf_recovery_test` | 双 Host/双 PF/四 VF fault matrix 完成；两路 Host-memory leak check 均为 `0 blocks outstanding`，UVM `warning=0 error=0 fatal=0` |
 | `HOST_MEM_ROOT=/home/ubuntu/host_mem_latest scripts/run_vcs53.sh host_mem regression` | adapter、queue data-engine 和 UMEM 三项均退出码 `0`；每项 UVM `warning=0 error=0 fatal=0`，真实 manager leak check 为 `0 blocks outstanding` |
 | `scripts/run_vcs53.sh core regression`、integration/net_packet 全量回归 | 这些全量回归的最近一次基线证据保留在上一轮记录；本轮针对 fail-closed 改动重新执行了上面列出的 coverage、smoke、host-mem、transport、dual-env 和 multi-VF 入口，不将未重跑的全量结果冒充本轮证据 |

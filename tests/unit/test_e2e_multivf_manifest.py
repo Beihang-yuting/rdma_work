@@ -80,6 +80,33 @@ class E2EMultiVFManifestTest(unittest.TestCase):
             test_source,
         )
 
+    def test_high_traffic_e2e_row_declares_all_real_dependencies(self) -> None:
+        """功能：约束高流量端到端测试在回归清单中显式声明真实依赖。
+        输入输出及副作用：读取 regression.list 和高流量测试源码，返回断言结果，
+        不创建仿真目录或修改外部 host_mem/net_packet checkout。
+        失败边界：缺少 e2e 行、依赖标签、4096 包或 16-entry window 时立即失败，
+        防止清单调用错误测试或把短流量场景冒充高流量覆盖。
+        """
+        manifest = (REPO_ROOT / "sim" / "regression.list").read_text(encoding="utf-8")
+        source = (REPO_ROOT / "tests" / "integration" /
+                  "rdma_end_to_end_high_traffic_test.sv").read_text(encoding="utf-8")
+
+        self.assertIn(
+            "e2e rdma_end_to_end_high_traffic_test dpu_common,host_mem,net_packet",
+            manifest,
+        )
+        self.assertIn("HIGH_PACKET_COUNT = 4096", source)
+        self.assertIn("HIGH_WINDOW = 16", source)
+        self.assertIn("HIGH_DRAIN_BATCH = 4", source)
+        self.assertIn("completion.completion_status != null", source)
+        self.assertIn("completion.cqe.status != null", source)
+        self.assertIn("completion_is_success(tx_completion)", source)
+        self.assertIn("completion_is_success(rx_completion)", source)
+        self.assertIn("mapping_authority_equal(tx_payload_mapping", source)
+        self.assertIn("RDMA_QUEUE_RUNTIME_CQ", source)
+        self.assertIn("before_tx_cq_pi", source)
+        self.assertIn("if (lhs == null || rhs == null)\n      return 1'b0;", source)
+
 
 if __name__ == "__main__":
     unittest.main()

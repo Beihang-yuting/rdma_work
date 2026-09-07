@@ -2,3 +2,4 @@
 core rdma_coverage_test core
 integration rdma_reset_cascade_test dpu_common
 e2e rdma_multivf_recovery_test dpu_common,host_mem,net_packet
+e2e rdma_end_to_end_high_traffic_test dpu_common,host_mem,net_packet
