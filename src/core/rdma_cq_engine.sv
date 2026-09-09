@@ -249,6 +249,28 @@ class rdma_cq_engine extends uvm_object;
     delegate.poll_cqe(cq_h, operation_timeout, result, status);
   endtask
 
+  // 功能：publish_cqe 将设备生成的 CQE 透明委托给共享 queue-data engine，
+  //   使 facade 与直接 delegate 保持同一 authority、backing 和 recovery 语义。
+  // 输入/输出及副作用：cq_h、model 为输入，result/status 为输出；facade 不 clone
+  //   result/image、不写 backing、不保存 runtime，仅转发 delegate 的输出对象。
+  // 失败边界：未 configure 或 delegate 为空返回 INVALID_STATE 且 result 为 null；
+  //   其余 route、polarity、full、编码和 recovery 拒绝由 delegate 原样传播。
+  task publish_cqe(
+    rdma_handle cq_h,
+    rdma_hw_cqe_model model,
+    output rdma_queue_device_publish_result result,
+    output rdma_status status
+  );
+    result = null;
+    status = null;
+    if (!configured || delegate == null) begin
+      status = rdma_status::make(RDMA_SC_INVALID_STATE,
+                                 "CQ facade is not configured");
+      return;
+    end
+    delegate.publish_cqe(cq_h, model, result, status);
+  endtask
+
   // 功能：请求共享 queue-data engine 对 CQ ring 做 quiesce、重建和原子切换。
   // 输入输出及副作用：cq_h/new_depth/new_cqe_bytes 为输入；成功时更新共享 attachment geometry。
   // 失败边界：facade 未配置或 delegate 拒绝 quiesce/分配/激活时返回错误且旧 ring 保持有效。

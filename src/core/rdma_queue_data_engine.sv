@@ -1770,6 +1770,328 @@ class rdma_queue_data_engine extends uvm_object;
     write_commit_device_entry(attachment, reservation, image, result, status);
   endtask
 
+  // 功能：publish_ceqe 在 CEQ backing 发布一个已经由 CQ producer 提交的通知，
+  //   使 CEQ poll 只负责 route CQ 而不会替 CQ 生成或消费 completion。
+  // 输入/输出及副作用：ceq_h、model 为只读输入，result/status 为输出；成功时写入
+  //   16B CEQ ring 并推进 CEQ producer，不修改 CQ cursor、model 或 WQE ledger。
+  // 失败边界：CEQ/CQ/QP authority、generation、已提交 PI、16 位 PI、polarity、
+  //   full ring 或 codec 失败时 result 保持 null；预写失败取消 reservation，写后失败
+  //   保留 pending/recovery evidence，不能改变 backing、cursor 或 committed occupancy。
+  task publish_ceqe(
+    rdma_handle ceq_h,
+    rdma_hw_ceqe_model model,
+    output rdma_queue_device_publish_result result,
+    output rdma_status status
+  );
+    rdma_queue_data_attachment attachment;
+    rdma_queue_data_attachment cq_attachment;
+    rdma_queue_data_qp_link link;
+    rdma_queue_cursor_snapshot reservation;
+    rdma_handle routed_cq_h;
+    rdma_codec_key key;
+    rdma_codec_base base_codec;
+    rdma_hw_ceqe_codec ceqe_codec;
+    rdma_hw_image image;
+    rdma_status original_status;
+    int unsigned producer_index;
+    int unsigned consumer_index;
+    bit producer_wrap;
+    bit consumer_wrap;
+    bit expected_polarity;
+
+    result = null;
+    status = null;
+    attachment = null;
+    cq_attachment = null;
+    link = null;
+    reservation = null;
+    routed_cq_h = null;
+    image = null;
+    producer_index = 0;
+    consumer_index = 0;
+    producer_wrap = 1'b0;
+    consumer_wrap = 1'b0;
+
+    status = ensure_handle(ceq_h, RDMA_RESOURCE_CEQ);
+    if (status == null || !status.ok()) begin
+      if (status == null)
+        status = bad("CEQE handle validation returned null status",
+                     RDMA_SC_INVALID_STATE);
+      return;
+    end
+    status = lookup_attachment(ceq_h, RDMA_QUEUE_RUNTIME_CEQ, attachment);
+    if (status == null || !status.ok()) begin
+      status = status == null ? bad("CEQE attachment lookup returned null status",
+                                    RDMA_SC_INVALID_STATE) : status;
+      return;
+    end
+    status = validate_publish_route_epoch(attachment);
+    if (status == null || !status.ok()) begin
+      status = status == null ? bad("CEQE route validation returned null status",
+                                    RDMA_SC_INVALID_STATE) : status;
+      return;
+    end
+    if (model == null || model.cq_h == null) begin
+      status = bad("CEQE model CQ authority is incomplete");
+      return;
+    end
+    status = model.validate();
+    if (status == null || !status.ok()) begin
+      status = status == null ? bad("CEQE model validation returned null status",
+                                    RDMA_SC_INVALID_STATE) : status;
+      return;
+    end
+    if (binding == null || model.cq_h.function_uid != binding.function_uid ||
+        model.cq_h.generation != binding.generation) begin
+      status = bad("CEQE CQ Function/generation authority is stale",
+                   model.cq_h != null && binding != null &&
+                   model.cq_h.generation != binding.generation ?
+                   RDMA_SC_STALE_GENERATION : RDMA_SC_INVALID_ARGUMENT);
+      return;
+    end
+    status = find_cq_handle_for_local_id(model.cqn, routed_cq_h);
+    if (status == null || !status.ok()) begin
+      status = status == null ? bad("CEQE CQ route lookup returned null status",
+                                    RDMA_SC_INVALID_STATE) : status;
+      return;
+    end
+    if (routed_cq_h == null || !routed_cq_h.same_instance(model.cq_h)) begin
+      status = bad("CEQE CQ authority does not match attached route",
+                   RDMA_SC_INVALID_STATE);
+      return;
+    end
+    status = lookup_attachment(routed_cq_h, RDMA_QUEUE_RUNTIME_CQ,
+                               cq_attachment);
+    if (status == null || !status.ok()) begin
+      status = status == null ? bad("CEQE routed CQ attachment is null",
+                                    RDMA_SC_INVALID_STATE) : status;
+      return;
+    end
+    status = validate_publish_route_epoch(cq_attachment);
+    if (status == null || !status.ok()) begin
+      status = status == null ? bad("CEQE CQ route validation returned null status",
+                                    RDMA_SC_INVALID_STATE) : status;
+      return;
+    end
+    // 设计说明：CEQE 的核心 route authority 是 cqn/cq_h；qpn=0 表示通知不绑定
+    // 某个 QP，属于协议允许的通用 CQ 通知。只有调用方显式给出非零 qpn 时才要求
+    // 它命中当前 Function 已 attach 的唯一 QP link，不能把 0 当成隐式 QP。
+    if (model.qpn != 0) begin
+      status = find_qp_link_for_local_id(model.qpn, link);
+      if (status == null || !status.ok()) begin
+        status = status == null ? bad("CEQE QP route lookup returned null status",
+                                      RDMA_SC_INVALID_STATE) : status;
+        return;
+      end
+      if (link == null ||
+          ((link.send_cq_h == null ||
+            !link.send_cq_h.same_instance(routed_cq_h)) &&
+           (link.recv_cq_h == null ||
+            !link.recv_cq_h.same_instance(routed_cq_h)))) begin
+        status = bad("CEQE QPN is not associated with routed CQ",
+                     RDMA_SC_INVALID_STATE);
+        return;
+      end
+    end
+    status = query_runtime_cursors(routed_cq_h, RDMA_QUEUE_RUNTIME_CQ,
+                                   producer_index, producer_wrap,
+                                   consumer_index, consumer_wrap);
+    if (status == null || !status.ok()) begin
+      status = status == null ? bad("CEQE CQ cursor query returned null status",
+                                    RDMA_SC_INVALID_STATE) : status;
+      return;
+    end
+    if (producer_index > 16'hffff) begin
+      status = bad("CEQE CQ producer index cannot fit in 16 bits",
+                   RDMA_SC_INVALID_ARGUMENT);
+      return;
+    end
+    if (model.cq_pi != producer_index[15:0] ||
+        model.cq_pi_wrap != producer_wrap) begin
+      status = bad("CEQE CQ producer cursor is not committed cursor",
+                   RDMA_SC_INVALID_ARGUMENT);
+      return;
+    end
+    status = attachment.runtime.reserve_device_producer(reservation);
+    if (status == null || !status.ok()) begin
+      if (status == null)
+        status = bad("CEQE device reservation returned null status",
+                     RDMA_SC_INVALID_STATE);
+      return;
+    end
+    expected_polarity = attachment.runtime.expected_producer_polarity(
+      reservation);
+    if (model.valid !== expected_polarity) begin
+      original_status = bad("CEQE producer polarity does not match reservation");
+      finish_device_producer_cancel(attachment, reservation, null,
+                                    original_status, "CEQE polarity", status);
+      return;
+    end
+    key = '{hw_version:"rdma", image_kind:RDMA_IMAGE_CEQE,
+      object_type:"ceqe", variant:"default", opcode:8'h00};
+    status = registry.lookup(key, base_codec);
+    if (status == null || !status.ok()) begin
+      original_status = status == null ?
+        bad("CEQE codec lookup returned null status", RDMA_SC_CODEC_ERROR) : status;
+      finish_device_producer_cancel(attachment, reservation, null,
+                                    original_status, "CEQE codec lookup", status);
+      return;
+    end
+    if (!$cast(ceqe_codec, base_codec) || ceqe_codec == null) begin
+      original_status = bad("CEQE registry codec type mismatch", RDMA_SC_CODEC_ERROR);
+      finish_device_producer_cancel(attachment, reservation, null,
+                                    original_status, "CEQE codec cast", status);
+      return;
+    end
+    status = ceqe_codec.encode(model, image);
+    if (status == null || !status.ok() || image == null ||
+        image.length != 16 || image.bytes.size() != 16) begin
+      original_status = status == null ?
+        bad("CEQE encode returned null status", RDMA_SC_CODEC_ERROR) :
+        (!status.ok() ? status : bad("CEQE codec did not return fixed 16B image",
+                                     RDMA_SC_CODEC_ERROR));
+      finish_device_producer_cancel(attachment, reservation, null,
+                                    original_status, "CEQE encode", status);
+      return;
+    end
+    write_commit_device_entry(attachment, reservation, image, result, status);
+  endtask
+
+  // 功能：publish_aeqe 在 AEQ backing 发布指向已 attached QP 的异常事件，供
+  //   AEQ poll 解码并以同一 target identity 交付给上层。
+  // 输入/输出及副作用：aeq_h、model 为只读输入，result/status 为输出；成功写入
+  //   固定 16B AEQ ring 并推进 producer，不取得 target_h、QP 或 image 所有权。
+  // 失败边界：AEQ/QP authority、零 QPN、generation、route、polarity、full 或
+  //   codec 失败时 result 为空且不改 committed state；reservation 后失败遵循共享
+  //   cancel/recovery 事务，绝不留下可见的半条 AEQE。
+  task publish_aeqe(
+    rdma_handle aeq_h,
+    rdma_hw_aeqe_model model,
+    output rdma_queue_device_publish_result result,
+    output rdma_status status
+  );
+    rdma_queue_data_attachment attachment;
+    rdma_queue_data_qp_link link;
+    rdma_queue_cursor_snapshot reservation;
+    rdma_codec_key key;
+    rdma_codec_base base_codec;
+    rdma_hw_aeqe_codec aeqe_codec;
+    rdma_hw_image image;
+    rdma_status original_status;
+    bit expected_polarity;
+
+    result = null;
+    status = null;
+    attachment = null;
+    link = null;
+    reservation = null;
+    image = null;
+    status = ensure_handle(aeq_h, RDMA_RESOURCE_AEQ);
+    if (status == null || !status.ok()) begin
+      if (status == null)
+        status = bad("AEQE handle validation returned null status",
+                     RDMA_SC_INVALID_STATE);
+      return;
+    end
+    status = lookup_attachment(aeq_h, RDMA_QUEUE_RUNTIME_AEQ, attachment);
+    if (status == null || !status.ok()) begin
+      status = status == null ? bad("AEQE attachment lookup returned null status",
+                                    RDMA_SC_INVALID_STATE) : status;
+      return;
+    end
+    status = validate_publish_route_epoch(attachment);
+    if (status == null || !status.ok()) begin
+      status = status == null ? bad("AEQE route validation returned null status",
+                                    RDMA_SC_INVALID_STATE) : status;
+      return;
+    end
+    if (model == null || model.target_h == null || model.qpn == 0) begin
+      status = bad("AEQE model target/QPN authority is incomplete",
+                   RDMA_SC_INVALID_ARGUMENT);
+      return;
+    end
+    status = model.validate();
+    if (status == null || !status.ok()) begin
+      status = status == null ? bad("AEQE model validation returned null status",
+                                    RDMA_SC_INVALID_STATE) : status;
+      return;
+    end
+    if (model.target_h.kind != RDMA_RESOURCE_QP) begin
+      status = bad("AEQE target is not a QP", RDMA_SC_INVALID_ARGUMENT);
+      return;
+    end
+    if (binding == null) begin
+      status = bad("AEQE Function binding is unavailable",
+                   RDMA_SC_INVALID_STATE);
+      return;
+    end
+    if (model.target_h.function_uid != binding.function_uid) begin
+      status = bad("AEQE target Function UID does not match AEQ attachment",
+                   RDMA_SC_INVALID_ARGUMENT);
+      return;
+    end
+    if (model.target_h.generation != binding.generation) begin
+      status = bad("AEQE target generation is stale",
+                   RDMA_SC_STALE_GENERATION);
+      return;
+    end
+    status = find_qp_link_for_local_id(model.qpn, link);
+    if (status == null || !status.ok()) begin
+      status = status == null ? bad("AEQE QP route lookup returned null status",
+                                    RDMA_SC_INVALID_STATE) : status;
+      return;
+    end
+    if (link == null || link.qp_h == null ||
+        !link.qp_h.same_instance(model.target_h)) begin
+      status = bad("AEQE target authority does not match QPN route",
+                   RDMA_SC_INVALID_STATE);
+      return;
+    end
+    status = attachment.runtime.reserve_device_producer(reservation);
+    if (status == null || !status.ok()) begin
+      if (status == null)
+        status = bad("AEQE device reservation returned null status",
+                     RDMA_SC_INVALID_STATE);
+      return;
+    end
+    expected_polarity = attachment.runtime.expected_producer_polarity(
+      reservation);
+    if (model.valid !== expected_polarity) begin
+      original_status = bad("AEQE producer polarity does not match reservation");
+      finish_device_producer_cancel(attachment, reservation, null,
+                                    original_status, "AEQE polarity", status);
+      return;
+    end
+    key = '{hw_version:"rdma", image_kind:RDMA_IMAGE_AEQE,
+      object_type:"aeqe", variant:"default", opcode:8'h00};
+    status = registry.lookup(key, base_codec);
+    if (status == null || !status.ok()) begin
+      original_status = status == null ?
+        bad("AEQE codec lookup returned null status", RDMA_SC_CODEC_ERROR) : status;
+      finish_device_producer_cancel(attachment, reservation, null,
+                                    original_status, "AEQE codec lookup", status);
+      return;
+    end
+    if (!$cast(aeqe_codec, base_codec) || aeqe_codec == null) begin
+      original_status = bad("AEQE registry codec type mismatch", RDMA_SC_CODEC_ERROR);
+      finish_device_producer_cancel(attachment, reservation, null,
+                                    original_status, "AEQE codec cast", status);
+      return;
+    end
+    status = aeqe_codec.encode(model, image);
+    if (status == null || !status.ok() || image == null ||
+        image.length != 16 || image.bytes.size() != 16) begin
+      original_status = status == null ?
+        bad("AEQE encode returned null status", RDMA_SC_CODEC_ERROR) :
+        (!status.ok() ? status : bad("AEQE codec did not return fixed 16B image",
+                                     RDMA_SC_CODEC_ERROR));
+      finish_device_producer_cancel(attachment, reservation, null,
+                                    original_status, "AEQE encode", status);
+      return;
+    end
+    write_commit_device_entry(attachment, reservation, image, result, status);
+  endtask
+
   // 功能：has_pending_cq_resize 查询指定 CQ 是否存在已发布但尚未完成的旧 backing 清理。
   // 输入输出及副作用：cq_h 为输入；函数只读取 engine recovery 表，不改变 runtime、manager 或 Host-memory。
   // 失败边界：空句柄、未配置或不存在记录均返回 0；调用方不得把 0 当作“CQ 一定可 resize”之外的证据。
@@ -2996,6 +3318,26 @@ class rdma_queue_data_engine extends uvm_object;
           return bad("CQE QPN routes to multiple attached QPs",
                      RDMA_SC_INVALID_STATE);
         link = candidate;
+      end
+    end
+    // 设计说明：resource manager 的 QP local ID 可宽于 CQE 的 18-bit qpn。
+    // 精确 route 不存在时才识别低位投影相同的超宽 authority，让调用方在 encode
+    // 前以完整 local_qp_id 返回 width 错误；绝不把该投影当作可发布的合法 QPN。
+    if (link == null) begin
+      foreach (qp_links[key]) begin
+        candidate = qp_links[key];
+        if (candidate == null || candidate.local_qp_id <= 18'h3ffff ||
+            candidate.local_qp_id[17:0] != qpn)
+          continue;
+        if ((!rq_cqe && candidate.send_cq_h != null &&
+             candidate.send_cq_h.same_instance(cq_h)) ||
+            (rq_cqe && candidate.recv_cq_h != null &&
+             candidate.recv_cq_h.same_instance(cq_h))) begin
+          if (link != null)
+            return bad("CQE projected QPN routes to multiple wide QPs",
+                       RDMA_SC_INVALID_STATE);
+          link = candidate;
+        end
       end
     end
     if (link == null)

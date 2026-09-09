@@ -1,6 +1,6 @@
 // 目录：测试层 unit/rdma_queue_data_engine_device_publish_test.sv。
-// 职责：验证 Task 5 的 CQE device-producer publish、真实 backing 写入和 poll
-//   释放 WQE 的端到端契约。
+// 职责：验证 CQE/CEQE/AEQE device-producer publish、真实 backing 写入、route、
+//   authority/polarity/full 原子性，以及 poll 释放 WQE/事件的端到端契约。
 // 依赖：依赖 rdma_queue_data_engine_fixture、mock Host-memory、CQE codec 与 UVM。
 // 所有权与生命周期：测试只拥有本地 fixture；queue、mapping、runtime 和 Host-memory
 //   都由 fixture 或其生命周期执行器管理，测试仅读取其已发布快照。
@@ -104,6 +104,75 @@ class rdma_device_publish_recovery_fault_engine extends rdma_queue_data_engine;
   endfunction
 endclass
 
+// 设计说明：CQE 的 18-bit qpn 不能承载 resource manager 合法的 21-bit QP
+// local ID。测试 manager 只把本 fixture 的下一 QP authority 置于首个超宽值，
+// 让生产 publish 在 encode 前验证完整 int unsigned，而不截断 packed model 字段。
+class rdma_device_publish_width_manager extends rdma_resource_manager;
+  `uvm_object_utils(rdma_device_publish_width_manager)
+
+  // 功能：构造 width manager，并把 QP local-ID 分配起点设为 18'h4_0000。
+  // 输入/输出及副作用：name 为输入；只初始化本测试对象的 protected 分配账本，
+  //   不修改全局 binding、外部 manager 或已分配资源。
+  // 失败/边界：该对象只用于最后一个独立 fixture；超过 manager 21-bit 上限仍由
+  //   生产分配器拒绝，不能作为绕过 lifecycle/authority 校验的 seam。
+  function new(string name = "rdma_device_publish_width_manager");
+    super.new(name);
+    next_local_id[RDMA_RESOURCE_QP] = 32'h0004_0000;
+  endfunction
+endclass
+
+// 设计说明：CEQE width 负例需要一个 producer_index=65536 的真实 runtime；逐条
+// 发布 65536 次会引入无关 WQE/backing 负担。本 test-only 子类只在已 attach CQ 上
+// 替换 runtime 快照，不为 production 增加 seam，publish 仍走完整公开校验路径。
+class rdma_device_publish_width_runtime_engine extends rdma_queue_data_engine;
+  `uvm_object_utils(rdma_device_publish_width_runtime_engine)
+
+  // 功能：构造 width runtime engine，保持所有生产依赖未配置的默认状态。
+  // 输入/输出及副作用：name 为输入；只建立本地 engine，不修改 factory 或 queue。
+  // 失败/边界：调用 install 前仍须走 fixture configure/attach；未配置公开 API 按基类拒绝。
+  function new(string name = "rdma_device_publish_width_runtime_engine");
+    super.new(name);
+  endfunction
+
+  // 功能：install_wide_cq_runtime 为已 attach CQ 安装 depth=131072、PI=65536 的
+  //   device runtime，保留同一 handle 与当前 Function route/epoch。
+  // 输入/输出及副作用：cq_h 为输入；成功时只替换本测试 engine 的 CQ runtime，
+  //   不修改 manager resource、queue backing 或调用者 model。
+  // 失败/边界：attachment/binding/identity/runtime 配置或激活失败时返回原错误；
+  //   不发布半配置 runtime，且该入口只供 width 负例、不得执行 backing 写入。
+  function rdma_status install_wide_cq_runtime(rdma_handle cq_h);
+    rdma_queue_runtime runtime;
+    rdma_function_identity identity;
+    rdma_status status;
+    string key;
+
+    if (cq_h == null)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "wide CQ runtime handle is null");
+    key = attachment_key(cq_h, RDMA_QUEUE_RUNTIME_CQ);
+    if (key == "" || !attachments.exists(key) || attachments[key] == null)
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "wide CQ runtime attachment is missing");
+    runtime = rdma_queue_runtime::type_id::create("wide_cq_runtime");
+    if (runtime == null)
+      return rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED,
+                               "wide CQ runtime allocation failed");
+    status = runtime.configure(cq_h, RDMA_QUEUE_RUNTIME_CQ,
+                               131072, 65536, 1'b0, 0, 1'b0, 1'b0);
+    if (status == null || !status.ok()) return status;
+    identity = binding == null ? null : binding.function_identity_snapshot();
+    if (identity == null)
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "wide CQ runtime Function identity is missing");
+    status = runtime.set_route_epoch(identity.route_key(), identity.reset_epoch);
+    if (status == null || !status.ok()) return status;
+    status = runtime.activate();
+    if (status == null || !status.ok()) return status;
+    attachments[key].runtime = runtime;
+    return rdma_status::success();
+  endfunction
+endclass
+
 class rdma_queue_data_engine_device_publish_test extends uvm_test;
   `uvm_component_utils(rdma_queue_data_engine_device_publish_test)
 
@@ -140,6 +209,19 @@ class rdma_queue_data_engine_device_publish_test extends uvm_test;
     candidate.generation = source.generation;
     copy = candidate;
     return rdma_status::success();
+  endfunction
+
+  // 功能：clone_test_handle_value 为 lifecycle request 复制 detached handle 值，
+  //   使 request 不借用 fixture 资源对象的可变 handle 实例。
+  // 输入/输出及副作用：source 为输入、copy 为输出；成功时分配并逐字段复制 kind、
+  //   Function UID、object ID、generation，不修改 source 或 manager。
+  // 失败边界：source 为空或 factory 分配失败返回非成功，copy 保持 null；调用方
+  //   必须停止 create/attach，不能用 null 或 dependency-only 资源替代。
+  function automatic rdma_status clone_test_handle_value(
+    rdma_handle source,
+    output rdma_handle copy
+  );
+    return clone_test_handle(source, copy);
   endfunction
 
   // 功能：make_cqe_for_outstanding_send 仅利用 post_send 已发布的 slot/wr_id
@@ -216,6 +298,1295 @@ class rdma_queue_data_engine_device_publish_test extends uvm_test;
       return;
     end
     queue_data.publish_cqe(cq_h, model, result, status);
+  endtask
+
+  // 功能：read_queue_backing_slot 从 lifecycle queue plan 的指定 ring 读取一个
+  //   完整槽位，供拒绝前后逐字节比较真实 backing 原子性。
+  // 输入/输出及副作用：fixture、queue、role、index、size 为输入，data 为输出；
+  //   只经 mock Host-memory read 观察 bytes，不推进 runtime cursor 或取得 mapping 所有权。
+  // 失败边界：任一对象/size/role/mapping 缺失或读越界时返回错误且 data 为空；
+  //   不以 Host-memory call 数量替代 backing 内容证据。
+  function automatic rdma_status read_queue_backing_slot(
+    rdma_queue_data_engine_fixture fixture,
+    rdma_queue_resource queue,
+    rdma_queue_backing_role_e role,
+    int unsigned index,
+    int unsigned size,
+    output byte data[]
+  );
+    rdma_queue_backing_ref backing;
+
+    data = new[0];
+    backing = null;
+    if (fixture == null || fixture.mem == null || queue == null ||
+        queue.queue_plan == null || size == 0)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "queue backing observation input is incomplete");
+    foreach (queue.queue_plan.refs[i])
+      if (queue.queue_plan.refs[i] != null &&
+          queue.queue_plan.refs[i].role == role)
+        backing = queue.queue_plan.refs[i];
+    if (backing == null || backing.mapping == null)
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "queue backing observation role is missing");
+    return fixture.mem.read(backing.mapping,
+      backing.mapping_offset + longint'(index) * longint'(size), size, data);
+  endfunction
+
+  // 功能：check_rejected_publish_atomic 验证一次 CQ/CEQ/AEQ publish 确定性拒绝
+  //   没有改变 backing、PI/CI、used、pending、reservation，且 result 保持 null。
+  // 输入/输出及副作用：label、fixture、queue/kind/role/entry size、调用前快照、
+  //   result/status 与期望错误码为输入；只调用公开 query/read API 并报告差异。
+  // 失败边界：任一查询失败、status 为空/错误码不符、bytes/cursor/occupancy 变化、
+  //   pending/reservation 出现或 result 非空均报告 UVM_ERROR；helper 不修复状态。
+  task automatic check_rejected_publish_atomic(
+    string label,
+    rdma_queue_data_engine_fixture fixture,
+    rdma_queue_resource queue,
+    rdma_queue_runtime_kind_e kind,
+    rdma_queue_backing_role_e role,
+    int unsigned entry_size,
+    byte before_bytes[],
+    int unsigned before_pi,
+    bit before_pi_wrap,
+    int unsigned before_ci,
+    bit before_ci_wrap,
+    int unsigned before_used,
+    rdma_queue_device_publish_result result,
+    rdma_status publish_status,
+    rdma_status_code_e expected_code
+  );
+    byte after_bytes[];
+    rdma_queue_pending_operation pending;
+    rdma_queue_cursor_snapshot reservation;
+    rdma_status status;
+    int unsigned after_pi;
+    int unsigned after_ci;
+    int unsigned after_used;
+    bit after_pi_wrap;
+    bit after_ci_wrap;
+    bit has_pending;
+    bit reservation_valid;
+
+    if (publish_status == null || publish_status.code != expected_code ||
+        result != null)
+      `uvm_error(label, publish_status == null ? "publish returned null status" :
+                 $sformatf("unexpected rejection code=%0d message=%s result=%s",
+                           publish_status.code, publish_status.message,
+                           result == null ? "null" : "non-null"))
+    status = fixture.engine.query_runtime_cursors(
+      queue.handle, kind, after_pi, after_pi_wrap, after_ci, after_ci_wrap);
+    if (status == null || !status.ok() || after_pi != before_pi ||
+        after_pi_wrap != before_pi_wrap || after_ci != before_ci ||
+        after_ci_wrap != before_ci_wrap)
+      `uvm_error({label, "_CURSOR"}, "rejected publish changed PI/CI")
+    status = fixture.engine.query_runtime_occupancy(
+      queue.handle, kind, after_used, has_pending);
+    if (status == null || !status.ok() || after_used != before_used || has_pending)
+      `uvm_error({label, "_USED"}, "rejected publish changed used/pending")
+    pending = null;
+    status = fixture.engine.query_runtime_pending(queue.handle, kind, pending);
+    if (status == null || status.code != RDMA_SC_INVALID_STATE || pending != null)
+      `uvm_error({label, "_PENDING"}, "rejected publish retained pending evidence")
+    reservation_valid = 1'b1;
+    reservation = null;
+    status = fixture.engine.query_runtime_device_reservation(
+      queue.handle, kind, reservation_valid, reservation);
+    if (status == null || !status.ok() || reservation_valid || reservation != null)
+      `uvm_error({label, "_RESERVATION"}, "rejected publish retained reservation")
+    status = read_queue_backing_slot(fixture, queue, role, before_pi,
+                                     entry_size, after_bytes);
+    if (status == null || !status.ok() || after_bytes != before_bytes)
+      `uvm_error({label, "_BACKING"}, "rejected publish changed backing bytes")
+  endtask
+
+  // 功能：capture_publish_queue_state 在负例调用前取得 queue 的 backing、PI/CI、
+  //   used 与 pending 基线，确保每个拒绝断言都有独立原子性证据。
+  // 输入/输出及副作用：fixture、queue/kind/role/entry size 为输入，其余为输出；
+  //   只读公开 runtime 与 Host-memory，不创建 reservation 或推进 cursor。
+  // 失败边界：任一 query/read 失败或队列已有 pending 时 status 非成功；所有数值和
+  //   bytes 先归一化为安全默认值，调用方不得在失败后继续 publish。
+  task automatic capture_publish_queue_state(
+    rdma_queue_data_engine_fixture fixture,
+    rdma_queue_resource queue,
+    rdma_queue_runtime_kind_e kind,
+    rdma_queue_backing_role_e role,
+    int unsigned entry_size,
+    output byte bytes[],
+    output int unsigned pi,
+    output bit pi_wrap,
+    output int unsigned ci,
+    output bit ci_wrap,
+    output int unsigned used,
+    output rdma_status status
+  );
+    bit pending;
+
+    bytes = new[0];
+    pi = 0;
+    pi_wrap = 1'b0;
+    ci = 0;
+    ci_wrap = 1'b0;
+    used = 0;
+    status = fixture.engine.query_runtime_cursors(
+      queue.handle, kind, pi, pi_wrap, ci, ci_wrap);
+    if (status == null || !status.ok()) return;
+    status = fixture.engine.query_runtime_occupancy(
+      queue.handle, kind, used, pending);
+    if (status == null || !status.ok() || pending) begin
+      if (status != null && status.ok())
+        status = rdma_status::make(RDMA_SC_INVALID_STATE,
+                                   "queue state capture found pending operation");
+      return;
+    end
+    status = read_queue_backing_slot(fixture, queue, role, pi,
+                                     entry_size, bytes);
+  endtask
+
+  // 功能：check_cqe_authority_rejections 逐项覆盖 foreign QPN、错误 QP identity/
+  //   Function、stale generation、错误 rq_cqe、非 outstanding WQE 与 polarity。
+  // 输入/输出及副作用：无显式输入；每个 case 使用同一真实 posted SQ WQE 和独立
+  //   调用前快照，调用公开 publish_cqe 后验证完整拒绝原子性。
+  // 失败边界：fixture/post/model/snapshot 失败会报告并停止；任一拒绝错误码、result、
+  //   backing、PI/CI、used/pending/reservation 变化由公共原子性 helper 报告。
+  task automatic check_cqe_authority_rejections();
+    rdma_queue_data_engine_fixture fixture;
+    rdma_queue_post_result posted;
+    rdma_hw_cqe_model cqe;
+    rdma_queue_device_publish_result published;
+    rdma_status status;
+    rdma_status model_status;
+    byte before_bytes[];
+    int unsigned before_pi;
+    int unsigned before_ci;
+    int unsigned before_used;
+    bit before_pi_wrap;
+    bit before_ci_wrap;
+    longint unsigned saved_function_uid;
+    int unsigned saved_object_id;
+    int unsigned saved_generation;
+    bit saved_polarity;
+
+    fixture = rdma_queue_data_engine_fixture::type_id::create(
+      "cqe_authority_fixture");
+    fixture.setup(status);
+    if (status == null || !status.ok()) begin
+      `uvm_error("CQE_AUTH_SETUP", "CQE authority fixture setup failed")
+      return;
+    end
+    fixture.engine.post_send(fixture.make_send(64'ha001), posted, status);
+    if (status == null || !status.ok() || posted == null) begin
+      `uvm_error("CQE_AUTH_POST", "CQE authority post failed")
+      return;
+    end
+    status = fixture.engine.query_runtime_producer_polarity(
+      fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, saved_polarity);
+    cqe = make_cqe_for_outstanding_send(fixture.qp.handle,
+      fixture.qp.local_qp_id, posted, saved_polarity, model_status);
+    capture_publish_queue_state(fixture, fixture.cq, RDMA_QUEUE_RUNTIME_CQ,
+      RDMA_QUEUE_ROLE_CQ_RING, fixture.cq.cqe_size_bytes, before_bytes,
+      before_pi, before_pi_wrap, before_ci, before_ci_wrap, before_used, status);
+    if (status == null || !status.ok() || model_status == null ||
+        !model_status.ok() || cqe == null) begin
+      `uvm_error("CQE_AUTH_MODEL", "CQE authority baseline is incomplete")
+      return;
+    end
+
+    cqe.qpn = fixture.qp.local_qp_id + 1;
+    publish_cqe_for_test(fixture.engine, fixture.cq.handle, cqe,
+                         published, status);
+    check_rejected_publish_atomic("CQE_FOREIGN_QPN", fixture, fixture.cq,
+      RDMA_QUEUE_RUNTIME_CQ, RDMA_QUEUE_ROLE_CQ_RING,
+      fixture.cq.cqe_size_bytes, before_bytes, before_pi, before_pi_wrap,
+      before_ci, before_ci_wrap, before_used, published, status,
+      RDMA_SC_INVALID_STATE);
+    cqe.qpn = fixture.qp.local_qp_id;
+
+    saved_object_id = cqe.qp_h.object_id;
+    cqe.qp_h.object_id = saved_object_id + 1;
+    publish_cqe_for_test(fixture.engine, fixture.cq.handle, cqe,
+                         published, status);
+    check_rejected_publish_atomic("CQE_WRONG_QP_HANDLE", fixture, fixture.cq,
+      RDMA_QUEUE_RUNTIME_CQ, RDMA_QUEUE_ROLE_CQ_RING,
+      fixture.cq.cqe_size_bytes, before_bytes, before_pi, before_pi_wrap,
+      before_ci, before_ci_wrap, before_used, published, status,
+      RDMA_SC_INVALID_STATE);
+    cqe.qp_h.object_id = saved_object_id;
+
+    saved_function_uid = cqe.qp_h.function_uid;
+    cqe.qp_h.function_uid = saved_function_uid + 1;
+    publish_cqe_for_test(fixture.engine, fixture.cq.handle, cqe,
+                         published, status);
+    check_rejected_publish_atomic("CQE_WRONG_FUNCTION", fixture, fixture.cq,
+      RDMA_QUEUE_RUNTIME_CQ, RDMA_QUEUE_ROLE_CQ_RING,
+      fixture.cq.cqe_size_bytes, before_bytes, before_pi, before_pi_wrap,
+      before_ci, before_ci_wrap, before_used, published, status,
+      RDMA_SC_INVALID_ARGUMENT);
+    cqe.qp_h.function_uid = saved_function_uid;
+
+    saved_generation = cqe.qp_h.generation;
+    cqe.qp_h.generation = saved_generation + 1;
+    publish_cqe_for_test(fixture.engine, fixture.cq.handle, cqe,
+                         published, status);
+    check_rejected_publish_atomic("CQE_STALE_GENERATION", fixture, fixture.cq,
+      RDMA_QUEUE_RUNTIME_CQ, RDMA_QUEUE_ROLE_CQ_RING,
+      fixture.cq.cqe_size_bytes, before_bytes, before_pi, before_pi_wrap,
+      before_ci, before_ci_wrap, before_used, published, status,
+      RDMA_SC_STALE_GENERATION);
+    cqe.qp_h.generation = saved_generation;
+
+    cqe.rq_cqe = 1'b1;
+    publish_cqe_for_test(fixture.engine, fixture.cq.handle, cqe,
+                         published, status);
+    check_rejected_publish_atomic("CQE_WRONG_RQ_CQE", fixture, fixture.cq,
+      RDMA_QUEUE_RUNTIME_CQ, RDMA_QUEUE_ROLE_CQ_RING,
+      fixture.cq.cqe_size_bytes, before_bytes, before_pi, before_pi_wrap,
+      before_ci, before_ci_wrap, before_used, published, status,
+      RDMA_SC_INVALID_STATE);
+    cqe.rq_cqe = 1'b0;
+
+    cqe.wqe_index = posted.index + 1;
+    publish_cqe_for_test(fixture.engine, fixture.cq.handle, cqe,
+                         published, status);
+    check_rejected_publish_atomic("CQE_WQE_LEDGER", fixture, fixture.cq,
+      RDMA_QUEUE_RUNTIME_CQ, RDMA_QUEUE_ROLE_CQ_RING,
+      fixture.cq.cqe_size_bytes, before_bytes, before_pi, before_pi_wrap,
+      before_ci, before_ci_wrap, before_used, published, status,
+      RDMA_SC_INVALID_STATE);
+    cqe.wqe_index = posted.index;
+
+    cqe.polarity = ~saved_polarity;
+    publish_cqe_for_test(fixture.engine, fixture.cq.handle, cqe,
+                         published, status);
+    check_rejected_publish_atomic("CQE_POLARITY", fixture, fixture.cq,
+      RDMA_QUEUE_RUNTIME_CQ, RDMA_QUEUE_ROLE_CQ_RING,
+      fixture.cq.cqe_size_bytes, before_bytes, before_pi, before_pi_wrap,
+      before_ci, before_ci_wrap, before_used, published, status,
+      RDMA_SC_INVALID_ARGUMENT);
+  endtask
+
+  // 功能：check_cqe_full_atomic 用十六个真实 outstanding SQ WQE 填满 CQ，验证
+  //   下一次合法 CQE 因 credit exhausted 返回 QUEUE_FULL 且保持事务原子性。
+  // 输入/输出及副作用：无显式输入；成功场景先发布完整 CQ ring，再检查 full
+  //   拒绝的 backing/PI/CI/used/pending/result，最后 poll 全部 CQE 释放 ledger。
+  // 失败边界：任一 post/publish/snapshot/poll 失败报告 UVM_ERROR；full 拒绝不得
+  //   占用 reservation 或改变已满 ring，cleanup poll 必须恰好消费 depth 条。
+  task automatic check_cqe_full_atomic();
+    rdma_queue_data_engine_fixture fixture;
+    rdma_queue_post_result posted[$];
+    rdma_hw_cqe_model cqe;
+    rdma_hw_cqe_model retry_cqe;
+    rdma_queue_device_publish_result published;
+    rdma_queue_completion_result completion;
+    rdma_status status;
+    rdma_status model_status;
+    byte before_bytes[];
+    int unsigned before_pi;
+    int unsigned before_ci;
+    int unsigned before_used;
+    int unsigned fill_start_pi;
+    int unsigned fill_start_ci;
+    bit before_pi_wrap;
+    bit before_ci_wrap;
+    bit fill_start_pi_wrap;
+    bit fill_start_ci_wrap;
+    bit polarity;
+
+    fixture = rdma_queue_data_engine_fixture::type_id::create("cqe_full_fixture");
+    fixture.setup(status);
+    if (status == null || !status.ok()) begin
+      `uvm_error("CQE_FULL_SETUP", "CQE full fixture setup failed")
+      return;
+    end
+    status = fixture.engine.query_runtime_cursors(
+      fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, fill_start_pi,
+      fill_start_pi_wrap, fill_start_ci, fill_start_ci_wrap);
+    if (status == null || !status.ok()) begin
+      `uvm_error("CQE_FULL_START", "CQE initial cursor query failed")
+      return;
+    end
+    for (int unsigned i = 0; i < fixture.cq.depth; i++) begin
+      rdma_queue_post_result one_post;
+      fixture.engine.post_send(fixture.make_send(64'hb000 + i), one_post, status);
+      if (status == null || !status.ok() || one_post == null) begin
+        `uvm_error("CQE_FULL_POST", $sformatf("post %0d failed", i))
+        return;
+      end
+      posted.push_back(one_post);
+      status = fixture.engine.query_runtime_producer_polarity(
+        fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, polarity);
+      cqe = make_cqe_for_outstanding_send(fixture.qp.handle,
+        fixture.qp.local_qp_id, one_post, polarity, model_status);
+      if (status == null || !status.ok() || model_status == null ||
+          !model_status.ok() || cqe == null) begin
+        `uvm_error("CQE_FULL_MODEL", $sformatf("model %0d failed", i))
+        return;
+      end
+      publish_cqe_for_test(fixture.engine, fixture.cq.handle, cqe,
+                           published, status);
+      if (status == null || !status.ok() || published == null) begin
+        `uvm_error("CQE_FULL_FILL", $sformatf("publish %0d failed", i))
+        return;
+      end
+      if (i == 0 && !$cast(retry_cqe, cqe.clone())) begin
+        `uvm_error("CQE_FULL_RETRY_MODEL", "retry CQE clone failed")
+        return;
+      end
+    end
+    capture_publish_queue_state(fixture, fixture.cq, RDMA_QUEUE_RUNTIME_CQ,
+      RDMA_QUEUE_ROLE_CQ_RING, fixture.cq.cqe_size_bytes, before_bytes,
+      before_pi, before_pi_wrap, before_ci, before_ci_wrap, before_used, status);
+    if (status == null || !status.ok() || before_pi != fill_start_pi ||
+        before_pi_wrap == fill_start_pi_wrap || before_ci != fill_start_ci ||
+        before_ci_wrap != fill_start_ci_wrap || before_used != fixture.cq.depth)
+      `uvm_error("CQE_FULL_WRAP",
+                 "filling one CQ depth did not toggle only producer wrap")
+    status = fixture.engine.query_runtime_producer_polarity(
+      fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, polarity);
+    retry_cqe.polarity = polarity;
+    publish_cqe_for_test(fixture.engine, fixture.cq.handle, retry_cqe,
+                         published, status);
+    check_rejected_publish_atomic("CQE_FULL", fixture, fixture.cq,
+      RDMA_QUEUE_RUNTIME_CQ, RDMA_QUEUE_ROLE_CQ_RING,
+      fixture.cq.cqe_size_bytes, before_bytes, before_pi, before_pi_wrap,
+      before_ci, before_ci_wrap, before_used, published, status,
+      RDMA_SC_QUEUE_FULL);
+    for (int unsigned i = 0; i < fixture.cq.depth; i++) begin
+      fixture.engine.poll_cqe(fixture.cq.handle, 0, completion, status);
+      if (status == null || !status.ok() || completion == null)
+        `uvm_error("CQE_FULL_DRAIN", $sformatf("poll %0d failed", i))
+    end
+  endtask
+
+  // 功能：check_cqe_authority_width 以完整 local_qp_id=18'h4_0000 验证 CQE
+  //   producer 在 packed qpn 编码前拒绝不可表示的 QP authority。
+  // 输入/输出及副作用：无显式输入；通过 factory 创建独立 width manager fixture，
+  //   发布一个真实 SQ WQE，再用合法 packed qpn=0 调用 publish_cqe。
+  // 失败边界：fixture 未取得指定超宽 QPN、publish 非 INVALID_ARGUMENT，或 backing/
+  //   PI/CI/used/pending/result 任一变化均报告 UVM_ERROR；不修改 model 字段宽度。
+  task automatic check_cqe_authority_width();
+    rdma_queue_data_engine_fixture fixture;
+    rdma_queue_post_result posted;
+    rdma_hw_cqe_model cqe;
+    rdma_queue_device_publish_result published;
+    rdma_status status;
+    rdma_status model_status;
+    byte before_bytes[];
+    int unsigned before_pi;
+    int unsigned before_ci;
+    int unsigned before_used;
+    bit before_pi_wrap;
+    bit before_ci_wrap;
+    bit polarity;
+
+    rdma_resource_manager::type_id::set_type_override(
+      rdma_device_publish_width_manager::get_type());
+    fixture = rdma_queue_data_engine_fixture::type_id::create(
+      "cqe_width_fixture");
+    fixture.setup(status);
+    if (status == null || !status.ok() || fixture.qp == null ||
+        fixture.qp.local_qp_id != 32'h0004_0000) begin
+      `uvm_error("CQE_WIDTH_SETUP", "wide QP fixture setup failed")
+      return;
+    end
+    fixture.engine.post_send(fixture.make_send(64'hc001), posted, status);
+    if (status == null || !status.ok() || posted == null) begin
+      `uvm_error("CQE_WIDTH_POST", "wide QP WQE post failed")
+      return;
+    end
+    status = fixture.engine.query_runtime_producer_polarity(
+      fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, polarity);
+    if (status == null || !status.ok()) begin
+      `uvm_error("CQE_WIDTH_POLARITY", "wide CQ polarity query failed")
+      return;
+    end
+    // model.qpn 是合法 18-bit 0；完整超宽 authority 只保留在 attached QP link。
+    cqe = make_cqe_for_outstanding_send(fixture.qp.handle, 0, posted,
+                                         polarity, model_status);
+    capture_publish_queue_state(fixture, fixture.cq, RDMA_QUEUE_RUNTIME_CQ,
+      RDMA_QUEUE_ROLE_CQ_RING, fixture.cq.cqe_size_bytes, before_bytes,
+      before_pi, before_pi_wrap, before_ci, before_ci_wrap, before_used, status);
+    if (status == null || !status.ok() || model_status == null ||
+        !model_status.ok() || cqe == null) begin
+      `uvm_error("CQE_WIDTH_MODEL", "wide QP CQE setup failed")
+      return;
+    end
+    publish_cqe_for_test(fixture.engine, fixture.cq.handle, cqe,
+                         published, status);
+    check_rejected_publish_atomic("CQE_WIDE_QPN_AUTHORITY", fixture,
+      fixture.cq, RDMA_QUEUE_RUNTIME_CQ, RDMA_QUEUE_ROLE_CQ_RING,
+      fixture.cq.cqe_size_bytes, before_bytes, before_pi, before_pi_wrap,
+      before_ci, before_ci_wrap, before_used, published, status,
+      RDMA_SC_INVALID_ARGUMENT);
+  endtask
+
+  // 功能：check_ceqe_runtime_width 让 routed CQ committed PI=65536，验证
+  //   publish_ceqe 在把 PI 写入 16-bit cq_pi 之前由生产边界拒绝。
+  // 输入/输出及副作用：无显式输入；创建 lifecycle-owned CEQ 并 attach，CQ runtime
+  //   由 test-only engine 设为超宽，模型 cq_pi 保持合法 packed 0。
+  // 失败/边界：fixture/CEQ/runtime setup、cast 或快照失败报告错误；publish 必须返回
+  //   INVALID_ARGUMENT，且 CEQ backing/PI/CI/used/pending/result 完全不变。
+  task automatic check_ceqe_runtime_width();
+    rdma_queue_data_engine_fixture fixture;
+    rdma_device_publish_width_runtime_engine width_engine;
+    rdma_create_ceq_req request;
+    rdma_queue_resource resource;
+    rdma_control_result control_result;
+    rdma_ceq ceq;
+    rdma_hw_ceqe_model ceqe;
+    rdma_queue_device_publish_result published;
+    rdma_status status;
+    rdma_status cleanup_status;
+    byte before_bytes[];
+    int unsigned before_pi;
+    int unsigned before_ci;
+    int unsigned before_used;
+    bit before_pi_wrap;
+    bit before_ci_wrap;
+    bit polarity;
+
+    rdma_queue_data_engine::type_id::set_type_override(
+      rdma_device_publish_width_runtime_engine::get_type());
+    fixture = rdma_queue_data_engine_fixture::type_id::create(
+      "ceqe_width_fixture");
+    fixture.setup(status);
+    ceq = null;
+    if (status == null || !status.ok() ||
+        !$cast(width_engine, fixture.engine)) begin
+      `uvm_error("CEQE_WIDTH_SETUP", "width engine fixture setup failed")
+      return;
+    end
+    request = rdma_create_ceq_req::type_id::create("ceqe_width_ceq_request");
+    if (request == null) begin
+      `uvm_error("CEQE_WIDTH_REQUEST", "width CEQ request allocation failed")
+      return;
+    end
+    request.owner = fixture.binding.make_handle();
+    request.depth = 16;
+    request.vector_id = 1;
+    request.ring_backing.mode = RDMA_QUEUE_BACKING_OWNED;
+    fixture.queue_executor.create_locked(fixture.binding,
+      fixture.binding.make_handle(), request, 64'h9101, resource, control_result);
+    status = control_result == null ? null : control_result.status;
+    if (status == null || !status.ok() || resource == null ||
+        !$cast(ceq, resource)) begin
+      `uvm_error("CEQE_WIDTH_CEQ", "width CEQ create failed")
+      return;
+    end
+    status = fixture.engine.attach_ceq(ceq.handle);
+    if (status == null || !status.ok()) begin
+      `uvm_error("CEQE_WIDTH_ATTACH", "width CEQ attach failed")
+    end else begin
+      status = width_engine.install_wide_cq_runtime(fixture.cq.handle);
+      if (status == null || !status.ok())
+        `uvm_error("CEQE_WIDTH_RUNTIME", "wide CQ runtime install failed")
+      else begin
+        status = fixture.engine.query_runtime_producer_polarity(
+          ceq.handle, RDMA_QUEUE_RUNTIME_CEQ, polarity);
+        ceqe = rdma_hw_ceqe_model::type_id::create("wide_runtime_ceqe");
+        if (status == null || !status.ok() || ceqe == null) begin
+          `uvm_error("CEQE_WIDTH_MODEL", "width CEQE allocation/polarity failed")
+        end else begin
+          status = clone_test_handle(fixture.cq.handle, ceqe.cq_h);
+          if (status == null || !status.ok() || ceqe.cq_h == null) begin
+            `uvm_error("CEQE_WIDTH_HANDLE", "width CEQE CQ clone failed")
+          end else begin
+            ceqe.cqn = fixture.cq.local_cq_id;
+            ceqe.qpn = 0;
+            ceqe.cq_pi = 16'h0;
+            ceqe.cq_pi_wrap = 1'b0;
+            ceqe.valid = polarity;
+            ceqe.ecode = 0;
+            ceqe.packet_opcode = 0;
+            capture_publish_queue_state(fixture, ceq, RDMA_QUEUE_RUNTIME_CEQ,
+              RDMA_QUEUE_ROLE_CEQ_RING, 16, before_bytes, before_pi,
+              before_pi_wrap, before_ci, before_ci_wrap, before_used, status);
+            if (status == null || !status.ok()) begin
+              `uvm_error("CEQE_WIDTH_STATE", "width CEQ state capture failed")
+            end else begin
+              fixture.engine.publish_ceqe(ceq.handle, ceqe, published, status);
+              check_rejected_publish_atomic("CEQE_WIDE_PI", fixture, ceq,
+                RDMA_QUEUE_RUNTIME_CEQ, RDMA_QUEUE_ROLE_CEQ_RING, 16,
+                before_bytes, before_pi, before_pi_wrap, before_ci,
+                before_ci_wrap, before_used, published, status,
+                RDMA_SC_INVALID_ARGUMENT);
+            end
+          end
+        end
+      end
+    end
+    fixture.destroy_lifecycle_owned_queue(ceq.handle, 64'h9111, cleanup_status);
+    if (cleanup_status == null || !cleanup_status.ok())
+      `uvm_error("CEQE_WIDTH_TEARDOWN", "width CEQ teardown failed")
+  endtask
+
+  // 功能：make_ceqe_from_committed_cq 读取已提交 CQ producer cursor，构造指向
+  //   同一 CQ/QP route 的 CEQE，供真实 CEQ publish/poll 路径消费。
+  // 输入/输出及副作用：queue_data、cq_h、cqn、qpn、valid 为输入，model/status
+  //   为输出；只读取 runtime cursor 并分配 detached model/handle，不修改 backing。
+  // 失败边界：engine/CQ 为空、cursor 查询失败、PI 超过 CEQE 16 位表示范围或
+  //   factory/handle clone 失败时返回非成功，model 保持 null。
+  task automatic make_ceqe_from_committed_cq(
+    rdma_queue_data_engine queue_data,
+    rdma_handle cq_h,
+    int unsigned cqn,
+    int unsigned qpn,
+    bit valid,
+    output rdma_hw_ceqe_model model,
+    output rdma_status status
+  );
+    int unsigned producer_index;
+    int unsigned consumer_index;
+    bit producer_wrap;
+    bit consumer_wrap;
+
+    model = null;
+    status = rdma_status::success();
+    if (queue_data == null || cq_h == null) begin
+      status = rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                                 "CQ runtime query input is null");
+      return;
+    end
+    status = queue_data.query_runtime_cursors(
+      cq_h, RDMA_QUEUE_RUNTIME_CQ, producer_index, producer_wrap,
+      consumer_index, consumer_wrap);
+    if (status == null || !status.ok()) return;
+    if (producer_index > 16'hffff) begin
+      status = rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                                 "CQ producer index cannot fit in CEQE");
+      return;
+    end
+    model = rdma_hw_ceqe_model::type_id::create("test_ceqe");
+    if (model == null) begin
+      status = rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED,
+                                 "test CEQE model allocation failed");
+      return;
+    end
+    status = clone_test_handle(cq_h, model.cq_h);
+    if (status == null || !status.ok() || model.cq_h == null) begin
+      model = null;
+      if (status == null)
+        status = rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED,
+                                   "test CEQE CQ handle clone returned null status");
+      return;
+    end
+    model.cqn = cqn;
+    model.qpn = qpn;
+    model.cq_pi = producer_index & 16'hffff;
+    model.cq_pi_wrap = producer_wrap;
+    model.valid = valid;
+    model.ecode = 8'h00;
+    model.packet_opcode = 8'h00;
+    status = rdma_status::success();
+  endtask
+
+  // 功能：setup_event_publish_topology 创建并 attach 独立的 lifecycle-owned
+  //   CEQ、AEQ、CQ，以及分别属于事件 CQ 和基础 CQ 的两个真实 RC QP。
+  // 输入/输出及副作用：输出 fixture、三类 queue、event_qp、foreign_qp 与 status；
+  //   成功会在 manager/Host-memory 建立资源，并把非拥有 route 登记到 queue-data engine。
+  // 失败边界：任一 factory/create/cast/clone/attach 失败立即返回非成功 status；所有
+  //   已发布的部分资源仍经输出交给统一 cleanup，不以 dependency-only CEQ 替代。
+  task automatic setup_event_publish_topology(
+    output rdma_queue_data_engine_fixture fixture,
+    output rdma_ceq lifecycle_ceq,
+    output rdma_aeq lifecycle_aeq,
+    output rdma_cq lifecycle_cq,
+    output rdma_qp event_qp,
+    output rdma_qp foreign_qp,
+    output rdma_status status
+  );
+    rdma_create_ceq_req ceq_request;
+    rdma_create_aeq_req aeq_request;
+    rdma_create_cq_req cq_request;
+    rdma_queue_resource resource;
+    rdma_control_result control_result;
+
+    fixture = null;
+    lifecycle_ceq = null;
+    lifecycle_aeq = null;
+    lifecycle_cq = null;
+    event_qp = null;
+    foreign_qp = null;
+    status = rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "event topology setup is incomplete");
+
+    fixture = rdma_queue_data_engine_fixture::type_id::create(
+      "event_publish_fixture");
+    if (fixture == null) begin
+      status = rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED,
+                                 "event fixture allocation failed");
+      return;
+    end
+    fixture.setup(status);
+    if (status == null || !status.ok()) return;
+
+    ceq_request = rdma_create_ceq_req::type_id::create("publish_ceq_request");
+    if (ceq_request == null) begin
+      status = rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED,
+                                 "CEQ request allocation failed");
+      return;
+    end
+    ceq_request.owner = fixture.binding.make_handle();
+    ceq_request.depth = 16;
+    ceq_request.vector_id = 1;
+    ceq_request.ring_backing.mode = RDMA_QUEUE_BACKING_OWNED;
+    resource = null;
+    control_result = null;
+    fixture.queue_executor.create_locked(
+      fixture.binding, fixture.binding.make_handle(), ceq_request, 64'h9001,
+      resource, control_result);
+    status = control_result == null ?
+      rdma_status::make(RDMA_SC_INVALID_STATE, "CEQ create returned no result") :
+      control_result.status;
+    if (status == null || !status.ok() || resource == null ||
+        !$cast(lifecycle_ceq, resource)) begin
+      if (status == null || status.ok())
+        status = rdma_status::make(RDMA_SC_INVALID_STATE,
+                                   "CEQ create returned invalid resource");
+      return;
+    end
+    status = fixture.engine.attach_ceq(lifecycle_ceq.handle);
+    if (status == null || !status.ok()) return;
+
+    aeq_request = rdma_create_aeq_req::type_id::create("publish_aeq_request");
+    if (aeq_request == null) begin
+      status = rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED,
+                                 "AEQ request allocation failed");
+      return;
+    end
+    aeq_request.owner = fixture.binding.make_handle();
+    aeq_request.depth = 16;
+    aeq_request.vector_id = 2;
+    aeq_request.ring_backing.mode = RDMA_QUEUE_BACKING_OWNED;
+    resource = null;
+    control_result = null;
+    fixture.queue_executor.create_locked(
+      fixture.binding, fixture.binding.make_handle(), aeq_request, 64'h9002,
+      resource, control_result);
+    status = control_result == null ?
+      rdma_status::make(RDMA_SC_INVALID_STATE, "AEQ create returned no result") :
+      control_result.status;
+    if (status == null || !status.ok() || resource == null ||
+        !$cast(lifecycle_aeq, resource)) begin
+      if (status == null || status.ok())
+        status = rdma_status::make(RDMA_SC_INVALID_STATE,
+                                   "AEQ create returned invalid resource");
+      return;
+    end
+    status = fixture.engine.attach_aeq(lifecycle_aeq.handle);
+    if (status == null || !status.ok()) return;
+
+    cq_request = rdma_create_cq_req::type_id::create("publish_cq_request");
+    if (cq_request == null) begin
+      status = rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED,
+                                 "CQ request allocation failed");
+      return;
+    end
+    cq_request.owner = fixture.binding.make_handle();
+    cq_request.depth = 16;
+    cq_request.cqe_size_bytes = RDMA_CQE_BYTES;
+    status = clone_test_handle_value(lifecycle_ceq.handle, cq_request.ceq_h);
+    if (status == null || !status.ok() || cq_request.ceq_h == null) return;
+    cq_request.ring_backing.mode = RDMA_QUEUE_BACKING_OWNED;
+    resource = null;
+    control_result = null;
+    fixture.queue_executor.create_locked(
+      fixture.binding, fixture.binding.make_handle(), cq_request, 64'h9003,
+      resource, control_result);
+    status = control_result == null ?
+      rdma_status::make(RDMA_SC_INVALID_STATE, "CQ create returned no result") :
+      control_result.status;
+    if (status == null || !status.ok() || resource == null ||
+        !$cast(lifecycle_cq, resource)) begin
+      if (status == null || status.ok())
+        status = rdma_status::make(RDMA_SC_INVALID_STATE,
+                                   "CQ create returned invalid resource");
+      return;
+    end
+    status = fixture.engine.attach_cq(lifecycle_cq.handle, RDMA_TRANSPORT_RC);
+    if (status == null || !status.ok()) return;
+
+    fixture.create_transport_qp_for_cq(
+      "event_publish_qp", RDMA_TRANSPORT_RC, lifecycle_cq, event_qp, status);
+    if (status == null || !status.ok() || event_qp == null) return;
+    status = fixture.engine.attach_qp(event_qp.handle);
+    if (status == null || !status.ok()) return;
+
+    fixture.create_transport_qp_for_cq(
+      "event_foreign_qp", RDMA_TRANSPORT_RC, fixture.cq, foreign_qp, status);
+    if (status == null || !status.ok() || foreign_qp == null) return;
+    status = fixture.engine.attach_qp(foreign_qp.handle);
+    if (status == null || !status.ok()) return;
+
+    status = rdma_status::success();
+  endtask
+
+  // 功能：check_ceqe_publish_cases 在真实 CQ/CEQ/QP route 上验证 qpn=0、非零
+  //   qpn、显式 CQ poll、authority/PI/polarity 拒绝以及满环 credit 契约。
+  // 输入/输出及副作用：fixture、lifecycle_ceq/cq、event_qp/foreign_qp 为输入，
+  //   status 为输出；成功路径写入并消费 CQE/CEQE，拒绝路径只读取原子性快照。
+  // 失败边界：正向 prerequisite 失败立即返回；每个负例必须保持 backing、cursor、
+  //   used、pending/reservation 和 result 不变，完整填充一圈必须显式翻转 producer wrap。
+  task automatic check_ceqe_publish_cases(
+    rdma_queue_data_engine_fixture fixture,
+    rdma_ceq lifecycle_ceq,
+    rdma_cq lifecycle_cq,
+    rdma_qp event_qp,
+    rdma_qp foreign_qp,
+    output rdma_status status
+  );
+    rdma_post_send_req send_request;
+    rdma_queue_post_result posted;
+    rdma_hw_cqe_model cqe;
+    rdma_hw_ceqe_model ceqe;
+    rdma_hw_ceqe_model polled_ceqe;
+    rdma_queue_device_publish_result published;
+    rdma_queue_event_result event_result;
+    rdma_queue_completion_result completion;
+    rdma_status model_status;
+    byte before_bytes[];
+    int unsigned before_pi;
+    int unsigned before_ci;
+    int unsigned before_used;
+    int unsigned fill_start_pi;
+    int unsigned fill_start_ci;
+    int unsigned saved_cqn;
+    int unsigned saved_cq_pi;
+    int unsigned saved_object_id;
+    int unsigned saved_generation;
+    longint unsigned saved_function_uid;
+    bit before_pi_wrap;
+    bit before_ci_wrap;
+    bit fill_start_pi_wrap;
+    bit fill_start_ci_wrap;
+    bit saved_cq_pi_wrap;
+    bit ceq_polarity;
+    bit has_pending;
+
+    status = rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "CEQE publish cases are incomplete");
+    send_request = fixture.make_send(64'h9004);
+    model_status = clone_test_handle_value(event_qp.handle, send_request.qp_h);
+    if (model_status == null || !model_status.ok() ||
+        send_request.qp_h == null) begin
+      status = model_status;
+      return;
+    end
+    fixture.engine.post_send(send_request, posted, status);
+    if (status == null || !status.ok() || posted == null) return;
+    status = fixture.engine.query_runtime_producer_polarity(
+      lifecycle_cq.handle, RDMA_QUEUE_RUNTIME_CQ, ceq_polarity);
+    if (status == null || !status.ok()) return;
+    cqe = make_cqe_for_outstanding_send(
+      event_qp.handle, event_qp.local_qp_id, posted, ceq_polarity, model_status);
+    if (model_status == null || !model_status.ok() || cqe == null) begin
+      status = model_status;
+      return;
+    end
+    publish_cqe_for_test(
+      fixture.engine, lifecycle_cq.handle, cqe, published, status);
+    if (status == null || !status.ok() || published == null) return;
+
+    status = fixture.engine.query_runtime_producer_polarity(
+      lifecycle_ceq.handle, RDMA_QUEUE_RUNTIME_CEQ, ceq_polarity);
+    if (status == null || !status.ok()) return;
+    make_ceqe_from_committed_cq(
+      fixture.engine, lifecycle_cq.handle, lifecycle_cq.local_cq_id, 0,
+      ceq_polarity, ceqe, model_status);
+    if (model_status == null || !model_status.ok() || ceqe == null) begin
+      status = model_status;
+      return;
+    end
+    fixture.engine.publish_ceqe(
+      lifecycle_ceq.handle, ceqe, published, status);
+    if (status == null || !status.ok() || published == null) return;
+    fixture.engine.poll_ceqe(
+      lifecycle_ceq.handle, 0, event_result, status);
+    polled_ceqe = null;
+    if (status == null || !status.ok() || event_result == null ||
+        event_result.queue_h == null ||
+        !event_result.queue_h.same_instance(lifecycle_ceq.handle) ||
+        !$cast(polled_ceqe, event_result.event_model) ||
+        polled_ceqe.cq_h == null ||
+        !polled_ceqe.cq_h.same_instance(lifecycle_cq.handle) ||
+        polled_ceqe.cqn != lifecycle_cq.local_cq_id) begin
+      uvm_report_error("EVENT_PUBLISH_CEQE_POLL",
+                       "CEQE poll did not preserve CEQ/CQ route identity");
+      status = rdma_status::make(RDMA_SC_INVALID_STATE,
+                                 "CEQE poll route identity mismatch");
+      return;
+    end
+    fixture.engine.poll_cqe(
+      lifecycle_cq.handle, 0, completion, status);
+    if (status == null || !status.ok() || completion == null ||
+        completion.cqe == null || completion.cqe.wr_id != 64'h9004) return;
+
+    status = fixture.engine.query_runtime_producer_polarity(
+      lifecycle_ceq.handle, RDMA_QUEUE_RUNTIME_CEQ, ceq_polarity);
+    if (status == null || !status.ok()) return;
+    make_ceqe_from_committed_cq(
+      fixture.engine, lifecycle_cq.handle, lifecycle_cq.local_cq_id,
+      event_qp.local_qp_id, ceq_polarity, ceqe, model_status);
+    if (model_status == null || !model_status.ok() || ceqe == null) begin
+      status = model_status;
+      return;
+    end
+    fixture.engine.publish_ceqe(
+      lifecycle_ceq.handle, ceqe, published, status);
+    if (status == null || !status.ok() || published == null) return;
+    fixture.engine.poll_ceqe(
+      lifecycle_ceq.handle, 0, event_result, status);
+    if (status == null || !status.ok() || event_result == null) return;
+
+    capture_publish_queue_state(
+      fixture, lifecycle_ceq, RDMA_QUEUE_RUNTIME_CEQ,
+      RDMA_QUEUE_ROLE_CEQ_RING, 16, before_bytes, before_pi, before_pi_wrap,
+      before_ci, before_ci_wrap, before_used, status);
+    if (status == null || !status.ok()) return;
+
+    make_ceqe_from_committed_cq(
+      fixture.engine, lifecycle_cq.handle, lifecycle_cq.local_cq_id,
+      foreign_qp.local_qp_id, ceq_polarity, ceqe, model_status);
+    if (model_status == null || !model_status.ok() || ceqe == null) begin
+      status = model_status;
+      return;
+    end
+    fixture.engine.publish_ceqe(
+      lifecycle_ceq.handle, ceqe, published, status);
+    check_rejected_publish_atomic(
+      "CEQE_FOREIGN_QPN", fixture, lifecycle_ceq, RDMA_QUEUE_RUNTIME_CEQ,
+      RDMA_QUEUE_ROLE_CEQ_RING, 16, before_bytes, before_pi, before_pi_wrap,
+      before_ci, before_ci_wrap, before_used, published, status,
+      RDMA_SC_INVALID_STATE);
+
+    make_ceqe_from_committed_cq(
+      fixture.engine, lifecycle_cq.handle, lifecycle_cq.local_cq_id,
+      event_qp.local_qp_id, ceq_polarity, ceqe, model_status);
+    if (model_status == null || !model_status.ok() || ceqe == null) begin
+      status = model_status;
+      return;
+    end
+    saved_cqn = ceqe.cqn;
+    ceqe.cqn = saved_cqn + 1;
+    fixture.engine.publish_ceqe(
+      lifecycle_ceq.handle, ceqe, published, status);
+    check_rejected_publish_atomic(
+      "CEQE_WRONG_CQN", fixture, lifecycle_ceq, RDMA_QUEUE_RUNTIME_CEQ,
+      RDMA_QUEUE_ROLE_CEQ_RING, 16, before_bytes, before_pi, before_pi_wrap,
+      before_ci, before_ci_wrap, before_used, published, status,
+      RDMA_SC_INVALID_STATE);
+    ceqe.cqn = saved_cqn;
+
+    saved_object_id = ceqe.cq_h.object_id;
+    ceqe.cq_h.object_id = saved_object_id + 1;
+    fixture.engine.publish_ceqe(
+      lifecycle_ceq.handle, ceqe, published, status);
+    check_rejected_publish_atomic(
+      "CEQE_WRONG_CQ_HANDLE", fixture, lifecycle_ceq, RDMA_QUEUE_RUNTIME_CEQ,
+      RDMA_QUEUE_ROLE_CEQ_RING, 16, before_bytes, before_pi, before_pi_wrap,
+      before_ci, before_ci_wrap, before_used, published, status,
+      RDMA_SC_INVALID_STATE);
+    ceqe.cq_h.object_id = saved_object_id;
+
+    saved_function_uid = ceqe.cq_h.function_uid;
+    ceqe.cq_h.function_uid = saved_function_uid + 1;
+    fixture.engine.publish_ceqe(
+      lifecycle_ceq.handle, ceqe, published, status);
+    check_rejected_publish_atomic(
+      "CEQE_WRONG_FUNCTION", fixture, lifecycle_ceq, RDMA_QUEUE_RUNTIME_CEQ,
+      RDMA_QUEUE_ROLE_CEQ_RING, 16, before_bytes, before_pi, before_pi_wrap,
+      before_ci, before_ci_wrap, before_used, published, status,
+      RDMA_SC_INVALID_ARGUMENT);
+    ceqe.cq_h.function_uid = saved_function_uid;
+
+    saved_generation = ceqe.cq_h.generation;
+    ceqe.cq_h.generation = saved_generation + 1;
+    fixture.engine.publish_ceqe(
+      lifecycle_ceq.handle, ceqe, published, status);
+    check_rejected_publish_atomic(
+      "CEQE_STALE_GENERATION", fixture, lifecycle_ceq, RDMA_QUEUE_RUNTIME_CEQ,
+      RDMA_QUEUE_ROLE_CEQ_RING, 16, before_bytes, before_pi, before_pi_wrap,
+      before_ci, before_ci_wrap, before_used, published, status,
+      RDMA_SC_STALE_GENERATION);
+    ceqe.cq_h.generation = saved_generation;
+
+    saved_cq_pi = ceqe.cq_pi;
+    ceqe.cq_pi = saved_cq_pi + 1;
+    fixture.engine.publish_ceqe(
+      lifecycle_ceq.handle, ceqe, published, status);
+    check_rejected_publish_atomic(
+      "CEQE_PI", fixture, lifecycle_ceq, RDMA_QUEUE_RUNTIME_CEQ,
+      RDMA_QUEUE_ROLE_CEQ_RING, 16, before_bytes, before_pi, before_pi_wrap,
+      before_ci, before_ci_wrap, before_used, published, status,
+      RDMA_SC_INVALID_ARGUMENT);
+    ceqe.cq_pi = saved_cq_pi;
+
+    saved_cq_pi_wrap = ceqe.cq_pi_wrap;
+    ceqe.cq_pi_wrap = ~saved_cq_pi_wrap;
+    fixture.engine.publish_ceqe(
+      lifecycle_ceq.handle, ceqe, published, status);
+    check_rejected_publish_atomic(
+      "CEQE_CQ_WRAP", fixture, lifecycle_ceq, RDMA_QUEUE_RUNTIME_CEQ,
+      RDMA_QUEUE_ROLE_CEQ_RING, 16, before_bytes, before_pi, before_pi_wrap,
+      before_ci, before_ci_wrap, before_used, published, status,
+      RDMA_SC_INVALID_ARGUMENT);
+    ceqe.cq_pi_wrap = saved_cq_pi_wrap;
+
+    ceqe.valid = ~ceqe.valid;
+    fixture.engine.publish_ceqe(
+      lifecycle_ceq.handle, ceqe, published, status);
+    check_rejected_publish_atomic(
+      "CEQE_POLARITY", fixture, lifecycle_ceq, RDMA_QUEUE_RUNTIME_CEQ,
+      RDMA_QUEUE_ROLE_CEQ_RING, 16, before_bytes, before_pi, before_pi_wrap,
+      before_ci, before_ci_wrap, before_used, published, status,
+      RDMA_SC_INVALID_ARGUMENT);
+
+    status = fixture.engine.query_runtime_cursors(
+      lifecycle_ceq.handle, RDMA_QUEUE_RUNTIME_CEQ, fill_start_pi,
+      fill_start_pi_wrap, fill_start_ci, fill_start_ci_wrap);
+    if (status == null || !status.ok()) return;
+    for (int unsigned i = 0; i < lifecycle_ceq.depth; i++) begin
+      status = fixture.engine.query_runtime_producer_polarity(
+        lifecycle_ceq.handle, RDMA_QUEUE_RUNTIME_CEQ, ceq_polarity);
+      if (status == null || !status.ok()) return;
+      make_ceqe_from_committed_cq(
+        fixture.engine, lifecycle_cq.handle, lifecycle_cq.local_cq_id, 0,
+        ceq_polarity, ceqe, model_status);
+      if (model_status == null || !model_status.ok() || ceqe == null) begin
+        status = model_status;
+        return;
+      end
+      fixture.engine.publish_ceqe(
+        lifecycle_ceq.handle, ceqe, published, status);
+      if (status == null || !status.ok() || published == null) return;
+    end
+    capture_publish_queue_state(
+      fixture, lifecycle_ceq, RDMA_QUEUE_RUNTIME_CEQ,
+      RDMA_QUEUE_ROLE_CEQ_RING, 16, before_bytes, before_pi, before_pi_wrap,
+      before_ci, before_ci_wrap, before_used, status);
+    if (status == null || !status.ok()) return;
+    if (before_pi != fill_start_pi ||
+        before_pi_wrap == fill_start_pi_wrap ||
+        before_ci != fill_start_ci ||
+        before_ci_wrap != fill_start_ci_wrap ||
+        before_used != lifecycle_ceq.depth)
+      uvm_report_error(
+        "CEQE_FULL_WRAP",
+        "filling one CEQ depth did not toggle only producer wrap");
+    status = fixture.engine.query_runtime_producer_polarity(
+      lifecycle_ceq.handle, RDMA_QUEUE_RUNTIME_CEQ, ceq_polarity);
+    if (status == null || !status.ok()) return;
+    make_ceqe_from_committed_cq(
+      fixture.engine, lifecycle_cq.handle, lifecycle_cq.local_cq_id, 0,
+      ceq_polarity, ceqe, model_status);
+    if (model_status == null || !model_status.ok() || ceqe == null) begin
+      status = model_status;
+      return;
+    end
+    fixture.engine.publish_ceqe(
+      lifecycle_ceq.handle, ceqe, published, status);
+    check_rejected_publish_atomic(
+      "CEQE_FULL", fixture, lifecycle_ceq, RDMA_QUEUE_RUNTIME_CEQ,
+      RDMA_QUEUE_ROLE_CEQ_RING, 16, before_bytes, before_pi, before_pi_wrap,
+      before_ci, before_ci_wrap, before_used, published, status,
+      RDMA_SC_QUEUE_FULL);
+    for (int unsigned i = 0; i < lifecycle_ceq.depth; i++) begin
+      fixture.engine.poll_ceqe(
+        lifecycle_ceq.handle, 0, event_result, status);
+      if (status == null || !status.ok() || event_result == null) return;
+    end
+    status = fixture.engine.query_runtime_occupancy(
+      lifecycle_ceq.handle, RDMA_QUEUE_RUNTIME_CEQ, before_used, has_pending);
+    if (status == null || !status.ok() || before_used != 0 || has_pending) begin
+      if (status != null && status.ok())
+        status = rdma_status::make(RDMA_SC_INVALID_STATE,
+                                   "CEQ drain did not restore credit");
+      return;
+    end
+    status = rdma_status::success();
+  endtask
+
+  // 功能：check_aeqe_publish_cases 验证真实非零 QP 目标的 AEQE 发布、poll 身份、
+  //   target/Function/generation/polarity 拒绝以及满环 credit 与恢复。
+  // 输入/输出及副作用：fixture、lifecycle_aeq、event_qp/foreign_qp 为输入，
+  //   status 为输出；成功路径写入/消费 AEQ，负例仅观察原子性快照。
+  // 失败边界：目标必须是同 Function/代际的 attached QP 且 qpn 非零；满一整圈
+  //   必须只翻转 producer wrap，full 拒绝与最终 drain 不得遗留 pending/占用。
+  task automatic check_aeqe_publish_cases(
+    rdma_queue_data_engine_fixture fixture,
+    rdma_aeq lifecycle_aeq,
+    rdma_qp event_qp,
+    rdma_qp foreign_qp,
+    output rdma_status status
+  );
+    rdma_hw_aeqe_model aeqe;
+    rdma_hw_aeqe_model polled_aeqe;
+    rdma_queue_device_publish_result published;
+    rdma_queue_event_result event_result;
+    rdma_status clone_status;
+    byte before_bytes[];
+    int unsigned before_pi;
+    int unsigned before_ci;
+    int unsigned before_used;
+    int unsigned fill_start_pi;
+    int unsigned fill_start_ci;
+    int unsigned saved_qpn;
+    int unsigned saved_object_id;
+    int unsigned saved_generation;
+    longint unsigned saved_function_uid;
+    bit before_pi_wrap;
+    bit before_ci_wrap;
+    bit fill_start_pi_wrap;
+    bit fill_start_ci_wrap;
+    bit aeq_polarity;
+    bit has_pending;
+
+    status = fixture.engine.query_runtime_producer_polarity(
+      lifecycle_aeq.handle, RDMA_QUEUE_RUNTIME_AEQ, aeq_polarity);
+    aeqe = rdma_hw_aeqe_model::type_id::create("test_aeqe");
+    if (status == null || !status.ok() || aeqe == null) begin
+      if (status != null && status.ok())
+        status = rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED,
+                                   "AEQE model allocation failed");
+      return;
+    end
+    clone_status = clone_test_handle_value(event_qp.handle, aeqe.target_h);
+    if (clone_status == null || !clone_status.ok() || aeqe.target_h == null) begin
+      status = clone_status;
+      return;
+    end
+    aeqe.qpn = event_qp.local_qp_id;
+    aeqe.valid = aeq_polarity;
+    aeqe.ecode = 0;
+    aeqe.packet_opcode = 0;
+    fixture.engine.publish_aeqe(
+      lifecycle_aeq.handle, aeqe, published, status);
+    if (status == null || !status.ok() || published == null) return;
+    fixture.engine.poll_aeqe(
+      lifecycle_aeq.handle, 0, event_result, status);
+    polled_aeqe = null;
+    if (status == null || !status.ok() || event_result == null ||
+        event_result.queue_h == null ||
+        !event_result.queue_h.same_instance(lifecycle_aeq.handle) ||
+        !$cast(polled_aeqe, event_result.event_model) ||
+        polled_aeqe.target_h == null ||
+        !polled_aeqe.target_h.same_instance(event_qp.handle) ||
+        polled_aeqe.qpn != event_qp.local_qp_id) begin
+      uvm_report_error("EVENT_PUBLISH_AEQE_POLL",
+                       "AEQE poll did not preserve AEQ/QP route identity");
+      status = rdma_status::make(RDMA_SC_INVALID_STATE,
+                                 "AEQE poll route identity mismatch");
+      return;
+    end
+
+    capture_publish_queue_state(
+      fixture, lifecycle_aeq, RDMA_QUEUE_RUNTIME_AEQ,
+      RDMA_QUEUE_ROLE_AEQ_RING, 16, before_bytes, before_pi, before_pi_wrap,
+      before_ci, before_ci_wrap, before_used, status);
+    if (status == null || !status.ok()) return;
+
+    saved_object_id = aeqe.target_h.object_id;
+    aeqe.target_h.object_id = saved_object_id + 1;
+    fixture.engine.publish_aeqe(
+      lifecycle_aeq.handle, aeqe, published, status);
+    check_rejected_publish_atomic(
+      "AEQE_WRONG_TARGET", fixture, lifecycle_aeq, RDMA_QUEUE_RUNTIME_AEQ,
+      RDMA_QUEUE_ROLE_AEQ_RING, 16, before_bytes, before_pi, before_pi_wrap,
+      before_ci, before_ci_wrap, before_used, published, status,
+      RDMA_SC_INVALID_STATE);
+    aeqe.target_h.object_id = saved_object_id;
+
+    saved_qpn = aeqe.qpn;
+    aeqe.qpn = foreign_qp.local_qp_id;
+    fixture.engine.publish_aeqe(
+      lifecycle_aeq.handle, aeqe, published, status);
+    check_rejected_publish_atomic(
+      "AEQE_FOREIGN_QPN", fixture, lifecycle_aeq, RDMA_QUEUE_RUNTIME_AEQ,
+      RDMA_QUEUE_ROLE_AEQ_RING, 16, before_bytes, before_pi, before_pi_wrap,
+      before_ci, before_ci_wrap, before_used, published, status,
+      RDMA_SC_INVALID_STATE);
+    aeqe.qpn = saved_qpn;
+
+    saved_function_uid = aeqe.target_h.function_uid;
+    aeqe.target_h.function_uid = saved_function_uid + 1;
+    fixture.engine.publish_aeqe(
+      lifecycle_aeq.handle, aeqe, published, status);
+    check_rejected_publish_atomic(
+      "AEQE_WRONG_FUNCTION", fixture, lifecycle_aeq, RDMA_QUEUE_RUNTIME_AEQ,
+      RDMA_QUEUE_ROLE_AEQ_RING, 16, before_bytes, before_pi, before_pi_wrap,
+      before_ci, before_ci_wrap, before_used, published, status,
+      RDMA_SC_INVALID_ARGUMENT);
+    aeqe.target_h.function_uid = saved_function_uid;
+
+    saved_generation = aeqe.target_h.generation;
+    aeqe.target_h.generation = saved_generation + 1;
+    fixture.engine.publish_aeqe(
+      lifecycle_aeq.handle, aeqe, published, status);
+    check_rejected_publish_atomic(
+      "AEQE_STALE_GENERATION", fixture, lifecycle_aeq, RDMA_QUEUE_RUNTIME_AEQ,
+      RDMA_QUEUE_ROLE_AEQ_RING, 16, before_bytes, before_pi, before_pi_wrap,
+      before_ci, before_ci_wrap, before_used, published, status,
+      RDMA_SC_STALE_GENERATION);
+    aeqe.target_h.generation = saved_generation;
+
+    aeqe.valid = ~aeqe.valid;
+    fixture.engine.publish_aeqe(
+      lifecycle_aeq.handle, aeqe, published, status);
+    check_rejected_publish_atomic(
+      "AEQE_POLARITY", fixture, lifecycle_aeq, RDMA_QUEUE_RUNTIME_AEQ,
+      RDMA_QUEUE_ROLE_AEQ_RING, 16, before_bytes, before_pi, before_pi_wrap,
+      before_ci, before_ci_wrap, before_used, published, status,
+      RDMA_SC_INVALID_ARGUMENT);
+
+    status = fixture.engine.query_runtime_cursors(
+      lifecycle_aeq.handle, RDMA_QUEUE_RUNTIME_AEQ, fill_start_pi,
+      fill_start_pi_wrap, fill_start_ci, fill_start_ci_wrap);
+    if (status == null || !status.ok()) return;
+    for (int unsigned i = 0; i < lifecycle_aeq.depth; i++) begin
+      status = fixture.engine.query_runtime_producer_polarity(
+        lifecycle_aeq.handle, RDMA_QUEUE_RUNTIME_AEQ, aeq_polarity);
+      if (status == null || !status.ok()) return;
+      aeqe.valid = aeq_polarity;
+      fixture.engine.publish_aeqe(
+        lifecycle_aeq.handle, aeqe, published, status);
+      if (status == null || !status.ok() || published == null) return;
+    end
+    capture_publish_queue_state(
+      fixture, lifecycle_aeq, RDMA_QUEUE_RUNTIME_AEQ,
+      RDMA_QUEUE_ROLE_AEQ_RING, 16, before_bytes, before_pi, before_pi_wrap,
+      before_ci, before_ci_wrap, before_used, status);
+    if (status == null || !status.ok()) return;
+    if (before_pi != fill_start_pi ||
+        before_pi_wrap == fill_start_pi_wrap ||
+        before_ci != fill_start_ci ||
+        before_ci_wrap != fill_start_ci_wrap ||
+        before_used != lifecycle_aeq.depth)
+      uvm_report_error(
+        "AEQE_FULL_WRAP",
+        "filling one AEQ depth did not toggle only producer wrap");
+    status = fixture.engine.query_runtime_producer_polarity(
+      lifecycle_aeq.handle, RDMA_QUEUE_RUNTIME_AEQ, aeq_polarity);
+    if (status == null || !status.ok()) return;
+    aeqe.valid = aeq_polarity;
+    fixture.engine.publish_aeqe(
+      lifecycle_aeq.handle, aeqe, published, status);
+    check_rejected_publish_atomic(
+      "AEQE_FULL", fixture, lifecycle_aeq, RDMA_QUEUE_RUNTIME_AEQ,
+      RDMA_QUEUE_ROLE_AEQ_RING, 16, before_bytes, before_pi, before_pi_wrap,
+      before_ci, before_ci_wrap, before_used, published, status,
+      RDMA_SC_QUEUE_FULL);
+    for (int unsigned i = 0; i < lifecycle_aeq.depth; i++) begin
+      fixture.engine.poll_aeqe(
+        lifecycle_aeq.handle, 0, event_result, status);
+      if (status == null || !status.ok() || event_result == null) return;
+    end
+    status = fixture.engine.query_runtime_occupancy(
+      lifecycle_aeq.handle, RDMA_QUEUE_RUNTIME_AEQ, before_used, has_pending);
+    if (status == null || !status.ok() || before_used != 0 || has_pending) begin
+      if (status != null && status.ok())
+        status = rdma_status::make(RDMA_SC_INVALID_STATE,
+                                   "AEQ drain did not restore credit");
+      return;
+    end
+    status = rdma_status::success();
+  endtask
+
+  // 功能：cleanup_event_publish_topology 按 foreign QP、event QP、CQ、AEQ、CEQ
+  //   的依赖反序销毁本测试创建的 lifecycle-owned 资源。
+  // 输入/输出及副作用：fixture 与五个可空资源为输入；每个存在的资源依次
+  //   detach/destroy，并通过 UVM 报告清理结果，不接管基础 fixture 的资源。
+  // 失败边界：fixture 为空时安全返回；单项失败只报告、不阻断后续独立资源清理，
+  //   从而避免首个 teardown 错误掩盖其余生命周期泄漏。
+  task automatic cleanup_event_publish_topology(
+    rdma_queue_data_engine_fixture fixture,
+    rdma_ceq lifecycle_ceq,
+    rdma_aeq lifecycle_aeq,
+    rdma_cq lifecycle_cq,
+    rdma_qp event_qp,
+    rdma_qp foreign_qp
+  );
+    rdma_status cleanup_status;
+
+    if (fixture == null) return;
+    if (foreign_qp != null) begin
+      fixture.destroy_lifecycle_owned_qp(
+        foreign_qp.handle, 64'h9015, cleanup_status);
+      if (cleanup_status == null || !cleanup_status.ok())
+        uvm_report_error("EVENT_FOREIGN_QP_TEARDOWN",
+                         "foreign QP teardown failed");
+    end
+    if (event_qp != null) begin
+      fixture.destroy_lifecycle_owned_qp(
+        event_qp.handle, 64'h9014, cleanup_status);
+      if (cleanup_status == null || !cleanup_status.ok())
+        uvm_report_error("EVENT_PUBLISH_QP_TEARDOWN",
+                         "event QP teardown failed");
+    end
+    if (lifecycle_cq != null) begin
+      fixture.destroy_lifecycle_owned_queue(
+        lifecycle_cq.handle, 64'h9013, cleanup_status);
+      if (cleanup_status == null || !cleanup_status.ok())
+        uvm_report_error("EVENT_PUBLISH_CQ_TEARDOWN",
+                         "lifecycle CQ teardown failed");
+    end
+    if (lifecycle_aeq != null) begin
+      fixture.destroy_lifecycle_owned_queue(
+        lifecycle_aeq.handle, 64'h9012, cleanup_status);
+      if (cleanup_status == null || !cleanup_status.ok())
+        uvm_report_error("EVENT_PUBLISH_AEQ_TEARDOWN",
+                         "lifecycle AEQ teardown failed");
+    end
+    if (lifecycle_ceq != null) begin
+      fixture.destroy_lifecycle_owned_queue(
+        lifecycle_ceq.handle, 64'h9011, cleanup_status);
+      if (cleanup_status == null || !cleanup_status.ok())
+        uvm_report_error("EVENT_PUBLISH_CEQ_TEARDOWN",
+                         "lifecycle CEQ teardown failed");
+    end
+  endtask
+
+  // 功能：check_event_publish_api 编排 topology、CEQE、AEQE 与统一清理四个阶段，
+  //   使每个事件类型的 authority/full/route 断言保持独立可读。
+  // 输入/输出及副作用：无显式输入；创建真实 lifecycle backing，运行公开 producer/
+  //   poll API，并无条件进入逆序 cleanup；只通过 UVM 报告暴露测试结果。
+  // 失败边界：topology 失败时跳过 producer 但仍清理部分资源；CEQE 失败不阻断
+  //   独立 AEQE 矩阵，任一阶段 null/non-success status 都产生明确 UVM_ERROR。
+  task automatic check_event_publish_api();
+    rdma_queue_data_engine_fixture fixture;
+    rdma_ceq lifecycle_ceq;
+    rdma_aeq lifecycle_aeq;
+    rdma_cq lifecycle_cq;
+    rdma_qp event_qp;
+    rdma_qp foreign_qp;
+    rdma_status status;
+
+    setup_event_publish_topology(
+      fixture, lifecycle_ceq, lifecycle_aeq, lifecycle_cq, event_qp,
+      foreign_qp, status);
+    if (status == null || !status.ok()) begin
+      uvm_report_error(
+        "EVENT_PUBLISH_SETUP",
+        status == null ? "event topology returned null status" :
+                         status.convert2string());
+    end else begin
+      check_ceqe_publish_cases(
+        fixture, lifecycle_ceq, lifecycle_cq, event_qp, foreign_qp, status);
+      if (status == null || !status.ok())
+        uvm_report_error(
+          "EVENT_PUBLISH_CEQE",
+          status == null ? "CEQE matrix returned null status" :
+                           status.convert2string());
+      check_aeqe_publish_cases(
+        fixture, lifecycle_aeq, event_qp, foreign_qp, status);
+      if (status == null || !status.ok())
+        uvm_report_error(
+          "EVENT_PUBLISH_AEQE",
+          status == null ? "AEQE matrix returned null status" :
+                           status.convert2string());
+    end
+    cleanup_event_publish_topology(
+      fixture, lifecycle_ceq, lifecycle_aeq, lifecycle_cq, event_qp,
+      foreign_qp);
   endtask
 
   // 功能：check_device_publish_calls 断言 publish 在 mock Host-memory 中先发起
@@ -1077,6 +2448,11 @@ class rdma_queue_data_engine_device_publish_test extends uvm_test;
     check_device_publish_fault_recovery("CQE_READ_FAIL", 1);
     check_device_publish_fault_recovery("CQE_READ_MISMATCH", 2);
     check_device_publish_stale_route();
+    check_cqe_authority_rejections();
+    check_cqe_full_atomic();
+    check_event_publish_api();
+    check_ceqe_runtime_width();
+    check_cqe_authority_width();
     phase.drop_objection(this);
   endtask
 endclass

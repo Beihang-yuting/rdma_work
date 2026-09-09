@@ -91,4 +91,48 @@ class rdma_eq_engine extends uvm_object;
     end
     delegate.poll_aeqe(aeq_h, operation_timeout, result, status);
   endtask
+
+  // 功能：publish_ceqe 将已经通过 CQ authority 校验的 CEQE 发布请求透明转交
+  //   给共享 queue-data engine，保持 CEQ backing 与 producer runtime 单一所有者。
+  // 输入/输出及副作用：ceq_h、model 为输入，result/status 为输出；facade 既不
+  //   clone result/image，也不修改 CEQ/CQ runtime 或 backing，只传播 delegate 输出。
+  // 失败边界：未 configure 或 delegate 缺失返回 INVALID_STATE 且 result 为 null；
+  //   其余 CQ route、PI、polarity、full、codec/recovery 拒绝原样保留。
+  task publish_ceqe(
+    rdma_handle ceq_h,
+    rdma_hw_ceqe_model model,
+    output rdma_queue_device_publish_result result,
+    output rdma_status status
+  );
+    result = null;
+    status = null;
+    if (!configured || delegate == null) begin
+      status = rdma_status::make(RDMA_SC_INVALID_STATE,
+                                 "EQ facade is not configured");
+      return;
+    end
+    delegate.publish_ceqe(ceq_h, model, result, status);
+  endtask
+
+  // 功能：publish_aeqe 将已绑定 QP 的 AEQE 发布请求透明转交给共享 engine，
+  //   防止 facade 自行构造 image、占用 ring 或改变 target route。
+  // 输入/输出及副作用：aeq_h、model 为输入，result/status 为输出；成功 result
+  //   的 queue_h/image 仍归 delegate 创建，facade 只借用并返回同一 detached 对象。
+  // 失败边界：未 configure/delegate 空返回 INVALID_STATE；目标 QP、generation、
+  //   polarity、满环和编码失败由 delegate 保持原错误码与空 result 传播。
+  task publish_aeqe(
+    rdma_handle aeq_h,
+    rdma_hw_aeqe_model model,
+    output rdma_queue_device_publish_result result,
+    output rdma_status status
+  );
+    result = null;
+    status = null;
+    if (!configured || delegate == null) begin
+      status = rdma_status::make(RDMA_SC_INVALID_STATE,
+                                 "EQ facade is not configured");
+      return;
+    end
+    delegate.publish_aeqe(aeq_h, model, result, status);
+  endtask
 endclass

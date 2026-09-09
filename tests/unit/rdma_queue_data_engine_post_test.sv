@@ -89,6 +89,13 @@ class rdma_queue_data_engine_fixture extends uvm_object;
     vector.msix_table_index = 1;
     vector.enabled = 1'b1;
     result.interrupt_vectors.push_back(vector);
+    // 设计说明：Task 6 的 lifecycle-owned AEQ 使用 local vector 2；在 fixture
+    // binding 中显式发布其独立硬件/MSI-X projection，避免把 AEQ 偷换为 CEQ 的
+    // vector 1，也让 policy preflight 能验证真实 Function authority。
+    vector.function_local_vector = 2;
+    vector.hardware_eq_vector = 2;
+    vector.msix_table_index = 2;
+    result.interrupt_vectors.push_back(vector);
     result.state = RDMA_BIND_ACTIVE;
     result.owner_h = result.make_handle();
     result.notify_valid = 1'b1;
@@ -316,21 +323,38 @@ class rdma_queue_data_engine_fixture extends uvm_object;
     output rdma_qp qp,
     output rdma_status status
   );
+    create_transport_qp_for_cq(label, transport, cq, qp, status);
+  endtask
+
+  // 功能：create_transport_qp_for_cq 在指定 lifecycle-owned CQ 上创建一个真实
+  //   transport QP，使 event publish 测试能以同一 CQ/QP route 校验 CEQE/AEQE。
+  // 输入/输出及副作用：label、transport、target_cq 为输入，qp/status 为输出；
+  //   成功时 manager/CMQ/Host-memory 新增 ACTIVE QP，所有权仍由 fixture 显式销毁。
+  // 失败/边界：target_cq/依赖缺失、transport 不受支持、context 或 create 失败时
+  //   qp 保持 null 并传播原始 status，不回退使用 fixture 的 dependency-only CQ。
+  task automatic create_transport_qp_for_cq(
+    string label,
+    rdma_transport_e transport,
+    rdma_cq target_cq,
+    output rdma_qp qp,
+    output rdma_status status
+  );
     rdma_create_qp_req request;
     rdma_control_result control_result;
 
     qp = null;
     status = rdma_status::success();
     if (binding == null || manager == null || qp_executor == null ||
-        pd == null || cq == null)
+        pd == null || target_cq == null || target_cq.handle == null)
       begin
         status = rdma_status::make(RDMA_SC_INVALID_STATE,
                                    "transport QP fixture is not initialized");
         return;
       end
-    if (!(transport inside {RDMA_TRANSPORT_UD, RDMA_TRANSPORT_URC})) begin
+    if (!(transport inside {RDMA_TRANSPORT_RC, RDMA_TRANSPORT_UD,
+                            RDMA_TRANSPORT_URC})) begin
       status = rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                                 "additional QP transport is not UD/URC");
+                                 "additional QP transport is unsupported");
       return;
     end
     request = rdma_create_qp_req::type_id::create({label, "_request"});
@@ -347,8 +371,10 @@ class rdma_queue_data_engine_fixture extends uvm_object;
     if (transport == RDMA_TRANSPORT_UD)
       request.sq_sgb_backing.mode = RDMA_QUEUE_BACKING_OWNED;
     request.pd_h = rdma_clone_handle_value(pd.handle, {label, "_pd"});
-    request.send_cq_h = rdma_clone_handle_value(cq.handle, {label, "_send_cq"});
-    request.recv_cq_h = rdma_clone_handle_value(cq.handle, {label, "_recv_cq"});
+    request.send_cq_h = rdma_clone_handle_value(target_cq.handle,
+                                                {label, "_send_cq"});
+    request.recv_cq_h = rdma_clone_handle_value(target_cq.handle,
+                                                {label, "_recv_cq"});
     request.context_attrs = make_transport_attrs({label, "_attrs"}, transport);
     if (request.context_attrs == null) begin
       status = rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
@@ -356,7 +382,9 @@ class rdma_queue_data_engine_fixture extends uvm_object;
       return;
     end
     qp_executor.create_locked(binding, binding.make_handle(), request,
-                              transport == RDMA_TRANSPORT_UD ? 64'h1010 : 64'h1011,
+                              transport == RDMA_TRANSPORT_RC ? 64'h100f :
+                              (transport == RDMA_TRANSPORT_UD ? 64'h1010 :
+                                                               64'h1011),
                               qp, control_result);
     if (control_result == null || control_result.status == null ||
         !control_result.status.ok() || qp == null) begin
@@ -545,6 +573,94 @@ class rdma_queue_data_engine_fixture extends uvm_object;
     identity.reset_epoch = next_epoch;
     return binding.configure_identity(identity);
   endfunction
+
+  // 功能：destroy_lifecycle_owned_queue 统一撤销测试临时创建并已 attach 的
+  //   CEQ/AEQ/CQ，确保每个 lifecycle-owned backing 都经 engine detach 和
+  //   executor destroy 释放，而不是依赖仿真结束隐式回收。
+  // 输入/输出及副作用：queue_h、transaction_id 为输入，status 为输出；成功时
+  //   先解除非拥有 attachment，再由 queue_executor 回收 manager、context 和 backing。
+  // 失败边界：fixture/executor/handle 不完整、detach 或 destroy 的 control result
+  //   为空/失败时返回非成功；调用方仍须继续按逆序尝试清理剩余独立资源。
+  task destroy_lifecycle_owned_queue(
+    rdma_handle queue_h,
+    longint unsigned transaction_id,
+    output rdma_status status
+  );
+    rdma_destroy_resource_req request;
+    rdma_control_result control_result;
+    status = rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "event fixture teardown is not initialized");
+    if (engine == null || queue_executor == null || binding == null ||
+        queue_h == null || transaction_id == 0) return;
+    status = engine.detach(queue_h);
+    if (status == null || !status.ok()) begin
+      if (status == null)
+        status = rdma_status::make(RDMA_SC_INVALID_STATE,
+                                   "event fixture detach returned null status");
+      return;
+    end
+    request = rdma_destroy_resource_req::type_id::create("event_fixture_destroy");
+    if (request == null) begin
+      status = rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED,
+                                 "event fixture destroy request allocation failed");
+      return;
+    end
+    request.owner = binding.make_handle();
+    request.target_h = queue_h;
+    queue_executor.destroy_locked(binding, binding.make_handle(), request,
+                                  transaction_id, control_result);
+    status = control_result == null ?
+      rdma_status::make(RDMA_SC_INVALID_STATE,
+                         "event fixture destroy returned no control result") :
+      control_result.status;
+    if (status == null)
+      status = rdma_status::make(RDMA_SC_INVALID_STATE,
+                                 "event fixture destroy returned null status");
+  endtask
+
+  // 功能：destroy_lifecycle_owned_qp 先解除 queue-data engine 的非拥有 QP
+  //   attachment，再由 QP lifecycle executor 完成 ERROR/flush/delete 与 backing 回收。
+  // 输入/输出及副作用：qp_h、transaction_id 为输入，status 为输出；成功时销毁
+  //   fixture 显式创建的临时 QP，不影响基础 fixture QP 或外部依赖生命周期。
+  // 失败/边界：依赖/handle/transaction 缺失、detach 或 destroy control result
+  //   为空/失败时返回非成功；调用方仍须继续清理其余 queue，不能提前退出。
+  task destroy_lifecycle_owned_qp(
+    rdma_handle qp_h,
+    longint unsigned transaction_id,
+    output rdma_status status
+  );
+    rdma_destroy_resource_req request;
+    rdma_control_result control_result;
+
+    status = rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "event QP teardown is not initialized");
+    if (engine == null || qp_executor == null || binding == null ||
+        qp_h == null || transaction_id == 0) return;
+    status = engine.detach(qp_h);
+    if (status == null || !status.ok()) begin
+      if (status == null)
+        status = rdma_status::make(RDMA_SC_INVALID_STATE,
+                                   "event QP detach returned null status");
+      return;
+    end
+    request = rdma_destroy_resource_req::type_id::create("event_qp_destroy");
+    if (request == null) begin
+      status = rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED,
+                                 "event QP destroy request allocation failed");
+      return;
+    end
+    request.owner = binding.make_handle();
+    request.target_h = qp_h;
+    qp_executor.destroy_locked(binding, binding.make_handle(), request,
+                               transaction_id, control_result);
+    status = control_result == null ?
+      rdma_status::make(RDMA_SC_INVALID_STATE,
+                        "event QP destroy returned no control result") :
+      control_result.status;
+    if (status == null)
+      status = rdma_status::make(RDMA_SC_INVALID_STATE,
+                                 "event QP destroy returned null status");
+  endtask
 endclass
 
 class rdma_queue_data_engine_post_test extends uvm_test;
@@ -856,4 +972,5 @@ class rdma_queue_data_engine_post_test extends uvm_test;
 
     phase.drop_objection(this);
   endtask
+
 endclass
