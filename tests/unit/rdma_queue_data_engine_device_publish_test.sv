@@ -47,6 +47,63 @@ class rdma_cq_device_write_preflight_fault_access extends rdma_queue_backing_acc
   endfunction
 endclass
 
+// 设计说明：runtime admission/cancel 的真实默认实现由 data engine 的 protected
+// virtual 边界统一调用。此 test-only engine 只返回一次确定性失败，让公开
+// publish/query/recover API 走 engine 自己的 unclaimed/recovery 分支，绝不暴露或
+// 改写 lifecycle-owned attachment/backing。
+class rdma_device_publish_recovery_fault_engine extends rdma_queue_data_engine;
+  `uvm_object_utils(rdma_device_publish_recovery_fault_engine)
+
+  static int unsigned admission_failures_remaining;
+  static int unsigned cancel_failures_remaining;
+
+  // 功能：构造 device publish recovery 故障 engine，默认不消耗 admission 或
+  //   cancel 注入次数，使未 armed 的 fixture 完全采用生产 data-engine 行为。
+  // 输入/输出及副作用：name 为输入；构造只建立 engine 自身默认状态，不配置
+  //   manager/Host-memory，也不改变静态故障计数或外部资源所有权。
+  // 失败边界：构造不验证依赖；未执行 configure 的对象仍由基类公开 API 返回
+  //   INVALID_STATE，不能作为直接操作 queue runtime 的测试后门。
+  function new(string name = "rdma_device_publish_recovery_fault_engine");
+    super.new(name);
+  endfunction
+
+  // 功能：admit_device_publish_recovery 在 armed 次数内拒绝 runtime 接管，促使
+  //   基类 enter_device_publish_recovery 按真实代码保留 unclaimed evidence。
+  // 输入/输出及副作用：attachment、prepared_pending 为输入；命中时仅递减静态
+  //   计数并返回错误，不触碰 pending、runtime、backing 或 engine 表；未命中委托基类。
+  // 失败边界：每次命中返回 RESOURCE_BUSY；计数归零后必须恢复真实 admission，
+  //   以验证 retry/abort 的配对清理而非永久伪造 recovery 状态。
+  protected virtual function rdma_status admit_device_publish_recovery(
+    rdma_queue_data_attachment attachment,
+    rdma_queue_pending_operation prepared_pending
+  );
+    if (admission_failures_remaining != 0) begin
+      admission_failures_remaining--;
+      return rdma_status::make(RDMA_SC_RESOURCE_BUSY,
+                               "injected device recovery admission failure");
+    end
+    return super.admit_device_publish_recovery(attachment, prepared_pending);
+  endfunction
+
+  // 功能：cancel_device_publish_reservation 在 armed 次数内拒绝 preflight cancel，
+  //   让基类 finish_device_producer_cancel 保存可观测 pending/reservation。
+  // 输入/输出及副作用：attachment、reservation 为输入；命中时仅消耗计数并返回
+  //   RESOURCE_BUSY，不修改 runtime cursor、reservation、backing 或生命周期资源。
+  // 失败边界：每次命中返回 RESOURCE_BUSY；计数归零后委托基类真实 cancel，避免
+  //   后续 retry/abort 继续被故障注入阻断。
+  protected virtual function rdma_status cancel_device_publish_reservation(
+    rdma_queue_data_attachment attachment,
+    rdma_queue_cursor_snapshot reservation
+  );
+    if (cancel_failures_remaining != 0) begin
+      cancel_failures_remaining--;
+      return rdma_status::make(RDMA_SC_RESOURCE_BUSY,
+                               "injected device reservation cancel failure");
+    end
+    return super.cancel_device_publish_reservation(attachment, reservation);
+  endfunction
+endclass
+
 class rdma_queue_data_engine_device_publish_test extends uvm_test;
   `uvm_component_utils(rdma_queue_data_engine_device_publish_test)
 
@@ -340,6 +397,241 @@ class rdma_queue_data_engine_device_publish_test extends uvm_test;
       `uvm_error({label, "_POLL"}, "recovered device CQE did not release WQE")
   endtask
 
+  // 功能：check_unclaimed_pending_kind_authority 让 runtime admission 一次失败，
+  //   验证同一 CQ identity 的错误 runtime kind 不能读取 engine-owned evidence。
+  // 输入/输出及副作用：无显式输入；任务只经公开 publish/query API 建立并读取
+  //   unclaimed recovery，不直接取得 attachment、runtime 或 backing 可变引用。
+  // 失败边界：setup/post/故障注入失败时报告 UVM_ERROR；错误 kind 若返回成功或
+  //   非空 pending 即为 authority 泄漏，正确 CQ kind 必须仍能查询同一 evidence。
+  task automatic check_unclaimed_pending_kind_authority();
+    rdma_queue_data_engine_fixture fixture;
+    rdma_queue_post_result posted;
+    rdma_queue_device_publish_result published;
+    rdma_hw_cqe_model cqe;
+    rdma_queue_completion_result completion;
+    rdma_queue_pending_operation correct_pending;
+    rdma_queue_pending_operation wrong_pending;
+    rdma_status status;
+    rdma_status model_status;
+    rdma_status injected;
+    bit polarity;
+    bit occupancy_pending;
+    bit reservation_valid;
+    int unsigned occupancy;
+    int unsigned producer_index;
+    int unsigned consumer_index;
+    bit producer_wrap;
+    bit consumer_wrap;
+    rdma_queue_cursor_snapshot reservation;
+
+    rdma_queue_data_engine::type_id::set_type_override(
+      rdma_device_publish_recovery_fault_engine::get_type());
+    rdma_device_publish_recovery_fault_engine::admission_failures_remaining = 1;
+    rdma_device_publish_recovery_fault_engine::cancel_failures_remaining = 0;
+    fixture = rdma_queue_data_engine_fixture::type_id::create(
+      "unclaimed_kind_authority_fixture");
+    fixture.setup(status);
+    if (status == null || !status.ok()) begin
+      `uvm_error("CQE_UNCLAIMED_KIND_SETUP", "unclaimed kind fixture setup failed")
+      return;
+    end
+    fixture.engine.post_send(fixture.make_send(64'hd530_0000), posted, status);
+    if (status == null || !status.ok() || posted == null) begin
+      `uvm_error("CQE_UNCLAIMED_KIND_POST", "unclaimed kind setup post failed")
+      return;
+    end
+    status = fixture.engine.query_runtime_producer_polarity(
+      fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, polarity);
+    cqe = make_cqe_for_outstanding_send(fixture.qp.handle,
+      fixture.qp.local_qp_id, posted, polarity, model_status);
+    if (status == null || !status.ok() || model_status == null ||
+        !model_status.ok() || cqe == null) begin
+      `uvm_error("CQE_UNCLAIMED_KIND_MODEL", "unclaimed kind CQE setup failed")
+      return;
+    end
+    injected = rdma_status::make(RDMA_SC_DMA_TRANSLATION,
+                                 "injected unclaimed device write failure");
+    status = fixture.mem.fail_next("write", injected);
+    if (status == null || !status.ok()) begin
+      `uvm_error("CQE_UNCLAIMED_KIND_INJECT", "unclaimed write injection failed")
+      return;
+    end
+    published = null;
+    publish_cqe_for_test(fixture.engine, fixture.cq.handle, cqe,
+                         published, status);
+    if (status == null || status.code != RDMA_SC_RECOVERY_REQUIRED ||
+        published != null) begin
+      `uvm_error("CQE_UNCLAIMED_KIND_PUBLISH",
+                 "admission failure did not retain unclaimed recovery")
+      return;
+    end
+    wrong_pending = null;
+    status = fixture.engine.query_runtime_pending(
+      fixture.cq.handle, RDMA_QUEUE_RUNTIME_CEQ, wrong_pending);
+    if (status == null || status.ok() || wrong_pending != null)
+      `uvm_error("CQE_UNCLAIMED_KIND_LEAK",
+                 "wrong runtime kind read CQ unclaimed evidence")
+    correct_pending = null;
+    status = fixture.engine.query_runtime_pending(
+      fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, correct_pending);
+    if (status == null || !status.ok() || correct_pending == null ||
+        !correct_pending.device_producer || correct_pending.cursor == null)
+      `uvm_error("CQE_UNCLAIMED_KIND_CORRECT",
+                 "correct runtime kind lost retained unclaimed evidence")
+    occupancy = 1;
+    occupancy_pending = 1'b1;
+    status = fixture.engine.query_runtime_occupancy(
+      fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, occupancy, occupancy_pending);
+    if (status == null || !status.ok() || occupancy != 0 || occupancy_pending)
+      `uvm_error("CQE_UNCLAIMED_INVISIBLE_OCCUPANCY",
+                 "unclaimed CQE changed committed occupancy before recovery")
+    reservation_valid = 1'b0;
+    reservation = null;
+    status = fixture.engine.query_runtime_device_reservation(
+      fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, reservation_valid, reservation);
+    if (status == null || !status.ok() || !reservation_valid || reservation == null ||
+        reservation.index != correct_pending.cursor.index ||
+        reservation.wrap != correct_pending.cursor.wrap)
+      `uvm_error("CQE_UNCLAIMED_RESERVATION",
+                 "unclaimed recovery lost the reserved CQ slot")
+    completion = null;
+    fixture.engine.poll_cqe(fixture.cq.handle, 0, completion, status);
+    if (status == null || status.code != RDMA_SC_QUEUE_EMPTY || completion != null)
+      `uvm_error("CQE_UNCLAIMED_INVISIBLE_POLL",
+                 "unclaimed CQE was visible to poll before recovery")
+    status = fixture.engine.query_runtime_cursors(
+      fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, producer_index, producer_wrap,
+      consumer_index, consumer_wrap);
+    if (status == null || !status.ok() || producer_index != 0 || producer_wrap ||
+        consumer_index != 0 || consumer_wrap)
+      `uvm_error("CQE_UNCLAIMED_CURSOR", "unclaimed CQE advanced a cursor")
+    fixture.engine.recover_queue(fixture.cq.handle,
+      RDMA_QUEUE_RECOVERY_RETRY_PENDING, 1'b1, status);
+    if (status == null || !status.ok()) begin
+      `uvm_error("CQE_UNCLAIMED_RETRY", "unclaimed CQE retry did not succeed")
+      return;
+    end
+    correct_pending = null;
+    status = fixture.engine.query_runtime_pending(
+      fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, correct_pending);
+    if (status == null || status.ok() || correct_pending != null ||
+        status.code != RDMA_SC_INVALID_STATE)
+      `uvm_error("CQE_UNCLAIMED_RETRY_CLEANUP",
+                 "retry did not delete paired unclaimed evidence")
+    occupancy = 0;
+    occupancy_pending = 1'b1;
+    status = fixture.engine.query_runtime_occupancy(
+      fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, occupancy, occupancy_pending);
+    if (status == null || !status.ok() || occupancy != 1 || occupancy_pending)
+      `uvm_error("CQE_UNCLAIMED_RETRY_OCCUPANCY",
+                 "unclaimed retry did not commit exactly one CQE")
+    reservation_valid = 1'b1;
+    reservation = null;
+    status = fixture.engine.query_runtime_device_reservation(
+      fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, reservation_valid, reservation);
+    if (status == null || !status.ok() || reservation_valid || reservation != null)
+      `uvm_error("CQE_UNCLAIMED_RETRY_RESERVATION",
+                 "unclaimed retry retained a committed reservation")
+    completion = null;
+    fixture.engine.poll_cqe(fixture.cq.handle, 0, completion, status);
+    if (status == null || !status.ok() || completion == null ||
+        completion.released_slots.size() != 1)
+      `uvm_error("CQE_UNCLAIMED_RETRY_POLL",
+                 "unclaimed retry CQE did not become consumable")
+  endtask
+
+  // 功能：check_unclaimed_pending_abort 让 admission 连续拒绝 publish 与 abort 的
+  //   runtime 接管，验证 abort fallback 取消 reservation、detach 并成对删除 evidence。
+  // 输入/输出及副作用：无显式输入；任务仅通过公开 publish/query/recover/poll API
+  //   观察 unclaimed 生命周期，不修改 queue plan、attachment 或 Host-memory backing。
+  // 失败边界：初始 unclaimed 不可查询、abort 非成功、仍可查询 pending/occupancy，
+  //   或 abort 前 poll 非 QUEUE_EMPTY 时报告 UVM_ERROR；detach 后查询必须失败且输出为空。
+  task automatic check_unclaimed_pending_abort();
+    rdma_queue_data_engine_fixture fixture;
+    rdma_queue_post_result posted;
+    rdma_queue_device_publish_result published;
+    rdma_queue_completion_result completion;
+    rdma_hw_cqe_model cqe;
+    rdma_queue_pending_operation pending;
+    rdma_queue_cursor_snapshot reservation;
+    rdma_status status;
+    rdma_status model_status;
+    rdma_status injected;
+    bit polarity;
+    bit reservation_valid;
+    bit occupancy_pending;
+    int unsigned occupancy;
+
+    rdma_queue_data_engine::type_id::set_type_override(
+      rdma_device_publish_recovery_fault_engine::get_type());
+    rdma_device_publish_recovery_fault_engine::admission_failures_remaining = 2;
+    rdma_device_publish_recovery_fault_engine::cancel_failures_remaining = 0;
+    fixture = rdma_queue_data_engine_fixture::type_id::create(
+      "unclaimed_abort_fixture");
+    fixture.setup(status);
+    if (status == null || !status.ok()) begin
+      `uvm_error("CQE_UNCLAIMED_ABORT_SETUP", "unclaimed abort fixture setup failed")
+      return;
+    end
+    fixture.engine.post_send(fixture.make_send(64'hd531_0000), posted, status);
+    status = fixture.engine.query_runtime_producer_polarity(
+      fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, polarity);
+    cqe = make_cqe_for_outstanding_send(fixture.qp.handle,
+      fixture.qp.local_qp_id, posted, polarity, model_status);
+    if (status == null || !status.ok() || posted == null ||
+        model_status == null || !model_status.ok() || cqe == null) begin
+      `uvm_error("CQE_UNCLAIMED_ABORT_MODEL", "unclaimed abort setup failed")
+      return;
+    end
+    injected = rdma_status::make(RDMA_SC_DMA_TRANSLATION,
+                                 "injected unclaimed abort write failure");
+    status = fixture.mem.fail_next("write", injected);
+    published = null;
+    publish_cqe_for_test(fixture.engine, fixture.cq.handle, cqe,
+                         published, status);
+    if (status == null || status.code != RDMA_SC_RECOVERY_REQUIRED ||
+        published != null) begin
+      `uvm_error("CQE_UNCLAIMED_ABORT_PUBLISH", "unclaimed abort was not retained")
+      return;
+    end
+    pending = null;
+    status = fixture.engine.query_runtime_pending(
+      fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, pending);
+    if (status == null || !status.ok() || pending == null) begin
+      `uvm_error("CQE_UNCLAIMED_ABORT_PENDING", "abort input evidence is absent")
+      return;
+    end
+    reservation_valid = 1'b0;
+    reservation = null;
+    status = fixture.engine.query_runtime_device_reservation(
+      fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, reservation_valid, reservation);
+    if (status == null || !status.ok() || !reservation_valid || reservation == null)
+      `uvm_error("CQE_UNCLAIMED_ABORT_RESERVATION", "abort input reservation is absent")
+    completion = null;
+    fixture.engine.poll_cqe(fixture.cq.handle, 0, completion, status);
+    if (status == null || status.code != RDMA_SC_QUEUE_EMPTY || completion != null)
+      `uvm_error("CQE_UNCLAIMED_ABORT_INVISIBLE", "unclaimed abort CQE was visible")
+    fixture.engine.recover_queue(fixture.cq.handle,
+      RDMA_QUEUE_RECOVERY_ABORT_AND_DETACH, 1'b1, status);
+    if (status == null || !status.ok()) begin
+      `uvm_error("CQE_UNCLAIMED_ABORT", "unclaimed abort did not detach")
+      return;
+    end
+    pending = null;
+    status = fixture.engine.query_runtime_pending(
+      fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, pending);
+    if (status == null || status.ok() || pending != null)
+      `uvm_error("CQE_UNCLAIMED_ABORT_PENDING_CLEANUP",
+                 "abort did not delete paired unclaimed evidence")
+    occupancy = 1;
+    occupancy_pending = 1'b1;
+    status = fixture.engine.query_runtime_occupancy(
+      fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, occupancy, occupancy_pending);
+    if (status == null || status.ok() || occupancy != 0 || occupancy_pending)
+      `uvm_error("CQE_UNCLAIMED_ABORT_OCCUPANCY",
+                 "abort left an observable queue runtime")
+  endtask
+
   // 功能：check_device_publish_preflight_failure 在 attachment access 的首次
   //   write_device 预检处注入 DEVICE_WRITE 拒绝，验证 reservation 被 cancel 且
   //   backend write/commit 均不可观察。
@@ -437,6 +729,112 @@ class rdma_queue_data_engine_device_publish_test extends uvm_test;
       fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, reservation_valid, reservation);
     if (status == null || !status.ok() || reservation_valid || reservation != null)
       `uvm_error("CQE_PREFLIGHT_RESERVATION", "preflight failure retained reservation")
+  endtask
+
+  // 功能：check_device_publish_cancel_failure 注入 access preflight 与 reservation
+  // cancel 双重失败，验证 engine 将未写入 CQE 保留为可查询 recovery 后再由 abort 清理。
+  // 输入/输出及副作用：无显式输入；任务通过 factory access/engine 的一次性故障驱动
+  // 公开 publish/query/poll/recover API，不读取或修改 lifecycle-owned backing。
+  // 失败边界：pending、reservation、poll 意外成功或推进 consumer cursor、或 abort
+  // cleanup 任一不符报告 UVM_ERROR；空 backing 在初始 owner 位相同时可返回其他
+  // 非成功校验状态，故不可把 consumer 不可见性错误限定为 QUEUE_EMPTY。
+  task automatic check_device_publish_cancel_failure();
+    rdma_queue_data_engine_fixture fixture;
+    rdma_queue_post_result posted;
+    rdma_queue_device_publish_result published;
+    rdma_queue_completion_result completion;
+    rdma_hw_cqe_model cqe;
+    rdma_queue_pending_operation pending;
+    rdma_queue_cursor_snapshot reservation;
+    rdma_status status;
+    rdma_status model_status;
+    bit polarity;
+    bit reservation_valid;
+    bit occupancy_pending;
+    int unsigned occupancy;
+    int unsigned producer_index;
+    int unsigned consumer_index;
+    bit producer_wrap;
+    bit consumer_wrap;
+
+    rdma_queue_data_engine::type_id::set_type_override(
+      rdma_device_publish_recovery_fault_engine::get_type());
+    rdma_queue_backing_access::type_id::set_type_override(
+      rdma_cq_device_write_preflight_fault_access::get_type());
+    rdma_device_publish_recovery_fault_engine::admission_failures_remaining = 0;
+    rdma_device_publish_recovery_fault_engine::cancel_failures_remaining = 1;
+    rdma_cq_device_write_preflight_fault_access::reject_next_device_write = 1'b0;
+    fixture = rdma_queue_data_engine_fixture::type_id::create(
+      "device_publish_cancel_failure_fixture");
+    fixture.setup(status);
+    if (status == null || !status.ok()) begin
+      `uvm_error("CQE_CANCEL_SETUP", "cancel failure fixture setup failed")
+      return;
+    end
+    fixture.engine.post_send(fixture.make_send(64'hd532_0000), posted, status);
+    status = fixture.engine.query_runtime_producer_polarity(
+      fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, polarity);
+    cqe = make_cqe_for_outstanding_send(fixture.qp.handle,
+      fixture.qp.local_qp_id, posted, polarity, model_status);
+    if (status == null || !status.ok() || posted == null ||
+        model_status == null || !model_status.ok() || cqe == null) begin
+      `uvm_error("CQE_CANCEL_MODEL", "cancel failure setup failed")
+      return;
+    end
+    published = null;
+    rdma_cq_device_write_preflight_fault_access::reject_next_device_write = 1'b1;
+    publish_cqe_for_test(fixture.engine, fixture.cq.handle, cqe,
+                         published, status);
+    rdma_cq_device_write_preflight_fault_access::reject_next_device_write = 1'b0;
+    if (status == null || status.code != RDMA_SC_RECOVERY_REQUIRED ||
+        published != null) begin
+      `uvm_error("CQE_CANCEL_PUBLISH", "cancel failure did not enter recovery")
+      return;
+    end
+    pending = null;
+    status = fixture.engine.query_runtime_pending(
+      fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, pending);
+    if (status == null || !status.ok() || pending == null ||
+        !pending.device_producer || pending.device_write_attempted) begin
+      `uvm_error("CQE_CANCEL_PENDING", "cancel failure lost no-write recovery evidence")
+      return;
+    end
+    occupancy = 1;
+    occupancy_pending = 1'b0;
+    status = fixture.engine.query_runtime_occupancy(
+      fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, occupancy, occupancy_pending);
+    if (status == null || !status.ok() || occupancy != 0 || !occupancy_pending)
+      `uvm_error("CQE_CANCEL_OCCUPANCY", "cancel failure changed committed occupancy")
+    reservation_valid = 1'b0;
+    reservation = null;
+    status = fixture.engine.query_runtime_device_reservation(
+      fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, reservation_valid, reservation);
+    if (status == null || !status.ok() || !reservation_valid || reservation == null ||
+        reservation.index != pending.cursor.index || reservation.wrap != pending.cursor.wrap)
+      `uvm_error("CQE_CANCEL_RESERVATION", "cancel failure lost reserved slot")
+    completion = null;
+    fixture.engine.poll_cqe(fixture.cq.handle, 0, completion, status);
+    if (status == null || status.ok() || completion != null)
+      `uvm_error("CQE_CANCEL_INVISIBLE",
+                 "cancel-failed CQE produced a visible completion before abort")
+    status = fixture.engine.query_runtime_cursors(
+      fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, producer_index, producer_wrap,
+      consumer_index, consumer_wrap);
+    if (status == null || !status.ok() || producer_index != 0 || producer_wrap ||
+        consumer_index != 0 || consumer_wrap)
+      `uvm_error("CQE_CANCEL_CURSOR",
+                 "cancel-failed CQE advanced a cursor before abort")
+    fixture.engine.recover_queue(fixture.cq.handle,
+      RDMA_QUEUE_RECOVERY_ABORT_AND_DETACH, 1'b1, status);
+    if (status == null || !status.ok()) begin
+      `uvm_error("CQE_CANCEL_ABORT", "cancel failure abort did not detach")
+      return;
+    end
+    pending = null;
+    status = fixture.engine.query_runtime_pending(
+      fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, pending);
+    if (status == null || status.ok() || pending != null)
+      `uvm_error("CQE_CANCEL_ABORT_CLEANUP", "cancel abort retained pending evidence")
   endtask
 
   // 功能：check_device_publish_stale_route 拍平 attachment 的冻结 route/epoch 与
@@ -671,7 +1069,10 @@ class rdma_queue_data_engine_device_publish_test extends uvm_test;
     if (poll_status == null || poll_status.code != RDMA_SC_QUEUE_EMPTY ||
         completion != null)
       `uvm_error("CQE_EMPTY", "second CQE poll did not prove occupancy is zero")
+    check_unclaimed_pending_kind_authority();
+    check_unclaimed_pending_abort();
     check_device_publish_preflight_failure();
+    check_device_publish_cancel_failure();
     check_device_publish_fault_recovery("CQE_WRITE_FAIL", 0);
     check_device_publish_fault_recovery("CQE_READ_FAIL", 1);
     check_device_publish_fault_recovery("CQE_READ_MISMATCH", 2);

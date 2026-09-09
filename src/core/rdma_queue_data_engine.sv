@@ -1110,7 +1110,7 @@ class rdma_queue_data_engine extends uvm_object;
       evidence == RDMA_QUEUE_MMIO_AMBIGUOUS;
     prepared_pending.consumer_doorbell_succeeded =
       evidence == RDMA_QUEUE_MMIO_SUCCESS;
-    status = attachment.runtime.enter_recovery_prepared(prepared_pending);
+    status = admit_device_publish_recovery(attachment, prepared_pending);
     if (status != null && status.ok()) begin
       status = attachment.runtime.record_recovery_failure(evidence);
       final_status = bad("device publish entered recovery",
@@ -1137,6 +1137,26 @@ class rdma_queue_data_engine extends uvm_object;
     final_status = bad("device recovery admission failed; evidence retained",
                        RDMA_SC_RECOVERY_REQUIRED);
   endtask
+
+  // 设计说明：device publish 的 runtime admission 是写后恢复证据进入状态机的
+  //   唯一边界。保留此 virtual 分派使故障注入能在不公开 attachment/backing 的
+  //   前提下验证 engine-owned unclaimed evidence 的保留与回收路径。
+  // 功能：admit_device_publish_recovery 将完整的 device pending 交给 attachment
+  //   runtime 接管，默认保持 runtime 的真实 state/identity 校验。
+  // 输入/输出及副作用：attachment、prepared_pending 为输入；成功时 runtime 接管
+  //   pending 并进入 recovery，函数不修改 Host-memory、backing 或 engine 表。
+  // 失败边界：attachment/runtime/pending 缺失返回 INVALID_STATE；runtime 拒绝、
+  //   返回 null 或状态迁移失败原样交给调用方决定保留 unclaimed evidence。
+  protected virtual function rdma_status admit_device_publish_recovery(
+    rdma_queue_data_attachment attachment,
+    rdma_queue_pending_operation prepared_pending
+  );
+    if (attachment == null || attachment.runtime == null ||
+        prepared_pending == null)
+      return bad("device recovery admission input is incomplete",
+                 RDMA_SC_INVALID_STATE);
+    return attachment.runtime.enter_recovery_prepared(prepared_pending);
+  endfunction
 
   // 功能：finish_device_producer_cancel 将 reservation 的安全取消收敛为可观察
   //   的原始失败或 RECOVERY_REQUIRED；若已有 detached pending，则在取消失败时
@@ -1167,7 +1187,7 @@ class rdma_queue_data_engine extends uvm_object;
                          RDMA_SC_RECOVERY_REQUIRED);
       return;
     end
-    cancel_status = attachment.runtime.cancel_device_producer(reservation);
+    cancel_status = cancel_device_publish_reservation(attachment, reservation);
     if (cancel_status != null && cancel_status.ok()) begin
       final_status = original_status;
       return;
@@ -1185,6 +1205,25 @@ class rdma_queue_data_engine extends uvm_object;
                         " cancel did not clear the device reservation"},
                        RDMA_SC_RECOVERY_REQUIRED);
   endtask
+
+  // 设计说明：preflight cancel 与写后 recovery 的边界不同：前者只能在尚未进入
+  //   backend 时撤销 reservation。virtual 分派把确定性取消失败限制在该边界，避免
+  //   测试取得或改写 lifecycle-owned runtime/backing。
+  // 功能：cancel_device_publish_reservation 请求 attachment runtime 取消指定的
+  //   device producer reservation，默认执行真实 runtime 校验和状态变更。
+  // 输入/输出及副作用：attachment、reservation 为输入；成功时清除 runtime 内的
+  //   reservation，不推进 producer cursor、不访问 Host-memory 或修改 queue plan。
+  // 失败边界：attachment/runtime/reservation 缺失返回 INVALID_STATE；runtime 的
+  //   stale、非 ACTIVE 或已有写入证据拒绝结果原样返回，调用方必须保留恢复证据。
+  protected virtual function rdma_status cancel_device_publish_reservation(
+    rdma_queue_data_attachment attachment,
+    rdma_queue_cursor_snapshot reservation
+  );
+    if (attachment == null || attachment.runtime == null || reservation == null)
+      return bad("device reservation cancel input is incomplete",
+                 RDMA_SC_INVALID_STATE);
+    return attachment.runtime.cancel_device_producer(reservation);
+  endfunction
 
   // 功能：write_commit_device_entry 执行 CQ/CEQ/AEQ 共享的设备发布事务，从
   //   reservation 到 DEVICE_WRITE、readback、producer commit 和 detached result。
@@ -1511,8 +1550,9 @@ class rdma_queue_data_engine extends uvm_object;
   //   detached recovery evidence，使调用方可审计而不能改写内部恢复对象。
   // 输入/输出及副作用：queue_h、kind 为输入，pending 为输出；函数只复制 evidence，
   //   不改变 runtime、unclaimed 表、reservation 或任何 backing ownership。
-  // 失败边界：句柄无效、unclaimed 配对不完整、快照复制失败、runtime 不存在或无
-  //   pending 时返回非成功 status 且 pending 保持 null，原 evidence 不会被删除。
+  // 失败边界：句柄或请求 kind 无效、unclaimed 配对不完整、快照复制失败、runtime
+  //   不存在或无 pending 时返回非成功 status 且 pending 保持 null，原 evidence
+  //   不会被删除或通过错误 kind 泄露。
   function rdma_status query_runtime_pending(
     rdma_handle queue_h, rdma_queue_runtime_kind_e kind,
     output rdma_queue_pending_operation pending
@@ -1524,6 +1564,11 @@ class rdma_queue_data_engine extends uvm_object;
     pending = null;
     if (queue_h == null)
       return bad("pending query queue handle is null", RDMA_SC_INVALID_ARGUMENT);
+    status = lookup_attachment(queue_h, kind, attachment);
+    if (status == null || !status.ok())
+      return status == null ?
+        bad("pending attachment lookup returned null status",
+            RDMA_SC_INVALID_STATE) : status;
     key = identity_key(queue_h);
     if (key != "" && (unclaimed_device_recoveries.exists(key) ||
                        unclaimed_recovery_attachments.exists(key))) begin
@@ -1539,11 +1584,6 @@ class rdma_queue_data_engine extends uvm_object;
         bad("unclaimed pending snapshot returned null status",
             RDMA_SC_RESOURCE_EXHAUSTED) : status;
     end
-    status = lookup_attachment(queue_h, kind, attachment);
-    if (status == null || !status.ok())
-      return status == null ?
-        bad("pending attachment lookup returned null status",
-            RDMA_SC_INVALID_STATE) : status;
     if (attachment == null || attachment.runtime == null)
       return bad("pending attachment is incomplete", RDMA_SC_INVALID_STATE);
     status = attachment.runtime.query_pending(pending);
@@ -4884,7 +4924,7 @@ class rdma_queue_data_engine extends uvm_object;
                      RDMA_SC_RECOVERY_REQUIRED);
         return;
       end
-      status = found.runtime.enter_recovery_prepared(unclaimed_pending);
+      status = admit_device_publish_recovery(found, unclaimed_pending);
       if (status == null || !status.ok()) begin
         // admission 仍失败时，retry 必须保留 engine-owned evidence。abort 可以
         // 仅在 runtime 仍 ACTIVE 且 reservation 与该 evidence 完全匹配时取消
