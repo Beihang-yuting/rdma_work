@@ -100,6 +100,58 @@ class rdma_queue_runtime_test extends uvm_test;
                 RDMA_SC_INVALID_STATE);
   endtask
 
+  // 功能：验证 device ring 的 consumer credit、重复 reservation、recovery pending 与 abort 隔离。
+  // 输入/输出及副作用：构造 AEQ runtime 与 detached pending，调用 producer/consumer/recovery 接口并产生 UVM 断言；fixture 句柄仍由测试持有。
+  // 失败/边界：任一前置配置失败即返回；空 ring 的 consumer commit、重复 reservation、stale producer commit 和 pending quiesce 必须拒绝且不改变账本。
+  task automatic test_device_consumer_credit_and_recovery();
+    rdma_queue_runtime runtime;
+    rdma_queue_cursor_snapshot producer, duplicate, consumer, stale, remaining;
+    rdma_queue_pending_operation pending;
+    rdma_status status;
+    int unsigned occupancy;
+    bit reservation_valid;
+    rdma_queue_runtime_state_e runtime_state;
+
+    runtime = rdma_queue_runtime::type_id::create("device_credit_runtime");
+    expect_ok("CREDIT_CONFIGURE", runtime.configure(
+      queue_handle("aeq", RDMA_RESOURCE_AEQ, 8), RDMA_QUEUE_RUNTIME_AEQ,
+      4, 0, 1'b0, 0, 1'b0, 1'b0));
+    expect_ok("CREDIT_ACTIVATE", runtime.activate());
+    expect_ok("CREDIT_RESERVE", runtime.reserve_device_producer(producer));
+    expect_code("CREDIT_DUPLICATE_RESERVE",
+                runtime.reserve_device_producer(duplicate), RDMA_SC_RESOURCE_BUSY);
+    if (duplicate != null) `uvm_error("CREDIT_DUPLICATE_RESERVE", "output was published")
+    expect_ok("CREDIT_COMMIT", runtime.commit_device_producer(producer));
+    expect_ok("CREDIT_PEEK", runtime.peek_consumer(consumer));
+    expect_ok("CREDIT_CONSUMER_COMMIT", runtime.commit_consumer(consumer));
+    expect_ok("CREDIT_QUERY", runtime.query_occupancy(occupancy));
+    if (occupancy != 0) `uvm_error("CREDIT_QUERY", "consumer did not release credit")
+    expect_code("CREDIT_EMPTY_COMMIT", runtime.commit_consumer(consumer),
+                RDMA_SC_QUEUE_EMPTY);
+
+    expect_ok("RECOVERY_RESERVE", runtime.reserve_device_producer(producer));
+    pending = rdma_queue_pending_operation::type_id::create("device_pending_test");
+    pending.queue_h = queue_handle("aeq", RDMA_RESOURCE_AEQ, 8);
+    pending.kind = RDMA_QUEUE_RUNTIME_AEQ;
+    pending.device_producer = 1'b1;
+    pending.device_write_attempted = 1'b1;
+    pending.mmio_evidence = RDMA_QUEUE_MMIO_NOT_APPLICABLE;
+    expect_ok("RECOVERY_ENTER", runtime.enter_recovery_prepared(pending));
+    expect_code("QUIESCE_PENDING", runtime.begin_quiesce(), RDMA_SC_RESOURCE_BUSY);
+    stale = rdma_queue_cursor_snapshot::type_id::create("stale_device_cursor");
+    stale.index = producer.index;
+    stale.wrap = ~producer.wrap;
+    expect_code("STALE_DEVICE_COMMIT", runtime.commit_device_producer(stale),
+                RDMA_SC_INVALID_STATE);
+    expect_ok("RECOVERY_ABORT", runtime.abort_recovery());
+    expect_ok("ABORT_QUERY_RESERVATION",
+              runtime.query_device_reservation(reservation_valid, remaining));
+    expect_ok("ABORT_QUERY_STATE", runtime.query_state(runtime_state));
+    if (reservation_valid || remaining != null ||
+        runtime_state != RDMA_QUEUE_RUNTIME_DETACHED)
+      `uvm_error("RECOVERY_ABORT", "abort retained device recovery state")
+  endtask
+
   // 功能：在 rdma_queue_runtime_test 中，run_phase 驱动 UVM 阶段中的场景初始化、事务执行和断言收尾，并在退出前释放 objection 或测试资源。
   // 输入/输出及副作用：phase（输入）；phase 由 UVM 提供；task 通过 objection、日志和断言暴露结果，可能调用 DUT 接口但不改变其所有权规则。
   // 失败/边界：run_phase 的 setup/阶段驱动失败时停止新增事务，并按测试生命周期清理 objection 与临时引用。
@@ -116,6 +168,7 @@ class rdma_queue_runtime_test extends uvm_test;
 
     phase.raise_objection(this);
     test_device_ring_reserve_commit_and_visibility();
+    test_device_consumer_credit_and_recovery();
     runtime = rdma_queue_runtime::type_id::create("runtime");
     queue_h = queue_handle("qp", RDMA_RESOURCE_QP, 9);
 
@@ -196,7 +249,7 @@ class rdma_queue_runtime_test extends uvm_test;
                 RDMA_SC_INVALID_ARGUMENT);
     expect_ok("RETRY_ALLOWED",
               runtime.recover(RDMA_QUEUE_RECOVERY_RETRY_PENDING, 1'b1));
-    if (runtime.state != RDMA_QUEUE_RUNTIME_ACTIVE ||
+    if (runtime.state != RDMA_QUEUE_RUNTIME_RECOVERY_REQUIRED ||
         runtime.pending_operation == null)
       `uvm_error("RETRY_ALLOWED", "retry did not retain pending authority")
     phase.drop_objection(this);

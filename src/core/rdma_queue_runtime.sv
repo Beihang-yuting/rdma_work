@@ -32,6 +32,14 @@ typedef enum bit {
   RDMA_QUEUE_RECOVERY_ABORT_AND_DETACH = 1'b1
 } rdma_queue_recovery_action_e;
 
+typedef enum bit [2:0] {
+  RDMA_QUEUE_MMIO_NONE           = 3'd0,
+  RDMA_QUEUE_MMIO_NOT_APPLICABLE = 3'd1,
+  RDMA_QUEUE_MMIO_NO_SUBMIT      = 3'd2,
+  RDMA_QUEUE_MMIO_SUCCESS        = 3'd3,
+  RDMA_QUEUE_MMIO_AMBIGUOUS      = 3'd4
+} rdma_queue_mmio_evidence_e;
+
 class rdma_queue_cursor_snapshot extends uvm_object;
   `uvm_object_utils(rdma_queue_cursor_snapshot)
   int unsigned index;
@@ -62,6 +70,12 @@ class rdma_queue_pending_operation extends uvm_object;
   rdma_handle queue_h;
   rdma_queue_runtime_kind_e kind;
   bit producer;
+  bit device_producer;
+  bit device_write_attempted;
+  bit consumer_committed;
+  bit cq_consumer_committed;
+  bit completion_released;
+  bit consumer_doorbell_succeeded;
   longint unsigned entry_offset;
   rdma_queue_cursor_snapshot cursor;
   // Cursor after the pending operation.  Keeping this value in the evidence
@@ -86,6 +100,14 @@ class rdma_queue_pending_operation extends uvm_object;
   rdma_handle routed_qp_h;
   bit mmio_maybe_submitted;
   bit known_no_mmio;
+  rdma_queue_mmio_evidence_e mmio_evidence;
+  rdma_queue_cursor_snapshot committed_consumer_cursor;
+  rdma_status failure_status;
+  int unsigned entry_size;
+  rdma_route_key_t route;
+  bit route_valid;
+  rdma_reset_epoch_t reset_epoch;
+  bit epoch_valid;
 
   // 功能：构造 rdma_queue_pending_operation，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：queue_h=null；kind=RDMA_QUEUE_RUNTIME_SQ；producer=0；entry_offset=0；cursor=null；next_cursor=null；image=null；request_snapshot=null；其余字段按实现默认值初始化。
   // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
@@ -96,7 +118,11 @@ class rdma_queue_pending_operation extends uvm_object;
     cursor=null; next_cursor=null; image=null; request_snapshot=null;
     signaled=0; wr_id=0; completion_index=0; completion_wrap=0;
     completion_target_valid=0; completion_released=0; routed_qp_h=null;
-    mmio_maybe_submitted=0; known_no_mmio=0;
+    device_producer=0; device_write_attempted=0; consumer_committed=0;
+    cq_consumer_committed=0; consumer_doorbell_succeeded=0;
+    mmio_maybe_submitted=0; known_no_mmio=0; mmio_evidence=RDMA_QUEUE_MMIO_NONE;
+    committed_consumer_cursor=null; failure_status=null; entry_size=0;
+    route='0; route_valid=0; reset_epoch=0; epoch_valid=0;
   endfunction
 
   // 功能：将 rhs 中 rdma_queue_pending_operation 的值字段复制到当前对象，建立与源对象隔离的快照。
@@ -115,9 +141,29 @@ class rdma_queue_pending_operation extends uvm_object;
     end
     kind = source.kind;
     producer = source.producer;
+    device_producer = source.device_producer;
+    device_write_attempted = source.device_write_attempted;
+    consumer_committed = source.consumer_committed;
+    cq_consumer_committed = source.cq_consumer_committed;
+    completion_released = source.completion_released;
+    consumer_doorbell_succeeded = source.consumer_doorbell_succeeded;
     entry_offset = source.entry_offset;
     mmio_maybe_submitted = source.mmio_maybe_submitted;
     known_no_mmio = source.known_no_mmio;
+    mmio_evidence = source.mmio_evidence;
+    entry_size = source.entry_size;
+    route = source.route;
+    route_valid = source.route_valid;
+    reset_epoch = source.reset_epoch;
+    epoch_valid = source.epoch_valid;
+    if (source.committed_consumer_cursor == null) committed_consumer_cursor = null;
+    else begin
+      cloned = source.committed_consumer_cursor.clone();
+      if (cloned == null || !$cast(committed_consumer_cursor, cloned))
+        `uvm_fatal("RDMA_COPY_TYPE", "pending committed cursor clone mismatch");
+    end
+    if (source.failure_status == null) failure_status = null;
+    else failure_status = rdma_clone_status_value(source.failure_status);
     if (source.cursor == null) cursor = null;
     else begin
       cloned = source.cursor.clone();
@@ -186,6 +232,10 @@ class rdma_queue_runtime extends uvm_object;
   bit producer_wrap;
   bit consumer_wrap;
   bit initial_polarity;
+  rdma_route_key_t route;
+  bit route_valid;
+  rdma_reset_epoch_t reset_epoch;
+  bit epoch_valid;
   int unsigned used;
   rdma_queue_pending_operation pending_operation;
   // 中文设计：device-produced ring 不使用 host WQE ledger，必须在同一把 runtime lock
@@ -212,7 +262,7 @@ class rdma_queue_runtime extends uvm_object;
   // 失败/边界：rdma_queue_runtime 构造只建立本地初始状态；本地 semaphore/ledger 等按构造体显式分配，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name="rdma_queue_runtime");
     super.new(name); queue_h=null; kind=RDMA_QUEUE_RUNTIME_SQ; state=RDMA_QUEUE_RUNTIME_DETACHED;
-    depth=0; producer_index=0; consumer_index=0; producer_wrap=0; consumer_wrap=0; initial_polarity=0; used=0; pending_operation=null; host_produced=0; device_reservation_valid=0; device_reservation=null; lock=new(1); recovery_commit_allowed=0;
+    depth=0; producer_index=0; consumer_index=0; producer_wrap=0; consumer_wrap=0; initial_polarity=0; route='0; route_valid=0; reset_epoch=0; epoch_valid=0; used=0; pending_operation=null; host_produced=0; device_reservation_valid=0; device_reservation=null; lock=new(1); recovery_commit_allowed=0;
   endfunction
 
   // 功能：configure 校验 ring 方向、几何与初始游标，构造临时句柄/账本并一次性发布 ATTACHED runtime 配置。
@@ -282,7 +332,7 @@ class rdma_queue_runtime extends uvm_object;
     end else staged_slots = new[0];
     queue_h=queue_snapshot; kind=k; depth=d; producer_index=pi; producer_wrap=pw; consumer_index=ci; consumer_wrap=cw;
     initial_polarity=initial_owner_polarity; host_produced=host_produced_cfg; used=staged_used;
-    slots=staged_slots; pending_operation=null; device_reservation_valid=0; device_reservation=null; recovery_commit_allowed=0; state=RDMA_QUEUE_RUNTIME_ATTACHED; lock.put(1); return rdma_status::success();
+    slots=staged_slots; pending_operation=null; device_reservation_valid=0; device_reservation=null; route='0; route_valid=0; reset_epoch=0; epoch_valid=0; recovery_commit_allowed=0; state=RDMA_QUEUE_RUNTIME_ATTACHED; lock.put(1); return rdma_status::success();
   endfunction
 
   // 功能：在 rdma_queue_runtime 中，activate 校验依赖和 binding 后建立运行边界，只保存非拥有引用并拒绝重复配置。
@@ -946,6 +996,181 @@ class rdma_queue_runtime extends uvm_object;
     pending_operation=copy; pending_operation.mmio_maybe_submitted=mmio_maybe_submitted; pending_operation.known_no_mmio=!mmio_maybe_submitted; state=RDMA_QUEUE_RUNTIME_RECOVERY_REQUIRED; lock.put(1); return rdma_status::success();
   endfunction
 
+  // 功能：enter_recovery_prepared 接管调用方已完成 detached 的 pending，安装 recovery evidence 而不再次 clone。
+  // 输入/输出及副作用：prepared（输入）在成功后由 runtime 接管；状态切换为 RECOVERY_REQUIRED，reservation 保持原快照。
+  // 失败/边界：prepared 为空、runtime 非 ACTIVE、queue identity/kind 不匹配或已有 pending 时返回错误且不改变现有状态。
+  function rdma_status enter_recovery_prepared(rdma_queue_pending_operation prepared);
+    rdma_status lock_status;
+    lock_status = acquire_lock();
+    if (!lock_status.ok()) return lock_status;
+    if (prepared == null || state != RDMA_QUEUE_RUNTIME_ACTIVE ||
+        pending_operation != null) begin
+      lock.put(1); return rdma_status::make(RDMA_SC_INVALID_STATE,
+                                             "runtime cannot install prepared recovery");
+    end
+    if (prepared.queue_h == null || queue_h == null ||
+        prepared.queue_h.kind != queue_h.kind ||
+        prepared.queue_h.function_uid != queue_h.function_uid ||
+        prepared.queue_h.object_id != queue_h.object_id ||
+        prepared.queue_h.generation != queue_h.generation) begin
+      lock.put(1); return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                                             "prepared recovery identity mismatch");
+    end
+    if (prepared.device_producer && !device_reservation_valid) begin
+      lock.put(1); return rdma_status::make(RDMA_SC_INVALID_STATE,
+                                             "device reservation is missing");
+    end
+    pending_operation = prepared;
+    state = RDMA_QUEUE_RUNTIME_RECOVERY_REQUIRED;
+    lock.put(1);
+    return rdma_status::success();
+  endfunction
+
+  // 功能：query_pending 返回当前 recovery pending 的 detached clone。
+  // 输入/输出及副作用：snapshot（输出）先置 null；成功时复制 pending，调用方不得修改 runtime 内部对象。
+  // 失败/边界：没有 pending、runtime 非 RECOVERY_REQUIRED 或 clone 失败时返回非成功状态并保持 null。
+  function rdma_status query_pending(output rdma_queue_pending_operation snapshot);
+    snapshot = null;
+    return snapshot_pending(snapshot);
+  endfunction
+
+  // 功能：query_has_pending 查询 runtime 是否持有 pending evidence。
+  // 输入/输出及副作用：present（输出）先置零，成功时写入 pending_operation != null；不修改 runtime。
+  // 失败/边界：未配置 runtime 或锁忙时返回错误并保持安全输出。
+  function rdma_status query_has_pending(output bit present);
+    rdma_status lock_status;
+    present = 1'b0;
+    lock_status = acquire_lock();
+    if (!lock_status.ok()) return lock_status;
+    if (depth == 0) begin lock.put(1); return rdma_status::make(RDMA_SC_INVALID_STATE,"runtime is unconfigured"); end
+    present = (pending_operation != null);
+    lock.put(1);
+    return rdma_status::success();
+  endfunction
+
+  // 功能：query_state 返回 runtime 当前状态快照。
+  // 输入/输出及副作用：runtime_state（输出）先置 DETACHED，成功时写入 state；不改变状态机。
+  // 失败/边界：锁忙时返回 RESOURCE_BUSY，输出保持 DETACHED。
+  function rdma_status query_state(output rdma_queue_runtime_state_e runtime_state);
+    rdma_status lock_status;
+    runtime_state = RDMA_QUEUE_RUNTIME_DETACHED;
+    lock_status = acquire_lock();
+    if (!lock_status.ok()) return lock_status;
+    runtime_state = state;
+    lock.put(1);
+    return rdma_status::success();
+  endfunction
+
+  // 功能：query_route_epoch 返回 runtime 配置时锁存的 route/reset epoch authority 快照。
+  // 输入/输出及副作用：route_snapshot、route_snapshot_valid、epoch_snapshot、epoch_snapshot_valid（输出）先清零；当前 configure 接口未携带 authority，因此未锁存时返回 INVALID_STATE。
+  // 失败/边界：未配置、route/epoch 无效或锁忙时返回非成功状态，四个 output 保持安全默认值。
+  function rdma_status query_route_epoch(
+    output rdma_route_key_t route_snapshot,
+    output bit route_snapshot_valid,
+    output rdma_reset_epoch_t epoch_snapshot,
+    output bit epoch_snapshot_valid
+  );
+    rdma_status lock_status;
+    route_snapshot = '0;
+    route_snapshot_valid = 1'b0;
+    epoch_snapshot = '0;
+    epoch_snapshot_valid = 1'b0;
+    lock_status = acquire_lock();
+    if (!lock_status.ok()) return lock_status;
+    if (depth == 0 || !route_valid || !epoch_valid) begin
+      lock.put(1);
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "route or reset epoch is unavailable");
+    end
+    route_snapshot = route;
+    route_snapshot_valid = 1'b1;
+    epoch_snapshot = reset_epoch;
+    epoch_snapshot_valid = 1'b1;
+    lock.put(1);
+    return rdma_status::success();
+  endfunction
+
+  // 功能：reservation_matches 判断输入 cursor 是否与当前 device reservation 完全相等。
+  // 输入/输出及副作用：cursor（输入）；仅读取 reservation 与 cursor，不修改 runtime。
+  // 失败/边界：无有效 reservation、输入为空或 runtime 非 device ring 时返回 0。
+  function bit reservation_matches(rdma_queue_cursor_snapshot cursor);
+    if (cursor == null || !device_reservation_valid || device_reservation == null)
+      return 1'b0;
+    return cursor_equal(cursor.index, cursor.wrap,
+                        device_reservation.index, device_reservation.wrap);
+  endfunction
+
+  // 功能：mark_pending_device_write_attempted 标记 pending 已进入 device write backend。
+  // 输入/输出及副作用：无显式输入；在 lock 内更新 device_write_attempted 并归一化 MMIO 投影。
+  // 失败/边界：无 recovery pending 或 pending 非 device producer 时返回 INVALID_STATE。
+  function rdma_status mark_pending_device_write_attempted();
+    rdma_status lock_status;
+    lock_status = acquire_lock();
+    if (!lock_status.ok()) return lock_status;
+    if (pending_operation == null || !pending_operation.device_producer) begin lock.put(1); return rdma_status::make(RDMA_SC_INVALID_STATE,"device pending is unavailable"); end
+    pending_operation.device_write_attempted = 1'b1;
+    pending_operation.mmio_evidence = RDMA_QUEUE_MMIO_AMBIGUOUS;
+    pending_operation.mmio_maybe_submitted = 1'b1;
+    pending_operation.known_no_mmio = 1'b0;
+    lock.put(1); return rdma_status::success();
+  endfunction
+
+  // 功能：mark_pending_consumer_doorbell_succeeded 记录 consumer doorbell 的确定成功结果。
+  // 输入/输出及副作用：无显式输入；更新 pending 阶段位及 MMIO evidence。
+  // 失败/边界：无 pending 或 doorbell 已明确 ambiguous 时返回 INVALID_STATE，禁止伪造成功。
+  function rdma_status mark_pending_consumer_doorbell_succeeded();
+    rdma_status lock_status;
+    lock_status = acquire_lock();
+    if (!lock_status.ok()) return lock_status;
+    if (pending_operation == null || pending_operation.mmio_evidence == RDMA_QUEUE_MMIO_AMBIGUOUS) begin lock.put(1); return rdma_status::make(RDMA_SC_INVALID_STATE,"consumer doorbell evidence is unavailable"); end
+    pending_operation.consumer_doorbell_succeeded = 1'b1;
+    pending_operation.mmio_evidence = RDMA_QUEUE_MMIO_SUCCESS;
+    pending_operation.mmio_maybe_submitted = 1'b0;
+    pending_operation.known_no_mmio = 1'b0;
+    lock.put(1); return rdma_status::success();
+  endfunction
+
+  // 功能：mark_pending_consumer_committed 标记 CI 已提交，并保存提交后 cursor 证据。
+  // 输入/输出及副作用：无显式输入；更新 consumer_committed/cq_consumer_committed 与 committed_consumer_cursor。
+  // 失败/边界：无 pending、未确认 doorbell（consumer pending）或 CI 游标不匹配时返回 INVALID_STATE。
+  function rdma_status mark_pending_consumer_committed();
+    rdma_status lock_status;
+    lock_status = acquire_lock();
+    if (!lock_status.ok()) return lock_status;
+    if (pending_operation == null || (!pending_operation.device_producer && !pending_operation.consumer_doorbell_succeeded)) begin lock.put(1); return rdma_status::make(RDMA_SC_INVALID_STATE,"consumer commit ordering is invalid"); end
+    pending_operation.consumer_committed = 1'b1;
+    if (pending_operation.next_cursor != null) begin
+      pending_operation.committed_consumer_cursor = rdma_queue_cursor_snapshot::type_id::create("committed_consumer_cursor");
+      pending_operation.committed_consumer_cursor.index = pending_operation.next_cursor.index;
+      pending_operation.committed_consumer_cursor.wrap = pending_operation.next_cursor.wrap;
+    end
+    lock.put(1); return rdma_status::success();
+  endfunction
+
+  // 功能：mark_pending_cq_consumer_committed 记录 CQ consumer CI 已完成的兼容别名阶段。
+  // 输入/输出及副作用：无显式输入；仅在 consumer_committed 已置位时更新 cq_consumer_committed。
+  // 失败/边界：无 pending 或 consumer_committed 为零时返回 INVALID_STATE，不改变阶段位。
+  function rdma_status mark_pending_cq_consumer_committed();
+    rdma_status lock_status;
+    lock_status = acquire_lock();
+    if (!lock_status.ok()) return lock_status;
+    if (pending_operation == null || !pending_operation.consumer_committed) begin lock.put(1); return rdma_status::make(RDMA_SC_INVALID_STATE,"CQ consumer commit ordering is invalid"); end
+    pending_operation.cq_consumer_committed = 1'b1;
+    lock.put(1); return rdma_status::success();
+  endfunction
+
+  // 功能：mark_pending_completion_released 标记 CQ 对应 WQE 已释放，保证恢复路径幂等。
+  // 输入/输出及副作用：无显式输入；更新 completion_released。
+  // 失败/边界：无 pending、CI 未提交或目标不是有效 CQ completion 时返回 INVALID_STATE。
+  function rdma_status mark_pending_completion_released();
+    rdma_status lock_status;
+    lock_status = acquire_lock();
+    if (!lock_status.ok()) return lock_status;
+    if (pending_operation == null || !pending_operation.consumer_committed || !pending_operation.completion_target_valid) begin lock.put(1); return rdma_status::make(RDMA_SC_INVALID_STATE,"completion release ordering is invalid"); end
+    pending_operation.completion_released = 1'b1;
+    lock.put(1); return rdma_status::success();
+  endfunction
+
   // Recovery execution is owned by rdma_queue_data_engine.  These helpers
   // only commit the state transition once that engine has completed the
   // replay, or preserve the evidence when replay itself fails.
@@ -961,6 +1186,22 @@ class rdma_queue_runtime extends uvm_object;
       lock.put(1);
       return rdma_status::make(RDMA_SC_INVALID_STATE,
                                "queue runtime has no pending recovery");
+    end
+    if (pending_operation.device_producer) begin
+      if (!pending_operation.device_write_attempted || device_reservation_valid) begin
+        lock.put(1);
+        return rdma_status::make(RDMA_SC_INVALID_STATE,
+                                 "device recovery stages are incomplete");
+      end
+      if (kind == RDMA_QUEUE_RUNTIME_CQ &&
+          (!pending_operation.consumer_doorbell_succeeded ||
+           !pending_operation.consumer_committed ||
+           (pending_operation.completion_target_valid &&
+            !pending_operation.completion_released))) begin
+        lock.put(1);
+        return rdma_status::make(RDMA_SC_INVALID_STATE,
+                                 "CQ recovery stages are incomplete");
+      end
     end
     pending_operation = null;
     device_reservation_valid = 1'b0;
@@ -1073,9 +1314,36 @@ class rdma_queue_runtime extends uvm_object;
     if(action==RDMA_QUEUE_RECOVERY_RETRY_PENDING) begin
       if(pending_operation.mmio_maybe_submitted) begin lock.put(1); return rdma_status::make(RDMA_SC_RECOVERY_REQUIRED,"pending MMIO outcome is ambiguous"); end
       if(!caller_confirmed_no_submit) begin lock.put(1); return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,"retry requires caller confirmation"); end
-      state=RDMA_QUEUE_RUNTIME_ACTIVE; lock.put(1); return rdma_status::success();
+      // caller confirmation only records that retry is permitted; pending
+      // evidence remains isolated until the engine completes each stage.
+      lock.put(1); return rdma_status::success();
     end
     if(action==RDMA_QUEUE_RECOVERY_ABORT_AND_DETACH) begin state=RDMA_QUEUE_RUNTIME_DETACHED; lock.put(1); return rdma_status::success(); end
     lock.put(1); return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,"recovery action is invalid");
+  endfunction
+
+  // 功能：record_recovery_failure（枚举重载）以 MMIO evidence 为唯一 authority 更新 recovery 阶段投影。
+  // 输入/输出及副作用：evidence（输入）；在 lock 内写入 mmio_evidence，并同步 known_no_mmio/mmio_maybe_submitted/consumer_doorbell_succeeded。
+  // 失败/边界：无 recovery pending 或 evidence 非法时返回非成功状态；不会把 SUCCESS 覆盖成 NO_SUBMIT。
+  function rdma_status record_recovery_failure(rdma_queue_mmio_evidence_e evidence);
+    rdma_status lock_status;
+    lock_status = acquire_lock();
+    if (!lock_status.ok()) return lock_status;
+    if (pending_operation == null) begin lock.put(1); return rdma_status::make(RDMA_SC_INVALID_STATE,"queue runtime has no pending recovery"); end
+    if (!(evidence inside {RDMA_QUEUE_MMIO_NONE, RDMA_QUEUE_MMIO_NOT_APPLICABLE,
+                           RDMA_QUEUE_MMIO_NO_SUBMIT, RDMA_QUEUE_MMIO_SUCCESS,
+                           RDMA_QUEUE_MMIO_AMBIGUOUS})) begin
+      lock.put(1); return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,"MMIO evidence is invalid");
+    end
+    if (pending_operation.mmio_evidence == RDMA_QUEUE_MMIO_SUCCESS &&
+        evidence != RDMA_QUEUE_MMIO_SUCCESS) begin
+      lock.put(1); return rdma_status::make(RDMA_SC_INVALID_STATE,"MMIO success evidence is immutable");
+    end
+    pending_operation.mmio_evidence = evidence;
+    pending_operation.known_no_mmio = (evidence inside {RDMA_QUEUE_MMIO_NOT_APPLICABLE, RDMA_QUEUE_MMIO_NO_SUBMIT});
+    pending_operation.mmio_maybe_submitted = (evidence == RDMA_QUEUE_MMIO_AMBIGUOUS);
+    pending_operation.consumer_doorbell_succeeded = (evidence == RDMA_QUEUE_MMIO_SUCCESS);
+    lock.put(1);
+    return rdma_status::success();
   endfunction
 endclass
