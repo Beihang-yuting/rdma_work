@@ -292,24 +292,27 @@ class rdma_queue_slot_ledger_entry extends uvm_object;
 endclass
 
 // 设计说明：rdma_queue_runtime 是单 attachment 的并发状态 authority；所有
-// reservation/pending/ledger/retry 变更都必须在同一把 lock 下完成。basic ring
-// 字段暂保留 public 以兼容现有 data-engine 读取，新测试与新调用方应使用 query API。
+// reservation/pending/ledger/retry 变更都必须在同一把 lock 下完成。仅保留既有
+// state/depth/PI/CI/used 标量兼容读取；identity、方向、polarity 与 route/epoch
+// authority 必须保持 protected，并通过带锁 detached/value query 发布。
 class rdma_queue_runtime extends uvm_object;
   `uvm_object_utils(rdma_queue_runtime)
-  rdma_handle queue_h;
-  rdma_queue_runtime_kind_e kind;
   rdma_queue_runtime_state_e state;
   int unsigned depth;
   int unsigned producer_index;
   int unsigned consumer_index;
   bit producer_wrap;
   bit consumer_wrap;
-  bit initial_polarity;
-  rdma_route_key_t route;
-  bit route_valid;
-  rdma_reset_epoch_t reset_epoch;
-  bit epoch_valid;
   int unsigned used;
+  // 中文设计：以下 attachment 配置共同决定 queue authority 与 ring 方向；它们
+  // 只能由 configure/set_route_epoch/copy_ring_state 在 runtime lock 内发布。
+  protected rdma_handle queue_h;
+  protected rdma_queue_runtime_kind_e kind;
+  protected bit initial_polarity;
+  protected rdma_route_key_t route;
+  protected bit route_valid;
+  protected rdma_reset_epoch_t reset_epoch;
+  protected bit epoch_valid;
   // 中文设计：device-produced ring 不使用 host WQE ledger，必须在同一把 runtime lock
   // 保护下保存单一 detached reservation，供写入/提交/恢复阶段共享且不泄露内部句柄。
   protected bit host_produced;
@@ -852,6 +855,224 @@ class rdma_queue_runtime extends uvm_object;
     return make_runtime_status(RDMA_SC_OK, "");
   endfunction
 
+  // 功能：handle_value_equal 对两个 nullable handle 执行完整 identity 值比较，
+  //   供 prepared recovery 区分同一对象与跨 kind/Function/generation 的证据。
+  // 输入/输出及副作用：lhs/rhs（输入）；只读四个 identity 字段并返回 bit，
+  //   不 clone、修改或接管任一 handle。
+  // 失败/边界：两个 null 视为相等；仅一侧 null 或任一 identity 字段不等时返回 0。
+  protected function bit handle_value_equal(rdma_handle lhs, rdma_handle rhs);
+    if (lhs == null || rhs == null)
+      return lhs == null && rhs == null;
+    return lhs.kind == rhs.kind &&
+           lhs.function_uid == rhs.function_uid &&
+           lhs.object_id == rhs.object_id &&
+           lhs.generation == rhs.generation;
+  endfunction
+
+  // 功能：image_value_equal 比较 recovery image 的全部 metadata、目标地址、
+  //   原始 bytes 与 field_summary，防止不同硬件事务共享同一 cursor 后合并阶段。
+  // 输入/输出及副作用：lhs/rhs（输入）；逐值只读并返回 bit，不修改动态队列。
+  // 失败/边界：两个 null 视为相等；长度、任一 metadata/byte/summary 不同均返回 0。
+  protected function bit image_value_equal(rdma_hw_image lhs, rdma_hw_image rhs);
+    if (lhs == null || rhs == null)
+      return lhs == null && rhs == null;
+    if (lhs.length != rhs.length || lhs.alignment != rhs.alignment ||
+        lhs.endian != rhs.endian || lhs.image_kind != rhs.image_kind ||
+        lhs.hardware_version != rhs.hardware_version ||
+        lhs.function_generation != rhs.function_generation ||
+        lhs.write_target_kind != rhs.write_target_kind ||
+        lhs.backing_target != rhs.backing_target ||
+        lhs.hmc_target != rhs.hmc_target || lhs.bar_target != rhs.bar_target ||
+        lhs.bytes.size() != rhs.bytes.size() ||
+        lhs.field_summary.size() != rhs.field_summary.size())
+      return 1'b0;
+    foreach (lhs.bytes[i])
+      if (lhs.bytes[i] != rhs.bytes[i]) return 1'b0;
+    foreach (lhs.field_summary[i])
+      if (lhs.field_summary[i] != rhs.field_summary[i]) return 1'b0;
+    return 1'b1;
+  endfunction
+
+  // 功能：status_value_equal 比较原始 failure_status 的错误分类、硬件上下文、
+  //   transaction identity、严重度、retry 属性与诊断文本。
+  // 输入/输出及副作用：lhs/rhs（输入）；只读 status 并返回 bit，不改写错误快照。
+  // 失败/边界：两个 null 视为相等；仅一侧 null 或任一诊断字段不等时返回 0。
+  protected function bit status_value_equal(rdma_status lhs, rdma_status rhs);
+    if (lhs == null || rhs == null)
+      return lhs == null && rhs == null;
+    return lhs.category == rhs.category && lhs.code == rhs.code &&
+           lhs.hardware_code == rhs.hardware_code &&
+           lhs.hardware_code_valid == rhs.hardware_code_valid &&
+           lhs.source_engine == rhs.source_engine &&
+           lhs.function_uid == rhs.function_uid &&
+           lhs.generation == rhs.generation &&
+           lhs.resource_id == rhs.resource_id &&
+           lhs.command_id == rhs.command_id && lhs.wr_id == rhs.wr_id &&
+           lhs.severity == rhs.severity && lhs.retryable == rhs.retryable &&
+           lhs.message == rhs.message;
+  endfunction
+
+  // 功能：address_vector_value_equal 比较 post-send request 内完整 UD
+  //   address-vector，包括固定 destination_ip 数组和全部转发/封装属性。
+  // 输入/输出及副作用：lhs/rhs（输入）；逐字段只读并返回 bit，不修改 AV。
+  // 失败/边界：两个 null 视为相等；仅一侧 null 或任一路由字段不等时返回 0。
+  protected function bit address_vector_value_equal(
+    rdma_address_vector lhs, rdma_address_vector rhs
+  );
+    if (lhs == null || rhs == null)
+      return lhs == null && rhs == null;
+    if (lhs.source_address_index != rhs.source_address_index ||
+        lhs.source_vport != rhs.source_vport ||
+        lhs.destination_vport != rhs.destination_vport ||
+        lhs.destination_port != rhs.destination_port ||
+        lhs.destination_mac != rhs.destination_mac || lhs.ipv6 != rhs.ipv6 ||
+        lhs.vlan_enable != rhs.vlan_enable || lhs.cfi != rhs.cfi ||
+        lhs.lag_enable != rhs.lag_enable ||
+        lhs.tunnel_enable != rhs.tunnel_enable ||
+        lhs.forwarding_enable != rhs.forwarding_enable ||
+        lhs.vlan_id != rhs.vlan_id ||
+        lhs.traffic_class != rhs.traffic_class ||
+        lhs.flow_label != rhs.flow_label || lhs.hop_limit != rhs.hop_limit ||
+        lhs.udp_source_port != rhs.udp_source_port ||
+        lhs.\priority  != rhs.\priority  ||
+        lhs.multicast != rhs.multicast ||
+        lhs.forwarding_mode != rhs.forwarding_mode)
+      return 1'b0;
+    foreach (lhs.destination_ip[i])
+      if (lhs.destination_ip[i] != rhs.destination_ip[i]) return 1'b0;
+    return 1'b1;
+  endfunction
+
+  // 功能：request_value_equal 按实际 post-send/post-recv subclass 比较 semantic
+  //   base、owner、nested handles/address-vector、payload 与每个 nullable SGE。
+  // 输入/输出及副作用：lhs/rhs（输入）；只读完整 request object graph 并返回 bit，
+  //   不 clone 或改变 caller/runtime 持有的 request。
+  // 失败/边界：两个 null 视为相等；subclass 不同、不支持的 subclass、任一 nested
+  //   null 形态或值字段不同均返回 0。
+  protected function bit request_value_equal(
+    rdma_semantic_request lhs, rdma_semantic_request rhs
+  );
+    rdma_post_send_req lhs_send;
+    rdma_post_send_req rhs_send;
+    rdma_post_recv_req lhs_recv;
+    rdma_post_recv_req rhs_recv;
+
+    if (lhs == null || rhs == null)
+      return lhs == null && rhs == null;
+    if (lhs.request_id != rhs.request_id ||
+        lhs.correlation_id != rhs.correlation_id ||
+        !handle_value_equal(lhs.owner, rhs.owner) ||
+        lhs.expected_status_code != rhs.expected_status_code ||
+        lhs.timeout_policy != rhs.timeout_policy ||
+        lhs.timeout_value != rhs.timeout_value)
+      return 1'b0;
+
+    if ($cast(lhs_send, lhs)) begin
+      if (!$cast(rhs_send, rhs)) return 1'b0;
+      if (!handle_value_equal(lhs_send.qp_h, rhs_send.qp_h) ||
+          lhs_send.wr_id != rhs_send.wr_id ||
+          lhs_send.transport != rhs_send.transport ||
+          lhs_send.opcode != rhs_send.opcode ||
+          lhs_send.inline_data != rhs_send.inline_data ||
+          lhs_send.payload.size() != rhs_send.payload.size() ||
+          lhs_send.signaled != rhs_send.signaled ||
+          lhs_send.solicited != rhs_send.solicited ||
+          lhs_send.immediate_data != rhs_send.immediate_data ||
+          lhs_send.remote_addr != rhs_send.remote_addr ||
+          lhs_send.rkey != rhs_send.rkey ||
+          lhs_send.remote_access_valid != rhs_send.remote_access_valid ||
+          lhs_send.rkey_valid != rhs_send.rkey_valid ||
+          lhs_send.destination_qpn != rhs_send.destination_qpn ||
+          lhs_send.qkey != rhs_send.qkey ||
+          lhs_send.invalidate_rkey != rhs_send.invalidate_rkey ||
+          !handle_value_equal(lhs_send.completion_qp_h,
+                              rhs_send.completion_qp_h) ||
+          !handle_value_equal(lhs_send.mr_h, rhs_send.mr_h) ||
+          !handle_value_equal(lhs_send.mw_h, rhs_send.mw_h) ||
+          !handle_value_equal(lhs_send.authority_h, rhs_send.authority_h) ||
+          lhs_send.address_vector_id != rhs_send.address_vector_id ||
+          !address_vector_value_equal(lhs_send.address_vector,
+                                      rhs_send.address_vector) ||
+          lhs_send.fence != rhs_send.fence ||
+          lhs_send.address_vector_valid != rhs_send.address_vector_valid ||
+          lhs_send.sgb_iova != rhs_send.sgb_iova ||
+          lhs_send.compare_value != rhs_send.compare_value ||
+          lhs_send.swap_add_value != rhs_send.swap_add_value ||
+          lhs_send.sges.size() != rhs_send.sges.size())
+        return 1'b0;
+      foreach (lhs_send.payload[i])
+        if (lhs_send.payload[i] != rhs_send.payload[i]) return 1'b0;
+      foreach (lhs_send.sges[i]) begin
+        if (lhs_send.sges[i] == null || rhs_send.sges[i] == null) begin
+          if (!(lhs_send.sges[i] == null && rhs_send.sges[i] == null))
+            return 1'b0;
+        end else if (lhs_send.sges[i].iova != rhs_send.sges[i].iova ||
+                     lhs_send.sges[i].length != rhs_send.sges[i].length ||
+                     lhs_send.sges[i].lkey != rhs_send.sges[i].lkey) begin
+          return 1'b0;
+        end
+      end
+      return 1'b1;
+    end
+
+    if ($cast(lhs_recv, lhs)) begin
+      if (!$cast(rhs_recv, rhs)) return 1'b0;
+      if (!handle_value_equal(lhs_recv.target_h, rhs_recv.target_h) ||
+          !handle_value_equal(lhs_recv.completion_qp_h,
+                              rhs_recv.completion_qp_h) ||
+          lhs_recv.wr_id != rhs_recv.wr_id ||
+          lhs_recv.sges.size() != rhs_recv.sges.size())
+        return 1'b0;
+      foreach (lhs_recv.sges[i]) begin
+        if (lhs_recv.sges[i] == null || rhs_recv.sges[i] == null) begin
+          if (!(lhs_recv.sges[i] == null && rhs_recv.sges[i] == null))
+            return 1'b0;
+        end else if (lhs_recv.sges[i].iova != rhs_recv.sges[i].iova ||
+                     lhs_recv.sges[i].length != rhs_recv.sges[i].length ||
+                     lhs_recv.sges[i].lkey != rhs_recv.sges[i].lkey) begin
+          return 1'b0;
+        end
+      end
+      return 1'b1;
+    end
+    return 1'b0;
+  endfunction
+
+  // 功能：pending_immutable_evidence_equal 比较 prepared 重入不可借用的完整
+  //   transaction evidence；MMIO enum 与阶段位由后续单调 merge 规则单独处理。
+  // 输入/输出及副作用：lhs/rhs（输入）；只读 pending 及嵌套值对象并返回 bit，
+  //   不投影 MMIO、不分配对象、不改变当前 pending。
+  // 失败/边界：任一 pending/null nested immutable、identity/cursor/image/status/
+  //   request/WR/completion/routed-QP/route-epoch 值不等时返回 0。
+  protected function bit pending_immutable_evidence_equal(
+    rdma_queue_pending_operation lhs,
+    rdma_queue_pending_operation rhs
+  );
+    if (lhs == null || rhs == null) return 1'b0;
+    return handle_value_equal(lhs.queue_h, rhs.queue_h) &&
+           lhs.kind == rhs.kind && lhs.producer == rhs.producer &&
+           lhs.device_producer == rhs.device_producer &&
+           lhs.entry_offset == rhs.entry_offset &&
+           lhs.entry_size == rhs.entry_size &&
+           lhs.cursor != null && rhs.cursor != null &&
+           cursor_equal(lhs.cursor.index, lhs.cursor.wrap,
+                        rhs.cursor.index, rhs.cursor.wrap) &&
+           lhs.next_cursor != null && rhs.next_cursor != null &&
+           cursor_equal(lhs.next_cursor.index, lhs.next_cursor.wrap,
+                        rhs.next_cursor.index, rhs.next_cursor.wrap) &&
+           image_value_equal(lhs.image, rhs.image) &&
+           status_value_equal(lhs.failure_status, rhs.failure_status) &&
+           request_value_equal(lhs.request_snapshot, rhs.request_snapshot) &&
+           lhs.wr_id == rhs.wr_id && lhs.signaled == rhs.signaled &&
+           lhs.completion_index == rhs.completion_index &&
+           lhs.completion_wrap == rhs.completion_wrap &&
+           lhs.completion_target_valid == rhs.completion_target_valid &&
+           handle_value_equal(lhs.routed_qp_h, rhs.routed_qp_h) &&
+           lhs.route == rhs.route && lhs.route_valid == rhs.route_valid &&
+           lhs.reset_epoch == rhs.reset_epoch &&
+           lhs.epoch_valid == rhs.epoch_valid;
+  endfunction
+
   // 功能：clone_pending_value 原子建立完整 pending evidence，串联所有 non-fatal value-copy helper。
   // 输入/输出及副作用：source（输入）、copy（输出）先置 null；成功时 copy 包含所有嵌套快照与阶段位，source 不被修改。
   // 失败/边界：source 为空返回 INVALID_ARGUMENT；任一 helper 失败均丢弃 candidate、返回 RESOURCE_EXHAUSTED，runtime 不发布半状态。
@@ -1115,6 +1336,48 @@ class rdma_queue_runtime extends uvm_object;
     recovery_commit_allowed = 0;
     recovery_retry_confirmed = 0;
     state = RDMA_QUEUE_RUNTIME_ATTACHED;
+    lock.put(1);
+    return make_runtime_status(RDMA_SC_OK, "");
+  endfunction
+
+  // 功能：query_attachment_config 返回 configure 锁存的 queue identity、runtime
+  //   kind、producer 方向与 initial polarity，替代外部直接读取 authority 字段。
+  // 输入/输出及副作用：queue_snapshot/kind_snapshot/host_produced_snapshot/
+  //   initial_polarity_snapshot（输出）先置安全默认值；成功时 queue 为 detached clone，
+  //   其余为持锁值快照，不修改 runtime。
+  // 失败/边界：未配置或已 DETACHED、queue handle 缺失、锁忙或 clone 分配失败时
+  //   返回非成功，所有 output 保持 null/SQ/0/0，caller 不得使用默认值作 authority。
+  function rdma_status query_attachment_config(
+    output rdma_handle queue_snapshot,
+    output rdma_queue_runtime_kind_e kind_snapshot,
+    output bit host_produced_snapshot,
+    output bit initial_polarity_snapshot
+  );
+    rdma_status lock_status;
+    rdma_status copy_status;
+
+    queue_snapshot = null;
+    kind_snapshot = RDMA_QUEUE_RUNTIME_SQ;
+    host_produced_snapshot = 1'b0;
+    initial_polarity_snapshot = 1'b0;
+    lock_status = acquire_lock();
+    if (!status_is_ok(lock_status)) return lock_status;
+    if (state == RDMA_QUEUE_RUNTIME_DETACHED || depth == 0 || queue_h == null) begin
+      lock.put(1);
+      return make_runtime_status(RDMA_SC_INVALID_STATE,
+                                 "runtime attachment config is unavailable");
+    end
+    copy_status = clone_handle_value_nonfatal(queue_h, queue_snapshot);
+    if (!status_is_ok(copy_status) || queue_snapshot == null) begin
+      queue_snapshot = null;
+      lock.put(1);
+      return copy_status != null ? copy_status : make_runtime_status(
+        RDMA_SC_RESOURCE_EXHAUSTED,
+        "runtime attachment handle clone returned null status");
+    end
+    kind_snapshot = kind;
+    host_produced_snapshot = host_produced;
+    initial_polarity_snapshot = initial_polarity;
     lock.put(1);
     return make_runtime_status(RDMA_SC_OK, "");
   endfunction
@@ -2753,24 +3016,16 @@ class rdma_queue_runtime extends uvm_object;
                                  "prepared recovery is null");
     end
 
-    // 中文设计：重复 admission 只允许同一 transaction 的阶段/evidence 单调合并；
-    // identity 或 cursor 冲突必须在不修改既有 isolated pending 的前提下拒绝。
+    // 中文设计：重复 admission 先按值比较完整 immutable object graph；只有
+    // queue/cursor/image/status/request/WR/completion/route 全部属于同一 transaction，
+    // 才允许后续 MMIO 投影和阶段位单调合并。
     if (state == RDMA_QUEUE_RUNTIME_RECOVERY_REQUIRED &&
         pending_operation_state != null) begin
-      if (!pending_identity_matches_locked(prepared) ||
-          prepared.device_producer != pending_operation_state.device_producer ||
-          prepared.producer != pending_operation_state.producer ||
-          prepared.cursor == null || pending_operation_state.cursor == null ||
-          !cursor_equal(prepared.cursor.index, prepared.cursor.wrap,
-                        pending_operation_state.cursor.index,
-                        pending_operation_state.cursor.wrap) ||
-          prepared.next_cursor == null || pending_operation_state.next_cursor == null ||
-          !cursor_equal(prepared.next_cursor.index, prepared.next_cursor.wrap,
-                        pending_operation_state.next_cursor.index,
-                        pending_operation_state.next_cursor.wrap)) begin
+      if (!pending_immutable_evidence_equal(prepared,
+                                            pending_operation_state)) begin
         lock.put(1);
         return make_runtime_status(RDMA_SC_INVALID_STATE,
-                                   "prepared recovery transaction conflicts with pending");
+                                   "prepared recovery immutable evidence conflicts");
       end
       if (!(prepared.mmio_evidence inside {RDMA_QUEUE_MMIO_NONE,
                                            RDMA_QUEUE_MMIO_NOT_APPLICABLE,
@@ -2782,24 +3037,8 @@ class rdma_queue_runtime extends uvm_object;
                                    "prepared MMIO evidence is invalid");
       end
 
-      // 中文设计：先验证全部可能失败的 merge 条件，再投影新 evidence；否则
-      // committed cursor 冲突可能在 mmio_evidence/兼容位已改变后才返回错误。
-      if (prepared.entry_size != pending_operation_state.entry_size ||
-          prepared.entry_offset != pending_operation_state.entry_offset ||
-          prepared.route_valid != pending_operation_state.route_valid ||
-          prepared.epoch_valid != pending_operation_state.epoch_valid ||
-          (prepared.route_valid && prepared.route != pending_operation_state.route) ||
-          (prepared.epoch_valid &&
-           prepared.reset_epoch != pending_operation_state.reset_epoch) ||
-          prepared.completion_target_valid !=
-            pending_operation_state.completion_target_valid ||
-          (prepared.completion_target_valid &&
-           (prepared.completion_index != pending_operation_state.completion_index ||
-            prepared.completion_wrap != pending_operation_state.completion_wrap))) begin
-        lock.put(1);
-        return make_runtime_status(RDMA_SC_INVALID_STATE,
-                                   "prepared recovery immutable evidence conflicts");
-      end
+      // 中文设计：immutable 比较与其余阶段校验全部完成后才投影 evidence；否则
+      // committed cursor 冲突可能在 enum/兼容位已改变后才返回错误。
       if (prepared.committed_consumer_cursor != null &&
           (!cursor_equal(prepared.committed_consumer_cursor.index,
                          prepared.committed_consumer_cursor.wrap,
@@ -3620,12 +3859,12 @@ class rdma_queue_runtime extends uvm_object;
     return make_runtime_status(RDMA_SC_OK, "");
   endfunction
 
-  // 功能：recover 处理 retry/abort 控制动作；RETRY_PENDING 只记录一次 caller
-  //   confirmation，实际 backend 与 cursor commit 仍由 data engine 分阶段完成。
+  // 功能：recover 处理 retry/abort 控制动作；RETRY_PENDING 为 no-submit 重放或
+  //   SUCCESS 后仅本地续做记录一次 caller confirmation，实际阶段由 data engine 完成。
   // 输入/输出及副作用：action、caller_confirmed_no_submit（输入）；授权成功仅置
   //   recovery_retry_confirmed 并保持 RECOVERY_REQUIRED/pending，abort 清除全部恢复状态。
-  // 失败/边界：无 pending、evidence 非确定 no-submit、AMBIGUOUS、未确认或 action
-  //   非法时返回对应错误；失败不推进 PI/CI，也不丢失 pending。
+  // 失败/边界：无 pending、NONE/AMBIGUOUS、未确认或 action 非法时返回对应错误；
+  //   AMBIGUOUS 始终不可 retry，SUCCESS 授权也不得重新提交 MMIO。
   function rdma_status recover(rdma_queue_recovery_action_e action, bit caller_confirmed_no_submit=1'b0);
     rdma_status lock_status;
     rdma_queue_mmio_evidence_e evidence;
@@ -3646,18 +3885,19 @@ class rdma_queue_runtime extends uvm_object;
                                    "pending MMIO outcome is ambiguous");
       end
       if (!(evidence inside {RDMA_QUEUE_MMIO_NOT_APPLICABLE,
-                             RDMA_QUEUE_MMIO_NO_SUBMIT})) begin
+                             RDMA_QUEUE_MMIO_NO_SUBMIT,
+                             RDMA_QUEUE_MMIO_SUCCESS})) begin
         lock.put(1);
         return make_runtime_status(RDMA_SC_INVALID_STATE,
-                                   "pending recovery lacks no-submit evidence");
+                                   "pending recovery evidence is not retryable");
       end
       if (!caller_confirmed_no_submit) begin
         lock.put(1);
         return make_runtime_status(RDMA_SC_INVALID_ARGUMENT,
                                    "retry requires caller confirmation");
       end
-      // 中文设计：caller confirmation 只记录本轮允许 retry；data engine 仍需
-      // 显式执行 write、doorbell 与 cursor commit 的每个阶段。
+      // 中文设计：caller confirmation 只记录本轮允许 retry；SUCCESS 表示 MMIO
+      // 已完成，data engine 只能续做 release/CI/complete，不能再提交 doorbell。
       recovery_retry_confirmed = 1'b1;
       lock.put(1);
       return make_runtime_status(RDMA_SC_OK, "");
@@ -3679,8 +3919,8 @@ class rdma_queue_runtime extends uvm_object;
 
   // 功能：record_recovery_failure 原样记录 backend 提供的 MMIO enum，并通过
   //   单调转换表刷新兼容投影；不得根据 direction 或旧 bit 改写 evidence。
-  // 输入/输出及副作用：evidence（输入）；成功时更新 pending evidence/派生位并
-  //   关闭旧 commit gate；无论转换成功与否，本次新结果都会清除未消费 retry 授权。
+  // 输入/输出及副作用：evidence（输入）；成功时更新 pending evidence/派生位、
+  //   关闭旧 commit gate并清除未消费 retry 授权；拒绝转换保留全部原状态。
   // 失败/边界：无 pending、非法 enum、方向冲突、降级或缺少一次性 confirmation
   //   时返回错误；失败不改变原 enum/兼容位和 producer/consumer 账本。
   function rdma_status record_recovery_failure(rdma_queue_mmio_evidence_e evidence);
@@ -3701,9 +3941,10 @@ class rdma_queue_runtime extends uvm_object;
                                  "MMIO evidence is invalid");
     end
     project_status = project_mmio_evidence_locked(evidence);
-    recovery_retry_confirmed = 1'b0;
-    if (status_is_ok(project_status))
+    if (status_is_ok(project_status)) begin
+      recovery_retry_confirmed = 1'b0;
       recovery_commit_allowed = 1'b0;
+    end
     lock.put(1);
     return project_status != null ? project_status :
       make_runtime_status(RDMA_SC_RESOURCE_EXHAUSTED,

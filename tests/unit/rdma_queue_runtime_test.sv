@@ -290,6 +290,62 @@ class rdma_queue_runtime_test extends uvm_test;
                  status.convert2string())
   endfunction
 
+  // 功能：验证 runtime attachment 配置只经带锁值查询公开，并且 queue handle
+  //   返回 detached snapshot，caller 修改查询结果不能伪造内部 identity authority。
+  // 输入/输出及副作用：无显式参数；配置一个 device CQ runtime，两次调用
+  //   query_attachment_config，并在两次查询之间修改第一次返回的 handle generation。
+  // 失败/边界：未配置/clone 失败必须返回非成功且输出安全清零；成功查询应保持
+  //   kind=CQ、host_produced=0、initial_polarity=1，第二次 identity 不受篡改影响。
+  task automatic test_attachment_config_query_is_detached();
+    rdma_queue_runtime runtime;
+    rdma_handle configured_h;
+    rdma_handle first_h;
+    rdma_handle second_h;
+    rdma_queue_runtime_kind_e runtime_kind;
+    rdma_status status;
+    bit host_direction;
+    bit initial_owner_polarity;
+
+    runtime = rdma_queue_runtime::type_id::create(
+      "attachment_config_runtime");
+    configured_h = queue_handle(
+      "attachment_config_cq", RDMA_RESOURCE_CQ, 44);
+    if (runtime == null || configured_h == null) begin
+      `uvm_error("ATTACHMENT_CONFIG_FIXTURE", "fixture allocation failed")
+      return;
+    end
+    status = runtime.configure(
+      configured_h, RDMA_QUEUE_RUNTIME_CQ, 4,
+      0, 1'b0, 0, 1'b0, 1'b0, 1'b1);
+    expect_ok("ATTACHMENT_CONFIG_CONFIGURE", status);
+    if (status == null || !status.ok()) return;
+
+    status = runtime.query_attachment_config(
+      first_h, runtime_kind, host_direction, initial_owner_polarity);
+    expect_ok("ATTACHMENT_CONFIG_QUERY_FIRST", status);
+    if (status == null || !status.ok() || first_h == null) return;
+    if (first_h == configured_h || runtime_kind != RDMA_QUEUE_RUNTIME_CQ ||
+        host_direction || !initial_owner_polarity ||
+        !first_h.same_instance(configured_h))
+      `uvm_error("ATTACHMENT_CONFIG_QUERY_FIRST",
+                 "query did not return detached configuration values")
+
+    first_h.generation++;
+    second_h = null;
+    runtime_kind = RDMA_QUEUE_RUNTIME_SQ;
+    host_direction = 1'b1;
+    initial_owner_polarity = 1'b0;
+    status = runtime.query_attachment_config(
+      second_h, runtime_kind, host_direction, initial_owner_polarity);
+    expect_ok("ATTACHMENT_CONFIG_QUERY_SECOND", status);
+    if (status == null || !status.ok() || second_h == null ||
+        second_h == first_h || !second_h.same_instance(configured_h) ||
+        runtime_kind != RDMA_QUEUE_RUNTIME_CQ || host_direction ||
+        !initial_owner_polarity)
+      `uvm_error("ATTACHMENT_CONFIG_DETACHED",
+                 "caller mutation changed runtime attachment authority")
+  endtask
+
   // 功能：验证 activate 只执行 ATTACHED->ACTIVE 状态迁移，无 route/epoch 时
   //   publish authority 查询、prepared recovery 和 resize-copy 仍分别 fail-closed。
   // 输入输出及副作用：无显式参数；构造 source/target CQ runtime 与一份完整但
@@ -934,6 +990,227 @@ class rdma_queue_runtime_test extends uvm_test;
         !snapshot.consumer_doorbell_succeeded)
       `uvm_error("MMIO_AUTHORIZED_SUCCESS",
                  "SUCCESS projection was not stable")
+  endtask
+
+  // 功能：验证 record_recovery_failure 拒绝 consumer 的 NOT_APPLICABLE 转换时，
+  //   不得消费此前由 recover 记录的一次性 retry confirmation。
+  // 输入/输出及副作用：无显式参数；构造 NO_SUBMIT consumer pending，依次执行
+  //   confirm、非法转换和合法 SUCCESS 转换，并通过 detached query 观察 enum 投影。
+  // 失败/边界：非法方向转换必须返回 INVALID_STATE 且保持 NO_SUBMIT；紧随其后的
+  //   SUCCESS 不重新确认也必须成功，证明拒绝路径未清除 authorization。
+  task automatic test_rejected_mmio_transition_preserves_confirmation();
+    rdma_queue_runtime runtime;
+    rdma_queue_pending_operation pending;
+    rdma_queue_pending_operation snapshot;
+    rdma_status status;
+
+    status = make_consumer_recovery_fixture(
+      "mmio_reject_atomic", 41, 8'h41, RDMA_QUEUE_MMIO_NO_SUBMIT,
+      runtime, pending);
+    expect_ok("MMIO_REJECT_FIXTURE", status);
+    if (status == null || !status.ok()) return;
+    status = runtime.enter_recovery_prepared(pending);
+    expect_ok("MMIO_REJECT_ENTER", status);
+    if (status == null || !status.ok()) return;
+    status = runtime.recover(RDMA_QUEUE_RECOVERY_RETRY_PENDING, 1'b1);
+    expect_ok("MMIO_REJECT_CONFIRM", status);
+    if (status == null || !status.ok()) return;
+
+    expect_code("MMIO_REJECT_DIRECTION",
+                runtime.record_recovery_failure(
+                  RDMA_QUEUE_MMIO_NOT_APPLICABLE),
+                RDMA_SC_INVALID_STATE);
+    status = runtime.query_pending(snapshot);
+    expect_ok("MMIO_REJECT_QUERY", status);
+    if (status == null || !status.ok() || snapshot == null) return;
+    if (snapshot.mmio_evidence != RDMA_QUEUE_MMIO_NO_SUBMIT ||
+        !snapshot.known_no_mmio || snapshot.consumer_doorbell_succeeded)
+      `uvm_error("MMIO_REJECT_ATOMIC",
+                 "rejected transition changed pending evidence")
+
+    status = runtime.record_recovery_failure(RDMA_QUEUE_MMIO_SUCCESS);
+    expect_ok("MMIO_REJECT_CONTINUATION", status);
+    if (status == null || !status.ok()) return;
+    status = runtime.query_pending(snapshot);
+    if (status == null || !status.ok() || snapshot == null ||
+        snapshot.mmio_evidence != RDMA_QUEUE_MMIO_SUCCESS ||
+        !snapshot.consumer_doorbell_succeeded || snapshot.known_no_mmio)
+      `uvm_error("MMIO_REJECT_CONTINUATION",
+                 "preserved confirmation did not authorize SUCCESS")
+  endtask
+
+  // 功能：验证重复 enter_recovery_prepared 只有完整 immutable transaction
+  //   evidence 按值相等时才允许合并，覆盖 image、nested request SGE 和 routed QP。
+  // 输入/输出及副作用：无显式参数；分别建立 CQ consumer 与 SQ producer pending，
+  //   从 query_pending 取得 detached 副本后篡改单个嵌套字段并尝试重复 admission。
+  // 失败/边界：每个不一致必须返回 INVALID_STATE；拒绝后再次查询必须仍保留原
+  //   image byte、SGE lkey 或 routed_qp_h object_id，不能发布部分 evidence/阶段。
+  task automatic test_prepared_immutable_evidence_atomicity();
+    rdma_queue_runtime consumer_runtime;
+    rdma_queue_runtime request_runtime;
+    rdma_queue_pending_operation pending;
+    rdma_queue_pending_operation snapshot;
+    rdma_queue_pending_operation original;
+    rdma_post_send_req request;
+    rdma_post_send_req request_snapshot;
+    rdma_sge sge;
+    rdma_handle sq_h;
+    rdma_route_key_t route;
+    rdma_reset_epoch_t epoch;
+    rdma_status status;
+    byte unsigned original_image_byte;
+    bit [31:0] original_lkey;
+    int unsigned original_routed_object_id;
+
+    status = make_consumer_recovery_fixture(
+      "immutable_consumer", 42, 8'h42, RDMA_QUEUE_MMIO_SUCCESS,
+      consumer_runtime, pending);
+    expect_ok("IMMUTABLE_CONSUMER_FIXTURE", status);
+    if (status == null || !status.ok()) return;
+    pending.routed_qp_h = queue_handle(
+      "immutable_consumer_qp", RDMA_RESOURCE_QP, 142);
+    if (pending.routed_qp_h == null) begin
+      `uvm_error("IMMUTABLE_CONSUMER_FIXTURE",
+                 "routed QP allocation failed")
+      return;
+    end
+    status = consumer_runtime.enter_recovery_prepared(pending);
+    expect_ok("IMMUTABLE_CONSUMER_ENTER", status);
+    if (status == null || !status.ok()) return;
+
+    status = consumer_runtime.query_pending(snapshot);
+    expect_ok("IMMUTABLE_IMAGE_QUERY", status);
+    if (status == null || !status.ok() || snapshot == null ||
+        snapshot.image == null || snapshot.image.bytes.size() == 0) return;
+    original_image_byte = snapshot.image.bytes[0];
+    snapshot.image.bytes[0] ^= 8'hff;
+    expect_code("IMMUTABLE_IMAGE_MISMATCH",
+                consumer_runtime.enter_recovery_prepared(snapshot),
+                RDMA_SC_INVALID_STATE);
+    status = consumer_runtime.query_pending(original);
+    if (status == null || !status.ok() || original == null ||
+        original.image == null || original.image.bytes.size() == 0 ||
+        original.image.bytes[0] != original_image_byte)
+      `uvm_error("IMMUTABLE_IMAGE_ATOMIC",
+                 "image mismatch changed original pending")
+
+    status = consumer_runtime.query_pending(snapshot);
+    expect_ok("IMMUTABLE_ROUTED_QP_QUERY", status);
+    if (status == null || !status.ok() || snapshot == null ||
+        snapshot.routed_qp_h == null) return;
+    original_routed_object_id = snapshot.routed_qp_h.object_id;
+    snapshot.routed_qp_h.object_id++;
+    expect_code("IMMUTABLE_ROUTED_QP_MISMATCH",
+                consumer_runtime.enter_recovery_prepared(snapshot),
+                RDMA_SC_INVALID_STATE);
+    status = consumer_runtime.query_pending(original);
+    if (status == null || !status.ok() || original == null ||
+        original.routed_qp_h == null ||
+        original.routed_qp_h.object_id != original_routed_object_id)
+      `uvm_error("IMMUTABLE_ROUTED_QP_ATOMIC",
+                 "routed QP mismatch changed original pending")
+
+    sq_h = queue_handle("immutable_request_sq", RDMA_RESOURCE_QP, 43);
+    route = fixture_route(8'h43);
+    epoch = rdma_reset_epoch_t'(64'h443);
+    request_runtime = rdma_queue_runtime::type_id::create(
+      "immutable_request_runtime");
+    if (sq_h == null || request_runtime == null) begin
+      `uvm_error("IMMUTABLE_REQUEST_FIXTURE",
+                 "host runtime allocation failed")
+      return;
+    end
+    status = request_runtime.configure(
+      sq_h, RDMA_QUEUE_RUNTIME_SQ, 4, 0, 1'b0, 0, 1'b0, 1'b1);
+    expect_ok("IMMUTABLE_REQUEST_CONFIGURE", status);
+    if (status == null || !status.ok()) return;
+    status = request_runtime.set_route_epoch(route, epoch);
+    expect_ok("IMMUTABLE_REQUEST_AUTHORITY", status);
+    if (status == null || !status.ok()) return;
+    status = request_runtime.activate();
+    expect_ok("IMMUTABLE_REQUEST_ACTIVATE", status);
+    if (status == null || !status.ok()) return;
+
+    pending = rdma_queue_pending_operation::type_id::create(
+      "immutable_request_pending");
+    request = rdma_post_send_req::type_id::create(
+      "immutable_request_value");
+    sge = rdma_sge::type_id::create("immutable_request_sge");
+    if (pending == null || request == null || sge == null) begin
+      `uvm_error("IMMUTABLE_REQUEST_FIXTURE",
+                 "pending request allocation failed")
+      return;
+    end
+    pending.queue_h = queue_handle(
+      "immutable_request_pending_sq", RDMA_RESOURCE_QP, 43);
+    pending.kind = RDMA_QUEUE_RUNTIME_SQ;
+    pending.producer = 1'b1;
+    pending.cursor = rdma_queue_cursor_snapshot::type_id::create(
+      "immutable_request_cursor");
+    pending.next_cursor = rdma_queue_cursor_snapshot::type_id::create(
+      "immutable_request_next");
+    pending.image = rdma_hw_image::type_id::create(
+      "immutable_request_image");
+    pending.failure_status = rdma_status::make(
+      RDMA_SC_DMA_TRANSLATION, "immutable request injected failure");
+    request.qp_h = queue_handle(
+      "immutable_request_qp", RDMA_RESOURCE_QP, 43);
+    if (pending.queue_h == null || pending.cursor == null ||
+        pending.next_cursor == null || pending.image == null ||
+        pending.failure_status == null || request.qp_h == null) begin
+      `uvm_error("IMMUTABLE_REQUEST_FIXTURE",
+                 "nested request evidence allocation failed")
+      return;
+    end
+    pending.cursor.index = 0;
+    pending.cursor.wrap = 1'b0;
+    pending.next_cursor.index = 1;
+    pending.next_cursor.wrap = 1'b0;
+    pending.entry_size = 64;
+    pending.entry_offset = 0;
+    pending.image.length = 64;
+    pending.image.alignment = 64;
+    pending.image.endian = RDMA_ENDIAN_BIG;
+    pending.image.image_kind = RDMA_IMAGE_SQE;
+    pending.image.hardware_version = RDMA_HW_VERSION;
+    pending.image.function_generation = 5;
+    for (int unsigned i = 0; i < 64; i++)
+      pending.image.bytes.push_back(byte'(i));
+    sge.iova.value = 64'h1000;
+    sge.length = 16;
+    sge.lkey = 32'h1234_5678;
+    request.sges.push_back(sge);
+    pending.request_snapshot = request;
+    pending.wr_id = 64'h4243;
+    pending.signaled = 1'b1;
+    pending.mmio_evidence = RDMA_QUEUE_MMIO_NO_SUBMIT;
+    pending.route = route;
+    pending.route_valid = 1'b1;
+    pending.reset_epoch = epoch;
+    pending.epoch_valid = 1'b1;
+    status = request_runtime.enter_recovery_prepared(pending);
+    expect_ok("IMMUTABLE_REQUEST_ENTER", status);
+    if (status == null || !status.ok()) return;
+
+    status = request_runtime.query_pending(snapshot);
+    expect_ok("IMMUTABLE_REQUEST_QUERY", status);
+    if (status == null || !status.ok() || snapshot == null ||
+        !$cast(request_snapshot, snapshot.request_snapshot) ||
+        request_snapshot.sges.size() != 1 ||
+        request_snapshot.sges[0] == null) return;
+    original_lkey = request_snapshot.sges[0].lkey;
+    request_snapshot.sges[0].lkey ^= 32'hffff_ffff;
+    expect_code("IMMUTABLE_REQUEST_MISMATCH",
+                request_runtime.enter_recovery_prepared(snapshot),
+                RDMA_SC_INVALID_STATE);
+    status = request_runtime.query_pending(original);
+    if (status == null || !status.ok() || original == null ||
+        !$cast(request_snapshot, original.request_snapshot) ||
+        request_snapshot.sges.size() != 1 ||
+        request_snapshot.sges[0] == null ||
+        request_snapshot.sges[0].lkey != original_lkey)
+      `uvm_error("IMMUTABLE_REQUEST_ATOMIC",
+                 "nested SGE mismatch changed original pending")
   endtask
 
   // 功能：验证 consumer recovery 的 committed 阶段必须与 runtime CI 和
@@ -1726,6 +2003,7 @@ class rdma_queue_runtime_test extends uvm_test;
 
     phase.raise_objection(this);
     configure_factory_faults();
+    test_attachment_config_query_is_detached();
     test_activate_without_authority_preserves_boundaries();
     test_device_ring_reserve_commit_and_visibility();
     test_device_consumer_credit_and_recovery();
@@ -1733,6 +2011,8 @@ class rdma_queue_runtime_test extends uvm_test;
     test_host_configure_empty_ledger_invariant();
     test_copy_ring_state_authority_and_geometry();
     test_mmio_evidence_authority_transitions();
+    test_rejected_mmio_transition_preserves_confirmation();
+    test_prepared_immutable_evidence_atomicity();
     test_consumer_recovery_commit_invariant();
     test_nonfatal_factory_failures();
     test_device_depth_two_ceq_and_lifecycle();

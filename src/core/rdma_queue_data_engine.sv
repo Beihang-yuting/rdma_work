@@ -3759,8 +3759,12 @@ class rdma_queue_data_engine extends uvm_object;
     rdma_status status;
     rdma_queue_runtime dependents[$];
     rdma_cq_resize_recovery recovery;
+    rdma_handle runtime_queue_h;
+    rdma_queue_runtime_kind_e runtime_kind;
     string key;
     string recovery_key;
+    bit runtime_host_produced;
+    bit runtime_initial_polarity;
     bit manager_quiesced;
     bit cq_quiesced;
     bit cleanup_complete;
@@ -3786,6 +3790,18 @@ class rdma_queue_data_engine extends uvm_object;
     if (old_attachment.runtime == null || old_attachment.access == null)
       return finish_resize(bad("CQ attachment runtime/access is missing",
                                RDMA_SC_INVALID_STATE));
+    status = old_attachment.runtime.query_attachment_config(
+      runtime_queue_h, runtime_kind, runtime_host_produced,
+      runtime_initial_polarity);
+    if (status == null || !status.ok() || runtime_queue_h == null ||
+        old_attachment.queue_h == null ||
+        !runtime_queue_h.same_instance(old_attachment.queue_h) ||
+        runtime_kind != RDMA_QUEUE_RUNTIME_CQ || runtime_host_produced) begin
+      if (status == null || status.ok())
+        status = bad("CQ runtime attachment config is inconsistent",
+                     RDMA_SC_INVALID_STATE);
+      return finish_resize(status);
+    end
     status = manager.begin_cq_resize(cq_h);
     if (!status.ok()) return finish_resize(status);
     manager_quiesced = 1'b1;
@@ -3828,7 +3844,7 @@ class rdma_queue_data_engine extends uvm_object;
 
     status = backing_planner.allocate_owned_cq_resize_ring(
       binding, cq_h, new_depth, new_cqe_bytes, candidate_ring, candidate_ref,
-      old_attachment.runtime.initial_polarity);
+      runtime_initial_polarity);
     if (!status.ok()) begin
       status = abort_cq_resize(cq_h, old_attachment.runtime, dependents,
                                candidate_ref, manager_quiesced, cq_quiesced,
@@ -3849,7 +3865,7 @@ class rdma_queue_data_engine extends uvm_object;
       RDMA_QUEUE_RUNTIME_CQ, new_depth,
       old_attachment.runtime.producer_index, old_attachment.runtime.producer_wrap,
       old_attachment.runtime.consumer_index, old_attachment.runtime.consumer_wrap,
-      1'b0, old_attachment.runtime.initial_polarity);
+      1'b0, runtime_initial_polarity);
     if (!status.ok()) begin
       status = abort_cq_resize(cq_h, old_attachment.runtime, dependents,
                                candidate_ref, manager_quiesced, cq_quiesced,
@@ -4779,10 +4795,10 @@ class rdma_queue_data_engine extends uvm_object;
       return;
     end
 
-    // 设计阶段：consumer recovery 不重写队列条目；它只重放 consumer
-    // doorbell，并且只有 MMIO 明确成功后才继续提交对应 CI（CQ 路径还会
-    // 处理 WQE release）。doorbell 结果不确定时必须保留 AMBIGUOUS，不能
-    // 把本地后续失败误写成“未提交”。
+    // 设计阶段：consumer recovery 不重写队列条目。NO_SUBMIT 经显式确认后
+    // 才重放 doorbell 并记录 SUCCESS；已有 SUCCESS 的 pending 绝不重发 MMIO，
+    // 只续做尚未完成的 WQE release、CI 和 complete。doorbell 结果不确定时
+    // 必须保留 AMBIGUOUS，不能把本地后续失败误写成“未提交”。
     if (attachment.kind == RDMA_QUEUE_RUNTIME_CQ) begin
       if (pending.image == null) begin
         status = bad("CQ recovery image is missing", RDMA_SC_INVALID_STATE);
@@ -4824,13 +4840,18 @@ class rdma_queue_data_engine extends uvm_object;
                                                                 cqe.wqe_wrap);
         if (!status.ok()) return;
       end
-      submit_consumer_doorbell(attachment, next, db_result, status,
-                               db_mmio_maybe_submitted, link);
-      if (!status.ok()) begin
-        void'(attachment.runtime.record_recovery_failure(
-          db_mmio_maybe_submitted ? RDMA_QUEUE_MMIO_AMBIGUOUS :
-                                    RDMA_QUEUE_MMIO_NO_SUBMIT));
-        return;
+      if (pending.mmio_evidence != RDMA_QUEUE_MMIO_SUCCESS) begin
+        submit_consumer_doorbell(attachment, next, db_result, status,
+                                 db_mmio_maybe_submitted, link);
+        if (!status.ok()) begin
+          void'(attachment.runtime.record_recovery_failure(
+            db_mmio_maybe_submitted ? RDMA_QUEUE_MMIO_AMBIGUOUS :
+                                      RDMA_QUEUE_MMIO_NO_SUBMIT));
+          return;
+        end
+        status = attachment.runtime.record_recovery_failure(
+          RDMA_QUEUE_MMIO_SUCCESS);
+        if (status == null || !status.ok()) return;
       end
       if (!pending.completion_released) begin
         status = wqe_attachment.runtime.match_and_release(cqe.wqe_index,
@@ -4842,6 +4863,38 @@ class rdma_queue_data_engine extends uvm_object;
           return;
         end
       end
+      if (!pending.consumer_committed) begin
+        status = attachment.runtime.enable_recovery_commit();
+        if (!status.ok()) return;
+        status = attachment.runtime.commit_consumer(pending.cursor);
+        if (!status.ok()) begin
+          void'(attachment.runtime.record_recovery_failure(
+            RDMA_QUEUE_MMIO_SUCCESS));
+          return;
+        end
+      end
+      if (!pending.completion_released) begin
+        status = attachment.runtime.mark_pending_completion_released();
+        if (status == null || !status.ok()) return;
+      end
+      status = attachment.runtime.complete_recovery_retry();
+      return;
+    end
+
+    if (pending.mmio_evidence != RDMA_QUEUE_MMIO_SUCCESS) begin
+      submit_consumer_doorbell(attachment, next, db_result, status,
+                               db_mmio_maybe_submitted, no_route);
+      if (!status.ok()) begin
+        void'(attachment.runtime.record_recovery_failure(
+          db_mmio_maybe_submitted ? RDMA_QUEUE_MMIO_AMBIGUOUS :
+                                    RDMA_QUEUE_MMIO_NO_SUBMIT));
+        return;
+      end
+      status = attachment.runtime.record_recovery_failure(
+        RDMA_QUEUE_MMIO_SUCCESS);
+      if (status == null || !status.ok()) return;
+    end
+    if (!pending.consumer_committed) begin
       status = attachment.runtime.enable_recovery_commit();
       if (!status.ok()) return;
       status = attachment.runtime.commit_consumer(pending.cursor);
@@ -4850,25 +4903,6 @@ class rdma_queue_data_engine extends uvm_object;
           RDMA_QUEUE_MMIO_SUCCESS));
         return;
       end
-      status = attachment.runtime.complete_recovery_retry();
-      return;
-    end
-
-    submit_consumer_doorbell(attachment, next, db_result, status,
-                             db_mmio_maybe_submitted, no_route);
-    if (!status.ok()) begin
-      void'(attachment.runtime.record_recovery_failure(
-        db_mmio_maybe_submitted ? RDMA_QUEUE_MMIO_AMBIGUOUS :
-                                  RDMA_QUEUE_MMIO_NO_SUBMIT));
-      return;
-    end
-    status = attachment.runtime.enable_recovery_commit();
-    if (!status.ok()) return;
-    status = attachment.runtime.commit_consumer(pending.cursor);
-    if (!status.ok()) begin
-      void'(attachment.runtime.record_recovery_failure(
-        RDMA_QUEUE_MMIO_SUCCESS));
-      return;
     end
     status = attachment.runtime.complete_recovery_retry();
   endtask
