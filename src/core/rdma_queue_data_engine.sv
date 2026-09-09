@@ -1,10 +1,11 @@
 // 目录：核心执行层 core/rdma_queue_data_engine.sv。
-// 职责：实现 rdma_queue_data_engine 在本层的职责和对外接口。
-// 依赖：依赖本层公共 types/model/adapter 契约及其上游快照。
-// 所有权与生命周期：对象只拥有显式创建的值快照；外部资源保存非拥有引用，生命周期由调用方管理。
-
-// 中文说明：rdma_queue_data_engine.sv 属于核心执行层，负责队列、控制面、资源和恢复流程。
-// 阅读提示：先看公开类型和接口，再看实现细节；失败路径应保持状态与资源所有权可追踪。
+// 职责：实现 queue-data facade，协调 SQ/RQ/SRQ post、CQ/CEQ/AEQ device publish、
+// poll、CQ resize 与 recovery，并在每个边界校验 Function、route、generation 和 epoch。
+// 依赖：依赖 rdma_queue_runtime 的冻结队列状态、codec/model、resource manager、
+// Host-memory/backing access 与 doorbell scheduler 契约；全局 topology authority 只读自 binding。
+// 所有权与生命周期：engine 拥有本地 attachment 索引、detached 结果和未接管 recovery
+// evidence；runtime、queue handle、backing capability、mapping 与 QP route 均为非拥有引用，
+// 其生命周期由 lifecycle/resource manager 或外部环境管理，detach/abort 不越权释放 mapping。
 
 // 设计说明：本层是 host 侧 queue-data facade。queue 的生命周期仍归 lifecycle
 // resource 所有；engine 仅在 attachment 存活期间保存 detached runtime cursor 和
@@ -4872,10 +4873,14 @@ class rdma_queue_data_engine extends uvm_object;
     status = attachment.runtime.complete_recovery_retry();
   endtask
 
-  // 功能：在 rdma_queue_data_engine 中，recover_queue 执行受控事务并按后端提交证据推进状态机，同时保留失败阶段和 generation 证据。
-  // 输入/输出及副作用：queue_h（输入）、action（输入）、caller_confirmed_no_submit（输入）、status（输出）；输入 action/epoch/handle
-  //   决定迁移目标；成功时更新状态或恢复证据，外部资源仍由其拥有者管理。
-  // 失败/边界：recover_queue 遇到锁、超时、generation 变化或提交证据不完整时保持原状态，不推进游标。
+  // 功能：recover_queue 定位 queue 的 claimed/unclaimed recovery，执行 abort，
+  //   或把 caller-confirmed retry 先交给 runtime 授权，再重放尚未完成的事务阶段。
+  // 输入输出及副作用：queue_h、action、caller_confirmed_no_submit（输入）选择
+  //   recovery 对象与动作，status（输出）返回最终阶段结果；retry 可能访问 backing、
+  //   doorbell 和 runtime ledger，abort 可能删除 attachment，但不接管外部 mapping。
+  // 失败边界：句柄/证据不完整、非法 action、未确认 retry、AMBIGUOUS MMIO、
+  //   runtime 授权/pending 查询返回 null 或非成功，以及 replay 任一阶段失败时保留可恢复
+  //   evidence；只有 runtime enum gate 可以记录一次性 confirmation。
   task recover_queue(
     rdma_handle queue_h,
     rdma_queue_recovery_action_e action,
@@ -4973,11 +4978,13 @@ class rdma_queue_data_engine extends uvm_object;
       if (candidate != null && candidate.queue_h != null &&
           candidate.queue_h.same_instance(queue_h) && candidate.runtime != null &&
           candidate.runtime.state == RDMA_QUEUE_RUNTIME_RECOVERY_REQUIRED) begin
-        // unclaimed handoff already selected this same attachment.  It must
-        // be accepted once, rather than being mistaken for a second runtime.
-        if (found != null && found != candidate)
-          begin status = bad("queue has multiple pending recovery runtimes",
-                             RDMA_SC_INVALID_STATE); return; end
+        // 中文设计：unclaimed handoff 已选中同一个 attachment 时只接管一次；
+        // 只有发现不同 runtime 也声明同一 queue recovery 时才按歧义拒绝。
+        if (found != null && found != candidate) begin
+          status = bad("queue has multiple pending recovery runtimes",
+                       RDMA_SC_INVALID_STATE);
+          return;
+        end
         found = candidate;
       end
     end
@@ -5019,24 +5026,57 @@ class rdma_queue_data_engine extends uvm_object;
     end
     if (action == RDMA_QUEUE_RECOVERY_ABORT_AND_DETACH) begin
       status = found.runtime.abort_recovery();
-      if (!status.ok()) return;
-      // Drop all borrowed backing capabilities and QP routing metadata once
-      // the caller chooses abort.  Lifecycle-owned DMA mappings remain owned
-      // by the resource manager; only the data-engine attachment is removed.
+      if (status == null || !status.ok()) begin
+        status = status == null ?
+          bad("runtime recovery abort returned null status",
+              RDMA_SC_RECOVERY_REQUIRED) : status;
+        return;
+      end
+      // 中文设计：caller 选择 abort 后删除 data-engine attachment，使借用的
+      // backing capability 与 QP route metadata 一并失效；lifecycle owner 仍持有
+      // DMA mapping，本层不能越权释放外部资源。
       status = detach(queue_h);
       return;
     end
-    if (action != RDMA_QUEUE_RECOVERY_RETRY_PENDING)
-      begin status = bad("recovery action is invalid"); return; end
-    if (!caller_confirmed_no_submit)
-      begin status = bad("retry requires caller confirmation"); return; end
+    if (action != RDMA_QUEUE_RECOVERY_RETRY_PENDING) begin
+      status = bad("recovery action is invalid");
+      return;
+    end
+    if (!caller_confirmed_no_submit) begin
+      status = bad("retry requires caller confirmation");
+      return;
+    end
     begin
       rdma_queue_pending_operation pending;
-      status = found.runtime.snapshot_pending(pending);
-      if (!status.ok()) return;
-      if (pending.mmio_maybe_submitted)
-        begin status = rdma_status::make(RDMA_SC_RECOVERY_REQUIRED,
-                                          "pending MMIO outcome is ambiguous"); return; end
+
+      // 中文设计：caller bit 不能由 engine snapshot 或兼容投影直接解释成 authority。
+      // runtime.recover() 先依据唯一 mmio_evidence enum 拒绝 AMBIGUOUS/错误方向，
+      // 再记录一次性 confirmation；后续 commit gate 成功时消费该授权。
+      status = found.runtime.recover(
+        RDMA_QUEUE_RECOVERY_RETRY_PENDING, caller_confirmed_no_submit);
+      if (status == null || !status.ok()) begin
+        status = status == null ?
+          bad("runtime recovery confirmation returned null status",
+              RDMA_SC_RECOVERY_REQUIRED) : status;
+        return;
+      end
+      status = found.runtime.query_pending(pending);
+      if (status == null || !status.ok()) begin
+        status = status == null ?
+          bad("runtime recovery pending query returned null status",
+              RDMA_SC_RECOVERY_REQUIRED) : status;
+        return;
+      end
+      if (pending == null) begin
+        status = bad("runtime recovery pending query returned null evidence",
+                     RDMA_SC_RECOVERY_REQUIRED);
+        return;
+      end
+      if (pending.mmio_evidence == RDMA_QUEUE_MMIO_AMBIGUOUS) begin
+        status = bad("pending MMIO outcome is ambiguous",
+                     RDMA_SC_RECOVERY_REQUIRED);
+        return;
+      end
       replay_pending(found, pending, status);
       return;
     end

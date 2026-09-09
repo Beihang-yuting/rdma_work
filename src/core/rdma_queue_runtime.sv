@@ -1147,12 +1147,12 @@ class rdma_queue_runtime extends uvm_object;
     return make_runtime_status(RDMA_SC_OK, "");
   endfunction
 
-  // 功能：activate 在 queue identity、geometry 和 route/reset epoch 已冻结后，
-  //   将 ATTACHED runtime 切换为可接收 producer/consumer 事务的 ACTIVE。
-  // 输入输出及副作用：无显式参数；成功仅更新 state，已锁存的
-  //   queue_h、route、reset_epoch、PI/CI 和 ledger 保持不变。
-  // 失败边界：非 ATTACHED、route/epoch 未成对有效或 route 值损坏时返回
-  //   INVALID_STATE；失败保持 ATTACHED 和全部 authority 快照。
+  // 功能：activate 只把已 configure 的 runtime 从 ATTACHED 切换为 ACTIVE；
+  //   route/reset epoch authority 由 publish、prepared recovery 和 copy 边界校验。
+  // 输入输出及副作用：无显式参数；成功仅更新 state，queue_h、可选 route/epoch、
+  //   PI/CI 和 ledger 保持不变，因此直接 runtime fixture 可在 authority 前激活。
+  // 失败边界：非 ATTACHED 或锁忙时返回 INVALID_STATE/RESOURCE_BUSY；本函数不把
+  //   缺失 authority 伪造成有效值，query_route_epoch 仍会 fail-closed。
   function rdma_status activate();
     rdma_status lock_status;
     lock_status = acquire_lock();
@@ -1161,11 +1161,6 @@ class rdma_queue_runtime extends uvm_object;
       lock.put(1);
       return make_runtime_status(RDMA_SC_INVALID_STATE,
                                  "queue runtime is not attached");
-    end
-    if (!route_valid || !epoch_valid || !rdma_route_key_valid(route)) begin
-      lock.put(1);
-      return make_runtime_status(RDMA_SC_INVALID_STATE,
-                                 "queue runtime authority is incomplete");
     end
     state = RDMA_QUEUE_RUNTIME_ACTIVE;
     lock.put(1);

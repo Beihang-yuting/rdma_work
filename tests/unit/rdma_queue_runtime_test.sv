@@ -290,14 +290,22 @@ class rdma_queue_runtime_test extends uvm_test;
                  status.convert2string())
   endfunction
 
-  // 功能：验证 ATTACHED runtime 只有在 route/reset epoch 成对锁存后才能进入 ACTIVE。
-  // 输入输出及副作用：无显式参数；构造 CQ runtime，先尝试无 authority
-  //   激活，再设置 fixture route/epoch 并成功激活。
-  // 失败边界：无 authority 时必须返回 INVALID_STATE 并保持 ATTACHED；
-  //   首次断言失败即返回，避免后续调用掩盖原始差异。
-  task automatic test_activate_requires_authority();
+  // 功能：验证 activate 只执行 ATTACHED->ACTIVE 状态迁移，无 route/epoch 时
+  //   publish authority 查询、prepared recovery 和 resize-copy 仍分别 fail-closed。
+  // 输入输出及副作用：无显式参数；构造 source/target CQ runtime 与一份完整但
+  //   缺 route/epoch 的 consumer pending，通过公开状态/query/copy 接口观察结果。
+  // 失败边界：configure 后 activate 必须成功；缺 authority 的 query/pending/copy
+  //   必须拒绝且 output 归零、source 不进入 recovery、target 保持 ATTACHED。
+  task automatic test_activate_without_authority_preserves_boundaries();
     rdma_queue_runtime runtime;
+    rdma_queue_runtime copy_target;
+    rdma_queue_pending_operation pending;
     rdma_queue_runtime_state_e runtime_state;
+    rdma_handle cq_h;
+    rdma_route_key_t route_snapshot;
+    rdma_reset_epoch_t epoch_snapshot;
+    bit route_snapshot_valid;
+    bit epoch_snapshot_valid;
     rdma_status status;
 
     runtime = rdma_queue_runtime::type_id::create("authority_gate_runtime");
@@ -305,24 +313,115 @@ class rdma_queue_runtime_test extends uvm_test;
       `uvm_error("ACTIVATE_AUTHORITY_FIXTURE", "runtime allocation failed")
       return;
     end
+    cq_h = queue_handle("authority_gate_cq", RDMA_RESOURCE_CQ, 41);
+    if (cq_h == null) begin
+      `uvm_error("ACTIVATE_AUTHORITY_FIXTURE", "queue handle allocation failed")
+      return;
+    end
     status = runtime.configure(
-      queue_handle("authority_gate_cq", RDMA_RESOURCE_CQ, 41),
+      cq_h,
       RDMA_QUEUE_RUNTIME_CQ, 2, 0, 1'b0, 0, 1'b0, 1'b0);
     expect_ok("ACTIVATE_AUTHORITY_CONFIGURE", status);
     if (status == null || !status.ok()) return;
     status = runtime.activate();
-    expect_code("ACTIVATE_AUTHORITY_REQUIRED", status,
-                RDMA_SC_INVALID_STATE);
-    if (status == null || status.code != RDMA_SC_INVALID_STATE) return;
-    expect_ok("ACTIVATE_AUTHORITY_STATE", runtime.query_state(runtime_state));
-    if (runtime_state != RDMA_QUEUE_RUNTIME_ATTACHED)
-      `uvm_error("ACTIVATE_AUTHORITY_ATOMIC",
-                 "failed activation changed runtime state")
-    status = runtime.set_route_epoch(
-      fixture_route(8'h41), rdma_reset_epoch_t'(64'h341));
-    expect_ok("ACTIVATE_AUTHORITY_SET", status);
+    expect_ok("ACTIVATE_WITHOUT_AUTHORITY", status);
     if (status == null || !status.ok()) return;
-    expect_ok("ACTIVATE_AUTHORITY_SUCCESS", runtime.activate());
+    expect_ok("ACTIVATE_AUTHORITY_STATE", runtime.query_state(runtime_state));
+    if (runtime_state != RDMA_QUEUE_RUNTIME_ACTIVE) begin
+      `uvm_error("ACTIVATE_AUTHORITY_STATE",
+                 "activation without authority did not publish ACTIVE")
+      return;
+    end
+
+    route_snapshot = '1;
+    route_snapshot_valid = 1'b1;
+    epoch_snapshot = '1;
+    epoch_snapshot_valid = 1'b1;
+    status = runtime.query_route_epoch(
+      route_snapshot, route_snapshot_valid, epoch_snapshot,
+      epoch_snapshot_valid);
+    expect_code("PUBLISH_AUTHORITY_REQUIRED", status,
+                RDMA_SC_INVALID_STATE);
+    if (status == null || status.code != RDMA_SC_INVALID_STATE ||
+        route_snapshot != '0 || route_snapshot_valid || epoch_snapshot != '0 ||
+        epoch_snapshot_valid) begin
+      `uvm_error("PUBLISH_AUTHORITY_DEFAULTS",
+                 "missing publish authority leaked non-default outputs")
+      return;
+    end
+
+    pending = rdma_queue_pending_operation::type_id::create(
+      "authority_gate_pending");
+    if (pending == null) begin
+      `uvm_error("ACTIVATE_AUTHORITY_FIXTURE", "pending allocation failed")
+      return;
+    end
+    pending.queue_h = queue_handle(
+      "authority_gate_pending_cq", RDMA_RESOURCE_CQ, 41);
+    pending.kind = RDMA_QUEUE_RUNTIME_CQ;
+    pending.cursor = rdma_queue_cursor_snapshot::type_id::create(
+      "authority_gate_cursor");
+    pending.next_cursor = rdma_queue_cursor_snapshot::type_id::create(
+      "authority_gate_next");
+    pending.image = rdma_hw_image::type_id::create("authority_gate_image");
+    pending.failure_status = rdma_status::make(
+      RDMA_SC_PCIE_COMPLETION, "injected missing-authority recovery");
+    if (pending.queue_h == null || pending.cursor == null ||
+        pending.next_cursor == null || pending.image == null ||
+        pending.failure_status == null) begin
+      `uvm_error("ACTIVATE_AUTHORITY_FIXTURE",
+                 "prepared evidence allocation failed")
+      return;
+    end
+    pending.cursor.index = 0;
+    pending.cursor.wrap = 1'b0;
+    pending.next_cursor.index = 1;
+    pending.next_cursor.wrap = 1'b0;
+    pending.entry_size = 64;
+    pending.entry_offset = 0;
+    pending.image.length = pending.entry_size;
+    pending.image.alignment = pending.entry_size;
+    pending.image.endian = RDMA_ENDIAN_BIG;
+    pending.image.image_kind = RDMA_IMAGE_CQE;
+    pending.image.hardware_version = RDMA_HW_VERSION;
+    for (int unsigned i = 0; i < pending.entry_size; i++)
+      pending.image.bytes.push_back(byte'(i));
+    pending.mmio_evidence = RDMA_QUEUE_MMIO_NO_SUBMIT;
+    pending.route = '0;
+    pending.route_valid = 1'b0;
+    pending.reset_epoch = '0;
+    pending.epoch_valid = 1'b0;
+    expect_code("PREPARED_AUTHORITY_REQUIRED",
+                runtime.enter_recovery_prepared(pending),
+                RDMA_SC_INVALID_ARGUMENT);
+    expect_ok("PREPARED_AUTHORITY_STATE",
+              runtime.query_state(runtime_state));
+    if (runtime_state != RDMA_QUEUE_RUNTIME_ACTIVE) begin
+      `uvm_error("PREPARED_AUTHORITY_ATOMIC",
+                 "rejected prepared recovery changed source state")
+      return;
+    end
+
+    expect_ok("COPY_AUTHORITY_QUIESCE", runtime.begin_quiesce());
+    copy_target = rdma_queue_runtime::type_id::create(
+      "authority_gate_copy_target");
+    if (copy_target == null) begin
+      `uvm_error("ACTIVATE_AUTHORITY_FIXTURE", "copy target allocation failed")
+      return;
+    end
+    status = copy_target.configure(
+      queue_handle("authority_gate_copy_cq", RDMA_RESOURCE_CQ, 41),
+      RDMA_QUEUE_RUNTIME_CQ, 2, 0, 1'b0, 0, 1'b0, 1'b0);
+    expect_ok("COPY_AUTHORITY_CONFIGURE", status);
+    if (status == null || !status.ok()) return;
+    expect_code("COPY_AUTHORITY_REQUIRED",
+                copy_target.copy_ring_state(runtime),
+                RDMA_SC_INVALID_STATE);
+    expect_ok("COPY_AUTHORITY_TARGET_STATE",
+              copy_target.query_state(runtime_state));
+    if (runtime_state != RDMA_QUEUE_RUNTIME_ATTACHED)
+      `uvm_error("COPY_AUTHORITY_ATOMIC",
+                 "rejected authority copy changed target state")
   endtask
 
   // 功能：验证 device-produced CQ runtime 的 reservation、commit 与 consumer 可见性边界，并确认 host/device producer API 方向隔离。
@@ -1627,7 +1726,7 @@ class rdma_queue_runtime_test extends uvm_test;
 
     phase.raise_objection(this);
     configure_factory_faults();
-    test_activate_requires_authority();
+    test_activate_without_authority_preserves_boundaries();
     test_device_ring_reserve_commit_and_visibility();
     test_device_consumer_credit_and_recovery();
     test_pending_copy_and_mmio_evidence();
