@@ -200,6 +200,12 @@ class rdma_context_backing_contract_test extends uvm_test;
         cq_ref.shadow_view_length != 8 ||
         (cq_ref.shadow_pointer_base.value & 63) != 0)
       `uvm_error("CQC_REF", "CQC slot/view geometry is incorrect")
+    // 功能：验证非零 CQ local-id 仍按冻结 ABI 的 64B shadow stride 对齐。
+    // 输入/输出及副作用：cq_ref 为 acquire 返回的只读 context ref；只调用 validate，
+    // 不写 mock slot、token 或资源管理器状态。
+    // 失败边界：+1 字节仍必须被后续坏 ref 覆盖拒绝；这里失败表示 validator 错将
+    // CQ 按 SRQ 的 4KB 对齐，不能以修改 mock base 掩盖 ABI 缺陷。
+    expect_status("CQC_NONZERO_LOCAL_VALIDATE", cq_ref.validate(), RDMA_SC_OK);
     if (!$cast(cq_token, cq_ref.slot_token) ||
         cq_token.completion_authority == null)
       `uvm_error("CQC_TOKEN", "CQC token does not implement the contract")

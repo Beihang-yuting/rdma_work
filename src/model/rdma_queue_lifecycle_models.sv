@@ -857,8 +857,11 @@ class rdma_context_backing_ref extends uvm_object;
          shadow_view_length != 512 || hmc_ref.size != 512))
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "QP context geometry must be 512 bytes");
+    // 设计说明：context shadow 的对齐由冻结硬件 ABI 按资源类型决定：CQ slot
+    // 为 64B、SRQ 为 4KB、QP 为 512B；不能把 CQ 误按 SRQ 的页粒度要求。
     if (!rdma_queue_aligned(shadow_pointer_base.value,
-                            resource_kind == RDMA_RESOURCE_QP ? 512 : 4096))
+                            resource_kind == RDMA_RESOURCE_CQ ? 64 :
+                            (resource_kind == RDMA_RESOURCE_QP ? 512 : 4096)))
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "shadow pointer unaligned");
     return rdma_status::success();

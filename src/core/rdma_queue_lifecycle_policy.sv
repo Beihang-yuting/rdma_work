@@ -548,13 +548,17 @@ virtual class rdma_queue_lifecycle_policy extends uvm_object;
     context_ref = plan.context_ref;
     if (!same_function(context_ref.owner, owner))
       return invalid_argument("queue context belongs to another Function");
+    // 设计说明：同 validate 一致使用冻结 ABI stride，避免第二个 CQ 的 64B
+    // shadow base 被误当 4KB page base 而在 lifecycle preflight 拒绝。
     if (context_ref.resource_kind != kind ||
         context_ref.local_id != local_id ||
         context_ref.slot_length != (kind == RDMA_RESOURCE_SRQ ? 32 : 64) ||
         context_ref.shadow_view_offset != view_offset ||
         context_ref.shadow_view_length != view_length ||
         context_ref.shadow_pointer_base.value == 0 ||
-        (context_ref.shadow_pointer_base.value & 64'hfff) != 0)
+        !rdma_queue_aligned(context_ref.shadow_pointer_base.value,
+                            kind == RDMA_RESOURCE_CQ ? 64 :
+                            (kind == RDMA_RESOURCE_QP ? 512 : 4096)))
       return invalid_state("queue context backing geometry is invalid");
     shadow_base = context_ref.shadow_pointer_base;
     return rdma_status::success();
