@@ -2818,6 +2818,86 @@ class rdma_queue_data_engine extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 设计说明：recovery abort 同时跨越 runtime pending/reservation 与 engine
+  // attachment 两个状态域。必须先取得 detach 所需的 resize_lock 并验证目标仍在
+  // attachments 中，再执行不可回滚的 runtime abort/cancel；锁内删除本地借用引用
+  // 不再调用可能失败的外部后端，因此不会留下“runtime 已清空、attachment 仍存在”
+  // 或“reservation 已取消、unclaimed evidence 仍存在”的分裂状态。
+  // 功能：detach_recovery_transaction 原子完成 claimed pending 的 abort 或
+  // unclaimed/reservation-only device reservation 的 cancel，并隔离同一 handle 的
+  // 全部 attachment；它是 recover_queue 的内部提交边界，不替代普通 detach API。
+  // 输入/输出及副作用：queue_h、expected_attachment 为输入；cancel_reservation 为空
+  // 时调用 expected runtime 的 abort_recovery，非空时调用 cancel_device_producer；
+  // 成功后删除同 handle attachments/QP link，但不释放或修改 lifecycle mapping。
+  // 失败边界：锁忙、CQ resize recovery 存在、expected attachment 已消失/换代，或
+  // runtime abort/cancel 拒绝时返回原错误且不删除 attachment；所有 engine 可失败
+  // 条件都在 runtime 状态迁移前检查，故调用方可用同一 evidence 安全重试。
+  protected function rdma_status detach_recovery_transaction(
+    rdma_handle queue_h,
+    rdma_queue_data_attachment expected_attachment,
+    rdma_queue_cursor_snapshot cancel_reservation = null
+  );
+    rdma_status status;
+    string key;
+    string matching_keys[$];
+    bit expected_found;
+
+    if (queue_h == null || expected_attachment == null ||
+        expected_attachment.queue_h == null ||
+        expected_attachment.runtime == null ||
+        !expected_attachment.queue_h.same_instance(queue_h))
+      return bad("recovery detach attachment is invalid",
+                 RDMA_SC_INVALID_STATE);
+    if (resize_lock == null || !resize_lock.try_get(1))
+      return bad("queue detach is busy", RDMA_SC_RESOURCE_BUSY);
+    if (queue_h.kind == RDMA_RESOURCE_CQ &&
+        cq_resize_recoveries.exists(cq_recovery_key(queue_h))) begin
+      resize_lock.put(1);
+      return bad("queue detach requires CQ cleanup recovery",
+                 RDMA_SC_RECOVERY_REQUIRED);
+    end
+
+    expected_found = 1'b0;
+    foreach (attachments[key]) begin
+      if (attachments[key] != null && attachments[key].queue_h != null &&
+          attachments[key].queue_h.same_instance(queue_h)) begin
+        matching_keys.push_back(key);
+        if (attachments[key] == expected_attachment)
+          expected_found = 1'b1;
+      end
+    end
+    if (!expected_found || matching_keys.size() == 0) begin
+      resize_lock.put(1);
+      return bad("recovery detach attachment is stale",
+                 RDMA_SC_INVALID_STATE);
+    end
+
+    if (cancel_reservation == null)
+      status = expected_attachment.runtime.abort_recovery();
+    else
+      status = expected_attachment.runtime.cancel_device_producer(
+        cancel_reservation);
+    if (status == null || !status.ok()) begin
+      resize_lock.put(1);
+      return status == null ?
+        bad("recovery detach runtime transition returned null status",
+            RDMA_SC_RECOVERY_REQUIRED) : status;
+    end
+
+    foreach (matching_keys[i]) begin
+      if (attachments.exists(matching_keys[i]) &&
+          attachments[matching_keys[i]] != null &&
+          attachments[matching_keys[i]].runtime != null)
+        attachments[matching_keys[i]].runtime.state =
+          RDMA_QUEUE_RUNTIME_DETACHED;
+      attachments.delete(matching_keys[i]);
+    end
+    if (queue_h.kind == RDMA_RESOURCE_QP)
+      qp_links.delete(identity_key(queue_h));
+    resize_lock.put(1);
+    return rdma_status::success();
+  endfunction
+
   // 功能：在 rdma_queue_data_engine 中，sqe_authority_status 对发送请求的
   // QP、URC completion QP、MR/MW 和 FLUSH authority 做运行时身份及 attach
   // 校验，确保已通过语义模型的请求仍绑定到当前 queue-data route。
@@ -5383,13 +5463,11 @@ class rdma_queue_data_engine extends uvm_object;
               unclaimed_pending.cursor != null &&
               reservation.index == unclaimed_pending.cursor.index &&
               reservation.wrap == unclaimed_pending.cursor.wrap) begin
-            status = found.runtime.cancel_device_producer(reservation);
+            status = detach_recovery_transaction(
+              queue_h, found, reservation);
             if (status != null && status.ok()) begin
-              status = detach(queue_h);
-              if (status != null && status.ok()) begin
-                unclaimed_device_recoveries.delete(key);
-                unclaimed_recovery_attachments.delete(key);
-              end
+              unclaimed_device_recoveries.delete(key);
+              unclaimed_recovery_attachments.delete(key);
               return;
             end
           end
@@ -5438,13 +5516,13 @@ class rdma_queue_data_engine extends uvm_object;
                            RDMA_SC_RECOVERY_REQUIRED);
               return;
             end
-            status = candidate.runtime.cancel_device_producer(reservation);
+            status = detach_recovery_transaction(
+              queue_h, candidate, reservation);
             if (status == null || !status.ok()) begin
               status = bad("reservation-only recovery abort could not cancel",
                            RDMA_SC_RECOVERY_REQUIRED);
               return;
             end
-            status = detach(queue_h);
             return;
           end
         end
@@ -5453,17 +5531,13 @@ class rdma_queue_data_engine extends uvm_object;
       return;
     end
     if (action == RDMA_QUEUE_RECOVERY_ABORT_AND_DETACH) begin
-      status = found.runtime.abort_recovery();
+      status = detach_recovery_transaction(queue_h, found);
       if (status == null || !status.ok()) begin
         status = status == null ?
-          bad("runtime recovery abort returned null status",
+          bad("recovery abort/detach returned null status",
               RDMA_SC_RECOVERY_REQUIRED) : status;
         return;
       end
-      // 中文设计：caller 选择 abort 后删除 data-engine attachment，使借用的
-      // backing capability 与 QP route metadata 一并失效；lifecycle owner 仍持有
-      // DMA mapping，本层不能越权释放外部资源。
-      status = detach(queue_h);
       return;
     end
     if (action != RDMA_QUEUE_RECOVERY_RETRY_PENDING) begin

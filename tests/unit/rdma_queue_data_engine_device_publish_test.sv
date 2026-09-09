@@ -102,6 +102,29 @@ class rdma_device_publish_recovery_fault_engine extends rdma_queue_data_engine;
     end
     return super.cancel_device_publish_reservation(attachment, reservation);
   endfunction
+
+  // 功能：hold_detach_lock_for_test 占用 data-engine 已有 resize/detach 互斥锁，
+  //   让公开 recover_queue 的 abort 在真正 detach 前稳定返回 RESOURCE_BUSY。
+  // 输入/输出及副作用：无显式输入；成功时本测试 engine 持有一个 resize_lock token，
+  //   不修改 attachment、runtime pending、reservation、backing 或外部 mapping。
+  // 失败边界：锁为空或已被占用时返回 RESOURCE_BUSY；调用方必须配对调用
+  //   release_detach_lock_for_test，且本 helper 只用于观察事务顺序而不伪造 detach 结果。
+  function rdma_status hold_detach_lock_for_test();
+    if (resize_lock == null || !resize_lock.try_get(1))
+      return rdma_status::make(RDMA_SC_RESOURCE_BUSY,
+                               "injected detach lock is unavailable");
+    return rdma_status::success();
+  endfunction
+
+  // 功能：release_detach_lock_for_test 归还 hold_detach_lock_for_test 取得的唯一
+  //   token，使同一 recovery 可再次经真实 detach 路径完成 abort。
+  // 输入/输出及副作用：无显式输入；向 resize_lock 归还一个 token，不修改 queue
+  //   recovery evidence、cursor、backing bytes 或 lifecycle mapping 所有权。
+  // 失败边界：仅允许在本 fixture 已成功占锁后调用；测试保证严格配对，重复归还会
+  //   破坏 semaphore 容量，因此任何提前返回都必须先显式释放已持有 token。
+  function void release_detach_lock_for_test();
+    resize_lock.put(1);
+  endfunction
 endclass
 
 // 设计说明：CQE 的 18-bit qpn 不能承载 resource manager 合法的 21-bit QP
@@ -185,6 +208,41 @@ class rdma_device_publish_width_runtime_engine extends rdma_queue_data_engine;
   endfunction
 endclass
 
+// 设计说明：UVM 1.2 不提供可移除 type override 的可移植接口；测试以无行为变化的
+// passthrough 类型作为 fixture 间 reset 目标，避免 fault/width 子类泄露到后续场景。
+class rdma_device_publish_passthrough_engine extends rdma_queue_data_engine;
+  `uvm_object_utils(rdma_device_publish_passthrough_engine)
+
+  // 功能：构造不带 fault seam 的 queue-data engine reset 目标，全部行为继承生产基类。
+  // 输入/输出及副作用：name 为输入；只建立默认 engine 状态，不配置或拥有外部资源。
+  // 失败边界：未 configure 时仍由生产基类拒绝公开 API；本类不改变任何返回码。
+  function new(string name = "rdma_device_publish_passthrough_engine");
+    super.new(name);
+  endfunction
+endclass
+
+class rdma_device_publish_passthrough_access extends rdma_queue_backing_access;
+  `uvm_object_utils(rdma_device_publish_passthrough_access)
+
+  // 功能：构造不注入 preflight fault 的 backing-access reset 目标，继承真实 span I/O。
+  // 输入/输出及副作用：name 为输入；不申请、不 attach 或释放 lifecycle mapping。
+  // 失败边界：未 configure/attach 的访问仍按生产基类拒绝；本类不放宽 DMA permission。
+  function new(string name = "rdma_device_publish_passthrough_access");
+    super.new(name);
+  endfunction
+endclass
+
+class rdma_device_publish_passthrough_manager extends rdma_resource_manager;
+  `uvm_object_utils(rdma_device_publish_passthrough_manager)
+
+  // 功能：构造使用生产 local-ID 分配规则的 resource-manager reset 目标。
+  // 输入/输出及副作用：name 为输入；只初始化基类账本，不创建 Function/queue/QP。
+  // 失败边界：所有 allocation/authority 失败沿用生产基类；不保留 width fixture 起点。
+  function new(string name = "rdma_device_publish_passthrough_manager");
+    super.new(name);
+  endfunction
+endclass
+
 class rdma_queue_data_engine_device_publish_test extends uvm_test;
   `uvm_component_utils(rdma_queue_data_engine_device_publish_test)
 
@@ -194,6 +252,30 @@ class rdma_queue_data_engine_device_publish_test extends uvm_test;
   function new(string name = "rdma_queue_data_engine_device_publish_test",
                uvm_component parent = null);
     super.new(name, parent);
+  endfunction
+
+  // 功能：reset_device_publish_factory_state 把三个被本文件覆盖的基类恢复到无故障
+  //   passthrough 类型，并清零所有静态 fault 开关/计数，隔离下一 fixture。
+  // 输入/输出及副作用：无显式输入；更新全局 UVM factory 的 engine/access/manager
+  //   type override，并清除 admission/cancel/preflight 静态注入状态。
+  // 失败边界：只应在 fixture 事务之间调用；已创建对象不受 override 变化影响，故
+  //   不能用它中途撤销正在运行的 fault，也不会释放任何 lifecycle 资源。
+  function automatic void reset_device_publish_factory_state();
+    uvm_factory factory;
+
+    factory = uvm_factory::get();
+    factory.set_type_override_by_type(
+      rdma_queue_data_engine::get_type(),
+      rdma_device_publish_passthrough_engine::get_type(), 1'b1);
+    factory.set_type_override_by_type(
+      rdma_queue_backing_access::get_type(),
+      rdma_device_publish_passthrough_access::get_type(), 1'b1);
+    factory.set_type_override_by_type(
+      rdma_resource_manager::get_type(),
+      rdma_device_publish_passthrough_manager::get_type(), 1'b1);
+    rdma_device_publish_recovery_fault_engine::admission_failures_remaining = 0;
+    rdma_device_publish_recovery_fault_engine::cancel_failures_remaining = 0;
+    rdma_cq_device_write_preflight_fault_access::reject_next_device_write = 1'b0;
   endfunction
 
   // 功能：clone_test_handle 手工复制 QP handle 的身份字段，避免测试辅助函数在
@@ -344,6 +426,316 @@ class rdma_queue_data_engine_device_publish_test extends uvm_test;
     return fixture.mem.read(backing.mapping,
       backing.mapping_offset + longint'(index) * longint'(size), size, data);
   endfunction
+
+  // 功能：count_host_mem_calls 统计 mock Host-memory 已记录的指定 method_name，
+  //   使 fault case 能区分 write/read 与无关 query/allocate 调用。
+  // 输入/输出及副作用：mem、method_name 为输入；返回匹配 calls 条目的数量，只读
+  //   mock ledger，不消费故障、不修改 mapping 或 transaction 顺序。
+  // 失败边界：mem 为空时返回 0；调用方必须先验证 fixture 完整，不能把安全默认值
+  //   当成“backend 未调用”的充分证据。
+  function automatic int unsigned count_host_mem_calls(
+    rdma_mock_host_mem mem,
+    string method_name
+  );
+    int unsigned count;
+
+    count = 0;
+    if (mem == null)
+      return 0;
+    foreach (mem.calls[i])
+      if (mem.calls[i] != null &&
+          mem.calls[i].method_name == method_name)
+        count++;
+    return count;
+  endfunction
+
+  // 功能：host_mem_mapping_call_since 在指定 calls 起点之后查找某 mapping 的
+  //   method_name 记录，用于区分 borrowed target destroy 与 source owner release。
+  // 输入/输出及副作用：mem、method_name、mapping、start_index 为输入；按唯一 IOVA
+  //   比较 mock call 的 detached mapping 快照并返回命中位，只读调用账本。
+  // 失败边界：mem/mapping 为空或 start_index 超出当前 calls 时返回 0；fixture 中每次
+  //   allocate 产生唯一 IOVA，本 helper 不可用于地址可能复用的跨 reset 比较。
+  function automatic bit host_mem_mapping_call_since(
+    rdma_mock_host_mem mem,
+    string method_name,
+    rdma_dma_mapping mapping,
+    int unsigned start_index
+  );
+    if (mem == null || mapping == null || start_index > mem.calls.size())
+      return 1'b0;
+    for (int unsigned i = start_index; i < mem.calls.size(); i++) begin
+      if (mem.calls[i] != null &&
+          mem.calls[i].method_name == method_name &&
+          mem.calls[i].mapping != null &&
+          mem.calls[i].mapping.iova.value == mapping.iova.value)
+        return 1'b1;
+    end
+    return 1'b0;
+  endfunction
+
+  // 功能：make_cq_backing_slice 把真实 Host-memory mapping 的一个 4KiB 范围描述为
+  //   lifecycle borrowed CQ slice，并显式发布其逻辑 queue offset。
+  // 输入/输出及副作用：name、mapping、logical_offset 为输入；返回新 slice 值对象，
+  //   不修改 mapping 权限/状态，也不取得 allocation release authority。
+  // 失败边界：mapping 为空时返回 null；offset 必须由调用方选择 0 或 4096，最终
+  //   对齐、连续性和 DEVICE_WRITE authority 仍由 lifecycle planner 完整校验。
+  function automatic rdma_queue_backing_slice make_cq_backing_slice(
+    string name,
+    rdma_dma_mapping mapping,
+    longint unsigned logical_offset
+  );
+    rdma_queue_backing_slice slice;
+
+    if (mapping == null)
+      return null;
+    slice = rdma_queue_backing_slice::type_id::create(name);
+    if (slice == null)
+      return null;
+    slice.role = RDMA_QUEUE_ROLE_CQ_RING;
+    slice.mapping = mapping;
+    slice.mapping_offset = 0;
+    slice.length = 4096;
+    slice.logical_queue_offset = logical_offset;
+    return slice;
+  endfunction
+
+  // 功能：setup_segmented_cq_topology 建立真实 lifecycle CQ(depth=128, 64B CQE)，
+  //   其 8KiB ring 借用两个 source lifecycle CQ 各自拥有的 4KiB mapping。
+  // 输入/输出及副作用：label 为输入；输出 fixture、两个 source CQ、target CQ、
+  //   primary/additional mapping 与 ref；source lifecycle 保持唯一 release owner。
+  // 失败边界：任一 source/target create 或 plan shape 失败立即返回；mapping 必须先
+  //   来自 source CQ plan，再由 target 返回 plan 输出，测试不得 attach 或直接 allocate。
+  task automatic setup_segmented_cq_topology(
+    string label,
+    output rdma_queue_data_engine_fixture fixture,
+    output rdma_cq source_cq_first,
+    output rdma_cq source_cq_second,
+    output rdma_cq segmented_cq,
+    output rdma_queue_backing_ref backing,
+    output rdma_dma_mapping first_mapping,
+    output rdma_dma_mapping second_mapping,
+    output rdma_status status
+  );
+    rdma_queue_backing_ref source_backing;
+    rdma_queue_backing_slice slice;
+    rdma_create_cq_req request;
+    rdma_queue_resource resource;
+    rdma_control_result control_result;
+
+    fixture = null;
+    source_cq_first = null;
+    source_cq_second = null;
+    segmented_cq = null;
+    backing = null;
+    first_mapping = null;
+    second_mapping = null;
+    status = rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "segmented CQ setup is incomplete");
+    fixture = rdma_queue_data_engine_fixture::type_id::create(
+      {label, "_fixture"});
+    if (fixture == null)
+      return;
+    fixture.setup(status);
+    if (status == null || !status.ok())
+      return;
+    request = rdma_create_cq_req::type_id::create(
+      {label, "_source_first_request"});
+    if (request == null) begin
+      status = rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED,
+                                 "first source CQ request allocation failed");
+      return;
+    end
+    request.owner = fixture.binding.make_handle();
+    request.depth = 16;
+    request.cqe_size_bytes = 64;
+    status = clone_test_handle_value(fixture.ceq.handle, request.ceq_h);
+    if (status == null || !status.ok() || request.ceq_h == null)
+      return;
+    request.ring_backing.mode = RDMA_QUEUE_BACKING_OWNED;
+    resource = null;
+    control_result = null;
+    fixture.queue_executor.create_locked(
+      fixture.binding, fixture.binding.make_handle(), request, 64'h9201,
+      resource, control_result);
+    status = control_result == null ? null : control_result.status;
+    if (status == null || !status.ok() || resource == null ||
+        !$cast(source_cq_first, resource))
+      return;
+    source_backing = null;
+    foreach (source_cq_first.queue_plan.refs[i])
+      if (source_cq_first.queue_plan.refs[i] != null &&
+          source_cq_first.queue_plan.refs[i].role == RDMA_QUEUE_ROLE_CQ_RING)
+        source_backing = source_cq_first.queue_plan.refs[i];
+    if (source_backing == null || source_backing.mapping == null ||
+        source_backing.length != 4096) begin
+      status = rdma_status::make(RDMA_SC_INVALID_STATE,
+                                 "first source CQ mapping is unavailable");
+      return;
+    end
+    first_mapping = source_backing.mapping;
+
+    request = rdma_create_cq_req::type_id::create(
+      {label, "_source_second_request"});
+    if (request == null) begin
+      status = rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED,
+                                 "second source CQ request allocation failed");
+      return;
+    end
+    request.owner = fixture.binding.make_handle();
+    request.depth = 16;
+    request.cqe_size_bytes = 64;
+    status = clone_test_handle_value(fixture.ceq.handle, request.ceq_h);
+    if (status == null || !status.ok() || request.ceq_h == null)
+      return;
+    request.ring_backing.mode = RDMA_QUEUE_BACKING_OWNED;
+    resource = null;
+    control_result = null;
+    fixture.queue_executor.create_locked(
+      fixture.binding, fixture.binding.make_handle(), request, 64'h9202,
+      resource, control_result);
+    status = control_result == null ? null : control_result.status;
+    if (status == null || !status.ok() || resource == null ||
+        !$cast(source_cq_second, resource))
+      return;
+    source_backing = null;
+    foreach (source_cq_second.queue_plan.refs[i])
+      if (source_cq_second.queue_plan.refs[i] != null &&
+          source_cq_second.queue_plan.refs[i].role == RDMA_QUEUE_ROLE_CQ_RING)
+        source_backing = source_cq_second.queue_plan.refs[i];
+    if (source_backing == null || source_backing.mapping == null ||
+        source_backing.length != 4096) begin
+      status = rdma_status::make(RDMA_SC_INVALID_STATE,
+                                 "second source CQ mapping is unavailable");
+      return;
+    end
+    second_mapping = source_backing.mapping;
+
+    request = rdma_create_cq_req::type_id::create({label, "_cq_request"});
+    if (request == null) begin
+      status = rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED,
+                                 "segmented CQ request allocation failed");
+      return;
+    end
+    request.owner = fixture.binding.make_handle();
+    request.depth = 128;
+    request.cqe_size_bytes = 64;
+    status = clone_test_handle_value(fixture.ceq.handle, request.ceq_h);
+    if (status == null || !status.ok() || request.ceq_h == null)
+      return;
+    request.ring_backing.mode = RDMA_QUEUE_BACKING_BORROWED;
+    request.ring_backing.slices.delete();
+    slice = make_cq_backing_slice({label, "_primary_slice"},
+                                  first_mapping, 0);
+    if (slice == null) begin
+      status = rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED,
+                                 "segmented CQ primary slice allocation failed");
+      return;
+    end
+    request.ring_backing.slices.push_back(slice);
+    slice = make_cq_backing_slice({label, "_additional_slice"},
+                                  second_mapping, 4096);
+    if (slice == null) begin
+      status = rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED,
+                                 "segmented CQ additional slice allocation failed");
+      return;
+    end
+    request.ring_backing.slices.push_back(slice);
+    resource = null;
+    control_result = null;
+    fixture.queue_executor.create_locked(
+      fixture.binding, fixture.binding.make_handle(), request, 64'h9203,
+      resource, control_result);
+    status = control_result == null ? null : control_result.status;
+    if (status == null || !status.ok() || resource == null ||
+        !$cast(segmented_cq, resource))
+      return;
+    foreach (segmented_cq.queue_plan.refs[i]) begin
+      if (segmented_cq.queue_plan.refs[i] != null &&
+          segmented_cq.queue_plan.refs[i].role == RDMA_QUEUE_ROLE_CQ_RING)
+        backing = segmented_cq.queue_plan.refs[i];
+    end
+    if (backing == null || backing.mapping == null ||
+        backing.additional_segments.size() != 1 ||
+        backing.additional_segments[0] == null ||
+        backing.additional_segments[0].mapping == null ||
+        backing.length != 4096 ||
+        backing.additional_segments[0].logical_queue_offset != 4096 ||
+        backing.additional_segments[0].length != 4096) begin
+      status = rdma_status::make(RDMA_SC_INVALID_STATE,
+                                 "segmented CQ plan did not retain two mappings");
+      return;
+    end
+    first_mapping = backing.mapping;
+    second_mapping = backing.additional_segments[0].mapping;
+    status = rdma_status::success();
+  endtask
+
+  // 功能：cleanup_segmented_cq_topology 按 target CQ、source CQ2、source CQ1 的
+  //   借用依赖反序清理 plan-shape fixture，并核对 mapping 的唯一 release owner。
+  // 输入/输出及副作用：fixture、三个可空 CQ 和两个 source mapping 为输入；调用
+  //   lifecycle executor 销毁资源，target 不 release，source destroy 各 release 一份。
+  // 失败边界：fixture 为空时安全返回；单项 destroy/ownership 断言失败均报告
+  //   UVM_ERROR，但继续清理后续资源，避免首个 teardown 错误掩盖 source 泄漏。
+  task automatic cleanup_segmented_cq_topology(
+    string label,
+    rdma_queue_data_engine_fixture fixture,
+    rdma_cq source_cq_first,
+    rdma_cq source_cq_second,
+    rdma_cq segmented_cq,
+    rdma_dma_mapping first_mapping,
+    rdma_dma_mapping second_mapping
+  );
+    rdma_status cleanup_status;
+    int unsigned calls_before_destroy;
+
+    if (fixture == null)
+      return;
+    if (segmented_cq != null) begin
+      calls_before_destroy = fixture.mem == null ? 0 : fixture.mem.calls.size();
+      fixture.destroy_lifecycle_owned_queue(
+        segmented_cq.handle, 1'b1, 1'b0,
+        64'h92f2, cleanup_status);
+      if (cleanup_status == null || !cleanup_status.ok())
+        uvm_report_error({label, "_CQ_TEARDOWN"},
+                         "segmented target CQ teardown failed");
+      if (host_mem_mapping_call_since(
+            fixture.mem, "release", first_mapping, calls_before_destroy) ||
+          host_mem_mapping_call_since(
+            fixture.mem, "release", second_mapping, calls_before_destroy) ||
+          host_mem_mapping_call_since(
+            fixture.mem, "release_opaque", first_mapping,
+            calls_before_destroy) ||
+          host_mem_mapping_call_since(
+            fixture.mem, "release_opaque", second_mapping,
+            calls_before_destroy))
+        uvm_report_error({label, "_BORROWED_RELEASE"},
+                         "segmented target CQ released source mapping");
+    end
+    if (source_cq_second != null) begin
+      calls_before_destroy = fixture.mem == null ? 0 : fixture.mem.calls.size();
+      fixture.destroy_lifecycle_owned_queue(
+        source_cq_second.handle, 1'b1, 1'b0, 64'h92f3, cleanup_status);
+      if (cleanup_status == null || !cleanup_status.ok())
+        uvm_report_error({label, "_SOURCE_SECOND_TEARDOWN"},
+                         "segmented second source CQ teardown failed");
+      if (second_mapping != null && !host_mem_mapping_call_since(
+            fixture.mem, "release", second_mapping, calls_before_destroy))
+        uvm_report_error({label, "_SOURCE_SECOND_RELEASE"},
+                         "second source CQ did not release owned mapping");
+    end
+    if (source_cq_first != null) begin
+      calls_before_destroy = fixture.mem == null ? 0 : fixture.mem.calls.size();
+      fixture.destroy_lifecycle_owned_queue(
+        source_cq_first.handle, 1'b1, 1'b0, 64'h92f4, cleanup_status);
+      if (cleanup_status == null || !cleanup_status.ok())
+        uvm_report_error({label, "_SOURCE_FIRST_TEARDOWN"},
+                         "segmented first source CQ teardown failed");
+      if (first_mapping != null && !host_mem_mapping_call_since(
+            fixture.mem, "release", first_mapping, calls_before_destroy))
+        uvm_report_error({label, "_SOURCE_FIRST_RELEASE"},
+                         "first source CQ did not release owned mapping");
+    end
+  endtask
 
   // 功能：check_rejected_publish_atomic 验证一次 CQ/CEQ/AEQ publish 确定性拒绝
   //   没有改变 backing、PI/CI、used、pending、reservation，且 result 保持 null。
@@ -1422,8 +1814,9 @@ class rdma_queue_data_engine_device_publish_test extends uvm_test;
     status = rdma_status::success();
   endtask
 
-  // 功能：check_aeqe_publish_cases 验证真实非零 QP 目标的 AEQE 发布、poll 身份、
-  //   target/Function/generation/polarity 拒绝以及满环 credit 与恢复。
+  // 功能：check_aeqe_publish_cases 验证真实非零 QP 目标的 AEQE 发布、16-byte
+  //   write/readback recovery、poll 身份、target/Function/generation/polarity 拒绝
+  //   以及满环 credit 与恢复。
   // 输入/输出及副作用：fixture、lifecycle_aeq、event_qp/foreign_qp 为输入，
   //   status 为输出；成功路径写入/消费 AEQ，负例仅观察原子性快照。
   // 失败边界：目标必须是同 Function/代际的 attached QP 且 qpn 非零；满一整圈
@@ -1439,6 +1832,7 @@ class rdma_queue_data_engine_device_publish_test extends uvm_test;
     rdma_hw_aeqe_model polled_aeqe;
     rdma_queue_device_publish_result published;
     rdma_queue_event_result event_result;
+    rdma_queue_pending_operation recovery_pending;
     rdma_status clone_status;
     byte before_bytes[];
     int unsigned before_pi;
@@ -1456,6 +1850,8 @@ class rdma_queue_data_engine_device_publish_test extends uvm_test;
     bit fill_start_ci_wrap;
     bit aeq_polarity;
     bit has_pending;
+    int unsigned recovery_writes_before;
+    int unsigned recovery_reads_before;
 
     status = fixture.engine.query_runtime_producer_polarity(
       lifecycle_aeq.handle, RDMA_QUEUE_RUNTIME_AEQ, aeq_polarity);
@@ -1475,9 +1871,49 @@ class rdma_queue_data_engine_device_publish_test extends uvm_test;
     aeqe.valid = aeq_polarity;
     aeqe.ecode = 0;
     aeqe.packet_opcode = 0;
+    recovery_writes_before = count_host_mem_calls(fixture.mem, "write");
+    recovery_reads_before = count_host_mem_calls(fixture.mem, "read");
+    fixture.mem.corrupt_next_readback = 1'b1;
+    published = null;
     fixture.engine.publish_aeqe(
       lifecycle_aeq.handle, aeqe, published, status);
-    if (status == null || !status.ok() || published == null) return;
+    if (status == null || status.code != RDMA_SC_RECOVERY_REQUIRED ||
+        published != null) begin
+      status = rdma_status::make(RDMA_SC_INVALID_STATE,
+                                 "AEQE readback mismatch was not retained");
+      return;
+    end
+    recovery_pending = null;
+    status = fixture.engine.query_runtime_pending(
+      lifecycle_aeq.handle, RDMA_QUEUE_RUNTIME_AEQ, recovery_pending);
+    if (status == null || !status.ok() || recovery_pending == null ||
+        !recovery_pending.device_producer ||
+        !recovery_pending.device_write_attempted ||
+        recovery_pending.image == null || recovery_pending.image.length != 16 ||
+        recovery_pending.cursor == null || recovery_pending.next_cursor == null) begin
+      status = rdma_status::make(RDMA_SC_INVALID_STATE,
+                                 "AEQE recovery evidence is incomplete");
+      return;
+    end
+    fixture.engine.recover_queue(
+      lifecycle_aeq.handle, RDMA_QUEUE_RECOVERY_RETRY_PENDING, 1'b0, status);
+    if (status == null || status.code != RDMA_SC_INVALID_ARGUMENT) begin
+      status = rdma_status::make(RDMA_SC_INVALID_STATE,
+                                 "AEQE unconfirmed retry was accepted");
+      return;
+    end
+    fixture.engine.recover_queue(
+      lifecycle_aeq.handle, RDMA_QUEUE_RECOVERY_RETRY_PENDING, 1'b1, status);
+    if (status == null || !status.ok() ||
+        count_host_mem_calls(fixture.mem, "write") !=
+          recovery_writes_before + 2 ||
+        count_host_mem_calls(fixture.mem, "read") !=
+          recovery_reads_before + 2) begin
+      if (status != null && status.ok())
+        status = rdma_status::make(RDMA_SC_INVALID_STATE,
+                                   "AEQE recovery did not replay 16-byte I/O once");
+      return;
+    end
     fixture.engine.poll_aeqe(
       lifecycle_aeq.handle, 0, event_result, status);
     polled_aeqe = null;
@@ -2084,6 +2520,7 @@ class rdma_queue_data_engine_device_publish_test extends uvm_test;
   //   或 abort 前 poll 非 QUEUE_EMPTY 时报告 UVM_ERROR；detach 后查询必须失败且输出为空。
   task automatic check_unclaimed_pending_abort();
     rdma_queue_data_engine_fixture fixture;
+    rdma_device_publish_recovery_fault_engine fault_engine;
     rdma_queue_post_result posted;
     rdma_queue_device_publish_result published;
     rdma_queue_completion_result completion;
@@ -2097,6 +2534,7 @@ class rdma_queue_data_engine_device_publish_test extends uvm_test;
     bit reservation_valid;
     bit occupancy_pending;
     int unsigned occupancy;
+    int unsigned calls_before_abort;
 
     rdma_queue_data_engine::type_id::set_type_override(
       rdma_device_publish_recovery_fault_engine::get_type());
@@ -2105,7 +2543,8 @@ class rdma_queue_data_engine_device_publish_test extends uvm_test;
     fixture = rdma_queue_data_engine_fixture::type_id::create(
       "unclaimed_abort_fixture");
     fixture.setup(status);
-    if (status == null || !status.ok()) begin
+    if (status == null || !status.ok() ||
+        !$cast(fault_engine, fixture.engine)) begin
       `uvm_error("CQE_UNCLAIMED_ABORT_SETUP", "unclaimed abort fixture setup failed")
       return;
     end
@@ -2147,6 +2586,36 @@ class rdma_queue_data_engine_device_publish_test extends uvm_test;
     fixture.engine.poll_cqe(fixture.cq.handle, 0, completion, status);
     if (status == null || status.code != RDMA_SC_QUEUE_EMPTY || completion != null)
       `uvm_error("CQE_UNCLAIMED_ABORT_INVISIBLE", "unclaimed abort CQE was visible")
+    calls_before_abort = fixture.mem.calls.size();
+    status = fault_engine.hold_detach_lock_for_test();
+    if (status == null || !status.ok()) begin
+      `uvm_error("CQE_UNCLAIMED_ABORT_ARM", "unclaimed detach lock failed")
+      return;
+    end
+    fixture.engine.recover_queue(fixture.cq.handle,
+      RDMA_QUEUE_RECOVERY_ABORT_AND_DETACH, 1'b1, status);
+    fault_engine.release_detach_lock_for_test();
+    if (status == null || status.ok())
+      `uvm_error("CQE_UNCLAIMED_ABORT_BUSY",
+                 "unclaimed abort ignored detach lock failure")
+    pending = null;
+    status = fixture.engine.query_runtime_pending(
+      fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, pending);
+    if (status == null || !status.ok() || pending == null ||
+        pending.cursor == null || fixture.mem.calls.size() != calls_before_abort)
+      `uvm_error("CQE_UNCLAIMED_ABORT_RETAIN",
+                 "failed unclaimed detach lost evidence or touched mapping")
+    reservation_valid = 1'b0;
+    reservation = null;
+    status = fixture.engine.query_runtime_device_reservation(
+      fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, reservation_valid,
+      reservation);
+    if (status == null || !status.ok() || !reservation_valid ||
+        reservation == null || pending == null || pending.cursor == null ||
+        reservation.index != pending.cursor.index ||
+        reservation.wrap != pending.cursor.wrap)
+      `uvm_error("CQE_UNCLAIMED_ABORT_RETAIN_RESERVATION",
+                 "failed unclaimed detach cancelled reservation")
     fixture.engine.recover_queue(fixture.cq.handle,
       RDMA_QUEUE_RECOVERY_ABORT_AND_DETACH, 1'b1, status);
     if (status == null || !status.ok()) begin
@@ -2166,6 +2635,253 @@ class rdma_queue_data_engine_device_publish_test extends uvm_test;
     if (status == null || status.ok() || occupancy != 0 || occupancy_pending)
       `uvm_error("CQE_UNCLAIMED_ABORT_OCCUPANCY",
                  "abort left an observable queue runtime")
+    published = null;
+    publish_cqe_for_test(fixture.engine, fixture.cq.handle, cqe,
+                         published, status);
+    if (status == null || status.code != RDMA_SC_INVALID_STATE ||
+        published != null)
+      `uvm_error("CQE_UNCLAIMED_ABORT_PUBLISH_STALE",
+                 "unclaimed abort left publish attachment active")
+    completion = null;
+    fixture.engine.poll_cqe(fixture.cq.handle, 0, completion, status);
+    if (status == null || status.code != RDMA_SC_INVALID_STATE ||
+        completion != null || fixture.mem.calls.size() != calls_before_abort)
+      `uvm_error("CQE_UNCLAIMED_ABORT_POLL_STALE",
+                 "unclaimed abort left poll active or released mapping")
+  endtask
+
+  // 功能：check_claimed_abort_detach_failure_atomicity 在 CQ runtime 已接管 device
+  //   pending 后占用真实 detach 锁，验证失败 abort 不会提前清除 pending/reservation，
+  //   释放锁后同一 abort 可幂等完成并使旧 handle 的 publish/poll 都失效。
+  // 输入/输出及副作用：无显式输入；任务建立 lifecycle-owned CQ/QP、发布真实 posted
+  //   WQE 对应 CQE，并以 readback mismatch 进入 recovery；只借测试子类占用现有锁。
+  // 失败边界：setup/query/注入失败立即报告并返回；RESOURCE_BUSY 前后 image/cursor/
+  //   next_cursor、PI/CI/wrap、used、reservation 和 Host-memory 调用数必须不变，最终
+  //   abort 不得触发 release/release_opaque，旧 attachment API 必须返回 INVALID_STATE。
+  task automatic check_claimed_abort_detach_failure_atomicity();
+    rdma_queue_data_engine_fixture fixture;
+    rdma_device_publish_recovery_fault_engine fault_engine;
+    rdma_queue_post_result posted;
+    rdma_queue_device_publish_result published;
+    rdma_queue_completion_result completion;
+    rdma_hw_cqe_model cqe;
+    rdma_queue_pending_operation pending_before;
+    rdma_queue_pending_operation pending_after;
+    rdma_queue_cursor_snapshot reservation;
+    rdma_status status;
+    rdma_status model_status;
+    int unsigned used_before;
+    int unsigned used_after;
+    int unsigned pi_before;
+    int unsigned pi_after;
+    int unsigned ci_before;
+    int unsigned ci_after;
+    int unsigned calls_before_abort;
+    bit pending_present;
+    bit reservation_valid;
+    bit pw_before;
+    bit pw_after;
+    bit cw_before;
+    bit cw_after;
+    bit polarity;
+
+    rdma_queue_data_engine::type_id::set_type_override(
+      rdma_device_publish_recovery_fault_engine::get_type());
+    rdma_device_publish_recovery_fault_engine::admission_failures_remaining = 0;
+    rdma_device_publish_recovery_fault_engine::cancel_failures_remaining = 0;
+    fixture = rdma_queue_data_engine_fixture::type_id::create(
+      "claimed_abort_detach_failure_fixture");
+    fixture.setup(status);
+    if (status == null || !status.ok() ||
+        !$cast(fault_engine, fixture.engine)) begin
+      `uvm_error("CQE_ABORT_SPLIT_SETUP",
+                 "claimed abort detach-failure fixture setup failed")
+      return;
+    end
+    fixture.engine.post_send(fixture.make_send(64'hd533_0000), posted, status);
+    if (status == null || !status.ok() || posted == null) begin
+      `uvm_error("CQE_ABORT_SPLIT_POST", "claimed abort setup post failed")
+      return;
+    end
+    status = fixture.engine.query_runtime_producer_polarity(
+      fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, polarity);
+    cqe = make_cqe_for_outstanding_send(fixture.qp.handle,
+      fixture.qp.local_qp_id, posted, polarity, model_status);
+    if (status == null || !status.ok() || model_status == null ||
+        !model_status.ok() || cqe == null) begin
+      `uvm_error("CQE_ABORT_SPLIT_MODEL", "claimed abort CQE setup failed")
+      return;
+    end
+    fixture.mem.corrupt_next_readback = 1'b1;
+    published = null;
+    publish_cqe_for_test(fixture.engine, fixture.cq.handle, cqe,
+                         published, status);
+    fixture.mem.corrupt_next_readback = 1'b0;
+    if (status == null || status.code != RDMA_SC_RECOVERY_REQUIRED ||
+        published != null) begin
+      `uvm_error("CQE_ABORT_SPLIT_PUBLISH",
+                 "readback mismatch did not establish claimed recovery")
+      return;
+    end
+    pending_before = null;
+    status = fixture.engine.query_runtime_pending(
+      fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, pending_before);
+    if (status == null || !status.ok() || pending_before == null ||
+        pending_before.image == null || pending_before.cursor == null ||
+        pending_before.next_cursor == null ||
+        !pending_before.device_producer ||
+        !pending_before.device_write_attempted) begin
+      `uvm_error("CQE_ABORT_SPLIT_PENDING", "claimed pending is incomplete")
+      return;
+    end
+    status = fixture.engine.query_runtime_occupancy(
+      fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, used_before,
+      pending_present);
+    if (status == null || !status.ok() || !pending_present) begin
+      `uvm_error("CQE_ABORT_SPLIT_USED", "claimed occupancy query failed")
+      return;
+    end
+    status = fixture.engine.query_runtime_cursors(
+      fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, pi_before, pw_before,
+      ci_before, cw_before);
+    if (status == null || !status.ok()) begin
+      `uvm_error("CQE_ABORT_SPLIT_CURSOR", "claimed cursor query failed")
+      return;
+    end
+    reservation = null;
+    reservation_valid = 1'b0;
+    status = fixture.engine.query_runtime_device_reservation(
+      fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, reservation_valid,
+      reservation);
+    if (status == null || !status.ok() || !reservation_valid ||
+        reservation == null ||
+        reservation.index != pending_before.cursor.index ||
+        reservation.wrap != pending_before.cursor.wrap) begin
+      `uvm_error("CQE_ABORT_SPLIT_RESERVATION",
+                 "claimed reservation query failed")
+      return;
+    end
+    calls_before_abort = fixture.mem.calls.size();
+    status = fault_engine.hold_detach_lock_for_test();
+    if (status == null || !status.ok()) begin
+      `uvm_error("CQE_ABORT_SPLIT_ARM", "detach lock injection failed")
+      return;
+    end
+    fixture.engine.recover_queue(fixture.cq.handle,
+      RDMA_QUEUE_RECOVERY_ABORT_AND_DETACH, 1'b1, status);
+    fault_engine.release_detach_lock_for_test();
+    if (status == null || status.code != RDMA_SC_RESOURCE_BUSY)
+      `uvm_error("CQE_ABORT_SPLIT_STATUS",
+                 "busy detach did not return RESOURCE_BUSY")
+    pending_after = null;
+    status = fixture.engine.query_runtime_pending(
+      fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, pending_after);
+    if (status == null || !status.ok() || pending_after == null ||
+        pending_after.image == null || pending_after.cursor == null ||
+        pending_after.next_cursor == null ||
+        pending_after.image.bytes != pending_before.image.bytes ||
+        pending_after.cursor.index != pending_before.cursor.index ||
+        pending_after.cursor.wrap != pending_before.cursor.wrap ||
+        pending_after.next_cursor.index != pending_before.next_cursor.index ||
+        pending_after.next_cursor.wrap != pending_before.next_cursor.wrap ||
+        pending_after.device_write_attempted !=
+          pending_before.device_write_attempted ||
+        pending_after.mmio_evidence != pending_before.mmio_evidence)
+      `uvm_error("CQE_ABORT_SPLIT_EVIDENCE",
+                 "failed detach lost or changed claimed evidence")
+    status = fixture.engine.query_runtime_occupancy(
+      fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, used_after,
+      pending_present);
+    if (status == null || !status.ok() || !pending_present ||
+        used_after != used_before)
+      `uvm_error("CQE_ABORT_SPLIT_USED_AFTER",
+                 "failed detach changed claimed occupancy")
+    status = fixture.engine.query_runtime_cursors(
+      fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, pi_after, pw_after,
+      ci_after, cw_after);
+    if (status == null || !status.ok() || pi_after != pi_before ||
+        pw_after != pw_before || ci_after != ci_before ||
+        cw_after != cw_before)
+      `uvm_error("CQE_ABORT_SPLIT_CURSOR_AFTER",
+                 "failed detach changed claimed cursors")
+    reservation = null;
+    reservation_valid = 1'b0;
+    status = fixture.engine.query_runtime_device_reservation(
+      fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, reservation_valid,
+      reservation);
+    if (status == null || !status.ok() || !reservation_valid ||
+        reservation == null || reservation.index != pending_before.cursor.index ||
+        reservation.wrap != pending_before.cursor.wrap ||
+        fixture.mem.calls.size() != calls_before_abort)
+      `uvm_error("CQE_ABORT_SPLIT_ATOMIC",
+                 "failed detach changed reservation or Host-memory calls")
+    fixture.engine.recover_queue(fixture.cq.handle,
+      RDMA_QUEUE_RECOVERY_ABORT_AND_DETACH, 1'b1, status);
+    if (status == null || !status.ok()) begin
+      `uvm_error("CQE_ABORT_SPLIT_RETRY", "second abort did not detach")
+      return;
+    end
+    published = null;
+    publish_cqe_for_test(fixture.engine, fixture.cq.handle, cqe,
+                         published, status);
+    if (status == null || status.code != RDMA_SC_INVALID_STATE ||
+        published != null)
+      `uvm_error("CQE_ABORT_SPLIT_PUBLISH_STALE",
+                 "aborted attachment still accepted publish")
+    completion = null;
+    fixture.engine.poll_cqe(fixture.cq.handle, 0, completion, status);
+    if (status == null || status.code != RDMA_SC_INVALID_STATE ||
+        completion != null || fixture.mem.calls.size() != calls_before_abort)
+      `uvm_error("CQE_ABORT_SPLIT_POLL_STALE",
+                 "aborted attachment remained visible or released mapping")
+    rdma_device_publish_recovery_fault_engine::admission_failures_remaining = 0;
+    rdma_device_publish_recovery_fault_engine::cancel_failures_remaining = 0;
+  endtask
+
+  // 功能：check_segmented_cq_plan_ownership 用两个真实 source lifecycle CQ 的
+  //   4KiB mapping 组成 8KiB borrowed target CQ，只验证公开 plan shape 与 release owner。
+  // 输入/输出及副作用：无显式输入；经 lifecycle create/destroy 建立并清理三个 CQ，
+  //   不 attach target、不调用 device publish，也不修改 mapping 私有 token 或 registry。
+  // 失败边界：create/shape/ownership 任一不符均报告 UVM_ERROR；清理仍按 target、
+  //   source CQ2、source CQ1 继续，并证明 target 不释放而 source 各释放自己的 mapping。
+  task automatic check_segmented_cq_plan_ownership();
+    rdma_queue_data_engine_fixture fixture;
+    rdma_cq source_cq_first;
+    rdma_cq source_cq_second;
+    rdma_cq segmented_cq;
+    rdma_queue_backing_ref backing;
+    rdma_dma_mapping first_mapping;
+    rdma_dma_mapping second_mapping;
+    rdma_status status;
+
+    setup_segmented_cq_topology(
+      "segmented_plan", fixture, source_cq_first, source_cq_second,
+      segmented_cq, backing, first_mapping, second_mapping, status);
+    if (status == null || !status.ok()) begin
+      `uvm_error("CQE_SEGMENT_PLAN_SETUP",
+                 status == null ? "segmented plan setup returned null" :
+                   $sformatf("segmented plan setup failed code=%0d message=%s",
+                             status.code, status.message))
+    end
+    else if (backing == null || first_mapping == null ||
+             second_mapping == null ||
+             backing.ownership != RDMA_OWNERSHIP_BORROWED ||
+             backing.mapping_offset != 0 || backing.length != 4096 ||
+             backing.logical_queue_offset != 0 ||
+             backing.additional_segments.size() != 1 ||
+             backing.additional_segments[0] == null ||
+             backing.additional_segments[0].ownership !=
+               RDMA_OWNERSHIP_BORROWED ||
+             backing.additional_segments[0].mapping_offset != 0 ||
+             backing.additional_segments[0].length != 4096 ||
+             backing.additional_segments[0].logical_queue_offset != 4096 ||
+             first_mapping.iova.value == second_mapping.iova.value) begin
+      `uvm_error("CQE_SEGMENT_PLAN_SHAPE",
+                 "segmented lifecycle plan lost borrowed 4KiB slices")
+    end
+    cleanup_segmented_cq_topology(
+      "CQE_SEGMENT_PLAN", fixture, source_cq_first, source_cq_second,
+      segmented_cq, first_mapping, second_mapping);
   endtask
 
   // 功能：check_device_publish_preflight_failure 在 attachment access 的首次
@@ -2605,19 +3321,37 @@ class rdma_queue_data_engine_device_publish_test extends uvm_test;
     if (poll_status == null || poll_status.code != RDMA_SC_QUEUE_EMPTY ||
         completion != null)
       `uvm_error("CQE_EMPTY", "second CQE poll did not prove occupancy is zero")
+    reset_device_publish_factory_state();
     check_unclaimed_pending_kind_authority();
+    reset_device_publish_factory_state();
     check_unclaimed_pending_abort();
+    reset_device_publish_factory_state();
+    check_claimed_abort_detach_failure_atomicity();
+    reset_device_publish_factory_state();
+    check_segmented_cq_plan_ownership();
+    reset_device_publish_factory_state();
     check_device_publish_preflight_failure();
+    reset_device_publish_factory_state();
     check_device_publish_cancel_failure();
+    reset_device_publish_factory_state();
     check_device_publish_fault_recovery("CQE_WRITE_FAIL", 0);
+    reset_device_publish_factory_state();
     check_device_publish_fault_recovery("CQE_READ_FAIL", 1);
+    reset_device_publish_factory_state();
     check_device_publish_fault_recovery("CQE_READ_MISMATCH", 2);
+    reset_device_publish_factory_state();
     check_device_publish_stale_route();
+    reset_device_publish_factory_state();
     check_cqe_authority_rejections();
+    reset_device_publish_factory_state();
     check_cqe_full_atomic();
+    reset_device_publish_factory_state();
     check_event_publish_api();
+    reset_device_publish_factory_state();
     check_ceqe_runtime_width();
+    reset_device_publish_factory_state();
     check_cqe_authority_width();
+    reset_device_publish_factory_state();
     phase.drop_objection(this);
   endtask
 endclass
