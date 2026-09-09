@@ -56,6 +56,50 @@ class rdma_queue_runtime_test extends uvm_test;
                  status.convert2string())
   endfunction
 
+  // 功能：验证 device-produced CQ runtime 的 reservation、commit 与 consumer 可见性边界，并确认 host/device producer API 方向隔离。
+  // 输入/输出及副作用：在本地构造 CQ 与 SQ runtime，调用 configure/activate/reserve/commit/query 接口并产生 UVM 断言；不接管外部句柄所有权。
+  // 失败/边界：若配置、激活或 reservation 前置步骤失败则提前返回；未提交 reservation 必须保持 occupancy 为零且 peek 返回 RDMA_SC_QUEUE_EMPTY，方向错误必须返回 RDMA_SC_INVALID_STATE。
+  task automatic test_device_ring_reserve_commit_and_visibility();
+    rdma_queue_runtime runtime;
+    rdma_queue_runtime host_runtime;
+    rdma_queue_cursor_snapshot reservation, consumer;
+    rdma_status status;
+    int unsigned occupancy;
+
+    runtime = rdma_queue_runtime::type_id::create("device_runtime");
+    status = runtime.configure(queue_handle("cq", RDMA_RESOURCE_CQ, 7),
+                               RDMA_QUEUE_RUNTIME_CQ, 2, 0, 1'b0,
+                               0, 1'b0, 1'b0);
+    expect_ok("DEVICE_CONFIGURE", status);
+    if (status == null || !status.ok()) return;
+    expect_ok("DEVICE_ACTIVATE", runtime.activate());
+    status = runtime.reserve_device_producer(reservation);
+    expect_ok("DEVICE_RESERVE", status);
+    if (status == null || !status.ok() || reservation == null) return;
+    status = runtime.query_occupancy(occupancy);
+    if (status == null || occupancy != 0)
+      `uvm_error("DEVICE_OCCUPANCY", "reservation changed committed occupancy")
+    status = runtime.peek_consumer(consumer);
+    if (status == null || status.code != RDMA_SC_QUEUE_EMPTY || consumer != null)
+      `uvm_error("DEVICE_VISIBILITY", "uncommitted slot became visible")
+    expect_ok("DEVICE_COMMIT", runtime.commit_device_producer(reservation));
+    status = runtime.query_occupancy(occupancy);
+    if (status == null || occupancy != 1)
+      `uvm_error("DEVICE_OCCUPANCY", "committed occupancy is incorrect")
+
+    host_runtime = rdma_queue_runtime::type_id::create("host_runtime");
+    expect_ok("HOST_CONFIGURE", host_runtime.configure(
+      queue_handle("sq", RDMA_RESOURCE_QP, 9), RDMA_QUEUE_RUNTIME_SQ,
+      2, 0, 1'b0, 0, 1'b0, 1'b1));
+    expect_ok("HOST_ACTIVATE", host_runtime.activate());
+    expect_code("HOST_DEVICE_RESERVE",
+                host_runtime.reserve_device_producer(reservation),
+                RDMA_SC_INVALID_STATE);
+    expect_code("DEVICE_HOST_RESERVE",
+                runtime.reserve_producer(reservation),
+                RDMA_SC_INVALID_STATE);
+  endtask
+
   // 功能：在 rdma_queue_runtime_test 中，run_phase 驱动 UVM 阶段中的场景初始化、事务执行和断言收尾，并在退出前释放 objection 或测试资源。
   // 输入/输出及副作用：phase（输入）；phase 由 UVM 提供；task 通过 objection、日志和断言暴露结果，可能调用 DUT 接口但不改变其所有权规则。
   // 失败/边界：run_phase 的 setup/阶段驱动失败时停止新增事务，并按测试生命周期清理 objection 与临时引用。
@@ -71,6 +115,7 @@ class rdma_queue_runtime_test extends uvm_test;
     rdma_status status;
 
     phase.raise_objection(this);
+    test_device_ring_reserve_commit_and_visibility();
     runtime = rdma_queue_runtime::type_id::create("runtime");
     queue_h = queue_handle("qp", RDMA_RESOURCE_QP, 9);
 

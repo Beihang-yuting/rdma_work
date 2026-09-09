@@ -188,6 +188,11 @@ class rdma_queue_runtime extends uvm_object;
   bit initial_polarity;
   int unsigned used;
   rdma_queue_pending_operation pending_operation;
+  // 中文设计：device-produced ring 不使用 host WQE ledger，必须在同一把 runtime lock
+  // 保护下保存单一 detached reservation，供写入/提交/恢复阶段共享且不泄露内部句柄。
+  bit host_produced;
+  bit device_reservation_valid;
+  rdma_queue_cursor_snapshot device_reservation;
   protected rdma_queue_slot_ledger_entry slots[];
   protected semaphore lock;
   protected bit recovery_commit_allowed;
@@ -207,26 +212,58 @@ class rdma_queue_runtime extends uvm_object;
   // 失败/边界：rdma_queue_runtime 构造只建立本地初始状态；本地 semaphore/ledger 等按构造体显式分配，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name="rdma_queue_runtime");
     super.new(name); queue_h=null; kind=RDMA_QUEUE_RUNTIME_SQ; state=RDMA_QUEUE_RUNTIME_DETACHED;
-    depth=0; producer_index=0; consumer_index=0; producer_wrap=0; consumer_wrap=0; initial_polarity=0; used=0; pending_operation=null; lock=new(1); recovery_commit_allowed=0;
+    depth=0; producer_index=0; consumer_index=0; producer_wrap=0; consumer_wrap=0; initial_polarity=0; used=0; pending_operation=null; host_produced=0; device_reservation_valid=0; device_reservation=null; lock=new(1); recovery_commit_allowed=0;
   endfunction
 
-  // 功能：在 rdma_queue_runtime 中，configure 校验依赖和 binding 后建立运行边界，只保存非拥有引用并拒绝重复配置。
-  // 输入/输出及副作用：qh（输入）、k（输入）、d（输入）、pi（输入）、pw（输入）、ci（输入）、cw（输入）、host_produced（输入）、initial_owner_polarity（输入）；configure 先依据 !lock_status.ok(；qh==null；d==0 || (d & (d-1 校验 qh、k、d、pi、pw、ci、cw、host_produced、initial_owner_polarity；成功时更新本对象配置/状态并保存非拥有引用，返回
-  //   rdma_status。
-  // 失败/边界：实现中的空依赖、重复登记、状态或 generation/authority 校验失败时返回错误；失败时保留旧配置。
+  // 功能：configure 校验 ring 方向、几何与初始游标，构造临时句柄/账本并一次性发布 ATTACHED runtime 配置。
+  // 输入/输出及副作用：qh、k、d、pi、pw、ci、cw、host_produced_cfg、initial_owner_polarity（输入）；成功时锁存游标、方向、occupancy 与 detached handle，外部资源仍由调用方拥有。
+  // 失败/边界：空句柄、重复配置、深度非二次幂、游标越界/组合非法、方向与 queue kind 不匹配或临时对象分配失败时返回错误，并保留旧状态。
   function rdma_status configure(rdma_handle qh, rdma_queue_runtime_kind_e k,
                                  int unsigned d, int unsigned pi, bit pw,
-                                 int unsigned ci, bit cw, bit host_produced,
+                                 int unsigned ci, bit cw, bit host_produced_cfg,
                                  bit initial_owner_polarity = 1'b0);
     rdma_status lock_status;
     rdma_handle queue_snapshot;
+    rdma_queue_slot_ledger_entry staged_slots[];
+    int unsigned staged_used;
+    bit device_kind;
+    bit expected_host_direction;
+    rdma_resource_kind_e expected_resource_kind;
     lock_status = acquire_lock();
     if (!lock_status.ok()) return lock_status;
+    if (state != RDMA_QUEUE_RUNTIME_DETACHED) begin lock.put(1); return rdma_status::make(RDMA_SC_INVALID_STATE,"queue runtime is already configured"); end
     if (qh==null) begin lock.put(1); return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,"queue handle is null"); end
     if (d==0 || (d & (d-1))!=0) begin lock.put(1); return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,"queue depth is not a power of two"); end
     if (pi>=d || ci>=d) begin lock.put(1); return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,"queue cursor is outside depth"); end
     if (!(k inside {RDMA_QUEUE_RUNTIME_SQ,RDMA_QUEUE_RUNTIME_RQ,RDMA_QUEUE_RUNTIME_SRQ,RDMA_QUEUE_RUNTIME_CQ,RDMA_QUEUE_RUNTIME_CEQ,RDMA_QUEUE_RUNTIME_AEQ}))
       begin lock.put(1); return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,"queue runtime kind is invalid"); end
+    device_kind = (k inside {RDMA_QUEUE_RUNTIME_CQ, RDMA_QUEUE_RUNTIME_CEQ, RDMA_QUEUE_RUNTIME_AEQ});
+    expected_host_direction = !device_kind;
+    case (k)
+      RDMA_QUEUE_RUNTIME_CQ: expected_resource_kind = RDMA_RESOURCE_CQ;
+      RDMA_QUEUE_RUNTIME_CEQ: expected_resource_kind = RDMA_RESOURCE_CEQ;
+      RDMA_QUEUE_RUNTIME_AEQ: expected_resource_kind = RDMA_RESOURCE_AEQ;
+      RDMA_QUEUE_RUNTIME_SRQ: expected_resource_kind = RDMA_RESOURCE_SRQ;
+      default: expected_resource_kind = RDMA_RESOURCE_QP;
+    endcase
+    if (qh.kind != expected_resource_kind) begin
+      lock.put(1);
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "queue handle kind does not match runtime kind");
+    end
+    if (host_produced_cfg != expected_host_direction) begin
+      lock.put(1);
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "producer direction does not match queue kind");
+    end
+    if (device_kind) begin
+      if (pw == cw) begin
+        if (pi < ci) begin lock.put(1); return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,"same-wrap cursors are reversed"); end
+        staged_used = pi - ci;
+      end else if (pi == ci) staged_used = d;
+      else staged_used = d - ci + pi;
+      if (staged_used > d) begin lock.put(1); return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,"initial occupancy exceeds depth"); end
+    end else staged_used = 0;
     // Keep an immutable identity snapshot.  The lifecycle resource remains
     // authoritative, but callers must not be able to mutate the runtime's
     // generation fence through the handle passed to configure().
@@ -236,10 +273,16 @@ class rdma_queue_runtime extends uvm_object;
       return rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED,
                                "queue runtime handle snapshot failed");
     end
+    if (!device_kind) begin
+      staged_slots = new[d];
+      foreach (staged_slots[i]) begin
+        staged_slots[i] = rdma_queue_slot_ledger_entry::type_id::create($sformatf("slot_%0d", i));
+        if (staged_slots[i] == null) begin lock.put(1); return rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED,"slot ledger allocation failed"); end
+      end
+    end else staged_slots = new[0];
     queue_h=queue_snapshot; kind=k; depth=d; producer_index=pi; producer_wrap=pw; consumer_index=ci; consumer_wrap=cw;
-    initial_polarity=initial_owner_polarity;
-    used=0; slots=new[d]; foreach(slots[i]) slots[i]=rdma_queue_slot_ledger_entry::type_id::create($sformatf("slot_%0d",i));
-    pending_operation=null; recovery_commit_allowed=0; state=RDMA_QUEUE_RUNTIME_ATTACHED; lock.put(1); return rdma_status::success();
+    initial_polarity=initial_owner_polarity; host_produced=host_produced_cfg; used=staged_used;
+    slots=staged_slots; pending_operation=null; device_reservation_valid=0; device_reservation=null; recovery_commit_allowed=0; state=RDMA_QUEUE_RUNTIME_ATTACHED; lock.put(1); return rdma_status::success();
   endfunction
 
   // 功能：在 rdma_queue_runtime 中，activate 校验依赖和 binding 后建立运行边界，只保存非拥有引用并拒绝重复配置。
@@ -265,12 +308,14 @@ class rdma_queue_runtime extends uvm_object;
       return rdma_status::make(RDMA_SC_INVALID_STATE,
                                "queue runtime is not active");
     end
-    if (pending_operation != null || used != 0) begin
+    if (pending_operation != null || device_reservation_valid || used != 0) begin
       lock.put(1);
       return rdma_status::make(RDMA_SC_RESOURCE_BUSY,
                                pending_operation != null ?
                                "queue runtime has a pending operation" :
-                               "queue runtime has outstanding slots");
+                               (device_reservation_valid ?
+                                "queue runtime has a device reservation" :
+                                "queue runtime has outstanding slots"));
     end
     state = RDMA_QUEUE_RUNTIME_QUIESCING;
     lock.put(1);
@@ -289,7 +334,7 @@ class rdma_queue_runtime extends uvm_object;
       return rdma_status::make(RDMA_SC_INVALID_STATE,
                                "queue runtime is not quiescing");
     end
-    if (pending_operation != null || used != 0) begin
+    if (pending_operation != null || device_reservation_valid || used != 0) begin
       lock.put(1);
       return rdma_status::make(RDMA_SC_RESOURCE_BUSY,
                                "quiesced runtime has mutable work");
@@ -311,7 +356,7 @@ class rdma_queue_runtime extends uvm_object;
       return rdma_status::make(RDMA_SC_INVALID_STATE,
                                "queue runtime is not quiescing");
     end
-    if (pending_operation != null || used != 0) begin
+    if (pending_operation != null || device_reservation_valid || used != 0) begin
       lock.put(1);
       return rdma_status::make(RDMA_SC_RESOURCE_BUSY,
                                "quiesced runtime has mutable work");
@@ -331,14 +376,24 @@ class rdma_queue_runtime extends uvm_object;
     rdma_queue_slot_ledger_entry staged_slot;
     // 动态数组不能用 null aggregate 比较；以 source.depth 和实际 size
     // 同时作为“已配置且有槽位账本”的判据，避免在复制阶段触发越界。
-    if (source == null || source.depth == 0 || source.slots.size() == 0 ||
-        source.slots.size() < source.depth)
+    if (source == null || source.depth == 0)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "source runtime is null");
     if (source.consumer_index >= depth || source.producer_index >= depth)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "source cursor exceeds resized depth");
     if (source.used > depth)
       return rdma_status::make(RDMA_SC_RESOURCE_BUSY,
                                "source runtime occupancy exceeds resized depth");
+    if (!source.host_produced && !host_produced) begin
+      producer_index = source.producer_index;
+      producer_wrap = source.producer_wrap;
+      consumer_index = source.consumer_index;
+      consumer_wrap = source.consumer_wrap;
+      used = source.used;
+      slots = new[0];
+      return rdma_status::success();
+    end
+    if (source.slots.size() == 0 || source.slots.size() < source.depth)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "source runtime has no host ledger");
     limit = (source.depth < depth) ? source.depth : depth;
     // A shrink may only discard slots that are truly empty.  Validate the
     // entire source ledger before touching this runtime so a failed clone
@@ -409,12 +464,31 @@ class rdma_queue_runtime extends uvm_object;
   // 功能：在 rdma_queue_runtime 中，query_available 按完整 key/handle 查找唯一权威记录并返回 detached 快照，避免把内部可变引用泄露给调用方。
   // 输入/输出及副作用：value（输出）；query_available 读取 value 并使用字段 value，并写入 value；函数返回 rdma_status，不取得调用方资源所有权。
   // 失败/边界：query_available 在 key/handle 缺失、记录不唯一或 generation/reset epoch 过期时返回明确错误，不回退到默认 authority。
-  function rdma_status query_available(output int unsigned value); if(depth==0) begin value=0; return rdma_status::make(RDMA_SC_INVALID_STATE,"runtime is unconfigured"); end value=depth-used; return rdma_status::success(); endfunction
+  // 功能：query_available 在 runtime lock 内返回可再提交的 producer credit，并扣除尚未 commit 的 device reservation。
+  // 输入/输出及副作用：value（输出）先置零，成功时写入 depth-used-1（有 reservation）或 depth-used；不修改游标或账本。
+  // 失败/边界：未配置、内部 used 越界或锁忙返回非成功状态；结果下限为零，失败不泄露旧值。
+  function rdma_status query_available(output int unsigned value);
+    rdma_status lock_status;
+    value = 0;
+    lock_status = acquire_lock();
+    if (!lock_status.ok()) return lock_status;
+    if (depth == 0) begin lock.put(1); return rdma_status::make(RDMA_SC_INVALID_STATE,"runtime is unconfigured"); end
+    if (used > depth) begin lock.put(1); return rdma_status::make(RDMA_SC_INVALID_STATE,"runtime occupancy exceeds depth"); end
+    value = depth - used;
+    if (!host_produced && device_reservation_valid && value > 0) value--;
+    lock.put(1);
+    return rdma_status::success();
+  endfunction
 
   // 功能：在 rdma_queue_runtime 中，available_slots 只读查询当前运行时/测试账本，返回槽位、对象或恢复记录的快照而不推进事务。
   // 输入/输出及副作用：无显式参数；available_slots 读取当前对象的 depth 和 used 计数，返回尚可预留的槽位数，不修改运行时账本；函数返回 int unsigned，不取得调用方资源所有权。
 // 失败/边界：available_slots 返回 depth-used；runtime 未 configure 时 depth 为 0，结果保持 0，不会为负数或修改槽位账本。
-  function int unsigned available_slots(); return depth-used; endfunction
+  function int unsigned available_slots();
+    int unsigned value;
+    value = (used <= depth) ? (depth - used) : 0;
+    if (!host_produced && device_reservation_valid && value > 0) value--;
+    return value;
+  endfunction
 
   // 功能：在 rdma_queue_runtime 中，peek_consumer 只读查询当前运行时/测试账本，返回槽位、对象或恢复记录的快照而不推进事务。
   // 输入/输出及副作用：snapshot（输出）；peek_consumer 读取 snapshot 并使用字段 snapshot、lock_status、snapshot.index、snapshot.wrap，并写入 snapshot；函数返回 rdma_status，不取得调用方资源所有权。
@@ -429,7 +503,17 @@ class rdma_queue_runtime extends uvm_object;
       return rdma_status::make(RDMA_SC_INVALID_STATE,
                                "queue runtime is not active");
     end
+    if (!host_produced && used == 0) begin
+      lock.put(1);
+      return rdma_status::make(RDMA_SC_QUEUE_EMPTY,
+                               "device ring has no committed entries");
+    end
     snapshot = rdma_queue_cursor_snapshot::type_id::create("consumer_snapshot");
+    if (snapshot == null) begin
+      lock.put(1);
+      return rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED,
+                               "consumer snapshot allocation failed");
+    end
     snapshot.index = consumer_index;
     snapshot.wrap = consumer_wrap;
     lock.put(1);
@@ -459,7 +543,208 @@ class rdma_queue_runtime extends uvm_object;
       return rdma_status::make(RDMA_SC_INVALID_STATE,
                                "consumer reservation is stale");
     end
+    if (!host_produced) begin
+      if (used == 0) begin
+        lock.put(1);
+        return rdma_status::make(RDMA_SC_QUEUE_EMPTY,
+                                 "device ring has no committed entries");
+      end
+      used--;
+    end
     cursor_advance(consumer_index, consumer_wrap);
+    lock.put(1);
+    return rdma_status::success();
+  endfunction
+
+  // 功能：reserve_device_producer 为 CQ/CEQ/AEQ 锁定当前 producer cursor，返回与 runtime 内部隔离的 detached 快照。
+  // 输入/输出及副作用：reservation（输出）先置 null；成功时只登记 device_reservation/device_reservation_valid，不推进 committed PI 或 used。
+  // 失败/边界：未配置/非 ACTIVE、host-produced 方向、SQ/RQ/SRQ kind、pending recovery、已有 reservation、ring full 或快照分配失败时返回明确错误且 output 保持 null。
+  function rdma_status reserve_device_producer(
+    output rdma_queue_cursor_snapshot reservation
+  );
+    rdma_status lock_status;
+    reservation = null;
+    lock_status = acquire_lock();
+    if (!lock_status.ok()) return lock_status;
+    if (host_produced || !(kind inside {RDMA_QUEUE_RUNTIME_CQ,
+                                        RDMA_QUEUE_RUNTIME_CEQ,
+                                        RDMA_QUEUE_RUNTIME_AEQ})) begin
+      lock.put(1);
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "device producer is invalid for this ring");
+    end
+    if (state != RDMA_QUEUE_RUNTIME_ACTIVE || pending_operation != null) begin
+      lock.put(1);
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "queue runtime is not ready for reservation");
+    end
+    if (device_reservation_valid) begin
+      lock.put(1);
+      return rdma_status::make(RDMA_SC_RESOURCE_BUSY,
+                               "device reservation is busy");
+    end
+    if (used >= depth) begin
+      lock.put(1);
+      return rdma_status::make(RDMA_SC_QUEUE_FULL,
+                               "device ring is full");
+    end
+    device_reservation = rdma_queue_cursor_snapshot::type_id::create(
+      "device_producer_reservation");
+    reservation = rdma_queue_cursor_snapshot::type_id::create(
+      "device_producer_reservation_out");
+    if (device_reservation == null || reservation == null) begin
+      device_reservation = null;
+      reservation = null;
+      lock.put(1);
+      return rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED,
+                               "device reservation allocation failed");
+    end
+    device_reservation.index = producer_index;
+    device_reservation.wrap = producer_wrap;
+    reservation.index = producer_index;
+    reservation.wrap = producer_wrap;
+    device_reservation_valid = 1'b1;
+    lock.put(1);
+    return rdma_status::success();
+  endfunction
+
+  // 功能：commit_device_producer 将匹配的 device reservation 原子推进到 committed producer cursor，并增加 occupancy。
+  // 输入/输出及副作用：reservation（输入）必须是 reserve_device_producer 返回的值副本；成功时只更新 PI/wrap、used 并清除 reservation，不访问 WQE slots。
+  // 失败/边界：reservation 为空/失配、runtime 非 ACTIVE（且未显式 recovery commit）、pending evidence、内部计数越界或方向错误时返回错误并保留 reservation。
+  function rdma_status commit_device_producer(
+    rdma_queue_cursor_snapshot reservation
+  );
+    rdma_status lock_status;
+    lock_status = acquire_lock();
+    if (!lock_status.ok()) return lock_status;
+    if (host_produced || !(kind inside {RDMA_QUEUE_RUNTIME_CQ,
+                                        RDMA_QUEUE_RUNTIME_CEQ,
+                                        RDMA_QUEUE_RUNTIME_AEQ})) begin
+      lock.put(1);
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "device producer is invalid for this ring");
+    end
+    if (reservation == null || !device_reservation_valid ||
+        device_reservation == null ||
+        reservation.index != device_reservation.index ||
+        reservation.wrap != device_reservation.wrap) begin
+      lock.put(1);
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "device reservation is stale");
+    end
+    if (state != RDMA_QUEUE_RUNTIME_ACTIVE &&
+        !(recovery_commit_allowed && state == RDMA_QUEUE_RUNTIME_RECOVERY_REQUIRED)) begin
+      lock.put(1);
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "queue runtime is not active");
+    end
+    if (used >= depth) begin
+      lock.put(1);
+      return rdma_status::make(RDMA_SC_QUEUE_FULL,
+                               "device ring is full");
+    end
+    cursor_advance(producer_index, producer_wrap);
+    used++;
+    device_reservation_valid = 1'b0;
+    device_reservation = null;
+    lock.put(1);
+    return rdma_status::success();
+  endfunction
+
+  // 功能：cancel_device_producer 清除尚未产生写入副作用的 device reservation，不改变 committed cursor 或 occupancy。
+  // 输入/输出及副作用：reservation（输入）必须匹配内部快照；成功时清除 reservation 状态，调用方继续拥有传入值副本。
+  // 失败/边界：空/失配快照、非 ACTIVE、无 reservation 或 pending 标记写入尝试时返回 INVALID_STATE/RECOVERY_REQUIRED，并保留内部 reservation。
+  function rdma_status cancel_device_producer(
+    rdma_queue_cursor_snapshot reservation
+  );
+    rdma_status lock_status;
+    lock_status = acquire_lock();
+    if (!lock_status.ok()) return lock_status;
+    if (reservation == null || !device_reservation_valid ||
+        device_reservation == null ||
+        reservation.index != device_reservation.index ||
+        reservation.wrap != device_reservation.wrap) begin
+      lock.put(1);
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "device reservation is stale");
+    end
+    if (state != RDMA_QUEUE_RUNTIME_ACTIVE) begin
+      lock.put(1);
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "queue runtime is not active");
+    end
+    if (pending_operation != null && pending_operation.mmio_maybe_submitted) begin
+      lock.put(1);
+      return rdma_status::make(RDMA_SC_RECOVERY_REQUIRED,
+                               "device reservation has write evidence");
+    end
+    device_reservation_valid = 1'b0;
+    device_reservation = null;
+    lock.put(1);
+    return rdma_status::success();
+  endfunction
+
+  // 功能：expected_producer_polarity 依据 initial_polarity 与 reservation（或当前 producer wrap）纯计算 device producer owner 位。
+  // 输入/输出及副作用：reservation（可选输入）；函数只读取快照并返回 bit，不修改 runtime 或外部资源。
+  // 失败/边界：null reservation 使用当前 producer_wrap；该 helper 不验证 runtime 状态，状态化校验必须调用 query_expected_producer_polarity。
+  function bit expected_producer_polarity(
+    rdma_queue_cursor_snapshot reservation = null
+  );
+    return initial_polarity ^ (reservation == null ? producer_wrap : reservation.wrap);
+  endfunction
+
+  // 功能：query_occupancy 在 runtime lock 内返回已 commit 的 producer-consumer 距离。
+  // 输入/输出及副作用：value（输出）先置零，成功时写入 used；不修改游标、reservation 或 ledger。
+  // 失败/边界：未配置、used 超过 depth 或锁忙时返回非成功状态并保持安全输出零。
+  function rdma_status query_occupancy(output int unsigned value);
+    rdma_status lock_status;
+    value = 0;
+    lock_status = acquire_lock();
+    if (!lock_status.ok()) return lock_status;
+    if (depth == 0) begin lock.put(1); return rdma_status::make(RDMA_SC_INVALID_STATE,"runtime is unconfigured"); end
+    if (used > depth) begin lock.put(1); return rdma_status::make(RDMA_SC_INVALID_STATE,"runtime occupancy exceeds depth"); end
+    value = used;
+    lock.put(1);
+    return rdma_status::success();
+  endfunction
+
+  // 功能：query_device_reservation 返回内部 device reservation 的 detached value copy，供诊断与恢复读取。
+  // 输入/输出及副作用：valid、reservation（输出）先分别置 0/null；成功时复制 reservation，调用方不得修改 runtime 内部对象。
+  // 失败/边界：未配置、非 device ring、内部 reservation 句柄缺失或 clone 分配失败时返回非成功状态且保留安全输出。
+  function rdma_status query_device_reservation(
+    output bit valid,
+    output rdma_queue_cursor_snapshot reservation
+  );
+    rdma_status lock_status;
+    valid = 1'b0;
+    reservation = null;
+    lock_status = acquire_lock();
+    if (!lock_status.ok()) return lock_status;
+    if (depth == 0 || host_produced) begin lock.put(1); return rdma_status::make(RDMA_SC_INVALID_STATE,"runtime is not a device ring"); end
+    if (!device_reservation_valid) begin lock.put(1); return rdma_status::success(); end
+    if (device_reservation == null) begin lock.put(1); return rdma_status::make(RDMA_SC_INVALID_STATE,"device reservation state is corrupt"); end
+    reservation = rdma_queue_cursor_snapshot::type_id::create("device_reservation_query");
+    if (reservation == null) begin lock.put(1); return rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED,"device reservation snapshot allocation failed"); end
+    reservation.index = device_reservation.index;
+    reservation.wrap = device_reservation.wrap;
+    valid = 1'b1;
+    lock.put(1);
+    return rdma_status::success();
+  endfunction
+
+  // 功能：query_expected_producer_polarity 对 device runtime 执行状态化 owner/polarity 查询。
+  // 输入/输出及副作用：polarity（输出）先置零，成功时写入 initial_polarity XOR producer_wrap；不修改 runtime 状态。
+  // 失败/边界：未配置、host-produced ring、游标/occupancy 越界或锁忙时返回非成功状态，输出保持零。
+  function rdma_status query_expected_producer_polarity(output bit polarity);
+    rdma_status lock_status;
+    polarity = 1'b0;
+    lock_status = acquire_lock();
+    if (!lock_status.ok()) return lock_status;
+    if (depth == 0 || host_produced || producer_index >= depth || used > depth) begin
+      lock.put(1);
+      return rdma_status::make(RDMA_SC_INVALID_STATE,"producer polarity is unavailable");
+    end
+    polarity = initial_polarity ^ producer_wrap;
     lock.put(1);
     return rdma_status::success();
   endfunction
@@ -490,6 +775,7 @@ class rdma_queue_runtime extends uvm_object;
     reservation=null;
     lock_status = acquire_lock();
     if (!lock_status.ok()) return lock_status;
+    if (!host_produced) begin lock.put(1); return rdma_status::make(RDMA_SC_INVALID_STATE,"host producer is invalid for this ring"); end
     if (state!=RDMA_QUEUE_RUNTIME_ACTIVE) begin lock.put(1); return rdma_status::make(RDMA_SC_INVALID_STATE,"queue runtime is not active"); end
     if (used>=depth) begin lock.put(1); return rdma_status::make(RDMA_SC_QUEUE_FULL,"queue producer ring is full"); end
     reservation=rdma_queue_cursor_snapshot::type_id::create("producer_reservation"); reservation.index=producer_index; reservation.wrap=producer_wrap; lock.put(1); return rdma_status::success();
@@ -507,6 +793,7 @@ class rdma_queue_runtime extends uvm_object;
     rdma_status lock_status;
     lock_status = acquire_lock();
     if (!lock_status.ok()) return lock_status;
+    if (!host_produced) begin lock.put(1); return rdma_status::make(RDMA_SC_INVALID_STATE,"host producer is invalid for this ring"); end
     if (reservation==null || reservation.index>=depth) begin lock.put(1); return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,"producer reservation is invalid"); end
     if (state!=RDMA_QUEUE_RUNTIME_ACTIVE &&
         !(recovery_commit_allowed && state == RDMA_QUEUE_RUNTIME_RECOVERY_REQUIRED)) begin lock.put(1); return rdma_status::make(RDMA_SC_INVALID_STATE,"queue runtime is not active"); end
@@ -676,6 +963,8 @@ class rdma_queue_runtime extends uvm_object;
                                "queue runtime has no pending recovery");
     end
     pending_operation = null;
+    device_reservation_valid = 1'b0;
+    device_reservation = null;
     recovery_commit_allowed = 1'b0;
     state = RDMA_QUEUE_RUNTIME_ACTIVE;
     lock.put(1);
@@ -717,6 +1006,8 @@ class rdma_queue_runtime extends uvm_object;
                                "queue runtime has no pending recovery");
     end
     pending_operation = null;
+    device_reservation_valid = 1'b0;
+    device_reservation = null;
     recovery_commit_allowed = 1'b0;
     state = RDMA_QUEUE_RUNTIME_DETACHED;
     lock.put(1);
