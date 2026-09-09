@@ -105,6 +105,248 @@ class rdma_queue_data_engine_recovery_test extends uvm_test;
                  status.convert2string())
   endtask
 
+  // 功能：check_consumer_local_stage_gates 构造 MMIO SUCCESS 的真实 CQ consumer
+  //   pending，验证 no-allocation CI commit 与 WQE release marker 均经过显式 gate。
+  // 输入/输出及副作用：无显式参数；创建独立 CQ runtime/handle/cursor/image/status，
+  //   真实提交一项 device entry，调用 recover/commit/begin/finalize 并查询 pending。
+  // 失败/边界：未 enable 的 commit 必须零 mutation；release begin 竞争必须 BUSY，
+  //   cancel 只解锁并保留错误，成功 finalize 必须在 complete 前立即发布 release marker。
+  task automatic check_consumer_local_stage_gates();
+    rdma_queue_runtime runtime;
+    rdma_queue_pending_operation pending;
+    rdma_queue_pending_operation snapshot;
+    rdma_queue_cursor_snapshot producer;
+    rdma_handle cq_h;
+    rdma_handle qp_h;
+    rdma_route_key_t route;
+    rdma_reset_epoch_t epoch;
+    rdma_status status;
+    rdma_status noalloc_status;
+    rdma_status busy_status;
+    int unsigned occupancy;
+    int unsigned i;
+    rdma_queue_runtime_state_e runtime_state;
+
+    cq_h = make_queue_handle("consumer_gate_cq");
+    if (cq_h == null) begin
+      `uvm_error("CONSUMER_GATE_FIXTURE", "CQ handle allocation failed")
+      return;
+    end
+    cq_h.kind = RDMA_RESOURCE_CQ;
+    qp_h = make_queue_handle("consumer_gate_qp");
+    if (qp_h == null) begin
+      `uvm_error("CONSUMER_GATE_FIXTURE", "routed QP handle allocation failed")
+      return;
+    end
+    route = '0;
+    route.host_topology_key = 32'h4401;
+    route.root_id = 16'h44;
+    route.segment = 16'h2;
+    route.bdf.segment = route.segment;
+    route.bdf.bus = 8'h44;
+    route.bdf.device = 5'h4;
+    route.bdf.function_num = 3'h1;
+    epoch = rdma_reset_epoch_t'(64'h444);
+
+    runtime = rdma_queue_runtime::type_id::create("consumer_gate_runtime");
+    if (runtime == null) begin
+      `uvm_error("CONSUMER_GATE_FIXTURE", "CQ runtime allocation failed")
+      return;
+    end
+    status = runtime.configure(cq_h, RDMA_QUEUE_RUNTIME_CQ, 4,
+                               0, 1'b0, 0, 1'b0, 1'b0);
+    if (status == null || !status.ok()) begin
+      `uvm_error("CONSUMER_GATE_CONFIGURE", status == null ? "null status" :
+                 status.convert2string())
+      return;
+    end
+    status = runtime.set_route_epoch(route, epoch);
+    if (status == null || !status.ok()) begin
+      `uvm_error("CONSUMER_GATE_AUTHORITY", status == null ? "null status" :
+                 status.convert2string())
+      return;
+    end
+    status = runtime.activate();
+    if (status == null || !status.ok()) begin
+      `uvm_error("CONSUMER_GATE_ACTIVATE", status == null ? "null status" :
+                 status.convert2string())
+      return;
+    end
+    status = runtime.reserve_device_producer(producer);
+    if (status == null || !status.ok() || producer == null) begin
+      `uvm_error("CONSUMER_GATE_RESERVE", status == null ? "null status" :
+                 status.convert2string())
+      return;
+    end
+    status = runtime.commit_device_producer(producer);
+    if (status == null || !status.ok()) begin
+      `uvm_error("CONSUMER_GATE_DEVICE_COMMIT", status == null ? "null status" :
+                 status.convert2string())
+      return;
+    end
+
+    pending = rdma_queue_pending_operation::type_id::create(
+      "consumer_gate_pending");
+    if (pending == null) begin
+      `uvm_error("CONSUMER_GATE_FIXTURE", "pending allocation failed")
+      return;
+    end
+    pending.queue_h = make_queue_handle("consumer_gate_pending_cq");
+    if (pending.queue_h == null) begin
+      `uvm_error("CONSUMER_GATE_FIXTURE", "pending CQ handle allocation failed")
+      return;
+    end
+    pending.queue_h.kind = RDMA_RESOURCE_CQ;
+    pending.kind = RDMA_QUEUE_RUNTIME_CQ;
+    pending.cursor = rdma_queue_cursor_snapshot::type_id::create(
+      "consumer_gate_cursor");
+    pending.next_cursor = rdma_queue_cursor_snapshot::type_id::create(
+      "consumer_gate_next");
+    pending.image = rdma_hw_image::type_id::create("consumer_gate_image");
+    pending.failure_status = rdma_status::make(
+      RDMA_SC_INVALID_STATE, "prepared consumer gate sentinel");
+    if (pending.cursor == null || pending.next_cursor == null ||
+        pending.image == null || pending.failure_status == null) begin
+      `uvm_error("CONSUMER_GATE_FIXTURE", "pending evidence allocation failed")
+      return;
+    end
+    pending.cursor.index = producer.index;
+    pending.cursor.wrap = producer.wrap;
+    pending.next_cursor.index = producer.index + 1;
+    pending.next_cursor.wrap = producer.wrap;
+    if (pending.next_cursor.index >= 4) begin
+      pending.next_cursor.index = 0;
+      pending.next_cursor.wrap = ~pending.next_cursor.wrap;
+    end
+    pending.entry_size = 64;
+    pending.entry_offset = longint'(pending.cursor.index) * pending.entry_size;
+    pending.image.length = pending.entry_size;
+    pending.image.image_kind = RDMA_IMAGE_CQE;
+    for (i = 0; i < pending.entry_size; i++)
+      pending.image.bytes.push_back(byte'(i));
+    pending.mmio_evidence = RDMA_QUEUE_MMIO_SUCCESS;
+    pending.completion_index = 0;
+    pending.completion_wrap = 1'b0;
+    pending.completion_target_valid = 1'b1;
+    pending.completion_wq_kind = RDMA_QUEUE_RUNTIME_SQ;
+    pending.routed_qp_h = qp_h;
+    pending.route = route;
+    pending.route_valid = 1'b1;
+    pending.reset_epoch = epoch;
+    pending.epoch_valid = 1'b1;
+    status = runtime.enter_recovery_prepared(pending);
+    if (status == null || !status.ok()) begin
+      `uvm_error("CONSUMER_GATE_ENTER", status == null ? "null status" :
+                 status.convert2string())
+      return;
+    end
+    status = runtime.recover(
+      RDMA_QUEUE_RECOVERY_RETRY_PENDING, 1'b1);
+    if (status == null || !status.ok()) begin
+      `uvm_error("CONSUMER_GATE_CONFIRM", status == null ? "null status" :
+                 status.convert2string())
+      return;
+    end
+    noalloc_status = rdma_status::make(
+      RDMA_SC_OK, "unauthorized commit must replace this status");
+    if (runtime.commit_consumer_recovery_noalloc(
+          pending.cursor.index, pending.cursor.wrap, noalloc_status) ||
+        noalloc_status == null || noalloc_status.code != RDMA_SC_INVALID_STATE)
+      `uvm_error("CONSUMER_GATE_REJECT",
+                 "noalloc consumer commit bypassed recovery gate")
+    status = runtime.query_occupancy(occupancy);
+    if (status == null || !status.ok() || occupancy != 1)
+      `uvm_error("CONSUMER_GATE_OCCUPANCY",
+                 "rejected consumer commit changed CQ occupancy")
+    status = runtime.query_pending(snapshot);
+    if (status == null || !status.ok() || snapshot == null ||
+        snapshot.consumer_committed || snapshot.cq_consumer_committed ||
+        snapshot.committed_consumer_cursor != null)
+      `uvm_error("CONSUMER_GATE_PENDING",
+                 "rejected consumer commit published stage evidence")
+
+    if (!runtime.enable_recovery_commit_noalloc(noalloc_status) ||
+        noalloc_status == null || !noalloc_status.ok()) begin
+      `uvm_error("CONSUMER_GATE_ENABLE",
+                 "noalloc consumer commit gate could not be enabled")
+      return;
+    end
+    if (!runtime.commit_consumer_recovery_noalloc(
+          pending.cursor.index, pending.cursor.wrap, noalloc_status) ||
+        noalloc_status == null || !noalloc_status.ok()) begin
+      `uvm_error("CONSUMER_GATE_COMMIT",
+                 "authorized noalloc consumer commit failed")
+      return;
+    end
+    status = runtime.query_pending(snapshot);
+    if (status == null || !status.ok() || snapshot == null ||
+        !snapshot.consumer_committed || !snapshot.cq_consumer_committed ||
+        snapshot.completion_released ||
+        snapshot.committed_consumer_cursor == null) begin
+      `uvm_error("CONSUMER_GATE_COMMITTED_PENDING",
+                 "authorized commit did not publish exact stage evidence")
+      return;
+    end
+
+    if (!runtime.begin_consumer_release_noalloc(noalloc_status) ||
+        noalloc_status == null || !noalloc_status.ok()) begin
+      `uvm_error("CONSUMER_RELEASE_BEGIN", "release gate could not be acquired")
+      return;
+    end
+    busy_status = rdma_status::make(
+      RDMA_SC_OK, "competing release begin must replace this status");
+    if (runtime.begin_consumer_release_noalloc(busy_status) ||
+        busy_status == null || busy_status.code != RDMA_SC_RESOURCE_BUSY)
+      `uvm_error("CONSUMER_RELEASE_BUSY",
+                 "competing release begin did not fail before WQ mutation")
+
+    noalloc_status.code = RDMA_SC_INVALID_STATE;
+    noalloc_status.message = "preserved WQE release failure";
+    if (!runtime.finish_consumer_release_noalloc(1'b0, noalloc_status) ||
+        noalloc_status.code != RDMA_SC_INVALID_STATE ||
+        noalloc_status.message != "preserved WQE release failure") begin
+      `uvm_error("CONSUMER_RELEASE_CANCEL",
+                 "failed release did not unlock with its diagnosis preserved")
+      return;
+    end
+    status = runtime.query_pending(snapshot);
+    if (status == null || !status.ok() || snapshot == null ||
+        snapshot.completion_released) begin
+      `uvm_error("CONSUMER_RELEASE_CANCEL_PENDING",
+                 "failed release published completion_released")
+      return;
+    end
+
+    if (!runtime.begin_consumer_release_noalloc(noalloc_status) ||
+        noalloc_status == null || !noalloc_status.ok() ||
+        !runtime.finish_consumer_release_noalloc(1'b1, noalloc_status) ||
+        !noalloc_status.ok()) begin
+      `uvm_error("CONSUMER_RELEASE_FINISH",
+                 "successful release could not publish its marker")
+      return;
+    end
+    status = runtime.query_pending(snapshot);
+    if (status == null || !status.ok() || snapshot == null ||
+        !snapshot.completion_released)
+      `uvm_error("CONSUMER_RELEASE_MARKER",
+                 "successful release marker was not immediately visible")
+    if (!runtime.complete_consumer_recovery_noalloc(1'b0, noalloc_status) ||
+        noalloc_status == null || !noalloc_status.ok()) begin
+      `uvm_error("CONSUMER_RELEASE_COMPLETE",
+                 "premarked consumer recovery did not complete")
+      return;
+    end
+    status = runtime.query_occupancy(occupancy);
+    if (status == null || !status.ok() || occupancy != 0)
+      `uvm_error("CONSUMER_RELEASE_FINAL_OCCUPANCY",
+                 "completed consumer recovery retained CQ occupancy")
+    status = runtime.query_state(runtime_state);
+    if (status == null || !status.ok() ||
+        runtime_state != RDMA_QUEUE_RUNTIME_ACTIVE)
+      `uvm_error("CONSUMER_RELEASE_FINAL_STATE",
+                 "completed consumer recovery did not return ACTIVE")
+  endtask
+
   // 功能：check_engine_recovery_policy 验证 producer write 的 NO_SUBMIT pending
   //   需要 caller confirmation 后才 replay/commit，并验证 MMIO 失败的 AMBIGUOUS
   //   pending 禁止自动 retry、只能显式 abort/detach。
@@ -144,9 +386,9 @@ class rdma_queue_data_engine_recovery_test extends uvm_test;
     if (status == null || !status.ok())
       `uvm_error("RECOVERY_RETRY", status == null ? "null status" :
                  status.convert2string())
-    // A confirmed retry must replay the pending write and producer commit,
-    // rather than merely changing the runtime state.  The next post therefore
-    // starts at slot 1; slot 0 is owned by the recovered operation.
+    // 设计说明：confirmed retry 必须真正重放 pending write 与 producer commit，
+    // 不能只修改 runtime state；因此下一次 post 应从 slot 1 开始，slot 0 仍由
+    // 已恢复的 operation 占有。
     result = null;
     fixture.engine.post_send(fixture.make_send(64'h9999_aaaa_bbbb_cccd),
                              result, status);
@@ -175,10 +417,12 @@ class rdma_queue_data_engine_recovery_test extends uvm_test;
   //   pending；未确认 recovery 不推进，确认后只补 WQE release 而不重发 doorbell/CI。
   // 输入/输出及副作用：无显式参数；建立 ordering-fault fixture，执行真实
   //   post_send、publish_cqe、poll_cqe 与 public recover_queue，并观测 trace、公开
-  //   detached pending 及 CQ/SQ occupancy；成功最终各消费一份 CQE/WQE credit。
+  //   detached pending、CQ/SQ occupancy、factory guard 与 CQE codec guard；成功最终
+  //   各消费一份 CQE/WQE credit。
   // 失败/边界：setup/post/publish/poll 或 pending 查询失败即报告并返回；首次 poll
   //   必须在 doorbell→commit 后只失败一次 release，未确认 retry 必须拒绝且零副作用，
-  //   确认 retry 只能再调用一次 release，禁止重复 MMIO、CI decrement 或 ledger 释放。
+  //   确认 retry 只能再调用一次 release，禁止重复 MMIO、CI decrement、codec lookup/
+  //   decode、factory allocation 或 ledger 释放。
   task automatic check_success_consumer_recovery_skips_mmio();
     rdma_queue_data_engine_fixture fixture;
     rdma_queue_data_engine_ordering_fault ordering;
@@ -189,19 +433,39 @@ class rdma_queue_data_engine_recovery_test extends uvm_test;
     rdma_queue_completion_result completion;
     rdma_queue_pending_operation pending;
     rdma_status status;
+    rdma_queue_consumer_fault_registry fault_registry;
+    rdma_queue_consumer_codec_guard codec_guard;
+    rdma_codec_base original_cqe_codec;
+    rdma_codec_base displaced_cqe_codec;
+    rdma_codec_key cqe_codec_key;
+    rdma_queue_poll_factory_fault_wrapper status_guard;
+    rdma_queue_poll_factory_fault_wrapper pending_guard;
+    rdma_queue_poll_factory_fault_wrapper handle_guard;
+    rdma_queue_poll_factory_fault_wrapper cursor_guard;
+    rdma_queue_poll_factory_fault_wrapper image_guard;
+    rdma_queue_poll_factory_fault_wrapper slot_guard;
+    rdma_queue_poll_factory_fault_wrapper cqe_model_guard;
+    uvm_factory factory;
     int unsigned occupancy;
     int unsigned trace_before_retry;
+    int unsigned guarded_creates;
+    string first_guarded_create;
     bit has_pending;
     bit polarity;
 
-    uvm_factory::get().set_type_override_by_type(
+    factory = uvm_factory::get();
+    factory.set_type_override_by_type(
       rdma_queue_data_engine::get_type(),
       rdma_queue_data_engine_ordering_fault::get_type(), 1'b1);
+    factory.set_type_override_by_type(
+      rdma_hw_doorbell_codec_registry::get_type(),
+      rdma_queue_consumer_fault_registry::get_type(), 1'b1);
     fixture = rdma_queue_data_engine_fixture::type_id::create(
       "success_consumer_fixture");
     fixture.setup(status);
     if (status == null || !status.ok() ||
-        !$cast(ordering, fixture.engine)) begin
+        !$cast(ordering, fixture.engine) ||
+        !$cast(fault_registry, fixture.registry)) begin
       `uvm_error("SUCCESS_CONSUMER_FIXTURE",
                  status == null ? "null setup status" :
                  status.convert2string())
@@ -317,12 +581,73 @@ class rdma_queue_data_engine_recovery_test extends uvm_test;
       `uvm_error("SUCCESS_CONSUMER_CONFIRM",
                  "unconfirmed retry changed a completed transaction stage")
 
+    // 中文设计：在 confirmed SUCCESS continuation 前替换 CQE codec，并让
+    // test-only engine 到达首个 commit/release seam 时再打开 factory guard。
+    // 合规实现可在 seam 前完成 public detached query/route 校验，但 seam 后
+    // 只使用 admission-time routed_qp_h/completion cursor，不触发 codec 或 factory。
+    cqe_codec_key = '{hw_version:"rdma", image_kind:RDMA_IMAGE_CQE,
+      object_type:"cqe", variant:"default", opcode:8'h00};
+    original_cqe_codec = null;
+    status = fixture.registry.lookup(cqe_codec_key, original_cqe_codec);
+    if (status == null || !status.ok() || original_cqe_codec == null) begin
+      `uvm_error("SUCCESS_CONSUMER_CODEC_SETUP", status == null ?
+                 "CQE codec lookup returned null" : status.convert2string())
+      return;
+    end
+    codec_guard = new("success_recovery_cqe_guard", original_cqe_codec);
+    codec_guard.injected_error = rdma_status::make(
+      RDMA_SC_CODEC_ERROR, "SUCCESS recovery attempted to decode CQE");
+    codec_guard.block_decode = 1'b1;
+    displaced_cqe_codec = null;
+    if (!fault_registry.replace_codec_for_test(
+          cqe_codec_key, codec_guard, displaced_cqe_codec) ||
+        displaced_cqe_codec != original_cqe_codec) begin
+      `uvm_error("SUCCESS_CONSUMER_CODEC_REPLACE", "CQE codec guard install failed")
+      return;
+    end
+    status_guard = new("recovery_status_guard", rdma_status::get_type());
+    pending_guard = new(
+      "recovery_pending_guard", rdma_queue_pending_operation::get_type());
+    handle_guard = new("recovery_handle_guard", rdma_handle::get_type());
+    cursor_guard = new(
+      "recovery_cursor_guard", rdma_queue_cursor_snapshot::get_type());
+    image_guard = new("recovery_image_guard", rdma_hw_image::get_type());
+    slot_guard = new(
+      "recovery_slot_guard", rdma_queue_slot_ledger_entry::get_type());
+    cqe_model_guard = new(
+      "recovery_cqe_model_guard", rdma_hw_cqe_model::get_type());
+    factory.set_type_override_by_type(
+      rdma_status::get_type(), status_guard, 1'b1);
+    factory.set_type_override_by_type(
+      rdma_queue_pending_operation::get_type(), pending_guard, 1'b1);
+    factory.set_type_override_by_type(
+      rdma_handle::get_type(), handle_guard, 1'b1);
+    factory.set_type_override_by_type(
+      rdma_queue_cursor_snapshot::get_type(), cursor_guard, 1'b1);
+    factory.set_type_override_by_type(
+      rdma_hw_image::get_type(), image_guard, 1'b1);
+    factory.set_type_override_by_type(
+      rdma_queue_slot_ledger_entry::get_type(), slot_guard, 1'b1);
+    factory.set_type_override_by_type(
+      rdma_hw_cqe_model::get_type(), cqe_model_guard, 1'b1);
+    ordering.arm_recovery_allocation_guard_once = 1'b1;
     fixture.engine.recover_queue(
       fixture.cq.handle, RDMA_QUEUE_RECOVERY_RETRY_PENDING, 1'b1, status);
+    rdma_queue_poll_factory_fault_wrapper::disable_allocation_guard(
+      guarded_creates, first_guarded_create);
+    void'(fault_registry.restore_codec_for_test(
+      cqe_codec_key, original_cqe_codec));
     if (status == null || !status.ok())
       `uvm_error("SUCCESS_CONSUMER_RECOVER",
                  status == null ? "null recovery status" :
                  status.convert2string())
+    if (codec_guard.decode_calls != 0)
+      `uvm_error("SUCCESS_CONSUMER_NO_DECODE", $sformatf(
+        "SUCCESS recovery called CQE decode %0d times", codec_guard.decode_calls))
+    if (guarded_creates != 0)
+      `uvm_error("SUCCESS_CONSUMER_NO_ALLOC", $sformatf(
+        "SUCCESS recovery factory creates=%0d first=%s",
+        guarded_creates, first_guarded_create))
     if (ordering.trace.size() != trace_before_retry + 1 ||
         ordering.trace[trace_before_retry] != "release" ||
         ordering.doorbell_calls != 1 || ordering.commit_calls != 1 ||
@@ -356,6 +681,7 @@ class rdma_queue_data_engine_recovery_test extends uvm_test;
   task run_phase(uvm_phase phase);
     phase.raise_objection(this);
     check_pending_snapshot();
+    check_consumer_local_stage_gates();
     check_engine_recovery_policy();
     check_success_consumer_recovery_skips_mmio();
     phase.drop_objection(this);

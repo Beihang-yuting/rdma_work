@@ -58,10 +58,18 @@ class rdma_queue_poll_factory_fault_wrapper extends uvm_object_wrapper;
   protected bit armed_state;
   protected bit wrong_type_state;
   protected bit fired_state;
+  protected bit scheduler_result_role;
+  protected bit scheduler_status_role;
+  static bit allocation_guard_active;
+  static bit scheduler_guard_armed;
+  static bit scheduler_result_seen;
+  static int unsigned guarded_factory_creates;
+  static string first_guarded_factory_create;
 
   // 功能：构造 poll 专用 factory wrapper，保存原类型 wrapper 并保持未注入状态。
   // 输入/输出及副作用：name/delegate_value 为输入并保存为非拥有引用；只初始化
-  //   target/armed/wrong/fired 字段，不修改 UVM factory 或创建 RDMA 对象。
+  //   target/armed/wrong/fired 与 scheduler guard role 字段，不修改 UVM factory
+  //   或创建 RDMA 对象。
   // 失败/边界：delegate_value 为空时未命中创建也返回 null；调用方必须先安装有效
   //   registry wrapper，不能用本对象替代生产类型注册。
   function new(string name, uvm_object_wrapper delegate_value);
@@ -71,6 +79,8 @@ class rdma_queue_poll_factory_fault_wrapper extends uvm_object_wrapper;
     armed_state = 1'b0;
     wrong_type_state = 1'b0;
     fired_state = 1'b0;
+    scheduler_result_role = 1'b0;
+    scheduler_status_role = 1'b0;
   endfunction
 
   // 功能：仅在 armed 且 instance name 精确匹配时返回一次 null/错误类型，其他
@@ -81,6 +91,7 @@ class rdma_queue_poll_factory_fault_wrapper extends uvm_object_wrapper;
   //   为空或其创建失败时原样返回 null，测试必须结合 fired_state 区分是否命中。
   virtual function uvm_object create_object(string name = "");
     rdma_queue_runtime_wrong_factory_object wrong_object;
+    uvm_object created;
 
     if (armed_state && name == target_name) begin
       armed_state = 1'b0;
@@ -90,7 +101,25 @@ class rdma_queue_poll_factory_fault_wrapper extends uvm_object_wrapper;
       return wrong_object;
     end
     if (delegate == null) return null;
-    return delegate.create_object(name);
+    created = delegate.create_object(name);
+    // 中文设计：scheduler 的最终成功 status 是 submit() 返回前最后一个已知
+    // factory event。先观察 result，再观察紧随其后的 success status，才能把
+    // scheduler 自身合法的 snapshot/result 分配排除在 post-scheduler guard 之外。
+    if (scheduler_guard_armed && scheduler_result_role &&
+        name == "doorbell_result")
+      scheduler_result_seen = 1'b1;
+    if (scheduler_guard_armed && scheduler_status_role &&
+        scheduler_result_seen && name == "rdma_status") begin
+      scheduler_guard_armed = 1'b0;
+      scheduler_result_seen = 1'b0;
+      allocation_guard_active = 1'b1;
+    end
+    else if (allocation_guard_active) begin
+      guarded_factory_creates++;
+      if (first_guarded_factory_create == "")
+        first_guarded_factory_create = {wrapper_type_name, ":", name};
+    end
+    return created;
   endfunction
 
   // 功能：返回 wrapper 在 UVM factory 中显示的稳定测试类型名。
@@ -128,11 +157,259 @@ class rdma_queue_poll_factory_fault_wrapper extends uvm_object_wrapper;
   function bit fired();
     return fired_state;
   endfunction
+
+  // 功能：set_scheduler_guard_role 指定本 wrapper 是否观察 scheduler result 或
+  //   随后的最终 success status，以精确打开 post-scheduler allocation 窗口。
+  // 输入/输出及副作用：result_role/status_role 为输入；只更新本 wrapper 的观测
+  //   角色，不 arm factory fault，也不改变全局 guard counter。
+  // 失败/边界：两个 role 同时为零表示普通计数 wrapper；同时为一只用于测试错误，
+  //   正常配置必须把 result/status 分配给不同 requested type。
+  function void set_scheduler_guard_role(bit result_role, bit status_role);
+    scheduler_result_role = result_role;
+    scheduler_status_role = status_role;
+  endfunction
+
+  // 功能：arm_scheduler_allocation_guard 清空旧计数，并等待一次完整 scheduler
+  //   success result/status 后自动开始统计后续 factory 创建。
+  // 输入/输出及副作用：无显式输入；重置全局 guard 状态，仅影响测试 wrapper
+  //   观测，不阻止或替换任何生产对象创建。
+  // 失败/边界：若 scheduler 没有成功 result，guard 不会开启；调用方必须结合
+  //   poll status 与 PCIe history 判断目标 transaction 是否真的进入 scheduler。
+  static function void arm_scheduler_allocation_guard();
+    allocation_guard_active = 1'b0;
+    scheduler_guard_armed = 1'b1;
+    scheduler_result_seen = 1'b0;
+    guarded_factory_creates = 0;
+    first_guarded_factory_create = "";
+  endfunction
+
+  // 功能：arm_immediate_allocation_guard 从调用点立即统计 factory 创建，用于
+  //   已有 SUCCESS pending 的本地 recovery continuation。
+  // 输入/输出及副作用：无显式输入；清零旧计数并打开全局 guard，不修改 runtime
+  //   pending、codec registry 或 scheduler history。
+  // 失败/边界：guard 会统计测试随后执行的查询分配；调用方必须在被测 API 返回后
+  //   立即 disable，再进行其它 status/snapshot 断言。
+  static function void arm_immediate_allocation_guard();
+    allocation_guard_active = 1'b1;
+    scheduler_guard_armed = 1'b0;
+    scheduler_result_seen = 1'b0;
+    guarded_factory_creates = 0;
+    first_guarded_factory_create = "";
+  endfunction
+
+  // 功能：disable_allocation_guard 关闭所有 allocation 统计窗口，并返回命中数
+  //   与第一笔 factory type/name 供断言诊断。
+  // 输入/输出及副作用：creates/first_create 为输出；读取并关闭静态 guard，保留
+  //   factory override 委托关系，不清除任何已创建对象。
+  // 失败/边界：未 arm 时稳定返回零/空字符串；本函数不把命中自动报告为错误，
+  //   由具体 poll/recovery 契约决定期望值。
+  static function void disable_allocation_guard(
+    output int unsigned creates,
+    output string first_create
+  );
+    creates = guarded_factory_creates;
+    first_create = first_guarded_factory_create;
+    allocation_guard_active = 1'b0;
+    scheduler_guard_armed = 1'b0;
+    scheduler_result_seen = 1'b0;
+  endfunction
+endclass
+
+// 设计说明：consumer doorbell 的 registry/codec 异常必须经真实 poll preparation
+// 触发，不能增加生产 virtual seam。该 registry 仅向测试开放 protected codec 表的
+// 单项替换能力；未调用 replace/remove 时与生产 defaults registry 完全一致。
+class rdma_queue_consumer_fault_registry
+  extends rdma_hw_doorbell_codec_registry;
+  `uvm_object_utils(rdma_queue_consumer_fault_registry)
+
+  // 功能：构造尚未注入 codec 故障的 doorbell registry，沿用生产 defaults 状态。
+  // 输入/输出及副作用：name 为对象名；只调用基类构造，不注册、删除或替换 codec。
+  // 失败/边界：必须由 fixture 的 register_defaults/register_queue_codecs 完成配置；
+  //   未配置对象的 lookup 行为仍由基类明确拒绝。
+  function new(string name = "rdma_queue_consumer_fault_registry");
+    super.new(name);
+  endfunction
+
+  // 功能：replace_codec_for_test 把一个精确 key 的现有 codec 暂时替换为 caller
+  //   提供的 codec（允许 null），并返回原始非拥有引用供用例恢复。
+  // 输入/输出及副作用：key/replacement 为输入，original 为输出；成功只更新本
+  //   registry 的单个 codecs 条目，不修改其它 queue/doorbell profile。
+  // 失败/边界：key canonicalize 失败或原条目不存在时返回 0 且 original=null；
+  //   replacement=null 专用于验证 lookup success+null codec 的 fail-safe 路径。
+  function bit replace_codec_for_test(
+    rdma_codec_key key,
+    rdma_codec_base replacement,
+    output rdma_codec_base original
+  );
+    string canonical;
+    rdma_status status;
+
+    original = null;
+    status = canonicalize(key, canonical);
+    if (status == null || !status.ok() || !codecs.exists(canonical))
+      return 1'b0;
+    original = codecs[canonical];
+    codecs[canonical] = replacement;
+    return 1'b1;
+  endfunction
+
+  // 功能：remove_codec_for_test 删除一个精确 registry 条目并返回原始 codec，
+  //   使 consumer preparation 走真实 lookup error 分支。
+  // 输入/输出及副作用：key 为输入，original 为输出；成功只删除 canonical key，
+  //   调用方可用 replace_codec_for_test 恢复同一非拥有 codec 引用。
+  // 失败/边界：key 非法或条目不存在时返回 0 且不修改 registry；不得在 fixture
+  //   setup 注册 defaults 期间调用，以免把测试故障扩散到其它 profile。
+  function bit remove_codec_for_test(
+    rdma_codec_key key,
+    output rdma_codec_base original
+  );
+    string canonical;
+    rdma_status status;
+
+    original = null;
+    status = canonicalize(key, canonical);
+    if (status == null || !status.ok() || !codecs.exists(canonical))
+      return 1'b0;
+    original = codecs[canonical];
+    codecs.delete(canonical);
+    return 1'b1;
+  endfunction
+
+  // 功能：restore_codec_for_test 恢复 remove/replace 保存的精确 codec 引用。
+  // 输入/输出及副作用：key/original 为输入；成功覆盖本 registry 的一个条目，
+  //   不重新构造 codec，也不修改 defaults_registered 或其它 profile。
+  // 失败/边界：key canonicalize 失败或 original=null 时返回 0 且保持当前表；
+  //   调用方必须在每个故障 poll 后立即恢复，避免污染后续正常消费。
+  function bit restore_codec_for_test(
+    rdma_codec_key key,
+    rdma_codec_base original
+  );
+    string canonical;
+    rdma_status status;
+
+    status = canonicalize(key, canonical);
+    if (status == null || !status.ok() || original == null)
+      return 1'b0;
+    codecs[canonical] = original;
+    return 1'b1;
+  endfunction
+endclass
+
+// 设计说明：codec guard 保存原 codec 的非拥有引用，通过标准 virtual codec
+// interface 注入 encode null/error/null-image，并在 SUCCESS recovery 中阻断任何
+// CQE decode。它不复制 codec，也不改变 production registry 类的接口。
+class rdma_queue_consumer_codec_guard extends rdma_codec_base;
+  rdma_codec_base delegate;
+  rdma_status injected_error;
+  bit return_null_encode_status;
+  bit return_error_encode_status;
+  bit return_null_encode_image;
+  bit block_decode;
+  int unsigned encode_calls;
+  int unsigned decode_calls;
+
+  // 功能：构造 codec guard 并保存 delegate 非拥有引用，默认完全透传所有操作。
+  // 输入/输出及副作用：name/delegate_value 为输入；清零 fault flags/counters，
+  //   injected_error 保持 null，由具体用例在 arm 前预物化。
+  // 失败/边界：delegate_value=null 时透传入口返回 injected_error/null；测试必须
+  //   在替换 registry 前验证 delegate 有效，不能把 guard 当作独立 codec。
+  function new(string name, rdma_codec_base delegate_value);
+    super.new(name);
+    delegate = delegate_value;
+    injected_error = null;
+    return_null_encode_status = 1'b0;
+    return_error_encode_status = 1'b0;
+    return_null_encode_image = 1'b0;
+    block_decode = 1'b0;
+    encode_calls = 0;
+    decode_calls = 0;
+  endfunction
+
+  // 功能：encode 记录 consumer doorbell encode 调用，并按一次用例配置返回 null、
+  //   预物化错误或 success+null image；无故障时委托真实 codec。
+  // 输入/输出及副作用：model 为输入，image 为输出；递增 encode_calls，故障时
+  //   image=null 且不调用 delegate，透传时不取得返回 image 的所有权。
+  // 失败/边界：injected_error 缺失时 error 模式返回 null；三个 fault flag 由测试
+  //   保证互斥，null status/image 都必须由 engine 在 scheduler 前 fail-safe 拒绝。
+  virtual function rdma_status encode(
+    rdma_hw_model model,
+    output rdma_hw_image image
+  );
+    rdma_status status;
+
+    encode_calls++;
+    image = null;
+    if (return_null_encode_status)
+      return null;
+    if (return_error_encode_status)
+      return injected_error;
+    if (return_null_encode_image) begin
+      if (delegate == null) return injected_error;
+      status = delegate.validate_model(model);
+      return status;
+    end
+    if (delegate == null) return injected_error;
+    return delegate.encode(model, image);
+  endfunction
+
+  // 功能：decode 统计 CQE decode；block_decode 时返回预物化错误，证明 confirmed
+  //   SUCCESS recovery 不能重新 lookup/decode 原 CQE image。
+  // 输入/输出及副作用：image 为输入，model 为输出；递增 decode_calls，透传时
+  //   直接发布 delegate 结果，block 时保持 model=null。
+  // 失败/边界：delegate 或 injected_error 为空时返回 null；初始 poll 必须在
+  //   block_decode=0 下完成，只有 recovery continuation 才允许 arm。
+  virtual function rdma_status decode(
+    rdma_hw_image image,
+    output rdma_hw_model model
+  );
+    decode_calls++;
+    model = null;
+    if (block_decode)
+      return injected_error;
+    if (delegate == null) return injected_error;
+    return delegate.decode(image, model);
+  endfunction
+
+  // 功能：validate_model 把模型合法性检查委托给原 codec，供 null-image fault
+  //   返回一个真实 success status 而不编码 image。
+  // 输入/输出及副作用：model 为输入；返回 delegate status，不修改 model/counter。
+  // 失败/边界：delegate=null 时返回 injected_error（可能为 null）；engine 必须安全
+  //   处理 codec 返回的 null status。
+  virtual function rdma_status validate_model(rdma_hw_model model);
+    if (delegate == null) return injected_error;
+    return delegate.validate_model(model);
+  endfunction
+
+  // 功能：validate_image 把 image metadata 检查委托给原 codec。
+  // 输入/输出及副作用：image 为输入；只读并返回 delegate status。
+  // 失败/边界：delegate=null 时返回 injected_error；不尝试构造替代 status。
+  virtual function rdma_status validate_image(rdma_hw_image image);
+    if (delegate == null) return injected_error;
+    return delegate.validate_image(image);
+  endfunction
+
+  // 功能：hardware_endian 返回原 codec 的 hardware byte order。
+  // 输入/输出及副作用：无显式输入；只读 delegate，不修改 guard 或 codec。
+  // 失败/边界：delegate=null 时返回 RDMA_ENDIAN_BIG 安全测试默认；该值不会使
+  //   缺失 delegate 的 encode/decode 获得成功。
+  virtual function rdma_byte_endian_e hardware_endian();
+    if (delegate == null) return RDMA_ENDIAN_BIG;
+    return delegate.hardware_endian();
+  endfunction
+
+  // 功能：describe_fields 返回稳定的测试 guard 描述，不调用可能分配的 delegate
+  //   文本格式化路径。
+  // 输入/输出及副作用：无显式输入；返回固定字符串，不修改任何状态。
+  // 失败/边界：描述不代表 profile authority；registry key 仍是唯一选择依据。
+  virtual function string describe_fields();
+    return "queue consumer codec guard";
+  endfunction
 endclass
 
 // 设计说明：CQ poll 的 doorbell、CQ CI commit 与 WQE release 必须经过唯一的
 // 三个 transaction seam，测试才能在不读取或修改 runtime 私有账本的前提下证明
-// 相对顺序并一次性注入阶段故障。该子类只记录调用并委托真实生产实现。
+// 相对顺序并一次性注入阶段故障。recovery allocation guard 也只在既有
+// commit/release seam 的首个入口打开，不为生产 engine 增加第四个 virtual seam。
 class rdma_queue_data_engine_ordering_fault extends rdma_queue_data_engine;
   `uvm_object_utils(rdma_queue_data_engine_ordering_fault)
 
@@ -145,6 +422,11 @@ class rdma_queue_data_engine_ordering_fault extends rdma_queue_data_engine;
   bit null_doorbell_status_once;
   bit null_commit_status_once;
   bit null_release_status_once;
+  bit arm_recovery_allocation_guard_once;
+  bit hold_release_gate_after_commit_once;
+  bit held_release_gate_active;
+  rdma_queue_runtime held_release_runtime;
+  rdma_status held_release_status;
   int unsigned commit_calls;
   int unsigned release_calls;
   int unsigned doorbell_calls;
@@ -168,6 +450,11 @@ class rdma_queue_data_engine_ordering_fault extends rdma_queue_data_engine;
     null_doorbell_status_once = 1'b0;
     null_commit_status_once = 1'b0;
     null_release_status_once = 1'b0;
+    arm_recovery_allocation_guard_once = 1'b0;
+    hold_release_gate_after_commit_once = 1'b0;
+    held_release_gate_active = 1'b0;
+    held_release_runtime = null;
+    held_release_status = null;
     commit_calls = 0;
     release_calls = 0;
     doorbell_calls = 0;
@@ -188,7 +475,9 @@ class rdma_queue_data_engine_ordering_fault extends rdma_queue_data_engine;
     output rdma_doorbell_result result,
     output rdma_status status,
     output rdma_queue_mmio_evidence_e evidence,
-    rdma_queue_data_qp_link routed_link
+    input rdma_queue_data_qp_link routed_link,
+    input rdma_doorbell_desc prepared_desc = null,
+    input rdma_status prepared_status = null
   );
     rdma_status pending_status;
 
@@ -213,8 +502,15 @@ class rdma_queue_data_engine_ordering_fault extends rdma_queue_data_engine;
     if (fail_doorbell_once) begin
       fail_doorbell_once = 1'b0;
       result = null;
-      status = rdma_status::make(RDMA_SC_PCIE_COMPLETION,
-                                 "injected consumer doorbell failure");
+      if (prepared_status != null) begin
+        void'(set_engine_status_noalloc(
+          prepared_status, RDMA_SC_PCIE_COMPLETION,
+          "injected consumer doorbell failure"));
+        status = prepared_status;
+      end
+      else
+        status = rdma_status::make(RDMA_SC_PCIE_COMPLETION,
+                                   "injected consumer doorbell failure");
       if (inject_none_doorbell)
         evidence = RDMA_QUEUE_MMIO_NONE;
       else if (inject_not_applicable_doorbell)
@@ -225,18 +521,29 @@ class rdma_queue_data_engine_ordering_fault extends rdma_queue_data_engine;
       return;
     end
     super.submit_consumer_doorbell(attachment, next, result, status,
-                                   evidence, routed_link);
+                                   evidence, routed_link, prepared_desc,
+                                   prepared_status);
   endtask
 
-  // 功能：记录 CQ consumer commit 阶段，并在 armed 的首次调用拒绝 CI 提交。
-  // 输入/输出及副作用：cq_attachment/cursor 为输入；递增 commit_calls、追加
-  //   "commit"，未注入时返回真实 runtime.commit_consumer 的状态与副作用。
+  // 功能：记录 CQ consumer commit 阶段；可在 armed 的首次调用拒绝 CI，或在一次
+  //   成功 commit 后用预建 status 抢先持有 CQ release gate，验证 engine 自身 gate。
+  // 输入/输出及副作用：cq_attachment/cursor/prepared_status 为输入；
+  //   递增 commit_calls、追加 "commit"；正常先委托真实 commit，hold 模式保存
+  //   runtime 非拥有引用并调用 begin_consumer_release_noalloc 持有其 lock。
   // 失败/边界：fail_commit_once 只返回一次 INVALID_STATE 且不修改 CQ CI/used；
-  //   计数归零后委托基类，故 recovery 能补做且不会永久屏蔽生产实现。
+  //   hold 模式不创建 status，缺预建 slot/runtime 时 held flag 保持 0，让测试失败；
+  //   测试必须在退出前以 finish(false) 归还注入 gate，不能把 lock 泄漏到后续用例。
   protected virtual function rdma_status commit_cq_consumer(
     rdma_queue_data_attachment cq_attachment,
-    rdma_queue_cursor_snapshot cursor
+    rdma_queue_cursor_snapshot cursor,
+    rdma_status prepared_status = null
   );
+    rdma_status delegated_status;
+
+    if (arm_recovery_allocation_guard_once) begin
+      arm_recovery_allocation_guard_once = 1'b0;
+      rdma_queue_poll_factory_fault_wrapper::arm_immediate_allocation_guard();
+    end
     commit_calls++;
     trace.push_back("commit");
     if (null_commit_status_once) begin
@@ -245,22 +552,49 @@ class rdma_queue_data_engine_ordering_fault extends rdma_queue_data_engine;
     end
     if (fail_commit_once) begin
       fail_commit_once = 1'b0;
+      if (prepared_status != null) begin
+        void'(set_engine_status_noalloc(
+          prepared_status, RDMA_SC_INVALID_STATE,
+          "injected CQ consumer commit failure"));
+        return prepared_status;
+      end
       return rdma_status::make(RDMA_SC_INVALID_STATE,
                                "injected CQ consumer commit failure");
     end
-    return super.commit_cq_consumer(cq_attachment, cursor);
+    delegated_status = super.commit_cq_consumer(
+      cq_attachment, cursor, prepared_status);
+    if (hold_release_gate_after_commit_once && delegated_status != null &&
+        delegated_status.ok()) begin
+      hold_release_gate_after_commit_once = 1'b0;
+      held_release_runtime = cq_attachment == null ? null :
+                             cq_attachment.runtime;
+      held_release_gate_active =
+        held_release_runtime != null && held_release_status != null &&
+        held_release_runtime.begin_consumer_release_noalloc(
+          held_release_status);
+    end
+    return delegated_status;
   endfunction
 
   // 功能：记录 CQ WQE release 阶段，并在 armed 的首次调用拒绝 ledger mutation。
-  // 输入/输出及副作用：wqe_attachment/cqe 为输入，released 为输出；递增
-  //   release_calls、追加 "release"，未注入时委托真实 match_and_release。
+  // 输入/输出及副作用：wqe_attachment/cqe/prepared_status 与 frozen
+  //   target 为输入，released 为输出；递增 release_calls、追加 "release"，
+  //   armed 时在入口打开 factory guard，未注入时委托对应 release 实现。
   // 失败/边界：fail_release_once 命中时清空 released 并返回 INVALID_STATE，保证
   //   SQ/RQ/SRQ ledger 不变；下一次 recovery 调用恢复真实 release。
   protected virtual function rdma_status release_cq_wqe(
     rdma_queue_data_attachment wqe_attachment,
     rdma_hw_cqe_model cqe,
-    output rdma_queue_slot_ledger_entry released[$]
+    output rdma_queue_slot_ledger_entry released[$],
+    input rdma_status prepared_status = null,
+    input bit frozen_target_valid = 1'b0,
+    input int unsigned frozen_target_index = 0,
+    input bit frozen_target_wrap = 1'b0
   );
+    if (arm_recovery_allocation_guard_once) begin
+      arm_recovery_allocation_guard_once = 1'b0;
+      rdma_queue_poll_factory_fault_wrapper::arm_immediate_allocation_guard();
+    end
     release_calls++;
     trace.push_back("release");
     if (null_release_status_once) begin
@@ -271,10 +605,18 @@ class rdma_queue_data_engine_ordering_fault extends rdma_queue_data_engine;
     if (fail_release_once) begin
       fail_release_once = 1'b0;
       released.delete();
+      if (prepared_status != null) begin
+        void'(set_engine_status_noalloc(
+          prepared_status, RDMA_SC_INVALID_STATE,
+          "injected CQ WQE release failure"));
+        return prepared_status;
+      end
       return rdma_status::make(RDMA_SC_INVALID_STATE,
                                "injected CQ WQE release failure");
     end
-    return super.release_cq_wqe(wqe_attachment, cqe, released);
+    return super.release_cq_wqe(
+      wqe_attachment, cqe, released, prepared_status,
+      frozen_target_valid, frozen_target_index, frozen_target_wrap);
   endfunction
 endclass
 
@@ -491,6 +833,13 @@ class rdma_queue_data_engine_device_publish_test extends uvm_test;
   protected rdma_queue_poll_factory_fault_wrapper poll_handle_fault;
   protected rdma_queue_poll_factory_fault_wrapper poll_image_fault;
   protected rdma_queue_poll_factory_fault_wrapper poll_status_fault;
+  protected rdma_queue_poll_factory_fault_wrapper poll_cursor_fault;
+  protected rdma_queue_poll_factory_fault_wrapper poll_cqe_model_fault;
+  protected rdma_queue_poll_factory_fault_wrapper poll_doorbell_result_fault;
+  protected rdma_queue_poll_factory_fault_wrapper poll_cq_db_model_fault;
+  protected rdma_queue_poll_factory_fault_wrapper poll_ceq_db_model_fault;
+  protected rdma_queue_poll_factory_fault_wrapper poll_aeq_db_model_fault;
+  protected rdma_queue_poll_factory_fault_wrapper poll_db_desc_fault;
 
   // 功能：构造 UVM 测试组件，不预先绑定 queue-data fixture，保持每次 run 独立。
   // 输入/输出及副作用：name、parent 为输入；只建立组件层级，不申请 queue 或 mapping。
@@ -505,12 +854,20 @@ class rdma_queue_data_engine_device_publish_test extends uvm_test;
     poll_handle_fault = null;
     poll_image_fault = null;
     poll_status_fault = null;
+    poll_cursor_fault = null;
+    poll_cqe_model_fault = null;
+    poll_doorbell_result_fault = null;
+    poll_cq_db_model_fault = null;
+    poll_ceq_db_model_fault = null;
+    poll_aeq_db_model_fault = null;
+    poll_db_desc_fault = null;
   endfunction
 
   // 功能：为 CQ/event poll admission 所需的结果/证据对象安装按 instance name 命中的
   //   raw factory wrapper，供 null/错误类型分配故障保持非致命且可重复验证。
   // 输入/输出及副作用：无显式输入；首次调用创建 wrapper 并覆盖 pending/result/
-  //   slot/handle/image/status 类型；后续调用保持既有 override，不形成 wrapper 链。
+  //   slot/handle/image/status/cursor/model/descriptor/result 类型；后续调用保持既有
+  //   override，不形成 wrapper 链，并为 scheduler result/status 配置 guard 角色。
   // 失败/边界：必须在目标 fixture setup 完成后、首次 arm 前调用；全局 override
   //   持续到本 UVM test 结束，未 armed 时只委托原 registry，不改变生产行为。
   function automatic void configure_poll_factory_faults();
@@ -532,6 +889,22 @@ class rdma_queue_data_engine_device_publish_test extends uvm_test;
       "poll_image_factory_fault", rdma_hw_image::get_type());
     poll_status_fault = new(
       "poll_status_factory_fault", rdma_status::get_type());
+    poll_cursor_fault = new(
+      "poll_cursor_factory_fault", rdma_queue_cursor_snapshot::get_type());
+    poll_cqe_model_fault = new(
+      "poll_cqe_model_factory_fault", rdma_hw_cqe_model::get_type());
+    poll_doorbell_result_fault = new(
+      "poll_doorbell_result_factory_fault", rdma_doorbell_result::get_type());
+    poll_cq_db_model_fault = new(
+      "poll_cq_db_model_factory_fault", rdma_hw_cq_doorbell_model::get_type());
+    poll_ceq_db_model_fault = new(
+      "poll_ceq_db_model_factory_fault", rdma_hw_ceq_doorbell_model::get_type());
+    poll_aeq_db_model_fault = new(
+      "poll_aeq_db_model_factory_fault", rdma_hw_aeq_doorbell_model::get_type());
+    poll_db_desc_fault = new(
+      "poll_db_desc_factory_fault", rdma_doorbell_desc::get_type());
+    poll_doorbell_result_fault.set_scheduler_guard_role(1'b1, 1'b0);
+    poll_status_fault.set_scheduler_guard_role(1'b0, 1'b1);
     factory.set_type_override_by_type(
       rdma_queue_pending_operation::get_type(), poll_pending_fault, 1'b1);
     factory.set_type_override_by_type(
@@ -546,6 +919,20 @@ class rdma_queue_data_engine_device_publish_test extends uvm_test;
       rdma_hw_image::get_type(), poll_image_fault, 1'b1);
     factory.set_type_override_by_type(
       rdma_status::get_type(), poll_status_fault, 1'b1);
+    factory.set_type_override_by_type(
+      rdma_queue_cursor_snapshot::get_type(), poll_cursor_fault, 1'b1);
+    factory.set_type_override_by_type(
+      rdma_hw_cqe_model::get_type(), poll_cqe_model_fault, 1'b1);
+    factory.set_type_override_by_type(
+      rdma_doorbell_result::get_type(), poll_doorbell_result_fault, 1'b1);
+    factory.set_type_override_by_type(
+      rdma_hw_cq_doorbell_model::get_type(), poll_cq_db_model_fault, 1'b1);
+    factory.set_type_override_by_type(
+      rdma_hw_ceq_doorbell_model::get_type(), poll_ceq_db_model_fault, 1'b1);
+    factory.set_type_override_by_type(
+      rdma_hw_aeq_doorbell_model::get_type(), poll_aeq_db_model_fault, 1'b1);
+    factory.set_type_override_by_type(
+      rdma_doorbell_desc::get_type(), poll_db_desc_fault, 1'b1);
   endfunction
 
   // 功能：reset_device_publish_factory_state 把三个被本文件覆盖的基类恢复到无故障
@@ -567,6 +954,9 @@ class rdma_queue_data_engine_device_publish_test extends uvm_test;
     factory.set_type_override_by_type(
       rdma_resource_manager::get_type(),
       rdma_device_publish_passthrough_manager::get_type(), 1'b1);
+    factory.set_type_override_by_type(
+      rdma_hw_doorbell_codec_registry::get_type(),
+      rdma_queue_consumer_fault_registry::get_type(), 1'b1);
     rdma_device_publish_recovery_fault_engine::admission_failures_remaining = 0;
     rdma_device_publish_recovery_fault_engine::cancel_failures_remaining = 0;
     rdma_cq_device_write_preflight_fault_access::reject_next_device_write = 1'b0;
@@ -830,7 +1220,8 @@ class rdma_queue_data_engine_device_publish_test extends uvm_test;
   // 输入/输出及副作用：left、right 为输入；返回所有公开 evidence 字段的合取结果，
   //   只读取 detached snapshot，不访问 attachment、backing 或 runtime 内部状态。
   // 失败边界：null 不对称、image/request/committed cursor 等对象存在性不同或任一
-  //   标量/byte 不同均返回 0；device recovery 的 request_snapshot 必须保持同一 null 性。
+  //   标量/byte 或 completion WQ kind 不同均返回 0；device recovery 的
+  //   request_snapshot 必须保持同一 null 性。
   function automatic bit same_device_pending_value(
     rdma_queue_pending_operation left,
     rdma_queue_pending_operation right
@@ -880,6 +1271,7 @@ class rdma_queue_data_engine_device_publish_test extends uvm_test;
            left.completion_index == right.completion_index &&
            left.completion_wrap == right.completion_wrap &&
            left.completion_target_valid == right.completion_target_valid &&
+           left.completion_wq_kind == right.completion_wq_kind &&
            left.mmio_maybe_submitted == right.mmio_maybe_submitted &&
            left.known_no_mmio == right.known_no_mmio &&
            left.mmio_evidence == right.mmio_evidence &&
@@ -4630,10 +5022,216 @@ class rdma_queue_data_engine_device_publish_test extends uvm_test;
                  "verification snapshot returned null" : status.convert2string())
   endtask
 
+  // 功能：check_cq_local_preparation_failure 验证一个 consumer doorbell 本地准备
+  //   故障在 admission/scheduler 前结束，并保持 CQE、CQ CI 与 SQ WQE 全部可见。
+  // 输入/输出及副作用：label/fixture/ordering/expected_code 为输入；执行一次公开
+  //   poll，并读取 PCIe history、runtime occupancy/cursor/pending，不修改故障源。
+  // 失败/边界：status code 不符、发布 completion、调用任一 transaction seam、
+  //   PCIe 增长、CQ/SQ used 或 CI 改变、安装 pending 时报告 UVM_ERROR。
+  task automatic check_cq_local_preparation_failure(
+    string label,
+    rdma_queue_data_engine_fixture fixture,
+    rdma_queue_data_engine_ordering_fault ordering,
+    rdma_status_code_e expected_code
+  );
+    rdma_queue_completion_result completion;
+    rdma_queue_pending_operation pending;
+    rdma_status status;
+    int unsigned pcie_before;
+    int unsigned cq_occupancy;
+    int unsigned sq_occupancy;
+    int unsigned producer_index;
+    int unsigned consumer_index;
+    bit producer_wrap;
+    bit consumer_wrap;
+    bit has_pending;
+
+    if (fixture == null || ordering == null) begin
+      `uvm_error(label, "local preparation fixture is incomplete")
+      return;
+    end
+    ordering.trace.delete();
+    ordering.doorbell_calls = 0;
+    ordering.commit_calls = 0;
+    ordering.release_calls = 0;
+    pcie_before = count_pcie_calls(fixture.pcie, "mmio_write");
+    completion = null;
+    fixture.engine.poll_cqe(fixture.cq.handle, 0, completion, status);
+    if (status == null || status.code != expected_code || completion != null)
+      `uvm_error(label, status == null ?
+                 "local preparation returned null status" : status.convert2string())
+    if (ordering.trace.size() != 0 || ordering.doorbell_calls != 0 ||
+        ordering.commit_calls != 0 || ordering.release_calls != 0 ||
+        count_pcie_calls(fixture.pcie, "mmio_write") != pcie_before)
+      `uvm_error({label, "_NO_SUBMIT"},
+                 "local preparation crossed admission/scheduler or local stages")
+    cq_occupancy = 0;
+    has_pending = 1'b0;
+    status = fixture.engine.query_runtime_occupancy(
+      fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, cq_occupancy, has_pending);
+    if (status == null || !status.ok() || cq_occupancy != 1 || has_pending)
+      `uvm_error({label, "_CQ"}, "local failure changed CQ used/pending")
+    status = fixture.engine.query_runtime_cursors(
+      fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ,
+      producer_index, producer_wrap, consumer_index, consumer_wrap);
+    if (status == null || !status.ok() || consumer_index != 0 || consumer_wrap)
+      `uvm_error({label, "_CI"}, "local failure advanced CQ consumer cursor")
+    sq_occupancy = 0;
+    has_pending = 1'b0;
+    status = fixture.engine.query_runtime_occupancy(
+      fixture.qp.handle, RDMA_QUEUE_RUNTIME_SQ, sq_occupancy, has_pending);
+    if (status == null || !status.ok() || sq_occupancy != 1 || has_pending)
+      `uvm_error({label, "_SQ"}, "local failure changed SQ WQE credit")
+    pending = null;
+    status = fixture.engine.query_runtime_pending(
+      fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, pending);
+    if (status == null || status.code != RDMA_SC_INVALID_STATE ||
+        pending != null)
+      `uvm_error({label, "_PENDING"},
+                 "local failure installed consumer recovery evidence")
+  endtask
+
+  // 功能：check_cq_consumer_codec_preparation_failures 用真实 registry lookup 与
+  //   codec.encode 覆盖 missing/null codec、error/null status 和 success+null image，
+  //   并确认恢复原 codec 后同一 CQE 仍能成功消费。
+  // 输入/输出及副作用：无显式输入；建立 fault-registry fixture，逐次替换单个
+  //   cq_rc_ud codec，调用 local-failure helper，最后恢复原引用并正常 poll。
+  // 失败/边界：registry cast/replace/remove/restore 失败、任何故障跨 scheduler、
+  //   或最终 trace/result 不完整时报告 UVM_ERROR；每个分支都恢复原 codec。
+  task automatic check_cq_consumer_codec_preparation_failures();
+    rdma_queue_data_engine_fixture fixture;
+    rdma_queue_data_engine_ordering_fault ordering;
+    rdma_queue_consumer_fault_registry fault_registry;
+    rdma_queue_consumer_codec_guard codec_guard;
+    rdma_queue_post_result posted;
+    rdma_hw_cqe_model cqe;
+    rdma_queue_completion_result completion;
+    rdma_codec_base original_codec;
+    rdma_codec_base displaced_codec;
+    rdma_codec_key key;
+    rdma_status status;
+
+    prepare_ordering_cqe(
+      "cq_consumer_codec", fixture, ordering, posted, cqe, status);
+    if (status == null || !status.ok() || fixture == null ||
+        !$cast(fault_registry, fixture.registry) || fault_registry == null) begin
+      `uvm_error("CQ_CONSUMER_CODEC_SETUP", status == null ?
+                 "codec fixture returned null" : status.convert2string())
+      return;
+    end
+    key = '{hw_version:"rdma", image_kind:RDMA_IMAGE_DOORBELL,
+      object_type:"doorbell", variant:"cq_rc_ud", opcode:8'h00};
+    original_codec = null;
+    if (!fault_registry.remove_codec_for_test(key, original_codec) ||
+        original_codec == null) begin
+      `uvm_error("CQ_CONSUMER_CODEC_REMOVE", "doorbell codec remove failed")
+      return;
+    end
+    check_cq_local_preparation_failure(
+      "CQ_CONSUMER_LOOKUP_ERROR", fixture, ordering,
+      RDMA_SC_UNSUPPORTED_OPCODE);
+    if (!fault_registry.restore_codec_for_test(key, original_codec)) begin
+      `uvm_error("CQ_CONSUMER_CODEC_RESTORE", "lookup codec restore failed")
+      return;
+    end
+
+    displaced_codec = null;
+    if (!fault_registry.replace_codec_for_test(key, null, displaced_codec) ||
+        displaced_codec != original_codec) begin
+      `uvm_error("CQ_CONSUMER_CODEC_NULL_INJECT", "null codec replace failed")
+      return;
+    end
+    check_cq_local_preparation_failure(
+      "CQ_CONSUMER_CODEC_NULL", fixture, ordering,
+      RDMA_SC_RESOURCE_EXHAUSTED);
+    if (!fault_registry.restore_codec_for_test(key, original_codec)) begin
+      `uvm_error("CQ_CONSUMER_CODEC_NULL_RESTORE", "null codec restore failed")
+      return;
+    end
+
+    codec_guard = new("cq_consumer_codec_guard", original_codec);
+    codec_guard.injected_error = rdma_status::make(
+      RDMA_SC_CODEC_ERROR, "injected consumer doorbell codec failure");
+    displaced_codec = null;
+    if (!fault_registry.replace_codec_for_test(
+          key, codec_guard, displaced_codec) ||
+        displaced_codec != original_codec) begin
+      `uvm_error("CQ_CONSUMER_CODEC_GUARD", "codec guard replace failed")
+      return;
+    end
+    codec_guard.return_error_encode_status = 1'b1;
+    check_cq_local_preparation_failure(
+      "CQ_CONSUMER_ENCODE_ERROR", fixture, ordering, RDMA_SC_CODEC_ERROR);
+    codec_guard.return_error_encode_status = 1'b0;
+    codec_guard.return_null_encode_status = 1'b1;
+    check_cq_local_preparation_failure(
+      "CQ_CONSUMER_ENCODE_NULL", fixture, ordering, RDMA_SC_INVALID_STATE);
+    codec_guard.return_null_encode_status = 1'b0;
+    codec_guard.return_null_encode_image = 1'b1;
+    check_cq_local_preparation_failure(
+      "CQ_CONSUMER_IMAGE_NULL", fixture, ordering, RDMA_SC_CODEC_ERROR);
+    codec_guard.return_null_encode_image = 1'b0;
+    if (!fault_registry.restore_codec_for_test(key, original_codec)) begin
+      `uvm_error("CQ_CONSUMER_CODEC_FINAL_RESTORE", "codec restore failed")
+      return;
+    end
+
+    ordering.trace.delete();
+    completion = null;
+    fixture.engine.poll_cqe(fixture.cq.handle, 0, completion, status);
+    if (status == null || !status.ok() || completion == null ||
+        ordering.trace.size() != 3 || ordering.trace[0] != "doorbell" ||
+        ordering.trace[1] != "commit" || ordering.trace[2] != "release")
+      `uvm_error("CQ_CONSUMER_CODEC_FINAL", status == null ?
+                 "restored codec poll returned null" : status.convert2string())
+  endtask
+
+  // 功能：check_cq_poll_post_scheduler_allocation_guard 在真实 scheduler 成功返回
+  //   后监测所有相关 UVM factory，证明 CQ CI commit、WQE release、marker/finalize
+  //   与结果发布不再创建 status/cursor/evidence 对象。
+  // 输入/输出及副作用：无显式输入；建立一笔真实 CQE，arm result/status 边界
+  //   guard 后执行公开 poll，返回即关闭 guard，再检查 trace 与 completion。
+  // 失败/边界：scheduler 未成功、guard 未跨过边界、任一 post-scheduler factory
+  //   create、顺序非 doorbell→commit→release 或结果不完整时报告 UVM_ERROR。
+  task automatic check_cq_poll_post_scheduler_allocation_guard();
+    rdma_queue_data_engine_fixture fixture;
+    rdma_queue_data_engine_ordering_fault ordering;
+    rdma_queue_post_result posted;
+    rdma_hw_cqe_model cqe;
+    rdma_queue_completion_result completion;
+    rdma_status status;
+    int unsigned guarded_creates;
+    string first_create;
+
+    prepare_ordering_cqe(
+      "cq_post_scheduler_alloc", fixture, ordering, posted, cqe, status);
+    if (status == null || !status.ok()) begin
+      `uvm_error("CQ_POST_SCHED_ALLOC_SETUP", status == null ?
+                 "allocation guard setup returned null" : status.convert2string())
+      return;
+    end
+    configure_poll_factory_faults();
+    rdma_queue_poll_factory_fault_wrapper::arm_scheduler_allocation_guard();
+    completion = null;
+    fixture.engine.poll_cqe(fixture.cq.handle, 0, completion, status);
+    rdma_queue_poll_factory_fault_wrapper::disable_allocation_guard(
+      guarded_creates, first_create);
+    if (status == null || !status.ok() || completion == null ||
+        ordering.trace.size() != 3 || ordering.trace[0] != "doorbell" ||
+        ordering.trace[1] != "commit" || ordering.trace[2] != "release")
+      `uvm_error("CQ_POST_SCHED_ALLOC_FLOW", status == null ?
+                 "guarded poll returned null" : status.convert2string())
+    if (guarded_creates != 0)
+      `uvm_error("CQ_POST_SCHED_ALLOC", $sformatf(
+        "post-scheduler factory creates=%0d first=%s",
+        guarded_creates, first_create))
+  endtask
+
   // 功能：覆盖 CQ prepared pending/result/release-slot 以及 nested handle/image/
-  //   status 的 null 与错误类型 factory 结果，最后确认同一可见 CQE 仍可正常消费。
+  //   status 及 doorbell model/descriptor 的 null 与错误类型 factory 结果，最后
+  //   确认同一可见 CQE 仍可正常消费。
   // 输入/输出及副作用：无显式输入；建立一笔真实 post/publish，依次驱动十二个
-  //   pre-admission 故障，再执行一次成功 poll；只使用公开状态查询。
+  //   pre-admission 故障矩阵，再执行一次成功 poll；只使用公开状态查询。
   // 失败/边界：任一故障若提前消费 CQE 或 WQE 会被逐项 atomicity 断言捕获；
   //   wrapper 未命中也必须失败，最终成功路径必须仍为 doorbell→commit→release。
   task automatic check_cq_poll_prepared_factory_failures();
@@ -4687,6 +5285,18 @@ class rdma_queue_data_engine_device_publish_test extends uvm_test;
       1'b0, fixture, ordering);
     check_cq_poll_factory_fault_case(
       "CQ_STATUS_WRONG", poll_status_fault, "CQ result model_status",
+      1'b1, fixture, ordering);
+    check_cq_poll_factory_fault_case(
+      "CQ_DB_MODEL_NULL", poll_cq_db_model_fault, "cq_ci_db_model",
+      1'b0, fixture, ordering);
+    check_cq_poll_factory_fault_case(
+      "CQ_DB_MODEL_WRONG", poll_cq_db_model_fault, "cq_ci_db_model",
+      1'b1, fixture, ordering);
+    check_cq_poll_factory_fault_case(
+      "CQ_DB_DESC_NULL", poll_db_desc_fault, "consumer_db_desc",
+      1'b0, fixture, ordering);
+    check_cq_poll_factory_fault_case(
+      "CQ_DB_DESC_WRONG", poll_db_desc_fault, "consumer_db_desc",
       1'b1, fixture, ordering);
 
     ordering.trace.delete();
@@ -4946,6 +5556,114 @@ class rdma_queue_data_engine_device_publish_test extends uvm_test;
       fixture.qp.handle, RDMA_QUEUE_RUNTIME_SQ, occupancy, has_pending);
     if (status == null || !status.ok() || occupancy != 0 || has_pending)
       `uvm_error("CQ_RELEASE_FAIL_SQ_FINAL", "SQ release retry was not exact")
+  endtask
+
+  // 功能：验证 engine 在 WQ release 前必须取得 CQ release gate；测试 seam 在成功
+  //   commit 后抢先持锁，使本轮 poll 必须在调用 release_cq_wqe 前失败退出。
+  // 输入/输出及副作用：无显式输入；以预建 status 注入一次 gate 竞争，观察 trace、
+  //   CQ/SQ occupancy 与 detached pending，撤销注入后 caller-confirmed retry 只释放一次。
+  // 失败/边界：首次 poll 若触碰 WQ ledger、发布 result 或遗失 committed pending 即报错；
+  //   注入 gate 无论断言结果都显式 finish(false)，避免测试锁泄漏掩盖后续用例。
+  task automatic check_cq_poll_release_gate_blocks_wq_mutation();
+    rdma_queue_data_engine_fixture fixture;
+    rdma_queue_data_engine_ordering_fault ordering;
+    rdma_queue_post_result posted;
+    rdma_hw_cqe_model cqe;
+    rdma_queue_completion_result completion;
+    rdma_queue_pending_operation pending;
+    rdma_status status;
+    bit has_pending;
+    int unsigned occupancy;
+
+    prepare_ordering_cqe("cq_release_gate_busy", fixture, ordering, posted,
+                         cqe, status);
+    if (status == null || !status.ok()) begin
+      `uvm_error("CQ_RELEASE_GATE_SETUP", status == null ?
+                 "release-gate setup returned null status" :
+                 status.convert2string())
+      return;
+    end
+    ordering.held_release_status = rdma_status::make(
+      RDMA_SC_OK, "prebuilt injected release gate status");
+    ordering.hold_release_gate_after_commit_once = 1'b1;
+    completion = null;
+    fixture.engine.poll_cqe(fixture.cq.handle, 0, completion, status);
+    if (status == null || status.code != RDMA_SC_RESOURCE_BUSY ||
+        completion != null)
+      `uvm_error("CQ_RELEASE_GATE_RESULT", status == null ?
+                 "release-gate poll returned null status" :
+                 status.convert2string())
+    if (!ordering.held_release_gate_active ||
+        ordering.held_release_runtime == null ||
+        ordering.trace.size() != 2 || ordering.trace[0] != "doorbell" ||
+        ordering.trace[1] != "commit" || ordering.doorbell_calls != 1 ||
+        ordering.commit_calls != 1 || ordering.release_calls != 0)
+      `uvm_error("CQ_RELEASE_GATE_TRACE", $sformatf(
+        "held=%0b trace=%p calls=%0d/%0d/%0d",
+        ordering.held_release_gate_active, ordering.trace,
+        ordering.doorbell_calls, ordering.commit_calls,
+        ordering.release_calls))
+    occupancy = 0;
+    has_pending = 1'b0;
+    status = fixture.engine.query_runtime_occupancy(
+      fixture.qp.handle, RDMA_QUEUE_RUNTIME_SQ, occupancy, has_pending);
+    if (status == null || !status.ok() || occupancy != 1 || has_pending)
+      `uvm_error("CQ_RELEASE_GATE_SQ_HELD",
+                 "CQ gate contention changed the routed SQ ledger")
+
+    if (ordering.held_release_gate_active &&
+        ordering.held_release_runtime != null) begin
+      if (!ordering.held_release_runtime.finish_consumer_release_noalloc(
+            1'b0, ordering.held_release_status))
+        `uvm_error("CQ_RELEASE_GATE_CANCEL",
+                   "injected CQ release gate could not be unlocked")
+      else
+        ordering.held_release_gate_active = 1'b0;
+    end
+    else
+      `uvm_error("CQ_RELEASE_GATE_CANCEL",
+                 "commit seam did not acquire the injected CQ release gate")
+
+    occupancy = 32'hffff_ffff;
+    has_pending = 1'b0;
+    status = fixture.engine.query_runtime_occupancy(
+      fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, occupancy, has_pending);
+    if (status == null || !status.ok() || occupancy != 0 || !has_pending)
+      `uvm_error("CQ_RELEASE_GATE_CQ_PENDING",
+                 "gate contention lost the committed CQ pending state")
+    pending = null;
+    status = fixture.engine.query_runtime_pending(
+      fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, pending);
+    if (status == null || !status.ok() || pending == null ||
+        !pending.consumer_committed || !pending.cq_consumer_committed ||
+        pending.completion_released)
+      `uvm_error("CQ_RELEASE_GATE_PENDING", status == null ?
+                 "gate pending query returned null status" :
+                 status.convert2string())
+
+    fixture.engine.recover_queue(
+      fixture.cq.handle, RDMA_QUEUE_RECOVERY_RETRY_PENDING, 1'b1, status);
+    if (status == null || !status.ok())
+      `uvm_error("CQ_RELEASE_GATE_RECOVER", status == null ?
+                 "release-gate retry returned null status" :
+                 status.convert2string())
+    if (ordering.trace.size() != 3 || ordering.trace[2] != "release" ||
+        ordering.doorbell_calls != 1 || ordering.commit_calls != 1 ||
+        ordering.release_calls != 1)
+      `uvm_error("CQ_RELEASE_GATE_RETRY", $sformatf(
+        "trace=%p calls=%0d/%0d/%0d", ordering.trace,
+        ordering.doorbell_calls, ordering.commit_calls,
+        ordering.release_calls))
+    status = fixture.engine.query_runtime_occupancy(
+      fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, occupancy, has_pending);
+    if (status == null || !status.ok() || occupancy != 0 || has_pending)
+      `uvm_error("CQ_RELEASE_GATE_CQ_FINAL",
+                 "release-gate retry did not complete CQ recovery")
+    status = fixture.engine.query_runtime_occupancy(
+      fixture.qp.handle, RDMA_QUEUE_RUNTIME_SQ, occupancy, has_pending);
+    if (status == null || !status.ok() || occupancy != 0 || has_pending)
+      `uvm_error("CQ_RELEASE_GATE_SQ_FINAL",
+                 "release-gate retry did not release exactly one SQ WQE")
   endtask
 
   // 功能：验证 consumer doorbell 本地 NO_SUBMIT 保持 CQ/SQ 可见且无 PCIe write，
@@ -5239,6 +5957,66 @@ class rdma_queue_data_engine_device_publish_test extends uvm_test;
     check_cq_poll_unknown_evidence_case("CQ_MMIO_NOT_APPLICABLE", 1'b1);
   endtask
 
+  // 功能：check_event_db_model_factory_fault 对 CEQ/AEQ consumer doorbell model 的
+  //   一次 null/错误类型 raw factory 结果执行公开 poll 原子性断言。
+  // 输入/输出及副作用：label/fixture/ordering/queue_h/kind/wrapper/name/wrong_type
+  //   为输入；短暂 arm wrapper，按 kind 调用 poll_ceqe/poll_aeqe 并查询 occupancy。
+  // 失败/边界：只接受 CEQ/AEQ；未命中 factory、非 RESOURCE_EXHAUSTED、发布结果、
+  //   trace/PCIe 增长、used/pending 改变时报告 UVM_ERROR，并始终 disarm wrapper。
+  task automatic check_event_db_model_factory_fault(
+    string label,
+    rdma_queue_data_engine_fixture fixture,
+    rdma_queue_data_engine_ordering_fault ordering,
+    rdma_handle queue_h,
+    rdma_queue_runtime_kind_e kind,
+    rdma_queue_poll_factory_fault_wrapper wrapper,
+    string target_name,
+    bit wrong_type
+  );
+    rdma_queue_event_result event_result;
+    rdma_status status;
+    int unsigned occupancy;
+    int unsigned pcie_before;
+    bit has_pending;
+    bit fired;
+
+    if (fixture == null || ordering == null || queue_h == null ||
+        wrapper == null || !(kind inside {RDMA_QUEUE_RUNTIME_CEQ,
+                                         RDMA_QUEUE_RUNTIME_AEQ})) begin
+      `uvm_error(label, "event model fault fixture is incomplete")
+      return;
+    end
+    ordering.trace.delete();
+    ordering.doorbell_calls = 0;
+    ordering.commit_calls = 0;
+    ordering.release_calls = 0;
+    pcie_before = count_pcie_calls(fixture.pcie, "mmio_write");
+    wrapper.arm(target_name, wrong_type);
+    event_result = null;
+    if (kind == RDMA_QUEUE_RUNTIME_CEQ)
+      fixture.engine.poll_ceqe(queue_h, 0, event_result, status);
+    else
+      fixture.engine.poll_aeqe(queue_h, 0, event_result, status);
+    fired = wrapper.fired();
+    wrapper.disarm();
+    if (!fired || status == null ||
+        status.code != RDMA_SC_RESOURCE_EXHAUSTED || event_result != null)
+      `uvm_error(label, status == null ?
+                 "event model fault returned null" : status.convert2string())
+    if (ordering.trace.size() != 0 || ordering.doorbell_calls != 0 ||
+        ordering.commit_calls != 0 || ordering.release_calls != 0 ||
+        count_pcie_calls(fixture.pcie, "mmio_write") != pcie_before)
+      `uvm_error({label, "_NO_SUBMIT"},
+                 "event model fault crossed scheduler/local stages")
+    occupancy = 0;
+    has_pending = 1'b0;
+    status = fixture.engine.query_runtime_occupancy(
+      queue_h, kind, occupancy, has_pending);
+    if (status == null || !status.ok() || occupancy != 1 || has_pending)
+      `uvm_error({label, "_STATE"},
+                 "event model fault changed used or installed pending")
+  endtask
+
   // 功能：检查 ordering seam 在 event doorbell 入口观察到的 prepared pending
   //   是否已冻结完整 queue/cursor/image/status/route evidence，且没有 CQ release 阶段。
   // 输入/输出及副作用：label/ordering/queue_h/kind 为输入；只读测试子类保存的
@@ -5278,9 +6056,10 @@ class rdma_queue_data_engine_device_publish_test extends uvm_test;
   // 功能：验证 CEQ/AEQ 都在 scheduler 前完成 event result 与 pending admission，
   //   成功顺序严格为 doorbell→consumer commit，且从不触碰 CQ WQE release seam。
   // 输入/输出及副作用：无显式输入；建立 lifecycle event topology，各发布一条
-  //   CEQE/AEQE，先注入 prepared result null/wrong-type，再正常 poll 并统一清理。
-  // 失败/边界：result factory 故障必须保持 event 可见且无 pending/seam；正常路径
-  //   必须在 doorbell 入口观察完整 pending，release_calls 始终为 0。
+  //   CEQE/AEQE，先注入 doorbell model 与 prepared result null/wrong-type，再正常
+  //   poll 并统一清理。
+  // 失败/边界：model/result factory 故障必须保持 event 可见且无 pending/seam；
+  //   正常路径必须在 doorbell 入口观察完整 pending，release_calls 始终为 0。
   task automatic check_event_poll_prepared_admission();
     rdma_queue_data_engine_fixture fixture;
     rdma_queue_data_engine_ordering_fault ordering;
@@ -5352,6 +6131,14 @@ class rdma_queue_data_engine_device_publish_test extends uvm_test;
       if (status == null || !status.ok() || published == null) begin
         `uvm_error("CEQ_PREPARED_PUBLISH", "CEQE publish failed")
       end else begin
+        check_event_db_model_factory_fault(
+          "CEQ_DB_MODEL_NULL", fixture, ordering, lifecycle_ceq.handle,
+          RDMA_QUEUE_RUNTIME_CEQ, poll_ceq_db_model_fault,
+          "ceq_ci_db_model", 1'b0);
+        check_event_db_model_factory_fault(
+          "CEQ_DB_MODEL_WRONG", fixture, ordering, lifecycle_ceq.handle,
+          RDMA_QUEUE_RUNTIME_CEQ, poll_ceq_db_model_fault,
+          "ceq_ci_db_model", 1'b1);
         ordering.trace.delete();
         ordering.doorbell_calls = 0;
         ordering.commit_calls = 0;
@@ -5413,6 +6200,14 @@ class rdma_queue_data_engine_device_publish_test extends uvm_test;
         if (status == null || !status.ok() || published == null) begin
           `uvm_error("AEQ_PREPARED_PUBLISH", "AEQE publish failed")
         end else begin
+          check_event_db_model_factory_fault(
+            "AEQ_DB_MODEL_NULL", fixture, ordering, lifecycle_aeq.handle,
+            RDMA_QUEUE_RUNTIME_AEQ, poll_aeq_db_model_fault,
+            "aeq_ci_db_model", 1'b0);
+          check_event_db_model_factory_fault(
+            "AEQ_DB_MODEL_WRONG", fixture, ordering, lifecycle_aeq.handle,
+            RDMA_QUEUE_RUNTIME_AEQ, poll_aeq_db_model_fault,
+            "aeq_ci_db_model", 1'b1);
           ordering.trace.delete();
           ordering.doorbell_calls = 0;
           ordering.commit_calls = 0;
@@ -5650,6 +6445,10 @@ class rdma_queue_data_engine_device_publish_test extends uvm_test;
     reset_device_publish_factory_state();
     check_snapshot_release_range_factory_atomicity();
     reset_device_publish_factory_state();
+    check_cq_poll_post_scheduler_allocation_guard();
+    reset_device_publish_factory_state();
+    check_cq_consumer_codec_preparation_failures();
+    reset_device_publish_factory_state();
     check_cq_poll_prepared_factory_failures();
     reset_device_publish_factory_state();
     check_cq_poll_commit_before_release_order();
@@ -5657,6 +6456,8 @@ class rdma_queue_data_engine_device_publish_test extends uvm_test;
     check_cq_poll_commit_failure_is_recoverable();
     reset_device_publish_factory_state();
     check_cq_poll_release_failure_is_idempotent();
+    reset_device_publish_factory_state();
+    check_cq_poll_release_gate_blocks_wq_mutation();
     reset_device_publish_factory_state();
     check_cq_poll_no_submit_requires_confirmation();
     reset_device_publish_factory_state();

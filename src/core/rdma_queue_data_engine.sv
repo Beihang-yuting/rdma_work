@@ -319,12 +319,12 @@ class rdma_queue_data_engine extends uvm_object;
     return factory.create_object_by_type(requested_type, "", name);
   endfunction
 
-  // 功能：make_engine_status_nonfatal 构造不会被错误 factory override 变成 null 的
-  //   engine 状态，供 CQ poll admission 前失败与 post-doorbell null 归一化使用。
+  // 功能：make_engine_status_nonfatal 经 raw factory 构造可显式检查类型的 engine
+  //   状态，供 consumer admission 前的本地准备和其它非致命边界使用。
   // 输入/输出及副作用：code/message 为输入；返回独立 status，不改变 transaction
   //   evidence、cursor、backing 或 scheduler history。
-  // 失败/边界：raw factory 返回 null/错误类型时直接构造 fallback；错误 code 不会
-  //   被伪装为 OK，fallback 仅填充本地诊断字段。
+  // 失败/边界：raw factory 返回 null/错误类型时返回 null，禁止用隐藏 new 或共享
+  //   singleton 绕过故障；scheduler 后必须改用 caller 预建 status slot。
   protected function rdma_status make_engine_status_nonfatal(
     rdma_status_code_e code,
     string message = ""
@@ -334,8 +334,7 @@ class rdma_queue_data_engine extends uvm_object;
 
     raw_result = factory_create_object_nonfatal(
       rdma_status::get_type(), "queue_data_engine_status");
-    if (raw_result == null || !$cast(result, raw_result))
-      result = new("queue_data_engine_status_fallback");
+    if (raw_result == null || !$cast(result, raw_result)) return null;
     result.category = rdma_status::category_for(code);
     result.code = code;
     result.hardware_code = '0;
@@ -377,6 +376,35 @@ class rdma_queue_data_engine extends uvm_object;
     destination.severity = source.severity;
     destination.retryable = source.retryable;
     destination.message = source.message;
+    return 1'b1;
+  endfunction
+
+  // 功能：set_engine_status_noalloc 将 code/message 写入 caller 预建的 status slot，
+  //   供 consumer scheduler/continuation barrier 后归一化 null 或不完整返回。
+  // 输入/输出及副作用：destination、code、message 为输入；成功覆盖完整诊断字段，
+  //   返回 1，不创建对象、不调用 codec，也不修改 runtime/pending/ledger。
+  // 失败/边界：destination=null 时返回 0 且无副作用；该 helper 不推断 MMIO
+  //   evidence，调用方仍必须把 backend enum 交给 runtime 单调校验。
+  protected function bit set_engine_status_noalloc(
+    rdma_status destination,
+    rdma_status_code_e code,
+    string message = ""
+  );
+    if (destination == null) return 1'b0;
+    destination.category = rdma_status::category_for(code);
+    destination.code = code;
+    destination.hardware_code = '0;
+    destination.hardware_code_valid = 1'b0;
+    destination.source_engine = RDMA_ENGINE_NONE;
+    destination.function_uid = '0;
+    destination.generation = '0;
+    destination.resource_id = '0;
+    destination.command_id = '0;
+    destination.wr_id = '0;
+    destination.severity = code == RDMA_SC_OK ? RDMA_SEVERITY_INFO :
+                                                RDMA_SEVERITY_ERROR;
+    destination.retryable = 1'b0;
+    destination.message = message;
     return 1'b1;
   endfunction
 
@@ -509,7 +537,7 @@ class rdma_queue_data_engine extends uvm_object;
   // 功能：prepare_consumer_pending 在 consumer scheduler 前构造可由 runtime 直接
   //   接管的完整 detached evidence，冻结 queue/cursor/image/route/epoch 与 CQ target。
   // 输入/输出及副作用：attachment、cursor、next、entry image/offset、completion
-  //   target、routed_qp_h 为输入，pending 先置 null；只分配本地值并只读 runtime authority。
+  //   target、completion_wq_kind、routed_qp_h 为输入，pending 先置 null；只分配本地值并只读 runtime authority。
   // 失败/边界：identity、geometry、route/epoch 或任一 pending/nested raw allocation
   //   不完整时返回非成功；不 admission、不调用 scheduler，也不修改 backing/CI/ledger。
   protected function rdma_status prepare_consumer_pending(
@@ -521,6 +549,7 @@ class rdma_queue_data_engine extends uvm_object;
     int unsigned completion_index,
     bit completion_wrap,
     bit completion_target_valid,
+    rdma_queue_runtime_kind_e completion_wq_kind,
     rdma_handle routed_qp_h,
     output rdma_queue_pending_operation pending
   );
@@ -548,6 +577,14 @@ class rdma_queue_data_engine extends uvm_object;
         entry_offset != longint'(cursor.index) * attachment.entry_size)
       return make_engine_status_nonfatal(
         RDMA_SC_INVALID_ARGUMENT, "consumer pending input is incomplete");
+    if (completion_target_valid &&
+        (!(completion_wq_kind inside {RDMA_QUEUE_RUNTIME_SQ,
+                                      RDMA_QUEUE_RUNTIME_RQ,
+                                      RDMA_QUEUE_RUNTIME_SRQ}) ||
+         routed_qp_h == null || routed_qp_h.kind != RDMA_RESOURCE_QP))
+      return make_engine_status_nonfatal(
+        RDMA_SC_INVALID_ARGUMENT,
+        "CQ completion target route or WQ kind is invalid");
 
     raw_candidate = factory_create_object_nonfatal(
       rdma_queue_pending_operation::get_type(), "prepared_consumer_pending");
@@ -609,6 +646,7 @@ class rdma_queue_data_engine extends uvm_object;
     candidate.completion_index = completion_index;
     candidate.completion_wrap = completion_wrap;
     candidate.completion_target_valid = completion_target_valid;
+    candidate.completion_wq_kind = completion_wq_kind;
     candidate.routed_qp_h = routed_qp_copy;
     candidate.mmio_maybe_submitted = 1'b0;
     candidate.known_no_mmio = 1'b0;
@@ -1402,7 +1440,8 @@ class rdma_queue_data_engine extends uvm_object;
   // 功能：clone_unclaimed_device_pending 为 engine-owned 的 device recovery
   //   evidence 创建完整 detached 查询快照，避免 query API 泄露可写内部对象。
   // 输入/输出及副作用：source 为输入、copy 为输出；函数只分配和复制 handle、
-  //   cursor、image、status 与设备发布阶段字段，不修改 unclaimed 表或 runtime。
+  //   cursor、image、status、completion target/kind 与设备发布阶段字段，
+  //   不修改 unclaimed 表或 runtime，routed QP 也不借用 source 引用。
   // 失败边界：source 不是完整 device pending、任一对象分配或复制失败时返回非空
   //   status 且 copy=null；调用方必须保留原 evidence，不能因查询失败删除表项。
   protected function rdma_status clone_unclaimed_device_pending(
@@ -1491,6 +1530,7 @@ class rdma_queue_data_engine extends uvm_object;
     candidate.completion_index = source.completion_index;
     candidate.completion_wrap = source.completion_wrap;
     candidate.completion_target_valid = source.completion_target_valid;
+    candidate.completion_wq_kind = source.completion_wq_kind;
     candidate.mmio_maybe_submitted = source.mmio_maybe_submitted;
     candidate.known_no_mmio = source.known_no_mmio;
     candidate.mmio_evidence = source.mmio_evidence;
@@ -2724,10 +2764,9 @@ class rdma_queue_data_engine extends uvm_object;
       return bad("CQ resize has no pending recovery", RDMA_SC_INVALID_STATE);
     end
     recovery = cq_resize_recoveries[key];
-    // Recovery is allowed to finish an old-generation transaction after a
-    // Function reset changed binding.generation.  The caller still has to
-    // present the recorded identity and either the old or current generation;
-    // this cleanup exception is not permission to operate on a stale CQ normally.
+    // 设计说明：Function reset 改变 binding.generation 后，recovery 仍允许完成
+    // 已记录的旧代际事务；caller 必须提供记录中的 identity，并携带旧代际或当前代际。
+    // 该例外只授权清理遗留事务，不能据此对 stale CQ 执行普通数据面操作。
     if (!same_cq_recovery_identity(recovery.cq_h, cq_h) ||
         (cq_h.generation != recovery.cq_h.generation &&
          (binding == null || cq_h.generation != binding.generation))) begin
@@ -2775,10 +2814,9 @@ class rdma_queue_data_engine extends uvm_object;
       resize_lock.put(1);
       return status;
     end
-    // Any retained backing is released only after checking its opaque
-    // allocation identity and immutable Function/CQ route evidence.  The
-    // check deliberately runs on retry, because recovery records are mutable
-    // storage owned by the engine and may survive a reset boundary.
+    // 设计说明：释放 retained backing 前必须重验 opaque allocation identity 以及
+    // 不可变的 Function/CQ route evidence。检查刻意放在每次 retry 中执行，因为
+    // recovery record 是 engine 拥有的可变存储，并可能跨越 reset 边界继续存活。
     if ((!recovery.published && recovery.pending_ref != null &&
          !recovery_backing_matches(recovery.pending_ref, recovery)) ||
         (recovery.published &&
@@ -4050,9 +4088,9 @@ class rdma_queue_data_engine extends uvm_object;
       candidate = qp_links[key];
       if (candidate == null || candidate.local_qp_id != qpn)
         continue;
-      // A CQ can be shared by a QP's send and receive paths, and a QP may
-      // use distinct CQs for each path.  Route using the CQE's receive bit;
-      // accepting the opposite handle would release the wrong WQE ledger.
+      // 设计说明：同一 CQ 可以由 QP 的 send/receive 路径共享，同一 QP 也可为两条
+      // 路径配置不同 CQ；因此必须按 CQE 的 receive bit 选择 route。接受相反方向的
+      // CQ handle 会释放错误的 WQE ledger，不能仅凭 QPN 命中。
       if ((!rq_cqe && candidate.send_cq_h != null &&
            candidate.send_cq_h.same_instance(cq_h)) ||
           (rq_cqe && candidate.recv_cq_h != null &&
@@ -4200,19 +4238,18 @@ class rdma_queue_data_engine extends uvm_object;
                                      completion_status);
   endfunction
 
-  // 功能：submit_consumer_doorbell 在完成 model/codec/descriptor 本地物化后提交
-  //   CQ/CEQ/AEQ consumer doorbell，并用唯一 enum 区分未提交、成功与不确定结果。
-  // 输入/输出及副作用：attachment、next、routed_link 为输入；result/status/evidence
-  //   为输出；只有进入 doorbells.submit 才可能产生 PCIe/MMIO 副作用。
-  // 失败/边界：本地预检失败保持 NO_SUBMIT；进入 scheduler 前立即改为 AMBIGUOUS；
-  //   仅非空成功 status/result 才改为 SUCCESS，null/失败 backend 不推断为未提交。
-  protected virtual task submit_consumer_doorbell(
+  // 功能：prepare_consumer_doorbell 在 recovery admission 前完成 CQ/CEQ/AEQ
+  //   doorbell model、codec image、descriptor 与 post-scheduler status slot 物化。
+  // 输入/输出及副作用：attachment/next/routed_link 为输入，prepared_desc 与
+  //   noalloc_status 为输出；只读 frozen route/WQ cursor，不调用 scheduler 或改 ledger。
+  // 失败/边界：依赖/null/wrong-type model/handle/descriptor、registry/null status/null
+  //   codec、encode error/null image 均返回非成功，输出不发布且 MMIO evidence 未建立。
+  protected function rdma_status prepare_consumer_doorbell(
     rdma_queue_data_attachment attachment,
     rdma_queue_cursor_snapshot next,
-    output rdma_doorbell_result result,
-    output rdma_status status,
-    output rdma_queue_mmio_evidence_e evidence,
-    rdma_queue_data_qp_link routed_link
+    rdma_queue_data_qp_link routed_link,
+    output rdma_doorbell_desc prepared_desc,
+    output rdma_status noalloc_status
   );
     rdma_hw_cq_doorbell_model cq;
     rdma_hw_ceq_doorbell_model ceq;
@@ -4227,24 +4264,47 @@ class rdma_queue_data_engine extends uvm_object;
     rdma_queue_cursor_snapshot sq_cursor;
     rdma_queue_cursor_snapshot rq_cursor;
     rdma_status cursor_status;
+    rdma_status status;
+    rdma_function_handle function_h;
+    rdma_handle model_target_h;
+    rdma_handle descriptor_target_h;
+    rdma_doorbell_desc desc_candidate;
+    uvm_object raw_model;
+    uvm_object raw_desc;
+    uvm_object raw_function_h;
+    uvm_object raw_status;
     string variant;
     longint unsigned relative_offset;
 
-    result = null;
-    status = null;
-    evidence = RDMA_QUEUE_MMIO_NO_SUBMIT;
-    if (attachment == null || next == null) begin
-      status = bad("consumer doorbell attachment/cursor is null");
-      return;
-    end
+    prepared_desc = null;
+    noalloc_status = null;
+    if (attachment == null || attachment.queue_h == null ||
+        attachment.runtime == null || next == null || binding == null ||
+        registry == null || doorbells == null)
+      return make_engine_status_nonfatal(
+        RDMA_SC_INVALID_ARGUMENT,
+        "consumer doorbell preparation input is incomplete");
+
+    status = clone_poll_handle_nonfatal(
+      attachment.queue_h, "consumer doorbell model", model_target_h);
+    if (status == null || !status.ok() || model_target_h == null)
+      return status == null || status.ok() ? make_engine_status_nonfatal(
+        RDMA_SC_RESOURCE_EXHAUSTED,
+        "consumer doorbell model target allocation failed") : status;
+    model_target_h.object_id = attachment.local_id;
+
     case (attachment.kind)
       RDMA_QUEUE_RUNTIME_CQ: begin
         variant = (attachment.transport == RDMA_TRANSPORT_URC) ?
                   "cq_urc" : "cq_rc_ud";
         relative_offset = RDMA_DB_CQ_OFFSET;
-        cq = rdma_hw_cq_doorbell_model::type_id::create("cq_ci_db_model");
-        cq.target_h = projected_id_handle(attachment.queue_h,
-                                          attachment.local_id);
+        raw_model = factory_create_object_nonfatal(
+          rdma_hw_cq_doorbell_model::get_type(), "cq_ci_db_model");
+        if (raw_model == null || !$cast(cq, raw_model))
+          return make_engine_status_nonfatal(
+            RDMA_SC_RESOURCE_EXHAUSTED,
+            "CQ consumer doorbell model allocation failed");
+        cq.target_h = model_target_h;
         cq.variant = (variant == "cq_urc") ? RDMA_CQ_DB_URC :
                                                RDMA_CQ_DB_RC_UD;
         cq.cqn = attachment.local_id;
@@ -4254,23 +4314,27 @@ class rdma_queue_data_engine extends uvm_object;
         cq.arm_sn = 0;
         cq.ci = next.index;
         cq.wrap = next.wrap;
-        // URC CQ notifications carry the WQ consumer cursors, not the CQ CI.
-        // The CQE route identifies the QP whose completion is being consumed;
-        // use that link explicitly so a shared CQ never aliases its own CI
-        // into SQ/RQ fields.
+        // 设计说明：URC CQ notification 携带的是 WQ consumer cursor，而不是 CQ CI。
+        // CQE route 标识被消费 completion 所属的 QP，故必须显式使用该 link，避免
+        // shared CQ 把自身 CI 错填到 SQ/RQ 字段。
         if (attachment.transport == RDMA_TRANSPORT_URC) begin
           if (routed_link == null)
-            begin
-              status = bad("URC CQ consumer doorbell has no QP route",
-                           RDMA_SC_INVALID_STATE);
-              return;
-            end
+            return make_engine_status_nonfatal(
+              RDMA_SC_INVALID_STATE,
+              "URC CQ consumer doorbell has no QP route");
           cursor_status = lookup_attachment(routed_link.qp_h,
                                              RDMA_QUEUE_RUNTIME_SQ,
                                              sq_attachment);
-          if (!cursor_status.ok()) begin status = cursor_status; return; end
+          if (cursor_status == null || !cursor_status.ok())
+            return cursor_status == null ? make_engine_status_nonfatal(
+              RDMA_SC_INVALID_STATE,
+              "URC SQ attachment lookup returned null status") : cursor_status;
           cursor_status = sq_attachment.runtime.peek_consumer(sq_cursor);
-          if (!cursor_status.ok()) begin status = cursor_status; return; end
+          if (cursor_status == null || !cursor_status.ok() || sq_cursor == null)
+            return cursor_status == null || cursor_status.ok() ?
+              make_engine_status_nonfatal(
+                RDMA_SC_INVALID_STATE,
+                "URC SQ consumer cursor is unavailable") : cursor_status;
           if (routed_link.srq_h != null)
             cursor_status = lookup_attachment(routed_link.srq_h,
                                                RDMA_QUEUE_RUNTIME_SRQ,
@@ -4279,9 +4343,16 @@ class rdma_queue_data_engine extends uvm_object;
             cursor_status = lookup_attachment(routed_link.qp_h,
                                                RDMA_QUEUE_RUNTIME_RQ,
                                                rq_attachment);
-          if (!cursor_status.ok()) begin status = cursor_status; return; end
+          if (cursor_status == null || !cursor_status.ok())
+            return cursor_status == null ? make_engine_status_nonfatal(
+              RDMA_SC_INVALID_STATE,
+              "URC RQ attachment lookup returned null status") : cursor_status;
           cursor_status = rq_attachment.runtime.peek_consumer(rq_cursor);
-          if (!cursor_status.ok()) begin status = cursor_status; return; end
+          if (cursor_status == null || !cursor_status.ok() || rq_cursor == null)
+            return cursor_status == null || cursor_status.ok() ?
+              make_engine_status_nonfatal(
+                RDMA_SC_INVALID_STATE,
+                "URC RQ consumer cursor is unavailable") : cursor_status;
           cq.sq_ci = sq_cursor.index;
           cq.sq_wrap = sq_cursor.wrap;
           cq.rq_ci = rq_cursor.index;
@@ -4298,9 +4369,13 @@ class rdma_queue_data_engine extends uvm_object;
       RDMA_QUEUE_RUNTIME_CEQ: begin
         variant = "ceq";
         relative_offset = RDMA_DB_CEQ_OFFSET;
-        ceq = rdma_hw_ceq_doorbell_model::type_id::create("ceq_ci_db_model");
-        ceq.target_h = projected_id_handle(attachment.queue_h,
-                                           attachment.local_id);
+        raw_model = factory_create_object_nonfatal(
+          rdma_hw_ceq_doorbell_model::get_type(), "ceq_ci_db_model");
+        if (raw_model == null || !$cast(ceq, raw_model))
+          return make_engine_status_nonfatal(
+            RDMA_SC_RESOURCE_EXHAUSTED,
+            "CEQ consumer doorbell model allocation failed");
+        ceq.target_h = model_target_h;
         ceq.ceqn = attachment.local_id;
         ceq.ci = next.index;
         ceq.wrap = next.wrap;
@@ -4309,83 +4384,227 @@ class rdma_queue_data_engine extends uvm_object;
       RDMA_QUEUE_RUNTIME_AEQ: begin
         variant = "aeq";
         relative_offset = RDMA_DB_AEQ_OFFSET;
-        aeq = rdma_hw_aeq_doorbell_model::type_id::create("aeq_ci_db_model");
-        aeq.target_h = projected_id_handle(attachment.queue_h,
-                                           attachment.local_id);
+        raw_model = factory_create_object_nonfatal(
+          rdma_hw_aeq_doorbell_model::get_type(), "aeq_ci_db_model");
+        if (raw_model == null || !$cast(aeq, raw_model))
+          return make_engine_status_nonfatal(
+            RDMA_SC_RESOURCE_EXHAUSTED,
+            "AEQ consumer doorbell model allocation failed");
+        aeq.target_h = model_target_h;
         aeq.aeqn = attachment.local_id;
         aeq.ci = next.index;
         aeq.wrap = next.wrap;
         model = aeq;
       end
-      default: begin
-        status = bad("consumer doorbell runtime kind is invalid");
-        return;
-      end
+      default:
+        return make_engine_status_nonfatal(
+          RDMA_SC_INVALID_ARGUMENT,
+          "consumer doorbell runtime kind is invalid");
     endcase
     codec_key = '{hw_version:"rdma", image_kind:RDMA_IMAGE_DOORBELL,
       object_type:"doorbell", variant:variant, opcode:8'h00};
     status = registry.lookup(codec_key, codec);
-    if (!status.ok()) return;
+    if (status == null)
+      return make_engine_status_nonfatal(
+        RDMA_SC_INVALID_STATE,
+        "consumer doorbell registry returned null status");
+    if (!status.ok()) return status;
+    if (codec == null)
+      return make_engine_status_nonfatal(
+        RDMA_SC_RESOURCE_EXHAUSTED,
+        "consumer doorbell registry returned null codec");
     status = codec.encode(model, image);
-    if (!status.ok()) return;
-    desc = rdma_doorbell_desc::type_id::create("consumer_db_desc");
-    desc.kind = (attachment.kind == RDMA_QUEUE_RUNTIME_CQ) ? RDMA_DOORBELL_CQ :
-                (attachment.kind == RDMA_QUEUE_RUNTIME_CEQ) ? RDMA_DOORBELL_CEQ :
-                                                              RDMA_DOORBELL_AEQ;
-    desc.function_h = binding.make_handle();
-    desc.target_h = rdma_clone_handle_value(attachment.queue_h,
-                                             "consumer DB target");
-    desc.notify_bar_id = binding.notify_bar_id;
-    desc.relative_offset = relative_offset;
-    desc.width = RDMA_DB_BYTES;
-    desc.endian = RDMA_ENDIAN_BIG;
-    desc.payload_image = image;
-    desc.barrier_policy = RDMA_DB_BARRIER_MMIO;
-    desc.write_combining_policy = RDMA_DB_WRITE_NON_COMBINING;
-    desc.allow_merge = 1'b0;
-    desc.merge_requested = 1'b0;
-    desc.timeout = operation_timeout;
-    desc.readback_policy = RDMA_DB_READBACK_NONE;
-    // Once submit() is entered, the scheduler may have passed its preflight
-    // and issued (or partially issued) the MMIO write before reporting an
-    // error.  Preserve that ambiguity for recovery; failures above this
-    // point are known-no-MMIO and may be retried after explicit confirmation.
+    if (status == null)
+      return make_engine_status_nonfatal(
+        RDMA_SC_INVALID_STATE,
+        "consumer doorbell codec returned null status");
+    if (!status.ok()) return status;
+    if (image == null || image.length == 0 ||
+        image.bytes.size() != image.length)
+      return make_engine_status_nonfatal(
+        RDMA_SC_CODEC_ERROR,
+        "consumer doorbell codec returned an invalid image");
+
+    raw_desc = factory_create_object_nonfatal(
+      rdma_doorbell_desc::get_type(), "consumer_db_desc");
+    if (raw_desc == null || !$cast(desc_candidate, raw_desc))
+      return make_engine_status_nonfatal(
+        RDMA_SC_RESOURCE_EXHAUSTED,
+        "consumer doorbell descriptor allocation failed");
+    raw_function_h = factory_create_object_nonfatal(
+      rdma_function_handle::get_type(), "consumer_db_function_handle");
+    if (raw_function_h == null || !$cast(function_h, raw_function_h))
+      return make_engine_status_nonfatal(
+        RDMA_SC_RESOURCE_EXHAUSTED,
+        "consumer doorbell Function handle allocation failed");
+    function_h.kind = RDMA_RESOURCE_FUNCTION;
+    function_h.function_uid = binding.function_uid;
+    function_h.object_id = binding.global_function_id;
+    function_h.generation = binding.generation;
+    if (!binding.accepts(function_h))
+      return make_engine_status_nonfatal(
+        RDMA_SC_STALE_GENERATION,
+        "consumer doorbell Function authority is stale");
+    status = clone_poll_handle_nonfatal(
+      attachment.queue_h, "consumer doorbell descriptor",
+      descriptor_target_h);
+    if (status == null || !status.ok() || descriptor_target_h == null)
+      return status == null || status.ok() ? make_engine_status_nonfatal(
+        RDMA_SC_RESOURCE_EXHAUSTED,
+        "consumer doorbell descriptor target allocation failed") : status;
+
+    desc_candidate.kind =
+      (attachment.kind == RDMA_QUEUE_RUNTIME_CQ) ? RDMA_DOORBELL_CQ :
+      (attachment.kind == RDMA_QUEUE_RUNTIME_CEQ) ? RDMA_DOORBELL_CEQ :
+                                                    RDMA_DOORBELL_AEQ;
+    desc_candidate.function_h = function_h;
+    desc_candidate.target_h = descriptor_target_h;
+    desc_candidate.notify_bar_id = binding.notify_bar_id;
+    desc_candidate.relative_offset = relative_offset;
+    desc_candidate.width = RDMA_DB_BYTES;
+    desc_candidate.endian = RDMA_ENDIAN_BIG;
+    desc_candidate.payload_image = image;
+    desc_candidate.barrier_policy = RDMA_DB_BARRIER_MMIO;
+    desc_candidate.write_combining_policy = RDMA_DB_WRITE_NON_COMBINING;
+    desc_candidate.allow_merge = 1'b0;
+    desc_candidate.merge_requested = 1'b0;
+    desc_candidate.timeout = operation_timeout;
+    desc_candidate.readback_policy = RDMA_DB_READBACK_NONE;
+
+    raw_status = factory_create_object_nonfatal(
+      rdma_status::get_type(), "consumer_noalloc_status");
+    if (raw_status == null || !$cast(noalloc_status, raw_status)) begin
+      noalloc_status = null;
+      return make_engine_status_nonfatal(
+        RDMA_SC_RESOURCE_EXHAUSTED,
+        "consumer no-allocation status slot allocation failed");
+    end
+    void'(set_engine_status_noalloc(noalloc_status, RDMA_SC_OK, ""));
+    prepared_desc = desc_candidate;
+    return noalloc_status;
+  endfunction
+
+  // 功能：submit_consumer_doorbell 通过既有 virtual seam 提交 admission 前预建的
+  //   descriptor；legacy caller 未提供时仍先在 scheduler 外完成同一准备。
+  // 输入/输出及副作用：attachment/next/routed_link 与可选 prepared_desc/
+  //   prepared_status 为输入，result/status/evidence 为输出；仅 submit 可能产生 MMIO。
+  // 失败/边界：准备失败保持 NO_SUBMIT；submit 前一刻置 AMBIGUOUS；scheduler 的
+  //   null/incomplete success 使用预建 slot 归一化，barrier 后不 factory/new/codec。
+  protected virtual task submit_consumer_doorbell(
+    rdma_queue_data_attachment attachment,
+    rdma_queue_cursor_snapshot next,
+    output rdma_doorbell_result result,
+    output rdma_status status,
+    output rdma_queue_mmio_evidence_e evidence,
+    input rdma_queue_data_qp_link routed_link,
+    input rdma_doorbell_desc prepared_desc = null,
+    input rdma_status prepared_status = null
+  );
+    rdma_doorbell_desc desc;
+
+    result = null;
+    status = null;
+    evidence = RDMA_QUEUE_MMIO_NO_SUBMIT;
+    desc = prepared_desc;
+    if (desc == null) begin
+      status = prepare_consumer_doorbell(
+        attachment, next, routed_link, desc, prepared_status);
+      if (status == null || !status.ok() || desc == null ||
+          prepared_status == null)
+        return;
+    end
+    if (prepared_status == null || doorbells == null) return;
+
+    // 中文设计：只有所有 caller-local preparation 已成功才跨 scheduler barrier；
+    // 从 AMBIGUOUS 发布到 task 返回期间只读取既有对象并写标量 evidence/status。
     evidence = RDMA_QUEUE_MMIO_AMBIGUOUS;
     doorbells.submit(binding, desc, result, status);
     if (status != null && status.ok() && result != null)
       evidence = RDMA_QUEUE_MMIO_SUCCESS;
-    else if (status == null)
-      status = bad("consumer doorbell scheduler returned null status",
-                   RDMA_SC_INVALID_STATE);
-    else if (status.ok() && result == null)
-      status = bad("consumer doorbell scheduler returned null result",
-                   RDMA_SC_INVALID_STATE);
+    else if (status == null) begin
+      void'(set_engine_status_noalloc(
+        prepared_status, RDMA_SC_INVALID_STATE,
+        "consumer doorbell scheduler returned null status"));
+      status = prepared_status;
+    end
+    else if (status.ok() && result == null) begin
+      void'(set_engine_status_noalloc(
+        prepared_status, RDMA_SC_INVALID_STATE,
+        "consumer doorbell scheduler returned null result"));
+      status = prepared_status;
+    end
   endtask
 
   // 功能：commit_cq_consumer 为 CQ/CEQ/AEQ poll/recovery 提供唯一可覆写 CI
-  //   commit seam；名称保留 CQ 兼容契约，默认只委托 attachment runtime 的原子提交。
-  // 输入/输出及副作用：cq_attachment/cursor 为输入；成功时 runtime 推进对应
-  //   device ring CI 并递减 committed occupancy，返回 runtime 原始状态。
-  // 失败/边界：默认实现不补偿、不重试也不改写 null/error status；调用方负责把
-  //   失败记录进已 admission 的 pending，测试子类只允许一次性注入本地错误。
+  //   commit seam；名称保留 CQ 兼容契约，可选 slot 选择零分配 recovery 原子提交。
+  // 输入/输出及副作用：cq_attachment/cursor 与可选 prepared_status 为输入；有 slot
+  //   时按 frozen cursor 推进 CI/used 并同步 pending marker，否则保持 legacy 委托。
+  // 失败/边界：null 输入或 stale recovery 由 caller-owned slot 返回错误且零 mutation；
+  //   未传 slot 的旧调用仍返回 runtime.commit_consumer 的独立状态。
   protected virtual function rdma_status commit_cq_consumer(
     rdma_queue_data_attachment cq_attachment,
-    rdma_queue_cursor_snapshot cursor
+    rdma_queue_cursor_snapshot cursor,
+    rdma_status prepared_status = null
   );
+    if (prepared_status != null) begin
+      if (cq_attachment == null || cq_attachment.runtime == null ||
+          cursor == null) begin
+        void'(set_engine_status_noalloc(
+          prepared_status, RDMA_SC_INVALID_ARGUMENT,
+          "consumer commit input is incomplete"));
+        return prepared_status;
+      end
+      void'(cq_attachment.runtime.commit_consumer_recovery_noalloc(
+        cursor.index, cursor.wrap, prepared_status));
+      return prepared_status;
+    end
     return cq_attachment.runtime.commit_consumer(cursor);
   endfunction
 
   // 功能：release_cq_wqe 为 CQ poll/recovery 提供唯一可覆写 WQE release seam，
-  //   默认只委托 routed SQ/RQ/SRQ runtime 的原子 match_and_release。
-  // 输入/输出及副作用：wqe_attachment/cqe 为输入，released 为输出；成功时消费到
-  //   cqe.wqe_index/wqe_wrap 的连续 ledger range 并返回 runtime 原始条目引用。
-  // 失败/边界：默认实现不复制、不补偿也不重试；调用方不得在 scheduler 后检查
-  //   returned runtime-owned entries，测试子类只允许一次性注入 release 错误。
+  //   默认按可选 caller slot 选择 noalloc release，或保持 legacy match_and_release。
+  // 输入/输出及副作用：wqe_attachment/cqe、prepared_status 与仅供 cqe=null recovery
+  //   使用的 frozen target 标量为输入；released 先清空，成功推进 routed WQ CI/used。
+  // 失败/边界：noalloc 模式缺 attachment/target 时写入 slot 且零 mutation；有 cqe 时
+  //   禁止 frozen 标量覆盖其 target，未传 slot 的旧调用保持原返回/队列语义。
   protected virtual function rdma_status release_cq_wqe(
     rdma_queue_data_attachment wqe_attachment,
     rdma_hw_cqe_model cqe,
-    output rdma_queue_slot_ledger_entry released[$]
+    output rdma_queue_slot_ledger_entry released[$],
+    input rdma_status prepared_status = null,
+    input bit frozen_target_valid = 1'b0,
+    input int unsigned frozen_target_index = 0,
+    input bit frozen_target_wrap = 1'b0
   );
+    int unsigned target_index;
+    bit target_wrap;
+
+    released.delete();
+    if (prepared_status != null) begin
+      if (wqe_attachment == null || wqe_attachment.runtime == null) begin
+        void'(set_engine_status_noalloc(
+          prepared_status, RDMA_SC_INVALID_ARGUMENT,
+          "CQ WQE release attachment is incomplete"));
+        return prepared_status;
+      end
+      if (cqe != null) begin
+        target_index = cqe.wqe_index;
+        target_wrap = cqe.wqe_wrap;
+      end
+      else if (frozen_target_valid) begin
+        target_index = frozen_target_index;
+        target_wrap = frozen_target_wrap;
+      end
+      else begin
+        void'(set_engine_status_noalloc(
+          prepared_status, RDMA_SC_INVALID_ARGUMENT,
+          "CQ WQE release target is unavailable"));
+        return prepared_status;
+      end
+      void'(wqe_attachment.runtime.match_and_release_noalloc(
+        target_index, target_wrap, prepared_status));
+      return prepared_status;
+    end
     return wqe_attachment.runtime.match_and_release(
       cqe.wqe_index, cqe.wqe_wrap, released);
   endfunction
@@ -4416,11 +4635,14 @@ class rdma_queue_data_engine extends uvm_object;
     rdma_queue_pending_operation pending;
     rdma_handle result_qp_h;
     rdma_doorbell_result db_result;
+    rdma_doorbell_desc prepared_db_desc;
     rdma_queue_mmio_evidence_e db_mmio_evidence;
     rdma_status local_status;
+    rdma_status noalloc_status;
     rdma_status completion_status;
     rdma_status final_success;
     rdma_queue_completion_result result_candidate;
+    bit release_succeeded;
     byte data[];
     longint unsigned offset;
     string route_key;
@@ -4448,8 +4670,8 @@ class rdma_queue_data_engine extends uvm_object;
                      RDMA_SC_CODEC_ERROR);
         return;
       end
-      // The entry size belongs to this attachment/read, so pass it directly
-      // instead of mutating the shared registry codec's active profile.
+      // 设计说明：entry size 属于本次 attachment/read，必须显式传给 decode，不能
+      // 修改 registry 共享 codec 的 active profile 而污染其他并发 transaction。
       status = variable_cqe_codec.decode_with_entry_bytes(
         entry_image, cq_attachment.entry_size, decoded_model);
     end
@@ -4463,10 +4685,9 @@ class rdma_queue_data_engine extends uvm_object;
     end
     status = find_qp_link_for_cq(cq_h, cqe.qpn, cqe.rq_cqe, link);
     if (!status.ok()) return;
-    // Some simulators lose a class-handle output assigned from an associative
-    // array traversal across a function boundary.  Re-resolve directly at
-    // the transaction site as a defensive fallback; the same identity and
-    // send/receive-CQ predicate is retained.
+    // 设计说明：部分 simulator 会在 function 边界丢失由 associative array 遍历
+    // 赋给 output 的 class handle。这里在 transaction 现场按相同 identity 与
+    // send/receive-CQ predicate 防御性重查，不能放宽 route 条件。
     if (link == null) begin
       foreach (qp_links[route_key]) begin
         if (qp_links[route_key] == null ||
@@ -4485,9 +4706,8 @@ class rdma_queue_data_engine extends uvm_object;
       status = bad("CQE route has no QP link", RDMA_SC_INVALID_STATE);
       return;
     end
-    // Snapshot the route handle before the doorbell task.  This keeps result
-    // construction independent of any simulator-specific class-handle
-    // lifetime/argument aliasing across task calls.
+    // 设计说明：在 doorbell task 前冻结 route handle，使 result 构造不依赖
+    // simulator 对跨 task class-handle lifetime/argument aliasing 的差异行为。
     result_qp_h = link.qp_h;
     if (cqe.rq_cqe) begin
       if (link.srq_h != null)
@@ -4536,7 +4756,8 @@ class rdma_queue_data_engine extends uvm_object;
     end
     status = prepare_consumer_pending(
       cq_attachment, cursor, next, offset, entry_image,
-      cqe.wqe_index, cqe.wqe_wrap, 1'b1, result_qp_h, pending);
+      cqe.wqe_index, cqe.wqe_wrap, 1'b1, wqe_attachment.kind,
+      result_qp_h, pending);
     if (status == null || !status.ok() || pending == null) begin
       if (status == null || status.ok())
         status = make_engine_status_nonfatal(
@@ -4545,6 +4766,18 @@ class rdma_queue_data_engine extends uvm_object;
     end
     pending.wr_id = result_candidate.cqe.wr_id;
     pending.signaled = release_snapshots[release_snapshots.size()-1].signaled;
+    prepared_db_desc = null;
+    noalloc_status = null;
+    status = prepare_consumer_doorbell(
+      cq_attachment, next, link, prepared_db_desc, noalloc_status);
+    if (status == null || !status.ok() || prepared_db_desc == null ||
+        noalloc_status == null) begin
+      if (status == null || status.ok())
+        status = make_engine_status_nonfatal(
+          RDMA_SC_RESOURCE_EXHAUSTED,
+          "CQ consumer doorbell preparation is incomplete");
+      return;
+    end
     status = cq_attachment.runtime.enter_recovery_prepared(pending);
     if (status == null || !status.ok()) begin
       if (status == null)
@@ -4556,98 +4789,102 @@ class rdma_queue_data_engine extends uvm_object;
     db_result = null;
     db_mmio_evidence = RDMA_QUEUE_MMIO_NO_SUBMIT;
     submit_consumer_doorbell(cq_attachment, next, db_result, status,
-                             db_mmio_evidence, link);
-    if (status == null)
-      status = make_engine_status_nonfatal(
-        RDMA_SC_INVALID_STATE, "CQ consumer doorbell returned null status");
+                             db_mmio_evidence, link, prepared_db_desc,
+                             noalloc_status);
+    if (status == null) begin
+      void'(set_engine_status_noalloc(
+        noalloc_status, RDMA_SC_INVALID_STATE,
+        "CQ consumer doorbell returned null status"));
+      status = noalloc_status;
+    end
     else if (status.ok() &&
              (db_result == null ||
-              db_mmio_evidence != RDMA_QUEUE_MMIO_SUCCESS))
-      status = make_engine_status_nonfatal(
-        RDMA_SC_INVALID_STATE,
-        "CQ consumer doorbell returned incomplete success evidence");
+              db_mmio_evidence != RDMA_QUEUE_MMIO_SUCCESS)) begin
+      void'(set_engine_status_noalloc(
+        noalloc_status, RDMA_SC_INVALID_STATE,
+        "CQ consumer doorbell returned incomplete success evidence"));
+      status = noalloc_status;
+    end
     if (!status.ok()) begin
-      local_status = cq_attachment.runtime.record_recovery_failure(
-        db_mmio_evidence, status);
-      if (local_status == null || !local_status.ok())
-        status = make_engine_status_nonfatal(
-          RDMA_SC_RECOVERY_REQUIRED,
-          "CQ doorbell failure evidence could not be retained");
+      if (!cq_attachment.runtime.record_recovery_failure_noalloc(
+            db_mmio_evidence, status, noalloc_status)) begin
+        void'(set_engine_status_noalloc(
+          noalloc_status, RDMA_SC_RECOVERY_REQUIRED,
+          "CQ doorbell failure evidence could not be retained"));
+        status = noalloc_status;
+      end
       return;
     end
-    status = cq_attachment.runtime.record_recovery_failure(
-      RDMA_QUEUE_MMIO_SUCCESS);
-    if (status == null || !status.ok()) begin
-      status = make_engine_status_nonfatal(
+    if (!cq_attachment.runtime.record_recovery_failure_noalloc(
+          RDMA_QUEUE_MMIO_SUCCESS, null, noalloc_status)) begin
+      void'(set_engine_status_noalloc(
+        noalloc_status,
         RDMA_SC_RECOVERY_REQUIRED,
-        "CQ doorbell success evidence could not be retained");
+        "CQ doorbell success evidence could not be retained"));
+      status = noalloc_status;
       return;
     end
-    status = cq_attachment.runtime.mark_pending_consumer_doorbell_succeeded();
-    if (status == null || !status.ok()) begin
-      status = make_engine_status_nonfatal(
-        RDMA_SC_RECOVERY_REQUIRED,
-        "CQ doorbell success marker could not be validated");
+    if (!cq_attachment.runtime.enable_recovery_commit_noalloc(noalloc_status)) begin
+      status = noalloc_status;
       return;
     end
-    status = cq_attachment.runtime.enable_recovery_commit();
-    if (status == null || !status.ok()) begin
-      if (status == null)
-        status = make_engine_status_nonfatal(
-          RDMA_SC_RECOVERY_REQUIRED, "CQ consumer commit gate returned null");
-      return;
+    status = commit_cq_consumer(cq_attachment, cursor, noalloc_status);
+    if (status == null) begin
+      void'(set_engine_status_noalloc(
+        noalloc_status, RDMA_SC_INVALID_STATE,
+        "CQ consumer commit returned null status"));
+      status = noalloc_status;
     end
-    status = commit_cq_consumer(cq_attachment, cursor);
-    if (status == null)
-      status = make_engine_status_nonfatal(
-        RDMA_SC_INVALID_STATE, "CQ consumer commit returned null status");
     if (!status.ok()) begin
-      local_status = cq_attachment.runtime.record_recovery_failure(
-        RDMA_QUEUE_MMIO_SUCCESS, status);
-      if (local_status == null || !local_status.ok())
-        status = make_engine_status_nonfatal(
-          RDMA_SC_RECOVERY_REQUIRED,
-          "CQ consumer commit failure could not be retained");
+      if (!cq_attachment.runtime.record_recovery_failure_noalloc(
+            RDMA_QUEUE_MMIO_SUCCESS, status, noalloc_status)) begin
+        void'(set_engine_status_noalloc(
+          noalloc_status, RDMA_SC_RECOVERY_REQUIRED,
+          "CQ consumer commit failure could not be retained"));
+        status = noalloc_status;
+      end
       return;
     end
-    status = cq_attachment.runtime.mark_pending_consumer_committed();
-    if (status == null || !status.ok()) begin
-      status = make_engine_status_nonfatal(
-        RDMA_SC_RECOVERY_REQUIRED,
-        "CQ consumer commit marker could not be validated");
-      return;
-    end
-    status = cq_attachment.runtime.mark_pending_cq_consumer_committed();
-    if (status == null || !status.ok()) begin
-      status = make_engine_status_nonfatal(
-        RDMA_SC_RECOVERY_REQUIRED,
-        "CQ compatibility commit marker could not be recorded");
+    // 中文设计：这是唯一允许的跨 runtime 嵌套区间。先由 CQ runtime begin
+    // 持有 marker authority，再按 CQ->WQ 顺序进入 routed WQ runtime；所有
+    // begin-success 分支必须调用 finish，严禁新增 WQ->CQ 的反向嵌套路径。
+    if (!cq_attachment.runtime.begin_consumer_release_noalloc(noalloc_status)) begin
+      status = noalloc_status;
       return;
     end
     released.delete();
-    status = release_cq_wqe(wqe_attachment, cqe, released);
-    if (status == null)
-      status = make_engine_status_nonfatal(
-        RDMA_SC_INVALID_STATE, "CQ WQE release returned null status");
-    if (!status.ok()) begin
-      local_status = cq_attachment.runtime.record_recovery_failure(
-        RDMA_QUEUE_MMIO_SUCCESS, status);
-      if (local_status == null || !local_status.ok())
-        status = make_engine_status_nonfatal(
-          RDMA_SC_RECOVERY_REQUIRED, "CQ WQE release failure could not be retained");
+    status = release_cq_wqe(
+      wqe_attachment, cqe, released, noalloc_status);
+    if (status == null) begin
+      void'(set_engine_status_noalloc(
+        noalloc_status, RDMA_SC_INVALID_STATE,
+        "CQ WQE release returned null status"));
+      status = noalloc_status;
+    end
+    release_succeeded = status.ok();
+    if (!cq_attachment.runtime.finish_consumer_release_noalloc(
+          release_succeeded, status)) begin
+      if (status == null || status.ok()) begin
+        void'(set_engine_status_noalloc(
+          noalloc_status, RDMA_SC_INVALID_STATE,
+          "CQ release gate finalization failed"));
+        status = noalloc_status;
+      end
       return;
     end
-    status = cq_attachment.runtime.mark_pending_completion_released();
-    if (status == null || !status.ok()) begin
-      status = make_engine_status_nonfatal(
-        RDMA_SC_RECOVERY_REQUIRED, "CQ WQE release marker could not be recorded");
+    if (!release_succeeded) begin
+      if (!cq_attachment.runtime.record_recovery_failure_noalloc(
+            RDMA_QUEUE_MMIO_SUCCESS, status, noalloc_status)) begin
+        void'(set_engine_status_noalloc(
+          noalloc_status, RDMA_SC_RECOVERY_REQUIRED,
+          "CQ WQE release failure could not be retained"));
+        status = noalloc_status;
+      end
       return;
     end
-    status = cq_attachment.runtime.complete_recovery_retry();
-    if (status == null || !status.ok()) begin
-      if (status == null)
-        status = make_engine_status_nonfatal(
-          RDMA_SC_RECOVERY_REQUIRED, "CQ completion finalization returned null");
+    if (!cq_attachment.runtime.complete_consumer_recovery_noalloc(
+          1'b0, noalloc_status)) begin
+      status = noalloc_status;
       return;
     end
     result = result_candidate;
@@ -4753,8 +4990,8 @@ class rdma_queue_data_engine extends uvm_object;
           return bad("CQ dependent attachment is incomplete",
                      RDMA_SC_INVALID_STATE);
         candidate_runtime = attachment.runtime;
-        // A shared SRQ can be reached through more than one QP link; only
-        // transition a runtime once per resize transaction.
+        // 设计说明：同一 shared SRQ 可经多个 QP link 到达；一次 resize transaction
+        // 对每个 runtime 只允许执行一次状态迁移，避免重复 quiesce。
         already_seen = 1'b0;
         foreach (runtimes[j])
           if (runtimes[j] === candidate_runtime) already_seen = 1'b1;
@@ -4762,9 +4999,8 @@ class rdma_queue_data_engine extends uvm_object;
           continue;
         status = candidate_runtime.begin_quiesce();
         if (status == null || !status.ok()) begin
-          // Keep the successfully quiesced runtime list intact.  abort_cq_resize
-          // needs the exact list to retry restore_active when a transient
-          // backend/lock failure prevents immediate rollback.
+          // 设计说明：保留已经成功 quiesce 的完整 runtime 列表；若暂态 backend/lock
+          // 故障阻止立即 rollback，abort_cq_resize 必须依赖该精确列表重试 restore_active。
           if (status == null)
             status = bad("CQ dependent begin quiesce returned null",
                          RDMA_SC_RECOVERY_REQUIRED);
@@ -4890,9 +5126,8 @@ class rdma_queue_data_engine extends uvm_object;
         manager_restore_pending = 1'b0;
     end
     if (first_failure != null) begin
-      // A failed rollback must retain every runtime that is still QUIESCING;
-      // otherwise a later retry can only see the old CQ handle and would have
-      // no safe way to restore a dependent that was removed from the list.
+      // 设计说明：rollback 失败时必须保留每个仍处于 QUIESCING 的 runtime；否则后续
+      // retry 只能看到旧 CQ handle，无法安全恢复已从列表丢失的 dependent。
       recovery_status = record_prepublish_recovery(
         cq_h, old_runtime, dependents, manager_restore_pending,
         cq_restore_pending, first_failure);
@@ -5183,9 +5418,9 @@ class rdma_queue_data_engine extends uvm_object;
     recovery.backing_length = old_ref.length;
     recovery.backing_logical_queue_offset = old_ref.logical_queue_offset;
     recovery.backing_geometry_valid = 1'b1;
-    // Published recovery must bind its immutable epoch to the old backing;
-    // candidate mapping epoch belongs to the new attachment and is not a
-    // proof that the retained old mapping is still safe to release.
+    // 设计说明：published recovery 的 immutable epoch 必须绑定 old backing；
+    // candidate mapping epoch 属于新 attachment，不能证明 retained old mapping
+    // 仍可安全释放。
     recovery.backing_reset_epoch = old_ref.mapping.reset_epoch;
     recovery.backing_epoch_valid = 1'b1;
     foreach (dependents[i])
@@ -5299,11 +5534,13 @@ class rdma_queue_data_engine extends uvm_object;
     rdma_queue_pending_operation pending;
     rdma_queue_event_result result_candidate;
     rdma_doorbell_result db_result;
+    rdma_doorbell_desc prepared_db_desc;
     rdma_queue_mmio_evidence_e db_mmio_evidence;
     rdma_queue_data_qp_link no_route;
     rdma_status event_status;
     rdma_status final_success;
     rdma_status local_status;
+    rdma_status noalloc_status;
     byte data[];
     longint unsigned offset;
 
@@ -5361,11 +5598,23 @@ class rdma_queue_data_engine extends uvm_object;
     end
     status = prepare_consumer_pending(
       attachment, cursor, next, offset, entry_image,
-      0, 1'b0, 1'b0, null, pending);
+      0, 1'b0, 1'b0, RDMA_QUEUE_RUNTIME_SQ, null, pending);
     if (status == null || !status.ok() || pending == null) begin
       if (status == null || status.ok())
         status = make_engine_status_nonfatal(
           RDMA_SC_RESOURCE_EXHAUSTED, "CEQ prepared pending is incomplete");
+      return;
+    end
+    prepared_db_desc = null;
+    noalloc_status = null;
+    status = prepare_consumer_doorbell(
+      attachment, next, no_route, prepared_db_desc, noalloc_status);
+    if (status == null || !status.ok() || prepared_db_desc == null ||
+        noalloc_status == null) begin
+      if (status == null || status.ok())
+        status = make_engine_status_nonfatal(
+          RDMA_SC_RESOURCE_EXHAUSTED,
+          "CEQ consumer doorbell preparation is incomplete");
       return;
     end
     status = attachment.runtime.enter_recovery_prepared(pending);
@@ -5379,72 +5628,65 @@ class rdma_queue_data_engine extends uvm_object;
     db_result = null;
     db_mmio_evidence = RDMA_QUEUE_MMIO_NO_SUBMIT;
     submit_consumer_doorbell(attachment, next, db_result, status,
-                             db_mmio_evidence, no_route);
-    if (status == null)
-      status = make_engine_status_nonfatal(
-        RDMA_SC_INVALID_STATE, "CEQ consumer doorbell returned null status");
+                             db_mmio_evidence, no_route, prepared_db_desc,
+                             noalloc_status);
+    if (status == null) begin
+      void'(set_engine_status_noalloc(
+        noalloc_status, RDMA_SC_INVALID_STATE,
+        "CEQ consumer doorbell returned null status"));
+      status = noalloc_status;
+    end
     else if (status.ok() &&
              (db_result == null ||
-              db_mmio_evidence != RDMA_QUEUE_MMIO_SUCCESS))
-      status = make_engine_status_nonfatal(
-        RDMA_SC_INVALID_STATE,
-        "CEQ consumer doorbell returned incomplete success evidence");
+              db_mmio_evidence != RDMA_QUEUE_MMIO_SUCCESS)) begin
+      void'(set_engine_status_noalloc(
+        noalloc_status, RDMA_SC_INVALID_STATE,
+        "CEQ consumer doorbell returned incomplete success evidence"));
+      status = noalloc_status;
+    end
     if (!status.ok()) begin
-      local_status = attachment.runtime.record_recovery_failure(
-        db_mmio_evidence, status);
-      if (local_status == null || !local_status.ok())
-        status = make_engine_status_nonfatal(
-          RDMA_SC_RECOVERY_REQUIRED,
-          "CEQ doorbell failure evidence could not be retained");
+      if (!attachment.runtime.record_recovery_failure_noalloc(
+            db_mmio_evidence, status, noalloc_status)) begin
+        void'(set_engine_status_noalloc(
+          noalloc_status, RDMA_SC_RECOVERY_REQUIRED,
+          "CEQ doorbell failure evidence could not be retained"));
+        status = noalloc_status;
+      end
       return;
     end
-    status = attachment.runtime.record_recovery_failure(
-      RDMA_QUEUE_MMIO_SUCCESS);
-    if (status == null || !status.ok()) begin
-      status = make_engine_status_nonfatal(
+    if (!attachment.runtime.record_recovery_failure_noalloc(
+          RDMA_QUEUE_MMIO_SUCCESS, null, noalloc_status)) begin
+      void'(set_engine_status_noalloc(
+        noalloc_status,
         RDMA_SC_RECOVERY_REQUIRED,
-        "CEQ doorbell success evidence could not be retained");
+        "CEQ doorbell success evidence could not be retained"));
+      status = noalloc_status;
       return;
     end
-    status = attachment.runtime.mark_pending_consumer_doorbell_succeeded();
-    if (status == null || !status.ok()) begin
-      status = make_engine_status_nonfatal(
-        RDMA_SC_RECOVERY_REQUIRED,
-        "CEQ doorbell success marker could not be validated");
+    if (!attachment.runtime.enable_recovery_commit_noalloc(noalloc_status)) begin
+      status = noalloc_status;
       return;
     end
-    status = attachment.runtime.enable_recovery_commit();
-    if (status == null || !status.ok()) begin
-      if (status == null)
-        status = make_engine_status_nonfatal(
-          RDMA_SC_RECOVERY_REQUIRED, "CEQ consumer commit gate returned null");
-      return;
+    status = commit_cq_consumer(attachment, cursor, noalloc_status);
+    if (status == null) begin
+      void'(set_engine_status_noalloc(
+        noalloc_status, RDMA_SC_INVALID_STATE,
+        "CEQ consumer commit returned null status"));
+      status = noalloc_status;
     end
-    status = commit_cq_consumer(attachment, cursor);
-    if (status == null)
-      status = make_engine_status_nonfatal(
-        RDMA_SC_INVALID_STATE, "CEQ consumer commit returned null status");
     if (!status.ok()) begin
-      local_status = attachment.runtime.record_recovery_failure(
-        RDMA_QUEUE_MMIO_SUCCESS, status);
-      if (local_status == null || !local_status.ok())
-        status = make_engine_status_nonfatal(
-          RDMA_SC_RECOVERY_REQUIRED,
-          "CEQ consumer commit failure could not be retained");
+      if (!attachment.runtime.record_recovery_failure_noalloc(
+            RDMA_QUEUE_MMIO_SUCCESS, status, noalloc_status)) begin
+        void'(set_engine_status_noalloc(
+          noalloc_status, RDMA_SC_RECOVERY_REQUIRED,
+          "CEQ consumer commit failure could not be retained"));
+        status = noalloc_status;
+      end
       return;
     end
-    status = attachment.runtime.mark_pending_consumer_committed();
-    if (status == null || !status.ok()) begin
-      status = make_engine_status_nonfatal(
-        RDMA_SC_RECOVERY_REQUIRED,
-        "CEQ consumer commit marker could not be validated");
-      return;
-    end
-    status = attachment.runtime.complete_recovery_retry();
-    if (status == null || !status.ok()) begin
-      if (status == null)
-        status = make_engine_status_nonfatal(
-          RDMA_SC_RECOVERY_REQUIRED, "CEQ event finalization returned null");
+    if (!attachment.runtime.complete_consumer_recovery_noalloc(
+          1'b0, noalloc_status)) begin
+      status = noalloc_status;
       return;
     end
     result = result_candidate;
@@ -5507,11 +5749,12 @@ class rdma_queue_data_engine extends uvm_object;
     rdma_queue_pending_operation pending;
     rdma_queue_event_result result_candidate;
     rdma_doorbell_result db_result;
+    rdma_doorbell_desc prepared_db_desc;
     rdma_queue_mmio_evidence_e db_mmio_evidence;
     rdma_queue_data_qp_link no_route;
     rdma_status event_status;
     rdma_status final_success;
-    rdma_status local_status;
+    rdma_status noalloc_status;
     byte data[];
     longint unsigned offset;
 
@@ -5569,11 +5812,23 @@ class rdma_queue_data_engine extends uvm_object;
     end
     status = prepare_consumer_pending(
       attachment, cursor, next, offset, entry_image,
-      0, 1'b0, 1'b0, null, pending);
+      0, 1'b0, 1'b0, RDMA_QUEUE_RUNTIME_SQ, null, pending);
     if (status == null || !status.ok() || pending == null) begin
       if (status == null || status.ok())
         status = make_engine_status_nonfatal(
           RDMA_SC_RESOURCE_EXHAUSTED, "AEQ prepared pending is incomplete");
+      return;
+    end
+    prepared_db_desc = null;
+    noalloc_status = null;
+    status = prepare_consumer_doorbell(
+      attachment, next, no_route, prepared_db_desc, noalloc_status);
+    if (status == null || !status.ok() || prepared_db_desc == null ||
+        noalloc_status == null) begin
+      if (status == null || status.ok())
+        status = make_engine_status_nonfatal(
+          RDMA_SC_RESOURCE_EXHAUSTED,
+          "AEQ consumer doorbell preparation is incomplete");
       return;
     end
     status = attachment.runtime.enter_recovery_prepared(pending);
@@ -5587,72 +5842,65 @@ class rdma_queue_data_engine extends uvm_object;
     db_result = null;
     db_mmio_evidence = RDMA_QUEUE_MMIO_NO_SUBMIT;
     submit_consumer_doorbell(attachment, next, db_result, status,
-                             db_mmio_evidence, no_route);
-    if (status == null)
-      status = make_engine_status_nonfatal(
-        RDMA_SC_INVALID_STATE, "AEQ consumer doorbell returned null status");
+                             db_mmio_evidence, no_route, prepared_db_desc,
+                             noalloc_status);
+    if (status == null) begin
+      void'(set_engine_status_noalloc(
+        noalloc_status, RDMA_SC_INVALID_STATE,
+        "AEQ consumer doorbell returned null status"));
+      status = noalloc_status;
+    end
     else if (status.ok() &&
              (db_result == null ||
-              db_mmio_evidence != RDMA_QUEUE_MMIO_SUCCESS))
-      status = make_engine_status_nonfatal(
-        RDMA_SC_INVALID_STATE,
-        "AEQ consumer doorbell returned incomplete success evidence");
+              db_mmio_evidence != RDMA_QUEUE_MMIO_SUCCESS)) begin
+      void'(set_engine_status_noalloc(
+        noalloc_status, RDMA_SC_INVALID_STATE,
+        "AEQ consumer doorbell returned incomplete success evidence"));
+      status = noalloc_status;
+    end
     if (!status.ok()) begin
-      local_status = attachment.runtime.record_recovery_failure(
-        db_mmio_evidence, status);
-      if (local_status == null || !local_status.ok())
-        status = make_engine_status_nonfatal(
-          RDMA_SC_RECOVERY_REQUIRED,
-          "AEQ doorbell failure evidence could not be retained");
+      if (!attachment.runtime.record_recovery_failure_noalloc(
+            db_mmio_evidence, status, noalloc_status)) begin
+        void'(set_engine_status_noalloc(
+          noalloc_status, RDMA_SC_RECOVERY_REQUIRED,
+          "AEQ doorbell failure evidence could not be retained"));
+        status = noalloc_status;
+      end
       return;
     end
-    status = attachment.runtime.record_recovery_failure(
-      RDMA_QUEUE_MMIO_SUCCESS);
-    if (status == null || !status.ok()) begin
-      status = make_engine_status_nonfatal(
+    if (!attachment.runtime.record_recovery_failure_noalloc(
+          RDMA_QUEUE_MMIO_SUCCESS, null, noalloc_status)) begin
+      void'(set_engine_status_noalloc(
+        noalloc_status,
         RDMA_SC_RECOVERY_REQUIRED,
-        "AEQ doorbell success evidence could not be retained");
+        "AEQ doorbell success evidence could not be retained"));
+      status = noalloc_status;
       return;
     end
-    status = attachment.runtime.mark_pending_consumer_doorbell_succeeded();
-    if (status == null || !status.ok()) begin
-      status = make_engine_status_nonfatal(
-        RDMA_SC_RECOVERY_REQUIRED,
-        "AEQ doorbell success marker could not be validated");
+    if (!attachment.runtime.enable_recovery_commit_noalloc(noalloc_status)) begin
+      status = noalloc_status;
       return;
     end
-    status = attachment.runtime.enable_recovery_commit();
-    if (status == null || !status.ok()) begin
-      if (status == null)
-        status = make_engine_status_nonfatal(
-          RDMA_SC_RECOVERY_REQUIRED, "AEQ consumer commit gate returned null");
-      return;
+    status = commit_cq_consumer(attachment, cursor, noalloc_status);
+    if (status == null) begin
+      void'(set_engine_status_noalloc(
+        noalloc_status, RDMA_SC_INVALID_STATE,
+        "AEQ consumer commit returned null status"));
+      status = noalloc_status;
     end
-    status = commit_cq_consumer(attachment, cursor);
-    if (status == null)
-      status = make_engine_status_nonfatal(
-        RDMA_SC_INVALID_STATE, "AEQ consumer commit returned null status");
     if (!status.ok()) begin
-      local_status = attachment.runtime.record_recovery_failure(
-        RDMA_QUEUE_MMIO_SUCCESS, status);
-      if (local_status == null || !local_status.ok())
-        status = make_engine_status_nonfatal(
-          RDMA_SC_RECOVERY_REQUIRED,
-          "AEQ consumer commit failure could not be retained");
+      if (!attachment.runtime.record_recovery_failure_noalloc(
+            RDMA_QUEUE_MMIO_SUCCESS, status, noalloc_status)) begin
+        void'(set_engine_status_noalloc(
+          noalloc_status, RDMA_SC_RECOVERY_REQUIRED,
+          "AEQ consumer commit failure could not be retained"));
+        status = noalloc_status;
+      end
       return;
     end
-    status = attachment.runtime.mark_pending_consumer_committed();
-    if (status == null || !status.ok()) begin
-      status = make_engine_status_nonfatal(
-        RDMA_SC_RECOVERY_REQUIRED,
-        "AEQ consumer commit marker could not be validated");
-      return;
-    end
-    status = attachment.runtime.complete_recovery_retry();
-    if (status == null || !status.ok()) begin
-      if (status == null)
-        status = make_engine_status_nonfatal(
-          RDMA_SC_RECOVERY_REQUIRED, "AEQ event finalization returned null");
+    if (!attachment.runtime.complete_consumer_recovery_noalloc(
+          1'b0, noalloc_status)) begin
+      status = noalloc_status;
       return;
     end
     result = result_candidate;
@@ -5961,16 +6209,13 @@ class rdma_queue_data_engine extends uvm_object;
     rdma_doorbell_result db_result;
     rdma_queue_mmio_evidence_e db_mmio_evidence;
     rdma_queue_data_qp_link link;
-    rdma_queue_data_qp_link no_route;
     rdma_queue_data_attachment wqe_attachment;
     rdma_queue_slot_ledger_entry released[$];
-    rdma_hw_cqe_model cqe;
+    rdma_doorbell_desc prepared_db_desc;
     rdma_hw_sqe_model sgb_model;
     rdma_post_send_req pending_send;
-    rdma_hw_model decoded_model;
-    rdma_codec_base codec;
-    rdma_codec_key codec_key;
     rdma_status local_status;
+    rdma_status noalloc_status;
     byte data[];
     rdma_queue_pending_operation device_pending;
     rdma_queue_cursor_snapshot current_device_reservation;
@@ -5980,7 +6225,9 @@ class rdma_queue_data_engine extends uvm_object;
     bit runtime_epoch_valid;
     bit reservation_valid;
     bit backend_write_started;
+    bit release_succeeded;
     byte readback[];
+    string qp_key;
 
     status = null;
     if (attachment == null || pending == null) begin
@@ -6144,11 +6391,10 @@ class rdma_queue_data_engine extends uvm_object;
         status = bad("producer recovery image is missing", RDMA_SC_INVALID_STATE);
         return;
       end
-      // A known-no-MMIO producer failure is normally the queue write itself;
-      // retry the detached SGB slot first (when present), then the exact
-      // detached 64-byte WQE image before issuing its doorbell.  SGB bytes are
-      // not part of pending.image, so silently omitting this write would make
-      // a recovered SGE-SGB WQE reference stale/zero payload data.
+      // 设计说明：已知未发 MMIO 的 producer 故障通常发生在 queue write；若存在
+      // detached SGB slot，必须先重放它，再重放精确的 detached 64-byte WQE image，
+      // 最后才发 doorbell。SGB bytes 不属于 pending.image，省略该写入会让恢复后的
+      // SGE-SGB WQE 引用 stale/zero payload data。
       if (pending.kind == RDMA_QUEUE_RUNTIME_SQ &&
           pending.request_snapshot != null &&
           $cast(pending_send, pending.request_snapshot) &&
@@ -6202,263 +6448,281 @@ class rdma_queue_data_engine extends uvm_object;
       return;
     end
 
-    // 设计阶段：consumer recovery 只读 prepared image/route 以重建本地调用参数。
-    // NO_SUBMIT 经 caller confirmation 仅重发一次；SUCCESS 绝不重发。随后先补
-    // consumer CI 并立即发布 commit markers，CQ 最后才补 WQE release marker。
-    // 任一步失败都把真实 status 与单调 enum 原子保存在原 pending 中。
-    if (attachment.kind == RDMA_QUEUE_RUNTIME_CQ) begin
-      if (pending.image == null) begin
-        status = bad("CQ recovery image is missing", RDMA_SC_INVALID_STATE);
-        return;
-      end
-      codec_key = '{hw_version:"rdma", image_kind:RDMA_IMAGE_CQE,
-        object_type:"cqe", variant:"default", opcode:8'h00};
-      status = registry.lookup(codec_key, codec);
-      if (!status.ok()) return;
-      status = codec.decode(pending.image, decoded_model);
-      if (!status.ok()) return;
-      if (!$cast(cqe, decoded_model) || cqe == null) begin
-        status = bad("CQ recovery image decoded to the wrong model",
-                     RDMA_SC_CODEC_ERROR);
-        return;
-      end
-      link = null;
-      if (pending.routed_qp_h != null)
-        status = find_qp_link_for_local_id(pending.routed_qp_h.object_id,
-                                           link);
-      if (status == null || !status.ok() || link == null)
-        status = find_qp_link_for_cq(pending.queue_h, cqe.qpn, cqe.rq_cqe,
-                                     link);
-      if (!status.ok()) return;
-      if (cqe.rq_cqe) begin
-        if (link.srq_h != null)
-          status = lookup_attachment(link.srq_h, RDMA_QUEUE_RUNTIME_SRQ,
-                                     wqe_attachment);
-        else
-          status = lookup_attachment(link.qp_h, RDMA_QUEUE_RUNTIME_RQ,
-                                     wqe_attachment);
-      end
-      else
-        status = lookup_attachment(link.qp_h, RDMA_QUEUE_RUNTIME_SQ,
-                                   wqe_attachment);
-      if (!status.ok()) return;
-      if (!pending.completion_released) begin
-        status = wqe_attachment.runtime.validate_release_range(cqe.wqe_index,
-                                                                cqe.wqe_wrap);
-        if (!status.ok()) return;
-      end
-      case (pending.mmio_evidence)
-        RDMA_QUEUE_MMIO_NO_SUBMIT: begin
-          db_result = null;
-          db_mmio_evidence = RDMA_QUEUE_MMIO_NO_SUBMIT;
-          submit_consumer_doorbell(attachment, next, db_result, status,
-                                   db_mmio_evidence, link);
-          if (status == null)
-            status = make_engine_status_nonfatal(
-              RDMA_SC_INVALID_STATE,
-              "CQ recovery doorbell returned null status");
-          else if (status.ok() &&
-                   (db_result == null ||
-                    db_mmio_evidence != RDMA_QUEUE_MMIO_SUCCESS))
-            status = make_engine_status_nonfatal(
-              RDMA_SC_INVALID_STATE,
-              "CQ recovery doorbell returned incomplete success evidence");
-          if (!status.ok()) begin
-            local_status = attachment.runtime.record_recovery_failure(
-              db_mmio_evidence, status);
-            if (local_status == null || !local_status.ok())
-              status = make_engine_status_nonfatal(
-                RDMA_SC_RECOVERY_REQUIRED,
-                "CQ recovery doorbell failure could not be retained");
-            return;
-          end
-          status = attachment.runtime.record_recovery_failure(
-            RDMA_QUEUE_MMIO_SUCCESS);
-          if (status == null || !status.ok()) begin
-            status = make_engine_status_nonfatal(
-              RDMA_SC_RECOVERY_REQUIRED,
-              "CQ recovery doorbell success could not be retained");
-            return;
-          end
-        end
-        RDMA_QUEUE_MMIO_SUCCESS: begin
-          // 已确认成功的 transaction 只继续本地阶段；caller confirmation 不能
-          // 降级该 enum，也不能触发第二次 scheduler/PCIe submit。
-        end
-        default: begin
-          status = make_engine_status_nonfatal(
-            RDMA_SC_RECOVERY_REQUIRED,
-            "CQ recovery doorbell evidence is not safely replayable");
-          return;
-        end
-      endcase
-      status = attachment.runtime.mark_pending_consumer_doorbell_succeeded();
-      if (status == null || !status.ok()) begin
+    // 中文设计：consumer pending 在 admission 时已冻结完整 identity、
+    // route/epoch 和 completion target。recovery 只核对这些值并选择现有
+    // attachment，禁止重新 decode CQE 或从当前 codec 推导 WQ 方向。
+    link = null;
+    wqe_attachment = null;
+    if (!(attachment.kind inside {RDMA_QUEUE_RUNTIME_CQ,
+                                  RDMA_QUEUE_RUNTIME_CEQ,
+                                  RDMA_QUEUE_RUNTIME_AEQ}) ||
+        pending.kind != attachment.kind || pending.producer ||
+        pending.device_producer || attachment.queue_h == null ||
+        pending.queue_h == null ||
+        !attachment.queue_h.same_instance(pending.queue_h) ||
+        pending.cursor == null || pending.next_cursor == null ||
+        pending.image == null || pending.failure_status == null ||
+        pending.entry_size != attachment.entry_size ||
+        pending.image.length != pending.entry_size ||
+        pending.image.bytes.size() != pending.image.length ||
+        pending.entry_offset !=
+          longint'(pending.cursor.index) * pending.entry_size) begin
+      status = make_engine_status_nonfatal(
+        RDMA_SC_INVALID_STATE,
+        "consumer recovery pending evidence is incomplete");
+      return;
+    end
+    runtime_route = '0;
+    runtime_route_valid = 1'b0;
+    runtime_epoch = '0;
+    runtime_epoch_valid = 1'b0;
+    status = attachment.runtime.query_route_epoch(
+      runtime_route, runtime_route_valid, runtime_epoch, runtime_epoch_valid);
+    if (status == null || !status.ok() || !runtime_route_valid ||
+        !runtime_epoch_valid || !pending.route_valid || !pending.epoch_valid ||
+        pending.route != runtime_route || pending.reset_epoch != runtime_epoch) begin
+      if (status == null || status.ok())
         status = make_engine_status_nonfatal(
-          RDMA_SC_RECOVERY_REQUIRED,
-          "CQ recovery doorbell marker is inconsistent");
-        return;
-      end
-
-      if (!pending.consumer_committed) begin
-        status = attachment.runtime.enable_recovery_commit();
-        if (status == null || !status.ok()) begin
-          if (status == null)
-            status = make_engine_status_nonfatal(
-              RDMA_SC_RECOVERY_REQUIRED,
-              "CQ recovery consumer commit gate returned null");
-          return;
-        end
-        status = commit_cq_consumer(attachment, pending.cursor);
-        if (status == null)
-          status = make_engine_status_nonfatal(
-            RDMA_SC_INVALID_STATE,
-            "CQ recovery consumer commit returned null status");
-        if (!status.ok()) begin
-          local_status = attachment.runtime.record_recovery_failure(
-            RDMA_QUEUE_MMIO_SUCCESS, status);
-          if (local_status == null || !local_status.ok())
-            status = make_engine_status_nonfatal(
-              RDMA_SC_RECOVERY_REQUIRED,
-              "CQ recovery commit failure could not be retained");
-          return;
-        end
-        status = attachment.runtime.mark_pending_consumer_committed();
-        if (status == null || !status.ok()) begin
-          status = make_engine_status_nonfatal(
-            RDMA_SC_RECOVERY_REQUIRED,
-            "CQ recovery consumer commit marker failed");
-          return;
-        end
-      end
-      if (!pending.cq_consumer_committed) begin
-        status = attachment.runtime.mark_pending_cq_consumer_committed();
-        if (status == null || !status.ok()) begin
-          status = make_engine_status_nonfatal(
-            RDMA_SC_RECOVERY_REQUIRED,
-            "CQ recovery compatibility commit marker failed");
-          return;
-        end
-      end
-      if (!pending.completion_released) begin
-        released.delete();
-        status = release_cq_wqe(wqe_attachment, cqe, released);
-        if (status == null)
-          status = make_engine_status_nonfatal(
-            RDMA_SC_INVALID_STATE, "CQ recovery WQE release returned null status");
-        if (!status.ok()) begin
-          local_status = attachment.runtime.record_recovery_failure(
-            RDMA_QUEUE_MMIO_SUCCESS, status);
-          if (local_status == null || !local_status.ok())
-            status = make_engine_status_nonfatal(
-              RDMA_SC_RECOVERY_REQUIRED,
-              "CQ recovery release failure could not be retained");
-          return;
-        end
-        status = attachment.runtime.mark_pending_completion_released();
-        if (status == null || !status.ok()) begin
-          status = make_engine_status_nonfatal(
-            RDMA_SC_RECOVERY_REQUIRED,
-            "CQ recovery release marker failed");
-          return;
-        end
-      end
-      status = attachment.runtime.complete_recovery_retry();
-      if (status == null)
-        status = make_engine_status_nonfatal(
-          RDMA_SC_RECOVERY_REQUIRED,
-          "CQ recovery completion returned null status");
+          RDMA_SC_STALE_GENERATION,
+          "consumer recovery route or reset epoch is stale");
       return;
     end
 
-    // CEQ/AEQ 没有 CQ 专用 WQE ledger 阶段，但沿用相同 MMIO enum 与
-    // doorbell→consumer commit 顺序；device-producer NOT_APPLICABLE 已在上方返回。
-    case (pending.mmio_evidence)
-      RDMA_QUEUE_MMIO_NO_SUBMIT: begin
-        db_result = null;
-        db_mmio_evidence = RDMA_QUEUE_MMIO_NO_SUBMIT;
-        submit_consumer_doorbell(attachment, next, db_result, status,
-                                 db_mmio_evidence, no_route);
-        if (status == null)
+    if (attachment.kind == RDMA_QUEUE_RUNTIME_CQ) begin
+      if (!pending.completion_target_valid ||
+          !(pending.completion_wq_kind inside {RDMA_QUEUE_RUNTIME_SQ,
+                                               RDMA_QUEUE_RUNTIME_RQ,
+                                               RDMA_QUEUE_RUNTIME_SRQ}) ||
+          pending.routed_qp_h == null ||
+          pending.routed_qp_h.kind != RDMA_RESOURCE_QP) begin
+        status = make_engine_status_nonfatal(
+          RDMA_SC_INVALID_STATE,
+          "CQ recovery completion target is incomplete");
+        return;
+      end
+      qp_key = identity_key(pending.routed_qp_h);
+      if (qp_key == "" || !qp_links.exists(qp_key) ||
+          qp_links[qp_key] == null || qp_links[qp_key].qp_h == null ||
+          !qp_links[qp_key].qp_h.same_instance(pending.routed_qp_h)) begin
+        status = make_engine_status_nonfatal(
+          RDMA_SC_STALE_GENERATION,
+          "CQ recovery routed QP identity is stale");
+        return;
+      end
+      link = qp_links[qp_key];
+      if (pending.completion_wq_kind == RDMA_QUEUE_RUNTIME_SQ) begin
+        if (link.send_cq_h == null ||
+            !link.send_cq_h.same_instance(pending.queue_h)) begin
           status = make_engine_status_nonfatal(
             RDMA_SC_INVALID_STATE,
-            "event recovery doorbell returned null status");
-        else if (status.ok() &&
-                 (db_result == null ||
-                  db_mmio_evidence != RDMA_QUEUE_MMIO_SUCCESS))
-          status = make_engine_status_nonfatal(
-            RDMA_SC_INVALID_STATE,
-            "event recovery doorbell returned incomplete success evidence");
-        if (!status.ok()) begin
-          local_status = attachment.runtime.record_recovery_failure(
-            db_mmio_evidence, status);
-          if (local_status == null || !local_status.ok())
-            status = make_engine_status_nonfatal(
-              RDMA_SC_RECOVERY_REQUIRED,
-              "event recovery doorbell failure could not be retained");
+            "CQ recovery SQ route does not target the pending CQ");
           return;
         end
-        status = attachment.runtime.record_recovery_failure(
-          RDMA_QUEUE_MMIO_SUCCESS);
-        if (status == null || !status.ok()) begin
+        status = lookup_attachment(
+          link.qp_h, RDMA_QUEUE_RUNTIME_SQ, wqe_attachment);
+      end
+      else if (pending.completion_wq_kind == RDMA_QUEUE_RUNTIME_RQ) begin
+        if (link.recv_cq_h == null ||
+            !link.recv_cq_h.same_instance(pending.queue_h) ||
+            link.srq_h != null) begin
           status = make_engine_status_nonfatal(
-            RDMA_SC_RECOVERY_REQUIRED,
-            "event recovery doorbell success could not be retained");
+            RDMA_SC_INVALID_STATE,
+            "CQ recovery RQ route does not target the pending CQ");
+          return;
+        end
+        status = lookup_attachment(
+          link.qp_h, RDMA_QUEUE_RUNTIME_RQ, wqe_attachment);
+      end
+      else begin
+        if (link.recv_cq_h == null ||
+            !link.recv_cq_h.same_instance(pending.queue_h) ||
+            link.srq_h == null) begin
+          status = make_engine_status_nonfatal(
+            RDMA_SC_INVALID_STATE,
+            "CQ recovery SRQ route does not target the pending CQ");
+          return;
+        end
+        status = lookup_attachment(
+          link.srq_h, RDMA_QUEUE_RUNTIME_SRQ, wqe_attachment);
+      end
+      if (status == null || !status.ok() || wqe_attachment == null ||
+          wqe_attachment.runtime == null ||
+          wqe_attachment.kind != pending.completion_wq_kind) begin
+        if (status == null || status.ok())
+          status = make_engine_status_nonfatal(
+            RDMA_SC_INVALID_STATE,
+            "CQ recovery WQ attachment is unavailable");
+        return;
+      end
+      if (!pending.completion_released) begin
+        status = wqe_attachment.runtime.validate_release_range(
+          pending.completion_index, pending.completion_wrap);
+        if (status == null || !status.ok()) begin
+          if (status == null)
+            status = make_engine_status_nonfatal(
+              RDMA_SC_INVALID_STATE,
+              "CQ recovery release validation returned null status");
+          return;
+        end
+      end
+    end
+    else if (pending.completion_target_valid || pending.routed_qp_h != null ||
+             pending.cq_consumer_committed || pending.completion_released) begin
+      status = make_engine_status_nonfatal(
+        RDMA_SC_INVALID_STATE,
+        "event recovery carries CQ-only completion evidence");
+      return;
+    end
+
+    // 中文设计：NO_SUBMIT 在 scheduler 入口前预建 descriptor/status；
+    // SUCCESS 则复用 detached pending 的 caller-owned failure_status 作 continuation
+    // slot。从第一个 scheduler/commit/release seam 起不再创建任何对象。
+    prepared_db_desc = null;
+    noalloc_status = null;
+    case (pending.mmio_evidence)
+      RDMA_QUEUE_MMIO_NO_SUBMIT: begin
+        status = prepare_consumer_doorbell(
+          attachment, next, link, prepared_db_desc, noalloc_status);
+        if (status == null || !status.ok() || prepared_db_desc == null ||
+            noalloc_status == null) begin
+          if (status == null || status.ok())
+            status = make_engine_status_nonfatal(
+              RDMA_SC_RESOURCE_EXHAUSTED,
+              "consumer recovery doorbell preparation is incomplete");
           return;
         end
       end
       RDMA_QUEUE_MMIO_SUCCESS: begin
+        noalloc_status = pending.failure_status;
+        if (!set_engine_status_noalloc(noalloc_status, RDMA_SC_OK, "")) begin
+          status = make_engine_status_nonfatal(
+            RDMA_SC_RESOURCE_EXHAUSTED,
+            "consumer recovery continuation status is unavailable");
+          return;
+        end
+        status = noalloc_status;
       end
       default: begin
         status = make_engine_status_nonfatal(
           RDMA_SC_RECOVERY_REQUIRED,
-          "event recovery doorbell evidence is not safely replayable");
+          "consumer recovery doorbell evidence is not safely replayable");
         return;
       end
     endcase
-    status = attachment.runtime.mark_pending_consumer_doorbell_succeeded();
-    if (status == null || !status.ok()) begin
-      status = make_engine_status_nonfatal(
-        RDMA_SC_RECOVERY_REQUIRED,
-        "event recovery doorbell marker is inconsistent");
+
+    if (pending.mmio_evidence == RDMA_QUEUE_MMIO_NO_SUBMIT) begin
+      db_result = null;
+      db_mmio_evidence = RDMA_QUEUE_MMIO_NO_SUBMIT;
+      submit_consumer_doorbell(
+        attachment, next, db_result, status, db_mmio_evidence, link,
+        prepared_db_desc, noalloc_status);
+      if (status == null) begin
+        void'(set_engine_status_noalloc(
+          noalloc_status, RDMA_SC_INVALID_STATE,
+          "consumer recovery doorbell returned null status"));
+        status = noalloc_status;
+      end
+      else if (status.ok() &&
+               (db_result == null ||
+                db_mmio_evidence != RDMA_QUEUE_MMIO_SUCCESS)) begin
+        void'(set_engine_status_noalloc(
+          noalloc_status, RDMA_SC_INVALID_STATE,
+          "consumer recovery doorbell returned incomplete success evidence"));
+        status = noalloc_status;
+      end
+      if (!status.ok()) begin
+        if (!attachment.runtime.record_recovery_failure_noalloc(
+              db_mmio_evidence, status, noalloc_status)) begin
+          void'(set_engine_status_noalloc(
+            noalloc_status, RDMA_SC_RECOVERY_REQUIRED,
+            "consumer recovery doorbell failure could not be retained"));
+          status = noalloc_status;
+        end
+        return;
+      end
+      if (!attachment.runtime.record_recovery_failure_noalloc(
+            RDMA_QUEUE_MMIO_SUCCESS, null, noalloc_status)) begin
+        void'(set_engine_status_noalloc(
+          noalloc_status, RDMA_SC_RECOVERY_REQUIRED,
+          "consumer recovery doorbell success could not be retained"));
+        status = noalloc_status;
+        return;
+      end
+      status = noalloc_status;
+    end
+
+    if (!pending.consumer_committed) begin
+      if (!attachment.runtime.enable_recovery_commit_noalloc(noalloc_status)) begin
+        status = noalloc_status;
+        return;
+      end
+      status = commit_cq_consumer(
+        attachment, pending.cursor, noalloc_status);
+      if (status == null) begin
+        void'(set_engine_status_noalloc(
+          noalloc_status, RDMA_SC_INVALID_STATE,
+          "consumer recovery commit returned null status"));
+        status = noalloc_status;
+      end
+      if (!status.ok()) begin
+        if (!attachment.runtime.record_recovery_failure_noalloc(
+              RDMA_QUEUE_MMIO_SUCCESS, status, noalloc_status)) begin
+          void'(set_engine_status_noalloc(
+            noalloc_status, RDMA_SC_RECOVERY_REQUIRED,
+            "consumer recovery commit failure could not be retained"));
+          status = noalloc_status;
+        end
+        return;
+      end
+    end
+
+    if (attachment.kind == RDMA_QUEUE_RUNTIME_CQ &&
+        !pending.completion_released) begin
+      // 中文设计：recovery 与首轮 poll 共用同一 CQ->WQ 锁序。begin 成功后
+      // release seam 的成功/失败都由 finish 在 CQ lock 内发布 marker 或仅解锁，
+      // 因而后续 complete 即使竞争失败也不会再次释放同一 WQE range。
+      if (!attachment.runtime.begin_consumer_release_noalloc(noalloc_status)) begin
+        status = noalloc_status;
+        return;
+      end
+      released.delete();
+      status = release_cq_wqe(
+        wqe_attachment, null, released, noalloc_status, 1'b1,
+        pending.completion_index, pending.completion_wrap);
+      if (status == null) begin
+        void'(set_engine_status_noalloc(
+          noalloc_status, RDMA_SC_INVALID_STATE,
+          "CQ recovery WQE release returned null status"));
+        status = noalloc_status;
+      end
+      release_succeeded = status.ok();
+      if (!attachment.runtime.finish_consumer_release_noalloc(
+            release_succeeded, status)) begin
+        if (status == null || status.ok()) begin
+          void'(set_engine_status_noalloc(
+            noalloc_status, RDMA_SC_INVALID_STATE,
+            "CQ recovery release gate finalization failed"));
+          status = noalloc_status;
+        end
+        return;
+      end
+      if (!release_succeeded) begin
+        if (!attachment.runtime.record_recovery_failure_noalloc(
+              RDMA_QUEUE_MMIO_SUCCESS, status, noalloc_status)) begin
+          void'(set_engine_status_noalloc(
+            noalloc_status, RDMA_SC_RECOVERY_REQUIRED,
+            "CQ recovery release failure could not be retained"));
+          status = noalloc_status;
+        end
+        return;
+      end
+    end
+    if (!attachment.runtime.complete_consumer_recovery_noalloc(
+          1'b0, noalloc_status)) begin
+      status = noalloc_status;
       return;
     end
-    if (!pending.consumer_committed) begin
-      status = attachment.runtime.enable_recovery_commit();
-      if (status == null || !status.ok()) begin
-        if (status == null)
-          status = make_engine_status_nonfatal(
-            RDMA_SC_RECOVERY_REQUIRED,
-            "event recovery consumer commit gate returned null");
-        return;
-      end
-      status = attachment.runtime.commit_consumer(pending.cursor);
-      if (status == null)
-        status = make_engine_status_nonfatal(
-          RDMA_SC_INVALID_STATE,
-          "event recovery consumer commit returned null status");
-      if (!status.ok()) begin
-        local_status = attachment.runtime.record_recovery_failure(
-          RDMA_QUEUE_MMIO_SUCCESS, status);
-        if (local_status == null || !local_status.ok())
-          status = make_engine_status_nonfatal(
-            RDMA_SC_RECOVERY_REQUIRED,
-            "event recovery commit failure could not be retained");
-        return;
-      end
-      status = attachment.runtime.mark_pending_consumer_committed();
-      if (status == null || !status.ok()) begin
-        status = make_engine_status_nonfatal(
-          RDMA_SC_RECOVERY_REQUIRED,
-          "event recovery consumer commit marker failed");
-        return;
-      end
-    end
-    status = attachment.runtime.complete_recovery_retry();
-    if (status == null)
-      status = make_engine_status_nonfatal(
-        RDMA_SC_RECOVERY_REQUIRED,
-        "event recovery completion returned null status");
+    status = noalloc_status;
   endtask
 
   // 功能：recover_queue 定位 queue 的 claimed/unclaimed recovery，执行 abort，

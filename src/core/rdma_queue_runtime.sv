@@ -100,6 +100,9 @@ class rdma_queue_pending_operation extends uvm_object;
   int unsigned completion_index;
   bit completion_wrap;
   bit completion_target_valid;
+  // 中文设计：completion_wq_kind 冻结 CQE admission 时已经解析出的实际
+  // SQ/RQ/SRQ ledger 类型；SUCCESS recovery 不得重新 decode CQE 推导方向。
+  rdma_queue_runtime_kind_e completion_wq_kind;
   // 中文设计：routed_qp_h 与 completion_released 一起标识 CQ 专用释放阶段，
   // 防止“WQE 已释放、CI 尚未提交”的 retry 重复释放同一 WQE。
   rdma_handle routed_qp_h;
@@ -140,6 +143,7 @@ class rdma_queue_pending_operation extends uvm_object;
     completion_index = 0;
     completion_wrap = 0;
     completion_target_valid = 0;
+    completion_wq_kind = RDMA_QUEUE_RUNTIME_SQ;
     routed_qp_h = null;
     mmio_maybe_submitted = 0;
     known_no_mmio = 0;
@@ -254,6 +258,7 @@ class rdma_queue_pending_operation extends uvm_object;
     completion_index = source.completion_index;
     completion_wrap = source.completion_wrap;
     completion_target_valid = source.completion_target_valid;
+    completion_wq_kind = source.completion_wq_kind;
     routed_qp_h = source.routed_qp_h;
     request_snapshot = source.request_snapshot;
   endfunction
@@ -322,6 +327,11 @@ class rdma_queue_runtime extends uvm_object;
   protected rdma_queue_slot_ledger_entry slots[];
   protected semaphore lock;
   protected bit recovery_commit_allowed;
+  // 中文设计：consumer_release_gate_active 只在 CQ consumer 已提交后、对应 WQE
+  // release 尚未开始时置位；置位期间 runtime lock token 由 begin API 持有并只能由
+  // finish API 归还。唯一合法的跨 runtime 嵌套锁序是 CQ runtime -> routed WQ
+  // runtime，任何实现都禁止在持有 WQ runtime lock 时反向进入 CQ runtime。
+  protected bit consumer_release_gate_active;
   // 中文设计：NO_SUBMIT 只证明上一轮没有进入 MMIO，不能自动授权下一轮。
   // caller confirmation 与一次 evidence 转移绑定并在使用后清除，避免跨 retry 重放。
   protected bit recovery_retry_confirmed;
@@ -391,6 +401,35 @@ class rdma_queue_runtime extends uvm_object;
     result.retryable = 1'b0;
     result.message = message;
     return result;
+  endfunction
+
+  // 功能：set_runtime_status_noalloc 在 caller 已拥有的 status slot 中写入一个
+  //   完整 runtime 结果，供 scheduler/continuation barrier 后的零分配路径复用。
+  // 输入/输出及副作用：slot、code、message 为输入；slot 非空时覆盖全部诊断字段
+  //   并返回 1，不创建对象，也不修改 queue cursor、ledger 或 pending evidence。
+  // 失败/边界：slot=null 时返回 0 且无任何副作用；message 只记录当前失败原因，
+  //   不从兼容位推导 authority，也不把非 OK code 伪装成成功。
+  protected function bit set_runtime_status_noalloc(
+    rdma_status slot,
+    rdma_status_code_e code,
+    string message = ""
+  );
+    if (slot == null) return 1'b0;
+    slot.category = rdma_status::category_for(code);
+    slot.code = code;
+    slot.hardware_code = '0;
+    slot.hardware_code_valid = 1'b0;
+    slot.source_engine = RDMA_ENGINE_NONE;
+    slot.function_uid = '0;
+    slot.generation = '0;
+    slot.resource_id = '0;
+    slot.command_id = '0;
+    slot.wr_id = '0;
+    slot.severity = (code == RDMA_SC_OK) ? RDMA_SEVERITY_INFO :
+                                           RDMA_SEVERITY_ERROR;
+    slot.retryable = 1'b0;
+    slot.message = message;
+    return 1'b1;
   endfunction
 
   // 功能：status_is_ok 对可能为空的下游状态执行安全成功判断，避免 recovery/clone 异常路径解引用 null handle。
@@ -1125,6 +1164,7 @@ class rdma_queue_runtime extends uvm_object;
            lhs.completion_index == rhs.completion_index &&
            lhs.completion_wrap == rhs.completion_wrap &&
            lhs.completion_target_valid == rhs.completion_target_valid &&
+           lhs.completion_wq_kind == rhs.completion_wq_kind &&
            handle_value_equal(lhs.routed_qp_h, rhs.routed_qp_h) &&
            lhs.route == rhs.route && lhs.route_valid == rhs.route_valid &&
            lhs.reset_epoch == rhs.reset_epoch &&
@@ -1215,6 +1255,7 @@ class rdma_queue_runtime extends uvm_object;
     candidate.completion_index = source.completion_index;
     candidate.completion_wrap = source.completion_wrap;
     candidate.completion_target_valid = source.completion_target_valid;
+    candidate.completion_wq_kind = source.completion_wq_kind;
     candidate.mmio_maybe_submitted = source.mmio_maybe_submitted;
     candidate.known_no_mmio = source.known_no_mmio;
     candidate.mmio_evidence = source.mmio_evidence;
@@ -1254,11 +1295,12 @@ class rdma_queue_runtime extends uvm_object;
     device_reservation = null;
     lock = new(1);
     recovery_commit_allowed = 0;
+    consumer_release_gate_active = 0;
     recovery_retry_confirmed = 0;
   endfunction
 
   // 功能：configure 校验 ring 方向、几何与初始游标，构造临时句柄/账本并一次性发布 ATTACHED runtime 配置。
-  // 输入/输出及副作用：qh、k、d、pi、pw、ci、cw、host_produced_cfg、initial_owner_polarity（输入）；成功时锁存游标、方向、occupancy 与 detached handle，外部资源仍由调用方拥有。
+  // 输入/输出及副作用：qh、k、d、pi、pw、ci、cw、host_produced_cfg、initial_owner_polarity（输入）；成功时锁存游标、方向、occupancy 与 detached handle，并清空 recovery/release gate；外部资源仍由调用方拥有。
   // 失败/边界：空句柄、重复配置、深度非二次幂、游标越界/组合非法、方向与 queue kind 不匹配或临时对象分配失败时返回错误，并保留旧状态。
   function rdma_status configure(rdma_handle qh, rdma_queue_runtime_kind_e k,
                                  int unsigned d, int unsigned pi, bit pw,
@@ -1392,6 +1434,7 @@ class rdma_queue_runtime extends uvm_object;
     reset_epoch = 0;
     epoch_valid = 0;
     recovery_commit_allowed = 0;
+    consumer_release_gate_active = 0;
     recovery_retry_confirmed = 0;
     state = RDMA_QUEUE_RUNTIME_ATTACHED;
     lock.put(1);
@@ -2060,6 +2103,202 @@ class rdma_queue_runtime extends uvm_object;
     recovery_commit_allowed = 1'b0;
     lock.put(1);
     return make_runtime_status(RDMA_SC_OK, "");
+  endfunction
+
+  // 功能：commit_consumer_recovery_noalloc 在 consumer doorbell 已确定成功后，
+  //   以 admission 冻结的 old cursor 原子提交 CQ/CEQ/AEQ CI，并同步发布 commit marker。
+  // 输入/输出及副作用：reservation_index/reservation_wrap 是冻结 cursor 标量，
+  //   status_slot 由 caller 预先创建；成功消费 recovery_commit_allowed、递减 used、
+  //   推进 CI，把 pending.next_cursor 发布为 committed_consumer_cursor，CQ 同时置
+  //   cq_consumer_committed，并保持 release gate 为关闭状态。
+  // 失败/边界：status_slot/null lock、未授权 commit、非 consumer recovery、非
+  //   SUCCESS、stale cursor、空/损坏 occupancy 或阶段已提交时返回 0；所有拒绝
+  //   分支在修改 CI/pending 或消费 authorization 前完成。
+  function bit commit_consumer_recovery_noalloc(
+    int unsigned reservation_index,
+    bit reservation_wrap,
+    rdma_status status_slot
+  );
+    int unsigned expected_next_index;
+    bit expected_next_wrap;
+    rdma_status_code_e failure_code;
+    string failure_message;
+
+    if (status_slot == null) return 1'b0;
+    if (lock == null || !lock.try_get(1)) begin
+      void'(set_runtime_status_noalloc(
+        status_slot, RDMA_SC_RESOURCE_BUSY, "queue runtime is busy"));
+      return 1'b0;
+    end
+
+    failure_code = RDMA_SC_INVALID_STATE;
+    failure_message = "consumer recovery evidence is invalid";
+    if (state != RDMA_QUEUE_RUNTIME_RECOVERY_REQUIRED ||
+        pending_operation_state == null || host_produced ||
+        !is_device_ring_kind(kind) || pending_operation_state.producer ||
+        pending_operation_state.device_producer ||
+        !recovery_commit_allowed ||
+        !pending_identity_matches_locked(pending_operation_state) ||
+        pending_operation_state.kind != kind ||
+        pending_operation_state.mmio_evidence != RDMA_QUEUE_MMIO_SUCCESS ||
+        !pending_operation_state.consumer_doorbell_succeeded ||
+        pending_operation_state.consumer_committed ||
+        !pending_cursor_shape_valid(pending_operation_state) ||
+        pending_operation_state.cursor == null ||
+        pending_operation_state.next_cursor == null ||
+        !cursor_equal(reservation_index, reservation_wrap,
+                      pending_operation_state.cursor.index,
+                      pending_operation_state.cursor.wrap) ||
+        !cursor_equal(consumer_index, consumer_wrap,
+                      pending_operation_state.cursor.index,
+                      pending_operation_state.cursor.wrap) ||
+        (pending_operation_state.committed_consumer_cursor != null &&
+         !cursor_equal(
+           pending_operation_state.committed_consumer_cursor.index,
+           pending_operation_state.committed_consumer_cursor.wrap,
+           pending_operation_state.next_cursor.index,
+           pending_operation_state.next_cursor.wrap))) begin
+      lock.put(1);
+      void'(set_runtime_status_noalloc(status_slot, failure_code,
+                                       failure_message));
+      return 1'b0;
+    end
+    if (used == 0) begin
+      lock.put(1);
+      void'(set_runtime_status_noalloc(
+        status_slot, RDMA_SC_QUEUE_EMPTY,
+        "device ring has no committed entries"));
+      return 1'b0;
+    end
+    if (used > depth) begin
+      lock.put(1);
+      void'(set_runtime_status_noalloc(
+        status_slot, RDMA_SC_INVALID_STATE,
+        "device ring occupancy exceeds depth"));
+      return 1'b0;
+    end
+
+    expected_next_index = consumer_index;
+    expected_next_wrap = consumer_wrap;
+    cursor_advance(expected_next_index, expected_next_wrap);
+    if (!cursor_equal(expected_next_index, expected_next_wrap,
+                      pending_operation_state.next_cursor.index,
+                      pending_operation_state.next_cursor.wrap)) begin
+      lock.put(1);
+      void'(set_runtime_status_noalloc(
+        status_slot, RDMA_SC_INVALID_STATE,
+        "consumer recovery CI advance mismatched evidence"));
+      return 1'b0;
+    end
+
+    // 中文设计：以上校验只读所有 authority；从这里开始在同一临界区一次性发布
+    // credit、CI 和 marker，任何 caller 都看不到部分 committed 状态。
+    used--;
+    consumer_index = expected_next_index;
+    consumer_wrap = expected_next_wrap;
+    if (pending_operation_state.committed_consumer_cursor == null)
+      pending_operation_state.committed_consumer_cursor =
+        pending_operation_state.next_cursor;
+    pending_operation_state.consumer_committed = 1'b1;
+    if (kind == RDMA_QUEUE_RUNTIME_CQ)
+      pending_operation_state.cq_consumer_committed = 1'b1;
+    recovery_commit_allowed = 1'b0;
+    consumer_release_gate_active = 1'b0;
+    recovery_retry_confirmed = 1'b0;
+    lock.put(1);
+    void'(set_runtime_status_noalloc(status_slot, RDMA_SC_OK, ""));
+    return 1'b1;
+  endfunction
+
+  // 功能：begin_consumer_release_noalloc 在 CQ consumer CI 已原子提交后验证唯一
+  //   pending release authority，并持有 CQ runtime lock 形成 WQE release/marker 屏障。
+  // 输入/输出及副作用：status_slot 为 caller 预建状态槽；成功置
+  //   consumer_release_gate_active 并带锁返回，调用方随后只能按 CQ->WQ 顺序执行
+  //   release，且每条退出路径都必须调用 finish_consumer_release_noalloc。
+  // 失败/边界：slot/lock 无效、gate 已活动、非 CQ SUCCESS consumer pending、CI/
+  //   marker/target 不完整或 target 已释放时返回 0；失败均在 WQ mutation 前归还锁，
+  //   pending、CQ cursor/credit 与 release marker 保持不变。
+  function bit begin_consumer_release_noalloc(rdma_status status_slot);
+    if (status_slot == null) return 1'b0;
+    if (lock == null || !lock.try_get(1)) begin
+      void'(set_runtime_status_noalloc(
+        status_slot, RDMA_SC_RESOURCE_BUSY, "queue runtime is busy"));
+      return 1'b0;
+    end
+    if (consumer_release_gate_active) begin
+      lock.put(1);
+      void'(set_runtime_status_noalloc(
+        status_slot, RDMA_SC_RESOURCE_BUSY,
+        "consumer release gate is already active"));
+      return 1'b0;
+    end
+    if (state != RDMA_QUEUE_RUNTIME_RECOVERY_REQUIRED ||
+        pending_operation_state == null || host_produced ||
+        kind != RDMA_QUEUE_RUNTIME_CQ ||
+        pending_operation_state.producer ||
+        pending_operation_state.device_producer ||
+        !pending_identity_matches_locked(pending_operation_state) ||
+        pending_operation_state.kind != RDMA_QUEUE_RUNTIME_CQ ||
+        pending_operation_state.mmio_evidence != RDMA_QUEUE_MMIO_SUCCESS ||
+        !pending_operation_state.consumer_doorbell_succeeded ||
+        !pending_operation_state.consumer_committed ||
+        !pending_operation_state.cq_consumer_committed ||
+        pending_operation_state.committed_consumer_cursor == null ||
+        !pending_operation_state.completion_target_valid ||
+        pending_operation_state.completion_released ||
+        !(pending_operation_state.completion_wq_kind inside {
+            RDMA_QUEUE_RUNTIME_SQ, RDMA_QUEUE_RUNTIME_RQ,
+            RDMA_QUEUE_RUNTIME_SRQ}) ||
+        pending_operation_state.routed_qp_h == null ||
+        pending_operation_state.routed_qp_h.kind != RDMA_RESOURCE_QP ||
+        !consumer_recovery_invariant_locked(
+          pending_operation_state, pending_operation_state.mmio_evidence,
+          pending_operation_state.consumer_committed,
+          pending_operation_state.committed_consumer_cursor) ||
+        !cursor_equal(
+          consumer_index, consumer_wrap,
+          pending_operation_state.committed_consumer_cursor.index,
+          pending_operation_state.committed_consumer_cursor.wrap)) begin
+      lock.put(1);
+      void'(set_runtime_status_noalloc(
+        status_slot, RDMA_SC_INVALID_STATE,
+        "consumer release authority is invalid"));
+      return 1'b0;
+    end
+
+    consumer_release_gate_active = 1'b1;
+    void'(set_runtime_status_noalloc(status_slot, RDMA_SC_OK, ""));
+    return 1'b1;
+  endfunction
+
+  // 功能：finish_consumer_release_noalloc 结束 begin 持有的 CQ release 屏障；成功
+  //   release 时在归还 lock 前立即发布 completion_released，失败时只撤销 gate。
+  // 输入/输出及副作用：release_succeeded 表示 routed WQ mutation 的实际结果，
+  //   status_slot 是 caller 状态槽；函数清除 consumer_release_gate_active 并归还
+  //   begin 持有的 token，成功 release 同时把 slot 置 OK。
+  // 失败/边界：gate 未活动时返回 0 且绝不误归还 lock；一旦 gate 活动，本函数不再
+  //   校验可变 authority、不得失败，release_succeeded=0 时完整保留 caller 的失败
+  //   status 与 pending marker，确保所有 begin-success 路径都能无条件解锁。
+  function bit finish_consumer_release_noalloc(
+    bit release_succeeded,
+    rdma_status status_slot
+  );
+    if (!consumer_release_gate_active) begin
+      if (status_slot != null)
+        void'(set_runtime_status_noalloc(
+          status_slot, RDMA_SC_INVALID_STATE,
+          "consumer release gate is not active"));
+      return 1'b0;
+    end
+
+    if (release_succeeded) begin
+      pending_operation_state.completion_released = 1'b1;
+      if (status_slot != null)
+        void'(set_runtime_status_noalloc(status_slot, RDMA_SC_OK, ""));
+    end
+    consumer_release_gate_active = 1'b0;
+    lock.put(1);
+    return 1'b1;
   endfunction
 
   // 功能：reserve_device_producer 为 CQ/CEQ/AEQ 锁定当前 producer cursor，返回与 runtime 内部隔离的 detached 快照。
@@ -2817,6 +3056,113 @@ class rdma_queue_runtime extends uvm_object;
     return make_runtime_status(RDMA_SC_OK, "");
   endfunction
 
+  // 功能：match_and_release_noalloc 以冻结 completion cursor 原子释放 host
+  //   SQ/RQ/SRQ ledger range，供 CQ scheduler barrier 后不构造 returned slot 队列。
+  // 输入/输出及副作用：target_index/target_wrap 指定最后一项，status_slot 由 caller
+  //   预建；成功把连续 slot 标为 consumed、推进 host CI 并按项递减 used。
+  // 失败/边界：status slot/null lock、非 host ring、状态/target、
+  //   slots 容量或 used occupancy 不一致时返回 0；函数先校验完整
+  //   区间再修改任一 slot，拒绝路径保持 CI、used 和 ledger 原样。
+  function bit match_and_release_noalloc(
+    int unsigned target_index,
+    bit target_wrap,
+    rdma_status status_slot
+  );
+    int unsigned i;
+    bit w;
+    int unsigned count;
+    bit reached_target;
+    rdma_queue_slot_ledger_entry slot;
+
+    if (status_slot == null) return 1'b0;
+    if (lock == null || !lock.try_get(1)) begin
+      void'(set_runtime_status_noalloc(
+        status_slot, RDMA_SC_RESOURCE_BUSY, "queue runtime is busy"));
+      return 1'b0;
+    end
+    if (!host_produced ||
+        !(kind inside {RDMA_QUEUE_RUNTIME_SQ, RDMA_QUEUE_RUNTIME_RQ,
+                       RDMA_QUEUE_RUNTIME_SRQ}) ||
+        (state != RDMA_QUEUE_RUNTIME_ACTIVE &&
+         !(recovery_commit_allowed &&
+           state == RDMA_QUEUE_RUNTIME_RECOVERY_REQUIRED))) begin
+      lock.put(1);
+      void'(set_runtime_status_noalloc(
+        status_slot, RDMA_SC_INVALID_STATE,
+        "queue runtime is not an active host WQ"));
+      return 1'b0;
+    end
+    if (depth == 0 || target_index >= depth) begin
+      lock.put(1);
+      void'(set_runtime_status_noalloc(
+        status_slot, RDMA_SC_INVALID_ARGUMENT,
+        "completion index is outside depth"));
+      return 1'b0;
+    end
+    if (consumer_index >= depth || slots.size() < depth || used == 0 ||
+        used > depth) begin
+      lock.put(1);
+      void'(set_runtime_status_noalloc(
+        status_slot, RDMA_SC_INVALID_STATE,
+        "completion ledger geometry or occupancy is invalid"));
+      return 1'b0;
+    end
+
+    // 中文设计：先从当前 CI 到 target 逐项验证完整 outstanding ledger；任何
+    // null/unposted/consumed/stale 项都在 mutation 前拒绝，避免只释放半段 credit。
+    i = consumer_index;
+    w = consumer_wrap;
+    count = 0;
+    do begin
+      if (count >= depth || count >= used) begin
+        lock.put(1);
+        void'(set_runtime_status_noalloc(
+          status_slot, RDMA_SC_INVALID_STATE,
+          "completion cursor is not outstanding"));
+        return 1'b0;
+      end
+      slot = slots[i];
+      if (slot == null || !slot.posted || slot.consumed ||
+          slot.index != i || slot.wrap != w) begin
+        lock.put(1);
+        void'(set_runtime_status_noalloc(
+          status_slot, RDMA_SC_INVALID_STATE,
+          "completion skips an unposted slot"));
+        return 1'b0;
+      end
+      reached_target = cursor_equal(i, w, target_index, target_wrap);
+      cursor_advance(i, w);
+      count++;
+      if (reached_target) break;
+    end while (count <= depth);
+    if (!reached_target) begin
+      lock.put(1);
+      void'(set_runtime_status_noalloc(
+        status_slot, RDMA_SC_INVALID_STATE,
+        "completion cursor is not outstanding"));
+      return 1'b0;
+    end
+
+    i = consumer_index;
+    w = consumer_wrap;
+    count = 0;
+    do begin
+      slot = slots[i];
+      reached_target = cursor_equal(i, w, target_index, target_wrap);
+      slot.consumed = 1'b1;
+      slot.posted = 1'b0;
+      used--;
+      cursor_advance(i, w);
+      count++;
+      if (reached_target) break;
+    end while (count <= depth);
+    consumer_index = i;
+    consumer_wrap = w;
+    lock.put(1);
+    void'(set_runtime_status_noalloc(status_slot, RDMA_SC_OK, ""));
+    return 1'b1;
+  endfunction
+
   // 功能：snapshot_release_range 在 runtime lock 内校验从当前 host consumer CI
   //   到 target_index/target_wrap 的完整 outstanding WQE range，并深复制每一项。
   // 输入/输出及副作用：target cursor 为输入，snapshots 为输出并先清空；成功按
@@ -2960,7 +3306,8 @@ class rdma_queue_runtime extends uvm_object;
   // 功能：enter_recovery 为 SQ/RQ/SRQ host producer 保留 legacy bit 入口，将
   //   caller operation 深复制为 runtime-owned pending 并投影 NO_SUBMIT/AMBIGUOUS。
   // 输入/输出及副作用：operation、mmio_maybe_submitted（输入）；成功切换为
-  //   RECOVERY_REQUIRED 并保存 detached pending，不接管 caller 原对象或外部 backing。
+  //   RECOVERY_REQUIRED 并保存 detached pending、清空 commit/retry/release gate，
+  //   不接管 caller 原对象或外部 backing。
   // 失败/边界：非 ACTIVE、非 host-produced producer、CQ/CEQ/AEQ、identity/cursor
   //   冲突或复制分配失败时返回错误；device producer/consumer 必须使用 prepared 入口。
   function rdma_status enter_recovery(rdma_queue_pending_operation operation, bit mmio_maybe_submitted);
@@ -3099,6 +3446,7 @@ class rdma_queue_runtime extends uvm_object;
                             "legacy MMIO evidence projection failed");
     end
     recovery_commit_allowed = 1'b0;
+    consumer_release_gate_active = 1'b0;
     recovery_retry_confirmed = 1'b0;
     lock.put(1);
     return make_runtime_status(RDMA_SC_OK, "");
@@ -3107,7 +3455,8 @@ class rdma_queue_runtime extends uvm_object;
   // 功能：enter_recovery_prepared 接管调用方已完成 detached 的 pending；首次
   //   admission 安装 recovery evidence，重复 admission 只单调合并同一事务阶段。
   // 输入输出及副作用：prepared（输入）在首次成功后由 runtime 接管，状态切换为
-  //   RECOVERY_REQUIRED；重复成功只合并 MMIO/commit 阶段，reservation 保持原快照。
+  //   RECOVERY_REQUIRED；重复成功只合并 MMIO/commit 阶段并重置本轮 commit/retry/
+  //   release gate，reservation 保持原快照。
   // 失败边界：null、非 ACTIVE、identity/direction/geometry/image/status/route/epoch
   //   不完整或 reservation 冲突均原子拒绝；重复事务若 immutable evidence、cursor、
   //   MMIO 转换或阶段顺序冲突也拒绝，不发布部分 merge。
@@ -3245,6 +3594,7 @@ class rdma_queue_runtime extends uvm_object;
       if (staged_committed_cursor != null)
         pending_operation_state.committed_consumer_cursor = staged_committed_cursor;
       recovery_commit_allowed = 1'b0;
+      consumer_release_gate_active = 1'b0;
       recovery_retry_confirmed = 1'b0;
       lock.put(1);
       return make_runtime_status(RDMA_SC_OK, "");
@@ -3373,6 +3723,7 @@ class rdma_queue_runtime extends uvm_object;
         RDMA_SC_RESOURCE_EXHAUSTED,"prepared MMIO evidence projection failed");
     end
     recovery_commit_allowed = 1'b0;
+    consumer_release_gate_active = 1'b0;
     recovery_retry_confirmed = 1'b0;
     lock.put(1);
     return make_runtime_status(RDMA_SC_OK, "");
@@ -3674,8 +4025,9 @@ class rdma_queue_runtime extends uvm_object;
 
   // 功能：complete_recovery_retry 在 data engine 已完成 replay 的各外部阶段后，
   //   按 producer/consumer 方向验证最终证据并清除 pending、恢复 ACTIVE。
-  // 输入输出及副作用：无显式输入；成功清除 pending/reservation/retry 授权并
-  //   更新 state，PI/CI/used 必须已由对应 commit API 完成，本函数不重复推进。
+  // 输入输出及副作用：无显式输入；成功清除 pending/reservation、commit/retry/
+  //   release gate 并更新 state，PI/CI/used 必须已由对应 commit API 完成，本函数
+  //   不重复推进。
   // 失败边界：无 pending、identity stale、device PI 未到 next_cursor、host slot
   //   未 posted，或 consumer doorbell/CI/CQ release 阶段不全时返回错误并保留证据。
   function rdma_status complete_recovery_retry();
@@ -3771,6 +4123,7 @@ class rdma_queue_runtime extends uvm_object;
     device_reservation_valid = 1'b0;
     device_reservation = null;
     recovery_commit_allowed = 1'b0;
+    consumer_release_gate_active = 1'b0;
     recovery_retry_confirmed = 1'b0;
     state = RDMA_QUEUE_RUNTIME_ACTIVE;
     lock.put(1);
@@ -3886,7 +4239,7 @@ class rdma_queue_runtime extends uvm_object;
   // 功能：abort_recovery 放弃当前 pending 并把 attachment 隔离为 DETACHED，
   //   防止不确定 transaction 继续对旧 queue 可见。
   // 输入输出及副作用：无显式输入；成功清除 pending、device reservation、
-  //   commit/retry 授权并更新 state；不回滚已经成功的 CI，也不释放外部 mapping。
+  //   commit/retry/release gate 并更新 state；不回滚已经成功的 CI，也不释放外部 mapping。
   // 失败边界：仅 RECOVERY_REQUIRED 且 pending 非空时允许；其它状态返回
   //   INVALID_STATE，失败不改变 recovery evidence。
   function rdma_status abort_recovery();
@@ -3903,6 +4256,7 @@ class rdma_queue_runtime extends uvm_object;
     device_reservation_valid = 1'b0;
     device_reservation = null;
     recovery_commit_allowed = 1'b0;
+    consumer_release_gate_active = 1'b0;
     recovery_retry_confirmed = 1'b0;
     state = RDMA_QUEUE_RUNTIME_DETACHED;
     lock.put(1);
@@ -3946,6 +4300,53 @@ class rdma_queue_runtime extends uvm_object;
     return make_runtime_status(RDMA_SC_OK, "");
   endfunction
 
+  // 功能：enable_recovery_commit_noalloc 使用 caller 预建 status 打开一次 consumer
+  //   CI commit gate，使 scheduler/continuation barrier 后无需创建返回对象。
+  // 输入/输出及副作用：status_slot 为 caller-owned 输入；成功置
+  //   recovery_commit_allowed，并在 NO_SUBMIT/NOT_APPLICABLE 时消费本轮 confirmation。
+  // 失败/边界：slot/null lock、无 pending、NONE/AMBIGUOUS 或确定未提交却无
+  //   confirmation 时返回 0；拒绝不打开 gate、不消费既有 recovery authority。
+  function bit enable_recovery_commit_noalloc(rdma_status status_slot);
+    if (status_slot == null) return 1'b0;
+    if (lock == null || !lock.try_get(1)) begin
+      void'(set_runtime_status_noalloc(
+        status_slot, RDMA_SC_RESOURCE_BUSY, "queue runtime is busy"));
+      return 1'b0;
+    end
+    if (state != RDMA_QUEUE_RUNTIME_RECOVERY_REQUIRED ||
+        pending_operation_state == null) begin
+      lock.put(1);
+      void'(set_runtime_status_noalloc(
+        status_slot, RDMA_SC_INVALID_STATE,
+        "queue runtime has no pending recovery"));
+      return 1'b0;
+    end
+    if (pending_operation_state.mmio_evidence inside {
+          RDMA_QUEUE_MMIO_NONE, RDMA_QUEUE_MMIO_AMBIGUOUS}) begin
+      lock.put(1);
+      void'(set_runtime_status_noalloc(
+        status_slot, RDMA_SC_RECOVERY_REQUIRED,
+        "recovery commit lacks definitive MMIO evidence"));
+      return 1'b0;
+    end
+    if (pending_operation_state.mmio_evidence inside {
+          RDMA_QUEUE_MMIO_NO_SUBMIT,
+          RDMA_QUEUE_MMIO_NOT_APPLICABLE}) begin
+      if (!recovery_retry_confirmed) begin
+        lock.put(1);
+        void'(set_runtime_status_noalloc(
+          status_slot, RDMA_SC_INVALID_STATE,
+          "recovery commit lacks retry confirmation"));
+        return 1'b0;
+      end
+      recovery_retry_confirmed = 1'b0;
+    end
+    recovery_commit_allowed = 1'b1;
+    lock.put(1);
+    void'(set_runtime_status_noalloc(status_slot, RDMA_SC_OK, ""));
+    return 1'b1;
+  endfunction
+
   // 功能：snapshot_pending 为 legacy caller 返回当前 pending transaction 的
   //   完整 detached 值副本，避免暴露 runtime 内部可变 evidence。
   // 输入输出及副作用：snapshot（输出）先置 null；成功时深复制 handle、cursor、
@@ -3980,7 +4381,8 @@ class rdma_queue_runtime extends uvm_object;
   // 功能：recover 处理 retry/abort 控制动作；RETRY_PENDING 为 no-submit 重放或
   //   SUCCESS 后仅本地续做记录一次 caller confirmation，实际阶段由 data engine 完成。
   // 输入/输出及副作用：action、caller_confirmed_no_submit（输入）；授权成功仅置
-  //   recovery_retry_confirmed 并保持 RECOVERY_REQUIRED/pending，abort 清除全部恢复状态。
+  //   recovery_retry_confirmed 并保持 RECOVERY_REQUIRED/pending，abort 清除 pending
+  //   及 commit/retry/release gate 等全部恢复状态。
   // 失败/边界：无 pending、NONE/AMBIGUOUS、未确认或 action 非法时返回对应错误；
   //   AMBIGUOUS 始终不可 retry，SUCCESS 授权也不得重新提交 MMIO。
   function rdma_status recover(rdma_queue_recovery_action_e action, bit caller_confirmed_no_submit=1'b0);
@@ -4025,6 +4427,7 @@ class rdma_queue_runtime extends uvm_object;
       device_reservation_valid = 1'b0;
       device_reservation = null;
       recovery_commit_allowed = 1'b0;
+      consumer_release_gate_active = 1'b0;
       recovery_retry_confirmed = 1'b0;
       state = RDMA_QUEUE_RUNTIME_DETACHED;
       lock.put(1);
@@ -4101,5 +4504,233 @@ class rdma_queue_runtime extends uvm_object;
     return project_status != null ? project_status :
       make_runtime_status(RDMA_SC_RESOURCE_EXHAUSTED,
                           "MMIO evidence projection failed");
+  endfunction
+
+  // 功能：record_recovery_failure_noalloc 在 consumer scheduler 返回后，把本次
+  //   MMIO enum 与真实阶段错误原子写入既有 pending，不创建 status 或 evidence。
+  // 输入/输出及副作用：evidence/actual_failure 为输入，status_slot 是 caller 预建
+  //   的错误槽；成功单调更新 enum/兼容位并按值覆盖 pending.failure_status。
+  // 失败/边界：slot/null lock、无 pending、非法/降级转换、成功 actual_failure 或
+  //   缺诊断目标时返回 0；拒绝不会消费 confirmation、改变 enum、gate 或诊断。
+  function bit record_recovery_failure_noalloc(
+    rdma_queue_mmio_evidence_e evidence,
+    rdma_status actual_failure,
+    rdma_status status_slot
+  );
+    rdma_queue_mmio_evidence_e current;
+    bit transition_allowed;
+    bit consume_confirmation;
+
+    if (status_slot == null) return 1'b0;
+    if (lock == null || !lock.try_get(1)) begin
+      void'(set_runtime_status_noalloc(
+        status_slot, RDMA_SC_RESOURCE_BUSY, "queue runtime is busy"));
+      return 1'b0;
+    end
+    if (state != RDMA_QUEUE_RUNTIME_RECOVERY_REQUIRED ||
+        pending_operation_state == null) begin
+      lock.put(1);
+      void'(set_runtime_status_noalloc(
+        status_slot, RDMA_SC_INVALID_STATE,
+        "queue runtime has no pending recovery"));
+      return 1'b0;
+    end
+    if (!(evidence inside {RDMA_QUEUE_MMIO_NONE,
+                           RDMA_QUEUE_MMIO_NOT_APPLICABLE,
+                           RDMA_QUEUE_MMIO_NO_SUBMIT,
+                           RDMA_QUEUE_MMIO_SUCCESS,
+                           RDMA_QUEUE_MMIO_AMBIGUOUS})) begin
+      lock.put(1);
+      void'(set_runtime_status_noalloc(
+        status_slot, RDMA_SC_INVALID_ARGUMENT,
+        "MMIO evidence is invalid"));
+      return 1'b0;
+    end
+    if (actual_failure != null &&
+        (actual_failure.ok() || pending_operation_state.failure_status == null)) begin
+      lock.put(1);
+      void'(set_runtime_status_noalloc(
+        status_slot, RDMA_SC_INVALID_ARGUMENT,
+        "recovery failure status is invalid"));
+      return 1'b0;
+    end
+
+    current = pending_operation_state.mmio_evidence;
+    transition_allowed = 1'b0;
+    consume_confirmation = 1'b0;
+    if (pending_operation_state.device_producer) begin
+      case (current)
+        RDMA_QUEUE_MMIO_NONE: begin
+          transition_allowed = evidence inside {
+            RDMA_QUEUE_MMIO_NONE, RDMA_QUEUE_MMIO_NO_SUBMIT};
+          if (evidence == RDMA_QUEUE_MMIO_NOT_APPLICABLE)
+            transition_allowed = pending_operation_state.device_write_attempted;
+        end
+        RDMA_QUEUE_MMIO_NO_SUBMIT: begin
+          transition_allowed = (evidence == RDMA_QUEUE_MMIO_NO_SUBMIT);
+          if (evidence == RDMA_QUEUE_MMIO_NOT_APPLICABLE) begin
+            transition_allowed = recovery_retry_confirmed &&
+                                 pending_operation_state.device_write_attempted;
+            consume_confirmation = transition_allowed;
+          end
+        end
+        RDMA_QUEUE_MMIO_NOT_APPLICABLE:
+          transition_allowed =
+            (evidence == RDMA_QUEUE_MMIO_NOT_APPLICABLE);
+        default:
+          transition_allowed = 1'b0;
+      endcase
+    end
+    else begin
+      case (current)
+        RDMA_QUEUE_MMIO_NONE:
+          transition_allowed = evidence inside {
+            RDMA_QUEUE_MMIO_NONE, RDMA_QUEUE_MMIO_NO_SUBMIT,
+            RDMA_QUEUE_MMIO_SUCCESS, RDMA_QUEUE_MMIO_AMBIGUOUS};
+        RDMA_QUEUE_MMIO_NO_SUBMIT: begin
+          transition_allowed = (evidence == RDMA_QUEUE_MMIO_NO_SUBMIT);
+          if (evidence inside {RDMA_QUEUE_MMIO_SUCCESS,
+                               RDMA_QUEUE_MMIO_AMBIGUOUS}) begin
+            transition_allowed = recovery_retry_confirmed;
+            consume_confirmation = transition_allowed;
+          end
+        end
+        RDMA_QUEUE_MMIO_SUCCESS:
+          transition_allowed = (evidence == RDMA_QUEUE_MMIO_SUCCESS);
+        RDMA_QUEUE_MMIO_AMBIGUOUS:
+          transition_allowed = (evidence == RDMA_QUEUE_MMIO_AMBIGUOUS);
+        default:
+          transition_allowed = 1'b0;
+      endcase
+    end
+    if (!transition_allowed) begin
+      lock.put(1);
+      void'(set_runtime_status_noalloc(
+        status_slot, RDMA_SC_INVALID_STATE,
+        "MMIO evidence transition is unauthorized"));
+      return 1'b0;
+    end
+
+    // 中文设计：转换、诊断目标和 caller confirmation 均已验证；以下更新作为
+    // 一个锁内发布点完成，SUCCESS 同时产生唯一 doorbell-success 派生 marker。
+    pending_operation_state.mmio_evidence = evidence;
+    pending_operation_state.known_no_mmio =
+      evidence inside {RDMA_QUEUE_MMIO_NOT_APPLICABLE,
+                       RDMA_QUEUE_MMIO_NO_SUBMIT};
+    pending_operation_state.mmio_maybe_submitted =
+      (evidence == RDMA_QUEUE_MMIO_AMBIGUOUS);
+    pending_operation_state.consumer_doorbell_succeeded =
+      (evidence == RDMA_QUEUE_MMIO_SUCCESS);
+    if (actual_failure != null) begin
+      pending_operation_state.failure_status.category = actual_failure.category;
+      pending_operation_state.failure_status.code = actual_failure.code;
+      pending_operation_state.failure_status.hardware_code =
+        actual_failure.hardware_code;
+      pending_operation_state.failure_status.hardware_code_valid =
+        actual_failure.hardware_code_valid;
+      pending_operation_state.failure_status.source_engine =
+        actual_failure.source_engine;
+      pending_operation_state.failure_status.function_uid =
+        actual_failure.function_uid;
+      pending_operation_state.failure_status.generation =
+        actual_failure.generation;
+      pending_operation_state.failure_status.resource_id =
+        actual_failure.resource_id;
+      pending_operation_state.failure_status.command_id =
+        actual_failure.command_id;
+      pending_operation_state.failure_status.wr_id = actual_failure.wr_id;
+      pending_operation_state.failure_status.severity = actual_failure.severity;
+      pending_operation_state.failure_status.retryable = actual_failure.retryable;
+      pending_operation_state.failure_status.message = actual_failure.message;
+    end
+    if (consume_confirmation)
+      recovery_retry_confirmed = 1'b0;
+    recovery_commit_allowed = 1'b0;
+    lock.put(1);
+    // 成功时保留 caller slot 当前内容；若 actual_failure 与 slot 是同一对象，
+    // 调用方仍可原样返回真实阶段错误，而不是被辅助 API 的 OK 覆盖。
+    return 1'b1;
+  endfunction
+
+  // 功能：complete_consumer_recovery_noalloc 在 consumer commit 和可选 CQ WQE
+  //   release 均完成后，单调合并 release marker 并一次性恢复 ACTIVE。
+  // 输入/输出及副作用：completion_released_now 表示本次外部 release 已成功，
+  //   status_slot 由 caller 预建；成功清除 pending/reservation 及 commit/retry/
+  //   release gate 并更新 state。
+  // 失败/边界：slot/null lock、identity/CI/doorbell/commit marker 不完整、event 携带
+  //   CQ release 或 CQ target 未释放时返回 0；拒绝保持 pending 和所有阶段位原样。
+  function bit complete_consumer_recovery_noalloc(
+    bit completion_released_now,
+    rdma_status status_slot
+  );
+    bit release_complete;
+
+    if (status_slot == null) return 1'b0;
+    if (lock == null || !lock.try_get(1)) begin
+      void'(set_runtime_status_noalloc(
+        status_slot, RDMA_SC_RESOURCE_BUSY, "queue runtime is busy"));
+      return 1'b0;
+    end
+    if (state != RDMA_QUEUE_RUNTIME_RECOVERY_REQUIRED ||
+        pending_operation_state == null || host_produced ||
+        !is_device_ring_kind(kind) || pending_operation_state.producer ||
+        pending_operation_state.device_producer ||
+        !pending_identity_matches_locked(pending_operation_state) ||
+        pending_operation_state.kind != kind ||
+        pending_operation_state.mmio_evidence != RDMA_QUEUE_MMIO_SUCCESS ||
+        !pending_operation_state.consumer_doorbell_succeeded ||
+        !pending_operation_state.consumer_committed ||
+        pending_operation_state.committed_consumer_cursor == null ||
+        !consumer_recovery_invariant_locked(
+          pending_operation_state, pending_operation_state.mmio_evidence,
+          pending_operation_state.consumer_committed,
+          pending_operation_state.committed_consumer_cursor) ||
+        !cursor_equal(
+          consumer_index, consumer_wrap,
+          pending_operation_state.committed_consumer_cursor.index,
+          pending_operation_state.committed_consumer_cursor.wrap)) begin
+      lock.put(1);
+      void'(set_runtime_status_noalloc(
+        status_slot, RDMA_SC_INVALID_STATE,
+        "consumer recovery stages are incomplete"));
+      return 1'b0;
+    end
+
+    release_complete = pending_operation_state.completion_released ||
+                       completion_released_now;
+    if (kind == RDMA_QUEUE_RUNTIME_CQ) begin
+      if (!pending_operation_state.cq_consumer_committed ||
+          (pending_operation_state.completion_target_valid &&
+           !release_complete)) begin
+        lock.put(1);
+        void'(set_runtime_status_noalloc(
+          status_slot, RDMA_SC_INVALID_STATE,
+          "CQ completion release is incomplete"));
+        return 1'b0;
+      end
+    end
+    else if (completion_released_now ||
+             pending_operation_state.completion_target_valid ||
+             pending_operation_state.completion_released) begin
+      lock.put(1);
+      void'(set_runtime_status_noalloc(
+        status_slot, RDMA_SC_INVALID_STATE,
+        "event recovery cannot publish a CQ release stage"));
+      return 1'b0;
+    end
+
+    if (kind == RDMA_QUEUE_RUNTIME_CQ &&
+        pending_operation_state.completion_target_valid && release_complete)
+      pending_operation_state.completion_released = 1'b1;
+    pending_operation_state = null;
+    device_reservation_valid = 1'b0;
+    device_reservation = null;
+    recovery_commit_allowed = 1'b0;
+    consumer_release_gate_active = 1'b0;
+    recovery_retry_confirmed = 1'b0;
+    state = RDMA_QUEUE_RUNTIME_ACTIVE;
+    lock.put(1);
+    void'(set_runtime_status_noalloc(status_slot, RDMA_SC_OK, ""));
+    return 1'b1;
   endfunction
 endclass
