@@ -402,6 +402,47 @@ class rdma_queue_backing_access extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：write_device 按 RDMA_DMA_DEVICE_WRITE 方向预检并将调用方 payload 依次写入所有 backing span，供 Host-memory device producer 发布使用。
+  // 输入/输出及副作用：offset、data 为输入，backend_write_started 为输出；函数先解析并完整预检 spans，再按逻辑顺序调用 host_mem.write()，首次进入 backend 前将 backend_write_started 置 1；不更新 runtime、mapping ownership 或 cursor。
+  // 失败/边界：resolve/preflight 或任一 backend write 返回 null status 时统一为 RDMA_SC_INVALID_STATE；预检失败时 backend_write_started 保持 0 且不发起任何写调用，backend 非成功状态原样传播且后续 span 不再写入。
+  function rdma_status write_device(
+      longint unsigned offset,
+      byte data[],
+      output bit backend_write_started
+  );
+    rdma_queue_backing_span spans[$];
+    rdma_status status;
+    longint unsigned position;
+    byte chunk[];
+
+    backend_write_started = 1'b0;
+    status = resolve(offset, data.size(), spans);
+    if (status == null || !status.ok())
+      return status == null ?
+        rdma_status::make(RDMA_SC_INVALID_STATE,
+                          "device write resolve returned null status") : status;
+    status = preflight_spans(spans, RDMA_DMA_DEVICE_WRITE);
+    if (status == null || !status.ok())
+      return status == null ?
+        rdma_status::make(RDMA_SC_INVALID_STATE,
+                          "device write preflight returned null status") : status;
+    position = 0;
+    foreach (spans[i]) begin
+      chunk = new[spans[i].length];
+      foreach (chunk[j])
+        chunk[j] = data[position + j];
+      backend_write_started = 1'b1;
+      status = host_mem.write(spans[i].mapping, spans[i].mapping_offset,
+                              chunk);
+      if (status == null)
+        return invalid_state("host memory device write returned null status");
+      if (!status.ok())
+        return status;
+      position += spans[i].length;
+    end
+    return rdma_status::success();
+  endfunction
+
   // 功能：在 rdma_queue_backing_access 中，write 把请求数据写入指定后端并保留返回状态；只有写入成功才允许本地游标继续推进。
   // 输入/输出及副作用：offset（输入）、data（输入）；输入 request/image/cursor 决定写入内容；成功时更新 PI/CI、slot ledger 或 pending journal，并通过 output
   //   返回结果。

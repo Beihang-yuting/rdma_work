@@ -72,6 +72,45 @@ class rdma_queue_backing_access_test extends uvm_test;
         expected, status == null ? "null" : status.convert2string()))
   endfunction
 
+  // 功能：assert_device_write_contract 验证面向设备写入的方向权限与跨 span 原子预检契约。
+  // 输入/输出及副作用：access、mem、m0、m1（输入）；task 调整两个 mapping 的权限，调用 write_device/write 并通过 UVM 报告状态、backend_write_started 及后端 write 调用次数；不转移 fixture 所有权。
+  // 失败/边界：任一 span 的 device_write 权限缺失时必须在首个 backend write 前失败并保持调用次数不变；成功路径必须跨两个 span 写入并将 backend_write_started 置位，普通 write 在 device_read 缺失时必须返回 RDMA_SC_DMA_PERMISSION。
+  task automatic assert_device_write_contract(
+    rdma_queue_backing_access access,
+    rdma_mock_host_mem mem,
+    rdma_dma_mapping m0,
+    rdma_dma_mapping m1
+  );
+    byte payload[] = new[16];
+    rdma_status status;
+    bit backend_write_started;
+    int unsigned write_calls;
+
+    foreach (payload[i]) payload[i] = byte'(i);
+    m0.permissions.device_read = 1'b0;
+    m1.permissions.device_read = 1'b0;
+    write_calls = call_count(mem, "write");
+    backend_write_started = 1'b1;
+    status = access.write_device(4096 - 8, payload, backend_write_started);
+    if (status == null || !status.ok())
+      `uvm_error("DEVICE_WRITE", "DEVICE_WRITE mapping was rejected")
+    if (!backend_write_started)
+      `uvm_error("DEVICE_WRITE_STARTED", "successful write did not report backend entry")
+    if (call_count(mem, "write") != write_calls + 2)
+      `uvm_error("DEVICE_WRITE_SPANS", "device write did not visit both spans")
+    status = access.write(4096 - 8, payload);
+    expect_code("WRITE_DIRECTION", status, RDMA_SC_DMA_PERMISSION);
+    m1.permissions.device_write = 1'b0;
+    write_calls = call_count(mem, "write");
+    backend_write_started = 1'b1;
+    status = access.write_device(4096 - 8, payload, backend_write_started);
+    expect_code("DEVICE_PREFLIGHT_PERMISSION", status, RDMA_SC_DMA_PERMISSION);
+    if (backend_write_started)
+      `uvm_error("DEVICE_PREFLIGHT_STARTED", "preflight failure entered backend")
+    if (call_count(mem, "write") != write_calls)
+      `uvm_error("DEVICE_PREFLIGHT", "failed span was written")
+  endtask
+
   // 功能：在 rdma_queue_backing_access_test 中，run_phase 驱动 UVM 阶段中的场景初始化、事务执行和断言收尾，并在退出前释放 objection 或测试资源。
   // 输入/输出及副作用：phase（输入）；phase 由 UVM 提供；task 通过 objection、日志和断言暴露结果，可能调用 DUT 接口但不改变其所有权规则。
   // 失败/边界：run_phase 的 setup/阶段驱动失败时停止新增事务，并按测试生命周期清理 objection 与临时引用。
@@ -211,6 +250,8 @@ class rdma_queue_backing_access_test extends uvm_test;
 
     if (call_count(mem, "release") != 0)
       `uvm_error("BORROWED_RELEASE", "access helper released borrowed backing")
+
+    assert_device_write_contract(access, mem, m0, m1);
 
     phase.drop_objection(this);
   endtask
