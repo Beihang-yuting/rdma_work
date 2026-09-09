@@ -473,8 +473,8 @@ class rdma_queue_runtime extends uvm_object;
   protected function bit pending_cursor_shape_valid(
     rdma_queue_pending_operation pending
   );
-    rdma_queue_cursor_snapshot expected_next;
-    rdma_status status;
+    int unsigned expected_next_index;
+    bit expected_next_wrap;
     longint unsigned expected_offset;
 
     if (pending == null || pending.cursor == null ||
@@ -488,10 +488,15 @@ class rdma_queue_runtime extends uvm_object;
     expected_offset = longint'(pending.cursor.index) * pending.entry_size;
     if (pending.entry_offset != expected_offset)
       return 1'b0;
-    status = derive_next_cursor(pending.cursor, expected_next);
-    if (!status_is_ok(status) || expected_next == null)
-      return 1'b0;
-    return cursor_equal(expected_next.index, expected_next.wrap,
+    expected_next_index = pending.cursor.index;
+    expected_next_wrap = pending.cursor.wrap;
+    if (expected_next_index + 1 >= depth) begin
+      expected_next_index = 0;
+      expected_next_wrap = ~expected_next_wrap;
+    end
+    else
+      expected_next_index++;
+    return cursor_equal(expected_next_index, expected_next_wrap,
                         pending.next_cursor.index, pending.next_cursor.wrap);
   endfunction
 
@@ -639,6 +644,59 @@ class rdma_queue_runtime extends uvm_object;
     candidate.severity = source.severity;
     candidate.retryable = source.retryable;
     candidate.message = source.message;
+    copy = candidate;
+    return make_runtime_status(RDMA_SC_OK, "");
+  endfunction
+
+  // 功能：clone_slot_value_nonfatal 为一个已校验的 host WQE ledger entry 建立
+  //   完整 detached 值副本，供 CQ poll 在任何 consumer 副作用前预物化结果。
+  // 输入/输出及副作用：source 为输入、copy 为输出并先置 null；复制 slot 标量、
+  //   request_snapshot、image 与 completion_status，不修改 runtime-owned source。
+  // 失败/边界：source 为空、raw factory 返回 null/错误类型，或任一 nested value
+  //   复制失败时返回非成功且 copy=null；调用方必须丢弃整个 range candidate。
+  protected function rdma_status clone_slot_value_nonfatal(
+    rdma_queue_slot_ledger_entry source,
+    output rdma_queue_slot_ledger_entry copy
+  );
+    rdma_queue_slot_ledger_entry candidate;
+    rdma_status status;
+    uvm_object raw_candidate;
+
+    copy = null;
+    if (source == null)
+      return make_runtime_status(RDMA_SC_INVALID_STATE,
+                                 "release range contains a null slot");
+    raw_candidate = factory_create_object_nonfatal(
+      rdma_queue_slot_ledger_entry::get_type(), "release_range_slot_copy");
+    if (raw_candidate == null || !$cast(candidate, raw_candidate))
+      return make_runtime_status(RDMA_SC_RESOURCE_EXHAUSTED,
+                                 "release range slot allocation failed");
+    status = clone_request_value_nonfatal(source.request_snapshot,
+                                          candidate.request_snapshot);
+    if (!status_is_ok(status))
+      return status == null ?
+        make_runtime_status(RDMA_SC_RESOURCE_EXHAUSTED,
+                            "release range request copy returned null status") :
+        status;
+    status = clone_image_value_nonfatal(source.image, candidate.image);
+    if (!status_is_ok(status))
+      return status == null ?
+        make_runtime_status(RDMA_SC_RESOURCE_EXHAUSTED,
+                            "release range image copy returned null status") :
+        status;
+    status = clone_status_value_nonfatal(source.completion_status,
+                                         candidate.completion_status);
+    if (!status_is_ok(status))
+      return status == null ?
+        make_runtime_status(RDMA_SC_RESOURCE_EXHAUSTED,
+                            "release range status copy returned null status") :
+        status;
+    candidate.posted = source.posted;
+    candidate.consumed = source.consumed;
+    candidate.signaled = source.signaled;
+    candidate.wr_id = source.wr_id;
+    candidate.index = source.index;
+    candidate.wrap = source.wrap;
     copy = candidate;
     return make_runtime_status(RDMA_SC_OK, "");
   endfunction
@@ -1835,13 +1893,10 @@ class rdma_queue_runtime extends uvm_object;
   //   evidence 或 consumer invariant 损坏时返回错误；失败不得部分推进 CI/used。
   function rdma_status commit_consumer(rdma_queue_cursor_snapshot reservation);
     rdma_status lock_status;
-    rdma_status next_status;
-    rdma_queue_cursor_snapshot expected_next;
     rdma_queue_cursor_snapshot committed_copy;
     bit recovery_path;
     bit ci_at_pending;
     bit ci_at_next;
-    uvm_object raw_committed_copy;
 
     if (reservation == null)
       return make_runtime_status(RDMA_SC_INVALID_ARGUMENT,
@@ -1930,17 +1985,6 @@ class rdma_queue_runtime extends uvm_object;
       return make_runtime_status(RDMA_SC_INVALID_STATE,
                                  "consumer recovery reservation is stale");
     end
-    next_status = derive_next_cursor(pending_operation_state.cursor, expected_next);
-    if (!status_is_ok(next_status) || expected_next == null ||
-        !cursor_equal(expected_next.index, expected_next.wrap,
-                      pending_operation_state.next_cursor.index,
-                      pending_operation_state.next_cursor.wrap)) begin
-      lock.put(1);
-      return (next_status != null && !next_status.ok()) ? next_status :
-        make_runtime_status(RDMA_SC_INVALID_STATE,
-                            "consumer recovery next cursor is invalid");
-    end
-
     ci_at_pending = cursor_equal(consumer_index, consumer_wrap,
                                  pending_operation_state.cursor.index,
                                  pending_operation_state.cursor.wrap);
@@ -1963,16 +2007,9 @@ class rdma_queue_runtime extends uvm_object;
                                  "committed consumer cursor is inconsistent");
     end
     if (pending_operation_state.committed_consumer_cursor == null) begin
-      raw_committed_copy = factory_create_object_nonfatal(
-        rdma_queue_cursor_snapshot::get_type(), "committed_consumer_cursor");
-      if (raw_committed_copy == null ||
-          !$cast(committed_copy, raw_committed_copy)) begin
-        lock.put(1);
-        return make_runtime_status(RDMA_SC_RESOURCE_EXHAUSTED,
-                                   "committed consumer cursor allocation failed");
-      end
-      committed_copy.index = pending_operation_state.next_cursor.index;
-      committed_copy.wrap = pending_operation_state.next_cursor.wrap;
+      // next_cursor 在 prepared admission 前已作为 runtime-owned detached
+      // 值完成物化；commit 只发布该不可变证据的别名，避免 doorbell 后再分配。
+      committed_copy = pending_operation_state.next_cursor;
     end
 
     // CI 与 used 先在锁内形成候选提交状态，再用共享 invariant 验证；若内部
@@ -2776,6 +2813,87 @@ class rdma_queue_runtime extends uvm_object;
     end while (count <= depth);
     consumer_index = i;
     consumer_wrap = w;
+    lock.put(1);
+    return make_runtime_status(RDMA_SC_OK, "");
+  endfunction
+
+  // 功能：snapshot_release_range 在 runtime lock 内校验从当前 host consumer CI
+  //   到 target_index/target_wrap 的完整 outstanding WQE range，并深复制每一项。
+  // 输入/输出及副作用：target cursor 为输入，snapshots 为输出并先清空；成功按
+  //   消费顺序返回 detached slot/request/image/status 值，不推进 CI、不减少 used。
+  // 失败/边界：非 ACTIVE host ring、空/越界/非 outstanding target、畸形 ledger，
+  //   或任一 raw factory/nested copy 失败时清空全部输出且 ledger/游标/credit 不变。
+  function rdma_status snapshot_release_range(
+    int unsigned target_index,
+    bit target_wrap,
+    output rdma_queue_slot_ledger_entry snapshots[$]
+  );
+    int unsigned i;
+    bit w;
+    int unsigned count;
+    bit reached_target;
+    rdma_queue_slot_ledger_entry slot;
+    rdma_queue_slot_ledger_entry slot_copy;
+    rdma_queue_slot_ledger_entry staged[$];
+    rdma_status lock_status;
+    rdma_status copy_status;
+
+    snapshots.delete();
+    staged.delete();
+    lock_status = acquire_lock();
+    if (!status_is_ok(lock_status)) return lock_status;
+    if (state != RDMA_QUEUE_RUNTIME_ACTIVE || !host_produced ||
+        is_device_ring_kind(kind) || depth == 0 || slots.size() < depth) begin
+      lock.put(1);
+      return make_runtime_status(RDMA_SC_INVALID_STATE,
+                                 "release range runtime is not active host WQ");
+    end
+    if (target_index >= depth) begin
+      lock.put(1);
+      return make_runtime_status(RDMA_SC_INVALID_ARGUMENT,
+                                 "completion index is outside depth");
+    end
+    if (used == 0 || used > depth) begin
+      lock.put(1);
+      return make_runtime_status(RDMA_SC_INVALID_STATE,
+                                 "release range has invalid occupancy");
+    end
+
+    i = consumer_index;
+    w = consumer_wrap;
+    count = 0;
+    do begin
+      if (count >= used || count >= depth) begin
+        lock.put(1);
+        snapshots.delete();
+        return make_runtime_status(RDMA_SC_INVALID_STATE,
+                                   "completion cursor is not outstanding");
+      end
+      slot = slots[i];
+      if (slot == null || !slot.posted || slot.consumed ||
+          slot.index != i || slot.wrap != w) begin
+        lock.put(1);
+        snapshots.delete();
+        return make_runtime_status(RDMA_SC_INVALID_STATE,
+                                   "completion skips an unposted slot");
+      end
+      copy_status = clone_slot_value_nonfatal(slot, slot_copy);
+      if (!status_is_ok(copy_status) || slot_copy == null) begin
+        lock.put(1);
+        snapshots.delete();
+        return copy_status == null ?
+          make_runtime_status(RDMA_SC_RESOURCE_EXHAUSTED,
+                              "release range clone returned null status") :
+          copy_status;
+      end
+      staged.push_back(slot_copy);
+      reached_target = cursor_equal(i, w, target_index, target_wrap);
+      cursor_advance(i, w);
+      count++;
+      if (reached_target) break;
+    end while (count <= depth);
+
+    foreach (staged[j]) snapshots.push_back(staged[j]);
     lock.put(1);
     return make_runtime_status(RDMA_SC_OK, "");
   endfunction
@@ -3917,13 +4035,16 @@ class rdma_queue_runtime extends uvm_object;
                                "recovery action is invalid");
   endfunction
 
-  // 功能：record_recovery_failure 原样记录 backend 提供的 MMIO enum，并通过
-  //   单调转换表刷新兼容投影；不得根据 direction 或旧 bit 改写 evidence。
-  // 输入/输出及副作用：evidence（输入）；成功时更新 pending evidence/派生位、
-  //   关闭旧 commit gate并清除未消费 retry 授权；拒绝转换保留全部原状态。
-  // 失败/边界：无 pending、非法 enum、方向冲突、降级或缺少一次性 confirmation
-  //   时返回错误；失败不改变原 enum/兼容位和 producer/consumer 账本。
-  function rdma_status record_recovery_failure(rdma_queue_mmio_evidence_e evidence);
+  // 功能：record_recovery_failure 原样记录 backend MMIO enum，并可把本次真实
+  //   doorbell/commit/release 错误写入 admission 前预分配的 failure_status。
+  // 输入/输出及副作用：evidence 与可选 actual_failure 为输入；成功时在同一锁内
+  //   更新 enum/兼容投影、诊断字段并关闭旧 commit/retry gate，不推进任何游标。
+  // 失败/边界：无 pending、非法/降级 enum、actual_failure 为成功或目标 status
+  //   缺失时原子拒绝；actual_failure=null 表示只更新阶段，不以 sentinel 覆盖真错误。
+  function rdma_status record_recovery_failure(
+    rdma_queue_mmio_evidence_e evidence,
+    rdma_status actual_failure = null
+  );
     rdma_status lock_status;
     rdma_status project_status;
     lock_status = acquire_lock();
@@ -3940,8 +4061,39 @@ class rdma_queue_runtime extends uvm_object;
       return make_runtime_status(RDMA_SC_INVALID_ARGUMENT,
                                  "MMIO evidence is invalid");
     end
+    if (actual_failure != null &&
+        (actual_failure.ok() || pending_operation_state.failure_status == null)) begin
+      lock.put(1);
+      return make_runtime_status(RDMA_SC_INVALID_ARGUMENT,
+                                 "recovery failure status is invalid");
+    end
     project_status = project_mmio_evidence_locked(evidence);
     if (status_is_ok(project_status)) begin
+      if (actual_failure != null) begin
+        pending_operation_state.failure_status.category =
+          actual_failure.category;
+        pending_operation_state.failure_status.code = actual_failure.code;
+        pending_operation_state.failure_status.hardware_code =
+          actual_failure.hardware_code;
+        pending_operation_state.failure_status.hardware_code_valid =
+          actual_failure.hardware_code_valid;
+        pending_operation_state.failure_status.source_engine =
+          actual_failure.source_engine;
+        pending_operation_state.failure_status.function_uid =
+          actual_failure.function_uid;
+        pending_operation_state.failure_status.generation =
+          actual_failure.generation;
+        pending_operation_state.failure_status.resource_id =
+          actual_failure.resource_id;
+        pending_operation_state.failure_status.command_id =
+          actual_failure.command_id;
+        pending_operation_state.failure_status.wr_id = actual_failure.wr_id;
+        pending_operation_state.failure_status.severity =
+          actual_failure.severity;
+        pending_operation_state.failure_status.retryable =
+          actual_failure.retryable;
+        pending_operation_state.failure_status.message = actual_failure.message;
+      end
       recovery_retry_confirmed = 1'b0;
       recovery_commit_allowed = 1'b0;
     end
