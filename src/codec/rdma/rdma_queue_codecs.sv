@@ -1463,6 +1463,91 @@ class rdma_hw_cqe_codec extends rdma_hw_queue_codec_base;
     return rdma_status::success();
   endfunction
 
+  // 功能：encode_with_entry_bytes 使用调用方指定的 32/64/128B CQE profile
+  //       编码一份 detached 硬件镜像；它为本次调用新建局部 builder，复用
+  //       validate_model/encode_fields/check_reserved，并保持 active_bytes 不变。
+  // 输入/输出及副作用：model 为只读 CQE 模型，entry_size 为显式 profile，
+  //       image 为输出镜像；成功时 image.bytes、length、alignment、endian、
+  //       image_kind、hardware_version 和 function_generation 完整发布，
+  //       不取得 ring、backing 或其他外部资源的所有权。
+  // 失败边界：entry_size 不是 32/64/128、模型代际无效、builder 分配/复位、
+  //       字段编码、保留位检查、序列化或 image 分配失败时返回明确错误，
+  //       image 保持 null；进入本函数的任何路径都不能修改 active_bytes。
+  virtual function rdma_status encode_with_entry_bytes(
+      rdma_hw_model model,
+      int unsigned entry_size,
+      output rdma_hw_image image
+  );
+    rdma_hw_qword_builder builder;
+    byte unsigned bytes[];
+    rdma_hw_image candidate;
+    rdma_status status;
+
+    image = null;
+    if (!(entry_size inside {32, 64, 128}))
+      return err("CQE profile size is invalid");
+
+    status = validate_model(model);
+    if (status == null)
+      return err("CQE model validation returned null");
+    if (!status.ok())
+      return status;
+
+    builder = new("cqe_encode_profile");
+    if (builder == null)
+      return err("CQE profile builder allocation failed");
+
+    status = builder.reset(entry_size);
+    if (status == null)
+      return err("CQE profile builder reset returned null");
+    if (!status.ok()) begin
+      if (status.message == "")
+        return err("CQE profile builder reset failed");
+      return err(status.message);
+    end
+
+    status = encode_fields(model, builder);
+    if (status == null)
+      return err("CQE field encode returned null");
+    if (!status.ok())
+      return status;
+
+    status = check_reserved(builder);
+    if (status == null)
+      return err("CQE reserved check returned null");
+    if (!status.ok())
+      return err(status.message == "" ?
+                 "CQE reserved check failed" : status.message);
+
+    bytes = new[0];
+    status = builder.serialize(bytes);
+    if (status == null)
+      return err("CQE profile serialize returned null");
+    if (!status.ok())
+      return err(status.message == "" ?
+                 "CQE profile serialize failed" : status.message);
+    if (bytes.size() != entry_size)
+      return err("CQE profile serialize length is invalid");
+
+    candidate = rdma_hw_image::type_id::create("cqe_profile_image");
+    if (candidate == null)
+      return err("CQE profile image allocation failed");
+    foreach (bytes[i])
+      candidate.bytes.push_back(bytes[i]);
+    candidate.length = entry_size;
+    candidate.alignment = entry_size;
+    candidate.endian = RDMA_ENDIAN_BIG;
+    candidate.image_kind = RDMA_IMAGE_CQE;
+    candidate.hardware_version = RDMA_HW_VERSION;
+    candidate.function_generation = model_handle_generation(model);
+    candidate.write_target_kind = RDMA_HW_TARGET_NONE;
+    candidate.backing_target = '0;
+    candidate.hmc_target = '0;
+    candidate.bar_target = '0;
+    image = candidate;
+    return rdma_status::success();
+  endfunction
+
   // 功能：validate_image_with_entry_bytes 按调用方指定的 CQE profile 校验
   //       image metadata 和保留位，避免共享 codec 的 active_bytes 串扰。
   // 输入/输出及副作用：image、entry_size 为输入；函数只读取 image 字节并

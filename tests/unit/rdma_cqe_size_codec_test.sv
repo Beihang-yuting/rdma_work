@@ -13,6 +13,41 @@ class rdma_cqe_size_codec_test extends uvm_test;
     super.new(name,parent);
   endfunction
 
+  // 功能：make_hw_cqe_model 构造一份可直接交给 rdma_hw_cqe_codec 编码的
+  // 完整 CQE 模型，覆盖句柄代际、完成状态、opcode 和 ring 游标等关键字段。
+  // 输入/输出及副作用：无输入；返回值是测试独占的 rdma_hw_cqe_model，内部
+  // 新建 QP 值句柄和成功状态，不取得 resource manager 或 backing 的所有权。
+  // 失败边界：该辅助函数只构造本地值；若后续测试改动字段使 validate() 拒绝，
+  // 应由调用方报告具体 codec 状态，函数本身不隐式修复或重试。
+  function automatic rdma_hw_cqe_model make_hw_cqe_model();
+    rdma_hw_cqe_model model;
+    rdma_handle qp_h;
+
+    model = rdma_hw_cqe_model::type_id::create("explicit_profile_source");
+    qp_h = rdma_handle::type_id::create("explicit_profile_qp");
+    qp_h.kind = RDMA_RESOURCE_QP;
+    qp_h.function_uid = 64'h0102_0304_0506_0708;
+    qp_h.object_id = 32'h0000_0042;
+    qp_h.generation = 11;
+
+    model.qp_h = qp_h;
+    model.wr_id = 64'h1122_3344_5566_7788;
+    model.opcode = RDMA_WR_SEND;
+    model.status = rdma_status::success("CQE completed");
+    model.byte_len = 32'h0000_0040;
+    model.immediate_data = 32'hcafe_beef;
+    model.qpn = 18'h2a55;
+    model.wqe_index = 15'h1234;
+    model.wqe_wrap = 1'b1;
+    model.rq_cqe = 1'b0;
+    model.polarity = 1'b1;
+    model.packet_opcode = 8'h04;
+    model.ecode = 8'h00;
+    model.payload_len = 32'h0000_0040;
+    model.signature = 8'ha5;
+    return model;
+  endfunction
+
   // 功能：执行三种 CQE profile 的字段编码、解码和关键字段相等断言。
   // 输入输出及副作用：无显式输入；失败通过 UVM error/fatal 报告，不修改生产状态。
   // 失败边界：任一 profile layout 无效、codec 返回错误或 qpn/wr_id 不一致即测试失败。
@@ -95,6 +130,108 @@ class rdma_cqe_size_codec_test extends uvm_test;
     end
   endtask
 
+  // 功能：test_cqe_explicit_profile_is_stateless 交错使用 32/64/128B 显式
+  // 编码入口，检查镜像 metadata、尾部清零和 active profile 不被污染。
+  // 输入/输出及副作用：任务创建本地 codec、模型和镜像；成功调用只发布
+  // detached image，失败通过 UVM error 记录，不修改 registry 或外部资源。
+  // 失败边界：任一 profile 长度/对齐/端序/代际/类型不符、尾部非零、非法
+  // 48B 被接受或默认 encode 长度被改变都会使测试失败。
+  task automatic test_cqe_explicit_profile_is_stateless();
+    rdma_hw_cqe_codec codec;
+    rdma_hw_cqe_model source;
+    rdma_hw_image image32;
+    rdma_hw_image image64;
+    rdma_hw_image image128;
+    rdma_hw_image active_image;
+    rdma_hw_image invalid_image;
+    rdma_status status;
+    int unsigned sizes[3] = '{32, 64, 128};
+    rdma_hw_image images[3];
+
+    codec = rdma_hw_cqe_codec::type_id::create("explicit_profile_codec");
+    source = make_hw_cqe_model();
+
+    // 保持 codec 的 active profile 为 64B，再由显式入口各自选择局部
+    // builder；这样可以直接验证调用之间不存在共享 profile 状态污染。
+    status = codec.set_entry_bytes(64);
+    if (status == null || !status.ok()) begin
+      `uvm_error("CQE_EXPLICIT_SETUP", "failed to set baseline 64B profile")
+      return;
+    end
+
+    status = codec.encode_with_entry_bytes(source, 32, image32);
+    if (status == null || !status.ok() || image32 == null ||
+        image32.bytes.size() != 32 || image32.length != 32 ||
+        image32.alignment != 32 || image32.endian != RDMA_ENDIAN_BIG ||
+        image32.image_kind != RDMA_IMAGE_CQE ||
+        image32.hardware_version != RDMA_HW_VERSION ||
+        image32.function_generation != source.qp_h.generation ||
+        image32.write_target_kind != RDMA_HW_TARGET_NONE)
+      `uvm_error("CQE_EXPLICIT_32", "32B explicit CQE image metadata is invalid")
+    else begin
+      foreach (image32.bytes[i]) begin
+        if (i >= 24 && image32.bytes[i] !== 8'h00)
+          `uvm_error("CQE_EXPLICIT_32_TAIL",
+                     $sformatf("32B CQE tail byte %0d is nonzero", i))
+      end
+    end
+
+    status = codec.encode_with_entry_bytes(source, 128, image128);
+    if (status == null || !status.ok() || image128 == null ||
+        image128.bytes.size() != 128 || image128.length != 128 ||
+        image128.alignment != 128 || image128.endian != RDMA_ENDIAN_BIG ||
+        image128.image_kind != RDMA_IMAGE_CQE ||
+        image128.hardware_version != RDMA_HW_VERSION ||
+        image128.function_generation != source.qp_h.generation ||
+        image128.write_target_kind != RDMA_HW_TARGET_NONE)
+      `uvm_error("CQE_EXPLICIT_128", "128B explicit CQE image metadata is invalid")
+    else begin
+      foreach (image128.bytes[i]) begin
+        if (i >= 24 && image128.bytes[i] !== 8'h00)
+          `uvm_error("CQE_EXPLICIT_128_TAIL",
+                     $sformatf("128B CQE tail byte %0d is nonzero", i))
+      end
+    end
+
+    status = codec.encode_with_entry_bytes(source, 64, image64);
+    if (status == null || !status.ok() || image64 == null ||
+        image64.bytes.size() != 64 || image64.length != 64 ||
+        image64.alignment != 64 || image64.endian != RDMA_ENDIAN_BIG ||
+        image64.image_kind != RDMA_IMAGE_CQE ||
+        image64.hardware_version != RDMA_HW_VERSION ||
+        image64.function_generation != source.qp_h.generation ||
+        image64.write_target_kind != RDMA_HW_TARGET_NONE)
+      `uvm_error("CQE_EXPLICIT_64", "64B explicit CQE image metadata is invalid")
+    else begin
+      foreach (image64.bytes[i]) begin
+        if (i >= 24 && image64.bytes[i] !== 8'h00)
+          `uvm_error("CQE_EXPLICIT_64_TAIL",
+                     $sformatf("64B CQE tail byte %0d is nonzero", i))
+      end
+    end
+
+    // 上述显式调用不得改变 codec 原有的 64B active profile。
+    status = codec.encode(source, active_image);
+    if (status == null || !status.ok() || active_image == null ||
+        active_image.bytes.size() != 64 || active_image.length != 64)
+      `uvm_error("CQE_EXPLICIT_ACTIVE", "explicit encode changed active profile")
+
+    status = codec.encode_with_entry_bytes(source, 48, invalid_image);
+    if (status == null || status.ok() || invalid_image != null ||
+        status.code != RDMA_SC_CODEC_ERROR)
+      `uvm_error("CQE_EXPLICIT_INVALID", "invalid 48B profile was accepted")
+
+    // 按交错顺序再次覆盖全部 profile，捕获错误缓存上一次显式尺寸的实现。
+    foreach (sizes[i]) begin
+      images[i] = null;
+      status = codec.encode_with_entry_bytes(source, sizes[i], images[i]);
+      if (status == null || !status.ok() || images[i] == null ||
+          images[i].bytes.size() != sizes[i])
+        `uvm_error("CQE_EXPLICIT_INTERLEAVE",
+                   $sformatf("interleaved %0dB encode failed", sizes[i]))
+    end
+  endtask
+
   // 功能：构造含 qword2 保留位的 32B CQE image，确认 codec 不会把签名字段之外的位误当作有效数据。
   // 输入输出及副作用：仅创建本地 codec、模型和 image，并通过 decode_with_entry_bytes 返回校验状态；不修改共享 registry 或外部资源。
   // 失败边界：若 qword2[55:0] 任一保留位被接受，或 image/模型准备失败导致无法执行断言，则报告 UVM error。
@@ -166,6 +303,7 @@ class rdma_cqe_size_codec_test extends uvm_test;
     phase.raise_objection(this);
     test_cqe_sizes_round_trip();
     test_cqe_decode_profiles_are_stateless();
+    test_cqe_explicit_profile_is_stateless();
     test_cqe_qword2_reserved_bits_rejected();
     test_cqe_layout_rejects_offset_overflow();
     phase.drop_objection(this);
