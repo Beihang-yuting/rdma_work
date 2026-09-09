@@ -449,6 +449,131 @@ class rdma_queue_data_engine_device_publish_test extends uvm_test;
     return count;
   endfunction
 
+  // 功能：same_test_handle_value 比较两个 detached handle 的完整资源身份，供
+  //   recovery 前后确认 queue/QP authority 没有被 retry 或 detach 失败替换。
+  // 输入/输出及副作用：left、right 为输入；返回 null 对称性及 kind、Function UID、
+  //   object ID、generation 的逐字段比较结果，不修改任一 handle。
+  // 失败边界：仅一侧为 null 时返回 0；两侧都为 null 时返回 1，本函数不把对象地址
+  //   相同当作值相等，也不查询 manager 当前 generation。
+  function automatic bit same_test_handle_value(
+    rdma_handle left,
+    rdma_handle right
+  );
+    if (left == null || right == null)
+      return left == null && right == null;
+    return left.kind == right.kind &&
+           left.function_uid == right.function_uid &&
+           left.object_id == right.object_id &&
+           left.generation == right.generation;
+  endfunction
+
+  // 功能：same_test_cursor_value 比较两个 cursor 快照的 index/wrap，用于验证
+  //   recovery reservation、当前 cursor 与 next_cursor 都保持同一 ring 位置。
+  // 输入/输出及副作用：left、right 为输入；返回 null 对称性和 index/wrap 比较结果，
+  //   不推进 runtime，也不取得 cursor 所有权。
+  // 失败边界：仅一侧为 null 时返回 0；两侧都为 null 时返回 1；本函数不知道 depth，
+  //   因而不额外判断 index 是否越界。
+  function automatic bit same_test_cursor_value(
+    rdma_queue_cursor_snapshot left,
+    rdma_queue_cursor_snapshot right
+  );
+    if (left == null || right == null)
+      return left == null && right == null;
+    return left.index == right.index && left.wrap == right.wrap;
+  endfunction
+
+  // 功能：same_test_status_value 比较 pending 中冻结的 failure_status 全部公开字段，
+  //   防止 retry 失败悄悄覆盖原始 DMA 诊断或 authority 上下文。
+  // 输入/输出及副作用：left、right 为输入；返回 status 标量与 message 的值比较，
+  //   不调用 clone、factory 或 status.ok()，也不修改诊断对象。
+  // 失败边界：仅一侧为 null 时返回 0，两侧都为 null 时返回 1；字符串按精确值比较，
+  //   因而任何错误消息改写都会被视为 evidence 变化。
+  function automatic bit same_test_status_value(
+    rdma_status left,
+    rdma_status right
+  );
+    if (left == null || right == null)
+      return left == null && right == null;
+    return left.category == right.category &&
+           left.code == right.code &&
+           left.hardware_code == right.hardware_code &&
+           left.hardware_code_valid == right.hardware_code_valid &&
+           left.source_engine == right.source_engine &&
+           left.function_uid == right.function_uid &&
+           left.generation == right.generation &&
+           left.resource_id == right.resource_id &&
+           left.command_id == right.command_id &&
+           left.wr_id == right.wr_id &&
+           left.severity == right.severity &&
+           left.retryable == right.retryable &&
+           left.message == right.message;
+  endfunction
+
+  // 功能：same_device_pending_value 对 device-producer pending 的完整公开快照做
+  //   值比较，覆盖身份、方向/阶段、image、cursor、route/epoch、MMIO 与失败状态。
+  // 输入/输出及副作用：left、right 为输入；返回所有公开 evidence 字段的合取结果，
+  //   只读取 detached snapshot，不访问 attachment、backing 或 runtime 内部状态。
+  // 失败边界：null 不对称、image/request/committed cursor 等对象存在性不同或任一
+  //   标量/byte 不同均返回 0；device recovery 的 request_snapshot 必须保持同一 null 性。
+  function automatic bit same_device_pending_value(
+    rdma_queue_pending_operation left,
+    rdma_queue_pending_operation right
+  );
+    if (left == null || right == null)
+      return left == null && right == null;
+    if (!same_test_handle_value(left.queue_h, right.queue_h) ||
+        !same_test_handle_value(left.routed_qp_h, right.routed_qp_h) ||
+        !same_test_cursor_value(left.cursor, right.cursor) ||
+        !same_test_cursor_value(left.next_cursor, right.next_cursor) ||
+        !same_test_cursor_value(left.committed_consumer_cursor,
+                                right.committed_consumer_cursor) ||
+        !same_test_status_value(left.failure_status, right.failure_status))
+      return 1'b0;
+    if (left.image == null || right.image == null) begin
+      if (!(left.image == null && right.image == null))
+        return 1'b0;
+    end
+    else if (left.image.length != right.image.length ||
+             left.image.alignment != right.image.alignment ||
+             left.image.endian != right.image.endian ||
+             left.image.image_kind != right.image.image_kind ||
+             left.image.hardware_version != right.image.hardware_version ||
+             left.image.function_generation !=
+               right.image.function_generation ||
+             left.image.write_target_kind != right.image.write_target_kind ||
+             left.image.backing_target != right.image.backing_target ||
+             left.image.hmc_target != right.image.hmc_target ||
+             left.image.bar_target != right.image.bar_target ||
+             left.image.field_summary != right.image.field_summary ||
+             left.image.bytes != right.image.bytes)
+      return 1'b0;
+    if ((left.request_snapshot == null) != (right.request_snapshot == null))
+      return 1'b0;
+    return left.kind == right.kind &&
+           left.producer == right.producer &&
+           left.device_producer == right.device_producer &&
+           left.device_write_attempted == right.device_write_attempted &&
+           left.consumer_committed == right.consumer_committed &&
+           left.cq_consumer_committed == right.cq_consumer_committed &&
+           left.completion_released == right.completion_released &&
+           left.consumer_doorbell_succeeded ==
+             right.consumer_doorbell_succeeded &&
+           left.entry_offset == right.entry_offset &&
+           left.wr_id == right.wr_id &&
+           left.signaled == right.signaled &&
+           left.completion_index == right.completion_index &&
+           left.completion_wrap == right.completion_wrap &&
+           left.completion_target_valid == right.completion_target_valid &&
+           left.mmio_maybe_submitted == right.mmio_maybe_submitted &&
+           left.known_no_mmio == right.known_no_mmio &&
+           left.mmio_evidence == right.mmio_evidence &&
+           left.entry_size == right.entry_size &&
+           left.route == right.route &&
+           left.route_valid == right.route_valid &&
+           left.reset_epoch == right.reset_epoch &&
+           left.epoch_valid == right.epoch_valid;
+  endfunction
+
   // 功能：host_mem_mapping_call_since 在指定 calls 起点之后查找某 mapping 的
   //   method_name 记录，用于区分 borrowed target destroy 与 source owner release。
   // 输入/输出及副作用：mem、method_name、mapping、start_index 为输入；按唯一 IOVA
@@ -2369,6 +2494,293 @@ class rdma_queue_data_engine_device_publish_test extends uvm_test;
       `uvm_error({label, "_POLL"}, "recovered device CQE did not release WQE")
   endtask
 
+  // 功能：check_device_publish_retry_chain 从 CQ readback mismatch 建立 pending，
+  //   依次验证未确认 retry、确认后 read 故障、再次确认成功与成功后的重复 retry。
+  // 输入/输出及副作用：无显式输入；任务建立独立 lifecycle-owned CQ/QP，注入一次
+  //   mismatch 和一次 recovery read 故障，并最终 poll 唯一提交的 CQE 释放 SQ WQE。
+  // 失败边界：每个失败阶段的完整 pending/backing/PI/CI/wrap/occupancy/reservation/
+  //   result 必须保持不变；I/O delta 必须分别为 0、write+read 各 1、各 1，末次 retry
+  //   必须返回 INVALID_STATE 且不得再次访问 Host-memory。
+  task automatic check_device_publish_retry_chain();
+    rdma_queue_data_engine_fixture fixture;
+    rdma_queue_post_result posted;
+    rdma_queue_device_publish_result published;
+    rdma_queue_completion_result completion;
+    rdma_hw_cqe_model cqe;
+    rdma_queue_pending_operation pending_before;
+    rdma_queue_pending_operation pending_after;
+    rdma_queue_cursor_snapshot reservation_before;
+    rdma_queue_cursor_snapshot reservation_after;
+    rdma_status status;
+    rdma_status model_status;
+    rdma_status injected;
+    byte backing_before[];
+    byte backing_after[];
+    int unsigned pi_before;
+    int unsigned pi_after;
+    int unsigned ci_before;
+    int unsigned ci_after;
+    int unsigned used_before;
+    int unsigned used_after;
+    int unsigned calls_before;
+    int unsigned writes_before;
+    int unsigned reads_before;
+    bit pi_wrap_before;
+    bit pi_wrap_after;
+    bit ci_wrap_before;
+    bit ci_wrap_after;
+    bit pending_present;
+    bit reservation_valid;
+    bit polarity;
+
+    fixture = rdma_queue_data_engine_fixture::type_id::create(
+      "device_publish_retry_chain_fixture");
+    fixture.setup(status);
+    if (status == null || !status.ok()) begin
+      `uvm_error("CQE_RETRY_CHAIN_SETUP", "retry-chain fixture setup failed")
+      return;
+    end
+    fixture.engine.post_send(fixture.make_send(64'hd540_0000), posted, status);
+    status = fixture.engine.query_runtime_producer_polarity(
+      fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, polarity);
+    cqe = make_cqe_for_outstanding_send(fixture.qp.handle,
+      fixture.qp.local_qp_id, posted, polarity, model_status);
+    if (status == null || !status.ok() || posted == null ||
+        model_status == null || !model_status.ok() || cqe == null) begin
+      `uvm_error("CQE_RETRY_CHAIN_MODEL", "retry-chain CQE setup failed")
+      return;
+    end
+
+    fixture.mem.corrupt_next_readback = 1'b1;
+    published = null;
+    publish_cqe_for_test(fixture.engine, fixture.cq.handle, cqe,
+                         published, status);
+    fixture.mem.corrupt_next_readback = 1'b0;
+    if (status == null || status.code != RDMA_SC_RECOVERY_REQUIRED ||
+        published != null) begin
+      `uvm_error("CQE_RETRY_CHAIN_MISMATCH",
+                 "readback mismatch did not retain a null-result recovery")
+      return;
+    end
+    pending_before = null;
+    status = fixture.engine.query_runtime_pending(
+      fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, pending_before);
+    if (status == null || !status.ok() || pending_before == null ||
+        pending_before.image == null || pending_before.cursor == null ||
+        pending_before.next_cursor == null ||
+        !pending_before.device_producer ||
+        !pending_before.device_write_attempted) begin
+      `uvm_error("CQE_RETRY_CHAIN_PENDING", "retry-chain pending is incomplete")
+      return;
+    end
+    status = fixture.engine.query_runtime_cursors(
+      fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, pi_before, pi_wrap_before,
+      ci_before, ci_wrap_before);
+    if (status == null || !status.ok()) begin
+      `uvm_error("CQE_RETRY_CHAIN_CURSOR", "retry-chain cursor snapshot failed")
+      return;
+    end
+    status = fixture.engine.query_runtime_occupancy(
+      fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, used_before, pending_present);
+    if (status == null || !status.ok() || !pending_present) begin
+      `uvm_error("CQE_RETRY_CHAIN_USED", "retry-chain occupancy snapshot failed")
+      return;
+    end
+    reservation_before = null;
+    reservation_valid = 1'b0;
+    status = fixture.engine.query_runtime_device_reservation(
+      fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, reservation_valid,
+      reservation_before);
+    if (status == null || !status.ok() || !reservation_valid ||
+        !same_test_cursor_value(reservation_before, pending_before.cursor)) begin
+      `uvm_error("CQE_RETRY_CHAIN_RESERVATION",
+                 "retry-chain reservation snapshot failed")
+      return;
+    end
+    status = read_queue_backing_slot(fixture, fixture.cq,
+      RDMA_QUEUE_ROLE_CQ_RING, pending_before.cursor.index,
+      fixture.cq.cqe_size_bytes, backing_before);
+    if (status == null || !status.ok() ||
+        backing_before.size() != pending_before.image.bytes.size()) begin
+      `uvm_error("CQE_RETRY_CHAIN_BACKING",
+                 "mismatch recovery backing does not contain the pending image")
+      return;
+    end
+    foreach (backing_before[i]) begin
+      if (backing_before[i] !== pending_before.image.bytes[i]) begin
+        `uvm_error("CQE_RETRY_CHAIN_BACKING",
+                   $sformatf("mismatch backing byte %0d differs", i))
+        return;
+      end
+    end
+
+    calls_before = fixture.mem.calls.size();
+    writes_before = count_host_mem_calls(fixture.mem, "write");
+    reads_before = count_host_mem_calls(fixture.mem, "read");
+    fixture.engine.recover_queue(fixture.cq.handle,
+      RDMA_QUEUE_RECOVERY_RETRY_PENDING, 1'b0, status);
+    if (status == null || status.code != RDMA_SC_INVALID_ARGUMENT ||
+        published != null || fixture.mem.calls.size() != calls_before ||
+        count_host_mem_calls(fixture.mem, "write") != writes_before ||
+        count_host_mem_calls(fixture.mem, "read") != reads_before)
+      `uvm_error("CQE_RETRY_CHAIN_UNCONFIRMED",
+                 "unconfirmed retry changed result or issued backend I/O")
+    pending_after = null;
+    status = fixture.engine.query_runtime_pending(
+      fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, pending_after);
+    if (status == null || !status.ok() ||
+        !same_device_pending_value(pending_before, pending_after))
+      `uvm_error("CQE_RETRY_CHAIN_UNCONFIRMED_PENDING",
+                 "unconfirmed retry changed pending evidence")
+    status = fixture.engine.query_runtime_cursors(
+      fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, pi_after, pi_wrap_after,
+      ci_after, ci_wrap_after);
+    if (status == null || !status.ok() || pi_after != pi_before ||
+        pi_wrap_after != pi_wrap_before || ci_after != ci_before ||
+        ci_wrap_after != ci_wrap_before)
+      `uvm_error("CQE_RETRY_CHAIN_UNCONFIRMED_CURSOR",
+                 "unconfirmed retry changed PI/CI")
+    status = fixture.engine.query_runtime_occupancy(
+      fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, used_after, pending_present);
+    if (status == null || !status.ok() || used_after != used_before ||
+        !pending_present)
+      `uvm_error("CQE_RETRY_CHAIN_UNCONFIRMED_USED",
+                 "unconfirmed retry changed occupancy")
+    reservation_after = null;
+    reservation_valid = 1'b0;
+    status = fixture.engine.query_runtime_device_reservation(
+      fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, reservation_valid,
+      reservation_after);
+    if (status == null || !status.ok() || !reservation_valid ||
+        !same_test_cursor_value(reservation_before, reservation_after))
+      `uvm_error("CQE_RETRY_CHAIN_UNCONFIRMED_RESERVATION",
+                 "unconfirmed retry changed reservation")
+    status = read_queue_backing_slot(fixture, fixture.cq,
+      RDMA_QUEUE_ROLE_CQ_RING, pending_before.cursor.index,
+      fixture.cq.cqe_size_bytes, backing_after);
+    if (status == null || !status.ok() || backing_after != backing_before)
+      `uvm_error("CQE_RETRY_CHAIN_UNCONFIRMED_BACKING",
+                 "unconfirmed retry changed backing bytes")
+
+    injected = rdma_status::make(RDMA_SC_DMA_TRANSLATION,
+                                 "injected retry-chain read failure");
+    status = fixture.mem.fail_next("read", injected);
+    if (status == null || !status.ok()) begin
+      `uvm_error("CQE_RETRY_CHAIN_INJECT", "retry read fault injection failed")
+      return;
+    end
+    calls_before = fixture.mem.calls.size();
+    writes_before = count_host_mem_calls(fixture.mem, "write");
+    reads_before = count_host_mem_calls(fixture.mem, "read");
+    fixture.engine.recover_queue(fixture.cq.handle,
+      RDMA_QUEUE_RECOVERY_RETRY_PENDING, 1'b1, status);
+    if (status == null || status.code != RDMA_SC_DMA_TRANSLATION ||
+        published != null || fixture.mem.calls.size() != calls_before + 2 ||
+        count_host_mem_calls(fixture.mem, "write") != writes_before + 1 ||
+        count_host_mem_calls(fixture.mem, "read") != reads_before + 1)
+      `uvm_error("CQE_RETRY_CHAIN_READ_FAIL",
+                 "confirmed retry did not stop after one write/read pair")
+    pending_after = null;
+    status = fixture.engine.query_runtime_pending(
+      fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, pending_after);
+    if (status == null || !status.ok() ||
+        !same_device_pending_value(pending_before, pending_after))
+      `uvm_error("CQE_RETRY_CHAIN_READ_FAIL_PENDING",
+                 "retry read failure changed pending evidence")
+    status = fixture.engine.query_runtime_cursors(
+      fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, pi_after, pi_wrap_after,
+      ci_after, ci_wrap_after);
+    if (status == null || !status.ok() || pi_after != pi_before ||
+        pi_wrap_after != pi_wrap_before || ci_after != ci_before ||
+        ci_wrap_after != ci_wrap_before)
+      `uvm_error("CQE_RETRY_CHAIN_READ_FAIL_CURSOR",
+                 "retry read failure changed PI/CI")
+    status = fixture.engine.query_runtime_occupancy(
+      fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, used_after, pending_present);
+    if (status == null || !status.ok() || used_after != used_before ||
+        !pending_present)
+      `uvm_error("CQE_RETRY_CHAIN_READ_FAIL_USED",
+                 "retry read failure changed occupancy")
+    reservation_after = null;
+    reservation_valid = 1'b0;
+    status = fixture.engine.query_runtime_device_reservation(
+      fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, reservation_valid,
+      reservation_after);
+    if (status == null || !status.ok() || !reservation_valid ||
+        !same_test_cursor_value(reservation_before, reservation_after))
+      `uvm_error("CQE_RETRY_CHAIN_READ_FAIL_RESERVATION",
+                 "retry read failure changed reservation")
+    status = read_queue_backing_slot(fixture, fixture.cq,
+      RDMA_QUEUE_ROLE_CQ_RING, pending_before.cursor.index,
+      fixture.cq.cqe_size_bytes, backing_after);
+    if (status == null || !status.ok() || backing_after != backing_before)
+      `uvm_error("CQE_RETRY_CHAIN_READ_FAIL_BACKING",
+                 "retry read failure changed backing image")
+
+    calls_before = fixture.mem.calls.size();
+    writes_before = count_host_mem_calls(fixture.mem, "write");
+    reads_before = count_host_mem_calls(fixture.mem, "read");
+    fixture.engine.recover_queue(fixture.cq.handle,
+      RDMA_QUEUE_RECOVERY_RETRY_PENDING, 1'b1, status);
+    if (status == null || !status.ok() || published != null ||
+        fixture.mem.calls.size() != calls_before + 2 ||
+        count_host_mem_calls(fixture.mem, "write") != writes_before + 1 ||
+        count_host_mem_calls(fixture.mem, "read") != reads_before + 1)
+      `uvm_error("CQE_RETRY_CHAIN_SUCCESS",
+                 "confirmed retry did not commit after one write/read pair")
+    status = fixture.engine.query_runtime_cursors(
+      fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, pi_after, pi_wrap_after,
+      ci_after, ci_wrap_after);
+    if (status == null || !status.ok() ||
+        pi_after != pending_before.next_cursor.index ||
+        pi_wrap_after != pending_before.next_cursor.wrap ||
+        ci_after != ci_before || ci_wrap_after != ci_wrap_before)
+      `uvm_error("CQE_RETRY_CHAIN_SUCCESS_CURSOR",
+                 "successful retry did not advance PI exactly once")
+    status = fixture.engine.query_runtime_occupancy(
+      fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, used_after, pending_present);
+    if (status == null || !status.ok() || used_after != used_before + 1 ||
+        pending_present)
+      `uvm_error("CQE_RETRY_CHAIN_SUCCESS_USED",
+                 "successful retry did not publish exactly one CQE")
+    pending_after = null;
+    status = fixture.engine.query_runtime_pending(
+      fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, pending_after);
+    if (status == null || status.code != RDMA_SC_INVALID_STATE ||
+        pending_after != null)
+      `uvm_error("CQE_RETRY_CHAIN_SUCCESS_PENDING",
+                 "successful retry retained pending evidence")
+    reservation_after = null;
+    reservation_valid = 1'b1;
+    status = fixture.engine.query_runtime_device_reservation(
+      fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, reservation_valid,
+      reservation_after);
+    if (status == null || !status.ok() || reservation_valid ||
+        reservation_after != null)
+      `uvm_error("CQE_RETRY_CHAIN_SUCCESS_RESERVATION",
+                 "successful retry retained reservation")
+    status = read_queue_backing_slot(fixture, fixture.cq,
+      RDMA_QUEUE_ROLE_CQ_RING, pending_before.cursor.index,
+      fixture.cq.cqe_size_bytes, backing_after);
+    if (status == null || !status.ok() || backing_after != backing_before)
+      `uvm_error("CQE_RETRY_CHAIN_SUCCESS_BACKING",
+                 "successful retry changed the committed CQE image")
+
+    calls_before = fixture.mem.calls.size();
+    fixture.engine.recover_queue(fixture.cq.handle,
+      RDMA_QUEUE_RECOVERY_RETRY_PENDING, 1'b1, status);
+    if (status == null || status.code != RDMA_SC_INVALID_STATE ||
+        published != null || fixture.mem.calls.size() != calls_before)
+      `uvm_error("CQE_RETRY_CHAIN_REPEAT",
+                 "retry after successful commit was not an I/O-free INVALID_STATE")
+    completion = null;
+    fixture.engine.poll_cqe(fixture.cq.handle, 0, completion, status);
+    if (status == null || !status.ok() || completion == null ||
+        completion.released_slots.size() != 1)
+      `uvm_error("CQE_RETRY_CHAIN_POLL",
+                 "retry-chain CQE did not release exactly one WQE")
+  endtask
+
   // 功能：check_unclaimed_pending_kind_authority 让 runtime admission 一次失败，
   //   验证同一 CQ identity 的错误 runtime kind 不能读取 engine-owned evidence。
   // 输入/输出及副作用：无显式输入；任务只经公开 publish/query API 建立并读取
@@ -2517,7 +2929,8 @@ class rdma_queue_data_engine_device_publish_test extends uvm_test;
   // 输入/输出及副作用：无显式输入；任务仅通过公开 publish/query/recover/poll API
   //   观察 unclaimed 生命周期，不修改 queue plan、attachment 或 Host-memory backing。
   // 失败边界：初始 unclaimed 不可查询、abort 非成功、仍可查询 pending/occupancy，
-  //   或 abort 前 poll 非 QUEUE_EMPTY 时报告 UVM_ERROR；detach 后查询必须失败且输出为空。
+  //   或 abort 前 poll 非 QUEUE_EMPTY 时报告 UVM_ERROR；失败 detach 前后完整 image、
+  //   cursor/stage/MMIO、PI/CI/wrap、occupancy、reservation、backing 与 I/O 数必须相同。
   task automatic check_unclaimed_pending_abort();
     rdma_queue_data_engine_fixture fixture;
     rdma_device_publish_recovery_fault_engine fault_engine;
@@ -2526,7 +2939,11 @@ class rdma_queue_data_engine_device_publish_test extends uvm_test;
     rdma_queue_completion_result completion;
     rdma_hw_cqe_model cqe;
     rdma_queue_pending_operation pending;
+    rdma_queue_pending_operation pending_before;
+    rdma_queue_pending_operation pending_after;
     rdma_queue_cursor_snapshot reservation;
+    rdma_queue_cursor_snapshot reservation_before;
+    rdma_queue_cursor_snapshot reservation_after;
     rdma_status status;
     rdma_status model_status;
     rdma_status injected;
@@ -2535,6 +2952,22 @@ class rdma_queue_data_engine_device_publish_test extends uvm_test;
     bit occupancy_pending;
     int unsigned occupancy;
     int unsigned calls_before_abort;
+    int unsigned calls_before_final_abort;
+    int unsigned writes_before_abort;
+    int unsigned reads_before_abort;
+    int unsigned pi_before_abort;
+    int unsigned pi_after_abort;
+    int unsigned ci_before_abort;
+    int unsigned ci_after_abort;
+    int unsigned occupancy_before_abort;
+    int unsigned occupancy_after_abort;
+    bit pi_wrap_before_abort;
+    bit pi_wrap_after_abort;
+    bit ci_wrap_before_abort;
+    bit ci_wrap_after_abort;
+    bit pending_before_abort;
+    byte backing_before_abort[];
+    byte backing_after_abort[];
 
     rdma_queue_data_engine::type_id::set_type_override(
       rdma_device_publish_recovery_fault_engine::get_type());
@@ -2576,6 +3009,7 @@ class rdma_queue_data_engine_device_publish_test extends uvm_test;
       `uvm_error("CQE_UNCLAIMED_ABORT_PENDING", "abort input evidence is absent")
       return;
     end
+    pending_before = pending;
     reservation_valid = 1'b0;
     reservation = null;
     status = fixture.engine.query_runtime_device_reservation(
@@ -2586,7 +3020,34 @@ class rdma_queue_data_engine_device_publish_test extends uvm_test;
     fixture.engine.poll_cqe(fixture.cq.handle, 0, completion, status);
     if (status == null || status.code != RDMA_SC_QUEUE_EMPTY || completion != null)
       `uvm_error("CQE_UNCLAIMED_ABORT_INVISIBLE", "unclaimed abort CQE was visible")
+    status = fixture.engine.query_runtime_cursors(
+      fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, pi_before_abort,
+      pi_wrap_before_abort, ci_before_abort, ci_wrap_before_abort);
+    if (status == null || !status.ok()) begin
+      `uvm_error("CQE_UNCLAIMED_ABORT_CURSOR_BEFORE",
+                 "unclaimed abort cursor snapshot failed")
+      return;
+    end
+    status = fixture.engine.query_runtime_occupancy(
+      fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, occupancy_before_abort,
+      pending_before_abort);
+    if (status == null || !status.ok()) begin
+      `uvm_error("CQE_UNCLAIMED_ABORT_USED_BEFORE",
+                 "unclaimed abort occupancy snapshot failed")
+      return;
+    end
+    reservation_before = reservation;
+    status = read_queue_backing_slot(fixture, fixture.cq,
+      RDMA_QUEUE_ROLE_CQ_RING, pending_before.cursor.index,
+      fixture.cq.cqe_size_bytes, backing_before_abort);
+    if (status == null || !status.ok()) begin
+      `uvm_error("CQE_UNCLAIMED_ABORT_BACKING_BEFORE",
+                 "unclaimed abort backing snapshot failed")
+      return;
+    end
     calls_before_abort = fixture.mem.calls.size();
+    writes_before_abort = count_host_mem_calls(fixture.mem, "write");
+    reads_before_abort = count_host_mem_calls(fixture.mem, "read");
     status = fault_engine.hold_detach_lock_for_test();
     if (status == null || !status.ok()) begin
       `uvm_error("CQE_UNCLAIMED_ABORT_ARM", "unclaimed detach lock failed")
@@ -2598,24 +3059,51 @@ class rdma_queue_data_engine_device_publish_test extends uvm_test;
     if (status == null || status.ok())
       `uvm_error("CQE_UNCLAIMED_ABORT_BUSY",
                  "unclaimed abort ignored detach lock failure")
-    pending = null;
+    pending_after = null;
     status = fixture.engine.query_runtime_pending(
-      fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, pending);
-    if (status == null || !status.ok() || pending == null ||
-        pending.cursor == null || fixture.mem.calls.size() != calls_before_abort)
+      fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, pending_after);
+    if (status == null || !status.ok() ||
+        !same_device_pending_value(pending_before, pending_after) ||
+        published != null || fixture.mem.calls.size() != calls_before_abort ||
+        count_host_mem_calls(fixture.mem, "write") != writes_before_abort ||
+        count_host_mem_calls(fixture.mem, "read") != reads_before_abort)
       `uvm_error("CQE_UNCLAIMED_ABORT_RETAIN",
                  "failed unclaimed detach lost evidence or touched mapping")
+    status = fixture.engine.query_runtime_cursors(
+      fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, pi_after_abort,
+      pi_wrap_after_abort, ci_after_abort, ci_wrap_after_abort);
+    if (status == null || !status.ok() ||
+        pi_after_abort != pi_before_abort ||
+        pi_wrap_after_abort != pi_wrap_before_abort ||
+        ci_after_abort != ci_before_abort ||
+        ci_wrap_after_abort != ci_wrap_before_abort)
+      `uvm_error("CQE_UNCLAIMED_ABORT_CURSOR_AFTER",
+                 "failed unclaimed detach changed PI/CI")
+    status = fixture.engine.query_runtime_occupancy(
+      fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, occupancy_after_abort,
+      occupancy_pending);
+    if (status == null || !status.ok() ||
+        occupancy_after_abort != occupancy_before_abort ||
+        occupancy_pending != pending_before_abort)
+      `uvm_error("CQE_UNCLAIMED_ABORT_USED_AFTER",
+                 "failed unclaimed detach changed occupancy")
     reservation_valid = 1'b0;
-    reservation = null;
+    reservation_after = null;
     status = fixture.engine.query_runtime_device_reservation(
       fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, reservation_valid,
-      reservation);
+      reservation_after);
     if (status == null || !status.ok() || !reservation_valid ||
-        reservation == null || pending == null || pending.cursor == null ||
-        reservation.index != pending.cursor.index ||
-        reservation.wrap != pending.cursor.wrap)
+        !same_test_cursor_value(reservation_before, reservation_after))
       `uvm_error("CQE_UNCLAIMED_ABORT_RETAIN_RESERVATION",
                  "failed unclaimed detach cancelled reservation")
+    status = read_queue_backing_slot(fixture, fixture.cq,
+      RDMA_QUEUE_ROLE_CQ_RING, pending_before.cursor.index,
+      fixture.cq.cqe_size_bytes, backing_after_abort);
+    if (status == null || !status.ok() ||
+        backing_after_abort != backing_before_abort)
+      `uvm_error("CQE_UNCLAIMED_ABORT_BACKING_AFTER",
+                 "failed unclaimed detach changed backing bytes")
+    calls_before_final_abort = fixture.mem.calls.size();
     fixture.engine.recover_queue(fixture.cq.handle,
       RDMA_QUEUE_RECOVERY_ABORT_AND_DETACH, 1'b1, status);
     if (status == null || !status.ok()) begin
@@ -2645,7 +3133,8 @@ class rdma_queue_data_engine_device_publish_test extends uvm_test;
     completion = null;
     fixture.engine.poll_cqe(fixture.cq.handle, 0, completion, status);
     if (status == null || status.code != RDMA_SC_INVALID_STATE ||
-        completion != null || fixture.mem.calls.size() != calls_before_abort)
+        completion != null ||
+        fixture.mem.calls.size() != calls_before_final_abort)
       `uvm_error("CQE_UNCLAIMED_ABORT_POLL_STALE",
                  "unclaimed abort left poll active or released mapping")
   endtask
@@ -2981,6 +3470,233 @@ class rdma_queue_data_engine_device_publish_test extends uvm_test;
       fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, reservation_valid, reservation);
     if (status == null || !status.ok() || reservation_valid || reservation != null)
       `uvm_error("CQE_PREFLIGHT_RESERVATION", "preflight failure retained reservation")
+  endtask
+
+  // 功能：check_lifecycle_owned_cq_permission_failure 经公开 CQ replacement API
+  //   发布一个缺少 DEVICE_WRITE 的 control-plane owned 单 mapping，并验证真实 engine
+  //   attachment 的生产 preflight 拒绝 CQE，而非借用 multi-segment 或测试 access seam。
+  // 输入/输出及副作用：无显式输入；任务 detach CQ、begin resize、修改 detached
+  //   candidate 的 ring ref/page mapping permission mirror、replace 并重新 attach，随后
+  //   post 匹配 WQE 并调用公开 publish_cqe；mapping 的销毁权仍归 lifecycle executor。
+  // 失败边界：候选不是唯一 CONTROL_PLANE CQ_RING、存在 additional segment、公开
+  //   lifecycle 步骤失败或 publish 不返回 DMA_PERMISSION 时报告；拒绝前后 backing、
+  //   PI/CI/wrap、occupancy、pending、reservation、result 与 backend 调用数必须不变。
+  task automatic check_lifecycle_owned_cq_permission_failure();
+    rdma_queue_data_engine_fixture fixture;
+    rdma_resource candidate_resource;
+    rdma_cq candidate_cq;
+    rdma_queue_backing_ref ring_ref;
+    rdma_queue_ring_layout ring;
+    rdma_queue_post_result posted;
+    rdma_queue_device_publish_result published;
+    rdma_hw_cqe_model cqe;
+    rdma_queue_pending_operation pending;
+    rdma_queue_cursor_snapshot reservation;
+    rdma_status status;
+    rdma_status model_status;
+    byte backing_before[];
+    byte backing_after[];
+    int unsigned ring_ref_count;
+    int unsigned ring_count;
+    int unsigned pi_before;
+    int unsigned pi_after;
+    int unsigned ci_before;
+    int unsigned ci_after;
+    int unsigned used_before;
+    int unsigned used_after;
+    int unsigned calls_before;
+    int unsigned writes_before;
+    int unsigned reads_before;
+    bit pi_wrap_before;
+    bit pi_wrap_after;
+    bit ci_wrap_before;
+    bit ci_wrap_after;
+    bit pending_present;
+    bit reservation_valid;
+    bit polarity;
+
+    fixture = rdma_queue_data_engine_fixture::type_id::create(
+      "lifecycle_owned_cq_permission_fixture");
+    fixture.setup(status);
+    if (status == null || !status.ok()) begin
+      `uvm_error("CQE_OWNED_PERMISSION_SETUP",
+                 "lifecycle-owned permission fixture setup failed")
+      return;
+    end
+    candidate_resource = null;
+    candidate_cq = null;
+    status = fixture.manager.lookup(fixture.cq.handle, candidate_resource);
+    if (status == null || !status.ok() || candidate_resource == null ||
+        !$cast(candidate_cq, candidate_resource)) begin
+      `uvm_error("CQE_OWNED_PERMISSION_LOOKUP",
+                 "active CQ replacement candidate lookup failed")
+      return;
+    end
+    ring_ref = null;
+    ring = null;
+    ring_ref_count = 0;
+    ring_count = 0;
+    if (candidate_cq.queue_plan != null) begin
+      foreach (candidate_cq.queue_plan.refs[i]) begin
+        if (candidate_cq.queue_plan.refs[i] != null &&
+            candidate_cq.queue_plan.refs[i].role == RDMA_QUEUE_ROLE_CQ_RING) begin
+          ring_ref_count++;
+          ring_ref = candidate_cq.queue_plan.refs[i];
+        end
+      end
+      foreach (candidate_cq.queue_plan.rings[i]) begin
+        if (candidate_cq.queue_plan.rings[i] != null &&
+            candidate_cq.queue_plan.rings[i].role == RDMA_QUEUE_ROLE_CQ_RING) begin
+          ring_count++;
+          ring = candidate_cq.queue_plan.rings[i];
+        end
+      end
+    end
+    if (ring_ref_count != 1 || ring_count != 1 || ring_ref == null ||
+        ring == null || ring_ref.mapping == null ||
+        ring_ref.ownership != RDMA_OWNERSHIP_CONTROL_PLANE ||
+        ring_ref.additional_segments.size() != 0 || ring.pages.size() == 0) begin
+      `uvm_error("CQE_OWNED_PERMISSION_SHAPE",
+                 "CQ replacement is not a lifecycle-owned single mapping")
+      return;
+    end
+    status = fixture.engine.detach(fixture.cq.handle);
+    if (status == null || !status.ok()) begin
+      `uvm_error("CQE_OWNED_PERMISSION_DETACH",
+                 "CQ detach before permission replacement failed")
+      return;
+    end
+    status = fixture.manager.begin_cq_resize(fixture.cq.handle);
+    if (status == null || !status.ok()) begin
+      `uvm_error("CQE_OWNED_PERMISSION_BEGIN",
+                 "CQ begin resize before permission replacement failed")
+      return;
+    end
+    ring_ref.mapping.permissions.device_write = 1'b0;
+    foreach (ring.pages[i]) begin
+      if (ring.pages[i] == null || ring.pages[i].mapping == null) begin
+        `uvm_error("CQE_OWNED_PERMISSION_PAGE",
+                   "CQ ring page mapping mirror is incomplete")
+        return;
+      end
+      ring.pages[i].mapping.permissions.device_write = 1'b0;
+    end
+    candidate_cq.queue_iova = ring_ref.mapping.iova;
+    status = fixture.manager.replace_active_cq(candidate_cq);
+    if (status == null || !status.ok()) begin
+      `uvm_error("CQE_OWNED_PERMISSION_REPLACE",
+                 status == null ? "CQ permission replacement returned null" :
+                                  status.convert2string())
+      return;
+    end
+    status = fixture.engine.attach_cq(fixture.cq.handle, RDMA_TRANSPORT_RC);
+    if (status == null || !status.ok()) begin
+      `uvm_error("CQE_OWNED_PERMISSION_ATTACH",
+                 "CQ permission replacement attach failed")
+      return;
+    end
+    fixture.engine.post_send(fixture.make_send(64'hd511_0000), posted, status);
+    status = fixture.engine.query_runtime_producer_polarity(
+      fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, polarity);
+    cqe = make_cqe_for_outstanding_send(fixture.qp.handle,
+      fixture.qp.local_qp_id, posted, polarity, model_status);
+    if (status == null || !status.ok() || posted == null ||
+        model_status == null || !model_status.ok() || cqe == null) begin
+      `uvm_error("CQE_OWNED_PERMISSION_MODEL",
+                 "CQ permission rejection model setup failed")
+      return;
+    end
+    status = fixture.engine.query_runtime_cursors(
+      fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, pi_before, pi_wrap_before,
+      ci_before, ci_wrap_before);
+    if (status == null || !status.ok()) begin
+      `uvm_error("CQE_OWNED_PERMISSION_CURSOR_BEFORE",
+                 "CQ permission cursor snapshot failed")
+      return;
+    end
+    status = fixture.engine.query_runtime_occupancy(
+      fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, used_before, pending_present);
+    if (status == null || !status.ok() || pending_present) begin
+      `uvm_error("CQE_OWNED_PERMISSION_USED_BEFORE",
+                 "CQ permission occupancy baseline is not clean")
+      return;
+    end
+    pending = null;
+    status = fixture.engine.query_runtime_pending(
+      fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, pending);
+    if (status == null || status.code != RDMA_SC_INVALID_STATE ||
+        pending != null) begin
+      `uvm_error("CQE_OWNED_PERMISSION_PENDING_BEFORE",
+                 "CQ permission baseline retained pending evidence")
+      return;
+    end
+    reservation = null;
+    reservation_valid = 1'b1;
+    status = fixture.engine.query_runtime_device_reservation(
+      fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, reservation_valid,
+      reservation);
+    if (status == null || !status.ok() || reservation_valid ||
+        reservation != null) begin
+      `uvm_error("CQE_OWNED_PERMISSION_RESERVATION_BEFORE",
+                 "CQ permission baseline retained reservation")
+      return;
+    end
+    status = read_queue_backing_slot(fixture, fixture.cq,
+      RDMA_QUEUE_ROLE_CQ_RING, pi_before, fixture.cq.cqe_size_bytes,
+      backing_before);
+    if (status == null || !status.ok()) begin
+      `uvm_error("CQE_OWNED_PERMISSION_BACKING_BEFORE",
+                 "CQ permission backing snapshot failed")
+      return;
+    end
+    calls_before = fixture.mem.calls.size();
+    writes_before = count_host_mem_calls(fixture.mem, "write");
+    reads_before = count_host_mem_calls(fixture.mem, "read");
+    published = null;
+    publish_cqe_for_test(fixture.engine, fixture.cq.handle, cqe,
+                         published, status);
+    if (status == null || status.code != RDMA_SC_DMA_PERMISSION ||
+        published != null || fixture.mem.calls.size() != calls_before ||
+        count_host_mem_calls(fixture.mem, "write") != writes_before ||
+        count_host_mem_calls(fixture.mem, "read") != reads_before)
+      `uvm_error("CQE_OWNED_PERMISSION_PUBLISH",
+                 "lifecycle-owned permission rejection touched backend/result")
+    status = fixture.engine.query_runtime_cursors(
+      fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, pi_after, pi_wrap_after,
+      ci_after, ci_wrap_after);
+    if (status == null || !status.ok() || pi_after != pi_before ||
+        pi_wrap_after != pi_wrap_before || ci_after != ci_before ||
+        ci_wrap_after != ci_wrap_before)
+      `uvm_error("CQE_OWNED_PERMISSION_CURSOR_AFTER",
+                 "CQ permission rejection changed PI/CI")
+    status = fixture.engine.query_runtime_occupancy(
+      fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, used_after, pending_present);
+    if (status == null || !status.ok() || used_after != used_before ||
+        pending_present)
+      `uvm_error("CQE_OWNED_PERMISSION_USED_AFTER",
+                 "CQ permission rejection changed occupancy")
+    pending = null;
+    status = fixture.engine.query_runtime_pending(
+      fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, pending);
+    if (status == null || status.code != RDMA_SC_INVALID_STATE ||
+        pending != null)
+      `uvm_error("CQE_OWNED_PERMISSION_PENDING_AFTER",
+                 "CQ permission rejection retained pending evidence")
+    reservation = null;
+    reservation_valid = 1'b1;
+    status = fixture.engine.query_runtime_device_reservation(
+      fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, reservation_valid,
+      reservation);
+    if (status == null || !status.ok() || reservation_valid ||
+        reservation != null)
+      `uvm_error("CQE_OWNED_PERMISSION_RESERVATION_AFTER",
+                 "CQ permission rejection retained reservation")
+    status = read_queue_backing_slot(fixture, fixture.cq,
+      RDMA_QUEUE_ROLE_CQ_RING, pi_before, fixture.cq.cqe_size_bytes,
+      backing_after);
+    if (status == null || !status.ok() || backing_after != backing_before)
+      `uvm_error("CQE_OWNED_PERMISSION_BACKING_AFTER",
+                 "CQ permission rejection changed backing bytes")
   endtask
 
   // 功能：check_device_publish_cancel_failure 注入 access preflight 与 reservation
@@ -3330,6 +4046,8 @@ class rdma_queue_data_engine_device_publish_test extends uvm_test;
     reset_device_publish_factory_state();
     check_segmented_cq_plan_ownership();
     reset_device_publish_factory_state();
+    check_lifecycle_owned_cq_permission_failure();
+    reset_device_publish_factory_state();
     check_device_publish_preflight_failure();
     reset_device_publish_factory_state();
     check_device_publish_cancel_failure();
@@ -3339,6 +4057,8 @@ class rdma_queue_data_engine_device_publish_test extends uvm_test;
     check_device_publish_fault_recovery("CQE_READ_FAIL", 1);
     reset_device_publish_factory_state();
     check_device_publish_fault_recovery("CQE_READ_MISMATCH", 2);
+    reset_device_publish_factory_state();
+    check_device_publish_retry_chain();
     reset_device_publish_factory_state();
     check_device_publish_stale_route();
     reset_device_publish_factory_state();
