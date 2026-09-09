@@ -42,25 +42,46 @@ class rdma_eq_engine_test extends uvm_test;
     return rdma_status::success();
   endfunction
 
-  // 功能：setup_publish_event_rings 在指定 fixture 中创建并 attach 一对真实
-  //   lifecycle-owned CEQ/AEQ，供 producer facade 等价性验证。
-  // 输入/输出及副作用：fixture 为输入，ceq/aeq/status 为输出；成功会建立 owned
-  //   Host-memory backing 并向共享 queue-data engine 登记两个非拥有 attachment。
-  // 失败/边界：request/create/cast/attach 任一步失败立即返回；已创建的部分资源
-  //   仍经输出交给调用方清理，绝不使用 dependency-only CEQ 伪造 ring。
+  // 功能：setup_publish_event_rings 为一套 equivalence fixture 依次创建/attach
+  //   lifecycle CEQ、AEQ、依赖该 CEQ 的 CQ，以及依赖该 CQ 的 RC QP。
+  // 输入/输出及副作用：fixture 为输入，四个资源、各自 created/attached 状态及
+  //   status 为输出；成功建立 owned backing 和同一套完整 event/transport route。
+  // 失败/边界：request/create/cast/clone/attach 任一步失败立即返回；状态输出保留
+  //   已完成阶段，使 cleanup 能销毁未 attach 的资源且不借用 dependency-only CQ/CEQ。
   task automatic setup_publish_event_rings(
     rdma_queue_data_engine_fixture fixture,
     output rdma_ceq ceq,
     output rdma_aeq aeq,
+    output rdma_cq cq,
+    output rdma_qp target_qp,
+    output bit ceq_created,
+    output bit ceq_attached,
+    output bit aeq_created,
+    output bit aeq_attached,
+    output bit cq_created,
+    output bit cq_attached,
+    output bit qp_created,
+    output bit qp_attached,
     output rdma_status status
   );
     rdma_create_ceq_req ceq_request;
     rdma_create_aeq_req aeq_request;
+    rdma_create_cq_req cq_request;
     rdma_queue_resource resource;
     rdma_control_result control_result;
 
     ceq = null;
     aeq = null;
+    cq = null;
+    target_qp = null;
+    ceq_created = 1'b0;
+    ceq_attached = 1'b0;
+    aeq_created = 1'b0;
+    aeq_attached = 1'b0;
+    cq_created = 1'b0;
+    cq_attached = 1'b0;
+    qp_created = 1'b0;
+    qp_attached = 1'b0;
     status = rdma_status::make(RDMA_SC_INVALID_STATE,
                                "EQ publish rings are incomplete");
     if (fixture == null || fixture.binding == null ||
@@ -90,8 +111,10 @@ class rdma_eq_engine_test extends uvm_test;
                                    "EQ publish CEQ resource is invalid");
       return;
     end
+    ceq_created = 1'b1;
     status = fixture.engine.attach_ceq(ceq.handle);
     if (status == null || !status.ok()) return;
+    ceq_attached = 1'b1;
 
     aeq_request = rdma_create_aeq_req::type_id::create("eq_publish_aeq_request");
     if (aeq_request == null) begin
@@ -118,12 +141,56 @@ class rdma_eq_engine_test extends uvm_test;
                                    "EQ publish AEQ resource is invalid");
       return;
     end
+    aeq_created = 1'b1;
     status = fixture.engine.attach_aeq(aeq.handle);
+    if (status == null || !status.ok()) return;
+    aeq_attached = 1'b1;
+
+    cq_request = rdma_create_cq_req::type_id::create("eq_publish_cq_request");
+    if (cq_request == null) begin
+      status = rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED,
+                                 "EQ publish CQ request allocation failed");
+      return;
+    end
+    cq_request.owner = fixture.binding.make_handle();
+    cq_request.depth = 16;
+    cq_request.cqe_size_bytes = RDMA_CQE_BYTES;
+    status = clone_test_handle_value(ceq.handle, cq_request.ceq_h);
+    if (status == null || !status.ok() || cq_request.ceq_h == null) return;
+    cq_request.ring_backing.mode = RDMA_QUEUE_BACKING_OWNED;
+    resource = null;
+    control_result = null;
+    fixture.queue_executor.create_locked(
+      fixture.binding, fixture.binding.make_handle(), cq_request, 64'ha103,
+      resource, control_result);
+    status = control_result == null ?
+      rdma_status::make(RDMA_SC_INVALID_STATE, "EQ publish CQ returned no result") :
+      control_result.status;
+    if (status == null || !status.ok() || resource == null ||
+        !$cast(cq, resource)) begin
+      if (status == null || status.ok())
+        status = rdma_status::make(RDMA_SC_INVALID_STATE,
+                                   "EQ publish CQ resource is invalid");
+      return;
+    end
+    cq_created = 1'b1;
+    status = fixture.engine.attach_cq(cq.handle, RDMA_TRANSPORT_RC);
+    if (status == null || !status.ok()) return;
+    cq_attached = 1'b1;
+
+    fixture.create_transport_qp_for_cq(
+      "eq_publish_event_qp", RDMA_TRANSPORT_RC, cq, target_qp, status);
+    if (status == null || !status.ok() || target_qp == null) return;
+    qp_created = 1'b1;
+    status = fixture.engine.attach_qp(target_qp.handle);
+    if (status == null || !status.ok()) return;
+    qp_attached = 1'b1;
+    status = rdma_status::success();
   endtask
 
   // 功能：make_publish_event_models 从 CQ committed cursor 与真实 attached QP
   //   构造 CEQE/AEQE，确保两种 facade 成功路径使用完整 authority。
-  // 输入/输出及副作用：fixture、ceq、aeq、非零 target_qp 为输入，ceqe/aeqe/status
+  // 输入/输出及副作用：fixture、ceq、aeq、cq、非零 target_qp 为输入，ceqe/aeqe/status
   //   为输出；只读 runtime cursor/polarity并创建 detached model，不写 event backing。
   // 失败/边界：cursor 超过 CEQE 16-bit、polarity 查询、handle clone 或分配失败时
   //   两个输出归一化为 null；AEQE 始终使用非零 fixture QPN。
@@ -131,6 +198,7 @@ class rdma_eq_engine_test extends uvm_test;
     rdma_queue_data_engine_fixture fixture,
     rdma_ceq ceq,
     rdma_aeq aeq,
+    rdma_cq cq,
     rdma_qp target_qp,
     output rdma_hw_ceqe_model ceqe,
     output rdma_hw_aeqe_model aeqe,
@@ -145,7 +213,7 @@ class rdma_eq_engine_test extends uvm_test;
     ceqe = null;
     aeqe = null;
     status = fixture.engine.query_runtime_cursors(
-      fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, producer_index, producer_wrap,
+      cq.handle, RDMA_QUEUE_RUNTIME_CQ, producer_index, producer_wrap,
       consumer_index, consumer_wrap);
     if (status == null || !status.ok()) return;
     if (producer_index > 16'hffff) begin
@@ -162,12 +230,12 @@ class rdma_eq_engine_test extends uvm_test;
                                  "EQ facade CEQE allocation failed");
       return;
     end
-    status = clone_test_handle_value(fixture.cq.handle, ceqe.cq_h);
+    status = clone_test_handle_value(cq.handle, ceqe.cq_h);
     if (status == null || !status.ok() || ceqe.cq_h == null) begin
       ceqe = null;
       return;
     end
-    ceqe.cqn = fixture.cq.local_cq_id;
+    ceqe.cqn = cq.local_cq_id;
     ceqe.qpn = 0;
     ceqe.cq_pi = producer_index;
     ceqe.cq_pi_wrap = producer_wrap;
@@ -233,33 +301,51 @@ class rdma_eq_engine_test extends uvm_test;
            lhs.status.message == rhs.status.message;
   endfunction
 
-  // 功能：cleanup_publish_event_rings 分别销毁 equivalence fixture 的事件 QP、
-  //   AEQ 与 CEQ，证明测试不会把临时生命周期留给仿真结束隐式回收。
-  // 输入/输出及副作用：fixture、ceq、aeq、target_qp 为输入；存在的资源按
-  //   QP→AEQ→CEQ 顺序 detach/destroy，并报告失败，不影响另一项清理尝试。
+  // 功能：cleanup_publish_event_rings 销毁 equivalence fixture 的 QP、CQ、AEQ、
+  //   CEQ，证明完整依赖拓扑不会留给仿真结束隐式回收。
+  // 输入/输出及副作用：fixture、四个资源及 created/attached 状态为输入；按
+  //   QP→CQ→AEQ→CEQ 顺序清理并报告失败，不影响下一项资源清理。
   // 失败/边界：fixture 为空安全返回；QP 或 queue 单项 status 为空/非成功只报告，
   //   不提前退出，避免一个失败掩盖后续独立资源泄漏。
   task automatic cleanup_publish_event_rings(
     rdma_queue_data_engine_fixture fixture,
     rdma_ceq ceq,
     rdma_aeq aeq,
-    rdma_qp target_qp
+    rdma_cq cq,
+    rdma_qp target_qp,
+    bit ceq_created,
+    bit ceq_attached,
+    bit aeq_created,
+    bit aeq_attached,
+    bit cq_created,
+    bit cq_attached,
+    bit qp_created,
+    bit qp_attached
   );
     rdma_status status;
 
     if (fixture == null) return;
     if (target_qp != null) begin
-      fixture.destroy_lifecycle_owned_qp(target_qp.handle, 64'ha113, status);
+      fixture.destroy_lifecycle_owned_qp(
+        target_qp.handle, qp_created, qp_attached, 64'ha114, status);
       if (status == null || !status.ok())
         `uvm_error("EQ_QP_TEARDOWN", "EQ publish QP teardown failed")
     end
+    if (cq != null) begin
+      fixture.destroy_lifecycle_owned_queue(
+        cq.handle, cq_created, cq_attached, 64'ha113, status);
+      if (status == null || !status.ok())
+        `uvm_error("EQ_CQ_TEARDOWN", "EQ publish CQ teardown failed")
+    end
     if (aeq != null) begin
-      fixture.destroy_lifecycle_owned_queue(aeq.handle, 64'ha112, status);
+      fixture.destroy_lifecycle_owned_queue(
+        aeq.handle, aeq_created, aeq_attached, 64'ha112, status);
       if (status == null || !status.ok())
         `uvm_error("EQ_AEQ_TEARDOWN", "EQ publish AEQ teardown failed")
     end
     if (ceq != null) begin
-      fixture.destroy_lifecycle_owned_queue(ceq.handle, 64'ha111, status);
+      fixture.destroy_lifecycle_owned_queue(
+        ceq.handle, ceq_created, ceq_attached, 64'ha111, status);
       if (status == null || !status.ok())
         `uvm_error("EQ_CEQ_TEARDOWN", "EQ publish CEQ teardown failed")
     end
@@ -278,6 +364,8 @@ class rdma_eq_engine_test extends uvm_test;
     rdma_ceq facade_ceq;
     rdma_aeq direct_aeq;
     rdma_aeq facade_aeq;
+    rdma_cq direct_cq;
+    rdma_cq facade_cq;
     rdma_qp direct_qp;
     rdma_qp facade_qp;
     rdma_eq_engine facade;
@@ -290,6 +378,22 @@ class rdma_eq_engine_test extends uvm_test;
     rdma_status direct_status;
     rdma_status facade_status;
     bit ready;
+    bit direct_ceq_created;
+    bit direct_ceq_attached;
+    bit direct_aeq_created;
+    bit direct_aeq_attached;
+    bit direct_cq_created;
+    bit direct_cq_attached;
+    bit direct_qp_created;
+    bit direct_qp_attached;
+    bit facade_ceq_created;
+    bit facade_ceq_attached;
+    bit facade_aeq_created;
+    bit facade_aeq_attached;
+    bit facade_cq_created;
+    bit facade_cq_attached;
+    bit facade_qp_created;
+    bit facade_qp_attached;
     string setup_stage;
 
     direct_fixture = rdma_queue_data_engine_fixture::type_id::create(
@@ -300,6 +404,8 @@ class rdma_eq_engine_test extends uvm_test;
     facade_ceq = null;
     direct_aeq = null;
     facade_aeq = null;
+    direct_cq = null;
+    facade_cq = null;
     direct_qp = null;
     facade_qp = null;
     setup_stage = "fixture allocation";
@@ -314,24 +420,17 @@ class rdma_eq_engine_test extends uvm_test;
     if (ready) begin
       setup_stage = "event ring setup";
       setup_publish_event_rings(
-        direct_fixture, direct_ceq, direct_aeq, direct_status);
+        direct_fixture, direct_ceq, direct_aeq, direct_cq, direct_qp,
+        direct_ceq_created, direct_ceq_attached, direct_aeq_created,
+        direct_aeq_attached, direct_cq_created, direct_cq_attached,
+        direct_qp_created, direct_qp_attached, direct_status);
       setup_publish_event_rings(
-        facade_fixture, facade_ceq, facade_aeq, facade_status);
+        facade_fixture, facade_ceq, facade_aeq, facade_cq, facade_qp,
+        facade_ceq_created, facade_ceq_attached, facade_aeq_created,
+        facade_aeq_attached, facade_cq_created, facade_cq_attached,
+        facade_qp_created, facade_qp_attached, facade_status);
       ready = direct_status != null && direct_status.ok() &&
               facade_status != null && facade_status.ok();
-    end
-    if (ready) begin
-      setup_stage = "event QP setup";
-      direct_fixture.create_transport_qp(
-        "eq_direct_event_qp", RDMA_TRANSPORT_RC, direct_qp, direct_status);
-      facade_fixture.create_transport_qp(
-        "eq_facade_event_qp", RDMA_TRANSPORT_RC, facade_qp, facade_status);
-      if (direct_status != null && direct_status.ok() && direct_qp != null)
-        direct_status = direct_fixture.engine.attach_qp(direct_qp.handle);
-      if (facade_status != null && facade_status.ok() && facade_qp != null)
-        facade_status = facade_fixture.engine.attach_qp(facade_qp.handle);
-      ready = direct_status != null && direct_status.ok() && direct_qp != null &&
-              facade_status != null && facade_status.ok() && facade_qp != null;
     end
     if (ready) begin
       setup_stage = "facade configure";
@@ -345,11 +444,11 @@ class rdma_eq_engine_test extends uvm_test;
     if (ready) begin
       setup_stage = "event model construction";
       make_publish_event_models(
-        direct_fixture, direct_ceq, direct_aeq, direct_qp,
+        direct_fixture, direct_ceq, direct_aeq, direct_cq, direct_qp,
         direct_ceqe, direct_aeqe,
         direct_status);
       make_publish_event_models(
-        facade_fixture, facade_ceq, facade_aeq, facade_qp,
+        facade_fixture, facade_ceq, facade_aeq, facade_cq, facade_qp,
         facade_ceqe, facade_aeqe,
         facade_status);
       ready = direct_status != null && direct_status.ok() &&
@@ -442,9 +541,15 @@ class rdma_eq_engine_test extends uvm_test;
                    "AEQE facade rejection differs from direct delegate")
     end
     cleanup_publish_event_rings(
-      direct_fixture, direct_ceq, direct_aeq, direct_qp);
+      direct_fixture, direct_ceq, direct_aeq, direct_cq, direct_qp,
+      direct_ceq_created, direct_ceq_attached, direct_aeq_created,
+      direct_aeq_attached, direct_cq_created, direct_cq_attached,
+      direct_qp_created, direct_qp_attached);
     cleanup_publish_event_rings(
-      facade_fixture, facade_ceq, facade_aeq, facade_qp);
+      facade_fixture, facade_ceq, facade_aeq, facade_cq, facade_qp,
+      facade_ceq_created, facade_ceq_attached, facade_aeq_created,
+      facade_aeq_attached, facade_cq_created, facade_cq_attached,
+      facade_qp_created, facade_qp_attached);
   endtask
 
   // 功能：配置 EQ facade，消费空 CEQ、拒绝错误 AEQ kind，并执行 CEQE/AEQE
@@ -462,8 +567,13 @@ class rdma_eq_engine_test extends uvm_test;
     rdma_ceq runtime_ceq;
     rdma_status status;
     rdma_status cleanup_status;
+    bit runtime_ceq_created;
+    bit runtime_ceq_attached;
 
     phase.raise_objection(this);
+    runtime_ceq = null;
+    runtime_ceq_created = 1'b0;
+    runtime_ceq_attached = 1'b0;
     fixture = rdma_queue_data_engine_fixture::type_id::create("eq_fixture");
     fixture.setup(status);
     if (status == null || !status.ok()) begin
@@ -504,19 +614,33 @@ class rdma_eq_engine_test extends uvm_test;
       phase.drop_objection(this);
       return;
     end
+    runtime_ceq_created = 1'b1;
     status = fixture.engine.attach_ceq(runtime_ceq.handle);
     if (status == null || !status.ok()) begin
       `uvm_error("EQ_ATTACH", status == null ? "CEQ attachment setup failed: null status" :
                  status.convert2string())
+      fixture.destroy_lifecycle_owned_queue(
+        runtime_ceq.handle, runtime_ceq_created, runtime_ceq_attached,
+        64'h1004, cleanup_status);
+      if (cleanup_status == null || !cleanup_status.ok())
+        `uvm_error("EQ_RUNTIME_CEQ_TEARDOWN",
+                   "unattached runtime CEQ teardown failed")
       phase.drop_objection(this);
       return;
     end
+    runtime_ceq_attached = 1'b1;
 
     status = facade.configure(fixture.manager, fixture.binding, fixture.mem,
                               fixture.scheduler, fixture.registry, 2us,
                               fixture.engine);
     if (status == null || !status.ok()) begin
       `uvm_error("EQ_CONFIGURE", "EQ facade configuration failed")
+      fixture.destroy_lifecycle_owned_queue(
+        runtime_ceq.handle, runtime_ceq_created, runtime_ceq_attached,
+        64'h1004, cleanup_status);
+      if (cleanup_status == null || !cleanup_status.ok())
+        `uvm_error("EQ_RUNTIME_CEQ_TEARDOWN",
+                   "configured-path runtime CEQ teardown failed")
       phase.drop_objection(this);
       return;
     end
@@ -534,7 +658,8 @@ class rdma_eq_engine_test extends uvm_test;
     check_publish_delegate_equivalence();
 
     fixture.destroy_lifecycle_owned_queue(
-      runtime_ceq.handle, 64'h1004, cleanup_status);
+      runtime_ceq.handle, runtime_ceq_created, runtime_ceq_attached,
+      64'h1004, cleanup_status);
     if (cleanup_status == null || !cleanup_status.ok())
       `uvm_error("EQ_RUNTIME_CEQ_TEARDOWN", "runtime CEQ teardown failed")
 

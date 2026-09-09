@@ -135,20 +135,31 @@ class rdma_device_publish_width_runtime_engine extends rdma_queue_data_engine;
   endfunction
 
   // 功能：install_wide_cq_runtime 为已 attach CQ 安装 depth=131072、PI=65536 的
-  //   device runtime，保留同一 handle 与当前 Function route/epoch。
-  // 输入/输出及副作用：cq_h 为输入；成功时只替换本测试 engine 的 CQ runtime，
-  //   不修改 manager resource、queue backing 或调用者 model。
-  // 失败/边界：attachment/binding/identity/runtime 配置或激活失败时返回原错误；
-  //   不发布半配置 runtime，且该入口只供 width 负例、不得执行 backing 写入。
-  function rdma_status install_wide_cq_runtime(rdma_handle cq_h);
+  //   device runtime，并注入与本 width 场景目标 CEQ 一致的 detached dependency。
+  // 输入/输出及副作用：cq_h、ceq_h 为输入；成功时只替换本测试 engine 的 CQ
+  //   runtime/ceq_h 快照，不修改 manager resource、queue backing 或调用者 model。
+  // 失败/边界：handle/attachment/binding/identity/clone/runtime 配置或激活失败时
+  //   返回原错误；不发布半配置状态，且该入口只供 width 负例、不得写 backing。
+  function rdma_status install_wide_cq_runtime(
+    rdma_handle cq_h,
+    rdma_handle ceq_h
+  );
     rdma_queue_runtime runtime;
     rdma_function_identity identity;
+    rdma_handle ceq_snapshot;
     rdma_status status;
     string key;
 
-    if (cq_h == null)
+    if (cq_h == null || ceq_h == null)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                               "wide CQ runtime handle is null");
+                               "wide CQ runtime handle/dependency is null");
+    status = ensure_handle(ceq_h, RDMA_RESOURCE_CEQ);
+    if (status == null || !status.ok()) return status;
+    status = clone_publish_handle(ceq_h, "wide CQ dependency", ceq_snapshot);
+    if (status == null || !status.ok() || ceq_snapshot == null)
+      return status == null || status.ok() ?
+        rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED,
+                          "wide CQ dependency snapshot is unavailable") : status;
     key = attachment_key(cq_h, RDMA_QUEUE_RUNTIME_CQ);
     if (key == "" || !attachments.exists(key) || attachments[key] == null)
       return rdma_status::make(RDMA_SC_INVALID_STATE,
@@ -169,6 +180,7 @@ class rdma_device_publish_width_runtime_engine extends rdma_queue_data_engine;
     status = runtime.activate();
     if (status == null || !status.ok()) return status;
     attachments[key].runtime = runtime;
+    attachments[key].ceq_h = ceq_snapshot;
     return rdma_status::success();
   endfunction
 endclass
@@ -744,6 +756,8 @@ class rdma_queue_data_engine_device_publish_test extends uvm_test;
     bit before_pi_wrap;
     bit before_ci_wrap;
     bit polarity;
+    bit ceq_created;
+    bit ceq_attached;
 
     rdma_queue_data_engine::type_id::set_type_override(
       rdma_device_publish_width_runtime_engine::get_type());
@@ -751,6 +765,8 @@ class rdma_queue_data_engine_device_publish_test extends uvm_test;
       "ceqe_width_fixture");
     fixture.setup(status);
     ceq = null;
+    ceq_created = 1'b0;
+    ceq_attached = 1'b0;
     if (status == null || !status.ok() ||
         !$cast(width_engine, fixture.engine)) begin
       `uvm_error("CEQE_WIDTH_SETUP", "width engine fixture setup failed")
@@ -773,11 +789,14 @@ class rdma_queue_data_engine_device_publish_test extends uvm_test;
       `uvm_error("CEQE_WIDTH_CEQ", "width CEQ create failed")
       return;
     end
+    ceq_created = 1'b1;
     status = fixture.engine.attach_ceq(ceq.handle);
     if (status == null || !status.ok()) begin
       `uvm_error("CEQE_WIDTH_ATTACH", "width CEQ attach failed")
     end else begin
-      status = width_engine.install_wide_cq_runtime(fixture.cq.handle);
+      ceq_attached = 1'b1;
+      status = width_engine.install_wide_cq_runtime(
+        fixture.cq.handle, ceq.handle);
       if (status == null || !status.ok())
         `uvm_error("CEQE_WIDTH_RUNTIME", "wide CQ runtime install failed")
       else begin
@@ -815,7 +834,8 @@ class rdma_queue_data_engine_device_publish_test extends uvm_test;
         end
       end
     end
-    fixture.destroy_lifecycle_owned_queue(ceq.handle, 64'h9111, cleanup_status);
+    fixture.destroy_lifecycle_owned_queue(
+      ceq.handle, ceq_created, ceq_attached, 64'h9111, cleanup_status);
     if (cleanup_status == null || !cleanup_status.ok())
       `uvm_error("CEQE_WIDTH_TEARDOWN", "width CEQ teardown failed")
   endtask
@@ -881,18 +901,32 @@ class rdma_queue_data_engine_device_publish_test extends uvm_test;
   endtask
 
   // 功能：setup_event_publish_topology 创建并 attach 独立的 lifecycle-owned
-  //   CEQ、AEQ、CQ，以及分别属于事件 CQ 和基础 CQ 的两个真实 RC QP。
-  // 输入/输出及副作用：输出 fixture、三类 queue、event_qp、foreign_qp 与 status；
-  //   成功会在 manager/Host-memory 建立资源，并把非拥有 route 登记到 queue-data engine。
+  //   两个 CEQ、AEQ、CQ，以及分别属于事件 CQ 和基础 CQ 的两个真实 RC QP。
+  // 输入/输出及副作用：输出 fixture、正确/错误 CEQ、AEQ、CQ、两个 QP、每项
+  //   created/attached 阶段状态与 status；成功会在 manager/Host-memory 建立资源，
+  //   并把非拥有 route 登记到 queue-data engine。
   // 失败边界：任一 factory/create/cast/clone/attach 失败立即返回非成功 status；所有
   //   已发布的部分资源仍经输出交给统一 cleanup，不以 dependency-only CEQ 替代。
   task automatic setup_event_publish_topology(
     output rdma_queue_data_engine_fixture fixture,
     output rdma_ceq lifecycle_ceq,
+    output rdma_ceq wrong_ceq,
     output rdma_aeq lifecycle_aeq,
     output rdma_cq lifecycle_cq,
     output rdma_qp event_qp,
     output rdma_qp foreign_qp,
+    output bit lifecycle_ceq_created,
+    output bit lifecycle_ceq_attached,
+    output bit wrong_ceq_created,
+    output bit wrong_ceq_attached,
+    output bit lifecycle_aeq_created,
+    output bit lifecycle_aeq_attached,
+    output bit lifecycle_cq_created,
+    output bit lifecycle_cq_attached,
+    output bit event_qp_created,
+    output bit event_qp_attached,
+    output bit foreign_qp_created,
+    output bit foreign_qp_attached,
     output rdma_status status
   );
     rdma_create_ceq_req ceq_request;
@@ -903,10 +937,23 @@ class rdma_queue_data_engine_device_publish_test extends uvm_test;
 
     fixture = null;
     lifecycle_ceq = null;
+    wrong_ceq = null;
     lifecycle_aeq = null;
     lifecycle_cq = null;
     event_qp = null;
     foreign_qp = null;
+    lifecycle_ceq_created = 1'b0;
+    lifecycle_ceq_attached = 1'b0;
+    wrong_ceq_created = 1'b0;
+    wrong_ceq_attached = 1'b0;
+    lifecycle_aeq_created = 1'b0;
+    lifecycle_aeq_attached = 1'b0;
+    lifecycle_cq_created = 1'b0;
+    lifecycle_cq_attached = 1'b0;
+    event_qp_created = 1'b0;
+    event_qp_attached = 1'b0;
+    foreign_qp_created = 1'b0;
+    foreign_qp_attached = 1'b0;
     status = rdma_status::make(RDMA_SC_INVALID_STATE,
                                "event topology setup is incomplete");
 
@@ -945,8 +992,42 @@ class rdma_queue_data_engine_device_publish_test extends uvm_test;
                                    "CEQ create returned invalid resource");
       return;
     end
+    lifecycle_ceq_created = 1'b1;
     status = fixture.engine.attach_ceq(lifecycle_ceq.handle);
     if (status == null || !status.ok()) return;
+    lifecycle_ceq_attached = 1'b1;
+
+    ceq_request = rdma_create_ceq_req::type_id::create(
+      "publish_wrong_ceq_request");
+    if (ceq_request == null) begin
+      status = rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED,
+                                 "wrong CEQ request allocation failed");
+      return;
+    end
+    ceq_request.owner = fixture.binding.make_handle();
+    ceq_request.depth = 16;
+    ceq_request.vector_id = 1;
+    ceq_request.ring_backing.mode = RDMA_QUEUE_BACKING_OWNED;
+    resource = null;
+    control_result = null;
+    fixture.queue_executor.create_locked(
+      fixture.binding, fixture.binding.make_handle(), ceq_request, 64'h9006,
+      resource, control_result);
+    status = control_result == null ?
+      rdma_status::make(RDMA_SC_INVALID_STATE,
+                        "wrong CEQ create returned no result") :
+      control_result.status;
+    if (status == null || !status.ok() || resource == null ||
+        !$cast(wrong_ceq, resource)) begin
+      if (status == null || status.ok())
+        status = rdma_status::make(RDMA_SC_INVALID_STATE,
+                                   "wrong CEQ create returned invalid resource");
+      return;
+    end
+    wrong_ceq_created = 1'b1;
+    status = fixture.engine.attach_ceq(wrong_ceq.handle);
+    if (status == null || !status.ok()) return;
+    wrong_ceq_attached = 1'b1;
 
     aeq_request = rdma_create_aeq_req::type_id::create("publish_aeq_request");
     if (aeq_request == null) begin
@@ -973,8 +1054,10 @@ class rdma_queue_data_engine_device_publish_test extends uvm_test;
                                    "AEQ create returned invalid resource");
       return;
     end
+    lifecycle_aeq_created = 1'b1;
     status = fixture.engine.attach_aeq(lifecycle_aeq.handle);
     if (status == null || !status.ok()) return;
+    lifecycle_aeq_attached = 1'b1;
 
     cq_request = rdma_create_cq_req::type_id::create("publish_cq_request");
     if (cq_request == null) begin
@@ -1003,33 +1086,40 @@ class rdma_queue_data_engine_device_publish_test extends uvm_test;
                                    "CQ create returned invalid resource");
       return;
     end
+    lifecycle_cq_created = 1'b1;
     status = fixture.engine.attach_cq(lifecycle_cq.handle, RDMA_TRANSPORT_RC);
     if (status == null || !status.ok()) return;
+    lifecycle_cq_attached = 1'b1;
 
     fixture.create_transport_qp_for_cq(
       "event_publish_qp", RDMA_TRANSPORT_RC, lifecycle_cq, event_qp, status);
     if (status == null || !status.ok() || event_qp == null) return;
+    event_qp_created = 1'b1;
     status = fixture.engine.attach_qp(event_qp.handle);
     if (status == null || !status.ok()) return;
+    event_qp_attached = 1'b1;
 
     fixture.create_transport_qp_for_cq(
       "event_foreign_qp", RDMA_TRANSPORT_RC, fixture.cq, foreign_qp, status);
     if (status == null || !status.ok() || foreign_qp == null) return;
+    foreign_qp_created = 1'b1;
     status = fixture.engine.attach_qp(foreign_qp.handle);
     if (status == null || !status.ok()) return;
+    foreign_qp_attached = 1'b1;
 
     status = rdma_status::success();
   endtask
 
   // 功能：check_ceqe_publish_cases 在真实 CQ/CEQ/QP route 上验证 qpn=0、非零
   //   qpn、显式 CQ poll、authority/PI/polarity 拒绝以及满环 credit 契约。
-  // 输入/输出及副作用：fixture、lifecycle_ceq/cq、event_qp/foreign_qp 为输入，
+  // 输入/输出及副作用：fixture、正确/错误 lifecycle CEQ、CQ 与两个 QP 为输入，
   //   status 为输出；成功路径写入并消费 CQE/CEQE，拒绝路径只读取原子性快照。
   // 失败边界：正向 prerequisite 失败立即返回；每个负例必须保持 backing、cursor、
   //   used、pending/reservation 和 result 不变，完整填充一圈必须显式翻转 producer wrap。
   task automatic check_ceqe_publish_cases(
     rdma_queue_data_engine_fixture fixture,
     rdma_ceq lifecycle_ceq,
+    rdma_ceq wrong_ceq,
     rdma_cq lifecycle_cq,
     rdma_qp event_qp,
     rdma_qp foreign_qp,
@@ -1061,6 +1151,7 @@ class rdma_queue_data_engine_device_publish_test extends uvm_test;
     bit fill_start_ci_wrap;
     bit saved_cq_pi_wrap;
     bit ceq_polarity;
+    bit wrong_ceq_polarity;
     bit has_pending;
 
     status = rdma_status::make(RDMA_SC_INVALID_STATE,
@@ -1137,6 +1228,31 @@ class rdma_queue_data_engine_device_publish_test extends uvm_test;
     fixture.engine.poll_ceqe(
       lifecycle_ceq.handle, 0, event_result, status);
     if (status == null || !status.ok() || event_result == null) return;
+
+    // 设计说明：cqn/cq_h 只能证明事件来源 CQ，不能授权目标 CEQ。这里选择同一
+    // Function 内另一个已 attach 的真实 CEQ，并令 valid 匹配该错误 CEQ 的当前
+    // producer polarity，确保拒绝只能来自被冻结的 CQ→CEQ dependency。
+    status = fixture.engine.query_runtime_producer_polarity(
+      wrong_ceq.handle, RDMA_QUEUE_RUNTIME_CEQ, wrong_ceq_polarity);
+    if (status == null || !status.ok()) return;
+    make_ceqe_from_committed_cq(
+      fixture.engine, lifecycle_cq.handle, lifecycle_cq.local_cq_id, 0,
+      wrong_ceq_polarity, ceqe, model_status);
+    if (model_status == null || !model_status.ok() || ceqe == null) begin
+      status = model_status;
+      return;
+    end
+    capture_publish_queue_state(
+      fixture, wrong_ceq, RDMA_QUEUE_RUNTIME_CEQ, RDMA_QUEUE_ROLE_CEQ_RING,
+      16, before_bytes, before_pi, before_pi_wrap, before_ci, before_ci_wrap,
+      before_used, status);
+    if (status == null || !status.ok()) return;
+    fixture.engine.publish_ceqe(wrong_ceq.handle, ceqe, published, status);
+    check_rejected_publish_atomic(
+      "CEQE_WRONG_CEQ", fixture, wrong_ceq, RDMA_QUEUE_RUNTIME_CEQ,
+      RDMA_QUEUE_ROLE_CEQ_RING, 16, before_bytes, before_pi, before_pi_wrap,
+      before_ci, before_ci_wrap, before_used, published, status,
+      RDMA_SC_INVALID_STATE);
 
     capture_publish_queue_state(
       fixture, lifecycle_ceq, RDMA_QUEUE_RUNTIME_CEQ,
@@ -1491,54 +1607,81 @@ class rdma_queue_data_engine_device_publish_test extends uvm_test;
     status = rdma_status::success();
   endtask
 
-  // 功能：cleanup_event_publish_topology 按 foreign QP、event QP、CQ、AEQ、CEQ
-  //   的依赖反序销毁本测试创建的 lifecycle-owned 资源。
-  // 输入/输出及副作用：fixture 与五个可空资源为输入；每个存在的资源依次
-  //   detach/destroy，并通过 UVM 报告清理结果，不接管基础 fixture 的资源。
+  // 功能：cleanup_event_publish_topology 按 foreign QP、event QP、CQ、AEQ、错误
+  //   CEQ、正确 CEQ 的依赖反序销毁本测试创建的 lifecycle-owned 资源。
+  // 输入/输出及副作用：fixture、六个可空资源及每项 created/attached 状态为输入；
+  //   每个已创建资源依次按阶段 detach/destroy，并通过 UVM 报告清理结果，不接管
+  //   基础 fixture 的资源。
   // 失败边界：fixture 为空时安全返回；单项失败只报告、不阻断后续独立资源清理，
   //   从而避免首个 teardown 错误掩盖其余生命周期泄漏。
   task automatic cleanup_event_publish_topology(
     rdma_queue_data_engine_fixture fixture,
     rdma_ceq lifecycle_ceq,
+    rdma_ceq wrong_ceq,
     rdma_aeq lifecycle_aeq,
     rdma_cq lifecycle_cq,
     rdma_qp event_qp,
-    rdma_qp foreign_qp
+    rdma_qp foreign_qp,
+    bit lifecycle_ceq_created,
+    bit lifecycle_ceq_attached,
+    bit wrong_ceq_created,
+    bit wrong_ceq_attached,
+    bit lifecycle_aeq_created,
+    bit lifecycle_aeq_attached,
+    bit lifecycle_cq_created,
+    bit lifecycle_cq_attached,
+    bit event_qp_created,
+    bit event_qp_attached,
+    bit foreign_qp_created,
+    bit foreign_qp_attached
   );
     rdma_status cleanup_status;
 
     if (fixture == null) return;
     if (foreign_qp != null) begin
       fixture.destroy_lifecycle_owned_qp(
-        foreign_qp.handle, 64'h9015, cleanup_status);
+        foreign_qp.handle, foreign_qp_created, foreign_qp_attached,
+        64'h9015, cleanup_status);
       if (cleanup_status == null || !cleanup_status.ok())
         uvm_report_error("EVENT_FOREIGN_QP_TEARDOWN",
                          "foreign QP teardown failed");
     end
     if (event_qp != null) begin
       fixture.destroy_lifecycle_owned_qp(
-        event_qp.handle, 64'h9014, cleanup_status);
+        event_qp.handle, event_qp_created, event_qp_attached,
+        64'h9014, cleanup_status);
       if (cleanup_status == null || !cleanup_status.ok())
         uvm_report_error("EVENT_PUBLISH_QP_TEARDOWN",
                          "event QP teardown failed");
     end
     if (lifecycle_cq != null) begin
       fixture.destroy_lifecycle_owned_queue(
-        lifecycle_cq.handle, 64'h9013, cleanup_status);
+        lifecycle_cq.handle, lifecycle_cq_created, lifecycle_cq_attached,
+        64'h9013, cleanup_status);
       if (cleanup_status == null || !cleanup_status.ok())
         uvm_report_error("EVENT_PUBLISH_CQ_TEARDOWN",
                          "lifecycle CQ teardown failed");
     end
     if (lifecycle_aeq != null) begin
       fixture.destroy_lifecycle_owned_queue(
-        lifecycle_aeq.handle, 64'h9012, cleanup_status);
+        lifecycle_aeq.handle, lifecycle_aeq_created, lifecycle_aeq_attached,
+        64'h9012, cleanup_status);
       if (cleanup_status == null || !cleanup_status.ok())
         uvm_report_error("EVENT_PUBLISH_AEQ_TEARDOWN",
                          "lifecycle AEQ teardown failed");
     end
+    if (wrong_ceq != null) begin
+      fixture.destroy_lifecycle_owned_queue(
+        wrong_ceq.handle, wrong_ceq_created, wrong_ceq_attached,
+        64'h9016, cleanup_status);
+      if (cleanup_status == null || !cleanup_status.ok())
+        uvm_report_error("EVENT_WRONG_CEQ_TEARDOWN",
+                         "wrong lifecycle CEQ teardown failed");
+    end
     if (lifecycle_ceq != null) begin
       fixture.destroy_lifecycle_owned_queue(
-        lifecycle_ceq.handle, 64'h9011, cleanup_status);
+        lifecycle_ceq.handle, lifecycle_ceq_created, lifecycle_ceq_attached,
+        64'h9011, cleanup_status);
       if (cleanup_status == null || !cleanup_status.ok())
         uvm_report_error("EVENT_PUBLISH_CEQ_TEARDOWN",
                          "lifecycle CEQ teardown failed");
@@ -1554,15 +1697,32 @@ class rdma_queue_data_engine_device_publish_test extends uvm_test;
   task automatic check_event_publish_api();
     rdma_queue_data_engine_fixture fixture;
     rdma_ceq lifecycle_ceq;
+    rdma_ceq wrong_ceq;
     rdma_aeq lifecycle_aeq;
     rdma_cq lifecycle_cq;
     rdma_qp event_qp;
     rdma_qp foreign_qp;
     rdma_status status;
+    bit lifecycle_ceq_created;
+    bit lifecycle_ceq_attached;
+    bit wrong_ceq_created;
+    bit wrong_ceq_attached;
+    bit lifecycle_aeq_created;
+    bit lifecycle_aeq_attached;
+    bit lifecycle_cq_created;
+    bit lifecycle_cq_attached;
+    bit event_qp_created;
+    bit event_qp_attached;
+    bit foreign_qp_created;
+    bit foreign_qp_attached;
 
     setup_event_publish_topology(
-      fixture, lifecycle_ceq, lifecycle_aeq, lifecycle_cq, event_qp,
-      foreign_qp, status);
+      fixture, lifecycle_ceq, wrong_ceq, lifecycle_aeq, lifecycle_cq, event_qp,
+      foreign_qp, lifecycle_ceq_created, lifecycle_ceq_attached,
+      wrong_ceq_created, wrong_ceq_attached, lifecycle_aeq_created,
+      lifecycle_aeq_attached, lifecycle_cq_created, lifecycle_cq_attached,
+      event_qp_created, event_qp_attached, foreign_qp_created,
+      foreign_qp_attached, status);
     if (status == null || !status.ok()) begin
       uvm_report_error(
         "EVENT_PUBLISH_SETUP",
@@ -1570,7 +1730,8 @@ class rdma_queue_data_engine_device_publish_test extends uvm_test;
                          status.convert2string());
     end else begin
       check_ceqe_publish_cases(
-        fixture, lifecycle_ceq, lifecycle_cq, event_qp, foreign_qp, status);
+        fixture, lifecycle_ceq, wrong_ceq, lifecycle_cq, event_qp, foreign_qp,
+        status);
       if (status == null || !status.ok())
         uvm_report_error(
           "EVENT_PUBLISH_CEQE",
@@ -1585,8 +1746,12 @@ class rdma_queue_data_engine_device_publish_test extends uvm_test;
                            status.convert2string());
     end
     cleanup_event_publish_topology(
-      fixture, lifecycle_ceq, lifecycle_aeq, lifecycle_cq, event_qp,
-      foreign_qp);
+      fixture, lifecycle_ceq, wrong_ceq, lifecycle_aeq, lifecycle_cq, event_qp,
+      foreign_qp, lifecycle_ceq_created, lifecycle_ceq_attached,
+      wrong_ceq_created, wrong_ceq_attached, lifecycle_aeq_created,
+      lifecycle_aeq_attached, lifecycle_cq_created, lifecycle_cq_attached,
+      event_qp_created, event_qp_attached, foreign_qp_created,
+      foreign_qp_attached);
   endtask
 
   // 功能：check_device_publish_calls 断言 publish 在 mock Host-memory 中先发起

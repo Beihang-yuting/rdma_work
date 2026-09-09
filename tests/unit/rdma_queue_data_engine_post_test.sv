@@ -574,92 +574,126 @@ class rdma_queue_data_engine_fixture extends uvm_object;
     return binding.configure_identity(identity);
   endfunction
 
-  // 功能：destroy_lifecycle_owned_queue 统一撤销测试临时创建并已 attach 的
-  //   CEQ/AEQ/CQ，确保每个 lifecycle-owned backing 都经 engine detach 和
-  //   executor destroy 释放，而不是依赖仿真结束隐式回收。
-  // 输入/输出及副作用：queue_h、transaction_id 为输入，status 为输出；成功时
-  //   先解除非拥有 attachment，再由 queue_executor 回收 manager、context 和 backing。
-  // 失败边界：fixture/executor/handle 不完整、detach 或 destroy 的 control result
-  //   为空/失败时返回非成功；调用方仍须继续按逆序尝试清理剩余独立资源。
+  // 功能：destroy_lifecycle_owned_queue 按 created/attached 状态撤销测试临时
+  //   CEQ/AEQ/CQ；已 attach 时先 detach，随后无论 detach 成败都尝试 executor destroy。
+  // 输入/输出及副作用：queue_h、created、attached、transaction_id 为输入，status
+  //   为输出；成功时回收 manager、context 和 owned backing，未创建资源为空操作。
+  // 失败边界：状态矛盾、destroy 依赖/handle/transaction 缺失，或 attached=1 时
+  //   engine 缺失均拒绝；detach 与 destroy 都失败时保留首个 detach 错误。
   task destroy_lifecycle_owned_queue(
     rdma_handle queue_h,
+    bit created,
+    bit attached,
     longint unsigned transaction_id,
     output rdma_status status
   );
     rdma_destroy_resource_req request;
     rdma_control_result control_result;
+    rdma_status detach_status;
+    rdma_status destroy_status;
+    rdma_status first_failure;
+
     status = rdma_status::make(RDMA_SC_INVALID_STATE,
                                "event fixture teardown is not initialized");
-    if (engine == null || queue_executor == null || binding == null ||
-        queue_h == null || transaction_id == 0) return;
-    status = engine.detach(queue_h);
-    if (status == null || !status.ok()) begin
-      if (status == null)
+    first_failure = null;
+    if (!created) begin
+      if (attached)
         status = rdma_status::make(RDMA_SC_INVALID_STATE,
-                                   "event fixture detach returned null status");
+                                   "uncreated event queue is marked attached");
+      else
+        status = rdma_status::success();
       return;
+    end
+    if ((attached && engine == null) || queue_executor == null || binding == null ||
+        queue_h == null || transaction_id == 0) return;
+    if (attached) begin
+      detach_status = engine.detach(queue_h);
+      if (detach_status == null)
+        detach_status = rdma_status::make(
+          RDMA_SC_INVALID_STATE, "event fixture detach returned null status");
+      if (!detach_status.ok()) first_failure = detach_status;
     end
     request = rdma_destroy_resource_req::type_id::create("event_fixture_destroy");
     if (request == null) begin
-      status = rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED,
-                                 "event fixture destroy request allocation failed");
+      destroy_status = rdma_status::make(
+        RDMA_SC_RESOURCE_EXHAUSTED,
+        "event fixture destroy request allocation failed");
+      status = first_failure == null ? destroy_status : first_failure;
       return;
     end
     request.owner = binding.make_handle();
     request.target_h = queue_h;
     queue_executor.destroy_locked(binding, binding.make_handle(), request,
                                   transaction_id, control_result);
-    status = control_result == null ?
+    destroy_status = control_result == null ?
       rdma_status::make(RDMA_SC_INVALID_STATE,
                          "event fixture destroy returned no control result") :
       control_result.status;
-    if (status == null)
-      status = rdma_status::make(RDMA_SC_INVALID_STATE,
-                                 "event fixture destroy returned null status");
+    if (destroy_status == null)
+      destroy_status = rdma_status::make(
+        RDMA_SC_INVALID_STATE, "event fixture destroy returned null status");
+    status = first_failure == null ? destroy_status : first_failure;
   endtask
 
-  // 功能：destroy_lifecycle_owned_qp 先解除 queue-data engine 的非拥有 QP
-  //   attachment，再由 QP lifecycle executor 完成 ERROR/flush/delete 与 backing 回收。
-  // 输入/输出及副作用：qp_h、transaction_id 为输入，status 为输出；成功时销毁
-  //   fixture 显式创建的临时 QP，不影响基础 fixture QP 或外部依赖生命周期。
-  // 失败/边界：依赖/handle/transaction 缺失、detach 或 destroy control result
-  //   为空/失败时返回非成功；调用方仍须继续清理其余 queue，不能提前退出。
+  // 功能：destroy_lifecycle_owned_qp 按 created/attached 状态释放临时 QP；已
+  //   attach 时先解除 queue-data link，随后始终由 executor 尝试 flush/delete/backing 回收。
+  // 输入/输出及副作用：qp_h、created、attached、transaction_id 为输入，status
+  //   为输出；未创建 QP 为空操作，不影响基础 fixture QP 或外部资源。
+  // 失败边界：状态矛盾、destroy 依赖/handle/transaction 缺失，或 attached=1 时
+  //   engine 缺失均拒绝；detach 失败仍执行 destroy，两者均失败时返回首个错误。
   task destroy_lifecycle_owned_qp(
     rdma_handle qp_h,
+    bit created,
+    bit attached,
     longint unsigned transaction_id,
     output rdma_status status
   );
     rdma_destroy_resource_req request;
     rdma_control_result control_result;
+    rdma_status detach_status;
+    rdma_status destroy_status;
+    rdma_status first_failure;
 
     status = rdma_status::make(RDMA_SC_INVALID_STATE,
                                "event QP teardown is not initialized");
-    if (engine == null || qp_executor == null || binding == null ||
-        qp_h == null || transaction_id == 0) return;
-    status = engine.detach(qp_h);
-    if (status == null || !status.ok()) begin
-      if (status == null)
+    first_failure = null;
+    if (!created) begin
+      if (attached)
         status = rdma_status::make(RDMA_SC_INVALID_STATE,
-                                   "event QP detach returned null status");
+                                   "uncreated event QP is marked attached");
+      else
+        status = rdma_status::success();
       return;
+    end
+    if ((attached && engine == null) || qp_executor == null || binding == null ||
+        qp_h == null || transaction_id == 0) return;
+    if (attached) begin
+      detach_status = engine.detach(qp_h);
+      if (detach_status == null)
+        detach_status = rdma_status::make(
+          RDMA_SC_INVALID_STATE, "event QP detach returned null status");
+      if (!detach_status.ok()) first_failure = detach_status;
     end
     request = rdma_destroy_resource_req::type_id::create("event_qp_destroy");
     if (request == null) begin
-      status = rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED,
-                                 "event QP destroy request allocation failed");
+      destroy_status = rdma_status::make(
+        RDMA_SC_RESOURCE_EXHAUSTED,
+        "event QP destroy request allocation failed");
+      status = first_failure == null ? destroy_status : first_failure;
       return;
     end
     request.owner = binding.make_handle();
     request.target_h = qp_h;
     qp_executor.destroy_locked(binding, binding.make_handle(), request,
                                transaction_id, control_result);
-    status = control_result == null ?
+    destroy_status = control_result == null ?
       rdma_status::make(RDMA_SC_INVALID_STATE,
                         "event QP destroy returned no control result") :
       control_result.status;
-    if (status == null)
-      status = rdma_status::make(RDMA_SC_INVALID_STATE,
-                                 "event QP destroy returned null status");
+    if (destroy_status == null)
+      destroy_status = rdma_status::make(
+        RDMA_SC_INVALID_STATE, "event QP destroy returned null status");
+    status = first_failure == null ? destroy_status : first_failure;
   endtask
 endclass
 

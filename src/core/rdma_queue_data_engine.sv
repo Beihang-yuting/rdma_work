@@ -4,7 +4,8 @@
 // 依赖：依赖 rdma_queue_runtime 的冻结队列状态、codec/model、resource manager、
 // Host-memory/backing access 与 doorbell scheduler 契约；全局 topology authority 只读自 binding。
 // 所有权与生命周期：engine 拥有本地 attachment 索引、detached 结果和未接管 recovery
-// evidence；runtime、queue handle、backing capability、mapping 与 QP route 均为非拥有引用，
+// evidence 与 detached CQ→CEQ dependency 快照；runtime、backing capability、mapping
+// 与 QP route 均为非拥有引用，
 // 其生命周期由 lifecycle/resource manager 或外部环境管理，detach/abort 不越权释放 mapping。
 
 // 设计说明：本层是 host 侧 queue-data facade。queue 的生命周期仍归 lifecycle
@@ -95,10 +96,12 @@ endclass
 
 // 设计说明：每个 ring 必须拥有独立 attachment。尤其同一 QP 的 SQ/RQ 逻辑
 // offset 都从零开始，若共享 backing-access lookup namespace 会把不同 ring 的
-// slot 误解析到同一 mapping；因此只借用各自的 access/runtime，不共享索引。
+// slot 误解析到同一 mapping；因此只借用各自的 access/runtime，不共享索引。CQ
+// attachment 还冻结其 authoritative CEQ handle 值，阻止通知被改投同 Function 其他 CEQ。
 class rdma_queue_data_attachment extends uvm_object;
   `uvm_object_utils(rdma_queue_data_attachment)
   rdma_handle queue_h;
+  rdma_handle ceq_h;
   rdma_queue_runtime_kind_e kind;
   rdma_queue_runtime runtime;
   rdma_queue_backing_access access;
@@ -107,12 +110,15 @@ class rdma_queue_data_attachment extends uvm_object;
   int unsigned local_id;
   rdma_transport_e transport;
 
-  // 功能：构造 rdma_queue_data_attachment，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：queue_h=null；kind=RDMA_QUEUE_RUNTIME_SQ；runtime=null；access=null；role=RDMA_QUEUE_ROLE_CQ_RING；entry_size=64；local_id=0；transport=RDMA_TRANSPORT_RC。
-  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
-  // 失败/边界：rdma_queue_data_attachment 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
+  // 功能：构造 queue attachment 的安全默认状态；CQ 的 ceq_h 依赖必须在发布
+  //   attachment 前另行冻结，其他 runtime 保持该字段为空。
+  // 输入/输出及副作用：name 为对象名；new 只初始化本地 queue_h/ceq_h、runtime、
+  //   backing role、geometry 与 transport，不访问 manager 或 Host-memory。
+  // 失败/边界：构造不分配 dependency handle；ceq_h 为空的 CQ attachment 不完整，
+  //   attach/publish 必须返回错误，不能回退到同 Function 任意 CEQ。
   function new(string name = "rdma_queue_data_attachment");
     super.new(name);
-    queue_h = null; kind = RDMA_QUEUE_RUNTIME_SQ; runtime = null;
+    queue_h = null; ceq_h = null; kind = RDMA_QUEUE_RUNTIME_SQ; runtime = null;
     access = null; role = RDMA_QUEUE_ROLE_CQ_RING; entry_size = 64;
     local_id = 0; transport = RDMA_TRANSPORT_RC;
   endfunction
@@ -1873,6 +1879,15 @@ class rdma_queue_data_engine extends uvm_object;
                                     RDMA_SC_INVALID_STATE) : status;
       return;
     end
+    // 设计说明：CEQ route 不由调用参数或 qpn 推断。attach_cq 已从 authoritative
+    // CQ 冻结 ceq_h 值快照；必须在 reserve 前对比完整 instance，才能让 qpn=0
+    // 的通用 CQ 通知也无法越过 CQ 创建时选择的 event queue/vector。
+    if (cq_attachment.ceq_h == null ||
+        !cq_attachment.ceq_h.same_instance(ceq_h)) begin
+      status = bad("CEQE target CEQ does not match CQ dependency",
+                   RDMA_SC_INVALID_STATE);
+      return;
+    end
     // 设计说明：CEQE 的核心 route authority 是 cqn/cq_h；qpn=0 表示通知不绑定
     // 某个 QP，属于协议允许的通用 CQ 通知。只有调用方显式给出非零 qpn 时才要求
     // 它命中当前 Function 已 attach 的唯一 QP link，不能把 0 当成隐式 QP。
@@ -2437,7 +2452,8 @@ class rdma_queue_data_engine extends uvm_object;
   // 输入/输出及副作用：queue_h、kind、role、queue_ref/qp_ref、cursor、geometry 和
   //   transport 为输入；成功时向 attachments 插入新记录，但不取得外部 backing 所有权。
   // 失败边界：重复 key、几何/依赖不完整、access/runtime 配置、route/epoch 校验或
-  //   activate 失败时返回非成功 status，attachments 不发布半成品记录。
+  //   activate 失败时返回非成功 status，attachments 不发布半成品记录；CQ 必须
+  //   同时冻结 authoritative ceq_h 的 detached 值快照。
   protected function rdma_status create_attachment(
     rdma_handle queue_h,
     rdma_queue_runtime_kind_e kind,
@@ -2453,17 +2469,32 @@ class rdma_queue_data_engine extends uvm_object;
     int unsigned local_id,
     rdma_transport_e transport,
     int unsigned entry_size = 64,
-    bit initial_polarity = 1'b0
+    bit initial_polarity = 1'b0,
+    rdma_handle ceq_h = null
   );
     rdma_queue_data_attachment attachment;
     rdma_queue_backing_access access;
     rdma_queue_runtime runtime;
     rdma_function_identity identity;
+    rdma_handle ceq_snapshot;
     rdma_status status;
     string key;
 
+    ceq_snapshot = null;
     if (queue_h == null || depth == 0)
       return bad("queue attachment geometry is invalid");
+    if (kind == RDMA_QUEUE_RUNTIME_CQ) begin
+      status = ensure_handle(ceq_h, RDMA_RESOURCE_CEQ);
+      if (status == null || !status.ok())
+        return status == null ?
+          bad("CQ attachment CEQ validation returned null status",
+              RDMA_SC_INVALID_STATE) : status;
+      status = clone_publish_handle(ceq_h, "CQ attachment CEQ", ceq_snapshot);
+      if (status == null || !status.ok() || ceq_snapshot == null)
+        return status == null || status.ok() ?
+          bad("CQ attachment CEQ snapshot is unavailable",
+              RDMA_SC_RESOURCE_EXHAUSTED) : status;
+    end
     key = attachment_key(queue_h, kind);
     if (attachments.exists(key))
       return bad("queue is already attached", RDMA_SC_INVALID_STATE);
@@ -2511,10 +2542,14 @@ class rdma_queue_data_engine extends uvm_object;
                                   RDMA_SC_INVALID_STATE) : status;
     attachment = rdma_queue_data_attachment::type_id::create(
       $sformatf("queue_attachment_%0d", attachments.num()));
+    if (attachment == null)
+      return bad("queue attachment allocation failed",
+                 RDMA_SC_RESOURCE_EXHAUSTED);
     attachment.queue_h = rdma_clone_handle_value(queue_h,
                                                   "queue attachment handle");
     if (attachment.queue_h == null)
       attachment.queue_h = queue_h;
+    attachment.ceq_h = ceq_snapshot;
     attachment.kind = kind; attachment.runtime = runtime; attachment.access = access;
     attachment.role = role; attachment.entry_size = entry_size;
     attachment.local_id = local_id; attachment.transport = transport;
@@ -2639,9 +2674,12 @@ class rdma_queue_data_engine extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：在 rdma_queue_data_engine 中，attach_cq 把 attach_cq 指定的资源或后端能力绑定到当前对象索引，并校验 Function、generation 和队列类型一致。
-  // 输入/输出及副作用：cq_h（输入）、transport_variant（输入）；attach_cq 先依据 !status.ok(；!(transport_variant inside {RDMA_TRANSPORT_RC, RDMA_TRANSPORT_UD, RDMA_TRANSPORT_URC}；!$cast(cq, resource 校验 cq_h、transport_variant；成功时更新本对象配置/状态并保存非拥有引用，返回 rdma_status。
-  // 失败/边界：资源不存在、类型不符、重复登记或跨 Function 串线时拒绝绑定并保持索引不变。
+  // 功能：attach_cq 从 manager 读取 authoritative CQ，建立 ring attachment，并把
+  //   CQ→CEQ dependency 冻结为 detached handle 快照供 CEQE route 校验。
+  // 输入/输出及副作用：cq_h、transport_variant 为输入；成功时新增 CQ runtime、
+  //   backing access 和 ceq_h 值快照，不取得 CQ、CEQ 或 manager 资源所有权。
+  // 失败/边界：CQ/CEQ handle、Function/generation、transport、backing、snapshot
+  //   分配或重复 attachment 无效时拒绝，attachments 索引不得发布半成品。
   function rdma_status attach_cq(
     rdma_handle cq_h, rdma_transport_e transport_variant
   );
@@ -2675,7 +2713,7 @@ class rdma_queue_data_engine extends uvm_object;
       RDMA_QUEUE_ROLE_CQ_RING, queue_backing, null, cq.depth,
       cq.producer_index, cq.producer_wrap, cq.consumer_index,
       cq.consumer_wrap, 1'b0, cq.local_cq_id, transport_variant,
-      cq.cqe_size_bytes, initial_polarity);
+      cq.cqe_size_bytes, initial_polarity, cq.ceq_h);
   endfunction
 
   // 功能：在 rdma_queue_data_engine 中，attach_event_queue 把 attach_event_queue 指定的资源或后端能力绑定到当前对象索引，并校验 Function、generation 和队列类型一致。
@@ -4102,6 +4140,7 @@ class rdma_queue_data_engine extends uvm_object;
     rdma_queue_runtime dependents[$];
     rdma_cq_resize_recovery recovery;
     rdma_handle runtime_queue_h;
+    rdma_handle replacement_ceq_h;
     rdma_queue_runtime_kind_e runtime_kind;
     string key;
     string recovery_key;
@@ -4360,7 +4399,20 @@ class rdma_queue_data_engine extends uvm_object;
                                status);
       return finish_resize(status);
     end
+    status = clone_publish_handle(old_attachment.ceq_h,
+                                  "CQ resize attachment CEQ",
+                                  replacement_ceq_h);
+    if (status == null || !status.ok() || replacement_ceq_h == null) begin
+      if (status == null || status.ok())
+        status = bad("CQ resize CEQ snapshot is unavailable",
+                     RDMA_SC_RESOURCE_EXHAUSTED);
+      status = abort_cq_resize(cq_h, old_attachment.runtime, dependents,
+                               candidate_ref, manager_quiesced, cq_quiesced,
+                               status);
+      return finish_resize(status);
+    end
     replacement.queue_h = old_attachment.queue_h;
+    replacement.ceq_h = replacement_ceq_h;
     replacement.kind = old_attachment.kind;
     replacement.runtime = candidate_runtime;
     replacement.access = candidate_access;
