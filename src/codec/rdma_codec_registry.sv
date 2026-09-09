@@ -1,26 +1,34 @@
-// 目录：硬件编解码层 codec/rdma_codec_registry.sv。
-// 职责：实现 rdma_codec_registry 在本层的职责和对外接口。
-// 依赖：依赖本层公共 types/model/adapter 契约及其上游快照。
-// 所有权与生命周期：对象只拥有显式创建的值快照；外部资源保存非拥有引用，生命周期由调用方管理。
+// 目录/层次：src/codec，位于语义模型与具体硬件 codec 实现之间的注册层。
+// 文件职责：把完整 rdma_codec_key 规范化为稳定字符串，并提供 codec 的唯一登记、
+// 查找、清空与有序枚举接口；本文件不执行 encode/decode，也不补选默认 variant。
+// 主要依赖：rdma_types_pkg 的 image-kind/status 定义、rdma_codec_base 与 UVM object；
+// 不依赖 queue runtime、Host-memory、PCIe、网络组件或 dpu_common topology。
+// 所有权与生命周期：registry 拥有关联数组及其 key，但只保存 codec 非拥有引用；
+// codec 由创建它的 profile/registry owner 管理，clear 仅解除引用而不销毁对象。
 
-// 中文说明：rdma_codec_registry.sv 属于编码层，将模型字段转换为硬件图像并执行反向校验。
-// 阅读提示：先看公开类型和接口，再看实现细节；失败路径应保持状态与资源所有权可追踪。
+// 设计说明：完整 key 的五个维度共同构成 codec authority。集中规范化可防止登记与
+// 查询使用不同拼接规则；缺项、保留分隔符、未知 image kind 和重复 key 均 fail closed。
 
 class rdma_codec_registry extends uvm_object;
   `uvm_object_utils(rdma_codec_registry)
 
   protected rdma_codec_base codecs[string];
 
-  // 功能：构造 rdma_codec_registry，调用 super.new 建立 UVM 层级对象；外部依赖字段保持未绑定，后续由 configure/build/activate 明确注入。
-  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
-  // 失败/边界：rdma_codec_registry 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
+  // 功能：构造一个 codec 表为空的 registry，并把 name 交给 UVM 基类。
+  // 输入/输出及副作用：name 为对象名；关联数组 codecs 保持空表，不登记 codec，
+  //   也不取得任何外部对象的所有权。
+  // 失败/边界：构造阶段没有必需外部依赖；后续 lookup 在尚未登记目标 key 时返回
+  //   RDMA_SC_UNSUPPORTED_OPCODE，而不是把空表解释为默认 codec。
   function new(string name = "rdma_codec_registry");
     super.new(name);
   endfunction
 
-  // 功能：contains_delimiter 比较 component 与当前 authority/状态字段，返回布尔结果供上层执行精确分支。
-  // 输入/输出及副作用：component（输入）；contains_delimiter 读取 component 并使用字段 i；函数返回 bit，不取得调用方资源所有权。
-  // 失败/边界：contains_delimiter 比较或前置条件不满足时返回 0/false；该路径不隐式重试，也不转移未声明资源。
+  // 功能：contains_delimiter 检查一个 key 字符串分量是否含 canonical 格式保留的
+  //   `|` 字符，供 canonicalize 排除可产生拼接歧义的输入。
+  // 输入/输出及副作用：component 为只读字符串；返回是否发现 8'h7c，不修改
+  //   component、codec 表或任何外部状态。
+  // 失败/边界：空字符串和不含分隔符的字符串返回 0；本函数只检查保留字符，
+  //   空字符串是否合法由 canonicalize 的必填字段检查决定。
   protected function bit contains_delimiter(string component);
     for (int unsigned i = 0; i < component.len(); i++) begin
       if (component.getc(i) == 8'h7c)
@@ -29,9 +37,12 @@ class rdma_codec_registry extends uvm_object;
     return 1'b0;
   endfunction
 
-  // 功能：在 rdma_codec_registry 中，canonicalize 规范化输入 key/恢复记录并检查必需字段，使同一语义对象只产生一种登记表示。
-  // 输入/输出及副作用：key（输入）、canonical（输出）；canonicalize 读取 key、canonical 并使用字段 canonical，并写入 canonical；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：canonicalize 返回 RDMA_SC_INVALID_ARGUMENT；具体拒绝条件包括 “codec key has an empty required string component”；“codec key string component contains reserved delimiter '|'”；“codec key image kind is invalid”；失败路径不提交部分状态、不隐式重试，也不转移未声明资源。
+  // 功能：canonicalize 校验 codec key 的必填字符串与 image kind，并按固定五元组
+  //   顺序生成 hw_version|image_kind|object_type|variant|opcode 唯一索引。
+  // 输入/输出及副作用：key 为值输入，canonical 为输出；入口先清空 canonical，
+  //   成功时填入小写十六进制 opcode 的稳定字符串，不读取或修改 codecs。
+  // 失败/边界：hw_version/object_type/variant 为空、任一字符串含 `|`，或
+  //   image_kind 不在受支持枚举集合时返回 RDMA_SC_INVALID_ARGUMENT 并保持输出为空。
   protected function rdma_status canonicalize(
     rdma_codec_key key,
     output string canonical
@@ -66,9 +77,13 @@ class rdma_codec_registry extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：在 rdma_codec_registry 中，register_codec 将输入对象登记或挂接到当前集合/依赖图，并同步维护对应账本和生命周期引用。
-  // 输入/输出及副作用：key（输入）、codec（输入）；register_codec 先依据 !status.ok(；codec == null；codecs.exists(canonical 校验 key、codec；成功时更新本对象配置/状态并保存非拥有引用，返回 rdma_status。
-  // 失败/边界：register_codec 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal，不保留部分有效快照。
+  // 功能：register_codec 把非空 codec 非拥有引用登记到完整 key 的 canonical 索引，
+  //   建立后续 lookup 的唯一 authority。
+  // 输入/输出及副作用：key 与 codec 为输入；成功时向 codecs 新增一个引用并返回
+  //   RDMA_SC_OK，不 clone codec，也不改变已有登记项。
+  // 失败/边界：key 规范化失败或 codec=null 时返回对应非成功 status；重复 canonical
+  //   key 报 RDMA_CODEC_DUPLICATE fatal，并在 catcher 消费 fatal 时仍返回
+  //   RDMA_SC_INVALID_STATE，原登记保持不变。
   function rdma_status register_codec(
     rdma_codec_key key,
     rdma_codec_base codec
@@ -86,8 +101,8 @@ class rdma_codec_registry extends uvm_object;
       `uvm_fatal("RDMA_CODEC_DUPLICATE",
                  $sformatf("duplicate codec registration for %s",
                            canonical))
-      // A report catcher may consume the fatal in a negative unit test.  The
-      // operation must still fail and leave the original registration intact.
+      // 设计说明：负向单测可能用 report catcher 消费 fatal，因此此分支还必须显式
+      // 返回失败，确保 caller 不会把重复登记误判为成功，且原引用保持不变。
       return rdma_status::make(RDMA_SC_INVALID_STATE,
                                "duplicate codec registration");
     end
@@ -96,10 +111,13 @@ class rdma_codec_registry extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：在 rdma_codec_registry 中，lookup 按完整 key/handle 查找唯一权威记录并返回 detached 快照，避免把内部可变引用泄露给调用方。
-  // 输入/输出及副作用：key（输入）、codec（输出）；lookup 读取 key、codec 并使用字段 codec、status，并写入 codec；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：lookup 在 key/handle 缺失、记录不唯一或 generation/reset epoch 过期时返回明确错误，不回退到默认 authority。
-  function rdma_status lookup(
+  // 功能：lookup 作为可覆写的 registry 读取边界，按完整 codec key 查找唯一登记项，
+  //   使 adapter/test registry 能注入明确失败而不改写调用方或基础 codec 表。
+  // 输入/输出及副作用：key 为输入，codec 为输出；基类先置 codec=null，成功返回
+  //   登记项的非拥有引用与 RDMA_SC_OK，不复制 codec 或改变 registry 内容。
+  // 失败/边界：key 非法或条目缺失时保持 codec=null 并返回明确非成功 status；override
+  //   必须保留完整 key authority 与输出初始化，返回 null status 时 caller 必须 fail closed。
+  virtual function rdma_status lookup(
     rdma_codec_key key,
     output rdma_codec_base codec
   );
@@ -120,16 +138,20 @@ class rdma_codec_registry extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：在 rdma_codec_registry 中，clear 按 owner、generation 和幂等规则释放/隔离记录，并同步删除其账本引用。
-  // 输入/输出及副作用：无显式参数；输入 action/epoch/handle 决定迁移目标；成功时更新状态或恢复证据，外部资源仍由其拥有者管理。
-  // 失败/边界：clear 发现 owner/generation 不匹配、记录未知或重复释放时返回错误或幂等结果，不重新激活旧句柄。
+  // 功能：clear 删除 registry 的全部 key→codec 关联，恢复为空表状态。
+  // 输入/输出及副作用：无参数和返回值；只清空 codecs 关联数组中的非拥有引用，
+  //   不调用 codec 方法，也不销毁 codec 对象。
+  // 失败/边界：空表上重复调用保持幂等；已有 caller 保存的 codec 引用不失效，
+  //   但后续 registry lookup 必须重新登记后才能成功。
   virtual function void clear();
     codecs.delete();
   endfunction
 
-  // 功能：在 rdma_codec_registry 中，list_keys 导出并排序所有 canonical codec key，向调用方提供稳定、无内部别名的注册表视图。
-  // 输入/输出及副作用：keys（输出）；list_keys 读取 keys 并使用输入参数和固定枚举/常量，并写入 keys；函数返回 void，不取得调用方资源所有权。
-  // 失败/边界：list_keys 无返回值，仅执行 函数体中的顺序操作；调用方须保证前置依赖已经绑定，函数不自动重试或接管外部资源。
+  // 功能：list_keys 导出当前全部 canonical key，并按字符串升序形成稳定视图。
+  // 输入/输出及副作用：keys 为输出队列；入口先删除 caller 原内容，再复制关联数组
+  //   索引并在多项时排序，不暴露或修改 codec 引用。
+  // 失败/边界：空 registry 返回空队列；函数没有 status 输出或分配恢复路径，
+  //   caller 不得从空结果推断 registry 生命周期已结束。
   function void list_keys(output string keys[$]);
     keys.delete();
     foreach (codecs[canonical])

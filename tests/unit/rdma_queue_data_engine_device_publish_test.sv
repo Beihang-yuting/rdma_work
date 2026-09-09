@@ -216,11 +216,15 @@ class rdma_queue_poll_factory_fault_wrapper extends uvm_object_wrapper;
 endclass
 
 // 设计说明：consumer doorbell 的 registry/codec 异常必须经真实 poll preparation
-// 触发，不能增加生产 virtual seam。该 registry 仅向测试开放 protected codec 表的
-// 单项替换能力；未调用 replace/remove 时与生产 defaults registry 完全一致。
+// 触发，不能增加 queue-data transaction seam。该 registry 只对精确 CQ RC/UD key
+// 注入一次 lookup null status，或向测试开放 protected codec 表的单项替换能力；
+// 未 arm/replace/remove 时与 production defaults registry 完全一致。
 class rdma_queue_consumer_fault_registry
   extends rdma_hw_doorbell_codec_registry;
   `uvm_object_utils(rdma_queue_consumer_fault_registry)
+
+  protected bit null_lookup_status_armed;
+  protected int unsigned null_lookup_status_hits;
 
   // 功能：构造尚未注入 codec 故障的 doorbell registry，沿用生产 defaults 状态。
   // 输入/输出及副作用：name 为对象名；只调用基类构造，不注册、删除或替换 codec。
@@ -228,6 +232,62 @@ class rdma_queue_consumer_fault_registry
   //   未配置对象的 lookup 行为仍由基类明确拒绝。
   function new(string name = "rdma_queue_consumer_fault_registry");
     super.new(name);
+    null_lookup_status_armed = 1'b0;
+    null_lookup_status_hits = 0;
+  endfunction
+
+  // 功能：arm_null_lookup_status_once 为下一次精确的 cq_rc_ud consumer
+  //   doorbell lookup 开启一次 null status 故障，并从零开始统计目标命中。
+  // 输入/输出及副作用：无显式输入输出；只更新本 test registry 的 armed/hits，
+  //   不删除 codec、不改变 defaults_registered，也不触碰 engine/runtime。
+  // 失败/边界：重复 arm 会重置未消费窗口与计数；非目标 key 始终委托 super.lookup，
+  //   目标命中后自动 disarm，故同一窗口最多返回一次 null status。
+  function void arm_null_lookup_status_once();
+    null_lookup_status_armed = 1'b1;
+    null_lookup_status_hits = 0;
+  endfunction
+
+  // 功能：disarm_null_lookup_status 显式关闭 lookup null-status 故障窗口，供故障
+  //   断言完成后恢复同一 registry 的 production lookup 行为。
+  // 输入/输出及副作用：无显式输入输出；清除 armed 位但保留 hits 作为只读证据，
+  //   不修改 codec 表或任何 queue-data 状态。
+  // 失败/边界：未 arm 或故障已自动消费时调用保持幂等；不会回退、补发或伪造 lookup。
+  function void disarm_null_lookup_status();
+    null_lookup_status_armed = 1'b0;
+  endfunction
+
+  // 功能：null_lookup_status_hit_count 返回最近一次 arm 窗口内精确目标 key 的命中数，
+  //   使测试能证明故障既未漏过也没有扩散到其它 registry 查询。
+  // 输入/输出及副作用：无显式输入；只读 null_lookup_status_hits 并返回计数，
+  //   不清除 armed/hits，也不访问 codec 表。
+  // 失败/边界：从未 arm、仅发生非目标 lookup 或 base-handle 未启用 virtual dispatch
+  //   时返回 0；按一次性契约正常命中只能返回 1。
+  function int unsigned null_lookup_status_hit_count();
+    return null_lookup_status_hits;
+  endfunction
+
+  // 功能：lookup 在精确 cq_rc_ud consumer doorbell key 的一次 armed 查询中返回
+  //   null status/codec，以驱动 production preparation 的 fail-closed guard。
+  // 输入/输出及副作用：key 为输入、codec 为输出；目标命中时 codec=null、hits++
+  //   并消费 armed 位，所有其它查询原样委托 super.lookup。
+  // 失败/边界：只匹配完整 rdma/DOORBELL/doorbell/cq_rc_ud/00 key；未 arm、key
+  //   任一字段不同或一次故障已消费时不得返回 null，也不取得 codec 所有权。
+  virtual function rdma_status lookup(
+    rdma_codec_key key,
+    output rdma_codec_base codec
+  );
+    codec = null;
+    if (null_lookup_status_armed &&
+        key.hw_version == "rdma" &&
+        key.image_kind == RDMA_IMAGE_DOORBELL &&
+        key.object_type == "doorbell" &&
+        key.variant == "cq_rc_ud" &&
+        key.opcode == 8'h00) begin
+      null_lookup_status_armed = 1'b0;
+      null_lookup_status_hits++;
+      return null;
+    end
+    return super.lookup(key, codec);
   endfunction
 
   // 功能：replace_codec_for_test 把一个精确 key 的现有 codec 暂时替换为 caller
@@ -5025,9 +5085,10 @@ class rdma_queue_data_engine_device_publish_test extends uvm_test;
   // 功能：check_cq_local_preparation_failure 验证一个 consumer doorbell 本地准备
   //   故障在 admission/scheduler 前结束，并保持 CQE、CQ CI 与 SQ WQE 全部可见。
   // 输入/输出及副作用：label/fixture/ordering/expected_code 为输入；执行一次公开
-  //   poll，并读取 PCIe history、runtime occupancy/cursor/pending，不修改故障源。
+  //   poll，并读取 PCIe history、CQ backing、runtime occupancy/cursor/pending，
+  //   不修改故障源或 ledger。
   // 失败/边界：status code 不符、发布 completion、调用任一 transaction seam、
-  //   PCIe 增长、CQ/SQ used 或 CI 改变、安装 pending 时报告 UVM_ERROR。
+  //   PCIe 增长、CQ backing、CQ/SQ used/cursor 改变或安装 pending 时报告 UVM_ERROR。
   task automatic check_cq_local_preparation_failure(
     string label,
     rdma_queue_data_engine_fixture fixture,
@@ -5038,16 +5099,76 @@ class rdma_queue_data_engine_device_publish_test extends uvm_test;
     rdma_queue_pending_operation pending;
     rdma_status status;
     int unsigned pcie_before;
+    int unsigned cq_occupancy_before;
     int unsigned cq_occupancy;
+    int unsigned sq_occupancy_before;
     int unsigned sq_occupancy;
+    int unsigned cq_producer_index_before;
+    int unsigned cq_consumer_index_before;
+    int unsigned sq_producer_index_before;
+    int unsigned sq_consumer_index_before;
     int unsigned producer_index;
     int unsigned consumer_index;
+    bit cq_producer_wrap_before;
+    bit cq_consumer_wrap_before;
+    bit sq_producer_wrap_before;
+    bit sq_consumer_wrap_before;
     bit producer_wrap;
     bit consumer_wrap;
     bit has_pending;
+    byte backing_before[];
+    byte backing_after[];
 
     if (fixture == null || ordering == null) begin
       `uvm_error(label, "local preparation fixture is incomplete")
+      return;
+    end
+    cq_occupancy_before = 0;
+    has_pending = 1'b0;
+    status = fixture.engine.query_runtime_occupancy(
+      fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, cq_occupancy_before,
+      has_pending);
+    if (status == null || !status.ok() || cq_occupancy_before != 1 ||
+        has_pending) begin
+      `uvm_error({label, "_BASE_CQ"},
+                 "local preparation CQ baseline is incomplete")
+      return;
+    end
+    status = fixture.engine.query_runtime_cursors(
+      fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ,
+      cq_producer_index_before, cq_producer_wrap_before,
+      cq_consumer_index_before, cq_consumer_wrap_before);
+    if (status == null || !status.ok()) begin
+      `uvm_error({label, "_BASE_CQ_CURSOR"},
+                 "local preparation CQ cursor baseline is unavailable")
+      return;
+    end
+    sq_occupancy_before = 0;
+    has_pending = 1'b0;
+    status = fixture.engine.query_runtime_occupancy(
+      fixture.qp.handle, RDMA_QUEUE_RUNTIME_SQ, sq_occupancy_before,
+      has_pending);
+    if (status == null || !status.ok() || sq_occupancy_before != 1 ||
+        has_pending) begin
+      `uvm_error({label, "_BASE_SQ"},
+                 "local preparation SQ baseline is incomplete")
+      return;
+    end
+    status = fixture.engine.query_runtime_cursors(
+      fixture.qp.handle, RDMA_QUEUE_RUNTIME_SQ,
+      sq_producer_index_before, sq_producer_wrap_before,
+      sq_consumer_index_before, sq_consumer_wrap_before);
+    if (status == null || !status.ok()) begin
+      `uvm_error({label, "_BASE_SQ_CURSOR"},
+                 "local preparation SQ cursor baseline is unavailable")
+      return;
+    end
+    status = fixture.read_cq_entry(
+      cq_consumer_index_before, fixture.cq.cqe_size_bytes, backing_before);
+    if (status == null || !status.ok() ||
+        backing_before.size() != fixture.cq.cqe_size_bytes) begin
+      `uvm_error({label, "_BASE_BACKING"},
+                 "local preparation CQ backing baseline is unavailable")
       return;
     end
     ordering.trace.delete();
@@ -5069,19 +5190,46 @@ class rdma_queue_data_engine_device_publish_test extends uvm_test;
     has_pending = 1'b0;
     status = fixture.engine.query_runtime_occupancy(
       fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, cq_occupancy, has_pending);
-    if (status == null || !status.ok() || cq_occupancy != 1 || has_pending)
+    if (status == null || !status.ok() ||
+        cq_occupancy != cq_occupancy_before || has_pending)
       `uvm_error({label, "_CQ"}, "local failure changed CQ used/pending")
     status = fixture.engine.query_runtime_cursors(
       fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ,
       producer_index, producer_wrap, consumer_index, consumer_wrap);
-    if (status == null || !status.ok() || consumer_index != 0 || consumer_wrap)
-      `uvm_error({label, "_CI"}, "local failure advanced CQ consumer cursor")
+    if (status == null || !status.ok() ||
+        producer_index != cq_producer_index_before ||
+        producer_wrap != cq_producer_wrap_before ||
+        consumer_index != cq_consumer_index_before ||
+        consumer_wrap != cq_consumer_wrap_before)
+      `uvm_error({label, "_CI"}, "local failure changed CQ cursors")
     sq_occupancy = 0;
     has_pending = 1'b0;
     status = fixture.engine.query_runtime_occupancy(
       fixture.qp.handle, RDMA_QUEUE_RUNTIME_SQ, sq_occupancy, has_pending);
-    if (status == null || !status.ok() || sq_occupancy != 1 || has_pending)
+    if (status == null || !status.ok() ||
+        sq_occupancy != sq_occupancy_before || has_pending)
       `uvm_error({label, "_SQ"}, "local failure changed SQ WQE credit")
+    status = fixture.engine.query_runtime_cursors(
+      fixture.qp.handle, RDMA_QUEUE_RUNTIME_SQ,
+      producer_index, producer_wrap, consumer_index, consumer_wrap);
+    if (status == null || !status.ok() ||
+        producer_index != sq_producer_index_before ||
+        producer_wrap != sq_producer_wrap_before ||
+        consumer_index != sq_consumer_index_before ||
+        consumer_wrap != sq_consumer_wrap_before)
+      `uvm_error({label, "_SQ_CURSOR"},
+                 "local failure changed SQ WQE ledger cursors")
+    status = fixture.read_cq_entry(
+      cq_consumer_index_before, fixture.cq.cqe_size_bytes, backing_after);
+    if (status == null || !status.ok() ||
+        backing_after.size() != backing_before.size())
+      `uvm_error({label, "_BACKING"},
+                 "local failure made CQ backing unavailable")
+    else foreach (backing_before[i]) begin
+      if (backing_after[i] !== backing_before[i])
+        `uvm_error({label, "_BACKING"},
+                   $sformatf("local failure changed CQ backing byte %0d", i))
+    end
     pending = null;
     status = fixture.engine.query_runtime_pending(
       fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, pending);
@@ -5089,6 +5237,82 @@ class rdma_queue_data_engine_device_publish_test extends uvm_test;
         pending != null)
       `uvm_error({label, "_PENDING"},
                  "local failure installed consumer recovery evidence")
+  endtask
+
+  // 功能：check_cq_consumer_registry_null_status 经真实 CQ poll 注入一次 registry
+  //   lookup null status，验证 guard fail-closed 后关闭故障并消费同一 CQE。
+  // 输入/输出及副作用：无显式输入；建立一笔真实 SQ WQE/CQE，arm 精确 registry
+  //   key，复用原子失败检查，再 disarm 并执行正常 doorbell→commit→release。
+  // 失败/边界：故障未恰好命中一次、返回码非 INVALID_STATE、任何首次副作用、
+  //   retry 顺序/结果/原 WQE identity 错误或最终 CQ/SQ 非空时报告 UVM_ERROR。
+  task automatic check_cq_consumer_registry_null_status();
+    rdma_queue_data_engine_fixture fixture;
+    rdma_queue_data_engine_ordering_fault ordering;
+    rdma_queue_consumer_fault_registry fault_registry;
+    rdma_queue_post_result posted;
+    rdma_hw_cqe_model cqe;
+    rdma_queue_completion_result completion;
+    rdma_status status;
+    int unsigned occupancy;
+    bit has_pending;
+
+    prepare_ordering_cqe(
+      "cq_consumer_registry_null", fixture, ordering, posted, cqe, status);
+    if (status == null || !status.ok() || fixture == null || posted == null ||
+        !$cast(fault_registry, fixture.registry) || fault_registry == null) begin
+      `uvm_error("CQ_CONSUMER_REGISTRY_NULL_SETUP", status == null ?
+                 "registry-null fixture returned null" :
+                 status.convert2string())
+      return;
+    end
+
+    fault_registry.arm_null_lookup_status_once();
+    check_cq_local_preparation_failure(
+      "CQ_CONSUMER_REGISTRY_NULL", fixture, ordering, RDMA_SC_INVALID_STATE);
+    if (fault_registry.null_lookup_status_hit_count() != 1)
+      `uvm_error("CQ_CONSUMER_REGISTRY_NULL_HIT",
+                 $sformatf("lookup null fault hits=%0d, expected 1",
+                   fault_registry.null_lookup_status_hit_count()))
+    fault_registry.disarm_null_lookup_status();
+
+    ordering.trace.delete();
+    completion = null;
+    fixture.engine.poll_cqe(fixture.cq.handle, 0, completion, status);
+    if (status == null || !status.ok() || completion == null ||
+        completion.released_slots.size() != 1)
+      `uvm_error("CQ_CONSUMER_REGISTRY_NULL_RETRY", status == null ?
+                 "restored registry poll returned null" :
+                 status.convert2string())
+    else if (completion.released_slots[0] == null ||
+             completion.released_slots[0].wr_id != posted.wr_id ||
+             completion.released_slots[0].index != posted.index ||
+             completion.released_slots[0].wrap != posted.wrap)
+      `uvm_error("CQ_CONSUMER_REGISTRY_NULL_LEDGER",
+                 "restored poll did not release the original visible WQE")
+    if (ordering.trace.size() != 3 || ordering.trace[0] != "doorbell" ||
+        ordering.trace[1] != "commit" || ordering.trace[2] != "release" ||
+        ordering.doorbell_calls != 1 || ordering.commit_calls != 1 ||
+        ordering.release_calls != 1)
+      `uvm_error("CQ_CONSUMER_REGISTRY_NULL_ORDER",
+                 $sformatf("trace=%p calls=%0d/%0d/%0d",
+                           ordering.trace, ordering.doorbell_calls,
+                           ordering.commit_calls, ordering.release_calls))
+    if (fault_registry.null_lookup_status_hit_count() != 1)
+      `uvm_error("CQ_CONSUMER_REGISTRY_NULL_REPEAT",
+                 "lookup null fault escaped its one-shot target window")
+
+    occupancy = 32'hffff_ffff;
+    has_pending = 1'b1;
+    status = fixture.engine.query_runtime_occupancy(
+      fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, occupancy, has_pending);
+    if (status == null || !status.ok() || occupancy != 0 || has_pending)
+      `uvm_error("CQ_CONSUMER_REGISTRY_NULL_CQ_FINAL",
+                 "restored poll did not consume CQ exactly once")
+    status = fixture.engine.query_runtime_occupancy(
+      fixture.qp.handle, RDMA_QUEUE_RUNTIME_SQ, occupancy, has_pending);
+    if (status == null || !status.ok() || occupancy != 0 || has_pending)
+      `uvm_error("CQ_CONSUMER_REGISTRY_NULL_SQ_FINAL",
+                 "restored poll did not release SQ WQE exactly once")
   endtask
 
   // 功能：check_cq_consumer_codec_preparation_failures 用真实 registry lookup 与
@@ -6446,6 +6670,8 @@ class rdma_queue_data_engine_device_publish_test extends uvm_test;
     check_snapshot_release_range_factory_atomicity();
     reset_device_publish_factory_state();
     check_cq_poll_post_scheduler_allocation_guard();
+    reset_device_publish_factory_state();
+    check_cq_consumer_registry_null_status();
     reset_device_publish_factory_state();
     check_cq_consumer_codec_preparation_failures();
     reset_device_publish_factory_state();
