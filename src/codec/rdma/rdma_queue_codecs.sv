@@ -232,11 +232,13 @@ class rdma_hw_ceqe_model extends rdma_ceqe_model;
   endfunction
 
   // 功能：validate 校验 当前对象字段 与当前对象状态的一致性，并显式处理“CEQE requires CQ handle”等拒绝条件，返回 rdma_status 供上层决定是否提交。
-  // 输入/输出及副作用：无显式参数；validate 读取 对象字段：rdma_status、cq_h、cq_h.kind、cq_h.object_id、cqn 并使用字段 rdma_status、cq_h、cq_h.kind、cq_h.object_id、cqn；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：validate 返回 RDMA_SC_INVALID_ARGUMENT；典型拒绝条件为“CEQE requires CQ handle”“CEQE CQN does not match handle”；失败路径不提交部分状态或转移未声明资源。
+  // 输入/输出及副作用：无显式参数；validate 只读取 cq_h 及其 kind，返回状态且
+  //   不修改 cq_h/cqn；global handle incarnation 与 Function-local cqn 的关联由
+  //   queue-data attachment authority 校验，codec 不跨命名空间猜测 identity。
+  // 失败/边界：cq_h 为空或不是 CQ 时返回 INVALID_ARGUMENT；cqn 的字段宽度由
+  //   packed 类型/codec 保证，unknown local CQN 必须由拥有 topology 的调用方拒绝。
   virtual function rdma_status validate();
     if (cq_h==null || cq_h.kind!=RDMA_RESOURCE_CQ) return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,"CEQE requires CQ handle");
-    if (cq_h.object_id != 0 && cqn != 0 && cq_h.object_id != cqn) return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,"CEQE CQN does not match handle");
     return rdma_status::success();
   endfunction
 

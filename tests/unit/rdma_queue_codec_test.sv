@@ -45,9 +45,20 @@ class rdma_queue_codec_test extends uvm_test;
   task run_phase(uvm_phase phase);
     rdma_codec_registry r; rdma_status s; rdma_codec_base c; rdma_hw_image im,im2; rdma_hw_model m;
     rdma_hw_sqe_model sq, sq2; rdma_hw_rqe_model rq, rq2; rdma_hw_cqe_model cq, cq2;
+    rdma_hw_ceqe_model ceqe;
     rdma_sqe_rc_ext re; rdma_sge sg; byte unsigned bad[];
     phase.raise_objection(this);
     r=rdma_codec_registry::type_id::create("r"); s=rdma_register_queue_codecs(r); ok("register",s);
+    // 设计说明：CQ handle.object_id 是 resource manager 分配的 global incarnation，
+    // cqn 是 Function-local CQ ID；二者不共享命名空间，model/codec 只能校验 handle
+    // kind 和各字段宽度，完整 identity 由 queue-data attachment 边界完成。
+    ceqe=rdma_hw_ceqe_model::type_id::create("ceqe_local_cqn");
+    ceqe.cq_h=h("ceqe_cq",RDMA_RESOURCE_CQ,32'h3000_0002);
+    ceqe.cqn=21'h1; ceqe.qpn=0; ceqe.cq_pi=16'h1; ceqe.cq_pi_wrap=0;
+    ceqe.valid=0; ceqe.ecode=0; ceqe.packet_opcode=0;
+    s=ceqe.validate(); ok("ceqe global handle local cqn validate",s);
+    s=r.lookup('{hw_version:"rdma",image_kind:RDMA_IMAGE_CEQE,object_type:"ceqe",variant:"default",opcode:0},c);
+    ok("lookup ceqe",s); s=c.encode(ceqe,im); ok("ceqe global handle local cqn encode",s);
     sq=rdma_hw_sqe_model::type_id::create("sq"); sq.transport=RDMA_TRANSPORT_RC; sq.qp_h=h("q",RDMA_RESOURCE_QP,'h15555);
     sq.hw_opcode=4'hd; sq.icos=5; sq.qp_sn=8'ha6; sq.dst_port=11; sq.index='h4567; sq.wrap=1; sq.sign_en=1; sq.se=1; sq.fence=2; sq.ce=2; sq.valid=1; sq.signature=8'hc7;
     re=rdma_sqe_rc_ext::type_id::create("re"); re.remote_access_valid=1; re.rkey_valid=1; re.rkey=32'hdeadbeef; re.remote_addr.value=64'h0123456789abcdef; sq.transport_ext=re;
