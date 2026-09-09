@@ -1,10 +1,9 @@
 // 目录：测试层 rdma_unit_test_pkg.sv。
-// 职责：验证 rdma_unit_test_pkg 对应模块的接口、错误路径和边界行为。
-// 依赖：依赖被测 package、UVM 测试基类和必要的 mock/fixture。
-// 所有权与生命周期：测试对象只拥有本地 fixture；外部后端句柄由测试环境提供并在测试结束释放。
-
-// 中文说明：rdma_unit_test_pkg.sv 属于仿真入口或测试包，负责注册并组织验证组件。
-// 阅读提示：先看公开类型和接口，再看实现细节；失败路径应保持状态与资源所有权可追踪。
+// 职责：作为单元测试 package 的 import/include 注册入口，按依赖顺序组织 mock、
+//   fixture 与 UVM test class 的可见域，不实现或驱动任何 runtime 事务。
+// 依赖：依赖被测 package、UVM 基类以及被 include 的 mock/fixture 源文件。
+// 所有权与生命周期：本 package 不拥有 runtime、queue、mapping 或 Host-memory；
+//   被注册测试在各自 run_phase 中按自身 fixture 规则申请和释放资源。
 
 `ifdef RDMA_HOST_MEM_TEST
   // 外部 host_mem_manager 原始文件以 compilation-unit 形式提供。把它包在
@@ -90,6 +89,7 @@ package rdma_unit_test_pkg;
   `include "unit/rdma_queue_runtime_test.sv"
   `include "unit/rdma_queue_backing_access_test.sv"
   `include "unit/rdma_queue_data_engine_post_test.sv"
+  `include "unit/rdma_queue_data_engine_device_publish_test.sv"
   `include "unit/rdma_cq_engine_resize_test.sv"
   `include "unit/rdma_queue_data_engine_poll_test.sv"
   `include "unit/rdma_queue_data_engine_recovery_test.sv"
