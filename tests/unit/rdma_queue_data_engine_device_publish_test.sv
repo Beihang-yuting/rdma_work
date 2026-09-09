@@ -2353,13 +2353,14 @@ class rdma_queue_data_engine_device_publish_test extends uvm_test;
       `uvm_error("CQE_HOST_CALL", "device publish Host-memory direction/order is wrong")
   endtask
 
-  // 功能：check_device_publish_fault_recovery 对 backend write、read 与 readback
-  //   mismatch 三类已开始设备写入故障执行 publish、查询 pending 和确认 retry。
-  // 输入/输出及副作用：label、fault_kind 为输入；任务建立独立 fixture 并通过
-  //   mock 注入单次故障，成功恢复后 poll CQE 释放该测试提前 post 的 SQ WQE。
-  // 失败边界：fixture/post/model/注入、pending 证据、reservation、retry 或 poll
-  //   任一不符合契约时报告 UVM_ERROR；已开始写入必须返回 RECOVERY_REQUIRED，
-  //   不能发布 result 或悄悄清除 reservation。
+  // 功能：check_device_publish_fault_recovery 对首次 backend write、首次 read 与
+  //   readback mismatch 三类已开始设备写入故障执行完整原子快照、pending 查询和 retry。
+  // 输入/输出及副作用：label、fault_kind 为输入；任务建立独立 lifecycle fixture，
+  //   在注入前读取 backing/runtime 基线，故障后比较公开 detached evidence，恢复成功后
+  //   poll CQE 释放该测试提前 post 的 SQ WQE。
+  // 失败边界：write-fail 必须只有一次 write 且 backing 不变；read-fail/mismatch 必须
+  //   恰有一次 write/read 且 backing 等于 pending image。三者都不得推进 committed
+  //   PI/CI/occupancy 或发布 result，并须保留完整 pending/reservation 后才能 retry。
   task automatic check_device_publish_fault_recovery(
     string label,
     int unsigned fault_kind
@@ -2370,14 +2371,34 @@ class rdma_queue_data_engine_device_publish_test extends uvm_test;
     rdma_queue_completion_result completion;
     rdma_hw_cqe_model cqe;
     rdma_queue_pending_operation pending;
+    rdma_queue_pending_operation pending_after;
     rdma_queue_cursor_snapshot reservation;
     rdma_status status;
     rdma_status model_status;
     rdma_status injected;
+    byte backing_before[];
+    byte backing_after[];
     bit polarity;
     bit reservation_valid;
     bit occupancy_pending;
+    bit backing_matches_image;
+    bit expected_next_wrap;
     int unsigned occupancy;
+    int unsigned pi_before;
+    int unsigned pi_after;
+    int unsigned ci_before;
+    int unsigned ci_after;
+    int unsigned used_before;
+    int unsigned calls_before;
+    int unsigned writes_before;
+    int unsigned reads_before;
+    int unsigned expected_next_index;
+    int unsigned expected_write_delta;
+    int unsigned expected_read_delta;
+    bit pi_wrap_before;
+    bit pi_wrap_after;
+    bit ci_wrap_before;
+    bit ci_wrap_after;
 
     fixture = rdma_queue_data_engine_fixture::type_id::create(
       {label, "_fixture"});
@@ -2405,6 +2426,38 @@ class rdma_queue_data_engine_device_publish_test extends uvm_test;
       `uvm_error({label, "_MODEL"}, "device publish fault CQE build failed")
       return;
     end
+    capture_publish_queue_state(fixture, fixture.cq, RDMA_QUEUE_RUNTIME_CQ,
+      RDMA_QUEUE_ROLE_CQ_RING, fixture.cq.cqe_size_bytes, backing_before,
+      pi_before, pi_wrap_before, ci_before, ci_wrap_before, used_before,
+      status);
+    if (status == null || !status.ok()) begin
+      `uvm_error({label, "_SNAPSHOT"},
+                 "device publish fault baseline snapshot failed")
+      return;
+    end
+    pending = null;
+    status = fixture.engine.query_runtime_pending(
+      fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, pending);
+    if (status == null || status.code != RDMA_SC_INVALID_STATE ||
+        pending != null) begin
+      `uvm_error({label, "_PENDING_BEFORE"},
+                 "device publish fault baseline already has pending evidence")
+      return;
+    end
+    reservation_valid = 1'b1;
+    reservation = null;
+    status = fixture.engine.query_runtime_device_reservation(
+      fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, reservation_valid,
+      reservation);
+    if (status == null || !status.ok() || reservation_valid ||
+        reservation != null) begin
+      `uvm_error({label, "_RESERVATION_BEFORE"},
+                 "device publish fault baseline already has a reservation")
+      return;
+    end
+    calls_before = fixture.mem.calls.size();
+    writes_before = count_host_mem_calls(fixture.mem, "write");
+    reads_before = count_host_mem_calls(fixture.mem, "read");
     case (fault_kind)
       0: begin
         injected = rdma_status::make(RDMA_SC_DMA_TRANSLATION,
@@ -2436,23 +2489,82 @@ class rdma_queue_data_engine_device_publish_test extends uvm_test;
                  "started device publish fault did not retain recovery")
       return;
     end
+    expected_write_delta = 1;
+    expected_read_delta = fault_kind == 0 ? 0 : 1;
+    if (fixture.mem.calls.size() != calls_before + expected_write_delta +
+                                      expected_read_delta ||
+        count_host_mem_calls(fixture.mem, "write") !=
+          writes_before + expected_write_delta ||
+        count_host_mem_calls(fixture.mem, "read") !=
+          reads_before + expected_read_delta)
+      `uvm_error({label, "_CALL_DELTA"},
+                 $sformatf("initial failure I/O delta is not write=%0d read=%0d",
+                           expected_write_delta, expected_read_delta))
     pending = null;
     status = fixture.engine.query_runtime_pending(
       fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, pending);
     if (status == null || !status.ok() || pending == null ||
         !pending.device_producer || !pending.device_write_attempted ||
         pending.cursor == null || pending.next_cursor == null ||
-        pending.image == null || pending.image.length != RDMA_CQE_BYTES ||
-        pending.mmio_evidence != RDMA_QUEUE_MMIO_NOT_APPLICABLE) begin
+        pending.image == null || pending.failure_status == null ||
+        pending.image.length != fixture.cq.cqe_size_bytes ||
+        pending.image.bytes.size() != fixture.cq.cqe_size_bytes ||
+        pending.image.alignment != fixture.cq.cqe_size_bytes ||
+        pending.image.endian != RDMA_ENDIAN_BIG ||
+        pending.image.image_kind != RDMA_IMAGE_CQE ||
+        !same_test_handle_value(pending.queue_h, fixture.cq.handle) ||
+        pending.routed_qp_h != null ||
+        pending.kind != RDMA_QUEUE_RUNTIME_CQ || pending.producer ||
+        pending.consumer_committed || pending.cq_consumer_committed ||
+        pending.completion_released ||
+        pending.consumer_doorbell_succeeded ||
+        pending.committed_consumer_cursor != null ||
+        pending.request_snapshot != null || pending.wr_id != 0 ||
+        pending.signaled || pending.completion_index != 0 ||
+        pending.completion_wrap || pending.completion_target_valid ||
+        pending.cursor.index != pi_before ||
+        pending.cursor.wrap != pi_wrap_before ||
+        pending.entry_offset != longint'(pi_before) *
+                                longint'(fixture.cq.cqe_size_bytes) ||
+        pending.entry_size != fixture.cq.cqe_size_bytes ||
+        pending.mmio_evidence != RDMA_QUEUE_MMIO_NOT_APPLICABLE ||
+        pending.mmio_maybe_submitted || !pending.known_no_mmio ||
+        !pending.route_valid || !pending.epoch_valid) begin
       `uvm_error({label, "_PENDING"},
                  "started device publish fault lost replay evidence")
       return;
     end
+    expected_next_index = pi_before + 1;
+    expected_next_wrap = pi_wrap_before;
+    if (expected_next_index >= fixture.cq.depth) begin
+      expected_next_index = 0;
+      expected_next_wrap = ~expected_next_wrap;
+    end
+    if (pending.next_cursor.index != expected_next_index ||
+        pending.next_cursor.wrap != expected_next_wrap)
+      `uvm_error({label, "_NEXT_CURSOR"},
+                 "initial failure pending next cursor is incorrect")
+    if ((fault_kind inside {0, 1}) &&
+        !same_test_status_value(injected, pending.failure_status))
+      `uvm_error({label, "_FAILURE_STATUS"},
+                 "initial backend failure status was not preserved")
+    if (fault_kind == 2 &&
+        pending.failure_status.code != RDMA_SC_DMA_TRANSLATION)
+      `uvm_error({label, "_MISMATCH_STATUS"},
+                 "readback mismatch failure status is not DMA_TRANSLATION")
+    status = fixture.engine.query_runtime_cursors(
+      fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, pi_after, pi_wrap_after,
+      ci_after, ci_wrap_after);
+    if (status == null || !status.ok() || pi_after != pi_before ||
+        pi_wrap_after != pi_wrap_before || ci_after != ci_before ||
+        ci_wrap_after != ci_wrap_before)
+      `uvm_error({label, "_CURSOR_AFTER"},
+                 "initial failure changed committed PI/CI")
     occupancy = 0;
     occupancy_pending = 1'b0;
     status = fixture.engine.query_runtime_occupancy(
       fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, occupancy, occupancy_pending);
-    if (status == null || !status.ok() || occupancy != 0 ||
+    if (status == null || !status.ok() || occupancy != used_before ||
         !occupancy_pending)
       `uvm_error({label, "_OCCUPANCY"},
                  "failed device publish changed occupancy or hid pending")
@@ -2461,12 +2573,39 @@ class rdma_queue_data_engine_device_publish_test extends uvm_test;
     status = fixture.engine.query_runtime_device_reservation(
       fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, reservation_valid, reservation);
     if (status == null || !status.ok() || !reservation_valid ||
-        reservation == null || reservation.index != pending.cursor.index ||
-        reservation.wrap != pending.cursor.wrap) begin
+        !same_test_cursor_value(reservation, pending.cursor)) begin
       `uvm_error({label, "_RESERVATION"},
                  "failed device publish lost the reserved slot")
       return;
     end
+    status = read_queue_backing_slot(fixture, fixture.cq,
+      RDMA_QUEUE_ROLE_CQ_RING, pi_before, fixture.cq.cqe_size_bytes,
+      backing_after);
+    if (status == null || !status.ok()) begin
+      `uvm_error({label, "_BACKING_AFTER"},
+                 "initial failure backing snapshot failed")
+      return;
+    end
+    backing_matches_image = backing_after.size() == pending.image.bytes.size();
+    if (backing_matches_image) begin
+      foreach (backing_after[i]) begin
+        if (backing_after[i] !== pending.image.bytes[i])
+          backing_matches_image = 1'b0;
+      end
+    end
+    if ((fault_kind == 0 && backing_after != backing_before) ||
+        (fault_kind != 0 && !backing_matches_image))
+      `uvm_error({label, "_BACKING_CONTRACT"},
+                 fault_kind == 0 ?
+                   "first write failure changed backing bytes" :
+                   "post-write read failure backing differs from pending image")
+    pending_after = null;
+    status = fixture.engine.query_runtime_pending(
+      fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, pending_after);
+    if (status == null || !status.ok() ||
+        !same_device_pending_value(pending, pending_after))
+      `uvm_error({label, "_DETACHED_PENDING"},
+                 "public detached pending snapshot changed after observation")
     fixture.engine.recover_queue(fixture.cq.handle,
       RDMA_QUEUE_RECOVERY_RETRY_PENDING, 1'b1, status);
     if (status == null || !status.ok()) begin
