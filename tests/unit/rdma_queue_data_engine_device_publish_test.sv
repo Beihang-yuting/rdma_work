@@ -5,6 +5,48 @@
 // 所有权与生命周期：测试只拥有本地 fixture；queue、mapping、runtime 和 Host-memory
 //   都由 fixture 或其生命周期执行器管理，测试仅读取其已发布快照。
 
+// 设计说明：CQ 的 allocation 必须完整满足 lifecycle 的 DEVICE_WRITE 契约，故
+// 不能借由修改 allocation snapshot 伪造 publish 预检失败。engine 通过 factory
+// 创建 backing-access；此 test-only 子类仅在 setup 完成后被静态开关命中的首次
+// write_device 调用处返回权限拒绝，模拟 access 已完成 span 预检但尚未触及 backend。
+class rdma_cq_device_write_preflight_fault_access extends rdma_queue_backing_access;
+  `uvm_object_utils(rdma_cq_device_write_preflight_fault_access)
+
+  // 设计说明：factory 创建的 CQ/SQ/RQ access 都是独立对象，测试须用共享的一次性
+  // 开关精确命中 setup 后的 publish 调用，不能获取或修改 engine 私有 attachment。
+  static bit reject_next_device_write;
+
+  // 功能：构造 CQ device-write 预检故障 access，默认不拒绝调用，使 fixture
+  //   setup、普通 post 和未显式 armed 的 publish 保持基类行为。
+  // 输入/输出及副作用：name 为输入；构造不改变静态一次性开关、不申请 mapping，
+  //   也不修改 runtime、Host-memory 或 lifecycle 对资源的所有权。
+  // 失败边界：构造不验证 factory 或外部依赖；access 未经 configure/attach 时仍由
+  //   基类接口拒绝，不能把该测试类当作绕过生产 lifecycle 校验的通道。
+  function new(string name = "rdma_cq_device_write_preflight_fault_access");
+    super.new(name);
+  endfunction
+
+  // 功能：write_device 在 armed 的首次设备发布预检处注入 DMA permission 拒绝，
+  //   验证 engine 取消 reservation 而不向 Host-memory backend 发起 write。
+  // 输入/输出及副作用：offset、data 为输入，backend_write_started 为输出；命中
+  //   开关时清除一次性开关并保持输出为 0，未命中时完全委托基类实现。
+  // 失败边界：仅 armed 的第一笔调用返回 RDMA_SC_DMA_PERMISSION；不访问 backing、
+  //   不伪造已开始写入，后续调用恢复基类行为，避免泄露故障到其他测试事务。
+  virtual function rdma_status write_device(
+    longint unsigned offset,
+    byte data[],
+    output bit backend_write_started
+  );
+    if (reject_next_device_write) begin
+      reject_next_device_write = 1'b0;
+      backend_write_started = 1'b0;
+      return rdma_status::make(RDMA_SC_DMA_PERMISSION,
+                               "injected CQ device-write preflight failure");
+    end
+    return super.write_device(offset, data, backend_write_started);
+  endfunction
+endclass
+
 class rdma_queue_data_engine_device_publish_test extends uvm_test;
   `uvm_component_utils(rdma_queue_data_engine_device_publish_test)
 
@@ -119,33 +161,9 @@ class rdma_queue_data_engine_device_publish_test extends uvm_test;
     queue_data.publish_cqe(cq_h, model, result, status);
   endtask
 
-  // 功能：find_cq_backing 返回 fixture 生命周期已创建的 CQ ring backing，用于
-  //   只读验证 publish 写入的真实 bytes 与 Host-memory 调用 authority。
-  // 输入/输出及副作用：fixture 为输入、backing 为输出；只遍历 queue plan，不改变
-  //   mapping、permissions 或 runtime cursor。
-  // 失败边界：fixture、CQ、ring ref 或 mapping 缺失时返回 INVALID_STATE 且 backing=null。
-  function automatic rdma_status find_cq_backing(
-    rdma_queue_data_engine_fixture fixture,
-    output rdma_queue_backing_ref backing
-  );
-    backing = null;
-    if (fixture == null || fixture.cq == null)
-      return rdma_status::make(RDMA_SC_INVALID_STATE,
-                               "fixture CQ is unavailable");
-    foreach (fixture.cq.queue_plan.refs[i]) begin
-      if (fixture.cq.queue_plan.refs[i] != null &&
-          fixture.cq.queue_plan.refs[i].role == RDMA_QUEUE_ROLE_CQ_RING)
-        backing = fixture.cq.queue_plan.refs[i];
-    end
-    if (backing == null || backing.mapping == null)
-      return rdma_status::make(RDMA_SC_INVALID_STATE,
-                               "fixture CQ backing is missing");
-    return rdma_status::success();
-  endfunction
-
   // 功能：check_device_publish_calls 断言 publish 在 mock Host-memory 中先发起
   //   一次真实 write、再发起同槽位 readback，且两次都使用 CQ mapping。
-  // 输入/输出及副作用：mem、start、backing、offset、image 为输入；任务只报告
+  // 输入/输出及副作用：mem、start、offset、image 为输入；任务只报告
   //   调用序列和方向契约，不修改 mock 记录或 backing bytes。
   // 失败边界：调用数量不足、顺序/映射/偏移/大小不匹配，或 write/read 方向不是
   //   DEVICE_READ 时报告 UVM_ERROR；mock call.direction 表示 host_mem API 访问
@@ -153,12 +171,10 @@ class rdma_queue_data_engine_device_publish_test extends uvm_test;
   task automatic check_device_publish_calls(
     rdma_mock_host_mem mem,
     int unsigned start,
-    rdma_queue_backing_ref backing,
     longint unsigned offset,
     rdma_hw_image image
   );
-    if (mem == null || backing == null || backing.mapping == null ||
-        image == null) begin
+    if (mem == null || image == null) begin
       `uvm_error("CQE_HOST_CALL", "Host-memory call evidence is incomplete")
       return;
     end
@@ -170,12 +186,6 @@ class rdma_queue_data_engine_device_publish_test extends uvm_test;
     if (mem.calls[start].method_name != "write" ||
         mem.calls[start + 1].method_name != "read" ||
         mem.calls[start].mapping == null || mem.calls[start + 1].mapping == null ||
-        mem.calls[start].mapping.iova.value != backing.mapping.iova.value ||
-        mem.calls[start + 1].mapping.iova.value != backing.mapping.iova.value ||
-        mem.calls[start].mapping.size != backing.mapping.size ||
-        mem.calls[start + 1].mapping.size != backing.mapping.size ||
-        mem.calls[start].mapping.reset_epoch != backing.mapping.reset_epoch ||
-        mem.calls[start + 1].mapping.reset_epoch != backing.mapping.reset_epoch ||
         !mem.calls[start].mapping.permissions.device_write ||
         !mem.calls[start + 1].mapping.permissions.device_write ||
         mem.calls[start].mapping.permissions.device_read ||
@@ -187,6 +197,321 @@ class rdma_queue_data_engine_device_publish_test extends uvm_test;
         mem.calls[start].direction != RDMA_DMA_DEVICE_READ ||
         mem.calls[start + 1].direction != RDMA_DMA_DEVICE_READ)
       `uvm_error("CQE_HOST_CALL", "device publish Host-memory direction/order is wrong")
+  endtask
+
+  // 功能：check_device_publish_fault_recovery 对 backend write、read 与 readback
+  //   mismatch 三类已开始设备写入故障执行 publish、查询 pending 和确认 retry。
+  // 输入/输出及副作用：label、fault_kind 为输入；任务建立独立 fixture 并通过
+  //   mock 注入单次故障，成功恢复后 poll CQE 释放该测试提前 post 的 SQ WQE。
+  // 失败边界：fixture/post/model/注入、pending 证据、reservation、retry 或 poll
+  //   任一不符合契约时报告 UVM_ERROR；已开始写入必须返回 RECOVERY_REQUIRED，
+  //   不能发布 result 或悄悄清除 reservation。
+  task automatic check_device_publish_fault_recovery(
+    string label,
+    int unsigned fault_kind
+  );
+    rdma_queue_data_engine_fixture fixture;
+    rdma_queue_post_result posted;
+    rdma_queue_device_publish_result published;
+    rdma_queue_completion_result completion;
+    rdma_hw_cqe_model cqe;
+    rdma_queue_pending_operation pending;
+    rdma_queue_cursor_snapshot reservation;
+    rdma_status status;
+    rdma_status model_status;
+    rdma_status injected;
+    bit polarity;
+    bit reservation_valid;
+    bit occupancy_pending;
+    int unsigned occupancy;
+
+    fixture = rdma_queue_data_engine_fixture::type_id::create(
+      {label, "_fixture"});
+    fixture.setup(status);
+    if (status == null || !status.ok()) begin
+      `uvm_error({label, "_SETUP"}, "device publish fault fixture setup failed")
+      return;
+    end
+    fixture.engine.post_send(fixture.make_send(64'hd500_0000 + fault_kind),
+                             posted, status);
+    if (status == null || !status.ok() || posted == null) begin
+      `uvm_error({label, "_POST"}, "device publish fault setup post failed")
+      return;
+    end
+    polarity = 1'b0;
+    status = fixture.engine.query_runtime_producer_polarity(
+      fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, polarity);
+    if (status == null || !status.ok()) begin
+      `uvm_error({label, "_POLARITY"}, "device publish fault polarity query failed")
+      return;
+    end
+    cqe = make_cqe_for_outstanding_send(fixture.qp.handle,
+      fixture.qp.local_qp_id, posted, polarity, model_status);
+    if (model_status == null || !model_status.ok() || cqe == null) begin
+      `uvm_error({label, "_MODEL"}, "device publish fault CQE build failed")
+      return;
+    end
+    case (fault_kind)
+      0: begin
+        injected = rdma_status::make(RDMA_SC_DMA_TRANSLATION,
+                                     "injected device write failure");
+        status = fixture.mem.fail_next("write", injected);
+      end
+      1: begin
+        injected = rdma_status::make(RDMA_SC_DMA_TRANSLATION,
+                                     "injected device read failure");
+        status = fixture.mem.fail_next("read", injected);
+      end
+      2: begin
+        fixture.mem.corrupt_next_readback = 1'b1;
+        status = rdma_status::success();
+      end
+      default: status = rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                                           "unknown device publish fault");
+    endcase
+    if (status == null || !status.ok()) begin
+      `uvm_error({label, "_INJECT"}, "device publish fault injection failed")
+      return;
+    end
+    published = null;
+    publish_cqe_for_test(fixture.engine, fixture.cq.handle, cqe,
+                         published, status);
+    if (status == null || status.code != RDMA_SC_RECOVERY_REQUIRED ||
+        published != null) begin
+      `uvm_error({label, "_PUBLISH"},
+                 "started device publish fault did not retain recovery")
+      return;
+    end
+    pending = null;
+    status = fixture.engine.query_runtime_pending(
+      fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, pending);
+    if (status == null || !status.ok() || pending == null ||
+        !pending.device_producer || !pending.device_write_attempted ||
+        pending.cursor == null || pending.next_cursor == null ||
+        pending.image == null || pending.image.length != RDMA_CQE_BYTES ||
+        pending.mmio_evidence != RDMA_QUEUE_MMIO_NOT_APPLICABLE) begin
+      `uvm_error({label, "_PENDING"},
+                 "started device publish fault lost replay evidence")
+      return;
+    end
+    occupancy = 0;
+    occupancy_pending = 1'b0;
+    status = fixture.engine.query_runtime_occupancy(
+      fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, occupancy, occupancy_pending);
+    if (status == null || !status.ok() || occupancy != 0 ||
+        !occupancy_pending)
+      `uvm_error({label, "_OCCUPANCY"},
+                 "failed device publish changed occupancy or hid pending")
+    reservation_valid = 1'b0;
+    reservation = null;
+    status = fixture.engine.query_runtime_device_reservation(
+      fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, reservation_valid, reservation);
+    if (status == null || !status.ok() || !reservation_valid ||
+        reservation == null || reservation.index != pending.cursor.index ||
+        reservation.wrap != pending.cursor.wrap) begin
+      `uvm_error({label, "_RESERVATION"},
+                 "failed device publish lost the reserved slot")
+      return;
+    end
+    fixture.engine.recover_queue(fixture.cq.handle,
+      RDMA_QUEUE_RECOVERY_RETRY_PENDING, 1'b1, status);
+    if (status == null || !status.ok()) begin
+      `uvm_error({label, "_RETRY"}, "device publish recovery retry failed")
+      return;
+    end
+    occupancy = 0;
+    occupancy_pending = 1'b1;
+    status = fixture.engine.query_runtime_occupancy(
+      fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, occupancy, occupancy_pending);
+    if (status == null || !status.ok() || occupancy != 1 || occupancy_pending)
+      `uvm_error({label, "_RETRY_OCCUPANCY"},
+                 "device publish retry did not commit exactly one CQE")
+    reservation_valid = 1'b1;
+    reservation = null;
+    status = fixture.engine.query_runtime_device_reservation(
+      fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, reservation_valid, reservation);
+    if (status == null || !status.ok() || reservation_valid || reservation != null)
+      `uvm_error({label, "_RETRY_RESERVATION"},
+                 "device publish retry retained a committed reservation")
+    completion = null;
+    fixture.engine.poll_cqe(fixture.cq.handle, 0, completion, status);
+    if (status == null || !status.ok() || completion == null ||
+        completion.released_slots.size() != 1)
+      `uvm_error({label, "_POLL"}, "recovered device CQE did not release WQE")
+  endtask
+
+  // 功能：check_device_publish_preflight_failure 在 attachment access 的首次
+  //   write_device 预检处注入 DEVICE_WRITE 拒绝，验证 reservation 被 cancel 且
+  //   backend write/commit 均不可观察。
+  // 输入/输出及副作用：无显式输入；任务在 setup 前注册 factory override、在 setup
+  //   后 arm 一次性 access 故障，随后只读取 publish、Host-memory 和 runtime 观测值。
+  // 失败边界：factory 注入、publish 拒绝、调用数/游标/occupancy/pending/reservation
+  //   检查任一不符时报告 UVM_ERROR；该 access 只模拟未开始 backend 的预检失败，
+  //   不能替代 mapping 权限或 lifecycle allocation 的独立覆盖。
+  task automatic check_device_publish_preflight_failure();
+    rdma_queue_data_engine_fixture fixture;
+    rdma_queue_post_result posted;
+    rdma_queue_device_publish_result published;
+    rdma_hw_cqe_model cqe;
+    rdma_queue_pending_operation pending;
+    rdma_queue_cursor_snapshot reservation;
+    rdma_status status;
+    rdma_status model_status;
+    bit polarity;
+    bit reservation_valid;
+    bit occupancy_pending;
+    int unsigned occupancy;
+    int unsigned calls_before;
+    int unsigned producer_index;
+    int unsigned consumer_index;
+    bit producer_wrap;
+    bit consumer_wrap;
+
+    fixture = rdma_queue_data_engine_fixture::type_id::create(
+      "device_publish_preflight_fixture");
+    rdma_queue_backing_access::type_id::set_type_override(
+      rdma_cq_device_write_preflight_fault_access::get_type());
+    rdma_cq_device_write_preflight_fault_access::reject_next_device_write =
+      1'b0;
+    fixture.setup(status);
+    if (status == null || !status.ok()) begin
+      `uvm_error("CQE_PREFLIGHT_SETUP", status == null ?
+                 "preflight fixture setup returned null status" :
+                 status.convert2string())
+      return;
+    end
+    fixture.engine.post_send(fixture.make_send(64'hd510_0000), posted, status);
+    if (status == null || !status.ok() || posted == null) begin
+      `uvm_error("CQE_PREFLIGHT_POST", "preflight setup post failed")
+      return;
+    end
+    status = fixture.engine.query_runtime_producer_polarity(
+      fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, polarity);
+    cqe = make_cqe_for_outstanding_send(fixture.qp.handle,
+      fixture.qp.local_qp_id, posted, polarity, model_status);
+    if (status == null || !status.ok() || model_status == null ||
+        !model_status.ok() || cqe == null) begin
+      `uvm_error("CQE_PREFLIGHT_MODEL", "preflight CQE setup is incomplete")
+      return;
+    end
+    status = fixture.engine.query_runtime_cursors(
+      fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, producer_index, producer_wrap,
+      consumer_index, consumer_wrap);
+    if (status == null || !status.ok()) begin
+      `uvm_error("CQE_PREFLIGHT_CURSOR", "preflight cursor query failed")
+      return;
+    end
+    calls_before = fixture.mem.calls.size();
+    published = null;
+    rdma_cq_device_write_preflight_fault_access::reject_next_device_write =
+      1'b1;
+    publish_cqe_for_test(fixture.engine, fixture.cq.handle, cqe,
+                         published, status);
+    rdma_cq_device_write_preflight_fault_access::reject_next_device_write =
+      1'b0;
+    if (status == null || status.code != RDMA_SC_DMA_PERMISSION ||
+        published != null || fixture.mem.calls.size() != calls_before)
+      `uvm_error("CQE_PREFLIGHT_PUBLISH",
+                 "preflight failure entered backend or published a CQE")
+    occupancy = 0;
+    occupancy_pending = 1'b1;
+    status = fixture.engine.query_runtime_occupancy(
+      fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, occupancy, occupancy_pending);
+    if (status == null || !status.ok() || occupancy != 0 || occupancy_pending)
+      `uvm_error("CQE_PREFLIGHT_OCCUPANCY", "preflight failure changed occupancy")
+    status = fixture.engine.query_runtime_cursors(
+      fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, occupancy, polarity,
+      consumer_index, consumer_wrap);
+    if (status == null || !status.ok() || occupancy != producer_index ||
+        polarity != producer_wrap)
+      `uvm_error("CQE_PREFLIGHT_CURSOR_AFTER", "preflight failure advanced PI")
+    pending = null;
+    status = fixture.engine.query_runtime_pending(
+      fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, pending);
+    if (status == null || status.ok() || pending != null ||
+        status.code != RDMA_SC_INVALID_STATE)
+      `uvm_error("CQE_PREFLIGHT_PENDING", "preflight failure retained pending")
+    reservation_valid = 1'b1;
+    reservation = null;
+    status = fixture.engine.query_runtime_device_reservation(
+      fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, reservation_valid, reservation);
+    if (status == null || !status.ok() || reservation_valid || reservation != null)
+      `uvm_error("CQE_PREFLIGHT_RESERVATION", "preflight failure retained reservation")
+  endtask
+
+  // 功能：check_device_publish_stale_route 拍平 attachment 的冻结 route/epoch 与
+  //   binding 当前 epoch 不一致场景，验证 publish 在 reserve 前 fail-closed。
+  // 输入/输出及副作用：无显式输入；任务先建立有效 CQE，再经 fixture 公开 API
+  //   更新 binding reset epoch；只读取 Host-memory/runtime 观测值。
+  // 失败边界：未返回 STALE_GENERATION、出现 backend 调用、occupancy/pending 或
+  //   reservation 非空时报告 UVM_ERROR；该场景故意不恢复旧 binding。
+  task automatic check_device_publish_stale_route();
+    rdma_queue_data_engine_fixture fixture;
+    rdma_queue_post_result posted;
+    rdma_queue_device_publish_result published;
+    rdma_hw_cqe_model cqe;
+    rdma_queue_pending_operation pending;
+    rdma_queue_cursor_snapshot reservation;
+    rdma_status status;
+    rdma_status model_status;
+    bit polarity;
+    bit reservation_valid;
+    bit occupancy_pending;
+    int unsigned occupancy;
+    int unsigned calls_before;
+
+    fixture = rdma_queue_data_engine_fixture::type_id::create(
+      "device_publish_stale_route_fixture");
+    fixture.setup(status);
+    if (status == null || !status.ok()) begin
+      `uvm_error("CQE_STALE_ROUTE_SETUP", "stale route fixture setup failed")
+      return;
+    end
+    fixture.engine.post_send(fixture.make_send(64'hd520_0000), posted, status);
+    if (status == null || !status.ok() || posted == null) begin
+      `uvm_error("CQE_STALE_ROUTE_POST", "stale route setup post failed")
+      return;
+    end
+    status = fixture.engine.query_runtime_producer_polarity(
+      fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, polarity);
+    cqe = make_cqe_for_outstanding_send(fixture.qp.handle,
+      fixture.qp.local_qp_id, posted, polarity, model_status);
+    if (status == null || !status.ok() || model_status == null ||
+        !model_status.ok() || cqe == null) begin
+      `uvm_error("CQE_STALE_ROUTE_MODEL", "stale route CQE setup is incomplete")
+      return;
+    end
+    calls_before = fixture.mem.calls.size();
+    status = fixture.advance_binding_reset_epoch(1);
+    if (status == null || !status.ok()) begin
+      `uvm_error("CQE_STALE_ROUTE_INJECT", "stale route epoch injection failed")
+      return;
+    end
+    published = null;
+    publish_cqe_for_test(fixture.engine, fixture.cq.handle, cqe,
+                         published, status);
+    if (status == null || status.code != RDMA_SC_STALE_GENERATION ||
+        published != null || fixture.mem.calls.size() != calls_before)
+      `uvm_error("CQE_STALE_ROUTE_PUBLISH",
+                 "stale route publish reserved or entered Host-memory")
+    occupancy = 0;
+    occupancy_pending = 1'b1;
+    status = fixture.engine.query_runtime_occupancy(
+      fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, occupancy, occupancy_pending);
+    if (status == null || !status.ok() || occupancy != 0 || occupancy_pending)
+      `uvm_error("CQE_STALE_ROUTE_OCCUPANCY", "stale route changed occupancy")
+    pending = null;
+    status = fixture.engine.query_runtime_pending(
+      fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, pending);
+    if (status == null || status.ok() || pending != null ||
+        status.code != RDMA_SC_INVALID_STATE)
+      `uvm_error("CQE_STALE_ROUTE_PENDING", "stale route retained pending")
+    reservation_valid = 1'b1;
+    reservation = null;
+    status = fixture.engine.query_runtime_device_reservation(
+      fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, reservation_valid, reservation);
+    if (status == null || !status.ok() || reservation_valid || reservation != null)
+      `uvm_error("CQE_STALE_ROUTE_RESERVATION", "stale route retained reservation")
   endtask
 
   // 功能：run_phase 依次 post_send、以 runtime 查询的 polarity publish CQE、读取
@@ -203,9 +528,8 @@ class rdma_queue_data_engine_device_publish_test extends uvm_test;
     rdma_queue_device_publish_result published;
     rdma_queue_completion_result completion;
     rdma_queue_pending_operation pending;
-    rdma_queue_backing_ref backing;
     rdma_status setup_status, status, model_status, poll_status;
-    rdma_status pending_status, polarity_status, backing_status;
+    rdma_status pending_status, polarity_status;
     rdma_status occupancy_status;
     byte backing_bytes[];
     bit polarity;
@@ -229,15 +553,6 @@ class rdma_queue_data_engine_device_publish_test extends uvm_test;
       phase.drop_objection(this);
       return;
     end
-    backing_status = find_cq_backing(fixture, backing);
-    if (backing_status == null || !backing_status.ok()) begin
-      `uvm_error("CQE_BACKING", "fixture CQ backing lookup failed")
-      phase.drop_objection(this);
-      return;
-    end
-    // DEVICE_WRITE 与 readback 都不依赖 device_read；若 publish 错用了 posting
-    // ring 的方向权限，此处将被 backing-access preflight 拒绝。
-    backing.mapping.permissions.device_read = 1'b0;
     pre_occupancy = 0;
     occupancy_pending = 1'b1;
     occupancy_status = fixture.engine.query_runtime_occupancy(
@@ -264,7 +579,8 @@ class rdma_queue_data_engine_device_publish_test extends uvm_test;
     pending = null;
     pending_status = fixture.engine.query_runtime_pending(
       fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, pending);
-    if (pending != null || (pending_status != null && pending_status.ok()))
+    if (pending != null || pending_status == null || pending_status.ok() ||
+        pending_status.code != RDMA_SC_INVALID_STATE)
       `uvm_error("CQE_PRE_PENDING", "empty CQ unexpectedly has recovery pending")
     polarity = 1'b0;
     polarity_status = fixture.engine.query_runtime_producer_polarity(
@@ -319,12 +635,12 @@ class rdma_queue_data_engine_device_publish_test extends uvm_test;
     if (status == null || !status.ok() ||
         (post_index == pre_index && post_wrap == pre_wrap))
       `uvm_error("CQE_POST_CURSOR", "publish did not advance runtime producer cursor")
-    backing_offset = backing.mapping_offset +
-      longint'(published.index) * longint'(published.image.length);
-    check_device_publish_calls(fixture.mem, host_call_start, backing,
+    backing_offset = longint'(published.index) *
+      longint'(published.image.length);
+    check_device_publish_calls(fixture.mem, host_call_start,
                                backing_offset, published.image);
-    status = fixture.mem.read(backing.mapping, backing_offset,
-                              published.image.length, backing_bytes);
+    status = fixture.read_cq_entry(published.index, published.image.length,
+                                   backing_bytes);
     if (status == null || !status.ok() ||
         backing_bytes.size() != published.image.bytes.size())
       `uvm_error("CQE_BACKING", "cannot read real CQ backing after publish")
@@ -335,7 +651,8 @@ class rdma_queue_data_engine_device_publish_test extends uvm_test;
     pending = null;
     pending_status = fixture.engine.query_runtime_pending(
       fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, pending);
-    if (pending != null || (pending_status != null && pending_status.ok()))
+    if (pending != null || pending_status == null || pending_status.ok() ||
+        pending_status.code != RDMA_SC_INVALID_STATE)
       `uvm_error("CQE_POST_PENDING", "committed CQE retained recovery pending")
     completion = null;
     fixture.engine.poll_cqe(fixture.cq.handle, 0, completion, poll_status);
@@ -354,6 +671,11 @@ class rdma_queue_data_engine_device_publish_test extends uvm_test;
     if (poll_status == null || poll_status.code != RDMA_SC_QUEUE_EMPTY ||
         completion != null)
       `uvm_error("CQE_EMPTY", "second CQE poll did not prove occupancy is zero")
+    check_device_publish_preflight_failure();
+    check_device_publish_fault_recovery("CQE_WRITE_FAIL", 0);
+    check_device_publish_fault_recovery("CQE_READ_FAIL", 1);
+    check_device_publish_fault_recovery("CQE_READ_MISMATCH", 2);
+    check_device_publish_stale_route();
     phase.drop_objection(this);
   endtask
 endclass

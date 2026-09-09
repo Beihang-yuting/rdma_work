@@ -491,6 +491,60 @@ class rdma_queue_data_engine_fixture extends uvm_object;
     return mem.write(backing.mapping,
                      backing.mapping_offset + longint'(index) * 64, data);
   endfunction
+
+  // 功能：read_cq_entry 通过 fixture 管理的 CQ backing 读取指定已发布槽位，供
+  //   publish 测试核对真实 Host-memory bytes，而不向测试暴露可修改 mapping 引用。
+  // 输入/输出及副作用：index、size 为输入，data 为输出；函数只读取 fixture 所有的
+  //   CQ queue plan 与 mock Host-memory，不推进 runtime cursor 或修改 backing。
+  // 失败边界：CQ backing/mapping 缺失、size 为零或读越界时返回非成功 status，
+  //   data 保持由 host-memory API 定义的安全空值。
+  function rdma_status read_cq_entry(
+    int unsigned index,
+    int unsigned size,
+    output byte data[]
+  );
+    rdma_queue_backing_ref backing;
+
+    data = new[0];
+    backing = null;
+    if (size == 0)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "fixture CQ read size is zero");
+    foreach (cq.queue_plan.refs[i]) begin
+      if (cq.queue_plan.refs[i] != null &&
+          cq.queue_plan.refs[i].role == RDMA_QUEUE_ROLE_CQ_RING)
+        backing = cq.queue_plan.refs[i];
+    end
+    if (backing == null || backing.mapping == null)
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "fixture CQ backing is missing");
+    return mem.read(backing.mapping,
+                    backing.mapping_offset + longint'(index) * size,
+                    size, data);
+  endfunction
+
+  // 功能：advance_binding_reset_epoch 通过 binding 的公开 identity 配置接口发布
+  //   新 reset epoch，模拟 attachment 冻结 route 后外部 Function 已复位。
+  // 输入/输出及副作用：next_epoch 为输入；成功时替换 binding 内部 authority snapshot，
+  //   不修改已 attach runtime、queue handle、mapping 或 Host-memory 内容。
+  // 失败边界：binding/旧 identity 缺失、next_epoch 为零或 identity 配置失败时返回
+  //   非成功 status；调用方只能用它验证 stale route 拒绝，不能继续使用旧生命周期。
+  function rdma_status advance_binding_reset_epoch(rdma_reset_epoch_t next_epoch);
+    rdma_function_identity identity;
+
+    if (binding == null)
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "fixture binding is unavailable");
+    if (next_epoch == 0)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "fixture reset epoch is zero");
+    identity = binding.function_identity_snapshot();
+    if (identity == null)
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "fixture Function identity is unavailable");
+    identity.reset_epoch = next_epoch;
+    return binding.configure_identity(identity);
+  endfunction
 endclass
 
 class rdma_queue_data_engine_post_test extends uvm_test;

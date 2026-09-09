@@ -565,10 +565,12 @@ class rdma_queue_data_engine extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：在 rdma_queue_data_engine 中，lookup_attachment 按完整 key/handle 查找唯一权威记录并返回 detached 快照，避免把内部可变引用泄露给调用方。
-  // 输入/输出及副作用：handle（输入）、kind（输入）、attachment（输出）；输入 handle/key/cursor 用于选择读取范围；返回值或 output 为 detached
-  //   快照，读取不取得外部资源所有权。
-  // 失败/边界：lookup_attachment 在 key/handle 缺失、记录不唯一或 generation/reset epoch 过期时返回明确错误，不回退到默认 authority。
+  // 功能：lookup_attachment 按完整 handle/kind key 返回 engine 索引的借用
+  //   attachment，供同一 engine 内的 publish/poll/recovery 使用。
+  // 输入/输出及副作用：handle、kind 为输入，attachment 为输出；成功时输出仅是
+  //   非拥有引用，不复制 runtime/access，也不验证 route、reset epoch 或 backing。
+  // 失败边界：handle 校验、索引缺失、runtime/access 不完整时返回非成功 status；
+  //   调用方须在需要时另行执行冻结 route/epoch 与具体 backing authority 校验。
   protected function rdma_status lookup_attachment(
     rdma_handle handle, rdma_queue_runtime_kind_e kind,
     output rdma_queue_data_attachment attachment
@@ -584,6 +586,50 @@ class rdma_queue_data_engine extends uvm_object;
     attachment = attachments[attachment_key(handle, kind)];
     if (attachment.runtime == null || attachment.access == null)
       return bad("queue attachment is incomplete", RDMA_SC_INVALID_STATE);
+    return rdma_status::success();
+  endfunction
+
+  // 功能：validate_publish_route_epoch 对比 attachment runtime 冻结的 route/epoch
+  //   与当前 binding detached identity，阻止复位或换路后继续预留 device producer slot。
+  // 输入/输出及副作用：attachment 为输入；函数只读取 runtime 与 binding snapshot，
+  //   不预留 cursor、不访问 backing、不修改任何 ownership。
+  // 失败边界：attachment/binding/identity 缺失、query 返回 null、route/epoch 无效
+  //   或任一快照不相等时返回明确非成功 status，调用方必须在 reserve 前停止。
+  protected function rdma_status validate_publish_route_epoch(
+    rdma_queue_data_attachment attachment
+  );
+    rdma_function_identity identity;
+    rdma_route_key_t route;
+    rdma_reset_epoch_t epoch;
+    bit route_valid;
+    bit epoch_valid;
+    rdma_status status;
+
+    route = '0;
+    epoch = '0;
+    route_valid = 1'b0;
+    epoch_valid = 1'b0;
+    if (attachment == null || attachment.runtime == null || binding == null)
+      return bad("publish route authority is incomplete", RDMA_SC_INVALID_STATE);
+    identity = binding.function_identity_snapshot();
+    if (identity == null)
+      return bad("publish Function identity snapshot is unavailable",
+                 RDMA_SC_INVALID_STATE);
+    status = identity.validate();
+    if (status == null || !status.ok())
+      return status == null ?
+        bad("publish Function identity validation returned null status",
+            RDMA_SC_INVALID_STATE) : status;
+    status = attachment.runtime.query_route_epoch(route, route_valid, epoch,
+                                                  epoch_valid);
+    if (status == null || !status.ok())
+      return status == null ?
+        bad("publish runtime route query returned null status",
+            RDMA_SC_INVALID_STATE) : status;
+    if (!route_valid || !epoch_valid || route != identity.route_key() ||
+        epoch != identity.reset_epoch)
+      return bad("publish route or reset epoch is stale",
+                 RDMA_SC_STALE_GENERATION);
     return rdma_status::success();
   endfunction
 
@@ -763,6 +809,110 @@ class rdma_queue_data_engine extends uvm_object;
     candidate.field_summary.delete();
     foreach (source.field_summary[i])
       candidate.field_summary.push_back(source.field_summary[i]);
+    copy = candidate;
+    return rdma_status::success();
+  endfunction
+
+  // 功能：clone_unclaimed_device_pending 为 engine-owned 的 device recovery
+  //   evidence 创建完整 detached 查询快照，避免 query API 泄露可写内部对象。
+  // 输入/输出及副作用：source 为输入、copy 为输出；函数只分配和复制 handle、
+  //   cursor、image、status 与设备发布阶段字段，不修改 unclaimed 表或 runtime。
+  // 失败边界：source 不是完整 device pending、任一对象分配或复制失败时返回非空
+  //   status 且 copy=null；调用方必须保留原 evidence，不能因查询失败删除表项。
+  protected function rdma_status clone_unclaimed_device_pending(
+    rdma_queue_pending_operation source,
+    output rdma_queue_pending_operation copy
+  );
+    rdma_queue_pending_operation candidate;
+    rdma_status status;
+
+    copy = null;
+    if (source == null || !source.device_producer || source.producer ||
+        source.request_snapshot != null || source.queue_h == null ||
+        source.cursor == null || source.next_cursor == null ||
+        source.image == null || source.failure_status == null)
+      return bad("unclaimed device pending is incomplete", RDMA_SC_INVALID_STATE);
+    candidate = rdma_queue_pending_operation::type_id::create(
+      "unclaimed_device_pending_snapshot");
+    if (candidate == null)
+      return bad("unclaimed device pending allocation failed",
+                 RDMA_SC_RESOURCE_EXHAUSTED);
+    status = clone_publish_handle(source.queue_h, "unclaimed device queue",
+                                  candidate.queue_h);
+    if (status == null || !status.ok() || candidate.queue_h == null)
+      return status == null ?
+        bad("unclaimed device queue clone returned null status",
+            RDMA_SC_RESOURCE_EXHAUSTED) : status;
+    candidate.cursor = rdma_queue_cursor_snapshot::type_id::create(
+      "unclaimed_device_cursor_snapshot");
+    candidate.next_cursor = rdma_queue_cursor_snapshot::type_id::create(
+      "unclaimed_device_next_cursor_snapshot");
+    if (candidate.cursor == null || candidate.next_cursor == null)
+      return bad("unclaimed device cursor snapshot allocation failed",
+                 RDMA_SC_RESOURCE_EXHAUSTED);
+    candidate.cursor.index = source.cursor.index;
+    candidate.cursor.wrap = source.cursor.wrap;
+    candidate.next_cursor.index = source.next_cursor.index;
+    candidate.next_cursor.wrap = source.next_cursor.wrap;
+    if (source.committed_consumer_cursor != null) begin
+      candidate.committed_consumer_cursor =
+        rdma_queue_cursor_snapshot::type_id::create(
+          "unclaimed_device_committed_cursor_snapshot");
+      if (candidate.committed_consumer_cursor == null)
+        return bad("unclaimed device committed cursor allocation failed",
+                   RDMA_SC_RESOURCE_EXHAUSTED);
+      candidate.committed_consumer_cursor.index =
+        source.committed_consumer_cursor.index;
+      candidate.committed_consumer_cursor.wrap =
+        source.committed_consumer_cursor.wrap;
+    end
+    status = clone_publish_image(source.image, candidate.image);
+    if (status == null || !status.ok() || candidate.image == null)
+      return status == null ?
+        bad("unclaimed device image clone returned null status",
+            RDMA_SC_RESOURCE_EXHAUSTED) : status;
+    candidate.failure_status = rdma_status::type_id::create(
+      "unclaimed_device_failure_status_snapshot");
+    if (candidate.failure_status == null)
+      return bad("unclaimed device failure status allocation failed",
+                 RDMA_SC_RESOURCE_EXHAUSTED);
+    status = copy_publish_status_into(source.failure_status,
+                                      candidate.failure_status);
+    if (status == null || !status.ok())
+      return status == null ?
+        bad("unclaimed device failure status copy returned null status",
+            RDMA_SC_RESOURCE_EXHAUSTED) : status;
+    if (source.routed_qp_h != null) begin
+      status = clone_publish_handle(source.routed_qp_h,
+                                    "unclaimed device routed QP",
+                                    candidate.routed_qp_h);
+      if (status == null || !status.ok() || candidate.routed_qp_h == null)
+        return status == null ?
+          bad("unclaimed device routed QP clone returned null status",
+              RDMA_SC_RESOURCE_EXHAUSTED) : status;
+    end
+    candidate.kind = source.kind;
+    candidate.producer = source.producer;
+    candidate.device_producer = source.device_producer;
+    candidate.device_write_attempted = source.device_write_attempted;
+    candidate.consumer_committed = source.consumer_committed;
+    candidate.cq_consumer_committed = source.cq_consumer_committed;
+    candidate.completion_released = source.completion_released;
+    candidate.consumer_doorbell_succeeded = source.consumer_doorbell_succeeded;
+    candidate.entry_offset = source.entry_offset;
+    candidate.wr_id = source.wr_id;
+    candidate.signaled = source.signaled;
+    candidate.completion_index = source.completion_index;
+    candidate.completion_wrap = source.completion_wrap;
+    candidate.completion_target_valid = source.completion_target_valid;
+    candidate.mmio_maybe_submitted = source.mmio_maybe_submitted;
+    candidate.known_no_mmio = source.known_no_mmio;
+    candidate.mmio_evidence = source.mmio_evidence;
+    candidate.entry_size = source.entry_size;
+    candidate.route = source.route;
+    candidate.route_valid = source.route_valid;
+    candidate.reset_epoch = source.reset_epoch;
+    candidate.epoch_valid = source.epoch_valid;
     copy = candidate;
     return rdma_status::success();
   endfunction
@@ -1357,19 +1507,43 @@ class rdma_queue_data_engine extends uvm_object;
           RDMA_SC_INVALID_STATE) : status;
   endfunction
 
-  // 功能：query_runtime_pending 返回指定 runtime 的 detached recovery evidence。
-  // 输入/输出及副作用：queue_h、kind 为输入，pending 为输出；不修改 runtime 或其 pending 所有权。
-  // 失败边界：句柄无效、runtime 不存在或无 pending 时返回错误且 pending 保持 null。
+  // 功能：query_runtime_pending 返回 runtime 或 engine-owned unclaimed 表中的
+  //   detached recovery evidence，使调用方可审计而不能改写内部恢复对象。
+  // 输入/输出及副作用：queue_h、kind 为输入，pending 为输出；函数只复制 evidence，
+  //   不改变 runtime、unclaimed 表、reservation 或任何 backing ownership。
+  // 失败边界：句柄无效、unclaimed 配对不完整、快照复制失败、runtime 不存在或无
+  //   pending 时返回非成功 status 且 pending 保持 null，原 evidence 不会被删除。
   function rdma_status query_runtime_pending(
     rdma_handle queue_h, rdma_queue_runtime_kind_e kind,
     output rdma_queue_pending_operation pending
   );
     rdma_queue_data_attachment attachment;
     rdma_status status;
+    string key;
 
     pending = null;
+    if (queue_h == null)
+      return bad("pending query queue handle is null", RDMA_SC_INVALID_ARGUMENT);
+    key = identity_key(queue_h);
+    if (key != "" && (unclaimed_device_recoveries.exists(key) ||
+                       unclaimed_recovery_attachments.exists(key))) begin
+      if (!unclaimed_device_recoveries.exists(key) ||
+          unclaimed_device_recoveries[key] == null ||
+          !unclaimed_recovery_attachments.exists(key) ||
+          unclaimed_recovery_attachments[key] == null)
+        return bad("unclaimed pending evidence pair is incomplete",
+                   RDMA_SC_RECOVERY_REQUIRED);
+      status = clone_unclaimed_device_pending(unclaimed_device_recoveries[key],
+                                              pending);
+      return status == null ?
+        bad("unclaimed pending snapshot returned null status",
+            RDMA_SC_RESOURCE_EXHAUSTED) : status;
+    end
     status = lookup_attachment(queue_h, kind, attachment);
-    if (status == null || !status.ok()) return status;
+    if (status == null || !status.ok())
+      return status == null ?
+        bad("pending attachment lookup returned null status",
+            RDMA_SC_INVALID_STATE) : status;
     if (attachment == null || attachment.runtime == null)
       return bad("pending attachment is incomplete", RDMA_SC_INVALID_STATE);
     status = attachment.runtime.query_pending(pending);
@@ -1414,10 +1588,22 @@ class rdma_queue_data_engine extends uvm_object;
       return;
     end
     status = lookup_attachment(cq_h, RDMA_QUEUE_RUNTIME_CQ, attachment);
-    if (status == null || !status.ok()) return;
+    if (status == null || !status.ok()) begin
+      status = status == null ?
+        bad("CQ publish attachment lookup returned null status",
+            RDMA_SC_INVALID_STATE) : status;
+      return;
+    end
     if (attachment == null || attachment.runtime == null ||
         attachment.access == null || attachment.entry_size == 0) begin
       status = bad("CQ publish attachment is incomplete", RDMA_SC_INVALID_STATE);
+      return;
+    end
+    status = validate_publish_route_epoch(attachment);
+    if (status == null || !status.ok()) begin
+      status = status == null ?
+        bad("CQ publish route validation returned null status",
+            RDMA_SC_INVALID_STATE) : status;
       return;
     end
     if (model == null || model.qp_h == null || model.status == null) begin
@@ -1441,7 +1627,11 @@ class rdma_queue_data_engine extends uvm_object;
       return;
     end
     status = find_qp_link_for_cq(cq_h, model.qpn, model.rq_cqe, link);
-    if (status == null || !status.ok()) return;
+    if (status == null || !status.ok()) begin
+      status = status == null ?
+        bad("CQE QP route lookup returned null status", RDMA_SC_INVALID_STATE) : status;
+      return;
+    end
     if (link == null || link.qp_h == null ||
         !link.qp_h.same_instance(model.qp_h)) begin
       status = bad("CQE QP authority does not match CQ route",
@@ -1464,14 +1654,24 @@ class rdma_queue_data_engine extends uvm_object;
       status = lookup_attachment(link.qp_h, RDMA_QUEUE_RUNTIME_SQ,
                                   wqe_attachment);
     end
-    if (status == null || !status.ok()) return;
+    if (status == null || !status.ok()) begin
+      status = status == null ?
+        bad("CQE WQE attachment lookup returned null status",
+            RDMA_SC_INVALID_STATE) : status;
+      return;
+    end
     if (wqe_attachment == null || wqe_attachment.runtime == null) begin
       status = bad("CQE WQE attachment is incomplete", RDMA_SC_INVALID_STATE);
       return;
     end
     status = wqe_attachment.runtime.validate_release_range(
       model.wqe_index, model.wqe_wrap);
-    if (status == null || !status.ok()) return;
+    if (status == null || !status.ok()) begin
+      status = status == null ?
+        bad("CQE WQE release validation returned null status",
+            RDMA_SC_INVALID_STATE) : status;
+      return;
+    end
 
     status = attachment.runtime.reserve_device_producer(reservation);
     if (status == null || !status.ok()) begin
@@ -4429,16 +4629,22 @@ class rdma_queue_data_engine extends uvm_object;
         else if (status.ok())
           status = bad("device recovery readback length differs",
                        RDMA_SC_RECOVERY_REQUIRED);
-        void'(attachment.runtime.record_recovery_failure(
-          RDMA_QUEUE_MMIO_NOT_APPLICABLE));
+        local_status = attachment.runtime.record_recovery_failure(
+          RDMA_QUEUE_MMIO_NOT_APPLICABLE);
+        if (local_status == null || !local_status.ok())
+          status = bad("device recovery read failure evidence could not be retained",
+                       RDMA_SC_RECOVERY_REQUIRED);
         return;
       end
       foreach (data[i]) begin
         if (readback[i] !== data[i]) begin
           status = bad("device recovery readback mismatch",
                        RDMA_SC_RECOVERY_REQUIRED);
-          void'(attachment.runtime.record_recovery_failure(
-            RDMA_QUEUE_MMIO_NOT_APPLICABLE));
+          local_status = attachment.runtime.record_recovery_failure(
+            RDMA_QUEUE_MMIO_NOT_APPLICABLE);
+          if (local_status == null || !local_status.ok())
+            status = bad("device recovery mismatch evidence could not be retained",
+                         RDMA_SC_RECOVERY_REQUIRED);
           return;
         end
       end
@@ -4455,8 +4661,11 @@ class rdma_queue_data_engine extends uvm_object;
         if (status == null)
           status = bad("device recovery producer commit returned null status",
                        RDMA_SC_RECOVERY_REQUIRED);
-        void'(attachment.runtime.record_recovery_failure(
-          RDMA_QUEUE_MMIO_NOT_APPLICABLE));
+        local_status = attachment.runtime.record_recovery_failure(
+          RDMA_QUEUE_MMIO_NOT_APPLICABLE);
+        if (local_status == null || !local_status.ok())
+          status = bad("device recovery commit evidence could not be retained",
+                       RDMA_SC_RECOVERY_REQUIRED);
         return;
       end
       status = attachment.runtime.complete_recovery_retry();
@@ -4635,24 +4844,139 @@ class rdma_queue_data_engine extends uvm_object;
   );
     rdma_queue_data_attachment candidate;
     rdma_queue_data_attachment found;
+    rdma_queue_pending_operation unclaimed_pending;
+    rdma_queue_cursor_snapshot reservation;
+    rdma_queue_runtime_state_e runtime_state;
+    bit reservation_valid;
     string key;
     status = ensure_handle(queue_h, queue_h == null ? RDMA_RESOURCE_QP :
                            queue_h.kind);
-    if (!status.ok()) return;
+    if (status == null || !status.ok()) begin
+      status = status == null ?
+        bad("recovery queue handle validation returned null status",
+            RDMA_SC_INVALID_STATE) : status;
+      return;
+    end
     found = null;
+    unclaimed_pending = null;
+    reservation = null;
+    reservation_valid = 1'b0;
+    runtime_state = RDMA_QUEUE_RUNTIME_DETACHED;
+    key = identity_key(queue_h);
+    // 设计说明：runtime admission 失败时 evidence 由 engine 的 unclaimed 表保留。
+    // retry/abort 必须先尝试把同一 detached pending 安装回原 attachment runtime；
+    // 安装成功后 runtime 接管生命周期，表项才可成对删除，安装失败则保持证据不丢失。
+    if (key != "" && (unclaimed_device_recoveries.exists(key) ||
+                       unclaimed_recovery_attachments.exists(key))) begin
+      if (!unclaimed_device_recoveries.exists(key) ||
+          unclaimed_device_recoveries[key] == null ||
+          !unclaimed_recovery_attachments.exists(key) ||
+          unclaimed_recovery_attachments[key] == null) begin
+        status = bad("unclaimed recovery evidence pair is incomplete",
+                     RDMA_SC_RECOVERY_REQUIRED);
+        return;
+      end
+      found = unclaimed_recovery_attachments[key];
+      unclaimed_pending = unclaimed_device_recoveries[key];
+      if (found.runtime == null || found.queue_h == null ||
+          !found.queue_h.same_instance(queue_h)) begin
+        status = bad("unclaimed recovery attachment is stale",
+                     RDMA_SC_RECOVERY_REQUIRED);
+        return;
+      end
+      status = found.runtime.enter_recovery_prepared(unclaimed_pending);
+      if (status == null || !status.ok()) begin
+        // admission 仍失败时，retry 必须保留 engine-owned evidence。abort 可以
+        // 仅在 runtime 仍 ACTIVE 且 reservation 与该 evidence 完全匹配时取消
+        // reservation，然后 detach；这样不会遗留一个不可见的活动 attachment。
+        if (action == RDMA_QUEUE_RECOVERY_ABORT_AND_DETACH) begin
+          status = found.runtime.query_device_reservation(reservation_valid,
+                                                           reservation);
+          if (status == null || !status.ok()) begin
+            status = status == null ?
+              bad("unclaimed recovery reservation query returned null status",
+                  RDMA_SC_RECOVERY_REQUIRED) : status;
+            return;
+          end
+          status = found.runtime.query_state(runtime_state);
+          if (status == null || !status.ok()) begin
+            status = status == null ?
+              bad("unclaimed recovery state query returned null status",
+                  RDMA_SC_RECOVERY_REQUIRED) : status;
+            return;
+          end
+          if (reservation_valid && reservation != null &&
+              runtime_state == RDMA_QUEUE_RUNTIME_ACTIVE &&
+              unclaimed_pending.cursor != null &&
+              reservation.index == unclaimed_pending.cursor.index &&
+              reservation.wrap == unclaimed_pending.cursor.wrap) begin
+            status = found.runtime.cancel_device_producer(reservation);
+            if (status != null && status.ok()) begin
+              status = detach(queue_h);
+              if (status != null && status.ok()) begin
+                unclaimed_device_recoveries.delete(key);
+                unclaimed_recovery_attachments.delete(key);
+              end
+              return;
+            end
+          end
+        end
+        status = bad("unclaimed recovery admission is still unavailable",
+                     RDMA_SC_RECOVERY_REQUIRED);
+        return;
+      end
+      unclaimed_device_recoveries.delete(key);
+      unclaimed_recovery_attachments.delete(key);
+    end
     foreach (attachments[key]) begin
       candidate = attachments[key];
       if (candidate != null && candidate.queue_h != null &&
           candidate.queue_h.same_instance(queue_h) && candidate.runtime != null &&
           candidate.runtime.state == RDMA_QUEUE_RUNTIME_RECOVERY_REQUIRED) begin
-        if (found != null)
+        // unclaimed handoff already selected this same attachment.  It must
+        // be accepted once, rather than being mistaken for a second runtime.
+        if (found != null && found != candidate)
           begin status = bad("queue has multiple pending recovery runtimes",
                              RDMA_SC_INVALID_STATE); return; end
         found = candidate;
       end
     end
-    if (found == null)
-      begin status = bad("queue has no pending recovery", RDMA_SC_INVALID_STATE); return; end
+    if (found == null) begin
+      // cancel 前置路径在还没有完整 pending 时也可能返回 RECOVERY_REQUIRED。
+      // 它只能显式 abort：再次 cancel 成功后 detach；retry 没有可重放 image，
+      // 必须保持 fail-closed，而不是伪造一笔 publish。
+      foreach (attachments[key]) begin
+        candidate = attachments[key];
+        if (candidate != null && candidate.queue_h != null &&
+            candidate.queue_h.same_instance(queue_h) && candidate.runtime != null) begin
+          status = candidate.runtime.query_device_reservation(reservation_valid,
+                                                               reservation);
+          if (status == null || !status.ok()) begin
+            status = status == null ?
+              bad("reservation-only recovery query returned null status",
+                  RDMA_SC_RECOVERY_REQUIRED) : status;
+            return;
+          end
+          if (reservation_valid && reservation != null) begin
+            if (action != RDMA_QUEUE_RECOVERY_ABORT_AND_DETACH) begin
+              status = bad("reservation-only recovery cannot retry without image",
+                           RDMA_SC_RECOVERY_REQUIRED);
+              return;
+            end
+            status = candidate.runtime.cancel_device_producer(reservation);
+            if (status == null || !status.ok()) begin
+              status = bad("reservation-only recovery abort could not cancel",
+                           RDMA_SC_RECOVERY_REQUIRED);
+              return;
+            end
+            status = detach(queue_h);
+            return;
+          end
+        end
+      end
+      status = bad("queue has no pending recovery", RDMA_SC_INVALID_STATE);
+      return;
+    end
     if (action == RDMA_QUEUE_RECOVERY_ABORT_AND_DETACH) begin
       status = found.runtime.abort_recovery();
       if (!status.ok()) return;

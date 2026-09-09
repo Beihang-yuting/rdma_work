@@ -402,10 +402,12 @@ class rdma_queue_backing_access extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 设计说明：access 实例由 UVM factory 创建；保留 virtual 分派可让隔离测试替换
+  //   未开始 backend 的预检结果，而生产实现仍在本函数集中执行完整 span 校验。
   // 功能：write_device 按 RDMA_DMA_DEVICE_WRITE 方向预检并将调用方 payload 依次写入所有 backing span，供 Host-memory device producer 发布使用。
   // 输入/输出及副作用：offset、data 为输入，backend_write_started 为输出；函数先解析并完整预检 spans，再按逻辑顺序调用 host_mem.write()，首次进入 backend 前将 backend_write_started 置 1；不更新 runtime、mapping ownership 或 cursor。
   // 失败/边界：resolve/preflight 或任一 backend write 返回 null status 时统一为 RDMA_SC_INVALID_STATE；预检失败时 backend_write_started 保持 0 且不发起任何写调用，backend 非成功状态原样传播且后续 span 不再写入。
-  function rdma_status write_device(
+  virtual function rdma_status write_device(
       longint unsigned offset,
       byte data[],
       output bit backend_write_started
