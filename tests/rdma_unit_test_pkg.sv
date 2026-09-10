@@ -90,6 +90,7 @@ package rdma_unit_test_pkg;
   `include "unit/rdma_queue_backing_access_test.sv"
   `include "unit/rdma_queue_data_engine_post_test.sv"
   `include "unit/rdma_queue_data_engine_device_publish_test.sv"
+  `include "unit/rdma_queue_data_engine_final_fix_test.sv"
   `include "unit/rdma_cq_engine_resize_test.sv"
   `include "unit/rdma_queue_data_engine_poll_test.sv"
   `include "unit/rdma_queue_data_engine_recovery_test.sv"

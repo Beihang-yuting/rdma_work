@@ -68,12 +68,10 @@ virtual class rdma_queue_lifecycle_policy extends uvm_object;
   pure virtual function rdma_status build_flush_command(
     rdma_function_handle owner, rdma_queue_flush_target target,
     time timeout, output rdma_cmq_command_desc command);
-  // Classify a terminal QUERY completion as trustworthy hardware-presence
-  // evidence.  A successful status alone is deliberately insufficient: the
-  // response payload must authenticate to the profile's typed context codec
-  // and identify this queue's local object ID.  Inconclusive responses leave
-  // the outputs at UNKNOWN/0 and return a status suitable for continued
-  // recovery.
+  // 中文设计：terminal QUERY completion 只有在 payload 通过 profile typed
+  // context codec 鉴权且明确指向本 queue local object ID 时，才是可信的 hardware
+  // presence evidence；单独的成功 status 不足以定论。无法定论的响应保持输出为
+  // UNKNOWN/0，并返回允许 recovery 继续推进的 status。
   // 功能：classify_query_completion 验证 QUERY completion 的 opcode、owner 和 payload，将硬件存在性写入 presence，并把证据是否充分写入 conclusive。
   // 输入/输出及副作用：resource（输入）、completion（输入）、presence（输出）、conclusive（输出）；函数读取 resource.handle、completion.status 和 completion.image，并写入 presence、conclusive；函数返回 rdma_status，不取得调用方资源所有权。
 
@@ -741,13 +739,11 @@ virtual class rdma_queue_lifecycle_policy extends uvm_object;
                               body, timeout, command);
   endfunction
 
-  // Build a context image suitable for QUERY decoding.  The returned query
-  // slices contain all object-identifying fields, while a few create-context
-  // builders require dependency handles that are not part of the queue's
-  // authoritative local-ID projection (for example a CQ's CEQ handle or an
-  // SRQ's PD handle).  Use harmless in-range placeholders for those fields;
-  // the query payload is overlaid below before decoding, so no placeholder
-  // can become presence evidence.
+  // 中文设计：QUERY 解码所需的 context image 包含全部对象身份字段，但少数
+  // create-context builder 还要求不属于 queue authoritative local-ID 投影的依赖
+  // handle，例如 CQ 的 CEQ 或 SRQ 的 PD。这里为这些字段提供无害且范围合法的
+  // placeholder；下方会先覆盖真实 query payload 再解码，placeholder 不可能成为
+  // presence evidence。
   // 功能：在 rdma_queue_lifecycle_policy 中，query_builder_view 按完整 key/handle 查找唯一权威记录并返回 detached 快照，避免把内部可变引用泄露给调用方。
   // 输入/输出及副作用：resource（输入）、builder_resource（输出）；query_builder_view 读取 resource、builder_resource 并使用字段 builder_resource、cloned_object、cq.ceq_h、placeholder、placeholder.kind、placeholder.function_uid、placeholder.generation、placeholder.object_id，并写入 builder_resource；函数返回 rdma_status，不取得调用方资源所有权。
   // 失败/边界：query_builder_view 在 key/handle 缺失、记录不唯一或 generation/reset epoch 过期时返回明确错误，不回退到默认 authority。
@@ -771,9 +767,9 @@ virtual class rdma_queue_lifecycle_policy extends uvm_object;
       RDMA_RESOURCE_CQ: begin
         if (!$cast(cq, builder_resource))
           return invalid_state("query CQ builder projection failed");
-        // CQC's CEQN is in the returned payload.  A null dependency is
-        // explicitly supported by the CQC builder and avoids confusing the
-        // opaque registry incarnation ID with the 12-bit local CEQ ID.
+        // 中文设计：CQC 的 CEQN 来自返回 payload；CQC builder 明确支持 null
+        // dependency，这可避免把 opaque registry incarnation ID 误当成 12-bit
+        // local CEQ ID。
         cq.ceq_h = null;
       end
       RDMA_RESOURCE_SRQ: begin
@@ -792,12 +788,10 @@ virtual class rdma_queue_lifecycle_policy extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // The CMQ engine authenticates the CQ owner/slot while polling the raw CQE
-  // and then snapshots the decoded payload.  Recovery may receive a scripted
-  // or delayed completion instead of the original poll path, so repeat the
-  // immutable identity checks at this boundary.  In particular, SQ wrap is
-  // ticket identity; CQ owner is the phase bit carried by the raw CQE and is
-  // intentionally not inferred from SQ wrap.
+  // 中文设计：CMQ engine 在轮询 raw CQE 时会鉴权 CQ owner/slot，再保存 decoded
+  // payload 快照；recovery 可能收到 scripted 或 delayed completion 而非原 poll
+  // 路径结果，因此本边界必须重复 immutable identity 检查。SQ wrap 属于 ticket
+  // identity，CQ owner 则是 raw CQE 携带的 phase bit，不能从 SQ wrap 反推。
   // 功能：在 rdma_queue_lifecycle_policy 中，query_completion_identity_matches 按完整 key/handle 查找唯一权威记录并返回 detached 快照，避免把内部可变引用泄露给调用方。
   // 输入/输出及副作用：completion（输入）、payload（输入）；query_completion_identity_matches 读取 completion、payload 并使用字段 qword0、raw_owner、raw_wrap、raw_wqe_index、raw_opcode、raw_ecode；函数返回 bit，不取得调用方资源所有权。
   // 失败/边界：query_completion_identity_matches 在 key/handle 缺失、记录不唯一或 generation/reset epoch 过期时返回明确错误，不回退到默认 authority。
@@ -927,12 +921,10 @@ virtual class rdma_queue_lifecycle_policy extends uvm_object;
         payload.opcode != completion.ticket.opcode_key.opcode)
       return rdma_status::success();
 
-    // Error ecodes are meaningful only when authenticated to this exact
-    // query opcode.  Profiles with an absence whitelist commonly carry no
-    // object bytes, so apply that whitelist before the success-payload length
-    // check.  A whitelist value paired with an OK status is malformed, and
-    // all other nonzero ecodes remain inconclusive even if their bytes happen
-    // to decode as a valid context.
+    // 中文设计：error ecode 只有在精确鉴权到本 query opcode 后才有意义。带
+    // absence whitelist 的 profile 通常不返回 object bytes，因此须在成功 payload
+    // 长度检查前先应用 whitelist；whitelist 值与 OK status 配对属于畸形响应，
+    // 其余非零 ecode 即使 bytes 恰好可解成合法 context 也仍然无法定论。
     if (absent_ecode_valid && payload.command_ecode == absent_ecode) begin
       if (!completion.status.ok() &&
           (!completion.status.hardware_code_valid ||

@@ -1614,8 +1614,9 @@ class rdma_queue_runtime extends uvm_object;
   //   source authority 与 cursor，host ring 接管 staging 出的 detached ledger，
   //   device ring 保持零长度 ledger。
   // 失败/边界：source 未冻结/authority 非成对有效、target 不空/半有效/identity
-  //   不同、目标深度容不下 PI/CI、缩容丢弃未消费 slot 或任一 staging 分配失败时
-  //   返回错误；所有 target 字段在完整校验和分配成功前保持不变。
+  //   不同、任一侧仍持有 recovery retry confirmation、目标深度容不下 PI/CI、
+  //   缩容丢弃未消费 slot 或任一 staging 分配失败时返回错误；所有 target 字段
+  //   在完整校验和分配成功前保持不变。
   function rdma_status copy_ring_state(rdma_queue_runtime source);
     int unsigned i, limit;
     rdma_queue_slot_ledger_entry staged_slots[];
@@ -1648,7 +1649,8 @@ class rdma_queue_runtime extends uvm_object;
                             "source runtime lock status is unavailable");
     if (source.state != RDMA_QUEUE_RUNTIME_QUIESCING ||
         source.pending_operation_state != null || source.device_reservation_valid ||
-        source.used != 0 || source.recovery_commit_allowed) begin
+        source.used != 0 || source.recovery_commit_allowed ||
+        source.recovery_retry_confirmed) begin
       source.lock.put(1);
       return make_runtime_status(RDMA_SC_RESOURCE_BUSY,
                                  "source runtime has mutable evidence");
@@ -1766,6 +1768,7 @@ class rdma_queue_runtime extends uvm_object;
                             "target runtime lock status is unavailable");
     if (state != RDMA_QUEUE_RUNTIME_ATTACHED || pending_operation_state != null ||
         device_reservation_valid || used != 0 || recovery_commit_allowed ||
+        recovery_retry_confirmed ||
         kind != source_kind ||
         host_produced != source_host_produced || depth == 0 ||
         queue_h == null || queue_h.kind != source_queue_kind ||

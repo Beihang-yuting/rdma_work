@@ -6,8 +6,8 @@
 // 中文说明：rdma_queue_backing_access.sv 属于核心执行层，负责队列、控制面、资源和恢复流程。
 // 阅读提示：先看公开类型和接口，再看实现细节；失败路径应保持状态与资源所有权可追踪。
 
-// Normalize queue/QP backing references into mapping-relative DMA spans.
-// The access object borrows lifecycle-owned mappings and never releases them.
+// 中文设计：本层把 queue/QP backing reference 归一化为 mapping-relative DMA
+// span；access 对象只借用 lifecycle-owned mapping，绝不取得或执行释放权。
 
 class rdma_queue_backing_span extends uvm_object;
   `uvm_object_utils(rdma_queue_backing_span)
@@ -94,9 +94,8 @@ class rdma_queue_backing_access extends uvm_object;
       return invalid("logical backing access length is zero");
     if (!add_ok(offset, length))
       return dma_error("logical backing access range overflows");
-    // Queue entries are at least qwords and all supported fixed images are
-    // qword aligned. This also prevents a caller from splitting a span at an
-    // arbitrary byte while retaining deterministic DMA transactions.
+    // 中文设计：所有受支持的固定 queue image 至少为一个 qword 且按 qword 对齐；
+    // 同时拒绝调用方在任意 byte 位置切分 span，保证 DMA transaction 边界确定。
     if ((offset & 64'h7) != 0 || (length & 64'h7) != 0)
       return invalid("logical backing access range is unaligned");
     return rdma_status::success();
@@ -280,8 +279,8 @@ class rdma_queue_backing_access extends uvm_object;
       return dma_error("logical backing access is outside backing coverage");
     request_end = offset + length;
 
-    // Walk the canonical primary + additional segment order. Since
-    // reference_total proved contiguous coverage, spans cannot contain holes.
+    // 中文设计：严格按 primary 后接 additional segment 的规范顺序遍历；
+    // reference_total 已证明逻辑覆盖连续，因此生成的 span 不允许出现空洞。
     segment_start = 0;
     mapping = backing_ref.mapping;
     mapping_offset = backing_ref.mapping_offset;
@@ -518,12 +517,10 @@ class rdma_queue_backing_access extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // Host-side verification read for a just-published queue entry.  This is
-  // deliberately distinct from read(): read() models a device-write DMA
-  // transaction and therefore requires DEVICE_WRITE permission (as used for
-  // CQ/CEQ/AEQ consumption).  Posting rings are DEVICE_READ-only mappings,
-  // but the host still needs to verify that its own write reached backing
-  // memory before ringing the producer doorbell.
+  // 中文设计：readback 专用于 host 刚发布 queue entry 后的回读确认，刻意与
+  // read() 隔离。read() 模拟 CQ/CEQ/AEQ consumer 的 device-write DMA，要求
+  // DEVICE_WRITE；posting ring mapping 仅授予 DEVICE_READ，但 host 仍须在敲
+  // producer doorbell 前确认自己的写入已到达 backing memory。
   // 功能：在 rdma_queue_backing_access 中，readback 按完整 key/handle 查找唯一权威记录并返回 detached 快照，避免把内部可变引用泄露给调用方。
   // 输入/输出及副作用：offset（输入）、length（输入）、data（输出）；readback 读取 offset、length、data 并使用字段 data、status、position、chunk，并写入 data；函数返回 rdma_status，不取得调用方资源所有权。
   // 失败/边界：readback 在 key/handle 缺失、记录不唯一或 generation/reset epoch 过期时返回明确错误，不回退到默认 authority。
@@ -539,9 +536,8 @@ class rdma_queue_backing_access extends uvm_object;
     data = new[0];
     status = resolve(offset, length, spans);
     if (!status.ok()) return status;
-    // Validate that the mapping authorizes the device-read direction used by
-    // the posting ring, while intentionally not requiring reverse DMA write
-    // permission merely to inspect host memory.
+    // 中文设计：这里只验证 posting ring 使用的 device-read 权限；单纯检查 host
+    // memory 不应额外要求反向 DMA write 权限，否则会错误拒绝只读 posting mapping。
     status = preflight_spans(spans, RDMA_DMA_DEVICE_READ);
     if (!status.ok()) return status;
     data = new[length];

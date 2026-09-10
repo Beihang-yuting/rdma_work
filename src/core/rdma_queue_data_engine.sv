@@ -319,6 +319,34 @@ class rdma_queue_data_engine extends uvm_object;
     return factory.create_object_by_type(requested_type, "", name);
   endfunction
 
+  // 功能：lookup_codec_checked 在统一 registry 边界查找完整 codec key，并保证
+  //   成功返回时 status 与 codec 都非空，供 host producer 与三类 consumer 共用。
+  // 输入/输出及副作用：key/operation_context 为输入，codec 输出先置 null；只读取 registry，
+  //   不修改 codec 注册、runtime、backing、cursor 或 recovery evidence。
+  // 失败/边界：registry 缺失、lookup 返回 null status，或成功但 codec=null 时
+  //   均返回确定性的 CODEC_ERROR；registry 的非成功非空 status 原样传播。
+  protected function rdma_status lookup_codec_checked(
+    rdma_codec_key key,
+    string operation_context,
+    output rdma_codec_base codec
+  );
+    rdma_status status;
+
+    codec = null;
+    if (registry == null)
+      return bad({operation_context, " codec registry is unavailable"},
+                 RDMA_SC_CODEC_ERROR);
+    status = registry.lookup(key, codec);
+    if (status == null)
+      return bad({operation_context, " codec lookup returned null status"},
+                 RDMA_SC_CODEC_ERROR);
+    if (!status.ok()) return status;
+    if (codec == null)
+      return bad({operation_context, " codec lookup returned null codec"},
+                 RDMA_SC_CODEC_ERROR);
+    return status;
+  endfunction
+
   // 功能：make_engine_status_nonfatal 经 raw factory 构造可显式检查类型的 engine
   //   状态，供 consumer admission 前的本地准备和其它非致命边界使用。
   // 输入/输出及副作用：code/message 为输入；返回独立 status，不改变 transaction
@@ -1880,6 +1908,7 @@ class rdma_queue_data_engine extends uvm_object;
     bit backend_write_started;
     int unsigned occupancy;
     longint unsigned offset;
+    uvm_object raw_next;
 
     result = null;
     status = null;
@@ -1927,8 +1956,10 @@ class rdma_queue_data_engine extends uvm_object;
     // 这样取消本身失败时，runtime 能立刻接管同一 queue/cursor/image evidence，
     // 调用方可经 query_runtime_pending/recover_queue 查询或显式 abort，而不是只
     // 留下无法处理的 reservation。
-    next = rdma_queue_cursor_snapshot::type_id::create("device_publish_next");
-    if (next == null) begin
+    raw_next = factory_create_object_nonfatal(
+      rdma_queue_cursor_snapshot::get_type(), "device_publish_next");
+    if (raw_next == null || !$cast(next, raw_next)) begin
+      next = null;
       original_status = bad("device publish next cursor allocation failed",
                             RDMA_SC_RESOURCE_EXHAUSTED);
       finish_device_producer_cancel(attachment, reservation, null,
@@ -2989,8 +3020,9 @@ class rdma_queue_data_engine extends uvm_object;
   //   planner，并发布 queue-data engine 的单一运行环境。
   // 输入/输出及副作用：resource_manager、function_binding、memory、scheduler、
   //   codecs、timeout 为输入；成功仅保存非拥有引用和 timeout，configured 置 1。
-  // 失败/边界：空/零依赖、resize 锁忙、未清理 CQ recovery、仍有 attachment/QP
-  //   link、binding 非 ACTIVE/零 generation 或 planner configure 失败时保留旧配置。
+  // 失败/边界：空/零依赖、resize 锁忙、未清理 CQ/unclaimed recovery、仍有
+  //   attachment/QP link、binding 非 ACTIVE/零 generation 或 planner configure
+  //   失败时保留旧配置；不完整 unclaimed pair 也不得跨越配置生命周期。
   function rdma_status configure(
     rdma_resource_manager resource_manager,
     rdma_function_binding function_binding,
@@ -3000,6 +3032,13 @@ class rdma_queue_data_engine extends uvm_object;
     time timeout
   );
     rdma_status status;
+    rdma_queue_data_attachment attachment;
+    rdma_queue_runtime_state_e runtime_state;
+    rdma_queue_cursor_snapshot reservation;
+    string attachment_index;
+    bit has_pending;
+    bit reservation_valid;
+
     if (resource_manager == null || function_binding == null || memory == null ||
         scheduler == null || codecs == null || timeout == 0)
       return bad("queue data engine configuration has a null/zero dependency");
@@ -3010,6 +3049,54 @@ class rdma_queue_data_engine extends uvm_object;
       resize_lock.put(1);
       return bad("queue data engine has pending CQ cleanup recovery",
                  RDMA_SC_RECOVERY_REQUIRED);
+    end
+    // 中文设计：unclaimed evidence 与 attachment 是成对恢复 authority，但任一
+    // 表项残留或 pair 不完整都代表旧配置仍有不可丢弃状态。此检查必须先于普通
+    // attachment busy gate，才能返回可操作的 RECOVERY_REQUIRED 而不是掩盖为 busy。
+    if (unclaimed_device_recoveries.num() != 0 ||
+        unclaimed_recovery_attachments.num() != 0) begin
+      resize_lock.put(1);
+      return bad("queue data engine has unclaimed recovery evidence",
+                 RDMA_SC_RECOVERY_REQUIRED);
+    end
+    // 中文设计：reservation-only evidence 不进入 unclaimed 表，claimed pending
+    // 也只存在 runtime 内；因此必须在普通 attachment busy 判断前只读审计全部
+    // runtime。任一 recovery 状态、pending、reservation 或查询异常都阻止换配置。
+    foreach (attachments[attachment_index]) begin
+      attachment = attachments[attachment_index];
+      if (attachment == null || attachment.runtime == null) begin
+        resize_lock.put(1);
+        return bad("queue data engine attachment recovery state is corrupt",
+                   RDMA_SC_RECOVERY_REQUIRED);
+      end
+      status = attachment.runtime.query_state(runtime_state);
+      if (status == null || !status.ok() ||
+          runtime_state == RDMA_QUEUE_RUNTIME_RECOVERY_REQUIRED) begin
+        resize_lock.put(1);
+        return bad("queue data engine runtime requires recovery",
+                   RDMA_SC_RECOVERY_REQUIRED);
+      end
+      has_pending = 1'b0;
+      status = attachment.runtime.query_has_pending(has_pending);
+      if (status == null || !status.ok() || has_pending) begin
+        resize_lock.put(1);
+        return bad("queue data engine runtime has pending recovery",
+                   RDMA_SC_RECOVERY_REQUIRED);
+      end
+      if (attachment.kind inside {RDMA_QUEUE_RUNTIME_CQ,
+                                  RDMA_QUEUE_RUNTIME_CEQ,
+                                  RDMA_QUEUE_RUNTIME_AEQ}) begin
+        reservation_valid = 1'b0;
+        reservation = null;
+        status = attachment.runtime.query_device_reservation(
+          reservation_valid, reservation);
+        if (status == null || !status.ok() ||
+            reservation_valid || reservation != null) begin
+          resize_lock.put(1);
+          return bad("queue data engine runtime has a device reservation",
+                     RDMA_SC_RECOVERY_REQUIRED);
+        end
+      end
     end
     // attachment/qp_links 是当前队列 backing 和依赖拓扑的唯一索引。
     // 重配置前若直接清空它们会丢失 release authority，留下 manager-active
@@ -3420,15 +3507,22 @@ class rdma_queue_data_engine extends uvm_object;
                               RDMA_QUEUE_ROLE_AEQ_RING);
   endfunction
 
-  // 功能：detach 在 engine resize 锁内隔离指定资源的全部 ring attachment，并在
-  //   QP 场景删除对应 route link，防止旧 handle 继续访问 runtime/backing。
+  // 功能：detach 在 engine resize 锁内先审计指定资源全部 ring 的 recovery
+  //   authority，再隔离无恢复证据的 attachment；QP 场景同时删除对应 route link。
   // 输入/输出及副作用：queue_h 为输入；成功把匹配 runtime 标为 DETACHED 并删除
   //   本地非拥有索引，不释放 manager resource、mapping 或 Host-memory。
-  // 失败/边界：handle/stale generation、锁忙、CQ 尚有 resize cleanup recovery 或
-  //   没有匹配 attachment 时返回错误；失败前不会部分删除，重复 detach 非幂等。
+  // 失败/边界：handle/stale generation、锁忙、CQ cleanup、claimed pending、device
+  //   reservation、unclaimed evidence、runtime 查询不一致或没有 attachment 时返回
+  //   错误；所有检查在首次 mutation 前完成，重复 detach 非幂等。
   function rdma_status detach(rdma_handle queue_h);
     rdma_status status;
     string key;
+    string matching_keys[$];
+    rdma_queue_data_attachment attachment;
+    rdma_queue_cursor_snapshot reservation;
+    rdma_queue_runtime_state_e runtime_state;
+    bit has_pending;
+    bit reservation_valid;
     bit found;
     found = 1'b0;
     status = ensure_handle(queue_h, queue_h == null ? RDMA_RESOURCE_QP :
@@ -3442,13 +3536,62 @@ class rdma_queue_data_engine extends uvm_object;
       return bad("queue detach requires CQ cleanup recovery",
                  RDMA_SC_RECOVERY_REQUIRED);
     end
+    key = identity_key(queue_h);
+    if (key != "" && (unclaimed_device_recoveries.exists(key) ||
+                       unclaimed_recovery_attachments.exists(key))) begin
+      resize_lock.put(1);
+      return bad("queue detach requires unclaimed recovery resolution",
+                 RDMA_SC_RECOVERY_REQUIRED);
+    end
+
+    // 中文设计：同一 QP 可对应多个 ring attachment。先收集并查询每个 runtime，
+    // 任一 pending/reservation/RECOVERY_REQUIRED 或查询异常都整体拒绝；只有完整
+    // preflight 通过后才写 state/delete，避免前一个 ring 已删除而后一个 ring 拒绝。
     foreach (attachments[key]) begin
       if (attachments[key] != null && attachments[key].queue_h != null &&
           attachments[key].queue_h.same_instance(queue_h)) begin
-        if (attachments[key].runtime != null)
-          attachments[key].runtime.state = RDMA_QUEUE_RUNTIME_DETACHED;
-        attachments.delete(key); found = 1'b1;
+        attachment = attachments[key];
+        matching_keys.push_back(key);
+        if (attachment.runtime == null) begin
+          resize_lock.put(1);
+          return bad("queue detach runtime is unavailable",
+                     RDMA_SC_RECOVERY_REQUIRED);
+        end
+        status = attachment.runtime.query_state(runtime_state);
+        if (status == null || !status.ok() ||
+            runtime_state == RDMA_QUEUE_RUNTIME_RECOVERY_REQUIRED) begin
+          resize_lock.put(1);
+          return bad("queue detach requires runtime recovery resolution",
+                     RDMA_SC_RECOVERY_REQUIRED);
+        end
+        has_pending = 1'b0;
+        status = attachment.runtime.query_has_pending(has_pending);
+        if (status == null || !status.ok() || has_pending) begin
+          resize_lock.put(1);
+          return bad("queue detach requires pending recovery resolution",
+                     RDMA_SC_RECOVERY_REQUIRED);
+        end
+        if (attachment.kind inside {RDMA_QUEUE_RUNTIME_CQ,
+                                    RDMA_QUEUE_RUNTIME_CEQ,
+                                    RDMA_QUEUE_RUNTIME_AEQ}) begin
+          reservation_valid = 1'b0;
+          reservation = null;
+          status = attachment.runtime.query_device_reservation(
+            reservation_valid, reservation);
+          if (status == null || !status.ok() ||
+              reservation_valid || reservation != null) begin
+            resize_lock.put(1);
+            return bad("queue detach requires device reservation resolution",
+                       RDMA_SC_RECOVERY_REQUIRED);
+          end
+        end
       end
+    end
+    foreach (matching_keys[i]) begin
+      attachment = attachments[matching_keys[i]];
+      attachment.runtime.state = RDMA_QUEUE_RUNTIME_DETACHED;
+      attachments.delete(matching_keys[i]);
+      found = 1'b1;
     end
     if (queue_h.kind == RDMA_RESOURCE_QP)
       qp_links.delete(identity_key(queue_h));
@@ -3783,9 +3926,28 @@ class rdma_queue_data_engine extends uvm_object;
     image = null;
     codec_key = '{hw_version:"rdma", image_kind:image_kind,
       object_type:object_type, variant:variant, opcode:8'h00};
-    status = registry.lookup(codec_key, codec);
-    if (!status.ok()) return status;
-    return codec.encode(model, image);
+    status = lookup_codec_checked(codec_key, "queue encode", codec);
+    if (status == null || !status.ok())
+      return status == null ?
+        bad("queue codec lookup normalization failed", RDMA_SC_CODEC_ERROR) :
+        status;
+    status = codec.encode(model, image);
+    if (status == null) begin
+      image = null;
+      return bad("queue codec encode returned null status",
+                 RDMA_SC_CODEC_ERROR);
+    end
+    if (!status.ok()) begin
+      image = null;
+      return status;
+    end
+    if (image == null || image.length == 0 ||
+        image.bytes.size() != image.length) begin
+      image = null;
+      return bad("queue codec returned an incomplete image",
+                 RDMA_SC_CODEC_ERROR);
+    end
+    return status;
   endfunction
 
   // 功能：write_and_verify 把 host-produced WQE image 写到 attachment 相对 offset，
@@ -3963,8 +4125,9 @@ class rdma_queue_data_engine extends uvm_object;
   //   并经共享 scheduler 提交已写 WQE 的 producer 通知。
   // 输入/输出及副作用：target_h、kind、reservation、next、SQE header、local_id 为
   //   输入，result/status 为输出；scheduler 调用可能产生 PCIe/MMIO 副作用。
-  // 失败/边界：target/next 缺失、kind 非 posting ring、SQ header 不足、codec 或
-  //   scheduler 失败时不发布成功 result；本 helper 不提交 runtime PI/ledger。
+  // 失败/边界：target/next 缺失、kind 非 posting ring、SQ header 不足、model/
+  //   descriptor/authority 分配失败、codec null/失败或 scheduler 返回不完整结果时
+  //   不发布成功 result；本 helper 不提交 runtime PI/ledger。
   protected task submit_producer_doorbell(
     rdma_handle target_h, rdma_queue_runtime_kind_e kind,
     rdma_queue_cursor_snapshot reservation, rdma_queue_cursor_snapshot next,
@@ -3982,6 +4145,8 @@ class rdma_queue_data_engine extends uvm_object;
     rdma_doorbell_desc desc;
     string variant;
     longint unsigned relative_offset;
+    uvm_object raw_model;
+    uvm_object raw_desc;
 
     result = null; model = null; image = null; status = null;
     if (target_h == null || next == null) begin
@@ -3991,8 +4156,19 @@ class rdma_queue_data_engine extends uvm_object;
     case (kind)
       RDMA_QUEUE_RUNTIME_SQ: begin
         variant = "sq"; relative_offset = RDMA_DB_SQ_OFFSET;
-        sq = rdma_hw_sq_doorbell_model::type_id::create("sq_db_model");
+        raw_model = factory_create_object_nonfatal(
+          rdma_hw_sq_doorbell_model::get_type(), "sq_db_model");
+        if (raw_model == null || !$cast(sq, raw_model)) begin
+          status = bad("SQ doorbell model allocation failed",
+                       RDMA_SC_RESOURCE_EXHAUSTED);
+          return;
+        end
         sq.target_h = rdma_clone_handle_value(target_h, "SQ DB target");
+        if (sq.target_h == null) begin
+          status = bad("SQ doorbell target snapshot allocation failed",
+                       RDMA_SC_RESOURCE_EXHAUSTED);
+          return;
+        end
         if (sqe_image == null || sqe_image.bytes.size() < RDMA_DB_BYTES) begin
           status = bad("SQ doorbell lacks the encoded SQE header");
           return;
@@ -4005,15 +4181,37 @@ class rdma_queue_data_engine extends uvm_object;
       end
       RDMA_QUEUE_RUNTIME_RQ: begin
         variant = "rq"; relative_offset = RDMA_DB_RQ_OFFSET;
-        rq = rdma_hw_rq_doorbell_model::type_id::create("rq_db_model");
+        raw_model = factory_create_object_nonfatal(
+          rdma_hw_rq_doorbell_model::get_type(), "rq_db_model");
+        if (raw_model == null || !$cast(rq, raw_model)) begin
+          status = bad("RQ doorbell model allocation failed",
+                       RDMA_SC_RESOURCE_EXHAUSTED);
+          return;
+        end
         rq.target_h = projected_id_handle(target_h, local_id);
+        if (rq.target_h == null) begin
+          status = bad("RQ doorbell target snapshot allocation failed",
+                       RDMA_SC_RESOURCE_EXHAUSTED);
+          return;
+        end
         rq.qpn = local_id; rq.icos = 0; rq.pi = next.index; rq.wrap = next.wrap;
         model = rq;
       end
       RDMA_QUEUE_RUNTIME_SRQ: begin
         variant = "srq_pi"; relative_offset = RDMA_DB_SRFQ_OFFSET;
-        srq = rdma_hw_srq_doorbell_model::type_id::create("srq_db_model");
+        raw_model = factory_create_object_nonfatal(
+          rdma_hw_srq_doorbell_model::get_type(), "srq_db_model");
+        if (raw_model == null || !$cast(srq, raw_model)) begin
+          status = bad("SRQ doorbell model allocation failed",
+                       RDMA_SC_RESOURCE_EXHAUSTED);
+          return;
+        end
         srq.target_h = projected_id_handle(target_h, local_id);
+        if (srq.target_h == null) begin
+          status = bad("SRQ doorbell target snapshot allocation failed",
+                       RDMA_SC_RESOURCE_EXHAUSTED);
+          return;
+        end
         srq.variant = RDMA_SRQ_DB_PI; srq.srqn = local_id;
         srq.pi = next.index; srq.wrap = next.wrap; model = srq;
       end
@@ -4024,16 +4222,43 @@ class rdma_queue_data_engine extends uvm_object;
     endcase
     codec_key = '{hw_version:"rdma", image_kind:RDMA_IMAGE_DOORBELL,
       object_type:"doorbell", variant:variant, opcode:8'h00};
-    status = registry.lookup(codec_key, codec);
-    if (!status.ok()) return;
+    status = lookup_codec_checked(codec_key, "producer doorbell", codec);
+    if (status == null || !status.ok()) begin
+      if (status == null)
+        status = bad("producer doorbell lookup normalization failed",
+                     RDMA_SC_CODEC_ERROR);
+      return;
+    end
     status = codec.encode(model, image);
+    if (status == null) begin
+      status = bad("producer doorbell encode returned null status",
+                   RDMA_SC_CODEC_ERROR);
+      return;
+    end
     if (!status.ok()) return;
-    desc = rdma_doorbell_desc::type_id::create("producer_db_desc");
+    if (image == null || image.length != RDMA_DB_BYTES ||
+        image.bytes.size() != RDMA_DB_BYTES) begin
+      status = bad("producer doorbell codec returned an invalid image",
+                   RDMA_SC_CODEC_ERROR);
+      return;
+    end
+    raw_desc = factory_create_object_nonfatal(
+      rdma_doorbell_desc::get_type(), "producer_db_desc");
+    if (raw_desc == null || !$cast(desc, raw_desc)) begin
+      status = bad("producer doorbell descriptor allocation failed",
+                   RDMA_SC_RESOURCE_EXHAUSTED);
+      return;
+    end
     desc.kind = (kind == RDMA_QUEUE_RUNTIME_SQ) ? RDMA_DOORBELL_SQ :
                 (kind == RDMA_QUEUE_RUNTIME_RQ) ? RDMA_DOORBELL_RQ :
                                                    RDMA_DOORBELL_SRQ;
     desc.function_h = binding.make_handle();
     desc.target_h = rdma_clone_handle_value(target_h, "producer DB target");
+    if (desc.function_h == null || desc.target_h == null) begin
+      status = bad("producer doorbell authority snapshot allocation failed",
+                   RDMA_SC_RESOURCE_EXHAUSTED);
+      return;
+    end
     desc.notify_bar_id = binding.notify_bar_id; desc.relative_offset = relative_offset;
     desc.width = RDMA_DB_BYTES; desc.endian = RDMA_ENDIAN_BIG;
     desc.payload_image = image; desc.barrier_policy = RDMA_DB_BARRIER_DMA_MMIO;
@@ -4041,23 +4266,39 @@ class rdma_queue_data_engine extends uvm_object;
     desc.allow_merge = 1'b0; desc.merge_requested = 1'b0;
     desc.timeout = operation_timeout; desc.readback_policy = RDMA_DB_READBACK_NONE;
     doorbells.submit(binding, desc, result, status);
+    if (status == null) begin
+      result = null;
+      status = bad("producer doorbell scheduler returned null status",
+                   RDMA_SC_INVALID_STATE);
+    end
+    else if (status.ok() && result == null)
+      status = bad("producer doorbell scheduler returned no result",
+                   RDMA_SC_INVALID_STATE);
   endtask
 
   // 功能：make_entry_image 把从 queue backing 读取的固定长度 bytes 包装为待解码的
   //   CQE/CEQE/AEQE hardware image，并填入当前 Function generation 与大端元数据。
   // 输入/输出及副作用：data、kind、entry_size 为输入，image 先置 null；成功创建
   //   detached image，只复制 bytes，不修改 backing 或 consumer cursor。
-  // 失败/边界：entry_size=0 或 byte count 不等时返回 DMA_TRANSLATION；对象分配由
-  //   UVM factory 管理，调用方必须在成功后才访问 image 或进入 codec。
+  // 失败/边界：entry_size=0 或 byte count 不等时返回 DMA_TRANSLATION；raw factory
+  //   返回 null/错误类型时非致命返回 RESOURCE_EXHAUSTED，成功后才允许进入 codec。
   protected function rdma_status make_entry_image(
     byte data[], rdma_image_kind_e kind, int unsigned entry_size,
     output rdma_hw_image image
   );
+    uvm_object raw_image;
+
     image = null;
     if (entry_size == 0 || data.size() != entry_size)
       return bad("queue entry byte count does not match attachment geometry",
                  RDMA_SC_DMA_TRANSLATION);
-    image = rdma_hw_image::type_id::create("queue_entry_image");
+    raw_image = factory_create_object_nonfatal(
+      rdma_hw_image::get_type(), "queue_entry_image");
+    if (raw_image == null || !$cast(image, raw_image)) begin
+      image = null;
+      return bad("queue entry image allocation failed",
+                 RDMA_SC_RESOURCE_EXHAUSTED);
+    end
     foreach (data[i]) image.bytes.push_back(data[i]);
     image.length = entry_size;
     image.alignment = entry_size;
@@ -4661,8 +4902,13 @@ class rdma_queue_data_engine extends uvm_object;
     if (!status.ok()) return;
     codec_key = '{hw_version:"rdma", image_kind:RDMA_IMAGE_CQE,
       object_type:"cqe", variant:"default", opcode:8'h00};
-    status = registry.lookup(codec_key, codec);
-    if (!status.ok()) return;
+    status = lookup_codec_checked(codec_key, "CQE poll", codec);
+    if (status == null || !status.ok()) begin
+      if (status == null)
+        status = bad("CQE codec lookup normalization failed",
+                     RDMA_SC_CODEC_ERROR);
+      return;
+    end
     begin
       rdma_hw_cqe_codec variable_cqe_codec;
       if (!$cast(variable_cqe_codec, codec)) begin
@@ -4674,6 +4920,10 @@ class rdma_queue_data_engine extends uvm_object;
       // 修改 registry 共享 codec 的 active profile 而污染其他并发 transaction。
       status = variable_cqe_codec.decode_with_entry_bytes(
         entry_image, cq_attachment.entry_size, decoded_model);
+    end
+    if (status == null) begin
+      status = bad("CQE decode returned null status", RDMA_SC_CODEC_ERROR);
+      return;
     end
     if (!status.ok()) return;
     if (!$cast(cqe, decoded_model) || cqe == null)
@@ -5558,9 +5808,18 @@ class rdma_queue_data_engine extends uvm_object;
     if (!status.ok()) return;
     codec_key = '{hw_version:"rdma", image_kind:RDMA_IMAGE_CEQE,
       object_type:"ceqe", variant:"default", opcode:8'h00};
-    status = registry.lookup(codec_key, codec);
-    if (!status.ok()) return;
+    status = lookup_codec_checked(codec_key, "CEQE poll", codec);
+    if (status == null || !status.ok()) begin
+      if (status == null)
+        status = bad("CEQE codec lookup normalization failed",
+                     RDMA_SC_CODEC_ERROR);
+      return;
+    end
     status = codec.decode(entry_image, decoded_model);
+    if (status == null) begin
+      status = bad("CEQE decode returned null status", RDMA_SC_CODEC_ERROR);
+      return;
+    end
     if (!status.ok()) return;
     if (!$cast(ceqe, decoded_model) || ceqe == null) begin
       status = bad("CEQE codec returned the wrong model type", RDMA_SC_CODEC_ERROR);
@@ -5772,9 +6031,18 @@ class rdma_queue_data_engine extends uvm_object;
     if (!status.ok()) return;
     codec_key = '{hw_version:"rdma", image_kind:RDMA_IMAGE_AEQE,
       object_type:"aeqe", variant:"default", opcode:8'h00};
-    status = registry.lookup(codec_key, codec);
-    if (!status.ok()) return;
+    status = lookup_codec_checked(codec_key, "AEQE poll", codec);
+    if (status == null || !status.ok()) begin
+      if (status == null)
+        status = bad("AEQE codec lookup normalization failed",
+                     RDMA_SC_CODEC_ERROR);
+      return;
+    end
     status = codec.decode(entry_image, decoded_model);
+    if (status == null) begin
+      status = bad("AEQE decode returned null status", RDMA_SC_CODEC_ERROR);
+      return;
+    end
     if (!status.ok()) return;
     if (!$cast(aeqe, decoded_model) || aeqe == null) begin
       status = bad("AEQE codec returned the wrong model type", RDMA_SC_CODEC_ERROR);
@@ -6809,11 +7077,15 @@ class rdma_queue_data_engine extends uvm_object;
               reservation.wrap == unclaimed_pending.cursor.wrap) begin
             status = detach_recovery_transaction(
               queue_h, found, reservation);
-            if (status != null && status.ok()) begin
-              unclaimed_device_recoveries.delete(key);
-              unclaimed_recovery_attachments.delete(key);
+            if (status == null) begin
+              status = bad("unclaimed recovery abort returned null status",
+                           RDMA_SC_RECOVERY_REQUIRED);
               return;
             end
+            if (!status.ok()) return;
+            unclaimed_device_recoveries.delete(key);
+            unclaimed_recovery_attachments.delete(key);
+            return;
           end
         end
         status = bad("unclaimed recovery admission is still unavailable",
@@ -6862,11 +7134,12 @@ class rdma_queue_data_engine extends uvm_object;
             end
             status = detach_recovery_transaction(
               queue_h, candidate, reservation);
-            if (status == null || !status.ok()) begin
+            if (status == null) begin
               status = bad("reservation-only recovery abort could not cancel",
                            RDMA_SC_RECOVERY_REQUIRED);
               return;
             end
+            if (!status.ok()) return;
             return;
           end
         end

@@ -225,6 +225,8 @@ class rdma_queue_consumer_fault_registry
 
   protected bit null_lookup_status_armed;
   protected int unsigned null_lookup_status_hits;
+  protected bit targeted_null_lookup_armed;
+  protected rdma_codec_key targeted_null_lookup_key;
 
   // 功能：构造尚未注入 codec 故障的 doorbell registry，沿用生产 defaults 状态。
   // 输入/输出及副作用：name 为对象名；只调用基类构造，不注册、删除或替换 codec。
@@ -233,6 +235,21 @@ class rdma_queue_consumer_fault_registry
   function new(string name = "rdma_queue_consumer_fault_registry");
     super.new(name);
     null_lookup_status_armed = 1'b0;
+    null_lookup_status_hits = 0;
+    targeted_null_lookup_armed = 1'b0;
+    targeted_null_lookup_key = '{hw_version:"", image_kind:RDMA_IMAGE_SQE,
+                                 object_type:"", variant:"", opcode:8'h00};
+  endfunction
+
+  // 功能：arm_targeted_null_lookup_once 为任意一个完整 codec key 开启一次 null
+  //   lookup status 故障，用于分别验证 SQE、producer doorbell 和三类 poll 解码边界。
+  // 输入/输出及副作用：key 为输入并按值保存；重置命中计数、置 armed，不删除或
+  //   替换 registry 中的真实 codec，也不修改 queue runtime/backing。
+  // 失败/边界：测试必须传入完整 key；重复 arm 覆盖旧目标，目标命中一次后自动
+  //   关闭，非目标 lookup 始终委托生产 registry。
+  function void arm_targeted_null_lookup_once(rdma_codec_key key);
+    targeted_null_lookup_key = key;
+    targeted_null_lookup_armed = 1'b1;
     null_lookup_status_hits = 0;
   endfunction
 
@@ -254,6 +271,7 @@ class rdma_queue_consumer_fault_registry
   // 失败/边界：未 arm 或故障已自动消费时调用保持幂等；不会回退、补发或伪造 lookup。
   function void disarm_null_lookup_status();
     null_lookup_status_armed = 1'b0;
+    targeted_null_lookup_armed = 1'b0;
   endfunction
 
   // 功能：null_lookup_status_hit_count 返回最近一次 arm 窗口内精确目标 key 的命中数，
@@ -277,6 +295,16 @@ class rdma_queue_consumer_fault_registry
     output rdma_codec_base codec
   );
     codec = null;
+    if (targeted_null_lookup_armed &&
+        key.hw_version == targeted_null_lookup_key.hw_version &&
+        key.image_kind == targeted_null_lookup_key.image_kind &&
+        key.object_type == targeted_null_lookup_key.object_type &&
+        key.variant == targeted_null_lookup_key.variant &&
+        key.opcode == targeted_null_lookup_key.opcode) begin
+      targeted_null_lookup_armed = 1'b0;
+      null_lookup_status_hits++;
+      return null;
+    end
     if (null_lookup_status_armed &&
         key.hw_version == "rdma" &&
         key.image_kind == RDMA_IMAGE_DOORBELL &&
@@ -942,22 +970,56 @@ class rdma_queue_data_engine_device_publish_test extends uvm_test;
     tracked_fixtures.push_back(fixture);
   endfunction
 
-  // 功能：cleanup_tracked_fixtures 逐个弹出本 test instance 登记的 fixture，
-  //   对每个对象恰好调用一次聚合 cleanup，并在单项失败后继续处理剩余对象。
-  // 输入/输出及副作用：status 为输出；清空 tracked_fixtures，释放各 fixture
-  //   的 attachment 与 lifecycle-owned 资源，并用 UVM_ERROR 报告每个失败。
-  // 失败/边界：空队列幂等成功；cleanup 返回 null 或非 OK 时保存首个清理失败，
-  //   但不覆盖此前业务测试的 UVM 报告，也不阻止后续 fixture 清理。
+  // 功能：cleanup_tracked_fixtures 逐个弹出登记的 fixture，先以公开 recovery abort
+  //   解决 fault case 刻意保留的 pending/reservation，再恰好调用一次聚合 cleanup。
+  // 输入/输出及副作用：status 为输出；清空 tracked_fixtures，显式隔离带 recovery
+  //   evidence 的 attachment，并释放各 fixture lifecycle-owned 资源。
+  // 失败/边界：无 recovery 时 recover_queue 返回 INVALID_STATE 并继续普通 cleanup；
+  //   abort 未成功时保留 attachment 标志交给 cleanup，cleanup 的 null/失败会报告
+  //   UVM_ERROR、保存首错，但不阻止后续 fixture 回收。
   protected task automatic cleanup_tracked_fixtures(
     output rdma_status status
   );
     rdma_queue_data_engine_fixture fixture;
     rdma_status cleanup_status;
+    rdma_status recovery_status;
     rdma_status first_failure;
 
     first_failure = null;
     while (tracked_fixtures.size() != 0) begin
       fixture = tracked_fixtures.pop_back();
+      // 中文设计：普通 detach 现在必须拒绝 recovery authority；测试 epilogue 不能再
+      // 借 fixture.cleanup 静默丢弃故障证据，而应与真实 caller 一样显式 abort。
+      if (fixture != null && fixture.engine != null) begin
+        if (fixture.qp_attached && fixture.qp != null) begin
+          fixture.engine.recover_queue(
+            fixture.qp.handle, RDMA_QUEUE_RECOVERY_ABORT_AND_DETACH,
+            1'b0, recovery_status);
+          if (recovery_status != null && recovery_status.ok())
+            fixture.qp_attached = 1'b0;
+        end
+        if (fixture.cq_attached && fixture.cq != null) begin
+          fixture.engine.recover_queue(
+            fixture.cq.handle, RDMA_QUEUE_RECOVERY_ABORT_AND_DETACH,
+            1'b0, recovery_status);
+          if (recovery_status != null && recovery_status.ok())
+            fixture.cq_attached = 1'b0;
+        end
+        if (fixture.ceq_attached && fixture.ceq != null) begin
+          fixture.engine.recover_queue(
+            fixture.ceq.handle, RDMA_QUEUE_RECOVERY_ABORT_AND_DETACH,
+            1'b0, recovery_status);
+          if (recovery_status != null && recovery_status.ok())
+            fixture.ceq_attached = 1'b0;
+        end
+        if (fixture.aeq_attached && fixture.aeq != null) begin
+          fixture.engine.recover_queue(
+            fixture.aeq.handle, RDMA_QUEUE_RECOVERY_ABORT_AND_DETACH,
+            1'b0, recovery_status);
+          if (recovery_status != null && recovery_status.ok())
+            fixture.aeq_attached = 1'b0;
+        end
+      end
       cleanup_status = null;
       fixture.cleanup(cleanup_status);
       if (cleanup_status == null || !cleanup_status.ok()) begin
@@ -4924,6 +4986,16 @@ class rdma_queue_data_engine_device_publish_test extends uvm_test;
     calls_before_abort = fixture.mem.calls.size();
     writes_before_abort = count_host_mem_calls(fixture.mem, "write");
     reads_before_abort = count_host_mem_calls(fixture.mem, "read");
+    status = fixture.engine.detach(fixture.cq.handle);
+    if (status == null || status.code != RDMA_SC_RECOVERY_REQUIRED)
+      `uvm_error("CQE_UNCLAIMED_ORDINARY_DETACH",
+                 "ordinary detach bypassed unclaimed recovery ownership")
+    status = fixture.engine.configure(
+      fixture.manager, fixture.binding, fixture.mem, fixture.scheduler,
+      fixture.registry, 100ns);
+    if (status == null || status.code != RDMA_SC_RECOVERY_REQUIRED)
+      `uvm_error("CQE_UNCLAIMED_RECONFIGURE",
+                 "reconfigure did not prioritize retained unclaimed evidence")
     status = fault_engine.hold_detach_lock_for_test();
     if (status == null || !status.ok()) begin
       `uvm_error("CQE_UNCLAIMED_ABORT_ARM", "unclaimed detach lock failed")
@@ -4932,9 +5004,9 @@ class rdma_queue_data_engine_device_publish_test extends uvm_test;
     fixture.engine.recover_queue(fixture.cq.handle,
       RDMA_QUEUE_RECOVERY_ABORT_AND_DETACH, 1'b1, status);
     fault_engine.release_detach_lock_for_test();
-    if (status == null || status.ok())
+    if (status == null || status.code != RDMA_SC_RESOURCE_BUSY)
       `uvm_error("CQE_UNCLAIMED_ABORT_BUSY",
-                 "unclaimed abort ignored detach lock failure")
+                 "unclaimed abort did not preserve RESOURCE_BUSY")
     pending_after = null;
     status = fixture.engine.query_runtime_pending(
       fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, pending_after);
@@ -5014,6 +5086,30 @@ class rdma_queue_data_engine_device_publish_test extends uvm_test;
         fixture.mem.calls.size() != calls_before_final_abort)
       `uvm_error("CQE_UNCLAIMED_ABORT_POLL_STALE",
                  "unclaimed abort left poll active or released mapping")
+    status = fixture.engine.detach(fixture.qp.handle);
+    if (status == null || !status.ok())
+      `uvm_error("CQE_UNCLAIMED_QP_DETACH",
+                 "QP detach after explicit CQ abort failed")
+    else
+      fixture.qp_attached = 1'b0;
+    status = fixture.engine.detach(fixture.ceq.handle);
+    if (status == null || !status.ok())
+      `uvm_error("CQE_UNCLAIMED_CEQ_DETACH",
+                 "CEQ detach after explicit CQ abort failed")
+    else
+      fixture.ceq_attached = 1'b0;
+    status = fixture.engine.detach(fixture.aeq.handle);
+    if (status == null || !status.ok())
+      `uvm_error("CQE_UNCLAIMED_AEQ_DETACH",
+                 "AEQ detach after explicit CQ abort failed")
+    else
+      fixture.aeq_attached = 1'b0;
+    status = fixture.engine.configure(
+      fixture.manager, fixture.binding, fixture.mem, fixture.scheduler,
+      fixture.registry, 100ns);
+    if (status == null || !status.ok())
+      `uvm_error("CQE_UNCLAIMED_RECONFIGURE_AFTER_ABORT",
+                 "reconfigure remained blocked after explicit abort cleanup")
   endtask
 
   // 功能：check_claimed_abort_detach_failure_atomicity 在 CQ runtime 已接管 device
@@ -5130,6 +5226,10 @@ class rdma_queue_data_engine_device_publish_test extends uvm_test;
       return;
     end
     calls_before_abort = fixture.mem.calls.size();
+    status = fixture.engine.detach(fixture.cq.handle);
+    if (status == null || status.code != RDMA_SC_RECOVERY_REQUIRED)
+      `uvm_error("CQE_CLAIMED_ORDINARY_DETACH",
+                 "ordinary detach bypassed claimed recovery ownership")
     status = fault_engine.hold_detach_lock_for_test();
     if (status == null || !status.ok()) begin
       `uvm_error("CQE_ABORT_SPLIT_ARM", "detach lock injection failed")
@@ -5688,6 +5788,149 @@ class rdma_queue_data_engine_device_publish_test extends uvm_test;
       fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, pending);
     if (status == null || status.ok() || pending != null)
       `uvm_error("CQE_CANCEL_ABORT_CLEANUP", "cancel abort retained pending evidence")
+  endtask
+
+  // 功能：check_reservation_only_detach_reconfigure 让 device publish 的 next cursor
+  //   分配失败且安全 cancel 同时失败，建立只有 reservation、没有 pending 的恢复窗口，
+  //   验证普通 detach/reconfigure 均不能越过该 authority。
+  // 输入/输出及副作用：无显式输入；通过精确 factory 与 cancel 故障驱动真实 CQ
+  //   reservation，读取公开 reservation/pending/occupancy，并以显式 abort 完成 detach。
+  // 失败/边界：分配故障必须非致命返回 RECOVERY_REQUIRED；detach/reconfigure 拒绝和
+  //   abort 锁忙均须保留 reservation，只有最终 abort 成功后才允许重新 configure。
+  task automatic check_reservation_only_detach_reconfigure();
+    rdma_queue_data_engine_fixture fixture;
+    rdma_device_publish_recovery_fault_engine fault_engine;
+    rdma_queue_post_result posted;
+    rdma_queue_device_publish_result published;
+    rdma_hw_cqe_model cqe;
+    rdma_queue_pending_operation pending;
+    rdma_queue_cursor_snapshot reservation_before;
+    rdma_queue_cursor_snapshot reservation_after;
+    rdma_status status;
+    rdma_status model_status;
+    bit polarity;
+    bit reservation_valid;
+    bit fired;
+    int unsigned occupancy;
+    bit has_pending;
+
+    reset_device_publish_factory_state();
+    rdma_queue_data_engine::type_id::set_type_override(
+      rdma_device_publish_recovery_fault_engine::get_type(), 1'b1);
+    rdma_device_publish_recovery_fault_engine::cancel_failures_remaining = 1;
+    fixture = rdma_queue_data_engine_fixture::type_id::create(
+      "reservation_only_detach_fixture");
+    fixture.setup(status);
+    track_fixture(fixture);
+    if (status == null || !status.ok() ||
+        !$cast(fault_engine, fixture.engine) || fault_engine == null) begin
+      `uvm_error("RESERVATION_ONLY_SETUP",
+                 "reservation-only fixture setup failed")
+      return;
+    end
+    configure_poll_factory_faults();
+    fixture.engine.post_send(fixture.make_send(64'hd533_0000), posted, status);
+    status = fixture.engine.query_runtime_producer_polarity(
+      fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, polarity);
+    cqe = make_cqe_for_outstanding_send(
+      fixture.qp.handle, fixture.qp.local_qp_id, posted, polarity,
+      model_status);
+    if (status == null || !status.ok() || posted == null ||
+        model_status == null || !model_status.ok() || cqe == null) begin
+      `uvm_error("RESERVATION_ONLY_MODEL",
+                 "reservation-only CQE preparation failed")
+      return;
+    end
+
+    poll_cursor_fault.arm("device_publish_next", 1'b0);
+    publish_cqe_for_test(
+      fixture.engine, fixture.cq.handle, cqe, published, status);
+    fired = poll_cursor_fault.fired();
+    poll_cursor_fault.disarm();
+    if (!fired || status == null ||
+        status.code != RDMA_SC_RECOVERY_REQUIRED || published != null) begin
+      `uvm_error("RESERVATION_ONLY_PUBLISH",
+                 "next-cursor fault did not retain reservation-only recovery")
+      return;
+    end
+    pending = null;
+    status = fixture.engine.query_runtime_pending(
+      fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, pending);
+    if (status == null || status.code != RDMA_SC_INVALID_STATE ||
+        pending != null)
+      `uvm_error("RESERVATION_ONLY_PENDING",
+                 "reservation-only fault unexpectedly installed pending")
+    reservation_valid = 1'b0;
+    reservation_before = null;
+    status = fixture.engine.query_runtime_device_reservation(
+      fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, reservation_valid,
+      reservation_before);
+    if (status == null || !status.ok() || !reservation_valid ||
+        reservation_before == null)
+      `uvm_error("RESERVATION_ONLY_EVIDENCE",
+                 "reservation-only evidence is not observable")
+    status = fixture.engine.query_runtime_occupancy(
+      fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, occupancy, has_pending);
+    if (status == null || !status.ok() || occupancy != 0 || has_pending)
+      `uvm_error("RESERVATION_ONLY_OCCUPANCY",
+                 "reservation-only fault changed committed occupancy")
+
+    status = fixture.engine.detach(fixture.cq.handle);
+    if (status == null || status.code != RDMA_SC_RECOVERY_REQUIRED)
+      `uvm_error("RESERVATION_ONLY_ORDINARY_DETACH",
+                 "ordinary detach bypassed reservation-only authority")
+    status = fixture.engine.configure(
+      fixture.manager, fixture.binding, fixture.mem, fixture.scheduler,
+      fixture.registry, 100ns);
+    if (status == null || status.code != RDMA_SC_RECOVERY_REQUIRED)
+      `uvm_error("RESERVATION_ONLY_RECONFIGURE",
+                 "reconfigure did not prioritize reservation-only evidence")
+
+    status = fault_engine.hold_detach_lock_for_test();
+    if (status == null || !status.ok()) begin
+      `uvm_error("RESERVATION_ONLY_LOCK", "detach lock injection failed")
+      return;
+    end
+    fixture.engine.recover_queue(
+      fixture.cq.handle, RDMA_QUEUE_RECOVERY_ABORT_AND_DETACH, 1'b1,
+      status);
+    fault_engine.release_detach_lock_for_test();
+    if (status == null || status.code != RDMA_SC_RESOURCE_BUSY)
+      `uvm_error("RESERVATION_ONLY_BUSY_STATUS",
+                 "reservation-only abort did not preserve RESOURCE_BUSY")
+    reservation_valid = 1'b0;
+    reservation_after = null;
+    status = fixture.engine.query_runtime_device_reservation(
+      fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, reservation_valid,
+      reservation_after);
+    if (status == null || !status.ok() || !reservation_valid ||
+        reservation_before == null || reservation_after == null ||
+        reservation_after.index != reservation_before.index ||
+        reservation_after.wrap != reservation_before.wrap)
+      `uvm_error("RESERVATION_ONLY_BUSY_EVIDENCE",
+                 "failed abort changed reservation-only evidence")
+
+    fixture.engine.recover_queue(
+      fixture.cq.handle, RDMA_QUEUE_RECOVERY_ABORT_AND_DETACH, 1'b1,
+      status);
+    if (status == null || !status.ok()) begin
+      `uvm_error("RESERVATION_ONLY_ABORT",
+                 "explicit reservation-only abort did not detach")
+      return;
+    end
+    fixture.cq_attached = 1'b0;
+    status = fixture.engine.detach(fixture.qp.handle);
+    if (status != null && status.ok()) fixture.qp_attached = 1'b0;
+    status = fixture.engine.detach(fixture.ceq.handle);
+    if (status != null && status.ok()) fixture.ceq_attached = 1'b0;
+    status = fixture.engine.detach(fixture.aeq.handle);
+    if (status != null && status.ok()) fixture.aeq_attached = 1'b0;
+    status = fixture.engine.configure(
+      fixture.manager, fixture.binding, fixture.mem, fixture.scheduler,
+      fixture.registry, 100ns);
+    if (status == null || !status.ok())
+      `uvm_error("RESERVATION_ONLY_RECONFIGURE_AFTER_ABORT",
+                 "reconfigure remained blocked after explicit abort")
   endtask
 
   // 功能：check_device_publish_stale_route 拍平 attachment 的冻结 route/epoch 与
@@ -7644,6 +7887,8 @@ class rdma_queue_data_engine_device_publish_test extends uvm_test;
     check_device_publish_preflight_failure();
     reset_device_publish_factory_state();
     check_device_publish_cancel_failure();
+    reset_device_publish_factory_state();
+    check_reservation_only_detach_reconfigure();
     reset_device_publish_factory_state();
     check_device_publish_fault_recovery("CQE_WRITE_FAIL", 0);
     reset_device_publish_factory_state();

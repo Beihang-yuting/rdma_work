@@ -78,6 +78,29 @@ class rdma_queue_runtime_factory_fault_wrapper extends uvm_object_wrapper;
   endfunction
 endclass
 
+// 设计说明：public recovery 转移会在进入 QUIESCING 前消费 retry confirmation，
+// 因而 copy gate 的防御式不变量需要受限 test-only 子类注入该单一 protected bit；
+// 被测 copy_ring_state 仍是生产实现，测试不改写 pending、游标或锁。
+class rdma_queue_runtime_retry_authority_probe extends rdma_queue_runtime;
+  `uvm_object_utils(rdma_queue_runtime_retry_authority_probe)
+
+  // 功能：构造未配置的 runtime probe，仅复用生产状态机并开放 retry bit 注入。
+  // 输入输出及副作用：name 为对象名；调用基类构造，不配置 queue/route 或状态。
+  // 失败边界：未完成 configure 的 probe 与生产 runtime 一样拒绝业务入口。
+  function new(string name = "rdma_queue_runtime_retry_authority_probe");
+    super.new(name);
+  endfunction
+
+  // 功能：set_retry_confirmation_for_test 精确设置 copy gate 应拒绝的一次性恢复授权。
+  // 输入输出及副作用：value 为输入；仅修改 recovery_retry_confirmed，不触碰
+  //   pending、reservation、cursor、ledger、state 或 semaphore。
+  // 失败边界：该 helper 仅供本文件在 QUIESCING source/空 ATTACHED target 上构造
+  //   public transition 当前不可达的不一致状态，禁止用于正向 runtime 行为测试。
+  function void set_retry_confirmation_for_test(bit value);
+    recovery_retry_confirmed = value;
+  endfunction
+endclass
+
 // 设计说明：测试只通过 runtime 公开查询和事务入口观察状态，
 // 不直接读写 reservation、pending、occupancy 或 PI/CI 内部字段。
 class rdma_queue_runtime_test extends uvm_test;
@@ -898,6 +921,79 @@ class rdma_queue_runtime_test extends uvm_test;
     if (status == null || !status.ok() || reservation == null ||
         reservation.index != 0 || reservation.wrap != 1'b0)
       `uvm_error("COPY_NARROW_ATOMIC", "geometry failure changed target PI")
+  endtask
+
+  // 功能：验证 copy_ring_state 的 source 与 target gate 都显式拒绝尚未消费的
+  //   recovery_retry_confirmed，避免 resize 把一次性 retry authority 复制或覆盖。
+  // 输入输出及副作用：构造同 identity/route 的 QUIESCING source 与 ATTACHED target，
+  //   仅用 probe 注入单一 retry bit；通过生产 copy API 和公开 cursor 查询观察结果。
+  // 失败边界：任一侧带 authorization 时 copy 必须原子拒绝；两侧清零后同一 source/
+  //   target 必须成功复制，证明拒绝并非由其它 geometry/authority 条件造成。
+  task automatic test_copy_ring_state_rejects_retry_confirmation();
+    rdma_queue_runtime_retry_authority_probe source;
+    rdma_queue_runtime_retry_authority_probe target;
+    rdma_handle cq_h;
+    rdma_route_key_t route;
+    rdma_status status;
+    int unsigned producer_index;
+    int unsigned consumer_index;
+    bit producer_wrap;
+    bit consumer_wrap;
+
+    cq_h = queue_handle("copy_retry_cq", RDMA_RESOURCE_CQ, 52);
+    route = fixture_route(8'h52);
+    source = rdma_queue_runtime_retry_authority_probe::type_id::create(
+      "copy_retry_source");
+    target = rdma_queue_runtime_retry_authority_probe::type_id::create(
+      "copy_retry_target");
+    if (source == null || target == null || cq_h == null) begin
+      `uvm_error("COPY_RETRY_FIXTURE", "runtime probe allocation failed")
+      return;
+    end
+    status = source.configure(cq_h, RDMA_QUEUE_RUNTIME_CQ, 8,
+                              3, 1'b0, 3, 1'b0, 1'b0);
+    expect_ok("COPY_RETRY_SOURCE_CONFIGURE", status);
+    if (status == null || !status.ok()) return;
+    expect_ok("COPY_RETRY_SOURCE_ROUTE",
+              source.set_route_epoch(route, rdma_reset_epoch_t'(64'h552)));
+    expect_ok("COPY_RETRY_SOURCE_ACTIVATE", source.activate());
+    expect_ok("COPY_RETRY_SOURCE_QUIESCE", source.begin_quiesce());
+    status = target.configure(cq_h, RDMA_QUEUE_RUNTIME_CQ, 8,
+                              0, 1'b0, 0, 1'b0, 1'b0);
+    expect_ok("COPY_RETRY_TARGET_CONFIGURE", status);
+    if (status == null || !status.ok()) return;
+    expect_ok("COPY_RETRY_TARGET_ROUTE",
+              target.set_route_epoch(route, rdma_reset_epoch_t'(64'h552)));
+
+    source.set_retry_confirmation_for_test(1'b1);
+    expect_code("COPY_RETRY_SOURCE_GATE", target.copy_ring_state(source),
+                RDMA_SC_RESOURCE_BUSY);
+    status = target.query_cursors(producer_index, producer_wrap,
+                                  consumer_index, consumer_wrap);
+    if (status == null || !status.ok() || producer_index != 0 ||
+        producer_wrap || consumer_index != 0 || consumer_wrap)
+      `uvm_error("COPY_RETRY_SOURCE_ATOMIC",
+                 "source retry rejection changed target cursors")
+
+    source.set_retry_confirmation_for_test(1'b0);
+    target.set_retry_confirmation_for_test(1'b1);
+    expect_code("COPY_RETRY_TARGET_GATE", target.copy_ring_state(source),
+                RDMA_SC_INVALID_STATE);
+    status = target.query_cursors(producer_index, producer_wrap,
+                                  consumer_index, consumer_wrap);
+    if (status == null || !status.ok() || producer_index != 0 ||
+        producer_wrap || consumer_index != 0 || consumer_wrap)
+      `uvm_error("COPY_RETRY_TARGET_ATOMIC",
+                 "target retry rejection changed target cursors")
+
+    target.set_retry_confirmation_for_test(1'b0);
+    expect_ok("COPY_RETRY_AFTER_CLEAR", target.copy_ring_state(source));
+    status = target.query_cursors(producer_index, producer_wrap,
+                                  consumer_index, consumer_wrap);
+    if (status == null || !status.ok() || producer_index != 3 ||
+        producer_wrap || consumer_index != 3 || consumer_wrap)
+      `uvm_error("COPY_RETRY_AFTER_CLEAR",
+                 "copy did not succeed after both retry gates cleared")
   endtask
 
   // 功能：验证 mmio_evidence 是 consumer recovery 的唯一 authority，NONE
@@ -2010,6 +2106,7 @@ class rdma_queue_runtime_test extends uvm_test;
     test_pending_copy_and_mmio_evidence();
     test_host_configure_empty_ledger_invariant();
     test_copy_ring_state_authority_and_geometry();
+    test_copy_ring_state_rejects_retry_confirmation();
     test_mmio_evidence_authority_transitions();
     test_rejected_mmio_transition_preserves_confirmation();
     test_prepared_immutable_evidence_atomicity();

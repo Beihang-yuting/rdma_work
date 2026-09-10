@@ -125,8 +125,8 @@ class rdma_cq_engine extends uvm_object;
     shadow_rq_ci = rq_ci;
     shadow_arm_state = arm_state;
     shadow_sequence = seq;
-    // Reconfigure starts a fresh active shadow state, even when the epoch is
-    // unchanged; this avoids returning an old snapshot for newly supplied CI.
+    // 中文设计：即使 reset epoch 未变化，重配置也必须启动新的 active shadow；
+    // 否则后续 flush 可能把旧缓存快照误当作本次新输入的 CI 返回。
     shadow_flushed = 1'b0;
     flushed_shadow = null;
     shadow_flush_result = null;

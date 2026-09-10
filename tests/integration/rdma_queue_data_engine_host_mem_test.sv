@@ -9,9 +9,9 @@
 // 中文说明：rdma_queue_data_engine_host_mem_test.sv 属于集成测试，验证真实适配器与队列/控制面之间的联调。
 // 阅读提示：先看公开类型和接口，再看实现细节；失败路径应保持状态与资源所有权可追踪。
 
-// End-to-end queue data-plane test using the pinned host_mem implementation.
-// The test intentionally reuses the lifecycle fixture from the core package,
-// replacing only its host-memory adapter with a delegating real adapter.
+// 中文设计：本文件使用 pinned host_mem 实现完成 queue data-plane 端到端验证；
+// 测试刻意复用 core package 的 lifecycle fixture，只把 Host-memory adapter
+// 替换为委托真实实现的 adapter，避免复制或伪造资源生命周期。
 
 import rdma_unit_test_pkg::*;
 import rdma_codec_pkg::*;

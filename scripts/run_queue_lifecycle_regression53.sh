@@ -25,13 +25,20 @@ readonly CORE_TESTS=(
   # 设备产生的 CQE 发布属于核心队列生命周期回归，
   # 必须在定义共享 fixture 的 post 测试之后执行。
   rdma_queue_data_engine_device_publish_test
+  rdma_queue_host_codec_final_fix_test
+  rdma_queue_producer_doorbell_final_fix_test
+  rdma_queue_cqe_codec_final_fix_test
+  rdma_queue_entry_image_final_fix_test
+  rdma_queue_ceqe_codec_final_fix_test
+  rdma_queue_aeqe_codec_final_fix_test
+  rdma_queue_recovery_lifecycle_final_fix_test
   rdma_queue_data_engine_poll_test
   rdma_queue_data_engine_recovery_test
   rdma_cq_engine_resize_test
   rdma_cqe_size_codec_test
   rdma_sq_models_test
-  # SQ/RQ/CQ/EQ engines share the queue lifecycle build and must run in the
-  # same VCS 53 regression so PI/CI, credits and doorbell paths are covered.
+  # SQ/RQ/CQ/EQ engine 共享 queue lifecycle 编译，必须纳入同一 VCS53 回归，
+  # 才能共同覆盖 PI/CI、credit 与 doorbell 路径。
   rdma_sq_engine_test
   rdma_rq_engine_test
   rdma_cq_engine_test
