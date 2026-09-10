@@ -791,11 +791,11 @@ class rdma_host_mem_adapter_test extends uvm_test;
     request_context_snapshot.copy(request_context);
 
     hm = rdma_host_mem_external_pkg::host_mem_manager::type_id::create("hm");
-    // 新版 host_mem 默认采用随机 placement；本段验证的是“拒绝请求不推进
-    // allocator 状态”的精确回滚契约，因此显式切换到可复现的 first-fit。
-    hm.set_alloc_policy(host_mem_pkg::HOST_MEM_FIRST_FIT);
+    // 中文设计：新版 host_mem 在 init_region 中用 MODE_LINEAR 选择
+    // first-fit scan，free 时合并 segment；因此拒绝请求后的首地址可复用。
     hm.init_region(64'h0000_0001_0000_0000,
-                   64'h0000_0001_00ff_ffff);
+                   64'h0000_0001_00ff_ffff,
+                   host_mem_pkg::MODE_LINEAR);
     adapter = rdma_host_mem_adapter::type_id::create("adapter");
     adapter.mem = hm;
 
@@ -1302,11 +1302,11 @@ class rdma_host_mem_adapter_test extends uvm_test;
     // A non-zero iova_base is the first end-exclusive IOVA cursor.  Each
     // successful mapping aligns that cursor and advances it by mapping size.
     offset_hm = rdma_host_mem_external_pkg::host_mem_manager::type_id::create("offset_hm");
-    // 下面的 backing 地址比较用于确认 rejected rebase 没有消耗一个块；
-    // 使用 deterministic policy，避免把随机 placement 误报成 cursor 破坏。
-    offset_hm.set_alloc_policy(host_mem_pkg::HOST_MEM_FIRST_FIT);
+    // 中文设计：MODE_LINEAR 使用确定性 first-fit scan 并在 free 时
+    // 合并 segment，因此 backing 地址比较能精确证明 rejected rebase 未消耗块。
     offset_hm.init_region(64'h0000_0002_0000_0000,
-                          64'h0000_0002_00ff_ffff);
+                          64'h0000_0002_00ff_ffff,
+                          host_mem_pkg::MODE_LINEAR);
     offset_adapter = rdma_host_mem_adapter::type_id::create("offset_adapter");
     offset_adapter.mem = offset_hm;
     offset_adapter.iova_base = 64'h0000_0000_4000_0000;
@@ -1389,10 +1389,11 @@ class rdma_host_mem_adapter_test extends uvm_test;
     // IOVA arithmetic failure rolls back the real backing allocation and
     // does not advance the cursor.  The same base is reusable immediately.
     overflow_hm = rdma_host_mem_external_pkg::host_mem_manager::type_id::create("overflow_hm");
-    // 溢出回滚断言需要观察同一块 backing 是否可重用，故固定为 first-fit。
-    overflow_hm.set_alloc_policy(host_mem_pkg::HOST_MEM_FIRST_FIT);
+    // 中文设计：MODE_LINEAR 的 first-fit scan 与 free segment 合并使
+    // 溢出回滚后同一 backing 可立即复用，便于观察 allocator 游标不变。
     overflow_hm.init_region(64'h0000_0003_0000_0000,
-                            64'h0000_0003_00ff_ffff);
+                            64'h0000_0003_00ff_ffff,
+                            host_mem_pkg::MODE_LINEAR);
     overflow_adapter = rdma_host_mem_adapter::type_id::create(
       "overflow_adapter"
     );
@@ -1424,14 +1425,14 @@ class rdma_host_mem_adapter_test extends uvm_test;
     // distinct because allocation identity and adapter ownership are opaque.
     equal_hm_a = rdma_host_mem_external_pkg::host_mem_manager::type_id::create("equal_hm_a");
     equal_hm_b = rdma_host_mem_external_pkg::host_mem_manager::type_id::create("equal_hm_b");
-    // 两个独立 manager 的数值 alias 是本测试要验证的边界；显式使用
-    // first-fit 后仍由 adapter 的 opaque identity 检验跨 manager 隔离。
-    equal_hm_a.set_alloc_policy(host_mem_pkg::HOST_MEM_FIRST_FIT);
-    equal_hm_b.set_alloc_policy(host_mem_pkg::HOST_MEM_FIRST_FIT);
+    // 中文设计：两个 manager 都用 MODE_LINEAR 的 first-fit scan 生成
+    // 相同数值地址；free 合并不改变 adapter opaque identity 的跨 manager 隔离。
     equal_hm_a.init_region(64'h0000_0005_0000_0000,
-                           64'h0000_0005_000f_ffff);
+                           64'h0000_0005_000f_ffff,
+                           host_mem_pkg::MODE_LINEAR);
     equal_hm_b.init_region(64'h0000_0005_0000_0000,
-                           64'h0000_0005_000f_ffff);
+                           64'h0000_0005_000f_ffff,
+                           host_mem_pkg::MODE_LINEAR);
     equal_adapter_a = rdma_host_mem_adapter::type_id::create(
       "equal_adapter_a"
     );
