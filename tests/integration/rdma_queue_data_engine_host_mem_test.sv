@@ -439,16 +439,18 @@ endclass
 class rdma_queue_data_engine_host_mem_test extends uvm_test;
   `uvm_component_utils(rdma_queue_data_engine_host_mem_test)
 
-  // 中文设计：以下字段只观察故障 create 的 canonical identity/backing，
-  // 不向正常 caller 转移 cleanup authority；若被测 helper 未回滚，测试
-  // epilogue 才用 observed handle 恢复，保证失败断言仍以 0 leak 收尾。
+  // 中文设计：以下字段只观察故障 create 的实际注入类型与 canonical
+  // identity/backing，不向正常 caller 转移 cleanup authority；若被测 helper
+  // 未回滚，测试 epilogue 才用 observed handle 恢复，保证失败断言仍以 0 leak 收尾。
   protected rdma_handle observed_create_fault_h;
   protected rdma_dma_mapping observed_create_fault_mapping;
   protected int unsigned observed_create_fault_releases_before;
+  protected rdma_test_queue_create_fault_e observed_create_fault_mode;
 
   // 功能：构造 host_mem 集成测试并清空 create-fault 的观察证据。
-  // 输入/输出及副作用：name/parent 为 UVM 层级输入；初始化三个非拥有
-  //   observed 字段，不创建 manager、fixture、queue 或 pinned allocation。
+  // 输入/输出及副作用：name/parent 为 UVM 层级输入；初始化 canonical
+  //   handle/mapping/release 计数与实际命中的 fault mode 四项观察字段，
+  //   不创建 manager、fixture、queue 或 pinned allocation。
   // 失败/边界：外部依赖仍由顶层测试 task 后续绑定；null 观察字段不代表
   //   cleanup 成功，只表示尚未执行一个可观察的故障 create。
   function new(string name = "rdma_queue_data_engine_host_mem_test",
@@ -457,6 +459,7 @@ class rdma_queue_data_engine_host_mem_test extends uvm_test;
     observed_create_fault_h = null;
     observed_create_fault_mapping = null;
     observed_create_fault_releases_before = 0;
+    observed_create_fault_mode = RDMA_TEST_QUEUE_CREATE_FAULT_NONE;
   endfunction
 
   // 功能：retain_failure 把一个阶段的 null/non-OK status 规范化后
@@ -745,10 +748,11 @@ class rdma_queue_data_engine_host_mem_test extends uvm_test;
   // 输入/输出及副作用：label/fixture/request/create/rollback transaction ID 与
   //   fault_mode 为输入；resource/created_h/control_result/status 入口置安全值；
   //   成功把 detached created_h 的 cleanup authority 交给 caller，故障模式另存
-  //   canonical handle/mapping 的非拥有测试观察证据。
+  //   canonical handle/mapping 的非拥有观察证据；post-create 失败同步 result status。
   // 失败/边界：依赖、create status、canonical resource/handle、result/resource_h、
   //   clone 或 caller resource 缺失时返回明确错误；create 已成功但证据不完整时
-  //   先按 canonical handle 委托一次 rollback，失败输出保持 null 且 fake 不参与销毁。
+  //   先清空三条 resource authority，再按 canonical handle 委托一次 rollback；
+  //   rollback 失败追加 diagnostics 且 fake 不参与销毁。
   task automatic create_queue_for_test(
     string label,
     rdma_queue_data_engine_fixture fixture,
@@ -778,6 +782,7 @@ class rdma_queue_data_engine_host_mem_test extends uvm_test;
     observed_create_fault_h = null;
     observed_create_fault_mapping = null;
     observed_create_fault_releases_before = 0;
+    observed_create_fault_mode = RDMA_TEST_QUEUE_CREATE_FAULT_NONE;
     if (fixture == null || fixture.queue_executor == null ||
         fixture.binding == null || request == null || transaction_id == 0 ||
         rollback_transaction_id == 0 ||
@@ -812,8 +817,10 @@ class rdma_queue_data_engine_host_mem_test extends uvm_test;
           observed_proxy, observed_create_fault_mapping);
     end
     if (fault_mode == RDMA_TEST_QUEUE_CREATE_FAULT_RESULT_HANDLE_MISSING &&
-        control_result != null)
+        control_result != null) begin
       control_result.resource_h = null;
+      observed_create_fault_mode = fault_mode;
+    end
     if (control_result == null)
       primary_status = rdma_status::make(
         RDMA_SC_INVALID_STATE, "test queue create returned no control result");
@@ -833,8 +840,10 @@ class rdma_queue_data_engine_host_mem_test extends uvm_test;
         RDMA_SC_INVALID_STATE,
         "test queue create omitted result resource handle");
     else begin
-      if (fault_mode == RDMA_TEST_QUEUE_CREATE_FAULT_HANDLE_CLONE_NULL)
+      if (fault_mode == RDMA_TEST_QUEUE_CREATE_FAULT_HANDLE_CLONE_NULL) begin
         created_h = null;
+        observed_create_fault_mode = fault_mode;
+      end
       else
         created_h = rdma_clone_handle_value(
           control_result.resource_h, {label, " canonical handle"});
@@ -857,11 +866,16 @@ class rdma_queue_data_engine_host_mem_test extends uvm_test;
     end
 
     // 中文设计：rollback_authority 始终直接来自 canonical_resource.handle，
-    // 与 result/fake/clone 相互独立。任一 post-create 失败由 wrapper 消费该
-    // authority；caller 永远不会同时拿到失败 status 和可二次销毁的 created_h。
+    // 与 result/fake/clone 相互独立。任一 post-create primary failure 先将
+    // wrapper/result status 同步，并清空三条 caller-facing resource authority，
+    // 再由 wrapper 消费 canonical authority；rollback diagnostics 仍写回 result。
     if (primary_status != null) begin
       resource = null;
       created_h = null;
+      if (control_result != null) begin
+        control_result.resource_h = null;
+        control_result.status = primary_status;
+      end
       if (rollback_authority != null) begin
         cleanup_created_queue_handle(
           fixture, rollback_authority, 1'b0,
@@ -920,11 +934,12 @@ class rdma_queue_data_engine_host_mem_test extends uvm_test;
   //   注入 result-handle 缺失或 clone-null，验证 wrapper 拒绝前已释放 canonical queue。
   // 输入/输出及副作用：proxy/fault_mode/label/transaction_id 为输入，status
   //   入口置成功并返回首错；task 读取 wrapper 保存的 canonical 观察证据，
-  //   检查 primary code、rollback diagnostics、manager lookup、mapping release
-  //   次数与 completion。
+  //   检查实际命中的 fault mode、caller-facing primary status/空 handle、
+  //   rollback diagnostics、manager lookup、mapping release 次数与 completion。
   // 失败/边界：仅接受两种 create evidence 故障及可派生两个非溢出事务的 ID；
-  //   create 未以 INVALID_STATE 拒绝、caller 输出非空、rollback 另有失败、queue
-  //   仍 ACTIVE、mapping 未精确释放一次或 completion 未完成均失败；恢复
+  //   create/result 未以同一 INVALID_STATE 拒绝、任一 caller handle 非空、
+  //   实际 fault mode 不符、rollback 另有失败、queue 仍 ACTIVE、mapping 未精确
+  //   释放一次或 completion 未完成均失败；恢复
   //   epilogue 只收口仍活动资源，保证最终 0 leak。
   task automatic test_create_evidence_rollback_contract(
     rdma_real_host_mem_proxy proxy,
@@ -1008,20 +1023,31 @@ class rdma_queue_data_engine_host_mem_test extends uvm_test;
           {evidence_kind, " did not reject and clear create output"});
         disable evidence_rollback_flow;
       end
+      if (control_result.resource_h != null) begin
+        first_failure = rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          {evidence_kind, " exposed a stale result resource handle"});
+        disable evidence_rollback_flow;
+      end
+      if (control_result.status == null ||
+          control_result.status.code != RDMA_SC_INVALID_STATE ||
+          control_result.status.code != step.code ||
+          control_result.status.message != step.message) begin
+        first_failure = rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          {evidence_kind, " result status did not preserve primary failure"});
+        disable evidence_rollback_flow;
+      end
       if (control_result.rollback_statuses.size() != 0) begin
         first_failure = rdma_status::make(
           RDMA_SC_INVALID_STATE,
           {evidence_kind, " reported an unexpected rollback failure"});
         disable evidence_rollback_flow;
       end
-      if ((fault_mode ==
-             RDMA_TEST_QUEUE_CREATE_FAULT_RESULT_HANDLE_MISSING &&
-           control_result.resource_h != null) ||
-          (fault_mode == RDMA_TEST_QUEUE_CREATE_FAULT_HANDLE_CLONE_NULL &&
-           control_result.resource_h == null)) begin
+      if (observed_create_fault_mode != fault_mode) begin
         first_failure = rdma_status::make(
           RDMA_SC_INVALID_STATE,
-          {evidence_kind, " injection changed the wrong result evidence"});
+          {evidence_kind, " injection was not observed internally"});
         disable evidence_rollback_flow;
       end
       if (canonical_h == null || mapping == null) begin
