@@ -30,6 +30,16 @@ typedef enum int unsigned {
   RDMA_REAL_MEM_FAULT_OPAQUE_RELEASE_NULL_STATUS
 } rdma_real_mem_fault_e;
 
+// 中文设计：queue create fault 只破坏真实 executor 已成功返回后的
+// caller-facing 证据，不替换 manager/planner/Host-memory；每个模式均保留
+// canonical 非拥有观察引用，供行为断言和失败恢复 epilogue 查漏。
+typedef enum int unsigned {
+  RDMA_TEST_QUEUE_CREATE_FAULT_NONE,
+  RDMA_TEST_QUEUE_CREATE_FAULT_WRONG_CALLER_TYPE,
+  RDMA_TEST_QUEUE_CREATE_FAULT_RESULT_HANDLE_MISSING,
+  RDMA_TEST_QUEUE_CREATE_FAULT_HANDLE_CLONE_NULL
+} rdma_test_queue_create_fault_e;
+
 // 中文设计：fault adapter 继承真实 adapter，正常模式仍持有真实 manager
 // allocation ledger；arm 后仅下一次匹配 API 返回畸形结果，测试随后恢复正常
 // 模式并通过真实 release 收口，避免用 mock 掩盖 ownership 副作用。
@@ -429,12 +439,24 @@ endclass
 class rdma_queue_data_engine_host_mem_test extends uvm_test;
   `uvm_component_utils(rdma_queue_data_engine_host_mem_test)
 
-  // 功能：构造 rdma_queue_data_engine_host_mem_test，调用 super.new 建立 UVM 层级对象；外部依赖字段保持未绑定，后续由 configure/build/activate 明确注入。
-  // 输入/输出及副作用：name、parent（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
-  // 失败/边界：rdma_queue_data_engine_host_mem_test 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
+  // 中文设计：以下字段只观察故障 create 的 canonical identity/backing，
+  // 不向正常 caller 转移 cleanup authority；若被测 helper 未回滚，测试
+  // epilogue 才用 observed handle 恢复，保证失败断言仍以 0 leak 收尾。
+  protected rdma_handle observed_create_fault_h;
+  protected rdma_dma_mapping observed_create_fault_mapping;
+  protected int unsigned observed_create_fault_releases_before;
+
+  // 功能：构造 host_mem 集成测试并清空 create-fault 的观察证据。
+  // 输入/输出及副作用：name/parent 为 UVM 层级输入；初始化三个非拥有
+  //   observed 字段，不创建 manager、fixture、queue 或 pinned allocation。
+  // 失败/边界：外部依赖仍由顶层测试 task 后续绑定；null 观察字段不代表
+  //   cleanup 成功，只表示尚未执行一个可观察的故障 create。
   function new(string name = "rdma_queue_data_engine_host_mem_test",
                uvm_component parent = null);
     super.new(name, parent);
+    observed_create_fault_h = null;
+    observed_create_fault_mapping = null;
+    observed_create_fault_releases_before = 0;
   endfunction
 
   // 功能：retain_failure 把一个阶段的 null/non-OK status 规范化后
@@ -718,32 +740,53 @@ class rdma_queue_data_engine_host_mem_test extends uvm_test;
     end
   endtask
 
-  // 功能：create_queue_for_test 调用真实 queue executor，并在 caller-facing
-  //   类型投影前从 control result 保存 canonical detached resource handle。
-  // 输入/输出及副作用：label/fixture/request/transaction_id/inject_wrong_type 为
-  //   输入；resource/created_h/control_result/status 入口置安全值，真实成功会注册 CQ。
-  // 失败/边界：依赖、create status、canonical resource/handle 或 clone 缺失时
-  //   返回明确错误；注入只替换返回对象，不登记或销毁 fake resource。
+  // 功能：create_queue_for_test 调用真实 queue executor，并按 fault_mode 在
+  //   caller-facing 类型投影前破坏 result handle、clone 输出或对象动态类型。
+  // 输入/输出及副作用：label/fixture/request/create/rollback transaction ID 与
+  //   fault_mode 为输入；resource/created_h/control_result/status 入口置安全值；
+  //   成功把 detached created_h 的 cleanup authority 交给 caller，故障模式另存
+  //   canonical handle/mapping 的非拥有测试观察证据。
+  // 失败/边界：依赖、create status、canonical resource/handle、result/resource_h、
+  //   clone 或 caller resource 缺失时返回明确错误；create 已成功但证据不完整时
+  //   先按 canonical handle 委托一次 rollback，失败输出保持 null 且 fake 不参与销毁。
   task automatic create_queue_for_test(
     string label,
     rdma_queue_data_engine_fixture fixture,
     rdma_create_cq_req request,
     longint unsigned transaction_id,
-    bit inject_wrong_type,
+    longint unsigned rollback_transaction_id,
+    rdma_test_queue_create_fault_e fault_mode,
     output rdma_queue_resource resource,
     output rdma_handle created_h,
     output rdma_control_result control_result,
     output rdma_status status
   );
     rdma_queue_resource canonical_resource;
+    rdma_queue_backing_ref observed_backing;
+    rdma_real_host_mem_proxy observed_proxy;
+    rdma_handle rollback_authority;
+    rdma_status primary_status;
+    rdma_status rollback_status;
 
     resource = null;
     created_h = null;
     control_result = null;
     status = rdma_status::success();
     canonical_resource = null;
+    rollback_authority = null;
+    primary_status = null;
+    observed_create_fault_h = null;
+    observed_create_fault_mapping = null;
+    observed_create_fault_releases_before = 0;
     if (fixture == null || fixture.queue_executor == null ||
-        fixture.binding == null || request == null || transaction_id == 0) begin
+        fixture.binding == null || request == null || transaction_id == 0 ||
+        rollback_transaction_id == 0 ||
+        rollback_transaction_id == transaction_id ||
+        !(fault_mode inside {
+          RDMA_TEST_QUEUE_CREATE_FAULT_NONE,
+          RDMA_TEST_QUEUE_CREATE_FAULT_WRONG_CALLER_TYPE,
+          RDMA_TEST_QUEUE_CREATE_FAULT_RESULT_HANDLE_MISSING,
+          RDMA_TEST_QUEUE_CREATE_FAULT_HANDLE_CLONE_NULL})) begin
       status = rdma_status::make(
         RDMA_SC_INVALID_ARGUMENT, "test queue create input is incomplete");
       return;
@@ -751,33 +794,97 @@ class rdma_queue_data_engine_host_mem_test extends uvm_test;
     fixture.queue_executor.create_locked(
       fixture.binding, fixture.binding.make_handle(), request,
       transaction_id, canonical_resource, control_result);
-    if (control_result != null && control_result.resource_h != null)
-      created_h = rdma_clone_handle_value(
-        control_result.resource_h, {label, " canonical handle"});
-    if (control_result == null || control_result.status == null) begin
-      status = rdma_status::make(
-        RDMA_SC_INVALID_STATE, "test queue create returned no status");
-      return;
+    if (canonical_resource != null)
+      rollback_authority = canonical_resource.handle;
+
+    // 中文设计：真实 create 的 canonical resource 是 result 投影之外的独立
+    // 证据；故障测试先保留其非拥有引用，再只抹除 caller-facing result 字段。
+    if (fault_mode != RDMA_TEST_QUEUE_CREATE_FAULT_NONE &&
+        canonical_resource != null) begin
+      observed_create_fault_h = rollback_authority;
+      observed_backing = find_queue_backing(
+        canonical_resource, RDMA_QUEUE_ROLE_CQ_RING);
+      if (observed_backing != null)
+        observed_create_fault_mapping = observed_backing.mapping;
+      if (observed_create_fault_mapping != null &&
+          $cast(observed_proxy, fixture.mem))
+        observed_create_fault_releases_before = release_success_count(
+          observed_proxy, observed_create_fault_mapping);
     end
-    if (!control_result.status.ok()) begin
+    if (fault_mode == RDMA_TEST_QUEUE_CREATE_FAULT_RESULT_HANDLE_MISSING &&
+        control_result != null)
+      control_result.resource_h = null;
+    if (control_result == null)
+      primary_status = rdma_status::make(
+        RDMA_SC_INVALID_STATE, "test queue create returned no control result");
+    else if (control_result.status == null)
+      primary_status = rdma_status::make(
+        RDMA_SC_INVALID_STATE, "test queue create returned no status");
+    else if (!control_result.status.ok()) begin
       status = control_result.status;
       return;
     end
-    if (canonical_resource == null || created_h == null) begin
-      status = rdma_status::make(
+    else if (canonical_resource == null || rollback_authority == null)
+      primary_status = rdma_status::make(
         RDMA_SC_INVALID_STATE,
-        "test queue create omitted canonical resource evidence");
+        "test queue create omitted canonical resource authority");
+    else if (control_result.resource_h == null)
+      primary_status = rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "test queue create omitted result resource handle");
+    else begin
+      if (fault_mode == RDMA_TEST_QUEUE_CREATE_FAULT_HANDLE_CLONE_NULL)
+        created_h = null;
+      else
+        created_h = rdma_clone_handle_value(
+          control_result.resource_h, {label, " canonical handle"});
+      if (created_h == null)
+        primary_status = rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "test queue create could not clone result resource handle");
+    end
+
+    if (primary_status == null) begin
+      if (fault_mode == RDMA_TEST_QUEUE_CREATE_FAULT_WRONG_CALLER_TYPE)
+        resource = rdma_queue_resource::type_id::create(
+          {label, " caller_type_fault"});
+      else
+        resource = canonical_resource;
+      if (resource == null)
+        primary_status = rdma_status::make(
+          RDMA_SC_RESOURCE_EXHAUSTED,
+          "test queue caller-facing resource allocation failed");
+    end
+
+    // 中文设计：rollback_authority 始终直接来自 canonical_resource.handle，
+    // 与 result/fake/clone 相互独立。任一 post-create 失败由 wrapper 消费该
+    // authority；caller 永远不会同时拿到失败 status 和可二次销毁的 created_h。
+    if (primary_status != null) begin
+      resource = null;
+      created_h = null;
+      if (rollback_authority != null) begin
+        cleanup_created_queue_handle(
+          fixture, rollback_authority, 1'b0,
+          rollback_transaction_id, rollback_status);
+        if (rollback_status == null)
+          rollback_status = rdma_status::make(
+            RDMA_SC_INVALID_STATE,
+            "test queue canonical rollback returned null status");
+        if (!rollback_status.ok()) begin
+          if (control_result != null)
+            control_result.rollback_statuses.push_back(rollback_status);
+          status = rdma_status::make(
+            primary_status.code,
+            $sformatf("%s; canonical rollback failed: %s",
+                      primary_status.message,
+                      rollback_status.convert2string()));
+          return;
+        end
+      end
+      status = primary_status;
       return;
     end
-    if (inject_wrong_type)
-      resource = rdma_queue_resource::type_id::create(
-        {label, " caller_type_fault"});
-    else
-      resource = canonical_resource;
-    if (resource == null)
-      status = rdma_status::make(
-        RDMA_SC_RESOURCE_EXHAUSTED,
-        "test queue caller-facing resource allocation failed");
+    status = rdma_status::success();
   endtask
 
   // 功能：cleanup_created_queue_handle 负责按 canonical detached handle 销毁
@@ -807,6 +914,158 @@ class rdma_queue_data_engine_host_mem_test extends uvm_test;
     if (status == null)
       status = rdma_status::make(
         RDMA_SC_INVALID_STATE, "test queue cleanup returned null status");
+  endtask
+
+  // 功能：test_create_evidence_rollback_contract 在真实 owned CQ create 后
+  //   注入 result-handle 缺失或 clone-null，验证 wrapper 拒绝前已释放 canonical queue。
+  // 输入/输出及副作用：proxy/fault_mode/label/transaction_id 为输入，status
+  //   入口置成功并返回首错；task 读取 wrapper 保存的 canonical 观察证据，
+  //   检查 primary code、rollback diagnostics、manager lookup、mapping release
+  //   次数与 completion。
+  // 失败/边界：仅接受两种 create evidence 故障及可派生两个非溢出事务的 ID；
+  //   create 未以 INVALID_STATE 拒绝、caller 输出非空、rollback 另有失败、queue
+  //   仍 ACTIVE、mapping 未精确释放一次或 completion 未完成均失败；恢复
+  //   epilogue 只收口仍活动资源，保证最终 0 leak。
+  task automatic test_create_evidence_rollback_contract(
+    rdma_real_host_mem_proxy proxy,
+    rdma_test_queue_create_fault_e fault_mode,
+    string label,
+    longint unsigned transaction_id,
+    output rdma_status status
+  );
+    rdma_queue_data_engine_fixture fixture;
+    rdma_create_cq_req request;
+    rdma_queue_resource resource;
+    rdma_resource snapshot;
+    rdma_handle created_h;
+    rdma_handle canonical_h;
+    rdma_dma_mapping mapping;
+    rdma_control_result control_result;
+    rdma_status first_failure;
+    rdma_status step;
+    rdma_status lookup_status;
+    rdma_status completion_status;
+    rdma_status cleanup_status;
+    int unsigned releases_before;
+    bit release_complete;
+    string evidence_kind;
+
+    status = rdma_status::success();
+    evidence_kind = fault_mode ==
+      RDMA_TEST_QUEUE_CREATE_FAULT_RESULT_HANDLE_MISSING ?
+      "missing result handle" : "null handle clone";
+    fixture = rdma_queue_data_engine_fixture::type_id::create(
+      {label, "_fixture"});
+    first_failure = null;
+    canonical_h = null;
+    mapping = null;
+    begin : evidence_rollback_flow
+      if (proxy == null || fixture == null || label == "" ||
+          transaction_id == 0 ||
+          transaction_id > 64'hffff_ffff_ffff_fffd ||
+          !(fault_mode inside {
+            RDMA_TEST_QUEUE_CREATE_FAULT_RESULT_HANDLE_MISSING,
+            RDMA_TEST_QUEUE_CREATE_FAULT_HANDLE_CLONE_NULL})) begin
+        first_failure = rdma_status::make(
+          RDMA_SC_INVALID_ARGUMENT,
+          "create evidence rollback test input is invalid");
+        disable evidence_rollback_flow;
+      end
+      fixture.mem = proxy;
+      fixture.setup(step, 16, 64, 16, 16);
+      retain_failure("create evidence fixture setup", step, first_failure);
+      if (first_failure != null)
+        disable evidence_rollback_flow;
+      request = rdma_create_cq_req::type_id::create({label, "_request"});
+      if (request == null) begin
+        first_failure = rdma_status::make(
+          RDMA_SC_RESOURCE_EXHAUSTED,
+          "create evidence request allocation failed");
+        disable evidence_rollback_flow;
+      end
+      request.owner = fixture.binding.make_handle();
+      request.depth = 64;
+      request.cqe_size_bytes = 64;
+      request.ceq_h = rdma_clone_handle_value(
+        fixture.ceq.handle, {label, " CEQ"});
+      request.ring_backing.mode = RDMA_QUEUE_BACKING_OWNED;
+      create_queue_for_test(
+        label, fixture, request, transaction_id, transaction_id + 1,
+        fault_mode,
+        resource, created_h, control_result, step);
+      canonical_h = observed_create_fault_h;
+      mapping = observed_create_fault_mapping;
+      releases_before = observed_create_fault_releases_before;
+      if (step == null || step.code != RDMA_SC_INVALID_STATE) begin
+        first_failure = rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          {evidence_kind, " did not preserve primary INVALID_STATE"});
+        disable evidence_rollback_flow;
+      end
+      if (resource != null || created_h != null || control_result == null) begin
+        first_failure = rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          {evidence_kind, " did not reject and clear create output"});
+        disable evidence_rollback_flow;
+      end
+      if (control_result.rollback_statuses.size() != 0) begin
+        first_failure = rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          {evidence_kind, " reported an unexpected rollback failure"});
+        disable evidence_rollback_flow;
+      end
+      if ((fault_mode ==
+             RDMA_TEST_QUEUE_CREATE_FAULT_RESULT_HANDLE_MISSING &&
+           control_result.resource_h != null) ||
+          (fault_mode == RDMA_TEST_QUEUE_CREATE_FAULT_HANDLE_CLONE_NULL &&
+           control_result.resource_h == null)) begin
+        first_failure = rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          {evidence_kind, " injection changed the wrong result evidence"});
+        disable evidence_rollback_flow;
+      end
+      if (canonical_h == null || mapping == null) begin
+        first_failure = rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "create evidence observation is incomplete");
+        disable evidence_rollback_flow;
+      end
+
+      // 中文设计：期望值来自 manager 的公开 lookup、proxy 成功 release 账本
+      // 与 mapping completion，均独立于 wrapper 返回的错误 status/fake resource。
+      snapshot = null;
+      lookup_status = fixture.manager.lookup(canonical_h, snapshot);
+      release_complete = 1'b0;
+      completion_status = mapping.release_completion_status(release_complete);
+      if (lookup_status == null ||
+          lookup_status.code != RDMA_SC_INVALID_STATE ||
+          snapshot != null ||
+          release_success_count(proxy, mapping) != releases_before + 1 ||
+          completion_status == null || !completion_status.ok() ||
+          !release_complete)
+        first_failure = rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          {evidence_kind,
+           " left canonical queue or mapping active"});
+    end
+
+    // 中文设计：若断言观察到 ACTIVE canonical queue，只通过 accepted lifecycle
+    // helper 恢复一次；正常 rollback 已在 wrapper 内消费 authority，lookup 返回
+    // INVALID_STATE，此处不会发起第二次 destroy。
+    snapshot = null;
+    lookup_status = fixture == null || fixture.manager == null ||
+                    canonical_h == null ? null :
+      fixture.manager.lookup(canonical_h, snapshot);
+    if (lookup_status != null && lookup_status.ok()) begin
+      fixture.destroy_lifecycle_owned_queue(
+        canonical_h, 1'b1, 1'b0, transaction_id + 2, cleanup_status);
+      retain_failure("create evidence recovery destroy", cleanup_status,
+                     first_failure);
+    end
+    cleanup_fixture(fixture, cleanup_status);
+    retain_failure("create evidence fixture cleanup", cleanup_status,
+                   first_failure);
+    status = first_failure == null ? rdma_status::success() : first_failure;
   endtask
 
   // 功能：test_partial_create_cleanup_contract 在真实 CQ create 后注入错误动态
@@ -867,7 +1126,8 @@ class rdma_queue_data_engine_host_mem_test extends uvm_test;
         fixture.ceq.handle, "partial create CEQ");
       request.ring_backing.mode = RDMA_QUEUE_BACKING_OWNED;
       create_queue_for_test(
-        "partial_create", fixture, request, 64'hd201, 1'b1,
+        "partial_create", fixture, request, 64'hd201, 64'hd204,
+        RDMA_TEST_QUEUE_CREATE_FAULT_WRONG_CALLER_TYPE,
         exposed_resource, created_h, control_result, step);
       retain_failure("partial create injected result", step, first_failure);
       if (first_failure != null || exposed_resource == null ||
@@ -925,7 +1185,7 @@ class rdma_queue_data_engine_host_mem_test extends uvm_test;
           first_failure);
     end
 
-    // 中文设计：RED 或任一前置失败若仍留下 canonical handle，只按该
+    // 中文设计：故障断言或任一前置失败若仍留下 canonical handle，只按该
     // detached handle 恢复一次；fake exposed_resource 从未登记，禁止销毁。
     authoritative_resource = null;
     lookup_status = fixture == null || fixture.manager == null ||
@@ -1372,7 +1632,9 @@ class rdma_queue_data_engine_host_mem_test extends uvm_test;
       request.ring_backing.mode = RDMA_QUEUE_BACKING_OWNED;
       create_queue_for_test(
         {label, " first source"}, fixture, request,
-        64'ha100 + cqe_size, 1'b0, resource, source_first_h,
+        64'ha100 + cqe_size, 64'hf100_0000_0000_0000 + cqe_size,
+        RDMA_TEST_QUEUE_CREATE_FAULT_NONE,
+        resource, source_first_h,
         control_result, step);
       retain_failure("first source CQ create", step, first_failure);
       if (first_failure == null &&
@@ -1409,7 +1671,9 @@ class rdma_queue_data_engine_host_mem_test extends uvm_test;
       request.ring_backing.mode = RDMA_QUEUE_BACKING_OWNED;
       create_queue_for_test(
         {label, " second source"}, fixture, request,
-        64'ha200 + cqe_size, 1'b0, resource, source_second_h,
+        64'ha200 + cqe_size, 64'hf200_0000_0000_0000 + cqe_size,
+        RDMA_TEST_QUEUE_CREATE_FAULT_NONE,
+        resource, source_second_h,
         control_result, step);
       retain_failure("second source CQ create", step, first_failure);
       if (first_failure == null &&
@@ -1466,7 +1730,9 @@ class rdma_queue_data_engine_host_mem_test extends uvm_test;
       request.ring_backing.slices.push_back(slice);
       create_queue_for_test(
         {label, " target"}, fixture, request,
-        64'ha300 + cqe_size, 1'b0, resource, target_cq_h,
+        64'ha300 + cqe_size, 64'hf300_0000_0000_0000 + cqe_size,
+        RDMA_TEST_QUEUE_CREATE_FAULT_NONE,
+        resource, target_cq_h,
         control_result, step);
       retain_failure("segmented target CQ create", step, first_failure);
       if (first_failure == null &&
@@ -2052,9 +2318,9 @@ class rdma_queue_data_engine_host_mem_test extends uvm_test;
   endtask
 
   // 功能：test_real_host_mem_device_publish_and_release 建立单一真实 host_mem
-  //   manager/adapter/proxy 生命周期，依次验证畸形后端输出、partial-create
-  //   canonical cleanup、opaque release、三种 segmented CQ stride、CEQE/AEQE
-  //   与最终零活动分配。
+  //   manager/adapter/proxy 生命周期，依次验证畸形后端输出、create 证据缺失
+  //   rollback、partial-create canonical cleanup、opaque release、三种 segmented
+  //   CQ stride、CEQE/AEQE 与最终零活动分配。
   // 输入/输出及副作用：无显式输入/输出；task 创建并借用一个外部
   //   manager，通过 UVM report 发布行为和数字泄漏断言。
   // 失败/边界：任一状态为 null/non-OK 或 leak_count 非零时报错；
@@ -2082,6 +2348,18 @@ class rdma_queue_data_engine_host_mem_test extends uvm_test;
     if (status == null || !status.ok())
       `uvm_error("PROXY_OUTPUT", status == null ? "null status" :
                  status.convert2string())
+    test_create_evidence_rollback_contract(
+      proxy, RDMA_TEST_QUEUE_CREATE_FAULT_RESULT_HANDLE_MISSING,
+      "missing_result_handle", 64'hd301, status);
+    if (status == null || !status.ok())
+      `uvm_error("CREATE_RESULT_HANDLE_ROLLBACK",
+                 status == null ? "null status" : status.convert2string())
+    test_create_evidence_rollback_contract(
+      proxy, RDMA_TEST_QUEUE_CREATE_FAULT_HANDLE_CLONE_NULL,
+      "null_handle_clone", 64'hd401, status);
+    if (status == null || !status.ok())
+      `uvm_error("CREATE_HANDLE_CLONE_ROLLBACK",
+                 status == null ? "null status" : status.convert2string())
     test_partial_create_cleanup_contract(proxy, status);
     if (status == null || !status.ok())
       `uvm_error("PARTIAL_CREATE", status == null ? "null status" :
