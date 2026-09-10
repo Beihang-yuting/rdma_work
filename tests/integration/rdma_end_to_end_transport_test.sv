@@ -3,8 +3,9 @@
 // 依赖：复用 rdma_end_to_end_dual_env_test 的双 Function fixture、queue-data
 //   engine、host-memory adapter 与 net_packet sink；并为每个 Function 装配一个
 //   rdma_env 组合对象，验证组合层与数据面使用同一份 identity/binding 快照。
-// 所有权与生命周期：测试仅拥有本地 fixture 和 mapping；每个事务完成后由
-//   基类 cleanup_env 按 mapping→QP/CQ/CEQ 顺序释放，manager 负责最终 leak check。
+// 所有权与生命周期：测试拥有本地 fixture 和 mapping；组合 engine 只借用
+//   fixture 的 CQ/QP，清理时先撤销其 attachment，再由基类 cleanup_env 按
+//   mapping→QP/CQ/CEQ/AEQ→PD→Function 释放并执行最终 leak check。
 
 // 中文设计说明：传输矩阵共用一套已隔离的 TX/RX Function，按独立 WR ID
 // 顺序推进 SQ/RQ/CQ ring。UD 只允许 SEND，RC 支持 SEND/WRITE/READ/ATOMIC，
@@ -37,6 +38,14 @@ class rdma_end_to_end_transport_test extends rdma_end_to_end_dual_env_test;
   rdma_env rx_composition_env;
   rdma_env_config tx_composition_cfg;
   rdma_env_config rx_composition_cfg;
+  bit tx_composition_cq_attached;
+  bit tx_composition_rc_attached;
+  bit tx_composition_ud_attached;
+  bit tx_composition_urc_attached;
+  bit rx_composition_cq_attached;
+  bit rx_composition_rc_attached;
+  bit rx_composition_ud_attached;
+  bit rx_composition_urc_attached;
 
   // 功能：构造 transport E2E 测试并清零事务计数器。
   // 输入/输出及副作用：name、parent（输入）；调用父类构造，不取得外部资源。
@@ -51,6 +60,14 @@ class rdma_end_to_end_transport_test extends rdma_end_to_end_dual_env_test;
     rx_composition_env = null;
     tx_composition_cfg = null;
     rx_composition_cfg = null;
+    tx_composition_cq_attached = 1'b0;
+    tx_composition_rc_attached = 1'b0;
+    tx_composition_ud_attached = 1'b0;
+    tx_composition_urc_attached = 1'b0;
+    rx_composition_cq_attached = 1'b0;
+    rx_composition_rc_attached = 1'b0;
+    rx_composition_ud_attached = 1'b0;
+    rx_composition_urc_attached = 1'b0;
   endfunction
 
   // 功能：在 UVM build 阶段创建两个纯组合 rdma_env，并注入已启用但可选的
@@ -129,8 +146,8 @@ class rdma_end_to_end_transport_test extends rdma_end_to_end_dual_env_test;
     status = rx_composition_env.configure(rx_composition_cfg);
     if (status == null || !status.ok()) return;
     // 让组合层自己的 queue-data engine 绑定 fixture 已创建的真实资源；后续
-    // sequence 只通过 rdma_env 语义入口提交/轮询，fixture 仅提供资源创建和
-    // CQE backing 写入辅助，不再旁路数据面 engine。
+    // sequence 只通过 rdma_env 语义入口提交/轮询，fixture 仅创建并持有
+    // lifecycle 资源，正向 CQE 必须由组合 engine 的公开 publish 路径生成。
     status = tx_composition_env.bind_data_path(
       tx_env.manager, tx_env.binding, tx_env.mem, tx_env.scheduler,
       tx_env.registry, 2us);
@@ -142,27 +159,107 @@ class rdma_end_to_end_transport_test extends rdma_end_to_end_dual_env_test;
     status = tx_composition_env.queue_data.attach_cq(
       tx_env.cq.handle, RDMA_TRANSPORT_RC);
     if (status == null || !status.ok()) return;
+    tx_composition_cq_attached = 1'b1;
     status = tx_composition_env.queue_data.attach_qp(tx_env.qp.handle);
     if (status == null || !status.ok()) return;
+    tx_composition_rc_attached = 1'b1;
     status = tx_composition_env.queue_data.attach_qp(tx_env.ud_qp.handle);
     if (status == null || !status.ok()) return;
+    tx_composition_ud_attached = 1'b1;
     status = tx_composition_env.queue_data.attach_qp(tx_env.urc_qp.handle);
     if (status == null || !status.ok()) return;
+    tx_composition_urc_attached = 1'b1;
     status = rx_composition_env.queue_data.attach_cq(
       rx_env.cq.handle, RDMA_TRANSPORT_RC);
     if (status == null || !status.ok()) return;
+    rx_composition_cq_attached = 1'b1;
     status = rx_composition_env.queue_data.attach_qp(rx_env.qp.handle);
     if (status == null || !status.ok()) return;
+    rx_composition_rc_attached = 1'b1;
     status = rx_composition_env.queue_data.attach_qp(rx_env.ud_qp.handle);
     if (status == null || !status.ok()) return;
+    rx_composition_ud_attached = 1'b1;
     status = rx_composition_env.queue_data.attach_qp(rx_env.urc_qp.handle);
     if (status == null || !status.ok()) return;
+    rx_composition_urc_attached = 1'b1;
     if (tx_composition_env.function_identity_snapshot == null ||
         rx_composition_env.function_identity_snapshot == null ||
         !tx_composition_env.function_identity_snapshot.same_incarnation(tx_identity) ||
         !rx_composition_env.function_identity_snapshot.same_incarnation(rx_identity))
       status = rdma_status::make(RDMA_SC_INVALID_STATE,
                                  "rdma_env Function snapshot mismatch");
+  endtask
+
+  // 功能：detach_composition_resource 撤销一个由 composition queue-data engine
+  //   借用的 CQ/QP attachment，并同步清除调用方记录的 attached 标志。
+  // 输入/输出及副作用：env、resource_h、label 为输入，attached 与 first_failure
+  //   为 inout；成功只删除 composition 本地 runtime/route，不释放 manager resource。
+  // 失败/边界：未 attach 时幂等返回；env/engine/handle 缺失或 detach 拒绝时保留
+  //   attached 并记录首错，调用方仍须继续撤销其它独立 attachment。
+  task automatic detach_composition_resource(
+    input rdma_env env,
+    input rdma_handle resource_h,
+    input string label,
+    inout bit attached,
+    inout rdma_status first_failure
+  );
+    rdma_status stage_status;
+
+    if (!attached) return;
+    stage_status = env == null || env.queue_data == null || resource_h == null ?
+      null : env.queue_data.detach(resource_h);
+    if (stage_status == null)
+      stage_status = rdma_status::make(
+        RDMA_SC_INVALID_STATE, {label, " detach returned null status"});
+    else if (!stage_status.ok())
+      stage_status = rdma_status::make(
+        stage_status.code, {label, " detach: ", stage_status.message});
+    if (!stage_status.ok() && first_failure == null)
+      first_failure = stage_status;
+    if (stage_status.ok()) attached = 1'b0;
+  endtask
+
+  // 功能：cleanup_composition_data_paths 在 lifecycle fixture 销毁前撤销 TX/RX
+  //   composition engine 对 URC/UD/RC QP 和 CQ 的全部非拥有引用。
+  // 输入/输出及副作用：status 为输出；按每端 QP→CQ 顺序调用 detach 并保留首错，
+  //   不释放 queue backing、payload mapping 或 Function 资源。
+  // 失败/边界：支持 partial configure 与重复 cleanup；单项失败不阻断后续端点，
+  //   失败 attachment 标志保持为一，便于诊断或显式重试。
+  task automatic cleanup_composition_data_paths(output rdma_status status);
+    rdma_status first_failure;
+
+    first_failure = null;
+    detach_composition_resource(
+      tx_composition_env, tx_env == null || tx_env.urc_qp == null ? null :
+      tx_env.urc_qp.handle, "TX URC QP", tx_composition_urc_attached,
+      first_failure);
+    detach_composition_resource(
+      tx_composition_env, tx_env == null || tx_env.ud_qp == null ? null :
+      tx_env.ud_qp.handle, "TX UD QP", tx_composition_ud_attached,
+      first_failure);
+    detach_composition_resource(
+      tx_composition_env, tx_env == null || tx_env.qp == null ? null :
+      tx_env.qp.handle, "TX RC QP", tx_composition_rc_attached,
+      first_failure);
+    detach_composition_resource(
+      tx_composition_env, tx_env == null || tx_env.cq == null ? null :
+      tx_env.cq.handle, "TX CQ", tx_composition_cq_attached, first_failure);
+    detach_composition_resource(
+      rx_composition_env, rx_env == null || rx_env.urc_qp == null ? null :
+      rx_env.urc_qp.handle, "RX URC QP", rx_composition_urc_attached,
+      first_failure);
+    detach_composition_resource(
+      rx_composition_env, rx_env == null || rx_env.ud_qp == null ? null :
+      rx_env.ud_qp.handle, "RX UD QP", rx_composition_ud_attached,
+      first_failure);
+    detach_composition_resource(
+      rx_composition_env, rx_env == null || rx_env.qp == null ? null :
+      rx_env.qp.handle, "RX RC QP", rx_composition_rc_attached,
+      first_failure);
+    detach_composition_resource(
+      rx_composition_env, rx_env == null || rx_env.cq == null ? null :
+      rx_env.cq.handle, "RX CQ", rx_composition_cq_attached, first_failure);
+    status = first_failure == null ? rdma_status::success() : first_failure;
   endtask
 
   // 功能：按 transport 选择发送端 fixture 中已创建的匹配 QP。
@@ -601,6 +698,8 @@ class rdma_end_to_end_transport_test extends rdma_end_to_end_dual_env_test;
     rdma_function_identity tx_event_identity;
     rdma_function_identity rx_event_identity;
     rdma_hw_cqe_model cqe;
+    rdma_queue_device_publish_result published;
+    bit cq_polarity;
     int unsigned before_rq_pi;
     rdma_qp tx_qp;
     rdma_qp rx_qp;
@@ -1022,21 +1121,31 @@ class rdma_end_to_end_transport_test extends rdma_end_to_end_dual_env_test;
         end
       end
     end
-    // 发送 CQE 只写入 backing，统一由 wait_transport_completion 消费并校验 CI。
-    // make_cqe 的 cq_slot 参数必须使用绝对序号，内部据此计算 ring wrap
-    //   后的 owner polarity；写入 backing 时再单独取 modulo 槽位。
-    cqe = make_cqe(tx_qp, posted, 1'b0, case_counter,
-                   tx_cq_slot);
+    // 中文设计：发送 completion 必须由实际持有 SQ/CQ runtime 的组合 engine
+    // 查询 polarity 并公开 publish；fixture 只拥有 lifecycle 资源，不能旁路写 backing。
+    local_status = tx_composition_env.queue_data.query_runtime_producer_polarity(
+      tx_env.cq.handle, RDMA_QUEUE_RUNTIME_CQ, cq_polarity);
+    if (local_status == null || !local_status.ok()) begin
+      status = failure_status(local_status, RDMA_SC_INVALID_STATE,
+                              "TX CQ polarity query failed");
+      return;
+    end
+    cqe = make_cqe(tx_qp, posted, 1'b0, case_counter, cq_polarity);
     cqe.wr_id = wr_id;
     cqe.opcode = opcode;
     cqe.byte_len = opcode == RDMA_WR_RDMA_READ ? PAYLOAD_BYTES :
                    ((opcode inside {RDMA_WR_ATOMIC_CMP_SWAP,
                                      RDMA_WR_ATOMIC_FETCH_ADD}) ? 8 :
                     PAYLOAD_BYTES);
-    local_status = tx_env.write_cq_entry(tx_cq_slot % CQ_DEPTH, cqe);
-    if (local_status == null || !local_status.ok()) begin
-      status = failure_status(local_status, RDMA_SC_DMA_TRANSLATION,
-                              "TX CQE write failed");
+    published = null;
+    tx_composition_env.queue_data.publish_cqe(
+      tx_env.cq.handle, cqe, published, local_status);
+    if (local_status == null || !local_status.ok() || published == null ||
+        published.index != tx_cq_slot % CQ_DEPTH ||
+        published.wrap != bit'(tx_cq_slot / CQ_DEPTH) ||
+        !published.occupancy_valid || published.occupancy != 1) begin
+      status = failure_status(local_status, RDMA_SC_INVALID_STATE,
+                              "TX CQE public publish failed");
       return;
     end
     wait_transport_completion(transport, wr_id, posted.index, posted.wrap,
@@ -1053,17 +1162,28 @@ class rdma_end_to_end_transport_test extends rdma_end_to_end_dual_env_test;
     end
     tx_cq_slot++;
     if (needs_receive_wqe) begin
-      // SEND/WRITE 的接收方向独立写入 CQE 并轮询，验证 RQ/CQ consumer 与
-      // credit 释放；READ/ATOMIC 由 responder response 完成，不消费 RQ。
-      cqe = make_cqe(rx_qp, recv_posted, 1'b1, case_counter,
-                     rx_cq_slot);
+      // SEND/WRITE 的接收方向独立查询自身 CQ polarity、公开 publish 并轮询；
+      // TX polarity 不得复用于 RX，READ/ATOMIC response 不消费 RQ。
+      local_status = rx_composition_env.queue_data.query_runtime_producer_polarity(
+        rx_env.cq.handle, RDMA_QUEUE_RUNTIME_CQ, cq_polarity);
+      if (local_status == null || !local_status.ok()) begin
+        status = failure_status(local_status, RDMA_SC_INVALID_STATE,
+                                "RX CQ polarity query failed");
+        return;
+      end
+      cqe = make_cqe(rx_qp, recv_posted, 1'b1, case_counter, cq_polarity);
       cqe.wr_id = recv_posted.wr_id;
       cqe.opcode = RDMA_WR_RECV;
       cqe.byte_len = PAYLOAD_BYTES;
-      local_status = rx_env.write_cq_entry(rx_cq_slot % CQ_DEPTH, cqe);
-      if (local_status == null || !local_status.ok()) begin
-        status = failure_status(local_status, RDMA_SC_DMA_TRANSLATION,
-                                "RX CQE write failed");
+      published = null;
+      rx_composition_env.queue_data.publish_cqe(
+        rx_env.cq.handle, cqe, published, local_status);
+      if (local_status == null || !local_status.ok() || published == null ||
+          published.index != rx_cq_slot % CQ_DEPTH ||
+          published.wrap != bit'(rx_cq_slot / CQ_DEPTH) ||
+          !published.occupancy_valid || published.occupancy != 1) begin
+        status = failure_status(local_status, RDMA_SC_INVALID_STATE,
+                                "RX CQE public publish failed");
         return;
       end
       begin
@@ -1249,6 +1369,10 @@ class rdma_end_to_end_transport_test extends rdma_end_to_end_dual_env_test;
     end
     else `uvm_error("E2E_SETUP", status == null ? "null setup status" : status.convert2string());
     drain_composition_pending();
+    cleanup_composition_data_paths(status);
+    if (status == null || !status.ok())
+      `uvm_error("E2E_COMPOSITION_CLEANUP",
+                 status == null ? "null cleanup status" : status.convert2string())
     cleanup_env("tx_transport", tx_env, tx_host_adapter, tx_payload_mapping);
     cleanup_env("rx_transport", rx_env, rx_host_adapter, rx_payload_mapping);
     if (tx_host_mem != null) tx_host_mem.leak_check(`__FILE__, `__LINE__);

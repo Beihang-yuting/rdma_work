@@ -1740,6 +1740,728 @@ class rdma_queue_data_engine_device_publish_test extends uvm_test;
                                      entry_size, bytes);
   endtask
 
+  // 功能：test_runtime_full_and_credit 对指定 CQ/CEQ/AEQ runtime 连续填满，
+  //   验证第 depth+1 次 reservation 失败原子性，poll 一项后复用该 credit，
+  //   并在保持满环的条件下完成两个完整 producer/consumer wrap。
+  // 输入/输出及副作用：kind、queue_h、depth 为输入；task 独占新建 runtime，
+  //   通过公开 reserve/commit/query/peek 接口更新本地账本，不访问 Host-memory；
+  //   所有已提交 cursor 与 occupancy 都保存于 task 内 model 数组。
+  // 失败边界：null handle、depth 非大于一的二次幂、任一状态/快照不符均报告
+  //   UVM_ERROR 并停止该 profile；QUEUE_FULL 不得改变 PI/CI、used/available、
+  //   reservation 或 pending presence，也不得遗留调用方可提交的 cursor。
+  task automatic test_runtime_full_and_credit(
+    rdma_queue_runtime_kind_e kind,
+    rdma_handle queue_h,
+    int unsigned depth
+  );
+    rdma_queue_runtime runtime;
+    rdma_queue_cursor_snapshot reservation, consumer;
+    rdma_queue_cursor_snapshot reservation_before, reservation_after;
+    rdma_status status;
+    int unsigned used_before, used_after, available_before, available_after;
+    int unsigned pi_before, pi_after, ci_before, ci_after;
+    bit pw_before, pw_after, cw_before, cw_after;
+    bit reservation_valid_before, reservation_valid_after;
+    bit pending_before, pending_after;
+    int unsigned published_index[];
+    bit published_wrap[];
+    int unsigned published_occupancy[];
+    int unsigned expected_index;
+    bit expected_wrap;
+    int unsigned sample;
+
+    if (queue_h == null || depth inside {0, 1} ||
+        (depth & (depth - 1)) != 0) begin
+      `uvm_error("RUNTIME_FULL_ARGUMENT",
+                 "runtime profile requires a queue and power-of-two depth")
+      return;
+    end
+    runtime = rdma_queue_runtime::type_id::create(
+      $sformatf("runtime_full_credit_%0d_%0d", kind, depth));
+    if (runtime == null) begin
+      `uvm_error("RUNTIME_FULL_FACTORY", "runtime allocation failed")
+      return;
+    end
+    status = runtime.configure(queue_h, kind, depth, 0, 1'b0,
+                               0, 1'b0, 1'b0);
+    if (status == null || !status.ok()) begin
+      `uvm_error("RUNTIME_FULL_CONFIGURE", status == null ?
+                 "runtime configure returned null" : status.convert2string())
+      return;
+    end
+    status = runtime.activate();
+    if (status == null || !status.ok()) begin
+      `uvm_error("RUNTIME_FULL_ACTIVATE", status == null ?
+                 "runtime activate returned null" : status.convert2string())
+      return;
+    end
+
+    published_index = new[depth + 1 + 2 * depth];
+    published_wrap = new[depth + 1 + 2 * depth];
+    published_occupancy = new[depth + 1 + 2 * depth];
+    sample = 0;
+    // 中文设计：首次填充不提交 consumer，确保每个 kind 都真实到达 full；
+    // reserve 后检查公开 reservation presence，commit 后保存 committed occupancy。
+    for (int unsigned n = 0; n < depth; n++) begin
+      reservation = null;
+      status = runtime.reserve_device_producer(reservation);
+      if (status == null || !status.ok() || reservation == null ||
+          reservation.index != n || reservation.wrap) begin
+        `uvm_error("RUNTIME_FILL_RESERVE",
+                   $sformatf("kind=%0d depth=%0d fill=%0d cursor mismatch",
+                             kind, depth, n))
+        return;
+      end
+      reservation_valid_before = 1'b0;
+      reservation_before = null;
+      status = runtime.query_device_reservation(
+        reservation_valid_before, reservation_before);
+      if (status == null || !status.ok() || !reservation_valid_before ||
+          reservation_before == null ||
+          reservation_before.index != reservation.index ||
+          reservation_before.wrap != reservation.wrap) begin
+        `uvm_error("RUNTIME_FILL_RESERVATION",
+                   "public reservation query did not return reserved cursor")
+        return;
+      end
+      status = runtime.commit_device_producer(reservation);
+      if (status == null || !status.ok()) begin
+        `uvm_error("RUNTIME_FILL_COMMIT", status == null ?
+                   "device commit returned null" : status.convert2string())
+        return;
+      end
+      status = runtime.query_occupancy(published_occupancy[sample]);
+      if (status == null || !status.ok() ||
+          published_occupancy[sample] != n + 1) begin
+        `uvm_error("RUNTIME_FILL_OCCUPANCY",
+                   "fill occupancy differs from committed model count")
+        return;
+      end
+      published_index[sample] = reservation.index;
+      published_wrap[sample] = reservation.wrap;
+      sample++;
+    end
+
+    status = runtime.query_occupancy(used_before);
+    if (status == null || !status.ok() || used_before != depth) begin
+      `uvm_error("RUNTIME_FULL_OCCUPANCY", "filled ring occupancy is not depth")
+      return;
+    end
+    status = runtime.query_available(available_before);
+    if (status == null || !status.ok() || available_before != 0) begin
+      `uvm_error("RUNTIME_FULL_AVAILABLE", "filled ring exposes producer credit")
+      return;
+    end
+    pi_before = runtime.producer_index;
+    pw_before = runtime.producer_wrap;
+    ci_before = runtime.consumer_index;
+    cw_before = runtime.consumer_wrap;
+    reservation_valid_before = 1'b1;
+    reservation_before = null;
+    status = runtime.query_device_reservation(
+      reservation_valid_before, reservation_before);
+    if (status == null || !status.ok() || reservation_valid_before ||
+        reservation_before != null) begin
+      `uvm_error("RUNTIME_FULL_RESERVATION_BEFORE",
+                 "full committed ring retained a device reservation")
+      return;
+    end
+    pending_before = 1'b1;
+    status = runtime.query_has_pending(pending_before);
+    if (status == null || !status.ok() || pending_before) begin
+      `uvm_error("RUNTIME_FULL_PENDING_BEFORE",
+                 "full committed ring retained pending evidence")
+      return;
+    end
+    reservation = rdma_queue_cursor_snapshot::type_id::create(
+      "runtime_full_output_sentinel");
+    status = runtime.reserve_device_producer(reservation);
+    if (status == null || status.code != RDMA_SC_QUEUE_FULL ||
+        reservation != null)
+      `uvm_error("RUNTIME_FULL", "full ring accepted an additional reservation")
+    status = runtime.query_occupancy(used_after);
+    if (status == null || !status.ok()) begin
+      `uvm_error("RUNTIME_FULL_QUERY", "post-full occupancy query failed")
+      return;
+    end
+    status = runtime.query_available(available_after);
+    if (status == null || !status.ok()) begin
+      `uvm_error("RUNTIME_FULL_QUERY", "post-full available query failed")
+      return;
+    end
+    pi_after = runtime.producer_index;
+    pw_after = runtime.producer_wrap;
+    ci_after = runtime.consumer_index;
+    cw_after = runtime.consumer_wrap;
+    reservation_valid_after = 1'b1;
+    reservation_after = null;
+    status = runtime.query_device_reservation(
+      reservation_valid_after, reservation_after);
+    pending_after = 1'b1;
+    status = runtime.query_has_pending(pending_after);
+    if (status == null || !status.ok() || reservation_valid_after ||
+        reservation_after != null || pending_before || pending_after ||
+        used_after != used_before ||
+        available_after != available_before || pi_after != pi_before ||
+        pw_after != pw_before || ci_after != ci_before ||
+        cw_after != cw_before) begin
+      `uvm_error("RUNTIME_FULL_STATE",
+                 "QUEUE_FULL changed cursor, credit, reservation, or pending state")
+      return;
+    end
+
+    // 中文设计：只消费一个 CI 后必须恰好复用 slot 0/wrap 1；后续每轮先
+    // consume 再 publish，使 occupancy 恒为 depth 并完成两次完整回卷。
+    status = runtime.peek_consumer(consumer);
+    if (status == null || !status.ok() || consumer == null ||
+        consumer.index != 0 || consumer.wrap) begin
+      `uvm_error("RUNTIME_CREDIT_PEEK", "first consumer cursor is not slot zero")
+      return;
+    end
+    status = runtime.commit_consumer(consumer);
+    if (status == null || !status.ok()) begin
+      `uvm_error("RUNTIME_CREDIT_CONSUME", "consumer did not release one credit")
+      return;
+    end
+    status = runtime.query_available(available_after);
+    if (status == null || !status.ok() || available_after != 1) begin
+      `uvm_error("RUNTIME_CREDIT_AVAILABLE", "poll-one did not return one credit")
+      return;
+    end
+    reservation = null;
+    status = runtime.reserve_device_producer(reservation);
+    if (status == null || !status.ok() || reservation == null ||
+        reservation.index != 0 || !reservation.wrap) begin
+      `uvm_error("RUNTIME_CREDIT", "CI did not return wrapped slot-zero credit")
+      return;
+    end
+    status = runtime.commit_device_producer(reservation);
+    if (status == null || !status.ok()) begin
+      `uvm_error("RUNTIME_CREDIT_COMMIT", "reused credit did not commit")
+      return;
+    end
+    published_index[sample] = reservation.index;
+    published_wrap[sample] = reservation.wrap;
+    status = runtime.query_occupancy(published_occupancy[sample]);
+    if (status == null || !status.ok() ||
+        published_occupancy[sample] != depth) begin
+      `uvm_error("RUNTIME_CREDIT_OCCUPANCY", "slot reuse did not refill ring")
+      return;
+    end
+    sample++;
+
+    expected_index = 1;
+    expected_wrap = 1'b0;
+    for (int unsigned n = 0; n < 2 * depth; n++) begin
+      status = runtime.peek_consumer(consumer);
+      if (status == null || !status.ok() || consumer == null ||
+          consumer.index != expected_index || consumer.wrap != expected_wrap) begin
+        `uvm_error("RUNTIME_WRAP_CONSUMER",
+                   $sformatf("kind=%0d depth=%0d step=%0d consumer mismatch",
+                             kind, depth, n))
+        return;
+      end
+      status = runtime.commit_consumer(consumer);
+      if (status == null || !status.ok()) begin
+        `uvm_error("RUNTIME_WRAP_CONSUME", "wrap consumer commit failed")
+        return;
+      end
+      reservation = null;
+      status = runtime.reserve_device_producer(reservation);
+      if (status == null || !status.ok() || reservation == null ||
+          reservation.index != expected_index ||
+          reservation.wrap == expected_wrap) begin
+        `uvm_error("RUNTIME_WRAP_PRODUCER",
+                   $sformatf("kind=%0d depth=%0d step=%0d producer mismatch",
+                             kind, depth, n))
+        return;
+      end
+      status = runtime.commit_device_producer(reservation);
+      if (status == null || !status.ok()) begin
+        `uvm_error("RUNTIME_WRAP_COMMIT", "wrap producer commit failed")
+        return;
+      end
+      published_index[sample] = reservation.index;
+      published_wrap[sample] = reservation.wrap;
+      status = runtime.query_occupancy(published_occupancy[sample]);
+      if (status == null || !status.ok() ||
+          published_occupancy[sample] != depth) begin
+        `uvm_error("RUNTIME_WRAP_OCCUPANCY",
+                   "consume/publish rotation changed full occupancy")
+        return;
+      end
+      sample++;
+      expected_index++;
+      if (expected_index == depth) begin
+        expected_index = 0;
+        expected_wrap = ~expected_wrap;
+      end
+    end
+    status = runtime.query_available(available_after);
+    if (status == null || !status.ok() || available_after != 0 ||
+        sample != depth + 1 + 2 * depth)
+      `uvm_error("RUNTIME_WRAP_FINAL",
+                 "two-wrap profile did not preserve full credit accounting")
+  endtask
+
+  // 功能：check_runtime_full_credit_matrix 对三种 device ring 分别执行 depth
+  //   2/4 的统一 full、credit reuse 与两整圈 wrap characterization。
+  // 输入/输出及副作用：无显式输入输出；创建六个不登记到 lifecycle manager 的
+  //   handle 值，每个 handle 仅由对应本地 runtime profile 借用。
+  // 失败边界：handle factory 返回 null 时被调 task 报错；本 task 不放宽 CQ
+  //   lifecycle 最小深度，也不把 runtime-only identity 交给 engine。
+  task automatic check_runtime_full_credit_matrix();
+    rdma_handle queue_h;
+    rdma_resource_kind_e resource_kind;
+    rdma_queue_runtime_kind_e runtime_kind;
+    int unsigned depth;
+
+    for (int unsigned kind_offset = 0; kind_offset < 3; kind_offset++) begin
+      resource_kind = (kind_offset == 0) ? RDMA_RESOURCE_CQ :
+                      ((kind_offset == 1) ? RDMA_RESOURCE_CEQ :
+                                            RDMA_RESOURCE_AEQ);
+      runtime_kind = (kind_offset == 0) ? RDMA_QUEUE_RUNTIME_CQ :
+                     ((kind_offset == 1) ? RDMA_QUEUE_RUNTIME_CEQ :
+                                           RDMA_QUEUE_RUNTIME_AEQ);
+      for (int unsigned depth_selector = 0; depth_selector < 2;
+           depth_selector++) begin
+        depth = depth_selector == 0 ? 2 : 4;
+        queue_h = rdma_handle::type_id::create(
+          $sformatf("runtime_only_%0d_%0d", kind_offset, depth));
+        if (queue_h != null) begin
+          queue_h.kind = resource_kind;
+          queue_h.function_uid = 64'h9000_0000_0000_0009;
+          queue_h.object_id = 32'h900 + kind_offset * 16 + depth_selector;
+          queue_h.generation = 9;
+        end
+        test_runtime_full_and_credit(runtime_kind, queue_h, depth);
+      end
+    end
+  endtask
+
+  // 功能：publish_small_event_entry 为小深度 lifecycle CEQ/AEQ 构造一个合法
+  //   event model，并只经公开 device-producer API 完成 reserve/write/commit。
+  // 输入/输出及副作用：fixture、kind、event_qp 为输入，published/status 为输出；
+  //   CEQE 绑定 fixture CQ/QP route，AEQE 绑定非零 local_qp_id 的 event_qp，
+  //   成功会写对应 backing 并推进 PI/used。
+  // 失败边界：fixture/queue/QP、AEQ 的零 QPN、polarity、model/handle 构造或 publish 失败时
+  //   published 保持 null；pending/reservation 由 engine 保留并由调用方 cleanup。
+  task automatic publish_small_event_entry(
+    rdma_queue_data_engine_fixture fixture,
+    rdma_queue_runtime_kind_e kind,
+    rdma_qp event_qp,
+    output rdma_queue_device_publish_result published,
+    output rdma_status status
+  );
+    rdma_hw_ceqe_model ceqe;
+    rdma_hw_aeqe_model aeqe;
+    rdma_status model_status;
+    bit polarity;
+
+    published = null;
+    status = rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "small event fixture is incomplete");
+    if (fixture == null || fixture.engine == null || fixture.cq == null ||
+        fixture.qp == null || fixture.qp.handle == null) return;
+    case (kind)
+      RDMA_QUEUE_RUNTIME_CEQ: begin
+        if (fixture.ceq == null || fixture.ceq.handle == null) return;
+        status = fixture.engine.query_runtime_producer_polarity(
+          fixture.ceq.handle, kind, polarity);
+        if (status == null || !status.ok()) return;
+        make_ceqe_from_committed_cq(
+          fixture.engine, fixture.cq.handle, fixture.cq.local_cq_id,
+          fixture.qp.local_qp_id, polarity, ceqe, model_status);
+        if (model_status == null || !model_status.ok() || ceqe == null) begin
+          status = model_status;
+          return;
+        end
+        fixture.engine.publish_ceqe(
+          fixture.ceq.handle, ceqe, published, status);
+      end
+      RDMA_QUEUE_RUNTIME_AEQ: begin
+        if (fixture.aeq == null || fixture.aeq.handle == null ||
+            event_qp == null || event_qp.handle == null ||
+            event_qp.local_qp_id == 0) return;
+        status = fixture.engine.query_runtime_producer_polarity(
+          fixture.aeq.handle, kind, polarity);
+        if (status == null || !status.ok()) return;
+        aeqe = rdma_hw_aeqe_model::type_id::create("small_event_aeqe");
+        if (aeqe == null) begin
+          status = rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED,
+                                     "small event AEQE allocation failed");
+          return;
+        end
+        model_status = clone_test_handle_value(event_qp.handle,
+                                                aeqe.target_h);
+        if (model_status == null || !model_status.ok() ||
+            aeqe.target_h == null) begin
+          status = model_status;
+          return;
+        end
+        aeqe.qpn = event_qp.local_qp_id;
+        aeqe.valid = polarity;
+        aeqe.ecode = 0;
+        aeqe.packet_opcode = 0;
+        fixture.engine.publish_aeqe(
+          fixture.aeq.handle, aeqe, published, status);
+      end
+      default: status = rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT, "small event kind is not CEQ or AEQ");
+    endcase
+  endtask
+
+  // 功能：poll_small_event_entry 从指定 lifecycle CEQ/AEQ 只消费一项并提交 CI，
+  //   使 producer 恰好恢复一个 credit。
+  // 输入/输出及副作用：fixture、kind 为输入，status 为输出；成功推进同 kind 的
+  //   consumer cursor，不消费 CQ 或另一 event ring，也不释放 lifecycle resource。
+  // 失败边界：fixture/kind 不完整、空 ring、decode 或 consumer commit 失败时返回
+  //   原始错误；event result 为空视为 INVALID_STATE，调用方不得计为已释放 credit。
+  task automatic poll_small_event_entry(
+    rdma_queue_data_engine_fixture fixture,
+    rdma_queue_runtime_kind_e kind,
+    output rdma_status status
+  );
+    rdma_queue_event_result event_result;
+
+    event_result = null;
+    status = rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "small event poll fixture is incomplete");
+    if (fixture == null || fixture.engine == null) return;
+    case (kind)
+      RDMA_QUEUE_RUNTIME_CEQ:
+        if (fixture.ceq != null)
+          fixture.engine.poll_ceqe(fixture.ceq.handle, 0, event_result, status);
+      RDMA_QUEUE_RUNTIME_AEQ:
+        if (fixture.aeq != null)
+          fixture.engine.poll_aeqe(fixture.aeq.handle, 0, event_result, status);
+      default: status = rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT, "small event poll kind is not CEQ or AEQ");
+    endcase
+    if (status != null && status.ok() && event_result == null)
+      status = rdma_status::make(RDMA_SC_INVALID_STATE,
+                                 "small event poll returned no result");
+  endtask
+
+  // 功能：validate_small_event_publish 交叉核对一次 event publish 的 result、
+  //   producer/consumer cursor、occupancy/pending 与下一项公开 polarity query。
+  // 输入/输出及副作用：fixture、queue/kind/depth、期望 result 与 CI 为输入，status
+  //   为输出；仅查询公开 runtime 状态，不读取内部 attachment 或修改 backing。
+  // 失败边界：任一 result 字段、next PI/wrap、CI、used 或 pending 不符即返回
+  //   INVALID_STATE；polarity query 必须成功但不以固定初值替代 runtime 权威。
+  task automatic validate_small_event_publish(
+    rdma_queue_data_engine_fixture fixture,
+    rdma_queue_resource queue,
+    rdma_queue_runtime_kind_e kind,
+    int unsigned depth,
+    rdma_queue_device_publish_result published,
+    int unsigned expected_index,
+    bit expected_wrap,
+    int unsigned expected_occupancy,
+    int unsigned expected_ci,
+    bit expected_ci_wrap,
+    output rdma_status status
+  );
+    int unsigned pi;
+    int unsigned ci;
+    int unsigned used;
+    int unsigned next_index;
+    bit pi_wrap;
+    bit ci_wrap;
+    bit next_wrap;
+    bit pending;
+    bit next_polarity;
+
+    status = rdma_status::success();
+    if (fixture == null || fixture.engine == null || queue == null ||
+        queue.handle == null || published == null || depth == 0 ||
+        published.index != expected_index || published.wrap != expected_wrap ||
+        !published.occupancy_valid ||
+        published.occupancy != expected_occupancy) begin
+      status = rdma_status::make(RDMA_SC_INVALID_STATE,
+        $sformatf({"small event publish result mismatch: kind=%0d depth=%0d ",
+                   "result_null=%0b index=%0d/%0d wrap=%0b/%0b ",
+                   "occupancy_valid=%0b occupancy=%0d/%0d"},
+                  kind, depth, published == null,
+                  published == null ? 0 : published.index, expected_index,
+                  published == null ? 0 : published.wrap, expected_wrap,
+                  published == null ? 0 : published.occupancy_valid,
+                  published == null ? 0 : published.occupancy,
+                  expected_occupancy));
+      return;
+    end
+    next_index = expected_index + 1;
+    next_wrap = expected_wrap;
+    if (next_index == depth) begin
+      next_index = 0;
+      next_wrap = ~next_wrap;
+    end
+    status = fixture.engine.query_runtime_cursors(
+      queue.handle, kind, pi, pi_wrap, ci, ci_wrap);
+    if (status == null || !status.ok()) return;
+    if (pi != next_index || pi_wrap != next_wrap || ci != expected_ci ||
+        ci_wrap != expected_ci_wrap) begin
+      status = rdma_status::make(RDMA_SC_INVALID_STATE,
+                                 "small event runtime cursor mismatch");
+      return;
+    end
+    status = fixture.engine.query_runtime_occupancy(
+      queue.handle, kind, used, pending);
+    if (status == null || !status.ok()) return;
+    if (used != expected_occupancy || pending) begin
+      status = rdma_status::make(RDMA_SC_INVALID_STATE,
+                                 "small event runtime occupancy mismatch");
+      return;
+    end
+    status = fixture.engine.query_runtime_producer_polarity(
+      queue.handle, kind, next_polarity);
+  endtask
+
+  // 功能：check_small_event_lifecycle_full_credit 在真实 owned backing 上执行一个
+  //   CEQ/AEQ depth-2/4 的 fill→full→poll-one→reuse→两整圈 wrap→drain 流程。
+  // 输入/输出及副作用：kind、depth 为输入；task 创建独立完整 fixture，保存每次
+  //   publish 的 index/wrap/occupancy 并读取 full 前后 backing，最终聚合 cleanup。
+  // 失败边界：能力/setup/publish/poll/query/原子性任一不符报告 UVM_ERROR 并进入
+  //   cleanup；QUEUE_FULL 必须保持 backing/cursor/used/reservation/pending 不变。
+  task automatic check_small_event_lifecycle_full_credit(
+    rdma_queue_runtime_kind_e kind,
+    int unsigned depth
+  );
+    rdma_queue_data_engine_fixture fixture;
+    rdma_queue_resource queue;
+    rdma_qp event_qp;
+    rdma_queue_backing_role_e role;
+    rdma_queue_device_publish_result published;
+    rdma_status status;
+    rdma_status cleanup_status;
+    rdma_status event_qp_cleanup_status;
+    byte before_bytes[];
+    int unsigned before_pi;
+    int unsigned before_ci;
+    int unsigned before_used;
+    int unsigned used;
+    int unsigned expected_ci;
+    int unsigned slot_index;
+    int unsigned sample;
+    int unsigned published_index[];
+    bit published_wrap[];
+    int unsigned published_occupancy[];
+    bit before_pi_wrap;
+    bit before_ci_wrap;
+    bit pending;
+    bit polarity_before;
+    bit polarity_after;
+    bit expected_ci_wrap;
+    bit slot_consumer_wrap;
+    bit reservation_valid;
+    bit event_qp_created;
+    bit event_qp_attached;
+    rdma_queue_cursor_snapshot reservation;
+    rdma_queue_pending_operation pending_operation;
+
+    fixture = rdma_queue_data_engine_fixture::type_id::create(
+      $sformatf("small_event_%0d_%0d_fixture", kind, depth));
+    event_qp = null;
+    event_qp_created = 1'b0;
+    event_qp_attached = 1'b0;
+    begin : small_event_flow
+      if (fixture == null || !(kind inside {RDMA_QUEUE_RUNTIME_CEQ,
+                                            RDMA_QUEUE_RUNTIME_AEQ}) ||
+          !(depth inside {2, 4})) begin
+        `uvm_error("SMALL_EVENT_ARGUMENT", "small event profile is invalid")
+        disable small_event_flow;
+      end
+      fixture.setup(status, 16, RDMA_CQE_BYTES, depth, depth);
+      if (status == null || !status.ok()) begin
+        `uvm_error("SMALL_EVENT_SETUP", status == null ?
+                   "small event setup returned null" : status.convert2string())
+        disable small_event_flow;
+      end
+      event_qp = fixture.qp;
+      // AEQE 的公开 authority 契约保留 qpn=0；因此 AEQ profile 创建并 attach
+      // 第二个真实 RC QP，使事件压力覆盖合法的非零 QPN，而不是放宽 producer。
+      if (kind == RDMA_QUEUE_RUNTIME_AEQ) begin
+        fixture.create_transport_qp(
+          "small_event_aeq_qp", RDMA_TRANSPORT_RC, event_qp, status);
+        if (status == null || !status.ok() || event_qp == null ||
+            event_qp.handle == null || event_qp.local_qp_id == 0) begin
+          `uvm_error("SMALL_EVENT_QP_CREATE", status == null ?
+                     "small event QP create returned null" :
+                     status.convert2string())
+          disable small_event_flow;
+        end
+        event_qp_created = 1'b1;
+        status = fixture.engine.attach_qp(event_qp.handle);
+        if (status == null || !status.ok()) begin
+          `uvm_error("SMALL_EVENT_QP_ATTACH", status == null ?
+                     "small event QP attach returned null" :
+                     status.convert2string())
+          disable small_event_flow;
+        end
+        event_qp_attached = 1'b1;
+      end
+      queue = kind == RDMA_QUEUE_RUNTIME_CEQ ? fixture.ceq : fixture.aeq;
+      role = kind == RDMA_QUEUE_RUNTIME_CEQ ? RDMA_QUEUE_ROLE_CEQ_RING :
+                                             RDMA_QUEUE_ROLE_AEQ_RING;
+      if (queue == null || queue.depth != depth ||
+          fixture.binding.queue_caps.max_ceq_depth < depth ||
+          fixture.binding.queue_caps.max_aeq_depth < depth) begin
+        `uvm_error("SMALL_EVENT_CAPABILITY",
+                   "small event lifecycle depth/capability mismatch")
+        disable small_event_flow;
+      end
+      published_index = new[depth + 1 + 2 * depth];
+      published_wrap = new[depth + 1 + 2 * depth];
+      published_occupancy = new[depth + 1 + 2 * depth];
+      sample = 0;
+
+      // 首轮不 poll，逐项保存 public result 并证明 producer 独立填满 event ring。
+      for (int unsigned n = 0; n < depth; n++) begin
+        publish_small_event_entry(fixture, kind, event_qp, published, status);
+        validate_small_event_publish(
+          fixture, queue, kind, depth, published, n, 1'b0, n + 1,
+          0, 1'b0, status);
+        if (status == null || !status.ok()) begin
+          `uvm_error("SMALL_EVENT_FILL", status == null ?
+                     "small event fill returned null" : status.convert2string())
+          disable small_event_flow;
+        end
+        published_index[sample] = published.index;
+        published_wrap[sample] = published.wrap;
+        published_occupancy[sample] = published.occupancy;
+        sample++;
+      end
+      capture_publish_queue_state(
+        fixture, queue, kind, role, 16, before_bytes, before_pi,
+        before_pi_wrap, before_ci, before_ci_wrap, before_used, status);
+      if (status == null || !status.ok() || before_used != depth) begin
+        `uvm_error("SMALL_EVENT_FULL_STATE", "full state capture failed")
+        disable small_event_flow;
+      end
+      reservation_valid = 1'b1;
+      reservation = null;
+      status = fixture.engine.query_runtime_device_reservation(
+        queue.handle, kind, reservation_valid, reservation);
+      pending_operation = null;
+      if (status != null && status.ok())
+        status = fixture.engine.query_runtime_pending(
+          queue.handle, kind, pending_operation);
+      if (status == null || status.code != RDMA_SC_INVALID_STATE ||
+          reservation_valid || reservation != null || pending_operation != null) begin
+        `uvm_error("SMALL_EVENT_FULL_EVIDENCE",
+                   "full ring retained reservation or pending evidence")
+        disable small_event_flow;
+      end
+      status = fixture.engine.query_runtime_producer_polarity(
+        queue.handle, kind, polarity_before);
+      if (status == null || !status.ok()) disable small_event_flow;
+      publish_small_event_entry(fixture, kind, event_qp, published, status);
+      check_rejected_publish_atomic(
+        "SMALL_EVENT_FULL", fixture, queue, kind, role, 16, before_bytes,
+        before_pi, before_pi_wrap, before_ci, before_ci_wrap, before_used,
+        published, status, RDMA_SC_QUEUE_FULL);
+      status = fixture.engine.query_runtime_producer_polarity(
+        queue.handle, kind, polarity_after);
+      if (status == null || !status.ok() || polarity_after != polarity_before) begin
+        `uvm_error("SMALL_EVENT_FULL_POLARITY",
+                   "QUEUE_FULL changed expected producer polarity")
+        disable small_event_flow;
+      end
+
+      poll_small_event_entry(fixture, kind, status);
+      if (status == null || !status.ok()) begin
+        `uvm_error("SMALL_EVENT_POLL_ONE", "poll-one failed")
+        disable small_event_flow;
+      end
+      publish_small_event_entry(fixture, kind, event_qp, published, status);
+      validate_small_event_publish(
+        fixture, queue, kind, depth, published, 0, 1'b1, depth,
+        1, 1'b0, status);
+      if (status == null || !status.ok()) begin
+        `uvm_error("SMALL_EVENT_REUSE", "released slot-zero credit was not reused")
+        disable small_event_flow;
+      end
+      published_index[sample] = published.index;
+      published_wrap[sample] = published.wrap;
+      published_occupancy[sample] = published.occupancy;
+      sample++;
+
+      expected_ci = 1;
+      expected_ci_wrap = 1'b0;
+      for (int unsigned n = 0; n < 2 * depth; n++) begin
+        slot_index = expected_ci;
+        slot_consumer_wrap = expected_ci_wrap;
+        poll_small_event_entry(fixture, kind, status);
+        if (status == null || !status.ok()) begin
+          `uvm_error("SMALL_EVENT_ROTATE_POLL", "rotation poll failed")
+          disable small_event_flow;
+        end
+        expected_ci++;
+        if (expected_ci == depth) begin
+          expected_ci = 0;
+          expected_ci_wrap = ~expected_ci_wrap;
+        end
+        publish_small_event_entry(fixture, kind, event_qp, published, status);
+        validate_small_event_publish(
+          fixture, queue, kind, depth, published, slot_index,
+          ~slot_consumer_wrap, depth, expected_ci, expected_ci_wrap, status);
+        if (status == null || !status.ok()) begin
+          `uvm_error("SMALL_EVENT_ROTATE_PUBLISH", "rotation publish failed")
+          disable small_event_flow;
+        end
+        published_index[sample] = published.index;
+        published_wrap[sample] = published.wrap;
+        published_occupancy[sample] = published.occupancy;
+        sample++;
+      end
+      for (int unsigned n = 0; n < depth; n++) begin
+        poll_small_event_entry(fixture, kind, status);
+        if (status == null || !status.ok()) begin
+          `uvm_error("SMALL_EVENT_DRAIN", "final event drain failed")
+          disable small_event_flow;
+        end
+      end
+      status = fixture.engine.query_runtime_occupancy(
+        queue.handle, kind, used, pending);
+      if (status == null || !status.ok() || used != 0 || pending ||
+          sample != depth + 1 + 2 * depth)
+        `uvm_error("SMALL_EVENT_FINAL",
+                   "small event rotations did not drain or save every result")
+    end
+    if (fixture != null) begin
+      if (event_qp_created) begin
+        fixture.destroy_lifecycle_owned_qp(
+          event_qp == null ? null : event_qp.handle,
+          event_qp_created, event_qp_attached, 64'h2905,
+          event_qp_cleanup_status);
+        if (event_qp_cleanup_status == null ||
+            !event_qp_cleanup_status.ok())
+          `uvm_error("SMALL_EVENT_QP_CLEANUP",
+                     event_qp_cleanup_status == null ?
+                     "small event QP cleanup returned null" :
+                     event_qp_cleanup_status.convert2string())
+      end
+      fixture.cleanup(cleanup_status);
+      if (cleanup_status == null || !cleanup_status.ok())
+        `uvm_error("SMALL_EVENT_CLEANUP", cleanup_status == null ?
+                   "small event cleanup returned null" :
+                   cleanup_status.convert2string())
+    end
+  endtask
+
+  // 功能：check_small_event_lifecycle_matrix 逐项运行 CEQ/AEQ 的 depth 2/4
+  //   owned-backing profile，补足 runtime-only matrix 不覆盖的 lifecycle 边界。
+  // 输入/输出及副作用：无显式输入输出；四个 profile 使用独立 fixture 并分别
+  //   释放资源，不共享 event cursor 或 backing。
+  // 失败边界：单个 profile 失败不跳过矩阵中的其它 profile，所有错误由被调 task
+  //   报告；本 task 不尝试创建 lifecycle depth 2/4 CQ。
+  task automatic check_small_event_lifecycle_matrix();
+    check_small_event_lifecycle_full_credit(RDMA_QUEUE_RUNTIME_CEQ, 2);
+    check_small_event_lifecycle_full_credit(RDMA_QUEUE_RUNTIME_CEQ, 4);
+    check_small_event_lifecycle_full_credit(RDMA_QUEUE_RUNTIME_AEQ, 2);
+    check_small_event_lifecycle_full_credit(RDMA_QUEUE_RUNTIME_AEQ, 4);
+  endtask
+
   // 功能：check_cqe_authority_rejections 逐项覆盖 foreign QPN、错误 QP identity/
   //   Function、stale generation、错误 rq_cqe、非 outstanding WQE 与 polarity。
   // 输入/输出及副作用：无显式输入；每个 case 使用同一真实 posted SQ WQE 和独立
@@ -6642,6 +7364,10 @@ class rdma_queue_data_engine_device_publish_test extends uvm_test;
     if (poll_status == null || poll_status.code != RDMA_SC_QUEUE_EMPTY ||
         completion != null)
       `uvm_error("CQE_EMPTY", "second CQE poll did not prove occupancy is zero")
+    reset_device_publish_factory_state();
+    check_runtime_full_credit_matrix();
+    reset_device_publish_factory_state();
+    check_small_event_lifecycle_matrix();
     reset_device_publish_factory_state();
     check_unclaimed_pending_kind_authority();
     reset_device_publish_factory_state();

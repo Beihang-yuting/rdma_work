@@ -20,10 +20,25 @@ class rdma_queue_data_engine_fixture extends uvm_object;
   rdma_doorbell_scheduler scheduler;
   rdma_hw_doorbell_codec_registry registry;
   rdma_queue_data_engine engine;
+  rdma_function function_resource;
   rdma_pd pd;
   rdma_ceq ceq;
+  rdma_aeq aeq;
   rdma_cq cq;
   rdma_qp qp;
+  bit function_created;
+  bit pd_created;
+  bit pd_activated;
+  bit ceq_created;
+  bit aeq_created;
+  bit cq_created;
+  bit qp_created;
+  bit ud_qp_created;
+  bit urc_qp_created;
+  bit cq_attached;
+  bit ceq_attached;
+  bit aeq_attached;
+  bit qp_attached;
   // 基础 RC QP 之外，集成传输矩阵按需创建同一 Function 下的 UD/URC
   // QP。它们共享 CQ 依赖但拥有各自的 SQ/RQ backing 与 transport context。
   rdma_qp ud_qp;
@@ -37,7 +52,13 @@ class rdma_queue_data_engine_fixture extends uvm_object;
     binding = null; manager = null; mem = null; pcie = null;
     contexts = null; cmq = null; queue_executor = null; qp_executor = null;
     scheduler = null; registry = null; engine = null;
-    pd = null; ceq = null; cq = null; qp = null;
+    function_resource = null; pd = null; ceq = null; aeq = null;
+    cq = null; qp = null;
+    function_created = 1'b0; pd_created = 1'b0; pd_activated = 1'b0;
+    ceq_created = 1'b0; aeq_created = 1'b0; cq_created = 1'b0;
+    qp_created = 1'b0; ud_qp_created = 1'b0; urc_qp_created = 1'b0;
+    cq_attached = 1'b0; ceq_attached = 1'b0;
+    aeq_attached = 1'b0; qp_attached = 1'b0;
     ud_qp = null; urc_qp = null;
   endfunction
 
@@ -89,9 +110,8 @@ class rdma_queue_data_engine_fixture extends uvm_object;
     vector.msix_table_index = 1;
     vector.enabled = 1'b1;
     result.interrupt_vectors.push_back(vector);
-    // 设计说明：Task 6 的 lifecycle-owned AEQ 使用 local vector 2；在 fixture
-    // binding 中显式发布其独立硬件/MSI-X projection，避免把 AEQ 偷换为 CEQ 的
-    // vector 1，也让 policy preflight 能验证真实 Function authority。
+    // 设计说明：额外发布 vector 2 以兼容仍显式请求该向量的局部拓扑；基础
+    // fixture 的 CEQ/AEQ 均按统一 lifecycle 契约借用 vector 1，不假设独占向量。
     vector.function_local_vector = 2;
     vector.hardware_eq_vector = 2;
     vector.msix_table_index = 2;
@@ -186,17 +206,38 @@ class rdma_queue_data_engine_fixture extends uvm_object;
     return rdma_status::make(value.code, {stage, ": ", value.message});
   endfunction
 
-  // 功能：setup 更新字段 status、binding、manager、mem、pcie、contexts、cmq、queue_executor、qp_executor、scheduler，并在提交前保持 Function authority、generation 和资源所有权约束。
-  // 输入/输出及副作用：status（输出）；setup 驱动下游事务，并写入 status；函数返回 无直接返回值，不取得调用方资源所有权。
-  // 失败/边界：setup 返回 RDMA_SC_INVALID_STATE；典型拒绝条件为“CQ fixture creation returned no status”“QP fixture creation returned no status”；失败路径不提交部分状态或转移未声明资源。
-  task setup(output rdma_status status);
-    rdma_function function_resource;
+  // 功能：setup 以可配置的 CQ/CEQ/AEQ depth 与 CQE stride 建立完整正向
+  //   lifecycle fixture：Function、ACTIVE PD、owned CEQ/AEQ/CQ、RC QP 及
+  //   queue-data engine。
+  // 输入/输出及副作用：status 为输出；cq_depth/cqe_size/ceq_depth/aeq_depth
+  //   为输入且保留旧 setup(status) 默认调用；成功后 engine 按 CQ→CEQ→AEQ→QP
+  //   借用 attachment，资源销毁权仍归 executor/manager，并写入 mock Host-memory/CMQ。
+  // 失败/边界：任一步 null/non-OK control status、cast、配置或 attach 失败时保留
+  //   首个 setup status，调用 cleanup 继续撤销所有已建资源；CQ depth<16 仍由
+  //   lifecycle policy 拒绝，失败不发布半初始化成功状态。
+  task setup(
+    output rdma_status status,
+    input int unsigned cq_depth = 16,
+    input int unsigned cqe_size = RDMA_CQE_BYTES,
+    input int unsigned ceq_depth = 16,
+    input int unsigned aeq_depth = 16
+  );
+    rdma_create_ceq_req ceq_request;
+    rdma_create_aeq_req aeq_request;
     rdma_create_cq_req cq_request;
     rdma_create_qp_req qp_request;
     rdma_queue_resource queue;
     rdma_control_result control_result;
+    rdma_status cleanup_status;
 
     status = null;
+    function_resource = null; pd = null; ceq = null; aeq = null;
+    cq = null; qp = null; ud_qp = null; urc_qp = null;
+    function_created = 1'b0; pd_created = 1'b0; pd_activated = 1'b0;
+    ceq_created = 1'b0; aeq_created = 1'b0; cq_created = 1'b0;
+    qp_created = 1'b0; ud_qp_created = 1'b0; urc_qp_created = 1'b0;
+    cq_attached = 1'b0; ceq_attached = 1'b0;
+    aeq_attached = 1'b0; qp_attached = 1'b0;
     binding = make_binding({get_name(), "_binding"});
     manager = rdma_resource_manager::type_id::create({get_name(), "_manager"});
     if (mem == null)
@@ -216,99 +257,185 @@ class rdma_queue_data_engine_fixture extends uvm_object;
       {get_name(), "_registry"});
     engine = rdma_queue_data_engine::type_id::create({get_name(), "_engine"});
 
-    status = setup_status("create_function",
-                          manager.create_function(binding, function_resource));
-    if (!status.ok()) return;
-    status = setup_status("create_pd", manager.create_pd(binding, pd));
-    if (!status.ok()) return;
-    // A CQ lifecycle request requires an explicit CEQ dependency.  Keep the
-    // dependency real so the executor can build the CQC projection and
-    // retain the lifecycle-owned context/backing references used by the data
-    // engine fixture.
-    status = setup_status("create_ceq", manager.create_ceq(binding, ceq));
-    if (!status.ok()) return;
-    status = setup_status("queue_executor.configure",
-                          queue_executor.configure(manager, cmq, mem,
-                                                    contexts, 2us));
-    if (!status.ok()) return;
+    // 中文设计：setup_flow 只负责建立资源；所有失败使用 disable 跳到统一
+    // epilogue，使 partial setup 与 normal cleanup 共享同一逆序释放实现。
+    begin : setup_flow
+      status = setup_status("create_function",
+                            manager.create_function(binding, function_resource));
+      if (!status.ok() || function_resource == null) begin
+        if (status.ok()) status = rdma_status::make(
+          RDMA_SC_INVALID_STATE, "Function fixture creation returned null");
+        disable setup_flow;
+      end
+      function_created = 1'b1;
+      status = setup_status("create_pd", manager.create_pd(binding, pd));
+      if (!status.ok() || pd == null) begin
+        if (status.ok()) status = rdma_status::make(
+          RDMA_SC_INVALID_STATE, "PD fixture creation returned null");
+        disable setup_flow;
+      end
+      pd_created = 1'b1;
+      status = setup_status("activate_pd", manager.activate(pd.handle));
+      if (!status.ok()) disable setup_flow;
+      pd_activated = 1'b1;
+      status = setup_status("queue_executor.configure",
+                            queue_executor.configure(manager, cmq, mem,
+                                                      contexts, 2us));
+      if (!status.ok()) disable setup_flow;
 
-    cq_request = rdma_create_cq_req::type_id::create(
-      {get_name(), "_cq_request"});
-    cq_request.owner = binding.make_handle();
-    cq_request.depth = 16;
-    cq_request.cqe_size_bytes = RDMA_CQE_BYTES;
-    cq_request.ceq_h = rdma_clone_handle_value(ceq.handle,
-                                                "fixture CQ CEQ");
-    queue_executor.create_locked(binding, binding.make_handle(), cq_request,
-                                 64'h1001, queue, control_result);
-    if (control_result == null || control_result.status == null ||
-        !control_result.status.ok() || queue == null || !$cast(cq, queue)) begin
+      ceq_request = rdma_create_ceq_req::type_id::create(
+        {get_name(), "_ceq_request"});
+      if (ceq_request == null) begin
+        status = rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED,
+                                   "CEQ request allocation failed");
+        disable setup_flow;
+      end
+      ceq_request.owner = binding.make_handle();
+      ceq_request.depth = ceq_depth;
+      ceq_request.vector_id = 1;
+      ceq_request.ring_backing.mode = RDMA_QUEUE_BACKING_OWNED;
+      queue = null; control_result = null;
+      queue_executor.create_locked(binding, binding.make_handle(), ceq_request,
+                                   64'h1001, queue, control_result);
+      status = control_result == null || control_result.status == null ?
+        rdma_status::make(RDMA_SC_INVALID_STATE,
+                          "CEQ fixture creation returned no status") :
+        setup_status("CEQ create", control_result.status);
+      if (!status.ok() || queue == null || !$cast(ceq, queue)) begin
+        if (status.ok()) status = rdma_status::make(
+          RDMA_SC_INVALID_STATE, "CEQ fixture creation returned wrong resource");
+        disable setup_flow;
+      end
+      ceq_created = 1'b1;
+
+      aeq_request = rdma_create_aeq_req::type_id::create(
+        {get_name(), "_aeq_request"});
+      if (aeq_request == null) begin
+        status = rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED,
+                                   "AEQ request allocation failed");
+        disable setup_flow;
+      end
+      aeq_request.owner = binding.make_handle();
+      aeq_request.depth = aeq_depth;
+      aeq_request.vector_id = 1;
+      aeq_request.ring_backing.mode = RDMA_QUEUE_BACKING_OWNED;
+      queue = null; control_result = null;
+      queue_executor.create_locked(binding, binding.make_handle(), aeq_request,
+                                   64'h1002, queue, control_result);
+      status = control_result == null || control_result.status == null ?
+        rdma_status::make(RDMA_SC_INVALID_STATE,
+                          "AEQ fixture creation returned no status") :
+        setup_status("AEQ create", control_result.status);
+      if (!status.ok() || queue == null || !$cast(aeq, queue)) begin
+        if (status.ok()) status = rdma_status::make(
+          RDMA_SC_INVALID_STATE, "AEQ fixture creation returned wrong resource");
+        disable setup_flow;
+      end
+      aeq_created = 1'b1;
+
+      cq_request = rdma_create_cq_req::type_id::create(
+        {get_name(), "_cq_request"});
+      if (cq_request == null) begin
+        status = rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED,
+                                   "CQ request allocation failed");
+        disable setup_flow;
+      end
+      cq_request.owner = binding.make_handle();
+      cq_request.depth = cq_depth;
+      cq_request.cqe_size_bytes = cqe_size;
+      cq_request.ceq_h = rdma_clone_handle_value(ceq.handle,
+                                                  "fixture CQ CEQ");
+      cq_request.ring_backing.mode = RDMA_QUEUE_BACKING_OWNED;
+      if (cq_request.ceq_h == null) begin
+        status = rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED,
+                                   "CQ CEQ handle clone failed");
+        disable setup_flow;
+      end
+      queue = null; control_result = null;
+      queue_executor.create_locked(binding, binding.make_handle(), cq_request,
+                                   64'h1003, queue, control_result);
       status = control_result == null || control_result.status == null ?
         rdma_status::make(RDMA_SC_INVALID_STATE,
                           "CQ fixture creation returned no status") :
         setup_status("CQ create", control_result.status);
-      if (control_result != null)
-        status.message = {status.message, $sformatf(" primary=%p rollback=%p steps=%p resource=%p",
-                                                     control_result.primary_status,
-                                                     control_result.rollback_statuses,
-                                                     control_result.completed_steps,
-                                                     control_result.resource_h)};
-      return;
-    end
+      if (!status.ok() || queue == null || !$cast(cq, queue)) begin
+        if (status.ok()) status = rdma_status::make(
+          RDMA_SC_INVALID_STATE, "CQ fixture creation returned wrong resource");
+        disable setup_flow;
+      end
+      cq_created = 1'b1;
 
-    status = setup_status("qp_executor.configure",
-                          qp_executor.configure(manager, cmq, mem,
-                                                contexts, 2us));
-    if (!status.ok()) return;
-    qp_request = rdma_create_qp_req::type_id::create(
-      {get_name(), "_qp_request"});
-    qp_request.owner = binding.make_handle();
-    qp_request.transport = RDMA_TRANSPORT_RC;
-    qp_request.sq_depth = 16;
-    qp_request.rq_depth = 16;
-    qp_request.max_send_sge = 4;
-    qp_request.max_recv_sge = 4;
-    qp_request.max_inline_data = 512;
-    qp_request.sq_sgb_backing.mode = RDMA_QUEUE_BACKING_OWNED;
-    qp_request.pd_h = rdma_clone_handle_value(pd.handle, "fixture QP PD");
-    qp_request.send_cq_h = rdma_clone_handle_value(cq.handle,
-                                                   "fixture QP send CQ");
-    qp_request.recv_cq_h = rdma_clone_handle_value(cq.handle,
-                                                   "fixture QP receive CQ");
-    qp_request.context_attrs = make_rc_attrs({get_name(), "_qp_attrs"});
-    qp_executor.create_locked(binding, binding.make_handle(), qp_request,
-                              64'h1002, qp, control_result);
-    if (control_result == null || control_result.status == null ||
-        !control_result.status.ok() || qp == null) begin
+      status = setup_status("qp_executor.configure",
+                            qp_executor.configure(manager, cmq, mem,
+                                                  contexts, 2us));
+      if (!status.ok()) disable setup_flow;
+      qp_request = rdma_create_qp_req::type_id::create(
+        {get_name(), "_qp_request"});
+      if (qp_request == null) begin
+        status = rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED,
+                                   "QP request allocation failed");
+        disable setup_flow;
+      end
+      qp_request.owner = binding.make_handle();
+      qp_request.transport = RDMA_TRANSPORT_RC;
+      qp_request.sq_depth = 16;
+      qp_request.rq_depth = 16;
+      qp_request.max_send_sge = 4;
+      qp_request.max_recv_sge = 4;
+      qp_request.max_inline_data = 512;
+      qp_request.sq_sgb_backing.mode = RDMA_QUEUE_BACKING_OWNED;
+      qp_request.pd_h = rdma_clone_handle_value(pd.handle, "fixture QP PD");
+      qp_request.send_cq_h = rdma_clone_handle_value(cq.handle,
+                                                     "fixture QP send CQ");
+      qp_request.recv_cq_h = rdma_clone_handle_value(cq.handle,
+                                                     "fixture QP receive CQ");
+      qp_request.context_attrs = make_rc_attrs({get_name(), "_qp_attrs"});
+      control_result = null;
+      qp_executor.create_locked(binding, binding.make_handle(), qp_request,
+                                64'h1004, qp, control_result);
       status = control_result == null || control_result.status == null ?
         rdma_status::make(RDMA_SC_INVALID_STATE,
                           "QP fixture creation returned no status") :
         setup_status("QP create", control_result.status);
-      if (control_result != null)
-        status.message = {status.message, $sformatf(" primary=%p rollback=%p steps=%p resource=%p",
-                                                     control_result.primary_status,
-                                                     control_result.rollback_statuses,
-                                                     control_result.completed_steps,
-                                                     control_result.resource_h)};
-      return;
-    end
+      if (!status.ok() || qp == null) disable setup_flow;
+      qp_created = 1'b1;
 
-    status = setup_status("scheduler.configure", scheduler.configure(mem, pcie));
-    if (!status.ok()) return;
-    status = setup_status("registry.register_defaults",
-                          registry.register_defaults());
-    if (!status.ok()) return;
-    status = setup_status("register_queue_codecs",
-                          rdma_register_queue_codecs(registry));
-    if (!status.ok()) return;
-    status = setup_status("engine.configure",
-                          engine.configure(manager, binding, mem, scheduler,
-                                           registry, 2us));
-    if (!status.ok()) return;
-    status = setup_status("engine.attach_cq",
-                          engine.attach_cq(cq.handle, RDMA_TRANSPORT_RC));
-    if (!status.ok()) return;
-    status = setup_status("engine.attach_qp", engine.attach_qp(qp.handle));
+      status = setup_status("scheduler.configure", scheduler.configure(mem, pcie));
+      if (!status.ok()) disable setup_flow;
+      status = setup_status("registry.register_defaults",
+                            registry.register_defaults());
+      if (!status.ok()) disable setup_flow;
+      status = setup_status("register_queue_codecs",
+                            rdma_register_queue_codecs(registry));
+      if (!status.ok()) disable setup_flow;
+      status = setup_status("engine.configure",
+                            engine.configure(manager, binding, mem, scheduler,
+                                             registry, 2us));
+      if (!status.ok()) disable setup_flow;
+      status = setup_status("engine.attach_cq",
+                            engine.attach_cq(cq.handle, RDMA_TRANSPORT_RC));
+      if (!status.ok()) disable setup_flow;
+      cq_attached = 1'b1;
+      status = setup_status("engine.attach_ceq", engine.attach_ceq(ceq.handle));
+      if (!status.ok()) disable setup_flow;
+      ceq_attached = 1'b1;
+      status = setup_status("engine.attach_aeq", engine.attach_aeq(aeq.handle));
+      if (!status.ok()) disable setup_flow;
+      aeq_attached = 1'b1;
+      status = setup_status("engine.attach_qp", engine.attach_qp(qp.handle));
+      if (!status.ok()) disable setup_flow;
+      qp_attached = 1'b1;
+    end
+    if (status == null)
+      status = rdma_status::make(RDMA_SC_INVALID_STATE,
+                                 "fixture setup returned null status");
+    if (!status.ok()) begin
+      cleanup(cleanup_status);
+      if (cleanup_status == null)
+        status.message = {status.message, "; cleanup returned null status"};
+      else if (!cleanup_status.ok())
+        status.message = {status.message, "; cleanup: ", cleanup_status.message};
+    end
   endtask
 
   // 功能：create_transport_qp 在已建立的 Function/PD/CQ 生命周期上创建一个
@@ -408,7 +535,9 @@ class rdma_queue_data_engine_fixture extends uvm_object;
     status = rdma_status::success();
     create_transport_qp("ud", RDMA_TRANSPORT_UD, ud_qp, status);
     if (status == null || !status.ok()) return;
+    ud_qp_created = 1'b1;
     create_transport_qp("urc", RDMA_TRANSPORT_URC, urc_qp, status);
+    if (status != null && status.ok()) urc_qp_created = 1'b1;
   endtask
 
   // 功能：get_qp_for_transport 返回当前 fixture 中与指定 transport 匹配的
@@ -485,10 +614,13 @@ class rdma_queue_data_engine_fixture extends uvm_object;
                     64, data);
   endfunction
 
-  // 功能：在 rdma_queue_data_engine_fixture 中，write_cq_entry 把请求数据写入指定后端并保留返回状态；只有写入成功才允许本地游标继续推进。
-  // 输入/输出及副作用：index（输入）、model（输入）；输入 request/image/cursor 决定写入内容；成功时更新 PI/CI、slot ledger 或 pending journal，并通过 output
-  //   返回结果。
-  // 失败/边界：write_cq_entry 遇到后端拒绝、范围溢出或 DMA 权限不足时保留失败证据，不推进本地游标。
+  // 功能：write_cq_entry 仅作为 malformed image/owner mismatch 的 raw backing
+  //   故障注入器；它故意绕过 runtime reservation/commit，严禁用于正向 CQE 生成。
+  // 输入/输出及副作用：index/model 为输入；按 CQ attachment 的 cqe_size_bytes
+  //   计算 slot offset 并直接改写 mock Host-memory，不推进 PI/CI、occupancy、WQE
+  //   ledger 或 pending，调用方仍拥有 model/image 及后续故障清理责任。
+  // 失败/边界：codec、backing、mapping、范围或 DMA 写入失败时返回原始 status；
+  //   即使写入成功也没有 committed entry，调用方不得 poll 该字节来伪造 completion。
   function rdma_status write_cq_entry(
     int unsigned index, rdma_hw_cqe_model model
   );
@@ -517,7 +649,8 @@ class rdma_queue_data_engine_fixture extends uvm_object;
     data = new[image.bytes.size()];
     foreach (data[i]) data[i] = image.bytes[i];
     return mem.write(backing.mapping,
-                     backing.mapping_offset + longint'(index) * 64, data);
+                     backing.mapping_offset +
+                       longint'(index) * longint'(cq.cqe_size_bytes), data);
   endfunction
 
   // 功能：read_cq_entry 通过 fixture 管理的 CQ backing 读取指定已发布槽位，供
@@ -550,6 +683,171 @@ class rdma_queue_data_engine_fixture extends uvm_object;
                     backing.mapping_offset + longint'(index) * size,
                     size, data);
   endfunction
+
+  // 功能：cleanup 统一撤销 fixture 的 attachment 与 lifecycle 资源，严格按
+  //   detach(基础 QP/CQ/CEQ/AEQ)→destroy(URC/UD/基础 QP/CQ/CEQ/AEQ)→PD→Function
+  //   顺序执行，附加 transport QP 必须先于其共享 CQ/PD 销毁。
+  // 输入/输出及副作用：status 为输出；task 读取 setup 记录的 created/attached
+  //   状态，驱动 engine、executor 与 manager 回收 owned backing/context；engine
+  //   仅借用这些对象，cleanup 不释放外部 PCIe/Host-memory adapter 本身。
+  // 失败/边界：每个 null status 规范化为 INVALID_STATE，保存首个失败并继续后续
+  //   cleanup；重复调用对已成功回收的阶段为空操作，detach 失败也绝不跳过 destroy。
+  task cleanup(output rdma_status status);
+    rdma_status first_failure;
+    rdma_status stage_status;
+
+    first_failure = null;
+    // 中文设计：先解除全部非拥有引用，再触碰任一 lifecycle owner，避免后续
+    // destroy 因 engine attachment 仍存活而早退，并保证单个 detach 失败不泄漏其余资源。
+    if (qp_attached) begin
+      stage_status = engine == null ? null : engine.detach(qp.handle);
+      if (stage_status == null)
+        stage_status = rdma_status::make(
+          RDMA_SC_INVALID_STATE, "fixture QP detach returned null status");
+      if (!stage_status.ok() && first_failure == null)
+        first_failure = stage_status;
+      if (stage_status.ok()) qp_attached = 1'b0;
+    end
+    if (cq_attached) begin
+      stage_status = engine == null ? null : engine.detach(cq.handle);
+      if (stage_status == null)
+        stage_status = rdma_status::make(
+          RDMA_SC_INVALID_STATE, "fixture CQ detach returned null status");
+      if (!stage_status.ok() && first_failure == null)
+        first_failure = stage_status;
+      if (stage_status.ok()) cq_attached = 1'b0;
+    end
+    if (ceq_attached) begin
+      stage_status = engine == null ? null : engine.detach(ceq.handle);
+      if (stage_status == null)
+        stage_status = rdma_status::make(
+          RDMA_SC_INVALID_STATE, "fixture CEQ detach returned null status");
+      if (!stage_status.ok() && first_failure == null)
+        first_failure = stage_status;
+      if (stage_status.ok()) ceq_attached = 1'b0;
+    end
+    if (aeq_attached) begin
+      stage_status = engine == null ? null : engine.detach(aeq.handle);
+      if (stage_status == null)
+        stage_status = rdma_status::make(
+          RDMA_SC_INVALID_STATE, "fixture AEQ detach returned null status");
+      if (!stage_status.ok() && first_failure == null)
+        first_failure = stage_status;
+      if (stage_status.ok()) aeq_attached = 1'b0;
+    end
+
+    // 中文设计：所有 detach 均已尝试后才逆序销毁；附加 transport QP 不挂在
+    // fixture.engine 上，因此以 attached=0 直接交还 executor。外部 composition
+    // engine 的借用 attachment 必须由其调用方先行解除。
+    if (urc_qp_created) begin
+      destroy_lifecycle_owned_qp(urc_qp == null ? null : urc_qp.handle,
+                                 1'b1, 1'b0, 64'h2011, stage_status);
+      if (stage_status == null)
+        stage_status = rdma_status::make(
+          RDMA_SC_INVALID_STATE, "fixture URC QP destroy returned null status");
+      if (!stage_status.ok() && first_failure == null)
+        first_failure = stage_status;
+      if (stage_status.ok()) begin
+        urc_qp_created = 1'b0;
+        urc_qp = null;
+      end
+    end
+    if (ud_qp_created) begin
+      destroy_lifecycle_owned_qp(ud_qp == null ? null : ud_qp.handle,
+                                 1'b1, 1'b0, 64'h2010, stage_status);
+      if (stage_status == null)
+        stage_status = rdma_status::make(
+          RDMA_SC_INVALID_STATE, "fixture UD QP destroy returned null status");
+      if (!stage_status.ok() && first_failure == null)
+        first_failure = stage_status;
+      if (stage_status.ok()) begin
+        ud_qp_created = 1'b0;
+        ud_qp = null;
+      end
+    end
+    // 基础 QP 即使先前 detach 失败也仍交给 executor 尝试 destroy，使首错与
+    // 最大化回收兼得；CQ/CEQ/AEQ 随后按依赖反序释放。
+    if (qp_created) begin
+      destroy_lifecycle_owned_qp(qp == null ? null : qp.handle,
+                                 1'b1, 1'b0, 64'h2004, stage_status);
+      if (stage_status == null)
+        stage_status = rdma_status::make(
+          RDMA_SC_INVALID_STATE, "fixture QP destroy returned null status");
+      if (!stage_status.ok() && first_failure == null)
+        first_failure = stage_status;
+      if (stage_status.ok()) qp_created = 1'b0;
+    end
+    if (cq_created) begin
+      destroy_lifecycle_owned_queue(cq == null ? null : cq.handle,
+                                    1'b1, 1'b0, 64'h2003, stage_status);
+      if (stage_status == null)
+        stage_status = rdma_status::make(
+          RDMA_SC_INVALID_STATE, "fixture CQ destroy returned null status");
+      if (!stage_status.ok() && first_failure == null)
+        first_failure = stage_status;
+      if (stage_status.ok()) cq_created = 1'b0;
+    end
+    if (ceq_created) begin
+      destroy_lifecycle_owned_queue(ceq == null ? null : ceq.handle,
+                                    1'b1, 1'b0, 64'h2001, stage_status);
+      if (stage_status == null)
+        stage_status = rdma_status::make(
+          RDMA_SC_INVALID_STATE, "fixture CEQ destroy returned null status");
+      if (!stage_status.ok() && first_failure == null)
+        first_failure = stage_status;
+      if (stage_status.ok()) ceq_created = 1'b0;
+    end
+    if (aeq_created) begin
+      destroy_lifecycle_owned_queue(aeq == null ? null : aeq.handle,
+                                    1'b1, 1'b0, 64'h2002, stage_status);
+      if (stage_status == null)
+        stage_status = rdma_status::make(
+          RDMA_SC_INVALID_STATE, "fixture AEQ destroy returned null status");
+      if (!stage_status.ok() && first_failure == null)
+        first_failure = stage_status;
+      if (stage_status.ok()) aeq_created = 1'b0;
+    end
+
+    if (pd_created) begin
+      // 中文设计：activate 之前失败的 PD 仍处于 ALLOCATED，只能走
+      // release_reserved；ACTIVE PD 才执行 quiesce→finalize，避免 partial setup
+      // 把合法的未激活资源误报为 cleanup 失败。
+      if (pd_activated) begin
+        stage_status = manager == null || pd == null ? null :
+          manager.begin_quiesce(pd.handle);
+        if (stage_status == null)
+          stage_status = rdma_status::make(
+            RDMA_SC_INVALID_STATE, "fixture PD quiesce returned null status");
+        if (!stage_status.ok() && first_failure == null)
+          first_failure = stage_status;
+        stage_status = manager == null || pd == null ? null :
+          manager.finalize_release(pd.handle);
+      end
+      else
+        stage_status = manager == null || pd == null ? null :
+          manager.release_reserved(pd.handle);
+      if (stage_status == null)
+        stage_status = rdma_status::make(
+          RDMA_SC_INVALID_STATE, "fixture PD release returned null status");
+      if (!stage_status.ok() && first_failure == null)
+        first_failure = stage_status;
+      if (stage_status.ok()) begin
+        pd_created = 1'b0;
+        pd_activated = 1'b0;
+      end
+    end
+    if (function_created) begin
+      stage_status = manager == null || function_resource == null ? null :
+        manager.release_function(function_resource.owner);
+      if (stage_status == null)
+        stage_status = rdma_status::make(
+          RDMA_SC_INVALID_STATE, "fixture Function release returned null status");
+      if (!stage_status.ok() && first_failure == null)
+        first_failure = stage_status;
+      if (stage_status.ok()) function_created = 1'b0;
+    end
+    status = first_failure == null ? rdma_status::success() : first_failure;
+  endtask
 
   // 功能：advance_binding_reset_epoch 通过 binding 的公开 identity 配置接口发布
   //   新 reset epoch，模拟 attachment 冻结 route 后外部 Function 已复位。

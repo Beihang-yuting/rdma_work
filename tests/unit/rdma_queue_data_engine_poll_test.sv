@@ -112,6 +112,7 @@ class rdma_queue_data_engine_poll_test extends uvm_test;
     rdma_post_send_req send_request;
     rdma_hw_cqe_model cqe;
     rdma_status cqe_status;
+    rdma_status cleanup_status;
     rdma_queue_device_publish_result publish_result;
     int unsigned occupancy;
     bit pending;
@@ -141,83 +142,101 @@ class rdma_queue_data_engine_poll_test extends uvm_test;
                  "poll_aeqe published output while unconfigured")
 
     fixture = rdma_queue_data_engine_fixture::type_id::create("poll_fixture");
-    fixture.setup(status);
-    if (status == null || !status.ok()) begin
-      `uvm_error("FIXTURE_SETUP", status == null ? "null setup status" :
-                 status.convert2string())
-      phase.drop_objection(this);
-      return;
+    // 中文设计：所有正向阶段通过 named flow 退出到同一 cleanup epilogue；
+    // 任一 setup/publish/poll 失败都不能用早退跳过 lifecycle-owned 资源释放。
+    begin : poll_flow
+      if (fixture == null) begin
+        `uvm_error("FIXTURE_FACTORY", "poll fixture allocation failed")
+        disable poll_flow;
+      end
+      fixture.setup(status);
+      if (status == null || !status.ok()) begin
+        `uvm_error("FIXTURE_SETUP", status == null ? "null setup status" :
+                   status.convert2string())
+        disable poll_flow;
+      end
+
+      send_request = fixture.make_send(64'h1111_2222_3333_4444);
+      fixture.engine.post_send(send_request, posted, status);
+      if (status == null || !status.ok() || posted == null) begin
+        `uvm_error("POLL_SETUP_POST", status == null ? "null status" :
+                   status.convert2string())
+        disable poll_flow;
+      end
+
+      polarity = 1'b0;
+      cqe_status = fixture.engine.query_runtime_producer_polarity(
+        fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, polarity);
+      if (cqe_status == null || !cqe_status.ok()) begin
+        `uvm_error("POLL_SETUP_POLARITY", cqe_status == null ? "null status" :
+                   cqe_status.convert2string())
+        disable poll_flow;
+      end
+      cqe = make_cqe_for_outstanding_send(fixture.qp.handle,
+        fixture.qp.local_qp_id, posted, polarity, cqe_status);
+      if (cqe_status == null || !cqe_status.ok() || cqe == null) begin
+        `uvm_error("POLL_SETUP_CQE", cqe_status == null ? "null status" :
+                   cqe_status.convert2string())
+        disable poll_flow;
+      end
+      publish_result = null;
+      fixture.engine.publish_cqe(fixture.cq.handle, cqe, publish_result, status);
+      if (status == null || !status.ok() || publish_result == null ||
+          publish_result.status == null || !publish_result.status.ok() ||
+          !publish_result.occupancy_valid || publish_result.occupancy != 1) begin
+        `uvm_error("POLL_SETUP_PUBLISH", status == null ? "null status" :
+                   status.convert2string())
+        disable poll_flow;
+      end
+      occupancy = 0;
+      pending = 1'b1;
+      status = fixture.engine.query_runtime_occupancy(
+        fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, occupancy, pending);
+      if (status == null || !status.ok() || occupancy != 1 || pending) begin
+        `uvm_error("POLL_SETUP_OCCUPANCY", status == null ? "null status" :
+                   status.convert2string())
+        disable poll_flow;
+      end
+
+      completion = null;
+      fixture.engine.poll_cqe(fixture.cq.handle, 0, completion, status);
+      // 设计说明：该断言覆盖 read/decode/route/CI-doorbell/ledger-release 完整
+      // 事务，确保 poll 在执行 match_and_release 后再检查 released_slots。
+      if (status == null || !status.ok() || completion == null ||
+          completion.cqe == null ||
+          completion.cqe.qpn != fixture.qp.local_qp_id ||
+          completion.cqe.wr_id != send_request.wr_id ||
+          completion.completion_status == null ||
+          !completion.completion_status.ok())
+        `uvm_error("POLL_CQE", status == null ? "null status" :
+                   status.convert2string())
+      if (fixture.cq.queue_plan == null ||
+          fixture.cq.queue_plan.context_ref == null)
+        `uvm_error("POLL_CQE_CONTEXT", "CQ fixture lost lifecycle backing")
+      occupancy = 1;
+      pending = 1'b1;
+      status = fixture.engine.query_runtime_occupancy(
+        fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, occupancy, pending);
+      if (status == null || !status.ok() || occupancy != 0 || pending)
+        `uvm_error("POLL_CQE_CREDIT",
+                   "poll-one did not restore CQ occupancy to zero")
+
+      // 设计说明：CI commit 必须推进 CQ runtime。backing 中旧字节仍存在；若 CI
+      // 未推进，第二次 poll 会重复消费同一 CQE，而不会观察到下一空槽。
+      completion = null;
+      fixture.engine.poll_cqe(fixture.cq.handle, 0, completion, status);
+      if (status == null || status.code != RDMA_SC_QUEUE_EMPTY ||
+          completion != null)
+        `uvm_error("POLL_CQE_CI", status == null ? "null status" :
+                   status.convert2string())
     end
 
-    send_request = fixture.make_send(64'h1111_2222_3333_4444);
-    fixture.engine.post_send(send_request, posted, status);
-    if (status == null || !status.ok() || posted == null) begin
-      `uvm_error("POLL_SETUP_POST", status == null ? "null status" :
-                 status.convert2string())
-      phase.drop_objection(this);
-      return;
+    if (fixture != null) begin
+      fixture.cleanup(cleanup_status);
+      if (cleanup_status == null || !cleanup_status.ok())
+        `uvm_error("POLL_CLEANUP", cleanup_status == null ?
+                   "fixture cleanup returned null" : cleanup_status.convert2string())
     end
-
-    polarity = 1'b0;
-    cqe_status = fixture.engine.query_runtime_producer_polarity(
-      fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, polarity);
-    if (cqe_status == null || !cqe_status.ok()) begin
-      `uvm_error("POLL_SETUP_POLARITY", cqe_status == null ? "null status" :
-                 cqe_status.convert2string())
-      phase.drop_objection(this);
-      return;
-    end
-    cqe = make_cqe_for_outstanding_send(fixture.qp.handle,
-      fixture.qp.local_qp_id, posted, polarity, cqe_status);
-    if (cqe_status == null || !cqe_status.ok() || cqe == null) begin
-      `uvm_error("POLL_SETUP_CQE", cqe_status == null ? "null status" :
-                 cqe_status.convert2string())
-      phase.drop_objection(this);
-      return;
-    end
-    publish_result = null;
-    fixture.engine.publish_cqe(fixture.cq.handle, cqe, publish_result, status);
-    if (status == null || !status.ok() || publish_result == null ||
-        publish_result.status == null || !publish_result.status.ok() ||
-        !publish_result.occupancy_valid || publish_result.occupancy != 1) begin
-      `uvm_error("POLL_SETUP_PUBLISH", status == null ? "null status" :
-                 status.convert2string())
-      phase.drop_objection(this);
-      return;
-    end
-    occupancy = 0;
-    pending = 1'b1;
-    status = fixture.engine.query_runtime_occupancy(
-      fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, occupancy, pending);
-    if (status == null || !status.ok() || occupancy != 1 || pending) begin
-      `uvm_error("POLL_SETUP_OCCUPANCY", status == null ? "null status" :
-                 status.convert2string())
-      phase.drop_objection(this);
-      return;
-    end
-
-    completion = null;
-    fixture.engine.poll_cqe(fixture.cq.handle, 0, completion, status);
-    // 设计说明：该断言覆盖 read/decode/route/CI-doorbell/ledger-release 完整
-    // 事务，确保 poll 在执行 match_and_release 后再检查 released_slots。
-    if (status == null || !status.ok() || completion == null ||
-        completion.cqe == null || completion.cqe.qpn != fixture.qp.local_qp_id ||
-        completion.cqe.wr_id != send_request.wr_id ||
-        completion.completion_status == null ||
-        !completion.completion_status.ok())
-      `uvm_error("POLL_CQE", status == null ? "null status" :
-                 status.convert2string())
-    if (fixture.cq.queue_plan == null || fixture.cq.queue_plan.context_ref == null)
-      `uvm_error("POLL_CQE_CONTEXT", "CQ fixture lost lifecycle backing")
-
-    // 设计说明：CI commit 必须推进 CQ runtime。backing 中旧字节仍存在；若 CI
-    // 未推进，第二次 poll 会重复消费同一 CQE，而不会观察到下一空槽。
-    completion = null;
-    fixture.engine.poll_cqe(fixture.cq.handle, 0, completion, status);
-    if (status == null || status.code != RDMA_SC_QUEUE_EMPTY ||
-        completion != null)
-      `uvm_error("POLL_CQE_CI", status == null ? "null status" :
-                 status.convert2string())
 
     phase.drop_objection(this);
   endtask

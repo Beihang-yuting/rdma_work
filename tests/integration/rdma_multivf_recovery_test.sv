@@ -301,17 +301,38 @@ class rdma_multivf_recovery_test extends uvm_test;
   endtask
 `endif
 
+  // 功能：cleanup_cqe_fixture 释放 multi-VF 业务错误注入使用的独立 queue-data
+  //   fixture，避免仅清空对象引用而遗留 mock backing 与 manager resource。
+  // 输入/输出及副作用：status 为输出；成功时调用 fixture 聚合 cleanup 并清除
+  //   cqe_fixture 所有权出口，不影响四个真实 VF Host-memory mapping。
+  // 失败/边界：fixture 为空时幂等成功；cleanup 返回 null/失败时保留对象引用供
+  //   诊断或重试，不把未释放状态伪装为成功。
+  task automatic cleanup_cqe_fixture(output rdma_status status);
+    if (cqe_fixture == null) begin
+      status = rdma_status::success();
+      return;
+    end
+    cqe_fixture.cleanup(status);
+    if (status != null && status.ok()) cqe_fixture = null;
+  endtask
+
   // 功能：放弃未完成的多 VF fixture，并以真实 release 结果决定是否丢弃环境引用。
   // 输入/输出及副作用：label（输入）、cleanup_status（输出）；先清理已登记 mapping，
-  //   清理成功才清除 env/辅助对象，失败则保留所有权出口供下一次重试。
-  // 失败/边界：cleanup 返回 null/非 OK 时 fixture_ready 保持 0 且不伪造可用环境；
-  //   没有 mapping 时清理幂等成功，调用方仍须停止当前构建流程。
+  //   再清理可空 CQE fixture；两者都成功才清除 env/辅助对象。
+  // 失败/边界：任一 cleanup 返回 null/非 OK 时保存首错、继续另一清理阶段并保留
+  //   未释放所有权出口；没有 mapping/CQE fixture 时幂等成功。
   task automatic abandon_fixture(
     string label,
     output rdma_status cleanup_status
   );
+    rdma_status mapping_status;
+    rdma_status cqe_status;
+
     fixture_ready = 1'b0;
-    release_partial_mappings(cleanup_status);
+    release_partial_mappings(mapping_status);
+    cleanup_cqe_fixture(cqe_status);
+    cleanup_status = mapping_status == null || !mapping_status.ok() ?
+      mapping_status : cqe_status;
     if (cleanup_status == null || !cleanup_status.ok()) begin
       `uvm_error("MULTIVF_CLEANUP", $sformatf(
         "%s: fixture cleanup failed: %s", label,
@@ -321,7 +342,6 @@ class rdma_multivf_recovery_test extends uvm_test;
     end
     env = null;
     coverage = null;
-    cqe_fixture = null;
   endtask
 
   // 功能：将 Function 及其 device/mailbox/MSI-X BAR 写入冻结前快照，形成可投影 binding。
@@ -408,8 +428,8 @@ class rdma_multivf_recovery_test extends uvm_test;
     rdma_dma_request_context dma_request;
     rdma_host_mem_route_entry route_entry;
 
-    // build_fixture 可能被回归 harness 重入；先释放上一次仍登记的 backing。
-    // 清理失败时必须立即返回并保留 env/mapping 引用，下一次调用才能重试。
+    // build_fixture 可能被回归 harness 重入；先释放上一次仍登记的真实 backing
+    // 与独立 CQE fixture。任一清理失败都保留所有权出口供下一次重试。
     fixture_ready = 1'b0;
     release_partial_mappings(status);
     if (status == null || !status.ok()) begin
@@ -418,9 +438,15 @@ class rdma_multivf_recovery_test extends uvm_test;
                  status.convert2string())
       return;
     end
+    cleanup_cqe_fixture(status);
+    if (status == null || !status.ok()) begin
+      `uvm_error("MULTIVF_CLEANUP", status == null ?
+                 "previous CQE fixture cleanup returned null" :
+                 status.convert2string())
+      return;
+    end
     env = null;
     coverage = null;
-    cqe_fixture = null;
     for (int index = 0; index < 4; index++) begin
       vf_identity[index] = null;
       vf_context[index] = null;
@@ -751,12 +777,14 @@ class rdma_multivf_recovery_test extends uvm_test;
     rdma_queue_completion_result queue_completion;
     rdma_status poll_status;
     rdma_hw_cqe_model cqe;
+    rdma_queue_device_publish_result published;
     rdma_queue_post_result posted;
     rdma_post_send_req send_request;
     rdma_host_mem_router host_mem;
     rdma_dma_mapping mapping;
     rdma_mock_cmq_port cmq;
     rdma_queue_data_engine engine;
+    bit cq_polarity;
 `ifdef RDMA_NET_PACKET
     rdma_packet packet;
     rdma_net_fault packet_fault;
@@ -874,8 +902,8 @@ class rdma_multivf_recovery_test extends uvm_test;
         stamp_fault_status(vf_index, status, RDMA_ENGINE_CMQ);
       end
       RDMA_FAULT_CQE_ERROR: begin
-        // 设备先把错误 ecode 编码写入 CQ backing，engine 再执行 read →
-        // decode → completion_status_from_ecode；测试不直接覆盖最终状态。
+        // 业务错误 ecode 仍是合法 completion：先 post 建立 WQE ledger，再查询
+        // runtime polarity 并经 public publish 提交，poll 只把 ecode 映射为业务状态。
         engine = cqe_fixture == null ? null : cqe_fixture.engine;
         if (engine == null || cqe_fixture.qp == null ||
             cqe_fixture.qp.handle == null || cqe_fixture.cq == null ||
@@ -906,12 +934,25 @@ class rdma_multivf_recovery_test extends uvm_test;
               cqe.wqe_index = posted.index;
               cqe.wqe_wrap = posted.wrap;
               cqe.rq_cqe = 1'b0;
-              cqe.polarity = 1'b1;
+              status = engine.query_runtime_producer_polarity(
+                cqe_fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, cq_polarity);
+              cqe.polarity = cq_polarity;
               cqe.packet_opcode = 8'h01;
               cqe.ecode = RDMA_ECODE_EC_RCE_CQ_FULL;
               cqe.payload_len = 0;
               cqe.status = rdma_status::success();
-              status = cqe_fixture.write_cq_entry(0, cqe);
+              if (status != null && status.ok()) begin
+                published = null;
+                engine.publish_cqe(
+                  cqe_fixture.cq.handle, cqe, published, status);
+                if (status != null && status.ok() &&
+                    (published == null || published.index != 0 ||
+                     published.wrap || !published.occupancy_valid ||
+                     published.occupancy != 1))
+                  status = rdma_status::make(
+                    RDMA_SC_INVALID_STATE,
+                    "CQE error public publish result is inconsistent");
+              end
             end
             if (status != null && status.ok()) begin
               queue_completion = null;
@@ -1235,6 +1276,10 @@ class rdma_multivf_recovery_test extends uvm_test;
     if (coverage == null || coverage.sample_count() < 4 ||
         !coverage.has_fault_coverage())
       `uvm_error("MULTIVF_COVER", "fault matrix did not produce coverage evidence")
+    cleanup_cqe_fixture(status);
+    if (status == null || !status.ok())
+      `uvm_error("MULTIVF_CQE_CLEANUP", status == null ?
+                 "CQE fixture cleanup returned null" : status.convert2string())
     fixture_ready = 1'b0;
     phase.drop_objection(this);
   endtask

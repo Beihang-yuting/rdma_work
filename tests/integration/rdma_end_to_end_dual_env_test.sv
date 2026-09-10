@@ -5,8 +5,9 @@
 //   rdma_net_packet_adapter 和 rdma_net_packet_queue_sink；外部源码只通过
 //   filelist 路径引用，本文件不复制或修改外部组件。
 // 所有权与生命周期：测试独占 tx/rx fixture、host-memory manager、adapter、
-//   sink 和 payload mapping；每个 mapping 先显式 release，再销毁 QP/CQ/CEQ，
-//   最后以 adapter.check_leaks() 和 host_mem.leak_check() 验证没有残留资源。
+//   sink 和 payload mapping；每个 mapping 先显式 release，再销毁
+//   QP/CQ/CEQ/AEQ、PD 与 Function，最后以 adapter.check_leaks() 和
+//   host_mem.leak_check() 验证没有残留资源。
 
 // 中文说明：该测试故意把发送端和接收端放在不同 Function/IOVA/物理区间，
 // 从而验证多 Host 场景下不能通过默认 root/PF 或别名 mapping 误串线。
@@ -28,9 +29,6 @@ class rdma_end_to_end_dual_env_test extends uvm_test;
   localparam int unsigned PACKET_COUNT = 128;
   localparam int unsigned PAYLOAD_BYTES = 256;
   localparam int unsigned CQ_DEPTH = 16;
-  // CQ 生命周期策略为硬件 CQ ring 选择 1 作为首个 slot 的 owner，后续
-  // 每次 ring wrap 翻转一次；测试生成的 CQE 必须遵循该 runtime 约定。
-  localparam bit CQ_INITIAL_POLARITY = 1'b1;
 
   rdma_queue_data_engine_fixture tx_env;
   rdma_queue_data_engine_fixture rx_env;
@@ -242,16 +240,16 @@ class rdma_end_to_end_dual_env_test extends uvm_test;
   endfunction
 
   // 功能：生成设备侧 CQE，分别表示发送 SQ 或接收 RQ 的 WQE 已完成。
-  // 输入/输出及副作用：qp、posted、rq_cqe、packet_index、cq_slot（输入）；返回
+  // 输入/输出及副作用：qp、posted、rq_cqe、packet_index、polarity（输入）；返回
   //   新建 CQE 值对象，不写入 CQ backing。
   // 失败/边界：posted 为空时仍生成占位 index=0，调用方必须在写 CQE 前检查
-  //   post status；cq_slot 用于计算 owner polarity 的 wrap。
+  //   post status；polarity 必须来自目标 env 的公开 runtime query。
   function automatic rdma_hw_cqe_model make_cqe(
     rdma_qp qp,
     rdma_queue_post_result posted,
     bit rq_cqe,
     int unsigned packet_index,
-    int unsigned cq_slot
+    bit polarity
   );
     rdma_hw_cqe_model cqe;
 
@@ -263,7 +261,7 @@ class rdma_end_to_end_dual_env_test extends uvm_test;
     cqe.wqe_index = posted == null ? 0 : posted.index;
     cqe.wqe_wrap = posted == null ? 0 : posted.wrap;
     cqe.rq_cqe = rq_cqe;
-    cqe.polarity = CQ_INITIAL_POLARITY ^ bit'(cq_slot / CQ_DEPTH);
+    cqe.polarity = polarity;
     cqe.packet_opcode = 8'h01;
     cqe.ecode = RDMA_CMQ_SUCCESS_ECODE;
     cqe.payload_len = PAYLOAD_BYTES;
@@ -271,12 +269,13 @@ class rdma_end_to_end_dual_env_test extends uvm_test;
     return cqe;
   endfunction
 
-  // 功能：在 CQ backing 写入一个 CQE 并轮询一次，验证 CI 提交、WQE release
-  //   和 detached completion 的 WR ID/状态。
+  // 功能：经公开 publish_cqe 提交一个有真实 WQE ledger 的 CQE 并 poll 一次，
+  //   验证 producer cursor/wrap、CI commit、WQE release 与 detached completion。
   // 输入/输出及副作用：env、posted、rq_cqe、packet_index、cq_slot（输入）；
-  //   写入真实 host_mem 并推进该 env 的 CQ consumer cursor。
-  // 失败/边界：任一 write/poll/route/status 失败返回错误；失败时 result 保持
-  //   为空，调用方不得将该包计入成功吞吐。
+  //   query 目标 CQ polarity 后写入真实 host_mem，并推进该 env 的 CQ PI/CI；
+  //   publish result/pending 由 engine 管理，调用方不取得 runtime 所有权。
+  // 失败/边界：post/handle/polarity/publish/poll/route 任一步失败返回首个错误；
+  //   publish 失败时 result 保持空，调用方不得直接写 backing 或计入成功吞吐。
   task automatic publish_and_poll_cqe(
     rdma_queue_data_engine_fixture env,
     rdma_qp qp,
@@ -287,13 +286,37 @@ class rdma_end_to_end_dual_env_test extends uvm_test;
     output rdma_status status
   );
     rdma_hw_cqe_model cqe;
+    rdma_queue_device_publish_result published;
     rdma_queue_completion_result completion;
+    bit polarity;
 
     status = rdma_status::success();
-    cqe = make_cqe(qp, posted, rq_cqe, packet_index, cq_slot);
-    status = env.write_cq_entry(cq_slot % CQ_DEPTH, cqe);
-    if (status == null || !status.ok())
+    if (env == null || env.engine == null || env.cq == null ||
+        posted == null || posted.status == null || !posted.status.ok()) begin
+      status = rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                                 "E2E CQ publish evidence is incomplete");
       return;
+    end
+    status = env.engine.query_runtime_producer_polarity(
+      env.cq.handle, RDMA_QUEUE_RUNTIME_CQ, polarity);
+    if (status == null || !status.ok()) return;
+    cqe = make_cqe(qp, posted, rq_cqe, packet_index, polarity);
+    if (cqe == null || cqe.qp_h == null) begin
+      status = rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED,
+                                 "E2E CQE model construction failed");
+      return;
+    end
+    published = null;
+    env.engine.publish_cqe(env.cq.handle, cqe, published, status);
+    if (status == null || !status.ok() || published == null ||
+        published.index != cq_slot % CQ_DEPTH ||
+        published.wrap != bit'(cq_slot / CQ_DEPTH) ||
+        !published.occupancy_valid || published.occupancy != 1) begin
+      if (status == null || status.ok())
+        status = rdma_status::make(RDMA_SC_INVALID_STATE,
+                                   "E2E CQ publish cursor/occupancy mismatch");
+      return;
+    end
     completion = null;
     env.engine.poll_cqe(env.cq.handle, 0, completion, status);
     if (status == null || !status.ok() || completion == null ||
@@ -472,10 +495,12 @@ class rdma_end_to_end_dual_env_test extends uvm_test;
     status = rdma_status::success();
   endtask
 
-  // 功能：销毁 fixture 的 QP/CQ/CEQ，并释放真实 adapter 的 payload mapping。
+  // 功能：释放 payload mapping，并委托 fixture 聚合 cleanup 撤销
+  //   QP/CQ/CEQ/AEQ、PD 与 Function 的完整 lifecycle。
   // 输入/输出及副作用：env、adapter、mapping（输入）；向 lifecycle executor
-  //   提交 destroy，释放 host_mem backing，并通过 leak_count 输出 owner 账本状态。
-  // 失败/边界：任一 release/destroy 失败记录 UVM error 但继续清理其余资源，
+  //   释放 host_mem backing，并通过 leak_count 输出 owner 账本状态；env.cleanup
+  //   负责借用 attachment 与 owned queue 的逆序回收。
+  // 失败/边界：任一 release/cleanup 失败记录 UVM error 但继续 adapter leak 检查，
   //   防止一个失败路径掩盖其它 mapping 泄漏。
   task automatic cleanup_env(
     string tag,
@@ -484,8 +509,6 @@ class rdma_end_to_end_dual_env_test extends uvm_test;
     inout rdma_dma_mapping mapping
   );
     rdma_status status;
-    rdma_control_result destroy_result;
-    rdma_destroy_resource_req destroy_request;
     int unsigned leak_count;
 
     if (adapter != null && mapping != null) begin
@@ -495,54 +518,12 @@ class rdma_end_to_end_dual_env_test extends uvm_test;
                     tag, status == null ? "null" : status.convert2string()))
       mapping = null;
     end
-    if (env == null || env.binding == null)
-      return;
-    // 附加 UD/URC QP 与基础 RC QP 共用同一 Function/CQ，但各自拥有独立
-    // transport context 和 backing；必须按 QP 逐一销毁，不能只销毁 RC。
-    if (env.ud_qp != null) begin
-      destroy_request = rdma_destroy_resource_req::type_id::create(
-        {tag, "_destroy_ud_qp"});
-      destroy_request.owner = env.binding.make_handle();
-      destroy_request.target_h = env.ud_qp.handle;
-      env.qp_executor.destroy_locked(env.binding, env.binding.make_handle(),
-                                     destroy_request, 64'h3010,
-                                     destroy_result);
-    end
-    if (env.urc_qp != null) begin
-      destroy_request = rdma_destroy_resource_req::type_id::create(
-        {tag, "_destroy_urc_qp"});
-      destroy_request.owner = env.binding.make_handle();
-      destroy_request.target_h = env.urc_qp.handle;
-      env.qp_executor.destroy_locked(env.binding, env.binding.make_handle(),
-                                     destroy_request, 64'h3011,
-                                     destroy_result);
-    end
-    if (env.qp != null) begin
-      destroy_request = rdma_destroy_resource_req::type_id::create(
-        {tag, "_destroy_qp"});
-      destroy_request.owner = env.binding.make_handle();
-      destroy_request.target_h = env.qp.handle;
-      env.qp_executor.destroy_locked(env.binding, env.binding.make_handle(),
-                                     destroy_request, 64'h3001,
-                                     destroy_result);
-    end
-    if (env.cq != null) begin
-      destroy_request = rdma_destroy_resource_req::type_id::create(
-        {tag, "_destroy_cq"});
-      destroy_request.owner = env.binding.make_handle();
-      destroy_request.target_h = env.cq.handle;
-      env.queue_executor.destroy_locked(env.binding, env.binding.make_handle(),
-                                        destroy_request, 64'h3002,
-                                        destroy_result);
-    end
-    if (env.ceq != null) begin
-      destroy_request = rdma_destroy_resource_req::type_id::create(
-        {tag, "_destroy_ceq"});
-      destroy_request.owner = env.binding.make_handle();
-      destroy_request.target_h = env.ceq.handle;
-      env.queue_executor.destroy_locked(env.binding, env.binding.make_handle(),
-                                        destroy_request, 64'h3003,
-                                        destroy_result);
+    if (env != null) begin
+      env.cleanup(status);
+      if (status == null || !status.ok())
+        `uvm_error("E2E_FIXTURE_CLEANUP", $sformatf(
+          "%s fixture cleanup failed: %s", tag,
+          status == null ? "null" : status.convert2string()))
     end
     if (adapter != null) begin
       status = adapter.check_leaks(leak_count);

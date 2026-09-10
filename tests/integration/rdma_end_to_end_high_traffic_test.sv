@@ -129,6 +129,8 @@ class rdma_end_to_end_high_traffic_test extends rdma_end_to_end_transport_test;
     rdma_packet network_packet;
     rdma_packet received_packet;
     rdma_hw_cqe_model cqe;
+    rdma_queue_device_publish_result tx_published[HIGH_WINDOW];
+    rdma_queue_device_publish_result rx_published[HIGH_WINDOW];
     byte unsigned payload[$];
     byte write_data[];
     byte tx_readback[];
@@ -199,6 +201,7 @@ class rdma_end_to_end_high_traffic_test extends rdma_end_to_end_transport_test;
     rdma_function_identity rx_identity;
     bit saw_sq_wrap;
     bit saw_rq_wrap;
+    bit cq_polarity;
 
     status = rdma_status::success();
     tx_cq_absolute = 0;
@@ -536,37 +539,73 @@ class rdma_end_to_end_high_traffic_test extends rdma_end_to_end_transport_test;
         return;
       end
 
-      // 先把整个窗口的 TX/RX CQE 写入真实 CQ backing，再按四个一批 poll。
-      // 这验证了 CQE backing 的延迟消费、owner polarity 和 consumer 侧批量
-      // 回收；write_cq_entry 当前不推进 queue-data 的硬件 producer 账本，
-      // 因而这里不宣称已经覆盖真实 CQ producer/CEQ 中断 backpressure。
+      // 中文设计：先经组合 engine 的公开 producer pipeline 填满 TX/RX CQ，
+      // 保存每项 result.index/wrap/occupancy，再按四个一批独立 poll 两个 ring；
+      // 这样 backing、runtime credit 与 WQE ledger 在整窗延迟消费期间保持一致。
       for (int unsigned slot = 0; slot < HIGH_WINDOW; slot++) begin
+        tx_status = tx_composition_env.queue_data.query_runtime_producer_polarity(
+          tx_env.cq.handle, RDMA_QUEUE_RUNTIME_CQ, cq_polarity);
+        if (tx_status == null || !tx_status.ok()) begin status = tx_status; return; end
         cqe = make_cqe(tx_env.qp, tx_window_posts[slot], 1'b0,
-                       window_base + slot, tx_cq_absolute + slot);
+                       window_base + slot, cq_polarity);
         cqe.wr_id = tx_window_posts[slot].wr_id;
         cqe.opcode = RDMA_WR_SEND;
         cqe.byte_len = HIGH_PAYLOAD_BYTES;
-        if (cqe.polarity != (1'b1 ^ bit'((tx_cq_absolute + slot) / HIGH_CQ_DEPTH))) begin
-          status = rdma_status::make(RDMA_SC_INVALID_STATE,
-                                     "TX CQE owner polarity does not match absolute slot");
+        tx_published[slot] = null;
+        tx_composition_env.queue_data.publish_cqe(
+          tx_env.cq.handle, cqe, tx_published[slot], tx_status);
+        if (tx_status == null || !tx_status.ok() || tx_published[slot] == null ||
+            tx_published[slot].index !=
+              (tx_cq_absolute + slot) % HIGH_CQ_DEPTH ||
+            tx_published[slot].wrap !=
+              bit'((tx_cq_absolute + slot) / HIGH_CQ_DEPTH) ||
+            !tx_published[slot].occupancy_valid ||
+            tx_published[slot].occupancy != slot + 1) begin
+          status = tx_status == null || tx_status.ok() ?
+            rdma_status::make(RDMA_SC_INVALID_STATE,
+                              "TX CQ public publish result mismatch") : tx_status;
           return;
         end
-        tx_status = tx_env.write_cq_entry((tx_cq_absolute + slot) % HIGH_CQ_DEPTH,
-                                          cqe);
-        if (tx_status == null || !tx_status.ok()) begin status = tx_status; return; end
+        rx_status = rx_composition_env.queue_data.query_runtime_producer_polarity(
+          rx_env.cq.handle, RDMA_QUEUE_RUNTIME_CQ, cq_polarity);
+        if (rx_status == null || !rx_status.ok()) begin status = rx_status; return; end
         cqe = make_cqe(rx_env.qp, rx_window_posts[slot], 1'b1,
-                       window_base + slot, rx_cq_absolute + slot);
+                       window_base + slot, cq_polarity);
         cqe.wr_id = rx_window_posts[slot].wr_id;
         cqe.opcode = RDMA_WR_RECV;
         cqe.byte_len = HIGH_PAYLOAD_BYTES;
-        if (cqe.polarity != (1'b1 ^ bit'((rx_cq_absolute + slot) / HIGH_CQ_DEPTH))) begin
-          status = rdma_status::make(RDMA_SC_INVALID_STATE,
-                                     "RX CQE owner polarity does not match absolute slot");
+        rx_published[slot] = null;
+        rx_composition_env.queue_data.publish_cqe(
+          rx_env.cq.handle, cqe, rx_published[slot], rx_status);
+        if (rx_status == null || !rx_status.ok() || rx_published[slot] == null ||
+            rx_published[slot].index !=
+              (rx_cq_absolute + slot) % HIGH_CQ_DEPTH ||
+            rx_published[slot].wrap !=
+              bit'((rx_cq_absolute + slot) / HIGH_CQ_DEPTH) ||
+            !rx_published[slot].occupancy_valid ||
+            rx_published[slot].occupancy != slot + 1) begin
+          status = rx_status == null || rx_status.ok() ?
+            rdma_status::make(RDMA_SC_INVALID_STATE,
+                              "RX CQ public publish result mismatch") : rx_status;
           return;
         end
-        rx_status = rx_env.write_cq_entry((rx_cq_absolute + slot) % HIGH_CQ_DEPTH,
-                                          cqe);
-        if (rx_status == null || !rx_status.ok()) begin status = rx_status; return; end
+      end
+
+      local_status = tx_composition_env.queue_data.query_runtime_occupancy(
+        tx_env.cq.handle, RDMA_QUEUE_RUNTIME_CQ, tx_cq_used, tx_cq_pending);
+      if (local_status == null || !local_status.ok() ||
+          tx_cq_used != HIGH_CQ_DEPTH || tx_cq_pending) begin
+        status = rdma_status::make(RDMA_SC_INVALID_STATE,
+                                   "TX CQ did not reach committed full occupancy");
+        return;
+      end
+      local_status = rx_composition_env.queue_data.query_runtime_occupancy(
+        rx_env.cq.handle, RDMA_QUEUE_RUNTIME_CQ, rx_cq_used, rx_cq_pending);
+      if (local_status == null || !local_status.ok() ||
+          rx_cq_used != HIGH_CQ_DEPTH || rx_cq_pending) begin
+        status = rdma_status::make(RDMA_SC_INVALID_STATE,
+                                   "RX CQ did not reach committed full occupancy");
+        return;
       end
 
       completed_in_window = 0;
@@ -731,6 +770,10 @@ class rdma_end_to_end_high_traffic_test extends rdma_end_to_end_transport_test;
         `uvm_error("HIGH_TRAFFIC_RX_CREDIT", "RX RQ did not fully drain")
     end
     drain_composition_pending();
+    cleanup_composition_data_paths(status);
+    if (status == null || !status.ok())
+      `uvm_error("HIGH_TRAFFIC_COMPOSITION_CLEANUP",
+                 status == null ? "null cleanup status" : status.convert2string())
     cleanup_env("high_tx", tx_env, tx_host_adapter, tx_payload_mapping);
     cleanup_env("high_rx", rx_env, rx_host_adapter, rx_payload_mapping);
     if (tx_host_mem != null)
