@@ -305,10 +305,15 @@ class rdma_multivf_recovery_test extends uvm_test;
   //   fixture，避免仅清空对象引用而遗留 mock backing 与 manager resource。
   // 输入/输出及副作用：status 为输出；成功时调用 fixture 聚合 cleanup 并清除
   //   cqe_fixture 所有权出口，不影响四个真实 VF Host-memory mapping。
-  // 失败/边界：fixture 为空时幂等成功；cleanup 返回 null/失败时保留对象引用供
-  //   诊断或重试，不把未释放状态伪装为成功。
+  // 失败/边界：fixture 为空或 created/attached 标志已全部清除时幂等成功；
+  //   cleanup 返回 null/失败时保留对象引用供诊断或重试，不把未释放状态伪装为成功。
   task automatic cleanup_cqe_fixture(output rdma_status status);
     if (cqe_fixture == null) begin
+      status = rdma_status::success();
+      return;
+    end
+    if (!cqe_fixture.needs_cleanup()) begin
+      cqe_fixture = null;
       status = rdma_status::success();
       return;
     end
@@ -750,6 +755,76 @@ class rdma_multivf_recovery_test extends uvm_test;
     fixture_ready = 1'b1;
   endtask
 
+  // 功能：validate_cqe_release_credit 核对业务错误 CQE 仍精确释放
+  //   本轮 post 的唯一 SQ slot，并证明 SQ producer/consumer credit 归零。
+  // 输入/输出及副作用：engine、fixture、posted、completion 为输入，
+  //   status 为输出；只读 detached release evidence 和公开 SQ runtime，不推进游标。
+  // 失败/边界：缺少句柄/结果、released_slots 非唯一或 wr_id/index/wrap
+  //   不符、SQ occupancy/pending 未归零或 PI/CI 未按 post 的下一游标收敛时失败。
+  task automatic validate_cqe_release_credit(
+    rdma_queue_data_engine engine,
+    rdma_queue_data_engine_fixture fixture,
+    rdma_queue_post_result posted,
+    rdma_queue_completion_result completion,
+    output rdma_status status
+  );
+    int unsigned sq_used;
+    int unsigned sq_pi;
+    int unsigned sq_ci;
+    int unsigned expected_next_index;
+    bit sq_pending;
+    bit sq_pw;
+    bit sq_cw;
+    bit expected_next_wrap;
+
+    status = rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "CQE release evidence is incomplete");
+    if (engine == null || fixture == null || fixture.qp == null ||
+        fixture.qp.handle == null || fixture.qp.sq_depth == 0 ||
+        posted == null || completion == null || completion.cqe == null)
+      return;
+    if (completion.cqe.wr_id != posted.wr_id ||
+        completion.cqe.wqe_index != posted.index ||
+        completion.cqe.wqe_wrap != posted.wrap ||
+        completion.cqe.qpn != fixture.qp.local_qp_id ||
+        completion.released_slots.size() != 1 ||
+        completion.released_slots[0] == null ||
+        completion.released_slots[0].wr_id != posted.wr_id ||
+        completion.released_slots[0].index != posted.index ||
+        completion.released_slots[0].wrap != posted.wrap) begin
+      status = rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "CQE poll did not release the exact posted SQ slot");
+      return;
+    end
+    status = engine.query_runtime_occupancy(
+      fixture.qp.handle, RDMA_QUEUE_RUNTIME_SQ, sq_used, sq_pending);
+    if (status == null || !status.ok()) return;
+    if (sq_used != 0 || sq_pending) begin
+      status = rdma_status::make(
+        RDMA_SC_INVALID_STATE, "CQE poll did not return SQ credit to zero");
+      return;
+    end
+    status = engine.query_runtime_cursors(
+      fixture.qp.handle, RDMA_QUEUE_RUNTIME_SQ,
+      sq_pi, sq_pw, sq_ci, sq_cw);
+    if (status == null || !status.ok()) return;
+    expected_next_index = posted.index + 1;
+    expected_next_wrap = posted.wrap;
+    if (expected_next_index == fixture.qp.sq_depth) begin
+      expected_next_index = 0;
+      expected_next_wrap = ~expected_next_wrap;
+    end
+    if (sq_pi != expected_next_index || sq_pw != expected_next_wrap ||
+        sq_ci != expected_next_index || sq_cw != expected_next_wrap) begin
+      status = rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "CQE poll SQ cursors do not converge at the hand-calculated next slot");
+      return;
+    end
+    status = rdma_status::success();
+  endtask
+
   // 功能：执行一个 VF 故障场景并映射为统一 rdma_status，同时采样 coverage fault 证据。
   // 输入/输出及副作用：vf_index/fault（输入）、status（输出）；VF_FLR 会推进目标 generation，
   //   并 drain/reallocate 目标 mapping；正常返回时更新 vf_status 并发布 coverage 样本。
@@ -981,10 +1056,23 @@ class rdma_multivf_recovery_test extends uvm_test;
                   "VF%0d CQE completion evidence is missing", vf_index))
               end
               else begin
-                // poll_cqe 的顶层 status 只表示 read/decode/CI/WQE-release
-                // 事务完成；硬件 ecode 的业务结果位于 completion_status。
-                status = rdma_clone_status_value(
-                  queue_completion.completion_status);
+                validate_cqe_release_credit(
+                  engine, cqe_fixture, posted, queue_completion, poll_status);
+                if (poll_status == null || !poll_status.ok()) begin
+                  status = poll_status == null ? rdma_status::make(
+                    RDMA_SC_INVALID_STATE,
+                    "CQE release-credit validation returned null") : poll_status;
+                  `uvm_error("MULTIVF_CQE", $sformatf(
+                    "VF%0d CQE release-credit evidence failed: %s", vf_index,
+                    status.convert2string()))
+                end
+                else begin
+                  // poll_cqe 的顶层 status 只表示 read/decode/CI/WQE-release
+                  // 事务完成；只有 ledger/credit 已独立验证后才接受 ecode
+                  // 的业务结果，避免 QUEUE_FULL 掩盖 SQ slot 未释放。
+                  status = rdma_clone_status_value(
+                    queue_completion.completion_status);
+                end
                 if (status == null) begin
                   status = rdma_status::make(
                     RDMA_SC_INVALID_STATE,
@@ -992,7 +1080,8 @@ class rdma_multivf_recovery_test extends uvm_test;
                   `uvm_error("MULTIVF_CQE", $sformatf(
                     "VF%0d CQE completion clone failed", vf_index))
                 end
-                else if (status.code != RDMA_SC_QUEUE_FULL)
+                else if (poll_status != null && poll_status.ok() &&
+                         status.code != RDMA_SC_QUEUE_FULL)
                   `uvm_error("MULTIVF_CQE", $sformatf(
                     "VF%0d unexpected CQE completion code: %s", vf_index,
                     status.convert2string()))

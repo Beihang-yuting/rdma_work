@@ -99,7 +99,7 @@ class rdma_queue_data_engine_poll_test extends uvm_test;
   // 功能：run_phase 验证未配置拒绝、post→public publish_cqe→poll 的 WQE release，
   //   以及 consumer commit 后 CQ 为空的可观察结果。
   // 输入/输出及副作用：phase 为输入；任务创建 fixture、调用公开 API 并报告断言，
-  //   不直接写入正向 CQ backing，也不接管 fixture 资源。
+  //   不直接写入正向 CQ backing，最终聚合释放 fixture-owned lifecycle 资源。
   // 失败边界：setup、post、polarity、CQE 构造、publish 或 poll 失败时停止后续正向
   //   事务并释放 objection；第二次 poll 只能返回 QUEUE_EMPTY。
   task run_phase(uvm_phase phase);
@@ -231,7 +231,7 @@ class rdma_queue_data_engine_poll_test extends uvm_test;
                    status.convert2string())
     end
 
-    if (fixture != null) begin
+    if (fixture != null && fixture.needs_cleanup()) begin
       fixture.cleanup(cleanup_status);
       if (cleanup_status == null || !cleanup_status.ok())
         `uvm_error("POLL_CLEANUP", cleanup_status == null ?

@@ -90,8 +90,8 @@ class rdma_cq_engine_test extends uvm_test;
   //   publish_cqe 与 facade publish_cqe 的成功输出及确定性拒绝输出。
   // 输入/输出及副作用：无显式输入；两边各 post/publish 一个 WQE 并写各自 backing，
   //   逐字段比较 queue_h、image、index/wrap/occupancy/status，不共享可变 runtime。
-  // 失败/边界：任一 setup/configure/post/model/publish 失败立即报告；null model 拒绝
-  //   必须保留 delegate 的精确 code/message 且 direct/facade result 都为 null。
+  // 失败/边界：任一 setup/configure/post/model/publish 失败立即报告并进入 epilogue；
+  //   null model 拒绝必须保留精确 code/message，两个 fixture 各自独立完成清理。
   task automatic check_publish_delegate_equivalence();
     rdma_queue_data_engine_fixture direct_fixture;
     rdma_queue_data_engine_fixture facade_fixture;
@@ -104,6 +104,8 @@ class rdma_cq_engine_test extends uvm_test;
     rdma_hw_cqe_model facade_model;
     rdma_status direct_status;
     rdma_status facade_status;
+    rdma_status direct_cleanup_status;
+    rdma_status facade_cleanup_status;
     bit direct_polarity;
     bit facade_polarity;
 
@@ -111,26 +113,27 @@ class rdma_cq_engine_test extends uvm_test;
       "cq_direct_publish_fixture");
     facade_fixture = rdma_queue_data_engine_fixture::type_id::create(
       "cq_forward_publish_fixture");
-    if (direct_fixture == null || facade_fixture == null) begin
-      `uvm_error("CQ_DELEGATE_FIXTURE", "CQ equivalence fixture allocation failed")
-      return;
-    end
-    direct_fixture.setup(direct_status);
-    facade_fixture.setup(facade_status);
-    if (direct_status == null || !direct_status.ok() ||
-        facade_status == null || !facade_status.ok()) begin
-      `uvm_error("CQ_DELEGATE_SETUP", "CQ equivalence fixture setup failed")
-      return;
-    end
-    facade = rdma_cq_engine::type_id::create("cq_publish_equivalence_facade");
-    facade_status = facade.configure(
-      facade_fixture.manager, facade_fixture.binding, facade_fixture.mem,
-      facade_fixture.scheduler, facade_fixture.registry, 2us,
-      facade_fixture.engine);
-    if (facade_status == null || !facade_status.ok()) begin
-      `uvm_error("CQ_DELEGATE_CONFIGURE", "CQ equivalence facade configure failed")
-      return;
-    end
+    begin : delegate_equivalence_flow
+      if (direct_fixture == null || facade_fixture == null) begin
+        `uvm_error("CQ_DELEGATE_FIXTURE", "CQ equivalence fixture allocation failed")
+        disable delegate_equivalence_flow;
+      end
+      direct_fixture.setup(direct_status);
+      facade_fixture.setup(facade_status);
+      if (direct_status == null || !direct_status.ok() ||
+          facade_status == null || !facade_status.ok()) begin
+        `uvm_error("CQ_DELEGATE_SETUP", "CQ equivalence fixture setup failed")
+        disable delegate_equivalence_flow;
+      end
+      facade = rdma_cq_engine::type_id::create("cq_publish_equivalence_facade");
+      facade_status = facade.configure(
+        facade_fixture.manager, facade_fixture.binding, facade_fixture.mem,
+        facade_fixture.scheduler, facade_fixture.registry, 2us,
+        facade_fixture.engine);
+      if (facade_status == null || !facade_status.ok()) begin
+        `uvm_error("CQ_DELEGATE_CONFIGURE", "CQ equivalence facade configure failed")
+        disable delegate_equivalence_flow;
+      end
 
     direct_fixture.engine.post_send(
       direct_fixture.make_send(64'h5151), direct_posted, direct_status);
@@ -139,7 +142,7 @@ class rdma_cq_engine_test extends uvm_test;
     if (direct_status == null || !direct_status.ok() || direct_posted == null ||
         facade_status == null || !facade_status.ok() || facade_posted == null) begin
       `uvm_error("CQ_DELEGATE_POST", "CQ equivalence WQE post failed")
-      return;
+      disable delegate_equivalence_flow;
     end
     direct_status = direct_fixture.engine.query_runtime_producer_polarity(
       direct_fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, direct_polarity);
@@ -148,7 +151,7 @@ class rdma_cq_engine_test extends uvm_test;
     if (direct_status == null || !direct_status.ok() ||
         facade_status == null || !facade_status.ok()) begin
       `uvm_error("CQ_DELEGATE_POLARITY", "CQ equivalence polarity query failed")
-      return;
+      disable delegate_equivalence_flow;
     end
     make_publish_cqe(
       direct_fixture, direct_posted, direct_polarity, direct_model, direct_status);
@@ -157,7 +160,7 @@ class rdma_cq_engine_test extends uvm_test;
     if (direct_status == null || !direct_status.ok() || direct_model == null ||
         facade_status == null || !facade_status.ok() || facade_model == null) begin
       `uvm_error("CQ_DELEGATE_MODEL", "CQ equivalence model construction failed")
-      return;
+      disable delegate_equivalence_flow;
     end
     direct_fixture.engine.publish_cqe(
       direct_fixture.cq.handle, direct_model, direct_result, direct_status);
@@ -203,6 +206,24 @@ class rdma_cq_engine_test extends uvm_test;
         direct_result != null || facade_result != null)
       `uvm_error("CQ_DELEGATE_REJECT",
                  "CQ facade rejection differs from direct delegate")
+    end
+
+    if (direct_fixture != null && direct_fixture.needs_cleanup()) begin
+      direct_fixture.cleanup(direct_cleanup_status);
+      if (direct_cleanup_status == null || !direct_cleanup_status.ok())
+        `uvm_error("CQ_DELEGATE_DIRECT_CLEANUP",
+                   direct_cleanup_status == null ?
+                   "direct fixture cleanup returned null" :
+                   direct_cleanup_status.convert2string())
+    end
+    if (facade_fixture != null && facade_fixture.needs_cleanup()) begin
+      facade_fixture.cleanup(facade_cleanup_status);
+      if (facade_cleanup_status == null || !facade_cleanup_status.ok())
+        `uvm_error("CQ_DELEGATE_FACADE_CLEANUP",
+                   facade_cleanup_status == null ?
+                   "facade fixture cleanup returned null" :
+                   facade_cleanup_status.convert2string())
+    end
   endtask
 
   // 功能：check_cqe_stride_profile 通过 CQ facade 连续发布两个真实 SQ completion，
@@ -221,6 +242,12 @@ class rdma_cq_engine_test extends uvm_test;
     rdma_status status, model_status, cleanup_status;
     byte slot0[], slot1[];
     bit polarity;
+    bit initial_polarity;
+    bit initial_polarity_found;
+    int unsigned cq_used;
+    int unsigned sq_used;
+    bit cq_pending;
+    bit sq_pending;
 
     fixture = rdma_queue_data_engine_fixture::type_id::create(
       $sformatf("cq_stride_%0d_fixture", cqe_size));
@@ -235,6 +262,20 @@ class rdma_cq_engine_test extends uvm_test;
                    "stride setup returned null" : status.convert2string())
         disable stride_flow;
       end
+      initial_polarity = 1'b0;
+      initial_polarity_found = 1'b0;
+      foreach (fixture.cq.queue_plan.rings[i]) begin
+        if (fixture.cq.queue_plan.rings[i] != null &&
+            fixture.cq.queue_plan.rings[i].role == RDMA_QUEUE_ROLE_CQ_RING) begin
+          initial_polarity =
+            fixture.cq.queue_plan.rings[i].initial_polarity;
+          initial_polarity_found = 1'b1;
+        end
+      end
+      if (!initial_polarity_found) begin
+        `uvm_error("CQ_STRIDE_LAYOUT", "CQ initial polarity is unavailable")
+        disable stride_flow;
+      end
       facade = rdma_cq_engine::type_id::create(
         $sformatf("cq_stride_%0d_facade", cqe_size));
       status = facade.configure(
@@ -247,12 +288,19 @@ class rdma_cq_engine_test extends uvm_test;
 
       fixture.engine.post_send(
         fixture.make_send(64'h6000 + cqe_size), posted0, status);
-      if (status == null || !status.ok() || posted0 == null) begin
+      if (status == null || !status.ok() || posted0 == null ||
+          posted0.wr_id != 64'h6000 + cqe_size ||
+          posted0.index != 0 || posted0.wrap) begin
         `uvm_error("CQ_STRIDE_POST0", "first stride WQE post failed")
         disable stride_flow;
       end
       status = fixture.engine.query_runtime_producer_polarity(
         fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, polarity);
+      if (status == null || !status.ok() || polarity != initial_polarity) begin
+        `uvm_error("CQ_STRIDE_POLARITY0",
+                   "first CQ polarity differs from layout oracle")
+        disable stride_flow;
+      end
       make_publish_cqe(fixture, posted0, polarity, cqe0, model_status);
       if (status == null || !status.ok() || model_status == null ||
           !model_status.ok() || cqe0 == null) begin
@@ -272,12 +320,19 @@ class rdma_cq_engine_test extends uvm_test;
 
       fixture.engine.post_send(
         fixture.make_send(64'h7000 + cqe_size), posted1, status);
-      if (status == null || !status.ok() || posted1 == null) begin
+      if (status == null || !status.ok() || posted1 == null ||
+          posted1.wr_id != 64'h7000 + cqe_size ||
+          posted1.index != 1 || posted1.wrap) begin
         `uvm_error("CQ_STRIDE_POST1", "second stride WQE post failed")
         disable stride_flow;
       end
       status = fixture.engine.query_runtime_producer_polarity(
         fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, polarity);
+      if (status == null || !status.ok() || polarity != initial_polarity) begin
+        `uvm_error("CQ_STRIDE_POLARITY1",
+                   "second CQ polarity differs from layout oracle")
+        disable stride_flow;
+      end
       make_publish_cqe(fixture, posted1, polarity, cqe1, model_status);
       if (status == null || !status.ok() || model_status == null ||
           !model_status.ok() || cqe1 == null) begin
@@ -327,17 +382,45 @@ class rdma_cq_engine_test extends uvm_test;
       end
       facade.poll_cqe(fixture.cq.handle, completion, status);
       if (status == null || !status.ok() || completion == null ||
-          completion.cqe == null || completion.cqe.wr_id != posted0.wr_id) begin
+          completion.cqe == null ||
+          completion.cqe.wr_id != 64'h6000 + cqe_size ||
+          completion.cqe.qpn != fixture.qp.local_qp_id ||
+          completion.cqe.wqe_index != 0 || completion.cqe.wqe_wrap ||
+          completion.cqe.polarity != initial_polarity ||
+          completion.released_slots.size() != 1 ||
+          completion.released_slots[0] == null ||
+          completion.released_slots[0].wr_id != 64'h6000 + cqe_size ||
+          completion.released_slots[0].index != 0 ||
+          completion.released_slots[0].wrap) begin
         `uvm_error("CQ_STRIDE_POLL0", "first stride completion did not poll")
         disable stride_flow;
       end
       completion = null;
       facade.poll_cqe(fixture.cq.handle, completion, status);
       if (status == null || !status.ok() || completion == null ||
-          completion.cqe == null || completion.cqe.wr_id != posted1.wr_id)
+          completion.cqe == null ||
+          completion.cqe.wr_id != 64'h7000 + cqe_size ||
+          completion.cqe.qpn != fixture.qp.local_qp_id ||
+          completion.cqe.wqe_index != 1 || completion.cqe.wqe_wrap ||
+          completion.cqe.polarity != initial_polarity ||
+          completion.released_slots.size() != 1 ||
+          completion.released_slots[0] == null ||
+          completion.released_slots[0].wr_id != 64'h7000 + cqe_size ||
+          completion.released_slots[0].index != 1 ||
+          completion.released_slots[0].wrap)
         `uvm_error("CQ_STRIDE_POLL1", "second stride completion did not poll")
+      status = fixture.engine.query_runtime_occupancy(
+        fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, cq_used, cq_pending);
+      if (status == null || !status.ok() || cq_used != 0 || cq_pending) begin
+        `uvm_error("CQ_STRIDE_CQ_DRAIN", "stride CQ occupancy did not return to zero")
+        disable stride_flow;
+      end
+      status = fixture.engine.query_runtime_occupancy(
+        fixture.qp.handle, RDMA_QUEUE_RUNTIME_SQ, sq_used, sq_pending);
+      if (status == null || !status.ok() || sq_used != 0 || sq_pending)
+        `uvm_error("CQ_STRIDE_SQ_DRAIN", "stride SQ occupancy did not return to zero")
     end
-    if (fixture != null) begin
+    if (fixture != null && fixture.needs_cleanup()) begin
       fixture.cleanup(cleanup_status);
       if (cleanup_status == null || !cleanup_status.ok())
         `uvm_error("CQ_STRIDE_CLEANUP", cleanup_status == null ?
@@ -471,7 +554,7 @@ class rdma_cq_engine_test extends uvm_test;
     check_variable_cqe_strides();
     end
 
-    if (fixture != null) begin
+    if (fixture != null && fixture.needs_cleanup()) begin
       fixture.cleanup(cleanup_status);
       if (cleanup_status == null || !cleanup_status.ok())
         `uvm_error("CQ_CLEANUP", cleanup_status == null ?

@@ -667,28 +667,29 @@ class rdma_end_to_end_high_traffic_test extends rdma_end_to_end_transport_test;
       end
       tx_cq_absolute += HIGH_WINDOW;
       rx_cq_absolute += HIGH_WINDOW;
-      // 一个完整 CQ depth 的批量 poll 应只推进 consumer/CI 一圈：producer
-      // 快照保持不变（当前 fixture 没有硬件 producer API），consumer index
-      // 回到原值但 wrap 必须翻转。该断言把已验证的 CI 行为与未覆盖的
-      // producer/CEQ 中断行为明确分开。
+      // 中文设计：空 CQ 连续公开 publish 整整一个 depth 后，PI
+      // index 回到窗口前手算值且 PI wrap 精确翻转；再 poll 整环后
+      // CI 也回到原 index 并翻转，最终 PI/CI index+wrap 必须收敛。
       local_status = tx_composition_env.queue_data.query_runtime_cursors(
         tx_env.cq.handle, RDMA_QUEUE_RUNTIME_CQ, tx_cq_pi, tx_cq_pw,
         tx_cq_ci, tx_cq_cw);
       if (local_status == null || !local_status.ok() ||
-          tx_cq_pi != before_tx_cq_pi || tx_cq_pw != before_tx_cq_pw ||
-          tx_cq_ci != before_tx_cq_ci || tx_cq_cw == before_tx_cq_cw) begin
+          tx_cq_pi != before_tx_cq_pi || tx_cq_pw != ~before_tx_cq_pw ||
+          tx_cq_ci != before_tx_cq_ci || tx_cq_cw != ~before_tx_cq_cw ||
+          tx_cq_pi != tx_cq_ci || tx_cq_pw != tx_cq_cw) begin
         status = rdma_status::make(RDMA_SC_INVALID_STATE,
-                                   "TX CQ consumer did not advance one complete ring");
+                                   "TX CQ producer/consumer did not converge after one ring");
         return;
       end
       local_status = rx_composition_env.queue_data.query_runtime_cursors(
         rx_env.cq.handle, RDMA_QUEUE_RUNTIME_CQ, rx_cq_pi, rx_cq_pw,
         rx_cq_ci, rx_cq_cw);
       if (local_status == null || !local_status.ok() ||
-          rx_cq_pi != before_rx_cq_pi || rx_cq_pw != before_rx_cq_pw ||
-          rx_cq_ci != before_rx_cq_ci || rx_cq_cw == before_rx_cq_cw) begin
+          rx_cq_pi != before_rx_cq_pi || rx_cq_pw != ~before_rx_cq_pw ||
+          rx_cq_ci != before_rx_cq_ci || rx_cq_cw != ~before_rx_cq_cw ||
+          rx_cq_pi != rx_cq_ci || rx_cq_pw != rx_cq_cw) begin
         status = rdma_status::make(RDMA_SC_INVALID_STATE,
-                                   "RX CQ consumer did not advance one complete ring");
+                                   "RX CQ producer/consumer did not converge after one ring");
         return;
       end
       local_status = tx_composition_env.queue_data.query_runtime_cursors(
