@@ -525,7 +525,8 @@ class rdma_queue_data_engine_host_mem_test extends uvm_test;
   // 功能：cleanup_segmented_profile 按 routed QP→borrowed target CQ→source CQ2
   //   →source CQ1→基础 fixture 的依赖反序清理一个 stride profile。
   // 输入/输出及副作用：fixture/proxy/局部资源、mapping 和 attach 标志为
-  //   输入，status 返回首错；成功时 target 不释放 mapping，两个 source 各释放一次。
+  //   输入；status 入口置成功安全值，尾部返回首错；成功时 target 不释放
+  //   mapping，两个 source 各释放一次。
   // 失败/边界：任一 detach/destroy/null status/所有权断言失败都只记首错，
   //   但继续尝试其余释放；最后仅通过 cleanup_fixture 委托一次 Task 9 cleanup。
   task automatic cleanup_segmented_profile(
@@ -548,6 +549,7 @@ class rdma_queue_data_engine_host_mem_test extends uvm_test;
     int unsigned second_before;
     bit release_complete;
 
+    status = rdma_status::success();
     first_failure = null;
     first_before = release_success_count(proxy, first_mapping);
     second_before = release_success_count(proxy, second_mapping);
@@ -629,8 +631,9 @@ class rdma_queue_data_engine_host_mem_test extends uvm_test;
 
   // 功能：run_real_cq_profile 对指定 32/64/128B CQE stride 建立两个
   //   source-owned 4KiB mapping 和一个 borrowed 8KiB target CQ，完成发布与回卷。
-  // 输入/输出及副作用：cqe_size/proxy 为输入，status 返回首个失败；
-  //   每个 CQE 先 post 真实 send WQE，publish 写 pinned bytes，poll 后恢复 credit。
+  // 输入/输出及副作用：cqe_size/proxy 为输入；status 入口置成功安全值，
+  //   尾部返回首个失败；每个 CQE 先 post 真实 send WQE，publish 写 pinned
+  //   bytes，poll 后恢复 credit。
   // 失败/边界：stride 不受支持、fixture/create/attach/post/publish/read/poll 任一
   //   null/non-OK 时停止新事务，但始终按 target→source→fixture 逆序清理。
   task automatic run_real_cq_profile(
@@ -674,6 +677,7 @@ class rdma_queue_data_engine_host_mem_test extends uvm_test;
     bit target_qp_attached;
     string label;
 
+    status = rdma_status::success();
     fixture = null;
     source_first = null;
     source_second = null;
@@ -988,8 +992,9 @@ class rdma_queue_data_engine_host_mem_test extends uvm_test;
 
   // 功能：run_real_event_profiles 在同一个真实 fixture 上发布 16B CEQE
   //   与 AEQE，并用一个真实 CQE/WQE 建立 CEQ 通知的 authoritative route。
-  // 输入/输出及副作用：proxy 为借用输入，status 返回 setup/publish/read/
-  //   poll/cleanup 的首错；成功路径推进各事件队列一次 PI/CI 并恢复 credit。
+  // 输入/输出及副作用：proxy 为借用输入；status 入口置成功安全值，尾部
+  //   返回 setup/publish/read/poll/cleanup 的首错；成功路径推进各事件队列
+  //   一次 PI/CI 并恢复 credit。
   // 失败/边界：proxy/fixture/backing/route 缺失或任一 status 为 null/non-OK
   //   时不再发布依赖事件，但总是经 cleanup_fixture 精确委托一次清理。
   task automatic run_real_event_profiles(
@@ -1022,6 +1027,7 @@ class rdma_queue_data_engine_host_mem_test extends uvm_test;
     bit polarity;
     bit event_qp_attached;
 
+    status = rdma_status::success();
     fixture = null;
     event_qp = null;
     event_qp_attached = 1'b0;
