@@ -499,9 +499,9 @@ class rdma_multivf_recovery_test extends uvm_test;
     end
 
 `ifdef RDMA_HOST_MEM_TEST
-    // 先发布 Host route，再交给 device_env 复用；两个 manager 使用不同
-    // 的 backing 区间，但故意设置相同 IOVA 起点，以证明 route/domain 才
-    // 是跨 Host 隔离的权威，而不是 IOVA 数值本身。
+    // 中文设计：两个 manager 只提供不同 backing 区间，adapter 故意使用
+    // 相同 IOVA 起点；跨 Host authority 由下方 route_entry.host_topology_key
+    // 和 dpu_common host_routes 明确发布，不能依赖 host_mem manager 私有字段。
     host_routes.delete();
     for (int host_index = 0; host_index < 2; host_index++) begin
       host_manager[host_index] = rdma_host_mem_external_pkg::host_mem_manager::type_id::create(
@@ -512,7 +512,6 @@ class rdma_multivf_recovery_test extends uvm_test;
         abandon_fixture($sformatf("Host%0d manager construction", host_index), status);
         return;
       end
-      host_manager[host_index].set_host_id(host_index);
       host_manager[host_index].init_region(
         host_index == 0 ? 64'h0000_0008_0000_0000 :
                           64'h0000_0009_0000_0000,

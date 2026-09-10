@@ -146,15 +146,15 @@ class rdma_end_to_end_dual_env_test extends uvm_test;
     status = rdma_status::success();
     tx_host_mem = rdma_host_mem_external_pkg::host_mem_manager::type_id::create("tx_host_mem");
     rx_host_mem = rdma_host_mem_external_pkg::host_mem_manager::type_id::create("rx_host_mem");
-    // 物理 backing 区间不相交，且分别设置不同 host_id，模拟多 Host fabric。
+    // 中文设计：两个 manager 只提供互不重叠的物理 backing，两个 adapter
+    // 再提供独立 IOVA 域；Host topology authority 属于 dpu_common 快照/route，
+    // 不是 pinned host_mem manager API 的字段。
     tx_host_mem.init_region(64'h0000_0008_0000_0000,
                             64'h0000_0008_00ff_ffff,
                             MODE_BUDDY, 16, 8'hd1);
     rx_host_mem.init_region(64'h0000_0009_0000_0000,
                             64'h0000_0009_00ff_ffff,
                             MODE_BUDDY, 16, 8'he2);
-    tx_host_mem.set_host_id(1);
-    rx_host_mem.set_host_id(2);
 
     tx_host_adapter = rdma_host_mem_adapter::type_id::create("tx_host_adapter");
     rx_host_adapter = rdma_host_mem_adapter::type_id::create("rx_host_adapter");
