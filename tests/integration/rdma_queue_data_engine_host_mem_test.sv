@@ -3,7 +3,7 @@
 //       publish、mapping-relative 分段读回、ring wrap 和释放契约。
 // 依赖：依赖 UVM、Task 9 queue-data fixture、RDMA codec/core 与 pinned
 //       host_mem manager/adapter；不复制外部 manager 实现。
-// 所有权与生命周期：顶层 task 拥有单一 manager/adapter 和各 fixture；
+// 所有权与生命周期：顶层 task 拥有单一 manager/adapter/proxy 和各 fixture；
 //       source CQ 拥有 4KiB mapping，target CQ/engine 只借用，最后逆序清理并查漏。
 
 // 中文说明：rdma_queue_data_engine_host_mem_test.sv 属于集成测试，验证真实适配器与队列/控制面之间的联调。
@@ -15,6 +15,147 @@
 
 import rdma_unit_test_pkg::*;
 import rdma_codec_pkg::*;
+
+// 中文设计：这些 one-shot 模式只在本集成测试内破坏 adapter 返回契约，
+// 用真实 proxy 调用链验证 null status、缺失 mapping 与失败 partial data
+// 不会越过测试边界成为正式输出；未命中的方法继续调用真实 pinned adapter。
+typedef enum int unsigned {
+  RDMA_REAL_MEM_FAULT_NONE,
+  RDMA_REAL_MEM_FAULT_ALLOCATE_NULL_STATUS,
+  RDMA_REAL_MEM_FAULT_ALLOCATE_SUCCESS_NULL,
+  RDMA_REAL_MEM_FAULT_WRITE_NULL_STATUS,
+  RDMA_REAL_MEM_FAULT_READ_NULL_PARTIAL,
+  RDMA_REAL_MEM_FAULT_READ_ERROR_PARTIAL,
+  RDMA_REAL_MEM_FAULT_RELEASE_NULL_STATUS,
+  RDMA_REAL_MEM_FAULT_OPAQUE_RELEASE_NULL_STATUS
+} rdma_real_mem_fault_e;
+
+// 中文设计：fault adapter 继承真实 adapter，正常模式仍持有真实 manager
+// allocation ledger；arm 后仅下一次匹配 API 返回畸形结果，测试随后恢复正常
+// 模式并通过真实 release 收口，避免用 mock 掩盖 ownership 副作用。
+class rdma_fault_host_mem_adapter extends rdma_host_mem_adapter;
+  `uvm_object_utils(rdma_fault_host_mem_adapter)
+
+  protected rdma_real_mem_fault_e next_fault;
+
+  // 功能：构造 one-shot fault adapter，并以不注入故障的模式启动。
+  // 输入/输出及副作用：name 为 UVM 对象名；初始化真实 adapter 基类与
+  //   next_fault，不创建 manager 或 pinned allocation。
+  // 失败/边界：mem 仍须由顶层显式绑定；未 arm 时全部 API 保持真实行为。
+  function new(string name = "rdma_fault_host_mem_adapter");
+    super.new(name);
+    next_fault = RDMA_REAL_MEM_FAULT_NONE;
+  endfunction
+
+  // 功能：arm 选择下一次匹配 adapter API 的单次畸形返回模式。
+  // 输入/输出及副作用：fault 为输入并覆盖 next_fault；不调用 manager，
+  //   不分配、写入或释放任何 mapping。
+  // 失败/边界：重复 arm 以最后一次为准；NONE 显式取消尚未消费的故障。
+  function void arm(rdma_real_mem_fault_e fault);
+    next_fault = fault;
+  endfunction
+
+  // 功能：consume_fault 判断当前 API 是否命中已 arm 模式，命中后立即复位。
+  // 输入/输出及副作用：expected 为输入；返回是否命中的 bit，命中时把
+  //   next_fault 清为 NONE，保证故障不会污染恢复清理。
+  // 失败/边界：模式不匹配时返回 0 且保留原模式，供预定 API 稍后消费。
+  protected function bit consume_fault(rdma_real_mem_fault_e expected);
+    if (next_fault != expected)
+      return 1'b0;
+    next_fault = RDMA_REAL_MEM_FAULT_NONE;
+    return 1'b1;
+  endfunction
+
+  // 功能：allocate 在指定模式返回 null status+非空假 candidate 或
+  //   success+null mapping，否则执行真实 pinned allocation。
+  // 输入/输出及副作用：request_context/size/alignment/direction 为输入，
+  //   mapping 为输出；正常路径更新真实 adapter ledger，故障路径不占用 backing。
+  // 失败/边界：故障 candidate 没有 allocation identity，只用于证明 proxy
+  //   不发布 backend 临时输出；one-shot 消费后后续 allocate 自动恢复正常。
+  virtual function rdma_status allocate(
+    rdma_dma_request_context request_context,
+    int unsigned size,
+    int unsigned alignment,
+    rdma_dma_direction_e direction,
+    output rdma_dma_mapping mapping
+  );
+    if (consume_fault(RDMA_REAL_MEM_FAULT_ALLOCATE_NULL_STATUS)) begin
+      mapping = rdma_dma_mapping::type_id::create("fault_allocate_candidate");
+      return null;
+    end
+    if (consume_fault(RDMA_REAL_MEM_FAULT_ALLOCATE_SUCCESS_NULL)) begin
+      mapping = null;
+      return rdma_status::success();
+    end
+    return super.allocate(request_context, size, alignment, direction, mapping);
+  endfunction
+
+  // 功能：write 在指定模式返回 null status 且不写 backing，否则委托真实 adapter。
+  // 输入/输出及副作用：mapping/offset/data 为输入；正常路径可能更新 pinned
+  //   bytes，故障路径只消费模式且不改变 allocation/cursor。
+  // 失败/边界：null status 是被测 contract violation；恢复后的调用仍须接受
+  //   真实 adapter 的 authority、range 与 permission 校验。
+  virtual function rdma_status write(
+    rdma_dma_mapping mapping,
+    longint unsigned offset,
+    byte data[]
+  );
+    if (consume_fault(RDMA_REAL_MEM_FAULT_WRITE_NULL_STATUS))
+      return null;
+    return super.write(mapping, offset, data);
+  endfunction
+
+  // 功能：read 在指定模式写入两字节 partial candidate 后返回 null 或明确错误，
+  //   否则从真实 pinned backing 读取完整数据。
+  // 输入/输出及副作用：mapping/offset/size 为输入，data 为输出；故障路径只写
+  //   临时错误载荷，不修改 backing，正常路径保持真实 adapter read 语义。
+  // 失败/边界：两种 partial 模式均为 one-shot；调用边界必须返回非成功并
+  //   丢弃 data，不能把 `8'hd1/8'hd2` 暴露给上层。
+  virtual function rdma_status read(
+    rdma_dma_mapping mapping,
+    longint unsigned offset,
+    int unsigned size,
+    output byte data[]
+  );
+    if (consume_fault(RDMA_REAL_MEM_FAULT_READ_NULL_PARTIAL)) begin
+      data = new[2];
+      data[0] = 8'hd1;
+      data[1] = 8'hd2;
+      return null;
+    end
+    if (consume_fault(RDMA_REAL_MEM_FAULT_READ_ERROR_PARTIAL)) begin
+      data = new[2];
+      data[0] = 8'he1;
+      data[1] = 8'he2;
+      return rdma_status::make(
+        RDMA_SC_UNKNOWN_HW_ERROR, "injected partial read failure");
+    end
+    return super.read(mapping, offset, size, data);
+  endfunction
+
+  // 功能：release 在指定模式返回 null 且保留真实 allocation，供 proxy 验证
+  //   strict release 的 status 归一化与 active index 稳定性。
+  // 输入/输出及副作用：mapping 为输入；正常路径释放 backing，故障路径只消费
+  //   模式，不标记 completion、不改变真实 ledger。
+  // 失败/边界：故障后必须切回正常模式精确释放同一 mapping；不得重试已成功释放者。
+  virtual function rdma_status \release (rdma_dma_mapping mapping);
+    if (consume_fault(RDMA_REAL_MEM_FAULT_RELEASE_NULL_STATUS))
+      return null;
+    return super.\release (mapping);
+  endfunction
+
+  // 功能：release_opaque 在指定模式返回 null 且不消费 allocation identity，
+  //   否则由真实 adapter 按 opaque token 完成释放。
+  // 输入/输出及副作用：mapping 为输入；正常成功会更新真实 ledger/completion，
+  //   故障路径只消费 next_fault，不修改 proxy canonical index。
+  // 失败/边界：故障 mapping 必须仍可在恢复调用中释放一次；未知或重复 token
+  //   继续由真实 adapter 返回明确非成功。
+  virtual function rdma_status release_opaque(rdma_dma_mapping mapping);
+    if (consume_fault(RDMA_REAL_MEM_FAULT_OPAQUE_RELEASE_NULL_STATUS))
+      return null;
+    return super.release_opaque(mapping);
+  endfunction
+endclass
 
 // 中文设计：真实 adapter 的 opaque allocation identity 不能穿过 resource
 // manager 的 borrowed public projection；本 proxy 作为测试边界恢复 canonical
@@ -123,10 +264,11 @@ class rdma_real_host_mem_proxy extends rdma_mock_host_mem;
 
   // 功能：allocate 委托真实 adapter 分配 pinned mapping，并按成功 mapping
   //   的 IOVA 保存 canonical 非拥有引用，供 borrowed 投影后的 I/O 恢复 identity。
-  // 输入/输出及副作用：request_context/size/alignment/direction 为输入，
-  //   mapping/status 为输出；成功会更新 delegate allocator 与 active_mappings。
-  // 失败/边界：delegate 缺失时清空 mapping 并返回 INVALID_STATE；真实分配
-  //   返回 null/non-OK 或无 mapping 时不登记索引，也不伪造成功或自行释放。
+  // 输入/输出及副作用：request_context/size/alignment/direction 为输入；
+  //   mapping 入口清空，只有 delegate 返回非空 candidate 和成功 status 后才发布
+  //   并更新 active_mappings，proxy 不取得真实 allocation 的释放权。
+  // 失败/边界：delegate 缺失、返回 null/non-OK status 或 success/null mapping
+  //   时返回明确非成功，mapping 保持 null 且 canonical index 不改变。
   virtual function rdma_status allocate(
     rdma_dma_request_context request_context,
     int unsigned size,
@@ -134,26 +276,37 @@ class rdma_real_host_mem_proxy extends rdma_mock_host_mem;
     rdma_dma_direction_e direction,
     output rdma_dma_mapping mapping
   );
+    rdma_dma_mapping candidate;
     rdma_status status;
 
-    if (delegate == null) begin
-      mapping = null;
+    mapping = null;
+    candidate = null;
+    if (delegate == null)
       return rdma_status::make(RDMA_SC_INVALID_STATE,
                                "real host-memory delegate is null");
-    end
     status = delegate.allocate(request_context, size, alignment, direction,
-                               mapping);
-    if (status != null && status.ok() && mapping != null)
-      active_mappings[mapping.iova.value] = mapping;
-    return status;
+                               candidate);
+    if (status == null)
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "real host-memory allocate returned null status");
+    if (!status.ok())
+      return status;
+    if (candidate == null)
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "real host-memory allocate succeeded without a mapping");
+    active_mappings[candidate.iova.value] = candidate;
+    mapping = candidate;
+    return rdma_status::success();
   endfunction
 
   // 功能：write 先把 borrowed public mapping 安全解析到 canonical identity，
   //   再由真实 adapter 将 data 写入 mapping-relative offset。
   // 输入/输出及副作用：mapping/offset/data 为输入；成功只修改 pinned bytes，
   //   proxy 不推进队列游标、不取得 mapping 所有权。
-  // 失败/边界：delegate 缺失、mapping 未登记/字段变化、范围溢出或权限不足
-  //   时返回明确错误，不用 IOVA 猜测 allocation，也不执行部分写入。
+  // 失败/边界：delegate 缺失、mapping 未登记/字段变化、范围溢出、权限不足
+  //   或任一内部调用返回 null status 时返回明确错误，不执行部分写入。
   virtual function rdma_status write(
     rdma_dma_mapping mapping,
     longint unsigned offset,
@@ -166,17 +319,25 @@ class rdma_real_host_mem_proxy extends rdma_mock_host_mem;
       return rdma_status::make(RDMA_SC_INVALID_STATE,
                                "real host-memory delegate is null");
     status = resolve_delegate_mapping(mapping, resolved);
-    if (status == null || !status.ok())
+    if (status == null)
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "proxy write mapping resolution returned null status");
+    if (!status.ok())
       return status;
-    return delegate.write(resolved, offset, data);
+    status = delegate.write(resolved, offset, data);
+    if (status == null)
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE, "real host-memory write returned null status");
+    return status;
   endfunction
 
   // 功能：read 先把 borrowed public mapping 安全解析到 canonical identity，
   //   再从真实 adapter 读取 mapping-relative offset/size 的 pinned bytes。
-  // 输入/输出及副作用：mapping/offset/size 为输入，data/status 为输出；
-  //   只读真实 backing，不修改队列 cursor、allocation 或 ownership。
-  // 失败/边界：delegate 缺失、mapping 未登记/字段变化、范围溢出或权限不足
-  //   时清空 data 并返回错误；size=0 由真实 adapter 按契约返回空成功。
+  // 输入/输出及副作用：mapping/offset/size 为输入；data 入口清空，真实
+  //   adapter 只写 candidate，完整成功且尺寸等于 size 时才发布正式 data。
+  // 失败/边界：delegate 缺失、mapping 未登记/字段变化、null/non-OK status、
+  //   partial/短读、范围或权限错误时 data 保持空；size=0 可发布空成功。
   virtual function rdma_status read(
     rdma_dma_mapping mapping,
     longint unsigned offset,
@@ -185,26 +346,40 @@ class rdma_real_host_mem_proxy extends rdma_mock_host_mem;
   );
     rdma_dma_mapping resolved;
     rdma_status status;
+    byte candidate[];
 
-    if (delegate == null) begin
-      data = new[0];
+    data = new[0];
+    candidate = new[0];
+    if (delegate == null)
       return rdma_status::make(RDMA_SC_INVALID_STATE,
                                "real host-memory delegate is null");
-    end
     status = resolve_delegate_mapping(mapping, resolved);
-    if (status == null || !status.ok()) begin
-      data = new[0];
+    if (status == null)
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "proxy read mapping resolution returned null status");
+    if (!status.ok())
       return status;
-    end
-    return delegate.read(resolved, offset, size, data);
+    status = delegate.read(resolved, offset, size, candidate);
+    if (status == null)
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE, "real host-memory read returned null status");
+    if (!status.ok())
+      return status;
+    if (candidate.size() != size)
+      return rdma_status::make(
+        RDMA_SC_UNKNOWN_HW_ERROR,
+        "real host-memory read returned the wrong size");
+    data = candidate;
+    return rdma_status::success();
   endfunction
 
   // 功能：release 把完整 public mapping 的 strict 释放委托给真实
   //   adapter，用于正常 lifecycle-owned backing 收口。
   // 输入/输出及副作用：mapping 为输入；delegate 成功时释放 pinned block、
   //   标记 mapping completion，并按 IOVA 累计 strict_release_successes。
-  // 失败/边界：delegate 缺失、public geometry/owner/route 篡改、未知或重复
-  //   mapping 时返回非成功，失败不计数也不隐式转为 opaque release。
+  // 失败/边界：delegate 缺失、null status、public geometry/owner/route 篡改、
+  //   未知或重复 mapping 时返回非成功，失败不计数也不转为 opaque release。
   virtual function rdma_status \release (rdma_dma_mapping mapping);
     rdma_status status;
 
@@ -212,7 +387,11 @@ class rdma_real_host_mem_proxy extends rdma_mock_host_mem;
       return rdma_status::make(RDMA_SC_INVALID_STATE,
                                "real host-memory delegate is null");
     status = delegate.\release (mapping);
-    if (status != null && status.ok() && mapping != null) begin
+    if (status == null)
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "real host-memory strict release returned null status");
+    if (status.ok() && mapping != null) begin
       strict_release_successes[mapping.iova.value]++;
       active_mappings.delete(mapping.iova.value);
     end
@@ -223,7 +402,7 @@ class rdma_real_host_mem_proxy extends rdma_mock_host_mem;
   //   rdma_host_mem_adapter，避免进入基类 mock token 或 strict geometry 路径。
   // 输入/输出及副作用：mapping 是 adapter 拥有的 allocation capability；
   //   成功时 delegate 释放 pinned backing，并按 IOVA 累计一次成功释放证据。
-  // 失败/边界：delegate 为 null 时返回 INVALID_STATE；空 mapping、未知 token
+  // 失败/边界：delegate/null status 返回 INVALID_STATE；空 mapping、未知 token
   //   或重复释放由 delegate 拒绝，失败不增加成功计数，不回退到 release。
   virtual function rdma_status release_opaque(rdma_dma_mapping mapping);
     rdma_status status;
@@ -232,7 +411,11 @@ class rdma_real_host_mem_proxy extends rdma_mock_host_mem;
       return rdma_status::make(RDMA_SC_INVALID_STATE,
                                "real host-memory delegate is null");
     status = delegate.release_opaque(mapping);
-    if (status != null && status.ok() && mapping != null) begin
+    if (status == null)
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "real host-memory opaque release returned null status");
+    if (status.ok() && mapping != null) begin
       opaque_release_successes[mapping.iova.value]++;
       active_mappings.delete(mapping.iova.value);
     end
@@ -342,10 +525,10 @@ class rdma_queue_data_engine_host_mem_test extends uvm_test;
 
   // 功能：read_real_queue_entry 通过 backing-access 的 resolve_ref 将队列
   //   logical offset 拆成 mapping-relative spans，再从真实 pinned Host-memory 读回。
-  // 输入/输出及副作用：fixture/queue/role/logical_offset/size 为输入，
-  //   data 为输出；access 只借用 mapping，读取不推进 PI/CI 且不取得释放权。
-  // 失败/边界：必需对象/role/Function 缺失、size=0、跨越未覆盖区间或
-  //   mapping authority/permission 失效时返回非成功，data 保持安全空值。
+  // 输入/输出及副作用：fixture/queue/role/logical_offset/size 为输入；data
+  //   入口清空，access 只写 candidate，完整成功且尺寸匹配时才发布正式数据。
+  // 失败/边界：必需对象/role/Function 缺失、size=0、null/non-OK status、
+  //   partial read、未覆盖区间或 mapping authority 失效时 data 保持空。
   function automatic rdma_status read_real_queue_entry(
     rdma_queue_data_engine_fixture fixture,
     rdma_queue_resource queue,
@@ -357,8 +540,10 @@ class rdma_queue_data_engine_host_mem_test extends uvm_test;
     rdma_queue_backing_ref backing;
     rdma_queue_backing_access access;
     rdma_status status;
+    byte candidate[];
 
     data = new[0];
+    candidate = new[0];
     if (fixture == null || fixture.mem == null || queue == null || size == 0)
       return rdma_status::make(
         RDMA_SC_INVALID_ARGUMENT, "real queue read input is incomplete");
@@ -382,7 +567,18 @@ class rdma_queue_data_engine_host_mem_test extends uvm_test;
       return status == null ? rdma_status::make(
         RDMA_SC_INVALID_STATE, "real queue access attach returned null") :
         status;
-    return access.read(logical_offset, size, data);
+    status = access.read(logical_offset, size, candidate);
+    if (status == null)
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE, "real queue access read returned null status");
+    if (!status.ok())
+      return status;
+    if (candidate.size() != size)
+      return rdma_status::make(
+        RDMA_SC_UNKNOWN_HW_ERROR,
+        "real queue access read returned the wrong size");
+    data = candidate;
+    return rdma_status::success();
   endfunction
 
   // 功能：check_runtime_drained 在一次 publish/poll 后验证指定 runtime 的
@@ -522,10 +718,454 @@ class rdma_queue_data_engine_host_mem_test extends uvm_test;
     end
   endtask
 
+  // 功能：create_queue_for_test 调用真实 queue executor，并在 caller-facing
+  //   类型投影前从 control result 保存 canonical detached resource handle。
+  // 输入/输出及副作用：label/fixture/request/transaction_id/inject_wrong_type 为
+  //   输入；resource/created_h/control_result/status 入口置安全值，真实成功会注册 CQ。
+  // 失败/边界：依赖、create status、canonical resource/handle 或 clone 缺失时
+  //   返回明确错误；注入只替换返回对象，不登记或销毁 fake resource。
+  task automatic create_queue_for_test(
+    string label,
+    rdma_queue_data_engine_fixture fixture,
+    rdma_create_cq_req request,
+    longint unsigned transaction_id,
+    bit inject_wrong_type,
+    output rdma_queue_resource resource,
+    output rdma_handle created_h,
+    output rdma_control_result control_result,
+    output rdma_status status
+  );
+    rdma_queue_resource canonical_resource;
+
+    resource = null;
+    created_h = null;
+    control_result = null;
+    status = rdma_status::success();
+    canonical_resource = null;
+    if (fixture == null || fixture.queue_executor == null ||
+        fixture.binding == null || request == null || transaction_id == 0) begin
+      status = rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT, "test queue create input is incomplete");
+      return;
+    end
+    fixture.queue_executor.create_locked(
+      fixture.binding, fixture.binding.make_handle(), request,
+      transaction_id, canonical_resource, control_result);
+    if (control_result != null && control_result.resource_h != null)
+      created_h = rdma_clone_handle_value(
+        control_result.resource_h, {label, " canonical handle"});
+    if (control_result == null || control_result.status == null) begin
+      status = rdma_status::make(
+        RDMA_SC_INVALID_STATE, "test queue create returned no status");
+      return;
+    end
+    if (!control_result.status.ok()) begin
+      status = control_result.status;
+      return;
+    end
+    if (canonical_resource == null || created_h == null) begin
+      status = rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "test queue create omitted canonical resource evidence");
+      return;
+    end
+    if (inject_wrong_type)
+      resource = rdma_queue_resource::type_id::create(
+        {label, " caller_type_fault"});
+    else
+      resource = canonical_resource;
+    if (resource == null)
+      status = rdma_status::make(
+        RDMA_SC_RESOURCE_EXHAUSTED,
+        "test queue caller-facing resource allocation failed");
+  endtask
+
+  // 功能：cleanup_created_queue_handle 负责按 canonical detached handle 销毁
+  //   一个 create 已成功但 caller-facing 类型不可用的 queue。
+  // 输入/输出及副作用：fixture/created_h/attached/transaction_id 为输入，status
+  //   入口置成功；非空 handle 以 created=1 精确委托一次 lifecycle queue destroy。
+  // 失败/边界：null handle 为幂等成功且不解引用 fixture；非空 handle 配 null
+  //   fixture、零 transaction_id、attached 但 engine 缺失或底层 destroy 异常
+  //   均返回非成功；底层 null status 规范化为 INVALID_STATE。
+  task automatic cleanup_created_queue_handle(
+    rdma_queue_data_engine_fixture fixture,
+    rdma_handle created_h,
+    bit attached,
+    longint unsigned transaction_id,
+    output rdma_status status
+  );
+    status = rdma_status::success();
+    if (created_h == null)
+      return;
+    if (fixture == null) begin
+      status = rdma_status::make(
+        RDMA_SC_INVALID_STATE, "test queue cleanup fixture is null");
+      return;
+    end
+    fixture.destroy_lifecycle_owned_queue(
+      created_h, 1'b1, attached, transaction_id, status);
+    if (status == null)
+      status = rdma_status::make(
+        RDMA_SC_INVALID_STATE, "test queue cleanup returned null status");
+  endtask
+
+  // 功能：test_partial_create_cleanup_contract 在真实 CQ create 后注入错误动态
+  //   类型，验证 cleanup 仍只凭提前保存的 canonical handle 释放 queue/mapping。
+  // 输入/输出及副作用：proxy 为借用输入，status 入口置成功并返回首错；task
+  //   创建一个额外 owned CQ，保存 release 计数并在失败时执行恢复销毁。
+  // 失败/边界：create/canonical lookup/backing 缺失、cast 意外成功、cleanup 后
+  //   queue 仍 ACTIVE 或 release 次数不为一次均失败；fake resource 永不销毁。
+  task automatic test_partial_create_cleanup_contract(
+    rdma_real_host_mem_proxy proxy,
+    output rdma_status status
+  );
+    rdma_queue_data_engine_fixture fixture;
+    rdma_create_cq_req request;
+    rdma_queue_resource exposed_resource;
+    rdma_resource authoritative_resource;
+    rdma_cq typed_resource;
+    rdma_cq authoritative_cq;
+    rdma_queue_backing_ref backing;
+    rdma_dma_mapping mapping;
+    rdma_handle created_h;
+    rdma_control_result control_result;
+    rdma_status first_failure;
+    rdma_status step;
+    rdma_status lookup_status;
+    rdma_status cleanup_status;
+    int unsigned releases_before;
+
+    status = rdma_status::success();
+    fixture = rdma_queue_data_engine_fixture::type_id::create(
+      "partial_create_fixture");
+    first_failure = null;
+    created_h = null;
+    mapping = null;
+    begin : partial_create_flow
+      if (proxy == null || fixture == null) begin
+        first_failure = rdma_status::make(
+          RDMA_SC_INVALID_STATE, "partial create fixture is unavailable");
+        disable partial_create_flow;
+      end
+      fixture.mem = proxy;
+      fixture.setup(step, 16, 64, 16, 16);
+      retain_failure("partial create fixture setup", step, first_failure);
+      if (first_failure != null)
+        disable partial_create_flow;
+      request = rdma_create_cq_req::type_id::create(
+        "partial_create_request");
+      if (request == null) begin
+        first_failure = rdma_status::make(
+          RDMA_SC_RESOURCE_EXHAUSTED,
+          "partial create request allocation failed");
+        disable partial_create_flow;
+      end
+      request.owner = fixture.binding.make_handle();
+      request.depth = 64;
+      request.cqe_size_bytes = 64;
+      request.ceq_h = rdma_clone_handle_value(
+        fixture.ceq.handle, "partial create CEQ");
+      request.ring_backing.mode = RDMA_QUEUE_BACKING_OWNED;
+      create_queue_for_test(
+        "partial_create", fixture, request, 64'hd201, 1'b1,
+        exposed_resource, created_h, control_result, step);
+      retain_failure("partial create injected result", step, first_failure);
+      if (first_failure != null || exposed_resource == null ||
+          created_h == null) begin
+        if (first_failure == null)
+          first_failure = rdma_status::make(
+            RDMA_SC_INVALID_STATE,
+            "partial create did not publish fault evidence");
+        disable partial_create_flow;
+      end
+      if ($cast(typed_resource, exposed_resource)) begin
+        first_failure = rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "partial create wrong-type injection unexpectedly cast to CQ");
+        disable partial_create_flow;
+      end
+      authoritative_resource = null;
+      step = fixture.manager.lookup(created_h, authoritative_resource);
+      retain_failure("partial create canonical lookup", step, first_failure);
+      if (first_failure != null ||
+          !$cast(authoritative_cq, authoritative_resource) ||
+          authoritative_cq == null) begin
+        if (first_failure == null)
+          first_failure = rdma_status::make(
+            RDMA_SC_INVALID_STATE,
+            "partial create canonical CQ is unavailable");
+        disable partial_create_flow;
+      end
+      backing = find_queue_backing(
+        authoritative_cq, RDMA_QUEUE_ROLE_CQ_RING);
+      if (backing == null || backing.mapping == null) begin
+        first_failure = rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "partial create canonical backing is unavailable");
+        disable partial_create_flow;
+      end
+      mapping = backing.mapping;
+      releases_before = release_success_count(proxy, mapping);
+      cleanup_created_queue_handle(
+        fixture, created_h, 1'b0, 64'hd202, cleanup_status);
+      retain_failure("partial create canonical cleanup", cleanup_status,
+                     first_failure);
+      authoritative_resource = null;
+      lookup_status = fixture.manager.lookup(
+        created_h, authoritative_resource);
+      if (lookup_status == null ||
+          lookup_status.code != RDMA_SC_INVALID_STATE ||
+          authoritative_resource != null ||
+          release_success_count(proxy, mapping) != releases_before + 1)
+        retain_failure(
+          "partial create cleanup evidence",
+          rdma_status::make(
+            RDMA_SC_INVALID_STATE,
+            "wrong-type create left canonical queue or mapping active"),
+          first_failure);
+    end
+
+    // 中文设计：RED 或任一前置失败若仍留下 canonical handle，只按该
+    // detached handle 恢复一次；fake exposed_resource 从未登记，禁止销毁。
+    authoritative_resource = null;
+    lookup_status = fixture == null || fixture.manager == null ||
+                    created_h == null ? null :
+      fixture.manager.lookup(created_h, authoritative_resource);
+    if (lookup_status != null && lookup_status.ok()) begin
+      fixture.destroy_lifecycle_owned_queue(
+        created_h, 1'b1, 1'b0, 64'hd203, cleanup_status);
+      retain_failure("partial create recovery destroy", cleanup_status,
+                     first_failure);
+    end
+    cleanup_fixture(fixture, cleanup_status);
+    retain_failure("partial create fixture cleanup", cleanup_status,
+                   first_failure);
+    status = first_failure == null ? rdma_status::success() : first_failure;
+  endtask
+
+  // 功能：test_proxy_failure_output_contracts 以 one-shot 真实 adapter 故障
+  //   验证 proxy 对 mapping/data/status 的 candidate-then-publish 边界。
+  // 输入/输出及副作用：proxy/fault_adapter 为借用输入，status 入口置成功并
+  //   返回首错；task 创建真实 fixture/isolated mappings，故障后恢复并精确释放。
+  // 失败/边界：任一 null status、success/null mapping、失败 partial data、
+  //   active index 或 release 计数异常均失败，但仍继续释放真实 allocation。
+  task automatic test_proxy_failure_output_contracts(
+    rdma_real_host_mem_proxy proxy,
+    rdma_fault_host_mem_adapter fault_adapter,
+    output rdma_status status
+  );
+    rdma_queue_data_engine_fixture fixture;
+    rdma_queue_backing_ref backing;
+    rdma_dma_request_context request_context;
+    rdma_dma_mapping mapping;
+    rdma_dma_mapping opaque_mapping;
+    rdma_status first_failure;
+    rdma_status step;
+    rdma_status cleanup_status;
+    byte payload[];
+    byte data[];
+    int unsigned releases_before;
+
+    status = rdma_status::success();
+    fixture = rdma_queue_data_engine_fixture::type_id::create(
+      "proxy_failure_fixture");
+    first_failure = null;
+    mapping = null;
+    opaque_mapping = null;
+    begin : proxy_failure_flow
+      if (proxy == null || fault_adapter == null ||
+          proxy.delegate != fault_adapter || fixture == null) begin
+        first_failure = rdma_status::make(
+          RDMA_SC_INVALID_STATE, "proxy failure fixture is unavailable");
+        disable proxy_failure_flow;
+      end
+      fixture.mem = proxy;
+      fixture.setup(step, 16, 64, 16, 16);
+      retain_failure("proxy failure fixture setup", step, first_failure);
+      if (first_failure != null)
+        disable proxy_failure_flow;
+      backing = find_queue_backing(fixture.cq, RDMA_QUEUE_ROLE_CQ_RING);
+      if (backing == null || backing.mapping == null) begin
+        first_failure = rdma_status::make(
+          RDMA_SC_INVALID_STATE, "proxy failure backing is unavailable");
+        disable proxy_failure_flow;
+      end
+      request_context = rdma_dma_request_context::type_id::create(
+        "proxy_failure_context");
+      if (request_context == null) begin
+        first_failure = rdma_status::make(
+          RDMA_SC_RESOURCE_EXHAUSTED, "proxy failure context allocation failed");
+        disable proxy_failure_flow;
+      end
+      request_context.function_h = rdma_clone_function_handle_value(
+        backing.mapping.function_h, "proxy failure Function");
+      request_context.requester_bdf = backing.mapping.requester_bdf;
+      request_context.pasid_valid = backing.mapping.pasid_valid;
+      request_context.pasid = backing.mapping.pasid;
+      request_context.dma_domain_valid = backing.mapping.dma_domain_valid;
+      request_context.dma_domain_id = backing.mapping.dma_domain_id;
+      request_context.route = backing.mapping.route;
+      request_context.route_valid = backing.mapping.route_valid;
+      request_context.reset_epoch = backing.mapping.reset_epoch;
+      request_context.epoch_valid = backing.mapping.epoch_valid;
+      request_context.owner_h = rdma_clone_handle_value(
+        backing.mapping.owner_h, "proxy failure owner");
+
+      // 中文设计：先用非空 sentinel 调用 null-status allocation；proxy
+      // 必须同时丢弃 caller 旧值与 backend 生成的无 identity candidate。
+      mapping = backing.mapping;
+      fault_adapter.arm(RDMA_REAL_MEM_FAULT_ALLOCATE_NULL_STATUS);
+      step = proxy.allocate(request_context, 4096, 4096,
+                            RDMA_DMA_DEVICE_WRITE, mapping);
+      if (step == null || step.ok() || mapping != null)
+        retain_failure(
+          "proxy allocate null status",
+          rdma_status::make(
+            RDMA_SC_INVALID_STATE,
+            "proxy published null-status allocation output"),
+          first_failure);
+
+      mapping = backing.mapping;
+      fault_adapter.arm(RDMA_REAL_MEM_FAULT_ALLOCATE_SUCCESS_NULL);
+      step = proxy.allocate(request_context, 4096, 4096,
+                            RDMA_DMA_DEVICE_WRITE, mapping);
+      if (step == null || step.ok() || mapping != null)
+        retain_failure(
+          "proxy allocate success/null",
+          rdma_status::make(
+            RDMA_SC_INVALID_STATE,
+            "proxy accepted success without a mapping"),
+          first_failure);
+
+      step = proxy.allocate(request_context, 4096, 4096,
+                            RDMA_DMA_DEVICE_WRITE, mapping);
+      if (step == null || !step.ok() || mapping == null) begin
+        retain_failure("proxy recovery allocation", step, first_failure);
+        if (step != null && step.ok())
+          retain_failure(
+            "proxy recovery mapping",
+            rdma_status::make(
+              RDMA_SC_INVALID_STATE, "proxy recovery mapping is null"),
+            first_failure);
+        disable proxy_failure_flow;
+      end
+      payload = new[4];
+      payload[0] = 8'h11;
+      payload[1] = 8'h22;
+      payload[2] = 8'h33;
+      payload[3] = 8'h44;
+
+      fault_adapter.arm(RDMA_REAL_MEM_FAULT_WRITE_NULL_STATUS);
+      step = proxy.write(mapping, 0, payload);
+      if (step == null || step.ok())
+        retain_failure(
+          "proxy write null status",
+          rdma_status::make(
+            RDMA_SC_INVALID_STATE, "proxy propagated null write status"),
+          first_failure);
+
+      data = new[1];
+      data[0] = 8'hff;
+      fault_adapter.arm(RDMA_REAL_MEM_FAULT_READ_NULL_PARTIAL);
+      step = proxy.read(mapping, 0, 4, data);
+      if (step == null || step.ok() || data.size() != 0)
+        retain_failure(
+          "proxy read null partial",
+          rdma_status::make(
+            RDMA_SC_INVALID_STATE,
+            "proxy published null-status partial read data"),
+          first_failure);
+
+      data = new[1];
+      data[0] = 8'hff;
+      fault_adapter.arm(RDMA_REAL_MEM_FAULT_READ_ERROR_PARTIAL);
+      step = proxy.read(mapping, 0, 4, data);
+      if (step == null || step.ok() || data.size() != 0)
+        retain_failure(
+          "proxy read error partial",
+          rdma_status::make(
+            RDMA_SC_INVALID_STATE,
+            "proxy published failed partial read data"),
+          first_failure);
+
+      data = new[1];
+      data[0] = 8'hff;
+      fault_adapter.arm(RDMA_REAL_MEM_FAULT_READ_NULL_PARTIAL);
+      step = read_real_queue_entry(
+        fixture, fixture.cq, RDMA_QUEUE_ROLE_CQ_RING, 0, 64, data);
+      if (step == null || step.ok() || data.size() != 0)
+        retain_failure(
+          "real queue read null partial",
+          rdma_status::make(
+            RDMA_SC_INVALID_STATE,
+            "real queue helper published failed partial data"),
+          first_failure);
+
+      releases_before = release_success_count(proxy, mapping);
+      fault_adapter.arm(RDMA_REAL_MEM_FAULT_RELEASE_NULL_STATUS);
+      step = proxy.\release (mapping);
+      if (step == null || step.ok() ||
+          !proxy.active_mappings.exists(mapping.iova.value) ||
+          release_success_count(proxy, mapping) != releases_before)
+        retain_failure(
+          "proxy strict release null status",
+          rdma_status::make(
+            RDMA_SC_INVALID_STATE,
+            "proxy strict null release changed lifecycle evidence"),
+          first_failure);
+      step = proxy.\release (mapping);
+      retain_failure("proxy strict release recovery", step, first_failure);
+      if (step != null && step.ok())
+        mapping = null;
+
+      step = proxy.allocate(request_context, 4096, 4096,
+                            RDMA_DMA_DEVICE_WRITE, opaque_mapping);
+      retain_failure("proxy opaque recovery allocation", step, first_failure);
+      if (step == null || !step.ok() || opaque_mapping == null)
+        disable proxy_failure_flow;
+      releases_before = release_success_count(proxy, opaque_mapping);
+      fault_adapter.arm(RDMA_REAL_MEM_FAULT_OPAQUE_RELEASE_NULL_STATUS);
+      step = proxy.release_opaque(opaque_mapping);
+      if (step == null || step.ok() ||
+          !proxy.active_mappings.exists(opaque_mapping.iova.value) ||
+          release_success_count(proxy, opaque_mapping) != releases_before)
+        retain_failure(
+          "proxy opaque release null status",
+          rdma_status::make(
+            RDMA_SC_INVALID_STATE,
+            "proxy opaque null release changed lifecycle evidence"),
+          first_failure);
+      step = proxy.release_opaque(opaque_mapping);
+      retain_failure("proxy opaque release recovery", step, first_failure);
+      if (step != null && step.ok())
+        opaque_mapping = null;
+    end
+
+    // 中文设计：若流程在正常 recovery release 前中止，只对仍登记于 proxy
+    // 的真实 mapping 调用 opaque rollback；fault 已 one-shot 消费，不会污染清理。
+    if (mapping != null &&
+        proxy != null && proxy.active_mappings.exists(mapping.iova.value)) begin
+      cleanup_status = proxy.release_opaque(mapping);
+      retain_failure("proxy strict mapping fallback", cleanup_status,
+                     first_failure);
+    end
+    if (opaque_mapping != null && proxy != null &&
+        proxy.active_mappings.exists(opaque_mapping.iova.value)) begin
+      cleanup_status = proxy.release_opaque(opaque_mapping);
+      retain_failure("proxy opaque mapping fallback", cleanup_status,
+                     first_failure);
+    end
+    cleanup_fixture(fixture, cleanup_status);
+    retain_failure("proxy failure fixture cleanup", cleanup_status,
+                   first_failure);
+    status = first_failure == null ? rdma_status::success() : first_failure;
+  endtask
+
   // 功能：cleanup_segmented_profile 按 routed QP→borrowed target CQ→source CQ2
   //   →source CQ1→基础 fixture 的依赖反序清理一个 stride profile。
-  // 输入/输出及副作用：fixture/proxy/局部资源、mapping 和 attach 标志为
-  //   输入；status 入口置成功安全值，尾部返回首错；成功时 target 不释放
+  // 输入/输出及副作用：fixture/proxy、三个 canonical detached handle、QP、
+  //   mapping 和 attach 标志为输入；status 入口置成功安全值，尾部返回首错；
+  //   成功时 target 不释放
   //   mapping，两个 source 各释放一次。
   // 失败/边界：任一 detach/destroy/null status/所有权断言失败都只记首错，
   //   但继续尝试其余释放；最后仅通过 cleanup_fixture 委托一次 Task 9 cleanup。
@@ -533,9 +1173,9 @@ class rdma_queue_data_engine_host_mem_test extends uvm_test;
     int unsigned cqe_size,
     rdma_queue_data_engine_fixture fixture,
     rdma_real_host_mem_proxy proxy,
-    rdma_cq source_first,
-    rdma_cq source_second,
-    rdma_cq target_cq,
+    rdma_handle source_first_h,
+    rdma_handle source_second_h,
+    rdma_handle target_cq_h,
     rdma_qp target_qp,
     bit target_cq_attached,
     bit target_qp_attached,
@@ -562,12 +1202,10 @@ class rdma_queue_data_engine_host_mem_test extends uvm_test;
         64'hb100 + cqe_size, step);
       retain_failure("segmented target QP cleanup", step, first_failure);
     end
-    if (target_cq != null) begin
-      fixture.destroy_lifecycle_owned_queue(
-        target_cq.handle, 1'b1, target_cq_attached,
-        64'hb200 + cqe_size, step);
-      retain_failure("segmented target CQ cleanup", step, first_failure);
-    end
+    cleanup_created_queue_handle(
+      fixture, target_cq_h, target_cq_attached,
+      64'hb200 + cqe_size, step);
+    retain_failure("segmented target CQ cleanup", step, first_failure);
     if (release_success_count(proxy, first_mapping) != first_before ||
         release_success_count(proxy, second_mapping) != second_before)
       retain_failure(
@@ -578,10 +1216,9 @@ class rdma_queue_data_engine_host_mem_test extends uvm_test;
 
     // 中文设计：target 的所有非拥有引用已撤销，现按第二段
     // 到第一段的顺序销毁 source owners，并同时校验调用数与 completion。
-    if (source_second != null) begin
-      fixture.destroy_lifecycle_owned_queue(
-        source_second.handle, 1'b1, 1'b0,
-        64'hb300 + cqe_size, step);
+    if (source_second_h != null) begin
+      cleanup_created_queue_handle(
+        fixture, source_second_h, 1'b0, 64'hb300 + cqe_size, step);
       retain_failure("segmented second source cleanup", step, first_failure);
       if (second_mapping != null &&
           release_success_count(proxy, second_mapping) != second_before + 1)
@@ -601,10 +1238,9 @@ class rdma_queue_data_engine_host_mem_test extends uvm_test;
                             "second source release is incomplete"),
           first_failure);
     end
-    if (source_first != null) begin
-      fixture.destroy_lifecycle_owned_queue(
-        source_first.handle, 1'b1, 1'b0,
-        64'hb400 + cqe_size, step);
+    if (source_first_h != null) begin
+      cleanup_created_queue_handle(
+        fixture, source_first_h, 1'b0, 64'hb400 + cqe_size, step);
       retain_failure("segmented first source cleanup", step, first_failure);
       if (first_mapping != null &&
           release_success_count(proxy, first_mapping) != first_before + 1)
@@ -651,6 +1287,9 @@ class rdma_queue_data_engine_host_mem_test extends uvm_test;
     rdma_cq source_first;
     rdma_cq source_second;
     rdma_cq target_cq;
+    rdma_handle source_first_h;
+    rdma_handle source_second_h;
+    rdma_handle target_cq_h;
     rdma_qp target_qp;
     rdma_dma_mapping first_mapping;
     rdma_dma_mapping second_mapping;
@@ -682,6 +1321,9 @@ class rdma_queue_data_engine_host_mem_test extends uvm_test;
     source_first = null;
     source_second = null;
     target_cq = null;
+    source_first_h = null;
+    source_second_h = null;
+    target_cq_h = null;
     target_qp = null;
     first_mapping = null;
     second_mapping = null;
@@ -728,12 +1370,10 @@ class rdma_queue_data_engine_host_mem_test extends uvm_test;
       request.ceq_h = rdma_clone_handle_value(
         fixture.ceq.handle, "first source CEQ");
       request.ring_backing.mode = RDMA_QUEUE_BACKING_OWNED;
-      resource = null;
-      control_result = null;
-      fixture.queue_executor.create_locked(
-        fixture.binding, fixture.binding.make_handle(), request,
-        64'ha100 + cqe_size, resource, control_result);
-      step = control_result == null ? null : control_result.status;
+      create_queue_for_test(
+        {label, " first source"}, fixture, request,
+        64'ha100 + cqe_size, 1'b0, resource, source_first_h,
+        control_result, step);
       retain_failure("first source CQ create", step, first_failure);
       if (first_failure == null &&
           (resource == null || !$cast(source_first, resource)))
@@ -767,12 +1407,10 @@ class rdma_queue_data_engine_host_mem_test extends uvm_test;
       request.ceq_h = rdma_clone_handle_value(
         fixture.ceq.handle, "second source CEQ");
       request.ring_backing.mode = RDMA_QUEUE_BACKING_OWNED;
-      resource = null;
-      control_result = null;
-      fixture.queue_executor.create_locked(
-        fixture.binding, fixture.binding.make_handle(), request,
-        64'ha200 + cqe_size, resource, control_result);
-      step = control_result == null ? null : control_result.status;
+      create_queue_for_test(
+        {label, " second source"}, fixture, request,
+        64'ha200 + cqe_size, 1'b0, resource, source_second_h,
+        control_result, step);
       retain_failure("second source CQ create", step, first_failure);
       if (first_failure == null &&
           (resource == null || !$cast(source_second, resource)))
@@ -826,12 +1464,10 @@ class rdma_queue_data_engine_host_mem_test extends uvm_test;
         disable profile_flow;
       end
       request.ring_backing.slices.push_back(slice);
-      resource = null;
-      control_result = null;
-      fixture.queue_executor.create_locked(
-        fixture.binding, fixture.binding.make_handle(), request,
-        64'ha300 + cqe_size, resource, control_result);
-      step = control_result == null ? null : control_result.status;
+      create_queue_for_test(
+        {label, " target"}, fixture, request,
+        64'ha300 + cqe_size, 1'b0, resource, target_cq_h,
+        control_result, step);
       retain_failure("segmented target CQ create", step, first_failure);
       if (first_failure == null &&
           (resource == null || !$cast(target_cq, resource)))
@@ -983,7 +1619,7 @@ class rdma_queue_data_engine_host_mem_test extends uvm_test;
     end
 
     cleanup_segmented_profile(
-      cqe_size, fixture, proxy, source_first, source_second, target_cq,
+      cqe_size, fixture, proxy, source_first_h, source_second_h, target_cq_h,
       target_qp, target_cq_attached, target_qp_attached,
       first_mapping, second_mapping, cleanup_status);
     retain_failure("segmented profile cleanup", cleanup_status, first_failure);
@@ -1300,8 +1936,9 @@ class rdma_queue_data_engine_host_mem_test extends uvm_test;
 
   // 功能：test_direct_proxy_opaque_release 用真实 pinned allocation 验证
   //   proxy 在 public mapping geometry 被篡改时仍按 opaque identity 释放 backing。
-  // 输入/输出及副作用：proxy 借用顶层 real adapter，status 返回首个
-  //   setup/allocate/release/cleanup 错误；成功路径只释放一次 isolated mapping。
+  // 输入/输出及副作用：proxy 借用顶层 real adapter；status 入口先置成功
+  //   安全值，尾部返回首个 setup/allocate/release/cleanup 错误；成功路径只释放
+  //   一次 isolated mapping。
   // 失败/边界：proxy/delegate/fixture/backing 缺失时返回 INVALID_STATE；
   //   proxy 拒绝时直接用 delegate.release_opaque 恢复清理，保留原错且不 double-free。
   task automatic test_direct_proxy_opaque_release(
@@ -1316,9 +1953,9 @@ class rdma_queue_data_engine_host_mem_test extends uvm_test;
     rdma_status step;
     rdma_status cleanup_status;
 
+    status = rdma_status::success();
     fixture = rdma_queue_data_engine_fixture::type_id::create(
       "opaque_release_fixture");
-    status = rdma_status::success();
     first_failure = null;
     begin : opaque_flow
       if (proxy == null || proxy.delegate == null || fixture == null) begin
@@ -1415,8 +2052,9 @@ class rdma_queue_data_engine_host_mem_test extends uvm_test;
   endtask
 
   // 功能：test_real_host_mem_device_publish_and_release 建立单一真实 host_mem
-  //   manager/adapter/proxy 生命周期，依次验证 opaque release、三种
-  //   segmented CQ stride、CEQE/AEQE 与最终零活动分配。
+  //   manager/adapter/proxy 生命周期，依次验证畸形后端输出、partial-create
+  //   canonical cleanup、opaque release、三种 segmented CQ stride、CEQE/AEQE
+  //   与最终零活动分配。
   // 输入/输出及副作用：无显式输入/输出；task 创建并借用一个外部
   //   manager，通过 UVM report 发布行为和数字泄漏断言。
   // 失败/边界：任一状态为 null/non-OK 或 leak_count 非零时报错；
@@ -1424,7 +2062,7 @@ class rdma_queue_data_engine_host_mem_test extends uvm_test;
   task automatic test_real_host_mem_device_publish_and_release();
     int unsigned profiles[3] = '{32, 64, 128};
     rdma_host_mem_external_pkg::host_mem_manager host_manager;
-    rdma_host_mem_adapter real_adapter;
+    rdma_fault_host_mem_adapter real_adapter;
     rdma_real_host_mem_proxy proxy;
     rdma_status status;
     int unsigned leak_count;
@@ -1433,13 +2071,21 @@ class rdma_queue_data_engine_host_mem_test extends uvm_test;
       "real_publish_host_manager");
     host_manager.init_region(64'h0000_0008_0000_0000,
                              64'h0000_0008_00ff_ffff);
-    real_adapter = rdma_host_mem_adapter::type_id::create(
+    real_adapter = rdma_fault_host_mem_adapter::type_id::create(
       "real_publish_adapter");
     real_adapter.mem = host_manager;
     real_adapter.iova_base = 64'h0000_0010_0000_0000;
     proxy = rdma_real_host_mem_proxy::type_id::create("real_publish_proxy");
     proxy.delegate = real_adapter;
 
+    test_proxy_failure_output_contracts(proxy, real_adapter, status);
+    if (status == null || !status.ok())
+      `uvm_error("PROXY_OUTPUT", status == null ? "null status" :
+                 status.convert2string())
+    test_partial_create_cleanup_contract(proxy, status);
+    if (status == null || !status.ok())
+      `uvm_error("PARTIAL_CREATE", status == null ? "null status" :
+                 status.convert2string())
     test_direct_proxy_opaque_release(proxy, status);
     if (status == null || !status.ok())
       `uvm_error("OPAQUE_RELEASE", status == null ? "null status" :
