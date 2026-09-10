@@ -22,6 +22,9 @@ readonly CORE_TESTS=(
   rdma_queue_runtime_test
   rdma_queue_backing_access_test
   rdma_queue_data_engine_post_test
+  # 设备产生的 CQE 发布属于核心队列生命周期回归，
+  # 必须在定义共享 fixture 的 post 测试之后执行。
+  rdma_queue_data_engine_device_publish_test
   rdma_queue_data_engine_poll_test
   rdma_queue_data_engine_recovery_test
   rdma_cq_engine_resize_test
