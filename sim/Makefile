@@ -5,11 +5,11 @@
 BUILD ?= build/core
 HOST_MEM_BUILD ?= build/host_mem
 E2E_BUILD ?= build/e2e
-# 53 机上的 host_mem_latest 是驱动更新后的只读 checkout；固定 commit/hash
-# 使 E2E 使用的真实 host-memory 实现可复现，同时不把外部源码复制进本仓库。
-override HOST_MEM_PINNED_COMMIT := 365b7553fc7dac6b4ad55886a8e4869153607c28
-override HOST_MEM_PKG_SHA256 := e874491da16334b12d9299355a3148275309a0c5a2c3303cda2fc7c3382ed74f
-override HOST_MEM_MANAGER_SHA256 := 6b5eb9bbd94d410b1382a665ddb60347132558fc7882cbed1115f69fa0c1d410
+# 53 机上的 /home/ubuntu/workspace/host_mem 是真实 pinned backing 的只读
+# checkout；固定 commit/hash 使 E2E 可复现，同时不把外部源码复制进本仓库。
+override HOST_MEM_PINNED_COMMIT := 3b9e000d5df4d10efbb3029f43605e0362e0caca
+override HOST_MEM_PKG_SHA256 := d2ba57918a3b605525274433008142c80921b6205b0848c76bef8f1fc0d0bba5
+override HOST_MEM_MANAGER_SHA256 := 8dd5ca3ba3abcfae4808c8ea10c34ced279316bebdc04f6f8e0ae5e55e337a9d
 override RDMA_ARCHIVE := /home/ubuntu/Downloads/dpu_kernel_rdma-version_0.1.34.tar(1).gz
 override RDMA_ARCHIVE_PREFIX := dpu_kernel_rdma-version_0.1.34
 # 6766c4f is the net_packet master snapshot that contains packet.sv and the
