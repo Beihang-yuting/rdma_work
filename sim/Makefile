@@ -72,6 +72,11 @@ rdma_defs:
 		echo "rdma_defs requires TEST=rdma_cmq_driver_contract_test" >&2; \
 		exit 2; \
 	fi
+	@cd .. && python3 -m unittest \
+		tests.unit.test_verify_rdma_archive \
+		tests.unit.test_check_rdma_profile_names \
+		tests.unit.test_verify_rdma_cmq_oracle \
+		tests.unit.test_check_rdma_field_ownership -v
 	@set -euo pipefail; ref_dir=$$(mktemp -d /tmp/rdma_profile_ref.XXXXXX); \
 	if [[ ! "$$ref_dir" =~ ^/tmp/rdma_profile_ref\.[A-Za-z0-9]{6}$$ ]]; then \
 		echo "Refusing unexpected RDMA reference directory: $$ref_dir" >&2; \
@@ -114,7 +119,17 @@ rdma_defs:
 		--cases ../hw/rdma/c_oracle/cmq_oracle_cases.tsv \
 		--oracle-source ../hw/rdma/c_oracle/rdma_cmq_oracle.c \
 		--artifact-root ../hw/rdma/c_oracle/cases \
-		--cc /usr/bin/gcc
+		--cc /usr/bin/gcc; \
+	python3 ../tools/check_rdma_field_ownership.py \
+		--kernel-root "$$kernel_root" \
+		--archive-lock ../hw/rdma/archive_lock.env \
+		--source-manifest ../hw/rdma/source_manifest.txt \
+		--ownership ../hw/rdma/field_ownership.tsv \
+		--exclusions ../hw/rdma/field_exclusions.tsv \
+		--capabilities ../hw/rdma/cmq_capabilities.tsv \
+		--oracle-root ../hw/rdma/c_oracle/cases \
+		--mutation-manifest ../hw/rdma/cmq_field_mutation.tsv \
+		--sv-root ../src
 
 host_mem_preflight:
 	@if [[ -z "$(HOST_MEM_ROOT)" ]]; then \
