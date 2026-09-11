@@ -1385,7 +1385,13 @@ def parse_sv_constants(text: str) -> dict[str, int]:
 
 
 def parse_sq_field_mappings(text: str) -> dict[str, tuple[str, str, int, int]]:
-    """Parse and validate the SQE field declarations from an SV defs file."""
+    """功能：解析并校验 SV 定义中的 SQE 字段坐标，生成字段到 C 来源的映射。
+    输入输出及副作用：输入为含有 ``RDMA_FIELD`` 声明的 SV 文本；返回每个字段的
+    ``(来源文件、C 符号、LSB、宽度)`` 元组，并附加 16 字节目的 IPv6 地址别名；不修改
+    外部状态。
+    失败边界：缺少或多出字段、重复声明、字节偏移漂移、与冻结参考坐标不一致，或字段
+    坐标超出 64 位 qword 时抛出 ``ValidationError``。
+    """
     clean = mask_sv_strings(strip_sv_comments(text))
     declared: dict[str, tuple[int, int, int]] = {}
     pattern = re.compile(
@@ -1414,15 +1420,17 @@ def parse_sq_field_mappings(text: str) -> dict[str, tuple[str, str, int, int]]:
             raise ValidationError(f"SQ field byte offset drift: {stem}")
         if reference is None or (lsb, width) != (reference.lsb, reference.width):
             raise ValidationError(f"SQ field coordinate drift: {stem}")
-    return {
+    result = {
         stem: (mappings[stem].path, mappings[stem].c_symbol, lsb, width)
         for stem, (_, lsb, width) in declared.items()
-    } | {
-        # The 16-byte destination-IP memcpy is represented by the two
-        # independently mapped IPv6 qwords; this name is a convenience alias
-        # for callers that treat the raw range as one field.
-        "RDMA_SQ_WQE_UD_DST_IP": ("wr.h", "XTRDMA_SQ_WQE_UD_DST_IPV6_L", 0, 64)
     }
+    # The 16-byte destination-IP memcpy is represented by the two independently
+    # mapped IPv6 qwords; this name is a convenience alias for callers that
+    # treat the raw range as one field.
+    result["RDMA_SQ_WQE_UD_DST_IP"] = (
+        "wr.h", "XTRDMA_SQ_WQE_UD_DST_IPV6_L", 0, 64
+    )
+    return result
 
 
 def _sq_header(

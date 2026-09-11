@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import ast
 import importlib.util
 import os
 from pathlib import Path
@@ -2411,6 +2412,42 @@ class ReferenceEncodingTest(unittest.TestCase):
         self.assertIn("RDMA_SQ_WQE_UD_DST_IP", fields)
         self.assertTrue((CHECKER.GOLDEN_DIR / "sq.hex").exists())
         CHECKER.validate_sq_golden_vectors()
+
+    def test_sq_field_mapping_has_no_python38_dict_union(self) -> None:
+        """功能：检查 SQ 字段解析器不会执行 Python 3.9 才支持的字典合并。
+        输入输出及副作用：读取解析器源码并遍历 ``parse_sq_field_mappings`` 的 AST，
+        不修改文件或运行时状态；若通过则表示该函数的返回构造可在 Python 3.8 执行。
+        失败边界：函数不存在，或其 AST 含有字典字面量/推导式参与 ``|`` 运算时失败，
+        因为 Python 3.8 会在该分支抛出 ``TypeError``。
+        """
+        tree = ast.parse(CHECKER_PATH.read_text(encoding="utf-8"), str(CHECKER_PATH))
+        function = next(
+            (
+                node
+                for node in ast.walk(tree)
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and node.name == "parse_sq_field_mappings"
+            ),
+            None,
+        )
+        self.assertIsNotNone(function, "parse_sq_field_mappings definition is required")
+        assert function is not None
+
+        dict_unions = [
+            node.lineno
+            for node in ast.walk(function)
+            if isinstance(node, ast.BinOp)
+            and isinstance(node.op, ast.BitOr)
+            and any(
+                isinstance(operand, (ast.Dict, ast.DictComp))
+                for operand in (node.left, node.right)
+            )
+        ]
+        self.assertEqual(
+            dict_unions,
+            [],
+            "parse_sq_field_mappings must not use dict | dict on Python 3.8",
+        )
 
     def test_sq_opcodes_are_pinned_to_wr_h_enum(self) -> None:
         constants = CHECKER.parse_sv_constants(CHECKER.SV_DEFS_PATH.read_text())
