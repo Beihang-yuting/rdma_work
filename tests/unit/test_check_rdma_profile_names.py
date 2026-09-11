@@ -1569,20 +1569,101 @@ class Task12DoorbellDefinitionTest(unittest.TestCase):
         with self.assertRaisesRegex(CHECKER.ValidationError, "payload"):
             validate(changed, cases_by_kind["queue"])
 
-    def test_new_pinned_source_hash_mutation_is_rejected(self) -> None:
-        validate = getattr(CHECKER, "validate_source_hash_contract")
-        validate(CHECKER.SOURCE_HASHES)
-        drifted = dict(CHECKER.SOURCE_HASHES)
-        drifted["eth_header/register.h"] = "0" * 64
-        with self.assertRaisesRegex(CHECKER.ValidationError, "source hash"):
-            validate(drifted)
+class SourceIdentityTest(unittest.TestCase):
+    """验证 source manifest 是冻结源码身份的唯一权威。"""
+
+    def _lock(self, archive_id: str = "fixture-archive"):
+        """功能：构造最小 ArchiveLock fixture；输入输出及副作用：返回只读归档身份供校验器使用；失败边界：仅覆盖 source identity 所需字段。"""
+        return CHECKER.ArchiveLock(
+            archive_id=archive_id,
+            sha256="0" * 64,
+            size_bytes=1,
+            prefix="fixture",
+            member_list_sha256="1" * 64,
+            member_count=1,
+        )
+
+    def _fixture(self, selector: str = "FIXTURE_SYMBOL", digest: str | None = None):
+        """功能：创建临时锁定源码和 manifest；输入输出及副作用：返回临时目录、源码路径及记录；失败边界：调用方负责释放 TemporaryDirectory。"""
+        temp = tempfile.TemporaryDirectory(prefix="rdma_source_identity.")
+        root = Path(temp.name)
+        source = root / "fixture.h"
+        source.write_text("#define FIXTURE_SYMBOL 1\n", encoding="utf-8")
+        actual_digest = __import__("hashlib").sha256(source.read_bytes()).hexdigest()
+        record = CHECKER.SourceManifestRecord(
+            archive_id="fixture-archive",
+            path="fixture.h",
+            selector=selector,
+            sha256=actual_digest if digest is None else digest,
+        )
+        return temp, root, source, record
+
+    def test_source_manifest_git_head_does_not_change_locked_source_identity(self) -> None:
+        """功能：确认冻结源码只由 manifest 字节和 selector 决定；输入输出及副作用：临时写入无关 .git/HEAD 后完成校验；失败边界：源码、digest 或 selector 不匹配时由后续测试拒绝。"""
+        temp, root, _, record = self._fixture()
+        try:
+            (root / ".git").mkdir()
+            (root / ".git" / "HEAD").write_text(
+                "0123456789abcdef0123456789abcdef01234567\n", encoding="utf-8"
+            )
+            required_rows = CHECKER.REQUIRED_MANIFEST_ROWS
+            CHECKER.REQUIRED_MANIFEST_ROWS = {("fixture.h", "FIXTURE_SYMBOL")}
+            try:
+                sources = CHECKER.validate_source_manifest_sources(
+                    root, self._lock(), [record]
+                )
+            finally:
+                CHECKER.REQUIRED_MANIFEST_ROWS = required_rows
+            self.assertIn("fixture.h", sources)
+        finally:
+            temp.cleanup()
+
+    def test_source_digest_drift_is_rejected(self) -> None:
+        """功能：验证 manifest 摘要漂移被拒绝；输入输出及副作用：使用错误 sha256 调用源码身份校验；失败边界：必须报告 source digest mismatch。"""
+        temp, root, _, record = self._fixture(digest="f" * 64)
+        try:
+            with self.assertRaisesRegex(CHECKER.ValidationError, "source digest mismatch: fixture.h"):
+                CHECKER.validate_source_manifest_sources(root, self._lock(), [record])
+        finally:
+            temp.cleanup()
+
+    def test_selector_mismatch_is_rejected(self) -> None:
+        """功能：验证 selector 未覆盖源码符号时被拒绝；输入输出及副作用：传入不存在的 selector；失败边界：必须报告 source selector matches no locked symbol/text。"""
+        temp, root, _, record = self._fixture(selector="MISSING_SYMBOL")
+        try:
+            with self.assertRaisesRegex(CHECKER.ValidationError, "source selector matches no locked symbol/text: fixture.h"):
+                CHECKER.validate_source_manifest_sources(root, self._lock(), [record])
+        finally:
+            temp.cleanup()
+
+    def test_archive_identifier_mismatch_is_rejected(self) -> None:
+        """功能：验证 manifest archive_identifier 必须等于 ArchiveLock；输入输出及副作用：使用不同归档身份；失败边界：必须报告 source manifest archive identifier mismatch。"""
+        temp, root, _, record = self._fixture()
+        try:
+            with self.assertRaisesRegex(CHECKER.ValidationError, "source manifest archive identifier mismatch"):
+                CHECKER.validate_source_manifest_sources(root, self._lock("other-archive"), [record])
+        finally:
+            temp.cleanup()
+
+    def test_missing_source_is_rejected(self) -> None:
+        """功能：验证 manifest 指向缺失文件时被拒绝；输入输出及副作用：删除 fixture 后执行校验；失败边界：必须报告 source file missing。"""
+        temp, root, source, record = self._fixture()
+        try:
+            source.unlink()
+            with self.assertRaisesRegex(CHECKER.ValidationError, "source file missing: fixture.h"):
+                CHECKER.validate_source_manifest_sources(root, self._lock(), [record])
+        finally:
+            temp.cleanup()
 
 
 class MakefileCleanupTest(unittest.TestCase):
     def test_rdma_defs_routes_through_archive_verifier(self) -> None:
         """功能：确认 rdma_defs 使用统一 verifier；输入输出及副作用：读取 Makefile dry-run 文本；失败边界：禁止直接 tar/unzip 解压。"""
         rendered = subprocess.run(
-            ["make", "--no-print-directory", "-n", "rdma_defs"],
+            [
+                "make", "--no-print-directory", "-n",
+                "TEST=rdma_cmq_driver_contract_test", "rdma_defs",
+            ],
             cwd=REPO_ROOT / "sim", check=True, text=True,
             stdout=subprocess.PIPE,
         ).stdout
@@ -1595,7 +1676,10 @@ class MakefileCleanupTest(unittest.TestCase):
     def test_rdma_defs_cleanup_preserves_command_failure_and_reports_delete_failure(self) -> None:
         sim_dir = REPO_ROOT / "sim"
         rendered = subprocess.run(
-            ["make", "--no-print-directory", "-n", "rdma_defs"],
+            [
+                "make", "--no-print-directory", "-n",
+                "TEST=rdma_cmq_driver_contract_test", "rdma_defs",
+            ],
             cwd=sim_dir,
             check=True,
             text=True,

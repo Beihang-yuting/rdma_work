@@ -68,6 +68,10 @@ core:
 	fi
 
 rdma_defs:
+	@if [[ "$(TEST)" != "rdma_cmq_driver_contract_test" ]]; then \
+		echo "rdma_defs requires TEST=rdma_cmq_driver_contract_test" >&2; \
+		exit 2; \
+	fi
 	@set -euo pipefail; ref_dir=$$(mktemp -d /tmp/rdma_profile_ref.XXXXXX); \
 	if [[ ! "$$ref_dir" =~ ^/tmp/rdma_profile_ref\.[A-Za-z0-9]{6}$$ ]]; then \
 		echo "Refusing unexpected RDMA reference directory: $$ref_dir" >&2; \
@@ -98,7 +102,10 @@ rdma_defs:
 		--source-manifest ../hw/rdma/source_manifest.txt \
 		--extract-dir "$$ref_dir" \
 		--print-kernel-root); \
-	python3 ../tools/check_rdma_profile_names.py --kernel-root "$$kernel_root"
+	python3 ../tools/check_rdma_profile_names.py \
+		--kernel-root "$$kernel_root" \
+		--archive-lock ../hw/rdma/archive_lock.env \
+		--source-manifest ../hw/rdma/source_manifest.txt
 
 host_mem_preflight:
 	@if [[ -z "$(HOST_MEM_ROOT)" ]]; then \

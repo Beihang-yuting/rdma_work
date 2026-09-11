@@ -1,4 +1,4 @@
-# fixed-source provenance: archive identifier path selector sha256
+# archive_identifier path selector sha256
 rdma-driver-0.1.34 cmq.h xtrdma_cmq_opcode 67f685b23af4f1be64322e56e270546d993db95494ecba253d38afd0780b6e06
 rdma-driver-0.1.34 cmq.h XTRDMA_CMQ*|XTRDMA_OP_* 67f685b23af4f1be64322e56e270546d993db95494ecba253d38afd0780b6e06
 rdma-driver-0.1.34 qp.h XTRDMA_QPC_* 6202ca6df10cca9bebdcdf5f766c145cd319e0c765edcfbd8677e6d4afa267bd

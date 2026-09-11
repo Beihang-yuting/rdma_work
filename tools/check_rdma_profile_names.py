@@ -13,13 +13,28 @@ import fnmatch
 import hashlib
 from pathlib import Path
 import re
-import subprocess
 import sys
 from typing import NamedTuple
 
+try:
+    from .rdma_driver_contract import (
+        ArchiveLock,
+        ContractError,
+        SourceManifestRecord,
+        load_archive_lock,
+        load_source_manifest,
+    )
+except ImportError:  # pragma: no cover - direct script execution
+    if str(Path(__file__).resolve().parent) not in sys.path:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from rdma_driver_contract import (
+        ArchiveLock,
+        ContractError,
+        SourceManifestRecord,
+        load_archive_lock,
+        load_source_manifest,
+    )
 
-# 0.1.34 is distributed as a source archive without Git metadata.
-FIXED_COMMIT = "rdma-driver-0.1.34"
 REPO_ROOT = Path(__file__).resolve().parents[1]
 MANIFEST_PATH = REPO_ROOT / "hw" / "rdma" / "source_manifest.txt"
 SV_DEFS_PATH = REPO_ROOT / "src" / "codec" / "rdma" / "rdma_defs.svh"
@@ -39,30 +54,6 @@ PROFILE_FORBIDDEN_PATTERNS = (
     re.compile(r"(?:^|[\"'])xtr_v1\|"),
     re.compile(r"(?:src/codec/|tests/[^\s]*/?)xtr_v1(?:/|[\"'])"),
 )
-
-SOURCE_HASHES = {
-    "cmq.h": "67f685b23af4f1be64322e56e270546d993db95494ecba253d38afd0780b6e06",
-    "qp.h": "6202ca6df10cca9bebdcdf5f766c145cd319e0c765edcfbd8677e6d4afa267bd",
-    "cq.h": "36b6cca236607fd269347ee9bc6e7cfc4410e7ddb920c178931ce11d385e0208",
-    "wr.h": "c75fb5770ef0ea1af404efbaf95cf79356d1096d331d7cdfcc46ea9ad9b3225b",
-    "defs.h": "2715ad7e265c692f34e5decdd34d23ed0cde3b19c8a3de8d89bc60cf71824862",
-    "eth_header/rdma_register.h": "af957673ba0b561cd27d4bd22394cc0bc56a0173bff66c59176a5a829e0acc13",
-    "eth_header/register.h": "061071cab4008cee1fa837b9aa71c068215c98cb5665ef5f4b038a24da09c734",
-    "xtrdma_hw.h": "70aa98a0db8e0c753f11d7bf0347cee774cee01daf7c9593ea1999a2c1ffad68",
-    "map.h": "9b532a140458c3f9592b8a1d7531500e820f8f7b1650bf6fd7f41aa1d214c75d",
-    "qp.c": "c2832eee56ce17128a4c548ed96298912ba0ce6f4ce61401f433c257396f7c3c",
-    "cq.c": "60c502b5d2de6370c6162e9e827439e76003553a913b22cae5979b79e9b7921b",
-    "wr.c": "f9267765b49faff2b5772c28dde862bec7079413b2278540cba3c6f2ea64f7fe",
-    "cmq.c": "0976654707f3ee68a96589121aae22db7a6cefb1eec3454e756ba16e411ab383",
-    "alloc.h": "1e91bb9e92c253c985f2f65684ebbd61d48b512d13aff2b73a8cbae3b25265e9",
-    "mr.h": "db51447212e687556247a19edc76ad13a39e3f4e59e0b68f1cb08c0969eb9dba",
-    "mr.c": "19775d0b99785ab4a372dcebb79aa1560b4158fc04c916a0c144c1f2aa107e5d",
-    "rdma_main.h": "48fd532c4b5987696412f987bbb2e42111d08d9da298745bd91c39effa1128ed",
-    "srq.h": "c0f7edd9bc65a4a574c082167221bdb7644c28e6f4387c1bd2a5db157b2341ae",
-    "srq.c": "c4bfe2cc974b8458e45c7552412e11fad8014acc1da6f0e5c578eb9fd4e8a5d0",
-    "event.h": "9c1185a2279854c95ed00a949c2a8aa3f4a1588386de65bf7fa7662d08dfb99a",
-    "event.c": "6b196af6a6bcdffae099a63df647ed1f565a80fbd9aa0accbb69400ff7fe4c00",
-}
 
 REQUIRED_MANIFEST_ROWS = {
     ("cmq.h", "xtrdma_cmq_opcode"),
@@ -3862,64 +3853,63 @@ def validate_doorbell_contract(
             )
 
 
-def validate_source_hash_contract(source_hashes: dict[str, str]) -> None:
-    expected = {
-        "eth_header/register.h":
-            "061071cab4008cee1fa837b9aa71c068215c98cb5665ef5f4b038a24da09c734",
-    }
-    for path, pinned_hash in expected.items():
-        actual = source_hashes.get(path)
-        if actual != pinned_hash:
-            raise ValidationError(f"source hash contract drift for {path}")
-    for path, digest in source_hashes.items():
-        if re.fullmatch(r"[0-9a-f]{64}", digest) is None:
-            raise ValidationError(f"source hash is malformed for {path}")
-
-
-def load_manifest() -> list[tuple[str, str, str, str]]:
-    rows = []
-    for line_number, raw_line in enumerate(MANIFEST_PATH.read_text().splitlines(), 1):
-        line = raw_line.strip()
-        if not line or line.startswith("#"):
-            continue
-        columns = line.split()
-        if len(columns) != 4:
-            raise ValidationError(f"manifest line {line_number} does not have four columns")
-        rows.append(tuple(columns))
-    if not rows:
-        raise ValidationError("source manifest has no entries")
-    return rows
-
-
 def selector_matches(text: str, selector: str) -> bool:
-    macros, _ = parse_c_symbols(text)
+    """功能：判断源码文本是否覆盖 manifest selector 的任一替代项；输入输出及副作用：读取 text 和 selector，返回布尔覆盖结果且不修改输入；失败边界：空 selector 无匹配，glob 仅按符号名匹配，描述性 selector 按转义文本匹配。"""
+    macros, enums = parse_c_symbols(text)
+    enum_tags = re.findall(r"\benum\s+([A-Za-z_]\w*)\s*\{", text)
+    symbols = tuple(macros) + tuple(enums) + tuple(enum_tags)
     for alternative in selector.split("|"):
-        if fnmatch.fnmatchcase(alternative, "xtrdma_*opcode"):
-            if re.search(rf"\benum\s+{re.escape(alternative)}\s*\{{", text):
+        if not alternative:
+            continue
+        if "*" in alternative:
+            if any(fnmatch.fnmatchcase(name, alternative) for name in symbols):
                 return True
-        if any(fnmatch.fnmatchcase(name, alternative) for name in macros):
-            return True
-        if re.search(rf"\benum\s+{re.escape(alternative)}\s*\{{", text):
-            return True
-        if "*" not in alternative and re.search(rf"\b{re.escape(alternative)}\b", text):
+            continue
+        if re.search(
+            rf"(?<![A-Za-z0-9_]){re.escape(alternative)}(?![A-Za-z0-9_])",
+            text,
+        ):
             return True
     return False
 
 
-def validate_git_head(kernel_root: Path) -> None:
-    probe = subprocess.run(
-        ["git", "-C", str(kernel_root), "rev-parse", "--is-inside-work-tree"],
-        text=True, capture_output=True, check=False,
-    )
-    if probe.returncode != 0:
-        return
-    head = subprocess.run(
-        ["git", "-C", str(kernel_root), "rev-parse", "HEAD"],
-        text=True, capture_output=True, check=False,
-    )
-    if head.returncode != 0 or head.stdout.strip() != FIXED_COMMIT:
-        actual = head.stdout.strip() or "<unreadable>"
-        raise ValidationError(f"kernel HEAD {actual} does not match fixed {FIXED_COMMIT}")
+def validate_source_manifest_sources(
+    kernel_root: Path,
+    archive_lock: ArchiveLock,
+    records: list[SourceManifestRecord],
+) -> dict[str, str]:
+    """功能：依据 ArchiveLock 与 source manifest 验证冻结源码并读取文本；输入输出及副作用：读取 kernel_root 下记录文件，返回 path 到 UTF-8 文本映射；失败边界：归档身份、同路径摘要、缺失文件、摘要或 selector 漂移以及必需覆盖缺失时抛 ValidationError。"""
+    if not records:
+        raise ValidationError("source manifest has no entries")
+    source_text: dict[str, str] = {}
+    path_digests: dict[str, str] = {}
+    seen_rows: set[tuple[str, str]] = set()
+    for record in records:
+        if record.archive_id != archive_lock.archive_id:
+            raise ValidationError("source manifest archive identifier mismatch")
+        previous_digest = path_digests.setdefault(record.path, record.sha256)
+        if previous_digest != record.sha256:
+            raise ValidationError(f"source manifest digest mismatch: {record.path}")
+        source_path = kernel_root / record.path
+        if not source_path.is_file():
+            raise ValidationError(f"source file missing: {record.path}")
+        actual_digest = hashlib.sha256(source_path.read_bytes()).hexdigest()
+        if actual_digest != record.sha256:
+            raise ValidationError(f"source digest mismatch: {record.path}")
+        try:
+            text = source_path.read_text(encoding="utf-8")
+        except UnicodeDecodeError as error:
+            raise ValidationError(f"source is not UTF-8: {record.path}") from error
+        source_text[record.path] = text
+        if not selector_matches(text, record.selector):
+            raise ValidationError(
+                f"source selector matches no locked symbol/text: {record.path}"
+            )
+        seen_rows.add((record.path, record.selector))
+    missing_rows = REQUIRED_MANIFEST_ROWS - seen_rows
+    if missing_rows:
+        raise ValidationError(f"required manifest rows missing: {sorted(missing_rows)}")
+    return source_text
 
 
 def validate_required_sv_constants(
@@ -3935,39 +3925,20 @@ def validate_required_sv_constants(
             )
 
 
-def validate(kernel_root: Path) -> None:
-    validate_git_head(kernel_root)
-    validate_source_hash_contract(SOURCE_HASHES)
+def validate(
+    kernel_root: Path,
+    archive_lock_path: Path,
+    source_manifest_path: Path,
+) -> None:
+    """功能：执行冻结 RDMA 定义、映射和 golden 全量契约校验；输入输出及副作用：读取 kernel_root、ArchiveLock、source manifest 与仓库定义并输出无副作用校验结果；失败边界：任一来源身份、映射、常量、mask 或 golden 漂移抛 ValidationError。"""
+    try:
+        archive_lock = load_archive_lock(archive_lock_path)
+        records = load_source_manifest(source_manifest_path)
+    except ContractError as error:
+        raise ValidationError(str(error)) from error
     validate_mapping_uniqueness(FIELD_MAPPINGS, VALUE_MAPPINGS, REFERENCE_FIELDS)
     validate_body_translations(BODY_TRANSLATIONS, FIELD_MAPPINGS)
-    rows = load_manifest()
-    seen_rows = set()
-    source_text: dict[str, str] = {}
-    for commit, relative_path, selector, manifest_hash in rows:
-        if commit != FIXED_COMMIT:
-            raise ValidationError(f"manifest commit for {relative_path} is not fixed commit")
-        expected_hash = SOURCE_HASHES.get(relative_path)
-        if expected_hash is None or manifest_hash != expected_hash:
-            raise ValidationError(f"manifest hash for {relative_path} is not the built-in pinned hash")
-        source_path = kernel_root / relative_path
-        if not source_path.is_file():
-            raise ValidationError(f"source file missing: {relative_path}")
-        actual_hash = hashlib.sha256(source_path.read_bytes()).hexdigest()
-        if actual_hash != expected_hash:
-            raise ValidationError(
-                f"source hash mismatch for {relative_path}: {actual_hash} != {expected_hash}"
-            )
-        text = source_path.read_text()
-        source_text[relative_path] = text
-        if not selector_matches(text, selector):
-            raise ValidationError(f"selector {selector} matches nothing in {relative_path}")
-        seen_rows.add((relative_path, selector))
-    missing_rows = REQUIRED_MANIFEST_ROWS - seen_rows
-    if missing_rows:
-        raise ValidationError(f"required manifest rows missing: {sorted(missing_rows)}")
-    for path in SOURCE_HASHES:
-        if path not in source_text:
-            raise ValidationError(f"pinned source {path} has no manifest row")
+    source_text = validate_source_manifest_sources(kernel_root, archive_lock, records)
 
     parsed_sources = {path: parse_c_symbols(text) for path, text in source_text.items()}
     validate_access_projections(source_text["rdma_main.h"])
@@ -4065,19 +4036,35 @@ def validate(kernel_root: Path) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """功能：解析 CLI 并选择 profile-only 或冻结源码契约校验；输入输出及副作用：读取参数、打印 PASS/FAIL 并返回进程状态码；失败边界：冻结模式缺少三个路径参数或任一契约错误时返回 1。"""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--kernel-root",
         type=Path,
         help="校验冻结硬件资料；省略时只执行内部 profile 命名守卫",
     )
+    parser.add_argument("--archive-lock", type=Path)
+    parser.add_argument("--source-manifest", type=Path)
     args = parser.parse_args(argv)
     try:
+        frozen_args = (args.kernel_root, args.archive_lock, args.source_manifest)
+        if args.kernel_root is None and any(value is not None for value in frozen_args[1:]):
+            raise ValidationError(
+                "frozen-source mode requires --kernel-root, --archive-lock and --source-manifest"
+            )
         if args.kernel_root is None:
             validate_profile_names()
             print("rdma profile naming: PASS")
             return 0
-        validate(args.kernel_root.resolve())
+        if args.archive_lock is None or args.source_manifest is None:
+            raise ValidationError(
+                "frozen-source mode requires --kernel-root, --archive-lock and --source-manifest"
+            )
+        validate(
+            args.kernel_root.resolve(),
+            args.archive_lock.resolve(),
+            args.source_manifest.resolve(),
+        )
     except (OSError, ValidationError) as error:
         print(f"rdma definitions: FAIL: {error}", file=sys.stderr)
         return 1
