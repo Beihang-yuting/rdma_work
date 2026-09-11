@@ -93,13 +93,13 @@ rdma_defs:
 		exit $$cleanup_status; \
 	}; \
 	trap cleanup EXIT; \
-	case "$(RDMA_ARCHIVE)" in \
-		*.tar.gz|*.tar*.gz|*.tgz) tar -xzf "$(RDMA_ARCHIVE)" -C "$$ref_dir" "$(RDMA_ARCHIVE_PREFIX)" ;; \
-		*.zip) unzip -q "$(RDMA_ARCHIVE)" "$(RDMA_ARCHIVE_PREFIX)/*" -d "$$ref_dir" ;; \
-		*) echo "Unsupported RDMA archive format: $(RDMA_ARCHIVE)" >&2; exit 2 ;; \
-	esac; \
-	python3 ../tools/check_rdma_profile_names.py \
-		--kernel-root "$$ref_dir/$(RDMA_ARCHIVE_PREFIX)"
+	kernel_root=$$(python3 ../tools/verify_rdma_archive.py \
+		--archive "$(RDMA_ARCHIVE)" \
+		--lock ../hw/rdma/archive_lock.env \
+		--source-manifest ../hw/rdma/source_manifest.txt \
+		--extract-dir "$$ref_dir" \
+		--print-kernel-root); \
+	python3 ../tools/check_rdma_profile_names.py --kernel-root "$$kernel_root"
 
 host_mem_preflight:
 	@if [[ -z "$(HOST_MEM_ROOT)" ]]; then \
