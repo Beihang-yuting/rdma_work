@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 from contextlib import ExitStack
 import re
 import shlex
@@ -42,36 +43,111 @@ class OracleVerifierUnitTest(unittest.TestCase):
             verifier.canonical_reports("BYTES\t00\nUNKNOWN\tx\n")
 
     def test_sparse_layout_contract(self):
-        """功能：锁定 oracle 实现与测试 harness 的稀疏排版约束。
-        输入输出及副作用：读取受影响源码，检查行宽和控制语句单一
-        动作；
-        不写文件。
-        失败边界：超过 100 列或控制头后直接执行动作的行必须拒绝，避免
-        隐藏
-        复合逻辑。"""
+        """功能：按 Python、shell 与 C 语法锁定 Task 3 文件的稀疏排版。
+        输入输出及副作用：读取 verifier、测试、capture helper 和 probe，检查
+        行宽、同行动作及声明；不写文件。
+        失败边界：超过 100 列、Python suite/分号同行动作、shell case/命令链，
+        或 C 非独立 for 头的多分号行均必须拒绝。"""
         repo = Path(__file__).resolve().parents[2]
-        paths = (
+        python_paths = (
             repo / "tools/verify_rdma_cmq_oracle.py",
             repo / "tests/unit/test_verify_rdma_cmq_oracle.py",
-            repo / "tests/support/capture_rdma_cmq_oracle_candidate.sh",
-            repo / "hw/rdma/c_oracle/rdma_cmq_oracle.c",
         )
-        one_line_action = re.compile(
-            r"^\s*(?:if|elif|for|while)\b.*:\s*(?:continue|break|raise|return|"
-            r"[A-Za-z_]\w*\s*(?:[+\-*/]?=)|[A-Za-z_]\w*\()"
+        shell_path = repo / "tests/support/capture_rdma_cmq_oracle_candidate.sh"
+        c_path = repo / "hw/rdma/c_oracle/rdma_cmq_oracle.c"
+        paths = (*python_paths, shell_path, c_path)
+        sources = {
+            path: path.read_text(encoding="utf-8")
+            for path in paths
+        }
+        python_orphan_suite_body = re.compile(
+            r"^\s*(?:else|finally)\s*:\s*(?!#)\S"
         )
+        shell_inline_case_action = re.compile(
+            r"^\s*(?:--[A-Za-z0-9_-]+|\*|\*\.[A-Za-z0-9_.*?-]+)\)\s+\S"
+        )
+        shell_chained_action = re.compile(
+            r";\s*(?!(?:then|do)\b|;|$)\S"
+        )
+        c_for_header = re.compile(
+            r"^\s*for\s*\([^;]*;[^;]*;[^;]*\)\s*\{?\s*$"
+        )
+
         for path in paths:
-            for line_number, line in enumerate(
-                path.read_text(encoding="utf-8").splitlines(), 1
+            for line_number, line in enumerate(sources[path].splitlines(), 1):
+                with self.subTest(path=path, line=line_number, rule="line width"):
+                    self.assertLessEqual(
+                        len(line),
+                        100,
+                        f"{path}:{line_number} exceeds 100 columns",
+                    )
+
+        for path in python_paths:
+            statement_lines = {}
+            tree = ast.parse(sources[path], filename=str(path))
+            for node in ast.walk(tree):
+                if isinstance(node, (ast.ExceptHandler, ast.stmt)):
+                    statement_lines.setdefault(node.lineno, []).append(
+                        type(node).__name__
+                    )
+            for line_number, statement_types in sorted(statement_lines.items()):
+                with self.subTest(
+                    path=path,
+                    line=line_number,
+                    rule="Python statement count",
+                ):
+                    self.assertEqual(
+                        len(statement_types),
+                        1,
+                        f"{path}:{line_number} has multiple Python statements: "
+                        + ", ".join(statement_types),
+                    )
+            for line_number, line in enumerate(sources[path].splitlines(), 1):
+                with self.subTest(
+                    path=path,
+                    line=line_number,
+                    rule="Python orphan suite body",
+                ):
+                    self.assertIsNone(
+                        python_orphan_suite_body.match(line),
+                        f"{path}:{line_number} has a one-line Python suite body",
+                    )
+
+        for path in (shell_path, python_paths[1]):
+            for line_number, line in enumerate(sources[path].splitlines(), 1):
+                with self.subTest(
+                    path=path,
+                    line=line_number,
+                    rule="shell case body",
+                ):
+                    self.assertIsNone(
+                        shell_inline_case_action.match(line),
+                        f"{path}:{line_number} has an inline shell case action",
+                    )
+
+        for line_number, line in enumerate(sources[shell_path].splitlines(), 1):
+            with self.subTest(
+                path=shell_path,
+                line=line_number,
+                rule="shell command chain",
             ):
-                self.assertLessEqual(
-                    len(line),
-                    100,
-                    f"{path}:{line_number} exceeds 100 columns",
-                )
                 self.assertIsNone(
-                    one_line_action.match(line),
-                    f"{path}:{line_number} has a one-line control action",
+                    shell_chained_action.search(line),
+                    f"{shell_path}:{line_number} chains shell commands",
+                )
+
+        for line_number, line in enumerate(sources[c_path].splitlines(), 1):
+            if line.count(";") <= 1:
+                continue
+            with self.subTest(
+                path=c_path,
+                line=line_number,
+                rule="C declaration/action count",
+            ):
+                self.assertRegex(
+                    line,
+                    c_for_header,
+                    f"{c_path}:{line_number} has multiple C declarations/actions",
                 )
 
     def test_cases_require_exact_four(self):
@@ -399,7 +475,8 @@ chmod +x "$out"
                 values["_build_and_run"].side_effect = lambda *call: (outputs[call[3]], "")
                 missing = args.artifact_root / "cmq_sq_doorbell.input.tsv"
                 missing.unlink()
-                with self.assertRaises(verifier.ContractError): verifier.verify(args)
+                with self.assertRaises(verifier.ContractError):
+                    verifier.verify(args)
                 shutil.copy2(
                     Path(__file__).resolve().parents[2]
                     / "hw/rdma/c_oracle/cases/cmq_sq_doorbell.input.tsv",
@@ -421,7 +498,8 @@ chmod +x "$out"
                 (args.artifact_root / "cmq_sq_doorbell.bytes.hex").write_text(
                     "ff\n", encoding="utf-8"
                 )
-                with self.assertRaises(verifier.ContractError): verifier.verify(args)
+                with self.assertRaises(verifier.ContractError):
+                    verifier.verify(args)
 
             root = Path(temp) / "fields"
             root.mkdir()
@@ -438,7 +516,8 @@ chmod +x "$out"
                 (args.artifact_root / "cmq_sq_doorbell.fields.tsv").write_text(
                     "drift\n", encoding="utf-8"
                 )
-                with self.assertRaises(verifier.ContractError): verifier.verify(args)
+                with self.assertRaises(verifier.ContractError):
+                    verifier.verify(args)
 
     def test_verify_rejects_closure_probe_and_input_drift(self):
         """功能：实际调用 verify() 覆盖 source closure、probe source、input
@@ -840,7 +919,9 @@ source=''
 out=''
 for arg in "$@"; do
     case "$arg" in
-        *.c) source=$arg ;;
+        *.c)
+            source=$arg
+            ;;
     esac
 done
 if [ -z "$source" ] || ! grep -Fq '{marker}' "$source"; then

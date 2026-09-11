@@ -46,7 +46,11 @@ struct xtrdma_dma_mem {
 };
 struct xtrdma_sc_dev;
 struct xtrdma_cmq_quanta;
-struct xtrdma_ring { u32 head; u32 tail; u32 size; };
+struct xtrdma_ring {
+	u32 head;
+	u32 tail;
+	u32 size;
+};
 struct xtrdma_sc_cmq {
 	struct xtrdma_sc_dev *sc_dev;
 	u64 sq_pa;

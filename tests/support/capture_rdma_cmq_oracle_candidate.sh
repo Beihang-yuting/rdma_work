@@ -28,14 +28,30 @@ cc=
 while (($#)); do
 	key=$1
 	case "$key" in
-		--archive) archive=${2-};;
-		--archive-lock) archive_lock=${2-};;
-		--source-manifest) source_manifest=${2-};;
-		--source-anchors) source_anchors=${2-};;
-		--cases) cases=${2-};;
-		--oracle-source) oracle_source=${2-};;
-		--output-dir) output_dir=${2-};;
-		--cc) cc=${2-};;
+		--archive)
+			archive=${2-}
+			;;
+		--archive-lock)
+			archive_lock=${2-}
+			;;
+		--source-manifest)
+			source_manifest=${2-}
+			;;
+		--source-anchors)
+			source_anchors=${2-}
+			;;
+		--cases)
+			cases=${2-}
+			;;
+		--oracle-source)
+			oracle_source=${2-}
+			;;
+		--output-dir)
+			output_dir=${2-}
+			;;
+		--cc)
+			cc=${2-}
+			;;
 		*)
 			usage
 			exit 2
