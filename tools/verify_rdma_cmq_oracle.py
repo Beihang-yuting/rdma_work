@@ -429,8 +429,10 @@ def source_digests(
             depth = 1
             pos = start
             while depth and pos < len(text):
-                if text[pos] == "{": depth += 1
-                elif text[pos] == "}": depth -= 1
+                if text[pos] == "{":
+                    depth += 1
+                elif text[pos] == "}":
+                    depth -= 1
                 pos += 1
             body = text[start:pos]
             normalized = " ".join(token.split())
