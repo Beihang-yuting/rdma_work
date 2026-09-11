@@ -11,7 +11,6 @@ override HOST_MEM_PINNED_COMMIT := 3b9e000d5df4d10efbb3029f43605e0362e0caca
 override HOST_MEM_PKG_SHA256 := d2ba57918a3b605525274433008142c80921b6205b0848c76bef8f1fc0d0bba5
 override HOST_MEM_MANAGER_SHA256 := 8dd5ca3ba3abcfae4808c8ea10c34ced279316bebdc04f6f8e0ae5e55e337a9d
 override RDMA_ARCHIVE := /home/ubuntu/Downloads/dpu_kernel_rdma-version_0.1.34.tar(1).gz
-override RDMA_ARCHIVE_PREFIX := dpu_kernel_rdma-version_0.1.34
 # 6766c4f is the net_packet master snapshot that contains packet.sv and the
 # RoCEv2/iWARP protocol headers consumed by this adapter.
 override NET_PACKET_PINNED_COMMIT := 6766c4f042484814548481065328ffbcffab590f
@@ -69,7 +68,7 @@ core:
 	fi
 
 rdma_defs:
-	@ref_dir=$$(mktemp -d /tmp/rdma_profile_ref.XXXXXX); \
+	@set -euo pipefail; ref_dir=$$(mktemp -d /tmp/rdma_profile_ref.XXXXXX); \
 	if [[ ! "$$ref_dir" =~ ^/tmp/rdma_profile_ref\.[A-Za-z0-9]{6}$$ ]]; then \
 		echo "Refusing unexpected RDMA reference directory: $$ref_dir" >&2; \
 		exit 2; \

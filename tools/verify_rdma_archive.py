@@ -57,6 +57,8 @@ def verify_archive(archive: Path, lock_path: Path, manifest_path: Path, extract_
         raise ContractError("archive SHA-256 does not match lock")
 
     extract_dir = Path(extract_dir)
+    if extract_dir.is_symlink():
+        raise ContractError("extract directory must not be a symlink")
     extract_dir.mkdir(parents=True, exist_ok=True)
     final_root = extract_dir / lock.prefix
     if final_root.exists():
@@ -112,8 +114,10 @@ def verify_archive(archive: Path, lock_path: Path, manifest_path: Path, extract_
             raise ContractError(f"destination appeared during verification: {final_root}")
         staged_prefix.rename(final_root)
         return final_root.resolve()
-    except Exception:
+    except Exception as exc:
         shutil.rmtree(stage, ignore_errors=True)
+        if isinstance(exc, (UnicodeError, tarfile.TarError)):
+            raise ContractError(f"invalid tar archive metadata: {exc}") from exc
         raise
     finally:
         if stage.exists():

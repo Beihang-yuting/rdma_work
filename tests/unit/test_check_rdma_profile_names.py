@@ -1579,6 +1579,19 @@ class Task12DoorbellDefinitionTest(unittest.TestCase):
 
 
 class MakefileCleanupTest(unittest.TestCase):
+    def test_rdma_defs_routes_through_archive_verifier(self) -> None:
+        """功能：确认 rdma_defs 使用统一 verifier；输入输出及副作用：读取 Makefile dry-run 文本；失败边界：禁止直接 tar/unzip 解压。"""
+        rendered = subprocess.run(
+            ["make", "--no-print-directory", "-n", "rdma_defs"],
+            cwd=REPO_ROOT / "sim", check=True, text=True,
+            stdout=subprocess.PIPE,
+        ).stdout
+        self.assertIn("verify_rdma_archive.py", rendered)
+        self.assertIn("--lock ../hw/rdma/archive_lock.env", rendered)
+        self.assertIn("--source-manifest ../hw/rdma/source_manifest.txt", rendered)
+        self.assertNotRegex(rendered, r"(?:tar -x|unzip -q)")
+        self.assertIn("set -euo pipefail", rendered)
+
     def test_rdma_defs_cleanup_preserves_command_failure_and_reports_delete_failure(self) -> None:
         sim_dir = REPO_ROOT / "sim"
         rendered = subprocess.run(

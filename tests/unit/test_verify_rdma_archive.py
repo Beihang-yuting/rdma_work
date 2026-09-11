@@ -40,7 +40,7 @@ class ArchiveFixtureTest(unittest.TestCase):
                     tar.addfile(info, __import__("io").BytesIO(payload))
                     names.append(name)
                 else:
-                    type_map = {"symlink": tarfile.SYMTYPE, "hardlink": tarfile.LNKTYPE, "fifo": tarfile.FIFOTYPE, "chr": tarfile.CHRTYPE}
+                    type_map = {"symlink": tarfile.SYMTYPE, "hardlink": tarfile.LNKTYPE, "fifo": tarfile.FIFOTYPE, "chr": tarfile.CHRTYPE, "block": tarfile.BLKTYPE}
                     info.type = type_map[kind]
                     tar.addfile(info)
                     names.append(name)
@@ -131,8 +131,12 @@ class ArchiveFixtureTest(unittest.TestCase):
 
     def test_links_fifo_and_device_rejected(self):
         """功能：验证链接、FIFO、设备节点类型拒绝；输入输出及副作用：逐类构造；失败边界：每项抛 ContractError。"""
-        for kind in ("symlink", "hardlink", "fifo", "chr"):
+        for kind in ("symlink", "hardlink", "fifo", "chr", "block"):
             self.assert_rejected([("kernel", "dir", None), ("kernel/x", kind, None)])
+
+    def test_link_declared_before_target_is_rejected(self):
+        """功能：验证先出现的链接同样拒绝；输入输出及副作用：链接位于目标前；失败边界：必须抛 ContractError。"""
+        self.assert_rejected([("kernel", "dir", None), ("kernel/link", "symlink", None), ("kernel/target", "file", b"x")])
 
     def test_extraction_failure_is_atomic(self):
         """功能：验证提取失败清理 staging；输入输出及副作用：构造缺失 manifest；失败边界：不得残留私有目录。"""

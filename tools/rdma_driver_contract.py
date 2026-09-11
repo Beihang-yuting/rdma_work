@@ -16,6 +16,7 @@ class ContractError(RuntimeError):
 
 @dataclass(frozen=True)
 class ArchiveLock:
+    """功能：表示冻结归档身份与摘要；输入输出及副作用：字段只读；失败边界：由 load_archive_lock 校验后构造。"""
     archive_id: str
     sha256: str
     size_bytes: int
@@ -26,6 +27,7 @@ class ArchiveLock:
 
 @dataclass(frozen=True)
 class SourceManifestRecord:
+    """功能：表示单条来源文件契约；输入输出及副作用：保存 archive/path/selector/hash；失败边界：非法值不得绕过解析器。"""
     archive_id: str
     path: str
     selector: str
@@ -40,6 +42,7 @@ _LOWER_SHA256 = re.compile(r"[0-9a-f]{64}")
 
 
 def _load_exact_env(path: Path, expected_keys: set[str]) -> dict[str, str]:
+    """功能：读取并校验 env 键集合；输入输出及副作用：返回字符串映射；失败边界：未知、重复、缺失或空值抛 ContractError。"""
     values: dict[str, str] = {}
     for line_number, raw_line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
         line = raw_line.strip()
@@ -62,18 +65,21 @@ def _load_exact_env(path: Path, expected_keys: set[str]) -> dict[str, str]:
 
 
 def _require_lower_sha256(label: str, value: str) -> str:
+    """功能：校验小写 SHA-256；输入输出及副作用：返回原字符串；失败边界：非 64 位小写十六进制抛错。"""
     if _LOWER_SHA256.fullmatch(value) is None:
         raise ContractError(f"{label} must be 64 lowercase hex digits")
     return value
 
 
 def _require_positive_decimal(label: str, value: str) -> int:
+    """功能：解析正十进制整数；输入输出及副作用：返回 int；失败边界：零、负数或非数字抛错。"""
     if re.fullmatch(r"[1-9][0-9]*", value) is None:
         raise ContractError(f"{label} must be a positive decimal integer")
     return int(value, 10)
 
 
 def _require_relative_member_path(label: str, value: str) -> str:
+    """功能：校验 POSIX 相对成员路径；输入输出及副作用：返回原路径；失败边界：绝对、空组件、遍历、反斜杠或 NUL 抛错。"""
     pure_path = PurePosixPath(value)
     raw_parts = value.split("/")
     if pure_path.is_absolute() or value in {"", "."}:
@@ -86,6 +92,7 @@ def _require_relative_member_path(label: str, value: str) -> str:
 
 
 def load_archive_lock(path: Path) -> ArchiveLock:
+    """功能：加载冻结 archive lock；输入输出及副作用：读取 path 并返回不可变 ArchiveLock；失败边界：键值或 prefix 不符契约时抛错。"""
     values = _load_exact_env(path, _ARCHIVE_KEYS)
     prefix = _require_relative_member_path("RDMA_ARCHIVE_PREFIX", values["RDMA_ARCHIVE_PREFIX"])
     if "/" in prefix:
@@ -101,6 +108,7 @@ def load_archive_lock(path: Path) -> ArchiveLock:
 
 
 def load_source_manifest(path: Path) -> list[SourceManifestRecord]:
+    """功能：加载来源 manifest；输入输出及副作用：读取 path 返回记录列表；失败边界：列数、路径、摘要或重复身份非法时抛错。"""
     records: list[SourceManifestRecord] = []
     identities: set[tuple[str, str, str]] = set()
     for line_number, raw_line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
@@ -126,6 +134,7 @@ def load_source_manifest(path: Path) -> list[SourceManifestRecord]:
 
 
 def canonical_member_list_digest(member_names: list[str]) -> str:
+    """功能：按 GNU tar 拼写排序计算成员列表摘要；输入输出及副作用：返回 SHA-256；失败边界：空列表或重复成员抛错。"""
     if not member_names:
         raise ContractError("archive member list is empty")
     if len(member_names) != len(set(member_names)):
