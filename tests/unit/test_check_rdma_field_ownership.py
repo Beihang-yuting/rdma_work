@@ -551,6 +551,212 @@ class FieldOwnershipFixtureTest(unittest.TestCase):
         self.assertFalse(module.validate_polarity_group({"valid"}))
         self.assertFalse(module.validate_polarity_group({"wrap", "valid", "extra"}))
 
+    def test_rejects_typed_writer_covering_static_request_bit(self):
+        """功能：拒绝生产 QPC writer 通过 put_field 覆盖 C 保留位。
+        输入输出及副作用：向最小 SV encode_fields fixture 注入 qword0 bit24 的直接写入；
+        source-walk 必须返回 ContractError，不修改临时输入。
+        失败边界：若只看 canonical zero 而忽略 typed writer，伪造的 STATIC_UNWRITABLE 证据会被接受。"""
+        module = self.require_checker()
+        coordinates = {
+            ("CMQ_SQE", "QPC_CREATE", "REQUEST", "XTRDMA_CMQSQ_WQE_QPN"): 0,
+        }
+        source = (
+            "class rdma_hw_cmq_qpc_layout_codec;\n"
+            "function void encode_fields();\n"
+            "  builder.put_field(0, 24, 1, fake_bit);\n"
+            "endfunction\nendclass\n"
+        )
+        self.assert_rejected(
+            lambda checker_module: checker_module.validate_sv_writer_contract(
+                {"rdma_cmq_codecs.sv": source}, coordinates,
+                [{"case_id": "cmq_sqe_qpc_create_request", "qword_index": "0",
+                  "bit_index": "24", "evidence_mode": "STATIC_UNWRITABLE"}],
+                [], [],
+            )
+        )
+
+    def test_rejects_derived_mask_drift_into_static_bit(self):
+        """功能：拒绝 QPC_CREATE derived ownership mask 把 C 保留 bit 置一。
+        输入输出及副作用：提供含 bit24 的伪造 RDMA_QPC_CREATE_BODY_OWNERSHIP；只读解析文本。
+        失败边界：mask 漂移必须在未执行任何 model encoder 前 fail-closed。"""
+        module = self.require_checker()
+        source = (
+            "localparam bit [63:0] RDMA_QPC_CREATE_BODY_OWNERSHIP [0:7] = '{\n"
+            "64'h0000000001ffffff, 64'h0000000000000000, 64'h0, 64'h0, "
+            "64'h0, 64'h0, 64'h0, 64'h0};\n"
+        )
+        self.assert_rejected(
+            lambda checker_module: checker_module.validate_derived_masks(
+                source,
+                {0: 0x0000000000ffffff, 1: 0, 2: 0, 3: 0,
+                 4: 0, 5: 0, 6: 0, 7: 0},
+                "RDMA_QPC_CREATE_BODY_OWNERSHIP",
+            )
+        )
+
+    def test_rejects_writer_coordinate_drift_from_c_map(self):
+        """功能：拒绝 SV symbolic writer 坐标与 C 派生坐标不一致。
+        输入输出及副作用：把 QPN alias 映射到错误的 qword/bit 区间；验证只读映射并抛错。
+        失败边界：不能以 SV 常量或字段名覆盖 C source 的唯一坐标权威。"""
+        module = self.require_checker()
+        source = (
+            "class rdma_hw_cmq_qpc_layout_codec;\n"
+            "function void encode_fields();\n"
+            "  `CMQ_QPC_PUT(RDMA_CMQ_QPN, value)\n"
+            "endfunction\nendclass\n"
+            "`define CMQ_QPC_PUT(STEM, VALUE) \\\n"
+            "  put(builder, STEM``_WORD_BYTE_OFFSET, STEM``_LSB, STEM``_WIDTH, VALUE);\n"
+        )
+        coordinates = {
+            ("CMQ_SQE", "QPC_CREATE", "REQUEST", "XTRDMA_CMQSQ_WQE_QPN"): 0,
+        }
+        # A malformed C map with the same alias but a non-zero base must not be
+        # silently reconciled with the SV field name.
+        bad_coordinates = {
+            ("CMQ_SQE", "QPC_CREATE", "REQUEST", "XTRDMA_CMQSQ_WQE_QPN"): 8,
+        }
+        self.assert_rejected(
+            lambda checker_module: checker_module.validate_sv_writer_contract(
+                {"rdma_cmq_codecs.sv": source}, bad_coordinates, [], [], [],
+            )
+        )
+
+    def test_source_walk_collects_body_envelope_and_doorbell_macro_writers(self):
+        """功能：确认 source-walk 分别收集 QPC body、envelope 和 CMQ doorbell 的宏 writer。
+        输入输出及副作用：传入含宏定义与三个 production class 的最小 SV fixture；返回每个 C 坐标的 range。
+        失败边界：宏定义文本不能被当成未知 writer，且任一 case 的成功分支缺失都必须被发现。"""
+        module = self.require_checker()
+        source = (
+            "`define CMQ_QPC_PUT(STEM, VALUE) \\\n"
+            "  status = put(builder, STEM``_WORD_BYTE_OFFSET, STEM``_LSB, \\\n"
+            "               STEM``_WIDTH, VALUE); \\\n"
+            "  if (!status.ok()) return status;\n"
+            "`define CMQ_ENVELOPE_PUT(STEM, VALUE) \\\n"
+            "  status = builder.put_field(STEM``_WORD_BYTE_OFFSET, STEM``_LSB, \\\n"
+            "                             STEM``_WIDTH, VALUE);\n"
+            "`define DB_PUT(STEM, VALUE) \\\n"
+            "  status = put(builder, STEM``_WORD_BYTE_OFFSET, STEM``_LSB, \\\n"
+            "               STEM``_WIDTH, VALUE);\n"
+            "RDMA_FIELD(RDMA_CMQ_QPN, 0, 0, 8)\n"
+            "RDMA_FIELD(RDMA_CMQ_VALID, 0, 63, 1)\n"
+            "RDMA_FIELD(RDMA_CMQ_DB_PI, 0, 32, 5)\n"
+            "RDMA_FIELD(RDMA_CMQ_DB_POLARITY, 0, 37, 1)\n"
+            "class rdma_hw_cmq_qpc_layout_codec;\n"
+            "function rdma_status encode_fields(bit [7:0] opcode, "
+            "rdma_hw_model model, rdma_hw_qword_builder builder);\n"
+            "  rdma_status status;\n"
+            "  case (opcode)\n"
+            "    RDMA_OP_QPC_CREATE: begin\n"
+            "      `CMQ_QPC_PUT(RDMA_CMQ_QPN, model.qpn)\n"
+            "    end\n"
+            "  endcase\n"
+            "endfunction\nendclass\n"
+            "class rdma_hw_cmq_envelope_codec;\n"
+            "function rdma_status encode(rdma_hw_cmq_envelope envelope, "
+            "output rdma_hw_image image);\n"
+            "  rdma_status status;\n"
+            "  `CMQ_ENVELOPE_PUT(RDMA_CMQ_VALID, envelope.valid)\n"
+            "endfunction\nendclass\n"
+            "class rdma_hw_doorbell_codec;\n"
+            "function rdma_status encode_fields(rdma_hw_model model, "
+            "rdma_hw_qword_builder builder);\n"
+            "  rdma_status status;\n"
+            "  case (variant_name)\n"
+            "    \"cmq_sq\": begin\n"
+            "      `DB_PUT(RDMA_CMQ_DB_PI, model.pi)\n"
+            "      `DB_PUT(RDMA_CMQ_DB_POLARITY, model.polarity)\n"
+            "    end\n"
+            "  endcase\n"
+            "endfunction\nendclass\n"
+        )
+        coordinates = {
+            ("CMQ_SQE", "QPC_CREATE", "REQUEST", "XTRDMA_CMQSQ_WQE_QPN"):
+                (0, 0, 8),
+            ("CMQ_SQE", "QPC_CREATE", "REQUEST", "XTRDMA_CMQSQ_WQE_VALID"):
+                (0, 63, 1),
+            ("CMQ_SQ_DOORBELL", "CMQ_SQ", "REQUEST", "XTRDMA_CMQSQ_DB_PI"):
+                (0, 32, 5),
+            ("CMQ_SQ_DOORBELL", "CMQ_SQ", "REQUEST", "XTRDMA_CMQSQ_DB_POL"):
+                (0, 37, 1),
+        }
+        ranges = module._scan_sv_writer_ranges(
+            {"fixture.sv": source}, coordinates
+        )
+        observed = {
+            (item.case_id, item.operation, item.base, item.lsb, item.width)
+            for item in ranges
+        }
+        self.assertIn(
+            ("cmq_sqe_qpc_create_request", "MACRO_PUT", 0, 0, 8),
+            observed,
+        )
+        self.assertIn(
+            ("cmq_sqe_qpc_create_request", "MACRO_PUT", 0, 63, 1),
+            observed,
+        )
+        self.assertIn(
+            ("cmq_sq_doorbell", "MACRO_PUT", 0, 32, 5),
+            observed,
+        )
+        self.assertIn(
+            ("cmq_sq_doorbell", "MACRO_PUT", 0, 37, 1),
+            observed,
+        )
+        self.assertFalse(any(item.operation == "UNKNOWN_WRITER" for item in ranges))
+
+    def test_selected_mask_ignores_other_cmq_sq_case_returns(self):
+        """功能：只从 selected_mask 方法读取 CMQ SQ 的允许位 literal。
+        输入输出及副作用：fixture 另含 offset/target 方法的同名 case 分支；返回 selected_mask 的整数值。
+        失败边界：跨方法正则匹配会把多个合法 cmq_sq 分支误报为重复并阻断 source-walk。"""
+        module = self.require_checker()
+        source = (
+            "function bit [63:0] expected_relative_offset();\n"
+            "  case (variant_name)\n"
+            "    \"cmq_sq\": return 64'h10;\n"
+            "  endcase\n"
+            "endfunction\n"
+            "function bit [63:0] selected_mask();\n"
+            "  case (variant_name)\n"
+            "    \"cmq_sq\": return 64'h0000_003f_0000_0000;\n"
+            "  endcase\n"
+            "endfunction\n"
+            "function bit [63:0] another_target();\n"
+            "  case (variant_name)\n"
+            "    \"cmq_sq\": return 64'h20;\n"
+            "  endcase\n"
+            "endfunction\n"
+        )
+        self.assertEqual(
+            module._selected_mask_for_cmq_doorbell(source),
+            0x0000003F00000000,
+        )
+
+    def test_model_accepts_tq_flush_from_sv_supported_set(self):
+        """功能：确认 TQ_FLUSH opcode 属于 completion codec 的真实 supported_opcode 集合。
+        输入输出及副作用：传入 owner-ready 与 0x20；返回 OK/ready=1，不修改状态。
+        失败边界：硬编码集合漏项会把合法 opcode 错误标成 UNSUPPORTED_OPCODE。"""
+        module = self.require_checker()
+        self.assertEqual(module.model_outcome(1, 1, 0x20), ("OK", 1))
+
+    def test_derive_memcpy_and_offset_evidence(self):
+        """功能：从 memcpy/offsetof 调用推导目标 buffer 的 byte base。
+        输入输出及副作用：fixture 仅含一个 memcpy 与 offsetof 赋值；返回 C-derived 坐标映射。
+        失败边界：缺少调用参数、目标 buffer 不符或多个 base 时必须拒绝而非猜测。"""
+        module = self.require_checker()
+        source = (
+            "void f(void) {\n"
+            "  size_t off = offsetof(struct packet, payload);\n"
+            "  memcpy(wqe + 1, src, 56);\n"
+            "}\n"
+        )
+        self.assertEqual(
+            module.derive_macro_offsets(
+                source, "f", {"XTRDMA_TEST_FIELD"}, expected_buffers={"wqe + 1"},
+                evidence_macros={"XTRDMA_TEST_FIELD": {"kind": "MEMCPY", "base": 8}},
+            )["XTRDMA_TEST_FIELD"],
+            8,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

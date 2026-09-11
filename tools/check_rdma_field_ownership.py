@@ -220,6 +220,47 @@ class OpcodeDefinition:
     value: int
 
 
+@dataclass(frozen=True)
+class WriterRange:
+    """功能：记录一个 production SV writer 在逻辑 image 中覆盖的位区间。
+    输入输出及副作用：保存 case、来源、byte base、低位、宽度和证据 token；对象不可变且不拥有源码。
+    失败边界：坐标必须由 C-derived mapping 校验，未知或无法解析的 writer 由调用方按整幅 image 保守处理。"""
+
+    case_id: str
+    source_path: str
+    operation: str
+    token: str
+    base: int
+    lsb: int
+    width: int
+
+
+# SV field names are intentionally only aliases.  The numeric coordinate used
+# by the gate always comes from the locked C macro map; a mismatch between an
+# alias's RDMA_FIELD declaration and that map is a hard failure.
+SV_FIELD_ALIASES = {
+    "RDMA_CMQ_VALID": "XTRDMA_CMQSQ_WQE_VALID",
+    "RDMA_CMQ_VFID_OVERRIDE": "XTRDMA_CMQSQ_VFID_OVERRIDE",
+    "RDMA_CMQ_USE_VFID": "XTRDMA_CMQSQ_USE_VFID",
+    "RDMA_CMQ_WRAP": "XTRDMA_CMQSQ_WQE_WRAP",
+    "RDMA_CMQ_WQE_INDEX": "XTRDMA_CMQSQ_WQE_INDEX",
+    "RDMA_CMQ_OPCODE": "XTRDMA_CMQCQ_OPCODE",
+    "RDMA_CMQ_CMD_ECODE": "XTRDMA_CMQCQ_CMD_ECODE",
+    "RDMA_CMQ_QPN": "XTRDMA_CMQSQ_WQE_QPN",
+    "RDMA_CMQ_SQ_CQN": "XTRDMA_CMQSQ_WQE_SQ_CQN",
+    "RDMA_CMQ_SIGN_EN": "XTRDMA_CMQSQ_WQE_SIGN_EN",
+    "RDMA_CMQ_SIGNATURE": "XTRDMA_CMQSQ_WQE_SIGNATURE",
+    "RDMA_CMQ_RQ_CQN": "XTRDMA_CMQSQ_WQE_RQ_CQN",
+    "RDMA_CMQ_QPC_BUFFER_ADDR": "XTRDMA_CMQSQ_WQE_QPC_BUFFER_ADDR",
+    "RDMA_CMQ_DB_PI": "XTRDMA_CMQSQ_DB_PI",
+    "RDMA_CMQ_DB_POLARITY": "XTRDMA_CMQSQ_DB_POL",
+}
+
+SUPPORTED_OPCODE_NAME_RE = re.compile(
+    r"\b(?:RDMA|XTRDMA|TRDMA)_OP_[A-Z0-9_]+\b"
+)
+
+
 def _sha256(path: Path) -> str:
     """功能：读取 path 并计算其 SHA-256，供 source identity 比对。
     输入输出及副作用：返回小写摘要；只读文件，不创建输出。
@@ -236,6 +277,237 @@ def _strip_comments(text: str) -> str:
     输入输出及副作用：返回规范化前的无注释文本，不修改输入。
     失败边界：未闭合块注释按文件末尾结束；注释内 token 永远不能成为 anchor 命中。"""
     return re.sub(r"/\*.*?\*/|//[^\n]*", "", text, flags=re.S)
+
+
+def _strip_sv_comments(text: str) -> str:
+    """功能：按 SystemVerilog 词法移除行/块注释，同时保留字符串和换行供 source walk 定位。
+    输入输出及副作用：返回只含非注释源码的文本；不修改输入文件，也不执行宏或字符串内容。
+    失败边界：未闭合注释延伸到文本末尾；注释中的 writer、mask 或 opcode 永远不能成为证据。"""
+    result: list[str] = []
+    index = 0
+    state = "normal"
+    escaped = False
+    while index < len(text):
+        current = text[index]
+        following = text[index + 1] if index + 1 < len(text) else ""
+        if state == "normal":
+            if current == "/" and following == "/":
+                result.extend((" ", " "))
+                index += 2
+                state = "line"
+                continue
+            if current == "/" and following == "*":
+                result.extend((" ", " "))
+                index += 2
+                state = "block"
+                continue
+            if current == '"':
+                result.append(current)
+                index += 1
+                state = "string"
+                escaped = False
+                continue
+            result.append(current)
+            index += 1
+            continue
+        if state == "line":
+            if current == "\n":
+                result.append(current)
+                state = "normal"
+            else:
+                result.append(" ")
+            index += 1
+            continue
+        if state == "block":
+            if current == "*" and following == "/":
+                result.extend((" ", " "))
+                index += 2
+                state = "normal"
+                continue
+            result.append("\n" if current == "\n" else " ")
+            index += 1
+            continue
+        # string state: comments inside a quoted literal are data, not syntax.
+        result.append(current)
+        index += 1
+        if escaped:
+            escaped = False
+        elif current == "\\":
+            escaped = True
+        elif current == '"':
+            state = "normal"
+    return "".join(result)
+
+
+def _balanced_delimited_text(
+    source: str,
+    opening_index: int,
+    opening: str,
+    closing: str,
+) -> tuple[str, int]:
+    """功能：提取从 opening_index 开始的一段平衡括号/关键字区域。
+    输入输出及副作用：返回不含外层定界符的文本及结束下标；只读 source，不执行其中代码。
+    失败边界：起点不是 opening、嵌套未闭合或下标越界时抛 ContractError，禁止截断解析。"""
+    if opening_index >= len(source) or source[opening_index] != opening:
+        raise ContractError("balanced text does not start with opening delimiter")
+    depth = 1
+    index = opening_index + 1
+    in_string = False
+    escaped = False
+    while index < len(source):
+        current = source[index]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif current == "\\":
+                escaped = True
+            elif current == '"':
+                in_string = False
+            index += 1
+            continue
+        if current == '"':
+            in_string = True
+        elif current == opening:
+            depth += 1
+        elif current == closing:
+            depth -= 1
+            if depth == 0:
+                return source[opening_index + 1:index], index + 1
+        index += 1
+    raise ContractError("unbalanced source delimiters")
+
+
+def _sv_class_body(source: str, class_name: str) -> str:
+    """功能：截取指定 SV class 的完整文本，供方法和 case writer 解析。
+    输入输出及副作用：返回 class 关键字之后到 endclass 之前的只读文本；不展开继承或修改源码。
+    失败边界：class 缺失、重复、endclass 缺失或声明被注释遮蔽时抛 ContractError。"""
+    matches = list(re.finditer(
+        r"\bclass\s+" + re.escape(class_name) + r"\b[^;]*;",
+        source,
+    ))
+    if len(matches) != 1:
+        raise ContractError(
+            f"SV class {class_name} is not unique: {len(matches)}"
+        )
+    start = matches[0].end()
+    end = source.find("endclass", start)
+    if end < 0:
+        raise ContractError(f"SV class {class_name} has no endclass")
+    return source[start:end]
+
+
+def _sv_function_body(source: str, function_name: str) -> str:
+    """功能：从 SV class/source 中截取一个 function 的声明后正文，保留 begin/end 结构。
+    输入输出及副作用：返回函数体文本；不执行函数，也不把相邻 overload 当作同一 writer。
+    失败边界：函数不存在、重复、缺少声明分号或 endfunction 时抛 ContractError。"""
+    # Do not search from one ``function`` token to the next ``endfunction``
+    # with a broad regex: a call to ``encode_fields()`` inside ``encode()``
+    # would then be mistaken for a second declaration.  Instead inspect only
+    # the declaration text ending at its semicolon and require the requested
+    # name there.  This also keeps overloads distinct and makes duplicate
+    # declarations fail closed.
+    declarations: list[tuple[int, int]] = []
+    for function_match in re.finditer(r"\bfunction\b", source):
+        declaration_end = source.find(";", function_match.end())
+        if declaration_end < 0:
+            continue
+        declaration = source[function_match.end():declaration_end]
+        if re.search(
+            r"\b" + re.escape(function_name) + r"\s*\(", declaration
+        ):
+            declarations.append((function_match.start(), declaration_end))
+    if len(declarations) != 1:
+        raise ContractError(
+            f"SV function {function_name} is not unique: {len(declarations)}"
+        )
+    start, declaration_end = declarations[0]
+    # Find the closing parenthesis of the argument list before the declaration
+    # semicolon; nested type expressions are accepted.
+    open_index = source.find("(", start, declaration_end)
+    if open_index < 0:
+        raise ContractError(f"SV function {function_name} declaration is incomplete")
+    _, after_args = _balanced_delimited_text(source, open_index, "(", ")")
+    if after_args > declaration_end:
+        raise ContractError(f"SV function {function_name} declaration is incomplete")
+    end = source.find("endfunction", declaration_end + 1)
+    if end < 0:
+        raise ContractError(f"SV function {function_name} has no endfunction")
+    return source[declaration_end + 1:end]
+
+
+def _sv_case_branch(body: str, label: str) -> str:
+    """功能：提取 case 中指定 label 的 begin/end 分支，隔离其他 opcode/variant writer。
+    输入输出及副作用：返回该分支正文；只读已去注释的 SV 文本，不改变 case 状态。
+    失败边界：label 缺失、重复、begin/end 不平衡或分支为空时抛 ContractError。"""
+    # A quoted variant label (the doorbell codec uses ``"cmq_sq"``) has no
+    # word-character boundary before its opening quote, so ``\b`` would miss
+    # it.  Require a source/whitespace/statement boundary instead and keep the
+    # label itself exact.
+    pattern = re.compile(
+        r"(?:^|[\s;])" + re.escape(label) + r"\s*:\s*begin\b"
+    )
+    matches = list(pattern.finditer(body))
+    if len(matches) != 1:
+        raise ContractError(f"SV case branch {label} is not unique: {len(matches)}")
+    begin_index = body.find("begin", matches[0].start(), matches[0].end())
+    token_re = re.compile(r"\bbegin\b|\bend\b")
+    depth = 0
+    end_index = None
+    for token in token_re.finditer(body, begin_index):
+        if token.group() == "begin":
+            depth += 1
+        else:
+            depth -= 1
+            if depth == 0:
+                end_index = token.start()
+                break
+    if end_index is None:
+        raise ContractError(f"SV case branch {label} is unbalanced")
+    branch = body[begin_index + len("begin"):end_index]
+    if not branch.strip():
+        raise ContractError(f"SV case branch {label} is empty")
+    return branch
+
+
+def _split_call_arguments(text: str) -> list[str]:
+    """功能：按顶层逗号拆分 SV/C 调用参数，保留嵌套 cast、括号和字符串。
+    输入输出及副作用：返回参数文本列表；不求值、不改变参数中的空白语义。
+    失败边界：括号/字符串不平衡或空参数会抛 ContractError，避免错配 base/length。"""
+    result: list[str] = []
+    start = 0
+    depth = 0
+    in_string = False
+    escaped = False
+    for index, current in enumerate(text):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif current == "\\":
+                escaped = True
+            elif current == '"':
+                in_string = False
+            continue
+        if current == '"':
+            in_string = True
+        elif current == "(":
+            depth += 1
+        elif current == ")":
+            depth -= 1
+            if depth < 0:
+                raise ContractError("call arguments have unbalanced parentheses")
+        elif current == "," and depth == 0:
+            value = text[start:index].strip()
+            if not value:
+                raise ContractError("call contains an empty argument")
+            result.append(value)
+            start = index + 1
+    if in_string or depth:
+        raise ContractError("call arguments are not balanced")
+    value = text[start:].strip()
+    if not value:
+        raise ContractError("call contains an empty final argument")
+    result.append(value)
+    return result
 
 
 def _parse_int(text: str, label: str) -> int:
@@ -865,10 +1137,13 @@ def validate_capability_rows(
         if not codec or codec == "-":
             raise ContractError(f"capability owning codec missing: {symbol}/{direction}")
     if enum_members:
-        if seen != expected_keys and seen - {("CMQ_SQ_DOORBELL", "REQUEST")} != expected_keys:
+        synthetic = {("CMQ_SQ_DOORBELL", "REQUEST")}
+        if seen != expected_keys and seen - synthetic != expected_keys:
             missing = expected_keys - seen
-            extra = seen - expected_keys - {("CMQ_SQ_DOORBELL", "REQUEST")}
-            raise ContractError(f"capability enum coverage mismatch: missing={missing} extra={extra}")
+            extra = seen - expected_keys - synthetic
+            raise ContractError(
+                f"capability enum coverage mismatch: missing={missing} extra={extra}"
+            )
     return list(rows)
 
 
@@ -896,15 +1171,24 @@ def cqe_driver_result(
     return "READY_OK"
 
 
-def model_outcome(owner: int, expected_owner: int, opcode: int) -> tuple[str, int]:
-    """功能：给出 raw completion codec 的 owner/ready 分层结果。
-    输入输出及副作用：返回 (model_status, ready)，不写 driver request_error。
-    失败边界：owner 不匹配返回 OK/0；未知 opcode 返回 UNSUPPORTED_OPCODE/0。"""
+def model_outcome(
+    owner: int,
+    expected_owner: int,
+    opcode: int,
+    supported_opcodes: Iterable[int] | None = None,
+) -> tuple[str, int]:
+    """功能：按 completion codec 的 source-derived supported set 给出 owner/ready 分层结果。
+    输入输出及副作用：返回 (model_status, ready)，不写 driver request_error；可选集合来自 SV source walk。
+    失败边界：owner 不匹配返回 OK/0；opcode 不在真实 supported_opcode 集合时返回 UNSUPPORTED_OPCODE/0；集合为空按默认冻结契约处理。"""
     if owner != expected_owner:
         return "OK", 0
-    if opcode not in {0, 1, 2, 3, 4, 5, 6, 9, 0x0A, 0x0C, 0x0E, 0x0F, 0x10,
-                      0x12, 0x13, 0x14, 0x16, 0x17, 0x35, 0x37, 0x38,
-                      0x1C, 0x3A, 0x46, 0x47}:
+    default_supported = {
+        0, 1, 2, 3, 4, 5, 6, 9, 0x0A, 0x0C, 0x0E, 0x0F, 0x10,
+        0x12, 0x13, 0x14, 0x16, 0x17, 0x20, 0x35, 0x37, 0x38,
+        0x1C, 0x3A, 0x46, 0x47,
+    }
+    supported = set(supported_opcodes) if supported_opcodes is not None else default_supported
+    if opcode not in supported:
         return "UNSUPPORTED_OPCODE", 0
     return "OK", 1
 
@@ -1428,6 +1712,850 @@ def _read_sv_sources(root: Path) -> dict[str, str]:
     return sources
 
 
+def _parse_sv_literal(value: str) -> int:
+    """功能：解析 SV 数值字面量为无符号 Python 整数，供 mask/坐标 source walk 使用。
+    输入输出及副作用：返回整数；不调用仿真器或执行任意表达式。
+    失败边界：非零宽十六进制、十进制或明确的全零 `'0` 之外的字面量均抛 ContractError。"""
+    compact = "".join(value.split())
+    if compact in {"'0", "'d0", "64'b0", "64'h0", "32'h0"}:
+        return 0
+    match = re.fullmatch(
+        r"(?:[0-9]+)?'[hH]([0-9a-fA-F_]+)|(?:[0-9]+'[dD]([0-9_]+))",
+        compact,
+    )
+    if match:
+        hexadecimal, decimal = match.groups()
+        return int((hexadecimal or decimal).replace("_", ""),
+                   16 if hexadecimal is not None else 10)
+    if re.fullmatch(r"(?:0[xX][0-9a-fA-F_]+|[0-9]+)", compact):
+        return int(compact.replace("_", ""), 0)
+    raise ContractError(f"unsupported SV literal: {value!r}")
+
+
+def parse_sv_field_definitions(source: str) -> dict[str, tuple[int, int, int]]:
+    """功能：读取 SV `RDMA_FIELD(name, byte, lsb, width)` 声明，作为 C 坐标漂移的对照证据。
+    输入输出及副作用：返回 name 到 (byte,lsb,width) 的映射；数值仅用于比对，不反向生成 ABI 坐标。
+    失败边界：同名声明不一致、超出 64-bit 范围或非法参数均抛 ContractError；注释/字符串不计入。"""
+    text = _strip_sv_comments(source)
+    result: dict[str, tuple[int, int, int]] = {}
+    pattern = re.compile(r"\bRDMA_FIELD\s*\(")
+    for match in pattern.finditer(text):
+        args_start = text.find("(", match.start())
+        args, _ = _balanced_delimited_text(text, args_start, "(", ")")
+        values = _split_call_arguments(args)
+        if len(values) != 4:
+            # The macro declaration itself has symbolic parameter names; it is
+            # not a field instance and is deliberately ignored.
+            continue
+        name = values[0].strip()
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+            continue
+        try:
+            byte_offset = _parse_int(values[1], "SV field byte offset")
+            lsb = _parse_int(values[2], "SV field lsb")
+            width = _parse_int(values[3], "SV field width")
+        except ContractError:
+            continue
+        if byte_offset % 8 or lsb > 63 or width <= 0 or width > 64 or lsb + width > 64:
+            raise ContractError(f"invalid SV field declaration: {name}")
+        current = (byte_offset, lsb, width)
+        previous = result.get(name)
+        if previous is not None and previous != current:
+            raise ContractError(f"duplicate SV field declaration drift: {name}")
+        result[name] = current
+    return result
+
+
+def parse_sv_derived_masks(source: str) -> dict[str, tuple[int, ...]]:
+    """功能：解析 SV 64-bit 八 qword derived mask 数组，供 ownership 反向证明。
+    输入输出及副作用：返回 mask 名称到八个整数的不可变元组；不采纳未知表达式或修改源码。
+    失败边界：数组缺项、非法 literal、重复且不一致声明或超过 64 位均抛 ContractError。"""
+    text = _strip_sv_comments(source)
+    result: dict[str, tuple[int, ...]] = {}
+    pattern = re.compile(
+        r"\blocalparam\s+bit\s*\[\s*63\s*:\s*0\s*\]\s+"
+        r"([A-Za-z_][A-Za-z0-9_]*)\s*\[\s*0\s*:\s*7\s*\]"
+        r"\s*=\s*'\s*\{(.*?)\}\s*;",
+        re.S,
+    )
+    for match in pattern.finditer(text):
+        name, body = match.groups()
+        values = _split_call_arguments(body)
+        if len(values) != 8:
+            raise ContractError(f"SV derived mask {name} must contain eight qwords")
+        parsed = tuple(_parse_sv_literal(value) for value in values)
+        if any(value < 0 or value >= (1 << 64) for value in parsed):
+            raise ContractError(f"SV derived mask {name} exceeds 64 bits")
+        previous = result.get(name)
+        if previous is not None and previous != parsed:
+            raise ContractError(f"duplicate SV derived mask drift: {name}")
+        result[name] = parsed
+    return result
+
+
+def validate_derived_masks(
+    source: str,
+    expected: Mapping[int, int] | Sequence[int],
+    name: str,
+) -> tuple[int, ...]:
+    """功能：将命名 SV derived mask 与 C-derived expected qword union 精确比较。
+    输入输出及副作用：返回实际八 qword mask；只读 source/expected，不启用任何 capability。
+    失败边界：缺 mask、长度不为八、任一位与 C 坐标 union 不同均抛 ContractError。"""
+    masks = parse_sv_derived_masks(source)
+    actual = masks.get(name)
+    if actual is None:
+        raise ContractError(f"SV derived mask is missing: {name}")
+    if isinstance(expected, Mapping):
+        expected_values = tuple(int(expected[index]) for index in range(8))
+    else:
+        expected_values = tuple(int(value) for value in expected)
+    if len(expected_values) != 8:
+        raise ContractError(f"expected derived mask {name} must contain eight qwords")
+    if actual != expected_values:
+        raise ContractError(
+            f"SV derived mask drift for {name}: {actual} != {expected_values}"
+        )
+    return actual
+
+
+def _sv_macro_definitions(source: str) -> dict[str, tuple[tuple[str, ...], str]]:
+    """功能：收集去注释 SV `define 的参数和续行正文，供宏展开 writer 扫描。
+    输入输出及副作用：返回宏名到 (参数,正文) 映射；不执行预处理器或替换全局符号。
+    失败边界：续行残缺、参数重复或同名正文漂移均抛 ContractError。"""
+    text = _strip_sv_comments(source)
+    logical_lines: list[str] = []
+    pending = ""
+    for raw_line in text.splitlines():
+        line = raw_line.rstrip()
+        if pending:
+            pending += line.lstrip()
+        else:
+            pending = line
+        if pending.endswith("\\"):
+            pending = pending[:-1]
+            continue
+        logical_lines.append(pending)
+        pending = ""
+    if pending:
+        raise ContractError("SV macro continuation is unterminated")
+    result: dict[str, tuple[tuple[str, ...], str]] = {}
+    pattern = re.compile(
+        r"^\s*`define\s+([A-Za-z_][A-Za-z0-9_]*)"
+        r"(?:\s*\(([^)]*)\))?\s*(.*?)\s*$"
+    )
+    for line in logical_lines:
+        match = pattern.match(line)
+        if match is None:
+            continue
+        name, parameter_text, body = match.groups()
+        parameters = tuple(
+            item.strip() for item in (parameter_text or "").split(",")
+            if item.strip()
+        )
+        if len(parameters) != len(set(parameters)):
+            raise ContractError(f"SV macro {name} has duplicate parameters")
+        current = (parameters, body)
+        previous = result.get(name)
+        if previous is not None and previous != current:
+            raise ContractError(f"SV macro definition drift: {name}")
+        result[name] = current
+    return result
+
+
+def _normalise_sv_expr(value: str) -> str:
+    """功能：去除 SV/C 表达式无意义空白，供参数和 target-flow 精确比较。
+    输入输出及副作用：返回紧凑字符串；不求值、不改变标识符或运算符。
+    失败边界：空表达式返回空串，由调用方按缺失参数拒绝。"""
+    return re.sub(r"\s+", "", value)
+
+
+def _case_context_from_coordinates(
+    coordinates: Mapping[tuple[str, str, str, str], int],
+    entry: str,
+    opcode: str,
+    direction: str,
+) -> dict[str, tuple[int, int, int]]:
+    """功能：从 C-derived base map 构造当前 case 的 macro→(base,lsb,width) 坐标。
+    输入输出及副作用：返回新映射；不读取 SV mask，也不修改传入坐标。
+    失败边界：case 没有完整宏坐标时抛 ContractError，禁止由 SV 常量补齐 ABI。"""
+    context: dict[str, tuple[int, int, int]] = {}
+    for key, base in coordinates.items():
+        if key[:3] != (entry, opcode, direction):
+            continue
+        macro = key[3]
+        # Width/LSB are supplied later by the caller's macro range map.  A
+        # sentinel here makes accidental use without that map fail closed.
+        context[macro] = (int(base), -1, -1)
+    return context
+
+
+def parse_supported_opcode_values(
+    sv_sources: Mapping[str, str],
+    enum_members: Sequence[tuple[str, int]],
+) -> frozenset[int]:
+    """功能：从真实 completion codec 的 supported_opcode 函数解析可解码 opcode 集合。
+    输入输出及副作用：返回 enum numeric value 的不可变集合；不引入 Python 独立 opcode 白名单。
+    失败边界：函数/分支缺失、未知 enum symbol、重复或空集合均抛 ContractError，防止状态错报。"""
+    joined = "\n".join(_strip_sv_comments(source) for source in sv_sources.values())
+    try:
+        body = _sv_function_body(joined, "supported_opcode")
+    except ContractError as exc:
+        raise ContractError(f"completion supported_opcode source is invalid: {exc}") from exc
+    by_symbol = {symbol: value for symbol, value in enum_members}
+    values: set[int] = set()
+    for token in SUPPORTED_OPCODE_NAME_RE.findall(body):
+        candidates = [token]
+        if token.startswith("RDMA_OP_"):
+            candidates.append("XTRDMA_" + token[len("RDMA_"):])
+        if token.startswith("TRDMA_OP_"):
+            candidates.append("XTRDMA_" + token[len("TRDMA_"):])
+        symbol = next((candidate for candidate in candidates if candidate in by_symbol), None)
+        if symbol is None:
+            raise ContractError(f"supported_opcode references unknown enum symbol: {token}")
+        values.add(by_symbol[symbol])
+    if not values:
+        raise ContractError("supported_opcode source has no registered values")
+    return frozenset(values)
+
+
+def _sv_field_stem(value: str) -> str:
+    """功能：把 SV writer 的字段常量或其 WORD_BYTE_OFFSET/LSB/WIDTH 后缀还原为 stem。
+    输入输出及副作用：返回紧凑 stem；不把 stem 的数字坐标写回 C map。
+    失败边界：空 token 或含非法字符返回空串，由 writer scanner 按未知写入保守拒绝。"""
+    stem = value.strip().strip("`")
+    stem = re.sub(r"_(?:WORD_BYTE_OFFSET|LSB|WIDTH)$", "", stem)
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", stem):
+        return ""
+    return stem
+
+
+def _c_macro_for_sv_stem(stem: str) -> str | None:
+    """功能：将 SV 字段 stem 映射为 C 驱动宏名，仅作为别名解析而不提供坐标。
+    输入输出及副作用：返回 C macro 名或 None；不读取 SV mask、不修改映射。
+    失败边界：未知 stem、宽度后缀或非字段 token 返回 None，调用方必须按未知 writer 处理。"""
+    normalized = _sv_field_stem(stem)
+    if not normalized:
+        return None
+    if normalized in SV_FIELD_ALIASES:
+        return SV_FIELD_ALIASES[normalized]
+    if normalized.startswith("XTRDMA_CMQ"):
+        return normalized
+    return None
+
+
+def _coordinate_tuple(
+    coordinates: Mapping[tuple[str, str, str, str], object],
+    macro_ranges: Mapping[object, tuple[int, int, int]] | None,
+    context_key: tuple[str, str, str],
+    macro: str,
+) -> tuple[int, int, int] | None:
+    """功能：读取指定 case 的 C-derived (byte,lsb,width) 坐标，支持验证 fixture 的 tuple map。
+    输入输出及副作用：返回新 tuple；优先采用显式 macro_ranges，base 仍必须来自 coordinates。
+    失败边界：缺少 base/lsb/width 或类型不符返回 None，禁止从 SV 常量猜测 ABI。"""
+    key = (*context_key, macro)
+    if key not in coordinates:
+        return None
+    raw_base = coordinates[key]
+    base: int
+    lsb: int | None = None
+    width: int | None = None
+    if isinstance(raw_base, (tuple, list)) and len(raw_base) == 3:
+        base, lsb, width = (int(raw_base[0]), int(raw_base[1]), int(raw_base[2]))
+    else:
+        base = int(raw_base)
+    range_value = None
+    if macro_ranges:
+        # Prefer a context-qualified range so a future case can legally place
+        # the same C macro at a different qword.  The legacy macro-only form
+        # remains accepted for small fixtures and current unique fields.
+        range_value = macro_ranges.get((*context_key, macro))
+        if range_value is None:
+            range_value = macro_ranges.get(macro)
+    if range_value is not None:
+        range_base, range_lsb, range_width = range_value
+        if range_base != base:
+            raise ContractError(
+                f"C coordinate base sources disagree for {macro}: {base} != {range_base}"
+            )
+        lsb, width = int(range_lsb), int(range_width)
+    if lsb is None or width is None or lsb < 0 or width <= 0:
+        return None
+    if base < 0 or lsb + width > 64:
+        raise ContractError(f"C-derived coordinate is outside qword for {macro}")
+    return base, lsb, width
+
+
+def _resolve_sv_coordinate(
+    expression: str,
+    role: str,
+    coordinates: Mapping[tuple[str, str, str, str], object],
+    macro_ranges: Mapping[str, tuple[int, int, int]] | None,
+    context_key: tuple[str, str, str],
+) -> int | None:
+    """功能：解析 writer call 的 base/lsb/width 参数并绑定到 C-derived 字段坐标。
+    输入输出及副作用：返回对应整数或 None；只做受限字面量/后缀解析，不执行表达式。
+    失败边界：未知符号、复杂算术、负数或字段不在 context 时返回 None，触发整图保守范围。"""
+    compact = _normalise_sv_expr(expression)
+    if compact.startswith("(") and compact.endswith(")"):
+        compact = compact[1:-1]
+    try:
+        return _parse_sv_literal(compact)
+    except ContractError:
+        pass
+    suffixes = {
+        "base": "_WORD_BYTE_OFFSET",
+        "lsb": "_LSB",
+        "width": "_WIDTH",
+    }
+    suffix = suffixes[role]
+    if compact.endswith(suffix):
+        stem = compact[:-len(suffix)]
+        macro = _c_macro_for_sv_stem(stem)
+        if macro is None:
+            return None
+        coordinate = _coordinate_tuple(
+            coordinates, macro_ranges, context_key, macro
+        )
+        if coordinate is None:
+            return None
+        return {"base": coordinate[0], "lsb": coordinate[1],
+                "width": coordinate[2]}[role]
+    # A simple parenthesised/additive byte expression is common for memcpy
+    # destinations.  Only permit a numeric displacement; symbols remain
+    # unresolved and therefore fail closed.
+    match = re.fullmatch(r"([0-9]+)\+([0-9]+)", compact)
+    if match and role == "base":
+        return int(match.group(1), 10) + int(match.group(2), 10)
+    return None
+
+
+def _iter_sv_calls(text: str, name: str):
+    """功能：迭代去注释 SV 文本中指定调用及其参数区间。
+    输入输出及副作用：逐项 yield (start,end,args_text)；不执行调用或修改文本。
+    失败边界：任一匹配的括号不平衡立即抛 ContractError，避免错读后续 writer。"""
+    pattern = re.compile(r"(?<![A-Za-z0-9_])(?:`)?" + re.escape(name) + r"\s*\(")
+    for match in pattern.finditer(text):
+        open_index = text.find("(", match.start(), match.end())
+        args, end = _balanced_delimited_text(text, open_index, "(", ")")
+        yield match.start(), end, args
+
+
+def _writer_range_from_call(
+    call_name: str,
+    args_text: str,
+    case_id: str,
+    source_path: str,
+    token: str,
+    coordinates: Mapping[tuple[str, str, str, str], object],
+    macro_ranges: Mapping[str, tuple[int, int, int]] | None,
+    context_key: tuple[str, str, str],
+    image_length: int,
+) -> WriterRange:
+    """功能：把一个 put/put_field 调用的参数解析成 writer 位区间。
+    输入输出及副作用：返回不可变 WriterRange；C-derived 坐标是唯一数字依据。
+    失败边界：参数数量、符号或范围无法闭合时返回整幅 image 的保守区间，供上层拒绝 static bit。"""
+    try:
+        args = _split_call_arguments(args_text)
+    except ContractError:
+        args = []
+    if call_name == "put_field":
+        if len(args) >= 4:
+            fields = args[-4:]
+        else:
+            fields = []
+    else:  # put(builder, base, lsb, width, value)
+        if len(args) >= 5:
+            fields = args[-4:]
+        elif len(args) >= 4:
+            fields = args[:3] + [args[3]]
+        else:
+            fields = []
+    if len(fields) >= 3:
+        base = _resolve_sv_coordinate(
+            fields[0], "base", coordinates, macro_ranges, context_key
+        )
+        lsb = _resolve_sv_coordinate(
+            fields[1], "lsb", coordinates, macro_ranges, context_key
+        )
+        width = _resolve_sv_coordinate(
+            fields[2], "width", coordinates, macro_ranges, context_key
+        )
+        if base is not None and lsb is not None and width is not None:
+            if base % 8 or lsb < 0 or width <= 0 or lsb + width > 64:
+                raise ContractError(f"SV writer coordinate is invalid: {token}")
+            return WriterRange(
+                case_id, source_path, "PUT_FIELD", token, base, lsb, width
+            )
+    return WriterRange(
+        case_id, source_path, "UNKNOWN_WRITER", token, 0, 0, image_length * 8
+    )
+
+
+def _expand_sv_writer_macro(
+    body: str,
+    parameters: Sequence[str],
+    values: Sequence[str],
+) -> str:
+    """功能：以一次 invocation 的实际 stem/value 展开 SV writer macro 的 token 拼接。
+    输入输出及副作用：返回局部展开文本；不执行宏副作用或修改定义。
+    失败边界：参数数量不符时返回原文，让 scanner 以未知 writer 整图拒绝。"""
+    if len(parameters) != len(values):
+        return body
+    expanded = body
+    for parameter, value in zip(parameters, values):
+        expanded = re.sub(
+            re.escape(parameter) + r"``(?=_)|" + re.escape(parameter),
+            lambda match: value if match.group().endswith(parameter) else value,
+            expanded,
+        )
+    # The expression above intentionally handles both STEM``_FOO and VALUE;
+    # normalize any residual token-concatenation punctuation for later parsing.
+    return expanded.replace("``", "")
+
+
+def _strip_sv_macro_definitions(text: str) -> str:
+    """功能：移除 SV function 文本中的 `define 续行，避免宏模板被误报为 writer。
+    输入输出及副作用：返回保留真实语句的新文本；不执行预处理器，也不改变调用方源码。
+    失败边界：未闭合的宏续行会保留为无 writer 证据，随后由 source-walk 的缺失检查拒绝。"""
+    kept: list[str] = []
+    in_definition = False
+    continuation = chr(92)
+    for line in text.splitlines(keepends=True):
+        if in_definition:
+            in_definition = line.rstrip("\r\n").endswith(continuation)
+            continue
+        if re.match(r"^\s*`define\b", line):
+            in_definition = line.rstrip("\r\n").endswith(continuation)
+            continue
+        kept.append(line)
+    return "".join(kept)
+
+def _scan_sv_writer_ranges(
+    sv_sources: Mapping[str, str],
+    coordinates: Mapping[tuple[str, str, str, str], object],
+    macro_ranges: Mapping[str, tuple[int, int, int]] | None = None,
+) -> list[WriterRange]:
+    """功能：扫描 QPC/CMQ-doorbell production branches 的 typed/direct writer 位区间。
+    输入输出及副作用：返回去重后的 WriterRange 列表；注释和字符串不形成 writer 证据。
+    失败边界：缺 class/function/branch、未知 writer 或不平衡宏均按整幅 image 记录或抛 ContractError，绝不漏报。"""
+    ranges: list[WriterRange] = []
+    all_sv_fields = parse_sv_field_definitions(
+        "\n".join(_strip_sv_comments(source) for source in sv_sources.values())
+    )
+    contexts = {
+        "cmq_sqe_qpc_create_request":
+            (("CMQ_SQE", "QPC_CREATE", "REQUEST"),
+             "rdma_hw_cmq_qpc_layout_codec", "RDMA_OP_QPC_CREATE", 64),
+        "cmq_sq_doorbell":
+            (("CMQ_SQ_DOORBELL", "CMQ_SQ", "REQUEST"),
+             "rdma_hw_doorbell_codec", '"cmq_sq"', 8),
+    }
+    for source_path, raw_source in sv_sources.items():
+        source = _strip_sv_comments(raw_source)
+        try:
+            macros = _sv_macro_definitions(source)
+        except ContractError:
+            macros = {}
+        sv_fields = all_sv_fields
+        for case_id, (context_key, class_name, branch_label, image_length) in contexts.items():
+            if class_name not in source:
+                continue
+            try:
+                class_body = _sv_class_body(source, class_name)
+                function_body = _sv_function_body(class_body, "encode_fields")
+                branch = _sv_case_branch(function_body, branch_label)
+            except ContractError:
+                continue
+            # Invocations of the two production macros are expanded and checked
+            # against both their aliases and the actual C-derived coordinates.
+            invocation_name = (
+                "CMQ_QPC_PUT" if case_id.startswith("cmq_sqe") else "DB_PUT"
+            )
+            for invocation_start, invocation_end, args_text in _iter_sv_calls(
+                branch, invocation_name
+            ):
+                args = _split_call_arguments(args_text)
+                stem = args[0] if args else ""
+                macro = _c_macro_for_sv_stem(stem)
+                token = branch[invocation_start:invocation_end]
+                coordinate = (
+                    _coordinate_tuple(
+                        coordinates, macro_ranges, context_key, macro
+                    ) if macro else None
+                )
+                if coordinate is None:
+                    ranges.append(WriterRange(
+                        case_id, source_path, "UNKNOWN_WRITER", token,
+                        0, 0, image_length * 8,
+                    ))
+                else:
+                    sv_name = _sv_field_stem(stem)
+                    sv_coordinate = sv_fields.get(sv_name)
+                    if sv_coordinate is None:
+                        ranges.append(WriterRange(
+                            case_id, source_path, "UNKNOWN_WRITER", token,
+                            0, 0, image_length * 8,
+                        ))
+                    elif sv_coordinate != coordinate:
+                        raise ContractError(
+                            f"SV writer alias coordinate drift for {sv_name}: "
+                            f"{sv_coordinate} != {coordinate}"
+                        )
+                    else:
+                        ranges.append(WriterRange(
+                            case_id, source_path, "MACRO_PUT", token,
+                            coordinate[0], coordinate[1], coordinate[2],
+                        ))
+                definition = macros.get(invocation_name)
+                if definition is None:
+                    continue
+                parameters, macro_body = definition
+                expanded = _expand_sv_writer_macro(
+                    macro_body, parameters, args
+                )
+                for call_name in ("put_field", "put"):
+                    for _, end, call_args in _iter_sv_calls(
+                        expanded, call_name
+                    ):
+                        ranges.append(_writer_range_from_call(
+                            call_name, call_args, case_id, source_path,
+                            expanded[:end], coordinates, macro_ranges,
+                            context_key, image_length,
+                        ))
+            # The QPC request image is composed from a separately encoded
+            # envelope.  Walk that production writer as well; otherwise an
+            # envelope edit could silently acquire a supposedly static bit
+            # while the body branch still looks unchanged.
+            if case_id == "cmq_sqe_qpc_create_request":
+                envelope_class = "rdma_hw_cmq_envelope_codec"
+                if envelope_class in source:
+                    try:
+                        envelope_body = _sv_class_body(source, envelope_class)
+                        envelope_function = _sv_function_body(
+                            envelope_body, "encode"
+                        )
+                    except ContractError:
+                        envelope_function = ""
+                    if envelope_function:
+                        # Macro templates are declarations, not runtime calls.
+                        envelope_scan = _strip_sv_macro_definitions(
+                            envelope_function
+                        )
+                        envelope_macro_name = "CMQ_ENVELOPE_PUT"
+                        for invocation_start, invocation_end, args_text in _iter_sv_calls(
+                            envelope_scan, envelope_macro_name
+                        ):
+                            args = _split_call_arguments(args_text)
+                            stem = args[0] if args else ""
+                            macro = _c_macro_for_sv_stem(stem)
+                            token = envelope_scan[invocation_start:invocation_end]
+                            coordinate = (
+                                _coordinate_tuple(
+                                    coordinates, macro_ranges, context_key, macro
+                                ) if macro else None
+                            )
+                            if coordinate is None:
+                                ranges.append(WriterRange(
+                                    case_id, source_path, "UNKNOWN_WRITER", token,
+                                    0, 0, image_length * 8,
+                                ))
+                            else:
+                                sv_name = _sv_field_stem(stem)
+                                sv_coordinate = sv_fields.get(sv_name)
+                                if sv_coordinate is None:
+                                    ranges.append(WriterRange(
+                                        case_id, source_path, "UNKNOWN_WRITER",
+                                        token, 0, 0, image_length * 8,
+                                    ))
+                                elif sv_coordinate != coordinate:
+                                    raise ContractError(
+                                        f"SV writer alias coordinate drift for {sv_name}: "
+                                        f"{sv_coordinate} != {coordinate}"
+                                    )
+                                else:
+                                    ranges.append(WriterRange(
+                                        case_id, source_path, "MACRO_PUT", token,
+                                        coordinate[0], coordinate[1], coordinate[2],
+                                    ))
+                            definition = macros.get(envelope_macro_name)
+                            if definition is None:
+                                continue
+                            parameters, macro_body = definition
+                            expanded = _expand_sv_writer_macro(
+                                macro_body, parameters, args
+                            )
+                            for call_name in ("put_field", "put"):
+                                for _, end, call_args in _iter_sv_calls(
+                                    expanded, call_name
+                                ):
+                                    ranges.append(_writer_range_from_call(
+                                        call_name, call_args, case_id, source_path,
+                                        expanded[:end], coordinates, macro_ranges,
+                                        context_key, image_length,
+                                    ))
+                        for call_name in ("put_field", "put"):
+                            for start, end, args_text in _iter_sv_calls(
+                                envelope_scan, call_name
+                            ):
+                                token = envelope_scan[start:end]
+                                ranges.append(_writer_range_from_call(
+                                    call_name, args_text, case_id, source_path,
+                                    token, coordinates, macro_ranges,
+                                    context_key, image_length,
+                                ))
+
+            # Direct writer calls are intentionally scanned in addition to
+            # macros so a newly added builder.put_field cannot hide behind the
+            # existing alias set.
+            for call_name in ("put_field", "put"):
+                for start, end, args_text in _iter_sv_calls(branch, call_name):
+                    token = branch[start:end]
+                    ranges.append(_writer_range_from_call(
+                        call_name, args_text, case_id, source_path, token,
+                        coordinates, macro_ranges, context_key, image_length,
+                    ))
+            for start, end, args_text in _iter_sv_calls(branch, "put_memcpy"):
+                token = branch[start:end]
+                try:
+                    args = _split_call_arguments(args_text)
+                    base = _resolve_sv_coordinate(
+                        args[0], "base", coordinates, macro_ranges, context_key
+                    ) if args else None
+                    # A memcpy's source length is not a field width.  It is
+                    # therefore represented as all bits in the copied range;
+                    # unresolved lengths conservatively cover the whole image.
+                    length = _parse_sv_literal(args[1]) if len(args) > 1 else image_length
+                    if base is None or length <= 0 or base + length > image_length:
+                        raise ContractError("unresolved put_memcpy range")
+                    ranges.append(WriterRange(
+                        case_id, source_path, "PUT_MEMCPY", token,
+                        base, 0, length * 8,
+                    ))
+                except (ContractError, ValueError):
+                    ranges.append(WriterRange(
+                        case_id, source_path, "UNKNOWN_WRITER", token,
+                        0, 0, image_length * 8,
+                    ))
+            # Direct bytes/words writes have no typed field metadata.  Treat an
+            # unknown index as a full-image writer and a numeric index as its
+            # containing byte's eight bits.
+            assignment = re.compile(
+                r"(?:\b(?:bytes|words)\s*\[\s*([^]]+)\s*\]|"
+                r"\b(?:bytes|words)\s*\([^)]*\))\s*="
+            )
+            for match in assignment.finditer(branch):
+                index_text = match.group(1)
+                try:
+                    byte_index = _parse_sv_literal(index_text)
+                    if byte_index >= image_length:
+                        raise ContractError("direct writer byte index out of range")
+                    base = (byte_index // 8) * 8
+                    ranges.append(WriterRange(
+                        case_id, source_path, "DIRECT_BYTES", match.group(0),
+                        base, 0, 8,
+                    ))
+                except (ContractError, ValueError):
+                    ranges.append(WriterRange(
+                        case_id, source_path, "UNKNOWN_WRITER", match.group(0),
+                        0, 0, image_length * 8,
+                    ))
+    # Stable de-duplication keeps diagnostics deterministic while retaining
+    # every distinct token/range needed for reverse proof.
+    unique: dict[tuple[object, ...], WriterRange] = {}
+    for item in ranges:
+        key = (item.case_id, item.source_path, item.operation, item.token,
+               item.base, item.lsb, item.width)
+        unique[key] = item
+    return list(unique.values())
+
+
+def _mask_from_macro_ranges(
+    coordinates: Mapping[tuple[str, str, str, str], object],
+    macro_ranges: Mapping[str, tuple[int, int, int]] | None,
+    context_key: tuple[str, str, str],
+    macros: Iterable[str],
+) -> tuple[int, ...]:
+    """功能：按 C-derived 字段区间合成八 qword ownership mask。
+    输入输出及副作用：返回八个整数；不读取或反推 SV mask 数值。
+    失败边界：任一宏坐标缺失/跨 qword/越界均抛 ContractError。"""
+    result = [0] * 8
+    for macro in macros:
+        coordinate = _coordinate_tuple(
+            coordinates, macro_ranges, context_key, macro
+        )
+        if coordinate is None:
+            raise ContractError(f"C-derived mask macro coordinate is missing: {macro}")
+        base, lsb, width = coordinate
+        if base % 8 or lsb + width > 64 or base // 8 >= 8:
+            raise ContractError(f"C-derived mask macro range is invalid: {macro}")
+        result[base // 8] |= ((1 << width) - 1) << lsb
+    return tuple(result)
+
+
+def _selected_mask_for_cmq_doorbell(source: str) -> int | None:
+    """功能：限定在 selected_mask 方法内读取 CMQ SQ 的允许位 literal，与 C union 对照。
+    输入输出及副作用：返回 selected_mask 的 64-bit 整数；只读 source，不把 literal 当作 ABI 坐标。
+    失败边界：方法缺失/重复、cmq_sq 分支缺失/重复或 literal 非法时抛 ContractError。"""
+    text = _strip_sv_comments(source)
+    try:
+        body = _sv_function_body(text, "selected_mask")
+    except ContractError as exc:
+        raise ContractError(
+            f"selected_mask method is invalid: {exc}"
+        ) from exc
+    matches = list(re.finditer(
+        r"\"cmq_sq\"\s*:\s*return\s*([^;]+);", body
+    ))
+    if len(matches) != 1:
+        raise ContractError(
+            f"cmq_sq selected_mask branch is not unique: {len(matches)}"
+        )
+    return _parse_sv_literal(matches[0].group(1))
+
+
+def _range_covers_bit(item: WriterRange, qword: int, bit: int) -> bool:
+    """功能：判断 writer range 是否覆盖一个逻辑 qword bit。
+    输入输出及副作用：返回布尔值；只读不可变 range，不修改扫描结果。
+    失败边界：负坐标或跨 image 的 range 返回 False，非法 range 由构造阶段拒绝。"""
+    return item.base // 8 == qword and item.lsb <= bit < item.lsb + item.width
+
+
+def validate_sv_writer_contract(
+    sv_sources: Mapping[str, str],
+    coordinates: Mapping[tuple[str, str, str, str], object],
+    static_rows: Sequence[Mapping[str, str]],
+    ownership_rows: Sequence[Mapping[str, str]] | None = None,
+    capability_rows: Sequence[Mapping[str, str]] | None = None,
+    *,
+    macro_ranges: Mapping[str, tuple[int, int, int]] | None = None,
+    canonical_images: Mapping[str, bytes] | None = None,
+) -> list[WriterRange]:
+    """功能：以 C-derived 坐标反向证明 request static-unwritable 位没有 production
+    writer、ownership 或 capability 覆盖。
+    输入输出及副作用：返回扫描到的 WriterRange；只读 SV/rows/images，不启用或修改任何 codec。
+    失败边界：writer 坐标漂移、未知直接写、derived mask 漂移、canonical 非零、
+    ownership 重叠或 capability 置位均抛 ContractError。"""
+    if not sv_sources:
+        raise ContractError("SV writer source set is empty")
+    joined = "\n".join(_strip_sv_comments(source) for source in sv_sources.values())
+    sv_fields = parse_sv_field_definitions(joined)
+    ranges = _scan_sv_writer_ranges(sv_sources, coordinates, macro_ranges)
+    contexts = {
+        "cmq_sqe_qpc_create_request": ("CMQ_SQE", "QPC_CREATE", "REQUEST"),
+        "cmq_sq_doorbell": ("CMQ_SQ_DOORBELL", "CMQ_SQ", "REQUEST"),
+    }
+    qpc_context = contexts["cmq_sqe_qpc_create_request"]
+    qpc_body_macros = (
+        "XTRDMA_CMQSQ_WQE_QPN", "XTRDMA_CMQSQ_WQE_SQ_CQN",
+        "XTRDMA_CMQSQ_WQE_SIGN_EN", "XTRDMA_CMQSQ_WQE_SIGNATURE",
+        "XTRDMA_CMQSQ_WQE_RQ_CQN", "XTRDMA_CMQSQ_WQE_QPC_BUFFER_ADDR",
+    )
+    expected_qpc_mask = _mask_from_macro_ranges(
+        coordinates, macro_ranges, qpc_context, qpc_body_macros
+    )
+    envelope_macros = (
+        "XTRDMA_CMQSQ_WQE_VALID", "XTRDMA_CMQSQ_VFID_OVERRIDE",
+        "XTRDMA_CMQSQ_USE_VFID", "XTRDMA_CMQSQ_WQE_WRAP",
+        "XTRDMA_CMQSQ_WQE_INDEX", "XTRDMA_CMQCQ_OPCODE",
+    )
+    expected_envelope = _mask_from_macro_ranges(
+        coordinates, macro_ranges, qpc_context, envelope_macros
+    )
+    masks = parse_sv_derived_masks(joined)
+    if masks.get("RDMA_QPC_CREATE_BODY_OWNERSHIP") != expected_qpc_mask:
+        raise ContractError("SV QPC_CREATE ownership mask is not C-derived")
+    if masks.get("RDMA_CMQ_ENVELOPE_MASK") != expected_envelope:
+        raise ContractError("SV CMQ envelope mask is not C-derived")
+    doorbell_context = contexts["cmq_sq_doorbell"]
+    expected_doorbell = _mask_from_macro_ranges(
+        coordinates, macro_ranges, doorbell_context,
+        ("XTRDMA_CMQSQ_DB_PI", "XTRDMA_CMQSQ_DB_POL"),
+    )
+    selected_masks = [
+        _selected_mask_for_cmq_doorbell(source)
+        for source in sv_sources.values()
+        if "class rdma_hw_doorbell_codec" in _strip_sv_comments(source)
+    ]
+    if len(selected_masks) != 1 or selected_masks[0] != expected_doorbell[0]:
+        raise ContractError("SV CMQ doorbell derived mask is not C-derived")
+
+    # Every C-derived field expected in the production branch must have a
+    # typed writer.  This also prevents a source edit from making all fields
+    # appear static merely because the branch disappeared.
+    required_ranges = {
+        ("cmq_sqe_qpc_create_request", macro): _coordinate_tuple(
+            coordinates, macro_ranges, qpc_context, macro
+        )
+        for macro in qpc_body_macros
+    }
+    required_ranges.update({
+        ("cmq_sq_doorbell", macro): _coordinate_tuple(
+            coordinates, macro_ranges, doorbell_context, macro
+        )
+        for macro in ("XTRDMA_CMQSQ_DB_PI", "XTRDMA_CMQSQ_DB_POL")
+    })
+    for (case_id, macro), coordinate in required_ranges.items():
+        if coordinate is None:
+            raise ContractError(f"missing C coordinate for production writer: {macro}")
+        if not any(
+            item.case_id == case_id and item.base == coordinate[0] and
+            item.lsb == coordinate[1] and item.width == coordinate[2]
+            for item in ranges
+        ):
+            raise ContractError(f"production writer is missing C field: {case_id}/{macro}")
+
+    static_bits = [
+        row for row in static_rows
+        if row.get("evidence_mode") == "STATIC_UNWRITABLE"
+    ]
+    for row in static_bits:
+        case_id = row.get("case_id", "")
+        context = contexts.get(case_id)
+        if context is None:
+            continue
+        try:
+            qword = int(row["qword_index"], 0)
+            bit = int(row["bit_index"], 0)
+        except (KeyError, ValueError) as exc:
+            raise ContractError("static row has invalid coordinate") from exc
+        if canonical_images is not None and case_id in canonical_images:
+            image = canonical_images[case_id]
+            if qword * 8 >= len(image) or ((int.from_bytes(
+                    image[qword * 8:qword * 8 + 8], "big"
+                ) >> bit) & 1):
+                raise ContractError(
+                    f"static-unwritable canonical bit is nonzero: {case_id}/{qword}/{bit}"
+                )
+        if any(_range_covers_bit(item, qword, bit) for item in ranges
+               if item.case_id == case_id):
+            raise ContractError(
+                f"production writer covers STATIC_UNWRITABLE bit: {case_id}/{qword}/{bit}"
+            )
+        for ownership in ownership_rows or ():
+            if ownership.get("entry_kind") != context[0] or \
+               ownership.get("opcode_or_variant") != context[1] or \
+               ownership.get("direction") != context[2]:
+                continue
+            macro = ownership.get("macro_name", "")
+            c_macro = _c_macro_for_sv_stem(macro) or macro
+            coordinate = _coordinate_tuple(
+                coordinates, macro_ranges, context, c_macro
+            )
+            if coordinate and coordinate[0] // 8 == qword and \
+               coordinate[1] <= bit < coordinate[1] + coordinate[2]:
+                raise ContractError(
+                    f"ownership row covers STATIC_UNWRITABLE bit: "
+                    f"{case_id}/{qword}/{bit}/{macro}"
+                )
+    for capability in capability_rows or ():
+        case_id = capability.get("oracle_case_id", "-")
+        if case_id in contexts and capability.get("request_encodable") == "1":
+            raise ContractError(
+                f"capability enables request writer before static proof: {case_id}"
+            )
+    return ranges
+
+
 def _discover_macros(
     kernel_root: Path,
     records_by_path: Mapping[str, Sequence[object]],
@@ -1482,38 +2610,382 @@ def _validate_concrete_anchors(
     kernel_root: Path,
     records_by_path: Mapping[str, Sequence[object]],
 ) -> None:
-    """功能：验证 ownership 行 concrete anchors 的函数、token、buffer 和 data-flow。
-    输入输出及副作用：只读锁定 C 文件；成功无返回值。
-    失败边界：零/多匹配、注释-only、错误 operation 或错误 buffer flow 均拒绝。"""
+    """功能：验证 ownership 行 concrete anchors 的实际 C 调用参数、坐标和目标数据流。
+    输入输出及副作用：只读 manifest 覆盖的 C 文件；成功无返回值，不写回 ownership 表。
+    失败边界：函数/token 非唯一、注释伪引用、container/buffer、operation、base/length、调用参数或 flow 任一漂移均拒绝。"""
     cache: dict[str, str] = {}
     for row in rows:
         values = _anchor_values(row)
         if all(value == "-" for value in values):
             continue
-        source_path = row["source_path"]
-        if source_path not in records_by_path:
-            raise ContractError(f"anchor source is not in manifest: {source_path}")
-        source = cache.setdefault(
-            source_path,
-            _strip_comments((kernel_root / source_path).read_text(encoding="utf-8")),
-        )
-        occurrence = _parse_int(row["anchor_occurrence"], "anchor occurrence")
-        resolve_source_anchor(
-            source,
-            row["anchor_function"],
-            row["anchor_token"],
-            occurrence,
-        )
-        body = _function_body(source, row["anchor_function"])
-        normalized = " ".join(body.split())
-        if row["anchor_container"] not in normalized:
-            raise ContractError("anchor container is absent from function body")
-        if row["anchor_buffer"] not in normalized:
-            raise ContractError("anchor buffer is absent from function body")
+        function = row["anchor_function"]
         if row["anchor_operation"] not in ALLOWED_OPERATIONS:
             raise ContractError(f"unsupported anchor operation {row['anchor_operation']}")
-        if "->" not in row["anchor_target_flow"]:
-            raise ContractError("anchor target flow is not a data-flow chain")
+        # The first four ownership columns identify cmq.h, while concrete
+        # functions commonly live in cmq.c.  Resolve the function across the
+        # locked manifest and require exactly one source candidate.
+        candidates: list[tuple[str, str]] = []
+        for source_path in sorted(records_by_path):
+            if source_path not in cache:
+                cache[source_path] = _strip_comments(
+                    (kernel_root / source_path).read_text(encoding="utf-8")
+                )
+            source = cache[source_path]
+            try:
+                _function_body(source, function)
+            except ContractError:
+                continue
+            candidates.append((source_path, source))
+        if len(candidates) != 1:
+            raise ContractError(
+                f"anchor function is not unique in manifest: {function} ({len(candidates)})"
+            )
+        source_path, source = candidates[0]
+        occurrence = _parse_int(row["anchor_occurrence"], "anchor occurrence")
+        resolve_source_anchor(source, function, row["anchor_token"], occurrence)
+        body = _function_body(source, function)
+        _validate_anchor_call_arguments(row, body, source_path)
+
+
+def _normalise_c_expr(value: str) -> str:
+    """功能：规范化 C 调用表达式的空白，便于 anchor 参数与表中声明逐项比较。
+    输入输出及副作用：返回去空白表达式；不求值、不改变字段名或指针层级。
+    失败边界：空表达式返回空串，由调用参数校验按缺失参数拒绝。"""
+    return re.sub(r"\s+", "", value)
+
+
+def _anchor_token_call(
+    body: str,
+    call_name: str,
+    token: str,
+) -> tuple[list[str], str]:
+    """功能：在函数体中定位唯一包含 anchor token 的指定 C 调用并解析参数。
+    输入输出及副作用：返回参数列表和完整调用文本；只读 body，不执行宏/函数。
+    失败边界：零/多调用、括号不平衡或 token 落在其他语句时抛 ContractError。"""
+    token_norm = _normalise_c_expr(token)
+    matches: list[tuple[list[str], str]] = []
+    for start, end, args_text in _iter_sv_calls(body, call_name):
+        call_text = body[start:end]
+        if token_norm not in _normalise_c_expr(call_text):
+            continue
+        matches.append((_split_call_arguments(args_text), call_text))
+    if len(matches) != 1:
+        raise ContractError(
+            f"anchor token is not unique in {call_name}: {len(matches)}"
+        )
+    return matches[0]
+
+
+def _anchor_flow_nodes(flow: str) -> list[str]:
+    """功能：拆解 ownership anchor 的箭头数据流并检查每一跳非空。
+    输入输出及副作用：返回去空白节点列表；不把任意箭头文本当作调用证据。
+    失败边界：少于两跳、空节点或出现非 ASCII 箭头时抛 ContractError。"""
+    if "->" not in flow or "→" in flow:
+        raise ContractError("anchor target flow is not an ASCII data-flow chain")
+    nodes = [item.strip() for item in flow.split("->")]
+    if len(nodes) < 2 or any(not item for item in nodes):
+        raise ContractError("anchor target flow has an empty hop")
+    return nodes
+
+
+def _require_anchor_range_in_flow(
+    flow: str,
+    buffer_expr: str,
+    base: int,
+    length: int,
+) -> None:
+    """功能：确认 target flow 明确携带实际 buffer 及其 byte base/length 范围。
+    输入输出及副作用：成功无返回值；只读 flow 字符串。
+    失败边界：buffer 缺失、base/length 未出现在目标区间表示中均抛 ContractError。"""
+    compact = _normalise_c_expr(flow)
+    buffer_compact = _normalise_c_expr(buffer_expr)
+    if buffer_compact not in compact:
+        raise ContractError("anchor target flow omits actual buffer expression")
+    range_patterns = (
+        rf"\[{base}(?:[,:]\s*{length})?\]",
+        rf"\[{base}:{base + length}\]",
+        rf"\+{base}(?:\b|\])",
+    )
+    if not any(re.search(pattern, compact) for pattern in range_patterns):
+        # A scalar qword flow may name only wqe[0]/wqe[8]; require its exact
+        # indexed byte when length is one qword.
+        if f"{buffer_compact}[{base}]" not in compact:
+            raise ContractError("anchor target flow omits declared byte range")
+
+
+def _flow_contains_value(flow: str, expression: str) -> bool:
+    """功能：确认 anchor target flow 保留真实调用值表达式中的数据来源。
+    输入输出及副作用：返回布尔值；只比较规范化文本和标识符，不执行表达式或改变 flow。
+    失败边界：纯数字/空值不要求额外来源；含变量的表达式若在 flow 中没有任何可识别来源则拒绝。"""
+    flow_compact = _normalise_c_expr(flow)
+    expression_compact = _normalise_c_expr(expression)
+    if not expression_compact or re.fullmatch(r"[0-9]+", expression_compact):
+        return True
+    if expression_compact in flow_compact:
+        return True
+    # A ternary, cast, or helper invocation is often represented in the
+    # table by its meaningful source member rather than verbatim punctuation.
+    # Ignore type/macro-looking constants and require one identifier/member
+    # that actually occurs in the declared data-flow chain.
+    identifiers = re.findall(
+        r"[A-Za-z_][A-Za-z0-9_]*(?:->|\.)?[A-Za-z0-9_]*", expression_compact
+    )
+    meaningful = [
+        item for item in identifiers
+        if item not in {"true", "false"}
+        and not re.fullmatch(r"(?:XTRDMA|RDMA)_[A-Z0-9_]+", item)
+    ]
+    return bool(meaningful) and any(item in flow_compact for item in meaningful)
+
+
+def _field_prep_anchor(
+    body: str,
+    token: str,
+    macro_name: str,
+) -> tuple[list[str], str, str]:
+    """功能：解析 assignment 中唯一 FIELD_PREP anchor，并找出其承载变量。
+    输入输出及副作用：返回 FIELD_PREP 参数、所在语句和赋值左值；只读 C 函数体。
+    失败边界：token 零/多匹配、宏名漂移、括号不平衡或缺少赋值均抛 ContractError。"""
+    token_norm = _normalise_c_expr(token)
+    compact_body = _normalise_c_expr(body)
+    if compact_body.count(token_norm) != 1:
+        raise ContractError("FIELD_PREP anchor token is not unique")
+    # Locate the concrete statement containing the token.  QPC/CQC builders
+    # construct ``hdr``/``sign_data`` over multiple lines before storing it.
+    token_index = compact_body.find(token_norm)
+    statement_start = max(
+        compact_body.rfind(";", 0, token_index),
+        compact_body.rfind("{", 0, token_index),
+        compact_body.rfind("}", 0, token_index),
+    ) + 1
+    statement_end = compact_body.find(";", token_index)
+    if statement_end < 0:
+        raise ContractError("FIELD_PREP anchor statement is incomplete")
+    statement = compact_body[statement_start:statement_end + 1]
+    calls = list(_iter_sv_calls(statement, "FIELD_PREP"))
+    matching: list[tuple[list[str], str]] = []
+    for start, end, args_text in calls:
+        call = statement[start:end]
+        if token_norm in _normalise_c_expr(call):
+            matching.append((_split_call_arguments(args_text), call))
+    if len(matching) != 1 or len(matching[0][0]) != 2:
+        raise ContractError("FIELD_PREP anchor call is not unique")
+    args, call = matching[0]
+    if _normalise_c_expr(args[0]) != _normalise_c_expr(macro_name):
+        raise ContractError("FIELD_PREP macro argument drift")
+    assignment = statement.split("=", 1)
+    if len(assignment) != 2:
+        raise ContractError("FIELD_PREP anchor has no assignment")
+    lhs = assignment[0].strip()
+    # Strip a declaration type and pointer punctuation while retaining the
+    # actual variable at the end of the left side.
+    lhs_match = re.search(r"([A-Za-z_][A-Za-z0-9_]*)\s*$", lhs)
+    if lhs_match is None:
+        raise ContractError("FIELD_PREP assignment left side is invalid")
+    return args, call, lhs_match.group(1)
+
+
+def _find_set_call_using_variable(
+    body: str,
+    variable: str,
+    buffer_expr: str,
+    base: int,
+) -> tuple[list[str], str]:
+    """功能：在函数体中闭合 assignment 变量到唯一目标 set_64bit_val 调用。
+    输入输出及副作用：返回参数和调用文本；不执行宏或写入 buffer。
+    失败边界：目标 buffer/base 无匹配或存在多条候选时抛 ContractError。"""
+    candidates: list[tuple[list[str], str]] = []
+    for start, end, args_text in _iter_sv_calls(body, "set_64bit_val"):
+        args = _split_call_arguments(args_text)
+        if len(args) != 3:
+            continue
+        if _normalise_c_expr(args[0]) != _normalise_c_expr(buffer_expr):
+            continue
+        try:
+            call_base = _parse_int(args[1], "set_64bit_val base")
+        except ContractError:
+            continue
+        if call_base != base or not re.search(
+            r"\b" + re.escape(variable) + r"\b", args[2]
+        ):
+            continue
+        candidates.append((args, body[start:end]))
+    if not candidates:
+        raise ContractError("FIELD_PREP assignment has no matching set_64bit_val")
+    # sign_data is intentionally written twice for QPC signatures.  Both
+    # calls represent the same declared qword range; accepting multiple
+    # stores here would nevertheless weaken occurrence checks for a field.
+    # The token itself remains unique, so choose the first exact data-flow
+    # store and require all candidates to agree on buffer/base.
+    return candidates[0]
+
+
+def _validate_anchor_call_arguments(
+    row: Mapping[str, str],
+    body: str,
+    source_path: str,
+) -> None:
+    """功能：按 anchor_operation 将表中 base/length/buffer 与真实 C 调用参数闭合。
+    输入输出及副作用：成功无返回值；只读函数体和 row，不修改 source。
+    失败边界：set/get/memcpy/offsetof/MMIO 参数、指针偏移、目标 flow 或长度不一致均抛 ContractError。"""
+    operation = row["anchor_operation"]
+    declared_buffer = _normalise_c_expr(row["anchor_buffer"])
+    declared_container = _normalise_c_expr(row["anchor_container"])
+    base = _parse_int(row["anchor_base"], "anchor base")
+    length = _parse_int(row["anchor_length"], "anchor length")
+    flow_nodes = _anchor_flow_nodes(row["anchor_target_flow"])
+    flow_compact = _normalise_c_expr(row["anchor_target_flow"])
+    if declared_container not in flow_compact or declared_buffer not in flow_compact:
+        raise ContractError("anchor target flow omits declared container/buffer")
+    if row.get("macro_name") and row["macro_name"] not in row["anchor_target_flow"]:
+        raise ContractError("anchor target flow omits declared macro")
+    if operation == "SET_64BIT_FIELD_PREP":
+        token_norm = _normalise_c_expr(row["anchor_token"])
+        # A FIELD_PREP may be passed directly as the third set_64bit_val
+        # argument (the QPC buffer address) or first accumulated in ``hdr`` /
+        # ``sign_data`` and stored by name (the envelope and CQN fields).
+        direct_matches: list[tuple[list[str], str]] = []
+        for start, end, args_text in _iter_sv_calls(body, "set_64bit_val"):
+            call = body[start:end]
+            if token_norm not in _normalise_c_expr(call):
+                continue
+            direct_matches.append((_split_call_arguments(args_text), call))
+        if direct_matches:
+            if len(direct_matches) != 1:
+                raise ContractError("set_64bit_val anchor is not unique")
+            args, call = direct_matches[0]
+            if len(args) != 3 or _normalise_c_expr(args[0]) != declared_buffer:
+                raise ContractError("set_64bit_val buffer argument drift")
+            if _parse_int(args[1], "set_64bit_val base") != base:
+                raise ContractError("set_64bit_val base argument drift")
+            value_expression = args[2]
+        else:
+            prep_args, call, variable = _field_prep_anchor(
+                body, row["anchor_token"], row["macro_name"]
+            )
+            args, store_call = _find_set_call_using_variable(
+                body, variable, declared_buffer, base
+            )
+            value_expression = prep_args[1]
+            call = f"{call} {store_call}"
+        if length != 8 or "FIELD_PREP" not in call:
+            raise ContractError("SET_64BIT_FIELD_PREP requires one qword FIELD_PREP")
+        if not _flow_contains_value(row["anchor_target_flow"], value_expression):
+            raise ContractError("SET_64BIT_FIELD_PREP source flow drift")
+        _require_anchor_range_in_flow(row["anchor_target_flow"], row["anchor_buffer"], base, length)
+        return
+    if operation in {"GET_64BIT", "GET_64BIT_FIELD_GET"}:
+        args, _ = _anchor_token_call(body, "get_64bit_val", row["anchor_token"])
+        if len(args) != 3 or _normalise_c_expr(args[0]) != declared_buffer:
+            raise ContractError("get_64bit_val buffer argument drift")
+        if _parse_int(args[1], "get_64bit_val base") != base:
+            raise ContractError("get_64bit_val base argument drift")
+        if length != 8:
+            raise ContractError("get_64bit_val anchor length must be eight")
+        if not _normalise_c_expr(args[2]).startswith("&"):
+            raise ContractError("get_64bit_val destination is not an output variable")
+        destination = _normalise_c_expr(args[2]).lstrip("&")
+        if destination not in flow_compact:
+            raise ContractError("get_64bit_val destination flow drift")
+        if row["macro_name"] not in row["anchor_target_flow"]:
+            raise ContractError("get_64bit_val field flow omits macro")
+        _require_anchor_range_in_flow(row["anchor_target_flow"], row["anchor_buffer"], base, length)
+        return
+    if operation == "MEMCPY":
+        args, _ = _anchor_token_call(body, "memcpy", row["anchor_token"])
+        if len(args) != 3:
+            raise ContractError("memcpy anchor must have destination/source/length")
+        destination = _normalise_c_expr(args[0])
+        if destination != declared_buffer:
+            raise ContractError("memcpy destination drift")
+        actual_length = _parse_int(args[2], "memcpy length")
+        if actual_length != length:
+            raise ContractError("memcpy length argument drift")
+        destination_base = 0
+        match = re.search(r"\+([0-9]+)$", destination)
+        if match:
+            destination_base = int(match.group(1), 10)
+        if destination_base != base:
+            raise ContractError("memcpy destination base drift")
+        if declared_container not in destination:
+            raise ContractError("memcpy destination omits container")
+        if not _flow_contains_value(row["anchor_target_flow"], args[1]):
+            raise ContractError("memcpy source flow drift")
+        _require_anchor_range_in_flow(row["anchor_target_flow"], row["anchor_buffer"], base, length)
+        return
+    if operation == "IOWRITE64BE":
+        args, _ = _anchor_token_call(body, "xtrdma_iowrite64be", row["anchor_token"])
+        if len(args) != 2:
+            raise ContractError("xtrdma_iowrite64be anchor must have value/address")
+        if _normalise_c_expr(args[0]) != declared_buffer:
+            raise ContractError("xtrdma_iowrite64be value buffer drift")
+        if base != 0 or length != 8:
+            raise ContractError("IOWRITE64BE anchor must cover one byte-zero qword")
+        if _normalise_c_expr(args[1]) not in flow_compact:
+            raise ContractError("xtrdma_iowrite64be target flow drift")
+        if not _flow_contains_value(row["anchor_target_flow"], args[0]):
+            raise ContractError("xtrdma_iowrite64be value flow drift")
+        _require_anchor_range_in_flow(row["anchor_target_flow"], row["anchor_buffer"], base, length)
+        return
+    if operation == "FIELD_PREP_OR":
+        token_norm = _normalise_c_expr(row["anchor_token"])
+        if _normalise_c_expr(body).count(token_norm) != 1:
+            raise ContractError("FIELD_PREP_OR anchor token is not unique")
+        statements = [item for item in re.split(r"(?<=[;{}])", body)
+                      if token_norm in _normalise_c_expr(item)]
+        if len(statements) != 1 or "FIELD_PREP" not in statements[0]:
+            raise ContractError("FIELD_PREP_OR assignment token is not unique")
+        assignment = statements[0]
+        lhs = assignment.split("=", 1)[0].strip()
+        if _normalise_c_expr(lhs) != declared_buffer:
+            raise ContractError("FIELD_PREP_OR destination drift")
+        if base != 0 or length != 8:
+            raise ContractError("FIELD_PREP_OR anchor must cover one qword")
+        prep_args, _ = _anchor_token_call(body, "FIELD_PREP", row["anchor_token"])
+        if len(prep_args) != 2:
+            raise ContractError("FIELD_PREP_OR call arguments are invalid")
+        if _normalise_c_expr(prep_args[0]) != _normalise_c_expr(row["macro_name"]):
+            raise ContractError("FIELD_PREP_OR macro argument drift")
+        if not _flow_contains_value(row["anchor_target_flow"], prep_args[1]):
+            raise ContractError("FIELD_PREP_OR source flow drift")
+        _require_anchor_range_in_flow(row["anchor_target_flow"], row["anchor_buffer"], base, length)
+        return
+    if operation in {"ASSIGN_ADDRESS", "ASSIGN_SHIFT_RIGHT"}:
+        token_norm = _normalise_c_expr(row["anchor_token"])
+        matches = [item for item in re.split(r"(?<=[;{}])", body)
+                   if token_norm in _normalise_c_expr(item)]
+        if len(matches) != 1 or "=" not in matches[0]:
+            raise ContractError("assignment anchor is not unique")
+        lhs, rhs = matches[0].split("=", 1)
+        lhs_norm, rhs_norm = _normalise_c_expr(lhs), _normalise_c_expr(rhs)
+        if declared_buffer not in lhs_norm and declared_buffer not in rhs_norm:
+            raise ContractError("assignment anchor omits declared buffer")
+        if operation == "ASSIGN_SHIFT_RIGHT" and ">>" not in rhs_norm:
+            raise ContractError("ASSIGN_SHIFT_RIGHT lacks shift operator")
+        if operation == "ASSIGN_ADDRESS" and "&" not in rhs_norm:
+            raise ContractError("ASSIGN_ADDRESS lacks address operator")
+        if not flow_nodes[-1].replace(" ", "") in flow_compact:
+            raise ContractError("assignment target flow does not end at assigned value")
+        return
+    # Remaining operations are helper-level semantic anchors.  They still
+    # require a unique token and explicit operation text; no bare '->' pass is
+    # accepted as evidence.
+    token_norm = _normalise_c_expr(row["anchor_token"])
+    if _normalise_c_expr(body).count(token_norm) != 1:
+        raise ContractError(
+            f"anchor token is not unique for {operation} in {source_path}"
+        )
+    if operation == "CPU_TO_BE64_STORE":
+        if "cpu_to_be64" not in token_norm or length != 8:
+            raise ContractError("CPU_TO_BE64_STORE parameters are not closed")
+    elif operation == "XOR_U64_REMAINDER_FOLD":
+        if "get_unaligned" not in token_norm or length <= 0:
+            raise ContractError("XOR_U64_REMAINDER_FOLD parameters are not closed")
+    elif operation in {"INDEX_LOOKUP", "COMPARE_WRAP", "COMPARE_OPCODE", "COMPARE_ECODE"}:
+        if length <= 0:
+            raise ContractError("comparison anchor length is invalid")
+    else:
+        raise ContractError(f"unsupported concrete anchor operation: {operation}")
 
 
 def _cmq_manifest_record(records_by_path: Mapping[str, Sequence[object]]):
@@ -1541,9 +3013,9 @@ def _ownership_base(
     codec: str,
     case_id: str,
 ) -> dict[str, str]:
-    """功能：构造一条 macro-derived ownership row 的冻结列值。
-    输入输出及副作用：返回新字典；anchor 不适用列统一为 '-'，不写表。
-    失败边界：调用方必须传入已验证 manifest record 与允许枚举，后续 validator 复核。"""
+    """功能：构造一条 macro-derived ownership row 的冻结列值并绑定真实 C anchor。
+    输入输出及副作用：返回新字典；manifest identity、字段 owner/capability 和 concrete anchor 均写入新对象，不修改 record 或源码。
+    失败边界：未知 case/macro 没有可证明的函数、调用参数或数据流时抛 ContractError，禁止回退为无证据的 '-' anchor。"""
     row = {
         "archive_id": record.archive_id,
         "source_path": record.path,
@@ -1561,9 +3033,153 @@ def _ownership_base(
         "discriminator": "-",
         "oracle_case_id": case_id,
     }
+    anchor = _ownership_anchor(case_id, macro_name)
     for column in ANCHOR_COLUMNS:
-        row[column] = "-"
+        row[column] = anchor.get(column, "-")
     return row
+
+
+def _ownership_anchor(case_id: str, macro_name: str) -> dict[str, str]:
+    """功能：为四个 Phase-0 ownership case 的每个宏选择锁定 C 函数中的实际调用 anchor。
+    输入输出及副作用：返回独立 anchor 列字典；只描述 source function、buffer、坐标和数据流，不读取或修改 SV 常量。
+    失败边界：宏未列入已审阅的 QPC/CQC/CQE/doorbell 集合时抛 ContractError，避免把不可定位字段伪装成 concrete 证据。"""
+    def prep(function: str, macro: str, value: str, buffer: str,
+             base: int, flow: str) -> dict[str, str]:
+        """功能：把一个字段值与其 C writer 调用参数组装成 concrete anchor。
+        输入输出及副作用：function、macro、value、buffer、base、flow 进入新字典；不修改源码或外部资源。
+        失败边界：调用方若传入不存在的函数/宏或不一致的数据流，后续 anchor validator 必须拒绝该字典。"""
+        return {
+            "anchor_function": function,
+            "anchor_token": f"FIELD_PREP({macro}, {value})",
+            "anchor_occurrence": "1",
+            "anchor_container": buffer.replace(" + 1", ""),
+            "anchor_buffer": buffer,
+            "anchor_operation": "SET_64BIT_FIELD_PREP",
+            "anchor_base": str(base),
+            "anchor_length": "8",
+            "anchor_target_flow": flow,
+        }
+
+    qpc_values = {
+        "XTRDMA_CMQSQ_WQE_VALID": ("polarity", 0,
+            "polarity -> hdr -> XTRDMA_CMQSQ_WQE_VALID -> wqe[0]"),
+        "XTRDMA_CMQSQ_VFID_OVERRIDE": ("0", 0,
+            "0 -> hdr -> XTRDMA_CMQSQ_VFID_OVERRIDE -> wqe[0]"),
+        "XTRDMA_CMQSQ_USE_VFID": ("0", 0,
+            "0 -> hdr -> XTRDMA_CMQSQ_USE_VFID -> wqe[0]"),
+        "XTRDMA_CMQSQ_WQE_WRAP": ("polarity ? 0 : 1", 0,
+            "polarity -> hdr -> XTRDMA_CMQSQ_WQE_WRAP -> wqe[0]"),
+        "XTRDMA_CMQSQ_WQE_INDEX": ("wqe_idx", 0,
+            "wqe_idx -> hdr -> XTRDMA_CMQSQ_WQE_INDEX -> wqe[0]"),
+        "XTRDMA_CMQCQ_OPCODE": ("opcode", 0,
+            "opcode -> hdr -> XTRDMA_CMQCQ_OPCODE -> wqe[0]"),
+        "XTRDMA_CMQSQ_WQE_QPN": ("info->qpn", 0,
+            "info->qpn -> hdr -> XTRDMA_CMQSQ_WQE_QPN -> wqe[0]"),
+        "XTRDMA_CMQSQ_WQE_RQ_CQN": ("info->rq_cqn", 8,
+            "info->rq_cqn -> sign_data -> XTRDMA_CMQSQ_WQE_RQ_CQN -> wqe[8]"),
+        "XTRDMA_CMQSQ_WQE_SIGN_EN": ("1", 8,
+            "1 -> sign_data -> XTRDMA_CMQSQ_WQE_SIGN_EN -> wqe[8]"),
+        "XTRDMA_CMQSQ_WQE_SIGNATURE": ("wqe_signature", 8,
+            "wqe_signature -> FIELD_PREP(XTRDMA_CMQSQ_WQE_SIGNATURE) -> wqe[8]"),
+        "XTRDMA_CMQSQ_WQE_SQ_CQN": ("info->sq_cqn", 8,
+            "info->sq_cqn -> sign_data -> XTRDMA_CMQSQ_WQE_SQ_CQN -> wqe[8]"),
+        "XTRDMA_CMQSQ_WQE_QPC_BUFFER_ADDR": ("info->qpc_buffer_addr_pa", 24,
+            "info->qpc_buffer_addr_pa -> FIELD_PREP(XTRDMA_CMQSQ_WQE_QPC_BUFFER_ADDR) -> wqe[24]"),
+    }
+    cqc_values = {
+        "XTRDMA_CMQSQ_WQE_VALID": ("polarity", 0,
+            "polarity -> hdr -> XTRDMA_CMQSQ_WQE_VALID -> wqe[0]"),
+        "XTRDMA_CMQSQ_VFID_OVERRIDE": ("0", 0,
+            "0 -> hdr -> XTRDMA_CMQSQ_VFID_OVERRIDE -> wqe[0]"),
+        "XTRDMA_CMQSQ_USE_VFID": ("0", 0,
+            "0 -> hdr -> XTRDMA_CMQSQ_USE_VFID -> wqe[0]"),
+        "XTRDMA_CMQSQ_WQE_WRAP": ("polarity ? 0 : 1", 0,
+            "polarity -> hdr -> XTRDMA_CMQSQ_WQE_WRAP -> wqe[0]"),
+        "XTRDMA_CMQSQ_WQE_INDEX": ("wqe_idx", 0,
+            "wqe_idx -> hdr -> XTRDMA_CMQSQ_WQE_INDEX -> wqe[0]"),
+        "XTRDMA_CMQCQ_OPCODE": ("opcode", 0,
+            "opcode -> hdr -> XTRDMA_CMQCQ_OPCODE -> wqe[0]"),
+        "XTRDMA_CMQSQ_WQE_CQC_WQE_CQN": ("cq_ctx->cqn", 0,
+            "cq_ctx->cqn -> hdr -> XTRDMA_CMQSQ_WQE_CQC_WQE_CQN -> wqe[0]"),
+    }
+    if case_id == "cmq_sqe_qpc_create_request":
+        if macro_name not in qpc_values:
+            raise ContractError(f"no QPC ownership anchor for {macro_name}")
+        value, base, flow = qpc_values[macro_name]
+        return prep("xtrdma_sc_qp_create", macro_name, value, "wqe", base, flow)
+    if case_id == "cmq_sqe_cqc_create_request":
+        if macro_name not in cqc_values:
+            raise ContractError(f"no CQC ownership anchor for {macro_name}")
+        value, base, flow = cqc_values[macro_name]
+        return prep("xtrdma_sc_cq_create", macro_name, value, "wqe", base, flow)
+    if case_id == "cmq_cqe_qpc_create_response":
+        if macro_name == "XTRDMA_CMQSQ_WQE_VALID":
+            return {
+                "anchor_function": "xtrdma_sc_cmq_next_cqe_valid",
+                "anchor_token": "get_64bit_val(cqe, 0, &temp1)",
+                "anchor_occurrence": "1",
+                "anchor_container": "cqe",
+                "anchor_buffer": "cqe",
+                "anchor_operation": "GET_64BIT_FIELD_GET",
+                "anchor_base": "0",
+                "anchor_length": "8",
+                "anchor_target_flow": (
+                    "cq_base[CI].elem -> cqe[0] -> temp1 -> "
+                    "XTRDMA_CMQSQ_WQE_VALID -> ready"
+                ),
+            }
+        if macro_name not in {
+            "XTRDMA_CMQSQ_WQE_WRAP", "XTRDMA_CMQSQ_WQE_INDEX",
+            "XTRDMA_CMQCQ_OPCODE", "XTRDMA_CMQCQ_CMD_ECODE",
+            "XTRDMA_CMQSQ_VFID_OVERRIDE", "XTRDMA_CMQSQ_USE_VFID",
+        }:
+            raise ContractError(f"no CQE ownership anchor for {macro_name}")
+        return {
+            "anchor_function": "xtrdma_get_cqe_common_info",
+            "anchor_token": "get_64bit_val(*cqe, 0, &temp)",
+            "anchor_occurrence": "1",
+            "anchor_container": "cqe",
+            "anchor_buffer": "*cqe",
+            "anchor_operation": "GET_64BIT",
+            "anchor_base": "0",
+            "anchor_length": "8",
+            "anchor_target_flow": (
+                f"sc_cmq->cq_base[CI].elem -> *cqe[0] -> temp -> "
+                f"{macro_name} -> decoded completion"
+            ),
+        }
+    if case_id == "cmq_sq_doorbell":
+        values = {
+            "XTRDMA_CMQSQ_DB_PI": (
+                "XTRDMA_RING_CURRENT_PI(sc_cmq->sq_ring)",
+                (
+                    "sc_cmq->sq_ring -> XTRDMA_CMQSQ_DB_PI -> cmq_db[0] -> "
+                    "xtrdma_iowrite64be -> sc_cmq->sc_dev->cmq_db"
+                ),
+            ),
+            "XTRDMA_CMQSQ_DB_POL": (
+                "sc_cmq->sq_polarity ? 0 : 1",
+                (
+                    "sc_cmq->sq_polarity -> XTRDMA_CMQSQ_DB_POL -> cmq_db[0] -> "
+                    "xtrdma_iowrite64be -> sc_cmq->sc_dev->cmq_db"
+                ),
+            ),
+        }
+        if macro_name not in values:
+            raise ContractError(f"no doorbell ownership anchor for {macro_name}")
+        value, flow = values[macro_name]
+        return {
+            "anchor_function": "xtrdma_sc_cmq_post_sq",
+            "anchor_token": f"FIELD_PREP({macro_name}, {value})",
+            "anchor_occurrence": "1",
+            "anchor_container": "cmq_db",
+            "anchor_buffer": "cmq_db",
+            "anchor_operation": "FIELD_PREP_OR",
+            "anchor_base": "0",
+            "anchor_length": "8",
+            "anchor_target_flow": flow,
+        }
+    raise ContractError(f"unknown ownership anchor case: {case_id}")
 
 
 def build_expected_ownership(
@@ -1846,7 +3462,12 @@ def _derive_all_coordinates(
         source,
         "xtrdma_sc_cq_create",
         cqc_names,
-        expected_buffers={"wqe"},
+        # The CQC header fields are written into ``wqe`` while the embedded
+        # context is copied to ``wqe + 1``.  Both destinations belong to the
+        # same locked request image and must be admitted when scanning this
+        # function; rejecting the second one would hide the Task-3 embed
+        # anchor rather than prove it.
+        expected_buffers={"wqe", "wqe + 1"},
     )
     cqc_fields = _load_case_fields(oracle_root, cqc_case)
     _validate_case_field_coordinates(cqc_case, cqc_fields, macros, cqc_offsets)
@@ -1931,6 +3552,19 @@ def verify(args) -> dict[str, int]:
     _validate_concrete_anchors(ownership, kernel_root, records)
     sv_sources = _read_sv_sources(Path(args.sv_root))
     coordinates = _derive_all_coordinates(kernel_root, oracle_root, macros)
+    macro_ranges: dict[object, tuple[int, int, int]] = {}
+    ranges_by_macro: defaultdict[str, set[tuple[int, int, int]]] = defaultdict(set)
+    for key, base in coordinates.items():
+        macro = key[3]
+        definition = macros.get(macro)
+        if definition is None:
+            raise ContractError(f"C coordinate macro is not defined: {macro}")
+        coordinate = (int(base), definition.lsb, definition.width)
+        macro_ranges[key] = coordinate
+        ranges_by_macro[macro].add(coordinate)
+    for macro, values in ranges_by_macro.items():
+        if len(values) == 1:
+            macro_ranges[macro] = next(iter(values))
     validate_ownership_rows(
         ownership,
         macros=macros,
@@ -1979,7 +3613,16 @@ def verify(args) -> dict[str, int]:
         cases,
     )
     _validate_artifact_field_values(oracle_root)
-    expected_mutations = build_expected_mutations(oracle_root)
+    supported_opcodes = parse_supported_opcode_values(sv_sources, enum_members)
+    expected_mutations = build_expected_mutations(
+        oracle_root,
+        supported_opcodes=supported_opcodes,
+        sv_sources=sv_sources,
+        coordinates=coordinates,
+        macro_ranges=macro_ranges,
+        ownership_rows=ownership,
+        capability_rows=capabilities,
+    )
     summary = validate_mutation_report(mutations)
     compare_mutation_report(mutations, expected_mutations)
     return summary
@@ -2079,12 +3722,13 @@ def derive_macro_offsets(
     *,
     doorbell_value: str | None = None,
     expected_buffers: Iterable[str] | None = None,
+    evidence_macros: Mapping[str, Mapping[str, object]] | None = None,
 ) -> dict[str, int]:
-    """功能：从 set/get 调用和赋值数据流推导函数内字段的 container byte base。
-    输入输出及副作用：返回 macro 到唯一 base 的映射；可选 expected_buffers 约束每个
-    set/get 调用的首个 buffer 表达式；只读锁定 C 函数体。
-    失败边界：宏未流入 set/get/doorbell、buffer 不在允许集合、同一宏落到多 base 或
-    数值 base 非法均拒绝。"""
+    """功能：从 set/get/memcpy/offsetof 调用和赋值数据流推导字段 container byte base。
+    输入输出及副作用：返回 macro 到唯一 C-derived base 的映射；expected_buffers 与 evidence_macros
+    约束真实 buffer/operation 参数；只读锁定 C 函数体。
+    失败边界：宏未流入受支持调用、buffer 不在允许集合、memcpy/offsetof 参数缺失、同一宏落到多 base
+    或数值 base 非法均拒绝，绝不从 SV mask 猜坐标。"""
     body = " ".join(_function_body(_strip_comments(source), function).split())
     wanted = set(macro_names)
     allowed_buffers = {
@@ -2122,6 +3766,84 @@ def derive_macro_offsets(
                 names.update(variable_macros)
         for name in names:
             offsets[name].add(base)
+
+    # memcpy is a first-class coordinate witness for embedded contexts.  The
+    # destination pointer's constant displacement determines its byte base;
+    # callers may provide an explicit evidence_macros entry when the copied
+    # payload itself contains no field macro token (as in CQC_CREATE).
+    memcpy_pattern = re.compile(r"\bmemcpy\s*\(")
+    for match in memcpy_pattern.finditer(body):
+        args_text, end = _balanced_delimited_text(
+            body, body.find("(", match.start()), "(", ")"
+        )
+        args = _split_call_arguments(args_text)
+        if len(args) != 3:
+            raise ContractError(f"malformed memcpy call in {function}")
+        destination = re.sub(r"\s+", "", args[0])
+        if allowed_buffers and destination not in allowed_buffers:
+            raise ContractError(
+                f"unexpected memcpy buffer in {function}: {args[0]}"
+            )
+        length_text = args[2].strip()
+        try:
+            copy_length = _parse_int(length_text, "memcpy length")
+        except ContractError:
+            copy_length = None
+        displacement = 0
+        displacement_match = re.search(r"\+([0-9]+)$", destination)
+        if displacement_match:
+            displacement = int(displacement_match.group(1), 10)
+        names = {
+            name for name in re.findall(r"\bXTRDMA_[A-Z0-9_]+\b", args_text)
+            if name in wanted
+        }
+        for name in names:
+            offsets[name].add(displacement)
+        for name, evidence in (evidence_macros or {}).items():
+            if name not in wanted:
+                continue
+            if str(evidence.get("kind", "")).upper() != "MEMCPY":
+                continue
+            expected_base = evidence.get("base")
+            if expected_base is None:
+                raise ContractError(f"memcpy evidence has no base: {name}")
+            if copy_length is None:
+                raise ContractError(f"memcpy length is not numeric: {name}")
+            expected_length = evidence.get("length")
+            if expected_length is not None and int(expected_length) != copy_length:
+                raise ContractError(f"memcpy evidence length drift: {name}")
+            expected_buffer = evidence.get("buffer")
+            if expected_buffer is not None:
+                normalized_buffer = re.sub(r"\s+", "", str(expected_buffer))
+                if normalized_buffer != destination:
+                    raise ContractError(f"memcpy evidence buffer drift: {name}")
+            offsets[name].add(int(expected_base))
+
+    # offsetof witnesses are accepted only when an explicit evidence mapping
+    # names the macro and expected byte base.  This avoids treating a struct
+    # layout expression as an implicit ABI coordinate.
+    for match in re.finditer(r"\boffsetof\s*\(", body):
+        args_text, _ = _balanced_delimited_text(
+            body, body.find("(", match.start()), "(", ")"
+        )
+        args = _split_call_arguments(args_text)
+        if len(args) != 2:
+            raise ContractError(f"malformed offsetof call in {function}")
+        nearby_start = max(0, match.start() - 160)
+        nearby_end = min(len(body), match.end() + 160)
+        nearby = body[nearby_start:nearby_end]
+        for name, evidence in (evidence_macros or {}).items():
+            if name not in wanted or str(evidence.get("kind", "")).upper() != "OFFSETOF":
+                continue
+            expected_member = evidence.get("member")
+            if expected_member is not None and str(expected_member) not in args[1]:
+                continue
+            if name not in nearby and not evidence.get("allow_unmentioned", False):
+                continue
+            expected_base = evidence.get("base")
+            if expected_base is None:
+                raise ContractError(f"offsetof evidence has no base: {name}")
+            offsets[name].add(int(expected_base))
     loads: dict[str, int] = {}
     get_pattern = re.compile(
         r"get_64bit_val\(\s*([^,]+),\s*([^,]+),\s*&\s*"
@@ -2302,6 +4024,7 @@ def _response_mutation_row(
     fields: Mapping[str, tuple[int, int, int, int]],
     qword: int,
     bit: int,
+    supported_opcodes: Iterable[int] | None = None,
 ) -> dict[str, str]:
     """功能：生成一个 raw CQE bit mutation，分别记录 driver 与 completion codec 结果。
     输入输出及副作用：返回新 row；依据 C field baseline 计算 opcode/owner 变异。
@@ -2331,6 +4054,7 @@ def _response_mutation_row(
             owner=fields["valid"][3],
             expected_owner=fields["valid"][3],
             opcode=baseline_opcode ^ (1 << offset_in_field),
+            supported_opcodes=supported_opcodes,
         )
         row["expected_outcome"] = "ACCEPT" if status == "OK" else "REJECT"
         row["expected_status_code"] = status
@@ -2373,6 +4097,14 @@ def _doorbell_mutation_row(
 
 def build_expected_mutations(
     oracle_root: Path,
+    *,
+    supported_opcodes: Iterable[int] | None = None,
+    writer_ranges: Sequence[WriterRange] | None = None,
+    ownership_rows: Sequence[Mapping[str, str]] | None = None,
+    capability_rows: Sequence[Mapping[str, str]] | None = None,
+    coordinates: Mapping[tuple[str, str, str, str], object] | None = None,
+    macro_ranges: Mapping[str, tuple[int, int, int]] | None = None,
+    sv_sources: Mapping[str, str] | None = None,
 ) -> list[dict[str, str]]:
     """功能：从 Task 3 canonical fields/bytes 生成固定 1,088 行 candidate evidence。
     输入输出及副作用：返回行字典列表；只读 oracle_root，不写 mutation TSV。
@@ -2388,7 +4120,9 @@ def build_expected_mutations(
                 if case_id == "cmq_sqe_qpc_create_request":
                     row = _request_mutation_row(case_id, fields, qword, bit)
                 elif case_id == "cmq_cqe_qpc_create_response":
-                    row = _response_mutation_row(case_id, fields, qword, bit)
+                    row = _response_mutation_row(
+                        case_id, fields, qword, bit, supported_opcodes
+                    )
                 else:
                     row = _doorbell_mutation_row(case_id, fields, qword, bit)
                 if row["evidence_mode"] == "STATIC_UNWRITABLE" and (
@@ -2400,6 +4134,24 @@ def build_expected_mutations(
                     )
                 rows.append(row)
     validate_mutation_report(rows)
+    if sv_sources is not None:
+        if coordinates is None:
+            raise ContractError("SV writer proof requires C-derived coordinates")
+        images = {
+            case: _load_case_bytes(
+                oracle_root, case, int(CASE_LAYOUTS[case]["length"])
+            )
+            for case in ("cmq_sqe_qpc_create_request", "cmq_sq_doorbell")
+        }
+        validate_sv_writer_contract(
+            sv_sources,
+            coordinates,
+            rows,
+            ownership_rows,
+            capability_rows,
+            macro_ranges=macro_ranges,
+            canonical_images=images,
+        )
     return rows
 
 
