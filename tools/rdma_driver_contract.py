@@ -11,7 +11,7 @@ import re
 
 
 class ContractError(RuntimeError):
-    """受版本控制的驱动契约输入无效或彼此不一致。"""
+    """功能：统一表示冻结驱动契约拒绝；输入输出及副作用：携带可诊断错误文本供 CLI 展示；失败边界：契约输入无效或彼此不一致时抛出。"""
 
 
 @dataclass(frozen=True)

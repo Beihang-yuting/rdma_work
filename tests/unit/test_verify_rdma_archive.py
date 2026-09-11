@@ -147,6 +147,17 @@ class ArchiveFixtureTest(unittest.TestCase):
         finally:
             import shutil; shutil.rmtree(root)
 
+    def test_publish_noreplace_rejects_existing_target(self):
+        """功能：验证发布原语不覆盖既有目标；输入输出及副作用：创建源目录和目标目录；失败边界：目标存在时抛 ContractError。"""
+        root = Path(tempfile.mkdtemp())
+        try:
+            source, destination = root / "source", root / "destination"
+            source.mkdir(); destination.mkdir()
+            with self.assertRaises(contract.ContractError):
+                verifier._publish_noreplace(source, destination)
+        finally:
+            import shutil; shutil.rmtree(root)
+
 
 if __name__ == "__main__":
     unittest.main()

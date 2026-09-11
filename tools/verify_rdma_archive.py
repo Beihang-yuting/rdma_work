@@ -5,7 +5,10 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
+import errno
 import hashlib
+import os
 from pathlib import Path, PurePosixPath
 import shutil
 import sys
@@ -36,6 +39,28 @@ def _safe_name(name: str) -> str:
     if pure.is_absolute() or any(part in {"", ".", ".."} for part in parts):
         raise ContractError(f"unsafe archive member path: {name!r}")
     return name
+
+
+def _publish_noreplace(source: Path, destination: Path) -> None:
+    """功能：以 Linux renameat2 RENAME_NOREPLACE 原子发布目录；输入输出及副作用：source 被移动到 destination；失败边界：目标已存在返回 EEXIST，系统不支持原语时拒绝发布。"""
+    libc = ctypes.CDLL(None, use_errno=True)
+    renameat2 = getattr(libc, "renameat2", None)
+    if renameat2 is None:
+        raise ContractError("exclusive atomic publish is unavailable")
+    renameat2.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+    renameat2.restype = ctypes.c_int
+    source_parent = os.open(str(source.parent), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    destination_parent = os.open(str(destination.parent), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        result = renameat2(source_parent, os.fsencode(source.name), destination_parent, os.fsencode(destination.name), 1)
+    finally:
+        os.close(source_parent)
+        os.close(destination_parent)
+    if result != 0:
+        error = ctypes.get_errno()
+        if error == errno.EEXIST:
+            raise ContractError(f"destination appeared during verification: {destination}")
+        raise OSError(error, os.strerror(error))
 
 
 def verify_archive(archive: Path, lock_path: Path, manifest_path: Path, extract_dir: Path) -> Path:
@@ -110,9 +135,7 @@ def verify_archive(archive: Path, lock_path: Path, manifest_path: Path, extract_
             if actual != record.sha256:
                 raise ContractError(f"manifest member hash mismatch: {record.path}")
         staged_prefix = stage / lock.prefix
-        if final_root.exists():
-            raise ContractError(f"destination appeared during verification: {final_root}")
-        staged_prefix.rename(final_root)
+        _publish_noreplace(staged_prefix, final_root)
         return final_root.resolve()
     except Exception as exc:
         shutil.rmtree(stage, ignore_errors=True)
