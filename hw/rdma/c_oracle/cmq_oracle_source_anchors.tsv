@@ -1,0 +1,17 @@
+case_id	role	source_path	source_function	anchor_token	token_occurrence	buffer_expression	operation	target_flow
+cmq_sqe_qpc_create_request	PREPARE	qp.c	xtrdma_hw_create_qp	create_qp_info.qpc_buffer_addr_pa = xtqp->cmdq_qpc_buf.iova >> XTRDMA_ADDR_512_BYTE_SHIFT;	1	create_qp_info.qpc_buffer_addr_pa	ASSIGN_SHIFT_RIGHT	xtqp->cmdq_qpc_buf.iova -> create_qp_info.qpc_buffer_addr_pa -> cmq_request->req_param
+cmq_sqe_qpc_create_request	BUILD	cmq.c	xtrdma_sc_qp_create	set_64bit_val(wqe, 24, FIELD_PREP(XTRDMA_CMQSQ_WQE_QPC_BUFFER_ADDR, info->qpc_buffer_addr_pa));	1	wqe	SET_64BIT_FIELD_PREP	info->qpn/sq_cqn/rq_cqn/qpc_buffer_addr_{pa,va} -> hdr/sign_data/signature -> wqe[0,8,24]
+cmq_sqe_qpc_create_request	STORE	defs.h	set_64bit_val	wqe_words[byte_index >> 3] = cpu_to_be64(val);	1	wqe_words	CPU_TO_BE64_STORE	val -> cpu_to_be64 -> wqe_words[byte_index >> 3]
+cmq_sqe_qpc_create_request	CHECKSUM	defs.h	xtrdma_bytes_xor	acc ^= get_unaligned((u64 *)ptr);	1	ptr	XOR_U64_REMAINDER_FOLD	hdr/wqe/qpc bytes -> acc -> folded u8 -> complemented signature
+cmq_sqe_cqc_create_request	PREPARE	cq.c	xtrdma_hw_create_cq	cmq_request->req_param = (void *)&xt_cq->cq_ctx;	1	cmq_request->req_param	ASSIGN_ADDRESS	xt_cq->cq_ctx -> cmq_request->req_param -> cq_ctx->ctx_addr.va
+cmq_sqe_cqc_create_request	BUILD	cmq.c	xtrdma_sc_cq_create	memcpy(wqe + 1, cq_ctx->ctx_addr.va, 56);	1	wqe + 1	MEMCPY	cq_ctx->ctx_addr.va[0:56] -> wqe[8:64]
+cmq_sqe_cqc_create_request	STORE	defs.h	set_64bit_val	wqe_words[byte_index >> 3] = cpu_to_be64(val);	1	wqe_words	CPU_TO_BE64_STORE	hdr -> cpu_to_be64 -> wqe[0]
+cmq_cqe_qpc_create_response	READY	cmq.c	xtrdma_sc_cmq_next_cqe_valid	get_64bit_val(cqe, 0, &temp1);	1	cqe	GET_64BIT_FIELD_GET	cq_base[CI].elem -> temp1 -> polarity -> cq_polarity -> ready/not-ready
+cmq_cqe_qpc_create_response	LOOKUP	cmq.c	xtrdma_sc_cmq_next_cqe_valid	*cmq_request = (struct xtrdma_cmq_request *)sc_cmq->request_array[wqe_idx];	1	sc_cmq->request_array	INDEX_LOOKUP	cqe.index -> request_array[wqe_idx] -> cmq_request
+cmq_cqe_qpc_create_response	PARSE	cmq.c	xtrdma_get_cqe_common_info	get_64bit_val(*cqe, 0, &temp);	1	*cqe	GET_64BIT	(sc_cmq->cq_base[CI].elem -> *cqe -> temp) -> FIELD_GET(opcode,ecode,wrap,index)
+cmq_cqe_qpc_create_response	LOAD	rdma_type.h	get_64bit_val	*val = be64_to_cpu(wqe_words[byte_index >> 3]);	1	wqe_words	BE64_TO_CPU_LOAD	wqe_words[byte_index >> 3] -> be64_to_cpu -> val
+cmq_cqe_qpc_create_response	VALIDATE_WRAP	cmq.c	xtrdma_get_cqe_common_info	cq_wqe_wrap != sq_wqe_wrap	1	status	COMPARE_WRAP	cqe.wrap/sqe.wrap -> status/request_error
+cmq_cqe_qpc_create_response	VALIDATE_OPCODE	cmq.c	xtrdma_get_cqe_common_info	opcode != cmq_request->cmq_cmd	1	status	COMPARE_OPCODE	cqe.opcode/request.opcode -> status/request_error
+cmq_cqe_qpc_create_response	VALIDATE_ECODE	cmq.c	xtrdma_get_cqe_common_info	ecode != 0	1	status	COMPARE_ECODE	cqe.ecode -> status/request_error
+cmq_sq_doorbell	POST	cmq.c	xtrdma_sc_cmq_post_sq	cmq_db = FIELD_PREP(XTRDMA_CMQSQ_DB_PI, XTRDMA_RING_CURRENT_PI(sc_cmq->sq_ring)) |	1	cmq_db	FIELD_PREP_OR	sc_cmq->sq_ring/sq_polarity -> cmq_db -> xtrdma_iowrite64be
+cmq_sq_doorbell	WRITE	rdma_main.h	xtrdma_iowrite64be	iowrite64be(val, db_addr);	1	db_addr	IOWRITE64BE	cmq_db -> iowrite64be -> CMQ doorbell MMIO bytes

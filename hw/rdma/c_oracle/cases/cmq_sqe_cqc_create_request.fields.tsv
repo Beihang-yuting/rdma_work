@@ -1,0 +1,10 @@
+cqn	0	0	21	15a5a5
+payload_length	0	0	0	38
+payload_source_byte	0	0	0	0
+payload_target_byte	0	0	0	8
+opcode	0	32	8	c
+index	0	40	5	12
+wrap	0	45	1	0
+use_vfid	0	48	11	0
+vf_id_override	0	59	1	0
+valid	0	63	1	1

@@ -1,0 +1,7 @@
+# 目录：hw/rdma/c_oracle/cases；QPC create oracle fixture 输入。
+wqe_index	0x15
+builder_polarity	1
+qpn	0x00a1b2c3
+sq_cqn	0x155555
+rq_cqn	0x0a3c5d
+qpc_iova	0x0123456789abc000

@@ -1,0 +1,10 @@
+request_error	0	0	1	0
+status	0	0	32	0
+ecode	0	24	8	0
+opcode	0	32	8	0
+index	0	40	5	13
+wrap	0	45	1	0
+use_vfid	0	48	11	0
+vf_id_override	0	59	1	0
+ready	0	63	1	1
+valid	0	63	1	1

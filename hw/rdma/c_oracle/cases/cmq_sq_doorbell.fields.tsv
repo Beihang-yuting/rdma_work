@@ -1,0 +1,7 @@
+head_after	0	0	32	37
+head_before	0	0	32	36
+pi_after	0	32	5	17
+pi_before	0	32	5	16
+polarity_after	0	37	1	0
+polarity_before	0	37	1	0
+wire_polarity	0	37	1	1

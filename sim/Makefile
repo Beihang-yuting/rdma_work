@@ -105,7 +105,16 @@ rdma_defs:
 	python3 ../tools/check_rdma_profile_names.py \
 		--kernel-root "$$kernel_root" \
 		--archive-lock ../hw/rdma/archive_lock.env \
-		--source-manifest ../hw/rdma/source_manifest.txt
+		--source-manifest ../hw/rdma/source_manifest.txt; \
+	python3 ../tools/verify_rdma_cmq_oracle.py \
+		--kernel-root "$$kernel_root" \
+		--archive-lock ../hw/rdma/archive_lock.env \
+		--source-manifest ../hw/rdma/source_manifest.txt \
+		--source-anchors ../hw/rdma/c_oracle/cmq_oracle_source_anchors.tsv \
+		--cases ../hw/rdma/c_oracle/cmq_oracle_cases.tsv \
+		--oracle-source ../hw/rdma/c_oracle/rdma_cmq_oracle.c \
+		--artifact-root ../hw/rdma/c_oracle/cases \
+		--cc /usr/bin/gcc
 
 host_mem_preflight:
 	@if [[ -z "$(HOST_MEM_ROOT)" ]]; then \
