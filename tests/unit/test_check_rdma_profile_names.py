@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Focused tests for the rdma definition checker/reference encoder."""
+"""目录：tests/unit；职责：验证 RDMA profile checker 与 reference encoder 的冻结契约。
+依赖：tools/check_rdma_profile_names.py、仓库 golden vectors 及临时 fixture；测试只读
+生产定义，TemporaryDirectory 负责短生命周期的变异输入，生产文件由被测 checker
+拥有且不得被测试改写。
+"""
 
 from __future__ import annotations
 
@@ -23,7 +27,15 @@ SPEC.loader.exec_module(CHECKER)
 
 
 class CExpressionTest(unittest.TestCase):
+    """功能：覆盖 C 字段/常量表达式解析的成功和拒绝边界。
+    输入输出及副作用：通过内存字符串调用 CHECKER 解析器，不写入生产文件。
+    失败边界：任一 BIT、GENMASK、enum 或非法表达式断言漂移都会使本套件失败。"""
+
     def test_bit_and_genmask_forms_are_decoded(self) -> None:
+        """功能：在 CExpressionTest 测试类中验证 BIT、BIT_ULL、GENMASK、GENMASK_ULL 均解码为正确 LSB/宽度。
+        输入输出及副作用：输入为本测试构造的内存 fixture 和 CHECKER API，断言返回值或 ValidationError；不修改生产源码，临时目录由测试负责清理。
+        失败边界：断言未满足、预期异常未抛出或错误信息/坐标不符时测试失败，防止该契约回归。
+        """
         self.assertEqual(CHECKER.parse_field_expression("BIT_ULL(63)"), (63, 1))
         self.assertEqual(CHECKER.parse_field_expression("BIT(7)"), (7, 1))
         self.assertEqual(
@@ -32,22 +44,38 @@ class CExpressionTest(unittest.TestCase):
         self.assertEqual(CHECKER.parse_field_expression("GENMASK(3, 0)"), (0, 4))
 
     def test_unsupported_expression_is_fatal(self) -> None:
+        """功能：在 CExpressionTest 测试类中确认移位等未支持 C 表达式被 ValidationError 拒绝。
+        输入输出及副作用：输入为本测试构造的内存 fixture 和 CHECKER API，断言返回值或 ValidationError；不修改生产源码，临时目录由测试负责清理。
+        失败边界：断言未满足、预期异常未抛出或错误信息/坐标不符时测试失败，防止该契约回归。
+        """
         with self.assertRaisesRegex(CHECKER.ValidationError, "unsupported"):
             CHECKER.parse_field_expression("(1UL << 63)")
 
     def test_bit_64_is_rejected_fail_closed(self) -> None:
+        """功能：在 CExpressionTest 测试类中确认 64 位以上 BIT 位置 fail-closed。
+        输入输出及副作用：输入为本测试构造的内存 fixture 和 CHECKER API，断言返回值或 ValidationError；不修改生产源码，临时目录由测试负责清理。
+        失败边界：断言未满足、预期异常未抛出或错误信息/坐标不符时测试失败，防止该契约回归。
+        """
         for expression in ("BIT(64)", "BIT_ULL(64)"):
             with self.subTest(expression=expression):
                 with self.assertRaisesRegex(CHECKER.ValidationError, "BIT.*64"):
                     CHECKER.parse_field_expression(expression)
 
     def test_explicit_values_are_decoded_without_eval(self) -> None:
+        """功能：在 CExpressionTest 测试类中确认十六进制/十进制常量可解析且不执行 eval。
+        输入输出及副作用：输入为本测试构造的内存 fixture 和 CHECKER API，断言返回值或 ValidationError；不修改生产源码，临时目录由测试负责清理。
+        失败边界：断言未满足、预期异常未抛出或错误信息/坐标不符时测试失败，防止该契约回归。
+        """
         self.assertEqual(CHECKER.parse_value_expression("0x35"), 0x35)
         self.assertEqual(CHECKER.parse_value_expression("12"), 12)
         with self.assertRaisesRegex(CHECKER.ValidationError, "unsupported"):
             CHECKER.parse_value_expression("PREVIOUS + 1")
 
     def test_implicit_enum_values_are_decoded_without_eval(self) -> None:
+        """功能：在 CExpressionTest 测试类中确认 enum 隐式递增值由 parse_c_symbols 正确重建。
+        输入输出及副作用：输入为本测试构造的内存 fixture 和 CHECKER API，断言返回值或 ValidationError；不修改生产源码，临时目录由测试负责清理。
+        失败边界：断言未满足、预期异常未抛出或错误信息/坐标不符时测试失败，防止该契约回归。
+        """
         _, enums = CHECKER.parse_c_symbols(
             """
 enum sample {
@@ -65,6 +93,10 @@ enum sample {
 
 
 class ErrorCodeMappingTest(unittest.TestCase):
+    """功能：验证硬件错误码 source identity、SV 常量和 codec case 的闭合映射。
+    输入输出及副作用：构造小型 defs/wr/SV fixture，调用 CHECKER 并断言异常或 canonical 结果；fixture 只在测试期间存活。
+    失败边界：缺失、重复、alias、raw literal 或 hardware_code 角色漂移必须被拒绝。"""
+
     SOURCES = {
         "defs.h": """
 #define EC_FIRST 0x02
@@ -97,12 +129,20 @@ enum xtrdma_cqe_ecode {
     )
 
     def require_checker_attribute(self, name: str):
+        """功能：在 ErrorCodeMappingTest/require_checker_attribute 中确认被测 checker 暴露指定 API 并返回该属性。
+        输入输出及副作用：输入参数为 self, name，返回测试所需的 fixture/结果或更新局部状态；不写入仓库文件。
+        失败边界：属性缺失、fixture 格式非法、坐标越界或被测 API 拒绝时由断言/ValidationError 暴露。
+        """
         self.assertTrue(
             hasattr(CHECKER, name), f"checker API missing: {name}"
         )
         return getattr(CHECKER, name)
 
     def mappings(self):
+        """功能：在 ErrorCodeMappingTest/mappings 中用 SOURCE_VALUES 生成 ErrorCodeMapping fixture。
+        输入输出及副作用：输入参数为 self，返回测试所需的 fixture/结果或更新局部状态；不写入仓库文件。
+        失败边界：属性缺失、fixture 格式非法、坐标越界或被测 API 拒绝时由断言/ValidationError 暴露。
+        """
         mapping_type = self.require_checker_attribute("ErrorCodeMapping")
         return tuple(
             mapping_type(path, symbol, f"RDMA_ECODE_{symbol}")
@@ -110,6 +150,10 @@ enum xtrdma_cqe_ecode {
         )
 
     def sv_text(self, overrides=None, extra: str = "") -> str:
+        """功能：在 ErrorCodeMappingTest/sv_text 中根据 source values 和 overrides 渲染最小 SV 常量文本。
+        输入输出及副作用：输入参数为 self, overrides, extra，返回测试所需的 fixture/结果或更新局部状态；不写入仓库文件。
+        失败边界：属性缺失、fixture 格式非法、坐标越界或被测 API 拒绝时由断言/ValidationError 暴露。
+        """
         values = dict(self.SOURCE_VALUES)
         if overrides is not None:
             values.update(overrides)
@@ -126,6 +170,10 @@ enum xtrdma_cqe_ecode {
         return "\n".join(declarations)
 
     def validate_fixture(self, sources=None, sv_text=None, mappings=None):
+        """功能：在 ErrorCodeMappingTest/validate_fixture 中把 fixture 交给 validate_error_code_mappings 并返回解析值。
+        输入输出及副作用：输入参数为 self, sources, sv_text, mappings，返回测试所需的 fixture/结果或更新局部状态；不写入仓库文件。
+        失败边界：属性缺失、fixture 格式非法、坐标越界或被测 API 拒绝时由断言/ValidationError 暴露。
+        """
         validate = self.require_checker_attribute(
             "validate_error_code_mappings"
         )
@@ -136,6 +184,10 @@ enum xtrdma_cqe_ecode {
         )
 
     def canonical_fixture(self):
+        """功能：在 ErrorCodeMappingTest/canonical_fixture 中验证 fixture 后生成 canonical error-code lookup。
+        输入输出及副作用：输入参数为 self，返回测试所需的 fixture/结果或更新局部状态；不写入仓库文件。
+        失败边界：属性缺失、fixture 格式非法、坐标越界或被测 API 拒绝时由断言/ValidationError 暴露。
+        """
         canonicalize = self.require_checker_attribute(
             "canonical_error_code_mappings"
         )
@@ -144,6 +196,10 @@ enum xtrdma_cqe_ecode {
         return canonicalize(mappings, values, self.EXPECTED_ALIASES)
 
     def codec_text(self) -> str:
+        """功能：在 ErrorCodeMappingTest/codec_text 中提供包含四个错误 codec function 的最小 SV 文本。
+        输入输出及副作用：输入参数为 self，返回测试所需的 fixture/结果或更新局部状态；不写入仓库文件。
+        失败边界：属性缺失、fixture 格式非法、坐标越界或被测 API 拒绝时由断言/ValidationError 暴露。
+        """
         return """
 `uvm_object_utils(rdma_hw_error_codec)
 local function rdma_status_code_e classify(bit [7:0] hardware_code);
@@ -187,6 +243,10 @@ endfunction
 """
 
     def test_source_discovery_rejects_missing_and_extra_mapping(self) -> None:
+        """功能：在 ErrorCodeMappingTest 测试类中确认错误码 mapping 缺失和额外 identity 都被拒绝。
+        输入输出及副作用：输入为本测试构造的内存 fixture 和 CHECKER API，断言返回值或 ValidationError；不修改生产源码，临时目录由测试负责清理。
+        失败边界：断言未满足、预期异常未抛出或错误信息/坐标不符时测试失败，防止该契约回归。
+        """
         mappings = self.mappings()
         self.validate_fixture(mappings=mappings)
 
@@ -205,6 +265,10 @@ endfunction
             self.validate_fixture(mappings=mappings + (extra,))
 
     def test_mapping_identity_and_sv_names_must_be_unique(self) -> None:
+        """功能：在 ErrorCodeMappingTest 测试类中确认 source identity 与 SV 名称重复会被拒绝。
+        输入输出及副作用：输入为本测试构造的内存 fixture 和 CHECKER API，断言返回值或 ValidationError；不修改生产源码，临时目录由测试负责清理。
+        失败边界：断言未满足、预期异常未抛出或错误信息/坐标不符时测试失败，防止该契约回归。
+        """
         mappings = self.mappings()
         duplicate_identity = mappings[0]._replace(
             sv_name="RDMA_ECODE_DUPLICATE_IDENTITY"
@@ -226,6 +290,10 @@ endfunction
             )
 
     def test_source_and_sv_constant_value_drift_are_rejected(self) -> None:
+        """功能：在 ErrorCodeMappingTest 测试类中确认 C source 数值漂移不会被 SV fixture 掩盖。
+        输入输出及副作用：输入为本测试构造的内存 fixture 和 CHECKER API，断言返回值或 ValidationError；不修改生产源码，临时目录由测试负责清理。
+        失败边界：断言未满足、预期异常未抛出或错误信息/坐标不符时测试失败，防止该契约回归。
+        """
         drifted_sources = dict(self.SOURCES)
         drifted_sources["defs.h"] = drifted_sources["defs.h"].replace(
             "EC_FIRST 0x02", "EC_FIRST 0x03"
@@ -245,6 +313,10 @@ endfunction
             )
 
     def test_sv_error_constants_are_exact_and_eight_bits(self) -> None:
+        """功能：在 ErrorCodeMappingTest 测试类中确认 SV 错误码常量必须完整且为 bit[7:0]。
+        输入输出及副作用：输入为本测试构造的内存 fixture 和 CHECKER API，断言返回值或 ValidationError；不修改生产源码，临时目录由测试负责清理。
+        失败边界：断言未满足、预期异常未抛出或错误信息/坐标不符时测试失败，防止该契约回归。
+        """
         missing = self.sv_text().replace(
             "localparam bit [7:0] RDMA_ECODE_EC_FIRST = 8'h02;", ""
         )
@@ -293,6 +365,10 @@ endfunction
             self.validate_fixture(sv_text=commented)
 
     def test_sv_error_constant_alternate_duplicate_is_rejected(self) -> None:
+        """功能：在 ErrorCodeMappingTest 测试类中确认通过 enum/alternate 声明伪造重复常量会失败。
+        输入输出及副作用：输入为本测试构造的内存 fixture 和 CHECKER API，断言返回值或 ValidationError；不修改生产源码，临时目录由测试负责清理。
+        失败边界：断言未满足、预期异常未抛出或错误信息/坐标不符时测试失败，防止该契约回归。
+        """
         duplicate = (
             "typedef enum bit [7:0] { RDMA_ECODE_EC_FIRST } "
             "rdma_ghost_e;"
@@ -303,6 +379,10 @@ endfunction
             self.validate_fixture(sv_text=self.sv_text(extra=duplicate))
 
     def test_alias_set_and_defs_first_policy_are_explicit(self) -> None:
+        """功能：在 ErrorCodeMappingTest 测试类中确认五组 alias 集合及 defs.h 优先 canonical policy。
+        输入输出及副作用：输入为本测试构造的内存 fixture 和 CHECKER API，断言返回值或 ValidationError；不修改生产源码，临时目录由测试负责清理。
+        失败边界：断言未满足、预期异常未抛出或错误信息/坐标不符时测试失败，防止该契约回归。
+        """
         canonical = self.canonical_fixture()
         self.assertEqual(canonical[0x08].path, "defs.h")
         self.assertEqual(canonical[0x08].c_symbol, "EC_SHARED")
@@ -318,6 +398,10 @@ endfunction
             canonicalize(mappings, values, ())
 
     def test_fixed_mapping_is_complete_and_contains_wr_f0(self) -> None:
+        """功能：在 ErrorCodeMappingTest 测试类中确认冻结 mapping 数量和 wr.h 0xf0 identity 完整。
+        输入输出及副作用：输入为本测试构造的内存 fixture 和 CHECKER API，断言返回值或 ValidationError；不修改生产源码，临时目录由测试负责清理。
+        失败边界：断言未满足、预期异常未抛出或错误信息/坐标不符时测试失败，防止该契约回归。
+        """
         mappings = self.require_checker_attribute("ERROR_CODE_MAPPINGS")
         identities = {(row.path, row.c_symbol) for row in mappings}
         self.assertEqual(len(mappings), 143)
@@ -334,6 +418,10 @@ endfunction
         )
 
     def test_codec_symbolic_constant_and_string_drift_are_rejected(self) -> None:
+        """功能：在 ErrorCodeMappingTest 测试类中确认 symbolic 常量或字符串映射漂移被拒绝。
+        输入输出及副作用：输入为本测试构造的内存 fixture 和 CHECKER API，断言返回值或 ValidationError；不修改生产源码，临时目录由测试负责清理。
+        失败边界：断言未满足、预期异常未抛出或错误信息/坐标不符时测试失败，防止该契约回归。
+        """
         validate_codec = self.require_checker_attribute(
             "validate_error_codec"
         )
@@ -377,6 +465,10 @@ endfunction
             validate_codec(commented_function, canonical)
 
     def test_codec_symbolic_unknown_default_is_exact(self) -> None:
+        """功能：在 ErrorCodeMappingTest 测试类中确认 symbolic_name 的未知 default 文本保持精确。
+        输入输出及副作用：输入为本测试构造的内存 fixture 和 CHECKER API，断言返回值或 ValidationError；不修改生产源码，临时目录由测试负责清理。
+        失败边界：断言未满足、预期异常未抛出或错误信息/坐标不符时测试失败，防止该契约回归。
+        """
         validate_codec = self.require_checker_attribute(
             "validate_error_codec"
         )
@@ -392,6 +484,10 @@ endfunction
             validate_codec(drifted_default, canonical)
 
     def test_codec_symbolic_rejects_case_item_after_default(self) -> None:
+        """功能：在 ErrorCodeMappingTest 测试类中确认 default 后追加 case item 被拒绝。
+        输入输出及副作用：输入为本测试构造的内存 fixture 和 CHECKER API，断言返回值或 ValidationError；不修改生产源码，临时目录由测试负责清理。
+        失败边界：断言未满足、预期异常未抛出或错误信息/坐标不符时测试失败，防止该契约回归。
+        """
         validate_codec = self.require_checker_attribute(
             "validate_error_codec"
         )
@@ -410,6 +506,10 @@ endfunction
             validate_codec(drifted, self.canonical_fixture())
 
     def test_codec_symbolic_lookup_rejects_unknown_specific_case(self) -> None:
+        """功能：在 ErrorCodeMappingTest 测试类中确认 symbolic lookup 不接受未知硬件码 case。
+        输入输出及副作用：输入为本测试构造的内存 fixture 和 CHECKER API，断言返回值或 ValidationError；不修改生产源码，临时目录由测试负责清理。
+        失败边界：断言未满足、预期异常未抛出或错误信息/坐标不符时测试失败，防止该契约回归。
+        """
         validate_codec = self.require_checker_attribute(
             "validate_error_codec"
         )
@@ -427,6 +527,10 @@ endfunction
             validate_codec(unknown_specific, canonical)
 
     def test_codec_symbolic_rejects_case_external_unknown_return(self) -> None:
+        """功能：在 ErrorCodeMappingTest 测试类中确认 symbolic case 返回外部未知标识会失败。
+        输入输出及副作用：输入为本测试构造的内存 fixture 和 CHECKER API，断言返回值或 ValidationError；不修改生产源码，临时目录由测试负责清理。
+        失败边界：断言未满足、预期异常未抛出或错误信息/坐标不符时测试失败，防止该契约回归。
+        """
         validate_codec = self.require_checker_attribute(
             "validate_error_codec"
         )
@@ -442,6 +546,10 @@ endfunction
             validate_codec(early_return, canonical)
 
     def test_codec_cannot_use_raw_literal_for_known_source_code(self) -> None:
+        """功能：在 ErrorCodeMappingTest 测试类中确认 known source error code 不得使用裸 literal。
+        输入输出及副作用：输入为本测试构造的内存 fixture 和 CHECKER API，断言返回值或 ValidationError；不修改生产源码，临时目录由测试负责清理。
+        失败边界：断言未满足、预期异常未抛出或错误信息/坐标不符时测试失败，防止该契约回归。
+        """
         validate_codec = self.require_checker_attribute(
             "validate_error_codec"
         )
@@ -462,6 +570,10 @@ endfunction
                     validate_codec(raw_f0, canonical)
 
     def test_codec_classify_rejects_case_external_known_code_returns(self) -> None:
+        """功能：在 ErrorCodeMappingTest 测试类中确认 classify 不得返回外部 known code 表达式。
+        输入输出及副作用：输入为本测试构造的内存 fixture 和 CHECKER API，断言返回值或 ValidationError；不修改生产源码，临时目录由测试负责清理。
+        失败边界：断言未满足、预期异常未抛出或错误信息/坐标不符时测试失败，防止该契约回归。
+        """
         validate_codec = self.require_checker_attribute(
             "validate_error_codec"
         )
@@ -484,6 +596,10 @@ endfunction
                     validate_codec(early_return, canonical)
 
     def test_codec_classify_rejects_case_item_after_default(self) -> None:
+        """功能：在 ErrorCodeMappingTest 测试类中确认 classify default 后的 case item 被拒绝。
+        输入输出及副作用：输入为本测试构造的内存 fixture 和 CHECKER API，断言返回值或 ValidationError；不修改生产源码，临时目录由测试负责清理。
+        失败边界：断言未满足、预期异常未抛出或错误信息/坐标不符时测试失败，防止该契约回归。
+        """
         validate_codec = self.require_checker_attribute(
             "validate_error_codec"
         )
@@ -502,6 +618,10 @@ endfunction
             validate_codec(drifted, self.canonical_fixture())
 
     def test_codec_inferred_engine_rejects_external_known_code_returns(self) -> None:
+        """功能：在 ErrorCodeMappingTest 测试类中确认 inferred_engine 不得返回外部 known code。
+        输入输出及副作用：输入为本测试构造的内存 fixture 和 CHECKER API，断言返回值或 ValidationError；不修改生产源码，临时目录由测试负责清理。
+        失败边界：断言未满足、预期异常未抛出或错误信息/坐标不符时测试失败，防止该契约回归。
+        """
         validate_codec = self.require_checker_attribute(
             "validate_error_codec"
         )
@@ -528,6 +648,10 @@ endfunction
                     validate_codec(early_return, canonical)
 
     def test_codec_inferred_engine_rejects_case_item_after_default(self) -> None:
+        """功能：在 ErrorCodeMappingTest 测试类中确认 inferred_engine default 尾部规则。
+        输入输出及副作用：输入为本测试构造的内存 fixture 和 CHECKER API，断言返回值或 ValidationError；不修改生产源码，临时目录由测试负责清理。
+        失败边界：断言未满足、预期异常未抛出或错误信息/坐标不符时测试失败，防止该契约回归。
+        """
         validate_codec = self.require_checker_attribute(
             "validate_error_codec"
         )
@@ -544,6 +668,10 @@ endfunction
             validate_codec(drifted, self.canonical_fixture())
 
     def test_codec_other_function_rejects_known_code_expression(self) -> None:
+        """功能：在 ErrorCodeMappingTest 测试类中确认无关 function 引用 known code 会失败。
+        输入输出及副作用：输入为本测试构造的内存 fixture 和 CHECKER API，断言返回值或 ValidationError；不修改生产源码，临时目录由测试负责清理。
+        失败边界：断言未满足、预期异常未抛出或错误信息/坐标不符时测试失败，防止该契约回归。
+        """
         validate_codec = self.require_checker_attribute(
             "validate_error_codec"
         )
@@ -562,6 +690,10 @@ endfunction
     def test_codec_decode_status_rejects_unapproved_hardware_code_uses(
         self,
     ) -> None:
+        """功能：在 ErrorCodeMappingTest 测试类中确认 decode_status 中未批准 hardware_code 用法被拒绝。
+        输入输出及副作用：输入为本测试构造的内存 fixture 和 CHECKER API，断言返回值或 ValidationError；不修改生产源码，临时目录由测试负责清理。
+        失败边界：断言未满足、预期异常未抛出或错误信息/坐标不符时测试失败，防止该契约回归。
+        """
         validate_codec = self.require_checker_attribute(
             "validate_error_codec"
         )
@@ -600,6 +732,10 @@ endfunction
                     validate_codec(bypass, canonical)
 
     def test_codec_accepts_reverse_pinned_success_comparison(self) -> None:
+        """功能：在 ErrorCodeMappingTest 测试类中确认反向 success comparison 仍符合固定 token 契约。
+        输入输出及副作用：输入为本测试构造的内存 fixture 和 CHECKER API，断言返回值或 ValidationError；不修改生产源码，临时目录由测试负责清理。
+        失败边界：断言未满足、预期异常未抛出或错误信息/坐标不符时测试失败，防止该契约回归。
+        """
         validate_codec = self.require_checker_attribute(
             "validate_error_codec"
         )
@@ -613,6 +749,10 @@ endfunction
             self.fail(f"reverse pinned success comparison was rejected: {error}")
 
     def test_codec_rejects_qualified_hardware_code_roles(self) -> None:
+        """功能：在 ErrorCodeMappingTest 测试类中确认带限定名的 hardware_code 角色不能绕过审计。
+        输入输出及副作用：输入为本测试构造的内存 fixture 和 CHECKER API，断言返回值或 ValidationError；不修改生产源码，临时目录由测试负责清理。
+        失败边界：断言未满足、预期异常未抛出或错误信息/坐标不符时测试失败，防止该契约回归。
+        """
         validate_codec = self.require_checker_attribute(
             "validate_error_codec"
         )
@@ -649,6 +789,10 @@ endfunction
                     validate_codec(bypass, canonical)
 
     def test_codec_rejects_token_pasting_macro_bypass(self) -> None:
+        """功能：在 ErrorCodeMappingTest 测试类中确认 token-pasting 宏不能绕过错误码审计。
+        输入输出及副作用：输入为本测试构造的内存 fixture 和 CHECKER API，断言返回值或 ValidationError；不修改生产源码，临时目录由测试负责清理。
+        失败边界：断言未满足、预期异常未抛出或错误信息/坐标不符时测试失败，防止该契约回归。
+        """
         validate_codec = self.require_checker_attribute(
             "validate_error_codec"
         )
@@ -670,6 +814,10 @@ endfunction
             validate_codec(macro_bypass, self.canonical_fixture())
 
     def test_codec_preprocessor_audit_ignores_comments_and_strings(self) -> None:
+        """功能：在 ErrorCodeMappingTest 测试类中确认 preprocessor 审计忽略注释和字符串中的伪宏。
+        输入输出及副作用：输入为本测试构造的内存 fixture 和 CHECKER API，断言返回值或 ValidationError；不修改生产源码，临时目录由测试负责清理。
+        失败边界：断言未满足、预期异常未抛出或错误信息/坐标不符时测试失败，防止该契约回归。
+        """
         validate_codec = self.require_checker_attribute(
             "validate_error_codec"
         )
@@ -684,6 +832,10 @@ string macro_text = "`REVIEW_HC(hardware_,code)";
             self.fail(f"comment/string backtick was parsed as code: {error}")
 
     def test_codec_raw_scan_ignores_quoted_diagnostic_text(self) -> None:
+        """功能：在 ErrorCodeMappingTest 测试类中确认 raw scan 不把诊断字符串当作 code token。
+        输入输出及副作用：输入为本测试构造的内存 fixture 和 CHECKER API，断言返回值或 ValidationError；不修改生产源码，临时目录由测试负责清理。
+        失败边界：断言未满足、预期异常未抛出或错误信息/坐标不符时测试失败，防止该契约回归。
+        """
         validate_codec = self.require_checker_attribute(
             "validate_error_codec"
         )
@@ -698,6 +850,10 @@ string macro_text = "`REVIEW_HC(hardware_,code)";
             self.fail(f"quoted raw literal was parsed as code: {error}")
 
     def test_codec_raw_scan_ignores_narrow_non_error_literals(self) -> None:
+        """功能：在 ErrorCodeMappingTest 测试类中确认窄位非错误 literal 不触发误报。
+        输入输出及副作用：输入为本测试构造的内存 fixture 和 CHECKER API，断言返回值或 ValidationError；不修改生产源码，临时目录由测试负责清理。
+        失败边界：断言未满足、预期异常未抛出或错误信息/坐标不符时测试失败，防止该契约回归。
+        """
         validate_codec = self.require_checker_attribute(
             "validate_error_codec"
         )
@@ -709,6 +865,10 @@ string macro_text = "`REVIEW_HC(hardware_,code)";
             self.fail(f"narrow non-error literal was rejected: {error}")
 
     def test_codec_raw_scan_ignores_wide_zero_extension_literals(self) -> None:
+        """功能：在 ErrorCodeMappingTest 测试类中确认宽零扩展 literal 不触发误报。
+        输入输出及副作用：输入为本测试构造的内存 fixture 和 CHECKER API，断言返回值或 ValidationError；不修改生产源码，临时目录由测试负责清理。
+        失败边界：断言未满足、预期异常未抛出或错误信息/坐标不符时测试失败，防止该契约回归。
+        """
         validate_codec = self.require_checker_attribute(
             "validate_error_codec"
         )
@@ -723,6 +883,10 @@ string macro_text = "`REVIEW_HC(hardware_,code)";
             self.fail(f"wide zero-extension literal was rejected: {error}")
 
     def test_codec_accepts_whitespace_in_based_literal(self) -> None:
+        """功能：在 ErrorCodeMappingTest 测试类中确认 based literal 内部空白按 SV 语法接受。
+        输入输出及副作用：输入为本测试构造的内存 fixture 和 CHECKER API，断言返回值或 ValidationError；不修改生产源码，临时目录由测试负责清理。
+        失败边界：断言未满足、预期异常未抛出或错误信息/坐标不符时测试失败，防止该契约回归。
+        """
         validate_codec = self.require_checker_attribute(
             "validate_error_codec"
         )
@@ -736,6 +900,10 @@ string macro_text = "`REVIEW_HC(hardware_,code)";
                     self.fail(f"legal based-literal whitespace was rejected: {error}")
 
     def test_error_codec_uvm_test_checks_success_symbols(self) -> None:
+        """功能：在 ErrorCodeMappingTest 测试类中确认 UVM error codec 测试覆盖 success symbols。
+        输入输出及副作用：输入为本测试构造的内存 fixture 和 CHECKER API，断言返回值或 ValidationError；不修改生产源码，临时目录由测试负责清理。
+        失败边界：断言未满足、预期异常未抛出或错误信息/坐标不符时测试失败，防止该契约回归。
+        """
         test_text = (
             REPO_ROOT / "tests" / "unit" /
             "rdma_error_codec_test.sv"
@@ -762,6 +930,10 @@ string macro_text = "`REVIEW_HC(hardware_,code)";
                 )
 
     def test_sv_error_constant_cannot_be_forged_inside_string(self) -> None:
+        """功能：在 ErrorCodeMappingTest 测试类中确认字符串内伪造常量不被当作声明。
+        输入输出及副作用：输入为本测试构造的内存 fixture 和 CHECKER API，断言返回值或 ValidationError；不修改生产源码，临时目录由测试负责清理。
+        失败边界：断言未满足、预期异常未抛出或错误信息/坐标不符时测试失败，防止该契约回归。
+        """
         declaration = (
             "localparam bit [7:0] RDMA_ECODE_EC_FIRST = 8'h02;"
         )
@@ -775,6 +947,10 @@ string macro_text = "`REVIEW_HC(hardware_,code)";
             self.validate_fixture(sv_text=forged)
 
     def test_codec_requires_cmq_profile_symbol_for_zero_cases(self) -> None:
+        """功能：在 ErrorCodeMappingTest 测试类中确认 zero case 必须使用 CMQ profile success symbol。
+        输入输出及副作用：输入为本测试构造的内存 fixture 和 CHECKER API，断言返回值或 ValidationError；不修改生产源码，临时目录由测试负责清理。
+        失败边界：断言未满足、预期异常未抛出或错误信息/坐标不符时测试失败，防止该契约回归。
+        """
         validate_codec = self.require_checker_attribute(
             "validate_error_codec"
         )
@@ -790,6 +966,10 @@ string macro_text = "`REVIEW_HC(hardware_,code)";
             validate_codec(source_zero, canonical)
 
     def test_repo_f0_uses_source_pinned_constant_and_symbol(self) -> None:
+        """功能：在 ErrorCodeMappingTest 测试类中确认仓库 f0 路径使用 source-pinned constant/symbol。
+        输入输出及副作用：输入为本测试构造的内存 fixture 和 CHECKER API，断言返回值或 ValidationError；不修改生产源码，临时目录由测试负责清理。
+        失败边界：断言未满足、预期异常未抛出或错误信息/坐标不符时测试失败，防止该契约回归。
+        """
         constants = CHECKER.parse_sv_constants(
             (REPO_ROOT / "src/codec/rdma/rdma_defs.svh").read_text()
         )
@@ -807,6 +987,10 @@ string macro_text = "`REVIEW_HC(hardware_,code)";
 
 
 class SvDefinitionTest(unittest.TestCase):
+    """功能：验证 SV 定义、mask API、字段映射和 profile 常量的静态契约。
+    输入输出及副作用：读取仓库 SV 文本并构造变异字符串，不修改源文件。
+    失败边界：重复声明、坐标/名称漂移或未声明的 composer 结构均应触发断言失败。"""
+
     NEW_URC_FIELDS = {
         "RDMA_QPC_URC_RSQ_SIZE": (
             "XTRDMA_QPC_URC_RSQ_SIZE", 24, 59, 3, 251
@@ -817,6 +1001,10 @@ class SvDefinitionTest(unittest.TestCase):
     }
 
     def test_duplicate_constant_is_fatal(self) -> None:
+        """功能：在 SvDefinitionTest 测试类中确认重复 SV constant 定义立即失败。
+        输入输出及副作用：输入为本测试构造的内存 fixture 和 CHECKER API，断言返回值或 ValidationError；不修改生产源码，临时目录由测试负责清理。
+        失败边界：断言未满足、预期异常未抛出或错误信息/坐标不符时测试失败，防止该契约回归。
+        """
         text = """
 localparam int unsigned RDMA_FIELD_OFFSET = 32;
 localparam int unsigned RDMA_FIELD_OFFSET = 40;
@@ -825,6 +1013,10 @@ localparam int unsigned RDMA_FIELD_OFFSET = 40;
             CHECKER.parse_sv_constants(text)
 
     def test_sv_comment_stripping_preserves_quoted_markers(self) -> None:
+        """功能：在 SvDefinitionTest 测试类中确认注释剥离保留 URL 等字符串标记。
+        输入输出及副作用：输入为本测试构造的内存 fixture 和 CHECKER API，断言返回值或 ValidationError；不修改生产源码，临时目录由测试负责清理。
+        失败边界：断言未满足、预期异常未抛出或错误信息/坐标不符时测试失败，防止该契约回归。
+        """
         strip_comments = getattr(CHECKER, "strip_sv_comments", None)
         self.assertIsNotNone(strip_comments, "checker has no strip_sv_comments")
         stripped = strip_comments(
@@ -837,6 +1029,10 @@ localparam int unsigned RDMA_FIELD_OFFSET = 40;
         self.assertNotIn("RDMA_ECODE_BLOCK", stripped)
 
     def test_width_and_value_literals_are_parsed(self) -> None:
+        """功能：在 SvDefinitionTest 测试类中确认 SV width/value literal 解析结果正确。
+        输入输出及副作用：输入为本测试构造的内存 fixture 和 CHECKER API，断言返回值或 ValidationError；不修改生产源码，临时目录由测试负责清理。
+        失败边界：断言未满足、预期异常未抛出或错误信息/坐标不符时测试失败，防止该契约回归。
+        """
         constants = CHECKER.parse_sv_constants(
             """
 localparam int unsigned RDMA_FIELD_WIDTH = 8;
@@ -849,6 +1045,10 @@ localparam bit [63:0] RDMA_WINDOW = 64'h2000;
         self.assertEqual(constants["RDMA_WINDOW"], 0x2000)
 
     def test_global_mapping_uniqueness_is_enforced(self) -> None:
+        """功能：在 SvDefinitionTest 测试类中确认全局 field/value/reference 名称唯一。
+        输入输出及副作用：输入为本测试构造的内存 fixture 和 CHECKER API，断言返回值或 ValidationError；不修改生产源码，临时目录由测试负责清理。
+        失败边界：断言未满足、预期异常未抛出或错误信息/坐标不符时测试失败，防止该契约回归。
+        """
         validate = getattr(CHECKER, "validate_mapping_uniqueness")
         validate(CHECKER.FIELD_MAPPINGS, CHECKER.VALUE_MAPPINGS,
                  CHECKER.REFERENCE_FIELDS)
@@ -898,6 +1098,10 @@ localparam bit [63:0] RDMA_WINDOW = 64'h2000;
             )
 
     def test_cmq_composer_does_not_retain_built_artifacts(self) -> None:
+        """功能：在 SvDefinitionTest 测试类中确认 composer 不保留被禁止的构建产物。
+        输入输出及副作用：输入为本测试构造的内存 fixture 和 CHECKER API，断言返回值或 ValidationError；不修改生产源码，临时目录由测试负责清理。
+        失败边界：断言未满足、预期异常未抛出或错误信息/坐标不符时测试失败，防止该契约回归。
+        """
         source = (
             REPO_ROOT
             / "src/codec/rdma/rdma_cmq_codecs.sv"
@@ -908,6 +1112,10 @@ localparam bit [63:0] RDMA_WINDOW = 64'h2000;
         )
 
     def test_duplicate_source_symbol_at_another_offset_is_fatal(self) -> None:
+        """功能：在 SvDefinitionTest 测试类中确认同一 source symbol 的不同 offset 被拒绝。
+        输入输出及副作用：输入为本测试构造的内存 fixture 和 CHECKER API，断言返回值或 ValidationError；不修改生产源码，临时目录由测试负责清理。
+        失败边界：断言未满足、预期异常未抛出或错误信息/坐标不符时测试失败，防止该契约回归。
+        """
         validate = CHECKER.validate_mapping_uniqueness
         first = next(
             mapping
@@ -926,6 +1134,10 @@ localparam bit [63:0] RDMA_WINDOW = 64'h2000;
             )
 
     def test_unrelated_identical_source_duplicate_is_fatal(self) -> None:
+        """功能：在 SvDefinitionTest 测试类中确认无关重复 source symbol 不能被忽略。
+        输入输出及副作用：输入为本测试构造的内存 fixture 和 CHECKER API，断言返回值或 ValidationError；不修改生产源码，临时目录由测试负责清理。
+        失败边界：断言未满足、预期异常未抛出或错误信息/坐标不符时测试失败，防止该契约回归。
+        """
         with self.assertRaisesRegex(CHECKER.ValidationError, "duplicated"):
             CHECKER.require_unique_expression(
                 {"XTRDMA_SQ_WQE_QPN": ["GENMASK(20, 0)", "GENMASK(20, 0)"]},
@@ -934,6 +1146,10 @@ localparam bit [63:0] RDMA_WINDOW = 64'h2000;
             )
 
     def test_modify_data_source_exception_requires_exact_quartet(self) -> None:
+        """功能：在 SvDefinitionTest 测试类中确认 MODIFY_DATA 只允许四个精确 offset。
+        输入输出及副作用：输入为本测试构造的内存 fixture 和 CHECKER API，断言返回值或 ValidationError；不修改生产源码，临时目录由测试负责清理。
+        失败边界：断言未满足、预期异常未抛出或错误信息/坐标不符时测试失败，防止该契约回归。
+        """
         validate = CHECKER.validate_mapping_uniqueness
         symbol = "XTRDMA_CMQSQ_WQE_MODIFY_DATA"
         fields = tuple(
@@ -966,6 +1182,10 @@ localparam bit [63:0] RDMA_WINDOW = 64'h2000;
             validate(fields + (extra_field,), (), references)
 
     def test_field_declaration_expands_to_auditable_coordinates(self) -> None:
+        """功能：在 SvDefinitionTest 测试类中确认 RDMA_FIELD 派生常量包含可审计坐标。
+        输入输出及副作用：输入为本测试构造的内存 fixture 和 CHECKER API，断言返回值或 ValidationError；不修改生产源码，临时目录由测试负责清理。
+        失败边界：断言未满足、预期异常未抛出或错误信息/坐标不符时测试失败，防止该契约回归。
+        """
         constants = CHECKER.parse_sv_constants(
             "`RDMA_FIELD(RDMA_QPC_QPN, 0, 16, 21)\n"
         )
@@ -975,6 +1195,10 @@ localparam bit [63:0] RDMA_WINDOW = 64'h2000;
         self.assertEqual(constants["RDMA_QPC_QPN_OFFSET"], 16)
 
     def test_new_urc_rows_match_source_reference_and_sv_coordinates(self) -> None:
+        """功能：在 SvDefinitionTest 测试类中确认 URC rows 的 source/reference/SV 坐标一致。
+        输入输出及副作用：输入为本测试构造的内存 fixture 和 CHECKER API，断言返回值或 ValidationError；不修改生产源码，临时目录由测试负责清理。
+        失败边界：断言未满足、预期异常未抛出或错误信息/坐标不符时测试失败，防止该契约回归。
+        """
         mappings = {mapping.sv_stem: mapping for mapping in CHECKER.FIELD_MAPPINGS}
         references = {
             reference.sv_stem: reference
@@ -1015,6 +1239,10 @@ localparam bit [63:0] RDMA_WINDOW = 64'h2000;
                 )
 
     def test_new_urc_source_coordinate_drift_is_rejected(self) -> None:
+        """功能：在 SvDefinitionTest 测试类中确认 URC source 坐标漂移被拒绝。
+        输入输出及副作用：输入为本测试构造的内存 fixture 和 CHECKER API，断言返回值或 ValidationError；不修改生产源码，临时目录由测试负责清理。
+        失败边界：断言未满足、预期异常未抛出或错误信息/坐标不符时测试失败，防止该契约回归。
+        """
         parsed_fields = {
             reference.sv_stem: (
                 reference.path,
@@ -1039,6 +1267,10 @@ localparam bit [63:0] RDMA_WINDOW = 64'h2000;
                     )
 
     def test_new_urc_reference_coordinate_drift_is_rejected(self) -> None:
+        """功能：在 SvDefinitionTest 测试类中确认 URC reference 坐标漂移被拒绝。
+        输入输出及副作用：输入为本测试构造的内存 fixture 和 CHECKER API，断言返回值或 ValidationError；不修改生产源码，临时目录由测试负责清理。
+        失败边界：断言未满足、预期异常未抛出或错误信息/坐标不符时测试失败，防止该契约回归。
+        """
         parsed_fields = {
             reference.sv_stem: (
                 reference.path,
@@ -1066,6 +1298,10 @@ localparam bit [63:0] RDMA_WINDOW = 64'h2000;
                     )
 
     def test_new_urc_sv_constant_drift_is_rejected(self) -> None:
+        """功能：在 SvDefinitionTest 测试类中确认 URC SV 常量漂移被拒绝。
+        输入输出及副作用：输入为本测试构造的内存 fixture 和 CHECKER API，断言返回值或 ValidationError；不修改生产源码，临时目录由测试负责清理。
+        失败边界：断言未满足、预期异常未抛出或错误信息/坐标不符时测试失败，防止该契约回归。
+        """
         validate_required = getattr(CHECKER, "validate_required_sv_constants")
         sv_constants = CHECKER.parse_sv_constants(
             (REPO_ROOT / "src/codec/rdma/rdma_defs.svh").read_text()
@@ -1088,6 +1324,10 @@ localparam bit [63:0] RDMA_WINDOW = 64'h2000;
                     validate_required(drifted, expected)
 
     def test_context_object_state_mode_and_right_values_are_mapped(self) -> None:
+        """功能：在 SvDefinitionTest 测试类中确认 context state/mode/right value mapping 完整。
+        输入输出及副作用：输入为本测试构造的内存 fixture 和 CHECKER API，断言返回值或 ValidationError；不修改生产源码，临时目录由测试负责清理。
+        失败边界：断言未满足、预期异常未抛出或错误信息/坐标不符时测试失败，防止该契约回归。
+        """
         mappings = {
             (mapping.path, mapping.c_symbol, mapping.sv_name)
             for mapping in CHECKER.VALUE_MAPPINGS
@@ -1130,11 +1370,19 @@ localparam bit [63:0] RDMA_WINDOW = 64'h2000;
         )
 
     def test_mask_file_exposes_qword_lookup_api_with_image_kind(self) -> None:
+        """功能：在 SvDefinitionTest 测试类中确认 mask file 暴露 image-kind/qword lookup API。
+        输入输出及副作用：输入为本测试构造的内存 fixture 和 CHECKER API，断言返回值或 ValidationError；不修改生产源码，临时目录由测试负责清理。
+        失败边界：断言未满足、预期异常未抛出或错误信息/坐标不符时测试失败，防止该契约回归。
+        """
         validate = getattr(CHECKER, "validate_sv_mask_api")
         validate((REPO_ROOT / "src/codec/rdma/rdma_image_masks.svh").read_text())
 
 
 class Task11DefinitionTest(unittest.TestCase):
+    """功能：覆盖 CMQ Task 11 body ownership 与 sparse context 坐标的冻结验证。
+    输入输出及副作用：使用仓库映射和复制后的 tuple 调用 CHECKER，所有变异仅在内存中进行。
+    失败边界：source、reference、SV mask 或 ownership 任一位漂移都必须 fail-closed。"""
+
     TASK11_FIELDS = {
         "RDMA_CMQ_NEXT_QP_STATE":
             ("XTRDMA_CMQSQ_WQE_NXT_QP_ST", 0, 60, 3),
@@ -1248,6 +1496,10 @@ class Task11DefinitionTest(unittest.TestCase):
 
     @staticmethod
     def parsed_reference_fields():
+        """功能：在 Task11DefinitionTest/parsed_reference_fields 中从 TASK11_FIELDS 构造 parsed reference 坐标字典。
+        输入输出及副作用：输入参数为 无参数，返回测试所需的 fixture/结果或更新局部状态；不写入仓库文件。
+        失败边界：属性缺失、fixture 格式非法、坐标越界或被测 API 拒绝时由断言/ValidationError 暴露。
+        """
         return {
             reference.sv_stem: (
                 reference.path,
@@ -1259,6 +1511,10 @@ class Task11DefinitionTest(unittest.TestCase):
         }
 
     def test_task11_rows_match_source_reference_and_sv_coordinates(self) -> None:
+        """功能：在 Task11DefinitionTest 测试类中确认 Task11 rows 同时匹配 source/reference/SV 坐标。
+        输入输出及副作用：输入为本测试构造的内存 fixture 和 CHECKER API，断言返回值或 ValidationError；不修改生产源码，临时目录由测试负责清理。
+        失败边界：断言未满足、预期异常未抛出或错误信息/坐标不符时测试失败，防止该契约回归。
+        """
         mappings = {mapping.sv_stem: mapping for mapping in CHECKER.FIELD_MAPPINGS}
         references = {
             reference.sv_stem: reference
@@ -1290,6 +1546,10 @@ class Task11DefinitionTest(unittest.TestCase):
                 )
 
     def test_task11_source_coordinate_drift_is_rejected(self) -> None:
+        """功能：在 Task11DefinitionTest 测试类中确认 Task11 source 坐标变异被拒绝。
+        输入输出及副作用：输入为本测试构造的内存 fixture 和 CHECKER API，断言返回值或 ValidationError；不修改生产源码，临时目录由测试负责清理。
+        失败边界：断言未满足、预期异常未抛出或错误信息/坐标不符时测试失败，防止该契约回归。
+        """
         parsed_fields = self.parsed_reference_fields()
         for stem in self.TASK11_FIELDS:
             with self.subTest(stem=stem):
@@ -1306,6 +1566,10 @@ class Task11DefinitionTest(unittest.TestCase):
                     )
 
     def test_task11_reference_coordinate_drift_is_rejected(self) -> None:
+        """功能：在 Task11DefinitionTest 测试类中确认 Task11 reference 坐标变异被拒绝。
+        输入输出及副作用：输入为本测试构造的内存 fixture 和 CHECKER API，断言返回值或 ValidationError；不修改生产源码，临时目录由测试负责清理。
+        失败边界：断言未满足、预期异常未抛出或错误信息/坐标不符时测试失败，防止该契约回归。
+        """
         parsed_fields = self.parsed_reference_fields()
         for stem in self.TASK11_FIELDS:
             with self.subTest(stem=stem):
@@ -1325,6 +1589,10 @@ class Task11DefinitionTest(unittest.TestCase):
                     )
 
     def test_task11_sv_constant_drift_is_rejected(self) -> None:
+        """功能：在 Task11DefinitionTest 测试类中确认 Task11 SV 常量变异被拒绝。
+        输入输出及副作用：输入为本测试构造的内存 fixture 和 CHECKER API，断言返回值或 ValidationError；不修改生产源码，临时目录由测试负责清理。
+        失败边界：断言未满足、预期异常未抛出或错误信息/坐标不符时测试失败，防止该契约回归。
+        """
         sv_constants = CHECKER.parse_sv_constants(
             (REPO_ROOT / "src/codec/rdma/rdma_defs.svh").read_text()
         )
@@ -1345,6 +1613,10 @@ class Task11DefinitionTest(unittest.TestCase):
                     CHECKER.validate_required_sv_constants(drifted, expected)
 
     def test_modify_mode_values_are_pinned_to_driver_enums(self) -> None:
+        """功能：在 Task11DefinitionTest 测试类中确认 modify mode 值绑定 driver enum。
+        输入输出及副作用：输入为本测试构造的内存 fixture 和 CHECKER API，断言返回值或 ValidationError；不修改生产源码，临时目录由测试负责清理。
+        失败边界：断言未满足、预期异常未抛出或错误信息/坐标不符时测试失败，防止该契约回归。
+        """
         expected = {
             ("qp.h", "XTRDMA_MODIFY_MODE_ONLY_ST",
              "RDMA_QPC_MODIFY_STATE_ONLY"),
@@ -1379,6 +1651,10 @@ class Task11DefinitionTest(unittest.TestCase):
                     )
 
     def test_cmq_ownership_is_parsed_separately_and_exact(self) -> None:
+        """功能：在 Task11DefinitionTest 测试类中确认 CMQ ownership 独立解析且逐 qword 精确。
+        输入输出及副作用：输入为本测试构造的内存 fixture 和 CHECKER API，断言返回值或 ValidationError；不修改生产源码，临时目录由测试负责清理。
+        失败边界：断言未满足、预期异常未抛出或错误信息/坐标不符时测试失败，防止该契约回归。
+        """
         text = (REPO_ROOT /
                 "src/codec/rdma/rdma_image_masks.svh").read_text()
         self.assertEqual(CHECKER.CMQ_BODY_OWNERSHIP, self.EXPECTED_OWNERSHIP)
@@ -1391,6 +1667,10 @@ class Task11DefinitionTest(unittest.TestCase):
         CHECKER.validate_cmq_body_ownership(self.EXPECTED_OWNERSHIP)
 
     def test_each_cmq_ownership_mask_drift_is_rejected(self) -> None:
+        """功能：在 Task11DefinitionTest 测试类中确认每个 CMQ ownership mask 漂移均拒绝。
+        输入输出及副作用：输入为本测试构造的内存 fixture 和 CHECKER API，断言返回值或 ValidationError；不修改生产源码，临时目录由测试负责清理。
+        失败边界：断言未满足、预期异常未抛出或错误信息/坐标不符时测试失败，防止该契约回归。
+        """
         for name in self.EXPECTED_OWNERSHIP:
             with self.subTest(name=name):
                 drifted = dict(self.EXPECTED_OWNERSHIP)
@@ -1404,6 +1684,10 @@ class Task11DefinitionTest(unittest.TestCase):
 
 
 class Task12DoorbellDefinitionTest(unittest.TestCase):
+    """功能：覆盖 CMQ/SQ/RQ/CQ/EQ doorbell 字段、常量和 golden payload 的验证。
+    输入输出及副作用：读取仓库定义并在内存中变异 case，断言固定顺序、offset 和 payload。
+    失败边界：字段坐标、常量、case 名称或 payload 改变时测试必须报告契约错误。"""
+
     DOORBELL_NAMES = [
         "cmq_sq", "sq", "rq", "srq_pi", "srq_limit", "cq_rc_ud",
         "cq_urc", "ceq", "aeq", "rts2sqd", "sqd2rts", "qp_flush",
@@ -1462,6 +1746,10 @@ class Task12DoorbellDefinitionTest(unittest.TestCase):
 
     @staticmethod
     def parsed_reference_fields():
+        """功能：在 Task12DoorbellDefinitionTest/parsed_reference_fields 中从 doorbell reference rows 构造 parsed 坐标字典。
+        输入输出及副作用：输入参数为 无参数，返回测试所需的 fixture/结果或更新局部状态；不写入仓库文件。
+        失败边界：属性缺失、fixture 格式非法、坐标越界或被测 API 拒绝时由断言/ValidationError 暴露。
+        """
         return {
             reference.sv_stem: (
                 reference.path,
@@ -1473,6 +1761,10 @@ class Task12DoorbellDefinitionTest(unittest.TestCase):
         }
 
     def test_all_doorbell_fields_are_source_pinned_and_exact(self) -> None:
+        """功能：在 Task12DoorbellDefinitionTest 测试类中确认所有 doorbell 字段均 source-pinned 且坐标精确。
+        输入输出及副作用：输入为本测试构造的内存 fixture 和 CHECKER API，断言返回值或 ValidationError；不修改生产源码，临时目录由测试负责清理。
+        失败边界：断言未满足、预期异常未抛出或错误信息/坐标不符时测试失败，防止该契约回归。
+        """
         mappings = {mapping.sv_stem: mapping for mapping in CHECKER.FIELD_MAPPINGS}
         references = {
             reference.sv_stem: reference
@@ -1493,6 +1785,10 @@ class Task12DoorbellDefinitionTest(unittest.TestCase):
                 )
 
     def test_doorbell_field_coordinate_mutation_is_rejected(self) -> None:
+        """功能：在 Task12DoorbellDefinitionTest 测试类中确认 doorbell 字段坐标变异被拒绝。
+        输入输出及副作用：输入为本测试构造的内存 fixture 和 CHECKER API，断言返回值或 ValidationError；不修改生产源码，临时目录由测试负责清理。
+        失败边界：断言未满足、预期异常未抛出或错误信息/坐标不符时测试失败，防止该契约回归。
+        """
         parsed_fields = self.parsed_reference_fields()
         stem = "RDMA_NOTIFY_CQ_URC_SQ_CI"
         references = list(CHECKER.REFERENCE_FIELDS)
@@ -1509,6 +1805,10 @@ class Task12DoorbellDefinitionTest(unittest.TestCase):
             )
 
     def test_all_doorbell_constants_are_source_pinned_and_exact(self) -> None:
+        """功能：在 Task12DoorbellDefinitionTest 测试类中确认所有 doorbell 常量均 source-pinned 且数值精确。
+        输入输出及副作用：输入为本测试构造的内存 fixture 和 CHECKER API，断言返回值或 ValidationError；不修改生产源码，临时目录由测试负责清理。
+        失败边界：断言未满足、预期异常未抛出或错误信息/坐标不符时测试失败，防止该契约回归。
+        """
         mappings = {
             (mapping.path, mapping.c_symbol, mapping.sv_name)
             for mapping in CHECKER.VALUE_MAPPINGS
@@ -1524,6 +1824,10 @@ class Task12DoorbellDefinitionTest(unittest.TestCase):
                 )
 
     def test_doorbell_constant_mutation_is_rejected(self) -> None:
+        """功能：在 Task12DoorbellDefinitionTest 测试类中确认 doorbell 常量变异被拒绝。
+        输入输出及副作用：输入为本测试构造的内存 fixture 和 CHECKER API，断言返回值或 ValidationError；不修改生产源码，临时目录由测试负责清理。
+        失败边界：断言未满足、预期异常未抛出或错误信息/坐标不符时测试失败，防止该契约回归。
+        """
         constants = CHECKER.parse_sv_constants(
             (REPO_ROOT / "src/codec/rdma/rdma_defs.svh").read_text()
         )
@@ -1537,6 +1841,10 @@ class Task12DoorbellDefinitionTest(unittest.TestCase):
             CHECKER.validate_required_sv_constants(drifted, expected)
 
     def test_doorbell_goldens_have_exact_order_size_offsets_and_sq_header(self) -> None:
+        """功能：在 Task12DoorbellDefinitionTest 测试类中确认 doorbell golden 顺序/大小/offset/SQ header 契约。
+        输入输出及副作用：输入为本测试构造的内存 fixture 和 CHECKER API，断言返回值或 ValidationError；不修改生产源码，临时目录由测试负责清理。
+        失败边界：断言未满足、预期异常未抛出或错误信息/坐标不符时测试失败，防止该契约回归。
+        """
         cases_by_kind = CHECKER.build_golden_cases()
         cases = cases_by_kind["doorbell"]
         self.assertEqual([case.name for case in cases], self.DOORBELL_NAMES)
@@ -1553,6 +1861,10 @@ class Task12DoorbellDefinitionTest(unittest.TestCase):
         self.assertEqual(cases[1].payload, sqe.payload[:8])
 
     def test_doorbell_case_name_and_payload_mutations_are_rejected(self) -> None:
+        """功能：在 Task12DoorbellDefinitionTest 测试类中确认 doorbell case 名称或 payload 变异被拒绝。
+        输入输出及副作用：输入为本测试构造的内存 fixture 和 CHECKER API，断言返回值或 ValidationError；不修改生产源码，临时目录由测试负责清理。
+        失败边界：断言未满足、预期异常未抛出或错误信息/坐标不符时测试失败，防止该契约回归。
+        """
         validate = getattr(CHECKER, "validate_doorbell_contract")
         cases_by_kind = CHECKER.build_golden_cases()
         cases = cases_by_kind["doorbell"]
@@ -1658,6 +1970,10 @@ class SourceIdentityTest(unittest.TestCase):
 
 
 class MakefileCleanupTest(unittest.TestCase):
+    """功能：验证 rdma_defs Make 入口经过 archive verifier 且失败清理保持可诊断。
+    输入输出及副作用：执行 make -n 获取命令文本，不运行解压或删除生产目录。
+    失败边界：缺少 fail-fast、直接解压或错误清理分支时断言失败。"""
+
     def test_rdma_defs_routes_through_archive_verifier(self) -> None:
         """功能：确认 rdma_defs 使用统一 verifier；输入输出及副作用：读取 Makefile dry-run 文本；失败边界：禁止直接 tar/unzip 解压。"""
         rendered = subprocess.run(
@@ -1675,6 +1991,10 @@ class MakefileCleanupTest(unittest.TestCase):
         self.assertIn("set -euo pipefail", rendered)
 
     def test_rdma_defs_cleanup_preserves_command_failure_and_reports_delete_failure(self) -> None:
+        """功能：在 MakefileCleanupTest 测试类中确认 Make 清理保留命令失败并报告删除失败。
+        输入输出及副作用：输入为本测试构造的内存 fixture 和 CHECKER API，断言返回值或 ValidationError；不修改生产源码，临时目录由测试负责清理。
+        失败边界：断言未满足、预期异常未抛出或错误信息/坐标不符时测试失败，防止该契约回归。
+        """
         sim_dir = REPO_ROOT / "sim"
         rendered = subprocess.run(
             [
@@ -1726,15 +2046,31 @@ class MakefileCleanupTest(unittest.TestCase):
 
 
 class ReferenceEncodingTest(unittest.TestCase):
+    """功能：验证独立 reference encoder 的字段占用、端序、golden 派生和语义输入耦合。
+    输入输出及副作用：在 ReferenceImage 与 bytes 副本上编码/变异，不修改仓库 golden。
+    失败边界：越界、重叠、映射漂移、非法语义值或未覆盖输入必须被断言捕获。"""
+
     def make_reference_image(self, byte_count: int):
+        """功能：在 ReferenceEncodingTest/make_reference_image 中创建被测 ReferenceImage 或报告构造 API 缺失。
+        输入输出及副作用：输入参数为 self, byte_count，返回测试所需的 fixture/结果或更新局部状态；不写入仓库文件。
+        失败边界：属性缺失、fixture 格式非法、坐标越界或被测 API 拒绝时由断言/ValidationError 暴露。
+        """
         image_type = getattr(CHECKER, "ReferenceImage", bytearray)
         return image_type(byte_count)
 
     def require_checker_attribute(self, name: str):
+        """功能：在 ReferenceEncodingTest/require_checker_attribute 中确认 reference encoder 暴露指定 helper。
+        输入输出及副作用：输入参数为 self, name，返回测试所需的 fixture/结果或更新局部状态；不写入仓库文件。
+        失败边界：属性缺失、fixture 格式非法、坐标越界或被测 API 拒绝时由断言/ValidationError 暴露。
+        """
         self.assertTrue(hasattr(CHECKER, name), f"checker has no {name}")
         return getattr(CHECKER, name)
 
     def field_value(self, case, stem: str) -> int:
+        """功能：在 ReferenceEncodingTest/field_value 中按 REFERENCE_BY_STEM 从 case payload 读取字段值。
+        输入输出及副作用：输入参数为 self, case, stem，返回测试所需的 fixture/结果或更新局部状态；不写入仓库文件。
+        失败边界：属性缺失、fixture 格式非法、坐标越界或被测 API 拒绝时由断言/ValidationError 暴露。
+        """
         reference = CHECKER.REFERENCE_BY_STEM[stem]
         word = int.from_bytes(
             case.payload[
@@ -1745,11 +2081,19 @@ class ReferenceEncodingTest(unittest.TestCase):
         return (word >> reference.lsb) & ((1 << reference.width) - 1)
 
     def mutate_field(self, case, stem: str):
+        """功能：在 ReferenceEncodingTest/mutate_field 中翻转命名字段最低位并返回变异 GoldenCase。
+        输入输出及副作用：输入参数为 self, case, stem，返回测试所需的 fixture/结果或更新局部状态；不写入仓库文件。
+        失败边界：属性缺失、fixture 格式非法、坐标越界或被测 API 拒绝时由断言/ValidationError 暴露。
+        """
         reference = CHECKER.REFERENCE_BY_STEM[stem]
         current = self.field_value(case, stem)
         return self.set_field(case, stem, current ^ 1)
 
     def set_field(self, case, stem: str, value: int):
+        """功能：在 ReferenceEncodingTest/set_field 中在 bytes 副本中替换命名字段值并返回新 case。
+        输入输出及副作用：输入参数为 self, case, stem, value，返回测试所需的 fixture/结果或更新局部状态；不写入仓库文件。
+        失败边界：属性缺失、fixture 格式非法、坐标越界或被测 API 拒绝时由断言/ValidationError 暴露。
+        """
         reference = CHECKER.REFERENCE_BY_STEM[stem]
         start = reference.word_byte_offset
         image = bytearray(case.payload)
@@ -1760,6 +2104,10 @@ class ReferenceEncodingTest(unittest.TestCase):
         return case._replace(payload=bytes(image))
 
     def mutate_input(self, case, name: str):
+        """功能：在 ReferenceEncodingTest/mutate_input 中从 case 摘要移除指定语义输入并返回新 case。
+        输入输出及副作用：输入参数为 self, case, name，返回测试所需的 fixture/结果或更新局部状态；不写入仓库文件。
+        失败边界：属性缺失、fixture 格式非法、坐标越界或被测 API 拒绝时由断言/ValidationError 暴露。
+        """
         inputs = []
         for item in case.inputs:
             if item.name != name:
@@ -1777,21 +2125,37 @@ class ReferenceEncodingTest(unittest.TestCase):
         return case._replace(inputs=tuple(inputs))
 
     def test_absolute_offsets_use_big_endian_driver_qwords(self) -> None:
+        """功能：在 ReferenceEncodingTest 测试类中确认逻辑 offset 以 driver 大端 qword 编码。
+        输入输出及副作用：输入为本测试构造的内存 fixture 和 CHECKER API，断言返回值或 ValidationError；不修改生产源码，临时目录由测试负责清理。
+        失败边界：断言未满足、预期异常未抛出或错误信息/坐标不符时测试失败，防止该契约回归。
+        """
         image = self.make_reference_image(16)
         CHECKER.put_field(image, 16, 21, 0x15555)
         self.assertEqual(bytes(image[:8]), bytes.fromhex("0000000155550000"))
 
     def test_overflow_is_fatal(self) -> None:
+        """功能：在 ReferenceEncodingTest 测试类中确认字段值溢出立即失败。
+        输入输出及副作用：输入为本测试构造的内存 fixture 和 CHECKER API，断言返回值或 ValidationError；不修改生产源码，临时目录由测试负责清理。
+        失败边界：断言未满足、预期异常未抛出或错误信息/坐标不符时测试失败，防止该契约回归。
+        """
         with self.assertRaisesRegex(CHECKER.ValidationError, "does not fit"):
             CHECKER.put_field(self.make_reference_image(8), 0, 4, 0x10)
 
     def test_zero_write_reserves_the_full_field_range(self) -> None:
+        """功能：在 ReferenceEncodingTest 测试类中确认零值写入仍占用完整字段范围。
+        输入输出及副作用：输入为本测试构造的内存 fixture 和 CHECKER API，断言返回值或 ValidationError；不修改生产源码，临时目录由测试负责清理。
+        失败边界：断言未满足、预期异常未抛出或错误信息/坐标不符时测试失败，防止该契约回归。
+        """
         image = self.make_reference_image(8)
         CHECKER.put_field(image, 0, 8, 0)
         with self.assertRaisesRegex(CHECKER.ValidationError, "overlap"):
             CHECKER.put_field(image, 0, 8, 1)
 
     def test_partial_zero_overlap_is_fatal_and_atomic(self) -> None:
+        """功能：在 ReferenceEncodingTest 测试类中确认部分重叠写入失败且 image/occupancy 原子不变。
+        输入输出及副作用：输入为本测试构造的内存 fixture 和 CHECKER API，断言返回值或 ValidationError；不修改生产源码，临时目录由测试负责清理。
+        失败边界：断言未满足、预期异常未抛出或错误信息/坐标不符时测试失败，防止该契约回归。
+        """
         image = self.make_reference_image(8)
         CHECKER.put_field(image, 0, 8, 0)
         payload_before = bytes(image)
@@ -1804,6 +2168,10 @@ class ReferenceEncodingTest(unittest.TestCase):
         self.assertEqual(tuple(image.occupancy), occupancy_before)
 
     def test_nonoverlap_width64_and_endian_behavior_is_preserved(self) -> None:
+        """功能：在 ReferenceEncodingTest 测试类中确认非重叠 64-bit 字段保持端序。
+        输入输出及副作用：输入为本测试构造的内存 fixture 和 CHECKER API，断言返回值或 ValidationError；不修改生产源码，临时目录由测试负责清理。
+        失败边界：断言未满足、预期异常未抛出或错误信息/坐标不符时测试失败，防止该契约回归。
+        """
         image = self.make_reference_image(16)
         CHECKER.put_field(image, 0, 4, 0xA)
         CHECKER.put_field(image, 4, 4, 0xB)
@@ -1812,10 +2180,18 @@ class ReferenceEncodingTest(unittest.TestCase):
         self.assertEqual(bytes(image[8:]), bytes.fromhex("0123456789abcdef"))
 
     def test_plain_bytearray_cannot_bypass_occupancy_tracking(self) -> None:
+        """功能：在 ReferenceEncodingTest 测试类中确认普通 bytearray 不能绕过 occupancy tracking。
+        输入输出及副作用：输入为本测试构造的内存 fixture 和 CHECKER API，断言返回值或 ValidationError；不修改生产源码，临时目录由测试负责清理。
+        失败边界：断言未满足、预期异常未抛出或错误信息/坐标不符时测试失败，防止该契约回归。
+        """
         with self.assertRaisesRegex(CHECKER.ValidationError, "occupancy"):
             CHECKER.put_field(bytearray(8), 0, 8, 0)
 
     def test_reference_encoder_is_independent_of_sv_mapping_placement(self) -> None:
+        """功能：在 ReferenceEncodingTest 测试类中确认 reference encoder 不依赖 SV mapping placement。
+        输入输出及副作用：输入为本测试构造的内存 fixture 和 CHECKER API，断言返回值或 ValidationError；不修改生产源码，临时目录由测试负责清理。
+        失败边界：断言未满足、预期异常未抛出或错误信息/坐标不符时测试失败，防止该契约回归。
+        """
         expected = CHECKER.build_golden_cases()
         saved_mappings = CHECKER.FIELD_MAPPINGS
         had_legacy_lookup = hasattr(CHECKER, "FIELD_BY_STEM")
@@ -1835,6 +2211,10 @@ class ReferenceEncodingTest(unittest.TestCase):
         self.assertEqual(actual, expected)
 
     def test_reference_validation_rejects_missing_duplicate_and_drift(self) -> None:
+        """功能：在 ReferenceEncodingTest 测试类中确认 reference 缺失/重复/漂移被拒绝。
+        输入输出及副作用：输入为本测试构造的内存 fixture 和 CHECKER API，断言返回值或 ValidationError；不修改生产源码，临时目录由测试负责清理。
+        失败边界：断言未满足、预期异常未抛出或错误信息/坐标不符时测试失败，防止该契约回归。
+        """
         references = self.require_checker_attribute("REFERENCE_FIELDS")
         validate_references = self.require_checker_attribute(
             "validate_reference_fields"
@@ -1865,6 +2245,10 @@ class ReferenceEncodingTest(unittest.TestCase):
                 )
 
     def test_destination_ip_profile_constants_are_checked_and_drive_placement(self) -> None:
+        """功能：在 ReferenceEncodingTest 测试类中确认 destination IP profile 常量同时校验并驱动 placement。
+        输入输出及副作用：输入为本测试构造的内存 fixture 和 CHECKER API，断言返回值或 ValidationError；不修改生产源码，临时目录由测试负责清理。
+        失败边界：断言未满足、预期异常未抛出或错误信息/坐标不符时测试失败，防止该契约回归。
+        """
         validate_profile = self.require_checker_attribute(
             "validate_profile_constants"
         )
@@ -1892,6 +2276,10 @@ class ReferenceEncodingTest(unittest.TestCase):
         )
 
     def test_every_golden_field_has_explicit_reference_placement(self) -> None:
+        """功能：在 ReferenceEncodingTest 测试类中确认每个 golden 字段都有显式 reference placement。
+        输入输出及副作用：输入为本测试构造的内存 fixture 和 CHECKER API，断言返回值或 ValidationError；不修改生产源码，临时目录由测试负责清理。
+        失败边界：断言未满足、预期异常未抛出或错误信息/坐标不符时测试失败，防止该契约回归。
+        """
         references = self.require_checker_attribute("REFERENCE_FIELDS")
         reference_stems = [reference.sv_stem for reference in references]
         self.assertEqual(len(set(reference_stems)), len(references))
@@ -1907,6 +2295,10 @@ class ReferenceEncodingTest(unittest.TestCase):
         original_put_named = CHECKER.put_named
 
         def record_put_named(image, stem, value):
+            """功能：在 ReferenceEncodingTest/test_every_golden_field_has_explicit_reference_placement/record_put_named 中记录 golden 构造期间每次 put_named 的 stem/value 供审计。
+            输入输出及副作用：输入参数为 image, stem, value，返回测试所需的 fixture/结果或更新局部状态；不写入仓库文件。
+            失败边界：属性缺失、fixture 格式非法、坐标越界或被测 API 拒绝时由断言/ValidationError 暴露。
+            """
             used_stems.append(stem)
             original_put_named(image, stem, value)
 
@@ -1929,6 +2321,10 @@ class ReferenceEncodingTest(unittest.TestCase):
         )
 
     def test_reference_cases_have_stable_contract(self) -> None:
+        """功能：在 ReferenceEncodingTest 测试类中确认 reference cases 的名称、长度和 payload 稳定。
+        输入输出及副作用：输入为本测试构造的内存 fixture 和 CHECKER API，断言返回值或 ValidationError；不修改生产源码，临时目录由测试负责清理。
+        失败边界：断言未满足、预期异常未抛出或错误信息/坐标不符时测试失败，防止该契约回归。
+        """
         cases = CHECKER.build_golden_cases()
         context_cases = cases["context"]
         self.assertEqual(
@@ -1966,6 +2362,10 @@ class ReferenceEncodingTest(unittest.TestCase):
         )
 
     def test_context_case_summaries_are_an_immutable_input_contract(self) -> None:
+        """功能：在 ReferenceEncodingTest 测试类中确认 context 摘要是不可变输入契约。
+        输入输出及副作用：输入为本测试构造的内存 fixture 和 CHECKER API，断言返回值或 ValidationError；不修改生产源码，临时目录由测试负责清理。
+        失败边界：断言未满足、预期异常未抛出或错误信息/坐标不符时测试失败，防止该契约回归。
+        """
         context_cases = CHECKER.build_golden_cases()["context"]
         self.assertEqual(CHECKER.GoldenCase._fields, ("name", "inputs", "payload"))
         for case in context_cases:
@@ -1995,6 +2395,10 @@ class ReferenceEncodingTest(unittest.TestCase):
         ])
 
     def test_body_masks_are_independent_exact_and_envelope_disjoint(self) -> None:
+        """功能：在 ReferenceEncodingTest 测试类中确认 body masks 独立、精确且不侵入 envelope。
+        输入输出及副作用：输入为本测试构造的内存 fixture 和 CHECKER API，断言返回值或 ValidationError；不修改生产源码，临时目录由测试负责清理。
+        失败边界：断言未满足、预期异常未抛出或错误信息/坐标不符时测试失败，防止该契约回归。
+        """
         masks = self.require_checker_attribute("BODY_MASKS")
         expected = {
             "cqc_create": (0x00000000001fffff, 0xff0fffffffffffff,
@@ -2043,6 +2447,10 @@ class ReferenceEncodingTest(unittest.TestCase):
                 self.assertTrue(all((a & b) == 0 for a, b in zip(envelope, body_mask)))
 
     def test_context_goldens_obey_body_masks_and_coordinate_translations(self) -> None:
+        """功能：在 ReferenceEncodingTest 测试类中确认 context goldens 遵守 body mask 和坐标转换。
+        输入输出及副作用：输入为本测试构造的内存 fixture 和 CHECKER API，断言返回值或 ValidationError；不修改生产源码，临时目录由测试负责清理。
+        失败边界：断言未满足、预期异常未抛出或错误信息/坐标不符时测试失败，防止该契约回归。
+        """
         validate = self.require_checker_attribute("validate_context_contract")
         validate(CHECKER.build_golden_cases()["context"])
         translations = self.require_checker_attribute("BODY_TRANSLATIONS")
@@ -2069,6 +2477,10 @@ class ReferenceEncodingTest(unittest.TestCase):
             )
 
     def test_qpc_traffic_class_projection_and_ecn_policy_are_enforced(self) -> None:
+        """功能：在 ReferenceEncodingTest 测试类中确认 QPC traffic class projection 与 ECN policy。
+        输入输出及副作用：输入为本测试构造的内存 fixture 和 CHECKER API，断言返回值或 ValidationError；不修改生产源码，临时目录由测试负责清理。
+        失败边界：断言未满足、预期异常未抛出或错误信息/坐标不符时测试失败，防止该契约回归。
+        """
         validate = self.require_checker_attribute("validate_context_contract")
         cases = CHECKER.build_golden_cases()["context"]
         for case, required_ecn in zip(cases[:3], (2, 0, 2)):
@@ -2102,6 +2514,10 @@ class ReferenceEncodingTest(unittest.TestCase):
                     validate(corrupted)
 
     def test_canonical_urc_semantics_drive_all_derived_fields(self) -> None:
+        """功能：在 ReferenceEncodingTest 测试类中确认 canonical URC semantics 驱动所有派生字段。
+        输入输出及副作用：输入为本测试构造的内存 fixture 和 CHECKER API，断言返回值或 ValidationError；不修改生产源码，临时目录由测试负责清理。
+        失败边界：断言未满足、预期异常未抛出或错误信息/坐标不符时测试失败，防止该契约回归。
+        """
         urc = CHECKER.build_golden_cases()["context"][2]
         inputs = {item.name: item.value for item in urc.inputs}
         expected_core = {
@@ -2180,6 +2596,10 @@ class ReferenceEncodingTest(unittest.TestCase):
         )
 
     def test_canonical_urc_common_handle_is_named_qpn(self) -> None:
+        """功能：在 ReferenceEncodingTest 测试类中确认 URC common handle 使用 qpn 名称。
+        输入输出及副作用：输入为本测试构造的内存 fixture 和 CHECKER API，断言返回值或 ValidationError；不修改生产源码，临时目录由测试负责清理。
+        失败边界：断言未满足、预期异常未抛出或错误信息/坐标不符时测试失败，防止该契约回归。
+        """
         urc = CHECKER.build_golden_cases()["context"][2]
         inputs = {item.name: item.value for item in urc.inputs}
 
@@ -2188,6 +2608,10 @@ class ReferenceEncodingTest(unittest.TestCase):
         self.assertNotIn("qp_id", inputs)
 
     def test_every_urc_semantic_input_is_coupled_to_payload(self) -> None:
+        """功能：在 ReferenceEncodingTest 测试类中确认每个 URC semantic input 都耦合 payload。
+        输入输出及副作用：输入为本测试构造的内存 fixture 和 CHECKER API，断言返回值或 ValidationError；不修改生产源码，临时目录由测试负责清理。
+        失败边界：断言未满足、预期异常未抛出或错误信息/坐标不符时测试失败，防止该契约回归。
+        """
         validate = self.require_checker_attribute("validate_context_contract")
         cases = CHECKER.build_golden_cases()["context"]
         urc = cases[2]
@@ -2209,6 +2633,10 @@ class ReferenceEncodingTest(unittest.TestCase):
                     validate(corrupted)
 
     def test_urc_accepts_optional_traffic_class_derived_summaries(self) -> None:
+        """功能：在 ReferenceEncodingTest 测试类中确认 URC 接受可选 traffic-class 派生摘要。
+        输入输出及副作用：输入为本测试构造的内存 fixture 和 CHECKER API，断言返回值或 ValidationError；不修改生产源码，临时目录由测试负责清理。
+        失败边界：断言未满足、预期异常未抛出或错误信息/坐标不符时测试失败，防止该契约回归。
+        """
         validate = self.require_checker_attribute("validate_context_contract")
         cases = CHECKER.build_golden_cases()["context"]
         urc = cases[2]
@@ -2225,6 +2653,10 @@ class ReferenceEncodingTest(unittest.TestCase):
             self.fail(f"valid derived summaries were rejected: {error}")
 
     def test_body_goldens_use_only_driver_supported_semantic_values(self) -> None:
+        """功能：在 ReferenceEncodingTest 测试类中确认 body goldens 只使用 driver 支持的语义值。
+        输入输出及副作用：输入为本测试构造的内存 fixture 和 CHECKER API，断言返回值或 ValidationError；不修改生产源码，临时目录由测试负责清理。
+        失败边界：断言未满足、预期异常未抛出或错误信息/坐标不符时测试失败，防止该契约回归。
+        """
         validate = self.require_checker_attribute("validate_context_contract")
         cases = CHECKER.build_golden_cases()["context"]
         supported = {
@@ -2314,6 +2746,10 @@ class ReferenceEncodingTest(unittest.TestCase):
                         validate(corrupted)
 
     def test_mrt_inputs_and_payload_fields_are_fully_coupled(self) -> None:
+        """功能：在 ReferenceEncodingTest 测试类中确认 MRT inputs 与 payload fields 完全耦合。
+        输入输出及副作用：输入为本测试构造的内存 fixture 和 CHECKER API，断言返回值或 ValidationError；不修改生产源码，临时目录由测试负责清理。
+        失败边界：断言未满足、预期异常未抛出或错误信息/坐标不符时测试失败，防止该契约回归。
+        """
         validate = self.require_checker_attribute("validate_context_contract")
         cases = CHECKER.build_golden_cases()["context"]
         by_name = {case.name: case for case in cases}
@@ -2367,6 +2803,10 @@ class ReferenceEncodingTest(unittest.TestCase):
                         validate(corrupted)
 
     def test_strict_golden_parser_rejects_all_structural_drift(self) -> None:
+        """功能：在 ReferenceEncodingTest 测试类中确认 strict golden parser 拒绝所有结构漂移。
+        输入输出及副作用：输入为本测试构造的内存 fixture 和 CHECKER API，断言返回值或 ValidationError；不修改生产源码，临时目录由测试负责清理。
+        失败边界：断言未满足、预期异常未抛出或错误信息/坐标不符时测试失败，防止该契约回归。
+        """
         parser = self.require_checker_attribute("parse_golden_text")
         rendered = CHECKER.render_golden(CHECKER.build_golden_cases()["context"])
         parsed = parser(rendered)
@@ -2390,6 +2830,10 @@ class ReferenceEncodingTest(unittest.TestCase):
                     parser(text)
 
     def test_qpc_sq_fields_use_driver_qword_at_byte_216(self) -> None:
+        """功能：在 ReferenceEncodingTest 测试类中确认 QPC SQ fields 使用 byte 216 driver qword。
+        输入输出及副作用：输入为本测试构造的内存 fixture 和 CHECKER API，断言返回值或 ValidationError；不修改生产源码，临时目录由测试负责清理。
+        失败边界：断言未满足、预期异常未抛出或错误信息/坐标不符时测试失败，防止该契约回归。
+        """
         offsets = {
             mapping.sv_stem: mapping.word_byte_offset
             for mapping in CHECKER.FIELD_MAPPINGS
@@ -2406,6 +2850,10 @@ class ReferenceEncodingTest(unittest.TestCase):
         self.assertEqual(qpc[216:224], bytes.fromhex("123456789abcdb80"))
 
     def test_sq_fields_and_golden_vectors_are_required(self) -> None:
+        """功能：在 ReferenceEncodingTest 测试类中确认 SQ fields 和 golden vectors 均为必需。
+        输入输出及副作用：输入为本测试构造的内存 fixture 和 CHECKER API，断言返回值或 ValidationError；不修改生产源码，临时目录由测试负责清理。
+        失败边界：断言未满足、预期异常未抛出或错误信息/坐标不符时测试失败，防止该契约回归。
+        """
         fields = CHECKER.parse_sq_field_mappings(CHECKER.SV_DEFS_PATH.read_text())
         self.assertIn("RDMA_SQ_WQE_QPN", fields)
         self.assertIn("RDMA_SQ_WQE_SIGNATURE", fields)
@@ -2450,6 +2898,10 @@ class ReferenceEncodingTest(unittest.TestCase):
         )
 
     def test_sq_opcodes_are_pinned_to_wr_h_enum(self) -> None:
+        """功能：在 ReferenceEncodingTest 测试类中确认 SQ opcodes 绑定 wr.h enum。
+        输入输出及副作用：输入为本测试构造的内存 fixture 和 CHECKER API，断言返回值或 ValidationError；不修改生产源码，临时目录由测试负责清理。
+        失败边界：断言未满足、预期异常未抛出或错误信息/坐标不符时测试失败，防止该契约回归。
+        """
         constants = CHECKER.parse_sv_constants(CHECKER.SV_DEFS_PATH.read_text())
         expected = {
             "RDMA_SQ_OPCODE_SEND": 1,
@@ -2465,6 +2917,10 @@ class ReferenceEncodingTest(unittest.TestCase):
         self.assertEqual({name: constants.get(name) for name in expected}, expected)
 
     def test_sq_masks_reject_reserved_bits(self) -> None:
+        """功能：在 ReferenceEncodingTest 测试类中确认 SQ masks 拒绝 reserved bits。
+        输入输出及副作用：输入为本测试构造的内存 fixture 和 CHECKER API，断言返回值或 ValidationError；不修改生产源码，临时目录由测试负责清理。
+        失败边界：断言未满足、预期异常未抛出或错误信息/坐标不符时测试失败，防止该契约回归。
+        """
         masks = CHECKER.parse_sv_masks(CHECKER.SV_MASKS_PATH.read_text())
         self.assertEqual(masks["RDMA_SQ_WQE_HEADER_MASK"][0], 0xEFFFFFFFFFFFFFFF)
         self.assertEqual(
@@ -2483,6 +2939,10 @@ class ReferenceEncodingTest(unittest.TestCase):
         )
 
     def test_sq_golden_cases_have_operation_specific_images(self) -> None:
+        """功能：在 ReferenceEncodingTest 测试类中确认 SQ golden case 按 operation 使用独立 image。
+        输入输出及副作用：输入为本测试构造的内存 fixture 和 CHECKER API，断言返回值或 ValidationError；不修改生产源码，临时目录由测试负责清理。
+        失败边界：断言未满足、预期异常未抛出或错误信息/坐标不符时测试失败，防止该契约回归。
+        """
         cases = CHECKER.parse_golden_text((CHECKER.GOLDEN_DIR / "sq.hex").read_text())
         by_name = {case.name: case for case in cases}
         self.assertGreaterEqual(len(cases), 18)
@@ -2499,6 +2959,10 @@ class ReferenceEncodingTest(unittest.TestCase):
         )
 
     def test_golden_summaries_list_every_participating_input(self) -> None:
+        """功能：在 ReferenceEncodingTest 测试类中确认 golden summary 列出每个参与输入。
+        输入输出及副作用：输入为本测试构造的内存 fixture 和 CHECKER API，断言返回值或 ValidationError；不修改生产源码，临时目录由测试负责清理。
+        失败边界：断言未满足、预期异常未抛出或错误信息/坐标不符时测试失败，防止该契约回归。
+        """
         cases = CHECKER.build_golden_cases()
         summaries = {
             case.name: case.summary
