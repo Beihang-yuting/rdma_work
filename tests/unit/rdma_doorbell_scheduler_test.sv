@@ -1,11 +1,314 @@
-// 目录：测试层 unit/rdma_doorbell_scheduler_test.sv。
-// 职责：验证 rdma_doorbell_scheduler_test 对应模块的接口、错误路径和边界行为。
-// 依赖：依赖被测 package、UVM 测试基类和必要的 mock/fixture。
-// 所有权与生命周期：测试对象只拥有本地 fixture；外部后端句柄由测试环境提供并在测试结束释放。
+// 目录：测试层 tests/unit。
+// 职责：验证 doorbell scheduler 的预检、分阶段 Host-memory 写、barrier、
+//   MMIO 截止时间、按 Function 串行化及每次调用 submission evidence 契约。
+// 依赖：rdma core 公开类型、UVM，rdma_mock_host_mem/rdma_mock_pcie、
+//   可控 factory 故障 wrapper 与调用 trace。
+// 所有权与生命周期：测试 phase 拥有本地 fixture 和断言证据；传给 DUT 的
+//   binding、mapping 和 adapter 均是测试生命周期内的非拥有引用。
 
-// 中文说明：rdma_doorbell_scheduler_test.sv 属于单元测试，覆盖对应模型、编码器或执行器契约。
-// 阅读提示：先看公开类型和接口，再看实现细节；失败路径应保持状态与资源所有权可追踪。
+// 设计说明：observer 只记录 scheduler 越过 MMIO 最后截止检查的次数，
+// 不在回调内分配、等待或反向调用 DUT，以精确隔离“准备进入 PCIe”边界。
+class rdma_doorbell_counting_observer
+  extends rdma_doorbell_submission_observer;
 
+  int unsigned calls;
+
+  // 功能：构造一个调用计数为零的 doorbell MMIO 边界 observer。
+  // 输入/输出及副作用：name 仅传给 uvm_object；将本地 calls 置零。
+  // 失败/边界：构造不访问 adapter/scheduler，不取得任何外部资源所有权。
+  function new(string name = "rdma_doorbell_counting_observer");
+    super.new(name);
+    calls = 0;
+  endfunction
+
+  // 功能：同步记录 scheduler 即将发起 PCIe MMIO 的一次可观察边界。
+  // 输入/输出及副作用：无输入和返回值；仅将本地 calls 加一。
+  // 失败/边界：回调不可失败，不分配、不等待、不取锁且不调用任何 service。
+  virtual function void before_mmio_maybe_visible();
+    calls++;
+  endfunction
+
+  // 功能：在独立测试场景之间清空 observer 计数，避免跨调用污染。
+  // 输入/输出及副作用：无输入和返回值；将本地 calls 置零。
+  // 失败/边界：重复调用幂等；不影响已返回的 observed result 或 DUT 状态。
+  function void clear();
+    calls = 0;
+  endfunction
+endclass
+
+// 设计说明：该 PCIe 替身让 DMA barrier 在整个 deadline 时刻完成，
+// 用于验证 barrier 成功后、PCIe MMIO 入口前的最后 deadline 拒绝。
+class rdma_doorbell_deadline_edge_pcie extends rdma_mock_pcie;
+  `uvm_object_utils(rdma_doorbell_deadline_edge_pcie)
+
+  time dma_delay;
+
+  // 功能：构造默认不延迟的 deadline-edge PCIe 测试替身。
+  // 输入/输出及副作用：name 传给父类；将本地 dma_delay 置零。
+  // 失败/边界：未配置 dma_delay 时与普通成功 barrier 等价，不接管 PCIe 资源。
+  function new(string name = "rdma_doorbell_deadline_edge_pcie");
+    super.new(name);
+    dma_delay = 0;
+  endfunction
+
+  // 功能：记录 DMA barrier，等待 dma_delay 后返回明确成功状态。
+  // 输入/输出及副作用：function_h 是非拥有路由值，status 输出直接构造的 OK；task 推进仿真时间。
+  // 失败/边界：dma_delay 达到请求 deadline 时，scheduler 必须在 MMIO 入口前返回 TIMEOUT。
+  virtual task dma_visibility_barrier(
+    rdma_function_handle function_h,
+    output rdma_status status
+  );
+    void'(record_call("dma_visibility_barrier", '0, '0, '0, '0,
+                      function_h));
+    #(dma_delay);
+    status = new("deadline_edge_dma_status");
+  endtask
+endclass
+
+// 设计说明：Host-memory 替身先执行真实 mock write，再打开
+//   status raw-factory 故障窗口并返回预构造失败，定位首个外部写后的构造降级。
+class rdma_doorbell_post_write_factory_mem extends rdma_mock_host_mem;
+  `uvm_object_utils(rdma_doorbell_post_write_factory_mem)
+
+  rdma_cmq_value_factory_fault_wrapper status_fault;
+  rdma_status injected_status;
+  bit wrong_type;
+  bit armed_once;
+
+  // 功能：构造未武装的 Host-memory 写后 factory 故障替身。
+  // 输入/输出及副作用：name 传给父类；清空 status_fault/injected_status 并将模式置默认。
+  // 失败/边界：未调用 arm_after_next_write 时不注入故障，外部 mapping 仍由父类 mock 管理。
+  function new(string name = "rdma_doorbell_post_write_factory_mem");
+    super.new(name);
+    status_fault = null;
+    injected_status = null;
+    wrong_type = 1'b0;
+    armed_once = 1'b0;
+  endfunction
+
+  // 功能：配置下一次成功写后的 status raw-factory 模式和返回失败值。
+  // 输入/输出及副作用：fault、response、return_wrong_type 为非拥有输入；保存本地测试配置。
+  // 失败/边界：fault 或 response 为 null 时后续 write 不武装 factory，防止测试 fixture 自身 fatal。
+  function void arm_after_next_write(
+    rdma_cmq_value_factory_fault_wrapper fault,
+    rdma_status response,
+    bit return_wrong_type
+  );
+    status_fault = fault;
+    injected_status = response;
+    wrong_type = return_wrong_type;
+    armed_once = (fault != null && response != null);
+  endfunction
+
+  // 功能：执行父类 Host-memory write，在其真实记录/写入完成后注入一次状态构造故障。
+  // 输入/输出及副作用：mapping、offset、data 传给父类；返回 injected_status 并武装 status_fault。
+  // 失败/边界：父类 write 失败或未武装时原样返回；故障只消费一次。
+  virtual function rdma_status write(
+    rdma_dma_mapping mapping,
+    longint unsigned offset,
+    byte data[]
+  );
+    rdma_status status;
+
+    status = super.write(mapping, offset, data);
+    if (status != null && status.ok() && armed_once) begin
+      armed_once = 1'b0;
+      status_fault.arm(wrong_type);
+      return injected_status;
+    end
+    return status;
+  endfunction
+endclass
+
+// 设计说明：PCIe 替身在记录 MMIO 后才打开指定 raw-factory
+// 故障，使 scheduler 必须保留 MMIO_VISIBLE 高水位并用直接构造降级。
+class rdma_doorbell_post_mmio_factory_pcie extends rdma_mock_pcie;
+  `uvm_object_utils(rdma_doorbell_post_mmio_factory_pcie)
+
+  rdma_cmq_value_factory_fault_wrapper post_mmio_fault;
+  bit wrong_type;
+  bit armed_once;
+  rdma_status success_status;
+
+  // 功能：构造未武装的 MMIO 后 factory 故障 PCIe 替身，预先直接构造 OK 状态。
+  // 输入/输出及副作用：name 传给父类；初始化本地 fault 配置和 success_status。
+  // 失败/边界：成功状态在 factory 武装前建立；本类不取得 function_h 所有权。
+  function new(string name = "rdma_doorbell_post_mmio_factory_pcie");
+    super.new(name);
+    post_mmio_fault = null;
+    wrong_type = 1'b0;
+    armed_once = 1'b0;
+    success_status = new("post_mmio_success_status");
+  endfunction
+
+  // 功能：配置下一次 MMIO 记录后武装的 raw-factory 故障。
+  // 输入/输出及副作用：fault 为非拥有 wrapper，return_wrong_type 选择 null/错误类型；更新本地状态。
+  // 失败/边界：fault 为 null 时保持未武装；重复配置只覆盖下一次模式。
+  function void arm_after_next_mmio(
+    rdma_cmq_value_factory_fault_wrapper fault,
+    bit return_wrong_type
+  );
+    post_mmio_fault = fault;
+    wrong_type = return_wrong_type;
+    armed_once = (fault != null);
+  endfunction
+
+  // 功能：记录一次成功 PCIe MMIO，再武装后续结果/status 构造故障。
+  // 输入/输出及副作用：function_h、address、data 被记录；status 返回预构造 OK 值；可更新 fault 状态。
+  // 失败/边界：故障只消费一次；武装发生在 MMIO 记录后，不得被分类为未提交。
+  virtual task mmio_write(
+    rdma_function_handle function_h,
+    rdma_bar_addr_t address,
+    byte data[],
+    output rdma_status status
+  );
+    void'(record_call("mmio_write", '0, '0, '0, '0, function_h,
+                      address, data));
+    status = success_status;
+    if (armed_once) begin
+      armed_once = 1'b0;
+      post_mmio_fault.arm(wrong_type);
+    end
+  endtask
+endclass
+
+// 设计说明：该 descriptor 只在公共入口的 snapshot 阶段返回 null，
+// 证明失败前已冻结声明 dependency_count，且不会误报外部可见性。
+class rdma_doorbell_snapshot_fault_desc extends rdma_doorbell_desc;
+  `uvm_object_utils(rdma_doorbell_snapshot_fault_desc)
+
+  // 功能：构造一个仅覆盖 clone 的 descriptor snapshot 故障 fixture。
+  // 输入/输出及副作用：name 传给父类；其他字段由测试通过 copy 填充。
+  // 失败/边界：构造本身成功；只有后续 clone 被故意拒绝。
+  function new(string name = "rdma_doorbell_snapshot_fault_desc");
+    super.new(name);
+  endfunction
+
+  // 功能：将入口 descriptor snapshot 故障注入为 null clone 结果。
+  // 输入/输出及副作用：无输入；返回 null，不修改 source descriptor。
+  // 失败/边界：该故障仅用于测试 snapshot 拒绝，不能作为有效复制值消费。
+  virtual function uvm_object clone();
+    return null;
+  endfunction
+endclass
+
+// 设计说明：三个 hostile value 在 clone 时返回 null 并计数，
+// 用于证明 legacy 投影只按显式字段直接复制 envelope 及其嵌套值。
+class rdma_doorbell_clone_fault_result extends rdma_doorbell_result;
+  `uvm_object_utils(rdma_doorbell_clone_fault_result)
+
+  local static int unsigned clone_calls;
+
+  // 功能：构造一个只在 clone 时故障的 doorbell result fixture。
+  // 输入/输出及副作用：name 传给父类；不改写公共结果默认字段。
+  // 失败/边界：构造不触发故障，clone 才返回 null；不接管嵌套 handle。
+  function new(string name = "rdma_doorbell_clone_fault_result");
+    super.new(name);
+  endfunction
+
+  // 功能：记录并拒绝一次 doorbell result clone，检测不应出现的 clone 依赖。
+  // 输入/输出及副作用：无输入；clone_calls 加一并返回 null。
+  // 失败/边界：返回 null 是故意故障；生产 nonfatal 投影不得调用本函数。
+  virtual function uvm_object clone();
+    clone_calls++;
+    return null;
+  endfunction
+
+  // 功能：清空 doorbell result clone 调用计数，用于隔离投影场景。
+  // 输入/输出及副作用：无输入和返回值；只写静态 clone_calls。
+  // 失败/边界：重复调用幂等，不改变已构造结果字段。
+  static function void clear_clone_calls();
+    clone_calls = 0;
+  endfunction
+
+  // 功能：返回当前 doorbell result clone 故障入口被调用的次数。
+  // 输入/输出及副作用：无输入；返回 clone_calls，不修改任何对象。
+  // 失败/边界：未发生 clone 时返回零；计数仅是测试证据。
+  static function int unsigned get_clone_calls();
+    return clone_calls;
+  endfunction
+endclass
+
+// 设计说明：该 hostile status 只禁止 clone 并记录调用次数，
+//   用于证明 legacy status 投影依赖显式标量复制，不依赖 UVM clone。
+class rdma_doorbell_clone_fault_status extends rdma_status;
+  `uvm_object_utils(rdma_doorbell_clone_fault_status)
+
+  local static int unsigned clone_calls;
+
+  // 功能：构造一个只在 clone 时故障的 status fixture。
+  // 输入/输出及副作用：name 传给父类；公共 status 字段保持可由测试显式填充。
+  // 失败/边界：构造不触发 clone 故障，不取得 adapter 或 scheduler 资源。
+  function new(string name = "rdma_doorbell_clone_fault_status");
+    super.new(name);
+  endfunction
+
+  // 功能：记录并拒绝一次 status clone，检测 legacy 投影的 clone 依赖。
+  // 输入/输出及副作用：无输入；clone_calls 加一并返回 null。
+  // 失败/边界：返回 null 是测试注入；生产投影必须绕开本函数且不产生 UVM fatal。
+  virtual function uvm_object clone();
+    clone_calls++;
+    return null;
+  endfunction
+
+  // 功能：清空 status clone 故障调用计数。
+  // 输入/输出及副作用：无输入和返回值；只将静态 clone_calls 置零。
+  // 失败/边界：重复调用幂等，不改写任何 status 值。
+  static function void clear_clone_calls();
+    clone_calls = 0;
+  endfunction
+
+  // 功能：读取 status clone 故障入口的调用次数。
+  // 输入/输出及副作用：无输入；返回 clone_calls，不修改状态。
+  // 失败/边界：未调用 clone 时返回零，计数不表示业务状态成功。
+  static function int unsigned get_clone_calls();
+    return clone_calls;
+  endfunction
+endclass
+
+// 设计说明：该 hostile envelope 拒绝 outer clone，使测试能分辨
+//   try_project_legacy 是否错误复制整个 observed 对象。
+class rdma_doorbell_clone_fault_submission_result
+  extends rdma_doorbell_submission_result;
+  `uvm_object_utils(rdma_doorbell_clone_fault_submission_result)
+
+  local static int unsigned clone_calls;
+
+  // 功能：构造一个 clone 恒失败的 observed envelope fixture。
+  // 输入/输出及副作用：name 传给父类；其他 envelope 字段由测试显式配置。
+  // 失败/边界：构造本身不失败；只有 clone 入口故意返回 null。
+  function new(
+    string name = "rdma_doorbell_clone_fault_submission_result"
+  );
+    super.new(name);
+  endfunction
+
+  // 功能：记录并拒绝 observed envelope clone，验证 legacy 投影不复制 outer 对象。
+  // 输入/输出及副作用：无输入；clone_calls 加一并返回 null。
+  // 失败/边界：故意返回 null；try_project_legacy 必须仍非致命完成。
+  virtual function uvm_object clone();
+    clone_calls++;
+    return null;
+  endfunction
+
+  // 功能：清空 observed envelope clone 调用计数。
+  // 输入/输出及副作用：无输入和返回值；只写静态 clone_calls。
+  // 失败/边界：重复清空幂等，不影响 envelope 中已设置的 effect/status。
+  static function void clear_clone_calls();
+    clone_calls = 0;
+  endfunction
+
+  // 功能：读取 observed envelope clone 故障入口的调用次数。
+  // 输入/输出及副作用：无输入；返回 clone_calls，不改写 fixture。
+  // 失败/边界：未调用 clone 时返回零；不用于推断任何 submission effect。
+  static function int unsigned get_clone_calls();
+    return clone_calls;
+  endfunction
+endclass
+
+// 设计说明：该 PCIe 替身只阻塞指定 Function UID 和方法的一次执行点，
+//   以可控 release 验证总 deadline、Function lock token 和跨 Function 独立性。
+//   它只记录调用并保存测试控制位，不拥有 function handle 或 scheduler。
 class rdma_doorbell_blocking_pcie extends rdma_mock_pcie;
   `uvm_object_utils(rdma_doorbell_blocking_pcie)
 
@@ -16,9 +319,9 @@ class rdma_doorbell_blocking_pcie extends rdma_mock_pcie;
   bit release_barrier;
   int unsigned blocked_call_count;
 
-  // 功能：构造 rdma_doorbell_blocking_pcie，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：blocked_function_uid=0；blocked_method="dma_visibility_barrier"；block_enabled=1'b0；barrier_entered=1'b0；release_barrier=1'b0；blocked_call_count=0。
-  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
-  // 失败/边界：rdma_doorbell_blocking_pcie 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
+  // 功能：构造默认未武装的 PCIe 阻塞 fixture，默认目标为 DMA barrier。
+  // 输入/输出及副作用：name 传给父类；清零 UID、入口证据、release 位和计数。
+  // 失败/边界：block_enabled=0 时所有 PCIe 调用立即完成；本类不接管 adapter 资源。
   function new(string name = "rdma_doorbell_blocking_pcie");
     super.new(name);
     blocked_function_uid = 0;
@@ -29,9 +332,10 @@ class rdma_doorbell_blocking_pcie extends rdma_mock_pcie;
     blocked_call_count = 0;
   endfunction
 
-  // 功能：在 rdma_doorbell_blocking_pcie 中，block_selected_call 在测试指定的 PCIe 调用点阻塞，直到 release 事件到达，以验证并发截止时间和顺序保证。
-  // 输入/输出及副作用：method_name（输入）、function_h（输入）；block_selected_call 驱动下游事务；函数返回 无直接返回值，不取得调用方资源所有权。
-  // 失败/边界：block_selected_call 异常完成由下游接口或 UVM 报告机制发布；该路径不隐式重试，也不转移未声明资源。
+  // 功能：当方法名和 Function UID 同时命中配置时，阻塞至 release_barrier。
+  // 输入/输出及副作用：method_name 和非拥有 function_h 为输入；命中时置入口位并计数。
+  // 失败/边界：未武装、方法/UID 不匹配或 function_h=null 时不等待；
+  //   命中后必须由测试或 watchdog 置 release_barrier，否则 task 持续阻塞。
   protected task block_selected_call(
     string method_name,
     rdma_function_handle function_h
@@ -45,9 +349,9 @@ class rdma_doorbell_blocking_pcie extends rdma_mock_pcie;
     end
   endtask
 
-  // 功能：在 rdma_doorbell_blocking_pcie 中，dma_visibility_barrier 在截止时间内执行 DMA 可见性或 MMIO 顺序屏障，确保 doorbell 之前的数据写入已按序可见。
-  // 输入/输出及副作用：function_h（输入）、status（输出）；dma_visibility_barrier 驱动下游事务，并写入 status；函数返回 无直接返回值，不取得调用方资源所有权。
-  // 失败/边界：dma_visibility_barrier 失败或超时通过 status 明确发布；该路径不隐式重试，也不转移未声明资源。
+  // 功能：记录 DMA visibility barrier，先消费注入失败，否则在选中点可控阻塞。
+  // 输入/输出及副作用：function_h 用于 trace 与匹配；status 输出注入失败或新建 OK 值。
+  // 失败/边界：take_failure 命中时立即返回且不阻塞；选中阻塞时由 scheduler deadline 取消。
   virtual task dma_visibility_barrier(
     rdma_function_handle function_h,
     output rdma_status status
@@ -61,9 +365,9 @@ class rdma_doorbell_blocking_pcie extends rdma_mock_pcie;
     status = rdma_status::success();
   endtask
 
-  // 功能：在 rdma_doorbell_blocking_pcie 中，mmio_ordering_barrier 在截止时间内执行 DMA 可见性或 MMIO 顺序屏障，确保 doorbell 之前的数据写入已按序可见。
-  // 输入/输出及副作用：function_h（输入）、status（输出）；mmio_ordering_barrier 驱动下游事务，并写入 status；函数返回 无直接返回值，不取得调用方资源所有权。
-  // 失败/边界：mmio_ordering_barrier 失败或超时通过 status 明确发布；该路径不隐式重试，也不转移未声明资源。
+  // 功能：记录 MMIO ordering barrier，先消费注入失败，否则在选中点可控阻塞。
+  // 输入/输出及副作用：function_h 用于 trace 与匹配；status 输出注入失败或新建 OK 值。
+  // 失败/边界：take_failure 命中时立即返回且不阻塞；选中阻塞时由 scheduler deadline 取消。
   virtual task mmio_ordering_barrier(
     rdma_function_handle function_h,
     output rdma_status status
@@ -77,9 +381,9 @@ class rdma_doorbell_blocking_pcie extends rdma_mock_pcie;
     status = rdma_status::success();
   endtask
 
-  // 功能：在 rdma_doorbell_blocking_pcie 中，mmio_write 把请求数据写入指定后端并保留返回状态；只有写入成功才允许本地游标继续推进。
-  // 输入/输出及副作用：function_h（输入）、address（输入）、data（输入）、status（输出）；mmio_write 驱动下游事务，并写入 status；函数返回 无直接返回值，不取得调用方资源所有权。
-  // 失败/边界：mmio_write 遇到后端拒绝、范围溢出或 DMA 权限不足时保留失败证据，不推进本地游标。
+  // 功能：记录 MMIO address/data，先消费注入失败，否则在选中点可控阻塞。
+  // 输入/输出及副作用：function_h、address、data 写入 trace；status 输出注入失败或 OK。
+  // 失败/边界：take_failure 命中时不进入阻塞；阻塞后若未释放，scheduler 必须按 deadline 结束。
   virtual task mmio_write(
     rdma_function_handle function_h,
     rdma_bar_addr_t address,
@@ -96,20 +400,23 @@ class rdma_doorbell_blocking_pcie extends rdma_mock_pcie;
   endtask
 endclass
 
+// 设计说明：主测试将 value-copy、预检、adapter 失败、deadline/锁并发和
+//   observed effect 放在同一 fixture 图中，共用身份、mapping 与 trace 以检查恢复后不污染。
+//   各辅助函数只构造值或发布断言，DUT 和 adapter 生命周期由 run_phase 管理。
 class rdma_doorbell_scheduler_test extends uvm_test;
   `uvm_component_utils(rdma_doorbell_scheduler_test)
 
-  // 功能：构造 rdma_doorbell_scheduler_test，调用 super.new 建立 UVM 层级对象；外部依赖字段保持未绑定，后续由 configure/build/activate 明确注入。
-  // 输入/输出及副作用：name、parent（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
-  // 失败/边界：rdma_doorbell_scheduler_test 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
+  // 功能：构造 doorbell scheduler UVM 单元测试组件。
+  // 输入/输出及副作用：name 和 parent 传给 uvm_test；fixture 延迟到 run_phase 创建。
+  // 失败/边界：parent 可为 null 以作为顶层测试；构造不配置 DUT 也不取得 adapter 所有权。
   function new(string name = "rdma_doorbell_scheduler_test",
                uvm_component parent = null);
     super.new(name, parent);
   endfunction
 
-  // 功能：在 rdma_doorbell_scheduler_test 中，expect_status 在测试中执行 expect_status 断言，比较输入结果与期望状态并报告可定位的失败信息。
-  // 输入/输出及副作用：label（输入）、status（输入）、expected（输入）；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
-  // 失败/边界：测试函数 expect_status 缺少前置对象时报告断言错误，并停止依赖该对象的后续检查。
+  // 功能：断言 status 非空且 code 精确等于 expected，并附加可定位 label。
+  // 输入/输出及副作用：label/status/expected 为只读输入；不返回值，偏差发布 UVM_ERROR。
+  // 失败/边界：status=null 时只报“null status”并立即返回，避免后续解引用。
   function automatic void expect_status(
     string label,
     rdma_status status,
@@ -125,10 +432,90 @@ class rdma_doorbell_scheduler_test extends uvm_test;
                            status.code.name(), status.convert2string()))
   endfunction
 
-  // 功能：make_binding 创建独立的 rdma_function_binding；根据 name、function_uid、function_id、generation、bar_base 设置字段 binding、binding.function_uid、binding.global_function_id、binding.generation、pcie.bdf、base.value、size、enabled、binding.notify_bar_id、notify_base.value，返回对象仅由调用方持有，不转移外部资源所有权。
-  // 输入/输出及副作用：name（输入）、function_uid（输入）、function_id（输入）、generation（输入）、bar_base（输入）；输入字段被复制到返回值或
-  //   output；生成结果与输入隔离，不隐式修改调用方对象。
-  // 失败/边界：make_binding 的结果直接由 return binding 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
+  // 功能：直接构造指定 code/message 的测试 status，使 raw-factory 故障窗口内的 fixture 不触发 typed factory fatal。
+  // 输入/输出及副作用：code、message 为输入；返回本函数直接 new 且填充分类/严重度的独立 status。
+  // 失败/边界：不调用 type_id::create/clone；未知 code 的 category 依据 rdma_status::category_for 保守计算。
+  function automatic rdma_status make_direct_status(
+    rdma_status_code_e code,
+    string message
+  );
+    rdma_status status;
+
+    status = new("doorbell_direct_test_status");
+    status.category = rdma_status::category_for(code);
+    status.code = code;
+    status.severity = (code == RDMA_SC_OK) ? RDMA_SEVERITY_INFO
+                                           : RDMA_SEVERITY_ERROR;
+    status.message = message;
+    return status;
+  endfunction
+
+  // 功能：统一断言 observed scheduler 的非空、effect、入口 dependency 数、observer 和 detached 输出契约。
+  // 输入/输出及副作用：label/result/expected_effect/expected_dependencies、
+  //   observer/call count/desc/source_status/expect_doorbell 为只读输入；仅发布断言。
+  // 失败/边界：result/status 为 null 时先报错并停止解引用；失败要求
+  //   doorbell_result=null，成功要求其与 desc 句柄隔离。
+  function automatic void expect_observed_contract(
+    string label,
+    rdma_doorbell_submission_result result,
+    rdma_submission_effect_e expected_effect,
+    int unsigned expected_dependencies,
+    rdma_doorbell_counting_observer observer,
+    int unsigned expected_observer_calls,
+    rdma_doorbell_desc desc,
+    rdma_status source_status,
+    bit expect_doorbell
+  );
+    if (result == null) begin
+      `uvm_error(label, "scheduler returned a null observed envelope")
+      return;
+    end
+    if (result.status == null) begin
+      `uvm_error(label, "observed envelope returned a null status")
+      return;
+    end
+    if (result.submission_effect != expected_effect)
+      `uvm_error(label,
+                 $sformatf("expected effect %s, got %s",
+                           expected_effect.name(),
+                           result.submission_effect.name()))
+    if (result.dependency_count != expected_dependencies)
+      `uvm_error(label,
+                 $sformatf("expected dependency_count=%0d, got %0d",
+                           expected_dependencies, result.dependency_count))
+    if (result.before_mmio_maybe_visible_called !=
+        (expected_observer_calls != 0))
+      `uvm_error(label, "observer-called flag disagrees with expected edge")
+    if (observer != null && observer.calls != expected_observer_calls)
+      `uvm_error(label,
+                 $sformatf("observer calls=%0d, expected %0d",
+                           observer.calls, expected_observer_calls))
+    if (source_status != null && result.status == source_status)
+      `uvm_error(label, "observed status aliases the adapter/source status")
+
+    if (expect_doorbell) begin
+      if (result.doorbell_result == null) begin
+        `uvm_error(label, "successful observed call omitted doorbell result")
+      end
+      else if (desc == null ||
+               result.doorbell_result.function_h == null ||
+               result.doorbell_result.target_h == null ||
+               result.doorbell_result.function_h == desc.function_h ||
+               result.doorbell_result.target_h == desc.target_h) begin
+        `uvm_error(label, "observed doorbell result is incomplete or aliased")
+      end
+    end
+    else if (result.doorbell_result != null) begin
+      `uvm_error(label, "failed observed call published a doorbell result")
+    end
+  endfunction
+
+  // 功能：构造 active PF binding fixture，填充稳定 Function identity、BAR0 notify 窗口、
+  //   queue DMA authority、中断向量和必需 capability。
+  // 输入/输出及副作用：name/function_uid/function_id/generation/bar_base 被复制；
+  //   返回新 binding，其 BDF bus 取 function_id 低 8 位，不修改任何输入对象。
+  // 失败/边界：factory 必须返回非空 binding；legacy identity 配置失败会报
+  //   UVM_ERROR，本辅助函数不替 DUT 执行输入合法性检查。
   function automatic rdma_function_binding make_binding(
     string name,
     longint unsigned function_uid,
@@ -186,9 +573,10 @@ class rdma_doorbell_scheduler_test extends uvm_test;
     return binding;
   endfunction
 
-  // 功能：make_target 创建独立的 rdma_handle；根据 name、function_h、kind、object_id 设置字段 target、target.kind、target.function_uid、target.object_id、target.generation，返回对象仅由调用方持有，不转移外部资源所有权。
-  // 输入/输出及副作用：name（输入）、function_h（输入）、kind（输入）、object_id（输入）；make_target 读取 name、function_h、kind、object_id 并使用字段 target、target.kind、target.function_uid、target.object_id、target.generation；函数返回 rdma_handle，不取得调用方资源所有权。
-  // 失败/边界：make_target 的结果直接由 return target 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
+  // 功能：为指定 Function 构造 kind/object_id/generation 一致的目标资源 handle。
+  // 输入/输出及副作用：name/kind/object_id 直接填充；从非拥有 function_h 复制 UID 和
+  //   generation；返回新 rdma_handle。
+  // 失败/边界：function_h 或 factory 结果为 null 会使 fixture 无法构造；函数不过滤 kind/object_id。
   function automatic rdma_handle make_target(
     string name,
     rdma_function_handle function_h,
@@ -204,10 +592,10 @@ class rdma_doorbell_scheduler_test extends uvm_test;
     return target;
   endfunction
 
-  // 功能：make_image 根据 name、function_h、relative_offset、payload、target_kind 生成或检查硬件镜像字段，保持布局、端序和保留位约束一致。
-  // 输入/输出及副作用：name（输入）、function_h（输入）、relative_offset（输入）、payload（输入）、target_kind（输入）；输入字段被复制到返回值或
-  //   output；生成结果与输入隔离，不隐式修改调用方对象。
-  // 失败/边界：make_image 先检查 target_kind == RDMA_HW_TARGET_BAR，再返回 image；拒绝分支不提交部分状态，也不隐式重试。
+  // 功能：构造 big-endian、8-byte aligned doorbell image，并标记 Function generation 与写目标类型。
+  // 输入/输出及副作用：深拷贝 payload 到新 image.bytes；复制 function_h.generation；
+  //   target_kind=BAR 时把 relative_offset 写入 bar_target。
+  // 失败/边界：function_h/factory 结果必须非空；非 BAR 目标不填 bar_target，长度和对齐由 DUT 预检。
   function automatic rdma_hw_image make_image(
     string name,
     rdma_function_handle function_h,
@@ -230,9 +618,11 @@ class rdma_doorbell_scheduler_test extends uvm_test;
     return image;
   endfunction
 
-  // 功能：make_desc 创建独立的 rdma_doorbell_desc；根据 name、binding 设置字段 desc、function_h、desc.kind、desc.function_h、desc.target_h、desc.notify_bar_id、desc.relative_offset、desc.width、desc.endian、desc.payload_image，返回对象仅由调用方持有，不转移外部资源所有权。
-  // 输入/输出及副作用：name（输入）、binding（输入）；make_desc 读取 name、binding 并使用字段 desc、function_h、desc.kind、desc.function_h、desc.target_h、desc.notify_bar_id、desc.relative_offset、desc.width；函数返回 rdma_doorbell_desc，不取得调用方资源所有权。
-  // 失败/边界：make_desc 的结果直接由 return desc 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
+  // 功能：从 binding 构造默认 RQ doorbell descriptor，含 8-byte payload、DMA+MMIO barrier
+  //   策略与总 100ns deadline，初始不含 dependency。
+  // 输入/输出及副作用：name 用于对象命名；从非拥有 binding 复制 Function handle、
+  //   notify BAR 和 generation；返回新 desc 及其自有 payload/target 值。
+  // 失败/边界：binding/factory 结果必须非空；该辅助函数只生成合法基线，故障由调用方修改注入。
   function automatic rdma_doorbell_desc make_desc(
     string name,
     rdma_function_binding binding
@@ -263,10 +653,10 @@ class rdma_doorbell_scheduler_test extends uvm_test;
     return desc;
   endfunction
 
-  // 功能：make_dependency 创建独立的 rdma_doorbell_dependency；根据 name、dependency_id、stage、mapping、relative_offset、function_h、value 设置字段 payload、dependency、dependency.dependency_id、dependency.stage、dependency.mapping、dependency.relative_offset、dependency.image、dependency.ready，返回对象仅由调用方持有，不转移外部资源所有权。
-  // 输入/输出及副作用：name（输入）、dependency_id（输入）、stage（输入）、mapping（输入）、relative_offset（输入）、function_h（输入）、value（输入）；输入字段被复制到返回值或
-  //   output；生成结果与输入隔离，不隐式修改调用方对象。
-  // 失败/边界：make_dependency 的结果直接由 return dependency 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
+  // 功能：构造 ready dependency fixture，其 8-byte backing image 从 value 开始递增。
+  // 输入/输出及副作用：dependency_id/stage/relative_offset 直接填充；mapping 作非拥有引用；
+  //   function_h 提供 image generation；返回新 dependency 和独立 image。
+  // 失败/边界：function_h/factory 结果必须非空；函数不检查 mapping 权限、范围或 stage 合法性。
   function automatic rdma_doorbell_dependency make_dependency(
     string name,
     longint unsigned dependency_id,
@@ -291,9 +681,10 @@ class rdma_doorbell_scheduler_test extends uvm_test;
     return dependency;
   endfunction
 
-  // 功能：在 rdma_doorbell_scheduler_test 中，add_two_dependencies 将输入对象登记或挂接到当前集合/依赖图，并同步维护对应账本和生命周期引用。
-  // 输入/输出及副作用：desc（输入）、mapping（输入）、function_h（输入）；add_two_dependencies 可能更新本对象明确拥有的状态；函数返回 void，不取得调用方资源所有权。
-  // 失败/边界：add_two_dependencies 无返回值，仅执行 queue_dependency=make_dependency(、payload_dependency=make_dependency(；调用方须保证前置依赖已经绑定，函数不自动重试或接管外部资源。
+  // 功能：向 desc 追加一个 queue-context 和一个 payload dependency，故意按反 stage 顺序插入。
+  // 输入/输出及副作用：desc.dependencies 增加两项；mapping/function_h 仅用于构造子值。
+  // 失败/边界：desc、mapping 和 function_h 必须非空；本函数不清空已有 dependency，
+  //   故调用次数会累加声明队列长度。
   function automatic void add_two_dependencies(
     rdma_doorbell_desc desc,
     rdma_dma_mapping mapping,
@@ -309,15 +700,14 @@ class rdma_doorbell_scheduler_test extends uvm_test;
       "payload_dependency", 64'd1, RDMA_DB_DEP_PAYLOAD,
       mapping, 8, function_h, 8'ha0
     );
-    // Deliberately interleaved: the scheduler must stage-sort while retaining
-    // caller order within each stage.
+    // 故意交错声明：scheduler 必须按 stage 排序，同时保留每个 stage 内的 caller 顺序。
     desc.dependencies.push_back(queue_dependency);
     desc.dependencies.push_back(payload_dependency);
   endfunction
 
-  // 功能：在 rdma_doorbell_scheduler_test 中，clear_observation 按 owner、generation 和幂等规则释放/隔离记录，并同步删除其账本引用。
-  // 输入/输出及副作用：mem（输入）、pcie（输入）、trace（输入）；输入 action/epoch/handle 决定迁移目标；成功时更新状态或恢复证据，外部资源仍由其拥有者管理。
-  // 失败/边界：clear_observation 发现 owner/generation 不匹配、记录未知或重复释放时返回错误或幂等结果，不重新激活旧句柄。
+  // 功能：清空 Host-memory、PCIe 各自调用队列与共享 trace，隔离后续场景。
+  // 输入/输出及副作用：mem/pcie/trace 为测试拥有 fixture；函数原地删除三组观测记录。
+  // 失败/边界：重复调用幂等；任一输入为 null 会使 fixture 解引用失败，不清理 adapter 故障队列。
   function automatic void clear_observation(
     rdma_mock_host_mem mem,
     rdma_mock_pcie pcie,
@@ -328,9 +718,9 @@ class rdma_doorbell_scheduler_test extends uvm_test;
     trace.clear();
   endfunction
 
-  // 功能：在 rdma_doorbell_scheduler_test 中，expect_no_side_effects 在测试中执行 expect_no_side_effects 断言，比较输入结果与期望状态并报告可定位的失败信息。
-  // 输入/输出及副作用：label（输入）、mem（输入）、pcie（输入）、trace（输入）；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
-  // 失败/边界：测试函数 expect_no_side_effects 缺少前置对象时报告断言错误，并停止依赖该对象的后续检查。
+  // 功能：断言当前场景未留下任何 Host-memory、PCIe 或共享 trace 调用。
+  // 输入/输出及副作用：label 用于报错；mem/pcie/trace 只读；发现记录时发布 UVM_ERROR。
+  // 失败/边界：函数不自动清空记录；任一 fixture 为 null 时无法执行检查。
   function automatic void expect_no_side_effects(
     string label,
     rdma_mock_host_mem mem,
@@ -342,10 +732,10 @@ class rdma_doorbell_scheduler_test extends uvm_test;
       `uvm_error(label, "preflight failure caused adapter side effects")
   endfunction
 
-  // 功能：在 rdma_doorbell_scheduler_test 中，expect_rejected 在测试中执行 expect_rejected 断言，比较输入结果与期望状态并报告可定位的失败信息。
-  // 输入/输出及副作用：label（输入）、scheduler（输入）、binding（输入）、desc（输入）、expected（输入）、mem（输入）、pcie（输入）、trace（输入）；fixture/输入由测试调用方提供；执行时会产生
-  //   UVM assertion/report，不向 DUT 转移未声明的资源所有权。
-  // 失败/边界：测试函数 expect_rejected 缺少前置对象时报告断言错误，并停止依赖该对象的后续检查。
+  // 功能：执行一次预期在外部 I/O 前被拒绝的 legacy submit，并统一验证错误码。
+  // 输入/输出及副作用：scheduler/binding/desc 驱动 DUT；expected 给出精确 code；
+  //   mem/pcie/trace 在调用前清空，并被检查为无副作用。
+  // 失败/边界：除 status 匹配外，result 必须为 null；该辅助 task 不适用于已开始外部 I/O 的失败。
   task automatic expect_rejected(
     string label,
     rdma_doorbell_scheduler scheduler,
@@ -367,9 +757,9 @@ class rdma_doorbell_scheduler_test extends uvm_test;
     expect_no_side_effects(label, mem, pcie, trace);
   endtask
 
-  // 功能：在 rdma_doorbell_scheduler_test 中，expect_trace 在测试中执行 expect_trace 断言，比较输入结果与期望状态并报告可定位的失败信息。
-  // 输入/输出及副作用：label（输入）、trace（输入）、expected（输入）；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
-  // 失败/边界：测试函数 expect_trace 缺少前置对象时报告断言错误，并停止依赖该对象的后续检查。
+  // 功能：断言 trace.calls 的长度与每个方法名都与 expected 队列完全一致。
+  // 输入/输出及副作用：label/trace/expected 为只读输入；对长度或元素偏差发布 UVM_ERROR。
+  // 失败/边界：长度不同时立即返回以避免越界；trace=null 时无法检查。
   function automatic void expect_trace(
     string label,
     rdma_mock_call_trace trace,
@@ -389,9 +779,9 @@ class rdma_doorbell_scheduler_test extends uvm_test;
     end
   endfunction
 
-  // 功能：在 rdma_doorbell_scheduler_test 中，expect_recovery_submit 在测试中执行 expect_recovery_submit 断言，比较输入结果与期望状态并报告可定位的失败信息。
-  // 输入/输出及副作用：label（输入）、scheduler（输入）、binding（输入）；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
-  // 失败/边界：测试函数 expect_recovery_submit 缺少前置对象时报告断言错误，并停止依赖该对象的后续检查。
+  // 功能：故障场景后向同一 Function 发起新的无 dependency submit，验证 lock/超时资源已恢复。
+  // 输入/输出及副作用：label 命名 fixture/报错；scheduler 被驱动；binding 提供原 Function 身份。
+  // 失败/边界：恢复调用必须同时返回 RDMA_SC_OK 和非空 result；本 task 不清空 adapter trace。
   task automatic expect_recovery_submit(
     string label,
     rdma_doorbell_scheduler scheduler,
@@ -408,10 +798,10 @@ class rdma_doorbell_scheduler_test extends uvm_test;
       `uvm_error(label, "same-Function recovery did not publish a result")
   endtask
 
-  // 功能：在测试辅助 rdma_doorbell_scheduler_test.check_value_clone_contracts 中构造或驱动“value clone contracts”场景，并断言 DUT
-  //   的状态、错误码和资源账本符合契约。
-  // 输入/输出及副作用：binding（输入）、allocated_mapping（输入）；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
-  // 失败/边界：必需对象/句柄/快照为空，或身份、范围、generation 和生命周期检查失败时返回非成功状态。
+  // 功能：验证 dependency、descriptor 和 legacy doorbell result 的 UVM clone 保留标量且深拷贝可变值图。
+  // 输入/输出及副作用：binding/allocated_mapping 为只读 fixture；task 构造源值、clone、
+  //   变异源图并发布 UVM_ERROR，同时检查 mock mapping 的不透明 allocation identity。
+  // 失败/边界：allocated_mapping clone 为 null/错类型时报错并返回；其他缺失子值只报错并防止解引用。
   task automatic check_value_clone_contracts(
     rdma_function_binding binding,
     rdma_dma_mapping allocated_mapping
@@ -594,9 +984,611 @@ class rdma_doorbell_scheduler_test extends uvm_test;
     end
   endtask
 
-  // 功能：在 rdma_doorbell_scheduler_test 中，run_phase 驱动 UVM 阶段中的场景初始化、事务执行和断言收尾，并在退出前释放 objection 或测试资源。
-  // 输入/输出及副作用：phase（输入）；phase 由 UVM 提供；task 通过 objection、日志和断言暴露结果，可能调用 DUT 接口但不改变其所有权规则。
-  // 失败/边界：run_phase 的 setup/阶段驱动失败时停止新增事务，并按测试生命周期清理 objection 与临时引用。
+  // 功能：验证 observed envelope 的普通 UVM deep-copy，以及不调用 hostile
+  //   clone/factory 的 legacy 单向投影。
+  // 输入/输出及副作用：binding 为只读 Function fixture；task 构造
+  //   source/cloned/projected 值并发布断言，不调用 scheduler 外部 I/O。
+  // 失败/边界：普通 clone 必须隔离；hostile outer/result/status clone 不得调用；
+  //   null doorbell 可投影，malformed status/result 返回直接构造 INVALID_STATE。
+  task automatic check_observed_value_projection(
+    rdma_function_binding binding
+  );
+    rdma_doorbell_submission_result source;
+    rdma_doorbell_submission_result cloned;
+    rdma_doorbell_clone_fault_submission_result hostile;
+    rdma_doorbell_clone_fault_result hostile_result;
+    rdma_doorbell_clone_fault_status hostile_status;
+    rdma_doorbell_result projected_result;
+    rdma_status projected_status;
+    uvm_object cloned_object;
+    string failure_reason;
+    bit projected;
+
+    source = new("observed_copy_source");
+    source.status = make_direct_status(RDMA_SC_TIMEOUT,
+                                       "observed copy source");
+    source.doorbell_result = new("observed_copy_doorbell");
+    source.doorbell_result.kind = RDMA_DOORBELL_RQ;
+    source.doorbell_result.function_h = binding.make_handle();
+    source.doorbell_result.target_h = make_target(
+      "observed_copy_target", source.doorbell_result.function_h,
+      RDMA_RESOURCE_QP, 21'h15555
+    );
+    source.doorbell_result.absolute_address.value =
+      binding.notify_base.value + 64'h10;
+    source.doorbell_result.width = 8;
+    source.doorbell_result.dependency_count = 2;
+    source.submission_effect = RDMA_SUBMIT_EFFECT_MMIO_MAYBE_VISIBLE;
+    source.dependency_count = 2;
+    source.before_mmio_maybe_visible_called = 1'b1;
+
+    cloned_object = source.clone();
+    if (cloned_object == null || !$cast(cloned, cloned_object)) begin
+      `uvm_error("OBSERVED_COPY", "observed envelope clone failed")
+    end
+    else if (cloned == source || cloned.status == null ||
+             cloned.status == source.status || cloned.doorbell_result == null ||
+             cloned.doorbell_result == source.doorbell_result ||
+             cloned.doorbell_result.function_h ==
+               source.doorbell_result.function_h ||
+             cloned.doorbell_result.target_h ==
+               source.doorbell_result.target_h ||
+             cloned.status.code != RDMA_SC_TIMEOUT ||
+             cloned.submission_effect !=
+               RDMA_SUBMIT_EFFECT_MMIO_MAYBE_VISIBLE ||
+             cloned.dependency_count != 2 ||
+             !cloned.before_mmio_maybe_visible_called) begin
+      `uvm_error("OBSERVED_COPY", "observed envelope was not deeply copied")
+    end
+
+    hostile = new("hostile_projection_source");
+    hostile_status = new("hostile_projection_status");
+    hostile_status.category = RDMA_STATUS_TIMEOUT;
+    hostile_status.code = RDMA_SC_TIMEOUT;
+    hostile_status.severity = RDMA_SEVERITY_ERROR;
+    hostile_status.message = "hostile projection timeout";
+    hostile_result = new("hostile_projection_result");
+    hostile_result.kind = RDMA_DOORBELL_RQ;
+    hostile_result.function_h = binding.make_handle();
+    hostile_result.target_h = make_target(
+      "hostile_projection_target", hostile_result.function_h,
+      RDMA_RESOURCE_QP, 21'h15555
+    );
+    hostile_result.absolute_address.value = binding.notify_base.value + 64'h10;
+    hostile_result.width = 8;
+    hostile_result.dependency_count = 2;
+    hostile.status = hostile_status;
+    hostile.doorbell_result = hostile_result;
+    hostile.submission_effect = RDMA_SUBMIT_EFFECT_MMIO_MAYBE_VISIBLE;
+    hostile.dependency_count = 2;
+    hostile.before_mmio_maybe_visible_called = 1'b1;
+
+    rdma_doorbell_clone_fault_submission_result::clear_clone_calls();
+    rdma_doorbell_clone_fault_result::clear_clone_calls();
+    rdma_doorbell_clone_fault_status::clear_clone_calls();
+    projected = hostile.try_project_legacy(
+      projected_result, projected_status, failure_reason
+    );
+    if (!projected || projected_result == null || projected_status == null ||
+        failure_reason != "" || projected_status.code != RDMA_SC_TIMEOUT ||
+        projected_status == hostile_status ||
+        projected_result == hostile_result ||
+        projected_result.function_h == hostile_result.function_h ||
+        projected_result.target_h == hostile_result.target_h ||
+        projected_result.absolute_address != hostile_result.absolute_address ||
+        projected_result.width != 8 ||
+        projected_result.dependency_count != 2 ||
+        rdma_doorbell_clone_fault_submission_result::get_clone_calls() != 0 ||
+        rdma_doorbell_clone_fault_result::get_clone_calls() != 0 ||
+        rdma_doorbell_clone_fault_status::get_clone_calls() != 0)
+      `uvm_error("LEGACY_DIRECT_PROJECTION",
+                 "legacy projection used clone/factory or lost fields")
+
+    hostile.doorbell_result = null;
+    projected = hostile.try_project_legacy(
+      projected_result, projected_status, failure_reason
+    );
+    if (!projected || projected_result != null || projected_status == null ||
+        projected_status.code != RDMA_SC_TIMEOUT || failure_reason != "")
+      `uvm_error("LEGACY_NULL_RESULT",
+                 "null observed doorbell result was not projected independently")
+
+    hostile.status = null;
+    projected = hostile.try_project_legacy(
+      projected_result, projected_status, failure_reason
+    );
+    if (projected || projected_result != null || projected_status == null ||
+        projected_status.code != RDMA_SC_INVALID_STATE || failure_reason == "")
+      `uvm_error("LEGACY_NULL_STATUS",
+                 "malformed observed status did not fail closed")
+
+    hostile.status = hostile_status;
+    hostile_result.function_h = null;
+    hostile.doorbell_result = hostile_result;
+    projected = hostile.try_project_legacy(
+      projected_result, projected_status, failure_reason
+    );
+    if (projected || projected_result != null || projected_status == null ||
+        projected_status.code != RDMA_SC_INVALID_STATE || failure_reason == "")
+      `uvm_error("LEGACY_MALFORMED_RESULT",
+                 "malformed observed result did not fail closed")
+  endtask
+
+  // 功能：验证 observed 入口在参数/snapshot/preflight/锁/写/barrier/MMIO
+  //   各边界发布精确单调 effect。
+  // 输入/输出及副作用：scheduler/binding/mapping/mem/pcie/trace/request_context
+  //   为 fixture；task 驱动真实 DUT、可控 adapter 故障和 raw-factory 窗口。
+  // 失败/边界：覆盖 null/invalid、声明依赖数、四种 barrier、最后 deadline、
+  //   MMIO error/timeout、null observer 和构造故障；偏差报 UVM_ERROR。
+  task automatic check_observed_submission_contracts(
+    rdma_doorbell_scheduler scheduler,
+    rdma_function_binding binding,
+    rdma_dma_mapping mapping,
+    rdma_mock_host_mem mem,
+    rdma_mock_pcie pcie,
+    rdma_mock_call_trace trace,
+    rdma_dma_request_context request_context
+  );
+    rdma_doorbell_counting_observer observer;
+    rdma_doorbell_submission_result observed;
+    rdma_doorbell_submission_result previous_observed;
+    rdma_doorbell_desc desc;
+    rdma_doorbell_desc owner_desc;
+    rdma_doorbell_desc waiter_desc;
+    rdma_doorbell_snapshot_fault_desc snapshot_fault_desc;
+    rdma_doorbell_dependency dependency;
+    rdma_doorbell_result owner_result;
+    rdma_status owner_status;
+    rdma_status injected;
+    rdma_doorbell_barrier_policy_e policies[4];
+    rdma_doorbell_blocking_pcie blocking_pcie;
+    rdma_doorbell_scheduler blocking_scheduler;
+    rdma_pcie_api blocking_api;
+    rdma_doorbell_deadline_edge_pcie deadline_pcie;
+    rdma_doorbell_scheduler deadline_scheduler;
+    rdma_pcie_api deadline_api;
+    rdma_doorbell_post_write_factory_mem fault_mem;
+    rdma_host_mem_api fault_mem_api;
+    rdma_dma_mapping fault_mapping;
+    rdma_doorbell_scheduler fault_mem_scheduler;
+    rdma_doorbell_post_mmio_factory_pcie fault_pcie;
+    rdma_pcie_api fault_pcie_api;
+    rdma_doorbell_scheduler fault_pcie_scheduler;
+    uvm_factory factory;
+    rdma_cmq_value_factory_fault_wrapper envelope_fault;
+    rdma_cmq_value_factory_fault_wrapper doorbell_fault;
+    rdma_cmq_value_factory_fault_wrapper status_fault;
+    bit owner_done;
+    bit waiter_done;
+    bit watchdog_fired;
+
+    observer = new("doorbell_counting_observer");
+    injected = make_direct_status(RDMA_SC_TIMEOUT,
+                                  "injected observed scheduler failure");
+    policies = '{RDMA_DB_BARRIER_NONE, RDMA_DB_BARRIER_DMA,
+                 RDMA_DB_BARRIER_MMIO, RDMA_DB_BARRIER_DMA_MMIO};
+
+    desc = make_desc("observed_null_binding", binding);
+    observer.clear();
+    scheduler.submit_observed(null, desc, observer, observed);
+    expect_status("OBSERVED_NULL_BINDING", observed.status,
+                  RDMA_SC_INVALID_ARGUMENT);
+    expect_observed_contract(
+      "OBSERVED_NULL_BINDING", observed,
+      RDMA_SUBMIT_EFFECT_PRE_SUBMIT_REJECTED, 0, observer, 0, desc, null, 0
+    );
+
+    observer.clear();
+    scheduler.submit_observed(binding, null, observer, observed);
+    expect_status("OBSERVED_NULL_DESC", observed.status,
+                  RDMA_SC_INVALID_ARGUMENT);
+    expect_observed_contract(
+      "OBSERVED_NULL_DESC", observed,
+      RDMA_SUBMIT_EFFECT_PRE_SUBMIT_REJECTED, 0, observer, 0, null, null, 0
+    );
+
+    desc = make_desc("observed_preflight", binding);
+    desc.width = 4;
+    observer.clear();
+    scheduler.submit_observed(binding, desc, observer, observed);
+    expect_status("OBSERVED_PREFLIGHT", observed.status,
+                  RDMA_SC_INVALID_ARGUMENT);
+    expect_observed_contract(
+      "OBSERVED_PREFLIGHT", observed,
+      RDMA_SUBMIT_EFFECT_PRE_SUBMIT_REJECTED, 0, observer, 0, desc, null, 0
+    );
+
+    desc = make_desc("observed_invalid_third_dependency", binding);
+    add_two_dependencies(desc, mapping, desc.function_h);
+    desc.dependencies.push_back(null);
+    observer.clear();
+    scheduler.submit_observed(binding, desc, observer, observed);
+    expect_status("OBSERVED_INVALID_THIRD", observed.status,
+                  RDMA_SC_INVALID_ARGUMENT);
+    expect_observed_contract(
+      "OBSERVED_INVALID_THIRD", observed,
+      RDMA_SUBMIT_EFFECT_PRE_SUBMIT_REJECTED, 3, observer, 0, desc, null, 0
+    );
+
+    desc = make_desc("observed_snapshot_fault_source", binding);
+    add_two_dependencies(desc, mapping, desc.function_h);
+    snapshot_fault_desc = new("observed_snapshot_fault");
+    snapshot_fault_desc.copy(desc);
+    observer.clear();
+    scheduler.submit_observed(binding, snapshot_fault_desc, observer, observed);
+    expect_status("OBSERVED_SNAPSHOT_FAULT", observed.status,
+                  RDMA_SC_INVALID_STATE);
+    expect_observed_contract(
+      "OBSERVED_SNAPSHOT_FAULT", observed,
+      RDMA_SUBMIT_EFFECT_PRE_SUBMIT_REJECTED, 2, observer, 0,
+      snapshot_fault_desc, null, 0
+    );
+
+    desc = make_desc("observed_first_write_failure", binding);
+    add_two_dependencies(desc, mapping, desc.function_h);
+    clear_observation(mem, pcie, trace);
+    expect_status("ARM_OBSERVED_FIRST_WRITE",
+                  mem.fail_write_at(1, injected), RDMA_SC_OK);
+    observer.clear();
+    scheduler.submit_observed(binding, desc, observer, observed);
+    expect_status("OBSERVED_FIRST_WRITE", observed.status, RDMA_SC_TIMEOUT);
+    expect_observed_contract(
+      "OBSERVED_FIRST_WRITE", observed,
+      RDMA_SUBMIT_EFFECT_HOST_MEMORY_MAYBE_VISIBLE, 2, observer, 0,
+      desc, injected, 0
+    );
+
+    desc = make_desc("observed_second_write_failure", binding);
+    add_two_dependencies(desc, mapping, desc.function_h);
+    clear_observation(mem, pcie, trace);
+    expect_status("ARM_OBSERVED_SECOND_WRITE",
+                  mem.fail_write_at(2, injected), RDMA_SC_OK);
+    observer.clear();
+    scheduler.submit_observed(binding, desc, observer, observed);
+    expect_status("OBSERVED_SECOND_WRITE", observed.status, RDMA_SC_TIMEOUT);
+    expect_observed_contract(
+      "OBSERVED_SECOND_WRITE", observed,
+      RDMA_SUBMIT_EFFECT_HOST_MEMORY_MAYBE_VISIBLE, 2, observer, 0,
+      desc, injected, 0
+    );
+    if (mem.calls.size() != 2)
+      `uvm_error("OBSERVED_SECOND_WRITE",
+                 "second-write failure did not enter exactly two writes")
+
+    desc = make_desc("observed_dma_failure", binding);
+    add_two_dependencies(desc, mapping, desc.function_h);
+    desc.barrier_policy = RDMA_DB_BARRIER_DMA;
+    clear_observation(mem, pcie, trace);
+    expect_status("ARM_OBSERVED_DMA",
+                  pcie.fail_next("dma_visibility_barrier", injected),
+                  RDMA_SC_OK);
+    observer.clear();
+    scheduler.submit_observed(binding, desc, observer, observed);
+    expect_status("OBSERVED_DMA_FAILURE", observed.status, RDMA_SC_TIMEOUT);
+    expect_observed_contract(
+      "OBSERVED_DMA_FAILURE", observed,
+      RDMA_SUBMIT_EFFECT_HOST_MEMORY_WRITTEN, 2, observer, 0,
+      desc, injected, 0
+    );
+
+    desc = make_desc("observed_mmio_barrier_failure", binding);
+    add_two_dependencies(desc, mapping, desc.function_h);
+    desc.barrier_policy = RDMA_DB_BARRIER_MMIO;
+    clear_observation(mem, pcie, trace);
+    expect_status("ARM_OBSERVED_MMIO_BARRIER",
+                  pcie.fail_next("mmio_ordering_barrier", injected),
+                  RDMA_SC_OK);
+    observer.clear();
+    scheduler.submit_observed(binding, desc, observer, observed);
+    expect_status("OBSERVED_MMIO_BARRIER_FAILURE", observed.status,
+                  RDMA_SC_TIMEOUT);
+    expect_observed_contract(
+      "OBSERVED_MMIO_BARRIER_FAILURE", observed,
+      RDMA_SUBMIT_EFFECT_HOST_MEMORY_ORDERED, 2, observer, 0,
+      desc, injected, 0
+    );
+
+    desc = make_desc("observed_mmio_error", binding);
+    desc.barrier_policy = RDMA_DB_BARRIER_NONE;
+    clear_observation(mem, pcie, trace);
+    expect_status("ARM_OBSERVED_MMIO_ERROR",
+                  pcie.fail_next("mmio_write", injected), RDMA_SC_OK);
+    observer.clear();
+    scheduler.submit_observed(binding, desc, observer, observed);
+    expect_status("OBSERVED_MMIO_ERROR", observed.status, RDMA_SC_TIMEOUT);
+    expect_observed_contract(
+      "OBSERVED_MMIO_ERROR", observed,
+      RDMA_SUBMIT_EFFECT_MMIO_MAYBE_VISIBLE, 0, observer, 1,
+      desc, injected, 0
+    );
+
+    previous_observed = observed;
+    foreach (policies[policy_index]) begin
+      desc = make_desc($sformatf("observed_policy_%0d", policy_index),
+                       binding);
+      desc.barrier_policy = policies[policy_index];
+      clear_observation(mem, pcie, trace);
+      observer.clear();
+      scheduler.submit_observed(binding, desc, observer, observed);
+      expect_status($sformatf("OBSERVED_POLICY_%0d", policy_index),
+                    observed.status, RDMA_SC_OK);
+      expect_observed_contract(
+        $sformatf("OBSERVED_POLICY_%0d", policy_index), observed,
+        RDMA_SUBMIT_EFFECT_MMIO_VISIBLE, 0, observer, 1,
+        desc, null, 1
+      );
+      if (observed == previous_observed)
+        `uvm_error("OBSERVED_CALL_LOCAL",
+                   "two scheduler calls shared one observed envelope")
+      previous_observed = observed;
+    end
+
+    desc = make_desc("observed_null_observer", binding);
+    desc.barrier_policy = RDMA_DB_BARRIER_NONE;
+    scheduler.submit_observed(binding, desc, null, observed);
+    expect_status("OBSERVED_NULL_OBSERVER", observed.status, RDMA_SC_OK);
+    expect_observed_contract(
+      "OBSERVED_NULL_OBSERVER", observed, RDMA_SUBMIT_EFFECT_MMIO_VISIBLE,
+      0, null, 0, desc, null, 1
+    );
+
+    blocking_pcie = rdma_doorbell_blocking_pcie::type_id::create(
+      "observed_blocking_pcie"
+    );
+    blocking_pcie.set_call_trace(trace);
+    blocking_api = blocking_pcie;
+    blocking_scheduler = rdma_doorbell_scheduler::type_id::create(
+      "observed_blocking_scheduler"
+    );
+    expect_status("CONFIGURE_OBSERVED_BLOCKING",
+                  blocking_scheduler.configure(mem, blocking_api), RDMA_SC_OK);
+
+    desc = make_desc("observed_mmio_timeout", binding);
+    desc.barrier_policy = RDMA_DB_BARRIER_NONE;
+    desc.timeout = 5ns;
+    blocking_pcie.blocked_function_uid = binding.function_uid;
+    blocking_pcie.blocked_method = "mmio_write";
+    blocking_pcie.block_enabled = 1'b1;
+    blocking_pcie.barrier_entered = 1'b0;
+    blocking_pcie.release_barrier = 1'b0;
+    observer.clear();
+    blocking_scheduler.submit_observed(binding, desc, observer, observed);
+    blocking_pcie.release_barrier = 1'b1;
+    expect_status("OBSERVED_MMIO_TIMEOUT", observed.status, RDMA_SC_TIMEOUT);
+    expect_observed_contract(
+      "OBSERVED_MMIO_TIMEOUT", observed,
+      RDMA_SUBMIT_EFFECT_MMIO_MAYBE_VISIBLE, 0, observer, 1,
+      desc, null, 0
+    );
+
+    owner_desc = make_desc("observed_lock_owner", binding);
+    owner_desc.barrier_policy = RDMA_DB_BARRIER_DMA;
+    owner_desc.timeout = 100ns;
+    waiter_desc = make_desc("observed_lock_waiter", binding);
+    waiter_desc.barrier_policy = RDMA_DB_BARRIER_NONE;
+    waiter_desc.timeout = 5ns;
+    blocking_pcie.blocked_method = "dma_visibility_barrier";
+    blocking_pcie.block_enabled = 1'b1;
+    blocking_pcie.barrier_entered = 1'b0;
+    blocking_pcie.release_barrier = 1'b0;
+    owner_done = 1'b0;
+    waiter_done = 1'b0;
+    watchdog_fired = 1'b0;
+    fork : observed_lock_watchdog
+      begin : observed_lock_scenario
+        fork : observed_lock_owner_worker
+          begin
+            blocking_scheduler.submit(binding, owner_desc, owner_result,
+                                      owner_status);
+            owner_done = 1'b1;
+          end
+        join_none
+        wait (blocking_pcie.barrier_entered);
+        observer.clear();
+        blocking_scheduler.submit_observed(binding, waiter_desc, observer,
+                                           observed);
+        waiter_done = 1'b1;
+        blocking_pcie.release_barrier = 1'b1;
+        wait (owner_done);
+      end
+      begin : observed_lock_deadline
+        #40ns;
+        watchdog_fired = 1'b1;
+        blocking_pcie.release_barrier = 1'b1;
+        #20ns;
+      end
+    join_any
+    disable observed_lock_watchdog;
+    if (watchdog_fired || !owner_done || !waiter_done)
+      `uvm_error("OBSERVED_LOCK_DEADLINE", "Function-lock scenario hung")
+    expect_status("OBSERVED_LOCK_OWNER", owner_status, RDMA_SC_OK);
+    expect_status("OBSERVED_LOCK_DEADLINE", observed.status, RDMA_SC_TIMEOUT);
+    expect_observed_contract(
+      "OBSERVED_LOCK_DEADLINE", observed,
+      RDMA_SUBMIT_EFFECT_PRE_SUBMIT_REJECTED, 0, observer, 0,
+      waiter_desc, null, 0
+    );
+    blocking_pcie.block_enabled = 1'b0;
+
+    deadline_pcie = rdma_doorbell_deadline_edge_pcie::type_id::create(
+      "observed_deadline_edge_pcie"
+    );
+    deadline_pcie.set_call_trace(trace);
+    deadline_pcie.dma_delay = 5ns;
+    deadline_api = deadline_pcie;
+    deadline_scheduler = rdma_doorbell_scheduler::type_id::create(
+      "observed_deadline_edge_scheduler"
+    );
+    expect_status("CONFIGURE_DEADLINE_EDGE",
+                  deadline_scheduler.configure(mem, deadline_api), RDMA_SC_OK);
+    desc = make_desc("observed_deadline_before_mmio", binding);
+    desc.barrier_policy = RDMA_DB_BARRIER_DMA;
+    desc.timeout = 5ns;
+    observer.clear();
+    deadline_scheduler.submit_observed(binding, desc, observer, observed);
+    expect_status("OBSERVED_DEADLINE_BEFORE_MMIO", observed.status,
+                  RDMA_SC_TIMEOUT);
+    expect_observed_contract(
+      "OBSERVED_DEADLINE_BEFORE_MMIO", observed,
+      RDMA_SUBMIT_EFFECT_HOST_MEMORY_ORDERED, 0, observer, 0,
+      desc, null, 0
+    );
+    if (deadline_pcie.calls.size() != 1 ||
+        deadline_pcie.calls[0].method_name != "dma_visibility_barrier")
+      `uvm_error("OBSERVED_DEADLINE_BEFORE_MMIO",
+                 "expired final deadline entered PCIe MMIO")
+
+    factory = uvm_factory::get();
+    envelope_fault = new("doorbell_submission_envelope_fault",
+                         rdma_doorbell_submission_result::get_type());
+    doorbell_fault = new("doorbell_nested_result_fault",
+                         rdma_doorbell_result::get_type());
+    status_fault = new("doorbell_nested_status_fault",
+                       rdma_status::get_type());
+    factory.set_type_override_by_type(
+      rdma_doorbell_submission_result::get_type(), envelope_fault, 1'b1
+    );
+    factory.set_type_override_by_type(
+      rdma_doorbell_result::get_type(), doorbell_fault, 1'b1
+    );
+    factory.set_type_override_by_type(
+      rdma_status::get_type(), status_fault, 1'b1
+    );
+
+    for (int unsigned wrong_type = 0; wrong_type < 2; wrong_type++) begin
+      envelope_fault.arm(wrong_type);
+      status_fault.arm(wrong_type);
+      observer.clear();
+      scheduler.submit_observed(binding, null, observer, observed);
+      if (envelope_fault.call_count() != 0 || status_fault.call_count() != 0)
+        `uvm_error("OBSERVED_PRE_FACTORY_FALLBACK",
+                   "entry fallback used raw factory")
+      expect_status("OBSERVED_PRE_FACTORY_FALLBACK", observed.status,
+                    RDMA_SC_INVALID_ARGUMENT);
+      expect_observed_contract(
+        "OBSERVED_PRE_FACTORY_FALLBACK", observed,
+        RDMA_SUBMIT_EFFECT_PRE_SUBMIT_REJECTED, 0, observer, 0,
+        null, null, 0
+      );
+      envelope_fault.disarm();
+      status_fault.disarm();
+    end
+
+    envelope_fault.arm(1'b1);
+    desc = make_desc("observed_envelope_factory_success", binding);
+    desc.barrier_policy = RDMA_DB_BARRIER_NONE;
+    observer.clear();
+    scheduler.submit_observed(binding, desc, observer, observed);
+    if (envelope_fault.call_count() != 0)
+      `uvm_error("OBSERVED_ENVELOPE_FACTORY",
+                 "scheduler constructed its call-local envelope via factory")
+    expect_status("OBSERVED_ENVELOPE_FACTORY", observed.status, RDMA_SC_OK);
+    expect_observed_contract(
+      "OBSERVED_ENVELOPE_FACTORY", observed,
+      RDMA_SUBMIT_EFFECT_MMIO_VISIBLE, 0, observer, 1,
+      desc, null, 1
+    );
+    envelope_fault.disarm();
+
+    fault_mem = rdma_doorbell_post_write_factory_mem::type_id::create(
+      "observed_factory_fault_mem"
+    );
+    fault_mem.set_call_trace(trace);
+    fault_mem_api = fault_mem;
+    fault_mem_scheduler = rdma_doorbell_scheduler::type_id::create(
+      "observed_factory_fault_mem_scheduler"
+    );
+    expect_status("CONFIGURE_FACTORY_FAULT_MEM",
+                  fault_mem_scheduler.configure(fault_mem_api, pcie),
+                  RDMA_SC_OK);
+    expect_status("ALLOCATE_FACTORY_FAULT_MEM",
+                  fault_mem.allocate(request_context, 64, 8,
+                                     RDMA_DMA_DEVICE_READ, fault_mapping),
+                  RDMA_SC_OK);
+    if (fault_mapping == null)
+      `uvm_fatal("FACTORY_FAULT_MEM_SETUP", "fault mapping is null")
+
+    for (int unsigned wrong_type = 0; wrong_type < 2; wrong_type++) begin
+      desc = make_desc($sformatf("observed_post_write_factory_%0d",
+                                 wrong_type), binding);
+      dependency = make_dependency(
+        $sformatf("observed_post_write_dependency_%0d", wrong_type),
+        1, RDMA_DB_DEP_PAYLOAD, fault_mapping, 8, desc.function_h, 8'h41
+      );
+      desc.dependencies.push_back(dependency);
+      fault_mem.arm_after_next_write(status_fault, injected, wrong_type);
+      observer.clear();
+      fault_mem_scheduler.submit_observed(binding, desc, observer, observed);
+      if (status_fault.call_count() != 1)
+        `uvm_error("OBSERVED_POST_WRITE_FACTORY",
+                   "status construction fault was not exercised exactly once")
+      expect_status("OBSERVED_POST_WRITE_FACTORY", observed.status,
+                    RDMA_SC_INVALID_STATE);
+      expect_observed_contract(
+        "OBSERVED_POST_WRITE_FACTORY", observed,
+        RDMA_SUBMIT_EFFECT_HOST_MEMORY_MAYBE_VISIBLE, 1, observer, 0,
+        desc, injected, 0
+      );
+      status_fault.disarm();
+    end
+
+    fault_pcie = rdma_doorbell_post_mmio_factory_pcie::type_id::create(
+      "observed_factory_fault_pcie"
+    );
+    fault_pcie.set_call_trace(trace);
+    fault_pcie_api = fault_pcie;
+    fault_pcie_scheduler = rdma_doorbell_scheduler::type_id::create(
+      "observed_factory_fault_pcie_scheduler"
+    );
+    expect_status("CONFIGURE_FACTORY_FAULT_PCIE",
+                  fault_pcie_scheduler.configure(mem, fault_pcie_api),
+                  RDMA_SC_OK);
+
+    for (int unsigned wrong_type = 0; wrong_type < 2; wrong_type++) begin
+      desc = make_desc($sformatf("observed_post_mmio_status_%0d",
+                                 wrong_type), binding);
+      desc.barrier_policy = RDMA_DB_BARRIER_NONE;
+      fault_pcie.arm_after_next_mmio(status_fault, wrong_type);
+      observer.clear();
+      fault_pcie_scheduler.submit_observed(binding, desc, observer, observed);
+      if (status_fault.call_count() != 1)
+        `uvm_error("OBSERVED_POST_MMIO_STATUS_FACTORY",
+                   "post-MMIO status fault was not consumed exactly once")
+      expect_status("OBSERVED_POST_MMIO_STATUS_FACTORY", observed.status,
+                    RDMA_SC_INVALID_STATE);
+      expect_observed_contract(
+        "OBSERVED_POST_MMIO_STATUS_FACTORY", observed,
+        RDMA_SUBMIT_EFFECT_MMIO_VISIBLE, 0, observer, 1,
+        desc, fault_pcie.success_status, 1
+      );
+      status_fault.disarm();
+
+      desc = make_desc($sformatf("observed_post_mmio_result_%0d",
+                                 wrong_type), binding);
+      desc.barrier_policy = RDMA_DB_BARRIER_NONE;
+      fault_pcie.arm_after_next_mmio(doorbell_fault, wrong_type);
+      observer.clear();
+      fault_pcie_scheduler.submit_observed(binding, desc, observer, observed);
+      if (doorbell_fault.call_count() != 1)
+        `uvm_error("OBSERVED_POST_MMIO_RESULT_FACTORY",
+                   "post-MMIO result fault was not consumed exactly once")
+      expect_status("OBSERVED_POST_MMIO_RESULT_FACTORY", observed.status,
+                    RDMA_SC_INVALID_STATE);
+      expect_observed_contract(
+        "OBSERVED_POST_MMIO_RESULT_FACTORY", observed,
+        RDMA_SUBMIT_EFFECT_MMIO_VISIBLE, 0, observer, 1,
+        desc, null, 0
+      );
+      doorbell_fault.disarm();
+    end
+  endtask
+
+  // 功能：建立共享 mock 环境，依次验证 value copy、observed effect、预检、
+  //   正常顺序、adapter 失败恢复、immutable snapshot 和 Function-lock/deadline 并发契约。
+  // 输入/输出及副作用：phase 由 UVM 提供；task 持有 objection，分配 mock mapping、
+  //   驱动 scheduler/adapter 并以 UVM report 发布所有可观测结果。
+  // 失败/边界：mapping 分配失败使用 UVM_FATAL 停止场景；各并发区域有 watchdog，
+  //   超时时释放阻塞点并报错；正常收尾时必须 drop objection。
   task run_phase(uvm_phase phase);
     rdma_mock_call_trace trace;
     rdma_mock_host_mem mem;
@@ -702,15 +1694,17 @@ class rdma_doorbell_scheduler_test extends uvm_test;
     if (mapping == null) begin
       `uvm_fatal("TEST_SETUP", "dependency mapping allocation failed")
     end
-    // Scheduler request/result objects are values: cloning must recursively
-    // detach every mutable handle/image/dependency while preserving the
-    // concrete mapping subclass's opaque allocation identity.
+    // 这些 scheduler request/result 是值：clone 必须递归隔离可变 handle/image/dependency，
+    //   同时保留具体 mapping 子类的不透明 allocation identity。
     check_value_clone_contracts(binding_a, mapping);
+    check_observed_value_projection(binding_a);
+    check_observed_submission_contracts(
+      scheduler, binding_a, mapping, mem, pcie, trace, request_context
+    );
     if (mapping.state != RDMA_MAPPING_ACTIVE)
       `uvm_error("DB_COPY_SETUP", "clone contract mutated source mapping state")
 
-    // Successful execution proves stage ordering, barriers, final address,
-    // exact payload bytes, and success-only result publication.
+    // 成功路径同时验证 stage 顺序、barrier、最终地址、精确 payload 和仅成功发布 result。
     desc = make_desc("success_desc", binding_a);
     add_two_dependencies(desc, mapping, function_a);
     clear_observation(mem, pcie, trace);
@@ -731,8 +1725,7 @@ class rdma_doorbell_scheduler_test extends uvm_test;
         result.dependency_count != 2)
       `uvm_error("ORDERED_SUBMIT", "success result is incomplete")
 
-    // Complete preflight must reject each malformed coordinate before the
-    // first host-memory or PCIe side effect.
+    // 完整 preflight 必须在第一个 Host-memory 或 PCIe 副作用前拒绝每个畸形坐标。
     binding_a.state = RDMA_BIND_BOUND;
     desc = make_desc("inactive_binding", binding_a);
     expect_rejected("INACTIVE_BINDING", scheduler, binding_a, desc,
@@ -871,8 +1864,8 @@ class rdma_doorbell_scheduler_test extends uvm_test;
     expect_rejected("UNSUPPORTED_READBACK", scheduler, binding_a, desc,
                     RDMA_SC_UNSUPPORTED_OPCODE, mem, pcie, trace);
 
-    // Each adapter failure stops the pipeline immediately and never publishes
-    // a result. The second host-write case proves no later write/barrier leaks.
+    // 每个 adapter 失败都必须立即停止 pipeline 且不发布 result；
+    //   第二次 Host-memory 写失败额外证明不泄漏后续写或 barrier。
     injected = rdma_status::make(RDMA_SC_TIMEOUT, "injected doorbell failure");
 
     desc = make_desc("fail_host_first", binding_a);
@@ -933,9 +1926,8 @@ class rdma_doorbell_scheduler_test extends uvm_test;
     if (result != null) `uvm_error("FAIL_MMIO_WRITE", "failure published result")
     expect_recovery_submit("RECOVER_MMIO_WRITE_FAILURE", scheduler, binding_a);
 
-    // All execution inputs become immutable values after the Function lock is
-    // acquired. Mutating the caller graph while a barrier is blocked cannot
-    // alter later adapter calls or the published result.
+    // 取得 Function lock 后，所有执行输入成为 immutable value；barrier 阻塞期间
+    //   修改 caller 对象图不得影响后续 adapter 调用或已发布 result。
     blocking_pcie = rdma_doorbell_blocking_pcie::type_id::create(
         "blocking_pcie");
     blocking_pcie_api = blocking_pcie;
@@ -1016,9 +2008,8 @@ class rdma_doorbell_scheduler_test extends uvm_test;
         blocking_pcie.calls[2].data != expected_mmio)
       `uvm_error("IMMUTABLE_SNAPSHOT", "adapter observed caller mutation")
 
-    // The timeout is one total simulation-time deadline. Each potentially
-    // blocking PCIe task must consume only the remaining request budget, be
-    // killed locally on expiry, and leave the Function lock reusable.
+    // 这里的 timeout 是一个总仿真时间 deadline；每个可阻塞 PCIe task 只能消耗剩余预算，
+    //   到期后必须局部终止并使 Function lock 可复用。
     foreach (blocking_methods[method_index]) begin
       first_desc = make_desc({"timeout_", blocking_methods[method_index]},
                              binding_a);
@@ -1068,9 +2059,8 @@ class rdma_doorbell_scheduler_test extends uvm_test;
                              concurrent_scheduler, binding_a);
     end
 
-    // Waiting for an already-held Function lock consumes the same deadline.
-    // A timed-out waiter must not put a token it never acquired: a third
-    // waiter remains blocked until the original owner releases the lock.
+    // 等待已占用 Function lock 也消耗同一 deadline；超时 waiter 不得归还未取得的 token，
+    //   因此第三个 waiter 必须继续阻塞到原 owner 释放 lock。
     first_desc = make_desc("lock_owner", binding_a);
     first_desc.timeout = 100ns;
     second_desc = make_desc("lock_timeout", binding_a);
@@ -1145,8 +2135,8 @@ class rdma_doorbell_scheduler_test extends uvm_test;
     expect_recovery_submit("RECOVER_LOCK_TIMEOUT", concurrent_scheduler,
                            binding_a);
 
-    // Lock identity deliberately excludes generation. Two distinct binding
-    // objects for old/new incarnations of one immutable Function serialize.
+    // 锁 identity 故意排除 generation：同一 immutable Function 的旧/新 incarnation
+    //   即使使用两个 binding 对象，也必须串行。
     rebound_binding_old = make_binding("rebound_old", 64'hcccc, 3, 1,
                                        64'h0000_0000_a000_0000);
     rebound_binding_new = make_binding("rebound_new", 64'hcccc, 3, 2,
@@ -1205,7 +2195,7 @@ class rdma_doorbell_scheduler_test extends uvm_test;
     if (first_result == null || second_result == null)
       `uvm_error("INCARNATION_LOCK", "serialized incarnation lost result")
 
-    // A different Function remains independent of the blocked Function.
+    // 不同 Function 拥有独立 lock，必须能越过已阻塞 Function 继续提交。
     first_desc = make_desc("different_function_a", binding_a);
     other_desc = make_desc("different_function_b", binding_b);
     blocking_pcie.blocked_function_uid = function_a.function_uid;
