@@ -60,9 +60,12 @@ class rdma_cmq_driver_field_mutation_test extends uvm_test;
     static_unwritable_count = 0;
   endfunction
 
-  // 功能：hex_nibble 把 canonical 文件中的单个规范十六进制字符转换为四位数值。
-  // 输入/输出及副作用：ch 为只读 ASCII 输入，value 仅在成功时接收 0..15；函数不改变文件游标。
-  // 失败/边界：除 0-9、a-f、A-F 外的字符全部返回 0，避免 %x 宽松接受注释或残缺 token。
+  // 功能：hex_nibble 把 canonical 文件中的单个规范十六进制字符转换为
+  //   四位数值。
+  // 输入/输出及副作用：ch 为只读 ASCII 输入；每次调用先把 value 置零，
+  //   成功时再写入 0..15；函数不改变文件游标。
+  // 失败/边界：除 0-9、a-f、A-F 外的字符全部返回 0，value 保持为零，避免
+  //   %x 宽松接受注释或残缺 token。
   function automatic bit hex_nibble(
       input int ch,
       output int unsigned value
@@ -786,8 +789,12 @@ class rdma_cmq_driver_field_mutation_test extends uvm_test;
 
   // 功能：check_qpc_typed_row 对一条 ordinary HOST_TYPED row 构造两个独立图，
   //   调用两次 production compose_sqe 并比较 C 坐标。
-  // 输入/输出及副作用：row 只读；创建 baseline/mutant、输出 image 和不可变性快照，成功后更新 visited/typed 计数。
-  // 失败/边界：图构造、mutation、compose、canonical、metadata、expected response 或输入不可变性任一失败都会报告且不伪造证据。
+  // 输入/输出及副作用：row 只读；创建 baseline/mutant、输出 image 和
+  //   不可变性快照；执行到 task 尾部时更新 visited/typed 计数，即使此前
+  //   报告过非致命 uvm_error。
+  // 失败/边界：图构造、mutation、snapshot 或 compose 失败时报告后返回且
+  //   不计数；canonical、metadata、expected response、输入不可变性或 delta
+  //   偏差报告非致命错误，row 仍计为已执行。
   task automatic check_qpc_typed_row(
       input rdma_cmq_field_evidence_row row
   );
@@ -1012,8 +1019,12 @@ class rdma_cmq_driver_field_mutation_test extends uvm_test;
 
   // 功能：check_qpc_driver_fixed_rejection 对一条 VFID fixed-zero row 构造合法图，
   //   并让 production profile 命中 opcode 专用拒绝。
-  // 输入/输出及副作用：row 只读；调用 zero baseline 与 nonzero mutant compose，成功后更新 visited/fixed 计数。
-  // 失败/边界：字段不是 override/use_vfid、baseline 不匹配 C、拒绝码非 INVALID_ARGUMENT、发布输出或改变输入图时报告错误。
+  // 输入/输出及副作用：row 只读；调用 zero baseline 与 nonzero mutant compose；
+  //   执行到 task 尾部时更新 visited/fixed 计数，即使此前报告过非致命
+  //   uvm_error。
+  // 失败/边界：row/字段/坐标错误、图或 snapshot 构造失败、baseline 不匹配 C
+  //   时报告后返回且不计数；拒绝码非 INVALID_ARGUMENT、发布输出或改变输入图
+  //   时报告非致命错误，row 仍计为已执行。
   task automatic check_qpc_driver_fixed_rejection(
       input rdma_cmq_field_evidence_row row
   );
@@ -1235,9 +1246,11 @@ class rdma_cmq_driver_field_mutation_test extends uvm_test;
   endfunction
 
   // 功能：check_completion_typed_value 核对 accepted raw CQE 中
-  //   owner/index/wrap/opcode/ecode 的类型化值来自 mutation 后字节。
-  // 输入/输出及副作用：row、mutant、completion 只读；仅报告字段投影偏差，不修改 completion payload。
-  // 失败/边界：非 HW_TYPED 字段、对象为空或 decoder 输出与 raw qword0 不一致时报告错误。
+  //   index/wrap/opcode/ecode 的类型化值来自 mutation 后字节。
+  // 输入/输出及副作用：row、mutant、completion 只读；仅报告字段投影偏差，
+  //   不修改 completion payload。
+  // 失败/边界：对象为空、字段不是 index/wrap/opcode/ecode，或 decoder 输出与 raw
+  //   qword0 不一致时报告错误；owner mutation 预期 NOT_READY，不调用本 task。
   task automatic check_completion_typed_value(
       input rdma_cmq_field_evidence_row row,
       input rdma_hw_image mutant,
@@ -1276,8 +1289,12 @@ class rdma_cmq_driver_field_mutation_test extends uvm_test;
 
   // 功能：check_completion_row 翻转一个 C CQE memory bit，分别执行 raw
   //   completion codec 与 production profile，并核对两层结果。
-  // 输入/输出及副作用：row、canonical 只读；创建 mutant，成功后更新 visited/raw 计数，不修改 canonical。
-  // 失败/边界：raw delta 非单 bit、状态/ready/publication 不符，或 ecode 未映射为非 OK command_status 时报告错误。
+  // 输入/输出及副作用：row、canonical 只读；创建 mutant，不修改 canonical；
+  //   执行到 task 尾部时更新 visited/raw 计数，即使此前报告过非致命
+  //   uvm_error。
+  // 失败/边界：row/canonical 不合法或 clone 失败时报告后返回且不计数；raw
+  //   delta、状态/ready/publication 不符，或 ecode 未映射为非 OK
+  //   command_status 时报告非致命错误，row 仍计为已执行。
   task automatic check_completion_row(
       input rdma_cmq_field_evidence_row row,
       input rdma_hw_image canonical

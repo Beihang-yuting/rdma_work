@@ -2770,13 +2770,16 @@ class rdma_hw_cmq_request_composer extends uvm_object;
 
   // 功能：validate_qpc_signature_source 解码 QPC signature source，并校验它与
   //   CMQ QPC body 的共享 QP 身份、transport variant 和 full-modify WBE 模板一致。
-  // 输入/输出及副作用：source 输入完整 QPC context image，body 输入 CMQ 64-byte
-  //   body image；函数只读 service_type、qp_h.object_id、transport 和 WBE 字段，
-  //   返回 rdma_status，不修改输入或转移资源所有权。
-  // 失败/边界：source/body 元数据不合法、codec lookup/decode 失败、QPN 低 21 位
-  //   不一致或 transport/WBE 组合不受支持时返回 CODEC_ERROR；CMQ header 的
-  //   24-bit QPN 与 QPC context 的 21-bit QPN 不同宽，只比较 ABI 共有的低 21 位，
-  //   不截断任一线上字段。
+  // 输入/输出及副作用：source 和 body 须已由 compose_request 校验元数据与
+  //   长度；函数只读 source 的 service_type、qp_h.kind/object_id、transport，
+  //   以及 body 的 QPN、modify_mode、WBE 字段，返回 rdma_status，不修改输入或
+  //   转移资源所有权。
+  // 失败/边界：service_type 无映射、codec lookup/decode 或类型转换失败、QP handle
+  //   缺失或 kind 错误、QPN 低 21 位不一致，以及 full modify 的 transport/WBE
+  //   组合不受支持时返回 CODEC_ERROR；元数据不合法由调用者在进入本函数前
+  //   拒绝。
+  //   CMQ header 的 24-bit QPN 与 QPC context 的 21-bit QPN 不同宽，只比较 ABI
+  //   共有的低 21 位，不截断任一线上字段。
   protected function rdma_status validate_qpc_signature_source(
     rdma_hw_image source,
     rdma_hw_image body
