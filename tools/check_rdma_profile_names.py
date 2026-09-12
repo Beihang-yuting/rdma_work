@@ -192,9 +192,14 @@ class ValidationError(RuntimeError):
 
 
 def find_profile_name_violations() -> list[str]:
-    """功能：在 RDMA profile checker 的 find_profile_name_violations 中扫描 PROFILE_SCAN_ROOTS 下的文本并收集旧 profile token 的路径和行号。
-    输入输出及副作用：输入参数为 无参数，返回声明类型结果或更新调用方拥有的局部状态；不修改冻结源码和仓库 golden。
-    失败边界：缺失、重复、越界、来源/坐标漂移或无法满足该操作的唯一性条件时抛 ValidationError，禁止静默接受不一致。
+    """
+    功能：在 RDMA profile checker 的 find_profile_name_violations 中扫描
+    PROFILE_SCAN_ROOTS 下的文本并收集旧
+    profile token 的路径和行号。
+    输入输出及副作用：无参数；返回包含相对路径、行号和原文的
+    list[str]。只读遍历 PROFILE_SCAN_ROOTS 下的文本，不改写源码或 golden。
+    失败边界：根目录不存在时结果为空；非文本后缀和 UTF-8
+    解码失败文件被跳过，只有 PROFILE_FORBIDDEN_PATTERNS 命中的行才记录。
     """
 
     violations: list[str] = []
@@ -217,9 +222,13 @@ def find_profile_name_violations() -> list[str]:
 
 
 def validate_profile_names() -> None:
-    """功能：在 RDMA profile checker 的 validate_profile_names 中执行内部 rdma 命名守卫并报告命名残留。
-    输入输出及副作用：输入参数为 无参数，返回声明类型结果或更新调用方拥有的局部状态；不修改冻结源码和仓库 golden。
-    失败边界：缺失、重复、越界、来源/坐标漂移或无法满足该操作的唯一性条件时抛 ValidationError，禁止静默接受不一致。
+    """
+    功能：在 RDMA profile checker 的 validate_profile_names 中执行内部 rdma
+    命名守卫并报告命名残留。
+    输入输出及副作用：无参数；调用 find_profile_name_violations，
+    违规为空时返回 None，整个检查不产生文件副作用。
+    失败边界：任一旧 rdma_xtr_v1/XTR_V1 token 命中都会抛 ValidationError
+    并列出位置；无命中才通过。
     """
 
     violations = find_profile_name_violations()
@@ -443,9 +452,13 @@ class GoldenCase(NamedTuple):
 
     @property
     def summary(self) -> str:
-        """功能：在 RDMA profile checker 的 GoldenCase/summary 中把 inputs 序列编码为 canonical name=value 摘要。
-        输入输出及副作用：输入参数为 self，返回声明类型结果或更新调用方拥有的局部状态；不修改冻结源码和仓库 golden。
-        失败边界：缺失、重复、越界、来源/坐标漂移或无法满足该操作的唯一性条件时抛 ValidationError，禁止静默接受不一致。
+        """
+        功能：在 RDMA profile checker 的 GoldenCase/summary 中把 inputs 序列编码为
+        canonical name=value 摘要。
+        输入输出及副作用：self.inputs 是 GoldenInput 序列；
+        返回按原顺序拼接的 name=value 字符串，不修改 tuple 或 payload。
+        失败边界：inputs 为空时返回空字符串；该属性不重新验证 token，
+        格式错误由 parse_input_summary 在写入前拒绝。
         """
         return ",".join(f"{item.name}={item.value}" for item in self.inputs)
 
@@ -979,9 +992,14 @@ PROFILE_VALUES = {
 
 
 def parse_field_expression(expression: str) -> tuple[int, int]:
-    """功能：在 RDMA profile checker 的 parse_field_expression 中将 BIT/GENMASK C 表达式转换为 (lsb,width) 坐标。
-    输入输出及副作用：输入参数为 expression，返回声明类型结果或更新调用方拥有的局部状态；不修改冻结源码和仓库 golden。
-    失败边界：缺失、重复、越界、来源/坐标漂移或无法满足该操作的唯一性条件时抛 ValidationError，禁止静默接受不一致。
+    """
+    功能：在 RDMA profile checker 的 parse_field_expression 中将 BIT/GENMASK C
+    表达式转换为 (lsb,width) 坐标。
+    输入输出及副作用：expression 为 C 字段宏文本；返回 (lsb, width)，其中
+    width 覆盖连续位段且 lsb 是最低位。
+    失败边界：只接受 BIT/ BIT_ULL 和 GENMASK/GENMASK_ULL 的 0..63 范围；
+    位点大于 63、high<low 或其它语法抛
+    ValidationError。
     """
     expr = expression.strip()
     bit_match = re.fullmatch(r"BIT(?:_ULL)?\(\s*(\d+)\s*\)", expr)
@@ -1002,9 +1020,13 @@ def parse_field_expression(expression: str) -> tuple[int, int]:
 
 
 def parse_value_expression(expression: str) -> int:
-    """功能：在 RDMA profile checker 的 parse_value_expression 中将十六进制或十进制 C 常量转换为整数。
-    输入输出及副作用：输入参数为 expression，返回声明类型结果或更新调用方拥有的局部状态；不修改冻结源码和仓库 golden。
-    失败边界：缺失、重复、越界、来源/坐标漂移或无法满足该操作的唯一性条件时抛 ValidationError，禁止静默接受不一致。
+    """
+    功能：在 RDMA profile checker 的 parse_value_expression 中将十六进制或十进制
+    C 常量转换为整数。
+    输入输出及副作用：expression 为 C 数值宏；返回去掉 u/l 后的整数值，
+    不执行 eval，也不改变输入字符串。
+    失败边界：仅接受十六进制/十进制无运算字面量；空串、负数、
+    移位或符号引用抛 unsupported mapped C value expression。
     """
     expr = expression.strip()
     if not re.fullmatch(r"(?:0[xX][0-9a-fA-F]+|[0-9]+)(?:[uUlL]+)?", expr):
@@ -1014,9 +1036,13 @@ def parse_value_expression(expression: str) -> int:
 
 
 def parse_sv_value(expression: str) -> int:
-    """功能：在 RDMA profile checker 的 parse_sv_value 中将无运算的 SystemVerilog based literal 转换为整数。
-    输入输出及副作用：输入参数为 expression，返回声明类型结果或更新调用方拥有的局部状态；不修改冻结源码和仓库 golden。
-    失败边界：缺失、重复、越界、来源/坐标漂移或无法满足该操作的唯一性条件时抛 ValidationError，禁止静默接受不一致。
+    """
+    功能：在 RDMA profile checker 的 parse_sv_value 中将无运算的 SystemVerilog based
+    literal 转换为整数。
+    输入输出及副作用：expression 为 SV localparam 右值；返回 h/d based literal
+    或 0x/十进制字面量对应的整数。
+    失败边界：允许下划线和 h/d 大小写；包含运算、二进制/
+    八进制或空值时抛 ValidationError，解析不会截断超宽值。
     """
     expr = expression.strip().replace("_", "")
     match = re.fullmatch(r"(?:\d+)'([hHdD])([0-9a-fA-F]+)", expr)
@@ -1028,9 +1054,13 @@ def parse_sv_value(expression: str) -> int:
 
 
 def strip_sv_comments(text: str) -> str:
-    """功能：在 RDMA profile checker 的 strip_sv_comments 中剥离 SV 注释而保留字符串和源码位置。
-    输入输出及副作用：输入参数为 text，返回声明类型结果或更新调用方拥有的局部状态；不修改冻结源码和仓库 golden。
-    失败边界：缺失、重复、越界、来源/坐标漂移或无法满足该操作的唯一性条件时抛 ValidationError，禁止静默接受不一致。
+    """
+    功能：在 RDMA profile checker 的 strip_sv_comments 中剥离 SV
+    注释而保留字符串和源码位置。
+    输入输出及副作用：text 为 SV 源码；返回等长的去注释文本，
+    保留字符串字符、换行和索引位置供后续扫描。
+    失败边界：行注释到换行结束、块注释到 */ 结束；
+    未闭合块注释会吞掉余下字符但不抛异常，调用方仍可按位置报错。
     """
     result: list[str] = []
     index = 0
@@ -1079,9 +1109,14 @@ def strip_sv_comments(text: str) -> str:
 
 
 def mask_sv_strings(text: str) -> str:
-    """功能：在 RDMA profile checker 的 mask_sv_strings 中掩盖字符串字面量以隔离结构扫描。
-    输入输出及副作用：输入参数为 text，返回声明类型结果或更新调用方拥有的局部状态；不修改冻结源码和仓库 golden。
-    失败边界：缺失、重复、越界、来源/坐标漂移或无法满足该操作的唯一性条件时抛 ValidationError，禁止静默接受不一致。
+    """
+    功能：在 RDMA profile checker 的 mask_sv_strings
+    中掩盖字符串字面量以隔离结构扫描。
+    输入输出及副作用：text 为已去注释的 SV 源码；返回等长文本，
+    把字符串内容替换为空格并保留换行以隔离结构 token。
+    失败边界：转义引号只结束相应字符串；
+    未闭合字符串会遮蔽至文本末尾，不修改原 text，
+    也不伪造宏或标识符。
     """
     result: list[str] = []
     index = 0
@@ -1109,9 +1144,14 @@ def mask_sv_strings(text: str) -> str:
 
 
 def validate_error_codec_preprocessor(codec_code: str) -> None:
-    """功能：在 RDMA profile checker 的 validate_error_codec_preprocessor 中锁定错误 codec 唯一的 uvm_object_utils 宏。
-    输入输出及副作用：输入参数为 codec_code，返回声明类型结果或更新调用方拥有的局部状态；不修改冻结源码和仓库 golden。
-    失败边界：缺失、重复、越界、来源/坐标漂移或无法满足该操作的唯一性条件时抛 ValidationError，禁止静默接受不一致。
+    """
+    功能：在 RDMA profile checker 的 validate_error_codec_preprocessor 中锁定错误
+    codec 唯一的
+    uvm_object_utils 宏。
+    输入输出及副作用：codec_code 为错误 codec 源码；成功返回 None，
+    并确认唯一的 uvm_object_utils(rdma_hw_error_codec) 宏。
+    失败边界：反引号数量不是 1、宏名称/
+    行形态不匹配或宏不在唯一反引号范围内时抛 ValidationError。
     """
     approved = list(
         re.finditer(
@@ -1133,9 +1173,13 @@ def validate_error_codec_preprocessor(codec_code: str) -> None:
 
 
 def tokenize_sv_syntax(text: str) -> list[str]:
-    """功能：在 RDMA profile checker 的 tokenize_sv_syntax 中把错误 codec 拆成可审计的 SV token。
-    输入输出及副作用：输入参数为 text，返回声明类型结果或更新调用方拥有的局部状态；不修改冻结源码和仓库 golden。
-    失败边界：缺失、重复、越界、来源/坐标漂移或无法满足该操作的唯一性条件时抛 ValidationError，禁止静默接受不一致。
+    """
+    功能：在 RDMA profile checker 的 tokenize_sv_syntax 中把错误 codec
+    拆成可审计的 SV token。
+    输入输出及副作用：text 为错误 codec 代码；返回按源码顺序排列的
+    token list，并将带宽度的 based literal 压成单 token。
+    失败边界：该词法器不做语义拒绝；空文本可返回空列表，
+    调用者必须由函数区间和 case 校验捕获结构缺失。
     """
     based_literal = re.compile(
         r"\d+\s*'\s*[sS]?\s*[hHdDbBoO]\s*[0-9a-fA-F_xXzZ?]+"
@@ -1161,9 +1205,14 @@ class SvFunctionRegion(NamedTuple):
 
 
 def parse_sv_function_regions(tokens: list[str]) -> list[SvFunctionRegion]:
-    """功能：在 RDMA profile checker 的 parse_sv_function_regions 中提取 function 的头部和 body token 区间。
-    输入输出及副作用：输入参数为 tokens，返回声明类型结果或更新调用方拥有的局部状态；不修改冻结源码和仓库 golden。
-    失败边界：缺失、重复、越界、来源/坐标漂移或无法满足该操作的唯一性条件时抛 ValidationError，禁止静默接受不一致。
+    """
+    功能：在 RDMA profile checker 的 parse_sv_function_regions 中提取 function
+    的头部和 body token 区间。
+    输入输出及副作用：tokens 为 SV token 序列；返回每个 function 的
+    SvFunctionRegion（名称、头/体起止索引）。
+    失败边界：找不到分号、括号或 endfunction，或 function
+    形态没有参数括号时抛 invalid SV function syntax；无 function
+    时返回空列表。
     """
     regions: list[SvFunctionRegion] = []
     position = 0
@@ -1192,9 +1241,13 @@ def parse_sv_function_regions(tokens: list[str]) -> list[SvFunctionRegion]:
 def matching_token_patterns(
     tokens: list[str], pattern: list[str], start: int, end: int
 ) -> list[int]:
-    """功能：在 RDMA profile checker 的 matching_token_patterns 中在指定 token 区间定位精确连续 pattern。
-    输入输出及副作用：输入参数为 tokens, pattern, start, end，返回声明类型结果或更新调用方拥有的局部状态；不修改冻结源码和仓库 golden。
-    失败边界：缺失、重复、越界、来源/坐标漂移或无法满足该操作的唯一性条件时抛 ValidationError，禁止静默接受不一致。
+    """
+    功能：在 RDMA profile checker 的 matching_token_patterns 中在指定 token
+    区间定位精确连续 pattern。
+    输入输出及副作用：tokens、pattern 和 [start,end) 定义扫描窗口；
+    返回所有精确连续匹配的起始索引，不复制或改写 token。
+    失败边界：窗口反向或短于 pattern 时自然返回空列表；
+    索引由调用方提供，函数不替调用方裁剪越界数据。
     """
     return [
         index
@@ -1206,9 +1259,15 @@ def matching_token_patterns(
 def matching_statement_patterns(
     tokens: list[str], pattern: list[str], start: int, end: int
 ) -> list[int]:
-    """功能：在 RDMA profile checker 的 matching_statement_patterns 中筛选位于语句边界的精确 pattern。
-    输入输出及副作用：输入参数为 tokens, pattern, start, end，返回声明类型结果或更新调用方拥有的局部状态；不修改冻结源码和仓库 golden。
-    失败边界：缺失、重复、越界、来源/坐标漂移或无法满足该操作的唯一性条件时抛 ValidationError，禁止静默接受不一致。
+    """
+    功能：在 RDMA profile checker 的 matching_statement_patterns
+    中筛选位于语句边界的精确 pattern。
+    输入输出及副作用：tokens 是待扫描序列，pattern 是连续 token，start/end
+    定义半开区间；函数先调用
+    matching_token_patterns，再检查前一 token 是否为起点、分号、begin 或 else，
+    返回语句起始索引。
+    失败边界：pattern 跨越窗口或仅出现在表达式中会被排除；
+    函数本身不抛异常，错误数量由上层契约判断。
     """
     return [
         index
@@ -1220,9 +1279,14 @@ def matching_statement_patterns(
 def validate_outer_case_default_is_last(
     case_body: str, function_name: str
 ) -> None:
-    """功能：在 RDMA profile checker 的 validate_outer_case_default_is_last 中验证错误码 case 的唯一最外层 default 位于尾部。
-    输入输出及副作用：输入参数为 case_body, function_name，返回声明类型结果或更新调用方拥有的局部状态；不修改冻结源码和仓库 golden。
-    失败边界：缺失、重复、越界、来源/坐标漂移或无法满足该操作的唯一性条件时抛 ValidationError，禁止静默接受不一致。
+    """
+    功能：在 RDMA profile checker 的 validate_outer_case_default_is_last
+    中验证错误码 case 的唯一最外层 default
+    位于尾部。
+    输入输出及副作用：case_body 与 function_name 描述一个错误码 case；
+    成功返回 None，要求唯一最外层 default 的语句位于末尾。
+    失败边界：嵌套 case 不平衡、default 缺失/重复、default 后仍有 case item
+    或 begin/end 未闭合时抛 ValidationError。
     """
     tokens = tokenize_sv_syntax(case_body)
     case_depth = 0
@@ -1272,9 +1336,16 @@ def validate_outer_case_default_is_last(
 
 
 def validate_hardware_code_uses(codec_code: str) -> None:
-    """功能：在 RDMA profile checker 的 validate_hardware_code_uses 中审计 hardware_code 在四个错误 codec function 中的固定角色。
-    输入输出及副作用：输入参数为 codec_code，返回声明类型结果或更新调用方拥有的局部状态；不修改冻结源码和仓库 golden。
-    失败边界：缺失、重复、越界、来源/坐标漂移或无法满足该操作的唯一性条件时抛 ValidationError，禁止静默接受不一致。
+    """
+    功能：在 RDMA profile checker 的 validate_hardware_code_uses 中审计 hardware_code
+    在四个错误 codec
+    function 中的固定角色。
+    输入输出及副作用：codec_code 为四个错误 codec function；成功返回 None，
+    锁定 hardware_code 的 formals、case
+    selector、decode_status 调用和输出赋值。
+    失败边界：classify/inferred_engine/symbolic_name/decode_status 缺失、重复、
+    调用顺序或额外 hardware_code 引用都会抛
+    ValidationError。
     """
     tokens = tokenize_sv_syntax(codec_code)
     regions = parse_sv_function_regions(tokens)
@@ -1405,17 +1476,25 @@ def validate_hardware_code_uses(codec_code: str) -> None:
 
 
 def parse_sv_constants(text: str) -> dict[str, int]:
-    """功能：在 RDMA profile checker 的 parse_sv_constants 中读取 localparam 和 RDMA_FIELD 并生成常量表。
-    输入输出及副作用：输入参数为 text，返回声明类型结果或更新调用方拥有的局部状态；不修改冻结源码和仓库 golden。
-    失败边界：缺失、重复、越界、来源/坐标漂移或无法满足该操作的唯一性条件时抛 ValidationError，禁止静默接受不一致。
+    """
+    功能：在 RDMA profile checker 的 parse_sv_constants 中读取 localparam 和
+    RDMA_FIELD 并生成常量表。
+    输入输出及副作用：text 为 SV 定义；返回名称到整数的 dict，
+    来源包括 localparam 和 RDMA_FIELD 生成的 OFFSET/LSB/WIDTH 常量。
+    失败边界：重复名称、非法 based literal 或越界字段不会覆盖旧值；
+    parse_sv_value 的 ValidationError 原样传播。
     """
     text = mask_sv_strings(strip_sv_comments(text))
     constants: dict[str, int] = {}
 
     def add(name: str, value: int) -> None:
-        """功能：在 RDMA profile checker 的 parse_sv_constants/add 中向本次解析的 constants 表登记唯一名称。
-        输入输出及副作用：输入参数为 name, value，返回声明类型结果或更新调用方拥有的局部状态；不修改冻结源码和仓库 golden。
-        失败边界：缺失、重复、越界、来源/坐标漂移或无法满足该操作的唯一性条件时抛 ValidationError，禁止静默接受不一致。
+        """
+        功能：在 RDMA profile checker 的 parse_sv_constants/add 中向本次解析的
+        constants 表登记唯一名称。
+        输入输出及副作用：name/value 是当前扫描得到的 SV 常量；把唯一
+        pair 写入闭包 constants，并无返回值或外部写入。
+        失败边界：name 已存在时抛 duplicate SV constant，保证 localparam 与
+        RDMA_FIELD 展开不能静默覆盖。
         """
         if name in constants:
             raise ValidationError(f"duplicate SV constant: {name}")
@@ -1443,12 +1522,15 @@ def parse_sv_constants(text: str) -> dict[str, int]:
 
 
 def parse_sq_field_mappings(text: str) -> dict[str, tuple[str, str, int, int]]:
-    """功能：解析并校验 SV 定义中的 SQE 字段坐标，生成字段到 C 来源的映射。
-    输入输出及副作用：输入为含有 ``RDMA_FIELD`` 声明的 SV 文本；返回每个字段的
-    ``(来源文件、C 符号、LSB、宽度)`` 元组，并附加 16 字节目的 IPv6 地址别名；不修改
-    外部状态。
-    失败边界：缺少或多出字段、重复声明、字节偏移漂移、与冻结参考坐标不一致，或字段
-    坐标超出 64 位 qword 时抛出 ``ValidationError``。
+    """
+    功能：解析并校验 SV 定义中的 SQE 字段坐标，生成字段到 C
+    来源的映射。
+    输入输出及副作用：text 为包含 RDMA_FIELD 的 SV 文本；返回 sv stem 到 (C
+    path、symbol、lsb、width) 的映射，并补充 16-byte
+    UD IPv6 别名。
+    失败边界：缺少/额外 stem、重复声明、非 64-bit qword 坐标、byte offset
+    或 reference lsb/width 漂移均抛
+    ValidationError。
     """
     clean = mask_sv_strings(strip_sv_comments(text))
     declared: dict[str, tuple[int, int, int]] = {}
@@ -1499,9 +1581,15 @@ def _sq_header(
     se: bool = False,
     index: int = 0x1234,
 ) -> None:
-    """功能：在 RDMA profile checker 的 _sq_header 中按 reference 坐标编码共享 SQE header 字段。
-    输入输出及副作用：输入参数为 image, opcode, inline, se, index，返回声明类型结果或更新调用方拥有的局部状态；不修改冻结源码和仓库 golden。
-    失败边界：缺失、重复、越界、来源/坐标漂移或无法满足该操作的唯一性条件时抛 ValidationError，禁止静默接受不一致。
+    """
+    功能：在 RDMA profile checker 的 _sq_header 中按 reference 坐标编码共享 SQE
+    header 字段。
+    输入输出及副作用：image 是 64-byte ReferenceImage；按 opcode/inline/se/index
+    写入 QPN、ICOS、QP_SN、header
+    flags 等固定 SQE 字段并更新 occupancy。
+    失败边界：image 必须由 ReferenceImage 管理；任何字段溢出、重叠或 image
+    太短由 put_named/put_field 抛
+    ValidationError，函数不返回新对象。
     """
     put_named(image, "RDMA_SQ_WQE_QPN", 0x15555)
     put_named(image, "RDMA_SQ_WQE_ICOS", 5)
@@ -1519,9 +1607,14 @@ def _sq_header(
 
 
 def _sq_sge(sgb: ReferenceImage, slot: int, length: int, lkey: int, iova: int) -> None:
-    """功能：在 RDMA profile checker 的 _sq_sge 中按 driver 两 qword 格式编码一个 SGB SGE。
-    输入输出及副作用：输入参数为 sgb, slot, length, lkey, iova，返回声明类型结果或更新调用方拥有的局部状态；不修改冻结源码和仓库 golden。
-    失败边界：缺失、重复、越界、来源/坐标漂移或无法满足该操作的唯一性条件时抛 ValidationError，禁止静默接受不一致。
+    """
+    功能：在 RDMA profile checker 的 _sq_sge 中按 driver 两 qword 格式编码一个
+    SGB SGE。
+    输入输出及副作用：sgb 是 512-byte ReferenceImage；slot、length、lkey、iova
+    决定两个 descriptor qword
+    的长度/key/地址写入并登记 occupancy。
+    失败边界：slot 必须在 0..31 且字段落在 512-byte SGB；越界、
+    重叠或值超宽抛 ValidationError，length==2^31 按驱动约定写零。
     """
     if slot < 0 or slot >= 32:
         raise ValidationError("SQ SGB slot is outside the 512-byte image")
@@ -1532,18 +1625,28 @@ def _sq_sge(sgb: ReferenceImage, slot: int, length: int, lkey: int, iova: int) -
 
 
 def _build_sq_golden_cases() -> tuple[list[GoldenCase], dict[str, bytes]]:
-    """功能：在 RDMA profile checker 的 _build_sq_golden_cases 中构造 RC、atomic、UD 的 SQE/SGB golden 集合。
-    输入输出及副作用：输入参数为 无参数，返回声明类型结果或更新调用方拥有的局部状态；不修改冻结源码和仓库 golden。
-    失败边界：缺失、重复、越界、来源/坐标漂移或无法满足该操作的唯一性条件时抛 ValidationError，禁止静默接受不一致。
+    """
+    功能：在 RDMA profile checker 的 _build_sq_golden_cases 中构造 RC、atomic、UD 的
+    SQE/SGB golden 集合。
+    输入输出及副作用：无参数；返回 (GoldenCase 列表, detached SGB bytes
+    字典)，分别覆盖 RC inline/direct、atomic
+    CAS/FAA、UD inline/SGB。
+    失败边界：每个 case 使用独立 ReferenceImage；字段坐标冲突、SGB slot
+    越界或摘要无法解析时构造过程抛 ValidationError。
     """
     cases: list[GoldenCase] = []
     sgb_images: dict[str, bytes] = {"sgb_boundary": bytes(512)}
     sgb_iova = 0x20000  # 512-byte aligned address used by the SGB pointer field.
 
     def add(name: str, summary: str, image: ReferenceImage, sgb: bytes | None = None) -> None:
-        """功能：在 RDMA profile checker 的 _build_sq_golden_cases/add 中登记一个 SQE case 及可选 detached SGB。
-        输入输出及副作用：输入参数为 name, summary, image, sgb，返回声明类型结果或更新调用方拥有的局部状态；不修改冻结源码和仓库 golden。
-        失败边界：缺失、重复、越界、来源/坐标漂移或无法满足该操作的唯一性条件时抛 ValidationError，禁止静默接受不一致。
+        """
+        功能：在 RDMA profile checker 的 _build_sq_golden_cases/add 中登记一个 SQE
+        case 及可选 detached SGB。
+        输入输出及副作用：name/summary/image 定义一个 SQE case，可选 sgb 定义
+        detached SGB；登记 bytes(image) 快照并在
+        sgb 非空时写入 sgb_images。
+        失败边界：summary token 非法由 parse_input_summary 拒绝；该 helper
+        不检查重复 name，最终一致性由 golden 校验器负责。
         """
         cases.append(GoldenCase(name, parse_input_summary(summary), bytes(image)))
         if sgb is not None:
@@ -1551,9 +1654,16 @@ def _build_sq_golden_cases() -> tuple[list[GoldenCase], dict[str, bytes]]:
 
     def rc_payload(name: str, length: int, *, opcode: int = 1, inline: bool = True,
                    immediate: int | None = None, remote: bool = False) -> None:
-        """功能：在 RDMA profile checker 的 _build_sq_golden_cases/rc_payload 中构造指定 RC opcode、长度和 inline/remote 组合。
-        输入输出及副作用：输入参数为 name, length, opcode, inline, immediate, remote，返回声明类型结果或更新调用方拥有的局部状态；不修改冻结源码和仓库 golden。
-        失败边界：缺失、重复、越界、来源/坐标漂移或无法满足该操作的唯一性条件时抛 ValidationError，禁止静默接受不一致。
+        """
+        功能：在 RDMA profile checker 的 _build_sq_golden_cases/rc_payload 中构造指定
+        RC opcode、长度和
+        inline/remote 组合。
+        输入输出及副作用：按 name、length、opcode、inline、immediate、remote
+        组合编码 RC header、payload、remote
+        key/VA，并为大 inline payload 生成 SGB。
+        失败边界：length 或字段值超出 reference width 时 put_named 抛
+        ValidationError；仅 inline 且长度不超过 32
+        才直接写入 SQE。
         """
         image = ReferenceImage(64)
         _sq_header(image, opcode, inline=inline, se=opcode in (1, 2, 5), index=length + 0x1200)
@@ -1580,9 +1690,13 @@ def _build_sq_golden_cases() -> tuple[list[GoldenCase], dict[str, bytes]]:
     rc_payload("rc_inline_512", 512)
 
     def direct_sge(name: str, count: int) -> None:
-        """功能：在 RDMA profile checker 的 _build_sq_golden_cases/direct_sge 中构造直接 SGE 数量对应的 RC case。
-        输入输出及副作用：输入参数为 name, count，返回声明类型结果或更新调用方拥有的局部状态；不修改冻结源码和仓库 golden。
-        失败边界：缺失、重复、越界、来源/坐标漂移或无法满足该操作的唯一性条件时抛 ValidationError，禁止静默接受不一致。
+        """
+        功能：在 RDMA profile checker 的 _build_sq_golden_cases/direct_sge 中构造直接
+        SGE 数量对应的 RC case。
+        输入输出及副作用：构造 count 个直接 SGE 的 RC SQE，把每个 slot 的
+        length/lkey/iova 写入 SQE body 后登记 name。
+        失败边界：count 使 descriptor 超出 64-byte image 或字段重叠时由
+        put_field 抛错；正常路径不分配 detached SGB。
         """
         image = ReferenceImage(64)
         _sq_header(image, 1, inline=False, se=True, index=0x1300 + count)
@@ -1600,9 +1714,16 @@ def _build_sq_golden_cases() -> tuple[list[GoldenCase], dict[str, bytes]]:
     direct_sge("rc_sge_direct_2", 2)
 
     def sgb_sge(name: str, count: int) -> None:
-        """功能：在 RDMA profile checker 的 _build_sq_golden_cases/sgb_sge 中构造把 SGE 放入 detached SGB 的 RC case。
-        输入输出及副作用：输入参数为 name, count，返回声明类型结果或更新调用方拥有的局部状态；不修改冻结源码和仓库 golden。
-        失败边界：缺失、重复、越界、来源/坐标漂移或无法满足该操作的唯一性条件时抛 ValidationError，禁止静默接受不一致。
+        """
+        功能：在 RDMA profile checker 的 _build_sq_golden_cases/sgb_sge 中构造把 SGE
+        放入 detached SGB 的 RC
+        case。
+        输入输出及副作用：name 标识 case，count 指定 SGE 数量；构造 count
+        个 detached-SGB SGE 的 RC SQE，写入
+        SGB_PA 并用 _sq_sge 生成 512-byte SGB。
+        失败边界：count 大于 32、SGB descriptor 越界或 image occupancy 冲突时抛
+        ValidationError；SQE 与 SGB
+        作为独立快照登记。
         """
         image = ReferenceImage(64)
         _sq_header(image, 1, inline=False, se=True, index=0x1400 + count)
@@ -1627,9 +1748,15 @@ def _build_sq_golden_cases() -> tuple[list[GoldenCase], dict[str, bytes]]:
     add("local_invalidate", "case=local_invalidate,opcode=14,mode=none", image)
 
     def atomic(name: str, opcode: int, cas: bool) -> None:
-        """功能：在 RDMA profile checker 的 _build_sq_golden_cases/atomic 中按 cas 分支构造 CAS 或 FAA atomic case。
-        输入输出及副作用：输入参数为 name, opcode, cas，返回声明类型结果或更新调用方拥有的局部状态；不修改冻结源码和仓库 golden。
-        失败边界：缺失、重复、越界、来源/坐标漂移或无法满足该操作的唯一性条件时抛 ValidationError，禁止静默接受不一致。
+        """
+        功能：在 RDMA profile checker 的 _build_sq_golden_cases/atomic 中按 cas
+        分支构造 CAS 或 FAA atomic
+        case。
+        输入输出及副作用：按 cas 选择 opcode 7 的 CAS 或 opcode 8 的 FAA，
+        填充 atomic remote/local SGE 和对应
+        swap/cmp 或 add data。
+        失败边界：cas 分支之外不会写另一组 atomic data；任何 64-bit atomic
+        字段溢出或重复占位由 put_named 拒绝。
         """
         image = ReferenceImage(64)
         _sq_header(image, opcode, inline=False, index=0x1600 + int(cas))
@@ -1652,9 +1779,15 @@ def _build_sq_golden_cases() -> tuple[list[GoldenCase], dict[str, bytes]]:
     atomic("atomic_faa", 8, False)
 
     def ud(name: str, with_sgb: bool) -> None:
-        """功能：在 RDMA profile checker 的 _build_sq_golden_cases/ud 中构造 inline 或 SGB 模式的 UD case。
-        输入输出及副作用：输入参数为 name, with_sgb，返回声明类型结果或更新调用方拥有的局部状态；不修改冻结源码和仓库 golden。
-        失败边界：缺失、重复、越界、来源/坐标漂移或无法满足该操作的唯一性条件时抛 ValidationError，禁止静默接受不一致。
+        """
+        功能：在 RDMA profile checker 的 _build_sq_golden_cases/ud 中构造 inline 或
+        SGB 模式的 UD case。
+        输入输出及副作用：name 标识 case，with_sgb 选择 inline 或 SGB；编码
+        DMAC、VLAN、routing、IPv6、Q_Key 等字段并
+        固定目的 IPv6 字节序。
+        失败边界：with_sgb 为真时必须能写入 SGB_PA 和一个 SGE；字段范围或
+        16-byte destination IP 长度不符时抛
+        ValidationError。
         """
         image = ReferenceImage(64)
         _sq_header(image, 1, inline=not with_sgb, se=True, index=0x1700 + int(with_sgb))
@@ -1696,9 +1829,14 @@ def _build_sq_golden_cases() -> tuple[list[GoldenCase], dict[str, bytes]]:
 
 
 def sq_reference_image(case_name: str = "sqe_rc_boundary") -> bytes:
-    """功能：在 RDMA profile checker 的 sq_reference_image 中从生成集合按名称返回 SQE reference bytes。
-    输入输出及副作用：输入参数为 case_name，返回声明类型结果或更新调用方拥有的局部状态；不修改冻结源码和仓库 golden。
-    失败边界：缺失、重复、越界、来源/坐标漂移或无法满足该操作的唯一性条件时抛 ValidationError，禁止静默接受不一致。
+    """
+    功能：在 RDMA profile checker 的 sq_reference_image 中从生成集合按名称返回
+    SQE reference bytes。
+    输入输出及副作用：case_name 选择 _build_sq_golden_cases 生成的 SQE；
+    返回对应 immutable payload bytes，不返回可变
+    ReferenceImage。
+    失败边界：case_name 不在生成集合时抛 unknown SQ golden case；命中 case
+    时即使 payload 全零也按名称返回。
     """
     for case in _build_sq_golden_cases()[0]:
         if case.name == case_name:
@@ -1707,9 +1845,13 @@ def sq_reference_image(case_name: str = "sqe_rc_boundary") -> bytes:
 
 
 def sq_reference_sgb(case_name: str = "sgb_boundary") -> bytes:
-    """功能：在 RDMA profile checker 的 sq_reference_sgb 中从生成集合按名称返回 detached SGB bytes。
-    输入输出及副作用：输入参数为 case_name，返回声明类型结果或更新调用方拥有的局部状态；不修改冻结源码和仓库 golden。
-    失败边界：缺失、重复、越界、来源/坐标漂移或无法满足该操作的唯一性条件时抛 ValidationError，禁止静默接受不一致。
+    """
+    功能：在 RDMA profile checker 的 sq_reference_sgb 中从生成集合按名称返回
+    detached SGB bytes。
+    输入输出及副作用：case_name 选择 detached SGB 字典项；返回对应 512-byte
+    bytes 快照，不暴露内部可变对象。
+    失败边界：缺少 case_name（包括非 SGB 的 SQE 名称）时抛 unknown SQ SGB
+    case，已有字典不会被修改。
     """
     sgb = _build_sq_golden_cases()[1]
     if case_name not in sgb:
@@ -1718,9 +1860,14 @@ def sq_reference_sgb(case_name: str = "sgb_boundary") -> bytes:
 
 
 def validate_sq_golden_vectors() -> None:
-    """功能：在 RDMA profile checker 的 validate_sq_golden_vectors 中逐字节比较仓库 sq.hex 与独立 SQE/SGB reference。
-    输入输出及副作用：输入参数为 无参数，返回声明类型结果或更新调用方拥有的局部状态；不修改冻结源码和仓库 golden。
-    失败边界：缺失、重复、越界、来源/坐标漂移或无法满足该操作的唯一性条件时抛 ValidationError，禁止静默接受不一致。
+    """
+    功能：在 RDMA profile checker 的 validate_sq_golden_vectors 中逐字节比较仓库
+    sq.hex 与独立 SQE/SGB
+    reference。
+    输入输出及副作用：无参数；读取 GOLDEN_DIR/sq.hex，
+    解析后与独立生成的 SQE 及 detached SGB cases 逐 case、逐 byte 比较。
+    失败边界：文件缺失、末尾换行/marker/摘要/长度格式错误，或实际
+    case 与生成 reference 不完全相等时抛 ValidationError。
     """
     path = GOLDEN_DIR / "sq.hex"
     if not path.is_file():
@@ -1744,14 +1891,25 @@ def validate_mapping_uniqueness(
     value_mappings: tuple[ValueMapping, ...],
     reference_fields: tuple[ReferenceField, ...],
 ) -> None:
-    """功能：在 RDMA profile checker 的 validate_mapping_uniqueness 中验证 field/value/reference source 与最终 SV 名称唯一。
-    输入输出及副作用：输入参数为 field_mappings, value_mappings, reference_fields，返回声明类型结果或更新调用方拥有的局部状态；不修改冻结源码和仓库 golden。
-    失败边界：缺失、重复、越界、来源/坐标漂移或无法满足该操作的唯一性条件时抛 ValidationError，禁止静默接受不一致。
+    """
+    功能：在 RDMA profile checker 的 validate_mapping_uniqueness 中验证 field/value/
+    reference source 与最终
+    SV 名称唯一。
+    输入输出及副作用：field_mappings、value_mappings、reference_fields
+    分别提供字段、值和 reference rows；函数检查
+    三类 mapping 的 SV stem、source identity 与最终常量名唯一，并允许
+    MODIFY_DATA 的四个固定 qword 例外。
+    失败边界：重复 stem/source、例外 offset 不是 32/40/48/56，或不同 producer
+    争用同一最终常量时抛 ValidationError。
     """
     def unique(items, label: str) -> None:
-        """功能：在 RDMA profile checker 的 validate_mapping_uniqueness/unique 中在局部 seen 集合中拒绝重复映射键。
-        输入输出及副作用：输入参数为 items, label，返回声明类型结果或更新调用方拥有的局部状态；不修改冻结源码和仓库 golden。
-        失败边界：缺失、重复、越界、来源/坐标漂移或无法满足该操作的唯一性条件时抛 ValidationError，禁止静默接受不一致。
+        """
+        功能：在 RDMA profile checker 的 validate_mapping_uniqueness/unique 中在局部
+        seen 集合中拒绝重复映射键。
+        输入输出及副作用：遍历 items，在局部 seen 集合中登记 label
+        对应的键；成功无返回且不改变输入迭代器元素。
+        失败边界：同一键第二次出现立即抛 duplicate label；
+        空迭代器合法通过，调用方负责选择键的语义。
         """
         seen = set()
         for item in items:
@@ -1760,9 +1918,15 @@ def validate_mapping_uniqueness(
             seen.add(item)
 
     def unique_sources(items, label: str) -> None:
-        """功能：在 RDMA profile checker 的 validate_mapping_uniqueness/unique_sources 中聚合 source offset 并执行 MODIFY_DATA 四 offset 例外。
-        输入输出及副作用：输入参数为 items, label，返回声明类型结果或更新调用方拥有的局部状态；不修改冻结源码和仓库 golden。
-        失败边界：缺失、重复、越界、来源/坐标漂移或无法满足该操作的唯一性条件时抛 ValidationError，禁止静默接受不一致。
+        """
+        功能：在 RDMA profile checker 的 validate_mapping_uniqueness/unique_sources
+        中聚合 source offset
+        并执行 MODIFY_DATA 四 offset 例外。
+        输入输出及副作用：items 提供待审计 mapping，label 命名错误类别；
+        按 (item.path,item.c_symbol) 聚合
+        word_byte_offset，仅允许 MODIFY_DATA 恰好占用 32/40/48/56 四个偏移。
+        失败边界：任何其它 source 重复，或 MODIFY_DATA 缺少/
+        多出固定四偏移时抛 duplicate label，避免 source identity 被覆盖。
         """
         modify_data_source = ("cmq.h", "XTRDMA_CMQSQ_WQE_MODIFY_DATA")
         modify_data_offsets = {32, 40, 48, 56}
@@ -1798,9 +1962,15 @@ def validate_mapping_uniqueness(
     final_names: dict[str, str] = {}
 
     def add_final(name: str, producer: str) -> None:
-        """功能：在 RDMA profile checker 的 validate_mapping_uniqueness/add_final 中登记最终 SV 常量的唯一 producer。
-        输入输出及副作用：输入参数为 name, producer，返回声明类型结果或更新调用方拥有的局部状态；不修改冻结源码和仓库 golden。
-        失败边界：缺失、重复、越界、来源/坐标漂移或无法满足该操作的唯一性条件时抛 ValidationError，禁止静默接受不一致。
+        """
+        功能：在 RDMA profile checker 的 validate_mapping_uniqueness/add_final
+        中登记最终 SV 常量的唯一
+        producer。
+        输入输出及副作用：name 是最终发出的 SV 常量名，producer 标识其
+        field/value/error/profile 来源；记录到 final_names
+        并返回 None。
+        失败边界：同名常量已有不同 producer 时抛 duplicate global SV constant；
+        同一 producer 重复登记保持幂等。
         """
         previous = final_names.get(name)
         if previous is not None and previous != producer:
@@ -1831,9 +2001,14 @@ def validate_profile_constants(
     sv_constants: dict[str, int],
     profile_values: dict[str, int],
 ) -> None:
-    """功能：在 RDMA profile checker 的 validate_profile_constants 中比较 profile_values 与解析的 SV 常量。
-    输入输出及副作用：输入参数为 sv_constants, profile_values，返回声明类型结果或更新调用方拥有的局部状态；不修改冻结源码和仓库 golden。
-    失败边界：缺失、重复、越界、来源/坐标漂移或无法满足该操作的唯一性条件时抛 ValidationError，禁止静默接受不一致。
+    """
+    功能：在 RDMA profile checker 的 validate_profile_constants 中比较 profile_values
+    与解析的 SV 常量。
+    输入输出及副作用：逐项比较 sv_constants 与 profile_values 的固定 profile
+    ABI（HW_VERSION、对象字节数、CMQ success、目的
+    IP placement）。
+    失败边界：缺少 required name 或数值不等于 expected 时抛 ValidationError；
+    额外常量不在此函数中删除。
     """
     for name, expected in profile_values.items():
         actual = sv_constants.get(name)
@@ -1849,9 +2024,16 @@ def validate_body_translations(
     translations: tuple[BodyTranslation, ...],
     field_mappings: tuple[FieldMapping, ...],
 ) -> None:
-    """功能：在 RDMA profile checker 的 validate_body_translations 中校验 context body 的 local 到 final qword 偏移换算。
-    输入输出及副作用：输入参数为 translations, field_mappings，返回声明类型结果或更新调用方拥有的局部状态；不修改冻结源码和仓库 golden。
-    失败边界：缺失、重复、越界、来源/坐标漂移或无法满足该操作的唯一性条件时抛 ValidationError，禁止静默接受不一致。
+    """
+    功能：在 RDMA profile checker 的 validate_body_translations 中校验 context body 的
+    local 到 final
+    qword 偏移换算。
+    输入输出及副作用：translations 提供 local/final 偏移，field_mappings
+    提供预期字段；核对 context body 的
+    local_word_byte_offset+final_base_offset 是否等于每个 FieldMapping 的最终 qword
+    byte offset。
+    失败边界：translation 重复、source/stem 不在 CQC/SRQC/EQC 期望集合、
+    坐标不等或漏项时抛 ValidationError。
     """
     expected = {
         mapping.sv_stem: mapping
@@ -1887,9 +2069,15 @@ def validate_body_translations(
 
 
 def validate_sv_mask_api(text: str) -> None:
-    """功能：在 RDMA profile checker 的 validate_sv_mask_api 中检查 image mask API 签名、selector 和 qword 边界保护。
-    输入输出及副作用：输入参数为 text，返回声明类型结果或更新调用方拥有的局部状态；不修改冻结源码和仓库 golden。
-    失败边界：缺失、重复、越界、来源/坐标漂移或无法满足该操作的唯一性条件时抛 ValidationError，禁止静默接受不一致。
+    """
+    功能：在 RDMA profile checker 的 validate_sv_mask_api 中检查 image mask API
+    签名、selector 和 qword
+    边界保护。
+    输入输出及副作用：text 为 image mask SV 源码；检查 request_envelope_mask/
+    body_mask 的完整签名、五种 image kind
+    selector 和 qword_index 边界守卫。
+    失败边界：任一签名缺失、selector 缺失或 qword_index > 7
+    检查少于两处时抛 ValidationError。
     """
     envelope_signature = re.compile(
         r"function\s+automatic\s+bit\s*\[63:0\]\s+"
@@ -1918,9 +2106,14 @@ def validate_sv_mask_api(text: str) -> None:
 
 
 def validate_access_projections(text: str) -> None:
-    """功能：在 RDMA profile checker 的 validate_access_projections 中从 xtrdma_get_access 重建五组 access 投影。
-    输入输出及副作用：输入参数为 text，返回声明类型结果或更新调用方拥有的局部状态；不修改冻结源码和仓库 golden。
-    失败边界：缺失、重复、越界、来源/坐标漂移或无法满足该操作的唯一性条件时抛 ValidationError，禁止静默接受不一致。
+    """
+    功能：在 RDMA profile checker 的 validate_access_projections 中从 xtrdma_get_access
+    重建五组 access 投影。
+    输入输出及副作用：text 是 rdma_main.h 的源码；从其中 xtrdma_get_access
+    函数体提取 access 条件，返回 None
+    并核对五组 IB_ACCESS 到 XTRDMA flag 的投影。
+    失败边界：函数缺失、return hw_access 缺失或观察到的条件集合与
+    ACCESS_PROJECTIONS 不完全相等时抛 ValidationError。
     """
     function = re.search(
         r"\bstatic\s+inline\s+u8\s+xtrdma_get_access\s*\([^)]*\)\s*\{"
@@ -1948,9 +2141,13 @@ def validate_access_projections(text: str) -> None:
 
 
 def parse_sv_masks(text: str) -> dict[str, tuple[int, ...]]:
-    """功能：在 RDMA profile checker 的 parse_sv_masks 中解析八 qword 的 SV field mask 数组。
-    输入输出及副作用：输入参数为 text，返回声明类型结果或更新调用方拥有的局部状态；不修改冻结源码和仓库 golden。
-    失败边界：缺失、重复、越界、来源/坐标漂移或无法满足该操作的唯一性条件时抛 ValidationError，禁止静默接受不一致。
+    """
+    功能：在 RDMA profile checker 的 parse_sv_masks 中解析八 qword 的 SV field mask
+    数组。
+    输入输出及副作用：text 为 SV mask 定义；返回每个 *_MASK
+    名称对应的恰好八个 qword 整数 tuple。
+    失败边界：重复名称、元素不是可解析 SV literal 或元素数量不是 8
+    时抛 ValidationError；没有 mask 时返回空 dict。
     """
     masks: dict[str, tuple[int, ...]] = {}
     pattern = re.compile(
@@ -1972,9 +2169,13 @@ def parse_sv_masks(text: str) -> dict[str, tuple[int, ...]]:
 
 
 def parse_sv_ownership(text: str) -> dict[str, tuple[int, ...]]:
-    """功能：在 RDMA profile checker 的 parse_sv_ownership 中解析八 qword 的 SV body ownership 数组。
-    输入输出及副作用：输入参数为 text，返回声明类型结果或更新调用方拥有的局部状态；不修改冻结源码和仓库 golden。
-    失败边界：缺失、重复、越界、来源/坐标漂移或无法满足该操作的唯一性条件时抛 ValidationError，禁止静默接受不一致。
+    """
+    功能：在 RDMA profile checker 的 parse_sv_ownership 中解析八 qword 的 SV body
+    ownership 数组。
+    输入输出及副作用：text 为 SV body ownership 定义；返回每个 *_OWNERSHIP
+    名称对应的八 qword tuple，独立于 field mask 解析。
+    失败边界：重复名称或 ownership 数组不是八个可解析 literal 时抛
+    ValidationError；缺少声明由上层基线比较发现。
     """
     ownership: dict[str, tuple[int, ...]] = {}
     pattern = re.compile(
@@ -1998,9 +2199,14 @@ def parse_sv_ownership(text: str) -> dict[str, tuple[int, ...]]:
 def validate_cmq_body_ownership(
     ownership: dict[str, tuple[int, ...]],
 ) -> None:
-    """功能：在 RDMA profile checker 的 validate_cmq_body_ownership 中比较 CMQ body ownership 基线并确认不侵入 envelope。
-    输入输出及副作用：输入参数为 ownership，返回声明类型结果或更新调用方拥有的局部状态；不修改冻结源码和仓库 golden。
-    失败边界：缺失、重复、越界、来源/坐标漂移或无法满足该操作的唯一性条件时抛 ValidationError，禁止静默接受不一致。
+    """
+    功能：在 RDMA profile checker 的 validate_cmq_body_ownership 中比较 CMQ body
+    ownership 基线并确认不侵入
+    envelope。
+    输入输出及副作用：将 ownership 与 CMQ_BODY_OWNERSHIP 八 qword
+    基线逐项比较，并确认任一 body bit 不与 ENVELOPE_MASK 重叠。
+    失败边界：键集合、qword 值或 envelope overlap 任一漂移都抛
+    ValidationError；输入 dict 不会被修正。
     """
     if ownership != CMQ_BODY_OWNERSHIP:
         raise ValidationError(
@@ -2014,17 +2220,27 @@ def validate_cmq_body_ownership(
 
 
 def strip_c_comments(line: str) -> str:
-    """功能：在 RDMA profile checker 的 strip_c_comments 中从 C 行文本删除块注释供 source symbol 扫描。
-    输入输出及副作用：输入参数为 line，返回声明类型结果或更新调用方拥有的局部状态；不修改冻结源码和仓库 golden。
-    失败边界：缺失、重复、越界、来源/坐标漂移或无法满足该操作的唯一性条件时抛 ValidationError，禁止静默接受不一致。
+    """
+    功能：在 RDMA profile checker 的 strip_c_comments 中从 C 行文本删除块注释供
+    source symbol 扫描。
+    输入输出及副作用：line 为一行 C 源码；返回移除 /*...*/ 后并 strip
+    的文本，供 #define/enum symbol 扫描。
+    失败边界：不处理字符串语义或跨行块注释；
+    未闭合注释按正则删除到行尾，调用方需用 source digest
+    保证输入可信。
     """
     return re.sub(r"/\*.*?\*/", "", line).strip()
 
 
 def parse_c_symbols(text: str) -> tuple[dict[str, list[str]], dict[str, list[str]]]:
-    """功能：在 RDMA profile checker 的 parse_c_symbols 中提取 C #define 和 enum 的全部表达式 occurrence。
-    输入输出及副作用：输入参数为 text，返回声明类型结果或更新调用方拥有的局部状态；不修改冻结源码和仓库 golden。
-    失败边界：缺失、重复、越界、来源/坐标漂移或无法满足该操作的唯一性条件时抛 ValidationError，禁止静默接受不一致。
+    """
+    功能：在 RDMA profile checker 的 parse_c_symbols 中提取 C #define 和 enum
+    的全部表达式 occurrence。
+    输入输出及副作用：text 为 C 头文件；返回 (macros,enums)，
+    分别保存每个 symbol 的全部表达式 occurrence，并重建可解析 enum
+    隐式值。
+    失败边界：不支持的显式表达式会让后续隐式项标为占位字符串；
+    重复 occurrence 保留在 list，不能被解析器静默去重。
     """
     macros: dict[str, list[str]] = {}
     for raw_line in text.splitlines():
@@ -2067,9 +2283,14 @@ def parse_c_symbols(text: str) -> tuple[dict[str, list[str]], dict[str, list[str
 def require_unique_expression(
     symbols: dict[str, list[str]], symbol: str, source_path: str
 ) -> str:
-    """功能：在 RDMA profile checker 的 require_unique_expression 中取得一个 source symbol 的唯一可解析表达式。
-    输入输出及副作用：输入参数为 symbols, symbol, source_path，返回声明类型结果或更新调用方拥有的局部状态；不修改冻结源码和仓库 golden。
-    失败边界：缺失、重复、越界、来源/坐标漂移或无法满足该操作的唯一性条件时抛 ValidationError，禁止静默接受不一致。
+    """
+    功能：在 RDMA profile checker 的 require_unique_expression 中取得一个 source
+    symbol 的唯一可解析表达式。
+    输入输出及副作用：从 symbols 中取 source_path:symbol
+    的唯一表达式并返回原文；wr.h 的 UD_DST_Q_KEY
+    允许相同文本的受控重复。
+    失败边界：symbol 缺失、出现多个不同表达式，
+    或重复不属于该唯一例外时抛 ValidationError。
     """
     expressions = symbols.get(symbol, [])
     if not expressions:
@@ -2088,9 +2309,15 @@ def require_unique_expression(
 def discover_error_code_values(
     source_text: dict[str, str],
 ) -> dict[tuple[str, str], int]:
-    """功能：在 RDMA profile checker 的 discover_error_code_values 中发现并解析 defs.h/wr.h 的真实 8-bit error code。
-    输入输出及副作用：输入参数为 source_text，返回声明类型结果或更新调用方拥有的局部状态；不修改冻结源码和仓库 golden。
-    失败边界：缺失、重复、越界、来源/坐标漂移或无法满足该操作的唯一性条件时抛 ValidationError，禁止静默接受不一致。
+    """
+    功能：在 RDMA profile checker 的 discover_error_code_values 中发现并解析 defs.h/
+    wr.h 的真实 8-bit error
+    code。
+    输入输出及副作用：source_text 按文件名提供 defs.h/wr.h 源码；读取其中
+    EC_* 与 XTRDMA_CQE_ECODE_*，解析为
+    (path,symbol)->8-bit integer 字典。
+    失败边界：源文件缺失、symbol 重复、表达式不可解析或值超出 0..0xff
+    时抛 ValidationError。
     """
     values: dict[tuple[str, str], int] = {}
     patterns = {
@@ -2128,9 +2355,14 @@ def validate_error_code_mappings(
     source_text: dict[str, str],
     sv_text: str,
 ) -> dict[tuple[str, str], int]:
-    """功能：在 RDMA profile checker 的 validate_error_code_mappings 中闭合 C error identity、SV 常量和数值映射。
-    输入输出及副作用：输入参数为 mappings, source_text, sv_text，返回声明类型结果或更新调用方拥有的局部状态；不修改冻结源码和仓库 golden。
-    失败边界：缺失、重复、越界、来源/坐标漂移或无法满足该操作的唯一性条件时抛 ValidationError，禁止静默接受不一致。
+    """
+    功能：在 RDMA profile checker 的 validate_error_code_mappings 中闭合 C error
+    identity、SV 常量和数值映射。
+    输入输出及副作用：mappings 提供 C identity/SV 名称，source_text 提供 defs.h/
+    wr.h 字节，sv_text 提供 SV 声明；
+    闭合三者的 identity 与数值并返回 source_values 供 canonical alias 选择。
+    失败边界：identity/SV 名重复、缺失/额外 mapping、非 bit[7:0] 单一定义或
+    C/SV 数值漂移时抛 ValidationError。
     """
     sv_text = mask_sv_strings(strip_sv_comments(sv_text))
     identities = [(mapping.path, mapping.c_symbol) for mapping in mappings]
@@ -2210,9 +2442,15 @@ def canonical_error_code_mappings(
     source_values: dict[tuple[str, str], int],
     expected_aliases=EXPECTED_ERROR_CODE_ALIASES,
 ) -> dict[int, ErrorCodeMapping]:
-    """功能：在 RDMA profile checker 的 canonical_error_code_mappings 中校验 alias 集并选择 defs.h 优先的 canonical identity。
-    输入输出及副作用：输入参数为 mappings, source_values, expected_aliases，返回声明类型结果或更新调用方拥有的局部状态；不修改冻结源码和仓库 golden。
-    失败边界：缺失、重复、越界、来源/坐标漂移或无法满足该操作的唯一性条件时抛 ValidationError，禁止静默接受不一致。
+    """
+    功能：在 RDMA profile checker 的 canonical_error_code_mappings 中校验 alias
+    集并选择 defs.h 优先的
+    canonical identity。
+    输入输出及副作用：mappings 提供候选 identity，source_values 提供 C 数值，
+    expected_aliases 提供冻结 alias 集；
+    按数值聚合并为每个值选择 defs.h 优先的 ErrorCodeMapping。
+    失败边界：观察到的 alias 集合与预期不等、同值出现多个 defs.h
+    identity 或 source value 缺失时抛 ValidationError。
     """
     by_value: dict[int, list[ErrorCodeMapping]] = {}
     for mapping in mappings:
@@ -2251,9 +2489,17 @@ def validate_error_codec(
     codec_text: str,
     canonical: dict[int, ErrorCodeMapping],
 ) -> None:
-    """功能：在 RDMA profile checker 的 validate_error_codec 中闭合错误 codec 的常量、case、symbolic_name 和 decode_status。
-    输入输出及副作用：输入参数为 codec_text, canonical，返回声明类型结果或更新调用方拥有的局部状态；不修改冻结源码和仓库 golden。
-    失败边界：缺失、重复、越界、来源/坐标漂移或无法满足该操作的唯一性条件时抛 ValidationError，禁止静默接受不一致。
+    """
+    功能：在 RDMA profile checker 的 validate_error_codec 中闭合错误 codec
+    的常量、case、symbolic_name 和
+    decode_status。
+    输入输出及副作用：codec_text 是错误 codec 源码，canonical 是数值到
+    canonical mapping；审计 preprocessor、
+    classify/inferred_engine case、symbolic_name 文本和 decode_status 的 hardware_code
+    调用闭合。
+    失败边界：known error code 裸 literal、case/default 结构、symbolic 字符串、
+    非 canonical 常量或 hardware_code
+    角色漂移均抛 ValidationError。
     """
     codec_text = strip_sv_comments(codec_text)
     codec_code = mask_sv_strings(codec_text)
@@ -2422,9 +2668,15 @@ class ReferenceImage(bytearray):
     """Golden payload plus occupancy masks for its logical qwords."""
 
     def __init__(self, byte_count: int):
-        """功能：在 RDMA profile checker 的 ReferenceImage/__init__ 中初始化零填充 reference image 及每个 qword 的 occupancy。
-        输入输出及副作用：输入参数为 self, byte_count，返回声明类型结果或更新调用方拥有的局部状态；不修改冻结源码和仓库 golden。
-        失败边界：缺失、重复、越界、来源/坐标漂移或无法满足该操作的唯一性条件时抛 ValidationError，禁止静默接受不一致。
+        """
+        功能：在 RDMA profile checker 的 ReferenceImage/__init__ 中初始化零填充
+        reference image 及每个 qword 的
+        occupancy。
+        输入输出及副作用：byte_count 指定 reference image 大小；初始化全零
+        bytearray，并建立每个 8-byte qword 的 occupancy
+        位图供重叠检测。
+        失败边界：byte_count 为负数或非整数时由 bytearray 抛 ValueError；
+        后续写入依赖 occupancy 长度与 image 保持一致。
         """
         super().__init__(byte_count)
         self.occupancy = [0] * ((byte_count + 7) // 8)
@@ -2433,9 +2685,15 @@ class ReferenceImage(bytearray):
 def put_field(
     image: ReferenceImage, logical_offset: int, width: int, value: int
 ) -> None:
-    """功能：在 RDMA profile checker 的 put_field 中按逻辑 bit 坐标以大端 qword 写字段并登记 occupancy。
-    输入输出及副作用：输入参数为 image, logical_offset, width, value，返回声明类型结果或更新调用方拥有的局部状态；不修改冻结源码和仓库 golden。
-    失败边界：缺失、重复、越界、来源/坐标漂移或无法满足该操作的唯一性条件时抛 ValidationError，禁止静默接受不一致。
+    """
+    功能：在 RDMA profile checker 的 put_field 中按逻辑 bit 坐标以大端 qword
+    写字段并登记 occupancy。
+    输入输出及副作用：在 image 的 logical_offset qword 中以大端序写 width 位
+    value，并原子更新对应 occupancy mask；返回 None。
+    失败边界：image 必须是 ReferenceImage，width/value
+    必须落在合法范围且字段不可跨 qword/image 边界或与已有 occupancy
+    重叠，否则抛
+    ValidationError。
     """
     if not isinstance(image, ReferenceImage):
         raise ValidationError("reference image occupancy tracking is required")
@@ -2456,9 +2714,14 @@ def put_field(
 
 
 def put_named(image: ReferenceImage, stem: str, value: int) -> None:
-    """功能：在 RDMA profile checker 的 put_named 中按 REFERENCE_BY_STEM 查找坐标并编码命名字段。
-    输入输出及副作用：输入参数为 image, stem, value，返回声明类型结果或更新调用方拥有的局部状态；不修改冻结源码和仓库 golden。
-    失败边界：缺失、重复、越界、来源/坐标漂移或无法满足该操作的唯一性条件时抛 ValidationError，禁止静默接受不一致。
+    """
+    功能：在 RDMA profile checker 的 put_named 中按 REFERENCE_BY_STEM
+    查找坐标并编码命名字段。
+    输入输出及副作用：image 是 ReferenceImage，stem 选择 REFERENCE_BY_STEM
+    坐标，value 是待编码整数；委托
+    put_field 写入 image 并更新 occupancy 记录。
+    失败边界：未知 stem、值超宽、字段越界或与先前命名字段重叠时抛
+    ValidationError，不会创建隐式坐标。
     """
     reference = REFERENCE_BY_STEM.get(stem)
     if reference is None:
@@ -2808,9 +3071,15 @@ def validate_reference_fields(
     field_mappings: tuple[FieldMapping, ...],
     parsed_fields: dict[str, tuple[str, str, int, int]] | None = None,
 ) -> None:
-    """功能：在 RDMA profile checker 的 validate_reference_fields 中比较 reference、FIELD_MAPPINGS 与 parsed_fields 的来源和坐标。
-    输入输出及副作用：输入参数为 reference_fields, field_mappings, parsed_fields，返回声明类型结果或更新调用方拥有的局部状态；不修改冻结源码和仓库 golden。
-    失败边界：缺失、重复、越界、来源/坐标漂移或无法满足该操作的唯一性条件时抛 ValidationError，禁止静默接受不一致。
+    """
+    功能：在 RDMA profile checker 的 validate_reference_fields 中比较 reference、
+    FIELD_MAPPINGS 与
+    parsed_fields 的来源和坐标。
+    输入输出及副作用：reference_fields 是冻结坐标，field_mappings 是 C/SV
+    映射，parsed_fields 是可选解析结果；比较三者
+    的 source identity、byte offset、lsb/width 与唯一性。
+    失败边界：重复 stem/source、坐标越 qword、mapping 缺失或 parsed_fields 与
+    reference 不等时抛 ValidationError。
     """
     mappings_by_stem = {}
     for mapping in field_mappings:
@@ -2861,9 +3130,13 @@ def validate_reference_fields(
 
 
 def parse_input_summary(summary: str) -> tuple[GoldenInput, ...]:
-    """功能：在 RDMA profile checker 的 parse_input_summary 中解析 golden header 的有序 name=value 输入摘要。
-    输入输出及副作用：输入参数为 summary，返回声明类型结果或更新调用方拥有的局部状态；不修改冻结源码和仓库 golden。
-    失败边界：缺失、重复、越界、来源/坐标漂移或无法满足该操作的唯一性条件时抛 ValidationError，禁止静默接受不一致。
+    """
+    功能：在 RDMA profile checker 的 parse_input_summary 中解析 golden header 的有序
+    name=value 输入摘要。
+    输入输出及副作用：summary 是逗号分隔的 golden header；返回保持顺序的
+    GoldenInput tuple，name/value 只接受小写 token。
+    失败边界：空摘要、格式不符或 name 重复时抛 ValidationError；
+    输入顺序不会被排序或合并。
     """
     if not summary:
         raise ValidationError("golden input summary must not be empty")
@@ -2882,21 +3155,36 @@ def parse_input_summary(summary: str) -> tuple[GoldenInput, ...]:
 
 
 def build_golden_cases() -> dict[str, list[GoldenCase]]:
-    """功能：在 RDMA profile checker 的 build_golden_cases 中构造 context、queue、doorbell 三类 reference cases。
-    输入输出及副作用：输入参数为 无参数，返回声明类型结果或更新调用方拥有的局部状态；不修改冻结源码和仓库 golden。
-    失败边界：缺失、重复、越界、来源/坐标漂移或无法满足该操作的唯一性条件时抛 ValidationError，禁止静默接受不一致。
+    """
+    功能：在 RDMA profile checker 的 build_golden_cases 中构造 context、queue、
+    doorbell 三类 reference
+    cases。
+    输入输出及副作用：无参数；创建 context、cmq、queue、doorbell 四类
+    GoldenCase 列表，所有 payload 由独立 ReferenceImage
+    编码。
+    失败边界：任何字段坐标/语义输入不匹配、目的 IP 长度错误或
+    ReferenceImage 重叠都会在构造时抛 ValidationError。
     """
     def semantic_input(name: str, value: str | int):
-        """功能：在 RDMA profile checker 的 build_golden_cases/semantic_input 中包装一个语义输入为摘要三元组。
-        输入输出及副作用：输入参数为 name, value，返回声明类型结果或更新调用方拥有的局部状态；不修改冻结源码和仓库 golden。
-        失败边界：缺失、重复、越界、来源/坐标漂移或无法满足该操作的唯一性条件时抛 ValidationError，禁止静默接受不一致。
+        """
+        功能：在 RDMA profile checker 的 build_golden_cases/semantic_input
+        中包装一个语义输入为摘要三元组。
+        输入输出及副作用：name/value 是 URC/MRT 等语义输入；返回供 make_case
+        消费的 ('',0,'name=value') 三元组，不写入 image。
+        失败边界：name/value 含逗号或不符合 parse_input_summary 的小写 token
+        时，后续摘要解析会抛 ValidationError。
         """
         return ("", 0, f"{name}={value}")
 
     def make_case(name: str, byte_count: int, inputs) -> GoldenCase:
-        """功能：在 RDMA profile checker 的 build_golden_cases/make_case 中根据摘要和字段三元组组装一个 GoldenCase。
-        输入输出及副作用：输入参数为 name, byte_count, inputs，返回声明类型结果或更新调用方拥有的局部状态；不修改冻结源码和仓库 golden。
-        失败边界：缺失、重复、越界、来源/坐标漂移或无法满足该操作的唯一性条件时抛 ValidationError，禁止静默接受不一致。
+        """
+        功能：在 RDMA profile checker 的 build_golden_cases/make_case
+        中根据摘要和字段三元组组装一个 GoldenCase。
+        输入输出及副作用：name 标识 case，byte_count 指定 image 大小，inputs
+        提供 (stem,value,summary_part) 三元组；
+        创建 image、校验可直接对应的摘要值后返回 GoldenCase 快照。
+        失败边界：byte_count 过短、字段重复/越界、摘要 token
+        非法或非派生字段值与输入不一致时抛 ValidationError。
         """
         summary = ",".join(
             summary_part for _, _, summary_part in inputs if summary_part
@@ -3230,9 +3518,16 @@ def build_golden_cases() -> dict[str, list[GoldenCase]]:
     ))
 
     def make_mrt(name: str, pbl: int, key_alloc: bool) -> GoldenCase:
-        """功能：在 RDMA profile checker 的 build_golden_cases/make_mrt 中构造指定 PBL/key-alloc 分支的 MRT body case。
-        输入输出及副作用：输入参数为 name, pbl, key_alloc，返回声明类型结果或更新调用方拥有的局部状态；不修改冻结源码和仓库 golden。
-        失败边界：缺失、重复、越界、来源/坐标漂移或无法满足该操作的唯一性条件时抛 ValidationError，禁止静默接受不一致。
+        """
+        功能：在 RDMA profile checker 的 build_golden_cases/make_mrt 中构造指定 PBL/
+        key-alloc 分支的 MRT body
+        case。
+        输入输出及副作用：name 标识 case，pbl 选择 0/1/2 分支，key_alloc
+        选择 KEY_ALLOC；据此选择 opcode，填充 STAG、
+        PBL、权限、地址和 self-parent 分支后返回 MRT case。
+        失败边界：pbl 不是 0..2 或 key_alloc 分支字段超宽/重叠时抛
+        ValidationError；只在对应 PBL 写入 PBA 或
+        FIRST_PBL_IDX。
         """
         opcode = 0x04 if key_alloc else 0x05
         stag = 0xFFFFFF
@@ -3316,9 +3611,14 @@ def build_golden_cases() -> dict[str, list[GoldenCase]]:
     ))
 
     def make_eq(name: str) -> GoldenCase:
-        """功能：在 RDMA profile checker 的 build_golden_cases/make_eq 中构造 EQC/AEQC body boundary case。
-        输入输出及副作用：输入参数为 name，返回声明类型结果或更新调用方拥有的局部状态；不修改冻结源码和仓库 golden。
-        失败边界：缺失、重复、越界、来源/坐标漂移或无法满足该操作的唯一性条件时抛 ValidationError，禁止静默接受不一致。
+        """
+        功能：在 RDMA profile checker 的 build_golden_cases/make_eq 中构造 EQC/AEQC
+        body boundary case。
+        输入输出及副作用：用 name 生成 64-byte CEQC/AEQC body boundary case，
+        覆盖 EQN、state、PBA、PI/CI、MSI-X
+        等字段。
+        失败边界：name 只影响 case identity；任何固定边界值无法落入
+        reference width 时 put_named 抛 ValidationError。
         """
         return make_case(name, 64, (
             ("RDMA_EQC_BODY_EQN", 0xFFF, "eqn=0xfff"),
@@ -3486,9 +3786,15 @@ def build_golden_cases() -> dict[str, list[GoldenCase]]:
     ))
 
     def make_qp_control(name, qpn, dst_port, qp_sn, icos, db_type, offset):
-        """功能：在 RDMA profile checker 的 build_golden_cases/make_qp_control 中构造 QP control doorbell 的 8-byte case。
-        输入输出及副作用：输入参数为 name, qpn, dst_port, qp_sn, icos, db_type, offset，返回声明类型结果或更新调用方拥有的局部状态；不修改冻结源码和仓库 golden。
-        失败边界：缺失、重复、越界、来源/坐标漂移或无法满足该操作的唯一性条件时抛 ValidationError，禁止静默接受不一致。
+        """
+        功能：在 RDMA profile checker 的 build_golden_cases/make_qp_control 中构造 QP
+        control doorbell 的
+        8-byte case。
+        输入输出及副作用：name 标识 case，qpn/dst_port/qp_sn/icos/db_type 编码 QP
+        控制字段，offset 写入摘要；返回
+        8-byte QP control doorbell GoldenCase。
+        失败边界：字段超宽或 offset 摘要不是合法数值时构造失败；
+        函数不验证不同 doorbell case 的 offset 唯一性。
         """
         return make_case(name, 8, (
             ("RDMA_NOTIFY_QP_QPN", qpn, f"qpn={qpn:#x}"),
@@ -3557,9 +3863,13 @@ def build_golden_cases() -> dict[str, list[GoldenCase]]:
 
 
 def render_golden(cases: list[GoldenCase]) -> str:
-    """功能：在 RDMA profile checker 的 render_golden 中把 GoldenCase 渲染为 canonical marker、摘要和 hex 文本。
-    输入输出及副作用：输入参数为 cases，返回声明类型结果或更新调用方拥有的局部状态；不修改冻结源码和仓库 golden。
-    失败边界：缺失、重复、越界、来源/坐标漂移或无法满足该操作的唯一性条件时抛 ValidationError，禁止静默接受不一致。
+    """
+    功能：在 RDMA profile checker 的 render_golden 中把 GoldenCase 渲染为 canonical
+    marker、摘要和 hex 文本。
+    输入输出及副作用：按 cases 顺序输出 marker、case 名、canonical inputs、
+    byte count 和两位小写 hex payload 文本。
+    失败边界：case.summary 重新解析后若不等于 case.inputs 抛 ValidationError；
+    空 cases 返回单个换行，是否接受由调用方决定。
     """
     lines: list[str] = []
     for index, case in enumerate(cases):
@@ -3580,9 +3890,14 @@ def render_golden(cases: list[GoldenCase]) -> str:
 
 
 def parse_golden_text(text: str) -> list[GoldenCase]:
-    """功能：在 RDMA profile checker 的 parse_golden_text 中严格解析并重建 canonical golden cases。
-    输入输出及副作用：输入参数为 text，返回声明类型结果或更新调用方拥有的局部状态；不修改冻结源码和仓库 golden。
-    失败边界：缺失、重复、越界、来源/坐标漂移或无法满足该操作的唯一性条件时抛 ValidationError，禁止静默接受不一致。
+    """
+    功能：在 RDMA profile checker 的 parse_golden_text 中严格解析并重建 canonical
+    golden cases。
+    输入输出及副作用：text 为 golden 文件；严格读取五行 case block，重建
+    GoldenCase 列表并用 render_golden 做 canonical
+    round-trip。
+    失败边界：缺少末尾换行、空行分隔、marker/header、hex、长度、重复
+    name 或 round-trip 任一漂移时抛 ValidationError。
     """
     if not text.endswith("\n"):
         raise ValidationError("golden file must end with one newline")
@@ -3628,21 +3943,38 @@ def parse_golden_text(text: str) -> list[GoldenCase]:
 
 
 def validate_context_contract(cases: list[GoldenCase]) -> None:
-    """功能：在 RDMA profile checker 的 validate_context_contract 中验证 context case 顺序、派生字段、mask 和 body translation。
-    输入输出及副作用：输入参数为 cases，返回声明类型结果或更新调用方拥有的局部状态；不修改冻结源码和仓库 golden。
-    失败边界：缺失、重复、越界、来源/坐标漂移或无法满足该操作的唯一性条件时抛 ValidationError，禁止静默接受不一致。
+    """
+    功能：在 RDMA profile checker 的 validate_context_contract 中验证 context case
+    顺序、派生字段、mask 和 body
+    translation。
+    输入输出及副作用：检查 context cases 的固定顺序/长度、RC/UD/URC
+    派生字段、MRT/SRQC/EQC body mask 以及 local-to-final
+    translations。
+    失败边界：case 名称、payload 长度、transport/traffic class、split backing、
+    幂次深度、semantic input
+    或任一字段映射不符时抛 ValidationError。
     """
     def inputs_by_name(case: GoldenCase) -> dict[str, str]:
-        """功能：在 RDMA profile checker 的 validate_context_contract/inputs_by_name 中建立单个 case 的输入名称查找表。
-        输入输出及副作用：输入参数为 case，返回声明类型结果或更新调用方拥有的局部状态；不修改冻结源码和仓库 golden。
-        失败边界：缺失、重复、越界、来源/坐标漂移或无法满足该操作的唯一性条件时抛 ValidationError，禁止静默接受不一致。
+        """
+        功能：在 RDMA profile checker 的 validate_context_contract/inputs_by_name
+        中建立单个 case
+        的输入名称查找表。
+        输入输出及副作用：case.inputs 为 GoldenInput 序列；返回 name 到 value
+        的字典供同一 context case 的派生校验读取，不修改
+        case。
+        失败边界：重复 name 在 parse_input_summary 阶段已拒绝；此 helper 对空
+        inputs 返回空 dict，缺失键由调用方报告。
         """
         return {item.name: item.value for item in case.inputs}
 
     def numeric_input(case: GoldenCase, name: str) -> int:
-        """功能：在 RDMA profile checker 的 validate_context_contract/numeric_input 中读取并解析单个 case 的数值输入。
-        输入输出及副作用：输入参数为 case, name，返回声明类型结果或更新调用方拥有的局部状态；不修改冻结源码和仓库 golden。
-        失败边界：缺失、重复、越界、来源/坐标漂移或无法满足该操作的唯一性条件时抛 ValidationError，禁止静默接受不一致。
+        """
+        功能：在 RDMA profile checker 的 validate_context_contract/numeric_input
+        中读取并解析单个 case 的数值输入。
+        输入输出及副作用：从 case.inputs 读取 name，并把 0x/十进制 value
+        转成 int，供 PSN、backing、depth 等数值比较。
+        失败边界：name 缺失或 value 不是允许的小写十六进制/
+        十进制形式时抛 ValidationError，并带 case.name 定位。
         """
         value = inputs_by_name(case).get(name)
         if value is None or re.fullmatch(r"(?:0x[0-9a-f]+|[0-9]+)", value) is None:
@@ -3650,9 +3982,14 @@ def validate_context_contract(cases: list[GoldenCase]) -> None:
         return int(value, 0)
 
     def field_value(case: GoldenCase, stem: str) -> int:
-        """功能：在 RDMA profile checker 的 validate_context_contract/field_value 中按冻结 reference 坐标从 payload 解码字段。
-        输入输出及副作用：输入参数为 case, stem，返回声明类型结果或更新调用方拥有的局部状态；不修改冻结源码和仓库 golden。
-        失败边界：缺失、重复、越界、来源/坐标漂移或无法满足该操作的唯一性条件时抛 ValidationError，禁止静默接受不一致。
+        """
+        功能：在 RDMA profile checker 的 validate_context_contract/field_value
+        中按冻结 reference 坐标从
+        payload 解码字段。
+        输入输出及副作用：按 REFERENCE_BY_STEM 取 case.payload 的大端 qword，
+        右移 reference.lsb 并截取 width 位返回字段值。
+        失败边界：stem 不在 reference 表会触发 KeyError；payload 短于
+        word_byte_offset+8 时由切片整数结果暴露，契约层负责拒绝。
         """
         reference = REFERENCE_BY_STEM[stem]
         word = int.from_bytes(
@@ -3920,9 +4257,15 @@ def validate_context_contract(cases: list[GoldenCase]) -> None:
         raise ValidationError(f"{urc.name} derived next DSQ address mismatch")
 
     def exact_log2(input_name: str) -> int:
-        """功能：在 RDMA profile checker 的 validate_context_contract/exact_log2 中验证 URC 深度/阈值为二次幂并求 log2。
-        输入输出及副作用：输入参数为 input_name，返回声明类型结果或更新调用方拥有的局部状态；不修改冻结源码和仓库 golden。
-        失败边界：缺失、重复、越界、来源/坐标漂移或无法满足该操作的唯一性条件时抛 ValidationError，禁止静默接受不一致。
+        """
+        功能：在 RDMA profile checker 的 validate_context_contract/exact_log2 中验证
+        URC 深度/阈值为二次幂并求
+        log2。
+        输入输出及副作用：读取 URC case 的 input_name，确认 entries
+        是非零二次幂并返回 bit_length()-1，供 depth/threshold
+        字段比较。
+        失败边界：输入为 0 或含多个 1 bit 时抛 ValidationError；缺失/
+        非数值先由 numeric_input 拒绝。
         """
         entries = numeric_input(urc, input_name)
         if entries == 0 or entries & (entries - 1):
@@ -4069,9 +4412,15 @@ DOORBELL_CASE_OFFSETS = (
 def validate_doorbell_contract(
     cases: list[GoldenCase], queue_cases: list[GoldenCase]
 ) -> None:
-    """功能：在 RDMA profile checker 的 validate_doorbell_contract 中验证 doorbell case 顺序、offset、SQ header 和 payload。
-    输入输出及副作用：输入参数为 cases, queue_cases，返回声明类型结果或更新调用方拥有的局部状态；不修改冻结源码和仓库 golden。
-    失败边界：缺失、重复、越界、来源/坐标漂移或无法满足该操作的唯一性条件时抛 ValidationError，禁止静默接受不一致。
+    """
+    功能：在 RDMA profile checker 的 validate_doorbell_contract 中验证 doorbell case
+    顺序、offset、SQ header
+    和 payload。
+    输入输出及副作用：cases 提供 doorbell GoldenCase，queue_cases 提供 queue
+    SQE；核对 cases 的固定名称顺序、8-byte
+    长度、offset 序列，并确认 SQ doorbell 等于 queue SQE 的前 8 bytes。
+    失败边界：offset 缺失/格式错误、case 几何或 payload 漂移、SQE case
+    缺失时抛 ValidationError。
     """
     if tuple(case.name for case in cases) != DOORBELL_CASE_NAMES:
         raise ValidationError("doorbell golden order/name contract drift")
@@ -4107,7 +4456,13 @@ def validate_doorbell_contract(
 
 
 def selector_matches(text: str, selector: str) -> bool:
-    """功能：判断源码文本是否覆盖 manifest selector 的任一替代项；输入输出及副作用：读取 text 和 selector，返回布尔覆盖结果且不修改输入；失败边界：空 selector 无匹配，glob 仅按符号名匹配，描述性 selector 按转义文本匹配。"""
+    """
+    功能：判断源码文本是否覆盖 manifest selector 的任一替代项；
+    输入输出及副作用：text 为一个锁定源码文件，selector 为 |
+    分隔的符号/glob/文本；返回是否至少命中一个 selector，不修改输入。
+    失败边界：空 selector 返回 False；glob 只匹配 parse_c_symbols 发现的
+    symbol，普通 selector 按标识边界匹配，避免注释子串误命中。
+    """
     macros, enums = parse_c_symbols(text)
     enum_tags = re.findall(r"\benum\s+([A-Za-z_]\w*)\s*\{", text)
     symbols = tuple(macros) + tuple(enums) + tuple(enum_tags)
@@ -4131,7 +4486,14 @@ def validate_source_manifest_sources(
     archive_lock: ArchiveLock,
     records: list[SourceManifestRecord],
 ) -> dict[str, str]:
-    """功能：依据 ArchiveLock 与 source manifest 验证冻结源码并读取文本；输入输出及副作用：读取 kernel_root 下记录文件，返回 path 到 UTF-8 文本映射；失败边界：归档身份、同路径摘要、缺失文件、摘要或 selector 漂移以及必需覆盖缺失时抛 ValidationError。"""
+    """
+    功能：依据 ArchiveLock 与 source manifest 验证冻结源码并读取文本；
+    输入输出及副作用：kernel_root 是解档根目录，archive_lock 提供锁定
+    archive_id，records 指向各 UTF-8 文件；校验
+    archive_id、sha256、selector 和 REQUIRED_MANIFEST_ROWS，返回 path->text。
+    失败边界：records 为空、文件缺失/不可读、同路径 digest 不一致、
+    摘要或 selector 漂移、必需 row 缺失时抛 ValidationError。
+    """
     if not records:
         raise ValidationError("source manifest has no entries")
     source_text: dict[str, str] = {}
@@ -4168,9 +4530,14 @@ def validate_source_manifest_sources(
 def validate_required_sv_constants(
     sv_constants: dict[str, int], expected_constants: dict[str, int]
 ) -> None:
-    """功能：在 RDMA profile checker 的 validate_required_sv_constants 中比较 expected_constants 与实际 SV 常量值。
-    输入输出及副作用：输入参数为 sv_constants, expected_constants，返回声明类型结果或更新调用方拥有的局部状态；不修改冻结源码和仓库 golden。
-    失败边界：缺失、重复、越界、来源/坐标漂移或无法满足该操作的唯一性条件时抛 ValidationError，禁止静默接受不一致。
+    """
+    功能：在 RDMA profile checker 的 validate_required_sv_constants 中比较
+    expected_constants 与实际 SV
+    常量值。
+    输入输出及副作用：逐项核对 expected_constants 与 parse_sv_constants 结果，
+    成功返回 None；不删除额外 SV 常量。
+    失败边界：required name 缺失或实际值不同（包括字段坐标和 profile
+    ABI）时抛 ValidationError，并保留 name/value 诊断。
     """
     for name, expected in expected_constants.items():
         actual = sv_constants.get(name)
@@ -4187,7 +4554,14 @@ def validate(
     archive_lock_path: Path,
     source_manifest_path: Path,
 ) -> None:
-    """功能：执行冻结 RDMA 定义、映射和 golden 全量契约校验；输入输出及副作用：读取 kernel_root、ArchiveLock、source manifest 与仓库定义并输出无副作用校验结果；失败边界：任一来源身份、映射、常量、mask 或 golden 漂移抛 ValidationError。"""
+    """
+    功能：执行冻结 RDMA 定义、映射和 golden 全量契约校验；
+    输入输出及副作用：接收 kernel_root、archive_lock_path、source_manifest_path；
+    按 archive、source、C/SV
+    mapping、mask 和 golden 阶段只读执行全量校验。
+    失败边界：任一 ContractError 转换为 ValidationError；路径/文件缺失、
+    身份或坐标漂移、codec/mask/golden 不一致都会中止且不写回。
+    """
     try:
         archive_lock = load_archive_lock(archive_lock_path)
         records = load_source_manifest(source_manifest_path)
@@ -4293,7 +4667,14 @@ def validate(
 
 
 def main(argv: list[str] | None = None) -> int:
-    """功能：解析 CLI 并选择 profile-only 或冻结源码契约校验；输入输出及副作用：读取参数、打印 PASS/FAIL 并返回进程状态码；失败边界：冻结模式缺少三个路径参数或任一契约错误时返回 1。"""
+    """
+    功能：解析 CLI 并选择 profile-only 或冻结源码契约校验；
+    输入输出及副作用：argv 为可选 CLI 参数；返回 0/1，profile-only
+    模式执行命名守卫，冻结模式再执行 validate，并把结果打印到
+    stdout/stderr。
+    失败边界：冻结模式必须同时提供三个路径；argparse、OSError 或
+    ValidationError 均打印 rdma definitions: FAIL 并返回 1。
+    """
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--kernel-root",
