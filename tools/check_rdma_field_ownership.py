@@ -1862,6 +1862,63 @@ def _sv_macro_definitions(source: str) -> dict[str, tuple[tuple[str, ...], str]]
     return result
 
 
+PRODUCTION_WRITER_MACROS = (
+    "CMQ_QPC_PUT", "CMQ_ENVELOPE_PUT", "DB_PUT",
+)
+
+
+def _collect_sv_macro_definitions(
+    sv_sources: Mapping[str, str],
+) -> dict[str, tuple[tuple[str, ...], str]]:
+    """功能：合并所有 SV source 的 production macro 定义并检查跨文件一致性。
+    输入输出及副作用：返回宏名到参数/正文的只读映射；
+    不执行预处理器或改写源码。
+    失败边界：续行错误或同名正文漂移立即抛错；
+    宏缺失由调用方拒绝。"""
+    definitions: dict[str, tuple[tuple[str, ...], str]] = {}
+    for source in sv_sources.values():
+        parsed = _sv_macro_definitions(source)
+        for name, current in parsed.items():
+            previous = definitions.get(name)
+            if previous is not None and previous != current:
+                raise ContractError(f"SV macro definition drift: {name}")
+            definitions[name] = current
+    return definitions
+
+
+def _validate_production_macro_definitions(
+    definitions: Mapping[str, tuple[tuple[str, ...], str]],
+    required: Iterable[str],
+) -> None:
+    """功能：锁定 production writer macro 的二参数模板和唯一 typed put 调用。
+    输入输出及副作用：只读 definitions；成功无返回值，不展开或执行
+    SV 宏。
+    失败边界：缺定义、参数漂移、坐标后缀缺失，或 put/put_field 非唯一均
+    拒绝。"""
+    for name in required:
+        definition = definitions.get(name)
+        if definition is None:
+            raise ContractError(
+                f"SV production macro definition is missing: {name}"
+            )
+        parameters, body = definition
+        if parameters != ("STEM", "VALUE"):
+            raise ContractError(f"SV production macro parameters drift: {name}")
+        compact = _normalise_sv_expr(body)
+        for suffix in ("STEM``_WORD_BYTE_OFFSET", "STEM``_LSB", "STEM``_WIDTH"):
+            if suffix not in compact:
+                raise ContractError(
+                    f"SV production macro coordinate token is missing: {name}"
+                )
+        calls = []
+        for call_name in ("put_field", "put"):
+            calls.extend(_iter_sv_calls(body, call_name))
+        if len(calls) != 1:
+            raise ContractError(
+                f"SV production macro typed writer is not unique: {name}"
+            )
+
+
 def _normalise_sv_expr(value: str) -> str:
     """功能：去除 SV/C 表达式无意义空白，供参数和 target-flow 精确比较。
     输入输出及副作用：返回紧凑字符串；不求值、不改变标识符或运算符。
@@ -2091,6 +2148,35 @@ def _writer_range_from_call(
     )
 
 
+def _expanded_macro_writer_ranges(
+    macro_body: str,
+    parameters: Sequence[str],
+    values: Sequence[str],
+    case_id: str,
+    source_path: str,
+    coordinates: Mapping[tuple[str, str, str, str], object],
+    macro_ranges: Mapping[str, tuple[int, int, int]] | None,
+    context_key: tuple[str, str, str],
+    image_length: int,
+) -> list[WriterRange]:
+    """功能：展开一次 production macro invocation 并解析其唯一 typed writer。
+    输入输出及副作用：返回 writer ranges；只读宏模板和 C-derived 坐标，
+    不执行 SV。
+    失败边界：无 writer 或出现多个 put/put_field 时拒绝 alias-only 证明。"""
+    expanded = _expand_sv_writer_macro(macro_body, parameters, values)
+    calls: list[tuple[str, str, str]] = []
+    for call_name in ("put_field", "put"):
+        for start, end, args_text in _iter_sv_calls(expanded, call_name):
+            calls.append((call_name, expanded[start:end], args_text))
+    if len(calls) != 1:
+        raise ContractError("SV production macro typed writer is not unique")
+    call_name, token, args_text = calls[0]
+    return [_writer_range_from_call(
+        call_name, args_text, case_id, source_path, token,
+        coordinates, macro_ranges, context_key, image_length,
+    )]
+
+
 def _expand_sv_writer_macro(
     body: str,
     parameters: Sequence[str],
@@ -2098,9 +2184,10 @@ def _expand_sv_writer_macro(
 ) -> str:
     """功能：以一次 invocation 的实际 stem/value 展开 SV writer macro 的 token 拼接。
     输入输出及副作用：返回局部展开文本；不执行宏副作用或修改定义。
-    失败边界：参数数量不符时返回原文，让 scanner 以未知 writer 整图拒绝。"""
+    失败边界：参数数量不符时立即抛错，禁止把未展开模板当作 writer
+    证据。"""
     if len(parameters) != len(values):
-        return body
+        raise ContractError("SV production macro invocation arity mismatch")
     expanded = body
     for parameter, value in zip(parameters, values):
         expanded = re.sub(
@@ -2150,6 +2237,155 @@ def _sv_begin_block_body(source: str, begin_index: int) -> str:
         if depth == 0:
             return source[body_start:token.start()]
     raise ContractError("SV begin/end block is unbalanced")
+
+
+def _validate_compose_merge_assignments(
+    body: str,
+    merge_block: str,
+) -> None:
+    """功能：审计 compose_request 中 merged_word 的全部赋值和按位更新。
+    输入输出及副作用：只读函数正文和 merge 节点；成功无返回值，不执行
+    SV 表达式。
+    失败边界：除一次 envelope|body OR 与一次 candidate image 读取外，其他赋值、
+    复合更新或 bit-select 均抛 ContractError。"""
+    compact = _normalise_sv_expr(body)
+    assignment_pattern = re.compile(
+        r"merged_word\s*(?P<index>\[[^]]+\])?\s*"
+        r"(?P<operator><=|<<=|>>=|\|=|&=|\^=|\+=|-=|\*=|/=|%=|=|\+\+|--)",
+    )
+    allowed = {"envelope_word|body_word", "image_word(candidate,q)"}
+    seen: list[tuple[str, int]] = []
+    for match in assignment_pattern.finditer(compact):
+        operator = match.group("operator")
+        index = match.group("index")
+        if index is not None or operator != "=":
+            raise ContractError("compose_request mutates merged_word after merge")
+        statement_end = compact.find(";", match.end())
+        if statement_end < 0:
+            raise ContractError("compose_request merged_word assignment is incomplete")
+        value = compact[match.end():statement_end]
+        if value not in allowed:
+            raise ContractError("compose_request merged_word assignment is not canonical")
+        seen.append((value, match.start()))
+
+    or_assignments = [item for item in seen if item[0] == "envelope_word|body_word"]
+    image_assignments = [
+        item for item in seen if item[0] == "image_word(candidate,q)"
+    ]
+    if len(or_assignments) != 1 or len(image_assignments) != 1:
+        raise ContractError("compose_request merged_word assignments are not unique")
+    if _normalise_sv_expr(merge_block).count(
+        "merged_word=envelope_word|body_word;"
+    ) != 1:
+        raise ContractError("compose_request merge OR is outside its canonical loop")
+
+
+def _validate_compose_image_mutators(
+    body: str,
+    merge_block: str,
+) -> None:
+    """功能：枚举 candidate/result image 的对象、bytes 方法、索引和整体赋值，
+    锁定唯一合法输出写入。
+    输入输出及副作用：只读 compose_request 正文及 merge 节点；
+    成功无返回值，不改变 image。
+    失败边界：对象重绑定、未知 bytes method、额外容器或索引写均抛
+    ContractError。"""
+    compact = _normalise_sv_expr(body)
+    object_assignments = [
+        (owner, _normalise_sv_expr(value))
+        for owner, value in re.findall(
+            r"\b(result|candidate)\s*=\s*([^;]+);", body
+        )
+    ]
+    allowed_assignments = {
+        ("result", "null"),
+        ("result", "candidate"),
+        (
+            "candidate",
+            'rdma_hw_image::type_id::create("rdma_cmq_request")',
+        ),
+    }
+    if any(item not in allowed_assignments for item in object_assignments):
+        raise ContractError("compose_request rebinds an image object")
+    if object_assignments.count(("result", "null")) != 1:
+        raise ContractError("compose_request result initialization is not unique")
+    if object_assignments.count(("result", "candidate")) != 1:
+        raise ContractError("compose_request result publication is not unique")
+    if object_assignments.count(
+        (
+            "candidate",
+            'rdma_hw_image::type_id::create("rdma_cmq_request")',
+        )
+    ) != 1:
+        raise ContractError("compose_request candidate allocation is not unique")
+
+    object_method_pattern = re.compile(
+        r"\b(result|candidate)\.([A-Za-z_][A-Za-z0-9_]*)\s*\("
+    )
+    if object_method_pattern.search(compact):
+        raise ContractError("compose_request calls an image mutator")
+
+    canonical_push = (
+        "candidate.bytes.push_back(merged_word[63-(i*8)-:8]);"
+    )
+    method_pattern = re.compile(
+        r"\b(candidate|result)\.bytes\.([A-Za-z_][A-Za-z0-9_]*)\s*\("
+    )
+    push_count = 0
+    for match in method_pattern.finditer(compact):
+        open_index = compact.find("(", match.start(), match.end())
+        _, end = _balanced_delimited_text(compact, open_index, "(", ")")
+        call = compact[match.start():end] + ";"
+        if call != canonical_push:
+            raise ContractError("compose_request has an unapproved image mutator")
+        push_count += 1
+    if push_count != 1 or compact.count(canonical_push) != 1:
+        raise ContractError("compose_request merged output writer is not unique")
+    if _normalise_sv_expr(merge_block).count(canonical_push) != 1:
+        raise ContractError("compose_request merged output writer is outside merge loop")
+
+    direct_assignment = re.compile(
+        r"\b(candidate|result)\.bytes\s*"
+        r"(?:<=|<<=|>>=|\|=|&=|\^=|\+=|-=|\*=|/=|%=|=)"
+    )
+    if direct_assignment.search(compact):
+        raise ContractError("compose_request assigns the image bytes container")
+
+    index_pattern = re.compile(r"\b(candidate|result)\.bytes\s*\[")
+    signature_writes = 0
+    write_operators = re.compile(
+        r"^(?:<=|<<=|>>=|\|=|&=|\^=|\+=|-=|\*=|/=|%=|=|\+\+|--)"
+    )
+    for match in index_pattern.finditer(compact):
+        open_index = compact.find("[", match.start(), match.end())
+        index_text, end = _balanced_delimited_text(compact, open_index, "[", "]")
+        tail = compact[end:]
+        operator_match = write_operators.match(tail)
+        if operator_match is None:
+            continue
+        operator = operator_match.group()
+        if (
+            match.group(1) == "candidate"
+            and index_text == "signature_byte"
+            and operator == "="
+        ):
+            statement_end = compact.find(";", end + len(operator))
+            if statement_end < 0:
+                raise ContractError("compose_request signature writer is incomplete")
+            value = compact[end + len(operator):statement_end]
+            if value != "~signature":
+                raise ContractError("compose_request signature writer value drift")
+            signature_writes += 1
+            continue
+        raise ContractError("compose_request has an unapproved indexed image writer")
+    if signature_writes > 1:
+        raise ContractError("compose_request signature writer is not unique")
+
+    prefix_update = re.compile(
+        r"(?:\+\+|--)\s*\b(candidate|result)\.bytes\s*\["
+    )
+    if prefix_update.search(compact):
+        raise ContractError("compose_request has a prefix indexed image writer")
 
 
 def _validate_compose_request_writer(
@@ -2255,30 +2491,8 @@ def _validate_compose_request_writer(
         if re.search(pattern, merge_block) is None:
             raise ContractError(f"compose_request merge lacks {label}")
 
-    merged_assignments = re.findall(r"merged_word=(.*?);", compact)
-    if not any(value == "envelope_word|body_word" for value in merged_assignments):
-        raise ContractError("compose_request merge is not an exact image OR")
-    if any(
-        "64'h" in value or "64'd" in value or "'0" in value
-        for value in merged_assignments
-        if value != "envelope_word|body_word"
-    ):
-        raise ContractError("compose_request merge contains a static bit value")
-
-    indexed_writes = list(re.finditer(
-        r"\b(result|candidate)\.bytes\s*\[[^]]+\]\s*=\s*([^;]+);",
-        body,
-        re.S,
-    ))
-    for match in indexed_writes:
-        owner, value = match.groups()
-        if owner == "result":
-            raise ContractError("compose_request writes result bytes directly")
-        if _normalise_sv_expr(value) != "~signature":
-            raise ContractError("compose_request has an unproven candidate byte writer")
-        lhs = _normalise_sv_expr(match.group(0))
-        if lhs != "candidate.bytes[signature_byte]=~signature;":
-            raise ContractError("compose_request signature writer is not canonical")
+    _validate_compose_merge_assignments(body, merge_block)
+    _validate_compose_image_mutators(body, merge_block)
     if "candidate.bytes[signature_byte]=~signature;" in compact:
         require_fragment(
             r"signature_byte=RDMA_CMQ_SIGNATURE_WORD_BYTE_OFFSET\+"
@@ -2325,6 +2539,21 @@ def _scan_sv_writer_ranges(
     失败边界：缺 class/function/branch、未知 writer 或不平衡宏均按整幅 image 记录或抛 ContractError，绝不漏报。"""
     ranges: list[WriterRange] = []
     production_context = False
+    production_class_names = (
+        "rdma_hw_cmq_qpc_layout_codec",
+        "rdma_hw_cmq_request_composer",
+        "rdma_hw_cmq_envelope_codec",
+        "rdma_hw_doorbell_codec",
+    )
+    source_texts = {
+        path: _strip_sv_comments(source)
+        for path, source in sv_sources.items()
+    }
+    production_context = any(
+        re.search(r"\bclass\s+" + re.escape(class_name) + r"\b", source)
+        for source in source_texts.values()
+        for class_name in production_class_names
+    )
     all_sv_fields = parse_sv_field_definitions(
         "\n".join(_strip_sv_comments(source) for source in sv_sources.values())
     )
@@ -2336,15 +2565,27 @@ def _scan_sv_writer_ranges(
             (("CMQ_SQ_DOORBELL", "CMQ_SQ", "REQUEST"),
              "rdma_hw_doorbell_codec", '"cmq_sq"', 8),
     }
+    all_macros = _collect_sv_macro_definitions(sv_sources)
+    if production_context:
+        missing_classes = [
+            class_name for class_name in production_class_names
+            if not any(
+                re.search(
+                    r"\bclass\s+" + re.escape(class_name) + r"\b", source
+                )
+                for source in source_texts.values()
+            )
+        ]
+        if missing_classes:
+            raise ContractError(
+                "CMQ production class is missing: " + ", ".join(missing_classes)
+            )
+        _validate_production_macro_definitions(
+            all_macros, PRODUCTION_WRITER_MACROS
+        )
     for source_path, raw_source in sv_sources.items():
-        source = _strip_sv_comments(raw_source)
-        if re.search(
-            r"\bclass\s+rdma_hw_cmq_qpc_layout_codec\b", source
-        ) or re.search(
-            r"\bclass\s+rdma_hw_cmq_request_composer\b", source
-        ):
-            production_context = True
-        macros = _sv_macro_definitions(source)
+        source = source_texts[source_path]
+        macros = all_macros
         sv_fields = all_sv_fields
         for case_id, (context_key, class_name, branch_label, image_length) in contexts.items():
             if class_name not in source:
@@ -2397,20 +2638,15 @@ def _scan_sv_writer_ranges(
                         ))
                 definition = macros.get(invocation_name)
                 if definition is None:
-                    continue
+                    raise ContractError(
+                        f"SV production macro definition is missing: "
+                        f"{invocation_name}"
+                    )
                 parameters, macro_body = definition
-                expanded = _expand_sv_writer_macro(
-                    macro_body, parameters, args
-                )
-                for call_name in ("put_field", "put"):
-                    for _, end, call_args in _iter_sv_calls(
-                        expanded, call_name
-                    ):
-                        ranges.append(_writer_range_from_call(
-                            call_name, call_args, case_id, source_path,
-                            expanded[:end], coordinates, macro_ranges,
-                            context_key, image_length,
-                        ))
+                ranges.extend(_expanded_macro_writer_ranges(
+                    macro_body, parameters, args, case_id, source_path,
+                    coordinates, macro_ranges, context_key, image_length,
+                ))
             # The QPC request image is composed from a separately encoded
             # envelope.  Walk that production writer as well; otherwise an
             # envelope edit could silently acquire a supposedly static bit
@@ -2423,8 +2659,10 @@ def _scan_sv_writer_ranges(
                         envelope_function = _sv_function_body(
                             envelope_body, "encode"
                         )
-                    except ContractError:
-                        envelope_function = ""
+                    except ContractError as exc:
+                        raise ContractError(
+                            f"CMQ envelope production path is invalid: {exc}"
+                        ) from exc
                     if envelope_function:
                         # Macro templates are declarations, not runtime calls.
                         envelope_scan = _strip_sv_macro_definitions(
@@ -2468,20 +2706,16 @@ def _scan_sv_writer_ranges(
                                     ))
                             definition = macros.get(envelope_macro_name)
                             if definition is None:
-                                continue
+                                raise ContractError(
+                                    "SV production macro definition is missing: "
+                                    f"{envelope_macro_name}"
+                                )
                             parameters, macro_body = definition
-                            expanded = _expand_sv_writer_macro(
-                                macro_body, parameters, args
-                            )
-                            for call_name in ("put_field", "put"):
-                                for _, end, call_args in _iter_sv_calls(
-                                    expanded, call_name
-                                ):
-                                    ranges.append(_writer_range_from_call(
-                                        call_name, call_args, case_id, source_path,
-                                        expanded[:end], coordinates, macro_ranges,
-                                        context_key, image_length,
-                                    ))
+                            ranges.extend(_expanded_macro_writer_ranges(
+                                macro_body, parameters, args, case_id,
+                                source_path, coordinates, macro_ranges,
+                                context_key, image_length,
+                            ))
                         for call_name in ("put_field", "put"):
                             for start, end, args_text in _iter_sv_calls(
                                 envelope_scan, call_name
@@ -2870,12 +3104,15 @@ def _anchor_token_call(
 
 
 def _anchor_flow_nodes(flow: str) -> list[str]:
-    """功能：拆解 ownership anchor 的箭头数据流并检查每一跳非空。
-    输入输出及副作用：返回去空白节点列表；不把任意箭头文本当作调用证据。
-    失败边界：少于两跳、空节点或出现非 ASCII 箭头时抛 ContractError。"""
+    """功能：按带空白的 flow 分隔符拆解 anchor 数据流并保留 C 成员箭头。
+    输入输出及副作用：返回去空白节点列表；不执行表达式或改变原始
+    flow。
+    失败边界：少于两跳、空节点、Unicode 箭头或无空白分隔符均抛
+    ContractError。"""
     if "->" not in flow or "→" in flow:
         raise ContractError("anchor target flow is not an ASCII data-flow chain")
-    nodes = [item.strip() for item in flow.split("->")]
+    separator = re.compile(r"\s+->\s+")
+    nodes = [item.strip() for item in separator.split(flow.strip())]
     if len(nodes) < 2 or any(not item for item in nodes):
         raise ContractError("anchor target flow has an empty hop")
     return nodes
@@ -2898,6 +3135,24 @@ def _flow_node_contains(node: str, expression: str) -> bool:
     return re.search(pattern, compact_node) is not None
 
 
+def _flow_node_contains_exact(node: str, expression: str) -> bool:
+    """功能：在 flow 节点中匹配完整 buffer/target 表达式并排除成员别名。
+    输入输出及副作用：返回布尔值；只规范化节点和表达式，
+    不求值或修改 flow。
+    失败边界：表达式若被标识符、点号、箭头或下标前缀包围则视为
+    未命中。
+    """
+    compact_node = _normalise_c_expr(node)
+    compact_expression = _normalise_c_expr(expression)
+    if not compact_node or not compact_expression:
+        return False
+    pattern = (
+        r"(?<![A-Za-z0-9_.$>\]])" + re.escape(compact_expression) +
+        r"(?![A-Za-z0-9_])"
+    )
+    return re.search(pattern, compact_node) is not None
+
+
 def _require_anchor_range_in_flow(
     flow: str,
     buffer_expr: str,
@@ -2906,6 +3161,7 @@ def _require_anchor_range_in_flow(
     target_expr: str | None = None,
     *,
     target_must_be_final: bool = False,
+    target_must_be_after: bool = False,
     container_expr: str | None = None,
 ) -> None:
     """功能：在结构化 data-flow 节点中绑定 buffer 的 byte base/length，并闭合
@@ -2927,7 +3183,7 @@ def _require_anchor_range_in_flow(
         失败边界：range 只出现在其他节点、length 与索引语义不符或表达式不
         完整时返回 False。"""
         compact_node = _normalise_c_expr(node)
-        if not _flow_node_contains(compact_node, buffer_compact):
+        if not _flow_node_contains_exact(compact_node, buffer_compact):
             return False
         escaped_buffer = re.escape(buffer_compact)
         indexed = rf"{escaped_buffer}\[{base}\]"
@@ -2970,7 +3226,7 @@ def _require_anchor_range_in_flow(
     if container_expr is not None:
         container_indices = [
             index for index, node in enumerate(nodes)
-            if _flow_node_contains(node, container_expr)
+            if _flow_node_contains_exact(node, container_expr)
         ]
         if not container_indices:
             raise ContractError(
@@ -2984,10 +3240,12 @@ def _require_anchor_range_in_flow(
     if target_expr is not None:
         target_indices = [
             index for index, node in enumerate(nodes)
-            if _flow_node_contains(node, target_expr)
+            if _flow_node_contains_exact(node, target_expr)
         ]
         if not target_indices:
             raise ContractError("anchor target flow omits final data-flow target")
+        if target_must_be_after and target_indices[0] <= range_index:
+            raise ContractError("anchor target is not after declared buffer range")
         if target_indices[0] < range_index:
             raise ContractError("anchor target precedes declared buffer range")
         if target_must_be_final and target_indices[-1] != len(nodes) - 1:
@@ -3178,6 +3436,7 @@ def _validate_anchor_call_arguments(
         _require_anchor_range_in_flow(
             row["anchor_target_flow"], row["anchor_buffer"], base, length,
             target_expr=destination,
+            target_must_be_after=True,
             container_expr=declared_container,
         )
         return
@@ -3204,6 +3463,7 @@ def _validate_anchor_call_arguments(
         _require_anchor_range_in_flow(
             row["anchor_target_flow"], row["anchor_buffer"], base, length,
             target_expr=destination,
+            target_must_be_after=True,
             container_expr=declared_container,
         )
         return

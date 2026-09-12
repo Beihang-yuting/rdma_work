@@ -137,6 +137,36 @@ class FieldOwnershipFixtureTest(unittest.TestCase):
         row.update(overrides)
         return row
 
+    def minimal_compose_source(self, merge_extra=""):
+        """功能：构造含 canonical envelope/body merge 的最小 composer fixture。
+        输入输出及副作用：merge_extra 插入 merge loop；返回源码字符串，
+        不执行 SV 或写文件。
+        失败边界：fixture 保留必要 data-flow；额外 mutator 应由 checker 拒绝。"""
+        return (
+            "class rdma_hw_cmq_request_composer;\n"
+            "function rdma_status compose_request(\n"
+            "  rdma_hw_cmq_envelope envelope, rdma_hw_image body,\n"
+            "  output rdma_hw_image result);\n"
+            "  result = null;\n"
+            "  status = envelope_codec.encode(envelope, envelope_image);\n"
+            "  status = ownership.lookup(envelope_snapshot.opcode, input_kind, masks);\n"
+            "  candidate = rdma_hw_image::type_id::create(\"rdma_cmq_request\");\n"
+            "  for (int unsigned q = 0; q < 8; q++) begin\n"
+            "    envelope_word = image_word(envelope_image, q);\n"
+            "    body_word = image_word(body, q);\n"
+            "    merged_word = envelope_word | body_word;\n"
+            "    candidate.bytes.push_back(merged_word[63 - (i * 8) -: 8]);\n"
+            f"    {merge_extra}\n"
+            "  end\n"
+            "  for (int unsigned q = 0; q < 8; q++) begin\n"
+            "    merged_word = image_word(candidate, q);\n"
+            "    if ((merged_word & ~(request_envelope_mask(q) | masks[q])) != 0)\n"
+            "      return status;\n"
+            "  end\n"
+            "  result = candidate;\n"
+            "endfunction\nendclass\n"
+        )
+
     def test_rejects_bit_genmask_drift(self):
         """功能：拒绝 C BIT/GENMASK 展开值与 ownership 坐标不一致。
         输入输出及副作用：传入同名宏的漂移表达式，期望 ContractError；不写仓库。
@@ -769,6 +799,183 @@ class FieldOwnershipFixtureTest(unittest.TestCase):
         )
         with self.assertRaises(module.ContractError):
             module._scan_sv_writer_ranges({"fixture.sv": source}, {})
+
+    def test_rejects_compose_request_image_mutator_bypass(self):
+        """功能：拒绝 candidate/result image 的非 canonical mutator 绕过 merge 证明。
+        输入输出及副作用：逐一注入 push/delete/insert 或索引自增；不执行
+        SV。
+        失败边界：除逐字节 merged_word push 外的 image 修改均抛 ContractError。"""
+        module = self.require_checker()
+        mutators = (
+            "candidate.bytes.push_back(8'hff);",
+            "candidate.bytes.delete();",
+            "candidate.bytes.push_front(8'hff);",
+            "candidate.bytes.insert(0, 8'hff);",
+            "candidate.bytes[0]++;",
+        )
+        for mutator in mutators:
+            with self.subTest(mutator=mutator):
+                source = self.minimal_compose_source(mutator)
+                with self.assertRaises(module.ContractError):
+                    module._scan_sv_writer_ranges({"fixture.sv": source}, {})
+
+    def test_rejects_compose_request_merge_post_mutation(self):
+        """功能：拒绝 canonical envelope/body OR 后对 merged_word 的静态复写或
+        按位修改。
+        输入输出及副作用：逐一注入 |=、^=、标量赋值和 bit-select；不执行
+        SV。
+        失败边界：merge 后任何未证明修改都必须 fail-closed。"""
+        module = self.require_checker()
+        mutations = (
+            "merged_word |= 64'h1;",
+            "merged_word ^= 64'h1;",
+            "merged_word = 1'b1;",
+            "merged_word[0] = 1'b1;",
+        )
+        for mutation in mutations:
+            with self.subTest(mutation=mutation):
+                source = self.minimal_compose_source(mutation)
+                with self.assertRaises(module.ContractError):
+                    module._scan_sv_writer_ranges({"fixture.sv": source}, {})
+
+    def test_rejects_missing_production_writer_macro(self):
+        """功能：缺失任一 production writer macro 定义时拒绝 source-walk 证明。
+        输入输出及副作用：传入调用点但删除对应定义；只读 fixture，不改
+        源码。
+        失败边界：三类 macro 均不得退化为 alias-only range。"""
+        module = self.require_checker()
+        source = (
+            "class rdma_hw_cmq_qpc_layout_codec;\n"
+            "function void encode_fields();\n"
+            "  case (opcode)\n"
+            "    RDMA_OP_QPC_CREATE: begin\n"
+            "      `CMQ_QPC_PUT(RDMA_CMQ_QPN, value)\n"
+            "    end\n"
+            "  endcase\n"
+            "endfunction\nendclass\n"
+            "class rdma_hw_cmq_envelope_codec;\n"
+            "function void encode();\n"
+            "  `CMQ_ENVELOPE_PUT(RDMA_CMQ_VALID, value)\n"
+            "endfunction\nendclass\n"
+            "class rdma_hw_doorbell_codec;\n"
+            "function void encode_fields();\n"
+            "  case (variant_name)\n"
+            "    \"cmq_sq\": begin\n"
+            "      `DB_PUT(RDMA_CMQ_DB_PI, value)\n"
+            "    end\n"
+            "  endcase\n"
+            "endfunction\nendclass\n"
+            + self.minimal_compose_source()
+        )
+        with self.assertRaises(module.ContractError):
+            module._scan_sv_writer_ranges({"fixture.sv": source}, {})
+
+    def test_rejects_production_macro_without_typed_writer(self):
+        """功能：拒绝只保留 alias invocation、没有实际 put writer 的生产宏。
+        输入输出及副作用：构造三个 production class，并将宏正文替换为 status
+        赋值；不执行 SV。
+        失败边界：alias range 不能单独证明字段可写，缺失 writer 必须
+        fail-closed。"""
+        module = self.require_checker()
+        source = (
+            "`define CMQ_QPC_PUT(STEM, VALUE) status = status;\n"
+            "`define CMQ_ENVELOPE_PUT(STEM, VALUE) status = status;\n"
+            "`define DB_PUT(STEM, VALUE) status = status;\n"
+            "RDMA_FIELD(RDMA_CMQ_QPN, 0, 0, 8)\n"
+            "RDMA_FIELD(RDMA_CMQ_VALID, 0, 63, 1)\n"
+            "RDMA_FIELD(RDMA_CMQ_DB_PI, 0, 32, 5)\n"
+            "RDMA_FIELD(RDMA_CMQ_DB_POLARITY, 0, 37, 1)\n"
+            "class rdma_hw_cmq_qpc_layout_codec;\n"
+            "function void encode_fields();\n"
+            "case (opcode) RDMA_OP_QPC_CREATE: begin\n"
+            "`CMQ_QPC_PUT(RDMA_CMQ_QPN, value) end endcase\n"
+            "endfunction endclass\n"
+            "class rdma_hw_cmq_envelope_codec;\n"
+            "function void encode();\n"
+            "`CMQ_ENVELOPE_PUT(RDMA_CMQ_VALID, value)\n"
+            "endfunction endclass\n"
+            "class rdma_hw_doorbell_codec;\n"
+            "function void encode_fields();\n"
+            "case (variant_name) \"cmq_sq\": begin\n"
+            "`DB_PUT(RDMA_CMQ_DB_PI, value)\n"
+            "`DB_PUT(RDMA_CMQ_DB_POLARITY, value) end endcase\n"
+            "endfunction endclass\n"
+            + self.minimal_compose_source()
+        )
+        coordinates = {
+            ("CMQ_SQE", "QPC_CREATE", "REQUEST", "XTRDMA_CMQSQ_WQE_QPN"):
+                (0, 0, 8),
+            ("CMQ_SQE", "QPC_CREATE", "REQUEST", "XTRDMA_CMQSQ_WQE_VALID"):
+                (0, 63, 1),
+            ("CMQ_SQ_DOORBELL", "CMQ_SQ", "REQUEST", "XTRDMA_CMQSQ_DB_PI"):
+                (0, 32, 5),
+            ("CMQ_SQ_DOORBELL", "CMQ_SQ", "REQUEST", "XTRDMA_CMQSQ_DB_POL"):
+                (0, 37, 1),
+        }
+        with self.assertRaises(module.ContractError):
+            module._scan_sv_writer_ranges({"fixture.sv": source}, coordinates)
+
+    def test_rejects_production_macro_missing_without_invocation(self):
+        """功能：即使 production branch 暂无 invocation，也要求三类宏定义齐全。
+        输入输出及副作用：删除 DB_PUT 定义但保留 class/function 结构；不执行
+        或写入源码。
+        失败边界：未使用宏的缺定义不能被空 branch 掩盖，source-walk 必须
+        拒绝。"""
+        module = self.require_checker()
+        source = (
+            "`define CMQ_QPC_PUT(STEM, VALUE) status = put(builder, 0, 0, 1, VALUE);\n"
+            "`define CMQ_ENVELOPE_PUT(STEM, VALUE) status = builder.put_field(0, 63, 1, VALUE);\n"
+            "class rdma_hw_cmq_qpc_layout_codec;\n"
+            "function void encode_fields();\n"
+            "case (opcode) RDMA_OP_QPC_CREATE: begin\n"
+            "`CMQ_QPC_PUT(RDMA_CMQ_QPN, value) end endcase\n"
+            "endfunction endclass\n"
+            "class rdma_hw_cmq_envelope_codec;\n"
+            "function void encode();\n"
+            "`CMQ_ENVELOPE_PUT(RDMA_CMQ_VALID, value)\n"
+            "endfunction endclass\n"
+            "class rdma_hw_doorbell_codec;\n"
+            "function void encode_fields();\n"
+            "case (variant_name) \"cmq_sq\": begin end endcase\n"
+            "endfunction endclass\n"
+            + self.minimal_compose_source()
+        )
+        with self.assertRaises(module.ContractError):
+            module._scan_sv_writer_ranges({"fixture.sv": source}, {})
+
+    def test_rejects_get_target_in_same_range_node(self):
+        """功能：GET anchor 的目标必须位于 buffer/range 节点之后，不能同节点
+        伪造闭合流。
+        输入输出及副作用：把 destination 与 cqe[0] 放在同一节点；不执行 C
+        函数。
+        失败边界：target 与 range 同节点或先于 range 时抛 ContractError。"""
+        module = self.require_checker()
+        row = self.minimal_ownership(
+            anchor_token="get_64bit_val(cqe, 0, &temp)",
+            anchor_container="cqe",
+            anchor_buffer="cqe",
+            anchor_operation="GET_64BIT",
+            anchor_target_flow=(
+                "cqe[0] temp -> XTRDMA_CMQSQ_WQE_QPN -> ready"
+            ),
+        )
+        body = "get_64bit_val(cqe, 0, &temp);"
+        with self.assertRaises(module.ContractError):
+            module._validate_anchor_call_arguments(row, body, "fixture.c")
+
+    def test_rejects_range_on_buffer_member_instead_of_declared_buffer(self):
+        """功能：拒绝把 buffer 的成员字段 range 冒充为 declared buffer 自身的
+        范围。
+        输入输出及副作用：传入 foo->wqe[0] 节点与后置 target；只读 flow，不
+        执行 C。
+        失败边界：range 必须绑定完整 buffer 表达式，成员/别名不能闭合
+        GET/MEMCPY。"""
+        module = self.require_checker()
+        with self.assertRaises(module.ContractError):
+            module._require_anchor_range_in_flow(
+                "wqe -> foo->wqe[0] -> X -> target",
+                "wqe", 0, 8, target_expr="target", target_must_be_after=True,
+            )
 
     def test_rejects_anchor_range_on_unrelated_flow_node(self):
         """功能：range/base/length 必须与 declared buffer 位于同一 flow 节点。
