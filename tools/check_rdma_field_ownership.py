@@ -414,6 +414,16 @@ def _sv_class_body(source: str, class_name: str) -> str:
     return source[start:end]
 
 
+def _has_sv_class_declaration(source: str, class_name: str) -> bool:
+    """功能：按完整 class 标识符判断 SV source 是否声明目标 production class。
+    输入输出及副作用：source 与 class_name 输入；返回布尔值，不截取正文、不修改源码。
+    失败边界：registry 前缀、相邻标识符或注释文本不得满足匹配；声明缺失时返回 False。"""
+    return re.search(
+        r"\bclass\s+" + re.escape(class_name) + r"\b",
+        source,
+    ) is not None
+
+
 def _sv_function_body(source: str, function_name: str) -> str:
     """功能：从 SV class/source 中截取一个 function 的声明后正文，保留 begin/end 结构。
     输入输出及副作用：返回函数体文本；不执行函数，也不把相邻 overload 当作同一 writer。
@@ -2804,7 +2814,7 @@ def _scan_sv_writer_ranges(
         for path, source in sv_sources.items()
     }
     production_context = any(
-        re.search(r"\bclass\s+" + re.escape(class_name) + r"\b", source)
+        _has_sv_class_declaration(source, class_name)
         for source in source_texts.values()
         for class_name in production_class_names
     )
@@ -2824,9 +2834,7 @@ def _scan_sv_writer_ranges(
         missing_classes = [
             class_name for class_name in production_class_names
             if not any(
-                re.search(
-                    r"\bclass\s+" + re.escape(class_name) + r"\b", source
-                )
+                _has_sv_class_declaration(source, class_name)
                 for source in source_texts.values()
             )
         ]
@@ -2842,7 +2850,7 @@ def _scan_sv_writer_ranges(
         macros = all_macros
         sv_fields = all_sv_fields
         for case_id, (context_key, class_name, branch_label, image_length) in contexts.items():
-            if class_name not in source:
+            if not _has_sv_class_declaration(source, class_name):
                 continue
             try:
                 class_body = _sv_class_body(source, class_name)
@@ -3165,7 +3173,9 @@ def validate_sv_writer_contract(
     selected_masks = [
         _selected_mask_for_cmq_doorbell(source)
         for source in sv_sources.values()
-        if "class rdma_hw_doorbell_codec" in _strip_sv_comments(source)
+        if _has_sv_class_declaration(
+            _strip_sv_comments(source), "rdma_hw_doorbell_codec"
+        )
     ]
     if len(selected_masks) != 1 or selected_masks[0] != expected_doorbell[0]:
         raise ContractError("SV CMQ doorbell derived mask is not C-derived")

@@ -921,6 +921,49 @@ class FieldOwnershipFixtureTest(unittest.TestCase):
         )
         self.assertFalse(any(item.operation == "UNKNOWN_WRITER" for item in ranges))
 
+    # 功能：验证 class 名称匹配按 token 边界选择真实 doorbell codec，而不误命中 registry 前缀。
+    # 输入输出及副作用：跨两个内存 source 执行 writer scan；返回的 range 来自真实 codec，不写生产文件。
+    # 失败边界：profile 中仅有 virtual registry、真实 codec 在另一文件时若仍被误报，测试必须失败。
+    def test_source_walk_ignores_doorbell_registry_prefix(self):
+        module = self.require_checker()
+        complete = self.complete_production_compose_source()
+        marker = "class rdma_hw_doorbell_codec;\n"
+        profile_source, doorbell_source = complete.split(marker, 1)
+        profile_source += (
+            "RDMA_FIELD(RDMA_CMQ_QPN, 0, 0, 8)\n"
+            "RDMA_FIELD(RDMA_CMQ_VALID, 0, 63, 1)\n"
+            "RDMA_FIELD(RDMA_CMQ_DB_PI, 0, 32, 5)\n"
+            "RDMA_FIELD(RDMA_CMQ_DB_POLARITY, 0, 37, 1)\n"
+            "virtual class rdma_hw_doorbell_codec_registry;\n"
+            "endclass\n"
+        )
+        doorbell_source = marker + doorbell_source
+        coordinates = {
+            ("CMQ_SQE", "QPC_CREATE", "REQUEST", "XTRDMA_CMQSQ_WQE_QPN"):
+                (0, 0, 8),
+            ("CMQ_SQE", "QPC_CREATE", "REQUEST", "XTRDMA_CMQSQ_WQE_VALID"):
+                (0, 63, 1),
+            ("CMQ_SQ_DOORBELL", "CMQ_SQ", "REQUEST", "XTRDMA_CMQSQ_DB_PI"):
+                (0, 32, 5),
+            ("CMQ_SQ_DOORBELL", "CMQ_SQ", "REQUEST", "XTRDMA_CMQSQ_DB_POL"):
+                (0, 37, 1),
+        }
+        ranges = module._scan_sv_writer_ranges(
+            {"profile.sv": profile_source, "doorbell.sv": doorbell_source},
+            coordinates,
+        )
+        self.assertTrue(any(
+            item.case_id == "cmq_sq_doorbell"
+            and item.source_path == "doorbell.sv"
+            and item.operation == "MACRO_PUT"
+            for item in ranges
+        ))
+        self.assertFalse(any(
+            item.case_id == "cmq_sq_doorbell"
+            and item.source_path == "profile.sv"
+            for item in ranges
+        ))
+
     def test_rejects_malformed_production_macro_in_source_walk(self):
         """功能：source-walk 遇到残缺的生产宏续行时必须立即拒绝。
         输入输出及副作用：传入未闭合 CMQ_QPC_PUT 定义；不写入任何

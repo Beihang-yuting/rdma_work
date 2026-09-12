@@ -11,6 +11,12 @@ C-derived mutation candidate 驱动。QPC_CREATE request 的 HOST_TYPED/HOST_FIX
 SUPPORTED；未证明的 response/doorbell 方向、CQC_CREATE 和 RESERVED_ZERO 保持
 UNSUPPORTED。
 
+Fix round 3 已完成：source-walk 对 production class 使用完整 token-boundary
+匹配，`rdma_hw_doorbell_codec_registry` 不再误命中真实
+`rdma_hw_doorbell_codec`；跨 source 回归 fixture 同时保留真实 `RDMA_FIELD`
+坐标声明。修复后已在 53 机重新执行完整 `rdma_defs
+rdma_cmq_driver_contract_test`，以下 fresh 结果覆盖此前的旧计数。
+
 Fix round 1 已完成：
 
 - I-1：SV production macro source-walk 对 malformed continuation、malformed
@@ -47,14 +53,15 @@ Fix round 1 已完成：
 python3 -m unittest tests.unit.test_cmq_gate_manifest -v
   PASS (2 tests)
 python3 -m unittest tests.unit.test_check_rdma_field_ownership -v
-  PASS (58 tests)
+  PASS (59 tests)
 python3 -m unittest discover -s tests/unit -p 'test_*.py' -v
-  PASS (227 tests)
+  PASS (228 tests)
 /home/ryan/.local/bin/python3.8 -m unittest
   tests.unit.test_check_rdma_field_ownership -v
-  PASS (58 tests)
+  未在 fix round 3 重跑，不计入本轮通过证据；Python 3 targeted result above 为本轮 fresh 结果
 SSHPASS=123 scripts/run_vcs53.sh rdma_defs rdma_cmq_driver_contract_test
-  PASS (197 tests; field ownership candidate and report gate PASS; fresh after fix round 2)
+  PASS (198 tests; rdma definitions PASS; RDMA CMQ oracle verification passed;
+  field ownership candidate/report gate PASS; fresh after fix round 3)
 SSHPASS=123 scripts/run_vcs53.sh core rdma_cmq_driver_field_mutation_test
   PASS
 SSHPASS=123 scripts/run_vcs53.sh core rdma_cmq_profile_test
@@ -74,8 +81,9 @@ EXECUTED_TOTAL=666 STATIC_TOTAL=422 GRAND_TOTAL=1088
 所有通过的 VCS case 均由 `check_uvm_summary.sh` 检查，UVM
 `warning=0 error=0 fatal=0`。
 
-Fix round 2 前的 `rdma_defs` 失败（ownership capability drift）不再作为通过
-证据；上面的 53 机结果是修复后重新执行的唯一有效记录。
+Fix round 2 前的 `rdma_defs` 失败（ownership capability drift）和 fix round 3
+前任何旧的 `PASS (197 tests)` 记录不再作为通过证据；上面的 53 机结果是本轮
+重新执行后的唯一有效记录。
 
 ## ABI 与边界说明
 
