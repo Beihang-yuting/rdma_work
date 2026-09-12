@@ -1320,8 +1320,10 @@ class rdma_cmq_profile_test extends uvm_test;
   endfunction
 
   // 功能：check_qpc_driver_fixed_vfid 验证 QPC_CREATE 的 VFID 字段由驱动固定为零。
-  // 输入输出及副作用：构造本地 Function、QPC body、slot 并调用 production compose_sqe；不触碰外部 I/O。
-  // 失败边界：任一非零 VFID 未在 body/image 发布前返回 INVALID_ARGUMENT 即报告错误。
+  // 输入/输出及副作用：无参数；构造本地 Function、QPC body、slot 并调用
+  //   production compose_sqe；只发布 UVM 断言，不触碰外部 I/O 或转移句柄所有权。
+  // 失败/边界：vfid_override 或 use_vfid 任一非零位未返回 INVALID_ARGUMENT，
+  //   或拒绝路径发布 image/expected 时报告错误；循环覆盖 11-bit use_vfid 边界。
   function automatic void check_qpc_driver_fixed_vfid();
     rdma_function_handle function_h;
     rdma_handle cmq_h;

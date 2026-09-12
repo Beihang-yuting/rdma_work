@@ -36,8 +36,8 @@ class rdma_cmq_driver_field_mutation_test extends uvm_test;
   int unsigned static_unwritable_count;
 
   // 功能：构造 CMQ mutation gate，并为 profile、fixture 和六类证据计数建立确定初值。
-  // 输入输出及副作用：name、parent 为 UVM component 输入；仅创建本地测试对象，不打开文件或启动事务。
-  // 失败边界：构造成功不表示合同已闭合；reader、codec 或 oracle 的失败均在 run_phase 中报告。
+  // 输入/输出及副作用：name、parent 为 UVM component 输入；仅创建本地测试对象，不打开文件或启动事务。
+  // 失败/边界：构造成功不表示合同已闭合；reader、codec 或 oracle 的失败均在 run_phase 中报告。
   function new(
       string name = "rdma_cmq_driver_field_mutation_test",
       uvm_component parent = null
@@ -61,8 +61,8 @@ class rdma_cmq_driver_field_mutation_test extends uvm_test;
   endfunction
 
   // 功能：hex_nibble 把 canonical 文件中的单个规范十六进制字符转换为四位数值。
-  // 输入输出及副作用：ch 为只读 ASCII 输入，value 仅在成功时接收 0..15；函数不改变文件游标。
-  // 失败边界：除 0-9、a-f、A-F 外的字符全部返回 0，避免 %x 宽松接受注释或残缺 token。
+  // 输入/输出及副作用：ch 为只读 ASCII 输入，value 仅在成功时接收 0..15；函数不改变文件游标。
+  // 失败/边界：除 0-9、a-f、A-F 外的字符全部返回 0，避免 %x 宽松接受注释或残缺 token。
   function automatic bit hex_nibble(
       input int ch,
       output int unsigned value
@@ -88,8 +88,8 @@ class rdma_cmq_driver_field_mutation_test extends uvm_test;
   endfunction
 
   // 功能：load_canonical_image 严格读取 Task 3 的单行 bytes.hex，并补齐 production API 所需的确定元数据。
-  // 输入输出及副作用：relative_path、image_kind、length 为输入；返回新 image，文件只读且所有出口都会关闭 fd。
-  // 失败边界：缺少 LF/CRLF、额外物理行、非单空格分隔、非两位 hex、注释、空 token 或字节数不符均返回 null。
+  // 输入/输出及副作用：relative_path、image_kind、length 为输入；返回新 image，文件只读且所有出口都会关闭 fd。
+  // 失败/边界：缺少 LF/CRLF、额外物理行、非单空格分隔、非两位 hex、注释、空 token 或字节数不符均返回 null。
   function automatic rdma_hw_image load_canonical_image(
       input string relative_path,
       input rdma_image_kind_e image_kind,
@@ -195,8 +195,8 @@ class rdma_cmq_driver_field_mutation_test extends uvm_test;
   endfunction
 
   // 功能：images_equal 比较两个 detached hardware image 的字节、元数据和字段摘要是否完全相同。
-  // 输入输出及副作用：lhs、rhs 只读；返回精确相等结果，不修改任一 image。
-  // 失败边界：任一对象为空、队列尺寸不同或任一 target/generation 字段不同时返回 0。
+  // 输入/输出及副作用：lhs、rhs 只读；返回精确相等结果，不修改任一 image。
+  // 失败/边界：任一对象为空、队列尺寸不同或任一 target/generation 字段不同时返回 0。
   function automatic bit images_equal(
       input rdma_hw_image lhs,
       input rdma_hw_image rhs
@@ -228,8 +228,8 @@ class rdma_cmq_driver_field_mutation_test extends uvm_test;
   endfunction
 
   // 功能：clone_image 为 response mutation 创建完全 detached 的 raw image 副本。
-  // 输入输出及副作用：source 只读；返回独立 clone，不改变 canonical bytes 或元数据。
-  // 失败边界：source 为空、clone 返回空或动态类型错误时返回 null，并由调用方停止该行验证。
+  // 输入/输出及副作用：source 只读；返回独立 clone，不改变 canonical bytes 或元数据。
+  // 失败/边界：source 为空、clone 返回空或动态类型错误时返回 null，并由调用方停止该行验证。
   function automatic rdma_hw_image clone_image(
       input rdma_hw_image source
   );
@@ -247,8 +247,8 @@ class rdma_cmq_driver_field_mutation_test extends uvm_test;
   endfunction
 
   // 功能：image_byte_xor 计算驱动签名算法使用的全 image 字节异或折叠值。
-  // 输入输出及副作用：image 只读；返回所有 bytes 的 8 位 XOR，不修改 image 或 field_summary。
-  // 失败边界：空 image 返回 0；调用方必须另行区分“空输入”和“合法零 parity”。
+  // 输入/输出及副作用：image 只读；返回所有 bytes 的 8 位 XOR，不修改 image 或 field_summary。
+  // 失败/边界：空 image 返回 0；调用方必须另行区分“空输入”和“合法零 parity”。
   function automatic byte unsigned image_byte_xor(
       input rdma_hw_image image
   );
@@ -265,8 +265,8 @@ class rdma_cmq_driver_field_mutation_test extends uvm_test;
   endfunction
 
   // 功能：expected_qpc_signature 按 xtrdma_bytes_xor 数据流独立计算 QPC_CREATE signature byte。
-  // 输入输出及副作用：sqe、source 只读；把 driver fields.tsv 固定的 byte12 视为未签名零位，返回 request/source XOR 的补码。
-  // 失败边界：任一 image 为空或 SQE 不含 byte12 时返回 0；调用方会同时检查对象和长度，不能把该值当作成功证明。
+  // 输入/输出及副作用：sqe、source 只读；把 driver fields.tsv 固定的 byte12 视为未签名零位，返回 request/source XOR 的补码。
+  // 失败/边界：任一 image 为空或 SQE 不含 byte12 时返回 0；调用方会同时检查对象和长度，不能把该值当作成功证明。
   function automatic byte unsigned expected_qpc_signature(
       input rdma_hw_image sqe,
       input rdma_hw_image source
@@ -290,8 +290,8 @@ class rdma_cmq_driver_field_mutation_test extends uvm_test;
   endfunction
 
   // 功能：handles_equal 比较资源句柄的 kind、Function authority、object ID 与 generation 值。
-  // 输入输出及副作用：lhs、rhs 只读；返回值相等结果，不把引用相等误当作图独立性证明。
-  // 失败边界：仅当双方都为空时空句柄相等；单边为空立即返回 0。
+  // 输入/输出及副作用：lhs、rhs 只读；返回值相等结果，不把引用相等误当作图独立性证明。
+  // 失败/边界：仅当双方都为空时空句柄相等；单边为空立即返回 0。
   function automatic bit handles_equal(
       input rdma_handle lhs,
       input rdma_handle rhs
@@ -306,8 +306,8 @@ class rdma_cmq_driver_field_mutation_test extends uvm_test;
   endfunction
 
   // 功能：functions_equal 比较 CMQ command/slot 的完整 Function identity 快照。
-  // 输入输出及副作用：lhs、rhs 只读；返回 UID、object ID 和 generation 的值相等结果。
-  // 失败边界：双方都为空才相等；不会从默认 Function 或 topology 猜测缺失身份。
+  // 输入/输出及副作用：lhs、rhs 只读；返回 UID、object ID 和 generation 的值相等结果。
+  // 失败/边界：双方都为空才相等；不会从默认 Function 或 topology 猜测缺失身份。
   function automatic bit functions_equal(
       input rdma_function_handle lhs,
       input rdma_function_handle rhs
@@ -321,8 +321,8 @@ class rdma_cmq_driver_field_mutation_test extends uvm_test;
   endfunction
 
   // 功能：qpc_graph_values_equal 比较 composer 可见的 command、body、source 与 slot 全部值，用于证明调用未篡改输入图。
-  // 输入输出及副作用：两组 command/slot 均只读；函数只做深值比较，不修改对象或执行 codec。
-  // 失败边界：任一必需对象、QPC body 或 opcode key 为空/类型不符时返回 0；不接受部分图相等。
+  // 输入/输出及副作用：两组 command/slot 均只读；函数只做深值比较，不修改对象或执行 codec。
+  // 失败/边界：任一必需对象、QPC body 或 opcode key 为空/类型不符时返回 0；不接受部分图相等。
   function automatic bit qpc_graph_values_equal(
       input rdma_cmq_command_desc lhs_command,
       input rdma_cmq_slot_context lhs_slot,
@@ -380,8 +380,8 @@ class rdma_cmq_driver_field_mutation_test extends uvm_test;
   endfunction
 
   // 功能：clone_qpc_graph 同时复制 command 与 slot，形成可用于调用前后不可变性比较的 detached 快照。
-  // 输入输出及副作用：source_command/source_slot 只读；成功时输出两个独立 clone，不保留对源 body/source/handle 的引用。
-  // 失败边界：任一输入为空、clone 或 cast 失败时清空两个输出并返回 0，禁止使用半完成快照。
+  // 输入/输出及副作用：source_command/source_slot 只读；成功时输出两个独立 clone，不保留对源 body/source/handle 的引用。
+  // 失败/边界：任一输入为空、clone 或 cast 失败时清空两个输出并返回 0，禁止使用半完成快照。
   function automatic bit clone_qpc_graph(
       input rdma_cmq_command_desc source_command,
       input rdma_cmq_slot_context source_slot,
@@ -411,9 +411,10 @@ class rdma_cmq_driver_field_mutation_test extends uvm_test;
     return 1'b1;
   endfunction
 
-  // 功能：ensure_qpc_codec 初始化一次 RC QPC production codec，供 signature source 的 typed decode/encode mutation 复用。
-  // 输入输出及副作用：failure_reason 输出失败原因；成功时更新本测试拥有的 registry 与 qpc_codec 引用。
-  // 失败边界：fixture 为空、注册失败、lookup 失败或返回 null codec 时返回 0，不继续构造未经认证的 source image。
+  // 功能：ensure_qpc_codec 初始化一次 RC QPC production codec，供 signature
+  //   source 的 typed decode/encode mutation 复用。
+  // 输入/输出及副作用：failure_reason 输出失败原因；成功时更新本测试拥有的 registry 与 qpc_codec 引用。
+  // 失败/边界：fixture 为空、注册失败、lookup 失败或返回 null codec 时返回 0，不继续构造未经认证的 source image。
   function automatic bit ensure_qpc_codec(
       output string failure_reason
   );
@@ -449,8 +450,8 @@ class rdma_cmq_driver_field_mutation_test extends uvm_test;
   endfunction
 
   // 功能：build_qpc_graph 构造与 Task 3 C oracle 完全同值、且由 typed QPC codec 产生 signature source 的独立有效图。
-  // 输入输出及副作用：输出 command、slot、source 和失败原因；仅创建本地对象并可能初始化 QPC registry。
-  // 失败边界：fixture/codec 失败、source encode 失败或 source XOR 不为驱动 fixture 固定的零 parity 时返回 0，不修补最终 SQE。
+  // 输入/输出及副作用：输出 command、slot、source 和失败原因；仅创建本地对象并可能初始化 QPC registry。
+  // 失败/边界：fixture/codec 失败、source encode 失败或 source XOR 不为驱动 fixture 固定的零 parity 时返回 0，不修补最终 SQE。
   function automatic bit build_qpc_graph(
       output rdma_cmq_command_desc command,
       output rdma_cmq_slot_context slot,
@@ -539,9 +540,11 @@ class rdma_cmq_driver_field_mutation_test extends uvm_test;
     return 1'b1;
   endfunction
 
-  // 功能：rewrite_qpc_source 从 clone 的 source 解码 typed QPC，修改 QPN 或 PD-index 的一个字段位，再由同一 production codec 重编码。
-  // 输入输出及副作用：command、field、field_bit 输入；成功时仅替换 command.qpc_signature_source，不修改原始 baseline command。
-  // 失败边界：decode/cast/encode 失败、QPN 超出 QPC 21-bit 投影或未知 field 时返回 0，并保留可定位原因。
+  // 功能：rewrite_qpc_source 从 clone 的 source 解码 typed QPC，修改 QPN 或
+  //   PD-index 的一个字段位，再由同一 production codec 重编码。
+  // 输入/输出及副作用：command、field、field_bit 输入；成功时仅替换
+  //   command.qpc_signature_source，不修改原始 baseline command。
+  // 失败/边界：decode/cast/encode 失败、QPN 超出 QPC 21-bit 投影或未知 field 时返回 0，并保留可定位原因。
   function automatic bit rewrite_qpc_source(
       input rdma_cmq_command_desc command,
       input string field,
@@ -610,8 +613,8 @@ class rdma_cmq_driver_field_mutation_test extends uvm_test;
   endfunction
 
   // 功能：mutate_qpc_request_inputs 按 ownership row 的语义字段复制图并翻转一个真实 composer 输入位。
-  // 输入输出及副作用：row、baseline command/slot 输入；输出独立 mutant，不修改 baseline 的 body、source、handle 或 slot。
-  // 失败边界：clone/cast 失败、字段坐标越界或非 ordinary typed 字段时返回 0；VALID/WRAP 和 fixed/static 行由专用路径处理。
+  // 输入/输出及副作用：row、baseline command/slot 输入；输出独立 mutant，不修改 baseline 的 body、source、handle 或 slot。
+  // 失败/边界：clone/cast 失败、字段坐标越界或非 ordinary typed 字段时返回 0；VALID/WRAP 和 fixed/static 行由专用路径处理。
   function automatic bit mutate_qpc_request_inputs(
       input rdma_cmq_field_evidence_row row,
       input rdma_cmq_command_desc baseline_command,
@@ -735,8 +738,8 @@ class rdma_cmq_driver_field_mutation_test extends uvm_test;
   endfunction
 
   // 功能：check_qpc_image_delta 验证一次 typed mutation 只改变 TSV 指定 wire 位，并独立核验派生 signature。
-  // 输入输出及副作用：row、baseline/mutant image 与各自 source 均只读；仅产生断言，不修改图像。
-  // 失败边界：对象为空、target 位 delta 非 1、额外非 signature 位变化或 signature 不符合驱动 XOR 算法时报告错误。
+  // 输入/输出及副作用：row、baseline/mutant image 与各自 source 均只读；仅产生断言，不修改图像。
+  // 失败/边界：对象为空、target 位 delta 非 1、额外非 signature 位变化或 signature 不符合驱动 XOR 算法时报告错误。
   task automatic check_qpc_image_delta(
       input rdma_cmq_field_evidence_row row,
       input rdma_hw_image baseline,
@@ -781,9 +784,10 @@ class rdma_cmq_driver_field_mutation_test extends uvm_test;
                  "composer signature differs from driver XOR data flow")
   endtask
 
-  // 功能：check_qpc_typed_row 对一条 ordinary HOST_TYPED row 构造两个独立图，调用两次 production compose_sqe 并比较 C 坐标。
-  // 输入输出及副作用：row 只读；创建 baseline/mutant、输出 image 和不可变性快照，成功后更新 visited/typed 计数。
-  // 失败边界：图构造、mutation、compose、canonical、metadata、expected response 或输入不可变性任一失败都会报告且不伪造证据。
+  // 功能：check_qpc_typed_row 对一条 ordinary HOST_TYPED row 构造两个独立图，
+  //   调用两次 production compose_sqe 并比较 C 坐标。
+  // 输入/输出及副作用：row 只读；创建 baseline/mutant、输出 image 和不可变性快照，成功后更新 visited/typed 计数。
+  // 失败/边界：图构造、mutation、compose、canonical、metadata、expected response 或输入不可变性任一失败都会报告且不伪造证据。
   task automatic check_qpc_typed_row(
       input rdma_cmq_field_evidence_row row
   );
@@ -906,8 +910,8 @@ class rdma_cmq_driver_field_mutation_test extends uvm_test;
   endtask
 
   // 功能：check_qpc_polarity_group 一次性执行 VALID/WRAP 两行相关证据，证明一个合法 slot wrap 迁移同时驱动两坐标。
-  // 输入输出及副作用：case_id 选择 QPC request；创建两个独立 slot 状态并调用 production composer，原 rows 不修改。
-  // 失败边界：相关组不是恰好 VALID+WRAP、任一 compose 失败、出现额外非 signature delta 或 signature XOR 错误时报告失败。
+  // 输入/输出及副作用：case_id 选择 QPC request；创建两个独立 slot 状态并调用 production composer，原 rows 不修改。
+  // 失败/边界：相关组不是恰好 VALID+WRAP、任一 compose 失败、出现额外非 signature delta 或 signature XOR 错误时报告失败。
   task automatic check_qpc_polarity_group(
       input string case_id
   );
@@ -1006,9 +1010,10 @@ class rdma_cmq_driver_field_mutation_test extends uvm_test;
     correlated_recompose_count += 2;
   endtask
 
-  // 功能：check_qpc_driver_fixed_rejection 对一条 VFID fixed-zero row 构造合法图，并让 production profile 命中 opcode 专用拒绝。
-  // 输入输出及副作用：row 只读；调用 zero baseline 与 nonzero mutant compose，成功后更新 visited/fixed 计数。
-  // 失败边界：字段不是 override/use_vfid、baseline 不匹配 C、拒绝码非 INVALID_ARGUMENT、发布输出或改变输入图时报告错误。
+  // 功能：check_qpc_driver_fixed_rejection 对一条 VFID fixed-zero row 构造合法图，
+  //   并让 production profile 命中 opcode 专用拒绝。
+  // 输入/输出及副作用：row 只读；调用 zero baseline 与 nonzero mutant compose，成功后更新 visited/fixed 计数。
+  // 失败/边界：字段不是 override/use_vfid、baseline 不匹配 C、拒绝码非 INVALID_ARGUMENT、发布输出或改变输入图时报告错误。
   task automatic check_qpc_driver_fixed_rejection(
       input rdma_cmq_field_evidence_row row
   );
@@ -1094,9 +1099,10 @@ class rdma_cmq_driver_field_mutation_test extends uvm_test;
     driver_fixed_reject_count++;
   endtask
 
-  // 功能：check_request_static_row 证明 QPC static coordinate 等于 C/production canonical，且不把 raw request 注入 typed composer。
-  // 输入输出及副作用：row、canonical_request 只读；读取预先由 production compose 得到的 canonical image，更新对应 static 计数。
-  // 失败边界：类别错误、对象缺失、canonical bit 不一致，或 unwritable 位非零时报告错误；不宣称运行时拒绝。
+  // 功能：check_request_static_row 证明 QPC static coordinate 等于
+  //   C/production canonical，且不把 raw request 注入 typed composer。
+  // 输入/输出及副作用：row、canonical_request 只读；读取预先由 production compose 得到的 canonical image，更新对应 static 计数。
+  // 失败/边界：类别错误、对象缺失、canonical bit 不一致，或 unwritable 位非零时报告错误；不宣称运行时拒绝。
   task automatic check_request_static_row(
       input rdma_cmq_field_evidence_row row,
       input rdma_hw_image canonical_request
@@ -1148,9 +1154,10 @@ class rdma_cmq_driver_field_mutation_test extends uvm_test;
     visited_bits++;
   endtask
 
-  // 功能：check_request_case 执行 QPC_CREATE 的 512 行 request 合同，并把每行分派到 typed、correlated、fixed 或 static 证明。
-  // 输入输出及副作用：case_id、opcode 选择冻结 case；构建一次 production canonical 并更新全部 request 证据计数。
-  // 失败边界：case/opcode 身份错误、canonical compose 不匹配、行数漂移或未知 evidence 时报告错误且不启用能力。
+  // 功能：check_request_case 执行 QPC_CREATE 的 512 行 request 合同，并把每行
+  //   分派到 typed、correlated、fixed 或 static 证明。
+  // 输入/输出及副作用：case_id、opcode 选择冻结 case；构建一次 production canonical 并更新全部 request 证据计数。
+  // 失败/边界：case/opcode 身份错误、canonical compose 不匹配、行数漂移或未知 evidence 时报告错误且不启用能力。
   task automatic check_request_case(
       input string case_id,
       input bit [7:0] opcode
@@ -1217,8 +1224,8 @@ class rdma_cmq_driver_field_mutation_test extends uvm_test;
   endtask
 
   // 功能：status_matches_row 比较 production API 返回的状态与 reader 类型化的 expected_status_code。
-  // 输入输出及副作用：status、row 只读；返回精确 code 匹配结果，不按 message 文本放宽错误类别。
-  // 失败边界：row 未声明运行时状态或 status 为空时返回 0；static 行不得调用本函数宣称执行结果。
+  // 输入/输出及副作用：status、row 只读；返回精确 code 匹配结果，不按 message 文本放宽错误类别。
+  // 失败/边界：row 未声明运行时状态或 status 为空时返回 0；static 行不得调用本函数宣称执行结果。
   function automatic bit status_matches_row(
       input rdma_status status,
       input rdma_cmq_field_evidence_row row
@@ -1227,9 +1234,10 @@ class rdma_cmq_driver_field_mutation_test extends uvm_test;
            status.code == row.status_code_value;
   endfunction
 
-  // 功能：check_completion_typed_value 核对 accepted raw CQE 中 owner/index/wrap/opcode/ecode 的类型化值来自 mutation 后字节。
-  // 输入输出及副作用：row、mutant、completion 只读；仅报告字段投影偏差，不修改 completion payload。
-  // 失败边界：非 HW_TYPED 字段、对象为空或 decoder 输出与 raw qword0 不一致时报告错误。
+  // 功能：check_completion_typed_value 核对 accepted raw CQE 中
+  //   owner/index/wrap/opcode/ecode 的类型化值来自 mutation 后字节。
+  // 输入/输出及副作用：row、mutant、completion 只读；仅报告字段投影偏差，不修改 completion payload。
+  // 失败/边界：非 HW_TYPED 字段、对象为空或 decoder 输出与 raw qword0 不一致时报告错误。
   task automatic check_completion_typed_value(
       input rdma_cmq_field_evidence_row row,
       input rdma_hw_image mutant,
@@ -1266,9 +1274,10 @@ class rdma_cmq_driver_field_mutation_test extends uvm_test;
     endcase
   endtask
 
-  // 功能：check_completion_row 翻转一个 C CQE memory bit，分别执行 raw completion codec 与 production profile，并核对两层结果。
-  // 输入输出及副作用：row、canonical 只读；创建 mutant，成功后更新 visited/raw 计数，不修改 canonical。
-  // 失败边界：raw delta 非单 bit、状态/ready/publication 不符，或 ecode 未映射为非 OK command_status 时报告错误。
+  // 功能：check_completion_row 翻转一个 C CQE memory bit，分别执行 raw
+  //   completion codec 与 production profile，并核对两层结果。
+  // 输入/输出及副作用：row、canonical 只读；创建 mutant，成功后更新 visited/raw 计数，不修改 canonical。
+  // 失败/边界：raw delta 非单 bit、状态/ready/publication 不符，或 ecode 未映射为非 OK command_status 时报告错误。
   task automatic check_completion_row(
       input rdma_cmq_field_evidence_row row,
       input rdma_hw_image canonical
@@ -1365,9 +1374,10 @@ class rdma_cmq_driver_field_mutation_test extends uvm_test;
     raw_decode_mutation_count++;
   endtask
 
-  // 功能：check_completion_case 执行 QPC_CREATE response 的全部 512 个 raw bit mutation，并保持 driver result 与 model result 分层。
-  // 输入输出及副作用：case_id、opcode 选择冻结 CQE case；只读 canonical artifact，逐行调用真实 decoder。
-  // 失败边界：case/opcode 不符、canonical 基线未被接受、行数漂移或任一 row 结果偏差时报告错误。
+  // 功能：check_completion_case 执行 QPC_CREATE response 的全部 512 个 raw bit
+  //   mutation，并保持 driver result 与 model result 分层。
+  // 输入/输出及副作用：case_id、opcode 选择冻结 CQE case；只读 canonical artifact，逐行调用真实 decoder。
+  // 失败/边界：case/opcode 不符、canonical 基线未被接受、行数漂移或任一 row 结果偏差时报告错误。
   task automatic check_completion_case(
       input string case_id,
       input bit [7:0] opcode
@@ -1419,8 +1429,8 @@ class rdma_cmq_driver_field_mutation_test extends uvm_test;
   endtask
 
   // 功能：check_doorbell_request_case 用 production encode_doorbell 闭合五个 PI 位、一个 polarity 位及 58 个不可写位。
-  // 输入输出及副作用：case_id 选择冻结 doorbell case；创建 CMQ handle 和 detached image，更新 typed/static/visited 计数。
-  // 失败边界：canonical `(0x17,1)` 不匹配 C、typed delta 非单 bit、static 位非零或 encoder 状态/元数据错误时报告失败。
+  // 输入/输出及副作用：case_id 选择冻结 doorbell case；创建 CMQ handle 和 detached image，更新 typed/static/visited 计数。
+  // 失败/边界：canonical `(0x17,1)` 不匹配 C、typed delta 非单 bit、static 位非零或 encoder 状态/元数据错误时报告失败。
   task automatic check_doorbell_request_case(
       input string case_id
   );
@@ -1549,9 +1559,10 @@ class rdma_cmq_driver_field_mutation_test extends uvm_test;
       `uvm_error("CMQ_DOORBELL_COUNT", "doorbell count is not 64")
   endtask
 
-  // 功能：check_cqc_embed_blocker 读取 CQC C-oracle field 与 capability 行，确认 payload target base=8 且 request 仍显式阻塞。
-  // 输入输出及副作用：无参数；只读两个 TSV，并检查当前 mutation rows 中没有 CQC case，不执行或平移错误 composer。
-  // 失败边界：文件缺失、字段/能力行不唯一、request_encodable 非零、blocker 改名或出现 CQC mutation 时报告错误。
+  // 功能：check_cqc_embed_blocker 读取 CQC C-oracle field 与 capability 行，确认
+  //   payload target base=8 且 request 仍显式阻塞。
+  // 输入/输出及副作用：无参数；只读两个 TSV，并检查当前 mutation rows 中没有 CQC case，不执行或平移错误 composer。
+  // 失败/边界：文件缺失、字段/能力行不唯一、request_encodable 非零、blocker 改名或出现 CQC mutation 时报告错误。
   task automatic check_cqc_embed_blocker();
     int fields_fd;
     int capabilities_fd;
@@ -1635,8 +1646,8 @@ class rdma_cmq_driver_field_mutation_test extends uvm_test;
   endtask
 
   // 功能：check_final_counts 断言 gate 实际执行/静态消费的六类计数与冻结 1,088 行完全闭合。
-  // 输入输出及副作用：读取本测试计数；产生一条稳定 summary 信息，不修改 rows 或 capability 文件。
-  // 失败边界：任一类别、executed/static subtotal 或 grand total 漂移时报告错误，禁止仅用总行数掩盖漏执行。
+  // 输入/输出及副作用：读取本测试计数；产生一条稳定 summary 信息，不修改 rows 或 capability 文件。
+  // 失败/边界：任一类别、executed/static subtotal 或 grand total 漂移时报告错误，禁止仅用总行数掩盖漏执行。
   task automatic check_final_counts();
     int unsigned executed_total;
     int unsigned static_total;
@@ -1675,8 +1686,8 @@ class rdma_cmq_driver_field_mutation_test extends uvm_test;
   endtask
 
   // 功能：run_phase 严格加载 mutation/oracle，依次执行 request、response、doorbell 与 CQC blocker，最后闭合分类计数。
-  // 输入输出及副作用：phase 由 UVM 提供；持有 objection 期间只做本地文件读取和纯 codec/profile 调用，结束时释放 objection。
-  // 失败边界：manifest 或 canonical request 无法读取时立即 fatal；其余偏差累计为 UVM_ERROR，绝不把缺失证据计为通过。
+  // 输入/输出及副作用：phase 由 UVM 提供；持有 objection 期间只做本地文件读取和纯 codec/profile 调用，结束时释放 objection。
+  // 失败/边界：manifest 或 canonical request 无法读取时立即 fatal；其余偏差累计为 UVM_ERROR，绝不把缺失证据计为通过。
   virtual task run_phase(uvm_phase phase);
     string error;
 

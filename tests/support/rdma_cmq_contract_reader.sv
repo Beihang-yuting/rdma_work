@@ -65,8 +65,8 @@ class rdma_cmq_field_evidence_row extends uvm_object;
   bit value_delta;
 
   // 功能：构造一个尚未解析的 CMQ 证据行，并为所有原始列和类型化列建立确定初值。
-  // 输入输出及副作用：name 输入仅设置 UVM 对象名；函数初始化本对象，不打开文件，也不取得外部对象所有权。
-  // 失败边界：构造成功不代表合同有效；只有 parse_row 完整赋值并验证后的对象才允许进入 gate。
+  // 输入/输出及副作用：name 输入仅设置 UVM 对象名；函数初始化本对象，不打开文件，也不取得外部对象所有权。
+  // 失败/边界：构造成功不代表合同有效；只有 parse_row 完整赋值并验证后的对象才允许进入 gate。
   function new(string name = "rdma_cmq_field_evidence_row");
     super.new(name);
 
@@ -105,8 +105,8 @@ class rdma_cmq_contract_reader;
   localparam int unsigned COLUMN_COUNT = 18;
 
   // 功能：split_tab 按单个 tab 边界拆分一行 TSV，并保留连续 tab 形成的空字段供上层拒绝。
-  // 输入输出及副作用：line 为只读输入，tokens 在进入函数时清空并接收全部列；函数不修改 line 或文件状态。
-  // 失败边界：零长度 line 返回 0；尾随 tab 或连续 tab 仍返回列，由 parse_row 以空列失败。
+  // 输入/输出及副作用：line 为只读输入，tokens 在进入函数时清空并接收全部列；函数不修改 line 或文件状态。
+  // 失败/边界：零长度 line 返回 0；尾随 tab 或连续 tab 仍返回列，由 parse_row 以空列失败。
   static function bit split_tab(string line, output string tokens[$]);
     int start;
 
@@ -128,8 +128,8 @@ class rdma_cmq_contract_reader;
   endfunction
 
   // 功能：strip_line_ending 接受规范 LF 或 CRLF 物理行，移除唯一行尾并返回不含换行的文本。
-  // 输入输出及副作用：raw 输入来自 $fgets，line 输出为新字符串；函数只读 raw，不改变文件游标。
-  // 失败边界：缺少 LF、出现孤立 CR/LF、空物理行或 CRCRLF 均返回 0，避免平台换行被静默归一化。
+  // 输入/输出及副作用：raw 输入来自 $fgets，line 输出为新字符串；函数只读 raw，不改变文件游标。
+  // 失败/边界：缺少 LF、出现孤立 CR/LF、空物理行或 CRCRLF 均返回 0，避免平台换行被静默归一化。
   static function bit strip_line_ending(
       input string raw,
       output string line
@@ -156,8 +156,8 @@ class rdma_cmq_contract_reader;
   endfunction
 
   // 功能：contains_forbidden_text 检测数据列中的注释起始符、空白或控制字符，防止 token 被宽松解析。
-  // 输入输出及副作用：token 为只读输入；返回是否存在 #、space、tab、CR、LF 或其他 ASCII 控制字符。
-  // 失败边界：空 token 由 parse_row 单独拒绝；本函数对非 ASCII 字节也保守返回 1。
+  // 输入/输出及副作用：token 为只读输入；返回是否存在 #、space、tab、CR、LF 或其他 ASCII 控制字符。
+  // 失败/边界：空 token 由 parse_row 单独拒绝；本函数对非 ASCII 字节也保守返回 1。
   static function bit contains_forbidden_text(string token);
     int ch;
 
@@ -172,8 +172,8 @@ class rdma_cmq_contract_reader;
   endfunction
 
   // 功能：parse_decimal 把 mutation 坐标的规范十进制文本转换为 int unsigned。
-  // 输入输出及副作用：text 输入、value 输出；成功时写 value，不读取或修改任何合同对象。
-  // 失败边界：空值、符号、0x 前缀、非数字、非规范前导零或 32-bit 溢出均返回 0。
+  // 输入/输出及副作用：text 输入、value 输出；成功时写 value，不读取或修改任何合同对象。
+  // 失败/边界：空值、符号、0x 前缀、非数字、非规范前导零或 32-bit 溢出均返回 0。
   static function bit parse_decimal(
       input string text,
       output int unsigned value
@@ -203,34 +203,58 @@ class rdma_cmq_contract_reader;
   endfunction
 
   // 功能：expected_field_at 用冻结驱动合同的逻辑 qword 坐标判定一行应归属的语义字段或保留零区域。
-  // 输入输出及副作用：row 为只读、已完成 case/坐标解析的对象；返回规范 expected_field，不使用被测 SV mask。
-  // 失败边界：case_kind 只接受三个冻结 case；超出 case 长度的坐标由 parse_row 先拒绝，default 返回空串使调用方失败。
+  // 输入/输出及副作用：row 为只读、已完成 case/坐标解析的对象；返回规范 expected_field，不使用被测 SV mask。
+  // 失败/边界：case_kind 只接受三个冻结 case；超出 case 长度的坐标由 parse_row 先拒绝，default 返回空串使调用方失败。
   static function string expected_field_at(
       rdma_cmq_field_evidence_row row
   );
     case (row.case_kind)
       RDMA_CMQ_CASE_QPC_REQUEST: begin
         if (row.qword_index == 0) begin
-          if (row.bit_index == 63) return "valid";
-          if (row.bit_index == 59) return "vf_id_override";
-          if (row.bit_index inside {[48:58]}) return "use_vfid";
-          if (row.bit_index == 45) return "wrap";
-          if (row.bit_index inside {[40:44]}) return "index";
-          if (row.bit_index inside {[32:39]}) return "opcode";
-          if (row.bit_index inside {[0:23]}) return "qpn";
+          if (row.bit_index == 63) begin
+            return "valid";
+          end
+          if (row.bit_index == 59) begin
+            return "vf_id_override";
+          end
+          if (row.bit_index inside {[48:58]}) begin
+            return "use_vfid";
+          end
+          if (row.bit_index == 45) begin
+            return "wrap";
+          end
+          if (row.bit_index inside {[40:44]}) begin
+            return "index";
+          end
+          if (row.bit_index inside {[32:39]}) begin
+            return "opcode";
+          end
+          if (row.bit_index inside {[0:23]}) begin
+            return "qpn";
+          end
           return "-";
         end
 
         if (row.qword_index == 1) begin
-          if (row.bit_index inside {[0:20]}) return "rq_cqn";
-          if (row.bit_index inside {[24:31]}) return "signature";
-          if (row.bit_index == 32) return "sign_en";
-          if (row.bit_index inside {[43:63]}) return "sq_cqn";
+          if (row.bit_index inside {[0:20]}) begin
+            return "rq_cqn";
+          end
+          if (row.bit_index inside {[24:31]}) begin
+            return "signature";
+          end
+          if (row.bit_index == 32) begin
+            return "sign_en";
+          end
+          if (row.bit_index inside {[43:63]}) begin
+            return "sq_cqn";
+          end
           return "-";
         end
 
-        if (row.qword_index == 3 && row.bit_index inside {[9:63]})
+        if (row.qword_index == 3 &&
+            row.bit_index inside {[9:63]}) begin
           return "qpc_buffer_addr_pa";
+        end
 
         return "-";
       end
@@ -239,17 +263,31 @@ class rdma_cmq_contract_reader;
         if (row.qword_index != 0)
           return "-";
 
-        if (row.bit_index == 63) return "owner";
-        if (row.bit_index == 45) return "wrap";
-        if (row.bit_index inside {[40:44]}) return "index";
-        if (row.bit_index inside {[32:39]}) return "opcode";
-        if (row.bit_index inside {[24:31]}) return "ecode";
+        if (row.bit_index == 63) begin
+          return "owner";
+        end
+        if (row.bit_index == 45) begin
+          return "wrap";
+        end
+        if (row.bit_index inside {[40:44]}) begin
+          return "index";
+        end
+        if (row.bit_index inside {[32:39]}) begin
+          return "opcode";
+        end
+        if (row.bit_index inside {[24:31]}) begin
+          return "ecode";
+        end
         return "-";
       end
 
       RDMA_CMQ_CASE_SQ_DOORBELL: begin
-        if (row.bit_index inside {[32:36]}) return "pi";
-        if (row.bit_index == 37) return "polarity";
+        if (row.bit_index inside {[32:36]}) begin
+          return "pi";
+        end
+        if (row.bit_index == 37) begin
+          return "polarity";
+        end
         return "-";
       end
 
@@ -258,8 +296,8 @@ class rdma_cmq_contract_reader;
   endfunction
 
   // 功能：matches_contract 比较一行的分类、证据、driver 结果与 model 结果是否精确等于冻结组合。
-  // 输入输出及副作用：row 只读；其余字符串是该坐标的期望值；函数返回布尔值，不改写 row。
-  // 失败边界：任一列缺失、跨层混用或额外状态发布均返回 0，由 parse_row 报 malformed row。
+  // 输入/输出及副作用：row 只读；其余字符串是该坐标的期望值；函数返回布尔值，不改写 row。
+  // 失败/边界：任一列缺失、跨层混用或额外状态发布均返回 0，由 parse_row 报 malformed row。
   static function bit matches_contract(
       rdma_cmq_field_evidence_row row,
       string expected_class,
@@ -282,8 +320,8 @@ class rdma_cmq_contract_reader;
   endfunction
 
   // 功能：validate_row_semantics 对 case 身份、consumer、字段所有权和运行时结果配对执行逐行 fail-closed 校验。
-  // 输入输出及副作用：row 为只读已解析对象；返回合同是否精确成立，不调用生产 codec 或修改证据。
-  // 失败边界：未知字段、错误 evidence/result 配对、static 行携带 status/ready、response 层混淆或 doorbell 路由漂移均返回 0。
+  // 输入/输出及副作用：row 为只读已解析对象；返回合同是否精确成立，不调用生产 codec 或修改证据。
+  // 失败/边界：未知字段、错误 evidence/result 配对、static 行携带 status/ready、response 层混淆或 doorbell 路由漂移均返回 0。
   static function bit validate_row_semantics(
       rdma_cmq_field_evidence_row row
   );
@@ -428,8 +466,8 @@ class rdma_cmq_contract_reader;
   endfunction
 
   // 功能：parse_row 将恰好 18 个原始 TSV token 转换为一个带规范枚举、数值和业务配对的证据对象。
-  // 输入输出及副作用：tokens 输入；成功时 row 输出新对象，失败时输出 null；函数不保留 tokens 引用。
-  // 失败边界：空列、注释/空白混入、未知 case/enum/result、非十进制坐标、长度越界、byte/qword 映射或语义配对漂移均返回 0。
+  // 输入/输出及副作用：tokens 输入；成功时 row 输出新对象，失败时输出 null；函数不保留 tokens 引用。
+  // 失败/边界：空列、注释/空白混入、未知 case/enum/result、非十进制坐标、长度越界、byte/qword 映射或语义配对漂移均返回 0。
   static function bit parse_row(
       input string tokens[$],
       output rdma_cmq_field_evidence_row row
@@ -590,8 +628,8 @@ class rdma_cmq_contract_reader;
   endfunction
 
   // 功能：read_all 读取完整 mutation manifest，验证物理文本、每行语义、坐标唯一性、correlation 闭合和冻结计数。
-  // 输入输出及副作用：path 输入；rows 和 error 输出；函数只读文件，并保证所有成功/失败出口前关闭 fd。
-  // 失败边界：header/换行/注释/空行异常、duplicate、任一行 fail-closed 校验失败，或 1088 行及六类计数漂移时返回 0 且 rows 清空。
+  // 输入/输出及副作用：path 输入；rows 和 error 输出；函数只读文件，并保证所有成功/失败出口前关闭 fd。
+  // 失败/边界：header/换行/注释/空行异常、duplicate、任一行 fail-closed 校验失败，或 1088 行及六类计数漂移时返回 0 且 rows 清空。
   static function bit read_all(
       input string path,
       output rdma_cmq_field_evidence_row rows[$],
