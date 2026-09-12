@@ -606,9 +606,11 @@ class rdma_hw_occ_flush_body extends rdma_hw_model;
     pd_backing = rhs_body.pd_backing;
   endfunction
 
-  // 功能：validate 校验 当前对象字段 与当前对象状态的一致性，并显式处理“OCC PD backing is not 4 KiB aligned”等拒绝条件，返回 rdma_status 供上层决定是否提交。
-  // 输入/输出及副作用：无显式参数；validate 读取 对象字段：rdma_status、pd_backing.value、mr_serial、qpn 并使用字段 vf_pattern、serial_pattern、qpn_pattern、qpn_pd_pattern、pd_pattern；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：validate 返回 RDMA_SC_INVALID_ARGUMENT；具体拒绝条件包括 “OCC PD backing is not 4 KiB aligned”；“OCC flush does not match a supported driver command pattern”；失败路径不提交部分状态、不隐式重试，也不转移未声明资源。
+  // 功能：validate 按驱动的 VF、MR serial、QPN、QPN+PD 和 PD 五种 OCC flush 图案校验全部 selector 与 payload 字段。
+  // 输入/输出及副作用：无显式参数；只读取 selector、qpn、mr_serial 和 pd_backing，返回与匹配图案或对齐错误对应的 rdma_status，不修改模型或外部资源。
+  // 失败/边界：PD backing 非 4 KiB 对齐或字段组合不属于五种完整图案时
+  //   返回 RDMA_SC_INVALID_ARGUMENT；QPN 图案允许驱动为 SMI 保留的 QPN 0，
+  //   但仍要求 EIRQE/ORQE/UAQE 全部置位且其他字段为零。
   virtual function rdma_status validate();
     bit vf_pattern;
     bit serial_pattern;
@@ -631,7 +633,7 @@ class rdma_hw_occ_flush_body extends rdma_hw_model;
     qpn_pattern = !vf_flush && !mr_serial_flush &&
                   !qpc && !cqc && !mrt && !pble && !sqrqe &&
                   !sgb_irqe && eirqe && orqe && uaqe && !pd &&
-                  qpn != 0 && mr_serial == 0 && pd_backing.value == 0;
+                  mr_serial == 0 && pd_backing.value == 0;
     qpn_pd_pattern = !vf_flush && !mr_serial_flush &&
                      !qpc && !cqc && !mrt && !pble && !sqrqe &&
                      !sgb_irqe && !eirqe && !orqe && !uaqe && pd &&

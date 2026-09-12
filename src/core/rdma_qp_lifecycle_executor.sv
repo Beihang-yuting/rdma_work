@@ -6,29 +6,6 @@
 // 中文说明：rdma_qp_lifecycle_executor.sv 属于核心执行层，负责队列、控制面、资源和恢复流程。
 // 阅读提示：先看公开类型和接口，再看实现细节；失败路径应保持状态与资源所有权可追踪。
 
-class rdma_qp_occ_flush_body extends rdma_hw_occ_flush_body;
-  // QP 回滚使用 QPN=0 的精确 OCC flush 图像，避免误刷其他资源。
-  `uvm_object_utils(rdma_qp_occ_flush_body)
-
-  // 功能：构造 rdma_qp_occ_flush_body，调用 super.new 建立 UVM 层级对象；外部依赖字段保持未绑定，后续由 configure/build/activate 明确注入。
-  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
-  // 失败/边界：rdma_qp_occ_flush_body 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
-  function new(string name = "rdma_qp_occ_flush_body");
-    super.new(name);
-  endfunction
-
-  // 功能：validate 校验 当前对象字段 与当前对象状态的一致性，返回 rdma_status 供上层决定是否提交。
-  // 输入/输出及副作用：无显式参数；validate 读取 对象字段：rdma_status、vf_flush、mr_serial_flush、qpc、cqc、mrt、pble、sqrqe 并使用字段 rdma_status、vf_flush、mr_serial_flush、qpc、cqc、mrt、pble、sqrqe；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：validate 的结果直接由 return rdma_status::success() 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
-  virtual function rdma_status validate();
-    if (!vf_flush && !mr_serial_flush && !qpc && !cqc && !mrt &&
-        !pble && !sqrqe && !sgb_irqe && eirqe && orqe && uaqe &&
-        !pd && qpn == 0 && mr_serial == 0 && pd_backing.value == 0)
-      return rdma_status::success();
-    return super.validate();
-  endfunction
-endclass
-
 class rdma_qp_lifecycle_executor extends uvm_object;
   // 生命周期执行器统一负责 QP backing 的分配、发布、恢复和最终清理。
   `uvm_object_utils(rdma_qp_lifecycle_executor)
@@ -1480,21 +1457,26 @@ class rdma_qp_lifecycle_executor extends uvm_object;
                             "QP command validation returned null");
   endfunction
 
-  // 功能：build_occ_command 创建独立的 rdma_status；根据 owner、local_qpn、pd_ref、command 设置字段 command、body、body.qpn、body.eirqe、body.orqe、body.uaqe、body.pd、pd_backing.value、command.function_h、command.opcode_key，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 功能：build_occ_command 为 QP 回滚或销毁构造 canonical OCC_FLUSH
+  //   命令；QPN 路径选择 EIRQE/ORQE/UAQE，PD 路径只选择 PD backing。
   // 输入/输出及副作用：owner（输入）、local_qpn（输入）、pd_ref（输入）、command（输出）；build_occ_command 读取 owner、local_qpn、pd_ref、command 并使用字段 command、body、body.qpn、body.eirqe、body.orqe、body.uaqe、body.pd、pd_backing.value，并写入 command；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：build_occ_command 返回 RDMA_SC_INVALID_ARGUMENT；典型拒绝条件为“QP OCC authority is invalid”“QP OCC PD mapping is null”；失败路径不提交部分状态或转移未声明资源。
+  // 失败/边界：owner 为空、local_qpn 超过 21 bit、PD mapping 为空或
+  //   canonical body/command 校验失败时返回错误；QPN 0 是驱动保留的合法
+  //   SMI QP 标识，不能借 subtype 绕过 profile exact-type 门禁。
   protected function rdma_status build_occ_command(
     rdma_function_handle owner,
     int unsigned local_qpn,
     rdma_qp_backing_ref pd_ref,
     output rdma_cmq_command_desc command
   );
-    rdma_qp_occ_flush_body body;
+    rdma_hw_occ_flush_body body;
 
     command = null;
     if (owner == null || local_qpn > 21'h1f_ffff)
       return invalid_argument("QP OCC authority is invalid");
-    body = rdma_qp_occ_flush_body::type_id::create("qp_occ_body");
+    // profile 只快照 exact canonical body；QP 层不得再创建带自定义
+    // validate() 的派生类型，否则 mock/production 共用的快照边界会拒绝命令。
+    body = rdma_hw_occ_flush_body::type_id::create("qp_occ_body");
     body.qpn = local_qpn;
     if (pd_ref == null) begin
       body.eirqe = 1'b1;
