@@ -1,6 +1,7 @@
 # RDMA 引擎契约优先渐进重构设计
 
-> 状态：总体路线已获批准；本文档完成独立复审修订后等待用户审阅，审阅前不改生产代码。
+> 状态：总体路线已获批准；本文档随已批准的分阶段实现同步，当前冻结 Task 9 CMQ
+> observed execution、journal digest 与 recovery value 契约。
 > 日期：2026-09-11
 > 首批范围：CMQ 提交证据、opcode 能力契约和 `rdma_cmq_engine` 内部分层。
 > 后续范围：`queue_data_engine`、`queue_runtime`、`resource_manager`、
@@ -338,24 +339,58 @@ ledger，也不创建锁；所有 `_locked` 操作都要求已经持有 `engine_
 
 每个 batch record 至少保存：
 
-- batch ID、attempt ID、start/end sequence 和当前 journal state；
+- batch key、batch ID、当前 attempt ID、engine instance/incarnation、start/end
+  sequence、当前 journal state、累计 `submission_effect`、本次 `attempt_effect`、
+  observer-armed 和 publication-retry-safe evidence；
+- batch-level Function identity、完整 binding、CMQ handle、doorbell image、最终
+  PI/polarity 和稳定 batch digest；
 - 每条 command 的 detached identity、ticket、token incarnation、slot index/wrap 和
   entry key；
 - 每条 command 的 detached 64B SQE image、dependency image 和完整 DMA/Function
   authority；
-- 每条 command 的 submission effect、completion phase、最后 status 和 recovery owner；
+- 每条 command 的 image/authority digest、累计 `submission_effect`、本次
+  `attempt_effect`、completion phase、权威 retained completion、最后 status、
+  `recovery_required` 和 recovery owner；
 - 预分配的 command/entry index 节点，以及 reset epoch/Function generation。
 
 recovery owner 是 item-level snapshot，不能只放在 batch 上。它至少包含 owning workflow、
-resource handle、transaction ID、attempt ID、允许的恢复 action 和 reset epoch；由提交该
-command 的 control-plane/lifecycle workflow 显式提供，engine 只验证并冻结，不从 opcode
-猜 owner。同一 Function 的一个 batch 可以包含属于不同 MR/QP/queue workflow 的 command。
-batch record 只拥有 fence coordinator 和共享 doorbell evidence，不能替各 item 决定补偿。
+resource handle、transaction ID、允许的恢复 action、完整 Function identity 和不可变的
+`admission_attempt_id`；由提交该 command 的 control-plane/lifecycle workflow 显式提供，
+engine 只验证并冻结，不从 opcode 或 status 猜 owner。同一 Function 的一个 batch 可以
+包含属于不同 MR/QP/queue workflow 的 command。batch record 只拥有 fence coordinator
+和共享 doorbell evidence，不能替各 item 决定补偿。
+
+owner workflow 与 action 编码固定为四态枚举，`allowed_actions` 固定为
+`logic [2:0]`：
+
+```systemverilog
+typedef enum logic [2:0] {
+  RDMA_CMQ_WORKFLOW_INVALID,
+  RDMA_CMQ_WORKFLOW_LEGACY_UNMIGRATED,
+  RDMA_CMQ_WORKFLOW_MR,
+  RDMA_CMQ_WORKFLOW_QUEUE,
+  RDMA_CMQ_WORKFLOW_QP
+} rdma_cmq_recovery_workflow_e;
+
+typedef enum logic [1:0] {
+  RDMA_CMQ_RECOVERY_INVALID,
+  RDMA_CMQ_RECOVERY_RETRY_PUBLISH,
+  RDMA_CMQ_RECOVERY_CONFIRM_RESET_ISOLATION
+} rdma_cmq_submission_recovery_action_e;
+```
+
+具体 owner 在首次 admission 时验证 workflow/resource-kind/action matrix，随后以完整
+Function identity 和非零 `admission_attempt_id` 冻结。MR 只接受 MR，QP 只接受 QP，
+QUEUE 只接受 CQ/SRQ/CEQ/AEQ；FUNCTION、PD、CMQ、MW 以及所有交叉组合均拒绝。bit 0
+对应 INVALID，必须为零；至少一个合法 action bit 必须为一。精确
+`LEGACY_UNMIGRATED` sentinel 保持未冻结、零 authority、零 admission attempt 且不允许
+任何 action，绝不能从 opcode/status 提升成具体 owner。所有 workflow/action/mask 在索引
+或迁移前先拒绝 X/Z、INVALID 和 spare 编码。
 
 journal state 固定为：
 
 ```systemverilog
-typedef enum bit [3:0] {
+typedef enum logic [3:0] {
   RDMA_CMQ_SUBMISSION_STAGED,
   RDMA_CMQ_SUBMISSION_PENDING_EFFECT,
   RDMA_CMQ_SUBMISSION_HOST_VISIBLE_NOT_PUBLISHED,
@@ -367,6 +402,13 @@ typedef enum bit [3:0] {
   RDMA_CMQ_SUBMISSION_RESET_QUARANTINED
 } rdma_cmq_submission_state_e;
 ```
+
+state 在任何 array/state indexing 前拒绝 X/Z 和 9..15 spare。
+`rdma_cmq_reduce_batch_state()` 只生成 diagnostic aggregate，不授权迁移；它拒绝
+pre-MMIO/published 的不可能混合，否则按保守顺序选择 `RESET_QUARANTINED`、
+`HOST_VISIBLE_NOT_PUBLISHED`、`PUBLISH_AMBIGUOUS`、`TIMED_OUT_QUARANTINED`、
+`PENDING_EFFECT`、`STAGED`，然后在仍有 pending item 时选 `PUBLISH_CONFIRMED`；全部
+completed 返回 `COMPLETED`，全部 terminal 且至少一项 late 返回 `LATE_COMPLETED`。
 
 状态迁移和释放规则如下：
 
@@ -432,7 +474,8 @@ poll、wait、journal query、受控 recovery、reset/FLR 和诊断读取仍可�
 首批只提供两个显式恢复 action，不实现“直接擦除 Host-memory image 并释放”的捷径：
 
 ```systemverilog
-typedef enum bit {
+typedef enum logic [1:0] {
+  RDMA_CMQ_RECOVERY_INVALID,
   RDMA_CMQ_RECOVERY_RETRY_PUBLISH,
   RDMA_CMQ_RECOVERY_CONFIRM_RESET_ISOLATION
 } rdma_cmq_submission_recovery_action_e;
@@ -444,8 +487,11 @@ task recover_submission_observed(
 );
 ```
 
-request 必须携带 batch/attempt ID、期望 Function immutable identity、generation/reset
-epoch、每项 recovery-owner identity，以及 detached image/authority hash。
+request 必须携带 batch key/ID、期望当前 attempt ID、期望 Function immutable identity、
+完整 binding/CMQ/doorbell/final PI/polarity/sequence 的 batch authority 投影、稳定
+batch digest，以及每项 recovery-owner identity 和 detached image/authority digest。
+record 保存同一完整 batch authority 投影；recovery 从 request-owned graph 和
+journal-owned graph 分别重算并校验，而不信任携带的 digest。
 `RETRY_PUBLISH` 只允许 `HOST_VISIBLE_NOT_PUBLISHED`，且 scheduler evidence 必须明确
 observer 从未 arm、effect 不超过 `HOST_MEMORY_ORDERED`；当前 mapping、authority、
 Function generation、reset epoch 和每个 image/hash 必须与 journal 完全相同。重试仍用
@@ -460,7 +506,19 @@ recovery 采用 CAS 式 attempt 语义。request 的 `expected_attempt_id` 必�
 并发/重复 retry 中只能一个取得新 attempt；随后到达的旧 expected ID 返回
 `RDMA_SC_INVALID_STATE` 和稳定的“stale CMQ recovery attempt”消息，不调用任何外部 I/O。
 attempt overflow 在 I/O 前返回 `RDMA_SC_RESOURCE_EXHAUSTED`。无论 scheduler 后续成功或
-失败，每项 result 都返回已经生效的 current attempt ID，调用方不得猜测是否递增。
+失败，每项 result 都返回已经生效的 current attempt ID，调用方不得猜测是否递增。该
+current attempt 只描述 batch/CAS 进度；owner 的 `admission_attempt_id` 是首次 admission
+provenance，retry 不得重写它。
+
+每个 attempt 同时保存两个 effect。`attempt_effect` 只描述本 API 调用触发的 scheduler
+attempt；`submission_effect` 是该 command 生命周期的保守累计高水位。正常首次
+scheduler envelope 中二者相等；若 authentic arm callback 后 envelope 丢失，原始
+`attempt_effect=UNOBSERVED`，而累计值必须吸收 callback 的 `MMIO_MAYBE_VISIBLE`。跨
+attempt 折叠只在五个 Host-memory/MMIO concrete 值之间取阶段最大值；当前
+`PRE_SUBMIT_REJECTED` 或 `UNOBSERVED` 不得抹去既有 concrete evidence。prior 为
+`UNOBSERVED` 时，后续 concrete evidence 可替换它；否则 `UNOBSERVED + PRE/UNOBSERVED`
+仍为 `UNOBSERVED`。生命周期 completion、timeout、late 或 reset 更新不得重写任一
+effect。
 
 recovery request 内的 item list 必须与 journal 原 batch 等长同序，且 identity/owner/hash
 逐项唯一匹配。batch 可定位且 item list 结构合法时，`results[]` 在 action 成功、失败或
@@ -475,6 +533,26 @@ attempt 和 fence 完全不变。
 list 合法的 action，校验或外部步骤失败都返回逐项非空 result/status，原 journal/fence
 不变。
 
+reset-isolation proof 使用四态状态：
+
+```systemverilog
+typedef enum logic [1:0] {
+  RDMA_CMQ_RESET_PROOF_INVALID,
+  RDMA_CMQ_RESET_PROOF_AWAITING_REBIND,
+  RDMA_CMQ_RESET_PROOF_READY
+} rdma_cmq_reset_isolation_proof_state_e;
+```
+
+公开构造出的 proof 只有 `INVALID`，不能凭字段相似自行取得 authority。
+`AWAITING_REBIND` 要求 backing release 已确认且仍引用旧 identity；`READY` 还要求新
+identity 保持相同 immutable Function、reset epoch 严格递增。proof 保存 proof/batch/
+attempt/engine identity、isolated/replacement identity、batch digest、release
+confirmation，以及有序四字段 tuple `{request_index, image_digest, authority_digest,
+full recovery_owner}`。四个 tuple 数组必须非空、等长、同序；所有 enum/mask 在索引或
+迁移前拒绝 X/Z/spare。replacement identity、proof state 和 release-confirmation 不进入
+稳定 proof digest，但完整值相等和合法迁移校验仍然必需，匹配 digest 本身永不授权
+recovery。
+
 若未来需要 erase/abort，必须另立规格并提供原始 preimage、排他 mapping ownership、
 DMA/read fence 和硬件绝不会读取该 slot 的证明；本规格不允许通过写零或覆盖 SQE 来
 推断安全释放。
@@ -482,7 +560,8 @@ DMA/read fence 和硬件绝不会读取该 slot 的证明；本规格不允许�
 batch ID 和 attempt ID 由 ledger 在锁内单调分配，稳定身份是
 `Function immutable identity + engine incarnation + reset epoch + counter`。counter 不得
 wrap 或复用；溢出必须在任何外部 I/O 前 poison/reject。retry 增加 attempt counter，
-但保持原 batch ID、ticket、slot 和 recovery owner。
+但保持原 batch ID、ticket、slot 和 recovery owner；owner 内首次冻结的
+`admission_attempt_id` 永远不随 current attempt 前进。
 
 effect 达到 `MMIO_MAYBE_VISIBLE` 后，整批 record 保持 `PUBLISH_AMBIGUOUS` 或
 `PUBLISH_CONFIRMED`，slot/entry key 持续由该 batch 独占；outstanding/ambiguous token
@@ -497,10 +576,190 @@ incarnation-safe characterization；无论该实现细节如何，slot、entry r
 token incarnation 和 epoch 必须保留到 `LATE_COMPLETED` 的有序 retire 或 reset 隔离。
 `RDMA_CMQ_COMPLETION_TIMEOUT` 只是对调用方的 completion phase，不是 journal 可回收终态。
 
+`recovery_required` 是按 command lifetime state 推导的保守“仍可能存在且未完全解决”位，
+不是自动 retry 能力。它同时保存在 journal item 和每次返回的 result 中；自动恢复还要求
+非零 batch/current-attempt identity、具体且已冻结的 owner、匹配的完整 journal authority，
+以及 action 所需 proof。精确表固定如下：
+
+| lifetime state / phase | `recovery_required` |
+| --- | --- |
+| 初始本地 `PRE_SUBMIT_REJECTED/NONE`，没有 retained journal | `0` |
+| `HOST_VISIBLE_NOT_PUBLISHED/NONE` | `1` |
+| `PUBLISH_AMBIGUOUS` 或 `PUBLISH_CONFIRMED` 且 phase 为 `PENDING` | `1` |
+| `TIMED_OUT_QUARANTINED/TIMEOUT` | `1` |
+| `RESET_QUARANTINED/RESET_CANCELLED`，具体 owner 的 proof 为 `AWAITING_REBIND` 或尚未确认的 `READY` | `1` |
+| `RESET_QUARANTINED/RESET_CANCELLED`，精确 legacy sentinel 且 backing release 已确认 | `0` |
+| `COMPLETED/TERMINAL`、`LATE_COMPLETED/DIAGNOSTIC_ONLY` 或 reset isolation 成功确认 | `0` |
+| 任一 `UNOBSERVED` result 或 delegation 后 malformed/degraded evidence | `1` |
+
+分类器必须穷举 state/phase/effect/proof 组合，并在读取或索引前拒绝 X/Z、spare 与不可能
+组合；拒绝时不得改写调用方预置输出。retry 若在 I/O 前拒绝，只更新本次
+`attempt_effect=PRE_SUBMIT_REJECTED`，不得清除 retained item 先前的 recovery bit。
+
+每个 journal item 还拥有权威 detached lifecycle `completion`。phase 为 `NONE` 或
+`PENDING` 时它才允许为空；`TERMINAL`、`TIMEOUT`、`RESET_CANCELLED` 和
+`DIAGNOSTIC_ONLY` 必须保留 public wait/reconcile/execute 所使用的同一完整 completion
+值。FIFO 只可作为 delivery-order index；pop FIFO 绝不能销毁 retained journal evidence。
+
 `submit_batch_observed()` 对输入逐项返回 result，顺序和数组长度必须与 requests 完全
 一致。共享一次 doorbell 的条目共享 batch ID 和 batch-level effect，但每条 result、
 ticket、status、identity 和 completion phase 都是独立 detached 值。单命令入口只是
 一项 batch 的包装，不能另写一套副作用状态机。
+
+#### 4.4.2 CMQ journal canonicalization 与 digest authority
+
+journal digest 只使用显式、版本化、schema-closed 的 canonical writer。禁止使用 UVM
+field automation、`sprint()`、`pack_bytes()`、host-endian integer、对象 instance name 或
+隐式 `get_type_name()`。primitive 编码固定为：
+
+- domain tag 是列出的 ASCII bytes 加最终 NUL，不带长度；
+- `u8/u16/u32/u64` 为 unsigned big-endian 固定宽度，窄 packed 值先零扩展；
+- boolean/enum 为一个 `u8`，有 X/Z 或 spare 值时在写入前拒绝；
+- string 为 `u32 byte_count` 加经验证的 UTF-8/`getc()` bytes；truncated、overlong、
+  surrogate、超过 U+10FFFF 或长度超过 `32'hffff_ffff` 时原子拒绝；
+- object 为 `u8 present`，存在时再写 counted stable schema tag 和字段；absent 只能配空
+  tag，present 必须配非空 tag；
+- dynamic queue/array 为 `u32 element_count` 加 index order 元素；fixed array 无 count，
+  按升序写入；
+- 256-bit digest 从 bit 255 到 bit 0 以 32 个 byte、MSB first 写入。
+
+所有复合 encoder 先写本地 child writer，仅在完整验证成功后把 raw child bytes 原子追加
+到 parent；任何失败都不得留下 prefix。writer snapshot 返回 detached bytes 且不清空
+writer。
+
+V1 nested schema 及字段顺序冻结如下。增删或重排字段必须新建 V2，不能静默改变 V1：
+
+- `HANDLE-V1`：`kind(u8)`、`function_uid(u64)`、`object_id(u32)`、
+  `generation(u32)`；Function handle 验证 runtime subtype 后仍用同一 schema。
+- `BDF-V1`：`segment(u16)`、`bus(u8)`、`device(u8)`、`function_num(u8)`。
+  `ROUTE-V1`：`host_topology_key(u32)`、`root_id(u16)`、`segment(u16)`、
+  `BDF-V1 bdf`。
+- `FUNCTION-IDENTITY-V1`：`key.root_id(u16)`、`key.host_topology_key(u32)`、
+  `key.function_kind(u8)`、`BDF-V1 key.parent_pf_bdf`、`key.vf_index(u16)`、
+  `BDF-V1 key.bdf`、`global_function_id(u32)`、`function_uid(u64)`、
+  `generation(u32)`、`reset_epoch(u64)`。
+- `OPCODE-KEY-V1`：`profile_name(string)`、`opcode(u32)`、`variant(string)`。
+  `RECOVERY-OWNER-V1`：`workflow(u8)`、`resource_h(HANDLE-V1)`、
+  `transaction_id(u64)`、`allowed_actions(u8)`、
+  `function_identity(FUNCTION-IDENTITY-V1)`、`admission_attempt_id(u64)`、
+  `frozen(u8)`；只有精确 legacy sentinel 的 resource/identity 可为 absent。
+- `IMAGE-V1`：`length(u64)`、`alignment(u32)`、`endian(u8)`、
+  `image_kind(u8)`、`hardware_version(u32)`、`function_generation(u32)`、
+  `write_target_kind(u8)`、`backing_target.value(u64)`、`hmc_target.value(u64)`、
+  `bar_target.value(u64)`、`bytes(queue<u8>)`、`field_summary(queue<string>)`；验证
+  `bytes.size()==length`。
+- `CMQ-TICKET-V1`：`command_id(u64)`、`function_h(HANDLE-V1)`、
+  `cmq_h(HANDLE-V1)`、`slot_sequence(u64)`、`sq_index(u32)`、`sq_wrap(u8)`、
+  `opcode_key(OPCODE-KEY-V1)`、`absolute_deadline(u64)`。
+- `DMA-CONTEXT-V1`：`function_h(HANDLE-V1)`、`BDF-V1 requester_bdf`、
+  `pasid_valid(u8)`、`pasid(u32)`、`dma_domain_valid(u8)`、
+  `dma_domain_id(u32)`、`ROUTE-V1 route`、`reset_epoch(u64)`、
+  `route_valid(u8)`、`epoch_valid(u8)`、nullable `owner_h(HANDLE-V1)`、
+  `queue_role_valid(u8)`、`queue_role(u32)`。
+- `DMA-MAPPING-PUBLIC-V1`：`function_h(HANDLE-V1)`、`BDF-V1 requester_bdf`、
+  `pasid_valid(u8)`、`pasid(u32)`、`dma_domain_valid(u8)`、
+  `dma_domain_id(u32)`、`ROUTE-V1 route`、`reset_epoch(u64)`、
+  `route_valid(u8)`、`epoch_valid(u8)`、`backing_addr.value(u64)`、
+  `iova.value(u64)`、`size(u64)`、`direction(u8)`、
+  `permissions.device_read(u8)`、`permissions.device_write(u8)`、
+  `permissions.atomic(u8)`、`state(u8)`、nullable `owner_h(HANDLE-V1)`、
+  `umem_backed(u8)`、`umem_page_count(u32)`。`umem_ref/pbl_ref/mw_ref`、concrete
+  subtype、adapter token 和所有 opaque allocation identity 明确排除；opaque capability
+  equivalence 另行校验，public digest 相同不能授权另一 allocation。
+- `FUNCTION-BINDING-V1`：`function_uid(u64)`、accessor 返回的 detached
+  `FUNCTION-IDENTITY-V1`、`pcie.bdf(BDF-V1)`、
+  `pcie.parent_pf_bdf(BDF-V1)`、`pcie.vf_index(u32)`、`pcie.mse(u8)`、
+  `pcie.bme(u8)`；六个升序固定 BAR `{bar_id(u8), base.value(u64), size(u64),
+  enabled(u8)}`；`notify_bar_id(u8)`、`notify_base.value(u64)`、
+  `notify_size(u64)`、`notify_table_sel(u32)`、`notify_table_index(u32)`、
+  `host_id(u32)`、`pfvf_id(u32)`、`rdma_vf_id(u32)`、
+  `global_function_id(u32)`、`vsi_id(u32)`；queue DMA 的
+  `requester_bdf(BDF-V1)`、`pasid_valid(u8)`、`pasid(u32)`、
+  `dma_domain_valid(u8)`、`dma_domain_id(u32)`；queue capability 的
+  `min_cq_depth(u32)`、`max_cq_depth(u32)`、`min_srq_depth(u32)`、
+  `max_srq_depth(u32)`、`max_ceq_depth(u32)`、`max_aeq_depth(u32)`、
+  `max_wq_sge(u32)`、`max_queue_ring_bytes(u64)`、`max_sgb_bytes(u64)`；
+  interrupt-vector queue 中每项 `function_local_vector(u32)`、
+  `hardware_eq_vector(u32)`、`msix_table_index(u32)`、`enabled(u8)`；最后为
+  `state(u8)`、`generation(u32)`、nullable `owner_h(HANDLE-V1)`、
+  `notify_valid(u8)`、`notify_ready(u8)`、`dmi_valid(u8)`、`dmi_ready(u8)`、
+  `vft_valid(u8)`、`vft_ready(u8)`。
+
+`CMQ-COMMAND-V1` 依次编码 `function_h(HANDLE-V1)`、
+`opcode_key(OPCODE-KEY-V1)`、精确 polymorphic body tag/schema、nullable
+`qpc_signature_source(IMAGE-V1)`、`vfid_override(u8)`、`use_vfid(u16)`、
+`timeout(u64)`、`recovery_owner(RECOVERY-OWNER-V1)`。body runtime tag 不得来自 factory
+name，仅允许以下五种 exact runtime type，任何 subclass/未知类型都拒绝：
+
+- `CMQ-BODY-QPC-V1`：nullable `qp_h/send_cq_h/recv_cq_h(HANDLE-V1)`、
+  `qpc_buffer.value(u64)`、`next_state(u8)`、`full_modify(u8)`、
+  `partial_modify(u8)`、`wbe_template_count(u8)`，随后 indices 0..3 的
+  `{modify_start_qword(u8), modify_wbe(u8), modify_data(u64)}`。
+- `CMQ-BODY-OBJECT-ID-V1`：`object_h(HANDLE-V1)`。
+- `CMQ-BODY-MR-DEREGISTER-V1`：`mr_h(HANDLE-V1)`、`stag_key(u8)`、
+  `next_state(u8)`。
+- `CMQ-BODY-OCC-FLUSH-V1`：按序十二个 `u8`：`vf_flush`、`mr_serial_flush`、
+  `qpc`、`cqc`、`mrt`、`pble`、`sqrqe`、`sgb_irqe`、`eirqe`、`orqe`、
+  `uaqe`、`pd`，再写 `qpn(u32)`、`mr_serial(u16)`、
+  `pd_backing.value(u64)`。
+- `CMQ-BODY-EMPTY-V1`：tag 后无字段。
+
+codec base profile 是唯一 layer-legal polymorphic canonicalization seam：
+
+```systemverilog
+virtual function rdma_status canonicalize_command_body(
+  input rdma_hw_model source,
+  output string schema_tag,
+  output byte unsigned canonical_field_bytes[]
+);
+```
+
+base 实现清空输出并返回 `RDMA_SC_UNSUPPORTED_OPCODE`。production profile 验证上述五种
+exact body，返回稳定 tag 和 tag 之后的 field bytes；caller 每次都从实际 request-owned
+或 journal-owned body 重新取得，不信任携带的 tag/bytes。model 层不得 cast codec body。
+同一 profile 的 `snapshot_command_body()` 与 `snapshot_completion_payload()` 是
+status-returning nonfatal polymorphic boundary：只接受精确支持的 runtime type，以 direct
+construction 显式复制全部字段/bytes，不进入 raw factory、`copy()` 或 `clone()`；未知或
+hostile subclass 返回非空 `INVALID_ARGUMENT`、null snapshot 和清空的 canonical output。
+
+`rdma_function_binding` 同样提供 `snapshot_identity_nonfatal()` 与
+`snapshot_complete_nonfatal()`。两者入口清空 output，direct-construct identity、PCIe、六
+BAR 和 owner 候选，验证完整值后才发布；complete snapshot 保持 exact base
+`rdma_handle` 或 `rdma_function_handle` subtype，拒绝其他 subtype，且不触发 factory。
+既有 identity accessor 委托该 seam，失败时只返回 null 而不发 UVM fatal。
+
+digest 使用四条独立 64-bit FNV-1a lane，multiplier 为
+`64'h00000100000001b3`，seed 依次为 `cbf29ce484222325`、
+`84222325cbf29ce4`、`9e3779b97f4a7c15`、`d6e8feb86659fd93`，结果固定打包为
+`{lane3,lane2,lane1,lane0}`。domain projection 固定为：
+
+- image digest：`CMQ-IMAGE-V1\0`，随后 `IMAGE-V1 sqe_image`、
+  `IMAGE-V1 dependency_image`；
+- authority digest：`CMQ-AUTH-V1\0`，随后 `CMQ-COMMAND-V1 command`、
+  `CMQ-TICKET-V1 ticket`、`RECOVERY-OWNER-V1 recovery_owner`、
+  `FUNCTION-IDENTITY-V1 function_identity`、`DMA-CONTEXT-V1 dma_context`、
+  `DMA-MAPPING-PUBLIC-V1 dependency_mapping`、`dependency_offset(u64)`；command 内
+  owner 必须与 item owner 是同一 canonical source node；
+- batch digest：`CMQ-BATCH-V1\0`，随后 `FUNCTION-IDENTITY-V1 function_identity`、
+  `FUNCTION-BINDING-V1 binding`、`HANDLE-V1 cmq_h`、`IMAGE-V1 doorbell_image`、
+  `final_pi(u32)`、`final_polarity(u8)`、`start_sequence(u64)`、
+  `end_sequence(u64)`，再写非空等长有序 tuple
+  `{request_index(u32), image_digest(32 bytes), authority_digest(32 bytes)}`；current
+  attempt、state、两个 effect、phase、status、completion、reset-confirmation 和
+  `recovery_required` 均排除；
+- reset proof digest：`CMQ-RESET-PROOF-V1\0`，随后 `proof_key(string)`、
+  `proof_id(u64)`、`batch_key(string)`、`batch_id(u64)`、`attempt_id(u64)`、
+  `engine_instance_id(u64)`、`engine_incarnation(u64)`、
+  `FUNCTION-IDENTITY-V1 isolated_identity`、`batch_digest(32 bytes)`，再写非空等长
+  有序 tuple `{request_index(u32), image_digest(32 bytes), authority_digest(32 bytes),
+  RECOVERY-OWNER-V1 recovery_owner}`。
+
+“独立重算”是 request-owned graph 和 journal-owned graph 分别运行同一个冻结 encoder 与
+同一个 FNV 实现，不是维护第二套 hash。recovery 先分别校验每张图的 item/batch/proof
+carried digest，再比较两个 verified recomputation，最后比较每个完整 detached value；
+digest match 永远不能单独授权 retry。binding canonicalization 必须先经
+`snapshot_complete_nonfatal()` 和 `snapshot_identity_nonfatal()` 获得完整 detached 值并
+验证 Function identity 一致。
 
 ### 4.5 `rdma_cmq_transport`
 
@@ -584,11 +843,15 @@ result，不反向依赖 engine；adapter 必须同时位于 port 和 engine 之
 当前不依赖 lifecycle/control-plane，也保持上述位置，避免首批顺手重排既有 package。
 这些普通 class/model 文件全部使用 `.sv`，不以 `.svh` 规避编译顺序。
 
-新增 result/journal/value class 必须登记 UVM factory，并实现可验证的 detached copy：
-handle、status、image、DMA context 和嵌套 item 都不能把源对象的可变引用泄漏出去；
-同一源图内部有意共享的节点在快照内保持一致，但与源图隔离。`do_copy()`/clone 失败
-不得发布半成品 result。测试在返回后修改 command、mapping、Function handle、status
-和嵌套 image，已发布 result 与 journal record 必须保持不变。
+新增 result/journal/value class 必须登记 UVM factory，并提供可验证的 detached value
+边界：handle、status、image、DMA context 和嵌套 item 都不能把源对象的可变引用泄漏
+出去；同一源图内部有意共享的 ticket/status/recovery-owner 节点在快照内保持一致，但与
+源图隔离。包含 polymorphic command body 或 completion payload 的 class 不得声称通用
+UVM `copy()/clone()/do_copy()` 是 production nonfatal deep-copy boundary，因为这些入口
+没有 profile 参数和 status 返回值。production journal/result/query/recovery 必须使用
+显式 status-returning typed snapshot seam；leaf value 可实现 direct-new `do_copy()`，但
+控制路径不依赖它。测试在返回后修改 command、mapping、Function handle、status 和嵌套
+image，已发布 result 与 journal record 必须保持不变。
 
 opcode capability 首先在现有 `rdma_cmq_codecs.sv` 内扩展 registry。待能力和测试稳定后，
 再按 common envelope、业务域 body、opcode contract 分文件；不能在同一提交中既改变
@@ -638,39 +901,72 @@ recovery ledger。每个 engine 仍定义自己的 execution result 和状态机
 CMQ completion 生命周期与通用 transport 阶段正交，使用独立枚举：
 
 ```systemverilog
-typedef enum bit [2:0] {
+typedef enum logic [2:0] {
   RDMA_CMQ_COMPLETION_NONE,
   RDMA_CMQ_COMPLETION_PENDING,
   RDMA_CMQ_COMPLETION_TERMINAL,
   RDMA_CMQ_COMPLETION_TIMEOUT,
   RDMA_CMQ_COMPLETION_RESET_CANCELLED,
-  RDMA_CMQ_COMPLETION_DIAGNOSTIC_ONLY
+  RDMA_CMQ_COMPLETION_DIAGNOSTIC_ONLY,
+  RDMA_CMQ_COMPLETION_UNOBSERVED
 } rdma_cmq_completion_phase_e;
 ```
 
-该阶段由 engine 的实际状态迁移设置，不能用 `completion != null` 或 status code 反推。
+前六个编码保持不变，`UNOBSERVED` 追加为 wrapper 无可信 lifecycle evidence 时的独立
+保守状态；它不能与 `NONE` 混同。`NONE` 只用于已正面确认不存在 completion 的路径，
+包括 pre-engine rejection 和尚未 arm 的 Host-visible journal state。所有 phase 在状态
+索引前拒绝 X/Z、`3'b111` spare。该阶段由 engine 的实际状态迁移设置，不能用
+`completion != null` 或 status code 反推。
 
 ### 5.2 execution result
 
 新增 `rdma_cmq_execution_result` 值对象，至少持有：
 
-- detached `ticket`、`completion` 和 `status`；
-- `rdma_submission_effect_e submission_effect`；
+- detached `ticket`、`completion`、operation `status` 和
+  `observation_status`；
+- detached command identity、与 journal item 相同的 canonical detached recovery
+  owner，以及经 engine 验证的 detached `rdma_dma_request_context`；
+- 累计 `rdma_submission_effect_e submission_effect` 和只描述本次调用的
+  `attempt_effect`；
 - `rdma_cmq_completion_phase_e completion_phase`；
-- attempt ID、batch ID、`recovery_required` 和本次 detached command identity；
-- 与 journal item 相同的 detached recovery-owner snapshot；
-- 经 engine 验证的 `rdma_dma_request_context` 快照，包含 Function、route、BDF、
-  PASID/domain 和 reset epoch；pre-submit adapter 拒绝时允许该字段为空。
+- batch key、batch ID、current attempt ID 和 `recovery_required`。
 
 所有 observed 入口的 result 都必须非空。`UNOBSERVED` 只表示 effect 无法精确取得，
 不表示 status、identity 或已有 ticket 可以丢失。command 通过 engine admission 并进入
-journal 后，即使后续失败也必须返回 detached ticket；只有 adapter/engine/scheduler 在
-任何外部 I/O 前确定拒绝时，ticket 与 DMA context 才允许为空。
+journal 后，即使后续失败也必须返回 detached ticket。只有 adapter/engine/scheduler 在
+任何外部 I/O 前确定拒绝时，ticket 与 DMA context 才允许为空；另一个唯一例外是 legacy
+wrapper 的手工 reconcile shape：`completion_phase=UNOBSERVED`、
+`recovery_required=1`、batch/attempt ID 均为零，此时 DMA context 可为空且绝不能授权
+engine retry。
 
-每个 `rdma_cmq_execution_result.status`、`rdma_doorbell_submission_result.status` 和
-`batch_status` 都必须是非空 detached value，包括 clone/factory/null-adapter/lock-deadline
-失败。`batch_status` 只描述 batch orchestration，不汇总或覆盖 item status；presence 与
-recovery 只能读取对应 item 的 status/effect/journal identity，不能由 batch status 推断。
+每个 `rdma_cmq_execution_result.status`、`observation_status`、
+`rdma_doorbell_submission_result.status` 和 `batch_status` 都必须是非空 detached value，
+包括 snapshot/factory/null-adapter/lock-deadline 失败。任何拥有 status 的新 value 构造器
+都必须 direct-construct 独立 status 节点，并把 category/code/severity/hardware/source
+identity/message 初始化为显式 fail-closed shape：category `RDMA_STATUS_STATE`、code
+`RDMA_SC_INVALID_STATE`、severity `RDMA_SEVERITY_ERROR`、hardware code 为零且 invalid、
+source engine `RDMA_ENGINE_NONE`、全部 identity 为零、retryable 为零，并使用稳定非空的
+class-specific message；不得继承 `rdma_status::new()` 的默认 OK。operation `status` 表示
+command/legacy operation 的原始
+结果；`observation_status` 只表示 observed envelope 及全部 evidence 是否忠实捕获。两者
+不能 alias，observation failure 不得覆盖已经有效的 operation result。
+
+production observation 表固定如下：
+
+| production path | operation `status` | `observation_status` |
+| --- | --- | --- |
+| 可靠 success 或可靠 command/hardware failure | 精确 operation result | `OK` |
+| 可靠 timeout、reset cancellation 或 late diagnostic | 精确 lifecycle result | `OK` |
+| delegation 后 null/malformed result、status、snapshot 或 observed envelope | 保留任何有效 operation result，否则保持 fail-closed `INVALID_STATE` | `INVALID_STATE` |
+| observer/effect/state contradiction | 保留 scheduler/operation status | `INVALID_STATE` |
+
+payload snapshot failure 同样只使 `observation_status` 失败，不能覆盖有效 operation
+status。observation failure 不改变任一 effect，不伪造 phase；后续 completion/timeout/
+late/reset lifecycle update 可更新 status、phase 和 recovery state，但不得重写
+`submission_effect` 或 `attempt_effect`。
+
+`batch_status` 只描述 batch orchestration，不汇总或覆盖 item status；presence 与 recovery
+只能读取对应 item 的 status/effect/journal identity，不能由 batch status 推断。
 
 | batch 输入/结果 | item result 规则 | batch status 规则 |
 | --- | --- | --- |
@@ -686,6 +982,16 @@ result 只属于本次调用，禁止放在 adapter 的 `last_*` 成员中。并
 Function 的相邻调用不能覆盖彼此证据。命令在第一次可能的外部 I/O 前进入 submission
 journal；effect 随 slot/ticket record 持久保存，供 timeout、reset、cancel、reconcile
 和 late completion 继续投影。
+
+显式 `rdma_cmq_nonfatal_snapshot_context` 由 direct `new` 构造，不登记 factory。每个方法
+入口先清空 output/reason，只用 direct construction 与显式 scalar/byte copy，绝不调用
+fatal clone helper、generic `copy/clone/do_copy` 或 `type_id::create`。required null status
+返回稳定非空 reason；optional null ticket 和 null completion 成功返回 null snapshot 与空
+reason。context 以 source object identity canonicalize status、ticket 和 frozen recovery
+owner，因此 source graph 中 outer 与 completion 共用的节点在 detached graph 中仍共用
+一个新节点，并且不 alias source。completion shell 的 polymorphic payload 由 profile
+typed hook 先行 detached；source payload 非空时，null、source self-alias 或其他未 detached
+payload 都必须非 fatal 地拒绝且不发布 partial shell。
 
 observed 接口固定为：
 
@@ -759,8 +1065,12 @@ code 重新推断。`submit_batch_observed()` 的 results 数组与 commands 数
 允许共享不可变 batch ID/effect，不允许共享可变 result、ticket 或 status。
 
 为保持兼容，`rdma_cmq_port` 新增 `execute_observed()`：基类默认调用旧 `execute()`
-并返回 `UNOBSERVED`；生产 adapter 覆盖它并发布精确 result。现有 `execute()` 暂时保留，
-由兼容调用方继续使用。生产恢复调用方全部迁移后，
+并返回 `attempt_effect=submission_effect=UNOBSERVED`、
+`completion_phase=UNOBSERVED`、`recovery_required=1`、零 batch/attempt ID 的手工 reconcile
+shape；生产 adapter 覆盖它并发布精确 result。legacy output 能可靠 detached 时
+`observation_status=OK`；捕获失败时保留任何有效 operation `status`，并把
+`observation_status` 设为 `INVALID_STATE`。现有 `execute()` 暂时保留，由兼容调用方继续
+使用。生产恢复调用方全部迁移后，
 `last_execute_definitive_no_submit()` 仅保留为弃用兼容入口并始终按保守语义处理。
 
 兼容包装的方向固定为：
@@ -768,7 +1078,8 @@ code 重新推断。`submit_batch_observed()` 的 results 数组与 commands 数
 ```text
 legacy port subclass:
     base execute_observed() -> legacy execute()
-    -> result.effect = UNOBSERVED
+    -> result.attempt_effect/submission_effect = UNOBSERVED
+    -> result.completion_phase = UNOBSERVED, recovery_required = 1
 
 production adapter:
     legacy execute() -> production execute_observed()

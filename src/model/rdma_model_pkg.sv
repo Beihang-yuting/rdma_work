@@ -24,6 +24,7 @@ package rdma_model_pkg;
   `include "rdma_context_models.sv"
   `include "rdma_submission_evidence.sv"
   `include "rdma_cmq_engine_models.sv"
+  `include "rdma_cmq_execution_models.sv"
   `include "rdma_control_plane_models.sv"
   `include "rdma_queue_models.sv"
 endpackage
