@@ -5,6 +5,12 @@
 已完成 CMQ 专用 gate、类型化 TSV reader、mutation smoke test、QPC_CREATE
 VFID 固定零校验和三条 proven capability 记录接线。
 
+Fix round 2 已完成：ownership 的 expected projection 现在由已闭合的
+C-derived mutation candidate 驱动。QPC_CREATE request 的 HOST_TYPED/HOST_FIXED
+字段（包括 opcode、SIGN_EN 和固定零 VFID）只在 request case 完整闭合后标为
+SUPPORTED；未证明的 response/doorbell 方向、CQC_CREATE 和 RESERVED_ZERO 保持
+UNSUPPORTED。
+
 Fix round 1 已完成：
 
 - I-1：SV production macro source-walk 对 malformed continuation、malformed
@@ -41,14 +47,14 @@ Fix round 1 已完成：
 python3 -m unittest tests.unit.test_cmq_gate_manifest -v
   PASS (2 tests)
 python3 -m unittest tests.unit.test_check_rdma_field_ownership -v
-  PASS (56 tests)
+  PASS (58 tests)
 python3 -m unittest discover -s tests/unit -p 'test_*.py' -v
-  PASS (225 tests)
+  PASS (227 tests)
 /home/ryan/.local/bin/python3.8 -m unittest
   tests.unit.test_check_rdma_field_ownership -v
-  PASS (56 tests)
+  PASS (58 tests)
 SSHPASS=123 scripts/run_vcs53.sh rdma_defs rdma_cmq_driver_contract_test
-  PASS (195 tests; field ownership candidate and report gate PASS)
+  PASS (197 tests; field ownership candidate and report gate PASS; fresh after fix round 2)
 SSHPASS=123 scripts/run_vcs53.sh core rdma_cmq_driver_field_mutation_test
   PASS
 SSHPASS=123 scripts/run_vcs53.sh core rdma_cmq_profile_test
@@ -67,6 +73,9 @@ EXECUTED_TOTAL=666 STATIC_TOTAL=422 GRAND_TOTAL=1088
 
 所有通过的 VCS case 均由 `check_uvm_summary.sh` 检查，UVM
 `warning=0 error=0 fatal=0`。
+
+Fix round 2 前的 `rdma_defs` 失败（ownership capability drift）不再作为通过
+证据；上面的 53 机结果是修复后重新执行的唯一有效记录。
 
 ## ABI 与边界说明
 

@@ -4030,11 +4030,19 @@ def _ownership_anchor(case_id: str, macro_name: str) -> dict[str, str]:
 
 def build_expected_ownership(
     records_by_path: Mapping[str, Sequence[object]],
+    proven_cases: Iterable[str] | None = None,
 ) -> list[dict[str, str]]:
-    """功能：构造四个 Task 3 case 所需字段的 canonical ownership rows。
-    输入输出及副作用：返回新列表；只使用 manifest identity 和显式模型字段语义。
-    失败边界：CMQ manifest selector 不唯一时拒绝，不回退到其他 source row。"""
+    """功能：按已闭合的 C-derived proof 投影四个 CMQ case 的 ownership capability。
+    输入输出及副作用：records_by_path 提供 manifest identity，proven_cases 提供已完成
+    mutation/source-walk 的 case；返回新 rows，不注册 opcode、不修改输入。
+    失败边界：未知 proof case、CMQ selector 不唯一或未证明方向试图变为 SUPPORTED 时拒绝。"""
     record = _cmq_manifest_record(records_by_path)
+    proven = set(proven_cases or ())
+    unknown = proven - PROVEN_CAPABILITY_CASES
+    if unknown:
+        raise ContractError(
+            f"unknown proven capability cases: {sorted(unknown)}"
+        )
     rows: list[dict[str, str]] = []
     qpc_model_fields = {
         "valid": "envelope.valid",
@@ -4051,10 +4059,11 @@ def build_expected_ownership(
         "qpc_buffer_addr_pa": "body.qpc_buffer.value >> 9",
     }
     for field, macro in CASE_FIELD_MACROS["cmq_sqe_qpc_create_request"].items():
-        ownership, _, mode = QPC_REQUEST_POLICY[field]
+        ownership, _, _ = QPC_REQUEST_POLICY[field]
         capability = (
             "SUPPORTED"
-            if mode in {"TYPED_RECOMPOSE", "CORRELATED_RECOMPOSE"}
+            if "cmq_sqe_qpc_create_request" in proven and
+            ownership in {"HOST_TYPED", "HOST_FIXED"}
             else "UNSUPPORTED"
         )
         rows.append(_ownership_base(
@@ -4096,7 +4105,12 @@ def build_expected_ownership(
     }
     for field, macro in response_fields.items():
         ownership = "HW_TYPED" if field in RESPONSE_TYPED_FIELDS else "RESERVED_ZERO"
-        capability = "SUPPORTED" if ownership == "HW_TYPED" else "UNSUPPORTED"
+        capability = (
+            "SUPPORTED"
+            if "cmq_cqe_qpc_create_response" in proven and
+            ownership == "HW_TYPED"
+            else "UNSUPPORTED"
+        )
         rows.append(_ownership_base(
             record, macro, "CMQ_CQE", "QPC_CREATE", "RESPONSE",
             ownership, capability, response_model_fields[field],
@@ -4106,7 +4120,9 @@ def build_expected_ownership(
         model_field = "model.pi" if field == "pi_after" else "model.polarity"
         rows.append(_ownership_base(
             record, macro, "CMQ_SQ_DOORBELL", "CMQ_SQ", "REQUEST",
-            "HOST_TYPED", "SUPPORTED", model_field,
+            "HOST_TYPED",
+            "SUPPORTED" if "cmq_sq_doorbell" in proven else "UNSUPPORTED",
+            model_field,
             "rdma_hw_cmq_hw_profile", "cmq_sq_doorbell",
         ))
     return rows
@@ -4441,7 +4457,35 @@ def verify(args) -> dict[str, int]:
         sv_sources=sv_sources,
         coordinates=coordinates,
     )
-    expected_ownership = build_expected_ownership(records)
+    cmq_header = (kernel_root / "cmq.h").read_text(encoding="utf-8")
+    enum_members = parse_opcode_enum(cmq_header)
+    validate_oracle_case_references(
+        [*ownership, *capabilities, *mutations],
+        cases,
+    )
+    _validate_artifact_field_values(oracle_root)
+    supported_opcodes = parse_supported_opcode_values(sv_sources, enum_members)
+    expected_mutations = build_expected_mutations(
+        oracle_root,
+        supported_opcodes=supported_opcodes,
+        sv_sources=sv_sources,
+        coordinates=coordinates,
+        macro_ranges=macro_ranges,
+        ownership_rows=ownership,
+        # Capability bits are checked only after the C-derived mutation
+        # candidate has been rebuilt and compared.  Passing the hand-edited
+        # table into source-walk here would make capability validation depend
+        # on its own untrusted flags.
+        capability_rows=None,
+    )
+    summary = validate_mutation_report(mutations)
+    compare_mutation_report(mutations, expected_mutations)
+    proven_cases = closed_proven_cases(mutations, expected_mutations)
+
+    expected_ownership = build_expected_ownership(
+        records,
+        proven_cases=proven_cases,
+    )
     _compare_rows(
         ownership,
         expected_ownership,
@@ -4466,30 +4510,6 @@ def verify(args) -> dict[str, int]:
         {row["macro_name"] for row in ownership},
         {row["macro_name"]: row["exclusion_reason"] for row in exclusions},
     )
-    cmq_header = (kernel_root / "cmq.h").read_text(encoding="utf-8")
-    enum_members = parse_opcode_enum(cmq_header)
-    validate_oracle_case_references(
-        [*ownership, *capabilities, *mutations],
-        cases,
-    )
-    _validate_artifact_field_values(oracle_root)
-    supported_opcodes = parse_supported_opcode_values(sv_sources, enum_members)
-    expected_mutations = build_expected_mutations(
-        oracle_root,
-        supported_opcodes=supported_opcodes,
-        sv_sources=sv_sources,
-        coordinates=coordinates,
-        macro_ranges=macro_ranges,
-        ownership_rows=ownership,
-        # Capability bits are checked only after the C-derived mutation
-        # candidate has been rebuilt and compared.  Passing the hand-edited
-        # table into source-walk here would make capability validation depend
-        # on its own untrusted flags.
-        capability_rows=None,
-    )
-    summary = validate_mutation_report(mutations)
-    compare_mutation_report(mutations, expected_mutations)
-    proven_cases = set(PROVEN_CAPABILITY_CASES)
     validate_capability_rows(
         capabilities,
         enum_members,
@@ -5067,6 +5087,24 @@ def compare_mutation_report(
                     f"mutation report drift at {key}/{column}: "
                     f"{actual_index[key][column]} != {expected_index[key][column]}"
                 )
+
+
+def closed_proven_cases(
+    actual: Sequence[Mapping[str, str]],
+    expected: Sequence[Mapping[str, str]],
+) -> frozenset[str]:
+    """功能：从逐列相等的 mutation report 与 C-derived candidate 推导闭合 case 集合。
+    输入输出及副作用：actual/expected 只读；返回不可变 proven case 集合，不修改报告或启用生产路径。
+    失败边界：任一允许 case 缺失完整 8-bit image 行时不进入 proven 集合，避免以总量或手工 TSV 越过 proof gate。"""
+    actual_counts = Counter(row["case_id"] for row in actual)
+    expected_counts = Counter(row["case_id"] for row in expected)
+    return frozenset(
+        case_id
+        for case_id in PROVEN_CAPABILITY_CASES
+        if actual_counts.get(case_id, 0) == expected_counts.get(case_id, 0)
+        and expected_counts.get(case_id, 0)
+        == int(CASE_LAYOUTS[case_id]["length"]) * 8
+    )
 
 
 if __name__ == "__main__":

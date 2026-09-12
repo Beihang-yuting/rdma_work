@@ -10,6 +10,7 @@ from __future__ import annotations
 import inspect
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 import unittest
 
 try:
@@ -136,6 +137,37 @@ class FieldOwnershipFixtureTest(unittest.TestCase):
         }
         row.update(overrides)
         return row
+
+    # 功能：构造带真实 CMQ manifest 身份的最小 record，供 expected projection 测试使用。
+    # 输入输出及副作用：无输入；返回只含 archive_id/path/selector/sha256 的内存对象，不写文件。
+    # 失败边界：字段缺失会让 ownership anchor 选择失败，测试不得用伪造的 fallback record 掩盖错误。
+    def cmq_manifest_records(self):
+        return {
+            "cmq.h": [
+                SimpleNamespace(
+                    archive_id="fixture",
+                    path="cmq.h",
+                    selector="XTRDMA_CMQ*|XTRDMA_OP_*",
+                    sha256="0" * 64,
+                )
+            ]
+        }
+
+    # 功能：索引四个 CMQ case 的 expected ownership rows，便于逐方向检查 capability 投影。
+    # 输入输出及副作用：rows 输入；返回按 entry/opcode/direction 分组的只读映射，不修改 rows。
+    # 失败边界：重复 identity 由测试显式失败，禁止以最后一行覆盖前一行。
+    def expected_ownership_by_case(self, rows):
+        result = {}
+        for row in rows:
+            key = (
+                row["entry_kind"],
+                row["opcode_or_variant"],
+                row["direction"],
+                row["macro_name"],
+            )
+            self.assertNotIn(key, result)
+            result[key] = row
+        return result
 
     def minimal_compose_source(self, merge_extra="", pre_merge_extra=""):
         """功能：构造含 canonical envelope/body merge 的 composer fixture。
@@ -1244,6 +1276,84 @@ class FieldOwnershipFixtureTest(unittest.TestCase):
                 evidence_macros={"XTRDMA_TEST_FIELD": {"kind": "MEMCPY", "base": 8}},
             )["XTRDMA_TEST_FIELD"],
             8,
+        )
+
+    # 功能：确认未闭合的 response、doorbell、CQC 方向不会因候选字段存在而提前开放。
+    # 输入输出及副作用：调用 expected ownership projection；只读取内存 fixture，不写仓库或启用 capability。
+    # 失败边界：任何未证明方向出现 SUPPORTED，或已证明 request 的 static/fixed 字段仍为 UNSUPPORTED，测试失败。
+    def test_expected_ownership_is_fail_closed_by_proven_case(self):
+        module = self.require_checker()
+        rows = module.build_expected_ownership(
+            self.cmq_manifest_records(),
+            proven_cases={"cmq_sqe_qpc_create_request"},
+        )
+        indexed = self.expected_ownership_by_case(rows)
+
+        qpc_request = {
+            row["macro_name"]: row
+            for row in rows
+            if row["entry_kind"] == "CMQ_SQE"
+            and row["opcode_or_variant"] == "QPC_CREATE"
+            and row["direction"] == "REQUEST"
+        }
+        self.assertTrue(qpc_request)
+        self.assertTrue(all(
+            row["capability"] == "SUPPORTED"
+            for row in qpc_request.values()
+            if row["ownership"] in {"HOST_TYPED", "HOST_FIXED"}
+        ))
+
+        for key, row in indexed.items():
+            entry, opcode, direction, _ = key
+            if (entry, opcode, direction) in {
+                ("CMQ_CQE", "QPC_CREATE", "RESPONSE"),
+                ("CMQ_SQ_DOORBELL", "CMQ_SQ", "REQUEST"),
+                ("CMQ_SQE", "CQC_CREATE", "REQUEST"),
+            }:
+                self.assertEqual(row["capability"], "UNSUPPORTED")
+
+    # 功能：确认三条 proven case 全部闭合后只开放对应方向，且 response reserved 位仍保持关闭。
+    # 输入输出及副作用：基于 C-derived proven case 集合生成 expected rows；不触碰实际 TSV 或外部资源。
+    # 失败边界：CQC、reserved 或任何没有 case 映射的方向被错误提升为 SUPPORTED 时测试失败。
+    def test_expected_ownership_promotes_only_owned_proven_fields(self):
+        module = self.require_checker()
+        rows = module.build_expected_ownership(
+            self.cmq_manifest_records(),
+            proven_cases=set(module.PROVEN_CAPABILITY_CASES),
+        )
+        indexed = self.expected_ownership_by_case(rows)
+
+        for row in rows:
+            identity = (
+                row["entry_kind"],
+                row["opcode_or_variant"],
+                row["direction"],
+            )
+            if identity == ("CMQ_SQE", "QPC_CREATE", "REQUEST"):
+                self.assertEqual(row["capability"], "SUPPORTED")
+            elif identity == ("CMQ_CQE", "QPC_CREATE", "RESPONSE"):
+                expected = (
+                    "SUPPORTED"
+                    if row["ownership"] == "HW_TYPED"
+                    else "UNSUPPORTED"
+                )
+                self.assertEqual(row["capability"], expected)
+            elif identity == ("CMQ_SQ_DOORBELL", "CMQ_SQ", "REQUEST"):
+                self.assertEqual(row["capability"], "SUPPORTED")
+            elif identity == ("CMQ_SQE", "CQC_CREATE", "REQUEST"):
+                self.assertEqual(row["capability"], "UNSUPPORTED")
+
+        self.assertEqual(
+            indexed[("CMQ_SQE", "QPC_CREATE", "REQUEST", "XTRDMA_CMQCQ_OPCODE")]["capability"],
+            "SUPPORTED",
+        )
+        self.assertEqual(
+            indexed[("CMQ_SQE", "QPC_CREATE", "REQUEST", "XTRDMA_CMQSQ_WQE_SIGN_EN")]["capability"],
+            "SUPPORTED",
+        )
+        self.assertEqual(
+            indexed[("CMQ_SQE", "QPC_CREATE", "REQUEST", "XTRDMA_CMQSQ_VFID_OVERRIDE")]["capability"],
+            "SUPPORTED",
         )
 
 
