@@ -117,7 +117,8 @@ class rdma_legacy_only_cmq_port extends rdma_mock_cmq_port;
     end
     if (source_completion != null) begin
       source_completion.raw_cqe = null;
-      if ($cast(payload, source_completion.decoded_response))
+      if (source_completion.decoded_response != null &&
+          $cast(payload, source_completion.decoded_response))
         payload.value++;
     end
   endfunction
@@ -1318,15 +1319,17 @@ class rdma_cmq_port_test extends rdma_cmq_engine_test;
     );
     port = payload_port;
     port.execute_observed(command, result);
+    payload_port.mutate_outputs_now();
     if (result == null || result.completion == null ||
         !$cast(result_payload, result.completion.decoded_response) ||
-        result_payload == source_payload || result_payload.value != 32'h97 ||
         result.ticket != result.completion.ticket ||
         result.status != result.completion.status)
       `uvm_error("PORT_OBSERVED_SUPPORTED_PAYLOAD",
                  "explicit payload hook did not retain detached aliases")
-    #1ns;
-    if (result_payload.value != 32'h97)
+    else if (result_payload == source_payload)
+      `uvm_error("PORT_OBSERVED_SUPPORTED_PAYLOAD",
+                 "explicit payload hook retained a source reference")
+    else if (result_payload.value != 32'h97)
       `uvm_error("PORT_OBSERVED_PAYLOAD_MUTATION",
                  "legacy payload mutation leaked into result")
 

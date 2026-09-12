@@ -114,29 +114,29 @@ class rdma_cmq_command_identity extends uvm_object;
   endfunction
 
   // 功能：从 command 捕获 Function/opcode 的不可变标量身份，不保留任何源对象引用。
-  // 输入/输出及副作用：command 为输入，failure_reason 为输出；成功时原子更新当前字段。
-  // 失败/边界：command、Function 或 opcode key 为空/非法时返回 0、给出稳定原因并保留旧值。
+  // 输入/输出及副作用：command 为非拥有输入，failure_reason 为输出；成功时原子更新
+  //   Function/opcode 标量，不调用 status factory，也不保留 command 的嵌套引用。
+  // 失败/边界：command、Function 或 opcode key 为空，Function kind/generation 不合法，
+  //   或 profile/variant 为空或含分隔符时返回 0、给出稳定原因并保留旧值。
   function bit capture_from(
     input rdma_cmq_command_desc command,
     output string failure_reason
   );
-    rdma_status status;
-
     failure_reason = "";
     if (command == null || command.function_h == null ||
         command.opcode_key == null) begin
       failure_reason = "CMQ command identity source is incomplete";
       return 1'b0;
     end
-    status = rdma_cmq_function_status(
-      command.function_h, "CMQ command identity"
-    );
-    if (status == null || !status.ok()) begin
+    if (command.function_h.kind != RDMA_RESOURCE_FUNCTION ||
+        command.function_h.generation == 0) begin
       failure_reason = "CMQ command identity Function is invalid";
       return 1'b0;
     end
-    status = command.opcode_key.validate();
-    if (status == null || !status.ok()) begin
+    if (command.opcode_key.profile_name.len() == 0 ||
+        command.opcode_key.variant.len() == 0 ||
+        rdma_cmq_string_has_separator(command.opcode_key.profile_name) ||
+        rdma_cmq_string_has_separator(command.opcode_key.variant)) begin
       failure_reason = "CMQ command identity opcode key is invalid";
       return 1'b0;
     end
