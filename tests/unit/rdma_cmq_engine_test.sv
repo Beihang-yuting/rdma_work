@@ -1,7 +1,8 @@
 // 目录：测试层 unit/rdma_cmq_engine_test.sv。
-// 职责：验证 rdma_cmq_engine_test 对应模块的接口、错误路径和边界行为。
-// 依赖：依赖被测 package、UVM 测试基类和必要的 mock/fixture。
-// 所有权与生命周期：测试对象只拥有本地 fixture；外部后端句柄由测试环境提供并在测试结束释放。
+// 职责：验证 CMQ engine/transport 的配置、提交、完成、恢复和生命周期边界。
+// 依赖：依赖 rdma_core_pkg、UVM、Host-memory/PCIe mock、profile 和故障 fixture。
+// 所有权与生命周期：测试对象只拥有本地 fixture；DUT 保存的 adapter/scheduler
+//   引用均不转移所有权，mock backing 由对应场景显式 reset/shutdown 释放。
 
 // 中文说明：rdma_cmq_engine_test.sv 属于单元测试，覆盖对应模型、编码器或执行器契约。
 // 阅读提示：先看公开类型和接口，再看实现细节；失败路径应保持状态与资源所有权可追踪。
@@ -1445,7 +1446,6 @@ class rdma_cmq_test_profile extends rdma_cmq_hw_profile;
 
   // 功能：在 rdma_cmq_test_profile 中，inspect_cqe 从输入 image/bytes 按固定 offset 提取字段，交付解码所需的值。
   // 输入/输出及副作用：raw_cqe（输入）、expected_owner（输入）、ready（输出）、decoded（输出）；inspect_cqe 读取 raw_cqe、expected_owner、ready、decoded 并使用字段 ready、decoded、codec_raw_cqe、codec_raw_cqe.endian、codec_raw_cqe.hardware_version、status、cloned_object、decoded.hardware_opcode，并写入 ready、decoded；函数返回 rdma_status，不取得调用方资源所有权。
-
   // 失败/边界：inspect_cqe 返回 RDMA_SC_INVALID_STATE、RDMA_SC_OK；具体拒绝条件包括 “injected test profile inspection failure”；“test profile completion codecs are unavailable”；“test profile could not snapshot its raw CQE input”；“test completion codec returned null decoded data”；“test error codec returned null status”；失败路径不提交部分状态、不隐式重试，也不转移未声明资源。
   virtual function rdma_status inspect_cqe(
     rdma_hw_image raw_cqe,
@@ -1972,7 +1972,6 @@ class rdma_cmq_profile_hook_fault_profile extends rdma_cmq_test_profile;
 
   // 功能：在 rdma_cmq_profile_hook_fault_profile 中，sqe_graphs_are_detached 检查嵌套 body/graph 引用是否已经 detached，防止编码或恢复阶段残留可变别名。
   // 输入/输出及副作用：source（输入）、source_extension_edge（输入）、snapshot（输入）、snapshot_extension_edge（输入）；sqe_graphs_are_detached 读取 source、source_extension_edge、snapshot、snapshot_extension_edge 并使用字段 source_nodes、snapshot_nodes、j；函数返回 bit，不取得调用方资源所有权。
-
   // 失败/边界：sqe_graphs_are_detached 比较或前置条件不满足时返回 0/false；该路径不隐式重试，也不转移未声明资源。
   protected function bit sqe_graphs_are_detached(
     rdma_cmq_sqe_model source,
@@ -2059,7 +2058,6 @@ class rdma_cmq_profile_hook_fault_profile extends rdma_cmq_test_profile;
 
   // 功能：在 rdma_cmq_profile_hook_fault_profile 中，qpc_graphs_are_detached 检查嵌套 body/graph 引用是否已经 detached，防止编码或恢复阶段残留可变别名。
   // 输入/输出及副作用：source（输入）、source_extension_edge（输入）、snapshot（输入）、snapshot_extension_edge（输入）；qpc_graphs_are_detached 读取 source、source_extension_edge、snapshot、snapshot_extension_edge 并使用字段 source_nodes、snapshot_nodes、j；函数返回 bit，不取得调用方资源所有权。
-
   // 失败/边界：qpc_graphs_are_detached 比较或前置条件不满足时返回 0/false；该路径不隐式重试，也不转移未声明资源。
   protected function bit qpc_graphs_are_detached(
     rdma_qpc_model source,
@@ -2583,6 +2581,76 @@ class rdma_cmq_runtime_build_failure_engine extends rdma_cmq_engine;
   endfunction
 endclass
 
+// 设计说明：transport facade 的单元测试只需要观察同步委托身份，不应把
+//   Host-memory/PCIe 行为带入该边界；因此 scheduler 替身直接发布调用方预置的
+//   call-local result，并记录 binding、descriptor 与 observer 的对象 identity。
+class rdma_cmq_transport_scheduler_double extends rdma_doorbell_scheduler;
+  `uvm_object_utils(rdma_cmq_transport_scheduler_double)
+
+  int unsigned submit_calls;
+  rdma_function_binding last_binding;
+  rdma_doorbell_desc last_desc;
+  rdma_doorbell_submission_observer last_observer;
+  rdma_doorbell_submission_result response;
+  bit return_null_result;
+
+  // 功能：构造尚未收到 facade 委托的 scheduler 替身，并清空预置响应与 identity 记录。
+  // 输入/输出及副作用：name 传给父类；submit_calls 置零，所有 identity、
+  //   response 置空，return_null_result 置零。
+  // 失败/边界：构造不配置父类 adapter，也不取得 response/参数所有权；
+  //   测试必须在委托前显式设置 response。
+  function new(string name = "rdma_cmq_transport_scheduler_double");
+    super.new(name);
+    submit_calls = 0;
+    last_binding = null;
+    last_desc = null;
+    last_observer = null;
+    response = null;
+    return_null_result = 1'b0;
+  endfunction
+
+  // 功能：记录 transport 透传的三个对象 identity，并按故障开关原样发布 response 或 null。
+  // 输入/输出及副作用：binding、desc、observer 为非拥有输入；记录 identity
+  //   并将 submit_calls 加一，result 与 response 为同一对象或为 null。
+  // 失败/边界：return_null_result 为 1 时故意返回 null；否则即使
+  //   response/status 畸形也原样返回，供 facade 修复。
+  virtual task submit_observed(
+    rdma_function_binding binding,
+    rdma_doorbell_desc desc,
+    rdma_doorbell_submission_observer observer,
+    output rdma_doorbell_submission_result result
+  );
+    submit_calls++;
+    last_binding = binding;
+    last_desc = desc;
+    last_observer = observer;
+    result = return_null_result ? null : response;
+  endtask
+endclass
+
+// 设计说明：facade 的 observer 契约是 identity 透传；这个无外部依赖的具体实现
+//   只为抽象基类提供合法实例，若未来替身错误调用回调，calls 也会留下证据。
+class rdma_cmq_transport_observer
+  extends rdma_doorbell_submission_observer;
+
+  int unsigned calls;
+
+  // 功能：构造调用计数为零的 transport observer fixture。
+  // 输入/输出及副作用：name 传给父类并将 calls 置零；不注册或保存 scheduler。
+  // 失败/边界：构造不访问 adapter、不分配外部资源；对象生命周期由当前测试场景管理。
+  function new(string name = "rdma_cmq_transport_observer");
+    super.new(name);
+    calls = 0;
+  endfunction
+
+  // 功能：记录一次意外或显式的 MMIO maybe-visible 回调，供测试定位 observer 是否被替换或额外调用。
+  // 输入/输出及副作用：无输入和返回值；仅将本对象 calls 加一。
+  // 失败/边界：回调不可失败，不等待、不取锁、不调用 adapter 或 scheduler。
+  virtual function void before_mmio_maybe_visible();
+    calls++;
+  endfunction
+endclass
+
 typedef enum int unsigned {
   RDMA_CMQ_TAMPER_FUNCTION_KIND,
   RDMA_CMQ_TAMPER_FUNCTION_UID,
@@ -2619,6 +2687,13 @@ class rdma_cmq_engine_probe extends rdma_cmq_engine;
   // 失败/边界：rdma_cmq_engine_probe 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_cmq_engine_probe");
     super.new(name);
+  endfunction
+
+  // 功能：返回 engine 当前安装的 transport 对象 identity，供生命周期测试确认 prepare/reset/reprepare 的替换边界。
+  // 输入/输出及副作用：无输入；返回 protected transport 的非拥有测试引用，不修改 engine、facade 或 scheduler 状态。
+  // 失败/边界：engine 未成功 prepare 或已 reset/shutdown/clear 时返回 null；调用方不得借此引用改写生产账本。
+  function rdma_cmq_transport transport_reference();
+    return transport;
   endfunction
 
   // 功能：执行 restore_mapping 指定的测试或恢复状态变更，更新受控账本并保留可回滚的故障证据。
@@ -3076,14 +3151,18 @@ class rdma_cmq_engine_probe extends rdma_cmq_engine;
     return slots[sq_index].ticket.command_id;
   endfunction
 
-  // 功能：在 rdma_cmq_engine_probe 中，retry_only_poisoned 根据当前证据转换事务或恢复状态，并保持重试、复位和所有权边界一致。
-  // 输入/输出及副作用：无显式参数；retry_only_poisoned 可能更新本对象明确拥有的状态；函数返回 bit，不取得调用方资源所有权。
-  // 失败/边界：retry_only_poisoned 只读输入并返回 bit；边界由函数体现有分支决定，不修改状态或转移资源。
+  // 功能：确认 release 失败后的 POISONED engine 只保留 Host-memory/backing
+  //   重试 authority，所有 runtime 协作者、transport 和游标均已清空。
+  // 输入/输出及副作用：无输入；只读 engine_state、backing/host_mem、协作者和
+  //   计数器并返回 bit，不修改测试或 DUT 状态。
+  // 失败/边界：任一运行引用残留、transport 非空、backing 缺失或计数器非零时
+  //   返回 0；不尝试 release 或修复账本。
   function bit retry_only_poisoned();
     return engine_state == RDMA_CMQ_ENGINE_POISONED &&
            host_mem != null && backing_mapping != null &&
            prepared_binding == null && dma_context == null &&
-           cmq_snapshot == null && scheduler == null && profile == null &&
+           cmq_snapshot == null && scheduler == null &&
+           transport == null && profile == null &&
            publish_seq == 0 && retire_seq == 0 && cq_consume_seq == 0;
   endfunction
 
@@ -3101,14 +3180,18 @@ class rdma_cmq_engine_probe extends rdma_cmq_engine;
     host_mem = source;
   endfunction
 
-  // 功能：在 rdma_cmq_engine_probe 中，missing_host_mem_poisoned 检查当前事务或测试证据是否满足指定布尔条件，供恢复分类和断言选择后续路径。
-  // 输入/输出及副作用：无显式参数；missing_host_mem_poisoned 可能更新本对象明确拥有的状态；函数返回 bit，不取得调用方资源所有权。
-  // 失败/边界：missing_host_mem_poisoned 只读输入并返回 bit；边界由函数体现有分支决定，不修改状态或转移资源。
+  // 功能：确认缺少 Host-memory release authority 的 POISONED engine 仅保留
+  //   backing identity，runtime 协作者、transport 和游标均已清空。
+  // 输入/输出及副作用：无输入；只读 engine_state、backing/host_mem、协作者和
+  //   计数器并返回 bit，不修改测试或 DUT 状态。
+  // 失败/边界：host_mem 仍存在、任一运行引用残留、transport 非空、backing
+  //   缺失或计数器非零时返回 0；不伪造可重试 adapter。
   function bit missing_host_mem_poisoned();
     return engine_state == RDMA_CMQ_ENGINE_POISONED &&
            host_mem == null && backing_mapping != null &&
            prepared_binding == null && dma_context == null &&
-           cmq_snapshot == null && scheduler == null && profile == null &&
+           cmq_snapshot == null && scheduler == null &&
+           transport == null && profile == null &&
            publish_seq == 0 && retire_seq == 0 && cq_consume_seq == 0;
   endfunction
 
@@ -3941,7 +4024,6 @@ class rdma_cmq_engine_test extends uvm_test;
 
   // 功能：在 rdma_cmq_engine_test 中，prepare_active 校验依赖和 binding 后建立运行边界，只保存非拥有引用并拒绝重复配置。
   // 输入/输出及副作用：label（输入）、engine（输入）、mem（输入）、pcie（输入）、scheduler（输入）、profile（输入）、prepared_binding（输入）、active_binding（输入）、cmq（输入）、runtime_desc（输出）；prepare_active 驱动下游事务，并写入 runtime_desc；函数返回 无直接返回值，不取得调用方资源所有权。
-
   // 失败/边界：prepare_active 失败或超时通过 runtime_desc 明确发布；该路径不隐式重试，也不转移未声明资源。
   task automatic prepare_active(
     string label,
@@ -4052,7 +4134,6 @@ class rdma_cmq_engine_test extends uvm_test;
 
   // 功能：在 rdma_cmq_engine_test 中，overwrite_profile_cqe 配置测试 fixture 的定向故障或替代依赖，使下一次调用覆盖指定边界路径。
   // 输入/输出及副作用：label（输入）、mem（输入）、mapping（输入）、cq_sequence（输入）、raw_cqe（输入）；overwrite_profile_cqe 驱动下游事务；函数返回 无直接返回值，不取得调用方资源所有权。
-
   // 失败/边界：overwrite_profile_cqe 异常完成由下游接口或 UVM 报告机制发布；该路径不隐式重试，也不转移未声明资源。
   task automatic overwrite_profile_cqe(
     string label,
@@ -4545,7 +4626,6 @@ class rdma_cmq_engine_test extends uvm_test;
 
   // 功能：在 rdma_cmq_engine_test 中，prepare_defaults 校验依赖和 binding 后建立运行边界，只保存非拥有引用并拒绝重复配置。
   // 输入/输出及副作用：label（输入）、engine（输入）、mem（输入）、binding（输入）、cmq（输入）、scheduler（输入）、profile（输入）、runtime_desc（输出）；prepare_defaults 驱动下游事务，并写入 runtime_desc；函数返回 无直接返回值，不取得调用方资源所有权。
-
   // 失败/边界：prepare_defaults 失败或超时通过 runtime_desc 明确发布；该路径不隐式重试，也不转移未声明资源。
   task automatic prepare_defaults(
     string label,
@@ -4562,6 +4642,252 @@ class rdma_cmq_engine_test extends uvm_test;
     engine.prepare(binding, cmq, 1'b1, 20'h34567, mem, scheduler,
                    profile, runtime_desc, status);
     expect_status(label, status, RDMA_SC_OK);
+  endtask
+
+  // 功能：验证 stateless transport 的一次配置、identity 透传和委托后畸形
+  //   envelope 修复契约。
+  // 输入/输出及副作用：无参数；构造本地 binding/desc/observer 和两个
+  //   scheduler 替身，调用 configure/submit_observed 并发布 UVM 断言。
+  // 失败/边界：覆盖未配置、null/repeated configure、null result/status 和
+  //   MMIO_MAYBE_VISIBLE；委托后未知 I/O 不得误报 PRE_SUBMIT_REJECTED。
+  task automatic check_transport_facade_contract();
+    rdma_cmq_transport transport;
+    rdma_cmq_transport_scheduler_double scheduler;
+    rdma_cmq_transport_scheduler_double rejected_scheduler;
+    rdma_function_binding binding;
+    rdma_doorbell_desc desc;
+    rdma_cmq_transport_observer observer;
+    rdma_doorbell_submission_result expected_result;
+    rdma_doorbell_submission_result result;
+    rdma_status expected_status;
+    rdma_status status;
+
+    transport = rdma_cmq_transport::type_id::create(
+      "transport_contract"
+    );
+    scheduler = rdma_cmq_transport_scheduler_double::type_id::create(
+      "transport_contract_scheduler"
+    );
+    rejected_scheduler =
+      rdma_cmq_transport_scheduler_double::type_id::create(
+        "transport_contract_rejected_scheduler"
+      );
+    binding = make_binding("transport_contract_binding", RDMA_BIND_ACTIVE);
+    desc = rdma_doorbell_desc::type_id::create("transport_contract_desc");
+    observer = new("transport_contract_observer");
+
+    transport.submit_observed(binding, desc, observer, result);
+    if (result == null || result.status == null) begin
+      `uvm_error("TRANSPORT_UNCONFIGURED",
+                 "unconfigured transport returned incomplete evidence")
+    end
+    else begin
+      expect_status("TRANSPORT_UNCONFIGURED_STATUS", result.status,
+                    RDMA_SC_INVALID_STATE);
+      if (result.submission_effect !=
+          RDMA_SUBMIT_EFFECT_PRE_SUBMIT_REJECTED)
+        `uvm_error("TRANSPORT_UNCONFIGURED_EFFECT",
+                   "pre-delegation rejection reported the wrong effect")
+    end
+
+    status = transport.configure(null);
+    expect_status("TRANSPORT_NULL_CONFIGURE", status,
+                  RDMA_SC_INVALID_ARGUMENT);
+    status = transport.configure(scheduler);
+    expect_status("TRANSPORT_CONFIGURE", status, RDMA_SC_OK);
+    status = transport.configure(rejected_scheduler);
+    expect_status("TRANSPORT_RECONFIGURE", status, RDMA_SC_INVALID_STATE);
+
+    expected_result = new("transport_forwarded_result");
+    expected_result.status = rdma_status::make(
+      RDMA_SC_TIMEOUT, "injected forwarded result"
+    );
+    expected_result.submission_effect =
+      RDMA_SUBMIT_EFFECT_HOST_MEMORY_ORDERED;
+    scheduler.response = expected_result;
+    transport.submit_observed(binding, desc, observer, result);
+    if (scheduler.submit_calls != 1 || rejected_scheduler.submit_calls != 0 ||
+        scheduler.last_binding != binding || scheduler.last_desc != desc ||
+        scheduler.last_observer != observer || result != expected_result ||
+        observer.calls != 0)
+      `uvm_error("TRANSPORT_FORWARD_IDENTITY",
+                 "transport cloned, replaced, skipped or repeated a delegate")
+
+    scheduler.return_null_result = 1'b1;
+    transport.submit_observed(binding, desc, observer, result);
+    if (result == null || result.status == null) begin
+      `uvm_error("TRANSPORT_NULL_RESULT",
+                 "null delegate result did not produce fallback evidence")
+    end
+    else begin
+      expect_status("TRANSPORT_NULL_RESULT_STATUS", result.status,
+                    RDMA_SC_INVALID_STATE);
+      if (result.submission_effect != RDMA_SUBMIT_EFFECT_UNOBSERVED)
+        `uvm_error("TRANSPORT_NULL_RESULT_EFFECT",
+                   "null delegate result claimed a pre-submit observation")
+    end
+
+    scheduler.return_null_result = 1'b0;
+    expected_result = new("transport_null_status_result");
+    expected_result.status = null;
+    expected_result.submission_effect =
+      RDMA_SUBMIT_EFFECT_HOST_MEMORY_WRITTEN;
+    scheduler.response = expected_result;
+    transport.submit_observed(binding, desc, observer, result);
+    if (result != expected_result || result.status == null) begin
+      `uvm_error("TRANSPORT_NULL_STATUS",
+                 "null delegate status was not repaired in-place")
+    end
+    else begin
+      expect_status("TRANSPORT_NULL_STATUS_VALUE", result.status,
+                    RDMA_SC_INVALID_STATE);
+      if (result.submission_effect !=
+          RDMA_SUBMIT_EFFECT_HOST_MEMORY_WRITTEN)
+        `uvm_error("TRANSPORT_NULL_STATUS_EFFECT",
+                   "null status repair lost the delegate scalar effect")
+    end
+
+    expected_result = new("transport_mmio_maybe_visible_result");
+    expected_status = rdma_status::make(
+      RDMA_SC_TIMEOUT, "injected MMIO maybe-visible result"
+    );
+    expected_result.status = expected_status;
+    expected_result.submission_effect =
+      RDMA_SUBMIT_EFFECT_MMIO_MAYBE_VISIBLE;
+    scheduler.response = expected_result;
+    transport.submit_observed(binding, desc, observer, result);
+    if (scheduler.submit_calls != 4 || result != expected_result ||
+        result.status != expected_status ||
+        result.submission_effect !=
+          RDMA_SUBMIT_EFFECT_MMIO_MAYBE_VISIBLE)
+      `uvm_error("TRANSPORT_MMIO_MAYBE_VISIBLE",
+                 "post-delegation evidence was cloned or downgraded")
+  endtask
+
+  // 功能：验证 engine 只在成功 prepare 提交新 transport，reset/shutdown 清除
+  //   引用，并在后续 prepare 创建绑定新 scheduler 的不同对象。
+  // 输入/输出及副作用：无参数；驱动两轮 prepare、reset/shutdown，mock 记录
+  //   backing I/O，probe 只暴露 facade identity。
+  // 失败/边界：profile 拒绝不得产生 I/O 或残留 facade；reset/reprepare 不得
+  //   复用旧 facade 或把第二轮委托发送给第一轮 scheduler。
+  task automatic check_transport_engine_lifecycle();
+    rdma_cmq_engine_probe engine;
+    rdma_mock_host_mem first_mem;
+    rdma_mock_host_mem second_mem;
+    rdma_cmq_transport_scheduler_double first_scheduler;
+    rdma_cmq_transport_scheduler_double second_scheduler;
+    rdma_cmq_test_profile first_profile;
+    rdma_cmq_test_profile second_profile;
+    rdma_function_binding first_binding;
+    rdma_function_binding second_binding;
+    rdma_cmq first_cmq;
+    rdma_cmq second_cmq;
+    rdma_cmq_runtime_desc runtime_desc;
+    rdma_cmq_transport first_transport;
+    rdma_cmq_transport second_transport;
+    rdma_doorbell_desc desc;
+    rdma_cmq_transport_observer observer;
+    rdma_doorbell_submission_result first_response;
+    rdma_doorbell_submission_result second_response;
+    rdma_doorbell_submission_result result;
+    rdma_cmq_completion completions[$];
+    rdma_status status;
+
+    engine = rdma_cmq_engine_probe::type_id::create(
+      "transport_lifecycle_engine"
+    );
+    first_mem = rdma_mock_host_mem::type_id::create(
+      "transport_lifecycle_first_mem"
+    );
+    first_scheduler =
+      rdma_cmq_transport_scheduler_double::type_id::create(
+        "transport_lifecycle_first_scheduler"
+      );
+    first_profile = rdma_cmq_test_profile::type_id::create(
+      "transport_lifecycle_first_profile"
+    );
+    first_binding = make_binding("transport_lifecycle_first_binding",
+                                 RDMA_BIND_PREPARED);
+    first_cmq = make_cmq("transport_lifecycle_first_cmq", first_binding);
+    first_profile.fail_validation = 1'b1;
+    engine.prepare(first_binding, first_cmq, 1'b1, 20'h34567, first_mem,
+                   first_scheduler, first_profile, runtime_desc, status);
+    expect_status("TRANSPORT_FAILED_PREPARE", status,
+                  RDMA_SC_INVALID_STATE);
+    if (runtime_desc != null || engine.transport_reference() != null ||
+        first_mem.calls.size() != 0)
+      `uvm_error("TRANSPORT_FAILED_PREPARE_ATOMIC",
+                 "failed prepare retained a facade or performed I/O")
+
+    first_profile.fail_validation = 1'b0;
+    prepare_defaults("TRANSPORT_FIRST_PREPARE", engine, first_mem,
+                     first_binding, first_cmq, first_scheduler,
+                     first_profile, runtime_desc);
+    first_transport = engine.transport_reference();
+    if (first_transport == null)
+      `uvm_error("TRANSPORT_FIRST_INSTALL",
+                 "successful prepare did not install a transport")
+    desc = rdma_doorbell_desc::type_id::create(
+      "transport_lifecycle_desc"
+    );
+    observer = new("transport_lifecycle_observer");
+    first_response = new("transport_lifecycle_first_response");
+    first_response.status = rdma_status::success();
+    first_scheduler.response = first_response;
+    if (first_transport != null)
+      first_transport.submit_observed(first_binding, desc, observer, result);
+    if (first_scheduler.submit_calls != 1 || result != first_response)
+      `uvm_error("TRANSPORT_FIRST_SCHEDULER",
+                 "first prepared facade is not configured to first scheduler")
+
+    engine.reset(completions, status);
+    expect_status("TRANSPORT_RESET", status, RDMA_SC_OK);
+    if (engine.transport_reference() != null)
+      `uvm_error("TRANSPORT_RESET_CLEAR",
+                 "reset retained the installed transport")
+
+    second_mem = rdma_mock_host_mem::type_id::create(
+      "transport_lifecycle_second_mem"
+    );
+    second_scheduler =
+      rdma_cmq_transport_scheduler_double::type_id::create(
+        "transport_lifecycle_second_scheduler"
+      );
+    second_profile = rdma_cmq_test_profile::type_id::create(
+      "transport_lifecycle_second_profile"
+    );
+    second_binding = make_binding("transport_lifecycle_second_binding",
+                                  RDMA_BIND_PREPARED);
+    second_binding.function_uid++;
+    second_binding.global_function_id++;
+    second_binding.generation++;
+    second_binding.synchronize_identity_from_legacy_mirrors();
+    second_binding.owner_h = second_binding.make_handle();
+    second_cmq = make_cmq("transport_lifecycle_second_cmq",
+                          second_binding);
+    prepare_defaults("TRANSPORT_SECOND_PREPARE", engine, second_mem,
+                     second_binding, second_cmq, second_scheduler,
+                     second_profile, runtime_desc);
+    second_transport = engine.transport_reference();
+    if (second_transport == null || second_transport == first_transport)
+      `uvm_error("TRANSPORT_REPREPARE_IDENTITY",
+                 "reprepare omitted or reused the old transport")
+    second_response = new("transport_lifecycle_second_response");
+    second_response.status = rdma_status::success();
+    second_scheduler.response = second_response;
+    if (second_transport != null)
+      second_transport.submit_observed(second_binding, desc, observer,
+                                       result);
+    if (second_scheduler.submit_calls != 1 ||
+        first_scheduler.submit_calls != 1 || result != second_response)
+      `uvm_error("TRANSPORT_SECOND_SCHEDULER",
+                 "reprepared facade reused the old scheduler")
+
+    engine.shutdown(status);
+    expect_status("TRANSPORT_SHUTDOWN", status, RDMA_SC_OK);
+    if (engine.transport_reference() != null)
+      `uvm_error("TRANSPORT_SHUTDOWN_CLEAR",
+                 "shutdown retained the installed transport")
   endtask
 
   // 功能：在测试辅助 rdma_cmq_engine_test.check_success_and_detachment 中构造或驱动“success and detachment”场景，并断言 DUT
@@ -13506,6 +13832,8 @@ class rdma_cmq_engine_test extends uvm_test;
   // 失败/边界：run_phase 的 setup/阶段驱动失败时停止新增事务，并按测试生命周期清理 objection 与临时引用。
   virtual task run_phase(uvm_phase phase);
     phase.raise_objection(this);
+    check_transport_facade_contract();
+    check_transport_engine_lifecycle();
     check_success_and_detachment();
     check_preallocation_rejections();
     check_pasid_normalization_and_busy_prepare();
