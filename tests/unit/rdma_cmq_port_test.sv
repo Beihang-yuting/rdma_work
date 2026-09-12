@@ -102,13 +102,13 @@ class rdma_legacy_only_cmq_port extends rdma_mock_cmq_port;
     returned_status = null_status ? null : source_status;
   endfunction
 
-  // 功能：在 execute 返回后故意改写遗留输出图，验证 observed wrapper 不泄露源引用。
-  // 输入/输出及副作用：无显式输入；修改本 port 保留的 ticket/status/completion/payload。
+  // 功能：在 execute_observed 返回后同步改写遗留输出图，验证结果不泄露源引用。
+  // 输入/输出及副作用：无显式输入；修改本 port 保留的 ticket/status/completion/payload，
+  //   供调用方在同一时间槽立即断言已发布快照保持原值。
   // 失败/边界：任一可选节点为空时跳过该节点；该测试故障注入不释放外部资源。
-  task automatic mutate_outputs_after_return();
+  function void mutate_outputs_now();
     rdma_legacy_direct_payload payload;
 
-    #1ns;
     if (source_ticket != null)
       source_ticket.command_id = 64'hdead;
     if (source_status != null) begin
@@ -120,11 +120,12 @@ class rdma_legacy_only_cmq_port extends rdma_mock_cmq_port;
       if ($cast(payload, source_completion.decoded_response))
         payload.value++;
     end
-  endtask
+  endfunction
 
   // 功能：返回预置 legacy 输出，并主动改写 caller command/owner 以覆盖 dispatch 前快照。
   // 输入/输出及副作用：command 为输入，ticket/completion/status 为输出；递增 execute_calls，
-  //   同步污染 command 图，并异步污染本 port 保留的遗留输出图。
+  //   同步污染 command 图；返回后的 output 突变由测试显式调用
+  //   mutate_outputs_now，避免与观察断言共享不确定调度时间槽。
   // 失败/边界：未配置 source 时输出可为空；该 adapter 不提供 lifecycle 提交证据。
   virtual task execute(
     rdma_cmq_command_desc command,
@@ -144,9 +145,6 @@ class rdma_legacy_only_cmq_port extends rdma_mock_cmq_port;
       if (command.recovery_owner != null)
         command.recovery_owner.workflow = RDMA_CMQ_WORKFLOW_INVALID;
     end
-    fork
-      mutate_outputs_after_return();
-    join_none
   endtask
 endclass
 
@@ -1182,6 +1180,8 @@ class rdma_cmq_port_test extends rdma_cmq_engine_test;
     rdma_cmq_value_factory_fault_wrapper ticket_fault;
     rdma_cmq_value_factory_fault_wrapper image_fault;
     rdma_cmq_value_factory_fault_wrapper completion_fault;
+    rdma_cmq_command_desc factory_commands[2];
+    rdma_legacy_only_cmq_port factory_ports[2];
     longint unsigned expected_uid;
     string expected_profile;
 
@@ -1217,7 +1217,7 @@ class rdma_cmq_port_test extends rdma_cmq_engine_test;
         result.ticket != result.completion.ticket ||
         result.status != result.completion.status)
       `uvm_error("PORT_OBSERVED_DETACH", "pre-dispatch or alias snapshot is wrong")
-    #1ns;
+    legacy_port.mutate_outputs_now();
     if (result.ticket.command_id != 64'h5501 ||
         result.status.code != RDMA_SC_OK || result.completion.raw_cqe == null)
       `uvm_error("PORT_OBSERVED_POST_RETURN", "legacy output mutation leaked")
@@ -1330,6 +1330,19 @@ class rdma_cmq_port_test extends rdma_cmq_engine_test;
       `uvm_error("PORT_OBSERVED_PAYLOAD_MUTATION",
                  "legacy payload mutation leaked into result")
 
+    for (int unsigned source_index = 0; source_index < 2; source_index++) begin
+      factory_commands[source_index] = make_command(
+        $sformatf("legacy_observed_factory_%0d", source_index), binding,
+        RDMA_OP_CQC_QUERY, 8'ha0 + source_index, 1us
+      );
+      factory_ports[source_index] = new(
+        $sformatf("legacy_observed_factory_port_%0d", source_index)
+      );
+      factory_ports[source_index].configure_response(
+        factory_commands[source_index], RDMA_SC_OK, 1'b1, 1'b0
+      );
+    end
+
     factory = uvm_factory::get();
     result_fault = new(
       "legacy_execution_result_fault", rdma_cmq_execution_result::get_type()
@@ -1356,13 +1369,8 @@ class rdma_cmq_port_test extends rdma_cmq_engine_test;
       rdma_cmq_completion::get_type(), completion_fault, 1'b1
     );
     for (int unsigned wrong_type = 0; wrong_type < 2; wrong_type++) begin
-      command = make_command(
-        $sformatf("legacy_observed_factory_%0d", wrong_type), binding,
-        RDMA_OP_CQC_QUERY, 8'ha0 + wrong_type, 1us
-      );
-      legacy_port = new($sformatf("legacy_observed_factory_port_%0d",
-                                  wrong_type));
-      legacy_port.configure_response(command, RDMA_SC_OK, 1'b1, 1'b0);
+      command = factory_commands[wrong_type];
+      legacy_port = factory_ports[wrong_type];
       result_fault.arm(wrong_type);
       status_fault.arm(wrong_type);
       ticket_fault.arm(wrong_type);

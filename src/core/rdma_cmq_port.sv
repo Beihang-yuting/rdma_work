@@ -31,7 +31,8 @@ virtual class rdma_cmq_port extends uvm_object;
   // 再把 legacy 返回值做 nonfatal detached snapshot，绝不反向调用自身。
   // 功能：执行一次 legacy execute，并发布保守的 observed execution result。
   // 输入/输出及副作用：command 为非拥有输入，result 为新建的 detached 输出；
-  //   调用一次 execute，且不修改调用方持有的 command、ticket 或 completion。
+  //   调用一次 execute。legacy override 可改写 command 指向的图，但发布的
+  //   command_identity/recovery_owner 是 dispatch 前捕获的 detached 快照。
   // 失败/边界：任一快照失败仅把 observation_status 置 INVALID_STATE；独立成功
   //   字段仍保留。所有 legacy 返回都标记 UNOBSERVED，禁止自动恢复或重试。
   virtual task execute_observed(
