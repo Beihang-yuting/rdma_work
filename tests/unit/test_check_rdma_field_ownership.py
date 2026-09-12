@@ -432,6 +432,80 @@ class FieldOwnershipFixtureTest(unittest.TestCase):
         }
         self.assert_rejected(lambda module: module.validate_capability_rows([row]))
 
+    def test_accepts_only_capability_with_explicit_closed_case_proof(self):
+        """功能：允许已由完整 mutation case 闭合证明的 QPC request capability。
+        输入输出及副作用：传入一个 QPC_CREATE request 行和显式 proven case 集合；验证只读 row。
+        失败边界：blocker 为 ``-`` 但没有闭合证明时必须拒绝；提供精确 case 证明后才可通过。"""
+        module = self.require_checker()
+        row = {
+            "driver_symbol": "XTRDMA_OP_QPC_CREATE",
+            "opcode": "QPC_CREATE",
+            "opcode_value": "0x00",
+            "direction": "REQUEST",
+            "registered": "1",
+            "request_encodable": "1",
+            "response_decodable": "0",
+            "oracle_case_id": "cmq_sqe_qpc_create_request",
+            "owning_codec": "rdma_hw_cmq_request_composer",
+            "blocker": "-",
+        }
+        with self.assertRaises(module.ContractError):
+            module.validate_capability_rows([row])
+        response = dict(row)
+        response["direction"] = "RESPONSE"
+        response["request_encodable"] = "0"
+        response["response_decodable"] = "1"
+        response["oracle_case_id"] = "cmq_cqe_qpc_create_response"
+        response["owning_codec"] = "rdma_hw_cmq_completion_codec"
+        doorbell = {
+            "driver_symbol": "-",
+            "opcode": "CMQ_SQ_DOORBELL",
+            "opcode_value": "-",
+            "direction": "REQUEST",
+            "registered": "1",
+            "request_encodable": "1",
+            "response_decodable": "0",
+            "oracle_case_id": "cmq_sq_doorbell",
+            "owning_codec": "rdma_hw_cmq_hw_profile",
+            "blocker": "-",
+        }
+        self.assertEqual(
+            module.validate_capability_rows(
+                [row, response, doorbell],
+                enum_members=[("XTRDMA_OP_QPC_CREATE", 0)],
+                proven_cases={
+                    "cmq_sqe_qpc_create_request",
+                    "cmq_cqe_qpc_create_response",
+                    "cmq_sq_doorbell",
+                },
+            ),
+            [row, response, doorbell],
+        )
+
+    def test_requires_synthetic_doorbell_in_enum_coverage(self):
+        """功能：要求 capability 完整覆盖 enum 双向行及独立 CMQ doorbell 行。
+        输入输出及副作用：传入一个完整 enum 的两条方向记录但省略 doorbell；不写入表。
+        失败边界：仅依赖 enum keys 的覆盖不能隐藏 register writer capability 的缺失。"""
+        module = self.require_checker()
+        rows = []
+        for direction in ("REQUEST", "RESPONSE"):
+            rows.append({
+                "driver_symbol": "XTRDMA_OP_QPC_CREATE",
+                "opcode": "QPC_CREATE",
+                "opcode_value": "0x00",
+                "direction": direction,
+                "registered": "1",
+                "request_encodable": "0",
+                "response_decodable": "0",
+                "oracle_case_id": "-",
+                "owning_codec": "rdma_hw_cmq_request_composer",
+                "blocker": "MISSING_CLOSED_EVIDENCE",
+            })
+        with self.assertRaises(module.ContractError):
+            module.validate_capability_rows(
+                rows, enum_members=[("XTRDMA_OP_QPC_CREATE", 0)]
+            )
+
     def test_rejects_missing_oracle_case(self):
         """功能：拒绝 ownership/mutation row 引用不存在的 oracle_case_id。
         输入输出及副作用：传入 unknown case；验证不得自行创建或推断 artifact。
@@ -825,6 +899,22 @@ class FieldOwnershipFixtureTest(unittest.TestCase):
         with self.assertRaises(module.ContractError):
             module._scan_sv_writer_ranges({"fixture.sv": source}, {})
 
+    def test_rejects_duplicate_production_macro_definition(self):
+        """功能：拒绝同名 production macro 即使正文相同也被重复定义。
+        输入输出及副作用：在完整 production fixture 前重复 CMQ_QPC_PUT；只读扫描文本。
+        失败边界：重复定义若被折叠成一个 dict 项，会让 include/拼接顺序
+        改变实际 writer 而不触发 ABI gate。"""
+        module = self.require_checker()
+        macro = (
+            "`define CMQ_QPC_PUT(STEM, VALUE) \\\n"
+            "  status = put(builder, STEM``_WORD_BYTE_OFFSET, STEM``_LSB, \\\n"
+            "               STEM``_WIDTH, VALUE); \\\n"
+            "  if (!status.ok()) return status;\n"
+        )
+        source = macro + self.complete_production_compose_source()
+        with self.assertRaises(module.ContractError):
+            module._collect_sv_macro_definitions({"fixture.sv": source})
+
     def test_rejects_missing_compose_request_writer(self):
         """功能：缺少真实 compose_request 输出合并路径时拒绝 QPC writer 证明。
         输入输出及副作用：传入只有 QPC body class 的 source；只返回错误，
@@ -1086,6 +1176,22 @@ class FieldOwnershipFixtureTest(unittest.TestCase):
         )
         with self.assertRaises(module.ContractError):
             module._validate_anchor_call_arguments(row, body, "fixture.c")
+
+    def test_rejects_nested_index_that_only_prefix_matches_declared_range(self):
+        """功能：拒绝把 wqe[0][1] 这样的嵌套索引冒充 declared wqe[0] qword。
+        输入输出及副作用：直接传入含嵌套索引的 flow；不执行 C 调用或修改表。
+        失败边界：range 匹配若只做前缀搜索，会把不同 buffer 元素误认成同一
+        base/length，进而伪造 anchor 的目标绑定。"""
+        module = self.require_checker()
+        with self.assertRaises(module.ContractError):
+            module._require_anchor_range_in_flow(
+                "wqe[0][1] -> temp -> target",
+                "wqe",
+                0,
+                8,
+                target_expr="temp",
+                target_must_be_after=True,
+            )
 
     def test_selected_mask_ignores_other_cmq_sq_case_returns(self):
         """功能：只从 selected_mask 方法读取 CMQ SQ 的允许位 literal。

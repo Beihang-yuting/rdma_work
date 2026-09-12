@@ -5,6 +5,22 @@
 已完成 CMQ 专用 gate、类型化 TSV reader、mutation smoke test、QPC_CREATE
 VFID 固定零校验和三条 proven capability 记录接线。
 
+Fix round 1 已完成：
+
+- I-1：SV production macro source-walk 对 malformed continuation、malformed
+  `` `define`` 和同名 production macro（包括正文完全相同的重复定义）统一
+  fail-closed；跨 source 重复也报告来源路径。
+- I-2：anchor range proof 只接受 declared buffer 与精确
+  ``base/length`` 在同一 flow node 的完整表达式；增加结束边界，拒绝
+  ``wqe[0][1]``、成员后缀和别名前缀伪造，并继续检查 target 顺序/终点。
+- QPC buffer mutation 先把 TSV wire bit 转为 field-local bit，再按
+  ``body.qpc_buffer.value[field_local_bit + 9]`` 写入，并用 source-level
+  delta 断言保护该 field-local→wire 映射；最终 image 仍由 production
+  ``compose_sqe`` 产生，未使用 SV mask 反推 expected bytes。
+- capability 只在 C-derived mutation candidate 与实际 report 完全逐列相等、
+  且 source writer proof 完整时开启；CQC_CREATE request 继续保持
+  ``CONTEXT_EMBED_BASE_MISMATCH`` blocker，不执行其 composer。
+
 ## 实现
 
 - 新增 `tests/support/rdma_cmq_contract_reader.sv`，严格解析 18 列 mutation
@@ -22,17 +38,43 @@ VFID 固定零校验和三条 proven capability 记录接线。
 ## 验证
 
 ```text
-python3 -m unittest tests.unit.test_cmq_gate_manifest -v   PASS (2 tests)
-python3 -m unittest tests.unit.test_check_rdma_field_ownership -v  PASS (52 tests)
-SSHPASS=123 scripts/run_vcs53.sh core rdma_cmq_driver_field_mutation_test  PASS
-SSHPASS=123 scripts/run_vcs53.sh core rdma_cmq_profile_test                PASS
+python3 -m unittest tests.unit.test_cmq_gate_manifest -v
+  PASS (2 tests)
+python3 -m unittest tests.unit.test_check_rdma_field_ownership -v
+  PASS (56 tests)
+python3 -m unittest discover -s tests/unit -p 'test_*.py' -v
+  PASS (225 tests)
+/home/ryan/.local/bin/python3.8 -m unittest
+  tests.unit.test_check_rdma_field_ownership -v
+  PASS (56 tests)
+SSHPASS=123 scripts/run_vcs53.sh rdma_defs rdma_cmq_driver_contract_test
+  PASS (195 tests; field ownership candidate and report gate PASS)
+SSHPASS=123 scripts/run_vcs53.sh core rdma_cmq_driver_field_mutation_test
+  PASS
+SSHPASS=123 scripts/run_vcs53.sh core rdma_cmq_profile_test
+  PASS
+SSHPASS=123 scripts/run_vcs53.sh cmq_gate regression
+  PASS (6 CMQ tests)
 ```
 
-VCS 两个测试均报告 warning/error/fatal 为 0。
+mutation test 的实际 summary：
 
-## Concern
+```text
+TYPED_RECOMPOSE=140 CORRELATED_RECOMPOSE=2 DRIVER_FIXED_REJECT=12
+RAW_DECODE_MUTATION=512 STATIC_CANONICAL=9 STATIC_UNWRITABLE=413
+EXECUTED_TOTAL=666 STATIC_TOTAL=422 GRAND_TOTAL=1088
+```
 
-Task 4 checker 当前仍把 QPC capability blocker 固定要求为
-`MISSING_PRODUCTION_PATH_EVIDENCE`，并无条件拒绝 request capability=1；Task 5
-brief 要求将 proven rows 的 blocker 置为 `-` 并启用 capability，因此后续需要在
-主任务中同步更新 checker 的 Task 5 证明条件后再运行 `rdma_defs` gate。
+所有通过的 VCS case 均由 `check_uvm_summary.sh` 检查，UVM
+`warning=0 error=0 fatal=0`。
+
+## ABI 与边界说明
+
+- 原始驱动 `cmq.h`/`cmq.c` 和 C oracle 是唯一 wire authority；reader、
+  mutation test 与 checker 均不从 `RDMA_CMQ_*_MASK` 生成 expected bytes。
+- QPC CMQ header 的 QPN 是 24 bit，而 QPC context QPN 是 21 bit；
+  `validate_qpc_signature_source` 只比较两者 ABI 共有的低 21 bit，保留
+  header 的完整 24 bit，不把高三位静默截断到线上字段。
+- 当前 capability 证明范围仍只有 QPC_CREATE request/response 和 SQ doorbell；
+  CQC_CREATE 由于真实 context embed base 与现有 composer 不一致，明确保持
+  blocker，不能通过静态 mutation 数量“解锁”。

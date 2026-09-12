@@ -2768,9 +2768,9 @@ class rdma_hw_cmq_request_composer extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：validate_qpc_signature_source 校验 source、body 与当前对象状态的一致性，并显式处理“rdma”等拒绝条件，返回 rdma_status 供上层决定是否提交。
-  // 输入/输出及副作用：source（输入）、body（输入）；validate_qpc_signature_source 读取 source、body 并使用字段 service_type、key.hw_version、key.image_kind、key.object_type、key.opcode、key.variant、status、decoded_model；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：必需对象/句柄/快照为空，或身份、范围、generation 和生命周期检查失败时返回非成功状态。
+  // 功能：validate_qpc_signature_source 解码 QPC signature source，并校验它与 CMQ QPC body 的共享 QP 身份、transport variant 和 full-modify WBE 模板一致。
+  // 输入/输出及副作用：source（输入，完整 QPC context image）、body（输入，CMQ 64-byte body image）；函数只读取 service_type、qp_h.object_id、transport 和 WBE 字段，返回 rdma_status，不修改输入或转移资源所有权。
+  // 失败/边界：source/body 元数据不合法、codec lookup/decode 失败、QPN 低 21 位不一致或 transport/WBE 组合不受支持时返回 CODEC_ERROR；CMQ header 的 24-bit QPN 与 QPC context 的 21-bit QPN 不同宽，比较时只使用驱动 ABI 共有的低 21 位，绝不截断线上字段。
   protected function rdma_status validate_qpc_signature_source(
     rdma_hw_image source,
     rdma_hw_image body
@@ -2782,6 +2782,8 @@ class rdma_hw_cmq_request_composer extends uvm_object;
     rdma_status status;
     bit [2:0] service_type;
     bit [23:0] body_qpn;
+    bit [20:0] body_qpc_qpn;
+    bit [20:0] source_qpc_qpn;
     bit [1:0] modify_mode;
     bit [1:0] wbe_template;
     bit [1:0] expected_wbe_template;
@@ -2809,10 +2811,18 @@ class rdma_hw_cmq_request_composer extends uvm_object;
       return codec_error({"QPC signature source decode failed: ",
                           (status == null) ? "null status" :
                                              status.message});
+    // 驱动的 CMQ header QPN 是 GENMASK(23, 0)，而 QPC context QPN
+    // 是 GENMASK_ULL(36, 16)。两者不是同宽字段：CMQ 保留完整 24-bit
+    // canonical 值，身份校验只比较 ABI 共同定义的低 21 位。
     body_qpn = (image_word(body, 0) >> RDMA_CMQ_QPN_LSB) & 24'hff_ffff;
     if (decoded_qpc.qp_h == null ||
-        decoded_qpc.qp_h.kind != RDMA_RESOURCE_QP ||
-        decoded_qpc.qp_h.object_id != body_qpn)
+        decoded_qpc.qp_h.kind != RDMA_RESOURCE_QP)
+      return codec_error(
+        "QPC signature source QPN does not match the CMQ body"
+      );
+    body_qpc_qpn = body_qpn[20:0];
+    source_qpc_qpn = decoded_qpc.qp_h.object_id[20:0];
+    if (source_qpc_qpn != body_qpc_qpn)
       return codec_error(
         "QPC signature source QPN does not match the CMQ body"
       );

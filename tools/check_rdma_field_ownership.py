@@ -196,6 +196,24 @@ FROZEN_MUTATION_COUNTS = {
     "GRAND_TOTAL": 1088,
 }
 
+# 只有这些 case 具备 Task 5 的完整生产路径闭合证据。集合中的名称必须
+# 同时出现在 canonical mutation candidate、实际 mutation report 和 source
+# writer proof 中；它不是“把 TSV 改成 1”即可绕过的能力开关。
+PROVEN_CAPABILITY_CASES = frozenset({
+    "cmq_sqe_qpc_create_request",
+    "cmq_cqe_qpc_create_response",
+    "cmq_sq_doorbell",
+})
+
+CAPABILITY_CASE_BY_KEY = {
+    ("XTRDMA_OP_QPC_CREATE", "REQUEST"):
+        "cmq_sqe_qpc_create_request",
+    ("XTRDMA_OP_QPC_CREATE", "RESPONSE"):
+        "cmq_cqe_qpc_create_response",
+    ("CMQ_SQ_DOORBELL", "REQUEST"):
+        "cmq_sq_doorbell",
+}
+
 
 @dataclass(frozen=True)
 class MacroDefinition:
@@ -1056,12 +1074,46 @@ def _as_flag(value: str, label: str) -> int:
 def validate_capability_rows(
     rows: Sequence[Mapping[str, str]],
     enum_members: Sequence[tuple[str, int]] | None = None,
+    *,
+    proven_cases: Iterable[str] | None = None,
+    mutation_rows: Sequence[Mapping[str, str]] | None = None,
+    expected_mutations: Sequence[Mapping[str, str]] | None = None,
 ) -> list[Mapping[str, str]]:
-    """功能：校验 enum capability 的完整双向记录、阻断原因和禁用位。
-    输入输出及副作用：返回 rows 的独立列表；不注册 opcode、不启用 encoder。
-    失败边界：缺失/重复成员、MAX 被执行、拼写过滤、unsupported 方向置位或 blocker 漂移均拒绝。"""
+    """功能：校验 enum capability 的完整双向记录、生产证据闭合和阻断原因。
+    输入输出及副作用：返回 rows 的独立列表；可选 mutation_rows 与
+    expected_mutations 用于把已启用方向绑定到 C-derived candidate，不注册 opcode。
+    失败边界：缺失/重复成员、MAX 被执行、拼写过滤、未闭合方向置位、synthetic
+    doorbell 缺失或 blocker 漂移均拒绝；仅传 ``proven_cases`` 只适合已由调用方
+    完成 source-walk 的内部闭合步骤，正式 verify 必须同时传两份 mutation report。"""
     if not rows:
         raise ContractError("capability table has no rows")
+
+    # Build the proof set before inspecting capability rows.  A caller that
+    # supplies both reports must prove byte-for-byte equality against the
+    # C-derived candidate; otherwise a hand-edited mutation table could turn
+    # an unsupported direction into an apparently supported one.
+    proof_cases = set(proven_cases or ())
+    unknown_proofs = proof_cases - PROVEN_CAPABILITY_CASES
+    if unknown_proofs:
+        raise ContractError(
+            f"unknown proven capability cases: {sorted(unknown_proofs)}"
+        )
+    if mutation_rows is not None:
+        validate_mutation_report(mutation_rows)
+        if expected_mutations is not None:
+            compare_mutation_report(mutation_rows, expected_mutations)
+            proof_cases.update(PROVEN_CAPABILITY_CASES)
+        else:
+            # Without the generated candidate, only complete per-case counts
+            # can be checked here.  The full verify path always supplies the
+            # candidate, while direct users still receive a conservative
+            # fail-closed result for malformed/incomplete reports.
+            case_counts = Counter(row["case_id"] for row in mutation_rows)
+            for case_id in PROVEN_CAPABILITY_CASES:
+                expected_count = int(CASE_LAYOUTS[case_id]["length"]) * 8
+                if case_counts.get(case_id, 0) == expected_count:
+                    proof_cases.add(case_id)
+
     members = list(enum_members or [])
     executable = [(symbol, value) for symbol, value in members
                   if symbol != "XTRDMA_OP_MAX"]
@@ -1071,6 +1123,7 @@ def validate_capability_rows(
         for direction in VALID_DIRECTIONS
     }
     seen: set[tuple[str, str]] = set()
+    synthetic_seen = False
     for row in rows:
         missing = [column for column in CAPABILITY_COLUMNS if column not in row]
         if missing:
@@ -1091,14 +1144,27 @@ def validate_capability_rows(
             seen.add(key)
             if direction != "REQUEST" or row["registered"] != "1":
                 raise ContractError("CMQ doorbell capability must be registered request")
-            if request or response:
-                raise ContractError("CMQ doorbell capability is not executable in Task 4")
+            case_id = "cmq_sq_doorbell"
+            if case_id in proof_cases:
+                if request != 1 or response != 0 or row["blocker"] != "-":
+                    raise ContractError(
+                        "closed CMQ doorbell capability flags or blocker drift"
+                    )
+            elif request or response:
+                raise ContractError(
+                    "CMQ doorbell capability lacks closed production evidence"
+                )
             if row["oracle_case_id"] != "cmq_sq_doorbell":
                 raise ContractError("CMQ doorbell oracle case drift")
             if row["owning_codec"] != "rdma_hw_cmq_hw_profile":
                 raise ContractError("CMQ doorbell owning codec drift")
-            if row["blocker"] != "MISSING_PRODUCTION_PATH_EVIDENCE":
+            expected_blocker = (
+                "-" if case_id in proof_cases
+                else "MISSING_PRODUCTION_PATH_EVIDENCE"
+            )
+            if row["blocker"] != expected_blocker:
                 raise ContractError("CMQ doorbell blocker drift")
+            synthetic_seen = True
             continue
         member = next((item for item in executable if item[0] == symbol), None)
         if member is None:
@@ -1114,8 +1180,6 @@ def validate_capability_rows(
             raise ContractError(f"capability opcode value drift: {symbol}")
         if row["registered"] != "1":
             raise ContractError(f"registered enum member marked unregistered: {symbol}")
-        if request or response:
-            raise ContractError("Task 4 capability cannot enable production path")
         expected_case = "-"
         if symbol == "XTRDMA_OP_QPC_CREATE" and direction == "REQUEST":
             expected_case = "cmq_sqe_qpc_create_request"
@@ -1131,6 +1195,28 @@ def validate_capability_rows(
             expected_blocker = "MISSING_PRODUCTION_PATH_EVIDENCE"
         else:
             expected_blocker = "MISSING_CLOSED_EVIDENCE"
+
+        case_id = CAPABILITY_CASE_BY_KEY.get((symbol, direction))
+        if case_id in proof_cases:
+            if case_id is None:
+                raise ContractError(
+                    f"proof case has no capability mapping: {symbol}/{direction}"
+                )
+            expected_request = int(
+                symbol == "XTRDMA_OP_QPC_CREATE" and direction == "REQUEST"
+            )
+            expected_response = int(
+                symbol == "XTRDMA_OP_QPC_CREATE" and direction == "RESPONSE"
+            )
+            if (request, response) != (expected_request, expected_response):
+                raise ContractError(
+                    f"closed capability flags drift: {symbol}/{direction}"
+                )
+            expected_blocker = "-"
+        elif request or response:
+            raise ContractError(
+                f"capability enables unproven production path: {symbol}/{direction}"
+            )
         if row["blocker"] != expected_blocker:
             raise ContractError(f"capability blocker drift: {symbol}/{direction}")
         codec = row["owning_codec"]
@@ -1138,11 +1224,12 @@ def validate_capability_rows(
             raise ContractError(f"capability owning codec missing: {symbol}/{direction}")
     if enum_members:
         synthetic = {("CMQ_SQ_DOORBELL", "REQUEST")}
-        if seen != expected_keys and seen - synthetic != expected_keys:
-            missing = expected_keys - seen
-            extra = seen - expected_keys - synthetic
+        expected_with_synthetic = expected_keys | synthetic
+        if seen != expected_with_synthetic or not synthetic_seen:
+            missing = expected_with_synthetic - seen
+            extra = seen - expected_with_synthetic
             raise ContractError(
-                f"capability enum coverage mismatch: missing={missing} extra={extra}"
+                f"capability coverage mismatch: missing={missing} extra={extra}"
             )
     return list(rows)
 
@@ -1625,18 +1712,11 @@ def validate_mutation_report(
     )
     summary["STATIC_TOTAL"] = summary["STATIC_CANONICAL"] + summary["STATIC_UNWRITABLE"]
     summary["GRAND_TOTAL"] = len(rows)
-    frozen = {
-        "TYPED_RECOMPOSE": 140,
-        "CORRELATED_RECOMPOSE": 2,
-        "DRIVER_FIXED_REJECT": 12,
-        "RAW_DECODE_MUTATION": 512,
-        "STATIC_CANONICAL": 9,
-        "STATIC_UNWRITABLE": 413,
-        "EXECUTED_TOTAL": 666,
-        "STATIC_TOTAL": 422,
-        "GRAND_TOTAL": 1088,
-    }
-    expected = dict(frozen)
+    # Keep one frozen source of truth for both validation and CLI reporting.
+    # Duplicating this map here would allow a future count change to make the
+    # checker accept a report that its summary claims is invalid (or vice
+    # versa).
+    expected = dict(FROZEN_MUTATION_COUNTS)
     if expected_counts:
         expected.update(expected_counts)
     if any(summary[key] != expected[key] for key in expected):
@@ -1844,8 +1924,13 @@ def _sv_macro_definitions(source: str) -> dict[str, tuple[tuple[str, ...], str]]
         r"(?:\s*\(([^)]*)\))?\s*(.*?)\s*$"
     )
     for line in logical_lines:
+        define_marker = re.match(r"^\s*`define\b", line)
         match = pattern.match(line)
         if match is None:
+            if define_marker is not None:
+                raise ContractError(
+                    "malformed SV macro definition: " + line.strip()
+                )
             continue
         name, parameter_text, body = match.groups()
         parameters = tuple(
@@ -1856,8 +1941,13 @@ def _sv_macro_definitions(source: str) -> dict[str, tuple[tuple[str, ...], str]]
             raise ContractError(f"SV macro {name} has duplicate parameters")
         current = (parameters, body)
         previous = result.get(name)
-        if previous is not None and previous != current:
-            raise ContractError(f"SV macro definition drift: {name}")
+        if previous is not None:
+            if name in PRODUCTION_WRITER_MACROS:
+                raise ContractError(
+                    f"duplicate SV production macro definition: {name}"
+                )
+            if previous != current:
+                raise ContractError(f"SV macro definition drift: {name}")
         result[name] = current
     return result
 
@@ -1876,12 +1966,18 @@ def _collect_sv_macro_definitions(
     失败边界：续行错误或同名正文漂移立即抛错；
     宏缺失由调用方拒绝。"""
     definitions: dict[str, tuple[tuple[str, ...], str]] = {}
-    for source in sv_sources.values():
+    for source_path, source in sv_sources.items():
         parsed = _sv_macro_definitions(source)
         for name, current in parsed.items():
             previous = definitions.get(name)
-            if previous is not None and previous != current:
-                raise ContractError(f"SV macro definition drift: {name}")
+            if previous is not None:
+                if name in PRODUCTION_WRITER_MACROS:
+                    raise ContractError(
+                        "duplicate SV production macro definition: "
+                        f"{name} in {source_path}"
+                    )
+                if previous != current:
+                    raise ContractError(f"SV macro definition drift: {name}")
             definitions[name] = current
     return definitions
 
@@ -2752,8 +2848,16 @@ def _scan_sv_writer_ranges(
                 class_body = _sv_class_body(source, class_name)
                 function_body = _sv_function_body(class_body, "encode_fields")
                 branch = _sv_case_branch(function_body, branch_label)
-            except ContractError:
-                continue
+            except ContractError as exc:
+                # Once a production class is present, a malformed function or
+                # branch is evidence of an invalid source walk—not an absent
+                # writer.  Silently continuing would let a broken branch make
+                # every bit look STATIC_UNWRITABLE and could enable a forged
+                # capability through a stale table.
+                raise ContractError(
+                    f"CMQ production writer source is invalid in "
+                    f"{source_path}/{class_name}: {exc}"
+                ) from exc
             # Invocations of the two production macros are expanded and checked
             # against both their aliases and the actual C-derived coordinates.
             invocation_name = (
@@ -3014,12 +3118,13 @@ def validate_sv_writer_contract(
     *,
     macro_ranges: Mapping[str, tuple[int, int, int]] | None = None,
     canonical_images: Mapping[str, bytes] | None = None,
+    proven_cases: Iterable[str] | None = None,
 ) -> list[WriterRange]:
     """功能：以 C-derived 坐标反向证明 request static-unwritable 位没有 production
     writer、ownership 或 capability 覆盖。
     输入输出及副作用：返回扫描到的 WriterRange；只读 SV/rows/images，不启用或修改任何 codec。
     失败边界：writer 坐标漂移、未知直接写、derived mask 漂移、canonical 非零、
-    ownership 重叠或 capability 置位均抛 ContractError。"""
+    ownership 重叠或未被 proven_cases 覆盖的 capability 置位均抛 ContractError。"""
     if not sv_sources:
         raise ContractError("SV writer source set is empty")
     joined = "\n".join(_strip_sv_comments(source) for source in sv_sources.values())
@@ -3027,6 +3132,7 @@ def validate_sv_writer_contract(
     ranges = _scan_sv_writer_ranges(sv_sources, coordinates, macro_ranges)
     contexts = {
         "cmq_sqe_qpc_create_request": ("CMQ_SQE", "QPC_CREATE", "REQUEST"),
+        "cmq_cqe_qpc_create_response": ("CMQ_CQE", "QPC_CREATE", "RESPONSE"),
         "cmq_sq_doorbell": ("CMQ_SQ_DOORBELL", "CMQ_SQ", "REQUEST"),
     }
     qpc_context = contexts["cmq_sqe_qpc_create_request"]
@@ -3132,11 +3238,27 @@ def validate_sv_writer_contract(
                     f"ownership row covers STATIC_UNWRITABLE bit: "
                     f"{case_id}/{qword}/{bit}/{macro}"
                 )
+    proven = set(proven_cases or ())
+    unknown_proven = proven - PROVEN_CAPABILITY_CASES
+    if unknown_proven:
+        raise ContractError(
+            f"unknown proven capability cases: {sorted(unknown_proven)}"
+        )
     for capability in capability_rows or ():
         case_id = capability.get("oracle_case_id", "-")
-        if case_id in contexts and capability.get("request_encodable") == "1":
+        if case_id == "-":
+            case_id = CAPABILITY_CASE_BY_KEY.get(
+                (capability.get("driver_symbol", ""),
+                 capability.get("direction", "")),
+                "-",
+            )
+        enabled = (
+            capability.get("request_encodable") == "1"
+            or capability.get("response_decodable") == "1"
+        )
+        if enabled and case_id in contexts and case_id not in proven:
             raise ContractError(
-                f"capability enables request writer before static proof: {case_id}"
+                f"capability enables unproven production path: {case_id}"
             )
     return ranges
 
@@ -3344,11 +3466,12 @@ def _require_anchor_range_in_flow(
         if not _flow_node_contains_exact(compact_node, buffer_compact):
             return False
         escaped_buffer = re.escape(buffer_compact)
-        indexed = rf"{escaped_buffer}\[{base}\]"
+        range_end = r"(?![A-Za-z0-9_.$>\[])"
+        indexed = rf"{escaped_buffer}\[{base}\]{range_end}"
         indexed_range = (
-            rf"{escaped_buffer}\[{base}[,:]{length}\]",
-            rf"{escaped_buffer}\[{base}:{base + length}\]",
-            rf"{escaped_buffer}\[{base}:{base + length - 1}\]",
+            rf"{escaped_buffer}\[{base}[,:]{length}\]{range_end}",
+            rf"{escaped_buffer}\[{base}:{base + length}\]{range_end}",
+            rf"{escaped_buffer}\[{base}:{base + length - 1}\]{range_end}",
         )
         if re.search(indexed, compact_node):
             # An indexed scalar denotes one qword in these anchors; do not let
@@ -3356,7 +3479,7 @@ def _require_anchor_range_in_flow(
             return length == 8
         if any(re.search(pattern, compact_node) for pattern in indexed_range):
             return True
-        pointer_range = rf"{escaped_buffer}\+{base}"
+        pointer_range = rf"{escaped_buffer}\+{base}{range_end}"
         if not re.search(pointer_range, compact_node):
             return False
         # Pointer displacement without an explicit span is only unambiguous
@@ -3364,7 +3487,10 @@ def _require_anchor_range_in_flow(
         if length == 8:
             return True
         return any(
-            re.search(rf"{pointer_range}(?:\+|,|:)\s*{length}", compact_node)
+            re.search(
+                rf"{pointer_range}(?:\+|,|:)\s*{length}{range_end}",
+                compact_node,
+            )
             for _ in (0,)
         )
 
@@ -4049,10 +4175,19 @@ def _compare_rows(
 
 def build_expected_capabilities(
     enum_members: Sequence[tuple[str, int]],
+    proven_cases: Iterable[str] | None = None,
 ) -> list[dict[str, str]]:
     """功能：为每个 executable enum 成员生成 REQUEST/RESPONSE 候选及 doorbell 行。
-    输入输出及副作用：返回新列表；保留 driver symbol/value，不注册或启用 production path。
-    失败边界：MAX 只作为边界排除；重复 enum 由 parser 提前拒绝。"""
+    输入输出及副作用：返回新列表；保留 driver symbol/value，并只为已闭合
+    ``proven_cases`` 设置 capability 位，不注册或启用未证明 production path。
+    失败边界：MAX 只作为边界排除；未知 proven case、重复 enum 或方向映射漂移由
+    调用方拒绝。"""
+    proven = set(proven_cases or ())
+    unknown = proven - PROVEN_CAPABILITY_CASES
+    if unknown:
+        raise ContractError(
+            f"unknown proven capability cases: {sorted(unknown)}"
+        )
     rows: list[dict[str, str]] = []
     for symbol, value in enum_members:
         if symbol == "XTRDMA_OP_MAX":
@@ -4076,14 +4211,25 @@ def build_expected_capabilities(
                 if direction == "REQUEST"
                 else "rdma_hw_cmq_completion_codec"
             )
+            case_proven = case_id in proven
+            request_encodable = int(
+                case_proven and symbol == "XTRDMA_OP_QPC_CREATE"
+                and direction == "REQUEST"
+            )
+            response_decodable = int(
+                case_proven and symbol == "XTRDMA_OP_QPC_CREATE"
+                and direction == "RESPONSE"
+            )
+            if case_proven:
+                blocker = "-"
             rows.append({
                 "driver_symbol": symbol,
                 "opcode": _opcode_name(symbol),
                 "opcode_value": f"0x{value:02x}",
                 "direction": direction,
                 "registered": "1",
-                "request_encodable": "0",
-                "response_decodable": "0",
+                "request_encodable": str(request_encodable),
+                "response_decodable": str(response_decodable),
                 "oracle_case_id": case_id,
                 "owning_codec": codec,
                 "blocker": blocker,
@@ -4094,11 +4240,14 @@ def build_expected_capabilities(
         "opcode_value": "-",
         "direction": "REQUEST",
         "registered": "1",
-        "request_encodable": "0",
+        "request_encodable": str(int("cmq_sq_doorbell" in proven)),
         "response_decodable": "0",
         "oracle_case_id": "cmq_sq_doorbell",
         "owning_codec": "rdma_hw_cmq_hw_profile",
-        "blocker": "MISSING_PRODUCTION_PATH_EVIDENCE",
+        "blocker": (
+            "-" if "cmq_sq_doorbell" in proven
+            else "MISSING_PRODUCTION_PATH_EVIDENCE"
+        ),
     })
     return rows
 
@@ -4319,15 +4468,6 @@ def verify(args) -> dict[str, int]:
     )
     cmq_header = (kernel_root / "cmq.h").read_text(encoding="utf-8")
     enum_members = parse_opcode_enum(cmq_header)
-    validate_capability_rows(capabilities, enum_members)
-    expected_capabilities = build_expected_capabilities(enum_members)
-    _compare_rows(
-        capabilities,
-        expected_capabilities,
-        CAPABILITY_COLUMNS,
-        ("driver_symbol", "opcode", "direction"),
-        "capability",
-    )
     validate_oracle_case_references(
         [*ownership, *capabilities, *mutations],
         cases,
@@ -4341,10 +4481,32 @@ def verify(args) -> dict[str, int]:
         coordinates=coordinates,
         macro_ranges=macro_ranges,
         ownership_rows=ownership,
-        capability_rows=capabilities,
+        # Capability bits are checked only after the C-derived mutation
+        # candidate has been rebuilt and compared.  Passing the hand-edited
+        # table into source-walk here would make capability validation depend
+        # on its own untrusted flags.
+        capability_rows=None,
     )
     summary = validate_mutation_report(mutations)
     compare_mutation_report(mutations, expected_mutations)
+    proven_cases = set(PROVEN_CAPABILITY_CASES)
+    validate_capability_rows(
+        capabilities,
+        enum_members,
+        mutation_rows=mutations,
+        expected_mutations=expected_mutations,
+        proven_cases=proven_cases,
+    )
+    expected_capabilities = build_expected_capabilities(
+        enum_members, proven_cases
+    )
+    _compare_rows(
+        capabilities,
+        expected_capabilities,
+        CAPABILITY_COLUMNS,
+        ("driver_symbol", "opcode", "direction"),
+        "capability",
+    )
     return summary
 
 
