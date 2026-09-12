@@ -26,3 +26,19 @@ Ruling：brief 给出的 `dhcp_header.sv` 摘要为 66 位且不是 SHA-256；�
 
 风险：`dpu_common` 与 `pcie_work` 仍故意 fail closed；Task 6A 需要项目所有者
 针对明确 checkout 完成批准后才能运行 integration/pcie 仿真。
+
+## Fix round 1
+
+根据 review-v2 修复了额外 TSV 字段、include 符号链接/目录链接、shadow 与循环
+include、dangling candidate、APPROVED capture、PCIe host-mem manager 可读性清单
+以及验证文档当前 active lock 说明；capture 现在同步候选父目录并保持原子发布。
+
+验证：
+
+```text
+python3 -m unittest tests.unit.test_external_dependency_lock tests.unit.test_run_vcs53_sync -v  PASS (7 tests)
+python3 -m unittest discover -s tests/unit -p 'test_*.py'                           PASS (235 tests)
+python3 -m py_compile tools/check_external_dependency_lock.py                      PASS
+bash -n scripts/run_vcs53.sh                                                       PASS
+git diff --check                                                                   PASS
+```

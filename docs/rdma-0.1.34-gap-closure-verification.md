@@ -62,7 +62,7 @@ publish/CEQ 注入点稳定后，应另设独立测试和回归行，避免把�
 | `HOST_MEM_ROOT=/home/ubuntu/host_mem_latest scripts/run_vcs53.sh host_mem regression` | adapter、queue data-engine 和 UMEM 三项均退出码 `0`；每项 UVM `warning=0 error=0 fatal=0`，真实 manager leak check 为 `0 blocks outstanding` |
 | `scripts/run_vcs53.sh core regression`、integration/net_packet 全量回归 | 这些全量回归的最近一次基线证据保留在上一轮记录；本轮针对 fail-closed 改动重新执行了上面列出的 coverage、smoke、host-mem、transport、dual-env 和 multi-VF 入口，不将未重跑的全量结果冒充本轮证据 |
 
-本轮 host-mem preflight 使用 `365b7553fc7dac6b4ad55886a8e4869153607c28`，并校验：
+历史记录中的 host-mem preflight 曾使用 `365b7553fc7dac6b4ad55886a8e4869153607c28`；该记录已被当前锁定基线 superseded。本轮 active 依赖必须通过 `hw/rdma/external_dependencies.tsv` 校验，host-mem commit 为 `3b9e000d5df4d10efbb3029f43605e0362e0caca`。
 
 - `src/host_mem_pkg.sv` SHA-256：`e874491da16334b12d9299355a3148275309a0c5a2c3303cda2fc7c3382ed74f`；
 - `src/host_mem_manager.sv` SHA-256：`6b5eb9bbd94d410b1382a665ddb60347132558fc7882cbed1115f69fa0c1d410`。

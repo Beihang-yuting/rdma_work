@@ -229,7 +229,8 @@ pcie_work_preflight:
 		"$(PCIE_WORK_ROOT)/pcie_tl_vip/src/shared/pcie_tl_device_profile_pkg.sv" \
 		"$(PCIE_WORK_ROOT)/pcie_tl_vip/src/topology/pcie_topology_pkg.sv" \
 		"$(PCIE_WORK_ROOT)/pcie_tl_vip/src/pcie_tl_pkg.sv" \
-		"$(HOST_MEM_ROOT)/src/host_mem_pkg.sv"; do \
+		"$(HOST_MEM_ROOT)/src/host_mem_pkg.sv" \
+		"$(HOST_MEM_ROOT)/src/host_mem_manager.sv"; do \
 		if [[ ! -r "$$dependency" ]]; then echo "Required pcie_work dependency is not readable: $$dependency" >&2; exit 2; fi; \
 		done
 	@python3 ../tools/check_external_dependency_lock.py verify --lock ../hw/rdma/external_dependencies.tsv --dependency host_mem --root "$(HOST_MEM_ROOT)"

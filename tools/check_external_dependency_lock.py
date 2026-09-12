@@ -61,6 +61,8 @@ def parse_lock(path: Path) -> list[Row]:
         rows: list[Row] = []
         seen: set[tuple[str, str]] = set()
         for record in reader:
+            if None in record:
+                raise ValueError("extra lock fields")
             if any(value is None for value in record.values()):
                 raise ValueError("invalid lock row")
             dep = record["dependency"]
@@ -83,7 +85,7 @@ def parse_lock(path: Path) -> list[Row]:
                     raise ValueError("invalid approved identity")
             else:
                 identities_are_seed = record["git_commit"] == record["snapshot_tree_sha256"] == record["sha256"] == "-"
-                identities_are_candidate = HEX40.fullmatch(record["git_commit"]) and HEX64.fullmatch(record["snapshot_tree_sha256"]) and HEX64.fullmatch(record["sha256"])
+                identities_are_candidate = (HEX40.fullmatch(record["git_commit"]) or record["git_commit"] == "-") and HEX64.fullmatch(record["snapshot_tree_sha256"]) and HEX64.fullmatch(record["sha256"])
                 if not (identities_are_seed or identities_are_candidate):
                     raise ValueError("invalid unapproved identity")
             rows.append(Row(dep, approval, record["root_env"], record["git_commit"], record["snapshot_tree_sha256"], dirs, kind, rel, record["sha256"].lower()))
@@ -105,10 +107,16 @@ def _root_path(root: str) -> Path:
     current = Path(candidate.anchor)
     for part in candidate.parts[1:]:
         current /= part
-        info = os.lstat(current)
+        try:
+            info = os.lstat(current)
+        except OSError as exc:
+            raise ValueError(f"invalid root path: {root}") from exc
         if stat.S_ISLNK(info.st_mode):
             raise ValueError("root contains symlink")
-    info = os.lstat(candidate)
+    try:
+        info = os.lstat(candidate)
+    except OSError as exc:
+        raise ValueError(f"invalid root path: {root}") from exc
     if not stat.S_ISDIR(info.st_mode):
         raise ValueError("root is not a directory")
     return candidate
@@ -150,34 +158,79 @@ def _includes(path: Path) -> list[str]:
 
 def closure(root: Path, direct: list[str], include_dirs: tuple[str, ...]) -> list[str]:
     """功能：从直接种子递归解析 include 闭包并返回规范相对路径集合。\n输入输出及副作用：输入 root、direct 相对路径和有序 include_dirs；返回 UTF-8 字节排序的路径列表。\n失败边界：未解析 include（uvm_macros.svh 除外）、越界、符号链接和循环引用均触发 ValueError。"""
-    queue = list(direct)
     found: set[str] = set()
-    dirs = [root / item for item in include_dirs]
-    while queue:
-        rel = queue.pop(0)
+    active: set[str] = set()
+    for include_dir in include_dirs:
+        _resolve_dir(root, include_dir)
+
+    def visit(rel: str) -> None:
+        if rel in active:
+            raise ValueError(f"include cycle: {rel}")
         if rel in found:
-            continue
+            return
+        active.add(rel)
         path = _resolve(root, rel)
-        found.add(rel)
         for name in _includes(path):
-            candidates: list[Path] = []
-            local = path.parent / name
-            if local.exists():
-                candidates.append(local)
-            for directory in dirs:
-                candidate = directory / name
-                if candidate.exists() and candidate not in candidates:
-                    candidates.append(candidate)
+            candidates: list[str] = []
+            local_rel = os.path.relpath(path.parent / name, root).replace(os.sep, "/")
+            if safe_relative(local_rel) and _candidate_file(root, local_rel):
+                candidates.append(local_rel)
+            for directory in include_dirs:
+                candidate_rel = f"{directory}/{name}" if directory else name
+                if safe_relative(candidate_rel) and _candidate_file(root, candidate_rel) and candidate_rel not in candidates:
+                    candidates.append(candidate_rel)
             if not candidates:
                 if name in ALLOW_UNRESOLVED:
                     continue
                 raise ValueError(f"unresolved include: {name}")
-            selected = candidates[0].resolve()
-            if os.path.commonpath((str(root.resolve()), str(selected))) != str(root.resolve()):
-                raise ValueError(f"include escapes root: {name}")
-            rel_name = os.path.relpath(selected, root).replace(os.sep, "/")
-            queue.append(rel_name)
+            if len(candidates) > 1:
+                raise ValueError(f"ambiguous include: {name}")
+            visit(candidates[0])
+        active.remove(rel)
+        found.add(rel)
+
+    for rel in direct:
+        visit(rel)
     return sorted(found, key=lambda item: item.encode("utf-8"))
+
+
+def _resolve_dir(root: Path, rel: str) -> Path:
+    """功能：逐组件检查 include 目录，拒绝符号链接和越界目录。\n输入输出及副作用：输入 root 与目录相对路径；返回真实目录 Path，仅执行 lstat。\n失败边界：缺失、符号链接、特殊对象和 root 外路径均抛出 ValueError。"""
+    if not safe_relative(rel):
+        raise ValueError("invalid include directory")
+    current = root
+    for part in rel.split("/"):
+        current /= part
+        try:
+            info = os.lstat(current)
+        except OSError as exc:
+            raise ValueError(f"missing include directory: {rel}") from exc
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            raise ValueError(f"invalid include directory: {rel}")
+    return current
+
+
+def _candidate_file(root: Path, rel: str) -> bool:
+    """功能：判断 include 候选是否为 root 内的普通文件并检查每个路径组件。\n输入输出及副作用：输入 root 与候选相对路径；存在且安全返回 True，缺失返回 False。\n失败边界：任一组件是符号链接、特殊文件或越界时抛出 ValueError，避免 shadow 绕过。"""
+    if not safe_relative(rel):
+        return False
+    current = root
+    parts = rel.split("/")
+    for index, part in enumerate(parts):
+        current /= part
+        try:
+            info = os.lstat(current)
+        except FileNotFoundError:
+            return False
+        except OSError as exc:
+            raise ValueError(f"cannot inspect include candidate: {rel}") from exc
+        if stat.S_ISLNK(info.st_mode):
+            raise ValueError(f"symlink include candidate: {rel}")
+        if index == len(parts) - 1 and not stat.S_ISREG(info.st_mode):
+            raise ValueError(f"special include candidate: {rel}")
+        if index < len(parts) - 1 and not stat.S_ISDIR(info.st_mode):
+            raise ValueError(f"invalid include component: {rel}")
+    return True
 
 
 def _git(root: Path, *args: str) -> str:
@@ -240,6 +293,8 @@ def capture(rows: list[Row], dependency: str, root_text: str, candidate_text: st
     group = [r for r in rows if r.dependency == dependency]
     if not group:
         raise ValueError(f"unknown dependency: {dependency}")
+    if group[0].approval != "UNAPPROVED":
+        raise ValueError(f"capture requires unapproved dependency: {dependency}")
     root = _root_path(root_text)
     candidate = Path(candidate_text)
     if not candidate.is_absolute() or os.path.commonpath(("/tmp", str(candidate.parent.resolve()))) != "/tmp":
@@ -249,7 +304,7 @@ def capture(rows: list[Row], dependency: str, root_text: str, candidate_text: st
         if parent.exists() and parent.is_symlink():
             raise ValueError("candidate parent is symlink")
         parent = parent.parent
-    if candidate.exists() and candidate.is_symlink():
+    if candidate.is_symlink():
         raise ValueError("candidate is symlink")
     direct = [r.relative_path for r in group if r.input_kind == "DIRECT"]
     paths = closure(root, direct, group[0].include_dirs)
@@ -274,6 +329,11 @@ def capture(rows: list[Row], dependency: str, root_text: str, candidate_text: st
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, candidate)
+        directory_fd = os.open(candidate.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
     finally:
         if os.path.exists(temporary):
             os.unlink(temporary)
