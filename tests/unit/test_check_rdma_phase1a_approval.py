@@ -220,6 +220,18 @@ class CheckerTests(unittest.TestCase):
                 with self.assertRaises(checker.ApprovalError):
                     checker.check_approval(repo_root=root, runner=FakeGit(responses))
 
+    def test_default_mode_rejects_tracked_but_physically_missing_artifact(self) -> None:
+        """功能：默认模式拒绝 Git 报告 tracked 但 worktree 实体已缺失的 approval artifact。
+
+        输入输出及副作用：从临时 fixture 删除 artifact 后运行生产文件读取，断言稳定 ApprovalError；临时目录负责清理。
+        失败边界：ls-files 与两类 diff 均成功也不能掩盖 read_bytes 的文件缺失失败。
+        """
+        with self._repo_fixture() as root:
+            (root / ARTIFACT_PATH).unlink()
+            with self.assertRaises(checker.ApprovalError) as raised:
+                checker.check_approval(repo_root=root, runner=FakeGit(self._responses()))
+        self.assertEqual(str(raised.exception), "approval artifact cannot be read")
+
     def test_staged_mode_requires_only_artifact_and_reads_index_blob(self) -> None:
         """功能：staged 模式只接受 approval 单一路径并从 git show :path 读取字节。
 
@@ -245,6 +257,42 @@ class CheckerTests(unittest.TestCase):
         with self._repo_fixture() as root:
             with self.assertRaises(checker.ApprovalError):
                 checker.check_approval(repo_root=root, staged=True, runner=FakeGit(responses))
+
+    def test_staged_mode_rejects_missing_index_artifact_blob(self) -> None:
+        """功能：staged 模式拒绝唯一 staged 路径存在但 `git show :artifact` 无法读取的候选。
+
+        输入输出及副作用：注入 staged name-only 成功和 index show 失败，断言稳定 ApprovalError；不修改真实 index。
+        失败边界：worktree 中存在同名 artifact 也不得回退读取，缺失 index blob 必须 fail-closed。
+        """
+        responses = self._responses()
+        responses[("diff", "--cached", "--name-only")] = (0, (ARTIFACT_PATH + "\n").encode(), b"")
+        responses[("show", f":{ARTIFACT_PATH}")] = (1, b"", b"missing index blob")
+        with self._repo_fixture() as root:
+            with self.assertRaises(checker.ApprovalError) as raised:
+                checker.check_approval(repo_root=root, staged=True, runner=FakeGit(responses))
+        self.assertEqual(str(raised.exception), "staged approval blob is unavailable")
+
+    def test_default_and_staged_modes_reject_untracked_or_dirty_plan(self) -> None:
+        """功能：确认默认和 staged 两种入口共享 plan tracked、worktree clean、index clean 门禁。
+
+        输入输出及副作用：逐模式注入三类 Git 失败并断言各自稳定 ApprovalError；只使用临时文件及 FakeGit。
+        失败边界：plan 未跟踪、worktree dirty 或 index dirty 任一成立时，两种模式都必须停止。
+        """
+        failures = [
+            (("ls-files", "--error-unmatch", "--", PLAN_PATH), "plan is not tracked"),
+            (("diff", "--quiet", "--", PLAN_PATH), "current plan worktree is dirty"),
+            (("diff", "--cached", "--quiet", "--", PLAN_PATH), "current plan index is dirty"),
+        ]
+        for staged in (False, True):
+            for command, diagnostic in failures:
+                responses = self._responses()
+                if staged:
+                    responses[("diff", "--cached", "--name-only")] = (0, (ARTIFACT_PATH + "\n").encode(), b"")
+                responses[command] = (1, b"", b"rejected")
+                with self.subTest(staged=staged, command=command), self._repo_fixture() as root:
+                    with self.assertRaises(checker.ApprovalError) as raised:
+                        checker.check_approval(repo_root=root, staged=staged, runner=FakeGit(responses))
+                self.assertEqual(str(raised.exception), diagnostic)
 
     def test_cli_prints_bound_values_on_success(self) -> None:
         """功能：确认 CLI 成功时输出计划 commit、blob hash、approver 与四项 APPROVED 决策。
@@ -277,6 +325,27 @@ class CheckerTests(unittest.TestCase):
         self.assertNotEqual(status, 0)
         self.assertEqual(len(error.getvalue().splitlines()), 1)
         self.assertTrue(error.getvalue().startswith("phase1a approval check failed: "))
+
+    def test_cli_rejects_invalid_arguments_without_argparse_exit(self) -> None:
+        """功能：确认未知选项和位置参数不会触发 argparse SystemExit 或多行 usage。
+
+        输入输出及副作用：逐个调用 main 并捕获 stdout/stderr，要求返回 1 和精确单行诊断；runner 不应被调用。
+        失败边界：`--bad` 与 `unexpected` 必须各自 fail-closed，禁止 SystemExit(2) 逃逸。
+        """
+        cases = [
+            (["--bad"], "phase1a approval check failed: invalid command line: unrecognized arguments: --bad\n"),
+            (["unexpected"], "phase1a approval check failed: invalid command line: unrecognized arguments: unexpected\n"),
+        ]
+        for argv, diagnostic in cases:
+            output = io.StringIO()
+            error = io.StringIO()
+            fake = FakeGit({})
+            with self.subTest(argv=argv), contextlib.redirect_stdout(output), contextlib.redirect_stderr(error):
+                status = checker.main(argv, runner=fake)
+            self.assertEqual(status, 1)
+            self.assertEqual(output.getvalue(), "")
+            self.assertEqual(error.getvalue(), diagnostic)
+            self.assertEqual(fake.calls, [])
 
     def test_git_evidence_rejects_commit_plan_and_hash_failures(self) -> None:
         """功能：覆盖 commit 缺失、非祖先、错误 parent、额外路径、计划路径和双 hash 漂移。

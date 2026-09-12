@@ -23,3 +23,11 @@
 ## Concerns
 
 Approval artifact 仍故意缺失；默认 CLI 在当前 checkout 上应继续 fail-closed，待项目 owner 显式批准后由后续 checkpoint 创建并绑定 artifact。
+
+## Review fix round 1
+
+- 新增 `_FailClosedArgumentParser.error()`，将未知选项与位置参数转换为 `ApprovalError`；`main()` 现在把参数解析放在统一捕获路径内，返回 1 且只输出一行稳定 stderr 诊断。
+- 新增独立证据用例：tracked 但实体缺失的默认 artifact、staged index blob 缺失，以及默认/staged 两种模式下 plan untracked、worktree dirty、index dirty。
+- RED：新增 invalid-argument 用例在原实现上因 `SystemExit(2)` 失败；其余新增用例验证现有拒绝分支。
+- GREEN：focused suite 更新为 15 tests / 15 passed；`py_compile` 与 `git diff --check` 通过，测试缓存已清理。
+- 范围保持不变：未创建真实 approval artifact，未运行真实仓库 checker，未开始 Task 8。

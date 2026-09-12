@@ -15,7 +15,7 @@ import re
 import subprocess
 import sys
 from pathlib import Path
-from typing import Callable, Sequence
+from typing import Callable, NoReturn, Sequence
 
 
 ARTIFACT_PATH = "docs/superpowers/approvals/2026-09-11-rdma-cmq-contract-foundation-phase1a.env"
@@ -42,6 +42,18 @@ _TIMESTAMP_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]
 
 class ApprovalError(ValueError):
     """表示 approval 字节、字段或 Git 绑定证据不满足 fail-closed 契约。"""
+
+
+class _FailClosedArgumentParser(argparse.ArgumentParser):
+    """将 argparse 的 usage/error 退出收束到 checker 的单行失败诊断。"""
+
+    def error(self, message: str) -> NoReturn:
+        """功能：把未知选项、位置参数和其他 CLI grammar 错误转换为 ApprovalError。
+
+        输入输出及副作用：输入 argparse 生成的 message，不打印 usage，始终抛出异常交给 main 输出。
+        失败边界：仅处理无效命令行；正常解析及 `--help` 的成功退出仍沿用 argparse 行为。
+        """
+        raise ApprovalError(f"invalid command line: {message}")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -279,10 +291,10 @@ def main(argv: Sequence[str] | None = None, *, repo_root: Path | str = Path(".")
     输入输出及副作用：输入可选 --staged，成功向 stdout 打印 commit/hash/approver/四项决策并返回 0；失败 stderr 一行并返回 1。
     失败边界：所有 ApprovalError、OS 错误和 runner 失败均 fail-closed，不创建或修改 artifact。
     """
-    parser = argparse.ArgumentParser(description="check CMQ Phase 1A approval")
-    parser.add_argument("--staged", action="store_true", help="validate the index candidate")
-    args = parser.parse_args(argv)
     try:
+        parser = _FailClosedArgumentParser(description="check CMQ Phase 1A approval")
+        parser.add_argument("--staged", action="store_true", help="validate the index candidate")
+        args = parser.parse_args(argv)
         approval = check_approval(repo_root=repo_root, staged=args.staged, runner=runner)
     except (ApprovalError, OSError) as exc:
         print(f"phase1a approval check failed: {exc}", file=sys.stderr)
