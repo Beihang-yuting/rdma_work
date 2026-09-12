@@ -137,11 +137,12 @@ class FieldOwnershipFixtureTest(unittest.TestCase):
         row.update(overrides)
         return row
 
-    def minimal_compose_source(self, merge_extra=""):
-        """功能：构造含 canonical envelope/body merge 的最小 composer fixture。
-        输入输出及副作用：merge_extra 插入 merge loop；返回源码字符串，
-        不执行 SV 或写文件。
-        失败边界：fixture 保留必要 data-flow；额外 mutator 应由 checker 拒绝。"""
+    def minimal_compose_source(self, merge_extra="", pre_merge_extra=""):
+        """功能：构造含 canonical envelope/body merge 的 composer fixture。
+        输入输出及副作用：merge_extra 写入 merge loop，pre_merge_extra 写在
+        candidate 分配后；返回源码字符串，不执行 SV 或写文件。
+        失败边界：fixture 保留必要 data-flow；额外 image alias/mutator
+        应被拒绝。"""
         return (
             "class rdma_hw_cmq_request_composer;\n"
             "function rdma_status compose_request(\n"
@@ -151,6 +152,7 @@ class FieldOwnershipFixtureTest(unittest.TestCase):
             "  status = envelope_codec.encode(envelope, envelope_image);\n"
             "  status = ownership.lookup(envelope_snapshot.opcode, input_kind, masks);\n"
             "  candidate = rdma_hw_image::type_id::create(\"rdma_cmq_request\");\n"
+            f"  {pre_merge_extra}\n"
             "  for (int unsigned q = 0; q < 8; q++) begin\n"
             "    envelope_word = image_word(envelope_image, q);\n"
             "    body_word = image_word(body, q);\n"
@@ -166,6 +168,63 @@ class FieldOwnershipFixtureTest(unittest.TestCase):
             "  result = candidate;\n"
             "endfunction\nendclass\n"
         )
+
+    def complete_production_compose_source(
+        self, merge_extra="", pre_merge_extra=""
+    ):
+        """功能：补齐 QPC、envelope、doorbell 三个 production class，供 composer
+        source-walk 在完整上下文中命中目标规则。
+        输入输出及副作用：参数仅插入 composer fixture；返回 SV 文本，不执行
+        或写入生产源码。
+        失败边界：任一 production class、branch 或 typed macro 缺失时由 checker
+        拒绝。"""
+        return (
+            "`define CMQ_QPC_PUT(STEM, VALUE) \\\n"
+            "  status = put(builder, STEM``_WORD_BYTE_OFFSET, STEM``_LSB, \\\n"
+            "               STEM``_WIDTH, VALUE); \\\n"
+            "  if (!status.ok()) return status;\n"
+            "`define CMQ_ENVELOPE_PUT(STEM, VALUE) \\\n"
+            "  status = builder.put_field(STEM``_WORD_BYTE_OFFSET, STEM``_LSB, \\\n"
+            "                             STEM``_WIDTH, VALUE);\n"
+            "`define DB_PUT(STEM, VALUE) \\\n"
+            "  status = put(builder, STEM``_WORD_BYTE_OFFSET, STEM``_LSB, \\\n"
+            "               STEM``_WIDTH, VALUE);\n"
+            "class rdma_hw_cmq_qpc_layout_codec;\n"
+            "function void encode_fields();\n"
+            "  case (opcode)\n"
+            "    RDMA_OP_QPC_CREATE: begin\n"
+            "      `CMQ_QPC_PUT(RDMA_CMQ_QPN, value)\n"
+            "    end\n"
+            "  endcase\n"
+            "endfunction\nendclass\n"
+            "class rdma_hw_cmq_envelope_codec;\n"
+            "function void encode();\n"
+            "  `CMQ_ENVELOPE_PUT(RDMA_CMQ_VALID, value)\n"
+            "endfunction\nendclass\n"
+            "class rdma_hw_doorbell_codec;\n"
+            "function void encode_fields();\n"
+            "  case (variant_name)\n"
+            "    \"cmq_sq\": begin\n"
+            "      `DB_PUT(RDMA_CMQ_DB_PI, value)\n"
+            "      `DB_PUT(RDMA_CMQ_DB_POLARITY, value)\n"
+            "    end\n"
+            "  endcase\n"
+            "endfunction\nendclass\n"
+            + self.minimal_compose_source(
+                merge_extra=merge_extra,
+                pre_merge_extra=pre_merge_extra,
+            )
+        )
+
+    def assert_compose_rejected(self, source, message_pattern):
+        """功能：在完整 production source 上断言 composer 拒绝并命中指定规则。
+        输入输出及副作用：source 是待扫描 SV 文本，message_pattern 是错误
+        正则；只读扫描，不创建持久资源。
+        失败边界：缺 class 等前置错误或未抛 ContractError 均使断言失败。"""
+        module = self.require_checker()
+        with self.assertRaises(module.ContractError) as raised:
+            module._scan_sv_writer_ranges({"fixture.sv": source}, {})
+        self.assertRegex(str(raised.exception), message_pattern)
 
     def test_rejects_bit_genmask_drift(self):
         """功能：拒绝 C BIT/GENMASK 展开值与 ownership 坐标不一致。
@@ -805,7 +864,6 @@ class FieldOwnershipFixtureTest(unittest.TestCase):
         输入输出及副作用：逐一注入 push/delete/insert 或索引自增；不执行
         SV。
         失败边界：除逐字节 merged_word push 外的 image 修改均抛 ContractError。"""
-        module = self.require_checker()
         mutators = (
             "candidate.bytes.push_back(8'hff);",
             "candidate.bytes.delete();",
@@ -815,9 +873,12 @@ class FieldOwnershipFixtureTest(unittest.TestCase):
         )
         for mutator in mutators:
             with self.subTest(mutator=mutator):
-                source = self.minimal_compose_source(mutator)
-                with self.assertRaises(module.ContractError):
-                    module._scan_sv_writer_ranges({"fixture.sv": source}, {})
+                source = self.complete_production_compose_source(
+                    merge_extra=mutator
+                )
+                self.assert_compose_rejected(
+                    source, r"compose_request .*image|compose_request .*writer"
+                )
 
     def test_rejects_compose_request_merge_post_mutation(self):
         """功能：拒绝 canonical envelope/body OR 后对 merged_word 的静态复写或
@@ -825,7 +886,6 @@ class FieldOwnershipFixtureTest(unittest.TestCase):
         输入输出及副作用：逐一注入 |=、^=、标量赋值和 bit-select；不执行
         SV。
         失败边界：merge 后任何未证明修改都必须 fail-closed。"""
-        module = self.require_checker()
         mutations = (
             "merged_word |= 64'h1;",
             "merged_word ^= 64'h1;",
@@ -834,9 +894,41 @@ class FieldOwnershipFixtureTest(unittest.TestCase):
         )
         for mutation in mutations:
             with self.subTest(mutation=mutation):
-                source = self.minimal_compose_source(mutation)
-                with self.assertRaises(module.ContractError):
-                    module._scan_sv_writer_ranges({"fixture.sv": source}, {})
+                source = self.complete_production_compose_source(
+                    merge_extra=mutation
+                )
+                self.assert_compose_rejected(
+                    source, r"compose_request .*merged_word"
+                )
+
+    def test_rejects_compose_request_alias_image_mutator(self):
+        """功能：拒绝 candidate 的 rdma_hw_image alias 及其 bytes 变异。
+        输入输出及副作用：构造 alias=candidate 后注入 push/delete/insert/bit 写；
+        仅扫描完整 production fixture，不执行 SV。
+        失败边界：alias rebind 或任一 alias bytes mutator 必须命中 image
+        规则。"""
+        mutators = (
+            "alias.bytes.push_back(8'hff);",
+            "alias.bytes.delete();",
+            "alias.bytes.push_front(8'hff);",
+            "alias.bytes.insert(0, 8'hff);",
+            "alias.bytes[0] = 1'b1;",
+            "alias.bytes[0] |= 1'b1;",
+            "alias |= merged_word;",
+            "alias = envelope_word | body_word;",
+        )
+        for mutator in mutators:
+            with self.subTest(mutator=mutator):
+                source = self.complete_production_compose_source(
+                    merge_extra=mutator,
+                    pre_merge_extra=(
+                        "rdma_hw_image alias; alias = candidate;"
+                    ),
+                )
+                self.assert_compose_rejected(
+                    source,
+                    r"compose_request .*image alias|compose_request .*image",
+                )
 
     def test_rejects_missing_production_writer_macro(self):
         """功能：缺失任一 production writer macro 定义时拒绝 source-walk 证明。

@@ -2280,47 +2280,182 @@ def _validate_compose_merge_assignments(
         raise ContractError("compose_request merge OR is outside its canonical loop")
 
 
+def _compose_image_declarations(body: str) -> set[str]:
+    """功能：收集 compose_request 中显式声明的 rdma_hw_image 对象名称。
+    输入输出及副作用：返回名称集合；只读函数正文，不执行 SV 或改变
+    源码。
+    失败边界：声明含数组、非法标识符或逗号结构不平衡时抛 ContractError，
+    防止隐藏未审计的 image alias。"""
+    declaration_text = re.sub(
+        r'"(?:\\.|[^"\\])*"', '""', body
+    )
+    pattern = re.compile(r"\brdma_hw_image\s+([^;]+);")
+    names: set[str] = set()
+    for match in pattern.finditer(declaration_text):
+        try:
+            parts = _split_call_arguments(match.group(1))
+        except ContractError as exc:
+            raise ContractError(
+                "compose_request image declaration is malformed"
+            ) from exc
+        for part in parts:
+            item = part.strip()
+            name_match = re.fullmatch(
+                r"([A-Za-z_][A-Za-z0-9_]*)(?:\s*=\s*.*)?",
+                item,
+                re.S,
+            )
+            if name_match is None:
+                raise ContractError(
+                    "compose_request image declaration is malformed"
+                )
+            name = name_match.group(1)
+            if name in names:
+                raise ContractError(
+                    f"compose_request image declaration is duplicated: {name}"
+                )
+            names.add(name)
+    return names
+
+
+def _iter_compose_assignments(body: str):
+    """功能：迭代 compose_request 中的简单变量赋值，供 image alias 流追踪。
+    输入输出及副作用：逐项返回 (owner, operator, value)；不求值、不修改
+    正文。
+    失败边界：未闭合分号的赋值不会被当作合法 flow，调用方须检查必需
+    发布点。"""
+    pattern = re.compile(
+        r"(?<![.A-Za-z0-9_])(?P<owner>[A-Za-z_][A-Za-z0-9_]*)\s*"
+        r"(?P<operator><=|<<=|>>=|\|=|&=|\^=|\+=|-=|\*=|/=|%=|=(?!=))"
+        r"\s*(?P<value>[^;]*);",
+        re.S,
+    )
+    for match in pattern.finditer(body):
+        yield (
+            match.group("owner"),
+            match.group("operator"),
+            match.group("value"),
+        )
+
+
 def _validate_compose_image_mutators(
     body: str,
     merge_block: str,
 ) -> None:
-    """功能：枚举 candidate/result image 的对象、bytes 方法、索引和整体赋值，
-    锁定唯一合法输出写入。
-    输入输出及副作用：只读 compose_request 正文及 merge 节点；
-    成功无返回值，不改变 image。
-    失败边界：对象重绑定、未知 bytes method、额外容器或索引写均抛
-    ContractError。"""
-    compact = _normalise_sv_expr(body)
-    object_assignments = [
-        (owner, _normalise_sv_expr(value))
-        for owner, value in re.findall(
-            r"\b(result|candidate)\s*=\s*([^;]+);", body
+    """功能：追踪 compose_request 内全部 image alias，锁定 candidate/result 的
+    canonical flow 以及唯一 merged bytes writer。
+    输入输出及副作用：只读函数正文和 merge 节点；成功无返回值，不执行
+    SV。
+    失败边界：未声明 alias、任何 alias rebind、bytes 方法/索引/容器写、
+    对象重绑或 compound merge 均抛 ContractError；envelope canonical 输入
+    链仅准许固定赋值。"""
+    source = _strip_sv_comments(body)
+    compact = _normalise_sv_expr(source)
+    canonical_names = {
+        "candidate", "result", "envelope_image", "canonical_envelope_image",
+    }
+    input_names = {"body", "qpc_signature_source"}
+    allowed_names = canonical_names | input_names
+    declared_names = _compose_image_declarations(source)
+    unknown_declarations = declared_names - allowed_names
+    if unknown_declarations:
+        names = ", ".join(sorted(unknown_declarations))
+        raise ContractError(
+            f"compose_request declares an unapproved image alias: {names}"
         )
-    ]
+    image_names = allowed_names | declared_names
+    image_name_pattern = "|".join(
+        re.escape(name)
+        for name in sorted(image_names, key=len, reverse=True)
+    )
+    qualified_member = re.compile(
+        r"\b[A-Za-z_][A-Za-z0-9_]*\s*\.\s*(?:"
+        + image_name_pattern
+        + r")\s*\.\s*(?:bytes|length|alignment|endian|image_kind)\b"
+    )
+    if qualified_member.search(compact):
+        raise ContractError("compose_request qualifies an image alias")
+
+    qualified_assignment = re.compile(
+        r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\.\s*"
+        r"([A-Za-z_][A-Za-z0-9_]*)\s*"
+        r"(?:<=|<<=|>>=|\|=|&=|\^=|\+=|-=|\*=|/=|%=|=(?!=))"
+        r"\s*([^;]*);"
+    )
+    for match in qualified_assignment.finditer(compact):
+        prefix, owner, value = match.groups()
+        direct_name_match = re.fullmatch(
+            r"\(*([A-Za-z_][A-Za-z0-9_]*)\)*", value
+        )
+        direct_name = (
+            direct_name_match.group(1) if direct_name_match else None
+        )
+        if prefix not in image_names and (
+            owner in image_names or direct_name in image_names
+        ):
+            raise ContractError("compose_request qualifies an image alias")
+    object_update = re.compile(
+        r"(?:\+\+|--)\s*(?:" + image_name_pattern + r")\b|"
+        r"(?:" + image_name_pattern + r")\s*(?:\+\+|--)\b"
+    )
+    if object_update.search(compact):
+        raise ContractError("compose_request updates an image object")
+
+    member_pattern = re.compile(
+        r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\.\s*bytes\b"
+    )
+    for owner in {match.group(1) for match in member_pattern.finditer(compact)}:
+        if owner not in image_names:
+            raise ContractError(
+                f"compose_request references an undeclared image alias: {owner}"
+            )
+
+    constructor = (
+        'rdma_hw_image::type_id::create("rdma_cmq_request")'
+    )
     allowed_assignments = {
         ("result", "null"),
         ("result", "candidate"),
-        (
-            "candidate",
-            'rdma_hw_image::type_id::create("rdma_cmq_request")',
-        ),
+        ("candidate", constructor),
+        ("envelope_image", "null"),
+        ("canonical_envelope_image", "null"),
+        ("envelope_image", "canonical_envelope_image"),
     }
-    if any(item not in allowed_assignments for item in object_assignments):
-        raise ContractError("compose_request rebinds an image object")
-    if object_assignments.count(("result", "null")) != 1:
-        raise ContractError("compose_request result initialization is not unique")
-    if object_assignments.count(("result", "candidate")) != 1:
-        raise ContractError("compose_request result publication is not unique")
-    if object_assignments.count(
-        (
-            "candidate",
-            'rdma_hw_image::type_id::create("rdma_cmq_request")',
+    assignment_counts: Counter[tuple[str, str]] = Counter()
+    for owner, operator, raw_value in _iter_compose_assignments(source):
+        value = _normalise_sv_expr(raw_value)
+        direct_name_match = re.fullmatch(
+            r"\(*([A-Za-z_][A-Za-z0-9_]*)\)*", value
         )
-    ) != 1:
+        direct_name = (
+            direct_name_match.group(1) if direct_name_match else None
+        )
+        if owner not in image_names:
+            if direct_name in image_names:
+                raise ContractError("compose_request rebinds an image alias")
+            continue
+        if owner in input_names:
+            raise ContractError("compose_request rebinds an input image")
+        if operator != "=" or (owner, value) not in allowed_assignments:
+            raise ContractError("compose_request rebinds an image object")
+        assignment_counts[(owner, value)] += 1
+
+    if assignment_counts[("result", "null")] != 1:
+        raise ContractError("compose_request result initialization is not unique")
+    if assignment_counts[("result", "candidate")] != 1:
+        raise ContractError("compose_request result publication is not unique")
+    if assignment_counts[("candidate", constructor)] != 1:
         raise ContractError("compose_request candidate allocation is not unique")
+    for owner in ("envelope_image", "canonical_envelope_image"):
+        for value in ("null", "canonical_envelope_image"):
+            if assignment_counts[(owner, value)] > 1:
+                raise ContractError(
+                    "compose_request canonical image assignment is not unique"
+                )
 
     object_method_pattern = re.compile(
-        r"\b(result|candidate)\.([A-Za-z_][A-Za-z0-9_]*)\s*\("
+        r"\b(?:" + image_name_pattern + r")\s*\.\s*"
+        r"(?!bytes\b)[A-Za-z_][A-Za-z0-9_]*\s*\("
     )
     if object_method_pattern.search(compact):
         raise ContractError("compose_request calls an image mutator")
@@ -2329,34 +2464,52 @@ def _validate_compose_image_mutators(
         "candidate.bytes.push_back(merged_word[63-(i*8)-:8]);"
     )
     method_pattern = re.compile(
-        r"\b(candidate|result)\.bytes\.([A-Za-z_][A-Za-z0-9_]*)\s*\("
+        r"\b([A-Za-z_][A-Za-z0-9_]*)\.bytes\."
+        r"([A-Za-z_][A-Za-z0-9_]*)\s*\("
     )
     push_count = 0
     for match in method_pattern.finditer(compact):
+        owner = match.group(1)
+        if owner not in image_names:
+            raise ContractError(
+                f"compose_request references an undeclared image alias: {owner}"
+            )
         open_index = compact.find("(", match.start(), match.end())
         _, end = _balanced_delimited_text(compact, open_index, "(", ")")
         call = compact[match.start():end] + ";"
-        if call != canonical_push:
+        if owner != "candidate" or call != canonical_push:
             raise ContractError("compose_request has an unapproved image mutator")
         push_count += 1
-    if push_count != 1 or compact.count(canonical_push) != 1:
+    if push_count != 1:
         raise ContractError("compose_request merged output writer is not unique")
     if _normalise_sv_expr(merge_block).count(canonical_push) != 1:
         raise ContractError("compose_request merged output writer is outside merge loop")
 
     direct_assignment = re.compile(
-        r"\b(candidate|result)\.bytes\s*"
-        r"(?:<=|<<=|>>=|\|=|&=|\^=|\+=|-=|\*=|/=|%=|=)"
+        r"\b([A-Za-z_][A-Za-z0-9_]*)\.bytes\s*"
+        r"(?:<=|<<=|>>=|\|=|&=|\^=|\+=|-=|\*=|/=|%=|=(?!=))"
     )
-    if direct_assignment.search(compact):
+    for match in direct_assignment.finditer(compact):
+        owner = match.group(1)
+        if owner not in image_names:
+            raise ContractError(
+                f"compose_request references an undeclared image alias: {owner}"
+            )
         raise ContractError("compose_request assigns the image bytes container")
 
-    index_pattern = re.compile(r"\b(candidate|result)\.bytes\s*\[")
+    index_pattern = re.compile(
+        r"\b([A-Za-z_][A-Za-z0-9_]*)\.bytes\s*\["
+    )
     signature_writes = 0
     write_operators = re.compile(
-        r"^(?:<=|<<=|>>=|\|=|&=|\^=|\+=|-=|\*=|/=|%=|=|\+\+|--)"
+        r"^(?:<=|<<=|>>=|\|=|&=|\^=|\+=|-=|\*=|/=|%=|=(?!=)|\+\+|--)"
     )
     for match in index_pattern.finditer(compact):
+        owner = match.group(1)
+        if owner not in image_names:
+            raise ContractError(
+                f"compose_request references an undeclared image alias: {owner}"
+            )
         open_index = compact.find("[", match.start(), match.end())
         index_text, end = _balanced_delimited_text(compact, open_index, "[", "]")
         tail = compact[end:]
@@ -2365,7 +2518,7 @@ def _validate_compose_image_mutators(
             continue
         operator = operator_match.group()
         if (
-            match.group(1) == "candidate"
+            owner == "candidate"
             and index_text == "signature_byte"
             and operator == "="
         ):
@@ -2382,9 +2535,14 @@ def _validate_compose_image_mutators(
         raise ContractError("compose_request signature writer is not unique")
 
     prefix_update = re.compile(
-        r"(?:\+\+|--)\s*\b(candidate|result)\.bytes\s*\["
+        r"(?:\+\+|--)\s*\b([A-Za-z_][A-Za-z0-9_]*)\.bytes\s*\["
     )
-    if prefix_update.search(compact):
+    for match in prefix_update.finditer(compact):
+        owner = match.group(1)
+        if owner not in image_names:
+            raise ContractError(
+                f"compose_request references an undeclared image alias: {owner}"
+            )
         raise ContractError("compose_request has a prefix indexed image writer")
 
 
