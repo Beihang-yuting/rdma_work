@@ -1,36 +1,35 @@
-// 目录：测试层 unit/rdma_cmq_engine_models_test.sv。
-// 职责：验证 rdma_cmq_engine_models_test 对应模块的接口、错误路径和边界行为。
-// 依赖：依赖被测 package、UVM 测试基类和必要的 mock/fixture。
-// 所有权与生命周期：测试对象只拥有本地 fixture；外部后端句柄由测试环境提供并在测试结束释放。
+// 目录：测试层 tests/unit/rdma_cmq_engine_models_test.sv。
+// 职责：验证共享提交证据顺序，以及 CMQ model 的 validation 与 detached clone 契约。
+// 依赖：依赖 rdma_model_pkg 导出的真实 helper/model 和 UVM test/object/report 基础设施。
+// 所有权与生命周期：测试创建并持有本地 fixture 引用；UVM 在测试结束后统一回收对象。
 
-// 中文说明：rdma_cmq_engine_models_test.sv 属于单元测试，覆盖对应模型、编码器或执行器契约。
-// 阅读提示：先看公开类型和接口，再看实现细节；失败路径应保持状态与资源所有权可追踪。
-
+// 设计说明：该故障 fixture 专门让 validate() 返回 null，以覆盖 command 对异常 model 的拒绝路径。
 class rdma_cmq_null_status_body extends rdma_hw_model;
   `uvm_object_utils(rdma_cmq_null_status_body)
 
-  // 功能：构造 rdma_cmq_null_status_body，调用 super.new 建立 UVM 层级对象；外部依赖字段保持未绑定，后续由 configure/build/activate 明确注入。
-  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
-  // 失败/边界：rdma_cmq_null_status_body 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
+  // 功能：构造一个 validate() 恒返 null 的 CMQ 测试 body，并初始化 UVM object 名称。
+  // 输入/输出及副作用：name 传给 rdma_hw_model::new；不创建外部资源，也不设置业务字段。
+  // 失败/边界：允许空名称；构造过程不校验后续 command，故障只在 validate() 调用时可见。
   function new(string name = "rdma_cmq_null_status_body");
     super.new(name);
   endfunction
 
-  // 功能：validate 校验 当前对象字段 与当前对象状态的一致性，返回 rdma_status 供上层决定是否提交。
-  // 输入/输出及副作用：无显式参数；validate 读取固定返回值或局部计算结果，不使用对象成员字段；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：validate 输入对象为空或查找未命中时返回 null；该路径不隐式重试，也不转移未声明资源。
+  // 功能：注入非法的 null validation status，验证 command model 能拒绝异常 body 实现。
+  // 输入/输出及副作用：无输入；恒定返回 null，不读取或修改对象字段，也不发布其他诊断。
+  // 失败/边界：此返回值故意违反正常 rdma_hw_model 契约，仅供本单测的 INVALID_STATE 分支使用。
   virtual function rdma_status validate();
     return null;
   endfunction
 
-  // 功能：describe 把 当前对象字段 与当前对象的身份/状态字段编码为稳定文本，供日志、查找或恢复索引使用。
-  // 输入/输出及副作用：无显式参数；无显式输入；返回 string，只读取对象字段，不修改模型或资源账本。
-  // 失败/边界：枚举未定义或对象未配置时返回 UNKNOWN/UNCONFIGURED 表示，同时保留数值上下文。
+  // 功能：为 null-status 故障 body 返回稳定描述，供被测模型的诊断路径识别 fixture 意图。
+  // 输入/输出及副作用：无输入；返回固定 string，不读取或修改对象状态。
+  // 失败/边界：不根据配置或 validation 结果变化；即使 validate() 返回 null 仍可安全调用。
   virtual function string describe();
     return "CMQ test body returning null validation status";
   endfunction
 endclass
 
+// 设计说明：测试集中覆盖共享纯值 helper 和既有 CMQ value model，避免引入 mock 或外部 I/O。
 class rdma_cmq_engine_models_test extends uvm_test;
   `uvm_component_utils(rdma_cmq_engine_models_test)
 
@@ -38,18 +37,17 @@ class rdma_cmq_engine_models_test extends uvm_test;
     64'h1122_3344_5566_7788;
   localparam int unsigned TEST_GENERATION = 32'd7;
 
-  // 功能：构造 rdma_cmq_engine_models_test，调用 super.new 建立 UVM 层级对象；外部依赖字段保持未绑定，后续由 configure/build/activate 明确注入。
-  // 输入/输出及副作用：name、parent（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
-  // 失败/边界：rdma_cmq_engine_models_test 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
+  // 功能：构造 CMQ model 单元测试组件，并通过 UVM 基类建立名称和父子层级。
+  // 输入/输出及副作用：name 和 parent 传给 uvm_test::new；fixture 延迟到 run_phase 创建。
+  // 失败/边界：parent 可为 null 以作为顶层 test；构造阶段不执行断言、仿真事务或资源分配。
   function new(string name = "rdma_cmq_engine_models_test",
                uvm_component parent = null);
     super.new(name, parent);
   endfunction
 
-  // 功能：在 rdma_cmq_engine_models_test 中，expect_status 在测试中执行 expect_status 断言，比较输入结果与期望状态并报告可定位的失败信息。
-  // 输入/输出及副作用：check_name（输入）、status（输入）、expected_code（输入）；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT
-  //   转移未声明的资源所有权。
-  // 失败/边界：测试函数 expect_status 缺少前置对象时报告断言错误，并停止依赖该对象的后续检查。
+  // 功能：比较 model 返回的 status code 与手工期望，并用 check_name 标识失败分支。
+  // 输入/输出及副作用：读取 check_name、status 和 expected_code；不匹配时发布 UVM error。
+  // 失败/边界：status 为 null 时报告错误并立即返回；匹配时无输出且不修改 status。
   function automatic void expect_status(
     string check_name,
     rdma_status status,
@@ -66,9 +64,9 @@ class rdma_cmq_engine_models_test extends uvm_test;
                            status.convert2string()))
   endfunction
 
-  // 功能：make_function 创建独立的 rdma_function_handle；根据 name 设置字段 function_h、function_h.function_uid、function_h.object_id、function_h.generation，返回对象仅由调用方持有，不转移外部资源所有权。
-  // 输入/输出及副作用：name（输入）；make_function 读取 name 并使用字段 function_h、function_h.function_uid、function_h.object_id、function_h.generation；函数返回 rdma_function_handle，不取得调用方资源所有权。
-  // 失败/边界：make_function 的结果直接由 return function_h 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
+  // 功能：创建带固定 function_uid、object_id 和 generation 的 Function handle fixture。
+  // 输入/输出及副作用：name 用作 UVM object 名称；返回新 handle，由测试局部引用持有。
+  // 失败/边界：不校验 name；假定已注册 factory 返回非空对象，不建立 topology 或外部绑定。
   function automatic rdma_function_handle make_function(string name);
     rdma_function_handle function_h;
 
@@ -79,9 +77,9 @@ class rdma_cmq_engine_models_test extends uvm_test;
     return function_h;
   endfunction
 
-  // 功能：make_cmq 创建独立的 rdma_handle；根据 name、function_h 设置字段 cmq_h、cmq_h.kind、cmq_h.function_uid、cmq_h.object_id、cmq_h.generation，返回对象仅由调用方持有，不转移外部资源所有权。
-  // 输入/输出及副作用：name（输入）、function_h（输入）；make_cmq 读取 name、function_h 并使用字段 cmq_h、cmq_h.kind、cmq_h.function_uid、cmq_h.object_id、cmq_h.generation；函数返回 rdma_handle，不取得调用方资源所有权。
-  // 失败/边界：make_cmq 的结果直接由 return cmq_h 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
+  // 功能：按 Function fixture 的 uid/generation 创建固定 object_id 的 CMQ handle。
+  // 输入/输出及副作用：读取 name 和 function_h；返回新 handle，不修改输入 Function handle。
+  // 失败/边界：function_h 必须非空；helper 不做空值防护，也不建立真实 CMQ 资源。
   function automatic rdma_handle make_cmq(
     string name,
     rdma_function_handle function_h
@@ -96,9 +94,9 @@ class rdma_cmq_engine_models_test extends uvm_test;
     return cmq_h;
   endfunction
 
-  // 功能：make_key 把 name 与当前对象的身份/状态字段编码为稳定文本，供日志、查找或恢复索引使用。
-  // 输入/输出及副作用：name（输入）；make_key 读取 name 并使用字段 key、key.profile_name、key.opcode、key.variant；函数返回 rdma_cmq_opcode_key，不取得调用方资源所有权。
-// 失败/边界：make_key 只按函数体列出的身份、generation、kind、object_id 或 cursor 字段拼接键；调用方须先完成空句柄校验，函数本身不分配资源、不自动回退到 root0。
+  // 功能：创建 generic_profile/query 对应固定 opcode 的 CMQ opcode key fixture。
+  // 输入/输出及副作用：name 用作 UVM object 名称；返回新 key，不修改其他 fixture。
+  // 失败/边界：不校验 name；固定字段本身有效，错误分支由调用方后续 mutation 构造。
   function automatic rdma_cmq_opcode_key make_key(string name);
     rdma_cmq_opcode_key key;
 
@@ -109,9 +107,9 @@ class rdma_cmq_engine_models_test extends uvm_test;
     return key;
   endfunction
 
-  // 功能：make_body 创建独立的 rdma_cmq_sqe_model；根据 name、function_h、target_h 设置字段 body、body.opcode、body.command_id、body.function_h、body.target_h，返回对象仅由调用方持有，不转移外部资源所有权。
-  // 输入/输出及副作用：name（输入）、function_h（输入）、target_h（输入）；make_body 读取 name、function_h、target_h 并使用字段 body、body.opcode、body.command_id、body.function_h、body.target_h；函数返回 rdma_cmq_sqe_model，不取得调用方资源所有权。
-  // 失败/边界：make_body 的结果直接由 return body 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
+  // 功能：创建 QUERY SQE body fixture，并关联固定 command_id、Function 和 target handle。
+  // 输入/输出及副作用：读取 name、function_h、target_h；返回新 body，保存输入对象引用但不修改它们。
+  // 失败/边界：允许保存 null handle 供后续 validation 拒绝；helper 本身不验证 handle 世代或 kind。
   function automatic rdma_cmq_sqe_model make_body(
     string name,
     rdma_function_handle function_h,
@@ -127,9 +125,9 @@ class rdma_cmq_engine_models_test extends uvm_test;
     return body;
   endfunction
 
-  // 功能：make_image 根据 name、image_kind、byte_count、generation 生成或检查硬件镜像字段，保持布局、端序和保留位约束一致。
-  // 输入/输出及副作用：name（输入）、image_kind（输入）、byte_count（输入）、generation（输入）；make_image 读取 name、image_kind、byte_count、generation 并使用字段 image、image.length、image.alignment、image.endian、image.image_kind、image.hardware_version、image.function_generation、image.write_target_kind；函数返回 rdma_hw_image，不取得调用方资源所有权。
-  // 失败/边界：make_image 的结果直接由 return image 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
+  // 功能：创建由 8'h5a 填充的硬件 image fixture，并设置长度、对齐、端序、kind 和 generation。
+  // 输入/输出及副作用：读取 name、image_kind、byte_count、generation；返回新 image 和独立 bytes。
+  // 失败/边界：byte_count 为零时返回空 bytes；不验证 kind/长度组合，错误 metadata 由 validate 拒绝。
   function automatic rdma_hw_image make_image(
     string name,
     rdma_image_kind_e image_kind,
@@ -154,9 +152,9 @@ class rdma_cmq_engine_models_test extends uvm_test;
     return image;
   endfunction
 
-  // 功能：make_ticket 创建独立的 rdma_cmq_ticket；根据 name、function_h、cmq_h、opcode_key 设置字段 ticket、ticket.command_id、ticket.function_h、ticket.cmq_h、ticket.slot_sequence、ticket.sq_index、ticket.sq_wrap、ticket.opcode_key、ticket.absolute_deadline，返回对象仅由调用方持有，不转移外部资源所有权。
-  // 输入/输出及副作用：name（输入）、function_h（输入）、cmq_h（输入）、opcode_key（输入）；make_ticket 读取 name、function_h、cmq_h、opcode_key 并使用字段 ticket、ticket.command_id、ticket.function_h、ticket.cmq_h、ticket.slot_sequence、ticket.sq_index、ticket.sq_wrap、ticket.opcode_key；函数返回 rdma_cmq_ticket，不取得调用方资源所有权。
-  // 失败/边界：make_ticket 的结果直接由 return ticket 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
+  // 功能：创建固定 command/slot/deadline 的 CMQ ticket fixture，并关联 Function、CMQ 和 opcode key。
+  // 输入/输出及副作用：读取 name 及三个对象引用；返回新 ticket，不克隆或修改输入对象。
+  // 失败/边界：允许保存 null 引用供 ticket.validate() 拒绝；helper 不检查世代、slot 或 deadline。
   function automatic rdma_cmq_ticket make_ticket(
     string name,
     rdma_function_handle function_h,
@@ -177,9 +175,46 @@ class rdma_cmq_engine_models_test extends uvm_test;
     return ticket;
   endfunction
 
-  // 功能：在 rdma_cmq_engine_models_test 中，run_phase 驱动 UVM 阶段中的场景初始化、事务执行和断言收尾，并在退出前释放 objection 或测试资源。
-  // 输入/输出及副作用：phase（输入）；phase 由 UVM 提供；task 通过 objection、日志和断言暴露结果，可能调用 DUT 接口但不改变其所有权规则。
-  // 失败/边界：run_phase 的 setup/阶段驱动失败时停止新增事务，并按测试生命周期清理 objection 与临时引用。
+  // 功能：检查共享 submission effect helper 只允许副作用阶段前进，并保持两个终止分支闭合。
+  // 输入/输出及副作用：无显式输入或返回值；调用真实 helper，并通过 UVM error 发布失败结果。
+  // 失败/边界：阶段回退、终止分支重开以及 before/after 含 X/Z 时均必须被 helper 拒绝。
+  function automatic void check_submission_effect_ordering();
+    rdma_submission_effect_e unknown_effect;
+
+    if (!rdma_submission_effect_is_monotonic(
+          RDMA_SUBMIT_EFFECT_HOST_MEMORY_WRITTEN,
+          RDMA_SUBMIT_EFFECT_MMIO_MAYBE_VISIBLE))
+      `uvm_error("EFFECT_FORWARD", "forward effect was rejected")
+
+    if (rdma_submission_effect_is_monotonic(
+          RDMA_SUBMIT_EFFECT_MMIO_MAYBE_VISIBLE,
+          RDMA_SUBMIT_EFFECT_HOST_MEMORY_ORDERED))
+      `uvm_error("EFFECT_REGRESSION", "effect regression was accepted")
+
+    if (rdma_submission_effect_is_monotonic(
+          RDMA_SUBMIT_EFFECT_PRE_SUBMIT_REJECTED,
+          RDMA_SUBMIT_EFFECT_HOST_MEMORY_MAYBE_VISIBLE))
+      `uvm_error("EFFECT_TERMINAL", "pre-submit rejection was reopened")
+
+    if (rdma_submission_effect_is_monotonic(
+          RDMA_SUBMIT_EFFECT_UNOBSERVED,
+          RDMA_SUBMIT_EFFECT_MMIO_VISIBLE))
+      `uvm_error("EFFECT_UNOBSERVED", "unknown evidence was promoted")
+
+    unknown_effect = rdma_submission_effect_e'(3'bx);
+
+    if (rdma_submission_effect_is_monotonic(
+          unknown_effect,
+          RDMA_SUBMIT_EFFECT_MMIO_VISIBLE) ||
+        rdma_submission_effect_is_monotonic(
+          RDMA_SUBMIT_EFFECT_HOST_MEMORY_WRITTEN,
+          unknown_effect))
+      `uvm_error("EFFECT_X", "four-state unknown evidence was accepted")
+  endfunction
+
+  // 功能：驱动 CMQ 模型 fixture、校验 submission effect 顺序，并验证对象校验与深拷贝契约。
+  // 输入/输出及副作用：phase 由 UVM 提供；task 持有 objection，调用断言并在结束时释放。
+  // 失败/边界：任一 ordering、validation 或 snapshot 契约失败均产生 UVM error；不接管 DUT 资源。
   task run_phase(uvm_phase phase);
     rdma_function_handle function_h;
     rdma_handle cmq_h;
@@ -214,6 +249,10 @@ class rdma_cmq_engine_models_test extends uvm_test;
 
     phase.raise_objection(this);
 
+    // 先校验独立的共享纯值契约，ordering 检查不依赖后续 CMQ object fixture。
+    check_submission_effect_ordering();
+
+    // 初始化一组有效且相互关联的 CMQ model，随后逐字段注入 validation 错误。
     function_h = make_function("function_h");
     cmq_h = make_cmq("cmq_h", function_h);
     key = make_key("key");
@@ -293,6 +332,7 @@ class rdma_cmq_engine_models_test extends uvm_test;
     runtime_desc.initial_cq_owner = 1'b1;
     runtime_desc.initial_doorbell_polarity = 1'b0;
 
+    // 先确认有效基线，再短暂修改单一字段覆盖各 model 的拒绝与恢复边界。
     expect_status("KEY_VALID", key.validate(), RDMA_SC_OK);
     expect_status("COMMAND_VALID", command.validate(), RDMA_SC_OK);
     expect_status("SLOT_VALID", slot.validate(), RDMA_SC_OK);
@@ -476,6 +516,7 @@ class rdma_cmq_engine_models_test extends uvm_test;
                   RDMA_SC_DMA_TRANSLATION);
     runtime_desc.cq_iova.value = 64'h0000_0001_2000_0800;
 
+    // 对每个值对象执行真实 clone，并先确认动态类型和嵌套引用均已 detached。
     cloned_object = key.clone();
     if (!$cast(key_snapshot, cloned_object))
       `uvm_error("KEY_CLONE", "opcode key clone has wrong type")
@@ -567,6 +608,7 @@ class rdma_cmq_engine_models_test extends uvm_test;
       `uvm_error("RUNTIME_DEEP_COPY",
                  "runtime descriptor handles alias the source")
 
+    // 修改所有源对象后，用手工 literal 证明已发布 snapshot 不受源图变化影响。
     function_h.generation++;
     cmq_h.object_id++;
     key.profile_name = "mutated_profile";

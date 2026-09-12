@@ -602,7 +602,7 @@ mask/capability 又移动所有 codec。
 `PRE_SUBMIT_REJECTED` 是未进入副作用路径的终止分支，不与后续阶段互转：
 
 ```systemverilog
-typedef enum bit [2:0] {
+typedef enum logic [2:0] {
   RDMA_SUBMIT_EFFECT_UNOBSERVED,
   RDMA_SUBMIT_EFFECT_PRE_SUBMIT_REJECTED,
   RDMA_SUBMIT_EFFECT_HOST_MEMORY_MAYBE_VISIBLE,
@@ -612,6 +612,9 @@ typedef enum bit [2:0] {
   RDMA_SUBMIT_EFFECT_MMIO_VISIBLE
 } rdma_submission_effect_e;
 ```
+
+这里有意使用四态 `logic` 基类型：持久化及恢复路径可见的 evidence 必须拒绝 X/Z，
+不能把未知值静默转换为 `UNOBSERVED`。
 
 跨引擎只共享这个副作用词汇和纯值校验，不共享 command、ticket、completion 或
 recovery ledger。每个 engine 仍定义自己的 execution result 和状态机。
