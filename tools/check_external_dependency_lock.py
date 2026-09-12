@@ -284,7 +284,7 @@ def verify(rows: list[Row], dependency: str, root_text: str) -> None:
             if ignored:
                 raise ValueError("untracked or ignored include shadow")
     else:
-        if group[0].git_commit != "-" or tree_digest(root, actual) != group[0].tree:
+        if tree_digest(root, actual) != group[0].tree:
             raise ValueError("snapshot identity drift")
 
 

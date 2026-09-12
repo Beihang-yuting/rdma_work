@@ -42,3 +42,19 @@ python3 -m py_compile tools/check_external_dependency_lock.py                   
 bash -n scripts/run_vcs53.sh                                                       PASS
 git diff --check                                                                   PASS
 ```
+
+## Fix round 2
+
+快照校验不再要求 approved 行的 `git_commit` 为 `-`；approved schema 继续保留
+40-hex provenance，非 Git 模式仅依据精确闭包、逐文件摘要和 canonical tree digest。
+新增 approved plain-snapshot 匹配与文件漂移回归。
+
+验证：
+
+```text
+python3 -m unittest tests.unit.test_external_dependency_lock tests.unit.test_run_vcs53_sync -v  PASS (8 tests)
+python3 -m unittest discover -s tests/unit -p 'test_*.py'                           PASS (236 tests)
+python3 -m py_compile tools/check_external_dependency_lock.py                      PASS
+bash -n scripts/run_vcs53.sh                                                       PASS
+git diff --check                                                                   PASS
+```
