@@ -406,6 +406,9 @@ class rdma_mock_cmq_port extends rdma_cmq_port;
   protected bit [7:0] gated_opcode;
   protected int unsigned gate_target_count;
   protected int unsigned gate_entered_count;
+  // 中文设计：该 shared seam 仅描述最近一次 legacy execute() 在 mock 内部是否
+  // 可证明地未写入 call ledger；Phase 1A observed fallback 不读取它，避免把
+  // mock 专属证据误提升为通用 lifecycle observation，1B consumer 迁移前保留。
   // Evidence is scoped to the most recent execute() call.  It is asserted
   // only on mock adapter paths that return before recording a CMQ call.
   protected bit last_execute_no_submit_proven;

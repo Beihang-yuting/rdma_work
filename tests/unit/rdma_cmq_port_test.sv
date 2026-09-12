@@ -24,6 +24,171 @@ class rdma_cmq_late_pair_probe extends rdma_cmq_engine_probe;
   endfunction
 endclass
 
+// 设计说明：该 payload 是 legacy port 允许直接按字段复制的最小已知测试类型，
+// 用来区分 base fallback 的保守拒绝与子类明确授予的复制能力。
+class rdma_legacy_direct_payload extends uvm_object;
+  `uvm_object_utils(rdma_legacy_direct_payload)
+
+  int unsigned value;
+
+  // 功能：构造 legacy decoded-response fixture，并把可观察数值初始化为零。
+  // 输入/输出及副作用：name 传给 uvm_object；仅写入本对象拥有的 value 字段。
+  // 失败/边界：默认值不是有效完成语义；构造不申请 factory、DMA 或外部资源。
+  function new(string name = "rdma_legacy_direct_payload");
+    super.new(name);
+    value = 0;
+  endfunction
+endclass
+
+// 设计说明：该端口只实现遗留 execute()，用输出和输入的主动突变证明 base
+// wrapper 必须先捕获 command/owner，且必须把遗留返回图复制为独立值。
+class rdma_legacy_only_cmq_port extends rdma_mock_cmq_port;
+  `uvm_object_utils(rdma_legacy_only_cmq_port)
+
+  int unsigned execute_calls;
+  rdma_cmq_ticket source_ticket;
+  rdma_cmq_completion source_completion;
+  rdma_status source_status;
+  rdma_status returned_status;
+
+  // 功能：构造 legacy-only CMQ port，并清空预置返回图与调用计数。
+  // 输入/输出及副作用：name 传给父类；初始化本测试 adapter 自己拥有的引用槽位。
+  // 失败/边界：未先 configure_response 时 execute 返回全空遗留输出；不接管 command。
+  function new(string name = "rdma_legacy_only_cmq_port");
+    super.new(name);
+    execute_calls = 0;
+    source_ticket = null;
+    source_completion = null;
+    source_status = null;
+    returned_status = null;
+  endfunction
+
+  // 功能：在 factory 故障窗口前建立固定的 legacy ticket/status/completion 返回图。
+  // 输入/输出及副作用：command、code、with_completion、null_status 和 payload 为输入；
+  //   写入本 port 的 source 输出，正常 completion 的 outer 与 nested handle 保持别名。
+  // 失败/边界：ticket/completion 构建失败时相关输出保持 null；null_status 只使
+  //   execute 的 status 输出为空，不改变 completion 内部的已构造 status。
+  function void configure_response(
+    rdma_cmq_command_desc command,
+    rdma_status_code_e code,
+    bit with_completion,
+    bit null_status,
+    uvm_object payload = null
+  );
+    rdma_status build_status;
+
+    source_ticket = null;
+    source_completion = null;
+    source_status = null;
+    returned_status = null;
+    build_status = rdma_cmq_direct_status(code, "legacy test response");
+    if (make_ticket(command, 64'h5501, source_ticket) == null ||
+        source_ticket == null)
+      return;
+    if (with_completion) begin
+      source_completion = make_completion(
+        source_ticket, build_status,
+        !(code inside {RDMA_SC_TIMEOUT, RDMA_SC_RESET_CANCELLED})
+      );
+      if (source_completion == null)
+        return;
+      source_completion.decoded_response = payload;
+      source_ticket = source_completion.ticket;
+      source_status = source_completion.status;
+    end
+    else begin
+      source_status = build_status;
+    end
+    returned_status = null_status ? null : source_status;
+  endfunction
+
+  // 功能：在 execute 返回后故意改写遗留输出图，验证 observed wrapper 不泄露源引用。
+  // 输入/输出及副作用：无显式输入；修改本 port 保留的 ticket/status/completion/payload。
+  // 失败/边界：任一可选节点为空时跳过该节点；该测试故障注入不释放外部资源。
+  task automatic mutate_outputs_after_return();
+    rdma_legacy_direct_payload payload;
+
+    #1ns;
+    if (source_ticket != null)
+      source_ticket.command_id = 64'hdead;
+    if (source_status != null) begin
+      source_status.code = RDMA_SC_INVALID_STATE;
+      source_status.message = "legacy output mutated after return";
+    end
+    if (source_completion != null) begin
+      source_completion.raw_cqe = null;
+      if ($cast(payload, source_completion.decoded_response))
+        payload.value++;
+    end
+  endtask
+
+  // 功能：返回预置 legacy 输出，并主动改写 caller command/owner 以覆盖 dispatch 前快照。
+  // 输入/输出及副作用：command 为输入，ticket/completion/status 为输出；递增 execute_calls，
+  //   同步污染 command 图，并异步污染本 port 保留的遗留输出图。
+  // 失败/边界：未配置 source 时输出可为空；该 adapter 不提供 lifecycle 提交证据。
+  virtual task execute(
+    rdma_cmq_command_desc command,
+    output rdma_cmq_ticket ticket,
+    output rdma_cmq_completion completion,
+    output rdma_status status
+  );
+    execute_calls++;
+    ticket = source_ticket;
+    completion = source_completion;
+    status = returned_status;
+    if (command != null) begin
+      if (command.function_h != null)
+        command.function_h.function_uid++;
+      if (command.opcode_key != null)
+        command.opcode_key.profile_name = "legacy_mutated_profile";
+      if (command.recovery_owner != null)
+        command.recovery_owner.workflow = RDMA_CMQ_WORKFLOW_INVALID;
+    end
+    fork
+      mutate_outputs_after_return();
+    join_none
+  endtask
+endclass
+
+// 设计说明：该子类只为已知 test payload 开放直接字段复制，证明 base hook
+// 默认拒绝任意非空 decoded response，而兼容 adapter 可以显式收窄其能力。
+class rdma_legacy_payload_cmq_port extends rdma_legacy_only_cmq_port;
+  `uvm_object_utils(rdma_legacy_payload_cmq_port)
+
+  // 功能：构造带明确 payload 复制能力的 legacy test port。
+  // 输入/输出及副作用：name 传给父类；不创建外部资源，也不改变预置输出。
+  // 失败/边界：仅本子类的 hook 扩展复制能力，不改变 base execute 的生命周期语义。
+  function new(string name = "rdma_legacy_payload_cmq_port");
+    super.new(name);
+  endfunction
+
+  // 功能：将唯一支持的 legacy test payload 直接复制为 detached decoded response。
+  // 输入/输出及副作用：source 为输入，snapshot/failure_reason 为输出；成功时 new 一个
+  //   payload 并复制 value，不调用 clone、factory 或 profile/engine 服务。
+  // 失败/边界：null source 是成功的 null 输出；未知 runtime type 清空输出并给出稳定原因。
+  protected virtual function bit try_snapshot_legacy_decoded_response(
+    input uvm_object source,
+    output uvm_object snapshot,
+    output string failure_reason
+  );
+    rdma_legacy_direct_payload source_payload;
+    rdma_legacy_direct_payload snapshot_payload;
+
+    snapshot = null;
+    failure_reason = "";
+    if (source == null)
+      return 1'b1;
+    if (!$cast(source_payload, source)) begin
+      failure_reason = "legacy test payload runtime type is unsupported";
+      return 1'b0;
+    end
+    snapshot_payload = new("legacy_direct_payload_snapshot");
+    snapshot_payload.value = source_payload.value;
+    snapshot = snapshot_payload;
+    return 1'b1;
+  endfunction
+endclass
+
 class rdma_cmq_port_test extends rdma_cmq_engine_test;
   `uvm_component_utils(rdma_cmq_port_test)
 
@@ -996,11 +1161,237 @@ class rdma_cmq_port_test extends rdma_cmq_engine_test;
     end
   endtask
 
+  // 功能：验证 base port 对仅有 execute() 的 legacy adapter 只发布 detached、
+  //   UNOBSERVED 结果，并在 payload、状态和 raw-factory 异常下保留独立字段。
+  // 输入/输出及副作用：无显式输入；构造 legacy adapter、command、completion 和
+  //   raw-factory fault wrapper，调用真实 execute_observed 并发布 UVM assertion。
+  // 失败/边界：null/timeout/reset status、缺失或未支持 payload、输入/输出突变和
+  //   null/wrong-type factory 均必须保守降级；任何不符都报告 UVM_ERROR。
+  task automatic check_legacy_observed_fallback();
+    rdma_function_binding binding;
+    rdma_cmq_command_desc command;
+    rdma_cmq_port port;
+    rdma_legacy_only_cmq_port legacy_port;
+    rdma_legacy_payload_cmq_port payload_port;
+    rdma_legacy_direct_payload source_payload;
+    rdma_legacy_direct_payload result_payload;
+    rdma_cmq_execution_result result;
+    uvm_factory factory;
+    rdma_cmq_value_factory_fault_wrapper result_fault;
+    rdma_cmq_value_factory_fault_wrapper status_fault;
+    rdma_cmq_value_factory_fault_wrapper ticket_fault;
+    rdma_cmq_value_factory_fault_wrapper image_fault;
+    rdma_cmq_value_factory_fault_wrapper completion_fault;
+    longint unsigned expected_uid;
+    string expected_profile;
+
+    binding = make_binding("legacy_observed_binding", RDMA_BIND_ACTIVE);
+
+    command = make_command(
+      "legacy_observed_normal", binding, RDMA_OP_CQC_QUERY, 8'h91, 1us
+    );
+    expected_uid = command.function_h.function_uid;
+    expected_profile = command.opcode_key.profile_name;
+    legacy_port = new("legacy_observed_normal_port");
+    legacy_port.configure_response(command, RDMA_SC_OK, 1'b1, 1'b0);
+    port = legacy_port;
+    port.execute_observed(command, result);
+    if (legacy_port.execute_calls != 1 || result == null ||
+        result.status == null || result.observation_status == null ||
+        result.submission_effect != RDMA_SUBMIT_EFFECT_UNOBSERVED)
+      `uvm_error("PORT_OBSERVED_FALLBACK", "legacy fallback is incomplete")
+    if (result.completion == null || result.ticket == null ||
+        result.command_identity == null || result.recovery_owner == null ||
+        result.status.code != RDMA_SC_OK ||
+        result.observation_status.code != RDMA_SC_OK ||
+        result.completion_phase != RDMA_CMQ_COMPLETION_UNOBSERVED ||
+        result.attempt_effect != RDMA_SUBMIT_EFFECT_UNOBSERVED ||
+        !result.recovery_required || result.dma_context != null ||
+        result.batch_key != "" || result.batch_id != 0 || result.attempt_id != 0)
+      `uvm_error("PORT_OBSERVED_NORMAL", "legacy result classification is wrong")
+    if (result.command_identity.function_uid != expected_uid ||
+        result.command_identity.profile_name != expected_profile ||
+        !result.recovery_owner.is_legacy_unmigrated() ||
+        result.ticket == legacy_port.source_ticket ||
+        result.status == legacy_port.source_status ||
+        result.ticket != result.completion.ticket ||
+        result.status != result.completion.status)
+      `uvm_error("PORT_OBSERVED_DETACH", "pre-dispatch or alias snapshot is wrong")
+    #1ns;
+    if (result.ticket.command_id != 64'h5501 ||
+        result.status.code != RDMA_SC_OK || result.completion.raw_cqe == null)
+      `uvm_error("PORT_OBSERVED_POST_RETURN", "legacy output mutation leaked")
+
+    command = make_command(
+      "legacy_observed_null_completion", binding, RDMA_OP_CQC_QUERY, 8'h92,
+      1us
+    );
+    legacy_port = new("legacy_observed_null_completion_port");
+    legacy_port.configure_response(command, RDMA_SC_OK, 1'b0, 1'b0);
+    port = legacy_port;
+    port.execute_observed(command, result);
+    if (result == null || result.ticket == null || result.completion != null ||
+        result.status == null || result.status.code != RDMA_SC_OK ||
+        result.observation_status == null ||
+        result.observation_status.code != RDMA_SC_OK ||
+        result.completion_phase != RDMA_CMQ_COMPLETION_UNOBSERVED)
+      `uvm_error("PORT_OBSERVED_NULL_COMPLETION",
+                 "null legacy completion was not retained as unobserved")
+    #1ns;
+
+    command = make_command(
+      "legacy_observed_null_status", binding, RDMA_OP_CQC_QUERY, 8'h93, 1us
+    );
+    legacy_port = new("legacy_observed_null_status_port");
+    legacy_port.configure_response(command, RDMA_SC_OK, 1'b0, 1'b1);
+    port = legacy_port;
+    port.execute_observed(command, result);
+    if (result == null || result.status == null ||
+        result.observation_status == null ||
+        result.status.code != RDMA_SC_INVALID_STATE ||
+        result.observation_status.code != RDMA_SC_INVALID_STATE ||
+        result.completion_phase != RDMA_CMQ_COMPLETION_UNOBSERVED)
+      `uvm_error("PORT_OBSERVED_NULL_STATUS",
+                 "null legacy status did not become INVALID_STATE")
+    #1ns;
+
+    command = make_command(
+      "legacy_observed_timeout", binding, RDMA_OP_CQC_QUERY, 8'h94, 1us
+    );
+    legacy_port = new("legacy_observed_timeout_port");
+    legacy_port.configure_response(command, RDMA_SC_TIMEOUT, 1'b1, 1'b0);
+    port = legacy_port;
+    port.execute_observed(command, result);
+    if (result == null || result.completion == null || result.status == null ||
+        result.status.code != RDMA_SC_TIMEOUT ||
+        result.completion_phase != RDMA_CMQ_COMPLETION_UNOBSERVED)
+      `uvm_error("PORT_OBSERVED_TIMEOUT",
+                 "legacy timeout inferred an observed lifecycle phase")
+    #1ns;
+
+    command = make_command(
+      "legacy_observed_reset", binding, RDMA_OP_CQC_QUERY, 8'h95, 1us
+    );
+    legacy_port = new("legacy_observed_reset_port");
+    legacy_port.configure_response(
+      command, RDMA_SC_RESET_CANCELLED, 1'b1, 1'b0
+    );
+    port = legacy_port;
+    port.execute_observed(command, result);
+    if (result == null || result.completion == null || result.status == null ||
+        result.status.code != RDMA_SC_RESET_CANCELLED ||
+        result.completion_phase != RDMA_CMQ_COMPLETION_UNOBSERVED)
+      `uvm_error("PORT_OBSERVED_RESET",
+                 "legacy reset inferred an observed lifecycle phase")
+    #1ns;
+
+    command = make_command(
+      "legacy_observed_unsupported_payload", binding, RDMA_OP_CQC_QUERY,
+      8'h96, 1us
+    );
+    source_payload = new("legacy_unsupported_payload");
+    source_payload.value = 32'h96;
+    legacy_port = new("legacy_observed_unsupported_payload_port");
+    legacy_port.configure_response(
+      command, RDMA_SC_OK, 1'b1, 1'b0, source_payload
+    );
+    port = legacy_port;
+    port.execute_observed(command, result);
+    if (result == null || result.ticket == null || result.status == null ||
+        result.status.code != RDMA_SC_OK || result.completion != null ||
+        result.observation_status == null ||
+        result.observation_status.code != RDMA_SC_INVALID_STATE ||
+        result.submission_effect != RDMA_SUBMIT_EFFECT_UNOBSERVED)
+      `uvm_error("PORT_OBSERVED_UNSUPPORTED_PAYLOAD",
+                 "unsupported payload erased outer legacy snapshots")
+    #1ns;
+
+    command = make_command(
+      "legacy_observed_supported_payload", binding, RDMA_OP_CQC_QUERY,
+      8'h97, 1us
+    );
+    source_payload = new("legacy_supported_payload");
+    source_payload.value = 32'h97;
+    payload_port = new("legacy_observed_supported_payload_port");
+    payload_port.configure_response(
+      command, RDMA_SC_OK, 1'b1, 1'b0, source_payload
+    );
+    port = payload_port;
+    port.execute_observed(command, result);
+    if (result == null || result.completion == null ||
+        !$cast(result_payload, result.completion.decoded_response) ||
+        result_payload == source_payload || result_payload.value != 32'h97 ||
+        result.ticket != result.completion.ticket ||
+        result.status != result.completion.status)
+      `uvm_error("PORT_OBSERVED_SUPPORTED_PAYLOAD",
+                 "explicit payload hook did not retain detached aliases")
+    #1ns;
+    if (result_payload.value != 32'h97)
+      `uvm_error("PORT_OBSERVED_PAYLOAD_MUTATION",
+                 "legacy payload mutation leaked into result")
+
+    factory = uvm_factory::get();
+    result_fault = new(
+      "legacy_execution_result_fault", rdma_cmq_execution_result::get_type()
+    );
+    status_fault = new("legacy_status_fault", rdma_status::get_type());
+    ticket_fault = new("legacy_ticket_fault", rdma_cmq_ticket::get_type());
+    image_fault = new("legacy_image_fault", rdma_hw_image::get_type());
+    completion_fault = new(
+      "legacy_completion_fault", rdma_cmq_completion::get_type()
+    );
+    factory.set_type_override_by_type(
+      rdma_cmq_execution_result::get_type(), result_fault, 1'b1
+    );
+    factory.set_type_override_by_type(
+      rdma_status::get_type(), status_fault, 1'b1
+    );
+    factory.set_type_override_by_type(
+      rdma_cmq_ticket::get_type(), ticket_fault, 1'b1
+    );
+    factory.set_type_override_by_type(
+      rdma_hw_image::get_type(), image_fault, 1'b1
+    );
+    factory.set_type_override_by_type(
+      rdma_cmq_completion::get_type(), completion_fault, 1'b1
+    );
+    for (int unsigned wrong_type = 0; wrong_type < 2; wrong_type++) begin
+      command = make_command(
+        $sformatf("legacy_observed_factory_%0d", wrong_type), binding,
+        RDMA_OP_CQC_QUERY, 8'ha0 + wrong_type, 1us
+      );
+      legacy_port = new($sformatf("legacy_observed_factory_port_%0d",
+                                  wrong_type));
+      legacy_port.configure_response(command, RDMA_SC_OK, 1'b1, 1'b0);
+      result_fault.arm(wrong_type);
+      status_fault.arm(wrong_type);
+      ticket_fault.arm(wrong_type);
+      image_fault.arm(wrong_type);
+      completion_fault.arm(wrong_type);
+      port = legacy_port;
+      port.execute_observed(command, result);
+      if (result == null || result.status == null ||
+          result.observation_status == null || result.ticket == null ||
+          result.completion == null || result_fault.call_count() != 0 ||
+          status_fault.call_count() != 0 || ticket_fault.call_count() != 0 ||
+          image_fault.call_count() != 0 || completion_fault.call_count() != 0)
+        `uvm_error("PORT_OBSERVED_FACTORY",
+                   "legacy fallback entered a raw factory fault wrapper")
+      result_fault.disarm();
+      status_fault.disarm();
+      ticket_fault.disarm();
+      image_fault.disarm();
+      completion_fault.disarm();
+      #1ns;
+    end
+  endtask
+
   // 功能：在 rdma_cmq_port_test 中，run_phase 驱动 UVM 阶段中的场景初始化、事务执行和断言收尾，并在退出前释放 objection 或测试资源。
   // 输入/输出及副作用：phase（输入）；phase 由 UVM 提供；task 通过 objection、日志和断言暴露结果，可能调用 DUT 接口但不改变其所有权规则。
   // 失败/边界：run_phase 的 setup/阶段驱动失败时停止新增事务，并按测试生命周期清理 objection 与临时引用。
   virtual task run_phase(uvm_phase phase);
     phase.raise_objection(this);
+    check_legacy_observed_fallback();
     check_mock_rejects_hostile_command_snapshots();
     check_mock_fifo_status_and_reconcile();
     check_mock_gate_prerelease();
