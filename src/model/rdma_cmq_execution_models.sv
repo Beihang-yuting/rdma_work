@@ -156,17 +156,21 @@ endclass
 // factory 的 validate()/clone()/copy()。nonfatal snapshot 由此可在 hostile
 // factory 窗口内先完整拒绝坏图，再直接构造候选值。
 
-// 功能：判断 handle 的运行时类型是否属于可稳定复制的 base/Function 两种值类型。
+// 功能：按唯一 UVM wrapper 判断 handle 是否为可复制的 base/Function 注册值类型。
 // 输入/输出及副作用：source 为只读输入；返回类型是否受支持，不修改对象。
-// 失败/边界：null、未知子类以及把非 Function kind 放入 Function 子类时返回 0。
+// 失败/边界：null、wrapper 不匹配的注册子类以及把非 Function kind 放入
+//   Function 类型时返回 0；不信任可覆盖的 get_type_name 字符串。
 function automatic bit rdma_cmq_direct_handle_type_supported(
   input rdma_handle source
 );
+  uvm_object_wrapper source_type;
+
   if (source == null)
     return 1'b0;
-  if (source.get_type_name() == "rdma_function_handle")
+  source_type = source.get_object_type();
+  if (source_type == rdma_function_handle::get_type())
     return source.kind == RDMA_RESOURCE_FUNCTION;
-  return source.get_type_name() == "rdma_handle";
+  return source_type == rdma_handle::get_type();
 endfunction
 
 // 功能：直接复制一个 handle 值并保留 exact base 或 Function runtime subtype。
@@ -186,7 +190,7 @@ function automatic bit rdma_cmq_try_snapshot_handle_direct(
   if (!rdma_cmq_direct_handle_type_supported(source))
     return 1'b0;
 
-  if (source.get_type_name() == "rdma_function_handle") begin
+  if (source.get_object_type() == rdma_function_handle::get_type()) begin
     function_snapshot = new("direct_function_handle_snapshot");
     candidate = function_snapshot;
   end
@@ -248,7 +252,7 @@ endfunction
 
 // 功能：直接复制 CMQ opcode key 的 profile、opcode 与 variant 值。
 // 输入/输出及副作用：source 为输入，snapshot 为输出；成功发布 detached key。
-// 失败/边界：输出先清空；非法 key 或未知 runtime subtype 原子失败。
+// 失败/边界：输出先清空；非法 key 或 wrapper 不匹配的注册子类原子失败。
 function automatic bit rdma_cmq_try_snapshot_opcode_key_direct(
   input rdma_cmq_opcode_key source,
   output rdma_cmq_opcode_key snapshot
@@ -257,7 +261,7 @@ function automatic bit rdma_cmq_try_snapshot_opcode_key_direct(
 
   snapshot = null;
   if (!rdma_cmq_opcode_key_shape_valid(source) ||
-      source.get_type_name() != "rdma_cmq_opcode_key")
+      source.get_object_type() != rdma_cmq_opcode_key::get_type())
     return 1'b0;
   candidate = new("direct_cmq_opcode_key_snapshot");
   candidate.profile_name = source.profile_name;
@@ -269,15 +273,17 @@ endfunction
 
 // 功能：不经 factory 检查 ticket 的句柄、位置、deadline 与 opcode 值关系。
 // 输入/输出及副作用：ticket 为只读输入；返回形状是否完整，不保留其引用。
-// 失败/边界：null/未知 subtype、零 ID/deadline、坏句柄或 SQ 序列不一致返回 0。
+// 失败/边界：null/wrapper 不匹配的注册子类、零 ID/deadline、坏句柄或
+//   SQ 序列不一致返回 0。
 function automatic bit rdma_cmq_ticket_shape_valid(
   input rdma_cmq_ticket ticket
 );
-  if (ticket == null || ticket.get_type_name() != "rdma_cmq_ticket" ||
+  if (ticket == null ||
+      ticket.get_object_type() != rdma_cmq_ticket::get_type() ||
       ticket.command_id == 0 || ticket.absolute_deadline == 0 ||
       ticket.function_h == null || ticket.cmq_h == null ||
       !rdma_cmq_direct_handle_type_supported(ticket.function_h) ||
-      ticket.function_h.get_type_name() != "rdma_function_handle" ||
+      ticket.function_h.get_object_type() != rdma_function_handle::get_type() ||
       !rdma_cmq_direct_handle_type_supported(ticket.cmq_h) ||
       ticket.function_h.kind != RDMA_RESOURCE_FUNCTION ||
       ticket.function_h.generation == 0 ||
@@ -293,10 +299,11 @@ endfunction
 
 // 功能：检查通用 hardware image 的 V1 可序列化元数据与 byte length。
 // 输入/输出及副作用：image 为只读输入；返回 bit，不修改 bytes/summary。
-// 失败/边界：null、未知 subtype、长度不符、零 alignment/version/generation 或
-//   未支持 endian/image/target 编码时返回 0。
+// 失败/边界：null、wrapper 不匹配的注册子类、长度不符、零
+//   alignment/version/generation 或未支持 endian/image/target 编码时返回 0。
 function automatic bit rdma_cmq_image_shape_valid(input rdma_hw_image image);
-  if (image == null || image.get_type_name() != "rdma_hw_image" ||
+  if (image == null ||
+      image.get_object_type() != rdma_hw_image::get_type() ||
       image.length != image.bytes.size() || image.alignment == 0 ||
       image.hardware_version == 0 || image.function_generation == 0)
     return 1'b0;
@@ -349,12 +356,13 @@ endfunction
 
 // 功能：不经 status/factory 校验具体 frozen owner 或精确 legacy sentinel。
 // 输入/输出及副作用：owner 为只读输入；返回稳定 shape 结果，不冻结或改写。
-// 失败/边界：未知 workflow/mask、非法矩阵、坏 identity/attempt 或 subtype 返回 0。
+// 失败/边界：未知 workflow/mask、非法矩阵、坏 identity/attempt 或 wrapper
+//   不匹配的注册子类返回 0。
 function automatic bit rdma_cmq_frozen_owner_shape_valid(
   input rdma_cmq_recovery_owner owner
 );
   if (owner == null ||
-      owner.get_type_name() != "rdma_cmq_recovery_owner")
+      owner.get_object_type() != rdma_cmq_recovery_owner::get_type())
     return 1'b0;
   if (owner.is_legacy_unmigrated())
     return 1'b1;
@@ -364,7 +372,7 @@ function automatic bit rdma_cmq_frozen_owner_shape_valid(
                                RDMA_CMQ_WORKFLOW_QP}) ||
       owner.resource_h == null ||
       !rdma_cmq_direct_handle_type_supported(owner.resource_h) ||
-      owner.resource_h.get_type_name() != "rdma_handle" ||
+      owner.resource_h.get_object_type() != rdma_handle::get_type() ||
       owner.resource_h.function_uid == 0 ||
       owner.resource_h.object_id == 0 ||
       owner.resource_h.generation == 0 || owner.transaction_id == 0 ||
@@ -390,6 +398,22 @@ function automatic bit rdma_cmq_frozen_owner_shape_valid(
   endcase
 endfunction
 
+// 功能：检查 required status 是否为精确 rdma_status 注册值且枚举均在冻结范围内。
+// 输入/输出及副作用：source 为只读输入；返回 shape bit，不缓存、复制或修改对象。
+// 失败/边界：null、wrapper 不匹配的注册子类、category X/Z 或 11..15、code X/Z
+//   或 17..31、source_engine X/Z 或 12..15 时返回 0。
+function automatic bit rdma_cmq_status_shape_valid(input rdma_status source);
+  if (source == null ||
+      source.get_object_type() != rdma_status::get_type())
+    return 1'b0;
+  if ($isunknown(source.category) || $isunknown(source.code) ||
+      $isunknown(source.source_engine))
+    return 1'b0;
+  return source.category <= RDMA_STATUS_RESET &&
+         source.code <= RDMA_SC_RECOVERY_REQUIRED &&
+         source.source_engine <= RDMA_ENGINE_RESET;
+endfunction
+
 // 设计说明：context 以源对象身份作为 associative-array key，使同一 ticket、
 // status 或 frozen owner 在 detached 图中仍只有一个 canonical node。
 class rdma_cmq_nonfatal_snapshot_context;
@@ -408,7 +432,8 @@ class rdma_cmq_nonfatal_snapshot_context;
 
   // 功能：直接复制必需 operation status，并复用同一 source 的 canonical snapshot。
   // 输入/输出及副作用：source 为输入，snapshot/reason 为输出；成功缓存新值。
-  // 失败/边界：输出先清空；required source 为 null 时稳定非致命失败。
+  // 失败/边界：输出先清空；required source 为 null、wrapper 不匹配或含
+  //   X/Z/spare category/code/source_engine 时在 cache lookup 前稳定非致命失败。
   function bit try_snapshot_required_status(
     input rdma_status source,
     output rdma_status snapshot,
@@ -420,6 +445,10 @@ class rdma_cmq_nonfatal_snapshot_context;
     failure_reason = "";
     if (source == null) begin
       failure_reason = "required CMQ status is null";
+      return 1'b0;
+    end
+    if (!rdma_cmq_status_shape_valid(source)) begin
+      failure_reason = "required CMQ status source is invalid";
       return 1'b0;
     end
     if (status_snapshots.exists(source)) begin
@@ -561,7 +590,7 @@ class rdma_cmq_nonfatal_snapshot_context;
   // 输入/输出及副作用：source/payload 为输入，snapshot/reason 为输出；复用
   //   context 中 ticket/status canonical nodes，并直接复制 raw CQE。
   // 失败/边界：null completion 可选成功；payload 缺失/自别名、坏 shell 或 raw
-  //   image 时原子失败，绝不调用 clone/copy/factory。
+  //   image 或 wrapper 不匹配的注册子类时原子失败，绝不调用 clone/copy/factory。
   function bit try_snapshot_completion_shell(
     input rdma_cmq_completion source,
     input uvm_object detached_payload,
@@ -578,7 +607,7 @@ class rdma_cmq_nonfatal_snapshot_context;
     failure_reason = "";
     if (source == null)
       return detached_payload == null;
-    if (source.get_type_name() != "rdma_cmq_completion") begin
+    if (source.get_object_type() != rdma_cmq_completion::get_type()) begin
       failure_reason = "CMQ completion runtime subtype is unsupported";
       return 1'b0;
     end
@@ -1395,7 +1424,7 @@ endfunction
 
 // 功能：按 DMA-CONTEXT-V1 编码 requester authority、route/epoch 与 owner hint。
 // 输入/输出及副作用：writer/dma_context 为输入；成功原子追加公开 DMA context。
-// 失败/边界：null、坏 Function/owner subtype、非法 route 或无效 PASID 非零时拒绝。
+// 失败/边界：null、坏 Function/owner wrapper、非法 route 或无效 PASID 非零时拒绝。
 function automatic bit rdma_cmq_append_dma_context_v1(
   input rdma_cmq_canonical_writer writer,
   input rdma_dma_request_context dma_context
@@ -1404,7 +1433,8 @@ function automatic bit rdma_cmq_append_dma_context_v1(
 
   if (writer == null || dma_context == null ||
       dma_context.function_h == null ||
-      dma_context.function_h.get_type_name() != "rdma_function_handle" ||
+      dma_context.function_h.get_object_type() !=
+        rdma_function_handle::get_type() ||
       !rdma_cmq_direct_handle_type_supported(dma_context.function_h) ||
       dma_context.function_h.kind != RDMA_RESOURCE_FUNCTION ||
       dma_context.function_h.generation == 0 ||
@@ -1446,7 +1476,8 @@ function automatic bit rdma_cmq_append_dma_mapping_public_v1(
   rdma_cmq_canonical_writer child;
 
   if (writer == null || mapping == null || mapping.function_h == null ||
-      mapping.function_h.get_type_name() != "rdma_function_handle" ||
+      mapping.function_h.get_object_type() !=
+        rdma_function_handle::get_type() ||
       !rdma_cmq_direct_handle_type_supported(mapping.function_h) ||
       mapping.function_h.kind != RDMA_RESOURCE_FUNCTION ||
       mapping.function_h.generation == 0 || mapping.size == 0 ||
@@ -1492,8 +1523,8 @@ endfunction
 
 // 功能：按 FUNCTION-BINDING-V1 编码已 detached binding 的全部公开 authority projection。
 // 输入/输出及副作用：writer/binding 为输入；内部取得 detached identity 后追加值。
-// 失败/边界：binding/PCIe/BAR/identity 缺失、snapshot status 非 OK 或 owner subtype
-//   非法时拒绝；不读取 protected identity 引用本身。
+// 失败/边界：binding/PCIe/BAR/identity 缺失、state 含 X/Z 或大于 RDMA_BIND_ERROR、
+//   snapshot status 非 OK 或 owner subtype 非法时拒绝；不读取 protected identity 引用本身。
 function automatic bit rdma_cmq_append_function_binding_v1(
   input rdma_cmq_canonical_writer writer,
   input rdma_function_binding binding
@@ -1502,7 +1533,8 @@ function automatic bit rdma_cmq_append_function_binding_v1(
   rdma_function_identity identity;
   rdma_status status;
 
-  if (writer == null || binding == null || binding.pcie == null)
+  if (writer == null || binding == null || binding.pcie == null ||
+      $isunknown(binding.state) || binding.state > RDMA_BIND_ERROR)
     return 1'b0;
   status = binding.snapshot_identity_nonfatal(identity);
   if (status == null || !status.ok() || identity == null)
@@ -1586,7 +1618,7 @@ endfunction
 // 功能：按 CMQ-COMMAND-V1 编码命令 shell，并在 body 位置插入 profile 输出。
 // 输入/输出及副作用：writer/command/body tag/field bytes 为输入；成功原子追加。
 // 失败/边界：未知 body tag、无效 Function/opcode/owner/image 或空 body 拒绝；
-//   model 层不 cast codec 具体 body，也不信任 factory type name 生成 tag。
+//   model 层不 cast codec 具体 body，且只信任唯一注册 wrapper 身份而非类型名字符串。
 function automatic bit rdma_cmq_append_command_v1(
   input rdma_cmq_canonical_writer writer,
   input rdma_cmq_command_desc command,
@@ -1597,7 +1629,8 @@ function automatic bit rdma_cmq_append_command_v1(
 
   if (writer == null || command == null || command.body == null ||
       command.function_h == null ||
-      command.function_h.get_type_name() != "rdma_function_handle" ||
+      command.function_h.get_object_type() !=
+        rdma_function_handle::get_type() ||
       !rdma_cmq_direct_handle_type_supported(command.function_h) ||
       command.function_h.kind != RDMA_RESOURCE_FUNCTION ||
       command.function_h.generation == 0 ||
@@ -2147,7 +2180,8 @@ endfunction
 // 功能：按冻结 lifetime state/phase/effect/proof 表推导 conservative recovery bit。
 // 输入/输出及副作用：五个证据输入只读，recovery_required 成功时一次性更新。
 // 失败/边界：X/Z/spare 或不可能的 state/phase/effect 组合返回非 OK 且保持
-//   预置输出；UNOBSERVED 始终需要 reconcile，终态/确认 reset 才清零。
+//   预置输出；UNOBSERVED 接受未观测或既有 Host/MMIO 累积证据并始终需要
+//   reconcile，只有可靠终态/确认 reset 才清零。
 function automatic rdma_status rdma_cmq_classify_recovery_required(
   input rdma_cmq_submission_state_e state,
   input rdma_cmq_completion_phase_e completion_phase,
@@ -2169,7 +2203,8 @@ function automatic rdma_status rdma_cmq_classify_recovery_required(
 
   if (completion_phase == RDMA_CMQ_COMPLETION_UNOBSERVED) begin
     candidate = 1'b1;
-    combination_valid = submission_effect == RDMA_SUBMIT_EFFECT_UNOBSERVED;
+    combination_valid = submission_effect !=
+                          RDMA_SUBMIT_EFFECT_PRE_SUBMIT_REJECTED;
   end
   else begin
     combination_valid = 1'b0;

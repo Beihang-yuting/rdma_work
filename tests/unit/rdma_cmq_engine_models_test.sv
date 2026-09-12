@@ -1,7 +1,8 @@
 // 目录：测试层 tests/unit/rdma_cmq_engine_models_test.sv。
 // 职责：验证共享提交证据顺序，以及 CMQ model 的 validation 与 detached clone 契约。
 // 依赖：依赖 rdma_model_pkg 导出的真实 helper/model 和 UVM test/object/report 基础设施。
-// 所有权与生命周期：测试创建并持有本地 fixture 引用；UVM 在测试结束后统一回收对象。
+// 所有权与生命周期：测试持有局部 fixture 引用；对象随 SystemVerilog 引用生命周期存在，
+// 仿真结束时由模拟器回收，UVM 不拥有这些局部对象。
 
 // 设计说明：该故障 fixture 专门让 validate() 返回 null，以覆盖 command 对异常 model 的拒绝路径。
 class rdma_cmq_null_status_body extends rdma_hw_model;
@@ -39,6 +40,43 @@ class rdma_cmq_value_wrong_factory_object extends uvm_object;
   // 失败/边界：对象允许正常构造，但任何被测 RDMA typed cast 都必须失败。
   function new(string name = "rdma_cmq_value_wrong_factory_object");
     super.new(name);
+  endfunction
+endclass
+
+// 设计说明：该注册 status 子类伪装基类名称，验证 required-status 边界只接受
+// 唯一 rdma_status wrapper，不能把可覆盖的 legacy 类型名当作动态类型权限。
+class rdma_cmq_spoofed_status_subtype extends rdma_status;
+  typedef uvm_object_registry#(
+    rdma_cmq_spoofed_status_subtype,
+    "rdma_cmq_spoofed_status_subtype"
+  ) type_id;
+
+  // 功能：返回 hostile status fixture 的独立 UVM registry singleton。
+  // 输入/输出及副作用：无输入；返回 type_id wrapper，不创建或修改 status。
+  // 失败/边界：wrapper 注册名保持真实子类名，不受 get_type_name 基类伪装影响。
+  static function type_id get_type();
+    return type_id::get();
+  endfunction
+
+  // 功能：向 required-status 测试公开 hostile 子类的真实 wrapper 身份。
+  // 输入/输出及副作用：无输入；返回 get_type()，不读取或写回 status 字段。
+  // 失败/边界：不得返回 rdma_status 基类 wrapper，否则 fixture 无法覆盖名称冒充。
+  virtual function uvm_object_wrapper get_object_type();
+    return get_type();
+  endfunction
+
+  // 功能：构造公共字段均为合法默认值、但动态类型不受支持的 status fixture。
+  // 输入/输出及副作用：name 传给 rdma_status；不安装 factory override 或外部资源。
+  // 失败/边界：合法公共字段不能提升该子类权限，snapshot 必须按 wrapper 拒绝。
+  function new(string name = "rdma_cmq_spoofed_status_subtype");
+    super.new(name);
+  endfunction
+
+  // 功能：故意返回 rdma_status 基类名称，复现字符串 exact-type 检查的绕过。
+  // 输入/输出及副作用：无输入；返回固定字符串，不改变独立 registry wrapper。
+  // 失败/边界：仅伪装 legacy 诊断名；生产权限判断不得信任本返回值。
+  virtual function string get_type_name();
+    return "rdma_status";
   endfunction
 endclass
 
@@ -566,6 +604,49 @@ class rdma_cmq_engine_models_test extends uvm_test;
     rdma_cmq_journal_digest_t actual;
 
     actual = rdma_cmq_digest_bytes(bytes);
+    if (actual != expected)
+      `uvm_error(label,
+                 $sformatf("expected %064x, got %064x", expected, actual))
+  endfunction
+
+  // 功能：校验一个已经由被测 encoder 产生的 schema stream 的手算长度与摘要常量。
+  // 输入/输出及副作用：label/writer/encoded/expected_size/expected_digest 为输入；
+  //   只读取 writer snapshot，失败时发布 UVM_ERROR，不调用任何 production serializer。
+  // 失败/边界：encoder 拒绝、writer 为空或长度漂移时立即报错；长度正确后才计算摘要，
+  //   因而期望侧始终只是独立 literal，不会用被测 schema 重建自身期望。
+  function automatic void expect_schema_golden(
+    string label,
+    rdma_cmq_canonical_writer writer,
+    bit encoded,
+    int unsigned expected_size,
+    rdma_cmq_journal_digest_t expected_digest
+  );
+    byte unsigned actual_bytes[];
+
+    if (!encoded || writer == null) begin
+      `uvm_error(label, "golden fixture was rejected before comparison")
+      return;
+    end
+    writer.snapshot(actual_bytes);
+    if (actual_bytes.size() != expected_size) begin
+      `uvm_error(label,
+                 $sformatf("expected %0d bytes, got %0d",
+                           expected_size, actual_bytes.size()))
+      return;
+    end
+    expect_digest(label, actual_bytes, expected_digest);
+  endfunction
+
+  // 功能：比较被测 item/batch/proof helper 发布的摘要与独立手算 literal。
+  // 输入/输出及副作用：label、actual、expected 只读；不重建 canonical bytes，
+  //   不调用 serializer，值不一致时发布 UVM_ERROR。
+  // 失败/边界：全零也按普通不等处理；调用方负责先断言 status 为 OK，避免把拒绝
+  //   路径误诊为 golden 漂移。
+  function automatic void expect_digest_value(
+    string label,
+    rdma_cmq_journal_digest_t actual,
+    rdma_cmq_journal_digest_t expected
+  );
     if (actual != expected)
       `uvm_error(label,
                  $sformatf("expected %064x, got %064x", expected, actual))
@@ -1325,6 +1406,127 @@ class rdma_cmq_engine_models_test extends uvm_test;
     disarm_snapshot_factory_faults();
   endfunction
 
+  // 功能：验证 required status 在 cache lookup 前拒绝注册子类与三类 spare 编码，
+  //   且 completion shell 对共享 status 使用同一门禁。
+  // 输入/输出及副作用：无显式输入；构造独立 snapshot context、status 与 completion
+  //   fixture；仅通过 UVM error 发布契约偏差，不保留外部资源。
+  // 失败/边界：覆盖 category=11、code=17、source_engine=12、已缓存源后变异，
+  //   以及伪装 get_type_name 的独立 wrapper；每次失败均须清空 snapshot 并给出原因。
+  function automatic void check_required_status_snapshot_validation();
+    rdma_cmq_nonfatal_snapshot_context snapshot_context;
+    rdma_cmq_spoofed_status_subtype subtype_status;
+    rdma_status source_status;
+    rdma_status status_snapshot;
+    rdma_status retained_snapshot;
+    rdma_function_handle function_h;
+    rdma_handle cmq_h;
+    rdma_cmq_opcode_key key;
+    rdma_cmq_completion completion;
+    rdma_cmq_completion completion_snapshot;
+    string failure_reason;
+    bit snapshot_ok;
+
+    snapshot_context = new();
+    subtype_status = new("registered_status_subtype");
+    if (subtype_status.get_type_name() != "rdma_status" ||
+        subtype_status.get_object_type() == rdma_status::get_type())
+      `uvm_error("STATUS_SUBTYPE_FIXTURE",
+                 "registered status subtype did not preserve hostile identity")
+    status_snapshot = rdma_status::success("preseeded subtype output");
+    failure_reason = "preseeded subtype reason";
+    snapshot_ok = snapshot_context.try_snapshot_required_status(
+      subtype_status, status_snapshot, failure_reason
+    );
+    if (snapshot_ok || status_snapshot != null || failure_reason == "")
+      `uvm_error("SNAPSHOT_STATUS_SUBTYPE",
+                 "registered status subtype was accepted or partially published")
+
+    source_status = rdma_status::success("invalid category source");
+    source_status.category = rdma_status_category_e'(4'd11);
+    status_snapshot = rdma_status::success("preseeded category output");
+    failure_reason = "preseeded category reason";
+    snapshot_ok = snapshot_context.try_snapshot_required_status(
+      source_status, status_snapshot, failure_reason
+    );
+    if (snapshot_ok || status_snapshot != null || failure_reason == "")
+      `uvm_error("SNAPSHOT_STATUS_CATEGORY_RANGE",
+                 "status category spare encoding was accepted")
+
+    source_status = rdma_status::success("invalid code source");
+    source_status.code = rdma_status_code_e'(5'd17);
+    status_snapshot = rdma_status::success("preseeded code output");
+    failure_reason = "preseeded code reason";
+    snapshot_ok = snapshot_context.try_snapshot_required_status(
+      source_status, status_snapshot, failure_reason
+    );
+    if (snapshot_ok || status_snapshot != null || failure_reason == "")
+      `uvm_error("SNAPSHOT_STATUS_CODE_RANGE",
+                 "status code spare encoding was accepted")
+
+    source_status = rdma_status::success("invalid engine source");
+    source_status.source_engine = rdma_engine_kind_e'(4'd12);
+    status_snapshot = rdma_status::success("preseeded engine output");
+    failure_reason = "preseeded engine reason";
+    snapshot_ok = snapshot_context.try_snapshot_required_status(
+      source_status, status_snapshot, failure_reason
+    );
+    if (snapshot_ok || status_snapshot != null || failure_reason == "")
+      `uvm_error("SNAPSHOT_STATUS_ENGINE_RANGE",
+                 "status source-engine spare encoding was accepted")
+
+    snapshot_context = new();
+    source_status = rdma_status::success("cache mutation source");
+    failure_reason = "preseeded initial-cache reason";
+    snapshot_ok = snapshot_context.try_snapshot_required_status(
+      source_status, retained_snapshot, failure_reason
+    );
+    if (!snapshot_ok || retained_snapshot == null || failure_reason != "")
+      `uvm_error("SNAPSHOT_STATUS_CACHE_SETUP",
+                 "valid status did not seed the canonical cache")
+    source_status.code = rdma_status_code_e'(5'd17);
+    status_snapshot = rdma_status::success("preseeded cache output");
+    failure_reason = "preseeded cache reason";
+    snapshot_ok = snapshot_context.try_snapshot_required_status(
+      source_status, status_snapshot, failure_reason
+    );
+    if (snapshot_ok || status_snapshot != null || failure_reason == "" ||
+        retained_snapshot == null || retained_snapshot.code != RDMA_SC_OK)
+      `uvm_error("SNAPSHOT_STATUS_MUTATED_CACHE",
+                 "mutated malformed status reused a cached snapshot")
+
+    snapshot_context = new();
+    source_status = rdma_status::success("completion shared status");
+    failure_reason = "preseeded completion-cache reason";
+    snapshot_ok = snapshot_context.try_snapshot_required_status(
+      source_status, retained_snapshot, failure_reason
+    );
+    if (!snapshot_ok || retained_snapshot == null || failure_reason != "")
+      `uvm_error("SNAPSHOT_COMPLETION_STATUS_SETUP",
+                 "valid completion status did not seed the canonical cache")
+    source_status.category = rdma_status_category_e'(4'd11);
+    function_h = make_function("status_validation_function");
+    cmq_h = make_cmq("status_validation_cmq", function_h);
+    key = make_key("status_validation_key");
+    completion = new("status_validation_completion");
+    completion.ticket = make_ticket(
+      "status_validation_ticket", function_h, cmq_h, key
+    );
+    completion.status = source_status;
+    completion.raw_cqe = make_image(
+      "status_validation_raw_cqe", RDMA_IMAGE_CMQ_CQE, 64,
+      TEST_GENERATION
+    );
+    completion.decoded_response = null;
+    completion_snapshot = new("preseeded_status_validation_completion");
+    failure_reason = "preseeded completion reason";
+    snapshot_ok = snapshot_context.try_snapshot_completion_shell(
+      completion, null, completion_snapshot, failure_reason
+    );
+    if (snapshot_ok || completion_snapshot != null || failure_reason == "")
+      `uvm_error("SNAPSHOT_COMPLETION_STATUS_RANGE",
+                 "completion shell reused a cached malformed status")
+  endfunction
+
   // 功能：创建只携带指定 lifetime state 的 journal item，供 reducer 表驱动测试。
   // 输入/输出及副作用：name、state 为输入；返回新 item，其他字段保持构造默认。
   // 失败/边界：允许 spare/X/Z state 进入 fixture，以验证 reducer 保持输出不变。
@@ -1617,6 +1819,14 @@ class rdma_cmq_engine_models_test extends uvm_test;
       RDMA_CMQ_COMPLETION_UNOBSERVED, RDMA_SUBMIT_EFFECT_UNOBSERVED,
       1'b0, 1'b1, 1'b1
     );
+    // arm 后 envelope 丢失时 phase 为 UNOBSERVED，但 cumulative effect 必须保留
+    // 已发生的 MMIO_MAYBE_VISIBLE 证据；该降级组合仍需保守 reconcile。
+    expect_recovery_case(
+      "RECOVERY_UNOBSERVED_POST_ARM", RDMA_CMQ_SUBMISSION_COMPLETED,
+      RDMA_CMQ_COMPLETION_UNOBSERVED,
+      RDMA_SUBMIT_EFFECT_MMIO_MAYBE_VISIBLE,
+      1'b0, 1'b0, 1'b1
+    );
 
     recovery_required = 1'b0;
     unknown_state = rdma_cmq_submission_state_e'(4'bx001);
@@ -1787,6 +1997,164 @@ class rdma_cmq_engine_models_test extends uvm_test;
       `uvm_error("WRITER_OBJECT_HEADER", "invalid object header was accepted")
     writer.snapshot(actual);
     expect_bytes("WRITER_OBJECT_HEADER_ATOMIC", actual, before_failure);
+  endfunction
+
+  // 功能：以 brief 字段表独立手算的长度与 digest literal 锁定十二个非 body V1 schema；
+  //   HANDLE 另比较完整 byte literal，直接暴露 header、宽度或大端顺序漂移。
+  // 输入/输出及副作用：无显式输入；构造固定 identity/owner/image/command/DMA/binding
+  //   fixture，把各 production encoder 的实际 writer 交给不含 serializer 的比较器。
+  // 失败/边界：任一 fixture 创建/冻结失败、encoder 拒绝、字段遗漏/换序/变宽或对象
+  //   header 漂移均发布 UVM_ERROR；golden 不覆盖 profile-owned body field bytes。
+  function automatic void check_schema_golden_vectors();
+    rdma_handle handle;
+    rdma_function_handle function_h;
+    rdma_handle cmq_h;
+    rdma_bdf_t bdf;
+    rdma_route_key_t route;
+    rdma_function_identity identity;
+    rdma_cmq_opcode_key key;
+    rdma_cmq_recovery_owner owner;
+    rdma_hw_image image;
+    rdma_cmq_sqe_model body;
+    rdma_cmq_command_desc command;
+    rdma_cmq_ticket ticket;
+    rdma_dma_request_context dma_context;
+    rdma_dma_mapping mapping;
+    rdma_function_binding binding;
+    rdma_cmq_canonical_writer writer;
+    rdma_status status;
+    byte unsigned body_bytes[];
+    byte unsigned actual_handle_bytes[];
+    byte unsigned expected_handle_bytes[];
+    bit encoded;
+
+    identity = make_identity("golden_identity");
+    bdf = identity.key.bdf;
+    route = identity.route_key();
+    key = make_key("golden_key");
+    owner = make_owner(
+      "golden_owner", RDMA_CMQ_WORKFLOW_MR, RDMA_RESOURCE_MR,
+      RDMA_CMQ_RECOVERY_RETRY_PUBLISH
+    );
+    status = owner.freeze_for_journal(identity, 37);
+    expect_status("GOLDEN_OWNER_FREEZE", status, RDMA_SC_OK);
+    function_h = make_function("golden_function");
+    cmq_h = make_cmq("golden_cmq", function_h);
+    body = make_body("golden_body", function_h, cmq_h);
+    ticket = make_ticket("golden_ticket", function_h, cmq_h, key);
+    dma_context = make_dma_context("golden_dma_context", identity);
+    mapping = make_mapping("golden_mapping", identity);
+    binding = make_binding("golden_binding", identity);
+
+    handle = make_resource_handle(
+      "golden_handle", RDMA_RESOURCE_MR, 32'h1020_3040
+    );
+    writer = new();
+    encoded = rdma_cmq_append_handle_v1(writer, handle, 1'b0);
+    writer.snapshot(actual_handle_bytes);
+    expected_handle_bytes = '{
+      8'h01, 8'h00, 8'h00, 8'h00, 8'h09,
+      8'h48, 8'h41, 8'h4e, 8'h44, 8'h4c, 8'h45, 8'h2d, 8'h56, 8'h31,
+      8'h02, 8'h11, 8'h22, 8'h33, 8'h44, 8'h55, 8'h66, 8'h77, 8'h88,
+      8'h10, 8'h20, 8'h30, 8'h40, 8'h00, 8'h00, 8'h00, 8'h07
+    };
+    expect_bytes("GOLDEN_HANDLE_BYTES", actual_handle_bytes,
+                 expected_handle_bytes);
+    expect_schema_golden(
+      "GOLDEN_HANDLE", writer, encoded, 31,
+      256'habe6b760_bc7c27d2_e4877ab3_2fd17530_eb1c861d_edd684c7_31b221e6_77661da0
+    );
+
+    writer = new();
+    encoded = rdma_cmq_append_bdf_v1(writer, bdf);
+    expect_schema_golden(
+      "GOLDEN_BDF", writer, encoded, 16,
+      256'h0046fa88_7e2200cb_ea3421f6_cccb66ad_2fbbf3cb_be10e658_7a4c72e0_ad12707d
+    );
+
+    writer = new();
+    encoded = rdma_cmq_append_route_v1(writer, route);
+    expect_schema_golden(
+      "GOLDEN_ROUTE", writer, encoded, 37,
+      256'h8a5aa83d_46157490_ea67743d_9bbb4cda_41de0ebc_82ded875_12b8dcf6_8bd6c9ea
+    );
+
+    writer = new();
+    encoded = rdma_cmq_append_function_identity_v1(writer, identity, 1'b0);
+    expect_schema_golden(
+      "GOLDEN_IDENTITY", writer, encoded, 90,
+      256'h6ac1c0fb_55319ca0_5b4c341f_38e96206_2e3263cb_a177d5af_ed75b85d_61876cd6
+    );
+
+    writer = new();
+    encoded = rdma_cmq_append_opcode_key_v1(writer, key);
+    expect_schema_golden(
+      "GOLDEN_OPCODE", writer, encoded, 50,
+      256'h24b098b7_71608999_298930db_57eba477_a0ae2ead_ccfbf546_7b98b11b_20dbd9e7
+    );
+
+    writer = new();
+    encoded = rdma_cmq_append_recovery_owner_v1(writer, owner);
+    expect_schema_golden(
+      "GOLDEN_OWNER", writer, encoded, 162,
+      256'h4566d606_fba93e9d_db7d9985_97f83fe7_86de860d_b2baec0e_3a979697_74a01ef7
+    );
+
+    image = make_image("golden_image", RDMA_IMAGE_CQC, 8, TEST_GENERATION);
+    image.field_summary.push_back("golden-image");
+    writer = new();
+    encoded = rdma_cmq_append_image_v1(writer, image, 1'b0);
+    expect_schema_golden(
+      "GOLDEN_IMAGE", writer, encoded, 92,
+      256'h011f34c7_c8b374e0_bdc518df_91ad9e22_09f41013_01b371e3_431a5ad8_53385832
+    );
+
+    command = rdma_cmq_command_desc::type_id::create("golden_command");
+    command.function_h = function_h;
+    command.opcode_key = key;
+    command.body = body;
+    command.qpc_signature_source = null;
+    command.vfid_override = 1'b1;
+    command.use_vfid = 11'h345;
+    command.timeout = 64'h0102_0304_0506_0708;
+    command.recovery_owner = owner;
+    body_bytes = new[0];
+    writer = new();
+    encoded = rdma_cmq_append_command_v1(
+      writer, command, "CMQ-BODY-EMPTY-V1", body_bytes
+    );
+    expect_schema_golden(
+      "GOLDEN_COMMAND", writer, encoded, 296,
+      256'h0213934c_c5f0f455_6e27041f_07270eff_5d08ae8b_e2bfe6f2_7545be27_4e5ae08f
+    );
+
+    writer = new();
+    encoded = rdma_cmq_append_ticket_v1(writer, ticket);
+    expect_schema_golden(
+      "GOLDEN_TICKET", writer, encoded, 159,
+      256'hc837b5de_67b5fb7b_15d5f683_222a29fd_28fade6b_97be515e_3591784d_f3058fcd
+    );
+
+    writer = new();
+    encoded = rdma_cmq_append_dma_context_v1(writer, dma_context);
+    expect_schema_golden(
+      "GOLDEN_DMA_CONTEXT", writer, encoded, 159,
+      256'h88bfa657_e10cbb3b_adb6906f_91eb0f09_21d50e1d_7a0a04e2_c25199f5_f7f1a6d9
+    );
+
+    writer = new();
+    encoded = rdma_cmq_append_dma_mapping_public_v1(writer, mapping);
+    expect_schema_golden(
+      "GOLDEN_DMA_MAPPING", writer, encoded, 195,
+      256'h6a5adc9d_f2a97be4_273bd9d2_1d3f70c6_3f458aa1_bd9ec6d5_12b36a5f_9e6b08d6
+    );
+
+    writer = new();
+    encoded = rdma_cmq_append_function_binding_v1(writer, binding);
+    expect_schema_golden(
+      "GOLDEN_BINDING", writer, encoded, 455,
+      256'h845b81fa_a965ff10_ba34a42d_5a5385a2_85dfc72e_05336c09_316b1fbf_099eaa32
+    );
   endfunction
 
   // 功能：逐字段变更 HANDLE/BDF/ROUTE/IDENTITY/OPCODE/OWNER V1 fixture，
@@ -2871,9 +3239,45 @@ class rdma_cmq_engine_models_test extends uvm_test;
     binding.vft_ready ^= 1'b1;
   endfunction
 
-  // 功能：验证 FNV 已知答案、item 双域字段覆盖和 opaque mapping authority 分离。
+  // 功能：逐一验证 FUNCTION-BINDING-V1 拒绝 state=9..15 的未分配编码，防止
+  //   删除或放宽 RDMA_BIND_ERROR 上界后把 spare state 固化进 journal authority。
+  // 输入/输出及副作用：无显式输入；每轮构造新 writer、预置 8'ha5，并比较调用前后字节。
+  // 失败/边界：任一 spare state 被接受或使失败 writer 发生部分追加时发布 UVM_ERROR；
+  //   合法 0..8 状态仍由逐字段 schema mutation 检查覆盖。
+  function automatic void check_binding_spare_state_canonicalization();
+    rdma_function_identity identity;
+    rdma_function_binding binding;
+    rdma_cmq_canonical_writer writer;
+    byte unsigned before_bytes[];
+    byte unsigned after_bytes[];
+    string label;
+    bit encoded;
+
+    identity = make_identity("binding_spare_identity");
+    binding = make_binding("binding_spare", identity);
+
+    for (int unsigned state_value = 9; state_value <= 15; state_value++) begin
+      label = $sformatf("BINDING_SPARE_STATE_%0d", state_value);
+      binding.state = rdma_binding_state_e'(state_value);
+      writer = new();
+      if (!writer.append_u8(8'ha5)) begin
+        `uvm_error(label, "failed to seed canonical writer sentinel")
+        continue;
+      end
+      writer.snapshot(before_bytes);
+      encoded = rdma_cmq_append_function_binding_v1(writer, binding);
+      writer.snapshot(after_bytes);
+
+      if (encoded)
+        `uvm_error(label, "spare binding state was canonicalized")
+      expect_bytes(label, after_bytes, before_bytes);
+    end
+  endfunction
+
+  // 功能：验证 FNV 已知答案、item 双域 literal golden、字段覆盖和 opaque authority 分离。
   // 输入/输出及副作用：无显式输入；构造 request-owned 图并反复独立计算 digest。
-  // 失败/边界：null/长度漂移/owner 不一致不发布 digest；private token 不进入公开字节。
+  // 失败/边界：null/长度漂移/owner 不一致不发布 digest；private token 不进入公开字节，
+  //   schema/domain/header/顺序或宽度漂移必须偏离仓库外手算的两个 256-bit literal。
   function automatic void check_journal_digest_contract();
     byte unsigned digest_bytes[];
     byte unsigned body_bytes[];
@@ -2965,8 +3369,16 @@ class rdma_cmq_engine_models_test extends uvm_test;
       baseline_authority_digest
     );
     expect_status("ITEM_DIGEST_BASELINE", status, RDMA_SC_OK);
-    if (baseline_image_digest == '0 || baseline_authority_digest == '0)
-      `uvm_error("ITEM_DIGEST_BASELINE", "valid graph returned zero digest")
+    expect_digest_value(
+      "ITEM_IMAGE_GOLDEN",
+      baseline_image_digest,
+      256'hffba8058_ff68e14c_321bf650_07c3bc02_4cdbd6c6_a065f317_801a4d57_bc178a12
+    );
+    expect_digest_value(
+      "ITEM_AUTHORITY_GOLDEN",
+      baseline_authority_digest,
+      256'hc6e16ef0_cd315821_86165b8b_a6c07b23_254b32aa_cfd33588_36b7067c_be6b9913
+    );
 
     status = rdma_cmq_compute_item_digests(
       command,
@@ -3188,9 +3600,10 @@ class rdma_cmq_engine_models_test extends uvm_test;
                  "matching public digest authorized a different allocation")
   endfunction
 
-  // 功能：验证 batch authority 投影、ordered tuple 覆盖及 mutable lifecycle 字段排除。
+  // 功能：验证 batch authority literal golden、ordered tuple 覆盖及 mutable lifecycle 字段排除。
   // 输入/输出及副作用：无显式输入；从 record/request 两份图分别重算并比较 digest。
-  // 失败/边界：空或不等长 tuple 不发布 digest；每个 included 字段 mutation 必须改值。
+  // 失败/边界：空或不等长 tuple 不发布 digest；任一 domain/schema/宽度/顺序漂移或
+  //   included 字段 mutation 必须偏离仓库外手算的完整 batch literal。
   function automatic void check_batch_digest_contract();
     rdma_function_identity identity;
     rdma_function_binding binding;
@@ -3237,8 +3650,11 @@ class rdma_cmq_engine_models_test extends uvm_test;
       baseline_digest
     );
     expect_status("BATCH_DIGEST_BASELINE", status, RDMA_SC_OK);
-    if (baseline_digest == '0)
-      `uvm_error("BATCH_DIGEST_BASELINE", "valid batch returned zero digest")
+    expect_digest_value(
+      "BATCH_DIGEST_GOLDEN",
+      baseline_digest,
+      256'h2adfd3c7_c8fe5ae1_dbe15121_a7222187_8bf755de_5a6c173e_3066a809_dd828d97
+    );
 
     record = new("batch_digest_record");
     record.batch_key = "batch-key";
@@ -3451,9 +3867,10 @@ class rdma_cmq_engine_models_test extends uvm_test;
       `uvm_error("BATCH_DIGEST_LENGTH", "unequal tuple published digest")
   endfunction
 
-  // 功能：验证 reset proof 的稳定 domain、ordered 四字段 tuple 和 mutable transition 排除。
+  // 功能：验证 reset proof literal golden、ordered 四字段 tuple 和 mutable transition 排除。
   // 输入/输出及副作用：无显式输入；构造不对称 proof 并逐项 mutation 后重算。
-  // 失败/边界：零 ID、空/不等长 tuple 或非法 owner 必须失败且输出清零。
+  // 失败/边界：零 ID、空/不等长 tuple 或非法 owner 必须失败且输出清零；任一
+  //   domain/header/宽度/顺序漂移必须偏离仓库外手算的完整 proof literal。
   function automatic void check_reset_proof_value();
     rdma_function_identity isolated_identity;
     rdma_function_identity replacement_identity;
@@ -3507,8 +3924,11 @@ class rdma_cmq_engine_models_test extends uvm_test;
       baseline_digest
     );
     expect_status("RESET_PROOF_BASELINE", status, RDMA_SC_OK);
-    if (baseline_digest == '0)
-      `uvm_error("RESET_PROOF_BASELINE", "valid proof returned zero digest")
+    expect_digest_value(
+      "RESET_PROOF_GOLDEN",
+      baseline_digest,
+      256'h566d7583_584213fe_f287c531_6b843754_45071d95_8af83cc3_7f13b868_cf7f9724
+    );
 
     status = rdma_cmq_compute_reset_proof_digest(
       "proof-key-2", 64'h101, "batch-key", 64'h202, 64'h303,
@@ -3761,9 +4181,12 @@ class rdma_cmq_engine_models_test extends uvm_test;
     check_submission_effect_ordering();
     check_recovery_owner_contract();
     check_execution_value_defaults();
+    check_required_status_snapshot_validation();
+    check_schema_golden_vectors();
     check_identity_schema_field_mutations();
     check_command_schema_field_mutations();
     check_dma_binding_schema_field_mutations();
+    check_binding_spare_state_canonicalization();
     check_journal_digest_contract();
     check_batch_digest_contract();
     check_batch_state_reducer();

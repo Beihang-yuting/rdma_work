@@ -9,7 +9,24 @@
 // 设计说明：该 owner 子类型故意不在 binding snapshot 支持集合内，用于证明
 // complete snapshot 不会把未知 runtime subtype 静默压平为 rdma_handle。
 class rdma_function_identity_unknown_owner extends rdma_handle;
-  `uvm_object_utils(rdma_function_identity_unknown_owner)
+  typedef uvm_object_registry#(
+    rdma_function_identity_unknown_owner,
+    "rdma_function_identity_unknown_owner"
+  ) type_id;
+
+  // 功能：返回 hostile owner fixture 的独立 UVM registry singleton。
+  // 输入/输出及副作用：无输入；返回 type_id wrapper，不构造或修改 handle。
+  // 失败/边界：registry 名保持真实子类名，不受 get_type_name 基类伪装影响。
+  static function type_id get_type();
+    return type_id::get();
+  endfunction
+
+  // 功能：向 binding snapshot 测试公开 hostile owner 的真实 wrapper 身份。
+  // 输入/输出及副作用：无输入；返回 get_type()，不访问 handle authority 字段。
+  // 失败/边界：不得返回 rdma_handle 基类 wrapper，否则不能覆盖字符串冒充缺陷。
+  virtual function uvm_object_wrapper get_object_type();
+    return get_type();
+  endfunction
 
   // 功能：构造 binding 不支持的 owner handle 动态类型。
   // 输入/输出及副作用：name 仅传给 rdma_handle；不登记真实资源。
@@ -17,6 +34,13 @@ class rdma_function_identity_unknown_owner extends rdma_handle;
   //   不得压平为 rdma_handle。
   function new(string name = "rdma_function_identity_unknown_owner");
     super.new(name);
+  endfunction
+
+  // 功能：故意伪造 exact base handle 的 legacy 类型名，复现字符串 subtype 绕过。
+  // 输入/输出及副作用：无输入；返回 rdma_handle 名称，不改 owner 字段或注册 wrapper。
+  // 失败/边界：get_object_type 仍标识本 hostile 注册子类，complete snapshot 必须拒绝。
+  virtual function string get_type_name();
+    return "rdma_handle";
   endfunction
 endclass
 
@@ -243,6 +267,10 @@ class rdma_function_identity_test extends uvm_test;
     unknown_owner.object_id = identity.global_function_id;
     unknown_owner.generation = identity.generation;
     unknown_owner_source.owner_h = unknown_owner;
+    if (unknown_owner.get_type_name() != "rdma_handle" ||
+        unknown_owner.get_object_type() == rdma_handle::get_type())
+      `uvm_error("BINDING_UNKNOWN_OWNER_FIXTURE",
+                 "hostile owner did not isolate name from wrapper")
     null_identity_source = new("null_identity_source");
     populate_test_binding(null_identity_source, identity);
     null_identity_source.inject_null_identity();
@@ -368,7 +396,7 @@ class rdma_function_identity_test extends uvm_test;
     if (status == null || !status.ok() || base_snapshot == null ||
         base_snapshot.owner_h == null ||
         $cast(typed_owner, base_snapshot.owner_h) ||
-        base_snapshot.owner_h.get_type_name() != "rdma_handle")
+        base_snapshot.owner_h.get_object_type() != rdma_handle::get_type())
       `uvm_error("BINDING_BASE_OWNER",
                  "exact base handle dynamic type was not preserved")
 

@@ -691,6 +691,14 @@ V1 nested schema 及字段顺序冻结如下。增删或重排字段必须新建
 `timeout(u64)`、`recovery_owner(RECOVERY-OWNER-V1)`。body runtime tag 不得来自 factory
 name，仅允许以下五种 exact runtime type，任何 subclass/未知类型都拒绝：
 
+这里的 exact runtime type 以唯一、正确注册的 UVM wrapper 身份为闭合契约：对象的
+`get_object_type()` 必须与下列具体类型的 `get_type()` singleton 相同；可覆盖的
+`get_type_name()` 只用于诊断，不能参与 dispatch、canonicalization 或 authority 判断。
+因此，拥有独立 wrapper、但把 `get_type_name()` 伪装成受支持基类名的注册子类仍必须
+原子拒绝。当前 VCS/SystemVerilog 不提供从基类 handle 查询不可伪造的动态 class
+identity；完全未注册且不覆盖任何虚方法/字段的 fieldless 子类与基类不可观测地区分，
+故这类对象位于支持模型契约之外，production producer 不得构造或传入该边界。
+
 - `CMQ-BODY-QPC-V1`：nullable `qp_h/send_cq_h/recv_cq_h(HANDLE-V1)`、
   `qpc_buffer.value(u64)`、`next_state(u8)`、`full_modify(u8)`、
   `partial_modify(u8)`、`wbe_template_count(u8)`，随后 indices 0..3 的
@@ -721,6 +729,7 @@ exact body，返回稳定 tag 和 tag 之后的 field bytes；caller 每次都�
 status-returning nonfatal polymorphic boundary：只接受精确支持的 runtime type，以 direct
 construction 显式复制全部字段/bytes，不进入 raw factory、`copy()` 或 `clone()`；未知或
 hostile subclass 返回非空 `INVALID_ARGUMENT`、null snapshot 和清空的 canonical output。
+这里的精确检查同样使用上述注册 wrapper singleton，不信任类型名字符串。
 
 `rdma_function_binding` 同样提供 `snapshot_identity_nonfatal()` 与
 `snapshot_complete_nonfatal()`。两者入口清空 output，direct-construct identity、PCIe、六

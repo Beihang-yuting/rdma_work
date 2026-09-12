@@ -86,11 +86,14 @@ class rdma_hw_cmq_hw_profile extends rdma_cmq_hw_profile;
     rdma_hw_mr_deregister_body mr_body;
     rdma_hw_occ_flush_body occ_body;
     rdma_hw_cmq_empty_body empty_body;
+    uvm_object_wrapper body_type;
     string result;
 
     if (body == null)
       return "<null-body>";
-    if ($cast(qpc_body, body)) begin
+    body_type = body.get_object_type();
+    if (body_type == rdma_hw_qpc_command_body::get_type() &&
+        $cast(qpc_body, body)) begin
       result = $sformatf(
         "qpc:%s:%s:%s:%016h:%0d:%0b:%0b:%0h",
         command_handle_value_key(qpc_body.qp_h),
@@ -108,13 +111,16 @@ class rdma_hw_cmq_hw_profile extends rdma_cmq_hw_profile;
                             qpc_body.modify_data[i])};
       return result;
     end
-    if ($cast(object_body, body))
+    if (body_type == rdma_hw_object_id_command_body::get_type() &&
+        $cast(object_body, body))
       return {"object:", command_handle_value_key(object_body.object_h)};
-    if ($cast(mr_body, body))
+    if (body_type == rdma_hw_mr_deregister_body::get_type() &&
+        $cast(mr_body, body))
       return $sformatf("mr:%s:%02h:%0d",
                        command_handle_value_key(mr_body.mr_h),
                        mr_body.stag_key, mr_body.next_state);
-    if ($cast(occ_body, body))
+    if (body_type == rdma_hw_occ_flush_body::get_type() &&
+        $cast(occ_body, body))
       return $sformatf(
         "occ:%0b:%0b:%0b:%0b:%0b:%0b:%0b:%0b:%0b:%0b:%0b:%0b:%06h:%03h:%016h",
         occ_body.vf_flush, occ_body.mr_serial_flush, occ_body.qpc,
@@ -123,7 +129,8 @@ class rdma_hw_cmq_hw_profile extends rdma_cmq_hw_profile;
         occ_body.pd, occ_body.qpn, occ_body.mr_serial,
         occ_body.pd_backing.value
       );
-    if ($cast(empty_body, body))
+    if (body_type == rdma_hw_cmq_empty_body::get_type() &&
+        $cast(empty_body, body))
       return "empty";
     return "";
   endfunction
@@ -163,10 +170,10 @@ class rdma_hw_cmq_hw_profile extends rdma_cmq_hw_profile;
   endfunction
 
   // 功能：对 exact 同类型 RDMA CMQ body 比较完整字段投影，验证 snapshot 值不漂移。
-  // 输入/输出及副作用：lhs/rhs 只读；先要求动态类型名一致，再比较
+  // 输入/输出及副作用：lhs/rhs 只读；先要求注册 wrapper 身份一致，再比较
   // command_body_value_key() 的非空结果，不修改任一 body。
-  // 失败/边界：任一句柄为 null、subtype 不同或未知 subtype 投影为空时返回 0；
-  // 这是值相等检查，不证明图已 detached。
+  // 失败/边界：任一句柄为 null、wrapper 不同或未知 subtype 投影为空时返回 0；
+  //   可覆盖 get_type_name 不参与判断，本检查不证明图已 detached。
   virtual function bit same_command_body_value(
     rdma_hw_model lhs,
     rdma_hw_model rhs
@@ -175,7 +182,7 @@ class rdma_hw_cmq_hw_profile extends rdma_cmq_hw_profile;
     string rhs_value;
 
     if (lhs == null || rhs == null ||
-        lhs.get_type_name() != rhs.get_type_name())
+        lhs.get_object_type() != rhs.get_object_type())
       return 1'b0;
     lhs_value = command_body_value_key(lhs);
     rhs_value = command_body_value_key(rhs);
@@ -222,7 +229,7 @@ class rdma_hw_cmq_hw_profile extends rdma_cmq_hw_profile;
       return invalid_argument({label, " handle is null"});
     if (!rdma_cmq_try_snapshot_handle_direct(source, 1'b0, snapshot) ||
         snapshot == null || snapshot == source ||
-        snapshot.get_type_name() != source.get_type_name() ||
+        snapshot.get_object_type() != source.get_object_type() ||
         !snapshot.same_instance(source)) begin
       snapshot = null;
       return invalid_argument({label, " handle direct snapshot failed"});
@@ -254,22 +261,35 @@ class rdma_hw_cmq_hw_profile extends rdma_cmq_hw_profile;
     rdma_handle handle1_snapshot;
     rdma_handle handle2_snapshot;
     rdma_hw_model candidate;
+    uvm_object_wrapper source_type;
 
     snapshot = null;
     if (source == null)
       return invalid_argument("rdma CMQ command body is null");
-    case (source.get_type_name())
-      "rdma_hw_qpc_command_body": void'($cast(source_qpc, source));
-      "rdma_hw_object_id_command_body": void'($cast(source_object, source));
-      "rdma_hw_mr_deregister_body": void'($cast(source_mr, source));
-      "rdma_hw_occ_flush_body": void'($cast(source_occ, source));
-      "rdma_hw_cmq_empty_body": void'($cast(source_empty, source));
-      default:
-        return invalid_argument(
-          {"rdma CMQ command body type is unsupported: ",
-           source.get_type_name()}
-        );
-    endcase
+    source_type = source.get_object_type();
+    if (source_type == rdma_hw_qpc_command_body::get_type()) begin
+      if (!$cast(source_qpc, source))
+        return invalid_argument("rdma CMQ QPC wrapper/cast mismatch");
+    end
+    else if (source_type == rdma_hw_object_id_command_body::get_type()) begin
+      if (!$cast(source_object, source))
+        return invalid_argument("rdma CMQ object wrapper/cast mismatch");
+    end
+    else if (source_type == rdma_hw_mr_deregister_body::get_type()) begin
+      if (!$cast(source_mr, source))
+        return invalid_argument("rdma CMQ MR wrapper/cast mismatch");
+    end
+    else if (source_type == rdma_hw_occ_flush_body::get_type()) begin
+      if (!$cast(source_occ, source))
+        return invalid_argument("rdma CMQ OCC wrapper/cast mismatch");
+    end
+    else if (source_type == rdma_hw_cmq_empty_body::get_type()) begin
+      if (!$cast(source_empty, source))
+        return invalid_argument("rdma CMQ empty wrapper/cast mismatch");
+    end
+    else begin
+      return invalid_argument("rdma CMQ command body wrapper is unsupported");
+    end
     status = source.validate();
     if (status == null)
       return invalid_argument("rdma CMQ body validation returned null");
@@ -362,7 +382,7 @@ class rdma_hw_cmq_hw_profile extends rdma_cmq_hw_profile;
       candidate = snapshot_empty;
     end
     if (candidate == null || candidate == source ||
-        candidate.get_type_name() != source.get_type_name() ||
+        candidate.get_object_type() != source.get_object_type() ||
         !same_command_body_value(source, candidate) ||
         !command_body_graph_detached(source, candidate))
       return invalid_argument("rdma CMQ body snapshot aliases its source");
@@ -379,8 +399,9 @@ class rdma_hw_cmq_hw_profile extends rdma_cmq_hw_profile;
   // 功能：把 exact 五种 RDMA CMQ body 编码为稳定 V1 tag 后的字段 bytes。
   // 输入/输出及副作用：source 为输入；schema_tag/canonical_field_bytes 入口清空，
   //   成功时发布 fresh tag/array，不保留 source handle。
-  // 失败/边界：null、未知/派生 subtype、body validation 或任一字段编码失败时
-  //   返回 INVALID_ARGUMENT 且输出保持空；不进入 raw factory。
+  // 失败/边界：null、未知/派生 subtype、body validation、QPC next_state 的
+  //   X/Z/7..15 spare 或任一字段编码失败时返回 INVALID_ARGUMENT 且输出保持空；
+  //   不进入 raw factory。
   virtual function rdma_status canonicalize_command_body(
     input rdma_hw_model source,
     output string schema_tag,
@@ -395,28 +416,45 @@ class rdma_hw_cmq_hw_profile extends rdma_cmq_hw_profile;
     rdma_status status;
     string candidate_tag;
     byte unsigned candidate_bytes[];
+    uvm_object_wrapper source_type;
 
     schema_tag = "";
     canonical_field_bytes = new[0];
     if (source == null)
       return invalid_argument("rdma CMQ canonical body is null");
-    case (source.get_type_name())
-      "rdma_hw_qpc_command_body": void'($cast(qpc_body, source));
-      "rdma_hw_object_id_command_body": void'($cast(object_body, source));
-      "rdma_hw_mr_deregister_body": void'($cast(mr_body, source));
-      "rdma_hw_occ_flush_body": void'($cast(occ_body, source));
-      "rdma_hw_cmq_empty_body": void'($cast(empty_body, source));
-      default:
-        return invalid_argument(
-          {"rdma CMQ canonical body type is unsupported: ",
-           source.get_type_name()}
-        );
-    endcase
+    source_type = source.get_object_type();
+    if (source_type == rdma_hw_qpc_command_body::get_type()) begin
+      if (!$cast(qpc_body, source))
+        return invalid_argument("rdma canonical QPC wrapper/cast mismatch");
+    end
+    else if (source_type == rdma_hw_object_id_command_body::get_type()) begin
+      if (!$cast(object_body, source))
+        return invalid_argument("rdma canonical object wrapper/cast mismatch");
+    end
+    else if (source_type == rdma_hw_mr_deregister_body::get_type()) begin
+      if (!$cast(mr_body, source))
+        return invalid_argument("rdma canonical MR wrapper/cast mismatch");
+    end
+    else if (source_type == rdma_hw_occ_flush_body::get_type()) begin
+      if (!$cast(occ_body, source))
+        return invalid_argument("rdma canonical OCC wrapper/cast mismatch");
+    end
+    else if (source_type == rdma_hw_cmq_empty_body::get_type()) begin
+      if (!$cast(empty_body, source))
+        return invalid_argument("rdma canonical empty wrapper/cast mismatch");
+    end
+    else begin
+      return invalid_argument("rdma CMQ canonical body wrapper is unsupported");
+    end
     status = source.validate();
     if (status == null || !status.ok())
       return (status == null) ? invalid_argument(
         "rdma CMQ canonical body validation returned null"
       ) : status;
+    if (qpc_body != null &&
+        ($isunknown(qpc_body.next_state) ||
+         qpc_body.next_state > RDMA_QPS_ERROR))
+      return invalid_argument("rdma canonical QPC next state is invalid");
 
     writer = new();
     if (qpc_body != null) begin
@@ -499,7 +537,7 @@ class rdma_hw_cmq_hw_profile extends rdma_cmq_hw_profile;
 
     snapshot = null;
     if (source == null ||
-        source.get_type_name() != "rdma_hw_cmq_completion" ||
+        source.get_object_type() != rdma_hw_cmq_completion::get_type() ||
         !$cast(source_payload, source))
       return invalid_argument(
         "rdma CMQ completion payload type is unsupported"
@@ -541,7 +579,8 @@ class rdma_hw_cmq_hw_profile extends rdma_cmq_hw_profile;
   // 功能：逐字段比较两个 RDMA CMQ completion payload，包括所有 object_payload 字节。
   // 输入/输出及副作用：lhs/rhs 只读；比较 owner/opcode/ecode/index/wrap、数组长度
   // 和每个 byte，返回 bit，不修改 payload。
-  // 失败/边界：任一输入无法 cast 为 rdma_hw_cmq_completion，或长度/任一字段不同时返回 0。
+  // 失败/边界：任一输入 wrapper 非 exact completion、无法 cast，或长度/任一字段
+  //   不同时返回 0；伪造 get_type_name 的注册子类不能参与等值门禁。
   virtual function bit same_completion_payload_value(
     uvm_object lhs,
     uvm_object rhs
@@ -549,7 +588,10 @@ class rdma_hw_cmq_hw_profile extends rdma_cmq_hw_profile;
     rdma_hw_cmq_completion lhs_payload;
     rdma_hw_cmq_completion rhs_payload;
 
-    if (!$cast(lhs_payload, lhs) || !$cast(rhs_payload, rhs) ||
+    if (lhs == null || rhs == null ||
+        lhs.get_object_type() != rdma_hw_cmq_completion::get_type() ||
+        rhs.get_object_type() != rdma_hw_cmq_completion::get_type() ||
+        !$cast(lhs_payload, lhs) || !$cast(rhs_payload, rhs) ||
         lhs_payload.object_payload.size() !=
           rhs_payload.object_payload.size())
       return 1'b0;
@@ -565,8 +607,8 @@ class rdma_hw_cmq_hw_profile extends rdma_cmq_hw_profile;
 
   // 功能：确认 completion snapshot 是与 source 不同的 typed 外层对象。
   // 输入/输出及副作用：source/snapshot 只读；两者均可 cast 且句柄不同时返回 1。
-  // 失败/边界：任一类型不符或外层句柄相同时返回 0；payload 只含动态 byte array，
-  // SystemVerilog 数组赋值已是值复制，无其他句柄需遍历。
+  // 失败/边界：任一 wrapper 非 exact completion、cast 失败或外层句柄相同时返回
+  //   0；payload 只含动态 byte array，无其他句柄需遍历。
   virtual function bit completion_payload_graph_detached(
     uvm_object source,
     uvm_object snapshot
@@ -574,7 +616,11 @@ class rdma_hw_cmq_hw_profile extends rdma_cmq_hw_profile;
     rdma_hw_cmq_completion source_payload;
     rdma_hw_cmq_completion snapshot_payload;
 
-    return $cast(source_payload, source) &&
+    return source != null && snapshot != null &&
+           source.get_object_type() == rdma_hw_cmq_completion::get_type() &&
+           snapshot.get_object_type() ==
+             rdma_hw_cmq_completion::get_type() &&
+           $cast(source_payload, source) &&
            $cast(snapshot_payload, snapshot) &&
            source_payload != snapshot_payload;
   endfunction

@@ -57,7 +57,24 @@ endclass
 // 设计说明：该 OCC 子类把源变异隐藏在 clone() 内，证明 production profile
 // 必须按 exact 支持类型直接复制，而不能信任 polymorphic legacy clone。
 class rdma_hw_snapshot_mutating_occ extends rdma_hw_occ_flush_body;
-  `uvm_object_utils(rdma_hw_snapshot_mutating_occ)
+  typedef uvm_object_registry#(
+    rdma_hw_snapshot_mutating_occ,
+    "rdma_hw_snapshot_mutating_occ"
+  ) type_id;
+
+  // 功能：返回 hostile OCC fixture 的独立 UVM registry singleton。
+  // 输入/输出及副作用：无输入；返回 type_id wrapper，不创建或修改 fixture。
+  // 失败/边界：wrapper 注册名保持真实子类名，不随伪造的 get_type_name 改变。
+  static function type_id get_type();
+    return type_id::get();
+  endfunction
+
+  // 功能：向 UVM factory 暴露 hostile OCC 的真实注册 wrapper 身份。
+  // 输入/输出及副作用：无输入；返回 get_type()，不分配 body 或执行 clone。
+  // 失败/边界：不得返回 OCC 基类 wrapper，否则 fixture 无法检验名称冒充边界。
+  virtual function uvm_object_wrapper get_object_type();
+    return get_type();
+  endfunction
 
   // 功能：构造 clone() 会篡改源 QPN 的 OCC body fixture，用于证明旧 clone 边界不可信。
   // 输入/输出及副作用：name 透传给 rdma_hw_occ_flush_body；其余字段由测试填充。
@@ -66,12 +83,56 @@ class rdma_hw_snapshot_mutating_occ extends rdma_hw_occ_flush_body;
     super.new(name);
   endfunction
 
+  // 功能：故意伪造受支持 OCC 基类的 legacy 类型名，复现字符串 dispatch 绕过。
+  // 输入/输出及副作用：无输入；返回基类名称，不改变本 fixture 或 factory wrapper。
+  // 失败/边界：该欺骗仅针对 get_type_name；get_object_type 仍返回本注册子类的独立 wrapper。
+  virtual function string get_type_name();
+    return "rdma_hw_occ_flush_body";
+  endfunction
+
   // 功能：注入 clone 期间源对象变异，再委托基类克隆。
   // 输入/输出及副作用：无参数；先将当前 qpn 加一，再返回 super.clone() 的 uvm_object。
   // 失败/边界：源变异是故意测试副作用；基类 factory clone 失败时可返回 null，本方法不恢复 qpn。
   virtual function uvm_object clone();
     qpn++;
     return super.clone();
+  endfunction
+endclass
+
+// 设计说明：completion hostile subtype 只伪造 legacy 类型名，验证 payload seam
+// 以 UVM wrapper 身份而非可覆盖字符串封闭支持集合。
+class rdma_hw_snapshot_spoofed_completion extends rdma_hw_cmq_completion;
+  typedef uvm_object_registry#(
+    rdma_hw_snapshot_spoofed_completion,
+    "rdma_hw_snapshot_spoofed_completion"
+  ) type_id;
+
+  // 功能：返回 hostile completion fixture 的独立 UVM registry singleton。
+  // 输入/输出及副作用：无输入；返回 type_id wrapper，不构造 payload。
+  // 失败/边界：注册身份必须保持子类类型，不能跟随 get_type_name 的基类伪装。
+  static function type_id get_type();
+    return type_id::get();
+  endfunction
+
+  // 功能：向 snapshot 测试公开 hostile completion 的真实 wrapper 身份。
+  // 输入/输出及副作用：无输入；返回 get_type()，不读写 payload bytes。
+  // 失败/边界：若错误返回基类 wrapper，hostile fixture 应由前置断言拒绝。
+  virtual function uvm_object_wrapper get_object_type();
+    return get_type();
+  endfunction
+
+  // 功能：构造可通过 completion 基类 cast、但具有独立注册 wrapper 的 hostile payload。
+  // 输入/输出及副作用：name 透传给基类；payload 标量与 bytes 由测试随后填写。
+  // 失败/边界：fixture 自身可保持值合法，但 production snapshot 必须按 wrapper 拒绝。
+  function new(string name = "rdma_hw_snapshot_spoofed_completion");
+    super.new(name);
+  endfunction
+
+  // 功能：故意返回受支持 completion 基类名，复现 get_type_name 字符串冒充。
+  // 输入/输出及副作用：无输入；仅返回固定字符串，不改 wrapper 或 payload 字段。
+  // 失败/边界：get_object_type 仍由本类显式 registry 方法提供且必须不同于基类 wrapper。
+  virtual function string get_type_name();
+    return "rdma_hw_cmq_completion";
   endfunction
 endclass
 
@@ -1237,6 +1298,40 @@ class rdma_cmq_profile_test extends uvm_test;
                  "unknown body published tag or bytes")
   endfunction
 
+  // 功能：逐一证明 QPC next_state 的 7..15 spare 编码不能进入 V1 canonical bytes。
+  // 输入/输出及副作用：无显式输入；构造 exact QPC body，并为每个 spare 值调用
+  //   production profile；只用 UVM error 报告结果，不修改外部资源。
+  // 失败/边界：每次调用必须返回非空 INVALID_ARGUMENT，同时清空预置 schema_tag 与
+  //   canonical_bytes；任何 spare 被编码或失败后残留输出都视为原子性缺陷。
+  function automatic void check_qpc_spare_state_canonicalization();
+    rdma_hw_cmq_hw_profile profile;
+    rdma_hw_qpc_command_body qpc_body;
+    rdma_status status;
+    string schema_tag;
+    byte unsigned canonical_bytes[];
+
+    profile = rdma_hw_cmq_hw_profile::type_id::create(
+      "qpc_spare_state_profile"
+    );
+    qpc_body = new("qpc_spare_state_body");
+    qpc_body.qp_h = make_handle(
+      "qpc_spare_state_qp", RDMA_RESOURCE_QP, 24'h123456
+    );
+    for (int unsigned state_value = 7; state_value < 16; state_value++) begin
+      qpc_body.next_state = rdma_qp_state_e'(state_value);
+      schema_tag = "preseeded-spare-tag";
+      canonical_bytes = '{8'ha5};
+      status = profile.canonicalize_command_body(
+        qpc_body, schema_tag, canonical_bytes
+      );
+      if (status == null || status.code != RDMA_SC_INVALID_ARGUMENT ||
+          schema_tag != "" || canonical_bytes.size() != 0)
+        `uvm_error("BODY_QPC_SPARE_STATE",
+                   $sformatf("next_state=%0d was accepted or published output",
+                             state_value))
+    end
+  endfunction
+
   // 功能：把 OCC fixture 重置为 driver 支持的 VF、MR-serial、QPN 或 PD pattern。
   // 输入/输出及副作用：body 为 inout、pattern 为输入；覆盖全部十五个 OCC 字段。
   // 失败/边界：pattern 仅接受 0..3；其他值保留全零无效形状供调用测试发现。
@@ -1809,6 +1904,7 @@ class rdma_cmq_profile_test extends uvm_test;
     rdma_hw_cmq_payload_check_probe profile;
     rdma_hw_cmq_completion source;
     rdma_hw_cmq_completion snapshot;
+    rdma_hw_snapshot_spoofed_completion spoofed_payload;
     uvm_object snapshot_object;
     rdma_cmq_value_wrong_factory_object unknown_payload;
     rdma_cmq_value_factory_fault_wrapper completion_fault;
@@ -1916,6 +2012,26 @@ class rdma_cmq_profile_test extends uvm_test;
     if (snapshot_object != null)
       `uvm_error("PAYLOAD_SNAPSHOT_UNKNOWN",
                  "unknown completion payload published snapshot")
+
+    spoofed_payload = new("spoofed_completion_payload");
+    spoofed_payload.owner = 1'b1;
+    spoofed_payload.opcode = RDMA_OP_CQC_QUERY;
+    spoofed_payload.object_payload = new[1];
+    spoofed_payload.object_payload[0] = 8'ha5;
+    if (spoofed_payload.get_type_name() != "rdma_hw_cmq_completion" ||
+        spoofed_payload.get_object_type() ==
+          rdma_hw_cmq_completion::get_type())
+      `uvm_error("PAYLOAD_SNAPSHOT_SPOOF_FIXTURE",
+                 "hostile completion did not isolate name from wrapper")
+    snapshot_object = source;
+    status = profile.snapshot_completion_payload(
+      spoofed_payload, snapshot_object
+    );
+    expect_status("PAYLOAD_SNAPSHOT_SPOOF", status,
+                  RDMA_SC_INVALID_ARGUMENT);
+    if (snapshot_object != null)
+      `uvm_error("PAYLOAD_SNAPSHOT_SPOOF",
+                 "name-spoofing completion payload published snapshot")
   endfunction
 
   // 功能：验证 owner-ready CQE 的 opcode/index/error/payload 解码和重复调用输出分离。
@@ -2124,7 +2240,7 @@ class rdma_cmq_profile_test extends uvm_test;
 
   // 功能：按依赖顺序运行 profile 组合、body 快照/canonicalization、SQE/CQE 和 doorbell
   //   契约场景，使所有 factory/callback 故障窗口在同一 UVM test 内受控。
-  // 输入/输出及副作用：phase 由 UVM 输入；task 在首尾配对 objection，依次调用十一组
+  // 输入/输出及副作用：phase 由 UVM 输入；task 在首尾配对 objection，依次调用十二组
   //   本地断言 helper；结果通过 UVM report 可见，不执行 VCS 外的资源清理。
   // 失败/边界：helper 的普通拒绝只报告错误并继续后续场景；若 UVM fatal 终止仿真，
   //   phase 无恢复语义，否则全部 helper 返回后必定 drop objection。
@@ -2134,6 +2250,7 @@ class rdma_cmq_profile_test extends uvm_test;
     check_driver_034_registry_contract();
     check_body_snapshot_contract();
     check_body_canonicalization_contract();
+    check_qpc_spare_state_canonicalization();
     check_body_schema_field_mutations();
     check_compose_sqe();
     check_compose_generation_policy();

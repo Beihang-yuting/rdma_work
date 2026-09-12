@@ -498,7 +498,7 @@ class rdma_function_binding extends uvm_object;
       return snapshot_status(
         RDMA_SC_INVALID_STATE, "Function identity snapshot source is null"
       );
-    if (identity.get_type_name() != "rdma_function_identity" ||
+    if (identity.get_object_type() != rdma_function_identity::get_type() ||
         identity.function_uid == 0 || identity.generation == 0 ||
         !rdma_function_key_route_valid(identity.key))
       return snapshot_status(
@@ -543,21 +543,23 @@ class rdma_function_binding extends uvm_object;
         RDMA_SC_INVALID_STATE,
         "Function identity nonfatal snapshot returned null status"
       ) : status;
-    if (pcie == null || pcie.get_type_name() != "rdma_pcie_identity")
+    if (pcie == null ||
+        pcie.get_object_type() != rdma_pcie_identity::get_type())
       return snapshot_status(
         RDMA_SC_INVALID_STATE,
         "Function binding PCIe identity is null or unsupported"
       );
     foreach (pcie.bar[i]) begin
       if (pcie.bar[i] == null ||
-          pcie.bar[i].get_type_name() != "rdma_bar_info")
+          pcie.bar[i].get_object_type() != rdma_bar_info::get_type())
         return snapshot_status(
           RDMA_SC_INVALID_STATE,
           $sformatf("Function binding BAR %0d is null or unsupported", i)
         );
     end
-    if (owner_h != null && owner_h.get_type_name() != "rdma_handle" &&
-        owner_h.get_type_name() != "rdma_function_handle")
+    if (owner_h != null &&
+        owner_h.get_object_type() != rdma_handle::get_type() &&
+        owner_h.get_object_type() != rdma_function_handle::get_type())
       return snapshot_status(
         RDMA_SC_INVALID_ARGUMENT,
         "Function binding owner runtime subtype is unsupported"
@@ -603,7 +605,8 @@ class rdma_function_binding extends uvm_object;
     if (owner_h == null) begin
       candidate.owner_h = null;
     end
-    else if (owner_h.get_type_name() == "rdma_function_handle") begin
+    else if (owner_h.get_object_type() ==
+             rdma_function_handle::get_type()) begin
       function_owner_candidate = new("binding_function_owner_snapshot");
       owner_candidate = function_owner_candidate;
       owner_candidate.kind = owner_h.kind;
@@ -682,7 +685,7 @@ class rdma_function_binding extends uvm_object;
     else
       values_equal &= candidate.owner_h != null &&
         candidate.owner_h != owner_h &&
-        candidate.owner_h.get_type_name() == owner_h.get_type_name() &&
+        candidate.owner_h.get_object_type() == owner_h.get_object_type() &&
         candidate.owner_h.same_instance(owner_h);
     if (!values_equal)
       return snapshot_status(
