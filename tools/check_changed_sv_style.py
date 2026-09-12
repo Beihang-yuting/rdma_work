@@ -125,48 +125,88 @@ def add_untracked(root: Path, changes: ChangeSet) -> None:
         changes.new_files.add(name)
 
 
-def strip_comments_and_strings(line: str) -> str:
-    """功能：移除一行中的注释和字符串字面量，保留语法标点供语句计数。
-    输入输出及副作用：输入原始 SV 行，返回等长空格替换结果；不改变调用方字符串。
-    失败边界：跨行块注释由逐行近似处理，常规行内注释、转义引号和字符串分号会被忽略。
+@dataclass
+class _SanitizeState:
+    """功能：保存跨行 SystemVerilog 注释和字符串的词法状态。
+    输入输出及副作用：状态由源文扫描器逐行更新，输出只影响后续空格替换；不持有文件资源。
+    失败边界：SystemVerilog 不支持嵌套块注释，遇到未闭合字符串或注释时状态延续到文件末尾。
     """
+
+    in_block_comment: bool = False
+    in_string: bool = False
+
+
+def _blank_character(character: str) -> str:
+    """功能：将注释或字符串中的字符替换为空白，同时保留换行边界。
+    输入输出及副作用：输入单个源字符，返回等长替代字符；纯函数不修改扫描状态。
+    失败边界：仅保留 CR/LF，其他控制字符统一变为空格以维持列号和行号稳定。"""
+
+    return character if character in "\r\n" else " "
+
+
+def _sanitize_line(line: str, state: _SanitizeState) -> str:
+    """功能：按共享词法状态移除一行中的注释和字符串，保留可计数语法。
+    输入输出及副作用：输入原始行和可变 state，返回与原行等长的净化行并更新跨行状态。
+    失败边界：行注释截断本行；块注释、转义引号和跨行字符串继续扫描，未闭合结构延续到 EOF。"""
 
     output: list[str] = []
     index = 0
-    in_block = False
     while index < len(line):
-        if in_block:
-            end = line.find("*/", index)
-            if end < 0:
-                return "".join(output) + " " * (len(line) - index)
-            output.extend(" " * (end + 2 - index))
-            index = end + 2
-            in_block = False
-        elif line.startswith("//", index):
-            output.extend(" " * (len(line) - index))
+        if state.in_block_comment:
+            if line.startswith("*/", index):
+                output.extend((" ", " "))
+                index += 2
+                state.in_block_comment = False
+            else:
+                output.append(_blank_character(line[index]))
+                index += 1
+            continue
+
+        if state.in_string:
+            character = line[index]
+            output.append(_blank_character(character))
+            index += 1
+            if character == "\\" and index < len(line):
+                output.append(_blank_character(line[index]))
+                index += 1
+            elif character == '"':
+                state.in_string = False
+            continue
+
+        if line.startswith("//", index):
+            output.extend(_blank_character(character) for character in line[index:])
             break
-        elif line.startswith("/*", index):
-            output.extend("  ")
+        if line.startswith("/*", index):
+            output.extend((" ", " "))
             index += 2
-            in_block = True
-        elif line[index] == '"':
+            state.in_block_comment = True
+            continue
+        character = line[index]
+        if character == '"':
             output.append(" ")
             index += 1
-            while index < len(line):
-                output.append(" ")
-                if line[index] == "\\":
-                    index += 1
-                    if index < len(line):
-                        output.append(" ")
-                elif line[index] == '"':
-                    index += 1
-                    break
-                else:
-                    index += 1
-        else:
-            output.append(line[index])
-            index += 1
+            state.in_string = True
+            continue
+        output.append(character)
+        index += 1
     return "".join(output)
+
+
+def sanitize_source(lines: list[str]) -> list[str]:
+    """功能：以单一词法状态净化完整 SV 源文，供所有结构扫描共享。
+    输入输出及副作用：输入按行源文，返回等长净化行列表；不修改原始行或工作树文件。
+    失败边界：跨行块注释和字符串会正确延续，未闭合结构只抑制其后文本而不伪造语法。"""
+
+    state = _SanitizeState()
+    return [_sanitize_line(line, state) for line in lines]
+
+
+def strip_comments_and_strings(line: str) -> str:
+    """功能：为单行调用者提供注释/字符串净化兼容入口。
+    输入输出及副作用：输入一行文本，返回等长净化文本；独立调用不会跨外部行保存状态。
+    失败边界：需要跨行语义的检查必须调用 sanitize_source，单行入口不承诺跨调用状态。"""
+
+    return sanitize_source([line])[0]
 
 
 def source_lines(root: Path, revision: str | None, path: str) -> list[str]:
@@ -195,33 +235,39 @@ def is_comment(line: str) -> bool:
     return line.strip().startswith("//")
 
 
-def method_ranges(lines: list[str]) -> list[tuple[int, int, int]]:
-    """功能：定位 function/task 声明及其结束行，为变更行关联方法。
-    输入输出及副作用：输入完整源文，返回 (声明行、结束行、结束索引) 的一基序号元组。
-    失败边界：未闭合方法延伸到文件末尾；嵌套方法不是合法 SV，按最外层结束处理。
-    """
+def method_ranges(cleaned_lines: list[str]) -> list[tuple[int, int, int]]:
+    """功能：在已净化的完整源文中定位 function/task 声明及其结束行。
+    输入输出及副作用：输入 sanitize_source 的行列表，返回 (声明行、结束行、索引) 元组；不修改源文。
+    失败边界：未闭合方法延伸到文件末尾；块注释和字符串已被净化，不会产生伪方法。"""
 
     methods: list[tuple[int, int, int]] = []
-    for index, line in enumerate(lines):
-        if not METHOD_RE.match(strip_comments_and_strings(line)):
+    for index, line in enumerate(cleaned_lines):
+        if not METHOD_RE.match(line):
             continue
-        end = len(lines)
-        for cursor in range(index + 1, len(lines)):
-            if END_RE.match(strip_comments_and_strings(lines[cursor])):
+        end = len(cleaned_lines)
+        for cursor in range(index + 1, len(cleaned_lines)):
+            if END_RE.match(cleaned_lines[cursor]):
                 end = cursor + 1
                 break
         methods.append((index + 1, end, index))
     return methods
 
 
-def check_method_comments(path: str, lines: list[str], changed: set[int], diagnostics: list[Diagnostic]) -> None:
+def check_method_comments(
+    path: str,
+    lines: list[str],
+    changed: set[int],
+    diagnostics: list[Diagnostic],
+    cleaned_lines: list[str] | None = None,
+) -> None:
     """功能：为包含变更行的每个 function/task 检查独占且紧邻的三段中文注释。
     输入输出及副作用：输入源文和变更行集合，向 diagnostics 添加缺失注释错误；不修改源文。
     失败边界：空行、代码行或已被另一方法使用的注释块都会终止/拒绝邻接搜索。
     """
 
     claimed: dict[tuple[int, int], int] = {}
-    for start, end, declaration_index in method_ranges(lines):
+    cleaned = cleaned_lines if cleaned_lines is not None else sanitize_source(lines)
+    for start, end, declaration_index in method_ranges(cleaned):
         if not any(start <= line <= end for line in changed):
             continue
         cursor = declaration_index - 1
@@ -263,45 +309,58 @@ def check_file_header(path: str, lines: list[str], diagnostics: list[Diagnostic]
             diagnostics.append(Diagnostic(path, 1, f"file header lacks {item}"))
 
 
-def check_changed_lines(path: str, lines: list[str], changed: set[int], diagnostics: list[Diagnostic]) -> None:
+def check_changed_lines(
+    path: str,
+    lines: list[str],
+    changed: set[int],
+    diagnostics: list[Diagnostic],
+    cleaned_lines: list[str] | None = None,
+) -> None:
     """功能：检查新增行的尾随空白、长度、单语句及单行 if-return 约束。
     输入输出及副作用：输入路径、源文和新增行号，添加硬错误或 soft-limit 提示；不改写文本。
-    失败边界：for 头恰好两个分隔分号是唯一多分号例外，注释/字符串分号不计入语句。
+    失败边界：for 头恰好两个分隔分号是唯一多分号例外，完整源文净化后注释/字符串分号不计入语句。
     """
 
+    cleaned = cleaned_lines if cleaned_lines is not None else sanitize_source(lines)
     for number in sorted(changed):
         if number < 1 or number > len(lines):
             continue
         original = lines[number - 1]
-        cleaned = strip_comments_and_strings(original)
+        cleaned_line = cleaned[number - 1]
         if original.rstrip("\n\r").endswith((" ", "\t")):
             diagnostics.append(Diagnostic(path, number, "changed SV line has trailing whitespace"))
         if len(original) > 100:
             diagnostics.append(Diagnostic(path, number, "soft-limit: changed SV line exceeds 100 columns", hard=False))
-        if re.search(r"\bif\s*\([^)]*\)\s*return\b", cleaned):
+        if re.search(r"\bif\s*\([^)]*\)\s*return\b", cleaned_line):
             diagnostics.append(Diagnostic(path, number, "single-line if return is not allowed"))
-        semicolons = cleaned.count(";")
-        is_for = bool(re.match(r"^\s*for\s*\(", cleaned))
+        semicolons = cleaned_line.count(";")
+        is_for = bool(re.match(r"^\s*for\s*\(", cleaned_line))
         if semicolons > 1 and not (is_for and semicolons == 2):
             diagnostics.append(Diagnostic(path, number, "changed SV line contains multiple statements"))
 
 
-def check_cases(path: str, lines: list[str], changed: set[int], diagnostics: list[Diagnostic]) -> None:
+def check_cases(
+    path: str,
+    lines: list[str],
+    changed: set[int],
+    diagnostics: list[Diagnostic],
+    cleaned_lines: list[str] | None = None,
+) -> None:
     """功能：检查变更 case 块是否有 default，并拒绝无 begin/end 的多语句分支。
     输入输出及副作用：输入源文和变更行，按 case 块添加稳定诊断；不改变 case 结构。
     失败边界：仅包含变更行的 case 才检查，嵌套 case 按最近 endcase 收束，注释字符串已剥离。
     """
 
+    cleaned = cleaned_lines if cleaned_lines is not None else sanitize_source(lines)
     index = 0
     while index < len(lines):
-        cleaned = strip_comments_and_strings(lines[index])
-        if not re.search(r"\bcase(?:z|x)?\s*\(", cleaned):
+        if not re.search(r"\bcase(?:z|x)?\s*\(", cleaned[index]):
             index += 1
             continue
         end = index + 1
         depth = 1
         while end < len(lines) and depth:
-            token = strip_comments_and_strings(lines[end])
+            token = cleaned[end]
             if re.search(r"\bcase(?:z|x)?\s*\(", token):
                 depth += 1
             if re.search(r"\bendcase\b", token):
@@ -310,20 +369,20 @@ def check_cases(path: str, lines: list[str], changed: set[int], diagnostics: lis
         block_changed = any(index + 1 <= line <= end for line in changed)
         if block_changed:
             block = lines[index:end]
-            if not any(re.search(r"\bdefault\s*:", strip_comments_and_strings(item)) for item in block):
+            if not any(re.search(r"\bdefault\s*:", cleaned[item_index]) for item_index in range(index, end)):
                 diagnostics.append(Diagnostic(path, index + 1, "changed case lacks explicit default"))
             branch_start: int | None = None
             branch_has_begin = False
             branch_statements = 0
-            for offset, item in enumerate(block[1:], index + 2):
-                token = strip_comments_and_strings(item)
+            for offset in range(index + 1, end):
+                token = cleaned[offset]
                 if re.search(r"\bendcase\b", token):
                     break
                 label = re.match(r"^\s*(?:default|[^:]+):", token)
                 if label:
                     if branch_start is not None and branch_statements > 1 and not branch_has_begin:
                         diagnostics.append(Diagnostic(path, branch_start, "multi-statement case branch requires begin/end"))
-                    branch_start = offset
+                    branch_start = offset + 1
                     branch_has_begin = "begin" in token
                     branch_statements = token[token.find(":") + 1 :].count(";")
                 elif branch_start is not None:
@@ -348,9 +407,10 @@ def run_checks(root: Path, changes: ChangeSet, revision: str | None) -> list[Dia
             diagnostics.append(Diagnostic(path, 1, str(exc)))
             continue
         changed = changes.lines[path]
-        check_changed_lines(path, lines, changed, diagnostics)
-        check_method_comments(path, lines, changed, diagnostics)
-        check_cases(path, lines, changed, diagnostics)
+        cleaned = sanitize_source(lines)
+        check_changed_lines(path, lines, changed, diagnostics, cleaned)
+        check_method_comments(path, lines, changed, diagnostics, cleaned)
+        check_cases(path, lines, changed, diagnostics, cleaned)
         if path in changes.new_files:
             check_file_header(path, lines, diagnostics)
     return sorted(diagnostics, key=lambda item: (item.path, item.line, item.message))

@@ -84,11 +84,53 @@ class ChangedSvStyleTest(unittest.TestCase):
         失败边界：任一方法缺邻接注释、合法 for 或返回语句被误报即失败。"""
 
         addition = """  // 功能：构造对象。\n  // 输入/输出及副作用：初始化对象状态。\n  // 失败/边界：资源不足时保持默认值。\n  function new();\n  endfunction\n  // 功能：读取状态。\n  // 输入/输出及副作用：返回 value，不更新对象。\n  // 失败/边界：对象失效时返回零。\n  function int get_status();\n    return value;\n  endfunction\n  // 功能：执行任务。\n  // 输入/输出及副作用：更新状态并完成 task。\n  // 失败/边界：忙时保持原状态。\n  task run_task();\n    value = value + 1;\n  endtask\n  // 功能：探测状态。\n  // 输入/输出及副作用：返回探测结果。\n  // 失败/边界：无效句柄返回零。\n  function bit probe();\n    return 1'b0;\n  endfunction\n  // 功能：构造测试辅助 fixture。\n  // 输入/输出及副作用：创建临时资源并由测试释放。\n  // 失败/边界：资源不足时返回零。\n  function bit test_helper();\n    return 1'b0;\n  endfunction\n"""
-        holder, root, base = self.create_repo(self.valid_source() + "\n" + addition)
+        base_source = self.valid_source()
+        holder, root, base = self.create_repo(base_source)
         with holder:
-            (root / "sample.sv").write_text(self.valid_source() + "\n" + addition + "// changed\n", encoding="utf-8")
+            changed_source = base_source.replace("endclass\n", addition + "endclass\n")
+            (root / "sample.sv").write_text(changed_source, encoding="utf-8")
             result = self.invoke(root, base)
             self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_multiline_block_comment_is_ignored_by_all_scans(self) -> None:
+        """功能：确认跨行块注释中的分号、case 和伪 function 文本不会污染变更行检查。
+        输入输出及副作用：在临时 SV 的跨行注释内修改伪代码行，输出零诊断；仅写临时 fixture。
+        失败边界：块注释状态若按行重置，会把伪方法或多分号误判为 changed SV 违规。"""
+
+        base_source = self.valid_source().replace(
+            "class sample;\n",
+            "class sample;\n"
+            "  /*\n"
+            "   placeholder\n"
+            "  */\n",
+        )
+        changed_source = base_source.replace(
+            "   placeholder",
+            "   function fake(); value = 1; value = 2; case (value); endcase",
+        ).replace("  value = 0;", "  value = 1;")
+        holder, root, base = self.create_repo(base_source)
+        with holder:
+            (root / "sample.sv").write_text(changed_source, encoding="utf-8")
+            result = self.invoke(root, base)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_missing_base_argument_is_rejected(self) -> None:
+        """功能：确认 checker CLI 缺少必需 --base 时由 argparse 稳定拒绝。
+        输入输出及副作用：在临时仓库调用无参数 CLI，输出非零状态和 required 诊断；不写入仓库。
+        失败边界：若缺少 base 被静默接受或触发无关 Git 错误，说明入口契约不明确。"""
+
+        holder, root, _base = self.create_repo(self.valid_source())
+        with holder:
+            result = subprocess.run(
+                ["python3", str(CHECKER)],
+                cwd=root,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("--base", result.stderr)
+            self.assertIn("required", result.stderr)
 
     def test_missing_each_required_method_label_is_rejected(self) -> None:
         """功能：分别删除功能、输入输出及副作用、失败边界标签并确认硬诊断。
