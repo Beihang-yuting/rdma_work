@@ -355,10 +355,12 @@ class rdma_cmq_port_test extends rdma_cmq_engine_test;
                  "rejected snapshots advanced sequence or consumed outcome")
   endtask
 
-  // 功能：在测试辅助 rdma_cmq_port_test.check_mock_fifo_status_and_reconcile 中构造或驱动“mock fifo status and reconcile”场景，并断言 DUT
-  //   的状态、错误码和资源账本符合契约。
-  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
-  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
+  // 功能：验证 mock CMQ 的失败、超时、晚完成和成功 FIFO 顺序，并确认 ticket
+  //   从调用快照派生、absolute_deadline 使用调用时刻加 command.timeout。
+  // 输入/输出及副作用：无显式输入；构造三条 command 和注入结果，调用 execute/
+  //   reconcile，消费一次 late completion，并以 UVM assertion 发布可观察结果。
+  // 失败/边界：缺失 detached ticket/completion、错误序列、重复消费、caller 突变
+  //   泄漏，或非零仿真时刻下 deadline 仍按裸 timeout 比较时报告 UVM_ERROR。
   task automatic check_mock_fifo_status_and_reconcile();
     rdma_function_binding binding;
     rdma_mock_cmq_port mock_cmq;
@@ -378,6 +380,7 @@ class rdma_cmq_port_test extends rdma_cmq_engine_test;
     int unsigned saved_generation;
     bit [31:0] saved_opcode;
     int unsigned saved_flags;
+    time execute_started_at;
 
     binding = make_binding("mock_port_binding", RDMA_BIND_ACTIVE);
     mock_cmq = rdma_mock_cmq_port::type_id::create("mock_cmq");
@@ -400,6 +403,9 @@ class rdma_cmq_port_test extends rdma_cmq_engine_test;
     if (!$cast(recorded_body, command.body))
       `uvm_fatal("MOCK_PORT_FIXTURE", "command body has an unexpected type")
     saved_flags = recorded_body.flags;
+    // 中文：ticket 保存绝对截止时刻；先记录本次无阻塞 mock 调用的起点，既保留
+    // 前序 fallback 的非零时间覆盖，也避免把 timeout 时长误当成绝对时间。
+    execute_started_at = $time;
     port.execute(command, ticket, completion, status);
     expect_status("MOCK_PORT_FAIL_STATUS", status, RDMA_SC_DMA_PERMISSION);
     if (ticket == null || completion == null ||
@@ -419,7 +425,7 @@ class rdma_cmq_port_test extends rdma_cmq_engine_test;
           ticket.command_id != 1 ||
           ticket.function_h.generation != saved_generation ||
           ticket.opcode_key.opcode != saved_opcode ||
-          ticket.absolute_deadline != command.timeout ||
+          ticket.absolute_deadline != execute_started_at + command.timeout ||
           mock_cmq.calls[0].\sequence  != 1 ||
           mock_cmq.calls[0].ticket.command_id != ticket.command_id)
         `uvm_error("MOCK_PORT_TICKET_ORIGIN",
@@ -1160,6 +1166,80 @@ class rdma_cmq_port_test extends rdma_cmq_engine_test;
     end
   endtask
 
+  // 功能：逐项验证 command identity 的无 factory 形状判断与既有 Function/opcode
+  //   validator 接受集合一致，覆盖空节点、非法 kind/generation、分隔符和零 opcode。
+  // 输入/输出及副作用：无显式输入；为每个 case 新建 command/identity，并调用
+  //   capture_from、rdma_cmq_function_status 和 opcode_key.validate 生成 UVM 断言。
+  // 失败/边界：任一接受结果偏离手工真值或两套 validator 语义不一致时报告
+  //   UVM_ERROR；fixture 不安装 factory override，也不推进仿真时间。
+  task automatic check_command_identity_capture_equivalence();
+    rdma_function_binding binding;
+    rdma_cmq_command_desc command;
+    rdma_cmq_command_desc tested_command;
+    rdma_cmq_command_identity identity;
+    rdma_status function_status;
+    rdma_status opcode_status;
+    string failure_reason;
+    bit capture_accepts;
+    bit validators_accept;
+    bit expected_accept;
+
+    binding = make_binding("identity_equivalence_binding", RDMA_BIND_ACTIVE);
+    for (int unsigned case_index = 0; case_index < 11; case_index++) begin
+      command = make_command(
+        $sformatf("identity_equivalence_%0d", case_index), binding,
+        RDMA_OP_CQC_QUERY, byte'(8'h80 + case_index), 1us
+      );
+      tested_command = command;
+      expected_accept = (case_index == 0 || case_index == 10);
+      case (case_index)
+        1: tested_command = null;
+        2: command.function_h = null;
+        3: command.opcode_key = null;
+        4: command.function_h.kind = RDMA_RESOURCE_CMQ;
+        5: command.function_h.generation = 0;
+        6: command.opcode_key.profile_name = "";
+        7: command.opcode_key.variant = "";
+        8: command.opcode_key.profile_name = "bad|profile";
+        9: command.opcode_key.variant = "bad|variant";
+        10: command.opcode_key.opcode = 0;
+        default: begin
+        end
+      endcase
+
+      identity = new($sformatf("identity_equivalence_result_%0d", case_index));
+      capture_accepts = identity.capture_from(tested_command, failure_reason);
+      validators_accept = 1'b0;
+      function_status = null;
+      opcode_status = null;
+      if (tested_command != null) begin
+        function_status = rdma_cmq_function_status(
+          tested_command.function_h, "CMQ command identity equivalence"
+        );
+        if (function_status != null && function_status.ok() &&
+            tested_command.opcode_key != null) begin
+          opcode_status = tested_command.opcode_key.validate();
+          if (opcode_status != null && opcode_status.ok())
+            validators_accept = 1'b1;
+        end
+      end
+
+      if (capture_accepts != expected_accept ||
+          validators_accept != expected_accept ||
+          capture_accepts != validators_accept ||
+          (capture_accepts && failure_reason != "") ||
+          (!capture_accepts && failure_reason == ""))
+        `uvm_error(
+          "COMMAND_IDENTITY_CAPTURE_EQUIVALENCE",
+          $sformatf(
+            "case=%0d expected=%0b capture=%0b validators=%0b reason='%s'",
+            case_index, expected_accept, capture_accepts, validators_accept,
+            failure_reason
+          )
+        )
+    end
+  endtask
+
   // 功能：验证 base port 对仅有 execute() 的 legacy adapter 只发布 detached、
   //   UNOBSERVED 结果，并在 payload、状态和 raw-factory 异常下保留独立字段。
   // 输入/输出及副作用：无显式输入；构造 legacy adapter、command、completion 和
@@ -1397,11 +1477,15 @@ class rdma_cmq_port_test extends rdma_cmq_engine_test;
     end
   endtask
 
-  // 功能：在 rdma_cmq_port_test 中，run_phase 驱动 UVM 阶段中的场景初始化、事务执行和断言收尾，并在退出前释放 objection 或测试资源。
-  // 输入/输出及副作用：phase（输入）；phase 由 UVM 提供；task 通过 objection、日志和断言暴露结果，可能调用 DUT 接口但不改变其所有权规则。
-  // 失败/边界：run_phase 的 setup/阶段驱动失败时停止新增事务，并按测试生命周期清理 objection 与临时引用。
+  // 功能：按顺序执行 identity 等价性、legacy fallback、mock 与 real-engine port
+  //   场景，使 factory override 前置条件和后续非零时间 deadline 覆盖保持确定。
+  // 输入/输出及副作用：phase 为 UVM 输入；持有一次 objection，调用本类八个检查
+  //   task 并由它们发布 UVM assertion，最后释放 objection。
+  // 失败/边界：子检查通过 UVM_ERROR/FATAL 报告契约偏差；本 task 不吞掉失败，
+  //   正常路径始终在全部同步检查返回后 drop_objection。
   virtual task run_phase(uvm_phase phase);
     phase.raise_objection(this);
+    check_command_identity_capture_equivalence();
     check_legacy_observed_fallback();
     check_mock_rejects_hostile_command_snapshots();
     check_mock_fifo_status_and_reconcile();
