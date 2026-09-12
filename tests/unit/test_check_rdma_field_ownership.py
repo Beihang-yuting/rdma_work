@@ -651,6 +651,28 @@ class FieldOwnershipFixtureTest(unittest.TestCase):
             "    end\n"
             "  endcase\n"
             "endfunction\nendclass\n"
+            "class rdma_hw_cmq_request_composer;\n"
+            "function rdma_status compose_request(\n"
+            "  rdma_hw_cmq_envelope envelope, rdma_hw_image body,\n"
+            "  output rdma_hw_image result);\n"
+            "  result = null;\n"
+            "  status = envelope_codec.encode(envelope, envelope_image);\n"
+            "  status = ownership.lookup(envelope_snapshot.opcode, input_kind, masks);\n"
+            "  candidate = rdma_hw_image::type_id::create(\"rdma_cmq_request\");\n"
+            "  for (int unsigned q = 0; q < 8; q++) begin\n"
+            "    envelope_word = image_word(envelope_image, q);\n"
+            "    body_word = image_word(body, q);\n"
+            "    merged_word = envelope_word | body_word;\n"
+            "    for (int unsigned i = 0; i < 8; i++)\n"
+            "      candidate.bytes.push_back(merged_word[63 - (i * 8) -: 8]);\n"
+            "  end\n"
+            "  for (int unsigned q = 0; q < 8; q++) begin\n"
+            "    merged_word = image_word(candidate, q);\n"
+            "    if ((merged_word & ~(request_envelope_mask(q) | masks[q])) != 0)\n"
+            "      return status;\n"
+            "  end\n"
+            "  result = candidate;\n"
+            "endfunction\nendclass\n"
             "class rdma_hw_cmq_envelope_codec;\n"
             "function rdma_status encode(rdma_hw_cmq_envelope envelope, "
             "output rdma_hw_image image);\n"
@@ -703,6 +725,68 @@ class FieldOwnershipFixtureTest(unittest.TestCase):
             observed,
         )
         self.assertFalse(any(item.operation == "UNKNOWN_WRITER" for item in ranges))
+
+    def test_rejects_malformed_production_macro_in_source_walk(self):
+        """功能：source-walk 遇到残缺的生产宏续行时必须立即拒绝。
+        输入输出及副作用：传入未闭合 CMQ_QPC_PUT 定义；不写入任何
+        源码文件。
+        失败边界：宏解析错误不得降级为空表并丢失 writer 证据。"""
+        module = self.require_checker()
+        source = "`define CMQ_QPC_PUT(STEM, VALUE) " + chr(92) + "\n"
+        with self.assertRaises(module.ContractError):
+            module._scan_sv_writer_ranges({"fixture.sv": source}, {})
+
+    def test_rejects_missing_compose_request_writer(self):
+        """功能：缺少真实 compose_request 输出合并路径时拒绝 QPC writer 证明。
+        输入输出及副作用：传入只有 QPC body class 的 source；只返回错误，
+        不改文件。
+        失败边界：body/envelope writer 不能替代 composer 的 output/data-flow 证据。"""
+        module = self.require_checker()
+        source = (
+            "class rdma_hw_cmq_qpc_layout_codec;\n"
+            "function void encode_fields();\n"
+            "  builder.put_field(0, 0, 8, value);\n"
+            "endfunction\nendclass\n"
+        )
+        with self.assertRaises(module.ContractError):
+            module._scan_sv_writer_ranges({"fixture.sv": source}, {})
+
+    def test_rejects_compose_request_static_bit_bypass(self):
+        """功能：compose_request 不能以静态位赋值绕过 envelope/body merge 证明。
+        输入输出及副作用：传入伪造 composer 的 candidate bytes 写入；不执行
+        SV。
+        失败边界：缺少逐 qword envelope/body merge 或 C-derived masks 时必须
+        拒绝。"""
+        module = self.require_checker()
+        source = (
+            "class rdma_hw_cmq_request_composer;\n"
+            "function rdma_status compose_request(\n"
+            "  input rdma_hw_image body, output rdma_hw_image result);\n"
+            "  result = null;\n"
+            "  result = rdma_hw_image::type_id::create(\"result\");\n"
+            "  result.bytes[0] = 1'b1;\n"
+            "endfunction\nendclass\n"
+        )
+        with self.assertRaises(module.ContractError):
+            module._scan_sv_writer_ranges({"fixture.sv": source}, {})
+
+    def test_rejects_anchor_range_on_unrelated_flow_node(self):
+        """功能：range/base/length 必须与 declared buffer 位于同一 flow 节点。
+        输入输出及副作用：把 wqe 的 [0] 范围伪造到 foo 节点；不写入 source。
+        失败边界：全局字符串同时出现 buffer、range 和 target 时仍须拒绝。"""
+        module = self.require_checker()
+        row = self.minimal_ownership(
+            anchor_target_flow=(
+                "info->qpn -> wqe -> foo[0] -> "
+                "XTRDMA_CMQSQ_WQE_QPN -> target"
+            )
+        )
+        body = (
+            "set_64bit_val(wqe, 0, "
+            "FIELD_PREP(XTRDMA_CMQSQ_WQE_QPN, info->qpn));"
+        )
+        with self.assertRaises(module.ContractError):
+            module._validate_anchor_call_arguments(row, body, "fixture.c")
 
     def test_selected_mask_ignores_other_cmq_sq_case_returns(self):
         """功能：只从 selected_mask 方法读取 CMQ SQ 的允许位 literal。

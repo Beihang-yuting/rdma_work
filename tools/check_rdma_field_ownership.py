@@ -2130,6 +2130,191 @@ def _strip_sv_macro_definitions(text: str) -> str:
         kept.append(line)
     return "".join(kept)
 
+
+def _sv_begin_block_body(source: str, begin_index: int) -> str:
+    """功能：提取从指定 begin 到配对 end 的 SV 结构块正文。
+    输入输出及副作用：返回不含外层 begin/end 的源码；只读文本，不执行
+    语句或宏。
+    失败边界：起点不是 begin、嵌套块不平衡或缺少闭合 end 时抛
+    ContractError。"""
+    if begin_index < 0 or not re.match(r"\bbegin\b", source[begin_index:]):
+        raise ContractError("SV block does not start with begin")
+    token_re = re.compile(r"\bbegin\b|\bend\b")
+    depth = 0
+    body_start = begin_index + len("begin")
+    for token in token_re.finditer(source, begin_index):
+        if token.group() == "begin":
+            depth += 1
+            continue
+        depth -= 1
+        if depth == 0:
+            return source[body_start:token.start()]
+    raise ContractError("SV begin/end block is unbalanced")
+
+
+def _validate_compose_request_writer(
+    sv_sources: Mapping[str, str],
+    coordinates: Mapping[tuple[str, str, str, str], object],
+    macro_ranges: Mapping[object, tuple[int, int, int]] | None,
+    writer_ranges: Sequence[WriterRange],
+) -> None:
+    """功能：验证 request composer 的真实 output merge，并把其输入 writer
+    绑定到 C 坐标。
+    输入输出及副作用：只读 SV、coordinates 和已扫描 ranges；成功无返回值，
+    不生成新 mask。
+    失败边界：缺 composer/function/output、缺 envelope/body merge、静态 bytes
+    绕写或 C writer 缺失均抛 ContractError。"""
+    candidates: list[tuple[str, str, str]] = []
+    production_context = False
+    for source_path, raw_source in sv_sources.items():
+        source = _strip_sv_comments(raw_source)
+        if re.search(r"\bclass\s+rdma_hw_cmq_qpc_layout_codec\b", source):
+            production_context = True
+        if not re.search(
+            r"\bclass\s+rdma_hw_cmq_request_composer\b", source
+        ):
+            continue
+        production_context = True
+        class_body = _sv_class_body(source, "rdma_hw_cmq_request_composer")
+        function_body = _sv_function_body(class_body, "compose_request")
+        candidates.append((source_path, class_body, function_body))
+    if not production_context:
+        return
+    if len(candidates) != 1:
+        raise ContractError(
+            "CMQ production source must contain one request composer compose_request"
+        )
+    source_path, class_body, body = candidates[0]
+    declaration_matches = list(re.finditer(
+        r"\bfunction\b[^;]*\bcompose_request\s*\([^;]*\)\s*;",
+        class_body,
+        re.S,
+    ))
+    if len(declaration_matches) != 1:
+        raise ContractError("compose_request declaration is not unique")
+    declaration = declaration_matches[0].group()
+    if not re.search(
+        r"\boutput\s+rdma_hw_image\s+result\b", declaration
+    ):
+        raise ContractError("compose_request output result is not declared")
+
+    compact = _normalise_sv_expr(body)
+
+    def require_fragment(pattern: str, label: str) -> None:
+        """功能：要求 compose_request 文本含一个结构化契约片段。
+        输入输出及副作用：匹配 compact 文本并返回空值；不执行匹配内容。
+        失败边界：片段缺失时抛 ContractError，防止相似字符串代替真实
+        data flow。"""
+        if re.search(pattern, compact) is None:
+            raise ContractError(f"compose_request is missing {label}")
+
+    require_fragment(r"result=null;", "output initialization")
+    require_fragment(
+        r"envelope_codec\.encode\(envelope,envelope_image\)",
+        "envelope encode",
+    )
+    require_fragment(
+        r"ownership\.lookup\(envelope_snapshot\.opcode,input_kind,masks\)",
+        "C-derived ownership lookup",
+    )
+    require_fragment(
+        r'candidate=rdma_hw_image::type_id::create\("rdma_cmq_request"\);',
+        "candidate allocation",
+    )
+    require_fragment(r"result=candidate;", "output publication")
+    require_fragment(
+        r"merged_word&~\(request_envelope_mask\(q\)\|masks\[q\]\)",
+        "C-derived ownership check",
+    )
+
+    q_loop_pattern = re.compile(
+        r"for\s*\(\s*int\s+unsigned\s+q\s*=\s*0\s*;"
+        r"\s*q\s*<\s*8\s*;\s*q\+\+\s*\)\s*begin",
+        re.S,
+    )
+    merge_blocks: list[str] = []
+    for match in q_loop_pattern.finditer(body):
+        begin_index = body.find("begin", match.start(), match.end())
+        block = _sv_begin_block_body(body, begin_index)
+        block_compact = _normalise_sv_expr(block)
+        if "candidate.bytes.push_back" not in block_compact:
+            continue
+        merge_blocks.append(block_compact)
+    if len(merge_blocks) != 1:
+        raise ContractError(
+            f"compose_request output merge loop is not unique: {len(merge_blocks)}"
+        )
+    merge_block = merge_blocks[0]
+    for pattern, label in (
+        (r"envelope_word=image_word\(envelope_image,q\);", "envelope image flow"),
+        (r"body_word=image_word\(body,q\);", "body image flow"),
+        (r"merged_word=envelope_word\|body_word;", "envelope/body merge"),
+        (r"candidate\.bytes\.push_back\(merged_word\[63-\(i\*8\)-:8\]\);",
+         "merged output write"),
+    ):
+        if re.search(pattern, merge_block) is None:
+            raise ContractError(f"compose_request merge lacks {label}")
+
+    merged_assignments = re.findall(r"merged_word=(.*?);", compact)
+    if not any(value == "envelope_word|body_word" for value in merged_assignments):
+        raise ContractError("compose_request merge is not an exact image OR")
+    if any(
+        "64'h" in value or "64'd" in value or "'0" in value
+        for value in merged_assignments
+        if value != "envelope_word|body_word"
+    ):
+        raise ContractError("compose_request merge contains a static bit value")
+
+    indexed_writes = list(re.finditer(
+        r"\b(result|candidate)\.bytes\s*\[[^]]+\]\s*=\s*([^;]+);",
+        body,
+        re.S,
+    ))
+    for match in indexed_writes:
+        owner, value = match.groups()
+        if owner == "result":
+            raise ContractError("compose_request writes result bytes directly")
+        if _normalise_sv_expr(value) != "~signature":
+            raise ContractError("compose_request has an unproven candidate byte writer")
+        lhs = _normalise_sv_expr(match.group(0))
+        if lhs != "candidate.bytes[signature_byte]=~signature;":
+            raise ContractError("compose_request signature writer is not canonical")
+    if "candidate.bytes[signature_byte]=~signature;" in compact:
+        require_fragment(
+            r"signature_byte=RDMA_CMQ_SIGNATURE_WORD_BYTE_OFFSET\+"
+            r"\(7-\(RDMA_CMQ_SIGNATURE_LSB>>3\)\);",
+            "C-derived signature byte",
+        )
+
+    if macro_ranges is None:
+        return
+    qpc_context = ("CMQ_SQE", "QPC_CREATE", "REQUEST")
+    required_macros = (
+        "XTRDMA_CMQSQ_WQE_VALID", "XTRDMA_CMQSQ_VFID_OVERRIDE",
+        "XTRDMA_CMQSQ_USE_VFID", "XTRDMA_CMQSQ_WQE_WRAP",
+        "XTRDMA_CMQSQ_WQE_INDEX", "XTRDMA_CMQCQ_OPCODE",
+        "XTRDMA_CMQSQ_WQE_QPN", "XTRDMA_CMQSQ_WQE_RQ_CQN",
+        "XTRDMA_CMQSQ_WQE_SIGN_EN", "XTRDMA_CMQSQ_WQE_SIGNATURE",
+        "XTRDMA_CMQSQ_WQE_SQ_CQN",
+        "XTRDMA_CMQSQ_WQE_QPC_BUFFER_ADDR",
+    )
+    for macro in required_macros:
+        coordinate = _coordinate_tuple(
+            coordinates, macro_ranges, qpc_context, macro
+        )
+        if coordinate is None:
+            raise ContractError(
+                f"compose_request has no C-derived coordinate: {macro}"
+            )
+        if not any(
+            item.case_id == "cmq_sqe_qpc_create_request" and
+            (item.base, item.lsb, item.width) == coordinate
+            for item in writer_ranges
+        ):
+            raise ContractError(
+                f"compose_request input writer is missing: {macro}"
+            )
+
 def _scan_sv_writer_ranges(
     sv_sources: Mapping[str, str],
     coordinates: Mapping[tuple[str, str, str, str], object],
@@ -2139,6 +2324,7 @@ def _scan_sv_writer_ranges(
     输入输出及副作用：返回去重后的 WriterRange 列表；注释和字符串不形成 writer 证据。
     失败边界：缺 class/function/branch、未知 writer 或不平衡宏均按整幅 image 记录或抛 ContractError，绝不漏报。"""
     ranges: list[WriterRange] = []
+    production_context = False
     all_sv_fields = parse_sv_field_definitions(
         "\n".join(_strip_sv_comments(source) for source in sv_sources.values())
     )
@@ -2152,10 +2338,13 @@ def _scan_sv_writer_ranges(
     }
     for source_path, raw_source in sv_sources.items():
         source = _strip_sv_comments(raw_source)
-        try:
-            macros = _sv_macro_definitions(source)
-        except ContractError:
-            macros = {}
+        if re.search(
+            r"\bclass\s+rdma_hw_cmq_qpc_layout_codec\b", source
+        ) or re.search(
+            r"\bclass\s+rdma_hw_cmq_request_composer\b", source
+        ):
+            production_context = True
+        macros = _sv_macro_definitions(source)
         sv_fields = all_sv_fields
         for case_id, (context_key, class_name, branch_label, image_length) in contexts.items():
             if class_name not in source:
@@ -2359,6 +2548,10 @@ def _scan_sv_writer_ranges(
                         case_id, source_path, "UNKNOWN_WRITER", match.group(0),
                         0, 0, image_length * 8,
                     ))
+    if production_context:
+        _validate_compose_request_writer(
+            sv_sources, coordinates, macro_ranges, ranges
+        )
     # Stable de-duplication keeps diagnostics deterministic while retaining
     # every distinct token/range needed for reverse proof.
     unique: dict[tuple[object, ...], WriterRange] = {}
@@ -2688,29 +2881,117 @@ def _anchor_flow_nodes(flow: str) -> list[str]:
     return nodes
 
 
+def _flow_node_contains(node: str, expression: str) -> bool:
+    """功能：判断单个 anchor flow 节点是否包含完整表达式而非标识符子串。
+    输入输出及副作用：返回布尔值；只规范化输入文本，不执行 C
+    表达式或修改节点。
+    失败边界：空节点/表达式或被字母数字下划线包围的伪命中均返回
+    False。"""
+    compact_node = _normalise_c_expr(node)
+    compact_expression = _normalise_c_expr(expression)
+    if not compact_node or not compact_expression:
+        return False
+    pattern = (
+        r"(?<![A-Za-z0-9_])" + re.escape(compact_expression) +
+        r"(?![A-Za-z0-9_])"
+    )
+    return re.search(pattern, compact_node) is not None
+
+
 def _require_anchor_range_in_flow(
     flow: str,
     buffer_expr: str,
     base: int,
     length: int,
+    target_expr: str | None = None,
+    *,
+    target_must_be_final: bool = False,
+    container_expr: str | None = None,
 ) -> None:
-    """功能：确认 target flow 明确携带实际 buffer 及其 byte base/length 范围。
-    输入输出及副作用：成功无返回值；只读 flow 字符串。
-    失败边界：buffer 缺失、base/length 未出现在目标区间表示中均抛 ContractError。"""
-    compact = _normalise_c_expr(flow)
+    """功能：在结构化 data-flow 节点中绑定 buffer 的 byte base/length，并闭合
+    最终 target。
+    输入输出及副作用：成功无返回值；只读 flow 字符串并按 ASCII 箭头解析
+    节点。
+    失败边界：buffer 与 range 不在同一节点、range 重复/缺失、target 缺失或
+    顺序错误均抛 ContractError。"""
+    nodes = _anchor_flow_nodes(flow)
     buffer_compact = _normalise_c_expr(buffer_expr)
-    if buffer_compact not in compact:
-        raise ContractError("anchor target flow omits actual buffer expression")
-    range_patterns = (
-        rf"\[{base}(?:[,:]\s*{length})?\]",
-        rf"\[{base}:{base + length}\]",
-        rf"\+{base}(?:\b|\])",
-    )
-    if not any(re.search(pattern, compact) for pattern in range_patterns):
-        # A scalar qword flow may name only wqe[0]/wqe[8]; require its exact
-        # indexed byte when length is one qword.
-        if f"{buffer_compact}[{base}]" not in compact:
-            raise ContractError("anchor target flow omits declared byte range")
+    if not buffer_compact:
+        raise ContractError("anchor target flow has an empty buffer expression")
+
+    def carries_range(node: str) -> bool:
+        """功能：识别同一节点内 buffer 对应的精确 byte range 表达式。
+        输入输出及副作用：返回布尔值；支持 qword index、显式 [base,length]/
+        slice
+        和指针位移。
+        失败边界：range 只出现在其他节点、length 与索引语义不符或表达式不
+        完整时返回 False。"""
+        compact_node = _normalise_c_expr(node)
+        if not _flow_node_contains(compact_node, buffer_compact):
+            return False
+        escaped_buffer = re.escape(buffer_compact)
+        indexed = rf"{escaped_buffer}\[{base}\]"
+        indexed_range = (
+            rf"{escaped_buffer}\[{base}[,:]{length}\]",
+            rf"{escaped_buffer}\[{base}:{base + length}\]",
+            rf"{escaped_buffer}\[{base}:{base + length - 1}\]",
+        )
+        if re.search(indexed, compact_node):
+            # An indexed scalar denotes one qword in these anchors; do not let
+            # a [0] token prove a different declared byte length.
+            return length == 8
+        if any(re.search(pattern, compact_node) for pattern in indexed_range):
+            return True
+        pointer_range = rf"{escaped_buffer}\+{base}"
+        if not re.search(pointer_range, compact_node):
+            return False
+        # Pointer displacement without an explicit span is only unambiguous
+        # for the qword anchors used by this contract.
+        if length == 8:
+            return True
+        return any(
+            re.search(rf"{pointer_range}(?:\+|,|:)\s*{length}", compact_node)
+            for _ in (0,)
+        )
+
+    range_indices = [
+        index for index, node in enumerate(nodes) if carries_range(node)
+    ]
+    if not range_indices:
+        raise ContractError(
+            "anchor target flow does not bind buffer and declared byte range"
+        )
+    if len(range_indices) != 1:
+        raise ContractError(
+            "anchor target flow has multiple declared buffer range nodes"
+        )
+    range_index = range_indices[0]
+
+    if container_expr is not None:
+        container_indices = [
+            index for index, node in enumerate(nodes)
+            if _flow_node_contains(node, container_expr)
+        ]
+        if not container_indices:
+            raise ContractError(
+                "anchor target flow omits declared container expression"
+            )
+        if range_index not in container_indices:
+            raise ContractError(
+                "anchor range is not attached to declared container node"
+            )
+
+    if target_expr is not None:
+        target_indices = [
+            index for index, node in enumerate(nodes)
+            if _flow_node_contains(node, target_expr)
+        ]
+        if not target_indices:
+            raise ContractError("anchor target flow omits final data-flow target")
+        if target_indices[0] < range_index:
+            raise ContractError("anchor target precedes declared buffer range")
+        if target_must_be_final and target_indices[-1] != len(nodes) - 1:
+            raise ContractError("anchor target flow does not end at final target")
 
 
 def _flow_contains_value(flow: str, expression: str) -> bool:
@@ -2872,7 +3153,12 @@ def _validate_anchor_call_arguments(
             raise ContractError("SET_64BIT_FIELD_PREP requires one qword FIELD_PREP")
         if not _flow_contains_value(row["anchor_target_flow"], value_expression):
             raise ContractError("SET_64BIT_FIELD_PREP source flow drift")
-        _require_anchor_range_in_flow(row["anchor_target_flow"], row["anchor_buffer"], base, length)
+        _require_anchor_range_in_flow(
+            row["anchor_target_flow"], row["anchor_buffer"], base, length,
+            target_expr=f"{row['anchor_buffer']}[{base}]",
+            target_must_be_final=True,
+            container_expr=declared_container,
+        )
         return
     if operation in {"GET_64BIT", "GET_64BIT_FIELD_GET"}:
         args, _ = _anchor_token_call(body, "get_64bit_val", row["anchor_token"])
@@ -2889,7 +3175,11 @@ def _validate_anchor_call_arguments(
             raise ContractError("get_64bit_val destination flow drift")
         if row["macro_name"] not in row["anchor_target_flow"]:
             raise ContractError("get_64bit_val field flow omits macro")
-        _require_anchor_range_in_flow(row["anchor_target_flow"], row["anchor_buffer"], base, length)
+        _require_anchor_range_in_flow(
+            row["anchor_target_flow"], row["anchor_buffer"], base, length,
+            target_expr=destination,
+            container_expr=declared_container,
+        )
         return
     if operation == "MEMCPY":
         args, _ = _anchor_token_call(body, "memcpy", row["anchor_token"])
@@ -2911,7 +3201,11 @@ def _validate_anchor_call_arguments(
             raise ContractError("memcpy destination omits container")
         if not _flow_contains_value(row["anchor_target_flow"], args[1]):
             raise ContractError("memcpy source flow drift")
-        _require_anchor_range_in_flow(row["anchor_target_flow"], row["anchor_buffer"], base, length)
+        _require_anchor_range_in_flow(
+            row["anchor_target_flow"], row["anchor_buffer"], base, length,
+            target_expr=destination,
+            container_expr=declared_container,
+        )
         return
     if operation == "IOWRITE64BE":
         args, _ = _anchor_token_call(body, "xtrdma_iowrite64be", row["anchor_token"])
@@ -2925,7 +3219,11 @@ def _validate_anchor_call_arguments(
             raise ContractError("xtrdma_iowrite64be target flow drift")
         if not _flow_contains_value(row["anchor_target_flow"], args[0]):
             raise ContractError("xtrdma_iowrite64be value flow drift")
-        _require_anchor_range_in_flow(row["anchor_target_flow"], row["anchor_buffer"], base, length)
+        _require_anchor_range_in_flow(
+            row["anchor_target_flow"], row["anchor_buffer"], base, length,
+            target_expr=args[1], target_must_be_final=True,
+            container_expr=declared_container,
+        )
         return
     if operation == "FIELD_PREP_OR":
         token_norm = _normalise_c_expr(row["anchor_token"])
@@ -2948,7 +3246,11 @@ def _validate_anchor_call_arguments(
             raise ContractError("FIELD_PREP_OR macro argument drift")
         if not _flow_contains_value(row["anchor_target_flow"], prep_args[1]):
             raise ContractError("FIELD_PREP_OR source flow drift")
-        _require_anchor_range_in_flow(row["anchor_target_flow"], row["anchor_buffer"], base, length)
+        _require_anchor_range_in_flow(
+            row["anchor_target_flow"], row["anchor_buffer"], base, length,
+            target_expr=f"{row['anchor_buffer']}[{base}]",
+            container_expr=declared_container,
+        )
         return
     if operation in {"ASSIGN_ADDRESS", "ASSIGN_SHIFT_RIGHT"}:
         token_norm = _normalise_c_expr(row["anchor_token"])
