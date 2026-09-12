@@ -7,13 +7,9 @@ HOST_MEM_BUILD ?= build/host_mem
 E2E_BUILD ?= build/e2e
 # 53 机上的 /home/ubuntu/workspace/host_mem 是真实 pinned backing 的只读
 # checkout；固定 commit/hash 使 E2E 可复现，同时不把外部源码复制进本仓库。
-override HOST_MEM_PINNED_COMMIT := 3b9e000d5df4d10efbb3029f43605e0362e0caca
-override HOST_MEM_PKG_SHA256 := d2ba57918a3b605525274433008142c80921b6205b0848c76bef8f1fc0d0bba5
-override HOST_MEM_MANAGER_SHA256 := 8dd5ca3ba3abcfae4808c8ea10c34ced279316bebdc04f6f8e0ae5e55e337a9d
 override RDMA_ARCHIVE := /home/ubuntu/Downloads/dpu_kernel_rdma-version_0.1.34.tar(1).gz
 # 6766c4f is the net_packet master snapshot that contains packet.sv and the
 # RoCEv2/iWARP protocol headers consumed by this adapter.
-override NET_PACKET_PINNED_COMMIT := 6766c4f042484814548481065328ffbcffab590f
 TEST ?= rdma_smoke_test
 VCS ?= vcs
 # Work around a VCS W-2024.09-SP1 class-codegen miscompile; not an RTL requirement.
@@ -162,49 +158,7 @@ host_mem_preflight:
 			exit 2; \
 		fi; \
 	done
-	@preflight_failed=0; \
-	git_metadata_available=0; \
-	if git -C "$(HOST_MEM_ROOT)" rev-parse --is-inside-work-tree \
-		>/dev/null 2>&1; then \
-		git_metadata_available=1; \
-		actual_head=$$(git -C "$(HOST_MEM_ROOT)" rev-parse HEAD); \
-		if [[ "$$actual_head" != "$(HOST_MEM_PINNED_COMMIT)" ]]; then \
-			echo "host_mem preflight failed: HEAD $$actual_head does not match pinned commit $(HOST_MEM_PINNED_COMMIT)" >&2; \
-			preflight_failed=1; \
-		else \
-			if ! git -C "$(HOST_MEM_ROOT)" diff --cached \
-				--no-ext-diff --quiet "$(HOST_MEM_PINNED_COMMIT)" -- \
-				src/host_mem_pkg.sv src/host_mem_manager.sv; then \
-				echo "host_mem preflight failed: pinned source index differs from commit $(HOST_MEM_PINNED_COMMIT) (staged change)" >&2; \
-				preflight_failed=1; \
-			fi; \
-			if ! git -C "$(HOST_MEM_ROOT)" diff --no-ext-diff --quiet -- \
-				src/host_mem_pkg.sv src/host_mem_manager.sv; then \
-				echo "host_mem preflight failed: pinned source worktree differs from the index (unstaged change)" >&2; \
-				preflight_failed=1; \
-			fi; \
-		fi; \
-	fi; \
-	pkg_hash=$$(sha256sum "$(HOST_MEM_ROOT)/src/host_mem_pkg.sv"); \
-	pkg_hash=$${pkg_hash%% *}; \
-	manager_hash=$$(sha256sum "$(HOST_MEM_ROOT)/src/host_mem_manager.sv"); \
-	manager_hash=$${manager_hash%% *}; \
-	if [[ "$$pkg_hash" != "$(HOST_MEM_PKG_SHA256)" ]]; then \
-		echo "host_mem preflight failed: host_mem_pkg.sv SHA-256 $$pkg_hash does not match pinned $(HOST_MEM_PKG_SHA256)" >&2; \
-		preflight_failed=1; \
-	fi; \
-	if [[ "$$manager_hash" != "$(HOST_MEM_MANAGER_SHA256)" ]]; then \
-		echo "host_mem preflight failed: host_mem_manager.sv SHA-256 $$manager_hash does not match pinned $(HOST_MEM_MANAGER_SHA256)" >&2; \
-		preflight_failed=1; \
-	fi; \
-	if [[ "$$preflight_failed" != 0 ]]; then \
-		exit 1; \
-	fi; \
-	if [[ "$$git_metadata_available" == 1 ]]; then \
-		echo "host_mem preflight passed: pinned git checkout and source hashes match"; \
-	else \
-		echo "host_mem preflight passed: git metadata unavailable; pinned source hashes match"; \
-	fi
+	@python3 ../tools/check_external_dependency_lock.py verify --lock ../hw/rdma/external_dependencies.tsv --dependency host_mem --root "$(HOST_MEM_ROOT)"
 
 host_mem: host_mem_preflight
 	set -euo pipefail; \
@@ -225,7 +179,7 @@ host_mem: host_mem_preflight
 		../scripts/check_uvm_summary.sh $(HOST_MEM_BUILD)/$(TEST).log; \
 	fi
 
-integration:
+integration: dpu_common_preflight
 	@if [[ -z "$(DPU_COMMON_ROOT)" ]]; then echo "DPU_COMMON_ROOT is required for integration" >&2; exit 2; fi
 	set -euo pipefail; \
 	mkdir -p build/integration; \
@@ -253,12 +207,7 @@ net_packet_preflight:
 		if [[ ! -r "$$dependency" ]]; then echo "Required net_packet dependency is not readable: $$dependency" >&2; preflight_failed=1; fi; \
 	done; \
 	if [[ "$$preflight_failed" != 0 ]]; then exit 2; fi
-	@if git -C "$(NET_PACKET_ROOT)" rev-parse --is-inside-work-tree >/dev/null 2>&1; then \
-		actual_head=$$(git -C "$(NET_PACKET_ROOT)" rev-parse HEAD); \
-		if [[ "$$actual_head" != "$(NET_PACKET_PINNED_COMMIT)" ]]; then echo "net_packet preflight failed: HEAD $$actual_head does not match pinned commit $(NET_PACKET_PINNED_COMMIT)" >&2; exit 1; fi; \
-		if ! git -C "$(NET_PACKET_ROOT)" diff --cached --no-ext-diff --quiet "$(NET_PACKET_PINNED_COMMIT)" -- src/core/packet.sv; then echo "net_packet preflight failed: staged source diff detected" >&2; exit 1; fi; \
-		if ! git -C "$(NET_PACKET_ROOT)" diff --no-ext-diff --quiet -- src/core/packet.sv; then echo "net_packet preflight failed: unstaged source diff detected" >&2; exit 1; fi; \
-	else echo "net_packet preflight failed: NET_PACKET_ROOT is not a git checkout" >&2; exit 1; fi
+	@python3 ../tools/check_external_dependency_lock.py verify --lock ../hw/rdma/external_dependencies.tsv --dependency net_packet --root "$(NET_PACKET_ROOT)"
 
 net_packet: net_packet_preflight
 	set -euo pipefail; \
@@ -275,12 +224,16 @@ pcie_work_preflight:
 	@if [[ -z "$(PCIE_WORK_ROOT)" ]]; then echo "PCIE_WORK_ROOT is required for pcie_work" >&2; exit 2; fi
 	@if [[ -z "$(HOST_MEM_ROOT)" ]]; then echo "HOST_MEM_ROOT is required for pcie_work" >&2; exit 2; fi
 	@for dependency in \
+		"$(PCIE_WORK_ROOT)/pcie_tl_vip/src/pcie_tl_if.sv" \
+		"$(PCIE_WORK_ROOT)/pcie_tl_vip/src/shared/pcie_tl_bdf_utils_pkg.sv" \
+		"$(PCIE_WORK_ROOT)/pcie_tl_vip/src/shared/pcie_tl_device_profile_pkg.sv" \
+		"$(PCIE_WORK_ROOT)/pcie_tl_vip/src/topology/pcie_topology_pkg.sv" \
 		"$(PCIE_WORK_ROOT)/pcie_tl_vip/src/pcie_tl_pkg.sv" \
-		"$(PCIE_WORK_ROOT)/pcie_tl_vip/src/shared/pcie_tl_func_manager.sv" \
-		"$(PCIE_WORK_ROOT)/pcie_tl_vip/src/shared/pcie_tl_bar_decoder.sv" \
 		"$(HOST_MEM_ROOT)/src/host_mem_pkg.sv"; do \
 		if [[ ! -r "$$dependency" ]]; then echo "Required pcie_work dependency is not readable: $$dependency" >&2; exit 2; fi; \
-	done
+		done
+	@python3 ../tools/check_external_dependency_lock.py verify --lock ../hw/rdma/external_dependencies.tsv --dependency host_mem --root "$(HOST_MEM_ROOT)"
+	@python3 ../tools/check_external_dependency_lock.py verify --lock ../hw/rdma/external_dependencies.tsv --dependency pcie_work --root "$(PCIE_WORK_ROOT)"
 
 pcie_work: pcie_work_preflight
 	set -euo pipefail; \
@@ -301,6 +254,7 @@ pcie_work: pcie_work_preflight
 dpu_common_preflight:
 	@if [[ -z "$(DPU_COMMON_ROOT)" ]]; then echo "DPU_COMMON_ROOT is required for dpu_common integration" >&2; exit 2; fi
 	@if [[ ! -r "$(DPU_COMMON_ROOT)/src/dpu_resource_pkg.sv" ]]; then echo "Required dpu_common dependency is not readable: $(DPU_COMMON_ROOT)/src/dpu_resource_pkg.sv" >&2; exit 2; fi
+	@python3 ../tools/check_external_dependency_lock.py verify --lock ../hw/rdma/external_dependencies.tsv --dependency dpu_common --root "$(DPU_COMMON_ROOT)"
 
 e2e: host_mem_preflight net_packet_preflight dpu_common_preflight
 	set -euo pipefail; \

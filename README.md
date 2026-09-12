@@ -25,7 +25,7 @@ CMQ/codec 基线来自 `/home/ubuntu/Downloads/dpu_kernel_rdma-version_0.1.34.ta
 | 依赖 | 环境变量 | 固定版本 |
 | --- | --- | --- |
 | dpu_common | `DPU_COMMON_ROOT` | 由仿真环境提供的 snapshot 实现 |
-| host_mem | `HOST_MEM_ROOT` | `365b7553fc7dac6b4ad55886a8e4869153607c28` |
+| host_mem | `HOST_MEM_ROOT` | `3b9e000d5df4d10efbb3029f43605e0362e0caca` |
 | net_packet | `NET_PACKET_ROOT` | `6766c4f042484814548481065328ffbcffab590f` |
 
 外部源码不会同步进本仓库，也不应把访问令牌写入 remote URL、脚本或配置文件。

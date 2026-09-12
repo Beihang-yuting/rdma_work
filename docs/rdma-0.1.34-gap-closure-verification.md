@@ -14,7 +14,7 @@
 | 定义基线 | `scripts/run_vcs53.sh rdma_defs rdma_defs_test` | VCS53 | `rdma definitions: PASS` |
 | core | `scripts/run_vcs53.sh core regression` | VCS53 | 编译并运行所有 core tests，UVM `warning=0 error=0 fatal=0` |
 | dpu_common integration | `DPU_COMMON_ROOT=/path/to/dpu_common scripts/run_vcs53.sh integration regression` | dpu_common snapshot | route、PF/VF、reset 和 context tests 全通过 |
-| host-mem | `HOST_MEM_ROOT=/path/to/host_mem scripts/run_vcs53.sh host_mem regression` | host_mem commit `365b7553fc7dac6b4ad55886a8e4869153607c28`，并通过源码 SHA-256 preflight | UMEM/PBL/MW、queue backing 和 release 无泄漏 |
+| host-mem | `HOST_MEM_ROOT=/path/to/host_mem scripts/run_vcs53.sh host_mem regression` | 历史记录：host_mem commit `365b7553fc7dac6b4ad55886a8e4869153607c28`（已被当前锁定记录 superseded） | UMEM/PBL/MW、queue backing 和 release 无泄漏 |
 | net_packet | `NET_PACKET_ROOT=/path/to/net_packet scripts/run_vcs53.sh net_packet regression` | net_packet commit `6766c4f042484814548481065328ffbcffab590f` | RoCEv2/iWARP pack/unpack 和故障策略全通过 |
 | multi-VF E2E | `PCIE_WORK_ROOT=... HOST_MEM_ROOT=... NET_PACKET_ROOT=... DPU_COMMON_ROOT=... scripts/run_vcs53.sh e2e rdma_multivf_recovery_test` | dpu_common、pinned host_mem、pinned net_packet | 双 Host/双 PF/四 VF 并发 fault matrix、FLR/generation recovery、CQE/CMQ、真实 mapping release 和 leak seal 全通过 |
 | high-traffic E2E | `PCIE_WORK_ROOT=... HOST_MEM_ROOT=... NET_PACKET_ROOT=... DPU_COMMON_ROOT=... scripts/run_vcs53.sh e2e rdma_end_to_end_high_traffic_test` | dpu_common、pinned host_mem、pinned net_packet | 4096×256B、SQ/RQ/CQ window=16、completion batch=4；queue-full、PI/CI、CQE owner/released-slot、真实 mapping 和 Function-qualified event pending 全通过 |
