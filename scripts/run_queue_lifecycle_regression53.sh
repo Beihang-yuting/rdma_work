@@ -61,6 +61,7 @@ readonly CORE_TESTS=(
   rdma_error_codec_test
   rdma_cmq_completion_test
   rdma_cmq_profile_test
+  rdma_cmq_driver_field_mutation_test
   rdma_context_cmq_regression_test
   rdma_queue_lifecycle_models_test
   rdma_context_backing_contract_test

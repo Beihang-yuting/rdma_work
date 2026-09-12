@@ -697,6 +697,15 @@ class rdma_hw_cmq_hw_profile extends rdma_cmq_hw_profile;
       return invalid_argument("CMQ command selects a different profile");
     if (command.opcode_key.opcode[31:8] != 0)
       return invalid_argument("rdma CMQ opcode exceeds 8 bits");
+
+    // 驱动在 QPC_CREATE 路径把 VFID_OVERRIDE 与 USE_VFID 固定为零；
+    // 非零输入必须在 body/image 构造前拒绝，避免发布不可达请求。
+    if (command.opcode_key.opcode[7:0] == RDMA_OP_QPC_CREATE &&
+        (command.vfid_override || command.use_vfid != 0))
+      return invalid_argument(
+        "QPC_CREATE driver-fixed VFID fields must remain zero"
+      );
+
     if (!command.vfid_override && command.use_vfid != 0)
       return invalid_argument("rdma CMQ VFID requires override");
     if (slot.backing_addr.value >

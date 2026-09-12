@@ -21,7 +21,7 @@ VCS_FLAGS := -full64 -sverilog -ntb_opts uvm-1.2 -timescale=1ns/1ps -debug_acces
 SHELL := /bin/bash
 .SHELLFLAGS := -o pipefail -c
 
-.PHONY: core host_mem_preflight host_mem rdma_defs integration net_packet net_packet_preflight pcie_work pcie_work_preflight dpu_common_preflight e2e regression
+.PHONY: core cmq_gate host_mem_preflight host_mem rdma_defs integration net_packet net_packet_preflight pcie_work pcie_work_preflight dpu_common_preflight e2e regression
 
 # 通过统一 run_vcs53.sh 入口逐项执行回归清单；每行必须是 suite/test/tags 三字段。
 regression:
@@ -66,6 +66,24 @@ core:
 		$(BUILD)/simv +UVM_TESTNAME=$(TEST) | tee $(BUILD)/$(TEST).log; \
 		../scripts/check_uvm_summary.sh $(BUILD)/$(TEST).log; \
 	fi
+
+cmq_gate:
+	set -euo pipefail; \
+	manifest=cmq_gate.list; \
+	[[ -r "$$manifest" ]] || { echo "CMQ gate manifest is missing" >&2; exit 2; }; \
+	mapfile -t cmq_tests < <(sed -e 's/[[:space:]]*#.*$$//' -e '/^[[:space:]]*$$/d' "$$manifest"); \
+	(( $${#cmq_tests[@]} == 6 )) || { echo "CMQ gate requires exactly six tests" >&2; exit 2; }; \
+	declare -A seen=(); \
+	for test_name in "$${cmq_tests[@]}"; do \
+		[[ "$$test_name" =~ ^[A-Za-z_][A-Za-z0-9_]*$$ ]] || { echo "invalid CMQ test name" >&2; exit 2; }; \
+		[[ -z "$${seen[$$test_name]+x}" ]] || { echo "duplicate CMQ test" >&2; exit 2; }; \
+		seen[$$test_name]=1; \
+	done; \
+	$(MAKE) BUILD=$(BUILD) TEST=rdma_smoke_test core >/dev/null; \
+	for test_name in "$${cmq_tests[@]}"; do \
+		$(BUILD)/simv +UVM_TESTNAME=$$test_name | tee $(BUILD)/$$test_name.log; \
+		../scripts/check_uvm_summary.sh $(BUILD)/$$test_name.log; \
+	done
 
 rdma_defs:
 	@if [[ "$(TEST)" != "rdma_cmq_driver_contract_test" ]]; then \

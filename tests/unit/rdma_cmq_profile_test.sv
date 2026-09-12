@@ -1319,6 +1319,57 @@ class rdma_cmq_profile_test extends uvm_test;
       `uvm_error("DOORBELL_PI_RANGE", "failure published image")
   endfunction
 
+  // 功能：check_qpc_driver_fixed_vfid 验证 QPC_CREATE 的 VFID 字段由驱动固定为零。
+  // 输入输出及副作用：构造本地 Function、QPC body、slot 并调用 production compose_sqe；不触碰外部 I/O。
+  // 失败边界：任一非零 VFID 未在 body/image 发布前返回 INVALID_ARGUMENT 即报告错误。
+  function automatic void check_qpc_driver_fixed_vfid();
+    rdma_function_handle function_h;
+    rdma_handle cmq_h;
+    rdma_hw_qpc_command_body body;
+    rdma_cmq_command_desc command;
+    rdma_cmq_opcode_key key;
+    rdma_cmq_slot_context slot;
+    rdma_hw_image image;
+    rdma_cmq_expected_response expected;
+    rdma_status status;
+    rdma_hw_cmq_hw_profile profile;
+
+    profile = rdma_hw_cmq_hw_profile::type_id::create("qpc_fixed_profile");
+    function_h = make_function("qpc_fixed_function");
+    cmq_h = make_handle("qpc_fixed_cmq", RDMA_RESOURCE_CMQ, 32'h44);
+    body = rdma_hw_qpc_command_body::type_id::create("qpc_fixed_body");
+    body.qp_h = make_handle("qpc_fixed_qp", RDMA_RESOURCE_QP, 24'ha1b2c3);
+    key = rdma_cmq_opcode_key::type_id::create("qpc_fixed_key");
+    key.profile_name = "rdma";
+    key.opcode = RDMA_OP_QPC_CREATE;
+    key.variant = "rc";
+    command = rdma_cmq_command_desc::type_id::create("qpc_fixed_command");
+    command.function_h = function_h;
+    command.opcode_key = key;
+    command.body = body;
+    command.timeout = 100;
+    slot = make_slot("qpc_fixed_slot", function_h, cmq_h);
+
+    command.vfid_override = 1'b1;
+    status = profile.compose_sqe(command, slot, image, expected);
+    expect_status("QPC_FIXED_OVERRIDE", status, RDMA_SC_INVALID_ARGUMENT);
+    if (image != null || expected != null)
+      `uvm_error("QPC_FIXED_OVERRIDE_OUTPUT", "fixed VFID rejection published output")
+
+    command.vfid_override = 1'b0;
+    for (int unsigned bit_index = 0; bit_index < 11; bit_index++) begin
+      command.use_vfid = '0;
+      command.use_vfid[bit_index] = 1'b1;
+      command.vfid_override = 1'b1;
+      image = null;
+      expected = null;
+      status = profile.compose_sqe(command, slot, image, expected);
+      expect_status("QPC_FIXED_USE_VFID", status, RDMA_SC_INVALID_ARGUMENT);
+      if (image != null || expected != null)
+        `uvm_error("QPC_FIXED_USE_VFID_OUTPUT", "fixed VFID rejection published output")
+    end
+  endfunction
+
   // 功能：在 rdma_cmq_profile_test 中，run_phase 驱动 UVM 阶段中的场景初始化、事务执行和断言收尾，并在退出前释放 objection 或测试资源。
   // 输入/输出及副作用：phase（输入）；phase 由 UVM 提供；task 通过 objection、日志和断言暴露结果，可能调用 DUT 接口但不改变其所有权规则。
   // 失败/边界：run_phase 的 setup/阶段驱动失败时停止新增事务，并按测试生命周期清理 objection 与临时引用。
@@ -1332,6 +1383,7 @@ class rdma_cmq_profile_test extends uvm_test;
     check_completion_payload_snapshot_contract();
     check_inspect_cqe();
     check_encode_doorbell();
+    check_qpc_driver_fixed_vfid();
     phase.drop_objection(this);
   endtask
 endclass

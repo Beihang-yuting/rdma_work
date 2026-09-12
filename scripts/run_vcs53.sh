@@ -18,7 +18,7 @@ suite=$1
 test_name=$2
 
 case "$suite" in
-  core|integration|host_mem|pcie_work|net_packet|e2e|axis_vip|rdma_defs) ;;
+  core|cmq_gate|integration|host_mem|pcie_work|net_packet|e2e|axis_vip|rdma_defs) ;;
   *)
     echo "Unsupported suite: $suite" >&2
     usage

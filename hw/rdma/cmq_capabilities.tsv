@@ -1,6 +1,6 @@
 driver_symbol	opcode	opcode_value	direction	registered	request_encodable	response_decodable	oracle_case_id	owning_codec	blocker
-XTRDMA_OP_QPC_CREATE	QPC_CREATE	0x00	REQUEST	1	0	0	cmq_sqe_qpc_create_request	rdma_hw_cmq_request_composer	MISSING_PRODUCTION_PATH_EVIDENCE
-XTRDMA_OP_QPC_CREATE	QPC_CREATE	0x00	RESPONSE	1	0	0	cmq_cqe_qpc_create_response	rdma_hw_cmq_completion_codec	MISSING_PRODUCTION_PATH_EVIDENCE
+XTRDMA_OP_QPC_CREATE	QPC_CREATE	0x00	REQUEST	1	1	0	cmq_sqe_qpc_create_request	rdma_hw_cmq_request_composer	-
+XTRDMA_OP_QPC_CREATE	QPC_CREATE	0x00	RESPONSE	1	0	1	cmq_cqe_qpc_create_response	rdma_hw_cmq_completion_codec	-
 XTRDMA_OP_QPC_MODIFY	QPC_MODIFY	0x01	REQUEST	1	0	0	-	rdma_hw_cmq_request_composer	MISSING_CLOSED_EVIDENCE
 XTRDMA_OP_QPC_MODIFY	QPC_MODIFY	0x01	RESPONSE	1	0	0	-	rdma_hw_cmq_completion_codec	MISSING_CLOSED_EVIDENCE
 XTRDMA_OP_QPC_DELETE	QPC_DELETE	0x02	REQUEST	1	0	0	-	rdma_hw_cmq_request_composer	MISSING_CLOSED_EVIDENCE
@@ -145,4 +145,4 @@ XTRDMA_OP_OCC_PD_IDX_SEARCH	OCC_PD_IDX_SEARCH	0x47	REQUEST	1	0	0	-	rdma_hw_cmq_r
 XTRDMA_OP_OCC_PD_IDX_SEARCH	OCC_PD_IDX_SEARCH	0x47	RESPONSE	1	0	0	-	rdma_hw_cmq_completion_codec	MISSING_CLOSED_EVIDENCE
 XTRDMA_OP_OCC_PD_KICKOUT	OCC_PD_KICKOUT	0x48	REQUEST	1	0	0	-	rdma_hw_cmq_request_composer	MISSING_CLOSED_EVIDENCE
 XTRDMA_OP_OCC_PD_KICKOUT	OCC_PD_KICKOUT	0x48	RESPONSE	1	0	0	-	rdma_hw_cmq_completion_codec	MISSING_CLOSED_EVIDENCE
--	CMQ_SQ_DOORBELL	-	REQUEST	1	0	0	cmq_sq_doorbell	rdma_hw_cmq_hw_profile	MISSING_PRODUCTION_PATH_EVIDENCE
+-	CMQ_SQ_DOORBELL	-	REQUEST	1	1	0	cmq_sq_doorbell	rdma_hw_cmq_hw_profile	-
