@@ -144,6 +144,25 @@ typedef enum int unsigned {
   RDMA_CMQ_TEST_ABORT_PROFILE_OUTPUT
 } rdma_cmq_test_abort_fault_e;
 
+// 设计说明：hostile-factory matrix 显式枚举 production profile 支持的五种
+// command-body dispatch，避免只用 object-ID fixture 得到无法证明其余分支的零计数。
+typedef enum int unsigned {
+  RDMA_CMQ_TEST_JOURNAL_BODY_QPC,
+  RDMA_CMQ_TEST_JOURNAL_BODY_OBJECT_ID,
+  RDMA_CMQ_TEST_JOURNAL_BODY_MR_DEREGISTER,
+  RDMA_CMQ_TEST_JOURNAL_BODY_OCC_FLUSH,
+  RDMA_CMQ_TEST_JOURNAL_BODY_EMPTY
+} rdma_cmq_test_journal_body_e;
+
+// 设计说明：orphan fault enum 让 probe 每次只向一张 retained 表注入一行，
+// 从而独立证明 record/preallocation/profile/ticket-index 四个存在性方向。
+typedef enum int unsigned {
+  RDMA_CMQ_TEST_JOURNAL_ORPHAN_RECORD,
+  RDMA_CMQ_TEST_JOURNAL_ORPHAN_PREALLOCATION,
+  RDMA_CMQ_TEST_JOURNAL_ORPHAN_PROFILE,
+  RDMA_CMQ_TEST_JOURNAL_ORPHAN_TICKET_INDEX
+} rdma_cmq_test_journal_orphan_e;
+
 // 设计说明：journal snapshot 必须绕过 raw UVM factory；该计数器把所有
 //   hostile override 的构造汇聚为一个可观察值，避免测试依赖某个具体派生类。
 class rdma_cmq_journal_factory_counter;
@@ -3203,6 +3222,109 @@ class rdma_cmq_engine_probe extends rdma_cmq_engine;
     return 1'b1;
   endfunction
 
+  // 功能：返回指定 engine-owned record 的非拥有 fault-injection 引用，供测试逐字段腐化。
+  // 输入/输出及副作用：batch_key 为输入；命中时返回 submission_journal 原句柄，
+  //   本函数本身不改写 record/index/preallocation/profile。
+  // 失败/边界：未知或空 key 返回 null；仅 probe 测试可持有该引用，public query 仍只返回 detached graph。
+  function rdma_cmq_batch_submission_record journal_record_fault_reference(
+    string batch_key
+  );
+    if (batch_key.len() == 0 || !submission_journal.exists(batch_key))
+      return null;
+    return submission_journal[batch_key];
+  endfunction
+
+  // 功能：按 kind 向且仅向一张 journal retained 表播种 orphan 行，复现部分提交损坏。
+  // 输入/输出及副作用：batch_key 选择目标；record/preallocated/profile_service/ticket
+  //   仅由对应 kind 消费；成功写入一行且不触碰其他三张表或 counter。
+  // 失败/边界：key 为空、目标依赖无效、该 key 已有任一 companion 或 ticket key
+  //   已占用时返回 0；未知 kind 不写入任何状态。
+  function bit seed_journal_orphan(
+    rdma_cmq_test_journal_orphan_e kind,
+    string batch_key,
+    rdma_cmq_batch_submission_record record,
+    rdma_cmq_preallocated_publish_batch preallocated,
+    rdma_cmq_hw_profile profile_service,
+    rdma_cmq_ticket ticket
+  );
+    string ticket_key;
+
+    if (batch_key.len() == 0 || submission_journal.exists(batch_key) ||
+        preallocated_publish_batches.exists(batch_key) ||
+        journal_profile_by_batch.exists(batch_key))
+      return 1'b0;
+    case (kind)
+      RDMA_CMQ_TEST_JOURNAL_ORPHAN_RECORD: begin
+        if (record == null)
+          return 1'b0;
+        submission_journal[batch_key] = record;
+      end
+      RDMA_CMQ_TEST_JOURNAL_ORPHAN_PREALLOCATION: begin
+        if (preallocated == null)
+          return 1'b0;
+        preallocated_publish_batches[batch_key] = preallocated;
+      end
+      RDMA_CMQ_TEST_JOURNAL_ORPHAN_PROFILE: begin
+        if (profile_service == null)
+          return 1'b0;
+        journal_profile_by_batch[batch_key] = profile_service;
+      end
+      RDMA_CMQ_TEST_JOURNAL_ORPHAN_TICKET_INDEX: begin
+        if (!rdma_cmq_ticket_shape_valid(ticket))
+          return 1'b0;
+        ticket_key = command_key(ticket);
+        if (ticket_key.len() == 0 ||
+            journal_batch_by_ticket.exists(ticket_key))
+          return 1'b0;
+        journal_batch_by_ticket[ticket_key] = batch_key;
+      end
+      default: return 1'b0;
+    endcase
+    return 1'b1;
+  endfunction
+
+  // 功能：删除 seed_journal_orphan() 为指定 kind 创建的唯一 orphan 行，隔离下一故障窗口。
+  // 输入/输出及副作用：batch_key/ticket 定位目标；成功只删除对应 record、
+  //   preallocation、profile 或 ticket-index 行，不修复或删除任何 companion。
+  // 失败/边界：目标行缺失、ticket shape/key 无效、index 指向其他 batch 或未知 kind
+  //   时返回 0 且表内容不变。
+  function bit clear_journal_orphan(
+    rdma_cmq_test_journal_orphan_e kind,
+    string batch_key,
+    rdma_cmq_ticket ticket
+  );
+    string ticket_key;
+
+    case (kind)
+      RDMA_CMQ_TEST_JOURNAL_ORPHAN_RECORD: begin
+        if (!submission_journal.exists(batch_key))
+          return 1'b0;
+        submission_journal.delete(batch_key);
+      end
+      RDMA_CMQ_TEST_JOURNAL_ORPHAN_PREALLOCATION: begin
+        if (!preallocated_publish_batches.exists(batch_key))
+          return 1'b0;
+        preallocated_publish_batches.delete(batch_key);
+      end
+      RDMA_CMQ_TEST_JOURNAL_ORPHAN_PROFILE: begin
+        if (!journal_profile_by_batch.exists(batch_key))
+          return 1'b0;
+        journal_profile_by_batch.delete(batch_key);
+      end
+      RDMA_CMQ_TEST_JOURNAL_ORPHAN_TICKET_INDEX: begin
+        if (!rdma_cmq_ticket_shape_valid(ticket))
+          return 1'b0;
+        ticket_key = command_key(ticket);
+        if (!journal_batch_by_ticket.exists(ticket_key) ||
+            journal_batch_by_ticket[ticket_key] != batch_key)
+          return 1'b0;
+        journal_batch_by_ticket.delete(ticket_key);
+      end
+      default: return 1'b0;
+    endcase
+    return 1'b1;
+  endfunction
+
   // 功能：返回当前 backing mapping 的非拥有测试引用，用于构造 opaque-authority fixture。
   // 输入/输出及副作用：无输入；返回 backing_mapping 原句柄，不修改 mapping。
   // 失败/边界：engine 未 prepare/已 release 时返回 null；生产 API 不暴露此 seam。
@@ -5465,12 +5587,77 @@ class rdma_cmq_engine_test extends uvm_test;
     );
   endfunction
 
+  // 功能：为 journal fixture 直接构造 production profile 支持的指定 command-body graph。
+  // 输入/输出及副作用：kind/name/identity/item_index 为输入；返回 QPC、object-ID、
+  //   MR-deregister、OCC-flush 或 empty 的新 owned 值及其必要 nested handle。
+  // 失败/边界：identity=null 或未知 kind 返回 null；所有合法分支都满足各 body validate()，
+  //   且不经过 UVM factory，因而可在 hostile override 安装前安全准备 source graph。
+  function automatic rdma_hw_model make_journal_command_body(
+    rdma_cmq_test_journal_body_e kind,
+    string name,
+    rdma_function_identity identity,
+    int unsigned item_index
+  );
+    rdma_hw_qpc_command_body qpc_body;
+    rdma_hw_object_id_command_body object_body;
+    rdma_hw_mr_deregister_body mr_body;
+    rdma_hw_occ_flush_body occ_body;
+    rdma_hw_cmq_empty_body empty_body;
+
+    if (identity == null)
+      return null;
+    case (kind)
+      RDMA_CMQ_TEST_JOURNAL_BODY_QPC: begin
+        qpc_body = new(name);
+        qpc_body.qp_h = make_journal_handle(
+          {name, "_qp"}, RDMA_RESOURCE_QP, identity,
+          32'h0000_0200 + item_index
+        );
+        qpc_body.qpc_buffer.value = 64'h0000_0001_1000_0000 +
+                                   longint'(item_index) * 64'h1000;
+        qpc_body.next_state = RDMA_QPS_RTS;
+        return qpc_body;
+      end
+      RDMA_CMQ_TEST_JOURNAL_BODY_OBJECT_ID: begin
+        object_body = new(name);
+        object_body.object_h = make_journal_handle(
+          {name, "_object"}, RDMA_RESOURCE_CQ, identity,
+          32'h0000_0100 + item_index
+        );
+        return object_body;
+      end
+      RDMA_CMQ_TEST_JOURNAL_BODY_MR_DEREGISTER: begin
+        mr_body = new(name);
+        mr_body.mr_h = make_journal_handle(
+          {name, "_mr"}, RDMA_RESOURCE_MR, identity,
+          32'h0000_0300 + item_index
+        );
+        mr_body.stag_key = 8'h5a + byte'(item_index);
+        mr_body.next_state = RDMA_CONTEXT_INVALID;
+        return mr_body;
+      end
+      RDMA_CMQ_TEST_JOURNAL_BODY_OCC_FLUSH: begin
+        occ_body = new(name);
+        occ_body.eirqe = 1'b1;
+        occ_body.orqe = 1'b1;
+        occ_body.uaqe = 1'b1;
+        occ_body.qpn = item_index;
+        return occ_body;
+      end
+      RDMA_CMQ_TEST_JOURNAL_BODY_EMPTY: begin
+        empty_body = new(name);
+        return empty_body;
+      end
+      default: return null;
+    endcase
+  endfunction
+
   // 功能：构造两项完整 journal record 与一一对应的 preallocated publication value；
   //   source record 使用与 engine backing 分离但保留 opaque release authority 的 mapping。
-  // 输入/输出及副作用：engine/profile/binding/cmq 和稳定 ID 为输入；成功直接复制 mapping
-  //   全部公开字段，通过 production profile 独立计算 item/batch digest，并发布两个 source graph。
-  // 失败/边界：任一依赖、mapping authority seam、nested handle、identity/profile
-  //   canonicalization 或 digest 失败时输出均为 null 并返回具体非空 status，不安装 DUT journal 行。
+  // 输入/输出及副作用：engine/profile/binding/cmq、稳定 ID 与 body_kind 为输入；成功
+  //   直接复制 mapping 全部公开字段，经 profile 计算 digest 并发布两个 source graph。
+  // 失败/边界：任一依赖、未知 body kind、mapping authority seam、nested handle、
+  //   identity/profile canonicalization 或 digest 失败时输出均为 null，不安装 DUT 行。
   function automatic rdma_status build_journal_fixture(
     string name,
     rdma_cmq_engine_probe engine,
@@ -5481,6 +5668,7 @@ class rdma_cmq_engine_test extends uvm_test;
     longint unsigned batch_id,
     longint unsigned attempt_id,
     longint unsigned first_command_id,
+    rdma_cmq_test_journal_body_e body_kind,
     output rdma_cmq_batch_submission_record record,
     output rdma_cmq_preallocated_publish_batch preallocated
   );
@@ -5629,7 +5817,6 @@ class rdma_cmq_engine_test extends uvm_test;
     for (int unsigned i = 0; i < 2; i++) begin
       rdma_cmq_batch_submission_item_record item;
       rdma_cmq_preallocated_publish_item publish_item;
-      rdma_hw_object_id_command_body body;
       rdma_hw_cmq_completion payload;
       rdma_cmq_expected_response expected;
       string body_tag;
@@ -5647,12 +5834,17 @@ class rdma_cmq_engine_test extends uvm_test;
       item.command.opcode_key.profile_name = "rdma";
       item.command.opcode_key.opcode = RDMA_OP_CQC_DELETE;
       item.command.opcode_key.variant = "CQC_DELETE";
-      body = new($sformatf("%s_body_%0d", name, i));
-      body.object_h = make_journal_handle(
-        $sformatf("%s_body_object_%0d", name, i), RDMA_RESOURCE_CQ,
-        identity, 32'h0000_0100 + i
+      item.command.body = make_journal_command_body(
+        body_kind, $sformatf("%s_body_%0d", name, i), identity, i
       );
-      item.command.body = body;
+      if (item.command.body == null) begin
+        record = null;
+        preallocated = null;
+        return rdma_cmq_direct_status(
+          RDMA_SC_INVALID_ARGUMENT,
+          "journal fixture command body kind is unsupported"
+        );
+      end
       item.command.qpc_signature_source = null;
       item.command.vfid_override = 1'b0;
       item.command.use_vfid = 0;
@@ -6032,12 +6224,13 @@ class rdma_cmq_engine_test extends uvm_test;
           rhs.recovery_owner == lhs.recovery_owner)
         `uvm_error(label,
                    $sformatf("journal item %0d command/owner alias drift", i))
-      if (!$cast(source_body, lhs.command.body) ||
-          !$cast(snapshot_body, rhs.command.body) ||
-          snapshot_body.object_h == null || source_body.object_h == null ||
-          snapshot_body.object_h == source_body.object_h)
-        `uvm_error(label,
-                   $sformatf("journal item %0d typed body is not detached", i))
+      if ($cast(source_body, lhs.command.body) &&
+          (!$cast(snapshot_body, rhs.command.body) ||
+           snapshot_body.object_h == null || source_body.object_h == null ||
+           snapshot_body.object_h == source_body.object_h))
+        `uvm_error(label, $sformatf(
+          "journal item %0d object-ID body is not detached", i
+        ))
       if (rhs.ticket == lhs.ticket || rhs.completion == lhs.completion ||
           rhs.completion.ticket != rhs.ticket ||
           rhs.completion.status != rhs.status || rhs.status == lhs.status)
@@ -6169,6 +6362,62 @@ class rdma_cmq_engine_test extends uvm_test;
       end
     end
   endfunction
+
+  // 功能：断言一个 malformed initial journal candidate 被 INVALID_ARGUMENT 原子拒绝。
+  // 输入/输出及副作用：label/engine/record/preallocated 为输入；调用真实安装入口，
+  //   若旧实现错误安装则立即经真实 remove helper 清理，以隔离后续 RED assertion。
+  // 失败/边界：status 非 INVALID_ARGUMENT、清理失败或四张表留下任一行时发布 UVM_ERROR；
+  //   调用方必须在空 journal engine 上逐项恢复 candidate 后再调用下一次。
+  function automatic void expect_candidate_journal_rejection(
+    string label,
+    rdma_cmq_engine_probe engine,
+    rdma_cmq_batch_submission_record record,
+    rdma_cmq_preallocated_publish_batch preallocated
+  );
+    rdma_status status;
+    rdma_status cleanup_status;
+
+    status = engine.install_submission_journal_probe(record, preallocated);
+    expect_status(label, status, RDMA_SC_INVALID_ARGUMENT);
+    if (status != null && status.ok()) begin
+      cleanup_status = engine.remove_submission_journal_probe(record.batch_key);
+      expect_status({label, "_RED_CLEANUP"}, cleanup_status, RDMA_SC_OK);
+    end
+    if (engine.submission_journal_count() != 0 ||
+        engine.journal_ticket_index_count() != 0 ||
+        engine.preallocated_publish_batch_count() != 0 ||
+        engine.journal_profile_count() != 0)
+      `uvm_error({label, "_ATOMIC"},
+                 "malformed candidate left one or more journal rows")
+  endfunction
+
+  // 功能：通过 batch 与 ticket 两个 public API 断言 stored corruption 统一 fail-closed。
+  // 输入/输出及副作用：label/engine/batch_key/caller_ticket 为输入；两次查询都要求
+  //   INVALID_STATE 且 output 为 null，不修改 retained row 或 caller ticket。
+  // 失败/边界：任一 API 返回其他 code、null status 或 partial record 时发布 UVM_ERROR；
+  //   ticket 必须是腐化前保存的合法 detached caller value。
+  task automatic expect_stored_journal_rejection(
+    string label,
+    rdma_cmq_engine_probe engine,
+    string batch_key,
+    rdma_cmq_ticket caller_ticket
+  );
+    rdma_cmq_batch_submission_record snapshot;
+    rdma_status status;
+
+    engine.query_submission_journal(batch_key, snapshot, status);
+    expect_status({label, "_BATCH"}, status, RDMA_SC_INVALID_STATE);
+    if (snapshot != null)
+      `uvm_error({label, "_BATCH_OUTPUT"},
+                 "stored corruption published a batch snapshot")
+    engine.query_submission_journal_by_ticket(
+      caller_ticket, snapshot, status
+    );
+    expect_status({label, "_TICKET"}, status, RDMA_SC_INVALID_STATE);
+    if (snapshot != null)
+      `uvm_error({label, "_TICKET_OUTPUT"},
+                 "stored corruption published a ticket snapshot")
+  endtask
 
   // 功能：安装 Task 13 全部 outer/body/payload hostile raw-factory override。
   // 输入/输出及副作用：无输入；永久更新本次 UVM test 的 global factory override 表。
@@ -15702,12 +15951,407 @@ class rdma_cmq_engine_test extends uvm_test;
                  "incarnation overflow performed I/O or changed state")
   endtask
 
-  // 功能：验证 journal 三表加 profile service 原子安装/删除、batch/ticket detached
-  //   query、fence、digest 重验，以及 reset/reprepare 后旧 ticket 的诊断可用性。
-  // 输入/输出及副作用：无参数；准备 tracking profile A，安装两项 record，制造
-  //   collision/partial/corruption，再以同名不同语义 profile B 激活新 incarnation。
-  // 失败/边界：candidate 错误必须 INVALID_ARGUMENT/RESOURCE_BUSY 且零部分写；stored
-  //   缺 profile、name/seam 漂移、digest/body 腐化必须 INVALID_STATE/null snapshot。
+  // 功能：在 storage fixture 安装前逐项验证 candidate 的完整 mutable-evidence invariant。
+  // 输入/输出及副作用：engine/record/preallocated 为调用方持有的非拥有输入；本 task
+  //   临时注入 enum、reducer、recovery、owner 与 completion 故障，并在每次断言后恢复。
+  // 失败/边界：每个 candidate 必须返回 INVALID_ARGUMENT 且四张 retained 表保持空；
+  //   fixture 不完整时报告 UVM_ERROR 并返回，不负责 prepare、安装、删除或 shutdown。
+  task automatic check_journal_candidate_mutable_evidence_invariants(
+    rdma_cmq_engine_probe engine,
+    rdma_cmq_batch_submission_record record,
+    rdma_cmq_preallocated_publish_batch preallocated
+  );
+    rdma_cmq_nonfatal_snapshot_context snapshot_context;
+    rdma_cmq_ticket detached_ticket;
+    rdma_cmq_completion saved_completion;
+    rdma_status detached_status;
+    string failure_reason;
+
+    if (engine == null || record == null || preallocated == null ||
+        record.items.size() == 0 || record.items[0] == null) begin
+      `uvm_error("JOURNAL_CANDIDATE_FIXTURE_OUTPUT",
+                 "candidate mutable-evidence fixture is incomplete")
+      return;
+    end
+
+    snapshot_context = new();
+    if (!snapshot_context.try_snapshot_optional_ticket(
+          record.items[0].ticket, detached_ticket, failure_reason
+        ) || detached_ticket == null ||
+        !snapshot_context.try_snapshot_required_status(
+          record.items[0].status, detached_status, failure_reason
+        ) || detached_status == null) begin
+      `uvm_error("JOURNAL_CANDIDATE_DETACHED_VALUES", failure_reason)
+      return;
+    end
+
+    record.state = rdma_cmq_submission_state_e'(4'hf);
+    expect_candidate_journal_rejection(
+      "JOURNAL_CANDIDATE_BATCH_STATE_ENUM", engine, record, preallocated
+    );
+    record.state = RDMA_CMQ_SUBMISSION_COMPLETED;
+    record.submission_effect = rdma_submission_effect_e'(3'b111);
+    expect_candidate_journal_rejection(
+      "JOURNAL_CANDIDATE_BATCH_EFFECT_ENUM", engine, record, preallocated
+    );
+    record.submission_effect = RDMA_SUBMIT_EFFECT_MMIO_VISIBLE;
+    record.attempt_effect = rdma_submission_effect_e'(3'b111);
+    expect_candidate_journal_rejection(
+      "JOURNAL_CANDIDATE_BATCH_ATTEMPT_EFFECT_ENUM", engine, record,
+      preallocated
+    );
+    record.attempt_effect = RDMA_SUBMIT_EFFECT_MMIO_VISIBLE;
+    record.items[0].state = rdma_cmq_submission_state_e'(4'hf);
+    expect_candidate_journal_rejection(
+      "JOURNAL_CANDIDATE_ITEM_STATE_ENUM", engine, record, preallocated
+    );
+    record.items[0].state = RDMA_CMQ_SUBMISSION_COMPLETED;
+    record.items[0].submission_effect = rdma_submission_effect_e'(3'b111);
+    expect_candidate_journal_rejection(
+      "JOURNAL_CANDIDATE_ITEM_EFFECT_ENUM", engine, record, preallocated
+    );
+    record.items[0].submission_effect = RDMA_SUBMIT_EFFECT_MMIO_VISIBLE;
+    record.items[0].attempt_effect = rdma_submission_effect_e'(3'b111);
+    expect_candidate_journal_rejection(
+      "JOURNAL_CANDIDATE_ATTEMPT_EFFECT_ENUM", engine, record, preallocated
+    );
+    record.items[0].attempt_effect = RDMA_SUBMIT_EFFECT_MMIO_VISIBLE;
+    record.items[0].completion_phase = rdma_cmq_completion_phase_e'(3'b111);
+    expect_candidate_journal_rejection(
+      "JOURNAL_CANDIDATE_PHASE_ENUM", engine, record, preallocated
+    );
+    record.items[0].completion_phase = RDMA_CMQ_COMPLETION_TERMINAL;
+    record.state = RDMA_CMQ_SUBMISSION_PUBLISH_CONFIRMED;
+    expect_candidate_journal_rejection(
+      "JOURNAL_CANDIDATE_BATCH_REDUCTION", engine, record, preallocated
+    );
+    record.state = RDMA_CMQ_SUBMISSION_COMPLETED;
+    record.items[0].recovery_required = 1'b1;
+    expect_candidate_journal_rejection(
+      "JOURNAL_CANDIDATE_RECOVERY_CLASSIFIER", engine, record, preallocated
+    );
+    record.items[0].recovery_required = 1'b0;
+    record.attempt_id++;
+    preallocated.attempt_id++;
+    expect_candidate_journal_rejection(
+      "JOURNAL_CANDIDATE_OWNER_ATTEMPT", engine, record, preallocated
+    );
+    record.attempt_id--;
+    preallocated.attempt_id--;
+    saved_completion = record.items[0].completion;
+    record.items[0].completion = null;
+    expect_candidate_journal_rejection(
+      "JOURNAL_CANDIDATE_REQUIRED_COMPLETION", engine, record,
+      preallocated
+    );
+    record.items[0].completion = saved_completion;
+    record.items[0].completion.ticket = detached_ticket;
+    expect_candidate_journal_rejection(
+      "JOURNAL_CANDIDATE_COMPLETION_TICKET_ALIAS", engine, record,
+      preallocated
+    );
+    record.items[0].completion.ticket = record.items[0].ticket;
+    record.items[0].completion.status = detached_status;
+    expect_candidate_journal_rejection(
+      "JOURNAL_CANDIDATE_COMPLETION_STATUS_ALIAS", engine, record,
+      preallocated
+    );
+    record.items[0].completion.status = record.items[0].status;
+  endtask
+
+  // 功能：在 storage fixture 已安装期间逐项验证 retained mutable-evidence invariant。
+  // 输入/输出及副作用：engine/record 为调用方持有的非拥有输入；通过 fault reference
+  //   临时破坏 enum、reducer、recovery、owner、completion 与 ticket，并逐项恢复原值。
+  // 失败/边界：batch/ticket API 对每个 corruption 必须返回 INVALID_STATE/null；缺少
+  //   retained record 时报告 UVM_ERROR 并返回，不删除 journal 或关闭共享 engine。
+  task automatic check_journal_stored_mutable_evidence_invariants(
+    rdma_cmq_engine_probe engine,
+    rdma_cmq_batch_submission_record record
+  );
+    rdma_cmq_batch_submission_record stored;
+    rdma_cmq_nonfatal_snapshot_context snapshot_context;
+    rdma_cmq_ticket detached_ticket;
+    rdma_cmq_ticket stored_ticket;
+    rdma_cmq_completion saved_completion;
+    rdma_status detached_status;
+    rdma_function_handle saved_function;
+    string failure_reason;
+    longint unsigned saved_sequence;
+
+    if (engine == null || record == null || record.items.size() == 0 ||
+        record.items[0] == null) begin
+      `uvm_error("JOURNAL_STORED_FIXTURE_OUTPUT",
+                 "stored mutable-evidence fixture is incomplete")
+      return;
+    end
+    snapshot_context = new();
+    if (!snapshot_context.try_snapshot_optional_ticket(
+          record.items[0].ticket, detached_ticket, failure_reason
+        ) || detached_ticket == null ||
+        !snapshot_context.try_snapshot_required_status(
+          record.items[0].status, detached_status, failure_reason
+        ) || detached_status == null) begin
+      `uvm_error("JOURNAL_STORED_DETACHED_VALUES", failure_reason)
+      return;
+    end
+    stored = engine.journal_record_fault_reference(record.batch_key);
+    if (stored == null) begin
+      `uvm_error("JOURNAL_STORED_REFERENCE",
+                 "valid storage record did not install")
+      return;
+    end
+
+    stored.state = rdma_cmq_submission_state_e'(4'hf);
+    expect_stored_journal_rejection(
+      "JOURNAL_STORED_BATCH_STATE_ENUM", engine, record.batch_key,
+      record.items[0].ticket
+    );
+    stored.state = RDMA_CMQ_SUBMISSION_COMPLETED;
+    stored.submission_effect = rdma_submission_effect_e'(3'b111);
+    expect_stored_journal_rejection(
+      "JOURNAL_STORED_BATCH_EFFECT_ENUM", engine, record.batch_key,
+      record.items[0].ticket
+    );
+    stored.submission_effect = RDMA_SUBMIT_EFFECT_MMIO_VISIBLE;
+    stored.attempt_effect = rdma_submission_effect_e'(3'b111);
+    expect_stored_journal_rejection(
+      "JOURNAL_STORED_BATCH_ATTEMPT_EFFECT_ENUM", engine, record.batch_key,
+      record.items[0].ticket
+    );
+    stored.attempt_effect = RDMA_SUBMIT_EFFECT_MMIO_VISIBLE;
+    stored.items[0].state = rdma_cmq_submission_state_e'(4'hf);
+    expect_stored_journal_rejection(
+      "JOURNAL_STORED_ITEM_STATE_ENUM", engine, record.batch_key,
+      record.items[0].ticket
+    );
+    stored.items[0].state = RDMA_CMQ_SUBMISSION_COMPLETED;
+    stored.items[0].submission_effect = rdma_submission_effect_e'(3'b111);
+    expect_stored_journal_rejection(
+      "JOURNAL_STORED_ITEM_EFFECT_ENUM", engine, record.batch_key,
+      record.items[0].ticket
+    );
+    stored.items[0].submission_effect = RDMA_SUBMIT_EFFECT_MMIO_VISIBLE;
+    stored.items[0].attempt_effect = rdma_submission_effect_e'(3'b111);
+    expect_stored_journal_rejection(
+      "JOURNAL_STORED_ATTEMPT_EFFECT_ENUM", engine, record.batch_key,
+      record.items[0].ticket
+    );
+    stored.items[0].attempt_effect = RDMA_SUBMIT_EFFECT_MMIO_VISIBLE;
+    stored.items[0].completion_phase = rdma_cmq_completion_phase_e'(3'b111);
+    expect_stored_journal_rejection(
+      "JOURNAL_STORED_PHASE_ENUM", engine, record.batch_key,
+      record.items[0].ticket
+    );
+    stored.items[0].completion_phase = RDMA_CMQ_COMPLETION_TERMINAL;
+
+    stored.state = RDMA_CMQ_SUBMISSION_PUBLISH_CONFIRMED;
+    expect_stored_journal_rejection(
+      "JOURNAL_STORED_BATCH_REDUCTION", engine, record.batch_key,
+      record.items[0].ticket
+    );
+    stored.state = RDMA_CMQ_SUBMISSION_COMPLETED;
+
+    stored.items[0].recovery_required = 1'b1;
+    expect_stored_journal_rejection(
+      "JOURNAL_STORED_RECOVERY_CLASSIFIER", engine, record.batch_key,
+      record.items[0].ticket
+    );
+    stored.items[0].recovery_required = 1'b0;
+    stored.items[0].recovery_owner.admission_attempt_id = stored.attempt_id + 1'b1;
+    expect_stored_journal_rejection(
+      "JOURNAL_STORED_OWNER_ATTEMPT", engine, record.batch_key,
+      record.items[0].ticket
+    );
+    stored.items[0].recovery_owner.admission_attempt_id = record.attempt_id;
+    saved_completion = stored.items[0].completion;
+    stored.items[0].completion = null;
+    expect_stored_journal_rejection(
+      "JOURNAL_STORED_REQUIRED_COMPLETION", engine, record.batch_key,
+      record.items[0].ticket
+    );
+    stored.items[0].completion = saved_completion;
+    stored.items[0].completion.ticket = detached_ticket;
+    expect_stored_journal_rejection(
+      "JOURNAL_STORED_COMPLETION_TICKET_ALIAS", engine, record.batch_key,
+      record.items[0].ticket
+    );
+    stored.items[0].completion.ticket = stored.items[0].ticket;
+    stored.items[0].completion.status = detached_status;
+    expect_stored_journal_rejection(
+      "JOURNAL_STORED_COMPLETION_STATUS_ALIAS", engine, record.batch_key,
+      record.items[0].ticket
+    );
+    stored.items[0].completion.status = stored.items[0].status;
+
+    // slot_sequence 增加两个完整 ring 周期仍保持 sq_index/wrap shape 合法，且不
+    // 改变 command_key；两 API 必须先发现 retained full-value drift，而非信任索引。
+    stored_ticket = stored.items[0].ticket;
+    saved_sequence = stored_ticket.slot_sequence;
+    stored_ticket.slot_sequence = saved_sequence + 64;
+    expect_stored_journal_rejection(
+      "JOURNAL_STORED_TICKET_NONKEY", engine, record.batch_key,
+      record.items[0].ticket
+    );
+    stored_ticket.slot_sequence = saved_sequence;
+    stored_ticket = null;
+
+    // null Function 使 retained ticket shape 无法安全形成 key；batch/ticket API 均须
+    // 在 caller full-value compare 前返回 INVALID_STATE，且故障窗口后恢复原 handle。
+    stored_ticket = stored.items[0].ticket;
+    saved_function = stored_ticket.function_h;
+    stored_ticket.function_h = null;
+    expect_stored_journal_rejection(
+      "JOURNAL_STORED_TICKET_NULL_FUNCTION", engine, record.batch_key,
+      record.items[0].ticket
+    );
+    stored_ticket.function_h = saved_function;
+    saved_function = null;
+    stored_ticket = null;
+  endtask
+
+  // 功能：复用已清空的 storage fixture，验证四类单行 orphan 先于正常分类被识别。
+  // 输入/输出及副作用：engine/profile_service/identity/record/preallocated 为非拥有输入；
+  //   逐次只播种一张 retained 表，并精确保存、临时回拨和恢复四个 identity counter。
+  // 失败/边界：播种/清理失败、非 INVALID_STATE、partial output 或窗口间残留均报告
+  //   UVM_ERROR；输入 graph 不完整时直接返回，不负责删除合法行或 shutdown。
+  task automatic check_journal_orphan_row_invariants(
+    rdma_cmq_engine_probe engine,
+    rdma_cmq_journal_tracking_profile profile_service,
+    rdma_function_identity identity,
+    rdma_cmq_batch_submission_record record,
+    rdma_cmq_preallocated_publish_batch preallocated
+  );
+    rdma_cmq_batch_submission_record snapshot;
+    rdma_status status;
+    string batch_key;
+    string allocated_key;
+    longint unsigned allocated_id;
+    longint unsigned saved_incarnation;
+    longint unsigned saved_batch_id;
+    longint unsigned saved_attempt_id;
+    longint unsigned saved_proof_id;
+
+    if (engine == null || profile_service == null || identity == null ||
+        record == null || preallocated == null || record.batch_key.len() == 0 ||
+        record.batch_id == 0 || record.engine_incarnation == 0 ||
+        record.items.size() == 0 || record.items[0] == null ||
+        record.items[0].ticket == null) begin
+      `uvm_error("JOURNAL_ORPHAN_FIXTURE_OUTPUT",
+                 "orphan fixture is incomplete")
+      return;
+    end
+    batch_key = record.batch_key;
+    saved_incarnation = engine.journal_engine_incarnation();
+    saved_batch_id = engine.journal_batch_counter();
+    saved_attempt_id = engine.journal_attempt_counter();
+    saved_proof_id = engine.journal_reset_proof_counter();
+
+    if (!engine.seed_journal_orphan(
+          RDMA_CMQ_TEST_JOURNAL_ORPHAN_PROFILE, batch_key, null, null,
+          profile_service, null
+        ))
+      `uvm_error("JOURNAL_ORPHAN_PROFILE_SEED", "profile orphan was not seeded")
+    engine.seed_journal_counters(
+      record.engine_incarnation, record.batch_id - 1'b1,
+      saved_attempt_id, saved_proof_id
+    );
+    status = engine.allocate_batch_identity_probe(
+      identity, allocated_key, allocated_id
+    );
+    engine.seed_journal_counters(
+      saved_incarnation, saved_batch_id, saved_attempt_id, saved_proof_id
+    );
+    expect_status("JOURNAL_ORPHAN_PROFILE_ALLOCATE", status,
+                  RDMA_SC_INVALID_STATE);
+    if (allocated_key != "" || allocated_id != 0)
+      `uvm_error("JOURNAL_ORPHAN_PROFILE_ALLOCATE_OUTPUT",
+                 "profile orphan allocation published an identity")
+    engine.query_submission_journal(batch_key, snapshot, status);
+    expect_status("JOURNAL_ORPHAN_PROFILE_QUERY", status,
+                  RDMA_SC_INVALID_STATE);
+    status = engine.remove_submission_journal_probe(batch_key);
+    expect_status("JOURNAL_ORPHAN_PROFILE_REMOVE", status,
+                  RDMA_SC_INVALID_STATE);
+    if (snapshot != null || !engine.clear_journal_orphan(
+          RDMA_CMQ_TEST_JOURNAL_ORPHAN_PROFILE, batch_key, null
+        ))
+      `uvm_error("JOURNAL_ORPHAN_PROFILE_CLEAN",
+                 "profile orphan query escaped or cleanup failed")
+    if (!engine.seed_journal_orphan(
+          RDMA_CMQ_TEST_JOURNAL_ORPHAN_PREALLOCATION, batch_key, null,
+          preallocated, null, null
+        ))
+      `uvm_error("JOURNAL_ORPHAN_PREALLOC_SEED",
+                 "preallocation orphan was not seeded")
+    status = engine.install_submission_journal_probe(record, preallocated);
+    expect_status("JOURNAL_ORPHAN_PREALLOC_INSTALL", status,
+                  RDMA_SC_INVALID_STATE);
+    engine.query_submission_journal(batch_key, snapshot, status);
+    expect_status("JOURNAL_ORPHAN_PREALLOC_QUERY", status,
+                  RDMA_SC_INVALID_STATE);
+    status = engine.remove_submission_journal_probe(batch_key);
+    expect_status("JOURNAL_ORPHAN_PREALLOC_REMOVE", status,
+                  RDMA_SC_INVALID_STATE);
+    if (snapshot != null || !engine.clear_journal_orphan(
+          RDMA_CMQ_TEST_JOURNAL_ORPHAN_PREALLOCATION, batch_key, null
+        ))
+      `uvm_error("JOURNAL_ORPHAN_PREALLOC_CLEAN",
+                 "preallocation orphan query escaped or cleanup failed")
+
+    if (!engine.seed_journal_orphan(
+          RDMA_CMQ_TEST_JOURNAL_ORPHAN_RECORD, batch_key, record, null,
+          null, null
+        ))
+      `uvm_error("JOURNAL_ORPHAN_RECORD_SEED", "record orphan was not seeded")
+    engine.query_submission_journal(batch_key, snapshot, status);
+    expect_status("JOURNAL_ORPHAN_RECORD_QUERY", status,
+                  RDMA_SC_INVALID_STATE);
+    status = engine.remove_submission_journal_probe(batch_key);
+    expect_status("JOURNAL_ORPHAN_RECORD_REMOVE", status,
+                  RDMA_SC_INVALID_STATE);
+    if (snapshot != null || !engine.clear_journal_orphan(
+          RDMA_CMQ_TEST_JOURNAL_ORPHAN_RECORD, batch_key, null
+        ))
+      `uvm_error("JOURNAL_ORPHAN_RECORD_CLEAN",
+                 "record orphan query escaped or cleanup failed")
+
+    if (!engine.seed_journal_orphan(
+          RDMA_CMQ_TEST_JOURNAL_ORPHAN_TICKET_INDEX, batch_key, null, null,
+          null, record.items[0].ticket
+        ))
+      `uvm_error("JOURNAL_ORPHAN_TICKET_SEED", "ticket orphan was not seeded")
+    engine.query_submission_journal(batch_key, snapshot, status);
+    expect_status("JOURNAL_ORPHAN_TICKET_BATCH_QUERY", status,
+                  RDMA_SC_INVALID_STATE);
+    engine.query_submission_journal_by_ticket(
+      record.items[0].ticket, snapshot, status
+    );
+    expect_status("JOURNAL_ORPHAN_TICKET_QUERY", status,
+                  RDMA_SC_INVALID_STATE);
+    status = engine.remove_submission_journal_probe(batch_key);
+    expect_status("JOURNAL_ORPHAN_TICKET_REMOVE", status,
+                  RDMA_SC_INVALID_STATE);
+    if (snapshot != null || !engine.clear_journal_orphan(
+          RDMA_CMQ_TEST_JOURNAL_ORPHAN_TICKET_INDEX, batch_key,
+          record.items[0].ticket
+        ))
+      `uvm_error("JOURNAL_ORPHAN_TICKET_CLEAN",
+                 "ticket orphan query escaped or cleanup failed")
+
+    if (engine.submission_journal_count() != 0 ||
+        engine.journal_ticket_index_count() != 0 ||
+        engine.preallocated_publish_batch_count() != 0 ||
+        engine.journal_profile_count() != 0)
+      `uvm_error("JOURNAL_ORPHAN_FINAL_COUNTS",
+                 "orphan fault windows mutated another retained row")
+  endtask
+
+  // 功能：用单一 storage fixture 验证 mutable/orphan invariant、四表原子生命周期、
+  //   detached query、fence/digest 重验及 reset/reprepare 后旧 ticket 的诊断可用性。
+  // 输入/输出及副作用：无参数；profile A 的同一 record 依次承载 candidate、stored、
+  //   lifecycle 与 orphan 窗口，再以同名不同语义 profile B 激活新 incarnation。
+  // 失败/边界：candidate/collision 必须原子拒绝，stored/orphan corruption 必须
+  //   INVALID_STATE/null；每个故障恢复后才复用 graph，末尾清空四表并 shutdown。
   task automatic check_submission_journal_storage_and_queries();
     rdma_cmq_engine_probe engine;
     rdma_mock_host_mem mem;
@@ -15729,6 +16373,7 @@ class rdma_cmq_engine_test extends uvm_test;
     rdma_cmq_preallocated_publish_batch candidate_preallocated;
     rdma_cmq_ticket old_ticket;
     rdma_cmq_completion reset_completions[$];
+    rdma_hw_model saved_body;
     rdma_cmq_unknown_body unknown_body;
     rdma_status status;
     string batch_key;
@@ -15769,7 +16414,8 @@ class rdma_cmq_engine_test extends uvm_test;
     expect_status("JOURNAL_STORAGE_ATTEMPT", status, RDMA_SC_OK);
     status = build_journal_fixture(
       "submission_journal", engine, profile_a, prepared_binding, cmq,
-      batch_key, batch_id, attempt_id, 64'h1000, record, preallocated
+      batch_key, batch_id, attempt_id, 64'h1000,
+      RDMA_CMQ_TEST_JOURNAL_BODY_OBJECT_ID, record, preallocated
     );
     expect_status("JOURNAL_STORAGE_FIXTURE", status, RDMA_SC_OK);
     if (record == null || preallocated == null) begin
@@ -15795,6 +16441,9 @@ class rdma_cmq_engine_test extends uvm_test;
       `uvm_error("JOURNAL_FENCE_EMPTY_VALUE",
                  "empty fence query published a partial fence")
 
+    check_journal_candidate_mutable_evidence_invariants(
+      engine, record, preallocated
+    );
     status = engine.install_submission_journal_probe(record, preallocated);
     expect_status("JOURNAL_INSTALL", status, RDMA_SC_OK);
     if (engine.submission_journal_count() != 1 ||
@@ -15804,6 +16453,7 @@ class rdma_cmq_engine_test extends uvm_test;
         !engine.journal_profile_matches(batch_key, profile_a))
       `uvm_error("JOURNAL_INSTALL_COUNTS",
                  "journal rows/profile service were not atomically installed")
+    check_journal_stored_mutable_evidence_invariants(engine, record);
 
     status = engine.install_submission_journal_probe(record, preallocated);
     expect_status("JOURNAL_DUPLICATE_BATCH", status,
@@ -15856,7 +16506,8 @@ class rdma_cmq_engine_test extends uvm_test;
     status = build_journal_fixture(
       "submission_journal_ticket_collision", engine, profile_a,
       prepared_binding, cmq, batch_key, batch_id, attempt_id, 64'h1000,
-      candidate, candidate_preallocated
+      RDMA_CMQ_TEST_JOURNAL_BODY_OBJECT_ID, candidate,
+      candidate_preallocated
     );
     expect_status("JOURNAL_COLLISION_FIXTURE", status, RDMA_SC_OK);
     status = engine.install_submission_journal_probe(
@@ -15880,7 +16531,8 @@ class rdma_cmq_engine_test extends uvm_test;
     status = build_journal_fixture(
       "submission_journal_cardinality", engine, profile_a,
       prepared_binding, cmq, batch_key, batch_id, attempt_id, 64'h2000,
-      candidate, candidate_preallocated
+      RDMA_CMQ_TEST_JOURNAL_BODY_OBJECT_ID, candidate,
+      candidate_preallocated
     );
     expect_status("JOURNAL_CARDINALITY_FIXTURE", status, RDMA_SC_OK);
     void'(candidate_preallocated.items.pop_back());
@@ -15897,7 +16549,8 @@ class rdma_cmq_engine_test extends uvm_test;
     expect_status("JOURNAL_PARTIAL_ATTEMPT", status, RDMA_SC_OK);
     status = build_journal_fixture(
       "submission_journal_partial", engine, profile_a, prepared_binding,
-      cmq, batch_key, batch_id, attempt_id, 64'h3000, candidate,
+      cmq, batch_key, batch_id, attempt_id, 64'h3000,
+      RDMA_CMQ_TEST_JOURNAL_BODY_OBJECT_ID, candidate,
       candidate_preallocated
     );
     expect_status("JOURNAL_PARTIAL_FIXTURE", status, RDMA_SC_OK);
@@ -15917,7 +16570,8 @@ class rdma_cmq_engine_test extends uvm_test;
     status = build_journal_fixture(
       "submission_journal_unknown_candidate", engine, profile_a,
       prepared_binding, cmq, batch_key, batch_id, attempt_id, 64'h4000,
-      candidate, candidate_preallocated
+      RDMA_CMQ_TEST_JOURNAL_BODY_OBJECT_ID, candidate,
+      candidate_preallocated
     );
     expect_status("JOURNAL_UNKNOWN_BODY_FIXTURE", status, RDMA_SC_OK);
     unknown_body = new("submission_journal_unknown_candidate_body");
@@ -15942,7 +16596,8 @@ class rdma_cmq_engine_test extends uvm_test;
     expect_status("JOURNAL_REMOVE_ATTEMPT", status, RDMA_SC_OK);
     status = build_journal_fixture(
       "submission_journal_remove", engine, profile_a, prepared_binding,
-      cmq, batch_key, batch_id, attempt_id, 64'h5000, candidate,
+      cmq, batch_key, batch_id, attempt_id, 64'h5000,
+      RDMA_CMQ_TEST_JOURNAL_BODY_OBJECT_ID, candidate,
       candidate_preallocated
     );
     expect_status("JOURNAL_REMOVE_FIXTURE", status, RDMA_SC_OK);
@@ -16078,6 +16733,7 @@ class rdma_cmq_engine_test extends uvm_test;
                  "corrupt digest query published a record")
     if (!engine.tamper_submission_batch_digest(record.batch_key))
       `uvm_error("JOURNAL_DIGEST_RESTORE", "stored digest restore failed")
+    saved_body = record.items[0].command.body;
     unknown_body = new("submission_journal_stored_unknown_body");
     if (!engine.tamper_submission_command_body(
           record.batch_key, 0, unknown_body
@@ -16090,7 +16746,27 @@ class rdma_cmq_engine_test extends uvm_test;
     if (snapshot != null)
       `uvm_error("JOURNAL_STORED_UNKNOWN_BODY_OUTPUT",
                  "stored unknown body query published a record")
+    // reset/reprepare 已证明 public lifecycle 保留 journal；故障窗口结束前先恢复
+    // 合法 body，再用 test probe 的真实删除入口关闭 fixture，不把 corruption 当修复语义。
+    if (!engine.tamper_submission_command_body(
+          record.batch_key, 0, saved_body
+        ))
+      `uvm_error("JOURNAL_STORED_BODY_RESTORE",
+                 "stored command body restore failed")
+    status = engine.remove_submission_journal_probe(record.batch_key);
+    expect_status("JOURNAL_STORAGE_REMOVE", status, RDMA_SC_OK);
+    if (engine.submission_journal_count() != 0 ||
+        engine.journal_ticket_index_count() != 0 ||
+        engine.preallocated_publish_batch_count() != 0 ||
+        engine.journal_profile_count() != 0)
+      `uvm_error("JOURNAL_STORAGE_REMOVE_COUNTS",
+                 "storage cleanup left one or more retained rows")
 
+    // reset/reprepare 后 engine counter 已属于新 incarnation；orphan allocation
+    // 检查由 helper 在单一故障窗口内回拨并恢复，避免污染共享 fixture 的生命周期。
+    check_journal_orphan_row_invariants(
+      engine, profile_a, identity, record, preallocated
+    );
     engine.shutdown(status);
     expect_status("JOURNAL_STORAGE_SHUTDOWN", status, RDMA_SC_OK);
   endtask
@@ -16098,10 +16774,11 @@ class rdma_cmq_engine_test extends uvm_test;
   // 功能：在 persistent hostile raw-factory override 下验证所有 Task 13 snapshot
   //   seam 只用 direct-new/profile typed copy，并非致命拒绝未知 body/payload。
   // 输入/输出及副作用：无参数；先构造完整 source graph，再永久安装 overrides，
-  //   用 callback 捕获 fatal 计数；本 task 必须是 run_phase 最后一个测试场景。
+  //   用 callback 捕获 fatal 计数，并逐项安装、查询、删除五个 row；必须是最后场景。
   // 失败/边界：任一 trap 构造/FCTTYP/fatal、partial output、alias topology 漂移或
   //   unknown polymorph 非 INVALID_ARGUMENT/null 都报告 UVM_ERROR。
   task automatic check_journal_hostile_factory_snapshots_last();
+    rdma_cmq_test_journal_body_e body_kinds[5];
     rdma_cmq_engine_probe engine;
     rdma_mock_host_mem mem;
     rdma_doorbell_scheduler scheduler;
@@ -16112,7 +16789,8 @@ class rdma_cmq_engine_test extends uvm_test;
     rdma_cmq_runtime_desc runtime_desc;
     rdma_cmq_batch_submission_record record;
     rdma_cmq_batch_submission_record snapshot;
-    rdma_cmq_preallocated_publish_batch preallocated;
+    rdma_cmq_batch_submission_record records[5];
+    rdma_cmq_preallocated_publish_batch preallocated_batches[5];
     rdma_cmq_execution_result result;
     rdma_cmq_execution_result result_snapshot;
     rdma_cmq_submission_recovery_request request;
@@ -16129,6 +16807,12 @@ class rdma_cmq_engine_test extends uvm_test;
     string batch_key;
     longint unsigned batch_id;
     longint unsigned attempt_id;
+
+    body_kinds[0] = RDMA_CMQ_TEST_JOURNAL_BODY_QPC;
+    body_kinds[1] = RDMA_CMQ_TEST_JOURNAL_BODY_OBJECT_ID;
+    body_kinds[2] = RDMA_CMQ_TEST_JOURNAL_BODY_MR_DEREGISTER;
+    body_kinds[3] = RDMA_CMQ_TEST_JOURNAL_BODY_OCC_FLUSH;
+    body_kinds[4] = RDMA_CMQ_TEST_JOURNAL_BODY_EMPTY;
 
     engine = rdma_cmq_engine_probe::type_id::create(
       "journal_hostile_engine"
@@ -16149,23 +16833,37 @@ class rdma_cmq_engine_test extends uvm_test;
     expect_status("JOURNAL_HOSTILE_PREPARE", status, RDMA_SC_OK);
     status = binding.snapshot_identity_nonfatal(identity);
     expect_status("JOURNAL_HOSTILE_IDENTITY", status, RDMA_SC_OK);
-    status = engine.allocate_batch_identity_probe(
-      identity, batch_key, batch_id
-    );
-    expect_status("JOURNAL_HOSTILE_BATCH", status, RDMA_SC_OK);
-    status = engine.allocate_attempt_identity_probe(attempt_id);
-    expect_status("JOURNAL_HOSTILE_ATTEMPT", status, RDMA_SC_OK);
-    status = build_journal_fixture(
-      "journal_hostile", engine, profile, binding, cmq, batch_key,
-      batch_id, attempt_id, 64'h7000, record, preallocated
-    );
-    expect_status("JOURNAL_HOSTILE_FIXTURE", status, RDMA_SC_OK);
+    foreach (body_kinds[i]) begin
+      status = engine.allocate_batch_identity_probe(
+        identity, batch_key, batch_id
+      );
+      expect_status(
+        $sformatf("JOURNAL_HOSTILE_BATCH_%0d", i), status, RDMA_SC_OK
+      );
+      status = engine.allocate_attempt_identity_probe(attempt_id);
+      expect_status(
+        $sformatf("JOURNAL_HOSTILE_ATTEMPT_%0d", i), status, RDMA_SC_OK
+      );
+      status = build_journal_fixture(
+        $sformatf("journal_hostile_%0d", i), engine, profile, binding,
+        cmq, batch_key, batch_id, attempt_id,
+        64'h7000 + longint'(i) * 64'h0100, body_kinds[i], records[i],
+        preallocated_batches[i]
+      );
+      expect_status(
+        $sformatf("JOURNAL_HOSTILE_FIXTURE_%0d", i), status, RDMA_SC_OK
+      );
+      if (records[i] == null || preallocated_batches[i] == null)
+        `uvm_error($sformatf("JOURNAL_HOSTILE_FIXTURE_OUTPUT_%0d", i),
+                   "hostile body source graph construction was incomplete")
+    end
+    record = records[1];
     status = build_journal_recovery_graphs(
       "journal_hostile", record, result, request, proof
     );
     expect_status("JOURNAL_HOSTILE_RECOVERY_FIXTURE", status, RDMA_SC_OK);
-    if (record == null || preallocated == null || result == null ||
-        request == null || proof == null) begin
+    if (record == null || preallocated_batches[1] == null ||
+        result == null || request == null || proof == null) begin
       `uvm_error("JOURNAL_HOSTILE_FIXTURE_OUTPUT",
                  "hostile source graph construction was incomplete")
       engine.shutdown(status);
@@ -16177,21 +16875,48 @@ class rdma_cmq_engine_test extends uvm_test;
     catcher = new("journal_hostile_fatal_catcher");
     uvm_report_cb::add(null, catcher);
 
-    status = engine.install_submission_journal_probe(record, preallocated);
-    expect_status("JOURNAL_HOSTILE_INSTALL", status, RDMA_SC_OK);
-    engine.query_submission_journal(record.batch_key, snapshot, status);
-    expect_status("JOURNAL_HOSTILE_QUERY_BATCH", status, RDMA_SC_OK);
-    expect_journal_snapshot(
-      "JOURNAL_HOSTILE_QUERY_BATCH_GRAPH", engine, profile, snapshot, record
-    );
-    engine.query_submission_journal_by_ticket(
-      record.items[1].ticket, snapshot, status
-    );
-    expect_status("JOURNAL_HOSTILE_QUERY_TICKET", status, RDMA_SC_OK);
-    expect_journal_snapshot(
-      "JOURNAL_HOSTILE_QUERY_TICKET_GRAPH", engine, profile,
-      snapshot, record
-    );
+    foreach (records[i]) begin
+      status = engine.install_submission_journal_probe(
+        records[i], preallocated_batches[i]
+      );
+      expect_status(
+        $sformatf("JOURNAL_HOSTILE_INSTALL_%0d", i), status, RDMA_SC_OK
+      );
+      engine.query_submission_journal(
+        records[i].batch_key, snapshot, status
+      );
+      expect_status(
+        $sformatf("JOURNAL_HOSTILE_QUERY_BATCH_%0d", i), status,
+        RDMA_SC_OK
+      );
+      expect_journal_snapshot(
+        $sformatf("JOURNAL_HOSTILE_QUERY_BATCH_GRAPH_%0d", i), engine,
+        profile, snapshot, records[i]
+      );
+      if (i == 1) begin
+        engine.query_submission_journal_by_ticket(
+          record.items[1].ticket, snapshot, status
+        );
+        expect_status("JOURNAL_HOSTILE_QUERY_TICKET", status, RDMA_SC_OK);
+        expect_journal_snapshot(
+          "JOURNAL_HOSTILE_QUERY_TICKET_GRAPH", engine, profile,
+          snapshot, record
+        );
+      end
+      status = engine.remove_submission_journal_probe(records[i].batch_key);
+      expect_status(
+        $sformatf("JOURNAL_HOSTILE_REMOVE_%0d", i), status, RDMA_SC_OK
+      );
+      records[i] = null;
+      preallocated_batches[i] = null;
+      snapshot = null;
+    end
+    if (engine.submission_journal_count() != 0 ||
+        engine.journal_ticket_index_count() != 0 ||
+        engine.preallocated_publish_batch_count() != 0 ||
+        engine.journal_profile_count() != 0)
+      `uvm_error("JOURNAL_HOSTILE_REMOVE_COUNTS",
+                 "hostile cleanup left one or more retained rows")
 
     status = engine.snapshot_execution_result_probe(
       result, result_snapshot
@@ -16293,9 +17018,12 @@ class rdma_cmq_engine_test extends uvm_test;
     expect_status("JOURNAL_HOSTILE_SHUTDOWN", status, RDMA_SC_OK);
   endtask
 
-  // 功能：在 rdma_cmq_engine_test 中，run_phase 驱动 UVM 阶段中的场景初始化、事务执行和断言收尾，并在退出前释放 objection 或测试资源。
-  // 输入/输出及副作用：phase（输入）；phase 由 UVM 提供；task 通过 objection、日志和断言暴露结果，可能调用 DUT 接口但不改变其所有权规则。
-  // 失败/边界：run_phase 的 setup/阶段驱动失败时停止新增事务，并按测试生命周期清理 objection 与临时引用。
+  // 功能：驱动 rdma_cmq_engine 全部回归，并在 storage 与永久 hostile factory
+  //   override 之间建立一个无 live transaction 的 fixture 回收时间槽。
+  // 输入/输出及副作用：phase 由 UVM 输入；task 管理 objection、执行断言，并在
+  //   storage shutdown 后推进 1ns，再运行必须位于末尾的 hostile 场景。
+  // 失败/边界：任一场景以 UVM severity 暴露失败；1ns 边界只允许出现在四表已空、
+  //   engine 已 shutdown 后，末尾无论断言结果都必须释放 objection。
   virtual task run_phase(uvm_phase phase);
     phase.raise_objection(this);
     check_transport_facade_contract();
@@ -16361,6 +17089,10 @@ class rdma_cmq_engine_test extends uvm_test;
     check_retire_then_wrap_publication();
     check_journal_identity_and_counter_contract();
     check_submission_journal_storage_and_queries();
+    // storage engine 已 shutdown 且四张 retained 表为空；推进一个 test-only tick，
+    // 让模拟器在安装永久 factory override 前回收上一 automatic fixture 的复杂 graph。
+    // 此边界没有 live DUT transaction，不改变任何被测 lifecycle 或超时语义。
+    #1ns;
     // Raw UVM factory overrides persist globally, so this must remain last.
     check_journal_hostile_factory_snapshots_last();
     phase.drop_objection(this);

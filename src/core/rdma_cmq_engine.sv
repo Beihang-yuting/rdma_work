@@ -5683,14 +5683,16 @@ class rdma_cmq_engine extends uvm_object;
     return journal_status(RDMA_SC_OK);
   endfunction
 
-  // 功能：用指定 profile 对 record 的完整 identity、item tuple 与 carried digest 重验。
-  // 输入/输出及副作用：source/profile_service 为只读输入；调用 profile 取得 body
-  //   canonical tag/bytes，并独立重算每项 image/authority 及 batch digest。
-  // 失败/边界：profile name 漂移、key/ID/shape/cardinality、重复 ticket/request、
-  //   polymorph 或 digest 不一致均返回非空失败；不修改 source 或任何 journal 表。
+  // 功能：用指定 profile 对 record 的 immutable digest 与 mutable lifecycle evidence
+  //   执行同一份完整 invariant，区分首次安装和合法 retry 后的 attempt 关系。
+  // 输入/输出及副作用：source/profile_service/initial_install 为只读输入；调用
+  //   profile canonicalize body，重算 item/batch digest、batch state 与 recovery bit。
+  // 失败/边界：key/shape/enum/reducer/classifier、owner attempt、required completion
+  //   alias、polymorph 或 digest 任一不一致返回非空失败；不修改 source 或 journal。
   protected function rdma_status validate_submission_record_locked(
     input rdma_cmq_batch_submission_record source,
-    input rdma_cmq_hw_profile profile_service
+    input rdma_cmq_hw_profile profile_service,
+    input bit initial_install
   );
     string expected_batch_key;
     string format_failure;
@@ -5702,6 +5704,7 @@ class rdma_cmq_engine extends uvm_object;
     rdma_cmq_journal_digest_t image_digests[$];
     rdma_cmq_journal_digest_t authority_digests[$];
     rdma_cmq_journal_digest_t computed_batch_digest;
+    rdma_cmq_submission_state_e reduced_batch_state;
     rdma_status status;
 
     if (source == null || profile_service == null ||
@@ -5741,11 +5744,19 @@ class rdma_cmq_engine extends uvm_object;
         RDMA_SC_INVALID_ARGUMENT,
         "CMQ journal retained profile name is invalid"
       );
+    if (!rdma_cmq_submission_state_valid(source.state) ||
+        !rdma_cmq_submission_effect_valid(source.submission_effect) ||
+        !rdma_cmq_submission_effect_valid(source.attempt_effect))
+      return journal_status(
+        RDMA_SC_INVALID_ARGUMENT,
+        "CMQ journal batch mutable evidence contains an invalid enum"
+      );
 
     foreach (source.items[i]) begin
       rdma_cmq_batch_submission_item_record item;
       rdma_cmq_journal_digest_t computed_image_digest;
       rdma_cmq_journal_digest_t computed_authority_digest;
+      bit classified_recovery_required;
       string body_tag;
       byte unsigned body_bytes[];
       string ticket_key;
@@ -5771,6 +5782,71 @@ class rdma_cmq_engine extends uvm_object;
         return journal_status(
           RDMA_SC_INVALID_ARGUMENT,
           $sformatf("CMQ journal item %0d projection is incomplete", i)
+        );
+      if (!rdma_cmq_submission_state_valid(item.state) ||
+          !rdma_cmq_submission_effect_valid(item.submission_effect) ||
+          !rdma_cmq_submission_effect_valid(item.attempt_effect) ||
+          !rdma_cmq_completion_phase_valid(item.completion_phase))
+        return journal_status(
+          RDMA_SC_INVALID_ARGUMENT,
+          $sformatf(
+            "CMQ journal item %0d mutable evidence has an invalid enum", i
+          )
+        );
+      if (!rdma_cmq_frozen_owner_shape_valid(item.recovery_owner))
+        return journal_status(
+          RDMA_SC_INVALID_ARGUMENT,
+          $sformatf("CMQ journal item %0d recovery owner is invalid", i)
+        );
+      if (!item.recovery_owner.is_legacy_unmigrated() &&
+          (item.recovery_owner.admission_attempt_id > source.attempt_id ||
+           (initial_install &&
+            item.recovery_owner.admission_attempt_id != source.attempt_id)))
+        return journal_status(
+          RDMA_SC_INVALID_ARGUMENT,
+          $sformatf(
+            "CMQ journal item %0d owner attempt is not valid for the batch",
+            i
+          )
+        );
+      if (item.completion_phase inside {
+            RDMA_CMQ_COMPLETION_TERMINAL,
+            RDMA_CMQ_COMPLETION_TIMEOUT,
+            RDMA_CMQ_COMPLETION_RESET_CANCELLED,
+            RDMA_CMQ_COMPLETION_DIAGNOSTIC_ONLY
+          } && item.completion == null)
+        return journal_status(
+          RDMA_SC_INVALID_ARGUMENT,
+          $sformatf("CMQ journal item %0d requires a completion", i)
+        );
+      if (item.completion != null &&
+          (item.completion.ticket != item.ticket ||
+           item.completion.status != item.status))
+        return journal_status(
+          RDMA_SC_INVALID_ARGUMENT,
+          $sformatf(
+            "CMQ journal item %0d completion aliases are inconsistent", i
+          )
+        );
+      status = rdma_cmq_classify_recovery_required(
+        item.state, item.completion_phase, item.submission_effect,
+        item.reset_isolation_confirmed,
+        item.recovery_owner.is_legacy_unmigrated(),
+        classified_recovery_required
+      );
+      if (status == null)
+        return journal_status(
+          RDMA_SC_INVALID_ARGUMENT,
+          "CMQ journal recovery classifier returned null status"
+        );
+      if (!status.ok())
+        return journal_status(RDMA_SC_INVALID_ARGUMENT, status.message);
+      if (classified_recovery_required != item.recovery_required)
+        return journal_status(
+          RDMA_SC_INVALID_ARGUMENT,
+          $sformatf(
+            "CMQ journal item %0d recovery classification disagrees", i
+          )
         );
       if (request_seen.exists(item.request_index))
         return journal_status(
@@ -5824,6 +5900,19 @@ class rdma_cmq_engine extends uvm_object;
       image_digests.push_back(computed_image_digest);
       authority_digests.push_back(computed_authority_digest);
     end
+    status = rdma_cmq_reduce_batch_state(source.items, reduced_batch_state);
+    if (status == null)
+      return journal_status(
+        RDMA_SC_INVALID_ARGUMENT,
+        "CMQ journal batch state reducer returned null status"
+      );
+    if (!status.ok())
+      return journal_status(RDMA_SC_INVALID_ARGUMENT, status.message);
+    if (reduced_batch_state != source.state)
+      return journal_status(
+        RDMA_SC_INVALID_ARGUMENT,
+        "CMQ journal batch state disagrees with its item reduction"
+      );
     status = rdma_cmq_compute_batch_digest(
       source.function_identity, source.binding, source.cmq_h,
       source.doorbell_image, source.final_pi, source.final_polarity,
@@ -5977,27 +6066,119 @@ class rdma_cmq_engine extends uvm_object;
     return journal_status(RDMA_SC_OK);
   endfunction
 
-  // 功能：检查一个 batch 的 record/ticket-index/preallocation/profile 四表一致性。
-  // 输入/输出及副作用：batch_key 为输入；只读四张 engine-owned 表并返回 status。
-  // 失败/边界：record 缺失返回 INVALID_ARGUMENT；任一伴随行、ticket key/full value、
-  //   index 数量或 exact profile handle 不一致返回 INVALID_STATE，不自动修复。
-  protected function rdma_status submission_journal_invariant_locked(
-    input string batch_key
+  // 功能：检查指定 key 的 record/preallocation/profile 三张主表是否全无或完整同在。
+  // 输入/输出及副作用：batch_key 为输入，row_set_present 为输出；只读三张表，
+  //   成功时以 0/1 区分完整缺席和完整存在，不读取 current runtime profile。
+  // 失败/边界：空 key 返回 INVALID_ARGUMENT；部分存在或已存在 null 行返回
+  //   INVALID_STATE 且 row_set_present 保持 0，不把 orphan 当作 busy/missing。
+  protected function rdma_status journal_row_set_existence_locked(
+    input string batch_key,
+    output bit row_set_present
   );
-    rdma_cmq_batch_submission_record record;
-    int unsigned indexed_count;
+    bit record_present;
+    bit preallocation_present;
+    bit profile_present;
 
-    if (batch_key.len() == 0 || !submission_journal.exists(batch_key))
+    row_set_present = 1'b0;
+    if (batch_key.len() == 0)
       return journal_status(
-        RDMA_SC_INVALID_ARGUMENT, "CMQ journal batch key is not present"
+        RDMA_SC_INVALID_ARGUMENT, "CMQ journal batch key is empty"
       );
-    if (!preallocated_publish_batches.exists(batch_key) ||
-        !journal_profile_by_batch.exists(batch_key) ||
+    record_present = submission_journal.exists(batch_key);
+    preallocation_present = preallocated_publish_batches.exists(batch_key);
+    profile_present = journal_profile_by_batch.exists(batch_key);
+    if (record_present != preallocation_present ||
+        record_present != profile_present)
+      return journal_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ journal record/preallocation/profile rows are orphaned"
+      );
+    if (!record_present)
+      return journal_status(RDMA_SC_OK);
+    if (submission_journal[batch_key] == null ||
         preallocated_publish_batches[batch_key] == null ||
         journal_profile_by_batch[batch_key] == null)
       return journal_status(
         RDMA_SC_INVALID_STATE,
-        "CMQ journal batch is missing preallocation or profile metadata"
+        "CMQ journal record/preallocation/profile row contains null"
+      );
+    row_set_present = 1'b1;
+    return journal_status(RDMA_SC_OK);
+  endfunction
+
+  // 功能：全局确认每条 ticket index 都指向一组完整、非空的 retained 主表行。
+  // 输入/输出及副作用：无输入；遍历 journal_batch_by_ticket 并只读三张主表，
+  //   返回直接构造的 status，不形成 ticket key 或修改任何 retained 状态。
+  // 失败/边界：空 index/target、目标主表缺失、部分存在、null 行或 helper null
+  //   status 均返回 INVALID_STATE；空 index 表是合法状态。
+  protected function rdma_status journal_ticket_index_targets_locked();
+    bit target_present;
+    rdma_status status;
+
+    foreach (journal_batch_by_ticket[ticket_key]) begin
+      string target_batch_key;
+
+      target_batch_key = journal_batch_by_ticket[ticket_key];
+      if (ticket_key.len() == 0 || target_batch_key.len() == 0)
+        return journal_status(
+          RDMA_SC_INVALID_STATE,
+          "CMQ journal ticket index contains an empty key or target"
+        );
+      status = journal_row_set_existence_locked(
+        target_batch_key, target_present
+      );
+      if (status == null)
+        return journal_status(
+          RDMA_SC_INVALID_STATE,
+          "CMQ journal ticket target check returned null status"
+        );
+      if (!status.ok() || !target_present)
+        return journal_status(
+          RDMA_SC_INVALID_STATE,
+          status.ok() ?
+            "CMQ journal ticket index targets a missing row set" :
+            status.message
+        );
+    end
+    return journal_status(RDMA_SC_OK);
+  endfunction
+
+  // 功能：检查一个 batch 的 record/ticket-index/preallocation/profile 四表一致性。
+  // 输入/输出及副作用：batch_key 为输入；先全局审计 index target，再只读该
+  //   batch 的完整主表与每个 retained ticket，始终在 key 形成前验证 ticket shape。
+  // 失败/边界：完整缺失返回 INVALID_ARGUMENT；orphan/null/坏 ticket、索引路由或
+  //   cardinality 不一致返回 INVALID_STATE，不触发 null-object access 或自动修复。
+  protected function rdma_status submission_journal_invariant_locked(
+    input string batch_key
+  );
+    rdma_cmq_batch_submission_record record;
+    bit row_set_present;
+    int unsigned indexed_count;
+    rdma_status status;
+
+    if (batch_key.len() == 0)
+      return journal_status(
+        RDMA_SC_INVALID_ARGUMENT, "CMQ journal batch key is not present"
+      );
+    status = journal_ticket_index_targets_locked();
+    if (status == null)
+      return journal_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ journal ticket target invariant returned null status"
+      );
+    if (!status.ok())
+      return journal_status(RDMA_SC_INVALID_STATE, status.message);
+    status = journal_row_set_existence_locked(batch_key, row_set_present);
+    if (status == null)
+      return journal_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ journal row-set invariant returned null status"
+      );
+    if (!status.ok())
+      return journal_status(RDMA_SC_INVALID_STATE, status.message);
+    if (!row_set_present)
+      return journal_status(
+        RDMA_SC_INVALID_ARGUMENT, "CMQ journal batch key is not present"
       );
     record = submission_journal[batch_key];
     if (record == null || record.batch_key != batch_key ||
@@ -6011,10 +6192,11 @@ class rdma_cmq_engine extends uvm_object;
     foreach (record.items[i]) begin
       string ticket_key;
 
-      if (record.items[i] == null || record.items[i].ticket == null)
+      if (record.items[i] == null ||
+          !rdma_cmq_ticket_shape_valid(record.items[i].ticket))
         return journal_status(
           RDMA_SC_INVALID_STATE,
-          "CMQ journal retained item or ticket is null"
+          "CMQ journal retained item or ticket shape is invalid"
         );
       ticket_key = command_key(record.items[i].ticket);
       if (!journal_batch_by_ticket.exists(ticket_key) ||
@@ -6048,8 +6230,10 @@ class rdma_cmq_engine extends uvm_object;
     output longint unsigned batch_id
   );
     longint unsigned candidate_id;
+    bit row_set_present;
     string candidate_key;
     string failure_reason;
+    rdma_status status;
 
     batch_key = "";
     batch_id = 0;
@@ -6074,9 +6258,25 @@ class rdma_cmq_engine extends uvm_object;
         RDMA_SC_INVALID_ARGUMENT,
         {"CMQ batch key allocation failed: ", failure_reason}
       );
-    if (submission_journal.exists(candidate_key) ||
-        preallocated_publish_batches.exists(candidate_key) ||
-        journal_profile_by_batch.exists(candidate_key))
+    status = journal_ticket_index_targets_locked();
+    if (status == null)
+      return journal_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ batch allocation ticket target check returned null status"
+      );
+    if (!status.ok())
+      return journal_status(RDMA_SC_INVALID_STATE, status.message);
+    status = journal_row_set_existence_locked(
+      candidate_key, row_set_present
+    );
+    if (status == null)
+      return journal_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ batch allocation row-set check returned null status"
+      );
+    if (!status.ok())
+      return journal_status(RDMA_SC_INVALID_STATE, status.message);
+    if (row_set_present)
       return journal_status(
         RDMA_SC_RESOURCE_BUSY, "CMQ batch key is already allocated"
       );
@@ -6129,6 +6329,7 @@ class rdma_cmq_engine extends uvm_object;
   );
     rdma_cmq_batch_submission_record record_snapshot;
     rdma_cmq_preallocated_publish_batch preallocated_snapshot;
+    bit row_set_present;
     string candidate_ticket_keys[$];
     rdma_status status;
 
@@ -6142,14 +6343,30 @@ class rdma_cmq_engine extends uvm_object;
         RDMA_SC_INVALID_STATE,
         "CMQ journal installation has no active profile service"
       );
-    if (submission_journal.exists(record.batch_key) ||
-        preallocated_publish_batches.exists(record.batch_key) ||
-        journal_profile_by_batch.exists(record.batch_key))
+    status = journal_row_set_existence_locked(
+      record.batch_key, row_set_present
+    );
+    if (status == null)
+      return journal_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ journal installation row-set check returned null status"
+      );
+    if (!status.ok())
+      return journal_status(status.code, status.message);
+    status = journal_ticket_index_targets_locked();
+    if (status == null)
+      return journal_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ journal installation ticket target check returned null status"
+      );
+    if (!status.ok())
+      return journal_status(RDMA_SC_INVALID_STATE, status.message);
+    if (row_set_present)
       return journal_status(
         RDMA_SC_RESOURCE_BUSY, "CMQ journal batch key is already installed"
       );
 
-    status = validate_submission_record_locked(record, profile);
+    status = validate_submission_record_locked(record, profile, 1'b1);
     if (status == null || !status.ok())
       return (status == null) ? journal_status(
         RDMA_SC_INVALID_STATE,
@@ -6175,7 +6392,9 @@ class rdma_cmq_engine extends uvm_object;
         RDMA_SC_INVALID_STATE,
         "CMQ journal candidate snapshot returned null status"
       ) : journal_status(status.code, status.message);
-    status = validate_submission_record_locked(record_snapshot, profile);
+    status = validate_submission_record_locked(
+      record_snapshot, profile, 1'b1
+    );
     if (status == null || !status.ok())
       return (status == null) ? journal_status(
         RDMA_SC_INVALID_STATE,
@@ -6212,7 +6431,7 @@ class rdma_cmq_engine extends uvm_object;
     string ticket_keys[$];
     rdma_status status;
 
-    if (batch_key.len() == 0 || !submission_journal.exists(batch_key))
+    if (batch_key.len() == 0)
       return journal_status(
         RDMA_SC_INVALID_ARGUMENT, "CMQ journal batch key is not installed"
       );
@@ -6251,17 +6470,18 @@ class rdma_cmq_engine extends uvm_object;
     rdma_status status;
 
     record = null;
-    if (batch_key.len() == 0 || !submission_journal.exists(batch_key))
+    if (batch_key.len() == 0)
       return journal_status(
         RDMA_SC_INVALID_ARGUMENT, "CMQ journal batch key is not installed"
       );
     status = submission_journal_invariant_locked(batch_key);
-    if (status == null || !status.ok())
+    if (status == null)
       return journal_status(
         RDMA_SC_INVALID_STATE,
-        (status == null) ? "CMQ journal invariant returned null status" :
-                           status.message
+        "CMQ journal invariant returned null status"
       );
+    if (!status.ok())
+      return journal_status(status.code, status.message);
     retained_profile = journal_profile_by_batch[batch_key];
     if (retained_profile == null)
       return journal_status(
@@ -6269,7 +6489,7 @@ class rdma_cmq_engine extends uvm_object;
         "CMQ journal retained profile service is missing"
       );
     status = validate_submission_record_locked(
-      submission_journal[batch_key], retained_profile
+      submission_journal[batch_key], retained_profile, 1'b0
     );
     if (status == null || !status.ok())
       return journal_status(
@@ -6288,7 +6508,9 @@ class rdma_cmq_engine extends uvm_object;
           "CMQ retained journal snapshot returned null status" :
           status.message
       );
-    status = validate_submission_record_locked(candidate, retained_profile);
+    status = validate_submission_record_locked(
+      candidate, retained_profile, 1'b0
+    );
     if (status == null || !status.ok())
       return journal_status(
         RDMA_SC_INVALID_STATE,
@@ -6325,16 +6547,17 @@ class rdma_cmq_engine extends uvm_object;
     engine_lock.put(1);
   endtask
 
-  // 功能：以 ticket 自身稳定 shape/key 定位 retained batch，并要求 indexed item 全值相等。
-  // 输入/输出及副作用：ticket 为 detached 只读输入，record/status 为输出；持现有锁
-  //   读取 ticket index 后复用 batch query helper，不读取当前 runtime authority。
-  // 失败/边界：坏/未知 ticket 或 full-value 不匹配为 INVALID_ARGUMENT；index/record
-  //   歧义与 retained corruption 为 INVALID_STATE；旧 incarnation ticket 仍可查询。
+  // 功能：以 caller ticket 稳定 key 定位 batch，先验证 retained graph 再比较全值。
+  // 输入/输出及副作用：ticket 为 detached 只读输入，record/status 为输出；持锁
+  //   审计全局 index，并只在 validated local candidate 唯一匹配后发布 record。
+  // 失败/边界：坏/未知 caller 或 valid retained 上的全值不匹配为 INVALID_ARGUMENT；
+  //   orphan/index 歧义与任意 retained corruption 为 INVALID_STATE/null output。
   task query_submission_journal_by_ticket(
     input rdma_cmq_ticket ticket,
     output rdma_cmq_batch_submission_record record,
     output rdma_status status
   );
+    rdma_cmq_batch_submission_record candidate;
     string ticket_key;
     string batch_key;
     int unsigned match_count;
@@ -6352,6 +6575,20 @@ class rdma_cmq_engine extends uvm_object;
       return;
     end
     ticket_key = command_key(ticket);
+    status = journal_ticket_index_targets_locked();
+    if (status == null) begin
+      status = journal_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ journal ticket target check returned null status"
+      );
+      engine_lock.put(1);
+      return;
+    end
+    if (!status.ok()) begin
+      status = journal_status(RDMA_SC_INVALID_STATE, status.message);
+      engine_lock.put(1);
+      return;
+    end
     if (!journal_batch_by_ticket.exists(ticket_key)) begin
       status = journal_status(
         RDMA_SC_INVALID_ARGUMENT,
@@ -6361,20 +6598,23 @@ class rdma_cmq_engine extends uvm_object;
       return;
     end
     batch_key = journal_batch_by_ticket[ticket_key];
-    if (!submission_journal.exists(batch_key)) begin
+    status = query_submission_journal_locked(batch_key, candidate);
+    if (status == null) begin
       status = journal_status(
         RDMA_SC_INVALID_STATE,
-        "CMQ journal ticket index references a missing batch"
+        "CMQ journal ticket query returned null status"
       );
       engine_lock.put(1);
       return;
     end
+    if (!status.ok()) begin
+      record = null;
+      engine_lock.put(1);
+      return;
+    end
     match_count = 0;
-    foreach (submission_journal[batch_key].items[i]) begin
-      if (submission_journal[batch_key].items[i] != null &&
-          same_ticket_value(
-            ticket, submission_journal[batch_key].items[i].ticket
-          ))
+    foreach (candidate.items[i]) begin
+      if (same_ticket_value(ticket, candidate.items[i].ticket))
         match_count++;
     end
     if (match_count == 0) begin
@@ -6393,14 +6633,8 @@ class rdma_cmq_engine extends uvm_object;
       engine_lock.put(1);
       return;
     end
-    status = query_submission_journal_locked(batch_key, record);
-    if (status == null) begin
-      record = null;
-      status = journal_status(
-        RDMA_SC_INVALID_STATE,
-        "CMQ journal ticket query returned null status"
-      );
-    end
+    record = candidate;
+    status = journal_status(RDMA_SC_OK);
     engine_lock.put(1);
   endtask
 

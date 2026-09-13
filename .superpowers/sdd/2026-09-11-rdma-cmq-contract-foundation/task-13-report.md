@@ -185,3 +185,104 @@ UVM severity；最终目标 UVM summary 保持 pristine。
 
 - 指定提交标题：`feat(cmq): add engine-owned submission journal storage`
 - 提交包含两份 Task 13 SV 文件和本实现报告；commit hash 以最终提交输出为准。
+
+## Fix round 1：review findings 与 RED
+
+独立 review 的四项 Important finding 均先由测试复现，再修改 production：
+
+- mutable lifecycle evidence 缺少完整 invariant；
+- retained ticket 的非 key 字段损坏会被错分为 caller error，null Function handle
+  还会在形成 key 时触发 null-object access；
+- record、preallocation、profile 与 ticket index 的单行 orphan 未统一视为
+  retained invariant corruption；
+- hostile-factory 场景只实际经过五种受支持 command body 中的 object-ID 分支。
+
+Fix-round RED 仍使用唯一允许的 host-53 命令：
+
+```bash
+SSHPASS=123 scripts/run_vcs53.sh core rdma_cmq_engine_test
+```
+
+该次命令退出 2：batch state corruption 被旧实现接受为 OK；retained ticket 的
+shape-valid 非 key 漂移被错报为 caller `INVALID_ARGUMENT`；随后 null Function handle
+在 `command_key()` 路径触发 NOA；profile orphan 分别落入 `RESOURCE_BUSY` 或普通
+missing-key 分类。五 body matrix 已编译，但因前述 deliberate null-ticket failure 未运行
+到末尾，因而同时保留了原 review 指出的 coverage gap。
+
+## Fix round 1：实现与测试闭环
+
+- `validate_submission_record_locked()` 现在由 install 与每次 query 共用，逐 batch/item
+  校验 state/effect/phase enum、batch reducer、recovery classifier、nonlegacy owner
+  attempt 关系，以及 required completion 的 ticket/status canonical alias。
+- 新增 null-safe 的 per-key row-set parity 与全局 ticket-target audit；allocate、install、
+  remove 及 query 都在普通 collision/missing 分类前拒绝 partial retained row。
+- ticket query 先审计 retained graph 并生成完整 detached candidate，确认 stored side
+  完整后才与 caller ticket 做 full-value compare，避免 retained corruption 被误归责给
+  caller。
+- candidate 与 stored corruption matrix 覆盖上述每类 mutable evidence；stored ticket
+  的合法 shape 非 key 漂移及 null Function handle 均通过 batch/ticket 两个公开 API
+  断言 `INVALID_STATE` + null output。
+- 单一共享 storage fixture 在真实 remove 后确认四表为空，再逐次只播种 record、
+  preallocation、profile 或 ticket-index 一行；为复现旧 batch key 临时回拨的
+  incarnation/batch/attempt/proof counter 在每个窗口后精确恢复。
+- hostile 场景在安装永久 override 前构造 QPC、object-ID、MR-deregister、OCC-flush
+  与 empty 五种 source graph；override 生效后逐行执行 install、batch query 与 remove，
+  并在 object-ID 行删除前执行 ticket query。每轮立即清空本地 row/snapshot 引用，末尾
+  断言四张 retained 表均为空。
+
+## VCS teardown SIGSEGV 定位与隔离
+
+功能断言完成后，未推进时间槽的组合场景曾在 `run_phase` 已打印
+`JOURNAL_DEBUG after hostile` 和 `JOURNAL_DEBUG after drop` 后发生 VCS runtime
+SIGSEGV。捕获日志为 `task-13-fix-vcs53-debug.log` 与
+`task-13-fix-vcs53-mutable-bad.log`；两份 stack annotator 都显示 `No context
+available`，且进程在 objection 已释放后的 teardown 阶段退出，而非 DUT transaction
+或 UVM assertion 路径。
+
+二分隔离分别运行 storage 半段和 hostile-factory 半段时均为 GREEN；只有两组复杂
+automatic fixture 在同一 simulation time slot 连续销毁、同时永久 raw-factory override
+生效时复现 teardown SIGSEGV。最终在 storage engine 已 shutdown 且四张 retained 表
+明确为空后加入一个有中文设计说明的 test-only `#1ns` quiescence boundary，使 VCS 在
+安装永久 override 前完成上一 fixture graph 的回收。该 tick 位于所有 live DUT
+transaction、timeout 和 retained authority 之外，不改变 production 行为或协议时序。
+
+去除全部 `JOURNAL_DEBUG` 与实验代码后的完整命令连续两次退出 0，均在
+`10115000 ps` 完成，UVM warning/error/fatal 为 `0/0/0`，并打印
+`UVM report is pristine`。当前 fix-round 候选的 fresh acceptance run 结果在最终提交前
+的验证小节补充。
+
+## Fix round 1 全文件复审补充
+
+当前文件长度为 production 8650 行、test 17100 行。对两份文件从 header 到 EOF
+重新执行 502 个 function/task 的邻近三段中文注释审计，文件 header 与所有方法均为
+零 finding；同时复核了 journal 所有权/生命周期、四表同锁事务、reset/reprepare
+保留、query 错误映射、hostile cleanup 和 run list。15 个 legacy case-style finding
+均由 Task 13 基线之前的提交引入且不在本次 diff，按小提交边界继续不混入。
+
+review 的 scheduler/transport 可观察计数建议保持为 deferred minor：production
+`prepare()` 在 incarnation overflow 后立即返回，早于 transport candidate 构造；
+`rdma_cmq_transport::configure()` 只保存非拥有 scheduler 引用，并不调用 scheduler
+API。现有测试已断言 Host-memory call 数为零、runtime output 为 null、engine state 与
+incarnation 不变；增加 `submit_calls == 0` 对 prepare 正常路径同样恒真，不能提供额外
+有效区分。该项不改变本轮四项 Important finding 的闭环。
+
+本附录按 fix-round 要求只保留为 controller evidence，最终 fix-round commit 仍只
+stage 两份 Task 13 SV 文件。
+
+## Fix round 1 fresh acceptance
+
+最终提交前于 2026-09-13 12:29（Asia/Shanghai）再次原样运行：
+
+```bash
+SSHPASS=123 scripts/run_vcs53.sh core rdma_cmq_engine_test
+```
+
+命令退出 0；VCS compile/elaborate/link 完成后，`rdma_cmq_engine_test` 在
+`10115000 ps` 结束。report catcher 的 demoted/caught warning、error、fatal 全部为零，
+最终 severity 为 `UVM_WARNING=0`、`UVM_ERROR=0`、`UVM_FATAL=0`，wrapper 输出
+`UVM report is pristine: warning=0 error=0 fatal=0`。
+
+同一最终候选还 fresh 运行 approval checker、以 `4efa9e0` 为 base 的 changed-SV
+style checker、`git diff --check`、SV path scope、debug residue 及新增 production
+forbidden-construction scan；全部退出 0 或无匹配。SV scope 仍严格只有
+`src/core/rdma_cmq_engine.sv` 与 `tests/unit/rdma_cmq_engine_test.sv`。
