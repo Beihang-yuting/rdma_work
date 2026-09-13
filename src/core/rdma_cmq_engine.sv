@@ -185,6 +185,117 @@ class rdma_cmq_preallocated_publish_batch extends uvm_object;
   endfunction
 endclass
 
+typedef class rdma_cmq_engine;
+
+// 设计说明：observer 是 scheduler 进入 MMIO_MAYBE_VISIBLE 前的一次性
+//   capability；它仅保存 engine 非拥有句柄和冻结标量，真实 authority
+//   由 engine 内 exact-object registry 与 journal 联合认证。
+class rdma_cmq_mmio_arm_observer
+  extends rdma_doorbell_submission_observer;
+  local rdma_cmq_engine owner;
+  local string capability_key;
+  local string batch_key;
+  local longint unsigned attempt_id;
+  local longint unsigned engine_incarnation;
+  local bit configured;
+
+  // 功能：构造尚未配置的 MMIO arm observer，建立空 authority 起点。
+  // 输入/输出及副作用：name 传给父类；owner/key 清空，ID 和 configured 清零。
+  // 失败/边界：构造不登记 capability、不取得 engine 所有权；configure 成功前
+  //   回调只能报稳定非法调用诊断。
+  function new(string name = "rdma_cmq_mmio_arm_observer");
+    super.new(name);
+    owner = null;
+    capability_key = "";
+    batch_key = "";
+    attempt_id = 0;
+    engine_incarnation = 0;
+    configured = 1'b0;
+  endfunction
+
+  // 功能：一次性冻结 observer 的 owner、capability/batch key 和 attempt/incarnation。
+  // 输入/输出及副作用：五个 *_arg 为输入；首次完整配置时写入
+  //   local 字段并返回 OK，owner_arg 仍由外部拥有。
+  // 失败/边界：已配置返回 RESOURCE_BUSY；null owner、空 key 或零 ID
+  //   返回 INVALID_ARGUMENT，两类失败均不改写任何 local 字段。
+  function rdma_status configure(
+    input rdma_cmq_engine owner_arg,
+    input string capability_key_arg,
+    input string batch_key_arg,
+    input longint unsigned attempt_id_arg,
+    input longint unsigned engine_incarnation_arg
+  );
+    if (configured)
+      return rdma_cmq_direct_status(
+        RDMA_SC_RESOURCE_BUSY, "CMQ MMIO arm observer is already configured"
+      );
+    if (owner_arg == null || capability_key_arg.len() == 0 ||
+        batch_key_arg.len() == 0 || attempt_id_arg == 0 ||
+        engine_incarnation_arg == 0)
+      return rdma_cmq_direct_status(
+        RDMA_SC_INVALID_ARGUMENT,
+        "CMQ MMIO arm observer configuration is incomplete"
+      );
+
+    owner = owner_arg;
+    capability_key = capability_key_arg;
+    batch_key = batch_key_arg;
+    attempt_id = attempt_id_arg;
+    engine_incarnation = engine_incarnation_arg;
+    configured = 1'b1;
+    return rdma_cmq_direct_status(RDMA_SC_OK);
+  endfunction
+
+  // 功能：查询 configure() 是否已成功冻结完整 capability 字段。
+  // 输入/输出及副作用：无输入；只读并返回 configured，不修改 observer。
+  // 失败/边界：初始或失败 configure 后返回 0，不根据其他字段推测。
+  function bit is_configured();
+    return configured;
+  endfunction
+
+  // 功能：返回 configure() 冻结的 engine 非拥有 owner 句柄供 identity 认证。
+  // 输入/输出及副作用：无输入；只读 owner 并返回 exact handle。
+  // 失败/边界：未配置时返回 null，不接管 engine 生命周期。
+  function rdma_cmq_engine owner_handle();
+    return owner;
+  endfunction
+
+  // 功能：返回冻结的 registry capability key 值供 exact-row 查找。
+  // 输入/输出及副作用：无输入；只读 capability_key，不修改 registry。
+  // 失败/边界：未配置时返回空字符串，字符串知识本身不授权。
+  function string get_capability_key();
+    return capability_key;
+  endfunction
+
+  // 功能：返回冻结的 journal batch key 值供 record 查找。
+  // 输入/输出及副作用：无输入；只读 batch_key，不查询 engine 状态。
+  // 失败/边界：未配置时返回空字符串，不用 key 重建 owner authority。
+  function string get_batch_key();
+    return batch_key;
+  endfunction
+
+  // 功能：返回冻结的 submission attempt ID 供 journal tuple 认证。
+  // 输入/输出及副作用：无输入；只读 attempt_id，不推进 engine counter。
+  // 失败/边界：未配置时返回零，零值不是有效 authority。
+  function longint unsigned get_attempt_id();
+    return attempt_id;
+  endfunction
+
+  // 功能：返回冻结的 engine incarnation 供拒绝 reset/reprepare 后旧能力。
+  // 输入/输出及副作用：无输入；只读 engine_incarnation，无外部副作用。
+  // 失败/边界：未配置时返回零，不回退查询 owner 当前代际。
+  function longint unsigned get_engine_incarnation();
+    return engine_incarnation;
+  endfunction
+
+  // 功能：在 scheduler 即将使 MMIO 可见时同步委托 owner 消费本 capability。
+  // 输入/输出及副作用：无输入/返回值；配置完整时传入 this，
+  //   由 owner 原子安装预分配 runtime 账本。
+  // 失败/边界：未配置或 null owner 只发布稳定 UVM_ERROR 并返回，
+  //   不解引用 owner；实现不得等待、分配、取锁或重入 scheduler/service。
+  extern virtual function void before_mmio_maybe_visible();
+endclass
+
 class rdma_cmq_engine extends uvm_object;
   `uvm_object_utils(rdma_cmq_engine)
 
@@ -239,6 +350,9 @@ class rdma_cmq_engine extends uvm_object;
   protected string journal_batch_by_ticket[string];
   protected rdma_cmq_preallocated_publish_batch
     preallocated_publish_batches[string];
+  // 预分配 observer 行仅以 exact object identity 授权；字符串字段只是
+  //   查找键，成功 arm 与对应 preallocation 在同一无分配函数中消费。
+  protected rdma_cmq_mmio_arm_observer arm_observers[string];
   // Approved non-owning seam: each row retains the exact profile service
   // used to type/canonicalize only its own record.
   protected rdma_cmq_hw_profile journal_profile_by_batch[string];
@@ -280,6 +394,7 @@ class rdma_cmq_engine extends uvm_object;
     submission_journal.delete();
     journal_batch_by_ticket.delete();
     preallocated_publish_batches.delete();
+    arm_observers.delete();
     journal_profile_by_batch.delete();
     fenced_batch_key = "";
     submission_fence_reason = "";
@@ -6066,11 +6181,12 @@ class rdma_cmq_engine extends uvm_object;
     return journal_status(RDMA_SC_OK);
   endfunction
 
-  // 功能：检查指定 key 的 record/preallocation/profile 三张主表是否全无或完整同在。
-  // 输入/输出及副作用：batch_key 为输入，row_set_present 为输出；只读三张表，
-  //   成功时以 0/1 区分完整缺席和完整存在，不读取 current runtime profile。
-  // 失败/边界：空 key 返回 INVALID_ARGUMENT；部分存在或已存在 null 行返回
-  //   INVALID_STATE 且 row_set_present 保持 0，不把 orphan 当作 busy/missing。
+  // 功能：检查指定 key 的 record/profile 主行是否同生同在，并区分 arm 前/后
+  //   preallocation 生命周期：未 arm record 必须有预分配行，已 arm record 可已消费。
+  // 输入/输出及副作用：batch_key 为输入，row_set_present 为输出；只读
+  //   record/preallocation/profile，成功以 0/1 区分完整缺席和完整存在。
+  // 失败/边界：空 key 返回 INVALID_ARGUMENT；record/profile 孤行、null 行、
+  //   无 record 的 preallocation，或 observer_armed=0 却缺 preallocation 返回 INVALID_STATE。
   protected function rdma_status journal_row_set_existence_locked(
     input string batch_key,
     output bit row_set_present
@@ -6087,20 +6203,32 @@ class rdma_cmq_engine extends uvm_object;
     record_present = submission_journal.exists(batch_key);
     preallocation_present = preallocated_publish_batches.exists(batch_key);
     profile_present = journal_profile_by_batch.exists(batch_key);
-    if (record_present != preallocation_present ||
-        record_present != profile_present)
+    if (record_present != profile_present)
       return journal_status(
         RDMA_SC_INVALID_STATE,
-        "CMQ journal record/preallocation/profile rows are orphaned"
+        "CMQ journal record/profile rows are orphaned"
       );
-    if (!record_present)
+    if (!record_present) begin
+      if (preallocation_present)
+        return journal_status(
+          RDMA_SC_INVALID_STATE,
+          "CMQ journal preallocation row is orphaned"
+        );
       return journal_status(RDMA_SC_OK);
+    end
     if (submission_journal[batch_key] == null ||
-        preallocated_publish_batches[batch_key] == null ||
-        journal_profile_by_batch[batch_key] == null)
+        journal_profile_by_batch[batch_key] == null ||
+        (preallocation_present &&
+         preallocated_publish_batches[batch_key] == null))
       return journal_status(
         RDMA_SC_INVALID_STATE,
         "CMQ journal record/preallocation/profile row contains null"
+      );
+    if (!preallocation_present &&
+        !submission_journal[batch_key].observer_armed)
+      return journal_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ unarmed journal record has no preallocation row"
       );
     row_set_present = 1'b1;
     return journal_status(RDMA_SC_OK);
@@ -6181,13 +6309,18 @@ class rdma_cmq_engine extends uvm_object;
         RDMA_SC_INVALID_ARGUMENT, "CMQ journal batch key is not present"
       );
     record = submission_journal[batch_key];
-    if (record == null || record.batch_key != batch_key ||
-        preallocated_publish_batches[batch_key].batch_key != batch_key ||
-        preallocated_publish_batches[batch_key].items.size() !=
-          record.items.size())
+    if (record == null || record.batch_key != batch_key)
       return journal_status(
         RDMA_SC_INVALID_STATE,
-        "CMQ journal batch row or preallocation is inconsistent"
+        "CMQ journal batch row is inconsistent"
+      );
+    if (preallocated_publish_batches.exists(batch_key) &&
+        (preallocated_publish_batches[batch_key].batch_key != batch_key ||
+         preallocated_publish_batches[batch_key].items.size() !=
+           record.items.size()))
+      return journal_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ journal preallocation row is inconsistent"
       );
     foreach (record.items[i]) begin
       string ticket_key;
@@ -6418,6 +6551,184 @@ class rdma_cmq_engine extends uvm_object;
     foreach (candidate_ticket_keys[i])
       journal_batch_by_ticket[candidate_ticket_keys[i]] = record.batch_key;
     return journal_status(RDMA_SC_OK);
+  endfunction
+
+  // 设计说明：该公开入口只因独立声明的 observer 需要同步回调而公开；
+  //   调用方已持 engine_lock，因此认证先完整收集只读证据，通过后才做
+  //   无失败的句柄转移与标量状态迁移，禁止任何构造或外部重入。
+  // 功能：认证 exact registered observer 及 journal tuple，把预分配 slot/token/
+  //   command/entry 安装到 runtime，并把 batch/items 推进到 PUBLISH_AMBIGUOUS。
+  // 输入/输出及副作用：observer 为非拥有输入；成功推进 publish_seq 一次、
+  //   安装预建句柄/索引、更新 MMIO_MAYBE_VISIBLE 证据，再删除 capability
+  //   与 preallocation 行；不取锁、不等待、不调用 scheduler/service/adapter。
+  // 失败/边界：null/未配置、owner/key/handle identity 伪造、tuple 漂移、
+  //   缺行、stale lifecycle、cursor/slot/token/registry 冲突或重复调用均只发布
+  //   RDMA_CMQ_MMIO_ARM_INVALID 且零状态变化；有效 capability 是无可恢复失败的内部不变量。
+  function void arm_submission_for_mmio(
+    input rdma_cmq_mmio_arm_observer observer
+  );
+    rdma_cmq_batch_submission_record record;
+    rdma_cmq_preallocated_publish_batch preallocated;
+    string capability_key;
+    string batch_key;
+    bit valid;
+
+    record = null;
+    preallocated = null;
+    capability_key = "";
+    batch_key = "";
+    valid = observer != null;
+    if (valid) begin
+      valid = observer.is_configured() && observer.owner_handle() == this;
+      if (valid) begin
+        capability_key = observer.get_capability_key();
+        batch_key = observer.get_batch_key();
+        valid = capability_key.len() != 0 && batch_key.len() != 0 &&
+                observer.get_attempt_id() != 0 &&
+                observer.get_engine_incarnation() != 0 &&
+                arm_observers.exists(capability_key) &&
+                arm_observers[capability_key] == observer &&
+                submission_journal.exists(batch_key) &&
+                preallocated_publish_batches.exists(batch_key) &&
+                journal_profile_by_batch.exists(batch_key);
+      end
+      if (valid) begin
+        record = submission_journal[batch_key];
+        preallocated = preallocated_publish_batches[batch_key];
+        valid = record != null && preallocated != null &&
+                journal_profile_by_batch[batch_key] != null;
+      end
+      if (valid)
+        valid = record.batch_key == batch_key &&
+                record.attempt_id == observer.get_attempt_id() &&
+                record.engine_incarnation ==
+                  observer.get_engine_incarnation() &&
+                engine_incarnation == observer.get_engine_incarnation() &&
+                record.state == RDMA_CMQ_SUBMISSION_PENDING_EFFECT &&
+                record.observer_armed == 1'b0 &&
+                record.submission_effect inside {
+                  RDMA_SUBMIT_EFFECT_HOST_MEMORY_MAYBE_VISIBLE,
+                  RDMA_SUBMIT_EFFECT_HOST_MEMORY_WRITTEN,
+                  RDMA_SUBMIT_EFFECT_HOST_MEMORY_ORDERED
+                } && record.attempt_effect == record.submission_effect &&
+                record.items.size() != 0 &&
+                record.start_sequence == publish_seq &&
+                record.end_sequence > record.start_sequence &&
+                record.end_sequence - record.start_sequence ==
+                  record.items.size() &&
+                preallocated.batch_key == batch_key &&
+                preallocated.attempt_id == observer.get_attempt_id() &&
+                preallocated.final_sequence == record.end_sequence &&
+                preallocated.profile_format_valid &&
+                preallocated.profile_endian inside {
+                  RDMA_ENDIAN_LITTLE, RDMA_ENDIAN_BIG
+                } && preallocated.profile_hardware_version != 0 &&
+                preallocated.items.size() == record.items.size();
+      if (valid && profile_image_format_valid)
+        valid = profile_image_endian == preallocated.profile_endian &&
+                profile_hardware_version ==
+                  preallocated.profile_hardware_version;
+      if (valid) begin
+        foreach (record.items[i]) begin
+          rdma_cmq_batch_submission_item_record item;
+          rdma_cmq_preallocated_publish_item preallocated_item;
+
+          item = record.items[i];
+          preallocated_item = preallocated.items[i];
+          if (item == null || preallocated_item == null ||
+              preallocated_item.slot_record == null) begin
+            valid = 1'b0;
+            break;
+          end
+          if (item.state != RDMA_CMQ_SUBMISSION_PENDING_EFFECT ||
+              item.submission_effect != record.submission_effect ||
+              item.attempt_effect != record.attempt_effect ||
+              item.completion_phase != RDMA_CMQ_COMPLETION_NONE ||
+              item.reset_isolation_confirmed || !item.recovery_required ||
+              preallocated_item.request_index != item.request_index ||
+              preallocated_item.command_key.len() == 0 ||
+              preallocated_item.entry_key.len() == 0 ||
+              preallocated_item.entry_key != item.entry_key ||
+              preallocated_item.command_token == 0 ||
+              preallocated_item.command_token != item.command_token ||
+              preallocated_item.slot_record.ticket != item.ticket ||
+              preallocated_item.slot_record.slot_sequence !=
+                item.slot_sequence ||
+              preallocated_item.slot_record.sq_index != item.slot_index ||
+              preallocated_item.slot_record.sq_wrap != item.slot_wrap ||
+              preallocated_item.slot_record.state != CMQ_SLOT_PUBLISHED ||
+              preallocated_item.slot_record.expected == null ||
+              preallocated_item.slot_record.command_token !=
+                item.command_token || item.slot_index >= CMQ_DEPTH ||
+              slots[item.slot_index] != null ||
+              token_in_use[item.command_token] ||
+              command_registry.exists(preallocated_item.command_key) ||
+              entry_registry.exists(preallocated_item.entry_key)) begin
+            valid = 1'b0;
+            break;
+          end
+          for (int unsigned prior = 0; prior < i; prior++) begin
+            if (preallocated.items[prior] == null ||
+                preallocated.items[prior].slot_record == null ||
+                preallocated.items[prior].slot_record.sq_index ==
+                  preallocated_item.slot_record.sq_index ||
+                preallocated.items[prior].command_token ==
+                  preallocated_item.command_token ||
+                preallocated.items[prior].command_key ==
+                  preallocated_item.command_key ||
+                preallocated.items[prior].entry_key ==
+                  preallocated_item.entry_key) begin
+              valid = 1'b0;
+              break;
+            end
+          end
+          if (!valid)
+            break;
+        end
+      end
+    end
+
+    if (!valid) begin
+      `uvm_error("RDMA_CMQ_MMIO_ARM_INVALID",
+                 "CMQ MMIO arm capability is invalid")
+      return;
+    end
+
+    // 全部认证、cardinality 与冲突检查已完成；以下路径只转移
+    // 预建句柄、写标量和删关联行，不包含 new/factory/format/wait/lock/
+    // scheduler/service/adapter 调用，不存在可观察的 partial failure。
+    foreach (record.items[i]) begin
+      rdma_cmq_batch_submission_item_record item;
+      rdma_cmq_preallocated_publish_item preallocated_item;
+      int unsigned slot_index;
+      int unsigned token_index;
+
+      item = record.items[i];
+      preallocated_item = preallocated.items[i];
+      slot_index = preallocated_item.slot_record.sq_index;
+      token_index = preallocated_item.command_token;
+      slots[slot_index] = preallocated_item.slot_record;
+      token_in_use[token_index] = 1'b1;
+      command_registry[preallocated_item.command_key] =
+        preallocated_item.slot_record;
+      entry_registry[preallocated_item.entry_key] =
+        preallocated_item.slot_record;
+      item.state = RDMA_CMQ_SUBMISSION_PUBLISH_AMBIGUOUS;
+      item.submission_effect = RDMA_SUBMIT_EFFECT_MMIO_MAYBE_VISIBLE;
+      item.attempt_effect = RDMA_SUBMIT_EFFECT_MMIO_MAYBE_VISIBLE;
+      item.completion_phase = RDMA_CMQ_COMPLETION_PENDING;
+      item.recovery_required = 1'b1;
+    end
+    publish_seq = preallocated.final_sequence;
+    profile_image_format_valid = preallocated.profile_format_valid;
+    profile_image_endian = preallocated.profile_endian;
+    profile_hardware_version = preallocated.profile_hardware_version;
+    record.state = RDMA_CMQ_SUBMISSION_PUBLISH_AMBIGUOUS;
+    record.submission_effect = RDMA_SUBMIT_EFFECT_MMIO_MAYBE_VISIBLE;
+    record.attempt_effect = RDMA_SUBMIT_EFFECT_MMIO_MAYBE_VISIBLE;
+    record.observer_armed = 1'b1;
+    arm_observers.delete(capability_key);
+    preallocated_publish_batches.delete(batch_key);
   endfunction
 
   // 功能：在完整结构预检后同步删除一个 batch 的 record/index/preallocation/profile 行。
@@ -8648,3 +8959,18 @@ class rdma_cmq_engine extends uvm_object;
     engine_lock.put(1);
   endtask
 endclass
+
+// 功能：在 doorbell 即将进入 MMIO 时把本 exact observer 交给 owner 认证与 arm。
+// 输入/输出及副作用：无显式输入/返回值；已配置时同步调用
+//   owner.arm_submission_for_mmio(this)，成功副作用由 engine 入口定义。
+// 失败/边界：未配置或 owner=null 仅发布单一稳定 UVM_ERROR 并返回；
+//   不解引用 null owner，不等待、分配、取锁或调用 scheduler/service/adapter。
+function void
+rdma_cmq_mmio_arm_observer::before_mmio_maybe_visible();
+  if (!configured || owner == null) begin
+    `uvm_error("RDMA_CMQ_MMIO_ARM_INVALID",
+               "CMQ MMIO arm capability is invalid")
+    return;
+  end
+  owner.arm_submission_for_mmio(this);
+endfunction

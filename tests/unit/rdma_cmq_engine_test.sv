@@ -984,6 +984,34 @@ class rdma_cmq_copy_fatal_catcher extends uvm_report_catcher;
   endfunction
 endclass
 
+// 设计说明：arm capability 的所有拒绝分支必须收敛到同一个稳定
+//   诊断；本 catcher 只吞掉该精确 ID/message，使其他 UVM_ERROR 仍污染汇总。
+class rdma_cmq_mmio_arm_error_catcher extends uvm_report_catcher;
+  int unsigned caught_count;
+
+  // 功能：构造一个尚未捕获 MMIO arm 非法调用诊断的计数器。
+  // 输入/输出及副作用：name 传给父类；caught_count 清零。
+  // 失败/边界：构造不自动注册 callback，测试窗口必须显式 add/delete。
+  function new(string name = "rdma_cmq_mmio_arm_error_catcher");
+    super.new(name);
+    caught_count = 0;
+  endfunction
+
+  // 功能：捕获且计数唯一允许的 MMIO arm capability 非法调用诊断。
+  // 输入/输出及副作用：读取当前 severity/ID/message；精确命中返回
+  //   CAUGHT 并递增 caught_count，其余 report 原样 THROW。
+  // 失败/边界：ID 或 message 漂移时不吞掉；不将其他 error/fatal 降级。
+  virtual function action_e catch();
+    if (get_severity() == UVM_ERROR &&
+        get_id() == "RDMA_CMQ_MMIO_ARM_INVALID" &&
+        get_message() == "CMQ MMIO arm capability is invalid") begin
+      caught_count++;
+      return CAUGHT;
+    end
+    return THROW;
+  endfunction
+endclass
+
 // 设计说明：hostile raw-factory 窗口要求任何 fatal 都成为可断言证据而不是终止
 //   仿真；测试结束后立即移除 catcher，避免改变其他场景的 UVM 语义。
 class rdma_cmq_journal_fatal_catcher extends uvm_report_catcher;
@@ -3151,6 +3179,173 @@ class rdma_cmq_engine_probe extends rdma_cmq_engine;
     rdma_cmq_preallocated_publish_batch preallocated
   );
     return install_submission_journal_locked(record, preallocated);
+  endfunction
+
+  // 功能：把一个已配置 observer 以 exact handle 登记到 arm capability 表。
+  // 输入/输出及副作用：capability_key/observer 为输入；成功写入一行并返回 1。
+  // 失败/边界：空 key、null observer 或重复 key 返回 0，不覆盖原 authority。
+  function bit register_mmio_arm_observer(
+    string capability_key,
+    rdma_cmq_mmio_arm_observer observer
+  );
+    if (capability_key.len() == 0 || observer == null ||
+        arm_observers.exists(capability_key))
+      return 1'b0;
+    arm_observers[capability_key] = observer;
+    return 1'b1;
+  endfunction
+
+  // 功能：删除指定测试 capability 行，为下一个伪造窗口恢复空表。
+  // 输入/输出及副作用：capability_key 为输入；命中时删行并返回 1。
+  // 失败/边界：未知 key 返回 0，不修改 journal/preallocation/runtime 账本。
+  function bit unregister_mmio_arm_observer(string capability_key);
+    if (!arm_observers.exists(capability_key))
+      return 1'b0;
+    arm_observers.delete(capability_key);
+    return 1'b1;
+  endfunction
+
+  // 功能：返回当前未消费 arm capability 行数供一次性断言。
+  // 输入/输出及副作用：无输入；只读 arm_observers.num() 并返回。
+  // 失败/边界：空表返回零，不检查行内 observer 完整性。
+  function int unsigned mmio_arm_observer_count();
+    return arm_observers.num();
+  endfunction
+
+  // 功能：返回 engine-owned 预分配批次的原句柄，供转移 identity 断言。
+  // 输入/输出及副作用：batch_key 为输入；命中返回非拥有句柄。
+  // 失败/边界：空/未知 key 返回 null，不从 journal 重建预分配值。
+  function rdma_cmq_preallocated_publish_batch
+  preallocated_publish_fault_reference(string batch_key);
+    if (batch_key.len() == 0 ||
+        !preallocated_publish_batches.exists(batch_key))
+      return null;
+    return preallocated_publish_batches[batch_key];
+  endfunction
+
+  // 功能：临时取出指定预分配行，注入缺行的 arm 认证窗口。
+  // 输入/输出及副作用：batch_key 为输入，命中时通过 value 发布原句柄并删行。
+  // 失败/边界：空/未知 key 返回 null 且不触及其他 retained 行。
+  function rdma_cmq_preallocated_publish_batch
+  take_preallocated_publish_batch(string batch_key);
+    rdma_cmq_preallocated_publish_batch value;
+
+    if (batch_key.len() == 0 ||
+        !preallocated_publish_batches.exists(batch_key))
+      return null;
+    value = preallocated_publish_batches[batch_key];
+    preallocated_publish_batches.delete(batch_key);
+    return value;
+  endfunction
+
+  // 功能：把先前取出的 exact 预分配句柄恢复到指定 batch 行。
+  // 输入/输出及副作用：batch_key/value 为输入；成功写行并返回 1。
+  // 失败/边界：空 key、null value 或已存在行返回 0，不覆盖旧值。
+  function bit restore_preallocated_publish_batch(
+    string batch_key,
+    rdma_cmq_preallocated_publish_batch value
+  );
+    if (batch_key.len() == 0 || value == null ||
+        preallocated_publish_batches.exists(batch_key))
+      return 1'b0;
+    preallocated_publish_batches[batch_key] = value;
+    return 1'b1;
+  endfunction
+
+  // 功能：在已持 engine_lock 的同步窗口内调用 observer，暴露任何重入取锁。
+  // 输入/输出及副作用：observer 为非拥有输入；task 取锁、同步回调后放锁。
+  // 失败/边界：null observer 不解引用；回调若等待或重取锁则本 task 无法完成。
+  task call_mmio_arm_while_engine_lock_held(
+    rdma_cmq_mmio_arm_observer observer
+  );
+    engine_lock.get(1);
+    if (observer != null)
+      observer.before_mmio_maybe_visible();
+    engine_lock.put(1);
+  endtask
+
+  // 功能：返回当前 runtime producer cursor，供 arm 只推进一次的断言。
+  // 输入/输出及副作用：无输入；只读 publish_seq。
+  // 失败/边界：counter 损坏时返回原值，不运行 ring invariant 修复。
+  function longint unsigned mmio_arm_publish_sequence();
+    return publish_seq;
+  endfunction
+
+  // 功能：返回指定 slot 的 exact runtime record 句柄供转移断言。
+  // 输入/输出及副作用：sq_index 为输入；合法且非空时返回非拥有句柄。
+  // 失败/边界：sq_index>=32 或空 slot 返回 null，不创建占位记录。
+  function rdma_cmq_slot_record mmio_arm_slot_reference(int unsigned sq_index);
+    if (sq_index >= 32)
+      return null;
+    return slots[sq_index];
+  endfunction
+
+  // 功能：查询指定 command token 是否已安装到 runtime 账本。
+  // 输入/输出及副作用：token 为输入；合法时返回 token_in_use 位。
+  // 失败/边界：token>=32 返回 0，不更改 incarnation 或预留状态。
+  function bit mmio_arm_token_in_use(int unsigned token);
+    if (token >= 32)
+      return 1'b0;
+    return token_in_use[token];
+  endfunction
+
+  // 功能：按预分配 command key 返回 runtime registry 的 exact slot 句柄。
+  // 输入/输出及副作用：key 为输入；命中返回非拥有句柄，只读索引。
+  // 失败/边界：未知 key 返回 null，不从 ticket 重算或补写索引。
+  function rdma_cmq_slot_record mmio_arm_command_reference(string key);
+    if (!command_registry.exists(key))
+      return null;
+    return command_registry[key];
+  endfunction
+
+  // 功能：按预分配 entry key 返回 runtime registry 的 exact slot 句柄。
+  // 输入/输出及副作用：key 为输入；命中返回非拥有句柄，只读索引。
+  // 失败/边界：未知 key 返回 null，不修改 slot/token 所有权。
+  function rdma_cmq_slot_record mmio_arm_entry_reference(string key);
+    if (!entry_registry.exists(key))
+      return null;
+    return entry_registry[key];
+  endfunction
+
+  // 功能：把 arm 可写账本投影为稳定文本，供非法回调前后逐值比对。
+  // 输入/输出及副作用：batch_key 定位 record；只读 cursor、表基数、
+  //   profile 格式与 batch/item mutable evidence 并返回 string。
+  // 失败/边界：record/item 缺失时以 missing 标记反映真实损坏，不解引用 null。
+  function string mmio_arm_state_fingerprint(string batch_key);
+    string value;
+
+    value = $sformatf(
+      "p=%016h|s=%0d|t=%0d|c=%0d|e=%0d|j=%0d|a=%0d|o=%0d|f=%0b:%0d:%0d",
+      publish_seq, slot_record_count(), tokens_in_use_count(),
+      command_registry.num(), entry_registry.num(), submission_journal.num(),
+      preallocated_publish_batches.num(), arm_observers.num(),
+      profile_image_format_valid, profile_image_endian,
+      profile_hardware_version
+    );
+    if (!submission_journal.exists(batch_key) ||
+        submission_journal[batch_key] == null)
+      return {value, "|record=missing"};
+    value = {value, $sformatf(
+      "|b=%0d:%0d:%0d:%0b",
+      submission_journal[batch_key].state,
+      submission_journal[batch_key].submission_effect,
+      submission_journal[batch_key].attempt_effect,
+      submission_journal[batch_key].observer_armed
+    )};
+    foreach (submission_journal[batch_key].items[i]) begin
+      if (submission_journal[batch_key].items[i] == null)
+        value = {value, "|item=missing"};
+      else
+        value = {value, $sformatf(
+          "|i%0d=%0d:%0d:%0d:%0d:%0b",
+          i, submission_journal[batch_key].items[i].state,
+          submission_journal[batch_key].items[i].submission_effect,
+          submission_journal[batch_key].items[i].attempt_effect,
+          submission_journal[batch_key].items[i].completion_phase,
+          submission_journal[batch_key].items[i].recovery_required
+        )};
+    end
+    return value;
   endfunction
 
   // 功能：调用锁内 journal 删除入口，验证 record/index/preallocation 同步移除。
@@ -5976,6 +6171,73 @@ class rdma_cmq_engine_test extends uvm_test;
       ) : status;
     end
     return rdma_cmq_direct_status(RDMA_SC_OK);
+  endfunction
+
+  // 功能：把完整 journal fixture 改成 doorbell 已 HOST_MEMORY_ORDERED、
+  //   但尚未进入 MMIO 的 PENDING_EFFECT arm 前状态。
+  // 输入/输出及副作用：record 为 inout；改写 batch/item lifecycle，清除
+  //   completion 并保留 digest authority、ticket 与预分配图。
+  // 失败/边界：record 为 null 或含 null item 时返回 0 且不保证 partial 改写回滚；
+  //   调用方只能对新建、尚未安装的 fixture 使用。
+  function automatic bit make_pending_mmio_arm_fixture(
+    inout rdma_cmq_batch_submission_record record
+  );
+    if (record == null)
+      return 1'b0;
+    foreach (record.items[i]) begin
+      if (record.items[i] == null)
+        return 1'b0;
+    end
+
+    record.state = RDMA_CMQ_SUBMISSION_PENDING_EFFECT;
+    record.submission_effect = RDMA_SUBMIT_EFFECT_HOST_MEMORY_ORDERED;
+    record.attempt_effect = RDMA_SUBMIT_EFFECT_HOST_MEMORY_ORDERED;
+    record.observer_armed = 1'b0;
+    foreach (record.items[i]) begin
+      record.items[i].state = RDMA_CMQ_SUBMISSION_PENDING_EFFECT;
+      record.items[i].submission_effect =
+        RDMA_SUBMIT_EFFECT_HOST_MEMORY_ORDERED;
+      record.items[i].attempt_effect = RDMA_SUBMIT_EFFECT_HOST_MEMORY_ORDERED;
+      record.items[i].completion_phase = RDMA_CMQ_COMPLETION_NONE;
+      record.items[i].reset_isolation_confirmed = 1'b0;
+      record.items[i].recovery_required = 1'b1;
+      record.items[i].completion = null;
+    end
+    return 1'b1;
+  endfunction
+
+  // 功能：调用一次应被拒绝的 observer，断言诊断递增且 arm 账本逐值不变。
+  // 输入/输出及副作用：label 用于诊断，batch_key 定位真实 authority record；
+  //   engine/observer/catcher 为非拥有输入，回调前后比较该 record 的 fingerprint。
+  // 失败/边界：三个句柄任一为 null 或 batch_key 为空时直接报 fixture error；本 helper
+  //   不吞掉非目标 UVM report，也不修复被 DUT 错误改写的状态。
+  function automatic void expect_mmio_arm_invalid_unchanged(
+    string label,
+    string batch_key,
+    rdma_cmq_engine_probe engine,
+    rdma_cmq_mmio_arm_observer observer,
+    rdma_cmq_mmio_arm_error_catcher catcher
+  );
+    string before_state;
+    string after_state;
+    int unsigned before_errors;
+
+    if (batch_key.len() == 0 || engine == null || observer == null ||
+        catcher == null) begin
+      `uvm_error({label, "_FIXTURE"},
+                 "MMIO arm rejection fixture handle or batch key is invalid")
+      return;
+    end
+    before_state = engine.mmio_arm_state_fingerprint(batch_key);
+    before_errors = catcher.caught_count;
+    observer.before_mmio_maybe_visible();
+    after_state = engine.mmio_arm_state_fingerprint(batch_key);
+    if (catcher.caught_count != before_errors + 1)
+      `uvm_error({label, "_DIAGNOSTIC"},
+                 "invalid MMIO arm did not emit exactly one stable error")
+    if (after_state != before_state)
+      `uvm_error({label, "_ATOMICITY"},
+                 "invalid MMIO arm changed journal, cursor or registry state")
   endfunction
 
   // 功能：从完整两项 journal record 构造 execution-result、recovery request
@@ -16771,6 +17033,308 @@ class rdma_cmq_engine_test extends uvm_test;
     expect_status("JOURNAL_STORAGE_SHUTDOWN", status, RDMA_SC_OK);
   endtask
 
+  // 功能：验证 pre-MMIO arm capability 仅能由登记的 exact observer 一次性消费，
+  //   并在已持 engine_lock 时用预分配值原子安装 runtime publication 账本。
+  // 输入/输出及副作用：无参数；自建 ACTIVE engine、PENDING_EFFECT journal、
+  //   多个 forged observer 与 catcher；成功路径消费 observer/preallocation 行。
+  // 失败/边界：伪造 identity、错 batch/attempt/incarnation、缺预分配、
+  //   stale state、未登记、未配置/null-owner、null 参数与重复回调均必须单诊断且零状态变化。
+  task automatic check_pre_mmio_arm_capability();
+    rdma_cmq_engine_probe engine;
+    rdma_mock_host_mem mem;
+    rdma_cmq_transport_scheduler_double scheduler;
+    rdma_cmq_journal_tracking_profile profile_service;
+    rdma_function_binding binding;
+    rdma_function_identity identity;
+    rdma_cmq cmq;
+    rdma_cmq_runtime_desc runtime_desc;
+    rdma_cmq_batch_submission_record record;
+    rdma_cmq_batch_submission_record stored_record;
+    rdma_cmq_batch_submission_record queried_record;
+    rdma_cmq_preallocated_publish_batch preallocated;
+    rdma_cmq_preallocated_publish_batch stored_preallocated;
+    rdma_cmq_preallocated_publish_batch removed_preallocated;
+    rdma_cmq_slot_record expected_slots[$];
+    rdma_cmq_mmio_arm_observer authentic;
+    rdma_cmq_mmio_arm_observer forged;
+    rdma_cmq_mmio_arm_observer wrong_batch;
+    rdma_cmq_mmio_arm_observer wrong_attempt;
+    rdma_cmq_mmio_arm_observer wrong_incarnation;
+    rdma_cmq_mmio_arm_observer unconfigured;
+    rdma_cmq_mmio_arm_error_catcher catcher;
+    rdma_status status;
+    string batch_key;
+    string capability_key;
+    string before_state;
+    string after_state;
+    longint unsigned batch_id;
+    longint unsigned attempt_id;
+    int unsigned profile_calls_before;
+    int unsigned errors_before;
+    time callback_time;
+
+    engine = rdma_cmq_engine_probe::type_id::create("mmio_arm_engine");
+    mem = rdma_mock_host_mem::type_id::create("mmio_arm_mem");
+    scheduler = rdma_cmq_transport_scheduler_double::type_id::create(
+      "mmio_arm_scheduler"
+    );
+    profile_service = rdma_cmq_journal_tracking_profile::type_id::create(
+      "mmio_arm_profile"
+    );
+    binding = make_binding("mmio_arm_binding", RDMA_BIND_PREPARED);
+    cmq = make_cmq("mmio_arm_cmq", binding);
+    engine.prepare(
+      binding, cmq, 1'b1, 20'h34567, mem, scheduler, profile_service,
+      runtime_desc, status
+    );
+    expect_status("MMIO_ARM_PREPARE", status, RDMA_SC_OK);
+    status = binding.snapshot_identity_nonfatal(identity);
+    expect_status("MMIO_ARM_IDENTITY", status, RDMA_SC_OK);
+    status = engine.allocate_batch_identity_probe(identity, batch_key, batch_id);
+    expect_status("MMIO_ARM_BATCH", status, RDMA_SC_OK);
+    status = engine.allocate_attempt_identity_probe(attempt_id);
+    expect_status("MMIO_ARM_ATTEMPT", status, RDMA_SC_OK);
+    status = build_journal_fixture(
+      "mmio_arm", engine, profile_service, binding, cmq, batch_key,
+      batch_id, attempt_id, 64'h2000,
+      RDMA_CMQ_TEST_JOURNAL_BODY_OBJECT_ID, record, preallocated
+    );
+    expect_status("MMIO_ARM_FIXTURE", status, RDMA_SC_OK);
+    if (!make_pending_mmio_arm_fixture(record)) begin
+      `uvm_error("MMIO_ARM_PENDING_FIXTURE",
+                 "journal fixture could not enter PENDING_EFFECT")
+      engine.shutdown(status);
+      return;
+    end
+    engine.seed_ring_counters(record.start_sequence, record.start_sequence);
+    status = engine.install_submission_journal_probe(record, preallocated);
+    expect_status("MMIO_ARM_INSTALL", status, RDMA_SC_OK);
+    stored_record = engine.journal_record_fault_reference(batch_key);
+    stored_preallocated =
+      engine.preallocated_publish_fault_reference(batch_key);
+    if (stored_record == null || stored_preallocated == null ||
+        stored_preallocated.items.size() != 2) begin
+      `uvm_error("MMIO_ARM_STORED_FIXTURE",
+                 "engine did not retain the complete arm fixture")
+      engine.shutdown(status);
+      return;
+    end
+    foreach (stored_preallocated.items[i])
+      expected_slots.push_back(stored_preallocated.items[i].slot_record);
+
+    capability_key = {batch_key, "|arm=0000000000000001"};
+    authentic = new("mmio_arm_authentic");
+    status = authentic.configure(
+      engine, capability_key, batch_key, attempt_id,
+      engine.journal_engine_incarnation()
+    );
+    expect_status("MMIO_ARM_CONFIGURE", status, RDMA_SC_OK);
+    if (!authentic.is_configured() || authentic.owner_handle() != engine ||
+        authentic.get_capability_key() != capability_key ||
+        authentic.get_batch_key() != batch_key ||
+        authentic.get_attempt_id() != attempt_id ||
+        authentic.get_engine_incarnation() !=
+          engine.journal_engine_incarnation())
+      `uvm_error("MMIO_ARM_ACCESSORS",
+                 "configured observer accessors changed immutable authority")
+    status = authentic.configure(
+      engine, {capability_key, "-again"}, batch_key, attempt_id + 1'b1,
+      engine.journal_engine_incarnation() + 1'b1
+    );
+    expect_status("MMIO_ARM_CONFIGURE_ONESHOT", status, RDMA_SC_RESOURCE_BUSY);
+    if (authentic.get_capability_key() != capability_key ||
+        authentic.get_attempt_id() != attempt_id ||
+        authentic.get_engine_incarnation() !=
+          engine.journal_engine_incarnation())
+      `uvm_error("MMIO_ARM_CONFIGURE_IMMUTABLE",
+                 "second configure changed one-shot observer authority")
+    if (!engine.register_mmio_arm_observer(capability_key, authentic))
+      `uvm_error("MMIO_ARM_REGISTER", "authentic observer was not registered")
+
+    catcher = new("mmio_arm_error_catcher");
+    uvm_report_cb::add(null, catcher);
+
+    forged = new("mmio_arm_forged");
+    status = forged.configure(
+      engine, capability_key, batch_key, attempt_id,
+      engine.journal_engine_incarnation()
+    );
+    expect_status("MMIO_ARM_FORGED_CONFIGURE", status, RDMA_SC_OK);
+    expect_mmio_arm_invalid_unchanged(
+      "MMIO_ARM_FORGED", batch_key, engine, forged, catcher
+    );
+
+    if (!engine.unregister_mmio_arm_observer(capability_key))
+      `uvm_error("MMIO_ARM_UNREGISTER", "authentic row could not be removed")
+    expect_mmio_arm_invalid_unchanged(
+      "MMIO_ARM_UNREGISTERED", batch_key, engine, authentic, catcher
+    );
+    if (!engine.register_mmio_arm_observer(capability_key, authentic))
+      `uvm_error("MMIO_ARM_REREGISTER", "authentic row could not be restored")
+
+    wrong_batch = new("mmio_arm_wrong_batch");
+    status = wrong_batch.configure(
+      engine, "wrong-batch-capability", "wrong-batch", attempt_id,
+      engine.journal_engine_incarnation()
+    );
+    expect_status("MMIO_ARM_WRONG_BATCH_CONFIGURE", status, RDMA_SC_OK);
+    if (!engine.register_mmio_arm_observer(
+          wrong_batch.get_capability_key(), wrong_batch
+        ))
+      `uvm_error("MMIO_ARM_WRONG_BATCH_REGISTER",
+                 "wrong-batch observer fixture was not registered")
+    expect_mmio_arm_invalid_unchanged(
+      "MMIO_ARM_WRONG_BATCH", batch_key, engine, wrong_batch, catcher
+    );
+    void'(engine.unregister_mmio_arm_observer(
+      wrong_batch.get_capability_key()
+    ));
+
+    wrong_attempt = new("mmio_arm_wrong_attempt");
+    status = wrong_attempt.configure(
+      engine, "wrong-attempt-capability", batch_key, attempt_id + 1'b1,
+      engine.journal_engine_incarnation()
+    );
+    expect_status("MMIO_ARM_WRONG_ATTEMPT_CONFIGURE", status, RDMA_SC_OK);
+    if (!engine.register_mmio_arm_observer(
+          wrong_attempt.get_capability_key(), wrong_attempt
+        ))
+      `uvm_error("MMIO_ARM_WRONG_ATTEMPT_REGISTER",
+                 "wrong-attempt observer fixture was not registered")
+    expect_mmio_arm_invalid_unchanged(
+      "MMIO_ARM_WRONG_ATTEMPT", batch_key, engine, wrong_attempt, catcher
+    );
+    void'(engine.unregister_mmio_arm_observer(
+      wrong_attempt.get_capability_key()
+    ));
+
+    wrong_incarnation = new("mmio_arm_wrong_incarnation");
+    status = wrong_incarnation.configure(
+      engine, "wrong-incarnation-capability", batch_key, attempt_id,
+      engine.journal_engine_incarnation() + 1'b1
+    );
+    expect_status("MMIO_ARM_WRONG_INCARNATION_CONFIGURE", status, RDMA_SC_OK);
+    if (!engine.register_mmio_arm_observer(
+          wrong_incarnation.get_capability_key(), wrong_incarnation
+        ))
+      `uvm_error("MMIO_ARM_WRONG_INCARNATION_REGISTER",
+                 "wrong-incarnation observer fixture was not registered")
+    expect_mmio_arm_invalid_unchanged(
+      "MMIO_ARM_WRONG_INCARNATION", batch_key, engine,
+      wrong_incarnation, catcher
+    );
+    void'(engine.unregister_mmio_arm_observer(
+      wrong_incarnation.get_capability_key()
+    ));
+
+    removed_preallocated = engine.take_preallocated_publish_batch(batch_key);
+    if (removed_preallocated == null)
+      `uvm_error("MMIO_ARM_DROP_PREALLOCATION",
+                 "preallocation fixture could not be removed")
+    expect_mmio_arm_invalid_unchanged(
+      "MMIO_ARM_MISSING_PREALLOCATION", batch_key, engine,
+      authentic, catcher
+    );
+    if (!engine.restore_preallocated_publish_batch(
+          batch_key, removed_preallocated
+        ))
+      `uvm_error("MMIO_ARM_RESTORE_PREALLOCATION",
+                 "preallocation fixture could not be restored")
+
+    stored_record.state = RDMA_CMQ_SUBMISSION_STAGED;
+    expect_mmio_arm_invalid_unchanged(
+      "MMIO_ARM_STALE_STATE", batch_key, engine, authentic, catcher
+    );
+    stored_record.state = RDMA_CMQ_SUBMISSION_PENDING_EFFECT;
+
+    unconfigured = new("mmio_arm_unconfigured");
+    status = unconfigured.configure(
+      null, "unconfigured-capability", batch_key, attempt_id,
+      engine.journal_engine_incarnation()
+    );
+    expect_status("MMIO_ARM_NULL_OWNER_CONFIGURE", status,
+                  RDMA_SC_INVALID_ARGUMENT);
+    if (unconfigured.is_configured() || unconfigured.owner_handle() != null)
+      `uvm_error("MMIO_ARM_NULL_OWNER_STATE",
+                 "failed configure published a partial owner capability")
+    expect_mmio_arm_invalid_unchanged(
+      "MMIO_ARM_UNCONFIGURED", batch_key, engine, unconfigured, catcher
+    );
+
+    before_state = engine.mmio_arm_state_fingerprint(batch_key);
+    errors_before = catcher.caught_count;
+    engine.arm_submission_for_mmio(null);
+    after_state = engine.mmio_arm_state_fingerprint(batch_key);
+    if (catcher.caught_count != errors_before + 1 ||
+        after_state != before_state)
+      `uvm_error("MMIO_ARM_NULL_OBSERVER",
+                 "null observer diagnostic changed engine state")
+
+    profile_calls_before = profile_service.journal_service_calls;
+    callback_time = $time;
+    engine.call_mmio_arm_while_engine_lock_held(authentic);
+    if ($time != callback_time || scheduler.submit_calls != 0 ||
+        profile_service.journal_service_calls != profile_calls_before)
+      `uvm_error("MMIO_ARM_REENTRY",
+                 "valid callback waited or re-entered scheduler/profile")
+    if (engine.mmio_arm_publish_sequence() != stored_record.end_sequence ||
+        engine.preallocated_publish_batch_count() != 0 ||
+        engine.mmio_arm_observer_count() != 0 ||
+        stored_record.state != RDMA_CMQ_SUBMISSION_PUBLISH_AMBIGUOUS ||
+        stored_record.submission_effect !=
+          RDMA_SUBMIT_EFFECT_MMIO_MAYBE_VISIBLE ||
+        stored_record.attempt_effect !=
+          RDMA_SUBMIT_EFFECT_MMIO_MAYBE_VISIBLE ||
+        !stored_record.observer_armed)
+      `uvm_error("MMIO_ARM_COMMIT",
+                 "valid callback did not atomically commit batch evidence")
+    foreach (stored_record.items[i]) begin
+      if (stored_record.items[i].state !=
+            RDMA_CMQ_SUBMISSION_PUBLISH_AMBIGUOUS ||
+          stored_record.items[i].submission_effect !=
+            RDMA_SUBMIT_EFFECT_MMIO_MAYBE_VISIBLE ||
+          stored_record.items[i].attempt_effect !=
+            RDMA_SUBMIT_EFFECT_MMIO_MAYBE_VISIBLE ||
+          stored_record.items[i].completion_phase !=
+            RDMA_CMQ_COMPLETION_PENDING ||
+          !stored_record.items[i].recovery_required ||
+          engine.mmio_arm_slot_reference(
+            stored_record.items[i].slot_index
+          ) != expected_slots[i] ||
+          !engine.mmio_arm_token_in_use(
+            stored_record.items[i].command_token
+          ) ||
+          engine.mmio_arm_command_reference(
+            stored_preallocated.items[i].command_key
+          ) != expected_slots[i] ||
+          engine.mmio_arm_entry_reference(
+            stored_preallocated.items[i].entry_key
+          ) != expected_slots[i])
+        `uvm_error("MMIO_ARM_ITEM_COMMIT",
+                   $sformatf("item %0d did not transfer exact preallocation", i))
+    end
+
+    expect_mmio_arm_invalid_unchanged(
+      "MMIO_ARM_DUPLICATE", batch_key, engine, authentic, catcher
+    );
+    if (catcher.caught_count != 10)
+      `uvm_error("MMIO_ARM_ERROR_COUNT",
+                 $sformatf("caught %0d stable errors instead of 10",
+                           catcher.caught_count))
+    uvm_report_cb::delete(null, catcher);
+
+    engine.query_submission_journal(batch_key, queried_record, status);
+    expect_status("MMIO_ARM_QUERY_AFTER_COMMIT", status, RDMA_SC_OK);
+    if (queried_record == null || queried_record.observer_armed != 1'b1 ||
+        queried_record.state != RDMA_CMQ_SUBMISSION_PUBLISH_AMBIGUOUS)
+      `uvm_error("MMIO_ARM_QUERY_AFTER_COMMIT_OUTPUT",
+                 "consumed preallocation made armed journal unqueryable")
+    status = engine.remove_submission_journal_probe(batch_key);
+    expect_status("MMIO_ARM_REMOVE_AFTER_COMMIT", status, RDMA_SC_OK);
+    engine.shutdown(status);
+    expect_status("MMIO_ARM_SHUTDOWN", status, RDMA_SC_OK);
+  endtask
+
   // 功能：在 persistent hostile raw-factory override 下验证所有 Task 13 snapshot
   //   seam 只用 direct-new/profile typed copy，并非致命拒绝未知 body/payload。
   // 输入/输出及副作用：无参数；先构造完整 source graph，再永久安装 overrides，
@@ -17089,6 +17653,7 @@ class rdma_cmq_engine_test extends uvm_test;
     check_retire_then_wrap_publication();
     check_journal_identity_and_counter_contract();
     check_submission_journal_storage_and_queries();
+    check_pre_mmio_arm_capability();
     // storage engine 已 shutdown 且四张 retained 表为空；推进一个 test-only tick，
     // 让模拟器在安装永久 factory override 前回收上一 automatic fixture 的复杂 graph。
     // 此边界没有 live DUT transaction，不改变任何被测 lifecycle 或超时语义。
