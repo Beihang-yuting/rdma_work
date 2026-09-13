@@ -3027,6 +3027,101 @@ class rdma_cmq_transport_scheduler_double extends rdma_doorbell_scheduler;
   endtask
 endclass
 
+// 设计说明：Task 14 只在 prepare 安装的 scheduler 真实 Function
+//   semaphore 下同步回调；不进入已知受 VCS 限制的 MMIO worker fork。
+class rdma_cmq_mmio_arm_scheduler_probe extends rdma_doorbell_scheduler;
+  `uvm_object_utils(rdma_cmq_mmio_arm_scheduler_probe)
+
+  int unsigned calls;
+  longint unsigned locked_function_uid;
+  int unsigned locked_global_function_id;
+  int object_count_before;
+  int object_count_after;
+  int unsigned trace_count_before;
+  int unsigned trace_count_after;
+  int unsigned profile_calls_before;
+  int unsigned profile_calls_after;
+  time time_before;
+  time time_after;
+  bit lock_contract_ok;
+
+  // 功能：构造尚未执行 exact-lock callback 的 scheduler probe。
+  // 输入/输出及副作用：name 传给父类；清空 key、回调计数和所有边界观测值。
+  // 失败/边界：构造不配置 adapter，也不接管 binding、observer 或 profile 生命周期。
+  function new(string name = "rdma_cmq_mmio_arm_scheduler_probe");
+    super.new(name);
+    calls = 0;
+    locked_function_uid = 0;
+    locked_global_function_id = 0;
+    object_count_before = 0;
+    object_count_after = 0;
+    trace_count_before = 0;
+    trace_count_after = 0;
+    profile_calls_before = 0;
+    profile_calls_after = 0;
+    time_before = 0;
+    time_after = 0;
+    lock_contract_ok = 1'b0;
+  endfunction
+
+  // 功能：按 production Function key 取得 inherited lock_for() semaphore，
+  //   在 token 持有期间调用 base authentic observer 并紧邻采样无分配/无重入证据。
+  // 输入/输出及副作用：binding/observer/trace/profile 为非拥有输入；记录
+  //   exact key、UVM instance 数、$time、unified trace/profile 计数，最后归还唯一 token。
+  // 失败/边界：任一输入为 null 时不取锁/回调；回调前后 token 意外可取、
+  //   或退出后不是恰好一个 token 时 lock_contract_ok=0，检查不改变实际 token 数。
+  task call_observer_under_exact_function_lock(
+    rdma_function_binding binding,
+    rdma_cmq_mmio_arm_observer observer,
+    rdma_mock_call_trace trace,
+    rdma_cmq_journal_tracking_profile profile_service
+  );
+    semaphore function_lock;
+    bit held_before;
+    bit held_after;
+    bit unexpected_token;
+    bit first_token;
+    bit second_token;
+
+    calls++;
+    lock_contract_ok = 1'b0;
+    if (binding == null || observer == null || trace == null ||
+        profile_service == null)
+      return;
+    locked_function_uid = binding.function_uid;
+    locked_global_function_id = binding.global_function_id;
+    function_lock = lock_for(locked_function_uid,
+                             locked_global_function_id);
+    function_lock.get(1);
+    unexpected_token = function_lock.try_get(1);
+    held_before = !unexpected_token;
+    if (unexpected_token)
+      function_lock.put(1);
+    object_count_before = uvm_object::get_inst_count();
+    trace_count_before = trace.calls.size();
+    profile_calls_before = profile_service.journal_service_calls;
+    time_before = $time;
+    observer.before_mmio_maybe_visible();
+    time_after = $time;
+    profile_calls_after = profile_service.journal_service_calls;
+    trace_count_after = trace.calls.size();
+    object_count_after = uvm_object::get_inst_count();
+    unexpected_token = function_lock.try_get(1);
+    held_after = !unexpected_token;
+    if (unexpected_token)
+      function_lock.put(1);
+    function_lock.put(1);
+    first_token = function_lock.try_get(1);
+    second_token = function_lock.try_get(1);
+    if (first_token)
+      function_lock.put(1);
+    if (second_token)
+      function_lock.put(1);
+    lock_contract_ok = held_before && held_after && first_token &&
+                       !second_token;
+  endtask
+endclass
+
 // 设计说明：facade 的 observer 契约是 identity 透传；这个无外部依赖的具体实现
 //   只为抽象基类提供合法实例，若未来替身错误调用回调，calls 也会留下证据。
 class rdma_cmq_transport_observer
@@ -3252,16 +3347,54 @@ class rdma_cmq_engine_probe extends rdma_cmq_engine;
     return 1'b1;
   endfunction
 
-  // 功能：在已持 engine_lock 的同步窗口内调用 observer，暴露任何重入取锁。
-  // 输入/输出及副作用：observer 为非拥有输入；task 取锁、同步回调后放锁。
-  // 失败/边界：null observer 不解引用；回调若等待或重取锁则本 task 无法完成。
-  task call_mmio_arm_while_engine_lock_held(
-    rdma_cmq_mmio_arm_observer observer
+  // 功能：确认 scheduler probe 是 prepare 安装的 exact 对象且 binding
+  //   使用同一 production Function key，再持真实 engine_lock 调用 exact-lock seam。
+  // 输入/输出及副作用：binding/scheduler_probe/observer/trace/profile 为非拥有输入；
+  //   engine_lock_contract 输出回调前后 token 被占用且退出后恰好恢复一个 token。
+  // 失败/边界：句柄缺失、scheduler identity 或 Function UID/global ID 不同时
+  //   输出 0 且不回调；意外多 token 按实际取得数原样归还，不掩盖损坏。
+  task call_mmio_arm_under_exact_locks(
+    rdma_function_binding binding,
+    rdma_cmq_mmio_arm_scheduler_probe scheduler_probe,
+    rdma_cmq_mmio_arm_observer observer,
+    rdma_mock_call_trace trace,
+    rdma_cmq_journal_tracking_profile profile_service,
+    output bit engine_lock_contract
   );
+    bit held_before;
+    bit held_after;
+    bit unexpected_token;
+    bit first_token;
+    bit second_token;
+
+    engine_lock_contract = 1'b0;
+    if (binding == null || scheduler_probe == null || observer == null ||
+        trace == null || profile_service == null ||
+        scheduler != scheduler_probe || prepared_binding == null ||
+        binding.function_uid != prepared_binding.function_uid ||
+        binding.global_function_id != prepared_binding.global_function_id)
+      return;
     engine_lock.get(1);
-    if (observer != null)
-      observer.before_mmio_maybe_visible();
+    unexpected_token = engine_lock.try_get(1);
+    held_before = !unexpected_token;
+    if (unexpected_token)
+      engine_lock.put(1);
+    scheduler_probe.call_observer_under_exact_function_lock(
+      binding, observer, trace, profile_service
+    );
+    unexpected_token = engine_lock.try_get(1);
+    held_after = !unexpected_token;
+    if (unexpected_token)
+      engine_lock.put(1);
     engine_lock.put(1);
+    first_token = engine_lock.try_get(1);
+    second_token = engine_lock.try_get(1);
+    if (first_token)
+      engine_lock.put(1);
+    if (second_token)
+      engine_lock.put(1);
+    engine_lock_contract = held_before && held_after && first_token &&
+                           !second_token;
   endtask
 
   // 功能：返回当前 runtime producer cursor，供 arm 只推进一次的断言。
@@ -3307,45 +3440,122 @@ class rdma_cmq_engine_probe extends rdma_cmq_engine;
     return entry_registry[key];
   endfunction
 
-  // 功能：把 arm 可写账本投影为稳定文本，供非法回调前后逐值比对。
-  // 输入/输出及副作用：batch_key 定位 record；只读 cursor、表基数、
-  //   profile 格式与 batch/item mutable evidence 并返回 string。
-  // 失败/边界：record/item 缺失时以 missing 标记反映真实损坏，不解引用 null。
-  function string mmio_arm_state_fingerprint(string batch_key);
-    string value;
-
-    value = $sformatf(
-      "p=%016h|s=%0d|t=%0d|c=%0d|e=%0d|j=%0d|a=%0d|o=%0d|f=%0b:%0d:%0d",
-      publish_seq, slot_record_count(), tokens_in_use_count(),
-      command_registry.num(), entry_registry.num(), submission_journal.num(),
-      preallocated_publish_batches.num(), arm_observers.num(),
-      profile_image_format_valid, profile_image_endian,
-      profile_hardware_version
-    );
-    if (!submission_journal.exists(batch_key) ||
-        submission_journal[batch_key] == null)
-      return {value, "|record=missing"};
-    value = {value, $sformatf(
-      "|b=%0d:%0d:%0d:%0b",
-      submission_journal[batch_key].state,
-      submission_journal[batch_key].submission_effect,
-      submission_journal[batch_key].attempt_effect,
-      submission_journal[batch_key].observer_armed
-    )};
-    foreach (submission_journal[batch_key].items[i]) begin
-      if (submission_journal[batch_key].items[i] == null)
-        value = {value, "|item=missing"};
-      else
-        value = {value, $sformatf(
-          "|i%0d=%0d:%0d:%0d:%0d:%0b",
-          i, submission_journal[batch_key].items[i].state,
-          submission_journal[batch_key].items[i].submission_effect,
-          submission_journal[batch_key].items[i].attempt_effect,
-          submission_journal[batch_key].items[i].completion_phase,
-          submission_journal[batch_key].items[i].recovery_required
-        )};
+  // 功能：对两项 Task 14 preallocation 逐值比较 batch/item/slot/ticket/expected 完整公开投影。
+  // 输入/输出及副作用：actual/expected 为只读输入；复用 production
+  //   same_ticket_value/same_expected_value，只返回比较结果且不构造 carrier。
+  // 失败/边界：任一 outer/item/slot/ticket/expected 为 null、cardinality 或任一字段不同均返回 0。
+  function bit preallocated_publish_value_matches(
+    rdma_cmq_preallocated_publish_batch actual,
+    rdma_cmq_preallocated_publish_batch expected
+  );
+    if (actual == null || expected == null ||
+        actual.batch_key != expected.batch_key ||
+        actual.attempt_id != expected.attempt_id ||
+        actual.final_sequence != expected.final_sequence ||
+        actual.profile_format_valid != expected.profile_format_valid ||
+        actual.profile_endian != expected.profile_endian ||
+        actual.profile_hardware_version !=
+          expected.profile_hardware_version ||
+        actual.items.size() != expected.items.size())
+      return 1'b0;
+    foreach (expected.items[i]) begin
+      if (actual.items[i] == null || expected.items[i] == null ||
+          actual.items[i].slot_record == null ||
+          expected.items[i].slot_record == null ||
+          actual.items[i].request_index != expected.items[i].request_index ||
+          actual.items[i].command_key != expected.items[i].command_key ||
+          actual.items[i].entry_key != expected.items[i].entry_key ||
+          actual.items[i].command_token != expected.items[i].command_token ||
+          actual.items[i].slot_record.slot_sequence !=
+            expected.items[i].slot_record.slot_sequence ||
+          actual.items[i].slot_record.sq_index !=
+            expected.items[i].slot_record.sq_index ||
+          actual.items[i].slot_record.sq_wrap !=
+            expected.items[i].slot_record.sq_wrap ||
+          actual.items[i].slot_record.state !=
+            expected.items[i].slot_record.state ||
+          actual.items[i].slot_record.command_token !=
+            expected.items[i].slot_record.command_token ||
+          !same_ticket_value(actual.items[i].slot_record.ticket,
+                             expected.items[i].slot_record.ticket) ||
+          !same_expected_value(actual.items[i].slot_record.expected,
+                               expected.items[i].slot_record.expected))
+        return 1'b0;
     end
-    return value;
+    return 1'b1;
+  endfunction
+
+  // 功能：对隔离的 Task 14 fixture 精确检查 retained 四表、ticket index
+  //   和 observer key→handle，并运行 production journal invariant。
+  // 输入/输出及副作用：输入已知 batch/row/value/profile、最多两个 observer
+  //   与 expect_preallocation；只读 protected 表并返回 bit，不暴露内部句柄。
+  // 失败/边界：record/profile 句柄缺失、key/exact handle/cardinality/value 任一漂移，
+  //   或 invariant 返回 null/失败均返回 0；expect_preallocation=0 用于已 arm 行。
+  function bit mmio_arm_fixture_rows_match(
+    string batch_key,
+    rdma_cmq_batch_submission_record expected_record_h,
+    rdma_cmq_preallocated_publish_batch expected_preallocation_h,
+    rdma_cmq_preallocated_publish_batch expected_preallocation_value,
+    rdma_cmq_hw_profile expected_profile_h,
+    string primary_capability_key,
+    rdma_cmq_mmio_arm_observer primary_observer_h,
+    string secondary_capability_key = "",
+    rdma_cmq_mmio_arm_observer secondary_observer_h = null,
+    bit expect_preallocation = 1'b1
+  );
+    rdma_status status;
+    int unsigned expected_observers;
+
+    expected_observers = (primary_capability_key.len() == 0) ? 0 : 1;
+    if (secondary_capability_key.len() != 0)
+      expected_observers++;
+    if (batch_key.len() == 0 || expected_record_h == null ||
+        expected_record_h.doorbell_image == null ||
+        expected_profile_h == null ||
+        submission_journal.num() != 1 || journal_batch_by_ticket.num() !=
+          expected_record_h.items.size() ||
+        preallocated_publish_batches.num() != expect_preallocation ||
+        journal_profile_by_batch.num() != 1 ||
+        arm_observers.num() != expected_observers ||
+        !submission_journal.exists(batch_key) ||
+        submission_journal[batch_key] != expected_record_h ||
+        (expect_preallocation &&
+         (expected_preallocation_h == null ||
+          expected_preallocation_value == null ||
+          !preallocated_publish_batches.exists(batch_key) ||
+          preallocated_publish_batches[batch_key] !=
+            expected_preallocation_h ||
+          !preallocated_publish_value_matches(
+            expected_preallocation_h, expected_preallocation_value
+          ))) || !journal_profile_by_batch.exists(batch_key) ||
+        journal_profile_by_batch[batch_key] != expected_profile_h ||
+        (expect_preallocation &&
+         (profile_image_format_valid ||
+          profile_image_endian != RDMA_ENDIAN_LITTLE ||
+          profile_hardware_version != 0)) ||
+        (!expect_preallocation &&
+         (!profile_image_format_valid ||
+          profile_image_endian != expected_record_h.doorbell_image.endian ||
+          profile_hardware_version !=
+            expected_record_h.doorbell_image.hardware_version)))
+      return 1'b0;
+    if ((primary_capability_key.len() != 0 &&
+         (!arm_observers.exists(primary_capability_key) ||
+          arm_observers[primary_capability_key] != primary_observer_h)) ||
+        (secondary_capability_key.len() != 0 &&
+         (!arm_observers.exists(secondary_capability_key) ||
+          arm_observers[secondary_capability_key] != secondary_observer_h)))
+      return 1'b0;
+    foreach (expected_record_h.items[i]) begin
+      string ticket_key;
+
+      ticket_key = command_key(expected_record_h.items[i].ticket);
+      if (!journal_batch_by_ticket.exists(ticket_key) ||
+          journal_batch_by_ticket[ticket_key] != batch_key)
+        return 1'b0;
+    end
+    status = submission_journal_invariant_locked(batch_key);
+    return status != null && status.ok();
   endfunction
 
   // 功能：调用锁内 journal 删除入口，验证 record/index/preallocation 同步移除。
@@ -6206,39 +6416,115 @@ class rdma_cmq_engine_test extends uvm_test;
     return 1'b1;
   endfunction
 
-  // 功能：调用一次应被拒绝的 observer，断言诊断递增且 arm 账本逐值不变。
-  // 输入/输出及副作用：label 用于诊断，batch_key 定位真实 authority record；
-  //   engine/observer/catcher 为非拥有输入，回调前后比较该 record 的 fingerprint。
-  // 失败/边界：三个句柄任一为 null 或 batch_key 为空时直接报 fixture error；本 helper
-  //   不吞掉非目标 UVM report，也不修复被 DUT 错误改写的状态。
-  function automatic void expect_mmio_arm_invalid_unchanged(
+  // 功能：调用一次应被拒绝的 observer，再用 public batch/ticket
+  //   query、production invariant 和 exact row predicate 断言隔离 fixture 完整不变。
+  // 输入/输出及副作用：label 定位诊断；engine/observer/catcher、source/stored
+  //   record/preallocation、profile 与一到两个 observer row 均为非拥有输入；
+  //   observer=null 时直接调用 engine null 入口；可显式恢复测试取出的 preallocation。
+  // 失败/边界：句柄缺失、诊断非单次、回调重入 profile、cursor/counter/runtime/
+  //   token-incarnation 漂移、query/detachment/digest 或 exact key/handle 失配均报 UVM_ERROR；不修复 DUT 改写。
+  task automatic expect_mmio_arm_invalid_unchanged(
     string label,
-    string batch_key,
     rdma_cmq_engine_probe engine,
     rdma_cmq_mmio_arm_observer observer,
-    rdma_cmq_mmio_arm_error_catcher catcher
+    rdma_cmq_mmio_arm_error_catcher catcher,
+    rdma_cmq_batch_submission_record source_record,
+    rdma_cmq_batch_submission_record stored_record,
+    rdma_cmq_preallocated_publish_batch source_preallocation,
+    rdma_cmq_preallocated_publish_batch stored_preallocation,
+    rdma_cmq_journal_tracking_profile profile_service,
+    string primary_capability_key,
+    rdma_cmq_mmio_arm_observer primary_observer,
+    string secondary_capability_key = "",
+    rdma_cmq_mmio_arm_observer secondary_observer = null,
+    bit restore_missing_preallocation = 1'b0
   );
-    string before_state;
-    string after_state;
+    rdma_cmq_batch_submission_record snapshot;
+    rdma_status status;
+    rdma_cmq_engine_state_e before_engine_state;
+    longint unsigned before_publish;
+    longint unsigned before_retire;
+    longint unsigned before_consume;
+    longint unsigned before_batch_counter;
+    longint unsigned before_attempt_counter;
+    longint unsigned before_reset_counter;
+    int unsigned before_profile_calls;
     int unsigned before_errors;
 
-    if (batch_key.len() == 0 || engine == null || observer == null ||
-        catcher == null) begin
+    if (engine == null || catcher == null || source_record == null ||
+        stored_record == null ||
+        source_preallocation == null || stored_preallocation == null ||
+        profile_service == null) begin
       `uvm_error({label, "_FIXTURE"},
-                 "MMIO arm rejection fixture handle or batch key is invalid")
+                 "MMIO arm rejection fixture has a null authority handle")
       return;
     end
-    before_state = engine.mmio_arm_state_fingerprint(batch_key);
+    before_engine_state = engine.state();
+    before_publish = engine.published_count();
+    before_retire = engine.retired_count();
+    before_consume = engine.cq_consumed_count();
+    before_batch_counter = engine.journal_batch_counter();
+    before_attempt_counter = engine.journal_attempt_counter();
+    before_reset_counter = engine.journal_reset_proof_counter();
+    before_profile_calls = profile_service.journal_service_calls;
     before_errors = catcher.caught_count;
-    observer.before_mmio_maybe_visible();
-    after_state = engine.mmio_arm_state_fingerprint(batch_key);
+    if (observer == null)
+      engine.arm_submission_for_mmio(null);
+    else
+      observer.before_mmio_maybe_visible();
     if (catcher.caught_count != before_errors + 1)
       `uvm_error({label, "_DIAGNOSTIC"},
                  "invalid MMIO arm did not emit exactly one stable error")
-    if (after_state != before_state)
+    if (engine.state() != before_engine_state ||
+        engine.published_count() != before_publish ||
+        engine.retired_count() != before_retire ||
+        engine.cq_consumed_count() != before_consume ||
+        engine.journal_batch_counter() != before_batch_counter ||
+        engine.journal_attempt_counter() != before_attempt_counter ||
+        engine.journal_reset_proof_counter() != before_reset_counter ||
+        profile_service.journal_service_calls != before_profile_calls)
       `uvm_error({label, "_ATOMICITY"},
-                 "invalid MMIO arm changed journal, cursor or registry state")
-  endfunction
+                 "invalid MMIO arm changed lifecycle, cursor or service state")
+    if (restore_missing_preallocation &&
+        !engine.restore_preallocated_publish_batch(
+          source_record.batch_key, stored_preallocation
+        ))
+      `uvm_error({label, "_RESTORE"},
+                 "missing-preallocation fixture could not restore exact row")
+    engine.query_submission_journal(
+      source_record.batch_key, snapshot, status
+    );
+    expect_status({label, "_QUERY_BATCH"}, status, RDMA_SC_OK);
+    expect_journal_snapshot(
+      {label, "_QUERY_BATCH_GRAPH"}, engine, profile_service,
+      snapshot, source_record
+    );
+    foreach (source_record.items[i]) begin
+      engine.query_submission_journal_by_ticket(
+        source_record.items[i].ticket, snapshot, status
+      );
+      expect_status($sformatf("%s_QUERY_TICKET_%0d", label, i), status,
+                    RDMA_SC_OK);
+      expect_journal_snapshot(
+        $sformatf("%s_QUERY_TICKET_GRAPH_%0d", label, i), engine,
+        profile_service, snapshot, source_record
+      );
+    end
+    if (!engine.mmio_arm_fixture_rows_match(
+          source_record.batch_key, stored_record, stored_preallocation,
+          source_preallocation, profile_service, primary_capability_key,
+          primary_observer, secondary_capability_key, secondary_observer
+        ) || engine.slot_record_count() != 0 ||
+        engine.tokens_in_use_count() != 0 ||
+        engine.command_registry_count() != 0 ||
+        engine.entry_registry_count() != 0)
+      `uvm_error({label, "_ROWS"},
+                 "invalid MMIO arm changed exact retained/runtime rows")
+    for (int unsigned i = 0; i < 32; i++)
+      if (engine.token_incarnation_at(i) != 0)
+        `uvm_error({label, "_TOKEN_INCARNATION"},
+                   $sformatf("token %0d incarnation changed", i))
+  endtask
 
   // 功能：从完整两项 journal record 构造 execution-result、recovery request
   //   与 reset-proof source graph，供 nonfatal snapshot seam 联合覆盖。
@@ -6392,7 +6678,7 @@ class rdma_cmq_engine_test extends uvm_test;
   // 功能：断言 journal query 返回完整、值相等且跨图分离的两项 snapshot。
   // 输入/输出及副作用：engine/profile/snapshot/source 为只读输入；仅发布 UVM_ERROR。
   // 失败/边界：任何 required node、alias topology、opaque mapping authority 或值字段
-  //   不一致均报错并避免继续解引用缺失节点。
+  //   不一致均报错；PENDING_EFFECT 允许 source/snapshot 同时无 completion。
   function automatic void expect_journal_snapshot(
     string label,
     rdma_cmq_engine_probe engine,
@@ -6456,7 +6742,7 @@ class rdma_cmq_engine_test extends uvm_test;
           rhs.ticket == null || rhs.recovery_owner == null ||
           rhs.dma_context == null || rhs.sqe_image == null ||
           rhs.dependency_mapping == null || rhs.dependency_image == null ||
-          rhs.completion == null || rhs.status == null) begin
+          lhs.status == null || rhs.status == null) begin
         `uvm_error(label, $sformatf("journal item %0d is incomplete", i))
         continue;
       end
@@ -6493,9 +6779,12 @@ class rdma_cmq_engine_test extends uvm_test;
         `uvm_error(label, $sformatf(
           "journal item %0d object-ID body is not detached", i
         ))
-      if (rhs.ticket == lhs.ticket || rhs.completion == lhs.completion ||
-          rhs.completion.ticket != rhs.ticket ||
-          rhs.completion.status != rhs.status || rhs.status == lhs.status)
+      if (rhs.ticket == lhs.ticket || rhs.status == lhs.status ||
+          (lhs.completion == null && rhs.completion != null) ||
+          (lhs.completion != null &&
+           (rhs.completion == null || rhs.completion == lhs.completion ||
+            rhs.completion.ticket != rhs.ticket ||
+            rhs.completion.status != rhs.status)))
         `uvm_error(label,
                    $sformatf("journal item %0d ticket/status alias drift", i))
       if (rhs.ticket.command_id != lhs.ticket.command_id ||
@@ -6503,6 +6792,21 @@ class rdma_cmq_engine_test extends uvm_test;
           rhs.ticket.absolute_deadline != lhs.ticket.absolute_deadline)
         `uvm_error(label,
                    $sformatf("journal item %0d ticket value drift", i))
+      if (rhs.status.category != lhs.status.category ||
+          rhs.status.code != lhs.status.code ||
+          rhs.status.hardware_code != lhs.status.hardware_code ||
+          rhs.status.hardware_code_valid != lhs.status.hardware_code_valid ||
+          rhs.status.source_engine != lhs.status.source_engine ||
+          rhs.status.function_uid != lhs.status.function_uid ||
+          rhs.status.generation != lhs.status.generation ||
+          rhs.status.resource_id != lhs.status.resource_id ||
+          rhs.status.command_id != lhs.status.command_id ||
+          rhs.status.wr_id != lhs.status.wr_id ||
+          rhs.status.severity != lhs.status.severity ||
+          rhs.status.retryable != lhs.status.retryable ||
+          rhs.status.message != lhs.status.message)
+        `uvm_error(label,
+                   $sformatf("journal item %0d status value drift", i))
       if (rhs.dma_context == lhs.dma_context ||
           rhs.dma_context.function_h == lhs.dma_context.function_h ||
           rhs.dma_context.owner_h == lhs.dma_context.owner_h ||
@@ -6521,18 +6825,19 @@ class rdma_cmq_engine_test extends uvm_test;
           !source_mapping.same_allocation(snapshot_mapping))
         `uvm_error(label,
                    $sformatf("journal item %0d mapping authority changed", i))
-      if (rhs.completion.raw_cqe == null ||
-          rhs.completion.raw_cqe == lhs.completion.raw_cqe ||
-          !engine.probe_same_image(
-            rhs.completion.raw_cqe, lhs.completion.raw_cqe
-          ) || !$cast(source_payload, lhs.completion.decoded_response) ||
-          !$cast(snapshot_payload, rhs.completion.decoded_response) ||
-          snapshot_payload == source_payload ||
-          !profile_service.same_completion_payload_value(
-            source_payload, snapshot_payload
-          ) || !profile_service.completion_payload_graph_detached(
-            source_payload, snapshot_payload
-          ))
+      if (lhs.completion != null &&
+          (rhs.completion.raw_cqe == null ||
+           rhs.completion.raw_cqe == lhs.completion.raw_cqe ||
+           !engine.probe_same_image(
+             rhs.completion.raw_cqe, lhs.completion.raw_cqe
+           ) || !$cast(source_payload, lhs.completion.decoded_response) ||
+           !$cast(snapshot_payload, rhs.completion.decoded_response) ||
+           snapshot_payload == source_payload ||
+           !profile_service.same_completion_payload_value(
+             source_payload, snapshot_payload
+           ) || !profile_service.completion_payload_graph_detached(
+             source_payload, snapshot_payload
+           )))
         `uvm_error(label,
                    $sformatf("journal item %0d completion graph drift", i))
     end
@@ -17033,16 +17338,18 @@ class rdma_cmq_engine_test extends uvm_test;
     expect_status("JOURNAL_STORAGE_SHUTDOWN", status, RDMA_SC_OK);
   endtask
 
-  // 功能：验证 pre-MMIO arm capability 仅能由登记的 exact observer 一次性消费，
-  //   并在已持 engine_lock 时用预分配值原子安装 runtime publication 账本。
-  // 输入/输出及副作用：无参数；自建 ACTIVE engine、PENDING_EFFECT journal、
-  //   多个 forged observer 与 catcher；成功路径消费 observer/preallocation 行。
-  // 失败/边界：伪造 identity、错 batch/attempt/incarnation、缺预分配、
-  //   stale state、未登记、未配置/null-owner、null 参数与重复回调均必须单诊断且零状态变化。
+  // 功能：验证 exact observer 在真实 engine/Function 双锁内一次性 arm，
+  //   只转移预分配句柄；所有 invalid callback 保持完整 authoritative state。
+  // 输入/输出及副作用：无参数；自建 ACTIVE engine、scheduler probe、
+  //   unified adapter trace、PENDING_EFFECT journal 与 forged observers；成功消费 arm 两行。
+  // 失败/边界：伪造 tuple、缺行、stale/duplicate/null 均须单诊断且零变化；
+  //   有效回调若分配对象、等待、重入 service 或未精确恢复两把锁均报 UVM_ERROR。
   task automatic check_pre_mmio_arm_capability();
     rdma_cmq_engine_probe engine;
     rdma_mock_host_mem mem;
-    rdma_cmq_transport_scheduler_double scheduler;
+    rdma_cmq_test_pcie pcie;
+    rdma_mock_call_trace trace;
+    rdma_cmq_mmio_arm_scheduler_probe scheduler;
     rdma_cmq_journal_tracking_profile profile_service;
     rdma_function_binding binding;
     rdma_function_identity identity;
@@ -17065,17 +17372,25 @@ class rdma_cmq_engine_test extends uvm_test;
     rdma_status status;
     string batch_key;
     string capability_key;
-    string before_state;
-    string after_state;
     longint unsigned batch_id;
     longint unsigned attempt_id;
-    int unsigned profile_calls_before;
+    longint unsigned publish_before_duplicate;
+    longint unsigned retire_before_duplicate;
+    longint unsigned consume_before_duplicate;
+    longint unsigned batch_counter_before_duplicate;
+    longint unsigned attempt_counter_before_duplicate;
+    longint unsigned reset_counter_before_duplicate;
+    int unsigned profile_calls_before_duplicate;
     int unsigned errors_before;
-    time callback_time;
+    bit engine_lock_contract;
 
     engine = rdma_cmq_engine_probe::type_id::create("mmio_arm_engine");
     mem = rdma_mock_host_mem::type_id::create("mmio_arm_mem");
-    scheduler = rdma_cmq_transport_scheduler_double::type_id::create(
+    pcie = rdma_cmq_test_pcie::type_id::create("mmio_arm_pcie");
+    trace = rdma_mock_call_trace::type_id::create("mmio_arm_trace");
+    mem.set_call_trace(trace);
+    pcie.set_call_trace(trace);
+    scheduler = rdma_cmq_mmio_arm_scheduler_probe::type_id::create(
       "mmio_arm_scheduler"
     );
     profile_service = rdma_cmq_journal_tracking_profile::type_id::create(
@@ -17083,6 +17398,8 @@ class rdma_cmq_engine_test extends uvm_test;
     );
     binding = make_binding("mmio_arm_binding", RDMA_BIND_PREPARED);
     cmq = make_cmq("mmio_arm_cmq", binding);
+    status = scheduler.configure(mem, pcie);
+    expect_status("MMIO_ARM_SCHEDULER", status, RDMA_SC_OK);
     engine.prepare(
       binding, cmq, 1'b1, 20'h34567, mem, scheduler, profile_service,
       runtime_desc, status
@@ -17151,6 +17468,8 @@ class rdma_cmq_engine_test extends uvm_test;
     if (!engine.register_mmio_arm_observer(capability_key, authentic))
       `uvm_error("MMIO_ARM_REGISTER", "authentic observer was not registered")
 
+    clear_submit_observation(mem, pcie, trace);
+
     catcher = new("mmio_arm_error_catcher");
     uvm_report_cb::add(null, catcher);
 
@@ -17161,13 +17480,17 @@ class rdma_cmq_engine_test extends uvm_test;
     );
     expect_status("MMIO_ARM_FORGED_CONFIGURE", status, RDMA_SC_OK);
     expect_mmio_arm_invalid_unchanged(
-      "MMIO_ARM_FORGED", batch_key, engine, forged, catcher
+      "MMIO_ARM_FORGED", engine, forged, catcher, record, stored_record,
+      preallocated, stored_preallocated, profile_service, capability_key,
+      authentic
     );
 
     if (!engine.unregister_mmio_arm_observer(capability_key))
       `uvm_error("MMIO_ARM_UNREGISTER", "authentic row could not be removed")
     expect_mmio_arm_invalid_unchanged(
-      "MMIO_ARM_UNREGISTERED", batch_key, engine, authentic, catcher
+      "MMIO_ARM_UNREGISTERED", engine, authentic, catcher, record,
+      stored_record, preallocated, stored_preallocated, profile_service,
+      "", null
     );
     if (!engine.register_mmio_arm_observer(capability_key, authentic))
       `uvm_error("MMIO_ARM_REREGISTER", "authentic row could not be restored")
@@ -17184,7 +17507,10 @@ class rdma_cmq_engine_test extends uvm_test;
       `uvm_error("MMIO_ARM_WRONG_BATCH_REGISTER",
                  "wrong-batch observer fixture was not registered")
     expect_mmio_arm_invalid_unchanged(
-      "MMIO_ARM_WRONG_BATCH", batch_key, engine, wrong_batch, catcher
+      "MMIO_ARM_WRONG_BATCH", engine, wrong_batch, catcher, record,
+      stored_record, preallocated, stored_preallocated, profile_service,
+      capability_key, authentic, wrong_batch.get_capability_key(),
+      wrong_batch
     );
     void'(engine.unregister_mmio_arm_observer(
       wrong_batch.get_capability_key()
@@ -17202,7 +17528,10 @@ class rdma_cmq_engine_test extends uvm_test;
       `uvm_error("MMIO_ARM_WRONG_ATTEMPT_REGISTER",
                  "wrong-attempt observer fixture was not registered")
     expect_mmio_arm_invalid_unchanged(
-      "MMIO_ARM_WRONG_ATTEMPT", batch_key, engine, wrong_attempt, catcher
+      "MMIO_ARM_WRONG_ATTEMPT", engine, wrong_attempt, catcher, record,
+      stored_record, preallocated, stored_preallocated, profile_service,
+      capability_key, authentic, wrong_attempt.get_capability_key(),
+      wrong_attempt
     );
     void'(engine.unregister_mmio_arm_observer(
       wrong_attempt.get_capability_key()
@@ -17220,8 +17549,10 @@ class rdma_cmq_engine_test extends uvm_test;
       `uvm_error("MMIO_ARM_WRONG_INCARNATION_REGISTER",
                  "wrong-incarnation observer fixture was not registered")
     expect_mmio_arm_invalid_unchanged(
-      "MMIO_ARM_WRONG_INCARNATION", batch_key, engine,
-      wrong_incarnation, catcher
+      "MMIO_ARM_WRONG_INCARNATION", engine, wrong_incarnation, catcher,
+      record, stored_record, preallocated, stored_preallocated,
+      profile_service, capability_key, authentic,
+      wrong_incarnation.get_capability_key(), wrong_incarnation
     );
     void'(engine.unregister_mmio_arm_observer(
       wrong_incarnation.get_capability_key()
@@ -17232,20 +17563,29 @@ class rdma_cmq_engine_test extends uvm_test;
       `uvm_error("MMIO_ARM_DROP_PREALLOCATION",
                  "preallocation fixture could not be removed")
     expect_mmio_arm_invalid_unchanged(
-      "MMIO_ARM_MISSING_PREALLOCATION", batch_key, engine,
-      authentic, catcher
+      "MMIO_ARM_MISSING_PREALLOCATION", engine, authentic, catcher,
+      record, stored_record, preallocated, removed_preallocated,
+      profile_service, capability_key, authentic, "", null, 1'b1
     );
-    if (!engine.restore_preallocated_publish_batch(
-          batch_key, removed_preallocated
-        ))
-      `uvm_error("MMIO_ARM_RESTORE_PREALLOCATION",
-                 "preallocation fixture could not be restored")
 
-    stored_record.state = RDMA_CMQ_SUBMISSION_STAGED;
+    stored_record.state = RDMA_CMQ_SUBMISSION_HOST_VISIBLE_NOT_PUBLISHED;
+    record.state = RDMA_CMQ_SUBMISSION_HOST_VISIBLE_NOT_PUBLISHED;
+    foreach (stored_record.items[i]) begin
+      stored_record.items[i].state =
+        RDMA_CMQ_SUBMISSION_HOST_VISIBLE_NOT_PUBLISHED;
+      record.items[i].state = RDMA_CMQ_SUBMISSION_HOST_VISIBLE_NOT_PUBLISHED;
+    end
     expect_mmio_arm_invalid_unchanged(
-      "MMIO_ARM_STALE_STATE", batch_key, engine, authentic, catcher
+      "MMIO_ARM_STALE_STATE", engine, authentic, catcher, record,
+      stored_record, preallocated, stored_preallocated, profile_service,
+      capability_key, authentic
     );
     stored_record.state = RDMA_CMQ_SUBMISSION_PENDING_EFFECT;
+    record.state = RDMA_CMQ_SUBMISSION_PENDING_EFFECT;
+    foreach (stored_record.items[i]) begin
+      stored_record.items[i].state = RDMA_CMQ_SUBMISSION_PENDING_EFFECT;
+      record.items[i].state = RDMA_CMQ_SUBMISSION_PENDING_EFFECT;
+    end
 
     unconfigured = new("mmio_arm_unconfigured");
     status = unconfigured.configure(
@@ -17258,28 +17598,45 @@ class rdma_cmq_engine_test extends uvm_test;
       `uvm_error("MMIO_ARM_NULL_OWNER_STATE",
                  "failed configure published a partial owner capability")
     expect_mmio_arm_invalid_unchanged(
-      "MMIO_ARM_UNCONFIGURED", batch_key, engine, unconfigured, catcher
+      "MMIO_ARM_UNCONFIGURED", engine, unconfigured, catcher, record,
+      stored_record, preallocated, stored_preallocated, profile_service,
+      capability_key, authentic
     );
 
-    before_state = engine.mmio_arm_state_fingerprint(batch_key);
-    errors_before = catcher.caught_count;
-    engine.arm_submission_for_mmio(null);
-    after_state = engine.mmio_arm_state_fingerprint(batch_key);
-    if (catcher.caught_count != errors_before + 1 ||
-        after_state != before_state)
-      `uvm_error("MMIO_ARM_NULL_OBSERVER",
-                 "null observer diagnostic changed engine state")
+    expect_mmio_arm_invalid_unchanged(
+      "MMIO_ARM_NULL_OBSERVER", engine, null, catcher, record,
+      stored_record, preallocated, stored_preallocated, profile_service,
+      capability_key, authentic
+    );
 
-    profile_calls_before = profile_service.journal_service_calls;
-    callback_time = $time;
-    engine.call_mmio_arm_while_engine_lock_held(authentic);
-    if ($time != callback_time || scheduler.submit_calls != 0 ||
-        profile_service.journal_service_calls != profile_calls_before)
-      `uvm_error("MMIO_ARM_REENTRY",
-                 "valid callback waited or re-entered scheduler/profile")
+    engine.call_mmio_arm_under_exact_locks(
+      binding, scheduler, authentic, trace, profile_service,
+      engine_lock_contract
+    );
+    if (!engine_lock_contract || scheduler.calls != 1 ||
+        scheduler.locked_function_uid != binding.function_uid ||
+        scheduler.locked_global_function_id !=
+          binding.global_function_id || !scheduler.lock_contract_ok)
+      `uvm_error("MMIO_ARM_EXACT_LOCK",
+                 "valid callback did not run under both exact locks")
+    if (scheduler.object_count_after != scheduler.object_count_before ||
+        scheduler.time_after != scheduler.time_before ||
+        scheduler.trace_count_before != 0 ||
+        scheduler.trace_count_after != scheduler.trace_count_before ||
+        scheduler.profile_calls_after != scheduler.profile_calls_before)
+      `uvm_error("MMIO_ARM_CALLBACK_BOUNDARY",
+                 "valid callback allocated, waited or re-entered a service")
+    expect_no_submit_side_effects("MMIO_ARM_NO_IO", mem, pcie, trace);
     if (engine.mmio_arm_publish_sequence() != stored_record.end_sequence ||
         engine.preallocated_publish_batch_count() != 0 ||
         engine.mmio_arm_observer_count() != 0 ||
+        engine.submission_journal_count() != 1 ||
+        engine.journal_ticket_index_count() != 2 ||
+        engine.journal_profile_count() != 1 ||
+        engine.slot_record_count() != 2 ||
+        engine.tokens_in_use_count() != 2 ||
+        engine.command_registry_count() != 2 ||
+        engine.entry_registry_count() != 2 ||
         stored_record.state != RDMA_CMQ_SUBMISSION_PUBLISH_AMBIGUOUS ||
         stored_record.submission_effect !=
           RDMA_SUBMIT_EFFECT_MMIO_MAYBE_VISIBLE ||
@@ -17314,8 +17671,78 @@ class rdma_cmq_engine_test extends uvm_test;
                    $sformatf("item %0d did not transfer exact preallocation", i))
     end
 
-    expect_mmio_arm_invalid_unchanged(
-      "MMIO_ARM_DUPLICATE", batch_key, engine, authentic, catcher
+    // duplicate 的 expected graph 由安装前独立 source 按生产契约写入确定值，
+    // 不复用 stored row 作为 oracle；随后逐项确认已转移 runtime handle 未被替换。
+    record.state = RDMA_CMQ_SUBMISSION_PUBLISH_AMBIGUOUS;
+    record.submission_effect = RDMA_SUBMIT_EFFECT_MMIO_MAYBE_VISIBLE;
+    record.attempt_effect = RDMA_SUBMIT_EFFECT_MMIO_MAYBE_VISIBLE;
+    record.observer_armed = 1'b1;
+    foreach (record.items[i]) begin
+      record.items[i].state = RDMA_CMQ_SUBMISSION_PUBLISH_AMBIGUOUS;
+      record.items[i].submission_effect =
+        RDMA_SUBMIT_EFFECT_MMIO_MAYBE_VISIBLE;
+      record.items[i].attempt_effect =
+        RDMA_SUBMIT_EFFECT_MMIO_MAYBE_VISIBLE;
+      record.items[i].completion_phase = RDMA_CMQ_COMPLETION_PENDING;
+      record.items[i].recovery_required = 1'b1;
+    end
+    publish_before_duplicate = engine.published_count();
+    retire_before_duplicate = engine.retired_count();
+    consume_before_duplicate = engine.cq_consumed_count();
+    batch_counter_before_duplicate = engine.journal_batch_counter();
+    attempt_counter_before_duplicate = engine.journal_attempt_counter();
+    reset_counter_before_duplicate = engine.journal_reset_proof_counter();
+    profile_calls_before_duplicate = profile_service.journal_service_calls;
+    errors_before = catcher.caught_count;
+    authentic.before_mmio_maybe_visible();
+    if (catcher.caught_count != errors_before + 1)
+      `uvm_error("MMIO_ARM_DUPLICATE_DIAGNOSTIC",
+                 "duplicate callback did not emit exactly one stable error")
+    if (engine.published_count() != publish_before_duplicate ||
+        engine.retired_count() != retire_before_duplicate ||
+        engine.cq_consumed_count() != consume_before_duplicate ||
+        engine.journal_batch_counter() != batch_counter_before_duplicate ||
+        engine.journal_attempt_counter() !=
+          attempt_counter_before_duplicate ||
+        engine.journal_reset_proof_counter() !=
+          reset_counter_before_duplicate ||
+        profile_service.journal_service_calls !=
+          profile_calls_before_duplicate ||
+        engine.submission_journal_count() != 1 ||
+        engine.journal_ticket_index_count() != 2 ||
+        engine.preallocated_publish_batch_count() != 0 ||
+        engine.journal_profile_count() != 1 ||
+        engine.mmio_arm_observer_count() != 0 ||
+        !engine.mmio_arm_fixture_rows_match(
+          batch_key, stored_record, null, null, profile_service,
+          "", null, "", null, 1'b0
+        ) ||
+        engine.slot_record_count() != 2 ||
+        engine.tokens_in_use_count() != 2 ||
+        engine.command_registry_count() != 2 ||
+        engine.entry_registry_count() != 2)
+      `uvm_error("MMIO_ARM_DUPLICATE_ATOMICITY",
+                 "duplicate callback changed retained or runtime state")
+    foreach (stored_record.items[i]) begin
+      if (engine.mmio_arm_slot_reference(
+            stored_record.items[i].slot_index
+          ) != expected_slots[i] ||
+          !engine.mmio_arm_token_in_use(
+            stored_record.items[i].command_token
+          ) || engine.mmio_arm_command_reference(
+            stored_preallocated.items[i].command_key
+          ) != expected_slots[i] || engine.mmio_arm_entry_reference(
+            stored_preallocated.items[i].entry_key
+          ) != expected_slots[i])
+        `uvm_error("MMIO_ARM_DUPLICATE_ROWS",
+                   $sformatf("item %0d runtime row changed", i))
+    end
+    for (int unsigned i = 0; i < 32; i++)
+      if (engine.token_incarnation_at(i) != 0)
+        `uvm_error("MMIO_ARM_DUPLICATE_TOKEN_INCARNATION",
+                   $sformatf("token %0d incarnation changed", i))
+    expect_no_submit_side_effects(
+      "MMIO_ARM_DUPLICATE_NO_IO", mem, pcie, trace
     );
     if (catcher.caught_count != 10)
       `uvm_error("MMIO_ARM_ERROR_COUNT",
@@ -17325,10 +17752,21 @@ class rdma_cmq_engine_test extends uvm_test;
 
     engine.query_submission_journal(batch_key, queried_record, status);
     expect_status("MMIO_ARM_QUERY_AFTER_COMMIT", status, RDMA_SC_OK);
-    if (queried_record == null || queried_record.observer_armed != 1'b1 ||
-        queried_record.state != RDMA_CMQ_SUBMISSION_PUBLISH_AMBIGUOUS)
-      `uvm_error("MMIO_ARM_QUERY_AFTER_COMMIT_OUTPUT",
-                 "consumed preallocation made armed journal unqueryable")
+    expect_journal_snapshot(
+      "MMIO_ARM_QUERY_AFTER_COMMIT_GRAPH", engine, profile_service,
+      queried_record, record
+    );
+    foreach (record.items[i]) begin
+      engine.query_submission_journal_by_ticket(
+        record.items[i].ticket, queried_record, status
+      );
+      expect_status($sformatf("MMIO_ARM_QUERY_AFTER_COMMIT_TICKET_%0d", i),
+                    status, RDMA_SC_OK);
+      expect_journal_snapshot(
+        $sformatf("MMIO_ARM_QUERY_AFTER_COMMIT_TICKET_GRAPH_%0d", i),
+        engine, profile_service, queried_record, record
+      );
+    end
     status = engine.remove_submission_journal_probe(batch_key);
     expect_status("MMIO_ARM_REMOVE_AFTER_COMMIT", status, RDMA_SC_OK);
     engine.shutdown(status);
