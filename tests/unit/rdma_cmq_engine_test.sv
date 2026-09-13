@@ -9957,13 +9957,13 @@ class rdma_cmq_engine_test extends uvm_test;
       return;
     end
 
-    request_proof.state = RDMA_CMQ_RESET_PROOF_AWAITING_REBIND;
+    // request proof 保持完整、自洽且 READY，只降低 retained proof 的状态，
+    // 独立证明 CONFIRM 必须认证 journal authority，不能只依赖 caller gate。
     retained_proof.state = RDMA_CMQ_RESET_PROOF_AWAITING_REBIND;
     expect_reset_confirmation_rejected(
       "RECOVERY_CONFIRM_RETAINED_NOT_READY", engine, scheduler,
       confirm_request, stored_record, stored_preallocated
     );
-    request_proof.state = RDMA_CMQ_RESET_PROOF_READY;
     retained_proof.state = RDMA_CMQ_RESET_PROOF_READY;
 
     stored_record.items[1].completion_phase = RDMA_CMQ_COMPLETION_TERMINAL;
