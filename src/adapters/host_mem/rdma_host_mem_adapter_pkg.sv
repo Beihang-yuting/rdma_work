@@ -58,10 +58,13 @@ package rdma_host_mem_adapter_pkg;
       return rdma_status::success();
     endfunction
 
-    // 功能：在 rdma_host_mem_allocation_identity 中，mark_release_complete 执行 mark_release_complete 的mark_release_complete 指定的测试或恢复状态变更，更新受控账本并保留可回滚的故障证据。
-    // 输入/输出及副作用：seal（输入）；输入 request/image/cursor 决定写入内容；成功时更新 PI/CI、slot ledger 或 pending journal，并通过 output 返回结果。
-    // 失败/边界：mark_release_complete 仅允许测试/恢复范围内的状态变更；代际或资源不匹配时拒绝并保留原账本。
-    function rdma_status mark_release_complete(
+    // 功能：在 rdma_host_mem_allocation_identity 中核对 release seal，并把
+    //   release_complete 从未完成原子地标记为已完成。
+    // 输入/输出及副作用：seal 为待核对的输入；成功时只更新本地
+    //   release_complete 位并返回 OK，不访问 Host-memory 或转移资源所有权。
+    // 失败/边界：seal 为空、未初始化、与保存的 release_seal 不同返回
+    //   INVALID_ARGUMENT；重复完成返回 INVALID_STATE，且保留原完成位。
+    virtual function rdma_status mark_release_complete(
       rdma_host_mem_release_seal seal
     );
       if (seal == null || release_seal == null || seal != release_seal)
@@ -141,10 +144,12 @@ package rdma_host_mem_adapter_pkg;
       return rdma_status::success();
     endfunction
 
-    // 功能：在 rdma_host_mem_mapping 中，mark_release_complete 执行 mark_release_complete 的mark_release_complete 指定的测试或恢复状态变更，更新受控账本并保留可回滚的故障证据。
-    // 输入/输出及副作用：release_seal（输入）；输入 request/image/cursor 决定写入内容；成功时更新 PI/CI、slot ledger 或 pending journal，并通过 output
-    //   返回结果。
-    // 失败/边界：mark_release_complete 仅允许测试/恢复范围内的状态变更；代际或资源不匹配时拒绝并保留原账本。
+    // 功能：在 rdma_host_mem_mapping 中把 release seal 校验委托给其
+    //   allocation_identity，作为 adapter 完成释放前的唯一幂等标记入口。
+    // 输入/输出及副作用：release_seal 为输入；成功时只更新内部 identity 的
+    //   release_complete 位并返回 status，不修改 mapping public 字段或 backing。
+    // 失败/边界：allocation_identity 为空返回 INVALID_STATE；seal 不匹配或
+    //   已完成时传播对应错误，失败不得改变 identity 的完成状态。
     function rdma_status mark_release_complete(
       rdma_host_mem_release_seal release_seal
     );
@@ -960,6 +965,78 @@ package rdma_host_mem_adapter_pkg;
       return rdma_status::success();
     endfunction
 
+    // 功能：只读确认 mapping 精确命中本 adapter 唯一 active opaque allocation，且 release seal 未完成。
+    // 输入/输出及副作用：mapping 为待释放 authority；只读 allocations 与 shared identity，不 seal/free 或改 mapping。
+    // 失败/边界：空/异型、未知、跨 adapter、重复 identity、已释放、无 backing 或已完成 seal 均拒绝。
+    virtual function rdma_status validate_failure_atomic_release(
+      rdma_dma_mapping mapping
+    );
+      rdma_host_mem_mapping concrete_mapping;
+      rdma_status status;
+      int allocation_index;
+      int unsigned match_count;
+      bit release_complete;
+
+      if (!$cast(concrete_mapping, mapping) || concrete_mapping == null)
+        return rdma_status::make(
+          RDMA_SC_INVALID_ARGUMENT,
+          "failure-atomic host mapping has no allocation identity"
+        );
+      if (concrete_mapping.state != RDMA_MAPPING_ACTIVE)
+        return rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "failure-atomic host mapping is not active"
+        );
+
+      allocation_index = -1;
+      match_count = 0;
+      foreach (allocations[i]) begin
+        if (allocations[i] != null && allocations[i].authority != null &&
+            allocations[i].authority.same_allocation(concrete_mapping)) begin
+          allocation_index = i;
+          match_count++;
+        end
+      end
+      if (match_count == 0)
+        return rdma_status::make(
+          RDMA_SC_DMA_TRANSLATION,
+          "failure-atomic host mapping is not owned by this adapter"
+        );
+      if (match_count != 1)
+        return rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "failure-atomic host mapping identity is ambiguous"
+        );
+      if (!allocations[allocation_index].active ||
+          allocations[allocation_index].authority.state !=
+            RDMA_MAPPING_ACTIVE)
+        return rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "failure-atomic host allocation has already been released"
+        );
+      if (allocations[allocation_index].backing_mem == null)
+        return rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "failure-atomic host allocation has no backing manager"
+        );
+
+      release_complete = 1'b0;
+      status = concrete_mapping.release_completion_status(release_complete);
+      if (status == null)
+        return rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "failure-atomic host release status is null"
+        );
+      if (!status.ok())
+        return status;
+      if (release_complete)
+        return rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "failure-atomic host release is already complete"
+        );
+      return rdma_status::success();
+    endfunction
+
     // 功能：release_opaque 仅依据 mapping 内部 allocation identity 查找并
     //       释放 backing，供 router 在 manager 返回畸形 public 字段时回滚。
     // 输入/输出及副作用：mapping（输入）；成功时更新 adapter allocation ledger、
@@ -970,29 +1047,29 @@ package rdma_host_mem_adapter_pkg;
       rdma_host_mem_mapping concrete_mapping;
       rdma_status status;
       int allocation_index;
+      int unsigned match_count;
 
+      status = validate_failure_atomic_release(mapping);
+      if (status == null || !status.ok())
+        return status;
       if (!$cast(concrete_mapping, mapping) || concrete_mapping == null)
         return rdma_status::make(
-          RDMA_SC_INVALID_ARGUMENT,
-          "opaque host mapping has no allocation identity"
+          RDMA_SC_INVALID_STATE,
+          "validated opaque host mapping lost its concrete type"
         );
       allocation_index = -1;
+      match_count = 0;
       foreach (allocations[i]) begin
         if (allocations[i] != null && allocations[i].authority != null &&
             allocations[i].authority.same_allocation(concrete_mapping)) begin
           allocation_index = i;
-          break;
+          match_count++;
         end
       end
-      if (allocation_index < 0)
-        return rdma_status::make(
-          RDMA_SC_DMA_TRANSLATION,
-          "opaque host mapping is not owned by this adapter"
-        );
-      if (!allocations[allocation_index].active)
+      if (match_count != 1 || allocation_index < 0)
         return rdma_status::make(
           RDMA_SC_INVALID_STATE,
-          "opaque host mapping has already been released"
+          "validated opaque host mapping identity changed"
         );
       status = concrete_mapping.mark_release_complete(release_seal);
       if (status == null)

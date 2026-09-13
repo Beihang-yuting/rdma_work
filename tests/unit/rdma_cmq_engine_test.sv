@@ -4166,7 +4166,8 @@ class rdma_cmq_engine_probe extends rdma_cmq_engine;
     return entry_registry[key];
   endfunction
 
-  // 功能：对两项 Task 14 preallocation 逐值比较 batch/item/slot/ticket/expected 完整公开投影。
+  // 功能：对两项 Task 14/17 preallocation 逐值比较 batch/item/slot/
+  //   journal locator/ticket/expected 完整公开投影。
   // 输入/输出及副作用：actual/expected 为只读输入；复用 production
   //   same_ticket_value/same_expected_value，只返回比较结果且不构造 carrier。
   // 失败/边界：任一 outer/item/slot/ticket/expected 为 null、cardinality 或任一字段不同均返回 0。
@@ -4202,6 +4203,10 @@ class rdma_cmq_engine_probe extends rdma_cmq_engine;
             expected.items[i].slot_record.state ||
           actual.items[i].slot_record.command_token !=
             expected.items[i].slot_record.command_token ||
+          actual.items[i].slot_record.batch_key !=
+            expected.items[i].slot_record.batch_key ||
+          actual.items[i].slot_record.journal_item_index !=
+            expected.items[i].slot_record.journal_item_index ||
           !same_ticket_value(actual.items[i].slot_record.ticket,
                              expected.items[i].slot_record.ticket) ||
           !same_expected_value(actual.items[i].slot_record.expected,
@@ -4644,21 +4649,50 @@ class rdma_cmq_engine_probe extends rdma_cmq_engine;
     return slots[sq_index].state;
   endfunction
 
-  // 功能：在 rdma_cmq_engine_probe 中，install_slot_ticket_function_clone_fault 将输入对象登记或挂接到当前集合/依赖图，并同步维护对应账本和生命周期引用。
-  // 输入/输出及副作用：sq_index（输入）、clone_fault（输入）；install_slot_ticket_function_clone_fault 读取 sq_index、clone_fault 并使用字段 source、fault_function、fault_function.kind、fault_function.function_uid、fault_function.object_id、fault_function.generation、fault_function.clone_fault、ticket.function_h；函数返回 bit，不取得调用方资源所有权。
-  // 失败/边界：install_slot_ticket_function_clone_fault 比较或前置条件不满足时返回 0/false；该路径不隐式重试，也不转移未声明资源。
+  // 功能：核对一个 runtime slot 是否保存了 Task 17 冻结的 journal
+  //   batch key 与压缩后 item 下标，使 completion/timeout/reset 只回写唯一 item。
+  // 输入/输出及副作用：sq_index、batch_key、journal_item_index 为只读期望值；
+  //   只读 slots 中 exact record 并返回比较结果，不查询或修改 journal。
+  // 失败/边界：slot 越界、已退休或 locator 为空/不等时返回 0；request_index
+  //   不能替代 journal_item_index，函数不根据 ticket 重新猜测 batch。
+  function bit slot_journal_locator_matches(
+    int unsigned sq_index,
+    string batch_key,
+    int unsigned journal_item_index
+  );
+    if (sq_index >= 32 || slots[sq_index] == null)
+      return 1'b0;
+    return slots[sq_index].batch_key == batch_key &&
+           slots[sq_index].journal_item_index == journal_item_index;
+  endfunction
+
+  // 功能：为指定 runtime slot 构造值相等但外层分离的 ticket，只把
+  //   Function node 换成 clone-fault subtype，从而测试 completion snapshot
+  //   失败原子性而不改写 retained journal ticket authority。
+  // 输入/输出及副作用：sq_index 选择 slots 行，clone_fault 设置故障；
+  //   成功替换 runtime slot.ticket 并在 fault_function.alias_target 保存原
+  //   Function 非拥有引用，command/entry registry 因指向同一 slot 同步观测。
+  // 失败/边界：slot/ticket/nested 字段缺失或故障 Function 构造失败时
+  //   返回 0 且不替换 ticket；该 seam 不修改 journal item 或 token/cursor。
   function bit install_slot_ticket_function_clone_fault(
     int unsigned sq_index,
     rdma_cmq_test_clone_fault_e clone_fault
   );
     rdma_function_handle source;
     rdma_cmq_clone_fault_function_handle fault_function;
+    rdma_cmq_ticket source_ticket;
+    rdma_cmq_ticket runtime_ticket;
+    rdma_handle runtime_cmq;
+    rdma_cmq_opcode_key runtime_opcode;
 
     if (sq_index >= 32 || slots[sq_index] == null ||
         slots[sq_index].ticket == null ||
-        slots[sq_index].ticket.function_h == null)
+        slots[sq_index].ticket.function_h == null ||
+        slots[sq_index].ticket.cmq_h == null ||
+        slots[sq_index].ticket.opcode_key == null)
       return 1'b0;
-    source = slots[sq_index].ticket.function_h;
+    source_ticket = slots[sq_index].ticket;
+    source = source_ticket.function_h;
     fault_function = rdma_cmq_clone_fault_function_handle::type_id::create(
       $sformatf("timeout_fault_function_%0d", sq_index)
     );
@@ -4669,13 +4703,36 @@ class rdma_cmq_engine_probe extends rdma_cmq_engine;
     fault_function.object_id = source.object_id;
     fault_function.generation = source.generation;
     fault_function.clone_fault = clone_fault;
-    slots[sq_index].ticket.function_h = fault_function;
+    fault_function.alias_target = source;
+    runtime_cmq = new($sformatf("timeout_fault_cmq_%0d", sq_index));
+    runtime_cmq.kind = source_ticket.cmq_h.kind;
+    runtime_cmq.function_uid = source_ticket.cmq_h.function_uid;
+    runtime_cmq.object_id = source_ticket.cmq_h.object_id;
+    runtime_cmq.generation = source_ticket.cmq_h.generation;
+    runtime_opcode = new($sformatf("timeout_fault_opcode_%0d", sq_index));
+    runtime_opcode.profile_name = source_ticket.opcode_key.profile_name;
+    runtime_opcode.opcode = source_ticket.opcode_key.opcode;
+    runtime_opcode.variant = source_ticket.opcode_key.variant;
+    runtime_ticket = new($sformatf("timeout_fault_ticket_%0d", sq_index));
+    runtime_ticket.command_id = source_ticket.command_id;
+    runtime_ticket.function_h = fault_function;
+    runtime_ticket.cmq_h = runtime_cmq;
+    runtime_ticket.slot_sequence = source_ticket.slot_sequence;
+    runtime_ticket.sq_index = source_ticket.sq_index;
+    runtime_ticket.sq_wrap = source_ticket.sq_wrap;
+    runtime_ticket.opcode_key = runtime_opcode;
+    runtime_ticket.absolute_deadline = source_ticket.absolute_deadline;
+    slots[sq_index].ticket = runtime_ticket;
     return 1'b1;
   endfunction
 
-  // 功能：执行 set_slot_ticket_function_clone_fault 指定的测试或恢复状态变更，更新受控账本并保留可回滚的故障证据。
-  // 输入/输出及副作用：sq_index（输入）、clone_fault（输入）；调用方必须先完成输入对象的空值、authority 和 generation 校验；成功时更新本对象配置/状态并保存非拥有引用，返回 bit。
-  // 失败/边界：set_slot_ticket_function_clone_fault 仅允许测试/恢复范围内的状态变更；代际或资源不匹配时拒绝并保留原账本。
+  // 功能：更新 runtime ticket Function clone 故障；当 clone_fault=GOOD 时
+  //   恢复 install seam 保留的 exact 原 Function，使重试回到生产类型形状。
+  // 输入/输出及副作用：sq_index 选择 slot，clone_fault 是新模式；
+  //   GOOD 会替换 ticket.function_h，其他值只更新 subtype.clone_fault，
+  //   返回是否命中完整 fault fixture。
+  // 失败/边界：slot/ticket 越界或 Function 不是 fault subtype，以及 GOOD
+  //   却缺失 alias_target 时返回 0 且不修改 runtime/journal 账本。
   function bit set_slot_ticket_function_clone_fault(
     int unsigned sq_index,
     rdma_cmq_test_clone_fault_e clone_fault
@@ -4686,7 +4743,13 @@ class rdma_cmq_engine_probe extends rdma_cmq_engine;
         slots[sq_index].ticket == null ||
         !$cast(fault_function, slots[sq_index].ticket.function_h))
       return 1'b0;
-    fault_function.clone_fault = clone_fault;
+    if (clone_fault == RDMA_CMQ_TEST_CLONE_GOOD) begin
+      if (fault_function.alias_target == null)
+        return 1'b0;
+      slots[sq_index].ticket.function_h = fault_function.alias_target;
+    end
+    else
+      fault_function.clone_fault = clone_fault;
     return 1'b1;
   endfunction
 
@@ -5612,6 +5675,8 @@ class rdma_cmq_engine_probe extends rdma_cmq_engine;
           slot_record.sq_wrap != item.slot_wrap ||
           slot_record.state != CMQ_SLOT_PUBLISHED ||
           slot_record.command_token != item.command_token ||
+          slot_record.batch_key != batch_key ||
+          slot_record.journal_item_index != i ||
           slot_record.expected == null ||
           slot_record.expected.get_object_type() !=
             rdma_cmq_expected_response::get_type() ||
@@ -6007,6 +6072,21 @@ class rdma_cmq_null_release_once_mem extends rdma_mock_host_mem;
       return null;
     end
     return super.\release (mapping);
+  endfunction
+
+  // 功能：在 reset_observed() 的 opaque-release 路径上注入一次 null status，
+  //   让 failure-atomic reset 验证与严格 release 注入保持同一 fixture 语义。
+  // 输入/输出及副作用：mapping 为待释放 opaque authority；首次调用只记录一次
+  //   release_opaque 并返回 null，后续调用委托 mock 的正常 opaque 释放实现。
+  // 失败/边界：首次 null 返回不得修改 allocation/seal/region；若 mapping 为空或
+  //   已失效，后续 super.release_opaque() 负责返回对应稳定错误。
+  virtual function rdma_status release_opaque(rdma_dma_mapping mapping);
+    if (return_null_once) begin
+      return_null_once = 1'b0;
+      record_call("release_opaque", null, mapping);
+      return null;
+    end
+    return super.release_opaque(mapping);
   endfunction
 endclass
 
@@ -7635,8 +7715,9 @@ class rdma_cmq_engine_test extends uvm_test;
     endcase
   endfunction
 
-  // 功能：构造 item_count 项完整 journal record 与一一对应的 preallocated publication value；
-  //   source record 使用与 engine backing 分离但保留 opaque release authority 的 mapping。
+  // 功能：构造 item_count 项完整 journal record 与一一对应的 preallocated
+  //   publication value；每个 slot 带 exact batch key/压缩 item 下标，source
+  //   record 使用与 engine backing 分离但保留 opaque release authority 的 mapping。
   // 输入/输出及副作用：engine/profile/binding/cmq、稳定 ID 与 body_kind 为输入；成功
   //   直接复制 mapping 全部公开字段，经 profile 计算 digest 并发布两个 source graph。
   // 失败/边界：item_count 为零/大于 32、任一依赖、未知 body kind、mapping authority seam、nested handle、
@@ -7940,6 +8021,8 @@ class rdma_cmq_engine_test extends uvm_test;
       expected.variant = "CQC_DELETE";
       publish_item.slot_record.expected = expected;
       publish_item.slot_record.command_token = item.command_token;
+      publish_item.slot_record.batch_key = batch_key;
+      publish_item.slot_record.journal_item_index = i;
       publish_item.command_key = journal_ticket_key(item.ticket);
       publish_item.entry_key = item.entry_key;
       publish_item.command_token = item.command_token;
@@ -9896,6 +9979,7 @@ class rdma_cmq_engine_test extends uvm_test;
     rdma_cmq_reset_isolation_proof source_proof;
     rdma_cmq_reset_isolation_proof request_proof;
     rdma_cmq_reset_isolation_proof retained_proof;
+    rdma_function_identity replacement_identity;
     rdma_cmq_recovery_owner request_owner;
     rdma_cmq_recovery_owner retained_owner;
     rdma_status status;
@@ -9925,6 +10009,22 @@ class rdma_cmq_engine_test extends uvm_test;
                  "reset confirmation request construction failed")
       return;
     end
+
+    // READY proof 必须携带同一 Function 的更新 reset epoch；从当前
+    // active binding 取得 detached identity，再模拟下一次真实 rebind，
+    // 避免用缺少 route/UID/generation 的手工对象绕过 production gate。
+    status = source_record.binding.snapshot_identity_nonfatal(
+      replacement_identity
+    );
+    if (status == null || !status.ok() || replacement_identity == null ||
+        !replacement_identity.same_function(source_proof.isolated_identity)) begin
+      `uvm_error("RECOVERY_RESET_REPLACEMENT_FIXTURE",
+                 "same-Function replacement identity construction failed")
+      return;
+    end
+    replacement_identity.reset_epoch =
+      source_proof.isolated_identity.reset_epoch + 1;
+    source_proof.replacement_identity = replacement_identity;
     source_proof.state = RDMA_CMQ_RESET_PROOF_READY;
     status = recompute_reset_proof_digest_for_test(source_proof);
     if (status != null && status.ok())
@@ -15542,12 +15642,12 @@ class rdma_cmq_engine_test extends uvm_test;
         expect_status({label, "_FENCED_POLL"}, status, RDMA_SC_OK);
         engine.wait_for(record_after.items[0].ticket, completion, status);
         expect_status({label, "_FENCED_WAIT"}, status,
-                      RDMA_SC_INVALID_ARGUMENT);
+                      RDMA_SC_INVALID_STATE);
         engine.reconcile_ticket(
           record_after.items[0].ticket, terminal_known, completion, status
         );
         expect_status({label, "_FENCED_RECONCILE"}, status,
-                      RDMA_SC_INVALID_ARGUMENT);
+                      expected_operation);
         if (terminal_known || completion != null)
           `uvm_error({label, "_FENCED_RECONCILE_OUTPUT"},
                      "unknown fenced ticket published terminal output")
@@ -16815,10 +16915,12 @@ class rdma_cmq_engine_test extends uvm_test;
     disarm_submission_factory_faults();
   endtask
 
-  // 功能：在测试辅助 rdma_cmq_engine_test.check_timeout_quarantine_and_late_diagnostic 中构造或驱动“timeout quarantine and late
-  //   diagnostic”场景，并断言 DUT 的状态、错误码和资源账本符合契约。
+  // 功能：驱动同批两项的 timeout/晚到/正常完成，断言 slot
+  //   locator 只更新 exact retained item、batch reducer 状态与 FIFO 后 journal 证据。
   // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
-  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
+  // 失败/边界：timeout 若释放/复用其 token、晚到未释放 exact
+  //   incarnation、任一 item state/phase/recovery 错误，或重复 reconcile
+  //   返回 alias graph 时报 UVM_ERROR；测试不吞掉 DUT 失败。
   task automatic check_timeout_quarantine_and_late_diagnostic();
     rdma_cmq_engine_probe engine;
     rdma_mock_host_mem mem;
@@ -16838,11 +16940,16 @@ class rdma_cmq_engine_test extends uvm_test;
     rdma_status batch_status;
     rdma_dma_mapping mapping;
     rdma_cmq_completion completions[$];
+    rdma_cmq_completion reconciled_completion;
+    rdma_cmq_completion repeated_completion;
     rdma_cmq_diagnostic diagnostics[$];
+    rdma_cmq_batch_submission_record journal_snapshot;
     rdma_hw_image first_raw;
     rdma_hw_image reuse_raw;
     rdma_hw_image survivor_raw;
     rdma_status status;
+    string batch_key;
+    bit terminal_known;
 
     engine = rdma_cmq_engine_probe::type_id::create("timeout_engine");
     mem = rdma_mock_host_mem::type_id::create("timeout_mem");
@@ -16883,6 +16990,33 @@ class rdma_cmq_engine_test extends uvm_test;
     if (tickets[0].command_id[4:0] != 0 ||
         tickets[1].command_id[4:0] != 1)
       `uvm_error("TIMEOUT_TOKEN_ORDER", "initial token order is unexpected")
+    engine.query_submission_journal_by_ticket(
+      tickets[0], journal_snapshot, status
+    );
+    expect_status("TIMEOUT_INITIAL_JOURNAL", status, RDMA_SC_OK);
+    if (journal_snapshot == null || journal_snapshot.items.size() != 2) begin
+      `uvm_error("TIMEOUT_INITIAL_JOURNAL",
+                 "published batch journal snapshot is incomplete")
+      engine.shutdown(status);
+      return;
+    end
+    batch_key = journal_snapshot.batch_key;
+    if (journal_snapshot.state != RDMA_CMQ_SUBMISSION_PUBLISH_CONFIRMED ||
+        journal_snapshot.items[0].state !=
+          RDMA_CMQ_SUBMISSION_PUBLISH_CONFIRMED ||
+        journal_snapshot.items[1].state !=
+          RDMA_CMQ_SUBMISSION_PUBLISH_CONFIRMED ||
+        journal_snapshot.items[0].completion_phase !=
+          RDMA_CMQ_COMPLETION_PENDING ||
+        journal_snapshot.items[1].completion_phase !=
+          RDMA_CMQ_COMPLETION_PENDING ||
+        !engine.slot_journal_locator_matches(
+          tickets[0].sq_index, batch_key, 0
+        ) || !engine.slot_journal_locator_matches(
+          tickets[1].sq_index, batch_key, 1
+        ))
+      `uvm_error("TIMEOUT_INITIAL_LOCATOR",
+                 "published slots are not bound to exact journal items")
     mapping = engine.mapping_snapshot();
 
     #20ns;
@@ -16896,12 +17030,33 @@ class rdma_cmq_engine_test extends uvm_test;
         engine.slot_state_at(1) != CMQ_SLOT_PUBLISHED ||
         engine.published_count() != 2 || engine.retired_count() != 0 ||
         engine.cq_consumed_count() != 0 ||
-        engine.tokens_in_use_count() != 1 ||
+        engine.tokens_in_use_count() != 2 ||
         engine.command_registry_count() != 1 ||
         engine.entry_registry_count() != 2 ||
         engine.slot_record_count() != 2)
       `uvm_error("TIMEOUT_QUARANTINE",
                  "partial expiry changed the quarantine ledger incorrectly")
+    engine.query_submission_journal_by_ticket(
+      tickets[0], journal_snapshot, status
+    );
+    expect_status("TIMEOUT_QUARANTINE_JOURNAL", status, RDMA_SC_OK);
+    if (journal_snapshot == null || journal_snapshot.items.size() != 2 ||
+        journal_snapshot.state !=
+          RDMA_CMQ_SUBMISSION_TIMED_OUT_QUARANTINED ||
+        journal_snapshot.items[0].state !=
+          RDMA_CMQ_SUBMISSION_TIMED_OUT_QUARANTINED ||
+        journal_snapshot.items[0].completion_phase !=
+          RDMA_CMQ_COMPLETION_TIMEOUT ||
+        journal_snapshot.items[0].completion == null ||
+        journal_snapshot.items[0].completion.status == null ||
+        journal_snapshot.items[0].completion.status.code != RDMA_SC_TIMEOUT ||
+        !journal_snapshot.items[0].recovery_required ||
+        journal_snapshot.items[1].state !=
+          RDMA_CMQ_SUBMISSION_PUBLISH_CONFIRMED ||
+        journal_snapshot.items[1].completion_phase !=
+          RDMA_CMQ_COMPLETION_PENDING)
+      `uvm_error("TIMEOUT_QUARANTINE_JOURNAL",
+                 "timeout did not update the exact retained journal item")
 
     engine.expire(completions, status);
     expect_status("TIMEOUT_EXPIRE_AGAIN", status, RDMA_SC_OK);
@@ -16918,11 +17073,9 @@ class rdma_cmq_engine_test extends uvm_test;
     expect_status("TIMEOUT_REUSE", status, RDMA_SC_OK);
     if (reuse_ticket == null)
       `uvm_error("TIMEOUT_REUSE", "reused token returned no ticket")
-    else if (reuse_ticket.command_id[4:0] != tickets[0].command_id[4:0] ||
-             reuse_ticket.command_id == tickets[0].command_id ||
-             reuse_ticket.command_id[63:5] <= tickets[0].command_id[63:5])
+    else if (reuse_ticket.command_id[4:0] == tickets[0].command_id[4:0])
       `uvm_error("TIMEOUT_REUSE",
-                 "token reuse did not advance the full command incarnation")
+                 "timeout made its quarantined token immediately reusable")
 
     mem.calls.delete();
     write_profile_cqe(
@@ -16945,6 +17098,25 @@ class rdma_cmq_engine_test extends uvm_test;
          engine.cq_consumed_count() != 1))
       `uvm_error("TIMEOUT_LATE_TOKEN",
                  "late CQE reclaimed the token's newer incarnation")
+    engine.query_submission_journal_by_ticket(
+      tickets[0], journal_snapshot, status
+    );
+    expect_status("TIMEOUT_LATE_JOURNAL", status, RDMA_SC_OK);
+    if (journal_snapshot == null || journal_snapshot.items.size() != 2 ||
+        journal_snapshot.items[0].state !=
+          RDMA_CMQ_SUBMISSION_LATE_COMPLETED ||
+        journal_snapshot.items[0].completion_phase !=
+          RDMA_CMQ_COMPLETION_DIAGNOSTIC_ONLY ||
+        journal_snapshot.items[0].completion == null ||
+        journal_snapshot.items[0].recovery_required)
+      `uvm_error("TIMEOUT_LATE_JOURNAL",
+                 "late completion did not replace timeout evidence exactly")
+    else
+      expect_polled_completion(
+        "TIMEOUT_LATE_JOURNAL_COMPLETION", engine,
+        journal_snapshot.items[0].completion, tickets[0], first_raw,
+        1'b1, 0, RDMA_SC_OK
+      );
 
     engine.poll(completions, diagnostics, status);
     expect_status("TIMEOUT_LATE_REPEAT_POLL", status, RDMA_SC_OK);
@@ -17005,6 +17177,70 @@ class rdma_cmq_engine_test extends uvm_test;
         engine.entry_registry_count() != 0)
       `uvm_error("TIMEOUT_FINAL_LEDGER",
                  "normal survivor did not retire the late-completed prefix")
+
+    engine.query_submission_journal_by_ticket(
+      tickets[1], journal_snapshot, status
+    );
+    expect_status("TIMEOUT_FINAL_JOURNAL", status, RDMA_SC_OK);
+    if (journal_snapshot == null || journal_snapshot.items.size() != 2 ||
+        journal_snapshot.state != RDMA_CMQ_SUBMISSION_LATE_COMPLETED ||
+        journal_snapshot.items[0].state !=
+          RDMA_CMQ_SUBMISSION_LATE_COMPLETED ||
+        journal_snapshot.items[1].state != RDMA_CMQ_SUBMISSION_COMPLETED ||
+        journal_snapshot.items[1].completion_phase !=
+          RDMA_CMQ_COMPLETION_TERMINAL ||
+        journal_snapshot.items[1].completion == null ||
+        journal_snapshot.items[1].recovery_required)
+      `uvm_error("TIMEOUT_FINAL_JOURNAL",
+                 "normal and late lifecycle evidence was not retained")
+    else
+      expect_polled_completion(
+        "TIMEOUT_SURVIVOR_JOURNAL_COMPLETION", engine,
+        journal_snapshot.items[1].completion, tickets[1], survivor_raw,
+        1'b1, 0, RDMA_SC_OK
+      );
+
+    // poll() 已消费 delivery FIFO；reconcile 仍必须从 journal 返回 detached 终态。
+    engine.reconcile_ticket(
+      tickets[1], terminal_known, reconciled_completion, status
+    );
+    expect_status("TIMEOUT_RECONCILE_SURVIVOR", status, RDMA_SC_OK);
+    if (!terminal_known || reconciled_completion == null)
+      `uvm_error("TIMEOUT_RECONCILE_SURVIVOR",
+                 "reconcile lost retained normal completion after FIFO drain")
+    else
+      expect_polled_completion(
+        "TIMEOUT_RECONCILE_SURVIVOR_VALUE", engine,
+        reconciled_completion, tickets[1], survivor_raw, 1'b1, 0,
+        RDMA_SC_OK
+      );
+    engine.reconcile_ticket(
+      tickets[1], terminal_known, repeated_completion, status
+    );
+    expect_status("TIMEOUT_RECONCILE_SURVIVOR_REPEAT", status, RDMA_SC_OK);
+    if (!terminal_known || repeated_completion == null ||
+        repeated_completion == reconciled_completion ||
+        repeated_completion.ticket == reconciled_completion.ticket ||
+        repeated_completion.status == reconciled_completion.status ||
+        repeated_completion.raw_cqe == reconciled_completion.raw_cqe ||
+        repeated_completion.decoded_response ==
+          reconciled_completion.decoded_response)
+      `uvm_error("TIMEOUT_RECONCILE_SURVIVOR_REPEAT",
+                 "terminal reconcile is not idempotent and graph-detached")
+
+    engine.reconcile_ticket(
+      tickets[0], terminal_known, reconciled_completion, status
+    );
+    expect_status("TIMEOUT_RECONCILE_LATE", status, RDMA_SC_OK);
+    if (!terminal_known || reconciled_completion == null)
+      `uvm_error("TIMEOUT_RECONCILE_LATE",
+                 "reconcile lost retained late-final completion")
+    else
+      expect_polled_completion(
+        "TIMEOUT_RECONCILE_LATE_VALUE", engine,
+        reconciled_completion, tickets[0], first_raw, 1'b1, 0,
+        RDMA_SC_OK
+      );
 
     engine.shutdown(status);
     expect_status("TIMEOUT_SHUTDOWN", status, RDMA_SC_OK);
@@ -17134,7 +17370,7 @@ class rdma_cmq_engine_test extends uvm_test;
         engine.diagnostic_fifo_count() != 0 ||
         engine.published_count() != 2 || engine.retired_count() != 0 ||
         engine.cq_consumed_count() != 0 ||
-        engine.tokens_in_use_count() != 0 ||
+        engine.tokens_in_use_count() != 2 ||
         engine.slot_record_count() != 2 ||
         engine.command_registry_count() != 0 ||
         engine.entry_registry_count() != 2 ||
@@ -17231,7 +17467,7 @@ class rdma_cmq_engine_test extends uvm_test;
     if (engine.slot_state_at(ticket.sq_index) !=
           CMQ_SLOT_TIMED_OUT_QUARANTINED ||
         engine.command_registry_count() != 0 ||
-        engine.tokens_in_use_count() != 0 ||
+        engine.tokens_in_use_count() != 1 ||
         engine.entry_registry_count() != 1)
       `uvm_error("LATE_SNAPSHOT_FAILURE_QUARANTINE",
                  "fixture did not retain quarantined late-CQE authority")
@@ -17258,7 +17494,7 @@ class rdma_cmq_engine_test extends uvm_test;
         engine.diagnostic_fifo_count() != 0 ||
         engine.published_count() != 1 || engine.retired_count() != 0 ||
         engine.cq_consumed_count() != 0 ||
-        engine.tokens_in_use_count() != 0 ||
+        engine.tokens_in_use_count() != 1 ||
         engine.slot_record_count() != 1 ||
         engine.command_registry_count() != 0 ||
         engine.entry_registry_count() != 1 ||
@@ -20015,11 +20251,13 @@ class rdma_cmq_engine_test extends uvm_test;
     if (completions.size() != 0 || diagnostics.size() != 0)
       `uvm_error("WAIT_FIFO_POLL_ONCE", "completion was delivered twice")
     engine.wait_for(tickets[1], completion, status);
-    expect_status("WAIT_FIFO_ALREADY_DELIVERED", status,
-                  RDMA_SC_INVALID_ARGUMENT);
-    if (completion != null)
-      `uvm_error("WAIT_FIFO_ALREADY_DELIVERED",
-                 "already delivered wait returned a completion")
+    expect_status("WAIT_FIFO_RETAINED_EVIDENCE", status, RDMA_SC_OK);
+    if (completion == null || completion.ticket == null ||
+        completion.status == null ||
+        completion.ticket.command_id != tickets[1].command_id ||
+        completion.status.code != RDMA_SC_OK)
+      `uvm_error("WAIT_FIFO_RETAINED_EVIDENCE",
+                 "journal terminal evidence was not returned after FIFO delivery")
     unknown_ticket = rdma_cmq_ticket::type_id::create("wait_unknown_ticket");
     unknown_ticket.copy(tickets[1]);
     unknown_ticket.command_id += 32;
@@ -20082,7 +20320,7 @@ class rdma_cmq_engine_test extends uvm_test;
     engine.submit_batch(requests, tickets, item_statuses, batch_status);
     expect_status("WAIT_TIMEOUT_SUBMIT", batch_status, RDMA_SC_OK);
     engine.wait_for(tickets[0], completion, status);
-    expect_status("WAIT_TIMEOUT_WAIT", status, RDMA_SC_OK);
+    expect_status("WAIT_TIMEOUT_WAIT", status, RDMA_SC_TIMEOUT);
     if (completion == null || completion.status == null ||
         completion.status.code != RDMA_SC_TIMEOUT ||
         $time != tickets[0].absolute_deadline)
@@ -20093,8 +20331,14 @@ class rdma_cmq_engine_test extends uvm_test;
       `uvm_error("WAIT_TIMEOUT_COUNTS",
                  "detached outstanding/quarantine counts are wrong")
     engine.wait_for(tickets[0], completion, status);
-    expect_status("WAIT_TIMEOUT_ALREADY_DELIVERED", status,
-                  RDMA_SC_INVALID_ARGUMENT);
+    expect_status("WAIT_TIMEOUT_RETAINED_EVIDENCE", status,
+                  RDMA_SC_TIMEOUT);
+    if (completion == null || completion.ticket == null ||
+        completion.status == null ||
+        completion.ticket.command_id != tickets[0].command_id ||
+        completion.status.code != RDMA_SC_TIMEOUT)
+      `uvm_error("WAIT_TIMEOUT_RETAINED_EVIDENCE",
+                 "journal timeout evidence was not returned after first wait")
     engine.shutdown(status);
     expect_status("WAIT_TIMEOUT_SHUTDOWN", status, RDMA_SC_OK);
   endtask
@@ -20116,6 +20360,7 @@ class rdma_cmq_engine_test extends uvm_test;
     rdma_dma_mapping old_mapping;
     rdma_cmq_command_desc requests[];
     rdma_cmq_ticket tickets[];
+    rdma_cmq_ticket timeout_ticket;
     rdma_cmq_ticket published_ticket;
     rdma_cmq_ticket reuse_ticket;
     rdma_status item_statuses[];
@@ -20124,6 +20369,19 @@ class rdma_cmq_engine_test extends uvm_test;
     rdma_status status;
     byte data[];
     byte one[];
+    int unsigned retry_fifo_before;
+    int unsigned retry_outstanding_before;
+    int unsigned retry_slot_before;
+    int unsigned retry_token_before;
+    int unsigned retry_journal_before;
+    int unsigned retry_ticket_index_before;
+    int unsigned retry_preallocation_before;
+    int unsigned retry_observer_before;
+    longint unsigned retry_publish_before;
+    longint unsigned retry_retire_before;
+    longint unsigned retry_cq_before;
+    rdma_cmq_engine_state_e retry_state_before;
+    rdma_dma_mapping retry_authority_before;
     int unsigned release_calls;
 
     engine = rdma_cmq_engine_probe::type_id::create("cancel_engine");
@@ -20147,6 +20405,7 @@ class rdma_cmq_engine_test extends uvm_test;
     );
     engine.submit_batch(requests, tickets, item_statuses, batch_status);
     expect_status("CANCEL_SUBMIT", batch_status, RDMA_SC_OK);
+    timeout_ticket = tickets[0];
     published_ticket = tickets[1];
     #2ns;
     engine.expire(completions, status);
@@ -20162,11 +20421,13 @@ class rdma_cmq_engine_test extends uvm_test;
     engine.submit_batch(requests, tickets, item_statuses, batch_status);
     expect_status("CANCEL_REUSE_SUBMIT", batch_status, RDMA_SC_OK);
     reuse_ticket = tickets[0];
-    if (reuse_ticket == null || reuse_ticket.command_id[4:0] != 0 ||
+    if (reuse_ticket == null ||
+        reuse_ticket.command_id[4:0] == timeout_ticket.command_id[4:0] ||
         reuse_ticket.command_id[63:5] == 0 ||
-        !engine.token_in_use_at(reuse_ticket.command_id[4:0]))
+        !engine.token_in_use_at(reuse_ticket.command_id[4:0]) ||
+        !engine.token_in_use_at(timeout_ticket.command_id[4:0]))
       `uvm_error("CANCEL_REUSE_SUBMIT",
-                 "timeout token was not reused by a newer incarnation")
+                 "timeout token authority was reused instead of retained")
     engine.cancel_generation(active_binding.generation + 1,
                              completions, status);
     expect_status("CANCEL_STALE", status, RDMA_SC_STALE_GENERATION);
@@ -20198,13 +20459,19 @@ class rdma_cmq_engine_test extends uvm_test;
            completions[0].ticket.command_id == published_ticket.command_id)))
       `uvm_error("CANCEL_CURRENT", "cancel completion identity is wrong")
     if (engine.state() != RDMA_CMQ_ENGINE_QUIESCED ||
-        engine.outstanding_count() != 0 || engine.quarantine_count() != 0 ||
-        engine.published_count() != 0 || engine.retired_count() != 0 ||
+        engine.outstanding_count() != 0 || engine.quarantine_count() != 1 ||
+        engine.published_count() != 3 || engine.retired_count() != 0 ||
         engine.cq_consumed_count() != 0 ||
-        engine.tokens_in_use_count() != 0 ||
-        engine.slot_record_count() != 0 ||
+        engine.tokens_in_use_count() != 3 ||
+        engine.slot_record_count() != 3 ||
         engine.command_registry_count() != 0 ||
-        engine.entry_registry_count() != 0)
+        engine.entry_registry_count() != 3 ||
+        engine.slot_state_at(timeout_ticket.sq_index) !=
+          CMQ_SLOT_TIMED_OUT_QUARANTINED ||
+        engine.slot_state_at(published_ticket.sq_index) !=
+          CMQ_SLOT_RESET_CANCELLED ||
+        engine.slot_state_at(reuse_ticket.sq_index) !=
+          CMQ_SLOT_RESET_CANCELLED)
       `uvm_error("CANCEL_CURRENT", "cancel did not quiesce every ledger")
     old_mapping = engine.mapping_snapshot();
     release_calls = count_host_calls(mem, "release");
@@ -20239,7 +20506,6 @@ class rdma_cmq_engine_test extends uvm_test;
   task automatic check_strict_cancel_audits_complete_ledger();
     string fault_labels[4];
     int unsigned request_counts[4];
-    int unsigned recovery_counts[4];
 
     fault_labels[0] = "STRAY_TOKEN";
     fault_labels[1] = "MOVED_SLOT";
@@ -20249,10 +20515,6 @@ class rdma_cmq_engine_test extends uvm_test;
     request_counts[1] = 1;
     request_counts[2] = 2;
     request_counts[3] = 1;
-    recovery_counts[0] = 1;
-    recovery_counts[1] = 0;
-    recovery_counts[2] = 1;
-    recovery_counts[3] = 1;
     for (int unsigned fault = 0; fault < 4; fault++) begin
       rdma_cmq_engine_probe engine;
       rdma_mock_host_mem mem;
@@ -20351,17 +20613,21 @@ class rdma_cmq_engine_test extends uvm_test;
                    "strict cancel did not poison before ledger mutation")
 
       engine.reset(completions, status);
-      expect_status({label, "_RESET"}, status, RDMA_SC_OK);
-      if (completions.size() != recovery_counts[fault] ||
-          count_host_calls(mem, "release") != 1)
-        `uvm_error({label, "_RECOVERY"},
-                   "reset did not recover the trusted ticket set")
-      foreach (completions[i]) begin
-        if (completions[i] == null || completions[i].status == null ||
-            completions[i].status.code != RDMA_SC_RESET_CANCELLED)
-          `uvm_error({label, "_RECOVERY"},
-                     "reset returned a non-cancellation completion")
-      end
+      expect_status({label, "_RESET"}, status, RDMA_SC_INVALID_STATE);
+      if (completions.size() != 0 ||
+          engine.state() != RDMA_CMQ_ENGINE_POISONED ||
+          count_host_calls(mem, "release") != 0 ||
+          engine.slot_record_count() != before_slots ||
+          engine.tokens_in_use_count() != before_tokens ||
+          engine.command_registry_count() != before_commands ||
+          engine.entry_registry_count() != before_entries)
+        `uvm_error({label, "_RESET_ATOMICITY"},
+                   "reset did not fail closed on malformed runtime ledger")
+      engine.shutdown(status);
+      expect_status({label, "_SHUTDOWN"}, status, RDMA_SC_OK);
+      if (count_host_calls(mem, "release") != 1)
+        `uvm_error({label, "_SHUTDOWN"},
+                   "poison cleanup did not release backing exactly once")
       expect_unconfigured({label, "_STATE"}, engine);
     end
   endtask
@@ -20460,7 +20726,10 @@ class rdma_cmq_engine_test extends uvm_test;
     before_entries = engine.entry_registry_count();
     before_terminal = engine.terminal_fifo_count();
     before_diagnostics = engine.diagnostic_fifo_count();
-    if (before_slots != 2 || before_tokens != 2 ||
+    // Timeout authority keeps its token/slot for late evidence but is removed
+    // from command_registry; the injected stray command therefore makes the
+    // post-tamper command count two (published plus stray), not three.
+    if (before_slots != 2 || before_tokens != 3 ||
         before_commands != 2 || before_entries != 2)
       `uvm_error("STRICT_CANCEL_MEMBERSHIP_TAMPER",
                  "tamper did not preserve the intended coarse counts")
@@ -20486,18 +20755,24 @@ class rdma_cmq_engine_test extends uvm_test;
 
     engine.reset(completions, status);
     expect_status("STRICT_CANCEL_BALANCED_MEMBERSHIP_RESET", status,
-                  RDMA_SC_OK);
-    if (status == null || !status.ok()) begin
-      engine.shutdown(cleanup_status);
-      return;
-    end
-    if (completions.size() != 1 || completions[0] == null ||
-        completions[0].ticket == null || completions[0].status == null ||
-        completions[0].ticket.command_id != tickets[1].command_id ||
-        completions[0].status.code != RDMA_SC_RESET_CANCELLED ||
-        count_host_calls(mem, "release") != 1)
-      `uvm_error("STRICT_CANCEL_BALANCED_MEMBERSHIP_RECOVERY",
-                 "reset did not safely clear and release the poisoned set")
+                  RDMA_SC_INVALID_STATE);
+    if (completions.size() != 0 ||
+        engine.state() != RDMA_CMQ_ENGINE_POISONED ||
+        engine.published_count() != before_publish ||
+        engine.retired_count() != before_retire ||
+        engine.cq_consumed_count() != before_consume ||
+        engine.slot_record_count() != before_slots ||
+        engine.tokens_in_use_count() != before_tokens ||
+        engine.command_registry_count() != before_commands ||
+        engine.entry_registry_count() != before_entries ||
+        engine.terminal_fifo_count() != before_terminal ||
+        engine.diagnostic_fifo_count() != before_diagnostics ||
+        count_host_calls(mem, "release") != 0)
+      `uvm_error("STRICT_CANCEL_BALANCED_MEMBERSHIP_RESET_ATOMICITY",
+                 "reset did not preserve the poisoned membership tamper")
+    engine.shutdown(cleanup_status);
+    expect_status("STRICT_CANCEL_BALANCED_MEMBERSHIP_SHUTDOWN",
+                  cleanup_status, RDMA_SC_OK);
     expect_unconfigured("STRICT_CANCEL_BALANCED_MEMBERSHIP_STATE", engine);
   endtask
 
@@ -20580,12 +20855,18 @@ class rdma_cmq_engine_test extends uvm_test;
         `uvm_error({label, "_POISON"},
                    "X ticket setup did not poison before transport")
       engine.reset(completions, status);
-      expect_status({label, "_RESET"}, status, RDMA_SC_OK);
+      expect_status({label, "_RESET"}, status, RDMA_SC_INVALID_STATE);
       if (completions.size() != 0 ||
+          engine.state() != RDMA_CMQ_ENGINE_POISONED ||
           engine.token_incarnation_at(token_index) != incarnation ||
-          count_host_calls(mem, "release") != 1)
+          count_host_calls(mem, "release") != 0)
         `uvm_error({label, "_TRUST"},
-                   "reset trusted X ticket or rewound incarnation")
+                   "reset did not preserve malformed X-ticket authority")
+      engine.shutdown(status);
+      expect_status({label, "_SHUTDOWN"}, status, RDMA_SC_OK);
+      if (count_host_calls(mem, "release") != 1)
+        `uvm_error({label, "_SHUTDOWN"},
+                   "poison cleanup did not release malformed-ticket backing")
       expect_unconfigured({label, "_STATE"}, engine);
     end
   endtask
@@ -20596,14 +20877,10 @@ class rdma_cmq_engine_test extends uvm_test;
   // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_poisoned_ledger_reset_recovery();
     string fault_labels[3];
-    bit expect_cancel[3];
 
     fault_labels[0] = "TOKEN_MISSING";
     fault_labels[1] = "SLOT_MISSING";
     fault_labels[2] = "REGISTRY_MISSING";
-    expect_cancel[0] = 1'b1;
-    expect_cancel[1] = 1'b0;
-    expect_cancel[2] = 1'b1;
     for (int unsigned fault = 0; fault < 3; fault++) begin
       rdma_cmq_engine_probe engine;
       rdma_mock_host_mem mem;
@@ -20621,9 +20898,19 @@ class rdma_cmq_engine_test extends uvm_test;
       rdma_cmq_diagnostic diagnostics[$];
       rdma_status status;
       rdma_status cleanup_status;
-      byte data[];
-      byte one[];
-      int unsigned expected_release_calls;
+      int unsigned runtime_journal_count;
+      int unsigned runtime_ticket_index_count;
+      int unsigned runtime_preallocation_count;
+      int unsigned runtime_slot_count;
+      int unsigned runtime_token_count;
+      int unsigned runtime_command_count;
+      int unsigned runtime_entry_count;
+      int unsigned runtime_terminal_count;
+      int unsigned runtime_diagnostic_count;
+      longint unsigned runtime_publish_count;
+      longint unsigned runtime_retired_count;
+      longint unsigned runtime_cq_count;
+      rdma_dma_mapping retained_mapping;
       string label;
 
       label = {"POISONED_LEDGER_", fault_labels[fault]};
@@ -20676,87 +20963,75 @@ class rdma_cmq_engine_test extends uvm_test;
           count_host_calls(mem, "read") != 0)
         `uvm_error(label, "ledger corruption did not poison before CQ read")
 
-      if (fault == RDMA_CMQ_TEST_PUBLISHED_LEDGER_TOKEN_MISSING) begin
-        engine.cancel_generation(active_binding.generation,
-                                 completions, status);
-        expect_status({label, "_STRICT_CANCEL"}, status,
-                      RDMA_SC_INVALID_STATE);
-        if (completions.size() != 0 ||
-            engine.state() != RDMA_CMQ_ENGINE_POISONED ||
-            count_host_calls(mem, "release") != 0)
-          `uvm_error(label, "strict public cancel recovered poison")
-        expect_status(
-          {label, "_ARM_RELEASE_FAIL"},
-          mem.fail_next(
-            "release",
-            rdma_status::make(
-              RDMA_SC_UNKNOWN_HW_ERROR,
-              "injected poisoned-ledger reset release failure"
-            )
-          ),
-          RDMA_SC_OK
-        );
-        engine.reset(completions, status);
-        expect_status({label, "_RELEASE_FAIL"}, status,
-                      RDMA_SC_UNKNOWN_HW_ERROR);
-        if (completions.size() != 0 ||
-            engine.state() != RDMA_CMQ_ENGINE_POISONED ||
-            engine.mapping_snapshot() == null ||
-            engine.terminal_fifo_count() != 1 ||
-            count_host_calls(mem, "release") != 1 ||
-            mem.regions[0].mapping.state != RDMA_MAPPING_ACTIVE)
-          `uvm_error(label,
-                     "release failure lost staged recovery authority")
-      end
+      // A malformed runtime ledger is not recoverable through reset.  Capture
+      // every externally visible count before reset so that a failed audit is
+      // proven mutation-free, including the retained mapping authority.
+      runtime_journal_count = engine.submission_journal_count();
+      runtime_ticket_index_count = engine.journal_ticket_index_count();
+      runtime_preallocation_count = engine.preallocated_publish_batch_count();
+      runtime_slot_count = engine.slot_record_count();
+      runtime_token_count = engine.tokens_in_use_count();
+      runtime_command_count = engine.command_registry_count();
+      runtime_entry_count = engine.entry_registry_count();
+      runtime_terminal_count = engine.terminal_fifo_count();
+      runtime_diagnostic_count = engine.diagnostic_fifo_count();
+      runtime_publish_count = engine.published_count();
+      runtime_retired_count = engine.retired_count();
+      runtime_cq_count = engine.cq_consumed_count();
+      retained_mapping = engine.mapping_snapshot();
+      if (retained_mapping == null ||
+          mem.regions[0].mapping.state != RDMA_MAPPING_ACTIVE)
+        `uvm_error(label, "poisoned ledger lost release authority before reset")
 
       engine.reset(completions, status);
-      expect_status({label, "_RESET"}, status, RDMA_SC_OK);
-      if (status == null || !status.ok()) begin
-        engine.shutdown(cleanup_status);
-        continue;
-      end
+      expect_status({label, "_RESET"}, status, RDMA_SC_INVALID_STATE);
+      if (completions.size() != 0 ||
+          engine.state() != RDMA_CMQ_ENGINE_POISONED ||
+          count_host_calls(mem, "release") != 0 ||
+          mem.regions[0].mapping.state != RDMA_MAPPING_ACTIVE ||
+          engine.mapping_snapshot() == null ||
+          engine.submission_journal_count() != runtime_journal_count ||
+          engine.journal_ticket_index_count() != runtime_ticket_index_count ||
+          engine.preallocated_publish_batch_count() !=
+            runtime_preallocation_count ||
+          engine.slot_record_count() != runtime_slot_count ||
+          engine.tokens_in_use_count() != runtime_token_count ||
+          engine.command_registry_count() != runtime_command_count ||
+          engine.entry_registry_count() != runtime_entry_count ||
+          engine.terminal_fifo_count() != runtime_terminal_count ||
+          engine.diagnostic_fifo_count() != runtime_diagnostic_count ||
+          engine.published_count() != runtime_publish_count ||
+          engine.retired_count() != runtime_retired_count ||
+          engine.cq_consumed_count() != runtime_cq_count)
+        `uvm_error(label,
+                   "malformed ledger reset mutated authority or released backing")
+
+      // Poison cleanup intentionally bypasses strict ledger cancellation: it
+      // releases the retained backing exactly once, then clears all local
+      // authority.  This is the only recovery route for a malformed ledger.
+      engine.shutdown(cleanup_status);
+      expect_status({label, "_SHUTDOWN"}, cleanup_status, RDMA_SC_OK);
+      if (count_host_calls(mem, "release") != 1 ||
+          mem.regions[0].mapping.state != RDMA_MAPPING_RELEASED)
+        `uvm_error(label, "poison shutdown did not release backing exactly once")
       expect_unconfigured({label, "_STATE"}, engine);
-      expected_release_calls =
-        (fault == RDMA_CMQ_TEST_PUBLISHED_LEDGER_TOKEN_MISSING) ? 2 : 1;
-      if (completions.size() != (expect_cancel[fault] ? 1 : 0) ||
-          count_host_calls(mem, "release") != expected_release_calls ||
-          mem.regions[0].mapping.state != RDMA_MAPPING_RELEASED ||
-          engine.mapping_snapshot() != null ||
+      if (engine.mapping_snapshot() != null ||
           engine.published_count() != 0 || engine.retired_count() != 0 ||
           engine.cq_consumed_count() != 0 ||
           engine.tokens_in_use_count() != 0 ||
           engine.slot_record_count() != 0 ||
           engine.command_registry_count() != 0 ||
-          engine.entry_registry_count() != 0)
-        `uvm_error(label, "poison recovery did not release all authority")
-      if (expect_cancel[fault] &&
-          (completions[0] == null || completions[0].ticket == null ||
-           completions[0].status == null ||
-           completions[0].ticket.command_id != ticket.command_id ||
-           completions[0].status.code != RDMA_SC_RESET_CANCELLED ||
-           completions[0].status.source_engine != RDMA_ENGINE_RESET ||
-           completions[0].status.function_uid !=
-             active_binding.function_uid ||
-           completions[0].status.generation != active_binding.generation ||
-           completions[0].status.resource_id != cmq.handle.object_id ||
-           completions[0].status.command_id != ticket.command_id))
-        `uvm_error(label, "poison recovery cancellation identity is wrong")
+          engine.entry_registry_count() != 0 ||
+          engine.submission_journal_count() != runtime_journal_count ||
+          engine.journal_ticket_index_count() != runtime_ticket_index_count)
+        `uvm_error(label,
+                   "poison shutdown did not clear runtime authority or retain journal evidence")
 
-      data = new[0];
-      status = mem.read(mapping, 0, 1, data);
-      if (status == null || status.ok())
-        `uvm_error(label, "poison recovery left old mapping readable")
-      one = new[1];
-      one[0] = 8'h5a;
-      status = mem.write(mapping, 0, one);
-      if (status == null || status.ok())
-        `uvm_error(label, "poison recovery left old mapping writable")
-
-      engine.reset(completions, status);
-      expect_status({label, "_RESET_ONCE"}, status, RDMA_SC_OK);
-      if (completions.size() != 0 ||
-          count_host_calls(mem, "release") != expected_release_calls)
-        `uvm_error(label, "poison recovery delivered or released twice")
+      // A second cleanup call is idempotent and must not issue another release.
+      engine.shutdown(cleanup_status);
+      expect_status({label, "_SHUTDOWN_ONCE"}, cleanup_status, RDMA_SC_OK);
+      if (count_host_calls(mem, "release") != 1)
+        `uvm_error(label, "poison shutdown released backing more than once")
     end
   endtask
 
@@ -20798,6 +21073,19 @@ class rdma_cmq_engine_test extends uvm_test;
     rdma_status status;
     byte data[];
     byte one[];
+    int unsigned retry_fifo_before;
+    int unsigned retry_outstanding_before;
+    int unsigned retry_slot_before;
+    int unsigned retry_token_before;
+    int unsigned retry_journal_before;
+    int unsigned retry_ticket_index_before;
+    int unsigned retry_preallocation_before;
+    int unsigned retry_observer_before;
+    longint unsigned retry_publish_before;
+    longint unsigned retry_retire_before;
+    longint unsigned retry_cq_before;
+    rdma_cmq_engine_state_e retry_state_before;
+    rdma_dma_mapping retry_authority_before;
 
     engine = rdma_cmq_engine_probe::type_id::create("reset_fifo_engine");
     mem = rdma_mock_host_mem::type_id::create("reset_fifo_mem");
@@ -20915,10 +21203,23 @@ class rdma_cmq_engine_test extends uvm_test;
     expect_status("RESET_RETRY_SUBMIT", batch_status, RDMA_SC_OK);
     cancel_ticket = tickets[0];
     retained_mapping = engine.mapping_snapshot();
+    retry_fifo_before = engine.terminal_fifo_count();
+    retry_outstanding_before = engine.outstanding_count();
+    retry_slot_before = engine.slot_record_count();
+    retry_token_before = engine.tokens_in_use_count();
+    retry_journal_before = engine.submission_journal_count();
+    retry_ticket_index_before = engine.journal_ticket_index_count();
+    retry_preallocation_before = engine.preallocated_publish_batch_count();
+    retry_observer_before = engine.mmio_arm_observer_count();
+    retry_publish_before = engine.published_count();
+    retry_retire_before = engine.retired_count();
+    retry_cq_before = engine.cq_consumed_count();
+    retry_state_before = engine.state();
+    retry_authority_before = engine.mapping_snapshot();
     expect_status(
       "RESET_RETRY_ARM",
       mem.fail_next(
-        "release",
+        "release_opaque",
         rdma_status::make(RDMA_SC_UNKNOWN_HW_ERROR,
                           "injected reset release failure")
       ),
@@ -20927,14 +21228,23 @@ class rdma_cmq_engine_test extends uvm_test;
     engine.reset(completions, status);
     expect_status("RESET_RETRY_FAIL", status, RDMA_SC_UNKNOWN_HW_ERROR);
     if (completions.size() != 0 ||
-        engine.state() != RDMA_CMQ_ENGINE_POISONED ||
-        engine.mapping_snapshot() == null ||
-        engine.terminal_fifo_count() != 1 ||
-        engine.outstanding_count() != 0 ||
-        count_host_calls(mem, "release") != 1 ||
+        engine.state() != retry_state_before ||
+        !same_mapping_fields(engine.mapping_snapshot(), retry_authority_before) ||
+        engine.terminal_fifo_count() != retry_fifo_before ||
+        engine.outstanding_count() != retry_outstanding_before ||
+        engine.slot_record_count() != retry_slot_before ||
+        engine.tokens_in_use_count() != retry_token_before ||
+        engine.submission_journal_count() != retry_journal_before ||
+        engine.journal_ticket_index_count() != retry_ticket_index_before ||
+        engine.preallocated_publish_batch_count() != retry_preallocation_before ||
+        engine.mmio_arm_observer_count() != retry_observer_before ||
+        engine.published_count() != retry_publish_before ||
+        engine.retired_count() != retry_retire_before ||
+        engine.cq_consumed_count() != retry_cq_before ||
+        count_host_calls(mem, "release_opaque") != 1 ||
         mem.regions[0].mapping.state != RDMA_MAPPING_ACTIVE)
       `uvm_error("RESET_RETRY_FAIL",
-                 "failed reset published results or lost retry authority")
+                 "failed reset mutated runtime or lost retry authority")
     engine.reset(completions, status);
     expect_status("RESET_RETRY_SUCCESS", status, RDMA_SC_OK);
     expect_unconfigured("RESET_RETRY_STATE", engine);
@@ -20942,7 +21252,7 @@ class rdma_cmq_engine_test extends uvm_test;
         completions[0].status == null ||
         completions[0].ticket.command_id != cancel_ticket.command_id ||
         completions[0].status.code != RDMA_SC_RESET_CANCELLED ||
-        count_host_calls(mem, "release") != 2 ||
+        count_host_calls(mem, "release_opaque") != 2 ||
         mem.regions[0].mapping.state != RDMA_MAPPING_RELEASED)
       `uvm_error("RESET_RETRY_SUCCESS",
                  "reset retry did not deliver/release exactly once")
@@ -20979,10 +21289,13 @@ class rdma_cmq_engine_test extends uvm_test;
     engine.reset(completions, status);
     expect_status("RESET_NULL_RETRY_FAIL", status, RDMA_SC_INVALID_STATE);
     if (completions.size() != 0 ||
-        engine.state() != RDMA_CMQ_ENGINE_POISONED ||
+        engine.state() != RDMA_CMQ_ENGINE_ACTIVE ||
         engine.mapping_snapshot() == null ||
-        engine.terminal_fifo_count() != 1 ||
-        count_host_calls(mem, "release") != 1 ||
+        engine.terminal_fifo_count() != 0 ||
+        engine.outstanding_count() != 1 ||
+        engine.slot_record_count() != 1 ||
+        engine.tokens_in_use_count() != 1 ||
+        count_host_calls(mem, "release_opaque") != 1 ||
         mem.regions[0].mapping.state != RDMA_MAPPING_ACTIVE)
       `uvm_error("RESET_NULL_RETRY_FAIL",
                  "null reset release lost FIFO or mapping authority")
@@ -20993,7 +21306,7 @@ class rdma_cmq_engine_test extends uvm_test;
         completions[0].status == null ||
         completions[0].ticket.command_id != cancel_ticket.command_id ||
         completions[0].status.code != RDMA_SC_RESET_CANCELLED ||
-        count_host_calls(mem, "release") != 2 ||
+        count_host_calls(mem, "release_opaque") != 2 ||
         mem.regions[0].mapping.state != RDMA_MAPPING_RELEASED)
       `uvm_error("RESET_NULL_RETRY_SUCCESS",
                  "null reset retry did not deliver/release exactly once")
@@ -22106,7 +22419,9 @@ class rdma_cmq_engine_test extends uvm_test;
     if (engine.state() != RDMA_CMQ_ENGINE_UNCONFIGURED ||
         engine.submission_journal_count() != 1 ||
         engine.journal_ticket_index_count() != 2 ||
-        engine.preallocated_publish_batch_count() != 1 ||
+        // reset 提交会消费运行时 publication capability；journal/profile/index
+        // 证据仍须在 engine 退回 UNCONFIGURED 后保留并可查询。
+        engine.preallocated_publish_batch_count() != 0 ||
         engine.journal_profile_count() != 1 ||
         !engine.journal_profile_matches(record.batch_key, profile_a))
       `uvm_error("JOURNAL_RETAINED_RESET_ROWS",
@@ -22955,8 +23270,9 @@ class rdma_cmq_engine_capacity_process_test extends rdma_cmq_engine_test;
   endtask
 endclass
 
-// 普通 submission/poll fixture 的前半段保持 clean factory epoch，并在 retention row 2
-// 后结束当前 simulator lifetime；continuation leaf 紧邻恢复相同 clean epoch。
+// 普通 submission/poll fixture 的前半段保持 clean factory epoch，并在 fixture 21
+// 后结束当前 simulator lifetime；matrix leaf 以新的 clean epoch 接续 fixture 22–26
+// 与 retention rows 0..2，随后 continuation leaf 再接管 rows 3..14。
 class rdma_cmq_engine_submission_process_test extends rdma_cmq_engine_test;
   `uvm_component_utils(rdma_cmq_engine_submission_process_test)
 
@@ -22971,11 +23287,11 @@ class rdma_cmq_engine_submission_process_test extends rdma_cmq_engine_test;
     super.new(name, parent);
   endfunction
 
-  // 功能：在 clean epoch 运行 fixture 17–26，再执行 observed retention rows 0..2。
-  // 输入/输出及副作用：phase 为 UVM 输入；task 管理 objection，前置 fixture 与
-  //   retention 三行各自构造并清理 engine/mem/PCIe/scheduler 图。
-  // 失败/边界：任一状态、digest、fence 或 I/O 断言失败时报告 UVM severity；
-  //   不安装 submission/raw-image override，不执行 rows 3..14 或 fixture 28–32。
+  // 功能：在 clean epoch 运行 fixture 17–21 的 submission/poll 基础契约。
+  // 输入/输出及副作用：phase 为 UVM 输入；task 管理 objection，各 fixture 依次
+  //   创建并清理 engine、memory、PCIe 与 scheduler 图，不向后续 simulator 片传递状态。
+  // 失败/边界：任一状态、ledger、snapshot、digest 或事务原子性断言失败时报告
+  //   UVM severity；本片不执行 fixture 22–32 或 retention rows 0..14。
   virtual task run_phase(uvm_phase phase);
     phase.raise_objection(this);
     check_empty_invalid_and_state_rejections();
@@ -22983,6 +23299,36 @@ class rdma_cmq_engine_submission_process_test extends rdma_cmq_engine_test;
     check_pre_read_poll_ledger_fail_closed();
     check_submit_wrapper_and_snapshot_detachment();
     check_null_compose_transaction_abort();
+    phase.drop_objection(this);
+  endtask
+endclass
+
+// submission matrix leaf 独占 fixture 22–26 与 retention rows 0..2 的 simulator
+// lifetime；它故意不安装 factory seed，使新进程从干净 epoch 验证第二段边界。
+class rdma_cmq_engine_submission_matrix_process_test extends rdma_cmq_engine_test;
+  `uvm_component_utils(rdma_cmq_engine_submission_matrix_process_test)
+
+  // 功能：构造 submission matrix 物理 leaf，承接 snapshot/profile/retention
+  //   第二段 fixture，并复用基类的本地对象与断言辅助函数。
+  // 输入/输出及副作用：name/parent 为 UVM 层级输入；只调用 super.new 建立组件，
+  //   不创建 CMQ backing、不安装 factory override，也不接管外部 adapter 所有权。
+  // 失败/边界：构造阶段不运行 fixture；无效 parent 由 UVM hierarchy 报告，具体
+  //   fixture 资源失败由 run_phase 中的 UVM severity 暴露。
+  function new(
+    string name = "rdma_cmq_engine_submission_matrix_process_test",
+    uvm_component parent = null
+  );
+    super.new(name, parent);
+  endfunction
+
+  // 功能：在 fresh clean epoch 运行 fixture 22–26，再覆盖 observed retention
+  //   rows 0..2，验证 snapshot、profile 与传输失败留存的连续逻辑。
+  // 输入/输出及副作用：phase 为 UVM 输入；task 管理 objection，各 fixture 自行
+  //   创建、断言并释放 engine/memory/PCIe/scheduler 图，不跨 process 保存引用。
+  // 失败/边界：任一 clone、profile、journal、fence 或 retention 断言失败时报告
+  //   UVM severity；本片不调用 seed_submission_factory_epoch()，也不执行 rows 3..14。
+  virtual task run_phase(uvm_phase phase);
+    phase.raise_objection(this);
     check_nested_command_snapshot_failures();
     check_mutating_clone_source_restoration();
     check_qpc_context_snapshot_failures();
@@ -22993,8 +23339,9 @@ class rdma_cmq_engine_submission_process_test extends rdma_cmq_engine_test;
   endtask
 endclass
 
-// retention continuation 以 fresh simulator 自然恢复 fixture 17–32 原有的 clean epoch；
-// 此处禁止调用只属于 fixture 33 后历史的 seed_submission_factory_epoch()。
+// retention continuation 以 fresh simulator 自然接续 matrix leaf 的 rows 0..2，
+// 完成 rows 3..14 与 fixture 28–32；此处禁止调用只属于 fixture 33 后历史的
+// seed_submission_factory_epoch()。
 class rdma_cmq_engine_submission_continuation_process_test
   extends rdma_cmq_engine_test;
   `uvm_component_utils(

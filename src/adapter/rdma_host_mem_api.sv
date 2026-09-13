@@ -55,6 +55,18 @@ virtual class rdma_host_mem_api extends uvm_object;
   // 失败/边界：release 发现 owner/generation 不匹配、记录未知或重复释放时返回错误或幂等结果，不重新激活旧句柄。
   pure virtual function rdma_status \release (rdma_dma_mapping mapping);
 
+  // 功能：只读确认本 manager 对指定 opaque allocation 提供 failure-atomic release 契约。
+  // 输入/输出及副作用：mapping 为待验证 authority；基类不访问 backing、不 release 或改 ledger。
+  // 失败/边界：基类无法证明 concrete release 顺序，始终返回 UNSUPPORTED_OPCODE 以 fail closed。
+  virtual function rdma_status validate_failure_atomic_release(
+    rdma_dma_mapping mapping
+  );
+    return rdma_status::make(
+      RDMA_SC_UNSUPPORTED_OPCODE,
+      "Host-memory manager does not advertise failure-atomic release"
+    );
+  endfunction
+
   // 功能：release_opaque 在调用方发现 public mapping 字段异常时，仍使用
   //       manager 内部的不透明 allocation identity 完成一次回滚释放。
   // 输入/输出及副作用：mapping（输入）；成功时释放 manager 所拥有的 backing，

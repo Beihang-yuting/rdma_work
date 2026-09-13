@@ -468,8 +468,8 @@ completion entry registry。
 fence 存在时，所有新 CMQ submit 都在调用 scheduler 前以
 `RDMA_SC_RESOURCE_BUSY + PRE_SUBMIT_REJECTED` 返回；不允许选择其他空 slot 绕过 gap。
 poll、wait、journal query、受控 recovery、reset/FLR 和诊断读取仍可运行。fence 只能在
-同一 batch 成功 arm 为 `PUBLISH_AMBIGUOUS`、reset/FLR 隔离旧 epoch，或后续单独批准的
-安全 abort 后清除；普通 `reconcile(ticket)` 不得自行再敲一次门铃。
+同一 batch 成功 arm 为 `PUBLISH_AMBIGUOUS`、reset/FLR 完成上述 allocation-free commit，
+或后续单独批准的安全 abort 后清除；普通 `reconcile(ticket)` 不得自行再敲一次门铃。
 
 首批只提供两个显式恢复 action，不实现“直接擦除 Host-memory image 并释放”的捷径：
 
@@ -527,11 +527,58 @@ recovery orchestration。batch/attempt 身份无法定位，或 item list 缺项
 数量不符时，`results[]` 为空并返回非空 `INVALID_ARGUMENT`/`INVALID_STATE`，journal、
 attempt 和 fence 完全不变。
 
-`CONFIRM_RESET_ISOLATION` 不能自行发起 reset。只有 reset/FLR coordinator 已证明硬件不再
-访问旧 CMQ、发布新 reset epoch，并把旧 record 转为 `RESET_QUARANTINED` 后，该 action
-才释放旧运行资源并清除 fence；detached diagnostic 继续保留。对 batch 可定位且 item
-list 合法的 action，校验或外部步骤失败都返回逐项非空 result/status，原 journal/fence
-不变。
+reset/FLR 的 observed 生命周期必须严格按以下顺序执行；每个箭头都是不可跳过的提交
+边界：
+
+```text
+mutation-free staging
+    -> confirmed backing release
+    -> allocation-free reset commit / fence clear
+    -> optional replacement prepare
+    -> READY proof
+    -> workflow confirmation
+```
+
+`stage_reset_candidate_locked()` 只能在锁内构造 detached candidate、取消 completion、
+proof 和调用方输出，不能修改 engine-owned map/FIFO/counter/state。只有
+`validate_failure_atomic_release()` 成功后，才可对 staged opaque authority 调用
+`release_opaque()`；null/non-OK 返回必须丢弃 candidate、清空 detached outputs，并逐值
+保留 journal、slot/token/index/cursor、FIFO、counter、state、fence 与 backing authority。
+释放成功后，`commit_reset_candidate_locked()` 是 allocation-free、no-fail 的锁内提交：它
+只写预先存在的 retained rows/proof/completion，清理旧 epoch runtime/preallocation 与
+submission fence，并允许下一次独立 prepare；不得再调用 adapter、scheduler、factory、
+clone、`new`、队列插入或 associative-array 插入。
+
+`CONFIRM_RESET_ISOLATION` 不能自行发起 reset、释放 backing、比较 replacement mapping、
+清除 fence 或调用任何 I/O。它只能消费 engine 已登记且 `READY` 的 proof，在同一锁内重验
+完整 journal/proof digest、ordered tuple、owner permission 和
+`RESET_QUARANTINED/RESET_CANCELLED` 生命周期，然后把尚未解决的 concrete-owner item
+标记为 `reset_isolation_confirmed=1`、`recovery_required=0`。精确
+`LEGACY_UNMIGRATED` sentinel 在确认 backing release 的 reset commit 中立即得到这两个
+resolved 值，因此不需要伪造 workflow confirmation；detached diagnostic/proof 仍保留。
+对 batch 可定位且 item list 合法的 action，校验失败返回逐项非空 result/status，原
+journal/fence 不变。
+
+reset 的公开 seam 固定为：
+
+```systemverilog
+task reset_observed(
+  output rdma_cmq_completion completions[$],
+  output rdma_cmq_reset_isolation_proof proofs[],
+  output rdma_status status
+);
+
+task query_reset_isolation_proof(
+  input string proof_key,
+  output rdma_cmq_reset_isolation_proof proof,
+  output rdma_status status
+);
+```
+
+Host-memory adapter 必须在 reset staging 前提供只读的
+`validate_failure_atomic_release(mapping)` capability；validator 不释放、不 seal、不改
+ledger，unsupported/default mapping 必须 fail closed。只有明确 advertised 且返回 OK 的
+adapter 才能进入上述 release/commit 顺序。
 
 reset-isolation proof 使用四态状态：
 
@@ -544,14 +591,15 @@ typedef enum logic [1:0] {
 ```
 
 公开构造出的 proof 只有 `INVALID`，不能凭字段相似自行取得 authority。
-`AWAITING_REBIND` 要求 backing release 已确认且仍引用旧 identity；`READY` 还要求新
-identity 保持相同 immutable Function、reset epoch 严格递增。proof 保存 proof/batch/
-attempt/engine identity、isolated/replacement identity、batch digest、release
-confirmation，以及有序四字段 tuple `{request_index, image_digest, authority_digest,
-full recovery_owner}`。四个 tuple 数组必须非空、等长、同序；所有 enum/mask 在索引或
-迁移前拒绝 X/Z/spare。replacement identity、proof state 和 release-confirmation 不进入
-稳定 proof digest，但完整值相等和合法迁移校验仍然必需，匹配 digest 本身永不授权
-recovery。
+`AWAITING_REBIND` 只由成功的 backing release commit 产生，并仍引用旧 identity；释放
+后 engine 已可准备独立的新 backing。可选 replacement prepare 只有在 ACTIVE 成功建立、
+且新 identity 保持相同 immutable Function、reset epoch 严格递增时，才把 proof 提升为
+`READY`。proof 保存 proof/batch/attempt/engine identity、isolated/replacement identity、
+batch digest、release confirmation，以及有序四字段 tuple `{request_index, image_digest,
+authority_digest, full recovery_owner}`。四个 tuple 数组必须非空、等长、同序；所有
+enum/mask 在索引或迁移前拒绝 X/Z/spare。replacement identity、proof state 和
+release-confirmation 不进入稳定 proof digest，但完整值相等和合法迁移校验仍然必需，
+匹配 digest 本身永不授权 recovery。
 
 若未来需要 erase/abort，必须另立规格并提供原始 preimage、排他 mapping ownership、
 DMA/read fence 和硬件绝不会读取该 slot 的证明；本规格不允许通过写零或覆盖 SQE 来
@@ -567,9 +615,10 @@ effect 达到 `MMIO_MAYBE_VISIBLE` 后，整批 record 保持 `PUBLISH_AMBIGUOUS
 `PUBLISH_CONFIRMED`，slot/entry key 持续由该 batch 独占；outstanding/ambiguous token
 同样不能提前复用，其中 ambiguous 和 timeout 状态进入 quarantine，正常 confirmed 状态
 按普通 outstanding 管理。禁止重复 doorbell，也禁止提前复用 entry key。reset/FLR 将
-未终态 record 转成 `RESET_QUARANTINED`，释放旧 epoch 运行资源，但保留 detached
-diagnostic record；旧 epoch late completion 只能进入 diagnostic，绝不能修改新 epoch
-的 slot/token/result。
+未终态 record 转成 `RESET_QUARANTINED`；上述 allocation-free commit 释放旧 epoch 运行
+资源、清除 fence，但保留 journal-owned detached diagnostic/proof record，使新 epoch 可
+独立 prepare。旧 epoch late completion 只能进入 diagnostic，绝不能修改新 epoch 的
+slot/token/result。
 
 timeout 时软件 command registry 和可分配 token 是否释放，保持现有
 incarnation-safe characterization；无论该实现细节如何，slot、entry registry、原 ticket、
@@ -600,6 +649,14 @@ token incarnation 和 epoch 必须保留到 `LATE_COMPLETED` 的有序 retire �
 `PENDING` 时它才允许为空；`TERMINAL`、`TIMEOUT`、`RESET_CANCELLED` 和
 `DIAGNOSTIC_ONLY` 必须保留 public wait/reconcile/execute 所使用的同一完整 completion
 值。FIFO 只可作为 delivery-order index；pop FIFO 绝不能销毁 retained journal evidence。
+
+legacy `reconcile_ticket()` 是只读 journal projection，不是 recovery action。它先按稳定
+ticket index 和完整 ticket equality 定位 retained item；只有当前 active incarnation 的
+`PUBLISH_AMBIGUOUS` 或 `PUBLISH_CONFIRMED/PENDING` 才允许一次普通 poll/expire，所有
+terminal、timeout、late、reset 或未 arm 的 fenced row 都只返回 retained detached evidence。
+它不调用 `RETRY_PUBLISH`、不敲门铃、不消费 retained completion，也不因当前 runtime 已是
+新 incarnation 而拒绝旧 reset ticket；`STAGED/PENDING_EFFECT` 则 fail-closed 且不改
+任何 effect 或 recovery bit。
 
 `submit_batch_observed()` 对输入逐项返回 result，顺序和数组长度必须与 requests 完全
 一致。共享一次 doorbell 的条目共享 batch ID 和 batch-level effect，但每条 result、
@@ -991,6 +1048,24 @@ result 只属于本次调用，禁止放在 adapter 的 `last_*` 成员中。并
 Function 的相邻调用不能覆盖彼此证据。命令在第一次可能的外部 I/O 前进入 submission
 journal；effect 随 slot/ticket record 持久保存，供 timeout、reset、cancel、reconcile
 和 late completion 继续投影。
+
+reset 的 completion/proof 输出同样是本次调用的 detached projection：
+`reset_observed()` 必须先完成 mutation-free staging 和
+`validate_failure_atomic_release()`，再执行 confirmed release 与 allocation-free commit。
+release 返回 null/non-OK 时，outputs 清空且 result/status 非空；journal、fence、runtime
+authority、FIFO、counter 和 engine state 逐值不变。成功 commit 后旧 backing/fence 已经
+释放，允许独立 replacement prepare；它不等待或要求 replacement mapping 等于旧 mapping。
+`AWAITING_REBIND` proof 只表示旧 backing 已隔离，`READY` 还要求同一 immutable Function
+的严格更大 reset epoch。`CONFIRM_RESET_ISOLATION` 只验证 journal-resident READY proof、
+完整 digest/tuple 和 owner permission，并把 concrete-owner rows 标记 resolved；它不
+发起 reset、不释放 backing、不清 fence、不调用 scheduler/Host-memory/PCIe。精确
+`LEGACY_UNMIGRATED` sentinel 在 release commit 立即得到 `recovery_required=0`，而
+concrete owner 在 workflow confirmation 前保持 `recovery_required=1`。
+
+reconcile 的返回必须遵守 §4.4.1 的只读表：terminal/timeout/late/reset completion
+来自 retained journal，重复查询返回值相等但图分离的 snapshot；unarmed fenced ticket
+不产生 scheduler/MMIO；旧 epoch reset ticket 在新 incarnation ACTIVE 后仍可读取旧证据。
+FIFO 只负责 delivery order，不能成为 completion 或 recovery authority。
 
 显式 `rdma_cmq_nonfatal_snapshot_context` 由 direct `new` 构造，不登记 factory。每个方法
 入口先清空 output/reason，只用 direct construction 与显式 scalar/byte copy，绝不调用
@@ -1442,12 +1517,24 @@ if (!status.ok())
    覆盖 ID overflow、retry 前 authority/hash 漂移、ambiguous 禁止 retry 和 reset 隔离。
    还要并发提交相同 expected attempt 的重复 retry，证明只有一次 scheduler I/O，并验证
    stale/非法 item list 的 results 基数与 journal 原子性。
+5. reset/FLR 的实现与测试必须固定为
+   `mutation-free staging -> confirmed backing release -> allocation-free reset commit/fence
+   clear -> optional replacement prepare -> READY proof -> workflow confirmation`；release
+   失败不得先执行 destructive cancel/clear，commit 后新 backing 可独立 prepare，且
+   `CONFIRM_RESET_ISOLATION` 不得再次释放旧 backing、清 fence 或调用 I/O。
 
 ### 阶段 1B：恢复调用方分项迁移
 
 MR control-plane、queue-lifecycle 和 QP-lifecycle 分成三个独立小计划/提交，依次迁移到
 `execute_observed()` 的 result-based presence/recovery 判断。每次只改一个 consumer 及其
 测试，不拆对应大单体；未迁移 consumer 继续走 legacy API 并保持保守行为。
+
+reset proof 的 workflow confirmation 只能消费 engine 已登记的 READY proof；旧 runtime
+authority 与 fence 在 reset commit 已清除，replacement 只用于证明同一 immutable Function
+的更大 reset epoch。精确 `LEGACY_UNMIGRATED` sentinel 在 release commit 即 resolved，
+concrete owner 则保持 `recovery_required=1`，直到获授权 workflow 完成 CONFIRM。所有
+consumer 的 reconcile 必须继续使用 journal-owned、old-epoch-safe 的只读 projection，
+不能把 FIFO delivery row 或当前 runtime authority 当作 recovery authority。
 
 全部生产调用方迁移后，才能停止写入/读取 adapter 级 `last_*` 证据，并让
 `last_execute_definitive_no_submit()` 固定返回保守 false。不得在中途把 status code
@@ -1545,9 +1632,10 @@ SIGSEGV 是已知阻断项，不能用删业务逻辑或跳过测试掩盖；若
   可被 poll、reconcile 和 late-completion 路径定位，且不得重复 doorbell。
 - observer 为 null 的普通 scheduler/legacy 调用不执行 hook，但仍返回非空 status/effect；
   所有 batch item status 和 batch status 满足 §5.2 的空 batch/部分拒绝/全局失败表。
-- pre-MMIO fence 期间所有新 submit 返回 `RESOURCE_BUSY + PRE_SUBMIT_REJECTED`；只有原
-  batch 的严格同 image/authority retry 或已证明的 reset isolation 能清除 fence，失败
-  recovery 不丢 journal。
+- pre-MMIO fence 期间所有新 submit 返回 `RESOURCE_BUSY + PRE_SUBMIT_REJECTED`；严格同
+  image/authority retry 可以在原 batch 上推进，reset/FLR 只有完成 confirmed release 与
+  allocation-free commit 才清除 fence，失败 recovery 不丢 journal；
+  `CONFIRM_RESET_ISOLATION` 本身不得释放 backing 或清 fence。
 - 两个相同 expected-attempt retry 只有一个递增并调用 scheduler；另一个稳定返回 stale
   failure。合法 recovery request 的 results 等长同序，无法定位/结构非法的 request 返回
   空 results，且两条失败路径都不改变 journal/fence。
@@ -1555,6 +1643,19 @@ SIGSEGV 是已知阻断项，不能用删业务逻辑或跳过测试掩盖；若
   cursor 或 completion result。
 - timeout 后 `TIMED_OUT_QUARANTINED` 保留旧 slot/entry/ticket/epoch，直到 late completion
   有序 retire 或 reset 隔离；timeout completion phase 本身不得触发 slot 复用。
+- reset release 失败/null status 必须在任何 destructive cancel/clear 之前返回，且逐值保留
+  journal、fence、preallocation、observer、slot/token/index、cursor、FIFO、counter、
+  engine state 与 backing authority；成功路径必须证明
+  `mutation-free staging -> confirmed backing release -> allocation-free reset commit` 的
+  顺序，并允许独立 replacement prepare。
+- 每个受影响 batch 的 `AWAITING_REBIND` proof 必须保留 batch/proof digest 与等长有序
+  `{request_index, image_digest, authority_digest, full recovery_owner}` tuple；只有同一
+  immutable Function 的严格更大 reset epoch 才能提升为 `READY`。精确
+  `LEGACY_UNMIGRATED` sentinel 在 reset commit 即 `recovery_required=0`，具体 owner
+  在 workflow confirmation 前保持 `1`。
+- `reconcile_ticket()` 必须按 retained journal 的完整 ticket authority 只读投影；FIFO
+  消费、当前新 incarnation 或旧 completion 的 detached snapshot 不得删除/改写 journal
+  evidence，也不得触发 retry 或重复 doorbell。
 - legacy `execute()` 的 ticket/completion/status/message 与 observed 投影逐字段一致；
   legacy subclass effect 恒为 `UNOBSERVED`，production adapter 不保存共享 `last_*` 证据。
 - 任何 wire capability 变化都同时具备 archive/ownership/C-oracle/vector/mutation 证据；

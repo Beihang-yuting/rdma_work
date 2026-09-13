@@ -24,6 +24,7 @@ ENGINE_PROCESS_TESTS = [
     "rdma_cmq_engine_test",
     "rdma_cmq_engine_capacity_process_test",
     "rdma_cmq_engine_submission_process_test",
+    "rdma_cmq_engine_submission_matrix_process_test",
     "rdma_cmq_engine_submission_continuation_process_test",
     "rdma_cmq_engine_invariant_process_test",
     "rdma_cmq_engine_raw_snapshot_process_test",
@@ -181,13 +182,13 @@ class CmqGateManifestTest(unittest.TestCase):
         mutation_pos = regression.index("rdma_cmq_driver_field_mutation_test")
         self.assertGreater(mutation_pos, profile_pos)
 
-    # 功能：冻结一个 engine 逻辑行到十三物理进程的合法、唯一且有序映射，防止 process shard 泄漏到公开 gate。
+    # 功能：冻结一个 engine 逻辑行到十四物理进程的合法、唯一且有序映射，防止 process shard 泄漏到公开 gate。
     # 输入输出及副作用：读取 process/cmq/CORE_TESTS 清单并执行断言；不修改 runner 或清单。
     # 失败边界：物理项缺失、重复、非法、乱序，或逻辑行不再 exact-once 时测试失败。
     def test_engine_process_manifest(self):
         process_rows = self._engine_process_rows()
         self.assertEqual(process_rows, ENGINE_PROCESS_TESTS)
-        self.assertEqual(len(process_rows), 13)
+        self.assertEqual(len(process_rows), 14)
         self.assertEqual(len(process_rows), len(set(process_rows)))
         self.assertTrue(all(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", row)
                             for row in process_rows))
@@ -205,7 +206,7 @@ class CmqGateManifestTest(unittest.TestCase):
             self.assertNotIn(process_test, logical_rows)
             self.assertNotIn(process_test, core_block.group(1))
 
-    # 功能：冻结十三 leaf 的 UVM 注册及 run_phase 展平后六十四个逻辑 fixture 的 exact-once 原始顺序。
+    # 功能：冻结十四 leaf 的 UVM 注册及 run_phase 展平后六十四个逻辑 fixture 的 exact-once 原始顺序。
     # 输入输出及副作用：只读解析 engine test 源码并断言 class/宏/调用列表；不运行仿真。
     # 失败边界：leaf 未注册、fixture 漏跑/重复/乱序或被跨 shard 拆分时测试失败。
     def test_engine_process_fixture_inventory(self):
@@ -242,7 +243,7 @@ class CmqGateManifestTest(unittest.TestCase):
         self.assertEqual(len(flattened_calls), len(set(flattened_calls)))
 
     # 功能：证明 observed retention 的两个物理调用以 inclusive bounds 有序、无重叠地精确覆盖 row 0..14。
-    # 输入输出及副作用：只读解析十三个 leaf 的 run_phase 与 bounded task 声明；返回 unittest 断言结果，不运行仿真。
+    # 输入输出及副作用：只读解析十四个 leaf 的 run_phase 与 bounded task 声明；返回 unittest 断言结果，不运行仿真。
     # 失败边界：task 不是显式双边界接口、range 数量/顺序/调用 leaf 漂移，或出现 gap/overlap/越界时测试失败。
     def test_observed_retention_range_partition(self):
         source = (ROOT / "tests" / "unit" /
@@ -275,7 +276,7 @@ class CmqGateManifestTest(unittest.TestCase):
         self.assertEqual(
             calls,
             [
-                ("rdma_cmq_engine_submission_process_test", 0, 2),
+                ("rdma_cmq_engine_submission_matrix_process_test", 0, 2),
                 ("rdma_cmq_engine_submission_continuation_process_test",
                  3, 14),
             ],
@@ -334,7 +335,7 @@ class CmqGateManifestTest(unittest.TestCase):
         self.assertEqual(makefile.count(invocation), 3)
 
     # 功能：用可控 simulator/checker 执行 runner，证明普通 self-map 与 engine
-    #   十三片 strict all-of。
+    #   十四片 strict all-of。
     # 输入输出及副作用：在 TemporaryDirectory 创建伪程序、清单、调用记录与
     #   日志；返回 unittest 断言结果并自动回收。
     # 失败边界：任一 leaf 未尝试、checker 非恰好一次、日志复用、失败码丢失
@@ -478,7 +479,7 @@ fi
                         transcript,
                     )
 
-    # 功能：验证 runner 对缺失 CLI 参数和非十三项 engine manifest 失败关闭，
+    # 功能：验证 runner 对缺失 CLI 参数和非十四项 engine manifest 失败关闭，
     #   不启动任何 simulator。
     # 输入输出及副作用：在 TemporaryDirectory 创建空可执行依赖和畸形清单；
     #   捕获子进程状态与诊断后自动回收。
@@ -534,7 +535,7 @@ fi
                 check=False,
             )
             self.assertEqual(malformed_manifest.returncode, 2)
-            self.assertIn("exactly thirteen", malformed_manifest.stderr)
+            self.assertIn("exactly fourteen", malformed_manifest.stderr)
 
 
 if __name__ == "__main__":

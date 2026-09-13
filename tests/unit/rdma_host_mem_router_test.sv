@@ -86,6 +86,32 @@ class rdma_test_host_mgr extends rdma_host_mem_api;
   function rdma_status \release (rdma_dma_mapping mapping);
     return rdma_status::success();
   endfunction
+
+  // 功能：声明本测试 manager 的 release_opaque 对 active mapping 满足 failure-atomic 契约。
+  // 输入/输出及副作用：mapping 为只读输入；不执行 release，也不修改 mapping 或测试状态。
+  // 失败/边界：mapping 为空或非 ACTIVE 时返回错误；不为未知生命周期猜测能力。
+  virtual function rdma_status validate_failure_atomic_release(
+    rdma_dma_mapping mapping
+  );
+    if (mapping == null)
+      return rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT,
+        "test failure-atomic mapping is null"
+      );
+    if (mapping.state != RDMA_MAPPING_ACTIVE)
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "test failure-atomic mapping is not active"
+      );
+    return rdma_status::success();
+  endfunction
+
+  // 功能：为 router 的 opaque 路径模拟一次成功释放，并保留普通 release 的测试语义。
+  // 输入/输出及副作用：mapping 为释放目标；委托 release，不持有 router parallel ledger。
+  // 失败/边界：普通 release 的拒绝结果原样返回；本 helper 不伪造额外 identity。
+  virtual function rdma_status release_opaque(rdma_dma_mapping mapping);
+    return \release (mapping);
+  endfunction
 endclass
 
 // 功能：构造一个“分配成功但返回 mapping 路由被篡改”的 Host-memory manager，
@@ -140,6 +166,84 @@ class rdma_malformed_host_mgr extends rdma_mock_host_mem;
   virtual function rdma_status release_opaque(rdma_dma_mapping mapping);
     opaque_release_calls++;
     return super.release_opaque(mapping);
+  endfunction
+endclass
+
+// 中文设计：router 的 failure-atomic 测试需要把 validator 与实际 release 两个
+// 外部返回点分别置为 non-OK/null，同时保留 mock 的真实 opaque allocation ledger。
+// 该 fixture 只增加一次性故障与调用计数，不替代 mock 的 identity 校验。
+class rdma_failure_atomic_router_mgr extends rdma_mock_host_mem;
+  `uvm_object_utils(rdma_failure_atomic_router_mgr)
+
+  int unsigned validation_calls;
+  int unsigned opaque_release_calls;
+  bit return_null_validation_once;
+  bit return_null_release_once;
+  rdma_status next_validation_failure;
+
+  // 功能：构造 failure-atomic router manager，并清零一次性故障和调用计数。
+  // 输入/输出及副作用：name 为 UVM 对象名；只初始化测试控制字段，不分配 backing。
+  // 失败/边界：默认无故障；只有测试显式设置的下一次调用会偏离父类行为。
+  function new(string name = "rdma_failure_atomic_router_mgr");
+    super.new(name);
+    validation_calls = 0;
+    opaque_release_calls = 0;
+    return_null_validation_once = 1'b0;
+    return_null_release_once = 1'b0;
+    next_validation_failure = null;
+  endfunction
+
+  // 功能：记录 capability 查询，并可在委托真实 mock identity 校验前注入一次 null/non-OK。
+  // 输入/输出及副作用：mapping 为只读 opaque authority；递增 validation_calls，消费一次故障。
+  // 失败/边界：null/non-OK 注入不修改 region、mapping、release seal 或 bytes。
+  virtual function rdma_status validate_failure_atomic_release(
+    rdma_dma_mapping mapping
+  );
+    rdma_status failure;
+
+    validation_calls++;
+    if (return_null_validation_once) begin
+      return_null_validation_once = 1'b0;
+      return null;
+    end
+    if (next_validation_failure != null) begin
+      failure = next_validation_failure;
+      next_validation_failure = null;
+      return failure;
+    end
+    return super.validate_failure_atomic_release(mapping);
+  endfunction
+
+  // 功能：记录 opaque release，并可在父类 seal/region mutation 前返回一次 null。
+  // 输入/输出及副作用：mapping 为释放 authority；递增 opaque_release_calls，成功才委托父类。
+  // 失败/边界：null 注入保持 allocation 可读可重试；其他失败由父类原样返回。
+  virtual function rdma_status release_opaque(rdma_dma_mapping mapping);
+    opaque_release_calls++;
+    if (return_null_release_once) begin
+      return_null_release_once = 1'b0;
+      return null;
+    end
+    return super.release_opaque(mapping);
+  endfunction
+endclass
+
+// 中文设计：parallel ledger 是 router 自己的 authority；测试只暴露只读行数，
+// 避免用 reconfigure 的间接结果替代“失败分支未删除 exact row”的断言。
+class rdma_host_mem_router_probe extends rdma_host_mem_router;
+  `uvm_object_utils(rdma_host_mem_router_probe)
+
+  // 功能：构造空 router probe；全部生产状态和生命周期仍由父类维护。
+  // 输入/输出及副作用：name 为 UVM 对象名；仅调用父类构造，不创建 manager/backing。
+  // 失败/边界：未 configure 时 ledger_count 返回零，其他业务入口沿父类拒绝。
+  function new(string name = "rdma_host_mem_router_probe");
+    super.new(name);
+  endfunction
+
+  // 功能：只读返回 router 当前 mapping parallel ledger 行数，供 failure-atomic 断言。
+  // 输入/输出及副作用：无输入；返回 m_maps.size()，不暴露可变 row handle。
+  // 失败/边界：空 ledger 返回零；函数不调用 manager 或修改任一 parallel array。
+  function int unsigned ledger_count();
+    return m_maps.size();
   endfunction
 endclass
 
@@ -199,9 +303,21 @@ class rdma_host_mem_router_test extends uvm_test;
     rdma_host_mem_route_entry malformed_entry;
     rdma_dma_mapping detached_mapping, detached_authority;
     rdma_dma_mapping malformed_mapping;
+    rdma_host_mem_router_probe atomic_router;
+    rdma_failure_atomic_router_mgr atomic_manager;
+    rdma_mock_host_mem foreign_manager;
+    rdma_host_mem_route_entry atomic_entry;
+    rdma_host_mem_route_entry atomic_entries[$];
+    rdma_dma_mapping atomic_mapping;
+    rdma_dma_mapping atomic_authority;
+    rdma_dma_mapping foreign_mapping;
+    rdma_dma_mapping default_mapping;
     rdma_status authority_status;
     rdma_host_mem_route_entry detached_entries[$];
     byte data[];
+    byte atomic_bytes[] = '{8'h19, 8'h2a, 8'h3b, 8'h4c};
+    bit release_done;
+    int unsigned validation_calls_before;
     rdma_status status;
 
     phase.raise_objection(this);
@@ -333,6 +449,175 @@ class rdma_host_mem_router_test extends uvm_test;
         malformed_manager.opaque_release_calls))
     if (malformed_manager.live_allocations() != 0)
       `uvm_error("HOST_ROUTE", "malformed mapping rollback leaked backing")
+
+    // validator/release 必须先由 router 的 opaque row 选择 stored manager。
+    // caller route 即使被篡改，也不能把 release 改投到另一 Host 或提前删 ledger。
+    atomic_router = rdma_host_mem_router_probe::type_id::create(
+      "failure_atomic_router"
+    );
+    atomic_manager = rdma_failure_atomic_router_mgr::type_id::create(
+      "failure_atomic_manager"
+    );
+    atomic_entry = rdma_host_mem_route_entry::type_id::create(
+      "failure_atomic_entry"
+    );
+    atomic_entry.host_topology_key = 0;
+    atomic_entry.manager = atomic_manager;
+    atomic_entries.push_back(atomic_entry);
+    status = atomic_router.configure(atomic_entries);
+    if (status == null || !status.ok())
+      `uvm_fatal("FAILURE_ATOMIC_ROUTE", "router configure failed")
+    status = atomic_router.allocate(
+      context0, 64, 8, RDMA_DMA_BIDIRECTIONAL, atomic_mapping
+    );
+    if (status == null || !status.ok() || atomic_mapping == null)
+      `uvm_fatal("FAILURE_ATOMIC_ROUTE", "router allocation failed")
+    status = atomic_router.write(atomic_mapping, 0, atomic_bytes);
+    if (status == null || !status.ok())
+      `uvm_fatal("FAILURE_ATOMIC_ROUTE", "router seed write failed")
+    authority_status = atomic_mapping.snapshot_release_authority(
+      atomic_authority
+    );
+    if (authority_status == null || !authority_status.ok() ||
+        atomic_authority == null)
+      `uvm_fatal("FAILURE_ATOMIC_ROUTE", "authority snapshot failed")
+    atomic_authority.copy(atomic_mapping);
+    atomic_authority.route.host_topology_key = 32'hffff_fffe;
+
+    status = atomic_router.validate_failure_atomic_release(
+      atomic_authority
+    );
+    if (status == null || !status.ok() ||
+        atomic_manager.validation_calls != 1 ||
+        atomic_manager.opaque_release_calls != 0 ||
+        atomic_router.ledger_count() != 1 ||
+        atomic_manager.live_allocations() != 1)
+      `uvm_error(
+        "FAILURE_ATOMIC_ROUTE_VALIDATE",
+        "read-only validation changed ledger or selected the caller route"
+      )
+    status = atomic_router.read(
+      atomic_mapping, 0, atomic_bytes.size(), data
+    );
+    if (status == null || !status.ok() || data != atomic_bytes)
+      `uvm_error(
+        "FAILURE_ATOMIC_ROUTE_VALIDATE_READ",
+        "validation changed active allocation bytes"
+      )
+
+    validation_calls_before = atomic_manager.validation_calls;
+    default_mapping = rdma_dma_mapping::type_id::create(
+      "failure_atomic_route_default"
+    );
+    status = atomic_router.validate_failure_atomic_release(default_mapping);
+    if (status == null || status.ok() ||
+        atomic_manager.validation_calls != validation_calls_before)
+      `uvm_error(
+        "FAILURE_ATOMIC_ROUTE_UNKNOWN",
+        "unknown mapping reached the stored manager"
+      )
+    foreign_manager = rdma_mock_host_mem::type_id::create(
+      "failure_atomic_foreign_manager"
+    );
+    status = foreign_manager.allocate(
+      context0, 64, 8, RDMA_DMA_BIDIRECTIONAL, foreign_mapping
+    );
+    if (status == null || !status.ok() || foreign_mapping == null)
+      `uvm_fatal("FAILURE_ATOMIC_ROUTE", "foreign allocation failed")
+    status = atomic_router.validate_failure_atomic_release(foreign_mapping);
+    if (status == null || status.ok() ||
+        atomic_manager.validation_calls != validation_calls_before)
+      `uvm_error(
+        "FAILURE_ATOMIC_ROUTE_FOREIGN",
+        "foreign allocation reached the stored manager"
+      )
+
+    atomic_manager.next_validation_failure = rdma_status::make(
+      RDMA_SC_UNKNOWN_HW_ERROR,
+      "injected router manager validation failure"
+    );
+    status = atomic_router.release_opaque(atomic_authority);
+    if (status == null || status.code != RDMA_SC_UNKNOWN_HW_ERROR ||
+        atomic_manager.opaque_release_calls != 0 ||
+        atomic_router.ledger_count() != 1 ||
+        atomic_manager.live_allocations() != 1)
+      `uvm_error(
+        "FAILURE_ATOMIC_ROUTE_VALIDATION_FAILURE",
+        "validator failure reached release or changed ledger"
+      )
+    atomic_manager.return_null_validation_once = 1'b1;
+    status = atomic_router.release_opaque(atomic_authority);
+    if (status == null || status.code != RDMA_SC_INVALID_STATE ||
+        atomic_manager.opaque_release_calls != 0 ||
+        atomic_router.ledger_count() != 1 ||
+        atomic_manager.live_allocations() != 1)
+      `uvm_error(
+        "FAILURE_ATOMIC_ROUTE_NULL_VALIDATION",
+        "null validator result reached release or changed ledger"
+      )
+
+    status = atomic_manager.fail_next(
+      "release_opaque",
+      rdma_status::make(
+        RDMA_SC_UNKNOWN_HW_ERROR,
+        "injected router manager release failure"
+      )
+    );
+    if (status == null || !status.ok())
+      `uvm_fatal("FAILURE_ATOMIC_ROUTE", "release injection failed")
+    status = atomic_router.release_opaque(atomic_authority);
+    if (status == null || status.code != RDMA_SC_UNKNOWN_HW_ERROR ||
+        atomic_router.ledger_count() != 1 ||
+        atomic_manager.live_allocations() != 1)
+      `uvm_error(
+        "FAILURE_ATOMIC_ROUTE_RELEASE_FAILURE",
+        "non-OK manager release changed router or manager ledger"
+      )
+    atomic_manager.return_null_release_once = 1'b1;
+    status = atomic_router.release_opaque(atomic_authority);
+    if (status == null || status.code != RDMA_SC_INVALID_STATE ||
+        atomic_router.ledger_count() != 1 ||
+        atomic_manager.live_allocations() != 1)
+      `uvm_error(
+        "FAILURE_ATOMIC_ROUTE_NULL_RELEASE",
+        "null manager release changed router or manager ledger"
+      )
+    release_done = 1'b1;
+    authority_status = atomic_mapping.release_completion_status(release_done);
+    status = atomic_router.read(
+      atomic_mapping, 0, atomic_bytes.size(), data
+    );
+    if (authority_status == null || !authority_status.ok() || release_done ||
+        status == null || !status.ok() || data != atomic_bytes)
+      `uvm_error(
+        "FAILURE_ATOMIC_ROUTE_RETRYABLE",
+        "failed release changed seal, bytes or read authority"
+      )
+
+    status = atomic_router.release_opaque(atomic_authority);
+    if (status == null || !status.ok() ||
+        atomic_router.ledger_count() != 0 ||
+        atomic_manager.live_allocations() != 0)
+      `uvm_error(
+        "FAILURE_ATOMIC_ROUTE_RETRY",
+        "successful retry did not retire exact ledger row"
+      )
+    release_done = 1'b0;
+    authority_status = atomic_mapping.release_completion_status(release_done);
+    if (authority_status == null || !authority_status.ok() || !release_done)
+      `uvm_error(
+        "FAILURE_ATOMIC_ROUTE_FINAL_SEAL",
+        "successful release did not complete shared seal"
+      )
+    status = atomic_router.validate_failure_atomic_release(atomic_mapping);
+    if (status == null || status.ok())
+      `uvm_error(
+        "FAILURE_ATOMIC_ROUTE_RELEASED",
+        "released router mapping retained capability"
+      )
+    status = foreign_manager.release_opaque(foreign_mapping);
+    if (status == null || !status.ok())
+      `uvm_error("FAILURE_ATOMIC_ROUTE_FOREIGN", "foreign cleanup failed")
     phase.drop_objection(this);
   endtask
 endclass

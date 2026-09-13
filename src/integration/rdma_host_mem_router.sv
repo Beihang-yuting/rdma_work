@@ -353,6 +353,84 @@ class rdma_host_mem_router extends rdma_host_mem_api;
     return status;
   endfunction
 
+  // 功能：按 opaque allocation identity 唯一定位 router row，并向该 row 的 stored manager 做只读能力查询。
+  // 输入/输出及副作用：mapping 为待验证 authority；只读 parallel ledger 与 manager，不 release 或删除 row。
+  // 失败/边界：未知/歧义 row、stored manager 缺失及 manager null/non-OK 均 fail closed 且保持 ledger。
+  virtual function rdma_status validate_failure_atomic_release(
+    rdma_dma_mapping mapping
+  );
+    rdma_host_mem_api manager;
+    rdma_status status;
+    int index;
+    int unsigned host_key;
+
+    index = find_mapping(mapping);
+    if (index < 0)
+      return rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT,
+        "failure-atomic router mapping is unknown or ambiguous"
+      );
+    host_key = m_map_routes[index].host_topology_key;
+    if (!m_managers.exists(host_key) || m_managers[host_key] == null)
+      return rdma_status::make(
+        RDMA_SC_DMA_TRANSLATION,
+        "failure-atomic router stored manager is unavailable"
+      );
+    manager = m_managers[host_key];
+    status = manager.validate_failure_atomic_release(mapping);
+    if (status == null)
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "Host manager failure-atomic validation returned null"
+      );
+    return status;
+  endfunction
+
+  // 功能：按 router retained opaque row 选择 stored manager，验证能力后执行 failure-atomic release。
+  // 输入/输出及副作用：mapping 为释放 authority；manager 非空 OK 后同步删除 exact parallel-ledger row。
+  // 失败/边界：lookup/validator/release 的 null 或 non-OK 均在删除前返回，保留 read/retry authority。
+  virtual function rdma_status release_opaque(rdma_dma_mapping mapping);
+    rdma_host_mem_api manager;
+    rdma_status status;
+    int index;
+    int unsigned host_key;
+
+    index = find_mapping(mapping);
+    if (index < 0)
+      return rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT,
+        "opaque router mapping is unknown or ambiguous"
+      );
+    host_key = m_map_routes[index].host_topology_key;
+    if (!m_managers.exists(host_key) || m_managers[host_key] == null)
+      return rdma_status::make(
+        RDMA_SC_DMA_TRANSLATION,
+        "opaque router stored manager is unavailable"
+      );
+    manager = m_managers[host_key];
+
+    status = manager.validate_failure_atomic_release(mapping);
+    if (status == null)
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "Host manager failure-atomic validation returned null"
+      );
+    if (!status.ok())
+      return status;
+
+    status = manager.release_opaque(mapping);
+    if (status == null)
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "Host manager opaque release returned null"
+      );
+    if (!status.ok())
+      return status;
+
+    delete_mapping_ledgers(index);
+    return status;
+  endfunction
+
   // 功能：推进指定 Host 的 router-local epoch，使该 Host 上已有 mapping 在下一次访问时失效。
   // 输入/输出及副作用：host_topology_key（输入）；仅当该 Host 已配置时递增 router-local epoch，
   //   不创建路由、不直接释放 mapping。
