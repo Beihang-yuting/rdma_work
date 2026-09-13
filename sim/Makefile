@@ -17,73 +17,20 @@ VCS_FLAGS := -full64 -sverilog -ntb_opts uvm-1.2 -timescale=1ns/1ps -debug_acces
 SHELL := /bin/bash
 .SHELLFLAGS := -o pipefail -c
 ENGINE_PROCESS_LIST := rdma_cmq_engine_process.list
+CORE_LOGICAL_RUNNER := ../scripts/run_core_logical_test.sh
 
-# 一个逻辑 core test 只经此处解析为物理 simulator process；普通测试映射到自身，
-# engine umbrella 从固定清单展开。每片分别保存原始日志并运行 strict summary，任何
-# simulator 或 summary 失败都保留为逻辑失败，绝不拼接或合成 UVM summary。
+# 功能：把一个 logical core test 转交给唯一 controller；普通 test 自映射，
+#   engine 按十三片展开。
+# 输入输出及副作用：参数 1 是 logical UVM test，参数 2 是含 simv 的 build
+#   目录；写每片独立 log 并打印聚合状态。
+# 失败边界：controller 对参数、manifest、simulator 或 summary 任一失败返回
+#   非零；Make 不保留第二份 fan-out 逻辑。
 define RUN_CORE_LOGICAL_TEST
-	logical_test="$(strip $(1))"; \
-	logical_build="$(strip $(2))"; \
-	physical_tests=(); \
-	if [[ "$$logical_test" == "rdma_cmq_engine_test" ]]; then \
-		process_manifest="$(ENGINE_PROCESS_LIST)"; \
-		[[ -r "$$process_manifest" ]] || { \
-			echo "engine process manifest is missing: $$process_manifest" >&2; \
-			exit 2; \
-		}; \
-		mapfile -t physical_tests < <( \
-			sed -e 's/[[:space:]]*\#.*$$//' \
-			    -e '/^[[:space:]]*$$/d' "$$process_manifest" \
-		); \
-		(( $${#physical_tests[@]} == 12 )) || { \
-			echo "engine process manifest requires exactly twelve tests" >&2; \
-			exit 2; \
-		}; \
-		[[ "$${physical_tests[0]}" == "$$logical_test" ]] || { \
-			echo "engine process manifest must start with $$logical_test" >&2; \
-			exit 2; \
-		}; \
-		unset process_seen; \
-		declare -A process_seen=(); \
-		for physical_test in "$${physical_tests[@]}"; do \
-			[[ "$$physical_test" =~ ^[A-Za-z_][A-Za-z0-9_]*$$ ]] || { \
-				echo "invalid engine process test: $$physical_test" >&2; \
-				exit 2; \
-			}; \
-			[[ -z "$${process_seen[$$physical_test]+x}" ]] || { \
-				echo "duplicate engine process test: $$physical_test" >&2; \
-				exit 2; \
-			}; \
-			process_seen[$$physical_test]=1; \
-		done; \
-	else \
-		[[ "$$logical_test" =~ ^[A-Za-z_][A-Za-z0-9_]*$$ ]] || { \
-			echo "invalid core test: $$logical_test" >&2; \
-			exit 2; \
-		}; \
-		physical_tests=("$$logical_test"); \
-	fi; \
-	logical_failed=0; \
-	for physical_test in "$${physical_tests[@]}"; do \
-		physical_log="$$logical_build/$$physical_test.log"; \
-		simulator_status=0; \
-		"$$logical_build/simv" +UVM_TESTNAME="$$physical_test" \
-			| tee "$$physical_log" || simulator_status=$$?; \
-		summary_status=0; \
-		../scripts/check_uvm_summary.sh "$$physical_log" \
-			|| summary_status=$$?; \
-		if (( simulator_status != 0 || summary_status != 0 )); then \
-			logical_failed=1; \
-			echo "PROCESS FAIL logical=$$logical_test physical=$$physical_test simulator=$$simulator_status summary=$$summary_status log=$$physical_log" >&2; \
-		else \
-			echo "PROCESS PASS logical=$$logical_test physical=$$physical_test log=$$physical_log"; \
-		fi; \
-	done; \
-	if (( logical_failed != 0 )); then \
-		echo "LOGICAL FAIL logical=$$logical_test processes=$${#physical_tests[@]}" >&2; \
-		exit 1; \
-	fi; \
-	echo "LOGICAL PASS logical=$$logical_test processes=$${#physical_tests[@]}"
+	"$(CORE_LOGICAL_RUNNER)" \
+		"$(strip $(1))" \
+		"$(strip $(2))" \
+		"$(ENGINE_PROCESS_LIST)" \
+		"../scripts/check_uvm_summary.sh"
 endef
 
 .PHONY: core cmq_gate sv_style host_mem_preflight host_mem rdma_defs integration net_packet net_packet_preflight pcie_work pcie_work_preflight dpu_common_preflight e2e regression

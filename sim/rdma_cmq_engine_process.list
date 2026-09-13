@@ -1,7 +1,14 @@
-# rdma_cmq_engine_test 的物理 UVM process 清单；顺序与 64-fixture 连续分区共同构成门禁契约。
+# 目录/层次：sim，rdma_cmq_engine_test logical gate 的物理 UVM process inventory。
+# 文件职责：冻结十三个 fresh simulator leaf 的唯一顺序，并与六十四个 fixture
+#   连续分区共同构成门禁契约。
+# 主要依赖：scripts/run_core_logical_test.sh 只读解析本清单；
+#   tests/unit/rdma_cmq_engine_test.sv 注册对应 class。
+# 所有权与生命周期：仓库拥有清单文本；每个 simulator process 独占自己的
+#   UVM/factory 生命周期和同名日志。
 rdma_cmq_engine_test
 rdma_cmq_engine_capacity_process_test
 rdma_cmq_engine_submission_process_test
+rdma_cmq_engine_submission_continuation_process_test
 rdma_cmq_engine_invariant_process_test
 rdma_cmq_engine_raw_snapshot_process_test
 rdma_cmq_engine_poll_fault_process_test

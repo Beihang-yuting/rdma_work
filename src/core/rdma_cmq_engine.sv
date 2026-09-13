@@ -7630,7 +7630,9 @@ class rdma_cmq_engine extends uvm_object;
   //   batch_status 只描述 orchestration；成功 admission 可能写 Host-memory/MMIO，
   //   并由 observer 或同步返回更新 engine-owned journal/fence/runtime。
   // 失败/边界：空 batch 在取锁前无条件返回 OK；本地拒绝不分配 ID 或调用 transport；
-  //   PRE effect 原子回滚，Host 可见、UNOBSERVED 或已 arm 结果保留恢复 authority。
+  //   PRE effect 原子回滚，Host 可见、UNOBSERVED 或已 arm 结果保留恢复 authority；
+  //   malformed status/effect 分别降级且不覆盖另一字段中仍有效的操作或副作用证据；
+  //   legacy recovery owner 即使 dependency 可重放也不授予 automatic publication retry。
   task submit_batch_observed(
     input rdma_cmq_command_desc commands[],
     output rdma_cmq_execution_result results[],
@@ -8645,24 +8647,45 @@ class rdma_cmq_engine extends uvm_object;
     observation_code = RDMA_SC_OK;
     observation_message = "";
     returned_effect = RDMA_SUBMIT_EFFECT_UNOBSERVED;
-    if (transport_result == null ||
-        !rdma_cmq_status_shape_valid(transport_result.status) ||
-        !rdma_cmq_submission_effect_valid(
-          transport_result.submission_effect
-        )) begin
+    // 设计说明：operation status 与 attempted effect 是独立 transport 证据；只对
+    // malformed 字段安装保守 fallback，避免 status 故障擦除有效 MMIO 证据，或
+    // effect 故障把真实 operation failure/OK 改写为另一个状态。
+    if (transport_result == null) begin
       operation_status = rdma_cmq_direct_status(
         RDMA_SC_INVALID_STATE,
-        "CMQ observed transport returned a malformed envelope"
+        "CMQ observed transport returned a null envelope"
       );
       observation_code = RDMA_SC_INVALID_STATE;
       observation_message =
-        "CMQ observed transport envelope is missing or malformed";
+        "CMQ observed transport envelope is missing";
     end
     else begin
-      operation_status = copy_submit_status_direct(
-        transport_result.status, "cmq_transport_operation_status"
-      );
-      returned_effect = transport_result.submission_effect;
+      if (rdma_cmq_status_shape_valid(transport_result.status)) begin
+        operation_status = copy_submit_status_direct(
+          transport_result.status, "cmq_transport_operation_status"
+        );
+      end
+      else begin
+        operation_status = rdma_cmq_direct_status(
+          RDMA_SC_INVALID_STATE,
+          "CMQ observed transport returned a malformed operation status"
+        );
+        observation_code = RDMA_SC_INVALID_STATE;
+        observation_message =
+          "CMQ observed transport operation status is malformed";
+      end
+
+      if (rdma_cmq_submission_effect_valid(
+            transport_result.submission_effect
+          )) begin
+        returned_effect = transport_result.submission_effect;
+      end
+      else begin
+        observation_code = RDMA_SC_INVALID_STATE;
+        observation_message = (observation_message.len() == 0) ?
+          "CMQ observed transport effect is malformed" :
+          "CMQ observed transport status and effect are malformed";
+      end
     end
 
     if (!observer_armed &&
@@ -8674,6 +8697,9 @@ class rdma_cmq_engine extends uvm_object;
         results[request_index].status = copy_submit_status_direct(
           operation_status,
           $sformatf("cmq_pre_rejected_item_%0d", request_index)
+        );
+        results[request_index].observation_status = rdma_cmq_direct_status(
+          observation_code, observation_message
         );
         results[request_index].submission_effect =
           RDMA_SUBMIT_EFFECT_PRE_SUBMIT_REJECTED;
@@ -8698,8 +8724,19 @@ class rdma_cmq_engine extends uvm_object;
     end
 
     retry_safe = 1'b1;
+    // 设计说明：dependency replayability 只证明数据可重放，不能替代恢复 authority；
+    // journal 安装已验证 owner 完整 shape，因此这里的 LEGACY_UNMIGRATED workflow
+    // 必然是精确 sentinel；它保留人工 reconciliation 兼容性但没有自动 retry 授权。
     foreach (retained_record.items[i]) begin
-      if (!retained_record.items[i].dependency_replay_safe)
+      rdma_cmq_batch_submission_item_record retry_item;
+
+      retry_item = retained_record.items[i];
+      if (retry_item == null || !retry_item.dependency_replay_safe)
+        retry_safe = 1'b0;
+      if (retry_item == null || retry_item.recovery_owner == null)
+        retry_safe = 1'b0;
+      else if (retry_item.recovery_owner.workflow ===
+               RDMA_CMQ_WORKFLOW_LEGACY_UNMIGRATED)
         retry_safe = 1'b0;
     end
     if (observer_armed) begin

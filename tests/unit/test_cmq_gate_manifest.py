@@ -1,18 +1,30 @@
-"""CMQ 专用 gate 清单的静态完整性测试。"""
+# 目录/层次：tests/unit，CMQ gate 与 engine 物理进程控制器的单元门禁。
+# 文件职责：冻结公开 logical 清单、engine fixture 分片，以及 runner 的 strict
+#   all-of 行为。
+# 主要依赖：Python unittest、临时文件系统、sim/Makefile、进程清单和 shell
+#   runner。
+# 资源所有权：仓库输入均为只读引用；TemporaryDirectory 独占并自动回收伪
+#   simulator、checker 与日志。
+"""CMQ 专用 gate 清单与物理进程控制器的完整性测试。"""
 
+import os
 from pathlib import Path
 import re
+import subprocess
+import tempfile
 import unittest
 
 
 ROOT = Path(__file__).resolve().parents[2]
 
 ENGINE_LOGICAL_TEST = "rdma_cmq_engine_test"
+ENGINE_LOGICAL_RUNNER = ROOT / "scripts" / "run_core_logical_test.sh"
 
 ENGINE_PROCESS_TESTS = [
     "rdma_cmq_engine_test",
     "rdma_cmq_engine_capacity_process_test",
     "rdma_cmq_engine_submission_process_test",
+    "rdma_cmq_engine_submission_continuation_process_test",
     "rdma_cmq_engine_invariant_process_test",
     "rdma_cmq_engine_raw_snapshot_process_test",
     "rdma_cmq_engine_poll_fault_process_test",
@@ -169,13 +181,13 @@ class CmqGateManifestTest(unittest.TestCase):
         mutation_pos = regression.index("rdma_cmq_driver_field_mutation_test")
         self.assertGreater(mutation_pos, profile_pos)
 
-    # 功能：冻结一个 engine 逻辑行到十二物理进程的合法、唯一且有序映射，防止 process shard 泄漏到公开 gate。
+    # 功能：冻结一个 engine 逻辑行到十三物理进程的合法、唯一且有序映射，防止 process shard 泄漏到公开 gate。
     # 输入输出及副作用：读取 process/cmq/CORE_TESTS 清单并执行断言；不修改 runner 或清单。
     # 失败边界：物理项缺失、重复、非法、乱序，或逻辑行不再 exact-once 时测试失败。
     def test_engine_process_manifest(self):
         process_rows = self._engine_process_rows()
         self.assertEqual(process_rows, ENGINE_PROCESS_TESTS)
-        self.assertEqual(len(process_rows), 12)
+        self.assertEqual(len(process_rows), 13)
         self.assertEqual(len(process_rows), len(set(process_rows)))
         self.assertTrue(all(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", row)
                             for row in process_rows))
@@ -193,7 +205,7 @@ class CmqGateManifestTest(unittest.TestCase):
             self.assertNotIn(process_test, logical_rows)
             self.assertNotIn(process_test, core_block.group(1))
 
-    # 功能：冻结十二 leaf 的 UVM 注册及 run_phase 展平后六十四个 fixture 的 exact-once 原始顺序。
+    # 功能：冻结十三 leaf 的 UVM 注册及 run_phase 展平后六十四个逻辑 fixture 的 exact-once 原始顺序。
     # 输入输出及副作用：只读解析 engine test 源码并断言 class/宏/调用列表；不运行仿真。
     # 失败边界：leaf 未注册、fixture 漏跑/重复/乱序或被跨 shard 拆分时测试失败。
     def test_engine_process_fixture_inventory(self):
@@ -215,18 +227,79 @@ class CmqGateManifestTest(unittest.TestCase):
             self.assertIsNotNone(
                 run_phase, f"missing run_phase in {process_test}"
             )
-            flattened_calls.extend(re.findall(
-                r"\b(check_[A-Za-z0-9_]+)\s*\(\s*\)\s*;",
-                run_phase.group(1),
-            ))
+            for fixture, arguments in re.findall(
+                    r"\b(check_[A-Za-z0-9_]+)\s*\(([^;]*)\)\s*;",
+                    run_phase.group(1)):
+                if fixture == "check_observed_transport_failure_retention":
+                    if fixture not in flattened_calls:
+                        flattened_calls.append(fixture)
+                else:
+                    self.assertEqual(arguments.strip(), "")
+                    flattened_calls.append(fixture)
 
         self.assertEqual(flattened_calls, ENGINE_FIXTURES)
         self.assertEqual(len(flattened_calls), 64)
         self.assertEqual(len(flattened_calls), len(set(flattened_calls)))
 
-    # 功能：确认 direct core、core regression 与 cmq_gate 都调用唯一 RUN_CORE_LOGICAL_TEST fan-out。
-    # 输入输出及副作用：只读 Makefile 并检查 helper 定义和三处调用；不启动编译或 simulator。
-    # 失败边界：helper 不校验 process list/独立 summary，或任一路径直接运行 simv 时测试失败。
+    # 功能：证明 observed retention 的两个物理调用以 inclusive bounds 有序、无重叠地精确覆盖 row 0..14。
+    # 输入输出及副作用：只读解析十三个 leaf 的 run_phase 与 bounded task 声明；返回 unittest 断言结果，不运行仿真。
+    # 失败边界：task 不是显式双边界接口、range 数量/顺序/调用 leaf 漂移，或出现 gap/overlap/越界时测试失败。
+    def test_observed_retention_range_partition(self):
+        source = (ROOT / "tests" / "unit" /
+                  "rdma_cmq_engine_test.sv").read_text()
+        self.assertRegex(
+            source,
+            r"task\s+automatic\s+check_observed_transport_failure_retention"
+            r"\s*\(\s*input\s+int\s+unsigned\s+first_fault\s*,\s*"
+            r"input\s+int\s+unsigned\s+last_fault\s*\)\s*;",
+        )
+
+        calls = []
+        for process_test in self._engine_process_rows():
+            body = self._class_body(process_test, source)
+            run_phase = re.search(
+                r"\bvirtual\s+task\s+run_phase\s*\([^;]+;"
+                r"(.*?)\bendtask\b",
+                body,
+                flags=re.DOTALL,
+            )
+            self.assertIsNotNone(
+                run_phase, f"missing run_phase in {process_test}"
+            )
+            for low, high in re.findall(
+                    r"\bcheck_observed_transport_failure_retention\s*\("
+                    r"\s*(\d+)\s*,\s*(\d+)\s*\)\s*;",
+                    run_phase.group(1)):
+                calls.append((process_test, int(low), int(high)))
+
+        self.assertEqual(
+            calls,
+            [
+                ("rdma_cmq_engine_submission_process_test", 0, 2),
+                ("rdma_cmq_engine_submission_continuation_process_test",
+                 3, 14),
+            ],
+        )
+        coverage = []
+        previous_high = -1
+        for _, low, high in calls:
+            self.assertEqual(low, previous_high + 1)
+            self.assertLessEqual(low, high)
+            coverage.extend(range(low, high + 1))
+            previous_high = high
+        self.assertEqual(coverage, list(range(15)))
+
+        continuation = self._class_body(
+            "rdma_cmq_engine_submission_continuation_process_test", source
+        )
+        self.assertNotIn("seed_submission_factory_epoch()", continuation)
+
+    # 功能：确认 direct core、core regression 与 cmq_gate 都调用唯一
+    #   RUN_CORE_LOGICAL_TEST fan-out。
+    # 输入输出及副作用：只读 Makefile 并检查 shell controller 绑定和三处调用；
+    #   不启动编译或 simulator。
+    # 失败边界：controller 路径未固定、helper 未传完整参数，或任一路径绕过
+    #   统一调用时测试失败。
     def test_engine_runner_uses_one_fanout(self):
         makefile = (ROOT / "sim" / "Makefile").read_text()
         helper = re.search(
@@ -241,9 +314,17 @@ class CmqGateManifestTest(unittest.TestCase):
             r"(?m)^ENGINE_PROCESS_LIST\s*:=\s*"
             r"rdma_cmq_engine_process\.list\s*$",
         )
-        self.assertIn("$(ENGINE_PROCESS_LIST)", helper.group(1))
-        self.assertIn("check_uvm_summary.sh", helper.group(1))
-        self.assertIn("(( $${#physical_tests[@]} == 12 ))", helper.group(1))
+        self.assertRegex(
+            makefile,
+            r"(?m)^CORE_LOGICAL_RUNNER\s*:=\s*"
+            r"\.\./scripts/run_core_logical_test\.sh\s*$",
+        )
+        for argument in (
+                '"$(strip $(1))"',
+                '"$(strip $(2))"',
+                '"$(ENGINE_PROCESS_LIST)"',
+                '"../scripts/check_uvm_summary.sh"'):
+            self.assertIn(argument, helper.group(1))
 
         invocation = "$(call RUN_CORE_LOGICAL_TEST,"
         core_body = self._make_target_body("core", makefile)
@@ -251,6 +332,209 @@ class CmqGateManifestTest(unittest.TestCase):
         self.assertEqual(core_body.count(invocation), 2)
         self.assertEqual(cmq_body.count(invocation), 1)
         self.assertEqual(makefile.count(invocation), 3)
+
+    # 功能：用可控 simulator/checker 执行 runner，证明普通 self-map 与 engine
+    #   十三片 strict all-of。
+    # 输入输出及副作用：在 TemporaryDirectory 创建伪程序、清单、调用记录与
+    #   日志；返回 unittest 断言结果并自动回收。
+    # 失败边界：任一 leaf 未尝试、checker 非恰好一次、日志复用、失败码丢失
+    #   或 logical 误报成功时测试失败。
+    def test_engine_runner_executes_strict_all_of(self):
+        self.assertTrue(
+            ENGINE_LOGICAL_RUNNER.is_file(),
+            f"missing core logical runner {ENGINE_LOGICAL_RUNNER}",
+        )
+
+        with tempfile.TemporaryDirectory() as temp:
+            temp_root = Path(temp)
+            manifest = temp_root / "engine_process.list"
+            checker = temp_root / "check_summary.sh"
+
+            manifest.write_text(
+                "\n".join(ENGINE_PROCESS_TESTS) + "\n", encoding="utf-8"
+            )
+            checker.write_text(
+                """#!/usr/bin/env bash
+set -u
+log_path="$1"
+printf '%s\n' "$log_path" >> "$FAKE_CHECKER_CALLS"
+if [[ "$(basename "$log_path")" == "$FAKE_CHECKER_FAIL.log" ]]; then
+  exit 9
+fi
+""",
+                encoding="utf-8",
+            )
+            checker.chmod(0o755)
+
+            scenarios = [
+                ("ordinary_success", "rdma_smoke_test",
+                 ["rdma_smoke_test"], "", "", 0),
+                ("engine_success", ENGINE_LOGICAL_TEST,
+                 ENGINE_PROCESS_TESTS, "", "", 0),
+                ("simulator_failure", ENGINE_LOGICAL_TEST,
+                 ENGINE_PROCESS_TESTS, ENGINE_PROCESS_TESTS[2], "", 1),
+                ("checker_failure", ENGINE_LOGICAL_TEST,
+                 ENGINE_PROCESS_TESTS, "", ENGINE_PROCESS_TESTS[9], 1),
+            ]
+            for (scenario, logical_test, expected_tests, simulator_fail,
+                 checker_fail, expected_status) in scenarios:
+                build = temp_root / scenario
+                build.mkdir()
+                simulator_calls = temp_root / f"{scenario}.simulator.calls"
+                checker_calls = temp_root / f"{scenario}.checker.calls"
+                simulator = build / "simv"
+                simulator.write_text(
+                    """#!/usr/bin/env bash
+set -u
+test_name=""
+for argument in "$@"; do
+  case "$argument" in
+    +UVM_TESTNAME=*) test_name="${argument#+UVM_TESTNAME=}" ;;
+  esac
+done
+printf '%s\n' "$test_name" >> "$FAKE_SIMULATOR_CALLS"
+printf 'SIMULATOR TEST %s\n' "$test_name"
+if [[ "$test_name" == "$FAKE_SIMULATOR_FAIL" ]]; then
+  exit 7
+fi
+""",
+                    encoding="utf-8",
+                )
+                simulator.chmod(0o755)
+
+                environment = dict(os.environ)
+                environment.update({
+                    "FAKE_SIMULATOR_CALLS": str(simulator_calls),
+                    "FAKE_CHECKER_CALLS": str(checker_calls),
+                    "FAKE_SIMULATOR_FAIL": simulator_fail,
+                    "FAKE_CHECKER_FAIL": checker_fail,
+                })
+                result = subprocess.run(
+                    [
+                        str(ENGINE_LOGICAL_RUNNER),
+                        logical_test,
+                        str(build),
+                        str(manifest),
+                        str(checker),
+                    ],
+                    cwd=ROOT / "sim",
+                    env=environment,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+
+                self.assertEqual(
+                    result.returncode,
+                    expected_status,
+                    result.stdout + result.stderr,
+                )
+                self.assertEqual(
+                    simulator_calls.read_text(encoding="utf-8").splitlines(),
+                    expected_tests,
+                )
+                expected_logs = [
+                    str(build / f"{name}.log")
+                    for name in expected_tests
+                ]
+                self.assertEqual(
+                    checker_calls.read_text(encoding="utf-8").splitlines(),
+                    expected_logs,
+                )
+                self.assertEqual(
+                    sorted(path.name for path in build.glob("*.log")),
+                    sorted(f"{name}.log" for name in expected_tests),
+                )
+                for name in expected_tests:
+                    self.assertEqual(
+                        (build / f"{name}.log").read_text(encoding="utf-8"),
+                        f"SIMULATOR TEST {name}\n",
+                    )
+
+                transcript = result.stdout + result.stderr
+                if expected_status == 0:
+                    self.assertIn(
+                        f"LOGICAL PASS logical={logical_test} "
+                        f"processes={len(expected_tests)}",
+                        transcript,
+                    )
+                    self.assertNotIn("PROCESS FAIL", transcript)
+                else:
+                    self.assertIn(
+                        f"LOGICAL FAIL logical={logical_test} "
+                        f"processes={len(expected_tests)}",
+                        transcript,
+                    )
+                    self.assertNotIn("LOGICAL PASS", transcript)
+
+                if simulator_fail:
+                    self.assertIn(
+                        f"physical={simulator_fail} simulator=7 summary=0",
+                        transcript,
+                    )
+                if checker_fail:
+                    self.assertIn(
+                        f"physical={checker_fail} simulator=0 summary=9",
+                        transcript,
+                    )
+
+    # 功能：验证 runner 对缺失 CLI 参数和非十三项 engine manifest 失败关闭，
+    #   不启动任何 simulator。
+    # 输入输出及副作用：在 TemporaryDirectory 创建空可执行依赖和畸形清单；
+    #   捕获子进程状态与诊断后自动回收。
+    # 失败边界：参数数量或 manifest cardinality 错误未返回 2，或错误输入触发
+    #   simulator 时测试失败。
+    def test_engine_runner_rejects_invalid_inputs(self):
+        self.assertTrue(
+            ENGINE_LOGICAL_RUNNER.is_file(),
+            f"missing core logical runner {ENGINE_LOGICAL_RUNNER}",
+        )
+
+        missing_arguments = subprocess.run(
+            [str(ENGINE_LOGICAL_RUNNER)],
+            cwd=ROOT / "sim",
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(missing_arguments.returncode, 2)
+        self.assertIn("Usage:", missing_arguments.stderr)
+
+        with tempfile.TemporaryDirectory() as temp:
+            temp_root = Path(temp)
+            build = temp_root / "build"
+            build.mkdir()
+            simulator = build / "simv"
+            checker = temp_root / "checker.sh"
+            manifest = temp_root / "malformed.list"
+            simulator.write_text(
+                "#!/usr/bin/env bash\nexit 99\n", encoding="utf-8"
+            )
+            checker.write_text(
+                "#!/usr/bin/env bash\nexit 99\n", encoding="utf-8"
+            )
+            manifest.write_text(
+                "\n".join(ENGINE_PROCESS_TESTS[:-1]) + "\n",
+                encoding="utf-8",
+            )
+            simulator.chmod(0o755)
+            checker.chmod(0o755)
+
+            malformed_manifest = subprocess.run(
+                [
+                    str(ENGINE_LOGICAL_RUNNER),
+                    ENGINE_LOGICAL_TEST,
+                    str(build),
+                    str(manifest),
+                    str(checker),
+                ],
+                cwd=ROOT / "sim",
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(malformed_manifest.returncode, 2)
+            self.assertIn("exactly thirteen", malformed_manifest.stderr)
 
 
 if __name__ == "__main__":
