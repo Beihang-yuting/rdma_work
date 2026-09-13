@@ -7,6 +7,90 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
 
+ENGINE_LOGICAL_TEST = "rdma_cmq_engine_test"
+
+ENGINE_PROCESS_TESTS = [
+    "rdma_cmq_engine_test",
+    "rdma_cmq_engine_capacity_process_test",
+    "rdma_cmq_engine_submission_process_test",
+    "rdma_cmq_engine_invariant_process_test",
+    "rdma_cmq_engine_raw_snapshot_process_test",
+    "rdma_cmq_engine_poll_fault_process_test",
+    "rdma_cmq_engine_poison_reset_process_test",
+    "rdma_cmq_engine_wrap_process_test",
+    "rdma_cmq_engine_wrap_publication_process_test",
+    "rdma_cmq_engine_journal_process_test",
+    "rdma_cmq_engine_mmio_arm_process_test",
+    "rdma_cmq_engine_hostile_factory_process_test",
+]
+
+ENGINE_FIXTURES = [
+    "check_transport_facade_contract",
+    "check_transport_engine_lifecycle",
+    "check_success_and_detachment",
+    "check_preallocation_rejections",
+    "check_pasid_normalization_and_busy_prepare",
+    "check_allocation_and_rollback_failures",
+    "check_null_status_guards",
+    "check_prepared_shutdown_lifecycle",
+    "check_shutdown_release_retry",
+    "check_active_shutdown_release_retry",
+    "check_null_shutdown_release_retry",
+    "check_missing_host_mem_shutdown",
+    "check_activation_guards",
+    "check_batch_compaction_and_doorbell",
+    "check_observed_batch_table",
+    "check_full_initial_capacity_and_shutdown_reset",
+    "check_empty_invalid_and_state_rejections",
+    "check_poll_empty_ledger_and_partial_drain",
+    "check_pre_read_poll_ledger_fail_closed",
+    "check_submit_wrapper_and_snapshot_detachment",
+    "check_null_compose_transaction_abort",
+    "check_nested_command_snapshot_failures",
+    "check_mutating_clone_source_restoration",
+    "check_qpc_context_snapshot_failures",
+    "check_transaction_failure_atomicity",
+    "check_profile_wide_cqe_format_authority",
+    "check_observed_transport_failure_retention",
+    "check_doorbell_authority_isolation",
+    "check_submission_validation_and_profile_metadata",
+    "check_profile_hook_snapshot_contract",
+    "check_stateful_profile_snapshot_rechecks",
+    "check_exact_type_profile_delegation",
+    "check_internal_invariant_batch_abort",
+    "check_timeout_quarantine_and_late_diagnostic",
+    "check_expire_snapshot_failure_is_atomic_and_retryable",
+    "check_late_diagnostic_snapshot_failure_is_retryable",
+    "check_command_incarnation_exhaustion",
+    "check_incarnation_survives_reprepare",
+    "check_max_dependency_id_boundary",
+    "check_counter_invariants_poison_before_transport",
+    "check_poll_raw_snapshot_rejects_self_clone_mutation",
+    "check_poll_payload_retained_self_clone_is_detached",
+    "check_poll_payload_hook_contract_failures",
+    "check_poll_decoded_status_contract_failures",
+    "check_poll_ticket_root_is_explicitly_constructed",
+    "check_retirement_preflight_poison_atomicity",
+    "check_cqe_poison_isolation_and_snapshot_detachment",
+    "check_poison_shutdown_release_retry_preserves_snapshot",
+    "check_wait_rejects_x_deadline_without_side_effects",
+    "check_wait_poison_lifecycle_boundaries",
+    "check_wait_for_caller_ticket_detachment",
+    "check_wait_for_fifo_and_deadline",
+    "check_cancel_reset_and_shutdown_lifecycle",
+    "check_strict_cancel_audits_complete_ledger",
+    "check_strict_cancel_audits_exact_membership",
+    "check_poison_recovery_rejects_x_tickets",
+    "check_poisoned_ledger_reset_recovery",
+    "check_reset_fifo_retry_and_reprepare",
+    "check_poll_backing_out_of_order_and_owner_wrap",
+    "check_retire_then_wrap_publication",
+    "check_journal_identity_and_counter_contract",
+    "check_submission_journal_storage_and_queries",
+    "check_pre_mmio_arm_capability",
+    "check_journal_hostile_factory_snapshots_last",
+]
+
 
 class CmqGateManifestTest(unittest.TestCase):
     """验证 manifest 顺序、唯一性以及 UVM 注册闭合。"""
@@ -18,6 +102,41 @@ class CmqGateManifestTest(unittest.TestCase):
         lines = (ROOT / "sim" / "cmq_gate.list").read_text().splitlines()
         return [line.strip() for line in lines
                 if line.strip() and not line.lstrip().startswith("#")]
+
+    # 功能：读取 engine 逻辑测试的物理进程清单，按 runner 的注释/空行规则返回顺序列表。
+    # 输入输出及副作用：无显式输入；返回物理 UVM test 名列表，不写文件或环境。
+    # 失败边界：清单缺失或不可读时由 Path.read_text 抛出异常，使 inventory 测试失败关闭。
+    def _engine_process_rows(self):
+        path = ROOT / "sim" / "rdma_cmq_engine_process.list"
+        lines = path.read_text().splitlines()
+        return [line.split("#", 1)[0].strip() for line in lines
+                if line.split("#", 1)[0].strip()]
+
+    # 功能：从 SystemVerilog 源码中提取指定 UVM test class 的完整声明体，供注册和 run_phase 清单审计。
+    # 输入输出及副作用：name/source 为只读输入；返回首个匹配 class 的正文字符串，不修改源码。
+    # 失败边界：类缺失、继承声明损坏或 endclass 缺失时立即断言失败，不回退到相邻类。
+    def _class_body(self, name, source):
+        match = re.search(
+            rf"\bclass\s+{re.escape(name)}\s+extends\s+"
+            rf"[A-Za-z_][A-Za-z0-9_]*\s*;(.*?)\bendclass\b",
+            source,
+            flags=re.DOTALL,
+        )
+        self.assertIsNotNone(match, f"missing UVM process class {name}")
+        return match.group(1)
+
+    # 功能：提取 Makefile 指定 target 的 recipe 文本，验证三条 core runner 路径共享同一逻辑展开入口。
+    # 输入输出及副作用：name/source 为只读输入；返回目标到下一顶层 target 之间的文本，不执行 make。
+    # 失败边界：target 缺失或正文为空时断言失败；不会误把后续 target 的调用计入当前路径。
+    def _make_target_body(self, name, source):
+        match = re.search(
+            rf"(?m)^{re.escape(name)}:\s*[^\n]*\n(.*?)(?=^[A-Za-z0-9_.-]+:|\Z)",
+            source,
+            flags=re.DOTALL,
+        )
+        self.assertIsNotNone(match, f"missing Make target {name}")
+        self.assertTrue(match.group(1).strip(), f"empty Make target {name}")
+        return match.group(1)
 
     # 功能：确认 gate 清单与固定 CMQ 测试顺序完全一致，并拒绝重复或非法 token。
     # 输入输出及副作用：读取仓库文本；断言失败只影响当前 unittest，不产生外部副作用。
@@ -49,6 +168,89 @@ class CmqGateManifestTest(unittest.TestCase):
         profile_pos = regression.index("rdma_cmq_profile_test")
         mutation_pos = regression.index("rdma_cmq_driver_field_mutation_test")
         self.assertGreater(mutation_pos, profile_pos)
+
+    # 功能：冻结一个 engine 逻辑行到十二物理进程的合法、唯一且有序映射，防止 process shard 泄漏到公开 gate。
+    # 输入输出及副作用：读取 process/cmq/CORE_TESTS 清单并执行断言；不修改 runner 或清单。
+    # 失败边界：物理项缺失、重复、非法、乱序，或逻辑行不再 exact-once 时测试失败。
+    def test_engine_process_manifest(self):
+        process_rows = self._engine_process_rows()
+        self.assertEqual(process_rows, ENGINE_PROCESS_TESTS)
+        self.assertEqual(len(process_rows), 12)
+        self.assertEqual(len(process_rows), len(set(process_rows)))
+        self.assertTrue(all(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", row)
+                            for row in process_rows))
+
+        logical_rows = self._rows()
+        regression = (ROOT / "scripts" /
+                      "run_queue_lifecycle_regression53.sh").read_text()
+        core_block = re.search(
+            r"readonly CORE_TESTS=\((.*?)\n\)", regression, re.DOTALL
+        )
+        self.assertIsNotNone(core_block)
+        self.assertEqual(logical_rows.count(ENGINE_LOGICAL_TEST), 1)
+        self.assertEqual(core_block.group(1).count(ENGINE_LOGICAL_TEST), 1)
+        for process_test in ENGINE_PROCESS_TESTS[1:]:
+            self.assertNotIn(process_test, logical_rows)
+            self.assertNotIn(process_test, core_block.group(1))
+
+    # 功能：冻结十二 leaf 的 UVM 注册及 run_phase 展平后六十四个 fixture 的 exact-once 原始顺序。
+    # 输入输出及副作用：只读解析 engine test 源码并断言 class/宏/调用列表；不运行仿真。
+    # 失败边界：leaf 未注册、fixture 漏跑/重复/乱序或被跨 shard 拆分时测试失败。
+    def test_engine_process_fixture_inventory(self):
+        source = (ROOT / "tests" / "unit" /
+                  "rdma_cmq_engine_test.sv").read_text()
+        flattened_calls = []
+        for process_test in self._engine_process_rows():
+            body = self._class_body(process_test, source)
+            self.assertRegex(
+                body,
+                rf"`uvm_component_utils\(\s*{re.escape(process_test)}\s*\)",
+            )
+            run_phase = re.search(
+                r"\bvirtual\s+task\s+run_phase\s*\([^;]+;"
+                r"(.*?)\bendtask\b",
+                body,
+                flags=re.DOTALL,
+            )
+            self.assertIsNotNone(
+                run_phase, f"missing run_phase in {process_test}"
+            )
+            flattened_calls.extend(re.findall(
+                r"\b(check_[A-Za-z0-9_]+)\s*\(\s*\)\s*;",
+                run_phase.group(1),
+            ))
+
+        self.assertEqual(flattened_calls, ENGINE_FIXTURES)
+        self.assertEqual(len(flattened_calls), 64)
+        self.assertEqual(len(flattened_calls), len(set(flattened_calls)))
+
+    # 功能：确认 direct core、core regression 与 cmq_gate 都调用唯一 RUN_CORE_LOGICAL_TEST fan-out。
+    # 输入输出及副作用：只读 Makefile 并检查 helper 定义和三处调用；不启动编译或 simulator。
+    # 失败边界：helper 不校验 process list/独立 summary，或任一路径直接运行 simv 时测试失败。
+    def test_engine_runner_uses_one_fanout(self):
+        makefile = (ROOT / "sim" / "Makefile").read_text()
+        helper = re.search(
+            r"(?m)^define RUN_CORE_LOGICAL_TEST\s*$"
+            r"(.*?)^endef\s*$",
+            makefile,
+            flags=re.DOTALL,
+        )
+        self.assertIsNotNone(helper, "missing shared core logical runner")
+        self.assertRegex(
+            makefile,
+            r"(?m)^ENGINE_PROCESS_LIST\s*:=\s*"
+            r"rdma_cmq_engine_process\.list\s*$",
+        )
+        self.assertIn("$(ENGINE_PROCESS_LIST)", helper.group(1))
+        self.assertIn("check_uvm_summary.sh", helper.group(1))
+        self.assertIn("(( $${#physical_tests[@]} == 12 ))", helper.group(1))
+
+        invocation = "$(call RUN_CORE_LOGICAL_TEST,"
+        core_body = self._make_target_body("core", makefile)
+        cmq_body = self._make_target_body("cmq_gate", makefile)
+        self.assertEqual(core_body.count(invocation), 2)
+        self.assertEqual(cmq_body.count(invocation), 1)
+        self.assertEqual(makefile.count(invocation), 3)
 
 
 if __name__ == "__main__":

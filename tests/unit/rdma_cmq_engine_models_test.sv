@@ -1733,9 +1733,12 @@ class rdma_cmq_engine_models_test extends uvm_test;
       `uvm_error(label, "recovery-required table row was misclassified")
   endfunction
 
-  // 功能：验证 recovery_required 只由 lifetime state/phase/effect/proof 表推导。
-  // 输入/输出及副作用：无显式输入；覆盖七个 completion phase 和 resolved/unresolved 行。
-  // 失败/边界：unknown/spare/impossible 输入必须返回非成功并保持预置 output。
+  // 功能：验证 recovery_required 只由 lifetime state/phase/effect/proof 表推导，
+  //   并冻结未 arm degraded envelope 的 HOST_VISIBLE/NONE/UNOBSERVED 恢复行。
+  // 输入/输出及副作用：无显式输入；覆盖七个 completion phase、同步未观测
+  //   transport 返回，以及 resolved/unresolved 行。
+  // 失败/边界：unknown/spare/impossible 输入必须返回非成功并保持预置 output；
+  //   只有精确的 host-visible 未观测组合可在 NONE phase 下保守要求恢复。
   function automatic void check_recovery_required_classifier();
     rdma_cmq_submission_state_e unknown_state;
     rdma_cmq_completion_phase_e unknown_phase;
@@ -1758,6 +1761,12 @@ class rdma_cmq_engine_models_test extends uvm_test;
       "RECOVERY_HOST_VISIBLE",
       RDMA_CMQ_SUBMISSION_HOST_VISIBLE_NOT_PUBLISHED,
       RDMA_CMQ_COMPLETION_NONE, RDMA_SUBMIT_EFFECT_HOST_MEMORY_ORDERED,
+      1'b0, 1'b0, 1'b1
+    );
+    expect_recovery_case(
+      "RECOVERY_HOST_VISIBLE_UNOBSERVED",
+      RDMA_CMQ_SUBMISSION_HOST_VISIBLE_NOT_PUBLISHED,
+      RDMA_CMQ_COMPLETION_NONE, RDMA_SUBMIT_EFFECT_UNOBSERVED,
       1'b0, 1'b0, 1'b1
     );
     expect_recovery_case(

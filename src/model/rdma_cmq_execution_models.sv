@@ -2180,8 +2180,8 @@ endfunction
 // 功能：按冻结 lifetime state/phase/effect/proof 表推导 conservative recovery bit。
 // 输入/输出及副作用：五个证据输入只读，recovery_required 成功时一次性更新。
 // 失败/边界：X/Z/spare 或不可能的 state/phase/effect 组合返回非 OK 且保持
-//   预置输出；UNOBSERVED 接受未观测或既有 Host/MMIO 累积证据并始终需要
-//   reconcile，只有可靠终态/确认 reset 才清零。
+//   预置输出；UNOBSERVED 接受未观测、未 arm 的 Host-visible evidence 或既有
+//   Host/MMIO 累积证据并始终需要 reconcile，只有可靠终态/确认 reset 才清零。
 function automatic rdma_status rdma_cmq_classify_recovery_required(
   input rdma_cmq_submission_state_e state,
   input rdma_cmq_completion_phase_e completion_phase,
@@ -2225,6 +2225,7 @@ function automatic rdma_status rdma_cmq_classify_recovery_required(
       RDMA_CMQ_SUBMISSION_HOST_VISIBLE_NOT_PUBLISHED: begin
         combination_valid = completion_phase == RDMA_CMQ_COMPLETION_NONE &&
                             submission_effect inside {
+                              RDMA_SUBMIT_EFFECT_UNOBSERVED,
                               RDMA_SUBMIT_EFFECT_HOST_MEMORY_MAYBE_VISIBLE,
                               RDMA_SUBMIT_EFFECT_HOST_MEMORY_WRITTEN,
                               RDMA_SUBMIT_EFFECT_HOST_MEMORY_ORDERED

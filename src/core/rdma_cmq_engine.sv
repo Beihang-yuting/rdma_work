@@ -3660,9 +3660,13 @@ class rdma_cmq_engine extends uvm_object;
     return status;
   endfunction
 
-  // 功能：checked_image_snapshot 复制 source、label、failure_code、snapshot 的受控字段并生成独立快照，供查询、编码或恢复使用；源对象保持不变。
-  // 输入/输出及副作用：source（输入）、label（输入）、failure_code（输入）、snapshot（输出）；checked_image_snapshot 读取 source、label、failure_code、snapshot 并使用字段 snapshot、saved_value、saved_value.bytes、saved_value.length、saved_value.alignment、saved_value.endian、saved_value.image_kind、saved_value.hardware_version，并写入 snapshot；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：checked_image_snapshot 先检查 source == null；saved_value == null；cloned_object == null || !$cast(snapshot, cloned_object，再返回 snapshot_failure(failure_code, {label, " image is null"})；rdma_status::success()；拒绝分支不提交部分状态，也不隐式重试。
+  // 功能：checked_image_snapshot 对 image 执行 factory-backed clone 并验证
+  //   全部 byte/metadata/target 投影等值且不自别名。
+  // 输入/输出及副作用：source/label/failure_code 为只读输入；
+  //   snapshot 先清空，成功时保留 source 的 registered runtime type 并恢复
+  //   clone 可能改写的公开字段，不接管 source 所有权。
+  // 失败/边界：null source、factory 构造失败、clone 返回 null/self
+  //   或任一公开字段漂移时按 failure_code 拒绝；不发布 partial snapshot。
   protected function rdma_status checked_image_snapshot(
     rdma_hw_image source,
     string label,
@@ -3719,6 +3723,53 @@ class rdma_cmq_engine extends uvm_object;
         failure_code, {label, " image snapshot changed its source value"}
       );
     end
+    return rdma_status::success();
+  endfunction
+
+  // 功能：checked_canonical_image_snapshot 先消费 image factory/clone 契约，
+  //   再把 submission 使用的 image 直接重建为 exact rdma_hw_image authority。
+  // 输入/输出及副作用：source/label/failure_code 为只读输入；
+  //   snapshot 先清空，成功时输出与 source/factory snapshot 无别名的
+  //   byte/metadata/target 等值 base image，不修改 profile 或 backing。
+  // 失败/边界：checked_image_snapshot 失败时原样传播；派生值的 base
+  //   投影不满足 journal shape 或重建后不等值时按 failure_code 拒绝，
+  //   不影响 completion poll 保留 runtime subtype 的既有契约。
+  protected function rdma_status checked_canonical_image_snapshot(
+    rdma_hw_image source,
+    string label,
+    rdma_status_code_e failure_code,
+    output rdma_hw_image snapshot
+  );
+    rdma_hw_image factory_snapshot;
+    rdma_hw_image canonical_snapshot;
+    rdma_status status;
+
+    snapshot = null;
+    status = checked_image_snapshot(
+      source, label, failure_code, factory_snapshot
+    );
+    if (status == null || !status.ok())
+      return status;
+    canonical_snapshot = new({label, "_canonical"});
+    canonical_snapshot.bytes = factory_snapshot.bytes;
+    canonical_snapshot.length = factory_snapshot.length;
+    canonical_snapshot.alignment = factory_snapshot.alignment;
+    canonical_snapshot.endian = factory_snapshot.endian;
+    canonical_snapshot.image_kind = factory_snapshot.image_kind;
+    canonical_snapshot.hardware_version = factory_snapshot.hardware_version;
+    canonical_snapshot.function_generation =
+      factory_snapshot.function_generation;
+    canonical_snapshot.write_target_kind = factory_snapshot.write_target_kind;
+    canonical_snapshot.backing_target = factory_snapshot.backing_target;
+    canonical_snapshot.hmc_target = factory_snapshot.hmc_target;
+    canonical_snapshot.bar_target = factory_snapshot.bar_target;
+    canonical_snapshot.field_summary = factory_snapshot.field_summary;
+    if (!rdma_cmq_image_shape_valid(canonical_snapshot) ||
+        !same_image_value(canonical_snapshot, factory_snapshot))
+      return snapshot_failure(
+        failure_code, {label, " canonical image value is invalid"}
+      );
+    snapshot = canonical_snapshot;
     return rdma_status::success();
   endfunction
 
@@ -3903,10 +3954,14 @@ class rdma_cmq_engine extends uvm_object;
     return status;
   endfunction
 
-  // 功能：在 rdma_cmq_engine 中，snapshot_command_value 按完整 key/handle 查找唯一权威记录并返回 detached 快照，避免把内部可变引用泄露给调用方。
-  // 输入/输出及副作用：source（输入）、snapshot（输出）、staging_invariant_failed（输出）；输入 handle/key/cursor 用于选择读取范围；返回值或 output 为
-  //   detached 快照，读取不取得外部资源所有权。
-  // 失败/边界：snapshot_command_value 在 key/handle 缺失、记录不唯一或 generation/reset epoch 过期时返回明确错误，不回退到默认 authority。
+  // 功能：snapshot_command_value 逐层验证 command shell/body/signature 的 clone
+  //   契约，并把 signature 重建为 journal digest 可接受的 exact image。
+  // 输入/输出及副作用：source 为只读 command；snapshot 成功时输出完整
+  //   detached 图；staging_invariant_failed 仅标识 body profile 契约故障；不转移
+  //   caller body/image 所有权，也不修改 shell 标量。
+  // 失败/边界：null source、Function/opcode/body/signature clone 返回
+  //   null/self/变值、signature canonical 形状非法或 final validate 失败时不发布
+  //   partial snapshot；持久 factory override 不得把派生 image 泄漏到 journal。
   protected function rdma_status snapshot_command_value(
     rdma_cmq_command_desc source,
     output rdma_cmq_command_desc snapshot,
@@ -3961,7 +4016,7 @@ class rdma_cmq_engine extends uvm_object;
       return status;
     signature_snapshot = null;
     if (source.qpc_signature_source != null) begin
-      status = checked_image_snapshot(
+      status = checked_canonical_image_snapshot(
         source.qpc_signature_source, "CMQ command signature",
         RDMA_SC_INVALID_ARGUMENT, signature_snapshot
       );
@@ -4091,10 +4146,15 @@ class rdma_cmq_engine extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：make_ticket_value 创建独立的 rdma_status；根据 name、command_id、function_h、cmq_h、slot_sequence、sq_index、sq_wrap、opcode_key、absolute_deadline、ticket 设置字段 ticket、ticket.command_id、status、ticket.slot_sequence、ticket.sq_index、ticket.sq_wrap、ticket.absolute_deadline、cloned_object，返回对象仅由调用方持有，不转移外部资源所有权。
-  // 输入/输出及副作用：name（输入）、command_id（输入）、function_h（输入）、cmq_h（输入）、slot_sequence（输入）、sq_index（输入）、sq_wrap（输入）、opcode_key（输入）、absolute_deadline（输入）、ticket（输出）；输入字段被复制到返回值或
-  //   output；生成结果与输入隔离，不隐式修改调用方对象。
-  // 失败/边界：make_ticket_value 返回 RDMA_SC_INVALID_STATE；典型拒绝条件为“CMQ ticket construction failed”“CMQ ticket validation failed”；失败路径不提交部分状态或转移未声明资源。
+  // 功能：make_ticket_value 先经 UVM factory 构造并 clone 候选 ticket，使测试可观测
+  //   factory/clone 故障；候选通过后再直接构造 exact rdma_cmq_ticket，
+  //   作为 journal digest 可接受的 canonical authority 值。
+  // 输入/输出及副作用：command_id、Function/CMQ handle、slot_sequence、SQ
+  //   位置、opcode_key 与 absolute_deadline 为输入；ticket 先清空，成功时输出
+  //   与输入及 factory 候选图均无别名的 exact base 值，不改写输入。
+  // 失败/边界：factory 构造、nested 快照、validate/clone 契约、direct
+  //   canonical 快照或最终形状任一失败均返回 INVALID_STATE；已武装
+  //   clone-self 故障仍在 canonicalization 前被消费，且失败不发布部分 ticket。
   protected function rdma_status make_ticket_value(
     string name,
     longint unsigned command_id,
@@ -4110,6 +4170,11 @@ class rdma_cmq_engine extends uvm_object;
     rdma_status status;
     uvm_object cloned_object;
     rdma_cmq_ticket detached_ticket;
+    rdma_cmq_ticket canonical_ticket;
+    rdma_handle function_snapshot_base;
+    rdma_handle cmq_snapshot;
+    rdma_function_handle function_snapshot;
+    rdma_cmq_opcode_key opcode_snapshot;
 
     ticket = rdma_cmq_ticket::type_id::create(name);
     if (ticket == null)
@@ -4156,7 +4221,32 @@ class rdma_cmq_engine extends uvm_object;
       ticket = null;
       return invalid_state("CMQ ticket snapshot clone contract failed");
     end
-    ticket = detached_ticket;
+    if (!rdma_cmq_try_snapshot_handle_direct(
+          detached_ticket.function_h, 1'b0, function_snapshot_base
+        ) || !$cast(function_snapshot, function_snapshot_base) ||
+        !rdma_cmq_try_snapshot_handle_direct(
+          detached_ticket.cmq_h, 1'b0, cmq_snapshot
+        ) || !rdma_cmq_try_snapshot_opcode_key_direct(
+          detached_ticket.opcode_key, opcode_snapshot
+        )) begin
+      ticket = null;
+      return invalid_state("CMQ ticket canonical snapshot failed");
+    end
+    canonical_ticket = new({name, "_canonical"});
+    canonical_ticket.command_id = detached_ticket.command_id;
+    canonical_ticket.function_h = function_snapshot;
+    canonical_ticket.cmq_h = cmq_snapshot;
+    canonical_ticket.slot_sequence = detached_ticket.slot_sequence;
+    canonical_ticket.sq_index = detached_ticket.sq_index;
+    canonical_ticket.sq_wrap = detached_ticket.sq_wrap;
+    canonical_ticket.opcode_key = opcode_snapshot;
+    canonical_ticket.absolute_deadline = detached_ticket.absolute_deadline;
+    if (!rdma_cmq_ticket_shape_valid(canonical_ticket) ||
+        !same_ticket_value(canonical_ticket, detached_ticket)) begin
+      ticket = null;
+      return invalid_state("CMQ ticket canonical value is invalid");
+    end
+    ticket = canonical_ticket;
     return rdma_status::success();
   endfunction
 
@@ -4195,36 +4285,88 @@ class rdma_cmq_engine extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：checked_record_snapshot 复制 source、snapshot 的受控字段并生成独立快照，供查询、编码或恢复使用；源对象保持不变。
-  // 输入/输出及副作用：source（输入）、snapshot（输出）；checked_record_snapshot 读取 source、snapshot 并使用字段 snapshot、cloned_object，并写入 snapshot；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：checked_record_snapshot 返回 函数体规定的失败状态；具体拒绝条件包括 “CMQ slot record source is null”；“CMQ slot record snapshot clone contract failed”；“CMQ slot record snapshot changed value”；失败路径不提交部分状态、不隐式重试，也不转移未声明资源。
+  // 功能：checked_record_snapshot 先验证 factory-backed slot record clone 契约，
+  //   再直接重建 exact rdma_cmq_slot_record/ticket/expected 值供预分配发布。
+  // 输入/输出及副作用：source 为只读候选；snapshot 先清空，成功时输出
+  //   与 source/factory clone 都无别名的 exact graph，不修改 slot/ticket 输入。
+  // 失败/边界：source/ticket/expected 不完整，clone 返回 null/self/变值，
+  //   nested direct snapshot 失败，或 canonical record 不等值时返回 INVALID_STATE；
+  //   factory clone-self 故障仍在 exact 重建前可观测，失败不发布部分图。
   protected function rdma_status checked_record_snapshot(
     rdma_cmq_slot_record source,
     output rdma_cmq_slot_record snapshot
   );
     uvm_object cloned_object;
+    rdma_cmq_slot_record factory_snapshot;
+    rdma_cmq_slot_record canonical_snapshot;
+    rdma_cmq_ticket canonical_ticket;
+    rdma_cmq_expected_response canonical_expected;
+    rdma_handle function_snapshot_base;
+    rdma_handle cmq_snapshot;
+    rdma_function_handle function_snapshot;
+    rdma_cmq_opcode_key opcode_snapshot;
+    rdma_status status;
 
     snapshot = null;
     if (source == null)
       return invalid_state("CMQ slot record source is null");
     cloned_object = source.clone();
-    if (cloned_object == null || !$cast(snapshot, cloned_object) ||
-        snapshot == source) begin
+    if (cloned_object == null || !$cast(factory_snapshot, cloned_object) ||
+        factory_snapshot == source) begin
       snapshot = null;
       return invalid_state("CMQ slot record snapshot clone contract failed");
     end
-    if (snapshot.slot_sequence != source.slot_sequence ||
-        snapshot.sq_index != source.sq_index ||
-        snapshot.sq_wrap != source.sq_wrap ||
-        snapshot.state != source.state ||
-        snapshot.command_token != source.command_token ||
-        !same_ticket_value(snapshot.ticket, source.ticket) ||
-        !same_expected_value(snapshot.expected, source.expected) ||
-        snapshot.ticket == source.ticket ||
-        snapshot.expected == source.expected) begin
+    if (factory_snapshot.slot_sequence != source.slot_sequence ||
+        factory_snapshot.sq_index != source.sq_index ||
+        factory_snapshot.sq_wrap != source.sq_wrap ||
+        factory_snapshot.state != source.state ||
+        factory_snapshot.command_token != source.command_token ||
+        !same_ticket_value(factory_snapshot.ticket, source.ticket) ||
+        !same_expected_value(factory_snapshot.expected, source.expected) ||
+        factory_snapshot.ticket == source.ticket ||
+        factory_snapshot.expected == source.expected) begin
       snapshot = null;
       return invalid_state("CMQ slot record snapshot changed value");
     end
+    if (!rdma_cmq_try_snapshot_handle_direct(
+          factory_snapshot.ticket.function_h, 1'b0, function_snapshot_base
+        ) || !$cast(function_snapshot, function_snapshot_base) ||
+        !rdma_cmq_try_snapshot_handle_direct(
+          factory_snapshot.ticket.cmq_h, 1'b0, cmq_snapshot
+        ) || !rdma_cmq_try_snapshot_opcode_key_direct(
+          factory_snapshot.ticket.opcode_key, opcode_snapshot
+        )) begin
+      return invalid_state("CMQ slot record ticket canonical snapshot failed");
+    end
+    canonical_ticket = new("cmq_slot_record_canonical_ticket");
+    canonical_ticket.command_id = factory_snapshot.ticket.command_id;
+    canonical_ticket.function_h = function_snapshot;
+    canonical_ticket.cmq_h = cmq_snapshot;
+    canonical_ticket.slot_sequence = factory_snapshot.ticket.slot_sequence;
+    canonical_ticket.sq_index = factory_snapshot.ticket.sq_index;
+    canonical_ticket.sq_wrap = factory_snapshot.ticket.sq_wrap;
+    canonical_ticket.opcode_key = opcode_snapshot;
+    canonical_ticket.absolute_deadline =
+      factory_snapshot.ticket.absolute_deadline;
+    canonical_expected = new("cmq_slot_record_canonical_expected");
+    canonical_expected.hardware_opcode =
+      factory_snapshot.expected.hardware_opcode;
+    canonical_expected.variant = factory_snapshot.expected.variant;
+    status = canonical_expected.validate();
+    if (!rdma_cmq_ticket_shape_valid(canonical_ticket) || status == null ||
+        !status.ok() ||
+        !same_ticket_value(canonical_ticket, factory_snapshot.ticket) ||
+        !same_expected_value(canonical_expected, factory_snapshot.expected))
+      return invalid_state("CMQ slot record canonical value is invalid");
+    canonical_snapshot = new("cmq_slot_record_canonical_snapshot");
+    canonical_snapshot.slot_sequence = factory_snapshot.slot_sequence;
+    canonical_snapshot.sq_index = factory_snapshot.sq_index;
+    canonical_snapshot.sq_wrap = factory_snapshot.sq_wrap;
+    canonical_snapshot.state = factory_snapshot.state;
+    canonical_snapshot.ticket = canonical_ticket;
+    canonical_snapshot.expected = canonical_expected;
+    canonical_snapshot.command_token = factory_snapshot.command_token;
+    snapshot = canonical_snapshot;
     return rdma_status::success();
   endfunction
 
@@ -5887,7 +6029,6 @@ class rdma_cmq_engine extends uvm_object;
           item.dependency_mapping == null || item.dependency_image == null ||
           item.status == null || item.command.opcode_key == null ||
           item.ticket.opcode_key == null || item.entry_key.len() == 0 ||
-          item.command_token == 0 ||
           item.command.opcode_key.profile_name != service_name ||
           item.ticket.opcode_key.profile_name != service_name ||
           item.slot_sequence != item.ticket.slot_sequence ||
@@ -6052,8 +6193,9 @@ class rdma_cmq_engine extends uvm_object;
   // 功能：验证并直接复制与 detached record 一一对应的预分配发布批次。
   // 输入/输出及副作用：source、source_record、record_snapshot 为输入，snapshot
   //   入口清空；成功复用 record_snapshot ticket 以维持 engine-owned alias。
-  // 失败/边界：批次/格式/cardinality、slot/key/token 或 expected-response 任一
-  //   partial/漂移时返回 INVALID_ARGUMENT/null；不修改 runtime slot/registry。
+  // 失败/边界：批次/SQE-CQE 格式/cardinality、slot/key/token 或 expected-response
+  //   任一 partial/漂移时返回 INVALID_ARGUMENT/null；doorbell 使用独立 codec 格式，
+  //   已由 record 校验与 digest 约束，不与 profile 的 SQE/CQE 格式强制相等。
   protected function rdma_status snapshot_preallocated_publish_batch_locked(
     input rdma_cmq_preallocated_publish_batch source,
     input rdma_cmq_batch_submission_record source_record,
@@ -6080,14 +6222,6 @@ class rdma_cmq_engine extends uvm_object;
         RDMA_SC_INVALID_ARGUMENT,
         "CMQ preallocated publication batch is incomplete or inconsistent"
       );
-    if (source_record.doorbell_image.endian != source.profile_endian ||
-        source_record.doorbell_image.hardware_version !=
-          source.profile_hardware_version)
-      return journal_status(
-        RDMA_SC_INVALID_ARGUMENT,
-        "CMQ preallocated profile format disagrees with doorbell image"
-      );
-
     candidate = new("journal_preallocated_batch_snapshot");
     candidate.batch_key = source.batch_key;
     candidate.attempt_id = source.attempt_id;
@@ -6132,7 +6266,6 @@ class rdma_cmq_engine extends uvm_object;
           ) || source_item.entry_key != source_record.items[i].entry_key ||
           source_item.command_token !=
             source_record.items[i].command_token ||
-          source_item.command_token == 0 ||
           source_record.items[i].sqe_image.endian !=
             source.profile_endian ||
           source_record.items[i].sqe_image.hardware_version !=
@@ -6649,7 +6782,6 @@ class rdma_cmq_engine extends uvm_object;
               preallocated_item.command_key.len() == 0 ||
               preallocated_item.entry_key.len() == 0 ||
               preallocated_item.entry_key != item.entry_key ||
-              preallocated_item.command_token == 0 ||
               preallocated_item.command_token != item.command_token ||
               preallocated_item.slot_record.ticket != item.ticket ||
               preallocated_item.slot_record.slot_sequence !=
@@ -6727,6 +6859,10 @@ class rdma_cmq_engine extends uvm_object;
     record.submission_effect = RDMA_SUBMIT_EFFECT_MMIO_MAYBE_VISIBLE;
     record.attempt_effect = RDMA_SUBMIT_EFFECT_MMIO_MAYBE_VISIBLE;
     record.observer_armed = 1'b1;
+    if (fenced_batch_key == batch_key) begin
+      fenced_batch_key = "";
+      submission_fence_reason = "";
+    end
     arm_observers.delete(capability_key);
     preallocated_publish_batches.delete(batch_key);
   endfunction
@@ -7379,619 +7515,837 @@ class rdma_cmq_engine extends uvm_object;
     engine_lock.put(1);
   endtask
 
-  // 功能：在 rdma_cmq_engine 中，submit 执行受控事务并按后端提交证据推进状态机，同时保留失败阶段和 generation 证据。
-  // 输入/输出及副作用：request（输入）、ticket（输出）、status（输出）；输入 request/image/cursor 决定写入内容；成功时更新 PI/CI、slot ledger 或 pending
-  //   journal，并通过 output 返回结果。
-  // 失败/边界：submit 遇到锁、超时、generation 变化或提交证据不完整时保持原状态，不推进游标。
-  task submit(
-    rdma_cmq_command_desc request,
-    output rdma_cmq_ticket ticket,
-    output rdma_status status
+  // 功能：直接复制 submit 路径要返回或写入 journal 的完整 status 标量，
+  //   避免 transport 已发生副作用后再依赖 UVM factory/clone。
+  // 输入/输出及副作用：source/name 为只读输入；返回调用方拥有的新 status，
+  //   不修改 source，也不读取共享 last_* 证据。
+  // 失败/边界：source 为 null、runtime subtype 或枚举 shape 非法时返回独立
+  //   INVALID_STATE；函数始终返回非空对象。
+  protected function rdma_status copy_submit_status_direct(
+    input rdma_status source,
+    input string name
   );
-    rdma_cmq_command_desc requests[];
-    rdma_cmq_ticket tickets[];
-    rdma_status item_statuses[];
-    rdma_status batch_status;
+    rdma_status snapshot;
 
-    ticket = null;
-    status = invalid_state("CMQ submit did not complete");
-    requests = new[1];
-    requests[0] = request;
-    submit_batch(requests, tickets, item_statuses, batch_status);
-    if (item_statuses.size() != 1 || tickets.size() != 1) begin
-      status = invalid_state("CMQ one-item batch returned misaligned outputs");
-      return;
-    end
-    if (item_statuses[0] == null) begin
-      status = invalid_state("CMQ one-item batch returned null item status");
-      return;
-    end
-    if (!item_statuses[0].ok()) begin
-      status = rdma_cmq_clone_status_value(item_statuses[0]);
-      return;
-    end
-    if (batch_status == null) begin
-      status = invalid_state("CMQ one-item batch returned null batch status");
-      return;
-    end
-    if (!batch_status.ok()) begin
-      status = rdma_cmq_clone_status_value(batch_status);
-      return;
-    end
-    if (tickets[0] == null) begin
-      status = invalid_state("CMQ one-item batch published no ticket");
-      return;
-    end
-    ticket = tickets[0];
-    status = rdma_status::success();
-  endtask
+    if (!rdma_cmq_status_shape_valid(source))
+      return rdma_cmq_direct_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ observed submit status is null or malformed"
+      );
 
-  // 功能：在 rdma_cmq_engine 中，submit_batch 执行受控事务并按后端提交证据推进状态机，同时保留失败阶段和 generation 证据。
-  // 输入/输出及副作用：requests（输入）、tickets（输出）、item_statuses（输出）、batch_status（输出）；输入 request/image/cursor 决定写入内容；成功时更新
-  //   PI/CI、slot ledger 或 pending journal，并通过 output 返回结果。
-  // 失败/边界：submit_batch 遇到锁、超时、generation 变化或提交证据不完整时保持原状态，不推进游标。
-  task submit_batch(
-    input rdma_cmq_command_desc requests[],
-    output rdma_cmq_ticket tickets[],
-    output rdma_status item_statuses[],
+    snapshot = new(name);
+    snapshot.category = source.category;
+    snapshot.code = source.code;
+    snapshot.hardware_code = source.hardware_code;
+    snapshot.hardware_code_valid = source.hardware_code_valid;
+    snapshot.source_engine = source.source_engine;
+    snapshot.function_uid = source.function_uid;
+    snapshot.generation = source.generation;
+    snapshot.resource_id = source.resource_id;
+    snapshot.command_id = source.command_id;
+    snapshot.wr_id = source.wr_id;
+    snapshot.severity = source.severity;
+    snapshot.retryable = source.retryable;
+    snapshot.message = source.message;
+    return snapshot;
+  endfunction
+
+  // 功能：为一个 input-aligned submit item 直接建立本地拒绝默认结果，
+  //   operation 与 observation status 从构造时起始终互相独立且非空。
+  // 输入/输出及副作用：name 仅用于新对象诊断名；返回调用方拥有的 result。
+  // 失败/边界：默认值表示尚未发布的 PRE_SUBMIT_REJECTED，ticket/IDs 为空且
+  //   recovery_required=0；后续 admission 必须显式覆盖 operation evidence。
+  protected function rdma_cmq_execution_result new_submit_result_direct(
+    input string name
+  );
+    rdma_cmq_execution_result result;
+
+    result = new(name);
+    result.status = rdma_cmq_direct_status(
+      RDMA_SC_INVALID_STATE, "CMQ submit item was not admitted"
+    );
+    result.observation_status = rdma_cmq_direct_status(RDMA_SC_OK);
+    result.submission_effect = RDMA_SUBMIT_EFFECT_PRE_SUBMIT_REJECTED;
+    result.attempt_effect = RDMA_SUBMIT_EFFECT_PRE_SUBMIT_REJECTED;
+    result.completion_phase = RDMA_CMQ_COMPLETION_NONE;
+    result.recovery_required = 1'b0;
+    return result;
+  endfunction
+
+  // 功能：从 retained journal item 构造完整 detached observed result，
+  //   并把 operation outcome 与本次 observation health 分开发布。
+  // 输入/输出及副作用：record/item/observation_code/message 为输入；result
+  //   入口清空，成功由既有 nonfatal snapshot seam 发布独立 ticket/owner/DMA/status。
+  // 失败/边界：record/item/command identity 不完整，或嵌套 snapshot 拒绝时返回
+  //   非空错误与 null result；不修改 journal 或 lifecycle evidence。
+  protected function rdma_status build_observed_result_locked(
+    input rdma_cmq_batch_submission_record record,
+    input rdma_cmq_batch_submission_item_record item,
+    input rdma_status_code_e observation_code,
+    input string observation_message,
+    output rdma_cmq_execution_result result
+  );
+    rdma_cmq_execution_result source;
+    rdma_cmq_command_identity command_identity;
+    string failure_reason;
+
+    result = null;
+    if (record == null || item == null || item.command == null ||
+        item.status == null)
+      return journal_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ observed result source journal item is incomplete"
+      );
+
+    command_identity = new("cmq_observed_command_identity");
+    if (!command_identity.capture_from(item.command, failure_reason))
+      return journal_status(
+        RDMA_SC_INVALID_STATE,
+        {"CMQ observed command identity capture failed: ", failure_reason}
+      );
+
+    source = new("cmq_observed_result_source");
+    source.ticket = item.ticket;
+    source.completion = item.completion;
+    source.status = item.status;
+    source.observation_status = rdma_cmq_direct_status(
+      observation_code, observation_message
+    );
+    source.command_identity = command_identity;
+    source.recovery_owner = item.recovery_owner;
+    source.dma_context = item.dma_context;
+    source.submission_effect = item.submission_effect;
+    source.attempt_effect = item.attempt_effect;
+    source.completion_phase = item.completion_phase;
+    source.batch_key = record.batch_key;
+    source.batch_id = record.batch_id;
+    source.attempt_id = record.attempt_id;
+    source.recovery_required = item.recovery_required;
+    return snapshot_execution_result_locked(source, result);
+  endfunction
+
+  // 功能：提交输入对齐的 observed CMQ batch，在 transport 前安装完整 journal、
+  //   ticket index、preallocation、profile 与 authentic MMIO observer 图。
+  // 输入/输出及副作用：commands 为调用方输入；results 与 commands 等长同序，
+  //   batch_status 只描述 orchestration；成功 admission 可能写 Host-memory/MMIO，
+  //   并由 observer 或同步返回更新 engine-owned journal/fence/runtime。
+  // 失败/边界：空 batch 在取锁前无条件返回 OK；本地拒绝不分配 ID 或调用 transport；
+  //   PRE effect 原子回滚，Host 可见、UNOBSERVED 或已 arm 结果保留恢复 authority。
+  task submit_batch_observed(
+    input rdma_cmq_command_desc commands[],
+    output rdma_cmq_execution_result results[],
     output rdma_status batch_status
   );
-    rdma_cmq_ticket caller_tickets[CMQ_DEPTH];
-    rdma_cmq_slot_record tentative_records[CMQ_DEPTH];
-    rdma_status tentative_success_statuses[CMQ_DEPTH];
+    rdma_cmq_batch_submission_record record_candidate;
+    rdma_cmq_batch_submission_record retained_record;
+    rdma_cmq_preallocated_publish_batch preallocated_candidate;
+    rdma_cmq_mmio_arm_observer observer;
     rdma_doorbell_dependency dependencies[$];
-    int unsigned original_indices[CMQ_DEPTH];
-    bit [4:0] tentative_tokens[CMQ_DEPTH];
-    time tentative_deadlines[CMQ_DEPTH];
-    bit tentative_token_reserved[CMQ_DEPTH];
-    bit preserve_item_status[];
-    int unsigned success_count;
+    rdma_doorbell_desc doorbell_candidate;
+    rdma_doorbell_desc doorbell_snapshot_desc;
+    rdma_doorbell_submission_result transport_result;
+    rdma_function_binding journal_binding;
+    rdma_function_identity journal_identity;
     rdma_function_handle active_function;
+    rdma_handle journal_cmq_h;
     rdma_handle doorbell_encode_target;
     rdma_hw_image doorbell_image;
     rdma_hw_image doorbell_snapshot;
-    rdma_doorbell_desc doorbell_candidate;
-    rdma_doorbell_desc doorbell_snapshot_desc;
-    rdma_doorbell_result doorbell_result;
+    int unsigned request_indices[$];
+    rdma_cmq_journal_digest_t image_digests[$];
+    rdma_cmq_journal_digest_t authority_digests[$];
+    bit local_result_finalized[];
     rdma_status status;
     rdma_status transaction_status;
-    rdma_status successful_batch_status;
+    rdma_status operation_status;
+    rdma_status_code_e observation_code;
+    rdma_submission_effect_e returned_effect;
+    longint unsigned batch_id;
+    longint unsigned attempt_id;
     longint unsigned final_sequence;
+    longint unsigned used;
     int unsigned final_pi;
     bit final_polarity;
     time minimum_remaining;
     time remaining;
-    longint unsigned used;
     bit transaction_failed;
     bit staged_profile_format_valid;
     rdma_byte_endian_e staged_profile_endian;
     int unsigned staged_profile_hardware_version;
+    bit observer_armed;
+    bit retry_safe;
+    string batch_key;
+    string capability_key;
+    string observation_message;
 
-    tickets = new[requests.size()];
-    item_statuses = new[requests.size()];
-    preserve_item_status = new[requests.size()];
-    foreach (tickets[i]) begin
-      tickets[i] = null;
-      item_statuses[i] = invalid_state("CMQ batch item was not published");
-      preserve_item_status[i] = 1'b0;
+    results = new[commands.size()];
+    batch_status = rdma_cmq_direct_status(
+      RDMA_SC_INVALID_STATE, "CMQ observed batch did not complete"
+    );
+    if (commands.size() == 0) begin
+      batch_status = rdma_cmq_direct_status(RDMA_SC_OK);
+      return;
     end
-    batch_status = invalid_state("CMQ batch submit did not complete");
-    success_count = 0;
+
+    local_result_finalized = new[commands.size()];
+    foreach (results[i]) begin
+      results[i] = new_submit_result_direct(
+        $sformatf("cmq_observed_result_%0d", i)
+      );
+      local_result_finalized[i] = 1'b0;
+    end
+
     transaction_failed = 1'b0;
     transaction_status = null;
-    successful_batch_status = null;
     staged_profile_format_valid = 1'b0;
     staged_profile_endian = RDMA_ENDIAN_LITTLE;
     staged_profile_hardware_version = 0;
     dependencies.delete();
-    foreach (tentative_token_reserved[i]) begin
-      tentative_token_reserved[i] = 1'b0;
-      caller_tickets[i] = null;
-      tentative_records[i] = null;
-      tentative_success_statuses[i] = null;
-      original_indices[i] = 0;
-      tentative_tokens[i] = '0;
-      tentative_deadlines[i] = 0;
-    end
 
     engine_lock.get(1);
     if (engine_state != RDMA_CMQ_ENGINE_ACTIVE) begin
-      batch_status = invalid_state("CMQ submit requires an ACTIVE engine");
-      foreach (item_statuses[i])
-        item_statuses[i] = rdma_cmq_clone_status_value(batch_status);
+      batch_status = rdma_cmq_direct_status(
+        RDMA_SC_INVALID_STATE, "CMQ submit requires an ACTIVE engine"
+      );
+      foreach (results[i])
+        results[i].status = copy_submit_status_direct(
+          batch_status, $sformatf("cmq_inactive_item_%0d", i)
+        );
       engine_lock.put(1);
       return;
     end
-    if (prepared_binding == null || cmq_snapshot == null ||
-        backing_mapping == null || scheduler == null || profile == null) begin
-      batch_status = invalid_state("CMQ ACTIVE publication authority is missing");
-      foreach (item_statuses[i])
-        item_statuses[i] = rdma_cmq_clone_status_value(batch_status);
+    if (prepared_binding == null || dma_context == null ||
+        cmq_snapshot == null || backing_mapping == null ||
+        transport == null || profile == null) begin
+      batch_status = rdma_cmq_direct_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ ACTIVE publication authority is missing"
+      );
+      foreach (results[i])
+        results[i].status = copy_submit_status_direct(
+          batch_status, $sformatf("cmq_missing_authority_item_%0d", i)
+        );
       engine_lock.put(1);
       return;
     end
+    if (fenced_batch_key.len() != 0) begin
+      foreach (results[i])
+        results[i].status = rdma_cmq_direct_status(
+          RDMA_SC_RESOURCE_BUSY,
+          "CMQ submission is fenced by a retained batch"
+        );
+      batch_status = rdma_cmq_direct_status(RDMA_SC_OK);
+      engine_lock.put(1);
+      return;
+    end
+
     active_function = prepared_binding.make_handle();
     if (active_function == null) begin
-      batch_status = invalid_state("CMQ ACTIVE Function handle is missing");
-      foreach (item_statuses[i])
-        item_statuses[i] = rdma_cmq_clone_status_value(batch_status);
+      batch_status = rdma_cmq_direct_status(
+        RDMA_SC_INVALID_STATE, "CMQ ACTIVE Function handle is missing"
+      );
+      foreach (results[i])
+        results[i].status = copy_submit_status_direct(
+          batch_status, $sformatf("cmq_missing_function_item_%0d", i)
+        );
       engine_lock.put(1);
       return;
     end
     status = ring_used(used);
-    if (!status.ok()) begin
-      batch_status = rdma_cmq_clone_status_value(status);
-      foreach (item_statuses[i])
-        item_statuses[i] = rdma_cmq_clone_status_value(batch_status);
+    if (status == null || !status.ok()) begin
+      batch_status = copy_submit_status_direct(
+        status, "cmq_ring_status"
+      );
+      foreach (results[i])
+        results[i].status = copy_submit_status_direct(
+          batch_status, $sformatf("cmq_ring_item_%0d", i)
+        );
       engine_lock.put(1);
       return;
     end
-    if (requests.size() == 0) begin
-      batch_status = rdma_status::success();
-      engine_lock.put(1);
-      return;
+    status = prepared_binding.snapshot_complete_nonfatal(journal_binding);
+    if (status == null || !status.ok() || journal_binding == null) begin
+      transaction_status = (status == null) ? rdma_cmq_direct_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ journal binding snapshot returned null status"
+      ) : copy_submit_status_direct(status, "cmq_binding_snapshot_status");
+      transaction_failed = 1'b1;
     end
-    staged_profile_format_valid = profile_image_format_valid;
-    staged_profile_endian = profile_image_endian;
-    staged_profile_hardware_version = profile_hardware_version;
+    if (!transaction_failed) begin
+      status = journal_binding.snapshot_identity_nonfatal(journal_identity);
+      if (status == null || !status.ok() || journal_identity == null) begin
+        transaction_status = (status == null) ? rdma_cmq_direct_status(
+          RDMA_SC_INVALID_STATE,
+          "CMQ journal Function identity snapshot returned null status"
+        ) : copy_submit_status_direct(
+          status, "cmq_identity_snapshot_status"
+        );
+        transaction_failed = 1'b1;
+      end
+    end
+    if (!transaction_failed &&
+        !rdma_cmq_try_snapshot_handle_direct(
+          cmq_snapshot.handle, 1'b0, journal_cmq_h
+        )) begin
+      transaction_status = rdma_cmq_direct_status(
+        RDMA_SC_INVALID_STATE, "CMQ journal handle snapshot failed"
+      );
+      transaction_failed = 1'b1;
+    end
 
-    foreach (requests[i]) begin : stage_each_request
-      rdma_cmq_command_desc command_snapshot;
-      rdma_cmq_slot_context slot_context;
-      rdma_cmq_slot_context slot_context_snapshot;
-      rdma_hw_image profile_sqe;
-      rdma_hw_image sqe_snapshot;
-      rdma_cmq_expected_response profile_expected;
-      rdma_cmq_expected_response expected_snapshot;
-      rdma_cmq_ticket authority_ticket;
-      rdma_cmq_ticket caller_ticket;
-      rdma_cmq_slot_record record_candidate;
-      rdma_cmq_slot_record record_snapshot;
-      rdma_doorbell_dependency dependency_candidate;
-      rdma_doorbell_dependency dependency_snapshot;
-      rdma_dma_mapping dependency_mapping;
-      time absolute_deadline;
-      longint unsigned slot_sequence;
-      longint unsigned relative_offset;
-      longint unsigned expected_backing_target;
-      longint unsigned command_id;
-      int unsigned sq_index;
-      int unsigned selected_token;
-      bit sq_wrap;
-      bit token_found;
-      bit snapshot_invariant_failed;
+    record_candidate = new("cmq_submission_record_candidate");
+    preallocated_candidate = new("cmq_publish_batch_candidate");
+    if (!transaction_failed) begin
+      record_candidate.engine_instance_id = engine_instance_id;
+      record_candidate.engine_incarnation = engine_incarnation;
+      record_candidate.function_identity = journal_identity;
+      record_candidate.binding = journal_binding;
+      record_candidate.cmq_h = journal_cmq_h;
+      record_candidate.start_sequence = publish_seq;
+      record_candidate.state = RDMA_CMQ_SUBMISSION_PENDING_EFFECT;
+      record_candidate.submission_effect =
+        RDMA_SUBMIT_EFFECT_HOST_MEMORY_MAYBE_VISIBLE;
+      record_candidate.attempt_effect =
+        RDMA_SUBMIT_EFFECT_HOST_MEMORY_MAYBE_VISIBLE;
+      record_candidate.observer_armed = 1'b0;
+      record_candidate.publication_retry_safe = 1'b0;
+      staged_profile_format_valid = profile_image_format_valid;
+      staged_profile_endian = profile_image_endian;
+      staged_profile_hardware_version = profile_hardware_version;
+    end
 
-      command_snapshot = null;
-      slot_context_snapshot = null;
-      profile_sqe = null;
-      sqe_snapshot = null;
-      profile_expected = null;
-      expected_snapshot = null;
-      authority_ticket = null;
-      caller_ticket = null;
-      record_candidate = null;
-      record_snapshot = null;
-      dependency_candidate = null;
-      dependency_snapshot = null;
-      dependency_mapping = null;
-      token_found = 1'b0;
-      selected_token = 0;
-      snapshot_invariant_failed = 1'b0;
+    if (!transaction_failed) begin
+      foreach (commands[i]) begin : stage_observed_command
+        rdma_cmq_command_desc command_snapshot;
+        rdma_cmq_command_identity command_identity;
+        rdma_cmq_slot_context slot_context;
+        rdma_cmq_slot_context slot_context_snapshot;
+        rdma_hw_image profile_sqe;
+        rdma_hw_image sqe_snapshot;
+        rdma_cmq_expected_response profile_expected;
+        rdma_cmq_expected_response expected_snapshot;
+        rdma_cmq_ticket authority_ticket;
+        rdma_cmq_slot_record slot_candidate;
+        rdma_cmq_slot_record slot_snapshot;
+        rdma_doorbell_dependency dependency_candidate;
+        rdma_doorbell_dependency dependency_snapshot;
+        rdma_dma_mapping dependency_mapping;
+        rdma_cmq_batch_submission_item_record item;
+        rdma_cmq_preallocated_publish_item publish_item;
+        bit [58:0] candidate_token_incarnation;
+        time absolute_deadline;
+        longint unsigned slot_sequence;
+        longint unsigned relative_offset;
+        longint unsigned expected_backing_target;
+        longint unsigned command_id;
+        int unsigned sq_index;
+        int unsigned selected_token;
+        bit sq_wrap;
+        bit token_found;
+        bit snapshot_invariant_failed;
+        string identity_failure;
 
-      status = snapshot_command_value(requests[i], command_snapshot,
-                                      snapshot_invariant_failed);
-      if (!status.ok()) begin
-        if (snapshot_invariant_failed) begin
-          transaction_status = status;
+        command_snapshot = null;
+        command_identity = null;
+        slot_context_snapshot = null;
+        profile_sqe = null;
+        sqe_snapshot = null;
+        profile_expected = null;
+        expected_snapshot = null;
+        authority_ticket = null;
+        slot_candidate = null;
+        slot_snapshot = null;
+        dependency_candidate = null;
+        dependency_snapshot = null;
+        dependency_mapping = null;
+        token_found = 1'b0;
+        selected_token = 0;
+        snapshot_invariant_failed = 1'b0;
+
+        status = snapshot_command_value(
+          commands[i], command_snapshot, snapshot_invariant_failed
+        );
+        if (status == null)
+          status = rdma_cmq_direct_status(
+            RDMA_SC_INVALID_STATE,
+            "CMQ command snapshot returned null status"
+          );
+        if (!status.ok()) begin
+          if (snapshot_invariant_failed) begin
+            transaction_status = status;
+            transaction_failed = 1'b1;
+            break;
+          end
+          results[i].status = copy_submit_status_direct(
+            status, $sformatf("cmq_local_snapshot_reject_%0d", i)
+          );
+          local_result_finalized[i] = 1'b1;
+          continue;
+        end
+
+        command_identity = new($sformatf("cmq_command_identity_%0d", i));
+        if (!command_identity.capture_from(
+              command_snapshot, identity_failure
+            )) begin
+          transaction_status = rdma_cmq_direct_status(
+            RDMA_SC_INVALID_STATE,
+            {"CMQ command identity capture failed: ", identity_failure}
+          );
           transaction_failed = 1'b1;
           break;
         end
-        item_statuses[i] = rdma_cmq_clone_status_value(status);
-        preserve_item_status[i] = 1'b1;
-        continue;
-      end
-      if (command_snapshot.function_h.kind != active_function.kind ||
-          command_snapshot.function_h.function_uid !=
-            active_function.function_uid ||
-          command_snapshot.function_h.object_id != active_function.object_id) begin
-        item_statuses[i] = invalid_argument(
-          "CMQ command Function identity does not match ACTIVE binding"
-        );
-        preserve_item_status[i] = 1'b1;
-        continue;
-      end
-      if (command_snapshot.function_h.generation !=
-          active_function.generation) begin
-        item_statuses[i] = rdma_status::make(
-          RDMA_SC_STALE_GENERATION,
-          "CMQ command Function generation does not match ACTIVE binding"
-        );
-        preserve_item_status[i] = 1'b1;
-        continue;
-      end
-      if (command_snapshot.opcode_key.profile_name !=
-          profile.profile_name()) begin
-        item_statuses[i] = rdma_status::make(
-          RDMA_SC_UNSUPPORTED_OPCODE,
-          "CMQ command opcode profile does not match ACTIVE profile"
-        );
-        preserve_item_status[i] = 1'b1;
-        continue;
-      end
-      if ($isunknown(command_snapshot.timeout)) begin
-        item_statuses[i] = invalid_argument(
-          "CMQ command timeout contains an unknown bit"
-        );
-        preserve_item_status[i] = 1'b1;
-        continue;
-      end
-      absolute_deadline = $time + command_snapshot.timeout;
-      if ($isunknown(absolute_deadline) || absolute_deadline == 0 ||
-          absolute_deadline < $time) begin
-        item_statuses[i] = invalid_argument(
-          "CMQ command absolute deadline overflows simulation time"
-        );
-        preserve_item_status[i] = 1'b1;
-        continue;
-      end
-      if ((used + success_count) == CMQ_DEPTH) begin
-        item_statuses[i] = rdma_status::make(
-          RDMA_SC_QUEUE_FULL, "CMQ submission ring is full"
-        );
-        preserve_item_status[i] = 1'b1;
-        continue;
-      end
-
-      // Include the current candidate in the producer precheck.  A sequence
-      // at UINT64_MAX cannot be published because its dependency ID is the
-      // checked sequence + 1, so fail before constructing either value.
-      if (publish_seq >=
-          (64'hffff_ffff_ffff_ffff - success_count)) begin
-        transaction_status = poison_status(
-          "CMQ producer sequence addition overflows"
-        );
-        transaction_failed = 1'b1;
-        break;
-      end
-
-      for (int unsigned token_index = 0;
-           token_index < CMQ_DEPTH; token_index++) begin
-        if (!token_found && !token_in_use[token_index] &&
-            !tentative_token_reserved[token_index] &&
-            token_incarnation[token_index] != {59{1'b1}}) begin
-          token_found = 1'b1;
-          selected_token = token_index;
+        results[i].command_identity = command_identity;
+        if (command_snapshot.function_h.kind != active_function.kind ||
+            command_snapshot.function_h.function_uid !=
+              active_function.function_uid ||
+            command_snapshot.function_h.object_id !=
+              active_function.object_id) begin
+          results[i].status = rdma_cmq_direct_status(
+            RDMA_SC_INVALID_ARGUMENT,
+            "CMQ command Function identity does not match ACTIVE binding"
+          );
+          local_result_finalized[i] = 1'b1;
+          continue;
         end
-      end
-      if (!token_found) begin
-        item_statuses[i] = rdma_status::make(
-          RDMA_SC_RESOURCE_EXHAUSTED, "CMQ command tokens are exhausted"
-        );
-        preserve_item_status[i] = 1'b1;
-        continue;
-      end
-      token_incarnation[selected_token]++;
-      tentative_token_reserved[selected_token] = 1'b1;
-      command_id = {token_incarnation[selected_token],
-                    selected_token[4:0]};
-      if (command_id == 0) begin
-        tentative_token_reserved[selected_token] = 1'b0;
-        item_statuses[i] = rdma_status::make(
-          RDMA_SC_RESOURCE_EXHAUSTED, "CMQ command ID is exhausted"
-        );
-        preserve_item_status[i] = 1'b1;
-        continue;
-      end
+        if (command_snapshot.function_h.generation !=
+            active_function.generation) begin
+          results[i].status = rdma_cmq_direct_status(
+            RDMA_SC_STALE_GENERATION,
+            "CMQ command Function generation does not match ACTIVE binding"
+          );
+          local_result_finalized[i] = 1'b1;
+          continue;
+        end
+        if (command_snapshot.opcode_key.profile_name !=
+            profile.profile_name()) begin
+          results[i].status = rdma_cmq_direct_status(
+            RDMA_SC_UNSUPPORTED_OPCODE,
+            "CMQ command opcode profile does not match ACTIVE profile"
+          );
+          local_result_finalized[i] = 1'b1;
+          continue;
+        end
+        if ($isunknown(command_snapshot.timeout)) begin
+          results[i].status = rdma_cmq_direct_status(
+            RDMA_SC_INVALID_ARGUMENT,
+            "CMQ command timeout contains an unknown bit"
+          );
+          local_result_finalized[i] = 1'b1;
+          continue;
+        end
+        absolute_deadline = $time + command_snapshot.timeout;
+        if ($isunknown(absolute_deadline) || absolute_deadline == 0 ||
+            absolute_deadline < $time) begin
+          results[i].status = rdma_cmq_direct_status(
+            RDMA_SC_INVALID_ARGUMENT,
+            "CMQ command absolute deadline overflows simulation time"
+          );
+          local_result_finalized[i] = 1'b1;
+          continue;
+        end
+        if ((used + record_candidate.items.size()) == CMQ_DEPTH) begin
+          results[i].status = rdma_cmq_direct_status(
+            RDMA_SC_QUEUE_FULL, "CMQ submission ring is full"
+          );
+          local_result_finalized[i] = 1'b1;
+          continue;
+        end
+        if (publish_seq >= 64'hffff_ffff_ffff_ffff -
+                           record_candidate.items.size()) begin
+          transaction_status = poison_status(
+            "CMQ producer sequence addition overflows"
+          );
+          transaction_failed = 1'b1;
+          break;
+        end
 
-      slot_sequence = publish_seq + success_count;
-      if (slot_sequence == 64'hffff_ffff_ffff_ffff) begin
-        transaction_status = poison_status(
-          "CMQ dependency identifier addition overflows"
-        );
-        transaction_failed = 1'b1;
-        break;
-      end
-      sq_index = slot_sequence % CMQ_DEPTH;
-      sq_wrap = (slot_sequence / CMQ_DEPTH) & 1'b1;
-      relative_offset = longint'(sq_index) * CMQE_BYTES;
-      if (backing_mapping.backing_addr.value >
-          (64'hffff_ffff_ffff_ffff - relative_offset)) begin
-        tentative_token_reserved[selected_token] = 1'b0;
-        item_statuses[i] = rdma_status::make(
-          RDMA_SC_DMA_TRANSLATION, "CMQ SQE backing address overflows"
-        );
-        preserve_item_status[i] = 1'b1;
-        continue;
-      end
-      expected_backing_target = backing_mapping.backing_addr.value +
-                                relative_offset;
+        for (int unsigned token_index = 0;
+             token_index < CMQ_DEPTH; token_index++) begin
+          bit staged_token;
 
-      slot_context = rdma_cmq_slot_context::type_id::create(
-        $sformatf("cmq_slot_context_%0d", slot_sequence)
-      );
-      if (slot_context == null) begin
-        transaction_status = invalid_state(
-          "CMQ slot context construction failed"
-        );
-        transaction_failed = 1'b1;
-        break;
-      end
-      status = checked_function_snapshot(
-        active_function, "CMQ submission slot", RDMA_SC_INVALID_STATE,
-        slot_context.function_h
-      );
-      if (!status.ok()) begin
-        transaction_status = status;
-        transaction_failed = 1'b1;
-        break;
-      end
-      status = checked_handle_snapshot(
-        cmq_snapshot.handle, "CMQ submission slot", RDMA_SC_INVALID_STATE,
-        slot_context.cmq_h
-      );
-      if (!status.ok()) begin
-        transaction_status = status;
-        transaction_failed = 1'b1;
-        break;
-      end
-      slot_context.backing_addr = backing_mapping.backing_addr;
-      slot_context.relative_offset = relative_offset;
-      slot_context.slot_sequence = slot_sequence;
-      slot_context.sq_index = sq_index;
-      slot_context.sq_wrap = sq_wrap;
-      status = slot_context.validate();
-      if (status == null || !status.ok()) begin
-        transaction_status = invalid_state(
-          "CMQ slot context validation failed"
-        );
-        transaction_failed = 1'b1;
-        break;
-      end
-      status = checked_slot_context_snapshot(slot_context,
-                                             slot_context_snapshot);
-      if (!status.ok()) begin
-        transaction_status = status;
-        transaction_failed = 1'b1;
-        break;
-      end
+          staged_token = 1'b0;
+          foreach (record_candidate.items[prior]) begin
+            if (record_candidate.items[prior].command_token == token_index)
+              staged_token = 1'b1;
+          end
+          if (!token_found && !token_in_use[token_index] &&
+              !staged_token &&
+              token_incarnation[token_index] != {59{1'b1}}) begin
+            token_found = 1'b1;
+            selected_token = token_index;
+          end
+        end
+        if (!token_found) begin
+          results[i].status = rdma_cmq_direct_status(
+            RDMA_SC_RESOURCE_EXHAUSTED,
+            "CMQ command tokens are exhausted"
+          );
+          local_result_finalized[i] = 1'b1;
+          continue;
+        end
+        candidate_token_incarnation =
+          token_incarnation[selected_token] + 1'b1;
+        command_id = {candidate_token_incarnation,
+                      selected_token[4:0]};
+        if (command_id == 0) begin
+          results[i].status = rdma_cmq_direct_status(
+            RDMA_SC_RESOURCE_EXHAUSTED, "CMQ command ID is exhausted"
+          );
+          local_result_finalized[i] = 1'b1;
+          continue;
+        end
 
-      status = profile.compose_sqe(command_snapshot, slot_context_snapshot,
-                                   profile_sqe, profile_expected);
-      if (status == null) begin
-        transaction_status = invalid_state(
-          "CMQ SQE composition returned null status"
-        );
-        transaction_failed = 1'b1;
-        break;
-      end
-      if (!status.ok()) begin
-        tentative_token_reserved[selected_token] = 1'b0;
-        item_statuses[i] = rdma_cmq_clone_status_value(status);
-        preserve_item_status[i] = 1'b1;
-        continue;
-      end
-      status = sqe_metadata_status(profile_sqe, expected_backing_target);
-      if (!status.ok()) begin
-        transaction_status = status;
-        transaction_failed = 1'b1;
-        break;
-      end
-      status = checked_image_snapshot(
-        profile_sqe, "CMQ SQE", RDMA_SC_INVALID_STATE, sqe_snapshot
-      );
-      if (!status.ok()) begin
-        transaction_status = status;
-        transaction_failed = 1'b1;
-        break;
-      end
-      status = sqe_metadata_status(sqe_snapshot, expected_backing_target);
-      if (!status.ok()) begin
-        transaction_status = status;
-        transaction_failed = 1'b1;
-        break;
-      end
-      if (!staged_profile_format_valid) begin
-        staged_profile_format_valid = 1'b1;
-        staged_profile_endian = sqe_snapshot.endian;
-        staged_profile_hardware_version = sqe_snapshot.hardware_version;
-      end
-      else if (sqe_snapshot.endian != staged_profile_endian ||
-               sqe_snapshot.hardware_version !=
-                 staged_profile_hardware_version) begin
-        transaction_status = invalid_state(
-          "CMQ profile changed its profile-wide SQE/CQE image format"
-        );
-        transaction_failed = 1'b1;
-        break;
-      end
-      status = checked_expected_snapshot(
-        profile_expected, "CMQ profile", RDMA_SC_INVALID_STATE,
-        expected_snapshot
-      );
-      if (!status.ok()) begin
-        transaction_status = status;
-        transaction_failed = 1'b1;
-        break;
-      end
+        slot_sequence = publish_seq + record_candidate.items.size();
+        if (slot_sequence == 64'hffff_ffff_ffff_ffff) begin
+          transaction_status = poison_status(
+            "CMQ dependency identifier addition overflows"
+          );
+          transaction_failed = 1'b1;
+          break;
+        end
+        sq_index = slot_sequence % CMQ_DEPTH;
+        sq_wrap = (slot_sequence / CMQ_DEPTH) & 1'b1;
+        relative_offset = longint'(sq_index) * CMQE_BYTES;
+        if (backing_mapping.backing_addr.value >
+            64'hffff_ffff_ffff_ffff - relative_offset) begin
+          results[i].status = rdma_cmq_direct_status(
+            RDMA_SC_DMA_TRANSLATION, "CMQ SQE backing address overflows"
+          );
+          local_result_finalized[i] = 1'b1;
+          continue;
+        end
+        expected_backing_target = backing_mapping.backing_addr.value +
+                                  relative_offset;
 
-      status = make_ticket_value(
-        $sformatf("cmq_authority_ticket_%0d", command_id), command_id,
-        active_function, cmq_snapshot.handle, slot_sequence, sq_index,
-        sq_wrap, command_snapshot.opcode_key, absolute_deadline,
-        authority_ticket
-      );
-      if (!status.ok()) begin
-        transaction_status = status;
-        transaction_failed = 1'b1;
-        break;
-      end
-      status = make_ticket_value(
-        $sformatf("cmq_caller_ticket_%0d", command_id), command_id,
-        active_function, cmq_snapshot.handle, slot_sequence, sq_index,
-        sq_wrap, command_snapshot.opcode_key, absolute_deadline,
-        caller_ticket
-      );
-      if (!status.ok()) begin
-        transaction_status = status;
-        transaction_failed = 1'b1;
-        break;
-      end
-
-      record_candidate = rdma_cmq_slot_record::type_id::create(
-        $sformatf("cmq_slot_record_%0d", slot_sequence)
-      );
-      if (record_candidate == null) begin
-        transaction_status = invalid_state(
-          "CMQ slot record construction failed"
+        slot_context = rdma_cmq_slot_context::type_id::create(
+          $sformatf("cmq_slot_context_%0d", slot_sequence)
         );
-        transaction_failed = 1'b1;
-        break;
-      end
-      record_candidate.slot_sequence = slot_sequence;
-      record_candidate.sq_index = sq_index;
-      record_candidate.sq_wrap = sq_wrap;
-      record_candidate.state = CMQ_SLOT_PUBLISHED;
-      record_candidate.ticket = authority_ticket;
-      record_candidate.expected = expected_snapshot;
-      record_candidate.command_token = selected_token[4:0];
-      status = checked_record_snapshot(record_candidate, record_snapshot);
-      if (!status.ok()) begin
-        transaction_status = status;
-        transaction_failed = 1'b1;
-        break;
-      end
-
-      dependency_candidate = rdma_doorbell_dependency::type_id::create(
-        $sformatf("cmq_dependency_%0d", slot_sequence + 1'b1)
-      );
-      status = make_mapping_snapshot(
-        backing_mapping, $sformatf("cmq_dependency_mapping_%0d",
-                                   slot_sequence), dependency_mapping
-      );
-      if (dependency_candidate == null || !status.ok() ||
-          dependency_mapping == null) begin
-        transaction_status = invalid_state(
-          "CMQ scheduler dependency construction failed"
+        if (slot_context == null) begin
+          transaction_status = rdma_cmq_direct_status(
+            RDMA_SC_INVALID_STATE, "CMQ slot context construction failed"
+          );
+          transaction_failed = 1'b1;
+          break;
+        end
+        status = checked_function_snapshot(
+          active_function, "CMQ submission slot", RDMA_SC_INVALID_STATE,
+          slot_context.function_h
         );
-        transaction_failed = 1'b1;
-        break;
-      end
-      dependency_candidate.dependency_id = slot_sequence + 1'b1;
-      dependency_candidate.stage = RDMA_DB_DEP_QUEUE_CONTEXT;
-      dependency_candidate.mapping = dependency_mapping;
-      dependency_candidate.relative_offset = relative_offset;
-      dependency_candidate.image = sqe_snapshot;
-      dependency_candidate.ready = 1'b1;
-      status = checked_dependency_snapshot(dependency_candidate,
-                                           dependency_snapshot);
-      if (!status.ok()) begin
-        transaction_status = status;
-        transaction_failed = 1'b1;
-        break;
-      end
+        if (status == null || !status.ok()) begin
+          transaction_status = copy_submit_status_direct(
+            status, "cmq_slot_function_status"
+          );
+          transaction_failed = 1'b1;
+          break;
+        end
+        status = checked_handle_snapshot(
+          cmq_snapshot.handle, "CMQ submission slot",
+          RDMA_SC_INVALID_STATE, slot_context.cmq_h
+        );
+        if (status == null || !status.ok()) begin
+          transaction_status = copy_submit_status_direct(
+            status, "cmq_slot_handle_status"
+          );
+          transaction_failed = 1'b1;
+          break;
+        end
+        slot_context.backing_addr = backing_mapping.backing_addr;
+        slot_context.relative_offset = relative_offset;
+        slot_context.slot_sequence = slot_sequence;
+        slot_context.sq_index = sq_index;
+        slot_context.sq_wrap = sq_wrap;
+        status = slot_context.validate();
+        if (status == null || !status.ok()) begin
+          transaction_status = rdma_cmq_direct_status(
+            RDMA_SC_INVALID_STATE, "CMQ slot context validation failed"
+          );
+          transaction_failed = 1'b1;
+          break;
+        end
+        status = checked_slot_context_snapshot(
+          slot_context, slot_context_snapshot
+        );
+        if (status == null || !status.ok()) begin
+          transaction_status = copy_submit_status_direct(
+            status, "cmq_slot_snapshot_status"
+          );
+          transaction_failed = 1'b1;
+          break;
+        end
 
-      original_indices[success_count] = i;
-      tentative_tokens[success_count] = selected_token[4:0];
-      tentative_deadlines[success_count] = absolute_deadline;
-      caller_tickets[success_count] = caller_ticket;
-      tentative_records[success_count] = record_snapshot;
-      tentative_success_statuses[success_count] = rdma_status::success();
-      dependencies.push_back(dependency_snapshot);
-      success_count++;
+        status = profile.compose_sqe(
+          command_snapshot, slot_context_snapshot,
+          profile_sqe, profile_expected
+        );
+        if (status == null) begin
+          transaction_status = rdma_cmq_direct_status(
+            RDMA_SC_INVALID_STATE, "CMQ SQE composition returned null status"
+          );
+          transaction_failed = 1'b1;
+          break;
+        end
+        if (!status.ok()) begin
+          results[i].status = copy_submit_status_direct(
+            status, $sformatf("cmq_local_compose_reject_%0d", i)
+          );
+          local_result_finalized[i] = 1'b1;
+          continue;
+        end
+        status = sqe_metadata_status(profile_sqe, expected_backing_target);
+        if (status == null || !status.ok()) begin
+          transaction_status = copy_submit_status_direct(
+            status, "cmq_sqe_metadata_status"
+          );
+          transaction_failed = 1'b1;
+          break;
+        end
+        status = checked_canonical_image_snapshot(
+          profile_sqe, "CMQ SQE", RDMA_SC_INVALID_STATE, sqe_snapshot
+        );
+        if (status == null || !status.ok()) begin
+          transaction_status = copy_submit_status_direct(
+            status, "cmq_sqe_snapshot_status"
+          );
+          transaction_failed = 1'b1;
+          break;
+        end
+        status = sqe_metadata_status(sqe_snapshot, expected_backing_target);
+        if (status == null || !status.ok()) begin
+          transaction_status = copy_submit_status_direct(
+            status, "cmq_sqe_snapshot_metadata_status"
+          );
+          transaction_failed = 1'b1;
+          break;
+        end
+        if (!staged_profile_format_valid) begin
+          staged_profile_format_valid = 1'b1;
+          staged_profile_endian = sqe_snapshot.endian;
+          staged_profile_hardware_version = sqe_snapshot.hardware_version;
+        end
+        else if (sqe_snapshot.endian != staged_profile_endian ||
+                 sqe_snapshot.hardware_version !=
+                   staged_profile_hardware_version) begin
+          transaction_status = rdma_cmq_direct_status(
+            RDMA_SC_INVALID_STATE,
+            "CMQ profile changed its profile-wide SQE/CQE image format"
+          );
+          transaction_failed = 1'b1;
+          break;
+        end
+        status = checked_expected_snapshot(
+          profile_expected, "CMQ profile", RDMA_SC_INVALID_STATE,
+          expected_snapshot
+        );
+        if (status == null || !status.ok()) begin
+          transaction_status = copy_submit_status_direct(
+            status, "cmq_expected_snapshot_status"
+          );
+          transaction_failed = 1'b1;
+          break;
+        end
+
+        status = make_ticket_value(
+          $sformatf("cmq_authority_ticket_%0d", command_id), command_id,
+          active_function, cmq_snapshot.handle, slot_sequence, sq_index,
+          sq_wrap, command_snapshot.opcode_key, absolute_deadline,
+          authority_ticket
+        );
+        if (status == null || !status.ok()) begin
+          transaction_status = copy_submit_status_direct(
+            status, "cmq_ticket_status"
+          );
+          transaction_failed = 1'b1;
+          break;
+        end
+
+        slot_candidate = rdma_cmq_slot_record::type_id::create(
+          $sformatf("cmq_slot_record_%0d", slot_sequence)
+        );
+        if (slot_candidate == null) begin
+          transaction_status = rdma_cmq_direct_status(
+            RDMA_SC_INVALID_STATE, "CMQ slot record construction failed"
+          );
+          transaction_failed = 1'b1;
+          break;
+        end
+        slot_candidate.slot_sequence = slot_sequence;
+        slot_candidate.sq_index = sq_index;
+        slot_candidate.sq_wrap = sq_wrap;
+        slot_candidate.state = CMQ_SLOT_PUBLISHED;
+        slot_candidate.ticket = authority_ticket;
+        slot_candidate.expected = expected_snapshot;
+        slot_candidate.command_token = selected_token[4:0];
+        status = checked_record_snapshot(slot_candidate, slot_snapshot);
+        if (status == null || !status.ok()) begin
+          transaction_status = copy_submit_status_direct(
+            status, "cmq_slot_record_snapshot_status"
+          );
+          transaction_failed = 1'b1;
+          break;
+        end
+
+        dependency_candidate = rdma_doorbell_dependency::type_id::create(
+          $sformatf("cmq_dependency_%0d", slot_sequence + 1'b1)
+        );
+        status = make_mapping_snapshot(
+          backing_mapping, $sformatf(
+            "cmq_dependency_mapping_%0d", slot_sequence
+          ), dependency_mapping
+        );
+        if (dependency_candidate == null || status == null ||
+            !status.ok() || dependency_mapping == null) begin
+          transaction_status = rdma_cmq_direct_status(
+            RDMA_SC_INVALID_STATE,
+            "CMQ scheduler dependency construction failed"
+          );
+          transaction_failed = 1'b1;
+          break;
+        end
+        dependency_candidate.dependency_id = slot_sequence + 1'b1;
+        dependency_candidate.stage = RDMA_DB_DEP_QUEUE_CONTEXT;
+        dependency_candidate.mapping = dependency_mapping;
+        dependency_candidate.relative_offset = relative_offset;
+        dependency_candidate.image = sqe_snapshot;
+        dependency_candidate.ready = 1'b1;
+        status = checked_dependency_snapshot(
+          dependency_candidate, dependency_snapshot
+        );
+        if (status == null || !status.ok()) begin
+          transaction_status = copy_submit_status_direct(
+            status, "cmq_dependency_snapshot_status"
+          );
+          transaction_failed = 1'b1;
+          break;
+        end
+
+        item = new($sformatf("cmq_submission_item_%0d", i));
+        item.request_index = i;
+        item.command = command_snapshot;
+        item.ticket = authority_ticket;
+        item.recovery_owner = null;
+        item.dma_context = dma_context;
+        item.sqe_image = sqe_snapshot;
+        item.dependency_mapping = backing_mapping;
+        item.dependency_offset = relative_offset;
+        item.dependency_image = sqe_snapshot;
+        item.slot_sequence = slot_sequence;
+        item.slot_index = sq_index;
+        item.slot_wrap = sq_wrap;
+        item.command_token = selected_token[4:0];
+        item.token_incarnation = engine_incarnation[58:0];
+        item.entry_key = entry_key(sq_index, sq_wrap);
+        item.state = RDMA_CMQ_SUBMISSION_PENDING_EFFECT;
+        item.submission_effect =
+          RDMA_SUBMIT_EFFECT_HOST_MEMORY_MAYBE_VISIBLE;
+        item.attempt_effect =
+          RDMA_SUBMIT_EFFECT_HOST_MEMORY_MAYBE_VISIBLE;
+        item.completion_phase = RDMA_CMQ_COMPLETION_NONE;
+        item.reset_isolation_confirmed = 1'b0;
+        item.recovery_required = 1'b1;
+        item.completion = null;
+        item.status = rdma_cmq_direct_status(RDMA_SC_OK);
+        record_candidate.items.push_back(item);
+
+        publish_item = new($sformatf("cmq_publish_item_%0d", i));
+        publish_item.request_index = i;
+        publish_item.slot_record = slot_snapshot;
+        publish_item.command_key = command_key(authority_ticket);
+        publish_item.entry_key = item.entry_key;
+        publish_item.command_token = selected_token[4:0];
+        preallocated_candidate.items.push_back(publish_item);
+        dependencies.push_back(dependency_snapshot);
+      end
     end
 
-    if (!transaction_failed && success_count == 0) begin
-      batch_status = rdma_status::success();
+    if (!transaction_failed && record_candidate.items.size() == 0) begin
+      batch_status = rdma_cmq_direct_status(RDMA_SC_OK);
       engine_lock.put(1);
       return;
     end
 
     if (!transaction_failed) begin
-      if (publish_seq >
-          (64'hffff_ffff_ffff_ffff - success_count)) begin
-        transaction_status = poison_status(
-          "CMQ final producer sequence overflows"
+      final_sequence = publish_seq + record_candidate.items.size();
+      final_pi = final_sequence % CMQ_DEPTH;
+      final_polarity = (final_sequence / CMQ_DEPTH) & 1'b1;
+      status = checked_handle_snapshot(
+        cmq_snapshot.handle, "CMQ doorbell encoder",
+        RDMA_SC_INVALID_STATE, doorbell_encode_target
+      );
+      if (status == null || !status.ok()) begin
+        transaction_status = copy_submit_status_direct(
+          status, "cmq_doorbell_handle_status"
         );
         transaction_failed = 1'b1;
       end
-      else begin
-        final_sequence = publish_seq + success_count;
-        final_pi = final_sequence % CMQ_DEPTH;
-        final_polarity = (final_sequence / CMQ_DEPTH) & 1'b1;
-        status = checked_handle_snapshot(
-          cmq_snapshot.handle, "CMQ doorbell encoder",
-          RDMA_SC_INVALID_STATE, doorbell_encode_target
+    end
+    if (!transaction_failed) begin
+      doorbell_image = null;
+      status = profile.encode_doorbell(
+        doorbell_encode_target, final_pi, final_polarity, doorbell_image
+      );
+      if (!same_handle(doorbell_encode_target, cmq_snapshot.handle)) begin
+        transaction_status = rdma_cmq_direct_status(
+          RDMA_SC_INVALID_STATE,
+          "CMQ doorbell encoder changed its detached handle input"
         );
-        if (!status.ok()) begin
-          transaction_status = status;
-          transaction_failed = 1'b1;
-        end
-        else begin
-          doorbell_image = null;
-          status = profile.encode_doorbell(
-            doorbell_encode_target, final_pi, final_polarity, doorbell_image
-          );
-          if (!same_handle(doorbell_encode_target, cmq_snapshot.handle)) begin
-            transaction_status = invalid_state(
-              "CMQ doorbell encoder changed its detached handle input"
-            );
-            transaction_failed = 1'b1;
-          end
-          else begin
-            if (status == null)
-              status = invalid_state(
-                "CMQ doorbell encoding returned null status"
-              );
-            if (!status.ok()) begin
-              transaction_status = status;
-              transaction_failed = 1'b1;
-            end
-          end
-        end
+        transaction_failed = 1'b1;
+      end
+      else if (status == null || !status.ok()) begin
+        transaction_status = (status == null) ? rdma_cmq_direct_status(
+          RDMA_SC_INVALID_STATE,
+          "CMQ doorbell encoding returned null status"
+        ) : copy_submit_status_direct(status, "cmq_doorbell_encode_status");
+        transaction_failed = 1'b1;
       end
     end
-
     if (!transaction_failed) begin
       status = doorbell_metadata_status(doorbell_image);
-      if (!status.ok()) begin
-        transaction_status = invalid_state(
-          {"CMQ doorbell profile output is invalid: ", status.message}
+      if (status == null || !status.ok()) begin
+        transaction_status = rdma_cmq_direct_status(
+          RDMA_SC_INVALID_STATE,
+          {"CMQ doorbell profile output is invalid: ",
+           (status == null) ? "null status" : status.message}
         );
         transaction_failed = 1'b1;
       end
     end
     if (!transaction_failed) begin
-      status = checked_image_snapshot(
+      status = checked_canonical_image_snapshot(
         doorbell_image, "CMQ doorbell", RDMA_SC_INVALID_STATE,
         doorbell_snapshot
       );
-      if (!status.ok()) begin
-        transaction_status = status;
+      if (status == null || !status.ok()) begin
+        transaction_status = copy_submit_status_direct(
+          status, "cmq_doorbell_snapshot_status"
+        );
         transaction_failed = 1'b1;
       end
     end
     if (!transaction_failed) begin
       status = doorbell_metadata_status(doorbell_snapshot);
-      if (!status.ok()) begin
-        transaction_status = invalid_state(
-          {"CMQ doorbell snapshot metadata is invalid: ", status.message}
+      if (status == null || !status.ok()) begin
+        transaction_status = rdma_cmq_direct_status(
+          RDMA_SC_INVALID_STATE,
+          {"CMQ doorbell snapshot metadata is invalid: ",
+           (status == null) ? "null status" : status.message}
         );
         transaction_failed = 1'b1;
       end
     end
 
+    minimum_remaining = 0;
     if (!transaction_failed) begin
-      minimum_remaining = 0;
-      for (int unsigned success_index = 0;
-           success_index < success_count; success_index++) begin
-        if ($time >= tentative_deadlines[success_index]) begin
-          transaction_status = rdma_status::make(
-            RDMA_SC_TIMEOUT, "CMQ batch deadline expired before publication"
+      foreach (record_candidate.items[i]) begin
+        if ($time >= record_candidate.items[i].ticket.absolute_deadline) begin
+          transaction_status = rdma_cmq_direct_status(
+            RDMA_SC_TIMEOUT,
+            "CMQ batch deadline expired before publication"
           );
           transaction_failed = 1'b1;
           break;
         end
-        remaining = tentative_deadlines[success_index] - $time;
+        remaining = record_candidate.items[i].ticket.absolute_deadline -
+                    $time;
         if (minimum_remaining == 0 || remaining < minimum_remaining)
           minimum_remaining = remaining;
       end
@@ -8004,7 +8358,8 @@ class rdma_cmq_engine extends uvm_object;
         "cmq_batch_doorbell_candidate"
       );
       if (doorbell_candidate == null) begin
-        transaction_status = invalid_state(
+        transaction_status = rdma_cmq_direct_status(
+          RDMA_SC_INVALID_STATE,
           "CMQ doorbell descriptor construction failed"
         );
         transaction_failed = 1'b1;
@@ -8016,8 +8371,10 @@ class rdma_cmq_engine extends uvm_object;
         active_function, "CMQ doorbell descriptor", RDMA_SC_INVALID_STATE,
         doorbell_candidate.function_h
       );
-      if (!status.ok()) begin
-        transaction_status = status;
+      if (status == null || !status.ok()) begin
+        transaction_status = copy_submit_status_direct(
+          status, "cmq_doorbell_function_status"
+        );
         transaction_failed = 1'b1;
       end
     end
@@ -8026,14 +8383,17 @@ class rdma_cmq_engine extends uvm_object;
         cmq_snapshot.handle, "CMQ doorbell descriptor",
         RDMA_SC_INVALID_STATE, doorbell_candidate.target_h
       );
-      if (!status.ok()) begin
-        transaction_status = status;
+      if (status == null || !status.ok()) begin
+        transaction_status = copy_submit_status_direct(
+          status, "cmq_doorbell_target_status"
+        );
         transaction_failed = 1'b1;
       end
     end
     if (!transaction_failed) begin
       doorbell_candidate.notify_bar_id = prepared_binding.notify_bar_id;
-      doorbell_candidate.relative_offset = doorbell_snapshot.bar_target.value;
+      doorbell_candidate.relative_offset =
+        doorbell_snapshot.bar_target.value;
       doorbell_candidate.width = doorbell_snapshot.length;
       doorbell_candidate.endian = doorbell_snapshot.endian;
       doorbell_candidate.payload_image = doorbell_snapshot;
@@ -8045,78 +8405,540 @@ class rdma_cmq_engine extends uvm_object;
       doorbell_candidate.dependencies = dependencies;
       doorbell_candidate.timeout = minimum_remaining;
       doorbell_candidate.readback_policy = RDMA_DB_READBACK_NONE;
-      status = checked_doorbell_desc_snapshot(doorbell_candidate,
-                                              doorbell_snapshot_desc);
-      if (!status.ok()) begin
-        transaction_status = status;
+      status = checked_doorbell_desc_snapshot(
+        doorbell_candidate, doorbell_snapshot_desc
+      );
+      if (status == null || !status.ok()) begin
+        transaction_status = copy_submit_status_direct(
+          status, "cmq_doorbell_descriptor_status"
+        );
         transaction_failed = 1'b1;
       end
     end
 
     if (!transaction_failed) begin
-      successful_batch_status = rdma_status::success();
-      doorbell_result = null;
-      scheduler.submit(prepared_binding, doorbell_snapshot_desc,
-                       doorbell_result,
-                       status);
-      if (status == null)
-        status = invalid_state("CMQ doorbell scheduler returned null status");
-      else if (status.ok() && doorbell_result == null)
-        status = invalid_state("CMQ doorbell scheduler returned no result");
-      if (!status.ok()) begin
-        transaction_status = status;
+      status = allocate_batch_identity_locked(
+        record_candidate.function_identity, batch_key, batch_id
+      );
+      if (status == null || !status.ok()) begin
+        transaction_status = copy_submit_status_direct(
+          status, "cmq_batch_identity_status"
+        );
+        transaction_failed = 1'b1;
+      end
+    end
+    if (!transaction_failed) begin
+      status = allocate_attempt_id_locked(attempt_id);
+      if (status == null || !status.ok()) begin
+        transaction_status = copy_submit_status_direct(
+          status, "cmq_attempt_identity_status"
+        );
+        transaction_failed = 1'b1;
+      end
+    end
+    if (!transaction_failed) begin
+      record_candidate.batch_key = batch_key;
+      record_candidate.batch_id = batch_id;
+      record_candidate.attempt_id = attempt_id;
+      record_candidate.end_sequence = final_sequence;
+      record_candidate.doorbell_image = doorbell_snapshot;
+      record_candidate.final_pi = final_pi;
+      record_candidate.final_polarity = final_polarity;
+      preallocated_candidate.batch_key = batch_key;
+      preallocated_candidate.attempt_id = attempt_id;
+      preallocated_candidate.final_sequence = final_sequence;
+      preallocated_candidate.profile_format_valid =
+        staged_profile_format_valid;
+      preallocated_candidate.profile_endian = staged_profile_endian;
+      preallocated_candidate.profile_hardware_version =
+        staged_profile_hardware_version;
+
+      foreach (record_candidate.items[i]) begin
+        rdma_cmq_batch_submission_item_record item;
+        string body_tag;
+        byte unsigned body_bytes[];
+        bit classified_recovery;
+
+        item = record_candidate.items[i];
+        if (!item.command.recovery_owner.is_legacy_unmigrated()) begin
+          status = item.command.recovery_owner.freeze_for_journal(
+            record_candidate.function_identity, attempt_id
+          );
+          if (status == null || !status.ok()) begin
+            transaction_status = copy_submit_status_direct(
+              status, "cmq_recovery_owner_freeze_status"
+            );
+            transaction_failed = 1'b1;
+            break;
+          end
+        end
+        item.recovery_owner = item.command.recovery_owner;
+        status = item.command.validate_for_journal(
+          record_candidate.function_identity, attempt_id
+        );
+        if (status == null || !status.ok()) begin
+          transaction_status = copy_submit_status_direct(
+            status, "cmq_journal_command_status"
+          );
+          transaction_failed = 1'b1;
+          break;
+        end
+        item.dependency_replay_safe =
+          item.dependency_mapping == backing_mapping &&
+          item.dependency_offset ==
+            longint'(item.slot_index) * CMQE_BYTES &&
+          same_image_value(item.sqe_image, item.dependency_image) &&
+          item.dma_context.function_h.generation ==
+            record_candidate.function_identity.generation &&
+          item.dma_context.reset_epoch ==
+            record_candidate.function_identity.reset_epoch &&
+          item.dependency_mapping.function_h.generation ==
+            record_candidate.function_identity.generation &&
+          item.dependency_mapping.reset_epoch ==
+            record_candidate.function_identity.reset_epoch;
+        status = profile.canonicalize_command_body(
+          item.command.body, body_tag, body_bytes
+        );
+        if (status == null || !status.ok()) begin
+          transaction_status = (status == null) ? rdma_cmq_direct_status(
+            RDMA_SC_INVALID_STATE,
+            "CMQ command body canonicalization returned null status"
+          ) : copy_submit_status_direct(
+            status, "cmq_command_canonical_status"
+          );
+          transaction_failed = 1'b1;
+          break;
+        end
+        status = rdma_cmq_compute_item_digests(
+          item.command, body_tag, body_bytes, item.ticket,
+          item.recovery_owner, record_candidate.function_identity,
+          item.dma_context, item.sqe_image, item.dependency_mapping,
+          item.dependency_offset, item.dependency_image,
+          item.image_digest, item.authority_digest
+        );
+        if (status == null || !status.ok()) begin
+          transaction_status = (status == null) ? rdma_cmq_direct_status(
+            RDMA_SC_INVALID_STATE,
+            "CMQ item digest returned null status"
+          ) : copy_submit_status_direct(status, "cmq_item_digest_status");
+          transaction_failed = 1'b1;
+          break;
+        end
+        status = rdma_cmq_classify_recovery_required(
+          item.state, item.completion_phase, item.submission_effect,
+          item.reset_isolation_confirmed,
+          item.recovery_owner.is_legacy_unmigrated(), classified_recovery
+        );
+        if (status == null || !status.ok()) begin
+          transaction_status = (status == null) ? rdma_cmq_direct_status(
+            RDMA_SC_INVALID_STATE,
+            "CMQ pending recovery classifier returned null status"
+          ) : copy_submit_status_direct(
+            status, "cmq_pending_recovery_status"
+          );
+          transaction_failed = 1'b1;
+          break;
+        end
+        item.recovery_required = classified_recovery;
+        request_indices.push_back(item.request_index);
+        image_digests.push_back(item.image_digest);
+        authority_digests.push_back(item.authority_digest);
+      end
+    end
+    if (!transaction_failed) begin
+      status = rdma_cmq_compute_batch_digest(
+        record_candidate.function_identity, record_candidate.binding,
+        record_candidate.cmq_h, record_candidate.doorbell_image,
+        record_candidate.final_pi, record_candidate.final_polarity,
+        record_candidate.start_sequence, record_candidate.end_sequence,
+        request_indices, image_digests, authority_digests,
+        record_candidate.batch_digest
+      );
+      if (status == null || !status.ok()) begin
+        transaction_status = (status == null) ? rdma_cmq_direct_status(
+          RDMA_SC_INVALID_STATE, "CMQ batch digest returned null status"
+        ) : copy_submit_status_direct(status, "cmq_batch_digest_status");
+        transaction_failed = 1'b1;
+      end
+    end
+
+    observer = null;
+    capability_key = "";
+    if (!transaction_failed) begin
+      capability_key = $sformatf(
+        "%s|attempt=%016h", batch_key, attempt_id
+      );
+      observer = new("cmq_submission_mmio_observer");
+      status = observer.configure(
+        this, capability_key, batch_key, attempt_id, engine_incarnation
+      );
+      if (status == null || !status.ok() ||
+          arm_observers.exists(capability_key)) begin
+        transaction_status = (status == null || status.ok()) ?
+          rdma_cmq_direct_status(
+            RDMA_SC_INVALID_STATE,
+            "CMQ MMIO observer construction or key collision failed"
+          ) : copy_submit_status_direct(
+            status, "cmq_observer_configure_status"
+          );
+        transaction_failed = 1'b1;
+      end
+    end
+    if (!transaction_failed) begin
+      status = install_submission_journal_locked(
+        record_candidate, preallocated_candidate
+      );
+      if (status == null || !status.ok()) begin
+        transaction_status = (status == null) ? rdma_cmq_direct_status(
+          RDMA_SC_INVALID_STATE,
+          "CMQ journal installation returned null status"
+        ) : copy_submit_status_direct(
+          status, "cmq_journal_installation_status"
+        );
         transaction_failed = 1'b1;
       end
     end
 
     if (transaction_failed) begin
       if (transaction_status == null)
-        transaction_status = invalid_state(
+        transaction_status = rdma_cmq_direct_status(
+          RDMA_SC_INVALID_STATE,
           "CMQ batch transaction failed without a status"
         );
-      foreach (tentative_token_reserved[token_index])
-        tentative_token_reserved[token_index] = 1'b0;
-      foreach (tickets[item_index]) begin
-        tickets[item_index] = null;
-        if (!preserve_item_status[item_index])
-          item_statuses[item_index] =
-            rdma_cmq_clone_status_value(transaction_status);
+      foreach (results[i]) begin
+        if (!local_result_finalized[i])
+          results[i].status = copy_submit_status_direct(
+            transaction_status,
+            $sformatf("cmq_transaction_failure_item_%0d", i)
+          );
       end
-      batch_status = rdma_cmq_clone_status_value(transaction_status);
+      batch_status = copy_submit_status_direct(
+        transaction_status, "cmq_transaction_failure_batch"
+      );
       engine_lock.put(1);
       return;
     end
 
-    for (int unsigned success_index = 0;
-         success_index < success_count; success_index++) begin
-      int unsigned original_index;
+    arm_observers[capability_key] = observer;
+    fenced_batch_key = batch_key;
+    submission_fence_reason =
+      "CMQ observed submission awaits authentic MMIO classification";
+    retained_record = submission_journal[batch_key];
+    foreach (retained_record.items[i]) begin
       int unsigned token_index;
-      int unsigned slot_index;
-      string published_command_key;
-      string published_entry_key;
 
-      original_index = original_indices[success_index];
-      token_index = tentative_tokens[success_index];
-      slot_index = tentative_records[success_index].sq_index;
-      token_in_use[token_index] = 1'b1;
-      slots[slot_index] = tentative_records[success_index];
-      published_command_key = command_key(slots[slot_index].ticket);
-      published_entry_key = entry_key(
-        slot_index, slots[slot_index].sq_wrap
-      );
-      command_registry[published_command_key] = slots[slot_index];
-      entry_registry[published_entry_key] = slots[slot_index];
-      tickets[original_index] = caller_tickets[success_index];
-      item_statuses[original_index] =
-        tentative_success_statuses[success_index];
-      tentative_token_reserved[token_index] = 1'b0;
+      token_index = retained_record.items[i].command_token;
+      token_incarnation[token_index] =
+        retained_record.items[i].ticket.command_id[63:5];
     end
-    publish_seq = final_sequence;
-    profile_image_format_valid = staged_profile_format_valid;
-    profile_image_endian = staged_profile_endian;
-    profile_hardware_version = staged_profile_hardware_version;
-    batch_status = successful_batch_status;
+
+    transport_result = null;
+    transport.submit_observed(
+      prepared_binding, doorbell_snapshot_desc, observer, transport_result
+    );
+    retained_record = submission_journal[batch_key];
+    observer_armed = retained_record != null &&
+                     retained_record.observer_armed;
+    if (!observer_armed)
+      arm_observers.delete(capability_key);
+
+    observation_code = RDMA_SC_OK;
+    observation_message = "";
+    returned_effect = RDMA_SUBMIT_EFFECT_UNOBSERVED;
+    if (transport_result == null ||
+        !rdma_cmq_status_shape_valid(transport_result.status) ||
+        !rdma_cmq_submission_effect_valid(
+          transport_result.submission_effect
+        )) begin
+      operation_status = rdma_cmq_direct_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ observed transport returned a malformed envelope"
+      );
+      observation_code = RDMA_SC_INVALID_STATE;
+      observation_message =
+        "CMQ observed transport envelope is missing or malformed";
+    end
+    else begin
+      operation_status = copy_submit_status_direct(
+        transport_result.status, "cmq_transport_operation_status"
+      );
+      returned_effect = transport_result.submission_effect;
+    end
+
+    if (!observer_armed &&
+        returned_effect == RDMA_SUBMIT_EFFECT_PRE_SUBMIT_REJECTED) begin
+      foreach (retained_record.items[i]) begin
+        int unsigned request_index;
+
+        request_index = retained_record.items[i].request_index;
+        results[request_index].status = copy_submit_status_direct(
+          operation_status,
+          $sformatf("cmq_pre_rejected_item_%0d", request_index)
+        );
+        results[request_index].submission_effect =
+          RDMA_SUBMIT_EFFECT_PRE_SUBMIT_REJECTED;
+        results[request_index].attempt_effect =
+          RDMA_SUBMIT_EFFECT_PRE_SUBMIT_REJECTED;
+        results[request_index].completion_phase =
+          RDMA_CMQ_COMPLETION_NONE;
+        results[request_index].recovery_required = 1'b0;
+      end
+      status = remove_submission_journal_locked(batch_key);
+      if (status == null || !status.ok()) begin
+        batch_status = (status == null) ? rdma_cmq_direct_status(
+          RDMA_SC_INVALID_STATE,
+          "CMQ PRE rollback returned null status"
+        ) : copy_submit_status_direct(status, "cmq_pre_rollback_status");
+        engine_lock.put(1);
+        return;
+      end
+      batch_status = rdma_cmq_direct_status(RDMA_SC_OK);
+      engine_lock.put(1);
+      return;
+    end
+
+    retry_safe = 1'b1;
+    foreach (retained_record.items[i]) begin
+      if (!retained_record.items[i].dependency_replay_safe)
+        retry_safe = 1'b0;
+    end
+    if (observer_armed) begin
+      retained_record.publication_retry_safe = 1'b0;
+      if (returned_effect == RDMA_SUBMIT_EFFECT_MMIO_VISIBLE) begin
+        retained_record.state = RDMA_CMQ_SUBMISSION_PUBLISH_CONFIRMED;
+        retained_record.submission_effect =
+          RDMA_SUBMIT_EFFECT_MMIO_VISIBLE;
+        retained_record.attempt_effect = RDMA_SUBMIT_EFFECT_MMIO_VISIBLE;
+      end
+      else if (returned_effect == RDMA_SUBMIT_EFFECT_MMIO_MAYBE_VISIBLE) begin
+        retained_record.state = RDMA_CMQ_SUBMISSION_PUBLISH_AMBIGUOUS;
+        retained_record.submission_effect =
+          RDMA_SUBMIT_EFFECT_MMIO_MAYBE_VISIBLE;
+        retained_record.attempt_effect =
+          RDMA_SUBMIT_EFFECT_MMIO_MAYBE_VISIBLE;
+      end
+      else begin
+        observation_code = RDMA_SC_INVALID_STATE;
+        observation_message =
+          "CMQ transport effect contradicts an authentic MMIO arm";
+        retained_record.state = RDMA_CMQ_SUBMISSION_PUBLISH_AMBIGUOUS;
+        retained_record.submission_effect =
+          RDMA_SUBMIT_EFFECT_MMIO_MAYBE_VISIBLE;
+        retained_record.attempt_effect =
+          (returned_effect == RDMA_SUBMIT_EFFECT_UNOBSERVED) ?
+            RDMA_SUBMIT_EFFECT_UNOBSERVED :
+            RDMA_SUBMIT_EFFECT_MMIO_MAYBE_VISIBLE;
+      end
+    end
+    else begin
+      retained_record.state =
+        RDMA_CMQ_SUBMISSION_HOST_VISIBLE_NOT_PUBLISHED;
+      retained_record.publication_retry_safe = retry_safe;
+      if (returned_effect inside {
+            RDMA_SUBMIT_EFFECT_HOST_MEMORY_MAYBE_VISIBLE,
+            RDMA_SUBMIT_EFFECT_HOST_MEMORY_WRITTEN,
+            RDMA_SUBMIT_EFFECT_HOST_MEMORY_ORDERED
+          }) begin
+        retained_record.submission_effect = returned_effect;
+        retained_record.attempt_effect = returned_effect;
+      end
+      else begin
+        retained_record.submission_effect = RDMA_SUBMIT_EFFECT_UNOBSERVED;
+        retained_record.attempt_effect = RDMA_SUBMIT_EFFECT_UNOBSERVED;
+        observation_code = RDMA_SC_INVALID_STATE;
+        if (returned_effect inside {
+              RDMA_SUBMIT_EFFECT_MMIO_MAYBE_VISIBLE,
+              RDMA_SUBMIT_EFFECT_MMIO_VISIBLE
+            }) begin
+          retained_record.publication_retry_safe = 1'b0;
+          observation_message =
+            "CMQ transport reported MMIO effect without authentic arm";
+        end
+        else begin
+          observation_message =
+            "CMQ transport effect could not be observed after delegation";
+        end
+      end
+    end
+
+    foreach (retained_record.items[i]) begin
+      rdma_cmq_batch_submission_item_record item;
+      rdma_cmq_execution_result detached_result;
+      bit classified_recovery;
+      int unsigned request_index;
+
+      item = retained_record.items[i];
+      item.state = retained_record.state;
+      item.submission_effect = retained_record.submission_effect;
+      item.attempt_effect = retained_record.attempt_effect;
+      item.completion_phase = observer_armed ?
+        RDMA_CMQ_COMPLETION_PENDING : RDMA_CMQ_COMPLETION_NONE;
+      item.status = copy_submit_status_direct(
+        operation_status, $sformatf("cmq_journal_operation_%0d", i)
+      );
+      status = rdma_cmq_classify_recovery_required(
+        item.state, item.completion_phase, item.submission_effect,
+        item.reset_isolation_confirmed,
+        item.recovery_owner.is_legacy_unmigrated(), classified_recovery
+      );
+      if (status == null || !status.ok()) begin
+        observation_code = RDMA_SC_INVALID_STATE;
+        observation_message = (status == null) ?
+          "CMQ retained recovery classifier returned null status" :
+          status.message;
+        item.recovery_required = 1'b1;
+      end
+      else begin
+        item.recovery_required = classified_recovery;
+      end
+      request_index = item.request_index;
+      status = build_observed_result_locked(
+        retained_record, item, observation_code, observation_message,
+        detached_result
+      );
+      if (status == null || !status.ok() || detached_result == null) begin
+        detached_result = new_submit_result_direct(
+          $sformatf("cmq_observed_fallback_%0d", request_index)
+        );
+        detached_result.status = copy_submit_status_direct(
+          item.status, $sformatf("cmq_observed_fallback_status_%0d", i)
+        );
+        detached_result.observation_status = rdma_cmq_direct_status(
+          RDMA_SC_INVALID_STATE,
+          "CMQ observed result snapshot failed"
+        );
+        detached_result.submission_effect = item.submission_effect;
+        detached_result.attempt_effect = item.attempt_effect;
+        detached_result.completion_phase = item.completion_phase;
+        detached_result.batch_key = retained_record.batch_key;
+        detached_result.batch_id = retained_record.batch_id;
+        detached_result.attempt_id = retained_record.attempt_id;
+        detached_result.recovery_required = 1'b1;
+      end
+      results[request_index] = detached_result;
+    end
+    batch_status = rdma_cmq_direct_status(RDMA_SC_OK);
     engine_lock.put(1);
+  endtask
+
+  // 功能：把一个 command 包装为恰好一次 observed batch 调用并返回其唯一结果。
+  // 输入/输出及副作用：command 为输入，result 为输出；所有 journal、transport
+  //   与 fence 副作用完全由 submit_batch_observed() 产生。
+  // 失败/边界：batch 返回错位/null 结果时发布非空 INVALID_STATE fallback；
+  //   不做第二次提交，也不写共享 last_* 证据。
+  task submit_observed(
+    input rdma_cmq_command_desc command,
+    output rdma_cmq_execution_result result
+  );
+    rdma_cmq_command_desc commands[];
+    rdma_cmq_execution_result results[];
+    rdma_status batch_status;
+
+    result = new_submit_result_direct("cmq_single_observed_fallback");
+    commands = new[1];
+    commands[0] = command;
+    submit_batch_observed(commands, results, batch_status);
+    if (results.size() != 1 || results[0] == null) begin
+      result.status = (batch_status == null) ? rdma_cmq_direct_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ one-item observed batch returned no result"
+      ) : copy_submit_status_direct(
+        batch_status, "cmq_single_observed_batch_status"
+      );
+      return;
+    end
+    result = results[0];
+  endtask
+
+  // 功能：把 observed batch 的 ticket/operation status 单向投影到 legacy 输出，
+  //   transport 与 journal transaction 仍只执行一次。
+  // 输入/输出及副作用：requests 为输入；tickets/item_statuses 与请求等长，
+  //   batch_status 直接承接 observed orchestration 状态。
+  // 失败/边界：result/ticket/status 形状异常时该项返回 INVALID_STATE 与 null ticket；
+  //   投影不重试、不反向修改 observed result 或 journal。
+  task submit_batch(
+    input rdma_cmq_command_desc requests[],
+    output rdma_cmq_ticket tickets[],
+    output rdma_status item_statuses[],
+    output rdma_status batch_status
+  );
+    rdma_cmq_execution_result observed_results[];
+
+    submit_batch_observed(requests, observed_results, batch_status);
+    tickets = new[requests.size()];
+    item_statuses = new[requests.size()];
+    foreach (tickets[i]) begin
+      rdma_cmq_nonfatal_snapshot_context snapshot_context;
+      string failure_reason;
+
+      tickets[i] = null;
+      item_statuses[i] = rdma_cmq_direct_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ legacy batch observed result is missing"
+      );
+      if (i >= observed_results.size() || observed_results[i] == null)
+        continue;
+      item_statuses[i] = copy_submit_status_direct(
+        observed_results[i].status,
+        $sformatf("cmq_legacy_item_status_%0d", i)
+      );
+      snapshot_context = new();
+      if (!snapshot_context.try_snapshot_optional_ticket(
+            observed_results[i].ticket, tickets[i], failure_reason
+          )) begin
+        tickets[i] = null;
+        item_statuses[i] = rdma_cmq_direct_status(
+          RDMA_SC_INVALID_STATE,
+          {"CMQ legacy ticket projection failed: ", failure_reason}
+        );
+      end
+    end
+    if (batch_status == null)
+      batch_status = rdma_cmq_direct_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ observed batch returned null orchestration status"
+      );
+  endtask
+
+  // 功能：把单条 observed result 单向投影为 legacy ticket/status，保证只调用
+  //   submit_observed() 一次且不重新推断 transport effect。
+  // 输入/输出及副作用：request 为输入；ticket/status 为 detached legacy 输出；
+  //   journal/fence/runtime 副作用由 observed 入口原样保留。
+  // 失败/边界：result/status/ticket snapshot 异常时返回 null ticket 与独立
+  //   INVALID_STATE；operation failure 原样返回且不以 batch 状态覆盖。
+  task submit(
+    input rdma_cmq_command_desc request,
+    output rdma_cmq_ticket ticket,
+    output rdma_status status
+  );
+    rdma_cmq_execution_result observed_result;
+    rdma_cmq_nonfatal_snapshot_context snapshot_context;
+    string failure_reason;
+
+    ticket = null;
+    status = rdma_cmq_direct_status(
+      RDMA_SC_INVALID_STATE, "CMQ legacy submit did not complete"
+    );
+    submit_observed(request, observed_result);
+    if (observed_result == null) begin
+      status = rdma_cmq_direct_status(
+        RDMA_SC_INVALID_STATE, "CMQ observed submit returned null result"
+      );
+      return;
+    end
+    status = copy_submit_status_direct(
+      observed_result.status, "cmq_legacy_submit_status"
+    );
+    snapshot_context = new();
+    if (!snapshot_context.try_snapshot_optional_ticket(
+          observed_result.ticket, ticket, failure_reason
+        )) begin
+      ticket = null;
+      status = rdma_cmq_direct_status(
+        RDMA_SC_INVALID_STATE,
+        {"CMQ legacy submit ticket projection failed: ", failure_reason}
+      );
+    end
   endtask
 
   // 功能：在 rdma_cmq_engine 中，expire 根据当前证据转换事务或恢复状态，并保持重试、复位和所有权边界一致。
