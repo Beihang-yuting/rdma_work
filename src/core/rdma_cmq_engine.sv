@@ -7966,11 +7966,11 @@ class rdma_cmq_engine extends uvm_object;
   endfunction
 
   // 功能：在任何 stale/action/authority 返回前为已结构对齐请求构造等长同序
-  //   execution results，并分离 ticket/owner/DMA/command identity 诊断值。
+  //   execution results；request ticket 失败时改从 retained ticket 创建 detached fallback。
   // 输入/输出及副作用：request/record 为只读输入，results 入口按 request 大小重建；
   //   只分配本地候选，不修改 retained row、counter、observer 或外部 I/O。
   // 失败/边界：任一 maker/snapshot/capture 失败仍用 direct-new 保留非空 aligned
-  //   outer result，并返回首个非空失败 status；caller 必须在 CAS 前拒绝整批。
+  //   outer/ticket shell，并返回首个失败 status；绝不把 retained ticket 引用返回 caller。
   protected function rdma_status stage_recovery_results_locked(
     input rdma_cmq_submission_recovery_request request,
     input rdma_cmq_batch_submission_record record,
@@ -8003,11 +8003,29 @@ class rdma_cmq_engine extends uvm_object;
       ticket_snapshot = make_recovery_ticket_locked(
         $sformatf("cmq_recovery_ticket_%0d", i), request.items[i].ticket
       );
-      if (ticket_snapshot == null && first_failure == null)
-        first_failure = journal_status(
-          RDMA_SC_INVALID_ARGUMENT,
-          "CMQ recovery aligned ticket snapshot failed"
+      if (ticket_snapshot == null) begin
+        if (first_failure == null)
+          first_failure = journal_status(
+            RDMA_SC_INVALID_ARGUMENT,
+            "CMQ recovery aligned ticket snapshot failed"
+          );
+        ticket_snapshot = make_recovery_ticket_locked(
+          $sformatf("cmq_recovery_retained_ticket_%0d", i),
+          record.items[i].ticket
         );
+      end
+      if (ticket_snapshot == null) begin
+        ticket_snapshot = new($sformatf(
+          "cmq_recovery_emergency_ticket_%0d", i
+        ));
+        ticket_snapshot.command_id = request.items[i].ticket.command_id;
+        ticket_snapshot.slot_sequence =
+          request.items[i].ticket.slot_sequence;
+        ticket_snapshot.sq_index = request.items[i].ticket.sq_index;
+        ticket_snapshot.sq_wrap = request.items[i].ticket.sq_wrap;
+        ticket_snapshot.absolute_deadline =
+          request.items[i].ticket.absolute_deadline;
+      end
       owner_snapshot = make_recovery_owner_locked(
         $sformatf("cmq_recovery_owner_%0d", i),
         request.items[i].recovery_owner
@@ -8042,8 +8060,7 @@ class rdma_cmq_engine extends uvm_object;
           );
       end
 
-      result.ticket = (ticket_snapshot == null) ?
-        record.items[i].ticket : ticket_snapshot;
+      result.ticket = ticket_snapshot;
       result.completion = null;
       result.status = rdma_cmq_direct_status(
         RDMA_SC_INVALID_STATE, "CMQ recovery attempt did not commit"
@@ -8134,6 +8151,59 @@ class rdma_cmq_engine extends uvm_object;
         return 1'b0;
     end
     return 1'b1;
+  endfunction
+
+  // 功能：把 authoritative retained READY reset proof 重新绑定到当前 journal
+  //   batch identity、engine/Function incarnation 与完整 ordered item authority tuple。
+  // 输入/输出及副作用：proof/record 为锁内只读输入；逐项比较 request index、
+  //   image/authority digest 和完整 frozen owner 值，只返回 detached status。
+  // 失败/边界：null、非 READY、backing 未释放、固定身份/tuple cardinality 或任一
+  //   item 值漂移返回 INVALID_ARGUMENT；不 mint proof、不更新 lifecycle 或访问 I/O。
+  protected function rdma_status
+  validate_reset_isolation_proof_binding_locked(
+    input rdma_cmq_reset_isolation_proof proof,
+    input rdma_cmq_batch_submission_record record
+  );
+    if (proof == null || record == null || record.function_identity == null ||
+        proof.state != RDMA_CMQ_RESET_PROOF_READY ||
+        !proof.backing_release_confirmed ||
+        proof.batch_key != record.batch_key ||
+        proof.batch_id != record.batch_id ||
+        proof.attempt_id != record.attempt_id ||
+        proof.engine_instance_id != record.engine_instance_id ||
+        proof.engine_incarnation != record.engine_incarnation ||
+        proof.isolated_identity == null ||
+        !proof.isolated_identity.same_incarnation(
+          record.function_identity
+        ) || proof.batch_digest !== record.batch_digest ||
+        proof.isolated_request_indices.size() != record.items.size() ||
+        proof.isolated_image_digests.size() != record.items.size() ||
+        proof.isolated_authority_digests.size() != record.items.size() ||
+        proof.isolated_recovery_owners.size() != record.items.size())
+      return journal_status(
+        RDMA_SC_INVALID_ARGUMENT,
+        "CMQ reset isolation proof does not bind the retained batch"
+      );
+    foreach (record.items[i]) begin
+      if (record.items[i] == null ||
+          proof.isolated_request_indices[i] !=
+            record.items[i].request_index ||
+          proof.isolated_image_digests[i] !==
+            record.items[i].image_digest ||
+          proof.isolated_authority_digests[i] !==
+            record.items[i].authority_digest ||
+          !same_journal_owner_value(
+            proof.isolated_recovery_owners[i],
+            record.items[i].recovery_owner
+          ))
+        return journal_status(
+          RDMA_SC_INVALID_ARGUMENT,
+          $sformatf(
+            "CMQ reset isolation proof item %0d does not bind journal", i
+          )
+        );
+    end
+    return journal_status(RDMA_SC_OK);
   endfunction
 
   // 功能：提交输入对齐的 observed CMQ batch，在 transport 前安装完整 journal、
@@ -9374,12 +9444,13 @@ class rdma_cmq_engine extends uvm_object;
   //   认证、candidate staging、唯一 CAS 与 transport 调用。这样第二个相同 expected
   //   attempt 只能在首个调用释放锁后观察新 attempt，并以 stale 结束。
   // 功能：对 retained fenced submission 执行 RETRY_PUBLISH，或消费 engine-minted
-  //   READY reset proof 完成 CONFIRM_RESET_ISOLATION；返回与 request items 等长结果。
+  //   READY reset proof 完成 CONFIRM_RESET_ISOLATION；CONFIRM 还会重验 retained
+  //   proof-to-row ordered tuple 与 RESET_QUARANTINED/RESET_CANCELLED 生命周期。
   // 输入/输出及副作用：request 为 detached authority 图；results/status 入口立即
   //   初始化。RETRY 成功 CAS 后推进一次 attempt、登记 observer 并可能写 Host/MMIO；
-  //   CONFIRM 不分配 attempt、不调用 I/O，只更新 reset confirmation/recovery bit。
+  //   CONFIRM 不分配 attempt、不调用 I/O，只在全部重验后更新 confirmation/recovery bit。
   // 失败/边界：无法 locate/结构对齐返回空 results；其后 stale、action、digest、
-  //   owner、binding/mapping/fence/deadline/staging/collision 失败返回 aligned results，
+  //   owner、proof/lifecycle、binding/mapping/fence/deadline/staging/collision 失败返回 aligned results，
   //   且在唯一 CAS 前不修改 counter、journal、preallocation、observer 或外部 I/O。
   task recover_submission_observed(
     input rdma_cmq_submission_recovery_request request,
@@ -9714,6 +9785,48 @@ class rdma_cmq_engine extends uvm_object;
     end
 
     if (request.action == RDMA_CMQ_RECOVERY_CONFIRM_RESET_ISOLATION) begin
+      nested_status = validate_submission_record_locked(
+        record, profile_service, 1'b0
+      );
+      if (nested_status == null || !nested_status.ok()) begin
+        status = journal_status(
+          RDMA_SC_INVALID_STATE,
+          (nested_status == null) ?
+            "CMQ reset confirmation journal validation returned null" :
+            {"CMQ reset confirmation journal is invalid: ",
+             nested_status.message}
+        );
+        reject_recovery_results_locked(results, status.code, status.message);
+        engine_lock.put(1);
+        return;
+      end
+      if (record.state != RDMA_CMQ_SUBMISSION_RESET_QUARANTINED) begin
+        status = journal_status(
+          RDMA_SC_INVALID_STATE,
+          "CMQ reset confirmation requires a quarantined batch"
+        );
+        reject_recovery_results_locked(results, status.code, status.message);
+        engine_lock.put(1);
+        return;
+      end
+      foreach (record.items[i]) begin
+        if (record.items[i].state !=
+              RDMA_CMQ_SUBMISSION_RESET_QUARANTINED ||
+            record.items[i].completion_phase !=
+              RDMA_CMQ_COMPLETION_RESET_CANCELLED ||
+            record.items[i].reset_isolation_confirmed ||
+            !record.items[i].recovery_required) begin
+          status = journal_status(
+            RDMA_SC_INVALID_STATE,
+            "CMQ reset confirmation item lifecycle is not unresolved"
+          );
+          reject_recovery_results_locked(
+            results, status.code, status.message
+          );
+          engine_lock.put(1);
+          return;
+        end
+      end
       if (request.reset_isolation_proof == null ||
           record.reset_isolation_proof == null ||
           record.reset_isolation_proof.state !=
@@ -9778,6 +9891,18 @@ class rdma_cmq_engine extends uvm_object;
             RDMA_SC_INVALID_ARGUMENT,
             "CMQ reset isolation proof authority does not match"
           ) : journal_status(nested_status.code, nested_status.message);
+        reject_recovery_results_locked(results, status.code, status.message);
+        engine_lock.put(1);
+        return;
+      end
+      nested_status = validate_reset_isolation_proof_binding_locked(
+        record.reset_isolation_proof, record
+      );
+      if (nested_status == null || !nested_status.ok()) begin
+        status = (nested_status == null) ? journal_status(
+          RDMA_SC_INVALID_STATE,
+          "CMQ reset proof binding validation returned null status"
+        ) : journal_status(nested_status.code, nested_status.message);
         reject_recovery_results_locked(results, status.code, status.message);
         engine_lock.put(1);
         return;

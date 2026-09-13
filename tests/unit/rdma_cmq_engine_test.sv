@@ -3775,6 +3775,19 @@ typedef enum int unsigned {
   RDMA_CMQ_RECOVERY_STAGE_OBSERVER_CONFIGURED
 } rdma_cmq_recovery_stage_fault_e;
 
+// 设计说明：owner tamper matrix 用命名枚举逐项覆盖 frozen provenance 与
+// concrete authority 字段；每个枚举只改变一个语义字段，避免循环索引隐藏缺口。
+typedef enum int unsigned {
+  RDMA_CMQ_OWNER_TAMPER_FROZEN,
+  RDMA_CMQ_OWNER_TAMPER_ADMISSION_ATTEMPT,
+  RDMA_CMQ_OWNER_TAMPER_FUNCTION_IDENTITY,
+  RDMA_CMQ_OWNER_TAMPER_WORKFLOW,
+  RDMA_CMQ_OWNER_TAMPER_RESOURCE,
+  RDMA_CMQ_OWNER_TAMPER_TRANSACTION,
+  RDMA_CMQ_OWNER_TAMPER_ACTION_MASK,
+  RDMA_CMQ_OWNER_TAMPER_COUNT
+} rdma_cmq_recovery_owner_tamper_e;
+
 class rdma_cmq_engine_probe extends rdma_cmq_engine;
   `uvm_object_utils(rdma_cmq_engine_probe)
 
@@ -8402,6 +8415,17 @@ class rdma_cmq_engine_test extends uvm_test;
         scheduler.submit_calls != expected_scheduler_calls)
       `uvm_error(label,
                  "rejected recovery changed retained authority or performed I/O")
+    foreach (stored_record.items[i]) begin
+      if (stored_record.items[i] == null ||
+          stored_record.items[i].reset_isolation_confirmed ||
+          !stored_record.items[i].recovery_required)
+        `uvm_error(
+          label,
+          $sformatf(
+            "rejected recovery changed reset lifecycle item %0d", i
+          )
+        )
+    end
   endtask
 
   // 功能：执行一个 located failure，并同时断言 aligned results 与完整原子性。
@@ -8440,6 +8464,97 @@ class rdma_cmq_engine_test extends uvm_test;
       (expected_fence_key.len() == 0) ? stored_record.batch_key :
                                        expected_fence_key
     );
+  endtask
+
+  // 功能：执行一次 result/ticket staging 拒绝，验证 aligned ticket/status 始终
+  //   非空且 ticket 全图与 request、journal 和 preallocation authority 分离。
+  // 输入/输出及副作用：label/engine/scheduler/request/retained rows 为输入；调用
+  //   一次 recovery 后故意改写返回 ticket 标量及三个嵌套值，检查 retained 值不变。
+  // 失败/边界：只用于 CAS 前 staging failure；若旧实现泄漏 retained alias，helper
+  //   先报告再恢复全部被触及字段，保证后续 RED 场景与 cleanup 仍可继续执行。
+  task automatic expect_recovery_ticket_failure_detached(
+    string label,
+    rdma_cmq_engine_probe engine,
+    rdma_cmq_transport_scheduler_double scheduler,
+    rdma_cmq_submission_recovery_request request,
+    rdma_cmq_batch_submission_record stored_record,
+    rdma_cmq_preallocated_publish_batch stored_preallocated
+  );
+    rdma_cmq_execution_result results[];
+    rdma_status status;
+    longint unsigned attempt_counter;
+    longint unsigned current_attempt;
+    longint unsigned saved_command_id;
+    int unsigned saved_function_object_id;
+    int unsigned saved_cmq_object_id;
+    bit [31:0] saved_opcode;
+    int unsigned scheduler_calls;
+
+    attempt_counter = engine.journal_attempt_counter();
+    current_attempt = stored_record.attempt_id;
+    scheduler_calls = scheduler.submit_calls;
+    saved_command_id = stored_record.items[0].ticket.command_id;
+    saved_function_object_id =
+      stored_record.items[0].ticket.function_h.object_id;
+    saved_cmq_object_id = stored_record.items[0].ticket.cmq_h.object_id;
+    saved_opcode = stored_record.items[0].ticket.opcode_key.opcode;
+
+    engine.recover_submission_observed(request, results, status);
+    expect_recovery_aligned_failure(
+      label, request, results, status, current_attempt
+    );
+    expect_recovery_rejection_atomicity(
+      {label, "_ATOMIC"}, engine, scheduler, stored_record,
+      stored_preallocated, attempt_counter, current_attempt,
+      scheduler_calls, 0, stored_record.batch_key
+    );
+    if (results.size() != request.items.size() || results[0] == null ||
+        results[0].ticket == null || results[0].status == null ||
+        results[0].ticket.function_h == null ||
+        results[0].ticket.cmq_h == null ||
+        results[0].ticket.opcode_key == null) begin
+      `uvm_error(label, "staging failure returned a partial aligned ticket")
+      return;
+    end
+    if (results[0].ticket == request.items[0].ticket ||
+        results[0].ticket == stored_record.items[0].ticket ||
+        results[0].ticket ==
+          stored_preallocated.items[0].slot_record.ticket ||
+        results[0].ticket.function_h ==
+          stored_record.items[0].ticket.function_h ||
+        results[0].ticket.cmq_h == stored_record.items[0].ticket.cmq_h ||
+        results[0].ticket.opcode_key ==
+          stored_record.items[0].ticket.opcode_key ||
+        results[0].status == stored_record.items[0].status)
+      `uvm_error(label, "staging failure exposed retained result authority")
+
+    results[0].ticket.command_id++;
+    results[0].ticket.function_h.object_id++;
+    results[0].ticket.cmq_h.object_id++;
+    results[0].ticket.opcode_key.opcode++;
+    if (stored_record.items[0].ticket.command_id != saved_command_id ||
+        stored_record.items[0].ticket.function_h.object_id !=
+          saved_function_object_id ||
+        stored_record.items[0].ticket.cmq_h.object_id !=
+          saved_cmq_object_id ||
+        stored_record.items[0].ticket.opcode_key.opcode != saved_opcode ||
+        stored_preallocated.items[0].slot_record.ticket.command_id !=
+          saved_command_id ||
+        stored_preallocated.items[0].slot_record.ticket.function_h.object_id !=
+          saved_function_object_id ||
+        stored_preallocated.items[0].slot_record.ticket.cmq_h.object_id !=
+          saved_cmq_object_id ||
+        stored_preallocated.items[0].slot_record.ticket.opcode_key.opcode !=
+          saved_opcode)
+      `uvm_error(label, "returned ticket mutation reached retained authority")
+
+    // RED 时返回值可能就是 retained/preallocation ticket；无条件恢复权威字段，
+    // 让剩余负向窗口仍从同一合法 fixture 出发。
+    stored_record.items[0].ticket.command_id = saved_command_id;
+    stored_record.items[0].ticket.function_h.object_id =
+      saved_function_object_id;
+    stored_record.items[0].ticket.cmq_h.object_id = saved_cmq_object_id;
+    stored_record.items[0].ticket.opcode_key.opcode = saved_opcode;
   endtask
 
   // 功能：执行一次无法定位或结构无法对齐的 recovery，并断言空结果与零副作用。
@@ -8664,7 +8779,8 @@ class rdma_cmq_engine_test extends uvm_test;
   //   与 reset-proof source graph，供 nonfatal snapshot seam 联合覆盖。
   // 输入/输出及副作用：record 为只读输入；成功发布三个本地 owned outer 值，
   //   嵌套 ticket/status/owner 故意保留 source alias 以验证 context canonicalization。
-  // 失败/边界：record/两项 graph/digest 前置不完整或 proof digest 失败时全部输出 null。
+  // 失败/边界：record/任意非空 item graph/digest 前置不完整或 proof digest
+  //   失败时全部输出 null。
   function automatic rdma_status build_journal_recovery_graphs(
     string name,
     rdma_cmq_batch_submission_record record,
@@ -8808,6 +8924,132 @@ class rdma_cmq_engine_test extends uvm_test;
     end
     return rdma_cmq_direct_status(RDMA_SC_OK);
   endfunction
+
+  // 功能：只为负向 proof fixture 从其当前完整字段重算 carried proof_digest，
+  //   使故意错误的 tuple 自洽而不能依赖 digest mismatch 被拒绝。
+  // 输入/输出及副作用：proof 为 inout 测试值；成功仅覆盖 proof.proof_digest，
+  //   其余字段与 journal/request authority 均不修改。
+  // 失败/边界：null 或非法 identity/owner/cardinality 返回非 OK；本 helper 不判断
+  //   proof 是否绑定当前 record，预期 rejection 必须由 DUT 独立得出。
+  function automatic rdma_status recompute_reset_proof_digest_for_test(
+    rdma_cmq_reset_isolation_proof proof
+  );
+    if (proof == null)
+      return rdma_cmq_direct_status(
+        RDMA_SC_INVALID_ARGUMENT, "reset proof fixture is null"
+      );
+    return rdma_cmq_compute_reset_proof_digest(
+      proof.proof_key, proof.proof_id, proof.batch_key, proof.batch_id,
+      proof.attempt_id, proof.engine_instance_id,
+      proof.engine_incarnation, proof.isolated_identity,
+      proof.batch_digest, proof.isolated_request_indices,
+      proof.isolated_image_digests, proof.isolated_authority_digests,
+      proof.isolated_recovery_owners, proof.proof_digest
+    );
+  endfunction
+
+  // 功能：把指定 journal fixture 转成合法未确认 RESET_QUARANTINED/
+  //   RESET_CANCELLED 状态，并为每项构造与 ticket/status 同节点的 completion。
+  // 输入/输出及副作用：record 为 inout；更新 batch/item mutable lifecycle，创建
+  //   RESET_CANCELLED status/completion，不改变 immutable digest、owner 或 ticket。
+  // 失败/边界：record/null item/ticket 任一缺失返回 0；只供当前隔离 fixture 使用，
+  //   遇到中途坏 item 不承诺回滚此前测试对象的局部改写。
+  function automatic bit make_reset_quarantined_journal_fixture(
+    rdma_cmq_batch_submission_record record
+  );
+    if (record == null)
+      return 1'b0;
+    foreach (record.items[i]) begin
+      if (record.items[i] == null || record.items[i].ticket == null)
+        return 1'b0;
+    end
+
+    record.state = RDMA_CMQ_SUBMISSION_RESET_QUARANTINED;
+    record.submission_effect = RDMA_SUBMIT_EFFECT_HOST_MEMORY_WRITTEN;
+    record.attempt_effect = RDMA_SUBMIT_EFFECT_HOST_MEMORY_WRITTEN;
+    record.observer_armed = 1'b0;
+    foreach (record.items[i]) begin
+      rdma_cmq_completion completion;
+
+      record.items[i].state = RDMA_CMQ_SUBMISSION_RESET_QUARANTINED;
+      record.items[i].submission_effect =
+        RDMA_SUBMIT_EFFECT_HOST_MEMORY_WRITTEN;
+      record.items[i].attempt_effect =
+        RDMA_SUBMIT_EFFECT_HOST_MEMORY_WRITTEN;
+      record.items[i].completion_phase =
+        RDMA_CMQ_COMPLETION_RESET_CANCELLED;
+      record.items[i].reset_isolation_confirmed = 1'b0;
+      record.items[i].recovery_required = 1'b1;
+      record.items[i].status = rdma_cmq_direct_status(
+        RDMA_SC_RESET_CANCELLED, "reset isolation fixture cancelled"
+      );
+      completion = new($sformatf("reset_isolation_completion_%0d", i));
+      completion.ticket = record.items[i].ticket;
+      completion.status = record.items[i].status;
+      completion.raw_cqe = null;
+      completion.decoded_response = null;
+      record.items[i].completion = completion;
+    end
+    return 1'b1;
+  endfunction
+
+  // 功能：恢复 CONFIRM 负向窗口可能被旧实现错误提交的两个 mutable bit，
+  //   让同一 retained fixture 可继续覆盖后续独立 proof/lifecycle 变体。
+  // 输入/输出及副作用：record 为 inout；只把每项 confirmation 清零、recovery
+  //   置一，不改 state/phase/completion/proof 或 attempt。
+  // 失败/边界：null record/item 被跳过；该 helper 仅在 rejection oracle 完成后调用，
+  //   不能掩盖当前窗口已经由 atomicity helper 报告的错误 mutation。
+  function automatic void restore_unconfirmed_reset_fixture(
+    rdma_cmq_batch_submission_record record
+  );
+    if (record == null)
+      return;
+    foreach (record.items[i]) begin
+      if (record.items[i] != null) begin
+        record.items[i].reset_isolation_confirmed = 1'b0;
+        record.items[i].recovery_required = 1'b1;
+      end
+    end
+  endfunction
+
+  // 功能：把 request/retained 两份 proof 分别重算为自洽值后执行一次应拒绝的
+  //   CONFIRM，并在完整返回/原子性 oracle 后恢复旧实现可能误写的 lifecycle bit。
+  // 输入/输出及副作用：label、fixture 和 request 为输入；调用一次 DUT recovery；
+  //   proof digest 仅在各自 detached proof 内更新，journal proof handle 本身保留。
+  // 失败/边界：任一 proof 缺失或重算失败会报告 fixture error 且不调用 DUT；
+  //   rejection 后总是恢复 unresolved bit，调用者仍负责恢复本窗口改写的 proof 字段。
+  task automatic expect_reset_confirmation_rejected(
+    string label,
+    rdma_cmq_engine_probe engine,
+    rdma_cmq_transport_scheduler_double scheduler,
+    rdma_cmq_submission_recovery_request request,
+    rdma_cmq_batch_submission_record stored_record,
+    rdma_cmq_preallocated_publish_batch stored_preallocated
+  );
+    rdma_status request_status;
+    rdma_status retained_status;
+
+    if (request == null || request.reset_isolation_proof == null ||
+        stored_record == null || stored_record.reset_isolation_proof == null) begin
+      `uvm_error(label, "reset confirmation proof pair is incomplete")
+      return;
+    end
+    request_status = recompute_reset_proof_digest_for_test(
+      request.reset_isolation_proof
+    );
+    retained_status = recompute_reset_proof_digest_for_test(
+      stored_record.reset_isolation_proof
+    );
+    if (request_status == null || !request_status.ok() ||
+        retained_status == null || !retained_status.ok()) begin
+      `uvm_error(label, "reset confirmation proof pair is not self-consistent")
+      return;
+    end
+    expect_recovery_rejected(
+      label, engine, scheduler, request, stored_record, stored_preallocated
+    );
+    restore_unconfirmed_reset_fixture(stored_record);
+  endtask
 
   // 功能：以相同 synthetic carried/recomputed digest 逐字段冲击 item/batch matcher。
   // 输入/输出及副作用：engine/request 指向已安装合法 fixture；内部取得两边 detached
@@ -9118,6 +9360,8 @@ class rdma_cmq_engine_test extends uvm_test;
     rdma_cmq_submission_recovery_item saved_item;
     rdma_cmq_execution_result unused_result;
     rdma_cmq_reset_isolation_proof proof;
+    rdma_cmq_reset_isolation_proof request_proof;
+    rdma_cmq_reset_isolation_proof retained_proof;
     rdma_cmq_mmio_arm_observer stale_observer;
     rdma_dma_mapping live_mapping;
     rdma_dma_mapping saved_mapping;
@@ -9251,6 +9495,24 @@ class rdma_cmq_engine_test extends uvm_test;
         "RECOVERY_CONFIRM_AWAITING", engine, scheduler, confirm_request,
         stored_record, stored_preallocated
       );
+      status = engine.snapshot_reset_proof_probe(proof, request_proof);
+      if (status != null && status.ok())
+        status = engine.snapshot_reset_proof_probe(proof, retained_proof);
+      if (status == null || !status.ok() || request_proof == null ||
+          retained_proof == null) begin
+        `uvm_error("RECOVERY_CONFIRM_RETAINED_AWAITING_FIXTURE",
+                   "detached AWAITING proof pair construction failed")
+      end
+      else begin
+        confirm_request.reset_isolation_proof = request_proof;
+        stored_record.reset_isolation_proof = retained_proof;
+        expect_recovery_rejected(
+          "RECOVERY_CONFIRM_RETAINED_AWAITING", engine, scheduler,
+          confirm_request, stored_record, stored_preallocated
+        );
+        stored_record.reset_isolation_proof = null;
+      end
+      confirm_request.reset_isolation_proof = proof;
       proof.state = RDMA_CMQ_RESET_PROOF_READY;
       expect_recovery_rejected(
         "RECOVERY_CONFIRM_FAKE_READY", engine, scheduler, confirm_request,
@@ -9263,10 +9525,35 @@ class rdma_cmq_engine_test extends uvm_test;
 
     request.items[0].image_digest[0] = !request.items[0].image_digest[0];
     expect_recovery_rejected(
-      "RECOVERY_REQUEST_ITEM_DIGEST", engine, scheduler, request,
+      "RECOVERY_REQUEST_ITEM0_IMAGE_DIGEST", engine, scheduler, request,
       stored_record, stored_preallocated
     );
     request.items[0].image_digest[0] = !request.items[0].image_digest[0];
+
+    request.items[0].authority_digest[0] =
+      !request.items[0].authority_digest[0];
+    expect_recovery_rejected(
+      "RECOVERY_REQUEST_ITEM0_AUTHORITY_DIGEST", engine, scheduler, request,
+      stored_record, stored_preallocated
+    );
+    request.items[0].authority_digest[0] =
+      !request.items[0].authority_digest[0];
+
+    request.items[1].image_digest[0] = !request.items[1].image_digest[0];
+    expect_recovery_rejected(
+      "RECOVERY_REQUEST_ITEM1_IMAGE_DIGEST", engine, scheduler, request,
+      stored_record, stored_preallocated
+    );
+    request.items[1].image_digest[0] = !request.items[1].image_digest[0];
+
+    request.items[1].authority_digest[0] =
+      !request.items[1].authority_digest[0];
+    expect_recovery_rejected(
+      "RECOVERY_REQUEST_ITEM1_AUTHORITY_DIGEST", engine, scheduler, request,
+      stored_record, stored_preallocated
+    );
+    request.items[1].authority_digest[0] =
+      !request.items[1].authority_digest[0];
 
     request.batch_digest[0] = !request.batch_digest[0];
     expect_recovery_rejected(
@@ -9282,14 +9569,41 @@ class rdma_cmq_engine_test extends uvm_test;
     );
     stored_record.items[0].command.timeout--;
 
+    stored_record.items[0].image_digest[0] =
+      !stored_record.items[0].image_digest[0];
+    expect_recovery_rejected(
+      "RECOVERY_JOURNAL_ITEM0_IMAGE_DIGEST", engine, scheduler, request,
+      stored_record, stored_preallocated
+    );
+    stored_record.items[0].image_digest[0] =
+      !stored_record.items[0].image_digest[0];
+
     stored_record.items[0].authority_digest[0] =
       !stored_record.items[0].authority_digest[0];
     expect_recovery_rejected(
-      "RECOVERY_JOURNAL_ITEM_DIGEST", engine, scheduler, request,
+      "RECOVERY_JOURNAL_ITEM0_AUTHORITY_DIGEST", engine, scheduler, request,
       stored_record, stored_preallocated
     );
     stored_record.items[0].authority_digest[0] =
       !stored_record.items[0].authority_digest[0];
+
+    stored_record.items[1].image_digest[0] =
+      !stored_record.items[1].image_digest[0];
+    expect_recovery_rejected(
+      "RECOVERY_JOURNAL_ITEM1_IMAGE_DIGEST", engine, scheduler, request,
+      stored_record, stored_preallocated
+    );
+    stored_record.items[1].image_digest[0] =
+      !stored_record.items[1].image_digest[0];
+
+    stored_record.items[1].authority_digest[0] =
+      !stored_record.items[1].authority_digest[0];
+    expect_recovery_rejected(
+      "RECOVERY_JOURNAL_ITEM1_AUTHORITY_DIGEST", engine, scheduler, request,
+      stored_record, stored_preallocated
+    );
+    stored_record.items[1].authority_digest[0] =
+      !stored_record.items[1].authority_digest[0];
 
     stored_record.batch_digest[0] = !stored_record.batch_digest[0];
     expect_recovery_rejected(
@@ -9562,12 +9876,293 @@ class rdma_cmq_engine_test extends uvm_test;
     expect_status("RECOVERY_AUTHORITY_SHUTDOWN", status, RDMA_SC_OK);
   endtask
 
-  // 功能：把三项 batch 分别绑定 MR/QP/QUEUE concrete owner，验证任一中间 owner
-  //   拒绝 action 时整批原子失败，并覆盖 RETRY/CONFIRM 权限不可互换。
+  // 功能：在既有三项 unique-owner batch 内验证 CONFIRM proof 必须重新绑定
+  //   retained record/ordered items，并且只允许未确认 reset-cancelled lifecycle。
+  // 输入/输出及副作用：engine/mem/scheduler/source/stored/preallocation 来自 owner
+  //   scenario；构造两份 detached READY proof，逐项执行负向 CONFIRM，最后提交一次合法确认。
+  // 失败/边界：proof snapshot/digest 或 reset fixture 构造失败即停止；每个负向窗口
+  //   都要求 aligned rejection、零 attempt/I/O/mutation，合法窗口只允许两个 recovery bit 改变。
+  task automatic check_recovery_reset_confirmation_contract(
+    rdma_cmq_engine_probe engine,
+    rdma_mock_host_mem mem,
+    rdma_cmq_transport_scheduler_double scheduler,
+    rdma_cmq_batch_submission_record source_record,
+    rdma_cmq_batch_submission_record stored_record,
+    rdma_cmq_preallocated_publish_batch stored_preallocated
+  );
+    rdma_cmq_submission_recovery_request confirm_request;
+    rdma_cmq_execution_result unused_result;
+    rdma_cmq_execution_result results[];
+    rdma_cmq_reset_isolation_proof source_proof;
+    rdma_cmq_reset_isolation_proof request_proof;
+    rdma_cmq_reset_isolation_proof retained_proof;
+    rdma_cmq_recovery_owner request_owner;
+    rdma_cmq_recovery_owner retained_owner;
+    rdma_status status;
+    string saved_request_key;
+    string saved_retained_key;
+    int unsigned saved_request_index;
+    int unsigned saved_retained_index;
+    rdma_cmq_journal_digest_t saved_request_image;
+    rdma_cmq_journal_digest_t saved_retained_image;
+    rdma_cmq_journal_digest_t saved_request_authority;
+    rdma_cmq_journal_digest_t saved_retained_authority;
+    longint unsigned attempt_counter;
+    longint unsigned current_attempt;
+    int unsigned scheduler_calls;
+    int unsigned mem_calls;
+    bit fence_active;
+    string fence_key;
+    string fence_reason;
+
+    status = build_journal_recovery_graphs(
+      "recovery_reset_confirm", source_record, unused_result,
+      confirm_request, source_proof
+    );
+    if (status == null || !status.ok() || confirm_request == null ||
+        source_proof == null) begin
+      `uvm_error("RECOVERY_RESET_CONFIRM_FIXTURE",
+                 "reset confirmation request construction failed")
+      return;
+    end
+    source_proof.state = RDMA_CMQ_RESET_PROOF_READY;
+    status = recompute_reset_proof_digest_for_test(source_proof);
+    if (status != null && status.ok())
+      status = engine.snapshot_reset_proof_probe(
+        source_proof, request_proof
+      );
+    if (status != null && status.ok())
+      status = engine.snapshot_reset_proof_probe(
+        source_proof, retained_proof
+      );
+    if (status == null || !status.ok() || request_proof == null ||
+        retained_proof == null || request_proof == retained_proof) begin
+      `uvm_error("RECOVERY_RESET_CONFIRM_PROOFS",
+                 "detached READY proof pair construction failed")
+      return;
+    end
+    confirm_request.action = RDMA_CMQ_RECOVERY_CONFIRM_RESET_ISOLATION;
+    confirm_request.reset_isolation_proof = request_proof;
+    stored_record.reset_isolation_proof = retained_proof;
+
+    expect_reset_confirmation_rejected(
+      "RECOVERY_CONFIRM_NON_RESET_LIFECYCLE", engine, scheduler,
+      confirm_request, stored_record, stored_preallocated
+    );
+
+    if (!make_reset_quarantined_journal_fixture(source_record) ||
+        !make_reset_quarantined_journal_fixture(stored_record)) begin
+      `uvm_error("RECOVERY_RESET_CONFIRM_LIFECYCLE",
+                 "reset-quarantined fixture construction failed")
+      return;
+    end
+
+    request_proof.state = RDMA_CMQ_RESET_PROOF_AWAITING_REBIND;
+    retained_proof.state = RDMA_CMQ_RESET_PROOF_AWAITING_REBIND;
+    expect_reset_confirmation_rejected(
+      "RECOVERY_CONFIRM_RETAINED_NOT_READY", engine, scheduler,
+      confirm_request, stored_record, stored_preallocated
+    );
+    request_proof.state = RDMA_CMQ_RESET_PROOF_READY;
+    retained_proof.state = RDMA_CMQ_RESET_PROOF_READY;
+
+    stored_record.items[1].completion_phase = RDMA_CMQ_COMPLETION_TERMINAL;
+    expect_reset_confirmation_rejected(
+      "RECOVERY_CONFIRM_WRONG_ITEM_PHASE", engine, scheduler,
+      confirm_request, stored_record, stored_preallocated
+    );
+    stored_record.items[1].completion_phase =
+      RDMA_CMQ_COMPLETION_RESET_CANCELLED;
+
+    saved_request_key = request_proof.batch_key;
+    saved_retained_key = retained_proof.batch_key;
+    request_proof.batch_key = {saved_request_key, "-wrong"};
+    retained_proof.batch_key = {saved_retained_key, "-wrong"};
+    expect_reset_confirmation_rejected(
+      "RECOVERY_CONFIRM_PROOF_BATCH_KEY", engine, scheduler,
+      confirm_request, stored_record, stored_preallocated
+    );
+    request_proof.batch_key = saved_request_key;
+    retained_proof.batch_key = saved_retained_key;
+
+    request_proof.batch_id++;
+    retained_proof.batch_id++;
+    expect_reset_confirmation_rejected(
+      "RECOVERY_CONFIRM_PROOF_BATCH_ID", engine, scheduler,
+      confirm_request, stored_record, stored_preallocated
+    );
+    request_proof.batch_id--;
+    retained_proof.batch_id--;
+
+    request_proof.attempt_id++;
+    retained_proof.attempt_id++;
+    expect_reset_confirmation_rejected(
+      "RECOVERY_CONFIRM_PROOF_ATTEMPT_ID", engine, scheduler,
+      confirm_request, stored_record, stored_preallocated
+    );
+    request_proof.attempt_id--;
+    retained_proof.attempt_id--;
+
+    request_proof.engine_instance_id++;
+    retained_proof.engine_instance_id++;
+    expect_reset_confirmation_rejected(
+      "RECOVERY_CONFIRM_PROOF_ENGINE_INSTANCE", engine, scheduler,
+      confirm_request, stored_record, stored_preallocated
+    );
+    request_proof.engine_instance_id--;
+    retained_proof.engine_instance_id--;
+
+    request_proof.engine_incarnation++;
+    retained_proof.engine_incarnation++;
+    expect_reset_confirmation_rejected(
+      "RECOVERY_CONFIRM_PROOF_ENGINE_INCARNATION", engine, scheduler,
+      confirm_request, stored_record, stored_preallocated
+    );
+    request_proof.engine_incarnation--;
+    retained_proof.engine_incarnation--;
+
+    request_proof.isolated_identity.reset_epoch++;
+    retained_proof.isolated_identity.reset_epoch++;
+    foreach (request_proof.isolated_recovery_owners[i])
+      request_proof.isolated_recovery_owners[i].function_identity.
+        reset_epoch++;
+    foreach (retained_proof.isolated_recovery_owners[i])
+      retained_proof.isolated_recovery_owners[i].function_identity.
+        reset_epoch++;
+    expect_reset_confirmation_rejected(
+      "RECOVERY_CONFIRM_PROOF_FUNCTION_INCARNATION", engine, scheduler,
+      confirm_request, stored_record, stored_preallocated
+    );
+    request_proof.isolated_identity.reset_epoch--;
+    retained_proof.isolated_identity.reset_epoch--;
+    foreach (request_proof.isolated_recovery_owners[i])
+      request_proof.isolated_recovery_owners[i].function_identity.
+        reset_epoch--;
+    foreach (retained_proof.isolated_recovery_owners[i])
+      retained_proof.isolated_recovery_owners[i].function_identity.
+        reset_epoch--;
+
+    saved_request_index = request_proof.isolated_request_indices.pop_back();
+    saved_retained_index =
+      retained_proof.isolated_request_indices.pop_back();
+    saved_request_image = request_proof.isolated_image_digests.pop_back();
+    saved_retained_image = retained_proof.isolated_image_digests.pop_back();
+    saved_request_authority =
+      request_proof.isolated_authority_digests.pop_back();
+    saved_retained_authority =
+      retained_proof.isolated_authority_digests.pop_back();
+    request_owner = request_proof.isolated_recovery_owners.pop_back();
+    retained_owner = retained_proof.isolated_recovery_owners.pop_back();
+    expect_reset_confirmation_rejected(
+      "RECOVERY_CONFIRM_PROOF_CARDINALITY", engine, scheduler,
+      confirm_request, stored_record, stored_preallocated
+    );
+    request_proof.isolated_request_indices.push_back(saved_request_index);
+    retained_proof.isolated_request_indices.push_back(saved_retained_index);
+    request_proof.isolated_image_digests.push_back(saved_request_image);
+    retained_proof.isolated_image_digests.push_back(saved_retained_image);
+    request_proof.isolated_authority_digests.push_back(
+      saved_request_authority
+    );
+    retained_proof.isolated_authority_digests.push_back(
+      saved_retained_authority
+    );
+    request_proof.isolated_recovery_owners.push_back(request_owner);
+    retained_proof.isolated_recovery_owners.push_back(retained_owner);
+
+    request_proof.isolated_request_indices[1]++;
+    retained_proof.isolated_request_indices[1]++;
+    expect_reset_confirmation_rejected(
+      "RECOVERY_CONFIRM_PROOF_ORDERED_INDEX", engine, scheduler,
+      confirm_request, stored_record, stored_preallocated
+    );
+    request_proof.isolated_request_indices[1]--;
+    retained_proof.isolated_request_indices[1]--;
+
+    request_proof.isolated_image_digests[1][0] =
+      !request_proof.isolated_image_digests[1][0];
+    retained_proof.isolated_image_digests[1][0] =
+      !retained_proof.isolated_image_digests[1][0];
+    expect_reset_confirmation_rejected(
+      "RECOVERY_CONFIRM_PROOF_IMAGE_DIGEST", engine, scheduler,
+      confirm_request, stored_record, stored_preallocated
+    );
+    request_proof.isolated_image_digests[1][0] =
+      !request_proof.isolated_image_digests[1][0];
+    retained_proof.isolated_image_digests[1][0] =
+      !retained_proof.isolated_image_digests[1][0];
+
+    request_proof.isolated_authority_digests[2][0] =
+      !request_proof.isolated_authority_digests[2][0];
+    retained_proof.isolated_authority_digests[2][0] =
+      !retained_proof.isolated_authority_digests[2][0];
+    expect_reset_confirmation_rejected(
+      "RECOVERY_CONFIRM_PROOF_AUTHORITY_DIGEST", engine, scheduler,
+      confirm_request, stored_record, stored_preallocated
+    );
+    request_proof.isolated_authority_digests[2][0] =
+      !request_proof.isolated_authority_digests[2][0];
+    retained_proof.isolated_authority_digests[2][0] =
+      !retained_proof.isolated_authority_digests[2][0];
+
+    request_proof.isolated_recovery_owners[2].transaction_id++;
+    retained_proof.isolated_recovery_owners[2].transaction_id++;
+    expect_reset_confirmation_rejected(
+      "RECOVERY_CONFIRM_PROOF_OWNER_TUPLE", engine, scheduler,
+      confirm_request, stored_record, stored_preallocated
+    );
+    request_proof.isolated_recovery_owners[2].transaction_id--;
+    retained_proof.isolated_recovery_owners[2].transaction_id--;
+
+    status = recompute_reset_proof_digest_for_test(request_proof);
+    if (status != null && status.ok())
+      status = recompute_reset_proof_digest_for_test(retained_proof);
+    if (status == null || !status.ok()) begin
+      `uvm_error("RECOVERY_CONFIRM_VALID_PROOF",
+                 "restored READY proof pair is not self-consistent")
+      return;
+    end
+    attempt_counter = engine.journal_attempt_counter();
+    current_attempt = stored_record.attempt_id;
+    scheduler_calls = scheduler.submit_calls;
+    mem_calls = mem.calls.size();
+    engine.recover_submission_observed(confirm_request, results, status);
+    expect_recovery_attempt_results(
+      "RECOVERY_CONFIRM_VALID_RESET", confirm_request, results, status,
+      RDMA_SC_OK, RDMA_SUBMIT_EFFECT_HOST_MEMORY_WRITTEN,
+      RDMA_SUBMIT_EFFECT_HOST_MEMORY_WRITTEN,
+      RDMA_CMQ_COMPLETION_RESET_CANCELLED, 1'b0, current_attempt
+    );
+    engine.query_submission_fence(
+      fence_active, fence_key, fence_reason, status
+    );
+    if (status == null || !status.ok() || !fence_active ||
+        fence_key != stored_record.batch_key || fence_reason.len() == 0 ||
+        engine.journal_attempt_counter() != attempt_counter ||
+        stored_record.attempt_id != current_attempt ||
+        scheduler.submit_calls != scheduler_calls ||
+        mem.calls.size() != mem_calls ||
+        engine.mmio_arm_observer_count() != 0 ||
+        engine.preallocated_publish_batch_count() != 1)
+      `uvm_error("RECOVERY_CONFIRM_VALID_ATOMIC",
+                 "valid reset confirmation changed attempt, rows or I/O")
+    foreach (stored_record.items[i]) begin
+      if (!stored_record.items[i].reset_isolation_confirmed ||
+          stored_record.items[i].recovery_required)
+        `uvm_error(
+          "RECOVERY_CONFIRM_VALID_STATE",
+          $sformatf("valid confirmation did not resolve item %0d", i)
+        )
+    end
+  endtask
+
+  // 功能：把三项 batch 分别绑定 MR/QP/QUEUE unique concrete owner，逐 item/字段
+  //   覆盖 owner tamper、action 隔离，并在同一拓扑验证 CONFIRM proof/lifecycle 契约。
   // 输入/输出及副作用：无外部输入；同时更新 source/stored owner 值并独立重算两图，
-  //   每轮重建 request，调用恢复后只允许 aligned failure 和零 CAS/I/O。
-  // 失败/边界：owner 构造、digest 或 request graph 失败即报告并停止；CONFIRM 仍无
-  //   READY retained proof，测试依赖 common owner permission 先于 action 专属 pipeline。
+  //   每轮重建或 snapshot request；负向调用只允许 aligned failure 和零 CAS/I/O，
+  //   最后一个合法 CONFIRM 只解析 reset recovery bit。
+  // 失败/边界：owner/proof/reset completion 构造、digest 或 request graph 失败即停止；
+  //   每个矩阵变体只有当前 item 的命名字段变化，不能由其他 owner 的共享别名满足。
   task automatic run_task16_recovery_owner_batch_atomicity();
     rdma_cmq_engine_probe engine;
     rdma_mock_host_mem mem;
@@ -9579,6 +10174,7 @@ class rdma_cmq_engine_test extends uvm_test;
     rdma_cmq_batch_submission_record stored_record;
     rdma_cmq_preallocated_publish_batch stored_preallocated;
     rdma_cmq_submission_recovery_request request;
+    rdma_cmq_submission_recovery_request request_value;
     rdma_cmq_execution_result unused_result;
     rdma_cmq_reset_isolation_proof proof;
     rdma_cmq_recovery_owner source_owner;
@@ -9586,6 +10182,7 @@ class rdma_cmq_engine_test extends uvm_test;
     rdma_cmq_recovery_workflow_e workflows[3];
     rdma_resource_kind_e resource_kinds[3];
     logic [2:0] masks[3];
+    string owner_field_labels[RDMA_CMQ_OWNER_TAMPER_COUNT];
     rdma_status status;
     rdma_status fixture_status;
 
@@ -9598,6 +10195,15 @@ class rdma_cmq_engine_test extends uvm_test;
     masks[0] = 3'b010;
     masks[1] = 3'b100;
     masks[2] = 3'b010;
+    owner_field_labels[RDMA_CMQ_OWNER_TAMPER_FROZEN] = "FROZEN";
+    owner_field_labels[RDMA_CMQ_OWNER_TAMPER_ADMISSION_ATTEMPT] =
+      "ADMISSION_ATTEMPT";
+    owner_field_labels[RDMA_CMQ_OWNER_TAMPER_FUNCTION_IDENTITY] =
+      "FUNCTION_IDENTITY";
+    owner_field_labels[RDMA_CMQ_OWNER_TAMPER_WORKFLOW] = "WORKFLOW";
+    owner_field_labels[RDMA_CMQ_OWNER_TAMPER_RESOURCE] = "RESOURCE";
+    owner_field_labels[RDMA_CMQ_OWNER_TAMPER_TRANSACTION] = "TRANSACTION";
+    owner_field_labels[RDMA_CMQ_OWNER_TAMPER_ACTION_MASK] = "ACTION_MASK";
 
     prepare_recovery_fixture(
       "recovery_owner_batch", 3, RDMA_SUBMIT_EFFECT_HOST_MEMORY_WRITTEN,
@@ -9690,6 +10296,69 @@ class rdma_cmq_engine_test extends uvm_test;
         "RECOVERY_OWNER_RETRY_ONLY_CONFIRM", engine, scheduler, request,
         stored_record, stored_preallocated
       );
+      request.action = RDMA_CMQ_RECOVERY_RETRY_PUBLISH;
+      request.reset_isolation_proof = null;
+      foreach (request.items[item_index]) begin
+        for (int unsigned field = RDMA_CMQ_OWNER_TAMPER_FROZEN;
+             field < RDMA_CMQ_OWNER_TAMPER_COUNT; field++) begin
+          status = engine.snapshot_recovery_request_probe(
+            request, request_value
+          );
+          if (status == null || !status.ok() || request_value == null) begin
+            `uvm_error("RECOVERY_OWNER_MATRIX_SNAPSHOT",
+                       "owner matrix request snapshot failed")
+            return;
+          end
+          case (rdma_cmq_recovery_owner_tamper_e'(field))
+            RDMA_CMQ_OWNER_TAMPER_FROZEN:
+              request_value.items[item_index].recovery_owner.frozen = 1'b0;
+            RDMA_CMQ_OWNER_TAMPER_ADMISSION_ATTEMPT:
+              request_value.items[item_index].recovery_owner.
+                admission_attempt_id++;
+            RDMA_CMQ_OWNER_TAMPER_FUNCTION_IDENTITY:
+              request_value.items[item_index].recovery_owner.
+                function_identity.reset_epoch++;
+            RDMA_CMQ_OWNER_TAMPER_WORKFLOW:
+              request_value.items[item_index].recovery_owner.workflow =
+                RDMA_CMQ_WORKFLOW_INVALID;
+            RDMA_CMQ_OWNER_TAMPER_RESOURCE:
+              request_value.items[item_index].recovery_owner.resource_h.
+                object_id++;
+            RDMA_CMQ_OWNER_TAMPER_TRANSACTION:
+              request_value.items[item_index].recovery_owner.transaction_id++;
+            RDMA_CMQ_OWNER_TAMPER_ACTION_MASK:
+              request_value.items[item_index].recovery_owner.allowed_actions =
+                3'b100;
+            default:
+              `uvm_error("RECOVERY_OWNER_MATRIX_FIELD",
+                         "owner matrix field selector is invalid")
+          endcase
+          if (field inside {RDMA_CMQ_OWNER_TAMPER_ADMISSION_ATTEMPT,
+                            RDMA_CMQ_OWNER_TAMPER_RESOURCE,
+                            RDMA_CMQ_OWNER_TAMPER_TRANSACTION,
+                            RDMA_CMQ_OWNER_TAMPER_ACTION_MASK}) begin
+            status = recompute_recovery_request_digests(
+              profile_service, request_value
+            );
+            if (status == null || !status.ok()) begin
+              `uvm_error(
+                "RECOVERY_OWNER_MATRIX_DIGEST",
+                $sformatf(
+                  "item %0d field %s self-consistent digest failed",
+                  item_index, owner_field_labels[field]
+                )
+              )
+              return;
+            end
+          end
+          expect_recovery_rejected(
+            $sformatf("RECOVERY_OWNER_ITEM%0d_%s", item_index,
+                      owner_field_labels[field]),
+            engine, scheduler, request_value, stored_record,
+            stored_preallocated
+          );
+        end
+      end
     end
 
     foreach (workflows[i]) begin
@@ -9717,6 +10386,10 @@ class rdma_cmq_engine_test extends uvm_test;
         "RECOVERY_OWNER_CONFIRM_ONLY_RETRY", engine, scheduler, request,
         stored_record, stored_preallocated
       );
+      check_recovery_reset_confirmation_contract(
+        engine, mem, scheduler, source_record, stored_record,
+        stored_preallocated
+      );
     end
 
     status = engine.remove_submission_journal_probe(stored_record.batch_key);
@@ -9725,12 +10398,12 @@ class rdma_cmq_engine_test extends uvm_test;
     expect_status("RECOVERY_OWNER_BATCH_SHUTDOWN", status, RDMA_SC_OK);
   endtask
 
-  // 功能：验证 recovery 所有 candidate-only 构造、attempt overflow、observer key
-  //   collision 与过期/零/X deadline 都在唯一 CAS 和 transport 调用前失败。
+  // 功能：验证 recovery result/ticket detached staging、其他 candidate-only 构造、
+  //   attempt overflow、observer collision 与过期/零/X deadline 均在 CAS/I/O 前失败。
   // 输入/输出及副作用：无外部输入；自建 fenced fixture，按单一 fault 窗口调用恢复，
-  //   逐次恢复 counter、observer、ticket/digest，并在末尾清理 retained journal。
-  // 失败/边界：deadline 修改同时覆盖 request/journal/preallocation alias；X deadline
-  //   无法形成合法 digest，仍必须以 aligned 非空失败且不推进任何 authority。
+  //   逐次恢复 counter、observer、request ticket/deadline/digest，并清理 retained journal。
+  // 失败/边界：request ticket snapshot 与 result maker 失败仍须返回 detached 非空
+  //   ticket/status；X deadline 无法形成合法 digest，仍须 aligned 拒绝且零 authority 推进。
   task automatic run_task16_recovery_staging_and_deadline_rejections();
     rdma_cmq_engine_probe engine;
     rdma_mock_host_mem mem;
@@ -9743,6 +10416,7 @@ class rdma_cmq_engine_test extends uvm_test;
     rdma_cmq_preallocated_publish_batch stored_preallocated;
     rdma_cmq_submission_recovery_request request;
     rdma_cmq_mmio_arm_observer collision_observer;
+    rdma_function_handle saved_request_function;
     rdma_status status;
     rdma_status fixture_status;
     string collision_key;
@@ -9767,7 +10441,21 @@ class rdma_cmq_engine_test extends uvm_test;
       return;
     end
 
-    for (int unsigned fault = RDMA_CMQ_RECOVERY_STAGE_RESULT_NULL;
+    saved_request_function = request.items[0].ticket.function_h;
+    request.items[0].ticket.function_h = null;
+    expect_recovery_ticket_failure_detached(
+      "RECOVERY_STAGING_REQUEST_TICKET_SNAPSHOT", engine, scheduler,
+      request, stored_record, stored_preallocated
+    );
+    request.items[0].ticket.function_h = saved_request_function;
+
+    engine.set_recovery_stage_fault(RDMA_CMQ_RECOVERY_STAGE_RESULT_NULL);
+    expect_recovery_ticket_failure_detached(
+      "RECOVERY_STAGING_RESULT_CANDIDATE", engine, scheduler, request,
+      stored_record, stored_preallocated
+    );
+
+    for (int unsigned fault = RDMA_CMQ_RECOVERY_STAGE_OWNER_NULL;
          fault <= RDMA_CMQ_RECOVERY_STAGE_OBSERVER_CONFIGURED; fault++) begin
       engine.set_recovery_stage_fault(
         rdma_cmq_recovery_stage_fault_e'(fault)
@@ -9957,12 +10645,11 @@ class rdma_cmq_engine_test extends uvm_test;
     expect_status("RECOVERY_ORDERED_SHUTDOWN", status, RDMA_SC_OK);
   endtask
 
-  // 功能：覆盖 UNOBSERVED→PRE→authentic arm 三次证据链；第一次 retry 只推进
-  //   attempt/raw PRE，第二次 retry 的真实 callback 提升 cumulative MMIO 下界，
-  //   而 null envelope 保留本次 raw UNOBSERVED 与首次 owner admission provenance。
+  // 功能：覆盖 null envelope+unarmed 的 UNOBSERVED 下界，再由下一次 authentic
+  //   arm 在仍无 envelope 时把 cumulative 推进到 MMIO_MAYBE_VISIBLE，同时保留 raw UNOBSERVED。
   // 输入/输出及副作用：无外部输入；自建 fenced fixture，连续两次更新 expected attempt，
   //   第二次要求 scheduler 在返回前同步调用 observer，并检查 fence/preallocation 消费。
-  // 失败/边界：未 arm 的 PRE 不得清 journal/fence 或遗留 observer；真实 arm 后即使
+  // 失败/边界：未 arm 的 null envelope 不得清 journal/fence 或遗留 observer；真实 arm 后即使
   //   envelope degraded 也不得把累计存在性退回 UNOBSERVED，且旧 attempt 无再 arm 能力。
   task automatic run_task16_recovery_unobserved_effect_chain();
     rdma_cmq_engine_probe engine;
@@ -10001,11 +10688,13 @@ class rdma_cmq_engine_test extends uvm_test;
       admission_attempt_id;
     first_retry_attempt = engine.journal_attempt_counter() + 1'b1;
 
+    scheduler.return_null_result = 1'b1;
+    scheduler.invoke_observer_before_return = 1'b0;
     engine.recover_submission_observed(request, results, status);
     expect_recovery_attempt_results(
-      "RECOVERY_UNOBSERVED_PRE", request, results, status,
+      "RECOVERY_UNOBSERVED_NULL_UNARMED", request, results, status,
       RDMA_SC_INVALID_STATE, RDMA_SUBMIT_EFFECT_UNOBSERVED,
-      RDMA_SUBMIT_EFFECT_PRE_SUBMIT_REJECTED, RDMA_CMQ_COMPLETION_NONE,
+      RDMA_SUBMIT_EFFECT_UNOBSERVED, RDMA_CMQ_COMPLETION_NONE,
       1'b1, first_retry_attempt
     );
     engine.query_submission_fence(
@@ -10016,16 +10705,14 @@ class rdma_cmq_engine_test extends uvm_test;
         stored_record.attempt_id != first_retry_attempt ||
         stored_preallocated.attempt_id != first_retry_attempt ||
         stored_record.submission_effect != RDMA_SUBMIT_EFFECT_UNOBSERVED ||
-        stored_record.attempt_effect !=
-          RDMA_SUBMIT_EFFECT_PRE_SUBMIT_REJECTED ||
+        stored_record.attempt_effect != RDMA_SUBMIT_EFFECT_UNOBSERVED ||
         engine.mmio_arm_observer_count() != 0 ||
         engine.preallocated_publish_batch_count() != 1)
-      `uvm_error("RECOVERY_UNOBSERVED_PRE_STATE",
+      `uvm_error("RECOVERY_UNOBSERVED_NULL_UNARMED_STATE",
                  "first retry lost recoverable UNOBSERVED authority")
 
     request.expected_attempt_id = first_retry_attempt;
     second_retry_attempt = first_retry_attempt + 1'b1;
-    scheduler.return_null_result = 1'b1;
     scheduler.invoke_observer_before_return = 1'b1;
     engine.recover_submission_observed(request, results, status);
     expect_recovery_attempt_results(
