@@ -1605,31 +1605,43 @@ class rdma_hw_cqe_codec extends rdma_hw_queue_codec_base;
   // 失败/边界：image_kind_expected 是只读访问器，返回 RDMA_IMAGE_CQE；未覆盖枚举沿 default/类型默认分支返回，不改变对象和外部资源。
   protected virtual function rdma_image_kind_e image_kind_expected(); return RDMA_IMAGE_CQE; endfunction
   protected virtual function int unsigned image_bytes(); return active_bytes; endfunction
-  // 功能：check_reserved 校验 CQE 三个有效 qword 中的保留位，允许 qword0/1
-  //       已定义字段和 qword2[63:56] signature，其余位必须为零。
+  // 功能：check_reserved 校验 CQE 当前 profile 的三个有效 qword；32/64B
+  //       使用 qword0..qword2，128B 使用 qword8..qword10，其余 active-window
+  //       保留位必须为零。
   // 输入/输出及副作用：b 为输入；函数读取序列化 qword 并返回校验状态，不修改
-  //       builder、active_bytes 或任何外部资源。
-  // 失败/边界：builder 少于三个 qword、qword0/1 未定义位非零、qword2[55:0]
-  //       非零或扩展 qword 非零时返回 CODEC_ERROR，调用方不得发布该 CQE。
+  //       builder、active_bytes 或任何外部资源；128B prefix qword0..qword7 不解释。
+  // 失败/边界：builder 少于三个 qword、active header/qword2 保留位非零或 active
+  //       window 之后的扩展 qword 非零时返回 CODEC_ERROR，调用方不得发布 CQE。
   protected virtual function rdma_status check_reserved(rdma_hw_qword_builder b);
     bit [63:0] w[];
+    int unsigned active_qword;
+
     b.get_words(w);
-    if (w.size() < 3 || (w[0]&~64'h88ff_ffff_ff03_ffff)!=0 ||
-        (w[2]&~64'hff00_0000_0000_0000)!=0)
+    if (w.size() < 3)
       return err("CQE reserved bits are nonzero");
-    foreach (w[i]) if (i >= 3 && w[i] !== 0)
+
+    // 128B CQEs reserve qword0..qword7 for the prefix and begin their
+    // three-qword completion window at qword8.  Only the active window is
+    // interpreted; its trailing qwords must remain zero.
+    active_qword = (w.size() == 16) ? 8 : 0;
+    if ((w[active_qword] & ~64'h88ff_ffff_ff03_ffff) != 0 ||
+        (w[active_qword + 2] & ~64'hff00_0000_0000_0000) != 0)
+      return err("CQE reserved bits are nonzero");
+    foreach (w[i]) if (i >= active_qword + 3 && w[i] !== 0)
       return err("CQE reserved words are nonzero");
     return rdma_status::success();
   endfunction
-  // 功能：在 rdma_hw_cqe_codec 中，encode_fields 按硬件布局把输入模型编码到 image/缓冲区，并在写入前检查范围、重叠、端序和保留位。
+  // 功能：在 rdma_hw_cqe_codec 中，encode_fields 按 profile-relative 硬件布局把
+  //       输入模型编码到 qword0 或 qword8 起始的 image/缓冲区，并检查字段范围。
   // 输入/输出及副作用：model（输入）、b（输入）；输入模型只读；成功时通过返回值或 output 发布完整 image/bytes，不修改源模型。
   // 失败/边界：encode_fields 遇到 image/model 为空、长度/对齐/保留位非法或 codec 校验失败时不发布部分字段。
-  protected virtual function rdma_status encode_fields(rdma_hw_model model, rdma_hw_qword_builder b); rdma_hw_cqe_model x; rdma_status s; if(!$cast(x,model)) return err("CQE model type mismatch"); s=x.validate(); if(!s.ok()) return s; `define CQPUT(S,V) s=b.put_field(S``_WORD_BYTE_OFFSET,S``_LSB,S``_WIDTH,V); if(!s.ok()) return err(s.message);
+  protected virtual function rdma_status encode_fields(rdma_hw_model model, rdma_hw_qword_builder b); rdma_hw_cqe_model x; rdma_status s; bit [63:0] words[]; int unsigned base_offset; if(!$cast(x,model)) return err("CQE model type mismatch"); s=x.validate(); if(!s.ok()) return s; b.get_words(words); base_offset = (words.size() == 16) ? 64 : 0; `define CQPUT(S,V) s=b.put_field(base_offset + S``_WORD_BYTE_OFFSET,S``_LSB,S``_WIDTH,V); if(!s.ok()) return err(s.message);
     `CQPUT(RDMA_CQE_POLARITY,x.polarity) `CQPUT(RDMA_CQE_RQ_CQE,x.rq_cqe) `CQPUT(RDMA_CQE_WQE_WRAP,x.wqe_wrap) `CQPUT(RDMA_CQE_WQE_INDEX,x.wqe_index) `CQPUT(RDMA_CQE_PKT_OPCODE,x.packet_opcode) `CQPUT(RDMA_CQE_ECODE,x.ecode) `CQPUT(RDMA_CQE_QPN,x.qpn) `CQPUT(RDMA_CQE_IMMDT_DATA,x.immediate_data) `CQPUT(RDMA_CQE_PAYLOAD_LEN,x.payload_len) `CQPUT(RDMA_CQE_SIGNATURE,x.signature) `undef CQPUT return rdma_status::success(); endfunction
-  // 功能：在 rdma_hw_cqe_codec 中，decode_fields 从硬件 image/缓冲区解码字段，验证长度、布局和完整性后返回模型或状态。
+  // 功能：在 rdma_hw_cqe_codec 中，decode_fields 从 qword0 或 qword8 起始的
+  //       profile-relative 硬件窗口解码字段，验证布局和完整性后返回模型或状态。
   // 输入/输出及副作用：b（输入）、model（输出）；输入 image/bytes 只读；成功时通过返回值或 output 发布 detached 解码快照，不接管调用方缓冲区。
   // 失败/边界：decode_fields 遇到 image/model 为空、长度/对齐/保留位非法或 codec 校验失败时不发布部分字段。
-  protected virtual function rdma_status decode_fields(rdma_hw_qword_builder b, output rdma_hw_model model); rdma_hw_cqe_model x; bit [63:0] v; rdma_status s; x=rdma_hw_cqe_model::type_id::create("decoded_cqe"); x.qp_h=rdma_hw_queue_projected_handle("decoded_qp",RDMA_RESOURCE_QP,0); `define CQGET(S,T) v='0; s=b.get_field(S``_WORD_BYTE_OFFSET,S``_LSB,S``_WIDTH,v); if(!s.ok()) return err(s.message); T=v;
+  protected virtual function rdma_status decode_fields(rdma_hw_qword_builder b, output rdma_hw_model model); rdma_hw_cqe_model x; bit [63:0] v; bit [63:0] words[]; int unsigned base_offset; rdma_status s; x=rdma_hw_cqe_model::type_id::create("decoded_cqe"); x.qp_h=rdma_hw_queue_projected_handle("decoded_qp",RDMA_RESOURCE_QP,0); b.get_words(words); base_offset = (words.size() == 16) ? 64 : 0; `define CQGET(S,T) v='0; s=b.get_field(base_offset + S``_WORD_BYTE_OFFSET,S``_LSB,S``_WIDTH,v); if(!s.ok()) return err(s.message); T=v;
     `CQGET(RDMA_CQE_POLARITY,x.polarity) `CQGET(RDMA_CQE_RQ_CQE,x.rq_cqe) `CQGET(RDMA_CQE_WQE_WRAP,x.wqe_wrap) `CQGET(RDMA_CQE_WQE_INDEX,x.wqe_index) `CQGET(RDMA_CQE_PKT_OPCODE,x.packet_opcode) `CQGET(RDMA_CQE_ECODE,x.ecode) `CQGET(RDMA_CQE_QPN,x.qpn) `CQGET(RDMA_CQE_IMMDT_DATA,x.immediate_data) `CQGET(RDMA_CQE_PAYLOAD_LEN,x.payload_len) `CQGET(RDMA_CQE_SIGNATURE,x.signature) `undef CQGET x.status=rdma_status::type_id::create("decoded_status"); model=x; return rdma_status::success(); endfunction
 endclass
 

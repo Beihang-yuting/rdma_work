@@ -47,6 +47,8 @@ class rdma_queue_codec_test extends uvm_test;
     rdma_hw_sqe_model sq, sq2; rdma_hw_rqe_model rq, rq2; rdma_hw_cqe_model cq, cq2;
     rdma_hw_ceqe_model ceqe;
     rdma_sqe_rc_ext re; rdma_sge sg; byte unsigned bad[];
+    rdma_hw_cqe_codec profile_codec; rdma_hw_image profile_image;
+    rdma_hw_qword_builder profile_builder; bit [63:0] profile_words[];
     phase.raise_objection(this);
     r=rdma_codec_registry::type_id::create("r"); s=rdma_register_queue_codecs(r); ok("register",s);
     // 设计说明：CQ handle.object_id 是 resource manager 分配的 global incarnation，
@@ -68,6 +70,25 @@ class rdma_queue_codec_test extends uvm_test;
     s=r.lookup('{hw_version:"rdma",image_kind:RDMA_IMAGE_RQE,object_type:"rqe",variant:"default",opcode:0},c); ok("lookup rq",s); s=c.encode(rq,im); ok("rq encode",s); s=c.decode(im,m); ok("rq decode",s);
     cq=rdma_hw_cqe_model::type_id::create("cq"); cq.qp_h=h("cq",RDMA_RESOURCE_QP,'h2aaaa); cq.qpn='h2aaaa; cq.wqe_index='h4567; cq.ecode=8'hf4; cq.payload_len='h10203040; cq.polarity=1; cq.rq_cqe=1; cq.wqe_wrap=1; cq.packet_opcode=8'h9a; cq.immediate_data=32'h89abcdef; cq.status=rdma_status::type_id::create("st");
     s=r.lookup('{hw_version:"rdma",image_kind:RDMA_IMAGE_CQE,object_type:"cqe",variant:"default",opcode:0},c); ok("lookup cq",s); s=c.encode(cq,im); ok("cq encode",s); s=c.decode(im,m); ok("cq decode",s);
+    // The 128B CQE profile owns qword8..qword10; qword0..qword7 remain a
+    // zeroed prefix in producer images and are not widened into CQE fields.
+    profile_codec = rdma_hw_cqe_codec::type_id::create("queue_test_profile_cqe");
+    s = profile_codec.encode_with_entry_bytes(cq, 128, profile_image);
+    if (s == null || !s.ok() || profile_image == null ||
+        profile_image.bytes.size() != 128 || profile_image.length != 128 ||
+        profile_image.alignment != 128)
+      `uvm_error("cq_128_profile", "128B CQE profile metadata is invalid")
+    else begin
+      profile_builder = new("queue_test_profile_builder");
+      s = profile_builder.deserialize(profile_image.bytes);
+      profile_builder.get_words(profile_words);
+      if (s == null || !s.ok() || profile_words.size() != 16 ||
+          profile_words[8][17:0] !== cq.qpn ||
+          profile_words[9][31:0] !== cq.payload_len ||
+          profile_words[10][63:56] !== cq.signature ||
+          profile_words[0] !== 0 || profile_words[7] !== 0)
+        `uvm_error("cq_128_profile_raw", "128B CQE fields are not at qword8 window")
+    end
     bad = new[64]; foreach (bad[i]) bad[i]=0; bad[0]=8'h1; im.bytes.delete(); foreach (bad[i]) im.bytes.push_back(bad[i]); im.length=64; im.alignment=64; im.endian=RDMA_ENDIAN_BIG; im.image_kind=RDMA_IMAGE_CQE; im.hardware_version=1; s=c.validate_image(im); if (s==null || s.ok()) `uvm_error("reserved","reserved bits accepted");
     phase.drop_objection(this);
   endtask

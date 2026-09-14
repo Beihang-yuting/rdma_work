@@ -45,3 +45,33 @@ retaining zero-BDF and PF/VF route validation. `rdma_function_identity_test`
 was rerun on VCS53 and exited 0 with warning=0 error=0 fatal=0. The model,
 queue-lifecycle, QP-lifecycle, and control-plane CMQ tests still require a
 post-correction run.
+
+## Phase 1C Task 1 — CQE profile-relative 128B header
+
+### Scope and implementation
+
+The CQE codec now derives an active qword window from the builder profile:
+32/64B use qword0..qword2 and 128B uses qword8..qword10 (byte64). Field
+encode/decode offsets and reserved checks use that same base. Prefix qwords in a
+128B image are intentionally opaque, while qwords after the active three-qword
+window remain fail-closed. Image length, alignment, endian, generation and
+target metadata are unchanged.
+
+Tests add a nonzero-prefix raw 128B decode case, a byte0-only negative case, and
+queue-codec raw qword8/qword9/qword10 assertions. The 128B explicit-image tail
+check now starts after the active window at byte88.
+
+### RED evidence
+
+`scripts/run_vcs53.sh core rdma_cqe_size_codec_test` failed before the codec
+change with `CQE_PROFILE_RELATIVE_DECODE` and `CQE_PROFILE_RELATIVE_BYTE0`
+(UVM warning=0, error=2, fatal=0).
+
+### GREEN evidence
+
+- `scripts/run_vcs53.sh core rdma_cqe_size_codec_test`: exit 0; UVM
+  warning=0, error=0, fatal=0; `PROCESS PASS` and `LOGICAL PASS`.
+- `scripts/run_vcs53.sh core rdma_queue_codec_test`: exit 0; UVM warning=0,
+  error=0, fatal=0; `PROCESS PASS` and `LOGICAL PASS`.
+- `python3 tools/check_changed_sv_style.py --base HEAD --head HEAD`: pass.
+- `git diff --check`: pass.

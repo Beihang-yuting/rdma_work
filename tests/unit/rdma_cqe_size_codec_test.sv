@@ -223,7 +223,7 @@ class rdma_cqe_size_codec_test extends uvm_test;
       `uvm_error("CQE_EXPLICIT_128", "128B explicit CQE image metadata is invalid")
     else begin
       foreach (image128.bytes[i]) begin
-        if (i >= 24 && image128.bytes[i] !== 8'h00)
+        if (i >= 88 && image128.bytes[i] !== 8'h00)
           `uvm_error("CQE_EXPLICIT_128_TAIL",
                      $sformatf("128B CQE tail byte %0d is nonzero", i))
       end
@@ -308,6 +308,68 @@ class rdma_cqe_size_codec_test extends uvm_test;
       `uvm_error("CQE_RESERVED_QWORD2", "qword2 reserved bit was accepted")
   endtask
 
+  // 功能：构造 128B CQE 的 profile-relative raw image，确认 qword8 起始的
+  // header 能从非零 prefix 后正确解码，并把旧 byte0 坐标作为负向证据。
+  // 输入输出及副作用：仅创建本地 codec、source/image 和 detached decode
+  // model；成功路径只读 raw bytes，失败通过 UVM error 记录，不修改生产资源。
+  // 失败边界：prefix、qword8/qword9/qword10 任一保留位不满足 profile，或
+  // byte0 image 被误当作 128B header，均报告具体坐标错误。
+  task automatic test_cqe_128b_profile_relative_header();
+    rdma_hw_cqe_codec codec;
+    rdma_hw_cqe_model source;
+    rdma_hw_image base64;
+    rdma_hw_image image128;
+    rdma_hw_model decoded;
+    rdma_hw_cqe_model decoded_cqe;
+    rdma_status st;
+
+    codec = rdma_hw_cqe_codec::type_id::create("profile_relative_codec");
+    source = make_hw_cqe_model();
+    st = codec.encode_with_entry_bytes(source, 64, base64);
+    if (st == null || !st.ok() || base64 == null || base64.bytes.size() != 64) begin
+      `uvm_error("CQE_PROFILE_RELATIVE_SETUP", "failed to build 64B CQE source")
+      return;
+    end
+
+    image128 = rdma_hw_image::type_id::create("profile_relative_raw");
+    foreach (image128.bytes[i]) image128.bytes[i] = 8'h00;
+    // Prefix bytes are outside the active qword8..qword10 window and are
+    // deliberately nonzero to prove that reserved checking is profile-relative.
+    for (int unsigned i = 0; i < 64; i++)
+      image128.bytes.push_back(8'hc3);
+    foreach (base64.bytes[i]) image128.bytes.push_back(base64.bytes[i]);
+    image128.length = 128;
+    image128.alignment = 128;
+    image128.endian = RDMA_ENDIAN_BIG;
+    image128.image_kind = RDMA_IMAGE_CQE;
+    image128.hardware_version = RDMA_HW_VERSION;
+    image128.function_generation = source.qp_h.generation;
+    image128.write_target_kind = RDMA_HW_TARGET_NONE;
+    image128.backing_target = '0;
+    image128.hmc_target = '0;
+    image128.bar_target = '0;
+
+    decoded = null;
+    st = codec.decode_with_entry_bytes(image128, 128, decoded);
+    if (st == null || !st.ok() || decoded == null || !$cast(decoded_cqe, decoded) ||
+        decoded_cqe.qpn != source.qpn || decoded_cqe.wqe_index != source.wqe_index ||
+        decoded_cqe.payload_len != source.payload_len || decoded_cqe.signature != source.signature)
+      `uvm_error("CQE_PROFILE_RELATIVE_DECODE",
+                 "128B CQE fields were not decoded from qword8 window")
+
+    // A legacy byte0 header is outside the 128B active window.  It must not be
+    // interpreted as the completion represented by qword8..qword10.
+    foreach (base64.bytes[i]) image128.bytes[i] = base64.bytes[i];
+    for (int unsigned i = 64; i < 128; i++)
+      image128.bytes[i] = 8'h00;
+    decoded = null;
+    st = codec.decode_with_entry_bytes(image128, 128, decoded);
+    if (st == null || !st.ok() || decoded == null || !$cast(decoded_cqe, decoded) ||
+        decoded_cqe.qpn == source.qpn)
+      `uvm_error("CQE_PROFILE_RELATIVE_BYTE0",
+                 "128B byte0 header was incorrectly treated as active")
+  endtask
+
   // 功能：验证极大 header offset 不会因 32 位无符号加法回绕而被误判为合法。
   // 输入输出及副作用：仅创建本地 layout/image 并检查返回状态，不修改生产资源。
   // 失败边界：构造函数、for_bytes() 或 encode_cqe() 任一路径接受回绕 offset
@@ -342,6 +404,7 @@ class rdma_cqe_size_codec_test extends uvm_test;
     test_cqe_decode_profiles_are_stateless();
     test_cqe_explicit_profile_is_stateless();
     test_cqe_qword2_reserved_bits_rejected();
+    test_cqe_128b_profile_relative_header();
     test_cqe_layout_rejects_offset_overflow();
     phase.drop_objection(this);
   endtask
