@@ -1594,7 +1594,6 @@ endclass
 class rdma_hw_cqe_codec extends rdma_hw_queue_codec_base;
   `uvm_object_utils(rdma_hw_cqe_codec)
   protected int unsigned active_bytes;
-  protected bit allow_ud_qword3;
 
   // 功能：构造 rdma_hw_cqe_codec，调用 super.new 建立 UVM 层级对象；外部依赖字段保持未绑定，后续由 configure/build/activate 明确注入。
   // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
@@ -1602,11 +1601,7 @@ class rdma_hw_cqe_codec extends rdma_hw_queue_codec_base;
   // 功能：构造 CQE codec 并默认保持历史 64B profile。
   // 输入输出及副作用：name 为输入；初始化本地 profile 状态，不拥有 ring 或 image。
   // 失败边界：profile 仅可由 set_entry_bytes 切换，构造不接管外部资源。
-  function new(string name="rdma_hw_cqe_codec");
-    super.new(name);
-    active_bytes = RDMA_CQE_BYTES;
-    allow_ud_qword3 = 1'b0;
-  endfunction
+  function new(string name="rdma_hw_cqe_codec"); super.new(name); active_bytes=RDMA_CQE_BYTES; endfunction
   // 功能：选择本次编解码使用的 CQE profile 大小。
   // 输入输出及副作用：bytes 为输入；成功时更新 codec 本地 profile，返回状态。
   // 失败边界：32/64/128 以外的大小被拒绝且保留原 profile。
@@ -1614,17 +1609,6 @@ class rdma_hw_cqe_codec extends rdma_hw_queue_codec_base;
     if (!(bytes inside {32,64,128}))
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,"CQE profile size is invalid");
     active_bytes=bytes; return rdma_status::success();
-  endfunction
-
-  // 功能：set_ud_qword3_enabled 为显式 UD variant 入口切换 qword3 的两个
-  //       驱动 overlay 字段，供后续携带 CQE transport/profile authority 的层调用。
-  // 输入/输出及副作用：enabled 为输入；成功时只更新 codec 本地 variant gate，
-  //       不修改 active_bytes、镜像或外部资源所有权。
-  // 失败/边界：该 gate 默认关闭，因此未提供 UD discriminator 的 default codec
-  //       继续把 qword3 视为 reserved；调用方必须在拥有 UD authority 后显式开启。
-  function rdma_status set_ud_qword3_enabled(bit enabled);
-    allow_ud_qword3 = enabled;
-    return rdma_status::success();
   endfunction
 
   // 功能：按调用方显式提供的 CQE entry profile 解码一份 image，构造独立的
@@ -1827,20 +1811,16 @@ class rdma_hw_cqe_codec extends rdma_hw_queue_codec_base;
   protected virtual function int unsigned image_bytes(); return active_bytes; endfunction
   // 功能：check_reserved 校验 CQE 当前 profile 的三个有效 qword；32/64B
   //       使用 qword0..qword2，128B 使用 qword8..qword10，其余 active-window
-  //       保留位必须为零；header-relative qword3 的 UD_SMAC/VLAN_TAG 位域
-  //       按驱动精确掩码放行，64B qword4..7 与 128B qword0..7 作为不透明数据。
+  //       保留位必须为零；header-relative qword3 及其后续 profile 扩展字段
+  //       留待 Task 3 在取得 transport/variant authority 后建模。
   // 输入/输出及副作用：b 为输入；函数读取序列化 qword 并返回校验状态，不修改
   //       builder、active_bytes 或任何外部资源；128B prefix qword0..qword7 不解释。
-  // 失败/边界：builder 少于四个 qword、active header/qword2 保留位非零或
-  //       128B 未定义 qword12..15 非零时返回 CODEC_ERROR；64B payload 和
-  //       128B prefix 不参与 reserved 拒绝，调用方不得将其误当作字段。
+  // 失败/边界：builder 为空或少于四个 qword、active header/qword2 保留位
+  //       非零或 active-window 之后的扩展 qword 非零时返回 CODEC_ERROR，
+  //       调用方不得发布 CQE。
   protected virtual function rdma_status check_reserved(rdma_hw_qword_builder b);
     bit [63:0] w[];
     int unsigned active_qword;
-    const bit [63:0] CQE_QWORD3_UD_SMAC_MASK = 64'hffff_ffff_ffff_0000;
-    const bit [63:0] CQE_QWORD3_UD_VLAN_TAG_MASK = 64'h0000_0000_0000_ffff;
-    const bit [63:0] CQE_QWORD3_UD_FIELDS_MASK =
-        CQE_QWORD3_UD_SMAC_MASK | CQE_QWORD3_UD_VLAN_TAG_MASK;
 
     if (b == null)
       return err("CQE qword builder is null");
@@ -1856,22 +1836,8 @@ class rdma_hw_cqe_codec extends rdma_hw_queue_codec_base;
         (w[active_qword + 2] & ~64'hff00_0000_0000_0000) != 0)
       return err("CQE reserved bits are nonzero");
 
-    // wr.h/wr.c expose qword3 only through two UD overlay fields.  Keep the
-    // mask expressed as their exact union instead of an unqualified qword
-    // exemption; this also documents why every bit is legal in that overlay.
-    if (!allow_ud_qword3 && w[active_qword + 3] !== 0)
-      return err("CQE qword3 requires UD variant");
-    if (allow_ud_qword3 &&
-        (w[active_qword + 3] & ~CQE_QWORD3_UD_FIELDS_MASK) != 0)
-      return err("CQE qword3 reserved bits are nonzero");
-
-    // Profile geometry selects the documented inline payload window: 64B
-    // entries leave qword4..7 opaque, while 128B entries leave qword0..7
-    // opaque before the header.  Only the undocumented 128B qword12..15
-    // retain strict zero-tail policy.
-    if (w.size() == 16)
-      foreach (w[i]) if (i >= 12 && w[i] !== 0)
-        return err("CQE reserved words are nonzero");
+    foreach (w[i]) if (i >= active_qword + 3 && w[i] !== 0)
+      return err("CQE reserved words are nonzero");
     return rdma_status::success();
   endfunction
   // 功能：在 rdma_hw_cqe_codec 中，encode_fields 按 profile-relative 硬件布局把

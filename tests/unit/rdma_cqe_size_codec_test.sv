@@ -370,120 +370,21 @@ class rdma_cqe_size_codec_test extends uvm_test;
                  "128B byte0 header was incorrectly treated as active")
   endtask
 
-  // 功能：验证 CQE header-relative qword3 的 UD_SMAC/UD_VLAN_TAG 位域以及
-  //       64B inline payload、128B prefix 的不透明生命周期契约。
-  // 输入/输出及副作用：任务构造 32/64/128B raw image，调用 detached decode
-  //       并检查 qword3、payload 和 128B tail 的接受/拒绝结果；不修改生产资源。
-  // 失败/边界：qword3 的任一精确字段被保留位检查误拒、64B qword4..7 或
-  //       128B qword0..7 被误判为 reserved，或 128B qword12..15 非零未拒绝时报告 UVM error。
-  task automatic test_cqe_qword3_masks_and_opaque_payload();
+  // 功能：验证 CQE detached decode 在 image 字节数短于声明 profile 时安全拒绝，
+  //       不进入 qword 窗口索引或发布部分模型。
+  // 输入/输出及副作用：任务构造 24B 的本地 CQE image 并调用 32B 显式解码，
+  //       只产生 UVM 断言，不修改 codec active profile 或外部资源。
+  // 失败/边界：长度、bytes 数组和 alignment 任一不满足 entry_size=32 时必须返回
+  //       非成功状态；若短 image 被接受则报告 CQE_SHORT_IMAGE。
+  task automatic test_cqe_short_image_rejected();
     rdma_hw_cqe_codec codec;
     rdma_hw_cqe_model source;
-    rdma_hw_image images[3];
     rdma_hw_image short_image;
     rdma_hw_model decoded;
     rdma_status st;
-    int unsigned sizes[3] = '{32, 64, 128};
 
-    codec = rdma_hw_cqe_codec::type_id::create("qword3_mask_codec");
+    codec = rdma_hw_cqe_codec::type_id::create("short_image_codec");
     source = make_hw_cqe_model();
-    // ECODE is an 8-bit raw field; values not present in the short symbolic
-    // list remain legal hardware observations and must round-trip unchanged.
-    source.ecode = 8'hff;
-    foreach (sizes[i]) begin
-      st = codec.encode_with_entry_bytes(source, sizes[i], images[i]);
-      if (st == null || !st.ok() || images[i] == null ||
-          images[i].bytes.size() != sizes[i]) begin
-        `uvm_error("CQE_QWORD3_SETUP", $sformatf(
-            "failed to build %0dB CQE image", sizes[i]))
-        continue;
-      end
-    end
-
-    // Driver wr.h/wr.c define qword3 as two exact fields, not as a generic
-    // reserved word: UD_SMAC[63:16] followed by UD_VLAN_TAG[15:0].
-    foreach (images[i]) begin
-      rdma_hw_qword_builder builder;
-      byte unsigned raw[];
-
-      if (images[i] == null)
-        continue;
-      builder = new($sformatf("qword3_builder_%0d", sizes[i]));
-      st = builder.deserialize(images[i].bytes);
-      if (st == null || !st.ok()) begin
-        `uvm_error("CQE_QWORD3_SETUP", $sformatf(
-            "qword3 builder deserialize failed for %0dB", sizes[i]))
-        continue;
-      end
-      st = builder.put_field((sizes[i] == 128 ? 88 : 24), 16, 48,
-                             48'h1122_3344_5566);
-      if (st == null || !st.ok())
-        `uvm_error("CQE_QWORD3_SMAC", $sformatf(
-            "UD_SMAC field write failed for %0dB", sizes[i]))
-      st = builder.put_field((sizes[i] == 128 ? 88 : 24), 0, 16,
-                             16'h7788);
-      if (st == null || !st.ok())
-        `uvm_error("CQE_QWORD3_VLAN", $sformatf(
-            "UD_VLAN_TAG field write failed for %0dB", sizes[i]))
-
-      // 64B qword4..7 and 128B qword0..7 are opaque inline/prefix bytes.
-      if (sizes[i] == 64) begin
-        st = builder.put_field(32, 0, 64, 64'hdead_beef_0123_4567);
-        if (st == null || !st.ok())
-          `uvm_error("CQE_INLINE_PAYLOAD", "64B inline payload write failed")
-      end
-      else if (sizes[i] == 128) begin
-        st = builder.put_field(0, 0, 64, 64'hcafe_f00d_dead_beef);
-        if (st == null || !st.ok())
-          `uvm_error("CQE_PREFIX_PAYLOAD", "128B prefix payload write failed")
-        st = builder.put_field(56, 0, 64, 64'h0123_4567_89ab_cdef);
-        if (st == null || !st.ok())
-          `uvm_error("CQE_PREFIX_PAYLOAD", "128B prefix tail write failed")
-      end
-      raw = new[0];
-      st = builder.serialize(raw);
-      if (st == null || !st.ok()) begin
-        `uvm_error("CQE_QWORD3_SETUP", $sformatf(
-            "qword3 builder serialize failed for %0dB", sizes[i]))
-        continue;
-      end
-      foreach (images[i].bytes[j]) images[i].bytes[j] = raw[j];
-      decoded = null;
-      st = codec.decode_with_entry_bytes(images[i], sizes[i], decoded);
-      if (st == null || st.ok())
-        `uvm_error("CQE_QWORD3_VARIANT", $sformatf(
-            "default non-UD profile accepted qword3 for %0dB", sizes[i]))
-    end
-
-    // qword3 acceptance requires an explicit UD discriminator; this keeps the
-    // default registry variant fail-closed until Task3 supplies transport authority.
-    st = codec.set_ud_qword3_enabled(1'b1);
-    if (st == null || !st.ok()) begin
-      `uvm_error("CQE_QWORD3_VARIANT", "failed to enable explicit UD variant")
-    end
-    else foreach (images[i]) begin
-      rdma_hw_cqe_model decoded_cqe;
-
-      if (images[i] == null)
-        continue;
-      decoded = null;
-      st = codec.decode_with_entry_bytes(images[i], sizes[i], decoded);
-      if (st == null || !st.ok() || decoded == null ||
-          !$cast(decoded_cqe, decoded) || decoded_cqe.ecode !== 8'hff)
-        `uvm_error("CQE_QWORD3_LEGAL", $sformatf(
-            "explicit UD qword3/payload decode failed for %0dB", sizes[i]))
-    end
-
-    // 128B absolute qword12..15 have no wr.h field/payload macro in the
-    // archived source, so the codec keeps the documented strict zero-tail.
-    if (images[2] != null) begin
-      images[2].bytes[96] = 8'h01;
-      decoded = null;
-      st = codec.decode_with_entry_bytes(images[2], 128, decoded);
-      if (st == null || st.ok())
-        `uvm_error("CQE_128B_TAIL", "128B undocumented tail was accepted")
-    end
-
     short_image = rdma_hw_image::type_id::create("short_cqe_image");
     for (int unsigned i = 0; i < 24; i++)
       short_image.bytes.push_back(8'h00);
@@ -538,7 +439,7 @@ class rdma_cqe_size_codec_test extends uvm_test;
     test_cqe_explicit_profile_is_stateless();
     test_cqe_qword2_reserved_bits_rejected();
     test_cqe_128b_profile_relative_header();
-    test_cqe_qword3_masks_and_opaque_payload();
+    test_cqe_short_image_rejected();
     test_cqe_layout_rejects_offset_overflow();
     phase.drop_objection(this);
   endtask
