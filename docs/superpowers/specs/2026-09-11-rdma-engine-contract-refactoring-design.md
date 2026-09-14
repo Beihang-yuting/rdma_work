@@ -1030,6 +1030,14 @@ command/legacy operation 的原始
 
 production observation 表固定如下：
 
+生产调用方向冻结为 `adapter.execute() -> adapter.execute_observed() ->
+engine.execute_observed() -> engine.submit_observed()`。submit 返回后，engine
+在 `engine_lock` 下按完整 ticket/batch/attempt/Function incarnation 重读 retained
+journal；只有 `PUBLISH_AMBIGUOUS/PENDING` 或 `PUBLISH_CONFIRMED/PENDING` 的已 arm
+项允许一次 `wait_for()`。Host-visible/NONE 立即返回，终态/timeout/late/reset 均从
+journal retained completion 快照返回；STAGED/PENDING_EFFECT 直接报告 observation
+error 且不做 I/O。ticket presence、status code 和 FIFO 都不是 wait authority。
+
 | production path | operation `status` | `observation_status` |
 | --- | --- | --- |
 | 可靠 success 或可靠 command/hardware failure | 精确 operation result | `OK` |
@@ -1451,6 +1459,12 @@ base `execute_observed() -> legacy execute()` 与 production
 `execute() -> execute_observed()` 必须分别有 subclass/mock 编译和运行测试；任何类都
 不能同时继承两个默认包装而产生递归。probe 适配只改变一处，其余 check 用例签名保持
 不变。
+
+Phase 1A 中 production legacy `execute()` 仍是 `last_execute_no_submit_proven` 的唯一
+写者：进入时清零，调用 observed override 一次后仅在初始
+`PRE_SUBMIT_REJECTED` 且 batch/attempt 为零、无 retained journal、`recovery_required=0`
+时置一。observed API、engine、wait/reconcile 与 retained snapshots 不读写该弃用成员；
+三个 Phase 1B consumer 完成迁移前 accessor 保留以维持 ABI。
 
 ## 8. 可读性与排版契约
 

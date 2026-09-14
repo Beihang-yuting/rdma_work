@@ -802,6 +802,7 @@ class rdma_cmq_engine extends uvm_object;
   );
     rdma_status validation_status;
     rdma_status snapshot_status;
+    rdma_status identity_status;
     rdma_cmq_ticket ticket_snapshot;
     uvm_object payload_snapshot;
 
@@ -1159,6 +1160,82 @@ class rdma_cmq_engine extends uvm_object;
         "CMQ journal ticket resolves to multiple retained items"
       );
     end
+    return journal_status(RDMA_SC_OK);
+  endfunction
+
+  // 功能：在 engine_lock 持有期间验证 observed result 与 retained journal 行的
+  //   完整身份及 state/phase/completion 组合，作为 execute 的唯一决策门禁。
+  // 输入/输出及副作用：submitted、batch_record、journal_item 为只读输入；返回
+  //   非空 status，不修改 journal 或任何 lifecycle 字段。
+  // 失败/边界：ticket、batch/attempt、engine incarnation、Function/CMQ identity
+  //   任一不一致，或 state/phase/completion 不匹配时返回 INVALID_STATE。
+  protected function rdma_status validate_observed_item_locked(
+    input rdma_cmq_execution_result submitted,
+    input rdma_cmq_batch_submission_record batch_record,
+    input rdma_cmq_batch_submission_item_record journal_item
+  );
+    if (submitted == null || batch_record == null || journal_item == null ||
+        submitted.ticket == null || journal_item.ticket == null ||
+        submitted.batch_key != batch_record.batch_key ||
+        submitted.batch_id != batch_record.batch_id ||
+        submitted.attempt_id != batch_record.attempt_id ||
+        batch_record.engine_instance_id != engine_instance_id ||
+        batch_record.engine_incarnation != engine_incarnation ||
+        !same_ticket_value(submitted.ticket, journal_item.ticket) ||
+        !same_ticket_value(journal_item.completion == null ? journal_item.ticket :
+                           journal_item.completion.ticket, journal_item.ticket))
+      return journal_status(
+        RDMA_SC_INVALID_STATE, "CMQ observed journal identity mismatch"
+      );
+    if (batch_record.function_identity == null ||
+        journal_item.ticket.function_h == null ||
+        journal_item.ticket.function_h.function_uid !=
+          batch_record.function_identity.function_uid ||
+        journal_item.ticket.function_h.object_id !=
+          batch_record.function_identity.global_function_id ||
+        journal_item.ticket.function_h.generation !=
+          batch_record.function_identity.generation)
+      return journal_status(
+        RDMA_SC_INVALID_STATE, "CMQ observed Function identity mismatch"
+      );
+    if (journal_item.state == RDMA_CMQ_SUBMISSION_HOST_VISIBLE_NOT_PUBLISHED)
+      if (journal_item.completion_phase != RDMA_CMQ_COMPLETION_NONE ||
+          journal_item.completion != null)
+        return journal_status(
+          RDMA_SC_INVALID_STATE, "CMQ observed host-visible lifecycle mismatch"
+        );
+    if (journal_item.state == RDMA_CMQ_SUBMISSION_COMPLETED)
+      if (journal_item.completion_phase != RDMA_CMQ_COMPLETION_TERMINAL ||
+          journal_item.completion == null)
+        return journal_status(
+          RDMA_SC_INVALID_STATE, "CMQ observed completed lifecycle mismatch"
+        );
+    if (journal_item.state == RDMA_CMQ_SUBMISSION_TIMED_OUT_QUARANTINED)
+      if (journal_item.completion_phase != RDMA_CMQ_COMPLETION_TIMEOUT ||
+          journal_item.completion == null)
+        return journal_status(
+          RDMA_SC_INVALID_STATE, "CMQ observed timeout lifecycle mismatch"
+        );
+    if (journal_item.state == RDMA_CMQ_SUBMISSION_LATE_COMPLETED)
+      if (journal_item.completion_phase != RDMA_CMQ_COMPLETION_DIAGNOSTIC_ONLY ||
+          journal_item.completion == null)
+        return journal_status(
+          RDMA_SC_INVALID_STATE, "CMQ observed late lifecycle mismatch"
+        );
+    if (journal_item.state == RDMA_CMQ_SUBMISSION_RESET_QUARANTINED)
+      if (journal_item.completion_phase != RDMA_CMQ_COMPLETION_RESET_CANCELLED ||
+          journal_item.completion == null)
+        return journal_status(
+          RDMA_SC_INVALID_STATE, "CMQ observed reset lifecycle mismatch"
+        );
+    if (journal_item.state inside {
+          RDMA_CMQ_SUBMISSION_PUBLISH_AMBIGUOUS,
+          RDMA_CMQ_SUBMISSION_PUBLISH_CONFIRMED
+        } && (journal_item.completion_phase != RDMA_CMQ_COMPLETION_PENDING ||
+              journal_item.completion != null))
+      return journal_status(
+        RDMA_SC_INVALID_STATE, "CMQ observed pending lifecycle mismatch"
+      );
     return journal_status(RDMA_SC_OK);
   endfunction
 
@@ -6034,6 +6111,7 @@ class rdma_cmq_engine extends uvm_object;
     rdma_cmq_command_identity command_identity_snapshot;
     rdma_cmq_recovery_owner owner_snapshot;
     rdma_dma_request_context dma_snapshot;
+    rdma_cmq_hw_profile snapshot_profile;
     rdma_status status;
     string failure_reason;
 
@@ -6045,6 +6123,11 @@ class rdma_cmq_engine extends uvm_object;
         "CMQ execution result source is null or unsupported"
       );
     context = new();
+    snapshot_profile = profile;
+    if (source.batch_key.len() != 0 &&
+        journal_profile_by_batch.exists(source.batch_key) &&
+        journal_profile_by_batch[source.batch_key] != null)
+      snapshot_profile = journal_profile_by_batch[source.batch_key];
     if (!context.try_snapshot_optional_ticket(
           source.ticket, ticket_snapshot, failure_reason
         ))
@@ -6053,7 +6136,7 @@ class rdma_cmq_engine extends uvm_object;
         {"CMQ execution result ticket snapshot failed: ", failure_reason}
       );
     status = snapshot_completion_with_profile_locked(
-      source.completion, context, profile, completion_snapshot
+      source.completion, context, snapshot_profile, completion_snapshot
     );
     if (status == null || !status.ok())
       return (status == null) ? journal_status(
@@ -11406,12 +11489,172 @@ class rdma_cmq_engine extends uvm_object;
     engine_lock.put(1);
   endtask
 
+  // 功能：执行单条 command 的 observed 生命周期，并在提交返回后依据锁内
+  //   retained journal 行决定立即返回或等待精确 pending 项。
+  // 输入/输出及副作用：command 为只读输入，result 为 caller-owned detached 图；
+  //   submit_observed 只调用一次，armed pending 才调用 wait_for，终态仅快照 journal。
+  // 失败/边界：STAGED/PENDING_EFFECT、缺失 journal、坏 envelope 或 authority 变化均
+  //   fail-closed；不会把 ticket/FIFO/status 当作 wait 判据，也不读写 last_* seam。
+  task execute_observed(
+    input rdma_cmq_command_desc command,
+    output rdma_cmq_execution_result result
+  );
+    rdma_cmq_execution_result submitted;
+    rdma_cmq_batch_submission_record batch_record;
+    rdma_cmq_batch_submission_item_record journal_item;
+    rdma_cmq_completion waited_completion;
+    rdma_status waited_status;
+    rdma_status lookup_status;
+    rdma_status snapshot_status;
+    rdma_status identity_status;
+    int unsigned item_index;
+    bit armed_pending;
+
+    result = new_submit_result_direct("cmq_execute_observed_fallback");
+    submit_observed(command, submitted);
+    if (submitted == null) begin
+      result.status = rdma_cmq_direct_status(
+        RDMA_SC_INVALID_STATE, "CMQ observed submit returned null result"
+      );
+      result.observation_status = rdma_cmq_direct_status(
+        RDMA_SC_INVALID_STATE, "CMQ observed submit returned null result"
+      );
+      result.submission_effect = RDMA_SUBMIT_EFFECT_UNOBSERVED;
+      result.attempt_effect = RDMA_SUBMIT_EFFECT_UNOBSERVED;
+      result.completion_phase = RDMA_CMQ_COMPLETION_UNOBSERVED;
+      result.recovery_required = 1'b1;
+      return;
+    end
+
+    // 未产生 retained identity 的 pre-submit rejection 直接返回 submit 结果。
+    if (submitted.ticket == null || submitted.batch_key.len() == 0) begin
+      result = submitted;
+      return;
+    end
+
+    engine_lock.get(1);
+    lookup_status = locate_journal_item_by_ticket_locked(
+      submitted.ticket, batch_record, journal_item, item_index
+    );
+    if (lookup_status == null || !lookup_status.ok() ||
+        batch_record == null || journal_item == null) begin
+      engine_lock.put(1);
+      result = submitted;
+      result.observation_status = rdma_cmq_direct_status(
+        RDMA_SC_INVALID_STATE, "CMQ observed journal lookup failed"
+      );
+      return;
+    end
+    identity_status = validate_observed_item_locked(
+      submitted, batch_record, journal_item
+    );
+    if (identity_status == null || !identity_status.ok()) begin
+      result = submitted;
+      result.observation_status = rdma_cmq_direct_status(
+        RDMA_SC_INVALID_STATE,
+        (identity_status == null) ?
+          "CMQ observed journal validation returned null status" :
+          identity_status.message
+      );
+      engine_lock.put(1);
+      return;
+    end
+
+    if (journal_item.state inside {
+          RDMA_CMQ_SUBMISSION_STAGED,
+          RDMA_CMQ_SUBMISSION_PENDING_EFFECT
+        }) begin
+      result = submitted;
+      result.observation_status = rdma_cmq_direct_status(
+        RDMA_SC_INVALID_STATE, "CMQ observed item has pending external effect"
+      );
+      engine_lock.put(1);
+      return;
+    end
+
+    if (journal_item.state == RDMA_CMQ_SUBMISSION_HOST_VISIBLE_NOT_PUBLISHED) begin
+      if (journal_item.completion_phase != RDMA_CMQ_COMPLETION_NONE ||
+          journal_item.completion != null) begin
+        result = submitted;
+        result.observation_status = rdma_cmq_direct_status(
+          RDMA_SC_INVALID_STATE,
+          "CMQ observed host-visible item has terminal evidence"
+        );
+        engine_lock.put(1);
+        return;
+      end
+      result = submitted;
+      engine_lock.put(1);
+      return;
+    end
+
+    if (journal_item.completion != null && journal_item.completion_phase inside {
+          RDMA_CMQ_COMPLETION_TERMINAL,
+          RDMA_CMQ_COMPLETION_TIMEOUT,
+          RDMA_CMQ_COMPLETION_DIAGNOSTIC_ONLY,
+          RDMA_CMQ_COMPLETION_RESET_CANCELLED
+        }) begin
+      snapshot_status = build_observed_result_locked(
+        batch_record, journal_item, RDMA_SC_OK,
+        "CMQ retained journal completion observed", result
+      );
+      if (snapshot_status == null || !snapshot_status.ok())
+        result = submitted;
+      engine_lock.put(1);
+      return;
+    end
+
+    armed_pending = journal_item.state inside {
+      RDMA_CMQ_SUBMISSION_PUBLISH_AMBIGUOUS,
+      RDMA_CMQ_SUBMISSION_PUBLISH_CONFIRMED
+    } && journal_item.completion_phase == RDMA_CMQ_COMPLETION_PENDING;
+    engine_lock.put(1);
+    if (!armed_pending) begin
+      result = submitted;
+      result.observation_status = rdma_cmq_direct_status(
+        RDMA_SC_INVALID_STATE, "CMQ observed journal lifecycle is malformed"
+      );
+      return;
+    end
+
+    // wait_for 在锁外执行；它完成后再次按同一 ticket 读取 retained journal。
+    waited_completion = null;
+    waited_status = null;
+    wait_for(submitted.ticket, waited_completion, waited_status);
+    engine_lock.get(1);
+    lookup_status = locate_journal_item_by_ticket_locked(
+      submitted.ticket, batch_record, journal_item, item_index
+    );
+    if (lookup_status != null && lookup_status.ok() &&
+        journal_item != null && journal_item.completion != null &&
+        journal_item.completion_phase inside {
+          RDMA_CMQ_COMPLETION_TERMINAL,
+          RDMA_CMQ_COMPLETION_TIMEOUT,
+          RDMA_CMQ_COMPLETION_DIAGNOSTIC_ONLY,
+          RDMA_CMQ_COMPLETION_RESET_CANCELLED
+        }) begin
+      snapshot_status = build_observed_result_locked(
+        batch_record, journal_item, RDMA_SC_OK,
+        "CMQ retained journal completion observed after wait", result
+      );
+      if (snapshot_status == null || !snapshot_status.ok())
+        result = submitted;
+    end
+    else begin
+      result = submitted;
+      result.observation_status = rdma_cmq_direct_status(
+        RDMA_SC_INVALID_STATE, "CMQ observed wait produced no retained completion"
+      );
+    end
+    engine_lock.put(1);
+  endtask
+
   // 功能：把一个 command 包装为恰好一次 observed batch 调用并返回其唯一结果。
   // 输入/输出及副作用：command 为输入，result 为输出；所有 journal、transport
   //   与 fence 副作用完全由 submit_batch_observed() 产生。
   // 失败/边界：batch 返回错位/null 结果时发布非空 INVALID_STATE fallback；
   //   不做第二次提交，也不写共享 last_* 证据。
-  task submit_observed(
+  virtual task submit_observed(
     input rdma_cmq_command_desc command,
     output rdma_cmq_execution_result result
   );
@@ -11430,6 +11673,14 @@ class rdma_cmq_engine extends uvm_object;
       ) : copy_submit_status_direct(
         batch_status, "cmq_single_observed_batch_status"
       );
+      result.observation_status = rdma_cmq_direct_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ one-item observed batch returned no result"
+      );
+      result.submission_effect = RDMA_SUBMIT_EFFECT_UNOBSERVED;
+      result.attempt_effect = RDMA_SUBMIT_EFFECT_UNOBSERVED;
+      result.completion_phase = RDMA_CMQ_COMPLETION_UNOBSERVED;
+      result.recovery_required = 1'b1;
       return;
     end
     result = results[0];

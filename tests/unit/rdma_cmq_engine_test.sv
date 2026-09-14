@@ -5783,6 +5783,29 @@ class rdma_cmq_engine_probe extends rdma_cmq_engine;
   endfunction
 endclass
 
+// 设计说明：该 probe 只模拟 submit_observed 委托后返回 null envelope，
+// 用于验证 engine execute 的 fail-closed UNOBSERVED recovery 规则。
+class rdma_cmq_null_observed_engine extends rdma_cmq_engine;
+  `uvm_object_utils(rdma_cmq_null_observed_engine)
+
+  // 功能：构造 null-observed probe，保持 engine 基类默认未配置状态。
+  // 输入/输出及副作用：name 传给父类；不分配外部资源。
+  // 失败/边界：该 probe 仅用于 envelope 故障注入，任何实际 I/O 均不会发生。
+  function new(string name = "rdma_cmq_null_observed_engine");
+    super.new(name);
+  endfunction
+
+  // 功能：模拟 submit_observed 委托后丢失 result envelope。
+  // 输入/输出及副作用：command 为只读输入，result 被清空为 null；不修改 engine 账本。
+  // 失败/边界：始终返回 null 以触发 execute_observed 的 recovery fail-closed 分支。
+  virtual task submit_observed(
+    input rdma_cmq_command_desc command,
+    output rdma_cmq_execution_result result
+  );
+    result = null;
+  endtask
+endclass
+
 // 设计说明：该 Host-memory 替身在 opaque release 已经退休 allocation 后直接
 //   改写 probe cursor，构造 release 成功与 runtime drift 同时发生的 adversarial
 //   重入窗口；它不伪造 release 失败，也不接管 engine 的生命周期所有权。
@@ -23677,6 +23700,31 @@ class rdma_cmq_engine_test extends uvm_test;
 
   // 功能：运行 engine 逻辑测试的第一物理片，在 clean factory epoch 连续覆盖
   //   transport、生命周期、提交/预分配与 observed batch fixture 1–15。
+  // 功能：验证 submit_observed 返回 null envelope 时 execute_observed 发布
+  //   UNOBSERVED effects/phase 与 recovery_required，而不伪造 PRE rejection。
+  // 输入/输出及副作用：构造 null-observed probe 并读取 result；不执行外部 I/O。
+  // 失败/边界：若 result 保留 PRE_SUBMIT_REJECTED/NONE 或 observation 非 INVALID_STATE，
+  //   以 UVM_ERROR 报告 post-delegation evidence 丢失。
+  task automatic check_execute_observed_null_envelope();
+    rdma_cmq_null_observed_engine engine;
+    rdma_cmq_execution_result result;
+
+    engine = rdma_cmq_null_observed_engine::type_id::create(
+      "null_observed_engine"
+    );
+    engine.execute_observed(null, result);
+    if (result == null || result.status == null ||
+        result.observation_status == null ||
+        result.observation_status.code != RDMA_SC_INVALID_STATE ||
+        result.submission_effect != RDMA_SUBMIT_EFFECT_UNOBSERVED ||
+        result.attempt_effect != RDMA_SUBMIT_EFFECT_UNOBSERVED ||
+        result.completion_phase != RDMA_CMQ_COMPLETION_UNOBSERVED ||
+        result.recovery_required != 1'b1)
+      `uvm_error("EXECUTE_OBSERVED_NULL_ENVELOPE",
+                 "null submit envelope was not classified as UNOBSERVED")
+  endtask
+
+  // 功能：运行 engine test 的基础 transport/journal fixture 集合并维持 UVM objection。
   // 输入/输出及副作用：phase 由 UVM 输入；task 持有 objection，逐项执行原始
   //   check_* fixture，并由各 fixture 自行 shutdown/reset 其本地 DUT。
   // 失败/边界：任一 fixture 用 UVM severity 报告契约失败；本片不建立永久
@@ -23698,6 +23746,7 @@ class rdma_cmq_engine_test extends uvm_test;
     check_activation_guards();
     check_batch_compaction_and_doorbell();
     check_observed_batch_table();
+    check_execute_observed_null_envelope();
     phase.drop_objection(this);
   endtask
 endclass

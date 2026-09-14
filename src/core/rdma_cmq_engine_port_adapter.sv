@@ -53,6 +53,45 @@ class rdma_cmq_engine_port_adapter extends rdma_cmq_port;
     return rdma_status::make(RDMA_SC_INVALID_STATE, message);
   endfunction
 
+  // 功能：检查 observed execution result 的 effect/phase/completion 形状，阻止
+  //   adapter 把不可能 envelope 当作可靠 lifecycle 证据继续发布。
+  // 输入/输出及副作用：value 为只读 engine 输出；返回布尔形状判定，不修改 value。
+  // 失败/边界：未知枚举、pending/terminal 与 completion nullness 矛盾均拒绝；
+  //   operation status 与 effects 不被该检查改写。
+  protected function bit observed_result_shape_valid(
+    input rdma_cmq_execution_result value
+  );
+    if (value == null || value.status == null ||
+        value.observation_status == null ||
+        !rdma_cmq_status_shape_valid(value.status) ||
+        !rdma_cmq_status_shape_valid(value.observation_status) ||
+        !rdma_cmq_submission_effect_valid(value.submission_effect) ||
+        !rdma_cmq_submission_effect_valid(value.attempt_effect) ||
+        !rdma_cmq_completion_phase_valid(value.completion_phase))
+      return 1'b0;
+    if (value.completion_phase == RDMA_CMQ_COMPLETION_PENDING &&
+        value.completion != null)
+      return 1'b0;
+    if (value.completion_phase == RDMA_CMQ_COMPLETION_NONE &&
+        value.completion != null)
+      return 1'b0;
+    if (value.completion_phase inside {
+          RDMA_CMQ_COMPLETION_TERMINAL,
+          RDMA_CMQ_COMPLETION_TIMEOUT,
+          RDMA_CMQ_COMPLETION_DIAGNOSTIC_ONLY,
+          RDMA_CMQ_COMPLETION_RESET_CANCELLED
+        } && value.completion == null)
+      return 1'b0;
+    if (value.completion != null &&
+        (value.completion.status == null ||
+         !rdma_cmq_status_shape_valid(value.completion.status) ||
+         value.completion.ticket == null ||
+         (value.ticket != null &&
+          !value.completion.ticket.same_instance(value.ticket))))
+      return 1'b0;
+    return 1'b1;
+  endfunction
+
   // 功能：在 rdma_cmq_engine_port_adapter 中，bind_engine 把 bind_engine 指定的资源或后端能力绑定到当前对象索引，并校验 Function、generation 和队列类型一致。
   // 输入/输出及副作用：owner（输入）、engine（输入）；bind_engine 先依据 owner == null || owner.kind != RDMA_RESOURCE_FUNCTION || engine == null；$isunknown(owner.function_uid；engines.exists(key 校验 owner、engine；成功时更新本对象配置/状态并保存非拥有引用，返回 rdma_status。
   // 失败/边界：资源不存在、类型不符、重复登记或跨 Function 串线时拒绝绑定并保持索引不变。
@@ -77,7 +116,6 @@ class rdma_cmq_engine_port_adapter extends rdma_cmq_port;
 
   // 功能：在 rdma_cmq_engine_port_adapter 中，execute 执行受控事务并按后端提交证据推进状态机，同时保留失败阶段和 generation 证据。
   // 输入/输出及副作用：command（输入）、ticket（输出）、completion（输出）、status（输出）；execute 驱动下游事务，并写入 ticket、completion、status；函数返回 无直接返回值，不取得调用方资源所有权。
-
   // 失败/边界：execute 遇到锁、超时、generation 变化或提交证据不完整时保持原状态，不推进游标。
   virtual task execute(
     rdma_cmq_command_desc command,
@@ -85,57 +123,83 @@ class rdma_cmq_engine_port_adapter extends rdma_cmq_port;
     output rdma_cmq_completion completion,
     output rdma_status status
   );
-    rdma_cmq_engine engine;
-    rdma_status engine_status;
-    string key;
+    rdma_cmq_execution_result observed_result;
 
     last_execute_no_submit_proven = 1'b0;
     ticket = null;
     completion = null;
     status = invalid_state("CMQ port execute did not complete");
-    if (command == null || command.function_h == null ||
-        command.function_h.kind != RDMA_RESOURCE_FUNCTION) begin
-      last_execute_no_submit_proven = 1'b1;
-      status = invalid_state("CMQ port command Function is unavailable");
+    execute_observed(command, observed_result);
+    if (observed_result == null) begin
+      status = invalid_state("CMQ observed execute returned null result");
       return;
     end
+    if (observed_result.status != null)
+      status = observed_result.status;
+    if (observed_result.ticket != null)
+      ticket = observed_result.ticket;
+    if (observed_result.completion != null)
+      completion = observed_result.completion;
+    if (observed_result.status != null &&
+        observed_result.status.code == RDMA_SC_INVALID_STATE &&
+        observed_result.submission_effect ==
+          RDMA_SUBMIT_EFFECT_PRE_SUBMIT_REJECTED &&
+        observed_result.batch_id == 0 && observed_result.attempt_id == 0 &&
+        observed_result.batch_key.len() == 0 &&
+        observed_result.recovery_required == 1'b0)
+      last_execute_no_submit_proven = 1'b1;
+  endtask
+
+  // 功能：production adapter 直接执行 observed route，并将 pre-engine 校验
+  //   或 engine 返回的 detached result 传递给调用方。
+  // 输入/输出及副作用：command 为非拥有输入，result 为 caller-owned 输出；
+  //   成功绑定时恰好调用一次 engine.execute_observed，不调用 super fallback。
+  // 失败/边界：Function 缺失/未绑定返回 PRE_SUBMIT_REJECTED；engine null 或
+  //   缺失 status 时保留可用字段并补 INVALID_STATE，observed 不读写共享 bit。
+  virtual task execute_observed(
+    input rdma_cmq_command_desc command,
+    output rdma_cmq_execution_result result
+  );
+    rdma_cmq_engine engine;
+    string key;
+
+    result = new("cmq_production_observed_result");
+    result.status = invalid_state("CMQ port command Function is unavailable");
+    result.observation_status = rdma_status::success();
+    result.submission_effect = RDMA_SUBMIT_EFFECT_PRE_SUBMIT_REJECTED;
+    result.attempt_effect = RDMA_SUBMIT_EFFECT_PRE_SUBMIT_REJECTED;
+    result.completion_phase = RDMA_CMQ_COMPLETION_NONE;
+    result.recovery_required = 1'b0;
+    if (command == null || command.function_h == null ||
+        command.function_h.kind != RDMA_RESOURCE_FUNCTION)
+      return;
     key = function_key(command.function_h);
     if (!engines.exists(key) || engines[key] == null) begin
-      last_execute_no_submit_proven = 1'b1;
-      status = invalid_state("CMQ port Function has no bound engine");
+      result.status = invalid_state("CMQ port Function has no bound engine");
       return;
     end
     engine = engines[key];
-    engine.submit(command, ticket, engine_status);
-    if (engine_status == null) begin
-      status = invalid_state("CMQ engine submit returned null status");
+    engine.execute_observed(command, result);
+    if (result == null) begin
+      result = new("cmq_production_observed_null_result");
+      result.status = invalid_state("CMQ engine observed execute returned null result");
+      result.observation_status = invalid_state("CMQ engine observed execute returned null result");
+      result.submission_effect = RDMA_SUBMIT_EFFECT_UNOBSERVED;
+      result.attempt_effect = RDMA_SUBMIT_EFFECT_UNOBSERVED;
+      result.completion_phase = RDMA_CMQ_COMPLETION_UNOBSERVED;
+      result.recovery_required = 1'b1;
       return;
     end
-    if (!engine_status.ok()) begin
-      status = rdma_cmq_clone_status_value(engine_status);
-      return;
-    end
-    if (ticket == null) begin
-      status = invalid_state("CMQ engine submit returned no ticket");
-      return;
-    end
-    engine.wait_for(ticket, completion, engine_status);
-    if (engine_status == null) begin
-      status = invalid_state("CMQ engine wait returned null status");
-      return;
-    end
-    if (!engine_status.ok()) begin
-      status = rdma_cmq_clone_status_value(engine_status);
-      return;
-    end
-    if (completion == null || completion.status == null) begin
-      completion = null;
-      status = invalid_state("CMQ engine wait returned incomplete completion");
-      return;
-    end
-    status = rdma_cmq_clone_status_value(completion.status);
-    if (status == null)
-      status = invalid_state("CMQ completion status copy failed");
+    if (result.status == null)
+      result.status = invalid_state("CMQ engine observed result status is null");
+    if (result.observation_status == null)
+      result.observation_status = invalid_state(
+        "CMQ engine observed result observation status is null"
+      );
+    if (!observed_result_shape_valid(result))
+      result.observation_status = invalid_state(
+        "CMQ engine observed result envelope is malformed"
+      );
   endtask
 
   // 功能：在 rdma_cmq_engine_port_adapter 中，reconcile 执行受控事务并按后端提交证据推进状态机，同时保留失败阶段和 generation 证据。

@@ -199,6 +199,33 @@ class rdma_cmq_port_test extends rdma_cmq_engine_test;
     super.new(name, parent);
   endfunction
 
+  // 功能：验证 production adapter 的 observed 入口对 pre-engine Function 拒绝
+  //   直接发布 PRE_SUBMIT_REJECTED 证据，而不是退回 legacy UNOBSERVED fallback。
+  // 输入/输出及副作用：无显式输入；构造空 command 并调用 adapter.execute_observed，
+  //   仅产生 caller-owned result，不接管外部资源。
+  // 失败/边界：当前 adapter 若仍继承 base 反向 fallback，结果会被标成
+  //   UNOBSERVED/recovery_required；该差异必须以 UVM_ERROR 暴露为 RED。
+  task automatic check_production_observed_pre_rejection();
+    rdma_cmq_engine_port_adapter adapter;
+    rdma_cmq_execution_result result;
+    bit seeded;
+
+    adapter = rdma_cmq_engine_port_adapter::type_id::create(
+      "production_observed_pre_rejection_adapter"
+    );
+    seeded = adapter.last_execute_definitive_no_submit();
+    adapter.execute_observed(null, result);
+    if (result == null || result.status == null ||
+        result.observation_status == null ||
+        result.submission_effect != RDMA_SUBMIT_EFFECT_PRE_SUBMIT_REJECTED ||
+        result.attempt_effect != RDMA_SUBMIT_EFFECT_PRE_SUBMIT_REJECTED ||
+        result.completion_phase != RDMA_CMQ_COMPLETION_NONE ||
+        result.recovery_required != 1'b0 ||
+        adapter.last_execute_definitive_no_submit() != seeded)
+      `uvm_error("PRODUCTION_OBSERVED_PRE_REJECT",
+                 "production observed pre-engine rejection contract is missing")
+  endtask
+
   // 功能：在 rdma_cmq_port_test 中，next_generation_binding 配置测试 fixture 的定向故障或替代依赖，使下一次调用覆盖指定边界路径。
   // 输入/输出及副作用：name（输入）、binding_state（输入）、generation_delta（输入）；next_generation_binding 读取 name、binding_state、generation_delta 并使用字段 binding、binding.owner_h；函数返回 rdma_function_binding，不取得调用方资源所有权。
 
@@ -1485,6 +1512,7 @@ class rdma_cmq_port_test extends rdma_cmq_engine_test;
   //   正常路径始终在全部同步检查返回后 drop_objection。
   virtual task run_phase(uvm_phase phase);
     phase.raise_objection(this);
+    check_production_observed_pre_rejection();
     check_command_identity_capture_equivalence();
     check_legacy_observed_fallback();
     check_mock_rejects_hostile_command_snapshots();
