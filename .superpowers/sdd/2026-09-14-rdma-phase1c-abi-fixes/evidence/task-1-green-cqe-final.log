@@ -1,0 +1,4 @@
+Command: scripts/run_vcs53.sh core rdma_cqe_size_codec_test (final)
+UVM Report Summary: warning=0 error=0 fatal=0
+PROCESS PASS logical=rdma_cqe_size_codec_test physical=rdma_cqe_size_codec_test
+LOGICAL PASS logical=rdma_cqe_size_codec_test processes=1

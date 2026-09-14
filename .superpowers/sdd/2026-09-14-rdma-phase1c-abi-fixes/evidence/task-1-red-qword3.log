@@ -1,0 +1,5 @@
+Command: scripts/run_vcs53.sh core rdma_cqe_size_codec_test (pre-fix)
+UVM_ERROR [CQE_QWORD3_LEGAL] legal qword3/payload bytes rejected for 32B
+UVM_ERROR [CQE_QWORD3_LEGAL] legal qword3/payload bytes rejected for 64B
+UVM_ERROR [CQE_QWORD3_LEGAL] legal qword3/payload bytes rejected for 128B
+UVM Report Summary: warning=0 error=3 fatal=0

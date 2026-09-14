@@ -1,5 +1,4 @@
-Phase 1C Task 1 GREEN evidence
-Host: ubuntu@10.11.10.53 (login bash via scripts/run_vcs53.sh)
 Command: scripts/run_vcs53.sh core rdma_queue_codec_test
-Result: PROCESS PASS / LOGICAL PASS (exit 0)
-UVM: warning=0 error=0 fatal=0
+UVM Report Summary: warning=0 error=0 fatal=0
+PROCESS PASS logical=rdma_queue_codec_test physical=rdma_queue_codec_test
+LOGICAL PASS logical=rdma_queue_codec_test processes=1
