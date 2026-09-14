@@ -2361,6 +2361,62 @@ class rdma_cmq_codec_test extends uvm_test;
     end
   endfunction
 
+  // 功能：check_cqc_raw_word_baseline 将 CQC_CREATE 编码镜像导入
+  // rdma_hw_qword_builder，冻结 cq.h:123-153 所定义的八个逻辑 qword 坐标。
+  // 输入/输出及副作用：使用本地 CQC fixture、builder 和 image；get_words 输出
+  // detached qword 快照，仅产生 UVM 断言，不修改生产 codec 或 registry 所有权。
+  // 失败/边界：编码失败、镜像长度非 64B、builder 写入失败，或任一 qword 超出
+  // driver body_mask 均报告错误；不接受缺失字段被默认为零的情况。
+  function automatic void check_cqc_raw_word_baseline();
+    rdma_hw_image image;
+    rdma_cqc_model cqc;
+    rdma_hw_qword_builder builder;
+    bit [63:0] words[];
+    bit [63:0] mask;
+    rdma_status status;
+
+    cqc = make_cqc();
+    image = encode_context("CQC_RAW_BASELINE", RDMA_OP_CQC_CREATE, cqc);
+    if (image == null || image.bytes.size() != RDMA_CMQE_BYTES) begin
+      `uvm_error("CQC_RAW_BASELINE", "CQC image is not a complete 64B body")
+      return;
+    end
+    builder = rdma_hw_qword_builder::type_id::create("cqc_raw_builder");
+    status = builder.reset(RDMA_CMQE_BYTES);
+    expect_ok("CQC_RAW_BUILDER_RESET", status);
+    status = builder.put_memcpy(0, image.bytes);
+    expect_ok("CQC_RAW_BUILDER_COPY", status);
+    builder.get_words(words);
+    if (words.size() != 8) begin
+      `uvm_error("CQC_RAW_BASELINE", "builder did not return eight qwords")
+      return;
+    end
+    for (int unsigned q = 0; q < 8; q++) begin
+      if (!body_mask(RDMA_IMAGE_CQC, RDMA_OP_CQC_CREATE, 0, q, mask))
+        `uvm_error("CQC_RAW_MASK", $sformatf(
+          "driver mask missing for CQC qword %0d", q))
+      else if ((words[q] & ~mask) != 0)
+        `uvm_error("CQC_RAW_MASK", $sformatf(
+          "CQC qword %0d writes outside driver mask: %016x", q,
+          words[q] & ~mask))
+    end
+    // 关键字段的原始坐标证据：PI/wrap、CQE size、CI/wrap、arm、shadow PA、CEQN。
+    if (words[4][22:0] != 23'd17 || words[4][23] != 1'b1)
+      `uvm_error("CQC_RAW_PI", "CQ PI/wrap raw coordinate mismatch")
+    if (words[4][63:62] != 2'd1)
+      `uvm_error("CQC_RAW_CQE_SIZE", "CQE size code is not at qword4[63:62]")
+    if (words[1][60:56] != 5'd10 || words[1][63:62] != 2'd1)
+      `uvm_error("CQC_RAW_STATE_SIZE", "CQ size/state raw coordinate mismatch")
+    if (words[5][11:0] != 12'h234)
+      `uvm_error("CQC_RAW_CEQN", "CEQN raw coordinate mismatch")
+    if (words[6][63:6] != (64'h0000_0000_0300_0040 >> 6))
+      `uvm_error("CQC_RAW_SHADOW", "shadow PA raw coordinate mismatch")
+    if (words[7][22:0] != 23'd9 || words[7][23] != 1'b0)
+      `uvm_error("CQC_RAW_CI", "CQ CI/wrap raw coordinate mismatch")
+    if (words[7][35:32] != 4'b10_01)
+      `uvm_error("CQC_RAW_ARM", "arm fields raw coordinate mismatch")
+  endfunction
+
   // 功能：在测试辅助 rdma_cmq_codec_test.check_injected_registry_snapshot 中构造或驱动“injected registry snapshot”场景，并断言 DUT
   //   的状态、错误码和资源账本符合契约。
   // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
@@ -2429,6 +2485,7 @@ class rdma_cmq_codec_test extends uvm_test;
     check_registry_contract();
     check_driver_034_opcode_registry();
     check_driver_034_golden_vectors();
+    check_cqc_raw_word_baseline();
     check_injected_registry_snapshot();
     check_envelope_oracle();
     check_ownership_oracles();
