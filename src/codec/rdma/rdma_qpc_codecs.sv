@@ -104,9 +104,12 @@ virtual class rdma_hw_qpc_codec_base extends rdma_codec_base;
     mask |= width_mask << lsb;
   endfunction
 
-  // 功能：在 rdma_hw_qpc_codec_base 中，qpc_allowed_mask 根据 opcode、对象类型或 profile 选择允许位掩码/有效 payload 范围，供保留位检查使用。
-  // 输入/输出及副作用：transport（输入）、qword_index（输入）、mask（输出）；qpc_allowed_mask 读取 transport、qword_index、mask 并使用字段 mask，并写入 mask；函数返回 bit，不取得调用方资源所有权。
-  // 失败/边界：qpc_allowed_mask 比较或前置条件不满足时返回 0/false；该路径不隐式重试，也不转移未声明资源。
+  // 功能：在 rdma_hw_qpc_codec_base 中，qpc_allowed_mask 构造软件可写的 QPC
+  //   字段所有权掩码，供 encode occupancy 校验确认每个字段均由当前 codec 负责。
+  // 输入/输出及副作用：transport、qword_index（输入）；mask（输出）接收当前
+  //   transport 的 writable 字段集合；函数只读 profile 常量，不取得外部资源所有权。
+  // 失败/边界：qword_index 超过 63 或 transport 不是 RC/UD/URC 时返回 0；
+  //   qword63 的硬件 runtime shadow 不在此掩码中，软件写路径因此保持零值。
   protected function bit qpc_allowed_mask(
     rdma_transport_e transport,
     int unsigned qword_index,
@@ -222,6 +225,29 @@ virtual class rdma_hw_qpc_codec_base extends rdma_codec_base;
     return 1'b1;
   endfunction
 
+  // 功能：在 rdma_hw_qpc_codec_base 中，qpc_decode_allowed_mask 在 writable
+  //   字段掩码之上叠加驱动明确声明的 QPC runtime shadow 读回位，区分观察数据
+  //   与软件可写状态，供 decode/validate_image 使用。
+  // 输入/输出及副作用：transport、qword_index（输入）；mask（输出）先接收
+  //   qpc_allowed_mask 的字段集合，再在 qword63 加入 wr.h 的四段 shadow 位；
+  //   这些位只作为硬件观察值参与保留位校验，不投影为软件模型字段；函数不
+  //   修改 image、model 或外部资源。
+  // 失败/边界：基础 transport/qword 校验失败时返回 0；除 qword63 的
+  //   RDMA_QPC_RUNTIME_SHADOW_READBACK_MASK 外，所有未声明位仍保持拒绝。
+  protected function bit qpc_decode_allowed_mask(
+    rdma_transport_e transport,
+    int unsigned qword_index,
+    output bit [63:0] mask
+  );
+    if (!qpc_allowed_mask(transport, qword_index, mask))
+      return 1'b0;
+
+    if (qword_index == RDMA_QPC_RUNTIME_SHADOW_QWORD_INDEX)
+      mask |= RDMA_QPC_RUNTIME_SHADOW_READBACK_MASK;
+
+    return 1'b1;
+  endfunction
+
   // 功能：validate_qpc_encode_mask 校验 builder、transport 与当前对象状态的一致性，并显式处理“QPC encode occupancy is not 64 qwords”等拒绝条件，返回 rdma_status 供上层决定是否提交。
   // 输入/输出及副作用：builder（输入）、transport（输入）；validate_qpc_encode_mask 读取 builder、transport 并使用字段 i、occupancy、rdma_status；函数返回 rdma_status，不取得调用方资源所有权。
   // 失败/边界：validate_qpc_encode_mask 返回 RDMA_SC_CODEC_ERROR；典型拒绝条件为“QPC encode occupancy is not 64 qwords”“QPC encode mask lookup failed”；失败路径不提交部分状态或转移未声明资源。
@@ -245,9 +271,12 @@ virtual class rdma_hw_qpc_codec_base extends rdma_codec_base;
     return rdma_status::success();
   endfunction
 
-  // 功能：validate_qpc_decode_mask 校验 builder、transport 与当前对象状态的一致性，并显式处理“QPC decode image is not 64 qwords”等拒绝条件，返回 rdma_status 供上层决定是否提交。
-  // 输入/输出及副作用：builder（输入）、transport（输入）；validate_qpc_decode_mask 读取 builder、transport 并使用字段 i、words、rdma_status；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：validate_qpc_decode_mask 返回 RDMA_SC_CODEC_ERROR；典型拒绝条件为“QPC decode image is not 64 qwords”“QPC decode mask lookup failed”；失败路径不提交部分状态或转移未声明资源。
+  // 功能：validate_qpc_decode_mask 校验硬件 readback image 的 64 个 qword，
+  //   对普通字段和 qword63 runtime shadow 分别使用精确 ownership mask。
+  // 输入/输出及副作用：builder、transport（输入）；builder 提供 words 快照，
+  //   函数只返回校验状态，不发布模型、修改 image 或取得调用方资源所有权。
+  // 失败/边界：image 长度不是 64 qword、transport 不支持，或任一 qword 含有
+  //   未被 writable/profile/shadow mask 声明的位时返回 RDMA_SC_CODEC_ERROR。
   protected function rdma_status validate_qpc_decode_mask(
     rdma_hw_qword_builder builder,
     rdma_transport_e transport
@@ -258,7 +287,7 @@ virtual class rdma_hw_qpc_codec_base extends rdma_codec_base;
     if (words.size() != 64)
       return codec_error("QPC decode image is not 64 qwords");
     foreach (words[i]) begin
-      if (!qpc_allowed_mask(transport, i, allowed))
+      if (!qpc_decode_allowed_mask(transport, i, allowed))
         return codec_error("QPC decode mask lookup failed");
       if ((words[i] & ~allowed) != 0)
         return codec_error($sformatf(

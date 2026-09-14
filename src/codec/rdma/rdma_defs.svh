@@ -424,6 +424,16 @@ localparam int unsigned RDMA_QPC_DEST_IP_BYTES = 16;
 `RDMA_FIELD(RDMA_QPC_RQ_SIZE, 496, 8, 4)
 `RDMA_FIELD(RDMA_QPC_RQ_OM, 496, 6, 2)
 
+// 功能：固定 QPC runtime shadow 的硬件坐标和 readback ownership 边界。
+// qp.h:20 将硬件 shadow 放在 byte 504；wr.h:35-38 明确声明
+// HW_DROP_DB_CNT[54:48]、SW_RING_DB_CNT[38:32]、SQ_PI_WRAP[15]、
+// SQ_PI[14:0] 四组可观察位。该掩码只供读回校验使用，软件编码器不得写入。
+// 失败边界：未列入掩码的 qword63 位（包括 bit63）必须继续按 reserved 拒绝。
+localparam int unsigned RDMA_QPC_RUNTIME_SHADOW_BYTE_OFFSET = 504;
+localparam int unsigned RDMA_QPC_RUNTIME_SHADOW_QWORD_INDEX = 63;
+localparam bit [63:0] RDMA_QPC_RUNTIME_SHADOW_READBACK_MASK =
+  64'h007f_007f_0000_ffff;
+
 // CQC sparse body in final 64-byte CMQ WQE coordinates (local context +8).
 `RDMA_FIELD(RDMA_CQC_BODY_CQN, 0, 0, 21)
 `RDMA_FIELD(RDMA_CQC_BODY_CQ_SD_PBA, 8, 0, 52)

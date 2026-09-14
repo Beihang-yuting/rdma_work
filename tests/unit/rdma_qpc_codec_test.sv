@@ -1250,6 +1250,62 @@ class rdma_qpc_codec_test extends uvm_test;
                            ext.destination_qpn))
   endfunction
 
+  // 功能：在 rdma_qpc_codec_test 中验证 QPC byte504..511 的 runtime shadow 读回策略；
+  //   按驱动 wr.h 的四个字段构造合法 shadow，并要求 readback decode 接受这些观察位。
+  // 输入/输出及副作用：codec、source 和 encoded（输入）；函数复制 image、改写测试副本
+  //   的 qword63 并调用 decode/encode，只产生 UVM 断言，不修改 source 或外部 backing。
+  // 失败/边界：旧实现把 qword63 全部当作 private-reserved，合法 shadow readback 应在 RED
+  //   阶段失败；bit63 不属于驱动声明字段，仍必须被拒绝；软件 encode 不能发布非零 shadow。
+  function automatic void check_runtime_shadow_readback(
+    rdma_codec_base codec,
+    rdma_qpc_model source,
+    rdma_hw_image encoded
+  );
+    rdma_hw_image write_image;
+    rdma_hw_image readback_image;
+    rdma_hw_image reserved_image;
+    rdma_hw_model decoded_model;
+    rdma_status status;
+
+    write_image = null;
+    status = codec.encode(source, write_image);
+    expect_ok("QPC_SHADOW_WRITE_ENCODE", status);
+    if (write_image == null)
+      return;
+
+    // qp.h:20 将 shadow view 固定在 QPC byte504，wr.h:35-38 只声明
+    // HW_DROP_DB_CNT[54:48]、SW_RING_DB_CNT[38:32]、SQ_PI_WRAP[15] 和
+    // SQ_PI[14:0]。其余位（这里选 bit63）必须继续保持 opaque/reserved。
+    if (image_field(write_image, 504, 0, 64) != 64'h0)
+      `uvm_error("QPC_SHADOW_WRITE_ZERO",
+                 "software QPC encode published nonzero runtime shadow")
+
+    readback_image = clone_image(write_image, "QPC_SHADOW_READBACK_CLONE");
+    set_image_field(readback_image, 504, 48, 7, 7'h2a);
+    set_image_field(readback_image, 504, 32, 7, 7'h15);
+    set_image_field(readback_image, 504, 15, 1, 1'b1);
+    set_image_field(readback_image, 504, 0, 15, 15'h1234);
+
+    decoded_model = null;
+    status = codec.decode(readback_image, decoded_model);
+    // RED 断言：旧 validate_qpc_decode_mask 会在这里报告 qword63 的
+    // private-reserved bits；实现修复后应返回 OK，并发布 detached model。
+    expect_ok("QPC_SHADOW_READBACK_FIELDS", status);
+    if (status.ok() && decoded_model == null)
+      `uvm_error("QPC_SHADOW_READBACK_MODEL",
+                 "accepted shadow readback did not publish a detached model")
+
+    reserved_image = clone_image(readback_image, "QPC_SHADOW_RESERVED_CLONE");
+    set_image_field(reserved_image, 504, 63, 1, 1'b1);
+    expect_decode_failure("QPC_SHADOW_RESERVED_BIT", codec, reserved_image);
+
+    // 保留 encoded 参数作为调用方传入的 canonical image 交叉检查，避免测试只
+    // 依赖本函数内部再次 encode 的结果。
+    if (encoded != null && image_field(encoded, 504, 0, 64) != 64'h0)
+      `uvm_error("QPC_SHADOW_CANONICAL_ZERO",
+                 "canonical QPC image contains a nonzero runtime shadow")
+  endfunction
+
   // 功能：在 rdma_qpc_codec_test 中，run_phase 驱动 UVM 阶段中的场景初始化、事务执行和断言收尾，并在退出前释放 objection 或测试资源。
   // 输入/输出及副作用：phase（输入）；phase 由 UVM 提供；task 通过 objection、日志和断言暴露结果，可能调用 DUT 接口但不改变其所有权规则。
   // 失败/边界：run_phase 的 setup/阶段驱动失败时停止新增事务，并按测试生命周期清理 objection 与临时引用。
@@ -1352,6 +1408,7 @@ class rdma_qpc_codec_test extends uvm_test;
                            ud_image, ud_decoded);
     check_golden_roundtrip("URC_GOLDEN", urc_codec, urc_source, urc_golden,
                            urc_image, urc_decoded);
+    check_runtime_shadow_readback(rc_codec, rc_source, rc_image);
     check_ud_destination_qpn_independence(ud_codec, ud_source);
 
     if (rc_decoded != null) begin
