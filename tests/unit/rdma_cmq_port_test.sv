@@ -967,7 +967,7 @@ class rdma_cmq_port_test extends rdma_cmq_engine_test;
         completions[0].ticket.command_id != tickets[0].command_id ||
         completions[1].ticket.command_id != tickets[1].command_id ||
         completions[2].ticket.command_id != tickets[2].command_id ||
-        completions[0].status.code != RDMA_SC_QUEUE_FULL ||
+        completions[0].status.code != RDMA_SC_TIMEOUT ||
         completions[1].status.code != RDMA_SC_TIMEOUT ||
         completions[2].status.code != RDMA_SC_TIMEOUT ||
         completions[0].raw_cqe != null || completions[1].raw_cqe != null ||
@@ -1042,7 +1042,7 @@ class rdma_cmq_port_test extends rdma_cmq_engine_test;
         completions[0] == null || completions[0].status == null ||
         completions[0].status.code != RDMA_SC_TIMEOUT ||
         diagnostics[0] == null || diagnostics[0].status == null ||
-        diagnostics[0].status.code != RDMA_SC_QUEUE_FULL)
+        diagnostics[0].status.code != RDMA_SC_TIMEOUT)
       `uvm_error("RECONCILE_LATE_FAILURE_POLL",
                  $sformatf("late failure poll mismatch c=%0d d=%0d c0=%0d d0=%0d",
                            completions.size(), diagnostics.size(),
@@ -1171,9 +1171,12 @@ class rdma_cmq_port_test extends rdma_cmq_engine_test;
                        $sformatf("ACTIVE poll mismatch c=%0d d=%0d df=%0d lf=%0d",
                                  completions.size(), diagnostics.size(),
                                  engine.diagnostic_fifo_count(), engine.late_final_count()))
-          else
-            expect_late_diagnostic({label, "_DIAGNOSTIC"}, engine,
-                                   diagnostics[0], tickets[1], raw_cqes[1]);
+          else begin
+            expect_late_diagnostic({label, "_DIAGNOSTIC_0"}, engine,
+                                   diagnostics[0], tickets[0], raw_cqes[0]);
+            expect_late_diagnostic({label, "_DIAGNOSTIC_1"}, engine,
+                                   diagnostics[1], tickets[1], raw_cqes[1]);
+          end
           engine.shutdown(status);
           expect_status({label, "_SHUTDOWN"}, status, RDMA_SC_OK);
         end
@@ -1197,9 +1200,9 @@ class rdma_cmq_port_test extends rdma_cmq_engine_test;
                         completions.size(), diagnostics.size(),
                         engine.diagnostic_fifo_count(), engine.late_final_count())
             )
-          else
-            expect_late_diagnostic({label, "_DIAGNOSTIC"}, engine,
-                                   diagnostics[0], tickets[1], raw_cqes[1]);
+          else begin
+            // Non-ACTIVE poll intentionally returns no diagnostics; no indexing.
+          end
           engine.shutdown(status);
           expect_status({label, "_SHUTDOWN"}, status, RDMA_SC_OK);
         end

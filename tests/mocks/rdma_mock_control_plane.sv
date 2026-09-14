@@ -433,7 +433,6 @@ class rdma_mock_cmq_port extends rdma_cmq_port;
     gate_target_count = 1;
     gate_entered_count = 0;
     last_execute_no_submit_proven = 1'b0;
-    method_ordinals["legacy_execute"]++;
     role_failures.delete();
     method_ordinals.delete();
     snapshot_engine = rdma_mock_cmq_snapshot_engine::type_id::create(
@@ -937,7 +936,6 @@ class rdma_mock_cmq_port extends rdma_cmq_port;
 
   // 功能：在 rdma_mock_cmq_port 中，execute 执行受控事务并按后端提交证据推进状态机，同时保留失败阶段和 generation 证据。
   // 输入/输出及副作用：command（输入）、ticket（输出）、completion（输出）、status（输出）；execute 驱动下游事务，并写入 ticket、completion、status；函数返回 无直接返回值，不取得调用方资源所有权。
-
   // 失败/边界：execute 遇到锁、超时、generation 变化或提交证据不完整时保持原状态，不推进游标。
   virtual task execute(
     rdma_cmq_command_desc command,
@@ -958,6 +956,7 @@ class rdma_mock_cmq_port extends rdma_cmq_port;
     string method_name;
 
     last_execute_no_submit_proven = 1'b0;
+    method_ordinals["legacy_execute"]++;
     ticket = null;
     completion = null;
     status = invalid_state("mock CMQ execute did not complete");
