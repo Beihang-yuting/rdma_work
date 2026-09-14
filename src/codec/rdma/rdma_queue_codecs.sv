@@ -150,35 +150,118 @@ endclass
 
 class rdma_hw_rqe_model extends rdma_rqe_model;
   `uvm_object_utils(rdma_hw_rqe_model)
-  bit [23:0] qpn; bit [7:0] qp_sn; bit [3:0] hw_opcode; bit [14:0] index; bit wrap; bit valid;
-  bit [31:0] payload_len; bit [7:0] signature; bit [7:0] sge_num;
+  bit [23:0] qpn;
+  bit [7:0] qp_sn;
+  bit [3:0] hw_opcode;
+  bit [14:0] index;
+  bit wrap;
+  bit valid;
+
+  bit [31:0] payload_len;
+  bit [7:0] signature;
+  bit [7:0] sge_num;
+
+  // XTRDMA_QP_RQ_SGB_PA is not a byte address in the wire image.  It is the
+  // physical SGB address after the driver's nine-bit alignment shift.
+  bit [54:0] sgb_pa;
 
   // 功能：构造 rdma_hw_rqe_model，调用 super.new 建立 UVM 层级对象；外部依赖字段保持未绑定，后续由 configure/build/activate 明确注入。
   // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
   // 失败/边界：rdma_hw_rqe_model 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
-  function new(string name="rdma_hw_rqe_model"); super.new(name); endfunction
+  function new(string name="rdma_hw_rqe_model");
+    super.new(name);
+    sgb_pa = '0;
+  endfunction
+
+  // 功能：set_sgb_pa_encoded 把调用方提供的 PA>>9 编码值安装到 RQE 模型。
+  // 输入/输出及副作用：encoded_pa 是未截断的 64 位编码输入；成功时写入
+  // sgb_pa，失败时保留旧值并返回 INVALID_ARGUMENT，不取得外部内存所有权。
+  // 失败/边界：encoded_pa[63:55] 任一置位表示超过驱动 55 位字段，拒绝截断。
+  function rdma_status set_sgb_pa_encoded(bit [63:0] encoded_pa);
+    if (encoded_pa[63:55] != 9'b0)
+      return rdma_status::make(
+          RDMA_SC_INVALID_ARGUMENT,
+          "RQE encoded SGB_PA exceeds 55 bits");
+
+    sgb_pa = encoded_pa[54:0];
+    return rdma_status::success();
+  endfunction
+
+  // 功能：set_sgb_pa_from_physical 将驱动 API 使用的物理 SGB 地址转换为
+  // 明确的 PA>>9 模型字段，确保 codec 不把未移位地址写进 qword4。
+  // 输入/输出及副作用：physical_pa 是 64 位物理地址；成功时更新 sgb_pa，
+  // 失败时不改变旧值；函数只更新本地语义快照，不取得 DMA 映射所有权。
+  // 失败/边界：低九位非零表示未满足 512B 对齐而被拒绝；转换后超过 55 位
+  // 也被拒绝，避免静默丢失高位。
+  function rdma_status set_sgb_pa_from_physical(bit [63:0] physical_pa);
+    bit [63:0] encoded_pa;
+
+    if (physical_pa[8:0] != 9'b0)
+      return rdma_status::make(
+          RDMA_SC_INVALID_ARGUMENT,
+          "RQE physical SGB_PA is not 512-byte aligned");
+
+    encoded_pa = physical_pa >> 9;
+    return set_sgb_pa_encoded(encoded_pa);
+  endfunction
+
+  // 功能：sgb_pa_as_physical 将已编码的 RQE SGB_PA 恢复成物理地址，供
+  // detached decode 断言和上层日志核对驱动的 512B 坐标。
+  // 输入/输出及副作用：无输入；返回低九位补零的 64 位物理地址，不修改模型
+  // 或外部资源；调用方获得的是值快照而非可写引用。
+  // 失败/边界：sgb_pa 已受 55 位宽度约束，左移不会溢出 64 位；零编码返回零。
+  function bit [63:0] sgb_pa_as_physical();
+    return {sgb_pa, 9'b0};
+  endfunction
 
   // 功能：将 rhs 中 rdma_hw_rqe_model 的值字段复制到当前对象，建立与源对象隔离的快照。
   // 输入/输出及副作用：rhs（输入）；rhs 是源对象；当前对象字段会被覆盖，嵌套句柄按实现执行 clone 或保持非拥有引用，源对象不被修改。
   // 失败/边界：do_copy 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（xtr RQE copy mismatch），不保留部分有效快照。
   virtual function void do_copy(uvm_object rhs);
-    rdma_hw_rqe_model x; super.do_copy(rhs); if (!$cast(x,rhs)) `uvm_fatal("RDMA_COPY_TYPE","xtr RQE copy mismatch");
-    qpn=x.qpn; qp_sn=x.qp_sn; hw_opcode=x.hw_opcode; index=x.index; wrap=x.wrap; valid=x.valid; payload_len=x.payload_len; signature=x.signature; sge_num=x.sge_num;
+    rdma_hw_rqe_model x;
+
+    super.do_copy(rhs);
+    if (!$cast(x, rhs))
+      `uvm_fatal("RDMA_COPY_TYPE", "xtr RQE copy mismatch")
+
+    qpn = x.qpn;
+    qp_sn = x.qp_sn;
+    hw_opcode = x.hw_opcode;
+    index = x.index;
+    wrap = x.wrap;
+    valid = x.valid;
+    payload_len = x.payload_len;
+    signature = x.signature;
+    sge_num = x.sge_num;
+    sgb_pa = x.sgb_pa;
   endfunction
 
   // 功能：validate 校验 当前对象字段 与当前对象状态的一致性，并显式处理“RQE requires QP or SRQ handle”等拒绝条件，返回 rdma_status 供上层决定是否提交。
   // 输入/输出及副作用：无显式参数；validate 读取 对象字段：rdma_status、target_h、target_h.kind、index 并使用字段 rdma_status、target_h、target_h.kind、index；函数返回 rdma_status，不取得调用方资源所有权。
   // 失败/边界：validate 返回 RDMA_SC_INVALID_ARGUMENT；典型拒绝条件为“RQE requires QP or SRQ handle”“RQE index exceeds width”；失败路径不提交部分状态或转移未声明资源。
   virtual function rdma_status validate();
-    if (target_h==null || !(target_h.kind inside {RDMA_RESOURCE_QP,RDMA_RESOURCE_SRQ})) return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,"RQE requires QP or SRQ handle");
-    if (index > 15'h7fff) return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,"RQE index exceeds width");
+    if (target_h == null ||
+        !(target_h.kind inside {RDMA_RESOURCE_QP, RDMA_RESOURCE_SRQ}))
+      return rdma_status::make(
+          RDMA_SC_INVALID_ARGUMENT,
+          "RQE requires QP or SRQ handle");
+
+    if (index > 15'h7fff)
+      return rdma_status::make(
+          RDMA_SC_INVALID_ARGUMENT,
+          "RQE index exceeds width");
+
     return rdma_status::success();
   endfunction
 
   // 功能：describe 把 当前对象字段 与当前对象的身份/状态字段编码为稳定文本，供日志、查找或恢复索引使用。
   // 输入/输出及副作用：无显式参数；无显式输入；返回 string，只读取对象字段，不修改模型或资源账本。
   // 失败/边界：枚举未定义或对象未配置时返回 UNKNOWN/UNCONFIGURED 表示，同时保留数值上下文。
-  virtual function string describe(); return $sformatf("XTR_RQE(qpn=%0d opcode=%0d index=%0d)",qpn,hw_opcode,index); endfunction
+  virtual function string describe();
+    return $sformatf(
+        "XTR_RQE(qpn=%0d opcode=%0d index=%0d sgb_pa=0x%0h)",
+        qpn, hw_opcode, index, sgb_pa);
+  endfunction
 endclass
 
 class rdma_hw_cqe_model extends rdma_cqe_model;
@@ -1372,25 +1455,140 @@ class rdma_hw_rqe_codec extends rdma_hw_queue_codec_base;
   // 功能：构造 rdma_hw_rqe_codec，调用 super.new 建立 UVM 层级对象；外部依赖字段保持未绑定，后续由 configure/build/activate 明确注入。
   // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
   // 失败/边界：rdma_hw_rqe_codec 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
-  function new(string name="rdma_hw_rqe_codec"); super.new(name); endfunction
+  function new(string name="rdma_hw_rqe_codec");
+    super.new(name);
+  endfunction
   // 功能：在 rdma_hw_rqe_codec 中，image_check 返回 profile 固定的镜像字段或长度常量，供编码和断言使用。
   // 输入/输出及副作用：b（输入）；image_check 读取 b 的 8 个 qword，校验 RQE 保留位和未使用 qword；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：image_check 先检查 (w[0]&~64'h80ff_ff0f_ffff_ffff，再返回 err("RQE reserved bits are nonzero")；拒绝分支不提交部分状态，也不隐式重试。
-  protected function rdma_status image_check(rdma_hw_qword_builder b); bit [63:0] w[]; b.get_words(w); if ((w[0]&~64'h80ff_ff0f_ffff_ffff)!=0 || w[1][63:32]!==0 || w[2]&~64'hff00_0000_0000_0000!==0 || w[3]!==0 || w[4]!==0 || w[5]!==0 || w[6]!==0 || w[7]!==0) return err("RQE reserved bits are nonzero"); return rdma_status::success(); endfunction
+  // 失败/边界：image_check 拒绝 qword0、qword1、qword2 中未声明的位，以及
+  // qword3、qword5、qword6、qword7 的任意非零内容；qword4 只允许 SGB_PA。
+  protected function rdma_status image_check(rdma_hw_qword_builder b);
+    bit [63:0] words[];
+    const bit [63:0] RQE_HEADER_MASK = 64'h80ff_ff0f_ffff_ffff;
+    const bit [63:0] RQE_TPL_MASK = 64'h0000_0000_ffff_ffff;
+    const bit [63:0] RQE_META_MASK = 64'hffff_0000_0000_0000;
+    const bit [63:0] RQE_SGB_MASK = 64'hffff_ffff_ffff_fe00;
+
+    b.get_words(words);
+    if (words.size() != 8)
+      return err("RQE image must contain eight qwords");
+
+    if ((words[0] & ~RQE_HEADER_MASK) !== 0 ||
+        (words[1] & ~RQE_TPL_MASK) !== 0 ||
+        (words[2] & ~RQE_META_MASK) !== 0 ||
+        words[3] !== 0 ||
+        (words[4] & ~RQE_SGB_MASK) !== 0 ||
+        words[5] !== 0 ||
+        words[6] !== 0 ||
+        words[7] !== 0)
+      return err("RQE reserved bits are nonzero");
+
+    return rdma_status::success();
+  endfunction
   // 功能：在 rdma_hw_rqe_codec 中，image_kind_expected 返回 profile 固定的镜像字段或长度常量，供编码和断言使用。
   // 输入/输出及副作用：无显式参数；image_kind_expected 读取 对象字段：s、s.message、x、model 并使用字段 s、s.message、x、model；函数返回 rdma_image_kind_e，不取得调用方资源所有权。
   // 失败/边界：image_kind_expected 是只读访问器，返回 RDMA_IMAGE_RQE；未覆盖枚举沿 default/类型默认分支返回，不改变对象和外部资源。
-  protected virtual function rdma_image_kind_e image_kind_expected(); return RDMA_IMAGE_RQE; endfunction protected virtual function int unsigned image_bytes(); return RDMA_RQE_BYTES; endfunction protected virtual function rdma_status check_reserved(rdma_hw_qword_builder b); return image_check(b); endfunction
+  protected virtual function rdma_image_kind_e image_kind_expected();
+    return RDMA_IMAGE_RQE;
+  endfunction
+
+  // 功能：image_bytes 返回 RQE 固定的硬件镜像长度，供基类 metadata 校验和
+  // builder 分配使用。
+  // 输入/输出及副作用：无输入；返回 RDMA_RQE_BYTES，不修改 codec 状态或外部资源。
+  // 失败/边界：RQE profile 只有 64B，函数不接受运行期扩展长度。
+  protected virtual function int unsigned image_bytes();
+    return RDMA_RQE_BYTES;
+  endfunction
+
+  // 功能：check_reserved 统一调用 RQE 专用保留位检查，确保编码和解码采用
+  // 相同的驱动掩码，而不是分别维护两份规则。
+  // 输入/输出及副作用：b 为待检查的 qword builder；返回校验状态，不修改 builder。
+  // 失败/边界：b 为空或任一未声明位非零时沿 image_check 返回 CODEC_ERROR。
+  protected virtual function rdma_status check_reserved(
+      rdma_hw_qword_builder b);
+    if (b == null)
+      return err("RQE qword builder is null");
+    return image_check(b);
+  endfunction
   // 功能：在 rdma_hw_rqe_codec 中，encode_fields 按硬件布局把输入模型编码到 image/缓冲区，并在写入前检查范围、重叠、端序和保留位。
   // 输入/输出及副作用：model（输入）、b（输入）；输入模型只读；成功时通过返回值或 output 发布完整 image/bytes，不修改源模型。
   // 失败/边界：encode_fields 遇到 image/model 为空、长度/对齐/保留位非法或 codec 校验失败时不发布部分字段。
-  protected virtual function rdma_status encode_fields(rdma_hw_model model, rdma_hw_qword_builder b); rdma_hw_rqe_model x; rdma_status s; if(!$cast(x,model)) return err("RQE model type mismatch"); s=x.validate(); if(!s.ok()) return s; `define RQPUT(S,V) s=b.put_field(S``_WORD_BYTE_OFFSET,S``_LSB,S``_WIDTH,V); if(!s.ok()) return err(s.message);
-    `RQPUT(RDMA_RQE_QPN,x.qpn) `RQPUT(RDMA_RQE_QP_SN,x.qp_sn) `RQPUT(RDMA_RQE_OPCODE,x.hw_opcode) `RQPUT(RDMA_RQE_INDEX,x.index) `RQPUT(RDMA_RQE_WRAP,x.wrap) `RQPUT(RDMA_RQE_VALID,x.valid) `RQPUT(RDMA_RQE_PAYLOAD_LEN,x.payload_len) `RQPUT(RDMA_RQE_SIGNATURE,x.signature) `RQPUT(RDMA_RQE_SGE_NUM,x.sge_num) `undef RQPUT return rdma_status::success(); endfunction
+  protected virtual function rdma_status encode_fields(
+      rdma_hw_model model,
+      rdma_hw_qword_builder b
+  );
+    rdma_hw_rqe_model x;
+    rdma_status status;
+
+    if (!$cast(x, model))
+      return err("RQE model type mismatch");
+    if (b == null)
+      return err("RQE qword builder is null");
+
+    status = x.validate();
+    if (!status.ok())
+      return status;
+
+    `define RQPUT(STEM, VALUE) \
+      status = b.put_field(STEM``_WORD_BYTE_OFFSET, STEM``_LSB, \
+                           STEM``_WIDTH, VALUE); \
+      if (!status.ok()) return err(status.message);
+
+    `RQPUT(RDMA_RQE_QPN, x.qpn)
+    `RQPUT(RDMA_RQE_QP_SN, x.qp_sn)
+    `RQPUT(RDMA_RQE_OPCODE, x.hw_opcode)
+    `RQPUT(RDMA_RQE_INDEX, x.index)
+    `RQPUT(RDMA_RQE_WRAP, x.wrap)
+    `RQPUT(RDMA_RQE_VALID, x.valid)
+    `RQPUT(RDMA_RQE_PAYLOAD_LEN, x.payload_len)
+    `RQPUT(RDMA_RQE_SIGNATURE, x.signature)
+    `RQPUT(RDMA_RQE_SGE_NUM, x.sge_num)
+    `RQPUT(RDMA_RQE_SGB_PA, x.sgb_pa)
+
+    `undef RQPUT
+    return rdma_status::success();
+  endfunction
   // 功能：在 rdma_hw_rqe_codec 中，decode_fields 从硬件 image/缓冲区解码字段，验证长度、布局和完整性后返回模型或状态。
   // 输入/输出及副作用：b（输入）、model（输出）；输入 image/bytes 只读；成功时通过返回值或 output 发布 detached 解码快照，不接管调用方缓冲区。
   // 失败/边界：decode_fields 遇到 image/model 为空、长度/对齐/保留位非法或 codec 校验失败时不发布部分字段。
-  protected virtual function rdma_status decode_fields(rdma_hw_qword_builder b, output rdma_hw_model model); rdma_hw_rqe_model x; bit [63:0] v; rdma_status s; x=rdma_hw_rqe_model::type_id::create("decoded_rqe"); x.target_h=rdma_hw_queue_projected_handle("decoded_qp",RDMA_RESOURCE_QP,0); `define RQGET(S,T) v='0; s=b.get_field(S``_WORD_BYTE_OFFSET,S``_LSB,S``_WIDTH,v); if(!s.ok()) return err(s.message); T=v;
-    `RQGET(RDMA_RQE_QPN,x.qpn) `RQGET(RDMA_RQE_QP_SN,x.qp_sn) `RQGET(RDMA_RQE_OPCODE,x.hw_opcode) `RQGET(RDMA_RQE_INDEX,x.index) `RQGET(RDMA_RQE_WRAP,x.wrap) `RQGET(RDMA_RQE_VALID,x.valid) `RQGET(RDMA_RQE_PAYLOAD_LEN,x.payload_len) `RQGET(RDMA_RQE_SIGNATURE,x.signature) `RQGET(RDMA_RQE_SGE_NUM,x.sge_num) `undef RQGET model=x; return rdma_status::success(); endfunction
+  protected virtual function rdma_status decode_fields(
+      rdma_hw_qword_builder b,
+      output rdma_hw_model model
+  );
+    rdma_hw_rqe_model x;
+    bit [63:0] value;
+    rdma_status status;
+
+    model = null;
+    if (b == null)
+      return err("RQE qword builder is null");
+
+    x = rdma_hw_rqe_model::type_id::create("decoded_rqe");
+    x.target_h = rdma_hw_queue_projected_handle(
+        "decoded_qp", RDMA_RESOURCE_QP, 0);
+
+    `define RQGET(STEM, TARGET) \
+      value = '0; \
+      status = b.get_field(STEM``_WORD_BYTE_OFFSET, STEM``_LSB, \
+                           STEM``_WIDTH, value); \
+      if (!status.ok()) return err(status.message); \
+      TARGET = value;
+
+    `RQGET(RDMA_RQE_QPN, x.qpn)
+    `RQGET(RDMA_RQE_QP_SN, x.qp_sn)
+    `RQGET(RDMA_RQE_OPCODE, x.hw_opcode)
+    `RQGET(RDMA_RQE_INDEX, x.index)
+    `RQGET(RDMA_RQE_WRAP, x.wrap)
+    `RQGET(RDMA_RQE_VALID, x.valid)
+    `RQGET(RDMA_RQE_PAYLOAD_LEN, x.payload_len)
+    `RQGET(RDMA_RQE_SIGNATURE, x.signature)
+    `RQGET(RDMA_RQE_SGE_NUM, x.sge_num)
+    `RQGET(RDMA_RQE_SGB_PA, x.sgb_pa)
+
+    `undef RQGET
+    model = x;
+    return rdma_status::success();
+  endfunction
 endclass
 
 class rdma_hw_cqe_codec extends rdma_hw_queue_codec_base;

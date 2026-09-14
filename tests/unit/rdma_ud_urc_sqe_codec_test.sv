@@ -39,6 +39,12 @@ class rdma_ud_urc_sqe_codec_test extends uvm_test;
   // 失败/边界：编码失败、opcode/QPN/Q_Key/IETH 不匹配时报告 UVM error。
   task run_phase(uvm_phase phase);
     rdma_post_send_req req; byte unsigned image[]; rdma_status s; rdma_ud_codec_probe probe;
+    rdma_hw_rqe_codec rqe_codec;
+    rdma_hw_rqe_model rqe_model;
+    rdma_hw_image rqe_image;
+    rdma_hw_qword_builder rqe_builder;
+    byte unsigned rqe_bytes[];
+    rdma_hw_model decoded_model;
     phase.raise_objection(this);
     probe = rdma_ud_codec_probe::type_id::create("ud_reserved_probe");
     s = probe.probe_payload(64'h0000_0001_0000_0000, RDMA_SQ_OPCODE_SEND);
@@ -86,6 +92,43 @@ class rdma_ud_urc_sqe_codec_test extends uvm_test;
     s=rdma_queue_codec::encode_sqe(req,image);
     if (s == null || !s.ok())
       `uvm_error("URC_ENCODE", $sformatf("URC SEND codec did not encode: %s", s == null ? "null status" : s.message))
+
+    // RQE qword4[63:9] 是驱动定义的 SGB_PA；该跨 transport 的 raw image
+    // 断言确保 UD/URC suite 也不会把 RQE 的字段误判为保留位。
+    rqe_codec = rdma_hw_rqe_codec::type_id::create("ud_suite_rqe_codec");
+    rqe_model = rdma_hw_rqe_model::type_id::create("ud_suite_rqe_model");
+    rqe_model.target_h = qp_handle();
+    begin
+      rdma_sge rqe_sge;
+      rqe_sge = rdma_sge::type_id::create("ud_suite_rqe_sge");
+      rqe_sge.length = 16;
+      rqe_model.sges.push_back(rqe_sge);
+    end
+    s = rqe_codec.encode(rqe_model, rqe_image);
+    if (s == null || !s.ok())
+      `uvm_error("RQE_SGB_RAW", "RQE fixture encode failed")
+    else begin
+      rqe_builder = new("ud_suite_rqe_builder");
+      s = rqe_builder.deserialize(rqe_image.bytes);
+      if (s == null || !s.ok())
+        `uvm_error("RQE_SGB_RAW", "RQE fixture deserialize failed")
+      else begin
+        s = rqe_builder.put_field(32, 9, 55, 55'h0012_3456_789a_bcde);
+        if (s == null || !s.ok())
+          `uvm_error("RQE_SGB_RAW", "RQE SGB raw field setup failed")
+        else begin
+          s = rqe_builder.serialize(rqe_bytes);
+          if (s == null || !s.ok())
+            `uvm_error("RQE_SGB_RAW", "RQE SGB raw field serialization failed")
+          else begin
+            foreach (rqe_image.bytes[i]) rqe_image.bytes[i] = rqe_bytes[i];
+            s = rqe_codec.decode(rqe_image, decoded_model);
+            if (s == null || !s.ok())
+              `uvm_error("RQE_SGB_RAW", "RQE SGB raw field was rejected")
+          end
+        end
+      end
+    end
     phase.drop_objection(this);
   endtask
 endclass

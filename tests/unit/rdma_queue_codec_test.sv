@@ -50,7 +50,10 @@ class rdma_queue_codec_test extends uvm_test;
     rdma_hw_cqe_codec profile_codec;
     rdma_hw_image profile_image;
     rdma_hw_qword_builder profile_builder;
+    rdma_hw_qword_builder rqe_builder;
     bit [63:0] profile_words[];
+    bit [63:0] rqe_words[];
+    byte unsigned rqe_bytes[];
     phase.raise_objection(this);
     r=rdma_codec_registry::type_id::create("r"); s=rdma_register_queue_codecs(r); ok("register",s);
     // 设计说明：CQ handle.object_id 是 resource manager 分配的 global incarnation，
@@ -69,7 +72,86 @@ class rdma_queue_codec_test extends uvm_test;
     sg=rdma_sge::type_id::create("sg"); sg.iova.value=64'h1000; sg.length=8; sq.sges.push_back(sg); sq.sge_num=4;
     s=r.lookup('{hw_version:"rdma",image_kind:RDMA_IMAGE_SQE,object_type:"sqe",variant:"rc",opcode:0},c); ok("lookup sq",s); s=c.encode(sq,im); ok("sq encode",s); s=c.decode(im,m); ok("sq decode",s); $cast(sq2,m); s=c.encode(sq2,im2); ok("sq reencode",s); eq_bytes("sq roundtrip",im,im2);
     rq=rdma_hw_rqe_model::type_id::create("rq"); rq.target_h=h("rq",RDMA_RESOURCE_QP,1); rq.qpn='habcde; rq.qp_sn='h5a; rq.hw_opcode=9; rq.index='h3456; rq.wrap=1; rq.valid=1; rq.payload_len='h10203040; rq.signature=8'h96; rq.sge_num=2; rq.sges.push_back(sg);
+    s = rq.set_sgb_pa_from_physical(64'h2468_acf1_3579_bc00);
+    ok("rq physical sgb setter", s);
+    if (rq.sgb_pa !== 55'h0012_3456_789a_bcde ||
+        rq.sgb_pa_as_physical() !== 64'h2468_acf1_3579_bc00)
+      `uvm_error("RQE_SGB_MODEL", "physical SGB_PA did not become PA>>9")
+    s = rq.set_sgb_pa_from_physical(64'h2468_acf1_3579_bc01);
+    if (s == null || s.ok())
+      `uvm_error("RQE_SGB_ALIGN", "unaligned physical SGB_PA was accepted")
+    s = rq.set_sgb_pa_encoded(64'h0080_0000_0000_0000);
+    if (s == null || s.ok())
+      `uvm_error("RQE_SGB_WIDTH", "encoded SGB_PA wider than 55 bits was accepted")
     s=r.lookup('{hw_version:"rdma",image_kind:RDMA_IMAGE_RQE,object_type:"rqe",variant:"default",opcode:0},c); ok("lookup rq",s); s=c.encode(rq,im); ok("rq encode",s); s=c.decode(im,m); ok("rq decode",s);
+
+    // Driver wr.h:188 把 RQE qword4[63:9] 定义为 SGB_PA；该 raw image
+    // 断言锁定合法字段位置，并防止回退为整 qword 保留位。
+    rqe_builder = new("rqe_sgb_red_builder");
+    s = rqe_builder.deserialize(im.bytes);
+    ok("rqe sgb red deserialize", s);
+    s = rqe_builder.put_field(32, 9, 55, 55'h0012_3456_789a_bcde);
+    ok("rqe sgb red raw field", s);
+    s = rqe_builder.serialize(rqe_bytes);
+    ok("rqe sgb red serialize", s);
+    rqe_builder.get_words(rqe_words);
+    if (rqe_words.size() != 8 ||
+        rqe_words[4][63:9] !== 55'h0012_3456_789a_bcde ||
+        rqe_words[4][8:0] !== 9'b0)
+      `uvm_error("RQE_SGB_RAW", "RQE qword4 raw coordinate is incorrect")
+    foreach (im.bytes[i]) im.bytes[i] = rqe_bytes[i];
+    s = c.decode(im, m);
+    if (s == null || !s.ok())
+      `uvm_error("RQE_SGB_RAW", "RQE qword4 SGB_PA raw field was rejected")
+    else begin
+      $cast(rq2, m);
+      if (rq2 == null || rq2.sgb_pa !== 55'h0012_3456_789a_bcde ||
+          rq2.sgb_pa_as_physical() !== 64'h2468_acf1_3579_bc00)
+        `uvm_error("RQE_SGB_DECODE", "RQE SGB_PA detached decode mismatched")
+    end
+
+    rq2 = rdma_hw_rqe_model::type_id::create("rq_copy");
+    rq2.copy(rq);
+    if (rq2.sgb_pa !== rq.sgb_pa ||
+        rq2.sgb_pa_as_physical() !== rq.sgb_pa_as_physical())
+      `uvm_error("RQE_SGB_COPY", "RQE SGB_PA detached copy mismatched")
+
+    // qword2 bit0 is outside SIGNATURE/SGE_NUM and must remain reserved;
+    // explicit parentheses in image_check keep this rejection unambiguous.
+    s = c.encode(rq, im);
+    ok("rq re-encode for reserved red", s);
+    rqe_builder = new("rqe_reserved_red_builder");
+    s = rqe_builder.deserialize(im.bytes);
+    ok("rqe reserved red deserialize", s);
+    s = rqe_builder.put_field(16, 0, 1, 1);
+    ok("rqe reserved red raw field", s);
+    s = rqe_builder.serialize(rqe_bytes);
+    ok("rqe reserved red serialize", s);
+    foreach (im.bytes[i]) im.bytes[i] = rqe_bytes[i];
+    s = c.decode(im, m);
+    if (s == null || s.ok())
+      `uvm_error("RQE_RESERVED", "RQE qword2 reserved bit was accepted")
+
+    // qword3 and qword5..qword7 remain fully reserved; qword4 low bits are
+    // also reserved because the driver consumes only SGB_PA[63:9].
+    for (int unsigned reserved_qword = 3;
+         reserved_qword <= 7;
+         reserved_qword++) begin
+      s = c.encode(rq, im);
+      ok("rq re-encode for reserved strictness", s);
+      rqe_builder = new("rqe_reserved_strict_builder");
+      s = rqe_builder.deserialize(im.bytes);
+      ok("rqe reserved strict deserialize", s);
+      s = rqe_builder.put_field(reserved_qword << 3, 0, 1, 1);
+      ok("rqe reserved strict raw field", s);
+      s = rqe_builder.serialize(rqe_bytes);
+      ok("rqe reserved strict serialize", s);
+      foreach (im.bytes[i]) im.bytes[i] = rqe_bytes[i];
+      s = c.decode(im, m);
+      if (s == null || s.ok())
+        `uvm_error("RQE_RESERVED", $sformatf(
+            "RQE reserved qword %0d was accepted", reserved_qword))
+    end
     cq=rdma_hw_cqe_model::type_id::create("cq"); cq.qp_h=h("cq",RDMA_RESOURCE_QP,'h2aaaa); cq.qpn='h2aaaa; cq.wqe_index='h4567; cq.ecode=8'hf4; cq.payload_len='h10203040; cq.polarity=1; cq.rq_cqe=1; cq.wqe_wrap=1; cq.packet_opcode=8'h9a; cq.immediate_data=32'h89abcdef; cq.status=rdma_status::type_id::create("st");
     s=r.lookup('{hw_version:"rdma",image_kind:RDMA_IMAGE_CQE,object_type:"cqe",variant:"default",opcode:0},c); ok("lookup cq",s); s=c.encode(cq,im); ok("cq encode",s); s=c.decode(im,m); ok("cq decode",s);
     // The 128B CQE profile owns qword8..qword10; qword0..qword7 remain a
