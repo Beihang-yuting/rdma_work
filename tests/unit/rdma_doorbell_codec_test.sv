@@ -259,6 +259,93 @@ class rdma_doorbell_codec_test extends uvm_test;
     endcase
   endfunction
 
+  // 功能：check_cq_invalid_flag_case 构造一个 CQ doorbell 快照，逐一验证
+  //       CI/ARM invalid 标志的 copy、编码、原始位坐标、解码和再编码结果。
+  // 输入/输出及副作用：label、variant、registry、golden、ci_invalid 和
+  //       arm_invalid（输入）；函数只创建本地 fixture，并通过 UVM report
+  //       暴露断言结果，不转移 registry、golden 或 CQ handle 的所有权。
+  // 失败/边界：variant 不是 cq_rc_ud/cq_urc、模型 cast 失败、编码/解码返回
+  //       非成功状态、image 长度或 bit63/bit62 坐标不符、copy 丢失标志，或
+  //       再编码改变任一原始字节时报告错误并停止该 case 的后续检查。
+  function automatic void check_cq_invalid_flag_case(
+    string label,
+    string variant,
+    rdma_hw_doorbell_codec_registry registry,
+    rdma_golden_case golden,
+    bit ci_invalid,
+    bit arm_invalid
+  );
+    rdma_hw_doorbell_model_base source;
+    rdma_hw_cq_doorbell_model cq;
+    rdma_hw_cq_doorbell_model copied_cq;
+    rdma_hw_cq_doorbell_model decoded_cq;
+    rdma_hw_image image;
+    rdma_hw_image roundtrip;
+    rdma_hw_model decoded;
+    rdma_status status;
+
+    source = make_model(variant, golden);
+    if (source == null || !$cast(cq, source)) begin
+      `uvm_error(label, "CQ fixture cast failed")
+      return;
+    end
+
+    cq.ci_invalid = ci_invalid;
+    cq.arm_invalid = arm_invalid;
+
+    copied_cq = rdma_hw_cq_doorbell_model::type_id::create(
+        {label, "_copy"});
+    copied_cq.copy(cq);
+    if (copied_cq.ci_invalid != ci_invalid ||
+        copied_cq.arm_invalid != arm_invalid) begin
+      `uvm_error(label, "CQ copy lost invalid marker fields")
+      return;
+    end
+
+    image = null;
+    status = registry.encode(cq, image);
+    expect_ok({label, "_ENCODE"}, status);
+    if (status == null || !status.ok())
+      return;
+    if (image == null || image.bytes.size() != RDMA_DB_BYTES ||
+        image.bar_target.value != RDMA_DB_CQ_OFFSET ||
+        image.bytes[0][7] != ci_invalid ||
+        image.bytes[0][6] != arm_invalid) begin
+      `uvm_error(label,
+                 "CQ invalid marker coordinates or BAR offset are incorrect")
+      return;
+    end
+
+    decoded = null;
+    status = registry.decode(variant, image, decoded);
+    expect_ok({label, "_DECODE"}, status);
+    if (status == null || !status.ok() || decoded == null ||
+        !$cast(decoded_cq, decoded)) begin
+      `uvm_error(label, "CQ invalid marker decode cast failed")
+      return;
+    end
+    if (decoded_cq.ci_invalid != ci_invalid ||
+        decoded_cq.arm_invalid != arm_invalid) begin
+      `uvm_error(label, "CQ decode lost invalid marker fields")
+      return;
+    end
+
+    roundtrip = null;
+    status = registry.encode(decoded_cq, roundtrip);
+    expect_ok({label, "_REENCODE"}, status);
+    if (status == null || !status.ok() || roundtrip == null ||
+        roundtrip.bytes.size() != image.bytes.size()) begin
+      `uvm_error(label, "CQ invalid marker re-encode failed")
+      return;
+    end
+    foreach (image.bytes[index]) begin
+      if (roundtrip.bytes[index] != image.bytes[index]) begin
+        `uvm_error(label, "CQ invalid marker round-trip changed raw bytes")
+        return;
+      end
+    end
+  endfunction
+
   // 功能：在测试辅助 rdma_doorbell_codec_test.check_metadata 中构造或驱动“metadata”场景，并断言 DUT 的状态、错误码和资源账本符合契约。
   // 输入/输出及副作用：label（输入）、model（输入）、image（输入）、expected_offset（输入）；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT
   //   转移未声明的资源所有权。
@@ -455,6 +542,25 @@ class rdma_doorbell_codec_test extends uvm_test;
     srq.limit = 32'h4000;
     expect_status("SRQ_RANGE", registry.encode(srq, image),
                   RDMA_SC_INVALID_ARGUMENT);
+
+    // cq.h:108-109 define independent CI/ARM invalid markers at bits 63/62.
+    // Exercise both wire variants and all combinations so neither marker can
+    // be accidentally tied to the other or hidden by a shared mask.
+    for (int unsigned ci_flag = 0; ci_flag < 2; ci_flag++) begin
+      for (int unsigned arm_flag = 0; arm_flag < 2; arm_flag++) begin
+        check_cq_invalid_flag_case(
+          $sformatf("CQ_RC_UD_INVALID_%0d_%0d", ci_flag, arm_flag),
+          "cq_rc_ud", registry,
+          find_golden(doorbell_cases, "cq_rc_ud"),
+          ci_flag, arm_flag);
+        check_cq_invalid_flag_case(
+          $sformatf("CQ_URC_INVALID_%0d_%0d", ci_flag, arm_flag),
+          "cq_urc", registry,
+          find_golden(doorbell_cases, "cq_urc"),
+          ci_flag, arm_flag);
+      end
+    end
+
     model = make_model("cq_urc", find_golden(doorbell_cases, "cq_urc"));
     if (!$cast(cq, model))
       `uvm_fatal("TEST_SETUP", "CQ model factory returned wrong type")

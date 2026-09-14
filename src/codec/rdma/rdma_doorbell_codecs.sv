@@ -413,13 +413,17 @@ class rdma_hw_cq_doorbell_model
   bit sq_wrap;
   int unsigned rq_ci;
   bit rq_wrap;
+  bit ci_invalid;
+  bit arm_invalid;
   bit arm;
   int unsigned arm_state;
   int unsigned arm_sn;
 
-  // 功能：构造 rdma_hw_cq_doorbell_model，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：variant=RDMA_CQ_DB_RC_UD；cqn=0；host_id=0；ci=0；wrap=1'b0；sq_ci=0；sq_wrap=1'b0；rq_ci=0；其余字段按实现默认值初始化。
+  // 功能：构造 rdma_hw_cq_doorbell_model，建立同时覆盖 RC/UD 与 URC 线布局的
+  //       独立 doorbell 快照；invalid 标志也在模型中保留，避免丢失驱动字段。
   // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
-  // 失败/边界：rdma_hw_cq_doorbell_model 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
+  // 失败/边界：构造只建立本地初始状态，不接管 CQ、Host-memory、PCIe 或 manager；
+  //       未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_hw_cq_doorbell_model");
     super.new(name);
     variant = RDMA_CQ_DB_RC_UD;
@@ -431,6 +435,8 @@ class rdma_hw_cq_doorbell_model
     sq_wrap = 1'b0;
     rq_ci = 0;
     rq_wrap = 1'b0;
+    ci_invalid = 1'b0;
+    arm_invalid = 1'b0;
     arm = 1'b0;
     arm_state = 0;
     arm_sn = 0;
@@ -453,6 +459,8 @@ class rdma_hw_cq_doorbell_model
     sq_wrap = rhs_model.sq_wrap;
     rq_ci = rhs_model.rq_ci;
     rq_wrap = rhs_model.rq_wrap;
+    ci_invalid = rhs_model.ci_invalid;
+    arm_invalid = rhs_model.arm_invalid;
     arm = rhs_model.arm;
     arm_state = rhs_model.arm_state;
     arm_sn = rhs_model.arm_sn;
@@ -493,6 +501,7 @@ class rdma_hw_cq_doorbell_model
                             "CQ doorbell RQ CI");
       if (!status.ok()) return status;
     end
+
     return target_id_status(cqn, "CQ doorbell");
   endfunction
 
@@ -831,8 +840,11 @@ class rdma_hw_doorbell_codec extends rdma_codec_base;
       "rq":       return 64'h0000_ffff_00ff_ffff;
       "srq_pi":   return 64'h4000_ffff_0000_ffff;
       "srq_limit":return 64'h8000_0000_ffff_ffff;
-      "cq_rc_ud": return 64'h3f00_ffff_ffff_ffff;
-      "cq_urc":   return 64'h3fff_ffff_ffff_ffff;
+      // cq.h:108-113 reserve the top two bits for explicit invalid markers;
+      // they are authored by the driver even when the corresponding cursor is
+      // not valid, so both CQ variants must include them in the selected mask.
+      "cq_rc_ud": return 64'hff00_ffff_ffff_ffff;
+      "cq_urc":   return 64'hffff_ffff_ffff_ffff;
       "ceq":      return 64'h0007_ffff_003f_ffff;
       "aeq":      return 64'h0007_ffff_0000_0fff;
       "rts2sqd",
@@ -1054,6 +1066,8 @@ class rdma_hw_doorbell_codec extends rdma_codec_base;
       end
       "cq_rc_ud", "cq_urc": begin
         void'($cast(cq, model));
+        `DB_PUT(RDMA_NOTIFY_CQ_CI_INVALID, cq.ci_invalid)
+        `DB_PUT(RDMA_NOTIFY_CQ_ARM_INVALID, cq.arm_invalid)
         `DB_PUT(RDMA_NOTIFY_CQ_ARM, cq.arm)
         `DB_PUT(RDMA_NOTIFY_CQ_URC,
                 (variant_name == "cq_urc"))
@@ -1287,6 +1301,8 @@ class rdma_hw_doorbell_codec extends rdma_codec_base;
             "decoded_cq_doorbell");
         cq.variant = (variant_name == "cq_rc_ud") ?
                      RDMA_CQ_DB_RC_UD : RDMA_CQ_DB_URC;
+        `DB_GET(RDMA_NOTIFY_CQ_CI_INVALID, cq.ci_invalid)
+        `DB_GET(RDMA_NOTIFY_CQ_ARM_INVALID, cq.arm_invalid)
         `DB_GET(RDMA_NOTIFY_CQ_ARM, cq.arm)
         `DB_GET(RDMA_NOTIFY_CQ_URC, value)
         if (value != (variant_name == "cq_urc"))
