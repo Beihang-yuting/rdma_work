@@ -188,6 +188,74 @@ class rdma_legacy_payload_cmq_port extends rdma_legacy_only_cmq_port;
   endfunction
 endclass
 
+// 设计说明：该 probe 只暴露 production adapter 的 observed envelope 判定，
+//   不绑定 engine 或外部资源；它用于把身份图的 fail-closed 决策表写成独立测试。
+class rdma_cmq_observed_semantics_probe extends rdma_cmq_engine_port_adapter;
+  `uvm_object_utils(rdma_cmq_observed_semantics_probe)
+
+  // 功能：构造 observed semantics probe，继承 adapter 的空绑定表和兼容位默认值。
+  // 输入/输出及副作用：name 传给父类；只建立本地 UVM 对象，不登记 engine。
+  // 失败/边界：probe 未绑定 Function 时不能执行真实命令，仅可调用纯 envelope 判定。
+  function new(string name = "rdma_cmq_observed_semantics_probe");
+    super.new(name);
+  endfunction
+
+  // 功能：调用 adapter 内部 observed_result_semantics_valid，检查 phase/effect 与
+  //   ticket、identity、owner、DMA 和 batch/attempt 图的完整性。
+  // 输入/输出及副作用：value 为只读结果图；返回 production 判定，不修改 value 或
+  //   adapter 兼容状态，也不触发 engine/外部 I/O。
+  // 失败/边界：任何未知枚举、半成品身份或 completion alias 不一致均按生产规则拒绝；
+  //   该 wrapper 不增加额外放宽条件。
+  function bit semantics_valid(rdma_cmq_execution_result value);
+    return observed_result_semantics_valid(value);
+  endfunction
+endclass
+
+// 设计说明：该 adapter 模拟 delegated engine 返回一个看似 PRE rejection、但
+//   observation_status 已失败的 malformed envelope，用于保护 legacy 兼容位不被伪造。
+class rdma_cmq_malformed_delegated_adapter
+  extends rdma_cmq_engine_port_adapter;
+  `uvm_object_utils(rdma_cmq_malformed_delegated_adapter)
+
+  // 功能：构造 malformed delegated adapter，保留父类的空 engine registry。
+  // 输入/输出及副作用：name 传给父类；不创建 engine、DMA 或 scheduler 资源。
+  // 失败/边界：该对象只用于 legacy execute seam 测试，不能代表真实 observed route。
+  function new(string name = "rdma_cmq_malformed_delegated_adapter");
+    super.new(name);
+  endfunction
+
+  // 功能：返回一个身份全空、PRE effect 正确但 observation_status 非 OK 的 delegated
+  //   result，模拟下游恶意/损坏实现试图伪造“确定未提交”证明。
+  // 输入/输出及副作用：command 为只读输入，result 为 caller-owned 新结果；不修改
+  //   command、adapter registry 或任何外部资源。
+  // 失败/边界：无论 command 内容如何都返回 malformed observation；调用方必须把
+  //   该 envelope 当作不可靠证据，不能置 last_execute_no_submit_proven。
+  virtual task execute_observed(
+    input rdma_cmq_command_desc command,
+    output rdma_cmq_execution_result result
+  );
+    result = new("malformed_delegated_result");
+    result.status = rdma_cmq_direct_status(
+      RDMA_SC_INVALID_STATE, "delegated local rejection"
+    );
+    result.observation_status = rdma_cmq_direct_status(
+      RDMA_SC_INVALID_STATE, "delegated observation is malformed"
+    );
+    result.submission_effect = RDMA_SUBMIT_EFFECT_PRE_SUBMIT_REJECTED;
+    result.attempt_effect = RDMA_SUBMIT_EFFECT_PRE_SUBMIT_REJECTED;
+    result.completion_phase = RDMA_CMQ_COMPLETION_NONE;
+    result.batch_key = "";
+    result.batch_id = 0;
+    result.attempt_id = 0;
+    result.recovery_required = 1'b0;
+    result.ticket = null;
+    result.completion = null;
+    result.command_identity = null;
+    result.recovery_owner = null;
+    result.dma_context = null;
+  endtask
+endclass
+
 class rdma_cmq_port_test extends rdma_cmq_engine_test;
   `uvm_component_utils(rdma_cmq_port_test)
 
@@ -207,7 +275,13 @@ class rdma_cmq_port_test extends rdma_cmq_engine_test;
   //   UNOBSERVED/recovery_required；该差异必须以 UVM_ERROR 暴露为 RED。
   task automatic check_production_observed_pre_rejection();
     rdma_cmq_engine_port_adapter adapter;
+    rdma_cmq_malformed_delegated_adapter malformed_adapter;
+    rdma_cmq_observed_semantics_probe semantics_probe;
+    rdma_cmq_execution_result malformed_result;
     rdma_cmq_execution_result result;
+    rdma_cmq_ticket ticket;
+    rdma_cmq_completion completion;
+    rdma_status status;
     bit seeded;
 
     adapter = rdma_cmq_engine_port_adapter::type_id::create(
@@ -224,6 +298,51 @@ class rdma_cmq_port_test extends rdma_cmq_engine_test;
         adapter.last_execute_definitive_no_submit() != seeded)
       `uvm_error("PRODUCTION_OBSERVED_PRE_REJECT",
                  "production observed pre-engine rejection contract is missing")
+
+    // 非 PRE 的 NONE 不能用全空 evidence 伪装成可恢复或已拒绝结果。
+    semantics_probe = rdma_cmq_observed_semantics_probe::type_id::create(
+      "observed_semantics_probe"
+    );
+    malformed_result = new("none_without_identity");
+    malformed_result.status = rdma_cmq_direct_status(RDMA_SC_OK);
+    malformed_result.observation_status = rdma_cmq_direct_status(RDMA_SC_OK);
+    malformed_result.submission_effect =
+      RDMA_SUBMIT_EFFECT_HOST_MEMORY_MAYBE_VISIBLE;
+    malformed_result.attempt_effect =
+      RDMA_SUBMIT_EFFECT_HOST_MEMORY_MAYBE_VISIBLE;
+    malformed_result.completion_phase = RDMA_CMQ_COMPLETION_NONE;
+    malformed_result.recovery_required = 1'b1;
+    if (semantics_probe.semantics_valid(malformed_result))
+      `uvm_error("OBSERVED_NONE_IDENTITY_GATE",
+                 "NONE result with no identity graph was accepted")
+
+    // UNOBSERVED 允许 post-delegation 的全空 envelope，但不允许只带 batch/id
+    //   的半成品；否则调用方可能把不属于任何 journal 的证据送进恢复。
+    malformed_result = new("unobserved_partial_batch");
+    malformed_result.status = rdma_cmq_direct_status(RDMA_SC_INVALID_STATE);
+    malformed_result.observation_status = rdma_cmq_direct_status(
+      RDMA_SC_INVALID_STATE
+    );
+    malformed_result.submission_effect = RDMA_SUBMIT_EFFECT_UNOBSERVED;
+    malformed_result.attempt_effect = RDMA_SUBMIT_EFFECT_UNOBSERVED;
+    malformed_result.completion_phase = RDMA_CMQ_COMPLETION_UNOBSERVED;
+    malformed_result.batch_key = "partial-batch";
+    malformed_result.batch_id = 1;
+    malformed_result.recovery_required = 1'b1;
+    if (semantics_probe.semantics_valid(malformed_result))
+      `uvm_error("OBSERVED_UNOBSERVED_PARTIAL_GATE",
+                 "UNOBSERVED partial batch identity was accepted")
+
+    // delegated result 即使伪造 PRE effect/zero IDs，只要 observation_status
+    //   非 OK，也不能污染 deprecated last_execute_no_submit_proven seam。
+    malformed_adapter =
+      rdma_cmq_malformed_delegated_adapter::type_id::create(
+        "malformed_delegated_adapter"
+      );
+    malformed_adapter.execute(null, ticket, completion, status);
+    if (malformed_adapter.last_execute_definitive_no_submit())
+      `uvm_error("LEGACY_NO_SUBMIT_MALFORMED",
+                 "malformed delegated result set no-submit proof")
   endtask
 
   // 功能：在 rdma_cmq_port_test 中，next_generation_binding 配置测试 fixture 的定向故障或替代依赖，使下一次调用覆盖指定边界路径。

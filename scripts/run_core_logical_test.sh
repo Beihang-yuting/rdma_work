@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # 目录/层次：scripts，core UVM logical-to-physical 执行控制层。
-# 文件职责：把普通 logical test 映射到自身，把 engine umbrella 展开为十四个
+# 文件职责：把普通 logical test 映射到自身，把 engine umbrella 展开为十五个
 #   独立 simulator process。
 # 主要依赖：bash、tee、可执行 simv、strict UVM summary checker，以及只读
 #   engine process manifest。
@@ -58,8 +58,8 @@ if [[ "$logical_test" == "$engine_logical_test" ]]; then
         -e '/^[[:space:]]*$/d' "$engine_manifest"
   )
 
-  if (( ${#physical_tests[@]} != 14 )); then
-    echo "engine process manifest requires exactly fourteen tests" >&2
+  if (( ${#physical_tests[@]} != 15 )); then
+    echo "engine process manifest requires exactly fifteen tests" >&2
     exit 2
   fi
 

@@ -168,6 +168,95 @@ class rdma_cmq_engine_port_adapter extends rdma_cmq_port;
            identity.variant == ticket.opcode_key.variant;
   endfunction
 
+  // 功能：判断 observed result 是否完全没有提交身份图，供本地 PRE 拒绝和
+  //   delegated UNOBSERVED 两种零 identity 形状共用。
+  // 输入/输出及副作用：value 为只读 execution result；返回 bit，不修改对象或
+  //   adapter 状态，也不访问 engine/外部资源。
+  // 失败/边界：value 为 null 时返回 0；只要 ticket、identity、owner、DMA 或
+  //   completion 任一存在，或 batch/attempt 有任一非零值，就不再视为空图。
+  protected function bit observed_identity_graph_empty(
+    input rdma_cmq_execution_result value
+  );
+    if (value == null)
+      return 1'b0;
+    return value.ticket == null && value.completion == null &&
+           value.command_identity == null && value.recovery_owner == null &&
+           value.dma_context == null && value.batch_key.len() == 0 &&
+           value.batch_id == 0 && value.attempt_id == 0;
+  endfunction
+
+  // 功能：验证 admitted observed result 的完整身份图，确保 ticket、Function/
+  //   opcode identity、recovery owner、DMA context 和 batch attempt 可互相追溯。
+  // 输入/输出及副作用：value 为只读结果图；返回 bit，不冻结、复制或
+  //   提交 authority；DMA validate 只读取 context 的公开约束。
+  // 失败/边界：任何半成品图、零 batch/attempt、ticket/identity 漂移、legacy owner
+  //   以外的 owner reset/generation 不一致，或 DMA context 校验失败均返回 0。
+  protected function bit observed_identity_graph_complete(
+    input rdma_cmq_execution_result value
+  );
+    rdma_status dma_status;
+
+    if (value == null || value.ticket == null ||
+        value.command_identity == null || value.recovery_owner == null ||
+        value.dma_context == null || value.batch_key.len() == 0 ||
+        value.batch_id == 0 || value.attempt_id == 0 ||
+        !rdma_cmq_ticket_shape_valid(value.ticket) ||
+        !command_identity_matches_ticket(value.command_identity,
+                                         value.ticket) ||
+        !rdma_cmq_frozen_owner_shape_valid(value.recovery_owner) ||
+        value.dma_context.function_h == null ||
+        value.dma_context.get_object_type() !=
+          rdma_dma_request_context::get_type())
+      return 1'b0;
+
+    dma_status = value.dma_context.validate();
+    if (dma_status == null || !dma_status.ok() ||
+        !same_handle_value(value.dma_context.function_h,
+                           value.ticket.function_h))
+      return 1'b0;
+
+    if (value.recovery_owner.is_legacy_unmigrated())
+      return 1'b1;
+
+    return value.recovery_owner.function_identity != null &&
+           value.recovery_owner.resource_h != null &&
+           value.recovery_owner.function_identity.function_uid ==
+             value.ticket.function_h.function_uid &&
+           value.recovery_owner.function_identity.generation ==
+             value.ticket.function_h.generation &&
+           value.recovery_owner.resource_h.function_uid ==
+             value.ticket.function_h.function_uid &&
+           value.recovery_owner.resource_h.generation ==
+             value.ticket.function_h.generation &&
+           value.dma_context.reset_epoch ==
+             value.recovery_owner.function_identity.reset_epoch;
+  endfunction
+
+  // 功能：确认 legacy execute 返回的结果确实是 adapter 在 engine 前确定拒绝的
+  //   PRE_SUBMIT_REJECTED envelope，作为 deprecated no-submit compatibility proof。
+  // 输入/输出及副作用：value 为只读 observed result；返回 bit，不读写共享
+  //   seam。
+  // 失败/边界：status/observation 缺失、观察失败、非 PRE effect、任何身份
+  //   半成品、
+  //   completion 或 recovery 标志存在时均返回 0，避免把 delegated malformed result
+  //   误报为“确定未提交”。
+  protected function bit legacy_no_submit_result_valid(
+    input rdma_cmq_execution_result value
+  );
+    if (value == null || value.status == null || value.observation_status == null ||
+        !rdma_cmq_status_shape_valid(value.status) ||
+        !rdma_cmq_status_shape_valid(value.observation_status) ||
+        value.status.code == RDMA_SC_OK ||
+        value.observation_status.code != RDMA_SC_OK ||
+        value.submission_effect != RDMA_SUBMIT_EFFECT_PRE_SUBMIT_REJECTED ||
+        value.attempt_effect != RDMA_SUBMIT_EFFECT_PRE_SUBMIT_REJECTED ||
+        value.completion_phase != RDMA_CMQ_COMPLETION_NONE ||
+        value.recovery_required != 1'b0 ||
+        !observed_identity_graph_empty(value))
+      return 1'b0;
+    return 1'b1;
+  endfunction
+
   // 功能：对 observed result 执行完整 effect/phase/recovery 语义交叉校验，并确认
   //   completion、ticket、status 和 identity 的 alias topology。
   // 输入/输出及副作用：value 为只读 engine 输出；返回布尔形状判定，不修改 value。
@@ -179,7 +268,8 @@ class rdma_cmq_engine_port_adapter extends rdma_cmq_port;
   );
     bit completion_phase_has_shell;
     bit concrete_effect;
-    rdma_status dma_status;
+    bit identity_graph_empty;
+    bit identity_graph_complete;
 
     if (value == null || value.status == null ||
         value.observation_status == null ||
@@ -190,41 +280,13 @@ class rdma_cmq_engine_port_adapter extends rdma_cmq_port;
         !rdma_cmq_completion_phase_valid(value.completion_phase))
       return 1'b0;
 
-    if (value.ticket != null && !rdma_cmq_ticket_shape_valid(value.ticket))
+    identity_graph_empty = observed_identity_graph_empty(value);
+    identity_graph_complete = observed_identity_graph_complete(value);
+    if (!identity_graph_empty && !identity_graph_complete)
       return 1'b0;
-    if (value.recovery_owner != null &&
-        !rdma_cmq_frozen_owner_shape_valid(value.recovery_owner))
-      return 1'b0;
-    if (value.dma_context != null) begin
-      if (value.dma_context.function_h == null ||
-          value.dma_context.get_object_type() !=
-            rdma_dma_request_context::get_type())
-        return 1'b0;
-      dma_status = value.dma_context.validate();
-      if (dma_status == null || !dma_status.ok())
-        return 1'b0;
-    end
-    if (value.ticket != null &&
-        (value.recovery_owner == null || value.dma_context == null ||
-         value.command_identity == null ||
-         !command_identity_matches_ticket(value.command_identity,
-                                          value.ticket) ||
-         !same_handle_value(value.dma_context.function_h,
-                            value.ticket.function_h) ||
-         (!value.recovery_owner.is_legacy_unmigrated() &&
-          (value.recovery_owner.function_identity == null ||
-           value.recovery_owner.function_identity.function_uid !=
-             value.ticket.function_h.function_uid ||
-           value.recovery_owner.function_identity.generation !=
-             value.ticket.function_h.generation ||
-           value.recovery_owner.resource_h == null ||
-           value.recovery_owner.resource_h.function_uid !=
-             value.ticket.function_h.function_uid ||
-           value.recovery_owner.resource_h.generation !=
-             value.ticket.function_h.generation))))
-      return 1'b0;
+
     if (value.completion != null &&
-        (value.ticket == null || value.completion.ticket == null ||
+        (!identity_graph_complete || value.completion.ticket == null ||
          value.completion.status == null ||
          !rdma_cmq_ticket_shape_valid(value.completion.ticket) ||
          !rdma_cmq_status_shape_valid(value.completion.status) ||
@@ -254,36 +316,45 @@ class rdma_cmq_engine_port_adapter extends rdma_cmq_port;
     );
     if (value.submission_effect == RDMA_SUBMIT_EFFECT_PRE_SUBMIT_REJECTED ||
         value.attempt_effect == RDMA_SUBMIT_EFFECT_PRE_SUBMIT_REJECTED)
-      return value.completion_phase == RDMA_CMQ_COMPLETION_NONE &&
-             value.completion == null &&
-             value.submission_effect == RDMA_SUBMIT_EFFECT_PRE_SUBMIT_REJECTED &&
-             value.attempt_effect == RDMA_SUBMIT_EFFECT_PRE_SUBMIT_REJECTED &&
-             value.recovery_required == 1'b0 && value.batch_key.len() == 0 &&
-             value.batch_id == 0 && value.attempt_id == 0;
+      return legacy_no_submit_result_valid(value);
 
     case (value.completion_phase)
       RDMA_CMQ_COMPLETION_UNOBSERVED:
-        return value.completion == null && value.recovery_required == 1'b1;
+        return value.completion == null && value.recovery_required == 1'b1 &&
+               value.submission_effect == RDMA_SUBMIT_EFFECT_UNOBSERVED &&
+               value.attempt_effect == RDMA_SUBMIT_EFFECT_UNOBSERVED &&
+               (identity_graph_empty || identity_graph_complete);
       RDMA_CMQ_COMPLETION_NONE:
-        return value.completion == null &&
+        return identity_graph_complete && value.completion == null &&
                value.submission_effect != RDMA_SUBMIT_EFFECT_MMIO_MAYBE_VISIBLE &&
                value.submission_effect != RDMA_SUBMIT_EFFECT_MMIO_VISIBLE &&
+               value.attempt_effect != RDMA_SUBMIT_EFFECT_MMIO_MAYBE_VISIBLE &&
+               value.attempt_effect != RDMA_SUBMIT_EFFECT_MMIO_VISIBLE &&
                value.recovery_required == 1'b1;
       RDMA_CMQ_COMPLETION_PENDING:
-        return value.completion == null &&
+        return identity_graph_complete && value.completion == null &&
                value.submission_effect inside {
+                 RDMA_SUBMIT_EFFECT_MMIO_MAYBE_VISIBLE,
+                 RDMA_SUBMIT_EFFECT_MMIO_VISIBLE
+               } && value.attempt_effect inside {
                  RDMA_SUBMIT_EFFECT_MMIO_MAYBE_VISIBLE,
                  RDMA_SUBMIT_EFFECT_MMIO_VISIBLE
                } && value.recovery_required == 1'b1;
       RDMA_CMQ_COMPLETION_TERMINAL,
       RDMA_CMQ_COMPLETION_DIAGNOSTIC_ONLY:
-        return concrete_effect && value.completion != null &&
+        return identity_graph_complete && concrete_effect &&
+               rdma_cmq_concrete_submission_effect(value.attempt_effect) &&
+               value.completion != null &&
                value.recovery_required == 1'b0;
       RDMA_CMQ_COMPLETION_TIMEOUT:
-        return concrete_effect && value.completion != null &&
+        return identity_graph_complete && concrete_effect &&
+               rdma_cmq_concrete_submission_effect(value.attempt_effect) &&
+               value.completion != null &&
                value.recovery_required == 1'b1;
       RDMA_CMQ_COMPLETION_RESET_CANCELLED:
-        return concrete_effect && value.completion != null;
+        return identity_graph_complete && concrete_effect &&
+               rdma_cmq_concrete_submission_effect(value.attempt_effect) &&
+               value.completion != null;
       default:
         return 1'b0;
     endcase
@@ -348,13 +419,7 @@ class rdma_cmq_engine_port_adapter extends rdma_cmq_port;
       ticket = observed_result.ticket;
     if (observed_result.completion != null)
       completion = observed_result.completion;
-    if (observed_result.status != null &&
-        observed_result.status.code == RDMA_SC_INVALID_STATE &&
-        observed_result.submission_effect ==
-          RDMA_SUBMIT_EFFECT_PRE_SUBMIT_REJECTED &&
-        observed_result.batch_id == 0 && observed_result.attempt_id == 0 &&
-        observed_result.batch_key.len() == 0 &&
-        observed_result.recovery_required == 1'b0)
+    if (legacy_no_submit_result_valid(observed_result))
       last_execute_no_submit_proven = 1'b1;
   endtask
 

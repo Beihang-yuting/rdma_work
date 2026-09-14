@@ -1167,15 +1167,17 @@ class rdma_cmq_engine extends uvm_object;
   //   完整身份及 state/phase/completion 组合，作为 execute 的唯一决策门禁。
   // 输入/输出及副作用：submitted、batch_record、journal_item 为只读输入；返回
   //   非空 status，不修改 journal 或任何 lifecycle 字段。
-  // 失败/边界：ticket、batch/attempt、Function/CMQ identity 任一不一致，或
-  //   active pending 行的 engine incarnation 不匹配、state/phase/completion 矛盾时返回 INVALID_STATE；
-  //   已 retained 的 terminal/timeout/late/reset 行允许跨 reprepare incarnation 查询。
+  // 失败/边界：ticket、batch/attempt、Function/CMQ identity 或 retained reset
+  //   mapping 任一不一致，或 active pending 行的 incarnation/lifecycle 矛盾时
+  //   返回 INVALID_STATE；caller 的旧 status/effect/phase 只做 shape 检查，当前
+  //   lifecycle 与 operation status 以 retained journal 行为准。
   protected function rdma_status validate_observed_item_locked(
     input rdma_cmq_execution_result submitted,
     input rdma_cmq_batch_submission_record batch_record,
     input rdma_cmq_batch_submission_item_record journal_item
   );
     rdma_cmq_command_identity expected_command_identity;
+    rdma_status dma_status;
     string identity_failure;
 
     if (submitted == null || batch_record == null || journal_item == null ||
@@ -1194,7 +1196,85 @@ class rdma_cmq_engine extends uvm_object;
       return journal_status(
         RDMA_SC_INVALID_STATE, "CMQ observed journal identity mismatch"
       );
+
+    // submitted 是 caller-owned detached 快照；它的 lifecycle/status/effect 可以
+    // 在取得锁前过时，但身份图、枚举 shape 和 completion 内部 alias
+    //   不能损坏。
+    if (!rdma_cmq_ticket_shape_valid(submitted.ticket) ||
+        !rdma_cmq_status_shape_valid(submitted.status) ||
+        !rdma_cmq_status_shape_valid(submitted.observation_status) ||
+        !rdma_cmq_submission_effect_valid(submitted.submission_effect) ||
+        !rdma_cmq_submission_effect_valid(submitted.attempt_effect) ||
+        !rdma_cmq_completion_phase_valid(submitted.completion_phase) ||
+        !rdma_cmq_frozen_owner_shape_valid(submitted.recovery_owner) ||
+        submitted.dma_context == null || submitted.dma_context.function_h == null)
+      return journal_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ observed submitted detached graph is malformed"
+      );
+    dma_status = submitted.dma_context.validate();
+    if (dma_status == null || !dma_status.ok() ||
+        !same_handle_value(submitted.dma_context.function_h,
+                           submitted.ticket.function_h))
+      return journal_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ observed submitted DMA identity is malformed"
+      );
+
+    // delegated result 可以携带旧的 state/effect 投影，但自身仍须满足基本
+    //   组合；
+    // 当前 lifecycle 与 operation status 的唯一 authority 是下方 retained row。
+    if (submitted.submission_effect == RDMA_SUBMIT_EFFECT_PRE_SUBMIT_REJECTED ||
+        submitted.attempt_effect == RDMA_SUBMIT_EFFECT_PRE_SUBMIT_REJECTED) begin
+      if (submitted.submission_effect != RDMA_SUBMIT_EFFECT_PRE_SUBMIT_REJECTED ||
+          submitted.attempt_effect != RDMA_SUBMIT_EFFECT_PRE_SUBMIT_REJECTED ||
+          submitted.completion_phase != RDMA_CMQ_COMPLETION_NONE ||
+          submitted.completion != null || submitted.batch_id == 0 ||
+          submitted.attempt_id == 0)
+        return journal_status(
+          RDMA_SC_INVALID_STATE,
+          "CMQ observed submitted PRE effect contradicts retained identity"
+        );
+    end
+    if (submitted.completion_phase == RDMA_CMQ_COMPLETION_UNOBSERVED &&
+        (submitted.submission_effect != RDMA_SUBMIT_EFFECT_UNOBSERVED ||
+         submitted.attempt_effect != RDMA_SUBMIT_EFFECT_UNOBSERVED ||
+         submitted.completion != null ||
+         submitted.recovery_required != 1'b1))
+      return journal_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ observed submitted UNOBSERVED envelope is malformed"
+      );
+    if (submitted.completion_phase == RDMA_CMQ_COMPLETION_PENDING &&
+        (submitted.completion != null ||
+         !(submitted.submission_effect inside {
+           RDMA_SUBMIT_EFFECT_MMIO_MAYBE_VISIBLE,
+           RDMA_SUBMIT_EFFECT_MMIO_VISIBLE
+         }) || !(submitted.attempt_effect inside {
+           RDMA_SUBMIT_EFFECT_MMIO_MAYBE_VISIBLE,
+           RDMA_SUBMIT_EFFECT_MMIO_VISIBLE
+         })))
+      return journal_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ observed submitted pending envelope is malformed"
+      );
+    if (submitted.completion != null &&
+        (submitted.completion.ticket == null || submitted.completion.status == null ||
+         !rdma_cmq_ticket_shape_valid(submitted.completion.ticket) ||
+         !rdma_cmq_status_shape_valid(submitted.completion.status) ||
+         !same_ticket_detached_value(submitted.completion.ticket,
+                                     submitted.ticket) ||
+         !same_status_value(submitted.completion.status, submitted.status) ||
+         submitted.completion.ticket != submitted.ticket ||
+         submitted.completion.status != submitted.status))
+      return journal_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ observed submitted completion alias is malformed"
+      );
+
     if (!rdma_cmq_identity_shape_valid(batch_record.function_identity) ||
+        !rdma_cmq_status_shape_valid(journal_item.status) ||
+        !rdma_cmq_frozen_owner_shape_valid(journal_item.recovery_owner) ||
         journal_item.ticket.function_h == null ||
         !same_handle_value(journal_item.ticket.function_h,
                            submitted.ticket.function_h) ||
@@ -1213,6 +1293,8 @@ class rdma_cmq_engine extends uvm_object;
           batch_record.function_identity.global_function_id ||
         journal_item.dma_context.function_h.generation !=
           batch_record.function_identity.generation ||
+        journal_item.dma_context.reset_epoch !=
+          batch_record.function_identity.reset_epoch ||
         !same_journal_dma_context_detached_value(
           submitted.dma_context, journal_item.dma_context
         ) ||
@@ -1222,6 +1304,22 @@ class rdma_cmq_engine extends uvm_object;
       return journal_status(
         RDMA_SC_INVALID_STATE,
         "CMQ observed Function or recovery authority mismatch"
+      );
+
+    if (batch_record.cmq_h.kind != RDMA_RESOURCE_CMQ ||
+        batch_record.cmq_h.function_uid !=
+          batch_record.function_identity.function_uid ||
+        batch_record.cmq_h.generation !=
+          batch_record.function_identity.generation ||
+        !same_handle_value(batch_record.cmq_h, submitted.ticket.cmq_h) ||
+        journal_item.dependency_mapping == null ||
+        journal_item.dependency_mapping.function_h == null ||
+        !journal_item.dependency_mapping.epoch_valid ||
+        journal_item.dependency_mapping.reset_epoch !=
+          batch_record.function_identity.reset_epoch)
+      return journal_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ observed CMQ or reset mapping authority mismatch"
       );
 
     expected_command_identity = new("cmq_observed_expected_command_identity");
@@ -1238,27 +1336,6 @@ class rdma_cmq_engine extends uvm_object;
           {"CMQ observed command identity is invalid: ", identity_failure}
       );
 
-    if (submitted.submission_effect != journal_item.submission_effect ||
-        submitted.attempt_effect != journal_item.attempt_effect ||
-        submitted.completion_phase != journal_item.completion_phase ||
-        submitted.recovery_required != journal_item.recovery_required ||
-        !same_status_value(submitted.status, journal_item.status))
-      return journal_status(
-        RDMA_SC_INVALID_STATE,
-        "CMQ observed operation evidence disagrees with retained journal"
-      );
-    if (submitted.completion != null &&
-        (submitted.completion.ticket == null ||
-         submitted.completion.status == null ||
-         !same_ticket_detached_value(submitted.completion.ticket,
-                                     journal_item.ticket) ||
-         !same_status_value(submitted.completion.status, submitted.status) ||
-         submitted.completion.ticket != submitted.ticket ||
-         submitted.completion.status != submitted.status))
-      return journal_status(
-        RDMA_SC_INVALID_STATE,
-        "CMQ observed completion evidence disagrees with operation result"
-      );
     if (journal_item.dependency_mapping == null ||
         journal_item.dependency_mapping.reset_epoch !=
           batch_record.function_identity.reset_epoch)
@@ -11848,13 +11925,20 @@ class rdma_cmq_engine extends uvm_object;
     // 只有完整的零 identity PRE_SUBMIT_REJECTED/NONE envelope 才能直接返回；
     // delegated submit 若缺少 identity 却宣称已提交，必须转换为 UNOBSERVED。
     if (submitted.ticket == null || submitted.batch_key.len() == 0) begin
-      if (submitted.ticket == null && submitted.batch_key.len() == 0 &&
-          submitted.batch_id == 0 && submitted.attempt_id == 0 &&
-          submitted.completion == null &&
+      if (submitted.ticket == null && submitted.completion == null &&
+          submitted.command_identity == null &&
+          submitted.recovery_owner == null && submitted.dma_context == null &&
+          submitted.batch_key.len() == 0 && submitted.batch_id == 0 &&
+          submitted.attempt_id == 0 &&
           submitted.completion_phase == RDMA_CMQ_COMPLETION_NONE &&
           submitted.submission_effect == RDMA_SUBMIT_EFFECT_PRE_SUBMIT_REJECTED &&
           submitted.attempt_effect == RDMA_SUBMIT_EFFECT_PRE_SUBMIT_REJECTED &&
-          submitted.recovery_required == 1'b0)
+          submitted.recovery_required == 1'b0 && submitted.status != null &&
+          submitted.observation_status != null &&
+          rdma_cmq_status_shape_valid(submitted.status) &&
+          rdma_cmq_status_shape_valid(submitted.observation_status) &&
+          submitted.status.code != RDMA_SC_OK &&
+          submitted.observation_status.code == RDMA_SC_OK)
         result = submitted;
       else begin
         result = submitted;
@@ -11902,10 +11986,19 @@ class rdma_cmq_engine extends uvm_object;
           RDMA_CMQ_SUBMISSION_STAGED,
           RDMA_CMQ_SUBMISSION_PENDING_EFFECT
         }) begin
-      result = submitted;
-      result.observation_status = rdma_cmq_direct_status(
-        RDMA_SC_INVALID_STATE, "CMQ observed item has pending external effect"
+      snapshot_status = build_observed_result_locked(
+        batch_record, journal_item, RDMA_SC_INVALID_STATE,
+        "CMQ observed item has pending external effect", result
       );
+      if (snapshot_status == null || !snapshot_status.ok()) begin
+        result = submitted;
+        result.observation_status = rdma_cmq_direct_status(
+          RDMA_SC_INVALID_STATE,
+          (snapshot_status == null) ?
+            "CMQ observed pending item snapshot returned null status" :
+            snapshot_status.message
+        );
+      end
       engine_lock.put(1);
       return;
     end
@@ -11921,7 +12014,19 @@ class rdma_cmq_engine extends uvm_object;
         engine_lock.put(1);
         return;
       end
-      result = submitted;
+      snapshot_status = build_observed_result_locked(
+        batch_record, journal_item, RDMA_SC_OK,
+        "CMQ retained host-visible journal observed", result
+      );
+      if (snapshot_status == null || !snapshot_status.ok()) begin
+        result = submitted;
+        result.observation_status = rdma_cmq_direct_status(
+          RDMA_SC_INVALID_STATE,
+          (snapshot_status == null) ?
+            "CMQ retained host-visible snapshot returned null status" :
+            snapshot_status.message
+        );
+      end
       engine_lock.put(1);
       return;
     end
@@ -11993,10 +12098,20 @@ class rdma_cmq_engine extends uvm_object;
       end
     end
     else begin
-      result = submitted;
-      result.observation_status = rdma_cmq_direct_status(
-        RDMA_SC_INVALID_STATE, "CMQ observed wait produced no retained completion"
-      );
+      snapshot_status = (journal_item == null) ? null :
+        build_observed_result_locked(
+          batch_record, journal_item, RDMA_SC_INVALID_STATE,
+          "CMQ observed wait produced no retained completion", result
+        );
+      if (snapshot_status == null || !snapshot_status.ok()) begin
+        result = submitted;
+        result.observation_status = rdma_cmq_direct_status(
+          RDMA_SC_INVALID_STATE,
+          (snapshot_status == null) ?
+            "CMQ observed wait produced no retained snapshot" :
+            snapshot_status.message
+        );
+      end
     end
     engine_lock.put(1);
   endtask

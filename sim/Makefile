@@ -20,7 +20,7 @@ ENGINE_PROCESS_LIST := rdma_cmq_engine_process.list
 CORE_LOGICAL_RUNNER := ../scripts/run_core_logical_test.sh
 
 # 功能：把一个 logical core test 转交给唯一 controller；普通 test 自映射，
-#   engine 按十四片展开。
+#   engine 按十五片展开，profile snapshot/recheck fixture 独占一片。
 # 输入输出及副作用：参数 1 是 logical UVM test，参数 2 是含 simv 的 build
 #   目录；写每片独立 log 并打印聚合状态。
 # 失败边界：controller 对参数、manifest、simulator 或 summary 任一失败返回

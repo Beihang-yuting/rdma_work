@@ -4370,6 +4370,31 @@ class rdma_cmq_engine_probe extends rdma_cmq_engine;
     return submission_journal[batch_key];
   endfunction
 
+  // 功能：在 engine_lock 临界区调用 production observed-item 校验，验证
+  //   detached result 的身份与 retained journal authority 分离后仍能完成定位。
+  // 输入/输出及副作用：submitted 为调用方构造的 observed 快照，record/item 为
+  //   engine-owned journal 非拥有引用；函数只读取校验结果，不修改任一 authority。
+  // 失败/边界：任一输入为空或锁获取异常时返回 INVALID_STATE；wrapper 不绕过
+  //   production identity、DMA、owner、epoch 和 lifecycle 组合检查。
+  task validate_observed_item_probe(
+    rdma_cmq_execution_result submitted,
+    rdma_cmq_batch_submission_record record,
+    rdma_cmq_batch_submission_item_record item,
+    output rdma_status status
+  );
+    status = null;
+    if (submitted == null || record == null || item == null) begin
+      status = rdma_cmq_direct_status(
+        RDMA_SC_INVALID_ARGUMENT,
+        "observed item probe inputs are incomplete"
+      );
+      return;
+    end
+    engine_lock.get(1);
+    status = validate_observed_item_locked(submitted, record, item);
+    engine_lock.put(1);
+  endtask
+
   // 功能：按 kind 向且仅向一张 journal retained 表播种 orphan 行，复现部分提交损坏。
   // 输入/输出及副作用：batch_key 选择目标；record/preallocated/profile_service/ticket
   //   仅由对应 kind 消费；成功写入一行且不触碰其他三张表或 counter。
@@ -23724,6 +23749,110 @@ class rdma_cmq_engine_test extends uvm_test;
         result.attempt_id != 0)
       `uvm_error("EXECUTE_OBSERVED_NULL_ENVELOPE",
                  "null submit envelope was not classified as UNOBSERVED")
+
+    exercise_observed_journal_authority_race();
+  endtask
+
+  // 功能：在同一 batch 的 pending journal 行上模拟一个先前捕获的 detached
+  //   observed snapshot，验证 execute-side identity gate 不把旧 lifecycle/status
+  //   当成当前 retained authority 的硬等值条件。
+  // 输入/输出及副作用：自建 ACTIVE engine、真实 scheduler 和单项 observed batch；
+  //   只改变 caller-owned result 快照，再调用 probe 暴露的 production validator。
+  // 失败/边界：若 result 与 journal 不分离、journal identity/epoch 校验失效，或
+  //   validator 继续要求 lifecycle/status/effect exact equality，则报告 UVM_ERROR；
+  //   fixture 返回前总是 shutdown engine，不留下外部 backing。
+  task automatic exercise_observed_journal_authority_race();
+    rdma_cmq_engine_probe engine;
+    rdma_mock_host_mem mem;
+    rdma_cmq_test_pcie pcie;
+    rdma_doorbell_scheduler scheduler;
+    rdma_cmq_test_profile profile;
+    rdma_function_binding prepared_binding;
+    rdma_function_binding active_binding;
+    rdma_cmq cmq;
+    rdma_cmq_runtime_desc runtime_desc;
+    rdma_cmq_command_desc commands[];
+    rdma_cmq_execution_result results[];
+    rdma_cmq_batch_submission_record record;
+    rdma_status batch_status;
+    rdma_status status;
+    rdma_status_code_e retained_status_code;
+    rdma_submission_effect_e retained_effect;
+    rdma_cmq_completion_phase_e retained_phase;
+
+    engine = rdma_cmq_engine_probe::type_id::create(
+      "observed_authority_race_engine"
+    );
+    mem = rdma_mock_host_mem::type_id::create(
+      "observed_authority_race_mem"
+    );
+    pcie = rdma_cmq_test_pcie::type_id::create(
+      "observed_authority_race_pcie"
+    );
+    scheduler = rdma_doorbell_scheduler::type_id::create(
+      "observed_authority_race_scheduler"
+    );
+    profile = rdma_cmq_test_profile::type_id::create(
+      "observed_authority_race_profile"
+    );
+    prepared_binding = make_binding(
+      "observed_authority_race_prepared", RDMA_BIND_PREPARED
+    );
+    active_binding = make_binding(
+      "observed_authority_race_active", RDMA_BIND_ACTIVE
+    );
+    cmq = make_cmq("observed_authority_race_cmq", prepared_binding);
+    prepare_active(
+      "OBSERVED_AUTHORITY_RACE", engine, mem, pcie, scheduler, profile,
+      prepared_binding, active_binding, cmq, runtime_desc
+    );
+
+    commands = new[1];
+    commands[0] = make_command(
+      "observed_authority_race_command", active_binding,
+      rdma_cmq_test_profile::TEST_OPCODE_A, 8'hd1, 1us
+    );
+    engine.submit_batch_observed(commands, results, batch_status);
+    expect_status("OBSERVED_AUTHORITY_RACE_SUBMIT", batch_status,
+                  RDMA_SC_OK);
+    if (results.size() != 1 || results[0] == null ||
+        results[0].batch_key.len() == 0) begin
+      `uvm_error("OBSERVED_AUTHORITY_RACE_FIXTURE",
+                 "pending observed result did not retain batch identity")
+      engine.shutdown(status);
+      return;
+    end
+
+    record = engine.journal_record_fault_reference(results[0].batch_key);
+    if (record == null || record.items.size() != 1 || record.items[0] == null) begin
+      `uvm_error("OBSERVED_AUTHORITY_RACE_JOURNAL",
+                 "pending observed journal authority is unavailable")
+      engine.shutdown(status);
+      return;
+    end
+
+    retained_status_code = record.items[0].status.code;
+    retained_effect = record.items[0].submission_effect;
+    retained_phase = record.items[0].completion_phase;
+    results[0].status.code = RDMA_SC_TIMEOUT;
+    results[0].status.message = "stale detached operation status";
+    results[0].submission_effect = RDMA_SUBMIT_EFFECT_HOST_MEMORY_ORDERED;
+    results[0].attempt_effect = RDMA_SUBMIT_EFFECT_HOST_MEMORY_ORDERED;
+    results[0].completion_phase = RDMA_CMQ_COMPLETION_NONE;
+    results[0].recovery_required = 1'b1;
+
+    if (record.items[0].status.code != retained_status_code ||
+        record.items[0].submission_effect != retained_effect ||
+        record.items[0].completion_phase != retained_phase)
+      `uvm_error("OBSERVED_AUTHORITY_RACE_ALIAS",
+                 "caller mutation leaked into retained journal authority")
+
+    engine.validate_observed_item_probe(
+      results[0], record, record.items[0], status
+    );
+    expect_status("OBSERVED_AUTHORITY_RACE_VALIDATE", status, RDMA_SC_OK);
+    engine.shutdown(status);
+    expect_status("OBSERVED_AUTHORITY_RACE_SHUTDOWN", status, RDMA_SC_OK);
   endtask
 
   // 功能：运行 engine test 的基础 transport/journal fixture 集合并维持 UVM objection。
