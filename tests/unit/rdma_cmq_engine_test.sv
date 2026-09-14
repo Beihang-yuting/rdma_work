@@ -4640,6 +4640,15 @@ class rdma_cmq_engine_probe extends rdma_cmq_engine;
     return diagnostic_fifo.size();
   endfunction
 
+  // 功能：late_final_count 读取 late-final completion 投递队列的当前长度，供
+  //   reset failure/null 原子性断言覆盖诊断与晚到 completion 两条 FIFO。
+  // 输入/输出及副作用：无输入；只读 late_final_fifo.size() 并返回计数，不消费
+  //   retained completion 或改变 journal。
+  // 失败/边界：队列为空返回零；该窄测试 seam 不把 FIFO 条目提升为 recovery authority。
+  function int unsigned late_final_count();
+    return late_final_fifo.size();
+  endfunction
+
   // 功能：在 rdma_cmq_engine_probe 中，slot_state_at 只读查询当前运行时/测试账本，返回槽位、对象或恢复记录的快照而不推进事务。
   // 输入/输出及副作用：sq_index（输入）；slot_state_at 读取 sq_index 并使用字段 slots、state；函数返回 rdma_cmq_slot_state_e，不取得调用方资源所有权。
   // 失败/边界：slot_state_at 先检查 sq_index >= 32 || slots[sq_index] == null，再返回 CMQ_SLOT_FREE；slots[sq_index].state；拒绝分支不提交部分状态，也不隐式重试。
@@ -5182,6 +5191,33 @@ class rdma_cmq_engine_probe extends rdma_cmq_engine;
     rdma_cmq_engine_state_e forced_state
   );
     engine_state = forced_state;
+  endfunction
+
+  // 功能：在 opaque backing release 已成功的重入窗口故意改变 runtime cursor，
+  //   模拟外部 lifecycle 代码绕过正常 gate 造成的 post-release drift。
+  // 输入/输出及副作用：无输入；仅递增受保护 publish_seq，供 reset CAS 回归
+  //   观察；不触碰 Host-memory allocation 或 retained journal。
+  // 失败/边界：仅测试 probe 可调用；未安装 runtime 时仍会改变 cursor，生产代码
+  //   不应把该 seam 当作恢复 authority。
+  function void inject_reset_release_drift();
+    publish_seq++;
+  endfunction
+
+  // 功能：返回 reset 释放 gate 的当前值，验证外部 release 窗口是否序列化了
+  //   lifecycle 入口。
+  // 输入/输出及副作用：无输入；只读 reset_release_in_progress 并返回 bit。
+  // 失败/边界：probe 构造或 reset 尚未进入 release 窗口时返回 0，不改变状态。
+  function bit reset_release_gate_active_probe();
+    return reset_release_in_progress;
+  endfunction
+
+  // 功能：判断 engine 是否仍暴露 backing/Host-memory runtime authority，供
+  //   release 成功后 drift 回归确认不会留下悬空句柄。
+  // 输入/输出及副作用：无输入；只读 backing_mapping/host_mem 并返回 bit。
+  // 失败/边界：任一 authority 为空返回 0；不依据 mapping 的 public state 猜测
+  //   外部 allocation 是否仍 active。
+  function bit runtime_backing_authority_present_probe();
+    return backing_mapping != null && host_mem != null;
   endfunction
 
   // 功能：逐字段比较 journal binding 与实际 transport binding 的完整 dpu_common 投影。
@@ -5744,6 +5780,44 @@ class rdma_cmq_engine_probe extends rdma_cmq_engine;
     );
     submission_journal[batch_key].items[0].status.code = saved_code;
     return !corrupted_graph_accepted;
+  endfunction
+endclass
+
+// 设计说明：该 Host-memory 替身在 opaque release 已经退休 allocation 后直接
+//   改写 probe cursor，构造 release 成功与 runtime drift 同时发生的 adversarial
+//   重入窗口；它不伪造 release 失败，也不接管 engine 的生命周期所有权。
+class rdma_cmq_reentrant_release_mem extends rdma_mock_host_mem;
+  `uvm_object_utils(rdma_cmq_reentrant_release_mem)
+
+  rdma_cmq_engine_probe mutation_engine;
+  bit mutate_after_success;
+
+  // 功能：构造默认不重入的 release fixture，初始化 mutation_engine 为空并关闭
+  //   一次性 post-release drift 注入。
+  // 输入/输出及副作用：name 传给父类；只初始化本地测试字段，不申请 backing。
+  // 失败/边界：未设置 mutation_engine 时 release 仍完全委托父类，不产生额外副作用。
+  function new(string name = "rdma_cmq_reentrant_release_mem");
+    super.new(name);
+    mutation_engine = null;
+    mutate_after_success = 1'b0;
+  endfunction
+
+  // 功能：先按 mock opaque token 完成真实 release，再在成功返回前注入一次
+  //   engine runtime cursor drift，模拟 reentrant lifecycle mutation。
+  // 输入/输出及副作用：mapping 为待释放 opaque authority；返回父类 release status，
+  //   成功时更新 mock region 后调用 probe seam 一次。
+  // 失败/边界：父类返回 null/non-OK 或开关关闭时不注入 drift；注入只改变测试
+  //   cursor，不能使 release 重新执行或改变 allocation seal 结果。
+  virtual function rdma_status release_opaque(rdma_dma_mapping mapping);
+    rdma_status status;
+
+    status = super.release_opaque(mapping);
+    if (status != null && status.ok() && mutate_after_success &&
+        mutation_engine != null) begin
+      mutate_after_success = 1'b0;
+      mutation_engine.inject_reset_release_drift();
+    end
+    return status;
   endfunction
 endclass
 
@@ -21414,6 +21488,188 @@ class rdma_cmq_engine_test extends uvm_test;
     expect_status("POISON_RESET_NEXT_SHUTDOWN", status, RDMA_SC_OK);
   endtask
 
+  // 功能：验证 opaque release 成功后即使 hostile/reentrant code 改写 runtime
+  //   cursor，reset 也不会把已释放 backing 继续作为 engine authority 暴露。
+  // 输入/输出及副作用：无显式输入；构造带 post-release drift 注入的 Host-memory
+  //   fixture，执行一次 observed reset，并检查 poison/authority/释放计数结果。
+  // 失败/边界：release 成功而 CAS 发现 drift 时允许返回 INVALID_STATE，但必须
+  //   清除 backing/Host-memory runtime 引用、保留可诊断的 POISONED 状态且不得二次
+  //   release；任何 wait/reset 后续调用都不能重新访问旧 backing。
+  task automatic check_reset_release_reentrant_drift_is_safe();
+    rdma_cmq_engine_probe engine;
+    rdma_cmq_reentrant_release_mem mem;
+    rdma_cmq_test_pcie pcie;
+    rdma_doorbell_scheduler scheduler;
+    rdma_cmq_test_profile profile;
+    rdma_function_binding prepared_binding;
+    rdma_function_binding active_binding;
+    rdma_cmq cmq;
+    rdma_cmq_runtime_desc runtime_desc;
+    rdma_cmq_command_desc requests[];
+    rdma_cmq_ticket tickets[];
+    rdma_status item_statuses[];
+    rdma_status batch_status;
+    rdma_cmq_completion completions[$];
+    rdma_cmq_reset_isolation_proof proofs[];
+    rdma_cmq_completion completion;
+    rdma_status status;
+
+    engine = rdma_cmq_engine_probe::type_id::create(
+      "reset_reentrant_drift_engine"
+    );
+    mem = rdma_cmq_reentrant_release_mem::type_id::create(
+      "reset_reentrant_drift_mem"
+    );
+    pcie = rdma_cmq_test_pcie::type_id::create("reset_reentrant_drift_pcie");
+    scheduler = rdma_doorbell_scheduler::type_id::create(
+      "reset_reentrant_drift_scheduler"
+    );
+    profile = rdma_cmq_test_profile::type_id::create(
+      "reset_reentrant_drift_profile"
+    );
+    prepared_binding = make_binding(
+      "reset_reentrant_drift_prepared", RDMA_BIND_PREPARED
+    );
+    active_binding = make_binding(
+      "reset_reentrant_drift_active", RDMA_BIND_ACTIVE
+    );
+    cmq = make_cmq("reset_reentrant_drift_cmq", prepared_binding);
+    prepare_active(
+      "RESET_REENTRANT_DRIFT", engine, mem, pcie, scheduler, profile,
+      prepared_binding, active_binding, cmq, runtime_desc
+    );
+    requests = new[1];
+    requests[0] = make_command(
+      "reset_reentrant_drift_request", active_binding,
+      rdma_cmq_test_profile::TEST_OPCODE_A, 8'h71, 100ns
+    );
+    engine.submit_batch(requests, tickets, item_statuses, batch_status);
+    expect_status("RESET_REENTRANT_DRIFT_SUBMIT", batch_status, RDMA_SC_OK);
+    if (tickets.size() != 1 || tickets[0] == null)
+      `uvm_error("RESET_REENTRANT_DRIFT_FIXTURE",
+                 "reentrant reset ticket fixture is incomplete")
+    mem.mutation_engine = engine;
+    mem.mutate_after_success = 1'b1;
+    engine.reset_observed(completions, proofs, status);
+    expect_status("RESET_REENTRANT_DRIFT_RESET", status,
+                  RDMA_SC_INVALID_STATE);
+    if (completions.size() != 0 || proofs.size() != 0 ||
+        mem.regions.size() != 1 || mem.regions[0].mapping == null ||
+        mem.regions[0].mapping.state != RDMA_MAPPING_RELEASED ||
+        count_host_calls(mem, "release_opaque") != 1 ||
+        engine.state() != RDMA_CMQ_ENGINE_POISONED ||
+        engine.runtime_backing_authority_present_probe() ||
+        engine.mapping_snapshot() != null || engine.slot_record_count() != 0 ||
+        engine.tokens_in_use_count() != 0 || engine.command_registry_count() != 0 ||
+        engine.entry_registry_count() != 0)
+      `uvm_error("RESET_REENTRANT_DRIFT_AUTHORITY",
+                 "successful release drift left dangling runtime authority")
+
+    completion = null;
+    engine.wait_for(tickets[0], completion, status);
+    expect_status("RESET_REENTRANT_DRIFT_WAIT", status, RDMA_SC_INVALID_STATE);
+    if (completion != null || count_host_calls(mem, "read") != 0 ||
+        count_host_calls(mem, "release_opaque") != 1)
+      `uvm_error("RESET_REENTRANT_DRIFT_WAIT_IO",
+                 "poisoned drift path accessed or retried released backing")
+    engine.reset_observed(completions, proofs, status);
+    expect_status("RESET_REENTRANT_DRIFT_RETRY", status,
+                  RDMA_SC_INVALID_STATE);
+    if (count_host_calls(mem, "release_opaque") != 1 ||
+        engine.runtime_backing_authority_present_probe())
+      `uvm_error("RESET_REENTRANT_DRIFT_RETRY_RELEASE",
+                 "drift poison path attempted a second release")
+  endtask
+
+  // 功能：验证已存在 TIMEOUT tombstone 的 item 可在 observed reset 中取得独立
+  //   RESET_CANCELLED evidence，而不会重复执行 slot/token cancellation side effect。
+  // 输入/输出及副作用：无显式输入；构造短 deadline batch，先 expire 形成 timeout，
+  //   再 reset 并查询 retained journal 的最终 reset phase。
+  // 失败/边界：timeout completion 必须先交付为 detached 输出、reset 必须成功释放
+  //   backing 并只产生一次 reset release；任何把 timeout completion 当作缺失 authority
+  //   而拒绝 staging 的实现都报告错误。
+  task automatic check_reset_timeout_tombstone_isolated();
+    rdma_cmq_engine_probe engine;
+    rdma_mock_host_mem mem;
+    rdma_cmq_test_pcie pcie;
+    rdma_doorbell_scheduler scheduler;
+    rdma_cmq_test_profile profile;
+    rdma_function_binding prepared_binding;
+    rdma_function_binding active_binding;
+    rdma_cmq cmq;
+    rdma_cmq_runtime_desc runtime_desc;
+    rdma_cmq_command_desc requests[];
+    rdma_cmq_ticket tickets[];
+    rdma_status item_statuses[];
+    rdma_status batch_status;
+    rdma_cmq_completion completions[$];
+    rdma_cmq_diagnostic diagnostics[$];
+    rdma_cmq_reset_isolation_proof proofs[];
+    rdma_cmq_batch_submission_record retained;
+    rdma_status status;
+
+    engine = rdma_cmq_engine_probe::type_id::create(
+      "reset_timeout_tombstone_engine"
+    );
+    mem = rdma_mock_host_mem::type_id::create("reset_timeout_tombstone_mem");
+    pcie = rdma_cmq_test_pcie::type_id::create("reset_timeout_tombstone_pcie");
+    scheduler = rdma_doorbell_scheduler::type_id::create(
+      "reset_timeout_tombstone_scheduler"
+    );
+    profile = rdma_cmq_test_profile::type_id::create(
+      "reset_timeout_tombstone_profile"
+    );
+    prepared_binding = make_binding(
+      "reset_timeout_tombstone_prepared", RDMA_BIND_PREPARED
+    );
+    active_binding = make_binding(
+      "reset_timeout_tombstone_active", RDMA_BIND_ACTIVE
+    );
+    cmq = make_cmq("reset_timeout_tombstone_cmq", prepared_binding);
+    prepare_active(
+      "RESET_TIMEOUT_TOMBSTONE", engine, mem, pcie, scheduler, profile,
+      prepared_binding, active_binding, cmq, runtime_desc
+    );
+    requests = new[1];
+    requests[0] = make_command(
+      "reset_timeout_tombstone_request", active_binding,
+      rdma_cmq_test_profile::TEST_OPCODE_A, 8'h72, 10ns
+    );
+    engine.submit_batch(requests, tickets, item_statuses, batch_status);
+    expect_status("RESET_TIMEOUT_TOMBSTONE_SUBMIT", batch_status, RDMA_SC_OK);
+    #20ns;
+    engine.expire(completions, status);
+    expect_status("RESET_TIMEOUT_TOMBSTONE_EXPIRE", status, RDMA_SC_OK);
+    if (completions.size() != 1 || completions[0] == null ||
+        completions[0].status == null ||
+        completions[0].status.code != RDMA_SC_TIMEOUT ||
+        engine.slot_state_at(tickets[0].sq_index) !=
+          CMQ_SLOT_TIMED_OUT_QUARANTINED)
+      `uvm_error("RESET_TIMEOUT_TOMBSTONE_SETUP",
+                 "timeout tombstone fixture was not established")
+    engine.reset_observed(completions, proofs, status);
+    expect_status("RESET_TIMEOUT_TOMBSTONE_RESET", status, RDMA_SC_OK);
+    if (proofs.size() != 1 || count_host_calls(mem, "release_opaque") != 1 ||
+        mem.regions.size() != 1 || mem.regions[0].mapping.state !=
+          RDMA_MAPPING_RELEASED || completions.size() != 1 ||
+        completions[0] == null || completions[0].status == null ||
+        completions[0].status.code != RDMA_SC_RESET_CANCELLED)
+      `uvm_error("RESET_TIMEOUT_TOMBSTONE_RESET",
+                 "reset did not publish an independent cancellation evidence")
+    engine.query_submission_journal_by_ticket(
+      tickets[0], retained, status
+    );
+    expect_status("RESET_TIMEOUT_TOMBSTONE_QUERY", status, RDMA_SC_OK);
+    if (retained == null || retained.items.size() != 1 ||
+        retained.items[0] == null || retained.items[0].completion == null ||
+        retained.items[0].completion.status == null ||
+        retained.items[0].state != RDMA_CMQ_SUBMISSION_RESET_QUARANTINED ||
+        retained.items[0].completion_phase != RDMA_CMQ_COMPLETION_RESET_CANCELLED ||
+        retained.items[0].completion.status.code != RDMA_SC_RESET_CANCELLED)
+      `uvm_error("RESET_TIMEOUT_TOMBSTONE_RETAINED",
+                 "reset tombstone did not replace timeout with reset evidence")
+  endtask
+
   // 功能：验证 canonical batch key 覆盖完整 Function identity、engine instance
   //   与单调 counters，并验证四个 64-bit overflow 都不回绕。
   // 输入/输出及副作用：无参数；构造独立 engine/binding/mock，执行 prepare/reset/
@@ -23515,6 +23771,8 @@ class rdma_cmq_engine_poison_reset_process_test extends rdma_cmq_engine_test;
     check_poison_recovery_rejects_x_tickets();
     check_poisoned_ledger_reset_recovery();
     check_reset_fifo_retry_and_reprepare();
+    check_reset_release_reentrant_drift_is_safe();
+    check_reset_timeout_tombstone_isolated();
     phase.drop_objection(this);
   endtask
 endclass

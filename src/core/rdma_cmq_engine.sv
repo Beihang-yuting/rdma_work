@@ -475,6 +475,10 @@ class rdma_cmq_engine extends uvm_object;
   // retried through the adapter's opaque allocation identity.  This bit is
   // retained only while the engine is POISONED with unreleased backing.
   protected bit backing_release_opaque;
+  // reset_observed owns an external release window; while set, every public
+  // lifecycle mutator must fail closed so no runtime graph can drift between
+  // candidate staging and allocation-free commit.
+  protected bit reset_release_in_progress;
   // The fixed CMQ profile API has no separate raw-CQE metadata hook.  A
   // profile therefore owns one endian/hardware-version format across its
   // SQE and CQE images.  Only a scheduler-successful batch may establish
@@ -544,6 +548,7 @@ class rdma_cmq_engine extends uvm_object;
     submission_fence_reason = "";
     last_poison = null;
     backing_release_opaque = 1'b0;
+    reset_release_in_progress = 1'b0;
     foreach (slots[i]) begin
       slots[i] = null;
       token_in_use[i] = 1'b0;
@@ -563,6 +568,22 @@ class rdma_cmq_engine extends uvm_object;
   // 失败/边界：invalid_state 返回 RDMA_SC_INVALID_STATE；失败路径不提交部分状态或转移未声明资源。
   protected function rdma_status invalid_state(string message);
     return rdma_status::make(RDMA_SC_INVALID_STATE, message);
+  endfunction
+
+  // 功能：在 reset_observed 已把 backing release 交给外部 adapter 的窗口内，
+  //   为所有会读写 runtime graph 的公开生命周期入口提供统一的 fail-closed
+  //   检查，避免 release 与后续状态提交之间出现可观察重入。
+  // 输入/输出及副作用：无外部输入；只读 reset_release_in_progress，返回独立
+  //   成功或 INVALID_STATE 状态，不修改 engine、journal、FIFO 或 adapter。
+  // 失败/边界：gate 为 1 时返回 INVALID_STATE，调用方必须在已取得
+  //   engine_lock 后立即退出；gate 为 0 时返回 OK。该 helper 不负责取锁，
+  //   也不能替代 reset_observed 对 release 结果的 CAS 重验。
+  protected function rdma_status reset_release_gate_status();
+    if (reset_release_in_progress)
+      return invalid_state(
+        "CMQ lifecycle mutation is blocked during reset backing release"
+      );
+    return rdma_status::success();
   endfunction
 
   // 功能：poison_status 校验 message 与当前对象状态的一致性，返回 rdma_status 供上层决定是否提交。
@@ -7741,6 +7762,11 @@ class rdma_cmq_engine extends uvm_object;
     capability_key = "";
     batch_key = "";
     valid = observer != null;
+    if (reset_release_in_progress) begin
+      `uvm_error("RDMA_CMQ_MMIO_ARM_INVALID",
+                 "CMQ MMIO arm is blocked during reset backing release")
+      return;
+    end
     if (valid) begin
       valid = observer.is_configured() && observer.owner_handle() == this;
       if (valid) begin
@@ -7864,6 +7890,12 @@ class rdma_cmq_engine extends uvm_object;
       end
     end
 
+    // The arm entry deliberately does not take engine_lock because it is called
+    // from scheduler/MMIO context.  Recheck the release gate immediately before
+    // the allocation-free publication commit so a concurrent reset cannot expose
+    // a slot after backing ownership has moved to the adapter.
+    if (reset_release_in_progress)
+      valid = 1'b0;
     if (!valid) begin
       `uvm_error("RDMA_CMQ_MMIO_ARM_INVALID",
                  "CMQ MMIO arm capability is invalid")
@@ -8205,10 +8237,25 @@ class rdma_cmq_engine extends uvm_object;
     late_final_fifo.delete();
     last_poison = null;
     backing_release_opaque = 1'b0;
+    reset_release_in_progress = 1'b0;
     foreach (slots[i]) begin
       slots[i] = null;
       token_in_use[i] = 1'b0;
     end
+  endfunction
+
+  // 功能：在 opaque backing 已经成功释放但 reset candidate 的 runtime CAS
+  //   失败时，把所有可能指向已释放 allocation 的本地引用原子清空，并把
+  //   engine 留在仅可诊断的 POISONED 状态。
+  // 输入/输出及副作用：无输入/返回值；调用 clear_configuration() 清理 runtime
+  //   graph、FIFO、slot/token 与协作者引用，再写入 POISONED 状态；不分配对象、
+  //   不调用 adapter/scheduler，也不触碰 retained journal authority。
+  // 失败/边界：仅允许在 release 已返回成功且 gate 仍由当前 reset 持有时调用；
+  //   helper 不尝试第二次 release 或制造 reset proof，重复调用保持无外部 I/O。
+  protected function void poison_released_runtime_drift_locked();
+    clear_configuration();
+    engine_state = RDMA_CMQ_ENGINE_POISONED;
+    reset_release_in_progress = 1'b0;
   endfunction
 
   // 功能：执行 retain_release_authority 指定的测试或恢复状态变更，更新受控账本并保留可回滚的故障证据。
@@ -8313,6 +8360,11 @@ class rdma_cmq_engine extends uvm_object;
     runtime_desc = null;
     status = invalid_state("CMQ prepare did not complete");
     engine_lock.get(1);
+    status = reset_release_gate_status();
+    if (!status.ok()) begin
+      engine_lock.put(1);
+      return;
+    end
     if (engine_state != RDMA_CMQ_ENGINE_UNCONFIGURED) begin
       status = invalid_state("CMQ engine is already configured");
       engine_lock.put(1);
@@ -8547,6 +8599,11 @@ class rdma_cmq_engine extends uvm_object;
 
     status = invalid_state("CMQ activate did not complete");
     engine_lock.get(1);
+    status = reset_release_gate_status();
+    if (!status.ok()) begin
+      engine_lock.put(1);
+      return;
+    end
     if (engine_state != RDMA_CMQ_ENGINE_PREPARED) begin
       status = invalid_state("CMQ engine is not PREPARED");
       engine_lock.put(1);
@@ -9169,6 +9226,18 @@ class rdma_cmq_engine extends uvm_object;
     dependencies.delete();
 
     engine_lock.get(1);
+    status = reset_release_gate_status();
+    if (!status.ok()) begin
+      batch_status = copy_submit_status_direct(
+        status, "cmq_reset_release_gate_batch_status"
+      );
+      foreach (results[i])
+        results[i].status = copy_submit_status_direct(
+          status, $sformatf("cmq_reset_release_gate_item_%0d", i)
+        );
+      engine_lock.put(1);
+      return;
+    end
     if (engine_state != RDMA_CMQ_ENGINE_ACTIVE) begin
       batch_status = rdma_cmq_direct_status(
         RDMA_SC_INVALID_STATE, "CMQ submit requires an ACTIVE engine"
@@ -10388,6 +10457,11 @@ class rdma_cmq_engine extends uvm_object;
     );
 
     engine_lock.get(1);
+    status = reset_release_gate_status();
+    if (!status.ok()) begin
+      engine_lock.put(1);
+      return;
+    end
     if (request == null ||
         request.get_object_type() !=
           rdma_cmq_submission_recovery_request::get_type() ||
@@ -11462,6 +11536,11 @@ class rdma_cmq_engine extends uvm_object;
     completions.delete();
     status = invalid_state("CMQ expire did not complete");
     engine_lock.get(1);
+    status = reset_release_gate_status();
+    if (!status.ok()) begin
+      engine_lock.put(1);
+      return;
+    end
     if (engine_state != RDMA_CMQ_ENGINE_ACTIVE) begin
       status = invalid_state("CMQ expire requires an ACTIVE engine");
       engine_lock.put(1);
@@ -11827,6 +11906,11 @@ class rdma_cmq_engine extends uvm_object;
     diagnostics.delete();
     status = invalid_state("CMQ poll did not complete");
     engine_lock.get(1);
+    status = reset_release_gate_status();
+    if (!status.ok()) begin
+      engine_lock.put(1);
+      return;
+    end
     if (engine_state != RDMA_CMQ_ENGINE_ACTIVE) begin
       status = invalid_state("CMQ poll requires an ACTIVE engine");
       while (diagnostic_fifo.size() != 0)
@@ -11882,6 +11966,11 @@ class rdma_cmq_engine extends uvm_object;
     completion = null;
     status = invalid_state("CMQ wait did not complete");
     engine_lock.get(1);
+    status = reset_release_gate_status();
+    if (!status.ok()) begin
+      engine_lock.put(1);
+      return;
+    end
     if (ticket == null) begin
       status = invalid_argument("CMQ wait ticket is null");
       engine_lock.put(1);
@@ -12197,6 +12286,11 @@ class rdma_cmq_engine extends uvm_object;
       engine_lock.put(1);
       #(wait_time);
       engine_lock.get(1);
+      status = reset_release_gate_status();
+      if (!status.ok()) begin
+        engine_lock.put(1);
+        return;
+      end
       if (journal_located) begin
         validation_status = locate_journal_item_by_ticket_locked(
           ticket_snapshot, current_batch, current_item, current_item_index
@@ -12256,6 +12350,11 @@ class rdma_cmq_engine extends uvm_object;
     completion = null;
     status = invalid_state("CMQ ticket reconcile did not complete");
     engine_lock.get(1);
+    status = reset_release_gate_status();
+    if (!status.ok()) begin
+      engine_lock.put(1);
+      return;
+    end
     if (ticket == null) begin
       status = invalid_argument("CMQ reconcile ticket is null");
       engine_lock.put(1);
@@ -12495,6 +12594,11 @@ class rdma_cmq_engine extends uvm_object;
     completions.delete();
     status = invalid_state("CMQ generation cancel did not complete");
     engine_lock.get(1);
+    status = reset_release_gate_status();
+    if (!status.ok()) begin
+      engine_lock.put(1);
+      return;
+    end
     if (!(engine_state inside {
           RDMA_CMQ_ENGINE_PREPARED,
           RDMA_CMQ_ENGINE_ACTIVE,
@@ -12932,16 +13036,6 @@ class rdma_cmq_engine extends uvm_object;
         return (status == null) ? invalid_state(
           "CMQ reset proof digest computation returned null"
         ) : status;
-      status = rdma_cmq_compute_reset_proof_digest(
-        proof.proof_key, proof.proof_id, proof.batch_key, proof.batch_id,
-        proof.attempt_id, proof.engine_instance_id, proof.engine_incarnation,
-        proof.isolated_identity, proof.batch_digest,
-        proof.isolated_request_indices, proof.isolated_image_digests,
-        proof.isolated_authority_digests, proof.isolated_recovery_owners,
-        proof.proof_digest
-      );
-      if (status == null || !status.ok())
-        return invalid_state("CMQ reset proof digest revalidation failed");
       status = snapshot_reset_proof_locked(proof, proof_snapshot);
       if (status == null || !status.ok() || proof_snapshot == null)
         return (status == null) ? invalid_state(
@@ -12988,6 +13082,7 @@ class rdma_cmq_engine extends uvm_object;
         rdma_cmq_nonfatal_snapshot_context context;
         rdma_cmq_reset_item_candidate item_candidate;
         bit needs_reset;
+        bit timeout_tombstone;
 
         item = row.items[i];
         needs_reset = reset_item_requires_quarantine(item.state) &&
@@ -13000,14 +13095,26 @@ class rdma_cmq_engine extends uvm_object;
         // item in the proof tuple, but must not mint or return a duplicate.
         if (item.state == RDMA_CMQ_SUBMISSION_RESET_QUARANTINED)
           continue;
-        if (item.completion != null || item.ticket == null ||
-            item.command_token >= CMQ_DEPTH || item.entry_key.len() == 0)
+        timeout_tombstone =
+          item.state == RDMA_CMQ_SUBMISSION_TIMED_OUT_QUARANTINED;
+        if (item.ticket == null || item.command_token >= CMQ_DEPTH ||
+            item.entry_key.len() == 0 ||
+            (timeout_tombstone &&
+             (item.completion == null ||
+              item.completion_phase != RDMA_CMQ_COMPLETION_TIMEOUT ||
+              item.completion.ticket != item.ticket ||
+              item.completion.status != item.status)) ||
+            (!timeout_tombstone && item.completion != null))
           return invalid_state("CMQ reset item cancellation authority is incomplete");
         slot_candidate = new($sformatf("cmq_reset_slot_%0d_%0d", b, i));
         slot_candidate.slot_sequence = item.slot_sequence;
         slot_candidate.sq_index = item.slot_index;
         slot_candidate.sq_wrap = item.slot_wrap;
-        slot_candidate.state = CMQ_SLOT_PUBLISHED;
+        // A timeout tombstone already owns the quarantined slot/token.  The
+        // candidate only borrows that identity to construct a new reset
+        // completion; it does not replay cancellation side effects.
+        slot_candidate.state = timeout_tombstone ?
+          CMQ_SLOT_TIMED_OUT_QUARANTINED : CMQ_SLOT_PUBLISHED;
         slot_candidate.ticket = item.ticket;
         slot_candidate.command_token = item.command_token;
         slot_candidate.batch_key = row.batch_key;
@@ -13077,6 +13184,11 @@ class rdma_cmq_engine extends uvm_object;
         ];
         if (item == null || item_candidate.cancellation_completion == null)
           continue;
+        // The retained journal contract requires completion.ticket and
+        // item.ticket to be the same authoritative handle.  The candidate
+        // completion was detached for caller delivery during staging, so
+        // restore this engine-owned alias only at the allocation-free commit.
+        item_candidate.cancellation_completion.ticket = item.ticket;
         item.status = item_candidate.cancellation_completion.status;
         item.completion = item_candidate.cancellation_completion;
         item.state = RDMA_CMQ_SUBMISSION_RESET_QUARANTINED;
@@ -13120,6 +13232,11 @@ class rdma_cmq_engine extends uvm_object;
     proofs = new[0];
     status = invalid_state("CMQ observed reset did not complete");
     engine_lock.get(1);
+    status = reset_release_gate_status();
+    if (!status.ok()) begin
+      engine_lock.put(1);
+      return;
+    end
     if (engine_state == RDMA_CMQ_ENGINE_UNCONFIGURED) begin
       status = rdma_status::success();
       engine_lock.put(1);
@@ -13166,6 +13283,11 @@ class rdma_cmq_engine extends uvm_object;
     foreach (candidate.returned_completions[i])
       completions.push_back(candidate.returned_completions[i]);
 
+    // Keep the gate asserted for the entire external release window.  Any
+    // lifecycle entry that was queued behind engine_lock will observe it before
+    // touching the staged runtime graph.
+    reset_release_in_progress = 1'b1;
+
     // The adapter call is intentionally outside engine_lock.  The candidate
     // retains only detached release authority plus local witnesses; no
     // engine-owned graph is exposed to the adapter.
@@ -13183,6 +13305,7 @@ class rdma_cmq_engine extends uvm_object;
     if (release_status == null || !release_status.ok()) begin
       completions.delete();
       proofs.delete();
+      reset_release_in_progress = 1'b0;
       status = (release_status == null) ? invalid_state(
         "CMQ reset release returned null status"
       ) : release_status;
@@ -13259,6 +13382,10 @@ class rdma_cmq_engine extends uvm_object;
     if (!candidate_runtime_unchanged) begin
       completions.delete();
       proofs.delete();
+      // release_opaque() has already retired the allocation.  The staged
+      // candidate is no longer safe to commit after a runtime drift, so drop
+      // every runtime/backing alias and leave an explicitly poisoned engine.
+      poison_released_runtime_drift_locked();
       status = invalid_state(
         "CMQ reset runtime authority changed during backing release"
       );
@@ -13492,6 +13619,11 @@ class rdma_cmq_engine extends uvm_object;
 
     status = invalid_state("CMQ shutdown did not complete");
     engine_lock.get(1);
+    status = reset_release_gate_status();
+    if (!status.ok()) begin
+      engine_lock.put(1);
+      return;
+    end
     if (engine_state == RDMA_CMQ_ENGINE_UNCONFIGURED) begin
       clear_configuration();
       status = rdma_status::success();
