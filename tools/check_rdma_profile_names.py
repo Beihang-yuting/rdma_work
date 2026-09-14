@@ -742,6 +742,9 @@ FIELD_MAPPINGS = (
     FieldMapping("wr.h", "XTRDMA_QP_RQ_TPL", "RDMA_RQE_PAYLOAD_LEN", 8),
     FieldMapping("wr.h", "XTRDMA_QP_RQ_SIGNATURE", "RDMA_RQE_SIGNATURE", 16),
     FieldMapping("wr.h", "XTRDMA_QP_RQ_SGE_NUM", "RDMA_RQE_SGE_NUM", 16),
+    # wr.h:171-188: XTRDMA_QP_RQ_SGB_PA is GENMASK_ULL(63, 9).
+    # The qword starts at byte 32 and the wire value is PA >> 9.
+    FieldMapping("wr.h", "XTRDMA_QP_RQ_SGB_PA", "RDMA_RQE_SGB_PA", 32),
     FieldMapping("wr.h", "XTRDMA_CQE_POLARITY", "RDMA_CQE_POLARITY", 0),
     FieldMapping("wr.h", "XTRDMA_CQE_RQ_CQE", "RDMA_CQE_RQ_CQE", 0),
     FieldMapping("wr.h", "XTRDMA_CQE_QP_WQE_WRAP", "RDMA_CQE_WQE_WRAP", 0),
@@ -2859,6 +2862,10 @@ REFERENCE_FIELDS = (
     ReferenceField("wr.h", "XTRDMA_QP_RQ_VALID", "RDMA_RQE_VALID", 0, 63, 1),
     ReferenceField("wr.h", "XTRDMA_QP_RQ_SIGNATURE", "RDMA_RQE_SIGNATURE", 16, 56, 8),
     ReferenceField("wr.h", "XTRDMA_QP_RQ_SGE_NUM", "RDMA_RQE_SGE_NUM", 16, 48, 8),
+    # Independent raw coordinate evidence from wr.h:188.  This reference is
+    # intentionally separate from FIELD_MAPPINGS so a mapping drift cannot
+    # make the golden placement self-approve.
+    ReferenceField("wr.h", "XTRDMA_QP_RQ_SGB_PA", "RDMA_RQE_SGB_PA", 32, 9, 55),
     ReferenceField("wr.h", "XTRDMA_CQE_QPN", "RDMA_CQE_QPN", 0, 0, 18),
     ReferenceField("wr.h", "XTRDMA_CQE_QP_WQE_INDEX", "RDMA_CQE_WQE_INDEX", 0, 40, 15),
     ReferenceField("wr.h", "XTRDMA_CQE_ECODE", "RDMA_CQE_ECODE", 0, 24, 8),
@@ -3681,6 +3688,7 @@ def build_golden_cases() -> dict[str, list[GoldenCase]]:
         ("RDMA_RQE_VALID", 1, "valid=1"),
         ("RDMA_RQE_SIGNATURE", 0x96, "signature=0x96"),
         ("RDMA_RQE_SGE_NUM", 2, "sge_num=2"),
+        ("RDMA_RQE_SGB_PA", 0x123456789ABCDE, "sgb_pa_encoded=0x123456789abcde"),
     ))
 
     cqe = make_case("cqe_error", 64, (

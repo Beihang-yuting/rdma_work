@@ -16,3 +16,22 @@
 
 - `enter_recovery()` 仍沿用旧 UVM clone 路径，非 fatal 深拷贝闭环需后续补强。
 - `configure()` 当前签名不携带 route/reset epoch，因此 `query_route_epoch()` 仅能在未来 authority 注入适配后报告有效快照。
+
+## RQE SGB_PA 驱动证据（Task 2 补充）
+
+本次 RQE 编码修复以 10.11.10.53 上锁定的
+`dpu_kernel_rdma-version_0.1.34/wr.h` 为唯一布局来源：
+
+- `wr.h:171` 定义 `XTRDMA_RQ_SGB_PA_SHIFT 9`，因此软件物理地址必须
+  512B 对齐，wire 值为 `physical_pa >> 9`。
+- `wr.h:172` 定义 RQE SGE 区从 byte 32 开始；`wr.h:188` 定义
+  `XTRDMA_QP_RQ_SGB_PA GENMASK_ULL(63, 9)`，对应 qword4 的 `[63:9]`、
+  LSB 9、宽度 55。qword4 `[8:0]` 仍为 reserved。
+- `hw/rdma/source_manifest.txt:10-11` 已用 `XTRDMA_RQE_*`/
+  `XTRDMA_QP_RQ_*` 覆盖该符号，驱动 tarball SHA-256 未改变，因此本次
+  不修改 source manifest。
+
+`tools/check_rdma_profile_names.py` 同时登记 `XTRDMA_QP_RQ_SGB_PA` 的
+字段映射、独立坐标参考和 `rqe_boundary` golden；SV 单测覆盖物理地址对齐、
+55 位编码边界、detached decode/copy，以及 qword4 低 9 位非零时拒绝并保持
+输出 model 为 `null`。

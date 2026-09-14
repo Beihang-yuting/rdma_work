@@ -4060,7 +4060,7 @@ class ReferenceEncodingTest(unittest.TestCase):
                 "rqe_boundary":
                     "qpn=0xabcde,index=0x3456,payload=0x10203040,"
                     "qp_sn=0x5a,opcode=9,wrap=1,valid=1,signature=0x96,"
-                    "sge_num=2",
+                    "sge_num=2,sgb_pa_encoded=0x123456789abcde",
                 "cqe_error":
                     "qpn=0x2aaaa,index=0x4567,ecode=0xf4,"
                     "payload=0x10203040,polarity=1,rq_cqe=1,wrap=1,"

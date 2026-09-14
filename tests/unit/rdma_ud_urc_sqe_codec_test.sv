@@ -113,7 +113,7 @@ class rdma_ud_urc_sqe_codec_test extends uvm_test;
       if (s == null || !s.ok())
         `uvm_error("RQE_SGB_RAW", "RQE fixture deserialize failed")
       else begin
-        s = rqe_builder.put_field(32, 9, 55, 55'h0012_3456_789a_bcde);
+        s = rqe_builder.put_field(32, 9, 55, 55'h1234_5678_9abc_de);
         if (s == null || !s.ok())
           `uvm_error("RQE_SGB_RAW", "RQE SGB raw field setup failed")
         else begin
