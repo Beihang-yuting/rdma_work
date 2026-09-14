@@ -1,0 +1,1809 @@
+TASK0_EVIDENCE=red-cmq-temporary-assertion-mutation
+SOURCE_HEAD=349a75750ea5a09f0ba18f011267f797798bc318
+BASELINE_CMQ_TEST_BLOB=26a136a27800cc7e6c240e000532e2b8acaf7e53
+VARIANT_CMQ_TEST_BLOB=a6bef332581f9bda696b26ea77383d9a600a12a0
+TEMPORARY_MUTATION=expected CQC PI literal 23'd17 -> 23'd16; restore immediately after run
+REMOTE_HOST=ubuntu@10.11.10.53 (login bash)
+COMMAND=scripts/run_vcs53.sh core rdma_cmq_codec_test
+.d..tp..... ./
+<f+++++++++ .git
+<f+++++++++ .gitignore
+<f+++++++++ AGENTS.md
+<f+++++++++ README.md
+<f+++++++++ task-1-report.md
+cd+++++++++ .superpowers/
+cd+++++++++ .superpowers/sdd/
+<f+++++++++ .superpowers/sdd/.gitignore
+cd+++++++++ .superpowers/sdd/2026-08-26-rdma-queue-lifecycle/
+<f+++++++++ .superpowers/sdd/2026-08-26-rdma-queue-lifecycle/task-14-fence-fix-report.md
+cd+++++++++ .superpowers/sdd/2026-08-31-rdma-queue-lifecycle-host-mem-boundaries/
+<f+++++++++ .superpowers/sdd/2026-08-31-rdma-queue-lifecycle-host-mem-boundaries/task-1-report.md
+<f+++++++++ .superpowers/sdd/2026-08-31-rdma-queue-lifecycle-host-mem-boundaries/task-2-report.md
+<f+++++++++ .superpowers/sdd/2026-08-31-rdma-queue-lifecycle-host-mem-boundaries/task-4-fix-report.md
+<f+++++++++ .superpowers/sdd/2026-08-31-rdma-queue-lifecycle-host-mem-boundaries/task-4-report.md
+cd+++++++++ .superpowers/sdd/2026-09-03-rdma-dpu-common-integration/
+<f+++++++++ .superpowers/sdd/2026-09-03-rdma-dpu-common-integration/task-1-compat-fixture-report.md
+<f+++++++++ .superpowers/sdd/2026-09-03-rdma-dpu-common-integration/task-1-report.md
+<f+++++++++ .superpowers/sdd/2026-09-03-rdma-dpu-common-integration/task-1-round3-report.md
+<f+++++++++ .superpowers/sdd/2026-09-03-rdma-dpu-common-integration/task-2-report.md
+cd+++++++++ .superpowers/sdd/2026-09-03-rdma-sq-engine/
+<f+++++++++ .superpowers/sdd/2026-09-03-rdma-sq-engine/task-1-report.md
+<f+++++++++ .superpowers/sdd/2026-09-03-rdma-sq-engine/task-2-report.md
+<f+++++++++ .superpowers/sdd/2026-09-03-rdma-sq-engine/task-3-report.md
+cd+++++++++ .superpowers/sdd/2026-09-05-rdma-driver-gap-closure/
+<f+++++++++ .superpowers/sdd/2026-09-05-rdma-driver-gap-closure/progress.md
+<f+++++++++ .superpowers/sdd/2026-09-05-rdma-driver-gap-closure/task-2-report.md
+<f+++++++++ .superpowers/sdd/2026-09-05-rdma-driver-gap-closure/task-4-report.md
+cd+++++++++ .superpowers/sdd/2026-09-06-rdma-post-axis-integration/
+<f+++++++++ .superpowers/sdd/2026-09-06-rdma-post-axis-integration/task-28-report.md
+cd+++++++++ .superpowers/sdd/2026-09-07-rdma-device-producer-publish/
+<f+++++++++ .superpowers/sdd/2026-09-07-rdma-device-producer-publish/task-1-report.md
+<f+++++++++ .superpowers/sdd/2026-09-07-rdma-device-producer-publish/task-2-report.md
+<f+++++++++ .superpowers/sdd/2026-09-07-rdma-device-producer-publish/task-3-report.md
+cd+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/phase1c-preanalysis.md
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/phase1c-remaining-audit.md
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/progress.md
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/review-00a7763..a462b1e.diff
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/review-00ac20e..503c364.diff
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/review-00dbd36..2814bde.diff
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/review-0989a7c..1227dfa.diff
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/review-10a2020..f21a9e1.diff
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/review-1227dfa..3b4d062.diff
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/review-154eb05..eb42c0a.diff
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/review-18887be..6987b4e.diff
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/review-1b1599c..1e2447b.diff
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/review-1e2447b..4fbc022.diff
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/review-1e2447b..850852d.diff
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/review-1e2447b..988af86.diff
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/review-222ac1b..e82d038.diff
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/review-257d055..c37feaf.diff
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/review-2814bde..41f14c3.diff
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/review-32b206e..a57ebe6.diff
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/review-39c1d4f..4e8a780.diff
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/review-41f14c3..6fd36f5.diff
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/review-4454507..1b1599c.diff
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/review-4e8a780..94b90cd.diff
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/review-4efa9e0..e804083.diff
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/review-4f37231..0989a7c.diff
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/review-4f6dafc..154eb05.diff
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/review-503c364..19ad847.diff
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/review-503c364..b006c65.diff
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/review-503c364..df6a866.diff
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/review-6987b4e..257d055.diff
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/review-6caeb41..a6cf1f3.diff
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/review-6caeb41..bc59f22.diff
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/review-6fd36f5..e3fa1df.diff
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/review-8152999..af19935.diff
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/review-88182e2..ec2345b.diff
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/review-94b90cd..b0da76a.diff
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/review-94b90cd..d79d5af.diff
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/review-988af86..a9d9f9c.diff
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/review-9d5eaa4..88182e2.diff
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/review-a57ebe6..39c1d4f.diff
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/review-a6a6476..6caeb41.diff
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/review-a9d9f9c..c72e7bd.diff
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/review-af19935..10a2020.diff
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/review-b006c65..3a6b34e.diff
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/review-b006c65..4f6dafc.diff
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/review-b0da76a..4454507.diff
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/review-bc59f22..4f37231.diff
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/review-bd60940..18887be.diff
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/review-c37feaf..4efa9e0.diff
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/review-c72e7bd..fd33cc1.diff
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/review-ca1613e..7e2f11a.diff
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/review-ca2d887..b9cc022.diff
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/review-cce6154..222ac1b.diff
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/review-d1816de..ca2d887.diff
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/review-e3fa1df..bd60940.diff
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/review-e804083..ed3d257.diff
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/review-e82d038..a6a6476.diff
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/review-eb42c0a..cce6154.diff
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/review-ec2345b..cc0e104.diff
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/review-ed3d257..8152999.diff
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/review-f21a9e1..9d5eaa4.diff
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/review-fd33cc1..5848a60.diff
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-1-brief.md
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-1-report.md
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-10-brief.md
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-10-report.md
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-11-brief.md
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-11-report.md
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-11-review.md
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-12-brief.md
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-12-report.md
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-12-review.md
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-13-brief.md
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-13-fix-vcs53-debug.log
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-13-fix-vcs53-mutable-bad.log
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-13-profile-ruling-analysis.md
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-13-report.md
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-13-review.md
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-14-brief.md
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-14-fix-vcs53-debug.log
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-14-oracle-reduction.md
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-14-report.md
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-14-review.md
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-14-sigsegv-diagnostic.md
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-15-brief.md
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-15-final-engine-12-vcs53.log
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-15-final-models-vcs53.log
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-15-final-port-vcs53.log
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-15-fix-round-1-static-process-green.log
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-15-fix-round-1-static-process-red.log
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-15-fix-round-1-vcs53-checkpoint.log
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-15-legacy-crash-ab-a-combined.log
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-15-legacy-crash-ab-b-segment-0.log
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-15-legacy-crash-ab-b-segment-1.log
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-15-legacy-crash-ab-b-segment-13.log
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-15-legacy-crash-ab-b-segment-14.log
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-15-legacy-crash-ab-b-segment-2.log
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-15-legacy-crash-ab-b-segment-3.log
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-15-legacy-crash-ab-compile.log
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-15-legacy-crash-ab-driver.log
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-15-legacy-crash-ab-instrumentation.diff
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-15-legacy-crash-ab-report.md
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-15-legacy-crash-ab-status.log
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-15-legacy-crash-ab-verification.log
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-15-legacy-crash-diagnosis.md
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-15-legacy-partition-combined-0-14.log
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-15-legacy-partition-compile.log
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-15-legacy-partition-range-0-2.log
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-15-legacy-partition-range-3-14.log
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-15-legacy-partition-report.md
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-15-preanalysis.md
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-15-process-partition.md
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-15-report.md
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-15-rereview.md
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-15-review.md
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-15-sigsegv-diagnostic.md
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-15-single-process-architecture.md
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-15-vcs53-codeshape.log
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-15-vcs53-control.log
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-15-wrap-ab-a-combined.log
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-15-wrap-ab-b1-fixture-59.log
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-15-wrap-ab-b2-fixture-60.log
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-15-wrap-ab-compile.log
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-15-wrap-ab-driver.log
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-15-wrap-ab-report.md
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-15-wrap-ab-status.log
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-15-wrap-diagnosis.md
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-15-wrap-process-vcs53.log
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-16-brief.md
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-16-preanalysis.md
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-16-readiness.md
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-16-report.md
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-16-rereview.md
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-16-rereview2.md
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-16-review.md
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-16-vcs-diagnostic.md
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-17-brief.md
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-17-preanalysis.md
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-17-preaudit.md
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-17-readiness.md
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-17-report.md
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-17-review.md
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-18-brief.md
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-18-controller-prep.md
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-18-preanalysis.md
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-18-report.md
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-18-rereview-a462b1e.md
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-18-rereview-final.md
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-18-rereview1.md
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-18-review.md
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-19-brief.md
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-19-preanalysis.md
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-2-brief.md
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-2-report.md
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-3-brief.md
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-3-final-rereview.md
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-3-report.md
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-3-rereview.md
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-3-rereview2.md
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-3-review.md
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-3-sparse-rereview.md
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-4-brief.md
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-4-final-review2.md
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-4-report.md
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-5-brief.md
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-5-fix-round-2-report.md
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-5-fix-round-2-review.md
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-5-fix-round-3-report.md
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-5-fix-round-3-review.md
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-5-preanalysis.md
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-5-report.md
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-6-brief.md
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-6-report.md
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-6-rereview2.md
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-6-rereview3.md
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-6-review-v2.md
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-6A-brief.md
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-6A-candidate-evidence.md
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-6A-current-candidate.tsv
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-6A-report.md
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-7-brief.md
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-7-report.md
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-7A-brief.md
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-7A-report.md
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-7B-brief.md
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-7B-report.md
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-8-brief.md
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-8-report.md
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-9-brief.md
+<f+++++++++ .superpowers/sdd/2026-09-11-rdma-cmq-contract-foundation/task-9-report.md
+cd+++++++++ .superpowers/sdd/2026-09-14-rdma-phase1c-abi-fixes/
+<f+++++++++ .superpowers/sdd/2026-09-14-rdma-phase1c-abi-fixes/progress.md
+<f+++++++++ .superpowers/sdd/2026-09-14-rdma-phase1c-abi-fixes/review-571266e..a449b57.diff
+<f+++++++++ .superpowers/sdd/2026-09-14-rdma-phase1c-abi-fixes/review-5d8d2f6..3f85367.diff
+<f+++++++++ .superpowers/sdd/2026-09-14-rdma-phase1c-abi-fixes/review-8ede5e7..5d8d2f6.diff
+<f+++++++++ .superpowers/sdd/2026-09-14-rdma-phase1c-abi-fixes/review-a449b57..8ede5e7.diff
+<f+++++++++ .superpowers/sdd/2026-09-14-rdma-phase1c-abi-fixes/review-a462b1e..571266e.diff
+<f+++++++++ .superpowers/sdd/2026-09-14-rdma-phase1c-abi-fixes/task-0-brief.md
+<f+++++++++ .superpowers/sdd/2026-09-14-rdma-phase1c-abi-fixes/task-0-report.md
+<f+++++++++ .superpowers/sdd/2026-09-14-rdma-phase1c-abi-fixes/task-0-rereview.md
+<f+++++++++ .superpowers/sdd/2026-09-14-rdma-phase1c-abi-fixes/task-0-rereview2.md
+<f+++++++++ .superpowers/sdd/2026-09-14-rdma-phase1c-abi-fixes/task-0-review.md
+<f+++++++++ .superpowers/sdd/2026-09-14-rdma-phase1c-abi-fixes/task-1-brief.md
+<f+++++++++ .superpowers/sdd/2026-09-14-rdma-phase1c-abi-fixes/task-2-brief.md
+<f+++++++++ .superpowers/sdd/2026-09-14-rdma-phase1c-abi-fixes/task-3-brief.md
+<f+++++++++ .superpowers/sdd/2026-09-14-rdma-phase1c-abi-fixes/task-4-brief.md
+<f+++++++++ .superpowers/sdd/2026-09-14-rdma-phase1c-abi-fixes/task-5-brief.md
+<f+++++++++ .superpowers/sdd/2026-09-14-rdma-phase1c-abi-fixes/task-6-brief.md
+<f+++++++++ .superpowers/sdd/2026-09-14-rdma-phase1c-abi-fixes/task-7-brief.md
+cd+++++++++ .superpowers/sdd/2026-09-14-rdma-phase1c-abi-fixes/evidence/
+<f+++++++++ .superpowers/sdd/2026-09-14-rdma-phase1c-abi-fixes/evidence/task-0-green-cmq.log
+<f+++++++++ .superpowers/sdd/2026-09-14-rdma-phase1c-abi-fixes/evidence/task-0-green-cqe.log
+<f+++++++++ .superpowers/sdd/2026-09-14-rdma-phase1c-abi-fixes/evidence/task-0-red.log
+cd+++++++++ docs/
+<f+++++++++ docs/rdma-0.1.34-gap-closure-verification.md
+cd+++++++++ docs/hw/
+<f+++++++++ docs/hw/xtr-v1-source-map.md
+cd+++++++++ docs/superpowers/
+cd+++++++++ docs/superpowers/approvals/
+<f+++++++++ docs/superpowers/approvals/2026-09-11-rdma-cmq-contract-foundation-phase1a.env
+cd+++++++++ docs/superpowers/plans/
+<f+++++++++ docs/superpowers/plans/2026-08-20-rdma-uvm-driver-architecture.md
+<f+++++++++ docs/superpowers/plans/2026-08-21-qpc-behavior-ownership.md
+<f+++++++++ docs/superpowers/plans/2026-08-21-xtr-v1-context-body-abi.md
+<f+++++++++ docs/superpowers/plans/2026-08-22-qpc-path-mtu-ownership.md
+<f+++++++++ docs/superpowers/plans/2026-08-22-urc-qpc-create-semantics.md
+<f+++++++++ docs/superpowers/plans/2026-08-23-cmq-ring-batch-engine.md
+<f+++++++++ docs/superpowers/plans/2026-08-23-xtr-v1-doorbells.md
+<f+++++++++ docs/superpowers/plans/2026-08-24-rdma-control-plane-14a.md
+<f+++++++++ docs/superpowers/plans/2026-08-26-rdma-function-binding-child-snapshots.md
+<f+++++++++ docs/superpowers/plans/2026-08-26-rdma-function-binding-unpacked-value-snapshots.md
+<f+++++++++ docs/superpowers/plans/2026-08-26-rdma-function-binding-value-snapshots.md
+<f+++++++++ docs/superpowers/plans/2026-08-26-rdma-queue-lifecycle.md
+<f+++++++++ docs/superpowers/plans/2026-08-31-rdma-qp-lifecycle.md
+<f+++++++++ docs/superpowers/plans/2026-08-31-rdma-queue-lifecycle-host-mem-boundaries.md
+<f+++++++++ docs/superpowers/plans/2026-09-02-rdma-queue-data-plane-engine.md
+<f+++++++++ docs/superpowers/plans/2026-09-03-rdma-dpu-common-integration.md
+<f+++++++++ docs/superpowers/plans/2026-09-03-rdma-sq-engine.md
+<f+++++++++ docs/superpowers/plans/2026-09-05-rdma-driver-gap-closure.md
+<f+++++++++ docs/superpowers/plans/2026-09-06-rdma-post-axis-integration.md
+<f+++++++++ docs/superpowers/plans/2026-09-07-rdma-multivf-recovery.md
+<f+++++++++ docs/superpowers/plans/2026-09-11-rdma-cmq-contract-foundation.md
+<f+++++++++ docs/superpowers/plans/2026-09-14-rdma-phase1c-abi-fixes.md
+cd+++++++++ docs/superpowers/specs/
+<f+++++++++ docs/superpowers/specs/2026-08-20-rdma-uvm-driver-architecture-design.md
+<f+++++++++ docs/superpowers/specs/2026-08-21-qpc-behavior-ownership-design.md
+<f+++++++++ docs/superpowers/specs/2026-08-21-xtr-v1-context-body-abi-design.md
+<f+++++++++ docs/superpowers/specs/2026-08-22-qpc-path-mtu-ownership-design.md
+<f+++++++++ docs/superpowers/specs/2026-08-22-urc-qpc-create-semantics-design.md
+<f+++++++++ docs/superpowers/specs/2026-08-23-cmq-ring-batch-engine-design.md
+<f+++++++++ docs/superpowers/specs/2026-08-24-rdma-control-plane-14a-design.md
+<f+++++++++ docs/superpowers/specs/2026-08-26-rdma-function-binding-child-snapshots-design.md
+<f+++++++++ docs/superpowers/specs/2026-08-26-rdma-function-binding-value-snapshots-design.md
+<f+++++++++ docs/superpowers/specs/2026-08-26-rdma-queue-lifecycle-design.md
+<f+++++++++ docs/superpowers/specs/2026-08-31-rdma-qp-lifecycle-design.md
+<f+++++++++ docs/superpowers/specs/2026-08-31-rdma-queue-lifecycle-host-mem-boundaries-design.md
+<f+++++++++ docs/superpowers/specs/2026-09-02-rdma-queue-data-codecs-host-mem-design.md
+<f+++++++++ docs/superpowers/specs/2026-09-02-rdma-sq-engine-design.md
+<f+++++++++ docs/superpowers/specs/2026-09-03-rdma-dpu-common-integration-design.md
+<f+++++++++ docs/superpowers/specs/2026-09-05-rdma-driver-gap-closure-design.md
+<f+++++++++ docs/superpowers/specs/2026-09-06-rdma-post-axis-integration-design.md
+<f+++++++++ docs/superpowers/specs/2026-09-07-rdma-device-producer-publish-design.md
+<f+++++++++ docs/superpowers/specs/2026-09-11-rdma-engine-contract-refactoring-design.md
+<f+++++++++ docs/superpowers/specs/2026-09-14-rdma-phase1c-abi-fixes-design.md
+cd+++++++++ hw/
+cd+++++++++ hw/rdma/
+<f+++++++++ hw/rdma/archive_lock.env
+<f+++++++++ hw/rdma/cmq_capabilities.tsv
+<f+++++++++ hw/rdma/cmq_field_mutation.tsv
+<f+++++++++ hw/rdma/external_dependencies.tsv
+<f+++++++++ hw/rdma/field_exclusions.tsv
+<f+++++++++ hw/rdma/field_ownership.tsv
+<f+++++++++ hw/rdma/source_manifest.txt
+cd+++++++++ hw/rdma/c_oracle/
+<f+++++++++ hw/rdma/c_oracle/cmq_oracle_cases.tsv
+<f+++++++++ hw/rdma/c_oracle/cmq_oracle_source_anchors.tsv
+<f+++++++++ hw/rdma/c_oracle/rdma_cmq_oracle.c
+cd+++++++++ hw/rdma/c_oracle/cases/
+<f+++++++++ hw/rdma/c_oracle/cases/cmq_cqe_qpc_create_response.bytes.hex
+<f+++++++++ hw/rdma/c_oracle/cases/cmq_cqe_qpc_create_response.fields.tsv
+<f+++++++++ hw/rdma/c_oracle/cases/cmq_cqe_qpc_create_response.input.tsv
+<f+++++++++ hw/rdma/c_oracle/cases/cmq_cqe_qpc_create_response.metadata.env
+<f+++++++++ hw/rdma/c_oracle/cases/cmq_sq_doorbell.bytes.hex
+<f+++++++++ hw/rdma/c_oracle/cases/cmq_sq_doorbell.fields.tsv
+<f+++++++++ hw/rdma/c_oracle/cases/cmq_sq_doorbell.input.tsv
+<f+++++++++ hw/rdma/c_oracle/cases/cmq_sq_doorbell.metadata.env
+<f+++++++++ hw/rdma/c_oracle/cases/cmq_sqe_cqc_create_request.bytes.hex
+<f+++++++++ hw/rdma/c_oracle/cases/cmq_sqe_cqc_create_request.fields.tsv
+<f+++++++++ hw/rdma/c_oracle/cases/cmq_sqe_cqc_create_request.input.tsv
+<f+++++++++ hw/rdma/c_oracle/cases/cmq_sqe_cqc_create_request.metadata.env
+<f+++++++++ hw/rdma/c_oracle/cases/cmq_sqe_qpc_create_request.bytes.hex
+<f+++++++++ hw/rdma/c_oracle/cases/cmq_sqe_qpc_create_request.fields.tsv
+<f+++++++++ hw/rdma/c_oracle/cases/cmq_sqe_qpc_create_request.input.tsv
+<f+++++++++ hw/rdma/c_oracle/cases/cmq_sqe_qpc_create_request.metadata.env
+cd+++++++++ hw/rdma/golden_vectors/
+<f+++++++++ hw/rdma/golden_vectors/cmq.hex
+<f+++++++++ hw/rdma/golden_vectors/context.hex
+<f+++++++++ hw/rdma/golden_vectors/doorbell.hex
+<f+++++++++ hw/rdma/golden_vectors/queue.hex
+<f+++++++++ hw/rdma/golden_vectors/sq.hex
+cd+++++++++ scripts/
+<f+++++++++ scripts/check_uvm_summary.sh
+<f+++++++++ scripts/run_core_logical_test.sh
+<f+++++++++ scripts/run_host_mem_regression53.sh
+<f+++++++++ scripts/run_qp_lifecycle_regression53.sh
+<f+++++++++ scripts/run_queue_lifecycle_regression53.sh
+<f+++++++++ scripts/run_vcs53.sh
+cd+++++++++ sim/
+<f+++++++++ sim/Makefile
+<f+++++++++ sim/cmq_gate.list
+<f+++++++++ sim/rdma_cmq_engine_process.list
+<f+++++++++ sim/regression.list
+cd+++++++++ sim/filelists/
+<f+++++++++ sim/filelists/core.f
+<f+++++++++ sim/filelists/e2e.f
+<f+++++++++ sim/filelists/host_mem.f
+<f+++++++++ sim/filelists/integration.f
+<f+++++++++ sim/filelists/net_packet.f
+<f+++++++++ sim/filelists/pcie_work.f
+cd+++++++++ src/
+cd+++++++++ src/adapter/
+<f+++++++++ src/adapter/rdma_abi_v5_api.sv
+<f+++++++++ src/adapter/rdma_adapter_pkg.sv
+<f+++++++++ src/adapter/rdma_context_backing_api.sv
+<f+++++++++ src/adapter/rdma_function_table_api.sv
+<f+++++++++ src/adapter/rdma_host_mem_api.sv
+<f+++++++++ src/adapter/rdma_net_api.sv
+<f+++++++++ src/adapter/rdma_pcie_api.sv
+<f+++++++++ src/adapter/rdma_queue_host_mem_submitter.sv
+cd+++++++++ src/adapters/
+cd+++++++++ src/adapters/host_mem/
+<f+++++++++ src/adapters/host_mem/rdma_host_mem_adapter_pkg.sv
+cd+++++++++ src/adapters/net_packet/
+<f+++++++++ src/adapters/net_packet/rdma_net_packet_adapter_pkg.sv
+<f+++++++++ src/adapters/net_packet/rdma_net_packet_bridge.sv
+cd+++++++++ src/adapters/pcie_work/
+<f+++++++++ src/adapters/pcie_work/rdma_pcie_work_adapter_pkg.sv
+cd+++++++++ src/codec/
+<f+++++++++ src/codec/rdma_bit_packer.sv
+<f+++++++++ src/codec/rdma_cmq_hw_profile.sv
+<f+++++++++ src/codec/rdma_codec_base.sv
+<f+++++++++ src/codec/rdma_codec_pkg.sv
+<f+++++++++ src/codec/rdma_codec_registry.sv
+cd+++++++++ src/codec/rdma/
+<f+++++++++ src/codec/rdma/rdma_cmq_codecs.sv
+<f+++++++++ src/codec/rdma/rdma_cmq_hw_profile.sv
+<f+++++++++ src/codec/rdma/rdma_context_body_codecs.sv
+<f+++++++++ src/codec/rdma/rdma_defs.svh
+<f+++++++++ src/codec/rdma/rdma_doorbell_codecs.sv
+<f+++++++++ src/codec/rdma/rdma_error_codec.sv
+<f+++++++++ src/codec/rdma/rdma_image_masks.svh
+<f+++++++++ src/codec/rdma/rdma_qpc_codecs.sv
+<f+++++++++ src/codec/rdma/rdma_queue_codecs.sv
+<f+++++++++ src/codec/rdma/rdma_queue_page_codec.sv
+<f+++++++++ src/codec/rdma/rdma_qword_codec.sv
+cd+++++++++ src/core/
+<f+++++++++ src/core/rdma_cmq_engine.sv
+<f+++++++++ src/core/rdma_cmq_engine_port_adapter.sv
+<f+++++++++ src/core/rdma_cmq_port.sv
+<f+++++++++ src/core/rdma_cmq_transport.sv
+<f+++++++++ src/core/rdma_control_plane.sv
+<f+++++++++ src/core/rdma_core_pkg.sv
+<f+++++++++ src/core/rdma_coverage.sv
+<f+++++++++ src/core/rdma_cq_engine.sv
+<f+++++++++ src/core/rdma_doorbell_scheduler.sv
+<f+++++++++ src/core/rdma_env.sv
+<f+++++++++ src/core/rdma_env_config.sv
+<f+++++++++ src/core/rdma_eq_engine.sv
+<f+++++++++ src/core/rdma_hmc_allocator.sv
+<f+++++++++ src/core/rdma_pcie_bar_allocator.sv
+<f+++++++++ src/core/rdma_qp_lifecycle_executor.sv
+<f+++++++++ src/core/rdma_queue_backing_access.sv
+<f+++++++++ src/core/rdma_queue_backing_planner.sv
+<f+++++++++ src/core/rdma_queue_data_engine.sv
+<f+++++++++ src/core/rdma_queue_lifecycle_executor.sv
+<f+++++++++ src/core/rdma_queue_lifecycle_policy.sv
+<f+++++++++ src/core/rdma_queue_runtime.sv
+<f+++++++++ src/core/rdma_resource_manager.sv
+<f+++++++++ src/core/rdma_responder_registry.sv
+<f+++++++++ src/core/rdma_rq_engine.sv
+<f+++++++++ src/core/rdma_sq_engine.sv
+<f+++++++++ src/core/rdma_sq_payload_writer.sv
+<f+++++++++ src/core/rdma_sriov_enumerator.sv
+<f+++++++++ src/core/rdma_stag_key_policy.sv
+cd+++++++++ src/integration/
+<f+++++++++ src/integration/rdma_device_env.sv
+<f+++++++++ src/integration/rdma_dpu_env_pkg.sv
+<f+++++++++ src/integration/rdma_dpu_identity_adapter.sv
+<f+++++++++ src/integration/rdma_function_context.sv
+<f+++++++++ src/integration/rdma_host_mem_router.sv
+<f+++++++++ src/integration/rdma_pcie_router.sv
+<f+++++++++ src/integration/rdma_reset_coordinator.sv
+cd+++++++++ src/model/
+<f+++++++++ src/model/rdma_cmq_engine_models.sv
+<f+++++++++ src/model/rdma_cmq_execution_models.sv
+<f+++++++++ src/model/rdma_context_layouts.sv
+<f+++++++++ src/model/rdma_context_models.sv
+<f+++++++++ src/model/rdma_context_types.sv
+<f+++++++++ src/model/rdma_control_plane_models.sv
+<f+++++++++ src/model/rdma_dma_mapping.sv
+<f+++++++++ src/model/rdma_dma_request_context.sv
+<f+++++++++ src/model/rdma_function_binding.sv
+<f+++++++++ src/model/rdma_function_identity.sv
+<f+++++++++ src/model/rdma_handle.sv
+<f+++++++++ src/model/rdma_hw_image.sv
+<f+++++++++ src/model/rdma_model_pkg.sv
+<f+++++++++ src/model/rdma_queue_lifecycle_models.sv
+<f+++++++++ src/model/rdma_queue_models.sv
+<f+++++++++ src/model/rdma_queue_txn_types.sv
+<f+++++++++ src/model/rdma_resource_refs.sv
+<f+++++++++ src/model/rdma_resources.sv
+<f+++++++++ src/model/rdma_semantic_requests.sv
+<f+++++++++ src/model/rdma_submission_evidence.sv
+cd+++++++++ src/types/
+<f+++++++++ src/types/rdma_address_types.sv
+<f+++++++++ src/types/rdma_enum_types.sv
+<f+++++++++ src/types/rdma_identity_types.sv
+<f+++++++++ src/types/rdma_status.sv
+<f+++++++++ src/types/rdma_types_pkg.sv
+cd+++++++++ tests/
+<f+++++++++ tests/rdma_unit_test_pkg.sv
+<f+++++++++ tests/tb_top.sv
+cd+++++++++ tests/data/
+<f+++++++++ tests/data/rdma_0_1_34_cmq_vectors.hex
+cd+++++++++ tests/integration/
+<f+++++++++ tests/integration/rdma_device_env_test.sv
+<f+++++++++ tests/integration/rdma_dpu_integration_test.sv
+<f+++++++++ tests/integration/rdma_end_to_end_dual_env_test.sv
+<f+++++++++ tests/integration/rdma_end_to_end_high_traffic_test.sv
+<f+++++++++ tests/integration/rdma_end_to_end_transport_test.sv
+<f+++++++++ tests/integration/rdma_function_context_test.sv
+<f+++++++++ tests/integration/rdma_host_mem_adapter_test.sv
+<f+++++++++ tests/integration/rdma_host_mem_umem_test.sv
+<f+++++++++ tests/integration/rdma_multivf_recovery_test.sv
+<f+++++++++ tests/integration/rdma_net_packet_adapter_test.sv
+<f+++++++++ tests/integration/rdma_pcie_work_adapter_test.sv
+<f+++++++++ tests/integration/rdma_queue_data_engine_host_mem_test.sv
+<f+++++++++ tests/integration/rdma_reset_cascade_test.sv
+<f+++++++++ tests/integration/rdma_sriov_enumeration_test.sv
+cd+++++++++ tests/mocks/
+<f+++++++++ tests/mocks/rdma_mock_adapters.sv
+<f+++++++++ tests/mocks/rdma_mock_context_backing.sv
+<f+++++++++ tests/mocks/rdma_mock_control_plane.sv
+cd+++++++++ tests/support/
+<f+++++++++ tests/support/capture_rdma_cmq_oracle_candidate.sh
+<f+++++++++ tests/support/rdma_cmq_contract_reader.sv
+<f+++++++++ tests/support/rdma_golden_reader.sv
+cd+++++++++ tests/unit/
+<f+++++++++ tests/unit/rdma_abi_v5_adapter_test.sv
+<f+++++++++ tests/unit/rdma_adapter_contract_test.sv
+<f+++++++++ tests/unit/rdma_cmq_codec_test.sv
+<f+++++++++ tests/unit/rdma_cmq_completion_test.sv
+<f+++++++++ tests/unit/rdma_cmq_driver_field_mutation_test.sv
+<f+++++++++ tests/unit/rdma_cmq_engine_models_test.sv
+<f+++++++++ tests/unit/rdma_cmq_engine_test.sv
+<f+++++++++ tests/unit/rdma_cmq_port_test.sv
+<f+++++++++ tests/unit/rdma_cmq_profile_test.sv
+<f+++++++++ tests/unit/rdma_codec_registry_test.sv
+<f+++++++++ tests/unit/rdma_context_backing_contract_test.sv
+<f+++++++++ tests/unit/rdma_context_body_codec_test.sv
+<f+++++++++ tests/unit/rdma_context_cmq_regression_test.sv
+<f+++++++++ tests/unit/rdma_context_model_test.sv
+<f+++++++++ tests/unit/rdma_control_plane_cmq_engine_test.sv
+<f+++++++++ tests/unit/rdma_control_plane_models_test.sv
+<f+++++++++ tests/unit/rdma_control_plane_test.sv
+<f+++++++++ tests/unit/rdma_coverage_test.sv
+<f+++++++++ tests/unit/rdma_cq_engine_resize_test.sv
+<f+++++++++ tests/unit/rdma_cq_engine_test.sv
+<f+++++++++ tests/unit/rdma_cq_shadow_flush_test.sv
+<f+++++++++ tests/unit/rdma_cqe_size_codec_test.sv
+<f+++++++++ tests/unit/rdma_defs_test.sv
+<f+++++++++ tests/unit/rdma_doorbell_codec_test.sv
+<f+++++++++ tests/unit/rdma_doorbell_scheduler_test.sv
+<f+++++++++ tests/unit/rdma_env_composition_test.sv
+<f+++++++++ tests/unit/rdma_eq_engine_test.sv
+<f+++++++++ tests/unit/rdma_error_codec_test.sv
+<f+++++++++ tests/unit/rdma_function_identity_test.sv
+<f+++++++++ tests/unit/rdma_harness_expected_failure_probe.sv
+<f+++++++++ tests/unit/rdma_host_mem_router_test.sv
+<f+++++++++ tests/unit/rdma_model_test.sv
+<f+++++++++ tests/unit/rdma_pcie_router_test.sv
+<f+++++++++ tests/unit/rdma_qp_lifecycle_test.sv
+<f+++++++++ tests/unit/rdma_qp_recovery_test.sv
+<f+++++++++ tests/unit/rdma_qpc_codec_test.sv
+<f+++++++++ tests/unit/rdma_queue_backing_access_test.sv
+<f+++++++++ tests/unit/rdma_queue_codec_test.sv
+<f+++++++++ tests/unit/rdma_queue_data_engine_device_publish_test.sv
+<f+++++++++ tests/unit/rdma_queue_data_engine_final_fix_test.sv
+<f+++++++++ tests/unit/rdma_queue_data_engine_poll_test.sv
+<f+++++++++ tests/unit/rdma_queue_data_engine_post_test.sv
+<f+++++++++ tests/unit/rdma_queue_data_engine_recovery_test.sv
+<f+++++++++ tests/unit/rdma_queue_host_mem_submitter_test.sv
+<f+++++++++ tests/unit/rdma_queue_lifecycle_models_test.sv
+<f+++++++++ tests/unit/rdma_queue_lifecycle_test.sv
+<f+++++++++ tests/unit/rdma_queue_model_test.sv
+<f+++++++++ tests/unit/rdma_queue_page_codec_test.sv
+<f+++++++++ tests/unit/rdma_queue_recovery_test.sv
+<f+++++++++ tests/unit/rdma_queue_runtime_test.sv
+<f+++++++++ tests/unit/rdma_queue_txn_journal_test.sv
+<f+++++++++ tests/unit/rdma_qword_codec_test.sv
+<f+++++++++ tests/unit/rdma_request_model_test.sv
+<f+++++++++ tests/unit/rdma_reset_coordinator_test.sv
+<f+++++++++ tests/unit/rdma_resource_manager_test.sv
+<f+++++++++ tests/unit/rdma_responder_registry_test.sv
+<f+++++++++ tests/unit/rdma_rq_engine_test.sv
+<f+++++++++ tests/unit/rdma_smoke_test.sv
+<f+++++++++ tests/unit/rdma_sq_codec_test.sv
+<f+++++++++ tests/unit/rdma_sq_engine_test.sv
+<f+++++++++ tests/unit/rdma_sq_models_test.sv
+<f+++++++++ tests/unit/rdma_sq_payload_writer_test.sv
+<f+++++++++ tests/unit/rdma_sqe_authority_test.sv
+<f+++++++++ tests/unit/rdma_types_test.sv
+<f+++++++++ tests/unit/rdma_ud_urc_sqe_codec_test.sv
+<f+++++++++ tests/unit/rdma_umem_pbl_mw_test.sv
+<f+++++++++ tests/unit/rdma_wqe_extended_opcode_test.sv
+<f+++++++++ tests/unit/test_check_changed_sv_style.py
+<f+++++++++ tests/unit/test_check_queue_lifecycle.py
+<f+++++++++ tests/unit/test_check_rdma_field_ownership.py
+<f+++++++++ tests/unit/test_check_rdma_phase1a_approval.py
+<f+++++++++ tests/unit/test_check_rdma_profile_names.py
+<f+++++++++ tests/unit/test_cmq_gate_manifest.py
+<f+++++++++ tests/unit/test_e2e_multivf_manifest.py
+<f+++++++++ tests/unit/test_external_dependency_lock.py
+<f+++++++++ tests/unit/test_multivf_recovery_guards.py
+<f+++++++++ tests/unit/test_run_queue_lifecycle_regression53.py
+<f+++++++++ tests/unit/test_run_vcs53_sync.py
+<f+++++++++ tests/unit/test_task9_verification.py
+<f+++++++++ tests/unit/test_verify_rdma_archive.py
+<f+++++++++ tests/unit/test_verify_rdma_cmq_oracle.py
+cd+++++++++ tools/
+<f+++++++++ tools/check_changed_sv_style.py
+<f+++++++++ tools/check_external_dependency_lock.py
+<f+++++++++ tools/check_queue_lifecycle.py
+<f+++++++++ tools/check_rdma_field_ownership.py
+<f+++++++++ tools/check_rdma_phase1a_approval.py
+<f+++++++++ tools/check_rdma_profile_names.py
+<f+++++++++ tools/rdma_driver_contract.py
+<f+++++++++ tools/verify_rdma_archive.py
+<f+++++++++ tools/verify_rdma_cmq_oracle.py
+bash: cannot set terminal process group (-1): Inappropriate ioctl for device
+bash: no job control in this shell
+set -euo pipefail; \
+mkdir -p build/core; \
+vcs -full64 -sverilog -ntb_opts uvm-1.2 -timescale=1ns/1ps -debug_access+class -f filelists/core.f -top tb_top -o build/core/simv; \
+if [[ "rdma_cmq_codec_test" == regression ]]; then \
+	mapfile -t suite_tests < <(sed -n '/^readonly CORE_TESTS=(/,/^)/p' ../scripts/run_queue_lifecycle_regression53.sh | sed -n 's/^[[:space:]]*\([A-Za-z_][A-Za-z0-9_]*\)[[:space:]]*$/\1/p'); \
+	if (( ${#suite_tests[@]} == 0 )); then echo "core regression manifest is empty" >&2; exit 2; fi; \
+	for test_name in "${suite_tests[@]}"; do \
+			"../scripts/run_core_logical_test.sh" "$test_name" "build/core" "rdma_cmq_engine_process.list" "../scripts/check_uvm_summary.sh"; \
+	done; \
+else \
+		"../scripts/run_core_logical_test.sh" "rdma_cmq_codec_test" "build/core" "rdma_cmq_engine_process.list" "../scripts/check_uvm_summary.sh"; \
+fi
+                         Chronologic VCS (TM)
+       Version W-2024.09-SP1_Full64 -- Mon Sep 14 13:59:25 2026
+
+                    Copyright (c) 1991 - 2024 Synopsys, Inc.
+   This software and the associated documentation are proprietary to Synopsys,
+ Inc. This software may only be used in accordance with the terms and conditions
+ of a written license agreement with Synopsys, Inc. All other use, reproduction,
+   or distribution of this software is strictly prohibited.  Licensed Products
+     communicate with Synopsys servers for the purpose of providing software
+    updates, detecting software piracy and verifying that customers are using
+    Licensed Products in conformity with the applicable License Key for such
+  Licensed Products. Synopsys will use information gathered in connection with
+    this process to deliver software updates and pursue software pirates and
+                                   infringers.
+
+ Inclusivity & Diversity - Visit SolvNetPlus to read the "Synopsys Statement on
+            Inclusivity and Diversity" (Refer to article 000036315 at
+                        https://solvnetplus.synopsys.com)
+
+Parsing design file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/uvm_pkg.sv'
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/uvm_macros.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/macros/uvm_version_defines.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/uvm_macros.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/macros/uvm_global_defines.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/uvm_macros.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/macros/snps_macros.svp'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/uvm_macros.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/macros/uvm_message_defines.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/uvm_macros.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/macros/uvm_phase_defines.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/uvm_macros.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/macros/uvm_object_defines.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/uvm_macros.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/macros/uvm_printer_defines.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/uvm_macros.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/macros/uvm_tlm_defines.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/tlm1/uvm_tlm_imps.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/macros/uvm_tlm_defines.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/uvm_macros.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/macros/uvm_sequence_defines.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/uvm_macros.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/macros/uvm_callback_defines.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/uvm_macros.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/macros/uvm_reg_defines.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/uvm_macros.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/macros/uvm_deprecated_defines.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/uvm_macros.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/uvm_pkg.sv'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/dpi/uvm_dpi.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/dpi/uvm_hdl.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/dpi/uvm_dpi.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/dpi/uvm_svcmd_dpi.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/dpi/uvm_dpi.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/dpi/uvm_regex.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/dpi/uvm_dpi.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/uvm_pkg.sv'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/base/uvm_base.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/base/uvm_coreservice.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/base/uvm_base.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/base/uvm_version.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/base/uvm_base.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/base/uvm_object_globals.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/base/uvm_base.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/base/uvm_misc.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/base/uvm_base.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/base/uvm_object.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/base/uvm_base.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/base/uvm_pool.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/base/uvm_base.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/base/uvm_queue.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/base/uvm_base.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/base/uvm_factory.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/base/uvm_base.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/base/uvm_registry.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/base/uvm_base.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/base/uvm_spell_chkr.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/base/uvm_base.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/base/uvm_resource.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/base/uvm_base.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/base/uvm_resource_specializations.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/base/uvm_base.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/base/uvm_resource_db.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/base/uvm_base.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/base/uvm_config_db.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/base/uvm_base.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/base/uvm_printer.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/base/uvm_base.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/base/uvm_comparer.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/base/uvm_base.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/base/uvm_packer.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/base/uvm_base.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/base/uvm_links.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/base/uvm_base.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/base/uvm_tr_database.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/base/uvm_base.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/base/uvm_tr_stream.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/base/uvm_base.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/base/uvm_recorder.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/base/uvm_base.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/base/uvm_event_callback.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/base/uvm_base.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/base/uvm_event.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/base/uvm_base.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/base/uvm_barrier.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/base/uvm_base.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/base/uvm_callback.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/uvm_macros.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/base/uvm_callback.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/base/uvm_base.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/base/uvm_report_message.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/base/uvm_base.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/base/uvm_report_catcher.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/base/uvm_base.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/base/uvm_report_server.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/base/uvm_base.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/base/uvm_report_handler.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/base/uvm_base.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/base/uvm_report_object.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/base/uvm_base.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/base/uvm_transaction.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/base/uvm_base.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/base/uvm_phase.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/base/uvm_base.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/base/uvm_domain.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/base/uvm_base.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/base/uvm_bottomup_phase.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/base/uvm_base.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/base/uvm_topdown_phase.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/base/uvm_base.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/base/uvm_task_phase.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/base/uvm_base.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/base/uvm_common_phases.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/base/uvm_base.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/base/uvm_runtime_phases.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/base/uvm_base.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/base/uvm_component.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/base/uvm_root.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/base/uvm_component.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/base/uvm_base.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/base/uvm_objection.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/base/uvm_base.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/base/uvm_heartbeat.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/base/uvm_base.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/base/uvm_globals.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/base/uvm_base.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/base/uvm_cmdline_processor.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/base/uvm_base.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/base/uvm_traversal.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/base/uvm_base.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/uvm_pkg.sv'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/dap/uvm_dap.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/dap/uvm_set_get_dap_base.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/dap/uvm_dap.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/dap/uvm_simple_lock_dap.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/dap/uvm_dap.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/dap/uvm_get_to_lock_dap.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/dap/uvm_dap.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/dap/uvm_set_before_get_dap.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/dap/uvm_dap.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/uvm_pkg.sv'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/tlm1/uvm_tlm.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/tlm1/uvm_tlm_ifs.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/tlm1/uvm_tlm.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/tlm1/uvm_sqr_ifs.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/tlm1/uvm_tlm.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/base/uvm_port_base.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/tlm1/uvm_tlm.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/tlm1/uvm_tlm_imps.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/tlm1/uvm_tlm.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/tlm1/uvm_imps.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/tlm1/uvm_tlm.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/tlm1/uvm_ports.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/tlm1/uvm_tlm.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/tlm1/uvm_exports.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/tlm1/uvm_tlm.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/tlm1/uvm_analysis_port.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/tlm1/uvm_tlm.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/tlm1/uvm_tlm_fifo_base.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/tlm1/uvm_tlm.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/tlm1/uvm_tlm_fifos.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/tlm1/uvm_tlm.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/tlm1/uvm_tlm_req_rsp.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/tlm1/uvm_tlm.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/tlm1/uvm_sqr_connections.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/tlm1/uvm_tlm.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/uvm_pkg.sv'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/comps/uvm_comps.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/comps/uvm_pair.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/comps/uvm_comps.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/comps/uvm_policies.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/comps/uvm_comps.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/comps/uvm_in_order_comparator.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/comps/uvm_comps.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/comps/uvm_algorithmic_comparator.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/comps/uvm_comps.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/comps/uvm_random_stimulus.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/comps/uvm_comps.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/comps/uvm_subscriber.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/comps/uvm_comps.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/comps/uvm_monitor.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/comps/uvm_comps.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/comps/uvm_driver.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/comps/uvm_comps.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/comps/uvm_push_driver.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/comps/uvm_comps.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/comps/uvm_scoreboard.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/comps/uvm_comps.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/comps/uvm_agent.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/comps/uvm_comps.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/comps/uvm_env.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/comps/uvm_comps.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/comps/uvm_test.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/comps/uvm_comps.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/uvm_pkg.sv'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/seq/uvm_seq.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/seq/uvm_sequence_item.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/seq/uvm_seq.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/seq/uvm_sequencer_base.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/seq/uvm_seq.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/seq/uvm_sequencer_analysis_fifo.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/seq/uvm_seq.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/seq/uvm_sequencer_param_base.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/seq/uvm_seq.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/seq/uvm_sequencer.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/seq/uvm_seq.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/seq/uvm_push_sequencer.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/seq/uvm_seq.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/seq/uvm_sequence_base.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/seq/uvm_seq.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/seq/uvm_sequence.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/seq/uvm_seq.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/seq/uvm_sequence_library.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/seq/uvm_seq.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/seq/uvm_sequence_builtin.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/seq/uvm_seq.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/uvm_pkg.sv'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/tlm2/uvm_tlm2.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/tlm2/uvm_tlm2_defines.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/tlm2/uvm_tlm2.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/tlm2/uvm_tlm2_time.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/tlm2/uvm_tlm2.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/tlm2/uvm_tlm2_generic_payload.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/tlm2/uvm_tlm2.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/tlm2/uvm_tlm2_ifs.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/tlm2/uvm_tlm2.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/tlm2/uvm_tlm2_imps.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/tlm2/uvm_tlm2.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/tlm2/uvm_tlm2_ports.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/tlm2/uvm_tlm2.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/tlm2/uvm_tlm2_exports.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/tlm2/uvm_tlm2.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/tlm2/uvm_tlm2_sockets_base.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/tlm2/uvm_tlm2.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/tlm2/uvm_tlm2_sockets.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/tlm2/uvm_tlm2.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/uvm_pkg.sv'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/reg/uvm_reg_model.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/reg/uvm_reg_item.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/reg/uvm_reg_model.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/reg/uvm_reg_adapter.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/reg/uvm_reg_model.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/reg/uvm_reg_predictor.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/reg/uvm_reg_model.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/reg/uvm_reg_sequence.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/reg/uvm_reg_model.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/reg/uvm_reg_cbs.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/reg/uvm_reg_model.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/reg/uvm_reg_backdoor.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/reg/uvm_reg_model.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/reg/uvm_reg_field.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/reg/uvm_reg_model.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/reg/uvm_vreg_field.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/reg/uvm_reg_model.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/reg/uvm_reg.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/reg/uvm_reg_model.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/reg/uvm_reg_indirect.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/reg/uvm_reg_model.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/reg/uvm_reg_fifo.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/reg/uvm_reg_model.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/reg/uvm_reg_file.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/reg/uvm_reg_model.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/reg/uvm_mem_mam.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/reg/uvm_reg_model.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/reg/uvm_vreg.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/reg/uvm_reg_model.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/reg/uvm_mem.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/reg/uvm_reg_model.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/reg/uvm_reg_map.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/reg/uvm_reg_model.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/reg/uvm_reg_block.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/reg/uvm_reg_model.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/reg/sequences/uvm_reg_hw_reset_seq.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/reg/uvm_reg_model.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/reg/sequences/uvm_reg_bit_bash_seq.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/reg/uvm_reg_model.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/reg/sequences/uvm_mem_walk_seq.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/reg/uvm_reg_model.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/reg/sequences/uvm_mem_access_seq.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/reg/uvm_reg_model.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/reg/sequences/uvm_reg_access_seq.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/reg/uvm_reg_model.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/reg/sequences/uvm_reg_mem_shared_access_seq.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/reg/uvm_reg_model.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/reg/sequences/uvm_reg_mem_built_in_seq.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/reg/uvm_reg_model.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/reg/sequences/uvm_reg_mem_hdl_paths_seq.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/reg/uvm_reg_model.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/reg/snps_uvm_reg_bank.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/reg/uvm_reg_model.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/uvm_pkg.sv'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/vcs/vcs_uvm_alt.sv'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/uvm_pkg.sv'.
+Parsing design file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/vcs/uvm_custom_install_vcs_recorder.sv'
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/vcs/msglog.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/vcs/uvm_custom_install_vcs_recorder.sv'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/vcs/uvm_msglog_report_server.sv'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/vcs/uvm_custom_install_vcs_recorder.sv'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/vcs/uvm_vcs_recorder.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/vcs/uvm_vcs_tr_database.svh'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/vcs/uvm_vcs_tr_stream.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/vcs/uvm_vcs_tr_database.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/vcs/uvm_vcs_recorder.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/vcs/uvm_custom_install_vcs_recorder.sv'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/vcs/uvm_vcs_record_interface.sv'.
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/macros/uvm_global_defines.svh'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/vcs/uvm_vcs_record_interface.sv'.
+Back to file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/vcs/uvm_custom_install_vcs_recorder.sv'.
+Parsing design file '../src/types/rdma_types_pkg.sv'
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/uvm_macros.svh'.
+Back to file '../src/types/rdma_types_pkg.sv'.
+Parsing included file '../src/types/rdma_enum_types.sv'.
+Back to file '../src/types/rdma_types_pkg.sv'.
+Parsing included file '../src/types/rdma_address_types.sv'.
+Back to file '../src/types/rdma_types_pkg.sv'.
+Parsing included file '../src/types/rdma_identity_types.sv'.
+Back to file '../src/types/rdma_types_pkg.sv'.
+Parsing included file '../src/types/rdma_status.sv'.
+Back to file '../src/types/rdma_types_pkg.sv'.
+Parsing design file '../src/model/rdma_model_pkg.sv'
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/uvm_macros.svh'.
+Back to file '../src/model/rdma_model_pkg.sv'.
+Parsing included file '../src/model/rdma_handle.sv'.
+Back to file '../src/model/rdma_model_pkg.sv'.
+Parsing included file '../src/model/rdma_function_identity.sv'.
+Back to file '../src/model/rdma_model_pkg.sv'.
+Parsing included file '../src/model/rdma_function_binding.sv'.
+Back to file '../src/model/rdma_model_pkg.sv'.
+Parsing included file '../src/model/rdma_dma_request_context.sv'.
+Back to file '../src/model/rdma_model_pkg.sv'.
+Parsing included file '../src/model/rdma_dma_mapping.sv'.
+Back to file '../src/model/rdma_model_pkg.sv'.
+Parsing included file '../src/model/rdma_resource_refs.sv'.
+Back to file '../src/model/rdma_model_pkg.sv'.
+Parsing included file '../src/model/rdma_context_types.sv'.
+Back to file '../src/model/rdma_model_pkg.sv'.
+Parsing included file '../src/model/rdma_queue_lifecycle_models.sv'.
+Back to file '../src/model/rdma_model_pkg.sv'.
+Parsing included file '../src/model/rdma_hw_image.sv'.
+Back to file '../src/model/rdma_model_pkg.sv'.
+Parsing included file '../src/model/rdma_semantic_requests.sv'.
+Back to file '../src/model/rdma_model_pkg.sv'.
+Parsing included file '../src/model/rdma_queue_txn_types.sv'.
+Back to file '../src/model/rdma_model_pkg.sv'.
+Parsing included file '../src/model/rdma_resources.sv'.
+Back to file '../src/model/rdma_model_pkg.sv'.
+Parsing included file '../src/model/rdma_context_layouts.sv'.
+Back to file '../src/model/rdma_model_pkg.sv'.
+Parsing included file '../src/model/rdma_context_models.sv'.
+Back to file '../src/model/rdma_model_pkg.sv'.
+Parsing included file '../src/model/rdma_submission_evidence.sv'.
+Back to file '../src/model/rdma_model_pkg.sv'.
+Parsing included file '../src/model/rdma_cmq_engine_models.sv'.
+Back to file '../src/model/rdma_model_pkg.sv'.
+Parsing included file '../src/model/rdma_cmq_execution_models.sv'.
+Back to file '../src/model/rdma_model_pkg.sv'.
+Parsing included file '../src/model/rdma_control_plane_models.sv'.
+Back to file '../src/model/rdma_model_pkg.sv'.
+Parsing included file '../src/model/rdma_queue_models.sv'.
+Back to file '../src/model/rdma_model_pkg.sv'.
+Parsing design file '../src/codec/rdma_codec_pkg.sv'
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/uvm_macros.svh'.
+Back to file '../src/codec/rdma_codec_pkg.sv'.
+Parsing included file '../src/codec/rdma/rdma_defs.svh'.
+Parsing included file '../src/codec/rdma/rdma_image_masks.svh'.
+Back to file '../src/codec/rdma/rdma_defs.svh'.
+Back to file '../src/codec/rdma_codec_pkg.sv'.
+Parsing included file '../src/codec/rdma_codec_base.sv'.
+Back to file '../src/codec/rdma_codec_pkg.sv'.
+Parsing included file '../src/codec/rdma_codec_registry.sv'.
+Back to file '../src/codec/rdma_codec_pkg.sv'.
+Parsing included file '../src/codec/rdma_bit_packer.sv'.
+Back to file '../src/codec/rdma_codec_pkg.sv'.
+Parsing included file '../src/codec/rdma_cmq_hw_profile.sv'.
+Back to file '../src/codec/rdma_codec_pkg.sv'.
+Parsing included file '../src/codec/rdma/rdma_qword_codec.sv'.
+Back to file '../src/codec/rdma_codec_pkg.sv'.
+Parsing included file '../src/codec/rdma/rdma_queue_page_codec.sv'.
+Back to file '../src/codec/rdma_codec_pkg.sv'.
+Parsing included file '../src/codec/rdma/rdma_queue_codecs.sv'.
+Back to file '../src/codec/rdma_codec_pkg.sv'.
+Parsing included file '../src/codec/rdma/rdma_doorbell_codecs.sv'.
+Back to file '../src/codec/rdma_codec_pkg.sv'.
+Parsing included file '../src/codec/rdma/rdma_qpc_codecs.sv'.
+Back to file '../src/codec/rdma_codec_pkg.sv'.
+Parsing included file '../src/codec/rdma/rdma_context_body_codecs.sv'.
+Back to file '../src/codec/rdma_codec_pkg.sv'.
+Parsing included file '../src/codec/rdma/rdma_cmq_codecs.sv'.
+Back to file '../src/codec/rdma_codec_pkg.sv'.
+Parsing included file '../src/codec/rdma/rdma_error_codec.sv'.
+Back to file '../src/codec/rdma_codec_pkg.sv'.
+Parsing included file '../src/codec/rdma/rdma_cmq_hw_profile.sv'.
+Back to file '../src/codec/rdma_codec_pkg.sv'.
+Parsing design file '../src/adapter/rdma_adapter_pkg.sv'
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/uvm_macros.svh'.
+Back to file '../src/adapter/rdma_adapter_pkg.sv'.
+Parsing included file '../src/adapter/rdma_host_mem_api.sv'.
+Back to file '../src/adapter/rdma_adapter_pkg.sv'.
+Parsing included file '../src/adapter/rdma_queue_host_mem_submitter.sv'.
+Back to file '../src/adapter/rdma_adapter_pkg.sv'.
+Parsing included file '../src/adapter/rdma_context_backing_api.sv'.
+Back to file '../src/adapter/rdma_adapter_pkg.sv'.
+Parsing included file '../src/adapter/rdma_pcie_api.sv'.
+Back to file '../src/adapter/rdma_adapter_pkg.sv'.
+Parsing included file '../src/adapter/rdma_function_table_api.sv'.
+Back to file '../src/adapter/rdma_adapter_pkg.sv'.
+Parsing included file '../src/adapter/rdma_net_api.sv'.
+Back to file '../src/adapter/rdma_adapter_pkg.sv'.
+Parsing included file '../src/adapter/rdma_abi_v5_api.sv'.
+Back to file '../src/adapter/rdma_adapter_pkg.sv'.
+Parsing design file '../src/core/rdma_core_pkg.sv'
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/uvm_macros.svh'.
+Back to file '../src/core/rdma_core_pkg.sv'.
+Parsing included file '../src/core/rdma_stag_key_policy.sv'.
+Back to file '../src/core/rdma_core_pkg.sv'.
+Parsing included file '../src/core/rdma_hmc_allocator.sv'.
+Back to file '../src/core/rdma_core_pkg.sv'.
+Parsing included file '../src/core/rdma_pcie_bar_allocator.sv'.
+Back to file '../src/core/rdma_core_pkg.sv'.
+Parsing included file '../src/core/rdma_sriov_enumerator.sv'.
+Back to file '../src/core/rdma_core_pkg.sv'.
+Parsing included file '../src/core/rdma_resource_manager.sv'.
+Back to file '../src/core/rdma_core_pkg.sv'.
+Parsing included file '../src/core/rdma_responder_registry.sv'.
+Back to file '../src/core/rdma_core_pkg.sv'.
+Parsing included file '../src/core/rdma_queue_lifecycle_policy.sv'.
+Back to file '../src/core/rdma_core_pkg.sv'.
+Parsing included file '../src/core/rdma_queue_backing_planner.sv'.
+Back to file '../src/core/rdma_core_pkg.sv'.
+Parsing included file '../src/core/rdma_queue_runtime.sv'.
+Back to file '../src/core/rdma_core_pkg.sv'.
+Parsing included file '../src/core/rdma_queue_backing_access.sv'.
+Back to file '../src/core/rdma_core_pkg.sv'.
+Parsing included file '../src/core/rdma_coverage.sv'.
+Back to file '../src/core/rdma_core_pkg.sv'.
+Parsing included file '../src/core/rdma_doorbell_scheduler.sv'.
+Back to file '../src/core/rdma_core_pkg.sv'.
+Parsing included file '../src/core/rdma_queue_data_engine.sv'.
+Back to file '../src/core/rdma_core_pkg.sv'.
+Parsing included file '../src/core/rdma_sq_engine.sv'.
+Back to file '../src/core/rdma_core_pkg.sv'.
+Parsing included file '../src/core/rdma_rq_engine.sv'.
+Back to file '../src/core/rdma_core_pkg.sv'.
+Parsing included file '../src/core/rdma_cq_engine.sv'.
+Back to file '../src/core/rdma_core_pkg.sv'.
+Parsing included file '../src/core/rdma_eq_engine.sv'.
+Back to file '../src/core/rdma_core_pkg.sv'.
+Parsing included file '../src/core/rdma_cmq_port.sv'.
+Back to file '../src/core/rdma_core_pkg.sv'.
+Parsing included file '../src/core/rdma_queue_lifecycle_executor.sv'.
+Back to file '../src/core/rdma_core_pkg.sv'.
+Parsing included file '../src/core/rdma_qp_lifecycle_executor.sv'.
+Back to file '../src/core/rdma_core_pkg.sv'.
+Parsing included file '../src/core/rdma_control_plane.sv'.
+Back to file '../src/core/rdma_core_pkg.sv'.
+Parsing included file '../src/core/rdma_cmq_transport.sv'.
+Back to file '../src/core/rdma_core_pkg.sv'.
+Parsing included file '../src/core/rdma_cmq_engine.sv'.
+
+Warning-[KUAI] Keyword used as identifier
+../src/core/rdma_cmq_engine.sv, 5757
+  'context' is a SystemVerilog keyword and may not be used as an identifier.
+  To avoid possible compatibility issue(s) in the future, please rename the 
+  identifier.
+
+
+Warning-[KUAI] Keyword used as identifier
+../src/core/rdma_cmq_engine.sv, 5770
+  'context' is a SystemVerilog keyword and may not be used as an identifier.
+  To avoid possible compatibility issue(s) in the future, please rename the 
+  identifier.
+
+
+Warning-[KUAI] Keyword used as identifier
+../src/core/rdma_cmq_engine.sv, 5876
+  'context' is a SystemVerilog keyword and may not be used as an identifier.
+  To avoid possible compatibility issue(s) in the future, please rename the 
+  identifier.
+
+
+Warning-[KUAI] Keyword used as identifier
+../src/core/rdma_cmq_engine.sv, 5880
+  'context' is a SystemVerilog keyword and may not be used as an identifier.
+  To avoid possible compatibility issue(s) in the future, please rename the 
+  identifier.
+
+
+Warning-[KUAI] Keyword used as identifier
+../src/core/rdma_cmq_engine.sv, 5891
+  'context' is a SystemVerilog keyword and may not be used as an identifier.
+  To avoid possible compatibility issue(s) in the future, please rename the 
+  identifier.
+
+
+Warning-[KUAI] Keyword used as identifier
+../src/core/rdma_cmq_engine.sv, 5903
+  'context' is a SystemVerilog keyword and may not be used as an identifier.
+  To avoid possible compatibility issue(s) in the future, please rename the 
+  identifier.
+
+
+Warning-[KUAI] Keyword used as identifier
+../src/core/rdma_cmq_engine.sv, 5985
+  'context' is a SystemVerilog keyword and may not be used as an identifier.
+  To avoid possible compatibility issue(s) in the future, please rename the 
+  identifier.
+
+
+Warning-[KUAI] Keyword used as identifier
+../src/core/rdma_cmq_engine.sv, 6006
+  'context' is a SystemVerilog keyword and may not be used as an identifier.
+  To avoid possible compatibility issue(s) in the future, please rename the 
+  identifier.
+
+
+Warning-[KUAI] Keyword used as identifier
+../src/core/rdma_cmq_engine.sv, 6010
+  'context' is a SystemVerilog keyword and may not be used as an identifier.
+  To avoid possible compatibility issue(s) in the future, please rename the 
+  identifier.
+
+
+Warning-[KUAI] Keyword used as identifier
+../src/core/rdma_cmq_engine.sv, 6232
+  'context' is a SystemVerilog keyword and may not be used as an identifier.
+  To avoid possible compatibility issue(s) in the future, please rename the 
+  identifier.
+
+
+Warning-[KUAI] Keyword used as identifier
+../src/core/rdma_cmq_engine.sv, 6245
+  'context' is a SystemVerilog keyword and may not be used as an identifier.
+  To avoid possible compatibility issue(s) in the future, please rename the 
+  identifier.
+
+
+Warning-[KUAI] Keyword used as identifier
+../src/core/rdma_cmq_engine.sv, 6298
+  'context' is a SystemVerilog keyword and may not be used as an identifier.
+  To avoid possible compatibility issue(s) in the future, please rename the 
+  identifier.
+
+
+Warning-[KUAI] Keyword used as identifier
+../src/core/rdma_cmq_engine.sv, 6368
+  'context' is a SystemVerilog keyword and may not be used as an identifier.
+  To avoid possible compatibility issue(s) in the future, please rename the 
+  identifier.
+
+
+Warning-[KUAI] Keyword used as identifier
+../src/core/rdma_cmq_engine.sv, 6371
+  'context' is a SystemVerilog keyword and may not be used as an identifier.
+  To avoid possible compatibility issue(s) in the future, please rename the 
+  identifier.
+
+
+Warning-[KUAI] Keyword used as identifier
+../src/core/rdma_cmq_engine.sv, 6373
+  'context' is a SystemVerilog keyword and may not be used as an identifier.
+  To avoid possible compatibility issue(s) in the future, please rename the 
+  identifier.
+
+
+Warning-[KUAI] Keyword used as identifier
+../src/core/rdma_cmq_engine.sv, 6420
+  'context' is a SystemVerilog keyword and may not be used as an identifier.
+  To avoid possible compatibility issue(s) in the future, please rename the 
+  identifier.
+
+
+Warning-[KUAI] Keyword used as identifier
+../src/core/rdma_cmq_engine.sv, 6440
+  'context' is a SystemVerilog keyword and may not be used as an identifier.
+  To avoid possible compatibility issue(s) in the future, please rename the 
+  identifier.
+
+
+Warning-[KUAI] Keyword used as identifier
+../src/core/rdma_cmq_engine.sv, 6446
+  'context' is a SystemVerilog keyword and may not be used as an identifier.
+  To avoid possible compatibility issue(s) in the future, please rename the 
+  identifier.
+
+
+Warning-[KUAI] Keyword used as identifier
+../src/core/rdma_cmq_engine.sv, 6454
+  'context' is a SystemVerilog keyword and may not be used as an identifier.
+  To avoid possible compatibility issue(s) in the future, please rename the 
+  identifier.
+
+
+Warning-[KUAI] Keyword used as identifier
+../src/core/rdma_cmq_engine.sv, 6461
+  'context' is a SystemVerilog keyword and may not be used as an identifier.
+  To avoid possible compatibility issue(s) in the future, please rename the 
+  identifier.
+
+
+Warning-[KUAI] Keyword used as identifier
+../src/core/rdma_cmq_engine.sv, 6463
+  'context' is a SystemVerilog keyword and may not be used as an identifier.
+  To avoid possible compatibility issue(s) in the future, please rename the 
+  identifier.
+
+
+Warning-[KUAI] Keyword used as identifier
+../src/core/rdma_cmq_engine.sv, 6480
+  'context' is a SystemVerilog keyword and may not be used as an identifier.
+  To avoid possible compatibility issue(s) in the future, please rename the 
+  identifier.
+
+
+Warning-[KUAI] Keyword used as identifier
+../src/core/rdma_cmq_engine.sv, 6540
+  'context' is a SystemVerilog keyword and may not be used as an identifier.
+  To avoid possible compatibility issue(s) in the future, please rename the 
+  identifier.
+
+
+Warning-[KUAI] Keyword used as identifier
+../src/core/rdma_cmq_engine.sv, 6567
+  'context' is a SystemVerilog keyword and may not be used as an identifier.
+  To avoid possible compatibility issue(s) in the future, please rename the 
+  identifier.
+
+
+Warning-[KUAI] Keyword used as identifier
+../src/core/rdma_cmq_engine.sv, 6640
+  'context' is a SystemVerilog keyword and may not be used as an identifier.
+  To avoid possible compatibility issue(s) in the future, please rename the 
+  identifier.
+
+
+Warning-[KUAI] Keyword used as identifier
+../src/core/rdma_cmq_engine.sv, 6648
+  'context' is a SystemVerilog keyword and may not be used as an identifier.
+  To avoid possible compatibility issue(s) in the future, please rename the 
+  identifier.
+
+
+Warning-[KUAI] Keyword used as identifier
+../src/core/rdma_cmq_engine.sv, 6656
+  'context' is a SystemVerilog keyword and may not be used as an identifier.
+  To avoid possible compatibility issue(s) in the future, please rename the 
+  identifier.
+
+
+Warning-[KUAI] Keyword used as identifier
+../src/core/rdma_cmq_engine.sv, 6697
+  'context' is a SystemVerilog keyword and may not be used as an identifier.
+  To avoid possible compatibility issue(s) in the future, please rename the 
+  identifier.
+
+
+Warning-[KUAI] Keyword used as identifier
+../src/core/rdma_cmq_engine.sv, 6705
+  'context' is a SystemVerilog keyword and may not be used as an identifier.
+  To avoid possible compatibility issue(s) in the future, please rename the 
+  identifier.
+
+
+Warning-[KUAI] Keyword used as identifier
+../src/core/rdma_cmq_engine.sv, 6760
+  'context' is a SystemVerilog keyword and may not be used as an identifier.
+  To avoid possible compatibility issue(s) in the future, please rename the 
+  identifier.
+
+
+Warning-[KUAI] Keyword used as identifier
+../src/core/rdma_cmq_engine.sv, 6803
+  'context' is a SystemVerilog keyword and may not be used as an identifier.
+  To avoid possible compatibility issue(s) in the future, please rename the 
+  identifier.
+
+
+Warning-[KUAI] Keyword used as identifier
+../src/core/rdma_cmq_engine.sv, 6923
+  'context' is a SystemVerilog keyword and may not be used as an identifier.
+  To avoid possible compatibility issue(s) in the future, please rename the 
+  identifier.
+
+
+Warning-[KUAI] Keyword used as identifier
+../src/core/rdma_cmq_engine.sv, 6974
+  'context' is a SystemVerilog keyword and may not be used as an identifier.
+  To avoid possible compatibility issue(s) in the future, please rename the 
+  identifier.
+
+
+Warning-[KUAI] Keyword used as identifier
+../src/core/rdma_cmq_engine.sv, 6982
+  'context' is a SystemVerilog keyword and may not be used as an identifier.
+  To avoid possible compatibility issue(s) in the future, please rename the 
+  identifier.
+
+
+Warning-[KUAI] Keyword used as identifier
+../src/core/rdma_cmq_engine.sv, 6990
+  'context' is a SystemVerilog keyword and may not be used as an identifier.
+  To avoid possible compatibility issue(s) in the future, please rename the 
+  identifier.
+
+
+Warning-[KUAI] Keyword used as identifier
+../src/core/rdma_cmq_engine.sv, 7056
+  'context' is a SystemVerilog keyword and may not be used as an identifier.
+  To avoid possible compatibility issue(s) in the future, please rename the 
+  identifier.
+
+
+Warning-[KUAI] Keyword used as identifier
+../src/core/rdma_cmq_engine.sv, 7340
+  'context' is a SystemVerilog keyword and may not be used as an identifier.
+  To avoid possible compatibility issue(s) in the future, please rename the 
+  identifier.
+
+
+Warning-[KUAI] Keyword used as identifier
+../src/core/rdma_cmq_engine.sv, 7344
+  'context' is a SystemVerilog keyword and may not be used as an identifier.
+  To avoid possible compatibility issue(s) in the future, please rename the 
+  identifier.
+
+
+Warning-[KUAI] Keyword used as identifier
+../src/core/rdma_cmq_engine.sv, 7345
+  'context' is a SystemVerilog keyword and may not be used as an identifier.
+  To avoid possible compatibility issue(s) in the future, please rename the 
+  identifier.
+
+
+Warning-[KUAI] Keyword used as identifier
+../src/core/rdma_cmq_engine.sv, 13532
+  'context' is a SystemVerilog keyword and may not be used as an identifier.
+  To avoid possible compatibility issue(s) in the future, please rename the 
+  identifier.
+
+
+Warning-[KUAI] Keyword used as identifier
+../src/core/rdma_cmq_engine.sv, 13550
+  'context' is a SystemVerilog keyword and may not be used as an identifier.
+  To avoid possible compatibility issue(s) in the future, please rename the 
+  identifier.
+
+
+Warning-[KUAI] Keyword used as identifier
+../src/core/rdma_cmq_engine.sv, 13552
+  'context' is a SystemVerilog keyword and may not be used as an identifier.
+  To avoid possible compatibility issue(s) in the future, please rename the 
+  identifier.
+
+
+Warning-[KUAI] Keyword used as identifier
+../src/core/rdma_cmq_engine.sv, 13685
+  'context' is a SystemVerilog keyword and may not be used as an identifier.
+  To avoid possible compatibility issue(s) in the future, please rename the 
+  identifier.
+
+
+Warning-[KUAI] Keyword used as identifier
+../src/core/rdma_cmq_engine.sv, 13730
+  'context' is a SystemVerilog keyword and may not be used as an identifier.
+  To avoid possible compatibility issue(s) in the future, please rename the 
+  identifier.
+
+
+Warning-[KUAI] Keyword used as identifier
+../src/core/rdma_cmq_engine.sv, 13732
+  'context' is a SystemVerilog keyword and may not be used as an identifier.
+  To avoid possible compatibility issue(s) in the future, please rename the 
+  identifier.
+
+Back to file '../src/core/rdma_core_pkg.sv'.
+Parsing included file '../src/core/rdma_cmq_engine_port_adapter.sv'.
+Back to file '../src/core/rdma_core_pkg.sv'.
+Parsing included file '../src/core/rdma_sq_payload_writer.sv'.
+Back to file '../src/core/rdma_core_pkg.sv'.
+Parsing included file '../src/core/rdma_env_config.sv'.
+Back to file '../src/core/rdma_core_pkg.sv'.
+Parsing included file '../src/core/rdma_env.sv'.
+Back to file '../src/core/rdma_core_pkg.sv'.
+Parsing design file '../tests/rdma_unit_test_pkg.sv'
+Parsing included file '/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/uvm_macros.svh'.
+Back to file '../tests/rdma_unit_test_pkg.sv'.
+Parsing included file '../tests/mocks/rdma_mock_adapters.sv'.
+Back to file '../tests/rdma_unit_test_pkg.sv'.
+Parsing included file '../tests/mocks/rdma_mock_control_plane.sv'.
+Back to file '../tests/rdma_unit_test_pkg.sv'.
+Parsing included file '../tests/mocks/rdma_mock_context_backing.sv'.
+Back to file '../tests/rdma_unit_test_pkg.sv'.
+Parsing included file '../tests/support/rdma_golden_reader.sv'.
+Back to file '../tests/rdma_unit_test_pkg.sv'.
+Parsing included file '../tests/support/rdma_cmq_contract_reader.sv'.
+Back to file '../tests/rdma_unit_test_pkg.sv'.
+Parsing included file '../tests/unit/rdma_smoke_test.sv'.
+Back to file '../tests/rdma_unit_test_pkg.sv'.
+Parsing included file '../tests/unit/rdma_responder_registry_test.sv'.
+Back to file '../tests/rdma_unit_test_pkg.sv'.
+Parsing included file '../tests/unit/rdma_env_composition_test.sv'.
+Back to file '../tests/rdma_unit_test_pkg.sv'.
+Parsing included file '../tests/unit/rdma_types_test.sv'.
+Back to file '../tests/rdma_unit_test_pkg.sv'.
+Parsing included file '../tests/unit/rdma_model_test.sv'.
+Back to file '../tests/rdma_unit_test_pkg.sv'.
+Parsing included file '../tests/unit/rdma_cmq_engine_models_test.sv'.
+Back to file '../tests/rdma_unit_test_pkg.sv'.
+Parsing included file '../tests/unit/rdma_control_plane_models_test.sv'.
+Back to file '../tests/rdma_unit_test_pkg.sv'.
+Parsing included file '../tests/unit/rdma_context_model_test.sv'.
+Back to file '../tests/rdma_unit_test_pkg.sv'.
+Parsing included file '../tests/unit/rdma_request_model_test.sv'.
+Back to file '../tests/rdma_unit_test_pkg.sv'.
+Parsing included file '../tests/unit/rdma_sq_models_test.sv'.
+Back to file '../tests/rdma_unit_test_pkg.sv'.
+Parsing included file '../tests/unit/rdma_queue_model_test.sv'.
+Back to file '../tests/rdma_unit_test_pkg.sv'.
+Parsing included file '../tests/unit/rdma_adapter_contract_test.sv'.
+Back to file '../tests/rdma_unit_test_pkg.sv'.
+Parsing included file '../tests/unit/rdma_resource_manager_test.sv'.
+Back to file '../tests/rdma_unit_test_pkg.sv'.
+Parsing included file '../tests/unit/rdma_queue_lifecycle_models_test.sv'.
+Back to file '../tests/rdma_unit_test_pkg.sv'.
+Parsing included file '../tests/unit/rdma_queue_lifecycle_test.sv'.
+Back to file '../tests/rdma_unit_test_pkg.sv'.
+Parsing included file '../tests/unit/rdma_qp_lifecycle_test.sv'.
+Back to file '../tests/rdma_unit_test_pkg.sv'.
+Parsing included file '../tests/unit/rdma_qp_recovery_test.sv'.
+Back to file '../tests/rdma_unit_test_pkg.sv'.
+Parsing included file '../tests/unit/rdma_queue_recovery_test.sv'.
+Back to file '../tests/rdma_unit_test_pkg.sv'.
+Parsing included file '../tests/unit/rdma_context_backing_contract_test.sv'.
+Back to file '../tests/rdma_unit_test_pkg.sv'.
+Parsing included file '../tests/unit/rdma_doorbell_scheduler_test.sv'.
+Back to file '../tests/rdma_unit_test_pkg.sv'.
+Parsing included file '../tests/unit/rdma_cmq_engine_test.sv'.
+
+Warning-[KUAI] Keyword used as identifier
+../tests/unit/rdma_cmq_engine_test.sv, 4516
+  'context' is a SystemVerilog keyword and may not be used as an identifier.
+  To avoid possible compatibility issue(s) in the future, please rename the 
+  identifier.
+
+
+Warning-[KUAI] Keyword used as identifier
+../tests/unit/rdma_cmq_engine_test.sv, 4518
+  'context' is a SystemVerilog keyword and may not be used as an identifier.
+  To avoid possible compatibility issue(s) in the future, please rename the 
+  identifier.
+
+
+Warning-[KUAI] Keyword used as identifier
+../tests/unit/rdma_cmq_engine_test.sv, 4520
+  'context' is a SystemVerilog keyword and may not be used as an identifier.
+  To avoid possible compatibility issue(s) in the future, please rename the 
+  identifier.
+
+
+Warning-[KUAI] Keyword used as identifier
+../tests/unit/rdma_cmq_engine_test.sv, 7709
+  'context' is a SystemVerilog keyword and may not be used as an identifier.
+  To avoid possible compatibility issue(s) in the future, please rename the 
+  identifier.
+
+
+Warning-[KUAI] Keyword used as identifier
+../tests/unit/rdma_cmq_engine_test.sv, 7713
+  'context' is a SystemVerilog keyword and may not be used as an identifier.
+  To avoid possible compatibility issue(s) in the future, please rename the 
+  identifier.
+
+
+Warning-[KUAI] Keyword used as identifier
+../tests/unit/rdma_cmq_engine_test.sv, 7714
+  'context' is a SystemVerilog keyword and may not be used as an identifier.
+  To avoid possible compatibility issue(s) in the future, please rename the 
+  identifier.
+
+
+Warning-[KUAI] Keyword used as identifier
+../tests/unit/rdma_cmq_engine_test.sv, 7717
+  'context' is a SystemVerilog keyword and may not be used as an identifier.
+  To avoid possible compatibility issue(s) in the future, please rename the 
+  identifier.
+
+
+Warning-[KUAI] Keyword used as identifier
+../tests/unit/rdma_cmq_engine_test.sv, 7718
+  'context' is a SystemVerilog keyword and may not be used as an identifier.
+  To avoid possible compatibility issue(s) in the future, please rename the 
+  identifier.
+
+
+Warning-[KUAI] Keyword used as identifier
+../tests/unit/rdma_cmq_engine_test.sv, 7719
+  'context' is a SystemVerilog keyword and may not be used as an identifier.
+  To avoid possible compatibility issue(s) in the future, please rename the 
+  identifier.
+
+
+Warning-[KUAI] Keyword used as identifier
+../tests/unit/rdma_cmq_engine_test.sv, 7720
+  'context' is a SystemVerilog keyword and may not be used as an identifier.
+  To avoid possible compatibility issue(s) in the future, please rename the 
+  identifier.
+
+
+Warning-[KUAI] Keyword used as identifier
+../tests/unit/rdma_cmq_engine_test.sv, 7721
+  'context' is a SystemVerilog keyword and may not be used as an identifier.
+  To avoid possible compatibility issue(s) in the future, please rename the 
+  identifier.
+
+
+Warning-[KUAI] Keyword used as identifier
+../tests/unit/rdma_cmq_engine_test.sv, 7722
+  'context' is a SystemVerilog keyword and may not be used as an identifier.
+  To avoid possible compatibility issue(s) in the future, please rename the 
+  identifier.
+
+
+Warning-[KUAI] Keyword used as identifier
+../tests/unit/rdma_cmq_engine_test.sv, 7723
+  'context' is a SystemVerilog keyword and may not be used as an identifier.
+  To avoid possible compatibility issue(s) in the future, please rename the 
+  identifier.
+
+
+Warning-[KUAI] Keyword used as identifier
+../tests/unit/rdma_cmq_engine_test.sv, 7724
+  'context' is a SystemVerilog keyword and may not be used as an identifier.
+  To avoid possible compatibility issue(s) in the future, please rename the 
+  identifier.
+
+
+Warning-[KUAI] Keyword used as identifier
+../tests/unit/rdma_cmq_engine_test.sv, 7725
+  'context' is a SystemVerilog keyword and may not be used as an identifier.
+  To avoid possible compatibility issue(s) in the future, please rename the 
+  identifier.
+
+
+Warning-[KUAI] Keyword used as identifier
+../tests/unit/rdma_cmq_engine_test.sv, 7726
+  'context' is a SystemVerilog keyword and may not be used as an identifier.
+  To avoid possible compatibility issue(s) in the future, please rename the 
+  identifier.
+
+
+Warning-[KUAI] Keyword used as identifier
+../tests/unit/rdma_cmq_engine_test.sv, 7730
+  'context' is a SystemVerilog keyword and may not be used as an identifier.
+  To avoid possible compatibility issue(s) in the future, please rename the 
+  identifier.
+
+
+Warning-[KUAI] Keyword used as identifier
+../tests/unit/rdma_cmq_engine_test.sv, 7731
+  'context' is a SystemVerilog keyword and may not be used as an identifier.
+  To avoid possible compatibility issue(s) in the future, please rename the 
+  identifier.
+
+
+Warning-[KUAI] Keyword used as identifier
+../tests/unit/rdma_cmq_engine_test.sv, 7732
+  'context' is a SystemVerilog keyword and may not be used as an identifier.
+  To avoid possible compatibility issue(s) in the future, please rename the 
+  identifier.
+
+Back to file '../tests/rdma_unit_test_pkg.sv'.
+Parsing included file '../tests/unit/rdma_cmq_port_test.sv'.
+Back to file '../tests/rdma_unit_test_pkg.sv'.
+Parsing included file '../tests/unit/rdma_control_plane_test.sv'.
+Back to file '../tests/rdma_unit_test_pkg.sv'.
+Parsing included file '../tests/unit/rdma_control_plane_cmq_engine_test.sv'.
+Back to file '../tests/rdma_unit_test_pkg.sv'.
+Parsing included file '../tests/unit/rdma_codec_registry_test.sv'.
+Back to file '../tests/rdma_unit_test_pkg.sv'.
+Parsing included file '../tests/unit/rdma_defs_test.sv'.
+Back to file '../tests/rdma_unit_test_pkg.sv'.
+Parsing included file '../tests/unit/rdma_qword_codec_test.sv'.
+Back to file '../tests/rdma_unit_test_pkg.sv'.
+Parsing included file '../tests/unit/rdma_queue_page_codec_test.sv'.
+Back to file '../tests/rdma_unit_test_pkg.sv'.
+Parsing included file '../tests/unit/rdma_queue_codec_test.sv'.
+Back to file '../tests/rdma_unit_test_pkg.sv'.
+Parsing included file '../tests/unit/rdma_cqe_size_codec_test.sv'.
+Back to file '../tests/rdma_unit_test_pkg.sv'.
+Parsing included file '../tests/unit/rdma_sq_codec_test.sv'.
+Back to file '../tests/rdma_unit_test_pkg.sv'.
+Parsing included file '../tests/unit/rdma_ud_urc_sqe_codec_test.sv'.
+Back to file '../tests/rdma_unit_test_pkg.sv'.
+Parsing included file '../tests/unit/rdma_wqe_extended_opcode_test.sv'.
+Back to file '../tests/rdma_unit_test_pkg.sv'.
+Parsing included file '../tests/unit/rdma_sqe_authority_test.sv'.
+Back to file '../tests/rdma_unit_test_pkg.sv'.
+Parsing included file '../tests/unit/rdma_queue_host_mem_submitter_test.sv'.
+
+Warning-[KUAI] Keyword used as identifier
+../tests/unit/rdma_queue_host_mem_submitter_test.sv, 55
+  'context' is a SystemVerilog keyword and may not be used as an identifier.
+  To avoid possible compatibility issue(s) in the future, please rename the 
+  identifier.
+
+
+Warning-[KUAI] Keyword used as identifier
+../tests/unit/rdma_queue_host_mem_submitter_test.sv, 81
+  'context' is a SystemVerilog keyword and may not be used as an identifier.
+  To avoid possible compatibility issue(s) in the future, please rename the 
+  identifier.
+
+
+Warning-[KUAI] Keyword used as identifier
+../tests/unit/rdma_queue_host_mem_submitter_test.sv, 85
+  'context' is a SystemVerilog keyword and may not be used as an identifier.
+  To avoid possible compatibility issue(s) in the future, please rename the 
+  identifier.
+
+
+Warning-[KUAI] Keyword used as identifier
+../tests/unit/rdma_queue_host_mem_submitter_test.sv, 94
+  'context' is a SystemVerilog keyword and may not be used as an identifier.
+  To avoid possible compatibility issue(s) in the future, please rename the 
+  identifier.
+
+
+Warning-[KUAI] Keyword used as identifier
+../tests/unit/rdma_queue_host_mem_submitter_test.sv, 95
+  'context' is a SystemVerilog keyword and may not be used as an identifier.
+  To avoid possible compatibility issue(s) in the future, please rename the 
+  identifier.
+
+Back to file '../tests/rdma_unit_test_pkg.sv'.
+Parsing included file '../tests/unit/rdma_queue_runtime_test.sv'.
+Back to file '../tests/rdma_unit_test_pkg.sv'.
+Parsing included file '../tests/unit/rdma_queue_backing_access_test.sv'.
+Back to file '../tests/rdma_unit_test_pkg.sv'.
+Parsing included file '../tests/unit/rdma_queue_data_engine_post_test.sv'.
+Back to file '../tests/rdma_unit_test_pkg.sv'.
+Parsing included file '../tests/unit/rdma_queue_data_engine_device_publish_test.sv'.
+Back to file '../tests/rdma_unit_test_pkg.sv'.
+Parsing included file '../tests/unit/rdma_queue_data_engine_final_fix_test.sv'.
+Back to file '../tests/rdma_unit_test_pkg.sv'.
+Parsing included file '../tests/unit/rdma_cq_engine_resize_test.sv'.
+Back to file '../tests/rdma_unit_test_pkg.sv'.
+Parsing included file '../tests/unit/rdma_queue_data_engine_poll_test.sv'.
+Back to file '../tests/rdma_unit_test_pkg.sv'.
+Parsing included file '../tests/unit/rdma_queue_data_engine_recovery_test.sv'.
+Back to file '../tests/rdma_unit_test_pkg.sv'.
+Parsing included file '../tests/unit/rdma_sq_engine_test.sv'.
+Back to file '../tests/rdma_unit_test_pkg.sv'.
+Parsing included file '../tests/unit/rdma_rq_engine_test.sv'.
+Back to file '../tests/rdma_unit_test_pkg.sv'.
+Parsing included file '../tests/unit/rdma_cq_engine_test.sv'.
+Back to file '../tests/rdma_unit_test_pkg.sv'.
+Parsing included file '../tests/unit/rdma_cq_shadow_flush_test.sv'.
+Back to file '../tests/rdma_unit_test_pkg.sv'.
+Parsing included file '../tests/unit/rdma_eq_engine_test.sv'.
+Back to file '../tests/rdma_unit_test_pkg.sv'.
+Parsing included file '../tests/unit/rdma_doorbell_codec_test.sv'.
+Back to file '../tests/rdma_unit_test_pkg.sv'.
+Parsing included file '../tests/unit/rdma_qpc_codec_test.sv'.
+Back to file '../tests/rdma_unit_test_pkg.sv'.
+Parsing included file '../tests/unit/rdma_context_body_codec_test.sv'.
+Back to file '../tests/rdma_unit_test_pkg.sv'.
+Parsing included file '../tests/unit/rdma_cmq_codec_test.sv'.
+Back to file '../tests/rdma_unit_test_pkg.sv'.
+Parsing included file '../tests/unit/rdma_error_codec_test.sv'.
+Back to file '../tests/rdma_unit_test_pkg.sv'.
+Parsing included file '../tests/unit/rdma_cmq_completion_test.sv'.
+Back to file '../tests/rdma_unit_test_pkg.sv'.
+Parsing included file '../tests/unit/rdma_cmq_profile_test.sv'.
+Back to file '../tests/rdma_unit_test_pkg.sv'.
+Parsing included file '../tests/unit/rdma_cmq_driver_field_mutation_test.sv'.
+Back to file '../tests/rdma_unit_test_pkg.sv'.
+Parsing included file '../tests/unit/rdma_context_cmq_regression_test.sv'.
+Back to file '../tests/rdma_unit_test_pkg.sv'.
+Parsing included file '../tests/unit/rdma_harness_expected_failure_probe.sv'.
+Back to file '../tests/rdma_unit_test_pkg.sv'.
+Parsing included file '../tests/unit/rdma_sq_payload_writer_test.sv'.
+Back to file '../tests/rdma_unit_test_pkg.sv'.
+Parsing included file '../tests/unit/rdma_function_identity_test.sv'.
+Back to file '../tests/rdma_unit_test_pkg.sv'.
+Parsing included file '../tests/unit/rdma_queue_txn_journal_test.sv'.
+Back to file '../tests/rdma_unit_test_pkg.sv'.
+Parsing included file '../tests/unit/rdma_abi_v5_adapter_test.sv'.
+Back to file '../tests/rdma_unit_test_pkg.sv'.
+Parsing included file '../tests/unit/rdma_umem_pbl_mw_test.sv'.
+Back to file '../tests/rdma_unit_test_pkg.sv'.
+Parsing included file '../tests/unit/rdma_coverage_test.sv'.
+Back to file '../tests/rdma_unit_test_pkg.sv'.
+Parsing design file '../tests/tb_top.sv'
+Top Level Modules:
+       tb_top
+TimeScale is 1 ns / 1 ps
+
+Warning-[TEIF] Task enabled inside a function
+../tests/mocks/rdma_mock_control_plane.sv, 489
+rdma_unit_test_pkg, "rdma_unit_test_pkg::\rdma_mock_cmq_port::release_one (this);"
+  Task 'rdma_mock_cmq_port::release_one' is enabled inside function 
+  'rdma_mock_cmq_port::release_cmq_opcode', it may bring delays into the 
+  function.
+
+Starting vcs inline pass...
+11 modules and 0 UDP read.
+recompiling package vcs_paramclassrepository
+recompiling package _vcs_DPI_package
+recompiling package uvm_pkg
+recompiling package _vcs_msglog
+recompiling package rdma_types_pkg
+recompiling package rdma_model_pkg
+recompiling package rdma_codec_pkg
+recompiling package rdma_adapter_pkg
+recompiling package rdma_core_pkg
+recompiling package rdma_unit_test_pkg
+recompiling module tb_top
+All of 11 modules done
+make[1]: Entering directory '/home/ubuntu/workspace/rdma_uvm.aCXXtx/sim/csrc'
+make[1]: Leaving directory '/home/ubuntu/workspace/rdma_uvm.aCXXtx/sim/csrc'
+make[1]: Entering directory '/home/ubuntu/workspace/rdma_uvm.aCXXtx/sim/csrc'
+rm -f _cuarc*.so _csrc*.so pre_vcsobj_*.so share_vcsobj_*.so
+g++ -w  -pipe -DVCSMX -DUVM_DPI_DO_TYPE_CHECK -fPIC -O -I/home/ubuntu/synopsys/vcs/W-2024.09-SP1/include    -c /home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/dpi/uvm_dpi.cc
+if [ -x ../build/core/simv ]; then chmod a-x ../build/core/simv; fi
+g++  -o ../build/core/simv   -no-pie  -Wl,--no-as-needed    -L/usr/lib/x86_64-linux-gnu -L/lib/x86_64-linux-gnu -Wl,--no-as-needed -rdynamic  -Wl,-rpath='$ORIGIN'/simv.daidir -Wl,-rpath=./simv.daidir -Wl,-rpath=/home/ubuntu/synopsys/vcs/W-2024.09-SP1/linux64/lib -L/home/ubuntu/synopsys/vcs/W-2024.09-SP1/linux64/lib  -Wl,-rpath-link=./ -Wl,--no-as-needed  uvm_dpi.o   objs/amcQw_d.o   _804986_archive_1.so   SIM_l.o      rmapats_mop.o rmapats.o rmar.o rmar_nd.o  rmar_llvm_0_1.o rmar_llvm_0_0.o            -lvirsim -lerrorinf -lsnpsmalloc -lvfs    -lvcsnew -lsimprofile -luclinative /home/ubuntu/synopsys/vcs/W-2024.09-SP1/linux64/lib/vcs_tls.o   -Wl,-whole-archive  -lvcsucli    -Wl,-no-whole-archive       ./../build/core/simv.daidir/vc_hdrs.o    /home/ubuntu/synopsys/vcs/W-2024.09-SP1/linux64/lib/vcs_save_restore_new.o -ldl  -lc -lm -lpthread -ldl 
+../build/core/simv up to date
+make[1]: Leaving directory '/home/ubuntu/workspace/rdma_uvm.aCXXtx/sim/csrc'
+CPU time: 87.309 seconds to compile + .883 seconds to elab + 2.553 seconds to link
+Info: [VCS_SAVE_RESTORE_INFO] ASLR (Address Space Layout Randomization) is detected on the machine. To enable $save functionality, ASLR will be switched off and simv re-executed.
+Please use '-no_save' simv switch to avoid re-execution or '-suppress=ASLR_DETECTED_INFO' to suppress this message.
+Chronologic VCS simulator copyright 1991-2024
+Contains Synopsys proprietary information.
+Compiler version W-2024.09-SP1_Full64; Runtime version W-2024.09-SP1_Full64;  Sep 14 14:01 2026
+UVM_INFO /home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/base/uvm_root.svh(402) @ 0: reporter [UVM/RELNOTES] 
+----------------------------------------------------------------
+UVM-1.2.Synopsys
+(C) 2007-2014 Mentor Graphics Corporation
+(C) 2007-2014 Cadence Design Systems, Inc.
+(C) 2006-2014 Synopsys, Inc.
+(C) 2011-2013 Cypress Semiconductor Corp.
+(C) 2013-2014 NVIDIA Corporation
+----------------------------------------------------------------
+
+  ***********       IMPORTANT RELEASE NOTES         ************
+
+  You are using a version of the UVM library that has been compiled
+  with `UVM_NO_DEPRECATED undefined.
+  See http://www.eda.org/svdb/view.php?id=3313 for more details.
+
+  You are using a version of the UVM library that has been compiled
+  with `UVM_OBJECT_DO_NOT_NEED_CONSTRUCTOR undefined.
+  See http://www.eda.org/svdb/view.php?id=3770 for more details.
+
+      (Specify +UVM_NO_RELNOTES to turn off this notice)
+
+UVM_INFO @ 0: reporter [RNTST] Running test rdma_cmq_codec_test...
+UVM_ERROR ../tests/unit/rdma_cmq_codec_test.sv(2405) @ 0: uvm_test_top [CQC_RAW_PI] CQ PI/wrap raw coordinate mismatch
+UVM_INFO /home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/base/uvm_objection.svh(1276) @ 0: reporter [TEST_DONE] 'run' phase is ready to proceed to the 'extract' phase
+UVM_INFO /home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/base/uvm_report_catcher.svh(705) @ 0: reporter [UVM/REPORT/CATCHER] 
+--- UVM Report catcher Summary ---
+
+
+Number of demoted UVM_FATAL reports  :    0
+Number of demoted UVM_ERROR reports  :    0
+Number of demoted UVM_WARNING reports:    0
+Number of caught UVM_FATAL reports   :    1
+Number of caught UVM_ERROR reports   :    0
+Number of caught UVM_WARNING reports :    0
+
+UVM_INFO /home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/base/uvm_report_server.svh(904) @ 0: reporter [UVM/REPORT/SERVER] 
+--- UVM Report Summary ---
+
+** Report counts by severity
+UVM_INFO :    4
+UVM_WARNING :    0
+UVM_ERROR :    1
+UVM_FATAL :    0
+** Report counts by id
+[CQC_RAW_PI]     1
+[RNTST]     1
+[TEST_DONE]     1
+[UVM/RELNOTES]     1
+[UVM/REPORT/CATCHER]     1
+
+$finish called from file "/home/ubuntu/synopsys/vcs/W-2024.09-SP1/etc/uvm-1.2/base/uvm_root.svh", line 527.
+$finish at simulation time                    0
+           V C S   S i m u l a t i o n   R e p o r t 
+Time: 0 ps
+CPU Time:      0.910 seconds;       Data structure size:   0.8Mb
+Mon Sep 14 14:01:21 2026
+UVM report is not pristine: warning=0 error=1 fatal=0
+PROCESS FAIL logical=rdma_cmq_codec_test physical=rdma_cmq_codec_test simulator=0 summary=1 log=build/core/rdma_cmq_codec_test.log
+LOGICAL FAIL logical=rdma_cmq_codec_test processes=1
+make: *** [Makefile:72: core] Error 1
+SHELL_EXIT_CODE=2

@@ -1,5 +1,0 @@
-Command: scripts/run_vcs53.sh core rdma_cmq_codec_test
-Remote: ubuntu@10.11.10.53 login bash; source HEAD: a449b57 (before fix-round-2 literal correction); shell exit code: 1
-Source log SHA256: 8534a75e1903e8ee6e64a39dfa0b10c7ed619bb6e23f418ce74d81ba74a0a2db
-Observed RED: UVM_ERROR [CQC_RAW_SHADOW] shadow PA raw coordinate mismatch
-UVM counts: warning=0 error=1 fatal=0; PROCESS FAIL; LOGICAL FAIL

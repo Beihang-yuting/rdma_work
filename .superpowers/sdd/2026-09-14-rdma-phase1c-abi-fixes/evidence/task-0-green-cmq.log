@@ -1,4 +1,0 @@
-Command: scripts/run_vcs53.sh core rdma_cmq_codec_test
-Remote: ubuntu@10.11.10.53 login bash; source HEAD: a449b57; shell exit code: 0
-Source log SHA256: a0416ef51fb9f82ce142682a5430bb45670eaccda8ebb3c714ec2a7b5873f4ff
-UVM counts: warning=0 error=0 fatal=0; UVM report is pristine; PROCESS PASS; LOGICAL PASS

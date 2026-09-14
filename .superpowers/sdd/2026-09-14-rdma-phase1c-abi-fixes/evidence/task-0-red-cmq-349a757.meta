@@ -1,0 +1,10 @@
+Source HEAD: 349a75750ea5a09f0ba18f011267f797798bc318
+Remote: ubuntu@10.11.10.53, login bash
+Command: scripts/run_vcs53.sh core rdma_cmq_codec_test
+Temporary test-only mutation: expected PI literal 23'd17 -> 23'd16; restored before any GREEN run.
+Variant test blob: a6bef332581f9bda696b26ea77383d9a600a12a0
+Baseline test blob: 26a136a27800cc7e6c240e000532e2b8acaf7e53
+Shell exit code: 2
+UVM counts: warning=0 error=1 fatal=0
+Failure: CQC_RAW_PI UVM_ERROR; PROCESS FAIL; LOGICAL FAIL
+Raw log SHA256: 07cbe69ef1141e8f86898fa0fed0a986743b415203aa9556bf515dd941fde2f6
