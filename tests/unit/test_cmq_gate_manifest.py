@@ -96,6 +96,9 @@ ENGINE_FIXTURES = [
     "check_poison_recovery_rejects_x_tickets",
     "check_poisoned_ledger_reset_recovery",
     "check_reset_fifo_retry_and_reprepare",
+    "check_reset_release_reentrant_drift_is_safe",
+    "check_reset_timeout_tombstone_isolated",
+    "check_timeout_fifo_survives_wait_target_and_reset",
     "check_poll_backing_out_of_order_and_owner_wrap",
     "check_retire_then_wrap_publication",
     "check_journal_identity_and_counter_contract",
@@ -206,7 +209,7 @@ class CmqGateManifestTest(unittest.TestCase):
             self.assertNotIn(process_test, logical_rows)
             self.assertNotIn(process_test, core_block.group(1))
 
-    # 功能：冻结十四 leaf 的 UVM 注册及 run_phase 展平后六十四个逻辑 fixture 的 exact-once 原始顺序。
+    # 功能：冻结十四 leaf 的 UVM 注册及 run_phase 展平后六十七个逻辑 fixture 的 exact-once 原始顺序。
     # 输入输出及副作用：只读解析 engine test 源码并断言 class/宏/调用列表；不运行仿真。
     # 失败边界：leaf 未注册、fixture 漏跑/重复/乱序或被跨 shard 拆分时测试失败。
     def test_engine_process_fixture_inventory(self):
@@ -239,7 +242,7 @@ class CmqGateManifestTest(unittest.TestCase):
                     flattened_calls.append(fixture)
 
         self.assertEqual(flattened_calls, ENGINE_FIXTURES)
-        self.assertEqual(len(flattened_calls), 64)
+        self.assertEqual(len(flattened_calls), 67)
         self.assertEqual(len(flattened_calls), len(set(flattened_calls)))
 
     # 功能：证明 observed retention 的两个物理调用以 inclusive bounds 有序、无重叠地精确覆盖 row 0..14。

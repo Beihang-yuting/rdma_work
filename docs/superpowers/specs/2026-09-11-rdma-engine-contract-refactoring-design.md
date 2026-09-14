@@ -658,6 +658,17 @@ terminal、timeout、late、reset 或未 arm 的 fenced row 都只返回 retaine
 新 incarnation 而拒绝旧 reset ticket；`STAGED/PENDING_EFFECT` 则 fail-closed 且不改
 任何 effect 或 recovery bit。
 
+这里的 exactly-once 是按生命周期事件和 phase 解释的，而不是限制一个 ticket 在整个
+生命周期只能出现一条 completion。一个 item 若先产生
+`TIMED_OUT_QUARANTINED/TIMEOUT`，再因 reset 进入
+`RESET_QUARANTINED/RESET_CANCELLED`，两个事件各自产生一次相互 detached 的观察证据；
+reset 前已经进入 delivery FIFO 的 timeout projection 仍按原顺序返回，reset cancellation
+projection 则作为新的 reset 事件追加。`wait_for()` 只删除目标 ticket 的 FIFO row，不能
+删除其他 ticket 的 delivery row；`reconcile_ticket()` 始终从 retained journal 重建
+快照，因此 FIFO 消费不会抹掉恢复 authority。对 terminal row，reconcile 的 `status`
+是返回 completion 的 operation status（例如 `RDMA_SC_RESET_CANCELLED`），而不是把所有
+成功观察统一改写为 orchestration-level `RDMA_SC_OK`；`terminal_known=1` 表示终态已知。
+
 `submit_batch_observed()` 对输入逐项返回 result，顺序和数组长度必须与 requests 完全
 一致。共享一次 doorbell 的条目共享 batch ID 和 batch-level effect，但每条 result、
 ticket、status、identity 和 completion phase 都是独立 detached 值。单命令入口只是

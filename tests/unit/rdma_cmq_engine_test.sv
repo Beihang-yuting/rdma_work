@@ -21670,6 +21670,209 @@ class rdma_cmq_engine_test extends uvm_test;
                  "reset tombstone did not replace timeout with reset evidence")
   endtask
 
+  // 功能：验证未消费的 timeout delivery row 在等待另一项完成后仍按原顺序保留，
+  //   observed reset 随后为同一 ticket 追加独立的 RESET_CANCELLED 生命周期证据。
+  // 输入/输出及副作用：构造两项同批 CMQ 请求，把第二项 CQE 写到当前 CQ 入口，
+  //   wait_for 只交付第二项，再调用 reset_observed；输出 completion/proof 由测试读取，
+  //   backing 由 reset 成功释放，不把 fixture 所有权转给 DUT 之外的对象。
+  // 失败/边界：timeout FIFO row 被 wait_for 错误消费、reset 输出顺序不是 timeout 后
+  //   cancellation、两次输出共享 graph、journal 未收敛到 reset evidence，或重复 reset
+  //   产生额外输出时报告 UVM_ERROR；该场景不把“每 ticket 仅一条全生命周期 completion”
+  //   当作契约，而是按 lifecycle event 检查 exactly-once。
+  task automatic check_timeout_fifo_survives_wait_target_and_reset();
+    rdma_cmq_engine_probe engine;
+    rdma_mock_host_mem mem;
+    rdma_cmq_test_pcie pcie;
+    rdma_doorbell_scheduler scheduler;
+    rdma_cmq_test_profile profile;
+    rdma_function_binding prepared_binding;
+    rdma_function_binding active_binding;
+    rdma_cmq cmq;
+    rdma_cmq_runtime_desc runtime_desc;
+    rdma_cmq_command_desc requests[];
+    rdma_cmq_ticket tickets[];
+    rdma_status item_statuses[];
+    rdma_status batch_status;
+    rdma_status status;
+    rdma_cmq_completion waited_completion;
+    rdma_cmq_completion reset_completions[$];
+    rdma_cmq_completion reconciled_completion;
+    rdma_cmq_completion repeated_completion;
+    rdma_cmq_reset_isolation_proof proofs[];
+    rdma_cmq_batch_submission_record retained;
+    rdma_hw_image raw_survivor;
+    bit terminal_known;
+
+    engine = rdma_cmq_engine_probe::type_id::create(
+      "timeout_fifo_wait_reset_engine"
+    );
+    mem = rdma_mock_host_mem::type_id::create(
+      "timeout_fifo_wait_reset_mem"
+    );
+    pcie = rdma_cmq_test_pcie::type_id::create(
+      "timeout_fifo_wait_reset_pcie"
+    );
+    scheduler = rdma_doorbell_scheduler::type_id::create(
+      "timeout_fifo_wait_reset_scheduler"
+    );
+    profile = rdma_cmq_test_profile::type_id::create(
+      "timeout_fifo_wait_reset_profile"
+    );
+    prepared_binding = make_binding(
+      "timeout_fifo_wait_reset_prepared", RDMA_BIND_PREPARED
+    );
+    active_binding = make_binding(
+      "timeout_fifo_wait_reset_active", RDMA_BIND_ACTIVE
+    );
+    cmq = make_cmq(
+      "timeout_fifo_wait_reset_cmq", prepared_binding
+    );
+    prepare_active(
+      "TIMEOUT_FIFO_WAIT_RESET", engine, mem, pcie, scheduler, profile,
+      prepared_binding, active_binding, cmq, runtime_desc
+    );
+
+    requests = new[2];
+    requests[0] = make_command(
+      "timeout_fifo_wait_reset_timeout", active_binding,
+      rdma_cmq_test_profile::TEST_OPCODE_A, 8'h81, 10ns
+    );
+    requests[1] = make_command(
+      "timeout_fifo_wait_reset_survivor", active_binding,
+      rdma_cmq_test_profile::TEST_OPCODE_B, 1us
+    );
+    engine.submit_batch(requests, tickets, item_statuses, batch_status);
+    expect_status("TIMEOUT_FIFO_WAIT_RESET_SUBMIT", batch_status,
+                  RDMA_SC_OK);
+    if (tickets.size() != 2 || item_statuses.size() != 2 ||
+        tickets[0] == null || tickets[1] == null) begin
+      `uvm_error("TIMEOUT_FIFO_WAIT_RESET_FIXTURE",
+                 "two-ticket timeout/reset fixture is incomplete")
+      engine.shutdown(status);
+      return;
+    end
+
+    #20ns;
+    raw_survivor = null;
+    write_profile_cqe(
+      "TIMEOUT_FIFO_WAIT_RESET_SURVIVOR", mem, engine.mapping_snapshot(),
+      profile, 0, 1'b1, tickets[1], 0, raw_survivor
+    );
+    engine.wait_for(tickets[1], waited_completion, status);
+    expect_status("TIMEOUT_FIFO_WAIT_RESET_WAIT", status, RDMA_SC_OK);
+    if (waited_completion == null || waited_completion.ticket == null ||
+        waited_completion.status == null ||
+        waited_completion.ticket.command_id != tickets[1].command_id ||
+        waited_completion.status.code != RDMA_SC_OK)
+      `uvm_error("TIMEOUT_FIFO_WAIT_RESET_WAIT",
+                 "wait_for did not return the non-timeout ticket")
+
+    // A wait for ticket B may consume only B's delivery row.  A's timeout row
+    // remains observable in FIFO order, while its retained journal evidence is
+    // the authoritative source for the later reset projection.
+    if (engine.terminal_fifo_count() != 1 ||
+        engine.slot_state_at(tickets[0].sq_index) !=
+          CMQ_SLOT_TIMED_OUT_QUARANTINED ||
+        engine.slot_state_at(tickets[1].sq_index) != CMQ_SLOT_COMPLETED ||
+        engine.cq_consumed_count() != 1 || engine.outstanding_count() != 0 ||
+        // The timed-out A keeps its token incarnation quarantined, while the
+        // normally completed B releases its token during poll.  Therefore the
+        // post-wait ledger has one retained token, not two.
+        engine.tokens_in_use_count() != 1 || engine.slot_record_count() != 2)
+      `uvm_error("TIMEOUT_FIFO_WAIT_RESET_FIFO",
+                 "wait_for consumed or changed the unrelated timeout row")
+
+    engine.query_submission_journal_by_ticket(
+      tickets[0], retained, status
+    );
+    expect_status("TIMEOUT_FIFO_WAIT_RESET_TIMEOUT_QUERY", status,
+                  RDMA_SC_OK);
+    if (retained == null || retained.items.size() != 2 ||
+        retained.items[0] == null || retained.items[0].completion == null ||
+        retained.items[0].completion.status == null ||
+        retained.items[0].completion.status.code != RDMA_SC_TIMEOUT ||
+        retained.items[0].state != RDMA_CMQ_SUBMISSION_TIMED_OUT_QUARANTINED)
+      `uvm_error("TIMEOUT_FIFO_WAIT_RESET_TIMEOUT_QUERY",
+                 "timeout journal evidence was not retained before reset")
+
+    engine.reset_observed(reset_completions, proofs, status);
+    expect_status("TIMEOUT_FIFO_WAIT_RESET_RESET", status, RDMA_SC_OK);
+    if (reset_completions.size() != 2 || proofs.size() != 1 ||
+        reset_completions[0] == null || reset_completions[1] == null ||
+        reset_completions[0].ticket == null ||
+        reset_completions[1].ticket == null ||
+        reset_completions[0].status == null ||
+        reset_completions[1].status == null ||
+        reset_completions[0].ticket.command_id != tickets[0].command_id ||
+        reset_completions[1].ticket.command_id != tickets[0].command_id ||
+        reset_completions[0].status.code != RDMA_SC_TIMEOUT ||
+        reset_completions[1].status.code != RDMA_SC_RESET_CANCELLED)
+      `uvm_error("TIMEOUT_FIFO_WAIT_RESET_ORDER",
+                 "reset did not preserve timeout-before-cancel output order")
+    if (reset_completions.size() == 2 &&
+        (reset_completions[0] == reset_completions[1] ||
+         reset_completions[0].ticket == reset_completions[1].ticket ||
+         reset_completions[0].status == reset_completions[1].status))
+      `uvm_error("TIMEOUT_FIFO_WAIT_RESET_DETACH",
+                 "timeout and reset outputs share a detached graph")
+    if (engine.state() != RDMA_CMQ_ENGINE_UNCONFIGURED ||
+        engine.terminal_fifo_count() != 0 ||
+        count_host_calls(mem, "release_opaque") != 1 ||
+        mem.regions.size() != 1 || mem.regions[0].mapping == null ||
+        mem.regions[0].mapping.state != RDMA_MAPPING_RELEASED)
+      `uvm_error("TIMEOUT_FIFO_WAIT_RESET_CLEANUP",
+                 "reset did not clear runtime or release old backing once")
+
+    engine.query_submission_journal_by_ticket(
+      tickets[0], retained, status
+    );
+    expect_status("TIMEOUT_FIFO_WAIT_RESET_FINAL_QUERY", status,
+                  RDMA_SC_OK);
+    if (retained == null || retained.items.size() != 2 ||
+        retained.items[0] == null || retained.items[0].completion == null ||
+        retained.items[0].completion.status == null ||
+        retained.items[0].state != RDMA_CMQ_SUBMISSION_RESET_QUARANTINED ||
+        retained.items[0].completion_phase !=
+          RDMA_CMQ_COMPLETION_RESET_CANCELLED ||
+        retained.items[0].completion.status.code != RDMA_SC_RESET_CANCELLED)
+      `uvm_error("TIMEOUT_FIFO_WAIT_RESET_FINAL_QUERY",
+                 "journal did not converge to reset evidence")
+
+    engine.reconcile_ticket(
+      tickets[0], terminal_known, reconciled_completion, status
+    );
+    // reconcile_ticket returns the detached terminal completion's status as
+    // its operation result.  A reset row is therefore RESET_CANCELLED rather
+    // than orchestration-level OK; terminal_known carries the classification.
+    expect_status("TIMEOUT_FIFO_WAIT_RESET_RECONCILE", status,
+                  RDMA_SC_RESET_CANCELLED);
+    if (!terminal_known || reconciled_completion == null ||
+        reconciled_completion.status == null ||
+        reconciled_completion.status.code != RDMA_SC_RESET_CANCELLED)
+      `uvm_error("TIMEOUT_FIFO_WAIT_RESET_RECONCILE",
+                 "reconcile did not return retained reset evidence")
+    engine.reconcile_ticket(
+      tickets[0], terminal_known, repeated_completion, status
+    );
+    expect_status("TIMEOUT_FIFO_WAIT_RESET_RECONCILE_REPEAT", status,
+                  RDMA_SC_RESET_CANCELLED);
+    if (!terminal_known || repeated_completion == null ||
+        repeated_completion == reconciled_completion ||
+        repeated_completion.ticket == reconciled_completion.ticket ||
+        repeated_completion.status == reconciled_completion.status)
+      `uvm_error("TIMEOUT_FIFO_WAIT_RESET_RECONCILE_REPEAT",
+                 "reset reconcile was not idempotent and detached")
+
+    reset_completions.delete();
+    proofs = new[0];
+    engine.reset_observed(reset_completions, proofs, status);
+    expect_status("TIMEOUT_FIFO_WAIT_RESET_REPEAT_RESET", status, RDMA_SC_OK);
+    if (reset_completions.size() != 0 || proofs.size() != 0 ||
+        count_host_calls(mem, "release_opaque") != 1)
+      `uvm_error("TIMEOUT_FIFO_WAIT_RESET_REPEAT_RESET",
+                 "idempotent reset produced duplicate lifecycle evidence")
+  endtask
+
   // 功能：验证 canonical batch key 覆盖完整 Function identity、engine instance
   //   与单调 counters，并验证四个 64-bit overflow 都不回绕。
   // 输入/输出及副作用：无参数；构造独立 engine/binding/mock，执行 prepare/reset/
@@ -23773,6 +23976,7 @@ class rdma_cmq_engine_poison_reset_process_test extends rdma_cmq_engine_test;
     check_reset_fifo_retry_and_reprepare();
     check_reset_release_reentrant_drift_is_safe();
     check_reset_timeout_tombstone_isolated();
+    check_timeout_fifo_survives_wait_target_and_reset();
     phase.drop_objection(this);
   endtask
 endclass
