@@ -745,16 +745,36 @@ FIELD_MAPPINGS = (
     # wr.h:171-188: XTRDMA_QP_RQ_SGB_PA is GENMASK_ULL(63, 9).
     # The qword starts at byte 32 and the wire value is PA >> 9.
     FieldMapping("wr.h", "XTRDMA_QP_RQ_SGB_PA", "RDMA_RQE_SGB_PA", 32),
+    # wr.h:123-149, CQE qword0 contains common owner, transport, receive and
+    # profile flags.  These rows deliberately keep the driver's source names
+    # instead of collapsing the overlay into a synthetic aggregate mask.
     FieldMapping("wr.h", "XTRDMA_CQE_POLARITY", "RDMA_CQE_POLARITY", 0),
+    FieldMapping("wr.h", "XTRDMA_CQE_QP_ST", "RDMA_CQE_QP_ST", 0),
     FieldMapping("wr.h", "XTRDMA_CQE_RQ_CQE", "RDMA_CQE_RQ_CQE", 0),
+    FieldMapping("wr.h", "XTRDMA_CQE_SRFQ", "RDMA_CQE_SRFQ", 0),
+    FieldMapping("wr.h", "XTRDMA_CQE_SE", "RDMA_CQE_SE", 0),
+    FieldMapping("wr.h", "XTRDMA_CQE_SIGN_EN", "RDMA_CQE_SIGN_EN", 0),
     FieldMapping("wr.h", "XTRDMA_CQE_QP_WQE_WRAP", "RDMA_CQE_WQE_WRAP", 0),
     FieldMapping("wr.h", "XTRDMA_CQE_QP_WQE_INDEX", "RDMA_CQE_WQE_INDEX", 0),
     FieldMapping("wr.h", "XTRDMA_CQE_PKT_OPCODE", "RDMA_CQE_PKT_OPCODE", 0),
     FieldMapping("wr.h", "XTRDMA_CQE_ECODE", "RDMA_CQE_ECODE", 0),
+    FieldMapping("wr.h", "XTRDMA_CQE_VLAN", "RDMA_CQE_VLAN", 0),
+    FieldMapping("wr.h", "XTRDMA_CQE_IPV6", "RDMA_CQE_IPV6", 0),
+    FieldMapping("wr.h", "XTRDMA_CQE_CQE_FORMAT", "RDMA_CQE_CQE_FORMAT", 0),
+    FieldMapping("wr.h", "XTRDMA_CQE_RESIZE_CQE", "RDMA_CQE_RESIZE_CQE", 0),
+    FieldMapping("wr.h", "XTRDMA_CQE_UD_MC", "RDMA_CQE_UD_MC", 0),
     FieldMapping("wr.h", "XTRDMA_CQE_QPN", "RDMA_CQE_QPN", 0),
     FieldMapping("wr.h", "XTRDMA_CQE_IMMDT_DATA_INVLD_KEY", "RDMA_CQE_IMMDT_DATA", 8),
     FieldMapping("wr.h", "XTRDMA_CQE_PAYLOAD_LEN", "RDMA_CQE_PAYLOAD_LEN", 8),
     FieldMapping("wr.h", "XTRDMA_CQE_SIGNATURE", "RDMA_CQE_SIGNATURE", 16),
+    FieldMapping("wr.h", "XTRDMA_CQE_RC_REMOTE_SYNDROME", "RDMA_CQE_RC_REMOTE_SYNDROME", 16),
+    FieldMapping("wr.h", "XTRDMA_CQE_UD_SRC_QPN", "RDMA_CQE_UD_SRC_QPN", 16),
+    FieldMapping("wr.h", "XTRDMA_CQE_RQE_CPL", "RDMA_CQE_RQE_CPL", 16),
+    FieldMapping("wr.h", "XTRDMA_CQE_SRFQN", "RDMA_CQE_SRFQN", 16),
+    FieldMapping("wr.h", "XTRDMA_CQE_SRFQE_WRAP", "RDMA_CQE_SRFQE_WRAP", 16),
+    FieldMapping("wr.h", "XTRDMA_CQE_SRFQE_INDEX", "RDMA_CQE_SRFQE_INDEX", 16),
+    FieldMapping("wr.h", "XTRDMA_CQE_UD_SMAC", "RDMA_CQE_UD_SMAC", 24),
+    FieldMapping("wr.h", "XTRDMA_CQE_UD_VLAN_TAG", "RDMA_CQE_UD_VLAN_TAG", 24),
     # CEQE/AEQE fields (event consumers use qwords at byte 0 and byte 8).
     FieldMapping("defs.h", "XTRDMA_CEQE_WQE_VLD", "RDMA_CEQE_VALID", 0),
     FieldMapping("defs.h", "XTRDMA_CEQE_URC_FLAG", "RDMA_CEQE_URC_FLAG", 0),
@@ -2897,15 +2917,35 @@ REFERENCE_FIELDS = (
     # intentionally separate from FIELD_MAPPINGS so a mapping drift cannot
     # make the golden placement self-approve.
     ReferenceField("wr.h", "XTRDMA_QP_RQ_SGB_PA", "RDMA_RQE_SGB_PA", 32, 9, 55),
-    ReferenceField("wr.h", "XTRDMA_CQE_QPN", "RDMA_CQE_QPN", 0, 0, 18),
-    ReferenceField("wr.h", "XTRDMA_CQE_QP_WQE_INDEX", "RDMA_CQE_WQE_INDEX", 0, 40, 15),
-    ReferenceField("wr.h", "XTRDMA_CQE_ECODE", "RDMA_CQE_ECODE", 0, 24, 8),
-    ReferenceField("wr.h", "XTRDMA_CQE_PAYLOAD_LEN", "RDMA_CQE_PAYLOAD_LEN", 8, 0, 32),
+    # wr.h:123-149, qword0 common/overlay fields.  Keep every source macro
+    # independently auditable; the codec decides which overlay is active.
     ReferenceField("wr.h", "XTRDMA_CQE_POLARITY", "RDMA_CQE_POLARITY", 0, 63, 1),
+    ReferenceField("wr.h", "XTRDMA_CQE_QP_ST", "RDMA_CQE_QP_ST", 0, 60, 3),
     ReferenceField("wr.h", "XTRDMA_CQE_RQ_CQE", "RDMA_CQE_RQ_CQE", 0, 59, 1),
+    ReferenceField("wr.h", "XTRDMA_CQE_SRFQ", "RDMA_CQE_SRFQ", 0, 58, 1),
+    ReferenceField("wr.h", "XTRDMA_CQE_SE", "RDMA_CQE_SE", 0, 57, 1),
+    ReferenceField("wr.h", "XTRDMA_CQE_SIGN_EN", "RDMA_CQE_SIGN_EN", 0, 56, 1),
     ReferenceField("wr.h", "XTRDMA_CQE_QP_WQE_WRAP", "RDMA_CQE_WQE_WRAP", 0, 55, 1),
+    ReferenceField("wr.h", "XTRDMA_CQE_QP_WQE_INDEX", "RDMA_CQE_WQE_INDEX", 0, 40, 15),
     ReferenceField("wr.h", "XTRDMA_CQE_PKT_OPCODE", "RDMA_CQE_PKT_OPCODE", 0, 32, 8),
+    ReferenceField("wr.h", "XTRDMA_CQE_ECODE", "RDMA_CQE_ECODE", 0, 24, 8),
+    ReferenceField("wr.h", "XTRDMA_CQE_VLAN", "RDMA_CQE_VLAN", 0, 23, 1),
+    ReferenceField("wr.h", "XTRDMA_CQE_IPV6", "RDMA_CQE_IPV6", 0, 22, 1),
+    ReferenceField("wr.h", "XTRDMA_CQE_CQE_FORMAT", "RDMA_CQE_CQE_FORMAT", 0, 20, 2),
+    ReferenceField("wr.h", "XTRDMA_CQE_RESIZE_CQE", "RDMA_CQE_RESIZE_CQE", 0, 19, 1),
+    ReferenceField("wr.h", "XTRDMA_CQE_UD_MC", "RDMA_CQE_UD_MC", 0, 18, 1),
+    ReferenceField("wr.h", "XTRDMA_CQE_QPN", "RDMA_CQE_QPN", 0, 0, 18),
     ReferenceField("wr.h", "XTRDMA_CQE_IMMDT_DATA_INVLD_KEY", "RDMA_CQE_IMMDT_DATA", 8, 32, 32),
+    ReferenceField("wr.h", "XTRDMA_CQE_PAYLOAD_LEN", "RDMA_CQE_PAYLOAD_LEN", 8, 0, 32),
+    ReferenceField("wr.h", "XTRDMA_CQE_SIGNATURE", "RDMA_CQE_SIGNATURE", 16, 56, 8),
+    ReferenceField("wr.h", "XTRDMA_CQE_RC_REMOTE_SYNDROME", "RDMA_CQE_RC_REMOTE_SYNDROME", 16, 48, 8),
+    ReferenceField("wr.h", "XTRDMA_CQE_UD_SRC_QPN", "RDMA_CQE_UD_SRC_QPN", 16, 32, 24),
+    ReferenceField("wr.h", "XTRDMA_CQE_RQE_CPL", "RDMA_CQE_RQE_CPL", 16, 31, 1),
+    ReferenceField("wr.h", "XTRDMA_CQE_SRFQN", "RDMA_CQE_SRFQN", 16, 16, 12),
+    ReferenceField("wr.h", "XTRDMA_CQE_SRFQE_WRAP", "RDMA_CQE_SRFQE_WRAP", 16, 15, 1),
+    ReferenceField("wr.h", "XTRDMA_CQE_SRFQE_INDEX", "RDMA_CQE_SRFQE_INDEX", 16, 0, 15),
+    ReferenceField("wr.h", "XTRDMA_CQE_UD_SMAC", "RDMA_CQE_UD_SMAC", 24, 16, 48),
+    ReferenceField("wr.h", "XTRDMA_CQE_UD_VLAN_TAG", "RDMA_CQE_UD_VLAN_TAG", 24, 0, 16),
     ReferenceField("defs.h", "XTRDMA_CEQE_QPN", "RDMA_CEQE_QPN", 0, 40, 21),
     ReferenceField("defs.h", "XTRDMA_CEQE_URC_FLAG", "RDMA_CEQE_URC_FLAG", 0, 62, 1),
     ReferenceField("defs.h", "XTRDMA_CEQE_URC_SQ_CEQE_VLD", "RDMA_CEQE_URC_SQ_CQE_VALID", 0, 39, 1),
@@ -3123,6 +3163,94 @@ REFERENCE_FIELDS = (
 )
 
 REFERENCE_BY_STEM = {reference.sv_stem: reference for reference in REFERENCE_FIELDS}
+
+# wr.h's CQE is a union of common, RC, UD and RQ/SRFQ overlays.  Keep the
+# required source identities independent from the rows below so deleting a
+# row cannot silently make the frozen-source checker less strict.
+WR_CQE_REQUIRED_SYMBOLS = frozenset(
+    {
+        "XTRDMA_CQE_POLARITY",
+        "XTRDMA_CQE_QP_ST",
+        "XTRDMA_CQE_RQ_CQE",
+        "XTRDMA_CQE_SRFQ",
+        "XTRDMA_CQE_SE",
+        "XTRDMA_CQE_SIGN_EN",
+        "XTRDMA_CQE_QP_WQE_WRAP",
+        "XTRDMA_CQE_QP_WQE_INDEX",
+        "XTRDMA_CQE_PKT_OPCODE",
+        "XTRDMA_CQE_ECODE",
+        "XTRDMA_CQE_VLAN",
+        "XTRDMA_CQE_IPV6",
+        "XTRDMA_CQE_CQE_FORMAT",
+        "XTRDMA_CQE_RESIZE_CQE",
+        "XTRDMA_CQE_UD_MC",
+        "XTRDMA_CQE_QPN",
+        "XTRDMA_CQE_IMMDT_DATA_INVLD_KEY",
+        "XTRDMA_CQE_PAYLOAD_LEN",
+        "XTRDMA_CQE_SIGNATURE",
+        "XTRDMA_CQE_RC_REMOTE_SYNDROME",
+        "XTRDMA_CQE_UD_SRC_QPN",
+        "XTRDMA_CQE_RQE_CPL",
+        "XTRDMA_CQE_SRFQN",
+        "XTRDMA_CQE_SRFQE_WRAP",
+        "XTRDMA_CQE_SRFQE_INDEX",
+        "XTRDMA_CQE_UD_SMAC",
+        "XTRDMA_CQE_UD_VLAN_TAG",
+    }
+)
+
+
+def validate_wr_cqe_mappings(
+    field_mappings: tuple[FieldMapping, ...],
+    reference_fields: tuple[ReferenceField, ...],
+) -> None:
+    """
+    功能：在 RDMA profile checker 的 validate_wr_cqe_mappings 中锁定 wr.h CQE
+    的完整 source identity 集合，并要求 FIELD_MAPPINGS 与 REFERENCE_FIELDS
+    同时覆盖所有 common/overlay 字段。
+    输入输出及副作用：接收两张只读 mapping 表；比较 `wr.h` 且以
+    `XTRDMA_CQE_` 开头的 source symbol、SV stem 和 qword byte offset，不写入
+    文件；具体 LSB/width 由 validate_reference_fields 再按真实 C 宏解析。
+    失败边界：任一字段被删、增加未知 CQE symbol、路径不是 wr.h、或两张表的
+    stem/offset 不一致时抛 ValidationError；非 CQE 的 CMQ/RQE/SQE rows 不在本
+    守卫的责任范围内。
+    """
+    mappings = {
+        mapping.c_symbol: mapping
+        for mapping in field_mappings
+        if mapping.path == "wr.h"
+        and mapping.c_symbol.startswith("XTRDMA_CQE_")
+    }
+    references = {
+        reference.c_symbol: reference
+        for reference in reference_fields
+        if reference.path == "wr.h"
+        and reference.c_symbol.startswith("XTRDMA_CQE_")
+    }
+
+    if set(mappings) != WR_CQE_REQUIRED_SYMBOLS:
+        missing = sorted(WR_CQE_REQUIRED_SYMBOLS - set(mappings))
+        extra = sorted(set(mappings) - WR_CQE_REQUIRED_SYMBOLS)
+        raise ValidationError(
+            f"CQE mapping contract differs: missing={missing}, extra={extra}"
+        )
+    if set(references) != WR_CQE_REQUIRED_SYMBOLS:
+        missing = sorted(WR_CQE_REQUIRED_SYMBOLS - set(references))
+        extra = sorted(set(references) - WR_CQE_REQUIRED_SYMBOLS)
+        raise ValidationError(
+            f"CQE mapping reference contract differs: missing={missing}, extra={extra}"
+        )
+
+    for symbol in sorted(WR_CQE_REQUIRED_SYMBOLS):
+        mapping = mappings[symbol]
+        reference = references[symbol]
+        if (
+            mapping.sv_stem != reference.sv_stem
+            or mapping.word_byte_offset != reference.word_byte_offset
+        ):
+            raise ValidationError(
+                f"CQE mapping source placement differs: {symbol}"
+            )
 
 
 def validate_reference_fields(
@@ -4662,6 +4790,7 @@ def validate(
     except ContractError as error:
         raise ValidationError(str(error)) from error
     validate_mapping_uniqueness(FIELD_MAPPINGS, VALUE_MAPPINGS, REFERENCE_FIELDS)
+    validate_wr_cqe_mappings(FIELD_MAPPINGS, REFERENCE_FIELDS)
     validate_body_translations(BODY_TRANSLATIONS, FIELD_MAPPINGS)
     source_text = validate_source_manifest_sources(kernel_root, archive_lock, records)
 

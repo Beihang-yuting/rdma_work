@@ -3211,10 +3211,136 @@ class ReferenceEncodingTest(unittest.TestCase):
             if reference.sv_stem.startswith("RDMA_SQ_")
             and reference.sv_stem not in used_stems
         }
+        # CQE overlay fields are source-mapped here even when the compact
+        # error golden intentionally exercises only its common RC projection.
+        # Their absence from this one golden must not weaken the mapping table.
+        cqe_audit_only = {
+            reference.sv_stem
+            for reference in references
+            if reference.sv_stem.startswith("RDMA_CQE_")
+            and reference.sv_stem not in used_stems
+        }
         self.assertTrue(task11_audit_only <= set(reference_stems))
         self.assertEqual(
-            set(used_stems), set(reference_stems) - task11_audit_only - sq_audit_only
+            set(used_stems),
+            set(reference_stems)
+            - task11_audit_only
+            - sq_audit_only
+            - cqe_audit_only,
         )
+
+    def test_wr_cqe_fields_cover_every_driver_wire_coordinate(self) -> None:
+        """
+        功能：在 ReferenceEncodingTest 测试类中核对 wr.h CQE 的每个硬件线缆
+        字段都在 FIELD_MAPPINGS 与 REFERENCE_FIELDS 中登记，并固定其 qword
+        byte offset、LSB 和 width。
+        输入输出及副作用：无显式参数；读取 checker 的两张只读映射表，使用
+        unittest 断言 source identity 与坐标，不修改生产源码或 golden 文件。
+        失败边界：缺少字段、错误 source、qword 偏移或位宽都会在对应 subTest
+        失败；该测试不把 wr.h 的辅助常量（shadow/SGE 之外的非 CQE 字段）误算
+        为 CQE wire contract。
+        """
+        expected = {
+            "XTRDMA_CQE_POLARITY": ("RDMA_CQE_POLARITY", 0, 63, 1),
+            "XTRDMA_CQE_QP_ST": ("RDMA_CQE_QP_ST", 0, 60, 3),
+            "XTRDMA_CQE_RQ_CQE": ("RDMA_CQE_RQ_CQE", 0, 59, 1),
+            "XTRDMA_CQE_SRFQ": ("RDMA_CQE_SRFQ", 0, 58, 1),
+            "XTRDMA_CQE_SE": ("RDMA_CQE_SE", 0, 57, 1),
+            "XTRDMA_CQE_SIGN_EN": ("RDMA_CQE_SIGN_EN", 0, 56, 1),
+            "XTRDMA_CQE_QP_WQE_WRAP": ("RDMA_CQE_WQE_WRAP", 0, 55, 1),
+            "XTRDMA_CQE_QP_WQE_INDEX": ("RDMA_CQE_WQE_INDEX", 0, 40, 15),
+            "XTRDMA_CQE_PKT_OPCODE": ("RDMA_CQE_PKT_OPCODE", 0, 32, 8),
+            "XTRDMA_CQE_ECODE": ("RDMA_CQE_ECODE", 0, 24, 8),
+            "XTRDMA_CQE_VLAN": ("RDMA_CQE_VLAN", 0, 23, 1),
+            "XTRDMA_CQE_IPV6": ("RDMA_CQE_IPV6", 0, 22, 1),
+            "XTRDMA_CQE_CQE_FORMAT": ("RDMA_CQE_CQE_FORMAT", 0, 20, 2),
+            "XTRDMA_CQE_RESIZE_CQE": ("RDMA_CQE_RESIZE_CQE", 0, 19, 1),
+            "XTRDMA_CQE_UD_MC": ("RDMA_CQE_UD_MC", 0, 18, 1),
+            "XTRDMA_CQE_QPN": ("RDMA_CQE_QPN", 0, 0, 18),
+            "XTRDMA_CQE_IMMDT_DATA_INVLD_KEY": (
+                "RDMA_CQE_IMMDT_DATA", 8, 32, 32
+            ),
+            "XTRDMA_CQE_PAYLOAD_LEN": ("RDMA_CQE_PAYLOAD_LEN", 8, 0, 32),
+            "XTRDMA_CQE_SIGNATURE": ("RDMA_CQE_SIGNATURE", 16, 56, 8),
+            "XTRDMA_CQE_RC_REMOTE_SYNDROME": (
+                "RDMA_CQE_RC_REMOTE_SYNDROME", 16, 48, 8
+            ),
+            "XTRDMA_CQE_UD_SRC_QPN": ("RDMA_CQE_UD_SRC_QPN", 16, 32, 24),
+            "XTRDMA_CQE_RQE_CPL": ("RDMA_CQE_RQE_CPL", 16, 31, 1),
+            "XTRDMA_CQE_SRFQN": ("RDMA_CQE_SRFQN", 16, 16, 12),
+            "XTRDMA_CQE_SRFQE_WRAP": ("RDMA_CQE_SRFQE_WRAP", 16, 15, 1),
+            "XTRDMA_CQE_SRFQE_INDEX": ("RDMA_CQE_SRFQE_INDEX", 16, 0, 15),
+            "XTRDMA_CQE_UD_SMAC": ("RDMA_CQE_UD_SMAC", 24, 16, 48),
+            "XTRDMA_CQE_UD_VLAN_TAG": ("RDMA_CQE_UD_VLAN_TAG", 24, 0, 16),
+        }
+        mappings = {
+            mapping.c_symbol: mapping
+            for mapping in CHECKER.FIELD_MAPPINGS
+            if mapping.path == "wr.h" and mapping.c_symbol.startswith("XTRDMA_CQE_")
+        }
+        references = {
+            reference.c_symbol: reference
+            for reference in CHECKER.REFERENCE_FIELDS
+            if reference.path == "wr.h" and reference.c_symbol.startswith("XTRDMA_CQE_")
+        }
+
+        self.assertEqual(set(mappings), set(expected))
+        self.assertEqual(set(references), set(expected))
+        for symbol, (stem, byte_offset, lsb, width) in expected.items():
+            with self.subTest(symbol=symbol):
+                mapping = mappings[symbol]
+                reference = references[symbol]
+                self.assertEqual(mapping.sv_stem, stem)
+                self.assertEqual(mapping.word_byte_offset, byte_offset)
+                self.assertEqual(
+                    (reference.sv_stem, reference.word_byte_offset,
+                     reference.lsb, reference.width),
+                    (stem, byte_offset, lsb, width),
+                )
+
+    def test_wr_cqe_mapping_guard_rejects_omission_or_extra_symbol(self) -> None:
+        """
+        功能：在 ReferenceEncodingTest 测试类中验证 checker 的 CQE 映射完整性
+        守卫拒绝删行、增行或把非 CQE source 混入固定集合。
+        输入输出及副作用：无显式参数；调用 checker 的纯内存映射验证函数，使用
+        NamedTuple 副本构造缺失/额外 source，不写入生产文件或驱动 archive。
+        失败边界：完整表必须通过；缺 mapping、缺 reference 或额外 wr.h CQE
+        symbol 必须抛出 ValidationError，并指出 CQE mapping contract。
+        """
+        validate = self.require_checker_attribute("validate_wr_cqe_mappings")
+        validate(CHECKER.FIELD_MAPPINGS, CHECKER.REFERENCE_FIELDS)
+
+        mapping_index = next(
+            index
+            for index, mapping in enumerate(CHECKER.FIELD_MAPPINGS)
+            if mapping.c_symbol == "XTRDMA_CQE_QP_ST"
+        )
+        with self.assertRaisesRegex(CHECKER.ValidationError, "CQE mapping"):
+            validate(
+                CHECKER.FIELD_MAPPINGS[:mapping_index]
+                + CHECKER.FIELD_MAPPINGS[mapping_index + 1:],
+                CHECKER.REFERENCE_FIELDS,
+            )
+
+        reference_index = next(
+            index
+            for index, reference in enumerate(CHECKER.REFERENCE_FIELDS)
+            if reference.c_symbol == "XTRDMA_CQE_QP_ST"
+        )
+        with self.assertRaisesRegex(CHECKER.ValidationError, "CQE mapping"):
+            validate(
+                CHECKER.FIELD_MAPPINGS,
+                CHECKER.REFERENCE_FIELDS[:reference_index]
+                + CHECKER.REFERENCE_FIELDS[reference_index + 1:],
+            )
+
+        extra = CHECKER.FieldMapping(
+            "wr.h", "XTRDMA_CQE_TEST_EXTRA", "RDMA_CQE_TEST_EXTRA", 0
+        )
+        with self.assertRaisesRegex(CHECKER.ValidationError, "CQE mapping"):
+            validate(
+                CHECKER.FIELD_MAPPINGS + (extra,), CHECKER.REFERENCE_FIELDS
+            )
 
     def test_reference_cases_have_stable_contract(self) -> None:
         """
