@@ -433,6 +433,7 @@ class rdma_mock_cmq_port extends rdma_cmq_port;
     gate_target_count = 1;
     gate_entered_count = 0;
     last_execute_no_submit_proven = 1'b0;
+    method_ordinals["legacy_execute"]++;
     role_failures.delete();
     method_ordinals.delete();
     snapshot_engine = rdma_mock_cmq_snapshot_engine::type_id::create(
@@ -1085,6 +1086,20 @@ class rdma_mock_cmq_port extends rdma_cmq_port;
       completion = null;
       status = invalid_state("mock CMQ final status copy failed");
     end
+  endtask
+
+  // 功能：在 legacy-only mock 中记录 observed fallback 的一次调用并委托基类
+  //   wrapper，验证 base 方向为 observed→legacy 且不会递归回 observed。
+  // 输入/输出及副作用：command 为非拥有输入，result 为 detached 输出；更新
+  //   method_ordinals 计数并调用一次 super.execute_observed。
+  // 失败/边界：基类快照失败仍按其 observation_status 返回；本 mock 不伪造
+  //   ticket/effect，也不写 production adapter 的 shared seam。
+  virtual task execute_observed(
+    input rdma_cmq_command_desc command,
+    output rdma_cmq_execution_result result
+  );
+    method_ordinals["observed_execute"]++;
+    super.execute_observed(command, result);
   endtask
 
   // 功能：在 rdma_mock_cmq_port 中，reconcile 执行受控事务并按后端提交证据推进状态机，同时保留失败阶段和 generation 证据。

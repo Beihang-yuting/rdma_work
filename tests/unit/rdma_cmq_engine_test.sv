@@ -23719,7 +23719,9 @@ class rdma_cmq_engine_test extends uvm_test;
         result.submission_effect != RDMA_SUBMIT_EFFECT_UNOBSERVED ||
         result.attempt_effect != RDMA_SUBMIT_EFFECT_UNOBSERVED ||
         result.completion_phase != RDMA_CMQ_COMPLETION_UNOBSERVED ||
-        result.recovery_required != 1'b1)
+        result.recovery_required != 1'b1 || result.ticket != null ||
+        result.completion != null || result.batch_id != 0 ||
+        result.attempt_id != 0)
       `uvm_error("EXECUTE_OBSERVED_NULL_ENVELOPE",
                  "null submit envelope was not classified as UNOBSERVED")
   endtask

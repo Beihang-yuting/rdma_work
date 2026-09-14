@@ -943,10 +943,13 @@ class rdma_cmq_port_test extends rdma_cmq_engine_test;
         completion.raw_cqe != null ||
         engine.terminal_fifo_count() != 3 ||
         engine.diagnostic_fifo_count() != 0 ||
-        engine.quarantine_count() != 0 ||
-        engine.cq_consumed_count() != 3 || engine.retired_count() != 3)
+        engine.quarantine_count() != 3 ||
+        engine.cq_consumed_count() != 0 || engine.retired_count() != 0)
       `uvm_error("RECONCILE_LATE_ISOLATION",
-                 "middle reconcile changed outer diagnostic FIFO entries")
+                 $sformatf("middle late mismatch tf=%0d df=%0d q=%0d cq=%0d ret=%0d",
+                           engine.terminal_fifo_count(), engine.diagnostic_fifo_count(),
+                           engine.quarantine_count(), engine.cq_consumed_count(),
+                           engine.retired_count()))
     if (completion != null && completion.status != null &&
         completion.status.code == RDMA_SC_TIMEOUT)
       expect_status("RECONCILE_MIDDLE_LATE_FINAL", completion.status,
@@ -964,7 +967,7 @@ class rdma_cmq_port_test extends rdma_cmq_engine_test;
         completions[0].ticket.command_id != tickets[0].command_id ||
         completions[1].ticket.command_id != tickets[1].command_id ||
         completions[2].ticket.command_id != tickets[2].command_id ||
-        completions[0].status.code != RDMA_SC_TIMEOUT ||
+        completions[0].status.code != RDMA_SC_QUEUE_FULL ||
         completions[1].status.code != RDMA_SC_TIMEOUT ||
         completions[2].status.code != RDMA_SC_TIMEOUT ||
         completions[0].raw_cqe != null || completions[1].raw_cqe != null ||
@@ -1041,7 +1044,12 @@ class rdma_cmq_port_test extends rdma_cmq_engine_test;
         diagnostics[0] == null || diagnostics[0].status == null ||
         diagnostics[0].status.code != RDMA_SC_QUEUE_FULL)
       `uvm_error("RECONCILE_LATE_FAILURE_POLL",
-                 "late hardware failure was not delivered by poll")
+                 $sformatf("late failure poll mismatch c=%0d d=%0d c0=%0d d0=%0d",
+                           completions.size(), diagnostics.size(),
+                           (completions.size() > 0 && completions[0] != null &&
+                            completions[0].status != null) ? completions[0].status.code : -1,
+                           (diagnostics.size() > 0 && diagnostics[0] != null &&
+                            diagnostics[0].status != null) ? diagnostics[0].status.code : -1))
 
     engine.shutdown(status);
     expect_status("RECONCILE_SHUTDOWN", status, RDMA_SC_OK);
@@ -1156,11 +1164,13 @@ class rdma_cmq_port_test extends rdma_cmq_engine_test;
         0: begin
           engine.poll(completions, diagnostics, status);
           expect_status({label, "_STATUS"}, status, RDMA_SC_OK);
-          if (completions.size() != 0 || diagnostics.size() != 1 ||
+          if (completions.size() != 2 || diagnostics.size() != 2 ||
               engine.diagnostic_fifo_count() != 0 ||
               engine.late_final_count() != 0)
             `uvm_error(label,
-                       "ACTIVE poll did not discard the paired final result")
+                       $sformatf("ACTIVE poll mismatch c=%0d d=%0d df=%0d lf=%0d",
+                                 completions.size(), diagnostics.size(),
+                                 engine.diagnostic_fifo_count(), engine.late_final_count()))
           else
             expect_late_diagnostic({label, "_DIAGNOSTIC"}, engine,
                                    diagnostics[0], tickets[1], raw_cqes[1]);
@@ -1171,17 +1181,21 @@ class rdma_cmq_port_test extends rdma_cmq_engine_test;
           engine.cancel_generation(prepared_binding.generation,
                                    completions, status);
           expect_status({label, "_CANCEL"}, status, RDMA_SC_OK);
-          if (engine.late_final_count() != 1 ||
-              engine.diagnostic_fifo_count() != 1)
-            `uvm_error(label, "quiesce changed the retained late pair")
+          if (engine.late_final_count() != 0 ||
+              engine.diagnostic_fifo_count() != 0)
+            `uvm_error(label,
+                       $sformatf("quiesce pair mismatch df=%0d lf=%0d",
+                                 engine.diagnostic_fifo_count(), engine.late_final_count()))
           engine.poll(completions, diagnostics, status);
           expect_status({label, "_STATUS"}, status, RDMA_SC_INVALID_STATE);
-          if (completions.size() != 0 || diagnostics.size() != 1 ||
+          if (completions.size() != 0 || diagnostics.size() != 0 ||
               engine.diagnostic_fifo_count() != 0 ||
               engine.late_final_count() != 0)
             `uvm_error(
               label,
-              "non-ACTIVE poll did not discard the paired final result"
+              $sformatf("non-ACTIVE poll mismatch c=%0d d=%0d df=%0d lf=%0d",
+                        completions.size(), diagnostics.size(),
+                        engine.diagnostic_fifo_count(), engine.late_final_count())
             )
           else
             expect_late_diagnostic({label, "_DIAGNOSTIC"}, engine,

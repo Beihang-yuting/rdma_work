@@ -1466,6 +1466,14 @@ Phase 1A 中 production legacy `execute()` 仍是 `last_execute_no_submit_proven
 时置一。observed API、engine、wait/reconcile 与 retained snapshots 不读写该弃用成员；
 三个 Phase 1B consumer 完成迁移前 accessor 保留以维持 ABI。
 
+`execute_observed()` 的决策只读取 submit 返回后锁内重查的 journal item：
+`PUBLISH_AMBIGUOUS/PUBLISH_CONFIRMED + PENDING` 才允许一次 `wait_for()`；
+`HOST_VISIBLE_NOT_PUBLISHED/NONE` 立即返回；COMPLETED、TIMEOUT、LATE 和 RESET
+行从 journal-owned snapshot 返回，即使 delivery FIFO 已被消费。STAGED、PENDING_EFFECT、
+缺失 authority、state/phase/effect 矛盾或 snapshot 失败必须保留 operation status/effects，
+并独立设置 `observation_status=INVALID_STATE`、`UNOBSERVED` phase/effect 与
+`recovery_required=1`（真实零 identity PRE_SUBMIT_REJECTED/NONE 除外）。
+
 ## 8. 可读性与排版契约
 
 本轮采用当前 `AGENTS.md`，并把用户认可的 Claude 风格具体化为以下规则：
@@ -1564,6 +1572,12 @@ consumer 的 reconcile 必须继续使用 journal-owned、old-epoch-safe 的只�
 全部生产调用方迁移后，才能停止写入/读取 adapter 级 `last_*` 证据，并让
 `last_execute_definitive_no_submit()` 固定返回保守 false。不得在中途把 status code
 映射重新包装成另一种共享 bit。
+
+Phase 1A 的 observed route 不得读取或写入 adapter shared last-state；只有 legacy
+`execute()` wrapper 可更新 deprecated compatibility seam。adapter 对 engine envelope
+执行语义 shape 校验（status/effect/phase/completion、ticket/Function/CMQ identity 和
+alias topology），任何矛盾只污染 observation，不覆盖有效 operation status/effects。
+Phase 1B 完成三个 consumer 迁移并验证后，才可删除该 seam。
 
 ### 阶段 1C：CMQ wire/opcode 契约修复
 

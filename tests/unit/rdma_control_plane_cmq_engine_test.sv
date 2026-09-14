@@ -488,6 +488,7 @@ class rdma_control_plane_cmq_engine_test extends uvm_test;
     rdma_control_result register_result;
     rdma_control_result destroy_result;
     rdma_control_result pd_destroy_result;
+    rdma_cmq_execution_result observed_result;
     rdma_status status;
     int unsigned cmq_backing_only_baseline;
     int unsigned release_count;
@@ -526,6 +527,16 @@ class rdma_control_plane_cmq_engine_test extends uvm_test;
     expect_status("REAL_ENGINE_ACTIVATE", status, RDMA_SC_OK);
     status = adapter.bind_engine(binding.make_handle(), engine);
     expect_status("REAL_ENGINE_BIND", status, RDMA_SC_OK);
+    // observed route 的 pre-engine guard 必须返回独立 envelope，且不得触发 CMQ I/O。
+    adapter.execute_observed(null, observed_result);
+    if (observed_result == null || observed_result.status == null ||
+        observed_result.observation_status == null ||
+        observed_result.submission_effect != RDMA_SUBMIT_EFFECT_PRE_SUBMIT_REJECTED ||
+        observed_result.attempt_effect != RDMA_SUBMIT_EFFECT_PRE_SUBMIT_REJECTED ||
+        observed_result.completion_phase != RDMA_CMQ_COMPLETION_NONE ||
+        observed_result.recovery_required != 1'b0)
+      `uvm_error("REAL_ENGINE_OBSERVED_ROUTE",
+                 "control-plane production adapter did not preserve pre-reject evidence")
     status = mock_pcie.configure_responder(
       mock_mem, engine.mapping_snapshot(), binding
     );
