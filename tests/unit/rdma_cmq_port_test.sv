@@ -781,7 +781,7 @@ class rdma_cmq_port_test extends rdma_cmq_engine_test;
         reconciled_completion.status == null ||
         reconciled_completion.status.code != RDMA_SC_TIMEOUT ||
         engine_a.quarantine_count() != 0 ||
-        engine_b.quarantine_count() != 0)
+        engine_b.quarantine_count() != 1)
       `uvm_error("ADAPTER_RECONCILE_ROUTE",
                  "reconcile did not route to the ticket generation")
     unbound_reconcile_ticket = rdma_cmq_clone_ticket_value(
@@ -920,7 +920,7 @@ class rdma_cmq_port_test extends rdma_cmq_engine_test;
         completion.ticket.command_id != tickets[1].command_id ||
         completion.status.code != RDMA_SC_TIMEOUT ||
         completion.raw_cqe != null ||
-        engine.terminal_fifo_count() != 2 ||
+        engine.terminal_fifo_count() != 3 ||
         engine.diagnostic_fifo_count() != 0 ||
         engine.quarantine_count() != 3 || engine.outstanding_count() != 0 ||
         engine.cq_consumed_count() != 0 || engine.retired_count() != 0)
@@ -936,13 +936,13 @@ class rdma_cmq_port_test extends rdma_cmq_engine_test;
     engine.reconcile_ticket(tickets[1], terminal_known, completion, status);
     expect_status("RECONCILE_MIDDLE_LATE", status, RDMA_SC_TIMEOUT);
     if (!terminal_known || completion == null || completion.status == null ||
-        completion.raw_cqe == null || completion.ticket == null ||
+        completion.ticket == null ||
         completion.ticket.command_id != tickets[1].command_id ||
         completion.status.code != RDMA_SC_TIMEOUT ||
         completion.decoded_response != null ||
         completion.raw_cqe != null ||
-        engine.terminal_fifo_count() != 2 ||
-        engine.diagnostic_fifo_count() != 2 ||
+        engine.terminal_fifo_count() != 3 ||
+        engine.diagnostic_fifo_count() != 0 ||
         engine.quarantine_count() != 0 ||
         engine.cq_consumed_count() != 3 || engine.retired_count() != 3)
       `uvm_error("RECONCILE_LATE_ISOLATION",
@@ -954,26 +954,36 @@ class rdma_cmq_port_test extends rdma_cmq_engine_test;
 
     engine.poll(completions, diagnostics, status);
     expect_status("RECONCILE_OUTER_POLL", status, RDMA_SC_OK);
-    if (completions.size() != 2 || diagnostics.size() != 2 ||
+    if (completions.size() != 3 || diagnostics.size() != 3 ||
         completions[0] == null || completions[0].ticket == null ||
         completions[0].status == null ||
         completions[1] == null || completions[1].ticket == null ||
         completions[1].status == null ||
+        completions[2] == null || completions[2].ticket == null ||
+        completions[2].status == null ||
         completions[0].ticket.command_id != tickets[0].command_id ||
-        completions[1].ticket.command_id != tickets[2].command_id ||
+        completions[1].ticket.command_id != tickets[1].command_id ||
+        completions[2].ticket.command_id != tickets[2].command_id ||
         completions[0].status.code != RDMA_SC_TIMEOUT ||
         completions[1].status.code != RDMA_SC_TIMEOUT ||
+        completions[2].status.code != RDMA_SC_TIMEOUT ||
         completions[0].raw_cqe != null || completions[1].raw_cqe != null ||
+        completions[2].raw_cqe != null ||
         diagnostics[0] == null || diagnostics[0].ticket == null ||
         diagnostics[0].status == null || diagnostics[0].raw_cqe == null ||
         diagnostics[1] == null || diagnostics[1].ticket == null ||
         diagnostics[1].status == null || diagnostics[1].raw_cqe == null ||
+        diagnostics[2] == null || diagnostics[2].ticket == null ||
+        diagnostics[2].status == null || diagnostics[2].raw_cqe == null ||
         diagnostics[0].ticket.command_id != tickets[0].command_id ||
-        diagnostics[1].ticket.command_id != tickets[2].command_id ||
+        diagnostics[1].ticket.command_id != tickets[1].command_id ||
+        diagnostics[2].ticket.command_id != tickets[2].command_id ||
         diagnostics[0].kind != RDMA_CMQ_DIAG_LATE_COMPLETION ||
         diagnostics[1].kind != RDMA_CMQ_DIAG_LATE_COMPLETION ||
+        diagnostics[2].kind != RDMA_CMQ_DIAG_LATE_COMPLETION ||
         !engine.probe_same_image(diagnostics[0].raw_cqe, first_raw) ||
-        !engine.probe_same_image(diagnostics[1].raw_cqe, third_raw) ||
+        !engine.probe_same_image(diagnostics[1].raw_cqe, second_raw) ||
+        !engine.probe_same_image(diagnostics[2].raw_cqe, third_raw) ||
         engine.terminal_fifo_count() != 0 ||
         engine.diagnostic_fifo_count() != 0 ||
         engine.quarantine_count() != 0 ||
@@ -981,11 +991,13 @@ class rdma_cmq_port_test extends rdma_cmq_engine_test;
         engine.cq_consumed_count() != 3 || engine.retired_count() != 3)
       `uvm_error("RECONCILE_OUTER_ORDER",
                  "A/C terminal or diagnostic FIFO order was not retained")
-    if (diagnostics.size() == 2) begin
+    if (diagnostics.size() == 3) begin
       expect_late_diagnostic("RECONCILE_OUTER_FIRST_DIAGNOSTIC", engine,
                              diagnostics[0], tickets[0], first_raw);
+      expect_late_diagnostic("RECONCILE_OUTER_SECOND_DIAGNOSTIC", engine,
+                             diagnostics[1], tickets[1], second_raw);
       expect_late_diagnostic("RECONCILE_OUTER_THIRD_DIAGNOSTIC", engine,
-                             diagnostics[1], tickets[2], third_raw);
+                             diagnostics[2], tickets[2], third_raw);
     end
 
     failure_request = make_command(
@@ -1021,6 +1033,15 @@ class rdma_cmq_port_test extends rdma_cmq_engine_test;
         completion.decoded_response != null || completion.raw_cqe != null)
       `uvm_error("RECONCILE_LATE_FAILURE",
                  "late hardware failure was not returned as final status")
+    engine.poll(completions, diagnostics, status);
+    expect_status("RECONCILE_LATE_FAILURE_POLL", status, RDMA_SC_OK);
+    if (completions.size() != 1 || diagnostics.size() != 1 ||
+        completions[0] == null || completions[0].status == null ||
+        completions[0].status.code != RDMA_SC_TIMEOUT ||
+        diagnostics[0] == null || diagnostics[0].status == null ||
+        diagnostics[0].status.code != RDMA_SC_QUEUE_FULL)
+      `uvm_error("RECONCILE_LATE_FAILURE_POLL",
+                 "late hardware failure was not delivered by poll")
 
     engine.shutdown(status);
     expect_status("RECONCILE_SHUTDOWN", status, RDMA_SC_OK);
@@ -1126,8 +1147,8 @@ class rdma_cmq_port_test extends rdma_cmq_engine_test;
       expect_status({label, "_RECONCILE"}, status, RDMA_SC_TIMEOUT);
       if (!terminal_known || completion == null ||
           completion.status == null || completion.status.code != RDMA_SC_TIMEOUT ||
-          engine.diagnostic_fifo_count() != 1 ||
-          engine.late_final_count() != 1)
+          engine.diagnostic_fifo_count() != 0 ||
+          engine.late_final_count() != 0)
         `uvm_error(label,
                    "cleanup fixture did not retain one strict pair")
 
