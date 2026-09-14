@@ -3422,10 +3422,11 @@ class rdma_queue_data_engine_device_publish_test extends uvm_test;
   endtask
 
   // 功能：check_ceqe_publish_cases 在真实 CQ/CEQ/QP route 上验证 qpn=0、非零
-  //   qpn、显式 CQ poll、authority/PI/polarity 拒绝以及满环 credit 契约。
+  //   qpn、RC/URC 完整字段传播、显式 CQ poll、authority/PI/polarity 拒绝以及满环
+  //   credit 契约。
   // 输入/输出及副作用：fixture、正确/错误 lifecycle CEQ、CQ 与两个 QP 为输入，
   //   status 为输出；成功路径写入并消费 CQE/CEQE，拒绝路径只读取原子性快照。
-  // 失败边界：正向 prerequisite 失败立即返回；每个负例必须保持 backing、cursor、
+  // 失败/边界：正向 prerequisite 失败立即返回；每个负例必须保持 backing、cursor、
   //   used、pending/reservation 和 result 不变，完整填充一圈必须显式翻转 producer wrap。
   task automatic check_ceqe_publish_cases(
     rdma_queue_data_engine_fixture fixture,
@@ -3516,6 +3517,64 @@ class rdma_queue_data_engine_device_publish_test extends uvm_test;
                        "CEQE poll did not preserve CEQ/CQ route identity");
       status = rdma_status::make(RDMA_SC_INVALID_STATE,
                                  "CEQE poll route identity mismatch");
+      return;
+    end
+
+    // 设计说明：URC CEQE 的 qword1 不携带 CQ consumer index，而是携带
+    // abnormal/WQE/SQ/RQ completion 字段；publish 与 poll 必须保留这些原始
+    // 驱动坐标，不能沿用 RC 分支的 cq_pi 校验或只复制公共头。
+    ceq_polarity = 1'b0;
+    status = fixture.engine.query_runtime_producer_polarity(
+      lifecycle_ceq.handle, RDMA_QUEUE_RUNTIME_CEQ, ceq_polarity);
+    if (status == null || !status.ok()) return;
+    make_ceqe_from_committed_cq(
+      fixture.engine, lifecycle_cq.handle, lifecycle_cq.local_cq_id,
+      event_qp.local_qp_id, ceq_polarity, ceqe, model_status);
+    if (model_status == null || !model_status.ok() || ceqe == null) begin
+      status = model_status;
+      return;
+    end
+    ceqe.urc_flag = 1'b1;
+    ceqe.cq_pi = 16'h0000;
+    ceqe.cq_pi_wrap = 1'b0;
+    ceqe.urc_sq_cqe_valid = 1'b1;
+    ceqe.urc_rq_cqe_valid = 1'b1;
+    ceqe.urc_abnormal_cqe_type = 2'b10;
+    ceqe.urc_abnormal_cqe_remote_ecode = 8'ha5;
+    ceqe.urc_abnormal_cqe_wqe_idx_wrap = 1'b1;
+    ceqe.urc_abnormal_cqe_wqe_idx = 15'h1234;
+    ceqe.urc_hw_cpl_sq_wqe_idx_wrap = 1'b0;
+    ceqe.urc_hw_cpl_sq_wqe_idx = 15'h2345;
+    ceqe.urc_hw_cpl_rq_wqe_idx_wrap = 1'b1;
+    ceqe.urc_hw_cpl_rq_wqe_idx = 15'h3456;
+    fixture.engine.publish_ceqe(
+      lifecycle_ceq.handle, ceqe, published, status);
+    if (status == null || !status.ok() || published == null) begin
+      uvm_report_error(
+        "EVENT_PUBLISH_CEQE_URC",
+        "URC CEQE publish incorrectly applied the RC CQ_PI contract");
+      return;
+    end
+    fixture.engine.poll_ceqe(
+      lifecycle_ceq.handle, 0, event_result, status);
+    polled_ceqe = null;
+    if (status == null || !status.ok() || event_result == null ||
+        !$cast(polled_ceqe, event_result.event_model) || polled_ceqe == null ||
+        !polled_ceqe.urc_flag ||
+        !polled_ceqe.urc_sq_cqe_valid || !polled_ceqe.urc_rq_cqe_valid ||
+        polled_ceqe.urc_abnormal_cqe_type != 2'b10 ||
+        polled_ceqe.urc_abnormal_cqe_remote_ecode != 8'ha5 ||
+        !polled_ceqe.urc_abnormal_cqe_wqe_idx_wrap ||
+        polled_ceqe.urc_abnormal_cqe_wqe_idx != 15'h1234 ||
+        polled_ceqe.urc_hw_cpl_sq_wqe_idx_wrap ||
+        polled_ceqe.urc_hw_cpl_sq_wqe_idx != 15'h2345 ||
+        !polled_ceqe.urc_hw_cpl_rq_wqe_idx_wrap ||
+        polled_ceqe.urc_hw_cpl_rq_wqe_idx != 15'h3456) begin
+      uvm_report_error(
+        "EVENT_PUBLISH_CEQE_URC_FIELDS",
+        "CEQE poll did not preserve complete URC driver fields");
+      status = rdma_status::make(
+        RDMA_SC_INVALID_STATE, "CEQE URC field propagation mismatch");
       return;
     end
     fixture.engine.poll_cqe(
@@ -3733,12 +3792,12 @@ class rdma_queue_data_engine_device_publish_test extends uvm_test;
     status = rdma_status::success();
   endtask
 
-  // 功能：check_aeqe_publish_cases 验证真实非零 QP 目标的 AEQE 发布、16-byte
-  //   write/readback recovery、poll 身份、target/Function/generation/polarity 拒绝
-  //   以及满环 credit 与恢复。
+  // 功能：check_aeqe_publish_cases 验证真实非零 QP 目标的 AEQE 发布、完整驱动
+  //   字段传播、16-byte write/readback recovery、poll 身份、target/Function/
+  //   generation/polarity 拒绝以及满环 credit 与恢复。
   // 输入/输出及副作用：fixture、lifecycle_aeq、event_qp/foreign_qp 为输入，
   //   status 为输出；成功路径写入/消费 AEQ，负例仅观察原子性快照。
-  // 失败边界：目标必须是同 Function/代际的 attached QP 且 qpn 非零；满一整圈
+  // 失败/边界：目标必须是同 Function/代际的 attached QP 且 qpn 非零；满一整圈
   //   必须只翻转 producer wrap，full 拒绝与最终 drain 不得遗留 pending/占用。
   task automatic check_aeqe_publish_cases(
     rdma_queue_data_engine_fixture fixture,
@@ -3788,8 +3847,21 @@ class rdma_queue_data_engine_device_publish_test extends uvm_test;
     end
     aeqe.qpn = event_qp.local_qp_id;
     aeqe.valid = aeq_polarity;
-    aeqe.ecode = 0;
-    aeqe.packet_opcode = 0;
+    aeqe.qp_state = 3'd4;
+    aeqe.srfq_en = 1'b1;
+    aeqe.overflow_flag = 1'b1;
+    aeqe.urc_flag = 1'b1;
+    aeqe.cq_invalid_flag = 1'b1;
+    aeqe.urc_abnormal_cqe_type = 2'b01;
+    aeqe.cqn_eqn_high = 13'h1234;
+    aeqe.cqn_eqn_low = 6'h2a;
+    aeqe.ecode = 8'h5a;
+    aeqe.packet_opcode = 8'hc3;
+    aeqe.urc_remote_ecode = 8'he1;
+    aeqe.wqe_wrap = 1'b1;
+    aeqe.wqe_index = 23'h456789;
+    aeqe.srfqn = 12'hbcd;
+    aeqe.srfqe_idx = 16'hd234;
     recovery_writes_before = count_host_mem_calls(fixture.mem, "write");
     recovery_reads_before = count_host_mem_calls(fixture.mem, "read");
     fixture.mem.corrupt_next_readback = 1'b1;
@@ -3842,9 +3914,21 @@ class rdma_queue_data_engine_device_publish_test extends uvm_test;
         !$cast(polled_aeqe, event_result.event_model) ||
         polled_aeqe.target_h == null ||
         !polled_aeqe.target_h.same_instance(event_qp.handle) ||
-        polled_aeqe.qpn != event_qp.local_qp_id) begin
+        polled_aeqe.qpn != event_qp.local_qp_id ||
+        polled_aeqe.qp_state != 3'd4 || !polled_aeqe.srfq_en ||
+        !polled_aeqe.overflow_flag || !polled_aeqe.urc_flag ||
+        !polled_aeqe.cq_invalid_flag ||
+        polled_aeqe.urc_abnormal_cqe_type != 2'b01 ||
+        polled_aeqe.cqn_eqn_high != 13'h1234 ||
+        polled_aeqe.cqn_eqn_low != 6'h2a ||
+        polled_aeqe.ecode != 8'h5a ||
+        polled_aeqe.packet_opcode != 8'hc3 ||
+        polled_aeqe.urc_remote_ecode != 8'he1 ||
+        !polled_aeqe.wqe_wrap || polled_aeqe.wqe_index != 23'h456789 ||
+        polled_aeqe.srfqn != 12'hbcd ||
+        polled_aeqe.srfqe_idx != 16'hd234) begin
       uvm_report_error("EVENT_PUBLISH_AEQE_POLL",
-                       "AEQE poll did not preserve AEQ/QP route identity");
+                       "AEQE poll did not preserve route and driver fields");
       status = rdma_status::make(RDMA_SC_INVALID_STATE,
                                  "AEQE poll route identity mismatch");
       return;

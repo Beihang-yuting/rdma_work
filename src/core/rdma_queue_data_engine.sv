@@ -879,6 +879,27 @@ class rdma_queue_data_engine extends uvm_object;
       ceqe_candidate.cq_pi = source_ceqe.cq_pi;
       ceqe_candidate.cq_pi_wrap = source_ceqe.cq_pi_wrap;
       ceqe_candidate.valid = source_ceqe.valid;
+      // CEQE qword1 是 RC/URC 双布局；候选快照必须复制 URC 的全部字段，
+      // 否则 poll 成功后上层看到的 detached model 会丢失驱动异常上下文。
+      ceqe_candidate.urc_flag = source_ceqe.urc_flag;
+      ceqe_candidate.urc_sq_cqe_valid = source_ceqe.urc_sq_cqe_valid;
+      ceqe_candidate.urc_rq_cqe_valid = source_ceqe.urc_rq_cqe_valid;
+      ceqe_candidate.urc_abnormal_cqe_type =
+        source_ceqe.urc_abnormal_cqe_type;
+      ceqe_candidate.urc_abnormal_cqe_remote_ecode =
+        source_ceqe.urc_abnormal_cqe_remote_ecode;
+      ceqe_candidate.urc_abnormal_cqe_wqe_idx_wrap =
+        source_ceqe.urc_abnormal_cqe_wqe_idx_wrap;
+      ceqe_candidate.urc_abnormal_cqe_wqe_idx =
+        source_ceqe.urc_abnormal_cqe_wqe_idx;
+      ceqe_candidate.urc_hw_cpl_sq_wqe_idx_wrap =
+        source_ceqe.urc_hw_cpl_sq_wqe_idx_wrap;
+      ceqe_candidate.urc_hw_cpl_sq_wqe_idx =
+        source_ceqe.urc_hw_cpl_sq_wqe_idx;
+      ceqe_candidate.urc_hw_cpl_rq_wqe_idx_wrap =
+        source_ceqe.urc_hw_cpl_rq_wqe_idx_wrap;
+      ceqe_candidate.urc_hw_cpl_rq_wqe_idx =
+        source_ceqe.urc_hw_cpl_rq_wqe_idx;
       result_candidate.event_model = ceqe_candidate;
     end
     else if ($cast(source_aeqe, decoded_event)) begin
@@ -901,6 +922,19 @@ class rdma_queue_data_engine extends uvm_object;
       aeqe_candidate.wqe_index = source_aeqe.wqe_index;
       aeqe_candidate.wqe_wrap = source_aeqe.wqe_wrap;
       aeqe_candidate.valid = source_aeqe.valid;
+      // AEQE 字段全部来自 defs.h/event.c 的逐位布局。尤其 flags 与拆分
+      // CQN/EQN 必须按原字段传播，不能只保留 qpn/ecode 这组公共标识。
+      aeqe_candidate.srfq_en = source_aeqe.srfq_en;
+      aeqe_candidate.overflow_flag = source_aeqe.overflow_flag;
+      aeqe_candidate.urc_flag = source_aeqe.urc_flag;
+      aeqe_candidate.cq_invalid_flag = source_aeqe.cq_invalid_flag;
+      aeqe_candidate.urc_abnormal_cqe_type =
+        source_aeqe.urc_abnormal_cqe_type;
+      aeqe_candidate.cqn_eqn_high = source_aeqe.cqn_eqn_high;
+      aeqe_candidate.cqn_eqn_low = source_aeqe.cqn_eqn_low;
+      aeqe_candidate.urc_remote_ecode = source_aeqe.urc_remote_ecode;
+      aeqe_candidate.srfqn = source_aeqe.srfqn;
+      aeqe_candidate.srfqe_idx = source_aeqe.srfqe_idx;
       result_candidate.event_model = aeqe_candidate;
     end
     else begin
@@ -2430,7 +2464,7 @@ class rdma_queue_data_engine extends uvm_object;
   //   使 CEQ poll 只负责 route CQ 而不会替 CQ 生成或消费 completion。
   // 输入/输出及副作用：ceq_h、model 为只读输入，result/status 为输出；成功时写入
   //   16B CEQ ring 并推进 CEQ producer，不修改 CQ cursor、model 或 WQE ledger。
-  // 失败边界：CEQ/CQ/QP authority、generation、已提交 PI、16 位 PI、polarity、
+  // 失败/边界：CEQ/CQ/QP authority、generation、已提交 PI、16 位 PI、polarity、
   //   full ring 或 codec 失败时 result 保持 null；预写失败取消 reservation，写后失败
   //   保留 pending/recovery evidence，不能改变 backing、cursor 或 committed occupancy。
   task publish_ceqe(
@@ -2571,8 +2605,16 @@ class rdma_queue_data_engine extends uvm_object;
                    RDMA_SC_INVALID_ARGUMENT);
       return;
     end
-    if (model.cq_pi != producer_index[15:0] ||
-        model.cq_pi_wrap != producer_wrap) begin
+    // 设计说明：驱动 defs.h 将 CEQE qword1 复用为两种互斥布局。RC CEQE
+    // 发布 CQ consumer index，必须匹配已提交 CQ producer；URC CEQE 的同一
+    // qword1 改为 abnormal/WQE/SQ/RQ completion，不应被 RC cursor 规则拦截。
+    // 输入/输出及副作用：model.urc_flag 只决定校验分支；RC 分支只读
+    // producer_index/producer_wrap，URC 分支不修改任何 CQ runtime 状态。
+    // 失败/边界：仅 RC 的 cq_pi/cq_pi_wrap 不匹配返回 INVALID_ARGUMENT；URC
+    // 字段的位宽、互斥与保留位仍由 CEQE codec 逐位校验。
+    if (!model.urc_flag &&
+        (model.cq_pi != producer_index[15:0] ||
+         model.cq_pi_wrap != producer_wrap)) begin
       status = bad("CEQE CQ producer cursor is not committed cursor",
                    RDMA_SC_INVALID_ARGUMENT);
       return;
