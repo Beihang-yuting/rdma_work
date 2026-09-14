@@ -75,6 +75,22 @@ class rdma_cmq_engine_port_adapter extends rdma_cmq_port;
     if (value.completion_phase == RDMA_CMQ_COMPLETION_NONE &&
         value.completion != null)
       return 1'b0;
+    if (value.completion_phase == RDMA_CMQ_COMPLETION_UNOBSERVED &&
+        (value.submission_effect != RDMA_SUBMIT_EFFECT_UNOBSERVED ||
+         value.attempt_effect != RDMA_SUBMIT_EFFECT_UNOBSERVED ||
+         value.recovery_required != 1'b1))
+      return 1'b0;
+    if (value.submission_effect == RDMA_SUBMIT_EFFECT_PRE_SUBMIT_REJECTED &&
+        (value.attempt_effect != RDMA_SUBMIT_EFFECT_PRE_SUBMIT_REJECTED ||
+         value.completion_phase != RDMA_CMQ_COMPLETION_NONE ||
+         value.recovery_required != 1'b0))
+      return 1'b0;
+    if (value.completion_phase == RDMA_CMQ_COMPLETION_PENDING &&
+        value.submission_effect inside {
+          RDMA_SUBMIT_EFFECT_UNOBSERVED,
+          RDMA_SUBMIT_EFFECT_PRE_SUBMIT_REJECTED
+        })
+      return 1'b0;
     if (value.completion_phase inside {
           RDMA_CMQ_COMPLETION_TERMINAL,
           RDMA_CMQ_COMPLETION_TIMEOUT,
@@ -87,7 +103,16 @@ class rdma_cmq_engine_port_adapter extends rdma_cmq_port;
          !rdma_cmq_status_shape_valid(value.completion.status) ||
          value.completion.ticket == null ||
          (value.ticket != null &&
-          !value.completion.ticket.same_instance(value.ticket))))
+          (value.completion.ticket.command_id != value.ticket.command_id ||
+           value.completion.ticket.slot_sequence != value.ticket.slot_sequence ||
+           value.completion.ticket.sq_index != value.ticket.sq_index ||
+           value.completion.ticket.sq_wrap != value.ticket.sq_wrap ||
+           value.completion.ticket.function_h == null ||
+           value.ticket.function_h == null ||
+           !value.completion.ticket.function_h.same_instance(value.ticket.function_h) ||
+           value.completion.ticket.cmq_h == null ||
+           value.ticket.cmq_h == null ||
+           !value.completion.ticket.cmq_h.same_instance(value.ticket.cmq_h)))))
       return 1'b0;
     return 1'b1;
   endfunction
