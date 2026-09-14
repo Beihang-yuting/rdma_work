@@ -75,3 +75,13 @@ change with `CQE_PROFILE_RELATIVE_DECODE` and `CQE_PROFILE_RELATIVE_BYTE0`
   error=0, fatal=0; `PROCESS PASS` and `LOGICAL PASS`.
 - `python3 tools/check_changed_sv_style.py --base HEAD --head HEAD`: pass.
 - `git diff --check`: pass.
+
+### Style remediation follow-up
+
+Review against `3f85367..HEAD` found adjacent-comment label typos in two
+changed test tasks, an undocumented `image_bytes()` accessor, merged
+declarations, and compressed CQE field functions. These were expanded or
+corrected without changing field masks, profile offsets, or test assertions.
+The follow-up verification was rerun on VCS53 for both focused tests; each
+returned exit 0 with UVM warning=0, error=0, fatal=0. The changed-line checker
+and `git diff --check` are both clean.

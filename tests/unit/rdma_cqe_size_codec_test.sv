@@ -170,7 +170,7 @@ class rdma_cqe_size_codec_test extends uvm_test;
   // 编码入口，检查镜像 metadata、尾部清零和 active profile 不被污染。
   // 输入/输出及副作用：任务创建本地 codec、模型和镜像；成功调用只发布
   // detached image，失败通过 UVM error 记录，不修改 registry 或外部资源。
-  // 失败边界：任一 profile 长度/对齐/端序/代际/类型不符、尾部非零、非法
+  // 失败/边界：任一 profile 长度/对齐/端序/代际/类型不符、尾部非零、非法
   // 48B 被接受或默认 encode 长度被改变都会使测试失败。
   task automatic test_cqe_explicit_profile_is_stateless();
     rdma_hw_cqe_codec codec;
@@ -310,9 +310,9 @@ class rdma_cqe_size_codec_test extends uvm_test;
 
   // 功能：构造 128B CQE 的 profile-relative raw image，确认 qword8 起始的
   // header 能从非零 prefix 后正确解码，并把旧 byte0 坐标作为负向证据。
-  // 输入输出及副作用：仅创建本地 codec、source/image 和 detached decode
+  // 输入/输出及副作用：仅创建本地 codec、source/image 和 detached decode
   // model；成功路径只读 raw bytes，失败通过 UVM error 记录，不修改生产资源。
-  // 失败边界：prefix、qword8/qword9/qword10 任一保留位不满足 profile，或
+  // 失败/边界：prefix、qword8/qword9/qword10 任一保留位不满足 profile，或
   // byte0 image 被误当作 128B header，均报告具体坐标错误。
   task automatic test_cqe_128b_profile_relative_header();
     rdma_hw_cqe_codec codec;

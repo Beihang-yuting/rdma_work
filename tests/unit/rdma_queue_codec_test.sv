@@ -47,8 +47,10 @@ class rdma_queue_codec_test extends uvm_test;
     rdma_hw_sqe_model sq, sq2; rdma_hw_rqe_model rq, rq2; rdma_hw_cqe_model cq, cq2;
     rdma_hw_ceqe_model ceqe;
     rdma_sqe_rc_ext re; rdma_sge sg; byte unsigned bad[];
-    rdma_hw_cqe_codec profile_codec; rdma_hw_image profile_image;
-    rdma_hw_qword_builder profile_builder; bit [63:0] profile_words[];
+    rdma_hw_cqe_codec profile_codec;
+    rdma_hw_image profile_image;
+    rdma_hw_qword_builder profile_builder;
+    bit [63:0] profile_words[];
     phase.raise_objection(this);
     r=rdma_codec_registry::type_id::create("r"); s=rdma_register_queue_codecs(r); ok("register",s);
     // 设计说明：CQ handle.object_id 是 resource manager 分配的 global incarnation，
