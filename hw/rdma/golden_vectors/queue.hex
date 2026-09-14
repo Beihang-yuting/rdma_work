@@ -18,12 +18,18 @@ cb c5 67 bd a6 a1 55 55 00 00 00 00 00 00 00 00 c7 04 00 00 de ad be ef 01 23 45
 
 # xtr_v1-golden-v1
 # case: ceqe_error
-# inputs: qpn=0x15555,cqn=0x1aaaaa,ecode=0xf4,pi=0xbeef,valid=1,packet_opcode=0x9a,wrap=1
+# inputs: qpn=0x15555,cqn=0x1aaaaa,ecode=0xf4,pi=0xbeef,valid=1,packet_opcode=0x9a,wrap=1,urc=0
 # bytes: 16
 81 55 55 1a aa aa f4 9a 00 00 00 00 00 80 be ef
 
 # xtr_v1-golden-v1
-# case: aeqe_error
-# inputs: qpn=0x2aaaa,state=5,ecode=0xff,index=0x654321,valid=1,packet_opcode=0x81,wrap=1
+# case: ceqe_urc_error
+# inputs: qpn=0x15555,cqn=0x1aaaaa,ecode=0xf4,valid=1,packet_opcode=0x9a,urc=1,sq_valid=1,rq_valid=1,abnormal_type=2,remote_ecode=0xa5,wqe_wrap=1,wqe_idx=0x4567,sq_cpl_wrap=1,sq_cpl_idx=0x2345,rq_cpl_wrap=1,rq_cpl_idx=0x3456
 # bytes: 16
-d0 00 00 81 ff 02 aa aa 00 e5 43 21 00 00 00 00
+c1 55 55 da aa aa f4 9a 02 a5 c5 67 a3 45 b4 56
+
+# xtr_v1-golden-v1
+# case: aeqe_error
+# inputs: qpn=0x2aaaa,state=5,ecode=0xff,index=0x654321,valid=1,packet_opcode=0x81,wrap=1,srfq=1,overflow=1,urc=1,cq_invalid=1,abnormal_type=2,cqn_eqn_high=0x1555,cqn_eqn_low=0x2a,remote_ecode=0xe1,srfqn=0xabc,srfqe_idx=0x1234
+# bytes: 16
+df 95 55 81 ff aa aa aa e1 e5 43 21 0a bc 12 34

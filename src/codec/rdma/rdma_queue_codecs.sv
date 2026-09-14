@@ -299,7 +299,25 @@ endclass
 
 class rdma_hw_ceqe_model extends rdma_ceqe_model;
   `uvm_object_utils(rdma_hw_ceqe_model)
-  bit [20:0] qpn; bit [20:0] cqn; bit [7:0] ecode; bit [7:0] packet_opcode; bit [15:0] cq_pi; bit cq_pi_wrap; bit valid;
+  bit [20:0] qpn;
+  bit [20:0] cqn;
+  bit [7:0] ecode;
+  bit [7:0] packet_opcode;
+  bit [15:0] cq_pi;
+  bit cq_pi_wrap;
+  bit valid;
+
+  bit urc_flag;
+  bit urc_sq_cqe_valid;
+  bit urc_rq_cqe_valid;
+  bit [1:0] urc_abnormal_cqe_type;
+  bit [7:0] urc_abnormal_cqe_remote_ecode;
+  bit urc_abnormal_cqe_wqe_idx_wrap;
+  bit [14:0] urc_abnormal_cqe_wqe_idx;
+  bit urc_hw_cpl_sq_wqe_idx_wrap;
+  bit [14:0] urc_hw_cpl_sq_wqe_idx;
+  bit urc_hw_cpl_rq_wqe_idx_wrap;
+  bit [14:0] urc_hw_cpl_rq_wqe_idx;
 
   // 功能：构造 rdma_hw_ceqe_model，调用 super.new 建立 UVM 层级对象；外部依赖字段保持未绑定，后续由 configure/build/activate 明确注入。
   // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
@@ -310,8 +328,30 @@ class rdma_hw_ceqe_model extends rdma_ceqe_model;
   // 输入/输出及副作用：rhs（输入）；rhs 是源对象；当前对象字段会被覆盖，嵌套句柄按实现执行 clone 或保持非拥有引用，源对象不被修改。
   // 失败/边界：do_copy 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（xtr CEQE copy mismatch），不保留部分有效快照。
   virtual function void do_copy(uvm_object rhs);
-    rdma_hw_ceqe_model x; super.do_copy(rhs); if (!$cast(x,rhs)) `uvm_fatal("RDMA_COPY_TYPE","xtr CEQE copy mismatch");
-    qpn=x.qpn; cqn=x.cqn; ecode=x.ecode; packet_opcode=x.packet_opcode; cq_pi=x.cq_pi; cq_pi_wrap=x.cq_pi_wrap; valid=x.valid;
+    rdma_hw_ceqe_model x;
+
+    super.do_copy(rhs);
+    if (!$cast(x, rhs))
+      `uvm_fatal("RDMA_COPY_TYPE", "xtr CEQE copy mismatch")
+
+    qpn = x.qpn;
+    cqn = x.cqn;
+    ecode = x.ecode;
+    packet_opcode = x.packet_opcode;
+    cq_pi = x.cq_pi;
+    cq_pi_wrap = x.cq_pi_wrap;
+    valid = x.valid;
+    urc_flag = x.urc_flag;
+    urc_sq_cqe_valid = x.urc_sq_cqe_valid;
+    urc_rq_cqe_valid = x.urc_rq_cqe_valid;
+    urc_abnormal_cqe_type = x.urc_abnormal_cqe_type;
+    urc_abnormal_cqe_remote_ecode = x.urc_abnormal_cqe_remote_ecode;
+    urc_abnormal_cqe_wqe_idx_wrap = x.urc_abnormal_cqe_wqe_idx_wrap;
+    urc_abnormal_cqe_wqe_idx = x.urc_abnormal_cqe_wqe_idx;
+    urc_hw_cpl_sq_wqe_idx_wrap = x.urc_hw_cpl_sq_wqe_idx_wrap;
+    urc_hw_cpl_sq_wqe_idx = x.urc_hw_cpl_sq_wqe_idx;
+    urc_hw_cpl_rq_wqe_idx_wrap = x.urc_hw_cpl_rq_wqe_idx_wrap;
+    urc_hw_cpl_rq_wqe_idx = x.urc_hw_cpl_rq_wqe_idx;
   endfunction
 
   // 功能：validate 校验 当前对象字段 与当前对象状态的一致性，并显式处理“CEQE requires CQ handle”等拒绝条件，返回 rdma_status 供上层决定是否提交。
@@ -328,12 +368,32 @@ class rdma_hw_ceqe_model extends rdma_ceqe_model;
   // 功能：describe 把 当前对象字段 与当前对象的身份/状态字段编码为稳定文本，供日志、查找或恢复索引使用。
   // 输入/输出及副作用：无显式参数；无显式输入；返回 string，只读取对象字段，不修改模型或资源账本。
   // 失败/边界：枚举未定义或对象未配置时返回 UNKNOWN/UNCONFIGURED 表示，同时保留数值上下文。
-  virtual function string describe(); return $sformatf("XTR_CEQE(qpn=%0d cqn=%0d)",qpn,cqn); endfunction
+  virtual function string describe();
+    return $sformatf("XTR_CEQE(qpn=%0d cqn=%0d urc=%0b)",
+                     qpn, cqn, urc_flag);
+  endfunction
 endclass
 
 class rdma_hw_aeqe_model extends rdma_aeqe_model;
   `uvm_object_utils(rdma_hw_aeqe_model)
-  bit [17:0] qpn; bit [2:0] qp_state; bit [7:0] ecode; bit [7:0] packet_opcode; bit [22:0] wqe_index; bit wqe_wrap; bit valid;
+  bit [17:0] qpn;
+  bit [2:0] qp_state;
+  bit [7:0] ecode;
+  bit [7:0] packet_opcode;
+  bit [22:0] wqe_index;
+  bit wqe_wrap;
+  bit valid;
+
+  bit srfq_en;
+  bit overflow_flag;
+  bit urc_flag;
+  bit cq_invalid_flag;
+  bit [1:0] urc_abnormal_cqe_type;
+  bit [12:0] cqn_eqn_high;
+  bit [5:0] cqn_eqn_low;
+  bit [7:0] urc_remote_ecode;
+  bit [11:0] srfqn;
+  bit [15:0] srfqe_idx;
 
   // 功能：构造 rdma_hw_aeqe_model，调用 super.new 建立 UVM 层级对象；外部依赖字段保持未绑定，后续由 configure/build/activate 明确注入。
   // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
@@ -344,19 +404,67 @@ class rdma_hw_aeqe_model extends rdma_aeqe_model;
   // 输入/输出及副作用：rhs（输入）；rhs 是源对象；当前对象字段会被覆盖，嵌套句柄按实现执行 clone 或保持非拥有引用，源对象不被修改。
   // 失败/边界：do_copy 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（xtr AEQE copy mismatch），不保留部分有效快照。
   virtual function void do_copy(uvm_object rhs);
-    rdma_hw_aeqe_model x; super.do_copy(rhs); if (!$cast(x,rhs)) `uvm_fatal("RDMA_COPY_TYPE","xtr AEQE copy mismatch");
-    qpn=x.qpn; qp_state=x.qp_state; ecode=x.ecode; packet_opcode=x.packet_opcode; wqe_index=x.wqe_index; wqe_wrap=x.wqe_wrap; valid=x.valid;
+    rdma_hw_aeqe_model x;
+
+    super.do_copy(rhs);
+    if (!$cast(x, rhs))
+      `uvm_fatal("RDMA_COPY_TYPE", "xtr AEQE copy mismatch")
+
+    qpn = x.qpn;
+    qp_state = x.qp_state;
+    ecode = x.ecode;
+    packet_opcode = x.packet_opcode;
+    wqe_index = x.wqe_index;
+    wqe_wrap = x.wqe_wrap;
+    valid = x.valid;
+    srfq_en = x.srfq_en;
+    overflow_flag = x.overflow_flag;
+    urc_flag = x.urc_flag;
+    cq_invalid_flag = x.cq_invalid_flag;
+    urc_abnormal_cqe_type = x.urc_abnormal_cqe_type;
+    cqn_eqn_high = x.cqn_eqn_high;
+    cqn_eqn_low = x.cqn_eqn_low;
+    urc_remote_ecode = x.urc_remote_ecode;
+    srfqn = x.srfqn;
+    srfqe_idx = x.srfqe_idx;
+  endfunction
+
+  // 功能：logical_cqn_eqn 将驱动 AEQE 的高/低拆分坐标重组成逻辑 EQ/CQ 编号。
+  // 输入/输出及副作用：无输入；读取 cqn_eqn_high、cqn_eqn_low，按 defs.h 的
+  //   CQN_EQN_LSHIFT=6 返回 19 位值，不修改模型或外部路由所有权。
+  // 失败/边界：字段宽度由 packed 类型保证；高段和低段均为合法值时直接返回
+  //   high|(low<<6)，不会把两个 wire 字段误当连续 19 位串接。
+  function bit [18:0] logical_cqn_eqn();
+    bit [18:0] high_part;
+
+    high_part = cqn_eqn_high;
+    high_part = high_part << RDMA_AEQE_CQN_EQN_LSHIFT;
+    return high_part | cqn_eqn_low;
   endfunction
 
   // 功能：validate 校验 当前对象字段 与当前对象状态的一致性，并显式处理“AEQE target handle is null”等拒绝条件，返回 rdma_status 供上层决定是否提交。
-  // 输入/输出及副作用：无显式参数；validate 读取固定返回值或局部计算结果，不使用对象成员字段；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：validate 返回 RDMA_SC_INVALID_ARGUMENT；典型拒绝条件为“AEQE target handle is null”；失败路径不提交部分状态或转移未声明资源。
-  virtual function rdma_status validate(); if (target_h==null) return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,"AEQE target handle is null"); return rdma_status::success(); endfunction
+  // 输入/输出及副作用：无显式参数；validate 读取 target_h 和 raw qp_state，
+  //   返回状态，不取得调用方资源所有权。
+  // 失败/边界：target_h 为空，或驱动 qp.h 的 0..5 状态编码之外的值（6/7）出现
+  //   时返回 INVALID_ARGUMENT；失败路径不发布部分事件镜像。
+  virtual function rdma_status validate();
+    if (target_h == null)
+      return rdma_status::make(
+          RDMA_SC_INVALID_ARGUMENT, "AEQE target handle is null");
+    // qp.h:xtrdma_qp_st enumerates INVLD, INIT, RTR, RTS, ERR and SQD.
+    if (qp_state > 3'd5)
+      return rdma_status::make(
+          RDMA_SC_INVALID_ARGUMENT, "AEQE QP state is outside driver enum");
+    return rdma_status::success();
+  endfunction
 
   // 功能：describe 把 当前对象字段 与当前对象的身份/状态字段编码为稳定文本，供日志、查找或恢复索引使用。
   // 输入/输出及副作用：无显式参数；无显式输入；返回 string，只读取对象字段，不修改模型或资源账本。
   // 失败/边界：枚举未定义或对象未配置时返回 UNKNOWN/UNCONFIGURED 表示，同时保留数值上下文。
-  virtual function string describe(); return $sformatf("XTR_AEQE(qpn=%0d ecode=0x%02x)",qpn,ecode); endfunction
+  virtual function string describe();
+    return $sformatf("XTR_AEQE(qpn=%0d ecode=0x%02x cqn_eqn=%0d)",
+                     qpn, ecode, logical_cqn_eqn());
+  endfunction
 endclass
 
 virtual class rdma_hw_queue_codec_base extends rdma_codec_base;
@@ -1928,25 +2036,197 @@ class rdma_hw_ceqe_codec extends rdma_hw_queue_codec_base;
   // 功能：构造 rdma_hw_ceqe_codec，调用 super.new 建立 UVM 层级对象；外部依赖字段保持未绑定，后续由 configure/build/activate 明确注入。
   // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
   // 失败/边界：rdma_hw_ceqe_codec 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
-  function new(string name="rdma_hw_ceqe_codec"); super.new(name); endfunction
+  function new(string name = "rdma_hw_ceqe_codec");
+    super.new(name);
+  endfunction
+
   // 功能：在 rdma_hw_ceqe_codec 中，image_kind_expected 返回 profile 固定的镜像字段或长度常量，供编码和断言使用。
   // 输入/输出及副作用：无显式参数；image_kind_expected 返回 CEQE codec 固定的 RDMA_IMAGE_CEQE 类型，不读取可变对象字段；函数返回 rdma_image_kind_e，不取得调用方资源所有权。
   // 失败/边界：image_kind_expected 是只读访问器，返回 RDMA_IMAGE_CEQE；未覆盖枚举沿 default/类型默认分支返回，不改变对象和外部资源。
-  protected virtual function rdma_image_kind_e image_kind_expected(); return RDMA_IMAGE_CEQE; endfunction protected virtual function int unsigned image_bytes(); return RDMA_CEQE_BYTES; endfunction
+  protected virtual function rdma_image_kind_e image_kind_expected();
+    return RDMA_IMAGE_CEQE;
+  endfunction
+
+  // 功能：image_bytes 返回驱动固定的 CEQE entry 大小，供基类 metadata 校验和
+  //   builder 分配使用。
+  // 输入/输出及副作用：无输入；返回 RDMA_CEQE_BYTES，不修改 codec 状态或外部
+  //   ring 所有权。
+  // 失败/边界：CEQE profile 只有 16B，调用方不能通过运行期参数扩大 entry。
+  protected virtual function int unsigned image_bytes();
+    return RDMA_CEQE_BYTES;
+  endfunction
+
   // 功能：check_reserved 校验 b 与当前对象状态的一致性，并显式处理“CEQE reserved bits are nonzero”等拒绝条件，返回 rdma_status 供上层决定是否提交。
-  // 输入/输出及副作用：b（输入）；check_reserved 读取 b 并使用字段 s、s.message、x、model；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：check_reserved 是只读访问器，返回 err("CEQE reserved bits are nonzero")；未覆盖枚举沿 default/类型默认分支返回，不改变对象和外部资源。
-  protected virtual function rdma_status check_reserved(rdma_hw_qword_builder b); bit [63:0] w[]; b.get_words(w); if ((w[0]&~64'h9fff_ff1f_ffff_ffff)!=0 || (w[1]&~64'h0000_0000_0080_ffff)!=0) return err("CEQE reserved bits are nonzero"); return rdma_status::success(); endfunction
+  // 输入/输出及副作用：b（输入）；读取两个逻辑 qword，按 qword0 的 URC_FLAG
+  //   选择 RC 或 URC profile mask；不修改 builder。
+  // 失败/边界：空 builder、qword 数量错误、variant 未拥有位或任一 reserved bit
+  //   非零时返回 CODEC_ERROR，绝不放宽整 qword。
+  protected virtual function rdma_status check_reserved(
+      rdma_hw_qword_builder b);
+    bit [63:0] words[];
+    bit [63:0] qword0_mask;
+    bit [63:0] qword1_mask;
+
+    if (b == null)
+      return err("CEQE qword builder is null");
+
+    b.get_words(words);
+    if (words.size() != 2)
+      return err("CEQE image must contain two qwords");
+
+    if (words[0][RDMA_CEQE_URC_FLAG_LSB]) begin
+      qword0_mask = RDMA_CEQE_QWORD0_UNION_MASK;
+      qword1_mask = RDMA_CEQE_QWORD1_URC_MASK;
+    end else begin
+      qword0_mask = RDMA_CEQE_QWORD0_RC_MASK;
+      qword1_mask = RDMA_CEQE_QWORD1_RC_MASK;
+    end
+
+    if ((words[0] & ~qword0_mask) !== 64'b0 ||
+        (words[1] & ~qword1_mask) !== 64'b0)
+      return err("CEQE reserved bits are nonzero");
+
+    return rdma_status::success();
+  endfunction
+
   // 功能：在 rdma_hw_ceqe_codec 中，encode_fields 按硬件布局把输入模型编码到 image/缓冲区，并在写入前检查范围、重叠、端序和保留位。
   // 输入/输出及副作用：model（输入）、b（输入）；输入模型只读；成功时通过返回值或 output 发布完整 image/bytes，不修改源模型。
   // 失败/边界：encode_fields 遇到 image/model 为空、长度/对齐/保留位非法或 codec 校验失败时不发布部分字段。
-  protected virtual function rdma_status encode_fields(rdma_hw_model model, rdma_hw_qword_builder b); rdma_hw_ceqe_model x; rdma_status s; if(!$cast(x,model)) return err("CEQE model type mismatch"); s=x.validate(); if(!s.ok()) return s; `define EQPUT(S,V) s=b.put_field(S``_WORD_BYTE_OFFSET,S``_LSB,S``_WIDTH,V); if(!s.ok()) return err(s.message);
-    `EQPUT(RDMA_CEQE_VALID,x.valid) `EQPUT(RDMA_CEQE_QPN,x.qpn) `EQPUT(RDMA_CEQE_CQN,x.cqn) `EQPUT(RDMA_CEQE_ECODE,x.ecode) `EQPUT(RDMA_CEQE_PKT_OPCODE,x.packet_opcode) `EQPUT(RDMA_CEQE_CQ_PI_WRAP,x.cq_pi_wrap) `EQPUT(RDMA_CEQE_CQ_PI,x.cq_pi) `undef EQPUT return rdma_status::success(); endfunction
+  protected virtual function rdma_status encode_fields(
+      rdma_hw_model model,
+      rdma_hw_qword_builder b
+  );
+    rdma_hw_ceqe_model x;
+    rdma_status status;
+
+    if (!$cast(x, model))
+      return err("CEQE model type mismatch");
+    if (b == null)
+      return err("CEQE qword builder is null");
+
+    status = x.validate();
+    if (!status.ok())
+      return status;
+
+    if (!x.urc_flag &&
+        (x.urc_sq_cqe_valid || x.urc_rq_cqe_valid ||
+         x.urc_abnormal_cqe_type != 0 ||
+         x.urc_abnormal_cqe_remote_ecode != 0 ||
+         x.urc_abnormal_cqe_wqe_idx_wrap ||
+         x.urc_abnormal_cqe_wqe_idx != 0 ||
+         x.urc_hw_cpl_sq_wqe_idx_wrap ||
+         x.urc_hw_cpl_sq_wqe_idx != 0 ||
+         x.urc_hw_cpl_rq_wqe_idx_wrap ||
+         x.urc_hw_cpl_rq_wqe_idx != 0))
+      return err("CEQE URC fields require urc_flag");
+
+    if (x.urc_flag && (x.cq_pi_wrap || x.cq_pi != 0))
+      return err("CEQE RC CI fields require urc_flag=0");
+
+    `define CEQE_PUT(STEM, VALUE) \
+      status = b.put_field(STEM``_WORD_BYTE_OFFSET, STEM``_LSB, \
+                           STEM``_WIDTH, VALUE); \
+      if (!status.ok()) \
+        return err(status.message);
+
+    `CEQE_PUT(RDMA_CEQE_VALID, x.valid)
+    `CEQE_PUT(RDMA_CEQE_URC_FLAG, x.urc_flag)
+    `CEQE_PUT(RDMA_CEQE_QPN, x.qpn)
+    `CEQE_PUT(RDMA_CEQE_CQN, x.cqn)
+    `CEQE_PUT(RDMA_CEQE_ECODE, x.ecode)
+    `CEQE_PUT(RDMA_CEQE_PKT_OPCODE, x.packet_opcode)
+
+    if (x.urc_flag) begin
+      `CEQE_PUT(RDMA_CEQE_URC_SQ_CQE_VALID, x.urc_sq_cqe_valid)
+      `CEQE_PUT(RDMA_CEQE_URC_RQ_CQE_VALID, x.urc_rq_cqe_valid)
+      `CEQE_PUT(RDMA_CEQE_URC_ABNML_CQE_TYPE, x.urc_abnormal_cqe_type)
+      `CEQE_PUT(RDMA_CEQE_URC_ABNML_CQE_REMOTE_ECODE,
+                x.urc_abnormal_cqe_remote_ecode)
+      `CEQE_PUT(RDMA_CEQE_URC_ABNML_CQE_WQE_IDX_WRAP,
+                x.urc_abnormal_cqe_wqe_idx_wrap)
+      `CEQE_PUT(RDMA_CEQE_URC_ABNML_CQE_WQE_IDX,
+                x.urc_abnormal_cqe_wqe_idx)
+      `CEQE_PUT(RDMA_CEQE_URC_HW_CPL_SQ_WQE_IDX_WRAP,
+                x.urc_hw_cpl_sq_wqe_idx_wrap)
+      `CEQE_PUT(RDMA_CEQE_URC_HW_CPL_SQ_WQE_IDX,
+                x.urc_hw_cpl_sq_wqe_idx)
+      `CEQE_PUT(RDMA_CEQE_URC_HW_CPL_RQ_WQE_IDX_WRAP,
+                x.urc_hw_cpl_rq_wqe_idx_wrap)
+      `CEQE_PUT(RDMA_CEQE_URC_HW_CPL_RQ_WQE_IDX,
+                x.urc_hw_cpl_rq_wqe_idx)
+    end else begin
+      `CEQE_PUT(RDMA_CEQE_CQ_PI_WRAP, x.cq_pi_wrap)
+      `CEQE_PUT(RDMA_CEQE_CQ_PI, x.cq_pi)
+    end
+
+    `undef CEQE_PUT
+    return rdma_status::success();
+  endfunction
+
   // 功能：在 rdma_hw_ceqe_codec 中，decode_fields 从硬件 image/缓冲区解码字段，验证长度、布局和完整性后返回模型或状态。
   // 输入/输出及副作用：b（输入）、model（输出）；输入 image/bytes 只读；成功时通过返回值或 output 发布 detached 解码快照，不接管调用方缓冲区。
   // 失败/边界：decode_fields 遇到 image/model 为空、长度/对齐/保留位非法或 codec 校验失败时不发布部分字段。
-  protected virtual function rdma_status decode_fields(rdma_hw_qword_builder b, output rdma_hw_model model); rdma_hw_ceqe_model x; bit [63:0] v; rdma_status s; x=rdma_hw_ceqe_model::type_id::create("decoded_ceqe"); x.cq_h=rdma_hw_queue_projected_handle("decoded_cq",RDMA_RESOURCE_CQ,0); `define EQGET(S,T) v='0; s=b.get_field(S``_WORD_BYTE_OFFSET,S``_LSB,S``_WIDTH,v); if(!s.ok()) return err(s.message); T=v;
-    `EQGET(RDMA_CEQE_VALID,x.valid) `EQGET(RDMA_CEQE_QPN,x.qpn) `EQGET(RDMA_CEQE_CQN,x.cqn) `EQGET(RDMA_CEQE_ECODE,x.ecode) `EQGET(RDMA_CEQE_PKT_OPCODE,x.packet_opcode) `EQGET(RDMA_CEQE_CQ_PI_WRAP,x.cq_pi_wrap) `EQGET(RDMA_CEQE_CQ_PI,x.cq_pi) `undef EQGET model=x; return rdma_status::success(); endfunction
+  protected virtual function rdma_status decode_fields(
+      rdma_hw_qword_builder b,
+      output rdma_hw_model model
+  );
+    rdma_hw_ceqe_model x;
+    bit [63:0] value;
+    rdma_status status;
+
+    model = null;
+    if (b == null)
+      return err("CEQE qword builder is null");
+
+    x = rdma_hw_ceqe_model::type_id::create("decoded_ceqe");
+    if (x == null)
+      return err("CEQE model allocation failed");
+    x.cq_h = rdma_hw_queue_projected_handle(
+        "decoded_cq", RDMA_RESOURCE_CQ, 0);
+
+    `define CEQE_GET(STEM, TARGET) \
+      value = '0; \
+      status = b.get_field(STEM``_WORD_BYTE_OFFSET, STEM``_LSB, \
+                           STEM``_WIDTH, value); \
+      if (!status.ok()) \
+        return err(status.message); \
+      TARGET = value;
+
+    `CEQE_GET(RDMA_CEQE_VALID, x.valid)
+    `CEQE_GET(RDMA_CEQE_URC_FLAG, x.urc_flag)
+    `CEQE_GET(RDMA_CEQE_QPN, x.qpn)
+    `CEQE_GET(RDMA_CEQE_CQN, x.cqn)
+    `CEQE_GET(RDMA_CEQE_ECODE, x.ecode)
+    `CEQE_GET(RDMA_CEQE_PKT_OPCODE, x.packet_opcode)
+
+    if (x.urc_flag) begin
+      `CEQE_GET(RDMA_CEQE_URC_SQ_CQE_VALID, x.urc_sq_cqe_valid)
+      `CEQE_GET(RDMA_CEQE_URC_RQ_CQE_VALID, x.urc_rq_cqe_valid)
+      `CEQE_GET(RDMA_CEQE_URC_ABNML_CQE_TYPE,
+                x.urc_abnormal_cqe_type)
+      `CEQE_GET(RDMA_CEQE_URC_ABNML_CQE_REMOTE_ECODE,
+                x.urc_abnormal_cqe_remote_ecode)
+      `CEQE_GET(RDMA_CEQE_URC_ABNML_CQE_WQE_IDX_WRAP,
+                x.urc_abnormal_cqe_wqe_idx_wrap)
+      `CEQE_GET(RDMA_CEQE_URC_ABNML_CQE_WQE_IDX,
+                x.urc_abnormal_cqe_wqe_idx)
+      `CEQE_GET(RDMA_CEQE_URC_HW_CPL_SQ_WQE_IDX_WRAP,
+                x.urc_hw_cpl_sq_wqe_idx_wrap)
+      `CEQE_GET(RDMA_CEQE_URC_HW_CPL_SQ_WQE_IDX,
+                x.urc_hw_cpl_sq_wqe_idx)
+      `CEQE_GET(RDMA_CEQE_URC_HW_CPL_RQ_WQE_IDX_WRAP,
+                x.urc_hw_cpl_rq_wqe_idx_wrap)
+      `CEQE_GET(RDMA_CEQE_URC_HW_CPL_RQ_WQE_IDX,
+                x.urc_hw_cpl_rq_wqe_idx)
+    end else begin
+      `CEQE_GET(RDMA_CEQE_CQ_PI_WRAP, x.cq_pi_wrap)
+      `CEQE_GET(RDMA_CEQE_CQ_PI, x.cq_pi)
+    end
+
+    `undef CEQE_GET
+    model = x;
+    return rdma_status::success();
+  endfunction
 endclass
 
 class rdma_hw_aeqe_codec extends rdma_hw_queue_codec_base;
@@ -1955,25 +2235,181 @@ class rdma_hw_aeqe_codec extends rdma_hw_queue_codec_base;
   // 功能：构造 rdma_hw_aeqe_codec，调用 super.new 建立 UVM 层级对象；外部依赖字段保持未绑定，后续由 configure/build/activate 明确注入。
   // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
   // 失败/边界：rdma_hw_aeqe_codec 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
-  function new(string name="rdma_hw_aeqe_codec"); super.new(name); endfunction
+  function new(string name = "rdma_hw_aeqe_codec");
+    super.new(name);
+  endfunction
+
   // 功能：在 rdma_hw_aeqe_codec 中，image_kind_expected 返回 profile 固定的镜像字段或长度常量，供编码和断言使用。
   // 输入/输出及副作用：无显式参数；image_kind_expected 返回 AEQE codec 固定的 RDMA_IMAGE_AEQE 类型，不读取可变对象字段；函数返回 rdma_image_kind_e，不取得调用方资源所有权。
   // 失败/边界：image_kind_expected 是只读访问器，返回 RDMA_IMAGE_AEQE；未覆盖枚举沿 default/类型默认分支返回，不改变对象和外部资源。
-  protected virtual function rdma_image_kind_e image_kind_expected(); return RDMA_IMAGE_AEQE; endfunction protected virtual function int unsigned image_bytes(); return RDMA_AEQE_BYTES; endfunction
+  protected virtual function rdma_image_kind_e image_kind_expected();
+    return RDMA_IMAGE_AEQE;
+  endfunction
+
+  // 功能：image_bytes 返回驱动固定的 AEQE entry 大小，供基类 metadata 校验和
+  //   builder 分配使用。
+  // 输入/输出及副作用：无输入；返回 RDMA_AEQE_BYTES，不修改 codec 状态或外部
+  //   ring 所有权。
+  // 失败/边界：AEQE profile 只有 16B，调用方不能通过运行期参数扩大 entry。
+  protected virtual function int unsigned image_bytes();
+    return RDMA_AEQE_BYTES;
+  endfunction
+
   // 功能：check_reserved 校验 b 与当前对象状态的一致性，并显式处理“AEQE reserved bits are nonzero”等拒绝条件，返回 rdma_status 供上层决定是否提交。
   // 输入/输出及副作用：b（输入）；check_reserved 读取 b 并使用字段 s、s.message、x、model；函数返回 rdma_status，不取得调用方资源所有权。
   // 失败/边界：check_reserved 是只读访问器，返回 err("AEQE reserved bits are nonzero")；未覆盖枚举沿 default/类型默认分支返回，不改变对象和外部资源。
-  protected virtual function rdma_status check_reserved(rdma_hw_qword_builder b); bit [63:0] w[]; b.get_words(w); if ((w[0]&~64'hf000_00ff_ff03_ffff)!=0 || (w[1]&~64'h00ff_ffff_0000_0000)!=0) return err("AEQE reserved bits are nonzero"); return rdma_status::success(); endfunction
+  protected virtual function rdma_status check_reserved(
+      rdma_hw_qword_builder b);
+    bit [63:0] words[];
+
+    if (b == null)
+      return err("AEQE qword builder is null");
+
+    b.get_words(words);
+    if (words.size() != 2)
+      return err("AEQE image must contain two qwords");
+    if ((words[0] & ~RDMA_AEQE_QWORD0_MASK) !== 64'b0 ||
+        (words[1] & ~RDMA_AEQE_QWORD1_MASK) !== 64'b0)
+      return err("AEQE reserved bits are nonzero");
+
+    return rdma_status::success();
+  endfunction
+
+  // 功能：validate_variant_fields 按驱动 event.c 的消费者选择，校验 AEQE
+  //   的 URC 异常字段和 SRFQ 字段是否由对应标志拥有，避免把 variant-inapplicable
+  //   的非零值伪装成可编码的硬件事件。
+  // 输入/输出及副作用：x（输入）是待编码或已解码的 detached AEQE；函数只读
+  //   x.srfq_en、x.urc_flag 及其从属字段，返回状态，不修改模型或外部资源。
+  // 失败/边界：urc_flag=0 时 URC abnormal/remote 字段非零，或 srfq_en=0
+  //   时 SRFQN/SRFQE 字段非零，均返回 CODEC_ERROR；queue WQE wrap/index
+  //   即使 urc_flag=0 也保留驱动逐字段解码的组合，不在模型侧擅自收紧。
+  protected function rdma_status validate_variant_fields(
+      rdma_hw_aeqe_model x);
+    if (x == null)
+      return err("AEQE variant model is null");
+
+    if (x.qp_state > 3'd5)
+      return err("AEQE QP state is outside driver enum");
+
+    if (!x.urc_flag &&
+        (x.urc_abnormal_cqe_type != 0 ||
+         x.urc_remote_ecode != 0))
+      return err("AEQE URC fields require urc_flag");
+
+    if (!x.srfq_en && (x.srfqn != 0 || x.srfqe_idx != 0))
+      return err("AEQE SRFQ fields require srfq_en");
+
+    return rdma_status::success();
+  endfunction
+
   // 功能：在 rdma_hw_aeqe_codec 中，encode_fields 按硬件布局把输入模型编码到 image/缓冲区，并在写入前检查范围、重叠、端序和保留位。
   // 输入/输出及副作用：model（输入）、b（输入）；输入模型只读；成功时通过返回值或 output 发布完整 image/bytes，不修改源模型。
   // 失败/边界：encode_fields 遇到 image/model 为空、长度/对齐/保留位非法或 codec 校验失败时不发布部分字段。
-  protected virtual function rdma_status encode_fields(rdma_hw_model model, rdma_hw_qword_builder b); rdma_hw_aeqe_model x; rdma_status s; if(!$cast(x,model)) return err("AEQE model type mismatch"); s=x.validate(); if(!s.ok()) return s; `define EQPUT2(S,V) s=b.put_field(S``_WORD_BYTE_OFFSET,S``_LSB,S``_WIDTH,V); if(!s.ok()) return err(s.message);
-    `EQPUT2(RDMA_AEQE_VALID,x.valid) `EQPUT2(RDMA_AEQE_QP_ST,x.qp_state) `EQPUT2(RDMA_AEQE_PKT_OPCODE,x.packet_opcode) `EQPUT2(RDMA_AEQE_ECODE,x.ecode) `EQPUT2(RDMA_AEQE_QPN,x.qpn) `EQPUT2(RDMA_AEQE_WQE_WRAP,x.wqe_wrap) `EQPUT2(RDMA_AEQE_WQE_INDEX,x.wqe_index) `undef EQPUT2 return rdma_status::success(); endfunction
+  protected virtual function rdma_status encode_fields(
+      rdma_hw_model model,
+      rdma_hw_qword_builder b
+  );
+    rdma_hw_aeqe_model x;
+    rdma_status status;
+
+    if (!$cast(x, model))
+      return err("AEQE model type mismatch");
+    if (b == null)
+      return err("AEQE qword builder is null");
+
+    status = x.validate();
+    if (!status.ok())
+      return status;
+
+    status = validate_variant_fields(x);
+    if (!status.ok())
+      return status;
+
+    `define AEQE_PUT(STEM, VALUE) \
+      status = b.put_field(STEM``_WORD_BYTE_OFFSET, STEM``_LSB, \
+                           STEM``_WIDTH, VALUE); \
+      if (!status.ok()) \
+        return err(status.message);
+
+    `AEQE_PUT(RDMA_AEQE_VALID, x.valid)
+    `AEQE_PUT(RDMA_AEQE_QP_ST, x.qp_state)
+    `AEQE_PUT(RDMA_AEQE_SRFQ_EN, x.srfq_en)
+    `AEQE_PUT(RDMA_AEQE_OVERFLOW_FLAG, x.overflow_flag)
+    `AEQE_PUT(RDMA_AEQE_URC_FLAG, x.urc_flag)
+    `AEQE_PUT(RDMA_AEQE_CQ_INVALID_FLAG, x.cq_invalid_flag)
+    `AEQE_PUT(RDMA_AEQE_URC_ABNML_CQE_TYPE,
+              x.urc_abnormal_cqe_type)
+    `AEQE_PUT(RDMA_AEQE_CQN_EQN_HIGH, x.cqn_eqn_high)
+    `AEQE_PUT(RDMA_AEQE_PKT_OPCODE, x.packet_opcode)
+    `AEQE_PUT(RDMA_AEQE_ECODE, x.ecode)
+    `AEQE_PUT(RDMA_AEQE_CQN_EQN_LOW, x.cqn_eqn_low)
+    `AEQE_PUT(RDMA_AEQE_QPN, x.qpn)
+    `AEQE_PUT(RDMA_AEQE_URC_REMOTE_ECODE, x.urc_remote_ecode)
+    `AEQE_PUT(RDMA_AEQE_WQE_WRAP, x.wqe_wrap)
+    `AEQE_PUT(RDMA_AEQE_WQE_INDEX, x.wqe_index)
+    `AEQE_PUT(RDMA_AEQE_SRFQN, x.srfqn)
+    `AEQE_PUT(RDMA_AEQE_SRFQE_IDX, x.srfqe_idx)
+
+    `undef AEQE_PUT
+    return rdma_status::success();
+  endfunction
+
   // 功能：在 rdma_hw_aeqe_codec 中，decode_fields 从硬件 image/缓冲区解码字段，验证长度、布局和完整性后返回模型或状态。
   // 输入/输出及副作用：b（输入）、model（输出）；输入 image/bytes 只读；成功时通过返回值或 output 发布 detached 解码快照，不接管调用方缓冲区。
   // 失败/边界：decode_fields 遇到 image/model 为空、长度/对齐/保留位非法或 codec 校验失败时不发布部分字段。
-  protected virtual function rdma_status decode_fields(rdma_hw_qword_builder b, output rdma_hw_model model); rdma_hw_aeqe_model x; bit [63:0] v; rdma_status s; x=rdma_hw_aeqe_model::type_id::create("decoded_aeqe"); x.target_h=rdma_hw_queue_projected_handle("decoded_qp",RDMA_RESOURCE_QP,0); `define EQGET2(S,T) v='0; s=b.get_field(S``_WORD_BYTE_OFFSET,S``_LSB,S``_WIDTH,v); if(!s.ok()) return err(s.message); T=v;
-    `EQGET2(RDMA_AEQE_VALID,x.valid) `EQGET2(RDMA_AEQE_QP_ST,x.qp_state) `EQGET2(RDMA_AEQE_PKT_OPCODE,x.packet_opcode) `EQGET2(RDMA_AEQE_ECODE,x.ecode) `EQGET2(RDMA_AEQE_QPN,x.qpn) `EQGET2(RDMA_AEQE_WQE_WRAP,x.wqe_wrap) `EQGET2(RDMA_AEQE_WQE_INDEX,x.wqe_index) `undef EQGET2 model=x; return rdma_status::success(); endfunction
+  protected virtual function rdma_status decode_fields(
+      rdma_hw_qword_builder b,
+      output rdma_hw_model model
+  );
+    rdma_hw_aeqe_model x;
+    bit [63:0] value;
+    rdma_status status;
+
+    model = null;
+    if (b == null)
+      return err("AEQE qword builder is null");
+
+    x = rdma_hw_aeqe_model::type_id::create("decoded_aeqe");
+    if (x == null)
+      return err("AEQE model allocation failed");
+    x.target_h = rdma_hw_queue_projected_handle(
+        "decoded_qp", RDMA_RESOURCE_QP, 0);
+
+    `define AEQE_GET(STEM, TARGET) \
+      value = '0; \
+      status = b.get_field(STEM``_WORD_BYTE_OFFSET, STEM``_LSB, \
+                           STEM``_WIDTH, value); \
+      if (!status.ok()) \
+        return err(status.message); \
+      TARGET = value;
+
+    `AEQE_GET(RDMA_AEQE_VALID, x.valid)
+    `AEQE_GET(RDMA_AEQE_QP_ST, x.qp_state)
+    `AEQE_GET(RDMA_AEQE_SRFQ_EN, x.srfq_en)
+    `AEQE_GET(RDMA_AEQE_OVERFLOW_FLAG, x.overflow_flag)
+    `AEQE_GET(RDMA_AEQE_URC_FLAG, x.urc_flag)
+    `AEQE_GET(RDMA_AEQE_CQ_INVALID_FLAG, x.cq_invalid_flag)
+    `AEQE_GET(RDMA_AEQE_URC_ABNML_CQE_TYPE,
+              x.urc_abnormal_cqe_type)
+    `AEQE_GET(RDMA_AEQE_CQN_EQN_HIGH, x.cqn_eqn_high)
+    `AEQE_GET(RDMA_AEQE_PKT_OPCODE, x.packet_opcode)
+    `AEQE_GET(RDMA_AEQE_ECODE, x.ecode)
+    `AEQE_GET(RDMA_AEQE_CQN_EQN_LOW, x.cqn_eqn_low)
+    `AEQE_GET(RDMA_AEQE_QPN, x.qpn)
+    `AEQE_GET(RDMA_AEQE_URC_REMOTE_ECODE, x.urc_remote_ecode)
+    `AEQE_GET(RDMA_AEQE_WQE_WRAP, x.wqe_wrap)
+    `AEQE_GET(RDMA_AEQE_WQE_INDEX, x.wqe_index)
+    `AEQE_GET(RDMA_AEQE_SRFQN, x.srfqn)
+    `AEQE_GET(RDMA_AEQE_SRFQE_IDX, x.srfqe_idx)
+
+    `undef AEQE_GET
+    status = validate_variant_fields(x);
+    if (!status.ok())
+      return status;
+
+    model = x;
+    return rdma_status::success();
+  endfunction
 endclass
 
 function rdma_status rdma_queue_codec::encode_sqe(

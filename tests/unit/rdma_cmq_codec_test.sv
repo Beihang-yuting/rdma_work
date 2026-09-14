@@ -2152,7 +2152,9 @@ class rdma_cmq_codec_test extends uvm_test;
     expect_compose_failure("QPC_SIGNATURE_SOURCE_GENERATION", composer,
                            envelope, base, bad, RDMA_SC_CODEC_ERROR);
     bad = clone_image(qpc_source, "RESERVED_QPC_SIGNATURE_SOURCE");
-    set_image_word(bad, 63, image_word(bad, 63) | 64'h1);
+    // qword63 bit0 是 wr.h 明确声明的 SQ_PI[0] runtime shadow，不能再用作
+    // reserved 负向向量；bit47 不在四段 readback mask 内，仍代表未知硬件位。
+    set_image_word(bad, 63, image_word(bad, 63) | (64'h1 << 47));
     expect_compose_failure("QPC_SIGNATURE_SOURCE_RESERVED", composer,
                            envelope, base, bad, RDMA_SC_CODEC_ERROR);
     bad = make_qpc_signature_source(21'h12346);

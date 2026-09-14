@@ -4067,10 +4067,19 @@ class ReferenceEncodingTest(unittest.TestCase):
                     "packet_opcode=0x9a,immediate=0x89abcdef",
                 "ceqe_error":
                     "qpn=0x15555,cqn=0x1aaaaa,ecode=0xf4,pi=0xbeef,"
-                    "valid=1,packet_opcode=0x9a,wrap=1",
+                    "valid=1,packet_opcode=0x9a,wrap=1,urc=0",
+                "ceqe_urc_error":
+                    "qpn=0x15555,cqn=0x1aaaaa,ecode=0xf4,valid=1,"
+                    "packet_opcode=0x9a,urc=1,sq_valid=1,rq_valid=1,"
+                    "abnormal_type=2,remote_ecode=0xa5,wqe_wrap=1,"
+                    "wqe_idx=0x4567,sq_cpl_wrap=1,sq_cpl_idx=0x2345,"
+                    "rq_cpl_wrap=1,rq_cpl_idx=0x3456",
                 "aeqe_error":
                     "qpn=0x2aaaa,state=5,ecode=0xff,index=0x654321,"
-                    "valid=1,packet_opcode=0x81,wrap=1",
+                    "valid=1,packet_opcode=0x81,wrap=1,srfq=1,overflow=1,"
+                    "urc=1,cq_invalid=1,abnormal_type=2,"
+                    "cqn_eqn_high=0x1555,cqn_eqn_low=0x2a,"
+                    "remote_ecode=0xe1,srfqn=0xabc,srfqe_idx=0x1234",
                 "cmq_sq": "pi=27,polarity=1,offset=0x0",
                 "sq": "offset=0x100",
                 "rq": "qpn=0x15555,icos=5,pi=0x4567,wrap=1,offset=0x10",

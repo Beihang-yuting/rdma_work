@@ -39,6 +39,35 @@ class rdma_queue_codec_test extends uvm_test;
     foreach (a.bytes[i]) if (a.bytes[i]!==b.bytes[i]) `uvm_error(l,$sformatf("byte %0d",i));
   endfunction
 
+  // 功能：make_event_image 将已序列化的 16-byte CEQE/AEQE payload 包装成带完整
+  //   metadata 的 detached hardware image，供 raw decode 与负向测试复用。
+  // 输入/输出及副作用：name、kind、payload（输入）；返回新建 image，复制 payload
+  //   字节并设置长度、端序、版本、generation 和无写目标 metadata，不取得 payload 所有权。
+  // 失败/边界：payload 长度不是对应 event entry 大小时仍构造 image，由 codec 的
+  //   validate_image 负责拒绝；空 payload 不隐式填零，调用方须显式准备 raw bytes。
+  function automatic rdma_hw_image make_event_image(
+      string name,
+      rdma_image_kind_e kind,
+      byte unsigned payload[]
+  );
+    rdma_hw_image image;
+
+    image = rdma_hw_image::type_id::create(name);
+    foreach (payload[i])
+      image.bytes.push_back(payload[i]);
+    image.length = payload.size();
+    image.alignment = payload.size();
+    image.endian = RDMA_ENDIAN_BIG;
+    image.image_kind = kind;
+    image.hardware_version = RDMA_HW_VERSION;
+    image.function_generation = 1;
+    image.write_target_kind = RDMA_HW_TARGET_NONE;
+    image.backing_target = '0;
+    image.hmc_target = '0;
+    image.bar_target = '0;
+    return image;
+  endfunction
+
   // 功能：在 rdma_queue_codec_test 中，run_phase 驱动 UVM 阶段中的场景初始化、事务执行和断言收尾，并在退出前释放 objection 或测试资源。
   // 输入/输出及副作用：phase（输入）；phase 由 UVM 提供；task 通过 objection、日志和断言暴露结果，可能调用 DUT 接口但不改变其所有权规则。
   // 失败/边界：run_phase 的 setup/阶段驱动失败时停止新增事务，并按测试生命周期清理 objection 与临时引用。
@@ -46,6 +75,12 @@ class rdma_queue_codec_test extends uvm_test;
     rdma_codec_registry r; rdma_status s; rdma_codec_base c; rdma_hw_image im,im2; rdma_hw_model m;
     rdma_hw_sqe_model sq, sq2; rdma_hw_rqe_model rq, rq2; rdma_hw_cqe_model cq, cq2;
     rdma_hw_ceqe_model ceqe;
+    rdma_hw_ceqe_model ceqe_urc;
+    rdma_hw_ceqe_model ceqe_copy;
+    rdma_hw_ceqe_model ceqe_decoded;
+    rdma_hw_aeqe_model aeqe;
+    rdma_hw_aeqe_model aeqe_copy;
+    rdma_hw_aeqe_model aeqe_decoded;
     rdma_sqe_rc_ext re; rdma_sge sg; byte unsigned bad[];
     rdma_hw_cqe_codec profile_codec;
     rdma_hw_image profile_image;
@@ -54,6 +89,13 @@ class rdma_queue_codec_test extends uvm_test;
     bit [63:0] profile_words[];
     bit [63:0] rqe_words[];
     byte unsigned rqe_bytes[];
+    rdma_hw_qword_builder eq_builder;
+    bit [63:0] eq_words[];
+    byte unsigned event_bytes[];
+    rdma_hw_image eq_image;
+    rdma_hw_image eq_image_copy;
+    rdma_hw_model eq_model;
+    rdma_hw_aeqe_model decoded_aeqe;
     bit [54:0] initial_sgb_pa;
     bit [54:0] previous_sgb_pa;
     phase.raise_objection(this);
@@ -68,6 +110,371 @@ class rdma_queue_codec_test extends uvm_test;
     s=ceqe.validate(); ok("ceqe global handle local cqn validate",s);
     s=r.lookup('{hw_version:"rdma",image_kind:RDMA_IMAGE_CEQE,object_type:"ceqe",variant:"default",opcode:0},c);
     ok("lookup ceqe",s); s=c.encode(ceqe,im); ok("ceqe global handle local cqn encode",s);
+
+    // RED: defs.h CEQE URC/abnormal layout uses fields that the legacy codec
+    // currently classifies as reserved.  The raw image below mirrors every
+    // driver-owned CEQE bit and must decode successfully after the fix.
+    eq_builder = new("ceqe_urc_red_builder");
+    s = eq_builder.reset(RDMA_CEQE_BYTES);
+    ok("ceqe urc red reset", s);
+    s = eq_builder.put_field(0, 63, 1, 1);
+    s = eq_builder.put_field(0, 62, 1, 1);
+    s = eq_builder.put_field(0, 40, 21, 21'h15555);
+    s = eq_builder.put_field(0, 39, 1, 1);
+    s = eq_builder.put_field(0, 38, 1, 1);
+    s = eq_builder.put_field(0, 16, 21, 21'h1AAAAA);
+    s = eq_builder.put_field(0, 8, 8, 8'hF4);
+    s = eq_builder.put_field(0, 0, 8, 8'h9A);
+    s = eq_builder.put_field(8, 56, 2, 2'b10);
+    s = eq_builder.put_field(8, 48, 8, 8'hA5);
+    s = eq_builder.put_field(8, 47, 1, 1);
+    s = eq_builder.put_field(8, 32, 15, 15'h4567);
+    s = eq_builder.put_field(8, 31, 1, 1);
+    s = eq_builder.put_field(8, 16, 15, 15'h2345);
+    s = eq_builder.put_field(8, 15, 1, 1);
+    s = eq_builder.put_field(8, 0, 15, 15'h3456);
+    ok("ceqe urc red fields", s);
+    s = eq_builder.serialize(event_bytes);
+    ok("ceqe urc red serialize", s);
+    eq_image = rdma_hw_image::type_id::create("ceqe_urc_red_image");
+    foreach (event_bytes[i]) eq_image.bytes.push_back(event_bytes[i]);
+    eq_image.length = RDMA_CEQE_BYTES;
+    eq_image.alignment = RDMA_CEQE_BYTES;
+    eq_image.endian = RDMA_ENDIAN_BIG;
+    eq_image.image_kind = RDMA_IMAGE_CEQE;
+    eq_image.hardware_version = RDMA_HW_VERSION;
+    eq_image.function_generation = 1;
+    eq_image.write_target_kind = RDMA_HW_TARGET_NONE;
+    eq_image.backing_target = '0;
+    eq_image.hmc_target = '0;
+    eq_image.bar_target = '0;
+    s = c.decode(eq_image, eq_model);
+    if (s == null || !s.ok() || !$cast(ceqe_decoded, eq_model) ||
+        ceqe_decoded.valid !== 1'b1 ||
+        ceqe_decoded.urc_flag !== 1'b1 ||
+        ceqe_decoded.qpn !== 21'h15555 ||
+        ceqe_decoded.cqn !== 21'h1aaaaa ||
+        ceqe_decoded.ecode !== 8'hf4 ||
+        ceqe_decoded.packet_opcode !== 8'h9a ||
+        ceqe_decoded.urc_sq_cqe_valid !== 1'b1 ||
+        ceqe_decoded.urc_rq_cqe_valid !== 1'b1 ||
+        ceqe_decoded.urc_abnormal_cqe_type !== 2'b10 ||
+        ceqe_decoded.urc_abnormal_cqe_remote_ecode !== 8'ha5 ||
+        ceqe_decoded.urc_abnormal_cqe_wqe_idx_wrap !== 1'b1 ||
+        ceqe_decoded.urc_abnormal_cqe_wqe_idx !== 15'h4567 ||
+        ceqe_decoded.urc_hw_cpl_sq_wqe_idx_wrap !== 1'b1 ||
+        ceqe_decoded.urc_hw_cpl_sq_wqe_idx !== 15'h2345 ||
+        ceqe_decoded.urc_hw_cpl_rq_wqe_idx_wrap !== 1'b1 ||
+        ceqe_decoded.urc_hw_cpl_rq_wqe_idx !== 15'h3456)
+      `uvm_error("CEQE_URC_RED",
+                 $sformatf("driver-owned CEQE URC fields were rejected: %s",
+                           s == null ? "<null>" : s.message))
+    else begin
+      s = c.encode(ceqe_decoded, eq_image_copy);
+      ok("ceqe urc raw decode re-encode", s);
+      eq_bytes("ceqe urc raw decode byte equivalence", eq_image,
+               eq_image_copy);
+    end
+
+    s = r.lookup(
+        '{hw_version:"rdma", image_kind:RDMA_IMAGE_AEQE,
+          object_type:"aeqe", variant:"default", opcode:0},
+        c);
+    ok("lookup aeqe", s);
+
+    // RED: defs.h AEQE includes flags, split CQN/EQN coordinates and URC
+    // queue fields.  All are intentionally nonzero so an incomplete mask
+    // cannot pass this test by accident.
+    eq_builder = new("aeqe_abnormal_red_builder");
+    s = eq_builder.reset(RDMA_AEQE_BYTES);
+    ok("aeqe abnormal red reset", s);
+    s = eq_builder.put_field(0, 63, 1, 1);
+    s = eq_builder.put_field(0, 60, 3, 3'd5);
+    s = eq_builder.put_field(0, 59, 1, 1);
+    s = eq_builder.put_field(0, 58, 1, 1);
+    s = eq_builder.put_field(0, 57, 1, 1);
+    s = eq_builder.put_field(0, 56, 1, 1);
+    s = eq_builder.put_field(0, 54, 2, 2'b10);
+    s = eq_builder.put_field(0, 40, 13, 13'h1555);
+    s = eq_builder.put_field(0, 32, 8, 8'h81);
+    s = eq_builder.put_field(0, 24, 8, 8'hFF);
+    s = eq_builder.put_field(0, 18, 6, 6'h2A);
+    s = eq_builder.put_field(0, 0, 18, 18'h2AAAA);
+    s = eq_builder.put_field(8, 56, 8, 8'hE1);
+    s = eq_builder.put_field(8, 55, 1, 1);
+    s = eq_builder.put_field(8, 32, 23, 23'h654321);
+    s = eq_builder.put_field(8, 16, 12, 12'hABC);
+    s = eq_builder.put_field(8, 0, 16, 16'h1234);
+    ok("aeqe abnormal red fields", s);
+    s = eq_builder.serialize(event_bytes);
+    ok("aeqe abnormal red serialize", s);
+    eq_image = rdma_hw_image::type_id::create("aeqe_abnormal_red_image");
+    foreach (event_bytes[i]) eq_image.bytes.push_back(event_bytes[i]);
+    eq_image.length = RDMA_AEQE_BYTES;
+    eq_image.alignment = RDMA_AEQE_BYTES;
+    eq_image.endian = RDMA_ENDIAN_BIG;
+    eq_image.image_kind = RDMA_IMAGE_AEQE;
+    eq_image.hardware_version = RDMA_HW_VERSION;
+    eq_image.function_generation = 1;
+    eq_image.write_target_kind = RDMA_HW_TARGET_NONE;
+    eq_image.backing_target = '0;
+    eq_image.hmc_target = '0;
+    eq_image.bar_target = '0;
+    s = c.decode(eq_image, eq_model);
+    if (s == null || !s.ok() || !$cast(decoded_aeqe, eq_model) ||
+        decoded_aeqe.valid !== 1'b1 ||
+        decoded_aeqe.qp_state !== 3'd5 ||
+        decoded_aeqe.srfq_en !== 1'b1 ||
+        decoded_aeqe.overflow_flag !== 1'b1 ||
+        decoded_aeqe.urc_flag !== 1'b1 ||
+        decoded_aeqe.cq_invalid_flag !== 1'b1 ||
+        decoded_aeqe.urc_abnormal_cqe_type !== 2'b10 ||
+        decoded_aeqe.cqn_eqn_high !== 13'h1555 ||
+        decoded_aeqe.cqn_eqn_low !== 6'h2a ||
+        decoded_aeqe.packet_opcode !== 8'h81 ||
+        decoded_aeqe.ecode !== 8'hff ||
+        decoded_aeqe.qpn !== 18'h2aaaa ||
+        decoded_aeqe.urc_remote_ecode !== 8'he1 ||
+        decoded_aeqe.wqe_wrap !== 1'b1 ||
+        decoded_aeqe.wqe_index !== 23'h654321 ||
+        decoded_aeqe.srfqn !== 12'habc ||
+        decoded_aeqe.srfqe_idx !== 16'h1234 ||
+        decoded_aeqe.logical_cqn_eqn() !== 19'h5556a)
+      `uvm_error("AEQE_ABNORMAL_RED", "driver-owned AEQE fields were rejected")
+    else begin
+      s = c.encode(decoded_aeqe, eq_image_copy);
+      ok("aeqe raw decode re-encode", s);
+      eq_bytes("aeqe raw decode byte equivalence", eq_image,
+               eq_image_copy);
+    end
+
+    // CEQE RC variant：RC qword1 只发布 CQ consumer index，完整往返必须保留
+    //   valid/common 字段及 wrap；URC 专用字段保持零，避免两个布局相互污染。
+    s = r.lookup(
+        '{hw_version:"rdma", image_kind:RDMA_IMAGE_CEQE,
+          object_type:"ceqe", variant:"default", opcode:0},
+        c);
+    ok("lookup ceqe for rc roundtrip", s);
+    ceqe = rdma_hw_ceqe_model::type_id::create("ceqe_rc_roundtrip");
+    ceqe.cq_h = h("ceqe_rc_cq", RDMA_RESOURCE_CQ, 32'h3000_0010);
+    ceqe.qpn = 21'h15555;
+    ceqe.cqn = 21'h1aaaaa;
+    ceqe.ecode = 8'hf4;
+    ceqe.packet_opcode = 8'h9a;
+    ceqe.cq_pi = 16'hbeef;
+    ceqe.cq_pi_wrap = 1'b1;
+    ceqe.valid = 1'b1;
+    s = c.encode(ceqe, im);
+    ok("ceqe rc encode", s);
+    s = c.decode(im, eq_model);
+    ok("ceqe rc decode", s);
+    if (s == null || !s.ok() || !$cast(ceqe_decoded, eq_model) ||
+        ceqe_decoded.urc_flag !== 1'b0 ||
+        ceqe_decoded.qpn !== ceqe.qpn ||
+        ceqe_decoded.cqn !== ceqe.cqn ||
+        ceqe_decoded.ecode !== ceqe.ecode ||
+        ceqe_decoded.packet_opcode !== ceqe.packet_opcode ||
+        ceqe_decoded.cq_pi !== ceqe.cq_pi ||
+        ceqe_decoded.cq_pi_wrap !== ceqe.cq_pi_wrap ||
+        ceqe_decoded.valid !== ceqe.valid)
+      `uvm_error("CEQE_RC_ROUNDTRIP", "CEQE RC fields did not round-trip")
+
+    ceqe_copy = rdma_hw_ceqe_model::type_id::create("ceqe_rc_copy");
+    ceqe_copy.copy(ceqe);
+    if (ceqe_copy.qpn !== ceqe.qpn || ceqe_copy.cqn !== ceqe.cqn ||
+        ceqe_copy.cq_pi !== ceqe.cq_pi ||
+        ceqe_copy.cq_pi_wrap !== ceqe.cq_pi_wrap ||
+        ceqe_copy.urc_flag !== ceqe.urc_flag)
+      `uvm_error("CEQE_RC_COPY", "CEQE RC detached copy lost fields")
+
+    // CEQE URC variant：qword1 的八组驱动字段必须编码到原始坐标，不能被
+    //   RC consumer-index 解释；随后验证 detached copy 仍包含所有 URC 字段。
+    ceqe_urc = rdma_hw_ceqe_model::type_id::create("ceqe_urc_roundtrip");
+    ceqe_urc.cq_h = h("ceqe_urc_cq", RDMA_RESOURCE_CQ, 32'h3000_0011);
+    ceqe_urc.qpn = 21'h15555;
+    ceqe_urc.cqn = 21'h1aaaaa;
+    ceqe_urc.ecode = 8'hf4;
+    ceqe_urc.packet_opcode = 8'h9a;
+    ceqe_urc.valid = 1'b1;
+    ceqe_urc.urc_flag = 1'b1;
+    ceqe_urc.urc_sq_cqe_valid = 1'b1;
+    ceqe_urc.urc_rq_cqe_valid = 1'b1;
+    ceqe_urc.urc_abnormal_cqe_type = 2'b10;
+    ceqe_urc.urc_abnormal_cqe_remote_ecode = 8'ha5;
+    ceqe_urc.urc_abnormal_cqe_wqe_idx_wrap = 1'b1;
+    ceqe_urc.urc_abnormal_cqe_wqe_idx = 15'h4567;
+    ceqe_urc.urc_hw_cpl_sq_wqe_idx_wrap = 1'b1;
+    ceqe_urc.urc_hw_cpl_sq_wqe_idx = 15'h2345;
+    ceqe_urc.urc_hw_cpl_rq_wqe_idx_wrap = 1'b1;
+    ceqe_urc.urc_hw_cpl_rq_wqe_idx = 15'h3456;
+    s = c.encode(ceqe_urc, im);
+    ok("ceqe urc encode", s);
+    s = c.decode(im, eq_model);
+    ok("ceqe urc decode", s);
+    if (s == null || !s.ok() || !$cast(ceqe_decoded, eq_model) ||
+        ceqe_decoded.urc_flag !== 1'b1 ||
+        ceqe_decoded.urc_sq_cqe_valid !== ceqe_urc.urc_sq_cqe_valid ||
+        ceqe_decoded.urc_rq_cqe_valid !== ceqe_urc.urc_rq_cqe_valid ||
+        ceqe_decoded.urc_abnormal_cqe_type !== ceqe_urc.urc_abnormal_cqe_type ||
+        ceqe_decoded.urc_abnormal_cqe_remote_ecode !==
+            ceqe_urc.urc_abnormal_cqe_remote_ecode ||
+        ceqe_decoded.urc_abnormal_cqe_wqe_idx_wrap !==
+            ceqe_urc.urc_abnormal_cqe_wqe_idx_wrap ||
+        ceqe_decoded.urc_abnormal_cqe_wqe_idx !==
+            ceqe_urc.urc_abnormal_cqe_wqe_idx ||
+        ceqe_decoded.urc_hw_cpl_sq_wqe_idx_wrap !==
+            ceqe_urc.urc_hw_cpl_sq_wqe_idx_wrap ||
+        ceqe_decoded.urc_hw_cpl_sq_wqe_idx !== ceqe_urc.urc_hw_cpl_sq_wqe_idx ||
+        ceqe_decoded.urc_hw_cpl_rq_wqe_idx_wrap !==
+            ceqe_urc.urc_hw_cpl_rq_wqe_idx_wrap ||
+        ceqe_decoded.urc_hw_cpl_rq_wqe_idx !== ceqe_urc.urc_hw_cpl_rq_wqe_idx)
+      `uvm_error("CEQE_URC_ROUNDTRIP", "CEQE URC fields did not round-trip")
+
+    ceqe_copy = rdma_hw_ceqe_model::type_id::create("ceqe_urc_copy");
+    ceqe_copy.copy(ceqe_urc);
+    if (ceqe_copy.urc_flag !== ceqe_urc.urc_flag ||
+        ceqe_copy.urc_abnormal_cqe_type !== ceqe_urc.urc_abnormal_cqe_type ||
+        ceqe_copy.urc_abnormal_cqe_remote_ecode !==
+            ceqe_urc.urc_abnormal_cqe_remote_ecode ||
+        ceqe_copy.urc_hw_cpl_sq_wqe_idx !== ceqe_urc.urc_hw_cpl_sq_wqe_idx ||
+        ceqe_copy.urc_hw_cpl_rq_wqe_idx !== ceqe_urc.urc_hw_cpl_rq_wqe_idx)
+      `uvm_error("CEQE_URC_COPY", "CEQE URC detached copy lost fields")
+
+    // 变体互斥负向：RC image 不得偷偷携带 URC completion 字段，URC image
+    //   也不得复用 RC 的 CQ_PI/CQ_PI_WRAP；两条路径都必须在发布 image 前拒绝。
+    ceqe.urc_sq_cqe_valid = 1'b1;
+    s = c.encode(ceqe, im);
+    if (s == null || s.ok())
+      `uvm_error("CEQE_RC_VARIANT", "RC CEQE accepted URC-only field")
+    ceqe.urc_sq_cqe_valid = 1'b0;
+    ceqe_urc.cq_pi = 16'h1;
+    s = c.encode(ceqe_urc, im);
+    if (s == null || s.ok())
+      `uvm_error("CEQE_URC_VARIANT", "URC CEQE accepted RC CI field")
+
+    // AEQE model round-trip：这里同时覆盖 defs.h 的 flags、拆分 CQN/EQN、
+    //   URC queue 坐标和 SRFQ 坐标，logical_cqn_eqn 必须按驱动左移 6 位重组。
+    s = r.lookup(
+        '{hw_version:"rdma", image_kind:RDMA_IMAGE_AEQE,
+          object_type:"aeqe", variant:"default", opcode:0},
+        c);
+    ok("lookup aeqe for roundtrip", s);
+    aeqe = rdma_hw_aeqe_model::type_id::create("aeqe_roundtrip");
+    aeqe.target_h = h("aeqe_qp", RDMA_RESOURCE_QP, 32'h4000_0001);
+    aeqe.valid = 1'b1;
+    aeqe.qp_state = 3'd5;
+    aeqe.srfq_en = 1'b1;
+    aeqe.overflow_flag = 1'b1;
+    aeqe.urc_flag = 1'b1;
+    aeqe.cq_invalid_flag = 1'b1;
+    aeqe.urc_abnormal_cqe_type = 2'b10;
+    aeqe.cqn_eqn_high = 13'h1555;
+    aeqe.cqn_eqn_low = 6'h2a;
+    aeqe.packet_opcode = 8'h81;
+    aeqe.ecode = 8'hff;
+    aeqe.qpn = 18'h2aaaa;
+    aeqe.urc_remote_ecode = 8'he1;
+    aeqe.wqe_wrap = 1'b1;
+    aeqe.wqe_index = 23'h654321;
+    aeqe.srfqn = 12'habc;
+    aeqe.srfqe_idx = 16'h1234;
+    s = c.encode(aeqe, im);
+    ok("aeqe encode", s);
+    s = c.decode(im, eq_model);
+    ok("aeqe decode", s);
+    if (s == null || !s.ok() || !$cast(aeqe_decoded, eq_model) ||
+        aeqe_decoded.valid !== aeqe.valid ||
+        aeqe_decoded.qp_state !== aeqe.qp_state ||
+        aeqe_decoded.srfq_en !== aeqe.srfq_en ||
+        aeqe_decoded.overflow_flag !== aeqe.overflow_flag ||
+        aeqe_decoded.urc_flag !== aeqe.urc_flag ||
+        aeqe_decoded.cq_invalid_flag !== aeqe.cq_invalid_flag ||
+        aeqe_decoded.urc_abnormal_cqe_type !== aeqe.urc_abnormal_cqe_type ||
+        aeqe_decoded.cqn_eqn_high !== aeqe.cqn_eqn_high ||
+        aeqe_decoded.cqn_eqn_low !== aeqe.cqn_eqn_low ||
+        aeqe_decoded.packet_opcode !== aeqe.packet_opcode ||
+        aeqe_decoded.ecode !== aeqe.ecode ||
+        aeqe_decoded.qpn !== aeqe.qpn ||
+        aeqe_decoded.urc_remote_ecode !== aeqe.urc_remote_ecode ||
+        aeqe_decoded.wqe_wrap !== aeqe.wqe_wrap ||
+        aeqe_decoded.wqe_index !== aeqe.wqe_index ||
+        aeqe_decoded.srfqn !== aeqe.srfqn ||
+        aeqe_decoded.srfqe_idx !== aeqe.srfqe_idx ||
+        aeqe_decoded.logical_cqn_eqn() !== aeqe.logical_cqn_eqn())
+      `uvm_error("AEQE_ROUNDTRIP", "AEQE fields did not round-trip")
+
+    aeqe_copy = rdma_hw_aeqe_model::type_id::create("aeqe_copy");
+    aeqe_copy.copy(aeqe);
+    if (aeqe_copy.srfq_en !== aeqe.srfq_en ||
+        aeqe_copy.urc_flag !== aeqe.urc_flag ||
+        aeqe_copy.urc_remote_ecode !== aeqe.urc_remote_ecode ||
+        aeqe_copy.wqe_index !== aeqe.wqe_index ||
+        aeqe_copy.srfqn !== aeqe.srfqn ||
+        aeqe_copy.srfqe_idx !== aeqe.srfqe_idx ||
+        aeqe_copy.logical_cqn_eqn() !== aeqe.logical_cqn_eqn())
+      `uvm_error("AEQE_COPY", "AEQE detached copy lost fields")
+
+    // logical_cqn_eqn 的上界覆盖 13-bit high 与 6-bit low 的拼接边界，
+    //   防止实现把 low 当成 high 的低位截断或错误左移。
+    aeqe.cqn_eqn_high = 13'h1fff;
+    aeqe.cqn_eqn_low = 6'h3f;
+    if (aeqe.logical_cqn_eqn() !== 19'h7ffff)
+      `uvm_error("AEQE_CQN_EQN_BOUNDARY", "AEQE CQN/EQN upper boundary is wrong")
+
+    // 变体负向：SRFQ 坐标必须由 SRFQ_EN 拥有；URC abnormal/remote 字段必须
+    //   由 URC_FLAG 拥有。queue WQE wrap/index 则按 event.c 无条件解码，允许
+    //   urc_flag=0 的非零组合，避免模型比真实驱动更严格。
+    aeqe.srfq_en = 1'b0;
+    s = c.encode(aeqe, im);
+    if (s == null || s.ok())
+      `uvm_error("AEQE_SRFQ_VARIANT", "AEQE accepted SRFQ fields without enable")
+    aeqe.srfq_en = 1'b1;
+    aeqe.urc_flag = 1'b0;
+    s = c.encode(aeqe, im);
+    if (s == null || s.ok())
+      `uvm_error("AEQE_URC_VARIANT", "AEQE accepted URC fields without flag")
+    aeqe.urc_flag = 1'b1;
+
+    // 驱动 qp.h 的 xtrdma_qp_st 只有 0..5；3-bit wire 的 6/7 是未知值，
+    //   编码和 raw decode 都必须 fail-closed，不能仅因字段宽度足够而放行。
+    aeqe.qp_state = 3'd6;
+    s = c.encode(aeqe, im);
+    if (s == null || s.ok())
+      `uvm_error("AEQE_QP_STATE", "AEQE accepted an unknown driver QP state")
+    aeqe.qp_state = 3'd5;
+
+    // 保留位负向：AEQE qword0 bit53 与 qword1 bits31:28 均不在 defs.h
+    //   字段集合中，raw decode 必须 fail-closed 且不能发布半成品 model。
+    s = c.encode(aeqe, im);
+    ok("aeqe re-encode for reserved red", s);
+    eq_builder = new("aeqe_reserved_builder");
+    s = eq_builder.deserialize(im.bytes);
+    ok("aeqe reserved deserialize", s);
+    s = eq_builder.put_field(0, 53, 1, 1);
+    ok("aeqe qword0 reserved field", s);
+    s = eq_builder.serialize(event_bytes);
+    ok("aeqe qword0 reserved serialize", s);
+    eq_image = make_event_image("aeqe_qword0_reserved", RDMA_IMAGE_AEQE,
+                                event_bytes);
+    s = c.decode(eq_image, eq_model);
+    if (s == null || s.ok() || eq_model != null)
+      `uvm_error("AEQE_RESERVED", "AEQE qword0 reserved bit was accepted")
+
+    s = c.encode(aeqe, im);
+    ok("aeqe re-encode for qword1 reserved red", s);
+    eq_builder = new("aeqe_reserved_qword1_builder");
+    s = eq_builder.deserialize(im.bytes);
+    ok("aeqe qword1 reserved deserialize", s);
+    s = eq_builder.put_field(8, 28, 1, 1);
+    ok("aeqe qword1 reserved field", s);
+    s = eq_builder.serialize(event_bytes);
+    ok("aeqe qword1 reserved serialize", s);
+    eq_image = make_event_image("aeqe_qword1_reserved", RDMA_IMAGE_AEQE,
+                                event_bytes);
+    s = c.decode(eq_image, eq_model);
+    if (s == null || s.ok() || eq_model != null)
+      `uvm_error("AEQE_RESERVED", "AEQE qword1 reserved bits were accepted")
+
     sq=rdma_hw_sqe_model::type_id::create("sq"); sq.transport=RDMA_TRANSPORT_RC; sq.qp_h=h("q",RDMA_RESOURCE_QP,'h15555);
     sq.hw_opcode=4'hd; sq.icos=5; sq.qp_sn=8'ha6; sq.dst_port=11; sq.index='h4567; sq.wrap=1; sq.sign_en=1; sq.se=1; sq.fence=2; sq.ce=2; sq.valid=1; sq.signature=8'hc7;
     re=rdma_sqe_rc_ext::type_id::create("re"); re.remote_access_valid=1; re.rkey_valid=1; re.rkey=32'hdeadbeef; re.remote_addr.value=64'h0123456789abcdef; sq.transport_ext=re;
