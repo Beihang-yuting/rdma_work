@@ -1136,7 +1136,7 @@ class rdma_cmq_engine extends uvm_object;
     match_count = 0;
     foreach (batch_record.items[i]) begin
       if (batch_record.items[i] != null &&
-          same_ticket_value(batch_record.items[i].ticket, ticket)) begin
+          same_ticket_detached_value(batch_record.items[i].ticket, ticket)) begin
         match_count++;
         journal_item = batch_record.items[i];
         journal_item_index = i;
@@ -1175,28 +1175,103 @@ class rdma_cmq_engine extends uvm_object;
     input rdma_cmq_batch_submission_record batch_record,
     input rdma_cmq_batch_submission_item_record journal_item
   );
+    rdma_cmq_command_identity expected_command_identity;
+    string identity_failure;
+
     if (submitted == null || batch_record == null || journal_item == null ||
         submitted.ticket == null || journal_item.ticket == null ||
+        batch_record.function_identity == null || batch_record.cmq_h == null ||
+        journal_item.command == null || journal_item.recovery_owner == null ||
+        journal_item.dma_context == null || journal_item.status == null ||
         submitted.batch_key != batch_record.batch_key ||
         submitted.batch_id != batch_record.batch_id ||
         submitted.attempt_id != batch_record.attempt_id ||
         batch_record.engine_instance_id != engine_instance_id ||
-        !same_ticket_value(submitted.ticket, journal_item.ticket) ||
-        !same_ticket_value(journal_item.completion == null ? journal_item.ticket :
+        !same_ticket_detached_value(submitted.ticket, journal_item.ticket) ||
+        !same_handle_value(batch_record.cmq_h, journal_item.ticket.cmq_h) ||
+        !same_ticket_detached_value(journal_item.completion == null ? journal_item.ticket :
                            journal_item.completion.ticket, journal_item.ticket))
       return journal_status(
         RDMA_SC_INVALID_STATE, "CMQ observed journal identity mismatch"
       );
-    if (batch_record.function_identity == null ||
+    if (!rdma_cmq_identity_shape_valid(batch_record.function_identity) ||
         journal_item.ticket.function_h == null ||
+        !same_handle_value(journal_item.ticket.function_h,
+                           submitted.ticket.function_h) ||
         journal_item.ticket.function_h.function_uid !=
           batch_record.function_identity.function_uid ||
         journal_item.ticket.function_h.object_id !=
           batch_record.function_identity.global_function_id ||
         journal_item.ticket.function_h.generation !=
-          batch_record.function_identity.generation)
+          batch_record.function_identity.generation ||
+        journal_item.dma_context.reset_epoch !=
+          batch_record.function_identity.reset_epoch ||
+        journal_item.dma_context.function_h == null ||
+        journal_item.dma_context.function_h.function_uid !=
+          batch_record.function_identity.function_uid ||
+        journal_item.dma_context.function_h.object_id !=
+          batch_record.function_identity.global_function_id ||
+        journal_item.dma_context.function_h.generation !=
+          batch_record.function_identity.generation ||
+        !same_journal_dma_context_detached_value(
+          submitted.dma_context, journal_item.dma_context
+        ) ||
+        !same_journal_owner_detached_value(
+          submitted.recovery_owner, journal_item.recovery_owner
+        ))
       return journal_status(
-        RDMA_SC_INVALID_STATE, "CMQ observed Function identity mismatch"
+        RDMA_SC_INVALID_STATE,
+        "CMQ observed Function or recovery authority mismatch"
+      );
+
+    expected_command_identity = new("cmq_observed_expected_command_identity");
+    if (!expected_command_identity.capture_from(
+          journal_item.command, identity_failure
+        ) || submitted.command_identity == null ||
+        !same_journal_command_identity_value(
+          submitted.command_identity, expected_command_identity
+        ))
+      return journal_status(
+        RDMA_SC_INVALID_STATE,
+        (identity_failure.len() == 0) ?
+          "CMQ observed command identity mismatch" :
+          {"CMQ observed command identity is invalid: ", identity_failure}
+      );
+
+    if (submitted.submission_effect != journal_item.submission_effect ||
+        submitted.attempt_effect != journal_item.attempt_effect ||
+        submitted.completion_phase != journal_item.completion_phase ||
+        submitted.recovery_required != journal_item.recovery_required ||
+        !same_status_value(submitted.status, journal_item.status))
+      return journal_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ observed operation evidence disagrees with retained journal"
+      );
+    if (submitted.completion != null &&
+        (submitted.completion.ticket == null ||
+         submitted.completion.status == null ||
+         !same_ticket_detached_value(submitted.completion.ticket,
+                                     journal_item.ticket) ||
+         !same_status_value(submitted.completion.status, submitted.status) ||
+         submitted.completion.ticket != submitted.ticket ||
+         submitted.completion.status != submitted.status))
+      return journal_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ observed completion evidence disagrees with operation result"
+      );
+    if (journal_item.dependency_mapping == null ||
+        journal_item.dependency_mapping.reset_epoch !=
+          batch_record.function_identity.reset_epoch)
+      return journal_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ observed DMA mapping reset evidence is stale"
+      );
+    if (!rdma_cmq_submission_state_valid(journal_item.state) ||
+        !rdma_cmq_completion_phase_valid(journal_item.completion_phase) ||
+        !rdma_cmq_submission_effect_valid(journal_item.submission_effect) ||
+        !rdma_cmq_submission_effect_valid(journal_item.attempt_effect))
+      return journal_status(
+        RDMA_SC_INVALID_STATE, "CMQ observed lifecycle evidence is malformed"
       );
     if (journal_item.state inside {
           RDMA_CMQ_SUBMISSION_PUBLISH_AMBIGUOUS,
@@ -1284,7 +1359,7 @@ class rdma_cmq_engine extends uvm_object;
         "CMQ retained completion snapshot returned null status"
       ) : journal_status(status.code, status.message);
     if (completion.ticket == null || completion.status == null ||
-        !same_ticket_value(completion.ticket, journal_item.ticket)) begin
+        !same_ticket_detached_value(completion.ticket, journal_item.ticket)) begin
       completion = null;
       return journal_status(
         RDMA_SC_INVALID_STATE,
@@ -2001,6 +2076,138 @@ class rdma_cmq_engine extends uvm_object;
     return lhs.same_instance(rhs);
   endfunction
 
+  // 功能：按公开值比较两个 detached handle，供跨快照 authority 定位使用。
+  // 输入/输出及副作用：lhs/rhs 为只读句柄；逐字段比较 kind、Function UID、
+  //   object ID 和 generation，返回确定 bit，不修改任何账本或句柄。
+  // 失败/边界：任一句柄为空或字段含未知值时返回 0；本比较不宣称两个句柄
+  //   属于同一可变对象，需由调用方另行验证 alias topology。
+  protected function bit same_handle_value(
+    input rdma_handle lhs,
+    input rdma_handle rhs
+  );
+    if (lhs == null || rhs == null ||
+        $isunknown(lhs.kind) || $isunknown(rhs.kind) ||
+        $isunknown(lhs.function_uid) || $isunknown(rhs.function_uid) ||
+        $isunknown(lhs.object_id) || $isunknown(rhs.object_id) ||
+        $isunknown(lhs.generation) || $isunknown(rhs.generation))
+      return 1'b0;
+    return lhs.kind === rhs.kind &&
+           lhs.function_uid === rhs.function_uid &&
+           lhs.object_id === rhs.object_id &&
+           lhs.generation === rhs.generation;
+  endfunction
+
+  // 功能：按公开字段比较 operation 与 completion 的 rdma_status 值，确认
+  //   错误码、硬件证据、身份、严重级别和诊断文本没有在快照中漂移。
+  // 输入/输出及副作用：lhs/rhs 为只读 status；返回完整值相等 bit，不复制或修改节点。
+  // 失败/边界：任一 status 为空、runtime subtype 不受支持或字段含未知值时返回 0；
+  //   对象是否同一节点由调用方单独验证，不由本值比较推断。
+  protected function bit same_status_value(
+    input rdma_status lhs,
+    input rdma_status rhs
+  );
+    if (lhs == null || rhs == null ||
+        !rdma_cmq_status_shape_valid(lhs) ||
+        !rdma_cmq_status_shape_valid(rhs))
+      return 1'b0;
+    return lhs.category === rhs.category &&
+           lhs.code === rhs.code &&
+           lhs.hardware_code === rhs.hardware_code &&
+           lhs.hardware_code_valid === rhs.hardware_code_valid &&
+           lhs.source_engine === rhs.source_engine &&
+           lhs.function_uid === rhs.function_uid &&
+           lhs.generation === rhs.generation &&
+           lhs.resource_id === rhs.resource_id &&
+           lhs.command_id === rhs.command_id &&
+           lhs.wr_id === rhs.wr_id &&
+           lhs.severity === rhs.severity &&
+           lhs.retryable === rhs.retryable &&
+           lhs.message == rhs.message;
+  endfunction
+
+  // 功能：判断 command 是否使用 profile 的 context-body codec；当生产 profile
+  //   的五种低层 body canonicalizer 无法处理 MRT/CQC 等 context model 时，
+  //   允许 journal 使用已编码 SQE image 作为稳定的 authority 投影。
+  // 输入/输出及副作用：command/body 为只读输入；仅检查 opcode 与 exact
+  //   context model dynamic type，不修改 command、body 或 engine 状态。
+  // 失败/边界：command/opcode/body 为空、opcode 不是已注册 context opcode，或
+  //   body 类型与 opcode 不匹配时返回 0；未知模型不得通过此 fallback。
+  protected function bit context_body_fallback_supported(
+    input rdma_cmq_command_desc command,
+    input rdma_hw_model body
+  );
+    rdma_mrt_model mrt;
+    rdma_cqc_model cqc;
+    rdma_srqc_model srqc;
+    rdma_ceqc_model ceqc;
+    rdma_aeqc_model aeqc;
+
+    if (command == null || command.opcode_key == null || body == null)
+      return 1'b0;
+    case (command.opcode_key.opcode)
+      RDMA_OP_KEY_ALLOC,
+      RDMA_OP_MR_REGISTER:
+        return $cast(mrt, body);
+      RDMA_OP_CQC_CREATE:
+        return $cast(cqc, body);
+      RDMA_OP_SRFQC_CREATE:
+        return $cast(srqc, body);
+      RDMA_OP_CEQC_CREATE:
+        return $cast(ceqc, body);
+      RDMA_OP_AEQC_CREATE:
+        return $cast(aeqc, body);
+      default:
+        return 1'b0;
+    endcase
+  endfunction
+
+  // 功能：生成 journal authority 所需的 command body canonical projection。
+  //   先委托 retained profile 的五种明确 V1 body seam；对已注册 MRT/CQC/
+  //   SRQC/CEQC/AEQC context command，仅在 profile 已成功编码 detached SQE
+  //   后以 CONTEXT-IMAGE-V1 标签和复制后的 SQE bytes 作为显式 fallback。
+  // 输入/输出及副作用：profile_service、command、encoded_image 为只读输入；
+  //   schema_tag/field_bytes 入口清空，成功时发布新 tag/byte array，不保留输入引用。
+  // 失败/边界：profile/cmd/image 缺失、profile canonicalization 返回 null、
+  //   context 类型不匹配或 image shape 非法时返回原始失败 status；该 fallback
+  //   不接受未知 body，也不把 EMPTY schema 冒充 context authority。
+  protected function rdma_status canonicalize_journal_body(
+    input rdma_cmq_hw_profile profile_service,
+    input rdma_cmq_command_desc command,
+    input rdma_hw_image encoded_image,
+    output string schema_tag,
+    output byte unsigned field_bytes[]
+  );
+    rdma_status status;
+
+    schema_tag = "";
+    field_bytes = new[0];
+    if (profile_service == null || command == null ||
+        command.body == null || encoded_image == null)
+      return rdma_cmq_direct_status(
+        RDMA_SC_INVALID_ARGUMENT,
+        "CMQ journal body canonicalization source is incomplete"
+      );
+    status = profile_service.canonicalize_command_body(
+      command.body, schema_tag, field_bytes
+    );
+    if (status == null)
+      return rdma_cmq_direct_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ journal body canonicalization returned null status"
+      );
+    if (status.ok())
+      return status;
+    if (!context_body_fallback_supported(command, command.body) ||
+        !rdma_cmq_image_shape_valid(encoded_image))
+      return status;
+
+    schema_tag = "CMQ-BODY-CONTEXT-IMAGE-V1";
+    field_bytes = new[encoded_image.bytes.size()];
+    foreach (encoded_image.bytes[i])
+      field_bytes[i] = encoded_image.bytes[i];
+    return rdma_cmq_direct_status(RDMA_SC_OK);
+  endfunction
+
   // 功能：在 rdma_cmq_engine 中由 same_bdf 逐字段比较输入值，返回结构、身份或序列化内容是否一致。
   // 输入/输出及副作用：lhs（输入）、rhs（输入）；比较对象/数组只读；返回 bit 或状态结果，不更新 runtime、账本或外部 adapter。
   // 失败/边界：same_bdf 的任一比较对象为空或类型不符时返回确定的 false/不等结果，不抛出未处理异常。
@@ -2465,6 +2672,29 @@ class rdma_cmq_engine extends uvm_object;
     return lhs.command_id == rhs.command_id &&
            lhs.function_h.same_instance(rhs.function_h) &&
            lhs.cmq_h.same_instance(rhs.cmq_h) &&
+           lhs.slot_sequence == rhs.slot_sequence &&
+           lhs.sq_index == rhs.sq_index &&
+           lhs.sq_wrap == rhs.sq_wrap &&
+           same_opcode_value(lhs.opcode_key, rhs.opcode_key) &&
+           lhs.absolute_deadline == rhs.absolute_deadline;
+  endfunction
+
+  // 功能：比较两个 caller/journal detached ticket 的公开 immutable 值，供
+  //   observed/reconcile 边界在 source graph 已分离时重新定位唯一记录。
+  // 输入/输出及副作用：lhs/rhs 为只读 ticket；比较 command、Function/CMQ
+  //   handle 值、slot、opcode 和 deadline，不修改账本或对象。
+  // 失败/边界：任一 ticket/句柄/key 为空或值不一致返回 0；本函数不授予
+  //   可变对象 alias authority，调用方仍须单独检查预期的 alias topology。
+  protected function bit same_ticket_detached_value(
+    input rdma_cmq_ticket lhs,
+    input rdma_cmq_ticket rhs
+  );
+    if (lhs == null || rhs == null || lhs.function_h == null ||
+        rhs.function_h == null || lhs.cmq_h == null || rhs.cmq_h == null)
+      return 1'b0;
+    return lhs.command_id == rhs.command_id &&
+           same_handle_value(lhs.function_h, rhs.function_h) &&
+           same_handle_value(lhs.cmq_h, rhs.cmq_h) &&
            lhs.slot_sequence == rhs.slot_sequence &&
            lhs.sq_index == rhs.sq_index &&
            lhs.sq_wrap == rhs.sq_wrap &&
@@ -5197,7 +5427,8 @@ class rdma_cmq_engine extends uvm_object;
     return rdma_cmq_direct_status(code, message);
   endfunction
 
-  // 功能：逐字段比较两个 frozen recovery-owner 值，不把句柄 identity 当对象别名。
+  // 功能：比较两个 retained frozen recovery-owner 节点，并要求其资源句柄
+  //   仍是同一 authority 对象。
   // 输入/输出及副作用：lhs/rhs 为只读输入；返回完整公开值是否相等。
   // 失败/边界：任一 owner 形状非法、嵌套句柄/identity 缺失或值漂移返回 0。
   protected function bit same_journal_owner_value(
@@ -5212,6 +5443,32 @@ class rdma_cmq_engine extends uvm_object;
     return lhs.workflow == rhs.workflow &&
            lhs.resource_h != null && rhs.resource_h != null &&
            lhs.resource_h.same_instance(rhs.resource_h) &&
+           lhs.transaction_id == rhs.transaction_id &&
+           lhs.allowed_actions == rhs.allowed_actions &&
+           lhs.function_identity != null && rhs.function_identity != null &&
+           lhs.function_identity.same_incarnation(rhs.function_identity) &&
+           lhs.admission_attempt_id == rhs.admission_attempt_id &&
+           lhs.frozen == rhs.frozen;
+  endfunction
+
+  // 功能：比较两个 detached recovery-owner 的完整 immutable 值，供 observed
+  //   结果与 retained journal 跨快照校验；不把值相等误当作对象 alias。
+  // 输入/输出及副作用：lhs/rhs 为只读 owner；比较 workflow、资源句柄值、事务、
+  //   action mask、Function identity、admission attempt 与 frozen 标志。
+  // 失败/边界：任一 owner shape 非法或公开字段漂移返回 0；调用方另行验证
+  //   同一结果图内应保留的 owner 节点 alias。
+  protected function bit same_journal_owner_detached_value(
+    input rdma_cmq_recovery_owner lhs,
+    input rdma_cmq_recovery_owner rhs
+  );
+    if (!rdma_cmq_frozen_owner_shape_valid(lhs) ||
+        !rdma_cmq_frozen_owner_shape_valid(rhs))
+      return 1'b0;
+    if (lhs.is_legacy_unmigrated() || rhs.is_legacy_unmigrated())
+      return lhs.is_legacy_unmigrated() && rhs.is_legacy_unmigrated();
+    return lhs.workflow == rhs.workflow && lhs.resource_h != null &&
+           rhs.resource_h != null &&
+           same_handle_value(lhs.resource_h, rhs.resource_h) &&
            lhs.transaction_id == rhs.transaction_id &&
            lhs.allowed_actions == rhs.allowed_actions &&
            lhs.function_identity != null && rhs.function_identity != null &&
@@ -5241,6 +5498,36 @@ class rdma_cmq_engine extends uvm_object;
            lhs.dma_domain_valid == rhs.dma_domain_valid &&
            lhs.dma_domain_id == rhs.dma_domain_id &&
            lhs.route == rhs.route && lhs.reset_epoch == rhs.reset_epoch &&
+           lhs.route_valid == rhs.route_valid &&
+           lhs.epoch_valid == rhs.epoch_valid &&
+           lhs.queue_role_valid == rhs.queue_role_valid &&
+           lhs.queue_role == rhs.queue_role;
+  endfunction
+
+  // 功能：比较两个 detached DMA request context 的完整 authority 值，供
+  //   observed 结果跨 source/journal 图校验而不恢复可变句柄 alias。
+  // 输入/输出及副作用：lhs/rhs 为只读 context；比较 Function/owner handle 值、
+  //   requester、PASID、DMA domain、route、epoch 和 queue-role 元数据。
+  // 失败/边界：任一 context/Function 缺失、可选 owner 形状不一致或字段漂移返回 0；
+  //   不执行 DMA、不修改 context。
+  protected function bit same_journal_dma_context_detached_value(
+    input rdma_dma_request_context lhs,
+    input rdma_dma_request_context rhs
+  );
+    if (lhs == null || rhs == null || lhs.function_h == null ||
+        rhs.function_h == null ||
+        !same_handle_value(lhs.function_h, rhs.function_h))
+      return 1'b0;
+    if ((lhs.owner_h == null) != (rhs.owner_h == null))
+      return 1'b0;
+    if (lhs.owner_h != null &&
+        !same_handle_value(lhs.owner_h, rhs.owner_h))
+      return 1'b0;
+    return lhs.requester_bdf == rhs.requester_bdf &&
+           lhs.pasid_valid == rhs.pasid_valid && lhs.pasid == rhs.pasid &&
+           lhs.dma_domain_valid == rhs.dma_domain_valid &&
+           lhs.dma_domain_id == rhs.dma_domain_id && lhs.route == rhs.route &&
+           lhs.reset_epoch == rhs.reset_epoch &&
            lhs.route_valid == rhs.route_valid &&
            lhs.epoch_valid == rhs.epoch_valid &&
            lhs.queue_role_valid == rhs.queue_role_valid &&
@@ -5477,6 +5764,7 @@ class rdma_cmq_engine extends uvm_object;
     rdma_cmq_opcode_key opcode_snapshot;
     rdma_hw_image signature_snapshot;
     rdma_status status;
+    bit context_body;
 
     snapshot = null;
     if (source == null || context == null || profile_service == null ||
@@ -5486,9 +5774,25 @@ class rdma_cmq_engine extends uvm_object;
         "CMQ journal command source/context/profile is invalid"
       );
 
-    status = profile_service.snapshot_command_body(
-      source.body, body_snapshot
-    );
+    context_body = has_exact_object_type(source.body,
+                                         rdma_cqc_model::get_type()) ||
+                   has_exact_object_type(source.body,
+                                         rdma_mrt_model::get_type()) ||
+                   has_exact_object_type(source.body,
+                                         rdma_srqc_model::get_type()) ||
+                   has_exact_object_type(source.body,
+                                         rdma_ceqc_model::get_type()) ||
+                   has_exact_object_type(source.body,
+                                         rdma_aeqc_model::get_type());
+    if (context_body)
+      status = checked_context_snapshot(
+        source.body, "CMQ journal command body", RDMA_SC_INVALID_ARGUMENT,
+        body_snapshot
+      );
+    else
+      status = profile_service.snapshot_command_body(
+        source.body, body_snapshot
+      );
     if (status == null)
       return journal_status(
         RDMA_SC_INVALID_STATE,
@@ -5497,11 +5801,15 @@ class rdma_cmq_engine extends uvm_object;
     if (!status.ok())
       return journal_status(status.code, status.message);
     if (body_snapshot == null || body_snapshot == source.body ||
-        !profile_service.same_command_body_value(
-          source.body, body_snapshot
-        ) || !profile_service.command_body_graph_detached(
-          source.body, body_snapshot
-        ))
+        (context_body &&
+         (!same_body_value(source.body, body_snapshot) ||
+          !body_graph_detached(source.body, body_snapshot))) ||
+        (!context_body &&
+         (!profile_service.same_command_body_value(
+            source.body, body_snapshot
+          ) || !profile_service.command_body_graph_detached(
+            source.body, body_snapshot
+          ))))
       return journal_status(
         RDMA_SC_INVALID_ARGUMENT,
         "CMQ journal command body snapshot contract failed"
@@ -6557,8 +6865,9 @@ class rdma_cmq_engine extends uvm_object;
           RDMA_SC_INVALID_ARGUMENT,
           $sformatf("CMQ recovery request item %0d is incomplete", i)
         );
-      status = profile.canonicalize_command_body(
-        source_item.command.body, body_tag, body_bytes
+      status = canonicalize_journal_body(
+        profile, source_item.command, source_item.sqe_image,
+        body_tag, body_bytes
       );
       if (status == null)
         return journal_status(
@@ -7248,8 +7557,9 @@ class rdma_cmq_engine extends uvm_object;
           "CMQ journal record contains a duplicate or empty ticket key"
         );
       ticket_seen[ticket_key] = 1'b1;
-      status = profile_service.canonicalize_command_body(
-        item.command.body, body_tag, body_bytes
+      status = canonicalize_journal_body(
+        profile_service, item.command, item.sqe_image,
+        body_tag, body_bytes
       );
       if (status == null)
         return journal_status(
@@ -10125,8 +10435,8 @@ class rdma_cmq_engine extends uvm_object;
             record_candidate.function_identity.generation &&
           item.dependency_mapping.reset_epoch ==
             record_candidate.function_identity.reset_epoch;
-        status = profile.canonicalize_command_body(
-          item.command.body, body_tag, body_bytes
+        status = canonicalize_journal_body(
+          profile, item.command, item.sqe_image, body_tag, body_bytes
         );
         if (status == null || !status.ok()) begin
           transaction_status = (status == null) ? rdma_cmq_direct_status(
@@ -10644,8 +10954,9 @@ class rdma_cmq_engine extends uvm_object;
       rdma_cmq_journal_digest_t image_digest;
       rdma_cmq_journal_digest_t authority_digest;
 
-      nested_status = profile_service.canonicalize_command_body(
-        request.items[i].command.body, body_tag, body_bytes
+      nested_status = canonicalize_journal_body(
+        profile_service, request.items[i].command,
+        request.items[i].sqe_image, body_tag, body_bytes
       );
       if (nested_status != null && nested_status.ok())
         nested_status = rdma_cmq_compute_item_digests(
@@ -10717,8 +11028,9 @@ class rdma_cmq_engine extends uvm_object;
       rdma_cmq_journal_digest_t image_digest;
       rdma_cmq_journal_digest_t authority_digest;
 
-      nested_status = profile_service.canonicalize_command_body(
-        record.items[i].command.body, body_tag, body_bytes
+      nested_status = canonicalize_journal_body(
+        profile_service, record.items[i].command,
+        record.items[i].sqe_image, body_tag, body_bytes
       );
       if (nested_status != null && nested_status.ok())
         nested_status = rdma_cmq_compute_item_digests(

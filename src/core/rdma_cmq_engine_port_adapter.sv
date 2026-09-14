@@ -53,14 +53,134 @@ class rdma_cmq_engine_port_adapter extends rdma_cmq_port;
     return rdma_status::make(RDMA_SC_INVALID_STATE, message);
   endfunction
 
-  // 功能：检查 observed execution result 的 effect/phase/completion 形状，阻止
-  //   adapter 把不可能 envelope 当作可靠 lifecycle 证据继续发布。
+  // 功能：比较两个 observed result 中 detached handle 的公开 immutable 值，
+  //   供 adapter 在 source graph 已分离时校验 Function/CMQ/资源 authority。
+  // 输入/输出及副作用：lhs/rhs 为只读句柄；比较 kind、Function UID、object ID
+  //   和 generation，返回 bit，不修改任何输入或 adapter 状态。
+  // 失败/边界：任一句柄为空或字段含 X/Z 时返回 0；值相等不代表两个节点应当
+  //   共享 alias，调用方必须另行检查结果图的 alias topology。
+  protected function bit same_handle_value(
+    input rdma_handle lhs,
+    input rdma_handle rhs
+  );
+    if (lhs == null || rhs == null || $isunknown(lhs.kind) ||
+        $isunknown(rhs.kind) || $isunknown(lhs.function_uid) ||
+        $isunknown(rhs.function_uid) || $isunknown(lhs.object_id) ||
+        $isunknown(rhs.object_id) || $isunknown(lhs.generation) ||
+        $isunknown(rhs.generation))
+      return 1'b0;
+    return lhs.kind === rhs.kind &&
+           lhs.function_uid === rhs.function_uid &&
+           lhs.object_id === rhs.object_id &&
+           lhs.generation === rhs.generation;
+  endfunction
+
+  // 功能：比较两个 detached ticket 的完整公开值，确认 completion 与 operation
+  //   result 指向同一 immutable command authority。
+  // 输入/输出及副作用：lhs/rhs 为只读 ticket；比较 command、Function/CMQ handle、
+  //   slot、opcode key 和 deadline，不执行 I/O 或修改对象。
+  // 失败/边界：任一 ticket shape 非法、嵌套值不一致或字段未知时返回 0；本函数
+  //   不要求对象别名，别名关系由 observed_result_shape_valid 单独验证。
+  protected function bit same_ticket_value(
+    input rdma_cmq_ticket lhs,
+    input rdma_cmq_ticket rhs
+  );
+    if (lhs == null || rhs == null ||
+        !rdma_cmq_ticket_shape_valid(lhs) ||
+        !rdma_cmq_ticket_shape_valid(rhs))
+      return 1'b0;
+    return lhs.command_id == rhs.command_id &&
+           same_handle_value(lhs.function_h, rhs.function_h) &&
+           same_handle_value(lhs.cmq_h, rhs.cmq_h) &&
+           lhs.slot_sequence == rhs.slot_sequence &&
+           lhs.sq_index == rhs.sq_index &&
+           lhs.sq_wrap == rhs.sq_wrap &&
+           lhs.opcode_key.profile_name == rhs.opcode_key.profile_name &&
+           lhs.opcode_key.opcode == rhs.opcode_key.opcode &&
+           lhs.opcode_key.variant == rhs.opcode_key.variant &&
+           lhs.absolute_deadline == rhs.absolute_deadline;
+  endfunction
+
+  // 功能：比较 operation 与 completion 的完整 detached status 值，确保硬件码、
+  //   Function/command 诊断字段及消息在 alias 节点间保持一致。
+  // 输入/输出及副作用：lhs/rhs 为只读 status；返回逐字段值相等 bit，不复制或修改节点。
+  // 失败/边界：任一 status 为空、runtime subtype 不受支持或枚举 shape 非法时返回 0；
+  //   对象 alias 由调用方另行验证。
+  protected function bit same_status_value(
+    input rdma_status lhs,
+    input rdma_status rhs
+  );
+    if (lhs == null || rhs == null ||
+        !rdma_cmq_status_shape_valid(lhs) ||
+        !rdma_cmq_status_shape_valid(rhs))
+      return 1'b0;
+    return lhs.category === rhs.category && lhs.code === rhs.code &&
+           lhs.hardware_code === rhs.hardware_code &&
+           lhs.hardware_code_valid === rhs.hardware_code_valid &&
+           lhs.source_engine === rhs.source_engine &&
+           lhs.function_uid === rhs.function_uid &&
+           lhs.generation === rhs.generation &&
+           lhs.resource_id === rhs.resource_id &&
+           lhs.command_id === rhs.command_id && lhs.wr_id === rhs.wr_id &&
+           lhs.severity === rhs.severity && lhs.retryable === rhs.retryable &&
+           lhs.message == rhs.message;
+  endfunction
+
+  // 功能：检查 observed envelope 中 command identity 的标量字段是否构成可追踪的
+  //   Function/opcode 身份，供 completion 与 ticket 交叉校验使用。
+  // 输入/输出及副作用：identity 为只读 command identity；返回 bit，不分配对象或修改
+  //   adapter 状态。
+  // 失败/边界：null、非 Function kind、零 UID/代际、未知 opcode 或空/含分隔符的
+  //   profile/variant 均返回 0；global_function_id 可为零，由上游 route 契约解释。
+  protected function bit command_identity_shape_valid(
+    input rdma_cmq_command_identity identity
+  );
+    return identity != null &&
+           identity.function_kind == RDMA_RESOURCE_FUNCTION &&
+           !$isunknown(identity.function_uid) && identity.function_uid != 0 &&
+           !$isunknown(identity.generation) && identity.generation != 0 &&
+           !$isunknown(identity.opcode) &&
+           identity.profile_name.len() != 0 &&
+           identity.variant.len() != 0 &&
+           !rdma_cmq_string_has_separator(identity.profile_name) &&
+           !rdma_cmq_string_has_separator(identity.variant);
+  endfunction
+
+  // 功能：比较 command identity 与 result ticket 的 Function/opcode 字段，确认
+  //   observed envelope 未将另一个 command 的诊断身份拼接进当前 ticket。
+  // 输入/输出及副作用：identity/ticket 为只读输入；返回值相等 bit，不创建快照。
+  // 失败/边界：任一对象为空、identity shape 非法或 profile/variant/UID/代际漂移
+  //   时返回 0；该函数不推断 batch 或恢复状态。
+  protected function bit command_identity_matches_ticket(
+    input rdma_cmq_command_identity identity,
+    input rdma_cmq_ticket ticket
+  );
+    if (identity == null || ticket == null ||
+        !command_identity_shape_valid(identity) ||
+        !rdma_cmq_ticket_shape_valid(ticket))
+      return 1'b0;
+    return identity.function_kind == ticket.function_h.kind &&
+           identity.function_uid == ticket.function_h.function_uid &&
+           identity.global_function_id == ticket.function_h.object_id &&
+           identity.generation == ticket.function_h.generation &&
+           identity.profile_name == ticket.opcode_key.profile_name &&
+           identity.opcode == ticket.opcode_key.opcode &&
+           identity.variant == ticket.opcode_key.variant;
+  endfunction
+
+  // 功能：对 observed result 执行完整 effect/phase/recovery 语义交叉校验，并确认
+  //   completion、ticket、status 和 identity 的 alias topology。
   // 输入/输出及副作用：value 为只读 engine 输出；返回布尔形状判定，不修改 value。
-  // 失败/边界：未知枚举、pending/terminal 与 completion nullness 矛盾均拒绝；
-  //   operation status 与 effects 不被该检查改写。
-  protected function bit observed_result_shape_valid(
+  // 失败/边界：未知枚举、PRE 与非 NONE phase 混用、UNOBSERVED 携带 completion、
+  //   terminal phase 缺 completion、ticket/owner/DMA/identity 漂移或 completion 未
+  //   alias result ticket/status 均拒绝；operation status/effects 不被改写。
+  protected function bit observed_result_semantics_valid(
     input rdma_cmq_execution_result value
   );
+    bit completion_phase_has_shell;
+    bit concrete_effect;
+    rdma_status dma_status;
+
     if (value == null || value.status == null ||
         value.observation_status == null ||
         !rdma_cmq_status_shape_valid(value.status) ||
@@ -69,52 +189,115 @@ class rdma_cmq_engine_port_adapter extends rdma_cmq_port;
         !rdma_cmq_submission_effect_valid(value.attempt_effect) ||
         !rdma_cmq_completion_phase_valid(value.completion_phase))
       return 1'b0;
-    if (value.completion_phase == RDMA_CMQ_COMPLETION_PENDING &&
-        value.completion != null)
+
+    if (value.ticket != null && !rdma_cmq_ticket_shape_valid(value.ticket))
       return 1'b0;
-    if (value.completion_phase == RDMA_CMQ_COMPLETION_NONE &&
-        value.completion != null)
+    if (value.recovery_owner != null &&
+        !rdma_cmq_frozen_owner_shape_valid(value.recovery_owner))
       return 1'b0;
-    if (value.completion_phase == RDMA_CMQ_COMPLETION_UNOBSERVED &&
-        (value.submission_effect != RDMA_SUBMIT_EFFECT_UNOBSERVED ||
-         value.attempt_effect != RDMA_SUBMIT_EFFECT_UNOBSERVED ||
-         value.recovery_required != 1'b1))
-      return 1'b0;
-    if (value.submission_effect == RDMA_SUBMIT_EFFECT_PRE_SUBMIT_REJECTED &&
-        (value.attempt_effect != RDMA_SUBMIT_EFFECT_PRE_SUBMIT_REJECTED ||
-         value.completion_phase != RDMA_CMQ_COMPLETION_NONE ||
-         value.recovery_required != 1'b0))
-      return 1'b0;
-    if (value.completion_phase == RDMA_CMQ_COMPLETION_PENDING &&
-        value.submission_effect inside {
-          RDMA_SUBMIT_EFFECT_UNOBSERVED,
-          RDMA_SUBMIT_EFFECT_PRE_SUBMIT_REJECTED
-        })
-      return 1'b0;
-    if (value.completion_phase inside {
-          RDMA_CMQ_COMPLETION_TERMINAL,
-          RDMA_CMQ_COMPLETION_TIMEOUT,
-          RDMA_CMQ_COMPLETION_DIAGNOSTIC_ONLY,
-          RDMA_CMQ_COMPLETION_RESET_CANCELLED
-        } && value.completion == null)
+    if (value.dma_context != null) begin
+      if (value.dma_context.function_h == null ||
+          value.dma_context.get_object_type() !=
+            rdma_dma_request_context::get_type())
+        return 1'b0;
+      dma_status = value.dma_context.validate();
+      if (dma_status == null || !dma_status.ok())
+        return 1'b0;
+    end
+    if (value.ticket != null &&
+        (value.recovery_owner == null || value.dma_context == null ||
+         value.command_identity == null ||
+         !command_identity_matches_ticket(value.command_identity,
+                                          value.ticket) ||
+         !same_handle_value(value.dma_context.function_h,
+                            value.ticket.function_h) ||
+         (!value.recovery_owner.is_legacy_unmigrated() &&
+          (value.recovery_owner.function_identity == null ||
+           value.recovery_owner.function_identity.function_uid !=
+             value.ticket.function_h.function_uid ||
+           value.recovery_owner.function_identity.generation !=
+             value.ticket.function_h.generation ||
+           value.recovery_owner.resource_h == null ||
+           value.recovery_owner.resource_h.function_uid !=
+             value.ticket.function_h.function_uid ||
+           value.recovery_owner.resource_h.generation !=
+             value.ticket.function_h.generation))))
       return 1'b0;
     if (value.completion != null &&
-        (value.completion.status == null ||
+        (value.ticket == null || value.completion.ticket == null ||
+         value.completion.status == null ||
+         !rdma_cmq_ticket_shape_valid(value.completion.ticket) ||
          !rdma_cmq_status_shape_valid(value.completion.status) ||
-         value.completion.ticket == null ||
-         (value.ticket != null &&
-          (value.completion.ticket.command_id != value.ticket.command_id ||
-           value.completion.ticket.slot_sequence != value.ticket.slot_sequence ||
-           value.completion.ticket.sq_index != value.ticket.sq_index ||
-           value.completion.ticket.sq_wrap != value.ticket.sq_wrap ||
-           value.completion.ticket.function_h == null ||
-           value.ticket.function_h == null ||
-           !value.completion.ticket.function_h.same_instance(value.ticket.function_h) ||
-           value.completion.ticket.cmq_h == null ||
-           value.ticket.cmq_h == null ||
-           !value.completion.ticket.cmq_h.same_instance(value.ticket.cmq_h)))))
+         !same_ticket_value(value.completion.ticket, value.ticket) ||
+         !same_status_value(value.completion.status, value.status) ||
+         value.completion.ticket != value.ticket ||
+         value.completion.status != value.status))
       return 1'b0;
-    return 1'b1;
+
+    completion_phase_has_shell = value.completion_phase inside {
+      RDMA_CMQ_COMPLETION_TERMINAL,
+      RDMA_CMQ_COMPLETION_TIMEOUT,
+      RDMA_CMQ_COMPLETION_DIAGNOSTIC_ONLY,
+      RDMA_CMQ_COMPLETION_RESET_CANCELLED
+    };
+    if (value.completion_phase inside {
+          RDMA_CMQ_COMPLETION_NONE,
+          RDMA_CMQ_COMPLETION_PENDING,
+          RDMA_CMQ_COMPLETION_UNOBSERVED
+        } && value.completion != null)
+      return 1'b0;
+    if (completion_phase_has_shell && value.completion == null)
+      return 1'b0;
+
+    concrete_effect = rdma_cmq_concrete_submission_effect(
+      value.submission_effect
+    );
+    if (value.submission_effect == RDMA_SUBMIT_EFFECT_PRE_SUBMIT_REJECTED ||
+        value.attempt_effect == RDMA_SUBMIT_EFFECT_PRE_SUBMIT_REJECTED)
+      return value.completion_phase == RDMA_CMQ_COMPLETION_NONE &&
+             value.completion == null &&
+             value.submission_effect == RDMA_SUBMIT_EFFECT_PRE_SUBMIT_REJECTED &&
+             value.attempt_effect == RDMA_SUBMIT_EFFECT_PRE_SUBMIT_REJECTED &&
+             value.recovery_required == 1'b0 && value.batch_key.len() == 0 &&
+             value.batch_id == 0 && value.attempt_id == 0;
+
+    case (value.completion_phase)
+      RDMA_CMQ_COMPLETION_UNOBSERVED:
+        return value.completion == null && value.recovery_required == 1'b1;
+      RDMA_CMQ_COMPLETION_NONE:
+        return value.completion == null &&
+               value.submission_effect != RDMA_SUBMIT_EFFECT_MMIO_MAYBE_VISIBLE &&
+               value.submission_effect != RDMA_SUBMIT_EFFECT_MMIO_VISIBLE &&
+               value.recovery_required == 1'b1;
+      RDMA_CMQ_COMPLETION_PENDING:
+        return value.completion == null &&
+               value.submission_effect inside {
+                 RDMA_SUBMIT_EFFECT_MMIO_MAYBE_VISIBLE,
+                 RDMA_SUBMIT_EFFECT_MMIO_VISIBLE
+               } && value.recovery_required == 1'b1;
+      RDMA_CMQ_COMPLETION_TERMINAL,
+      RDMA_CMQ_COMPLETION_DIAGNOSTIC_ONLY:
+        return concrete_effect && value.completion != null &&
+               value.recovery_required == 1'b0;
+      RDMA_CMQ_COMPLETION_TIMEOUT:
+        return concrete_effect && value.completion != null &&
+               value.recovery_required == 1'b1;
+      RDMA_CMQ_COMPLETION_RESET_CANCELLED:
+        return concrete_effect && value.completion != null;
+      default:
+        return 1'b0;
+    endcase
+  endfunction
+
+  // 功能：检查 observed execution result 的 effect/phase/completion 形状，阻止
+  //   adapter 把不可能 envelope 当作可靠 lifecycle 证据继续发布。
+  // 输入/输出及副作用：value 为只读 engine 输出；返回布尔形状判定，不修改 value。
+  // 失败/边界：未知枚举、pending/terminal 与 completion nullness 矛盾均拒绝；
+  //   operation status 与 effects 不被该检查改写。
+  protected function bit observed_result_shape_valid(
+    input rdma_cmq_execution_result value
+  );
+    return observed_result_semantics_valid(value);
   endfunction
 
   // 功能：在 rdma_cmq_engine_port_adapter 中，bind_engine 把 bind_engine 指定的资源或后端能力绑定到当前对象索引，并校验 Function、generation 和队列类型一致。

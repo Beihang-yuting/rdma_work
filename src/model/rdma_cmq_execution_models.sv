@@ -1615,7 +1615,9 @@ function automatic bit rdma_cmq_append_function_binding_v1(
   return rdma_cmq_commit_child_writer(writer, child);
 endfunction
 
-// 功能：按 CMQ-COMMAND-V1 编码命令 shell，并在 body 位置插入 profile 输出。
+// 功能：按 CMQ-COMMAND-V1 编码命令 shell，并在 body 位置插入 profile 输出；
+//   CONTEXT-IMAGE-V1 用于已注册 MRT/CQC/SRQC/CEQC/AEQC context command，
+//   其字段由 engine 从 detached SQE image 提供。
 // 输入/输出及副作用：writer/command/body tag/field bytes 为输入；成功原子追加。
 // 失败/边界：未知 body tag、无效 Function/opcode/owner/image 或空 body 拒绝；
 //   model 层不 cast codec 具体 body，且只信任唯一注册 wrapper 身份而非类型名字符串。
@@ -1641,7 +1643,8 @@ function automatic bit rdma_cmq_append_command_v1(
         (command_body_schema_tag == "CMQ-BODY-OBJECT-ID-V1") ||
         (command_body_schema_tag == "CMQ-BODY-MR-DEREGISTER-V1") ||
         (command_body_schema_tag == "CMQ-BODY-OCC-FLUSH-V1") ||
-        (command_body_schema_tag == "CMQ-BODY-EMPTY-V1")) ||
+        (command_body_schema_tag == "CMQ-BODY-EMPTY-V1") ||
+        (command_body_schema_tag == "CMQ-BODY-CONTEXT-IMAGE-V1")) ||
       (command.qpc_signature_source != null &&
        (!rdma_cmq_image_shape_valid(command.qpc_signature_source) ||
         command.qpc_signature_source.function_generation !=

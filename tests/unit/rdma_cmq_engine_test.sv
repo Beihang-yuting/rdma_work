@@ -23879,6 +23879,31 @@ class rdma_cmq_engine_submission_continuation_process_test
     check_observed_transport_failure_retention(3, 14);
     check_doorbell_authority_isolation();
     check_submission_validation_and_profile_metadata();
+    phase.drop_objection(this);
+  endtask
+endclass
+
+// continuation suffix 独占 fresh simulator lifetime，隔离 profile hook/factory 图。
+class rdma_cmq_engine_submission_profile_process_test
+  extends rdma_cmq_engine_test;
+  `uvm_component_utils(rdma_cmq_engine_submission_profile_process_test)
+
+  // 功能：构造 profile suffix 物理 leaf，承接 continuation 后半段 profile seam fixture。
+  // 输入/输出及副作用：name/parent 为 UVM 层级输入；只建立 UVM component，不创建外部资源。
+  // 失败/边界：构造阶段不运行 fixture；profile snapshot/recheck 失败由 run_phase 报告。
+  function new(
+    string name = "rdma_cmq_engine_submission_profile_process_test",
+    uvm_component parent = null
+  );
+    super.new(name, parent);
+  endfunction
+
+  // 功能：运行 profile hook、stateful profile 和 exact-type delegation fixture，隔离
+  //   可能触发 VCS lifetime crash 的 factory graph。
+  // 输入/输出及副作用：phase 为 UVM 输入；task 管理 objection，各 fixture 自行清理资源。
+  // 失败/边界：任一 profile snapshot/重检失败报告 UVM severity；不依赖前 leaf 对象。
+  virtual task run_phase(uvm_phase phase);
+    phase.raise_objection(this);
     check_profile_hook_snapshot_contract();
     check_stateful_profile_snapshot_rechecks();
     check_exact_type_profile_delegation();
