@@ -2464,9 +2464,10 @@ class rdma_queue_data_engine extends uvm_object;
   //   使 CEQ poll 只负责 route CQ 而不会替 CQ 生成或消费 completion。
   // 输入/输出及副作用：ceq_h、model 为只读输入，result/status 为输出；成功时写入
   //   16B CEQ ring 并推进 CEQ producer，不修改 CQ cursor、model 或 WQE ledger。
-  // 失败/边界：CEQ/CQ/QP authority、generation、已提交 PI、16 位 PI、polarity、
-  //   full ring 或 codec 失败时 result 保持 null；预写失败取消 reservation，写后失败
-  //   保留 pending/recovery evidence，不能改变 backing、cursor 或 committed occupancy。
+  // 失败/边界：CEQ/CQ/QP authority、generation、RC CEQE 的已提交 PI/16 位 PI、
+  //   polarity、full ring 或 codec 失败时 result 保持 null；预写失败取消 reservation，
+  //   写后失败保留 pending/recovery evidence，不能改变 backing、cursor 或 committed
+  //   occupancy。
   task publish_ceqe(
     rdma_handle ceq_h,
     rdma_hw_ceqe_model model,
