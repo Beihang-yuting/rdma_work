@@ -127,7 +127,7 @@ class rdma_queue_backing_access extends uvm_object;
 
   // 功能：在 rdma_queue_backing_access 中，attach_queue 把 attach_queue 指定的资源或后端能力绑定到当前对象索引，并校验 Function、generation 和队列类型一致。
   // 输入/输出及副作用：backing（输入）；attach_queue 先依据 owner == null || host_mem == null；queue_ref != null || qp_ref != null；backing == null 校验 backing；成功时更新本对象配置/状态并保存非拥有引用，返回 rdma_status。
-  // 失败/边界：资源不存在、类型不符、重复登记或跨 Function 串线时拒绝绑定并保持索引不变。
+  // 失败/边界：资源不存在、类型不符、重复登记、校验器返回 null 或跨 Function 串线时拒绝绑定并保持索引不变。
   function rdma_status attach_queue(rdma_queue_backing_ref backing);
     rdma_status status;
     if (owner == null || host_mem == null)
@@ -137,6 +137,8 @@ class rdma_queue_backing_access extends uvm_object;
     if (backing == null)
       return invalid("queue backing reference is null");
     status = backing.validate();
+    if (status == null)
+      return invalid_state("queue backing validation returned null status");
     if (!status.ok())
       return status;
     if (backing.mapping == null || backing.mapping.function_h == null)
@@ -150,7 +152,7 @@ class rdma_queue_backing_access extends uvm_object;
 
   // 功能：在 rdma_queue_backing_access 中，attach_qp 把 attach_qp 指定的资源或后端能力绑定到当前对象索引，并校验 Function、generation 和队列类型一致。
   // 输入/输出及副作用：backing（输入）；attach_qp 先依据 owner == null || host_mem == null；queue_ref != null || qp_ref != null；backing == null 校验 backing；成功时更新本对象配置/状态并保存非拥有引用，返回 rdma_status。
-  // 失败/边界：资源不存在、类型不符、重复登记或跨 Function 串线时拒绝绑定并保持索引不变。
+  // 失败/边界：资源不存在、类型不符、重复登记、校验器返回 null 或跨 Function 串线时拒绝绑定并保持索引不变。
   function rdma_status attach_qp(rdma_qp_backing_ref backing);
     rdma_status status;
     if (owner == null || host_mem == null)
@@ -160,6 +162,8 @@ class rdma_queue_backing_access extends uvm_object;
     if (backing == null)
       return invalid("QP backing reference is null");
     status = backing.validate();
+    if (status == null)
+      return invalid_state("QP backing validation returned null status");
     if (!status.ok())
       return status;
     if (backing.mapping == null || backing.mapping.function_h == null)

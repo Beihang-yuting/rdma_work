@@ -168,14 +168,21 @@ class rdma_queue_txn_evidence extends uvm_object;
 
   // 功能：记录共享 URC CQ 的 SQ/RQ consumer CI、arm state 和 sequence，形成可重放事务证据。
   // 输入/输出及副作用：shadow 为输入值快照；成功时复制其 authority 游标字段到本 evidence，不修改 shadow 或 queue runtime。
-  // 失败边界：shadow 为空或 validate 失败时返回对应错误，既有 evidence 字段保持不变。
+  // 失败/边界：shadow 为空、validate 返回 null 或 validate 失败时返回确定错误；
+  // 既有 evidence 字段保持不变。
   function rdma_status capture_urc_shadow(rdma_cq_shadow_snapshot shadow);
     rdma_status status;
     if (shadow == null)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "URC CQ shadow is null");
     status = shadow.validate();
-    if (!status.ok()) return status;
+    if (status == null)
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "URC CQ shadow validation returned null status"
+      );
+    if (!status.ok())
+      return status;
     urc_sq_ci = shadow.sq_ci;
     urc_rq_ci = shadow.rq_ci;
     urc_arm_state = shadow.arm_state;
@@ -279,8 +286,12 @@ class rdma_queue_txn_evidence extends uvm_object;
   endfunction
 
   // 功能：在 rdma_queue_txn_evidence 中，capture_request 从输入对象提取受控字段并返回 detached 投影，阻断调用方通过别名修改 authority。
-  // 输入/输出及副作用：source（输入）；capture_request 读取 source 并使用字段 status、cloned；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：capture_request 返回 RDMA_SC_INVALID_ARGUMENT、RDMA_SC_RESOURCE_EXHAUSTED；典型拒绝条件为“semantic request is null”“request snapshot clone failed”；失败路径不提交部分状态或转移未声明资源。
+  // 输入/输出及副作用：source（输入）；capture_request 读取 source 并使用字段
+  //   status、cloned；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：capture_request 返回 RDMA_SC_INVALID_ARGUMENT、RDMA_SC_INVALID_STATE、
+  //   RDMA_SC_RESOURCE_EXHAUSTED；典型拒绝条件为“semantic request is null”、
+  //   “request validation returned null status”“request snapshot clone failed”；
+  //   失败路径不提交部分状态或转移未声明资源。
   function rdma_status capture_request(rdma_semantic_request source);
     uvm_object cloned;
     rdma_status status;
@@ -288,7 +299,13 @@ class rdma_queue_txn_evidence extends uvm_object;
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "semantic request is null");
     status = source.validate();
-    if (!status.ok()) return status;
+    if (status == null)
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "semantic request validation returned null status"
+      );
+    if (!status.ok())
+      return status;
     cloned = source.clone();
     if (cloned == null || !$cast(request_snapshot, cloned))
       return rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED,

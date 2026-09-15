@@ -6,6 +6,44 @@
 // 中文说明：rdma_queue_backing_access_test.sv 属于单元测试，覆盖对应模型、编码器或执行器契约。
 // 阅读提示：先看公开类型和接口，再看实现细节；失败路径应保持状态与资源所有权可追踪。
 
+// 功能：构造故障注入用 queue backing reference，模拟扩展校验器返回空状态句柄。
+// 输入/输出及副作用：name（输入）；new 只初始化基类字段，不取得 mapping 或 Host-memory 所有权。
+// 失败/边界：该对象的 validate() 故意返回 null；attach_queue 必须将其转换为确定的 INVALID_STATE。
+class rdma_null_queue_backing_validate extends rdma_queue_backing_ref;
+  // 功能：创建 queue backing 故障注入对象，并复用基类的默认 role/ownership/geometry。
+  // 输入/输出及副作用：name（输入）；new 不修改外部 mapping，也不触发后端访问。
+  // 失败/边界：对象仅用于验证 null-status 防御，不能作为真实 queue backing 提交给设备。
+  function new(string name = "rdma_null_queue_backing_validate");
+    super.new(name);
+  endfunction
+
+  // 功能：模拟 queue backing 的可覆写校验器返回空状态，覆盖 attach_queue 的扩展边界。
+  // 输入/输出及副作用：无显式输入；函数不修改 backing 字段，返回 null rdma_status 句柄。
+  // 失败/边界：返回 null 是故障注入结果；调用方不得继续调用 status.ok() 或写入 queue_ref。
+  virtual function rdma_status validate();
+    return null;
+  endfunction
+endclass
+
+// 功能：构造故障注入用 QP backing reference，模拟扩展校验器返回空状态句柄。
+// 输入/输出及副作用：name（输入）；new 只初始化基类字段，不取得 mapping 或 Host-memory 所有权。
+// 失败/边界：该对象的 validate() 故意返回 null；attach_qp 必须将其转换为确定的 INVALID_STATE。
+class rdma_null_qp_backing_validate extends rdma_qp_backing_ref;
+  // 功能：创建 QP backing 故障注入对象，并复用基类默认 role/ownership/geometry。
+  // 输入/输出及副作用：name（输入）；new 不修改外部 mapping，也不触发后端访问。
+  // 失败/边界：对象仅用于验证 null-status 防御，不能作为真实 QP backing 提交给设备。
+  function new(string name = "rdma_null_qp_backing_validate");
+    super.new(name);
+  endfunction
+
+  // 功能：模拟 QP backing 的可覆写校验器返回空状态，覆盖 attach_qp 的扩展边界。
+  // 输入/输出及副作用：无显式输入；函数不修改 backing 字段，返回 null rdma_status 句柄。
+  // 失败/边界：返回 null 是故障注入结果；调用方不得继续调用 status.ok() 或写入 qp_ref。
+  virtual function rdma_status validate();
+    return null;
+  endfunction
+endclass
+
 class rdma_queue_backing_access_test extends uvm_test;
   `uvm_component_utils(rdma_queue_backing_access_test)
 
@@ -121,11 +159,15 @@ class rdma_queue_backing_access_test extends uvm_test;
     rdma_status status;
     rdma_queue_backing_ref backing;
     rdma_queue_backing_ref invalid_backing;
+    rdma_queue_backing_ref null_queue_backing;
     rdma_queue_backing_segment segment;
     rdma_queue_backing_segment invalid_segment;
     rdma_qp_backing_ref qp_backing;
+    rdma_qp_backing_ref null_qp_backing;
     rdma_queue_backing_access access;
     rdma_queue_backing_access invalid_access;
+    rdma_queue_backing_access null_queue_access;
+    rdma_queue_backing_access null_qp_access;
     rdma_queue_backing_span spans[$];
     byte data[];
     byte write_data[];
@@ -156,6 +198,24 @@ class rdma_queue_backing_access_test extends uvm_test;
     segment.ownership = backing.ownership;
     backing.additional_segments.push_back(segment);
 
+    // validate() 是可覆写边界；null status 必须在 attach 入口归一化，且
+    // 失败后 backing slot 仍应可接受一次合法绑定。
+    null_queue_access = rdma_queue_backing_access::type_id::create(
+      "null_queue_access"
+    );
+    status = null_queue_access.configure(fn(), mem);
+    expect_code("NULL_QUEUE_CONFIG", status, RDMA_SC_OK);
+    null_queue_backing = new("null_queue_backing");
+    write_calls = call_count(mem, "write");
+    read_calls = call_count(mem, "read");
+    status = null_queue_access.attach_queue(null_queue_backing);
+    expect_code("NULL_QUEUE_VALIDATE", status, RDMA_SC_INVALID_STATE);
+    if (call_count(mem, "write") != write_calls ||
+        call_count(mem, "read") != read_calls)
+      `uvm_error("NULL_QUEUE_BACKEND", "null queue validation touched Host memory")
+    status = null_queue_access.attach_queue(backing);
+    expect_code("NULL_QUEUE_RETRY", status, RDMA_SC_OK);
+
     access = rdma_queue_backing_access::type_id::create("access");
     status = access.configure(fn(), mem);
     expect_code("CONFIG", status, RDMA_SC_OK);
@@ -170,6 +230,24 @@ class rdma_queue_backing_access_test extends uvm_test;
     qp_backing.length = 4096;
     qp_backing.mapping_offset = 0;
     qp_backing.ownership = RDMA_OWNERSHIP_BORROWED;
+
+    // QP backing 也允许扩展校验器；null status 不能把 qp_ref 置为半有效引用。
+    null_qp_access = rdma_queue_backing_access::type_id::create(
+      "null_qp_access"
+    );
+    status = null_qp_access.configure(fn(), mem);
+    expect_code("NULL_QP_CONFIG", status, RDMA_SC_OK);
+    null_qp_backing = new("null_qp_backing");
+    write_calls = call_count(mem, "write");
+    read_calls = call_count(mem, "read");
+    status = null_qp_access.attach_qp(null_qp_backing);
+    expect_code("NULL_QP_VALIDATE", status, RDMA_SC_INVALID_STATE);
+    if (call_count(mem, "write") != write_calls ||
+        call_count(mem, "read") != read_calls)
+      `uvm_error("NULL_QP_BACKEND", "null QP validation touched Host memory")
+    status = null_qp_access.attach_qp(qp_backing);
+    expect_code("NULL_QP_RETRY", status, RDMA_SC_OK);
+
     status = access.attach_qp(qp_backing);
     expect_code("MIXED_ATTACH", status, RDMA_SC_INVALID_STATE);
 

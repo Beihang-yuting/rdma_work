@@ -4,6 +4,45 @@
 // 所有权与生命周期：测试对象只拥有本地 fixture；外部后端句柄由测试环境提供并在测试结束释放。
 
 // 中文说明：覆盖 queue transaction evidence 的单调阶段与恢复前置条件。
+
+// 功能：构造一个只用于故障注入的 CQ shadow，模拟可扩展 shadow 实现返回空状态句柄。
+// 输入/输出及副作用：name（输入）；构造函数只初始化 UVM 对象，不修改 shadow authority 或 evidence。
+// 失败/边界：该对象故意不提供有效校验状态；调用方必须把 validate() 的 null 返回当作失败，不能解引用。
+class rdma_null_shadow_validate extends rdma_cq_shadow_snapshot;
+  // 功能：创建故障注入用 CQ shadow，并复用基类的确定性零值字段初始化。
+  // 输入/输出及副作用：name（输入）；new 只调用基类构造函数，不拥有或修改外部 CQ 资源。
+  // 失败/边界：构造成功并不代表 shadow 可用于提交；本类的 validate() 始终返回 null，调用方必须继续做状态句柄检查。
+  function new(string name = "rdma_null_shadow_validate");
+    super.new(name);
+  endfunction
+
+  // 功能：模拟故障注入的 CQ shadow 校验器，返回空 rdma_status 以验证调用方的 fail-closed 处理。
+  // 输入/输出及副作用：无显式输入；函数不修改 shadow 字段并返回 null 状态句柄。
+  // 失败/边界：null 返回值是本测试刻意制造的异常；任何直接调用 status.ok() 的生产路径都应被该场景捕获。
+  virtual function rdma_status validate();
+    return null;
+  endfunction
+endclass
+
+// 功能：构造一个只用于故障注入的 semantic request，模拟扩展请求返回空状态句柄。
+// 输入/输出及副作用：name（输入）；构造函数只初始化 UVM 对象，不修改 request authority 或 evidence。
+// 失败/边界：该对象故意不提供有效校验状态；capture_request 必须返回确定的 INVALID_STATE，而不是解引用空句柄。
+class rdma_null_request_validate extends rdma_semantic_request;
+  // 功能：创建故障注入用 semantic request，并复用基类默认请求字段。
+  // 输入/输出及副作用：name（输入）；new 只调用基类构造函数，不取得请求所有权之外的资源。
+  // 失败/边界：构造成功并不代表请求通过校验；本类的 validate() 始终返回 null，调用方必须将其归一化为失败状态。
+  function new(string name = "rdma_null_request_validate");
+    super.new(name);
+  endfunction
+
+  // 功能：模拟故障注入的 semantic request 校验器，返回空 rdma_status 以验证事务快照入口的防御。
+  // 输入/输出及副作用：无显式输入；函数不修改 request 字段并返回 null 状态句柄。
+  // 失败/边界：null 返回值是本测试刻意制造的异常；调用方不得继续执行 clone 或读取 request 状态。
+  virtual function rdma_status validate();
+    return null;
+  endfunction
+endclass
+
 class rdma_queue_txn_journal_test extends uvm_test;
   `uvm_component_utils(rdma_queue_txn_journal_test)
   // 功能：构造 rdma_queue_txn_journal_test，调用 super.new 建立 UVM 层级对象；外部依赖字段保持未绑定，后续由 configure/build/activate 明确注入。
@@ -17,15 +56,54 @@ class rdma_queue_txn_journal_test extends uvm_test;
   // 失败/边界：run_phase 的 setup/阶段驱动失败时停止新增事务，并按测试生命周期清理 objection 与临时引用。
   task run_phase(uvm_phase phase);
     rdma_queue_txn_evidence evidence, submitted, evidence_copy;
+    rdma_queue_txn_evidence null_shadow_evidence;
     rdma_hw_image image, cqe, cqe_snapshot_image;
     rdma_function_identity identity;
     rdma_function_key_t key;
     rdma_handle queue_h;
     rdma_semantic_request request;
+    rdma_cq_shadow_snapshot null_shadow;
+    rdma_semantic_request null_request;
     rdma_status status, source_failure;
     uvm_object cloned;
     phase.raise_objection(this);
     evidence = rdma_queue_txn_evidence::type_id::create("evidence");
+
+    // 空校验状态是可扩展对象边界：必须 fail-closed，不能发布部分
+    // URC 证据，也不能解引用空句柄。
+    null_shadow_evidence = rdma_queue_txn_evidence::type_id::create(
+      "null_shadow_evidence"
+    );
+    null_shadow_evidence.urc_sq_ci = 17;
+    null_shadow_evidence.urc_rq_ci = 19;
+    null_shadow_evidence.urc_arm_state = 2'b01;
+    null_shadow_evidence.urc_sequence = 64'h55;
+    null_shadow = new("null_shadow");
+    status = null_shadow_evidence.capture_urc_shadow(null_shadow);
+    if (status == null || status.code != RDMA_SC_INVALID_STATE)
+      `uvm_error("NULL_SHADOW_STATUS", $sformatf(
+        "null shadow validation was not normalized: %s",
+        status == null ? "null" : status.convert2string()))
+    if (null_shadow_evidence.urc_sq_ci != 17 ||
+        null_shadow_evidence.urc_rq_ci != 19 ||
+        null_shadow_evidence.urc_arm_state != 2'b01 ||
+        null_shadow_evidence.urc_sequence != 64'h55)
+      `uvm_error("NULL_SHADOW_MUTATION",
+        "null shadow validation published partial URC evidence")
+
+    null_request = new("null_request");
+    request = rdma_semantic_request::type_id::create("prior_request");
+    request.request_id = 64'hcafe;
+    evidence.request_snapshot = request;
+    status = evidence.capture_request(null_request);
+    if (status == null || status.code != RDMA_SC_INVALID_STATE)
+      `uvm_error("NULL_REQUEST_STATUS", $sformatf(
+        "null request validation was not normalized: %s",
+        status == null ? "null" : status.convert2string()))
+    if (evidence.request_snapshot != request)
+      `uvm_error("NULL_REQUEST_MUTATION",
+        "null request validation replaced the existing snapshot")
+
     key = '{root_id:16'h1, host_topology_key:32'h10, function_kind:RDMA_FUNCTION_VF,
             parent_pf_bdf:'{segment:0,bus:8'h20,device:5'h1,function_num:0},
             vf_index:16'h2, bdf:'{segment:0,bus:8'h30,device:5'h4,function_num:1}};
