@@ -150,13 +150,74 @@ class rdma_cq_shadow_flush_test extends uvm_test;
       `uvm_error("CQ_SHADOW", "zero reset epoch was accepted")
   endtask
 
-  // 功能：启动两个 CQ shadow 场景并管理 objection，作为 VCS test 入口。
+  // 功能：验证 shared CQ 配置接受 21-bit 本地 QPN 上限，并拒绝第二次
+  // 覆盖活动 authority。
+  // 输入/输出及副作用：phase 为 UVM phase 输入；任务创建两个本地 CQ/QP 句柄，先以
+  // 高位 QPN 完成一次配置和 flush，再尝试用不同 CQ/游标重配置并检查原 shadow 仍可重放。
+  // 失败/边界：21-bit 上限 QPN 必须被接受；已配置 facade 的第二次调用
+  // 必须返回 INVALID_STATE，且不得清空首个 active shadow 或改变 flush
+  // 计数/快照。
+  task automatic test_shared_config_width_and_one_shot(uvm_phase phase);
+    rdma_cq_engine cq;
+    rdma_queue_data_engine data_engine;
+    rdma_function_identity identity;
+    rdma_handle cq_h;
+    rdma_handle qp_h;
+    rdma_handle replacement_cq_h;
+    rdma_cq_shadow_snapshot shadow;
+    rdma_status status;
+
+    cq = rdma_cq_engine::type_id::create("width_gate_cq");
+    data_engine = rdma_queue_data_engine::type_id::create("width_gate_engine");
+    identity = rdma_function_identity::type_id::create("width_gate_identity");
+    identity.function_uid = 64'h3333;
+    identity.generation = 5;
+    identity.reset_epoch = 6;
+    cq_h = make_handle(RDMA_RESOURCE_CQ, identity.function_uid,
+                       identity.generation, 12);
+    // 0x1fffff 是真实驱动 21-bit 资源句柄可表达的最大本地 QPN。
+    qp_h = make_handle(RDMA_RESOURCE_QP, identity.function_uid,
+                       identity.generation, 21'h1f_ffff);
+    status = cq.configure_shared(cq_h, qp_h, RDMA_TRANSPORT_URC, identity,
+                                 7, 8, 2'b1, 64'h66, data_engine);
+    if (status == null || !status.ok()) begin
+      `uvm_error("CQ_QPN_WIDTH", "21-bit shared-CQ QPN was rejected")
+      return;
+    end
+
+    status = cq.flush_shadow(shadow);
+    if (status == null || !status.ok() || shadow == null ||
+        shadow.sq_ci != 7 || shadow.rq_ci != 8 || cq.shadow_flush_count != 1) begin
+      `uvm_error("CQ_QPN_WIDTH", "initial high-QPN shadow flush failed")
+      return;
+    end
+
+    replacement_cq_h = make_handle(RDMA_RESOURCE_CQ, identity.function_uid,
+                                   identity.generation, 13);
+    status = cq.configure_shared(replacement_cq_h, qp_h, RDMA_TRANSPORT_URC,
+                                 identity, 99, 100, 2'b0, 64'h77, data_engine);
+    if (status == null || status.code != RDMA_SC_INVALID_STATE) begin
+      `uvm_error("CQ_CONFIG_GATE", "active shared CQ accepted a second configuration")
+      return;
+    end
+
+    shadow = null;
+    status = cq.flush_shadow(shadow);
+    if (status == null || !status.ok() || shadow == null ||
+        shadow.cq_h == null || shadow.cq_h.object_id != 12 ||
+        shadow.sq_ci != 7 || shadow.rq_ci != 8 ||
+        shadow.\sequence != 64'h66 || cq.shadow_flush_count != 1)
+      `uvm_error("CQ_CONFIG_GATE", "rejected reconfiguration changed cached shadow")
+  endtask
+
+  // 功能：启动三个 CQ shadow 场景并管理 objection，作为 VCS test 入口。
   // 输入/输出及副作用：phase 为 UVM phase 输入；任务运行测试并在结束时释放 objection。
-  // 失败边界：场景内部错误通过 UVM report 发布；任务本身不吞掉被测状态或外部资源。
+  // 失败/边界：场景内部错误通过 UVM report 发布；任务本身不吞掉被测状态或外部资源。
   task run_phase(uvm_phase phase);
     phase.raise_objection(this);
     test_shared_urc_shadow_flush_is_exactly_once(phase);
     test_shadow_flush_rejects_stale_or_cross_function(phase);
+    test_shared_config_width_and_one_shot(phase);
     phase.drop_objection(this);
   endtask
 endclass

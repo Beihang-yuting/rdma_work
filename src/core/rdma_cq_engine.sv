@@ -51,8 +51,12 @@ class rdma_cq_engine extends uvm_object;
   endfunction
 
   // 功能：配置共享 CQ 的 Function authority、URC completion QP 和可恢复 shadow 游标。
-  // 输入/输出及副作用：cq_h/completion_qp_h/transport/identity、SQ/RQ CI、arm、sequence 和 URC evidence_engine 为输入；成功时保存句柄快照与 authority 标量，不接管外部资源。
-  // 失败边界：CQ/QP 句柄为空或类型错误、URC 缺少 completion QP/evidence_engine、Function UID/generation/reset epoch 为零或句柄代际不匹配时返回错误且保留旧配置。
+  // 输入/输出及副作用：cq_h/completion_qp_h/transport/identity、SQ/RQ CI、arm、
+  // sequence 和 URC evidence_engine 为输入；成功时保存句柄快照与 authority
+  // 标量，不接管外部资源。
+  // 失败/边界：CQ/QP 句柄为空或类型错误、URC 缺少 completion QP/evidence_engine、
+  // Function UID/generation/reset epoch 为零或句柄代际不匹配时返回错误且保留旧配置；
+  // 已配置 facade 对再次通过全部校验的请求返回 INVALID_STATE，并保留原 authority/shadow。
   function rdma_status configure_shared(
     rdma_handle cq_h,
     rdma_handle completion_qp_h,
@@ -107,6 +111,12 @@ class rdma_cq_engine extends uvm_object;
          completion_qp_h.generation != identity.generation))
       return rdma_status::make(RDMA_SC_STALE_GENERATION,
                                "shared CQ completion QP authority is stale");
+    // 中文设计：先完成参数与 authority 校验，再执行 one-shot 门禁，保证非法
+    // 重配置仍返回其具体错误；合法重配置不得覆盖活动 authority 或
+    // shadow 缓存。
+    if (shared_configured)
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "shared CQ is already configured");
     cq_snapshot = rdma_clone_handle_value(cq_h, "shared CQ handle");
     qp_snapshot = rdma_clone_handle_value(completion_qp_h,
                                           "shared CQ completion QP");
@@ -125,8 +135,8 @@ class rdma_cq_engine extends uvm_object;
     shadow_rq_ci = rq_ci;
     shadow_arm_state = arm_state;
     shadow_sequence = seq;
-    // 中文设计：即使 reset epoch 未变化，重配置也必须启动新的 active shadow；
-    // 否则后续 flush 可能把旧缓存快照误当作本次新输入的 CI 返回。
+    // 中文设计：首次成功配置建立唯一的 active shadow，并清除构造期缓存；
+    // 后续配置由上方 one-shot 门禁拒绝，不能重置已发布的 flush 结果。
     shadow_flushed = 1'b0;
     flushed_shadow = null;
     shadow_flush_result = null;
