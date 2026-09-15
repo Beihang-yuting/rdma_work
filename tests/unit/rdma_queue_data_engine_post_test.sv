@@ -1276,6 +1276,102 @@ class rdma_queue_data_engine_post_test extends uvm_test;
     end
   endtask
 
+  // 功能：check_recv_owner_authority 验证 private RQ 的 receive request 在
+  //   owner Function UID 与当前 fixture 不一致时被 post_recv 拒绝，并保留原游标。
+  // 输入/输出及副作用：无显式参数；task 建立独立 fixture，篡改 request.owner，
+  //   读取前后 RQ producer/consumer cursor，并通过 UVM 报告暴露 authority 结果。
+  // 失败边界：setup、cursor 查询或 cleanup 返回空/失败状态时单独报告；若
+  //   foreign owner 被接受、result 非空或任一 cursor 推进则报告 UVM_ERROR。
+  task automatic check_recv_owner_authority();
+    rdma_queue_data_engine_fixture fixture;
+    rdma_post_recv_req request;
+    rdma_queue_post_result result;
+    rdma_status status;
+    rdma_status cursor_status;
+    rdma_status cleanup_status;
+    int unsigned before_index;
+    int unsigned after_index;
+    int unsigned before_consumer;
+    int unsigned after_consumer;
+    bit before_wrap;
+    bit after_wrap;
+    bit before_consumer_wrap;
+    bit after_consumer_wrap;
+    rdma_function_handle foreign_owner;
+    rdma_status epoch_status;
+
+    fixture = rdma_queue_data_engine_fixture::type_id::create(
+      "recv_owner_authority_fixture");
+    begin : recv_owner_authority_flow
+      if (fixture == null) begin
+        `uvm_error("RECV_OWNER_FIXTURE", "fixture allocation failed")
+        disable recv_owner_authority_flow;
+      end
+      fixture.setup(status);
+      if (status == null || !status.ok()) begin
+        `uvm_error("RECV_OWNER_FIXTURE",
+                   status == null ? "null setup status" : status.convert2string())
+        disable recv_owner_authority_flow;
+      end
+      cursor_status = fixture.engine.query_runtime_cursors(
+        fixture.qp.handle, RDMA_QUEUE_RUNTIME_RQ, before_index, before_wrap,
+        before_consumer, before_consumer_wrap);
+      if (cursor_status == null || !cursor_status.ok()) begin
+        `uvm_error("RECV_OWNER_CURSOR",
+                   cursor_status == null ? "null cursor status" :
+                   cursor_status.convert2string())
+        disable recv_owner_authority_flow;
+      end
+      request = fixture.make_recv(64'hface_cafe_0000_0001);
+      foreign_owner = fixture.binding.make_handle();
+      if (foreign_owner == null) begin
+        `uvm_error("RECV_OWNER_HANDLE", "fixture owner handle is unavailable")
+        disable recv_owner_authority_flow;
+      end
+      foreign_owner.function_uid = foreign_owner.function_uid ^ 64'h1;
+      request.owner = foreign_owner;
+      result = null;
+      fixture.engine.post_recv(request, result, status);
+      cursor_status = fixture.engine.query_runtime_cursors(
+        fixture.qp.handle, RDMA_QUEUE_RUNTIME_RQ, after_index, after_wrap,
+        after_consumer, after_consumer_wrap);
+      if (status == null || status.ok() || result != null ||
+          cursor_status == null || !cursor_status.ok() ||
+          after_index != before_index || after_wrap != before_wrap ||
+          after_consumer != before_consumer ||
+          after_consumer_wrap != before_consumer_wrap)
+        `uvm_error("RECV_OWNER_AUTHORITY",
+                   status == null ? "null status" : status.convert2string())
+
+      epoch_status = fixture.advance_binding_reset_epoch(2);
+      if (epoch_status == null || !epoch_status.ok()) begin
+        `uvm_error("RECV_EPOCH_FIXTURE", epoch_status == null ?
+                   "null epoch status" : epoch_status.convert2string())
+        disable recv_owner_authority_flow;
+      end
+      request = fixture.make_recv(64'hface_cafe_0000_0002);
+      request.owner = fixture.binding.make_handle();
+      result = null;
+      fixture.engine.post_recv(request, result, status);
+      cursor_status = fixture.engine.query_runtime_cursors(
+        fixture.qp.handle, RDMA_QUEUE_RUNTIME_RQ, after_index, after_wrap,
+        after_consumer, after_consumer_wrap);
+      if (status == null || status.ok() || result != null ||
+          cursor_status == null || !cursor_status.ok() ||
+          after_index != before_index || after_wrap != before_wrap ||
+          after_consumer != before_consumer ||
+          after_consumer_wrap != before_consumer_wrap)
+        `uvm_error("RECV_EPOCH_AUTHORITY",
+                   status == null ? "null status" : status.convert2string())
+    end
+    if (fixture != null && fixture.needs_cleanup()) begin
+      fixture.cleanup(cleanup_status);
+      if (cleanup_status == null || !cleanup_status.ok())
+        `uvm_error("RECV_OWNER_CLEANUP", cleanup_status == null ?
+                   "fixture cleanup returned null" : cleanup_status.convert2string())
+    end
+  endtask
+
   // 功能：run_phase 验证未配置门禁与真实 SQ/RQ post/readback，再运行原子、
   //   transport mismatch 和 SGB recovery 子场景。
   // 输入/输出及副作用：phase 为输入；task 管理 objection，创建并驱动主 fixture，
@@ -1371,6 +1467,7 @@ class rdma_queue_data_engine_post_test extends uvm_test;
       check_atomic_model_projection();
       check_transport_link_mismatch();
       check_sgb_recovery_replays_slot();
+      check_recv_owner_authority();
     end
 
     if (fixture != null && fixture.needs_cleanup()) begin

@@ -6321,9 +6321,10 @@ class rdma_queue_data_engine extends uvm_object;
   // 输入/输出及副作用：request 为输入，result/status 为输出；completion_qp_h 提供
   //   SRQ completion route。成功推进目标 RQ/SRQ PI/used 并发布 detached result；
   //   write、doorbell 或 commit 失败保存同一 cursor/request/image pending 供 recovery。
-  // 失败/边界：null/非法 request、completion QP 未 attach、SRQ 绑定不一致、队列
-  //   无 credit、codec/backing 或 MMIO/commit 失败时 result 保持 null；ambiguous doorbell
-  //   不自动重发，task 不取得 QP/SRQ、mapping 或 Host-memory 生命周期所有权。
+  // 失败/边界：null/非法 request、foreign owner、completion QP 未 attach、SRQ
+  //   绑定不一致、attachment route/reset epoch 过期、队列无 credit、codec/backing
+  //   或 MMIO/commit 失败时 result 保持 null；ambiguous doorbell 不自动重发，task
+  //   不取得 QP/SRQ、mapping 或 Host-memory 生命周期所有权。
   task post_recv(
     rdma_post_recv_req request,
     output rdma_queue_post_result result,
@@ -6368,6 +6369,15 @@ class rdma_queue_data_engine extends uvm_object;
       status = lookup_attachment(snapshot.target_h, RDMA_QUEUE_RUNTIME_RQ,
                                  attachment);
     end
+    if (!status.ok()) return;
+    // receive request 的 owner 是 Function authority 证据，不能只依赖 target_h
+    //   已出现在 attachment 索引中；同时在 reserve 前复核 binding 的 route/epoch，
+    //   防止复位后旧 attachment 继续发布 RQE。
+    if (snapshot.owner != null) begin
+      status = rdma_handle_owner_status(snapshot.target_h, snapshot.owner);
+      if (!status.ok()) return;
+    end
+    status = validate_publish_route_epoch(attachment);
     if (!status.ok()) return;
     status = attachment.runtime.reserve_producer(cursor);
     if (!status.ok()) return;
