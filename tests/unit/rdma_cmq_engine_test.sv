@@ -23779,6 +23779,10 @@ class rdma_cmq_engine_test extends uvm_test;
     rdma_status_code_e retained_status_code;
     rdma_submission_effect_e retained_effect;
     rdma_cmq_completion_phase_e retained_phase;
+    rdma_cmq_submission_state_e retained_state;
+    rdma_cmq_completion retained_completion;
+    rdma_status retained_item_status;
+    rdma_cmq_completion forged_completion;
 
     engine = rdma_cmq_engine_probe::type_id::create(
       "observed_authority_race_engine"
@@ -23834,6 +23838,9 @@ class rdma_cmq_engine_test extends uvm_test;
     retained_status_code = record.items[0].status.code;
     retained_effect = record.items[0].submission_effect;
     retained_phase = record.items[0].completion_phase;
+    retained_state = record.items[0].state;
+    retained_completion = record.items[0].completion;
+    retained_item_status = record.items[0].status;
     results[0].status.code = RDMA_SC_TIMEOUT;
     results[0].status.message = "stale detached operation status";
     results[0].submission_effect = RDMA_SUBMIT_EFFECT_HOST_MEMORY_ORDERED;
@@ -23851,6 +23858,27 @@ class rdma_cmq_engine_test extends uvm_test;
       results[0], record, record.items[0], status
     );
     expect_status("OBSERVED_AUTHORITY_RACE_VALIDATE", status, RDMA_SC_OK);
+
+    // 将 retained completion 改成终态但注入不一致的 status，验证 journal
+    // completion 必须与 item.status 保持值等价且共享 canonical status 节点。
+    forged_completion = new("observed_authority_forged_completion");
+    forged_completion.ticket = record.items[0].ticket;
+    forged_completion.status = rdma_cmq_direct_status(
+      RDMA_SC_TIMEOUT, "forged retained completion status"
+    );
+    record.items[0].state = RDMA_CMQ_SUBMISSION_COMPLETED;
+    record.items[0].completion_phase = RDMA_CMQ_COMPLETION_TERMINAL;
+    record.items[0].completion = forged_completion;
+    engine.validate_observed_item_probe(
+      results[0], record, record.items[0], status
+    );
+    expect_status("OBSERVED_AUTHORITY_COMPLETION_STATUS_GATE", status,
+                  RDMA_SC_INVALID_STATE);
+
+    record.items[0].state = retained_state;
+    record.items[0].completion_phase = retained_phase;
+    record.items[0].completion = retained_completion;
+    record.items[0].status = retained_item_status;
     engine.shutdown(status);
     expect_status("OBSERVED_AUTHORITY_RACE_SHUTDOWN", status, RDMA_SC_OK);
   endtask

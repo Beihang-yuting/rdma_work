@@ -726,6 +726,7 @@ class rdma_cmq_port_test extends rdma_cmq_engine_test;
     rdma_cmq_ticket unbound_reconcile_ticket;
     rdma_cmq_completion completion_a;
     rdma_cmq_completion completion_b;
+    rdma_cmq_execution_result observed_result_a;
     rdma_cmq_completion unbound_completion;
     rdma_cmq_completion reconciled_completion;
     rdma_dma_mapping mapping_a;
@@ -736,6 +737,7 @@ class rdma_cmq_port_test extends rdma_cmq_engine_test;
     rdma_function_handle wrong_owner;
     bit terminal_known;
     bit routes_published;
+    bit last_no_submit_before_observed;
 
     adapter = rdma_cmq_engine_port_adapter::type_id::create("adapter");
     engine_a = rdma_cmq_engine_probe::type_id::create("adapter_engine_a");
@@ -813,6 +815,8 @@ class rdma_cmq_port_test extends rdma_cmq_engine_test;
     command_b = make_command("adapter_command_b", active_b,
                              rdma_cmq_test_profile::TEST_OPCODE_B,
                              8'h52, 1us);
+    last_no_submit_before_observed =
+      adapter.last_execute_definitive_no_submit();
     mapping_a = engine_a.mapping_snapshot();
     cqe_hint_a = rdma_cmq_ticket::type_id::create("adapter_cqe_hint_a");
     cqe_hint_a.function_h = command_a.function_h;
@@ -821,7 +825,9 @@ class rdma_cmq_port_test extends rdma_cmq_engine_test;
     cqe_hint_a.sq_wrap = 1'b0;
     fork
       begin
-        adapter.execute(command_a, ticket_a, completion_a, status_a);
+        // A 路径直接调用 production observed API；只有 B 保留 legacy wrapper，
+        // 这样同一 fixture 同时证明 direct route 与兼容 route 不会串证据。
+        adapter.execute_observed(command_a, observed_result_a);
       end
       begin
         adapter.execute(command_b, ticket_b, completion_b, status_b);
@@ -869,6 +875,11 @@ class rdma_cmq_port_test extends rdma_cmq_engine_test;
     write_profile_cqe("ADAPTER_CQE_A", mem_a, mapping_a, profile_a,
                       0, 1'b1, cqe_hint_a, 0, raw_a);
     wait fork;
+    if (observed_result_a != null) begin
+      ticket_a = observed_result_a.ticket;
+      completion_a = observed_result_a.completion;
+      status_a = observed_result_a.status;
+    end
     expect_status("ADAPTER_EXECUTE_A", status_a, RDMA_SC_OK);
     expect_status("ADAPTER_EXECUTE_B", status_b, RDMA_SC_TIMEOUT);
     if (completion_a == null || completion_b == null ||
@@ -893,6 +904,19 @@ class rdma_cmq_port_test extends rdma_cmq_engine_test;
         engine_b.quarantine_count() != 1)
       `uvm_error("ADAPTER_REAL_COMPLETE",
                  "adapter did not retain detached timeout ticket/status")
+    if (observed_result_a == null ||
+        observed_result_a.submission_effect == RDMA_SUBMIT_EFFECT_UNOBSERVED ||
+        observed_result_a.attempt_effect == RDMA_SUBMIT_EFFECT_UNOBSERVED ||
+        observed_result_a.completion_phase != RDMA_CMQ_COMPLETION_TERMINAL ||
+        observed_result_a.recovery_required != 1'b0 ||
+        observed_result_a.ticket == null ||
+        observed_result_a.completion == null ||
+        observed_result_a.ticket != observed_result_a.completion.ticket ||
+        observed_result_a.status != observed_result_a.completion.status ||
+        adapter.last_execute_definitive_no_submit() !=
+          last_no_submit_before_observed)
+      `uvm_error("ADAPTER_DIRECT_OBSERVED_ROUTE",
+                 "direct observed route did not preserve terminal evidence")
 
     adapter.reconcile(ticket_b, terminal_known, reconciled_completion, status);
     expect_status("ADAPTER_RECONCILE_ROUTE", status, RDMA_SC_TIMEOUT);

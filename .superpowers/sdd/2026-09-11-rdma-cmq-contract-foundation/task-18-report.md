@@ -157,3 +157,30 @@ matrix/continuation 等 leaf 中的 caught UVM errors 是既有故障注入 catc
 inventory/runner/manifest、Task 18 report 和 Phase 1C progress 指针。`src/codec/rdma/rdma_queue_codecs.sv`
 与 `tests/unit/rdma_cqe_size_codec_test.sv` 等 Task 1/2 文件明确不在本提交范围；工作树中
 其他代理的修改保持原样，交由其各自提交和审查。
+
+## Post-review delta（待下一次串行 VCS 窗口验证）
+
+为关闭“production adapter 缺少直接 observed route 证据”的缺口，
+`tests/unit/rdma_cmq_port_test.sv::check_adapter_routes_real_engines_by_function`
+现在让 Function A 直接调用 `rdma_cmq_engine_port_adapter.execute_observed()`，
+Function B 保留 legacy `execute()` 作为同一 fixture 的兼容对照。新增断言要求 A 的
+terminal result 具有 concrete submission/attempt effect、`recovery_required=0`，
+`result.ticket`/`result.status` 分别与 `result.completion` 的对应字段保持对象别名，
+且 direct observed 调用不修改 `last_execute_no_submit_proven`。该测试仍复用真实
+engine、CMQ ring、CQE 发布和双 Function 并发场景，不放宽任何 driver wire layout。
+
+本 delta 尚未在 10.11.10.53 上取得新的 focused GREEN；下一次 serial VCS 窗口必须
+把实际命令、strict UVM summary 和日志 digest 追加到本报告，不能沿用旧 commit 的
+结果作为本次变更证据。
+
+### Fresh port verification
+
+2026-09-15 15:49（Asia/Shanghai）重新执行：
+
+```text
+SSHPASS=123 scripts/run_vcs53.sh core rdma_cmq_port_test
+```
+
+结果：`RC=0`，`LOGICAL PASS`，`UVM_WARNING/UVM_ERROR/UVM_FATAL=0/0/0`。
+完整日志：`/tmp/task18_port_20260915_154723.log`；SHA-256：
+`c14f0b71898238250ff76fcab86b32bf297b4cd731f6d7314334738782a01106`。

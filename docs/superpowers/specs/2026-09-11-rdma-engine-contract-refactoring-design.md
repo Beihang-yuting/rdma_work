@@ -1696,7 +1696,10 @@ SIGSEGV 是已知阻断项，不能用删业务逻辑或跳过测试掩盖；若
   消费、当前新 incarnation 或旧 completion 的 detached snapshot 不得删除/改写 journal
   evidence，也不得触发 retry 或重复 doorbell。
 - legacy `execute()` 的 ticket/completion/status/message 与 observed 投影逐字段一致；
-  legacy subclass effect 恒为 `UNOBSERVED`，production adapter 不保存共享 `last_*` 证据。
+  legacy-only subclass 的 observed effect 恒为 `UNOBSERVED`。Phase 1A 中 production
+  adapter 的 observed route 不读写共享 `last_*`，但其 legacy `execute()` wrapper
+  暂作为唯一 deprecated writer 更新 `last_execute_no_submit_proven`；三个 Phase 1B
+  consumer 完成迁移并验证后才删除该 writer/accessor。
 - 任何 wire capability 变化都同时具备 archive/ownership/C-oracle/vector/mutation 证据；
   对 canonical 非对称输入逐字节比较 size/offset/bit/endian/overlay/embed，不以 round-trip
   或 profile checker 单独通过替代。

@@ -1191,8 +1191,17 @@ class rdma_cmq_engine extends uvm_object;
         batch_record.engine_instance_id != engine_instance_id ||
         !same_ticket_detached_value(submitted.ticket, journal_item.ticket) ||
         !same_handle_value(batch_record.cmq_h, journal_item.ticket.cmq_h) ||
-        !same_ticket_detached_value(journal_item.completion == null ? journal_item.ticket :
-                           journal_item.completion.ticket, journal_item.ticket))
+        (journal_item.completion != null &&
+         (journal_item.completion.ticket == null ||
+          journal_item.completion.status == null ||
+          !rdma_cmq_ticket_shape_valid(journal_item.completion.ticket) ||
+          !rdma_cmq_status_shape_valid(journal_item.completion.status) ||
+          !same_ticket_detached_value(journal_item.completion.ticket,
+                                      journal_item.ticket) ||
+          !same_status_value(journal_item.completion.status,
+                             journal_item.status) ||
+          journal_item.completion.ticket != journal_item.ticket ||
+          journal_item.completion.status != journal_item.status)))
       return journal_status(
         RDMA_SC_INVALID_STATE, "CMQ observed journal identity mismatch"
       );
