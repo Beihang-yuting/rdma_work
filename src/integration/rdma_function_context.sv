@@ -37,7 +37,7 @@ class rdma_function_context extends uvm_object;
   // 输入/输出及副作用：source_identity/source_binding 被克隆到 result_context；resources、
   //   host_mem、pcie 和 registry 仅保存非拥有引用；coordinator 为空时创建新的 coordinator，
   //   并将 Host router/identity 登记其中。build_timeout 仅为兼容参数，不产生延迟。
-  // 失败/边界：依赖为空、identity 无效、资源未冻结或克隆失败时返回错误且 result_context 为 null；
+  // 失败/边界：依赖为空、identity 无效（包括 validator 返回 null）、资源未冻结或克隆失败时返回错误且 result_context 为 null；
   //   不复制 registry 可变状态，也不取得外部 router/快照所有权。
   static function rdma_status build(
     rdma_function_identity source_identity,
@@ -84,7 +84,8 @@ class rdma_function_context extends uvm_object;
         source_host_mem == null || source_pcie == null)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "Function context dependency is null");
-    if (!source_identity.validate().ok() || !source_resources.is_frozen())
+    status = source_identity.validate();
+    if (status == null || !status.ok() || !source_resources.is_frozen())
       return rdma_status::make(RDMA_SC_INVALID_STATE,
                                "Function context snapshot invalid");
     cloned_object = source_identity.clone();
@@ -102,6 +103,11 @@ class rdma_function_context extends uvm_object;
       binding_copy = rdma_function_binding::type_id::create(
         "context_binding");
       status = binding_copy.configure_identity(identity_copy);
+      if (status == null)
+        return rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "Function context binding configuration returned null status"
+        );
       if (!status.ok())
         return status;
     end
@@ -129,9 +135,15 @@ class rdma_function_context extends uvm_object;
   // 功能：允许已构造的 Function context 接收新的控制面/数据面事务。
   // 输入/输出及副作用：无参数；成功时仅把 DISCOVERED context 标记为 ACTIVE、创建新的 owner handle
   //   并更新 binding 状态，不分配队列或 DMA 资源。
-  // 失败/边界：QUARANTINED 或未完成 identity 绑定时拒绝激活；重复激活保持幂等成功。
+  // 失败/边界：QUARANTINED、identity validator 返回 null 或未完成 identity 绑定时拒绝激活；重复激活保持幂等成功。
   function rdma_status activate();
-    if (identity == null || !identity.validate().ok())
+    rdma_status identity_status;
+
+    if (identity == null)
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "Function context identity is invalid");
+    identity_status = identity.validate();
+    if (identity_status == null || !identity_status.ok())
       return rdma_status::make(RDMA_SC_INVALID_STATE,
                                "Function context identity is invalid");
     if (state == RDMA_CONTEXT_ACTIVE)
@@ -188,12 +200,22 @@ class rdma_function_context extends uvm_object;
     status = next_identity.configure(
       identity.key, identity.global_function_id, identity.function_uid,
       new_generation, new_epoch);
+    if (status == null)
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "reset identity configuration returned null status"
+      );
     if (!status.ok())
       return status;
     identity = next_identity;
     if (binding == null)
       binding = rdma_function_binding::type_id::create("reset_binding");
     status = binding.configure_identity(identity);
+    if (status == null)
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "reset binding configuration returned null status"
+      );
     if (!status.ok())
       return status;
     binding.owner_h = binding.make_handle();

@@ -46,10 +46,15 @@ class rdma_env_config extends uvm_object;
   endfunction
 
   // 功能：校验模式、adapter enable/required 关系、超时和每个 responder region 的地址边界。
-  // 输入输出及副作用：读取当前配置并返回 rdma_status；不修改配置或外部账本。
-  // 失败边界：required 未同时 enabled、timeout/硬件版本为零、region 为空 owner、非法 route、size=0 或 65-bit 末地址溢出时拒绝。
+  // 输入/输出及副作用：读取当前配置并返回 rdma_status；不修改配置或外部账本。
+  // 失败/边界：required 未同时 enabled、timeout/硬件版本为零、region 为空 owner、
+  // 非法 route、size=0 或 65-bit 末地址溢出时拒绝；嵌套 validator 返回 null
+  // 时 fail-closed。
   function rdma_status validate();
     bit [64:0] end_ext;
+    rdma_status identity_status;
+    rdma_status binding_status;
+
     if (hardware_version == 0)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "hardware version is zero");
     if (operation_timeout == 0)
@@ -83,12 +88,24 @@ class rdma_env_config extends uvm_object;
                                  "responder region end overflows 64 bits");
     end
     if (function_identity != null) begin
-      if (!function_identity.validate().ok())
+      identity_status = function_identity.validate();
+      if (identity_status == null)
+        return rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "Function identity validation returned null status"
+        );
+      if (!identity_status.ok())
         return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                  "Function identity snapshot is invalid");
     end
     if (function_binding != null) begin
-      if (!function_binding.validate().ok())
+      binding_status = function_binding.validate();
+      if (binding_status == null)
+        return rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "Function binding validation returned null status"
+        );
+      if (!binding_status.ok())
         return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                  "Function binding snapshot is invalid");
       if (function_identity != null &&

@@ -20,13 +20,27 @@ class rdma_env_event_route extends uvm_object;
   endfunction
 
   // 功能：校验事件携带完整 target Function、vector 和 generation，阻止裸 vector 串线。
-  // 输入输出及副作用：读取当前字段返回 rdma_status；不更新任何队列或 scoreboard 状态。
-  // 失败边界：target_function 为空/非法、generation 为零或与 Function generation 不一致时返回错误。
+  // 输入/输出及副作用：读取当前字段返回 rdma_status；不更新任何队列或 scoreboard 状态。
+  // 失败/边界：target_function 为空/非法、validator 返回 null、generation 为零或与 Function generation 不一致时返回错误。
   function rdma_status validate();
+    rdma_status identity_status;
+
     if (target_function == null)
-      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "event target Function is missing");
-    if (!target_function.validate().ok())
-      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "event target Function is invalid");
+      return rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT,
+        "event target Function is missing"
+      );
+    identity_status = target_function.validate();
+    if (identity_status == null)
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "event target Function validation returned null"
+      );
+    if (!identity_status.ok())
+      return rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT,
+        "event target Function is invalid"
+      );
     if (generation == 0 || generation != target_function.generation)
       return rdma_status::make(RDMA_SC_STALE_GENERATION, "event generation is stale");
     return rdma_status::success();
@@ -81,9 +95,12 @@ class rdma_env extends uvm_env;
     m_capability["net"] = "disabled";
   endfunction
 
-  // 功能：从 uvm_config_db 取配置和抽象 adapter，执行 required fatal、optional capability gate，再冻结 env 组件。
-  // 输入输出及副作用：phase 为 UVM build phase；读取 cfg/adapter/identity 引用并调用 configure，不创建 pcie_env/axis_env。
-  // 失败边界：缺少 cfg、cfg.validate/configure 失败或 required adapter 缺失触发 uvm_fatal；optional 缺失只标记 passive/disabled。
+  // 功能：从 uvm_config_db 取配置和抽象 adapter，执行 required fatal、
+  //   optional capability gate，再冻结 env 组件。
+  // 输入/输出及副作用：phase 为 UVM build phase；读取 cfg/adapter/identity 引用并
+  //   调用 configure，不创建 pcie_env/axis_env。
+  // 失败/边界：缺少 cfg、cfg.validate/configure 失败或 required adapter 缺失触发
+  //   uvm_fatal；optional 缺失只标记 passive/disabled。
   function void build_phase(uvm_phase phase);
     rdma_env_config supplied_cfg;
     rdma_function_identity supplied_identity;
@@ -148,13 +165,19 @@ class rdma_env extends uvm_env;
     if (function_binding_snapshot != null)
       config_snapshot.function_binding = function_binding_snapshot;
     status = configure(config_snapshot);
-    if (!status.ok())
-      begin `uvm_fatal("RDMA_ENV_CONFIG", status.message); return; end
+    if (status == null) begin
+      `uvm_fatal("RDMA_ENV_CONFIG", "rdma_env configure returned null status")
+      return;
+    end
+    if (!status.ok()) begin
+      `uvm_fatal("RDMA_ENV_CONFIG", status.message)
+      return;
+    end
   endfunction
 
   // 功能：按 cfg 快照创建内部 registry/codec/resource 对象，逐项 claim region 后 seal，提交完整一致的组合结果。
-  // 输入输出及副作用：cfg 为输入配置；更新 env 内部 owned 对象和 config snapshot，adapter 仍保持 borrowed 引用。
-  // 失败边界：cfg 为空/validate 失败、claim 冲突/溢出或 seal 失败时返回错误，旧 responder registry 不被部分替换。
+  // 输入/输出及副作用：cfg 为输入配置；更新 env 内部 owned 对象和 config snapshot，adapter 仍保持 borrowed 引用。
+  // 失败/边界：cfg 为空/validate 失败、claim 冲突/溢出或 seal 失败时返回错误，旧 responder registry 不被部分替换。
   function rdma_status configure(rdma_env_config cfg);
     rdma_env_config candidate_cfg;
     rdma_responder_registry candidate_registry;
@@ -171,7 +194,13 @@ class rdma_env extends uvm_env;
     if (cfg == null)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "rdma_env_config is null");
     status = cfg.validate();
-    if (!status.ok()) return status;
+    if (status == null)
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "rdma_env configuration validation returned null"
+      );
+    if (!status.ok())
+      return status;
     candidate_cfg = rdma_env_config::type_id::create("config_candidate");
     if (candidate_cfg == null) return rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED, "config snapshot allocation failed");
     candidate_cfg.copy(cfg);
@@ -186,10 +215,22 @@ class rdma_env extends uvm_env;
                                         source_region.route, source_region.base,
                                         source_region.size, source_region.owner,
                                         claimed_region);
-      if (!status.ok()) return status;
+      if (status == null)
+        return rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "responder registry claim returned null status"
+        );
+      if (!status.ok())
+        return status;
     end
     status = candidate_registry.seal();
-    if (!status.ok()) return status;
+    if (status == null)
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "responder registry seal returned null status"
+      );
+    if (!status.ok())
+      return status;
     candidate_queue_data = rdma_queue_data_engine::type_id::create("queue_data");
     candidate_sq = rdma_sq_engine::type_id::create("sq");
     candidate_rq = rdma_rq_engine::type_id::create("rq");
@@ -221,8 +262,9 @@ class rdma_env extends uvm_env;
   // 功能：bind_data_path 把已由上层 fixture 创建的资源管理器、Function
   // binding、host-memory、doorbell 和 codec 注入 env 自有 queue-data engine。
   // 输入/输出及副作用：依赖对象为输入；成功时 queue_data 保存借用引用，随后
-  // 可通过 env 的 post/poll 语义接口驱动真实 SQ/RQ/CQ；不会转移外部资源所有权。
-  // 失败边界：env 未 configure、依赖为空、Function 快照不一致或 engine 已有
+  // 可通过 env 的 post/poll 语义接口驱动真实 SQ/RQ/CQ；可选 context_api 只提供
+  // QPC runtime shadow 的读取能力，所有对象仍由调用方拥有且不会转移资源所有权。
+  // 失败/边界：env 未 configure、依赖为空、Function 快照不一致或 engine 已有
   // attachment 时返回错误，既有组合对象保持不变。
   function rdma_status bind_data_path(
     rdma_resource_manager resource_manager,
@@ -230,7 +272,8 @@ class rdma_env extends uvm_env;
     rdma_host_mem_api memory,
     rdma_doorbell_scheduler scheduler,
     rdma_codec_registry codec_registry,
-    time timeout
+    time timeout,
+    rdma_context_backing_api context_api = null
   );
     rdma_status status;
     rdma_function_identity identity;
@@ -243,15 +286,27 @@ class rdma_env extends uvm_env;
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "rdma_env data-path dependency is missing");
     identity = function_binding.identity_snapshot();
-    if (identity == null || !identity.validate().ok())
+    if (identity == null)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "rdma_env data-path Function identity is invalid");
+    status = identity.validate();
+    if (status == null)
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "rdma_env data-path Function identity validation returned null"
+      );
+    if (!status.ok())
+      return rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT,
+        "rdma_env data-path Function identity is invalid"
+      );
     if (function_identity_snapshot != null &&
         !function_identity_snapshot.same_incarnation(identity))
       return rdma_status::make(RDMA_SC_STALE_GENERATION,
                                "rdma_env data-path Function identity is stale");
     status = queue_data.configure(resource_manager, function_binding, memory,
-                                  scheduler, codec_registry, timeout);
+                                  scheduler, codec_registry, timeout,
+                                  context_api);
     return status == null ?
       rdma_status::make(RDMA_SC_INVALID_STATE,
                         "rdma_env data-path configure returned null status") : status;
@@ -348,14 +403,20 @@ class rdma_env extends uvm_env;
   endfunction
 
   // 功能：校验并接受带完整 Function/vector/generation 的事件路由，作为后续 scoreboard 路由入口。
-  // 输入输出及副作用：event 为输入；成功时递增 pending_count，失败不改变计数。
-  // 失败边界：空事件、身份不一致或 generation 过期返回错误，拒绝裸 vector 事件。
+  // 输入/输出及副作用：event 为输入；成功时递增 pending_count，失败不改变计数。
+  // 失败/边界：空事件、身份不一致或 generation 过期返回错误，拒绝裸 vector 事件。
   function rdma_status route_event(rdma_env_event_route event_route);
     rdma_status status;
     if (event_route == null)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "event route is null");
     status = event_route.validate();
-    if (!status.ok()) return status;
+    if (status == null)
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "event route validation returned null status"
+      );
+    if (!status.ok())
+      return status;
     if (function_identity_snapshot != null &&
         !function_identity_snapshot.same_incarnation(event_route.target_function))
       return rdma_status::make(RDMA_SC_STALE_GENERATION, "event target Function is not env owner");

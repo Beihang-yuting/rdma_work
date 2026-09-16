@@ -235,13 +235,24 @@ class rdma_queue_txn_evidence extends uvm_object;
   // Capture mutable producer objects as detached value snapshots.
   // 功能：在 rdma_queue_txn_evidence 中，capture_function_identity 从输入对象提取受控字段并返回 detached 投影，阻断调用方通过别名修改 authority。
   // 输入/输出及副作用：source（输入）；capture_function_identity 读取 source 并使用字段 cloned、route；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：capture_function_identity 返回 RDMA_SC_INVALID_ARGUMENT、RDMA_SC_RESOURCE_EXHAUSTED；典型拒绝条件为“Function identity is null”“Function identity snapshot clone failed”；失败路径不提交部分状态或转移未声明资源。
+  // 失败/边界：capture_function_identity 返回 RDMA_SC_INVALID_ARGUMENT、
+  //   RDMA_SC_INVALID_STATE、RDMA_SC_RESOURCE_EXHAUSTED；典型拒绝条件为
+  //   “Function identity is null”“validator 返回 null”“Function identity snapshot
+  //   clone failed”；失败路径不提交部分状态或转移未声明资源。
   function rdma_status capture_function_identity(rdma_function_identity source);
     uvm_object cloned;
+    rdma_status status;
+
     if (source == null)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "Function identity is null");
-    if (!source.validate().ok())
-      return source.validate();
+    status = source.validate();
+    if (status == null)
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "Function identity validation returned null status"
+      );
+    if (!status.ok())
+      return status;
     cloned = source.clone();
     if (cloned == null || !$cast(function_identity, cloned))
       return rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED, "Function identity snapshot clone failed");
@@ -415,12 +426,16 @@ class rdma_queue_txn_evidence extends uvm_object;
   // 输入/输出及副作用：无显式参数；输入 request/image/cursor 决定写入内容；成功时更新 PI/CI、slot ledger 或 pending journal，并通过 output 返回结果。
   // 失败/边界：mark_mmio_maybe_submitted 仅允许测试/恢复范围内的状态变更；代际或资源不匹配时拒绝并保留原账本。
   function rdma_status mark_mmio_maybe_submitted();
+    rdma_status transition_status;
+
     if (aborted || phase == RDMA_QUEUE_TXN_COMPLETED)
       return rdma_status::make(RDMA_SC_INVALID_STATE, "transaction is terminal");
     if (phase != RDMA_QUEUE_TXN_PAYLOAD_WRITTEN)
       return rdma_status::make(RDMA_SC_INVALID_STATE,
                                "MMIO submission requires payload evidence");
-    if (!transition_to(RDMA_QUEUE_TXN_DOORBELL_MAYBE_SUBMITTED).ok())
+    transition_status =
+      transition_to(RDMA_QUEUE_TXN_DOORBELL_MAYBE_SUBMITTED);
+    if (transition_status == null || !transition_status.ok())
       return rdma_status::make(RDMA_SC_INVALID_STATE,
                                "MMIO phase transition failed");
     mmio_maybe_submitted = 1'b1;

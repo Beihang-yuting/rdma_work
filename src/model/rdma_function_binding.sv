@@ -264,9 +264,9 @@ class rdma_function_binding extends uvm_object;
   //   和 PCIe 镜像。
   // 输入/输出及副作用：source 为调用方拥有的 identity；成功后 binding 拥有 clone，
   // 并更新 function_uid/global_function_id/generation 及 PCIe BDF/PF/VF 兼容投影。
-  // 失败/边界：source 为 null/校验失败时不改写 binding；clone/cast 失败返回
-  // RESOURCE_EXHAUSTED。identity 发布后若 pcie==null，会通过 legacy factory
-  // 重建 PCIe 投影。
+  // 失败/边界：source 为 null、validator 返回 null 或校验失败时不改写 binding；
+  // clone/cast 失败返回 RESOURCE_EXHAUSTED。identity 发布后若 pcie==null，
+  // 会通过 legacy factory 重建 PCIe 投影。
   function rdma_status configure_identity(rdma_function_identity source);
     uvm_object cloned_object;
     rdma_function_identity configured;
@@ -276,6 +276,11 @@ class rdma_function_binding extends uvm_object;
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "Function identity is null");
     status = source.validate();
+    if (status == null)
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "Function identity validation returned null status"
+      );
     if (!status.ok())
       return status;
     cloned_object = source.clone();
@@ -314,6 +319,7 @@ class rdma_function_binding extends uvm_object;
   );
     rdma_function_identity legacy_identity;
     rdma_function_key_t key;
+    rdma_status status;
 
     if (pcie == null)
       return rdma_status::make(RDMA_SC_INVALID_STATE,
@@ -326,9 +332,21 @@ class rdma_function_binding extends uvm_object;
     key.bdf = pcie.bdf;
     legacy_identity = rdma_function_identity::type_id::create(
       "legacy_identity");
-    if (legacy_identity.configure(key, global_function_id, function_uid,
-                                  generation, reset_epoch).ok() == 1'b0)
-      return legacy_identity.validate();
+    if (legacy_identity == null)
+      return rdma_status::make(
+        RDMA_SC_RESOURCE_EXHAUSTED,
+        "legacy Function identity allocation failed"
+      );
+    status = legacy_identity.configure(
+      key, global_function_id, function_uid, generation, reset_epoch
+    );
+    if (status == null)
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "legacy Function identity configuration returned null status"
+      );
+    if (!status.ok())
+      return status;
     return configure_identity(legacy_identity);
   endfunction
 
@@ -338,12 +356,20 @@ class rdma_function_binding extends uvm_object;
   // authority identity。
   // 输入/输出及副作用：无参数；只读原 identity.key/reset_epoch 作 route 根，并通过
   // configure_identity_from_legacy_mirrors() 更新 binding 拥有的 identity 和 PCIe 镜像。
-  // 失败/边界：原 identity 为 null/无效时返回 INVALID_STATE 且不伪造 route；
+  // 失败/边界：原 identity 为 null、validator 返回 null 或无效时返回 INVALID_STATE 且不伪造 route；
   // 重建过程的其他拒绝 status 原样透传。
   function rdma_status synchronize_identity_from_legacy_mirrors();
-    if (identity == null || !identity.validate().ok())
+    rdma_status identity_status;
+
+    if (identity == null)
       return rdma_status::make(RDMA_SC_INVALID_STATE,
                                "Function identity route is not configured");
+    identity_status = identity.validate();
+    if (identity_status == null || !identity_status.ok())
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "Function identity route is not configured"
+      );
     return configure_identity_from_legacy_mirrors(
       identity.key.root_id, identity.key.host_topology_key,
       identity.key.function_kind, identity.key.vf_index, identity.reset_epoch
@@ -412,17 +438,22 @@ class rdma_function_binding extends uvm_object;
   // 功能：从已配置 authority identity 构造可交给其他模型的 Function handle 值。
   // 输入/输出及副作用：无参数；比对 identity 与 UID/global-ID/generation/PCIe 镜像，
   // 成功时 factory-create 新 rdma_function_handle，调用方拥有该身份值。
-  // 失败/边界：identity/pcie 缺失或无效，以及任一兼容镜像不一致时返回 null；
+  // 失败/边界：identity/pcie 缺失、validator 返回 null/无效，以及任一兼容镜像不一致时返回 null；
   // 不回退到可能歧义的 legacy scalars。
   function rdma_function_handle make_handle();
     rdma_function_handle handle;
+    rdma_status identity_status;
 
     // 中文：identity 缺失或非法时不得退回 legacy scalar（global ID=0 也
     // 是合法值），否则会把未配置 binding 伪装成可用 Function。
-    if (identity == null || !identity.validate().ok() ||
-        function_uid != identity.function_uid ||
+    if (identity == null || pcie == null)
+      return null;
+    identity_status = identity.validate();
+    if (identity_status == null || !identity_status.ok())
+      return null;
+    if (function_uid != identity.function_uid ||
         global_function_id != identity.global_function_id ||
-        generation != identity.generation || pcie == null ||
+        generation != identity.generation ||
         !rdma_bdf_same(identity.key.bdf, pcie.bdf) ||
         !rdma_bdf_same(identity.key.parent_pf_bdf, pcie.parent_pf_bdf) ||
         identity.key.vf_index != pcie.vf_index)
@@ -441,10 +472,16 @@ class rdma_function_binding extends uvm_object;
   // 失败/边界：handle/identity/pcie 为 null、identity 无效、镜像漂移或 incarnation 不同
   // 均返回 0；该布尔边界不返回详细 status。
   function bit accepts(rdma_handle handle);
-    if (handle == null || identity == null || !identity.validate().ok() ||
-        function_uid != identity.function_uid ||
+    rdma_status identity_status;
+
+    if (handle == null || identity == null || pcie == null)
+      return 1'b0;
+    identity_status = identity.validate();
+    if (identity_status == null || !identity_status.ok())
+      return 1'b0;
+    if (function_uid != identity.function_uid ||
         global_function_id != identity.global_function_id ||
-        generation != identity.generation || pcie == null ||
+        generation != identity.generation ||
         !rdma_bdf_same(identity.key.bdf, pcie.bdf) ||
         !rdma_bdf_same(identity.key.parent_pf_bdf, pcie.parent_pf_bdf) ||
         identity.key.vf_index != pcie.vf_index)
@@ -744,6 +781,7 @@ class rdma_function_binding extends uvm_object;
     longint unsigned bar_last;
     longint unsigned notify_last;
     rdma_bar_info selected_bar;
+    rdma_status identity_status;
 
     if (pcie == null)
       return rdma_status::make(RDMA_SC_INVALID_STATE,
@@ -751,8 +789,14 @@ class rdma_function_binding extends uvm_object;
     if (identity == null)
       return rdma_status::make(RDMA_SC_INVALID_STATE,
                                "Function identity is not configured");
-    if (!identity.validate().ok())
-      return identity.validate();
+    identity_status = identity.validate();
+    if (identity_status == null)
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "Function identity validation returned null status"
+      );
+    if (!identity_status.ok())
+      return identity_status;
     begin
       if (identity.function_uid != function_uid ||
           identity.global_function_id != global_function_id ||
