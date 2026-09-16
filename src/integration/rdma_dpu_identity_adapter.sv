@@ -60,6 +60,9 @@ class rdma_dpu_identity_adapter extends uvm_object;
     if (key.kind == DPU_FUNCTION_VF) begin
       snapshot.list_functions(funcs);
       foreach (funcs[i]) begin
+        // dpu_common::list_functions() 返回已登记的值结构，不返回 null
+        // 或占位项；全零 key 仍可能是合法的 Host0/PF0，因此不能把它
+        // 当作“空元素”过滤。
         if (funcs[i].host_id == key.host_id &&
             funcs[i].pf_id == key.pf_id &&
             funcs[i].kind == DPU_FUNCTION_PF) begin
@@ -89,7 +92,19 @@ class rdma_dpu_identity_adapter extends uvm_object;
     if (uid == 0)
       uid = longint'(gid) + 1;
     identity = rdma_function_identity::type_id::create("dpu_identity");
+    if (identity == null)
+      return rdma_status::make(
+        RDMA_SC_RESOURCE_EXHAUSTED,
+        "DPU identity allocation failed"
+      );
     status = identity.configure(rkey, gid, uid, 1, 0);
+    if (status == null) begin
+      identity = null;
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "DPU identity configuration returned null status"
+      );
+    end
     if (!status.ok()) begin
       identity = null;
       return status;
@@ -112,7 +127,6 @@ class rdma_dpu_identity_adapter extends uvm_object;
   );
     dpu_pcie_function_id_t pcie_id, parent_pcie_id;
     dpu_function_key_t funcs[$];
-    dpu_function_key_t parent;
     dpu_bar_pair_lease_t device_bar;
     dpu_bar_pair_lease_t mailbox_bar;
     dpu_bar_pair_lease_t msix_bar;
@@ -124,7 +138,8 @@ class rdma_dpu_identity_adapter extends uvm_object;
     rdma_status status;
     bit parent_found;
 
-    identity = null; binding = null;
+    identity = null;
+    binding = null;
     if (snapshot == null || resources == null)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "DPU snapshots are null");
     if (!snapshot.is_frozen() || !resources.is_frozen())
@@ -171,6 +186,9 @@ class rdma_dpu_identity_adapter extends uvm_object;
     if (key.kind == DPU_FUNCTION_VF) begin
       snapshot.list_functions(funcs);
       foreach (funcs[i]) begin
+        // dpu_common::list_functions() 返回已登记的值结构，不返回 null
+        // 或占位项；全零 key 仍可能是合法的 Host0/PF0，因此不能把它
+        // 当作“空元素”过滤。
         if (funcs[i].host_id == key.host_id && funcs[i].pf_id == key.pf_id &&
             funcs[i].kind == DPU_FUNCTION_PF) begin
           if (!snapshot.get_pcie_id(funcs[i], parent_pcie_id, why))
@@ -194,11 +212,45 @@ class rdma_dpu_identity_adapter extends uvm_object;
           (longint'(rkey.root_id) << 16) | longint'(rkey.bdf);
     if (uid == 0) uid = longint'(gid) + 1;
     identity = rdma_function_identity::type_id::create("dpu_identity");
+    if (identity == null)
+      return rdma_status::make(
+        RDMA_SC_RESOURCE_EXHAUSTED,
+        "DPU identity allocation failed"
+      );
     status = identity.configure(rkey, gid, uid, 1, 0);
-    if (!status.ok()) begin identity = null; return status; end
+    if (status == null) begin
+      identity = null;
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "DPU identity configuration returned null status"
+      );
+    end
+    if (!status.ok()) begin
+      identity = null;
+      return status;
+    end
     binding = rdma_function_binding::type_id::create("dpu_binding");
+    if (binding == null) begin
+      identity = null;
+      return rdma_status::make(
+        RDMA_SC_RESOURCE_EXHAUSTED,
+        "DPU function binding allocation failed"
+      );
+    end
     status = binding.configure_identity(identity);
-    if (!status.ok()) begin identity = null; binding = null; return status; end
+    if (status == null) begin
+      identity = null;
+      binding = null;
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "DPU binding configuration returned null status"
+      );
+    end
+    if (!status.ok()) begin
+      identity = null;
+      binding = null;
+      return status;
+    end
     binding.pcie.bdf = rkey.bdf;
     binding.pcie.parent_pf_bdf = rkey.parent_pf_bdf;
     binding.pcie.vf_index = rkey.vf_index;
@@ -210,13 +262,19 @@ class rdma_dpu_identity_adapter extends uvm_object;
     // 使用 segment，Host 隔离由 route.host_topology_key 同时承担。
     binding.queue_dma.dma_domain_id = pcie_id.domain.segment_id;
     caps = snapshot.snapshot_dut_caps();
-    if (caps == null)
+    if (caps == null) begin
+      identity = null;
+      binding = null;
       return rdma_status::make(RDMA_SC_INVALID_STATE,
                                "snapshot DUT capabilities are unavailable");
+    end
     if ((caps.max_vio_net_qpairs_per_device == 0) ||
-        (caps.global_msix_vector_count == 0))
+        (caps.global_msix_vector_count == 0)) begin
+      identity = null;
+      binding = null;
       return rdma_status::make(RDMA_SC_INVALID_STATE,
                                "snapshot queue capability is zero");
+    end
     // dpu_common 当前没有 RDMA 专用 CQ/SRQ 字段，因此采用其设备级 VIO
     // qpair/MSI-X 上限作为保守上界；ring/SGB 上限直接受实际 device BAR
     // aperture 约束，后续专用 RDMA capability 可在此处替换而不改路由。
@@ -226,7 +284,10 @@ class rdma_dpu_identity_adapter extends uvm_object;
     binding.queue_caps.max_srq_depth = caps.max_vio_net_qpairs_per_device;
     binding.queue_caps.max_ceq_depth = caps.global_msix_vector_count;
     binding.queue_caps.max_aeq_depth = caps.global_msix_vector_count;
-    binding.queue_caps.max_wq_sge = 1;
+    // 真实驱动 xtrdma_hw.h 将 XTRDMA_MAX_SGE_NUM 定义为 32，xtrdma_hw.c
+    // 也把同一数值发布为 max_hw_wq_sge。集成层必须引用冻结的 RDMA ABI
+    // 常量，不能继续使用与硬件能力不一致的保守占位值。
+    binding.queue_caps.max_wq_sge = RDMA_MAX_WQ_SGE;
     binding.queue_caps.max_queue_ring_bytes = device_bar.size;
     binding.queue_caps.max_sgb_bytes = device_bar.size;
 
@@ -243,7 +304,19 @@ class rdma_dpu_identity_adapter extends uvm_object;
     binding.notify_base.value = mailbox_bar.base;
     binding.notify_size = mailbox_bar.size;
     status = binding.validate();
-    if (!status.ok()) begin identity = null; binding = null; return status; end
+    if (status == null) begin
+      identity = null;
+      binding = null;
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "DPU binding validation returned null status"
+      );
+    end
+    if (!status.ok()) begin
+      identity = null;
+      binding = null;
+      return status;
+    end
     return rdma_status::success();
   endfunction
 endclass
