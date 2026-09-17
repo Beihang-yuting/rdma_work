@@ -19,12 +19,17 @@ readonly CORE_TESTS=(
   rdma_request_model_test
   rdma_adapter_contract_test
   rdma_resource_manager_test
+  rdma_aeqe_route_test
+  rdma_resource_local_lookup_test
   rdma_queue_runtime_test
   rdma_queue_backing_access_test
   rdma_queue_data_engine_post_test
-  # 设备产生的 CQE 发布属于核心队列生命周期回归，
+  rdma_queue_detached_snapshot_test
+  # device publish、route-consume 与真实 AEQE E2E 共享 lifecycle fixture，
   # 必须在定义共享 fixture 的 post 测试之后执行。
   rdma_queue_data_engine_device_publish_test
+  rdma_queue_event_route_consume_test
+  rdma_aeqe_f5_e2e_test
   rdma_queue_host_codec_final_fix_test
   rdma_queue_producer_doorbell_final_fix_test
   rdma_queue_cqe_codec_final_fix_test
@@ -44,9 +49,12 @@ readonly CORE_TESTS=(
   rdma_cq_engine_test
   rdma_eq_engine_test
   rdma_queue_host_mem_submitter_test
+  rdma_queue_host_mem_submitter_authority_test
   rdma_queue_model_test
   rdma_queue_codec_test
   rdma_doorbell_scheduler_test
+  rdma_doorbell_scheduler_authority_test
+  rdma_doorbell_scheduler_reset_epoch_test
   rdma_cmq_engine_test
   rdma_cmq_port_test
   rdma_control_plane_test
@@ -66,6 +74,7 @@ readonly CORE_TESTS=(
   rdma_queue_lifecycle_models_test
   rdma_context_backing_contract_test
   rdma_queue_page_codec_test
+  rdma_sriov_enumerator_authority_test
   rdma_queue_lifecycle_test
   rdma_queue_recovery_test
   rdma_qp_lifecycle_test
@@ -104,12 +113,37 @@ readonly UNIT_INTEGRATION_TESTS=(
   rdma_reset_coordinator_test
 )
 
+# engine 的物理 process 由 sim/rdma_cmq_engine_process.list 交给统一
+# logical runner 展开；这里仅用于 --list 闭合普通 unit-test 发现集合，
+# 不能把 shard 名混进 CORE_TESTS，否则 regression 会重复执行每个 leaf。
+readonly ENGINE_PROCESS_TESTS=(
+  rdma_cmq_engine_test
+  rdma_cmq_engine_base_suffix_process_test
+  rdma_cmq_engine_capacity_process_test
+  rdma_cmq_engine_submission_process_test
+  rdma_cmq_engine_submission_matrix_process_test
+  rdma_cmq_engine_profile_wide_process_test
+  rdma_cmq_engine_retention_prefix_process_test
+  rdma_cmq_engine_submission_continuation_process_test
+  rdma_cmq_engine_submission_profile_process_test
+  rdma_cmq_engine_invariant_process_test
+  rdma_cmq_engine_raw_snapshot_process_test
+  rdma_cmq_engine_poll_fault_process_test
+  rdma_cmq_engine_poison_reset_process_test
+  rdma_cmq_engine_wrap_process_test
+  rdma_cmq_engine_wrap_publication_process_test
+  rdma_cmq_engine_journal_process_test
+  rdma_cmq_engine_mmio_arm_process_test
+  rdma_cmq_engine_hostile_factory_process_test
+)
+
 if [[ ${1-} == "--list" ]]; then
   if [[ $# -ne 1 ]]; then
     echo "Usage: $0 [--list]" >&2
     exit 2
   fi
   printf '%s\n' "${CORE_TESTS[@]}"
+  printf '%s\n' "${ENGINE_PROCESS_TESTS[@]}"
   printf '%s\n' "${UNIT_INTEGRATION_TESTS[@]}"
   exit 0
 fi
