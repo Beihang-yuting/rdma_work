@@ -20,7 +20,7 @@ class rdma_queue_data_engine_poll_test extends uvm_test;
   //   故障触发 fatal，保证 publish_cqe 能以普通 status 报告 authority 失败。
   // 输入/输出及副作用：source 为输入、copy 为输出；成功时创建 detached handle，
   //   不修改 fixture、资源管理器或 source。
-  // 失败边界：source 为空或分配失败时返回非成功 status，copy 保持 null。
+  // 失败/边界：source 为空或分配失败时返回非成功 status，copy 保持 null。
   function automatic rdma_status clone_test_handle(
     rdma_handle source,
     output rdma_handle copy
@@ -47,7 +47,7 @@ class rdma_queue_data_engine_poll_test extends uvm_test;
   //   polarity 构造可由公开 publish_cqe 提交并由 poll 精确释放的 CQE model。
   // 输入/输出及副作用：qp_h、qpn、posted、polarity 为输入，status 为输出；成功时
   //   返回 detached model，不读取或直接写入 CQ backing，也不修改 posted。
-  // 失败边界：QP、post status 或对象分配不完整时返回 null/非成功 status，不产生
+  // 失败/边界：QP、post status 或对象分配不完整时返回 null/非成功 status，不产生
   //   可提交的半成品 CQE。
   function automatic rdma_hw_cqe_model make_cqe_for_outstanding_send(
     rdma_handle qp_h,
@@ -100,7 +100,7 @@ class rdma_queue_data_engine_poll_test extends uvm_test;
   //   以及 consumer commit 后 CQ 为空的可观察结果。
   // 输入/输出及副作用：phase 为输入；任务创建 fixture、调用公开 API 并报告断言，
   //   不直接写入正向 CQ backing，最终聚合释放 fixture-owned lifecycle 资源。
-  // 失败边界：setup、post、polarity、CQE 构造、publish 或 poll 失败时停止后续正向
+  // 失败/边界：fixture 分配、setup、post、polarity、CQE 构造、publish 或 poll 失败时停止后续正向
   //   事务并释放 objection；第二次 poll 只能返回 QUEUE_EMPTY。
   task run_phase(uvm_phase phase);
     rdma_queue_data_engine engine;
@@ -149,7 +149,7 @@ class rdma_queue_data_engine_poll_test extends uvm_test;
         `uvm_error("FIXTURE_FACTORY", "poll fixture allocation failed")
         disable poll_flow;
       end
-      fixture.setup(status);
+      fixture.setup(status, 16, RDMA_CQE_BYTES, 16, 16, 1'b1);
       if (status == null || !status.ok()) begin
         `uvm_error("FIXTURE_SETUP", status == null ? "null setup status" :
                    status.convert2string())
